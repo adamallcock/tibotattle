@@ -413,6 +413,301 @@ test("the v1.2 desktop edge forwards only its exact routes and never logs creden
   assert.match(serializedLogs, /"route":"telemetry_v12_consent"/u);
 });
 
+test("the public gateway exposes the private-supported accountless and disconnect journey with closed forwarding", async () => {
+  const accountlessEnrollment = {
+    schemaVersion: "accountless-enrollment-v0.1",
+    deviceId: DEVICE_ID,
+    deviceSecretHash: "a".repeat(64),
+    policyVersion: "accountless-opt-out-v1",
+    authorizationBasis: "accountless-policy-v1",
+  };
+  const accountlessOwnership = {
+    schemaVersion: "accountless-upload-owner-v0.1",
+    policyVersion: "accountless-opt-out-v1",
+    authorizationBasis: "accountless-policy-v1",
+    telemetrySchemaVersion: "telemetry-contribution-v1.1",
+  };
+  const accountlessV12Authorization = {
+    schemaVersion: "accountless-upload-owner-v1.2",
+    policyVersion: "accountless-telemetry-v1.2-policy-v1",
+    authorizationBasis: "accountless-policy-v1.2",
+    telemetrySchemaVersion: "telemetry-contribution-v1.2",
+  };
+  const accountlessRenewal = {
+    schemaVersion: "accountless-renewal-v0.1",
+    policyVersion: "accountless-opt-out-v1",
+    authorizationBasis: "accountless-policy-v1",
+    telemetrySchemaVersion: "telemetry-contribution-v1.1",
+  };
+  const routes = [
+    {
+      id: "accountless_enrollment", path: "/api/v1/accountless/enrollment", body: JSON.stringify(accountlessEnrollment),
+      authorization: undefined, origin: PUBLIC_ORIGIN, status: 201,
+    },
+    {
+      id: "accountless_ownership", path: "/api/v1/accountless/ownership", body: JSON.stringify(accountlessOwnership),
+      authorization: DEVICE_AUTHORIZATION, status: 201,
+    },
+    {
+      id: "accountless_telemetry_v12_authorization",
+      path: "/api/v1/accountless/telemetry-v1.2-authorization",
+      body: JSON.stringify(accountlessV12Authorization),
+      authorization: DEVICE_AUTHORIZATION, status: 201,
+    },
+    {
+      id: "accountless_renewal", path: "/api/v1/accountless/renewal", body: JSON.stringify(accountlessRenewal),
+      authorization: DEVICE_AUTHORIZATION, status: 200,
+    },
+    {
+      id: "device_disconnect", path: "/api/v1/device/disconnect", body: null,
+      authorization: DEVICE_AUTHORIZATION, status: 200,
+    },
+  ];
+  const { calls: metadataCalls, fetchImpl: metadata } = metadataFetch();
+  const backendCalls = [];
+  const logs = [];
+  const handler = createOauthGatewayHandler({
+    configuration: configuration(),
+    fetchImpl: async (input, options) => {
+      if (new URL(input).origin === "http://metadata.google.internal") return metadata(input, options);
+      const url = new URL(input);
+      backendCalls.push({ url, options });
+      const route = routes.find((candidate) => candidate.path === url.pathname);
+      assert.ok(route, `unexpected backend path ${url.pathname}`);
+      return new Response(JSON.stringify({ accepted: true }), {
+        status: route.status,
+        headers: { "content-type": "application/json" },
+      });
+    },
+    logger: (line) => logs.push(line),
+  });
+
+  for (const route of routes) {
+    const result = await invoke(handler, {
+      method: "POST",
+      url: route.path,
+      body: route.body,
+      headers: {
+        origin: route.origin,
+        ...(route.authorization === undefined ? {} : { authorization: route.authorization }),
+        "x-serverless-authorization": "Bearer caller-controlled",
+        "x-forwarded-host": "attacker.invalid",
+        "x-forwarded-proto": "http",
+        forwarded: "host=attacker.invalid;proto=http",
+        "cf-connecting-ip": "203.0.113.9",
+        "x-usage-monitor-csrf": "caller-controlled",
+      },
+    });
+    assert.equal(result.status, route.status, route.path);
+  }
+
+  assert.equal(backendCalls.length, routes.length);
+  assert.equal(metadataCalls.length, routes.length);
+  for (let index = 0; index < routes.length; index += 1) {
+    const route = routes[index];
+    const { url, options } = backendCalls[index];
+    assert.equal(url.origin, BACKEND_ORIGIN);
+    assert.equal(url.pathname, route.path);
+    assert.equal(url.search, "");
+    assert.equal(options.method, "POST");
+    assert.equal(options.headers.get("origin"), BACKEND_ORIGIN,
+      "the gateway validates any public Origin before translating it for the private hop");
+    assert.equal(options.headers.get("authorization"), route.authorization ?? null);
+    assert.equal(options.headers.get("cookie"), null);
+    assert.equal(options.headers.get("x-usage-monitor-csrf"), null);
+    assert.equal(options.headers.get("x-serverless-authorization"), `Bearer ${TOKEN}`);
+    for (const header of ["x-forwarded-host", "x-forwarded-proto", "forwarded", "cf-connecting-ip"]) {
+      assert.equal(options.headers.has(header), false, header);
+    }
+    if (route.body === null) {
+      assert.equal(options.headers.has("content-type"), false);
+      assert.equal(options.body, undefined);
+    } else {
+      assert.equal(options.headers.get("content-type"), "application/json");
+      assert.equal(options.body.toString("utf8"), route.body);
+      assert.ok(Buffer.byteLength(options.body) <= 512);
+    }
+  }
+  const serializedLogs = logs.join("\n");
+  for (const secret of [DEVICE_AUTHORIZATION, DEVICE_ID, "caller-controlled", "accountless-policy-v1"]) {
+    assert.equal(serializedLogs.includes(secret), false, `gateway logs leaked ${secret}`);
+  }
+  for (const route of routes) {
+    assert.ok(serializedLogs.includes(`"route":"${route.id}"`),
+    `missing route-only log entry for ${route.path}`);
+  }
+});
+
+test("accountless gateway routes reject method, origin, cookie, bearer, query, and size violations before forwarding", async () => {
+  const accountlessBody = JSON.stringify({
+    schemaVersion: "accountless-upload-owner-v0.1",
+    policyVersion: "accountless-opt-out-v1",
+    authorizationBasis: "accountless-policy-v1",
+    telemetrySchemaVersion: "telemetry-contribution-v1.1",
+  });
+  const routes = [
+    "/api/v1/accountless/enrollment",
+    "/api/v1/accountless/ownership",
+    "/api/v1/accountless/telemetry-v1.2-authorization",
+    "/api/v1/accountless/renewal",
+    "/api/v1/device/disconnect",
+  ];
+  const { calls: metadataCalls, fetchImpl: metadata } = metadataFetch();
+  let backendCalls = 0;
+  const handler = createOauthGatewayHandler({
+    configuration: configuration(),
+    fetchImpl: async (input, options) => {
+      if (new URL(input).origin === "http://metadata.google.internal") return metadata(input, options);
+      backendCalls += 1;
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    },
+    logger: () => {},
+  });
+  const cases = [];
+  for (const route of routes) {
+    cases.push({
+      name: `${route} rejects GET`,
+      options: { method: "GET", url: route, body: null, headers: { authorization: DEVICE_AUTHORIZATION } },
+      status: 405, code: "METHOD_NOT_ALLOWED",
+    });
+    cases.push({
+      name: `${route} rejects a query`,
+      options: { method: "POST", url: `${route}?unexpected=1`, body: route.endsWith("disconnect") ? null : accountlessBody, headers: { authorization: DEVICE_AUTHORIZATION } },
+      status: 404, code: "NOT_FOUND",
+    });
+    cases.push({
+      name: `${route} rejects a foreign Origin`,
+      options: { method: "POST", url: route, body: route.endsWith("disconnect") ? null : accountlessBody, headers: { authorization: DEVICE_AUTHORIZATION, origin: "https://attacker.invalid" } },
+      status: 403, code: "CSRF_INVALID",
+    });
+  }
+  for (const route of routes.slice(1)) {
+    cases.push({
+      name: `${route} requires the exact Device bearer`,
+      options: { method: "POST", url: route, body: route.endsWith("disconnect") ? null : accountlessBody },
+      status: 401, code: "DEVICE_AUTH_INVALID",
+    });
+    cases.push({
+      name: `${route} rejects bearer confusion`,
+      options: { method: "POST", url: route, body: route.endsWith("disconnect") ? null : accountlessBody, headers: { authorization: UPLOAD_AUTHORIZATION } },
+      status: 401, code: "DEVICE_AUTH_INVALID",
+    });
+    cases.push({
+      name: `${route} rejects ambient session cookies`,
+      options: { method: "POST", url: route, body: route.endsWith("disconnect") ? null : accountlessBody, headers: { authorization: DEVICE_AUTHORIZATION, cookie: SESSION_COOKIE } },
+      status: 401,
+      code: route === "/api/v1/accountless/renewal" ? "AUTH_INVALID" : "DEVICE_AUTH_INVALID",
+    });
+  }
+  cases.push(
+    {
+      name: "enrollment rejects session cookie",
+      options: { url: routes[0], body: accountlessBody, headers: { cookie: SESSION_COOKIE } },
+      status: 401, code: "AUTH_INVALID",
+    },
+    {
+      name: "enrollment rejects a supplied Device bearer instead of treating it as enrollment proof",
+      options: { url: routes[0], body: accountlessBody, headers: { authorization: DEVICE_AUTHORIZATION } },
+      status: 400, code: "AUTHORIZATION_INVALID",
+    },
+    {
+      name: "unimplemented performance authorization stays private",
+      options: { url: "/api/v1/accountless/telemetry-performance-authorization", body: accountlessBody, headers: { authorization: DEVICE_AUTHORIZATION } },
+      status: 404, code: "NOT_FOUND",
+    },
+    {
+      name: "accountless enrollment requires JSON",
+      options: { url: routes[0], body: accountlessBody, headers: { "content-type": "text/plain" } },
+      status: 415, code: "CONTENT_TYPE_INVALID",
+    },
+    {
+      name: "device disconnect accepts no request body",
+      options: { url: routes[4], body: "{}", headers: { authorization: DEVICE_AUTHORIZATION } },
+      status: 400, code: "BODY_INVALID",
+    },
+    {
+      name: "device disconnect rejects chunked body framing without Content-Length",
+      options: {
+        url: routes[4],
+        body: null,
+        stream: Readable.from([Buffer.from("{}")]),
+        headers: { authorization: DEVICE_AUTHORIZATION, "transfer-encoding": "chunked" },
+      },
+      status: 400, code: "BODY_INVALID",
+    },
+  );
+  for (const route of routes.slice(0, 4)) {
+    cases.push({
+      name: `${route} enforces the private 512-byte request cap`,
+      options: {
+        url: route,
+        body: "{}",
+        headers: {
+          ...(route === routes[0] ? {} : { authorization: DEVICE_AUTHORIZATION }),
+          "content-length": "513",
+        },
+      },
+      status: 413, code: "BODY_TOO_LARGE",
+    });
+  }
+
+  for (const item of cases) {
+    const result = await invoke(handler, item.options);
+    assert.equal(result.status, item.status, item.name);
+    assert.equal(result.json().error.code, item.code, item.name);
+  }
+  assert.equal(metadataCalls.length, 0);
+  assert.equal(backendCalls, 0, "every gateway contract violation fails before identity lookup or proxying");
+});
+
+test("accountless gateway preserves private refusals and enforces the response-size contract", async () => {
+  const body = JSON.stringify({
+    schemaVersion: "accountless-upload-owner-v0.1",
+    policyVersion: "accountless-opt-out-v1",
+    authorizationBasis: "accountless-policy-v1",
+    telemetrySchemaVersion: "telemetry-contribution-v1.1",
+  });
+  const { calls: metadataCalls, fetchImpl: metadata } = metadataFetch();
+  const backendPaths = [];
+  const handler = createOauthGatewayHandler({
+    configuration: configuration(),
+    fetchImpl: async (input, options) => {
+      if (new URL(input).origin === "http://metadata.google.internal") return metadata(input, options);
+      const path = new URL(input).pathname;
+      backendPaths.push(path);
+      if (path === "/api/v1/accountless/ownership") {
+        return new Response(JSON.stringify({ error: { code: "ACCOUNTLESS_OWNERSHIP_DISABLED", requestId: "synthetic-request" } }), {
+          status: 503,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("x".repeat(16 * 1_024 + 1), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+    logger: () => {},
+  });
+  const refused = await invoke(handler, {
+    url: "/api/v1/accountless/ownership",
+    body,
+    headers: { authorization: DEVICE_AUTHORIZATION },
+  });
+  assert.equal(refused.status, 503);
+  assert.deepEqual(refused.json(), {
+    error: { code: "ACCOUNTLESS_OWNERSHIP_DISABLED", requestId: "synthetic-request" },
+  });
+  const oversized = await invoke(handler, {
+    url: "/api/v1/accountless/renewal",
+    body,
+    headers: { authorization: DEVICE_AUTHORIZATION },
+  });
+  assert.equal(oversized.status, 502);
+  assert.equal(oversized.json().error.code, "UPSTREAM_UNAVAILABLE");
+  assert.deepEqual(backendPaths, ["/api/v1/accountless/ownership", "/api/v1/accountless/renewal"]);
+  assert.equal(metadataCalls.length, 2);
+});
+
 test("the public gateway exposes only the authenticated sync and v1.2 manifest GETs", async () => {
   const routes = [
     {
@@ -1534,7 +1829,7 @@ test("personal gateway routes reject unsupported methods, queries, bodies, and s
     { name: "revoke requires JSON", options: { url: "/api/v1/me/devices/revoke", body: "{}", headers: { ...csrf, "content-type": "text/plain" } }, status: 415, code: "CONTENT_TYPE_INVALID" },
     { name: "revoke rejects declared oversize body", options: { url: "/api/v1/me/devices/revoke", body: "{}", headers: { ...csrf, "content-length": String(2 * 1_024 * 1_024 + 1) } }, status: 413, code: "BODY_TOO_LARGE" },
     { name: "revoke rejects streamed oversize body", options: { url: "/api/v1/me/devices/revoke", body: null, stream: tooLargeStream, headers: { ...csrf, "transfer-encoding": "chunked", "content-type": "application/json" } }, status: 413, code: "BODY_TOO_LARGE" },
-    { name: "disconnect remains private", options: { method: "POST", url: "/api/v1/device/disconnect", body: "{}", headers: { authorization: DEVICE_AUTHORIZATION } }, status: 404, code: "NOT_FOUND" },
+    { name: "disconnect rejects a nonempty body before forwarding", options: { method: "POST", url: "/api/v1/device/disconnect", body: "{}", headers: { authorization: DEVICE_AUTHORIZATION } }, status: 400, code: "BODY_INVALID" },
   ];
 
   for (const item of cases) {

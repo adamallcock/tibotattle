@@ -170,6 +170,44 @@ const ROUTES = new Map([
     requireDeviceAuthorization: true, allowMissingOrigin: true, rejectCookie: true,
     originContract: "backend",
   })],
+  ["/api/v1/accountless/enrollment", Object.freeze({
+    id: "accountless_enrollment", method: "POST", body: "json", maxBodyBytes: 512,
+    responseTypes: ["application/json"], maxResponseBytes: 16 * 1_024,
+    // Enrollment is intentionally unauthenticated; the private handler applies
+    // its own closed body, mode, issuance-budget, and rate-limit checks.
+    sessionCookie: false, forwardAuthorization: false, rejectAuthorization: true,
+    allowMissingOrigin: true, rejectCookie: true,
+    cookieError: "AUTH_INVALID", cookieErrorStatus: 401,
+    originContract: "backend",
+  })],
+  ["/api/v1/accountless/ownership", Object.freeze({
+    id: "accountless_ownership", method: "POST", body: "json", maxBodyBytes: 512,
+    responseTypes: ["application/json"], maxResponseBytes: 16 * 1_024,
+    requireDeviceAuthorization: true, allowMissingOrigin: true, rejectCookie: true,
+    cookieError: "DEVICE_AUTH_INVALID", cookieErrorStatus: 401,
+    originContract: "backend",
+  })],
+  ["/api/v1/accountless/telemetry-v1.2-authorization", Object.freeze({
+    id: "accountless_telemetry_v12_authorization", method: "POST", body: "json", maxBodyBytes: 512,
+    responseTypes: ["application/json"], maxResponseBytes: 16 * 1_024,
+    requireDeviceAuthorization: true, allowMissingOrigin: true, rejectCookie: true,
+    cookieError: "DEVICE_AUTH_INVALID", cookieErrorStatus: 401,
+    originContract: "backend",
+  })],
+  ["/api/v1/accountless/renewal", Object.freeze({
+    id: "accountless_renewal", method: "POST", body: "json", maxBodyBytes: 512,
+    responseTypes: ["application/json"], maxResponseBytes: 16 * 1_024,
+    requireDeviceAuthorization: true, allowMissingOrigin: true, rejectCookie: true,
+    cookieError: "AUTH_INVALID", cookieErrorStatus: 401,
+    originContract: "backend",
+  })],
+  ["/api/v1/device/disconnect", Object.freeze({
+    id: "device_disconnect", method: "POST", body: "none", maxBodyBytes: 0,
+    responseTypes: ["application/json"], maxResponseBytes: 16 * 1_024,
+    requireDeviceAuthorization: true, allowMissingOrigin: true, rejectCookie: true,
+    cookieError: "DEVICE_AUTH_INVALID", cookieErrorStatus: 401,
+    originContract: "backend",
+  })],
 ]);
 const MAX_URL_LENGTH = 8_192;
 const MAX_ACTIVE_REQUESTS = 4;
@@ -404,6 +442,16 @@ function declaredBodyLength(headers, maximum) {
 
 async function readIncomingBody(request, route) {
   if (route.body === "none") {
+    // Worker and private PostgreSQL disconnect handlers use this exact
+    // content-length contract: an advertised nonempty body is malformed, not
+    // an oversized body. Keep the gateway refusal aligned for this route only.
+    if (route.id === "device_disconnect"
+        && request.headers["content-length"] !== undefined
+        && request.headers["content-length"] !== "0") {
+      const error = new Error("BODY_INVALID");
+      error.status = 400;
+      throw error;
+    }
     const length = declaredBodyLength(request.headers, 0);
     if ((length !== null && length !== 0) || request.headers["transfer-encoding"] !== undefined) {
       const error = new Error("BODY_INVALID");
