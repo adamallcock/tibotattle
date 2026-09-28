@@ -2,10 +2,16 @@
 title: Effective cache throughput follow-up
 date: 2026-09-27
 type: plan
-status: retry-candidate-in-qualification
+status: next-throughput-increment-in-progress
 ---
 
 # Effective cache throughput follow-up
+
+Latest state (September 28): corrected analytics source `32bd4091` is deployed
+at 100%. The 10:10 UTC follow-up confirms advancing effective checkpoints and a
+shrinking daily queue; completed graph throughput remains low. The retry and
+follow-up evidence and the proposed next experiments are recorded at the end of
+this plan. Earlier sections preserve preceding experiments and rollback evidence.
 
 The owner requested further performance work after the production canary for
 source `42e649333dcc04050214841089736692ac36d87b`. The read-only observation at
@@ -428,5 +434,283 @@ queue contained 204 daily dates and 2,094 stored graph results.
   an unchanged owner revision: 3,734,682 rows read and 1,985 ms for the proposed
   SQL versus 33,521,609 rows and 6,217 ms for the old SQL. This is one measured
   query comparison (8.98 times fewer rows, 3.13 times faster), not end-to-end
-  production throughput. The complete Worker gate, exact artifact and natural
-  scheduled canary remain required before declaring this retry successful.
+  production throughput. Worker validation, exact analytics artifact
+  qualification and a natural scheduled canary remain required before declaring
+  this retry successful.
+
+### Qualified retry candidate
+
+- Isolated candidate: `32bd409178ab6b0bca6588afeef4385449132459`, based on the
+  rolled-back lease candidate and retaining the production schema compatibility
+  adapter. The main checkout's unrelated changes were preserved.
+- Focused validation: 42 error/typed-reader cases and 33 integrated dependency,
+  effective-reader and compact-proof cases passed. Independent source review
+  found no concrete semantic or schema-boundary blockers.
+- The final source-derived query comparison at 08:40 UTC returned identical
+  dependency bytes under an unchanged owner revision: 3,734,682 rows / 1,870 ms
+  versus 33,521,609 rows / 5,912 ms. Synthetic tests independently cover
+  nonempty outside-day conflict headers and partial/missing proof refusal.
+- Exact analytics dry-build artifact: 1,376,916 bytes, SHA-256
+  `809a80faef905ac00211222cabc2f893f4fb3d78d1247e5dde472eded067d69c`.
+  Read-only production preflight matched the active predecessor, bindings,
+  runtime, cron, complete schema and migration ledger. The query cap remains
+  950 and the delivery catch-up boost remains absent.
+- Subsequent validation and production activation are recorded below; the
+  website artifact gap remains distinct from the qualified analytics build.
+
+### Retry activation and verification
+
+- The full Worker Vitest run passed all 2,138 cases across 167 files. Workspace
+  package, endpoint, generated-type, TypeScript and script checks passed. The
+  umbrella command then stopped at the unrelated website asset stage because
+  the isolated checkout lacks the generated public release manifest. General
+  website/staging dry builds remain unqualified. The exact analytics dry build
+  passed and its active/configured resources have no website assets binding.
+- Under the owner's retry authorization, activation began at
+  2026-09-28 09:04:51.973 UTC. Version
+  `b488c666-0903-448d-a178-066cd9d8d9fd`, source `32bd4091`, is active at 100%.
+  Independent readback at 09:05:06.857 UTC matched its exact version resources,
+  bindings, runtime, minute schedule, complete schema and migration ledger.
+- The pre-activation aggregate at 09:04:07 UTC contained 195 queued daily dates,
+  2,096 stored graph results and 65 prepared effective dates. Public model
+  publication remained September 27.
+- Natural-run observation targeted at least 16 ordinary invocations and two
+  completed long-pass logs, with rollback source `214a6d3` pinned. No migration,
+  forced run, cache reset or manual lease deletion was performed.
+
+### Initial retry canary completed
+
+- The version-filtered observer captured 18 distinct scheduled invocations
+  between 09:05:50 and 09:22:49 UTC: 16 ordinary runs and two long passes. All
+  reported `ok`; there were zero uncaught exceptions, emitted lane failures or
+  scheduler graph-failure fields. Statement counts ranged from 42 to 707,
+  below the unchanged 950 cap. The observer exited successfully and stopped.
+- One graph calculation completed, independently confirmed by the stored-result
+  count. It was a current-day v1 fit. The long passes at 09:10 and 09:20 both
+  ended successfully; only the first produced a new graph result. These short,
+  mostly idle runs do not qualify sustained effective-data processing.
+- Aggregate observations bracketed the deployment as follows. Publication runs
+  in its separate Worker, so the daily-queue change is system progress during
+  the observation window, not an isolated benchmark of this analytics change.
+
+| Aggregate | 09:04:07 UTC baseline | 09:23:37 UTC final sample |
+| --- | ---: | ---: |
+| Daily dates queued | 195 | 189 |
+| Oldest queued date | March 16 | March 22 |
+| Stored graph results | 2,096 | 2,097 |
+| Effective prepared dates | 65 | 65 |
+| Latest public model day | September 27 | September 27 |
+
+- The sampled effective checkpoint cursors did not advance. A bounded aggregate
+  check found 52 eligible public owners, two with effective inputs. The existing
+  pending effective selections belong to one currently eligible public owner;
+  their age cannot be dismissed as work for an ineligible owner. This remains a
+  concrete performance gap to investigate through selection/deferral evidence.
+- Final active-version verification at 09:23:38.264 UTC matched version
+  `b488c666-0903-448d-a178-066cd9d8d9fd`, source `32bd4091`, at 100%, with the
+  same bindings, runtime, schedule, complete schema and migration ledger.
+- The operation released its exact deployment coordination lock at
+  09:24:06.981 UTC. The candidate remains a clean local commit. The main
+  checkout retains the implementation and this updated evidence.
+
+The authorized deployment retry is complete and its initial stability sample is
+clean. The paired query is approximately 3.16 times faster, but this canary does
+not establish an end-to-end speedup or reliable completion of the heavy effective
+path. The remaining performance gate is observed effective checkpoint advancement
+and completed results under representative scheduled work.
+
+## Follow-up progress and proposed next steps (10:10 UTC)
+
+This is a read-only assessment requested by the owner. Version `b488c666`,
+source `32bd4091`, was reverified at 10:10:43 UTC with unchanged bindings,
+runtime, schedule and schema. No implementation or production setting changed
+for this assessment.
+
+| Signal | Previous sample, 09:23 UTC | Follow-up, 10:10 UTC |
+| --- | ---: | ---: |
+| Daily dates queued | 189 | 169 |
+| Stored graph results | 2,097 | 2,098 |
+| Effective prepared dates | 65 | 69 |
+| Current effective fits source cursor | July 10 / ordinal 4,422 | August 15 / ordinal 15,385 |
+| Current effective model source cursor | July 27 / ordinal 9,422 | August 21 / ordinal 17,014 |
+| Latest public model day | September 27 | September 27 |
+
+The queue contracted by 20 dates in approximately 47 minutes (about 25 per hour
+in this interval). This is an observed rate, not a completion forecast. The
+checkpoint dates describe source-history acquisition, not completed graph dates
+or a percentage complete. A 10:16 UTC result census identifies both graph results
+created since activation as v1 fits; no new effective graph completion is proven.
+
+Retained logs for 09:23:38–10:12:25 contain 44 ordinary and five long schedule
+records, with zero recorded lane failures or matches for the prior collection
+control, generic typed-unavailable and D1 CPU-limit error signatures. Samples
+include ordinary query-budget deferrals and many idle completions. This log
+query is not a claim that every service or exception type was exhaustively audited.
+
+### Measured remaining costs
+
+- D1 Insights for the elapsed portion of the 10:00 UTC hour show the effective
+  dependency query averaging 1,517 ms and 3,055,313 rows read over 108 calls,
+  with about 164 seconds of aggregate SQL time. The query is substantially
+  improved but still dominates the sampled source query costs. These database
+  statistics include all callers, rather than a per-Worker CPU profile.
+- The leading sampled analytics query is the v1 retirement delete: 171 calls,
+  99 ms and 27,521 rows read per call, with zero rows written. Separately,
+  schedule logs show 174–210 statements spent on sweeps in some runs with no
+  graph completion. The runtime repeats those sweeps inside its iteration loop.
+- Some long passes used only 125–135 total statements, while others used
+  737–748. Selection records and cursor movement show pending work still exists.
+  The exact reason each pass ends must be distinguished before changing
+  scheduling; an idle outer result is not proof that the entire backlog is empty.
+- Both source and analytics D1 databases report read replication disabled. The
+  deployed source calls `withSession` only through its forwarding adapter, not
+  from a reader, so enabling replication alone would not route current reads.
+
+### Recommended experiments, in order
+
+1. **Reduce repeated dependency validation.** Profile the remaining completeness
+   and linked-source lookup, then compare improved indexed SQL and reuse of
+   immutable dependency evidence within one invocation. Retain fresh owner,
+   correction, erasure and publication checks. Require exact dependency hashes,
+   source-change refusal and lower rows/time on the same corpus.
+2. **Remove repeated idle cleanup and selection work.** Bound retirement per
+   pass and stop retrying a cleanup lane after it reports no work, while keeping
+   erasure and capacity cleanup live. Record closed graph selection/deferral
+   reasons and test whether an empty history selection can safely yield to
+   pending current work in the same pass. Measure saved statements and durable
+   progress, including protection against starvation and competing claims.
+3. **Complete effective-day preparation deliberately.** Existing page grouping,
+   all-phase quota preparation, batched dependency headers and effective leases
+   are already deployed. The next experiment is bounded preparation of missing
+   exact owner-days, potentially extending the existing builder to effective
+   inputs, then a warm calculation of adjacent result days. Include preparation
+   cost; a larger cache alone does not prove a faster completed result.
+4. **Dispatch independent jobs with bounded concurrency.** Use explicit
+   owner/day/metric/dependency jobs, initially compare concurrency 1, 2 and 4,
+   and preserve one writer per mutable checkpoint. A durable dispatcher must
+   recover missing, expired and duplicate deliveries. Judge completed outputs,
+   database latency and public-service health. Queue consumer instances provide
+   concurrency without requiring a separate deployed script per job.
+   [Cloudflare Queues concurrency](https://developers.cloudflare.com/queues/configuration/consumer-concurrency/).
+5. **Trial replica reads when query demand justifies them.** Integrate Sessions
+   for stable pinned input reads and retain fresh authority/final checks. Verify
+   actual routing and compare throughput. Replicas forward writes to the primary
+   and do not raise the invocation query allowance.
+   [D1 replication](https://developers.cloudflare.com/d1/best-practices/read-replication/)
+   and [D1 limits](https://developers.cloudflare.com/d1/platform/limits/).
+
+Keep the analytics cap at 950 for these comparisons. Publication and the v1.1
+prepared-day builder already have separate Workers. R2 checkpoint storage,
+database sharding and a separate batch service remain later options if measured
+storage or primary-database capacity dominates after these changes. The next
+bounded implementation should combine dependency-query profiling with the
+cleanup/selection experiment before multiplying concurrent database demand.
+
+## Authorized implementation scope (September 28, 10:22 UTC)
+
+The owner approved proceeding with the first two options in the user-facing
+recommendation: reduce repeated database/cleanup/scheduling work, then complete
+effective-day cache coverage. Queue-based parallel jobs (option 3) and D1 read
+replicas (option 4) are explicitly retained as later enhancements. This increment
+keeps the existing single-checkpoint writer, deployment topology and 950 cap.
+
+Acceptance for the current increment:
+
+1. Compare dependency SQL against source `32bd4091` on identical synthetic
+   inputs, including incomplete admissions and cross-day conflicts; preserve
+   exact dependency output and reduce physical rows read.
+2. Bound repeated idle retirement and improve selection of runnable work without
+   starving cleanup, erasure, current results or historical results. Preserve
+   lease and checkpoint head fences and expose only closed aggregate diagnostics.
+3. Identify the smallest bounded way to complete missing effective days, measure
+   its preparation cost and prove a subsequent complete warm calculation. Retain
+   source/correction/authority invalidation and interrupted-write recovery.
+4. Run focused regressions, then the owning Worker gate and exact analytics dry
+   build. Keep source, artifact and production qualification separate.
+
+Implementation ownership is split across dependency SQL, runtime/selection and
+effective cache coverage; tests run serially. The deployed `32bd4091` commit is
+the comparison baseline, and existing main-checkout changes are preserved.
+
+### Measurements during implementation
+
+- At 10:32 UTC, the existing production version had 161 publication days queued,
+  2,098 completed graph results and 69 effective prepared owner-days. The fits
+  acquisition cursor had reached August 23 and the model cursor August 31.
+  These are baseline observations while the new increment is local.
+- The first dependency-query rewrite reduced rows in a small synthetic fixture
+  but regressed in paired, read-only production queries under an unchanged owner
+  revision. The 100-day query read 4,135,580 rows versus 3,734,682 on `32bd4091`;
+  the single-day query read 3,270,950 versus 3,031,824. All returned dependency
+  rows matched. That rewrite was rejected and its source changes removed.
+- At 10:37 UTC, the read-only selection portion of the v1 retirement query found
+  zero candidates in both versions. Starting with terminal owner fences read two
+  rows in 0.47 ms; the deployed join read 27,518 in 115.90 ms. No deletion was
+  executed remotely. Full deletion semantics and scheduler effects require local
+  tests; this is not an end-to-end production throughput measurement.
+- At 10:42 UTC, a read-only comparison of effective checkpoint inventories and
+  cache-head presence found the same missing input date, June 21, in every
+  sampled active effective scope. The September 28 window has 69 quota dates,
+  one absent date already behind the active cursors, and 4,858,856 bytes of
+  retained cached payloads. The September 27 window has 70 dates, the same hole
+  and 4,881,738 bytes. These byte counts are below the 8 MiB admission bound;
+  head presence alone does not establish current dependency validity. The
+  missing date is the adopted mid-day cursor in the original model checkpoint,
+  making targeted prefix preparation a concrete recovery opportunity.
+- The second query candidate retains deployed completeness/admission checks and
+  compares full canonical occurrence BLOBs before compatibility decoding. At
+  10:48 UTC, a paired read-only probe under an unchanged owner revision returned
+  identical dependency bytes. A single-day query read 1,123,324 rows in 355 ms
+  versus 3,031,824 in 1,734 ms; the 100-day query read 3,571,266 in 1,477 ms
+  versus 3,734,682 in 2,037 ms. These are one paired observation per scope,
+  not an overall processing multiplier. The dependency/completeness suite passes
+  34/34, including every source family, correction links, incomplete proofs and
+  compact/raw identifier distinctions.
+- The complete cleanup/selection test set passes 134/134. Its repeated busy-work
+  scenario reduces empty core sweeps from 256 to eight statements over 32
+  attempts. A synthetic v1 empty deletion reads five rows versus 27,530 under
+  the old SQL, with one statement and zero writes in both cases. Useful erasure
+  drains remain bounded to 200 rows; withdrawal/source isolation, mandatory
+  capacity and ledger cleanup, round-robin selection, live leases and scan CAS
+  remain covered. TypeScript also passes at this checkpoint.
+
+### Local qualification of the next increment
+
+The final cache implementation independently fills a known missing prefix with
+one bounded page between analytical steps. It checkpoints a completed reduced
+day before an optional cache write; interrupted or budget-deferred writes retain
+that ready value. Format 4 adopts formats 3, 2 and the original checkpoint while
+leaving the older heads available for rollback. Owner authority, dependency
+identity, result identity, the 950 cap and deployment topology are unchanged.
+
+- Codec and compatibility checks pass 29/29; cache checks pass 10/10. All 42
+  graph integration cases were verified: the combined run passed 51/52, and the
+  sole forced-CAS test required its old four-page expectation to reflect the
+  new one-page independent preparation boundary. Both CAS variants pass on
+  rerun, retaining their competing-head and final-result assertions. The full
+  candidate Worker gate is running; this focused result is not that gate.
+- The exact deployed-source dense benchmark uses 6,001 quota records over five
+  days plus 120 usage records. Cold plus two warm results cost 1,056 statements
+  on source `32bd4091` and 1,097 on the candidate, a 3.9% increase. The cold
+  result costs 725 versus 764; warm results cost 166/165 versus 167/166. Cold
+  source reads remain 31 quota pages. The added durable preparation boundaries
+  cost writes; no end-to-end speedup is claimed from this fixture.
+- A separate missing-prefix experiment compares the same candidate with optional
+  gap filling disabled and enabled, not the deployed source. Exact outputs are
+  equal. The current result costs 290 versus 295 statements, the following fit
+  219 versus 167, and two adjacent results remain 166 and 167. The four-result
+  total falls from 842 to 795 (5.6%); the current quota page count falls from
+  eight to six and all three following results need zero quota pages. The
+  synthetic one-gap shape matches the observed missing June 21 prefix, but its
+  timing is not a production forecast.
+- The small cold fixture uses 380 statements with preparation versus 405 without
+  it. Ready-cache writes resume without source rescans; many-part interrupted
+  successors, response loss, bounded refusals and exact source-fence changes
+  pass. Unfinished optional preparation may be dropped when analytical
+  acquisition completes; completed ready values remain durable.
+- Independent reviews found no actionable correctness issues in the SQL,
+  scheduler, retirement or cache changes. Source review and synthetic tests
+  remain separate from production verification.
+
+Queue-based parallel jobs (user-facing option 3) and D1 replica reads (option 4)
+remain explicitly deferred until this increment has a measured production result.

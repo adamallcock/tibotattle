@@ -100,6 +100,42 @@ async function nextMissingHistoricalModelPosition(target:D1Database,sourceId:str
  return position;
 }
 
+/** Empty historical slots can serve current work, but must not repeatedly
+ * validate a fully cached cohort. A durable selection remains pending even if
+ * an older result is present. This is only a scheduling hint: scope capture,
+ * epoch validation and the normal lease still govern the selected owner-day. */
+async function nextPendingCurrentPosition(target:D1Database,sourceId:string,owners:StorageCommunityOwner[],
+ position:number,day:string):Promise<number|null> {
+ const cached=new Map<string,CachedGraphResult['source_kind']>();
+ const digests=owners.flatMap(owner=>owner.ownerDigest?[owner.ownerDigest]:[]);
+ for(let offset=0;offset<digests.length;offset+=CURRENT_FIT_CACHE_PAGE) {
+  const page=digests.slice(offset,offset+CURRENT_FIT_CACHE_PAGE);
+  const rows=(await target.prepare(`SELECT r.owner_digest,r.metric,r.source_kind FROM analytics_community_graph_results r
+   WHERE r.source_id=? AND r.day=? AND r.method=? AND r.metric IN('fits','model')
+    AND r.owner_digest IN(${page.map(()=>'?').join(',')})
+    AND NOT EXISTS(SELECT 1 FROM analytics_community_graph_work_selection s
+     WHERE s.source_id=r.source_id AND s.owner_digest=r.owner_digest AND s.day=r.day AND s.metric=r.metric
+      AND s.state IN('pending','claimed'))
+   ORDER BY r.owner_digest,r.metric LIMIT ?`)
+   .bind(sourceId,day,STORAGE_GRAPH_METHOD,...page,page.length*2+1)
+   .all<CachedGraphResult&{metric:'fits'|'model'}>()).results;
+  if(rows.length>page.length*2)throw fail();
+  const expected=new Set(page);
+  for(const row of rows) {
+   const key=`${row.owner_digest}:${row.metric}`;
+   if(!expected.has(row.owner_digest)||!['fits','model'].includes(row.metric)
+    ||!['v0.2','v1','v1.1','mixed','effective'].includes(row.source_kind)||cached.has(key))throw fail();
+   cached.set(key,row.source_kind);
+  }
+ }
+ for(let offset=0;offset<owners.length*2;offset++) {
+  const index=(position+offset)%(owners.length*2),owner=owners[Math.floor(index/2)]!;
+  const metric=index%2===0?'fits':'model';
+  if(!owner.ownerDigest||cached.get(`${owner.ownerDigest}:${metric}`)!==ownerSource(owner))return index;
+ }
+ return null;
+}
+
 /** Fair selection is durable BEFORE an expensive query. One problematic source
  * cannot prevent every other source from advancing. One third of the service
  * goes to current fits/models, two thirds to the newest unfinished historical
@@ -150,7 +186,7 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
   .first<{revision:number;tick:number;current_position:number;history_position:number}>();
  if(!scan||![scan.revision,scan.tick,scan.current_position,scan.history_position].every(Number.isSafeInteger)
   ||scan.revision<1||scan.tick<0||scan.tick>2||scan.current_position<0||scan.history_position<0)throw fail();
- const current=scan.tick===0;
+ let current=scan.tick===0;
  let position=current?scan.current_position%(owners.length*2)
   :scan.history_position%owners.length;
  const today=new Date(nowMs).toISOString().slice(0,10);
@@ -170,6 +206,11 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
   for(let offset=1;offset<ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS;offset++) {
    const candidate=new Date(Date.parse(today)-offset*86400000).toISOString().slice(0,10);
    if(!completed.has(candidate)){day=candidate;break;}
+  }
+  if(day===null) {
+   const pending=await nextPendingCurrentPosition(options.target,options.sourceId,owners,
+    scan.current_position%(owners.length*2),today);
+   if(pending!==null){current=true;position=pending;day=today;}
   }
  }
  if(!current&&day!==null)position=await nextMissingHistoricalModelPosition(options.target,options.sourceId,owners,position,day);

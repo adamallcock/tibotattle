@@ -374,6 +374,20 @@ Ordinary graph retirement removes at most 32 obsolete selection rows per pass,
 preserving in-horizon pending work and unexpired claims except for erased owners.
 Erasure completion requires selection metadata to be absent as well.
 
+Within one analytics pass, a retirement lane that reports no work is not polled
+again until a producing lane makes progress. Each new invocation probes it again;
+productive sweeps continue draining bounded pages. Delivery progress rearms the
+ordinary sweeps, while erasure and capacity recovery keep their independent
+mandatory checks. The v1 sweep starts with terminal owner fences before looking
+up their retained chunks. Sweep counters measure actual executed rounds and
+statements, including a round that finds nothing.
+
+When all historical model days are published, a historical scheduling slot can
+serve missing or pending current fits/model work. Selection remains bounded by
+the existing cohort and round-robin cursor; completed selection rows do not make
+an already-cached result pending. Scope, authority, scan revision and claim leases
+still gate the work. Normal current slots continue checking for changed inputs.
+
 Overlapping effective calculations still use an exact checkpoint-head comparison.
 When a save confirms that another writer has promoted a newer active head for
 the same key, `checkpoint_advanced` is a normal deferral. The scheduler may
@@ -394,6 +408,10 @@ Effective candidate and inventory reads constrain the physical owner/stream/time
 index before decoding records. Cross-day source expansion retains all dates.
 The compact v1.1 completeness check uses namespace, format and original chunk
 identity together, retaining its admission proofs and manifest membership.
+Occurrence dependency matching compares the complete canonical stored ID,
+including its encoding tag, before compatibility decoding. It retains the
+original chunk completeness gates and outside-day/correction expansion; the
+returned dependency headers and calculation identities are unchanged.
 These query changes use existing indexes and do not require a migration.
 
 The typed reader preserves an internal, non-enumerable error cause. The graph
@@ -406,8 +424,20 @@ a database interruption, missing evidence or a masked budget refusal.
 With `GRAPH_DAY_PROJECTION_FOLD=enabled` and analytics migration
 `0028_graph_day_effective_quota.sql` present, effective-history calculations also
 prepare missing quota days during any of their four quota acquisition passes.
-Preparation starts only at a complete day boundary; an adopted mid-day cursor
-waits until another day or a later pass. Exact already-prepared days are skipped.
+Inline preparation starts only at a complete day boundary. An adopted mid-day
+cursor or earlier missing day can instead be filled by one independent, resumable
+preparation cursor under the same graph claim. It reads at most 200 occurrences
+per step and alternates with analytical progress. Only an absent day or an exact
+dependency mismatch can start this work; a budget or size refusal cannot.
+Exact already-prepared days are skipped. A deterministic preparation limit
+records that day as refused for this checkpoint identity and leaves the ordinary
+calculation available.
+
+The checkpoint holds at most one preparation buffer. A completed day is saved as
+a closed reduced value before attempting its cache write, and remains resumable
+until the day manifest is promoted. Budget exhaustion cannot silently drop that
+completed preparation. These preparation boundaries also stop the normal page
+group so interrupted multi-batch saves reproduce the same successor.
 Once preparation completes the whole window, the same job can retry the fold
 within its remaining query and time budget.
 Both fits and model results
@@ -430,7 +460,11 @@ days, then checks occurrence links separately for each exact day. The shared
 headers admit at most 30,000 rows and 4 MiB; overflow selects the paged fallback.
 The loader stops at the first stale day and verifies every dependency before
 decoding cached payloads. It preserves query reserves for an ordinary page or
-checkpoint save. This batching does not weaken source or owner fences.
+checkpoint save. Exact day digests may be reused within the same owner-bound
+invocation, with source-owner checks around their use and the target authority
+check before storage. A changed owner revision cannot reuse that memo. No digest
+memo persists across invocations. This batching does not weaken source or owner
+fences.
 
 Retirement also bounds the effective prepared cache to the input horizon of
 the scheduled graph: the oldest retained result day plus its existing model
@@ -439,10 +473,10 @@ values before their pages. This does not change source or daily-publication
 retention.
 
 Prepared effective checkpoints retain the original effective method names and
-isolate their storage dependency digest with the `effective-quota-days-3`
+isolate their storage dependency digest with the `effective-quota-days-4`
 format domain. Older independently deployed cleanup Workers recognize those
-methods. The prepared reader adopts the previous `effective-quota-days-2` key
-before trying the original paged key, and advances only the new key. The previous
+methods. The prepared reader adopts `effective-quota-days-3`, then
+`effective-quota-days-2`, then the original paged key, and advances only the new key. The previous
 keys remain for rollback until ordinary horizon or erasure cleanup; disabling
 the flag resumes the original unwrapped key. Completed result identities remain
 unchanged. After validated result readback, the analytics Worker marks the

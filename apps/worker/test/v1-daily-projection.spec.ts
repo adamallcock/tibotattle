@@ -244,6 +244,62 @@ describe('separate typed v1 analytical projection',()=>{
   expect(await retireV1DailyProjectionPage(target(),sourceId,1)).toEqual({state:'idle',deleted:0});
   expect(await read()).toBeNull();
  });
+ it('starts empty retirement at sparse terminal fences instead of scanning retained active chunks',async()=>{
+  const value=await seed();await insertTypedTelemetryV1Chunk(source(),value.insert,namespace);await step();
+  const active='a'.repeat(64),withdrawn='b'.repeat(64),erased='c'.repeat(64),otherSource='synthetic-other-retirement';
+  const copy=async(ownerDigest:string,amount:number,selectedSource=sourceId)=>target().prepare(`
+   WITH RECURSIVE slots(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM slots WHERE n<?)
+   INSERT INTO analytics_v1_chunk_values
+    (source_id,owner_digest,slot_digest,namespace_digest,device_digest,chunk_digest,event_digest,content_digest,
+     observed_day,chunk_revision,owner_revision,values_json)
+   SELECT ?,?,printf('%064x',n),v.namespace_digest,v.device_digest,v.chunk_digest,v.event_digest,v.content_digest,
+    v.observed_day,v.chunk_revision,v.owner_revision,v.values_json
+   FROM slots CROSS JOIN analytics_v1_chunk_values v WHERE v.source_id=? AND v.owner_digest=? LIMIT ?`)
+   .bind(amount,selectedSource,ownerDigest,sourceId,await owner(),amount).run();
+  await copy(active,27_520);await copy(withdrawn,3);await copy(erased,2,otherSource);
+  await target().batch([
+   target().prepare('INSERT INTO analytics_v1_owner_fences VALUES(?,?,1,1,?)').bind(sourceId,withdrawn,'owner-withdrawn'),
+   target().prepare('INSERT INTO analytics_v1_owner_fences VALUES(?,?,1,1,?)').bind(sourceId,erased,'owner-erased'),
+  ]);
+  // The exact previous query is the baseline. Both statements see the same
+  // empty retirement set; only their access path differs.
+  const previous=await target().prepare(`DELETE FROM analytics_v1_chunk_values WHERE (source_id,owner_digest,slot_digest) IN (
+   SELECT c.source_id,c.owner_digest,c.slot_digest FROM analytics_v1_owner_fences f
+   JOIN analytics_v1_chunk_values c ON c.source_id=f.source_id AND c.owner_digest=f.owner_digest
+   WHERE f.source_id=? AND f.state='owner-erased' ORDER BY c.owner_digest,c.slot_digest LIMIT ?) RETURNING slot_digest`)
+   .bind(sourceId,200).all();
+  let afterReads=0,afterWrites=0,queries=0;
+  const measured=new Proxy(target(),{get(db,key){
+   if(key==='prepare')return(sql:string)=>new Proxy(db.prepare(sql),{get(statement,member){
+    if(member==='bind')return(...args:unknown[])=>{const bound=statement.bind(...args);return new Proxy(bound,{get(s,method){
+     if(method==='all')return async()=>{queries++;const result=await s.all();
+      afterReads+=result.meta.rows_read;afterWrites+=result.meta.rows_written;return result;};
+     const value=Reflect.get(s,method);return typeof value==='function'?value.bind(s):value;
+    }});};
+    const value=Reflect.get(statement,member);return typeof value==='function'?value.bind(statement):value;
+   }});
+   const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;
+  }});
+  expect(previous.results).toEqual([]);
+  expect(await retireV1DailyProjectionPage(measured,sourceId)).toEqual({state:'idle',deleted:0});
+  expect(queries).toBe(1);expect(afterWrites).toBe(0);
+  expect(previous.meta.rows_read).toBeGreaterThanOrEqual(27_520);
+  expect(afterReads).toBeLessThanOrEqual(8);
+  console.log('v1 empty retirement resource probe',JSON.stringify({beforeRowsRead:previous.meta.rows_read,
+   afterRowsRead:afterReads,beforeStatements:1,afterStatements:queries}));
+  // Sparse erased work still drains, with the original 200-row bound and exact
+  // source isolation. A reversible withdrawal retains all its summaries.
+  await copy(erased,203);
+  expect(await retireV1DailyProjectionPage(target(),sourceId)).toEqual({state:'retiring',deleted:200});
+  expect(await retireV1DailyProjectionPage(target(),sourceId)).toEqual({state:'retiring',deleted:3});
+  expect(await retireV1DailyProjectionPage(target(),sourceId)).toEqual({state:'idle',deleted:0});
+  expect(await target().prepare('SELECT count(*) n FROM analytics_v1_chunk_values WHERE source_id=? AND owner_digest=?')
+   .bind(sourceId,active).first('n')).toBe(27_520);
+  expect(await target().prepare('SELECT count(*) n FROM analytics_v1_chunk_values WHERE source_id=? AND owner_digest=?')
+   .bind(sourceId,withdrawn).first('n')).toBe(3);
+  expect(await target().prepare('SELECT count(*) n FROM analytics_v1_chunk_values WHERE source_id=? AND owner_digest=?')
+   .bind(otherSource,erased).first('n')).toBe(2);
+ });
  it('rejects a wrong namespace and refuses page continuation after source mutation',async()=>{
   const a=await seed();const b=await seed('quota',1,a.fixture);await insertTypedTelemetryV1Chunk(source(),a.insert,namespace);
   await insertTypedTelemetryV1Chunk(source(),b.insert,namespace);

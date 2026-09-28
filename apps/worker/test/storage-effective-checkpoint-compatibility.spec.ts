@@ -103,18 +103,21 @@ describe('effective checkpoint format keys shared with older workers', () => {
     expect(await storageGraphEffectiveCheckpointKey(original, false)).toEqual(original);
     expect(await storageGraphEffectiveCheckpointKey(original, false, 2)).toEqual(original);
     expect(await storageGraphEffectiveCheckpointKey(original, false, 3)).toEqual(original);
+    expect(await storageGraphEffectiveCheckpointKey(original, false, 4)).toEqual(original);
     const previous = await storageGraphEffectiveCheckpointKey(original, true, 2);
+    const latePhase = await storageGraphEffectiveCheckpointKey(original, true, 3);
     const prepared = await storageGraphEffectiveCheckpointKey(original, true);
     expect(prepared).toEqual({ ...original, dependencyDigest: expect.stringMatching(/^[a-f0-9]{64}$/u) });
-    // Pin both durable namespaces: v2 remains available for adoption/rollback,
-    // while only v3 may hold preparation started in a later acquisition phase.
+    // Pin every durable namespace: earlier writers retain their rollback
+    // heads, and only v4 may hold an independent gap or a ready-to-store day.
     expect(previous).toEqual({ ...original, dependencyDigest: '879d09906bdb08f12308f489840f82c83b61c72da6983c2cb2abcc660917eab4' });
-    expect(prepared.dependencyDigest).toBe('bf2a2695d3f1dbffda73105d80b5c11b0f45f76c4a91a0784d09628fd3ccdeb4');
-    expect(await storageGraphEffectiveCheckpointKey(original, true, 3)).toEqual(prepared);
+    expect(latePhase.dependencyDigest).toBe('bf2a2695d3f1dbffda73105d80b5c11b0f45f76c4a91a0784d09628fd3ccdeb4');
+    expect(prepared.dependencyDigest).toBe('11bd69df176fa7fd13ad2b6a4dde6763b6e6aa6b294711167c2f00a3edbe0906');
+    expect(await storageGraphEffectiveCheckpointKey(original, true, 4)).toEqual(prepared);
     expect(await storageGraphEffectiveCheckpointKey(original, true)).toEqual(prepared);
     const changedDependency = await storageGraphEffectiveCheckpointKey({ ...original, dependencyDigest: 'd'.repeat(64) }, true);
     expect(changedDependency.dependencyDigest).not.toBe(prepared.dependencyDigest);
-    expect(new Set(await Promise.all([original, previous, prepared].map(storageHistoryKeyDigest))).size).toBe(3);
+    expect(new Set(await Promise.all([original, previous, latePhase, prepared].map(storageHistoryKeyDigest))).size).toBe(4);
     expect(STORAGE_GRAPH_LIVE_CHECKPOINT_METHODS).toContain(prepared.method);
     // This is the same seven-method registry the pre-cache retirement caller
     // understands, so no registration or cleanup-policy expansion enables it.
@@ -125,16 +128,19 @@ describe('effective checkpoint format keys shared with older workers', () => {
   it.each(['fits', 'model'] as const)('preserves the %s prepared key through old-method cleanup and a matching old-format result', async metric => {
     const original = baseKey(metric);
     const previous = await storageGraphEffectiveCheckpointKey(original, true, 2);
+    const latePhase = await storageGraphEffectiveCheckpointKey(original, true, 3);
     const prepared = await storageGraphEffectiveCheckpointKey(original, true);
     const abandoned = { ...original, method: `${original.method}:quota-days-1` };
     expect(await retireStorageHistoryCheckpoint({ target: target(), key: abandoned, expectedHead: null }))
       .toEqual({ status: 'retired' });
     const oldHead = await save(original, false);
     const previousHead = await save(previous, true);
+    const lateHead = await save(latePhase, true);
     const preparedHead = await save(prepared, true);
     await drainRetirement();
     expect(await read(original)).toMatchObject({ status: 'ready', headDigest: oldHead, checkpoint: checkpoint(false) });
     expect(await read(previous)).toMatchObject({ status: 'ready', headDigest: previousHead, checkpoint: checkpoint(true) });
+    expect(await read(latePhase)).toMatchObject({ status: 'ready', headDigest: lateHead, checkpoint: checkpoint(true) });
     expect(await read(prepared)).toMatchObject({ status: 'ready', headDigest: preparedHead, checkpoint: checkpoint(true) });
     await expectRetired(abandoned);
 
@@ -146,6 +152,7 @@ describe('effective checkpoint format keys shared with older workers', () => {
     await drainRetirement();
     await expectRetired(original);
     expect(await read(previous)).toMatchObject({ status: 'ready', headDigest: previousHead, checkpoint: checkpoint(true) });
+    expect(await read(latePhase)).toMatchObject({ status: 'ready', headDigest: lateHead, checkpoint: checkpoint(true) });
     expect(await read(prepared)).toMatchObject({ status: 'ready', headDigest: preparedHead, checkpoint: checkpoint(true) });
     await expectRetired(abandoned);
     expect(await target().prepare('SELECT count(*) n FROM analytics_community_graph_results').first('n')).toBe(1);
@@ -155,6 +162,7 @@ describe('effective checkpoint format keys shared with older workers', () => {
     const keys = await Promise.all((['fits', 'model'] as const).flatMap(metric => [
       Promise.resolve(baseKey(metric)),
       storageGraphEffectiveCheckpointKey(baseKey(metric), true, 2),
+      storageGraphEffectiveCheckpointKey(baseKey(metric), true, 3),
       storageGraphEffectiveCheckpointKey(baseKey(metric), true),
     ]));
     for (const key of keys) await save(key, true);
@@ -171,8 +179,8 @@ describe('effective checkpoint format keys shared with older workers', () => {
       .bind(sourceId, ownerDigest).first('terminal_revision')).toBe(2);
   });
 
-  it('keeps both prepared formats through their final retained UTC day and retires them at the next boundary', async () => {
-    const keys = await Promise.all(([2, 3] as const).map(format => storageGraphEffectiveCheckpointKey(baseKey('model'), true, format)));
+  it('keeps all prepared formats through their final retained UTC day and retires them at the next boundary', async () => {
+    const keys = await Promise.all(([2, 3, 4] as const).map(format => storageGraphEffectiveCheckpointKey(baseKey('model'), true, format)));
     const heads = [];
     for (const key of keys) heads.push(await save(key, true));
     const finalDay = Date.parse(`${day}T00:00:00.000Z`) + (ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS - 1) * 86_400_000;

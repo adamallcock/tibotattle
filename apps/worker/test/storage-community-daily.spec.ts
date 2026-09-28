@@ -31,6 +31,9 @@ import { initializeTypedV1Admission } from "../src/typed-v1-admission";
 import { initializeStorageAnalyticsRuntime, runStorageAnalyticsPass, advanceStorageAnalytics } from "../src/storage-analytics-runtime";
 import { runStorageAnalyticsSchedule } from "../src/storage-analytics-worker";
 import * as storageCommunityGraphWork from '../src/storage-community-graph-work';
+import * as v1Projection from '../src/v1-daily-projection';
+import * as v11Projection from '../src/v11-daily-projection';
+import * as graphRetirement from '../src/storage-graph-retirement';
 import { createD1InvocationBudget } from '../src/d1-invocation-budget';
 import { StorageGraphOperationError } from '../src/storage-analytics-failure';
 
@@ -622,7 +625,7 @@ describe('independent public daily publication',()=>{
     expect(matching(/^ledger:/)).toEqual([]);
     expect(matching(/storage_erasure_jobs/)).toEqual([]);
     expect(matching(/SELECT event_digest,owner_digest FROM analytics_v11_projection_work/)).toEqual([]);
-    expect(matching(/analytics_v1_owner_fences f JOIN analytics_v1_chunk_values c/)).toEqual([]);
+    expect(matching(/analytics_v1_owner_fences f CROSS JOIN analytics_v1_chunk_values c/)).toEqual([]);
     expect(matching(/analytics_graph_erasure_receipts/)).toEqual([]);
     expect(matching(/WITH members AS MATERIALIZED/)).toEqual([]);
     expect(matching(/UPDATE analytics_community_graph_scan/)).toHaveLength(1);
@@ -632,8 +635,110 @@ describe('independent public daily publication',()=>{
     await runStorageAnalyticsPass({...options(),...watched,publishCommunity:true,publicOnly:true,
       maxSteps:1,maxQueries:900,deadlineMs:Date.now()+55_000});
     for(const pattern of [/^ledger:.*storage_erasure_jobs/,/SELECT event_digest,owner_digest FROM analytics_v11_projection_work/,
-      /analytics_v1_owner_fences f JOIN analytics_v1_chunk_values c/,/analytics_graph_erasure_receipts/,
+      /analytics_v1_owner_fences f CROSS JOIN analytics_v1_chunk_values c/,/analytics_graph_erasure_receipts/,
       /WITH members AS MATERIALIZED/]) expect(matching(pattern).length).toBeGreaterThan(0);
+  });
+  describe('invocation-local empty retirement suppression',()=>{
+    afterEach(()=>{vi.restoreAllMocks();});
+    const busyPass=(extra:Partial<Parameters<typeof runStorageAnalyticsPass>[0]>={})=>
+      runStorageAnalyticsPass({...options(),publishCommunity:true,publicOnly:true,skipPublication:true,
+        maxSteps:32,maxQueries:950,deadlineMs:Date.now()+60_000,...extra});
+
+    it('probes empty sweeps once during repeated busy claims and starts fresh next invocation',async()=>{
+      // Reproduce the previous scheduler's three unconditional empty sweeps
+      // with a real shared D1 meter; their contents are unchanged by the pass.
+      const baseline=createD1InvocationBudget(950),database=baseline.wrap(target());
+      for(let step=0;step<32;step++){
+        await v11Projection.retireV11DailyProjectionPage(database,sourceId);
+        await v1Projection.retireV1DailyProjectionPage(database,sourceId);
+        await graphRetirement.retireStorageGraphPage(database,sourceId);
+      }
+      const v11=vi.spyOn(v11Projection,'retireV11DailyProjectionPage');
+      const v1=vi.spyOn(v1Projection,'retireV1DailyProjectionPage');
+      const graphSweep=vi.spyOn(graphRetirement,'retireStorageGraphPage');
+      const graph=vi.spyOn(storageCommunityGraphWork,'advanceStorageCommunityGraphWork')
+        .mockResolvedValue({state:'deferred',reason:'selection_busy'});
+      const result=await busyPass();
+      expect(result).toMatchObject({state:'progress',reason:'step_limit',steps:32,graphCalculations:0,
+        sweepIterations:1,sweepV11Worked:0,sweepV1Worked:0,sweepGraphWorked:0});
+      expect(v11).toHaveBeenCalledTimes(1);expect(v1).toHaveBeenCalledTimes(1);expect(graphSweep).toHaveBeenCalledTimes(1);
+      expect(graph).toHaveBeenCalledTimes(32);
+      expect(result.sweepQueries!*32).toBe(baseline.queriesUsed);
+      expect(result.queriesUsed).toBeLessThanOrEqual(950);
+      console.log('empty retirement pass resource probe',JSON.stringify({beforeSweepStatements:baseline.queriesUsed,
+        afterSweepStatements:result.sweepQueries,afterPassStatements:result.queriesUsed,steps:result.steps}));
+      await busyPass({maxSteps:1});
+      expect(v11).toHaveBeenCalledTimes(2);expect(v1).toHaveBeenCalledTimes(2);expect(graphSweep).toHaveBeenCalledTimes(2);
+    });
+
+    it('continues bounded useful retirement until an empty page, despite a busy graph',async()=>{
+      const value=await seedV1();await insertTypedTelemetryV1Chunk(source(),value.insert,namespace);await ready();
+      const owner=(await readStorageCommunityOwnerPage(source()))[0]!.ownerDigest!;
+      await target().prepare(`WITH RECURSIVE slots(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM slots WHERE n<202)
+        INSERT INTO analytics_v1_chunk_values SELECT v.source_id,v.owner_digest,printf('%064x',n),v.namespace_digest,
+        v.device_digest,v.chunk_digest,v.event_digest,v.content_digest,v.observed_day,v.chunk_revision,v.owner_revision,v.values_json
+        FROM slots CROSS JOIN analytics_v1_chunk_values v WHERE v.source_id=? AND v.owner_digest=?`)
+        .bind(sourceId,owner).run();
+      await target().prepare("INSERT INTO analytics_v1_owner_fences VALUES(?,?,1,1,'owner-erased')").bind(sourceId,owner).run();
+      const retirement=vi.spyOn(v1Projection,'retireV1DailyProjectionPage');
+      vi.spyOn(storageCommunityGraphWork,'advanceStorageCommunityGraphWork').mockResolvedValue({state:'deferred',reason:'selection_busy'});
+      const result=await busyPass({maxSteps:8});
+      expect(result).toMatchObject({steps:8,sweepIterations:3,sweepV1Worked:2,sweepV11Worked:0,sweepGraphWorked:0});
+      expect(retirement).toHaveBeenCalledTimes(3);
+      expect(await target().prepare('SELECT count(*) n FROM analytics_v1_chunk_values WHERE source_id=? AND owner_digest=?')
+        .bind(sourceId,owner).first('n')).toBe(0);
+    });
+
+    it('rearms graph cleanup after completion without reopening unrelated empty sweeps',async()=>{
+      const v11=vi.spyOn(v11Projection,'retireV11DailyProjectionPage');
+      const v1=vi.spyOn(v1Projection,'retireV1DailyProjectionPage');
+      const graphSweep=vi.spyOn(graphRetirement,'retireStorageGraphPage');
+      vi.spyOn(storageCommunityGraphWork,'advanceStorageCommunityGraphWork')
+        .mockResolvedValueOnce({state:'complete',metric:'fits',day:today()})
+        .mockResolvedValue({state:'deferred',reason:'budget'});
+      const result=await busyPass({maxSteps:4});
+      expect(result).toMatchObject({steps:4,graphCalculations:1,sweepIterations:2});
+      expect(v11).toHaveBeenCalledTimes(1);expect(v1).toHaveBeenCalledTimes(1);expect(graphSweep).toHaveBeenCalledTimes(2);
+    });
+
+    it('rearms empty cleanup when the next delivered event erases an owner',async()=>{
+      const value=await seedV1();await insertTypedTelemetryV1Chunk(source(),value.insert,namespace);await ready();
+      const retirement=vi.spyOn(v1Projection,'retireV1DailyProjectionPage');
+      vi.spyOn(storageCommunityGraphWork,'advanceStorageCommunityGraphWork').mockImplementationOnce(async()=>{
+        expect(retirement).toHaveBeenCalledTimes(1);
+        await source().prepare('DELETE FROM participants WHERE id=?').bind(value.fixture.participantId).run();
+        return {state:'deferred',reason:'selection_busy'};
+      }).mockResolvedValue({state:'deferred',reason:'selection_busy'});
+      const result=await busyPass({publicOnly:false,skipV1PrefixProbe:true,maxSteps:3});
+      expect(result.sweepV1Worked).toBe(1);
+      expect(retirement.mock.calls.length).toBeGreaterThanOrEqual(2);
+      expect(await target().prepare('SELECT count(*) n FROM analytics_v1_chunk_values WHERE source_id=?').bind(sourceId).first('n')).toBe(0);
+      expect(await target().prepare("SELECT count(*) n FROM analytics_v1_owner_fences WHERE source_id=? AND state='owner-erased'")
+        .bind(sourceId).first('n')).toBe(1);
+    });
+
+    it('keeps erasure admission and all capacity recovery sweeps mandatory',async()=>{
+      const seen:string[]=[];
+      const ledger=new Proxy(b.DELETION_LEDGER,{get(db,key){
+        if(key==='prepare')return(sql:string)=>{seen.push(sql);return db.prepare(sql);};
+        const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;
+      }});
+      const full=new Proxy(target(),{get(db,key){
+        if(key==='prepare')return(sql:string)=>{
+          seen.push(sql);const statement=db.prepare(sql);
+          if(sql!=='SELECT 1 AS capacity_probe')return statement;
+          return new Proxy(statement,{get(s,method){
+            if(method==='run')return async()=>{const result=await s.run();return {...result,meta:{...result.meta,size_after:10_000_000_000}};};
+            const value=Reflect.get(s,method);return typeof value==='function'?value.bind(s):value;
+          }});
+        };
+        const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;
+      }});
+      expect(await busyPass({target:full,ledger})).toMatchObject({state:'deferred',reason:'capacity',steps:0});
+      for(const pattern of [/storage_erasure_jobs/,/analytics_v11_projection_work/,/analytics_v1_owner_fences/,
+        /analytics_graph_erasure_receipts/,/analytics_graph_day_values/,/analytics_community_daily_publications/,
+        /analytics_community_model_publications/])expect(seen.some(sql=>pattern.test(sql))).toBe(true);
+    });
   });
   it('keeps returning to the graph lane on a budget where the minute pass reserves a whole attempt',async()=>{
     await fixture();await ready();

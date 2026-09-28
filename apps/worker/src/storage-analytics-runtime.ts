@@ -269,9 +269,8 @@ export interface StorageAnalyticsPass {
  state:'idle'|'progress'|'deferred';steps:number;recordsRead:number;queriesUsed:number;
  dailyPublications:number;graphCalculations:number;
  /** Statements the three retirement sweeps took, and how often each found work.
-  * They run on every iteration of the hot loop regardless of whether the pass's
-  * own lane did anything, so without these a pass that spent its whole meter
-  * reclaiming space is indistinguishable from one that was simply idle.
+  * Empty sweeps sleep for this pass until a producing lane makes progress;
+  * iterations counts only rounds in which at least one sweep actually ran.
   *
   * Absent on a lane that does not run them, such as the catch-up pass. */
  sweepQueries?:number;sweepIterations?:number;
@@ -380,12 +379,16 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
  let steps=0,recordsRead=0,dailyPublications=0,graphCalculations=0,graphFailure:StorageGraphFailureFields|undefined;
  let graphCheckpointAdvances=0;
  let graphDayProjection:StorageGraphDayProjectionFields|undefined;
- // The three retirement sweeps run on EVERY iteration of the hot loop,
- // including a public-only pass whose own step is a no-op. A pass that
- // published nothing can still spend most of its meter here, which is
- // indistinguishable in the summary from a pass that had nothing to do — and
- // that ambiguity hid the graph lane being starved. These attribute the spend.
+ // Attribute actual retirement spend separately from useful calculation work.
  const sweep={queries:0,v11Worked:0,v1Worked:0,graphWorked:0,iterations:0};
+ type RetirementLane='v11'|'v1'|'graph'|'projection'|'daily'|'publication';
+ const emptyRetirement=new Set<RetirementLane>();
+ const idlePage={state:'idle' as const};
+ const retire=async(lane:RetirementLane,work:()=>Promise<boolean>)=>{
+  if(emptyRetirement.has(lane))return idlePage;
+  if(await work())return {state:'retiring' as const};
+  emptyRetirement.add(lane);return idlePage;
+ };
  const result=(state:StorageAnalyticsPass['state'],reason:StorageAnalyticsPass['reason']):StorageAnalyticsPass=>
   ({state,reason,steps,recordsRead,queriesUsed:meter.queriesUsed,dailyPublications,graphCalculations,
    sweepQueries:sweep.queries,sweepIterations:sweep.iterations,
@@ -493,17 +496,24 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
    const step=options.publicOnly?{state:'idle' as const,recordsRead:0}
     :page&&page.events>0?page:await advanceStorageAnalytics({...scoped,maxV11PhysicalPages:v11Pages,deadlineMs});
    steps+=!options.publicOnly&&page&&page.events>0?page.events:1;recordsRead+=step.recordsRead;
+   // This is invocation-local: every new pass probes every enabled cleanup
+   // lane again. Delivery can create terminal/superseded work in any store, so
+   // progress rearms them all. The independent erasure and capacity paths above
+   // always run, even after an ordinary sweep previously found no work.
+   if(step.state!=='idle')emptyRetirement.clear();
    // Retiring old generations cannot be starved by an always-busy journal. The
    // graph-only pass leaves those bounded pages to the minute schedule, which
    // keeps running them, and gives its whole window to one resumable claim.
-   const idlePage={state:'idle' as const};
    const sweepBefore=meter.queriesUsed;
-   const v11=options.graphOnly?idlePage:await retireV11DailyProjectionPage(scoped.target,options.sourceId);
-   const v1=options.graphOnly?idlePage:await retireV1DailyProjectionPage(scoped.target,options.sourceId);
-   const retiredGraph=options.graphOnly?idlePage:await retireStorageGraphPage(scoped.target,options.sourceId);
+   const v11=options.graphOnly?idlePage:await retire('v11',async()=>
+    (await retireV11DailyProjectionPage(scoped.target,options.sourceId)).state!=='idle');
+   const v1=options.graphOnly?idlePage:await retire('v1',async()=>
+    (await retireV1DailyProjectionPage(scoped.target,options.sourceId)).state!=='idle');
+   const retiredGraph=options.graphOnly?idlePage:await retire('graph',async()=>
+    (await retireStorageGraphPage(scoped.target,options.sourceId)).state!=='idle');
    if(!options.graphOnly){
     sweep.queries+=meter.queriesUsed-sweepBefore;
-    sweep.iterations+=1;
+    if(meter.queriesUsed>sweepBefore)sweep.iterations+=1;
     if(v11.state!=='idle')sweep.v11Worked+=1;
     if(v1.state!=='idle')sweep.v1Worked+=1;
     if(retiredGraph.state!=='idle')sweep.graphWorked+=1;
@@ -521,7 +531,7 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
     &&options.buildGraphDayProjections===true;
    const projectionLane=options.buildGraphDayProjections===true&&(!options.graphOnly||longPassBuild);
    const retiredProjection=(projectionLane||options.foldGraphDayProjections===true)&&!options.graphOnly
-    ?await retireGraphDayProjectionPage(scoped.target,options.sourceId):idlePage;
+    ?await retire('projection',async()=>(await retireGraphDayProjectionPage(scoped.target,options.sourceId)).state!=='idle'):idlePage;
    let publicIdle=true,graphRan=false;
    let projectionIdle=true,projectionRan=false;
    const runProjectionLane=async(slot:'opening'|'trailing'|'long'):Promise<void>=>{
@@ -566,6 +576,7 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
         :opening?{maxDays:GRAPH_DAY_PROJECTION_OPEN_DAYS}:{}),
        ...(options.graphDayProjectionFromDay===undefined?{}:{fromDay:options.graphDayProjectionFromDay})});
       projectionIdle=lane.state==='idle';
+      if(lane.built>0)emptyRetirement.delete('projection');
       // A pass runs several iterations, so the counters ACCUMULATE. Reporting
       // only the last one hides the work: a pass that built its whole selection
       // in the first iteration then reports zero candidates from the second.
@@ -644,7 +655,7 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
        for(let attempt=0;attempt<dailyAttempts&&deadlineMs-Date.now()>=(attempt===0?5_000:15_000);attempt++){
         const slot=Math.floor(Date.now()/60_000)+attempt;
         const daily=await advanceNextStorageCommunityDaily({...dailyScoped,preferStaleHead:slot%4!==3,skipDays});
-        if(daily.state==='published')dailyPublications++;
+        if(daily.state==='published'){dailyPublications++;emptyRetirement.delete('daily');}
         if(daily.state==='idle'){dailyIdle=true;break;}
         // A day waiting on a pending projection or on capacity yields to the
         // next candidate within this pass; one blocked day cannot hold the lane.
@@ -656,7 +667,8 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
        else laneFailure('daily_publish',error);
       }
      }
-     try{await retireStorageCommunityDailyPage(scoped);}catch(error){laneFailure('daily_publish',error);}
+     try{await retire('daily',async()=>(await retireStorageCommunityDailyPage(scoped))>0);}
+     catch(error){laneFailure('daily_publish',error);}
      return dailyIdle;
     };
     // A graph attempt that failed or was deferred with a recorded failure has
@@ -680,11 +692,19 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
        ...(options.foldGraphDayProjections===undefined?{}:{preparedFold:options.foldGraphDayProjections})});
       if(graph.failure)graphFailure??=graph.failure;
       if(graph.state==='complete')graphCalculations++;
+      // A deferred attempt is not proof of a durable write. In particular a
+      // busy lease must not reopen every empty sweep on every iteration.
+      // Checkpoint debris from an unfinished attempt is bounded and the next
+      // invocation probes it again; completed work may retire its head now.
+      if(graph.state==='complete'||graph.state==='reused'){
+       emptyRetirement.delete('graph');emptyRetirement.delete('projection');
+      }
       if((graph.state==='complete'||graph.state==='reused')&&meter.remainingQueries>=250&&Date.now()<deadlineMs) {
+       emptyRetirement.delete('publication');
        if(graph.metric==='model'&&graph.day)await publishStorageCommunityModelDay(scoped,{day:graph.day});
        if(meter.remainingQueries>=250&&Date.now()<deadlineMs)await publishStorageCommunityGraphPreview(scoped);
       }
-      if(meter.remainingQueries>=30)await retireStorageCommunityGraphPublications(scoped);
+      if(meter.remainingQueries>=30)await retire('publication',async()=>(await retireStorageCommunityGraphPublications(scoped))>0);
      }catch(error){laneFailure('graph_work',error);}
      if(graph.failure||graph.reason==='graph_failure')graphExhausted=true;
      // A verified newer checkpoint is safe to reload with this same meter and

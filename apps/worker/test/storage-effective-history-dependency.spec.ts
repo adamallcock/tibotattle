@@ -43,6 +43,7 @@ import { advanceV11QuotaAcquisition, V11_QUOTA_ACQUISITION_PAGE_SIZE,
   type V11QuotaPageReader } from "../src/quota-analysis-v11-reader";
 import type { StorageCommunityOwner } from "../src/storage-community-authority";
 import { createD1InvocationBudget } from "../src/d1-invocation-budget";
+import dependencySqlBaseline from "./fixtures/effective-history-dependency-32bd4091.json";
 
 const b = env as Env & {
   TEST_MIGRATIONS: D1Migration[];
@@ -86,9 +87,10 @@ async function stage(fixture: Fixture, prepared: Prepared): Promise<Staged> {
 }
 
 async function insertV1HistoryDay(fixture: Fixture, selectedDay: string, revision: number,
-  supersedes: Awaited<ReturnType<typeof currentTelemetryV1Chunk>> = null) {
+  supersedes: Awaited<ReturnType<typeof currentTelemetryV1Chunk>> = null,
+  occurrenceId = `event:v2:synthetic-v1-${selectedDay}`) {
   const projected = telemetryV11LegacyProjection("usage", v11UsageRecord(selectedDay, "a", {
-    eventId: `event:v2:synthetic-v1-${selectedDay}`,
+    eventId: occurrenceId,
     totalInputContextTokens: revision > 1 ? 150 : null,
     components: { inputUncachedTokens: 100, inputCacheReadTokens: null, inputCacheWriteTokens: null,
       outputTextTokens: 50, outputReasoningTokens: 25, outputCombinedTokens: revision > 1 ? 75 : null },
@@ -456,6 +458,167 @@ const emptyDependencyOwner: StorageCommunityOwner = {
 };
 
 describe("bounded shared effective day dependencies", () => {
+  it("keeps deployed dependency bytes while matching canonical occurrences before decoding", async () => {
+    const selectedDay = day(), outsideDay = dayAfter(selectedDay);
+    const fixture = await createV11DeviceFixture(db(), { grant: true });
+    const selected = await stage(fixture, await makeV11Day(selectedDay, {
+      usage: [v11UsageRecord(selectedDay, "a")],
+    }));
+    const outside = await stage(fixture, await makeV11Day(outsideDay, {
+      usage: Array.from({ length: 600 }, (_, index) => v11UsageRecord(outsideDay, "b", {
+        eventId: `synthetic:unlinked:${String(index).padStart(4, "0")}`,
+      })),
+    }));
+    await activate(fixture, [selected, outside]);
+    const owner = (await readStorageCommunityOwnerPage(db()))
+      .find(value => value.participantId === fixture.participantId)!;
+    for (const includeSessions of [false, true]) {
+      const observed = observeDependencyQueries(db());
+      const dependency = await effectiveHistoryDependency(observed.database, owner, namespace,
+        selectedDay, selectedDay, { includeSessions });
+      const query = observed.queries.find(value => value.sql.includes("selected(occurrence_id)"))!;
+      const priorSql = includeSessions ? dependencySqlBaseline.sql
+        .replaceAll("('usage','quota')", "('usage','quota','session')")
+        .replaceAll("(1,2)", "(1,2,3)") : dependencySqlBaseline.sql;
+      const current = await db().prepare(query.sql).bind(...query.values).all<Record<string, unknown>>();
+      const prior = await db().prepare(priorSql).bind(...query.values).all<Record<string, unknown>>();
+      expect(dependencySqlBaseline.revision).toBe("32bd4091");
+      expect(dependency.occurrenceLinks).toEqual([]);
+      expect(current.results).toEqual(prior.results);
+      expect(canonicalJson({ ...dependency, occurrenceLinks: prior.results })).toBe(canonicalJson(dependency));
+      expect(observed.queries.filter(value => value.sql.includes("selected(occurrence_id)"))).toHaveLength(1);
+      expect(observed.queries).toHaveLength(6);
+      // Both queries retain their completeness checks and outside-occurrence
+      // comparisons. Only the canonical-ID match moves ahead of decoding.
+      expect(current.meta.rows_read).toBeLessThan(prior.meta.rows_read);
+      console.log("effective-dependency-query-cost", JSON.stringify({ includeSessions,
+        current: current.meta.rows_read, prior: prior.meta.rows_read,
+        currentStatements: observed.queries.length, priorStatements: 6 }));
+    }
+  }, 30_000);
+
+  it.each(["v1", "v11", "v12"] as const)("preserves %s outside links and incomplete-chunk refusal with canonical matches", async family => {
+    const selectedDay = day(), outsideDay = dayAfter(selectedDay);
+    const occurrence = `event:v2:${"a".repeat(64)}`;
+    const fixture = await createV11DeviceFixture(db(), { grant: family === "v11" });
+    if (family === "v1") {
+      await insertV1HistoryDay(fixture, selectedDay, 1, null, occurrence);
+      const otherDevice = await createV11DeviceFixture(db(), { participantId: fixture.participantId });
+      await insertV1HistoryDay(otherDevice, outsideDay, 1, null, occurrence);
+    } else if (family === "v11") {
+      const selected = await stage(fixture, await makeV11Day(selectedDay, {
+        usage: [v11UsageRecord(selectedDay, "a")],
+      }));
+      // v1.1 refuses a same-stream occurrence moving between days. Its
+      // admitted cross-stream IDs may still coincide; preserve those links.
+      const outside = await stage(fixture, await makeV11Day(outsideDay, {
+        quota: [{ schemaVersion: "quota-observation-v1.1", observationId: occurrence,
+          observedTime: `${outsideDay}T12:05:00.000Z`, provider: "openai_codex",
+          planType: "pro", planVariant: "unknown", limitId: "codex", slot: "seven_day",
+          usedPercent: 20, windowDurationMinutes: 10_080, resetsAt: null,
+          accountPlanAttribution: { accountBasis: "unavailable", accountTrackId: null,
+            planBasis: "same_source_occurrence", planType: "pro", planEraId: null } }],
+      }));
+      await activate(fixture, [selected, outside]);
+    } else {
+      await db().prepare("UPDATE telemetry_v12_runtime SET state='active' WHERE id=1").run();
+      await grantTelemetryV12Consent(db(), fixture, telemetryV12RequiredConsent());
+      await prepareOwner(fixture.participantId);
+      await activateV12(fixture, [
+        await stageV12Day(fixture, selectedDay, [v12UsageRecord(selectedDay, occurrence)]),
+        await stageV12Day(fixture, outsideDay, [v12UsageRecord(outsideDay, occurrence),
+          v12UsageRecord(outsideDay, `event:v2:${"b".repeat(64)}`)]),
+      ]);
+    }
+    const owner = (await readStorageCommunityOwnerPage(db()))
+      .find(value => value.participantId === fixture.participantId)!;
+    const observed = observeDependencyQueries(db());
+    const dependency = await effectiveHistoryDependency(observed.database, owner, namespace, selectedDay, selectedDay);
+    expect(dependency.occurrenceLinks).toEqual([expect.objectContaining({ family, source_day: outsideDay })]);
+    const query = observed.queries.find(value => value.sql.includes("selected(occurrence_id)"))!;
+    const prior = await db().prepare(dependencySqlBaseline.sql).bind(...query.values).all();
+    expect(prior.results).toEqual(dependency.occurrenceLinks);
+
+    const rowIds = family === "v12"
+      ? (await db().prepare(`SELECT r.id AS id,c.chunk_day AS day FROM telemetry_v12_records r
+          JOIN telemetry_v12_chunks c ON c.id=r.chunk_id WHERE c.participant_id=? ORDER BY r.id`)
+        .bind(fixture.participantId).all<{ id: number; day: string }>()).results
+      : (await db().prepare(`SELECT storage_row_id AS id,observed_day AS day FROM typed_telemetry_compatibility_records
+          WHERE participant_id=? AND format_code=? ORDER BY storage_row_id`)
+        .bind(fixture.participantId, family === "v1" ? 10 : 11).all<{ id: number; day: string }>()).results;
+    for (const missingDay of [selectedDay, outsideDay]) {
+      const missingId = rowIds.find(row => row.day === missingDay)!.id;
+      // Read-only fault injection presents an incomplete proof count while
+      // leaving immutable admitted records untouched. The real missing-proof
+      // lifecycle is covered by typed-v11-chunk-completeness.spec.ts.
+      const withoutProof = (sql: string) => family === "v11"
+        ? sql.replaceAll("proof.chunk_key=physical_chunk.id", `proof.chunk_key=physical_chunk.id AND proof.typed_record_id<>${missingId}`)
+        : sql.replaceAll(new RegExp(`FROM ${family === "v1" ? "typed_v1_record_admissions" : "telemetry_v12_records"} complete\\s+WHERE complete.chunk_id=chunk.id`, "gu"),
+          match => `${match} AND complete.${family === "v1" ? "typed_record_id" : "id"}<>${missingId}`);
+      const currentSql = withoutProof(query.sql), priorSql = withoutProof(dependencySqlBaseline.sql);
+      expect(currentSql).not.toBe(query.sql);
+      expect(priorSql).not.toBe(dependencySqlBaseline.sql);
+      const current = await db().prepare(currentSql).bind(...query.values).all();
+      const priorMissing = await db().prepare(priorSql).bind(...query.values).all();
+      expect(current.results).toEqual([]);
+      expect(current.results).toEqual(priorMissing.results);
+    }
+  }, 30_000);
+
+  it("preserves correction-only occurrence links in both window directions", async () => {
+    const selectedDay = day(), outsideDay = dayAfter(selectedDay);
+    const occurrence = `event:v2:${"a".repeat(64)}`;
+    const selectedDevice = await createV11DeviceFixture(db());
+    const outsideDevice = await createV11DeviceFixture(db(), { participantId: selectedDevice.participantId });
+    await insertV1HistoryDay(selectedDevice, selectedDay, 1, null, occurrence);
+    await insertV1HistoryDay(outsideDevice, outsideDay, 1, null, occurrence);
+    await db().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+    const previous = await currentTelemetryV1Chunk(db(), outsideDevice.participantId,
+      outsideDevice.deviceId, "usage", outsideDay, 0);
+    expect(previous).not.toBeNull();
+    // The outside occurrence is now retained only by correction history.
+    await insertV1HistoryDay(outsideDevice, outsideDay, 2, previous, `event:v2:${"b".repeat(64)}`);
+    const owner = (await readStorageCommunityOwnerPage(db()))
+      .find(value => value.participantId === selectedDevice.participantId)!;
+    for (const [windowDay, family, sourceDay] of [
+      [selectedDay, "correction", outsideDay], [outsideDay, "v1", selectedDay],
+    ] as const) {
+      const observed = observeDependencyQueries(db());
+      const dependency = await effectiveHistoryDependency(observed.database, owner, namespace, windowDay, windowDay);
+      const query = observed.queries.find(value => value.sql.includes("selected(occurrence_id)"))!;
+      const prior = await db().prepare(dependencySqlBaseline.sql).bind(...query.values).all();
+      expect(dependency.occurrenceLinks).toEqual([expect.objectContaining({ family, source_day: sourceDay })]);
+      expect(dependency.occurrenceLinks).toEqual(prior.results);
+    }
+  }, 30_000);
+
+  it("preserves compact, plain, and escaped occurrence IDs without conflating codec tags", async () => {
+    const selectedDay = day(), outsideDay = dayAfter(selectedDay), differentIdDay = dayAfter(outsideDay);
+    const occurrences = ["0a49f9db-8b2d-4c3e-9a6f-2f4f1c7d9e0b",
+      `event:v2:${"a".repeat(64)}`, `event:v2:${"A".repeat(64)}`,
+      `quota-occurrence:v1:${"b".repeat(64)}`, "synthetic:plain-occurrence"].sort();
+    await db().prepare("UPDATE telemetry_v12_runtime SET state='active' WHERE id=1").run();
+    const fixture = await createV11DeviceFixture(db());
+    await grantTelemetryV12Consent(db(), fixture, telemetryV12RequiredConsent());
+    await prepareOwner(fixture.participantId);
+    await activateV12(fixture, [
+      await stageV12Day(fixture, selectedDay, occurrences.map(id => v12UsageRecord(selectedDay, id))),
+      await stageV12Day(fixture, outsideDay, occurrences.map(id => v12UsageRecord(outsideDay, id))),
+      // Same 32 encoded payload bytes as event:v2:aaaa..., different tag and
+      // original identifier. This day must never become an occurrence link.
+      await stageV12Day(fixture, differentIdDay, [v12UsageRecord(differentIdDay, "a".repeat(64))]),
+    ]);
+    const owner = (await readStorageCommunityOwnerPage(db()))
+      .find(value => value.participantId === fixture.participantId)!;
+    const observed = observeDependencyQueries(db());
+    const dependency = await effectiveHistoryDependency(observed.database, owner, namespace, selectedDay, selectedDay);
+    const query = observed.queries.find(value => value.sql.includes("selected(occurrence_id)"))!;
+    const prior = await db().prepare(dependencySqlBaseline.sql).bind(...query.values).all();
+    expect(dependency.occurrenceLinks).toEqual([expect.objectContaining({ family: "v12", source_day: outsideDay })]);
+    expect(dependency.occurrenceLinks).toEqual(prior.results);
+    expect(canonicalJson({ ...dependency, occurrenceLinks: prior.results })).toBe(canonicalJson(dependency));
+  }, 30_000);
+
   it("seeks typed occurrence links by owner and stream before decoding compatibility rows", async () => {
     const observed = observeDependencyQueries(db());
     await effectiveHistoryDependency(observed.database, emptyDependencyOwner, namespace, day(), day());
@@ -760,7 +923,7 @@ describe("effective quota preparation source fences", () => {
     const before = meter.queriesUsed;
     expect(await cache.shouldPrepare!(fixture.selectedDay)).toBe(false);
     const validated = meter.queriesUsed;
-    expect(validated - before).toBe(6);
+    expect(validated - before).toBe(8);
     expect(await cache.shouldPrepare!(fixture.selectedDay)).toBe(false);
     expect(await cache.shouldPrepare!(missingDay)).toBe(true);
     expect(meter.queriesUsed).toBe(validated);

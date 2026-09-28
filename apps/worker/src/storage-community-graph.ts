@@ -56,10 +56,10 @@ export function storageGraphEffectiveCheckpointMethod(metric:'fits'|'model'):str
  * Workers would retire. Only the storage key changes; source, acquisition and
  * analytical result identities retain their existing dependency. Disabling
  * preparation resumes the original key, and abandoned method-key tombstones
- * remain valid. Format 3 allows pending day preparation in all acquisition
- * phases; format 2 is read only when adopting the preceding deployment. */
-export async function storageGraphEffectiveCheckpointKey(key:StorageHistoryKey,preparedQuota=false,format:2|3=3):Promise<StorageHistoryKey> {
-  if(format!==2&&format!==3)throw fail();
+ * remain valid. Format 4 adds one independently resumable cache gap and a
+ * durable ready-to-store value; preceding formats are read only for adoption. */
+export async function storageGraphEffectiveCheckpointKey(key:StorageHistoryKey,preparedQuota=false,format:2|3|4=4):Promise<StorageHistoryKey> {
+  if(format!==2&&format!==3&&format!==4)throw fail();
   return {...key,...(preparedQuota?{dependencyDigest:await sha256Hex(canonicalJson({
     checkpointFormat:`effective-quota-days-${format}`,dependencyDigest:key.dependencyDigest}))}:{})};
 }
@@ -603,7 +603,8 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
         remainingQueries:()=>meter.remainingQueries,deadlineMs:checkpointWorkDeadlineMs,now}):undefined;
     const originalKey=originalEffectiveKey();
     const key=await storageGraphEffectiveCheckpointKey(originalKey,preparedQuota!==undefined);
-    const loadKeys=preparedQuota?[key,await storageGraphEffectiveCheckpointKey(originalKey,true,2),originalKey]:[key];
+    const loadKeys=preparedQuota?[key,await storageGraphEffectiveCheckpointKey(originalKey,true,3),
+      await storageGraphEffectiveCheckpointKey(originalKey,true,2),originalKey]:[key];
     let cursor:StorageHistoryLoadCursor|undefined,head:string|null=null,checkpoint:StorageEffectiveHistoryCheckpoint|undefined;
     let loadIndex=0;
     for(;;){
@@ -640,11 +641,18 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
         const next=await advanceStorageEffectiveAnalysis({source,sourceNamespace:bindings.sourceNamespace,
           owner:scope.owner,pin,day:scope.day,metric,nowMs,checkpoint,
           ...(preparedQuota?{preparedQuota}:{}),
+          allowQuotaCoverage:pages===0,
           budget:{get remainingQueries(){return meter.remainingQueries-80;},deadlineMs:checkpointWorkDeadlineMs,now}});
         if(next.status==='complete')return {state:'complete',analysis:next.analysis};
         if(!next.checkpoint)break;
         if(preparedQuota?.preferSinglePageCheckpoint?.())groupPages=1;
         successor=next.checkpoint;checkpoint=successor;pages++;
+        // Independent preparation reads one page per durable successor. Day
+        // completion is also a deterministic boundary: save its reduced value
+        // before any optional cache write changes the next retry's inputs.
+        if(next.quotaCoverageStep||successor.quotaCoverage?.pending?.state==='ready'){
+          whole=true;break;
+        }
         if(phase!==null&&(successor.phase!=='acquisition'||successor.acquisition.phase!==phase)){
           whole=true;break;
         }

@@ -32,6 +32,7 @@ import { eraseParticipantAsOwner } from '../src/participant-erasure';
 import { canonicalJson } from '../src/canonical-json';
 import { readStorageCommunityProgress } from '../src/storage-community-progress';
 import { advanceStorageCommunityGraphWork } from '../src/storage-community-graph-work';
+import { ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS } from '../src/admin-community-allowance';
 import {loadTypedV11GenerationSnapshot} from '../src/typed-v11-quota-reader';
 import {storageHistoryKeyDigest,type StorageHistoryKey} from '../src/storage-history-checkpoint';
 import {claimStorageGraphWorkSelection,ensureStorageGraphWorkSelection,loadLiveStorageGraphWorkSelection,readStorageGraphWorkSelection,
@@ -207,6 +208,34 @@ function cohortMetadataSource(rows:Array<Record<string,unknown>>):D1Database {
 function replayPublication(table:'analytics_community_model_publications'|'analytics_community_graph_previews',row:Record<string,unknown>){
  return b.STORAGE_ANALYTICS_DB.prepare(`INSERT INTO ${table} (${Object.keys(row).join(',')})
   VALUES(${Object.keys(row).map(()=>'?').join(',')})`).bind(...Object.values(row)).run();
+}
+async function completeSyntheticHistory(){
+ // One real publication supplies the validated aggregate DTO and authority.
+ // Copies vary only their synthetic day, so no historical graph calculation is
+ // needed to set up the selector's all-complete branch.
+ const owners=await readStorageCommunityOwnerPage(typed());
+ for(let index=0;index<owners.length;index++)expect((await compute('model',day(),index)).state).toBe('complete');
+ expect((await publishStorageCommunityModelDay(bindings(),{day:day()})).state).toBe('published');
+ const row=(await b.STORAGE_ANALYTICS_DB.prepare('SELECT * FROM analytics_community_model_publications WHERE source_id=? AND day=?')
+  .bind(namespace,day()).first<Record<string,unknown>>())!;
+ expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT count(*) n FROM analytics_community_model_publications WHERE source_id=?')
+  .bind(namespace).first('n')).toBe(1);
+ const todayMs=Date.parse(today()),seeded=new Set([day()]);
+ for(let age=2;age<ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS;age++){
+  const selectedDay=new Date(todayMs-age*86400000).toISOString().slice(0,10);
+  expect(seeded.has(selectedDay)).toBe(false);seeded.add(selectedDay);
+  const payload=canonicalJson({...JSON.parse(row.payload_json as string),day:selectedDay});
+  try{await replayPublication('analytics_community_model_publications',{...row,day:selectedDay,payload_json:payload,
+   payload_sha256:await sha256Hex(payload)});}catch(error){throw new Error(`synthetic history seed at offset ${age}`,{cause:error});}
+ }
+ expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT count(*) n FROM analytics_community_model_publications WHERE source_id=?')
+  .bind(namespace).first('n')).toBe(ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS-1);
+}
+async function pinGraphHistory(currentPosition=0,historyPosition=0){
+ await b.STORAGE_ANALYTICS_DB.prepare(`INSERT INTO analytics_community_graph_scan
+  (source_id,revision,tick,current_position,history_position) VALUES(?,1,1,?,?)
+  ON CONFLICT(source_id) DO UPDATE SET revision=revision+1,tick=1,current_position=excluded.current_position,
+   history_position=excluded.history_position`).bind(namespace,currentPosition,historyPosition).run();
 }
 function capturedQueries(){
  const queries:Array<{sql:string;args:unknown[]}>=[];
@@ -867,6 +896,70 @@ describe('isolated allowance graph publication',()=>{
   expect(failedOwner).toBe(owners[1]!.ownerDigest);
   expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT tick,current_position,history_position FROM analytics_community_graph_scan')
    .first()).toMatchObject({tick:2,current_position:0,history_position:2});
+ });
+ it('uses empty historical slots for pending current work in durable round-robin order',async()=>{
+  for(const suffix of ['a','b'])await fixture(`participant:history-fallback-${suffix}`);
+  await completeSyntheticHistory();
+  await pinGraphHistory(0,7);
+  const result=[];
+  for(let attempt=0;attempt<4;attempt++)result.push(await advanceStorageCommunityGraphWork(bindings()));
+  expect(result).toEqual([
+   {state:'complete',metric:'fits',day:today()},{state:'complete',metric:'model',day:today()},
+   {state:'complete',metric:'fits',day:today()},{state:'complete',metric:'model',day:today()},
+  ]);
+  const owners=await readStorageCommunityOwnerPage(typed());
+  const rows=(await b.STORAGE_ANALYTICS_DB.prepare(`SELECT owner_digest,metric FROM analytics_community_graph_results
+   WHERE source_id=? AND day=? ORDER BY owner_digest,metric`).bind(namespace,today()).all()).results;
+  expect(rows).toEqual(owners.flatMap(owner=>['fits','model'].map(metric=>({owner_digest:owner.ownerDigest,metric})))
+   .sort((a,b)=>a.owner_digest!.localeCompare(b.owner_digest!)||a.metric.localeCompare(b.metric)));
+  expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT tick,current_position,history_position FROM analytics_community_graph_scan')
+   .first()).toMatchObject({tick:2,current_position:4,history_position:7});
+  const target=capturedQueries();
+  expect(await advanceStorageCommunityGraphWork({...bindings(),target:target.database})).toEqual({state:'idle'});
+  expect(target.queries.filter(row=>row.sql.includes('r.metric IN'))).toHaveLength(1);
+  expect(target.queries.some(row=>row.sql.includes('analytics_history_checkpoint'))).toBe(false);
+  console.log('empty historical slot resource probe',JSON.stringify({previousEmptyHistoryOutcome:'idle',completedCurrentResults:4,
+   attempts:4,completedOwners:owners.length,emptyFallbackMetadataStatements:1}));
+ });
+ it('keeps a live fallback claim busy and rotates the next slot to another current metric',async()=>{
+  await fixture('participant:history-fallback-lease');await completeSyntheticHistory();
+  expect((await compute('fits',today())).state).toBe('complete');
+  const {envelope}=await selectedEnvelope('fits',today());
+  const ensured=await ensureStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,envelope});
+  if(!('selection'in ensured)||!ensured.selection)throw new Error('synthetic fallback selection unavailable');
+  const claimed=await claimStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,
+   selection:ensured.selection,claimToken:'synthetic-fallback-live-claim',leaseMs:120_000});
+  expect(claimed.status).toBe('claimed');
+  const before=await readStorageGraphWorkSelection(b.STORAGE_ANALYTICS_DB,ensured.selection.key);
+  await pinGraphHistory();
+  expect(await advanceStorageCommunityGraphWork(bindings()))
+   .toEqual({state:'deferred',metric:'fits',day:today(),reason:'selection_busy'});
+  expect(await readStorageGraphWorkSelection(b.STORAGE_ANALYTICS_DB,ensured.selection.key)).toEqual(before);
+  expect(await advanceStorageCommunityGraphWork(bindings())).toEqual({state:'complete',metric:'model',day:today()});
+  expect(await readStorageGraphWorkSelection(b.STORAGE_ANALYTICS_DB,ensured.selection.key)).toEqual(before);
+ });
+ it('treats completed selections as cached and defers a lost fallback scan CAS before capture',async()=>{
+  await fixture('participant:history-fallback-cas');await completeSyntheticHistory();
+  for(const metric of ['fits','model'] as const)expect((await compute(metric,today())).state).toBe('complete');
+  const {envelope}=await selectedEnvelope('fits',today());
+  const ensured=await ensureStorageGraphWorkSelection({source:typed(),target:b.STORAGE_ANALYTICS_DB,envelope});
+  if(!('selection'in ensured)||!ensured.selection)throw new Error('synthetic completed selection unavailable');
+  await b.STORAGE_ANALYTICS_DB.prepare(`UPDATE analytics_community_graph_work_selection SET state='complete'
+   WHERE source_id=? AND owner_digest=? AND day=? AND metric='fits'`).bind(namespace,envelope.ownerDigest,today()).run();
+  await pinGraphHistory();
+  expect(await advanceStorageCommunityGraphWork(bindings())).toEqual({state:'idle'});
+  await b.STORAGE_ANALYTICS_DB.prepare(`DELETE FROM analytics_community_graph_results
+   WHERE source_id=? AND metric='model' AND day=?`).bind(namespace,today()).run();
+  await pinGraphHistory();let changed=false,scoped=false;
+  const target=observed(b.STORAGE_ANALYTICS_DB,async(sql,moment)=>{
+   if(moment==='before'&&sql.includes('UPDATE analytics_community_graph_scan')&&!changed){
+    changed=true;await b.STORAGE_ANALYTICS_DB.prepare('UPDATE analytics_community_graph_scan SET revision=revision+1 WHERE source_id=?')
+     .bind(namespace).run();
+   }
+   if(sql.includes('analytics_history_checkpoint'))scoped=true;
+  });
+  expect(await advanceStorageCommunityGraphWork({...bindings(),target})).toEqual({state:'deferred',reason:'claim_changed'});
+  expect(changed).toBe(true);expect(scoped).toBe(false);
  });
  it('refreshes only the proof of an unchanged preview after an actual outside-window append',async()=>{
   const f=await fixture(),days=await activeDays(f);

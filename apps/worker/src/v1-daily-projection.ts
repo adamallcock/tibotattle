@@ -55,10 +55,13 @@ export function prepareV1ProjectionOwnerFence(target:D1Database,change:StorageCh
 
 export async function retireV1DailyProjectionPage(target:D1Database,sourceId:string,limit=200):Promise<{state:'idle'|'retiring';deleted:number}>{
  integer(limit,1);if(limit>200)throw fail();
+ // Start with the terminal fences. An ordinary JOIN may choose every retained
+ // chunk as its outer loop even when no owner is erased; the exact owner key
+ // makes each fenced lookup bounded by that owner's retained chunks instead.
  const result=await target.prepare(`DELETE FROM analytics_v1_chunk_values WHERE (source_id,owner_digest,slot_digest) IN (
   SELECT c.source_id,c.owner_digest,c.slot_digest FROM analytics_v1_owner_fences f
-  JOIN analytics_v1_chunk_values c ON c.source_id=f.source_id AND c.owner_digest=f.owner_digest
-  WHERE f.source_id=? AND f.state='owner-erased' ORDER BY c.owner_digest,c.slot_digest LIMIT ?) RETURNING slot_digest`)
+  CROSS JOIN analytics_v1_chunk_values c ON c.source_id=f.source_id AND c.owner_digest=f.owner_digest
+  WHERE f.source_id=? AND f.state='owner-erased' ORDER BY f.owner_digest,c.slot_digest LIMIT ?) RETURNING slot_digest`)
   .bind(sourceId,limit).all();
  return {state:result.results.length?'retiring':'idle',deleted:result.results.length};
 }

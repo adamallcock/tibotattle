@@ -2,7 +2,6 @@ import { canonicalTelemetryV11Json, parseTelemetryV11Record } from '@app-usagemo
 import { canonicalJson } from './canonical-json';
 import { sha256Hex } from './crypto';
 import { readEffectiveTelemetryOwnerDayPage, readEffectiveTelemetryOwnerDays, type EffectiveUsageReaderCursor } from './telemetry-usage-effective-reader';
-import { typedTelemetryIdSql } from './typed-telemetry-codec';
 import { TYPED_V11_CHUNK_PROOF_COUNT_SQL } from './typed-v11-chunk-completeness';
 import { advanceV11QuotaAcquisition, createV11QuotaAcquisitionCheckpoint,
   type V11QuotaAcquisitionCheckpoint, type V11CompletedQuotaAcquisition,
@@ -13,7 +12,7 @@ import type { V11SourcePin } from './telemetry-v11-domain';
 import type { V11QuotaPageRow } from './typed-v11-quota-reader';
 import type { StorageCommunityOwner } from './storage-community-authority';
 import { appendEffectiveQuotaDay, finishEffectiveQuotaDay, foldEffectiveQuotaDays,
-  mapEffectiveQuotaPageRow, validEffectiveQuotaDayPending,
+  mapEffectiveQuotaPageRow, validEffectiveQuotaDay, validEffectiveQuotaDayPending,
   type EffectiveQuotaDay, type EffectiveQuotaDayPending } from './effective-quota-day';
 
 export const STORAGE_EFFECTIVE_READER_METHOD = 'effective-usage-owner-day-v1';
@@ -31,10 +30,20 @@ export interface EffectiveQuotaCursor {
   phase: V11QuotaAcquisitionCheckpoint['phase']; day: string;
   after: EffectiveUsageReaderCursor | null; ordinal: number; complete: boolean;
 }
+/** One optional cache gap, independent of the analytical cursor. A completed
+ * buffer remains durable until the day manifest has actually been promoted.
+ * The turn bounds preparation to one page between analytical advances. */
+export interface EffectiveQuotaCoverage {
+  next: 'analysis'|'prepare';
+  refusedDays: readonly string[];
+  pending: { state:'reading'; after: EffectiveUsageReaderCursor; quota: EffectiveQuotaDayPending }
+    |{state:'ready';day:EffectiveQuotaDay}|null;
+}
 export type StorageEffectiveHistoryCheckpoint = {
   version: 1; source: 'effective'; day: string; layout: string;
   identity: V11QuotaAcquisitionIdentity; effectiveCursor: EffectiveQuotaCursor;
   effectiveDays:{quota:readonly string[];usage:readonly string[]};
+  quotaCoverage?: EffectiveQuotaCoverage;
 } & ({phase:'acquisition'; acquisition:V11QuotaAcquisitionCheckpoint; preparingQuota?:EffectiveQuotaDayPending}
   |{phase:'finish'; acquisition:V11CompletedQuotaAcquisition}
   |{phase:'usage'; acquisition:V11CompletedQuotaAcquisition; usage:V11UsageReductionCheckpoint});
@@ -56,6 +65,30 @@ export function validEffectiveDays(value:unknown,fromDay:string,throughDay:strin
     typeof day==='string'&&/^\d{4}-\d{2}-\d{2}$/u.test(day)&&Number.isFinite(Date.parse(day))
     &&new Date(day).toISOString().slice(0,10)===day&&day>=fromDay&&day<=throughDay
     &&(index===0||days[index-1]<day)));
+}
+export function validEffectiveQuotaCoverage(value:unknown,days:readonly string[],phase:StorageEffectiveHistoryCheckpoint['phase'],
+  inline?:EffectiveQuotaDayPending):value is EffectiveQuotaCoverage {
+  if(!value||typeof value!=='object'||Array.isArray(value)
+    ||Object.keys(value).sort().join(',')!=='next,pending,refusedDays')return false;
+  const coverage=value as EffectiveQuotaCoverage;
+  if(!['analysis','prepare'].includes(coverage.next)||!Array.isArray(coverage.refusedDays)
+    ||coverage.refusedDays.length>101||coverage.refusedDays.some((day,index)=>typeof day!=='string'
+      ||!days.includes(day)||index>0&&coverage.refusedDays[index-1]!>=day))return false;
+  if(coverage.pending===null)return phase==='acquisition';
+  const pending=coverage.pending;
+  if(inline!==undefined||!pending||typeof pending!=='object'||Array.isArray(pending)
+    ||!['reading','ready'].includes(pending.state))return false;
+  if(pending.state==='ready')return Object.keys(pending).sort().join(',')==='day,state'
+    &&validEffectiveQuotaDay(pending.day)&&days.includes(pending.day.projection.day)
+    &&!coverage.refusedDays.includes(pending.day.projection.day);
+  if(Object.keys(pending).sort().join(',')!=='after,quota,state'
+    ||!validEffectiveQuotaDayPending(pending.quota)||!days.includes(pending.quota.day)
+    ||coverage.refusedDays.includes(pending.quota.day))return false;
+  const after=pending.after,last=pending.quota.rows.at(-1);
+  return phase==='acquisition'&&!!last&&!!after&&typeof after==='object'&&!Array.isArray(after)
+    &&Object.keys(after).sort().join(',')==='observedAtMs,occurrenceId'
+    &&Number.isSafeInteger(after.observedAtMs)&&after.observedAtMs===last.observedAtMs
+    &&typeof after.occurrenceId==='string'&&/^[A-Za-z0-9._:-]{8,128}$/u.test(after.occurrenceId);
 }
 export interface EffectiveHistoryDependency {
   version: 'effective-history-dependency-v2'; participantId: string; fromDay: string; throughDay: string;
@@ -108,9 +141,10 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
   // match its chunk day. Apply those physical bounds before compatibility
   // decoding, while keeping every decoded source and admission check below.
   const typedStreams=includeSessions?'(1,2,3)':'(1,2)';
-  const typedOccurrence=typedTelemetryIdSql('h.occurrence_id');
-  const typedV12Occurrence=typedTelemetryIdSql('v12_record.occurrence_id');
-  const typedV12LinkedOccurrence=typedTelemetryIdSql('r.occurrence_id');
+  // Every admitted family and correction archive uses the same canonical,
+  // reversible occurrence-ID codec. Match those complete BLOBs (including the
+  // encoding tag) before compatibility decoding; the final dependency still
+  // contains only the same immutable header coordinates.
   const retainedV12=includeV12?`retained_v12(participant_id,device_id) AS (
       SELECT authorization.participant_id,authorization.device_id
         FROM telemetry_v12_active_authorizations authorization
@@ -153,7 +187,7 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
           WHERE complete.chunk_id=chunk.id)
     ),`:' ';
   const selectedV12=includeV12?`      UNION
-      SELECT ${typedV12Occurrence}
+      SELECT v12_record.occurrence_id
         FROM retained_v12_chunks chunk
         JOIN scope s ON chunk.source_day>=s.from_day AND chunk.source_day<=s.through_day
         CROSS JOIN telemetry_v12_records v12_record ON v12_record.chunk_id=chunk.id
@@ -174,7 +208,7 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
        WHERE chunk.stream IN ${sourceStreams}
          AND chunk.record_count=${TYPED_V11_CHUNK_PROOF_COUNT_SQL}
     ), ${retainedV12} selected(occurrence_id) AS MATERIALIZED (
-      SELECT r.occurrence_id
+      SELECT scoped_record.occurrence_id
         FROM scope s
         CROSS JOIN typed_v1_owner_memberships scoped_owner
           ON scoped_owner.participant_id=s.participant_id
@@ -203,7 +237,7 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
          AND r.format_code=10 AND r.stream IN ${sourceStreams}
          AND r.observed_day>=s.from_day AND r.observed_day<=s.through_day
       UNION
-      SELECT r.occurrence_id
+      SELECT scoped_record.occurrence_id
         FROM scope s
         CROSS JOIN typed_v11_owner_memberships scoped_owner
           ON scoped_owner.participant_id=s.participant_id
@@ -238,7 +272,7 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
          AND r.owner_id=typed_owner.id AND r.format_code=11 AND r.stream IN ${sourceStreams}
          AND r.observed_day>=s.from_day AND r.observed_day<=s.through_day
       UNION
-      SELECT ${typedOccurrence}
+      SELECT h.occurrence_id
         FROM telemetry_usage_correction_facts f
         JOIN telemetry_usage_correction_history h ON h.id=f.history_id
         JOIN scope s ON h.participant_id=s.participant_id AND lower(hex(h.owner_digest))=s.owner_digest
@@ -254,10 +288,11 @@ ${selectedV12}    ), linked(family,source_day,source_key,source_digest) AS (
         CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_time
           ON scoped_record.owner_id=scoped_owner.typed_owner_id AND scoped_record.format=10
           AND scoped_record.stream IN ${typedStreams}
+          AND scoped_record.occurrence_id IN (SELECT occurrence_id FROM selected)
           AND (scoped_record.observed_day<CAST(s.from_ms/86400000 AS INTEGER)
             OR scoped_record.observed_day>=CAST(s.through_ms/86400000 AS INTEGER))
         CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=scoped_record.id
-        JOIN selected wanted ON wanted.occurrence_id=r.occurrence_id
+        JOIN selected wanted ON wanted.occurrence_id=scoped_record.occurrence_id
         JOIN typed_v1_admission_state v1 ON v1.id=1 AND v1.runtime_contract_version=1
           AND v1.source_namespace=s.source_namespace
         JOIN typed_v1_owner_memberships owner_membership ON owner_membership.participant_id=r.participant_id
@@ -283,10 +318,11 @@ ${selectedV12}    ), linked(family,source_day,source_key,source_digest) AS (
         CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_time
           ON scoped_record.owner_id=scoped_owner.typed_owner_id AND scoped_record.format=11
           AND scoped_record.stream IN ${typedStreams}
+          AND scoped_record.occurrence_id IN (SELECT occurrence_id FROM selected)
           AND (scoped_record.observed_day<CAST(s.from_ms/86400000 AS INTEGER)
             OR scoped_record.observed_day>=CAST(s.through_ms/86400000 AS INTEGER))
         CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=scoped_record.id
-        JOIN selected wanted ON wanted.occurrence_id=r.occurrence_id
+        JOIN selected wanted ON wanted.occurrence_id=scoped_record.occurrence_id
         JOIN typed_v11_admission_state v11 ON v11.id=1 AND v11.runtime_contract_version=1
         JOIN typed_v11_owner_memberships owner_membership ON owner_membership.participant_id=r.participant_id
         JOIN typed_telemetry_owners typed_owner ON typed_owner.id=owner_membership.typed_owner_id
@@ -317,7 +353,7 @@ ${includeV12?`      UNION
        WHERE (chunk.source_day<s.from_day OR chunk.source_day>s.through_day)
          AND EXISTS (
            SELECT 1 FROM telemetry_v12_records r
-           JOIN selected wanted ON wanted.occurrence_id=${typedV12LinkedOccurrence}
+           JOIN selected wanted ON wanted.occurrence_id=r.occurrence_id
            WHERE r.chunk_id=chunk.id AND r.manifest_id=chunk.manifest_id AND r.stream=chunk.stream)
 `:''}    ), correction_frontiers AS (
       /* Active correction history/facts are append-only. The owner-erasure
@@ -329,7 +365,7 @@ ${includeV12?`      UNION
         FROM telemetry_usage_correction_facts f
         JOIN telemetry_usage_correction_history h ON h.id=f.history_id
         JOIN scope s ON h.participant_id=s.participant_id AND lower(hex(h.owner_digest))=s.owner_digest
-        JOIN selected wanted ON wanted.occurrence_id=${typedOccurrence}
+        JOIN selected wanted ON wanted.occurrence_id=h.occurrence_id
        WHERE date(h.event_time_ms/1000,'unixepoch')<s.from_day
           OR date(h.event_time_ms/1000,'unixepoch')>s.through_day
        GROUP BY date(h.event_time_ms/1000,'unixepoch')
@@ -579,14 +615,18 @@ export async function advanceStorageEffectiveAnalysis(input:{
    * calculation. Preparation piggybacks on any quota acquisition scan. */
   preparedQuota?:{
     load(days:readonly string[],identity:V11QuotaAcquisitionIdentity):Promise<readonly EffectiveQuotaDay[]|undefined>;
-    store(day:EffectiveQuotaDay):Promise<void>;
+    store(day:EffectiveQuotaDay):Promise<'stored'|'deferred'>;
+    /** Only a source-validated stale head or a missing head may open a gap. */
+    nextMissingDay?:(eligibleDays:readonly string[],excludedDays:readonly string[])=>Promise<string|undefined>;
     /** Called only at a day boundary, before accumulating a complete day. */
     shouldPrepare?:(day:string)=>Promise<boolean>;
     /** A costly cache miss leaves room for one deterministic page/save. */
     preferSinglePageCheckpoint?:()=>boolean;
   };
+  /** The durable group boundary is the only place to start a cache-only step. */
+  allowQuotaCoverage?:boolean;
   budget:{remainingQueries:number;deadlineMs:number;now?:()=>number};
-}):Promise<{status:'deferred';checkpoint:StorageEffectiveHistoryCheckpoint|null}|{status:'complete';analysis:object}>{
+}):Promise<{status:'deferred';checkpoint:StorageEffectiveHistoryCheckpoint|null;quotaCoverageStep?:true}|{status:'complete';analysis:object}>{
   const {source,pin,owner,budget}=input;
   const now=budget.now??Date.now;
   if(budget.remainingQueries<120||now()>=budget.deadlineMs)return {status:'deferred',checkpoint:null};
@@ -604,6 +644,8 @@ export async function advanceStorageEffectiveAnalysis(input:{
       ||checkpoint.acquisition.phase!==checkpoint.effectiveCursor.phase||checkpoint.effectiveCursor.complete
       ||checkpoint.preparingQuota.day!==checkpoint.effectiveCursor.day
       ||checkpoint.preparingQuota.quotaRowsRead>checkpoint.effectiveCursor.ordinal))throw fail();
+  if(checkpoint?.quotaCoverage!==undefined&&!validEffectiveQuotaCoverage(checkpoint.quotaCoverage,
+    checkpoint.effectiveDays.quota,checkpoint.phase,checkpoint.phase==='acquisition'?checkpoint.preparingQuota:undefined))throw fail();
   if(!checkpoint){
     const inventory={sourceNamespace:input.sourceNamespace,ownerDigest:owner.ownerDigest,
       ownerRevision:owner.ownerRevision,authorityEpoch:owner.authorityEpoch,fromDay:pin.fromDay,throughDay:pin.throughDay};
@@ -617,6 +659,28 @@ export async function advanceStorageEffectiveAnalysis(input:{
     readEffectiveTelemetryOwnerDayPage(source,{sourceNamespace:input.sourceNamespace,
       ownerDigest:owner.ownerDigest,ownerRevision:owner.ownerRevision,authorityEpoch:owner.authorityEpoch,
       day,stream,limit:200,...(after?{after}:{})});
+  let coverage=checkpoint.quotaCoverage;
+  const refused=(day:string):EffectiveQuotaCoverage=>({next:'analysis',pending:null,
+    refusedDays:[...new Set([...(coverage?.refusedDays??[]),day])].sort()});
+  const coverageFields=(phase:StorageEffectiveHistoryCheckpoint['phase'])=>
+    coverage&&(phase==='acquisition'||coverage.pending?.state==='ready')?{quotaCoverage:coverage}:{};
+  // Cache writes may span invocations. Both inline and gap preparation first
+  // checkpoint the reduced complete day, so retrying a write never needs to
+  // rescan that day or change the analytical cursor.
+  if(input.preparedQuota&&coverage?.pending?.state==='ready'){
+    if(input.allowQuotaCoverage===false)return {status:'deferred',checkpoint:null};
+    if(await input.preparedQuota.store(coverage.pending.day)==='stored')
+      coverage={...coverage,next:'analysis',pending:null};
+    else return {status:'deferred',checkpoint:null};
+    await assertEffectiveHistoryOwner(source,owner);
+    const {quotaCoverage:_,...withoutCoverage}=checkpoint;
+    checkpoint={...withoutCoverage,...coverageFields(checkpoint.phase)};
+    // The completed day and analytical cursor already have a durable head.
+    // Combine clearing that buffer with useful analytical/fold progress. If
+    // the write used this slice's headroom, keep the old ready head; replay
+    // merely confirms the idempotent cache write before trying again.
+    if(budget.remainingQueries<120||now()>=budget.deadlineMs)return {status:'deferred',checkpoint:null};
+  }
   if(checkpoint.phase==='acquisition'){
     const acquisition=checkpoint.acquisition;
     if(input.preparedQuota){
@@ -638,6 +702,28 @@ export async function advanceStorageEffectiveAnalysis(input:{
     let preparingQuota=input.preparedQuota?checkpoint.preparingQuota:undefined;
     if(cursor.phase!==acquisition.phase){Object.assign(cursor,{phase:acquisition.phase,day:checkpoint.effectiveDays.quota[0]??pin.throughDay,
       after:null,ordinal:0,complete:checkpoint.effectiveDays.quota.length===0});}
+    if(input.preparedQuota&&input.allowQuotaCoverage!==false&&preparingQuota===undefined
+      &&coverage?.next!=='analysis'){
+      // Days still ahead will be prepared by the normal scan. Only fill its
+      // missed prefix (including an adopted midpoint) independently.
+      const eligible=checkpoint.effectiveDays.quota.filter(day=>day<cursor.day
+        ||day===cursor.day&&(cursor.after!==null||cursor.complete));
+      const gap=coverage?.pending?.state==='reading'?coverage.pending:null;
+      const day=gap?.quota.day??await input.preparedQuota.nextMissingDay?.(eligible,coverage?.refusedDays??[]);
+      if(day!==undefined){
+        if(!checkpoint.effectiveDays.quota.includes(day)||(gap===null&&!eligible.includes(day)))throw fail();
+        const page=await read(day,'quota',gap?.after??undefined);
+        let ordinal=gap?.quota.quotaRowsRead??0;
+        const rows=page.rows.map(row=>mapEffectiveQuotaPageRow(row,day,++ordinal));
+        const pending=appendEffectiveQuotaDay(gap?.quota??null,day,rows,identity.windowMinutes);
+        const prepared=pending!==null&&page.next===null?finishEffectiveQuotaDay(pending):undefined;
+        coverage=pending===null||page.next===null&&prepared===undefined?refused(day):{
+          next:'analysis',refusedDays:coverage?.refusedDays??[],pending:page.next===null
+            ?{state:'ready',day:prepared!}:{state:'reading',quota:pending!,after:page.next}};
+        await assertEffectiveHistoryOwner(source,owner);
+        return {status:'deferred',checkpoint:{...checkpoint,quotaCoverage:coverage},quotaCoverageStep:true};
+      }
+    }
     const reader:V11QuotaPageReader={pageSize:200,effective:{complete:()=>cursor.complete},
       async readPage(){
         if(cursor.complete)return [];
@@ -645,15 +731,18 @@ export async function advanceStorageEffectiveAnalysis(input:{
         // boundary: later acquisition phases rewind and can fill that prefix.
         // The reducer filters phase-specific rows only after this reader, so
         // each phase can prepare the same complete, unfiltered day.
-        const prepare=!!input.preparedQuota&&(preparingQuota!==undefined||cursor.after===null
+        const prepare=!!input.preparedQuota&&!coverage?.pending&&!coverage?.refusedDays.includes(cursor.day)
+          &&(preparingQuota!==undefined||cursor.after===null
           &&(await input.preparedQuota.shouldPrepare?.(cursor.day)??true));
         const page=await read(cursor.day,'quota',cursor.after??undefined);
         const rows:V11QuotaPageRow[]=page.rows.map(row=>mapEffectiveQuotaPageRow(row,cursor.day,++cursor.ordinal));
         if(prepare&&input.preparedQuota){
           preparingQuota=appendEffectiveQuotaDay(preparingQuota??null,cursor.day,rows,identity.windowMinutes)??undefined;
+          if(preparingQuota===undefined)coverage=refused(cursor.day);
           if(page.next===null&&preparingQuota){
             const prepared=finishEffectiveQuotaDay(preparingQuota);
-            if(prepared)await input.preparedQuota.store(prepared);
+            coverage=prepared?{next:'prepare',refusedDays:coverage?.refusedDays??[],pending:{state:'ready',day:prepared}}
+              :refused(cursor.day);
             preparingQuota=undefined;
           }
         }
@@ -667,10 +756,17 @@ export async function advanceStorageEffectiveAnalysis(input:{
     const step=await advanceV11QuotaAcquisition(reader,identity,{remainingQueries:1,deadlineMs:budget.deadlineMs,now},
       acquisition,{maxPages:1,stopAtPhaseBoundary:true});
     await assertEffectiveHistoryOwner(source,owner);
+    if(step.status==='not_testable'&&coverage?.pending?.state==='ready'){
+      const {preparingQuota:_,...withoutInline}=checkpoint;
+      return {status:'deferred',checkpoint:{...withoutInline,quotaCoverage:coverage},quotaCoverageStep:true};
+    }
     if(step.status==='not_testable')return {status:'complete',analysis:input.metric==='fits'
       ?{schemaVersion:'account-scoped-quota-analysis-v0.1',status:'not_testable',reason:step.reason,tracks:[]}
       :{status:'not_testable',reason:step.reason,tracks:[]}};
-    const base={version:1 as const,source:'effective' as const,day:input.day,layout,identity,effectiveCursor:cursor,effectiveDays:checkpoint.effectiveDays};
+    if(coverage&&coverage.pending?.state!=='ready')coverage={...coverage,next:'prepare'};
+    const nextPhase=step.status==='deferred'?'acquisition':'finish';
+    const base={version:1 as const,source:'effective' as const,day:input.day,layout,identity,effectiveCursor:cursor,
+      effectiveDays:checkpoint.effectiveDays,...coverageFields(nextPhase)};
     return {status:'deferred',checkpoint:step.status==='deferred'
       ?{...base,phase:'acquisition',acquisition:step.checkpoint,
         ...(step.checkpoint.phase===cursor.phase&&preparingQuota?{preparingQuota}:{})}

@@ -2,6 +2,7 @@ import { env, reset, applyD1Migrations, type D1Migration } from 'cloudflare:test
 import { beforeEach, describe, expect, it } from 'vitest';
 import { canonicalJson } from '../src/canonical-json';
 import { sha256Hex } from '../src/crypto';
+import { finishEffectiveQuotaDay } from '../src/effective-quota-day';
 import { createV11QuotaAcquisitionCheckpoint } from '../src/quota-analysis-v11-reader';
 import { STORAGE_GRAPH_EFFECTIVE_MODEL_CHECKPOINT_METHOD, storageGraphEffectiveCheckpointKey } from '../src/storage-community-graph';
 import type { StorageEffectiveHistoryCheckpoint } from '../src/storage-effective-history';
@@ -64,7 +65,52 @@ async function save(value: StorageHistoryCheckpoint) {
   return { key: storageKey, ...result };
 }
 
+function withCoverage(state:'reading'|'ready'):Acquisition {
+  const value=checkpoint('endpoints'),quota=value.preparingQuota!;
+  delete value.preparingQuota;
+  // The independent gap is strictly behind the analytical cursor. Its local
+  // ordinal is unrelated to that cursor's global ordinal.
+  value.effectiveDays.quota=[quota.day,'2026-05-30'];
+  value.effectiveCursor={phase:'endpoints',day:'2026-05-30',after:null,ordinal:27,complete:false};
+  const day=finishEffectiveQuotaDay(quota);
+  if(!day)throw new Error('synthetic empty effective day unavailable');
+  value.quotaCoverage={next:'analysis',refusedDays:[],pending:state==='ready'?{state,day}:{state,quota,
+    after:{observedAtMs:quota.rows.at(-1)!.observedAtMs,occurrenceId:'synthetic-gap-2'}}};
+  return value;
+}
+
 describe('effective pending-day checkpoint codec across acquisition phases', () => {
+  it.each(['reading','ready'] as const)('roundtrips an independent %s gap without moving the analytical cursor',async state=>{
+    const value=withCoverage(state),saved=await save(value);
+    expect(await loadStorageHistoryCheckpoint({target:target(),key:saved.key})).toEqual({
+      status:'ready',headDigest:saved.headDigest,partCount:saved.totalParts,checkpoint:value});
+  });
+
+  it('retains only a completed day after acquisition finishes',async()=>{
+    const value=withCoverage('ready');
+    const finished:StorageEffectiveHistoryCheckpoint={...value,phase:'finish',
+      acquisition:{identity:value.identity,planAnchors:[],quotaRows:[]}};
+    const saved=await save(finished);
+    expect(await loadStorageHistoryCheckpoint({target:target(),key:saved.key})).toMatchObject({status:'ready',checkpoint:finished});
+  });
+
+  it.each(['unknown-key','variant','cursor','day','refused-duplicate','refused-ready','inline','reading-after-finish'] as const)(
+    'rejects a malformed independent cache buffer: %s',async mismatch=>{
+      const value=withCoverage(mismatch==='refused-ready'?'ready':'reading');
+      const malformed=structuredClone(value) as any;
+      if(mismatch==='unknown-key')malformed.quotaCoverage.extra=true;
+      if(mismatch==='variant')malformed.quotaCoverage.pending.state='pending';
+      if(mismatch==='cursor')malformed.quotaCoverage.pending.after.observedAtMs++;
+      if(mismatch==='day')malformed.effectiveDays.quota=['2026-05-30'];
+      if(mismatch==='refused-duplicate')malformed.quotaCoverage.refusedDays=['2026-05-29','2026-05-29'];
+      if(mismatch==='refused-ready')malformed.quotaCoverage.refusedDays=['2026-05-29'];
+      if(mismatch==='inline')malformed.preparingQuota=checkpoint('endpoints').preparingQuota;
+      if(mismatch==='reading-after-finish'){
+        malformed.phase='finish';malformed.acquisition={identity:value.identity,planAnchors:[],quotaRows:[]};
+      }
+      await expect(save(malformed)).rejects.toThrow('STORAGE_HISTORY_CHECKPOINT_UNAVAILABLE');
+      expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages').first('n')).toBe(0);
+    });
   it.each(phases)('roundtrips a partial prepared day in %s without changing its ordinals or payload', async phase => {
     const value = checkpoint(phase), saved = await save(value);
     expect(await loadStorageHistoryCheckpoint({ target: target(), key: saved.key })).toEqual({

@@ -12,9 +12,11 @@ import { decodeV1UsageReductionCheckpoint,encodeV1UsageReductionCheckpoint,
 import type { StorageV1HistoryCheckpoint } from './storage-v1-history';
 import type { StorageV11HistoryCheckpoint } from './storage-v11-history';
 import { isV11GenerationSnapshot } from './typed-v11-quota-reader';
-import { validEffectiveDays,validEffectiveQuotaCursor } from './storage-effective-history';
-import type { StorageEffectiveHistoryCheckpoint } from './storage-effective-history';
+import { validEffectiveDays,validEffectiveQuotaCursor,validEffectiveQuotaCoverage } from './storage-effective-history';
+import type { StorageEffectiveHistoryCheckpoint,EffectiveQuotaCoverage } from './storage-effective-history';
 import {validEffectiveQuotaDayPending,type EffectiveQuotaDayPending} from './effective-quota-day';
+import { GRAPH_DAY_PROJECTION_COMPONENTS,graphDayProjectionComponentEntries,graphDayProjectionFromComponents,
+ type GraphDayProjectionComponent } from './graph-day-projection-values';
 export type StorageHistoryCheckpoint=StorageV1HistoryCheckpoint|StorageV11HistoryCheckpoint|StorageEffectiveHistoryCheckpoint;
 export const STORAGE_HISTORY_PART_BYTES=128*1024,STORAGE_HISTORY_CONTROL_BYTES=16*1024;
 export const STORAGE_HISTORY_MAX_PARTS=1024,STORAGE_HISTORY_MAX_WRITES=32;
@@ -51,6 +53,51 @@ function keys(key:StorageHistoryKey){if(!key||Object.keys(key).sort().join(',')!
 function bounded(value:number,min:number,max:number){if(!Number.isSafeInteger(value)||value<min||value>max)throw fail();}
 function pin(value:string|null){if(value!==null&&!hash.test(value))throw fail();}
 export async function storageHistoryKeyDigest(key:StorageHistoryKey){keys(key);return sha256Hex(canonicalJson(key));}
+function decodeEffectiveCoverage(value:unknown,components:Record<string,unknown[]>,days:readonly string[],
+ phase:StorageEffectiveHistoryCheckpoint['phase'],inline?:EffectiveQuotaDayPending):EffectiveQuotaCoverage|undefined{
+ const coverageParts=()=>Object.keys(components).some(name=>name.startsWith('effectiveCoverage'));
+ if(value===undefined){if(coverageParts())throw fail();return undefined;}
+ if(!value||typeof value!=='object'||Array.isArray(value)
+  ||Object.keys(value).sort().join(',')!=='next,pending,refusedDays')throw fail();
+ const meta=value as Record<string,unknown>;
+ let pending:unknown=null;
+ if(meta.pending!==null){
+  if(!meta.pending||typeof meta.pending!=='object'||Array.isArray(meta.pending))throw fail();
+  const part=meta.pending as Record<string,unknown>;
+  if(part.state==='reading'){
+   if(Object.keys(part).sort().join(',')!=='after,day,quotaRowsRead,state')throw fail();
+   pending={state:'reading',after:part.after,quota:{day:part.day,quotaRowsRead:part.quotaRowsRead,
+    rows:components.effectiveCoverageRows??[]}};
+   delete components.effectiveCoverageRows;
+  }else if(part.state==='ready'){
+   if(Object.keys(part).sort().join(',')!=='day,quotaRowsRead,state'||typeof part.day!=='string')throw fail();
+   const projectionParts:Partial<Record<GraphDayProjectionComponent,unknown[]>>={};
+   for(const name of GRAPH_DAY_PROJECTION_COMPONENTS){
+    const key=`effectiveCoverage:${name}`;
+    if(components[key]!==undefined)projectionParts[name]=components[key];
+    delete components[key];
+   }
+   pending={state:'ready',day:{quotaRowsRead:part.quotaRowsRead,
+    projection:graphDayProjectionFromComponents(part.day,projectionParts)}};
+  }else throw fail();
+ }
+ const coverage={next:meta.next,refusedDays:meta.refusedDays,pending};
+ if(coverageParts()||!validEffectiveQuotaCoverage(coverage,days,phase,inline))throw fail();
+ return coverage;
+}
+function encodeEffectiveCoverage(coverage:EffectiveQuotaCoverage,components:Record<string,unknown[]>):unknown{
+ const pending=coverage.pending;
+ let meta:unknown=null;
+ if(pending?.state==='reading'){
+  components.effectiveCoverageRows=pending.quota.rows;
+  meta={state:'reading',after:pending.after,day:pending.quota.day,quotaRowsRead:pending.quota.quotaRowsRead};
+ }else if(pending?.state==='ready'){
+  for(const [name,entries]of graphDayProjectionComponentEntries(pending.day.projection))
+   components[`effectiveCoverage:${name}`]=[...entries];
+  meta={state:'ready',day:pending.day.projection.day,quotaRowsRead:pending.day.quotaRowsRead};
+ }
+ return {next:coverage.next,refusedDays:coverage.refusedDays,pending:meta};
+}
 function decode(controlText:string,manifest:Part[],parts:string[]):StorageHistoryCheckpoint{
  const control=parse(controlText),components:Record<string,unknown[]>={};
  if(size(controlText)>STORAGE_HISTORY_CONTROL_BYTES||!control||control.version!==1
@@ -80,14 +127,16 @@ function decode(controlText:string,manifest:Part[],parts:string[]):StorageHistor
       ||pending.quotaRowsRead>control.effectiveCursor.ordinal)throw fail();
     preparingQuota=pending;
    }else if(preparedRows!==undefined)throw fail();
+   const coverage=decodeEffectiveCoverage(control.quotaCoverage,components,control.effectiveDays.quota,'acquisition',preparingQuota);
    for(const name of V11_QUOTA_WORK_COMPONENTS)components[name]??=[];
    const acquisition=decodeV11QuotaWorkCheckpoint(control.identity,control.acquisition,components);
    if(preparingQuota&&(acquisition.phase!==control.effectiveCursor.phase||control.effectiveCursor.complete))throw fail();
    return {version:1,source:'effective',day:control.day,layout:control.layout,identity:control.identity,
     effectiveCursor:control.effectiveCursor,effectiveDays:control.effectiveDays,phase:'acquisition',acquisition,
-    ...(preparingQuota?{preparingQuota}:{})};
+    ...(preparingQuota?{preparingQuota}:{}),...(coverage?{quotaCoverage:coverage}:{})};
   }
   if(Object.hasOwn(control,'preparingQuota'))throw fail();
+  const coverage=decodeEffectiveCoverage(control.quotaCoverage,components,control.effectiveDays.quota,control.phase);
   const acquisition={identity:control.identity,planAnchors:components.planAnchors??[],quotaRows:components.quotaRows??[]};
   if(!validateV11CompletedQuotaAcquisition(acquisition)
    ||Object.keys(components).some(k=>!['planAnchors','quotaRows',...V11_USAGE_REDUCTION_COMPONENTS].includes(k)))throw fail();
@@ -96,11 +145,13 @@ function decode(controlText:string,manifest:Part[],parts:string[]):StorageHistor
     Object.fromEntries(V11_USAGE_REDUCTION_COMPONENTS.map(name=>[name,components[name]??[]])));
    if(!same(usage.identity,control.identity))throw fail();
    return {version:1,source:'effective',day:control.day,layout:control.layout,identity:control.identity,
-    effectiveCursor:control.effectiveCursor,effectiveDays:control.effectiveDays,phase:'usage',acquisition,usage};
+    effectiveCursor:control.effectiveCursor,effectiveDays:control.effectiveDays,phase:'usage',acquisition,usage,
+    ...(coverage?{quotaCoverage:coverage}:{})};
   }
   if(Object.keys(components).some(k=>!['planAnchors','quotaRows'].includes(k)))throw fail();
   return {version:1,source:'effective',day:control.day,layout:control.layout,identity:control.identity,
-   effectiveCursor:control.effectiveCursor,effectiveDays:control.effectiveDays,phase:'finish',acquisition};
+   effectiveCursor:control.effectiveCursor,effectiveDays:control.effectiveDays,phase:'finish',acquisition,
+   ...(coverage?{quotaCoverage:coverage}:{})};
  }
  if(control.source==='v1.1'){
   createV11QuotaAcquisitionCheckpoint(control.identity);
@@ -163,9 +214,12 @@ async function frame(key:StorageHistoryKey,checkpoint:StorageHistoryCheckpoint):
       ||pending.day!==checkpoint.effectiveCursor.day||pending.quotaRowsRead>checkpoint.effectiveCursor.ordinal)throw fail();
     components.effectiveQuotaRows=pending.rows;
    }
+   const coverage=checkpoint.quotaCoverage;
+   if(coverage!==undefined&&!validEffectiveQuotaCoverage(coverage,checkpoint.effectiveDays.quota,checkpoint.phase,pending))throw fail();
    const control=canonicalJson({version:1,source:'effective',day:checkpoint.day,layout:checkpoint.layout,
     identity:checkpoint.identity,effectiveCursor:checkpoint.effectiveCursor,effectiveDays:checkpoint.effectiveDays,phase:checkpoint.phase,
     ...(pending?{preparingQuota:{day:pending.day,quotaRowsRead:pending.quotaRowsRead}}:{}),
+    ...(coverage?{quotaCoverage:encodeEffectiveCoverage(coverage,components)}:{}),
     acquisition:checkpoint.phase==='acquisition'?encodeV11QuotaWorkCheckpoint(checkpoint.acquisition).control:null,
     usage:usage?.control??null});
    if(size(control)>STORAGE_HISTORY_CONTROL_BYTES)throw fail();

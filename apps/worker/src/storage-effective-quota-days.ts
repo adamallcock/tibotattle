@@ -19,7 +19,8 @@ export const STORAGE_EFFECTIVE_QUOTA_WINDOW_BYTES = 8 * 1024 * 1024;
 /** Optional input cache. It never grants source authority: both preparation
  * and consumption recompute the exact day dependency under the current owner
  * fence. The caller supplies the invocation's actual shared statement meter.
- * Cold preparation is fed by the existing quota scan, not a second traversal. */
+ * Preparation shares ordinary quota pages; an adopted prefix gap may use one
+ * additional bounded page between analytical checkpoints. */
 export async function createStorageEffectiveQuotaPreparation(input: {
   source: D1Database; target: D1Database; sourceId: string; sourceNamespace: string;
   owner: StorageCommunityOwner & {ownerDigest:string};
@@ -27,22 +28,41 @@ export async function createStorageEffectiveQuotaPreparation(input: {
 }): Promise<Preparation|undefined> {
   if (!await graphDayEffectiveQuotaSupported(input.target)) return undefined;
   const available = (reserve: number) => input.remainingQueries() >= reserve && input.now() < input.deadlineMs;
-  const keyFor = async (day: string): Promise<GraphDayProjectionKey> => ({
+  // Scalar identities only, scoped to this invocation's immutable owner
+  // revision. Every consumer fences that owner before and after using one.
+  const dependencyDigests=new Map<string,string>();
+  const keyFor = async (day: string): Promise<GraphDayProjectionKey> => {
+    let digest=dependencyDigests.get(day);
+    if(digest===undefined){
+      digest=await sha256Hex(canonicalJson(await effectiveHistoryDependency(input.source,
+        input.owner,input.sourceNamespace,day,day,{includeSessions:true})));
+      dependencyDigests.set(day,digest);
+    }
+    return {
     sourceId: input.sourceId, sourceLayout: 'effective', sourceNamespace: input.sourceNamespace,
     ownerDigest: input.owner.ownerDigest, deviceId: GRAPH_DAY_EFFECTIVE_DEVICE_ID,
     manifestId: GRAPH_DAY_EFFECTIVE_MANIFEST_ID, day,
     // Match the completed daily projector's dependency contract so retirement
     // can recognize corrections once that projector catches up. A session-only
     // change may conservatively rebuild quota inputs; it cannot serve stale data.
-    manifestDigest: await sha256Hex(canonicalJson(await effectiveHistoryDependency(input.source,
-      input.owner, input.sourceNamespace, day, day, {includeSessions:true}))),
-  });
+    manifestDigest:digest,
+  };};
   let attempted = false, fallbackPage = false;
   let retainedHeads:Awaited<ReturnType<typeof readGraphDayEffectiveQuotaHeads>>;
   let requestedDays:readonly string[]=[];
   const validDays=new Set<string>();
+  const missingDays=new Set<string>();
+  let coverageKnown=false;
+  let partialReprobe=false;
   return {
     preferSinglePageCheckpoint:()=>fallbackPage,
+    async nextMissingDay(days,excluded) {
+      // Absence and an exact dependency miss are evidence of a gap. An
+      // unavailable/oversized probe is not: never start another source scan
+      // merely because the whole-window cache could not be admitted.
+      if(!coverageKnown||!available(200))return undefined;
+      return days.find(day=>missingDays.has(day)&&!validDays.has(day)&&!excluded.includes(day));
+    },
     async shouldPrepare(day) {
       if(validDays.has(day))return false;
       const candidates=retainedHeads?.filter(head=>head.key.day===day)??[];
@@ -51,7 +71,9 @@ export async function createStorageEffectiveQuotaPreparation(input: {
       // framing their raw rows again in every later-phase checkpoint. This
       // only skips optional cache writes; source acquisition still runs.
       if(!available(160))return false;
+      await assertEffectiveHistoryOwner(input.source,input.owner);
       const key=await keyFor(day);
+      await assertEffectiveHistoryOwner(input.source,input.owner);
       if(!candidates.some(head=>head.key.manifestDigest===key.manifestDigest))return true;
       validDays.add(day);
       return false;
@@ -61,6 +83,8 @@ export async function createStorageEffectiveQuotaPreparation(input: {
       // coverage. Rechecking after every page would slow the paged fallback.
       if (attempted) return undefined;
       attempted = true;
+      coverageKnown=false;
+      missingDays.clear();
       requestedDays=[...days];
       if (days.length === 0) return [];
       if (!available(260)) return undefined;
@@ -72,32 +96,35 @@ export async function createStorageEffectiveQuotaPreparation(input: {
       const candidates = days.map(day => heads.filter(head => head.key.day === day));
       // Prove complete coverage and affordability before doing source work.
       // Until dependencies are known, use each day's largest retained candidate.
-      if (candidates.some(day => day.length === 0)) return undefined;
-      const bytes = candidates.reduce((sum,day) => sum + Math.max(...day.map(head => head.payloadBytes)),0);
-      const fragments = candidates.reduce((sum,day) => sum + Math.max(...day.map(head => head.fitFragmentCount)),0);
-      const payloadReads = candidates.reduce((sum,day) => sum + Math.max(...day.map(head => Math.ceil(head.cursor.partCount/32))),0);
+      const bytes = candidates.reduce((sum,day) => sum + Math.max(0,...day.map(head => head.payloadBytes)),0);
+      const fragments = candidates.reduce((sum,day) => sum + Math.max(0,...day.map(head => head.fitFragmentCount)),0);
+      const payloadReads = candidates.reduce((sum,day) => sum + Math.max(0,...day.map(head => Math.ceil(head.cursor.partCount/32))),0);
       if (bytes > STORAGE_EFFECTIVE_QUOTA_WINDOW_BYTES || fragments > QUOTA_RESET_CLUSTER_LIMIT) return undefined;
+      for(const [index,candidate]of candidates.entries())if(candidate.length===0)missingDays.add(days[index]!);
+      if (missingDays.size>0) {coverageKnown=true;return undefined;}
       // Share the five schema/header statements across the bounded window;
       // occurrence links still need one exact query for each selected day.
       // Read every dependency before loading payloads: a late miss still has
       // the 200 statements needed to advance the normal pager. A complete fold
       // needs only its 120-statement checkpoint reserve. Bulk heads remove one
       // manifest read per day, keeping a small 101-day window within the cap.
-      if (!available(5+days.length + Math.max(200,payloadReads+120) + 2)) return undefined;
+      const dependencyDays=days.filter(day=>!dependencyDigests.has(day));
+      if (!available((dependencyDays.length?5+dependencyDays.length:0) + Math.max(200,payloadReads+120) + 2)) return undefined;
       // Until the complete window is proved, any fallback must be able to
       // stage the same one-page successor on a retry, even if it is >30 parts.
       fallbackPage = true;
       await assertEffectiveHistoryOwner(input.source,input.owner);
       const dependencies=await createEffectiveHistoryDayDependencyReader(input.source,input.owner,
-        input.sourceNamespace,days,{includeSessions:true,canContinue:()=>input.now()<input.deadlineMs});
+        input.sourceNamespace,dependencyDays,{includeSessions:true,canContinue:()=>input.now()<input.deadlineMs});
       if(!dependencies)return undefined;
       const selected:typeof heads[number][] = [];
       for (const [index,day] of days.entries()) {
         if (input.now() >= input.deadlineMs) return undefined;
-        const digest=await dependencies.readDigest(day);
+        const digest=dependencyDigests.get(day)??await dependencies.readDigest(day);
         if(digest===undefined)return undefined;
+        dependencyDigests.set(day,digest);
         const head=candidates[index]!.find(candidate => candidate.key.manifestDigest === digest);
-        if (!head) return undefined;
+        if (!head) {missingDays.add(day);coverageKnown=true;return undefined;}
         validDays.add(day);
         selected.push(head);
       }
@@ -125,7 +152,7 @@ export async function createStorageEffectiveQuotaPreparation(input: {
       // Keep enough room for the normal checkpoint after optional preparation.
       // A bounded miss is harmless: the paged calculation already has the same
       // source rows and remains the authority for this result.
-      if (!available(160)) return;
+      if (!available(160)) return 'deferred';
       if (!validEffectiveQuotaDay(day)) throw fail();
       await assertEffectiveHistoryOwner(input.source,input.owner);
       const key = await keyFor(day.projection.day);
@@ -141,14 +168,23 @@ export async function createStorageEffectiveQuotaPreparation(input: {
           ...(cursor?{cursor}:{})});
         if (saved.status === 'stored') {
           validDays.add(day.projection.day);
-          // Reconsider a miss only when this scan has filled every missing
-          // day. That permits the current job to fold its remaining phases
-          // while avoiding a fresh metadata probe after every source page.
-          if(attempted&&requestedDays.length>0&&requestedDays.every(value=>validDays.has(value)))attempted=false;
-          return;
+          missingDays.delete(day.projection.day);
+          // Full exact coverage may rearm immediately. An absent-head probe
+          // did not validate its retained suffix; after filling those known
+          // holes, allow one additional full validation in this invocation.
+          // A later stale head can refuse that fold, never open a probe loop.
+          if(attempted&&requestedDays.length>0){
+            if(requestedDays.every(value=>validDays.has(value)))attempted=false;
+            else if(!partialReprobe&&coverageKnown&&missingDays.size===0
+              &&requestedDays.every(value=>validDays.has(value)||retainedHeads?.some(head=>head.key.day===value))){
+              partialReprobe=true;attempted=false;
+            }
+          }
+          return 'stored';
         }
         cursor = saved.cursor;
       }
+      return 'deferred';
     },
   };
 }
