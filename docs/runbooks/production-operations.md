@@ -370,7 +370,12 @@ merely because another invocation is running.
 
 With `GRAPH_DAY_PROJECTION_FOLD=enabled` and analytics migration
 `0028_graph_day_effective_quota.sql` present, effective-history calculations also
-prepare quota days during their first source scan. Both fits and model results
+prepare missing quota days during any of their four quota acquisition passes.
+Preparation starts only at a complete day boundary; an adopted mid-day cursor
+waits until another day or a later pass. Exact already-prepared days are skipped.
+Once preparation completes the whole window, the same job can retry the fold
+within its remaining query and time budget.
+Both fits and model results
 can reuse those inputs for overlapping windows; usage retains its existing
 effective reader. Missing migration support or incomplete cache coverage uses
 the paged calculation. This flag does not increase the 950-statement invocation
@@ -385,6 +390,13 @@ keeps the existing 4,096-reset-cluster bound. Whole-window query admission
 preserves a fallback calculation or checkpoint save; exceeding a preparation
 bound does not publish an analytical refusal.
 
+Complete-window validation shares a bounded header read across the selected
+days, then checks occurrence links separately for each exact day. The shared
+headers admit at most 30,000 rows and 4 MiB; overflow selects the paged fallback.
+The loader stops at the first stale day and verifies every dependency before
+decoding cached payloads. It preserves query reserves for an ordinary page or
+checkpoint save. This batching does not weaken source or owner fences.
+
 Retirement also bounds the effective prepared cache to the input horizon of
 the scheduled graph: the oldest retained result day plus its existing model
 lookback (currently 170 inclusive UTC input days). It deletes obsolete derived
@@ -392,10 +404,12 @@ values before their pages. This does not change source or daily-publication
 retention.
 
 Prepared effective checkpoints retain the original effective method names and
-isolate their storage dependency digest with the `effective-quota-days-2`
+isolate their storage dependency digest with the `effective-quota-days-3`
 format domain. Older independently deployed cleanup Workers recognize those
-methods. The prepared reader can adopt existing paged progress; disabling the
-flag resumes the original unwrapped key. Completed result identities remain
+methods. The prepared reader adopts the previous `effective-quota-days-2` key
+before trying the original paged key, and advances only the new key. The previous
+keys remain for rollback until ordinary horizon or erasure cleanup; disabling
+the flag resumes the original unwrapped key. Completed result identities remain
 unchanged. After validated result readback, the analytics Worker marks the
 prepared checkpoint retired with a bounded page; existing cleanup drains its
 remaining parts. The abandoned `:quota-days-1` keys and their permanent

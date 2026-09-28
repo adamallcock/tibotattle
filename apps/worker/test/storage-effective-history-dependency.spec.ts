@@ -15,11 +15,15 @@ import {
   type TelemetryV12UsageEvent,
 } from "@app-usagemonitor/telemetry-contract";
 import { initializeStorageSource } from "../src/analytics-delivery";
-import { initializeTypedV1Admission } from "../src/typed-v1-admission";
+import { initializeTypedV1Admission, insertTypedTelemetryV1Chunk } from "../src/typed-v1-admission";
+import { currentTelemetryV1Chunk } from "../src/telemetry-v1-repository";
+import { parseTelemetryV1Chunk, type TelemetryV1UsageEvent } from "../src/telemetry-v1";
+import { telemetryV11LegacyProjection } from "../src/telemetry-v11-compatibility";
 import { initializeTypedV11Admission, persistTypedV11StagedChunk } from "../src/typed-v11-admission";
 import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor } from "../src/telemetry-v11-domain";
 import { activateTelemetryV12Domain, createTelemetryV12DomainPredecessor } from "../src/telemetry-v12-domain";
-import { effectiveHistoryDependency, effectiveHistoryPin } from "../src/storage-effective-history";
+import { createEffectiveHistoryDayDependencyReader, effectiveHistoryDependency,
+  effectiveHistoryPin } from "../src/storage-effective-history";
 import { readEffectiveTelemetryOwnerDayPage, readEffectiveTelemetryOwnerDays } from "../src/telemetry-usage-effective-reader";
 import { readStorageCommunityOwnerPage } from "../src/storage-community-authority";
 import { drainCommunityPublicSourceBootstrap } from "../src/community-daily-aggregates";
@@ -79,6 +83,35 @@ async function stage(fixture: Fixture, prepared: Prepared): Promise<Staged> {
     });
   }
   return registerTelemetryV11DayManifest(db(), fixture, prepared.manifest);
+}
+
+async function insertV1HistoryDay(fixture: Fixture, selectedDay: string, revision: number,
+  supersedes: Awaited<ReturnType<typeof currentTelemetryV1Chunk>> = null) {
+  const projected = telemetryV11LegacyProjection("usage", v11UsageRecord(selectedDay, "a", {
+    eventId: `event:v2:synthetic-v1-${selectedDay}`,
+    totalInputContextTokens: revision > 1 ? 150 : null,
+    components: { inputUncachedTokens: 100, inputCacheReadTokens: null, inputCacheWriteTokens: null,
+      outputTextTokens: 50, outputReasoningTokens: 25, outputCombinedTokens: revision > 1 ? 75 : null },
+  }));
+  if (!projected) throw new Error("synthetic history v1 projection missing");
+  const records = [JSON.parse(projected.canonicalRecord) as TelemetryV1UsageEvent];
+  const envelopeDigest = await sha256Hex(`synthetic-history-v1:${crypto.randomUUID()}`);
+  const principal = await authenticateDevice(db(), fixture.authorization);
+  const upload = await createDeviceUploadAuthorization(db(), principal, envelopeDigest, 1000);
+  const claimed = await claimDeviceUploadAuthorization(db(), `Upload ${upload.uploadAuthorization}`, {
+    envelopeDigest, bodyBytes: 1000, contentType: "application/json",
+  });
+  const chunk = parseTelemetryV1Chunk({ schemaVersion: "telemetry-contribution-v1.0",
+    chunkId: `usage:${selectedDay}:0`, chunkRevision: revision,
+    chunkDigest: await sha256Hex(canonicalJson(records)), parserVersion: "synthetic-history-v1",
+    consent: { telemetrySchemaVersion: "telemetry-contribution-v1.0",
+      fieldDictionaryVersion: "telemetry-v1.0-registry-2026-08-07.1",
+      privacyContractVersion: "ongoing-privacy-safe-telemetry-v1.0" }, records,
+  });
+  return insertTypedTelemetryV1Chunk(db(), { chunkRowId: `chunk:${crypto.randomUUID()}`,
+    participantId: fixture.participantId, deviceId: fixture.deviceId, chunk, envelopeDigest,
+    r2Key: `synthetic/history-v1/${crypto.randomUUID()}`, deviceUploadAuthorizationId: claimed.authorizationId,
+    createdAt: new Date().toISOString(), supersedes }, namespace);
 }
 
 beforeEach(async () => {
@@ -386,6 +419,231 @@ describe("closed effective history dependency", () => {
   }, 120_000);
 });
 
+type DependencyQuery = { sql: string; values: readonly unknown[] };
+function observeDependencyQueries(source: D1Database, options: {
+  rows?: (query: DependencyQuery, rows: Record<string, unknown>[]) => Record<string, unknown>[];
+  afterQuery?: (query: DependencyQuery) => void;
+} = {}) {
+  const queries: DependencyQuery[] = [];
+  const database = new Proxy(source, { get(target, key) {
+    if (key === "prepare") return (sql: string) => {
+      const wrap = (statement: D1PreparedStatement, values: readonly unknown[] = []): D1PreparedStatement =>
+        new Proxy(statement, { get(inner, member) {
+          if (member === "bind") return (...bound: unknown[]) => wrap(inner.bind(...bound), bound);
+          if (member === "all") return async () => {
+            const query = { sql, values };
+            const result = await inner.all<Record<string, unknown>>();
+            queries.push(query);
+            const rows = options.rows?.(query, result.results) ?? result.results;
+            options.afterQuery?.(query);
+            return { ...result, results: rows };
+          };
+          const value = Reflect.get(inner, member);
+          return typeof value === "function" ? value.bind(inner) : value;
+        } });
+      return wrap(target.prepare(sql));
+    };
+    const value = Reflect.get(target, key);
+    return typeof value === "function" ? value.bind(target) : value;
+  } });
+  return { database, queries };
+}
+
+const emptyDependencyOwner: StorageCommunityOwner = {
+  participantId: "participant:synthetic-empty-history", ownerDigest: "a".repeat(64),
+  inputRevision: 1, ownerRevision: 1, authorityEpoch: 1,
+  hasV1: false, hasV11: false, hasV12: false, hasLegacy: false, hasEffective: true,
+};
+
+describe("bounded shared effective day dependencies", () => {
+  it("matches exact singleton digests across v1, v1.1, v1.2, sessions, corrections, and selected-day links", async () => {
+    const days = [day(), dayAfter(day())];
+    const legacy = await createV11DeviceFixture(db());
+    for (const selectedDay of days) await insertV1HistoryDay(legacy, selectedDay, 1);
+    await db().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+    for (const selectedDay of days) {
+      const previous = await currentTelemetryV1Chunk(db(), legacy.participantId, legacy.deviceId, "usage", selectedDay, 0);
+      expect(previous).not.toBeNull();
+      await insertV1HistoryDay(legacy, selectedDay, 2, previous);
+    }
+    const v11 = await createV11DeviceFixture(db(), { grant: true });
+    const v11Days: Staged[] = [];
+    for (const selectedDay of days) v11Days.push(await stage(v11, await makeV11Day(selectedDay, {
+      usage: [v11UsageRecord(selectedDay, "b", { eventId: `event:v2:synthetic-v11-${selectedDay}` })],
+      session: [{ schemaVersion: "session-dimension-v1.1", sessionUuid: `session:synthetic-history-${selectedDay}`,
+        firstEventTime: `${selectedDay}T12:00:00.000Z`, provider: "openai_codex",
+        toolClassCounts: { shell: 1, other: 0 } }],
+    })));
+    await activate(v11, v11Days);
+    await db().prepare("UPDATE telemetry_v12_runtime SET state='active' WHERE id=1").run();
+    const v12 = await createV11DeviceFixture(db());
+    await grantTelemetryV12Consent(db(), v12, telemetryV12RequiredConsent());
+    await prepareOwner(v12.participantId);
+    const v12Days: V12Uploaded[] = [];
+    for (const selectedDay of days) v12Days.push(await stageV12Day(v12, selectedDay,
+      [v12UsageRecord(selectedDay, `event:v2:${"c".repeat(64)}`)]));
+    await activateV12(v12, v12Days);
+    const owners = await readStorageCommunityOwnerPage(db());
+
+    for (const [family, fixture] of [["v1", legacy], ["v11", v11], ["v12", v12]] as const) {
+      const owner = owners.find(value => value.participantId === fixture.participantId)!;
+      expect(owner).toBeDefined();
+      for (const includeSessions of [false, true]) {
+        const observed = observeDependencyQueries(db());
+        const reader = await createEffectiveHistoryDayDependencyReader(observed.database, owner, namespace,
+          days, { includeSessions });
+        expect(reader).toBeDefined();
+        expect(observed.queries).toHaveLength(5);
+        for (const [index, selectedDay] of days.entries()) {
+          const exact = await effectiveHistoryDependency(db(), owner, namespace, selectedDay, selectedDay,
+            { includeSessions });
+          for (const vector of ["v1", "v11", "v12"] as const) expect(exact[vector]).toHaveLength(vector === family ? 1 : 0);
+          expect(exact.corrections).toEqual(family === "v1"
+            ? [expect.objectContaining({ event_day: selectedDay, history_fact_count: 1 })] : []);
+          if (family === "v12") expect(exact.occurrenceLinks).toEqual(expect.arrayContaining([
+            expect.objectContaining({ family: "v12", source_day: days[1 - index] }),
+          ]));
+          expect(await reader!.readDigest(selectedDay)).toBe(await sha256Hex(canonicalJson(exact)));
+          expect(observed.queries).toHaveLength(6 + index);
+        }
+        const wholeWindow = await effectiveHistoryDependency(db(), owner, namespace, days[0]!, days[1]!,
+          { includeSessions });
+        expect(wholeWindow.occurrenceLinks).toEqual([]);
+        // Each v1.2 singleton still links the other selected day. A partition
+        // of the whole-window result would silently omit that evidence.
+        expect(observed.queries.filter(query => query.sql.includes("selected(occurrence_id)"))).toHaveLength(2);
+        expect(observed.queries.some(query => query.sql.includes("q.used_percent")
+          || query.sql.includes("payload_json"))).toBe(false);
+      }
+    }
+  }, 60_000);
+
+  it("stops after six source statements when only the first of 101 digests is needed", async () => {
+    const first = Date.parse("2026-05-01T00:00:00.000Z");
+    const days = Array.from({ length: 101 }, (_, index) => new Date(first + index * 86_400_000).toISOString().slice(0, 10));
+    const observed = observeDependencyQueries(db());
+    const reader = await createEffectiveHistoryDayDependencyReader(observed.database, emptyDependencyOwner, namespace, days);
+    expect(observed.queries).toHaveLength(5);
+    const exact = await effectiveHistoryDependency(db(), emptyDependencyOwner, namespace, days[0]!, days[0]!);
+    expect(await reader!.readDigest(days[0]!)).toBe(await sha256Hex(canonicalJson(exact)));
+    expect(observed.queries).toHaveLength(6);
+    expect(observed.queries.filter(query => query.sql.includes("selected(occurrence_id)"))).toHaveLength(1);
+    expect(observed.queries.some(query => query.sql.includes("payload_json") || query.sql.includes("q.used_percent"))).toBe(false);
+  });
+
+  it.each(["schema", "v1", "v11", "v12", "corrections"] as const)(
+    "stops optional work when the deadline expires after the %s query", async (phase) => {
+      const selectedDay = day();
+      let now = 0;
+      const queryCounts = { schema: 1, v1: 2, v11: 3, v12: 4, corrections: 5 };
+      const observed = observeDependencyQueries(db(), { afterQuery() {
+        if (observed.queries.length === queryCounts[phase]) now = 10;
+      } });
+      const reader = await createEffectiveHistoryDayDependencyReader(observed.database, emptyDependencyOwner,
+        namespace, [selectedDay], { canContinue: () => now < 10 });
+      if (phase === "corrections") {
+        expect(reader).toBeDefined();
+        expect(await reader!.readDigest(selectedDay)).toBeUndefined();
+      } else expect(reader).toBeUndefined();
+      expect(observed.queries).toHaveLength(queryCounts[phase]);
+      expect(observed.queries.some(query => query.sql.includes("selected(occurrence_id)"))).toBe(false);
+    });
+
+  it("rejects invalid scopes and unselected reads before querying, and honors an already elapsed deadline", async () => {
+    const observed = observeDependencyQueries(db());
+    const first = "2026-05-01", second = "2026-05-02";
+    for (const days of [[second, first], [first, first], ["2026-02-30"], [first, "2026-08-10"],
+      Array.from({ length: 102 }, (_, index) => new Date(Date.parse(first) + index * 86_400_000).toISOString().slice(0, 10))]) {
+      await expect(createEffectiveHistoryDayDependencyReader(observed.database, emptyDependencyOwner, namespace, days))
+        .rejects.toThrow("STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE");
+    }
+    expect(await createEffectiveHistoryDayDependencyReader(observed.database, emptyDependencyOwner,
+      namespace, [first, second], { canContinue: () => false })).toBeUndefined();
+    expect(observed.queries).toHaveLength(0);
+    const reader = await createEffectiveHistoryDayDependencyReader(observed.database, emptyDependencyOwner,
+      namespace, [first]);
+    await expect(reader!.readDigest(second)).rejects.toThrow("STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE");
+    expect(observed.queries).toHaveLength(5);
+  });
+
+  it.each(["rows", "bytes"] as const)("declines aggregate %s overflow while preserving exact single-day fallback", async (kind) => {
+    const days = ["2026-05-01", "2026-05-02"];
+    const rowsByFamily = {
+      v1: Array.from({ length: kind === "rows" ? 15_000 : 20_000 }, (_, index) => ({
+        id: `chunk:${index.toString().padStart(5, "0")}`, device_id: "device:synthetic", stream: "usage",
+        chunk_day: days[index < (kind === "rows" ? 7_500 : 10_000) ? 0 : 1], chunk_seq: index, revision: 1,
+        chunk_digest: "b".repeat(64), accepted_record_count: 1,
+      })),
+      v11: kind === "rows" ? Array.from({ length: 15_001 }, (_, index) => ({
+        device_id: "device:synthetic-v11", observed_day: days[index < 7_500 ? 0 : 1],
+        manifest_id: `manifest:${index.toString().padStart(5, "0")}`, manifest_digest: "c".repeat(64),
+      })) : [],
+    };
+    const v1Bytes = new TextEncoder().encode(canonicalJson(rowsByFamily.v1)).byteLength;
+    expect(rowsByFamily.v1.length).toBeLessThanOrEqual(30_000);
+    expect(rowsByFamily.v11.length).toBeLessThanOrEqual(30_000);
+    if (kind === "rows") expect(v1Bytes).toBeLessThan(4 * 1024 * 1024);
+    else expect(v1Bytes).toBeGreaterThan(4 * 1024 * 1024);
+    const observed = observeDependencyQueries(db(), { rows(query, original) {
+      if (query.sql.startsWith("SELECT c.id,c.device_id,c.stream,c.chunk_day")) {
+        return rowsByFamily.v1.filter(row => row.chunk_day! >= String(query.values[3])
+          && row.chunk_day! <= String(query.values[4])).slice(0, Number(query.values.at(-1)));
+      }
+      if (query.sql.startsWith("SELECT DISTINCT event.device_id,domain_day.observed_day")) {
+        return rowsByFamily.v11.filter(row => row.observed_day! >= String(query.values[2])
+          && row.observed_day! <= String(query.values[3])).slice(0, Number(query.values.at(-1)));
+      }
+      return original;
+    } });
+    expect(await createEffectiveHistoryDayDependencyReader(observed.database, emptyDependencyOwner,
+      namespace, days)).toBeUndefined();
+    expect(observed.queries).toHaveLength(kind === "rows" ? 3 : 2);
+    if (kind === "rows") expect(observed.queries[2]!.values.at(-1)).toBe(15_001);
+    expect(observed.queries.some(query => query.sql.includes("selected(occurrence_id)"))).toBe(false);
+    for (const selectedDay of days) {
+      const exact = await effectiveHistoryDependency(observed.database, emptyDependencyOwner,
+        namespace, selectedDay, selectedDay);
+      const reader = await createEffectiveHistoryDayDependencyReader(observed.database, emptyDependencyOwner,
+        namespace, [selectedDay]);
+      expect(reader).toBeDefined();
+      expect(await reader!.readDigest(selectedDay)).toBe(await sha256Hex(canonicalJson(exact)));
+      expect(exact.v1.length).toBe(kind === "rows" ? 7_500 : 10_000);
+    }
+  }, 60_000);
+
+  it("supports an absent v1.2 schema and keeps partial-schema or provider errors visible", async () => {
+    await reset();
+    for (const migrations of [b.TEST_MIGRATIONS, b.TEST_TYPED_INGESTION_MIGRATIONS,
+      b.TEST_INGESTION_BRIDGE_MIGRATIONS, b.TEST_TYPED_V1_ADMISSION_MIGRATIONS,
+      b.TEST_TYPED_V11_ADMISSION_MIGRATIONS]) await applyD1Migrations(db(), migrations);
+    await applyD1Migrations(db(), b.TEST_INGESTION_ISOLATION_MIGRATIONS
+      .filter(migration => !/^(0008|0010|0011|0012)_/u.test(migration.name)));
+    const selectedDay = day();
+    const observed = observeDependencyQueries(db());
+    const reader = await createEffectiveHistoryDayDependencyReader(observed.database, emptyDependencyOwner,
+      namespace, [selectedDay]);
+    expect(reader).toBeDefined();
+    expect(observed.queries).toHaveLength(4);
+    const exact = await effectiveHistoryDependency(db(), emptyDependencyOwner, namespace, selectedDay, selectedDay);
+    expect(exact.v12).toEqual([]);
+    expect(await reader!.readDigest(selectedDay)).toBe(await sha256Hex(canonicalJson(exact)));
+    expect(observed.queries).toHaveLength(5);
+
+    const providerError = new Error("synthetic D1 provider unavailable");
+    const failing = observeDependencyQueries(db(), { rows(query, rows) {
+      if (query.sql.startsWith("SELECT c.id,c.device_id,c.stream,c.chunk_day")) throw providerError;
+      return rows;
+    } });
+    await expect(createEffectiveHistoryDayDependencyReader(failing.database, emptyDependencyOwner,
+      namespace, [selectedDay])).rejects.toBe(providerError);
+    await db().prepare("CREATE TABLE telemetry_v12_runtime (id INTEGER PRIMARY KEY)").run();
+    await expect(createEffectiveHistoryDayDependencyReader(db(), emptyDependencyOwner, namespace, [selectedDay]))
+      .rejects.toThrow("STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE");
+    await expect(effectiveHistoryDependency(db(), emptyDependencyOwner, namespace, selectedDay, selectedDay))
+      .rejects.toThrow("STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE");
+  });
+});
+
 function v12QuotaRecords(selectedDay: string): TelemetryV12QuotaObservation[] {
   const start = Date.parse(`${selectedDay}T01:00:00.000Z`);
   return Array.from({ length: 9 }, (_, index) => ({
@@ -479,6 +737,34 @@ async function retainedDailyFingerprint(selectedDay: string): Promise<string | n
 }
 
 describe("effective quota preparation source fences", () => {
+  it("skips exact cached days in an incomplete window without decoding or preparing them again", async () => {
+    const fixture = await quotaCacheFixture();
+    fixture.observed.clear();
+    const { cache, meter } = await quotaCacheFor(fixture.initial.owner, fixture.observed.database);
+    const missingDay = dayAfter(fixture.selectedDay);
+    expect(await cache.load([fixture.selectedDay, missingDay], fixture.identity)).toBeUndefined();
+    const before = meter.queriesUsed;
+    expect(await cache.shouldPrepare!(fixture.selectedDay)).toBe(false);
+    const validated = meter.queriesUsed;
+    expect(validated - before).toBe(6);
+    expect(await cache.shouldPrepare!(fixture.selectedDay)).toBe(false);
+    expect(await cache.shouldPrepare!(missingDay)).toBe(true);
+    expect(meter.queriesUsed).toBe(validated);
+    expect(fixture.observed.reads()).toBe(0);
+  }, 60_000);
+
+  it("prepares a changed day again even when its previous cached head remains", async () => {
+    const fixture = await quotaCacheFixture();
+    const changed = fixture.records.map((record, index) => index === 4 ? { ...record, usedPercent: 37 } : record);
+    const replacement = await stageV12Day(fixture.fixture, fixture.selectedDay, changed);
+    await activateV12(fixture.fixture, [replacement]);
+    const current = await readDependencyAt(fixture.selectedDay);
+    const { cache } = await quotaCacheFor(current.owner);
+    expect(await cache.load([fixture.selectedDay, dayAfter(fixture.selectedDay)], fixture.identity)).toBeUndefined();
+    expect(await cache.shouldPrepare!(fixture.selectedDay)).toBe(true);
+    expect(await retainedDailyFingerprint(fixture.selectedDay)).toBe(fixture.dailyFingerprint);
+  }, 60_000);
+
   it("loads real v1.2 quota without decoding it again and folds the same acquisition", async () => {
     const fixture = await quotaCacheFixture();
     fixture.observed.clear();
@@ -587,8 +873,8 @@ describe("effective quota preparation source fences", () => {
       && value.projection.runEndpoints.endpoints.length === 0)).toBe(true);
     expect(canonicalJson(loaded!.at(-1))).toBe(canonicalJson(fixture.prepared));
     expect(fixture.observed.reads()).toBe(0);
-    expect(measured.meter.queriesUsed).toBeLessThanOrEqual(830);
-    expect(measured.meter.remainingQueries).toBeGreaterThanOrEqual(120);
+    expect(measured.meter.queriesUsed).toBeLessThanOrEqual(230);
+    expect(measured.meter.remainingQueries).toBeGreaterThanOrEqual(720);
 
     // The last source day changes only after the first 100 dependencies still
     // match. A loader that interleaves validation and payload reads wastes its
@@ -619,7 +905,8 @@ describe("effective quota preparation source fences", () => {
     expect(await missed.cache.load(days, currentIdentity)).toBeUndefined();
     expect(cachedPayloadReads).toBe(0);
     expect(fixture.observed.reads()).toBe(0);
-    expect(missed.meter.remainingQueries).toBeGreaterThanOrEqual(200);
+    expect(missed.meter.queriesUsed).toBeLessThanOrEqual(120);
+    expect(missed.meter.remainingQueries).toBeGreaterThanOrEqual(830);
 
     // Rebuild that day from its now-current effective occurrences. Both
     // immutable cache heads remain, so loading must select the matching
@@ -650,8 +937,8 @@ describe("effective quota preparation source fences", () => {
     expect(reloaded!.map(value => value.projection.day)).toEqual(days);
     expect(canonicalJson(reloaded!.at(-1))).toBe(canonicalJson(currentPrepared));
     expect(fixture.observed.reads()).toBe(0);
-    expect(retained.meter.queriesUsed).toBeLessThanOrEqual(830);
-    expect(retained.meter.remainingQueries).toBeGreaterThanOrEqual(120);
+    expect(retained.meter.queriesUsed).toBeLessThanOrEqual(230);
+    expect(retained.meter.remainingQueries).toBeGreaterThanOrEqual(720);
     console.info("effective quota prepared window resource probe", {
       days: days.length, warmStatements: measured.meter.queriesUsed,
       warmRemaining: measured.meter.remainingQueries, lateMissStatements: missed.meter.queriesUsed,

@@ -1,0 +1,129 @@
+import { env, reset, applyD1Migrations, type D1Migration } from 'cloudflare:test';
+import { beforeEach, describe, expect, it } from 'vitest';
+import { canonicalJson } from '../src/canonical-json';
+import { sha256Hex } from '../src/crypto';
+import { createV11QuotaAcquisitionCheckpoint } from '../src/quota-analysis-v11-reader';
+import { STORAGE_GRAPH_EFFECTIVE_MODEL_CHECKPOINT_METHOD, storageGraphEffectiveCheckpointKey } from '../src/storage-community-graph';
+import type { StorageEffectiveHistoryCheckpoint } from '../src/storage-effective-history';
+import {
+  loadStorageHistoryCheckpoint, saveStorageHistoryCheckpoint, storageHistoryKeyDigest,
+  type StorageHistoryCheckpoint, type StorageHistoryKey,
+} from '../src/storage-history-checkpoint';
+
+const bindings = env as Env & { STORAGE_ANALYTICS_DB: D1Database; TEST_ANALYTICS_MIGRATIONS: D1Migration[] };
+const target = () => bindings.STORAGE_ANALYTICS_DB;
+const sourceId = 'synthetic-late-effective-codec';
+const sourceNamespace = 'synthetic-late-effective-origin';
+const ownerDigest = 'a'.repeat(64);
+const day = '2026-09-05';
+const phases = ['plan', 'clusters', 'fitability', 'endpoints'] as const;
+type Acquisition = Extract<StorageEffectiveHistoryCheckpoint, { phase: 'acquisition' }>;
+const key = (): Promise<StorageHistoryKey> => storageGraphEffectiveCheckpointKey({
+  sourceId, sourceNamespace, ownerDigest, day, dependencyDigest: 'b'.repeat(64),
+  method: STORAGE_GRAPH_EFFECTIVE_MODEL_CHECKPOINT_METHOD,
+}, true);
+
+beforeEach(async () => {
+  await reset();
+  await applyD1Migrations(target(), bindings.TEST_ANALYTICS_MIGRATIONS);
+  await target().prepare("INSERT INTO analytics_owner_state VALUES(?,?,1,1,'active')")
+    .bind(sourceId, ownerDigest).run();
+});
+
+function checkpoint(phase: typeof phases[number]): Acquisition {
+  const identity = {
+    participantId: 'synthetic-late-effective-participant', inputFingerprint: 'c'.repeat(64),
+    sourceMethodVersion: 'synthetic-effective-reader-1', observedAtCutoff: '2026-05-28T00:00:00.000Z',
+    resetsAtCutoff: '2026-06-04T00:00:00.000Z', windowMinutes: 10080, maxQuotaRows: 60000,
+  };
+  const inputDay = '2026-05-29';
+  const observedAtMs = Date.parse(`${inputDay}T12:00:00.000Z`);
+  const acquisition = createV11QuotaAcquisitionCheckpoint(identity);
+  acquisition.phase = phase;
+  acquisition.cursor = { observedAtMs: observedAtMs + 1, sourceRowId: 17 };
+  return {
+    version: 1, source: 'effective', day, layout: `effective:${sourceNamespace}`, identity,
+    phase: 'acquisition', acquisition,
+    effectiveCursor: {
+      phase, day: inputDay, after: { observedAtMs: observedAtMs + 1, occurrenceId: 'synthetic-row-17' },
+      ordinal: 17, complete: false,
+    },
+    effectiveDays: { quota: [inputDay], usage: [] },
+    // Day-local row ordinals remain distinct from the window-global cursor.
+    preparingQuota: {
+      day: inputDay, quotaRowsRead: 2,
+      rows: [0, 1].map(index => ({ sourceRowId: index + 1, observedAtMs: observedAtMs + index, anchor: null, row: null })),
+    },
+  };
+}
+
+async function save(value: StorageHistoryCheckpoint) {
+  const storageKey = await key();
+  const result = await saveStorageHistoryCheckpoint({ target: target(), key: storageKey, checkpoint: value, expectedHead: null });
+  if (result.status !== 'saved') throw new Error('synthetic pending day did not promote');
+  return { key: storageKey, ...result };
+}
+
+describe('effective pending-day checkpoint codec across acquisition phases', () => {
+  it.each(phases)('roundtrips a partial prepared day in %s without changing its ordinals or payload', async phase => {
+    const value = checkpoint(phase), saved = await save(value);
+    expect(await loadStorageHistoryCheckpoint({ target: target(), key: saved.key })).toEqual({
+      status: 'ready', headDigest: saved.headDigest, partCount: saved.totalParts, checkpoint: value,
+    });
+  });
+
+  it.each(['phase', 'complete', 'day', 'ordinal'] as const)('rejects a pending day with incompatible %s before staging', async mismatch => {
+    const value = checkpoint('clusters');
+    if (mismatch === 'phase') value.effectiveCursor.phase = 'plan';
+    if (mismatch === 'complete') value.effectiveCursor.complete = true;
+    if (mismatch === 'day') value.effectiveCursor.day = '2026-05-30';
+    if (mismatch === 'ordinal') value.effectiveCursor.ordinal = 1;
+    await expect(save(value)).rejects.toThrow('STORAGE_HISTORY_CHECKPOINT_UNAVAILABLE');
+    expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages').first('n')).toBe(0);
+    expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_heads').first('n')).toBe(0);
+  });
+
+  it('rejects pending preparation after acquisition has finished', async () => {
+    const value = checkpoint('endpoints');
+    const finished = { ...value, phase: 'finish', acquisition: { identity: value.identity, planAnchors: [], quotaRows: [] } };
+    await expect(save(finished as StorageHistoryCheckpoint)).rejects.toThrow('STORAGE_HISTORY_CHECKPOINT_UNAVAILABLE');
+    expect(await target().prepare('SELECT count(*) n FROM analytics_history_checkpoint_stages').first('n')).toBe(0);
+  });
+
+  it.each(['phase', 'complete'] as const)('rejects a correctly hashed retained stage with a %s mismatch during decode', async mismatch => {
+    const saved = await save(checkpoint('endpoints'));
+    const oldDigest = await storageHistoryKeyDigest(saved.key);
+    const stage = await target().prepare('SELECT control_json,manifest_json,authority_epoch FROM analytics_history_checkpoint_stages WHERE key_digest=? AND generation=?')
+      .bind(oldDigest, saved.headDigest).first<{ control_json: string; manifest_json: string; authority_epoch: number }>();
+    if (!stage) throw new Error('synthetic stage missing');
+    const control = JSON.parse(stage.control_json);
+    if (mismatch === 'phase') control.effectiveCursor.phase = 'plan';
+    else control.effectiveCursor.complete = true;
+    const controlText = canonicalJson(control);
+    const malformedKey = { ...saved.key, dependencyDigest: 'd'.repeat(64) };
+    const malformedDigest = await storageHistoryKeyDigest(malformedKey);
+    const generation = await sha256Hex(canonicalJson({
+      key: malformedKey, expectedHead: null, authorityEpoch: stage.authority_epoch,
+      control: controlText, manifest: JSON.parse(stage.manifest_json),
+    }));
+    // This disposable fixture installs an internally hashed old/future writer
+    // artifact. Keep all DB guards enabled and preserve the original stage, so
+    // failure is attributable to semantic decoding rather than hash corruption.
+    await target().batch([
+      target().prepare(`INSERT INTO analytics_history_checkpoint_stages
+        (key_digest,generation,source_id,owner_digest,day,dependency_digest,source_namespace,method,expected_head,owner_revision,authority_epoch,control_json,manifest_json,part_count)
+        SELECT ?,?,source_id,owner_digest,day,?,source_namespace,method,NULL,owner_revision,authority_epoch,?,manifest_json,part_count
+        FROM analytics_history_checkpoint_stages WHERE key_digest=? AND generation=?`)
+        .bind(malformedDigest, generation, malformedKey.dependencyDigest, controlText, oldDigest, saved.headDigest),
+      target().prepare(`INSERT INTO analytics_history_checkpoint_parts
+        SELECT ?,?,part_index,sha256,payload_bytes,payload_json FROM analytics_history_checkpoint_parts WHERE key_digest=? AND generation=?`)
+        .bind(malformedDigest, generation, oldDigest, saved.headDigest),
+      target().prepare('INSERT INTO analytics_history_checkpoint_heads(key_digest,generation,retired) VALUES(?,?,0)')
+        .bind(malformedDigest, generation),
+    ]);
+    await expect(loadStorageHistoryCheckpoint({ target: target(), key: malformedKey }))
+      .rejects.toThrow('STORAGE_HISTORY_CHECKPOINT_UNAVAILABLE');
+    expect(await loadStorageHistoryCheckpoint({ target: target(), key: saved.key }))
+      .toMatchObject({ status: 'ready', headDigest: saved.headDigest, checkpoint: checkpoint('endpoints') });
+  });
+});

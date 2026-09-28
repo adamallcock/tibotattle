@@ -337,26 +337,37 @@ ${includeV12?`      UNION
   return dependencyRows(rows);
 }
 
-/** Build the exact immutable evidence identity for one closed owner window.
- * This reads headers/digests only. Owner revision and authority epoch are
- * intentionally absent: callers fence them before and after each invocation,
- * while this identity remains reusable when an unrelated later upload advances
- * the owner-wide revision. Every source family is retained independently so a
- * late device/generation cannot be hidden by a winning-family shortcut. */
-export async function effectiveHistoryDependency(source:D1Database,owner:StorageCommunityOwner,
-  sourceNamespace:string,fromDay:string,throughDay:string,
-  options:{includeSessions?:boolean}={}):Promise<EffectiveHistoryDependency>{
+function validateDependencyScope(owner:StorageCommunityOwner,sourceNamespace:string,fromDay:string,throughDay:string):void {
   validDependencyDay(fromDay);validDependencyDay(throughDay);
   if(throughDay<fromDay||owner.participantId.length<1||owner.participantId.length>256
     ||!owner.ownerDigest||!/^[a-f0-9]{64}$/u.test(owner.ownerDigest)
     ||typeof sourceNamespace!=='string'||sourceNamespace.length<1||sourceNamespace.length>256)throw fail();
+}
+type EffectiveHistoryHeaders=Pick<EffectiveHistoryDependency,'v1'|'v11'|'v12'|'corrections'>;
+interface EffectiveHistoryHeaderSnapshot extends EffectiveHistoryHeaders { v12Available:boolean }
+
+/** The same header queries serve the authoritative window reader and the
+ * optional multi-day snapshot. The latter shares one aggregate bound across
+ * all vectors; exceeding it leaves callers on their exact per-day path. */
+async function readEffectiveHistoryHeaders(source:D1Database,owner:StorageCommunityOwner,
+  sourceNamespace:string,fromDay:string,throughDay:string,includeSessions:boolean,
+  optionalAggregate=false,canContinue?:()=>boolean):Promise<EffectiveHistoryHeaderSnapshot|undefined>{
   const fromMs=Date.parse(`${fromDay}T00:00:00.000Z`),throughExclusive=Date.parse(`${throughDay}T00:00:00.000Z`)+DAY_MS;
-  if(!options||typeof options!=='object'||Array.isArray(options))throw fail();
-  const includeSessions=options.includeSessions===true;
-  if(Object.keys(options).some(key=>key!=='includeSessions'))throw fail();
   const sourceStreams=includeSessions?"('usage','quota','session')":"('usage','quota')";
-  const streams=Object.freeze((includeSessions?['quota','session','usage']:['quota','usage']) as ('quota'|'session'|'usage')[]);
+  let totalRows=0,totalBytes=bytes(canonicalJson({v1:[],v11:[],v12:[],corrections:[]}));
+  const rowLimit=()=>optionalAggregate?MAX_EFFECTIVE_DEPENDENCY_ROWS-totalRows+1:MAX_EFFECTIVE_DEPENDENCY_ROWS+1;
+  const accept=(rows:readonly Record<string,unknown>[],vectorLimit=MAX_EFFECTIVE_DEPENDENCY_ROWS):boolean=>{
+    if(rows.length>vectorLimit){if(optionalAggregate)return false;throw fail();}
+    if(!optionalAggregate)return true;
+    totalRows+=rows.length;
+    if(totalRows>MAX_EFFECTIVE_DEPENDENCY_ROWS)return false;
+    // Replace one empty vector's two brackets in the aggregate encoding.
+    totalBytes+=bytes(canonicalJson(rows))-2;
+    return totalBytes<=MAX_EFFECTIVE_DEPENDENCY_BYTES;
+  };
+  if(optionalAggregate&&canContinue?.()===false)return undefined;
   const v12Available=await v12DependencySchema(source);
+  if(optionalAggregate&&canContinue?.()===false)return undefined;
   const v1=(await source.prepare(`SELECT c.id,c.device_id,c.stream,c.chunk_day,c.chunk_seq,c.revision,
       c.chunk_digest,c.accepted_record_count
     FROM telemetry_v1_chunks c
@@ -365,9 +376,10 @@ export async function effectiveHistoryDependency(source:D1Database,owner:Storage
     WHERE c.participant_id=? AND c.stream IN ${sourceStreams} AND c.superseded_at IS NULL AND c.accepted_record_count=c.record_count
       AND c.accepted_record_count>0 AND c.chunk_day>=? AND c.chunk_day<=?
     ORDER BY c.chunk_day,c.device_id,c.stream,c.chunk_seq,c.id LIMIT ?`)
-    .bind(owner.ownerDigest,sourceNamespace,owner.participantId,fromDay,throughDay,MAX_EFFECTIVE_DEPENDENCY_ROWS+1)
+    .bind(owner.ownerDigest,sourceNamespace,owner.participantId,fromDay,throughDay,rowLimit())
     .all<Record<string, unknown>>()).results;
-  if(v1.length>MAX_EFFECTIVE_DEPENDENCY_ROWS)throw fail();
+  if(!accept(v1))return undefined;
+  if(optionalAggregate&&canContinue?.()===false)return undefined;
   const v11=(await source.prepare(`SELECT DISTINCT event.device_id,domain_day.observed_day,manifest.id AS manifest_id,
       manifest.manifest_digest
     FROM storage_v11_event_sources event
@@ -384,11 +396,12 @@ export async function effectiveHistoryDependency(source:D1Database,owner:Storage
     WHERE event.participant_id=? AND event.owner_digest=? AND domain_day.observed_day>=?
       AND domain_day.observed_day<=?
     ORDER BY domain_day.observed_day,event.device_id,manifest.id LIMIT ?`)
-    .bind(owner.participantId,owner.ownerDigest,fromDay,throughDay,MAX_EFFECTIVE_DEPENDENCY_ROWS+1)
+    .bind(owner.participantId,owner.ownerDigest,fromDay,throughDay,rowLimit())
     .all<Record<string, unknown>>()).results;
-  if(v11.length>MAX_EFFECTIVE_DEPENDENCY_ROWS)throw fail();
+  if(!accept(v11))return undefined;
   let v12:Record<string, unknown>[]=[];
   if(v12Available){
+    if(optionalAggregate&&canContinue?.()===false)return undefined;
     v12=(await source.prepare(`WITH retained(participant_id,device_id) AS (
       SELECT authorization.participant_id,authorization.device_id
         FROM telemetry_v12_active_authorizations authorization
@@ -421,10 +434,11 @@ export async function effectiveHistoryDependency(source:D1Database,owner:Storage
         AND manifest.manifest_digest=domain_day.manifest_digest AND manifest.state='ready'
      WHERE generation.participant_id=? AND domain_day.observed_day>=? AND domain_day.observed_day<=?
      ORDER BY domain_day.observed_day,generation.device_id,manifest.id LIMIT ?`)
-      .bind(owner.participantId,fromDay,throughDay,MAX_EFFECTIVE_DEPENDENCY_ROWS+1)
+      .bind(owner.participantId,fromDay,throughDay,rowLimit())
       .all<Record<string, unknown>>()).results;
-    if(v12.length>MAX_EFFECTIVE_DEPENDENCY_ROWS)throw fail();
   }
+  if(!accept(v12))return undefined;
+  if(optionalAggregate&&canContinue?.()===false)return undefined;
   // Correction history/facts are immutable while the owner is active. The
   // only permitted deletion path is the owner-erasure fence, which also
   // invalidates this reader's owner CAS. Therefore a per-day count plus the
@@ -438,16 +452,85 @@ export async function effectiveHistoryDependency(source:D1Database,owner:Storage
     WHERE h.participant_id=? AND lower(hex(h.owner_digest))=?
       AND h.event_time_ms>=? AND h.event_time_ms<?
     GROUP BY date(h.event_time_ms/1000,'unixepoch')
-    ORDER BY event_day LIMIT 102`)
-    .bind(owner.participantId,owner.ownerDigest,fromMs,throughExclusive)
+    ORDER BY event_day LIMIT ?`)
+    .bind(owner.participantId,owner.ownerDigest,fromMs,throughExclusive,Math.min(102,rowLimit()))
     .all<Record<string, unknown>>()).results;
-  if(corrections.length>101)throw fail();
-  const occurrenceLinks=await effectiveHistoryOccurrenceLinks(source,owner,sourceNamespace,fromDay,throughDay,v12Available,includeSessions);
+  if(!accept(corrections,101))return undefined;
+  return {v1,v11,v12,corrections,v12Available};
+}
+
+function assembleEffectiveHistoryDependency(owner:StorageCommunityOwner,fromDay:string,throughDay:string,
+  includeSessions:boolean,headers:EffectiveHistoryHeaders,occurrenceLinks:readonly Record<string,unknown>[]):EffectiveHistoryDependency {
+  const {v1,v11,v12,corrections}=headers;
+  const streams=Object.freeze((includeSessions?['quota','session','usage']:['quota','usage']) as ('quota'|'session'|'usage')[]);
   const dependency={version:'effective-history-dependency-v2' as const,participantId:owner.participantId,
     fromDay,throughDay,streams,v1:dependencyRows(v1),v11:dependencyRows(v11),v12:dependencyRows(v12),
     corrections:dependencyRows(corrections),occurrenceLinks:dependencyRows(occurrenceLinks)};
   if(bytes(canonicalJson(dependency))>MAX_EFFECTIVE_DEPENDENCY_BYTES)throw fail();
   return Object.freeze(dependency);
+}
+
+/** Build the exact immutable evidence identity for one closed owner window.
+ * This reads headers/digests only. Owner revision and authority epoch are
+ * intentionally absent: callers fence them before and after each invocation,
+ * while this identity remains reusable when an unrelated later upload advances
+ * the owner-wide revision. Every source family is retained independently so a
+ * late device/generation cannot be hidden by a winning-family shortcut. */
+export async function effectiveHistoryDependency(source:D1Database,owner:StorageCommunityOwner,
+  sourceNamespace:string,fromDay:string,throughDay:string,
+  options:{includeSessions?:boolean}={}):Promise<EffectiveHistoryDependency>{
+  validateDependencyScope(owner,sourceNamespace,fromDay,throughDay);
+  if(!options||typeof options!=='object'||Array.isArray(options))throw fail();
+  const includeSessions=options.includeSessions===true;
+  if(Object.keys(options).some(key=>key!=='includeSessions'))throw fail();
+  const headers=await readEffectiveHistoryHeaders(source,owner,sourceNamespace,fromDay,throughDay,includeSessions);
+  if(!headers)throw fail();
+  const occurrenceLinks=await effectiveHistoryOccurrenceLinks(source,owner,sourceNamespace,fromDay,throughDay,headers.v12Available,includeSessions);
+  return assembleEffectiveHistoryDependency(owner,fromDay,throughDay,includeSessions,headers,occurrenceLinks);
+}
+
+/** Share bounded immutable headers across selected days while preserving each
+ * day's exact occurrence-link expansion. A whole-window link query cannot be
+ * split: another selected day is still outside THIS day's dependency. Callers
+ * keep the existing owner fences around this optional snapshot and its reads. */
+export async function createEffectiveHistoryDayDependencyReader(source:D1Database,owner:StorageCommunityOwner,
+  sourceNamespace:string,days:readonly string[],
+  options:{includeSessions?:boolean;canContinue?:()=>boolean}={}):Promise<{
+    readDigest(day:string):Promise<string|undefined>;
+  }|undefined>{
+  if(!Array.isArray(days)||days.length>101||!options||typeof options!=='object'||Array.isArray(options)
+    ||Object.keys(options).some(key=>key!=='includeSessions'&&key!=='canContinue')
+    ||(options.canContinue!==undefined&&typeof options.canContinue!=='function'))throw fail();
+  if(days.some((day,index)=>typeof day!=='string'||(index>0&&days[index-1]!>=day)))throw fail();
+  for(const day of days)validDependencyDay(day);
+  const fromDay=days[0]??'1970-01-01',throughDay=days.at(-1)??fromDay;
+  validateDependencyScope(owner,sourceNamespace,fromDay,throughDay);
+  if(Date.parse(throughDay)-Date.parse(fromDay)>100*DAY_MS)throw fail();
+  const includeSessions=options.includeSessions===true;
+  const selected=new Map(days.map(day=>[day,{v1:[],v11:[],v12:[],corrections:[]} as {
+    v1:Record<string,unknown>[];v11:Record<string,unknown>[];v12:Record<string,unknown>[];corrections:Record<string,unknown>[];
+  }]));
+  if(options.canContinue?.()===false)return undefined;
+  const headers=days.length
+    ?await readEffectiveHistoryHeaders(source,owner,sourceNamespace,fromDay,throughDay,includeSessions,true,options.canContinue)
+    :{v1:[],v11:[],v12:[],corrections:[],v12Available:false};
+  if(!headers)return undefined;
+  for(const [family,column] of [['v1','chunk_day'],['v11','observed_day'],['v12','observed_day'],['corrections','event_day']] as const){
+    for(const row of headers[family]){
+      const day=row[column];
+      if(typeof day!=='string')throw fail();
+      // The SQL orders each family by day and then by its immutable source
+      // coordinates. Appending to the partition preserves that exact order.
+      selected.get(day)?.[family].push(row);
+    }
+  }
+  const v12Available=headers.v12Available;
+  return {async readDigest(day:string){
+    const dayHeaders=selected.get(day);if(!dayHeaders)throw fail();
+    if(options.canContinue?.()===false)return undefined;
+    const links=await effectiveHistoryOccurrenceLinks(source,owner,sourceNamespace,day,day,v12Available,includeSessions);
+    return sha256Hex(canonicalJson(assembleEffectiveHistoryDependency(owner,day,day,includeSessions,dayHeaders,links)));
+  }};
 }
 export async function effectiveHistoryPin(owner:StorageCommunityOwner,fromDay:string,throughDay:string,
   dependency:EffectiveHistoryDependency):Promise<V11SourcePin>{
@@ -474,10 +557,12 @@ export async function advanceStorageEffectiveAnalysis(input:{
   pin:V11SourcePin;day:string;metric:'fits'|'model';nowMs:number;
   checkpoint?:StorageEffectiveHistoryCheckpoint|null;
   /** Complete source-validated days only; missing coverage keeps the paged
-   * calculation. Preparation piggybacks on its first quota scan. */
+   * calculation. Preparation piggybacks on any quota acquisition scan. */
   preparedQuota?:{
     load(days:readonly string[],identity:V11QuotaAcquisitionIdentity):Promise<readonly EffectiveQuotaDay[]|undefined>;
     store(day:EffectiveQuotaDay):Promise<void>;
+    /** Called only at a day boundary, before accumulating a complete day. */
+    shouldPrepare?:(day:string)=>Promise<boolean>;
     /** A costly cache miss leaves room for one deterministic page/save. */
     preferSinglePageCheckpoint?:()=>boolean;
   };
@@ -497,7 +582,8 @@ export async function advanceStorageEffectiveAnalysis(input:{
     ||!validEffectiveDays(checkpoint.effectiveDays,pin.fromDay,pin.throughDay)))throw fail();
   if(checkpoint?.phase==='acquisition'&&checkpoint.preparingQuota!==undefined
     &&(!validEffectiveQuotaDayPending(checkpoint.preparingQuota)
-      ||checkpoint.acquisition.phase!=='plan'||checkpoint.preparingQuota.day!==checkpoint.effectiveCursor.day
+      ||checkpoint.acquisition.phase!==checkpoint.effectiveCursor.phase||checkpoint.effectiveCursor.complete
+      ||checkpoint.preparingQuota.day!==checkpoint.effectiveCursor.day
       ||checkpoint.preparingQuota.quotaRowsRead>checkpoint.effectiveCursor.ordinal))throw fail();
   if(!checkpoint){
     const inventory={sourceNamespace:input.sourceNamespace,ownerDigest:owner.ownerDigest,
@@ -530,15 +616,21 @@ export async function advanceStorageEffectiveAnalysis(input:{
       if(budget.remainingQueries<120||now()>=budget.deadlineMs)return {status:'deferred',checkpoint:null};
     }
     const cursor=structuredClone(checkpoint.effectiveCursor);
-    let preparingQuota=input.preparedQuota&&acquisition.phase==='plan'?checkpoint.preparingQuota:undefined;
+    let preparingQuota=input.preparedQuota?checkpoint.preparingQuota:undefined;
     if(cursor.phase!==acquisition.phase){Object.assign(cursor,{phase:acquisition.phase,day:checkpoint.effectiveDays.quota[0]??pin.throughDay,
       after:null,ordinal:0,complete:checkpoint.effectiveDays.quota.length===0});}
     const reader:V11QuotaPageReader={pageSize:200,effective:{complete:()=>cursor.complete},
       async readPage(){
         if(cursor.complete)return [];
+        // An adopted job may begin halfway through a day. Wait for the next
+        // boundary: later acquisition phases rewind and can fill that prefix.
+        // The reducer filters phase-specific rows only after this reader, so
+        // each phase can prepare the same complete, unfiltered day.
+        const prepare=!!input.preparedQuota&&(preparingQuota!==undefined||cursor.after===null
+          &&(await input.preparedQuota.shouldPrepare?.(cursor.day)??true));
         const page=await read(cursor.day,'quota',cursor.after??undefined);
         const rows:V11QuotaPageRow[]=page.rows.map(row=>mapEffectiveQuotaPageRow(row,cursor.day,++cursor.ordinal));
-        if(input.preparedQuota&&acquisition.phase==='plan'&&(cursor.after===null||preparingQuota)){
+        if(prepare&&input.preparedQuota){
           preparingQuota=appendEffectiveQuotaDay(preparingQuota??null,cursor.day,rows,identity.windowMinutes)??undefined;
           if(page.next===null&&preparingQuota){
             const prepared=finishEffectiveQuotaDay(preparingQuota);
@@ -562,7 +654,7 @@ export async function advanceStorageEffectiveAnalysis(input:{
     const base={version:1 as const,source:'effective' as const,day:input.day,layout,identity,effectiveCursor:cursor,effectiveDays:checkpoint.effectiveDays};
     return {status:'deferred',checkpoint:step.status==='deferred'
       ?{...base,phase:'acquisition',acquisition:step.checkpoint,
-        ...(step.checkpoint.phase==='plan'&&preparingQuota?{preparingQuota}:{})}
+        ...(step.checkpoint.phase===cursor.phase&&preparingQuota?{preparingQuota}:{})}
       :{...base,phase:'finish',acquisition:{identity,planAnchors:step.planAnchors,quotaRows:step.quotaRows}}};
   }
   const days=checkpoint.effectiveDays.usage;

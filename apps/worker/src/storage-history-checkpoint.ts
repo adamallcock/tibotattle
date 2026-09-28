@@ -82,7 +82,7 @@ function decode(controlText:string,manifest:Part[],parts:string[]):StorageHistor
    }else if(preparedRows!==undefined)throw fail();
    for(const name of V11_QUOTA_WORK_COMPONENTS)components[name]??=[];
    const acquisition=decodeV11QuotaWorkCheckpoint(control.identity,control.acquisition,components);
-   if(preparingQuota&&acquisition.phase!=='plan')throw fail();
+   if(preparingQuota&&(acquisition.phase!==control.effectiveCursor.phase||control.effectiveCursor.complete))throw fail();
    return {version:1,source:'effective',day:control.day,layout:control.layout,identity:control.identity,
     effectiveCursor:control.effectiveCursor,effectiveDays:control.effectiveDays,phase:'acquisition',acquisition,
     ...(preparingQuota?{preparingQuota}:{})};
@@ -158,7 +158,8 @@ async function frame(key:StorageHistoryKey,checkpoint:StorageHistoryCheckpoint):
       ...(usage?.components??{})};
    const pending=checkpoint.phase==='acquisition'?checkpoint.preparingQuota:undefined;
    if(pending!==undefined){
-    if(!validEffectiveQuotaDayPending(pending)||checkpoint.phase!=='acquisition'||checkpoint.acquisition.phase!=='plan'
+    if(!validEffectiveQuotaDayPending(pending)||checkpoint.phase!=='acquisition'
+      ||checkpoint.acquisition.phase!==checkpoint.effectiveCursor.phase||checkpoint.effectiveCursor.complete
       ||pending.day!==checkpoint.effectiveCursor.day||pending.quotaRowsRead>checkpoint.effectiveCursor.ordinal)throw fail();
     components.effectiveQuotaRows=pending.rows;
    }

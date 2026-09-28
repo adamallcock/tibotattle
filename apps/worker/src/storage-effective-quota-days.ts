@@ -5,7 +5,7 @@ import { GRAPH_DAY_EFFECTIVE_DEVICE_ID, GRAPH_DAY_EFFECTIVE_MANIFEST_ID,
   graphDayEffectiveQuotaSupported, readGraphDayEffectiveQuotaHeads, readGraphDayProjection, writeGraphDayProjection,
   type GraphDayProjectionKey, type GraphDayProjectionLoadCursor,
   type GraphDayProjectionWriteCursor } from './graph-day-projection';
-import { assertEffectiveHistoryOwner, effectiveHistoryDependency,
+import { assertEffectiveHistoryOwner, effectiveHistoryDependency, createEffectiveHistoryDayDependencyReader,
   type advanceStorageEffectiveAnalysis } from './storage-effective-history';
 import type { StorageCommunityOwner } from './storage-community-authority';
 import { QUOTA_RESET_CLUSTER_LIMIT } from './quota-endpoint-collapse';
@@ -38,18 +38,36 @@ export async function createStorageEffectiveQuotaPreparation(input: {
       input.owner, input.sourceNamespace, day, day, {includeSessions:true}))),
   });
   let attempted = false, fallbackPage = false;
+  let retainedHeads:Awaited<ReturnType<typeof readGraphDayEffectiveQuotaHeads>>;
+  let requestedDays:readonly string[]=[];
+  const validDays=new Set<string>();
   return {
     preferSinglePageCheckpoint:()=>fallbackPage,
+    async shouldPrepare(day) {
+      if(validDays.has(day))return false;
+      const candidates=retainedHeads?.filter(head=>head.key.day===day)??[];
+      if(candidates.length===0)return true;
+      // The whole window may be cold while individual days are ready. Avoid
+      // framing their raw rows again in every later-phase checkpoint. This
+      // only skips optional cache writes; source acquisition still runs.
+      if(!available(160))return false;
+      const key=await keyFor(day);
+      if(!candidates.some(head=>head.key.manifestDigest===key.manifestDigest))return true;
+      validDays.add(day);
+      return false;
+    },
     async load(days) {
-      // A miss is tried once per graph invocation. Rechecking after every source
-      // page would make cold preparation slower than its maintained fallback.
+      // Keep a miss for this invocation until a successful write completes
+      // coverage. Rechecking after every page would slow the paged fallback.
       if (attempted) return undefined;
       attempted = true;
+      requestedDays=[...days];
       if (days.length === 0) return [];
       if (!available(260)) return undefined;
       const heads = await readGraphDayEffectiveQuotaHeads({target:input.target,sourceId:input.sourceId,
         sourceNamespace:input.sourceNamespace,ownerDigest:input.owner.ownerDigest,
         fromDay:days[0]!,throughDay:days[days.length-1]!});
+      retainedHeads=heads;
       if (!heads) return undefined;
       const candidates = days.map(day => heads.filter(head => head.key.day === day));
       // Prove complete coverage and affordability before doing source work.
@@ -59,22 +77,28 @@ export async function createStorageEffectiveQuotaPreparation(input: {
       const fragments = candidates.reduce((sum,day) => sum + Math.max(...day.map(head => head.fitFragmentCount)),0);
       const payloadReads = candidates.reduce((sum,day) => sum + Math.max(...day.map(head => Math.ceil(head.cursor.partCount/32))),0);
       if (bytes > STORAGE_EFFECTIVE_QUOTA_WINDOW_BYTES || fragments > QUOTA_RESET_CLUSTER_LIMIT) return undefined;
-      // The day dependency costs at most six statements, including v1.2. Read
-      // every dependency before loading payloads: a late cache miss still has
+      // Share the five schema/header statements across the bounded window;
+      // occurrence links still need one exact query for each selected day.
+      // Read every dependency before loading payloads: a late miss still has
       // the 200 statements needed to advance the normal pager. A complete fold
       // needs only its 120-statement checkpoint reserve. Bulk heads remove one
       // manifest read per day, keeping a small 101-day window within the cap.
-      if (!available(6*days.length + Math.max(200,payloadReads+120) + 2)) return undefined;
+      if (!available(5+days.length + Math.max(200,payloadReads+120) + 2)) return undefined;
       // Until the complete window is proved, any fallback must be able to
       // stage the same one-page successor on a retry, even if it is >30 parts.
       fallbackPage = true;
       await assertEffectiveHistoryOwner(input.source,input.owner);
+      const dependencies=await createEffectiveHistoryDayDependencyReader(input.source,input.owner,
+        input.sourceNamespace,days,{includeSessions:true,canContinue:()=>input.now()<input.deadlineMs});
+      if(!dependencies)return undefined;
       const selected:typeof heads[number][] = [];
       for (const [index,day] of days.entries()) {
         if (input.now() >= input.deadlineMs) return undefined;
-        const key = await keyFor(day);
-        const head=candidates[index]!.find(candidate => candidate.key.manifestDigest === key.manifestDigest);
+        const digest=await dependencies.readDigest(day);
+        if(digest===undefined)return undefined;
+        const head=candidates[index]!.find(candidate => candidate.key.manifestDigest === digest);
         if (!head) return undefined;
+        validDays.add(day);
         selected.push(head);
       }
       const prepared: EffectiveQuotaDay[] = [];
@@ -115,7 +139,14 @@ export async function createStorageEffectiveQuotaPreparation(input: {
         const saved = await writeGraphDayProjection({target:input.target,key,projection:day.projection,
           effectiveQuota:{quotaRowsRead:day.quotaRowsRead,ownerRevision:input.owner.ownerRevision},
           ...(cursor?{cursor}:{})});
-        if (saved.status === 'stored') return;
+        if (saved.status === 'stored') {
+          validDays.add(day.projection.day);
+          // Reconsider a miss only when this scan has filled every missing
+          // day. That permits the current job to fold its remaining phases
+          // while avoiding a fresh metadata probe after every source page.
+          if(attempted&&requestedDays.length>0&&requestedDays.every(value=>validDays.has(value)))attempted=false;
+          return;
+        }
         cursor = saved.cursor;
       }
     },

@@ -56,10 +56,12 @@ export function storageGraphEffectiveCheckpointMethod(metric:'fits'|'model'):str
  * Workers would retire. Only the storage key changes; source, acquisition and
  * analytical result identities retain their existing dependency. Disabling
  * preparation resumes the original key, and abandoned method-key tombstones
- * remain valid. */
-export async function storageGraphEffectiveCheckpointKey(key:StorageHistoryKey,preparedQuota=false):Promise<StorageHistoryKey> {
+ * remain valid. Format 3 allows pending day preparation in all acquisition
+ * phases; format 2 is read only when adopting the preceding deployment. */
+export async function storageGraphEffectiveCheckpointKey(key:StorageHistoryKey,preparedQuota=false,format:2|3=3):Promise<StorageHistoryKey> {
+  if(format!==2&&format!==3)throw fail();
   return {...key,...(preparedQuota?{dependencyDigest:await sha256Hex(canonicalJson({
-    checkpointFormat:'effective-quota-days-2',dependencyDigest:key.dependencyDigest}))}:{})};
+    checkpointFormat:`effective-quota-days-${format}`,dependencyDigest:key.dependencyDigest}))}:{})};
 }
 export const STORAGE_GRAPH_V11_CHECKPOINT_METHOD = STORAGE_GRAPH_METHOD + ':v11-shared-checkpoint-4';
 /** The v1.1 checkpoint namespaces, as a pure rule so both branches can be
@@ -601,17 +603,19 @@ export async function computeStorageGraphResult(bindings:StorageAnalyticsBinding
         remainingQueries:()=>meter.remainingQueries,deadlineMs:checkpointWorkDeadlineMs,now}):undefined;
     const originalKey=originalEffectiveKey();
     const key=await storageGraphEffectiveCheckpointKey(originalKey,preparedQuota!==undefined);
+    const loadKeys=preparedQuota?[key,await storageGraphEffectiveCheckpointKey(originalKey,true,2),originalKey]:[key];
     let cursor:StorageHistoryLoadCursor|undefined,head:string|null=null,checkpoint:StorageEffectiveHistoryCheckpoint|undefined;
-    let loadKey=key;
+    let loadIndex=0;
     for(;;){
       if(meter.remainingQueries<50||now()>=checkpointWorkDeadlineMs)return {state:'deferred',reason:'effective_checkpoint_read_budget'};
+      const loadKey=loadKeys[loadIndex]!;
       const loaded=await withStorageGraphFailureStage('graph_checkpoint_load',
         ()=>loadStorageHistoryCheckpoint({target:bindings.target,key:loadKey,cursor}));
       if(loaded.status==='deferred'){cursor=loaded.cursor;continue;}
-      if(loaded.status==='absent'&&preparedQuota&&loadKey===key){
-        // Adopt an existing paged calculation when enabling preparation. Its
-        // source dependency is identical, and only the new key is advanced.
-        loadKey=originalKey;continue;
+      if(loaded.status==='absent'&&loadIndex+1<loadKeys.length){
+        // Prefer the already-prepared format, then the original paged job.
+        // Source identities are unchanged; advance only the new format key.
+        loadIndex++;cursor=undefined;continue;
       }
       head=loadKey===key?(loaded.headDigest??null):null;
       if(loaded.status==='ready'){
