@@ -170,7 +170,7 @@ html[data-theme="dark"] .performance-axis-line { opacity: .42; }
 }
 
 .model-performance .performance-details {
-  margin-top: var(--space-5, 20px);
+  margin-top: var(--space-3, 12px);
   border: 1px solid var(--line);
   border-radius: var(--radius-md, 14px);
   background: var(--surface);
@@ -182,7 +182,7 @@ html[data-theme="dark"] .performance-axis-line { opacity: .42; }
   justify-content: space-between;
   gap: var(--space-4, 16px);
   min-height: var(--hit-target, 24px);
-  padding: var(--space-4, 16px) var(--pad-card, 24px);
+  padding: 8px var(--space-4, 16px);
   font-weight: var(--weight-semibold, 700);
   list-style: none;
 }

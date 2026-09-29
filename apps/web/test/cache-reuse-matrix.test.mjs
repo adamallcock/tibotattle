@@ -189,11 +189,16 @@ test("all ten time groups are accessible and distinguish zero reuse from no evid
   // hit target -- entirely past the right edge of the plot, where a measured
   // bucket cannot be told from one with no evidence.
   const plotWidth = Number(ui.find("cache-matrix-plot").getAttribute("viewBox").split(" ")[2]);
+  const hits = ui.all("cache-matrix-hit");
+  assert.ok(parseFloat(hits[0].style.width) > parseFloat(hits[1].style.width) * 2,
+    "the busy first bucket has more width while the other stacks get taller");
   for (const hit of ui.all("cache-matrix-hit")) {
     assert.ok(parseFloat(hit.style.left) + parseFloat(hit.style.width) <= plotWidth,
       `column at ${hit.style.left} overflows the ${plotWidth} wide plot`);
   }
   assert.ok(Number(ui.all("cache-matrix-gap").at(-1).getAttribute("x")) < plotWidth);
+  assert.equal(ui.find("cache-matrix-note").parent, ui.find("cache-matrix-legend"),
+    "the partial-light note shares a line with the outcome legend");
 });
 
 test("hover details lead with percentages, retain exact denominator and pricing callback", () => {

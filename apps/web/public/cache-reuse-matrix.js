@@ -190,12 +190,13 @@ export function createCacheReuseMatrix({
     legend.append(label);
     return [key, label];
   });
-  const note = el("p", "cache-matrix-note");
+  const note = el("span", "cache-matrix-note");
+  legend.append(note);
   const announcement = el("div", "cache-matrix-sr");
   announcement.setAttribute("aria-live", "polite");
   announcement.setAttribute("aria-atomic", "true");
   container.classList.add("cache-matrix");
-  container.replaceChildren(stage, legend, note, announcement);
+  container.replaceChildren(stage, legend, announcement);
 
   let impact = null;
   let currentImpact = null;
@@ -258,21 +259,21 @@ export function createCacheReuseMatrix({
     geometry = [];
     buttons = [];
     const narrow = w < 520;
-    // Lights per row. Wide mode used a fixed seven, which left a bucket's
-    // stack 46px wide inside a slot nearer 140 -- and because a tall bucket
-    // scales its cells down to fit the box, that wasted width was paid for
-    // directly in dot size. Filling the slot lets the SAME number of lights
-    // spread over a wider box, so every cell is drawn larger.
-    const slot = (w - 32) / Math.max(1, rows.length);
-    const columns = narrow ? Math.max(10, Math.floor((w - 125) / 6.4))
+    // The busiest, sub-minute bucket gets more horizontal room. The shared
+    // light unit stays the same; the narrower remaining slots make their
+    // smaller stacks taller without changing the measured proportions.
+    const firstWeight = narrow ? 1 : 2.3;
+    const standardSlot = (w - 32) / (rows.length - 1 + firstWeight);
+    const slotWidth = (index) => index === 0 ? standardSlot * firstWeight : standardSlot;
+    const slotStart = (index) => 16 + (index === 0 ? 0 : slotWidth(0) + (index - 1) * standardSlot);
+    const columnsFor = (slot) => narrow ? Math.max(10, Math.floor((w - 125) / 6.4))
       : Math.max(7, Math.min(30, Math.floor((slot * 0.84) / 6.8)));
-    const baseCw = narrow ? 3.8 : Math.min(4.8, (slot - 18 - (columns - 1) * 2) / columns);
+    const columnsForRow = (index) => columnsFor(slotWidth(index));
     const baseCh = narrow ? 3.8 : 4.8;
     const ch = baseCh;
     const gap = narrow ? 1.8 : 2;
     const pitch = ch + gap;
     const narrowStackHeight = 96;
-    const gridWidth = columns * baseCw + (columns - 1) * gap;
     const wholeRows = cacheReuseMatrixBuckets(impact) ?? rows;
     // The plot's height is FIXED rather than following the tallest bucket.
     // One unit across every bucket means the tall one has genuinely more
@@ -280,7 +281,8 @@ export function createCacheReuseMatrix({
     // chart past the fold and squeezing every other bucket into a fraction of
     // one light.
     const stackRows = Math.min(MAX_PIXEL_ROWS,
-      Math.max(1, ...wholeRows.map((row) => Math.ceil(Math.ceil(row.comparableReturns / unit) / columns))));
+      Math.max(1, ...wholeRows.map((row, index) =>
+        Math.ceil(Math.ceil(row.comparableReturns / unit) / columnsForRow(index)))));
     const stackHeight = Math.max(115, stackRows * pitch);
     const baseline = 86 + stackHeight;
     let height = baseline + 66;
@@ -302,6 +304,10 @@ export function createCacheReuseMatrix({
     let cursor = 26;
     rows.forEach((row, index) => {
       const lights = cacheReuseMatrixLights(row, unit);
+      const slot = slotWidth(index);
+      const columns = columnsForRow(index);
+      const baseCw = narrow ? 3.8 : Math.min(4.8, (slot - 18 - (columns - 1) * 2) / columns);
+      const gridWidth = columns * baseCw + (columns - 1) * gap;
       // Per-bucket, because the unit is shared: a bucket with more lights
       // draws them smaller. `n=` above each column carries the volume the ink
       // no longer can.
@@ -324,15 +330,10 @@ export function createCacheReuseMatrix({
         text(w - 18, cursor + 36, tr("n", { count: formatNumber(row.comparableReturns) }), "cache-matrix-muted", "end");
         cursor += rowHeight;
       } else {
-        // The column pitch is the SAME slot the cell size was derived from, so
-        // the two cannot disagree about how many buckets there are. A fixed
-        // nine outlived the nine-row tail merge and drew the tenth bucket
-        // entirely past the right edge of the plot, where a measured bucket is
-        // indistinguishable from one with no evidence.
-        const center = 16 + (index + .5) * slot;
+        const center = slotStart(index) + slot / 2;
         gx = center - gridWidth / 2;
         gy = baseline - pixelHeight;
-        box = { x: 16 + index * slot + 2, y: 12, width: slot - 4, height: baseline + 39 };
+        box = { x: slotStart(index) + 2, y: 12, width: slot - 4, height: baseline + 39 };
         text(center, 32, rate(row.reusedMoreThanHalfReturns, row.comparableReturns), "cache-matrix-rate", "middle");
         text(center, 52, tr("n", { count: formatNumber(row.comparableReturns) }), "cache-matrix-muted", "middle");
         text(center, baseline + 25, tr(`short.${row.label}`), "cache-matrix-gap", "middle");

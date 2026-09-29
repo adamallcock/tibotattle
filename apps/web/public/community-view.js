@@ -512,10 +512,11 @@ function buildCommunityAllowanceSingleChartModel(series, {
 export function buildCommunityAllowanceChartModel(series, options = {}) {
   const { view = "aggregate", rangeDays = null, seriesKeys = null,
     width = COMMUNITY_ALLOWANCE_CHART_WIDTH,
-    height = view === "models" ? COMMUNITY_ALLOWANCE_CHART_HEIGHT * 1.5 : COMMUNITY_ALLOWANCE_CHART_HEIGHT } = options;
+    height = view === "models" || view === "aggregate"
+      ? COMMUNITY_ALLOWANCE_CHART_HEIGHT * 1.5 : COMMUNITY_ALLOWANCE_CHART_HEIGHT } = options;
   if (!["aggregate", "plans", "models"].includes(view)) return null;
   if (!series?.breakdowns) {
-    return view === "aggregate" ? buildCommunityAllowanceSingleChartModel(series, options) : null;
+    return view === "aggregate" ? buildCommunityAllowanceSingleChartModel(series, { ...options, height }) : null;
   }
   if (series.state !== "published" || series.days.length === 0) return null;
   const anchor = series.breakdowns.hasCombined
