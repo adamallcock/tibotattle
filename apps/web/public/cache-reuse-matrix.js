@@ -275,9 +275,9 @@ export function createCacheReuseMatrix({
     const pitch = ch + gap;
     const narrowStackHeight = 96;
     const wholeRows = cacheReuseMatrixBuckets(impact) ?? rows;
-    // The plot's height is FIXED rather than following the tallest bucket.
-    // One unit across every bucket means the tall one has genuinely more
-    // lights, and it now draws them smaller to fit instead of stretching the
+    // The wide plot's stack height is fixed rather than following the tallest
+    // bucket. One unit across every bucket means the tall one has genuinely
+    // more lights, and it draws them smaller to fit instead of stretching the
     // chart past the fold and squeezing every other bucket into a fraction of
     // one light.
     const stackRows = Math.min(MAX_PIXEL_ROWS,
@@ -286,10 +286,6 @@ export function createCacheReuseMatrix({
     const stackHeight = Math.max(115, stackRows * pitch);
     const baseline = 86 + stackHeight;
     let height = baseline + 66;
-    if (narrow) height = rows.length * (narrowStackHeight + 35) + 26 + 40;
-    plot.setAttribute("viewBox", `0 0 ${w} ${height}`);
-    plot.style.height = `${height}px`;
-    view.style.minHeight = `${height}px`;
     const text = (x, y, label, className = "", anchor = "start") => {
       const node = svgEl("text", { x, y, class: className, "text-anchor": anchor });
       node.textContent = label;
@@ -375,6 +371,13 @@ export function createCacheReuseMatrix({
       buttons.push(button);
       hitLayer.append(button);
     });
+    // Narrow rows can be shorter than their maximum stack box. Size the SVG
+    // from the positions actually drawn so the last gap is followed only by
+    // the axis caption, not a large empty block.
+    if (narrow) height = cursor + 26;
+    plot.setAttribute("viewBox", `0 0 ${w} ${height}`);
+    plot.style.height = `${height}px`;
+    view.style.minHeight = `${height}px`;
     focusRect = svgEl("rect", { class: "cache-matrix-selection", x: 0, y: 0, width: 1, height: 1, rx: 7 });
     plot.append(focusRect);
     text(w / 2, height - 11, tr("axis"), "cache-matrix-muted", "middle");
