@@ -1071,6 +1071,147 @@ describe('the cache-retention lane',()=>{
   expect((await advanceCacheRetentionDayLane({target:target(),sourceId,build:unavailable,
    deadlineMs:Date.now()+30_000,remainingQueries:900})).candidates).toBe(1);
  });
+ it('advances to another owner across a real deadline without marking skipped effective days',async()=>{
+  const healthyOwner='b'.repeat(64);
+  await target().prepare(`INSERT INTO analytics_owner_state
+   (source_id,owner_digest,revision,authority_epoch,state) VALUES(?,?,1,1,'active')`)
+   .bind(sourceId,healthyOwner).run();
+  for(let day=1;day<=12;day+=1)
+   await deliverEffectiveDay(`2026-09-${String(day).padStart(2,'0')}`);
+  await deliverEffectiveDay('2026-09-13',healthyOwner);
+  let clock=100_000;
+  const seen:string[]=[];
+  const unavailable:CacheRetentionDayBuild=async(candidate,carry,budget)=>{
+   seen.push(candidate.ownerDigest);
+   if(candidate.ownerDigest===OWNER){
+    clock+=56_000;
+    throw new CacheRetentionRefusedError('owner_source_unavailable');
+   }
+   return build(candidate,carry,budget);
+  };
+  const first=await advanceCacheRetentionDayLane({target:target(),sourceId,build:unavailable,
+   deadlineMs:clock+55_000,now:()=>clock,remainingQueries:650,sourceQueries:350,
+   maxDays:12,maxWrites:48});
+  expect(first).toMatchObject({state:'progress',reason:'deadline',built:0,skipped:1});
+  expect(seen).toEqual([OWNER]);
+  expect(await target().prepare('SELECT COUNT(*) n FROM analytics_cache_retention_day_marks')
+   .first<number>('n')).toBe(0);
+  const cursor=await target().prepare(`SELECT * FROM analytics_cache_retention_owner_cursor
+   WHERE source_id=? AND shard_count=1 AND shard_index=0`).bind(sourceId).first<Record<string,unknown>>();
+  expect(cursor?.next_owner_offset).toBe(1);
+  expect(Object.keys(cursor??{}).sort()).toEqual(['method_version','next_owner_offset','revision',
+   'shard_count','shard_index','source_id']);
+  const second=await advanceCacheRetentionDayLane({target:target(),sourceId,build:unavailable,
+   deadlineMs:clock+55_000,now:()=>clock,remainingQueries:650,sourceQueries:350,
+   maxDays:12,maxWrites:48});
+  expect(second.built).toBe(1);
+  expect(seen[1]).toBe(healthyOwner);
+  expect((await target().prepare(`SELECT owner_digest FROM analytics_cache_retention_day_marks`)
+   .all<{owner_digest:string}>()).results.map(row=>row.owner_digest)).toEqual([healthyOwner]);
+  // The blocked owner is still eligible under its original fingerprint.
+  const recovered=await advanceCacheRetentionDayLane({target:target(),sourceId,build,
+   deadlineMs:Date.now()+30_000,remainingQueries:900,maxDays:12});
+  expect(recovered.built).toBeGreaterThan(0);
+  expect((await target().prepare(`SELECT COUNT(*) n FROM analytics_cache_retention_day_marks
+   WHERE owner_digest=?`).bind(OWNER).first<number>('n'))).toBeGreaterThan(0);
+ });
+ it('wraps a numeric owner cursor across withdrawn and newly active owners',async()=>{
+  const nextOwner='b'.repeat(64),newOwner='c'.repeat(64);
+  await target().prepare(`INSERT INTO analytics_owner_state
+   (source_id,owner_digest,revision,authority_epoch,state) VALUES(?,?,1,1,'active')`)
+   .bind(sourceId,nextOwner).run();
+  await deliverEffectiveDay(DAY,OWNER);
+  await deliverEffectiveDay(DAY,nextOwner);
+  const seen:string[]=[];
+  const recording:CacheRetentionDayBuild=async(candidate,carry,budget)=>{
+   seen.push(candidate.ownerDigest);
+   return build(candidate,carry,budget);
+  };
+  const pass=()=>advanceCacheRetentionDayLane({target:target(),sourceId,build:recording,
+   deadlineMs:Date.now()+30_000,remainingQueries:900,maxDays:1});
+  expect((await pass()).built).toBe(1);
+  await target().prepare(`UPDATE analytics_owner_state SET state='withdrawn'
+   WHERE source_id=? AND owner_digest=?`).bind(sourceId,nextOwner).run();
+  await target().prepare(`INSERT INTO analytics_owner_state
+   (source_id,owner_digest,revision,authority_epoch,state) VALUES(?,?,1,1,'active')`)
+   .bind(sourceId,newOwner).run();
+  await deliverEffectiveDay(DAY,newOwner);
+  expect((await pass()).built).toBe(1);
+  await target().prepare(`UPDATE analytics_owner_state SET state='active'
+   WHERE source_id=? AND owner_digest=?`).bind(sourceId,nextOwner).run();
+  expect((await pass()).built).toBe(1);
+  expect(seen).toEqual([OWNER,newOwner,nextOwner]);
+  expect((await pass()).state).toBe('idle');
+ });
+ it('reports bounded empty-owner probes honestly across invocations',async()=>{
+  const extraOwners=Array.from({length:15},(_,i)=>(i+1).toString(16).padStart(64,'0'));
+  for(const owner of extraOwners)
+   await target().prepare(`INSERT INTO analytics_owner_state
+    (source_id,owner_digest,revision,authority_epoch,state) VALUES(?,?,1,1,'active')`)
+    .bind(sourceId,owner).run();
+  let builds=0;
+  const pass=()=>advanceCacheRetentionDayLane({target:target(),sourceId,
+   build:async(candidate,carry,budget)=>{builds+=1;return build(candidate,carry,budget);},
+   deadlineMs:Date.now()+30_000,remainingQueries:900,maxDays:12});
+  for(let attempt=1;attempt<=3;attempt+=1){
+   expect(await pass()).toMatchObject({state:'deferred',reason:'owner_limit',
+    built:0,staged:0,refused:0,skipped:0,candidates:0});
+   expect(await target().prepare(`SELECT revision FROM analytics_cache_retention_owner_cursor
+    WHERE source_id=? AND shard_count=1 AND shard_index=0`).bind(sourceId)
+    .first<number>('revision')).toBe(attempt*12);
+  }
+  expect(builds).toBe(0);
+  // Once a complete rotation fits inside the bound, no candidate is a proven
+  // idle result. The cursor must still tolerate the changed ordinal set.
+  for(const owner of extraOwners.slice(0,5))
+   await target().prepare(`UPDATE analytics_owner_state SET state='withdrawn'
+    WHERE source_id=? AND owner_digest=?`).bind(sourceId,owner).run();
+  expect(await pass()).toMatchObject({state:'idle',reason:'complete',
+   built:0,staged:0,refused:0,skipped:0,candidates:0});
+  expect(builds).toBe(0);
+ });
+ it('does not open source work after a competing cursor advance',async()=>{
+  await deliverEffectiveDay();
+  const real=target();
+  let injected=false;
+  const raced={prepare(sql:string){
+   const statement=real.prepare(sql);
+   if(!sql.startsWith('WITH eligible AS'))return statement;
+   return {bind(...params:unknown[]){
+    const bound=statement.bind(...params);
+    return {async first(){
+     const row=await bound.first();
+     if(!injected){
+      injected=true;
+      await real.prepare(`INSERT INTO analytics_cache_retention_owner_cursor
+       (source_id,shard_count,shard_index,method_version,next_owner_offset,revision)
+       VALUES(?,1,0,?,0,1)`).bind(sourceId,CACHE_RETENTION_METHOD.version).run();
+     }
+     return row;
+    }};
+   }};
+  }} as unknown as D1Database;
+  let builds=0;
+  const result=await advanceCacheRetentionDayLane({target:raced,sourceId,
+   build:async(candidate,carry,budget)=>{builds+=1;return build(candidate,carry,budget);},
+   deadlineMs:Date.now()+30_000,remainingQueries:900});
+  expect(result).toMatchObject({state:'deferred',reason:'cursor_changed',built:0,candidates:0});
+  expect(builds).toBe(0);
+ });
+ it('refuses source work before the additive owner cursor migration',async()=>{
+  const before=b.TEST_ANALYTICS_MIGRATIONS.filter(m=>m.name<'0033_');
+  expect(before.length).toBe(b.TEST_ANALYTICS_MIGRATIONS.length-1);
+  await reset();
+  await applyD1Migrations(target(),before);
+  await target().prepare('INSERT INTO analytics_runtime_sources(source_id,source_namespace,contract_version) VALUES(?,?,1)')
+   .bind(sourceId,sourceNamespace).run();
+  let builds=0;
+  await expect(advanceCacheRetentionDayLane({target:target(),sourceId,
+   build:async(candidate,carry,budget)=>{builds+=1;return build(candidate,carry,budget);},
+   deadlineMs:Date.now()+30_000,remainingQueries:900}))
+   .rejects.toThrow(/analytics_cache_retention_owner_cursor/);
+  expect(builds).toBe(0);
+ });
  it('never opens a day it cannot pay for, and reports which bound stopped it',async()=>{
   await deliverDay();
   await deliverDay('2026-09-11','f'.repeat(64),'manifest-2');

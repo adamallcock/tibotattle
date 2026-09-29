@@ -329,18 +329,21 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
 ${selectedV12}    ), linked(${target()}family,source_day,source_key,source_digest) AS (
       /* Only outside-window chunk headers enter the dependency. Collapse
        * matching occurrences here instead of materializing each record's
-       * decoded identity and digest before throwing those columns away. */
+       * decoded identity and digest before throwing those columns away.
+       * Drive retained-history expansion from selected occurrences: its
+       * owner/format/stream/occurrence seek must not scan the owner's entire
+       * retained stream, and it must remain independent of observed time. */
       SELECT DISTINCT ${target('wanted')}'v1',r.observed_day,chunk.id,chunk.chunk_digest
         FROM scope s
         CROSS JOIN typed_v1_owner_memberships scoped_owner
           ON scoped_owner.participant_id=s.participant_id
-        CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_time
+        CROSS JOIN selected wanted
+        CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_occurrence
           ON scoped_record.owner_id=scoped_owner.typed_owner_id AND scoped_record.format=10
           AND scoped_record.stream IN ${typedStreams}
-          AND scoped_record.occurrence_id IN (SELECT occurrence_id FROM selected)
-          ${physicalOutside}
+          AND scoped_record.occurrence_id=wanted.occurrence_id
+          ${physicalOutside} ${selectedOutside}
         CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=scoped_record.id
-        JOIN selected wanted ON wanted.occurrence_id=scoped_record.occurrence_id ${selectedOutside}
         JOIN typed_v1_admission_state v1 ON v1.id=1 AND v1.runtime_contract_version=1
           AND v1.source_namespace=s.source_namespace
         JOIN typed_v1_owner_memberships owner_membership ON owner_membership.participant_id=r.participant_id
@@ -363,13 +366,13 @@ ${selectedV12}    ), linked(${target()}family,source_day,source_key,source_diges
         FROM scope s
         CROSS JOIN typed_v11_owner_memberships scoped_owner
           ON scoped_owner.participant_id=s.participant_id
-        CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_time
+        CROSS JOIN selected wanted
+        CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_occurrence
           ON scoped_record.owner_id=scoped_owner.typed_owner_id AND scoped_record.format=11
           AND scoped_record.stream IN ${typedStreams}
-          AND scoped_record.occurrence_id IN (SELECT occurrence_id FROM selected)
-          ${physicalOutside}
+          AND scoped_record.occurrence_id=wanted.occurrence_id
+          ${physicalOutside} ${selectedOutside}
         CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=scoped_record.id
-        JOIN selected wanted ON wanted.occurrence_id=scoped_record.occurrence_id ${selectedOutside}
         JOIN typed_v11_admission_state v11 ON v11.id=1 AND v11.runtime_contract_version=1
         JOIN typed_v11_owner_memberships owner_membership ON owner_membership.participant_id=r.participant_id
         JOIN typed_telemetry_owners typed_owner ON typed_owner.id=owner_membership.typed_owner_id

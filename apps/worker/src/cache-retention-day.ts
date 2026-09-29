@@ -1728,17 +1728,17 @@ export function createCacheRetentionDaySourceBuild(options: {
 
 export interface CacheRetentionDayLaneResult {
   state: "idle" | "progress" | "deferred";
-  reason: "complete" | "deadline" | "query_budget" | "day_limit" | "value_collision";
+  reason: "complete" | "deadline" | "query_budget" | "day_limit" | "owner_limit"
+    | "cursor_changed" | "value_collision";
   built: number;
   staged: number;
   /** Days refused for a reason recorded against the day's own inputs, so the
    * next selection excludes them. */
   refused: number;
-  /** Days refused for a transient, owner-scoped reason, deliberately NOT
-   * recorded, so the same days are selected again next pass. A pass whose
-   * candidates are all skipped makes no progress and repeats forever, which is
-   * indistinguishable from "never opened" without this counter. */
+  /** Days refused for a transient owner/source reason. No mark is written;
+   * the numeric owner cursor retries them on a later rotation. */
   skipped: number;
+  /** Selected rows, including rows not opened when a deadline ends the pass. */
   candidates: number;
   /** Conservative build allowance spent. With shared features this also
    * counts target feature statements; the outer D1 meter counts each actual
@@ -1751,8 +1751,40 @@ const shardSql = (column: string): string =>
   `(?5=1 OR ((instr('0123456789abcdef',substr(${column},1,1))-1)*16
     +(instr('0123456789abcdef',substr(${column},2,1))-1))%?5=?6)`;
 
+/** Pick one active, unfenced owner by numeric position. The cursor stores no
+ * owner identity; modulo makes owner additions and removals safe to revisit. */
+const OWNER_SELECTION_SQL = `WITH eligible AS (
+    SELECT o.owner_digest,
+      ROW_NUMBER() OVER (ORDER BY o.owner_digest)-1 AS ordinal,
+      COUNT(*) OVER () AS owner_count
+    FROM analytics_owner_state o
+    WHERE o.source_id=?1 AND o.state='active'
+      AND NOT EXISTS(SELECT 1 FROM analytics_storage_erasure_fences f
+        WHERE f.source_id=o.source_id AND f.owner_digest=o.owner_digest)
+      AND (?3=1 OR ((instr('0123456789abcdef',substr(o.owner_digest,1,1))-1)*16
+        +(instr('0123456789abcdef',substr(o.owner_digest,2,1))-1))%?3=?4)
+  )
+  SELECT e.owner_digest,e.ordinal,e.owner_count,
+    COALESCE((SELECT revision FROM analytics_cache_retention_owner_cursor c
+      WHERE c.source_id=?1 AND c.shard_count=?3 AND c.shard_index=?4),0) AS cursor_revision
+  FROM eligible e
+  WHERE e.ordinal=COALESCE((SELECT CASE WHEN c.method_version=?2 THEN c.next_owner_offset ELSE 0 END
+    FROM analytics_cache_retention_owner_cursor c
+    WHERE c.source_id=?1 AND c.shard_count=?3 AND c.shard_index=?4),0)%e.owner_count
+  LIMIT 1`;
+
+const ADVANCE_OWNER_CURSOR_SQL = `INSERT INTO analytics_cache_retention_owner_cursor
+    (source_id,shard_count,shard_index,method_version,next_owner_offset,revision)
+  VALUES(?,?,?,?,?,1)
+  ON CONFLICT(source_id,shard_count,shard_index) DO UPDATE SET
+    method_version=excluded.method_version,
+    next_owner_offset=excluded.next_owner_offset,
+    revision=analytics_cache_retention_owner_cursor.revision+1
+  WHERE analytics_cache_retention_owner_cursor.revision=?6`;
+
 /**
- * The candidate selection: oldest day first across all delivered layouts.
+ * The candidate selection: oldest day first across all delivered layouts for
+ * one owner selected by the numeric scheduling cursor.
  *
  * Each arm is limited on its own before the union, so the compound never
  * materializes more than `3 * maxDays` rows; taking the oldest N of each arm
@@ -1778,6 +1810,7 @@ const SELECTION_SQL = `SELECT * FROM (
     JOIN analytics_owner_state o ON o.source_id=v.source_id AND o.owner_digest=v.owner_digest
       AND o.state='active'
     WHERE v.source_id=?1 AND v.source_layout='typed-v11' AND (?2 IS NULL OR v.day>=?2)
+      AND v.owner_digest=?7
       AND NOT EXISTS(SELECT 1 FROM analytics_storage_erasure_fences f
         WHERE f.source_id=v.source_id AND f.owner_digest=v.owner_digest)
       AND NOT EXISTS(SELECT 1 FROM analytics_community_daily_owners e
@@ -1808,6 +1841,7 @@ const SELECTION_SQL = `SELECT * FROM (
         c.observed_day AS day,${v1DayRevision("c")} AS manifest_digest
       FROM analytics_v1_chunk_values c
       WHERE c.source_id=?1 AND (?2 IS NULL OR c.observed_day>=?2)
+        AND c.owner_digest=?7
         AND ${shardSql("c.owner_digest")}
         AND EXISTS(SELECT 1 FROM analytics_owner_state o WHERE o.source_id=c.source_id
           AND o.owner_digest=c.owner_digest AND o.state='active')
@@ -1842,6 +1876,7 @@ const SELECTION_SQL = `SELECT * FROM (
     JOIN analytics_owner_state o ON o.source_id=e.source_id AND o.owner_digest=e.owner_digest
       AND o.state='active'
     WHERE e.source_id=?1 AND e.source_format='effective' AND e.complete=1
+      AND e.owner_digest=?7
       AND ${effectiveDependencyDigestSql("e")} IS NOT NULL
       AND (?2 IS NULL OR e.day>=?2)
       AND NOT EXISTS(SELECT 1 FROM analytics_storage_erasure_fences f
@@ -1856,12 +1891,12 @@ const SELECTION_SQL = `SELECT * FROM (
   ORDER BY day,owner_digest,device_id LIMIT ?4`;
 
 /**
- * One bounded, resumable preparation page.
- *
- * Oldest day first, so a backfill converges and a stalled day is visible rather
- * than skipped. The lane refuses to OPEN a day it cannot pay for in full, so a
- * pass never ends with a day half written; a day that still needs another batch
- * keeps its staged rows and no mark, which is what the next pass resumes from.
+ * One bounded, resumable preparation pass. Owners rotate by a durable numeric
+ * cursor; days remain oldest first within each owner. A transiently unavailable
+ * first day leaves that owner eligible on its next rotation and allows other
+ * owners to advance now. Later days of that same owner wait for its daily
+ * projection to catch up. The lane never opens a day it cannot pay for in full;
+ * an unfinished batch retains staged rows without a mark for a later rotation.
  */
 export async function advanceCacheRetentionDayLane(options: {
   target: D1Database; sourceId: string; build: CacheRetentionDayBuild;
@@ -1894,92 +1929,141 @@ export async function advanceCacheRetentionDayLane(options: {
     reason: CacheRetentionDayLaneResult["reason"], candidates: number,
     sourceQueriesUsed: number): CacheRetentionDayLaneResult =>
     ({ state, reason, built, staged, refused, skipped, candidates, sourceQueriesUsed });
-  // One selection statement plus, per day, the carry read, a mark read, a
-  // staged read, its write batch and the promotion check. Refuse to open the
-  // lane below that.
+  // One owner read, cursor CAS and selection precede any source work. A day
+  // still reserves its full target write allowance before it is opened.
   if (options.remainingQueries < 5) return idle("deferred", "query_budget", 0, 0);
   if (now() >= options.deadlineMs) return idle("deferred", "deadline", 0, 0);
-  const candidates = (await target.prepare(SELECTION_SQL)
-    .bind(sourceId, options.fromDay ?? null, CACHE_RETENTION_METHOD.version, maxDays,
-      shardCount, shardIndex)
-    .all<{ source_id: string; source_layout: string; source_namespace: string; owner_digest: string;
-      device_id: string; manifest_id: string; manifest_digest: string; day: string }>()).results;
-  if (!candidates.length) return idle("idle", "complete", 0, 0);
   // One day also checks for a prior value with the same historical UNIQUE
   // identity. Only a colliding day spends four more target statements to retire
   // one bounded page; reserve those four before touching that page.
   const perDay = 6 + maxWrites;
-  let affordable = options.remainingQueries - 1;
+  let affordable = options.remainingQueries;
   const sourceAllowance = options.sourceQueries ?? 256;
   const sourceBudget: CacheRetentionBuildBudget = { deadlineMs: options.deadlineMs,
     remainingQueries: sourceAllowance,remainingSharedQueries:options.sharedRemainingQueries };
   const spent = (): number => sourceAllowance - sourceBudget.remainingQueries;
-  for (const row of candidates) {
-    if (affordable < perDay) {
-      return idle(built + staged ? "progress" : "deferred", "query_budget", candidates.length, spent());
-    }
-    affordable -= perDay;
-    if (now() >= options.deadlineMs) {
-      return idle(built + staged ? "progress" : "deferred", "deadline", candidates.length, spent());
-    }
-    if (row.source_id !== sourceId
-      || !CACHE_RETENTION_SOURCE_LAYOUTS.includes(
-        row.source_layout as CacheRetentionSourceLayout)) throw fail();
-    const candidate: CacheRetentionDayCandidate = { sourceId,
-      sourceLayout: row.source_layout as CacheRetentionSourceLayout,
-      sourceNamespace: row.source_namespace, ownerDigest: row.owner_digest, deviceId: row.device_id,
-      manifestId: row.manifest_id, manifestDigest: row.manifest_digest, day: row.day };
-    checkKey(candidate);
-    const carry = await readCacheRetentionCarryDays(target, candidate);
-    let aggregate: CacheRetentionDayAggregate;
-    try {
-      aggregate = await build(candidate, carry, sourceBudget);
-    } catch (error) {
-      if (error instanceof CacheRetentionRefusedError) {
-        if (!CACHE_RETENTION_RECORDED_REFUSALS.has(error.reason)) {
-          // Transient and owner-scoped: the pass's own memo already makes the
-          // rest of this owner's days free, and the next pass retries it.
-          skipped += 1;
-          console.log(JSON.stringify({ event: "cache_retention_day_skipped", reason: error.reason }));
+  let candidatesSeen = 0, attempted = 0;
+  const visited = new Set<string>();
+  let ownerCount: number | null = null;
+  let ownerCountDrifted = false;
+  const state = (): CacheRetentionDayLaneResult["state"] =>
+    built + staged + refused + skipped > 0 ? "progress" : "deferred";
+  const wrapResult = (): CacheRetentionDayLaneResult =>
+    idle(state() === "progress" ? "progress" : "idle",
+      state() === "progress" ? "day_limit" : "complete", candidatesSeen, spent());
+  // One failed owner cannot consume all twelve day slots. The cursor moves
+  // before its source attempt, so a crash or deadline still gives the next
+  // owner a turn. Its numeric position wraps, and no skipped day is marked.
+  for (let ownerProbe = 0; ownerProbe < 12 && attempted < maxDays; ownerProbe += 1) {
+    if (affordable < 3 || (options.sharedRemainingQueries?.() ?? Infinity) < 3)
+      return idle(state(), "query_budget", candidatesSeen, spent());
+    if (now() >= options.deadlineMs)
+      return idle(state(), "deadline", candidatesSeen, spent());
+    const owner = await target.prepare(OWNER_SELECTION_SQL)
+      .bind(sourceId, CACHE_RETENTION_METHOD.version, shardCount, shardIndex)
+      .first<{ owner_digest: string; ordinal: number; owner_count: number; cursor_revision: number }>();
+    affordable -= 1;
+    if (now() >= options.deadlineMs)
+      return idle(state(), "deadline", candidatesSeen, spent());
+    if (!owner) return wrapResult();
+    if (affordable < 2 || (options.sharedRemainingQueries?.() ?? Infinity) < 2)
+      return idle(state(), "query_budget", candidatesSeen, spent());
+    bounded(owner.ordinal, 0, Number.MAX_SAFE_INTEGER);
+    bounded(owner.owner_count, 1, Number.MAX_SAFE_INTEGER);
+    bounded(owner.cursor_revision, 0, Number.MAX_SAFE_INTEGER - 1);
+    if (owner.ordinal >= owner.owner_count || !HASH.test(owner.owner_digest)) throw fail();
+    if (ownerCount === null) ownerCount = owner.owner_count;
+    else if (ownerCount !== owner.owner_count) ownerCountDrifted = true;
+    if (visited.has(owner.owner_digest))
+      return !ownerCountDrifted && visited.size === owner.owner_count
+        ? wrapResult() : idle(state(), "owner_limit", candidatesSeen, spent());
+    visited.add(owner.owner_digest);
+    const next = (owner.ordinal + 1) % owner.owner_count;
+    const advanced = await target.prepare(ADVANCE_OWNER_CURSOR_SQL)
+      .bind(sourceId, shardCount, shardIndex, CACHE_RETENTION_METHOD.version,
+        next, owner.cursor_revision).run();
+    affordable -= 1;
+    if (advanced.meta.changes !== 1)
+      return idle(state(), "cursor_changed", candidatesSeen, spent());
+    if (now() >= options.deadlineMs)
+      return idle(state(), "deadline", candidatesSeen, spent());
+    if (affordable < 1 || (options.sharedRemainingQueries?.() ?? Infinity) < 1)
+      return idle(state(), "query_budget", candidatesSeen, spent());
+    const remaining = maxDays - attempted;
+    const candidates = (await target.prepare(SELECTION_SQL)
+      .bind(sourceId, options.fromDay ?? null, CACHE_RETENTION_METHOD.version, remaining,
+        shardCount, shardIndex, owner.owner_digest)
+      .all<{ source_id: string; source_layout: string; source_namespace: string; owner_digest: string;
+        device_id: string; manifest_id: string; manifest_digest: string; day: string }>()).results;
+    affordable -= 1;
+    candidatesSeen += candidates.length;
+    let ownerUnavailable = false;
+    for (const row of candidates) {
+      if (affordable < perDay)
+        return idle(state(), "query_budget", candidatesSeen, spent());
+      if (now() >= options.deadlineMs)
+        return idle(state(), "deadline", candidatesSeen, spent());
+      affordable -= perDay;
+      attempted += 1;
+      if (row.source_id !== sourceId || row.owner_digest !== owner.owner_digest
+        || !CACHE_RETENTION_SOURCE_LAYOUTS.includes(
+          row.source_layout as CacheRetentionSourceLayout)) throw fail();
+      const candidate: CacheRetentionDayCandidate = { sourceId,
+        sourceLayout: row.source_layout as CacheRetentionSourceLayout,
+        sourceNamespace: row.source_namespace, ownerDigest: row.owner_digest, deviceId: row.device_id,
+        manifestId: row.manifest_id, manifestDigest: row.manifest_digest, day: row.day };
+      checkKey(candidate);
+      const carry = await readCacheRetentionCarryDays(target, candidate);
+      let aggregate: CacheRetentionDayAggregate;
+      try {
+        aggregate = await build(candidate, carry, sourceBudget);
+      } catch (error) {
+        if (error instanceof CacheRetentionRefusedError) {
+          if (!CACHE_RETENTION_RECORDED_REFUSALS.has(error.reason)) {
+            skipped += 1;
+            ownerUnavailable = true;
+            // The skipped day used one target carry read, not its reserved
+            // write batch. Another owner may use the remaining allowance.
+            affordable += perDay - 1;
+            console.log(JSON.stringify({ event: "cache_retention_day_skipped", reason: error.reason }));
+            break;
+          }
+          refused += 1;
+          await writeCacheRetentionDayRefusal({ target, key: candidate, carry,
+            reason: error.reason as CacheRetentionRecordedRefusal });
+          console.log(JSON.stringify({ event: "cache_retention_day_refused", reason: error.reason }));
           continue;
         }
-        refused += 1;
-        await writeCacheRetentionDayRefusal({ target, key: candidate, carry,
-          reason: error.reason as CacheRetentionRecordedRefusal });
-        console.log(JSON.stringify({ event: "cache_retention_day_refused", reason: error.reason }));
-        continue;
+        if (!(error instanceof CacheRetentionDeferredError)) throw error;
+        return idle(state(), error.reason, candidatesSeen, spent());
       }
-      // A deferred build wrote nothing, so the pass ends here and the next one
-      // starts this day again.
-      if (!(error instanceof CacheRetentionDeferredError)) throw error;
-      return idle(built + staged ? "progress" : "deferred", error.reason, candidates.length, spent());
+      if (options.sharedRemainingQueries && options.sharedRemainingQueries() < 1)
+        return idle(state(), "query_budget", candidatesSeen, spent());
+      const collision = await retireCacheRetentionCollisionPage(target, candidate, carry, aggregate,
+        affordable >= 4 && (options.sharedRemainingQueries?.() ?? Infinity) >= 5);
+      if (collision === "query_budget")
+        return idle(state(), "query_budget", candidatesSeen, spent());
+      if (collision === "collision")
+        return idle(state(), "value_collision", candidatesSeen, spent());
+      const progressKey = candidate.sourceLayout === "effective"
+        ? await cacheRetentionDayMarkKey(candidate, await cacheRetentionStorageCarryDigest(candidate, carry))
+        : undefined;
+      const result = await writeCacheRetentionDay({ target, key: candidate, carry, aggregate,
+        maxWrites, progressKey });
+      if (result.status === "stored") built += 1; else staged += 1;
     }
-    if (options.sharedRemainingQueries && options.sharedRemainingQueries() < 1) {
-      return idle(built + staged ? "progress" : "deferred", "query_budget",
-        candidates.length, spent());
-    }
-    const collision = await retireCacheRetentionCollisionPage(target, candidate, carry, aggregate,
-      affordable >= 4 && (options.sharedRemainingQueries?.() ?? Infinity) >= 5);
-    if (collision === "query_budget") {
-      return idle(built + staged ? "progress" : "deferred", "query_budget",
-        candidates.length, spent());
-    }
-    if (collision === "collision") {
-      // A second invocation reselects the same day. Never report idle while a
-      // still-current legacy mark or another page of obsolete values blocks it.
-      return idle(built + staged ? "progress" : "deferred", "value_collision",
-        candidates.length, spent());
-    }
-    const progressKey = candidate.sourceLayout === "effective"
-      ? await cacheRetentionDayMarkKey(candidate, await cacheRetentionStorageCarryDigest(candidate, carry))
-      : undefined;
-    const result = await writeCacheRetentionDay({ target, key: candidate, carry, aggregate, maxWrites, progressKey });
-    if (result.status === "stored") built += 1; else staged += 1;
+    if (attempted >= maxDays)
+      return idle("progress", "day_limit", candidatesSeen, spent());
+    // A blocked owner stays eligible next rotation. If the owner was exhausted,
+    // move to the next one while this invocation still has room.
+    if (ownerUnavailable || candidates.length < remaining) continue;
   }
-  // A pass that only refused still advanced: it recorded refusals the next
-  // selection excludes. Reporting idle there would claim the lane is complete.
-  return idle("progress", candidates.length < maxDays ? "complete" : "day_limit",
-    candidates.length, spent());
+  // A fixed probe cap bounds target reads. It cannot prove an empty shard if
+  // more owners remain, so a no-work pass is deferred until a full observed
+  // wrap fits within a later pass (or the owner set contracts).
+  if (!ownerCountDrifted && ownerCount !== null && visited.size === ownerCount)
+    return wrapResult();
+  return idle(state(), "owner_limit", candidatesSeen, spent());
 }
 
 /** The whole community's band rows, one per (owner, band), ready for
