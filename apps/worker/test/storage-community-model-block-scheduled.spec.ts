@@ -1,5 +1,5 @@
 import {env,reset,type D1Migration} from 'cloudflare:test';
-import {expect,it} from 'vitest';
+import {expect,it,vi} from 'vitest';
 import {createModelBlockSelection,MODEL_BLOCK_METHOD,planHistoricalModelBlockRanges,
  type ModelBlockIdentity} from '../src/analytics-model-block-contract';
 import {runStorageAnalyticsPass} from '../src/storage-analytics-runtime';
@@ -116,6 +116,10 @@ it.each([{name:'constrained default',windowMs:20_000},{name:'minute',windowMs:55
  },180_000);
 
 it('selects and publishes the newest and oldest clipped historical dates after each complete cohort',async()=>{
+ // Keep both clipped edges deterministic and give selection, publication and
+ // retirement the same day. Date advances with real time so deadlines/leases
+ // still run; I/O timers, performance.now and the test timeout stay real.
+ try{
  await reset();
  await initializeSharedAnalyticsCorpusDatabases(source(),target(),b,sourceId,sourceNamespace);
  const liveToday='2026-09-28';
@@ -125,6 +129,10 @@ it('selects and publishes the newest and oldest clipped historical dates after e
   Date.parse(edge.outputFromDay))/86_400_000+1).toBeLessThan(32);
  const corpus=await seedSharedAnalyticsCorpus({...bindings(),anchorDay:newest.outputThroughDay,
   calendarDays:78,graphDays:2,crossDayLinks:false});
+ // Admission has native SQLite expiry checks, so finish admission on its real
+ // clock before aligning the analytical calculation and retention clocks.
+ vi.useFakeTimers({toFake:['Date'],shouldAdvanceTime:true});
+ vi.setSystemTime(Date.parse(`${liveToday}T12:00:00.000Z`));
  expect(await modelBlockStoreSupported(target())).toBe(true);
  expect(corpus.owner.hasEffective).toBe(true);
  const graphSelectionNowMs=Date.parse(`${liveToday}T12:00:00.000Z`);
@@ -206,6 +214,7 @@ it('selects and publishes the newest and oldest clipped historical dates after e
  await target().prepare(`UPDATE analytics_community_graph_scan SET revision=revision+1,
   tick=1,current_position=0,history_position=0 WHERE source_id=?`).bind(sourceId).run();
  await runSelectedDay(oldest.outputFromDay);
+ }finally{vi.useRealTimers();}
 },240_000);
 
 it('uses bounded native historical work when only the prior model-block migration is present',async()=>{
