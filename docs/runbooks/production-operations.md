@@ -660,10 +660,13 @@ controls. Do not restore a writer that predates correction archival.
 
 The effective dependency reader requires typed-ingestion migration
 `0005_owner_occurrence_lookup.sql` before its new source is deployed. The
-`typed_telemetry_owner_occurrence` index serves owner/format/stream/occurrence
-lookups across retained history. Date restrictions must not replace these
+`typed_telemetry_device_owner` and `typed_telemetry_manifest_owner` indexes
+scope the small metadata dictionaries. The reader then seeks selected canonical
+occurrence IDs through the existing format-specific device/manifest indexes,
+retaining explicit owner, format and stream predicates. No new index is built
+over the retained record table. Date restrictions must not replace these
 cross-day links: they carry correction and conflict dependencies outside the
-requested output window. A missing index refuses the new query explicitly.
+requested output window. A missing metadata index refuses the new query.
 
 Analytics migration `0033_cache_retention_owner_cursor.sql` must also precede
 the new cache Worker. Its table stores a numeric position and revision for each
@@ -693,10 +696,10 @@ qualified successor. A timeout with an unknown outcome requires read-only
 reconciliation before any further write.
 
 The narrow `apps/worker/scripts/existing-role-forward-migration.mjs` operator
-owns this two-object update. Its `prepareExistingRoleForwardPlan` API pins a
+owns this two-role update. Its `prepareExistingRoleForwardPlan` API pins a
 clean candidate, Wrangler bytes, the four exact predecessor Workers, both role
 bindings, complete schema/ledger prefixes, stable runtime controls and Time
-Travel bookmarks. It projects only the two reviewed additions through the
+Travel bookmarks. It projects only the three reviewed additions through the
 unchanged canonical preflight. `runExistingRoleForwardMigration` defaults to
 plan validation; execution requires the exact plan digest and confirmation.
 

@@ -331,15 +331,19 @@ ${selectedV12}    ), linked(${target()}family,source_day,source_key,source_diges
        * matching occurrences here instead of materializing each record's
        * decoded identity and digest before throwing those columns away.
        * Drive retained-history expansion from selected occurrences: its
-       * owner/format/stream/occurrence seek must not scan the owner's entire
-       * retained stream, and it must remain independent of observed time. */
+       * owned device/manifest and stream/occurrence seeks must not scan the
+       * owner's entire retained stream. They remain independent of observed
+       * time and preserve the complete canonical BLOB identity. */
       SELECT DISTINCT ${target('wanted')}'v1',r.observed_day,chunk.id,chunk.chunk_digest
         FROM scope s
         CROSS JOIN typed_v1_owner_memberships scoped_owner
           ON scoped_owner.participant_id=s.participant_id
         CROSS JOIN selected wanted
-        CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_occurrence
-          ON scoped_record.owner_id=scoped_owner.typed_owner_id AND scoped_record.format=10
+        CROSS JOIN typed_telemetry_devices scoped_device INDEXED BY typed_telemetry_device_owner
+          ON scoped_device.owner_id=scoped_owner.typed_owner_id
+        CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_v1_occurrence
+          ON scoped_record.device_id=scoped_device.id
+          AND scoped_record.owner_id=scoped_owner.typed_owner_id AND scoped_record.format=10
           AND scoped_record.stream IN ${typedStreams}
           AND scoped_record.occurrence_id=wanted.occurrence_id
           ${physicalOutside} ${selectedOutside}
@@ -367,8 +371,11 @@ ${selectedV12}    ), linked(${target()}family,source_day,source_key,source_diges
         CROSS JOIN typed_v11_owner_memberships scoped_owner
           ON scoped_owner.participant_id=s.participant_id
         CROSS JOIN selected wanted
-        CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_occurrence
-          ON scoped_record.owner_id=scoped_owner.typed_owner_id AND scoped_record.format=11
+        CROSS JOIN typed_telemetry_manifests scoped_manifest INDEXED BY typed_telemetry_manifest_owner
+          ON scoped_manifest.owner_id=scoped_owner.typed_owner_id
+        CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_v11_occurrence
+          ON scoped_record.manifest_id=scoped_manifest.id
+          AND scoped_record.owner_id=scoped_owner.typed_owner_id AND scoped_record.format=11
           AND scoped_record.stream IN ${typedStreams}
           AND scoped_record.occurrence_id=wanted.occurrence_id
           ${physicalOutside} ${selectedOutside}

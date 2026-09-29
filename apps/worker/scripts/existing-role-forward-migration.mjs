@@ -23,12 +23,22 @@ export const EXISTING_ROLE_FORWARD_PREVIOUS_SCHEDULED = '3216e2258830841c37f17c1
 export const EXISTING_ROLE_FORWARD_STEPS = Object.freeze([
   Object.freeze({ role: 'primary', binding: 'USAGE_MONITOR_DB', scheduledBinding: 'STORAGE_INGESTION_DB',
     directory: 'typed-ingestion-migrations', name: '0005_owner_occurrence_lookup.sql',
-    sha256: 'f3a0d9cfdfd067df30e08771c4f1e5100cdc0b8e6594430d1fc197f4750712ed',
-    objectType: 'index', objectName: 'typed_telemetry_owner_occurrence', table: 'typed_telemetry_records' }),
+    sha256: '970bf68dcf1d6fe78a2790a2857c16a2771d50e44633cbe89835af4d9661b602',
+    reviewedObjects: Object.freeze([
+      Object.freeze({type:'index',name:'typed_telemetry_device_owner',table:'typed_telemetry_devices'}),
+      Object.freeze({type:'index',name:'typed_telemetry_manifest_owner',table:'typed_telemetry_manifests'}),
+    ]),
+    fixtureTables: Object.freeze([
+      'CREATE TABLE typed_telemetry_devices(id INTEGER PRIMARY KEY,owner_id INTEGER NOT NULL)',
+      'CREATE TABLE typed_telemetry_manifests(id INTEGER PRIMARY KEY,owner_id INTEGER NOT NULL)',
+    ]) }),
   Object.freeze({ role: 'analytics', binding: 'ANALYTICS_DB', scheduledBinding: 'STORAGE_ANALYTICS_DB',
     directory: 'analytics-migrations', name: '0033_cache_retention_owner_cursor.sql',
     sha256: '370409563c2447a89d48a787c95aaa84da2fe73a437ac3c69ea57d0116cf0f8a',
-    objectType: 'table', objectName: 'analytics_cache_retention_owner_cursor', table: 'analytics_cache_retention_owner_cursor' }),
+    reviewedObjects: Object.freeze([
+      Object.freeze({type:'table',name:'analytics_cache_retention_owner_cursor',table:'analytics_cache_retention_owner_cursor'}),
+    ]),
+    fixtureTables: Object.freeze(['CREATE TABLE analytics_runtime_sources(source_id TEXT PRIMARY KEY)']) }),
 ]);
 
 const SHA=/^[a-f0-9]{64}$/u, COMMIT=/^[a-f0-9]{40}$/u;
@@ -73,8 +83,29 @@ async function validateCheckoutPaths(repositoryRoot,workerDirectory){
     ||worker!==join(repository,'apps','worker'))fail('SOURCE_PATH_INVALID');
 }
 
+function inspectReviewedObjects(step,sql){
+  const db=new DatabaseSync(':memory:');
+  try{
+    for(const ddl of step.fixtureTables)db.exec(ddl);
+    db.exec(sql);
+    const fixtureNames=step.fixtureTables.map(ddl=>{
+      const match=/^CREATE TABLE ([A-Za-z_][A-Za-z0-9_]*)\s*\(/u.exec(ddl);
+      if(!match)fail('SQL_FIXTURE_INVALID');
+      return match[1];
+    });
+    const additions=db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY type,name")
+      .all().filter(row=>!fixtureNames.includes(row.name));
+    if(additions.length!==step.reviewedObjects.length
+      ||additions.some((row,index)=>row.type!==step.reviewedObjects[index].type
+        ||row.name!==step.reviewedObjects[index].name
+        ||row.tbl_name!==step.reviewedObjects[index].table
+        ||typeof row.sql!=='string'))fail('SQL_OBJECT_NOT_REVIEWED');
+    return additions;
+  }finally{db.close();}
+}
+
 /** Inspect the two closed candidate files in a disposable SQLite database.
- * Only a single additive CREATE object can pass; no SQL is supplied by a plan. */
+ * Each file must add exactly its reviewed object set; no SQL comes from a plan. */
 export async function loadExistingRoleForwardSteps({workerDirectory}){
   const root=resolve(workerDirectory);
   const require=createRequire(join(root,'package.json'));
@@ -88,33 +119,37 @@ export async function loadExistingRoleForwardSteps({workerDirectory}){
     const bytes=await readFile(path);
     if(bytes.length!==stat.size||bytes.includes(0)||storageSha256(bytes)!==step.sha256)fail('SQL_FILE_CHANGED');
     const sql=bytes.toString('utf8');
+    const statements=split(sql);
     if(!Buffer.from(sql).equals(bytes)||/\bd1_storage_migrations\b/iu.test(sql)
-      ||split(sql).length!==1)fail('SQL_NOT_SINGLE_ADDITIVE_OBJECT');
-    const ddl=sql.replace(/^--[^\n]*(?:\n|$)/gmu,'').trim();
-    if(step.role==='primary'
-      ? !/^CREATE INDEX typed_telemetry_owner_occurrence\s+ON typed_telemetry_records\s*\(/iu.test(ddl)
-      : !/^CREATE TABLE analytics_cache_retention_owner_cursor\s*\(/iu.test(ddl))
-      fail('SQL_OBJECT_NOT_REVIEWED');
-    const db=new DatabaseSync(':memory:');
-    try{
-      db.exec(step.role==='primary'
-        ? 'CREATE TABLE typed_telemetry_records(owner_id INTEGER,format INTEGER,stream TEXT,occurrence_id BLOB)'
-        : 'CREATE TABLE analytics_runtime_sources(source_id TEXT PRIMARY KEY)');
-      db.exec(sql);
-      const rows=db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' AND name<>? ORDER BY type,name")
-        .all(step.role==='primary'?'typed_telemetry_records':'analytics_runtime_sources');
-      if(rows.length!==1||rows[0].type!==step.objectType||rows[0].name!==step.objectName
-        ||rows[0].tbl_name!==step.table||typeof rows[0].sql!=='string')fail('SQL_OBJECT_NOT_REVIEWED');
-      output.push({...step,sha256:storageSha256(bytes),bytes:bytes.length,sql,addedObject:rows[0]});
-    }finally{db.close();}
+      ||statements.length!==step.reviewedObjects.length)fail('SQL_OBJECT_COUNT_INVALID');
+    for(const [index,reviewed] of step.reviewedObjects.entries()){
+      const ddl=statements[index].replace(/^--[^\n]*(?:\n|$)/gmu,'').trim();
+      const prefix=reviewed.type==='index'
+        ?new RegExp(`^CREATE INDEX ${reviewed.name}\\s+ON ${reviewed.table}\\s*\\(`,'iu')
+        :new RegExp(`^CREATE TABLE ${reviewed.name}\\s*\\(`,'iu');
+      if(!prefix.test(ddl))fail('SQL_OBJECT_NOT_REVIEWED');
+    }
+    const additions=inspectReviewedObjects(step,sql);
+    output.push({...step,sha256:storageSha256(bytes),bytes:bytes.length,sql,addedObjects:additions});
   }
   return output;
 }
 
 export function projectExistingRoleSchema(rows,step){
-  if(!validRows(rows)||!object(step?.addedObject)
-    ||rows.some(row=>row.name===step.objectName))fail('BEFORE_SCHEMA_INVALID');
-  const projected=[...rows,step.addedObject];
+  const reviewed=EXISTING_ROLE_FORWARD_STEPS.find(value=>value.role===step?.role
+    &&value.name===step?.name&&value.sha256===step?.sha256);
+  if(!reviewed||!validRows(rows)||!Array.isArray(step.addedObjects)
+    ||typeof step.sql!=='string'||storageSha256(step.sql)!==reviewed.sha256
+    ||step.addedObjects.length!==reviewed.reviewedObjects.length
+    ||step.addedObjects.some((row,index)=>!exact(row,['type','name','tbl_name','sql'])
+      ||row.type!==reviewed.reviewedObjects[index].type
+      ||row.name!==reviewed.reviewedObjects[index].name
+      ||row.tbl_name!==reviewed.reviewedObjects[index].table
+      ||typeof row.sql!=='string'||rows.some(before=>before.name===row.name)))
+    fail('BEFORE_SCHEMA_INVALID');
+  if(!same(step.addedObjects,inspectReviewedObjects(reviewed,step.sql)))
+    fail('PROJECTED_SCHEMA_INVALID');
+  const projected=[...rows,...step.addedObjects];
   if(!validRows(projected))fail('PROJECTED_SCHEMA_INVALID');
   return {rows:projected,beforeSha256:storageSchemaDigest(rows),afterSha256:storageSchemaDigest(projected)};
 }
@@ -652,7 +687,8 @@ export async function runExistingRoleForwardMigration({plan,workerDirectory,repo
       await lock.assertOwned(state.owner);
       assertCleanSource(repositoryRoot,plan.sourceCommit);
       if(Date.parse(plan.expiresAt)<=Date.now())fail('APPROVAL_EXPIRED');
-      try{await adapter.migrateAtomic(target,{sql,sha256:storageSha256(sql),resultCount:2,atomic:true});}
+      try{await adapter.migrateAtomic(target,{sql,sha256:storageSha256(sql),
+        resultCount:step.reviewedObjects.length+1,atomic:true});}
       catch{state.lastFailure='PROVIDER_RESULT_UNCERTAIN';await operation.save(state);fail('PROVIDER_RESULT_UNCERTAIN');}
       const after=await inspect(index);
       if(after.schemaSha256!==target.afterSchemaSha256

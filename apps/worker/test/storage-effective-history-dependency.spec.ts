@@ -43,6 +43,7 @@ import { advanceV11QuotaAcquisition, V11_QUOTA_ACQUISITION_PAGE_SIZE,
   type V11QuotaPageReader } from "../src/quota-analysis-v11-reader";
 import type { StorageCommunityOwner } from "../src/storage-community-authority";
 import { createD1InvocationBudget } from "../src/d1-invocation-budget";
+import { encodeTypedTelemetryId, typedTelemetryDayNumber } from "../src/typed-telemetry-codec";
 import dependencySqlBaseline from "./fixtures/effective-history-dependency-32bd4091.json";
 import occurrenceSqlBaseline from "./fixtures/effective-history-dependency-c7dcdc6f.json";
 
@@ -709,7 +710,7 @@ describe("bounded shared effective day dependencies", () => {
     }
   }, 30_000);
 
-  it("seeks selected typed occurrences by owner, format, stream and canonical ID in both dependency modes", async () => {
+  it("seeks selected canonical IDs through owned metadata and existing format-specific indexes in both dependency modes", async () => {
     for (const includeSessions of [false, true]) {
       const observed = observeDependencyQueries(db());
       await effectiveHistoryDependency(observed.database, emptyDependencyOwner, namespace, day(), day(),
@@ -729,10 +730,15 @@ describe("bounded shared effective day dependencies", () => {
         expect(timed).toHaveLength(2);
         for (const row of timed) expect(row.detail).toContain(
           "owner_id=? AND stream=? AND observed_at_ms>? AND observed_at_ms<?");
-        const linked = typedSeeks.filter(row => row.detail.includes("typed_telemetry_owner_occurrence"));
-        expect(linked).toHaveLength(2);
-        for (const row of linked) expect(row.detail).toContain(
-          "owner_id=? AND format=? AND stream=? AND occurrence_id=?");
+        expect(typedSeeks.find(row => row.detail.includes("typed_telemetry_v1_occurrence"))?.detail)
+          .toContain("device_id=? AND stream=? AND occurrence_id=?");
+        expect(typedSeeks.find(row => row.detail.includes("typed_telemetry_v11_occurrence"))?.detail)
+          .toContain("manifest_id=? AND stream=? AND occurrence_id=?");
+        expect(plan.find(row => row.detail.includes("scoped_device"))?.detail)
+          .toContain("USING COVERING INDEX typed_telemetry_device_owner (owner_id=?)");
+        expect(plan.find(row => row.detail.includes("scoped_manifest"))?.detail)
+          .toContain("USING COVERING INDEX typed_telemetry_manifest_owner (owner_id=?)");
+        expect(query.sql).not.toContain("typed_telemetry_owner_occurrence");
       }
     }
   });
@@ -740,19 +746,32 @@ describe("bounded shared effective day dependencies", () => {
   it("refuses the occurrence lookup before its additive index migration and succeeds after it", async () => {
     const selectedDay = day();
     const before = await effectiveHistoryDependency(db(), emptyDependencyOwner, namespace, selectedDay, selectedDay);
-    await db().prepare("DROP INDEX typed_telemetry_owner_occurrence").run();
-    await expect(effectiveHistoryDependency(db(), emptyDependencyOwner, namespace, selectedDay, selectedDay))
-      .rejects.toThrow("no such index: typed_telemetry_owner_occurrence");
-    const reader = await createEffectiveHistoryDayDependencyReader(db(), emptyDependencyOwner, namespace,
-      [selectedDay], { occurrenceLinks: "batched" });
-    await expect(reader!.readDigest(selectedDay)).rejects.toThrow("no such index: typed_telemetry_owner_occurrence");
+    for (const index of ["typed_telemetry_device_owner", "typed_telemetry_manifest_owner"]) {
+      await db().prepare(`DROP INDEX ${index}`).run();
+      await expect(effectiveHistoryDependency(db(), emptyDependencyOwner, namespace, selectedDay, selectedDay))
+        .rejects.toThrow(`no such index: ${index}`);
+      const reader = await createEffectiveHistoryDayDependencyReader(db(), emptyDependencyOwner, namespace,
+        [selectedDay], { occurrenceLinks: "batched" });
+      await expect(reader!.readDigest(selectedDay)).rejects.toThrow(`no such index: ${index}`);
+      // Restore this index independently so the next refusal proves the other
+      // metadata seek is required rather than failing on the first missing one.
+      const table = index === "typed_telemetry_device_owner"
+        ? "typed_telemetry_devices" : "typed_telemetry_manifests";
+      await db().prepare(`CREATE INDEX ${index} ON ${table}(owner_id,id)`).run();
+    }
+    await db().batch(["typed_telemetry_device_owner", "typed_telemetry_manifest_owner"]
+      .map(index => db().prepare(`DROP INDEX ${index}`)));
     const migration = b.TEST_TYPED_INGESTION_MIGRATIONS.find(value =>
       value.name === "0005_owner_occurrence_lookup.sql");
     expect(migration).toBeDefined();
     await db().batch(migration!.queries.map(sql => db().prepare(sql)));
-    expect((await db().prepare("PRAGMA index_info(typed_telemetry_owner_occurrence)")
-      .all<{ name: string }>()).results.map(row => row.name))
-      .toEqual(["owner_id", "format", "stream", "occurrence_id"]);
+    expect(migration!.queries).toHaveLength(2);
+    for (const index of ["typed_telemetry_device_owner", "typed_telemetry_manifest_owner"]) {
+      expect((await db().prepare(`PRAGMA index_info(${index})`)
+        .all<{ name: string }>()).results.map(row => row.name)).toEqual(["owner_id", "id"]);
+    }
+    expect(await db().prepare("SELECT name FROM sqlite_schema WHERE name='typed_telemetry_owner_occurrence'")
+      .first()).toBeNull();
     const after = await effectiveHistoryDependency(db(), emptyDependencyOwner, namespace, selectedDay, selectedDay);
     expect(after).toEqual(before);
     const migratedReader = await createEffectiveHistoryDayDependencyReader(db(), emptyDependencyOwner, namespace,
@@ -760,7 +779,7 @@ describe("bounded shared effective day dependencies", () => {
     expect(await migratedReader!.readDigest(selectedDay)).toBe(await sha256Hex(canonicalJson(after)));
   });
 
-  it("keeps cross-day headers and dependency bytes with less work amid unrelated retained owner history", async () => {
+  it("keeps cross-day headers and dependency bytes with less work amid unrelated retained owner history", async ({ annotate }) => {
     const selectedDay = day(), outsideDay = dayAfter(selectedDay);
     const fixture = await createV11DeviceFixture(db(), { grant: true });
     const occurrence = `event:v2:${"a".repeat(64)}`;
@@ -803,13 +822,13 @@ describe("bounded shared effective day dependencies", () => {
       expect(current.meta.rows_read).toBeLessThan(noIn.meta.rows_read);
       expect(canonicalJson({ ...dependency, occurrenceLinks: prior.results.filter(row =>
         (row as {family:string}).family !== "__correction_runtime__") })).toBe(canonicalJson(dependency));
-      console.info("effective-occurrence-seek-cost", JSON.stringify({ includeSessions,
+      await annotate(JSON.stringify({ includeSessions,
         unrelatedOwnerRecords: 1_200, current: current.meta.rows_read,
-        prior: prior.meta.rows_read, noIn: noIn.meta.rows_read }));
+        prior: prior.meta.rows_read, noIn: noIn.meta.rows_read }), "effective-occurrence-seek-cost");
     }
   }, 60_000);
 
-  it("checks each complete chunk once when many selected occurrences match one outside chunk", async () => {
+  it("checks each complete chunk once when many selected occurrences match one outside chunk", async ({ annotate }) => {
     const selectedDay = day(), outsideDay = dayAfter(selectedDay);
     const costs: { occurrences: number; current: number; prior: number }[] = [];
     for (const occurrences of [20, 200]) {
@@ -848,8 +867,140 @@ describe("bounded shared effective day dependencies", () => {
     // Ten times as many matching records within the same two complete chunks
     // must scale linearly; a per-match proof count would be quadratic.
     expect(costs[1]!.current).toBeLessThan(costs[0]!.current * 11);
-    console.info("effective-occurrence-matched-chunk-cost", JSON.stringify(costs));
+    await annotate(JSON.stringify(costs), "effective-occurrence-matched-chunk-cost");
   }, 60_000);
+
+  it("skips unrelated owners' metadata and same-ID records through owner-leading seeks", async ({ annotate }) => {
+    const selectedDay = day(), outsideDay = dayAfter(selectedDay);
+    const occurrence = `event:v2:${"a".repeat(64)}`;
+    const quota = { schemaVersion: "quota-observation-v1.1" as const, observationId: occurrence,
+      observedTime: `${outsideDay}T12:05:00.000Z`, provider: "openai_codex" as const,
+      planType: "pro" as const, planVariant: "unknown" as const, limitId: "codex", slot: "seven_day" as const,
+      usedPercent: 20, windowDurationMinutes: 10_080, resetsAt: null,
+      accountPlanAttribution: { accountBasis: "unavailable" as const, accountTrackId: null,
+        planBasis: "same_source_occurrence" as const, planType: "pro" as const, planEraId: null } };
+    const fixture = await createV11DeviceFixture(db(), { grant: true });
+    await activate(fixture, [
+      await stage(fixture, await makeV11Day(selectedDay, { usage: [v11UsageRecord(selectedDay)] })),
+      await stage(fixture, await makeV11Day(outsideDay, { quota: [quota] })),
+    ]);
+    const owner = (await readStorageCommunityOwnerPage(db()))
+      .find(value => value.participantId === fixture.participantId)!;
+    const observed = observeDependencyQueries(db());
+    const before = await effectiveHistoryDependency(observed.database, owner, namespace, selectedDay, selectedDay);
+    const query = observed.queries.find(value => value.sql.includes("selected(occurrence_id)"))!;
+    const beforeCost = await db().prepare(query.sql).bind(...query.values).all();
+
+    // Fully admitted unrelated records deliberately share the canonical ID.
+    const other = await createV11DeviceFixture(db(), { grant: true });
+    await activate(other, [
+      await stage(other, await makeV11Day(selectedDay, {})),
+      await stage(other, await makeV11Day(outsideDay, { quota: [quota] })),
+    ]);
+    const otherV1 = await createV11DeviceFixture(db());
+    await insertV1HistoryDay(otherV1, outsideDay, 1, null, occurrence);
+    const typed = await db().prepare(`SELECT owner.namespace_id,owner.id AS owner_id,device.id AS device_id
+      FROM typed_v11_owner_memberships membership
+      JOIN typed_telemetry_owners owner ON owner.id=membership.typed_owner_id
+      JOIN typed_telemetry_devices device ON device.owner_id=owner.id
+      WHERE membership.participant_id=? LIMIT 1`).bind(other.participantId)
+      .first<{ namespace_id: number; owner_id: number; device_id: number }>();
+    expect(typed).not.toBeNull();
+    // Dictionaries can outlive individual admitted sources. Populate only
+    // unrelated owners' metadata, without forging record admission/proof rows.
+    for (let offset = 0; offset < 1_000; offset += 100) {
+      await db().batch(Array.from({ length: 100 }, (_, index) => db().prepare(`INSERT INTO
+        typed_telemetry_devices(namespace_id,owner_id,original_id) VALUES(?,?,?)`)
+        .bind(typed!.namespace_id, typed!.owner_id,
+          encodeTypedTelemetryId(`synthetic:unrelated-device:${offset + index}`))));
+      await db().batch(Array.from({ length: 100 }, (_, index) => db().prepare(`INSERT INTO
+        typed_telemetry_manifests(namespace_id,owner_id,device_id,original_id,chunk_day) VALUES(?,?,?,?,?)`)
+        .bind(typed!.namespace_id, typed!.owner_id, typed!.device_id,
+          encodeTypedTelemetryId(`synthetic:unrelated-manifest:${offset + index}`),
+          typedTelemetryDayNumber(outsideDay))));
+    }
+    const after = await effectiveHistoryDependency(db(), owner, namespace, selectedDay, selectedDay);
+    const afterCost = await db().prepare(query.sql).bind(...query.values).all();
+    expect(after).toEqual(before);
+    expect(afterCost.results).toEqual(beforeCost.results);
+    expect(after.occurrenceLinks).toHaveLength(1);
+    expect(afterCost.meta.rows_read).toBeLessThanOrEqual(beforeCost.meta.rows_read + 20);
+    await annotate(JSON.stringify({ unrelatedDevices: 1_000, unrelatedManifests: 1_000,
+      sameIdOtherOwnerRecords: 2, before: beforeCost.meta.rows_read, after: afterCost.meta.rows_read }),
+    "effective-occurrence-unrelated-metadata-cost");
+  }, 60_000);
+
+  it("preserves c7 singleton and batched results with 166 admitted owned manifests and 200 selected matches", async ({ annotate }) => {
+    const days = Array.from({ length: 166 }, (_, index) => new Date(Date.parse(`${day()}T00:00:00.000Z`)
+      - (165 - index) * 86_400_000).toISOString().slice(0, 10));
+    const selectedDay = days[0]!, outsideDay = days[1]!;
+    const fixture = await createV11DeviceFixture(db(), { grant: true });
+    const ids = Array.from({ length: 200 }, (_, index) => `synthetic:manifest-fanout:${index}`);
+    const candidates = [await stage(fixture, await makeV11Day(selectedDay, {
+      usage: ids.map(eventId => v11UsageRecord(selectedDay, "a", { eventId })),
+    })), await stage(fixture, await makeV11Day(outsideDay, {
+      quota: ids.map(observationId => ({ schemaVersion: "quota-observation-v1.1", observationId,
+        observedTime: `${outsideDay}T12:05:00.000Z`, provider: "openai_codex",
+        planType: "pro", planVariant: "unknown", limitId: "codex", slot: "seven_day",
+        usedPercent: 20, windowDurationMinutes: 10_080, resetsAt: null,
+        accountPlanAttribution: { accountBasis: "unavailable", accountTrackId: null,
+          planBasis: "same_source_occurrence", planType: "pro", planEraId: null } })),
+    }))];
+    for (const retainedDay of days.slice(2)) candidates.push(await stage(fixture, await makeV11Day(retainedDay, {
+      usage: [v11UsageRecord(retainedDay, "b", { eventId: `synthetic:unlinked-manifest:${retainedDay}` })],
+    })));
+    await activate(fixture, candidates);
+    const owner = (await readStorageCommunityOwnerPage(db()))
+      .find(value => value.participantId === fixture.participantId)!;
+    expect(await db().prepare(`SELECT count(*) AS n FROM typed_telemetry_manifests manifest
+      JOIN typed_v11_owner_memberships membership ON membership.typed_owner_id=manifest.owner_id
+      WHERE membership.participant_id=?`).bind(fixture.participantId).first("n")).toBe(166);
+    expect(await db().prepare(`SELECT count(*) AS n FROM typed_telemetry_records record
+      JOIN typed_v11_owner_memberships membership ON membership.typed_owner_id=record.owner_id
+      WHERE membership.participant_id=?`).bind(fixture.participantId).first("n")).toBe(564);
+    const costs: { mode: string; selectedDays: number; current: number; prior: number;
+      currentDurationMs: number; priorDurationMs: number }[] = [];
+    for (const mode of ["singleton", "batched"] as const) {
+      const observed = observeDependencyQueries(db());
+      if (mode === "singleton") {
+        const dependency = await effectiveHistoryDependency(observed.database, owner, namespace, selectedDay, selectedDay);
+        expect(dependency.occurrenceLinks).toHaveLength(1);
+      } else {
+        const reader = await createEffectiveHistoryDayDependencyReader(observed.database, owner, namespace,
+          days.slice(0, 16), { occurrenceLinks: "batched" });
+        expect(reader).toBeDefined();
+        for (const targetDay of days.slice(0, 16)) {
+          const exact = await effectiveHistoryDependency(db(), owner, namespace, targetDay, targetDay);
+          expect(await reader!.readDigest(targetDay)).toBe(await sha256Hex(canonicalJson(exact)));
+        }
+      }
+      const query = observed.queries.find(value => mode === "singleton"
+        ? value.sql.includes("selected(occurrence_id)") : value.sql.includes("/* batched occurrence links */"))!;
+      expect(query).toBeDefined();
+      const current = await db().prepare(query.sql).bind(...query.values).all();
+      const baseline = mode === "singleton" ? occurrenceSqlBaseline.sql : occurrenceSqlBaseline.batchedSql;
+      const prior = await db().prepare(baseline).bind(...query.values).all();
+      expect(current.results).toEqual(prior.results);
+      const currentDurations = [current.meta.duration], priorDurations = [prior.meta.duration];
+      // Alternate order after the first pair so the reported local duration
+      // does not consistently favor the query that runs second.
+      for (const currentFirst of [false, true]) {
+        for (const candidate of currentFirst ? [true, false] : [false, true]) {
+          const result = await db().prepare(candidate ? query.sql : baseline).bind(...query.values).all();
+          expect(result.results).toEqual(prior.results);
+          (candidate ? currentDurations : priorDurations).push(result.meta.duration);
+        }
+      }
+      const median = (values: number[]) => values.sort((left, right) => left - right)[1]!;
+      costs.push({ mode, selectedDays: mode === "singleton" ? 1 : 16,
+        current: current.meta.rows_read, prior: prior.meta.rows_read,
+        currentDurationMs: median(currentDurations), priorDurationMs: median(priorDurations) });
+    }
+    // Metadata fanout is measured explicitly. Runtime depends on selected
+    // occurrences times owned manifests; this is not a time-bound shortcut.
+    await annotate(JSON.stringify({ ownedManifests: 166, selectedMatches: 200,
+      admittedRecords: 564, costs }), "effective-occurrence-owned-manifest-fanout-cost");
+  }, 120_000);
 
   it("matches exact singleton digests across v1, v1.1, v1.2, sessions, corrections, and selected-day links", async () => {
     const days = [day(), dayAfter(day())];
