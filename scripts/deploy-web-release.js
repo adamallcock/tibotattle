@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import process from "node:process";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   PRODUCTION_DEPLOY_CONFIRMATION,
@@ -20,6 +20,7 @@ function usage() {
     "    --receipt /absolute/repository/.release-build/web-release-receipt.json \\",
     `    --confirm ${PRODUCTION_DEPLOY_CONFIRMATION} \\`,
     "    [--confirm-migrations BINDING:0000_name.sql,...]",
+    "    [--operation /absolute/private/new-operation-directory]",
     "    [--inventory PRIVATE_JSON --inventory-sha256 SHA256",
     "     --retained-public-source FULL_SHA --expected-live-manifest-sha256 SHA256]",
   ].join("\n");
@@ -30,6 +31,7 @@ export function parseDeployWebReleaseArgs(argv) {
     confirmation: null,
     confirmedMigrations: null,
     receiptPath: null,
+    operationDirectory: null,
     inventoryPath: null,
     inventorySha256: null,
     retainedPublicSourceCommit: null,
@@ -39,6 +41,7 @@ export function parseDeployWebReleaseArgs(argv) {
     ["--confirm", "confirmation"],
     ["--confirm-migrations", "confirmedMigrations"],
     ["--receipt", "receiptPath"],
+    ["--operation", "operationDirectory"],
     ["--inventory", "inventoryPath"],
     ["--inventory-sha256", "inventorySha256"],
     ["--retained-public-source", "retainedPublicSourceCommit"],
@@ -59,6 +62,12 @@ export function parseDeployWebReleaseArgs(argv) {
   }
   if (!parsed.confirmation || !parsed.receiptPath) {
     throw new TypeError(`A receipt and explicit confirmation are required\n${usage()}`);
+  }
+  if (parsed.operationDirectory !== null
+      && (!isAbsolute(parsed.operationDirectory)
+        || parsed.operationDirectory.length > 4096
+        || /[\0\r\n]/u.test(parsed.operationDirectory))) {
+    throw new TypeError(`A custom operation directory must be an absolute private path\n${usage()}`);
   }
   const typedFields = ["inventoryPath", "inventorySha256", "retainedPublicSourceCommit", "expectedLiveManifestSha256"];
   const typedCount = typedFields.filter((field) => parsed[field] !== null).length;
@@ -83,6 +92,7 @@ export async function deployWebRelease({
   repositoryRoot = REPOSITORY_ROOT,
   receiptPath,
   confirmation,
+  operationDirectory = null,
   confirmedMigrations = null,
   typedProduction = null,
   retainedPublicSourceCommit = null,
@@ -119,6 +129,7 @@ export async function deployWebRelease({
     expectedPreviousSourceCommit: verification.scope.baseCommit,
     workerDirectory,
     wrangler,
+    ...(operationDirectory === null ? {} : { operationDirectory }),
     ...(typedProduction === null ? {} : {
       typedProduction,
       retainedPublicSourceCommit,
@@ -144,6 +155,7 @@ async function main() {
       confirmation: parsed.confirmation,
       confirmedMigrations: parsed.confirmedMigrations,
       receiptPath: resolve(parsed.receiptPath),
+      operationDirectory: parsed.operationDirectory,
       ...(inventory === null ? {} : {
         typedProduction: {
           inventory,

@@ -319,6 +319,7 @@ test("web-only deployment delegates the receipt-pinned SHA to the production gua
       confirmation: "DEPLOY_PRODUCTION",
       confirmedMigrations: null,
       receiptPath,
+      operationDirectory: null,
       inventoryPath: null,
       inventorySha256: null,
       retainedPublicSourceCommit: null,
@@ -342,6 +343,7 @@ test("web-only typed deployment pins the candidate manifest from the verified re
     repositoryRoot: "/tmp/web-release-candidate",
     receiptPath: "/tmp/web-release-candidate/.release-build/web-release-receipt.json",
     confirmation: "DEPLOY_PRODUCTION",
+    operationDirectory: "/tmp/web-release-candidate/.release-build/production-operations/fresh",
     typedProduction,
     retainedPublicSourceCommit: baseCommit,
     expectedLiveManifestSha256: liveManifest,
@@ -354,6 +356,7 @@ test("web-only typed deployment pins the candidate manifest from the verified re
       return { ok: true };
     },
   });
+  assert.equal(passed.operationDirectory, "/tmp/web-release-candidate/.release-build/production-operations/fresh");
   assert.equal(passed.typedProduction, typedProduction);
   assert.equal(passed.retainedPublicSourceCommit, baseCommit);
   assert.equal(passed.expectedLiveManifestSha256, liveManifest);
@@ -364,6 +367,7 @@ test("web-only typed deployment pins the candidate manifest from the verified re
   assert.deepEqual(parseDeployWebReleaseArgs([
     "--receipt", "/tmp/receipt.json",
     "--confirm", "DEPLOY_PRODUCTION",
+    "--operation", "/tmp/web-release-candidate/.release-build/production-operations/fresh",
     "--inventory", "/tmp/inventory.json",
     "--inventory-sha256", "1".repeat(64),
     "--retained-public-source", baseCommit,
@@ -372,12 +376,15 @@ test("web-only typed deployment pins the candidate manifest from the verified re
     confirmation: "DEPLOY_PRODUCTION",
     confirmedMigrations: null,
     receiptPath: "/tmp/receipt.json",
+    operationDirectory: "/tmp/web-release-candidate/.release-build/production-operations/fresh",
     inventoryPath: "/tmp/inventory.json",
     inventorySha256: "1".repeat(64),
     retainedPublicSourceCommit: baseCommit,
     expectedLiveManifestSha256: liveManifest,
   });
   for (const extra of [
+    ["--operation", "relative/operation"],
+    ["--operation", "/tmp/bad\noperation"],
     ["--inventory", "/tmp/inventory.json"],
     ["--inventory", "/tmp/inventory.json", "--inventory-sha256", "1".repeat(64),
       "--retained-public-source", baseCommit, "--expected-live-manifest-sha256", liveManifest,

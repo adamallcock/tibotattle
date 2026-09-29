@@ -228,6 +228,10 @@ base before Wrangler starts. A newer deployment makes this receipt stale: merge
 the intended changes onto the new base and requalify, never auto-adopt live
 source or bypass the guard. Interrupted outcomes use the production operation
 journal and [explicit recovery procedure](production-operations.md#guarded-deployment-wrapper).
+A proven pre-mutation refusal with no retained lock may use the same valid
+receipt and a fresh, absolute private `--operation` directory after its cause
+is fixed. Preserve the first journal. An uncertain or attempted deployment
+must be reconciled, never retried with a fresh directory.
 
 ```bash
 npm run product:web-release:deploy -- \
