@@ -64,6 +64,28 @@ async function cacheRetentionErasureTables(target:D1Database):Promise<readonly s
  if (present.size>0 && required.some(name=>!present.has(name))) throw unavailable();
  return Object.freeze(CACHE_RETENTION_ERASURE_TABLES.filter(name=>present.has(name)));
 }
+const MODEL_BLOCK_ERASURE_TABLES = Object.freeze([
+ 'analytics_model_blocks','analytics_model_block_parts','analytics_model_block_policy',
+]);
+async function modelBlockErasureTables(target:D1Database):Promise<readonly string[]> {
+ const result=await target.prepare(`SELECT name FROM sqlite_schema WHERE type='table'
+   AND name IN ('analytics_model_blocks','analytics_model_block_parts','analytics_model_block_policy')`).all<{name:string}>();
+ if(result.success!==true||!Array.isArray(result.results))throw unavailable();
+ const rows=result.results;
+ if(rows.length===0)return [];
+ if(rows.length!==MODEL_BLOCK_ERASURE_TABLES.length||MODEL_BLOCK_ERASURE_TABLES.some(name=>!rows.some(row=>row.name===name)))throw unavailable();
+ return MODEL_BLOCK_ERASURE_TABLES;
+}
+const SHARED_FEATURE_ERASURE_TABLES = Object.freeze(['analytics_shared_feature_days','analytics_shared_feature_parts']);
+async function sharedFeatureErasureTables(target:D1Database):Promise<readonly string[]> {
+ const result=await target.prepare(`SELECT name FROM sqlite_schema WHERE type='table'
+   AND name IN ('analytics_shared_feature_days','analytics_shared_feature_parts')`).all<{name:string}>();
+ if(result.success!==true||!Array.isArray(result.results))throw unavailable();
+ if(result.results.length===0)return [];
+ if(result.results.length!==SHARED_FEATURE_ERASURE_TABLES.length
+   ||SHARED_FEATURE_ERASURE_TABLES.some(name=>!result.results.some(row=>row.name===name)))throw unavailable();
+ return SHARED_FEATURE_ERASURE_TABLES;
+}
 const payloadAbsence=(cacheTables:readonly string[]=[]):string=>`
  NOT EXISTS(SELECT 1 FROM analytics_v1_chunk_values WHERE source_id=?1 AND owner_digest=?2)
  AND NOT EXISTS(SELECT 1 FROM analytics_v11_projection_work WHERE source_id=?1 AND owner_digest=?2)
@@ -73,6 +95,7 @@ const payloadAbsence=(cacheTables:readonly string[]=[]):string=>`
  AND NOT EXISTS(SELECT 1 FROM analytics_graph_day_pages WHERE source_id=?1 AND owner_digest=?2)
  AND NOT EXISTS(SELECT 1 FROM analytics_community_graph_results WHERE source_id=?1 AND owner_digest=?2)
  AND NOT EXISTS(SELECT 1 FROM analytics_community_graph_execution WHERE source_id=?1 AND owner_digest=?2)
+ AND NOT EXISTS(SELECT 1 FROM analytics_community_graph_work_selection WHERE source_id=?1 AND owner_digest=?2)
  AND NOT EXISTS(SELECT 1 FROM analytics_history_checkpoint_stages WHERE source_id=?1 AND owner_digest=?2)
  AND NOT EXISTS(SELECT 1 FROM analytics_community_daily_owners WHERE source_id=?1 AND owner_digest=?2)
  AND NOT EXISTS(SELECT 1 FROM analytics_community_daily_publications p
@@ -84,12 +107,17 @@ const payloadAbsence=(cacheTables:readonly string[]=[]):string=>`
    AND COALESCE(json_extract(authority_json,'$.publicAuthorityEpoch'),-1)<?4)
  ${cacheTables.map(table=>` AND NOT EXISTS(SELECT 1 FROM ${table} WHERE source_id=?1 AND owner_digest=?2)`).join('\n')}`;
 async function readCompletion(b:StorageErasureBindings,job:Job,change:StorageChange,
- cacheTables:readonly string[]=[]):Promise<boolean>{
+ cacheTables?:readonly string[]):Promise<boolean>{
+ // Completed-job retries must also prove absence of payload families added
+ // after the receipt was first written. Targets predating these optional
+ // payload families remain supported; partially migrated families fail closed.
+ const payloadTables=cacheTables??[...await cacheRetentionErasureTables(b.target),
+  ...await modelBlockErasureTables(b.target),...await sharedFeatureErasureTables(b.target)];
  return !!await b.target.prepare(`SELECT 1 AS complete FROM analytics_storage_erasure_receipts r
  JOIN analytics_storage_erasure_fences f ON f.source_id=r.source_id AND f.owner_digest=r.owner_digest
   AND f.terminal_event_digest=r.terminal_event_digest
  WHERE r.source_id=?1 AND r.owner_digest=?2 AND r.terminal_event_digest=?3 AND r.payload_contract=1
-  AND f.public_authority_epoch=?4 AND ${payloadAbsence(cacheTables)}`)
+  AND f.public_authority_epoch=?4 AND ${payloadAbsence(payloadTables)}`)
   .bind(b.sourceId,job.owner_digest,change.eventDigest,change.publicAuthorityEpoch).first();
 }
 function terminal(value:unknown,job:Job):StorageChange{
@@ -108,6 +136,8 @@ async function advanceJob(b:StorageErasureBindings,job:Job):Promise<boolean>{
   .bind(b.sourceId).first<{source_namespace:string;contract_version:number}>();
  if(!ready||ready.source_namespace!==b.sourceNamespace||ready.contract_version!==1)throw unavailable();
  const cacheTables=await cacheRetentionErasureTables(b.target);
+ const payloadTables=[...cacheTables,...await modelBlockErasureTables(b.target),
+  ...await sharedFeatureErasureTables(b.target)];
  const current=await b.source.prepare(`SELECT c.sequence FROM storage_owner_revisions r
  JOIN storage_ingestion_changes c ON c.owner_digest=r.owner_digest AND c.revision=r.revision
  WHERE r.owner_digest=? AND r.state='erased' AND c.kind='owner-erased'`).bind(job.owner_digest).first<{sequence:number}>();
@@ -154,9 +184,9 @@ async function advanceJob(b:StorageErasureBindings,job:Job):Promise<boolean>{
  if(cacheTables.length>0) await retireCacheRetentionDayPage(b.target,b.sourceId);
  await b.target.prepare(`INSERT INTO analytics_storage_erasure_receipts(source_id,owner_digest,terminal_event_digest,payload_contract)
  SELECT ?1,?2,?3,1 WHERE EXISTS(SELECT 1 FROM analytics_storage_erasure_fences
- WHERE source_id=?1 AND owner_digest=?2 AND terminal_event_digest=?3 AND public_authority_epoch=?4) AND ${payloadAbsence(cacheTables)}
+ WHERE source_id=?1 AND owner_digest=?2 AND terminal_event_digest=?3 AND public_authority_epoch=?4) AND ${payloadAbsence(payloadTables)}
  ON CONFLICT(source_id,owner_digest) DO NOTHING`).bind(b.sourceId,job.owner_digest,change.eventDigest,change.publicAuthorityEpoch).run();
- const complete=await readCompletion(b,job,change,cacheTables);
+ const complete=await readCompletion(b,job,change,payloadTables);
  if(!complete)return false;
  await b.ledger.prepare(`UPDATE storage_erasure_jobs SET state='complete',completed_at=?
  WHERE participant_digest=? AND source_id=? AND owner_digest=? AND terminal_json=?`).bind(new Date().toISOString(),job.participant_digest,b.sourceId,job.owner_digest,json).run();
