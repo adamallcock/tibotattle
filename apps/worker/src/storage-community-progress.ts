@@ -1,4 +1,5 @@
 import { captureStorageCommunityAuthority, readStorageCommunityDeliveredTerminalEpoch,
+ readStorageCommunityCorrectionState,
  readStorageCommunitySourceTerminalEpoch, storageCommunityCalculationAuthorityIsCurrent,
  storageCommunityPublicationVisible, type StorageCommunityAuthority } from './storage-community-authority';
 import { STORAGE_GRAPH_METHOD } from './storage-community-graph';
@@ -7,6 +8,7 @@ import { COMMUNITY_MODEL_REFUSAL_REASONS } from './community-allowance';
 import type { StorageAnalyticsBindings } from './analytics-delivery';
 import { ApiError } from './errors';
 import { validStorageModelPublication, type StorageModelPublicationValue } from './storage-community-publication-value';
+import { STORAGE_DAILY_PENDING_DAYS_SQL } from './storage-community-daily';
 
 /** Same census bound as the typed admin overview. Every row read below is
  * either an aggregate or capped by this limit. A cap reached by a count that
@@ -143,11 +145,12 @@ export async function readStoragePipelineProgress(bindings: StorageAnalyticsBind
   const journalHead = count(headRow?.sequence ?? 0);
   const pendingChanges = count(pendingRow?.changes ?? 0), pendingActivations = count(pendingRow?.activations ?? 0);
   if (appliedSequence > journalHead || pendingActivations > pendingChanges) return null;
+  const correctionState=await readStorageCommunityCorrectionState(bindings.source);
   const [work, queue, published] = await bindings.target.batch([
    bindings.target.prepare(`SELECT from_day, through_day, next_day FROM analytics_v11_projection_work
     WHERE source_id=? AND event_digest=? AND phase='building'`).bind(bindings.sourceId, nextDigest ?? ''),
    bindings.target.prepare(`SELECT COUNT(*) AS days, MIN(day) AS oldest, MAX(day) AS newest
-    FROM analytics_community_daily_queue WHERE source_id=?`).bind(bindings.sourceId),
+    FROM (${STORAGE_DAILY_PENDING_DAYS_SQL})`).bind(bindings.sourceId,correctionState),
    bindings.target.prepare(`SELECT MAX(released_at) AS last,
      COALESCE(SUM(CASE WHEN released_at>=? THEN 1 ELSE 0 END),0) AS last_hour
     FROM analytics_community_daily_publications WHERE source_id=?`)
@@ -224,6 +227,7 @@ export async function readStorageCommunityProgress(bindings: StorageAnalyticsBin
   const from = new Date(Date.parse(today) - requiredDays * DAY_MS).toISOString().slice(0, 10);
   const sixHoursFrom = nowMs - 6 * HOUR_MS, oneHourFrom = nowMs - HOUR_MS;
   const cap = MAX_ADMIN_AGGREGATE_ROWS + 1;
+  const correctionState=authority.usageCorrectionState??'staged';
   const metadata = await bindings.target.batch([
    bindings.target.prepare(`SELECT day,authority_json,payload_json,payload_sha256,computed_ms FROM analytics_community_model_publications
     WHERE source_id=? AND day>=? AND day<? AND method=? ORDER BY day LIMIT ?`)
@@ -231,7 +235,7 @@ export async function readStorageCommunityProgress(bindings: StorageAnalyticsBin
    bindings.target.prepare(`SELECT authority_json,generated_at,inputs_current FROM analytics_community_graph_previews
     WHERE source_id=? AND method=?`).bind(bindings.sourceId, STORAGE_GRAPH_METHOD),
    bindings.target.prepare('SELECT updated_ms FROM analytics_community_graph_scan WHERE source_id=?').bind(bindings.sourceId),
-   bindings.target.prepare('SELECT day FROM analytics_community_daily_queue WHERE source_id=? ORDER BY day LIMIT 1').bind(bindings.sourceId),
+   bindings.target.prepare(`SELECT day FROM (${STORAGE_DAILY_PENDING_DAYS_SQL}) ORDER BY day LIMIT 1`).bind(bindings.sourceId,correctionState),
    // 4: active owner census. Withdrawn and erased owners are excluded here and
    // by the joins below, so a retained result can never outnumber the cohort.
    bindings.target.prepare(`SELECT COUNT(*) AS total FROM (
@@ -248,8 +252,9 @@ export async function readStorageCommunityProgress(bindings: StorageAnalyticsBin
     FROM analytics_community_graph_results r
     JOIN analytics_owner_state o ON o.source_id=r.source_id AND o.owner_digest=r.owner_digest AND o.state='active'
     WHERE r.source_id=? AND r.metric='model' AND r.method=? AND r.day>=? AND r.day<?
+      AND COALESCE(json_extract(r.authority_json,'$.usageCorrectionState'),'staged')=?
     GROUP BY r.day ORDER BY r.day LIMIT ?`)
-    .bind(bindings.sourceId, STORAGE_GRAPH_METHOD, from, today, requiredDays + 1),
+    .bind(bindings.sourceId, STORAGE_GRAPH_METHOD, from, today, correctionState, requiredDays + 1),
    // 6: current-day fits. The payload is a JSON array of selected fits, so an
    // unusable or refused analysis is the empty array, and each element carries
    // the owner digest: only the length is read, never an element.
@@ -258,8 +263,9 @@ export async function readStorageCommunityProgress(bindings: StorageAnalyticsBin
      COALESCE(SUM(CASE WHEN json_array_length(r.payload_json)>0 THEN 0 ELSE 1 END),0) AS no_fit
     FROM analytics_community_graph_results r
     JOIN analytics_owner_state o ON o.source_id=r.source_id AND o.owner_digest=r.owner_digest AND o.state='active'
-    WHERE r.source_id=? AND r.metric='fits' AND r.method=? AND r.day=?`)
-    .bind(bindings.sourceId, STORAGE_GRAPH_METHOD, today),
+    WHERE r.source_id=? AND r.metric='fits' AND r.method=? AND r.day=?
+      AND COALESCE(json_extract(r.authority_json,'$.usageCorrectionState'),'staged')=?`)
+    .bind(bindings.sourceId, STORAGE_GRAPH_METHOD, today, correctionState),
    // 7: distinct refusing owners per model reason over the window. Only the
    // reason token and the count cross the boundary; the digest is consumed
    // inside the aggregate.
@@ -269,8 +275,9 @@ export async function readStorageCommunityProgress(bindings: StorageAnalyticsBin
     JOIN analytics_owner_state o ON o.source_id=r.source_id AND o.owner_digest=r.owner_digest AND o.state='active'
     WHERE r.source_id=? AND r.method=? AND r.metric='model'
       AND json_extract(r.payload_json,'$.status')='not_testable' AND r.day>=? AND r.day<?
+      AND COALESCE(json_extract(r.authority_json,'$.usageCorrectionState'),'staged')=?
     GROUP BY reason ORDER BY owners DESC,reason LIMIT ?`)
-    .bind(bindings.sourceId, STORAGE_GRAPH_METHOD, from, today, cap),
+    .bind(bindings.sourceId, STORAGE_GRAPH_METHOD, from, today, correctionState, cap),
    // 8: selection census. `live` counts only unexpired claims: an expired
    // lease is outstanding work, not a running build.
    bindings.target.prepare(`SELECT COUNT(*) AS total,
@@ -317,7 +324,7 @@ export async function readStorageCommunityProgress(bindings: StorageAnalyticsBin
   const days = new Set<string>(), publishedAtByDay = new Map<string, string>();
   for (const raw of metadata[0]!.results) {
    const row = raw as StorageModelPublicationValue & { computed_ms: number };
-   if (!await validStorageModelPublication(row, authority, terminalEpoch)) continue;
+   if (!await validStorageModelPublication(row, authority, terminalEpoch,true)) continue;
    days.add(row.day);
    publishedAtByDay.set(row.day, instant(row.computed_ms));
   }
@@ -330,7 +337,7 @@ export async function readStorageCommunityProgress(bindings: StorageAnalyticsBin
   const preview = metadata[1]!.results[0] as { authority_json: string; generated_at: string; inputs_current: number } | undefined;
   const published = preview ? JSON.parse(preview.authority_json) as StorageCommunityAuthority : null;
   const ready = published !== null && storageCommunityPublicationVisible(published, authority, terminalEpoch);
-  const current = ready && preview!.inputs_current === 1 && published!.sourceEpoch === authority.sourceEpoch
+  const current = ready && (published!.usageCorrectionState??'staged')===(authority.usageCorrectionState??'staged') && preview!.inputs_current === 1 && published!.sourceEpoch === authority.sourceEpoch
    && preview!.generated_at.slice(0, 10) === today;
   const phase = !current ? 'current' as const : activeDay !== null ? 'history' as const
    : metadata[3]!.results.length ? 'daily' as const : null;

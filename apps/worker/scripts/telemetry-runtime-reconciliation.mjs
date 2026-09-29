@@ -22,6 +22,8 @@ export const TELEMETRY_RUNTIME_RECONCILIATION_SCHEMA =
   "typed-forward-post-deploy-reconciliation-v1";
 export const TELEMETRY_RUNTIME_DEPLOYMENT_ATTESTATION_SCHEMA =
   "typed-forward-live-deployment-attestation-v1";
+export const USAGE_CORRECTION_READINESS_SCHEMA =
+  "usage-correction-activation-readiness-v1";
 
 const COMMIT = /^[a-f0-9]{40}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
@@ -249,16 +251,44 @@ function validateActivationRequest(value) {
   if (!exactKeys(activation, [
     "confirmation", "expectedRevision", "idempotencyKey", "reconciliation", "target",
   ])
-      || !["usage_v12", "performance"].includes(activation.target)
+      || !["usage_v12", "performance", "usage_correction"].includes(activation.target)
       || !UUID_V4.test(activation.idempotencyKey ?? "")
       || !Number.isSafeInteger(activation.expectedRevision)
-      || activation.expectedRevision < 1
+      || (activation.target === "usage_correction"
+        ? activation.expectedRevision !== 0 : activation.expectedRevision < 1)
       || activation.confirmation !== (activation.target === "usage_v12"
         ? "activate_telemetry_v12_runtime"
-        : "activate_telemetry_performance_runtime")) {
+        : activation.target === "performance"
+          ? "activate_telemetry_performance_runtime"
+          : "activate_telemetry_usage_correction_runtime")) {
     fail("REQUEST_INVALID");
   }
   validateTelemetryRuntimeReconciliationProof(activation.reconciliation);
+  return value;
+}
+
+/** The evidence is reviewed separately. This closes the operator input to an
+ * exact deployed writer and four specific qualification receipts; it does not
+ * infer test success from digest strings. */
+export function validateUsageCorrectionReadiness(value, proof, approvedSha256) {
+  if (!exactKeys(value, [
+    "schema", "sourceCommit", "versionId", "configSha256", "writerGateSha256",
+    "onlineGateSha256", "erasureGateSha256", "restoreGateSha256",
+    "rollbackDisposition", "readinessSha256",
+  ]) || value.schema !== USAGE_CORRECTION_READINESS_SCHEMA
+      || !COMMIT.test(value.sourceCommit ?? "")
+      || !UUID_V4.test(value.versionId ?? "")
+      || !SHA256.test(value.configSha256 ?? "")
+      || !["writerGateSha256", "onlineGateSha256", "erasureGateSha256", "restoreGateSha256"]
+        .every((key) => SHA256.test(value[key] ?? ""))
+      || value.rollbackDisposition !== "forward-fix-only"
+      || !SHA256.test(value.readinessSha256 ?? "")) fail("CORRECTION_READINESS_INVALID");
+  const { readinessSha256, ...unsigned } = value;
+  if (identityDigest(unsigned) !== readinessSha256
+      || approvedSha256 !== readinessSha256
+      || value.sourceCommit !== proof.sourceCommit
+      || value.versionId !== proof.versionId
+      || value.configSha256 !== proof.configSha256) fail("CORRECTION_READINESS_INVALID");
   return value;
 }
 
@@ -452,7 +482,7 @@ function lockOwnerSource(proof) {
   return proof.deploymentAttestation.sourceCommit;
 }
 
-function operationBinding({ accountId, workerName, request }) {
+function operationBinding({ accountId, workerName, request, correctionReadiness }) {
   const activation = request.telemetryRuntimeActivation;
   return {
     schema: OPERATION_SCHEMA,
@@ -462,6 +492,9 @@ function operationBinding({ accountId, workerName, request }) {
     idempotencyKey: activation.idempotencyKey,
     expectedRevision: activation.expectedRevision,
     proofSha256: activation.reconciliation.proofSha256,
+    ...(correctionReadiness === null ? {} : {
+      correctionReadinessSha256: correctionReadiness.readinessSha256,
+    }),
     adminOrigin: DEPLOYMENT_ENDPOINTS.admin.origin,
   };
 }
@@ -490,6 +523,18 @@ function activationResultShape(value, activation) {
 // recovery path. They are fixed SELECTs selected by the closed target enum;
 // the request key is always passed as a bound D1 parameter.
 const ACTIVATION_RECONCILIATION_QUERIES = Object.freeze({
+  // Migration 0006 has no revision column. Its immutable staged->active state
+  // is represented by the fixed 0->1 activation contract. The audit operation
+  // ID, not this synthetic revision, attributes a committed activation.
+  usage_correction: `SELECT r.state AS runtime_state,
+                       CASE r.state WHEN 'staged' THEN 0 WHEN 'active' THEN 1 END AS runtime_policy_revision,
+                       a.operation_id AS audit_operation_id,
+                       a.action AS audit_action,
+                       a.outcome AS audit_outcome,
+                       a.details_json AS audit_details_json
+                  FROM telemetry_usage_correction_runtime r
+                  LEFT JOIN admin_action_audit a ON a.operation_id = ?
+                 WHERE r.id = 1`,
   usage_v12: `SELECT r.state AS runtime_state,
                      r.policy_revision AS runtime_policy_revision,
                      a.operation_id AS audit_operation_id,
@@ -671,6 +716,8 @@ export async function runProtectedTelemetryRuntimeActivation({
   repositoryRoot,
   operationDirectory,
   request,
+  correctionReadiness = null,
+  approvedCorrectionReadinessSha256 = null,
   session,
   requestSha256 = null,
   transport = "session",
@@ -692,6 +739,15 @@ export async function runProtectedTelemetryRuntimeActivation({
       || !isAbsolute(operationDirectory ?? "")
       || !["session", "browser"].includes(transport)) fail("ARGUMENTS_INVALID");
   validateActivationRequest(request);
+  if (request.telemetryRuntimeActivation.target === "usage_correction") {
+    validateUsageCorrectionReadiness(
+      correctionReadiness,
+      request.telemetryRuntimeActivation.reconciliation,
+      approvedCorrectionReadinessSha256,
+    );
+  } else if (correctionReadiness !== null || approvedCorrectionReadinessSha256 !== null) {
+    fail("CORRECTION_READINESS_INVALID");
+  }
   if (transport === "browser") {
     if (session !== null && session !== undefined) fail("ADMIN_SESSION_INVALID");
   } else if (!reconcileOnly) {
@@ -701,7 +757,7 @@ export async function runProtectedTelemetryRuntimeActivation({
   requestSha256 ??= identityDigest(request);
   if (!SHA256.test(requestSha256)) fail("BROWSER_HANDOFF_INVALID");
   const proof = activation.reconciliation;
-  const binding = operationBinding({ accountId, workerName, request });
+  const binding = operationBinding({ accountId, workerName, request, correctionReadiness });
   const operation = await operationFactory({
     directory: operationDirectory,
     kind: "production",
@@ -1015,7 +1071,8 @@ export function parseTelemetryRuntimeActivationOperatorArguments(argv) {
   const result = { resume: false };
   const allowed = new Set([
     "--account-id", "--worker-name", "--repository-root", "--operation-directory",
-    "--request-file", "--admin-session-file",
+    "--request-file", "--admin-session-file", "--correction-readiness-file",
+    "--approved-correction-readiness-sha256",
   ]);
   for (let index = 0; index < argv.length; index += 1) {
     const key = argv[index];
@@ -1036,7 +1093,11 @@ export function parseTelemetryRuntimeActivationOperatorArguments(argv) {
       || !safeAbsolutePath(result["--operation-directory"] ?? "")
       || !safeAbsolutePath(result["--request-file"] ?? "")
       || (result["--admin-session-file"] !== undefined
-        && !safeAbsolutePath(result["--admin-session-file"]))) {
+        && !safeAbsolutePath(result["--admin-session-file"]))
+      || (result["--correction-readiness-file"] !== undefined
+        && !safeAbsolutePath(result["--correction-readiness-file"]))
+      || (result["--approved-correction-readiness-sha256"] !== undefined
+        && !SHA256.test(result["--approved-correction-readiness-sha256"]))) {
     fail("ARGUMENTS_INVALID");
   }
   return result;
@@ -1119,6 +1180,14 @@ async function main() {
     const args = parseTelemetryRuntimeActivationOperatorArguments(argv.slice(2));
     const requestFile = await readOwnerPrivateJson(args["--request-file"], { withDigest: true });
     const request = requestFile.value;
+    const correctionTarget = request?.telemetryRuntimeActivation?.target === "usage_correction";
+    if (correctionTarget !== (args["--correction-readiness-file"] !== undefined)
+        || correctionTarget !== (args["--approved-correction-readiness-sha256"] !== undefined)) {
+      fail("CORRECTION_READINESS_INVALID");
+    }
+    const correctionReadiness = correctionTarget
+      ? await readOwnerPrivateJson(args["--correction-readiness-file"])
+      : null;
     if (mode === "activate" && args["--admin-session-file"] === undefined) {
       fail("ARGUMENTS_INVALID");
     }
@@ -1140,6 +1209,9 @@ async function main() {
       repositoryRoot: args["--repository-root"],
       operationDirectory: args["--operation-directory"],
       request,
+      correctionReadiness,
+      approvedCorrectionReadinessSha256:
+        args["--approved-correction-readiness-sha256"] ?? null,
       session,
       requestSha256: requestFile.sha256,
       transport: mode === "browser-arm" ? "browser" : "session",

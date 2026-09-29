@@ -1,3 +1,4 @@
+import {validStorageModelPublication} from '../src/storage-community-publication-value';
 import { publishStorageCommunityModelDay, publishStorageCommunityGraphPreview, readPublishedStorageCommunityGraph,
   readPublishedStorageCommunityAdminPreview, retireStorageCommunityGraphPublications,
   storageCommunityGraphPreviewReadyHint } from '../src/storage-community-graph-publication';
@@ -340,6 +341,21 @@ async function api(){
  return handleRequest(new Request(`https://synthetic.example.test/api/v1/community/daily?from=${day()}&to=${day()}`),configured);
 }
 describe('isolated allowance graph publication',()=>{
+ it('queues historical method refresh without withdrawing last-good publications after activation',async()=>{
+  await fixture();await compute('fits');await compute('model');
+  expect((await publishStorageCommunityModelDay(bindings(),{day:day()})).state).toBe('published');
+  expect((await publishStorageCommunityGraphPreview(bindings())).state).toBe('published');
+  const previous=await b.STORAGE_ANALYTICS_DB.prepare('SELECT day,authority_json,payload_json,payload_sha256 FROM analytics_community_model_publications WHERE day=?').bind(day()).first();
+  const publicBefore=await readPublishedStorageCommunityAdminPreview(bindings());
+  await typed().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+  const authority=await captureStorageCommunityAuthority(typed());
+  expect(await validStorageModelPublication(previous as never,authority,0)).toBe(true);
+  expect(await validStorageModelPublication(previous as never,authority,0,true)).toBe(false);
+  expect(await readPublishedStorageCommunityAdminPreview(bindings())).toEqual(publicBefore);
+  expect(await publishStorageCommunityModelDay(bindings(),{day:day()})).toMatchObject({state:'deferred',reason:'cache_pending'});
+  await b.STORAGE_ANALYTICS_DB.prepare("INSERT INTO analytics_community_graph_scan(source_id,revision,tick,current_position,history_position) VALUES(?,1,1,0,0) ON CONFLICT(source_id) DO UPDATE SET tick=1").bind(namespace).run();
+  expect(await advanceStorageCommunityGraphWork(bindings())).toMatchObject({metric:'model',day:day()});
+ });
  it('uses an aggregate hint and publishes ready fits before later graph work',async()=>{
   await fixture();
   const incompleteMeter=createD1InvocationBudget(10);

@@ -27,6 +27,7 @@ import {
 export const TELEMETRY_RUNTIME_ACTIVATION_CONFIRMATIONS = Object.freeze({
   usage_v12: "activate_telemetry_v12_runtime",
   performance: "activate_telemetry_performance_runtime",
+  usage_correction: "activate_telemetry_usage_correction_runtime",
 } as const);
 
 export type TelemetryRuntimeActivationTarget = keyof typeof TELEMETRY_RUNTIME_ACTIVATION_CONFIRMATIONS;
@@ -468,6 +469,17 @@ interface PerformanceRuntimeRow {
   readonly method_version: string;
 }
 
+interface CorrectionRuntimeRow {
+  readonly state: string;
+  /** Migration 0006 has no revision column. State is the fixed 0->1
+   * activation revision; the audit operation ID attributes the transition. */
+  readonly policy_revision: number;
+  readonly schema_version: string;
+  readonly method_version: string;
+  readonly max_capture_rows: number;
+  readonly max_history_page: number;
+}
+
 function invalidActivation(): never {
   throw new ApiError(400, "BODY_INVALID");
 }
@@ -676,12 +688,13 @@ export function parseTelemetryRuntimeActivationRequest(
   const confirmation = rawTarget.confirmation;
   const idempotencyKey = rawTarget.idempotencyKey;
   const reconciliation = parseReconciliationProof(rawTarget.reconciliation);
-  if ((targetValue !== "usage_v12" && targetValue !== "performance")
+  if ((targetValue !== "usage_v12" && targetValue !== "performance"
+      && targetValue !== "usage_correction")
       || typeof idempotencyKey !== "string"
       || !UUID_PATTERN.test(idempotencyKey)
       || typeof expectedRevision !== "number"
       || !Number.isSafeInteger(expectedRevision)
-      || expectedRevision < 1
+      || (targetValue === "usage_correction" ? expectedRevision !== 0 : expectedRevision < 1)
       || expectedRevision > MAX_REVISION
       || confirmation !== TELEMETRY_RUNTIME_ACTIVATION_CONFIRMATIONS[targetValue]) {
     invalidActivation();
@@ -899,6 +912,23 @@ async function readPerformanceRuntime(db: D1Database): Promise<PerformanceRuntim
   }
 }
 
+async function readCorrectionRuntime(db: D1Database): Promise<CorrectionRuntimeRow> {
+  try {
+    const row = await db.prepare(
+      `SELECT state,
+              CASE state WHEN 'staged' THEN 0 WHEN 'active' THEN 1 END AS policy_revision,
+              schema_version, method_version, max_capture_rows, max_history_page
+         FROM telemetry_usage_correction_runtime WHERE id = 1`,
+    ).first<CorrectionRuntimeRow>();
+    if (!row || !["staged", "active"].includes(row.state)
+        || !Number.isSafeInteger(row.policy_revision)) unavailableActivation();
+    return row;
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    unavailableActivation();
+  }
+}
+
 function assertRevisionForActivation(
   state: string,
   revision: number,
@@ -924,6 +954,13 @@ function assertPerformanceTuple(row: PerformanceRuntimeRow): void {
       || row.field_dictionary_version !== PERFORMANCE_FIELD_DICTIONARY_VERSION
       || row.privacy_contract_version !== PERFORMANCE_PRIVACY_CONTRACT_VERSION
       || row.method_version !== "performance-daily-histogram-v1") unavailableActivation();
+}
+
+function assertCorrectionTuple(row: CorrectionRuntimeRow): void {
+  if (row.schema_version !== "telemetry-usage-correction-v1"
+      || row.method_version !== "usage-total-correction-v1"
+      || row.max_capture_rows !== 200
+      || row.max_history_page !== 200) unavailableActivation();
 }
 
 function auditDetailsJson(value: unknown): string {
@@ -976,6 +1013,17 @@ function activationMutation(
       operationId,
     );
   }
+  if (input.target === "usage_correction") {
+    return db.prepare(
+      `UPDATE telemetry_usage_correction_runtime
+          SET state = 'active'
+        WHERE id = 1 AND state = 'staged'
+          AND schema_version = 'telemetry-usage-correction-v1'
+          AND method_version = 'usage-total-correction-v1'
+          AND max_capture_rows = 200 AND max_history_page = 200
+          ${controlGuard}`,
+    ).bind(controlsRevision, operationId);
+  }
   return db.prepare(
     `UPDATE telemetry_performance_runtime
         SET state = 'active', policy_revision = policy_revision + 1, updated_at = ?
@@ -1017,9 +1065,7 @@ async function activateAndAuditAtomically(
   if (mutationChanges !== 1 || auditChanges !== 1) {
     throw new DeterministicActivationBatchError(mutationChanges, auditChanges);
   }
-  const row = input.target === "usage_v12"
-    ? await readUsageRuntime(db)
-    : await readPerformanceRuntime(db);
+  const row = await readTargetRuntime(db, input.target);
   if (row.state !== "active" || row.policy_revision !== input.expectedRevision + 1) {
     reconciliationRequired();
   }
@@ -1041,13 +1087,15 @@ class DeterministicActivationBatchError extends Error {
   }
 }
 
-type RuntimeStateRow = UsageRuntimeRow | PerformanceRuntimeRow;
+type RuntimeStateRow = UsageRuntimeRow | PerformanceRuntimeRow | CorrectionRuntimeRow;
 
 async function readTargetRuntime(
   db: D1Database,
   target: TelemetryRuntimeActivationTarget,
 ): Promise<RuntimeStateRow> {
-  return target === "usage_v12" ? readUsageRuntime(db) : readPerformanceRuntime(db);
+  return target === "usage_v12" ? readUsageRuntime(db)
+    : target === "performance" ? readPerformanceRuntime(db)
+      : readCorrectionRuntime(db);
 }
 
 function activationResult(
@@ -1285,9 +1333,14 @@ export async function activateTelemetryRuntimeAsOwner(
     if (input.target === "usage_v12") {
       if (!("envelope_schema_version" in runtime)) unavailableActivation();
       assertUsageTuple(runtime);
-    } else {
-      if (!("method_version" in runtime)) unavailableActivation();
+    } else if (input.target === "performance") {
+      if (!("method_version" in runtime) || !("field_dictionary_version" in runtime)) {
+        unavailableActivation();
+      }
       assertPerformanceTuple(runtime);
+    } else {
+      if (!("max_capture_rows" in runtime)) unavailableActivation();
+      assertCorrectionTuple(runtime);
     }
     if (operationId === null) {
       try {

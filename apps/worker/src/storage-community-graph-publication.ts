@@ -314,7 +314,7 @@ async function capture(bindings:StorageAnalyticsBindings,day:string,metric:'fits
 async function current(bindings:StorageAnalyticsBindings,captured:Capture):Promise<StorageCommunityAuthority|null> {
   let fresh:StorageCommunityAuthority;
   try{fresh=await captureStorageCommunityAuthority(bindings.source,bindings);}catch{return null;}
-  if(!sameStorageCommunityHardAuthority(fresh,captured.authority))return null;
+  if(!sameStorageCommunityCalculationAuthority(fresh,captured.authority))return null;
   const latest=await owners(bindings.source);
   if(!Array.isArray(latest)||canonicalJson(latest.map(identity))!==canonicalJson(captured.members.map(identity)))return null;
   if(await readStorageCommunitySourceTerminalEpoch(bindings.source)>captured.terminalEpoch)return null;
@@ -327,7 +327,8 @@ function cohortProof(captured:Capture) {
 }
 function hardAuthority(authority:StorageCommunityAuthority) {
   return {sourceId:authority.sourceId,sourceNamespace:authority.sourceNamespace,
-    policyRevision:authority.policyRevision,collectionRevision:authority.collectionRevision};
+    policyRevision:authority.policyRevision,collectionRevision:authority.collectionRevision,
+    usageCorrectionState:authority.usageCorrectionState??'staged'};
 }
 interface PreviewFreshness {
   snapshot_source_epoch:number;inputs_current:0|1;oldest_computed_ms:number|null;newest_computed_ms:number|null;

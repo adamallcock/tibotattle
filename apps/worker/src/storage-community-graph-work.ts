@@ -11,7 +11,7 @@ import { STORAGE_V11_PREPARED_FOLD } from './storage-v11-history';
  * in, not a module default the deployment has overridden. */
 const v11CheckpointMethod=(metric:'fits'|'model',preparedFold?:boolean):string=>
  storageGraphV11CheckpointMethod(metric,preparedFold??STORAGE_V11_PREPARED_FOLD);
-import { readStorageCommunityOwnerPage, captureStorageCommunityAuthority,
+import { readStorageCommunityOwnerPage, captureStorageCommunityAuthority, readStorageCommunityCorrectionState,
  readStorageCommunityDeliveredTerminalEpoch, readStorageCommunitySourceTerminalEpoch,
  type StorageCommunityOwner } from './storage-community-authority';
 import { ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS } from './admin-community-allowance';
@@ -50,15 +50,16 @@ function ownerSource(owner:StorageCommunityOwner):CachedGraphResult['source_kind
  * so presence under the exact method and source format is the recovery hint.
  * The graph kernel and publisher retain their full input and authority checks. */
 async function nextMissingCurrentFitPosition(target:D1Database,sourceId:string,owners:StorageCommunityOwner[],
- position:number,day:string):Promise<number> {
+ position:number,day:string,correctionState:'staged'|'active'):Promise<number> {
  const cached=new Map<string,CachedGraphResult['source_kind']>();
  const digests=owners.flatMap(owner=>owner.ownerDigest?[owner.ownerDigest]:[]);
  for(let offset=0;offset<digests.length;offset+=CURRENT_FIT_CACHE_PAGE) {
   const page=digests.slice(offset,offset+CURRENT_FIT_CACHE_PAGE);
   const rows=(await target.prepare(`SELECT owner_digest,source_kind FROM analytics_community_graph_results
    WHERE source_id=? AND metric='fits' AND day=? AND method=?
+     AND COALESCE(json_extract(authority_json,'$.usageCorrectionState'),'staged')=?
      AND owner_digest IN(${page.map(()=>'?').join(',')}) ORDER BY owner_digest LIMIT ?`)
-   .bind(sourceId,day,STORAGE_GRAPH_METHOD,...page,page.length+1).all<CachedGraphResult>()).results;
+   .bind(sourceId,day,STORAGE_GRAPH_METHOD,correctionState,...page,page.length+1).all<CachedGraphResult>()).results;
   if(rows.length>page.length)throw fail();
   const expected=new Set(page);
   for(const row of rows) {
@@ -79,15 +80,16 @@ async function nextMissingCurrentFitPosition(target:D1Database,sourceId:string,o
  * checkpoint, but it never proves that the checkpoint or its source inputs are
  * valid; the graph kernel still loads and fences the exact dependency key. */
 async function nextMissingHistoricalModelPosition(target:D1Database,sourceId:string,owners:StorageCommunityOwner[],
- position:number,day:string):Promise<number> {
+ position:number,day:string,correctionState:'staged'|'active'):Promise<number> {
  const cached=new Map<string,CachedGraphResult['source_kind']>();
  const digests=owners.flatMap(owner=>owner.ownerDigest?[owner.ownerDigest]:[]);
  for(let offset=0;offset<digests.length;offset+=CURRENT_FIT_CACHE_PAGE) {
   const page=digests.slice(offset,offset+CURRENT_FIT_CACHE_PAGE);
   const rows=(await target.prepare(`SELECT owner_digest,source_kind FROM analytics_community_graph_results
    WHERE source_id=? AND metric='model' AND day=? AND method=?
+     AND COALESCE(json_extract(authority_json,'$.usageCorrectionState'),'staged')=?
      AND owner_digest IN(${page.map(()=>'?').join(',')}) ORDER BY owner_digest LIMIT ?`)
-   .bind(sourceId,day,STORAGE_GRAPH_METHOD,...page,page.length+1).all<CachedGraphResult>()).results;
+   .bind(sourceId,day,STORAGE_GRAPH_METHOD,correctionState,...page,page.length+1).all<CachedGraphResult>()).results;
   if(rows.length>page.length)throw fail();
   const expected=new Set(page);
   for(const row of rows) {
@@ -107,19 +109,20 @@ async function nextMissingHistoricalModelPosition(target:D1Database,sourceId:str
  * an older result is present. This is only a scheduling hint: scope capture,
  * epoch validation and the normal lease still govern the selected owner-day. */
 async function nextPendingCurrentPosition(target:D1Database,sourceId:string,owners:StorageCommunityOwner[],
- position:number,day:string):Promise<number|null> {
+ position:number,day:string,correctionState:'staged'|'active'):Promise<number|null> {
  const cached=new Map<string,CachedGraphResult['source_kind']>();
  const digests=owners.flatMap(owner=>owner.ownerDigest?[owner.ownerDigest]:[]);
  for(let offset=0;offset<digests.length;offset+=CURRENT_FIT_CACHE_PAGE) {
   const page=digests.slice(offset,offset+CURRENT_FIT_CACHE_PAGE);
   const rows=(await target.prepare(`SELECT r.owner_digest,r.metric,r.source_kind FROM analytics_community_graph_results r
    WHERE r.source_id=? AND r.day=? AND r.method=? AND r.metric IN('fits','model')
+    AND COALESCE(json_extract(r.authority_json,'$.usageCorrectionState'),'staged')=?
     AND r.owner_digest IN(${page.map(()=>'?').join(',')})
     AND NOT EXISTS(SELECT 1 FROM analytics_community_graph_work_selection s
      WHERE s.source_id=r.source_id AND s.owner_digest=r.owner_digest AND s.day=r.day AND s.metric=r.metric
       AND s.state IN('pending','claimed'))
    ORDER BY r.owner_digest,r.metric LIMIT ?`)
-   .bind(sourceId,day,STORAGE_GRAPH_METHOD,...page,page.length*2+1)
+   .bind(sourceId,day,STORAGE_GRAPH_METHOD,correctionState,...page,page.length*2+1)
    .all<CachedGraphResult&{metric:'fits'|'model'}>()).results;
   if(rows.length>page.length*2)throw fail();
   const expected=new Set(page);
@@ -187,6 +190,7 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
   after=rows.at(-1)!.participantId;
  }
  if(!owners.length)return {state:'idle'};
+ const correctionState=await readStorageCommunityCorrectionState(options.source);
  await options.target.prepare(`INSERT INTO analytics_community_graph_scan(source_id,revision,tick,current_position,history_position) VALUES(?,1,0,0,0)
   ON CONFLICT(source_id) DO NOTHING`).bind(options.sourceId).run();
  const scan=await options.target.prepare(`SELECT revision,tick,current_position,history_position
@@ -198,10 +202,11 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
  let position=current?scan.current_position%(owners.length*2)
   :scan.history_position%owners.length;
  const today=new Date(nowMs).toISOString().slice(0,10);
- if(current&&position%2===0)position=await nextMissingCurrentFitPosition(options.target,options.sourceId,owners,position,today);
+ if(current&&position%2===0)position=await nextMissingCurrentFitPosition(options.target,options.sourceId,owners,position,today,correctionState);
  let day:string|null=today;
  if(!current) {
   const authority=await captureStorageCommunityAuthority(options.source,options);
+  if(authority.usageCorrectionState!==correctionState)return {state:'deferred',reason:'source_changed'};
   const terminalEpoch=Math.max(await readStorageCommunitySourceTerminalEpoch(options.source),
    await readStorageCommunityDeliveredTerminalEpoch(options.target,options.sourceId));
   const from=new Date(Date.parse(today)-(ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS-1)*86400000).toISOString().slice(0,10);
@@ -209,7 +214,7 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
    WHERE source_id=? AND day>=? AND day<? AND method=? ORDER BY day LIMIT ?`)
    .bind(options.sourceId,from,today,STORAGE_GRAPH_METHOD,ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS).all<StorageModelPublicationValue>()).results;
   const completed=new Set<string>();
-  for(const row of published)if(await validStorageModelPublication(row,authority,terminalEpoch))completed.add(row.day);
+  for(const row of published)if(await validStorageModelPublication(row,authority,terminalEpoch,true))completed.add(row.day);
   day=null;
   for(let offset=1;offset<ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS;offset++) {
    const candidate=new Date(Date.parse(today)-offset*86400000).toISOString().slice(0,10);
@@ -217,11 +222,11 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
   }
   if(day===null) {
    const pending=await nextPendingCurrentPosition(options.target,options.sourceId,owners,
-    scan.current_position%(owners.length*2),today);
+    scan.current_position%(owners.length*2),today,correctionState);
    if(pending!==null){current=true;position=pending;day=today;}
   }
  }
- if(!current&&day!==null)position=await nextMissingHistoricalModelPosition(options.target,options.sourceId,owners,position,day);
+ if(!current&&day!==null)position=await nextMissingHistoricalModelPosition(options.target,options.sourceId,owners,position,day,correctionState);
  const owner=owners[current?Math.floor(position/2):position%owners.length]!;
  const metric=current&&position%2===0?'fits':'model';
  const claimed=await options.target.prepare(`UPDATE analytics_community_graph_scan SET revision=revision+1,

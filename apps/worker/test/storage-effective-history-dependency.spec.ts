@@ -424,7 +424,7 @@ describe("closed effective history dependency", () => {
 type DependencyQuery = { sql: string; values: readonly unknown[] };
 function observeDependencyQueries(source: D1Database, options: {
   rows?: (query: DependencyQuery, rows: Record<string, unknown>[]) => Record<string, unknown>[];
-  afterQuery?: (query: DependencyQuery) => void;
+  afterQuery?: (query: DependencyQuery) => void | Promise<void>;
 } = {}) {
   const queries: DependencyQuery[] = [];
   const database = new Proxy(source, { get(target, key) {
@@ -437,7 +437,7 @@ function observeDependencyQueries(source: D1Database, options: {
             const result = await inner.all<Record<string, unknown>>();
             queries.push(query);
             const rows = options.rows?.(query, result.results) ?? result.results;
-            options.afterQuery?.(query);
+            await options.afterQuery?.(query);
             return { ...result, results: rows };
           };
           const value = Reflect.get(inner, member);
@@ -458,6 +458,58 @@ const emptyDependencyOwner: StorageCommunityOwner = {
 };
 
 describe("bounded shared effective day dependencies", () => {
+  it("changes exact singleton and batched identities when correction reading activates without an owner revision", async () => {
+    const selectedDay=day(),days=[selectedDay,dayAfter(selectedDay)];
+    const staged=await effectiveHistoryDependency(db(),emptyDependencyOwner,namespace,
+      selectedDay,selectedDay);
+    const stagedReader=await createEffectiveHistoryDayDependencyReader(db(),emptyDependencyOwner,
+      namespace,days,{occurrenceLinks:'batched'});
+    expect(staged.correctionRuntime).toBe('staged');
+    expect(await stagedReader!.readDigest(selectedDay)).toBe(await sha256Hex(canonicalJson(staged)));
+    const mixedReader=await createEffectiveHistoryDayDependencyReader(db(),emptyDependencyOwner,
+      namespace,days,{occurrenceLinks:'batched'});
+    await db().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+    const active=await effectiveHistoryDependency(db(),emptyDependencyOwner,namespace,
+      selectedDay,selectedDay);
+    expect(active.correctionRuntime).toBe('active');
+    expect(active.v1).toEqual(staged.v1);
+    expect(active.v11).toEqual(staged.v11);
+    expect(active.v12).toEqual(staged.v12);
+    expect(active.corrections).toEqual(staged.corrections);
+    expect(await sha256Hex(canonicalJson(active))).not.toBe(await sha256Hex(canonicalJson(staged)));
+    expect(await stagedReader!.readDigest(days[1]!)).toBeUndefined();
+    expect(await mixedReader!.readDigest(days[1]!)).toBeUndefined();
+    const activeReader=await createEffectiveHistoryDayDependencyReader(db(),emptyDependencyOwner,
+      namespace,days,{occurrenceLinks:'batched'});
+    expect(await activeReader!.readDigest(selectedDay)).toBe(await sha256Hex(canonicalJson(active)));
+  });
+
+  it("rejects a correction activation between singleton snapshot and final runtime fence", async () => {
+    const selectedDay=day();
+    let runtimeReads=0;
+    const observed=observeDependencyQueries(db(),{async afterQuery(query){
+      if(!query.sql.includes('FROM telemetry_usage_correction_runtime LIMIT 2'))return;
+      if(++runtimeReads===1)await db().prepare(
+        "UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+    }});
+    await expect(effectiveHistoryDependency(observed.database,emptyDependencyOwner,namespace,
+      selectedDay,selectedDay)).rejects.toThrow('STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE');
+    expect(runtimeReads).toBe(1);
+  });
+
+  it("refuses malformed correction runtime evidence in both dependency modes", async () => {
+    const selectedDay=day();
+    const malformed=observeDependencyQueries(db(),{rows(query,rows){
+      return query.sql.includes('FROM telemetry_usage_correction_runtime LIMIT 2')
+        ? [{...rows[0],state:'unknown'}] : rows;
+    }});
+    await expect(effectiveHistoryDependency(malformed.database,emptyDependencyOwner,
+      namespace,selectedDay,selectedDay)).rejects.toThrow('STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE');
+    await expect(createEffectiveHistoryDayDependencyReader(malformed.database,
+      emptyDependencyOwner,namespace,[selectedDay])).rejects.toThrow(
+        'STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE');
+  });
+
   it("keeps deployed dependency bytes while matching canonical occurrences before decoding", async () => {
     const selectedDay = day(), outsideDay = dayAfter(selectedDay);
     const fixture = await createV11DeviceFixture(db(), { grant: true });
@@ -484,10 +536,10 @@ describe("bounded shared effective day dependencies", () => {
       const prior = await db().prepare(priorSql).bind(...query.values).all<Record<string, unknown>>();
       expect(dependencySqlBaseline.revision).toBe("32bd4091");
       expect(dependency.occurrenceLinks).toEqual([]);
-      expect(current.results).toEqual(prior.results);
+      expect(current.results.filter(row=>row.family!=='__correction_runtime__')).toEqual(prior.results);
       expect(canonicalJson({ ...dependency, occurrenceLinks: prior.results })).toBe(canonicalJson(dependency));
       expect(observed.queries.filter(value => value.sql.includes("selected(occurrence_id)"))).toHaveLength(1);
-      expect(observed.queries).toHaveLength(6);
+      expect(observed.queries).toHaveLength(7);
       // Both queries retain their completeness checks and outside-occurrence
       // comparisons. Only the canonical-ID match moves ahead of decoding.
       expect(current.meta.rows_read).toBeLessThan(prior.meta.rows_read);
@@ -570,12 +622,12 @@ describe("bounded shared effective day dependencies", () => {
       expect(currentSql).not.toBe(query.sql);
       expect(priorSql).not.toBe(dependencySqlBaseline.sql);
       expect(batchedSql).not.toBe(batchQuery.sql);
-      const current = await db().prepare(currentSql).bind(...query.values).all();
+      const current = await db().prepare(currentSql).bind(...query.values).all<{family:string}>();
       const priorMissing = await db().prepare(priorSql).bind(...query.values).all();
-      const batchedMissing = await db().prepare(batchedSql).bind(...batchQuery.values).all();
-      expect(current.results).toEqual([]);
-      expect(current.results).toEqual(priorMissing.results);
-      expect(batchedMissing.results).toEqual([]);
+      const batchedMissing = await db().prepare(batchedSql).bind(...batchQuery.values).all<{family:string}>();
+      expect(current.results.filter(row=>row.family!=='__correction_runtime__')).toEqual([]);
+      expect(current.results.filter(row=>row.family!=='__correction_runtime__')).toEqual(priorMissing.results);
+      expect(batchedMissing.results.filter(row=>row.family!=='__correction_runtime__')).toEqual([]);
     }
   }, 30_000);
 
@@ -698,7 +750,7 @@ describe("bounded shared effective day dependencies", () => {
         const reader = await createEffectiveHistoryDayDependencyReader(observed.database, owner, namespace,
           days, { includeSessions });
         expect(reader).toBeDefined();
-        expect(observed.queries).toHaveLength(5);
+        expect(observed.queries).toHaveLength(6);
         for (const [index, selectedDay] of days.entries()) {
           const exact = await effectiveHistoryDependency(db(), owner, namespace, selectedDay, selectedDay,
             { includeSessions });
@@ -709,7 +761,7 @@ describe("bounded shared effective day dependencies", () => {
             expect.objectContaining({ family: "v12", source_day: days[1 - index] }),
           ]));
           expect(await reader!.readDigest(selectedDay)).toBe(await sha256Hex(canonicalJson(exact)));
-          expect(observed.queries).toHaveLength(6 + index);
+        expect(observed.queries).toHaveLength(7 + index);
         }
         const wholeWindow = await effectiveHistoryDependency(db(), owner, namespace, days[0]!, days[1]!,
           { includeSessions });
@@ -723,30 +775,30 @@ describe("bounded shared effective day dependencies", () => {
     }
   }, 60_000);
 
-  it("stops after six source statements when only the first of 101 digests is needed", async () => {
+  it("stops after seven source statements when only the first of 101 digests is needed", async () => {
     const first = Date.parse("2026-05-01T00:00:00.000Z");
     const days = Array.from({ length: 101 }, (_, index) => new Date(first + index * 86_400_000).toISOString().slice(0, 10));
     const observed = observeDependencyQueries(db());
     const reader = await createEffectiveHistoryDayDependencyReader(observed.database, emptyDependencyOwner, namespace, days);
-    expect(observed.queries).toHaveLength(5);
+    expect(observed.queries).toHaveLength(6);
     const exact = await effectiveHistoryDependency(db(), emptyDependencyOwner, namespace, days[0]!, days[0]!);
     expect(await reader!.readDigest(days[0]!)).toBe(await sha256Hex(canonicalJson(exact)));
-    expect(observed.queries).toHaveLength(6);
+    expect(observed.queries).toHaveLength(7);
     expect(observed.queries.filter(query => query.sql.includes("selected(occurrence_id)"))).toHaveLength(1);
     expect(observed.queries.some(query => query.sql.includes("payload_json") || query.sql.includes("q.used_percent"))).toBe(false);
   });
 
-  it.each(["schema", "v1", "v11", "v12", "corrections"] as const)(
+  it.each(["schema", "v1", "v11", "v12", "corrections", "runtime"] as const)(
     "stops optional work when the deadline expires after the %s query", async (phase) => {
       const selectedDay = day();
       let now = 0;
-      const queryCounts = { schema: 1, v1: 2, v11: 3, v12: 4, corrections: 5 };
+      const queryCounts = { schema: 1, v1: 2, v11: 3, v12: 4, corrections: 5, runtime: 6 };
       const observed = observeDependencyQueries(db(), { afterQuery() {
         if (observed.queries.length === queryCounts[phase]) now = 10;
       } });
       const reader = await createEffectiveHistoryDayDependencyReader(observed.database, emptyDependencyOwner,
         namespace, [selectedDay], { canContinue: () => now < 10 });
-      if (phase === "corrections") {
+      if (phase === "runtime") {
         expect(reader).toBeDefined();
         expect(await reader!.readDigest(selectedDay)).toBeUndefined();
       } else expect(reader).toBeUndefined();
@@ -768,7 +820,7 @@ describe("bounded shared effective day dependencies", () => {
     const reader = await createEffectiveHistoryDayDependencyReader(observed.database, emptyDependencyOwner,
       namespace, [first]);
     await expect(reader!.readDigest(second)).rejects.toThrow("STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE");
-    expect(observed.queries).toHaveLength(5);
+    expect(observed.queries).toHaveLength(6);
   });
 
   it.each(["rows", "bytes"] as const)("declines aggregate %s overflow while preserving exact single-day fallback", async (kind) => {
@@ -828,11 +880,11 @@ describe("bounded shared effective day dependencies", () => {
     const reader = await createEffectiveHistoryDayDependencyReader(observed.database, emptyDependencyOwner,
       namespace, [selectedDay]);
     expect(reader).toBeDefined();
-    expect(observed.queries).toHaveLength(4);
+    expect(observed.queries).toHaveLength(5);
     const exact = await effectiveHistoryDependency(db(), emptyDependencyOwner, namespace, selectedDay, selectedDay);
     expect(exact.v12).toEqual([]);
     expect(await reader!.readDigest(selectedDay)).toBe(await sha256Hex(canonicalJson(exact)));
-    expect(observed.queries).toHaveLength(5);
+    expect(observed.queries).toHaveLength(6);
     const batched = await createEffectiveHistoryDayDependencyReader(db(), emptyDependencyOwner,
       namespace, [selectedDay], { occurrenceLinks: "batched" });
     expect(batched).toBeDefined();
@@ -955,7 +1007,7 @@ describe("effective quota preparation source fences", () => {
     const before = meter.queriesUsed;
     expect(await cache.shouldPrepare!(fixture.selectedDay)).toBe(false);
     const validated = meter.queriesUsed;
-    expect(validated - before).toBe(8);
+    expect(validated - before).toBe(9);
     expect(await cache.shouldPrepare!(fixture.selectedDay)).toBe(false);
     expect(await cache.shouldPrepare!(missingDay)).toBe(true);
     expect(meter.queriesUsed).toBe(validated);

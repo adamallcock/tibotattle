@@ -13,7 +13,7 @@ import { readPublishedStorageCommunityGraph } from './storage-community-graph-pu
 import { readCacheRetentionCommunitySeries } from './cache-retention-day';
 
 import { captureStorageCommunityAuthority, captureStorageCommunityRetirementAuthority, readStorageCommunityOwnerPage,
-  readStorageCommunitySourceTerminalEpoch, sameStorageCommunityHardAuthority, storageCommunityCalculationAuthorityIsCurrent,
+  readStorageCommunitySourceTerminalEpoch, sameStorageCommunityHardAuthority, sameStorageCommunityCalculationAuthority, storageCommunityCalculationAuthorityIsCurrent,
   storageCommunityPublicationVisible, type StorageCommunityAuthority, type StorageCommunityOwner } from './storage-community-authority';
 import { readEffectiveTelemetryOwnerDayPage, type EffectiveTelemetryStream } from './telemetry-usage-effective-reader';
 import { countStorageDailyContributingDevices, STORAGE_DAILY_DEVICE_METHOD } from './storage-community-daily-devices';
@@ -67,9 +67,9 @@ function usesEffectiveReader(owner: StorageCommunityOwner, effectiveEnabled: boo
 function sourceFormat(owner: StorageCommunityOwner, effectiveEnabled: boolean): OwnerCache['source_format'] {
   return usesEffectiveReader(owner, effectiveEnabled) ? 'effective' : owner.hasV11 ? 'v11' : 'v1';
 }
-function current(row: OwnerCache|undefined, owner: StorageCommunityOwner, effectiveEnabled: boolean): row is OwnerCache {
+function current(row: OwnerCache|undefined, owner: StorageCommunityOwner, effectiveEnabled: boolean, method = METHOD): row is OwnerCache {
   return row !== undefined && row.input_revision === owner.inputRevision && row.owner_revision === owner.ownerRevision
-    && row.source_format === sourceFormat(owner, effectiveEnabled) && row.method === METHOD;
+    && row.source_format === sourceFormat(owner, effectiveEnabled) && row.method === method;
 }
 function member(owner: StorageCommunityOwner, effectiveEnabled: boolean) {
   return {ownerDigest:owner.ownerDigest,inputRevision:owner.inputRevision,ownerRevision:owner.ownerRevision,
@@ -168,7 +168,7 @@ async function advanceEffectiveDailyValues(options: StorageCommunityDailyBinding
 
 async function ownerPage(options: StorageCommunityDailyBindings, observedDay: string,
   owner: StorageCommunityOwner, effectiveEnabled: boolean, old?: OwnerCache,
-  sharedFeatures = false, sharedFeatureBudget?: SharedAnalyticsFeatureBudget): Promise<'advanced'|'deferred'> {
+  sharedFeatures = false, sharedFeatureBudget?: SharedAnalyticsFeatureBudget, method = METHOD): Promise<'advanced'|'deferred'> {
   const {source,target,sourceId,sourceNamespace}=options, ownerDigest=owner.ownerDigest!;
   const effective = usesEffectiveReader(owner,effectiveEnabled);
   let sharedValues: V11DailyProjectionValues | null = null;
@@ -191,12 +191,12 @@ async function ownerPage(options: StorageCommunityDailyBindings, observedDay: st
   }
   dependencyDigest ??= effective ? await sha256Hex(canonicalJson(await effectiveHistoryDependency(
     source,owner,sourceNamespace,observedDay,observedDay,{includeSessions:true}))) : null;
-  const oldCursor = effective && old?.source_format === 'effective' && old.method === METHOD
+  const oldCursor = effective && old?.source_format === 'effective' && old.method === method
     ? readEffectiveCursor(old.fingerprint,dependencyDigest!) : null;
   // A later upload for another day advances the owner's authority revision,
   // but does not discard a partial fold of this unchanged closed day. The
   // occurrence reader and publication still enforce the fresh authority CAS.
-  const reuse = effective ? oldCursor !== null && sharedValues === null : current(old,owner,effectiveEnabled);
+  const reuse = effective ? oldCursor !== null && sharedValues === null : current(old,owner,effectiveEnabled,method);
   const progress = old?.progress_revision ?? 0;
   const retained=reuse?await target.prepare(`SELECT CASE WHEN length(CAST(values_json AS BLOB))<=? THEN values_json ELSE NULL END AS values_json
     FROM analytics_community_daily_owners WHERE source_id=? AND day=? AND owner_digest=? AND progress_revision=?`)
@@ -266,11 +266,11 @@ async function ownerPage(options: StorageCommunityDailyBindings, observedDay: st
       method=excluded.method,progress_revision=excluded.progress_revision,next_index=excluded.next_index,
       fingerprint=excluded.fingerprint,complete=excluded.complete,values_json=excluded.values_json
     WHERE analytics_community_daily_owners.progress_revision=?`).bind(sourceId,observedDay,ownerDigest,
-      owner.inputRevision,owner.ownerRevision,sourceFormat(owner,effectiveEnabled),METHOD,progress+1,nextIndex,fingerprint,complete?1:0,valuesJson,progress);
+      owner.inputRevision,owner.ownerRevision,sourceFormat(owner,effectiveEnabled),method,progress+1,nextIndex,fingerprint,complete?1:0,valuesJson,progress);
   try { await statement.run(); } catch { /* Only exact readback acknowledges a lost response or concurrent writer. */ }
   const receipt=await target.prepare(`SELECT * FROM analytics_community_daily_owners WHERE source_id=? AND day=? AND owner_digest=?`)
     .bind(sourceId,observedDay,ownerDigest).first<OwnerCache>();
-  return receipt && current(receipt,owner,effectiveEnabled) && receipt.progress_revision===progress+1
+  return receipt && current(receipt,owner,effectiveEnabled,method) && receipt.progress_revision===progress+1
     && receipt.next_index===nextIndex && receipt.fingerprint===fingerprint && receipt.complete===(complete?1:0)
     && receipt.values_json===valuesJson ? 'advanced':'deferred';
 }
@@ -334,6 +334,13 @@ const CONTAINMENT_EPOCH_SQL=`COALESCE((SELECT MAX(c.terminal_public_authority_ep
 const hardAuthority=(authority:StorageCommunityAuthority)=>({sourceId:authority.sourceId,sourceNamespace:authority.sourceNamespace,
   policyRevision:authority.policyRevision,collectionRevision:authority.collectionRevision});
 
+/** Queue entries and method-transition refreshes are one set of pending days.
+ * The latter do not revoke the last-good public snapshot while it is rebuilt. */
+export const STORAGE_DAILY_PENDING_DAYS_SQL=`SELECT day FROM analytics_community_daily_queue WHERE source_id=?1
+  UNION SELECT h.day FROM analytics_community_daily_heads h
+  JOIN analytics_community_daily_publications p ON p.source_id=h.source_id AND p.day=h.day AND p.revision=h.revision
+  WHERE h.source_id=?1 AND COALESCE(json_extract(p.authority_json,'$.usageCorrectionState'),'staged') IS NOT ?2`;
+
 /** Independent scheduler entry: new/corrected projections enqueue their days
  * transactionally. Policy changes and containment revisit old heads without
  * any ingestion-side analytical write, and only one day advances in this call.
@@ -363,11 +370,12 @@ export async function advanceNextStorageCommunityDaily(options:StorageCommunityD
        OR COALESCE(json_extract(p.authority_json,'$.publicAuthorityEpoch'),-1)<${CONTAINMENT_EPOCH_SQL}
        OR json_extract(p.payload_json,'$.apiEquivalentSpend.pricingMethodVersion')!=?
        OR json_extract(p.payload_json,'$.apiEquivalentSpend.registrySha256')!=?
-       OR json_extract(p.authority_json,'$.dailyDeviceMethod') IS NOT ?)
+       OR json_extract(p.authority_json,'$.dailyDeviceMethod') IS NOT ?
+       OR COALESCE(json_extract(p.authority_json,'$.usageCorrectionState'),'staged') IS NOT ?)
        AND NOT EXISTS(SELECT 1 FROM analytics_community_daily_queue q WHERE q.source_id=h.source_id AND q.day=h.day)
        ORDER BY h.day DESC LIMIT 1`)
       .bind(options.sourceId,skipJson,authority.sourceId,authority.sourceNamespace,authority.policyRevision,authority.collectionRevision,
-        COMMUNITY_DAILY_SPEND_PRICING_METHOD,COMMUNITY_DAILY_SPEND_REGISTRY_SHA256,STORAGE_DAILY_DEVICE_METHOD).first<string>('day');
+        COMMUNITY_DAILY_SPEND_PRICING_METHOD,COMMUNITY_DAILY_SPEND_REGISTRY_SHA256,STORAGE_DAILY_DEVICE_METHOD,authority.usageCorrectionState??'staged').first<string>('day');
   let observedDay=options.preferStaleHead?await staleHead():await queuedDay();
   if(observedDay===null)observedDay=options.preferStaleHead?await queuedDay():await staleHead();
   if(observedDay===null)return {state:'idle',ownersAdvanced:0};
@@ -393,6 +401,7 @@ export async function advanceStorageCommunityDaily(options: StorageCommunityDail
   const needsEffective=effectiveAvailable && (initialOwners?.some(owner=>owner.hasEffective===true)??false);
   const effectiveEnabled=needsEffective;
   const authority=await captureStorageCommunityAuthority(source,options), owners=initialOwners;
+  const method=authority.usageCorrectionState==='active'?`${METHOD}:usage-total-correction-active`:METHOD;
   const deferred=(reason:NonNullable<StorageCommunityDailyProgress['reason']>,ownersAdvanced=0):StorageCommunityDailyProgress=>
     ({state:reason==='projection_pending'&&ownersAdvanced>0?'progress':'deferred',reason,ownersAdvanced});
   if(!owners)return deferred('capacity');
@@ -405,10 +414,10 @@ export async function advanceStorageCommunityDaily(options: StorageCommunityDail
   const cache=new Map(rowset.map(row=>[row.owner_digest,row]));let ownersAdvanced=0;
   for(const owner of owners) {
     const row=cache.get(owner.ownerDigest!);
-    if(current(row,owner,effectiveEnabled)&&row.complete===1)continue;
+    if(current(row,owner,effectiveEnabled,method)&&row.complete===1)continue;
     if(ownersAdvanced>=maxOwners)return {state:'progress',ownersAdvanced};
     if(await ownerPage(options,options.day,owner,effectiveEnabled,row,
-      options.sharedFeatures,options.sharedFeatureBudget)==='deferred')return deferred('projection_pending',ownersAdvanced);
+      options.sharedFeatures,options.sharedFeatureBudget,method)==='deferred')return deferred('projection_pending',ownersAdvanced);
     ownersAdvanced++;
   }
   // Read all selected values and the queue revision in one target snapshot.
@@ -433,12 +442,12 @@ export async function advanceStorageCommunityDaily(options: StorageCommunityDail
     payload_sha256:string|null;device_method:string|null}|undefined;
   if(rows.length!==owners.length)return deferred('projection_pending',ownersAdvanced);
   const byOwner=new Map(owners.map(owner=>[owner.ownerDigest!,owner]));let bytes=0;
-  for(const row of rows){if(!current(row,byOwner.get(row.owner_digest)!,effectiveEnabled)||row.complete!==1)return deferred('projection_pending',ownersAdvanced);
+  for(const row of rows){if(!current(row,byOwner.get(row.owner_digest)!,effectiveEnabled,method)||row.complete!==1)return deferred('projection_pending',ownersAdvanced);
     if(typeof row.values_json!=='string')return deferred('capacity',ownersAdvanced);
     bytes+=byteLength(row.values_json);if(bytes>STORAGE_DAILY_CAPTURE_BYTES)return deferred('capacity',ownersAdvanced);}
   // Identity of an unchanged result: exact members and method under the hard
   // authority. Epoch churn alone never forces a new revision or release time.
-  const cohortDigest=await sha256Hex(canonicalJson({members:requested,method:METHOD,
+  const cohortDigest=await sha256Hex(canonicalJson({members:requested,method,
     deviceMethod:STORAGE_DAILY_DEVICE_METHOD,authority:hardAuthority(authority)}));
   const nowMs=options.nowMs??Date.now();if(!Number.isFinite(nowMs))throw unavailable();
   const revision=(previous?.revision??0)+1,releasedAt=new Date(nowMs).toISOString();
@@ -468,7 +477,7 @@ export async function advanceStorageCommunityDaily(options: StorageCommunityDail
   let pinned:StorageCommunityAuthority;
   try{pinned=await captureStorageCommunityAuthority(source,options);}catch{return deferred('source_changed',ownersAdvanced);}
   if(!finalOwners || canonicalJson(finalOwners.map(owner=>member(owner,finalEffectiveEnabled)))!==requestJson
-    || !sameStorageCommunityHardAuthority(pinned,authority))return deferred('source_changed',ownersAdvanced);
+    || !sameStorageCommunityCalculationAuthority(pinned,authority))return deferred('source_changed',ownersAdvanced);
   // A head published under another device-count method is never "unchanged",
   // or the stale-head pass would select it again without ever refreshing it.
   const unchanged=previous?.cohort_digest===cohortDigest&&previous.device_method===STORAGE_DAILY_DEVICE_METHOD
@@ -484,7 +493,7 @@ export async function advanceStorageCommunityDaily(options: StorageCommunityDail
        OR c.owner_revision!=json_extract(m.value,'$.ownerRevision') OR c.complete!=1 OR c.method!=?)`)
     .bind(sourceId,options.day,revision,cohortDigest,canonicalJson({...pinned,dailyDeviceMethod:STORAGE_DAILY_DEVICE_METHOD}),
       payloadJson,payloadHash,releasedAt,unchanged?1:0,
-      sourceId,options.day,revision,requestJson,sourceId,options.day,METHOD);
+      sourceId,options.day,revision,requestJson,sourceId,options.day,method);
   try {await target.batch([commit,target.prepare(`DELETE FROM analytics_community_daily_queue
     WHERE source_id=? AND day=? AND revision=? AND EXISTS(SELECT 1 FROM analytics_community_daily_publications
       WHERE source_id=? AND day=? AND cohort_digest=?)`).bind(sourceId,options.day,queueRevision,sourceId,options.day,cohortDigest)]);}catch{

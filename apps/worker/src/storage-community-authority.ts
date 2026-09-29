@@ -5,9 +5,20 @@ export interface StorageCommunityAuthority {
   sourceId: string; sourceNamespace: string; publicAuthorityEpoch: number;
   policyRevision: number; collectionRevision: number; graphInvalidationEpoch: number;
   sourceEpoch: number; sequence: number;
+  /** Calculation semantics may advance while last-good publications remain
+   * visible. Omitted stamps belong to the pre-activation staged method. */
+  usageCorrectionState?: 'staged'|'active';
 }
 const unavailable = () => new Error('STORAGE_COMMUNITY_AUTHORITY_UNAVAILABLE');
 const count = (n: unknown): n is number => typeof n === 'number' && Number.isSafeInteger(n) && n >= 0;
+
+export async function readStorageCommunityCorrectionState(source:D1Database):Promise<'staged'|'active'> {
+  const state=await source.prepare(`SELECT state FROM telemetry_usage_correction_runtime WHERE id=1
+    AND schema_version='telemetry-usage-correction-v1' AND method_version='usage-total-correction-v1'
+    AND max_capture_rows=200 AND max_history_page=200`).first<string>('state');
+  if(state!=='staged'&&state!=='active')throw unavailable();
+  return state;
+}
 
 /** A source-owned privacy/policy stamp, not an analytics freshness assertion.
  * No participant identities, credentials or derived payloads are copied here. */
@@ -31,11 +42,16 @@ async function captureAuthority(source: D1Database,
   const row = await source.prepare(`SELECT s.source_id AS sourceId,a.source_namespace AS sourceNamespace,
     s.authority_epoch AS publicAuthorityEpoch,i.policy_revision AS policyRevision,c.revision AS collectionRevision,
     m.graph_invalidation_epoch AS graphInvalidationEpoch,m.mutation_epoch AS sourceEpoch,
+    correction.state AS usageCorrectionState,
     COALESCE((SELECT MAX(sequence) FROM storage_ingestion_changes),0) AS sequence
     FROM storage_source_state s
     JOIN typed_v1_admission_state a ON a.id=1 AND a.runtime_contract_version=1
     JOIN typed_v11_admission_state b ON b.id=1 AND b.runtime_contract_version=1 AND b.source_namespace=a.source_namespace
     JOIN ingestion_analytics_separation i ON i.id=1
+    JOIN telemetry_usage_correction_runtime correction ON correction.id=1
+      AND correction.schema_version='telemetry-usage-correction-v1'
+      AND correction.method_version='usage-total-correction-v1' AND correction.state IN('staged','active')
+      AND correction.max_capture_rows=200 AND correction.max_history_page=200
     JOIN collection_controls c ON c.singleton=1 AND (?=1 OR c.publication_enabled=1)
     JOIN community_snapshot_mutation_control m ON m.singleton_id=1
     JOIN community_public_source_bootstrap p ON p.singleton=1 AND (?=1 OR p.completed=1) AND p.policy_version=?
@@ -55,6 +71,7 @@ export function sameStorageCommunityAuthority(a: StorageCommunityAuthority, b: S
   return a.sourceId === b.sourceId && a.sourceNamespace === b.sourceNamespace
     && a.publicAuthorityEpoch === b.publicAuthorityEpoch && a.policyRevision === b.policyRevision
     && a.collectionRevision === b.collectionRevision && a.graphInvalidationEpoch === b.graphInvalidationEpoch
+    && sameStorageCommunityCalculationMethod(a,b)
     && (!exactInputs || (a.sequence === b.sequence && a.sourceEpoch === b.sourceEpoch));
 }
 
@@ -65,8 +82,12 @@ export function sameStorageCommunityAuthority(a: StorageCommunityAuthority, b: S
  * authority comparison below. */
 export function sameStorageCommunityCalculationAuthority(a: StorageCommunityAuthority,
   b: StorageCommunityAuthority): boolean {
-  return a.sourceId === b.sourceId && a.sourceNamespace === b.sourceNamespace
-    && a.policyRevision === b.policyRevision && a.collectionRevision === b.collectionRevision;
+  return sameStorageCommunityHardAuthority(a,b) && sameStorageCommunityCalculationMethod(a,b);
+}
+
+export function sameStorageCommunityCalculationMethod(a:StorageCommunityAuthority,b:StorageCommunityAuthority):boolean {
+  const left=a.usageCorrectionState??'staged',right=b.usageCorrectionState??'staged';
+  return (left==='staged'||left==='active') && left===right;
 }
 
 /** Hard publication authority. A completed public aggregate becomes
@@ -76,7 +97,8 @@ export function sameStorageCommunityCalculationAuthority(a: StorageCommunityAuth
  * atomically instead of withdrawing it. */
 export function sameStorageCommunityHardAuthority(a: StorageCommunityAuthority,
   b: StorageCommunityAuthority): boolean {
-  return sameStorageCommunityCalculationAuthority(a, b);
+  return a.sourceId === b.sourceId && a.sourceNamespace === b.sourceNamespace
+    && a.policyRevision === b.policyRevision && a.collectionRevision === b.collectionRevision;
 }
 
 /** Source-ahead containment: a terminal (owner-withdrawn/erased) already
@@ -118,15 +140,19 @@ export async function storageCommunityCalculationAuthorityIsCurrent(source:D1Dat
   const controls=await readCollectionControls(source);
   if(!controls.publication)throw unavailable();
   const row=await source.prepare(`SELECT s.source_id AS sourceId,a.source_namespace AS sourceNamespace,
-    i.policy_revision AS policyRevision,c.revision AS collectionRevision
+    i.policy_revision AS policyRevision,c.revision AS collectionRevision,correction.state AS usageCorrectionState
     FROM storage_source_state s
     JOIN typed_v1_admission_state a ON a.id=1 AND a.runtime_contract_version=1
     JOIN typed_v11_admission_state b ON b.id=1 AND b.runtime_contract_version=1 AND b.source_namespace=a.source_namespace
     JOIN ingestion_analytics_separation i ON i.id=1
+    JOIN telemetry_usage_correction_runtime correction ON correction.id=1
+      AND correction.schema_version='telemetry-usage-correction-v1'
+      AND correction.method_version='usage-total-correction-v1' AND correction.state IN('staged','active')
+      AND correction.max_capture_rows=200 AND correction.max_history_page=200
     JOIN collection_controls c ON c.singleton=1 AND c.publication_enabled=1
     JOIN community_public_source_bootstrap p ON p.singleton=1 AND p.completed=1 AND p.policy_version=?
     WHERE s.singleton=1`).bind(COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION).first<Pick<StorageCommunityAuthority,
-      'sourceId'|'sourceNamespace'|'policyRevision'|'collectionRevision'>>();
+      'sourceId'|'sourceNamespace'|'policyRevision'|'collectionRevision'|'usageCorrectionState'>>();
   return !!row&&row.collectionRevision===controls.revision
     &&typeof row.sourceId==='string'&&typeof row.sourceNamespace==='string'
     &&count(row.policyRevision)&&row.policyRevision>=1&&count(row.collectionRevision)&&row.collectionRevision>=1

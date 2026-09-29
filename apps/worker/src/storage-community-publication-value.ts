@@ -1,6 +1,6 @@
 import { projectAdminModelHistoryDay } from '@app-usagemonitor/telemetry-contract';
 import { sha256Hex } from './crypto';
-import { storageCommunityPublicationVisible, type StorageCommunityAuthority } from './storage-community-authority';
+import { storageCommunityPublicationVisible, sameStorageCommunityCalculationMethod, type StorageCommunityAuthority } from './storage-community-authority';
 
 export interface StorageModelPublicationValue {
   day: string;
@@ -14,10 +14,11 @@ export interface StorageModelPublicationValue {
  * A completed day stays valid across ordinary uploads; only containment newer
  * than its pin, or a hard authority change, makes it unfinished again. */
 export async function validStorageModelPublication(row: StorageModelPublicationValue,
-  authority: StorageCommunityAuthority, terminalPublicAuthorityEpoch: number): Promise<boolean> {
+  authority: StorageCommunityAuthority, terminalPublicAuthorityEpoch: number, requireCurrentMethod=false): Promise<boolean> {
   try {
     const recorded = JSON.parse(row.authority_json) as StorageCommunityAuthority;
     if (!storageCommunityPublicationVisible(recorded, authority, terminalPublicAuthorityEpoch)
+        || (requireCurrentMethod && !sameStorageCommunityCalculationMethod(recorded,authority))
         || new TextEncoder().encode(row.payload_json).byteLength > 16 * 1024
         || await sha256Hex(row.payload_json) !== row.payload_sha256) return false;
     const value = projectAdminModelHistoryDay(JSON.parse(row.payload_json));

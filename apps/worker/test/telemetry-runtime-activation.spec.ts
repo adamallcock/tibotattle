@@ -47,11 +47,13 @@ const settings: Record<string, unknown> = {
 let reconciliationProof!: TelemetryRuntimeActivationRequest["reconciliation"];
 
 function request(
-  target: "usage_v12" | "performance",
-  expectedRevision = 1,
+  target: "usage_v12" | "performance" | "usage_correction",
+  expectedRevision = target === "usage_correction" ? 0 : 1,
   idempotencyKey = target === "usage_v12"
     ? "22222222-2222-4222-8222-222222222222"
-    : "33333333-3333-4333-8333-333333333333",
+    : target === "performance"
+      ? "33333333-3333-4333-8333-333333333333"
+      : "44444444-4444-4444-8444-444444444444",
 ): TelemetryRuntimeActivationRequest {
   return {
     idempotencyKey,
@@ -82,8 +84,14 @@ async function insertStartedActivation(input: TelemetryRuntimeActivationRequest)
   ).run();
 }
 
-async function runtimeRow(target: "usage_v12" | "performance") {
-  const table = target === "usage_v12" ? "telemetry_v12_runtime" : "telemetry_performance_runtime";
+async function runtimeRow(target: "usage_v12" | "performance" | "usage_correction") {
+  const table = target === "usage_v12" ? "telemetry_v12_runtime"
+    : target === "performance" ? "telemetry_performance_runtime"
+      : "telemetry_usage_correction_runtime";
+  if (target === "usage_correction") {
+    const row = await db().prepare(`SELECT state FROM ${table} WHERE id = 1`).first<{ state: string }>();
+    return row && { state: row.state, policy_revision: row.state === "active" ? 1 : 0 };
+  }
   return db().prepare(`SELECT state, policy_revision FROM ${table} WHERE id = 1`)
     .first<{ state: string; policy_revision: number }>();
 }
@@ -191,6 +199,104 @@ describe("protected telemetry runtime activation", () => {
         idempotencyKey: "not-a-uuid",
       },
     })).toThrowError("BODY_INVALID");
+    expect(parseTelemetryRuntimeActivationRequest({
+      action: "run_maintenance",
+      telemetryRuntimeActivation: request("usage_correction"),
+    })).toMatchObject(request("usage_correction"));
+    expect(() => parseTelemetryRuntimeActivationRequest({
+      action: "run_maintenance",
+      telemetryRuntimeActivation: request("usage_correction", 1),
+    })).toThrowError("BODY_INVALID");
+    expect(() => parseTelemetryRuntimeActivationRequest({
+      action: "run_maintenance",
+      telemetryRuntimeActivation: request("usage_v12", 0),
+    })).toThrowError("BODY_INVALID");
+  });
+
+  it("activates correction with owner audit and refuses a second operation", async () => {
+    const first = request("usage_correction");
+    expect(await runtimeRow("usage_correction")).toEqual({ state: "staged", policy_revision: 0 });
+    const activated = await activateTelemetryRuntimeAsOwner(
+      db(), settings, ACTOR_IDENTITY_KEY, first, NOW_EPOCH,
+    );
+    expect(activated).toMatchObject({ target: "usage_correction", state: "active",
+      fromRevision: 0, toRevision: 1 });
+    expect(await runtimeRow("usage_correction")).toEqual({ state: "active", policy_revision: 1 });
+    const audit = await db().prepare(
+      "SELECT operation_id, outcome, actor_identity_digest FROM admin_action_audit WHERE operation_id = ?",
+    ).bind(first.idempotencyKey).first<{ operation_id: string; outcome: string;
+      actor_identity_digest: string }>();
+    expect(audit).toMatchObject({ operation_id: first.idempotencyKey, outcome: "success" });
+    expect(audit?.actor_identity_digest).toMatch(/^[a-f0-9]{64}$/u);
+    expect(await activateTelemetryRuntimeAsOwner(db(), settings, ACTOR_IDENTITY_KEY, first, NOW_EPOCH))
+      .toMatchObject(activated);
+    await expect(activateTelemetryRuntimeAsOwner(db(), settings, ACTOR_IDENTITY_KEY,
+      request("usage_correction", 0, "55555555-5555-4555-8555-555555555555"), NOW_EPOCH))
+      .rejects.toMatchObject({ status: 409, code: "ADMIN_ACTION_CONFLICT" });
+  });
+
+  it("recovers correction activation from a lost D1 batch response by exact audit id", async () => {
+    const first = request("usage_correction", 0, "66666666-6666-4666-8666-666666666666");
+    const realBatch = db().batch.bind(db());
+    let lost = false;
+    const responseLostDb = new Proxy(db(), {
+      get(target, property, receiver) {
+        if (property === "batch") return async (statements: D1PreparedStatement[]) => {
+          const result = await realBatch(statements);
+          if (!lost) { lost = true; throw new Error("synthetic_response_lost_after_commit"); }
+          return result;
+        };
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as D1Database;
+    const recovered = await activateTelemetryRuntimeAsOwner(
+      responseLostDb, settings, ACTOR_IDENTITY_KEY, first, NOW_EPOCH,
+    );
+    expect(lost).toBe(true);
+    expect(recovered).toMatchObject({ target: "usage_correction", fromRevision: 0,
+      toRevision: 1, operationId: first.idempotencyKey });
+    expect(await runtimeRow("usage_correction")).toEqual({ state: "active", policy_revision: 1 });
+    expect(await db().prepare("SELECT outcome FROM admin_action_audit WHERE operation_id=?")
+      .bind(first.idempotencyKey).first()).toEqual({ outcome: "success" });
+  });
+
+  it("does not attribute an externally active correction runtime to a started audit", async () => {
+    const first = request("usage_correction", 0, "77777777-7777-4777-8777-777777777777");
+    await insertStartedActivation(first);
+    await db().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+    await expect(activateTelemetryRuntimeAsOwner(
+      db(), settings, ACTOR_IDENTITY_KEY, first, NOW_EPOCH,
+    )).rejects.toMatchObject({ status: 503,
+      code: "TELEMETRY_RUNTIME_ACTIVATION_RECONCILE_REQUIRED" });
+    expect(await db().prepare("SELECT outcome FROM admin_action_audit WHERE operation_id=?")
+      .bind(first.idempotencyKey).first()).toEqual({ outcome: "started" });
+  });
+
+  it("does not claim another correction writer after a zero-row activation CAS", async () => {
+    const losing = request("usage_correction", 0, "88888888-8888-4888-8888-888888888888");
+    const realBatch = db().batch.bind(db());
+    let raced = false;
+    const losingDb = new Proxy(db(), {
+      get(target, property, receiver) {
+        if (property === "batch") return async (statements: D1PreparedStatement[]) => {
+          if (!raced) {
+            raced = true;
+            await db().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+          }
+          return realBatch(statements);
+        };
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as D1Database;
+    await expect(activateTelemetryRuntimeAsOwner(
+      losingDb, settings, ACTOR_IDENTITY_KEY, losing, NOW_EPOCH,
+    )).rejects.toMatchObject({ status: 409, code: "ADMIN_ACTION_CONFLICT" });
+    expect(raced).toBe(true);
+    expect(await runtimeRow("usage_correction")).toEqual({ state: "active", policy_revision: 1 });
+    expect(await db().prepare("SELECT outcome FROM admin_action_audit WHERE operation_id=?")
+      .bind(losing.idempotencyKey).first()).toEqual({ outcome: "failure" });
   });
 
   it("activates usage and performance independently with one revision step", async () => {

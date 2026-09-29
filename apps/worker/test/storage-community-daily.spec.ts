@@ -1,3 +1,4 @@
+import {readStoragePipelineProgress} from '../src/storage-community-progress';
 import { canonicalTelemetryV11Json } from '@app-usagemonitor/telemetry-contract';
 import { createV11DeviceFixture } from './helpers/telemetry-v11';
 import { currentTelemetryV1Chunk, type TelemetryV1ChunkInsert } from '../src/telemetry-v1-repository';
@@ -188,6 +189,25 @@ async function seedV1(stream: 'usage' | 'quota' | 'session' = 'usage', count = 1
 }
 
 describe('independent public daily publication',()=>{
+  it('refreshes a completed day after correction activation while retaining its last-good public snapshot',async()=>{
+    await fixture();await ready();expect((await publish()).state).toBe('published');
+    const before=await captureStorageCommunityAuthority(source());
+    const old=(await publicRead()).rows[0]!;
+    expect(await target().prepare('SELECT count(*) n FROM analytics_community_daily_queue').first('n')).toBe(0);
+    await source().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+    expect(await storageCommunityAuthorityIsCurrent(source(),before)).toBe(false);
+    expect((await publicRead()).rows[0]).toEqual(old);
+    expect((await readStoragePipelineProgress(options(),Date.now()))?.daily.queuedDays).toBe(1);
+    let progress=await advanceNextStorageCommunityDaily(options());
+    for(let n=0;n<8&&progress.state!=='published';n++)progress=await advanceNextStorageCommunityDaily(options());
+    expect(progress).toMatchObject({state:'published',day:today()});
+    const current=(await publicRead()).rows[0]!;
+    expect(current.revision).toBe(old.revision+1);
+    expect(JSON.parse(current.payload_json).totals).toEqual(JSON.parse(old.payload_json).totals);
+    expect(await target().prepare("SELECT json_extract(authority_json,'$.usageCorrectionState') state FROM analytics_community_daily_publications ORDER BY revision DESC LIMIT 1").first('state')).toBe('active');
+    expect(await advanceNextStorageCommunityDaily(options())).toMatchObject({state:'idle'});
+  });
+
   it('reprices an old-registry v11 day in bounded pages without replaying admission',async()=>{
     const owner=await fixture(250);await ready();
     const priorCursor=await target().prepare('SELECT * FROM analytics_source_cursors').all();

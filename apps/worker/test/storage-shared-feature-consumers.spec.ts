@@ -74,11 +74,66 @@ it('reuses durable effective days for exact daily spend and seven-day cache publ
   }
   const destination=corpus.graphDates[0]!, lookback=corpus.historyDates.slice(
     corpus.historyDates.indexOf(destination)-7,corpus.historyDates.indexOf(destination));
+  const emptyDay=corpus.historyDates[corpus.historyDates.indexOf(corpus.correctionDay)+1]!;
+  expect(lookback).toContain(emptyDay);
+  expect(corpus.populatedDates).not.toContain(emptyDay);
+  for(const day of corpus.historyDates.slice(corpus.historyDates.indexOf(emptyDay)-7,
+    corpus.historyDates.indexOf(destination)-7)) {
+    await publish(reference(),day,false);
+    await publish(candidate(),day,false);
+  }
   for(const day of [...lookback,destination]) {
     await publish(reference(),day,false);
-    await publish(candidate(),day,true);
+    // Leave one proven-empty day cold for the cache consumer. Its seven-day
+    // carry includes positive source rows, yet it has no own session to pair.
+    await publish(candidate(),day,day!==emptyDay);
     expect(await payload(candidate(),day)).toBe(await payload(reference(),day));
   }
+  expect(await candidate().prepare(`SELECT count(*) n FROM analytics_shared_feature_days
+    WHERE source_id=? AND owner_digest=? AND day=?`).bind(sourceId,corpus.owner.ownerDigest,emptyDay)
+    .first<number>('n')).toBe(0);
+  const emptyReferenceKey=await effectiveCandidate(reference(),corpus.owner.ownerDigest,emptyDay);
+  const emptyCandidateKey=await effectiveCandidate(candidate(),corpus.owner.ownerDigest,emptyDay);
+  const emptyNative=await createCacheRetentionDaySourceBuild({source:source(),target:reference(),sourceNamespace})(
+    emptyReferenceKey.key,emptyReferenceKey.carry,{remainingQueries:10_000,deadlineMs:Date.now()+120_000});
+  expect(emptyNative.groups).toHaveLength(0);
+  const emptyFeatureReads=vi.spyOn(sharedStore,'advanceSharedAnalyticsFeatureDay');
+  let emptyShared:typeof emptyNative|undefined;
+  const emptyCosts:{source:number;target:number}[]=[];
+  for(let attempt=0;attempt<8&&!emptyShared;attempt++) {
+    const sourceMeter=createD1InvocationBudget(350),targetMeter=createD1InvocationBudget(650);
+    const build=createCacheRetentionDaySourceBuild({source:sourceMeter.wrap(source()),
+      target:targetMeter.wrap(candidate()),sourceNamespace,sharedFeatures:true});
+    try { emptyShared=await build(emptyCandidateKey.key,emptyCandidateKey.carry,
+      {remainingQueries:350,remainingSharedQueries:()=>Math.min(sourceMeter.remainingQueries,
+        targetMeter.remainingQueries),deadlineMs:Date.now()+120_000}); }
+    catch(error) { if(!(error instanceof CacheRetentionDeferredError))throw error; }
+    emptyCosts.push({source:sourceMeter.queriesUsed,target:targetMeter.queriesUsed});
+    expect(sourceMeter.queriesUsed).toBeLessThanOrEqual(350);
+    expect(targetMeter.queriesUsed).toBeLessThanOrEqual(650);
+    expect(sourceMeter.queriesUsed+targetMeter.queriesUsed).toBeLessThanOrEqual(1_000);
+  }
+  expect(emptyShared).toEqual(emptyNative);
+  expect(emptyCosts).toHaveLength(1);
+  expect(emptyFeatureReads).toHaveBeenCalledTimes(emptyCosts.length);
+  expect(emptyFeatureReads.mock.calls.map(([input])=>input.day)).toEqual(
+    Array(emptyCosts.length).fill(emptyDay));
+  expect(emptyCosts.at(-1)!.source+emptyCosts.at(-1)!.target).toBeLessThanOrEqual(150);
+  emptyFeatureReads.mockRestore();
+  const warmSourceMeter=createD1InvocationBudget(350),warmTargetMeter=createD1InvocationBudget(650);
+  const emptyWarm=await createCacheRetentionDaySourceBuild({source:warmSourceMeter.wrap(source()),
+    target:warmTargetMeter.wrap(candidate()),sourceNamespace,sharedFeatures:true})(
+      emptyCandidateKey.key,emptyCandidateKey.carry,{remainingQueries:350,
+        remainingSharedQueries:()=>Math.min(warmSourceMeter.remainingQueries,
+          warmTargetMeter.remainingQueries),deadlineMs:Date.now()+120_000});
+  expect(emptyWarm).toEqual(emptyNative);
+  const emptyColdStatements=emptyCosts.reduce((sum,cost)=>sum+cost.source+cost.target,0);
+  const emptyWarmStatements=warmSourceMeter.queriesUsed+warmTargetMeter.queriesUsed;
+  expect(emptyWarmStatements).toBeLessThan(emptyColdStatements);
+  console.info(JSON.stringify({event:'synthetic_shared_cache_empty',coldInvocations:emptyCosts.length,
+    coldStatements:emptyColdStatements,warmStatements:emptyWarmStatements,
+    maxColdSource:Math.max(...emptyCosts.map(cost=>cost.source)),
+    maxColdTarget:Math.max(...emptyCosts.map(cost=>cost.target))}));
   const beforeDaily=await payload(candidate(),corpus.correctionDay);
   const beforeFeature=await candidate().prepare(`SELECT head_revision,dependency_digest FROM analytics_shared_feature_days
     WHERE source_id=? AND owner_digest=? AND day=? AND state='complete'`)
@@ -104,6 +159,7 @@ it('reuses durable effective days for exact daily spend and seven-day cache publ
   }
   expect(shared).toEqual(native);
   expect(sharedFeatureReads).toHaveBeenCalledTimes(8);
+  expect(sharedFeatureReads.mock.calls.map(([input])=>input.day)).toEqual([destination,...lookback]);
   expect((await Promise.all(sharedFeatureReads.mock.results.map(result=>result.value)))
     .every(result=>result.state==='complete'&&result.reused)).toBe(true);
   sharedFeatureReads.mockRestore();
@@ -138,6 +194,31 @@ it('reuses durable effective days for exact daily spend and seven-day cache publ
   expect(afterFeatures.some(row=>row.dependency_digest!==beforeFeature?.dependency_digest)).toBe(true);
   const correctedCarry=await readCacheRetentionCarryDays(candidate(),candidateKey.key);
   expect(correctedCarry).not.toEqual(candidateKey.carry);
+  await publish(reference(),destination,false);
+  await publish(candidate(),destination,true);
+  const correctedReferenceKey=await effectiveCandidate(reference(),corpus.owner.ownerDigest,destination);
+  const correctedCandidateKey=await effectiveCandidate(candidate(),corpus.owner.ownerDigest,destination);
+  const correctedNative=await createCacheRetentionDaySourceBuild({source:source(),target:reference(),
+    sourceNamespace})(correctedReferenceKey.key,correctedReferenceKey.carry,
+      {remainingQueries:10_000,deadlineMs:Date.now()+120_000});
+  let correctedShared:typeof correctedNative|undefined;
+  const correctedCosts:{source:number;target:number}[]=[];
+  for(let attempt=0;attempt<8&&!correctedShared;attempt++) {
+    const sourceMeter=createD1InvocationBudget(350),targetMeter=createD1InvocationBudget(650);
+    const build=createCacheRetentionDaySourceBuild({source:sourceMeter.wrap(source()),
+      target:targetMeter.wrap(candidate()),sourceNamespace,sharedFeatures:true});
+    try { correctedShared=await build(correctedCandidateKey.key,correctedCandidateKey.carry,
+      {remainingQueries:350,remainingSharedQueries:()=>Math.min(sourceMeter.remainingQueries,
+        targetMeter.remainingQueries),deadlineMs:Date.now()+120_000}); }
+    catch(error) { if(!(error instanceof CacheRetentionDeferredError))throw error; }
+    correctedCosts.push({source:sourceMeter.queriesUsed,target:targetMeter.queriesUsed});
+    expect(sourceMeter.queriesUsed+targetMeter.queriesUsed).toBeLessThanOrEqual(1_000);
+  }
+  expect(correctedShared).toEqual(correctedNative);
+  expect(correctedCosts).toHaveLength(1);
+  console.info(JSON.stringify({event:'synthetic_shared_cache_correction',
+    statements:correctedCosts[0]!.source+correctedCosts[0]!.target,
+    sourceStatements:correctedCosts[0]!.source,targetStatements:correctedCosts[0]!.target}));
 
   // The target-side terminal receipt removes private feature generations and
   // both consumer lanes' per-owner rows through their normal retirement work.

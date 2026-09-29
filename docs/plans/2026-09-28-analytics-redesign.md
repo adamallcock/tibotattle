@@ -2,7 +2,7 @@
 title: A shared incremental analytics architecture
 date: 2026-09-28
 type: plan
-status: proposed
+status: production-enabled
 ---
 
 # A shared incremental analytics architecture
@@ -48,16 +48,150 @@ and production writes are subsequent, separately recorded operations.
   reference-output comparisons and full scheduled cost measurements. All three
   scheduled lanes have bounded completion evidence. These local synthetic
   measurements do not establish production latency or a whole-system speedup.
-- [ ] **L8 — Review and release candidate:** integrate reviewed changes on an
+- [x] **L8 — Review and release candidate:** integrate reviewed changes on an
   appropriate clean source revision, run the owning Worker/architecture/docs
-  gates, and create verified analytics/publication/cache artifacts.
-- [ ] **L9 — Migration readiness:** populated rehearsal against the exact live
+  gates, and create verified analytics/publication/cache artifacts. Candidate
+  `4ac0b999` passed the complete owning gate: 191 files / 2,356 tests, types,
+  scripts and dry deployment checks. All three disabled bundles are hash-pinned.
+- [x] **L9 — Migration readiness:** populated rehearsal against the exact live
   ledger, preservation/erasure/rollback checks, ordered migration and activation
-  commands, bounded online acceptance criteria and rollback instructions.
+  commands, bounded online acceptance criteria and rollback instructions. Native
+  D1 qualification passed all 31 migrations; the prior 28-entry schema matches
+  the observed live digest. The private package and plan-only operator review
+  are verified. Online qualification and fresh live reconciliation remain open;
+  the owner subsequently authorized the end-to-end staged rollout below.
 
 The readout will retain these identifiers and distinguish implemented, focused
 tests passed, full local qualification, and ready for online migration. A passing
 partial experiment does not mark its whole checklist item complete.
+
+## Running checklist: online qualification and production rollout
+
+The owner authorized proceeding end to end after reviewing the local candidate
+and staged migration proposal. Online testing started with candidate `4ac0b999`;
+online correction uncovered a cache uniqueness collision and stale closed-model
+publication after a v1.2 change. Bounded cache retirement passed live recovery;
+exact publication dependency validation is corrected in `9a590a4a`. Its fresh
+isolated online comparison passed at 12:03 UTC; its full owning gate and retained package passed at 12:50 UTC. The existing working tree remains preserved. No eligibility-policy change or
+public website release is part of this rollout.
+
+- [x] **M0 — Refresh production:** at 2026-09-29 02:21 UTC the three scheduled
+  Worker versions and 28-entry analytics schema still matched the package.
+  Database size was 1,096,814,592 bytes. No new migrations or controls were active.
+- [x] **M1 — Isolated online comparison:** fresh candidate `9a590a4a` passed
+  complete daily, price, scalar, model and cache parity through cold/warm work,
+  correction, publisher convergence, replay and physical erasure on separate
+  synthetic resources. The single-pass run completed at 12:03 UTC with no failed
+  statements and a maximum of 918 statements per invocation, below 950.
+  Unequal historical work prevents claiming an overall speedup from its totals.
+- [x] **M2 — Guarded scheduled deployment:** qualified a journaled three-role
+  procedure with pinned modules, preserved live configuration, exact version
+  readback and uncertain-response recovery. The public-site wrapper does not
+  accept these scheduled Worker entrypoints. Independent review, 25 local
+  recovery/refusal tests and live read-only provider checks passed, including
+  exact verification of provider settings changes after an owned upload.
+- [x] **M2a — Final corrected releases:** exact analytics `9a590a4a` passed
+  the complete owning gate at 12:50 UTC (191 files / 2,365 tests and both dry
+  builds), followed by native schema qualification and retained package review.
+  Public erasure backport `de675230` passed its owning gate (1,998 tests and both
+  dry builds), with the unchanged 38-file website manifest verified.
+- [x] **M3 — Production migration:** fresh identity/schema/recovery/lock checks
+  passed; the maintained operator applied exactly 0030–0032 and verified each
+  schema and ledger transition, completing at 12:52 UTC.
+- [x] **M4 — Disabled deployment:** all three pinned bundles deployed and
+  verified at 13:12 UTC with new controls disabled. Public erasure backport
+  `de675230` deployed and verified at 13:17 UTC, preserving the exact website
+  manifest. Missing-trigger completion refusal passed local regressions; no
+  real-owner erasure was performed.
+- [x] **M4a — Unblock authority delivery:** publication activation exposed a
+  pending owner activation whose historical delivery keeps the public authority
+  epoch behind. Candidate `e0bd9b9f` gives that verified condition a bounded
+  45-second ordinary-minute delivery slice, preserving the 950-statement meter
+  and tenth-minute graph window. Independent review, 26 focused tests and the
+  full owning gate passed (191 files / 2,375 tests, type/script checks and both
+  dry builds). Native schema qualification and retained artifacts passed;
+  all three scheduled Workers deployed and verified at 14:18 UTC. The first
+  expanded pass completed three delivery steps without an exception. At
+  15:00:53 UTC, delivery was complete: source and target both held sequence
+  27662 / authority epoch 24033, with no pending event or building projection.
+- [x] **M5 — Staged activation:** shared publication, cache, graph preparation
+  and model batches are enabled on exact `e0bd9b9f`; final live role/version,
+  flag and schedule verification passed at 15:30 UTC. Live adoption and
+  performance boundaries are recorded below rather than inferred from flags.
+  - [x] Shared publication: at 15:03 UTC, two shared feature days and two new
+    daily publications were complete; the queue advanced and public health/daily
+    endpoints returned HTTP 200. Isolated all-family parity and erasure proof
+    remain the controlled comparison; live output correlation is not provenance.
+  - [x] Shared cache: deployed at 15:04 UTC and completed its first natural-run
+    cache mark at 15:23 UTC, after durable lookback preparation. That selected
+    historical input was empty; nonempty production throughput remains unproved.
+  - [x] Shared graph preparation enabled at 15:24 UTC. At 15:27 UTC all 69
+    historical publications in the active window validated, and all three
+    effective owners had today's scalar/model results with no pending selection.
+  - [x] Durable model batches enabled at 15:28 UTC. No unfinished historical
+    model date was eligible; new production block computation/adoption remains
+    unexercised. The isolated online run holds the controlled adoption proof.
+- [x] **M6 — Production readout:** the 15:30 UTC snapshot recorded 30 newly
+  published daily dates, 123 dates still queued, 41 completed feature days,
+  one refreshed model day and a current graph preview. Public HTTP checks
+  passed; delivery remained caught up. Exact role identities, costs, limitations
+  and the forward-safe disable procedure are retained in the rollout receipt.
+
+**Remaining measurement checklist:**
+
+- [ ] Measure nonempty production cache throughput; the first completed live
+  shared-cache result covered an empty historical day.
+- [ ] Observe a newly eligible shared graph calculation and durable model block
+  through publication. Existing valid results are reused when controls change;
+  enabling them does not create artificial recalculation work.
+- [ ] Qualify the separate all-format ingestion transition below. Current
+  activation does not move v1/v1.1-only owners onto the effective reader.
+- [ ] Establish a comparable production performance baseline. Neither the
+  delivery recovery samples nor the isolated unequal cold workloads prove an
+  overall 10–100× improvement.
+
+### Completion of remaining items — authorized September 29
+
+Read-only refresh at 15:49 UTC: 50 daily publications completed since delivery
+recovery, 103 queued days, 67 complete shared feature days and 14 complete
+effective cache marks. The previously qualified `e0bd9b9f` package and deployed
+version receipt remain immutable. The next candidate is still local.
+
+The owner requested completion of all recommended items after the first
+production rollout. This includes the cache follow-up identified in the receipt.
+Keep the prior deployment evidence intact while qualifying this next increment.
+
+- [x] **N0 — Refresh and pin:** capture current live progress and preserve the
+  qualified `e0bd9b9f` fallback, public writer identity and existing dirty work.
+- [ ] **N1 — Cache efficiency:** avoid repeated eight-day validation and
+  unnecessary reconstruction for exact-current empty inputs; prove nonempty,
+  empty, late correction and erasure parity under actual scheduler budgets.
+- [ ] **N2 — All-format transition:** implement a guarded, resumable operator
+  and qualify the deployed writer, effective reader, rollback target,
+  correction retention, predecessor closure, erasure and restore together.
+- [ ] **N3 — Comparable online measurement:** compare identical completed
+  outputs and input ranges through cold, warm and correction work; retain
+  statements, rows, elapsed time and complete publication/adoption evidence.
+- [ ] **N4 — Qualify the release:** integrate the scoped changes into a clean
+  candidate, run the full owning gate and rehearse the exact online operation.
+- [ ] **N5 — Production completion:** deploy the qualified increment, perform
+  the qualified all-format transition, and verify nonempty cache/shared graph
+  and model-batch work through the existing publisher.
+- [ ] **N6 — Final readout:** reconcile all remaining checks with observed
+  results, record measured gains and unresolved limitations, and retain the
+  exact forward-safe recovery artifacts.
+
+The separate website deployment released the production coordination lock.
+Its availability is rechecked before each operation. Progress and evidence are
+recorded in the [online rollout receipt](../receipts/2026-09-29-shared-analytics-online-rollout.md).
+
+**Remaining all-format cutover boundary:** the shared reader supports v1, v1.1
+and v1.2, but current production owner selection routes v1/v1.1-only owners to
+their existing paths while the correction runtime is inactive. Activating that
+runtime changes upload admission, retained correction facts and predecessor
+closure, and cannot be reversed to staged state. It therefore needs separate
+writer, rollback-target, erasure/restore and occurrence-reader qualification.
+Completing M5 does not by itself establish an all-format ingestion cutover.
 
 ## Purpose and decision boundary
 
@@ -66,95 +200,75 @@ with freedom to replace the intermediate pipeline. It targets substantially less
 work per accepted change and faster completion of historical calculations.
 **Tenfold improvement is an experiment target; 100-fold improvement is a stretch
 hypothesis for workloads dominated by repeated acquisition. Neither is proven.**
-This document proposes work; it does not implement or authorize a deployment.
+The target design and local delivery record are separate from deployment
+authorization. The checklists above distinguish local qualification, deployed
+controls and remaining production measurement.
 
 The [artifact catalog](../research/2026-09-28-analytics-artifact-catalog.md)
 describes the existing system. Source findings here use analytics candidate
 `23575017c61d7b83093227d71e09096e50cf7bd1`. Its
 [production receipt](../receipts/2026-09-28-effective-usage-throughput.md)
-is a dated deployment observation, not a fresh production audit. The separate
-daily publisher was last recorded at `ba7f00b28a32cc839f420db32dec7009b31e884b`.
+is a dated deployment observation, not a fresh production audit. The latest
+deployment is recorded in the September 29 rollout checklist and receipt above.
 The [production runbook](../runbooks/production-operations.md) remains the
 operational authority.
 
 ## Implementation and rollout checkpoint
 
-Read-only production verification at **2026-09-28 22:39:40 UTC** confirmed
-analytics source `75a9b7efb260b062a25a90807886b7c984670a97`, version
-`d96c6ce2-c8a6-41c7-9717-c570020ba6e3`, at 100%. Effective folding is enabled,
-the every-minute schedule is intact, and the temporary delivery boost is absent.
-The analytics migration ledger contains 0028 and 0029, but neither 0030 nor 0031.
-This agrees with the [last deployment receipt](../receipts/2026-09-28-effective-model-publication.md).
-The same observation found 114 daily dates queued, oldest June 7, and 70 stored
-model-day publications through September 28. Existing publications do not prove
-that the new algorithm ran or establish a throughput multiplier.
+Production readback at **2026-09-29 15:30 UTC** verified all three scheduled
+roles on `e0bd9b9f`, with shared features enabled and model blocks enabled on
+analytics. The live ledger now contains 31 qualified migrations: 0001–0026 and
+0028–0032; 0027 remains excluded. Exact versions, activation times, natural-run
+results and unexercised boundaries are in the
+[online rollout receipt](../receipts/2026-09-29-shared-analytics-online-rollout.md).
 
 | Component | Local integration | Online / production integration |
 |---|---|---|
-| Effective quota-day and model usage-day reuse, checkpoint improvements, matching model publication method | Committed in the separate analytics release checkout | Deployed and active; these are improvements to the existing pipeline |
-| Shared acquisition/reducers for activity/API value, scalar fits, model fits and cache continuity | Synthetic all-family parity experiment; transient features; no production entrypoint imports | Not deployed |
-| Durable model-date blocks, batched dependencies, clipped ranges, bounded retirement and native publication bridge | Integrated through local scheduling and publication behind default-off `modelBlocks`; migrations 0030/0031; uncommitted working-tree candidate | No isolated online qualification or production activation |
-| Durable common features and incremental contribution replacement across every output family | Partial foundations; daily/scalar/cache processing has not been replaced by this experiment | Not deployed |
-| Object-backed analytical features, batch/container execution and concurrency 1/2/4/8 | Planned experiments | No redesign implementation or qualification |
+| Effective quota/model day reuse and matching model publication method | Committed in the production-based release checkout | Deployed and active in the existing analytics pipeline |
+| Durable model-date blocks, clipped ranges, bounded retirement and native publisher adoption | Integrated through the scheduler; migrations 0030/0031 | Isolated correction/replay/erasure and adoption passed; deployed and enabled on `e0bd9b9f`, awaiting newly eligible production work |
+| Durable shared features for daily counts/API value, scalar/model fits and cache continuity | Integrated through all three scheduled consumers; migration 0032 | Deployed and enabled; daily publication and empty-history cache completion observed; new shared graph work and nonempty throughput remain unexercised |
+| Clean release candidate and all-family qualification | `e0bd9b9f` passed the owning gate, 2,375 tests, dry builds and native schema/package qualification | Online parity passed on parent `9a590a4a`; the two-file scheduling follow-up deployed and completed production delivery recovery |
+| Object-backed features, containers and concurrency 1/2/4/8 | Planned experiments | No redesign implementation or qualification |
 
-The [latest paired publication experiment](../receipts/2026-09-28-model-block-edges.md)
-produces identical complete 70-date model outputs with 5.48 times fewer cold
-statements and 6.23 times fewer correction statements; unchanged replay is equal.
-It excludes fair scheduling/claim overhead, source admission, erasure cost, CPU
-and peak memory. These are model-history measurements, not whole-system or
-production speedups. All 2,327 Worker tests passed on the recorded 666-file
-snapshot; this checkpoint rechecked every recorded file hash without finding
-changes. The complete command still stops before bundling because release asset
-staging requires a clean committed tree. The candidate has no qualified deployment
-artifact yet.
+The requested local milestones L0–L9 are complete as of **2026-09-29 01:51 UTC**.
+Candidate `4ac0b999` is committed locally on `codex/analytics-shared-qualified-local`;
+it has not been pushed or merged into the main branch. The detailed local
+receipt is [durable shared analytics qualification](../receipts/2026-09-28-durable-shared-analytics-local.md).
+Earlier experiment receipts below remain point-in-time measurements of their
+named workloads; the table above records the September 29 deployed state.
 
-### Next experiment and route to production
+### Completed rollout sequence and next measurements
 
-1. **Complete work while inputs keep arriving.** Drive the real scheduler and
-   publisher with identical native/candidate mixed-version inputs. Append new
-   evidence from the same contributor outside an unfinished block's entire
-   dependency range between resumptions. Verify that exact dependencies remain
-   unchanged, then measure completed publications, retained/restarted work,
-   retirement, all statements and bytes. Include dense and skewed contributors,
-   latency injection, correction inside the range, erasure, interrupted saves and
-   UTC rollover. A changed contributor revision is part of today's job identity;
-   repeated restart is a risk to measure, not an established production defect.
-2. **Use the production execution envelope.** The entrypoint supplies a
-   55-second ordinary window or an eight-minute every-tenth-minute window, with
-   delivery taking up to ten seconds and sharing the same 950-statement meter.
-   Also test the lower-level 20-second default as a constrained case. The existing
-   scheduler edge tests use 60 seconds; the direct runner's 20-second proof is a
-   different gate. Include fair selection, claims and publication costs here.
-3. **Assemble one releasable candidate.** Reconcile the clean production-based
-   release checkout with relevant upstream changes, isolate the reviewed delta,
-   commit it, and run the owning gates and analytics-only artifact build. Add an
-   explicit deployment switch and useful completion/restart/capacity counters;
-   the current boolean is only an internal opt-in. Rehearse 0030/0031 against the
-   exact populated production schema and ledger, whose baseline omits 0027.
-4. **Qualify online in isolation.** After exact environment authorization, use
-   separate candidate resources and synthetic admitted inputs. Compare complete
-   published outputs and measure real D1 latency, CPU, retained storage, retries,
-   erasure cost and recovery. Start at one worker. Then qualify a bounded private
-   production shadow, including erasure of its derived state, before permitting
-   public writes. A quiet successful scheduler does not measure useful work.
-5. **Canary historical model outputs.** Apply the rehearsed forward migrations
-   and deploy the disabled artifact as separate approved operations. Enable a
-   bounded set of historical date blocks under the existing single-writer
-   coordination and native publication contract. Compare complete cohorts, keep
-   today on its native path, and expand only after actual work demonstrates the
-   gain. Switch back to current native computation on failure; retain the forward
-   schema and enforce current erasure/source authority on fallback.
-6. **Expand the redesign by output family.** Profile the separate daily publisher
-   next, then move its activity/API-value work and scalar/cache preparation onto
-   shared durable features. Test object storage against D1 using the same reducers,
-   and only then test independent partitions at concurrency 1/2/4/8. Replace
-   contributor-sized job boundaries with bounded evidence partitions as part of
-   that work. Retire redundant old lanes only after parity, measured total cost
-   and recovery are established for their replacements.
+The owner changed the sequence to finish both durable blocks and shared
+features locally first. The model-only canary recommendation is superseded.
 
-This sequence promotes a useful model-history improvement first. The original
-all-family, 10-times efficiency target remains open; R2/containers and parallel
-execution are further experiments, not requirements for the first canary.
+1. **Local candidate and recovery package (L8/L9): complete.** The owning Worker
+   gate, dependency/documentation checks, three scheduled Worker builds,
+   populated preservation/interruption rehearsal and native D1 qualification
+   passed. The package retains qualified migration bytes, disabled controls,
+   passing logs, a plan-only migration review and recovery instructions.
+2. **Isolated online qualification: complete.** Synthetic admitted mixed-version
+   inputs passed complete published parity, replay, correction and erasure on
+   separate candidate resources. Statements, rows and elapsed time were retained;
+   Worker CPU was not measured. Unequal cold-history work prevents an overall
+   speedup claim.
+3. **Migration and disabled deployment: complete.** The guarded operator applied
+   only 0030–0032, verified schema/ledger transitions, and deployed all three
+   roles while preserving bindings, schedules, secrets and existing controls.
+4. **Staged controls: enabled.** Shared publication and cache have completed live
+   work. Graph/model controls are enabled, with no unfinished effective graph
+   or historical model date in the checked window. Their next natural adoption
+   remains a production qualification step, not proof supplied by an idle run.
+5. **Next: expand only from measured gains.** Keep the qualified fallback available
+   while proving cold history, warm refresh and accepted corrections live.
+   Disabling the new controls selects the existing calculation paths; migrations
+   stay forward and erasure support must remain. Only after this qualification
+   compare R2/object files and independent partitions at concurrency 1/2/4/8.
+
+The local synthetic suite proves correctness and bounded progress for the named
+fixtures. A tenfold whole-pipeline gain remains an experimental target. More
+parallel workers, container execution and event-level delta reducers are further
+optimizations, not claims made by the current candidate.
 
 ## Recommendation
 

@@ -1,6 +1,8 @@
 import type { StorageAnalyticsBindings } from "./analytics-delivery";
 import { ApiError } from "./errors";
 import { hasTelemetryV12ChunkTable } from "./telemetry-v12-table";
+import { readStorageCommunityCorrectionState } from './storage-community-authority';
+import { STORAGE_DAILY_PENDING_DAYS_SQL } from './storage-community-daily';
 
 const MAX_ADMIN_AGGREGATE_ROWS = 10_000;
 
@@ -111,6 +113,8 @@ export async function readStorageAdminOverview(
   };
 }> {
   if (!Number.isFinite(nowEpoch)) throw unavailable();
+  let correctionState:'staged'|'active';
+  try{correctionState=await readStorageCommunityCorrectionState(bindings.source);}catch{throw unavailable();}
   const since = new Date(nowEpoch - 24 * 60 * 60 * 1_000).toISOString();
   const sinceWeek = new Date(nowEpoch - 7 * 24 * 60 * 60 * 1_000).toISOString();
   const sinceMonth = new Date(nowEpoch - 30 * 24 * 60 * 60 * 1_000).toISOString();
@@ -220,10 +224,9 @@ export async function readStorageAdminOverview(
     ).bind(bindings.sourceId).first<{ day: string; released_at: string }>(),
     bindings.target.prepare(
       `SELECT COUNT(*) AS total FROM (
-         SELECT 1 FROM analytics_community_daily_queue
-          WHERE source_id=? ORDER BY day LIMIT ?
+         SELECT day FROM (${STORAGE_DAILY_PENDING_DAYS_SQL}) ORDER BY day LIMIT ?3
        )`,
-    ).bind(bindings.sourceId, MAX_ADMIN_AGGREGATE_ROWS + 1).first<CountRow>(),
+    ).bind(bindings.sourceId, correctionState, MAX_ADMIN_AGGREGATE_ROWS + 1).first<CountRow>(),
     bindings.target.prepare(
       `SELECT COUNT(*) AS published_days, MAX(day) AS latest_evidence_day,
               MAX(computed_ms) AS latest_computed_ms

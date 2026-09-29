@@ -16,6 +16,8 @@ import {
   parseTelemetryRuntimeReconciliationArguments,
   runProtectedTelemetryRuntimeActivation,
   TELEMETRY_RUNTIME_RECONCILIATION_SCHEMA,
+  USAGE_CORRECTION_READINESS_SCHEMA,
+  validateUsageCorrectionReadiness,
 } from "./telemetry-runtime-reconciliation.mjs";
 import { TYPED_PRODUCTION_QUERIES } from "./production-typed-preflight.mjs";
 
@@ -126,6 +128,24 @@ test("requires the maintained activation operator arguments", () => {
     "--operation-directory": "/private/tmp/activation-operation",
     "--request-file": "/private/tmp/activation-request.json",
     resume: false,
+  });
+});
+
+test("accepts only absolute correction-readiness paths and a digest pin", () => {
+  const base = ["--account-id", ACCOUNT, "--worker-name", WORKER,
+    "--repository-root", "/private/tmp/checkout",
+    "--operation-directory", "/private/tmp/activation-operation",
+    "--request-file", "/private/tmp/activation-request.json"];
+  const parsed = parseTelemetryRuntimeActivationOperatorArguments([
+    ...base, "--correction-readiness-file", "/private/tmp/correction-readiness.json",
+    "--approved-correction-readiness-sha256", "a".repeat(64),
+  ]);
+  assert.equal(parsed["--correction-readiness-file"], "/private/tmp/correction-readiness.json");
+  for (const extra of [
+    ["--correction-readiness-file", "relative.json"],
+    ["--approved-correction-readiness-sha256", "not-a-digest"],
+  ]) assert.throws(() => parseTelemetryRuntimeActivationOperatorArguments([...base, ...extra]), {
+    code: "TELEMETRY_RUNTIME_RECONCILIATION_ARGUMENTS_INVALID",
   });
 });
 
@@ -320,6 +340,29 @@ function activationRequest(proof, idempotencyKey = "44444444-4444-4444-8444-4444
   };
 }
 
+function correctionRequest(proof, idempotencyKey = "77777777-7777-4777-8777-777777777777") {
+  return { action: "run_maintenance", telemetryRuntimeActivation: {
+    target: "usage_correction", expectedRevision: 0,
+    confirmation: "activate_telemetry_usage_correction_runtime",
+    idempotencyKey, reconciliation: proof,
+  } };
+}
+
+function correctionReadiness(proof) {
+  const unsigned = {
+    schema: USAGE_CORRECTION_READINESS_SCHEMA,
+    sourceCommit: proof.sourceCommit,
+    versionId: proof.versionId,
+    configSha256: proof.configSha256,
+    writerGateSha256: "1".repeat(64),
+    onlineGateSha256: "2".repeat(64),
+    erasureGateSha256: "3".repeat(64),
+    restoreGateSha256: "4".repeat(64),
+    rollbackDisposition: "forward-fix-only",
+  };
+  return { ...unsigned, readinessSha256: identityDigest(unsigned) };
+}
+
 function adminSession() {
   return {
     schema: "telemetry-runtime-admin-session-v1",
@@ -405,6 +448,129 @@ function liveProvider(...inventories) {
     capture: async () => inventories[Math.min(index++, inventories.length - 1)],
   };
 }
+
+test("correction readiness pins the exact deployed writer and reviewed evidence", async () => {
+  const captured = await runFixture();
+  try {
+    const readiness = correctionReadiness(captured.proof);
+    assert.deepEqual(validateUsageCorrectionReadiness(
+      readiness, captured.proof, readiness.readinessSha256,
+    ), readiness);
+    for (const changed of [
+      { ...readiness, sourceCommit: "d".repeat(40) },
+      { ...readiness, onlineGateSha256: "5".repeat(64) },
+      { ...readiness, rollbackDisposition: "restore-old-writer" },
+    ]) {
+      assert.throws(() => validateUsageCorrectionReadiness(
+        changed, captured.proof, readiness.readinessSha256,
+      ), { code: "TELEMETRY_RUNTIME_RECONCILIATION_CORRECTION_READINESS_INVALID" });
+    }
+    assert.throws(() => validateUsageCorrectionReadiness(
+      readiness, captured.proof, "0".repeat(64),
+    ), { code: "TELEMETRY_RUNTIME_RECONCILIATION_CORRECTION_READINESS_INVALID" });
+    const request = correctionRequest(captured.proof);
+    const operation = operationHarness(), lock = lockHarness();
+    let posts = 0;
+    await assert.rejects(runProtectedTelemetryRuntimeActivation({
+      accountId: ACCOUNT, workerName: WORKER,
+      repositoryRoot: "/private/tmp/synthetic-checkout",
+      operationDirectory: "/private/tmp/synthetic-operation",
+      request, session: adminSession(), provider: liveProvider(inventory()),
+      lockFactory: () => lock, operationFactory: operation.factory,
+      postAdmin: async () => { posts += 1; return resultFor(request); },
+    }), { code: "TELEMETRY_RUNTIME_RECONCILIATION_CORRECTION_READINESS_INVALID" });
+    assert.equal(operation.state.status, undefined);
+    assert.equal(lock.owner, null);
+    assert.equal(posts, 0);
+  } finally { await captured.cleanup(); }
+});
+
+test("correction lost response reconciles only its own terminal audit and retains ambiguous lock", async () => {
+  const captured = await runFixture();
+  const request = correctionRequest(captured.proof);
+  const readiness = correctionReadiness(captured.proof);
+  const operation = operationHarness(), lock = lockHarness();
+  const base = {
+    accountId: ACCOUNT, workerName: WORKER,
+    repositoryRoot: "/private/tmp/synthetic-checkout",
+    operationDirectory: "/private/tmp/synthetic-operation",
+    request, correctionReadiness: readiness,
+    approvedCorrectionReadinessSha256: readiness.readinessSha256,
+    session: adminSession(), provider: liveProvider(inventory()),
+    lockFactory: () => lock, operationFactory: operation.factory,
+  };
+  try {
+    await assert.rejects(runProtectedTelemetryRuntimeActivation({
+      ...base, postAdmin: async () => { throw new Error("lost response"); },
+    }), { code: "TELEMETRY_RUNTIME_RECONCILIATION_ACTIVATION_RESULT_UNCERTAIN" });
+    assert.equal(operation.state.status, "admin_intent");
+    assert.notEqual(lock.owner, null);
+    const activation = request.telemetryRuntimeActivation;
+    const details = {
+      schemaVersion: "telemetry-runtime-activation-v1", task: "telemetry_runtime_activation",
+      idempotencyKey: activation.idempotencyKey, target: activation.target,
+      expectedRevision: activation.expectedRevision, reconciliation: activation.reconciliation,
+      fromRevision: 0, toRevision: 1, state: "active",
+    };
+    let reads = 0;
+    const reconcile = async (auditOperationId) => runProtectedTelemetryRuntimeActivation({
+      ...base, resume: true, reconcileOnly: true, session: null,
+      postAdmin: async () => assert.fail("reconcile must never POST"),
+      environment: { CLOUDFLARE_API_TOKEN: "synthetic-provider-token" },
+      fetchImpl: async (url, options) => {
+        reads += 1;
+        assert.match(url, new RegExp(`/accounts/${ACCOUNT}/d1/database/${PRIMARY}/query$`));
+        const body = JSON.parse(options.body);
+        assert.match(body.sql, /telemetry_usage_correction_runtime/u);
+        assert.deepEqual(body.params, [activation.idempotencyKey]);
+        return Response.json({ success: true, result: [{ success: true, results: [{
+          audit_action: "run_maintenance", audit_details_json: JSON.stringify(details),
+          audit_operation_id: auditOperationId, audit_outcome: "success",
+          runtime_policy_revision: 1, runtime_state: "active",
+        }] }] });
+      },
+    });
+    await assert.rejects(reconcile("88888888-8888-4888-8888-888888888888"), {
+      code: "TELEMETRY_RUNTIME_RECONCILIATION_ACTIVATION_RECONCILE_REQUIRED",
+    });
+    assert.equal(operation.state.status, "admin_intent");
+    assert.notEqual(lock.owner, null);
+    assert.deepEqual(await reconcile(activation.idempotencyKey), resultFor(request));
+    assert.equal(reads, 2);
+    assert.equal(operation.state.status, "completed");
+    assert.equal(lock.owner, null);
+  } finally { await captured.cleanup(); }
+});
+
+test("correction browser handoff pins readiness before owner action", async () => {
+  const captured = await runFixture();
+  const request = correctionRequest(captured.proof);
+  const readiness = correctionReadiness(captured.proof);
+  const operation = operationHarness(), lock = lockHarness();
+  const base = {
+    accountId: ACCOUNT, workerName: WORKER,
+    repositoryRoot: "/private/tmp/synthetic-checkout",
+    operationDirectory: "/private/tmp/synthetic-operation",
+    request, correctionReadiness: readiness,
+    approvedCorrectionReadinessSha256: readiness.readinessSha256,
+    session: null, transport: "browser", provider: liveProvider(inventory()),
+    lockFactory: () => lock, operationFactory: operation.factory,
+    postAdmin: async () => assert.fail("browser arm must never POST"),
+  };
+  try {
+    const armed = await runProtectedTelemetryRuntimeActivation(base);
+    assert.equal(armed.status, "action_required");
+    assert.equal(armed.target, "usage_correction");
+    assert.equal(armed.expectedRevision, 0);
+    assert.equal(operation.state.status, "browser_action_required");
+    assert.notEqual(lock.owner, null);
+    await assert.rejects(runProtectedTelemetryRuntimeActivation({
+      ...base, resume: true, approvedCorrectionReadinessSha256: "0".repeat(64),
+    }), { code: "TELEMETRY_RUNTIME_RECONCILIATION_CORRECTION_READINESS_INVALID" });
+    assert.equal(operation.state.status, "browser_action_required");
+    assert.notEqual(lock.owner, null);
+  } finally { await captured.cleanup(); }
+});
 
 async function protectedFixture({ versionId = VERSION, postAdmin, operation, lock, resume = false } = {}) {
   const captured = await runFixture();

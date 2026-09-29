@@ -176,7 +176,8 @@ it("refuses invalid bounds and cancellation, and falls back after a batch row ov
   expect(cancelledAtBatch.queries.some(sql => sql.includes(marker))).toBe(false);
 
   const overflowing = observeD1(source, { rows(sql, original) {
-    return sql.includes(marker) ? Array(30_001).fill(original[0] ?? {}) : original;
+    return sql.includes(marker) ? [...original.filter(row=>row.family==='__correction_runtime__'),
+      ...Array(30_001).fill({family:'v1',target_day:days[0]})] : original;
   } });
   const fallback = await createEffectiveHistoryDayDependencyReader(overflowing.database, corpus.owner,
     namespace, days, { occurrenceLinks: "batched" });
@@ -187,8 +188,9 @@ it("refuses invalid bounds and cancellation, and falls back after a batch row ov
 
   const oversizedDigest = "b".repeat(4 * 1024 * 1024);
   const oversizedBytes = observeD1(source, { rows(sql, original) {
-    return sql.includes(marker) ? [{ ...(original[0] ?? {}), target_day: days[0],
-      source_digest: oversizedDigest }] : original;
+    return sql.includes(marker) ? [...original.filter(row=>row.family==='__correction_runtime__'),
+      {...(original.find(row=>row.family!=='__correction_runtime__') ?? {family:'v1'}),
+        target_day:days[0],source_digest:oversizedDigest}] : original;
   } });
   const byteFallback = await createEffectiveHistoryDayDependencyReader(oversizedBytes.database,
     corpus.owner, namespace, days, { occurrenceLinks: "batched" });
@@ -198,7 +200,9 @@ it("refuses invalid bounds and cancellation, and falls back after a batch row ov
   expect(oversizedBytes.queries.filter(sql => sql.includes(marker))).toHaveLength(1);
 
   const invalidTag = observeD1(source, { rows(sql, original) {
-    return sql.includes(marker) ? [{ ...(original[0] ?? {}), target_day: "2020-01-01" }] : original;
+    return sql.includes(marker) ? [...original.filter(row=>row.family==='__correction_runtime__'),
+      {...(original.find(row=>row.family!=='__correction_runtime__') ?? {family:'v1'}),
+        target_day:'2020-01-01'}] : original;
   } });
   const invalidReader = await createEffectiveHistoryDayDependencyReader(invalidTag.database,
     corpus.owner, namespace, days, { occurrenceLinks: "batched" });

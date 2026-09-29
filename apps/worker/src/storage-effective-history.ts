@@ -122,7 +122,10 @@ export function validEffectiveUsagePreparation(value:unknown,checkpoint:Pick<Sto
     &&preparation.rowsRead>=preparation.day.projection.usage.rowsRead;
 }
 export interface EffectiveHistoryDependency {
-  version: 'effective-history-dependency-v2'; participantId: string; fromDay: string; throughDay: string;
+  version: 'effective-history-dependency-v3'; participantId: string; fromDay: string; throughDay: string;
+  /** The correction-aware reader changes source selection at activation even
+   * when no owner revision or historical header changes. */
+  correctionRuntime: 'staged'|'active';
   /** The retained source streams represented by this identity. Session rows
    * are opt-in because usage/quota callers must keep their existing key. */
   streams: readonly ('quota'|'session'|'usage')[];
@@ -164,7 +167,9 @@ async function v12DependencySchema(source:D1Database):Promise<boolean>{
  * expansion without storing one dependency row per in-window record. */
 async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCommunityOwner,
   sourceNamespace:string,fromDay:string,throughDay:string,includeV12:boolean,includeSessions:boolean,
-  selectedDays?:readonly string[]):Promise<readonly Record<string,unknown>[]|undefined> {
+  selectedDays?:readonly string[]):Promise<{
+    rows:readonly Record<string,unknown>[];correctionRuntime:EffectiveHistoryDependency['correctionRuntime'];
+  }|undefined> {
   const batched=selectedDays!==undefined;
   const target=(alias='')=>batched?`${alias?`${alias}.`:''}target_day,`:'';
   const selectionScope=batched?'selection_scopes':'scope';
@@ -429,20 +434,44 @@ ${includeV12?batched?`      UNION
         'correction-day:'||source_day,NULL,NULL,NULL,NULL,
         history_fact_count,max_history_id,max_fact_id
         FROM correction_frontiers
+    ), fenced_headers AS (
+      SELECT ${target()}family,occurrence_id,source_day,record_day,observed_at_ms,source_key,source_digest,
+        canonical_digest,record_digest,base_digest,history_fact_count,max_history_id,max_fact_id
+        FROM outside_headers
+      UNION ALL
+      SELECT ${batched?'wanted.target_day,':''}'__correction_runtime__',NULL,NULL,NULL,NULL,NULL,
+        runtime.state,NULL,NULL,NULL,NULL,NULL,NULL
+        FROM telemetry_usage_correction_runtime runtime
+        ${batched?'CROSS JOIN selection_scopes wanted':''}
+       WHERE runtime.id=1 AND runtime.schema_version='telemetry-usage-correction-v1'
+         AND runtime.method_version='usage-total-correction-v1'
+         AND runtime.max_capture_rows BETWEEN 1 AND 200
+         AND runtime.max_history_page BETWEEN 1 AND 200
     )
     SELECT ${target()}family,occurrence_id,source_day,record_day,observed_at_ms,source_key,source_digest,canonical_digest,
       record_digest,base_digest,history_fact_count,max_history_id,max_fact_id
-      FROM outside_headers ORDER BY ${target()}family,source_day,source_key LIMIT ?`)
+      FROM fenced_headers ORDER BY ${target()}family,source_day,source_key LIMIT ?`)
     .bind(owner.ownerDigest,owner.participantId,sourceNamespace,fromDay,throughDay,
       Date.parse(`${fromDay}T00:00:00.000Z`),Date.parse(`${throughDay}T00:00:00.000Z`)+DAY_MS,
       ...(selectedDays?[JSON.stringify(selectedDays.map(day=>[day,Date.parse(day),Date.parse(day)+DAY_MS]))]:[]),
-      MAX_EFFECTIVE_DEPENDENCY_ROWS+1).all<Record<string,unknown>>()).results;
+      MAX_EFFECTIVE_DEPENDENCY_ROWS+(selectedDays?.length??1)+1).all<Record<string,unknown>>()).results;
+  const runtimeRows=rows.filter(row=>row.family==='__correction_runtime__');
+  const expectedDays=selectedDays??[fromDay];
+  if(batched&&rows.length>MAX_EFFECTIVE_DEPENDENCY_ROWS
+    &&runtimeRows.length<expectedDays.length)return undefined;
+  if(runtimeRows.length!==expectedDays.length || runtimeRows.some((row,index)=>
+    (row.source_digest!=='staged'&&row.source_digest!=='active')
+      ||(batched&&row.target_day!==expectedDays[index])
+      ||(!batched&&'target_day' in row)))throw fail();
+  const correctionRuntime=runtimeRows[0]!.source_digest as EffectiveHistoryDependency['correctionRuntime'];
+  if(runtimeRows.some(row=>row.source_digest!==correctionRuntime))throw fail();
+  const links=rows.filter(row=>row.family!=='__correction_runtime__');
   // The aggregate is optional: a batch too large for one bounded result must
   // not make an otherwise valid singleton dependency unavailable.
-  if(batched&&(rows.length>MAX_EFFECTIVE_DEPENDENCY_ROWS
-    ||bytes(canonicalJson(rows))>MAX_EFFECTIVE_DEPENDENCY_BYTES))return undefined;
-  if(rows.length>MAX_EFFECTIVE_DEPENDENCY_ROWS)throw fail();
-  return dependencyRows(rows);
+  if(batched&&(links.length>MAX_EFFECTIVE_DEPENDENCY_ROWS
+    ||bytes(canonicalJson(links))>MAX_EFFECTIVE_DEPENDENCY_BYTES))return undefined;
+  if(links.length>MAX_EFFECTIVE_DEPENDENCY_ROWS)throw fail();
+  return {rows:dependencyRows(links),correctionRuntime};
 }
 
 function validateDependencyScope(owner:StorageCommunityOwner,sourceNamespace:string,fromDay:string,throughDay:string):void {
@@ -451,8 +480,23 @@ function validateDependencyScope(owner:StorageCommunityOwner,sourceNamespace:str
     ||!owner.ownerDigest||!/^[a-f0-9]{64}$/u.test(owner.ownerDigest)
     ||typeof sourceNamespace!=='string'||sourceNamespace.length<1||sourceNamespace.length>256)throw fail();
 }
-type EffectiveHistoryHeaders=Pick<EffectiveHistoryDependency,'v1'|'v11'|'v12'|'corrections'>;
+type EffectiveHistoryHeaders=Pick<EffectiveHistoryDependency,'correctionRuntime'|'v1'|'v11'|'v12'|'corrections'>;
 interface EffectiveHistoryHeaderSnapshot extends EffectiveHistoryHeaders { v12Available:boolean }
+
+async function readCorrectionRuntime(source:D1Database):Promise<EffectiveHistoryDependency['correctionRuntime']>{
+  const result=await source.prepare(`SELECT id,schema_version,method_version,state,
+      max_capture_rows,max_history_page FROM telemetry_usage_correction_runtime LIMIT 2`)
+    .all<{id:number;schema_version:string;method_version:string;state:string;
+      max_capture_rows:number;max_history_page:number}>();
+  if(result.success!==true||!Array.isArray(result.results)||result.results.length!==1)throw fail();
+  const row=result.results[0]!;
+  if(row.id!==1||row.schema_version!=='telemetry-usage-correction-v1'
+    ||row.method_version!=='usage-total-correction-v1'
+    ||(row.state!=='staged'&&row.state!=='active')
+    ||!Number.isSafeInteger(row.max_capture_rows)||row.max_capture_rows<1||row.max_capture_rows>200
+    ||!Number.isSafeInteger(row.max_history_page)||row.max_history_page<1||row.max_history_page>200)throw fail();
+  return row.state;
+}
 
 /** The same header queries serve the authoritative window reader and the
  * optional multi-day snapshot. The latter shares one aggregate bound across
@@ -564,14 +608,17 @@ async function readEffectiveHistoryHeaders(source:D1Database,owner:StorageCommun
     .bind(owner.participantId,owner.ownerDigest,fromMs,throughExclusive,Math.min(102,rowLimit()))
     .all<Record<string, unknown>>()).results;
   if(!accept(corrections,101))return undefined;
-  return {v1,v11,v12,corrections,v12Available};
+  if(optionalAggregate&&canContinue?.()===false)return undefined;
+  const correctionRuntime=await readCorrectionRuntime(source);
+  return {v1,v11,v12,corrections,v12Available,correctionRuntime};
 }
 
 function assembleEffectiveHistoryDependency(owner:StorageCommunityOwner,fromDay:string,throughDay:string,
   includeSessions:boolean,headers:EffectiveHistoryHeaders,occurrenceLinks:readonly Record<string,unknown>[]):EffectiveHistoryDependency {
-  const {v1,v11,v12,corrections}=headers;
+  const {correctionRuntime,v1,v11,v12,corrections}=headers;
   const streams=Object.freeze((includeSessions?['quota','session','usage']:['quota','usage']) as ('quota'|'session'|'usage')[]);
-  const dependency={version:'effective-history-dependency-v2' as const,participantId:owner.participantId,
+  const dependency={version:'effective-history-dependency-v3' as const,participantId:owner.participantId,
+    correctionRuntime,
     fromDay,throughDay,streams,v1:dependencyRows(v1),v11:dependencyRows(v11),v12:dependencyRows(v12),
     corrections:dependencyRows(corrections),occurrenceLinks:dependencyRows(occurrenceLinks)};
   if(bytes(canonicalJson(dependency))>MAX_EFFECTIVE_DEPENDENCY_BYTES)throw fail();
@@ -595,7 +642,8 @@ export async function effectiveHistoryDependency(source:D1Database,owner:Storage
   if(!headers)throw fail();
   const occurrenceLinks=await effectiveHistoryOccurrenceLinks(source,owner,sourceNamespace,fromDay,throughDay,headers.v12Available,includeSessions);
   if(!occurrenceLinks)throw fail();
-  return assembleEffectiveHistoryDependency(owner,fromDay,throughDay,includeSessions,headers,occurrenceLinks);
+  if(occurrenceLinks.correctionRuntime!==headers.correctionRuntime)throw fail();
+  return assembleEffectiveHistoryDependency(owner,fromDay,throughDay,includeSessions,headers,occurrenceLinks.rows);
 }
 
 /** Share bounded immutable headers across selected days while preserving each
@@ -616,14 +664,14 @@ export async function createEffectiveHistoryDayDependencyReader(source:D1Databas
   const fromDay=days[0]??'1970-01-01',throughDay=days.at(-1)??fromDay;
   validateDependencyScope(owner,sourceNamespace,fromDay,throughDay);
   if(Date.parse(throughDay)-Date.parse(fromDay)>100*DAY_MS)throw fail();
+  if(options.canContinue?.()===false)return undefined;
+  if(days.length===0)return {readDigest:async()=>{throw fail();}};
   const includeSessions=options.includeSessions===true;
   const selected=new Map(days.map(day=>[day,{v1:[],v11:[],v12:[],corrections:[]} as {
     v1:Record<string,unknown>[];v11:Record<string,unknown>[];v12:Record<string,unknown>[];corrections:Record<string,unknown>[];
   }]));
-  if(options.canContinue?.()===false)return undefined;
-  const headers=days.length
-    ?await readEffectiveHistoryHeaders(source,owner,sourceNamespace,fromDay,throughDay,includeSessions,true,options.canContinue)
-    :{v1:[],v11:[],v12:[],corrections:[],v12Available:false};
+  const headers=await readEffectiveHistoryHeaders(source,owner,sourceNamespace,fromDay,throughDay,
+    includeSessions,true,options.canContinue);
   if(!headers)return undefined;
   for(const [family,column] of [['v1','chunk_day'],['v11','observed_day'],['v12','observed_day'],['corrections','event_day']] as const){
     for(const row of headers[family]){
@@ -645,6 +693,7 @@ export async function createEffectiveHistoryDayDependencyReader(source:D1Databas
     let links:readonly Record<string,unknown>[]|undefined;
     if(options.occurrenceLinks==='batched'){
       const index=Math.floor(selectedDays.indexOf(day)/EFFECTIVE_DEPENDENCY_BATCH_DAYS);
+      let loadedBlock=false;
       if(index!==blockIndex){
         // Retain only one bounded block. Concurrent calls are serialized below
         // so two block loads cannot transiently accumulate retained results.
@@ -655,26 +704,37 @@ export async function createEffectiveHistoryDayDependencyReader(source:D1Databas
             block[0]!,block.at(-1)!,v12Available,includeSessions,block);
           if(options.canContinue?.()===false)return undefined;
           if(rows){
+            if(rows.correctionRuntime!==headers.correctionRuntime)return undefined;
             const partition=new Map(block.map(targetDay=>[targetDay,[] as Record<string,unknown>[]]));
-            for(const row of rows){
+            for(const row of rows.rows){
               const {target_day:targetDay,...dependency}=row;
               if(typeof targetDay!=='string'||!partition.has(targetDay))throw fail();
               partition.get(targetDay)!.push(dependency);
             }
             blockLinks=new Map([...partition].map(([targetDay,values])=>[targetDay,dependencyRows(values)]));
             blockIndex=index;
+            loadedBlock=true;
           }else oversizedBlocks.add(index);
         }
       }
       links=blockLinks.get(day);
+      // A block can be read over several asynchronous consumer steps. The
+      // first day was fenced by its link query; later days must not reuse its
+      // staged identity after the one-way correction runtime activation.
+      if(links&&!loadedBlock&&headers.correctionRuntime==='staged'
+        &&await readCorrectionRuntime(source)!==headers.correctionRuntime)
+        return undefined;
     }
     if(!links){
       if(options.canContinue?.()===false)return undefined;
-      links=await effectiveHistoryOccurrenceLinks(source,owner,sourceNamespace,day,day,v12Available,includeSessions);
+      const snapshot=await effectiveHistoryOccurrenceLinks(source,owner,sourceNamespace,day,day,v12Available,includeSessions);
+      if(snapshot?.correctionRuntime!==headers.correctionRuntime)return undefined;
+      links=snapshot?.rows;
     }
     if(!links)throw fail();
     if(options.canContinue?.()===false)return undefined;
-    return sha256Hex(canonicalJson(assembleEffectiveHistoryDependency(owner,day,day,includeSessions,dayHeaders,links)));
+    return sha256Hex(canonicalJson(assembleEffectiveHistoryDependency(owner,day,day,includeSessions,
+      {...dayHeaders,correctionRuntime:headers.correctionRuntime},links)));
   };
   let pending:Promise<unknown>=Promise.resolve();
   return {readDigest(day:string){

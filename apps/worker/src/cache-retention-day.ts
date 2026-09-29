@@ -1508,7 +1508,11 @@ function createCacheRetentionSharedFeatureDayBuild(options: {
     const expected = new Map(carry.map(value => [value.day,value.manifestDigest]));
     expected.set(candidate.day,candidate.manifestDigest);
     const features = new Map<string, {cacheItems:readonly CacheRetentionItem[];cacheEventsRead:number}>();
-    for (const featureDay of [...cacheRetentionLookbackDays(candidate.day),candidate.day]) {
+    // Match the native reader's own-day-first rule. A complete current day
+    // without cache items has no session whose carry could affect its result.
+    // Preparing seven historical feature days in that case only consumes the
+    // shared invocation budget, even when those days have no source rows.
+    for (const featureDay of [candidate.day,...cacheRetentionLookbackDays(candidate.day)]) {
       if (options.now() >= budget.deadlineMs) throw new CacheRetentionDeferredError('deadline');
       const before = budget.remainingSharedQueries();
       let result: Awaited<ReturnType<typeof advanceSharedAnalyticsFeatureDay>>;
@@ -1532,15 +1536,18 @@ function createCacheRetentionSharedFeatureDayBuild(options: {
         throw new CacheRetentionRefusedError('owner_source_unavailable');
       }
       features.set(featureDay,result.value);
+      if (featureDay === candidate.day && result.value.cacheItems.length === 0) break;
     }
     const own = features.get(candidate.day)!;
     const sessions = new Set(own.cacheItems.map(item => item.sessionDigest));
     const tail = new Map<string,CacheRetentionEvent>();
-    for (const featureDay of cacheRetentionLookbackDays(candidate.day)) {
-      for (const item of features.get(featureDay)!.cacheItems) {
-        if (!sessions.has(item.sessionDigest)) continue;
-        if ('unreadable' in item) tail.delete(item.sessionDigest);
-        else tail.set(item.sessionDigest,item);
+    if (sessions.size > 0) {
+      for (const featureDay of cacheRetentionLookbackDays(candidate.day)) {
+        for (const item of features.get(featureDay)!.cacheItems) {
+          if (!sessions.has(item.sessionDigest)) continue;
+          if ('unreadable' in item) tail.delete(item.sessionDigest);
+          else tail.set(item.sessionDigest,item);
+        }
       }
     }
     // A source-only append after the first feature read may change an empty

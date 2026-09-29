@@ -545,8 +545,15 @@ records qualification and the remaining online gate.
 | `STORAGE_ANALYTICS_SHARED_FEATURES=enabled` | Analytics and publication Workers: shared daily, API-value, scalar and model inputs | Off |
 | `CACHE_RETENTION_SHARED_FEATURES=enabled` | Cache Worker: shared usage events and seven-day continuity inputs | Off |
 
-Admitted v1, v1.1 and v1.2 evidence uses the same effective reader. Shared
-features are keyed by source namespace, opaque owner, UTC day, exact dependency
+The shared feature path uses the effective reader for admitted v1, v1.1 and
+v1.2 evidence. Owner selection enters that path for an eligible retained v1.2
+domain, or for v1/v1.1 evidence when the separately qualified correction runtime
+is active. Enabling these performance controls does not activate that ingestion
+contract; with it inactive, v1/v1.1-only owners retain their existing paths.
+Correction-runtime activation changes admission and retained correction facts
+and is a separate, forward-only operation under the
+[occurrence-reader contract](../reference/system-architecture.md).
+Shared features are keyed by source namespace, opaque owner, UTC day, exact dependency
 digest and producer methods, including pricing registries. Owner metadata
 provides deduplication and authority fences. An unchanged day can be reused
 after an unrelated upload; a changed day or method receives a new value.
@@ -561,7 +568,9 @@ session identifiers. A pending source page retains only its admitted opaque
 pagination cursor, under the existing checkpoint privacy contract; completion
 removes it. Atomic head promotion prevents incomplete values from being read.
 Current source and target authority are checked before use. Erasure completion
-proves physical absence of feature heads and parts as well as existing outputs.
+proves physical absence of feature heads and parts, model heads/parts and owner
+model-policy rows as well as existing outputs. A partially installed schema
+fails closed; pre-feature schemas remain supported.
 
 The initial feature representation admits at most 6,000 source rows and 4 MiB
 per day; a complete scalar/model window admits at most 8 MiB. Capacity and
@@ -572,6 +581,18 @@ the existing 950-statement analytics invocation cap. Shared daily preparation
 uses a larger bounded slice while respecting the graph reserve and both the
 inner and outer statement meters. Publication and cache Workers retain their
 independent existing invocation caps.
+
+The analytics scheduler normally gives ordered delivery ten seconds and 175
+statements before public work. A verified public-authority epoch gap admits up
+to 850 delivery statements on ordinary minutes, ending by the earlier of 45
+seconds after isolate startup or the scheduled tick. Both metadata probes and
+delivery share the invocation's 950-statement cap. Missing or invalid probe
+metadata keeps the ordinary allowance; every tenth-minute graph window remains
+unchanged. After expanded delivery, public work requires completed delivery and
+at least 140 remaining statements. A slow in-flight query can overrun the
+cooperative deadline, so replay safety still depends on the durable cursor and
+receipt checks. Equal authority epochs do not prove all source updates delivered.
+Use the journal cursor and complete published outputs to assess recovery.
 
 Cleanup advances bounded cursor pages, preserves complete current-method
 features and active claims, removes obsolete method generations and abandoned
@@ -584,10 +605,119 @@ three Workers with these controls disabled, preserving the live configuration
 and previous serving payloads. Activate shared publication, cache, graph and
 finally model batches in measured stages; compare complete output identities,
 failure counts, queue drainage, statements and elapsed time at each stage.
+Before activation, inventory every deployed role bound to the target. Every
+Worker that can complete a typed erasure must have the new absence checks,
+including the analytics and publication schedulers. A separate preparer or
+JSON-mode public Worker does not acquire this responsibility merely because it
+shares a repository. Confirm actual bindings and call paths.
+
 Disabling the corresponding control restores the existing calculation path.
-Rollback does not reverse migrations or delete published data. Stop rollout on
+Keep the erasure-aware code when disabling work; do not restore an older writer
+that can attest completion without checking the new private tables. Rollback
+does not reverse migrations or delete published data. Stop rollout on
 output mismatch, recurring failure, stalled durable progress, or an erasure
 completion regression. Local throughput is not a production latency claim.
+
+## All-format correction activation
+
+The owner action `telemetryRuntimeActivation` accepts target `usage_correction`,
+expected revision `0`, confirmation `activate_telemetry_usage_correction_runtime`
+and a fresh deployment/schema reconciliation proof. The immutable runtime has
+no revision column: staged and active are represented by revisions 0 and 1.
+Only the exact owner audit operation attributes success. Activation and its
+terminal audit commit in one primary D1 transaction; retries reconcile that
+operation rather than infer success from an already-active runtime.
+
+Qualify the writer and null/known correction archive, v1.1 predecessor closure,
+effective reader, erasure and restore on the exact candidate before activation.
+The reconciliation operator requires a private
+`usage-correction-activation-readiness-v1` receipt with the deployed
+source/version/configuration and the reviewed writer, online, erasure and
+restore evidence digests. Pin its `readinessSha256` separately using
+`--approved-correction-readiness-sha256`. A receipt records reviewed evidence;
+its digest alone does not prove a test passed.
+
+Use the existing `telemetry-runtime-reconciliation.mjs` operator with
+`--mode browser-arm` for a same-origin authenticated Chrome handoff, or
+`--mode activate` with an owner-private admin session file. Both hold the
+production coordination lock and journal the exact request before the action.
+`--mode reconcile` reads the exact audit operation and releases the lock only
+on verified completion. Never manufacture owner audit records through D1 SQL.
+
+Correction state is a calculation-method stamp. Activation invalidates private
+reusable dependencies, daily owner methods and graph result eligibility, and
+schedules older daily/history publications for refresh. Last-good public
+snapshots remain visible until complete replacements publish; policy,
+collection and terminal privacy fences are unchanged. In-flight calculations
+must re-prove the method before publishing. The admin pending-day census
+includes method refreshes even when they have no ingestion queue entry.
+
+The transition is one-way. The recovery disposition is forward fix; retain
+correction-aware admission and erasure checks when disabling shared performance
+controls. Do not restore a writer that predates correction archival.
+
+## Scheduled analytics rollout operator
+
+`apps/worker/scripts/production-scheduled-analytics-deploy.mjs` guards the
+retained analytics, publication and cache bundles. Its private plan pins the
+candidate and predecessor commits, account and analytics database, complete
+schema and migration ledger, package manifest, Wrangler CLI, exact per-role
+bundle/configuration hashes, and each active predecessor version, bindings,
+settings and schedule. Every activation or fallback plan also pins the
+completed operation that deployed each current predecessor version and bundle.
+The command defaults to local plan validation:
+
+```sh
+node apps/worker/scripts/production-scheduled-analytics-deploy.mjs \
+  --plan "$PRIVATE_STAGE_PLAN" --package "$RETAINED_PACKAGE"
+```
+
+After reviewing that plan digest, an authorized operation adds `--execute
+--approved-plan-sha256 "$PLAN_SHA256" --confirmation
+DEPLOY_REVIEWED_SCHEDULED_ANALYTICS`, together with `--operation
+"$PRIVATE_OPERATION" --repository-root "$CLEAN_CANDIDATE" --cli
+"$PINNED_WRANGLER_DIST_CLI"`. Use a new private operation directory for each
+stage. The fixed stages are `deploy-disabled`, `shared-publication`,
+`shared-cache`, `shared-graph`, then `model-batches`. The first deploys all
+three exact prebuilt modules with controls off. Each later stage changes only
+the named role's closed feature controls; both erasure-aware analytics and
+publication versions must already be deployed. Before every mutation the
+operator rechecks the shared production lock, retained bytes, live predecessor,
+schema/ledger and role bindings. It journals upload and deployment intents,
+discovers the uniquely tagged uploaded version, verifies bindings, then checks
+the active 100% version after deployment. Cloudflare's service settings can describe an uploaded draft before
+that version is activated. Before upload, the complete predecessor settings hash
+must still match. After the operation's journaled upload, the guard accepts only
+the exact uploaded bindings and message/tag, reconstructs the original settings
+with the pinned predecessor version, and requires the original complete hash.
+Active version, runtime, ingress, schedules and unrelated settings remain fenced.
+A journal already at `uploaded` resumes with `--execute --resume
+--executor-stopped`; it verifies and deploys that version without uploading again.
+
+An uncertain lock acquisition, upload or deployment retains the journal and
+never repeats the mutation. After proving the original executor stopped, use
+the same inputs with
+`--reconcile --resume --executor-stopped --confirmation
+RECONCILE_SCHEDULED_ANALYTICS` to read back the exact tagged version and active
+deployment. Reconciliation performs no upload or deployment. Continue only
+from a verified journal state with an explicit `--execute --resume
+--executor-stopped` invocation. If the plan has expired, this resumption needs
+a newly reviewed `scheduled-analytics-approval-extension-v1` JSON file binding
+the original plan SHA-256, plus `--extension "$PRIVATE_EXTENSION"
+--approved-extension-sha256 "$EXTENSION_SHA256"`. An extension lasts at most
+24 hours and authorizes only exact-bound resumption; a fresh stage needs a
+fresh plan. A different owner, unmatched version, changed
+predecessor or incomplete schema remains a stop. Each stage still requires
+measured useful work, output comparison and erasure checks before the next
+stage. For an activated stage that completed and released its lock, the separate
+`disable-model`, `disable-graph`, `disable-cache` and `disable-publication`
+stages upload the same retained candidate modules with the named controls off.
+Disable in reverse dependency order: model batches, graph, cache, publication.
+The operator refuses to disable a producer while its downstream consumers are
+active.
+Use a fresh reviewed plan and current predecessor versions; do not restore an
+older erasure writer or reverse the schema. The ordinary public Worker deploy
+wrapper does not deploy these roles.
 
 ## Read-only observation
 
