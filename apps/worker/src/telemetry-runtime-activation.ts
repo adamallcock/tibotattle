@@ -1242,11 +1242,11 @@ async function reconcilePostMutation(
   }
   if (runtime.state === "active" && runtime.policy_revision === input.expectedRevision + 1) {
     if (audit !== null && audit.action !== "run_maintenance") reconciliationRequired();
-    const result = activationResult(operationId, input, {
-      state: "active",
-      policy_revision: runtime.policy_revision,
-    });
-    if (audit?.outcome === "success") return result;
+    if (audit?.outcome === "success") {
+      const completed = completedActivationResult(audit, input);
+      if (completed !== null) return completed;
+      reconciliationRequired();
+    }
     // Atomicity means a committed own activation always has a success audit.
     // A started audit beside an active row is an ambiguous state and must be
     // left untouched for exact operator reconciliation.
@@ -1358,7 +1358,9 @@ export async function activateTelemetryRuntimeAsOwner(
           if (raced.action !== "run_maintenance") {
             throw new ApiError(409, "ADMIN_ACTION_CONFLICT");
           }
-          activationDetailsMatch(raced.details_json, input);
+          if (activationDetailsMatch(raced.details_json, input) === null) {
+            reconciliationRequired();
+          }
           const racedRuntime = await readTargetRuntime(db, input.target);
           if (raced.outcome === "started"
               && racedRuntime.state === "staged"

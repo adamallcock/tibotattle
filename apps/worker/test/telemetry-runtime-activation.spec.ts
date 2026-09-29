@@ -261,6 +261,70 @@ describe("protected telemetry runtime activation", () => {
       .bind(first.idempotencyKey).first()).toEqual({ outcome: "success" });
   });
 
+  it("refuses a malformed started audit inserted after the initial audit read", async () => {
+    const input = request("usage_correction", 0, "99999999-9999-4999-8999-999999999999");
+    let inserted = false;
+    const racedDb = new Proxy(db(), {
+      get(target, property, receiver) {
+        if (property === "prepare") return (sql: string) => {
+          const prepared = target.prepare(sql);
+          if (!inserted && sql.includes("FROM telemetry_usage_correction_runtime")) {
+            return { first: async () => {
+              const row = await prepared.first();
+              inserted = true;
+              await db().prepare(`INSERT INTO admin_action_audit
+                (operation_id,action,actor_identity_digest,outcome,details_json,created_at)
+                VALUES (?,'run_maintenance',?,'started','{',?)`)
+                .bind(input.idempotencyKey, "a".repeat(64), new Date(NOW_EPOCH).toISOString()).run();
+              return row;
+            } } as D1PreparedStatement;
+          }
+          return prepared;
+        };
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as D1Database;
+    await expect(activateTelemetryRuntimeAsOwner(
+      racedDb, settings, ACTOR_IDENTITY_KEY, input, NOW_EPOCH,
+    )).rejects.toMatchObject({ status: 503,
+      code: "TELEMETRY_RUNTIME_ACTIVATION_RECONCILE_REQUIRED" });
+    expect(inserted).toBe(true);
+    expect(await runtimeRow("usage_correction")).toEqual({ state: "staged", policy_revision: 0 });
+    expect(await db().prepare("SELECT outcome FROM admin_action_audit WHERE operation_id=?")
+      .bind(input.idempotencyKey).first()).toEqual({ outcome: "started" });
+  });
+
+  it("refuses lost-response recovery without exact success audit details", async () => {
+    const input = request("usage_correction", 0, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    const realBatch = db().batch.bind(db());
+    let lost = false;
+    const responseLostDb = new Proxy(db(), {
+      get(target, property, receiver) {
+        if (property === "batch") return async (statements: D1PreparedStatement[]) => {
+          const result = await realBatch(statements);
+          if (!lost) {
+            lost = true;
+            await db().prepare("UPDATE admin_action_audit SET details_json='{}' WHERE operation_id=?")
+              .bind(input.idempotencyKey).run();
+            throw new Error("synthetic_response_lost_after_audit_tamper");
+          }
+          return result;
+        };
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as D1Database;
+    await expect(activateTelemetryRuntimeAsOwner(
+      responseLostDb, settings, ACTOR_IDENTITY_KEY, input, NOW_EPOCH,
+    )).rejects.toMatchObject({ status: 503,
+      code: "TELEMETRY_RUNTIME_ACTIVATION_RECONCILE_REQUIRED" });
+    expect(lost).toBe(true);
+    expect(await runtimeRow("usage_correction")).toEqual({ state: "active", policy_revision: 1 });
+    expect(await db().prepare("SELECT outcome FROM admin_action_audit WHERE operation_id=?")
+      .bind(input.idempotencyKey).first()).toEqual({ outcome: "success" });
+  });
+
   it("does not attribute an externally active correction runtime to a started audit", async () => {
     const first = request("usage_correction", 0, "77777777-7777-4777-8777-777777777777");
     await insertStartedActivation(first);
