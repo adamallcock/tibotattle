@@ -150,6 +150,12 @@ test("web-only scope accepts only committed public source and release controls",
   assert.equal(isAllowedWebReleasePath("apps/web/test/community-cache-retention.test.mjs"), true);
   assert.equal(isAllowedWebReleasePath("apps/web/public/feature-tour.js"), true);
   assert.equal(isAllowedWebReleasePath("apps/web/public/feature-tour.css"), true);
+  for (const asset of [
+    "cache-reuse-matrix.css", "cache-reuse-matrix.js",
+    "model-performance.css", "model-performance.js",
+  ]) assert.equal(isAllowedWebReleasePath(`apps/web/public/${asset}`), true);
+  assert.equal(isAllowedWebReleasePath("apps/web/test/cache-reuse-matrix.test.mjs"), true);
+  assert.equal(isAllowedWebReleasePath("apps/web/test/feature-insights.test.mjs"), true);
   assert.equal(isAllowedWebReleasePath("apps/web/test/feature-tour.test.mjs"), true);
   assert.equal(isAllowedWebReleasePath("apps/web/public/feature-tour-private.js"), false);
   // Still an exact allowlist, not a prefix: a sibling nobody named stays out.
