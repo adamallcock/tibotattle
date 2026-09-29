@@ -2947,7 +2947,7 @@ footer p { margin: 0; }
   max-width: 690px;
   margin: 0 0 22px;
   color: var(--site-paper);
-  font-size: clamp(3.7rem, 6.4vw, 6.3rem);
+  font-size: clamp(3.7rem, 6.4vw, 75px);
   line-height: .88;
   text-wrap: balance;
 }

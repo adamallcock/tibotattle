@@ -41,7 +41,8 @@ test("30-day comparisons keep dates aligned and use view-specific positive dolla
     assert.equal(model.dollarTicks[0].value > 0, true);
   }
   assert.notDeepEqual(models[0].dollarTicks, models[2].dollarTicks);
-  assert.equal(models[2].height, models[0].height * 1.5);
+  assert.equal(models[0].height, models[1].height * 1.5);
+  assert.equal(models[2].height, models[0].height);
   assert.ok(models[2].dollarTicks.at(-1).value >= 6500);
   assert.equal(models[1].legendSeries.length, 3);
   assert.deepEqual(models[1].cardSeries.map(item => item.key), ["plus", "prolite", "pro"]);

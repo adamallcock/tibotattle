@@ -3011,16 +3011,15 @@ test("the cache chart's unit noun is the same measurement in every locale", asyn
   }
 });
 
-test("the measured cache section styles its period control and its caveat", async () => {
+test("the measured cache section styles its period control without the ties caveat", async () => {
   const styles = await readFile(new URL("../public/feature-tour.css", import.meta.url), "utf8");
   const source = await readFile(
     new URL("../public/feature-insights.js", import.meta.url),
     "utf8",
   );
-  // Both are inserted above the plot once measured evidence arrives, so both
-  // have to be styled for that position rather than left unstyled.
+  // The period picker is inserted above the plot once measured evidence arrives.
   assert.match(source, /className='insight-demo-periods'/u);
-  assert.match(source, /className='insight-demo-ties'/u);
+  assert.doesNotMatch(source, /className='insight-demo-ties'/u);
   assert.match(source, /className='insight-demo-period-note'/u);
 
   // The period control reads as interactive: a pressed state, a hover, a
@@ -3034,26 +3033,11 @@ test("the measured cache section styles its period control and its caveat", asyn
   assert.match(styles, /\.insight-demo-periods button:hover \{/u);
   assert.match(styles, /\.insight-demo-periods button:focus-visible \{[^}]*outline:/u);
 
-  // The caveat reads as a caveat: quieter than the section label above it,
-  // held to a readable measure, and not dressed as a warning.
-  const label = styles.match(/\.insight-demo-label \{([^}]*)\}/u);
-  const ties = styles.match(/\.insight-demo-ties \{([^}]*)\}/u);
-  assert.ok(label && ties, "the label and the caveat are both styled");
-  const size = (rule) => Number(rule.match(/font-size:(\d+(?:\.\d+)?)px/u)?.[1]);
-  assert.ok(
-    size(ties[1]) < size(label[1]),
-    `the caveat sits below the label's weight (${size(ties[1])} vs ${size(label[1])})`,
-  );
-  assert.match(ties[1], /max-width:\d+ch/u, "the caveat is held to a readable measure");
-  assert.doesNotMatch(ties[1], /background|border|font-weight:\s*(6|7|8)/u);
-  // An empty period is an absence of evidence, so it is not painted in the
-  // caveat's tone: the two say different things.
+  assert.doesNotMatch(styles, /\.insight-demo-ties/u);
+  // An empty period still reports the absence of evidence.
   const note = styles.match(/\.insight-demo-period-note \{([^}]*)\}/u);
   assert.ok(note, "an empty period states itself");
-  assert.notEqual(
-    note[1].match(/color:([^;]+);/u)?.[1],
-    ties[1].match(/color:([^;]+);/u)?.[1],
-  );
+  assert.match(note[1], /color:var\(--amber/u);
 });
 
 

@@ -34,7 +34,10 @@ export function exampleModelSpeeds(period='all', speedMode='standard') {
   const latency=[1.4,2.1,1.1,3.8,1.7,.9,1.6,2.3,4.9,2.6,1.3,1.8,1.2,.8,2.7,1.9,3.4,1.5,2.2,1.1,1.8,3.1,2.4,1.2,4.2,1.7,.9,1.4,2.8,1.6];
   if (!['standard','fast'].includes(speedMode)) throw new RangeError('Unsupported speed mode');
   return {schemaVersion:5,method:5,speedMode,excludedUnknownTurns:0,status:'ready',collecting:false,stale:false,updatedAt:new Date(end+86400000-1).toISOString(),period,interval:'day',start,end,historyProgress:null,
-    models:speedMode==='fast'?[]:[['gpt-6-astra','Astra'],['gpt-6-sol','GPT-6 Sol']].map(([id,label],index)=>{
+    models:speedMode==='fast'?[]:[
+      ['gpt-6-astra','Astra'],['gpt-6-sol','GPT-6 Sol'],['gpt-6-luna','GPT-6 Luna'],
+      ['gpt-5.6-terra','Terra'],['gpt-5.6-sol','Sol'],['gpt-5.6-luna','Luna'],
+    ].map(([id,label],index)=>{
       const history=activity.map((count,i)=>{
         const j=(i+index*9)%30, n=Math.max(3,Math.round(count*(index ? .62 : 1)));
         const at=end-(29-i)*86400000, median=speeds[j]+index*8;
@@ -104,22 +107,6 @@ export function mountExampleInsights(doc,t,loadHostedCurve) {
       });
       chooser.append(group,note);
       demo?.insertBefore(chooser,demo.querySelector('[data-cache-demo]'));
-      // Stated from the measurement, never a fixed figure: it moves with the
-      // period, and on a corpus with no ties it says nothing at all rather
-      // than disclosing a caveat that does not apply.
-      const ties=doc.createElement('p');
-      ties.className='insight-demo-ties';
-      const showTies=()=>{
-        const total=impact.comparableReturns,count=impact.unorderedTies??0;
-        const share=total>0?count/total:0;
-        ties.hidden=count===0;
-        ties.textContent=count===0?'':t('accounting.cacheContinuity.matrix.unorderedTies',
-          {count:new Intl.NumberFormat(locale()).format(count),
-           percent:new Intl.NumberFormat(locale(),{maximumFractionDigits:1}).format(share*100)+'%'});
-      };
-      showTies();
-      for(const button of buttons)button.addEventListener('click',showTies);
-      demo?.insertBefore(ties,demo.querySelector('[data-cache-demo]'));
     }).catch(()=>{});
   }
   const win=doc.defaultView;
