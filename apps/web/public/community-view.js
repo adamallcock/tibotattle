@@ -6,7 +6,8 @@ export { allowanceModelPresentation, modelThemeIcon } from "./model-visuals.js";
 // retired in favour of daily revisions, so no snapshot render path lives here
 // any more.
 
-import { normalizeCommunityDailySeries, planWeeklyApiEquivalentUsd } from "./community-data.js";
+import { normalizeCommunityDailySeries, planWeeklyApiEquivalentUsd,
+  PUBLIC_ALLOWANCE_MODEL_CONFIG } from "./community-data.js";
 import {
   compact,
   compactPrecise,
@@ -185,6 +186,24 @@ function valueAxis(maximum, plotTop, plotBottom, minimum = 0) {
     ticks.push({ value, y: y(value) });
   }
   return { axisTop, axisBase, y, ticks };
+}
+
+// Allowance estimates occupy a narrow positive range. Derive a rounded floor
+// from the visible estimates and uncertainty bands instead of spending most of
+// the chart on empty space below them. Activity counts keep their zero axes.
+function allowanceValueAxis(minimum, maximum, plotTop, plotBottom) {
+  const spread = Math.max(maximum - minimum, maximum * 0.1, 1);
+  const padding = spread * 0.12;
+  const step = chartTickStep(spread + padding * 2);
+  const roundedBase = Math.floor(Math.max(minimum - padding, minimum * 0.5) / step) * step;
+  const axisBase = roundedBase > 0 ? roundedBase : chartTickStep(minimum * 0.5, 1);
+  const axisTop = axisBase + Math.ceil((maximum + padding - axisBase) / step) * step;
+  const y = value => plotBottom - (value - axisBase) / (axisTop - axisBase) * (plotBottom - plotTop);
+  const ticks = [];
+  for (let value = axisBase; value <= axisTop + step / 100; value += step) {
+    ticks.push({ value, y: y(value) });
+  }
+  return { axisBase, axisTop, y, ticks };
 }
 
 /**
@@ -394,12 +413,10 @@ function buildCommunityAllowanceSingleChartModel(series, {
     ? margin.left + plotWidth / 2
     : margin.left + ((atMs - startMs) / (endMs - startMs)) * plotWidth);
 
-  const dollars = valueAxis(
-    Math.max(...points.map((point) => (
-      point.band80Usd === null ? point.centralUsd : point.band80Usd.upperUsd
-    ))),
-    plotTop,
-    plotBottom,
+  const dollars = allowanceValueAxis(
+    Math.min(...points.map(point => point.band80Usd?.lowerUsd ?? point.centralUsd)),
+    Math.max(...points.map(point => point.band80Usd?.upperUsd ?? point.centralUsd)),
+    plotTop, plotBottom,
   );
 
   const dots = points.map((point) => ({
@@ -495,10 +512,11 @@ function buildCommunityAllowanceSingleChartModel(series, {
 export function buildCommunityAllowanceChartModel(series, options = {}) {
   const { view = "aggregate", rangeDays = null, seriesKeys = null,
     width = COMMUNITY_ALLOWANCE_CHART_WIDTH,
-    height = COMMUNITY_ALLOWANCE_CHART_HEIGHT } = options;
+    height = view === "models" || view === "aggregate"
+      ? COMMUNITY_ALLOWANCE_CHART_HEIGHT * 1.5 : COMMUNITY_ALLOWANCE_CHART_HEIGHT } = options;
   if (!["aggregate", "plans", "models"].includes(view)) return null;
   if (!series?.breakdowns) {
-    return view === "aggregate" ? buildCommunityAllowanceSingleChartModel(series, options) : null;
+    return view === "aggregate" ? buildCommunityAllowanceSingleChartModel(series, { ...options, height }) : null;
   }
   if (series.state !== "published" || series.days.length === 0) return null;
   const anchor = series.breakdowns.hasCombined
@@ -510,12 +528,13 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
   const breakdownDays = new Map(series.breakdowns.days.map(day => [day.day, day]));
   const definitions = [
     { key: "aggregate", view: "aggregate", label: null, className: "" },
-    ...[ ["pro", "Pro 20×"], ["prolite", "Pro 5×"], ["plus", "Plus"] ].map(([key, label], index) => ({
-      key, label, view: "plans", className: `allowance-series-${index}`,
+    ...[ ["plus", "Plus", 2], ["prolite", "Pro 5×", 1], ["pro", "Pro 20×", 0] ].map(([key, label, color]) => ({
+      key, label, view: "plans", className: `allowance-series-${color}`,
     })),
-    ...series.breakdowns.modelConfig.map(({ modelId, label }, index) => ({
+    ...PUBLIC_ALLOWANCE_MODEL_CONFIG.map(({ modelId, label }, index) => ({
       key: modelId, label, view: "models", ...allowanceModelPresentation(modelId, index),
-    })).sort((left, right) => left.order - right.order),
+      order: index,
+    })),
   ];
   const summaryFor = (day, definition) => {
     const breakdown = breakdownDays.get(day.day);
@@ -550,12 +569,9 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
     const own = planWeeklyApiEquivalentUsd(value, definition.key);
     return own === null ? value : own;
   };
-  // Dollar axes stay comparable across tabs, so the bound is every definition,
-  // not just the drawn ones — EXCEPT when a caller asks for a single series.
-  // That is the small-multiples case, where the whole point is that each panel
-  // gets its own axis; sharing one there would reintroduce the squashing the
-  // panels exist to avoid.
-  const axisDefinitions = seriesKeys === null ? definitions : viewDefinitions;
+  // Each view gets a scale from its own visible series. A plan small multiple
+  // narrows that further to one plan's own weekly value.
+  const axisDefinitions = viewDefinitions;
   let maximum = 0;
   let minimum = Infinity;
   for (const day of rangeDaysWithActivity) for (const definition of axisDefinitions) {
@@ -576,7 +592,7 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
   const endMs = communityDayStartMs(days.at(-1).day);
   const x = day => startMs === endMs ? (plot.left + plot.right) / 2
     : plot.left + (communityDayStartMs(day) - startMs) / (endMs - startMs) * (plot.right - plot.left);
-  const dollars = valueAxis(maximum, plot.top, plot.bottom, minimum);
+  const dollars = allowanceValueAxis(minimum, maximum, plot.top, plot.bottom);
   const split = points => {
     const segments = [];
     for (const point of points) {
@@ -617,6 +633,10 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
     return { ...definition, dots, markerDots, centralSegments, bandSegments: split(band), latest: dots.at(-1) ?? null };
   }).filter(definition => definition.dots.length > 0);
   if (visible.length === 0) return null;
+  const visibleByKey = new Map(visible.map(definition => [definition.key, definition]));
+  const cardSeries = view === "models"
+    ? viewDefinitions.map(definition => visibleByKey.get(definition.key)
+      ?? { ...definition, latest: null }) : visible;
   const dots = visible.flatMap(definition => definition.dots)
     .sort((a, b) => a.day.localeCompare(b.day) || a.seriesOrder - b.seriesOrder);
   const dayTicks = Array.from({ length: 6 }, (_, index) => {
@@ -627,6 +647,7 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
   return { width, height, margin, plot, dots, view,
     markerDots: visible.flatMap(definition => definition.markerDots),
     latest: dots.at(-1), legendSeries: view === "aggregate" ? null : visible,
+    cardSeries,
     latestSummaries: visible.map(definition => definition.latest),
     spanDays: 1 + Math.round((endMs - startMs) / MILLISECONDS_PER_DAY),
     sparse: new Set(dots.map(dot => dot.day)).size <= 2,
@@ -1001,6 +1022,9 @@ export function renderCommunityDailySeries({
   ));
   breakdown.append(summary);
   const wrap = node("div", "table-wrap snapshot-table");
+  wrap.setAttribute("role", "region");
+  wrap.setAttribute("aria-label", t("community.daily.metricsCaption"));
+  wrap.setAttribute("tabindex", "0");
   const table = documentRef.createElement("table");
   const caption = node("caption", "sr-only", t("community.daily.metricsCaption"));
   const thead = documentRef.createElement("thead");
@@ -1136,18 +1160,30 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t, inspe
   const legend = node("div", "community-daily-legend allowance-series-legend");
   const legendButtons = [];
   const legendItems = model.legendSeries?.map(series => [
-    `daily-legend-swatch allowance-central ${series.className}`, series.label, series.key,
+    `daily-legend-swatch allowance-central ${series.className}`, series.label, series.key, true,
   ]) ?? [
     ["daily-legend-swatch allowance-central", "community.allowance.legendCentral"],
     ["daily-legend-swatch allowance-band", "community.allowance.legendBand"],
     ["daily-legend-swatch allowance-dot", "community.allowance.legendDots"],
   ].map(([className, key]) => [className, t(key)]);
-  for (const [swatchClass, label, seriesKey] of legendItems) {
-    const item = node(seriesKey ? "button" : "span", seriesKey ? "allowance-legend-button" : "");
+  if (model.view === "models") {
+    legendItems.splice(0, legendItems.length, ...model.cardSeries.map(series => [
+      `daily-legend-swatch allowance-central ${series.className}`,
+      series.label, series.key, series.latest !== null,
+    ]));
+  }
+  for (const [swatchClass, label, seriesKey, hasEstimate] of legendItems) {
+    const item = node(seriesKey && hasEstimate ? "button" : "span",
+      seriesKey ? `allowance-legend-button${hasEstimate ? "" : " unavailable"}` : "");
     if (seriesKey) {
-      item.setAttribute("type", "button");
-      item.setAttribute("aria-pressed", "false");
-      legendButtons.push({ item, seriesKey });
+      if (hasEstimate) {
+        item.setAttribute("type", "button");
+        item.setAttribute("aria-pressed", "false");
+        legendButtons.push({ item, seriesKey });
+      } else {
+        item.setAttribute("role", "note");
+        item.setAttribute("aria-label", `${label}: ${t("community.allowance.noModelEstimate")}`);
+      }
     }
     const swatch = node("span", swatchClass);
     swatch.setAttribute("aria-hidden", "true");
@@ -1514,6 +1550,7 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t, inspe
 export function renderCommunityAllowanceSection({
   documentRef,
   container,
+  sourceContainer = null,
   stateNode = null,
   payload,
   rangeDays = null,
@@ -1528,6 +1565,7 @@ export function renderCommunityAllowanceSection({
   const inspection = previousInspection?.view === view ? previousInspection : null;
   allowanceInspectionByContainer.delete(container);
   clear(container);
+  sourceContainer?.replaceChildren();
   const series = normalizeCommunityDailySeries(payload);
   const retained = cachedEvidence(cache);
   const setChip = (labelKey, published) => {
@@ -1579,28 +1617,36 @@ export function renderCommunityAllowanceSection({
 
   setChip("community.allowance.available", true);
   const dollars = usdFormatter();
-  container.append(sourceDisclosureDetails(node, t, ["community.allowance.smallSampleDisclosure"]));
+  const sourceDisclosure = sourceDisclosureDetails(node, t,
+    view === "aggregate"
+      ? ["community.allowance.smallSampleDisclosure", "community.allowance.methodNote"]
+      : ["community.allowance.smallSampleDisclosure"]);
+  (sourceContainer ?? container).append(sourceDisclosure);
   if (view !== "aggregate") {
     container.append(node("p", "allowance-summary-caption", t("community.allowance.cardsCaption")));
     const cards = node("div", "allowance-summary-cards");
-    for (const latest of model.latestSummaries) {
-      const card = node("article", `allowance-summary-card ${latest.seriesClass}`.trim());
+    for (const seriesCard of model.cardSeries) {
+      const latest = seriesCard.latest;
+      const card = node("article", `allowance-summary-card ${seriesCard.className}`.trim());
       const heading = node("div", "allowance-summary-heading");
-      heading.append(node("h3", "", latest.seriesLabel));
-      const icon = modelThemeIcon(documentRef, latest.seriesTheme);
+      heading.append(node("h3", "", seriesCard.label));
+      const icon = modelThemeIcon(documentRef, seriesCard.theme);
       if (icon) heading.append(icon);
       // A plan cohort leads with ITS OWN week at API prices, because that is
       // the number a reader on that plan is asking about. The Pro 20x
       // equivalent stays underneath as the comparable figure the basis names.
-      const planUsd = view === "plans" ? planWeeklyApiEquivalentUsd(latest.centralUsd, latest.seriesKey) : null;
+      const planUsd = view === "plans" && latest !== null
+        ? planWeeklyApiEquivalentUsd(latest.centralUsd, latest.seriesKey) : null;
       card.append(heading,
         node("strong", "allowance-summary-value",
-          dollars.format(planUsd === null ? latest.centralUsd : planUsd)));
+          latest === null ? "—" : dollars.format(planUsd === null ? latest.centralUsd : planUsd)));
       if (planUsd !== null) {
         card.append(node("p", "allowance-plan-value",
           t("community.allowance.referenceEquivalent", { value: dollars.format(latest.centralUsd) })));
       }
-      card.append(node("p", "allowance-headline-caveat", `${formatUtcCalendarDay(latest.day)} · ${plural("community.allowance.shortAccountCount", latest.participantCount)}`));
+      card.append(node("p", "allowance-headline-caveat", latest === null
+        ? t("community.allowance.noModelEstimate")
+        : plural("community.allowance.shortAccountCount", latest.participantCount)));
       cards.append(card);
     }
     container.append(cards);
@@ -1667,10 +1713,5 @@ export function renderCommunityAllowanceSection({
 
   appendCommunityAllowanceChart({ documentRef, container, model, t, inspection });
 
-  container.append(node(
-    "p",
-    "snapshot-disclosure",
-    t("community.allowance.methodNote"),
-  ));
   return "published";
 }

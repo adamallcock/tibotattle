@@ -298,10 +298,22 @@ export function planWeeklyApiEquivalentUsd(referenceUsd, planType) {
   return referenceUsd / PLAN_REFERENCE_MULTIPLIERS[planType];
 }
 
-export const PUBLIC_ALLOWANCE_MODEL_CONFIG = Object.freeze(REVIEWED_MODEL_CATALOG
-  .filter(model => model.provider === "openai_codex" && model.allowanceTrack === "primary")
-  .map(model => Object.freeze({ modelId: model.id, label: model.label })));
-const PUBLIC_ALLOWANCE_MODEL_IDS = new Set(PUBLIC_ALLOWANCE_MODEL_CONFIG.map(model => model.modelId));
+// The public comparison is a selected roster, not the complete historical
+// model vocabulary. Keep older reviewed tuples valid on the wire so a page
+// update cannot make previously published days disappear.
+export const PUBLIC_ALLOWANCE_MODEL_CONFIG = Object.freeze([
+  ["gpt-6-astra", "GPT-6 Astra"],
+  ["gpt-6-sol", "GPT-6 Sol"],
+  ["gpt-6-luna", "GPT-6 Luna"],
+  ["gpt-5.6-terra", "GPT-5.6 Terra"],
+  ["gpt-5.6-sol", "GPT-5.6 Sol"],
+  ["gpt-5.6-luna", "GPT-5.6 Luna"],
+].map(([modelId, label]) => Object.freeze({ modelId, label })));
+const PUBLIC_ALLOWANCE_MODEL_IDS = new Set([
+  ...REVIEWED_MODEL_CATALOG.filter(model => model.provider === "openai_codex"
+    && model.allowanceTrack === "primary").map(model => model.id),
+  ...PUBLIC_ALLOWANCE_MODEL_CONFIG.map(model => model.modelId),
+]);
 const PUBLIC_ALLOWANCE_PLAN_IDS = Object.freeze(["pro", "prolite", "plus"]);
 const exactObject = (value, keys) => value !== null && typeof value === "object"
   && !Array.isArray(value) && Object.keys(value).length === keys.length
