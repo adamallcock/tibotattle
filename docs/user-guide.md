@@ -332,13 +332,13 @@ and its remaining limits.
 
 ## Refresh, progress, and recovery
 
-Use **Refresh** (or Cmd-R in the native app) to update quota, retained history,
+Use **Refresh** to update quota, retained history,
 and detailed Usage-and-costs and Trends evidence together. A valid
 generation-bound accounting cache is reused; a changed generation is
 recalculated. There is no separate detailed-accounting button. The app keeps
 verified prior figures visible, with their current freshness state, while work
 is in progress. If another refresh is already running, the shared controller
-keeps that single operation authoritative. Native controls follow its progress;
+keeps that single operation authoritative. Desktop controls follow its progress;
 the browser shows an informational notice without starting a second operation.
 
 Startup and frequent automatic quota checks stay light. While the app remains
@@ -529,8 +529,9 @@ Application Support or Keychain locations blindly.
 
 ## Updates and help
 
-In Electron, check for updates in **Settings → About**. Native Mac version
-0.1.18 uses its retained signed Sparkle feed to transition to Electron.
+In Electron, check for updates in **Settings → About**. An installed native Mac
+0.1.18 app can use **Check for Updates** on its retained signed Sparkle feed to
+transition to Electron on Apple silicon or Intel.
 A temporary network failure should leave the installed app usable; it does not
 prove an update exists or failed to
 publish. Verify the current release independently if an update looks stale.

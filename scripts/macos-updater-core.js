@@ -6,7 +6,6 @@ import {
   readdir,
   realpath,
 } from "node:fs/promises";
-import { isIP } from "node:net";
 import {
   basename,
   dirname,
@@ -16,11 +15,6 @@ import {
   sep,
 } from "node:path";
 
-import { DEPLOYMENT_ENDPOINTS } from "../config/deployment-endpoints.js";
-import {
-  normalizeReleaseArchitecture,
-  resolveReleaseChannel,
-} from "../config/release-channels.js";
 
 export const SPARKLE_VERSION = "2.9.3";
 export const SPARKLE_ARCHIVE_URL =
@@ -244,143 +238,6 @@ export async function inspectPinnedSparkleTools(path) {
   return Object.freeze({
     path: selected,
     tools: Object.freeze(tools),
-    version: SPARKLE_VERSION,
-  });
-}
-
-function normalizeAppcastURL(value) {
-  if (typeof value !== "string" || value.length === 0
-      || value.includes("\0")) {
-    fail("Updater appcast URL is required");
-  }
-  let selected;
-  try {
-    selected = new URL(value);
-  } catch {
-    fail("Updater appcast URL must be an absolute HTTPS URL");
-  }
-  const hostname = selected.hostname.startsWith("[")
-    ? selected.hostname.slice(1, -1)
-    : selected.hostname;
-  if (selected.protocol !== "https:"
-      || selected.username || selected.password
-      || selected.search || selected.hash
-      || ["localhost", "127.0.0.1", "[::1]"].includes(selected.hostname)
-      || isIP(hostname) !== 0
-      || selected.pathname === "/"
-      || selected.href !== value) {
-    fail("Updater appcast URL must be an exact HTTPS DNS URL");
-  }
-  return selected.href;
-}
-
-function normalizePublicEdKey(value) {
-  if (typeof value !== "string"
-      || !/^[A-Za-z0-9+/]{43}=$/u.test(value)
-      || Buffer.from(value, "base64").length !== 32
-      || Buffer.from(value, "base64").toString("base64") !== value) {
-    fail("Updater public Ed25519 key must be canonical base64 for 32 bytes");
-  }
-  return value;
-}
-
-export function normalizeMacOSUpdaterMetadata({
-  architecture = "arm64",
-  appcastURL = null,
-  publicEdKey = null,
-} = {}) {
-  normalizeReleaseArchitecture(architecture);
-  if (appcastURL === null || appcastURL === undefined || appcastURL === ""
-      || publicEdKey === null || publicEdKey === undefined
-      || publicEdKey === "") {
-    fail(
-      "Updater appcast URL and public Ed25519 key are required",
-      "MACOS_UPDATER_REQUIRED_FOR_DISTRIBUTION",
-    );
-  }
-  const normalizedURL = normalizeAppcastURL(appcastURL);
-  const intelPaths = [
-    resolveReleaseChannel("stable", { architecture: "x64" }).sparkle.appcastURL,
-    resolveReleaseChannel("internal-dogfood", { architecture: "x64" }).sparkle.appcastURL,
-    DEPLOYMENT_ENDPOINTS.sparkle.intelPreviewAppcastURL,
-  ].map((url) => new URL(url).pathname);
-  const intelPath = intelPaths.includes(new URL(normalizedURL).pathname);
-  if ((architecture === "x64") !== intelPath) {
-    fail("Updater feed path does not match its release architecture", "MACOS_UPDATER_ARCHITECTURE_MISMATCH");
-  }
-  return Object.freeze({
-    appcastURL: normalizedURL,
-    publicEdKey: normalizePublicEdKey(publicEdKey),
-  });
-}
-
-export async function normalizeMacOSUpdaterConfiguration({
-  architecture = "arm64",
-  appcastURL = null,
-  externalDistribution = false,
-  previewDistribution = false,
-  frameworkPath = null,
-  publicEdKey = null,
-} = {}) {
-  normalizeReleaseArchitecture(architecture);
-  if (typeof externalDistribution !== "boolean") {
-    fail("externalDistribution must be a boolean");
-  }
-  if (typeof previewDistribution !== "boolean") {
-    fail("previewDistribution must be a boolean");
-  }
-  if (externalDistribution && previewDistribution) {
-    fail(
-      "Production and preview updater channels are mutually exclusive",
-      "MACOS_UPDATER_CHANNEL_CONFLICT",
-    );
-  }
-  const distributionEnabled = externalDistribution || previewDistribution;
-  const provided = [appcastURL, frameworkPath, publicEdKey]
-    .some((value) => value !== null && value !== undefined && value !== "");
-  if (!distributionEnabled) {
-    if (provided) {
-      fail(
-        "Updater inputs are forbidden in development and ad-hoc builds",
-        "MACOS_UPDATER_FORBIDDEN_IN_DEVELOPMENT",
-      );
-    }
-    return Object.freeze({
-      appcastURL: null,
-      automaticChecks: false,
-      automaticUpdatesEnabledByDefault: false,
-      allowsAutomaticUpdateOptIn: false,
-      enabled: false,
-      framework: null,
-      publicEdKey: null,
-      version: null,
-    });
-  }
-  if ([appcastURL, frameworkPath, publicEdKey].some(
-    (value) => value === null || value === undefined || value === "",
-  )) {
-    fail(
-      "External distribution requires the reviewed Sparkle framework, appcast URL, and public Ed25519 key",
-      "MACOS_UPDATER_REQUIRED_FOR_DISTRIBUTION",
-    );
-  }
-  const framework = await inspectPinnedSparkleFramework(frameworkPath);
-  const metadata = normalizeMacOSUpdaterMetadata({
-    architecture,
-    appcastURL,
-    publicEdKey,
-  });
-  return Object.freeze({
-    appcastURL: metadata.appcastURL,
-    // Preview has a separate bundle, URL scheme, and state root. It retains
-    // manual compatibility checks, but must never silently consume an update
-    // merely because it was opened for testing.
-    automaticChecks: externalDistribution,
-    automaticUpdatesEnabledByDefault: externalDistribution,
-    allowsAutomaticUpdateOptIn: externalDistribution,
-    enabled: true,
-    framework,
-    publicEdKey: metadata.publicEdKey,
     version: SPARKLE_VERSION,
   });
 }

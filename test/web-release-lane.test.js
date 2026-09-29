@@ -82,10 +82,10 @@ async function candidateFixture({
 
   await writeFile(join(publicSource, "community.js"), "export const version = 2;\n");
   if (includeUnsupportedChange) {
-    const clientPath = join(root, "apps", "macos", "Sources");
+    const clientPath = join(root, "apps", "electron");
     await mkdir(clientPath, { recursive: true });
-    await writeFile(join(clientPath, "UsageMonitorApp.swift"), "// client change\n");
-    git(root, ["add", "apps/macos"]);
+    await writeFile(join(clientPath, "main.js"), "// client change\n");
+    git(root, ["add", "apps/electron"]);
   }
   if (includeUnsupportedPackageChange) {
     await writeFile(join(root, "package.json"), `${JSON.stringify({
@@ -167,7 +167,7 @@ test("web-only scope accepts only committed public source and release controls",
     isAllowedWebReleasePath("docs/runbooks/2026-08-17-public-site-local-preview.md"),
     true,
   );
-  assert.equal(isAllowedWebReleasePath("apps/macos/Sources/UsageMonitorApp.swift"), false);
+  assert.equal(isAllowedWebReleasePath("apps/electron/main.js"), false);
 });
 
 test("web-only scope rejects a client change even when a public site change is present", async (t) => {
@@ -179,7 +179,7 @@ test("web-only scope rejects a client change even when a public site change is p
       repositoryRoot: value.root,
       baseCommit: value.baseCommit,
     }),
-    /changed an unsupported path: apps\/macos\/Sources\/UsageMonitorApp\.swift/u,
+    /changed an unsupported path: apps\/electron\/main\.js/u,
   );
 });
 

@@ -52,8 +52,7 @@ navigation allowlist.
 | `src/` | Local/domain ingestion, accounting, identity, exports, contribution preparation, and durable state contracts. | UI composition, deployments, or native OS presentation. |
 | `apps/local/` | Loopback HTTP composition, refresh lifecycle, dashboard projections, and fixed relays. | Arbitrary proxying or hosted persistence. |
 | `apps/web/` | Shared dashboard/static public UI and browser localization. | Local filesystem or platform credential access. |
-| `apps/macos/` | Native lifecycle, menus/settings, login item, Keychain broker, updater, and WKWebView policy. | Accounting semantics or hosted authorization. |
-| `apps/electron/` | Cross-platform shell lifecycle, exact preload/IPC bridge, tray popup, settings, updater composition, and automatic-refresh cadence. | Local analysis, provider parsing, or arbitrary renderer commands. |
+| `apps/electron/` | Cross-platform shell lifecycle, exact preload/IPC bridge, tray popup, settings, updater, macOS Keychain and predecessor migration, and automatic-refresh cadence. | Local analysis, provider parsing, or arbitrary renderer commands. |
 | `apps/worker/` | Public website, identity, participant/session/device lifecycle, ingestion, aggregates, admin operations, D1/R2/DO composition. | Local source discovery or private Mac state. |
 | `packages/` | Runtime-neutral accounting, quota, identity, localization, and telemetry public APIs. | App-to-app imports or platform-specific side effects. |
 | `scripts/` and `tools/` | Build, validation, release, migration, and operator entrypoints. | Runtime product dependencies. |

@@ -13,7 +13,6 @@ import {
   getReleaseChannel,
   resolveReleaseChannel,
 } from "../config/release-channels.js";
-import { parseArguments as parseReleaseArguments } from "../scripts/release-macos-app.js";
 import {
   parseSparkleUpdatePublisherArguments,
 } from "../scripts/publish-sparkle-update.js";
@@ -141,37 +140,7 @@ test("a reviewed dogfood policy keeps every distribution identifier separate", (
   }
 });
 
-test("package and publisher CLIs require explicit named channel consent", () => {
-  assert.throws(
-    () => parseReleaseArguments(["--app", "TiboTattle.app"]),
-    /--channel is required/u,
-  );
-  const dogfoodRelease = parseReleaseArguments([
-    "--app", "TiboTattle.app",
-    "--channel", INTERNAL_DOGFOOD_RELEASE_CHANNEL,
-    "--prepare-candidate",
-  ]);
-  assert.equal(dogfoodRelease.channel, INTERNAL_DOGFOOD_RELEASE_CHANNEL);
-  assert.equal(dogfoodRelease.prepareCandidate, true);
-  assert.equal(dogfoodRelease.journalDirectory, `${dogfoodRelease.output}.operation`);
-  for (const flags of [["--resume", "--prepare-candidate"], ["--replace"], ["--journal", "/tmp/other-operation"]]) {
-    assert.throws(() => parseReleaseArguments(["--app", "TiboTattle.app", "--channel", INTERNAL_DOGFOOD_RELEASE_CHANNEL, ...flags]));
-  }
-  const bootstrapRelease = parseReleaseArguments([
-    "--app", "TiboTattle.app",
-    "--channel", STABLE_RELEASE_CHANNEL,
-    "--stable-bootstrap",
-  ]);
-  assert.equal(bootstrapRelease.stableBootstrap, true);
-  assert.throws(
-    () => parseReleaseArguments([
-      "--app", "TiboTattle.app",
-      "--channel", STABLE_RELEASE_CHANNEL,
-      "--previous-stable-manifest", "previous.json",
-      "--stable-bootstrap",
-    ]),
-    /cannot be combined/u,
-  );
+test("Sparkle publisher requires explicit named channel consent", () => {
   const publisherArguments = [
     "--bucket", STABLE.sparkle.r2Bucket,
     "--dmg", "release.dmg",

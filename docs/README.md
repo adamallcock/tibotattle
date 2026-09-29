@@ -47,8 +47,8 @@ an informal archive.
 | Release verification | [Verify a TiboTattle release](./verify-release.md) | User-facing checksum, native trust, manifest, and evidence verification |
 | Release trust | [Cross-platform release trust](./decisions/2026-08-18-cross-platform-release-trust.md) | Common evidence decision and artifact-specific native trust requirements |
 | Release publication | [Cross-platform release publication](./runbooks/2026-08-18-cross-platform-release-publication.md) | Activation-gated multi-platform evidence and immutable publication order; not a support claim |
-| macOS release | [macOS stable release](./runbooks/macos-stable-release-runbook.md) | Canonical build, signing, notarization, Sparkle, Homebrew, website, and GitHub release sequence |
-| Agent release tooling | [Agent release operations](./runbooks/agent-release-operations.md) | Read-only doctor/status, native phase resume, shared production ownership and explicit recovery; not publication authorization |
+| macOS release | [macOS Electron release and native upgrade feeds](./runbooks/macos-stable-release-runbook.md) | Installed transition qualification, both retained Sparkle feeds and exact-byte publication gates |
+| Production operation recovery | [Production operation ownership](./runbooks/agent-release-operations.md) | Shared production ownership and explicit recovery; not publication authorization |
 | Publication reconciliation | [Exact release publication](./runbooks/release-publication-reconciliation.md) | Manifest-driven GitHub, ARM/Intel feeds, tap and website reconciliation; writes require explicit authorization |
 | Early release qualification | [Synthetic admission and evidence reuse](./runbooks/release-qualification-admission.md) | Reviewed local proof cache and owning test lanes; not R7 or installed-app qualification |
 | Migration rehearsal | [Release migration rehearsal](./runbooks/release-migration-rehearsal.md) | Deployed-prefix observation, populated synthetic upgrades and separately gated disposable remote syntax checks |

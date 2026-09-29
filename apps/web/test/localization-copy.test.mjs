@@ -121,69 +121,6 @@ test("accounting period history labels preserve three-locale parity", () => {
   }
 });
 
-test("Keychain migration recovery names the real native controls in every locale", async () => {
-  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  const copies = [
-    "identity_migration_required",
-    "contribution_device_keychain_migration_required",
-  ].map((code) => {
-    const copy = appSource.match(new RegExp(`${code}:\\n\\s*"([^"]+)"`, "u"))?.[1];
-    assert.ok(copy, `${code} has fixed recovery copy`);
-    return copy;
-  });
-  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
-  const migrationNotice = html.match(
-    /id="incremental-keychain-migration-note" hidden>([\s\S]*?)<\/p>/u,
-  )?.[1].replace(/\s+/gu, " ").trim();
-  assert.ok(migrationNotice, "static migration notice is present");
-  assert.match(migrationNotice, /first tries .* silently/u);
-  assert.match(migrationNotice, /without changing its value or uploading anything/u);
-  assert.match(migrationNotice, /Settings… → General/u);
-  assert.match(migrationNotice, /Review migration…/u);
-  assert.match(migrationNotice, /credential and local history stay unchanged/u);
-  assert.doesNotMatch(migrationNotice, /macOS asks|Always Allow|quit and reopen/u);
-  for (const [locale, resourceLocale] of [
-    ["en-US", "en"],
-    ["zh-Hans", "zh-Hans"],
-    ["es", "es"],
-  ]) {
-    const nativeCatalog = await readFile(new URL(
-      `../../macos/Resources/${resourceLocale}.lproj/Localizable.strings`,
-      import.meta.url,
-    ), "utf8");
-    const nativeLabels = new Map([...nativeCatalog.matchAll(/^"([^"]+)" = "([^"]+)";$/gmu)]
-      .map(([, key, value]) => [key, value]));
-    for (const english of copies) {
-      const translated = translateLegacyText(english, locale);
-      for (const key of [
-        "menu.settings",
-        "settings.general",
-        "settings.keychainMigrationTitle",
-        "settings.keychainMigrationReview",
-      ]) {
-        const nativeLabel = nativeLabels.get(key);
-        assert.ok(nativeLabel, `${locale} native ${key} exists`);
-        assert.equal(translated.includes(nativeLabel), true, `${locale} names ${key}`);
-      }
-      if (locale !== "en-US") assert.notEqual(translated, english, locale);
-    }
-    const translatedNotice = translateLegacyText(migrationNotice, locale);
-    for (const key of [
-      "menu.settings",
-      "settings.general",
-      "settings.keychainMigrationTitle",
-      "settings.keychainMigrationReview",
-    ]) {
-      assert.equal(
-        translatedNotice.includes(nativeLabels.get(key)),
-        true,
-        `${locale} notice names ${key}`,
-      );
-    }
-    if (locale !== "en-US") assert.notEqual(translatedNotice, migrationNotice, locale);
-  }
-});
-
 test("Keychain connection and denied-access copy never recommends approval prompts or credential clearing", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");

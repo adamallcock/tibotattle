@@ -71,7 +71,7 @@ const PERMITTED_STDIN_LINES = new Map();
  *
  * When the signed macOS app spawns the companion it dup2's its end of a
  * private socketpair onto descriptor 0 and announces only that number
- * (apps/macos/Sources/KeychainBroker.swift). Node's `process.stdin` is a lazy
+ * (the retired AppKit Keychain broker). Node's `process.stdin` is a lazy
  * getter that constructs a stream over descriptor 0 on first access, so any
  * module the companion loads that so much as evaluates it would start reading
  * the broker's wire — stealing responses, desynchronising the strict in-order

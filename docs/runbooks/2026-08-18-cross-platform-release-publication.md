@@ -463,20 +463,20 @@ asset differs from the manifest, stop all downstream publication.
 
 ### macOS
 
-The existing local finalizer is scripts/release-macos-app.js. It must finish
+The Electron production builder and its reviewed finalization flow must finish
 Developer ID signing, hardened runtime, Apple notarization, ticket stapling,
-Gatekeeper assessment, and clean installation before freezing the DMG. The
-protected GitHub native finalizer still needs a real caller workflow with the
-permissions above, pinned actions, protected environments, exact-tag checks,
-and a fresh draft-to-published verification rehearsal. Until then, do not
-claim GitHub source/build provenance for the local DMG.
+Gatekeeper assessment, and clean installation before freezing each DMG. The
+[macOS runbook](./macos-stable-release-runbook.md) owns both architectures,
+installed update qualification, and the two incoming native Sparkle feeds.
+The protected GitHub finalizer needs the permissions above, pinned actions,
+protected environments, exact-tag checks, and draft-to-published verification
+before claiming hosted source/build provenance for the exact final bytes.
 
 #### Private Electron native-handover rehearsal
 
 The Electron path uses
 [`scripts/package-electron-production.mjs`](../../scripts/package-electron-production.mjs)
-and its fixed production builder configuration; the native Sparkle finalizer
-above is not an Electron finalizer. This private rehearsal proves specific
+and its fixed production builder configuration. This private rehearsal proves specific
 candidate operations, not stable release or platform support. Complete each
 step for both `darwin-arm64` and `darwin-x64` and for the explicitly approved
 ordered pair of prerelease versions. Never infer a build number or allocate a

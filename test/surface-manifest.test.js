@@ -5,14 +5,6 @@ import {
   LOCAL_COMPANION_STATIC_FILES,
 } from "../apps/local/static-assets.js";
 import {
-  CLIENT_SOURCE_FILES,
-  CLIENT_WEB_FILES,
-} from "../scripts/export-tibotattle.mjs";
-import {
-  collectWebModuleGraph,
-} from "../scripts/lib/runtime-closure.mjs";
-import { MACOS_RUNTIME_STATIC_ASSETS } from "../scripts/build-macos-app.js";
-import {
   assertSurfaceManifest,
   assertSurfaceProjection,
   surfaceFiles,
@@ -22,7 +14,6 @@ const SURFACES = [
   "electron-runtime",
   "history-free-export",
   "local-companion",
-  "native-macos",
 ];
 
 function reviewedManifest() {
@@ -39,7 +30,7 @@ function localCompanionFiles() {
     `apps/web/public/${file}`);
 }
 
-test("surface projections preserve exact local, Electron, native, and export inventories", async () => {
+test("surface projections preserve exact local, Electron, and export inventories", async () => {
   const localFiles = localCompanionFiles();
   assertSurfaceProjection("local-companion", localFiles, {
     label: "local companion route-file projection",
@@ -48,33 +39,12 @@ test("surface projections preserve exact local, Electron, native, and export inv
     [...new Set(localFiles)].sort(),
     [...surfaceFiles("electron-runtime")].sort(),
   );
-  assert.deepEqual(
-    [...CLIENT_WEB_FILES].sort(),
-    [...surfaceFiles("history-free-export")].sort(),
-  );
-
-  const webGraph = await collectWebModuleGraph({ surface: "native-macos" });
-  const nativeFiles = [
-    ...MACOS_RUNTIME_STATIC_ASSETS,
-    ...webGraph.relativeFiles,
-  ];
-  assertSurfaceProjection("native-macos", nativeFiles, {
-    label: "native macOS runtime-file projection",
-  });
 
   // Route behavior remains a separate contract: the two historical routes are
   // intentional aliases of one declared source file.
   assert.equal(
     LOCAL_COMPANION_STATIC_FILES["/"].file,
     LOCAL_COMPANION_STATIC_FILES["/index.html"].file,
-  );
-  assert.equal(
-    CLIENT_SOURCE_FILES.includes("apps/electron/desktop-copy-source.js"),
-    false,
-  );
-  assert.equal(
-    CLIENT_SOURCE_FILES.includes("scripts/generate-i18n-electron-copy.js"),
-    false,
   );
   for (const surface of SURFACES) {
     assert.equal(

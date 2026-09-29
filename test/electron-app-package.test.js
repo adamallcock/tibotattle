@@ -139,7 +139,7 @@ test("Electron builder configuration is an unsigned macOS arm64 directory build"
   assert.equal(BUILDER_CONFIG.buildDependenciesFromSource, false);
   assert.equal(BUILDER_CONFIG.nodeGypRebuild, false);
   assert.deepEqual(BUILDER_CONFIG.mac.target, [{ target: "dir", arch: ["arm64"] }]);
-  const expectedMacIcon = resolve("apps/macos/Assets/AppIcon.icns");
+  const expectedMacIcon = resolve("apps/electron/assets/AppIcon.icns");
   assert.equal(BUILDER_CONFIG.mac.icon, expectedMacIcon);
   const macIconMetadata = await lstat(expectedMacIcon);
   assert.ok(macIconMetadata.isFile());

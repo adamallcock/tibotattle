@@ -16,7 +16,7 @@ const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const REPOSITORY_ROOT = resolve(dirname(SCRIPT_PATH), "..");
 export const NATIVE_ELECTRON_HANDOVER_HELPER_SOURCE = resolve(
   REPOSITORY_ROOT,
-  "apps/macos/Helpers/NativeElectronHandoverHelper.swift",
+  "apps/electron/native/NativeElectronHandoverHelper.swift",
 );
 export const NATIVE_ELECTRON_HANDOVER_HELPER_MINIMUM_MACOS = "14.0";
 export const NATIVE_ELECTRON_HANDOVER_HELPER_ARCHITECTURES = Object.freeze(["arm64", "x64"]);

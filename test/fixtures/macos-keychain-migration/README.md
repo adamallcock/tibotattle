@@ -1,8 +1,9 @@
 # Signed synthetic Keychain migration fixture
 
-The original Swift mains are test-only compositions for
-`test/helpers/verify-signed-keychain-migration.mjs`. They exercise the shared
-production migration protocol and adoption algorithm without reading
+The original Swift mains and the preserved
+`KeychainMigration.swift` are test-only compositions for
+`test/helpers/verify-signed-keychain-migration.mjs`. They exercise the
+historical native migration protocol and adoption algorithm without reading
 application credentials from or changing the login/default Keychain. The
 explicit signing stage may use the operator's existing approved signing key;
 that is separate from the fixture's Keychain access.

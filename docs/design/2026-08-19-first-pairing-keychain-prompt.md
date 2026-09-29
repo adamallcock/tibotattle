@@ -16,7 +16,7 @@ It is not current product or release guidance. The implementation descriptions,
 that historical snapshot, not the 0.1.17 candidate.
 
 The [silent-migration decision](../decisions/2026-08-31-silent-keychain-migration.md),
-[native agent guidance](../../apps/macos/AGENTS.md#prompt-free-keychain-operation),
+[current agent guidance](../../AGENTS.md#product-invariants),
 and [native Keychain release gate](../runbooks/macos-stable-release-runbook.md#native-keychain-migration-gate)
 supersede this record's prompt and recovery advice. Automatic operation must be
 noninteractive: try bounded silent migration first, then offer a quiet,

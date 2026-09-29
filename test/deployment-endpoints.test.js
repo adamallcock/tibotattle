@@ -7,11 +7,16 @@ import {
 } from "../config/deployment-endpoints.js";
 import {
   checkDeploymentEndpointConsumers,
+  ELECTRON_RUNTIME_PATH,
+  MACOS_RELEASE_CORE_PATH,
+  SPARKLE_PUBLISHER_PATH,
+  validateDeploymentEndpointConsumers,
   validateWorkerSparkleReleaseContract,
   validateWorkerSparkleAppcastGuard,
   validateWorkerDeploymentEndpoints,
   validateWorkerDeploymentEndpointGates,
   WORKER_SPARKLE_RELEASE_CONTRACT_PATH,
+  WORKER_TYPES_PATH,
 } from "../apps/worker/scripts/check-deployment-endpoints.mjs";
 
 test("reviewed deployment endpoint manifest is internally coherent", () => {
@@ -180,6 +185,24 @@ test("checked-in deployment endpoint consumers match the reviewed manifest", asy
     "staging:check",
     "staging:deploy",
   ]);
+});
+
+test("Electron runtime endpoint drift fails the deployment consumer check", async () => {
+  const [electronRuntimeSource, macOSReleaseSource, publisherSource, workerTypes] =
+    await Promise.all([
+      ELECTRON_RUNTIME_PATH,
+      MACOS_RELEASE_CORE_PATH,
+      SPARKLE_PUBLISHER_PATH,
+      WORKER_TYPES_PATH,
+    ].map((path) => readFile(path, "utf8")));
+  const input = { electronRuntimeSource, macOSReleaseSource, publisherSource, workerTypes };
+  assert.doesNotThrow(() => validateDeploymentEndpointConsumers(input));
+  assert.throws(() => validateDeploymentEndpointConsumers({
+    ...input,
+    electronRuntimeSource: electronRuntimeSource.replaceAll(
+      "DEPLOYMENT_ENDPOINTS.public.origin", "https://other.example.test",
+    ),
+  }), { code: "DEPLOYMENT_ENDPOINTS_MISMATCH" });
 });
 
 test("Worker Sparkle release contract rejects drift from canonical manifests", async () => {

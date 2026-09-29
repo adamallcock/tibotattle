@@ -13,7 +13,7 @@ export const CREDENTIAL_FIXTURE_REQUIREMENT = 'identifier "com.usagemonitor.loca
   + 'and certificate leaf[field.1.2.840.113635.100.6.1.13] exists '
   + 'and certificate leaf[subject.OU] = "43RTH622SB"';
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u;
-const SOURCES = ['apps/macos/Sources/KeychainMigration.swift',
+const SOURCES = ['test/fixtures/macos-keychain-migration/KeychainMigration.swift',
   'test/fixtures/macos-keychain-migration/OwnershipPolicy.swift',
   'test/fixtures/macos-keychain-migration/FixtureSupport.swift',
   'test/fixtures/macos-keychain-migration/ElectronCredentialMain.swift'];

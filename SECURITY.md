@@ -23,7 +23,7 @@ in the [current status matrix](docs/current-status.md).
 
 Two distinct surfaces share this repository:
 
-- **Local macOS app** (`apps/macos`, `apps/local`, `apps/web`, `src/`,
+- **Local macOS app** (`apps/electron`, `apps/local`, `apps/web`, `src/`,
   `packages/`): runs entirely on your machine, binds to loopback only, and
   works fully offline. Issues that break the privacy model — uploads that
   bypass the applicable sharing policy, prompts/responses/paths entering derived

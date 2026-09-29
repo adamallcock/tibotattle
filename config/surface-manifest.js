@@ -76,20 +76,11 @@ const HISTORY_FREE_EXPORT_WEB_FILES = Object.freeze([
   ...HISTORY_FREE_EXPORT_ONLY_WEB_FILES,
 ]);
 
-// The reset helper is a native-only static input.  The web membership is the
-// same reviewed local/Electron set, while the Electron shell's own modules and
-// native Swift resources remain separate policy inventories.
-const NATIVE_MACOS_FILES = Object.freeze([
-  ...SHARED_WEB_FILES,
-  "apps/macos/reset-local-keychain.js",
-]);
-
 export const SURFACE_MANIFEST = Object.freeze({
   schemaVersion: SURFACE_MANIFEST_SCHEMA,
   surfaces: Object.freeze({
     "local-companion": SHARED_WEB_FILES,
     "electron-runtime": SHARED_WEB_FILES,
-    "native-macos": NATIVE_MACOS_FILES,
     "history-free-export": HISTORY_FREE_EXPORT_WEB_FILES,
   }),
 });

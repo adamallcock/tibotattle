@@ -12,16 +12,11 @@ Just installing the app? Use the [installation instructions](README.md#install-m
 for Apple silicon or Intel Macs. The published app bundles its runtime and does
 not require the development tools below.
 
-- **Node.js ≥ 22.13** for all repository tooling and tests.
-- **macOS on arm64 with exactly Node v26.2.0** for the macOS app-bundle
-  build and the retained release gate (`npm run product:macos:test`). The
-  build pins that version deliberately and fails on any other runtime
-  rather than producing an unverifiable bundle.
-  This is a build-host requirement, not an end-user architecture restriction;
-  the same builder can [explicitly target Intel](apps/macos/README.md#developer-build)
-  with its verified x64 runtime.
+- **Node.js ≥ 22.13** for repository tooling and tests.
 - **pnpm 11** (the repository sets `packageManager: pnpm@11.9.0`).
-- **Xcode command-line tools** for the native macOS app build.
+- **macOS and Xcode command-line tools** for packaging or installed-app
+  qualification. Follow the pinned release host requirements in the
+  [macOS release runbook](docs/runbooks/macos-stable-release-runbook.md).
 
 ## Developer setup
 
@@ -37,9 +32,9 @@ npm --prefix apps/worker ci
 
 The authoritative complete repository gate is `npm run check`. It composes
 root tests with architecture, Codex-contract, tool-inventory, documentation,
-schema-mirror, UI, release-site, local companion, Worker, native macOS, and
-local-review runtime checks. Some lanes require
-macOS arm64, exactly Node v26.2.0, or independently installed app dependencies;
+schema-mirror, UI, release-site, local companion, Worker, incoming
+Sparkle transition, and local-review runtime checks. Installed-app qualification
+requires separate macOS hosts and signed artifacts;
 report an environment-blocked lane explicitly.
 
 Use focused gates while iterating, then run the broadest applicable set before
@@ -50,12 +45,12 @@ npm test                       # core suite (serial by design)
 npm run codex:contract:check   # checked-in Codex plan/name contract parity
 npm run docs:check             # maintained docs, links, status, and current authority
 npm run product:worker:check   # hosted-service worker checks
-npm run product:macos:test     # retained macOS release gate (arm64 + Node v26.2.0)
+npm run product:macos:transition:test  # incoming Sparkle-to-Electron contracts
 npm run architecture:check     # ownership/boundary enforcement
 ```
 
-If you cannot run the macOS gate (for example, you are not on macOS arm64),
-say so in the pull request rather than skipping it silently.
+Report any unavailable installed-artifact or hardware gate separately from
+the source and contract checks.
 
 ## Generated artifacts are never hand-edited
 

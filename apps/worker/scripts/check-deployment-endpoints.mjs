@@ -2,8 +2,8 @@
 /**
  * Checks every deployment endpoint consumer that cannot share the JavaScript
  * manifest directly. The manifest is authoritative; this script makes the
- * checked-in Wrangler, generated Worker types, macOS build metadata, native
- * About link, signed-release configuration, and Sparkle publisher fail closed
+ * checked-in Wrangler, generated Worker types, Electron runtime,
+ * signed-release configuration, and Sparkle publisher fail closed
  * if any of them drift.
  */
 import { readFile } from "node:fs/promises";
@@ -14,9 +14,6 @@ import {
   DEPLOYMENT_ENDPOINTS,
   assertDeploymentEndpoints,
 } from "../../../config/deployment-endpoints.js";
-import {
-  MACOS_PREVIEW_PUBLIC_CONFIGURATION,
-} from "../../../scripts/build-macos-app.js";
 import {
   APPROVED_R2_BUCKET,
   APPCAST_ATOMIC_GUARD_SCHEMA,
@@ -66,21 +63,13 @@ export const SPARKLE_GUARD_NONCE_MIGRATION_PATH = join(
   "migrations",
   "0029_sparkle_appcast_guard_nonces.sql",
 );
-export const MACOS_BUILD_PATH = join(
-  REPOSITORY_ROOT,
-  "scripts",
-  "build-macos-app.js",
+export const ELECTRON_RUNTIME_PATH = join(
+  REPOSITORY_ROOT, "apps", "electron", "desktop-runtime.js",
 );
 export const MACOS_RELEASE_CORE_PATH = join(
   REPOSITORY_ROOT,
   "scripts",
   "macos-release-core.js",
-);
-export const MACOS_NATIVE_SOURCE_PATH = join(
-  REPOSITORY_ROOT,
-  "apps",
-  "macos",
-  "UsageMonitorApp.swift",
 );
 export const SPARKLE_PUBLISHER_PATH = join(
   REPOSITORY_ROOT,
@@ -298,20 +287,13 @@ export function validateWorkerDeploymentEndpoints(
 }
 
 export function validateDeploymentEndpointConsumers({
-  buildSource,
+  electronRuntimeSource,
   macOSReleaseSource,
-  nativeSource,
   publisherSource,
   workerTypes,
   endpoints = DEPLOYMENT_ENDPOINTS,
 }) {
   assertDeploymentEndpoints(endpoints);
-  if (MACOS_PREVIEW_PUBLIC_CONFIGURATION.centralOrigin
-      !== endpoints.public.origin
-      || MACOS_PREVIEW_PUBLIC_CONFIGURATION.sparkleAppcastURL
-        !== endpoints.sparkle.previewAppcastURL) {
-    fail("macOS preview defaults must match config/deployment-endpoints.js");
-  }
   if (APPROVED_R2_BUCKET !== endpoints.sparkle.r2Bucket
       || CANONICAL_UPDATE_ORIGIN !== endpoints.sparkle.origin
       || CANONICAL_APPCAST_URL !== endpoints.sparkle.appcastURL) {
@@ -319,7 +301,7 @@ export function validateDeploymentEndpointConsumers({
   }
 
   for (const [source, label] of [
-    [buildSource, "macOS build"],
+    [electronRuntimeSource, "Electron desktop runtime"],
     [macOSReleaseSource, "macOS signed-release build"],
     [publisherSource, "Sparkle publisher"],
   ]) {
@@ -328,12 +310,8 @@ export function validateDeploymentEndpointConsumers({
     rejectEmbeddedEndpoint(source, endpoints.sparkle.origin, label);
     rejectEmbeddedEndpoint(source, endpoints.sparkle.r2Bucket, label);
   }
-  if (!buildSource.includes("UsageMonitorPublicWebsiteOrigin")) {
-    fail("macOS build must generate the native public website origin");
-  }
-  if (nativeSource.includes(endpoints.public.origin)
-      || !nativeSource.includes("BundledProduct.publicWebsiteOrigin")) {
-    fail("native About must use its bundled public website origin");
+  if (!electronRuntimeSource.includes("DEPLOYMENT_ENDPOINTS.public.origin")) {
+    fail("Electron desktop runtime must use the reviewed public origin");
   }
   if (!workerTypes.includes(
     `PUBLIC_ORIGIN: \"${endpoints.public.origin}\"`,
@@ -427,9 +405,8 @@ export async function checkDeploymentEndpointConsumers({
   workerPackagePath = WORKER_PACKAGE_PATH,
   workerSparkleReleaseContractPath = WORKER_SPARKLE_RELEASE_CONTRACT_PATH,
   sparkleGuardNonceMigrationPath = SPARKLE_GUARD_NONCE_MIGRATION_PATH,
-  macOSBuildPath = MACOS_BUILD_PATH,
+  electronRuntimePath = ELECTRON_RUNTIME_PATH,
   macOSReleaseCorePath = MACOS_RELEASE_CORE_PATH,
-  macOSNativeSourcePath = MACOS_NATIVE_SOURCE_PATH,
   sparklePublisherPath = SPARKLE_PUBLISHER_PATH,
   endpoints = DEPLOYMENT_ENDPOINTS,
 } = {}) {
@@ -439,9 +416,8 @@ export async function checkDeploymentEndpointConsumers({
     workerPackageText,
     workerSparkleReleaseContractText,
     sparkleGuardNonceMigration,
-    buildSource,
+    electronRuntimeSource,
     macOSReleaseSource,
-    nativeSource,
     publisherSource,
   ] = await Promise.all([
     readFile(wranglerConfigPath, "utf8"),
@@ -449,9 +425,8 @@ export async function checkDeploymentEndpointConsumers({
     readFile(workerPackagePath, "utf8"),
     readFile(workerSparkleReleaseContractPath, "utf8"),
     readFile(sparkleGuardNonceMigrationPath, "utf8"),
-    readFile(macOSBuildPath, "utf8"),
+    readFile(electronRuntimePath, "utf8"),
     readFile(macOSReleaseCorePath, "utf8"),
-    readFile(macOSNativeSourcePath, "utf8"),
     readFile(sparklePublisherPath, "utf8"),
   ]);
   const wranglerConfiguration = parseWranglerConfiguration(wranglerText);
@@ -469,9 +444,8 @@ export async function checkDeploymentEndpointConsumers({
     endpoints,
   );
   const consumers = validateDeploymentEndpointConsumers({
-    buildSource,
+    electronRuntimeSource,
     macOSReleaseSource,
-    nativeSource,
     publisherSource,
     workerTypes,
     endpoints,
