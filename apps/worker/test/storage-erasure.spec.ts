@@ -89,7 +89,50 @@ async function completedSharedFeature(ownerDigest:string){
  }
  throw new Error('synthetic shared feature bound');
 }
+async function seedNewAnalyticsFamilies(ownerDigest:string){
+ const owner=await target().prepare('SELECT revision,authority_epoch FROM analytics_owner_state WHERE source_id=? AND owner_digest=?')
+  .bind(sourceId,ownerDigest).first<{revision:number;authority_epoch:number}>();
+ if(!owner)throw new Error('synthetic missing analytics owner');
+ await target().prepare(`INSERT INTO analytics_model_block_policy
+  (source_id,owner_digest,policy_revision,source_namespace,owner_revision,authority_epoch,
+   input_revision,method,authority_digest,today_day,updated_ms) VALUES(?,?,1,?,?,?,?,?,?,?,?)`)
+  .bind(sourceId,ownerDigest,sourceNamespace,owner.revision,owner.authority_epoch,1,
+   'synthetic-erasure','b'.repeat(64),today(),Date.now()).run();
+ await target().prepare(`INSERT INTO analytics_shared_feature_days
+  (job_key,source_id,source_namespace,owner_digest,day,method_digest,dependency_digest,
+   owner_revision,authority_epoch,input_revision,updated_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
+  .bind('a'.repeat(64),sourceId,sourceNamespace,ownerDigest,today(),'b'.repeat(64),'c'.repeat(64),
+   owner.revision,owner.authority_epoch,1,Date.now()).run();
+}
 describe('cross-store physical erasure completion',()=>{
+ it('uses the old public owner route with new model and shared-feature fence triggers',async()=>{
+  const f=await fixture();await deliver();await seedNewAnalyticsFamilies(f.event.ownerDigest);
+  expect(await count('analytics_model_block_policy')).toBe(1);
+  expect(await count('analytics_shared_feature_days')).toBe(1);
+  expect(await eraseParticipantAsOwner(runtime(),'synthetic-admin',f.participantId)).toMatchObject({deleted:true});
+  expect(await count('analytics_model_block_policy')).toBe(0);
+  expect(await count('analytics_shared_feature_days')).toBe(0);
+  expect(await count('analytics_storage_erasure_receipts')).toBe(1);
+ });
+ it('withholds the old public receipt when new-family cleanup triggers are absent',async()=>{
+  const f=await fixture();await deliver();await seedNewAnalyticsFamilies(f.event.ownerDigest);
+  for(const trigger of [
+   'analytics_model_block_policy_terminal_insert','analytics_model_block_policy_terminal_update',
+   'analytics_model_block_policy_owner_update','analytics_model_block_policy_owner_delete',
+   'analytics_shared_feature_terminal_insert','analytics_shared_feature_terminal_update',
+   'analytics_shared_feature_owner_update','analytics_shared_feature_owner_delete',
+  ])await target().prepare(`DROP TRIGGER ${trigger}`).run();
+  await expect(eraseParticipantAsOwner(runtime(),'synthetic-admin',f.participantId))
+   .rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
+  expect(await count('analytics_model_block_policy')).toBe(1);
+  expect(await count('analytics_shared_feature_days')).toBe(1);
+  expect(await count('analytics_storage_erasure_receipts')).toBe(0);
+  expect(await b.DELETION_LEDGER.prepare('SELECT state FROM storage_erasure_jobs').first('state')).toBe('pending');
+  await target().prepare('DELETE FROM analytics_model_block_policy').run();
+  await target().prepare('DELETE FROM analytics_shared_feature_days').run();
+  await drain();
+  expect(await count('analytics_storage_erasure_receipts')).toBe(1);
+ });
  it('keeps erasure completion compatible with analytics schemas before model blocks',async()=>{
   await reset();await initialize(b.TEST_ANALYTICS_MIGRATIONS.filter(migration=>migration.name<'0030_'));
   const f=await fixture();await deliver();

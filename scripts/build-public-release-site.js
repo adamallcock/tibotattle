@@ -11,7 +11,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { readElectronSitePublication, renderElectronSiteDownloads, renderElectronSiteDocumentation } from "./lib/electron-public-site.mjs";
+import { readElectronSitePublication, readPublishedElectronSiteRelease, renderElectronSiteDownloads, renderElectronSiteDocumentation } from "./lib/electron-public-site.mjs";
 import { isIP } from "node:net";
 import { homedir } from "node:os";
 import {
@@ -239,6 +239,9 @@ function usage() {
     "    Intel requires the same canonical cross-platform release manifest as Apple silicon.",
     "    [--electron-publication-plan /absolute/plan.json --electron-publication-root /absolute/artifacts",
     "     --electron-approved-plan-sha256 <reviewed identityDigest(plan)>]",
+    "    [--electron-published-manifest /absolute/release-manifest.json",
+    "     --electron-published-manifest-sha256 <attested manifest SHA-256>",
+    "     --electron-published-build-number <released build number>]",
     "    --social-image is the og:image/twitter:image. Use a rendered 1200x630 homepage",
     "    card from `npm run product:social-preview`; Electron mode also accepts an exact",
     "    copy of the 1024x1024 public brand icon, which downgrades to a summary card.",
@@ -254,6 +257,9 @@ export function parseArgs(argv) {
     "--electron-publication-plan": "electronPublicationPlan",
     "--electron-publication-root": "electronPublicationRoot",
     "--electron-approved-plan-sha256": "electronApprovedPlanSha256",
+    "--electron-published-manifest": "electronPublishedManifest",
+    "--electron-published-manifest-sha256": "electronPublishedManifestSha256",
+    "--electron-published-build-number": "electronPublishedBuildNumber",
     "--source": "source",
     "--site-url": "siteUrl",
     "--installer-path": "installerPath",
@@ -503,11 +509,21 @@ function validateInputs(args) {
   });
   const electronKeys = ['electronPublicationPlan', 'electronPublicationRoot', 'electronApprovedPlanSha256'];
   const electronConfigured = electronKeys.some(key => args[key] !== undefined);
+  const publishedKeys = ['electronPublishedManifest', 'electronPublishedManifestSha256', 'electronPublishedBuildNumber'];
+  const publishedConfigured = publishedKeys.some(key => args[key] !== undefined);
   if (electronConfigured && (electronKeys.some(key => !args[key]) || installerConfigured
+      || publishedConfigured
       || INTEL_INSTALLER_OPTION_KEYS.some(key => args[key])
       || !isAbsolute(args.electronPublicationPlan) || !isAbsolute(args.electronPublicationRoot)
       || !/^[a-f0-9]{64}$/u.test(args.electronApprovedPlanSha256))) {
     throw new TypeError('Electron publication requires all three explicit inputs and excludes native installer inputs');
+  }
+  if (publishedConfigured && (publishedKeys.some(key => !args[key]) || installerConfigured
+      || INTEL_INSTALLER_OPTION_KEYS.some(key => args[key])
+      || !isAbsolute(args.electronPublishedManifest)
+      || !/^[a-f0-9]{64}$/u.test(args.electronPublishedManifestSha256)
+      || !/^\d{10}$/u.test(args.electronPublishedBuildNumber))) {
+    throw new TypeError('Published Electron release requires all three explicit inputs and excludes native installer inputs');
   }
   const intelInstallerConfigured = INTEL_INSTALLER_OPTION_KEYS.some((key) =>
     args[key] !== undefined && args[key] !== null && args[key] !== "");
@@ -552,7 +568,9 @@ function validateInputs(args) {
     architectures: ["x64"],
     architecturesText: "x64",
   } : null;
-  const releaseInputs = [installerPath, installerReleaseManifest, intelInstaller?.installerPath, ...(electronConfigured ? [args.electronPublicationPlan, args.electronPublicationRoot] : [])].filter(Boolean);
+  const releaseInputs = [installerPath, installerReleaseManifest, intelInstaller?.installerPath,
+    ...(electronConfigured ? [args.electronPublicationPlan, args.electronPublicationRoot] : []),
+    ...(publishedConfigured ? [args.electronPublishedManifest] : [])].filter(Boolean);
   if (output === source
       || output === REPOSITORY_ROOT
       || output === homedir()
@@ -596,6 +614,9 @@ function validateInputs(args) {
     installerConfigured,
     electronPublication: electronConfigured ? { planPath: args.electronPublicationPlan,
       artifactRoot: args.electronPublicationRoot, approvedPlanSha256: args.electronApprovedPlanSha256 } : null,
+    electronPublishedRelease: publishedConfigured ? { manifestPath: args.electronPublishedManifest,
+      approvedManifestSha256: args.electronPublishedManifestSha256,
+      buildNumber: args.electronPublishedBuildNumber } : null,
     intelInstaller,
   };
   if (!installerConfigured) return options;
@@ -748,6 +769,8 @@ async function assertReleaseSitePathBoundaries(options) {
   const electronInputs = options.electronPublication ? [
     await canonicalReleasePath(options.electronPublication.planPath, 'Electron publication plan'),
     await canonicalReleasePath(options.electronPublication.artifactRoot, 'Electron artifact root', { directory: true }),
+  ] : options.electronPublishedRelease ? [
+    await canonicalReleasePath(options.electronPublishedRelease.manifestPath, 'Published Electron release manifest'),
   ] : [];
   const releaseInputs = [installerPath, installerManifest, intelInstallerPath, ...electronInputs].filter(Boolean);
   if (output === source
@@ -1558,7 +1581,10 @@ export async function buildPublicReleaseSite(rawArgs, {
     TypeError,
   );
   const electronRelease = options.electronPublication
-    ? await readElectronSitePublication({ ...options.electronPublication, verifyPublishedInstaller }) : null;
+    ? await readElectronSitePublication({ ...options.electronPublication, verifyPublishedInstaller })
+    : options.electronPublishedRelease
+      ? await readPublishedElectronSiteRelease({ ...options.electronPublishedRelease, verifyPublishedInstaller })
+      : null;
   let installerEvidence = null;
   let intelInstallerEvidence = null;
   if (options.installerConfigured) {

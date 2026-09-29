@@ -25,27 +25,33 @@ function series() {
       days: ["2026-09-01", "2026-09-02", "2026-09-03", "2026-09-04", "2026-09-05"].map((day, index) => ({
         day,
         byPlanType: { pro: summary(2000), prolite: summary(index === 2 ? null : 1000), plus: summary(3000) },
-        models: index === 3 ? [["gpt-5.5", 4500, 2], ["gpt-6-astra", 6000, 3]]
+        models: index === 3 ? [["gpt-5.5", 4500, 2], ["gpt-6-astra", 6000, 3],
+          ["gpt-6-sol", 3000, 2], ["gpt-6-luna", 500, 1]]
           : index === 4 ? [["gpt-6-astra", 6500, 3]] : [],
       })),
     },
   };
 }
 
-test("30-day comparisons use identical date and dollar axes", () => {
+test("30-day comparisons keep dates aligned and use view-specific positive dollar axes", () => {
   const models = ["aggregate", "plans", "models"].map(view => buildCommunityAllowanceChartModel(series(), { view, rangeDays: 30 }));
   for (const model of models) {
     assert.ok(model);
     assert.deepEqual(model.dayTicks, models[0].dayTicks);
-    assert.deepEqual(model.dollarTicks, models[0].dollarTicks);
-    assert.deepEqual(model.plot, models[0].plot);
-    assert.ok(model.dollarTicks.at(-1).value >= 6500);
+    assert.equal(model.dollarTicks[0].value > 0, true);
   }
+  assert.notDeepEqual(models[0].dollarTicks, models[2].dollarTicks);
+  assert.equal(models[0].height, models[1].height * 1.5);
+  assert.equal(models[2].height, models[0].height);
+  assert.ok(models[2].dollarTicks.at(-1).value >= 6500);
   assert.equal(models[1].legendSeries.length, 3);
-  assert.deepEqual(models[2].legendSeries.map(item => item.label), ["GPT-6 Astra", "GPT-5.5"]);
+  assert.deepEqual(models[1].cardSeries.map(item => item.key), ["plus", "prolite", "pro"]);
+  assert.deepEqual(models[1].latestSummaries.map(item => item.seriesKey), ["plus", "prolite", "pro"]);
+  assert.deepEqual(models[2].legendSeries.map(item => item.label),
+    ["GPT-6 Astra", "GPT-6 Sol", "GPT-6 Luna"]);
 });
 
-test("All fits the selected view's evidence dates without changing dollar scales", () => {
+test("All fits the selected view's evidence dates and dollar scale", () => {
   const data = series();
   const aggregate = buildCommunityAllowanceChartModel(data);
   const model = buildCommunityAllowanceChartModel(data, { view: "models" });
@@ -53,21 +59,34 @@ test("All fits the selected view's evidence dates without changing dollar scales
   assert.equal(model.dots[0].x, model.plot.left);
   assert.equal(model.dots.at(-1).x, model.plot.right);
   assert.equal(aggregate.dayTicks[0].day, "2026-09-01");
-  assert.deepEqual(model.dollarTicks, aggregate.dollarTicks);
+  assert.ok(model.dollarTicks[0].value > 0);
+  assert.notDeepEqual(model.dollarTicks, aggregate.dollarTicks);
 });
 
-test("preferred model order is stable for cards, legend and same-day inspection without hiding other models", () => {
+test("each plan's own-week chart gets a rounded positive floor", () => {
   const data = series();
-  const preferred = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"];
+  for (const key of ["plus", "prolite", "pro"]) {
+    const model = buildCommunityAllowanceChartModel(data, { view: "plans", seriesKeys: [key] });
+    assert.equal(model.legendSeries[0].key, key);
+    assert.ok(model.dollarTicks[0].value > 0);
+    assert.ok(model.dollarTicks[0].value < Math.min(...model.dots.map(dot => dot.band80Usd?.lowerUsd ?? dot.centralUsd)));
+  }
+});
+
+test("public model order is exact across cards, legend and same-day inspection", () => {
+  const data = series();
+  const preferred = ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna",
+    "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"];
   const ids = ["gpt-5.4", ...preferred.toReversed()];
   data.breakdowns.modelConfig = ids.map(modelId => ({ modelId, label: modelId }));
-  data.breakdowns.days.at(-1).models = ids.map(id => [id, 1500, 1]);
+  data.breakdowns.days.at(-1).models = [...ids, "gpt-5.5"].map(id => [id, 1500, 1]);
   const model = buildCommunityAllowanceChartModel(data, { view: "models" });
-  const expected = [...preferred, "gpt-5.4"];
-  assert.deepEqual(model.legendSeries.map(item => item.key), expected);
-  assert.deepEqual(model.latestSummaries.map(item => item.seriesKey), expected);
-  assert.deepEqual(model.dots.filter(dot => dot.day === "2026-09-05").map(dot => dot.seriesKey), expected);
-  assert.deepEqual(model.legendSeries.slice(0, 5).map(item => item.theme), ["astra", "sol", "terra", "luna", "classic"]);
+  assert.deepEqual(model.legendSeries.map(item => item.key), preferred);
+  assert.deepEqual(model.cardSeries.map(item => item.key), preferred);
+  assert.deepEqual(model.latestSummaries.map(item => item.seriesKey), preferred);
+  assert.deepEqual(model.dots.filter(dot => dot.day === "2026-09-05").map(dot => dot.seriesKey), preferred);
+  assert.deepEqual(model.legendSeries.map(item => item.theme),
+    ["astra", "sol", "luna", "terra", "sol", "luna"]);
   assert.deepEqual(data.breakdowns.modelConfig.map(item => item.modelId), ids, "catalog is never reordered in place");
 });
 
@@ -95,7 +114,9 @@ test("model points start with observed evidence and never acquire a fabricated b
   assert.ok(astra.dots.every(dot => dot.fitCount === null && dot.participantCount === 3));
   assert.deepEqual(model.bandSegments, []);
   assert.equal(model.sparse, true);
-  assert.equal(model.latestSummaries.length, 2);
+  assert.equal(model.latestSummaries.length, 3);
+  assert.equal(model.cardSeries.length, 6);
+  assert.equal(model.cardSeries.filter(item => item.latest === null).length, 3);
 });
 
 test("plan lines and uncertainty bands break at missing evidence", () => {
@@ -125,7 +146,7 @@ test("date range and absent public breakdowns fail honestly without affecting ag
 
 test("public view controls and method caveats are translated in every shipped language", () => {
   for (const locale of ["en-US", "zh-Hans", "es"]) {
-    for (const suffix of ["viewLabel", "viewAggregate", "viewPlans", "viewModels", "smallSampleDisclosure", "breakdownsUnavailable", "modelsAccumulating", "planMethod", "modelMethod", "planChartLabel", "modelChartLabel", "planChartDescription", "modelChartDescription", "cardsCaption", "legendFocus"]) {
+    for (const suffix of ["viewLabel", "viewAggregate", "viewPlans", "viewModels", "smallSampleDisclosure", "breakdownsUnavailable", "modelsAccumulating", "noModelEstimate", "planMethod", "modelMethod", "planChartLabel", "modelChartLabel", "planChartDescription", "modelChartDescription", "cardsCaption", "legendFocus"]) {
       const key = `community.allowance.${suffix}`;
       const value = translate(key, {}, locale);
       assert.notEqual(value, key);
@@ -159,6 +180,8 @@ test("the closed public wire survives normalization into all three chart views",
   assert.equal(normalized.state, "published");
   assert.equal(normalized.breakdowns.days.length, 35);
   assert.ok(normalized.breakdowns.modelConfig.some(model => model.modelId === "gpt-6-astra"));
+  assert.deepEqual(normalized.breakdowns.modelConfig.map(model => model.modelId),
+    ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"]);
   assert.ok(normalized.breakdowns.modelConfig.every(model => model.modelId !== "gpt-5.3-codex-spark"));
   for (const view of ["aggregate", "plans", "models"]) {
     assert.ok(buildCommunityAllowanceChartModel(normalized, { view }).dots.length > 0);
@@ -300,8 +323,14 @@ test("real public render shows model sample semantics, per-view labels and discl
       assert.match(container.text, /GPT-6 Astra/u);
       assert.match(container.text, /1 source/u);
       const cards = container.descendants().filter(element => element.tag === "article");
+      assert.deepEqual(cards.map(card => card.descendants().find(element => element.tag === "h3")?.text),
+        ["GPT-6 Astra", "GPT-6 Sol", "GPT-6 Luna", "GPT-5.6 Terra", "GPT-5.6 Sol", "GPT-5.6 Luna"]);
+      assert.doesNotMatch(container.text, /GPT-5.5/u);
+      assert.match(cards[3].text, /No published estimate yet/u);
       assert.match(cards[0].text.trim(), /^GPT-6 Astra/u);
       assert.match(cards[0].className, /allowance-model-astra/u);
+      assert.ok(cards.every(card => !/\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{1,2}, \d{4}\b/u.test(card.text)),
+        "model cards show source counts without repeating the publication day");
       assert.ok(cards.every(card => !card.text.includes("per 7 days")), "one shared unit caption replaces repeated card prose");
       assert.ok(cards.every(card => card.descendants().some(element => element.attributes.get("aria-hidden") === "true")));
       assert.equal(svg.attributes.get("aria-label"), "Community allowance by model");
@@ -310,12 +339,15 @@ test("real public render shows model sample semantics, per-view labels and discl
     } else if (view === "plans") {
       // Nothing is scaled any more: each plan is charted on its own axis at its
       // own week, so the old "Pro 5× ×4, Plus ×20" note would be a lie.
-      assert.match(container.text, /its own week at API prices, on its own scale/u);
+      assert.match(container.text, /Shading shows the middle 80% of qualifying reset fits/u);
+      assert.doesNotMatch(container.text, /Each plan is charted|Card values repeat/u);
       assert.equal(svg.attributes.get("aria-label"), "Community allowance by plan");
       const normalized = normalizeCommunityDailySeries(publicAllowanceFixture());
       const summaries = buildCommunityAllowanceChartModel(normalized, { view: "plans" }).latestSummaries;
       const cards = container.descendants().filter(element => element.tag === "article");
       assert.equal(cards.length, 3);
+      assert.ok(cards.every(card => !/\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{1,2}, \d{4}\b/u.test(card.text)),
+        "plan cards show source counts without repeating the publication day");
       cards.forEach((card, index) => {
         // The card LEADS with the plan's own week and carries the reference
         // equivalent underneath, which is the inverse of the old layout.
@@ -335,6 +367,21 @@ test("real public render shows model sample semantics, per-view labels and discl
   assert.equal(renderCommunityAllowanceSection({ documentRef, container, payload: emptyModels, view: "models" }), "estimates_accumulating");
   assert.match(container.text, /No identified model estimates/u);
   assert.doesNotMatch(container.text, /no reset fit has qualified/u);
+});
+
+test("the source disclosure can sit beside the introduction without leaving a result gap", () => {
+  const documentRef = { documentElement: { lang: "en-US" }, createElement: tag => new Element(tag),
+    createElementNS: (_, tag) => new Element(tag) };
+  const container = new Element("div");
+  const sourceContainer = new Element("div");
+  const payload = publicAllowanceFixture(NOW);
+  assert.equal(renderCommunityAllowanceSection({ documentRef, container, sourceContainer, payload }), "published");
+  assert.match(sourceContainer.text, /About these sources/u);
+  assert.match(sourceContainer.text, /single source.*estimated capacity/u);
+  assert.doesNotMatch(container.text, /About these sources/u);
+  payload.allowanceState = "updating";
+  assert.equal(renderCommunityAllowanceSection({ documentRef, container, sourceContainer, payload }), "allowance_updating");
+  assert.equal(sourceContainer.children.length, 0, "unavailable estimates do not leave a stale disclosure");
 });
 
 test("legend focus dims other series without discarding data and limits keyboard inspection to that series", () => {
@@ -360,7 +407,8 @@ test("legend focus dims other series without discarding data and limits keyboard
   assert.equal(astra.attributes.get("aria-pressed"), "false");
   assert.ok(svg.descendants().every(element => element.attributes.get("data-muted") !== "true"));
   svg.fire("keydown", { key: "End" });
-  assert.match(tooltip.text, /GPT-5.5/u);
+  assert.match(tooltip.text, /GPT-5.6 Sol/u);
+  assert.doesNotMatch(container.text, /GPT-5.5/u);
 });
 
 test("a changed publication preserves selected legend, inspected date and chart focus using only new point values", () => {

@@ -65,7 +65,7 @@ const PUBLIC_RELEASE_ASSET_BASENAMES = Object.freeze([
   "feature-insights.js",
   "feature-tour.css",
   "feature-tour.js",
-  "feature-value.jpg",
+  "feature-value.png",
   "feature-week.js",
   "github.svg",
   "i18n.generated.js",

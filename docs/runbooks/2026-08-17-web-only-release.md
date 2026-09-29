@@ -228,12 +228,41 @@ base before Wrangler starts. A newer deployment makes this receipt stale: merge
 the intended changes onto the new base and requalify, never auto-adopt live
 source or bypass the guard. Interrupted outcomes use the production operation
 journal and [explicit recovery procedure](production-operations.md#guarded-deployment-wrapper).
+A proven pre-mutation refusal with no retained lock may use the same valid
+receipt and a fresh, absolute private `--operation` directory after its cause
+is fixed. Preserve the first journal. An uncertain or attempted deployment
+must be reconciled, never retried with a fresh directory.
 
 ```bash
 npm run product:web-release:deploy -- \
   --receipt "$PWD/.release-build/web-release-receipt.json" \
   --confirm DEPLOY_PRODUCTION
 ```
+
+When production uses typed storage, use the same receipt entry point with an
+owner-private live inventory. First run the read-only `production:reconcile`
+procedure in [Production operations](production-operations.md#guarded-deployment-wrapper)
+against this clean candidate and require all database roles to qualify. Pin the
+current public manifest bytes and the full deployed source commit that produced
+them. The receipt supplies the candidate manifest SHA-256; the command verifies
+the live preimage and candidate postimage separately and preserves the live
+bindings, schedules, ingress, and secrets. Typed website publication never
+accepts `--confirm-migrations` and never applies a database migration.
+
+```bash
+npm run product:web-release:deploy -- \
+  --receipt "$PWD/.release-build/web-release-receipt.json" \
+  --confirm DEPLOY_PRODUCTION \
+  --inventory /absolute/private/live-inventory.json \
+  --inventory-sha256 <reviewed-inventory-sha256> \
+  --retained-public-source <full-deployed-public-source-sha> \
+  --expected-live-manifest-sha256 <reviewed-live-manifest-sha256>
+```
+
+If the candidate source changes after preparation, prepare a new receipt before
+deployment. A source whose typed schema differs from production cannot use this
+website-only lane; build a clean candidate from the live source and carry only
+the reviewed public-site closure.
 
 Never substitute a raw `wrangler deploy` command: it would bypass the
 web-only receipt and source-scope checks. Record the successful source commit,
@@ -254,6 +283,33 @@ commit. Other agents can prepare their own candidates in separate worktrees;
 release one candidate at a time against the latest recorded deployed base.
 
 ## Reviewed Electron stable downloads
+
+### Reuse an already-published release without its private build plan
+
+For a website-only update after the release worktree has been retired, use the
+canonical `release-manifest.json` asset from the existing GitHub release. First
+run `gh release verify vX.Y.Z --repo adamallcock/tibotattle` and confirm the
+release assets pass attestation verification. Download that exact manifest,
+record its SHA-256, and check its version, source commit, repository, and four
+direct installer records. Retain the digest with the local publication receipt.
+This is a recovery intake for an already-published release, not a way to create
+new installer trust claims or reconstruct a missing private plan.
+
+Pass `--electron-published-manifest`, `--electron-published-manifest-sha256`,
+and `--electron-published-build-number` to `product:web-release:prepare` after
+the `--` separator. The build number must be taken from the currently live
+`release-site-manifest.json` for that same installer version. The generator
+validates the canonical release schema, exact four installer targets and
+platform assurances and release tag; it streams and hashes each public
+GitHub installer before writing a production-qualified site manifest. The
+web-only receipt and deploy guards remain unchanged. Never claim that the
+local digest check itself verifies a release attestation; `gh release verify`
+is the separate cryptographic gate.
+
+Do not pass the private-plan flags or native installer flags with this mode.
+Keep the release manifest outside the public source and generated output.
+
+### Reuse a retained reviewed publication plan
 
 For a four-target normal Electron release, use the same public-site generator
 with `--electron-publication-plan`, `--electron-publication-root`, and

@@ -145,14 +145,22 @@ test("web-only scope accepts only committed public source and release controls",
   assert.equal(isAllowedWebReleasePath("apps/web/public/community.js"), true);
   assert.equal(isAllowedWebReleasePath("apps/web/public/community-refresh.js"), true);
   assert.equal(isAllowedWebReleasePath("apps/web/test/community-refresh.test.mjs"), true);
+  assert.equal(isAllowedWebReleasePath("apps/web/test/fixtures/public-allowance.js"), true);
   assert.equal(isAllowedWebReleasePath("apps/web/test/public-allowance-views.test.mjs"), true);
   assert.equal(isAllowedWebReleasePath("apps/web/test/community-cache-retention.test.mjs"), true);
   assert.equal(isAllowedWebReleasePath("apps/web/public/feature-tour.js"), true);
   assert.equal(isAllowedWebReleasePath("apps/web/public/feature-tour.css"), true);
+  for (const asset of [
+    "cache-reuse-matrix.css", "cache-reuse-matrix.js",
+    "model-performance.css", "model-performance.js",
+  ]) assert.equal(isAllowedWebReleasePath(`apps/web/public/${asset}`), true);
+  assert.equal(isAllowedWebReleasePath("apps/web/test/cache-reuse-matrix.test.mjs"), true);
+  assert.equal(isAllowedWebReleasePath("apps/web/test/feature-insights.test.mjs"), true);
   assert.equal(isAllowedWebReleasePath("apps/web/test/feature-tour.test.mjs"), true);
   assert.equal(isAllowedWebReleasePath("apps/web/public/feature-tour-private.js"), false);
   // Still an exact allowlist, not a prefix: a sibling nobody named stays out.
   assert.equal(isAllowedWebReleasePath("apps/web/test/unlisted.test.mjs"), false);
+  assert.equal(isAllowedWebReleasePath("apps/web/test/fixtures/unreviewed.js"), false);
   assert.equal(isAllowedWebReleasePath("apps/web/public/unreviewed.js"), false);
   assert.equal(isAllowedWebReleasePath("scripts/preview-public-release-site.js"), true);
   assert.equal(
@@ -311,12 +319,96 @@ test("web-only deployment delegates the receipt-pinned SHA to the production gua
       confirmation: "DEPLOY_PRODUCTION",
       confirmedMigrations: null,
       receiptPath,
+      operationDirectory: null,
+      inventoryPath: null,
+      inventorySha256: null,
+      retainedPublicSourceCommit: null,
+      expectedLiveManifestSha256: null,
     },
   );
   assert.throws(
     () => parseDeployWebReleaseArgs(["--receipt", receiptPath]),
     /receipt and explicit confirmation/u,
   );
+});
+
+test("web-only typed deployment pins the candidate manifest from the verified receipt", async () => {
+  const sourceCommit = "a".repeat(40);
+  const baseCommit = "b".repeat(40);
+  const candidateManifest = "c".repeat(64);
+  const liveManifest = "d".repeat(64);
+  const typedProduction = { inventory: {}, provider: {} };
+  let passed;
+  await deployWebRelease({
+    repositoryRoot: "/tmp/web-release-candidate",
+    receiptPath: "/tmp/web-release-candidate/.release-build/web-release-receipt.json",
+    confirmation: "DEPLOY_PRODUCTION",
+    operationDirectory: "/tmp/web-release-candidate/.release-build/production-operations/fresh",
+    typedProduction,
+    retainedPublicSourceCommit: baseCommit,
+    expectedLiveManifestSha256: liveManifest,
+    verifyReceipt: async () => ({
+      receipt: { site: { manifestSha256: candidateManifest } },
+      scope: { sourceCommit, baseCommit },
+    }),
+    runProduction: async (options) => {
+      passed = options;
+      return { ok: true };
+    },
+  });
+  assert.equal(passed.operationDirectory, "/tmp/web-release-candidate/.release-build/production-operations/fresh");
+  assert.equal(passed.typedProduction, typedProduction);
+  assert.equal(passed.retainedPublicSourceCommit, baseCommit);
+  assert.equal(passed.expectedLiveManifestSha256, liveManifest);
+  assert.equal(passed.candidatePublicManifestSha256, candidateManifest);
+  assert.equal(passed.expectedSourceCommit, sourceCommit);
+  assert.equal(passed.expectedPreviousSourceCommit, baseCommit);
+
+  assert.deepEqual(parseDeployWebReleaseArgs([
+    "--receipt", "/tmp/receipt.json",
+    "--confirm", "DEPLOY_PRODUCTION",
+    "--operation", "/tmp/web-release-candidate/.release-build/production-operations/fresh",
+    "--inventory", "/tmp/inventory.json",
+    "--inventory-sha256", "1".repeat(64),
+    "--retained-public-source", baseCommit,
+    "--expected-live-manifest-sha256", liveManifest,
+  ]), {
+    confirmation: "DEPLOY_PRODUCTION",
+    confirmedMigrations: null,
+    receiptPath: "/tmp/receipt.json",
+    operationDirectory: "/tmp/web-release-candidate/.release-build/production-operations/fresh",
+    inventoryPath: "/tmp/inventory.json",
+    inventorySha256: "1".repeat(64),
+    retainedPublicSourceCommit: baseCommit,
+    expectedLiveManifestSha256: liveManifest,
+  });
+  for (const extra of [
+    ["--operation", "relative/operation"],
+    ["--operation", "/tmp/bad\noperation"],
+    ["--inventory", "/tmp/inventory.json"],
+    ["--inventory", "/tmp/inventory.json", "--inventory-sha256", "1".repeat(64),
+      "--retained-public-source", baseCommit, "--expected-live-manifest-sha256", liveManifest,
+      "--confirm-migrations", "USAGE_MONITOR_DB:0001_schema.sql"],
+    ["--inventory", "/tmp/inventory.json", "--inventory-sha256", "not-a-digest",
+      "--retained-public-source", baseCommit, "--expected-live-manifest-sha256", liveManifest],
+  ]) {
+    assert.throws(() => parseDeployWebReleaseArgs([
+      "--receipt", "/tmp/receipt.json", "--confirm", "DEPLOY_PRODUCTION", ...extra,
+    ]), TypeError);
+  }
+  await assert.rejects(deployWebRelease({
+    repositoryRoot: "/tmp/web-release-candidate",
+    receiptPath: "/tmp/web-release-candidate/.release-build/web-release-receipt.json",
+    confirmation: "DEPLOY_PRODUCTION",
+    typedProduction,
+    retainedPublicSourceCommit: baseCommit,
+    expectedLiveManifestSha256: liveManifest,
+    verifyReceipt: async () => ({
+      receipt: { site: { manifestSha256: "bad" } },
+      scope: { sourceCommit, baseCommit },
+    }),
+    runProduction: async () => assert.fail("Invalid candidate must not deploy"),
+  }), /verified candidate manifest/u);
 });
 
 test("web-only preparation refuses a receipt path redirected through a symlink", async (t) => {

@@ -2947,7 +2947,7 @@ footer p { margin: 0; }
   max-width: 690px;
   margin: 0 0 22px;
   color: var(--site-paper);
-  font-size: clamp(3.7rem, 6.4vw, 6.3rem);
+  font-size: clamp(3.7rem, 6.4vw, 75px);
   line-height: .88;
   text-wrap: balance;
 }
@@ -3543,6 +3543,21 @@ footer p { margin: 0; }
   font-size: .69rem;
   line-height: 1.45;
 }
+.community-site .allowance-intro-copy {
+  max-width: 46ch;
+  color: var(--muted);
+  font-size: .69rem;
+  line-height: 1.45;
+}
+.community-site .allowance-intro-copy > span,
+.community-site .allowance-source-summary,
+.community-site .allowance-source-summary .snapshot-disclosure-details { display: inline; }
+.community-site .allowance-source-summary .snapshot-disclosure-details { margin: 0; }
+.community-site .allowance-source-summary .snapshot-disclosure-details > summary {
+  font-size: .69rem;
+  line-height: 1.45;
+}
+.community-site .allowance-source-summary .snapshot-disclosure-details[open] { display: block; }
 .community-site .community-window .allowance-controls {
   gap: 8px;
 }
@@ -3550,7 +3565,7 @@ footer p { margin: 0; }
   font-size: .52rem;
 }
 .community-site .community-window .result-summary {
-  margin-top: 18px;
+  margin-top: 10px;
 }
 .community-site .community-window .allowance-headline-value strong {
   font-size: clamp(2.65rem, 5.5vw, 4.35rem);
@@ -3778,6 +3793,57 @@ footer p { margin: 0; }
 .community-site .table-wrap {
   margin-top: 16px;
 }
+.community-site .snapshot-breakdown > summary {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  font-size: .82rem;
+}
+.community-site .snapshot-breakdown > summary::after { margin-inline-start: auto; }
+@media (max-width: 640px) {
+  /* Keep a year of daily detail in a bounded, keyboard-scrollable region.
+     Two metric columns retain every value without 361 tall card stacks. */
+  .community-site .snapshot-table {
+    max-height: min(65dvh, 560px);
+    overflow: auto;
+    margin-top: 10px;
+  }
+  .community-site .snapshot-table tr {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 2px 12px;
+    margin: 0;
+    padding: 7px 10px;
+    border: 0;
+    border-radius: 0;
+  }
+  .community-site .snapshot-table tr + tr { border-top: 1px solid var(--line); }
+  .community-site .snapshot-table tbody th[scope="row"] {
+    grid-column: 1 / -1;
+    margin: 0;
+    padding: 0 0 3px;
+    border: 0;
+    font-size: .75rem;
+  }
+  .community-site .snapshot-table td {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 1px;
+    min-width: 0;
+    padding: 2px 0;
+    font-size: .76rem;
+    font-weight: var(--weight-semibold);
+    line-height: 1.2;
+  }
+  .community-site .snapshot-table td::before {
+    font-size: .62rem;
+    font-weight: var(--weight-medium);
+    line-height: 1.2;
+  }
+  .community-site .snapshot-table td.numeric { text-align: start; }
+}
 /*
  * The public daily-series chart. Inline SVG only — the site is CSP-strict and
  * dependency-free. Usage-event bars read on the left axis in the chart
@@ -3853,11 +3919,25 @@ footer p { margin: 0; }
   margin: 0;
 }
 .community-site .allowance-view-controls {
-  margin: 14px 0;
-  flex-wrap: wrap;
+  margin: 0;
   max-width: 100%;
 }
 .community-site .allowance-view-controls button { min-height: 40px; }
+.community-site .allowance-picker-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+}
+.community-site .allowance-picker-row .segmented-control { flex-shrink: 0; }
+@media (max-width: 700px) {
+  .community-site .allowance-picker-row .segmented-control button {
+    padding-inline: .5rem;
+    white-space: nowrap;
+  }
+}
 .community-site .community-chart-dialog-toolbar { flex-wrap: wrap; }
 .allowance-summary-cards {
   display: grid;
@@ -3868,8 +3948,18 @@ footer p { margin: 0; }
   gap: 8px;
   margin-top: 8px;
 }
-@media (max-width: 460px) {
-  .allowance-summary-cards { grid-template-columns: minmax(0, 1fr); }
+.community-site .allowance-summary-cards {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+@media (max-width: 600px) {
+  .community-site .allowance-summary-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .allowance-summary-card { padding: 8px 7px; }
+  .allowance-summary-value { font-size: 1.25rem; }
+  .allowance-summary-card h3 { font-size: .72rem; overflow-wrap: anywhere; }
+  .allowance-summary-card p { font-size: .68rem; overflow-wrap: anywhere; }
+}
+@media (max-width: 340px) {
+  .community-site .allowance-summary-cards { grid-template-columns: minmax(0, 1fr); }
 }
 .allowance-summary-card {
   padding: 10px 11px;
@@ -3883,6 +3973,7 @@ footer p { margin: 0; }
 .allowance-summary-card h3 { font-size: .8rem; margin: 0; }
 .allowance-summary-card p { font-size: .72rem; line-height: 1.4; margin: 4px 0 0; }
 .allowance-summary-card .allowance-plan-value { color: var(--ink); }
+.community-site .allowance-legend-button.unavailable { opacity: .55; cursor: default; }
 .allowance-summary-value { font-family: var(--serif); font-size: 1.6rem; line-height: 1.1; }
 .allowance-summary-caption { color: var(--muted); font-size: .72rem; font-weight: var(--weight-semibold); margin: 12px 0 0; }
 .allowance-model-icon { width: 24px; height: 24px; flex: 0 0 auto; fill: none; stroke: var(--allowance-color); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
@@ -3911,7 +4002,7 @@ footer p { margin: 0; }
   padding: 4px 8px; border: 1px solid transparent; border-radius: var(--radius-xs);
   font: inherit; color: var(--muted); background: transparent; cursor: pointer;
 }
-.community-site .allowance-legend-button:hover,
+.community-site button.allowance-legend-button:hover,
 .community-site .allowance-legend-button[aria-pressed="true"] { color: var(--ink); background: var(--surface-raised); border-color: var(--line-strong); }
 .community-site .allowance-legend-button:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
 /* (4) The legend sat in its own block above the plot and cost ~40px of height
@@ -3930,6 +4021,13 @@ footer p { margin: 0; }
   padding: 1px 3px;
 }
 .community-site .allowance-legend-button { min-height: 26px; padding: 2px 6px; font-size: .72rem; }
+/* The expanded chart keeps its credit. Reserve a separate legend row so six
+   model labels can wrap without covering the credit or the plotted values. */
+.community-site .community-chart-dialog .allowance-series-legend {
+  position: static;
+  padding-inline-end: 90px;
+  min-height: 30px;
+}
 
 /* Closed, this is one quiet line — it inherited the journey card treatment and
    stood 105px tall shut, which is worse than the prose it replaced. */
@@ -4716,14 +4814,23 @@ html.community-chart-modal-open body {
   .community-site .topbar {
     column-gap: 3px;
     padding-inline: 8px;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    row-gap: 2px;
   }
   .community-site .brand-icon {
     width: 26px;
     height: 26px;
   }
+  .community-site .primary-nav {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    justify-content: center;
+    flex-wrap: wrap;
+    overflow: visible;
+  }
   .community-site .primary-nav a {
-    padding-inline: .18rem;
-    font-size: .61rem;
+    padding-inline: .4rem;
+    font-size: .69rem;
   }
   .community-site .header-download {
     padding-inline: 0;

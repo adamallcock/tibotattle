@@ -472,29 +472,34 @@
               <div class="activity-heading">
                 <div>
                   <h2 id="community-allowance-heading" data-i18n="community.allowance.heading">Pro 20x-equivalent allowance</h2>
-                  <p data-i18n="community.allowance.heroCopy">API-price value of a Pro 20x-equivalent week: overall, by plan or by model.</p>
+                  <div class="allowance-intro-copy" role="paragraph">
+                    <span data-i18n="community.allowance.heroCopy">API-price value of a Pro 20x-equivalent week: overall, by plan or by model.</span>
+                    <div class="allowance-source-summary" id="community-allowance-source-summary"></div>
+                  </div>
                 </div>
                 <div class="allowance-controls">
                   <span class="evidence-chip neutral" id="community-allowance-state">
                     Checking allowance estimates
                   </span>
-                  <div
-                    class="segmented-control"
-                    id="community-allowance-range-controls"
-                    data-allowance-range-controls
-                    role="group"
-                    aria-label="Allowance estimate date range"
-                    data-i18n-aria-label="aria.allowanceRange"
-                  >
-                    <button type="button" data-range-days="30" class="active" aria-pressed="true">30d</button>
-                    <button type="button" data-range-days="" aria-pressed="false">All</button>
-                  </div>
                 </div>
               </div>
-              <div class="segmented-control allowance-view-controls" data-allowance-view-controls role="group" aria-label="Allowance graph view" data-i18n-aria-label="community.allowance.viewLabel">
-                <button type="button" data-allowance-view="aggregate" class="active" aria-pressed="true" data-i18n="community.allowance.viewAggregate">Aggregate</button>
-                <button type="button" data-allowance-view="plans" aria-pressed="false" data-i18n="community.allowance.viewPlans">By plan</button>
-                <button type="button" data-allowance-view="models" aria-pressed="false" data-i18n="community.allowance.viewModels">By model</button>
+              <div class="allowance-picker-row">
+                <div class="segmented-control allowance-view-controls" data-allowance-view-controls role="group" aria-label="Allowance graph view" data-i18n-aria-label="community.allowance.viewLabel">
+                  <button type="button" data-allowance-view="aggregate" class="active" aria-pressed="true" data-i18n="community.allowance.viewAggregate">Aggregate</button>
+                  <button type="button" data-allowance-view="plans" aria-pressed="false" data-i18n="community.allowance.viewPlans">By plan</button>
+                  <button type="button" data-allowance-view="models" aria-pressed="false" data-i18n="community.allowance.viewModels">By model</button>
+                </div>
+                <div
+                  class="segmented-control"
+                  id="community-allowance-range-controls"
+                  data-allowance-range-controls
+                  role="group"
+                  aria-label="Allowance estimate date range"
+                  data-i18n-aria-label="aria.allowanceRange"
+                >
+                  <button type="button" data-range-days="30" class="active" aria-pressed="true">30d</button>
+                  <button type="button" data-range-days="" aria-pressed="false">All</button>
+                </div>
               </div>
               <div class="result-summary" id="community-allowance-result">
                 <p>Checking for published allowance estimates…</p>
@@ -505,20 +510,24 @@
 
       </section>
 
+      <section class="community-findings" aria-labelledby="community-findings-title">
+        <h2 id="community-findings-title" data-i18n="site.features.community">Community findings</h2>
+      <article class="tour-row tour-cache" id="cache-continuity" tabindex="-1">
+      <div class="tour-copy">
+      <p class="tour-eyebrow" data-i18n="site.features.cache">CACHE CONTINUITY</p>
+      <h3 data-i18n="site.features.cacheTitle">How long does the memory last?</h3>
+      <p data-i18n="site.features.cacheCopy">See cache reuse across time gaps, from under a minute to 24 hours and beyond. Every illuminated cell represents checked follow-ups; the percentages show how often more than half was reused.</p>
+      </div>
+<div class="insight-demo" id="cache-demo"><p class="insight-demo-label" data-i18n="site.features.insightExample">Synthetic demonstration · not measured results or a model benchmark</p><div data-cache-demo></div></div>
+      </article>
       <section
         class="community-proof community-proof-compact"
         id="community"
         data-community-state="checking"
         aria-labelledby="community-method-summary"
       >
-        <!--
-          Open by default. These four figures are the page's community proof, so
-          they must be readable without a click; the disclosure stays so the
-          band can still be folded away, and its summary keeps the exact label
-          the published-site contract pins.
-        -->
-        <details class="community-method" open>
-          <summary id="community-method-summary" data-i18n="community.daily.activitySummary">See community activity</summary>
+        <details class="community-method">
+          <summary id="community-method-summary" data-i18n="community.daily.activitySummary">Explore the contribution history</summary>
           <div class="community-method-body">
             <div class="activity-heading">
               <div>
@@ -536,6 +545,8 @@
         </details>
       </section>
 
+      </section>
+
       <section id="features" class="feature-tour" aria-labelledby="feature-tour-title">
       <p class="tour-eyebrow" data-i18n="site.features.eyebrow">A clearer picture of every session</p>
       <h2 id="feature-tour-title" data-i18n="site.features.heading">There is more to usage than a percentage.</h2>
@@ -551,7 +562,7 @@
 <div class="pace-verdict" aria-live="polite"><p data-demo-verdict data-i18n="site.features.wayCopy">A much earlier stop. Heavy flow makes the gap to reset impossible to miss.</p></div></div>
 <div class="pace-apparatus quota-grid">
 <article class="metric-card quota-tank" data-remaining="33" data-forecast-pool="true" data-stale="false">
-<div class="quota-tank-header"><span class="quota-tank-family"><img class="quota-codex-icon" src="./codex-color.svg" alt=""><span>Codex</span></span><span class="quota-tank-period" data-i18n="site.features.weekly">Weekly allowance</span></div>
+<div class="quota-tank-header"><span class="quota-tank-family"><img class="quota-codex-icon" src="./codex-color.svg" alt=""><span data-i18n="site.features.codex">Codex</span></span><span class="quota-tank-period" data-i18n="site.features.weekly">Weekly allowance</span></div>
 <div class="quota-tank-bottom"><div><strong class="quota-tank-value">33%</strong><span class="quota-tank-caption" data-i18n="allowance.remaining">remaining</span></div></div>
 </article>
 </div>
@@ -582,22 +593,14 @@
           <div class="trends-time-controls"><button id="trends-replay" class="button button-quiet compact" type="button" aria-pressed="false" disabled data-i18n="trends.play">Play history</button><input id="trends-time" type="range" aria-label="Explore history" data-i18n-aria-label="trends.explore" disabled><button id="trends-latest" class="button button-quiet compact" type="button" data-i18n="trends.latest">Latest</button></div>
 <div class="week-demo-charts"><p data-i18n="trends.headerAllowance">Allowance remaining</p><div id="allowance-timeline-chart"></div><div class="trends-reset-legend"><span id="trends-reset-count"></span></div><p id="trends-event-detail" hidden></p><p data-i18n="trends.headerSpend">API equivalent / hour</p><div id="usage-timeline-chart"></div></div><p class="week-demo-label" data-i18n="site.features.weekExample">Synthetic example week · explore the chart or select a reset marker</p></section>
       </article>
-      <article class="tour-row tour-cache" id="cache-continuity" tabindex="-1">
-      <div class="tour-copy">
-      <p class="tour-eyebrow" data-i18n="site.features.cache">03 / CACHE CONTINUITY</p>
-      <h3 data-i18n="site.features.cacheTitle">How long does the memory last?</h3>
-      <p data-i18n="site.features.cacheCopy">See cache reuse across time gaps, from under a minute to 24 hours and beyond. Every illuminated cell represents checked follow-ups; the percentages show how often more than half was reused.</p>
-      </div>
-<div class="insight-demo" id="cache-demo"><p class="insight-demo-label" data-i18n="site.features.insightExample">Synthetic demonstration · not measured results or a model benchmark</p><div data-cache-demo></div></div>
-      </article>
-<article class="tour-row tour-speeds" id="model-speeds" tabindex="-1"><div class="tour-copy"><h3 data-i18n="site.features.speedTitle">How fast does your model actually respond?</h3><p data-i18n="site.features.speedCopy">Compare output speed and time to first token. Select a model, change the period, and inspect the distribution behind each median.</p></div><section class="insight-demo" id="speeds-demo"><p class="insight-demo-label" data-i18n="site.features.insightExample">Synthetic demonstration · not measured results or a model benchmark</p><div data-speeds-demo></div></section></article>      <article class="tour-row tour-value" id="allowance-value" tabindex="-1">
+<article class="tour-row tour-speeds" id="model-speeds" tabindex="-1"><div class="tour-copy"><p class="tour-eyebrow" data-i18n="site.features.speed">03 / MODEL PERFORMANCE</p><h3 data-i18n="site.features.speedTitle">How fast does your model actually respond?</h3><p data-i18n="site.features.speedCopy">Compare output speed and time to first token. Select a model, change the period, and inspect the distribution behind each median.</p></div><section class="insight-demo" id="speeds-demo"><p class="insight-demo-label" data-i18n="site.features.insightExample">Synthetic demonstration · not measured results or a model benchmark</p><div class="model-performance" data-speeds-demo></div></section></article>      <article class="tour-row tour-value" id="allowance-value" tabindex="-1">
       <div class="tour-copy">
       <p class="tour-eyebrow" data-i18n="site.features.value">04 / ALLOWANCE VALUE</p>
       <h3 data-i18n="site.features.valueTitle">Put a value on your allowance.</h3>
       <p data-i18n="site.features.valueCopy">Explore API-price-equivalent estimates across observed resets, with the variation visible. A useful comparison, not your subscription bill or a promised limit.</p>
       </div>
       <figure class="feature-media">
-      <img src="./feature-value.jpg" width="1000" height="728" loading="lazy" alt="Put a value on your allowance." data-i18n-alt="site.features.valueTitle">
+      <img src="./feature-value.png" width="988" height="1007" loading="lazy" alt="Put a value on your allowance." data-i18n-alt="site.features.valueTitle">
       <figcaption>
       <span data-i18n="site.features.preview">App preview · example usage</span>
       </figcaption>
@@ -628,7 +631,8 @@
       </div>
       </section>
 
-<section class="tour-cta"><h2  data-i18n="site.features.cta">Get the full picture of your Codex usage.</h2><a href="#download" data-i18n="site.features.ctaLink">Choose your download →</a></section>
+
+      <div class="getting-started">
       <section
         class="feature-strip"
         id="how-it-works"
@@ -651,6 +655,8 @@
           <p data-i18n="electron.sharing.publicFeatureCopy">Fresh Electron installations share content-free measurements automatically. You can keep sharing off in Settings.</p>
         </article>
       </section>
+<section class="tour-cta"><h2  data-i18n="site.features.cta">Get the full picture of your Codex usage.</h2><a href="#download" data-i18n="site.features.ctaLink">Choose your download →</a></section>
+      </div>
     </main>
 
     <dialog

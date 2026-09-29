@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 
 import process from "node:process";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   PRODUCTION_DEPLOY_CONFIRMATION,
   runProductionDeployment,
 } from "../apps/worker/scripts/production-deploy.mjs";
+import { readPrivateProductionInventory } from "../apps/worker/scripts/production-reconcile.mjs";
+import { createProductionLiveProvider } from "../apps/worker/scripts/production-live-provider.mjs";
 import { verifyWebReleaseReceipt } from "./web-release-lane.js";
 
 const REPOSITORY_ROOT = fileURLToPath(new URL("../", import.meta.url));
@@ -18,6 +20,9 @@ function usage() {
     "    --receipt /absolute/repository/.release-build/web-release-receipt.json \\",
     `    --confirm ${PRODUCTION_DEPLOY_CONFIRMATION} \\`,
     "    [--confirm-migrations BINDING:0000_name.sql,...]",
+    "    [--operation /absolute/private/new-operation-directory]",
+    "    [--inventory PRIVATE_JSON --inventory-sha256 SHA256",
+    "     --retained-public-source FULL_SHA --expected-live-manifest-sha256 SHA256]",
   ].join("\n");
 }
 
@@ -26,10 +31,26 @@ export function parseDeployWebReleaseArgs(argv) {
     confirmation: null,
     confirmedMigrations: null,
     receiptPath: null,
+    operationDirectory: null,
+    inventoryPath: null,
+    inventorySha256: null,
+    retainedPublicSourceCommit: null,
+    expectedLiveManifestSha256: null,
   };
+  const fields = new Map([
+    ["--confirm", "confirmation"],
+    ["--confirm-migrations", "confirmedMigrations"],
+    ["--receipt", "receiptPath"],
+    ["--operation", "operationDirectory"],
+    ["--inventory", "inventoryPath"],
+    ["--inventory-sha256", "inventorySha256"],
+    ["--retained-public-source", "retainedPublicSourceCommit"],
+    ["--expected-live-manifest-sha256", "expectedLiveManifestSha256"],
+  ]);
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    if (!["--confirm", "--confirm-migrations", "--receipt"].includes(arg)) {
+    const field = fields.get(arg);
+    if (!field || parsed[field] !== null) {
       throw new TypeError(`Unknown web-release deployment argument: ${arg}\n${usage()}`);
     }
     const value = argv[index + 1];
@@ -37,12 +58,27 @@ export function parseDeployWebReleaseArgs(argv) {
       throw new TypeError(`Missing value for ${arg}\n${usage()}`);
     }
     index += 1;
-    if (arg === "--confirm") parsed.confirmation = value;
-    else if (arg === "--confirm-migrations") parsed.confirmedMigrations = value;
-    else parsed.receiptPath = value;
+    parsed[field] = value;
   }
   if (!parsed.confirmation || !parsed.receiptPath) {
     throw new TypeError(`A receipt and explicit confirmation are required\n${usage()}`);
+  }
+  if (parsed.operationDirectory !== null
+      && (!isAbsolute(parsed.operationDirectory)
+        || parsed.operationDirectory.length > 4096
+        || /[\0\r\n]/u.test(parsed.operationDirectory))) {
+    throw new TypeError(`A custom operation directory must be an absolute private path\n${usage()}`);
+  }
+  const typedFields = ["inventoryPath", "inventorySha256", "retainedPublicSourceCommit", "expectedLiveManifestSha256"];
+  const typedCount = typedFields.filter((field) => parsed[field] !== null).length;
+  if (typedCount !== 0 && typedCount !== typedFields.length) {
+    throw new TypeError(`Typed production deployment requires every inventory and public-site pin\n${usage()}`);
+  }
+  if (typedCount > 0 && (parsed.confirmedMigrations !== null
+      || !/^[a-f0-9]{64}$/u.test(parsed.inventorySha256)
+      || !/^[a-f0-9]{40}$/u.test(parsed.retainedPublicSourceCommit)
+      || !/^[a-f0-9]{64}$/u.test(parsed.expectedLiveManifestSha256))) {
+    throw new TypeError(`Typed production deployment pins are invalid\n${usage()}`);
   }
   return parsed;
 }
@@ -56,7 +92,11 @@ export async function deployWebRelease({
   repositoryRoot = REPOSITORY_ROOT,
   receiptPath,
   confirmation,
+  operationDirectory = null,
   confirmedMigrations = null,
+  typedProduction = null,
+  retainedPublicSourceCommit = null,
+  expectedLiveManifestSha256 = null,
   runProduction = runProductionDeployment,
   verifyReceipt = verifyWebReleaseReceipt,
 }) {
@@ -72,6 +112,16 @@ export async function deployWebRelease({
     ".bin",
     process.platform === "win32" ? "wrangler.cmd" : "wrangler",
   );
+  if (typedProduction === null && (retainedPublicSourceCommit !== null
+      || expectedLiveManifestSha256 !== null)) {
+    throw new TypeError("Typed web release pins require a private production inventory.");
+  }
+  if (typedProduction !== null && (confirmedMigrations !== null
+      || !/^[a-f0-9]{40}$/u.test(retainedPublicSourceCommit ?? "")
+      || !/^[a-f0-9]{64}$/u.test(expectedLiveManifestSha256 ?? "")
+      || !/^[a-f0-9]{64}$/u.test(verification.receipt?.site?.manifestSha256 ?? ""))) {
+    throw new TypeError("Typed web release requires a verified candidate manifest and complete live pins.");
+  }
   const deployment = await runProduction({
     confirmation,
     confirmedMigrations,
@@ -79,6 +129,13 @@ export async function deployWebRelease({
     expectedPreviousSourceCommit: verification.scope.baseCommit,
     workerDirectory,
     wrangler,
+    ...(operationDirectory === null ? {} : { operationDirectory }),
+    ...(typedProduction === null ? {} : {
+      typedProduction,
+      retainedPublicSourceCommit,
+      expectedLiveManifestSha256,
+      candidatePublicManifestSha256: verification.receipt.site.manifestSha256,
+    }),
   });
   return Object.freeze({
     deployment,
@@ -90,10 +147,26 @@ export async function deployWebRelease({
 async function main() {
   try {
     const parsed = parseDeployWebReleaseArgs(process.argv.slice(2));
+    const inventory = parsed.inventoryPath === null ? null : await readPrivateProductionInventory(
+      parsed.inventoryPath,
+      parsed.inventorySha256,
+    );
     const result = await deployWebRelease({
       confirmation: parsed.confirmation,
       confirmedMigrations: parsed.confirmedMigrations,
       receiptPath: resolve(parsed.receiptPath),
+      operationDirectory: parsed.operationDirectory,
+      ...(inventory === null ? {} : {
+        typedProduction: {
+          inventory,
+          provider: createProductionLiveProvider({
+            accountId: inventory.accountId,
+            workerName: inventory.workerName,
+          }),
+        },
+        retainedPublicSourceCommit: parsed.retainedPublicSourceCommit,
+        expectedLiveManifestSha256: parsed.expectedLiveManifestSha256,
+      }),
     });
     process.stdout.write(`${JSON.stringify(result.deployment, null, 2)}\n`);
     process.exitCode = result.deployment?.ok === true ? 0 : 1;
