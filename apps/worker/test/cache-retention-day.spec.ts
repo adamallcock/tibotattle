@@ -802,7 +802,135 @@ describe('the cache-retention lane',()=>{
    WHERE source_layout='effective'`).first<number>('n')).toBe(1);
   expect(await readCacheRetentionCommunityBands({target:target(),sourceId})
    .then(values=>values.find(row=>row.band==='under_one_minute')))
-   .toMatchObject({adjacencies:2});
+  .toMatchObject({adjacencies:2});
+ });
+ it('replaces a corrected effective own day without changing its carry identity',async()=>{
+  await deliverEffectiveDay();
+  const original:CacheRetentionDayCandidate={...key(),sourceLayout:'effective',
+   deviceId:CACHE_RETENTION_EFFECTIVE_DEVICE_ID,manifestId:CACHE_RETENTION_EFFECTIVE_MANIFEST_ID,
+   manifestDigest:EFFECTIVE_DEPENDENCY_DIGEST};
+  const carry=await readCacheRetentionCarryDays(target(),original);
+  const first=await writeCacheRetentionDay({target:target(),key:original,carry,
+   aggregate:reduce([ev(0),ev(1_000)],[],2)});
+  expect(first).toMatchObject({status:'stored',valueCount:1});
+
+  // A correction to this day changes the manifest identity but not any of
+  // the seven lookback days. The previously published mark stays immutable.
+  const correctedDigest='f'.repeat(64);
+  await deliverEffectiveDay(DAY,OWNER,2,correctedDigest);
+  const corrected={...original,manifestDigest:correctedDigest};
+  expect(await readCacheRetentionCarryDays(target(),corrected)).toEqual(carry);
+  const correctedAggregate=reduce([ev(0),ev(1_000),ev(2_000)],[],3);
+  const advance=()=>advanceCacheRetentionDayLane({target:target(),sourceId,
+   build:async()=>correctedAggregate,deadlineMs:Date.now()+60_000,
+   remainingQueries:100,maxWrites:48,maxDays:1});
+  // The first pass atomically retires just the colliding obsolete identity and
+  // defers. A fresh pass then publishes the corrected day under its own key.
+  expect(await advance()).toMatchObject({state:'deferred',reason:'value_collision',built:0});
+  expect(await target().prepare('SELECT COUNT(*) n FROM analytics_cache_retention_day_values')
+   .first<number>('n')).toBe(0);
+  expect(await advance()).toMatchObject({state:'progress',built:1,staged:0});
+  const second=await readCacheRetentionDay({target:target(),key:corrected,carry});
+  expect(second).toMatchObject({status:'ready',aggregate:correctedAggregate});
+  if(second.status!=='ready')throw new Error('corrected cache mark unavailable');
+  expect(second.markKey).not.toBe(first.markKey);
+  expect(await target().prepare(`SELECT COUNT(*) n FROM analytics_cache_retention_day_marks
+   WHERE source_id=? AND owner_digest=? AND day=?`).bind(sourceId,OWNER,DAY)
+   .first<number>('n')).toBe(1);
+  const current=await readCacheRetentionCommunityBands({target:target(),sourceId});
+  expect(current.find(row=>row.band==='under_one_minute')).toMatchObject({adjacencies:2});
+
+  expect(await writeCacheRetentionDay({target:target(),key:corrected,carry,
+   aggregate:correctedAggregate}))
+   .toMatchObject({status:'stored',markKey:second.markKey,valueCount:1});
+  expect(await target().prepare('SELECT COUNT(*) n FROM analytics_cache_retention_day_values')
+   .first<number>('n')).toBe(1);
+  expect(await retireCacheRetentionDayPage(target(),sourceId)).toMatchObject({state:'idle'});
+  expect(await readCacheRetentionCommunityBands({target:target(),sourceId})).toEqual(current);
+ });
+ it('pages obsolete collisions without deleting the corrected day’s current staging',async()=>{
+  await deliverEffectiveDay();
+  const original:CacheRetentionDayCandidate={...key(),sourceLayout:'effective',
+   deviceId:CACHE_RETENTION_EFFECTIVE_DEVICE_ID,manifestId:CACHE_RETENTION_EFFECTIVE_MANIFEST_ID,
+   manifestDigest:EFFECTIVE_DEPENDENCY_DIGEST};
+  const carry=await readCacheRetentionCarryDays(target(),original);
+  const events=(perGroup:number)=>Array.from({length:17},(_,group)=>
+   Array.from({length:perGroup},(_,item)=>ev(group*100_000+item*1_000,{
+    sessionDigest:group.toString(16).padStart(64,'0'),model:`gpt-5.6-sol-${group}`,
+   }))).flat();
+  const initial=reduce(events(2),[],34);
+  expect(initial.groups).toHaveLength(17);
+  let write=await writeCacheRetentionDay({target:target(),key:original,carry,
+   aggregate:initial,maxWrites:48});
+  for(let attempt=0;attempt<10&&write.status==='staging';attempt++){
+   write=await writeCacheRetentionDay({target:target(),key:original,carry,
+    aggregate:initial,maxWrites:48,cursor:write.cursor});
+  }
+  expect(write).toMatchObject({status:'stored',valueCount:17});
+  await deliverEffectiveDay(DAY,OWNER,2,'f'.repeat(64));
+  const corrected=reduce(events(3),[],51);
+  expect(corrected.groups).toHaveLength(17);
+  const advance=()=>advanceCacheRetentionDayLane({target:target(),sourceId,
+   build:async()=>corrected,deadlineMs:Date.now()+60_000,
+   remainingQueries:100,maxWrites:48,maxDays:1});
+
+  // Each collision pass touches at most sixteen values. The first removes the
+  // obsolete mark and sixteen children; the second removes its last orphan.
+  expect(await advance()).toMatchObject({state:'deferred',reason:'value_collision'});
+  expect(await target().prepare('SELECT COUNT(*) n FROM analytics_cache_retention_day_values')
+   .first<number>('n')).toBe(1);
+  expect(await advance()).toMatchObject({state:'deferred',reason:'value_collision'});
+  expect(await target().prepare('SELECT COUNT(*) n FROM analytics_cache_retention_day_values')
+   .first<number>('n')).toBe(0);
+
+  expect(await advance()).toMatchObject({state:'progress',staged:1,built:0});
+  const staged=await target().prepare('SELECT COUNT(*) n FROM analytics_cache_retention_day_values')
+   .first<number>('n');
+  expect(staged).toBeGreaterThan(0);
+  let built=false;
+  for(let attempt=0;attempt<10&&!built;attempt++){
+   const pass=await advance();
+   expect(pass.reason).not.toBe('value_collision');
+   built=pass.built===1;
+  }
+  expect(built).toBe(true);
+  expect(await target().prepare('SELECT COUNT(*) n FROM analytics_cache_retention_day_values')
+   .first<number>('n')).toBe(17);
+  const current=await readCacheRetentionCommunityBands({target:target(),sourceId});
+  expect(current.find(row=>row.band==='under_one_minute')).toMatchObject({adjacencies:34});
+ });
+ it('defers a still-delivered legacy collision without retiring its mark',async()=>{
+  await deliverDay();
+  const carry=carryFor();
+  await writeCacheRetentionDay({target:target(),key:key(),carry,
+   aggregate:reduce([ev(0),ev(1_000)],[],2)});
+  await deliverDay(DAY,'e'.repeat(64),'manifest-2');
+  const advance=(sharedRemainingQueries:()=>number)=>advanceCacheRetentionDayLane({
+   target:target(),sourceId,build:async()=>reduce([ev(0),ev(1_000),ev(2_000)],[],3),
+   deadlineMs:Date.now()+60_000,remainingQueries:100,maxWrites:48,maxDays:1,
+   sharedRemainingQueries});
+  expect(await advance(()=>4)).toMatchObject({state:'deferred',reason:'query_budget'});
+  expect(await advance(()=>100)).toMatchObject({state:'deferred',reason:'value_collision'});
+  expect(await target().prepare('SELECT COUNT(*) n FROM analytics_cache_retention_day_marks')
+   .first<number>('n')).toBe(1);
+  expect(await target().prepare('SELECT COUNT(*) n FROM analytics_cache_retention_day_values')
+   .first<number>('n')).toBe(1);
+ });
+ it('does not defer a second current legacy mark with disjoint model groups',async()=>{
+  await deliverDay();
+  await writeCacheRetentionDay({target:target(),key:key(),carry:carryFor(),
+   aggregate:reduce([ev(0),ev(1_000)],[],2)});
+  await deliverDay(DAY,'e'.repeat(64),'manifest-2');
+  const disjoint=reduce([ev(0,{model:'gpt-5.6-luna'}),
+   ev(1_000,{model:'gpt-5.6-luna'})],[],2);
+  expect(await advanceCacheRetentionDayLane({target:target(),sourceId,
+   build:async()=>disjoint,deadlineMs:Date.now()+60_000,
+   remainingQueries:100,maxWrites:48,maxDays:1}))
+   .toMatchObject({state:'progress',built:1,staged:0});
+  expect(await target().prepare('SELECT COUNT(*) n FROM analytics_cache_retention_day_marks')
+   .first<number>('n')).toBe(2);
+  expect(await target().prepare('SELECT COUNT(*) n FROM analytics_cache_retention_day_values')
+   .first<number>('n')).toBe(2);
  });
  it('resumes a dense effective day from a durable cursor without changing v2 output',async()=>{
   await deliverEffectiveDay();

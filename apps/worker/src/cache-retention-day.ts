@@ -676,24 +676,11 @@ export async function readCacheRetentionDay(input: { target: D1Database; key: Ca
   return { status: "ready", markKey, aggregate };
 }
 
-/**
- * One bounded retirement page. Three independent reasons, all keyed to this
- * source only: a row whose `method_version` is not the current contract, a row
- * for an owner with a terminal erasure fence, and a row whose day manifest
- * identity no longer matches any delivered day. Children are deleted after the
- * row that authorized them, so an interrupted retirement resumes from the
- * orphans rather than leaving a mark pointing at a partly deleted aggregate.
- */
-export async function retireCacheRetentionDayPage(target: D1Database, sourceId: string,
-  options: { limit?: number; methodVersion?: string } = {},
-): Promise<{ state: "idle" | "retiring"; marks: number; carry: number; values: number; bands: number }> {
-  const limit = options.limit ?? 32;
-  bounded(limit, 1, 200);
-  const version = options.methodVersion ?? CACHE_RETENTION_METHOD.version;
-  if (typeof version !== "string" || version.length < 1 || version.length > 128) throw fail();
-  const marks = (await target.prepare(`DELETE FROM analytics_cache_retention_day_marks
-    WHERE mark_key IN (SELECT m.mark_key FROM analytics_cache_retention_day_marks m
-      WHERE m.source_id=?1 AND (m.method_version!=?2
+/** The one obsolete-mark predicate shared by broad erasure retirement and
+ * collision-scoped correction cleanup. A still-delivered legacy manifest is
+ * not obsolete merely because another candidate was selected. */
+function cacheRetentionObsoleteMarkSql(versionParameter: string): string {
+  return `(m.method_version!=${versionParameter}
         OR EXISTS(SELECT 1 FROM analytics_storage_erasure_fences f
           WHERE f.source_id=m.source_id AND f.owner_digest=m.owner_digest)
         OR (m.source_layout='typed-v11' AND NOT EXISTS(
@@ -713,7 +700,27 @@ export async function retireCacheRetentionDayPage(target: D1Database, sourceId: 
           SELECT 1 FROM analytics_cache_retention_day_marks e
           WHERE ${effectiveMarkCurrentSql("e", true)}
             AND e.method_version=m.method_version AND e.source_id=m.source_id
-            AND e.owner_digest=m.owner_digest AND e.day=m.day)))
+            AND e.owner_digest=m.owner_digest AND e.day=m.day)))`;
+}
+
+/**
+ * One bounded retirement page. Three independent reasons, all keyed to this
+ * source only: a row whose `method_version` is not the current contract, a row
+ * for an owner with a terminal erasure fence, and a row whose day manifest
+ * identity no longer matches any delivered day. Children are deleted after the
+ * row that authorized them, so an interrupted retirement resumes from the
+ * orphans rather than leaving a mark pointing at a partly deleted aggregate.
+ */
+export async function retireCacheRetentionDayPage(target: D1Database, sourceId: string,
+  options: { limit?: number; methodVersion?: string } = {},
+): Promise<{ state: "idle" | "retiring"; marks: number; carry: number; values: number; bands: number }> {
+  const limit = options.limit ?? 32;
+  bounded(limit, 1, 200);
+  const version = options.methodVersion ?? CACHE_RETENTION_METHOD.version;
+  if (typeof version !== "string" || version.length < 1 || version.length > 128) throw fail();
+  const marks = (await target.prepare(`DELETE FROM analytics_cache_retention_day_marks
+    WHERE mark_key IN (SELECT m.mark_key FROM analytics_cache_retention_day_marks m
+      WHERE m.source_id=?1 AND ${cacheRetentionObsoleteMarkSql("?2")}
       ORDER BY m.owner_digest,m.day,m.mark_key LIMIT ?3) RETURNING mark_key`)
     .bind(sourceId, version, limit).all()).results.length;
   const values = (await target.prepare(`DELETE FROM analytics_cache_retention_day_values
@@ -753,6 +760,68 @@ export async function retireCacheRetentionDayPage(target: D1Database, sourceId: 
   } catch { /* Older analytics databases have no staged effective table. */ }
   return { state: marks + carry + values + bands > 0 ? "retiring" : "idle",
     marks, carry, values, bands };
+}
+
+/** Remove one page of values that would collide with a selected day's UNIQUE
+ * storage identity. Current marks keep their values; only marks proved obsolete
+ * by the same predicate as normal retirement may be removed. A staged value has
+ * no mark and is replaceable, but the selected mark's own staging is excluded.
+ * The batch deletes parent, value, bands, then carry in that order, so a failed
+ * attempt leaves all four tiers unchanged. A caller defers after each page. */
+async function retireCacheRetentionCollisionPage(target: D1Database, key: CacheRetentionDayKey,
+  carry: readonly CacheRetentionCarryDay[], aggregate: CacheRetentionDayAggregate,
+  allowCleanup: boolean,
+  limit = 16): Promise<"clear" | "collision" | "query_budget"> {
+  checkKey(key);
+  checkCarry(key, carry);
+  bounded(limit, 1, 32);
+  if (!validCacheRetentionDayAggregate(aggregate) || aggregate.day !== key.day
+    || aggregate.groups.length > CACHE_RETENTION_GROUP_LIMIT) throw fail();
+  const carryDigest = await cacheRetentionStorageCarryDigest(key, carry);
+  const markKey = await cacheRetentionDayMarkKey(key, carryDigest);
+  // Drive the table's historical UNIQUE prefix once per actual output group.
+  // A different model/effort is not a collision and must not stall a current
+  // legacy mark. CROSS JOIN fixes the small bounded JSON vector as the outer
+  // loop; the values lookup can then use its full composite UNIQUE index.
+  const dimensions = canonicalJson(aggregate.groups.map(group => [group.model, group.effort]));
+  const rows = (await target.prepare(`SELECT v.value_key,v.mark_key
+    FROM json_each(?) AS candidate CROSS JOIN analytics_cache_retention_day_values v
+    WHERE v.source_id=? AND v.owner_digest=? AND v.day=? AND v.method_version=?
+      AND v.carry_digest=? AND v.model=json_extract(candidate.value,'$[0]')
+      AND v.effort=json_extract(candidate.value,'$[1]') AND v.mark_key!=?
+    ORDER BY candidate.key LIMIT ?`)
+    .bind(dimensions, key.sourceId, key.ownerDigest, key.day, CACHE_RETENTION_METHOD.version,
+      carryDigest, markKey, limit)
+    .all<{ value_key: string; mark_key: string }>()).results;
+  if (rows.length === 0) return "clear";
+  if (!allowCleanup) return "query_budget";
+  const marks = [...new Set(rows.map(row => row.mark_key))];
+  const values = rows.map(row => row.value_key);
+  const markSlots = marks.map(() => "?").join(",");
+  const valueSlots = values.map(() => "?").join(",");
+  await target.batch([
+    target.prepare(`DELETE FROM analytics_cache_retention_day_marks
+      WHERE mark_key IN (SELECT m.mark_key FROM analytics_cache_retention_day_marks m
+        WHERE m.mark_key IN (${markSlots}) AND m.source_id=?
+          AND ${cacheRetentionObsoleteMarkSql("?")})`)
+      .bind(...marks, key.sourceId, CACHE_RETENTION_METHOD.version),
+    target.prepare(`DELETE FROM analytics_cache_retention_day_values
+      WHERE value_key IN (${valueSlots}) AND source_id=?
+        AND NOT EXISTS(SELECT 1 FROM analytics_cache_retention_day_marks m
+          WHERE m.mark_key=analytics_cache_retention_day_values.mark_key)`)
+      .bind(...values, key.sourceId),
+    target.prepare(`DELETE FROM analytics_cache_retention_day_bands
+      WHERE value_key IN (${valueSlots}) AND source_id=?
+        AND NOT EXISTS(SELECT 1 FROM analytics_cache_retention_day_values v
+          WHERE v.value_key=analytics_cache_retention_day_bands.value_key)`)
+      .bind(...values, key.sourceId),
+    target.prepare(`DELETE FROM analytics_cache_retention_day_carry
+      WHERE mark_key IN (${markSlots}) AND source_id=?
+        AND NOT EXISTS(SELECT 1 FROM analytics_cache_retention_day_marks m
+          WHERE m.mark_key=analytics_cache_retention_day_carry.mark_key)`)
+      .bind(...marks, key.sourceId),
+  ]);
+  return "collision";
 }
 
 /** The lane's own deadline and the source statements this pass may still spend
@@ -1652,7 +1721,7 @@ export function createCacheRetentionDaySourceBuild(options: {
 
 export interface CacheRetentionDayLaneResult {
   state: "idle" | "progress" | "deferred";
-  reason: "complete" | "deadline" | "query_budget" | "day_limit";
+  reason: "complete" | "deadline" | "query_budget" | "day_limit" | "value_collision";
   built: number;
   staged: number;
   /** Days refused for a reason recorded against the day's own inputs, so the
@@ -1829,9 +1898,10 @@ export async function advanceCacheRetentionDayLane(options: {
     .all<{ source_id: string; source_layout: string; source_namespace: string; owner_digest: string;
       device_id: string; manifest_id: string; manifest_digest: string; day: string }>()).results;
   if (!candidates.length) return idle("idle", "complete", 0, 0);
-  // One day costs the carry read, a mark read, a staged read, its write batches
-  // and the promotion check, plus one more for a recorded refusal.
-  const perDay = 5 + maxWrites;
+  // One day also checks for a prior value with the same historical UNIQUE
+  // identity. Only a colliding day spends four more target statements to retire
+  // one bounded page; reserve those four before touching that page.
+  const perDay = 6 + maxWrites;
   let affordable = options.remainingQueries - 1;
   const sourceAllowance = options.sourceQueries ?? 256;
   const sourceBudget: CacheRetentionBuildBudget = { deadlineMs: options.deadlineMs,
@@ -1876,6 +1946,22 @@ export async function advanceCacheRetentionDayLane(options: {
       // starts this day again.
       if (!(error instanceof CacheRetentionDeferredError)) throw error;
       return idle(built + staged ? "progress" : "deferred", error.reason, candidates.length, spent());
+    }
+    if (options.sharedRemainingQueries && options.sharedRemainingQueries() < 1) {
+      return idle(built + staged ? "progress" : "deferred", "query_budget",
+        candidates.length, spent());
+    }
+    const collision = await retireCacheRetentionCollisionPage(target, candidate, carry, aggregate,
+      affordable >= 4 && (options.sharedRemainingQueries?.() ?? Infinity) >= 5);
+    if (collision === "query_budget") {
+      return idle(built + staged ? "progress" : "deferred", "query_budget",
+        candidates.length, spent());
+    }
+    if (collision === "collision") {
+      // A second invocation reselects the same day. Never report idle while a
+      // still-current legacy mark or another page of obsolete values blocks it.
+      return idle(built + staged ? "progress" : "deferred", "value_collision",
+        candidates.length, spent());
     }
     const progressKey = candidate.sourceLayout === "effective"
       ? await cacheRetentionDayMarkKey(candidate, await cacheRetentionStorageCarryDigest(candidate, carry))
