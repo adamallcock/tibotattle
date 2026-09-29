@@ -40,6 +40,9 @@ type CachedGraphResult={owner_digest:string;source_kind:'v0.2'|'v1'|'v1.1'|'mixe
 export interface StorageGraphWorkProgress {
  state:'complete'|'reused'|'deferred'|'idle';metric?:'fits'|'model';day?:string;reason?:string;
  failure?:StorageGraphFailureFields;
+ /** Newly saved native model dates from a verified block, even if selection
+  * completion later yields. Absent when the block adapter did not run. */
+ modelBlockAdoptedDates?:number;
 }
 
 function ownerSource(owner:StorageCommunityOwner):CachedGraphResult['source_kind'] {
@@ -375,11 +378,14 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
    if(block.state!=='unsupported'){
     if(block.state==='complete'&&selection&&claimToken){
      const finished=await completeStorageGraphWorkSelection({target:options.target,selection,claimToken});
-     if(finished.status!=='completed')return {state:'deferred',metric,day,reason:'selection_changed'};
+     if(finished.status!=='completed')return {state:'deferred',metric,day,reason:'selection_changed',
+      modelBlockAdoptedDates:block.adoptedDates};
      selection=null;
     }
-    return block.state==='complete'?{state:block.reused?'reused':'complete',metric,day}
-     :{state:'deferred',metric,day,reason:block.reason??'block_deferred'};
+    return block.state==='complete'?{state:block.reused?'reused':'complete',metric,day,
+      modelBlockAdoptedDates:block.adoptedDates}
+     :{state:'deferred',metric,day,reason:block.reason??'block_deferred',
+       modelBlockAdoptedDates:block.adoptedDates};
    }
   }
   // An unsupported block may have spent bounded preflight statements before

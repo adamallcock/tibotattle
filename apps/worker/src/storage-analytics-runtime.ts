@@ -270,6 +270,9 @@ async function advanceStorageAnalyticsV1Page(options:StorageAnalyticsBindings&{
 export interface StorageAnalyticsPass {
  state:'idle'|'progress'|'deferred';steps:number;recordsRead:number;queriesUsed:number;
  dailyPublications:number;graphCalculations:number;
+ /** Closed count of verified model-block dates saved in this pass. Present
+  * when model blocks are enabled, including when no date was adopted. */
+ modelBlockAdoptedDates?:number;
  /** Statements the three retirement sweeps took, and how often each found work.
   * Empty sweeps sleep for this pass until a producing lane makes progress;
   * iterations counts only rounds in which at least one sweep actually ran.
@@ -390,7 +393,8 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
  const graphAdmission=options.graphOnly?GRAPH_ONLY_ADMISSION_QUERIES:GRAPH_LANE_ADMISSION_QUERIES;
  const meter=createD1InvocationBudget(options.maxQueries??900);
  const scoped={...options,source:meter.wrap(options.source),target:meter.wrap(options.target)};
- let steps=0,recordsRead=0,dailyPublications=0,graphCalculations=0,graphFailure:StorageGraphFailureFields|undefined;
+ let steps=0,recordsRead=0,dailyPublications=0,graphCalculations=0,modelBlockAdoptedDates=0,
+  graphFailure:StorageGraphFailureFields|undefined;
  let graphCheckpointAdvances=0;
  let graphDayProjection:StorageGraphDayProjectionFields|undefined;
  // Attribute actual retirement spend separately from useful calculation work.
@@ -414,6 +418,7 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
  };
  const result=(state:StorageAnalyticsPass['state'],reason:StorageAnalyticsPass['reason']):StorageAnalyticsPass=>
   ({state,reason,steps,recordsRead,queriesUsed:meter.queriesUsed,dailyPublications,graphCalculations,
+   ...(options.modelBlocks===true?{modelBlockAdoptedDates}:{}),
    sweepQueries:sweep.queries,sweepIterations:sweep.iterations,
    sweepV11Worked:sweep.v11Worked,sweepV1Worked:sweep.v1Worked,sweepGraphWorked:sweep.graphWorked,
    ...(graphFailure?{graphFailure}:{}),...(graphCheckpointAdvances?{graphCheckpointAdvances}:{}),
@@ -739,6 +744,7 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
        ...(options.sharedFeatures===true?{sharedFeatures:true}:{}),
        ...(options.graphSelectionNowMs===undefined?{}:{nowMs:options.graphSelectionNowMs})});
       if(graph.failure)graphFailure??=graph.failure;
+      modelBlockAdoptedDates+=graph.modelBlockAdoptedDates??0;
       if(graph.state==='complete')graphCalculations++;
       // A deferred attempt is not proof of a durable write. In particular a
       // busy lease must not reopen every empty sweep on every iteration.

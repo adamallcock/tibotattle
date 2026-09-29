@@ -225,6 +225,16 @@ describe('ordered ingestion before public analytics',()=>{
    STORAGE_ANALYTICS_MODEL_BLOCKS:'enabled'},{nowMs:at(10)});
   expect(pass.mock.calls[1]![0]).toMatchObject({sharedFeatures:true,modelBlocks:true,graphOnly:true});
  });
+ it('logs only the closed model-block adoption count from the public pass',async()=>{
+  pass.mockResolvedValueOnce(result).mockResolvedValueOnce({...result,modelBlockAdoptedDates:2});
+  await runStorageAnalyticsSchedule({...environment(),STORAGE_ANALYTICS_MODEL_BLOCKS:'enabled'});
+  const entry=JSON.parse(log.mock.calls[0]![0] as string);
+  expect(entry).toMatchObject({event:'storage_analytics_schedule',modelBlockAdoptedDates:2});
+  expect(Object.keys(entry).some(key=>/owner|participant|jobKey/u.test(key))).toBe(false);
+  pass.mockReset();log.mockReset();pass.mockResolvedValue(result);
+  await runStorageAnalyticsSchedule(environment());
+  expect(JSON.parse(log.mock.calls[0]![0] as string)).not.toHaveProperty('modelBlockAdoptedDates');
+ });
  it('rejects malformed durable feature activation before any database work',async()=>{
   for(const field of ['STORAGE_ANALYTICS_SHARED_FEATURES','STORAGE_ANALYTICS_MODEL_BLOCKS'] as const) {
    await expect(runStorageAnalyticsSchedule({...environment(),[field]:'yes' as 'enabled'}))

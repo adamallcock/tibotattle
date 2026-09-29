@@ -108,16 +108,16 @@ describe('effective quota coverage cache admission and invocation memo',()=>{
   expect(await current.value.nextMissingDay!([day,missing],[missing])).toBeUndefined();
   const before=current.sourceMeter.queriesUsed;
   expect(await current.value.shouldPrepare!(day)).toBe(false);
-  expect(current.sourceMeter.queriesUsed-before).toBe(8);
+  expect(current.sourceMeter.queriesUsed-before).toBe(9);
   const primed=current.sourceMeter.queriesUsed;
   expect(await current.value.store(prepared())).toBe('stored');
   expect(current.sourceMeter.queriesUsed-primed).toBe(2);
   const fresh=await cache();
   expect(await fresh.value.store(prepared())).toBe('stored');
-  expect(fresh.sourceMeter.queriesUsed).toBe(8);
-  // 8+2 source statements replace the former 6+8, while retaining
-  // independent owner checks before and after each digest consumer.
-  expect(current.sourceMeter.queriesUsed-before).toBe(10);
+  expect(fresh.sourceMeter.queriesUsed).toBe(9);
+  // Nine dependency statements include the correction runtime fence; the
+  // two subsequent owner checks remain independent for the second consumer.
+  expect(current.sourceMeter.queriesUsed-before).toBe(11);
  });
 
  it.each(['revision','authority_epoch'] as const)('refuses a memo after the source %s advances',async column=>{
@@ -200,6 +200,16 @@ describe('effective quota coverage cache admission and invocation memo',()=>{
   const current=await cache(source(),target(),{remaining:()=>259});
   expect(await current.value.load([day,missing],identity())).toBeUndefined();
   expect(await current.value.nextMissingDay!([day,missing],[])).toBeUndefined();
+  expect(current.sourceMeter.queriesUsed).toBe(0);
+ });
+ it('keeps the 200-statement fallback reserve before reading a warm window dependency',async()=>{
+  const seed=await cache();expect(await seed.value.store(prepared(missing))).toBe('stored');
+  let checks=0;
+  // The first check admits the head probe. The next one has exactly the old
+  // reserve, which is one statement short of the correction runtime fence.
+  const current=await cache(source(),target(),{remaining:()=>++checks===1?950:209});
+  expect(await current.value.load([day,missing],identity())).toBeUndefined();
+  expect(checks).toBe(2);
   expect(current.sourceMeter.queriesUsed).toBe(0);
  });
 });

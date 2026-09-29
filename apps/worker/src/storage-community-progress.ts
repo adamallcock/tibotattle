@@ -8,7 +8,7 @@ import { COMMUNITY_MODEL_REFUSAL_REASONS } from './community-allowance';
 import type { StorageAnalyticsBindings } from './analytics-delivery';
 import { ApiError } from './errors';
 import { validStorageModelPublication, type StorageModelPublicationValue } from './storage-community-publication-value';
-import { STORAGE_DAILY_PENDING_DAYS_SQL } from './storage-community-daily';
+import { STORAGE_DAILY_PENDING_DAYS_SQL } from './storage-community-daily-pending';
 
 /** Same census bound as the typed admin overview. Every row read below is
  * either an aggregate or capped by this limit. A cap reached by a count that

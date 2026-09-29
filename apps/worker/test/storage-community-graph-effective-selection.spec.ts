@@ -164,7 +164,8 @@ describe('effective graph work selection',()=>{
         target:contenderMeter.wrap(target()),get remainingQueries(){return contenderMeter.remainingQueries;},nowMs:started+300_001});
       expect(contender).toEqual({state:'deferred',metric:'fits',day:today(),reason:'selection_busy'});
       expect(contenderPages).toBe(0);
-      expect(contenderMeter.queriesUsed).toBe(9);
+      // The calculation-method probe also runs before a busy selection yields.
+      expect(contenderMeter.queriesUsed).toBe(10);
       expect(await readStorageGraphWorkSelection(target(),key(envelope))).toEqual(claimed);
     }finally{release();}
     expect(await winner).toMatchObject({state:'complete',metric:'fits',day:today()});
@@ -207,7 +208,9 @@ describe('effective graph work selection',()=>{
     });
     const result=await advanceStorageCommunityGraphWork({...bindings(),source:meter.wrap(observedSource),target:meter.wrap(observedTarget),
       get remainingQueries(){return meter.remainingQueries;},deadlineMs:Date.now()+60_000,leaseMs:570_000,preparedFold:false});
-    expect(preludeQueries).toBe(38);expect(pages).toBeGreaterThan(0);
+    // One scheduler method probe and both effective dependency captures now
+    // include the staged/active correction runtime in their source authority.
+    expect(preludeQueries).toBe(41);expect(pages).toBeGreaterThan(0);
     expect(result.failure).toBeUndefined();
     if(cap===560)expect(result.state).toBe('deferred');else expect(['complete','deferred']).toContain(result.state);
     expect(meter.remainingQueries).toBeGreaterThanOrEqual(38);

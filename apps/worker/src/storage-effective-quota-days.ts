@@ -102,14 +102,15 @@ export async function createStorageEffectiveQuotaPreparation(input: {
       if (bytes > STORAGE_EFFECTIVE_QUOTA_WINDOW_BYTES || fragments > QUOTA_RESET_CLUSTER_LIMIT) return undefined;
       for(const [index,candidate]of candidates.entries())if(candidate.length===0)missingDays.add(days[index]!);
       if (missingDays.size>0) {coverageKnown=true;return undefined;}
-      // Share the five schema/header statements across the bounded window;
-      // occurrence links still need one exact query for each selected day.
+      // Share six header statements, including the correction runtime fence,
+      // across the bounded window. Occurrence links still need one exact query
+      // for each selected day.
       // Read every dependency before loading payloads: a late miss still has
       // the 200 statements needed to advance the normal pager. A complete fold
       // needs only its 120-statement checkpoint reserve. Bulk heads remove one
       // manifest read per day, keeping a small 101-day window within the cap.
       const dependencyDays=days.filter(day=>!dependencyDigests.has(day));
-      if (!available((dependencyDays.length?5+dependencyDays.length:0) + Math.max(200,payloadReads+120) + 2)) return undefined;
+      if (!available((dependencyDays.length?6+dependencyDays.length:0) + Math.max(200,payloadReads+120) + 2)) return undefined;
       // Until the complete window is proved, any fallback must be able to
       // stage the same one-page successor on a retry, even if it is >30 parts.
       fallbackPage = true;

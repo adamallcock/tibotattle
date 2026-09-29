@@ -57,7 +57,9 @@ export async function createStorageEffectiveUsagePreparation(input:{
       for(const [index,values]of candidates.entries())if(values.length===0)missingDays.add(days[index]!);
       if(missingDays.size){coverageKnown=true;return undefined;}
       const dependencyDays=days.filter(day=>!digests.has(day));
-      if(!available((dependencyDays.length?5+dependencyDays.length:0)+Math.max(200,payloadReads+120)+2))return undefined;
+      // Six shared headers include the correction runtime fence; keep the
+      // 200-statement fallback reserve after reading every day dependency.
+      if(!available((dependencyDays.length?6+dependencyDays.length:0)+Math.max(200,payloadReads+120)+2))return undefined;
       await assertEffectiveHistoryOwner(input.source,input.owner);
       const dependencies=await createEffectiveHistoryDayDependencyReader(input.source,input.owner,input.sourceNamespace,
         dependencyDays,{includeSessions:true,canContinue:()=>input.now()<input.deadlineMs});

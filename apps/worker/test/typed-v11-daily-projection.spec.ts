@@ -160,6 +160,7 @@ async function activateSuccessor(value: Awaited<ReturnType<typeof fixture>>) {
 describe("typed accountless upload to isolated projection", () => {
   it("reports the typed current corpus from headers and publication state from analytics", async () => {
     await applyD1Migrations(source(), b.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+    await applyD1Migrations(source(), b.TEST_INGESTION_ISOLATION_MIGRATIONS);
     await initializeTypedV1Admission(source(), namespace);
     await initializeStorageAnalyticsRuntime({ source: source(), target: target(), sourceId,
       sourceNamespace: namespace });

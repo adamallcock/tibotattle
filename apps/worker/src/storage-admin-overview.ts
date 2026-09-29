@@ -2,7 +2,7 @@ import type { StorageAnalyticsBindings } from "./analytics-delivery";
 import { ApiError } from "./errors";
 import { hasTelemetryV12ChunkTable } from "./telemetry-v12-table";
 import { readStorageCommunityCorrectionState } from './storage-community-authority';
-import { STORAGE_DAILY_PENDING_DAYS_SQL } from './storage-community-daily';
+import { STORAGE_DAILY_PENDING_DAYS_SQL } from './storage-community-daily-pending';
 
 const MAX_ADMIN_AGGREGATE_ROWS = 10_000;
 

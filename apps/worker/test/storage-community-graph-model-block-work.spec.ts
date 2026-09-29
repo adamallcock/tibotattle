@@ -9,7 +9,7 @@ import {registerTelemetryV11DayManifest} from '../src/telemetry-v11-repository';
 import {activateTelemetryV11Domain,createTelemetryV11DomainPredecessor} from '../src/telemetry-v11-domain';
 import {sha256Hex} from '../src/crypto';
 import {createD1InvocationBudget} from '../src/d1-invocation-budget';
-import {initializeStorageAnalyticsRuntime,advanceStorageAnalytics} from '../src/storage-analytics-runtime';
+import {initializeStorageAnalyticsRuntime,advanceStorageAnalytics,runStorageAnalyticsPass} from '../src/storage-analytics-runtime';
 import {drainCommunityPublicSourceBootstrap} from '../src/community-daily-aggregates';
 import {readStorageCommunityOwnerPage} from '../src/storage-community-authority';
 import {advanceStorageCommunityGraphWork} from '../src/storage-community-graph-work';
@@ -80,6 +80,7 @@ describe('model block graph-work scheduling',()=>{
   expect(planHistoricalModelBlockRanges(today).some(range=>range.outputThroughDay===historicalDay)).toBe(true);
  const result=await advanceStorageCommunityGraphWork({...bindings(),nowMs});
   expect(result).toMatchObject({state:'complete',metric:'model',day:historicalDay});
+  expect(result).not.toHaveProperty('modelBlockAdoptedDates');
   expect(blockWork).not.toHaveBeenCalled();
   expect(await target().prepare(`SELECT count(*) n FROM analytics_community_graph_results
    WHERE source_id=? AND owner_digest=? AND metric='model' AND day=?`)
@@ -98,7 +99,7 @@ describe('model block graph-work scheduling',()=>{
   });
   const result=await advanceStorageCommunityGraphWork({...bindings(),source:meter.wrap(source()),target:meter.wrap(target()),
    get remainingQueries(){return meter.remainingQueries;},nowMs,deadlineMs,modelBlocks:true});
-  expect(result).toEqual({state:'complete',metric:'model',day:historicalDay});
+  expect(result).toEqual({state:'complete',metric:'model',day:historicalDay,modelBlockAdoptedDates:1});
   expect(blockWork).toHaveBeenCalledTimes(1);
   const input=blockWork.mock.calls[0]![0];
   expect(input).toMatchObject({sourceId:namespace,sourceNamespace:namespace,nowMs,deadlineMs,
@@ -117,6 +118,7 @@ describe('model block graph-work scheduling',()=>{
   const result=await advanceStorageCommunityGraphWork({...bindings(),nowMs,modelBlocks:true});
   expect(blockWork).toHaveBeenCalledTimes(1);
   expect(result).toMatchObject({state:'complete',metric:'model',day:historicalDay});
+  expect(result).not.toHaveProperty('modelBlockAdoptedDates');
   expect(await target().prepare(`SELECT count(*) n FROM analytics_community_graph_results
    WHERE source_id=? AND owner_digest=? AND metric='model' AND day=?`)
    .bind(namespace,owner.ownerDigest,historicalDay).first<number>('n')).toBe(1);
@@ -124,15 +126,49 @@ describe('model block graph-work scheduling',()=>{
 
  it('keeps the selected owner-day pending when block work yields',async()=>{
   const owner=await effectiveOwner();
-  blockWork.mockResolvedValue({state:'deferred',reason:'query_budget',adoptedDates:0,queriesUsed:0});
+  // The adapter may save other dates before its selected day runs out of
+  // allowance. The selected claim remains pending but those saves count.
+  blockWork.mockResolvedValue({state:'deferred',reason:'query_budget',adoptedDates:2,queriesUsed:0});
   expect(await advanceStorageCommunityGraphWork({...bindings(),nowMs,modelBlocks:true}))
-   .toEqual({state:'deferred',metric:'model',day:historicalDay,reason:'query_budget'});
+   .toEqual({state:'deferred',metric:'model',day:historicalDay,reason:'query_budget',
+    modelBlockAdoptedDates:2});
   expect(blockWork).toHaveBeenCalledTimes(1);
   expect(await readStorageGraphWorkSelection(target(),{sourceId:namespace,ownerDigest:owner.ownerDigest!,
    day:historicalDay,metric:'model'})).toMatchObject({state:'pending',claimToken:null});
   expect(await target().prepare(`SELECT count(*) n FROM analytics_community_graph_results
    WHERE source_id=? AND owner_digest=? AND metric='model' AND day=?`)
   .bind(namespace,owner.ownerDigest,historicalDay).first<number>('n')).toBe(0);
+ });
+
+ it('retains adopted-date evidence when another writer removes the selected claim',async()=>{
+  await effectiveOwner();
+  blockWork.mockImplementation(async()=>{
+   await target().prepare(`DELETE FROM analytics_community_graph_work_selection
+     WHERE source_id=? AND metric='model' AND day=?`).bind(namespace,historicalDay).run();
+   return {state:'complete',reused:false,adoptedDates:3,queriesUsed:0};
+  });
+  expect(await advanceStorageCommunityGraphWork({...bindings(),nowMs,modelBlocks:true}))
+   .toEqual({state:'deferred',metric:'model',day:historicalDay,reason:'selection_changed',
+    modelBlockAdoptedDates:3});
+ });
+
+ it('sums a partial adopted prefix through the public pass without claiming a complete graph calculation',async()=>{
+  await effectiveOwner();
+  blockWork.mockResolvedValue({state:'deferred',reason:'query_budget',adoptedDates:2,queriesUsed:0});
+  const pass=await runStorageAnalyticsPass({...bindings(),publishCommunity:true,publicOnly:true,
+   graphOnly:true,modelBlocks:true,graphSelectionNowMs:nowMs,maxSteps:1,maxQueries:950,
+   deadlineMs:Date.now()+60_000});
+  expect(pass).toMatchObject({modelBlockAdoptedDates:2,graphCalculations:0});
+  expect(blockWork).toHaveBeenCalledTimes(1);
+ });
+
+ it('reports zero only when model blocks were enabled',async()=>{
+  const enabled=await runStorageAnalyticsPass({...bindings(),publishCommunity:true,publicOnly:true,
+   graphOnly:true,modelBlocks:true,maxSteps:1,maxQueries:950,deadlineMs:Date.now()+60_000});
+  expect(enabled.modelBlockAdoptedDates).toBe(0);
+  const disabled=await runStorageAnalyticsPass({...bindings(),publishCommunity:true,publicOnly:true,
+   graphOnly:true,maxSteps:1,maxQueries:950,deadlineMs:Date.now()+60_000});
+  expect(disabled).not.toHaveProperty('modelBlockAdoptedDates');
  });
 
  it('keeps today on the native graph path with model blocks enabled',async()=>{

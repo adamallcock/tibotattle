@@ -74,7 +74,19 @@ describe('effective usage cache fences and complete coverage',()=>{
   // immutable owner scope. Loading still repeats its before/after owner fence.
   expect(current.sourceMeter.queriesUsed-before).toBe(2);
   const warm=await cache();expect(await warm.value.load([day,missing])).toEqual([prepared(),prepared(missing)]);
-  expect(warm.sourceMeter.queriesUsed).toBe(9);
+  // A new invocation pins the correction runtime once with the dependency
+  // headers so staged and active cached days cannot share an identity.
+  expect(warm.sourceMeter.queriesUsed).toBe(10);
+ });
+ it('keeps the 200-statement fallback reserve before reading a warm window dependency',async()=>{
+  const seed=await cache();
+  expect(await seed.value.store(prepared())).toBe('stored');
+  expect(await seed.value.store(prepared(missing))).toBe('stored');
+  let checks=0;
+  const current=await cache(source(),target(),{remaining:()=>++checks===1?950:209});
+  expect(await current.value.load([day,missing])).toBeUndefined();
+  expect(checks).toBe(2);
+  expect(current.sourceMeter.queriesUsed).toBe(0);
  });
  it('reuses an unchanged day after an unrelated owner revision advance',async()=>{
   const old=await cache();await old.value.store(prepared());

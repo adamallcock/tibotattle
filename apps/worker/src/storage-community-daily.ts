@@ -20,6 +20,8 @@ import { countStorageDailyContributingDevices, STORAGE_DAILY_DEVICE_METHOD } fro
 import type { EffectiveUsageReaderCursor } from './telemetry-usage-effective-reader';
 import { effectiveHistoryDependency } from './storage-effective-history';
 import { advanceSharedAnalyticsFeatureDay, type SharedAnalyticsFeatureBudget } from './storage-analytics-shared-features';
+import { STORAGE_DAILY_PENDING_DAYS_SQL } from './storage-community-daily-pending';
+export { STORAGE_DAILY_PENDING_DAYS_SQL } from './storage-community-daily-pending';
 
 export interface StorageCommunityDailyBindings {
   source: D1Database; target: D1Database; sourceId: string; sourceNamespace: string;
@@ -333,13 +335,6 @@ const CONTAINMENT_EPOCH_SQL=`COALESCE((SELECT MAX(c.terminal_public_authority_ep
       FROM analytics_community_daily_containment c WHERE c.source_id=p.source_id AND c.day=p.day),0)`;
 const hardAuthority=(authority:StorageCommunityAuthority)=>({sourceId:authority.sourceId,sourceNamespace:authority.sourceNamespace,
   policyRevision:authority.policyRevision,collectionRevision:authority.collectionRevision});
-
-/** Queue entries and method-transition refreshes are one set of pending days.
- * The latter do not revoke the last-good public snapshot while it is rebuilt. */
-export const STORAGE_DAILY_PENDING_DAYS_SQL=`SELECT day FROM analytics_community_daily_queue WHERE source_id=?1
-  UNION SELECT h.day FROM analytics_community_daily_heads h
-  JOIN analytics_community_daily_publications p ON p.source_id=h.source_id AND p.day=h.day AND p.revision=h.revision
-  WHERE h.source_id=?1 AND COALESCE(json_extract(p.authority_json,'$.usageCorrectionState'),'staged') IS NOT ?2`;
 
 /** Independent scheduler entry: new/corrected projections enqueue their days
  * transactionally. Policy changes and containment revisit old heads without
