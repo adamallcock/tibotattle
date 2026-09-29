@@ -2056,6 +2056,175 @@ export async function reconcileProductionDeployment({ operationDirectory, worker
   finally { operation?.close(); }
 }
 
+/**
+ * Resolve a typed deploy whose provider mutation completed but whose final
+ * verification was interrupted or observed a stale public health response.
+ * This never deploys: it rebinds the journal and its exact remote owner, then
+ * repeats the pinned configuration, three-role schema, manifest, and public
+ * checks before releasing the lock.
+ */
+export async function reconcileTypedProductionDeployment({
+  operationDirectory,
+  workerDirectory,
+  confirmation,
+  executorStopped = false,
+  typedProduction,
+  coordinationFactory = createProductionDeploymentLock,
+  buildSchemas = buildTypedProductionExpectedSchemas,
+  inspectTyped = runTypedProductionPreflight,
+  configTools = defaultTypedConfigTools,
+  healthRecheck = recheckProductionHealth,
+  publicSurfaceRecheck = recheckProductionPublicSurface,
+  publicReleaseManifestRecheck = recheckProductionPublicReleaseManifest,
+  fetchImpl = globalThis.fetch,
+} = {}) {
+  if (confirmation !== "RECONCILE_TYPED_PRODUCTION_DEPLOYMENT"
+      || executorStopped !== true) {
+    return localFailure("RECONCILIATION_CONFIRMATION_REQUIRED");
+  }
+  if (!typedProduction?.inventory
+      || typeof typedProduction.provider?.capture !== "function"
+      || typeof typedProduction.provider?.query !== "function"
+      || typeof buildSchemas !== "function"
+      || typeof inspectTyped !== "function"
+      || typeof configTools?.createSnapshot !== "function"
+      || typeof configTools?.render !== "function"
+      || typeof configTools?.verify !== "function") {
+    return typedFailure("PRODUCTION_TYPED_INPUT_INVALID");
+  }
+  let operation;
+  try {
+    const prior = await readOperation(operationDirectory);
+    const { state } = prior;
+    const pin = state.typed;
+    if (prior.kind !== "production"
+        || !EXACT_COMMIT.test(state.owner ?? "")
+        || !EXACT_COMMIT.test(state.sourceCommit ?? "")
+        || !EXACT_COMMIT.test(state.previousSourceCommit ?? "")
+        || state.confirmedMigrations !== null
+        || state.lock !== "held"
+        || !["deployed_unverified", "outcome_unknown", "verified"].includes(state.outcome)
+        || pin?.schema !== "production-typed-operation-v1"
+        || !PRODUCTION_SHA256_PATTERN.test(pin.liveConfigurationFingerprint ?? "")
+        || pin.predecessorSourceCommit !== state.previousSourceCommit
+        || !EXACT_COMMIT.test(pin.retainedPublicSourceCommit ?? "")
+        || !PRODUCTION_SHA256_PATTERN.test(pin.expectedLiveManifestSha256 ?? "")
+        || (pin.candidatePublicManifestSha256 !== undefined
+          && !PRODUCTION_SHA256_PATTERN.test(pin.candidatePublicManifestSha256))) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_INVALID");
+    }
+    operation = await openOperation({
+      directory: operationDirectory,
+      kind: "production",
+      binding: {
+        sourceCommit: state.sourceCommit,
+        previousSourceCommit: state.previousSourceCommit,
+        confirmedMigrations: null,
+        typed: pin,
+      },
+      resume: true,
+    });
+    if (operation.record.updatedAt !== prior.updatedAt) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_INVALID");
+    }
+    const lock = coordinationFactory({ repositoryRoot: resolve(workerDirectory, "../..") });
+    lock.assertOwned(state.owner);
+    const starting = configTools.createSnapshot(typedProduction.inventory);
+    const currentInventory = await typedProduction.provider.capture();
+    const current = configTools.createSnapshot(currentInventory);
+    if (!typedSnapshotMatches(starting, current)
+        || current.sourceCommit !== state.sourceCommit
+        || current.fingerprint !== pin.liveConfigurationFingerprint) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_LIVE_MISMATCH");
+    }
+    const expected = await buildSchemas({ workerDirectory });
+    const expectedIdentity = typedSchemaIdentity(expected);
+    if (!expectedIdentity
+        || JSON.stringify(expectedIdentity) !== JSON.stringify(pin.expectedSchemaIdentity)) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_SCHEMA_MISMATCH");
+    }
+    const parseErrors = [];
+    const trackedConfig = parse(
+      await readFile(join(workerDirectory, "wrangler.jsonc"), "utf8"),
+      parseErrors,
+    );
+    if (parseErrors.length || !trackedConfig || typeof trackedConfig !== "object") {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_CONFIG_MISMATCH");
+    }
+    const candidateConfig = configTools.render({
+      trackedConfig,
+      snapshot: current,
+      sourceCommit: state.sourceCommit,
+    });
+    if (!configTools.verify({
+      snapshot: current,
+      candidateConfig,
+      sourceCommit: state.sourceCommit,
+    })?.ok) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_CONFIG_MISMATCH");
+    }
+    const vars = typedConfigEnvironment(candidateConfig)?.vars;
+    const typed = await inspectTyped({
+      roles: typedRoles(),
+      expectedSchemas: expected.expectedSchemas,
+      config: {
+        mode: vars?.TELEMETRY_STORAGE_MODE,
+        sourceNamespace: vars?.TELEMETRY_STORAGE_NAMESPACE,
+      },
+      runQuery: (binding, sql) => typedProduction.provider.query(currentInventory, binding, sql),
+    });
+    if (!typed?.ok) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_PREFLIGHT_BLOCKED");
+    }
+    const afterSchema = configTools.createSnapshot(await typedProduction.provider.capture());
+    if (!typedSnapshotMatches(current, afterSchema)) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_LIVE_MISMATCH");
+    }
+    const manifest = await publicReleaseManifestRecheck({
+      fetchImpl,
+      expectedSha256: pin.candidatePublicManifestSha256 ?? pin.expectedLiveManifestSha256,
+      timeoutMs: PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS,
+    });
+    if (!manifest?.ok) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_PUBLIC_MISMATCH");
+    }
+    const health = await healthRecheck({
+      fetchImpl,
+      timeoutMs: PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS,
+    });
+    const surface = await publicSurfaceRecheck({
+      fetchImpl,
+      timeoutMs: PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS,
+    });
+    const finalSnapshot = configTools.createSnapshot(await typedProduction.provider.capture());
+    if (!health?.ok || health.sourceCommit !== state.sourceCommit
+        || !surface?.ok || !typedSnapshotMatches(current, finalSnapshot)) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_UNVERIFIED");
+    }
+    lock.assertOwned(state.owner);
+    state.outcome = "verified";
+    state.stage = "verified";
+    state.code = "PRODUCTION_DEPLOYED";
+    await operation.save(state);
+    lock.release(state.owner);
+    state.lock = "released";
+    await operation.save(state);
+    return {
+      ok: true,
+      code: "PRODUCTION_TYPED_RECONCILED",
+      outcome: "verified",
+      coordination: "released",
+    };
+  } catch (error) {
+    const code = /^(?:PRODUCTION|RELEASE_OPERATION)_[A-Z_]+$/.test(error?.code ?? "")
+      ? error.code
+      : "PRODUCTION_TYPED_RECONCILIATION_FAILED";
+    return localFailure(code);
+  } finally {
+    operation?.close();
+  }
+}
+
 export function parseProductionDeploymentArgs(argv) {
   const names = new Map([["--confirm", "confirmation"], ["--confirm-migrations", "confirmedMigrations"],
     ["--expected-previous-source", "expectedPreviousSourceCommit"], ["--operation", "operationDirectory"],
@@ -2070,7 +2239,15 @@ export function parseProductionDeploymentArgs(argv) {
     if (!name || name in result || !value || value.startsWith("--") || value.includes("\0")) throw operationError("PRODUCTION_ARGUMENTS_INVALID");
     result[name] = value;
   }
-  if (result.confirmation === "RECONCILE_PRODUCTION_DEPLOYMENT") {
+  if (result.confirmation === "RECONCILE_TYPED_PRODUCTION_DEPLOYMENT") {
+    if (!result.operationDirectory || !result.executorStopped
+        || !result.inventoryPath || !result.inventorySha256
+        || !PRODUCTION_SHA256_PATTERN.test(result.inventorySha256)
+        || result.confirmedMigrations || result.expectedPreviousSourceCommit
+        || result.retainedPublicSourceCommit || result.expectedLiveManifestSha256) {
+      throw operationError("PRODUCTION_ARGUMENTS_INVALID");
+    }
+  } else if (result.confirmation === "RECONCILE_PRODUCTION_DEPLOYMENT") {
     if (!result.operationDirectory || !result.executorStopped || result.confirmedMigrations || result.expectedPreviousSourceCommit
         || result.inventoryPath || result.inventorySha256 || result.retainedPublicSourceCommit || result.expectedLiveManifestSha256) {
       throw operationError("PRODUCTION_ARGUMENTS_INVALID");
@@ -2099,7 +2276,8 @@ async function main() {
         + "[--inventory PRIVATE_JSON --inventory-sha256 SHA256 "
         + "--retained-public-source FULL_SHA --expected-live-manifest-sha256 SHA256] "
         + "[--confirm-migrations BINDING:0000_name.sql,...]\n"
-        + "Reconcile only: --confirm RECONCILE_PRODUCTION_DEPLOYMENT --operation PRIVATE_DIRECTORY --executor-stopped\n",
+        + "Reconcile only: --confirm RECONCILE_PRODUCTION_DEPLOYMENT --operation PRIVATE_DIRECTORY --executor-stopped\n"
+        + "Typed recovery: --confirm RECONCILE_TYPED_PRODUCTION_DEPLOYMENT --operation PRIVATE_DIRECTORY --executor-stopped --inventory PRIVATE_JSON --inventory-sha256 SHA256\n",
     );
     process.exit(2);
   }
@@ -2112,7 +2290,11 @@ async function main() {
       ".bin",
       process.platform === "win32" ? "wrangler.cmd" : "wrangler",
     );
-    const run = options.confirmation === "RECONCILE_PRODUCTION_DEPLOYMENT" ? reconcileProductionDeployment : runProductionDeployment;
+    const run = options.confirmation === "RECONCILE_PRODUCTION_DEPLOYMENT"
+      ? reconcileProductionDeployment
+      : options.confirmation === "RECONCILE_TYPED_PRODUCTION_DEPLOYMENT"
+        ? reconcileTypedProductionDeployment
+        : runProductionDeployment;
     const runOptions = {
       ...options,
       wrangler,
