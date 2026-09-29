@@ -656,7 +656,73 @@ The transition is one-way. The recovery disposition is forward fix; retain
 correction-aware admission and erasure checks when disabling shared performance
 controls. Do not restore a writer that predates correction archival.
 
+### Effective-history lookup and cache scheduling prerequisites
+
+The effective dependency reader requires typed-ingestion migration
+`0005_owner_occurrence_lookup.sql` before its new source is deployed. The
+`typed_telemetry_owner_occurrence` index serves owner/format/stream/occurrence
+lookups across retained history. Date restrictions must not replace these
+cross-day links: they carry correction and conflict dependencies outside the
+requested output window. A missing index refuses the new query explicitly.
+
+Analytics migration `0033_cache_retention_owner_cursor.sql` must also precede
+the new cache Worker. Its table stores a numeric position and revision for each
+source/shard configuration, with no participant or owner identity. The cache
+lane advances this cursor before source work and uses compare-and-swap to
+reject a competing cursor update. A crash, slow skipped owner or invocation
+deadline therefore permits another owner to receive the next turn. The
+selection wraps against the current active, unfenced owner order; completed
+owners are skipped with bounded probes. An empty pass limited to 12 owner
+probes reports deferred, with at most 36 target statements and no source
+reads; only a full observed wrap proves idle for that pass.
+
+Within an owner, pending days remain oldest first. A transient source mismatch
+leaves that day unbuilt and unmarked until daily projection supplies a current
+fingerprint. Owner rotation improves fairness; it does not prove source
+availability or authorize publishing a stale cache result. Measure completed,
+current, nonempty cache output and public publication separately from cursor
+movement, skips and staged feature preparation.
+
+Both schema changes are additive. Applying them is a separately authorized
+production operation against the existing source and analytics roles. Preserve
+the complete deployed schema, runtime state and `d1_storage_migrations`
+ledger; do not replay a fresh restore package or substitute Wrangler's
+`d1_migrations` ledger. Rehearse populated upgrades, retain pre-write backup
+evidence, verify the exact resulting canonical schema, and only then deploy the
+qualified successor. A timeout with an unknown outcome requires read-only
+reconciliation before any further write.
+
+The narrow `apps/worker/scripts/existing-role-forward-migration.mjs` operator
+owns this two-object update. Its `prepareExistingRoleForwardPlan` API pins a
+clean candidate, Wrangler bytes, the four exact predecessor Workers, both role
+bindings, complete schema/ledger prefixes, stable runtime controls and Time
+Travel bookmarks. It projects only the two reviewed additions through the
+unchanged canonical preflight. `runExistingRoleForwardMigration` defaults to
+plan validation; execution requires the exact plan digest and confirmation.
+
+Each role's DDL and custom-ledger entry form one atomic request. The operation
+records intent before that request, verifies the resulting schema and ledger,
+and holds the shared production lock until final preflight and receipt checks.
+An uncertain request is reconciled without remote writes. A proved-applied
+result resumes after that role; a proved-not-applied result additionally needs
+explicit retry confirmation. Expired approvals permit inspection but no new
+DDL. If a partial operation expires, preserve its journal and obtain a
+separately reviewed recovery plan; do not replay it through a fresh migration
+package or edit the recorded approval.
+
 ## Scheduled analytics rollout operator
+
+For the already enabled September 29 deployment, the guarded `refresh-enabled`
+stage replaces all three bundles while preserving enabled shared processing.
+It requires predecessor source `3216e225`, a qualified successor, the 32-entry
+analytics ledger ending in 0033, and the completed two-role forward migration
+above. The stage adds `forwardMigration` with its private operation directory
+and exact raw `plan.json`/`receipt.json` hashes; `disabledOperation` is null.
+The operator checks the complete migration journal, candidate and SQL hashes,
+both live database schemas and ledgers, retained predecessor deployment
+receipts, exact versions, bindings, settings, schedules and ingress. This path
+uses no disable/reactivate sequence. Its normal upload/deploy journal and
+uncertain-outcome recovery rules below still apply.
 
 `apps/worker/scripts/production-scheduled-analytics-deploy.mjs` guards the
 retained analytics, publication and cache bundles. Its private plan pins the
