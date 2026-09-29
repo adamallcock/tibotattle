@@ -52,6 +52,40 @@ const LONG_PASS_WINDOW_MS=8*60_000;
  * pass and that owner-day is skipped once rather than twice. Both bounds are
  * validated by the pass against its own deadline. */
 const LONG_PASS_GRAPH_LEASE_MS=570_000;
+/** Recovery is reserved for a verified public-authority gap. Leave enough of
+ * the shared invocation meter for the public phase if delivery becomes idle. */
+const AUTHORITY_RECOVERY_DELIVERY_QUERIES=850;
+/** Public work has an initial capacity/cleanup phase before its 100-query
+ * iteration floor. Leave a modest statement margin above that floor. */
+const PUBLIC_PHASE_ADMISSION_QUERIES=140;
+async function authorityRecoveryAdmitted(bindings:{source:D1Database;target:D1Database;
+ sourceId:string;sourceNamespace:string}):Promise<boolean> {
+ // Both indexed singleton/key reads use the same invocation meter as the
+ // passes. A missing cursor can be an ordinary bootstrap state. Missing or
+ // malformed metadata cannot grant the longer delivery window; the normal
+ // pass retains its own complete runtime/source identity checks.
+ const source=await bindings.source.prepare(`SELECT s.source_id AS sourceId,
+  a.source_namespace AS v1Namespace,b.source_namespace AS v11Namespace,
+  s.authority_epoch AS authorityEpoch FROM storage_source_state s
+  JOIN typed_v1_admission_state a ON a.id=1 AND a.runtime_contract_version=1
+  JOIN typed_v11_admission_state b ON b.id=1 AND b.runtime_contract_version=1
+  WHERE s.singleton=1`).first<{sourceId:unknown;v1Namespace:unknown;v11Namespace:unknown;
+   authorityEpoch:unknown}>();
+ const target=await bindings.target.prepare(`SELECT r.source_id AS sourceId,
+  r.source_namespace AS sourceNamespace,r.contract_version AS contractVersion,
+  c.sequence AS cursorSequence,c.authority_epoch AS cursorEpoch
+  FROM analytics_runtime_sources r JOIN analytics_source_cursors c ON c.source_id=r.source_id
+  WHERE r.source_id=?`).bind(bindings.sourceId).first<{sourceId:unknown;sourceNamespace:unknown;
+   contractVersion:unknown;cursorSequence:unknown;cursorEpoch:unknown}>();
+ if(!source||source.sourceId!==bindings.sourceId||source.v1Namespace!==bindings.sourceNamespace
+  ||source.v11Namespace!==bindings.sourceNamespace||!Number.isSafeInteger(source.authorityEpoch)
+  ||(source.authorityEpoch as number)<0||!target||target.sourceId!==bindings.sourceId
+  ||target.sourceNamespace!==bindings.sourceNamespace||target.contractVersion!==1
+  ||!Number.isSafeInteger(target.cursorSequence)||(target.cursorSequence as number)<0
+  ||!Number.isSafeInteger(target.cursorEpoch)||(target.cursorEpoch as number)<0
+  ||(target.cursorEpoch as number)>(source.authorityEpoch as number))return false;
+ return (source.authorityEpoch as number)>(target.cursorEpoch as number);
+}
 /** Do not expose account identifiers, SQL, credentials or a stored record in
  * diagnostics. Retain the durable cursor and make scheduler failure visible.
  * Internal failure constants are closed uppercase identifiers; provider or
@@ -89,23 +123,45 @@ export async function runStorageAnalyticsSchedule(env:StorageAnalyticsWorkerEnv,
   // Give ordered delivery its own bounded opportunity before expensive graph
   // work, on every invocation including the long one, so ingestion delivery
   // never skips a minute. Both sequential phases share one actual-statement
-  // meter; this does not create competing cursor writers or two independent
-  // query allowances. The second phase then uses the rest of this invocation's
-  // work window: the minute schedule's, or the long pass's eight minutes. Graph
+  // meter; within this invocation they are sequential, with one cursor writer
+  // and no independent query allowances. The second phase uses the rest of the
+  // invocation's work window: the minute's, or the long pass's eight minutes. Graph
   // checkpoints reserve their own final save time. A slow in-flight query can
   // overrun this cooperative deadline; subsequent work must still stop rather
   // than receive a fresh allowance.
   const started=Date.now(),deadlineMs=started+(longPass?LONG_PASS_WINDOW_MS:55_000);
+  // Cron's scheduled instant can precede isolate startup. Recovery must not
+  // consume the next minute's opportunity even when this invocation starts
+  // late; the ordinary public phase keeps its existing 55-second deadline.
+  const recoveryDeadlineMs=Math.min(started+45_000,(options?.nowMs??started)+45_000);
+  const authorityLag=publishCommunity&&!longPass?await authorityRecoveryAdmitted(bindings):false;
+  const recoveryAdmitted=authorityLag&&recoveryDeadlineMs-Date.now()>=5_000;
+  const deliveryStarted=Date.now();
   const delivery=publishCommunity?await runStorageAnalyticsPass({...bindings,publishCommunity:false,
-   maxSteps:32,maxQueries:175,deadlineMs:started+10_000}):null;
+   maxSteps:32,maxQueries:recoveryAdmitted
+    ?Math.min(AUTHORITY_RECOVERY_DELIVERY_QUERIES,meter.remainingQueries):175,
+   deadlineMs:recoveryAdmitted?recoveryDeadlineMs:started+10_000}):null;
+  const deliveryElapsedMs=publishCommunity?Date.now()-deliveryStarted:0;
+  const deliveryComplete=!recoveryAdmitted||delivery?.state==='idle'&&delivery.reason==='complete';
   if(Date.now()>=deadlineMs){
    console.log(JSON.stringify({event,...delivery,state:'deferred',reason:'deadline',
+    recoveryAdmitted,deliveryElapsedMs,
     deliverySteps:delivery?.steps??0,deliveryRecordsRead:delivery?.recordsRead??0,
     deliveryQueriesUsed:delivery?.queriesUsed??0,publicIterations:0,publicRecordsRead:0,publicQueriesUsed:0,
     queriesUsed:meter.queriesUsed}));return;
   }
-  // The builder lane opens only on this second pass: the delivery phase has
-  // 175 statements and the long pass is graph-only. Both switches must be open,
+  if(!deliveryComplete||meter.remainingQueries===0
+   ||recoveryAdmitted&&meter.remainingQueries<PUBLIC_PHASE_ADMISSION_QUERIES){
+   console.log(JSON.stringify({event,...delivery,state:'deferred',
+    reason:deliveryComplete?'query_budget':delivery?.reason??'query_budget',
+    recoveryAdmitted,deliveryElapsedMs,
+    deliverySteps:delivery?.steps??0,deliveryRecordsRead:delivery?.recordsRead??0,
+    deliveryQueriesUsed:delivery?.queriesUsed??0,publicIterations:0,publicRecordsRead:0,publicQueriesUsed:0,
+    queriesUsed:meter.queriesUsed}));return;
+  }
+  // The builder lane opens only on this second pass: delivery normally has
+  // 175 statements, or at most 850 on an admitted ordinary-minute authority
+  // recovery; the long pass remains graph-only. Both switches must be open,
   // and the build reads the SAME metered source binding as everything else.
   const buildProjections=graphDayProjectionBuildEnabled(env);
   const foldProjections=storageV11PreparedFoldEnabled(env);
@@ -132,6 +188,7 @@ export async function runStorageAnalyticsSchedule(env:StorageAnalyticsWorkerEnv,
   // nothing" and "selected and prepared nothing" the builder is in.
   const projection=result.graphDayProjection;
   console.log(JSON.stringify({event,...result,
+   recoveryAdmitted,deliveryElapsedMs,
    ...(projection?{projectionOpened:projection.opened,projectionBuilt:projection.built,
     projectionRefused:projection.refused,projectionSkipped:projection.skipped,
     projectionCandidates:projection.candidates,projectionSourceQueries:projection.sourceQueriesUsed,
