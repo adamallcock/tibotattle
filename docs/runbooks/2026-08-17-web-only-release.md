@@ -50,7 +50,7 @@ dependency update, or Wrangler configuration change.
   `apps/web/public/model-catalog.generated.js` and
   `apps/web/public/telemetry-shared.generated.js`.
 
-It rejects every other path, including `apps/macos/`, Worker source/runtime
+It rejects every other path, including `apps/electron/`, Worker source/runtime
 code, migrations, package-lock files, and deployment configuration. No other
 file under `packages/` is admitted: not `packages/i18n/index.d.ts`, not
 `packages/telemetry-contract/index.js`, its typings, package manifest, JSON

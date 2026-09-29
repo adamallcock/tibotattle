@@ -1,9 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  MACOS_ARTIFACT_TEST_FILES,
-  MACOS_SMOKE_TEST_FILES,
-  MACOS_SOURCE_TEST_FILES,
+  MACOS_TRANSITION_TEST_FILES,
   mergeChangedPaths,
   parseTestLaneArguments,
   selectTestLanes,
@@ -14,30 +12,15 @@ import {
   PORTABLE_TEST_GROUPS,
 } from "../scripts/portable-test-manifest.mjs";
 
-test("lane manifests include every executable macOS test target", () => {
-  assert.deepEqual(MACOS_SOURCE_TEST_FILES, [
-    "test/release-agent.test.js",
-    "test/release-operation.test.js",
-    "test/macos-release-journal.test.js",
-    "test/i18n-foundation.test.js",
-    "test/macos-localization.test.js",
-    "test/macos-app-bundle.test.js",
+test("transition lane retains every incoming Sparkle contract target", () => {
+  assert.deepEqual(MACOS_TRANSITION_TEST_FILES, [
     "test/macos-keychain-migration-artifact.test.js",
-    "test/macos-keychain-migration-runner.test.js",
-    "test/macos-keychain-migration-ui.test.js",
-  ]);
-  assert.deepEqual(MACOS_ARTIFACT_TEST_FILES, [
-    "test/release-operation.test.js",
-    "test/macos-release-journal.test.js",
-    "test/macos-app-bundle.test.js",
-    "test/macos-keychain-migration-artifact.test.js",
-    "test/macos-keychain-migration-runner.test.js",
-    "test/macos-keychain-migration-ui.test.js",
     "test/macos-updater.test.js",
-    "test/macos-updater-release.test.mjs",
-  ]);
-  assert.deepEqual(MACOS_SMOKE_TEST_FILES, [
-    "test/macos-test-build.test.mjs",
+    "test/electron-sparkle-transition.test.js",
+    "test/generate-sparkle-appcast-stable-feed.test.js",
+    "test/sparkle-signed-feed-validation.test.js",
+    "test/sparkle-remote-inspection.test.js",
+    "test/publish-sparkle-update.test.js",
   ]);
 });
 
@@ -63,7 +46,7 @@ test("test-lane arguments retain explicit paths and reject ambiguous input", () 
       "origin/main",
       "--full",
       "--path",
-      "apps/macos/UsageMonitorApp.swift",
+      "scripts/electron-sparkle-transition.js",
       "--path",
       "apps/web/public/app.js",
     ]),
@@ -72,7 +55,7 @@ test("test-lane arguments retain explicit paths and reject ambiguous input", () 
       base: "origin/main",
       full: true,
       paths: [
-        "apps/macos/UsageMonitorApp.swift",
+        "scripts/electron-sparkle-transition.js",
         "apps/web/public/app.js",
       ],
     },
@@ -93,7 +76,7 @@ test("test-lane arguments retain explicit paths and reject ambiguous input", () 
     ["changed", "--path", "../outside.md"],
     ["changed", "--path", "/outside.md"],
     ["changed", "--base", ""],
-    ["macos-source", "--path", "apps/macos/UsageMonitorApp.swift"],
+    ["macos-transition", "--path", "scripts/electron-sparkle-transition.js"],
     ["portable", "--path", "apps/local/server.js"],
   ]) {
     assert.throws(() => parseTestLaneArguments(argv));
@@ -103,13 +86,13 @@ test("test-lane arguments retain explicit paths and reject ambiguous input", () 
 test("changed-path merger retains branch, active-worktree, and untracked entries", () => {
   assert.deepEqual(
     mergeChangedPaths([
-      "apps/macos/UsageMonitorApp.swift\0README.md\0",
+      "scripts/electron-sparkle-transition.js\0README.md\0",
       "README.md\0scripts/test-lanes.mjs\0",
       "test/new-untracked.test.js\0",
     ]),
     [
       "README.md",
-      "apps/macos/UsageMonitorApp.swift",
+      "scripts/electron-sparkle-transition.js",
       "scripts/test-lanes.mjs",
       "test/new-untracked.test.js",
     ],
@@ -117,54 +100,20 @@ test("changed-path merger retains branch, active-worktree, and untracked entries
 });
 
 test("test-lane selection narrows only paths with complete executable coverage", () => {
-  assert.deepEqual(
-    selectTestLanes(["apps/macos/UsageMonitorApp.swift"]),
-    {
-      lanes: ["macos-source", "macos-smoke"],
-      paths: ["apps/macos/UsageMonitorApp.swift"],
-      unknownPaths: [],
-    },
-  );
-  assert.deepEqual(
-    selectTestLanes(["apps/macos/UsageMonitorApp.swift"], { full: true }).lanes,
-    ["full"],
-  );
-  assert.deepEqual(
-    selectTestLanes(["apps/macos/Assets/AppIcon.icns"]).lanes,
-    ["macos-source", "macos-smoke", "macos-artifact"],
-  );
-  assert.deepEqual(
-    selectTestLanes(["scripts/build-macos-app.js"]).lanes,
-    ["macos-source", "macos-smoke", "macos-artifact"],
-  );
-  assert.deepEqual(
-    selectTestLanes(["scripts/prepare-sparkle-framework.js"]).lanes,
-    ["macos-artifact"],
-  );
-  assert.deepEqual(
-    selectTestLanes(["test/macos-app-bundle.test.js"]).lanes,
-    ["macos-source", "macos-artifact"],
-  );
   for (const path of [
+    "scripts/electron-sparkle-transition.js",
+    "scripts/prepare-sparkle-framework.js",
+    "scripts/macos-release-core.js",
     "test/macos-keychain-migration-artifact.test.js",
-    "test/macos-keychain-migration-runner.test.js",
-    "test/macos-keychain-migration-ui.test.js",
+    "test/macos-updater.test.js",
   ]) {
-    assert.deepEqual(selectTestLanes([path]).lanes,
-      ["macos-source", "macos-artifact"], path);
+    assert.deepEqual(selectTestLanes([path]).lanes, ["macos-transition"], path);
   }
   assert.deepEqual(
-    selectTestLanes(["test/macos-updater.test.js"]).lanes,
-    ["macos-artifact"],
+    selectTestLanes(["scripts/electron-sparkle-transition.js"], { full: true }).lanes,
+    ["full"],
   );
-  assert.deepEqual(
-    selectTestLanes(["test/macos-test-build.test.mjs"]).lanes,
-    ["macos-smoke"],
-  );
-  assert.deepEqual(
-    selectTestLanes(["packages/i18n/index.js"]).lanes,
-    ["i18n"],
-  );
+  assert.deepEqual(selectTestLanes(["packages/i18n/index.js"]).lanes, ["i18n"]);
   for (const path of [
     "scripts/generate-i18n-browser-mirror.js",
     "scripts/generate-i18n-electron-copy.js",
@@ -177,23 +126,15 @@ test("test-lane selection narrows only paths with complete executable coverage",
     "apps/web/public/app.js",
     "apps/local/server.js",
     "config/product-brand.js",
-    "scripts/macos-release-core.js",
+    "scripts/lib/sparkle-remote-inspection.mjs",
     "scripts/test-lanes.mjs",
-    "scripts/benchmark-test-lanes.mjs",
-    "test/macos-preview-install.test.js",
+    "scripts/unknown-new-tool.mjs",
     "src/unmapped-product-path.js",
     "../critical.md",
   ]) {
-    assert.deepEqual(
-      selectTestLanes([path]).lanes,
-      ["full"],
-      path,
-    );
+    assert.deepEqual(selectTestLanes([path]).lanes, ["full"], path);
   }
-  assert.deepEqual(
-    selectTestLanes(["docs/decisions/example.md"]).lanes,
-    [],
-  );
+  assert.deepEqual(selectTestLanes(["docs/decisions/example.md"]).lanes, []);
 });
 
 test("hosted lanes execute complete owning gates and unfamiliar or shared inputs stay broad", () => {

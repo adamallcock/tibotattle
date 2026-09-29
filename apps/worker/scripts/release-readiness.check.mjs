@@ -4,6 +4,7 @@ import {
   DEPLOYMENT_ENDPOINTS,
 } from "../../../config/deployment-endpoints.js";
 import {
+  getReleaseChannel,
   INTERNAL_DOGFOOD_RELEASE_CHANNEL,
   STABLE_RELEASE_CHANNEL,
 } from "../../../config/release-channels.js";
@@ -215,40 +216,41 @@ test("a copied manifest with the wrong appcast is rejected without probing or cl
   assert.equal(JSON.stringify(result).includes("wrong.xml"), false);
 });
 
-test("unconfigured dogfood fails closed without falling back to stable or probing", async () => {
-  let fetchCalls = 0;
+test("configured dogfood probes its reviewed endpoints without falling back to stable", async () => {
+  const calls = [];
   let consumerChecks = 0;
+  const dogfood = getReleaseChannel(INTERNAL_DOGFOOD_RELEASE_CHANNEL);
   const result = await verifyReleaseReadiness({
     channel: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
     probePublic: true,
     endpointConsumerCheck: async () => {
       consumerChecks += 1;
     },
-    fetchImpl: async () => {
-      fetchCalls += 1;
-      throw new Error("unconfigured dogfood must not probe");
+    fetchImpl: async (url) => {
+      calls.push(String(url));
+      throw new Error("synthetic dogfood probe failure");
     },
     clock: fixedClock(),
   });
-  assert.equal(fetchCalls, 0);
+  assert.deepEqual(calls, [
+    `${dogfood.serviceOrigin}/api/health`,
+    `${dogfood.serviceOrigin}/api/ready`,
+    dogfood.sparkle.appcastURL,
+  ]);
   assert.equal(consumerChecks, 0);
   assert.equal(result.channel, INTERNAL_DOGFOOD_RELEASE_CHANNEL);
   assert.equal(result.channelPolicy.name, INTERNAL_DOGFOOD_RELEASE_CHANNEL);
-  assert.equal(result.channelPolicy.configured, false);
-  assert.equal(result.channelPolicy.serviceOrigin, null);
-  assert.equal(result.channelPolicy.sparkle.appcastURL, null);
-  assert.equal(result.endpointManifest.status, "not_configured");
-  assert.equal(result.endpointManifest.publicOrigin, null);
-  assert.equal(result.endpointManifest.appcastURL, null);
-  assert.equal(result.status, "blocked");
+  assert.equal(result.channelPolicy.configured, true);
+  assert.equal(result.channelPolicy.serviceOrigin, dogfood.serviceOrigin);
+  assert.equal(result.channelPolicy.sparkle.appcastURL, dogfood.sparkle.appcastURL);
+  assert.equal(result.endpointManifest.status, "matched");
+  assert.equal(result.endpointManifest.publicOrigin, dogfood.serviceOrigin);
+  assert.equal(result.endpointManifest.appcastURL, dogfood.sparkle.appcastURL);
+  assert.equal(result.status, "not_ready");
   assert.equal(result.ready, false);
   assert.equal(
-    result.blockers.includes("RELEASE_CHANNEL_NOT_CONFIGURED"),
+    result.blockers.includes("HEALTH_UNAVAILABLE"),
     true,
-  );
-  assert.equal(
-    JSON.stringify(result).includes(DEPLOYMENT_ENDPOINTS.public.origin),
-    false,
   );
   assert.equal(JSON.stringify(result).includes(SECRET), false);
 });

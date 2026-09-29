@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { startLocalCompanionServer } from "./server.js";
-import { CLIENT_WEB_FILES } from "../../scripts/export-tibotattle.mjs";
 import {
   RUNTIME_WEB_MODULE_ENTRYPOINTS,
 } from "../../scripts/lib/runtime-closure.mjs";
@@ -37,9 +36,10 @@ test("Electron settings and bridge have a real loopback route and retained clien
       assert.equal(response.status, 200, file);
       assert.equal(await response.text(), await readFile(join(staticRoot, file), "utf8"), file);
       assert.equal(response.headers.get("access-control-allow-origin"), null);
-      assert.ok(CLIENT_WEB_FILES.includes(`apps/web/public/${file}`), `client export: ${file}`);
-      assert.ok([...RUNTIME_WEB_MODULE_ENTRYPOINTS, ...surfaceFiles("native-macos")]
-        .includes(`apps/web/public/${file}`), `native closure: ${file}`);
+      assert.ok(surfaceFiles("history-free-export").includes(`apps/web/public/${file}`),
+        `history-free export: ${file}`);
+      assert.ok([...RUNTIME_WEB_MODULE_ENTRYPOINTS, ...surfaceFiles("electron-runtime")]
+        .includes(`apps/web/public/${file}`), `Electron closure: ${file}`);
     }
     const health = await (await fetch(`${origin}/api/local/health`)).json();
     assert.equal(health.capabilities.centralServiceProxy, false);

@@ -1398,11 +1398,6 @@ test("local and Worker apps may use only their reviewed package roots", async ()
 
 for (const fixture of [
   {
-    app: "macos",
-    packageDirectory: "telemetry-contract",
-    packageName: "@fixture/telemetry-contract",
-  },
-  {
     app: "web",
     packageDirectory: "accounting",
     packageName: "@fixture/accounting",
@@ -1441,29 +1436,6 @@ for (const fixture of [
     );
   });
 }
-
-test("rejects macos imports into an owned root source area", async () => {
-  await withFixtureTree(
-    {
-      "apps/macos/src/index.js":
-        'import "../../../src/application/index.js";',
-      "src/application/index.js":
-        "export const application = true;",
-    },
-    async (rootDirectory) => {
-      const result = await checkArchitectureBoundaries({
-        baseline: [],
-        rootDirectory,
-      });
-
-      assert.equal(result.ok, false);
-      assert.deepEqual(
-        result.violations.map(({ category }) => category),
-        ["source_owner_dependency_direction"],
-      );
-    },
-  );
-});
 
 test("permits every reviewed source-owner dependency row through exact public facades", async () => {
   await withFixtureTree(

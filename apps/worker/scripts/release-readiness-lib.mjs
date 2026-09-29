@@ -14,7 +14,7 @@ import {
   fetchBoundedMacOSPreviewHTTPS,
   MACOS_PREVIEW_REMOTE_CODES,
   validateSparkleAppcastXML,
-} from "../../../scripts/verify-macos-preview-remote.js";
+} from "../../../scripts/lib/sparkle-remote-inspection.mjs";
 
 export const RELEASE_READINESS_SCHEMA_VERSION =
   "tibotattle-release-readiness-v0.1";

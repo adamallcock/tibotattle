@@ -846,8 +846,8 @@ provider response is a stop, not permission to retry raw Wrangler.
 
 Private operation records default to
 `.release-build/production-operations/<candidate-sha>` in the repository.
-Inspect them using `node scripts/release-agent.mjs status --operation <directory>`
-from the repository root. Only after establishing that the old executor cannot
+Inspect the private operation record locally without copying it into an issue or
+public artifact. Only after establishing that the old executor cannot
 still run, use the explicit reconciliation path:
 
 ```bash

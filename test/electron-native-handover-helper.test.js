@@ -92,7 +92,7 @@ print(String(data: data, encoding: .utf8)!)
 });
 
 test("native handover helper reads legacy preferences through the native default domain", async () => {
-  const source = await readFile("apps/macos/Helpers/NativeElectronHandoverHelper.swift", "utf8");
+  const source = await readFile("apps/electron/native/NativeElectronHandoverHelper.swift", "utf8");
   const start = source.indexOf("private static func readPreferences");
   const end = source.indexOf("private static func failureResponse", start);
   assert.ok(start >= 0 && end > start, "preference bridge functions must remain present");
@@ -154,7 +154,7 @@ test("guided install plan retains the old app at one exact backup path without p
 });
 
 test("the native writer helper cannot read or mutate main-app startup services", async () => {
-  const source = await readFile("apps/macos/Helpers/NativeElectronHandoverHelper.swift", "utf8");
+  const source = await readFile("apps/electron/native/NativeElectronHandoverHelper.swift", "utf8");
   assert.doesNotMatch(source, /import ServiceManagement|SMAppService|startAtLogin|loginItemDisabled/u);
   assert.equal((source.match(/return nativeWriterPreparedResponse\(preferences: preferences\)/gu) ?? []).length, 2);
 });

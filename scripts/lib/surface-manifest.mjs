@@ -37,7 +37,6 @@ function assertManifest(manifest) {
     "electron-runtime",
     "history-free-export",
     "local-companion",
-    "native-macos",
   ];
   if (JSON.stringify(surfaceNames) !== JSON.stringify(expectedSurfaceNames)) {
     fail("Surface manifest surface names changed");

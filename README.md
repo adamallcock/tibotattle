@@ -83,15 +83,10 @@ GitHub provenance evidence yourself.
 ## Build from source (developers)
 
 These requirements are for development, not installation of the released app.
-The native app builder runs on macOS 14 or later on Apple silicon. Repository
-tooling requires Node.js ≥ 22.13,
-[pnpm](https://pnpm.io) 11, and the Xcode command-line tools. The app-bundle
-build itself requires exactly Node v26.2.0 on macOS arm64: it fails on any
-other runtime rather than producing an unverifiable bundle.
-The default target is Apple silicon. To build an Intel target on that same
-builder, follow the explicit target and verified-runtime instructions in
-[the native developer guide](apps/macos/README.md#developer-build). A native
-Intel build host is not currently supported by this builder.
+Repository tooling requires Node.js ≥ 22.13 and
+[pnpm](https://pnpm.io) 11. macOS Electron packaging also requires the
+supported macOS build host and Xcode command-line tools; the production
+candidate procedure is in the [macOS release runbook](docs/runbooks/macos-stable-release-runbook.md).
 
 The root workspace uses pnpm; the Worker keeps its own npm lockfile, which is
 needed only for hosted-service checks and the full gates:
@@ -104,8 +99,7 @@ npm --prefix apps/worker ci
 Build and open the self-contained desktop app:
 
 ```bash
-npm run product:macos:build
-open ".release-build/macos/TiboTattle.app"
+npm run package:electron:development
 ```
 
 For development only, run the local dashboard in an external browser without
@@ -204,7 +198,7 @@ compatibility fallback until they are explicitly migrated.
 
 | Path | Contents |
 | --- | --- |
-| `apps/macos`, `apps/local`, `apps/web` | Desktop app shell, loopback companion server, and browser dashboard |
+| `apps/electron`, `apps/local`, `apps/web` | Desktop app shell, loopback companion server, and browser dashboard |
 | `apps/worker` | Optional hosted contribution service (off by default) |
 | `packages/` | Workspace packages: accounting, quota analysis, telemetry contract, identity core, and i18n |
 | `src/` | Product source: `application/`, `platform/`, `export/`, `contribution/`, `reporting/`, `providers/` owners plus compatibility roots |
@@ -250,35 +244,21 @@ separate source, native, installed, release, updater, and platform gates.
 npm run product:check
 ```
 
-For native iteration, start with a deterministic preflight and the source-only
-macOS lane:
+For iteration, run the preflight and the retained native-upgrade transition
+contract gate:
 
 ```bash
-npm run test:fast
-npm run test:macos:smoke
+npm run test:preflight
+npm run product:macos:transition:test
 ```
 
-`test:macos:smoke` builds one development-only app with the test compiler
-profile; that profile cannot create preview or external-distribution output.
-Use `npm run test:changed -- --base <revision>` to select known changed paths,
-which includes `<revision>...HEAD` plus staged, unstaged, and untracked local
-paths. It narrows only reviewed native app/build and i18n paths: native source
-changes include the test-profile smoke, and `--full` adds the expensive
-bundle-artifact lane. Web, local-server, shared configuration, runner, and
-unfamiliar paths conservatively run the complete `npm run check` gate. The
-smoke lane requires macOS arm64 with the pinned Node v26.2.0 builder; it fails
-rather than falsely reporting a smoke result on another platform. The retained
-release-quality macOS gate is always:
-
-```bash
-npm run product:macos:test
-```
-
-`npm test` and lane execution remain serial by design. The artifact lane itself
-uses two isolated OS-level builder processes for its reproducibility check;
-each build has a separate output and compiler scratch directory. Measure the
-local lanes with `npm run test:benchmark` (or `test:benchmark:release` to
-include the retained release gate).
+The transition gate prepares the pinned Sparkle tools and tests historical
+signed-artifact validation, both incoming appcast paths, and Electron handover
+contracts. It does not build the retired native app or qualify an installed
+upgrade. Use `npm run test:changed -- --base <revision>` to select known changed
+paths; unfamiliar or shared changes run the complete `npm run check` gate.
+Both-architecture installed upgrade qualification remains a separate release
+gate in the [macOS release runbook](docs/runbooks/macos-stable-release-runbook.md).
 
 `npm run architecture:check` enforces ownership boundaries. Maintained current
 references are deliberately split by authority:

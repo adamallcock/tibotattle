@@ -537,199 +537,51 @@ or community route registry.
 
 ## 5. Native, browser, and child-process APIs
 
-### macOS shell ↔ companion launch contract
+### Electron shell ↔ loopback companion
 
-**Source of truth:**
-[`apps/macos/UsageMonitorApp.swift`](../../apps/macos/UsageMonitorApp.swift).
+**Sources of truth:** [`apps/electron/main.js`](../../apps/electron/main.js),
+[`apps/electron/companion-supervisor.js`](../../apps/electron/companion-supervisor.js),
+[`apps/electron/ready-line.js`](../../apps/electron/ready-line.js), and
+[`apps/electron/loopback-policy.js`](../../apps/electron/loopback-policy.js).
 
-The shell starts the bundled Node companion with an ephemeral port and passes
-only fixed configuration values: parent PID, resource root, state root,
-selected `CODEX_HOME`, the inherited safe environment subset, optional fixed
-central origin, and the private Keychain-broker descriptor. A successful child
-announces exactly:
+Electron starts its bundled companion as one owned child, accepts only the
+fixed loopback readiness line and confines renderer navigation to that origin.
+Shutdown and refresh cancellation preserve the last verified local state.
+The narrow preload/IPC bridge is owned by
+[`apps/electron/preload.cjs`](../../apps/electron/preload.cjs) and the main
+process. Renderer content cannot supply arbitrary filesystem paths, network
+origins or process commands. The registered `usagemonitor://open` deep link is
+an app wake-up signal, not an OAuth-code transport; the canonical outbound
+`codex://threads/<UUID>` target remains separately validated.
 
-```text
-USAGE_MONITOR_READY http://127.0.0.1:<port>/
-```
-
-The shell accepts only the fixed loopback pattern and loads only that exact
-origin in its `WKWebView`.
-
-The custom URL `usagemonitor://open` is a wake-up signal after a hosted browser
-sign-in. Its scheme, host, empty query, and empty fragment are fixed by
-[`config/product-brand.js`](../../config/product-brand.js); it never transports
-an OAuth code, state, identity, or provider response.
-
-The outbound-only `codex://threads/<UUID>` target opens a user-selected thread
-in Codex. It is not a registered TiboTattle callback. Only a canonical UUID
-without credentials, port, query, fragment, encoding, or extra path is allowed.
-The native-owned isolated-world click bridge requires a trusted DOM click
-(including keyboard activation) in the pinned companion main frame. Generic
-WebKit navigation/new-window requests cannot open Codex programmatically.
-
-### WKWebView bridge
-
-| Direction | Name | Closed payload / purpose |
-|---|---|---|
-| Web → native | `tibotattleLocalization` | `{type: "set-language-preference", preference}` with preference restricted to the native locale enum |
-| Web → native | `tibotattleDownloads` | `{type: "reveal-latest-download"}`; the path never crosses the bridge |
-| Web → native | `tibotattleHostedSignIn` | `{inFlight: boolean}` only; carries no provider or identity data |
-| Isolated local click → native | `tibotattleCodexThreadLink` | `{threadId}` only, from the native-owned non-page content world after `event.isTrusted`; canonical UUID and pinned main-frame origin revalidated; never persisted or logged |
-| Native → web | `tibotattle:hosted-sign-in-return` | DOM event telling the live page to collect its opaque result |
-| Native → web | `tibotattle:local-evidence-updated` | DOM event telling the live page that the snapshot changed |
-| Native → web | `tibotattle:locale-override` | `CustomEvent` with one closed language preference |
-| Native → web | `tibotattle:appearance-override` | `CustomEvent` with schema version, native host, closed appearance preference, and resolved theme |
-
-At document start the shell also injects the fixed
-`window.__TIBOTATTLE_LOCALIZATION__` handoff and a native-dashboard marker. The
-native diagnostics reader calls only the allowlisted
-`window.__tibotattleContributionDiagnostics()` function and independently
-decodes a fixed boolean vocabulary.
-
-### Private Keychain broker protocol
+### macOS credential and predecessor migration protocols
 
 **Sources of truth:**
-[`apps/macos/Sources/KeychainBroker.swift`](../../apps/macos/Sources/KeychainBroker.swift)
-and
-[`src/contribution-device-keychain-broker.js`](../../src/contribution-device-keychain-broker.js).
+[`apps/electron/desktop-macos-keychain.js`](../../apps/electron/desktop-macos-keychain.js),
+[`apps/electron/desktop-keychain-broker.js`](../../apps/electron/desktop-keychain-broker.js),
+[`src/contribution-device-keychain-broker.js`](../../src/contribution-device-keychain-broker.js),
+[`apps/electron/desktop-native-migration.js`](../../apps/electron/desktop-native-migration.js),
+and the signed
+[`NativeElectronHandoverHelper.swift`](../../apps/electron/native/NativeElectronHandoverHelper.swift).
 
-The signed app and its spawned companion share a kernel-held socketpair. The
-child receives its endpoint as standard input; the environment contains only
-the descriptor announcement needed to select the broker transport. Frames are
-newline-delimited JSON protocol v2, strictly ordered, and at most 4,096 bytes.
-The wire names one of four logical capabilities; service and account strings
-never cross the channel:
+The signed Electron main process owns the reviewed macOS credential adapter
+and companion broker pipe. The wire selects closed logical capabilities; it
+never accepts arbitrary Keychain service/account names. An announced failed
+broker cannot silently fall back to an unrelated credential implementation.
+Existing native data and settings are imported through a private, journaled,
+no-clobber handover. The Swift helper authenticates its signed enclosing app,
+uses a fixed protocol, and cannot reset credentials or enable sharing. Unknown
+or newer data schemas preserve the predecessor state and stop startup.
+The [handover runbook](../runbooks/2026-09-07-macos-native-to-electron-handover.md)
+describes the recovery and exact signed-artifact gate.
 
-| Wire capability | App-owned modern Keychain service | Purpose |
-|---|---|---|
-| `export_identity` | `app-usagemonitor.export-identity.app.v1` | Stable local export pseudonym authority |
-| `account_observation` | `app-usagemonitor.account-observation.app.v1` | Account-continuity observation secret |
-| `claude_session_pseudonym` | `app-usagemonitor.claude-session-pseudonym.app.v1` | Local Claude-session pseudonymization |
-| `contribution_device` | `app-usagemonitor.contribution-device.app.v1` | Hosted collector device bearer |
-
-| Operation | Request | Successful response |
-|---|---|---|
-| `get` | `{v: 2, id, op: "get", capability}` | `{id, ok: true, secret: string|null}` |
-| `set` | `{v: 2, id, op: "set", capability, secret}` | `{id, ok: true}` |
-| `delete` | `{v: 2, id, op: "delete", capability}` | `{id, ok: true}` |
-
-The broker reads the `.app.v1` generation first. When only the corresponding
-legacy keytar-backed `.v1` item exists, it attempts a noninteractive read through
-`Contents/Helpers/TiboTattleKeychainMigration`. The helper retains the legacy
-`node` Developer ID identity, has no entitlements, and authenticates its native
-parent's live audit token and signing identity. The parent authenticates the
-spawned helper and pins its code hash. The helper accepts only the four fixed
-capabilities; stable/Preview storage identity comes from the authenticated
-parent, never the request. Its private descriptor frames and lifetime are
-bounded, including when the parent exits during a Keychain call.
-
-Up to three silent attempts use 250 ms and 750 ms backoff after the first
-attempt. The app-process budget survives companion replacement. Each automatic
-read forbids Keychain interaction. Adoption is create-if-absent with exact
-readback, preserves a conflicting modern item, and retains the legacy recovery
-copy. Failure returns `migration_required`; it never invents a fresh identity.
-After exhaustion a quiet native Settings action offers an explanation with
-Cancel as the default. Only deliberate **Approve migration** enables an
-interactive legacy read. Denial preserves the key and stops the approval pass;
-another prompt requires another explicit review. Teardown fences both admission
-and adoption. All four adapters preserve a fixed, content-free migration-required
-diagnostic. No broker operation approves migration or resets its retry budget.
-Protocol v1 remains accepted only for the historical contribution-device-only
-client and cannot name a wider capability. The
-[migration decision](../decisions/2026-08-31-silent-keychain-migration.md)
-records signed qualification and the retained-copy explicit-reset gate.
-
-The broker protocol admits exactly these four capabilities. The packaged
-companion's current runtime graph injects it for export identity, account
-observation, and contribution device; that graph's audited dependency closure
-excludes `@github/keytar`. Claude callback is reached from the standalone CLI
-and local-review compositions, which retain the keytar adapter for
-compatibility. Invalid or uncorrelatable frames close the channel; ordinary
-operation failures return a fixed error code and matching `id`. Native smoke
-modes use process-memory storage and never inspect or migrate the developer's
-login Keychain.
-
-The Electron macOS production adapter has a fifth native capability,
-`accountless_installation`, distinct from the four-capability broker. Only its
-main-process accountless backend can select that capability; `store` and
-`remove` reject it, leaving `createIfMissing` and `deleteExact` as the permitted
-mutations. The separate inherited FD3 accountless channel carries closed
-preference, credential and status operations for the owned companion. Its
-`credential_recovery_required` marker contains no path, secret or native
-error detail and pauses the scheduler. Neither native capability names nor
-secret operations are exposed through renderer IPC or HTTP. The
-[adapter contract](../../native/macos-keychain/README.md) defines the source
-boundary; it is not installed or signed-candidate qualification.
-
-The Linux Electron companion now has a separate, source-only Secret Service
-broker at inherited FD4. Its main-owned factory must provide the existing
-native backend with a qualified cross-process mutation lease; the child never
-loads Secret Service or keytar. Protocol v1 admits only `export_identity` and
-`account_observation`, with `read`, `create_if_missing`, `replace_exact`, and
-`delete_exact`. Requests carry strictly increasing IDs and canonical 32-byte
-secrets, with a 4096-byte per-frame limit and at most 32 pending operations.
-Malformed replies or transport failure permanently refuse further requests.
-The Linux descriptor announcement is mutually exclusive with the Mac broker.
-The three local-server identity/observation entrypoints share one cached
-transport and preserve explicit development overrides. An absent or malformed
-broker cannot select a child-side credential fallback. Conditional mutations
-execute under the parent-owned lease; locked account observation stays
-unattributed with its fixed diagnostic. This does not change the private FD3
-upload-only authority, enable production selection, or establish installed
-Linux qualification. Abandoned mutations require recovery and the underlying
-backend still reports `crashRecoveryComplete: false` and `productionSafe: false`.
-
-The Linux shell package requires the exact native mutex `.node` and sidecar
-from `native/linux-credential-mutex/build/qualification`, alongside the pinned
-Linux Keytar prebuild. Both mutex files are unpacked physical files so the
-loader's descriptor-based checks remain effective. Module-owned path mapping
-handles only the fixed `app.asar` to `app.asar.unpacked` layout; source paths
-remain unchanged. Staging and artifact verification use
-`validateLinuxCredentialMutexBindingManifest` for the closed sidecar schema,
-then independently compare its size/digest against captured bytes. The runtime
-manifest keeps its existing schema and records the pair as `linux_native_binding`
-inventory rows. These three exact unpacked files are required for Linux and
-cannot broaden another target's native inventory. Native execution and
-installed qualification remain separate.
-
-The dormant Linux accountless adapter uses a separate owner-private XDG-state
-record, not the legacy provider or social credential store. Its
-[fixed native boundary](../../native/linux-credential-mutex/README.md) exposes
-only `readAccountlessInstallationCredential`,
-`createAccountlessInstallationCredentialIfMissing`, and
-`deleteAccountlessInstallationCredentialExact`, with no caller-supplied path
-or capability number. The record is exactly 32 bytes under owner-only file
-permissions; it is not encrypted at rest and remains accessible to an
-authorized process while the desktop is locked. The native-private slot `4`
-does not expand the generic `0..3` lease API or the legacy FD4 protocol. Only
-the main-owned adapter can compose this record into the existing private FD3
-accountless channel. Invalid fixed records and uncertain mutations preserve
-recovery state instead of permitting silent identity replacement. The source
-keeps `productionSafe: false` and leaves runtime selection disabled; native
-qualification, installed lifecycle and release remain separate gates.
-
-The dormant Windows accountless adapter likewise owns a separate,
-owner-private protected-state record, not a fifth legacy Credential Manager
-capability. Its [fixed native boundary](../../native/windows-filesystem/README.md)
-exposes only `read`, `createIfMissing`, and `deleteExact` for an upload-only
-32-byte installation secret; callers cannot select a capability, record name,
-or path. The fixed record and `active`/`normal` journal are plaintext at rest.
-The two private native mutex methods,
-`acquireAccountlessInstallationCredentialMutex()` and
-`releaseAccountlessInstallationCredentialMutex(lease)`, have no capability
-argument and sit outside generic IDs `0..3` and FD4. They serialize cooperating
-processes only in the current owner's `Local\` Windows session: backup copies,
-same-owner processes that bypass the contract, and other sessions remain outside
-that protection. Before a create or exact delete, the backend writes `active`;
-an uncertain mutation, malformed record, failed release, or interruption retains
-it when the write can be verified and then returns fixed recovery rather than
-silently replacing identity. If it cannot retain that marker, it returns a
-content-free operation failure without a restart-persistence claim. The
-main-owned adapter may carry the secret only through the existing private FD3
-accountless channel, never renderer IPC or HTTP. `productionSafe` remains
-`false` and runtime selection remains disabled pending native Windows x64 build,
-manifest, security, physical-runner, installed-lifecycle, signing, and release
-evidence.
+Native 0.1.18 still consumes `/appcast.xml` on Apple silicon and
+`/intel/appcast.xml` on Intel. Those incoming Sparkle transport contracts are
+owned by [`scripts/generate-sparkle-appcast.js`](../../scripts/generate-sparkle-appcast.js),
+[`scripts/publish-sparkle-update.js`](../../scripts/publish-sparkle-update.js),
+and the signed Electron transition validator. Electron-to-Electron updates use
+the separate Electron updater feeds. The old AppKit shell, WKWebView bridge and
+native Keychain broker are no longer source-owned APIs in this checkout.
 
 ### Codex plugin MCP and installed-agent protocols
 
@@ -830,16 +682,12 @@ runbooks.
 
 ### Apple platform APIs
 
-The native shell uses these external platform APIs directly:
-
-| Framework/API | Use |
-|---|---|
-| WebKit (`WKWebView`, website data store, script messages) | Render and bridge the fixed loopback dashboard |
-| Security (`SecItem*`) | App-owned export identity and contribution-device secrets |
-| ServiceManagement (`SMAppService.mainApp`) | User-controlled launch-at-login registration |
-| UserNotifications | Optional local-only allowance notifications |
-| AppKit / `NSWorkspace` | System-browser handoff, reveal-download, settings, and app lifecycle |
-| Sparkle 2 | Signed appcast and update-artifact verification in distribution builds |
+Electron composes macOS login-item, notification, Keychain, signature and
+installed-updater behavior through its reviewed platform adapters. The retained
+Swift handover helper uses AppKit to authenticate and coordinate with a
+same-identity predecessor. Pinned Sparkle tools sign the incoming native
+appcasts; the Electron application uses its own updater after transition.
+Qualification is artifact- and architecture-specific.
 
 ## 6. Reviewed internal module APIs
 

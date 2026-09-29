@@ -23,8 +23,8 @@ test("Mac installation guidance separates both supported cask targets from the p
     assert.match(content, /macOS 14 or later/u, `${name} preserves the support floor`);
   }
   assert.match(readme, /## Build from source \(developers\)/u);
-  assert.match(readme, /exactly Node v26\.2\.0 on macOS arm64/u);
-  assert.match(readme, /A native\s+Intel build host is not currently supported/u);
+  assert.match(readme, /Electron packaging/u);
+  assert.match(readme, /retained Sparkle feed/u);
   assert.doesNotMatch(readme, /## Quick start \(macOS, Apple Silicon\)/u);
   assert.match(await text("CONTRIBUTING.md"), /## Developer setup/u);
   assert.match(await text("SUPPORT.md"), /macOS 14 or later on Apple silicon and Intel/u);
@@ -35,7 +35,6 @@ test("maintained Markdown retires self-service promises without implying history
     "README.md",
     "SUPPORT.md",
     "apps/local/README.md",
-    "apps/macos/README.md",
     "apps/worker/README.md",
     "docs/user-guide.md",
     "docs/reference/local-data-and-privacy.md",
@@ -177,37 +176,19 @@ test("local operation docs preserve owner preflight and durable disconnect inten
   assert.match(localReadme, /real Codex home and production credential\s+backend/u);
 });
 
-test("shipping local data sources remain disclosed in every maintained user surface", async () => {
-  const [
-    collector,
-    threadStore,
-    localServer,
-    appServer,
-    rootReadme,
-    localReadme,
-    macosReadme,
-    publicDocs,
-    publicPrivacy,
-    swiftFallback,
-    nativeApp,
-    ...catalogs
-  ] = await Promise.all([
+test("shipping local data sources remain disclosed in maintained user surfaces", async () => {
+  const [collector, threadStore, localServer, appServer, rootReadme,
+    localReadme, publicDocs, publicPrivacy, electronCopy] = await Promise.all([
     text("src/passive-collector.js"),
     text("src/platform/local-codex-thread-store.js"),
     text("apps/local/server.js"),
     text("src/providers/codex/app-server.js"),
     text("README.md"),
     text("apps/local/README.md"),
-    text("apps/macos/README.md"),
     text("apps/web/public/docs.html"),
     text("apps/web/public/privacy.html"),
-    text("apps/macos/Sources/Localization.swift"),
-    text("apps/macos/UsageMonitorApp.swift"),
-    text("apps/macos/Resources/en.lproj/Localizable.strings"),
-    text("apps/macos/Resources/es.lproj/Localizable.strings"),
-    text("apps/macos/Resources/zh-Hans.lproj/Localizable.strings"),
+    text("apps/electron/desktop-copy-source.js"),
   ]);
-
   const sourceContracts = [
     [collector, "sessions"],
     [collector, "archived_sessions"],
@@ -220,35 +201,21 @@ test("shipping local data sources remain disclosed in every maintained user surf
   for (const [source, marker] of sourceContracts) {
     assert.ok(source.includes(marker), `source still owns ${marker}`);
   }
-
   for (const [surface, name] of [
     [rootReadme, "root README"],
     [localReadme, "local companion README"],
-    [macosReadme, "macOS README"],
     [publicDocs, "public docs"],
     [publicPrivacy, "public privacy page"],
-    [swiftFallback, "Swift localization fallback"],
-    ...catalogs.map((catalog, index) => [catalog, `native catalog ${index}`]),
   ]) {
     for (const [, marker] of sourceContracts) {
       assert.ok(surface.includes(marker), `${name} discloses ${marker}`);
     }
-    assert.doesNotMatch(
-      surface,
-      /plan-usage-history\.json/u,
-      `${name} does not disclose the retired Claude Desktop plan-history source`,
-    );
+    assert.doesNotMatch(surface, /plan-usage-history\.json/u);
   }
-
-  assert.match(
-    nativeApp,
-    /alert\.informativeText = TiboTattleLocalization\.format\([\s\S]*?\.launcherFirstRunDisclosure/u,
-  );
-  assert.doesNotMatch(
-    nativeApp,
-    /Reads: timestamps, model and speed labels/u,
-    "the runtime alert must not bypass the maintained localized disclosure",
-  );
+  for (const marker of ["electron.firstRun.detail", "Never contributed:",
+    "prompts, responses", "first-run setup", "local dashboard"]) {
+    assert.ok(electronCopy.includes(marker), `Electron first-run disclosure retains ${marker}`);
+  }
 });
 
 test("component READMEs delegate executable route inventories to the canonical reference", async () => {
@@ -289,7 +256,6 @@ test("maintained public docs reject known pre-release and wrong-location claims"
   const [
     rootReadme,
     localReadme,
-    macosReadme,
     workerReadme,
     contributing,
     security,
@@ -297,12 +263,10 @@ test("maintained public docs reject known pre-release and wrong-location claims"
     issueConfig,
     pullRequestTemplate,
     rootPackage,
-    localizationFallback,
-    ...localizationCatalogs
+    electronCopy,
   ] = await Promise.all([
     text("README.md"),
     text("apps/local/README.md"),
-    text("apps/macos/README.md"),
     text("apps/worker/README.md"),
     text("CONTRIBUTING.md"),
     text("SECURITY.md"),
@@ -310,10 +274,7 @@ test("maintained public docs reject known pre-release and wrong-location claims"
     text(".github/ISSUE_TEMPLATE/config.yml"),
     text(".github/PULL_REQUEST_TEMPLATE.md"),
     text("package.json"),
-    text("apps/macos/Sources/Localization.swift"),
-    text("apps/macos/Resources/en.lproj/Localizable.strings"),
-    text("apps/macos/Resources/es.lproj/Localizable.strings"),
-    text("apps/macos/Resources/zh-Hans.lproj/Localizable.strings"),
+    text("apps/electron/desktop-copy-source.js"),
   ]);
 
   assert.doesNotMatch(rootReadme, /product-reference\.md|2026-07-29-end-to-end-pilot/u);
@@ -321,12 +282,6 @@ test("maintained public docs reject known pre-release and wrong-location claims"
   assert.doesNotMatch(localReadme, /usage-monitor\.example|Application Support\/TiboTattle/u);
   assert.doesNotMatch(localReadme, /plan-usage-history\.json/u);
   assert.doesNotMatch(localReadme, /GET \/api\/local\/contribution\/sync-next/u);
-  assert.doesNotMatch(
-    macosReadme,
-    /Automatic\s+updates[\s\S]{0,100}Settings…?\*\* → \*\*General/u,
-  );
-  assert.doesNotMatch(macosReadme, /plan-usage-history\.json/u);
-  assert.doesNotMatch(macosReadme, /quit Usage Monitor/u);
   assert.doesNotMatch(
     workerReadme,
     /Worker is development-only|public production is not authorized/u,
@@ -339,7 +294,7 @@ test("maintained public docs reject known pre-release and wrong-location claims"
   assert.doesNotMatch(issueConfig, /adamallcock\/app-usagemonitor/u);
   assert.match(pullRequestTemplate, /npm run docs:check/u);
   assert.doesNotMatch(rootPackage, /Local-only quota and standard API-price usage triangulation experiment/u);
-  for (const surface of [localizationFallback, ...localizationCatalogs]) {
+  for (const surface of [electronCopy]) {
     assert.doesNotMatch(surface, /settings\.previewUpdatesPending/u);
     assert.doesNotMatch(surface, /first signed release has not been published/u);
   }
