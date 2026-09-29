@@ -107,6 +107,7 @@ describe('durable ordered priced usage features',()=>{
   it('defers a feature page without advancing its durable usage cursor',async()=>{
     const quotaAcquisition=await acquisition();
     const checkpoint=await advanceV11UsageReduction(db,pin,{quotaAcquisition,
+      nowMs:Date.parse(modelHistoryWindow(day).fixedNow),
       preparedUsageReader:{days:[day],async readPage(){return {state:'deferred'};}}},
     {remainingQueries:10,deadlineMs:1,now:()=>0},null,1);
     expect(checkpoint.complete).toBe(false);expect(checkpoint.rowsRead).toBe(0);
