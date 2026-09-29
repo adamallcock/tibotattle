@@ -72,6 +72,8 @@ const MODEL_CATALOG_ROW_PATTERN =
 
 const PUBLIC_RELEASE_SOURCE_BASENAMES = new Set([
   "apple.svg",
+  "cache-reuse-matrix.css",
+  "cache-reuse-matrix.js",
   "community-data.js",
   "community-refresh.js",
   "last-known-good.js",
@@ -89,6 +91,8 @@ const PUBLIC_RELEASE_SOURCE_BASENAMES = new Set([
   "i18n.generated.js",
   "install-cta.js",
   "localization.js",
+  "model-performance.css",
+  "model-performance.js",
   "model-catalog.generated.js",
   "privacy.html",
   "styles.css",
@@ -131,6 +135,8 @@ const WEB_RELEASE_TOOLING_PATHS = new Set([
   "apps/web/test/fixtures/public-allowance.js",
   "apps/web/test/public-allowance-views.test.mjs",
   "apps/web/test/community-cache-retention.test.mjs",
+  "apps/web/test/cache-reuse-matrix.test.mjs",
+  "apps/web/test/feature-insights.test.mjs",
   "docs/runbooks/2026-08-17-web-only-release.md",
   "docs/runbooks/2026-08-17-public-site-local-preview.md",
   "docs/runbooks/macos-stable-release-runbook.md",
