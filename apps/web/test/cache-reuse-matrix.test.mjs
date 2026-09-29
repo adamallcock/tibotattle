@@ -201,6 +201,19 @@ test("all ten time groups are accessible and distinguish zero reuse from no evid
     "the partial-light note shares a line with the outcome legend");
 });
 
+test("narrow plot ends just after its measured gap rows", () => {
+  const ui = mount({ width: 390 });
+  ui.matrix.render({ impact: impact([[2000, 1900], [500, 450], [100, 70], [40, 20]]) });
+  const plot = ui.find("cache-matrix-plot");
+  const plotHeight = Number(plot.getAttribute("viewBox").split(" ")[3]);
+  const last = ui.all("cache-matrix-hit").at(-1);
+  const lastBottom = parseFloat(last.style.top) + parseFloat(last.style.height);
+  assert.ok(plotHeight > lastBottom);
+  assert.ok(plotHeight - lastBottom < 40,
+    "the narrow plot should not reserve maximum stack height for every small gap");
+  assert.equal(plot.style.height, `${plotHeight}px`);
+});
+
 test("hover details lead with percentages, retain exact denominator and pricing callback", () => {
   const seen = [];
   const ui = mount({ formatMetric: (summary) => { seen.push(summary); return [`lost:${summary.lostCacheTokens}`]; } });
