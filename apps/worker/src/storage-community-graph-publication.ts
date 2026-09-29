@@ -125,17 +125,19 @@ async function dependencyMetadata<T>(source:D1Database,sql:string,args:Array<str
   return rows.map(row=>JSON.parse(row.row_json!) as T);
 }
 
-/** A whole-owner input revision advances on today's append. Closed historical
- * values instead depend on the exact selected manifests/winning chunk vector.
- * Revalidate those identities in owner pages, then retain the final full source
- * fence. This neither accepts changed evidence nor rewrites calculation time. */
+/** Closed-window values depend on the exact selected manifests/winning chunk
+ * vector. A V1.2 correction can change it without advancing the older input
+ * revision. Revalidate those identities in owner pages, then retain the final
+ * full source fence. This does not rewrite calculation time. */
 async function closedDependencies(bindings:StorageAnalyticsBindings,authority:StorageCommunityAuthority,
-  page:StorageCommunityOwner[],day:string,budget:{remaining:number}):Promise<Map<string,string>|'capacity'|null> {
+  page:StorageCommunityOwner[],day:string,metric:'fits'|'model',
+  budget:{remaining:number}):Promise<Map<string,string>|'capacity'|null> {
   const window=modelHistoryWindow(day),result=new Map<string,string>();
   // Effective owners use the same closed-window metadata builder as graph
   // scope capture. This keeps publication revalidation byte-identical to the
   // dependency used by resumable work and retains every admitted source family.
-  if(page.some(owner=>(owner.hasV12&&!owner.hasEffective)
+  if(page.some(owner=>(metric==='fits'&&!owner.hasEffective&&!owner.hasV11)
+      ||(owner.hasV12&&!owner.hasEffective)
       ||(!owner.hasEffective&&!owner.hasV11&&(owner.hasLegacy||!owner.hasV1))))return null;
   for(const owner of page.filter(owner=>owner.hasEffective)){
     const dependency=await effectiveHistoryDependency(bindings.source,owner,bindings.sourceNamespace,
@@ -149,7 +151,7 @@ async function closedDependencies(bindings:StorageAnalyticsBindings,authority:St
     if(dependencySize>budget.remaining)return 'capacity';
     budget.remaining-=dependencySize;
     result.set(owner.ownerDigest!,await storageGraphDependencyDigest({authority,ownerDigest:owner.ownerDigest!,
-      source:'effective',metric:'model',day,dependency}));
+      source:'effective',metric,day,dependency}));
   }
   const v11=page.filter(owner=>!owner.hasEffective&&owner.hasV11);
   if(v11.length){
@@ -167,7 +169,7 @@ async function closedDependencies(bindings:StorageAnalyticsBindings,authority:St
     for(const owner of v11){
       const dependency=grouped.get(owner.participantId)!;if(dependency.length>101)return null;
       result.set(owner.ownerDigest!,await storageGraphDependencyDigest({authority,ownerDigest:owner.ownerDigest!,
-        source:'v1.1',metric:'model',day,dependency}));
+        source:'v1.1',metric,day,dependency}));
     }
   }
   const v1=page.filter(owner=>!owner.hasEffective&&!owner.hasV11);
@@ -189,21 +191,47 @@ async function closedDependencies(bindings:StorageAnalyticsBindings,authority:St
   }
   return result;
 }
+/** An accepted owner event can change a V1.2 window without advancing the
+ * older community input revision. Probe the retained owner/sequence index,
+ * then spend exact-window dependency reads only for owners with newer events.
+ * One source statement and at most one result per owner in this 32-row page. */
+async function changedOwnersSinceResult(source:D1Database,
+  candidates:readonly {ownerDigest:string;afterSequence:number}[],throughSequence:number):Promise<Set<string>> {
+  if(!candidates.length)return new Set();
+  if(candidates.length>32||!Number.isSafeInteger(throughSequence)||throughSequence<0
+    ||candidates.some(candidate=>!/^[a-f0-9]{64}$/u.test(candidate.ownerDigest)
+      ||!Number.isSafeInteger(candidate.afterSequence)||candidate.afterSequence<0
+      ||candidate.afterSequence>=throughSequence))throw fail();
+  const selected=candidates.map(()=>'(? , ?)').join(',');
+  const response=await source.prepare(`WITH candidate(owner_digest,after_sequence) AS (VALUES ${selected})
+    SELECT candidate.owner_digest FROM candidate WHERE EXISTS(
+      SELECT 1 FROM storage_ingestion_changes change
+      WHERE change.owner_digest=candidate.owner_digest AND change.sequence>candidate.after_sequence
+        AND change.sequence<=?)`).bind(...candidates.flatMap(candidate=>[candidate.ownerDigest,
+      candidate.afterSequence]),throughSequence).all<{owner_digest:string}>();
+  if(response.success!==true||!Array.isArray(response.results))throw fail();
+  const rows=response.results;
+  const expected=new Set(candidates.map(candidate=>candidate.ownerDigest));
+  if(rows.length>candidates.length||rows.some(row=>!expected.has(row.owner_digest)))throw fail();
+  return new Set(rows.map(row=>row.owner_digest));
+}
 async function capture(bindings:StorageAnalyticsBindings,day:string,metric:'fits'|'model'):Promise<Capture|CaptureCapacity|null> {
   validDay(day);await ready(bindings);
-  const authority=await captureStorageCommunityAuthority(bindings.source,bindings),members=await owners(bindings.source);
+  const members=await owners(bindings.source);
   if(members===null)return null;
   if(members==='capacity')return {deferred:'capacity',memberCount:0};
+  // Pin the journal after the owner snapshot. Any owner change in between is
+  // inside this sequence and receives dependency revalidation below; a later
+  // change is rejected by the final owner fence.
+  const authority=await captureStorageCommunityAuthority(bindings.source,bindings);
   const containment=await terminalEpoch(bindings);
   const results:CapturedResult[]=[],dependencyBudget={remaining:MAX_DEPENDENCY_BYTES};let size=0;
   for(let offset=0;offset<members.length;offset+=32){
     const page=members.slice(offset,offset+32);
-    // A completed cache is bound to the owner's source input revision. That
-    // revision changes on every relevant accepted mutation. Equality plus the
-    // final full-cohort/source fence makes repeated per-owner pin acquisition
-    // unnecessary here. Older closed-window values additionally require exact
-    // metadata equality. Current fits may form an explicitly dated completed
-    // snapshot only across the same hard authority and source-format proof.
+    // V1.2 corrections can leave the older input revision unchanged. Probe
+    // later owner events before deciding whether bounded exact-window
+    // revalidation is needed. Current fits may remain a dated completed
+    // snapshot while their inputs are stale.
     const rows=(await bindings.target.prepare(`WITH selected AS MATERIALIZED (
       SELECT owner_digest,input_revision,dependency_digest,payload_json,payload_fingerprint,payload_sha256,authority_json,source_kind,computed_ms
       FROM analytics_community_graph_results WHERE source_id=? AND metric=? AND day=? AND method=?
@@ -216,18 +244,34 @@ async function capture(bindings:StorageAnalyticsBindings,day:string,metric:'fits
       .all<ResultRow>()).results;
     if(rows.length!==page.length)return null;
     const byOwner=new Map(rows.map(row=>[row.owner_digest,row]));
-    const stale=page.filter(owner=>byOwner.get(owner.ownerDigest!)?.input_revision!==owner.inputRevision);
-    const revalidated=stale.length&&metric==='model'
-      ?await closedDependencies(bindings,authority,stale,day,dependencyBudget):null;
+    const rowAuthorities=new Map<string,StorageCommunityAuthority>();
+    for(const row of rows){
+      const rowAuthority=JSON.parse(row.authority_json) as StorageCommunityAuthority;
+      if(!Number.isSafeInteger(rowAuthority?.sequence)||rowAuthority.sequence<0
+        ||rowAuthority.sequence>authority.sequence)return null;
+      rowAuthorities.set(row.owner_digest,rowAuthority);
+    }
+    const changed=await changedOwnersSinceResult(bindings.source,page.flatMap(owner=>{
+      const row=byOwner.get(owner.ownerDigest!),sequence=rowAuthorities.get(owner.ownerDigest!)?.sequence;
+      return row&&sequence!==undefined&&sequence<authority.sequence
+        ?[{ownerDigest:owner.ownerDigest!,afterSequence:sequence}]:[];
+    }),authority.sequence);
+    const revalidationOwners=metric==='model'
+      ?page.filter(owner=>byOwner.get(owner.ownerDigest!)?.input_revision!==owner.inputRevision
+        ||changed.has(owner.ownerDigest!))
+      :page.filter(owner=>changed.has(owner.ownerDigest!)&&(owner.hasEffective||owner.hasV11));
+    const revalidated=revalidationOwners.length
+      ?await closedDependencies(bindings,authority,revalidationOwners,day,metric,dependencyBudget):null;
     if(revalidated==='capacity')return {deferred:'capacity',memberCount:members.length};
     for(const owner of page){
       const row=byOwner.get(owner.ownerDigest!);
       if(row?.payload_json===null)return {deferred:'capacity',memberCount:members.length};
       const source=owner.hasEffective?'effective':owner.hasV11?'v1.1':owner.hasV1?owner.hasLegacy?'mixed':'v1':'v0.2';
-      const rowAuthority=row?JSON.parse(row.authority_json) as StorageCommunityAuthority:null;
+      const rowAuthority=row?rowAuthorities.get(row.owner_digest):null;
       if(!row||row.input_revision>owner.inputRevision
         ||!Number.isSafeInteger(row.input_revision)||row.input_revision<0||row.source_kind!==source
-        ||(metric==='model'&&row.input_revision!==owner.inputRevision&&revalidated?.get(owner.ownerDigest!)!==row.dependency_digest)
+        ||(metric==='model'&&revalidationOwners.includes(owner)
+          &&revalidated?.get(owner.ownerDigest!)!==row.dependency_digest)
         ||!/^[a-f0-9]{64}$/.test(row.dependency_digest)
         // A closed historical result proves its exact old window above. A
         // stale current fit is that owner's last completed result: it stays
@@ -241,7 +285,9 @@ async function capture(bindings:StorageAnalyticsBindings,day:string,metric:'fits
         ||bytes(row.payload_json)>1024*1024||await sha256Hex(row.payload_json)!==row.payload_sha256)return null;
       size+=bytes(row.payload_json);if(size>MAX_FITS_BYTES)return {deferred:'capacity',memberCount:members.length};
       const result:CapturedResult={owner,source,dependencyDigest:row.dependency_digest,fits:null,composition:null,
-        inputCurrent:row.input_revision===owner.inputRevision,computedMs:row.computed_ms,
+        inputCurrent:row.input_revision===owner.inputRevision
+          &&(!changed.has(owner.ownerDigest!)||revalidated?.get(owner.ownerDigest!)===row.dependency_digest),
+        computedMs:row.computed_ms,
         sourceEpoch:rowAuthority.sourceEpoch,sequence:rowAuthority.sequence};
       if(metric==='fits'){
         result.fits=parsedCachedFits(row.payload_json,owner.ownerDigest!);if(result.fits===null)return null;
@@ -266,11 +312,11 @@ async function capture(bindings:StorageAnalyticsBindings,day:string,metric:'fits
  * stamp pins the epoch that proof was made against. An unrelated concurrent
  * upload changes none of these and therefore defers nothing. */
 async function current(bindings:StorageAnalyticsBindings,captured:Capture):Promise<StorageCommunityAuthority|null> {
-  const latest=await owners(bindings.source);
-  if(!Array.isArray(latest)||canonicalJson(latest.map(identity))!==canonicalJson(captured.members.map(identity)))return null;
   let fresh:StorageCommunityAuthority;
   try{fresh=await captureStorageCommunityAuthority(bindings.source,bindings);}catch{return null;}
   if(!sameStorageCommunityHardAuthority(fresh,captured.authority))return null;
+  const latest=await owners(bindings.source);
+  if(!Array.isArray(latest)||canonicalJson(latest.map(identity))!==canonicalJson(captured.members.map(identity)))return null;
   if(await readStorageCommunitySourceTerminalEpoch(bindings.source)>captured.terminalEpoch)return null;
   return fresh;
 }

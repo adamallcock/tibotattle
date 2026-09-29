@@ -35,6 +35,7 @@ import { advanceStorageCommunityGraphWork } from '../src/storage-community-graph
 import { ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS } from '../src/admin-community-allowance';
 import {loadTypedV11GenerationSnapshot} from '../src/typed-v11-quota-reader';
 import {storageHistoryKeyDigest,type StorageHistoryKey} from '../src/storage-history-checkpoint';
+import {seedSharedAnalyticsCorpus} from './fixtures/shared-analytics-corpus';
 import {claimStorageGraphWorkSelection,ensureStorageGraphWorkSelection,loadLiveStorageGraphWorkSelection,readStorageGraphWorkSelection,
   type StorageGraphWorkEnvelope} from '../src/storage-community-graph-selection';
 
@@ -307,6 +308,30 @@ async function v12Fixture(id=participantId){
  await activateTelemetryV12Domain(typed(),f,domain);
  for(let n=0;n<32;n++){if((await advanceStorageAnalytics(bindings())).state==='idle')break;}
  await advanceStorageCommunityDaily({...bindings(),day:day()});return f;
+}
+async function correctableV12Model(){
+ await typed().prepare("UPDATE telemetry_v12_runtime SET state='active',changed_at=? WHERE id=1")
+  .bind(new Date().toISOString()).run();
+ await typed().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+ const corpus=await seedSharedAnalyticsCorpus({source:typed(),target:b.STORAGE_ANALYTICS_DB,
+  sourceId:namespace,sourceNamespace:namespace,anchorDay:day(),calendarDays:14,graphDays:2,
+  correctionAffectsModelFit:true});
+ const selectedDay=corpus.graphDates[0]!;
+ const owners=await readStorageCommunityOwnerPage(typed());
+ expect(owners).toHaveLength(2);
+ for(const owner of owners){
+  if(owner.ownerDigest!==corpus.owner.ownerDigest){
+   await b.STORAGE_ANALYTICS_DB.prepare(`INSERT INTO analytics_owner_state
+    (source_id,owner_digest,revision,authority_epoch,state) VALUES(?,?,?,?,'active')`)
+    .bind(namespace,owner.ownerDigest,owner.ownerRevision,owner.authorityEpoch).run();
+  }
+ }
+ for(let index=0;index<owners.length;index++){
+  expect(await compute('model',selectedDay,index)).toMatchObject({state:'complete'});
+ }
+ expect(await publishStorageCommunityModelDay(bindings(),{day:selectedDay}))
+  .toMatchObject({state:'published'});
+ return {corpus,selectedDay};
 }
 async function api(){
  const configured={...b,USAGE_MONITOR_DB:typed(),ENVIRONMENT:'synthetic-development',ACCOUNT_SCOPED_INGEST_MODE:'disabled'} as Env;
@@ -740,6 +765,112 @@ describe('isolated allowance graph publication',()=>{
   await retireStorageCommunityGraphPublications(bindings());
   expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT * FROM analytics_community_model_publications').first()).toEqual(old);
   expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT count(*) n FROM analytics_community_graph_previews').first('n')).toBe(1);
+ });
+ it('does not republish a stale v1.2 model result after a same-revision correction',async()=>{
+  const {corpus,selectedDay}=await correctableV12Model();
+  const before=(await b.STORAGE_ANALYTICS_DB.prepare(`SELECT input_revision,dependency_digest,authority_json
+   FROM analytics_community_graph_results WHERE source_id=? AND owner_digest=? AND metric='model' AND day=?`)
+   .bind(namespace,corpus.owner.ownerDigest,selectedDay)
+   .first<{input_revision:number;dependency_digest:string;authority_json:string}>())!;
+  const corrected=await corpus.mutateCorrection();
+  const sourceAuthority=await captureStorageCommunityAuthority(typed());
+  expect(corrected.inputRevision).toBe(before.input_revision);
+  expect(sourceAuthority.sequence).toBeGreaterThan(JSON.parse(before.authority_json).sequence);
+  expect(await publishStorageCommunityModelDay(bindings(),{day:selectedDay}))
+   .toMatchObject({state:'deferred',reason:'cache_pending'});
+  // A failed journal read cannot be interpreted as proof of no owner changes.
+  const failedJournalSource=new Proxy(typed(),{get(db,key){
+   if(key==='prepare')return(sql:string)=>sql.includes('WITH candidate(owner_digest,after_sequence)')
+    ?{bind:()=>({all:async()=>({success:false,results:[]})})} as unknown as D1PreparedStatement
+    :db.prepare(sql);
+   const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;
+  }});
+  await expect(publishStorageCommunityModelDay({...bindings(),source:failedJournalSource},
+   {day:selectedDay})).rejects.toThrow('STORAGE_GRAPH_PUBLICATION_UNAVAILABLE');
+ });
+ it('revalidates a correction admitted between the initial owner and sequence reads',async()=>{
+  const {corpus,selectedDay}=await correctableV12Model();
+  const before=(await readStorageCommunityOwnerPage(typed()))
+   .find(owner=>owner.ownerDigest===corpus.owner.ownerDigest)!;
+  const published=await b.STORAGE_ANALYTICS_DB.prepare(`SELECT payload_sha256,revision
+   FROM analytics_community_model_publications WHERE source_id=? AND day=?`)
+   .bind(namespace,selectedDay).first();
+  let ownerReads=0;
+  const source=observed(typed(),async(sql,moment)=>{
+   if(moment==='after'&&sql.includes('p.id AS participantId')&&++ownerReads===1)
+    await corpus.mutateCorrection();
+  });
+  expect(await publishStorageCommunityModelDay({...bindings(),source},{day:selectedDay}))
+   .toMatchObject({state:'deferred',reason:'cache_pending'});
+  expect(ownerReads).toBe(1);
+  const after=(await readStorageCommunityOwnerPage(typed()))
+   .find(owner=>owner.ownerDigest===corpus.owner.ownerDigest)!;
+  expect(after.inputRevision).toBe(before.inputRevision);
+  expect(after.ownerRevision).toBeGreaterThan(before.ownerRevision);
+  expect(await b.STORAGE_ANALYTICS_DB.prepare(`SELECT payload_sha256,revision
+   FROM analytics_community_model_publications WHERE source_id=? AND day=?`)
+   .bind(namespace,selectedDay).first()).toEqual(published);
+ });
+ it('keeps a prior scalar preview visible but marks same-revision v1.2 correction inputs stale',async()=>{
+  const {corpus}=await correctableV12Model();
+  const owners=await readStorageCommunityOwnerPage(typed());
+  for(let index=0;index<owners.length;index++){
+   expect(await compute('fits',today(),index)).toMatchObject({state:'complete'});
+  }
+  expect(await publishStorageCommunityGraphPreview(bindings())).toMatchObject({state:'published'});
+  expect(await b.STORAGE_ANALYTICS_DB.prepare(`SELECT inputs_current
+   FROM analytics_community_graph_previews WHERE source_id=?`).bind(namespace)
+   .first<number>('inputs_current')).toBe(1);
+  const previous=(await readPublishedStorageCommunityGraph(bindings()))!;
+  const corrected=await corpus.mutateCorrection();
+  const primary=(await readStorageCommunityOwnerPage(typed()))
+   .find(owner=>owner.ownerDigest===corrected.ownerDigest)!;
+  expect(primary.inputRevision).toBe(corpus.owner.inputRevision);
+  expect(['published','unchanged']).toContain((await publishStorageCommunityGraphPreview(bindings())).state);
+  expect(await b.STORAGE_ANALYTICS_DB.prepare(`SELECT inputs_current
+   FROM analytics_community_graph_previews WHERE source_id=?`).bind(namespace)
+   .first<number>('inputs_current')).toBe(0);
+  expect((await readPublishedStorageCommunityGraph(bindings()))?.payload_json).toBe(previous.payload_json);
+ });
+ it('defers a model publication when v1.2 correction races its final owner fence',async()=>{
+  const {corpus,selectedDay}=await correctableV12Model();
+  const published=await b.STORAGE_ANALYTICS_DB.prepare(`SELECT payload_sha256,revision
+   FROM analytics_community_model_publications WHERE source_id=? AND day=?`)
+   .bind(namespace,selectedDay).first<{payload_sha256:string;revision:number}>();
+  let ownerReads=0;
+  const source=observed(typed(),async(sql,moment)=>{
+   if(moment==='before'&&sql.includes('p.id AS participantId')&&++ownerReads===2)
+    await corpus.mutateCorrection();
+  });
+  expect(await publishStorageCommunityModelDay({...bindings(),source},{day:selectedDay}))
+   .toMatchObject({state:'deferred',reason:'source_changed'});
+  expect(ownerReads).toBe(2);
+  expect(await b.STORAGE_ANALYTICS_DB.prepare(`SELECT payload_sha256,revision
+   FROM analytics_community_model_publications WHERE source_id=? AND day=?`)
+   .bind(namespace,selectedDay).first()).toEqual(published);
+ });
+ it('checks owner identity after the final authority sequence is captured',async()=>{
+  const {corpus,selectedDay}=await correctableV12Model();
+  const before=(await readStorageCommunityOwnerPage(typed()))
+   .find(owner=>owner.ownerDigest===corpus.owner.ownerDigest)!;
+  const published=await b.STORAGE_ANALYTICS_DB.prepare(`SELECT payload_sha256,revision,authority_json
+   FROM analytics_community_model_publications WHERE source_id=? AND day=?`)
+   .bind(namespace,selectedDay).first();
+  let authorityReads=0;
+  const source=observed(typed(),async(sql,moment)=>{
+   if(moment==='before'&&sql.includes('COALESCE((SELECT MAX(sequence)')&&++authorityReads===2)
+    await corpus.mutateCorrection();
+  });
+  expect(await publishStorageCommunityModelDay({...bindings(),source},{day:selectedDay}))
+   .toMatchObject({state:'deferred',reason:'source_changed'});
+  expect(authorityReads).toBe(2);
+  const after=(await readStorageCommunityOwnerPage(typed()))
+   .find(owner=>owner.ownerDigest===corpus.owner.ownerDigest)!;
+  expect(after.inputRevision).toBe(before.inputRevision);
+  expect(after.ownerRevision).toBeGreaterThan(before.ownerRevision);
+  expect(await b.STORAGE_ANALYTICS_DB.prepare(`SELECT payload_sha256,revision,authority_json
+   FROM analytics_community_model_publications WHERE source_id=? AND day=?`)
+   .bind(namespace,selectedDay).first()).toEqual(published);
  });
  it('publishes closed history for two active owners while both append today before every attempt',async()=>{
   const fixtures=[await fixture('participant:continuous-a'),await fixture('participant:continuous-b')];
