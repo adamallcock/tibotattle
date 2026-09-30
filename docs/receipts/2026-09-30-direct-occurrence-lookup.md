@@ -111,3 +111,38 @@ Local logs contain synthetic fixtures only. The complete dependency run is
 fixture initially compared different session selections; its options were
 aligned and all assertions retained. No source or gate was weakened to repair
 that fixture.
+
+## Frozen source and review closure
+
+Runtime/migration candidate: `45820c6cdac5bf9b5bfced56091dd26e1c7f5e7b`.
+Both normal default and staging dry builds pass on that clean source, including
+workspace-copy guards, endpoint checks and manifest-verified asset staging.
+Staging configuration reports `configured_unverified`; no live staging test,
+resource creation, remote migration, deployment or publication is claimed.
+An initial dry build correctly refused the dirty tree; the same normal command
+passed after the scoped local commit, with no build guard bypass.
+
+The private index-only review package pins the one-statement migration and its
+atomic two-result custom-ledger envelope. Local schema projection preserves all
+existing objects and adds only `typed_telemetry_owner_occurrence`:
+
+- Before primary canonical schema: `49f5b5678fd835a13e4653a0922ad67ad0801ac2883776558ce068e7b2daed43`.
+- After index-only primary canonical schema: `51d131e2215bcd99db0a79698c4195d06be40a3c091199674f45ed74f4e3c039`.
+- The catalog is excluded from this review; analytics and ledger schemas are
+  untouched. This is non-executable local review evidence, not fresh live
+  schema verification or execution-target qualification.
+
+The next gate is a closed index target in the guarded forward operator and its
+canonical/restored preflight variants, followed by fresh live fences, backup/
+capacity checks, final owning validation and a separately authorized trial.
+Measure completed public output and failures after that trial; the admin-flow
+redesign remains a separate outstanding task in the running checklist.
+
+| Retained local log | SHA-256 |
+|---|---|
+| tibotattle-direct-occurrence-complete-20260930.log | `ed762e9d77dd15179e953500ef948f77cc62f4a3a79850e65223131d86e67c21` |
+| tibotattle-direct-occurrence-consumers-20260930.log | `146707ec66d33375ab94719ddfd6c33525a563f457c94b507ec02c38dc4240b6` |
+| tibotattle-direct-occurrence-schema-20260930.log | `aa020f5e66d9320491d1e137e5aece5c8decebb801c04ab2843af5528d6a911d` |
+| tibotattle-direct-occurrence-default-dry-frozen-20260930.log | `f13584010163fbfeef46a26ecbc4af3dadf259e85ef005b0855c2df2fcfcee24` |
+| tibotattle-direct-occurrence-staging-dry-20260930.log | `3b2b17cf9a8675953f54df416a27062dd280226ef8a6fe25757ac6f866ac8c80` |
+| tibotattle-direct-occurrence-review-20260930.log | `7b7b95c69a78f4f790690922b164e1a7473ccf477cf1379802b617489b6b7b4a` |
