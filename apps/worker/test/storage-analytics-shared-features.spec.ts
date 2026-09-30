@@ -53,11 +53,12 @@ it('keeps shared-feature work and its statement cap when optional timing observe
   expect(['deferred','complete']).toContain(continued.state);
   expect(second.meter.queriesUsed).toBeLessThanOrEqual(950);
 },30_000);
-async function finish(owner:Awaited<ReturnType<typeof setup>>['owner'],day:string) {
+async function finish(owner:Awaited<ReturnType<typeof setup>>['owner'],day:string,clock:()=>number=Date.now) {
   let deferred=0;
   for (let attempt=0;attempt<24;attempt++) {
     const {value,meter}=input(owner,day);
-    const result=await advanceSharedAnalyticsFeatureDay(value);
+    const result=await advanceSharedAnalyticsFeatureDay({...value,
+      budget:{...value.budget,now:clock,deadlineMs:clock()+60_000}});
     expect(meter.queriesUsed).toBeLessThanOrEqual(950);
     if(result.state==='complete') return {result,deferred};
     expect(result.state,JSON.stringify(result)).toBe('deferred');
@@ -370,10 +371,10 @@ it('does not publish a feature if its source day changes at the save boundary',a
 
 it('saves resumable pages within a slow dependency budget without repeating its initial proof',async()=>{
   const corpus=await setup(true),day=corpus.graphDates[0]!;
-  let firstReads=0;
+  let firstReads=0,now=Date.now();
   for(let attempt=0;attempt<2;attempt++) {
     const {value,meter}=input(corpus.owner,day);
-    let now=Date.now(),dependencies=0,pages=0;
+    let dependencies=0,pages=0;
     const budget={...value.budget,now:()=>now,deadlineMs:now+55_000,
       statementCount:()=>meter.queriesUsed,observePhase:(phase:string)=>{
         if(phase==='feature_dependency') {dependencies++;now+=22_000;}
@@ -391,7 +392,7 @@ it('saves resumable pages within a slow dependency budget without repeating its 
     expect(head!.payload_bytes).toBeGreaterThan(firstReads);
     firstReads=head!.payload_bytes;
   }
-  const completed=await finish(corpus.owner,day);
+  const completed=await finish(corpus.owner,day,()=>now);
   const reference=await completeSourceDay(corpus.owner,day);
   expect(finalizeV11DailyProjectionValues(completed.result.value.daily)).toEqual(reference.daily);
 },180_000);
