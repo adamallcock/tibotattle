@@ -3,7 +3,7 @@ import { buildCommunityModelCompositionDay, ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DA
 import { advanceCommunityAnalysisRun } from "./community-analysis-runner";
 import type { CommunityAnalysisWorkIdentity } from "./community-analysis-work";
 import {
-  COMMUNITY_ATTRIBUTION_METHOD_VERSION, COMMUNITY_PARTICIPANT_PAGE_CTE,
+  COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION, COMMUNITY_PARTICIPANT_PAGE_CTE,
   COMPOSITION_CACHE_KEY_SUFFIX, validCompleteCachedComposition,
   type CommunityModelComposition,
 } from "./community-allowance";
@@ -106,7 +106,7 @@ export async function readCommunityModelHistoryProgress(db: D1Database,
   ) SELECT COUNT(d.day) AS resolved_days,MAX(CASE WHEN d.day IS NULL THEN dates.day END) AS active_day
     FROM dates LEFT JOIN community_model_composition_days d ON d.day=dates.day
       AND d.attribution_method_version=?3 AND (d.history_method_version IS NULL OR d.history_method_version=?4)`)
-    .bind(today, requiredDays, COMMUNITY_ATTRIBUTION_METHOD_VERSION, COMMUNITY_MODEL_HISTORY_METHOD)
+    .bind(today, requiredDays, COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION, COMMUNITY_MODEL_HISTORY_METHOD)
     .first<{ resolved_days: number; active_day: string | null }>();
   if (!days || !Number.isSafeInteger(days.resolved_days) || days.resolved_days < 0 || days.resolved_days > requiredDays
     || (days.active_day !== null && !/^\d{4}-\d{2}-\d{2}$/u.test(days.active_day))) return null;
@@ -247,7 +247,7 @@ async function advanceModelHistoryDay(db: D1Database, nowMs: number, options: {
     ) SELECT dates.day FROM dates LEFT JOIN community_model_composition_days d ON d.day=dates.day
       AND d.attribution_method_version=?3 AND (d.history_method_version IS NULL OR d.history_method_version=?4)
     WHERE d.day IS NULL ORDER BY dates.day DESC LIMIT 1`)
-    .bind(today, ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS - 1, COMMUNITY_ATTRIBUTION_METHOD_VERSION,
+    .bind(today, ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS - 1, COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION,
       COMMUNITY_MODEL_HISTORY_METHOD).first<{ day: string }>();
   if (!missing) return { ...progress, status: "complete" };
   if (publicationOnlyDay !== null && missing.day !== publicationOnlyDay) return progress;
@@ -306,7 +306,7 @@ async function advanceModelHistoryDay(db: D1Database, nowMs: number, options: {
           history_method_version=excluded.history_method_version
         WHERE community_model_composition_days.history_method_version IS NOT NULL
           OR community_model_composition_days.attribution_method_version IS NOT excluded.attribution_method_version`)
-        .bind(window.day, json, COMMUNITY_ATTRIBUTION_METHOD_VERSION, source!.mutation_epoch,
+        .bind(window.day, json, COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION, source!.mutation_epoch,
           COMMUNITY_MODEL_HISTORY_METHOD, options.maintenanceLease).run();
     // Keep the healthy preview available until its normal atomic refresh. A
     // newly backfilled day is not a reason to create a temporary graph outage.

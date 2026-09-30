@@ -1327,10 +1327,10 @@ test("the community allowance surface leads the product hero with honest labelin
     html,
     /data-range-days="30" class="active" aria-pressed="true"/u,
   );
-  assert.match(html, /Pro 20x-equivalent allowance/u);
+  assert.match(html, /Pro 10x-equivalent allowance/u);
   assert.match(html, /class="allowance-intro-copy" role="paragraph"[\s\S]*?id="community-allowance-source-summary"/u);
   assert.match(html, /class="allowance-picker-row"[\s\S]*?data-allowance-view-controls[\s\S]*?id="community-allowance-range-controls"/u);
-  assert.match(html, /API-price value of a Pro 20x-equivalent week: overall, by plan or by model/u);
+  assert.match(html, /Estimated weekly API-price value: Pro 10× equivalent overall and by model; each plan's own week in By plan/u);
   for (const view of ["aggregate", "plans", "models"]) {
     assert.equal(html.match(new RegExp(`data-allowance-view="${view}"`, "gu"))?.length, 2);
   }
@@ -2129,6 +2129,22 @@ test("the daily normalizer treats the allowance block as additive and per-day", 
     centralUsd: 1879,
     band80Usd: null,
   });
+
+  const current = allowanceBlock({
+    basis: "seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25",
+    normalization: "pro_x1_prolite_x2_promax_x0_4_plus_x10",
+  });
+  const currentOnly = normalizeCommunityDailySeries(publishedDailySeries({
+    days: [allowanceDay("2026-08-06", current)],
+  }));
+  assert.equal(currentOnly.allowanceIsCurrent, true);
+  const mixed = normalizeCommunityDailySeries(publishedDailySeries({
+    days: [allowanceDay("2026-08-06", allowanceBlock()), allowanceDay("2026-08-07", current)],
+  }));
+  assert.equal(mixed.state, "published");
+  assert.equal(mixed.allowanceIsCurrent, false);
+  assert.deepEqual(mixed.days.map(day => day.allowance), [null, null],
+    "a cutover response cannot connect unlike allowance bases");
 });
 
 test("the allowance chart model maps estimates honestly and slices ranges", () => {
@@ -2249,7 +2265,8 @@ test("the allowance section renders the estimate with its visible caveat", () =>
   const methodDetails = container.descendants().find(element => element.className === "snapshot-disclosure-details");
   assert.ok(methodDetails);
   assert.match(methodDetails.text, /Pro ×1, Pro 5x ×4, Plus ×20/u);
-  assert.match(methodDetails.text, /40-point observed-span floor/u);
+  assert.match(methodDetails.text, /recorded with that published basis/u);
+  assert.doesNotMatch(methodDetails.text, /40-point observed-span floor/u);
   assert.equal(container.children.at(-1).className, "community-daily-chart community-allowance-chart");
   // Chart present with band, line, and fit dots; sparse two-point series
   // carries the still-filling note.

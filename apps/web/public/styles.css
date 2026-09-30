@@ -3941,15 +3941,14 @@ footer p { margin: 0; }
 .community-site .community-chart-dialog-toolbar { flex-wrap: wrap; }
 .allowance-summary-cards {
   display: grid;
-  /* Three abreast wherever there is room for them. The old 190px floor wrapped
-     to 2 + 1 inside the embedded card column, which cost a whole row of height
-     and made the third plan look like an afterthought. */
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  /* Keep the four current personal plans together; narrow screens use two
+     columns so Pro Max does not become a solitary trailing card. */
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
   margin-top: 8px;
 }
 .community-site .allowance-summary-cards {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 @media (max-width: 600px) {
   .community-site .allowance-summary-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }

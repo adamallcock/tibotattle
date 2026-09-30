@@ -1,5 +1,5 @@
 import { captureSelectedStorageGraphScope,captureStorageGraphScope,computeStorageGraphResult,
- STORAGE_GRAPH_METHOD,storageGraphV11CheckpointMethod,
+ STORAGE_GRAPH_METHOD,STORAGE_GRAPH_PROJECTION_METHOD,storageGraphV11CheckpointMethod,
  type StorageGraphScope } from './storage-community-graph';
 import { STORAGE_V11_PREPARED_FOLD } from './storage-v11-history';
 /** The same rule the write site uses, so the durable envelope names the key
@@ -160,7 +160,7 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
   const from=new Date(Date.parse(today)-(ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS-1)*86400000).toISOString().slice(0,10);
   const published=(await options.target.prepare(`SELECT day,authority_json,payload_json,payload_sha256 FROM analytics_community_model_publications
    WHERE source_id=? AND day>=? AND day<? AND method=? ORDER BY day LIMIT ?`)
-   .bind(options.sourceId,from,today,STORAGE_GRAPH_METHOD,ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS).all<StorageModelPublicationValue>()).results;
+   .bind(options.sourceId,from,today,STORAGE_GRAPH_PROJECTION_METHOD,ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS).all<StorageModelPublicationValue>()).results;
   const completed=new Set<string>();
   for(const row of published)if(await validStorageModelPublication(row,authority,terminalEpoch))completed.add(row.day);
   day=null;

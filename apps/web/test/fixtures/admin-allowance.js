@@ -15,34 +15,36 @@ export function createAdminAllowancePreviewPayload() {
   });
   const days = Array.from({ length: 70 }, (_, index) => ({
     day: new Date(startMs + index * 86_400_000).toISOString().slice(0, 10),
-    combined: summary(2_100 + index, 6, 3),
+    combined: summary(2_100 + index, 8, 4),
     byPlanType: {
       pro: summary(2_050 + index),
-      // Divide before rounding: $1,917.90 / 4 = $479.475, displayed as $479.
+      // Divide before rounding: $1,917.90 / 2 = $958.95, displayed as $959.
       prolite: summary(1_917.9),
+      promax: summary(2_500),
       plus: summary(1_900),
     },
   }));
   return {
-    schemaVersion: "admin-community-allowance-preview-v0.3",
+    schemaVersion: "admin-community-allowance-preview-v0.4",
     generatedAt: "2026-09-06T10:30:00.000Z",
     from: days[0].day,
     to: days.at(-1).day,
-    basis: "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview",
+    basis: "seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25_preview",
     referencePlanType: "pro",
     trailingDays: 30,
     qualification: "shared_reset_fit_gates_25pp_span_floor",
     spanFloorPp: 25,
     plans: [
-      { planType: "pro", label: "Pro 20x", multiplier: 1 },
-      { planType: "prolite", label: "Pro 5x", multiplier: 4 },
-      { planType: "plus", label: "Plus", multiplier: 20 },
+      { planType: "pro", label: "Pro 10x", multiplier: 1 },
+      { planType: "prolite", label: "Pro 5x", multiplier: 2 },
+      { planType: "promax", label: "Pro Max 25x", multiplier: 0.4 },
+      { planType: "plus", label: "Plus", multiplier: 10 },
     ],
     days,
     coverage: null,
     models: {
       modelConfig: ADMIN_MODEL_CONFIG,
-      basis: "seven_day_codex_pro20x_equivalent_per_model_composition",
+      basis: "seven_day_codex_pro10x_equivalent_per_model_composition",
       gate: "shared_composition_kernel_identification",
       days: days.map(({ day }, index) => ({
         day,

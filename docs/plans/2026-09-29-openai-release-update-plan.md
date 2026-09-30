@@ -87,6 +87,39 @@ suites passed all 34 tests. Worker script checks passed. Worker deploy dry-run
 stopped at the absent generated public release manifest before any deployment;
 public-asset preparation is part of the subsequent Worker release work.
 
+## Main Worker follow-up on 2026-09-30
+
+The client work merged through [PR #257](https://github.com/adamallcock/tibotattle/pull/257)
+as `e5250c860da314900b85f7afe64ea32c43c6ddf9`. The main Worker component starts
+from that exact merge on `codex/sol61-main-worker`, retaining the original
+combined worktree separately. No Worker branch publication or deployment is
+included in the client merge.
+
+This component pairs the four-plan publishers with their public/admin readers:
+Pro 10x reference factors are Pro 1, Pro 5x 2, Pro Max 25x 0.4 and Plus 10.
+Raw `pro` identity, measured capacities, owner fits and acquisition checkpoints
+remain continuous. The normalized model-day, preview, daily-refresh and graph
+publication identities change. Public v1.2 and admin v0.4 carry the new basis;
+older public payloads and local caches retain their declared 20x coefficients.
+Empty Pro Max cohorts remain unavailable, and unsupported model prices remain
+unpriced.
+
+Focused validation passed 240 Worker tests in 11 suites, TypeScript, 1,073 UI
+tests and 71 release-site tests. These include reprojection without changing
+stored raw fits, exact publication/read identities, private-field exclusion,
+and legacy-cache units. Complete Worker validation and rendered inspection are
+recorded below when finished. The published 0.1.26 installer manifest was read
+back and matched the existing recorded SHA-256; local asset generation reuses
+that release evidence and does not publish a new client release.
+
+Release preparation must keep the schema, runtime and publication steps
+separate. Migration 0013 remains source-only: the existing forward operator is
+pinned through 0009 and must not be silently widened. A reviewed target-bound
+migration plan, populated rehearsal, application and reconciliation are still
+required before new performance writes are enabled. The main API, analytics
+publishers and generated public/admin assets must use the same normalization
+contract. Dots/purchased-credit identification still lacks upstream evidence.
+
 ## Implementation progress on 2026-09-29
 
 | Component | Current local result | Remaining boundary |

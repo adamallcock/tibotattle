@@ -279,23 +279,29 @@ export function communityDailyWindow(nowMs = Date.now()) {
 
 // The allowance block is additive on community-daily-aggregate-v1.0. Only the
 // exact merged methodology is interpreted: supported personal-plan fits are
-// normalized into one Pro 20x-equivalent summary before the median and range
+// normalized into one Pro 10x-equivalent summary before the median and range
 // are calculated. Old Pro-only blocks and any future methodology are per-day
 // absent, never silently relabelled under the merged copy.
 export const COMMUNITY_ALLOWANCE_BASIS =
-  "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d";
+  "seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25";
 export const COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE = "pro";
 export const COMMUNITY_ALLOWANCE_NORMALIZATION =
-  "pro_x1_prolite_x4_plus_x20";
+  "pro_x1_prolite_x2_promax_x0_4_plus_x10";
+const LEGACY_COMMUNITY_ALLOWANCE_BASIS =
+  "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d";
+const LEGACY_COMMUNITY_ALLOWANCE_NORMALIZATION = "pro_x1_prolite_x4_plus_x20";
 
 // Inverse of the validated reference-plan display basis, not a pricing model
 // or a new allowance fit. Convert the unrounded estimate before formatting.
-const PLAN_REFERENCE_MULTIPLIERS = Object.freeze({ pro: 1, prolite: 4, plus: 20 });
-export function planWeeklyApiEquivalentUsd(referenceUsd, planType) {
+const PLAN_REFERENCE_MULTIPLIERS = Object.freeze({ pro: 1, prolite: 2, promax: 0.4, plus: 10 });
+const LEGACY_PLAN_REFERENCE_MULTIPLIERS = Object.freeze({ pro: 1, prolite: 4, plus: 20 });
+export function planWeeklyApiEquivalentUsd(referenceUsd, planType, normalization = COMMUNITY_ALLOWANCE_NORMALIZATION) {
+  const multipliers = normalization === COMMUNITY_ALLOWANCE_NORMALIZATION ? PLAN_REFERENCE_MULTIPLIERS
+    : normalization === LEGACY_COMMUNITY_ALLOWANCE_NORMALIZATION ? LEGACY_PLAN_REFERENCE_MULTIPLIERS : null;
   if (typeof referenceUsd !== "number" || !Number.isFinite(referenceUsd) || referenceUsd < 0
       || typeof planType !== "string"
-      || !Object.prototype.hasOwnProperty.call(PLAN_REFERENCE_MULTIPLIERS, planType)) return null;
-  return referenceUsd / PLAN_REFERENCE_MULTIPLIERS[planType];
+      || (multipliers === null || !Object.prototype.hasOwnProperty.call(multipliers, planType))) return null;
+  return referenceUsd / multipliers[planType];
 }
 
 // The public comparison is a selected roster, not the complete historical
@@ -303,6 +309,7 @@ export function planWeeklyApiEquivalentUsd(referenceUsd, planType) {
 // update cannot make previously published days disappear.
 export const PUBLIC_ALLOWANCE_MODEL_CONFIG = Object.freeze([
   ["gpt-6-astra", "GPT-6 Astra"],
+  ["gpt-6.1-sol", "GPT-6.1 Sol"],
   ["gpt-6-sol", "GPT-6 Sol"],
   ["gpt-6-luna", "GPT-6 Luna"],
   ["gpt-5.6-terra", "GPT-5.6 Terra"],
@@ -314,7 +321,8 @@ const PUBLIC_ALLOWANCE_MODEL_IDS = new Set([
     && model.allowanceTrack === "primary").map(model => model.id),
   ...PUBLIC_ALLOWANCE_MODEL_CONFIG.map(model => model.modelId),
 ]);
-const PUBLIC_ALLOWANCE_PLAN_IDS = Object.freeze(["pro", "prolite", "plus"]);
+const LEGACY_PUBLIC_ALLOWANCE_PLAN_IDS = Object.freeze(["pro", "prolite", "plus"]);
+const PUBLIC_ALLOWANCE_PLAN_IDS = Object.freeze(["pro", "prolite", "promax", "plus"]);
 const exactObject = (value, keys) => value !== null && typeof value === "object"
   && !Array.isArray(value) && Object.keys(value).length === keys.length
   && keys.every(key => Object.prototype.hasOwnProperty.call(value, key));
@@ -350,10 +358,13 @@ function publicAllowanceSummary(value) {
 export const COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS = Object.freeze([
   "community-allowance-breakdowns-v1.0",
   "community-allowance-breakdowns-v1.1",
+  "community-allowance-breakdowns-v1.2",
 ]);
 const COMMUNITY_ALLOWANCE_BREAKDOWN_COMBINED_VERSION =
   "community-allowance-breakdowns-v1.1";
 const COMMUNITY_ALLOWANCE_MODEL_BASIS =
+  "seven_day_codex_pro10x_equivalent_per_model_composition";
+const LEGACY_COMMUNITY_ALLOWANCE_MODEL_BASIS =
   "seven_day_codex_pro20x_equivalent_per_model_composition";
 const COMMUNITY_ALLOWANCE_MODEL_GATE =
   "shared_composition_kernel_identification";
@@ -364,9 +375,7 @@ export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs =
   if (!exactObject(value, ["schemaVersion", "basis", "referencePlanType", "normalization",
     "modelBasis", "modelGate", "generatedAt", "days"])
       || !COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS.includes(value.schemaVersion)
-      || value.basis !== COMMUNITY_ALLOWANCE_BASIS || value.referencePlanType !== "pro"
-      || value.normalization !== COMMUNITY_ALLOWANCE_NORMALIZATION
-      || value.modelBasis !== COMMUNITY_ALLOWANCE_MODEL_BASIS
+      || value.referencePlanType !== "pro"
       || value.modelGate !== COMMUNITY_ALLOWANCE_MODEL_GATE
       || typeof value.generatedAt !== "string" || !Number.isFinite(nowMs)
       || !Array.isArray(value.days) || value.days.length > 70) return null;
@@ -381,15 +390,20 @@ export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs =
     - 69 * MILLISECONDS_PER_DAY).toISOString().slice(0, 10);
   const allowedDays = new Set(publishedDays);
   const days = [];
-  const hasCombined = value.schemaVersion === COMMUNITY_ALLOWANCE_BREAKDOWN_COMBINED_VERSION;
+  const isCurrent = value.schemaVersion === "community-allowance-breakdowns-v1.2";
+  if (value.modelBasis !== (isCurrent ? COMMUNITY_ALLOWANCE_MODEL_BASIS : LEGACY_COMMUNITY_ALLOWANCE_MODEL_BASIS)
+      || value.basis !== (isCurrent ? COMMUNITY_ALLOWANCE_BASIS : LEGACY_COMMUNITY_ALLOWANCE_BASIS)
+      || value.normalization !== (isCurrent ? COMMUNITY_ALLOWANCE_NORMALIZATION : LEGACY_COMMUNITY_ALLOWANCE_NORMALIZATION)) return null;
+  const planIds = isCurrent ? PUBLIC_ALLOWANCE_PLAN_IDS : LEGACY_PUBLIC_ALLOWANCE_PLAN_IDS;
+  const hasCombined = value.schemaVersion === COMMUNITY_ALLOWANCE_BREAKDOWN_COMBINED_VERSION || isCurrent;
   for (const row of value.days) {
     if (!exactObject(row, hasCombined ? ["day", "combined", "byPlanType", "models"] : ["day", "byPlanType", "models"]) || !publicDay(row.day)
         || !allowedDays.has(row.day) || row.day < earliestDay || row.day >= today || row.day >= generatedDay
         || (days.length > 0 && row.day <= days.at(-1).day)
-        || !exactObject(row.byPlanType, PUBLIC_ALLOWANCE_PLAN_IDS)
+        || !exactObject(row.byPlanType, planIds)
         || !Array.isArray(row.models) || row.models.length > PUBLIC_ALLOWANCE_MODEL_IDS.size) return null;
     const byPlanType = {};
-    for (const id of PUBLIC_ALLOWANCE_PLAN_IDS) {
+    for (const id of planIds) {
       const summary = publicAllowanceSummary(row.byPlanType[id]);
       if (summary === null) return null;
       byPlanType[id] = summary;
@@ -407,16 +421,19 @@ export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs =
     if (hasCombined && combined === null) return null;
     days.push({ day: row.day, ...(hasCombined ? { combined } : {}), byPlanType, models });
   }
-  return { generatedAt: value.generatedAt, hasCombined, modelConfig: PUBLIC_ALLOWANCE_MODEL_CONFIG, days };
+  return { generatedAt: value.generatedAt, hasCombined, isCurrent, normalization: value.normalization, planIds, modelConfig: PUBLIC_ALLOWANCE_MODEL_CONFIG, days };
 }
 
 function normalizedDailyAllowance(candidate) {
   if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
     return null;
   }
-  if (candidate.basis !== COMMUNITY_ALLOWANCE_BASIS
-      || candidate.referencePlanType !== COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE
-      || candidate.normalization !== COMMUNITY_ALLOWANCE_NORMALIZATION) {
+  const isCurrent = candidate.basis === COMMUNITY_ALLOWANCE_BASIS
+    && candidate.normalization === COMMUNITY_ALLOWANCE_NORMALIZATION;
+  const isLegacy = candidate.basis === LEGACY_COMMUNITY_ALLOWANCE_BASIS
+    && candidate.normalization === LEGACY_COMMUNITY_ALLOWANCE_NORMALIZATION;
+  if ((!isCurrent && !isLegacy)
+      || candidate.referencePlanType !== COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE) {
     return null;
   }
   const fitCount = finite(candidate.fitCount, null);
@@ -717,6 +734,7 @@ export function normalizeCommunityDailySeries(payload, { nowMs = Date.now() } = 
     return { state: "unsupported_schema", days: [] };
   }
   const days = [];
+  const allowanceBases = new Set();
   for (const candidate of payload.days) {
     const normalized = normalizedDailyDay(candidate);
     if (normalized === null
@@ -725,13 +743,22 @@ export function normalizeCommunityDailySeries(payload, { nowMs = Date.now() } = 
         || (days.length > 0 && normalized.day <= days[days.length - 1].day)) {
       return { state: "unsupported_schema", days: [] };
     }
+    if (normalized.allowance !== null) allowanceBases.add(candidate.payload.allowance.basis);
     days.push(normalized);
   }
+  // A response spanning the basis cutover cannot connect old and new
+  // allowance estimates into one line. Activity remains independently valid.
+  if (allowanceBases.size > 1) {
+    for (const day of days) day.allowance = null;
+  }
+  const allowanceIsCurrent = allowanceBases.size === 1
+    && allowanceBases.has(COMMUNITY_ALLOWANCE_BASIS);
   return {
     state: days.length === 0 ? "none_published" : "published",
     from,
     to,
     allowanceState: payload.allowanceState,
+    allowanceIsCurrent,
     breakdowns: payload.allowanceState === "ready"
       ? normalizePublicAllowanceBreakdowns(payload.allowanceBreakdowns, days.map(day => day.day), nowMs) : null,
     // Community-wide, not per-day: the lane measures gaps between consecutive
@@ -756,12 +783,12 @@ export const COMMUNITY_DAILY_CACHE_SCHEMA_IDENTITY = [
   ...COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS,
 ].join("|");
 
-function cachedAllowanceBlock(allowance) {
+function cachedAllowanceBlock(allowance, isCurrent) {
   if (allowance === null) return null;
   return {
-    basis: COMMUNITY_ALLOWANCE_BASIS,
+    basis: isCurrent ? COMMUNITY_ALLOWANCE_BASIS : LEGACY_COMMUNITY_ALLOWANCE_BASIS,
     referencePlanType: COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE,
-    normalization: COMMUNITY_ALLOWANCE_NORMALIZATION,
+    normalization: isCurrent ? COMMUNITY_ALLOWANCE_NORMALIZATION : LEGACY_COMMUNITY_ALLOWANCE_NORMALIZATION,
     fitCount: allowance.fitCount,
     participantCount: allowance.participantCount,
     centralUsd: allowance.centralUsd,
@@ -773,13 +800,15 @@ function cachedAllowanceBlock(allowance) {
 
 function cachedBreakdowns(breakdowns) {
   return {
-    schemaVersion: breakdowns.hasCombined
-      ? COMMUNITY_ALLOWANCE_BREAKDOWN_COMBINED_VERSION
-      : COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS[0],
-    basis: COMMUNITY_ALLOWANCE_BASIS,
+    schemaVersion: breakdowns.isCurrent
+      ? COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS[2]
+      : breakdowns.hasCombined
+        ? COMMUNITY_ALLOWANCE_BREAKDOWN_COMBINED_VERSION
+        : COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS[0],
+    basis: breakdowns.isCurrent ? COMMUNITY_ALLOWANCE_BASIS : LEGACY_COMMUNITY_ALLOWANCE_BASIS,
     referencePlanType: COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE,
-    normalization: COMMUNITY_ALLOWANCE_NORMALIZATION,
-    modelBasis: COMMUNITY_ALLOWANCE_MODEL_BASIS,
+    normalization: breakdowns.isCurrent ? COMMUNITY_ALLOWANCE_NORMALIZATION : LEGACY_COMMUNITY_ALLOWANCE_NORMALIZATION,
+    modelBasis: breakdowns.isCurrent ? COMMUNITY_ALLOWANCE_MODEL_BASIS : LEGACY_COMMUNITY_ALLOWANCE_MODEL_BASIS,
     modelGate: COMMUNITY_ALLOWANCE_MODEL_GATE,
     generatedAt: breakdowns.generatedAt,
     // `modelConfig` is this build's reviewed catalog, not published data, so
@@ -793,7 +822,7 @@ function cachedBreakdowns(breakdowns) {
   };
 }
 
-function cachedDay(day) {
+function cachedDay(day, allowanceIsCurrent) {
   return {
     day: day.day,
     revision: day.revision,
@@ -806,7 +835,7 @@ function cachedDay(day) {
       day: day.day,
       revision: day.revision,
       totals: day.totals,
-      allowance: cachedAllowanceBlock(day.allowance),
+      allowance: cachedAllowanceBlock(day.allowance, allowanceIsCurrent),
       ...(day.apiEquivalentSpend === null
         ? {}
         : { apiEquivalentSpend: day.apiEquivalentSpend }),
@@ -853,7 +882,7 @@ export function projectCommunityDailyPayloadForCache(payload, { nowMs = Date.now
     ...(series.breakdowns === null
       ? {}
       : { allowanceBreakdowns: cachedBreakdowns(series.breakdowns) }),
-    days: series.days.map(cachedDay),
+    days: series.days.map(day => cachedDay(day, series.allowanceIsCurrent)),
   };
 }
 

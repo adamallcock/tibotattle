@@ -2731,14 +2731,15 @@ describe("synthetic usage monitor service", () => {
         combined: { fitCount: number; centralUsd: number | null };
       }[];
     }>();
-    expect(body.schemaVersion).toBe("admin-community-allowance-preview-v0.3");
+    expect(body.schemaVersion).toBe("admin-community-allowance-preview-v0.4");
     expect(body.basis).toBe(
-      "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview",
+      "seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25_preview",
     );
     expect(body.plans).toMatchObject([
       { planType: "pro", multiplier: 1 },
-      { planType: "prolite", multiplier: 4 },
-      { planType: "plus", multiplier: 20 },
+      { planType: "prolite", multiplier: 2 },
+      { planType: "promax", multiplier: 0.4 },
+      { planType: "plus", multiplier: 10 },
     ]);
     expect(body.days).toHaveLength(70);
     expect(body.days.every((day) => (

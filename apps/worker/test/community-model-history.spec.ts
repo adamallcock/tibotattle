@@ -3,7 +3,7 @@ import { applyD1Migrations, reset, type D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { warmCommunityModelHistory, COMMUNITY_MODEL_HISTORY_METHOD, MODEL_HISTORY_CENSUS_SQL } from "../src/community-model-history";
 import { createD1InvocationBudget } from "../src/d1-invocation-budget";
-import { COMMUNITY_ATTRIBUTION_METHOD_VERSION, validCompleteCachedComposition } from "../src/community-allowance";
+import { COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION, validCompleteCachedComposition } from "../src/community-allowance";
 import { MODEL_HISTORY_METHOD_VERSION, type V1ModelComposition } from "../src/quota-analysis-v1";
 import { createV11DeviceFixture, makeV11Day, stageV11Day } from "./helpers/telemetry-v11";
 import { MODEL_HISTORY_TEST_DAY, seedModelHistoryFixture, insertModelHistoryRecords, modelHistorySourceInput } from "./helpers/model-history";
@@ -111,7 +111,7 @@ async function snapshot(day = DAY, history: string | null = COMMUNITY_MODEL_HIST
   await db().prepare(`INSERT INTO community_model_composition_days
     (day,payload_json,computed_at,attribution_method_version,source_mutation_epoch,history_method_version)
     VALUES(?,?,?, ?, (SELECT mutation_epoch FROM community_snapshot_mutation_control WHERE singleton_id=1), ?)`)
-    .bind(day, payload, TIME, COMMUNITY_ATTRIBUTION_METHOD_VERSION, history).run();
+    .bind(day, payload, TIME, COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION, history).run();
 }
 
 async function dayRow(day = DAY) {
@@ -171,7 +171,7 @@ describe("historical model warmer and retrospective publication", () => {
     await db().prepare(`INSERT INTO community_model_composition_days
       (day,payload_json,computed_at,attribution_method_version,source_mutation_epoch)
       VALUES(?,'{"synthetic":"pre-migration-forward"}',?,?,0)`)
-      .bind(DAY, TIME, COMMUNITY_ATTRIBUTION_METHOD_VERSION).run();
+      .bind(DAY, TIME, COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION).run();
     const forward = await dayRow();
     const before = await currentCaches();
     const run = await warm();

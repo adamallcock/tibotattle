@@ -1602,16 +1602,17 @@ test("rendered plan cards keep normalized headlines and show correctly rounded a
   await withAllowancePage(createAdminAllowancePreviewPayload(), async (documentRef) => {
     selectAllowanceControl(documentRef, "admin-community-mode-controls", 'button[data-allowance-mode="plans"]');
     const cards = allowanceNodes(documentRef, ".admin-allowance-plan-summary");
-    assert.equal(cards.length, 3);
-    assert.deepEqual(cards.map((card) => card.querySelector("h3").textContent), ["Pro 20×", "Pro 5×", "Plus"]);
-    assert.deepEqual(cards.map((card) => card.querySelector(".allowance-summary-value").textContent), ["$2,119", "$1,918", "$1,900"]);
+    assert.equal(cards.length, 4);
+    assert.deepEqual(cards.map((card) => card.querySelector("h3").textContent), ["Pro 10×", "Pro 5×", "Pro Max 25×", "Plus"]);
+    assert.deepEqual(cards.map((card) => card.querySelector(".allowance-summary-value").textContent), ["$2,119", "$1,918", "$2,500", "$1,900"]);
     assert.deepEqual(cards.map((card) => card.querySelector(".allowance-plan-value").textContent), [
       "This plan: $2,119/week at API prices",
-      "This plan: $479/week at API prices",
-      "This plan: $95/week at API prices",
+      "This plan: $959/week at API prices",
+      "This plan: $6,250/week at API prices",
+      "This plan: $190/week at API prices",
     ]);
     assert.equal(allowanceNodes(documentRef, ".allowance-summary-caption")[0].textContent,
-      "API-equivalent USD / Pro 20× week");
+      "API-equivalent USD / Pro 10× week");
     assert.match(descendantNodes(cards[1]).map((node) => node.textContent).join(" "), /1 account · 2 fits/u);
 
     const container = documentRef.byId.get("admin-community-allowance-result");
@@ -1620,7 +1621,7 @@ test("rendered plan cards keep normalized headlines and show correctly rounded a
     const focused = container.querySelector('button[data-allowance-plan="prolite"]');
     assert.equal(focused.getAttribute("aria-pressed"), "true");
     assert.equal(documentRef.activeElement, focused);
-    assert.equal(allowanceNodes(documentRef, ".allowance-plan-value").length, 3);
+    assert.equal(allowanceNodes(documentRef, ".allowance-plan-value").length, 4);
   });
 });
 

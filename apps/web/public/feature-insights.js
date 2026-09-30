@@ -32,10 +32,10 @@ export function exampleModelSpeeds(period='all', speedMode='standard') {
   const activity=[42,67,31,85,56,12,7,49,104,73,38,61,19,9,54,88,126,46,72,14,5,65,97,43,112,58,21,8,76,51];
   const speeds=[62,58,71,47,53,79,66,60,39,51,68,57,74,82,63,48,44,59,70,76,64,55,41,67,50,61,78,69,56,65];
   const latency=[1.4,2.1,1.1,3.8,1.7,.9,1.6,2.3,4.9,2.6,1.3,1.8,1.2,.8,2.7,1.9,3.4,1.5,2.2,1.1,1.8,3.1,2.4,1.2,4.2,1.7,.9,1.4,2.8,1.6];
-  if (!['standard','fast'].includes(speedMode)) throw new RangeError('Unsupported speed mode');
+  if (!['standard','fast','ultrafast'].includes(speedMode)) throw new RangeError('Unsupported speed mode');
   return {schemaVersion:5,method:5,speedMode,excludedUnknownTurns:0,status:'ready',collecting:false,stale:false,updatedAt:new Date(end+86400000-1).toISOString(),period,interval:'day',start,end,historyProgress:null,
-    models:speedMode==='fast'?[]:[
-      ['gpt-6-astra','Astra'],['gpt-6-sol','GPT-6 Sol'],['gpt-6-luna','GPT-6 Luna'],
+    models:speedMode!=='standard'?[]:[
+      ['gpt-6-astra','Astra'],['gpt-6.1-sol','GPT-6.1 Sol'],['gpt-6-sol','GPT-6 Sol'],['gpt-6-luna','GPT-6 Luna'],
       ['gpt-5.6-terra','Terra'],['gpt-5.6-sol','Sol'],['gpt-5.6-luna','Luna'],
     ].map(([id,label],index)=>{
       const history=activity.map((count,i)=>{

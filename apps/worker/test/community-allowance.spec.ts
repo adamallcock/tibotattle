@@ -493,10 +493,10 @@ describe("summarizeCommunityAllowanceDay", () => {
     expect(summary.fitCount).toBe(2);
     expect(summary.centralUsd).toBe(20);
     expect(summary.basis).toBe(
-      "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d",
+      "seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25",
     );
     expect(summary.referencePlanType).toBe("pro");
-    expect(summary.normalization).toBe("pro_x1_prolite_x4_plus_x20");
+    expect(summary.normalization).toBe("pro_x1_prolite_x2_promax_x0_4_plus_x10");
     expect(summary).not.toHaveProperty("planType");
     expect(summary).not.toHaveProperty("planVariant");
     expect(summary.trailingDays).toBe(30);
@@ -550,8 +550,16 @@ describe("summarizeCommunityAllowanceDay", () => {
     ], "2026-07-25");
     expect(summary.fitCount).toBe(3);
     expect(summary.participantCount).toBe(2);
-    expect(summary.centralUsd).toBe(100);
-    expect(summary.band80Usd).toEqual({ lowerUsd: 100, upperUsd: 100 });
+    expect(summary.centralUsd).toBe(50);
+    expect(summary.band80Usd).toEqual({ lowerUsd: 50, upperUsd: 90 });
+  });
+
+  it("converts a Pro Max 25x fit to the Pro 10x reference without changing its observed capacity", () => {
+    const promax = fit({ participantId: "p25", planType: "promax", capacityNanousd: 250e9 });
+    const summary = summarizeCommunityAllowanceDay([promax], "2026-07-25");
+    expect(summary).toMatchObject({ fitCount: 1, participantCount: 1, centralUsd: 100 });
+    expect(summarizeCommunityCapacityByPlanType([promax], "2026-07-25").promax)
+      .toMatchObject({ medianCapacityNanousd: 250e9, participantCount: 1, fitCount: 1 });
   });
 });
 
@@ -657,9 +665,9 @@ describe("community allowance in the daily aggregate", () => {
       .toBe("community-daily-aggregate-v1.0");
     expect(contributionPayload.allowance).toMatchObject({
       basis:
-        "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d",
+        "seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25",
       referencePlanType: "pro",
-      normalization: "pro_x1_prolite_x4_plus_x20",
+      normalization: "pro_x1_prolite_x2_promax_x0_4_plus_x10",
       qualification: "shared_reset_fit_gates_25pp_span_floor",
       spanFloorPp: 25,
       fitCount: 1,
@@ -688,7 +696,7 @@ describe("community allowance in the daily aggregate", () => {
     const participant = await enrolledParticipant();
     // The identical calibratable series, but observed on a ProLite (5x) plan.
     // The fit gates pass and the combined public summary converts it to the
-    // Pro 20x-equivalent basis with the shared multiplier configuration.
+    // Pro 10x-equivalent basis with the shared multiplier configuration.
     const accepted = await upload(
       participant,
       calibratableContribution("unknown", "prolite"),
@@ -2862,8 +2870,8 @@ describe("per-model composition from the v1.0 chunk corpus", () => {
           "gpt-5.6-sol": 2_400,
           "gpt-5.6-terra": 1_100,
         }),
-        // Plus capacities are per that plan's own weekly pool; x20 normalizes
-        // to the Pro-20x basis, landing on the same 2,400.
+        // Plus capacities are per that plan's own weekly pool; x10 normalizes
+        // 120 to 1,200 on the Pro-10x basis; the two-plan median is 1,800.
         composition("p-plus", "plus", { "gpt-5.6-sol": 120 }),
         // Identification failure: contributes to unstable, never to a median.
         composition("p-unstable", "pro", null, "fallback_blended"),
@@ -2880,7 +2888,7 @@ describe("per-model composition from the v1.0 chunk corpus", () => {
     expect(day.v1ParticipantCount).toBe(4);
     expect(day.unsupportedSourceParticipantCount).toBe(2);
     expect(expandAdminModelHistoryDay(day)!.byModel["gpt-5.6-sol"]).toEqual({
-      capacityUsd: 2_400,
+      capacityUsd: 1_800,
       participantCount: 2,
     });
     expect(expandAdminModelHistoryDay(day)!.byModel["gpt-5.6-terra"]).toEqual({

@@ -14,22 +14,23 @@ const ADMIN_RECONSTRUCTION_PUBLICATION_STATES = new Set([
 ]);
 const ADMIN_ACTION_SCHEMA_VERSION = "admin-action-v0.1";
 const ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION =
-  "admin-community-allowance-preview-v0.3";
+  "admin-community-allowance-preview-v0.4";
 const ADMIN_ALLOWANCE_PREVIEW_BASIS =
-  "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview";
+  "seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25_preview";
 const ADMIN_ALLOWANCE_PREVIEW_DAYS = 70;
 const ADMIN_METRICS_HISTORY_SCHEMA_VERSION = "admin-metrics-history-v0.3";
 const ADMIN_METRICS_HISTORY_MAX_DAYS = 30;
 const ADMIN_METRICS_HISTORY_MAX_SNAPSHOTS = 400;
 const ADMIN_METRICS_HISTORY_MAX_GAUGES = 128;
 const ADMIN_ALLOWANCE_PREVIEW_PLANS = Object.freeze([
-  Object.freeze({ planType: "pro", label: "Pro 20x", multiplier: 1 }),
-  Object.freeze({ planType: "prolite", label: "Pro 5x", multiplier: 4 }),
-  Object.freeze({ planType: "plus", label: "Plus", multiplier: 20 }),
+  Object.freeze({ planType: "pro", label: "Pro 10x", multiplier: 1 }),
+  Object.freeze({ planType: "prolite", label: "Pro 5x", multiplier: 2 }),
+  Object.freeze({ planType: "promax", label: "Pro Max 25x", multiplier: 0.4 }),
+  Object.freeze({ planType: "plus", label: "Plus", multiplier: 10 }),
 ]);
 const ADMIN_ALLOWANCE_PREVIEW_MODELS = ADMIN_MODEL_CONFIG;
 const ADMIN_ALLOWANCE_MODELS_BASIS =
-  "seven_day_codex_pro20x_equivalent_per_model_composition";
+  "seven_day_codex_pro10x_equivalent_per_model_composition";
 const ADMIN_ALLOWANCE_MODELS_GATE =
   "shared_composition_kernel_identification";
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
@@ -716,7 +717,7 @@ export function projectAdminAllowancePreview(value) {
     referencePlanType: "pro",
     trailingDays: 30,
     qualification: preview.qualification,
-    spanFloorPp: 40,
+    spanFloorPp: preview.spanFloorPp,
     plans: Object.freeze(plans),
     days: Object.freeze(days),
     coverage: projectAllowancePreviewCoverage(preview.coverage),
