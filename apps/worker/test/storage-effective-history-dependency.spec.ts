@@ -48,6 +48,7 @@ import dependencySqlBaseline from "./fixtures/effective-history-dependency-32bd4
 import occurrenceSqlBaseline from "./fixtures/effective-history-dependency-c7dcdc6f.json";
 import correctionSeekSqlBaseline from "./fixtures/effective-history-dependency-9a59dd27.json";
 import selectedChunkSqlBaseline from "./fixtures/effective-history-dependency-90c38f6e.json";
+import v11HeaderSqlBaseline from "./fixtures/effective-history-dependency-4b101167.json";
 
 const b = env as Env & {
   TEST_MIGRATIONS: D1Migration[];
@@ -868,16 +869,17 @@ describe("bounded shared effective day dependencies", () => {
         const typedSeeks = plan.filter(row => row.detail.includes("scoped_record"));
         expect(typedSeeks).toHaveLength(4);
         const timed = typedSeeks.filter(row => row.detail.includes("typed_telemetry_owner_time"));
-        // V1 selects through one sealed chunk proof and record PKs; V11
-        // retains the owner/time seek. Both outside occurrence seeks remain.
-        expect(timed).toHaveLength(1);
+        // Both formats select records through sealed chunk proofs and raw
+        // primary keys. Outside occurrence seeks keep their format indexes.
+        expect(timed).toHaveLength(0);
         expect(typedSeeks.filter(row => row.detail.includes("USING INTEGER PRIMARY KEY (rowid=?)")))
-          .toHaveLength(1);
+          .toHaveLength(2);
+        expect(plan.filter(row => row.detail === "MATERIALIZE admitted_v11_selected_chunks")).toHaveLength(1);
+        expect(plan.find(row => /SEARCH admission USING (?:COVERING )?INDEX typed_v11_proof_chunk/.test(row.detail))?.detail)
+          .toContain("chunk_key=?");
         expect(plan.filter(row => row.detail === "MATERIALIZE admitted_v1_selected_chunks")).toHaveLength(1);
         expect(plan.find(row => row.detail.includes("SEARCH admission USING COVERING INDEX typed_v1_admissions_chunk"))?.detail)
           .toContain("chunk_id=?");
-        for (const row of timed) expect(row.detail).toContain(
-          "owner_id=? AND stream=? AND observed_at_ms>? AND observed_at_ms<?");
         expect(typedSeeks.find(row => row.detail.includes("typed_telemetry_v1_occurrence"))?.detail)
           .toContain("device_id=? AND stream=? AND occurrence_id=?");
         expect(typedSeeks.find(row => row.detail.includes("typed_telemetry_v11_occurrence"))?.detail)
@@ -1071,6 +1073,68 @@ describe("bounded shared effective day dependencies", () => {
     }
     await annotate(JSON.stringify(costs),"dense-selected-v1-proof-cost");
   }, 60_000);
+
+  it("reuses sealed v1.1 chunk headers with exact deployed singleton and batched results", async ({ annotate }) => {
+    const selectedDay=day(),outsideDay=dayAfter(selectedDay);
+    const costs: {records:number;mode:string;includeSessions:boolean;current:number;prior:number}[]=[];
+    expect(v11HeaderSqlBaseline.sourceCommit).toBe("4b101167a7049314b60c62ffd996cd6178f7b331");
+    for (const records of [200,2_000]) {
+      const fixture=await createV11DeviceFixture(db(),{grant:true});
+      const ids=Array.from({length:records},(_,index)=>`synthetic:v11-sealed-header:${records}:${index}`);
+      const selected=await stage(fixture,await makeV11Day(selectedDay,{
+        usage:ids.map(eventId=>v11UsageRecord(selectedDay,"a",{eventId})),
+      }));
+      const outside=await stage(fixture,await makeV11Day(outsideDay,{
+        quota:ids.map(observationId=>({schemaVersion:"quota-observation-v1.1",observationId,
+          observedTime:`${outsideDay}T12:05:00.000Z`,provider:"openai_codex",planType:"pro",
+          planVariant:"unknown",limitId:"codex",slot:"seven_day",usedPercent:20,
+          windowDurationMinutes:10_080,resetsAt:null,
+          accountPlanAttribution:{accountBasis:"unavailable",accountTrackId:null,
+            planBasis:"same_source_occurrence",planType:"pro",planEraId:null}})),
+      }));
+      await activate(fixture,[selected,outside]);
+      const owner=(await readStorageCommunityOwnerPage(db())).find(value=>value.participantId===fixture.participantId)!;
+      for (const includeSessions of [false,true]) {
+        const observed=observeDependencyQueries(db());
+        const dependency=await effectiveHistoryDependency(observed.database,owner,namespace,selectedDay,selectedDay,{includeSessions});
+        expect(dependency.occurrenceLinks).toHaveLength(records/200);
+        expect(dependency.occurrenceLinks).toEqual(expect.arrayContaining([expect.objectContaining({family:"v11",source_day:outsideDay})]));
+        const batched=observeDependencyQueries(db());
+        const reader=await createEffectiveHistoryDayDependencyReader(batched.database,owner,namespace,
+          [selectedDay,outsideDay],{includeSessions,occurrenceLinks:"batched"});
+        for (const targetDay of [outsideDay,selectedDay]) {
+          const exact=await effectiveHistoryDependency(db(),owner,namespace,targetDay,targetDay,{includeSessions});
+          expect(await reader!.readDigest(targetDay)).toBe(await sha256Hex(canonicalJson(exact)));
+          expect(exact.occurrenceLinks).toHaveLength(records/200);
+        }
+        for (const [mode,query] of [
+          ["singleton",observed.queries.find(value=>value.sql.includes("selected(occurrence_id)"))!],
+          ["batched",batched.queries.find(value=>value.sql.startsWith("/* batched occurrence links */"))!],
+        ] as const) {
+          const oldSql=mode==="singleton"?v11HeaderSqlBaseline.sql:v11HeaderSqlBaseline.batchedSql;
+          const baseline=includeSessions?oldSql.replaceAll("('usage','quota')","('usage','quota','session')")
+            .replaceAll("(1,2)","(1,2,3)"):oldSql;
+          const current=await db().prepare(query.sql).bind(...query.values).all();
+          const prior=await db().prepare(baseline).bind(...query.values).all();
+          expect(current.results).toEqual(prior.results);
+          expect(current.meta.rows_read).toBeLessThan(prior.meta.rows_read);
+          const marker="\n    SELECT "+(mode==="batched"?"target_day,":"")+"family,occurrence_id,source_day,record_day,observed_at_ms,source_key,source_digest,canonical_digest,";
+          const selectedCount=(sql:string)=>{
+            const index=sql.lastIndexOf(marker);
+            expect(index).toBeGreaterThan(0);
+            return sql.slice(0,index)+"\n SELECT count(*) AS selected_count FROM selected LIMIT ?";
+          };
+          const nextSelected=await db().prepare(selectedCount(query.sql)).bind(...query.values).all();
+          const priorSelected=await db().prepare(selectedCount(baseline)).bind(...query.values).all();
+          expect(nextSelected.results).toEqual(priorSelected.results);
+          expect(nextSelected.meta.rows_read).toBeLessThan(priorSelected.meta.rows_read/3);
+          costs.push({records,mode,includeSessions,current:nextSelected.meta.rows_read,prior:priorSelected.meta.rows_read});
+        }
+      }
+    }
+    await annotate(JSON.stringify(costs),"dense-selected-v11-header-cost");
+    console.log("dense-selected-v11-header-cost",JSON.stringify(costs));
+  },60_000);
 
   it("checks each complete chunk once when many selected occurrences match one outside chunk", async ({ annotate }) => {
     const selectedDay = day(), outsideDay = dayAfter(selectedDay);

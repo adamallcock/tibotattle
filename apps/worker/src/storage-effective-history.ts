@@ -291,6 +291,48 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
          AND chunk.participant_id=r.participant_id AND chunk.device_id=r.device_id
          AND r.format_code=10 AND r.stream IN ${sourceStreams}
          AND r.observed_day>=s.from_day AND r.observed_day<=s.through_day
+    ), admitted_v11_selected_chunks AS MATERIALIZED (
+      /* Compact proofs seal each record to this immutable chunk's namespace,
+       * owner, device, manifest, stream and day. Validate source metadata once
+       * per complete chunk; retain every raw coordinate and time fence below. */
+      SELECT DISTINCT chunk.id,chunk.chunk_day AS source_day,r.namespace_id,r.owner_id,
+        header_record.device_id AS device_key,header_record.chunk_id AS chunk_key,
+        header_record.manifest_id AS manifest_key,header_record.stream AS stream_code
+        FROM scope s
+        CROSS JOIN typed_v11_owner_memberships scoped_owner ON scoped_owner.participant_id=s.participant_id
+        CROSS JOIN complete_v11_selected_chunks complete_chunk
+        CROSS JOIN telemetry_v11_chunks chunk ON chunk.id=complete_chunk.id
+        CROSS JOIN typed_v11_chunk_allocations allocation ON allocation.chunk_id=chunk.id
+        CROSS JOIN typed_telemetry_chunks physical_chunk ON physical_chunk.namespace_id=allocation.namespace_id
+          AND physical_chunk.format=11 AND physical_chunk.original_id=allocation.chunk_original
+        CROSS JOIN typed_v11_record_proofs representative ON representative.typed_record_id=(
+          SELECT proof.typed_record_id FROM typed_v11_record_proofs proof INDEXED BY typed_v11_proof_chunk
+           WHERE proof.chunk_key=physical_chunk.id ORDER BY proof.typed_record_id LIMIT 1)
+        CROSS JOIN typed_telemetry_records header_record ON header_record.id=representative.typed_record_id
+          AND header_record.owner_id=scoped_owner.typed_owner_id AND header_record.format=11
+        CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=header_record.id
+        JOIN typed_v11_admission_state v11 ON v11.id=1 AND v11.runtime_contract_version=1
+        JOIN typed_v11_owner_memberships owner_membership ON owner_membership.participant_id=r.participant_id
+        JOIN typed_telemetry_owners typed_owner ON typed_owner.id=owner_membership.typed_owner_id
+          AND typed_owner.namespace_id=v11.namespace_id
+        JOIN typed_v11_record_admissions admission ON admission.typed_record_id=r.storage_row_id
+        JOIN telemetry_v11_domain_days domain_day ON domain_day.manifest_id=admission.manifest_id
+        JOIN telemetry_v11_day_manifests manifest ON manifest.id=domain_day.manifest_id AND manifest.state='ready'
+        JOIN typed_v11_manifest_memberships manifest_membership ON manifest_membership.manifest_id=domain_day.manifest_id
+        JOIN storage_v11_event_sources event ON event.generation_id=domain_day.generation_id
+          AND event.owner_digest=s.owner_digest AND event.participant_id=s.participant_id
+        JOIN storage_v11_owner_links owner_link ON owner_link.participant_id=event.participant_id
+          AND owner_link.owner_digest=event.owner_digest AND owner_link.state='active'
+        JOIN telemetry_v11_domains generation ON generation.id=event.generation_id
+          AND generation.id=domain_day.generation_id AND generation.participant_id=chunk.participant_id
+          AND generation.device_id=chunk.device_id AND event.manifest_digest=generation.manifest_digest
+          AND event.from_day=generation.from_day AND event.through_day=generation.through_day
+          AND event.input_revision=generation.input_revision
+       WHERE v11.source_namespace=s.source_namespace AND r.participant_id=s.participant_id
+         AND r.source_namespace=v11.source_namespace AND r.namespace_id=v11.namespace_id
+         AND r.owner_id=typed_owner.id AND r.format_code=11 AND r.stream IN ${sourceStreams}
+         AND chunk.stream IN ${sourceStreams} AND chunk.id=admission.chunk_id
+         AND r.observed_day>=s.from_day AND r.observed_day<=s.through_day
     ), ${retainedV12} selected(${target()}occurrence_id) AS MATERIALIZED (
       SELECT ${target('s')}scoped_record.occurrence_id
         FROM ${selectionScope} s
@@ -309,38 +351,19 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
       UNION
       SELECT ${target('s')}scoped_record.occurrence_id
         FROM ${selectionScope} s
-        CROSS JOIN typed_v11_owner_memberships scoped_owner
-          ON scoped_owner.participant_id=s.participant_id
-        CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_time
-          ON scoped_record.owner_id=scoped_owner.typed_owner_id AND scoped_record.format=11
-          AND scoped_record.stream IN ${typedStreams}
+        CROSS JOIN admitted_v11_selected_chunks header
+          ON header.source_day>=s.from_day AND header.source_day<=s.through_day
+        CROSS JOIN typed_v11_record_proofs admission INDEXED BY typed_v11_proof_chunk
+          ON admission.chunk_key=header.chunk_key AND admission.manifest_key=header.manifest_key
+          AND admission.stream_code=header.stream_code
+        CROSS JOIN typed_telemetry_records scoped_record ON scoped_record.id=admission.typed_record_id
+          AND scoped_record.namespace_id=header.namespace_id AND scoped_record.owner_id=header.owner_id
+          AND scoped_record.device_id=header.device_key AND scoped_record.chunk_id=header.chunk_key
+          AND scoped_record.manifest_id=header.manifest_key AND scoped_record.format=11
+          AND scoped_record.stream=header.stream_code AND scoped_record.stream IN ${typedStreams}
           AND scoped_record.observed_at_ms>=s.from_ms AND scoped_record.observed_at_ms<s.through_ms
           AND scoped_record.observed_day>=CAST(s.from_ms/86400000 AS INTEGER)
           AND scoped_record.observed_day<CAST(s.through_ms/86400000 AS INTEGER)
-        CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=scoped_record.id
-        JOIN typed_v11_admission_state v11 ON v11.id=1 AND v11.runtime_contract_version=1
-        JOIN typed_v11_owner_memberships owner_membership ON owner_membership.participant_id=r.participant_id
-        JOIN typed_telemetry_owners typed_owner ON typed_owner.id=owner_membership.typed_owner_id
-          AND typed_owner.namespace_id=v11.namespace_id
-        JOIN typed_v11_record_admissions admission ON admission.typed_record_id=r.storage_row_id
-        JOIN telemetry_v11_chunks chunk ON chunk.id=admission.chunk_id AND chunk.stream IN ${sourceStreams}
-        JOIN complete_v11_selected_chunks complete_chunk ON complete_chunk.id=chunk.id
-        JOIN telemetry_v11_domain_days domain_day ON domain_day.manifest_id=admission.manifest_id
-        JOIN telemetry_v11_day_manifests manifest ON manifest.id=domain_day.manifest_id AND manifest.state='ready'
-        JOIN typed_v11_manifest_memberships manifest_membership ON manifest_membership.manifest_id=domain_day.manifest_id
-        JOIN storage_v11_event_sources event ON event.generation_id=domain_day.generation_id
-          AND event.owner_digest=s.owner_digest AND event.participant_id=s.participant_id
-        JOIN storage_v11_owner_links owner_link ON owner_link.participant_id=event.participant_id
-          AND owner_link.owner_digest=event.owner_digest AND owner_link.state='active'
-        JOIN telemetry_v11_domains generation ON generation.id=event.generation_id
-          AND generation.id=domain_day.generation_id AND generation.participant_id=chunk.participant_id
-          AND generation.device_id=chunk.device_id AND event.manifest_digest=generation.manifest_digest
-          AND event.from_day=generation.from_day AND event.through_day=generation.through_day
-          AND event.input_revision=generation.input_revision
-       WHERE v11.source_namespace=s.source_namespace AND r.participant_id=s.participant_id
-         AND r.source_namespace=v11.source_namespace AND r.namespace_id=v11.namespace_id
-         AND r.owner_id=typed_owner.id AND r.format_code=11 AND r.stream IN ${sourceStreams}
-         AND r.observed_day>=s.from_day AND r.observed_day<=s.through_day
       UNION
       SELECT ${target('s')}h.occurrence_id
         FROM ${selectionScope} s
