@@ -291,7 +291,8 @@ function statementUnsafe(statements) {
  * Wrangler transport, credentials, remote database IDs, or live-query input.
  * The resulting object is safe to pass to runTypedProductionPreflight.
  */
-export async function buildTypedProductionExpectedSchemas({ workerDirectory } = {}) {
+export async function buildTypedProductionExpectedSchemas({ workerDirectory, rolloutProfile = 'canonical' } = {}) {
+  if (!['canonical', 'direct-occurrence-index-only-v1'].includes(rolloutProfile)) fail('ROLLOUT_PROFILE_INVALID');
   if (typeof workerDirectory !== 'string' || !workerDirectory.length) fail('ARGUMENTS');
   const root = await safeDirectory(workerDirectory);
   const require = createRequire(join(root, 'package.json'));
@@ -312,6 +313,15 @@ export async function buildTypedProductionExpectedSchemas({ workerDirectory } = 
     const inputs = [];
     for (const directory of TYPED_SCHEMA_INPUT_DIRECTORIES[role]) {
       inputs.push(...await readDirectoryInputs(root, directory));
+    }
+    // The reviewed index rollout deliberately holds the independent day catalog.
+    // Omit exactly its hash-pinned source file; all remaining schema and restored
+    // variants still undergo the normal complete, exact preflight comparison.
+    if (role === 'primary' && rolloutProfile === 'direct-occurrence-index-only-v1') {
+      const index = inputs.findIndex(input => input.directory === 'ingestion-isolation-migrations'
+        && input.name === '0013_effective_dependency_day_catalog.sql');
+      if (index < 0 || inputs[index].sha256 !== 'a0f955007ed725bdd7206753b8deea3f1e9b0786267a46c88c6b8639dbb04a3d') fail('ROLLOUT_PROFILE_INPUT_CHANGED');
+      inputs.splice(index, 1);
     }
     if (!inputs.length) fail('INPUTS_INVALID');
     const db = new DatabaseSync(':memory:');

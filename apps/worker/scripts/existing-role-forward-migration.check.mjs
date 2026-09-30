@@ -5,12 +5,17 @@ import { cpSync, mkdirSync, readdirSync, rmSync, symlinkSync, writeFileSync } fr
 import { mkdtemp, readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
+import { TYPED_SCHEMA_INPUT_DIRECTORIES, WRANGLER_MIGRATION_LEDGER_SCHEMA } from './production-typed-schema.mjs';
+import { TYPED_PRODUCTION_PREFLIGHT_SQL } from './production-typed-preflight.mjs';
+import { storageSchemaDigest } from './d1-storage-plan.mjs';
 import { DatabaseSync } from 'node:sqlite';
 import { after, test } from 'node:test';
 import { buildTypedProductionExpectedSchemas } from './production-typed-schema.mjs';
 import { storageSha256 } from './d1-storage-plan.mjs';
 import { identityDigest, readOperation } from '../../../scripts/lib/release-operation.mjs';
-import { EXISTING_ROLE_FORWARD_CONFIRMATION, EXISTING_ROLE_FORWARD_PREVIOUS_PUBLIC,
+import { DIRECT_OCCURRENCE_FORWARD_SCHEMA, DIRECT_OCCURRENCE_FORWARD_PREVIOUS, DIRECT_OCCURRENCE_FORWARD_STEPS,
+  prepareExistingRoleForwardPlan, parseExistingRoleForwardArguments, EXISTING_ROLE_FORWARD_CONFIRMATION, EXISTING_ROLE_FORWARD_PREVIOUS_PUBLIC,
   EXISTING_ROLE_FORWARD_PREVIOUS_SCHEDULED, EXISTING_ROLE_FORWARD_STEPS,
   createExistingRoleProductionAdapter, existingRoleAtomicSql, loadExistingRoleForwardSteps, normalizeScheduledInventory,
   projectExistingRoleSchema, runExistingRoleForwardMigration, validateExistingRoleInventory,
@@ -55,9 +60,12 @@ function scheduledRaw(name,version){return {accountId:account,workerName:name,ve
   settings:{observability:{}},schedules:{schedules:[{cron:'0 * * * *'}]},
   subdomain:{enabled:false},routes:[],domains:[],namespaces:[]};}
 function makePlan(f,expiresAt=new Date(Date.now()+30_000).toISOString()){
+  const direct=f.profile===DIRECT_OCCURRENCE_FORWARD_SCHEMA;
+  const publicSource=direct?DIRECT_OCCURRENCE_FORWARD_PREVIOUS:EXISTING_ROLE_FORWARD_PREVIOUS_PUBLIC;
+  const scheduledSource=direct?DIRECT_OCCURRENCE_FORWARD_PREVIOUS:EXISTING_ROLE_FORWARD_PREVIOUS_SCHEDULED;
   const workerPins=['public','analytics','publication','cache'].map((workerName,i)=>({
     workerName,versionId:`${i+1}0000000-0000-4000-8000-000000000000`,
-    sourceCommit:i===0?EXISTING_ROLE_FORWARD_PREVIOUS_PUBLIC:EXISTING_ROLE_FORWARD_PREVIOUS_SCHEDULED,
+    sourceCommit:i===0?publicSource:scheduledSource,
     fingerprint:sha,bindings:{primary:ids[0],analytics:ids[1]}}));
   const before=[
     [{type:'table',name:'typed_telemetry_devices',tbl_name:'typed_telemetry_devices',
@@ -67,7 +75,9 @@ function makePlan(f,expiresAt=new Date(Date.now()+30_000).toISOString()){
     [{type:'table',name:'analytics_runtime_sources',tbl_name:'analytics_runtime_sources',
       sql:'CREATE TABLE analytics_runtime_sources(source_id TEXT PRIMARY KEY)'}]];
   const targets=f.steps.map((step,i)=>{
-    const p=projectExistingRoleSchema(before[i],step);
+    const prefix=direct?[{type:'table',name:'typed_telemetry_records',tbl_name:'typed_telemetry_records',
+      sql:'CREATE TABLE typed_telemetry_records(owner_id INTEGER,occurrence_id BLOB,format INTEGER,stream TEXT,observed_day TEXT)'}]:before[i];
+    const p=projectExistingRoleSchema(prefix,step,f.profile);
     return {role:step.role,binding:step.binding,name:`synthetic-${step.role}`,databaseId:ids[i],
       migrationName:step.name,migrationSha256:step.sha256,beforeSchemaSha256:p.beforeSha256,
       afterSchemaSha256:p.afterSha256,beforeLedger:[{name:'0000_seed.sql',sha256:sha}],
@@ -76,9 +86,9 @@ function makePlan(f,expiresAt=new Date(Date.now()+30_000).toISOString()){
   const backupValue={schema:'typed-forward-backup-receipt-v2',provider:'cloudflare-d1-time-travel',
     capturedAt:createdAt,expiresAt,targetsSha256:identityDigest(targets.map(x=>({role:x.role,databaseId:x.databaseId}))),
     targetBookmarks:targets.map(x=>({role:x.role,databaseId:x.databaseId,bookmark:'synthetic-bookmark'}))};
-  return {schema:'existing-role-forward-plan-v1',operationId:randomUUID(),environment:'production',
-    accountId:account,sourceCommit:f.commit,previousPublicSourceCommit:EXISTING_ROLE_FORWARD_PREVIOUS_PUBLIC,
-    previousScheduledSourceCommit:EXISTING_ROLE_FORWARD_PREVIOUS_SCHEDULED,createdAt,expiresAt,
+  return {schema:f.profile??'existing-role-forward-plan-v1',operationId:randomUUID(),environment:'production',
+    accountId:account,sourceCommit:f.commit,previousPublicSourceCommit:publicSource,
+    previousScheduledSourceCommit:scheduledSource,createdAt,expiresAt,
     sourceNamespace:'synthetic',wranglerSha256:sha,workerPins,expectedInputSha256:f.expected.inputSha256,
     controlsSha256:identityDigest(controls),projectedPreflightSha256:identityDigest({ok:true}),
     backup:{...backupValue,receiptSha256:identityDigest(backupValue)},targets};
@@ -99,7 +109,7 @@ function fakeRuntime(plan,{lost='none',delay=0,acquireUnknown=false}={}){
         controlInvariantSha256:target.controlInvariantSha256};},
     migrateAtomic:async(target,statement)=>{
       const i=plan.targets.findIndex(x=>x.role===target.role);state.calls.push(target.role);
-      assert.equal(statement.resultCount,i===0?3:2);
+      assert.equal(statement.resultCount,target.migrationName==='0006_direct_owner_occurrence.sql'?2:i===0?3:2);
       assert.equal(statement.atomic,true);
       if(lost==='before'&&state.calls.length===1)throw Error('lost before commit');
       state.schema[i]=target.afterSchemaSha256;
@@ -291,6 +301,124 @@ test('concrete transport uses a fresh private SQL namespace on resumed invocatio
   assert.equal(attempts.length,2);
   const statements=attempts.map(name=>readFile(join(op,name,'typed-forward-wrangler','mutation-0.sql'),'utf8'));
   const actual=await Promise.all(statements);
-  assert.deepEqual(new Set(actual),new Set(f.steps.map(existingRoleAtomicSql)));
+  assert.deepEqual(new Set(actual),new Set(f.steps.map(step=>existingRoleAtomicSql(step))));
   rmSync(op,{recursive:true,force:true});
+});
+
+async function directFixture(){
+  const f=await fixture();
+  return {...f,profile:DIRECT_OCCURRENCE_FORWARD_SCHEMA,
+    steps:await loadExistingRoleForwardSteps({workerDirectory:f.worker,schema:DIRECT_OCCURRENCE_FORWARD_SCHEMA}),
+    expected:await buildTypedProductionExpectedSchemas({workerDirectory:f.worker,rolloutProfile:'direct-occurrence-index-only-v1'})};
+}
+test('direct occurrence profile pins one index and atomically rolls index and ledger back',async()=>{
+  const f=await directFixture(),step=f.steps[0];
+  assert.deepEqual(f.steps.map(x=>x.sha256),DIRECT_OCCURRENCE_FORWARD_STEPS.map(x=>x.sha256));
+  assert.equal(f.steps.length,1);assert.equal(step.addedObjects.length,1);
+  assert.throws(()=>existingRoleAtomicSql(step),{code:'EXISTING_ROLE_FORWARD_STEP_INVALID'});
+  const db=new DatabaseSync(':memory:');
+  try{
+    db.exec(step.fixtureTables[0]);db.exec('CREATE TABLE d1_storage_migrations(name TEXT PRIMARY KEY,sha256 TEXT) STRICT');
+    db.exec("INSERT INTO typed_telemetry_records VALUES(7,X'0102',11,'usage','2026-09-01')");
+    const before=db.prepare('SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name').all();
+    db.exec('BEGIN');db.exec(existingRoleAtomicSql(step,DIRECT_OCCURRENCE_FORWARD_SCHEMA));
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM d1_storage_migrations').get().n,1);
+    assert.deepEqual(db.prepare('SELECT name FROM pragma_index_info(?)').all('typed_telemetry_owner_occurrence').map(x=>x.name),
+      ['owner_id','occurrence_id','format','stream','observed_day']);
+    db.exec('ROLLBACK');assert.deepEqual(db.prepare('SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name').all(),before);
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM typed_telemetry_records').get().n,1);
+    db.exec("INSERT INTO d1_storage_migrations VALUES('0006_direct_owner_occurrence.sql','synthetic')");
+    db.exec('BEGIN');assert.throws(()=>db.exec(existingRoleAtomicSql(step,DIRECT_OCCURRENCE_FORWARD_SCHEMA)));db.exec('ROLLBACK');
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM sqlite_schema WHERE name='typed_telemetry_owner_occurrence'").get().n,0);
+  }finally{db.close();}
+});
+test('direct profile completes or reconciles unknown outcomes without replaying an applied index',async()=>{
+  const f=await directFixture();
+  for(const lost of ['none','before','after']){
+    const plan=makePlan(f),op=await mkdtemp(join('/private/tmp','direct-occurrence-op-')),runtime=fakeRuntime(plan,{lost});
+    try{
+      if(lost!=='none'){
+        await assert.rejects(run(f,plan,op,runtime),{code:'EXISTING_ROLE_FORWARD_PROVIDER_RESULT_UNCERTAIN'});
+        const proof=await run(f,plan,op,runtime,{resume:true,reconcileOnly:true,execute:false});
+        assert.equal(proof.status,lost==='after'?'reconciled-applied':'reconciled-not-applied');
+        assert.equal(proof.remoteWrites,false);assert.deepEqual(runtime.state.calls,['primary']);
+        if(lost==='before')await assert.rejects(run(f,plan,op,runtime,{resume:true,approvedReconciliationSha256:proof.reconciliationSha256}),
+          {code:'EXISTING_ROLE_FORWARD_RETRY_NOT_APPROVED'});
+        const result=await run(f,plan,op,runtime,{resume:true,approvedReconciliationSha256:proof.reconciliationSha256,
+          ...(lost==='before'?{retryConfirmation:'RETRY_PROVEN_NOT_APPLIED_EXISTING_ROLE_FORWARD_MIGRATION'}:{})});
+        assert.equal(result.status,'complete');
+      }else assert.equal((await run(f,plan,op,runtime)).status,'complete');
+      assert.deepEqual(runtime.state.calls,lost==='before'?['primary','primary']:['primary']);
+      assert.equal(runtime.state.owner,null);
+      const receipt=JSON.parse(await readFile(join(op,'receipt.json'),'utf8')),operation=await readOperation(op);
+      assert.equal(verifyExistingRoleForwardReceipt({plan,receipt,operation}).status,'verified');
+      assert.equal(operation.state.nextRole,1);assert.equal(receipt.targets.length,1);
+    }finally{rmSync(op,{recursive:true,force:true});}
+  }
+});
+test('direct profile rejects cross-profile, source, capacity, Worker and control drift before DDL',async()=>{
+  const f=await directFixture(),baseline=makePlan(f);
+  for(const change of [p=>{p.schema='existing-role-forward-plan-v1';},p=>{p.schema='unreviewed';},
+    p=>{p.previousPublicSourceCommit='b'.repeat(40);},p=>{p.targets[0].migrationSha256='b'.repeat(64);},
+    p=>{p.targets[0].beforeBytes=8_000_000_000;}]){
+    const plan=structuredClone(baseline);change(plan);
+    await assert.rejects(runExistingRoleForwardMigration({plan,workerDirectory:f.worker,repositoryRoot:f.root}));
+  }
+  for(const drift of ['worker','controls']){
+    const plan=makePlan(f),runtime=fakeRuntime(plan),op=await mkdtemp(join('/private/tmp','direct-occurrence-drift-'));
+    const original=runtime.adapter;
+    runtime.adapter=()=>({...original(),...(drift==='worker'?{workerPins:async()=>plan.workerPins.map((x,i)=>i===1?{...x,versionId:randomUUID()}:x)}:
+      {controls:async()=>({...controls,collection:{...controls.collection,processing_enabled:0}})})});
+    try{await assert.rejects(run(f,plan,op,runtime),{code:drift==='worker'?'EXISTING_ROLE_FORWARD_WORKER_INVENTORY_DRIFT':'EXISTING_ROLE_FORWARD_ACTIVE_RUNTIME_DRIFT'});
+      assert.deepEqual(runtime.state.calls,[]);}finally{rmSync(op,{recursive:true,force:true});}
+  }
+});
+
+
+test('prepare projects exactly one index, validates all roles and captures one read-only backup',async()=>{
+  const f=await directFixture(),baseline=makePlan(f),rows={};
+  const split=createRequire(join(f.worker,'package.json'))('wrangler').unstable_splitSqlQuery;
+  for(const [role,dirs]of Object.entries(TYPED_SCHEMA_INPUT_DIRECTORIES)){
+    const db=new DatabaseSync(':memory:');
+    try{
+      for(const dir of dirs)for(const name of readdirSync(join(f.worker,dir)).filter(x=>x.endsWith('.sql')).sort()){
+        if(role==='primary'&&['0006_direct_owner_occurrence.sql','0013_effective_dependency_day_catalog.sql'].includes(name))continue;
+        for(const sql of split(await readFile(join(f.worker,dir,name),'utf8')))db.exec(sql);
+      }
+      if(role==='ledger')db.exec(WRANGLER_MIGRATION_LEDGER_SCHEMA.sql);
+      rows[role]=db.prepare(TYPED_PRODUCTION_PREFLIGHT_SQL.schema).all();
+    }finally{db.close();}
+  }
+  const inventory=baseline.workerPins.map((pin,i)=>({...pin,accountId:account,
+    schema:i===0?'production-live-config-v1':'existing-role-scheduled-inventory-v1',
+    bindings:[{name:i===0?'USAGE_MONITOR_DB':'STORAGE_INGESTION_DB',type:'d1',database_id:ids[0]},
+      {name:i===0?'ANALYTICS_DB':'STORAGE_ANALYTICS_DB',type:'d1',database_id:ids[1]}]}));
+  let backups=0;
+  const readOnly={wranglerSha256:sha,controls:async()=>controls,
+    inspect:async()=>({schemaRows:rows.primary,ledger:[{name:'0000_seed.sql',sha256:sha}],
+      controlInvariantSha256:sha,bytes:4096,name:'synthetic-primary'}),
+    query:async(binding,sql)=>{
+      const role={USAGE_MONITOR_DB:'primary',ANALYTICS_DB:'analytics',DELETION_LEDGER:'ledger'}[binding];
+      const results=sql===TYPED_PRODUCTION_PREFLIGHT_SQL.schema?rows[role]:sql===TYPED_PRODUCTION_PREFLIGHT_SQL.probe?[{typed_preflight_probe:1}]:
+        sql===TYPED_PRODUCTION_PREFLIGHT_SQL.sourceState?[{singleton:1,source_id:'synthetic',authority_epoch:1}]:
+        sql===TYPED_PRODUCTION_PREFLIGHT_SQL.analyticsRuntime?[{source_id:'synthetic',source_namespace:'synthetic',contract_version:1}]:
+        [{id:1,source_namespace:'synthetic',namespace_id:1,runtime_contract_version:1}];
+      return {success:true,results};
+    },
+    backup:async(targets,capturedAt,expiresAt)=>{backups++;assert.equal(targets.length,1);
+      const value={schema:'typed-forward-backup-receipt-v2',provider:'cloudflare-d1-time-travel',capturedAt,expiresAt,
+        targetsSha256:identityDigest(targets.map(x=>({role:x.role,databaseId:x.databaseId}))),
+        targetBookmarks:targets.map(x=>({role:x.role,databaseId:x.databaseId,bookmark:'synthetic'}))};
+      return {...value,receiptSha256:identityDigest(value)};}};
+  const input={workerDirectory:f.worker,repositoryRoot:f.root,accountId:account,candidateSourceCommit:f.commit,
+    publicWorker:inventory[0],scheduledWorkers:inventory.slice(1),sourceNamespace:'synthetic',wranglerSha256:sha,
+    readOnly,expiresAt:new Date(Date.now()+3600000).toISOString(),schema:DIRECT_OCCURRENCE_FORWARD_SCHEMA};
+  const plan=await prepareExistingRoleForwardPlan(input);
+  assert.equal(plan.targets.length,1);assert.equal(backups,1);
+  assert.equal(plan.targets[0].beforeSchemaSha256,storageSchemaDigest(rows.primary));
+  assert.equal(plan.targets[0].afterSchemaSha256,f.expected.expectedSchemas.primary.schemaSha256);
+  assert.equal(plan.schema,DIRECT_OCCURRENCE_FORWARD_SCHEMA);
+  await assert.rejects(prepareExistingRoleForwardPlan({...input,readOnly:{...readOnly,inspect:async()=>({...await readOnly.inspect(),bytes:8_000_000_000})}}),
+    {code:'EXISTING_ROLE_FORWARD_INDEX_CAPACITY_RESERVE_INSUFFICIENT'});
+  assert.equal(backups,1);
 });

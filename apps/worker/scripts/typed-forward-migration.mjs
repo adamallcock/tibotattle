@@ -208,8 +208,9 @@ function validateBackupReceipt(backup, targets, now = null) {
 }
 
 function validateBackupTargetIdentities(targets) {
-  if (!Array.isArray(targets) || targets.length !== 2
-      || targets[0]?.role !== 'primary' || targets[1]?.role !== 'analytics') fail('BACKUP_CAPTURE_TARGETS_INVALID');
+  if (!Array.isArray(targets) || ![1, 2].includes(targets.length)
+      || targets[0]?.role !== 'primary'
+      || (targets.length === 2 && targets[1]?.role !== 'analytics')) fail('BACKUP_CAPTURE_TARGETS_INVALID');
   return targets.map((target, index) => {
     if (!object(target) || !['role', 'binding', 'name', 'databaseId'].every(key => typeof target[key] === 'string')
         || target.role !== ['primary', 'analytics'][index]

@@ -6,7 +6,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import { identityDigest, readOperation, openOperation } from '../../../scripts/lib/release-operation.mjs';
-import { loadExistingRoleForwardSteps, verifyExistingRoleForwardReceipt } from './existing-role-forward-migration.mjs';
+import { DIRECT_OCCURRENCE_FORWARD_SCHEMA, DIRECT_OCCURRENCE_FORWARD_PREVIOUS, loadExistingRoleForwardSteps, verifyExistingRoleForwardReceipt } from './existing-role-forward-migration.mjs';
 import { createScheduledAnalyticsProvider, runScheduledAnalyticsRollout, scheduledSettingsStableDigest } from './production-scheduled-analytics-deploy.mjs';
 
 const source='a'.repeat(40),previous='b'.repeat(40),account='c'.repeat(32),database='11111111-1111-4111-8111-111111111111';
@@ -17,7 +17,9 @@ const files={analytics:'storage-analytics-worker.js',publication:'storage-public
 const flags={analytics:['STORAGE_ANALYTICS_SHARED_FEATURES','STORAGE_ANALYTICS_MODEL_BLOCKS'],publication:['STORAGE_ANALYTICS_SHARED_FEATURES','STORAGE_ANALYTICS_MODEL_BLOCKS'],cache:['CACHE_RETENTION_SHARED_FEATURES']};
 const hash=x=>createHash('sha256').update(x).digest('hex');
 const write=async(path,bytes)=>writeFile(path,bytes,{mode:0o600});
-async function fixture(t,{refresh=false}={}){
+async function fixture(t,{refresh=false,indexRefresh=false}={}){
+  refresh=refresh||indexRefresh;
+  const priorSource=indexRefresh?DIRECT_OCCURRENCE_FORWARD_PREVIOUS:refreshPrevious;
   const root=await realpath(await mkdtemp(join(tmpdir(),'scheduled-analytics-')));t.after(()=>rm(root,{recursive:true,force:true}));
   const pkg=join(root,'package'),operation=join(root,'operation');await mkdir(pkg,{mode:0o700});await mkdir(join(pkg,'artifacts'),{mode:0o700});
   const snapshots={},versions=new Map(),tags=new Map(),events=[],entries=[],rolePlans=[];
@@ -39,20 +41,20 @@ async function fixture(t,{refresh=false}={}){
     entries.push({path:`artifacts/${role}/${files[role]}`,sha256:bundleSha256},{path:`artifacts/${role}-retained-upload.json`,sha256:hash(configBytes)});
     const bindings=[{type:'d1',name:'STORAGE_ANALYTICS_DB',id:database},
       ...(refresh?[{type:'d1',name:'STORAGE_INGESTION_DB',id:primaryDatabase}]:[]),{type:'secret_text',name:'API_KEY'},
-      {type:'plain_text',name:'DEPLOYMENT_SOURCE_COMMIT',text:refresh?refreshPrevious:previous},
+      {type:'plain_text',name:'DEPLOYMENT_SOURCE_COMMIT',text:refresh?priorSource:previous},
       {type:'plain_text',name:'KEEP',text:'same'},
       ...flags[role].map(name=>({type:'plain_text',name,text:refresh&&!(role==='publication'&&name==='STORAGE_ANALYTICS_MODEL_BLOCKS')?'enabled':'disabled'})),
       ...(refresh&&role==='cache'?[{type:'plain_text',name:'CACHE_RETENTION_BUILD',text:'enabled'}]:[])];
     const activeVersionId=`0000000${index+2}-1111-4111-8111-111111111111`;
     const ingress={subdomainEnabled:false,previewsEnabled:false,routes:0,domains:0};
     settings.bindings=structuredClone(bindings);
-    snapshots[role]={activeVersionId,sourceCommit:refresh?refreshPrevious:previous,bindings,runtime,settings,ingress,
+    snapshots[role]={activeVersionId,sourceCommit:refresh?priorSource:previous,bindings,runtime,settings,ingress,
       settingsSha256:identityDigest(settings),settingsStableSha256:scheduledSettingsStableDigest(settings),schedules:['* * * * *']};
     versions.set(activeVersionId,{id:activeVersionId,tag:settings.annotations['workers/tag'],
       message:settings.annotations['workers/message'],bindings:structuredClone(bindings),runtime});
     rolePlans.push({role,name:config.name,bundleSha256,configPath,configSha256:hash(configBytes),d1Bindings:[{binding:'STORAGE_ANALYTICS_DB',databaseId:database},
       ...(refresh?[{binding:'STORAGE_INGESTION_DB',databaseId:primaryDatabase}]:[])],
-      predecessor:{versionId:activeVersionId,sourceCommit:refresh?refreshPrevious:previous,bindingsSha256:identityDigest(bindings),settingsSha256:identityDigest(settings),settingsStableSha256:scheduledSettingsStableDigest(settings),runtimeSha256:identityDigest(runtime),ingressSha256:identityDigest(ingress),schedules:['* * * * *'],
+      predecessor:{versionId:activeVersionId,sourceCommit:refresh?priorSource:previous,bindingsSha256:identityDigest(bindings),settingsSha256:identityDigest(settings),settingsStableSha256:scheduledSettingsStableDigest(settings),runtimeSha256:identityDigest(runtime),ingressSha256:identityDigest(ingress),schedules:['* * * * *'],
         secretNames:['secret_text:API_KEY'],otherBindingsSha256:identityDigest([]),provenanceOperation:null}});
   }
   const migrations=Array.from({length:28},(_,i)=>({name:`${String(i+1).padStart(4,'0')}_old.sql`,sha256:hash(String(i))}));
@@ -66,7 +68,7 @@ async function fixture(t,{refresh=false}={}){
   entries.push({path:'migrations/worker/analytics-migrations/qualification.json',sha256:hash(qualificationBytes)});
   const manifestBytes=JSON.stringify({sourceCommit:source,status:'local-qualified',remoteWrites:false,files:entries})+'\n';await write(join(pkg,'manifest.json'),manifestBytes);
   const plan={schema:'scheduled-analytics-rollout-v1',createdAt:new Date(Date.now()-1000).toISOString(),expiresAt:new Date(Date.now()+3600000).toISOString(),
-    stage:refresh?'refresh-enabled':'deploy-disabled',candidateSourceCommit:source,previousSourceCommit:refresh?refreshPrevious:previous,accountId:account,wranglerSha256:hash('wrangler'),
+    stage:indexRefresh?'index-refresh':refresh?'refresh-enabled':'deploy-disabled',candidateSourceCommit:source,previousSourceCommit:refresh?priorSource:previous,accountId:account,wranglerSha256:hash('wrangler'),
     packageManifestSha256:hash(manifestBytes),database:{id:database,schemaSha256:hash('schema'),migrations},disabledOperation:null,roles:rolePlans};
   let held=null;
   const lock={createOwner:()=> 'f'.repeat(40),isAncestor:()=>true,acquire(owner){assert.equal(held,null);held=owner;events.push('lock');},
@@ -96,12 +98,13 @@ async function fixture(t,{refresh=false}={}){
     async deploy(item,id){events.push(`deploy:${item.role}`);const version=versions.get(id);snapshots[item.role]={...snapshots[item.role],activeVersionId:id,sourceCommit:source,bindings:version.bindings};},
   };
   if(refresh){
-    const steps=await loadExistingRoleForwardSteps({workerDirectory:join(dirname(fileURLToPath(import.meta.url)),'..')});
+    const currentSteps=await loadExistingRoleForwardSteps({workerDirectory:join(dirname(fileURLToPath(import.meta.url)),'..')});
+    const steps=indexRefresh?[...(await loadExistingRoleForwardSteps({workerDirectory:join(dirname(fileURLToPath(import.meta.url)),'..'),schema:DIRECT_OCCURRENCE_FORWARD_SCHEMA})),currentSteps[1]]:currentSteps;
     for(const role of rolePlans){
       const directory=join(root,`predecessor-${role.role}`);
       const prior=await openOperation({directory,kind:'production',binding:{role:role.role}});
       await prior.save({status:'completed',stage:{analytics:'model-batches',publication:'shared-publication',cache:'shared-cache'}[role.role],
-        candidateSourceCommit:refreshPrevious,deployed:{[role.role]:{versionId:role.predecessor.versionId,
+        candidateSourceCommit:priorSource,...(indexRefresh?{dispatchTracking:'scheduled-refresh-dispatch-v1',index:3}:{}),deployed:{[role.role]:{versionId:role.predecessor.versionId,
           bundleSha256:hash(`previous-${role.role}`)}}});prior.close();
       role.predecessor.provenanceOperation=directory;
     }
@@ -116,28 +119,29 @@ async function fixture(t,{refresh=false}={}){
       migrationName:steps[1].name,migrationSha256:steps[1].sha256,
       beforeSchemaSha256:hash('analytics-before'),afterSchemaSha256:plan.database.schemaSha256,
       beforeLedger:migrations.slice(0,-1),controlInvariantSha256:hash('analytics-controls')}];
+    if(indexRefresh)targets.splice(1,1);
     const createdAt=new Date(Date.now()-2000).toISOString(),expiresAt=new Date(Date.now()+3600000).toISOString();
     const backupValue={schema:'typed-forward-backup-receipt-v2',provider:'cloudflare-d1-time-travel',
       capturedAt:createdAt,expiresAt,
       targetsSha256:identityDigest(targets.map(target=>({role:target.role,databaseId:target.databaseId}))),
       targetBookmarks:targets.map(target=>({role:target.role,databaseId:target.databaseId,bookmark:'synthetic'}))};
-    const migration={schema:'existing-role-forward-plan-v1',operationId:randomUUID(),environment:'production',
+    const migration={schema:indexRefresh?DIRECT_OCCURRENCE_FORWARD_SCHEMA:'existing-role-forward-plan-v1',operationId:randomUUID(),environment:'production',
       accountId:account,sourceCommit:source,
-      previousPublicSourceCommit:'c7dcdc6f4f9df0b9d006b69ac287f0a253cf2b6d',
-      previousScheduledSourceCommit:refreshPrevious,createdAt,expiresAt,
+      previousPublicSourceCommit:indexRefresh?priorSource:'c7dcdc6f4f9df0b9d006b69ac287f0a253cf2b6d',
+      previousScheduledSourceCommit:priorSource,createdAt,expiresAt,
       sourceNamespace:'synthetic',wranglerSha256:hash('wrangler'),
       workerPins:[{workerName:'tibotattle-public-synthetic',versionId:'00000001-1111-4111-8111-111111111111',
-        sourceCommit:'c7dcdc6f4f9df0b9d006b69ac287f0a253cf2b6d',fingerprint:hash('public'),
+        sourceCommit:indexRefresh?priorSource:'c7dcdc6f4f9df0b9d006b69ac287f0a253cf2b6d',fingerprint:hash('public'),
         bindings:{primary:primaryDatabase,analytics:database}},
       ...rolePlans.map(role=>({workerName:role.name,versionId:role.predecessor.versionId,
-        sourceCommit:refreshPrevious,fingerprint:hash(role.role),
+        sourceCommit:priorSource,fingerprint:hash(role.role),
         bindings:{primary:primaryDatabase,analytics:database}}))],
       expectedInputSha256:hash('inputs'),controlsSha256:hash('controls'),
       projectedPreflightSha256:hash('preflight'),
       backup:{...backupValue,receiptSha256:identityDigest(backupValue)},targets};
     const directory=join(root,'forward-migration');
     const operationRecord=await openOperation({directory,kind:'production',binding:migration});
-    await operationRecord.save({status:'complete',owner:'f'.repeat(40),nextRole:2,lastFailure:null});
+    await operationRecord.save({status:'complete',owner:'f'.repeat(40),nextRole:targets.length,lastFailure:null});
     operationRecord.close();
     const migrationBytes=JSON.stringify(migration)+'\n';await write(join(directory,'plan.json'),migrationBytes);
     const receiptValue={schema:'existing-role-forward-receipt-v1',status:'complete',planSha256:identityDigest(migration),
@@ -580,4 +584,31 @@ test('provider reads actual array-shaped routes and domains responses',async t=>
   versionCount=128;await assert.rejects(provider.versionInventory(role),{code:'SCHEDULED_ANALYTICS_REMOTE_SHAPE_INVALID'});
   wrappedRoutes=true;
   await assert.rejects(provider.snapshot(role),{code:'SCHEDULED_ANALYTICS_REMOTE_SHAPE_INVALID'});
+});
+
+
+test('index-only refresh adopts a verified one-role migration and preserves schedules and enabled controls',async t=>{
+  const f=await fixture(t,{indexRefresh:true});
+  assert.equal((await runScheduledAnalyticsRollout({plan:f.plan,packageRoot:f.pkg})).status,'planned');
+  assert.equal((await runScheduledAnalyticsRollout({...f.input,execute:true,confirmation:'DEPLOY_REVIEWED_SCHEDULED_ANALYTICS'})).status,'completed');
+  assert.deepEqual(f.events,['lock','upload:analytics','deploy:analytics','upload:publication','deploy:publication','upload:cache','deploy:cache','release']);
+  for(const role of roles){
+    assert.deepEqual(f.snapshots[role].schedules,['* * * * *']);
+    assert.equal(f.snapshots[role].sourceCommit,source);
+    const vars=Object.fromEntries(f.snapshots[role].bindings.filter(x=>x.type==='plain_text').map(x=>[x.name,x.text]));
+    assert.equal(vars[role==='cache'?'CACHE_RETENTION_SHARED_FEATURES':'STORAGE_ANALYTICS_SHARED_FEATURES'],'enabled');
+  }
+});
+test('index refresh refuses changed migration proof, predecessor operation and primary schema before upload',async t=>{
+  for(const drift of ['proof','predecessor','schema'])await t.test(drift,async sub=>{
+    const f=await fixture(sub,{indexRefresh:true});
+    if(drift==='proof')await write(join(f.plan.forwardMigration.operationDirectory,'receipt.json'),'{}\n');
+    if(drift==='predecessor'){
+      const prior=await openOperation({directory:f.plan.roles[0].predecessor.provenanceOperation,kind:'production',binding:{role:'analytics'},resume:true});
+      await prior.save({...prior.record.state,dispatchTracking:'unreviewed'});prior.close();
+    }
+    if(drift==='schema')f.sourceDatabaseState.schemaSha256=hash('unreviewed');
+    await assert.rejects(runScheduledAnalyticsRollout({...f.input,execute:true,confirmation:'DEPLOY_REVIEWED_SCHEDULED_ANALYTICS'}));
+    assert.deepEqual(f.events,[]);
+  });
 });

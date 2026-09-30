@@ -169,3 +169,28 @@ test('restore transformation changes are bound into the operation source identit
   assert.notDeepEqual(second.expectedSchemas.primary.restoredSchemaSha256, first.expectedSchemas.primary.restoredSchemaSha256);
   assert.equal(second.expectedSchemas.primary.schemaSha256, first.expectedSchemas.primary.schemaSha256);
 });
+
+
+test('index-only rollout omits exactly the reviewed day catalog and preserves all three role contracts',async()=>{
+  const generated=await buildTypedProductionExpectedSchemas({workerDirectory:actualWorker,rolloutProfile:'direct-occurrence-index-only-v1'});
+  const canonical=await buildTypedProductionExpectedSchemas({workerDirectory:actualWorker});
+  assert.equal(generated.migrationCounts.primary,91);assert.equal(canonical.migrationCounts.primary,92);
+  assert.equal(generated.expectedSchemas.primary.schemaSha256,'51d131e2215bcd99db0a79698c4195d06be40a3c091199674f45ed74f4e3c039');
+  assert.equal(generated.expectedSchemas.primary.restoredSchemaSha256.length,3);
+  assert.equal(generated.expectedSchemas.primary.requiredObjects.filter(x=>x.name.startsWith('storage_effective_source_days')).length,0);
+  assert.equal(generated.expectedSchemas.primary.requiredObjects.some(x=>x.name==='typed_telemetry_owner_occurrence'),true);
+  assert.deepEqual(generated.expectedSchemas.analytics,canonical.expectedSchemas.analytics);
+  assert.deepEqual(generated.expectedSchemas.ledger,canonical.expectedSchemas.ledger);
+  assert.notEqual(generated.inputSha256.primary,canonical.inputSha256.primary);
+  assert.deepEqual(generated.inputSha256.analytics,canonical.inputSha256.analytics);
+  await assert.rejects(buildTypedProductionExpectedSchemas({workerDirectory:actualWorker,rolloutProfile:'anything'}),
+    {code:'PRODUCTION_TYPED_SCHEMA_ROLLOUT_PROFILE_INVALID'});
+});
+test('index-only rollout refuses missing or changed held catalog source',async t=>{
+  const f=await fixture(t);
+  await assert.rejects(buildTypedProductionExpectedSchemas({workerDirectory:f.root,rolloutProfile:'direct-occurrence-index-only-v1'}),
+    {code:'PRODUCTION_TYPED_SCHEMA_ROLLOUT_PROFILE_INPUT_CHANGED'});
+  await writeFile(join(f.root,'ingestion-isolation-migrations','0013_effective_dependency_day_catalog.sql'),'CREATE TABLE unwanted(id INTEGER);');
+  await assert.rejects(buildTypedProductionExpectedSchemas({workerDirectory:f.root,rolloutProfile:'direct-occurrence-index-only-v1'}),
+    {code:'PRODUCTION_TYPED_SCHEMA_ROLLOUT_PROFILE_INPUT_CHANGED'});
+});

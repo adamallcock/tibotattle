@@ -674,9 +674,38 @@ optional index retains the metadata fallback. SQLite maintains index entries
 atomically with source admission, replacement and erasure. Its production
 migration and deployment remain separate from local qualification. Building it
 scans retained typed records, consumes storage and adds a write per future typed
-record. The closed two-role operator below does not admit this new migration.
-Qualify a guarded target and exact before/after schemas before any production
-write; an index trial does not require the optional source-day catalog.
+record.
+
+The same maintained forward operator admits the index through the separate
+`direct-occurrence-forward-plan-v1` profile (`prepare --profile direct-occurrence`).
+It pins migration 0006's reviewed bytes and one primary-role target, plus all four
+Workers at predecessor `d43c8f92a059d9c577776f7eca8a331eb305b8a6`.
+Preparation uses `direct-occurrence-index-only-v1` schema expectations: exactly
+hash-pinned catalog migration 0013 is held; every other canonical/restored object
+and every analytics/deletion-ledger role remains required. Missing or altered
+catalog source bytes, or any installed catalog object, refuse this index-only
+profile. Default canonical
+preflight remains unchanged and continues to require the complete source tree.
+Do not use a general migration runner to apply the held catalog inadvertently.
+
+Before writing, require the primary to be below 8 GB (at least 1 GB beneath the
+9 GB operating cap), a verified Time Travel bookmark, exact source/schema/ledger
+and Worker configuration pins, and the owning Worker gate. The index DDL and
+custom ledger entry share one atomic request. Preserve the coordination lock and
+journal on an unknown outcome; reconcile read-only before an explicitly approved
+retry. No automatic SQL replay is permitted.
+
+After the migration receipt is verified, the scheduled rollout's `index-refresh`
+stage deploys all three lanes against the unchanged analytics schema. It binds
+the exact predecessor operation, migration receipt, bundles, resources, controls,
+schedules and resulting primary schema/ledger. Normal upload/deploy journals and
+lost-response recovery remain in force. The older two-role migration and
+`refresh-enabled` contracts retain their original source pins and targets.
+Production migration, deployment, pauses and live measurement require their
+existing explicit authorization. Rollback deploys the reviewed predecessor code
+while retaining this additive index; it does not drop data, roll schema back or
+restore an older correction-unaware writer. Measure source work, completed/current
+results and public publication independently.
 
 Analytics migration `0033_cache_retention_owner_cursor.sql` must also precede
 the new cache Worker. Its table stores a numeric position and revision for each

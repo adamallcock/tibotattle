@@ -41,6 +41,35 @@ export const EXISTING_ROLE_FORWARD_STEPS = Object.freeze([
     fixtureTables: Object.freeze(['CREATE TABLE analytics_runtime_sources(source_id TEXT PRIMARY KEY)']) }),
 ]);
 
+// A separate closed profile preserves old plans and interrupted journals.
+// It admits one additive primary index and the exact four-Worker predecessor.
+export const DIRECT_OCCURRENCE_FORWARD_SCHEMA = 'direct-occurrence-forward-plan-v1';
+export const DIRECT_OCCURRENCE_FORWARD_PREVIOUS = 'd43c8f92a059d9c577776f7eca8a331eb305b8a6';
+export const DIRECT_OCCURRENCE_FORWARD_STEPS = Object.freeze([
+  Object.freeze({ role: 'primary', binding: 'USAGE_MONITOR_DB', scheduledBinding: 'STORAGE_INGESTION_DB',
+    directory: 'typed-ingestion-migrations', name: '0006_direct_owner_occurrence.sql',
+    sha256: '30988aa2d95498000a4a6e5352551a9695f667f4cefca63cf80c5657bcb4f70f',
+    reviewedObjects: Object.freeze([
+      Object.freeze({type:'index',name:'typed_telemetry_owner_occurrence',table:'typed_telemetry_records'}),
+    ]),
+    fixtureTables: Object.freeze([
+      'CREATE TABLE typed_telemetry_records(owner_id INTEGER,occurrence_id BLOB,format INTEGER,stream TEXT,observed_day TEXT)',
+    ]) }),
+]);
+function forwardProfile(schema){
+  if(schema===EXISTING_ROLE_FORWARD_SCHEMA)return {schema,steps:EXISTING_ROLE_FORWARD_STEPS,
+    publicSource:EXISTING_ROLE_FORWARD_PREVIOUS_PUBLIC,scheduledSource:EXISTING_ROLE_FORWARD_PREVIOUS_SCHEDULED,
+    rolloutProfile:'canonical'};
+  if(schema===DIRECT_OCCURRENCE_FORWARD_SCHEMA)return {schema,steps:DIRECT_OCCURRENCE_FORWARD_STEPS,
+    publicSource:DIRECT_OCCURRENCE_FORWARD_PREVIOUS,scheduledSource:DIRECT_OCCURRENCE_FORWARD_PREVIOUS,
+    rolloutProfile:'direct-occurrence-index-only-v1'};
+  fail('PROFILE_NOT_REVIEWED');
+}
+const INVENTORY_ROLES = Object.freeze([
+  Object.freeze({role:'primary',binding:'USAGE_MONITOR_DB',scheduledBinding:'STORAGE_INGESTION_DB'}),
+  Object.freeze({role:'analytics',binding:'ANALYTICS_DB',scheduledBinding:'STORAGE_ANALYTICS_DB'}),
+]);
+
 const SHA=/^[a-f0-9]{64}$/u, COMMIT=/^[a-f0-9]{40}$/u;
 const UUID=/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u;
 const NAME=/^[A-Za-z0-9_-]{1,63}$/u;
@@ -104,15 +133,16 @@ function inspectReviewedObjects(step,sql){
   }finally{db.close();}
 }
 
-/** Inspect the two closed candidate files in a disposable SQLite database.
+/** Inspect the selected closed profile in a disposable SQLite database.
  * Each file must add exactly its reviewed object set; no SQL comes from a plan. */
-export async function loadExistingRoleForwardSteps({workerDirectory}){
+export async function loadExistingRoleForwardSteps({workerDirectory,schema=EXISTING_ROLE_FORWARD_SCHEMA}){
+  const profile=forwardProfile(schema);
   const root=resolve(workerDirectory);
   const require=createRequire(join(root,'package.json'));
   const split=require('wrangler').unstable_splitSqlQuery;
   if(typeof split!=='function')fail('SPLITTER_UNAVAILABLE');
   const output=[];
-  for(const step of EXISTING_ROLE_FORWARD_STEPS){
+  for(const step of profile.steps){
     const path=join(root,step.directory,step.name),stat=await lstat(path);
     if(!stat.isFile()||stat.nlink!==1||stat.size<1||stat.size>240*1024
       ||await realpath(path)!==path)fail('SQL_FILE_UNSAFE');
@@ -135,8 +165,8 @@ export async function loadExistingRoleForwardSteps({workerDirectory}){
   return output;
 }
 
-export function projectExistingRoleSchema(rows,step){
-  const reviewed=EXISTING_ROLE_FORWARD_STEPS.find(value=>value.role===step?.role
+export function projectExistingRoleSchema(rows,step,schema=EXISTING_ROLE_FORWARD_SCHEMA){
+  const reviewed=forwardProfile(schema).steps.find(value=>value.role===step?.role
     &&value.name===step?.name&&value.sha256===step?.sha256);
   if(!reviewed||!validRows(rows)||!Array.isArray(step.addedObjects)
     ||typeof step.sql!=='string'||storageSha256(step.sql)!==reviewed.sha256
@@ -154,7 +184,8 @@ export function projectExistingRoleSchema(rows,step){
   return {rows:projected,beforeSha256:storageSchemaDigest(rows),afterSha256:storageSchemaDigest(projected)};
 }
 
-export function validateExistingRoleInventory({accountId,publicWorker,scheduledWorkers}){
+export function validateExistingRoleInventory({accountId,publicWorker,scheduledWorkers,schema=EXISTING_ROLE_FORWARD_SCHEMA}){
+  const profile=forwardProfile(schema);
   if(!/^[a-f0-9]{32}$/u.test(accountId??'')||!object(publicWorker)
     ||!Array.isArray(scheduledWorkers)||scheduledWorkers.length!==3)fail('INVENTORY_INVALID');
   const workers=[publicWorker,...scheduledWorkers];
@@ -163,10 +194,10 @@ export function validateExistingRoleInventory({accountId,publicWorker,scheduledW
     if(worker?.schema!==(index===0?'production-live-config-v1':'existing-role-scheduled-inventory-v1')||worker.accountId!==accountId
       ||!NAME.test(worker.workerName??'')||!UUID.test(worker.versionId??'')
       ||!SHA.test(worker.fingerprint??'')
-      ||worker.sourceCommit!==(index===0?EXISTING_ROLE_FORWARD_PREVIOUS_PUBLIC:EXISTING_ROLE_FORWARD_PREVIOUS_SCHEDULED)
+      ||worker.sourceCommit!==(index===0?profile.publicSource:profile.scheduledSource)
       ||!Array.isArray(worker.bindings))fail('INVENTORY_INVALID');
     const bindings={};
-    for(const step of EXISTING_ROLE_FORWARD_STEPS){
+    for(const step of INVENTORY_ROLES){
       const name=index===0?step.binding:step.scheduledBinding;
       const matches=worker.bindings.filter(binding=>binding.name===name);
       if(matches.length!==1||matches[0].type!=='d1'||!UUID.test(matches[0].database_id??''))fail('BINDING_INVALID');
@@ -181,7 +212,8 @@ export function validateExistingRoleInventory({accountId,publicWorker,scheduledW
   return pins;
 }
 
-export function normalizeScheduledInventory(raw){
+export function normalizeScheduledInventory(raw,{schema=EXISTING_ROLE_FORWARD_SCHEMA}={}){
+  const profile=forwardProfile(schema);
   const bindings=raw?.version?.resources?.bindings;
   if(!/^[a-f0-9]{32}$/u.test(raw?.accountId??'')||!NAME.test(raw?.workerName??'')
     ||!UUID.test(raw?.version?.id??'')||!Array.isArray(bindings)
@@ -191,7 +223,7 @@ export function normalizeScheduledInventory(raw){
     ||!Array.isArray(raw.namespaces))fail('SCHEDULED_INVENTORY_INVALID');
   const sources=bindings.filter(row=>row?.name==='DEPLOYMENT_SOURCE_COMMIT');
   if(sources.length!==1||sources[0].type!=='plain_text'
-    ||sources[0].text!==EXISTING_ROLE_FORWARD_PREVIOUS_SCHEDULED)fail('SCHEDULED_SOURCE_DRIFT');
+    ||sources[0].text!==profile.scheduledSource)fail('SCHEDULED_SOURCE_DRIFT');
   const normalizedBindings=bindings.map(row=>{
     if(!object(row)||typeof row.name!=='string'||typeof row.type!=='string')
       fail('SCHEDULED_BINDING_INVALID');
@@ -212,7 +244,8 @@ export function normalizeScheduledInventory(raw){
     sourceCommit:sources[0].text,bindings:normalizedBindings,fingerprint};
 }
 
-function validateControls(controls){
+function validateControls(controls,schema=EXISTING_ROLE_FORWARD_SCHEMA){
+  forwardProfile(schema);
   if(!exact(controls,['collection','correction'])
     ||!exact(controls.collection,['schema_version','control_state','revision','enrollment_enabled',
       'upload_registration_enabled','processing_enabled','publication_enabled'])
@@ -241,31 +274,33 @@ function validateInspection(inspection,step,pin){
  * pinned Wrangler/Cloudflare readers; tests inject deterministic observations. */
 export async function prepareExistingRoleForwardPlan({workerDirectory,repositoryRoot,accountId,
   candidateSourceCommit,publicWorker,scheduledWorkers,sourceNamespace,wranglerSha256,
-  readOnly,now=Date.now(),expiresAt}={}){
+  readOnly,now=Date.now(),expiresAt,schema=EXISTING_ROLE_FORWARD_SCHEMA}={}){
+  const profile=forwardProfile(schema);
   if(!readOnly||typeof readOnly.inspect!=='function'||typeof readOnly.query!=='function'
     ||typeof readOnly.controls!=='function'||typeof readOnly.backup!=='function'
     ||typeof sourceNamespace!=='string'||!/^[A-Za-z0-9_.:-]{1,256}$/u.test(sourceNamespace)
     ||!SHA.test(wranglerSha256??'')||readOnly.wranglerSha256!==wranglerSha256)
     fail('PREPARE_INPUT_INVALID');
   if(!COMMIT.test(candidateSourceCommit??'')
-    ||candidateSourceCommit===EXISTING_ROLE_FORWARD_PREVIOUS_PUBLIC)fail('CANDIDATE_INVALID');
+    ||candidateSourceCommit===profile.publicSource)fail('CANDIDATE_INVALID');
   await validateCheckoutPaths(repositoryRoot,workerDirectory);
   assertCleanSource(repositoryRoot,candidateSourceCommit);
-  const steps=await loadExistingRoleForwardSteps({workerDirectory});
-  const expected=await buildTypedProductionExpectedSchemas({workerDirectory});
-  const pins=validateExistingRoleInventory({accountId,publicWorker,scheduledWorkers});
+  const steps=await loadExistingRoleForwardSteps({workerDirectory,schema});
+  const expected=await buildTypedProductionExpectedSchemas({workerDirectory,rolloutProfile:profile.rolloutProfile});
+  const pins=validateExistingRoleInventory({accountId,publicWorker,scheduledWorkers,schema});
   const controls=await readOnly.controls(pins[0].bindings.primary);
-  validateControls(controls);
+  validateControls(controls,schema);
   const targets=[];
   const projected=new Map();
   for(const step of steps){
     const databaseId=pins[0].bindings[step.role];
     const before=validateInspection(await readOnly.inspect({step,databaseId}),step,pins[0]);
-    const schema=projectExistingRoleSchema(before.schemaRows,step);
-    projected.set(step.binding,schema.rows);
+    const projection=projectExistingRoleSchema(before.schemaRows,step,schema);
+    if(schema===DIRECT_OCCURRENCE_FORWARD_SCHEMA&&before.bytes>=8_000_000_000)fail('INDEX_CAPACITY_RESERVE_INSUFFICIENT');
+    projected.set(step.binding,projection.rows);
     targets.push({role:step.role,binding:step.binding,name:before.name,databaseId,
       migrationName:step.name,migrationSha256:step.sha256,
-      beforeSchemaSha256:schema.beforeSha256,afterSchemaSha256:schema.afterSha256,
+      beforeSchemaSha256:projection.beforeSha256,afterSchemaSha256:projection.afterSha256,
       beforeLedger:before.ledger,controlInvariantSha256:before.controlInvariantSha256,
       beforeBytes:before.bytes});
   }
@@ -282,11 +317,11 @@ export async function prepareExistingRoleForwardPlan({workerDirectory,repository
   if(backup?.schema!=='typed-forward-backup-receipt-v2'
     ||backup.provider!=='cloudflare-d1-time-travel'
     ||!SHA.test(backup.receiptSha256??'')
-    ||!Array.isArray(backup.targetBookmarks)||backup.targetBookmarks.length!==2)fail('BACKUP_INVALID');
-  const plan={schema:EXISTING_ROLE_FORWARD_SCHEMA,operationId:randomUUID(),environment:'production',
+    ||!Array.isArray(backup.targetBookmarks)||backup.targetBookmarks.length!==steps.length)fail('BACKUP_INVALID');
+  const plan={schema,operationId:randomUUID(),environment:'production',
     accountId,sourceCommit:candidateSourceCommit,
-    previousPublicSourceCommit:EXISTING_ROLE_FORWARD_PREVIOUS_PUBLIC,
-    previousScheduledSourceCommit:EXISTING_ROLE_FORWARD_PREVIOUS_SCHEDULED,
+    previousPublicSourceCommit:profile.publicSource,
+    previousScheduledSourceCommit:profile.scheduledSource,
     createdAt:new Date(now).toISOString(),expiresAt,sourceNamespace,wranglerSha256,
     workerPins:pins,expectedInputSha256:expected.inputSha256,
     controlsSha256:identityDigest(controls),projectedPreflightSha256:identityDigest(preflight),
@@ -296,15 +331,18 @@ export async function prepareExistingRoleForwardPlan({workerDirectory,repository
 }
 
 function validatePlan(plan,steps,expected,now,allowExpired=false){
+  const profile=forwardProfile(plan?.schema);
+  if(!same(steps.map(({role,name,sha256})=>({role,name,sha256})),
+    profile.steps.map(({role,name,sha256})=>({role,name,sha256}))))fail('PROFILE_STEP_CHANGED');
   if(!exact(plan,['schema','operationId','environment','accountId','sourceCommit',
     'previousPublicSourceCommit','previousScheduledSourceCommit','createdAt','expiresAt',
     'sourceNamespace','wranglerSha256','workerPins','expectedInputSha256','controlsSha256',
     'projectedPreflightSha256','backup','targets'])
-    ||plan.schema!==EXISTING_ROLE_FORWARD_SCHEMA||plan.environment!=='production'
+    ||plan.schema!==profile.schema||plan.environment!=='production'
     ||!UUID.test(plan.operationId??'')||!/^[a-f0-9]{32}$/u.test(plan.accountId??'')
     ||!COMMIT.test(plan.sourceCommit??'')
-    ||plan.previousPublicSourceCommit!==EXISTING_ROLE_FORWARD_PREVIOUS_PUBLIC
-    ||plan.previousScheduledSourceCommit!==EXISTING_ROLE_FORWARD_PREVIOUS_SCHEDULED
+    ||plan.previousPublicSourceCommit!==profile.publicSource
+    ||plan.previousScheduledSourceCommit!==profile.scheduledSource
     ||!date(plan.createdAt)||!date(plan.expiresAt)
     ||Date.parse(plan.createdAt)>now||Date.parse(plan.expiresAt)<=Date.parse(plan.createdAt)
     ||Date.parse(plan.expiresAt)-Date.parse(plan.createdAt)>86_400_000
@@ -315,14 +353,14 @@ function validatePlan(plan,steps,expected,now,allowExpired=false){
     ||!/^[A-Za-z0-9_.:-]{1,256}$/u.test(plan.sourceNamespace)
     ||!SHA.test(plan.wranglerSha256??'')
     ||!same(plan.expectedInputSha256,expected.inputSha256)
-    ||!Array.isArray(plan.targets)||plan.targets.length!==2)fail('PLAN_INVALID');
+    ||!Array.isArray(plan.targets)||plan.targets.length!==steps.length)fail('PLAN_INVALID');
   if(!exact(plan.backup,['schema','provider','capturedAt','expiresAt','targetsSha256',
       'targetBookmarks','receiptSha256'])
     ||plan.backup.schema!=='typed-forward-backup-receipt-v2'
     ||plan.backup.provider!=='cloudflare-d1-time-travel'
     ||!date(plan.backup.capturedAt)||!date(plan.backup.expiresAt)
     ||Date.parse(plan.backup.expiresAt)<Date.parse(plan.expiresAt)
-    ||!Array.isArray(plan.backup.targetBookmarks)||plan.backup.targetBookmarks.length!==2
+    ||!Array.isArray(plan.backup.targetBookmarks)||plan.backup.targetBookmarks.length!==steps.length
     ||!SHA.test(plan.backup.receiptSha256??'')
     ||identityDigest(Object.fromEntries(Object.entries(plan.backup)
       .filter(([key])=>key!=='receiptSha256')))!==plan.backup.receiptSha256)fail('PLAN_BACKUP_INVALID');
@@ -331,7 +369,7 @@ function validatePlan(plan,steps,expected,now,allowExpired=false){
     if(!exact(worker,['workerName','versionId','sourceCommit','fingerprint','bindings'])
       ||!NAME.test(worker.workerName??'')||!UUID.test(worker.versionId??'')
       ||!SHA.test(worker.fingerprint??'')
-      ||worker.sourceCommit!==(index===0?EXISTING_ROLE_FORWARD_PREVIOUS_PUBLIC:EXISTING_ROLE_FORWARD_PREVIOUS_SCHEDULED)
+      ||worker.sourceCommit!==(index===0?profile.publicSource:profile.scheduledSource)
       ||!exact(worker.bindings,['primary','analytics'])
       ||!UUID.test(worker.bindings.primary??'')||!UUID.test(worker.bindings.analytics??'')
       ||worker.bindings.primary!==plan.workerPins[0].bindings.primary
@@ -348,7 +386,7 @@ function validatePlan(plan,steps,expected,now,allowExpired=false){
       ||!SHA.test(target.beforeSchemaSha256??'')||!SHA.test(target.afterSchemaSha256??'')
       ||!SHA.test(target.controlInvariantSha256??'')||!validLedger(target.beforeLedger)
       ||!Number.isSafeInteger(target.beforeBytes)||target.beforeBytes<0
-      ||target.beforeBytes>=9_000_000_000
+      ||target.beforeBytes>=(profile.schema===DIRECT_OCCURRENCE_FORWARD_SCHEMA?8_000_000_000:9_000_000_000)
       ||typeof target.name!=='string'||!/^[a-z][a-z0-9-]{2,95}$/u.test(target.name)
       ||target.databaseId!==plan.workerPins[0].bindings[step.role]
       ||target.beforeLedger.some(row=>row.name===step.name))fail('PLAN_INVALID');
@@ -394,21 +432,21 @@ function validateReceiptContent(plan,receipt){
 
 /** Consumers must also pin the raw private receipt/plan file hashes. */
 export function verifyExistingRoleForwardReceipt({plan,receipt,operation}){
-  validatePlan(plan,EXISTING_ROLE_FORWARD_STEPS,{inputSha256:plan?.expectedInputSha256},Date.now(),true);
+  validatePlan(plan,forwardProfile(plan?.schema).steps,{inputSha256:plan?.expectedInputSha256},Date.now(),true);
   validateReceiptContent(plan,receipt);
   if(!exact(operation,['schema','kind','binding','id','createdAt','updatedAt','state'])
     ||operation.schema!==1||operation.kind!=='production'
     ||operation.binding!==identityDigest(plan)
     ||!exact(operation.state,['status','owner','nextRole','lastFailure'])
-    ||operation.state.status!=='complete'||operation.state.nextRole!==2
+    ||operation.state.status!=='complete'||operation.state.nextRole!==plan.targets.length
     ||operation.state.lastFailure!==null||!COMMIT.test(operation.state.owner??''))
     fail('OPERATION_NOT_COMPLETE');
   return {status:'verified',planSha256:identityDigest(plan),receiptSha256:receipt.receiptSha256};
 }
 
 /** One reviewed migration plus its operator ledger row in one D1 request. */
-export function existingRoleAtomicSql(step){
-  if(!EXISTING_ROLE_FORWARD_STEPS.some(value=>value.role===step?.role
+export function existingRoleAtomicSql(step,schema=EXISTING_ROLE_FORWARD_SCHEMA){
+  if(!forwardProfile(schema).steps.some(value=>value.role===step?.role
       &&value.name===step.name&&value.sha256===step.sha256)
     ||typeof step.sql!=='string'||storageSha256(step.sql)!==step.sha256)fail('STEP_INVALID');
   return `${step.sql.trim()}\nINSERT INTO d1_storage_migrations(name,sha256) VALUES('${step.name}','${step.sha256}');\n`;
@@ -418,7 +456,8 @@ export function existingRoleAtomicSql(step){
  * the maintained pinned Wrangler query adapter, never this REST reader. */
 export function createExistingRoleProductionAdapter({accountId,publicWorkerName,
   scheduledWorkerNames,operationDirectory,cliPath,wranglerSha256,sourceNamespace,
-  environment=process.env,fetchImpl=globalThis.fetch}={}){
+  environment=process.env,fetchImpl=globalThis.fetch,schema=EXISTING_ROLE_FORWARD_SCHEMA}={}){
+  const profile=forwardProfile(schema);
   if(!/^[a-f0-9]{32}$/u.test(accountId??'')||!NAME.test(publicWorkerName??'')
     ||!Array.isArray(scheduledWorkerNames)||scheduledWorkerNames.length!==3
     ||scheduledWorkerNames.some(name=>!NAME.test(name))
@@ -460,9 +499,9 @@ export function createExistingRoleProductionAdapter({accountId,publicWorkerName,
     const raw=[];
     for(const provider of providers)raw.push(await provider.capture());
     const snapshots=[createProductionLiveConfigSnapshot(raw[0]),
-      ...raw.slice(1).map(normalizeScheduledInventory)];
+      ...raw.slice(1).map(value=>normalizeScheduledInventory(value,{schema}))];
     const current=validateExistingRoleInventory({accountId,publicWorker:snapshots[0],
-      scheduledWorkers:snapshots.slice(1)});
+      scheduledWorkers:snapshots.slice(1),schema});
     rawPublic=raw[0];pins=current;
     return {publicWorker:snapshots[0],scheduledWorkers:snapshots.slice(1),pins:current};
   };
@@ -491,11 +530,11 @@ export function createExistingRoleProductionAdapter({accountId,publicWorkerName,
     const correction=await fixedRows(databaseId,CONTROL_SQL.correction);
     if(collection.length!==1||correction.length!==1)fail('ACTIVE_RUNTIME_DRIFT');
     const result={collection:collection[0],correction:correction[0]};
-    validateControls(result);return result;
+    validateControls(result,schema);return result;
   };
   const inspect=async input=>{
     const step=input.step??input,role=step.role,databaseId=input.databaseId;
-    if(!EXISTING_ROLE_FORWARD_STEPS.some(value=>value.role===role)
+    if(!profile.steps.some(value=>value.role===role)
       ||(await ensurePins())[0].bindings[role]!==databaseId)fail('TARGET_INVALID');
     const [schemaRows,ledgerSchema,ledger,info]=await Promise.all([
       fixedRows(databaseId,CONTROL_SQL.schema),fixedRows(databaseId,CONTROL_SQL.ledgerSchema),
@@ -569,8 +608,9 @@ export async function runExistingRoleForwardMigration({plan,workerDirectory,repo
   reconcileOnly=false,approvedReconciliationSha256=null,retryConfirmation=null,
   adapterFactory,lockFactory=()=>createProductionDeploymentLock({repositoryRoot}),now=Date.now()}={}){
   await validateCheckoutPaths(repositoryRoot,workerDirectory);
-  const steps=await loadExistingRoleForwardSteps({workerDirectory});
-  const expected=await buildTypedProductionExpectedSchemas({workerDirectory});
+  const profile=forwardProfile(plan?.schema),schema=profile.schema;
+  const steps=await loadExistingRoleForwardSteps({workerDirectory,schema});
+  const expected=await buildTypedProductionExpectedSchemas({workerDirectory,rolloutProfile:profile.rolloutProfile});
   const planSha256=validatePlan(plan,steps,expected,now,resume&&(execute||reconcileOnly));
   assertCleanSource(repositoryRoot,plan.sourceCommit);
   if(reconcileOnly&&!resume)fail('RECONCILE_REQUIRES_RESUME');
@@ -585,7 +625,7 @@ export async function runExistingRoleForwardMigration({plan,workerDirectory,repo
       if(!exact(state,['status','owner','nextRole','lastFailure'])
         ||!['lock_intent','running','uncertain','release_intent','complete'].includes(state.status)
         ||(state.owner!==null&&!COMMIT.test(state.owner))
-        ||!Number.isSafeInteger(state.nextRole)||state.nextRole<0||state.nextRole>2)fail('JOURNAL_INVALID');
+        ||!Number.isSafeInteger(state.nextRole)||state.nextRole<0||state.nextRole>steps.length)fail('JOURNAL_INVALID');
     }else{
       state={status:'lock_intent',owner:null,nextRole:0,lastFailure:null};
       await operation.save(state);
@@ -602,7 +642,7 @@ export async function runExistingRoleForwardMigration({plan,workerDirectory,repo
     const verifyCurrent=async({allowExpired=false}={})=>{
       if(!same(await adapter.workerPins(),plan.workerPins))fail('WORKER_INVENTORY_DRIFT');
       const controls=await adapter.controls();
-      validateControls(controls);
+      validateControls(controls,schema);
       if(identityDigest(controls)!==plan.controlsSha256)fail('ACTIVE_RUNTIME_DRIFT');
       await adapter.verifyBackup(plan.backup,plan.targets,{allowExpired});
     };
@@ -681,7 +721,7 @@ export async function runExistingRoleForwardMigration({plan,workerDirectory,repo
       await verifyCurrent();
       assertCleanSource(repositoryRoot,plan.sourceCommit);
       if(Date.parse(plan.expiresAt)<=Date.now())fail('APPROVAL_EXPIRED');
-      const sql=existingRoleAtomicSql(step);
+      const sql=existingRoleAtomicSql(step,schema);
       state={...state,status:'uncertain',nextRole:index,lastFailure:null};
       await operation.save(state);
       await lock.assertOwned(state.owner);
@@ -730,13 +770,14 @@ export function parseExistingRoleForwardArguments(argv){
   }
   const modes=['prepare','inspect','execute','reconcile'];
   const mode=flags.get('--mode');
+  if(flags.has('--profile')&&flags.get('--profile')!=='direct-occurrence')fail('ARGUMENTS');
   if(!modes.includes(mode))fail('ARGUMENTS');
   const common=['--mode','--repository-root','--operation-directory'];
   const prepared=['--account-id','--public-worker','--scheduled-workers',
     '--source-namespace','--candidate-source-commit','--expires-at','--cli-path','--wrangler-sha256'];
   const execute=['--cli-path','--wrangler-sha256','--approved-plan-sha256',
     '--confirmation','--resume','--approved-reconciliation-sha256','--retry-confirmation'];
-  const allowed=new Set([...common,...(mode==='prepare'?prepared:mode==='inspect'?[]:execute)]);
+  const allowed=new Set([...common,...(mode==='prepare'?[...prepared,'--profile']:mode==='inspect'?[]:execute)]);
   if([...flags.keys()].some(key=>!allowed.has(key))
     ||common.some(key=>!flags.has(key))
     ||(mode==='prepare'&&prepared.some(key=>!flags.has(key)))
@@ -772,6 +813,7 @@ async function main(){
   const workerDirectory=join(repositoryRoot,'apps','worker');
   const operationDirectory=resolve(options.operation_directory);
   await validateCheckoutPaths(repositoryRoot,workerDirectory);
+  const schema=options.profile==='direct-occurrence'?DIRECT_OCCURRENCE_FORWARD_SCHEMA:EXISTING_ROLE_FORWARD_SCHEMA;
   if(options.mode==='prepare'){
     await mkdir(operationDirectory,{recursive:true,mode:0o700});
     const directory=await lstat(operationDirectory);
@@ -782,14 +824,14 @@ async function main(){
     const adapter=createExistingRoleProductionAdapter({accountId:options.account_id,
       publicWorkerName:options.public_worker,scheduledWorkerNames,operationDirectory,
       cliPath:options.cli_path,wranglerSha256:options.wrangler_sha256,
-      sourceNamespace:options.source_namespace});
+      sourceNamespace:options.source_namespace,schema});
     const inventory=await adapter.captureWorkers();
     const plan=await prepareExistingRoleForwardPlan({workerDirectory,repositoryRoot,
       accountId:options.account_id,candidateSourceCommit:options.candidate_source_commit,
       publicWorker:inventory.publicWorker,scheduledWorkers:inventory.scheduledWorkers,
       sourceNamespace:options.source_namespace,wranglerSha256:options.wrangler_sha256,
       readOnly:adapter,
-      expiresAt:options.expires_at});
+      expiresAt:options.expires_at,schema});
     await writePrivateJsonNoClobber(join(operationDirectory,'plan.json'),plan);
     process.stdout.write(`${JSON.stringify({status:'prepared',planSha256:identityDigest(plan),remoteWrites:false})}\n`);
     return;
@@ -801,7 +843,7 @@ async function main(){
     accountId:plan.accountId,publicWorkerName:plan.workerPins[0].workerName,
     scheduledWorkerNames:plan.workerPins.slice(1).map(worker=>worker.workerName),
     operationDirectory,cliPath:options.cli_path,wranglerSha256:options.wrangler_sha256,
-    sourceNamespace:plan.sourceNamespace});
+    sourceNamespace:plan.sourceNamespace,schema:plan.schema});
   const result=await runExistingRoleForwardMigration({plan,workerDirectory,repositoryRoot,
     operationDirectory,execute:options.mode==='execute',resume:options.resume==='yes'
       ||options.mode==='reconcile',reconcileOnly:options.mode==='reconcile',

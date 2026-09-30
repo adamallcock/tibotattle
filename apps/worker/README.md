@@ -265,6 +265,12 @@ removed entries follow native erasure. It copies no payload, creates no cache or
 new work queue, and does not select authority. Without this optional migration,
 the metadata/format-index lookup remains available. It can be deployed without
 the source-day catalog; each migration and deployment is a separate operation.
+The guarded forward operator's `direct-occurrence` preparation profile and the
+scheduled rollout's `index-refresh` stage bind a single index migration to its
+exact production predecessor and verified receipt. The index-only schema profile
+holds the separately reviewed catalog, preserves all other schema requirements,
+and refuses partial or changed catalog state. Default canonical preflight still
+qualifies the complete migration tree.
 Building the index scans existing typed records, adds storage and adds an index
 write per future typed record. Measure those costs and qualify the guarded
 forward operation before production migration; local savings are not evidence

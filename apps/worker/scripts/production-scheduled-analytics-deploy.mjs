@@ -6,7 +6,8 @@ import { identityDigest, openOperation, readOperation, operationError } from '..
 import { createProductionDeploymentLock } from './production-deployment-lock.mjs';
 import { createMaintenanceTransport } from './production-maintenance-transport.mjs';
 import { storageSchemaDigest } from './d1-storage-plan.mjs';
-import { loadExistingRoleForwardSteps, verifyExistingRoleForwardReceipt } from './existing-role-forward-migration.mjs';
+import { DIRECT_OCCURRENCE_FORWARD_SCHEMA, DIRECT_OCCURRENCE_FORWARD_PREVIOUS,
+  loadExistingRoleForwardSteps, verifyExistingRoleForwardReceipt } from './existing-role-forward-migration.mjs';
 
 const ROLES = ['analytics', 'publication', 'cache'];
 const REFRESH_PREVIOUS_SOURCE = '3216e2258830841c37f17c1a0b7d8703e0a72293';
@@ -14,16 +15,16 @@ const REFRESH_PREVIOUS_STAGES = { analytics: 'model-batches', publication: 'shar
 const FILES = { analytics: 'storage-analytics-worker.js', publication: 'storage-publication-worker.js', cache: 'cache-retention-day-worker.js' };
 const ROLE_NAMES = { analytics: /^tibotattle-analytics-[a-z0-9-]+$/, publication: /^tibotattle-publication-[a-z0-9-]+$/, cache: /^tibotattle-cache-retention-[a-z0-9-]+$/ };
 const FLAGS = { analytics: ['STORAGE_ANALYTICS_SHARED_FEATURES', 'STORAGE_ANALYTICS_MODEL_BLOCKS'], publication: ['STORAGE_ANALYTICS_SHARED_FEATURES', 'STORAGE_ANALYTICS_MODEL_BLOCKS'], cache: ['CACHE_RETENTION_SHARED_FEATURES'] };
-const STAGES = { 'deploy-disabled': ROLES, 'refresh-enabled': ROLES, 'shared-publication': ['publication'], 'shared-cache': ['cache'], 'shared-graph': ['analytics'], 'model-batches': ['analytics'],
+const STAGES = { 'deploy-disabled': ROLES, 'refresh-enabled': ROLES, 'index-refresh': ROLES, 'shared-publication': ['publication'], 'shared-cache': ['cache'], 'shared-graph': ['analytics'], 'model-batches': ['analytics'],
   'disable-publication': ['publication'], 'disable-cache': ['cache'], 'disable-graph': ['analytics'], 'disable-model': ['analytics'] };
 const SHA = /^[a-f0-9]{64}$/, COMMIT = /^[a-f0-9]{40}$/, UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const fail = code => { throw operationError(`SCHEDULED_ANALYTICS_${code}`); };
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const keys = (value, expected) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).sort().join() === expected.slice().sort().join();
 const requiredFlags = stage => ({
-  analytics: { STORAGE_ANALYTICS_SHARED_FEATURES: ['refresh-enabled','shared-graph','model-batches','disable-model'].includes(stage) ? 'enabled' : 'disabled', STORAGE_ANALYTICS_MODEL_BLOCKS: ['refresh-enabled','model-batches'].includes(stage) ? 'enabled' : 'disabled' },
-  publication: { STORAGE_ANALYTICS_SHARED_FEATURES: ['refresh-enabled','shared-publication'].includes(stage) ? 'enabled' : 'disabled', STORAGE_ANALYTICS_MODEL_BLOCKS: 'disabled' },
-  cache: { CACHE_RETENTION_SHARED_FEATURES: ['refresh-enabled','shared-cache'].includes(stage) ? 'enabled' : 'disabled' },
+  analytics: { STORAGE_ANALYTICS_SHARED_FEATURES: ['refresh-enabled','index-refresh','shared-graph','model-batches','disable-model'].includes(stage) ? 'enabled' : 'disabled', STORAGE_ANALYTICS_MODEL_BLOCKS: ['refresh-enabled','index-refresh','model-batches'].includes(stage) ? 'enabled' : 'disabled' },
+  publication: { STORAGE_ANALYTICS_SHARED_FEATURES: ['refresh-enabled','index-refresh','shared-publication'].includes(stage) ? 'enabled' : 'disabled', STORAGE_ANALYTICS_MODEL_BLOCKS: 'disabled' },
+  cache: { CACHE_RETENTION_SHARED_FEATURES: ['refresh-enabled','index-refresh','shared-cache'].includes(stage) ? 'enabled' : 'disabled' },
 });
 const withoutMutableVars = vars => Object.fromEntries(Object.entries(vars).filter(([name]) => name !== 'DEPLOYMENT_SOURCE_COMMIT' && !Object.values(FLAGS).some(list => list.includes(name))));
 const bindingId = binding => binding.id ?? binding.database_id;
@@ -44,7 +45,8 @@ async function safeFile(path, limit = 8 * 1024 * 1024) {
 }
 
 export function validateScheduledAnalyticsPlan(plan, now = Date.now(), allowExpired = false) {
-  const refresh = plan?.stage === 'refresh-enabled';
+  const direct = plan?.stage === 'index-refresh';
+  const refresh = direct || plan?.stage === 'refresh-enabled';
   if (!keys(plan, ['schema','createdAt','expiresAt','stage','candidateSourceCommit','previousSourceCommit','accountId','wranglerSha256','packageManifestSha256','database','disabledOperation','roles',...(refresh ? ['forwardMigration'] : [])])
     || plan.schema !== 'scheduled-analytics-rollout-v1' || !Object.hasOwn(STAGES,plan.stage)
     || !COMMIT.test(plan.candidateSourceCommit) || !COMMIT.test(plan.previousSourceCommit)
@@ -52,9 +54,9 @@ export function validateScheduledAnalyticsPlan(plan, now = Date.now(), allowExpi
     || !Number.isFinite(Date.parse(plan.createdAt)) || !Number.isFinite(Date.parse(plan.expiresAt))
     || Date.parse(plan.createdAt) > now || (!allowExpired && Date.parse(plan.expiresAt) <= now)
     || Date.parse(plan.expiresAt) - Date.parse(plan.createdAt) > 86_400_000
-    || (['deploy-disabled','refresh-enabled'].includes(plan.stage) ? plan.disabledOperation !== null : typeof plan.disabledOperation !== 'string')
-    || refresh && (plan.previousSourceCommit !== REFRESH_PREVIOUS_SOURCE
-      || plan.candidateSourceCommit === REFRESH_PREVIOUS_SOURCE
+    || (['deploy-disabled','refresh-enabled','index-refresh'].includes(plan.stage) ? plan.disabledOperation !== null : typeof plan.disabledOperation !== 'string')
+    || refresh && (plan.previousSourceCommit !== (direct?DIRECT_OCCURRENCE_FORWARD_PREVIOUS:REFRESH_PREVIOUS_SOURCE)
+      || plan.candidateSourceCommit === (direct?DIRECT_OCCURRENCE_FORWARD_PREVIOUS:REFRESH_PREVIOUS_SOURCE)
       || !keys(plan.forwardMigration,['operationDirectory','planSha256','receiptSha256'])
       || typeof plan.forwardMigration.operationDirectory !== 'string'
       || resolve(plan.forwardMigration.operationDirectory)!==plan.forwardMigration.operationDirectory
@@ -128,7 +130,7 @@ async function verifyPackage(plan, packageRoot) {
       || JSON.stringify({...base,vars:{...base.vars,...Object.fromEntries(FLAGS[role.role].map(k=>[k,config.vars[k]]))}})!==JSON.stringify(config))fail('CONFIG_INVALID');
     const expected=requiredFlags(plan.stage)[role.role];
     if(STAGES[plan.stage].includes(role.role) && Object.entries(expected).some(([k,v])=>config.vars[k]!==v))fail('CONTROL_STAGE_INVALID');
-    if(plan.stage==='refresh-enabled'&&role.role==='cache'&&config.vars.CACHE_RETENTION_BUILD!=='enabled')fail('CONTROL_STAGE_INVALID');
+    if(['refresh-enabled','index-refresh'].includes(plan.stage)&&role.role==='cache'&&config.vars.CACHE_RETENTION_BUILD!=='enabled')fail('CONTROL_STAGE_INVALID');
     if(!Array.isArray(config.d1_databases)||config.d1_databases.length!==role.d1Bindings.length
       ||role.d1Bindings.some(x=>!config.d1_databases.some(y=>y.binding===x.binding&&y.database_id===x.databaseId)))fail('DATABASE_BINDING_CHANGED');
   }
@@ -140,7 +142,8 @@ async function verifyPackage(plan, packageRoot) {
  * pinned by raw file hashes; the migration operator validates its contents
  * and completed journal rather than trusting a file's mere presence. */
 async function verifyForwardMigrationProof(plan){
-  if(plan.stage!=='refresh-enabled')return null;
+  if(!['refresh-enabled','index-refresh'].includes(plan.stage))return null;
+  const direct=plan.stage==='index-refresh';
   const pin=plan.forwardMigration;
   let migration,receipt,operation;
   try{
@@ -153,22 +156,24 @@ async function verifyForwardMigrationProof(plan){
   }catch{fail('MIGRATION_PROOF_INVALID');}
   const primary=migration.targets.find(item=>item.role==='primary');
   const analytics=migration.targets.find(item=>item.role==='analytics');
-  const reviewedSteps=await loadExistingRoleForwardSteps({workerDirectory:join(dirname(fileURLToPath(import.meta.url)),'..')});
+  const reviewedSteps=await loadExistingRoleForwardSteps({workerDirectory:join(dirname(fileURLToPath(import.meta.url)),'..'),
+    ...(direct?{schema:DIRECT_OCCURRENCE_FORWARD_SCHEMA}:{})});
   if(migration.accountId!==plan.accountId||migration.sourceCommit!==plan.candidateSourceCommit
-    ||migration.previousScheduledSourceCommit!==REFRESH_PREVIOUS_SOURCE
+    ||migration.previousScheduledSourceCommit!==(direct?DIRECT_OCCURRENCE_FORWARD_PREVIOUS:REFRESH_PREVIOUS_SOURCE)
     ||primary?.migrationName!==reviewedSteps[0]?.name
     ||primary?.migrationSha256!==reviewedSteps[0]?.sha256
-    ||analytics?.migrationName!==reviewedSteps[1]?.name
-    ||analytics?.migrationSha256!==reviewedSteps[1]?.sha256
-    ||analytics.databaseId!==plan.database.id
-    ||analytics.migrationSha256!==plan.database.migrations.at(-1)?.sha256
-    ||analytics.afterSchemaSha256!==plan.database.schemaSha256)fail('MIGRATION_PROOF_MISMATCH');
+    ||(direct?(migration.schema!==DIRECT_OCCURRENCE_FORWARD_SCHEMA||migration.targets.length!==1):
+      (analytics?.migrationName!==reviewedSteps[1]?.name
+        ||analytics?.migrationSha256!==reviewedSteps[1]?.sha256
+        ||analytics.databaseId!==plan.database.id
+        ||analytics.migrationSha256!==plan.database.migrations.at(-1)?.sha256
+        ||analytics.afterSchemaSha256!==plan.database.schemaSha256)))fail('MIGRATION_PROOF_MISMATCH');
   for(const [index,role] of plan.roles.entries()){
     const pin=migration.workerPins[index+1];
     if(pin?.workerName!==role.name||pin.versionId!==role.predecessor.versionId
       ||pin.sourceCommit!==role.predecessor.sourceCommit
       ||role.d1Bindings.find(item=>item.binding==='STORAGE_INGESTION_DB')?.databaseId!==primary.databaseId
-      ||role.d1Bindings.find(item=>item.binding==='STORAGE_ANALYTICS_DB')?.databaseId!==analytics.databaseId)
+      ||role.d1Bindings.find(item=>item.binding==='STORAGE_ANALYTICS_DB')?.databaseId!==(direct?migration.workerPins[0].bindings.analytics:analytics.databaseId))
       fail('MIGRATION_PROOF_MISMATCH');
   }
   return {id:primary.databaseId,schemaSha256:primary.afterSchemaSha256,
@@ -254,7 +259,7 @@ function verifyPendingUploadPredecessor(role,snapshot,predecessorVersion,uploade
 
 function stagePrerequisites(stage,snapshots,source){
   if(stage==='deploy-disabled')return;
-  if(stage==='refresh-enabled'){
+  if(['refresh-enabled','index-refresh'].includes(stage)){
     for(const role of ROLES){
       const expected={...requiredFlags(stage)[role],...(role==='cache'?{CACHE_RETENTION_BUILD:'enabled'}:{})};
       for(const [name,value] of Object.entries(expected)){
@@ -304,7 +309,7 @@ export async function runScheduledAnalyticsRollout({plan,packageRoot,operationDi
   const operation=await openOperation({directory:operationDirectory,kind:'production',binding:plan,resume});
   const lock=lockFactory();let state=operation.record.state;
   try{
-    if(plan.stage==='refresh-enabled'&&(typeof lock.isAncestor!=='function'
+    if(['refresh-enabled','index-refresh'].includes(plan.stage)&&(typeof lock.isAncestor!=='function'
       ||!lock.isAncestor(plan.previousSourceCommit,plan.candidateSourceCommit)))fail('SOURCE_ANCESTRY_INVALID');
     if(!resume){
       const snapshots={};for(const role of plan.roles){snapshots[role.role]=await provider.snapshot(role);verifyPredecessor(role,snapshots[role.role]);}
@@ -318,12 +323,15 @@ export async function runScheduledAnalyticsRollout({plan,packageRoot,operationDi
         if(source.schemaSha256!==sourceDatabasePin.schemaSha256
           ||JSON.stringify(source.migrations)!==JSON.stringify(sourceDatabasePin.migrations))fail('SOURCE_SCHEMA_OR_LEDGER_CHANGED');
       }
-      if(plan.stage==='refresh-enabled'){
+      if(['refresh-enabled','index-refresh'].includes(plan.stage)){
         for(const role of plan.roles){
           const prior=await readOperation(role.predecessor.provenanceOperation).catch(()=>fail('PREDECESSOR_PROOF_MISSING'));
           if(prior.kind!=='production'||prior.state?.status!=='completed'
-            ||prior.state?.stage!==REFRESH_PREVIOUS_STAGES[role.role]
-            ||prior.state?.candidateSourceCommit!==REFRESH_PREVIOUS_SOURCE
+            ||(plan.stage==='index-refresh'?
+              (prior.state?.dispatchTracking!=='scheduled-refresh-dispatch-v1'||prior.state?.index!==3
+                ||prior.state?.candidateSourceCommit!==DIRECT_OCCURRENCE_FORWARD_PREVIOUS):
+              (prior.state?.stage!==REFRESH_PREVIOUS_STAGES[role.role]
+                ||prior.state?.candidateSourceCommit!==REFRESH_PREVIOUS_SOURCE))
             ||prior.state.deployed?.[role.role]?.versionId!==role.predecessor.versionId
             ||!SHA.test(prior.state.deployed?.[role.role]?.bundleSha256??''))fail('PREDECESSOR_PROOF_MISSING');
         }
