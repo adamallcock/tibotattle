@@ -755,6 +755,65 @@ describe("bounded shared effective day dependencies", () => {
     }
   }, 60_000);
 
+  for (const selectedCorrections of [false, true]) {
+    it(`seeks selected correction history without scanning unrelated owners (${selectedCorrections ? "archived" : "current"} selected occurrence)`, async ({ annotate }) => {
+      const selectedDay = day(), outsideDay = dayAfter(selectedDay);
+      const occurrence = "synthetic:selected-correction:chosen";
+      await db().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+      const fixture = await createV11DeviceFixture(db());
+      const outsideFixture = await createV11DeviceFixture(db(), { participantId: fixture.participantId });
+      await insertV1HistoryDay(fixture, selectedDay, 1, null, occurrence);
+      const selectedChunk = await currentTelemetryV1Chunk(db(), fixture.participantId, fixture.deviceId, "usage", selectedDay, 0);
+      await insertV1HistoryDay(outsideFixture, outsideDay, 1, null, occurrence);
+      if (selectedCorrections) await insertV1HistoryDay(fixture, selectedDay, 2, selectedChunk,
+        "synthetic:selected-correction:survivor");
+      const owner = (await readStorageCommunityOwnerPage(db()))
+        .find(value => value.participantId === fixture.participantId)!;
+      const before = await effectiveHistoryDependency(db(), owner, namespace, selectedDay, selectedDay);
+      expect(before.occurrenceLinks).toEqual([expect.objectContaining({ family: "v1", source_day: outsideDay })]);
+      const unrelated = await createV11DeviceFixture(db());
+      for (const retainedDay of [selectedDay, outsideDay]) {
+        const ids = Array.from({length: 200}, (_, index) => index === 0 ? occurrence :
+          `synthetic:other-owner-correction:${retainedDay}:${index}`);
+        await insertV1HistoryDay(unrelated, retainedDay, 1, null, ids);
+        const original = await currentTelemetryV1Chunk(db(), unrelated.participantId, unrelated.deviceId, "usage", retainedDay, 0);
+        await insertV1HistoryDay(unrelated, retainedDay, 2, original,
+          "synthetic:other-owner-correction:survivor:" + retainedDay);
+      }
+      const costs: {mode: string; includeSessions: boolean; current: number; prior: number}[] = [];
+      for (const includeSessions of [false, true]) {
+        const observed = observeDependencyQueries(db());
+        const dependency = await effectiveHistoryDependency(observed.database, owner, namespace,
+          selectedDay, selectedDay, {includeSessions});
+        expect(dependency.occurrenceLinks).toEqual(before.occurrenceLinks);
+        const batched = observeDependencyQueries(db());
+        const reader = await createEffectiveHistoryDayDependencyReader(batched.database, owner, namespace,
+          [selectedDay, outsideDay], {includeSessions, occurrenceLinks: "batched"});
+        expect(reader).toBeDefined();
+        expect(await reader!.readDigest(selectedDay)).toBe(await sha256Hex(canonicalJson(dependency)));
+        for (const [mode, query] of [
+          ["singleton", observed.queries.find(value => value.sql.includes("selected(occurrence_id)"))!],
+          ["batched", batched.queries.find(value => value.sql.startsWith("/* batched occurrence links */"))!],
+        ] as const) {
+          const sql = mode === "singleton" ? selectedChunkSqlBaseline.sql : selectedChunkSqlBaseline.batchedSql;
+          const baseline = includeSessions ? sql.replaceAll("('usage','quota')", "('usage','quota','session')")
+            .replaceAll("(1,2)", "(1,2,3)") : sql;
+          const current = await db().prepare(query.sql).bind(...query.values).all();
+          const prior = await db().prepare(baseline).bind(...query.values).all();
+          expect(current.results).toEqual(prior.results);
+          expect(current.meta.rows_read).toBeLessThan(prior.meta.rows_read / 2);
+          const plan = (await db().prepare("EXPLAIN QUERY PLAN " + query.sql).bind(...query.values)
+            .all<{detail:string}>()).results;
+          expect(plan.some(row => row.detail.includes("SCAN f USING"))).toBe(false);
+          costs.push({mode, includeSessions, current: current.meta.rows_read, prior: prior.meta.rows_read});
+        }
+      }
+      await annotate(JSON.stringify({selectedCorrections, unrelatedArchivedRecords: 400, costs}),
+        "selected-correction-owner-seek-cost");
+      console.log("selected-correction-owner-seek-cost", JSON.stringify({selectedCorrections, costs}));
+    }, 60_000);
+  }
+
   it("preserves compact, plain, and escaped occurrence IDs without conflating codec tags", async () => {
     const selectedDay = day(), outsideDay = dayAfter(selectedDay), differentIdDay = dayAfter(outsideDay);
     const occurrences = ["0a49f9db-8b2d-4c3e-9a6f-2f4f1c7d9e0b",
@@ -910,49 +969,52 @@ describe("bounded shared effective day dependencies", () => {
     }
   }, 60_000);
 
-  it.for(["v1", "v11"] as const)("does not recount unrelated retained %s chunk records for one selected day", async (family, { annotate }) => {
-    const selectedDay = day();
-    const fixture = await createV11DeviceFixture(db(), { grant: family === "v11" });
-    const selectedOccurrence = "synthetic:selective-proof:chosen";
-    const candidates: Staged[] = [];
-    if (family === "v1") await insertV1HistoryDay(fixture, selectedDay, 1, null, selectedOccurrence);
-    else candidates.push(await stage(fixture, await makeV11Day(selectedDay, {
-      usage: [v11UsageRecord(selectedDay, "a", { eventId: selectedOccurrence })],
-    })));
-    for (let offset = 1; offset <= 8; offset++) {
-      const retainedDay = new Date(Date.parse(selectedDay) + offset * 86_400_000).toISOString().slice(0,10);
-      const ids = Array.from({length:200}, (_, index) => `synthetic:selective-proof:unlinked:${offset}:${index}`);
-      if (family === "v1") await insertV1HistoryDay(fixture, retainedDay, 1, null, ids);
-      else candidates.push(await stage(fixture, await makeV11Day(retainedDay, {
-        usage: ids.map(eventId => v11UsageRecord(retainedDay, "b", {eventId})),
+  for (const family of ["v1", "v11"] as const) {
+    it(`does not recount unrelated retained ${family} chunk records for one selected day`, async ({ annotate }) => {
+      const selectedDay = day();
+      const fixture = await createV11DeviceFixture(db(), { grant: family === "v11" });
+      const selectedOccurrence = "synthetic:selective-proof:chosen";
+      const candidates: Staged[] = [];
+      if (family === "v1") await insertV1HistoryDay(fixture, selectedDay, 1, null, selectedOccurrence);
+      else candidates.push(await stage(fixture, await makeV11Day(selectedDay, {
+        usage: [v11UsageRecord(selectedDay, "a", { eventId: selectedOccurrence })],
       })));
-    }
-    if (family === "v11") await activate(fixture, candidates);
-    const owner = (await readStorageCommunityOwnerPage(db()))
-      .find(value => value.participantId === fixture.participantId)!;
-    for (const includeSessions of [false,true]) {
-      const observed = observeDependencyQueries(db());
-      const dependency = await effectiveHistoryDependency(observed.database,owner,namespace,
-        selectedDay,selectedDay,{includeSessions});
-      const query = observed.queries.find(value => value.sql.includes("selected(occurrence_id)"))!;
-      const baseline = includeSessions ? selectedChunkSqlBaseline.sql
-        .replaceAll("('usage','quota')", "('usage','quota','session')")
-        .replaceAll("(1,2)", "(1,2,3)") : selectedChunkSqlBaseline.sql;
-      const current = await db().prepare(query.sql).bind(...query.values).all<{family:string}>();
-      const prior = await db().prepare(baseline).bind(...query.values).all<{family:string}>();
-      expect(selectedChunkSqlBaseline.sourceCommit).toBe("90c38f6ef8a73aabe6b1baae0cb9b0cb9b42e2e2");
-      expect(dependency.occurrenceLinks).toEqual([]);
-      expect(current.results).toEqual(prior.results);
-      expect(canonicalJson({...dependency,occurrenceLinks:prior.results.filter(row =>
-        row.family !== "__correction_runtime__")})).toBe(canonicalJson(dependency));
-      expect(current.meta.rows_read).toBeLessThan(prior.meta.rows_read / 2);
-      expect(observed.queries).toHaveLength(7);
-      await annotate(JSON.stringify({family,includeSessions,unrelatedRetainedRecords:1600,
-        current:current.meta.rows_read,prior:prior.meta.rows_read}),"selective-chunk-proof-cost");
-      console.log("selective-chunk-proof-cost",JSON.stringify({family,includeSessions,
-        current:current.meta.rows_read,prior:prior.meta.rows_read}));
-    }
-  }, 60_000);
+      for (let offset = 1; offset <= 8; offset++) {
+        const retainedDay = new Date(Date.parse(selectedDay) + offset * 86_400_000).toISOString().slice(0,10);
+        const ids = Array.from({length:200}, (_, index) => `synthetic:selective-proof:unlinked:${offset}:${index}`);
+        if (family === "v1") await insertV1HistoryDay(fixture, retainedDay, 1, null, ids);
+        else candidates.push(await stage(fixture, await makeV11Day(retainedDay, {
+          usage: ids.map(eventId => v11UsageRecord(retainedDay, "b", {eventId})),
+        })));
+      }
+      if (family === "v11") await activate(fixture, candidates);
+      const owner = (await readStorageCommunityOwnerPage(db()))
+        .find(value => value.participantId === fixture.participantId)!;
+      for (const includeSessions of [false,true]) {
+        const observed = observeDependencyQueries(db());
+        const dependency = await effectiveHistoryDependency(observed.database,owner,namespace,
+          selectedDay,selectedDay,{includeSessions});
+        const query = observed.queries.find(value => value.sql.includes("selected(occurrence_id)"))!;
+        const baseline = includeSessions ? selectedChunkSqlBaseline.sql
+          .replaceAll("('usage','quota')", "('usage','quota','session')")
+          .replaceAll("(1,2)", "(1,2,3)") : selectedChunkSqlBaseline.sql;
+        const current = await db().prepare(query.sql).bind(...query.values).all<{family:string}>();
+        const prior = await db().prepare(baseline).bind(...query.values).all<{family:string}>();
+        expect(selectedChunkSqlBaseline.sourceCommit).toBe("90c38f6ef8a73aabe6b1baae0cb9b0cb9b42e2e2");
+        expect(dependency.occurrenceLinks).toEqual([]);
+        expect(current.results).toEqual(prior.results);
+        expect(canonicalJson({...dependency,occurrenceLinks:prior.results.filter(row =>
+          row.family !== "__correction_runtime__")})).toBe(canonicalJson(dependency));
+        expect(current.meta.rows_read).toBeLessThan(prior.meta.rows_read / 2);
+        expect(observed.queries).toHaveLength(7);
+        await annotate(JSON.stringify({family,includeSessions,unrelatedRetainedRecords:1600,
+          current:current.meta.rows_read,prior:prior.meta.rows_read}),"selective-chunk-proof-cost");
+        console.log("selective-chunk-proof-cost",JSON.stringify({family,includeSessions,
+          current:current.meta.rows_read,prior:prior.meta.rows_read}));
+      }
+    }, 60_000);
+
+  }
 
   it("checks each complete chunk once when many selected occurrences match one outside chunk", async ({ annotate }) => {
     const selectedDay = day(), outsideDay = dayAfter(selectedDay);

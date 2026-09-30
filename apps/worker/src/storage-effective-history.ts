@@ -245,10 +245,10 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
 ` : '';
   const rows=(await source.prepare(`${batched?'/* batched occurrence links */ ':''}WITH scope(owner_digest,participant_id,source_namespace,from_day,through_day,from_ms,through_ms,owner_digest_blob) AS (
       SELECT ?,?,?,?,?,?,?,?
-    ), ${batched?`selection_scopes(target_day,owner_digest,participant_id,source_namespace,from_day,through_day,from_ms,through_ms) AS MATERIALIZED (
+    ), ${batched?`selection_scopes(target_day,owner_digest,participant_id,source_namespace,from_day,through_day,from_ms,through_ms,owner_digest_blob) AS MATERIALIZED (
       SELECT json_extract(day.value,'$[0]'),s.owner_digest,s.participant_id,s.source_namespace,
         json_extract(day.value,'$[0]'),json_extract(day.value,'$[0]'),
-        json_extract(day.value,'$[1]'),json_extract(day.value,'$[2]')
+        json_extract(day.value,'$[1]'),json_extract(day.value,'$[2]'),s.owner_digest_blob
         FROM scope s CROSS JOIN json_each(?) day
     ), `:''}complete_v1_selected_chunks AS MATERIALIZED (
       SELECT chunk.id FROM scope s
@@ -330,9 +330,11 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
          AND r.observed_day>=s.from_day AND r.observed_day<=s.through_day
       UNION
       SELECT ${target('s')}h.occurrence_id
-        FROM telemetry_usage_correction_facts f
-        JOIN telemetry_usage_correction_history h ON h.id=f.history_id
-        JOIN ${selectionScope} s ON h.participant_id=s.participant_id AND lower(hex(h.owner_digest))=s.owner_digest
+        FROM ${selectionScope} s
+        CROSS JOIN telemetry_usage_correction_history h INDEXED BY telemetry_usage_correction_history_owner_time
+          ON h.owner_digest=s.owner_digest_blob AND h.participant_id=s.participant_id
+        CROSS JOIN telemetry_usage_correction_facts f INDEXED BY telemetry_usage_correction_facts_history
+          ON f.history_id=h.id
        WHERE h.event_time_ms>=s.from_ms AND h.event_time_ms<s.through_ms
 ${selectedV12}    ), /* Count completeness only for selected-day chunks and distinct matching
        * outside headers. Unrelated retained chunks cannot affect this identity. */
