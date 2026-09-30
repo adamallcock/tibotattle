@@ -1,5 +1,50 @@
 export type IsoInstant = string;
 export type OpaqueId = string;
+
+export const CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY: Readonly<{
+  version: "codex-included-allowance-speed-v0.1";
+  basis: "documented_included_allowance_relative_to_standard";
+  unit: "dimensionless";
+  reviewedFrom: "2026-09-29";
+  historicalApplicability: "unavailable_before_reviewed_from";
+  source: Readonly<{ publisher: "openai"; url: string; statement: string }>;
+  weights: Readonly<{ standard: 1; fast: 2.5; ultrafast: 8 }>;
+  supportedFastModels: readonly string[];
+  supportedUltrafastModels: readonly ["gpt-6-astra"];
+  establishesModeAvailability: false;
+  infersConsumptionBasis: false;
+  changesCalibrationBasis: false;
+}>;
+export type IncludedAllowanceConsumptionBasis =
+  | "included_allowance" | "purchased_credits" | "api_billing" | "unknown";
+export interface IncludedAllowanceSpeedWeight {
+  readonly policyVersion: typeof CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY.version;
+  readonly basis: typeof CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY.basis;
+  readonly reviewedFrom: typeof CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY.reviewedFrom;
+  readonly unit: "dimensionless";
+  readonly status: "documented" | "unavailable" | "not_applicable";
+  readonly reasonCode:
+    | "documented_speed_weight"
+    | "separate_credit_or_api_basis"
+    | "consumption_basis_unavailable"
+    | "provider_or_billing_surface_unavailable"
+    | "provider_or_billing_surface_not_supported"
+    | "event_time_unavailable"
+    | "before_reviewed_policy"
+    | "speed_mode_unavailable"
+    | "model_not_reviewed"
+    | "model_speed_not_supported";
+  readonly weight: 1 | 2.5 | 8 | null;
+}
+export function includedAllowanceSpeedWeight(input?: {
+  provider?: string | null;
+  billingSurface?: string | null;
+  consumptionBasis?: IncludedAllowanceConsumptionBasis | null;
+  modelId?: string | null;
+  mode?: string | null;
+  eventTime?: string | null;
+}): IncludedAllowanceSpeedWeight;
+
 // Runtime validation is required; this type intentionally does not encode the
 // provider-reported duration bounds.
 export type QuotaWindowDurationMinutes = number;

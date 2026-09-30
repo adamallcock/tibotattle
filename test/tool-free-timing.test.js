@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, readFile, rename, rm, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createParser, createToolFreeParser, digest, METHOD, TOOL_FREE_METHOD, MAX_STATE_BYTES } from '../src/providers/codex/logs.js';
+import { createParser, createToolFreeParser, digest, METHOD, TOOL_FREE_METHOD, MAX_STATE_BYTES, INFERENCE_TIMING_PARSER_VERSION } from '../src/providers/codex/logs.js';
 import { openTimingStore, ingestTimingFile, readTimingRows } from '../src/platform/index.js';
 import { createModelPerformanceController } from '../apps/local/model-performance-controller.js';
 import { modelPerformanceSourceScope } from '../apps/local/model-performance-snapshots.js';
@@ -134,7 +134,7 @@ test('additive sidecar resumes and joins without changing original rows, version
   const path = join(dir, 'supplement');
   let extra = await openTimingStore(path, extraConfig(primary.key));
   try {
-    assert.equal(extra.db.prepare('PRAGMA user_version').get().user_version, 5);
+    assert.equal(extra.db.prepare('PRAGMA user_version').get().user_version, 7);
     await ingestTimingFile(extra, file, { maxBytes: Buffer.byteLength(lines(fixture().slice(0, 6))) });
   } finally { extra.close(); }
   extra = await openTimingStore(path, extraConfig(primary.key));
@@ -144,7 +144,7 @@ test('additive sidecar resumes and joins without changing original rows, version
     assert.equal(joined.length, 1); assert.equal(joined[0].tool_free_tokens, 120); assert.equal(joined[0].tool_free_duration, 1200);
     const { tool_free_tokens, tool_free_duration, ...original } = joined[0];
     assert.deepEqual(original, before[0]); assert.deepEqual(readTimingRows(primary), before);
-    assert.equal(primary.db.prepare('PRAGMA user_version').get().user_version, 4);
+    assert.equal(primary.db.prepare('PRAGMA user_version').get().user_version, 6);
     assert.equal((await ingestTimingFile(extra, file)).bytes, 0);
     await assert.rejects(openTimingStore(path, primaryConfig), /incompatible_database/);
     await assert.rejects(openTimingStore(path, extraConfig(Buffer.alloc(32))), /correlation_mismatch/);
@@ -217,11 +217,13 @@ test('real worker backfills the supplement beside saved measurements and preserv
   // Each Codex root owns both of its additive sidecars; the unscoped original
   // remains untouched because it cannot prove which root produced its rows.
   const scopedDirectory = join(options.directory, `source-${modelPerformanceSourceScope(codexHome)}`);
-  const scopedPrimary = await openTimingStore(scopedDirectory, primaryConfig);
+  const scopedPrimary = await openTimingStore(scopedDirectory, { ...primaryConfig, parserVersion: INFERENCE_TIMING_PARSER_VERSION });
   try {
-    const extra = await openTimingStore(join(scopedDirectory, 'tool-free-v1'), extraConfig(scopedPrimary.key));
+    const extra = await openTimingStore(join(scopedDirectory, 'tool-free-v1'), {
+      ...extraConfig(scopedPrimary.key), parserVersion: INFERENCE_TIMING_PARSER_VERSION,
+    });
     extra.db.exec('PRAGMA user_version=999'); extra.close();
-    assert.equal(scopedPrimary.db.prepare('PRAGMA user_version').get().user_version, 4);
+    assert.equal(scopedPrimary.db.prepare('PRAGMA user_version').get().user_version, 6);
   } finally { scopedPrimary.close(); }
   const snapshotFile = join(options.directory, 'model-performance-snapshot.json');
   const saved = await readFile(snapshotFile, 'utf8');

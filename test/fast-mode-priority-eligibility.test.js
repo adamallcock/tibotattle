@@ -62,8 +62,8 @@ test("every shipped Priority card and reviewed alias equals the event-weighted S
       checked += 1;
     }
   }
-  assert.equal(checked, 32);
-  assert.equal(FAST_MODE_MODEL_FAMILY_KEYS.length, 19);
+  assert.equal(checked, 34);
+  assert.equal(FAST_MODE_MODEL_FAMILY_KEYS.length, 20);
   assert.equal(Math.max(...Object.values(FAST_MODE_QUOTA_MULTIPLIERS)), 2.5);
 });
 
@@ -186,7 +186,10 @@ test("unified usage projections qualify once and retain only occupied timeline c
     ["gpt-5.5", 272_000, "unsupported"],
   ]) {
     const projection = usageProjection({
-      model, observedAt: EVENT_TIME, components: { input_uncached_tokens: input },
+      model, observedAt: EVENT_TIME, components: {
+        input_uncached_tokens: input, input_cache_read_tokens: 0, input_cache_write_tokens: 0,
+        output_text_tokens: 0, output_reasoning_tokens: 0,
+      },
       tierSemantics: { codexSpeedMode: "fast" },
     });
     assert.equal(projection.fastModeFamily, expectedKey);

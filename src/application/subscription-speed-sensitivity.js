@@ -2,6 +2,7 @@ import {
   FAST_MODE_ASSUMED_MULTIPLIER,
   fastModeModelFamilyKey,
   fastModeQuotaMultiplier,
+  speedModeApiMultiplier,
   summarizeQuotaWeightedAccounting,
 } from "@app-usagemonitor/accounting";
 
@@ -27,10 +28,25 @@ export function subscriptionSpeedSensitivity(byModel, observedSpeedMode = "unkno
   let fastWeightedEquivalentUsd = 0;
   let assumedRatioStandardApiEquivalentUsd = 0;
   const modelMultipliers = {};
+  let ultrafastWeightedEquivalentUsd = 0;
+  let ultrafastUnweightedEquivalentUsd = 0;
+  let ultrafastComplete = true;
+  const ultrafastModelMultipliers = {};
   for (const [model, summary] of Object.entries(byModel ?? {})) {
     const costUsd = Number(summary?.costUsd ?? 0);
     if (!Number.isFinite(costUsd) || costUsd < 0) continue;
     standardApiEquivalentUsd += costUsd;
+    if (observedSpeedMode === "ultrafast") {
+      // A Fast-qualified aggregate does not establish Ultrafast eligibility.
+      // Require the exact model, date and context evidence for this scenario;
+      // the published API ratio is not the included-subscription quota weight.
+      const multiplier = speedModeApiMultiplier(model, "ultrafast", summary?.priceEvidence ?? {});
+      ultrafastModelMultipliers[model] = multiplier;
+      if (multiplier === null) {
+        ultrafastComplete = false;
+        ultrafastUnweightedEquivalentUsd += costUsd;
+      } else ultrafastWeightedEquivalentUsd += costUsd * multiplier;
+    }
     const crossing = speedWeightingByModel?.[model];
     const family = fastModeModelFamilyKey(model);
     const crossingAdmitted = crossing && typeof crossing === "object"
@@ -78,10 +94,24 @@ export function subscriptionSpeedSensitivity(byModel, observedSpeedMode = "unkno
       complete: true,
     },
   };
+  // Unknown mode deliberately keeps the existing Standard/Fast sensitivities.
+  // They are not bounds. Ultrafast is an observed scenario, never an inference for an
+  // unrecorded speed or a generic multiplier for unsupported models.
+  if (observedSpeedMode === "ultrafast") {
+    scenarios.ultrafast = {
+      relativeQuotaWeight: "model_specific",
+      weightedStandardApiEquivalentUsd: ultrafastComplete ? roundUsd(ultrafastWeightedEquivalentUsd) : null,
+      unweightedStandardApiEquivalentUsd: roundUsd(ultrafastUnweightedEquivalentUsd),
+      complete: ultrafastComplete,
+      modelMultipliers: ultrafastModelMultipliers,
+    };
+  }
   return {
-    basis: "codex_subscription_priority_price_ratio_applied_to_standard_api_equivalent",
+    basis: observedSpeedMode === "ultrafast"
+      ? "codex_speed_api_price_ratio_applied_to_standard_api_equivalent"
+      : "codex_subscription_priority_price_ratio_applied_to_standard_api_equivalent",
     observedSpeedMode,
-    selectedScenario: observedSpeedMode === "standard" || observedSpeedMode === "fast" ? observedSpeedMode : null,
+    selectedScenario: ["standard", "fast", "ultrafast"].includes(observedSpeedMode) ? observedSpeedMode : null,
     scenarios,
     modelMultipliers,
   };

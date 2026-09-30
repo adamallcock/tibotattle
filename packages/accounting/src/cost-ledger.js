@@ -135,23 +135,42 @@ function cardMatchesIdentity(card, { provider, model, surface }) {
     && (!card.surface || card.surface === surface);
 }
 
-function effectivePriceCards(priceCards, serviceTier) {
-  if (serviceTier === "standard") return priceCards;
-  // RunCost intentionally lets tierless cards act as Standard defaults. For a
-  // non-Standard counterfactual that is unsafe, so only exact tier cards enter.
-  return priceCards.filter((card) => card?.service_tier === serviceTier);
+function hasInputContextCondition(component) {
+  return component.conditions?.min_total_input_tokens !== undefined
+    || component.conditions?.max_total_input_tokens !== undefined;
 }
 
-function compiledTierCatalog(priceCards, serviceTier) {
+function isInputComponent(name) {
+  return name?.startsWith("input_") || name === "anthropic_input_cache_write_unsplit_tokens";
+}
+
+function effectivePriceCards(priceCards, serviceTier, inputContextUnavailable = false) {
+  // RunCost intentionally lets tierless cards act as Standard defaults. For a
+  // non-Standard counterfactual that is unsafe, so only exact tier cards enter.
+  const tierCards = serviceTier === "standard"
+    ? priceCards
+    : priceCards.filter((card) => card?.service_tier === serviceTier);
+  if (!inputContextUnavailable) return tierCards;
+  // RunCost infers an absent input total from priced components, including an
+  // empty sum of zero. Remove only conditional rates when that inference is
+  // unsupported; independent components retain their exact price provenance.
+  return tierCards.map((card) => ({
+    ...card,
+    components: card.components.filter((component) => !hasInputContextCondition(component)),
+  }));
+}
+
+function compiledTierCatalog(priceCards, serviceTier, inputContextUnavailable = false) {
   let tiers = COMPILED_TIER_CATALOGS.get(priceCards);
   if (!tiers) {
     tiers = new Map();
     COMPILED_TIER_CATALOGS.set(priceCards, tiers);
   }
-  if (!tiers.has(serviceTier)) {
-    tiers.set(serviceTier, compilePriceCatalog(effectivePriceCards(priceCards, serviceTier)));
+  const key = `${serviceTier}:${inputContextUnavailable ? "unknown-context" : "known-context"}`;
+  if (!tiers.has(key)) {
+    tiers.set(key, compilePriceCatalog(effectivePriceCards(priceCards, serviceTier, inputContextUnavailable)));
   }
-  return tiers.get(serviceTier);
+  return tiers.get(key);
 }
 
 function readSemanticQuantity(components, keys, consumed, informationalWarnings) {
@@ -494,11 +513,23 @@ export function priceUsageEvent(event, { priceCards = [], pricingContext = {} } 
   ));
   const suppliedTotalInputTokens = event.totalInputTokens ?? event.totalInputContextTokens
     ?? pricingContext.totalInputTokens ?? pricingContext.totalInputContextTokens;
-  const totalInputTokens = suppliedTotalInputTokens === undefined || suppliedTotalInputTokens === null
-    ? candidates
+  const hasSuppliedInputTotal = suppliedTotalInputTokens !== undefined && suppliedTotalInputTokens !== null;
+  const inputContextUnavailable = !hasSuppliedInputTotal && (
+    !Object.keys(observation.observed).some((key) => isInputComponent(PROVIDER_COMPONENTS[provider]?.[key]))
+    || observation.unavailable.some(isInputComponent)
+    || tokenResult.preUnpriced.some((component) => isInputComponent(component.name))
+  );
+  const contextDependentComponents = new Set(inputContextUnavailable
+    ? priceCards.filter((card) => cardMatchesIdentity(card, identity)
+      && (card.service_tier ?? "standard") === serviceTier)
+      .flatMap((card) => card.components.filter(hasInputContextCondition)
+        .map((component) => component.usage_component))
+    : []);
+  const totalInputTokens = hasSuppliedInputTotal
+    ? normalizeDecimal(suppliedTotalInputTokens, "totalInputTokens")
+    : inputContextUnavailable ? null : candidates
       .filter((component) => component.unit === "token" && component.name.startsWith("input_"))
-      .reduce((sum, component) => addDecimals(sum, component.quantity), "0")
-    : normalizeDecimal(suppliedTotalInputTokens, "totalInputTokens");
+      .reduce((sum, component) => addDecimals(sum, component.quantity), "0");
   const usageLedger = {
     schema_version: "0.1",
     provider,
@@ -506,7 +537,7 @@ export function priceUsageEvent(event, { priceCards = [], pricingContext = {} } 
     model: { requested: model },
     context: {
       service_tier: serviceTier,
-      total_input_tokens: totalInputTokens,
+      ...(totalInputTokens === null ? {} : { total_input_tokens: totalInputTokens }),
       ...(pricedAt ? { priced_at: pricedAt } : {}),
       ...(region ? { region: String(region) } : {}),
     },
@@ -519,7 +550,7 @@ export function priceUsageEvent(event, { priceCards = [], pricingContext = {} } 
 
   const ledger = calculateCost({
     usageLedger,
-    priceCards: compiledTierCatalog(priceCards, serviceTier),
+    priceCards: compiledTierCatalog(priceCards, serviceTier, inputContextUnavailable),
     mode: "compatibility",
   });
   const pricedByKey = new Map(ledger.components.map((component) => [component.metadata?.local_component_key, component]));
@@ -543,11 +574,13 @@ export function priceUsageEvent(event, { priceCards = [], pricingContext = {} } 
       });
     } else {
       const historicalPriceMissing = ledger.warnings.some((item) => item.code === "historical_price_missing");
+      const contextPriceMissing = contextDependentComponents.has(requested.name)
+        || (requested.name === "output_reasoning_tokens" && contextDependentComponents.has("output_text_tokens"));
       const reasonCode = !exactTierCardExists && serviceTier !== "standard"
         ? "service_tier_exact_card_missing"
         : historicalPriceMissing
           ? "historical_price_missing"
-          : "component_price_missing";
+          : contextPriceMissing ? "total_input_context_missing" : "component_price_missing";
       components.push({
         name: requested.metadata?.original_component ?? requested.name,
         pricedAs: requested.name,
@@ -565,7 +598,9 @@ export function priceUsageEvent(event, { priceCards = [], pricingContext = {} } 
           reasonCode,
           reasonCode === "service_tier_exact_card_missing"
             ? `No exact ${serviceTier} price card declares the requested non-Standard tier.`
-            : `No monetary price covered ${requested.name}.`,
+            : reasonCode === "total_input_context_missing"
+              ? `Input context was unavailable for the context-dependent price of ${requested.name}.`
+              : `No monetary price covered ${requested.name}.`,
           { component: requested.name, provider, model, serviceTier },
         ));
       }

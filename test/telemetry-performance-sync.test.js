@@ -8,6 +8,7 @@ import {
 import {
   initialTelemetryPerformanceSyncState,
   parseTelemetryPerformanceSyncState,
+  resumeTelemetryPerformanceSyncAfterAuthorization,
   prepareTelemetryPerformanceDay,
   runTelemetryPerformanceSync,
 } from "../src/contribution/telemetry-performance-sync.js";
@@ -21,6 +22,43 @@ globalThis.crypto ??= webcrypto;
 
 const DAY = "2026-09-21";
 const DIGEST = "a".repeat(64);
+
+test("renewed performance authorization preserves progress and rechecks the hosted capability", async () => {
+  const now = Date.parse("2026-09-21T12:00:00.000Z");
+  for (const reason of ["authorization_rejected", "response_invalid"]) {
+    const previous = { ...initialTelemetryPerformanceSyncState(), cursorDay: DAY,
+      lastReportRevision: DIGEST, paused: true, pausedReason: reason, retryCount: 3,
+      lastAttemptAt: new Date(now - 1_000).toISOString(),
+      lastOutcome: { at: new Date(now - 1_000).toISOString(), code: reason, status: "paused" } };
+    const resumed = resumeTelemetryPerformanceSyncAfterAuthorization(previous);
+    assert.equal(resumed.paused, false);
+    assert.equal(resumed.retryCount, 0);
+    assert.equal(resumed.cursorDay, previous.cursorDay);
+    assert.equal(resumed.lastReportRevision, previous.lastReportRevision);
+    assert.deepEqual(resumed.lastOutcome, previous.lastOutcome);
+    assert.equal(previous.paused, true);
+    const common = { day: DAY, nowEpoch: now, state: JSON.parse(JSON.stringify(resumed)),
+      prepareDay: () => assert.fail("an obsolete grant must not prepare data"),
+      createEnvelope: () => assert.fail("an obsolete grant must not encrypt data"),
+      send: () => assert.fail("an obsolete grant must not upload") };
+    const oldCapability = capability(now);
+    oldCapability.requiredConsent.fieldDictionaryVersion = "telemetry-performance-registry-2026-09-21.1";
+    const rejected = await runTelemetryPerformanceSync({ ...common, readCapabilities: async () => oldCapability });
+    assert.equal(rejected.state.pausedReason, "response_invalid");
+    assert.equal(rejected.state.cursorDay, DAY);
+    const accepted = await runTelemetryPerformanceSync({ ...common,
+      state: resumeTelemetryPerformanceSyncAfterAuthorization(rejected.state),
+      readCapabilities: async () => capability(now), prepareDay: () => report(),
+      createEnvelope: async ({ report }) => ({ report }), send: async () => ({ status: 202 }) });
+    assert.equal(accepted.status, "succeeded");
+  }
+  for (const reason of ["global_paused", "device_disconnected", "report_invalid", "upload_rejected", "user_opt_out"]) {
+    const state = { ...initialTelemetryPerformanceSyncState(), paused: true, pausedReason: reason };
+    assert.deepEqual(resumeTelemetryPerformanceSyncAfterAuthorization(state), state);
+  }
+  assert.throws(() => resumeTelemetryPerformanceSyncAfterAuthorization({ paused: true }),
+    error => error.code === "telemetry_performance_state_invalid");
+});
 
 function record(overrides = {}) {
   return {
@@ -69,7 +107,7 @@ function capability(now = Date.parse("2026-09-21T12:00:00.000Z")) {
     supportedSpeedMethods: ["receipt", "tool_free"],
     requiredConsent: {
       schemaVersion: "model-performance-daily-v1",
-      fieldDictionaryVersion: "telemetry-performance-registry-2026-09-21.1",
+      fieldDictionaryVersion: "telemetry-performance-registry-2026-09-29.1",
       privacyContractVersion: "privacy-safe-model-performance-v1",
       scope: "model-performance-daily",
     },

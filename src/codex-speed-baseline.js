@@ -2,11 +2,11 @@
 //
 // WHAT THIS RECOVERS
 // ------------------
-// Codex records the speed mode only when it is applied or changed
-// (`thread_settings_applied`), never at session start, so a session's BASELINE
-// is absent from the rollout log. `~/.codex/config.toml` holds a top-level
-// `service_tier` key with the CURRENT setting, which is the only place that
-// baseline exists.
+// Explicit `turn_context.service_tier` and `thread_settings_applied` records
+// provide speed evidence when present. Sessions without such evidence may
+// have an unresolved baseline. `~/.codex/config.toml` holds a top-level
+// `service_tier` key with the CURRENT setting; a declared observation can
+// cover only the time interval established by its readings.
 //
 // WHY IT MAY NEVER BACKFILL
 // -------------------------
@@ -76,7 +76,7 @@ const MAXIMUM_LEDGER_BYTES = 8 * 1_024;
 const MAXIMUM_WINDOWS = 64;
 const LEDGER_KEYS = Object.freeze(["schemaVersion", "windows"]);
 const WINDOW_KEYS = Object.freeze(["firstSeenAt", "lastSeenAt", "mode"]);
-const DECLARABLE_MODES = Object.freeze(["standard", "fast"]);
+const DECLARABLE_MODES = Object.freeze(["standard", "fast", "ultrafast"]);
 
 export class CodexSpeedBaselineError extends Error {
   constructor(code) {

@@ -15,7 +15,7 @@ import {
   readReplaySafeAccountingCache as readReplaySafeAccountingCacheImpl,
   refreshReplaySafeAccountingCache as refreshReplaySafeAccountingCacheImpl,
 } from "../src/replay-safe-accounting-cache.js";
-import { addUsdStrings } from "@app-usagemonitor/accounting";
+import { addUsdStrings, priceCodexUsageEvent, summarizeQuotaWeightedAccounting } from "@app-usagemonitor/accounting";
 import { stableJson } from "../src/storage.js";
 import {
   readLocalCollectorAccountingCache,
@@ -159,6 +159,7 @@ test("explicit legacy refresh keeps the injected characterization scanner on leg
   const cache = await refreshReplaySafeAccountingCacheImpl({
     stateFile: join(directory, "local-collector-state-v1.sqlite"),
     sourceMode: "legacy",
+    contextBehavior: "legacy_zero",
     scan: scanner([]),
     now: () => NOW,
   });
@@ -281,13 +282,13 @@ test("cache reads invalidate when the unified generation no longer matches", asy
     stateFile,
     sourceMode: "unified",
     expectedGeneration: "generation-test-1",
-    contextBehavior: "legacy_zero",
+    contextBehavior: "source_native",
   });
   assert.equal(available.status, "available");
   assert.deepEqual(available.cache.sourceDescriptor, {
     schemaVersion: "local-accounting-source-descriptor-v1",
     mode: "unified",
-    contextBehavior: "legacy_zero",
+    contextBehavior: "source_native",
     readerVersion: "test-unified-reader-v1",
     schemaVersionUsed: "test-unified-schema-v1",
     parserVersion: "test-parser-v1",
@@ -331,7 +332,7 @@ test("cache reads invalidate when the unified generation no longer matches", asy
     stateFile,
     sourceMode: "unified",
     expectedGeneration: "generation-test-1",
-    contextBehavior: "source_native",
+    contextBehavior: "legacy_zero",
   });
   assert.deepEqual(contextInvalidated, {
     status: "unavailable",
@@ -342,7 +343,7 @@ test("cache reads invalidate when the unified generation no longer matches", asy
     stateFile,
     sourceMode: "unified",
     expectedGeneration: "generation-test-2",
-    contextBehavior: "legacy_zero",
+    contextBehavior: "source_native",
   });
   assert.deepEqual(invalidated, {
     status: "unavailable",
@@ -370,7 +371,7 @@ test("cache reads invalidate when the unified generation no longer matches", asy
       id: "generation-test-1",
       fingerprint: "generation-fingerprint-stale",
     },
-    contextBehavior: "legacy_zero",
+    contextBehavior: "source_native",
   });
   assert.deepEqual(fingerprintInvalidated, {
     status: "unavailable",
@@ -404,7 +405,7 @@ test("cache reads invalidate when the unified generation no longer matches", asy
       id: "generation-test-1",
       fingerprint: "generation-fingerprint-current",
     },
-    contextBehavior: "legacy_zero",
+    contextBehavior: "source_native",
   });
   assert.deepEqual(historyInvalidated, {
     status: "unavailable",
@@ -1333,7 +1334,7 @@ test("the same lineage-aware scan produces a bounded weekly calibration summary"
   assert.equal(fastCapacity.basis.unresolvedScenario, "unresolved_as_fast");
   assert.equal(
     standardCapacity.basis.multiplierRegistryRecordedAt,
-    "2026-08-30",
+    "2026-09-29",
   );
   assert.equal(
     standardCapacity.calibration.validation.selectedCostBasis,
@@ -2171,6 +2172,11 @@ async function writeUnifiedCalibrationFixture(indexFile, {
       reasoningEffort: 8,
       outcome: 5,
       tokensInUncached: 1_000,
+      tokensInCacheRead: 0,
+      tokensInCacheWrite: 0,
+      tokensOutText: 0,
+      tokensOutReasoning: 0,
+      tokensOutCombined: 0,
     });
     if (isPlanAnchor) {
       writer.writeQuotaOccurrence({
@@ -2230,6 +2236,11 @@ async function writeUnifiedCalibrationFixture(indexFile, {
         reasoningEffort: 8,
         outcome: 5,
         tokensInUncached: boundary > 0 ? 1_000_000 + resetIndex * 100_000 : null,
+        tokensInCacheRead: 0,
+        tokensInCacheWrite: 0,
+        tokensOutText: 0,
+        tokensOutReasoning: 0,
+        tokensOutCombined: 0,
       });
       writer.writeQuotaOccurrence({
         generationId: generation.generationId,
@@ -3657,7 +3668,7 @@ test("replay cache rejects the old prefix-priced version and unreviewed model cr
       components: { input_uncached_tokens: 1_000 },
     })]),
   });
-  assert.equal(cache.schemaVersion, "local-replay-safe-accounting-v0.16");
+  assert.equal(cache.schemaVersion, "local-replay-safe-accounting-v0.18");
   assert.doesNotThrow(() => assertReplaySafeAccountingCache(cache));
   const oldVersion = structuredClone(cache);
   oldVersion.schemaVersion = "local-replay-safe-accounting-v0.12";
@@ -4595,4 +4606,98 @@ test("a failed refresh leaves the last good owner-only cache intact", async () =
 
   assert.deepEqual(await readTestCache(cacheFile), before);
   assert.equal((await stat(cacheFile)).mode & 0o777, 0o600);
+});
+
+test("Ultrafast replay weights Astra once and withholds unsupported Sol without losing Standard totals", async () => {
+  const instant = Date.parse("2026-09-29T20:00:00.000Z");
+  for (const model of ["gpt-6-astra", "gpt-6.1-sol"]) {
+    const cache = await buildReplaySafeAccountingCache({
+      now: () => instant,
+      scan: scanner([usageEvent({ timestamp: new Date(instant - 1_000).toISOString(),
+        model, speed: "ultrafast", components: { input_uncached_tokens: 1_000 } })]),
+    });
+    assert.doesNotThrow(() => assertReplaySafeAccountingCache(cache));
+    const period = cache.periods.find((row) => row.id === "all");
+    assert.equal(period.bySpeed.ultrafast.events, 1);
+    const weighted = summarizeQuotaWeightedAccounting({ speedWeighting: period.speedWeighting });
+    assert.equal(weighted.coverage.observedEvents, 1);
+    const standard = model === "gpt-6-astra" ? .01 : .002;
+    assert.equal(period.apiPriceEquivalentUsd, standard);
+    if (model === "gpt-6-astra") {
+      assert.equal(weighted.quotaWeightedApiPriceEquivalentUsd, .06);
+      assert.equal(weighted.weightingStatus, "complete");
+    } else {
+      assert.equal(weighted.quotaWeightedApiPriceEquivalentUsd, null);
+      assert.equal(weighted.weightingStatus, "unknown");
+      assert.equal(weighted.unweightedUnknownApiPriceEquivalentUsd, standard);
+    }
+  }
+});
+
+test("memoized accounting matches reviewed context boundaries and nullable observations", () => {
+  const pricer = createAccountingPricer();
+  for (const model of ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol"]) {
+    for (const totalInputContextTokens of [272_001, 272_000, 271_999, 300_000, 0, null]) {
+      const event = usageEvent({ timestamp: "2026-09-29T20:00:00.000Z", model,
+        components: { input_uncached_tokens: 300_000, input_cache_read_tokens: 1_000,
+          output_text_tokens: 1_000, output_reasoning_tokens: 500 } });
+      event.totalInputContextTokens = totalInputContextTokens;
+      const expected = priceCodexUsageEvent(event);
+      const actual = pricer(event, event.components);
+      assert.equal(actual.totalUsd, expected.totalUsd, `${model}/${totalInputContextTokens}`);
+      assert.equal(actual.coverageStatus, expected.coverageStatus);
+      assert.deepEqual(actual.selectedPriceCardIds, expected.selectedPriceCardIds);
+    }
+  }
+  const knownRawContext = usageEvent({ timestamp: "2026-09-29T20:00:00.000Z",
+    model: "gpt-6.1-sol", components: { output_text_tokens: 1_000 } });
+  knownRawContext.totalInputContextTokens = null;
+  knownRawContext.raw = { input_tokens: 272_001 };
+  assert.equal(pricer(knownRawContext, knownRawContext.components).totalUsd, "0.015");
+
+  for (const rawAvailability of [undefined, {}, { input_tokens: false }, { input_tokens: true }]) {
+    const event = usageEvent({ timestamp: "2026-09-29T20:00:00.000Z",
+      model: "gpt-6.1-sol", components: { input_uncached_tokens: 300_000, output_text_tokens: 1_000 } });
+    event.totalInputContextTokens = null;
+    event.raw = { input_tokens: 0 };
+    event.rawAvailability = rawAvailability;
+    assert.equal(pricer(event, event.components).totalUsd, priceCodexUsageEvent(event).totalUsd);
+  }
+
+  for (const model of ["gpt-6.1-sol", "gpt-6-astra"]) {
+    for (const totalInputContextTokens of [null, 272_001]) {
+      const event = usageEvent({ timestamp: "2026-09-29T20:00:00.000Z", model,
+        components: { output_text_tokens: 1_000 } });
+      event.totalInputContextTokens = totalInputContextTokens;
+      for (const name of ["input_uncached_tokens", "input_cache_read_tokens", "input_cache_write_tokens"]) {
+        event.components[name] = null;
+        event.componentAvailability[name] = false;
+      }
+      const expected = priceCodexUsageEvent(event);
+      assert.deepEqual(pricer(event, event.components), expected);
+      assert.equal(expected.coverageStatus, totalInputContextTokens === null ? "unpriced" : "partially_priced");
+      assert.equal(expected.totalUsd, totalInputContextTokens === null ? "0" : model === "gpt-6.1-sol" ? "0.015" : "0.075");
+    }
+  }
+});
+
+test("replay accounting preserves unknown context coverage instead of publishing a short-priced event", async () => {
+  const instant = Date.parse("2026-09-29T20:00:00.000Z");
+  const event = usageEvent({ timestamp: new Date(instant - 1_000).toISOString(),
+    model: "gpt-6.1-sol", components: { output_text_tokens: 1_000 } });
+  event.totalInputContextTokens = null;
+  event.raw = { input_tokens: 0 };
+  event.rawAvailability = { input_tokens: false };
+  for (const name of ["input_uncached_tokens", "input_cache_read_tokens", "input_cache_write_tokens"]) {
+    event.components[name] = null;
+    event.componentAvailability[name] = false;
+  }
+  const cache = await buildReplaySafeAccountingCache({ now: () => instant, scan: scanner([event]) });
+  const period = cache.periods.find((row) => row.id === "all");
+  assert.equal(period.totalTokens, 1_000);
+  assert.equal(period.apiPriceEquivalentUsd, 0);
+  assert.equal(period.pricingCoverage.unpricedEvents, 1);
+  assert.equal(period.pricingCoverage.fullyPricedEvents, 0);
+  assert.equal(cache.weeklyCalibrationInput.retainedUsageEvents, 1);
+  assert.doesNotThrow(() => assertReplaySafeAccountingCache(cache));
 });

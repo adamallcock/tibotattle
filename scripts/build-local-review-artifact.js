@@ -132,6 +132,7 @@ export const LOCAL_REVIEW_WORKSPACE_RUNTIME_FILES = Object.freeze({
   "@app-usagemonitor/quota-analysis": Object.freeze([
     "index.js",
     "package.json",
+    "src/included-allowance-speed.js",
     "src/model-composition.js",
     "src/plan-attribution.js",
     "src/quota-calibration.js",

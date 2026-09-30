@@ -6,6 +6,7 @@ import {
   createTelemetryPerformanceScheduler,
   initialTelemetryPerformanceSyncState,
   parseTelemetryPerformanceSyncState,
+  resumeTelemetryPerformanceSyncAfterAuthorization,
 } from "../../src/application/index.js";
 import {
   createAccountlessChildChannel,
@@ -223,7 +224,10 @@ export function createLocalAccountlessContribution({
   let performanceScheduler;
   let performanceGrantGeneration = 0;
   let performanceGrantedGeneration = -1;
-  let performanceResumeRequested = false;
+  // A new process must negotiate the current dictionary once even when the
+  // previous client persisted a rejected older grant. The protected preference
+  // and a fresh independent hosted grant still gate all preparation/uploads.
+  let performanceResumeRequested = true;
   const bridge = createAccountlessChildChannel({ channel,
     onInvalidated: () => {
       performanceGrantGeneration += 1;
@@ -343,14 +347,17 @@ export function createLocalAccountlessContribution({
       readState: async () => {
         const state = await readPerformanceState(performanceStateFile);
         if (!performanceResumeRequested) return state;
-        let preference = null;
-        try { preference = await bridge.readPreference(); } catch { /* sync remains paused */ }
-        if (preference?.enabled !== true) return state;
+        try { assertPerformancePreference(await bridge.readPreference(), origin); }
+        catch { return state; }
         performanceResumeRequested = false;
+        const resumed = resumeTelemetryPerformanceSyncAfterAuthorization(state);
+        if (!resumed.paused) return resumed;
         if (state.paused && [
-          "authorization_rejected", "device_disconnected", "global_paused",
-          "retry_exhausted",
-        ].includes(state.pausedReason)) return initialTelemetryPerformanceSyncState();
+          "device_disconnected", "global_paused", "retry_exhausted",
+        ].includes(state.pausedReason)) {
+          return parseTelemetryPerformanceSyncState({ ...state, paused: false,
+            pausedReason: null, retryCount: 0, nextAttemptAt: null });
+        }
         return state;
       },
       saveState: (value) => writePerformanceState(performanceStateFile, value),

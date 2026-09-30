@@ -143,8 +143,8 @@ function rowFor(rows) {
   return result[0];
 }
 
-test('GPT-6 Sol and Luna preserve observed timing and model identity across parser restart', () => {
-  for (const model of ['gpt-6-sol', 'gpt-6-luna']) {
+test('GPT-6.1 Sol, GPT-6 Sol and Luna preserve observed timing and model identity across parser restart', () => {
+  for (const model of ['gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna']) {
     const rows = performanceFixture({ model });
     const before = parse(rows.slice(0, 6));
     const resumed = parse(rows.slice(6), JSON.parse(JSON.stringify(before.parser.state())));
@@ -161,12 +161,15 @@ test('GPT-6 Sol and Luna preserve observed timing and model identity across pars
 });
 
 test('GPT-6 model suffixes remain unknown and generation switches invalidate attribution', () => {
-  for (const name of ['sol', 'luna']) {
-    const unknown = rowFor(performanceFixture({ model: `gpt-6-${name}-unreviewed` }));
+  for (const [previous, current] of [
+    ['gpt-5.6-sol', 'gpt-6-sol'], ['gpt-5.6-luna', 'gpt-6-luna'],
+    ['gpt-6-sol', 'gpt-6.1-sol'],
+  ]) {
+    const unknown = rowFor(performanceFixture({ model: `${current}-unreviewed` }));
     assert.equal(unknown.model, null);
     assert.equal(unknown.turn_duration, null);
-    const rows = performanceFixture({ model: `gpt-5.6-${name}` });
-    rows.splice(6, 0, context(1001, 'synthetic-turn', `gpt-6-${name}`));
+    const rows = performanceFixture({ model: previous });
+    rows.splice(6, 0, context(1001, 'synthetic-turn', current));
     const mixed = rowFor(rows);
     assert.equal(mixed.model, null);
     assert.equal(mixed.duration, null);
@@ -250,6 +253,28 @@ test('per-turn context service tier overrides the thread setting at the task bou
     assert.equal(fast.speed_mode, 'fast', serviceTier);
     assert.equal(fast.speed_mode_source, 'turn_context_service_tier', serviceTier);
   }
+});
+
+test('Ultrafast remains a distinct observed mode through thread and per-turn parser restarts', () => {
+  for (const [options, source] of [
+    [{ serviceTier: 'ultrafast' }, 'rollout_thread_settings'],
+    [{ serviceTier: 'standard', contextServiceTier: 'ultrafast' }, 'turn_context_service_tier'],
+  ]) {
+    const rows = performanceFixture(options);
+    for (const split of [3, 4]) {
+      const prefix = parse(rows.slice(0, split));
+      const resumed = parse(rows.slice(split), prefix.parser.state()).result;
+      assert.equal(resumed.length, 1);
+      assert.equal(resumed[0].speed_mode, 'ultrafast');
+      assert.equal(resumed[0].speed_mode_source, source);
+      assert.equal(resumed[0].api_service_tier, 'unknown');
+      assert.equal(resumed[0].sample_duration, 2000);
+    }
+  }
+  const mixed = performanceFixture({ serviceTier: 'ultrafast' });
+  mixed.splice(4, 0, settings(1000, 'priority'));
+  assert.equal(rowFor(mixed).speed_mode, 'mixed');
+  assert.equal(rowFor(performanceFixture({ serviceTier: 'ultrafast-private' })).speed_mode, 'other');
 });
 
 test('contradictory or malformed per-turn service tier evidence fails closed', () => {

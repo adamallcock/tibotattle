@@ -16,19 +16,20 @@ const STANDALONE_PERIODS = ["7", "30", "all"];
 // The shared dashboard can request the 24-hour backend period (`1`), while
 // the standalone controls intentionally expose only the standard periods.
 const PRELOAD_PERIODS = STANDALONE_PERIODS;
-const MAX_READY_PERIODS = 8;
+const MAX_READY_PERIODS = 12;
 // Keep the in-memory period cache useful across quick switches while ensuring
 // each entry is eventually revalidated. The cache holds at most the four
-// shared periods in two speed modes; it never persists measurements in browser storage.
+// shared periods in three speed modes; it never persists measurements in browser storage.
 const PERIOD_CACHE_TTL_MS = 60_000;
 // A first history pass can take minutes. Continue bounded background retries
 // while the document is visible instead of giving up after ten seconds.
 const PRELOAD_MAX_ATTEMPTS = 24;
 const preloadRetryDelay = attempt => Math.min(30_000, 5_000 * 2 ** attempt);
 const SPEED_METHOD = "speed";
-const SPEED_MODES = ["standard", "fast"];
+const SPEED_MODES = ["standard", "fast", "ultrafast"];
 const MODEL_NAMES = Object.freeze({
-  "gpt-6-astra": "Astra", "gpt-6-sol": "GPT-6 Sol", "gpt-6-luna": "GPT-6 Luna",
+  "gpt-6-astra": "Astra", "gpt-6.1-sol": "GPT-6.1 Sol",
+  "gpt-6-sol": "GPT-6 Sol", "gpt-6-luna": "GPT-6 Luna",
   "gpt-5.6-terra": "Terra", "gpt-5.6-sol": "Sol", "gpt-5.6-luna": "Luna",
   "gpt-5.5": "GPT-5.5", "gpt-5.4": "GPT-5.4",
   "gpt-5.4-mini": "GPT-5.4 mini", "gpt-5.3-codex-spark": "Spark",
@@ -505,7 +506,7 @@ export function mountModelPerformance(options = {}) {
       });
       modes.append(button);
     }
-    modeControls.append(modes, element("p", "performance-mode-note", translate(speedMode === "fast" ? "fastNote" : "standardNote")));
+    modeControls.append(modes, element("p", "performance-mode-note", translate(`${speedMode}Note`)));
     root.append(modeControls);
     if (payload?.excludedUnknownTurns) root.append(element("p", "performance-mode-note", translate("unknownMode", { count: number(payload.excludedUnknownTurns) })));
     const status = element("p", "performance-status"); status.setAttribute("role", "status");

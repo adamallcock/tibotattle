@@ -950,7 +950,7 @@ const PERFORMANCE_SPEED_METHODS = Object.freeze(["receipt", "tool_free"]);
 const PERFORMANCE_METHOD_VERSION = "performance-daily-histogram-v1";
 const PERFORMANCE_SCOPE = "model-performance-daily";
 const PERFORMANCE_RECORD_SCHEMA_VERSION = "model-performance-daily-v1";
-const PERFORMANCE_FIELD_DICTIONARY_VERSION = "telemetry-performance-registry-2026-09-21.1";
+const PERFORMANCE_FIELD_DICTIONARY_VERSION = "telemetry-performance-registry-2026-09-29.1";
 const PERFORMANCE_PRIVACY_CONTRACT_VERSION = "privacy-safe-model-performance-v1";
 
 function performanceOrigin(value) {
@@ -1303,6 +1303,8 @@ export function normalizeWindowBreakdown(payload) {
     tokens: 0,
     fastCostUsd: 0,
     fastEvents: 0,
+    ultrafastCostUsd: null,
+    ultrafastEvents: null,
     byModel: [],
     bySpeed: {},
     spark: { events: 0, costUsd: 0 },
@@ -1346,6 +1348,8 @@ export function normalizeWindowBreakdown(payload) {
     tokens: count(breakdown.tokens, 0),
     fastCostUsd: nonNegative(breakdown.fastCostUsd, 0),
     fastEvents: count(breakdown.fastEvents, 0),
+    ultrafastCostUsd: nonNegative(breakdown.ultrafastCostUsd, null),
+    ultrafastEvents: count(breakdown.ultrafastEvents, null),
     byModel,
     bySpeed,
     spark: {
@@ -2442,12 +2446,12 @@ const CACHE_SWITCH_ALLOWANCE_INTERPRETATION =
 const MONITORING_GAP_COPY = Object.freeze({
   quota_snapshots: ["Quota snapshots", "Current provider quota windows and their freshness."],
   account_attribution: ["Account attribution", "Whether quota and usage can be tied safely to one pseudonymous local account scope."],
-  fast_mode: ["Fast-mode accounting", "Codex records the speed mode only when it is applied or changed, never at session start, so turns before the first change in a session carry no recorded tier. An observed tier always wins; a timestamp-covered config declaration comes next, and anything neither covers is attributed to Standard as a visible assumption. Fast increments are priced at the published Priority (Fast) API rate for the model. Window-level inference is diagnostic only and never changes the money."],
+  fast_mode: ["Fast-mode accounting", "Codex can record speed in turn context or applied thread settings; older records can omit it. An observed tier always wins; a timestamp-covered config declaration comes next, and anything neither covers is attributed to Standard as a visible assumption. Fast and Ultrafast increments use published API rates for the exact model, context and date; unsupported Ultrafast remains unpriced. Window-level inference is diagnostic only and never changes the money."],
   subagents: ["Subagents and child rollouts", "Lineage-aware accounting excludes inherited parent snapshots before attributing genuine child-rollout increments; ambiguous lineage remains unknown."],
   shared_pool_surfaces: ["Work, Workspace Agents, Excel and connected Voice", "These shared-pool surfaces may not write complete local Codex evidence."],
   third_party_auth: ["Third-party ChatGPT-authenticated apps", "No complete local accounting source is available for third-party authenticated apps."],
   reasoning_effort: ["Reasoning effort", "The unified index can identify known reasoning changes for the switch diagnostic, but ordinary usage accounting does not yet provide a complete per-request reasoning-effort breakdown."],
-  api_service_tier: ["API service tier", "Subscription speed is separate; API standard, priority and flex are never inferred from it."],
+  api_service_tier: ["API service tier", "Subscription speed is separate; API standard, priority, ultrafast, batch and flex are never inferred from it."],
   provider_accounting_changes: ["Provider resets and accounting changes", "Reset propagation, credits, account tracks, and provider-side rule changes can move the observed allowance without a matching local usage increment."],
   unknown_token_components: ["Combined output components", "Some older snapshots expose only one combined output count. It is retained once and never added to separated text and reasoning output."],
   calculation_disagreement: ["Calculated usage versus observed quota", "Residual periods remain visible for review and may reflect missing surfaces, uncertain prices, reset contamination, or provider-side accounting."],
@@ -2692,7 +2696,7 @@ function normalizeCachePremiumWeighting(value, pricedDrops, standardPremium) {
       const premium = scenarios[scenario]?.quotaWeightedPremiumUsd;
       if (premium !== null && premium !== undefined
           && (premium + 0.000002 < standardPremium
-            || premium > standardPremium * 2.5 + 0.000002)) return null;
+            || premium > standardPremium * 6 + 0.000002)) return null;
     }
   }
   return {
@@ -3552,7 +3556,7 @@ function normalizeCacheContinuityImpact(value) {
   };
 }
 
-const OBSERVED_SPEED_KEYS = Object.freeze(["standard", "fast", "unknown"]);
+const OBSERVED_SPEED_KEYS = Object.freeze(["standard", "fast", "ultrafast", "unknown"]);
 // Published Priority (Fast) API price ratios over Standard, mirrored so the
 // dashboard never has to trust a server-supplied number to explain its own
 // arithmetic. Keys are canonical registered models; uncovered model/context/
@@ -3575,7 +3579,8 @@ const FAST_MODE_MULTIPLIERS = Object.freeze({
   "gpt-5.6-terra": 2,
   "gpt-6-astra": 2,
   "gpt-6-sol": 2,
-  "gpt-6-luna": 2
+  "gpt-6-luna": 2,
+  "gpt-6.1-sol": 2
 });
 const FAST_MODE_FAMILY_KEYS = Object.freeze([
   ...Object.keys(FAST_MODE_MULTIPLIERS), "unsupported"
@@ -3585,13 +3590,13 @@ const FAST_MODE_METRIC_LABEL = "Speed-priced API-price equivalent";
 const FAST_MODE_METRIC_SHORT_LABEL = "Speed-priced API equivalent";
 const FAST_MODE_STANDARD_METRIC_LABEL = "Standard-rate API-price equivalent";
 const FAST_MODE_METRIC_EXPLAINER =
-  "Standard-rate API prices, with Fast increments priced at the published Priority API rate for the exact model, context, and date. Where no eligible Priority rate exists, a disclosed assumed 2x Standard is used. This is a comparison, not a bill.";
+  "Standard-rate API prices, with Fast and Ultrafast increments priced at published API rates for the exact model, context, and date. Where no eligible Priority rate exists, Fast retains a disclosed assumed 2x Standard; unsupported Ultrafast remains unpriced. These comparisons do not measure included subscription allowance consumption.";
 const ALLOWANCE_SCENARIOS = Object.freeze([
   "unresolved_as_standard",
   "unresolved_as_fast"
 ]);
 const ALLOWANCE_BASIS_FAMILY_ID =
-  "codex_primary:speed_priced_api_equivalent:v3:priority_card_ratio_2026_08_30:event_time:observed_declared_scenario";
+  "codex_primary:speed_priced_api_equivalent:v4:published_speed_card_ratio_2026_09_29:event_time:observed_declared_scenario";
 const TIMELINE_ALLOWANCE_WEIGHTING_SCHEMA_VERSION =
   "quota-weighted-timeline-v0.1";
 const PLAN_SCOPED_TIMELINE_SCHEMA_VERSION =
@@ -3650,12 +3655,12 @@ function normalizeAllowanceScenario(value, scenario, usageEvents, standardUsd) {
   if (value?.basisId !== allowanceBasisId(scenario)
       || sourceWeightingStatus === null || coveredSubtotalUsd === null
       || coverage === null
-      || coveredSubtotalUsd > standardUsd * 2.5 + 0.00002
+      || coveredSubtotalUsd > standardUsd * 6 + 0.00002
       || (sourceWeightingStatus === "complete"
         ? quotaWeightedUsd === null
           || Math.abs(coveredSubtotalUsd - quotaWeightedUsd) > 0.00002
           || quotaWeightedUsd + 0.00002 < standardUsd
-          || quotaWeightedUsd > standardUsd * 2.5 + 0.00002
+          || quotaWeightedUsd > standardUsd * 6 + 0.00002
         : quotaWeightedUsd !== null)) return null;
   return {
     basisId: allowanceBasisId(scenario),
@@ -3834,16 +3839,15 @@ function normalizeFastMode(value) {
     unresolvedScenario: value?.unresolvedScenario === "unresolved_as_fast"
       ? "unresolved_as_fast"
       : "unresolved_as_standard",
-    // Codex records a tier only when the setting is applied or changed, never
-    // at session start, so turns before the first change in a session carry no
-    // recorded tier. The dashboard states this itself rather than reflecting a
-    // server claim.
-    logRecordsTierChangesOnly: true,
+    // Applied thread settings and explicit turn contexts provide speed
+    // evidence. Older sources can still omit the initial tier.
+    logRecordsTierChangesOnly: false,
     metricLabel: FAST_MODE_METRIC_LABEL,
     metricShortLabel: FAST_MODE_METRIC_SHORT_LABEL,
     metricExplainer: FAST_MODE_METRIC_EXPLAINER,
     standardMetricLabel: FAST_MODE_STANDARD_METRIC_LABEL,
     multipliers: { ...FAST_MODE_MULTIPLIERS },
+    ultrafastMultipliers: { "gpt-6-astra": 6 },
     quotaWeightedApiPriceEquivalentUsd: nonNegative(
       value?.quotaWeightedApiPriceEquivalentUsd,
       null
@@ -3864,6 +3868,8 @@ function normalizeFastMode(value) {
       0
     ),
     appliedMultipliers: {
+      ...(finite(value?.appliedMultipliers?.["ultrafast:gpt-6-astra"], null) !== null
+        ? { "ultrafast:gpt-6-astra": 6 } : {}),
       ...Object.fromEntries(
         Object.keys(FAST_MODE_MULTIPLIERS)
           .filter((family) => finite(value?.appliedMultipliers?.[family], null) !== null)
@@ -4681,7 +4687,7 @@ function normalizeSideChatHistoricalGap(value) {
   );
   const observedModels = array(exact?.observedModels)
     .filter((model) => LOCAL_MODELS.has(model));
-  const speedKeys = ["fast", "standard", "unknown", "other"];
+  const speedKeys = ["fast", "standard", "ultrafast", "unknown", "other"];
   const bySpeed = Object.fromEntries(speedKeys.map((speed) => {
     const row = exact?.bySpeed?.[speed];
     return [speed, {
@@ -5553,11 +5559,11 @@ function normalizeLocalAccounting(value = {}, {
     modelUsage,
     bySpeed: normalizeAccountingDimension(
       value.bySpeed,
-      new Set(["standard", "fast", "flex", "batch", "unknown"])
+      new Set(["standard", "fast", "ultrafast", "flex", "batch", "unknown"])
     ),
     byApiServiceTier: normalizeAccountingDimension(
       value.byApiServiceTier,
-      new Set(["standard", "priority", "flex", "batch", "unknown"])
+      new Set(["standard", "priority", "ultrafast", "flex", "batch", "unknown"])
     ),
     bySurface: normalizeAccountingDimension(
       value.bySurface,
@@ -6662,7 +6668,7 @@ export class LocalCompanionClient {
 
   modelPerformance(period = "all", { signal, endAt, speedMode = "standard" } = {}) {
     if (!["1", "7", "30", "all"].includes(period)) throw new RangeError("Unsupported display period");
-    if (!["standard", "fast"].includes(speedMode)) throw new RangeError("Unsupported speed mode");
+    if (!["standard", "fast", "ultrafast"].includes(speedMode)) throw new RangeError("Unsupported speed mode");
     const query = new URLSearchParams({ period, speedMode });
     if (endAt !== undefined) {
       const end = Date.parse(endAt);

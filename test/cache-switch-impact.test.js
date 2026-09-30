@@ -736,8 +736,8 @@ test("retained v15/v16/v17 parser suffixes retain cache continuity coverage afte
   }
 
   for (const parserVersion of [
-    "unified-rollout-typed-v19",
-    "unified-rollout-typed-v19-partial",
+    "unified-rollout-typed-v20",
+    "unified-rollout-typed-v20-partial",
     "unified-rollout-typed-v17-future",
   ]) {
     const continuity = analyzeCacheContinuityRows([continuityRow({

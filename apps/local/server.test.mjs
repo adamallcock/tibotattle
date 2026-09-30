@@ -373,7 +373,7 @@ test("published v10 through v17 upgrades to v18 receive a cold deadline without 
   const root = await mkdtemp(join(tmpdir(), "local-timeout-parser-upgrade-"));
   // Deliberately pin the target: another parser release must review its
   // predecessor set, not silently keep passing a generic mismatch test.
-  assert.equal(LOCAL_UNIFIED_INDEX_PARSER_VERSION, "unified-rollout-typed-v18");
+  assert.equal(LOCAL_UNIFIED_INDEX_PARSER_VERSION, "unified-rollout-typed-v19");
   const fixtures = [
     { name: "complete", cold: true },
     { name: "quarantine-partial", cold: true, generation: {
@@ -385,7 +385,7 @@ test("published v10 through v17 upgrades to v18 receive a cold deadline without 
     // Every fixture retains an older parser/generation row. Only publication
     // provenance may select the deadline, so this stays an ordinary refresh.
     { name: "current-with-old-history", parserVersion: LOCAL_UNIFIED_INDEX_PARSER_VERSION },
-    { name: "future", parserVersion: "unified-rollout-typed-v19" },
+    { name: "future", parserVersion: "unified-rollout-typed-v20" },
     { name: "unknown", parserVersion: "unknown-parser" },
     { name: "empty", parserVersion: "" },
     { name: "malformed-version", parserVersion: "unified-rollout-typed-v011" },
@@ -400,8 +400,8 @@ test("published v10 through v17 upgrades to v18 receive a cold deadline without 
     { name: "v17-partial-parser", parserVersion: "unified-rollout-typed-v17-partial" },
     { name: "v17-assumed-parser", parserVersion: "unified-rollout-typed-v17-cache-write-zero" },
     { name: "v17-parent-model-parser", parserVersion: "unified-rollout-typed-v17-parent-model" },
-    { name: "current-partial-parser", parserVersion: "unified-rollout-typed-v18-partial" },
-    { name: "current-assumed-parser", parserVersion: "unified-rollout-typed-v18-cache-write-zero" },
+    { name: "current-partial-parser", parserVersion: "unified-rollout-typed-v19-partial" },
+    { name: "current-assumed-parser", parserVersion: "unified-rollout-typed-v19-cache-write-zero" },
     { name: "unreviewed-predecessor", parserVersion: "unified-rollout-typed-v9" },
     { name: "missing-publication", metadata: { current_generation_id: undefined } },
     { name: "unknown-publication", metadata: { current_generation_id: "99" } },

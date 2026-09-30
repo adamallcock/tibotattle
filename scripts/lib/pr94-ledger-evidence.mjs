@@ -24,6 +24,10 @@ const WARNING_CODES = Object.freeze([
   "discount_not_applied", "provider_reported_cost_mismatch", "provider_reported_cost_used",
   "price_source_disagreement",
 ]);
+// Preserve the frozen v1 zero-counter shape and transport bytes. New reviewed
+// reasons are emitted only when observed; absent optional counters mean zero.
+const OPTIONAL_WARNING_CODES = Object.freeze(["total_input_context_missing"]);
+const ACCEPTED_WARNING_CODES = Object.freeze([...WARNING_CODES, ...OPTIONAL_WARNING_CODES]);
 const VERSION = "pr94-ledger-evidence-v1";
 const PRIVATE_VERSION = "pr94-ledger-evidence-private-v1";
 const MAX_ROWS = 10_000_000;
@@ -195,7 +199,7 @@ function pricedUsage(result, raw) {
   const context = result.pricingContext;
   atom(context.serviceTier); atom(context.tierSource); atom(context.priceEpochBasis);
   atom(context.region, true); instant(context.pricedAt, true);
-  if (Object.hasOwn(context, "historicalPriceReasonCode")) member(context.historicalPriceReasonCode, WARNING_CODES);
+  if (Object.hasOwn(context, "historicalPriceReasonCode")) member(context.historicalPriceReasonCode, ACCEPTED_WARNING_CODES);
   member(result.coverageStatus, COVERAGE);
   decimal(result.totalUsd);
   closed(result.coverageCounts, ["pricedComponents", "unpricedComponents", "unavailableComponents"]);
@@ -228,7 +232,7 @@ function pricedUsage(result, raw) {
     } else {
       if (component.unitPriceUsd !== null || component.costUsd !== null || component.priceCardId !== null) fail();
       if (component.pricedAs !== null && component.pricedAs !== name) fail();
-      member(component.reasonCode, WARNING_CODES);
+      member(component.reasonCode, ACCEPTED_WARNING_CODES);
       if (status === "unavailable" && component.reasonCode !== "component_observation_unavailable") fail();
     }
     // Deliberately omit accounting diagnostic messages and arbitrary metadata.
@@ -266,7 +270,7 @@ function pricedUsage(result, raw) {
     if (!Array.isArray(result.warnings[kind]) || result.warnings[kind].length > 128) fail();
     warnings[kind] = result.warnings[kind].map((item) => {
       closed(item, ["code", "message", "metadata"]);
-      return member(item.code, WARNING_CODES);
+      return member(item.code, ACCEPTED_WARNING_CODES);
     }).sort();
   }
   let registry = null;
@@ -342,7 +346,10 @@ export function validatePr94LedgerEvidenceAggregate(value) {
   if (sumCount(...Object.values(usage.coverage)) !== usage.events) fail();
   closed(usage.warnings, ["coverage", "informational"]);
   for (const kind of ["coverage", "informational"]) {
-    closed(usage.warnings[kind], WARNING_CODES);
+    closed(usage.warnings[kind], WARNING_CODES, OPTIONAL_WARNING_CODES);
+    for (const code of OPTIONAL_WARNING_CODES) {
+      if (Object.hasOwn(usage.warnings[kind], code) && count(usage.warnings[kind][code]) === 0) fail();
+    }
     for (const value of Object.values(usage.warnings[kind])) {
       if (BigInt(count(value)) > BigInt(usage.events) * 128n) fail();
     }
@@ -409,7 +416,7 @@ export function createPr94LedgerEvidence(configuration) {
           }
           aggregate.usage.coverage[price.coverageStatus] = sumCount(aggregate.usage.coverage[price.coverageStatus], 1);
           for (const kind of ["coverage", "informational"]) for (const code of price.warnings[kind]) {
-            aggregate.usage.warnings[kind][code] = sumCount(aggregate.usage.warnings[kind][code], 1);
+            aggregate.usage.warnings[kind][code] = sumCount(aggregate.usage.warnings[kind][code] ?? 0, 1);
           }
         } };
       });

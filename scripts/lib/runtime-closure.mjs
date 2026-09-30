@@ -141,6 +141,7 @@ export const RUNTIME_ACCOUNTING_FILES = Object.freeze([
 export const RUNTIME_QUOTA_ANALYSIS_FILES = Object.freeze([
   "index.js",
   "package.json",
+  "src/included-allowance-speed.js",
   "src/model-composition.js",
   "src/plan-attribution.js",
   "src/quota-calibration.js",

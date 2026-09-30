@@ -1,6 +1,7 @@
 import {
   canonicalRateLimitSnapshot,
   codexSessionMetaIdentity,
+  codexTierObservation,
   cumulativeSnapshotKey,
   extractToolObservations,
 } from "./providers/codex/logs.js";
@@ -784,6 +785,20 @@ export async function extractRolloutUsage(path, {
         if (typeof record.payload?.model === "string") {
           currentModel = record.payload.model;
         }
+        const tierObservation = codexTierObservation(record);
+        if (tierObservation?.status === "malformed") {
+          diagnostics.malformedAccountingRecords += 1;
+          return;
+        }
+        if (tierObservation?.status === "observed") {
+          const priorMs = tierState === null || tierState.inherited === true
+            ? Number.NEGATIVE_INFINITY : tierState.observedAtMs;
+          if (observedAtMs >= priorMs) tierState = {
+            providerTierRaw: tierObservation.rawTier, observedAtMs,
+            tierSource: "turn_override",
+          };
+          diagnostics.tierEvents += 1;
+        }
         const effort = record.payload?.effort;
         if (typeof effort === "string" && REASONING_EFFORT_VALUES.has(effort)) {
           currentEffort = effort;
@@ -828,6 +843,7 @@ export async function extractRolloutUsage(path, {
             tierState = {
               providerTierRaw: safeClassification(raw),
               observedAtMs,
+              tierSource: "rollout_thread_settings",
             };
           }
         }

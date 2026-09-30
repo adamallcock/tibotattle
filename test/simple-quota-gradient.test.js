@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { compositionExpectedPp } from "@app-usagemonitor/quota-analysis";
+import { priceCodexUsageEvent } from "@app-usagemonitor/accounting";
 import {
   analyzeFastDiagnostic,
   analyzeSimpleQuotaGradient,
@@ -170,6 +171,87 @@ test("captured Fast weighting reconciles a Fast segment with a later Standard re
   assert.equal(result.windowDiagnostics.length, 3);
   assert.deepEqual(result.windowDiagnostics.map((row) => row.window_hours), [1, 2, 3]);
   assert.match(result.hourly[0].hour_end_eastern_label, /EDT/);
+});
+
+function ultrafastDiagnosticFixture() {
+  const base = {
+    provider: "openai_codex", planType: "pro", limitId: "codex", slot: "primary",
+    windowDurationMins: 10_080, resetsAt: 1_800_000_000, marginalUsageEventCount: 1,
+  };
+  const priced = priceCodexUsageEvent({
+    model: "gpt-6-astra", timestamp: "2026-09-29T14:10:00.000Z",
+    totalInputContextTokens: 1_000, components: { input_uncached_tokens: 1_000 },
+  });
+  const snapshotIntervals = [{
+    ...base, priorObservedAt: "2026-09-29T14:00:00.000Z", eventTime: "2026-09-29T14:10:00.000Z",
+    marginalApiPricedUsd: 2, priorUsedPercent: 10, nextUsedPercent: 11,
+    tierUsageEventCounts: { ultrafast: 1 }, modelMix: { "gpt-6-astra": { events: 1, costUsd: 2 } },
+    priceCardIds: priced.selectedPriceCardIds,
+  }, {
+    ...base, eventTime: "2026-09-29T22:10:00.000Z", marginalApiPricedUsd: 5,
+    priorUsedPercent: 11, nextUsedPercent: 12, tierUsageEventCounts: { standard: 1 },
+  }];
+  const options = {
+    fastStart: "2026-09-29T14:00:00.000Z", fastEnd: "2026-09-29T18:00:00.000Z",
+    referenceStart: "2026-09-29T22:00:00.000Z", referenceEnd: "2026-09-30T00:00:00.000Z",
+  };
+  return { snapshotIntervals, options };
+}
+
+test("captured Ultrafast intervals use eligible API prices and retain their observed counts", () => {
+  const { snapshotIntervals, options } = ultrafastDiagnosticFixture();
+  const result = analyzeFastDiagnostic({ snapshotIntervals }, options);
+  assert.equal(result.fast.rawCostUsd, 2);
+  assert.equal(result.fast.tierWeightedCostUsd, 12);
+  assert.equal(result.fast.tierWeightedImpliedCapacityUsd, 1_200);
+  assert.equal(result.fast.eventCounts.ultrafast, 1);
+  assert.equal(result.fast.costs.ultrafast, 2);
+  assert.equal(result.ultrafastWeightingBasis, "published_api_price_ratio_not_included_allowance");
+  assert.match(result.segmentTable[0].speed_evidence, /1 Ultrafast events/u);
+  const weighted = result.hourly.find((row) => row.series === "Expected with captured speed pricing");
+  assert.equal(weighted.ultrafast_events, 1);
+  assert.equal(weighted.quota_change_pp, 2.4);
+  assert.equal(result.windowRowsByHours[1][0].ultrafast_events, 1);
+});
+
+test("unqualified or mixed Ultrafast intervals preserve raw cost and make every weighted aggregate unavailable", () => {
+  for (const change of [
+    { modelMix: { "gpt-6.1-sol": { events: 1, costUsd: 2 } } },
+    { modelMix: undefined },
+    { modelMix: { "gpt-6-astra": { events: 1, costUsd: 1 } } },
+    { priceCardIds: [] },
+    { priorObservedAt: undefined },
+    { priorObservedAt: "2026-09-28T23:59:00.000Z" },
+    { quality: { pricingWarnings: ["partially_priced"] } },
+    { tierUsageEventCounts: { fast: 1, ultrafast: 1 }, marginalUsageEventCount: 2 },
+  ]) {
+    const { snapshotIntervals, options } = ultrafastDiagnosticFixture();
+    snapshotIntervals[0] = { ...snapshotIntervals[0], ...change };
+    const result = analyzeFastDiagnostic({ snapshotIntervals }, options);
+    assert.equal(result.fast.rawCostUsd, 2);
+    assert.equal(result.fast.eventCounts.ultrafast, 1);
+    assert.equal(result.fast.tierWeightedCostUsd, null);
+    assert.equal(result.fast.tierWeightedImpliedCapacityUsd, null);
+    const weighted = result.hourly.find((row) => row.series === "Expected with captured speed pricing");
+    assert.equal(weighted.tier_weighted_cost_usd, null);
+    assert.equal(weighted.quota_change_pp, null);
+    for (const hours of [1, 2, 3]) {
+      const first = result.windowRowsByHours[hours][0];
+      assert.equal(first.tier_weighted_cost_usd, null);
+      assert.equal(first.weighted_expected_quota_change_pp, null);
+      assert.equal(first.weighted_residual_pp, null);
+      const diagnostic = result.windowDiagnostics.find((row) => row.window_hours === hours);
+      assert.equal(diagnostic.weighted_mae_pp, null);
+      assert.equal(diagnostic.weighted_peak_absolute_residual_pp, null);
+      assert.equal(diagnostic.weighted_mae_reduction_fraction, null);
+    }
+  }
+});
+
+test("Ultrafast usage cannot form a Standard reference segment", () => {
+  const { snapshotIntervals, options } = ultrafastDiagnosticFixture();
+  snapshotIntervals[1].tierUsageEventCounts = { ultrafast: 1 };
+  assert.throws(() => analyzeFastDiagnostic({ snapshotIntervals }, options), /cannot use Ultrafast usage as a Standard reference/u);
 });
 
 // --- Composition-aware expected line and pool-saturation guard --------------

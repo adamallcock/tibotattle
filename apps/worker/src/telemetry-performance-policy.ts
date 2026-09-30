@@ -177,8 +177,18 @@ interface PerformanceCapabilityRow {
 interface PerformanceGrantHead {
   capability_revision: number;
   authority_epoch: number;
+  schema_version: string;
+  field_dictionary_version: string;
+  privacy_contract_version: string;
   state: "accepted" | "active" | "revoked";
   expires_at: string;
+}
+
+function currentGrantContract(head: PerformanceGrantHead | null): boolean {
+  return head !== null
+    && head.schema_version === PERFORMANCE_RECORD_SCHEMA_VERSION
+    && head.field_dictionary_version === PERFORMANCE_FIELD_DICTIONARY_VERSION
+    && head.privacy_contract_version === PERFORMANCE_PRIVACY_CONTRACT_VERSION;
 }
 
 function nextGrantTuple(
@@ -210,7 +220,8 @@ async function readPerformanceCapabilityHead(
   principal: TelemetryPerformancePrincipal,
 ): Promise<PerformanceGrantHead | null> {
   return db.prepare(
-    `SELECT capability_revision, authority_epoch, state, expires_at
+    `SELECT capability_revision, authority_epoch, schema_version,
+            field_dictionary_version, privacy_contract_version, state, expires_at
        FROM telemetry_performance_device_capabilities
       WHERE participant_id = ? AND device_id = ?
       ORDER BY capability_revision DESC, authority_epoch DESC
@@ -223,7 +234,9 @@ async function readAccountlessPerformanceAuthorizationHead(
   principal: TelemetryPerformancePrincipal,
 ): Promise<PerformanceGrantHead | null> {
   return db.prepare(
-    `SELECT a.capability_revision, a.authority_epoch, a.state, a.expires_at
+    `SELECT a.capability_revision, a.authority_epoch,
+            a.performance_schema_version AS schema_version,
+            a.field_dictionary_version, a.privacy_contract_version, a.state, a.expires_at
        FROM accountless_telemetry_performance_authorizations a
       WHERE a.participant_id = ? AND a.device_credential_id = ?
       ORDER BY a.capability_revision DESC, a.authority_epoch DESC
@@ -399,6 +412,7 @@ export async function grantTelemetryPerformanceAccountlessAuthorization(
   const capabilityHead = await readPerformanceCapabilityHead(db, principal);
   const authorizationHead = await readAccountlessPerformanceAuthorizationHead(db, principal);
   const currentGrant = capabilityHead !== null && authorizationHead !== null
+    && currentGrantContract(capabilityHead) && currentGrantContract(authorizationHead)
     && capabilityHead.state === "accepted" && authorizationHead.state === "active"
     && capabilityHead.capability_revision === authorizationHead.capability_revision
     && capabilityHead.authority_epoch === authorizationHead.authority_epoch
@@ -445,6 +459,7 @@ export async function grantTelemetryPerformanceAccountlessAuthorization(
       const racedAuthorization = await readAccountlessPerformanceAuthorizationHead(db, principal);
       if (racedCapability?.state === "accepted"
           && racedAuthorization?.state === "active"
+          && currentGrantContract(racedCapability) && currentGrantContract(racedAuthorization)
           && racedCapability.capability_revision === racedAuthorization.capability_revision
           && racedCapability.authority_epoch === racedAuthorization.authority_epoch
           && racedCapability.expires_at === owner.expires_at
@@ -486,7 +501,8 @@ export async function grantTelemetryPerformanceSocialAuthorization(
     PERFORMANCE_PRIVACY_CONTRACT_VERSION, now).first<{ expires_at: string }>();
   if (!row || !instant(row.expires_at) || Date.parse(row.expires_at) <= nowEpoch) invalid("TELEMETRY_CONSENT_INVALID");
   const capabilityHead = await readPerformanceCapabilityHead(db, principal);
-  if (capabilityHead?.state === "accepted" && capabilityHead.expires_at === row.expires_at) {
+  if (capabilityHead?.state === "accepted" && currentGrantContract(capabilityHead)
+      && capabilityHead.expires_at === row.expires_at) {
     return readTelemetryPerformanceCapability(db, principal, nowEpoch);
   }
   const next = nextGrantTuple([capabilityHead]);
@@ -507,7 +523,8 @@ export async function grantTelemetryPerformanceSocialAuthorization(
         || message.includes("performance capability revision conflict")
         || message.includes("UNIQUE constraint failed: telemetry_performance_device_capabilities")) {
       const raced = await readPerformanceCapabilityHead(db, principal);
-      if (raced?.state === "accepted" && raced.expires_at === row.expires_at) {
+      if (raced?.state === "accepted" && currentGrantContract(raced)
+          && raced.expires_at === row.expires_at) {
         return readTelemetryPerformanceCapability(db, principal, nowEpoch);
       }
       invalid("TELEMETRY_CONSENT_INVALID");
@@ -520,7 +537,10 @@ export async function grantTelemetryPerformanceSocialAuthorization(
 export function telemetryPerformanceCapabilityResponse(
   row: PerformanceCapabilityRow,
 ): TelemetryPerformanceCapability {
-  if (row.state !== "accepted") invalid();
+  if (row.state !== "accepted"
+      || row.schema_version !== PERFORMANCE_RECORD_SCHEMA_VERSION
+      || row.field_dictionary_version !== PERFORMANCE_FIELD_DICTIONARY_VERSION
+      || row.privacy_contract_version !== PERFORMANCE_PRIVACY_CONTRACT_VERSION) invalid();
   return Object.freeze({
     schemaVersion: TELEMETRY_PERFORMANCE_CAPABILITIES_VERSION,
     lifecycle: "accepted",

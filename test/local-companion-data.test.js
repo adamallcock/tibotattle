@@ -41,6 +41,7 @@ import {
   readLocalUnifiedCompanionProjection,
 } from "../src/local-unified-companion-source.js";
 import { usageProjection } from "../src/local-companion-usage-model.js";
+import { readLocalUnifiedWindowBreakdown } from "../src/local-unified-window-breakdown.js";
 import {
   isAuthoritativeDashboardSnapshot,
   readAuthoritativeDashboardSnapshot,
@@ -159,7 +160,8 @@ test("usage projection preserves explicit context and absent-field pricing at 27
     const record = {
       observedAt: "2026-07-25T12:00:00.000Z",
       model: "gpt-5.6-sol",
-      components: { input_uncached_tokens: input, output_text_tokens: 20 },
+      components: { input_uncached_tokens: input, input_cache_read_tokens: 0,
+        input_cache_write_tokens: 0, output_text_tokens: 20, output_reasoning_tokens: 0 },
       ...context,
     };
     for (const price of [null, pricer]) {
@@ -168,6 +170,60 @@ test("usage projection preserves explicit context and absent-field pricing at 27
       assert.equal(projection.apiPriceEquivalentUsdExact, cost);
       assert.equal(projection.pricingCoverageStatus, "fully_priced");
     }
+  }
+});
+
+test("usage projection preserves missing inputs and known context in full and memoized pricing", () => {
+  const cases = [
+    { name: "absent inputs and context", inputs: {}, context: undefined, status: "unpriced", cost: null },
+    { name: "null inputs and context", inputs: {
+      input_uncached_tokens: null, input_cache_read_tokens: null, input_cache_write_tokens: null,
+    }, context: null, status: "unpriced", cost: null },
+    { name: "known zero inputs", inputs: {
+      input_uncached_tokens: 0, input_cache_read_tokens: 0, input_cache_write_tokens: 0,
+    }, context: null, status: "fully_priced", cost: "0.0002" },
+    { name: "explicit zero context with missing inputs", inputs: {}, context: 0,
+      status: "partially_priced", cost: "0.0002" },
+    { name: "explicit long context with missing inputs", inputs: {}, context: 272_001,
+      status: "partially_priced", cost: "0.0003" },
+  ];
+  const pricer = createAccountingPricer();
+  for (const { name, inputs, context, status, cost } of cases) {
+    const record = {
+      observedAt: "2026-09-29T12:00:00.000Z",
+      model: "gpt-6.1-sol",
+      totalInputContextTokens: context,
+      components: { ...inputs, output_text_tokens: 20, output_reasoning_tokens: 0 },
+    };
+    const projections = [null, pricer].map((price) => usageProjection(record, "unknown", price));
+    for (const projection of projections) {
+      assert.equal(projection.totalTokens, 20, name);
+      assert.equal(projection.components.output_text_tokens, 20, name);
+      assert.equal(projection.apiPriceEquivalentUsdExact, cost, name);
+      assert.equal(projection.apiPriceEquivalentUsd, Number(cost ?? 0), name);
+      assert.equal(projection.pricingCoverageStatus, status, name);
+      assert.equal(projection.priceCardIds.length, cost === null ? 0 : 1, name);
+    }
+    assert.deepEqual(projections[1], projections[0], name);
+  }
+});
+
+test("usage projection prices selected split output once when its combined alias is also observed", () => {
+  const record = {
+    observedAt: "2026-09-29T12:00:00.000Z",
+    model: "gpt-6.1-sol",
+    totalInputContextTokens: 0,
+    components: {
+      input_uncached_tokens: 0, input_cache_read_tokens: 0, input_cache_write_tokens: 0,
+      output_text_tokens: 20, output_reasoning_tokens: 10, output_combined_tokens: 30,
+    },
+  };
+  for (const price of [null, createAccountingPricer()]) {
+    const projection = usageProjection(record, "unknown", price);
+    assert.equal(projection.totalTokens, 30);
+    assert.equal(projection.components.output_combined_tokens, 0);
+    assert.equal(projection.apiPriceEquivalentUsdExact, "0.0003");
+    assert.equal(projection.pricingCoverageStatus, "fully_priced");
   }
 });
 
@@ -353,14 +409,14 @@ test("local companion builds a closed real-data projection without identifiers o
     assert.equal(fastModeGap.status, "partial");
     assert.match(
       fastModeGap.explanation,
-      /only when it is applied or changed, never at session start/u,
+      /turn context or applied thread settings/u,
     );
     const fastMode = snapshot.overview.accounting.fastMode;
     assert.equal(fastMode.unresolvedScenario, "unresolved_as_standard");
     assert.equal(fastMode.logObservability.sessionBaselineRecorded, false);
     assert.equal(fastMode.metricLabel, "Speed-priced API-price equivalent");
     assert.deepEqual(fastMode.multipliers, { ...FAST_MODE_QUOTA_MULTIPLIERS });
-    assert.equal(fastMode.multiplierSource.recordedAt, "2026-08-30");
+    assert.equal(fastMode.multiplierSource.recordedAt, "2026-09-29");
     assert.deepEqual(fastMode.coverage, {
       totalEvents: 2,
       observedEvents: 1,
@@ -717,7 +773,7 @@ test("development side-chat estimates adjust only the calibration timeline", asy
       {
         schemaVersion: "quota-weighted-timeline-v0.1",
         basisFamilyId:
-          "codex_primary:speed_priced_api_equivalent:v3:priority_card_ratio_2026_08_30:event_time:observed_declared_scenario",
+          "codex_primary:speed_priced_api_equivalent:v4:published_speed_card_ratio_2026_09_29:event_time:observed_declared_scenario",
         scenarioOrder: [
           "unresolved_as_standard",
           "unresolved_as_fast",
@@ -1333,7 +1389,10 @@ test("collector fallback keeps mixed event-time price provenance while an old re
       kind: "codex_rollout_usage_snapshot",
       observedAt,
       model: "gpt-5.6-terra",
-      components: { input_uncached_tokens: 1_000_000 },
+      components: {
+        input_uncached_tokens: 1_000_000, input_cache_read_tokens: 0,
+        input_cache_write_tokens: 0, output_text_tokens: 0, output_reasoning_tokens: 0,
+      },
     });
     await writeFile(
       join(root, ".usage-monitor", "collector-events.jsonl"),
@@ -2482,7 +2541,7 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
       sourceMode: "unified",
       unifiedIndexFile,
       expectedGeneration: built.generation,
-      contextBehavior: "legacy_zero",
+      contextBehavior: "source_native",
       codexHome: root,
       now: () => Date.parse("2026-07-25T12:00:00.000Z"),
     });
@@ -2516,7 +2575,7 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
     assert.equal(unifiedSnapshot.overview.accounting.sourceMode, "unified");
     assert.equal(
       unifiedSnapshot.overview.accounting.compatibilityBehavior,
-      "legacy_zero",
+      "source_native",
     );
     assert.equal(
       unifiedSnapshot.overview.accounting.generationMatched,
@@ -2583,7 +2642,7 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
       sourceMode: "unified",
       unifiedIndexFile,
       expectedGeneration: toolPartialGeneration,
-      contextBehavior: "legacy_zero",
+      contextBehavior: "source_native",
       codexHome: root,
       now: () => Date.parse("2026-07-25T12:00:00.000Z"),
     });
@@ -2681,12 +2740,77 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
   }
 });
 
+test("unified companion and window readers preserve output-only context evidence end to end", async () => {
+  const root = await fixtureRoot();
+  const start = "2026-09-29T12:00:00.000Z";
+  try {
+    const stateDirectory = join(root, ".usage-monitor");
+    const indexFile = join(stateDirectory, "output-only-index.sqlite");
+    const sessions = join(root, "sessions");
+    await mkdir(sessions);
+    const samples = [
+      { output_tokens: 20, reasoning_output_tokens: 0, total_tokens: 20 },
+      rolloutUsage(0, 20),
+      { input_tokens: 0, output_tokens: 20, reasoning_output_tokens: 0, total_tokens: 20 },
+      { input_tokens: 272_001, output_tokens: 20, reasoning_output_tokens: 0, total_tokens: 272_021 },
+    ];
+    await writeFile(join(sessions, "rollout-2026-09-29T12-00-00-output-only.jsonl"), `${[
+      { timestamp: start, type: "session_meta", payload: { id: "synthetic-output-only-session", thread_source: "user" } },
+      { timestamp: start, type: "turn_context", payload: { model: "gpt-6.1-sol", effort: "high" } },
+      ...samples.map((usage, index) => ({
+        timestamp: new Date(Date.parse(start) + index * 60_000).toISOString(),
+        type: "event_msg",
+        payload: { type: "token_count", info: { last_token_usage: usage, total_token_usage: null } },
+      })),
+    ].map(JSON.stringify).join("\n")}\n`);
+    const { rebuildLocalUnifiedIndex } = await import("../src/local-unified-index-build.js");
+    const built = await rebuildLocalUnifiedIndex({
+      codexHome: root, indexFile,
+      secretFile: join(stateDirectory, "output-only-device-salt"),
+      contractVersion: "companion-output-only-context-test-v1",
+    });
+    assert.equal(built.usageEvents, samples.length);
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      const rows = database.prepare(`
+        SELECT total_input_context AS context, tokens_in_uncached AS input
+        FROM usage_event ORDER BY observed_at_ms
+      `).all();
+      assert.deepEqual(rows.map((row) => row.context), [null, 0, 0, 272_001]);
+      assert.deepEqual(rows.map((row) => row.input), [null, 0, null, null]);
+    } finally {
+      database.close();
+    }
+    const companion = await readLocalUnifiedCompanionProjection({
+      indexFile, nowMs: Date.parse("2026-09-29T13:00:00.000Z"),
+    });
+    assert.equal(companion.status, "available");
+    const total = companion.usage.find((period) => period.id === "all");
+    assert.equal(total.events, 4);
+    assert.equal(total.totalTokens, 80);
+    assert.equal(total.apiPriceEquivalentUsdExact, "0.0007");
+    assert.deepEqual(total.pricingCoverage, {
+      fullyPricedEvents: 1, partiallyPricedEvents: 2, unpricedEvents: 1,
+    });
+    const window = await readLocalUnifiedWindowBreakdown({
+      indexFile, fromMs: Date.parse(start), toMs: Date.parse(start) + 5 * 60_000,
+    });
+    assert.equal(window.status, "available");
+    assert.equal(window.events, 4);
+    assert.equal(window.tokens, 80);
+    assert.equal(window.costUsd, 0.0007);
+    assert.equal(window.unpricedEvents, 1);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
 test("full unified snapshot prices stored context like the same-generation replay cache", async () => {
   const root = await fixtureRoot();
   const nowMs = Date.parse("2026-08-30T00:00:00.000Z");
   const cases = [
-    { at: "2026-07-01T12:00:00.000Z", input: 272_000, context: null, cost: 1.3606 },
-    { at: "2026-07-02T12:00:00.000Z", input: 300_000, context: null, cost: 1.5006 },
+    { at: "2026-07-01T12:00:00.000Z", input: 272_000, context: null, cost: 2.7209 },
+    { at: "2026-07-02T12:00:00.000Z", input: 300_000, context: null, cost: 3.0009 },
     { at: "2026-08-29T11:00:00.000Z", input: 271_999, context: null, cost: 1.088396 },
     { at: "2026-08-29T12:00:00.000Z", input: 272_000, context: 271_999, cost: 1.0884 },
     { at: "2026-08-29T13:00:00.000Z", input: 271_999, context: 272_000, cost: 2.176592 },
@@ -2741,7 +2865,7 @@ test("full unified snapshot prices stored context like the same-generation repla
       assert.deepEqual(currentRows.map((row) => row.output), cases.map(() => 20));
 
       // Recreate the historical missing-evidence rows explicitly so this
-      // pricing regression still proves legacy NULL semantics. The final two
+      // pricing regression proves complete components can establish context. The final two
       // rows retain their observed context totals for the contrasting case.
       for (const { at } of cases.filter((row) => row.context === null)) {
         database.prepare(`
@@ -2769,7 +2893,7 @@ test("full unified snapshot prices stored context like the same-generation repla
       sourceMode: "unified",
       unifiedIndexFile: indexFile,
       expectedGeneration: built.generation,
-      contextBehavior: "legacy_zero",
+      contextBehavior: "source_native",
       codexHome: root,
       now: () => nowMs,
     });
@@ -2784,7 +2908,7 @@ test("full unified snapshot prices stored context like the same-generation repla
     assert.equal(accounting.accountingCacheStatus, "available");
     assert.equal(accounting.generationMatched, true);
     assert.equal(accounting.generationFingerprint, built.generation.fingerprint);
-    assert.equal(accounting.compatibilityBehavior, "legacy_zero");
+    assert.equal(accounting.compatibilityBehavior, "source_native");
     assert.equal(timeline.source, "unified_local_index");
     assert.equal(timeline.history.status, "complete");
     // Exercise the production builder, not a hand-shaped fixture: requiring
@@ -2802,7 +2926,7 @@ test("full unified snapshot prices stored context like the same-generation repla
     const history = accounting.periods.find((period) => period.periodId === "history");
     assert.equal(all.events, cases.length);
     assert.equal(all.totalTokens, 1_388_098);
-    assert.equal(all.apiPriceEquivalentUsd, 7.214588);
+    assert.equal(all.apiPriceEquivalentUsd, 10.075188);
     for (const field of [
       "events", "totalTokens", "apiPriceEquivalentUsd", "priceCardIds", "priceCardBreakdown",
     ]) {
@@ -3021,7 +3145,7 @@ test("an attested rollout quarantine publishes verified totals as a terminal gap
       sourceMode: "unified",
       unifiedIndexFile,
       expectedGeneration: built.generation,
-      contextBehavior: "legacy_zero",
+      contextBehavior: "source_native",
       codexHome: root,
       now: () => Date.parse("2026-07-25T12:00:00.000Z"),
     });

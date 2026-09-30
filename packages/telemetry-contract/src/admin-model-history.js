@@ -36,6 +36,12 @@ const adminHistoryPreviousIds = Object.freeze([
   "gpt-5.6-sol", "gpt-5.6-sol-wm", "gpt-5.6-terra", "gpt-6-astra", "o1",
   "o1-pro", "o3", "o3-mini", "o3-pro", "o4-mini", "gpt-6-sol", "gpt-6-luna",
 ]);
+// Frozen roster before GPT-6.1 Sol was published. Keep its forecast Astra
+// identity covered without claiming the new Sol identity was observed then.
+const adminHistorySeptember23Version = "reviewed-model-catalog-2026-09-23.1";
+const adminHistorySeptember23Ids = Object.freeze([
+  ...adminHistoryPreviousIds, "gpt-6.1-astra",
+]);
 // Frozen roster for reviewed-model-catalog-2026-09-03.1.
 const adminHistoryOlderIds = Object.freeze([
   "codex-auto-review", "gpt-4-turbo-2024-04-09", "gpt-4.1", "gpt-4.1-mini",
@@ -110,7 +116,9 @@ export function projectAdminModelHistoryDay(value) {
   }
   const ids = catalogVersion === ADMIN_MODEL_HISTORY_CATALOG_VERSION
     ? adminHistoryCurrentIds
-    : catalogVersion === PREVIOUS_ADMIN_MODEL_HISTORY_CATALOG_VERSION
+    : catalogVersion === adminHistorySeptember23Version
+      ? adminHistorySeptember23Ids
+      : catalogVersion === PREVIOUS_ADMIN_MODEL_HISTORY_CATALOG_VERSION
       ? adminHistoryPreviousIds
       : catalogVersion === OLDER_ADMIN_MODEL_HISTORY_CATALOG_VERSION
         ? adminHistoryOlderIds
@@ -142,7 +150,9 @@ export function expandAdminModelHistoryDay(value) {
   if (day === null) return null;
   const covered = new Set(day.catalogVersion === ADMIN_MODEL_HISTORY_CATALOG_VERSION
     ? adminHistoryCurrentIds
-    : day.catalogVersion === PREVIOUS_ADMIN_MODEL_HISTORY_CATALOG_VERSION
+    : day.catalogVersion === adminHistorySeptember23Version
+      ? adminHistorySeptember23Ids
+      : day.catalogVersion === PREVIOUS_ADMIN_MODEL_HISTORY_CATALOG_VERSION
       ? adminHistoryPreviousIds
       : day.catalogVersion === OLDER_ADMIN_MODEL_HISTORY_CATALOG_VERSION
         ? adminHistoryOlderIds : adminHistoryLegacyIds);

@@ -321,3 +321,20 @@ test("unknown model pricing warning blocks live execution", async () => {
   assert.ok(result.stopReasons.includes("pricing_warning"));
   assert.equal(executions, 0);
 });
+
+test("an Ultrafast manifest cannot select a missing measured sensitivity scenario", async () => {
+  const times = [0, 1, 3, 4].map(second => Date.parse(`2026-09-29T20:00:0${second}.000Z`));
+  const declaration = { ...manifest().tierDeclaration, codexSpeedMode: "ultrafast", providerTierRaw: "ultrafast" };
+  const result = await runExperiment({
+    manifest: manifest({ model: "gpt-6-astra", tierDeclaration: declaration }),
+    executeLive: true,
+    clock: () => times.shift(),
+    readSnapshot: async () => accountSnapshot(20),
+    readConcurrency: quietConcurrency,
+    executeWorkload: async () => ({ exitCode: 0 }),
+    scanUsage: async () => localUsage(),
+  });
+  assert.equal(result.measuredLocal.subscriptionSpeedSensitivity.observedSpeedMode, "ultrafast");
+  assert.equal(result.measuredLocal.subscriptionSpeedSensitivity.selectedScenario, null);
+  assert.equal(Object.hasOwn(result.measuredLocal.subscriptionSpeedSensitivity.scenarios, "ultrafast"), false);
+});

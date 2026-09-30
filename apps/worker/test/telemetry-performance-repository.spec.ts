@@ -20,6 +20,7 @@ import {
   assertTelemetryPerformanceWriteAllowed,
   grantTelemetryPerformanceAccountlessAuthorization,
   grantTelemetryPerformanceSocialAuthorization,
+  readTelemetryPerformanceCapability,
 } from "../src/telemetry-performance-policy";
 import {
   ACCOUNTLESS_RENEWAL_SCHEMA_VERSION,
@@ -41,6 +42,9 @@ const bindings = env as Bindings;
 const db = () => bindings.USAGE_MONITOR_DB;
 const DAY = "2026-09-21";
 const NOW = Date.parse("2026-09-21T12:00:00.000Z");
+const PREVIOUS_DICTIONARY = "telemetry-performance-registry-2026-09-21.1";
+const CURRENT_DICTIONARY = "telemetry-performance-registry-2026-09-29.1";
+const PERFORMANCE_UPGRADE = "0013_performance_ultrafast.sql";
 const AUTHORIZATION = {
   schemaVersion: "telemetry-performance-authorization-v1" as const,
   capabilityRevision: 1,
@@ -50,15 +54,19 @@ const AUTHORIZATION = {
   scope: "model-performance-daily" as const,
 };
 
-beforeEach(async () => {
+async function migrateFixture(includePerformanceUpgrade = true) {
   await reset();
   await applyD1Migrations(db(), bindings.TEST_MIGRATIONS);
   await applyD1Migrations(db(), bindings.TEST_TYPED_INGESTION_MIGRATIONS);
   await applyD1Migrations(db(), bindings.TEST_INGESTION_BRIDGE_MIGRATIONS);
   await applyD1Migrations(db(), bindings.TEST_TYPED_V11_ADMISSION_MIGRATIONS);
   await applyD1Migrations(db(), bindings.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
-  await applyD1Migrations(db(), bindings.TEST_INGESTION_ISOLATION_MIGRATIONS);
-});
+  await applyD1Migrations(db(), bindings.TEST_INGESTION_ISOLATION_MIGRATIONS.filter(
+    (migration) => includePerformanceUpgrade || migration.name !== PERFORMANCE_UPGRADE,
+  ));
+}
+
+beforeEach(() => migrateFixture());
 
 function record(modelId = "gpt-5.6-luna") {
   return {
@@ -170,7 +178,7 @@ async function report(modelId = "gpt-5.6-luna", records = [record(modelId)], rep
     sourceRevision,
     methodVersion: "performance-daily-histogram-v1",
     parserVersion: "codex-parser-v17",
-    fieldDictionaryVersion: "telemetry-performance-registry-2026-09-21.1",
+    fieldDictionaryVersion: "telemetry-performance-registry-2026-09-29.1",
     privacyContractVersion: "privacy-safe-model-performance-v1",
     bucketSchemeVersion: "performance-histogram-v1",
     measurementVersion: "model-performance-samples-v1",
@@ -182,17 +190,66 @@ async function report(modelId = "gpt-5.6-luna", records = [record(modelId)], rep
   };
 }
 
-async function activatePerformance(fixture: Awaited<ReturnType<typeof createV11DeviceFixture>>) {
+async function activatePerformance(fixture: Awaited<ReturnType<typeof createV11DeviceFixture>>,
+  dictionary = CURRENT_DICTIONARY) {
   await db().prepare("UPDATE telemetry_performance_runtime SET state='active' WHERE id=1").run();
   await db().prepare(`INSERT INTO telemetry_performance_device_capabilities (
     participant_id, device_id, schema_version, field_dictionary_version,
     privacy_contract_version, scope, capability_revision, authority_epoch,
     issued_at, expires_at, state, consented_at
   ) VALUES (?, ?, 'model-performance-daily-v1',
-    'telemetry-performance-registry-2026-09-21.1',
+    ?,
     'privacy-safe-model-performance-v1', 'model-performance-daily', 1, 1,
     '2026-09-21T00:00:00.000Z', '2099-01-01T00:00:00.000Z', 'accepted',
-    '2026-09-21T00:00:00.000Z')`).bind(fixture.participantId, fixture.deviceId).run();
+    '2026-09-21T00:00:00.000Z')`).bind(fixture.participantId, fixture.deviceId, dictionary).run();
+}
+
+async function seedPreviousPerformanceReport(
+  fixture: Awaited<ReturnType<typeof createV11DeviceFixture>>, sourceRevision = 1,
+) {
+  const id = crypto.randomUUID();
+  const body = { ...await report(), fieldDictionaryVersion: PREVIOUS_DICTIONARY, sourceRevision };
+  const { reportRevision: _oldDigest, ...revisionBody } = body;
+  const revision = await sha256Hex(canonicalJson(revisionBody));
+  await db().prepare(`INSERT INTO telemetry_performance_reports (
+    id, participant_id, device_id, report_day, report_revision,
+    source_generation, source_digest, source_revision, method_version,
+    parser_version, schema_version, field_dictionary_version, privacy_contract_version,
+    bucket_scheme_version, measurement_version, record_count, canonical_bytes,
+    capability_revision, authority_epoch, state, created_at
+  ) VALUES (?, ?, ?, ?, ?, 'source:v1:fixture', ?, ?, 'performance-daily-histogram-v1',
+    'codex-parser-v17', 'model-performance-daily-v1', ?, 'privacy-safe-model-performance-v1',
+    'performance-histogram-v1', 'model-performance-samples-v1', 1, ?, 1, 1, 'current', ?)`)
+    .bind(id, fixture.participantId, fixture.deviceId, DAY, revision, body.sourceDigest,
+      sourceRevision, PREVIOUS_DICTIONARY, new TextEncoder().encode(canonicalJson({
+        ...revisionBody, reportRevision: revision,
+      })).byteLength, new Date(NOW).toISOString()).run();
+  await db().prepare(`INSERT INTO telemetry_performance_cohorts (
+    report_id, cohort_index, provider, model_id, reasoning_effort, speed_method,
+    speed_mode, speed_mode_source, api_service_tier, turns, speed_turns, ttft_turns,
+    completion_turns, timed_responses, speed_tokens, speed_duration_ms,
+    speed_min, speed_max, ttft_min, ttft_max, completion_min, completion_max
+  ) VALUES (?, 0, 'openai_codex', 'gpt-5.6-luna', 'high', 'receipt', 'standard',
+    'rollout_thread_settings', 'unknown', 1, 1, 1, 1, 1, 100, 1000,
+    100, 100, 100, 100, 1000, 1000)`).bind(id).run();
+  const sample = record();
+  for (const [metric, histogram] of [
+    ['speed', sample.speedHistogram], ['ttft', sample.ttftHistogram],
+    ['turnDuration', sample.completionHistogram],
+  ] as const) {
+    for (const [bucket, count] of Object.entries(histogram.buckets)) {
+      await db().prepare(`INSERT INTO telemetry_performance_buckets (
+        report_id, cohort_index, metric, bucket_index, bucket_count
+      ) VALUES (?, 0, ?, ?, ?)`).bind(id, metric, Number(bucket), count).run();
+    }
+  }
+  await db().prepare(`INSERT INTO telemetry_performance_receipts (
+    id, participant_id, device_id, report_id, report_day, report_revision,
+    envelope_digest, outcome, created_at
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, 'accepted', ?)`).bind(crypto.randomUUID(),
+    fixture.participantId, fixture.deviceId, id, DAY, revision,
+    String(sourceRevision).repeat(64), new Date(NOW).toISOString()).run();
+  return { id, revision, body: { ...revisionBody, reportRevision: revision } };
 }
 
 async function createAccountlessPerformanceFixture() {
@@ -224,6 +281,172 @@ async function createAccountlessPerformanceFixture() {
 }
 
 describe("independent performance report repository", () => {
+  it("rolls back the dictionary migration after a late failure without losing historical rows", async () => {
+    await migrateFixture(false);
+    const fixture = await createV11DeviceFixture(db());
+    await activatePerformance(fixture, PREVIOUS_DICTIONARY);
+    await seedPreviousPerformanceReport(fixture);
+    const before = await readTelemetryPerformanceReports(db(), fixture.participantId);
+    const previousRuntime = await db().prepare("SELECT * FROM telemetry_performance_runtime").first();
+    const migration = bindings.TEST_INGESTION_ISOLATION_MIGRATIONS.find(
+      (candidate) => candidate.name === PERFORMANCE_UPGRADE,
+    );
+    if (!migration) throw new Error("missing synthetic performance migration");
+    await expect(applyD1Migrations(db(), [{ ...migration, queries: [...migration.queries,
+      "INSERT INTO telemetry_performance_runtime SELECT * FROM telemetry_performance_runtime",
+    ] }])).rejects.toThrow(/UNIQUE constraint/u);
+    expect(await db().prepare("SELECT * FROM telemetry_performance_runtime").first()).toEqual(previousRuntime);
+    expect(await readTelemetryPerformanceReports(db(), fixture.participantId)).toEqual(before);
+    expect((await db().prepare("PRAGMA foreign_key_check").all()).results).toEqual([]);
+    expect((await db().prepare("SELECT name FROM sqlite_master WHERE name LIKE 'performance_upgrade_%'").all()).results).toEqual([]);
+    expect(await db().prepare("SELECT name FROM d1_migrations WHERE name=?").bind(PERFORMANCE_UPGRADE).first()).toBeNull();
+    await applyD1Migrations(db(), [migration]);
+    expect(await readTelemetryPerformanceReports(db(), fixture.participantId)).toEqual(before);
+  });
+
+  it("migrates the performance dictionary without changing history or reusing old consent", async () => {
+    await migrateFixture(false);
+    const fixture = await createV11DeviceFixture(db());
+    await db().prepare("UPDATE device_credentials SET expires_at=? WHERE id=?")
+      .bind(AUTHORIZATION.expiresAt, fixture.deviceId).run();
+    await activatePerformance(fixture, PREVIOUS_DICTIONARY);
+    const first = await seedPreviousPerformanceReport(fixture);
+    await db().prepare("UPDATE telemetry_performance_reports SET state='superseded', superseded_at=? WHERE id=?")
+      .bind(new Date(NOW + 1000).toISOString(), first.id).run();
+    const second = await seedPreviousPerformanceReport(fixture, 2);
+    const currentReport = await report("gpt-6.1-sol", [{ ...record("gpt-6.1-sol"),
+      speedMode: "ultrafast", speedModeSource: "turn_context_service_tier",
+    }]);
+    await expect(admitTelemetryPerformanceReport(db(), fixture, currentReport, AUTHORIZATION,
+      "e".repeat(64), NOW)).rejects.toMatchObject({ code: "TELEMETRY_TRANSPORT_BLOCKED" });
+    await expect(readTelemetryPerformanceCapability(db(), fixture, NOW))
+      .rejects.toMatchObject({ code: "TELEMETRY_TRANSPORT_BLOCKED" });
+    await expect(db().prepare("UPDATE telemetry_performance_cohorts SET speed_mode='ultrafast' WHERE report_id=?")
+      .bind(second.id).run()).rejects.toThrow(/CHECK constraint/u);
+    const historicalTables = [
+      "accountless_telemetry_performance_authorizations", "telemetry_performance_device_capabilities",
+      "telemetry_performance_reports", "telemetry_performance_cohorts",
+      "telemetry_performance_buckets", "telemetry_performance_receipts",
+    ];
+    const before = await Promise.all(historicalTables.map((table) => db().prepare(`SELECT * FROM ${table}`).all()));
+    const runtime = await db().prepare("SELECT state, policy_revision, created_at FROM telemetry_performance_runtime").first();
+    await applyD1Migrations(db(), bindings.TEST_INGESTION_ISOLATION_MIGRATIONS.filter(
+      (migration) => migration.name === PERFORMANCE_UPGRADE,
+    ));
+    for (const [index, table] of historicalTables.entries()) {
+      const after = await db().prepare(`SELECT * FROM ${table}`).all();
+      expect(after.results).toEqual(before[index]!.results);
+    }
+    expect(await db().prepare("SELECT state, policy_revision, created_at, field_dictionary_version FROM telemetry_performance_runtime").first())
+      .toEqual({ ...runtime, policy_revision: Number(runtime!.policy_revision) + 1, field_dictionary_version: CURRENT_DICTIONARY });
+    expect((await db().prepare("PRAGMA foreign_key_check").all()).results).toEqual([]);
+    expect((await db().prepare("SELECT name FROM sqlite_master WHERE name LIKE 'performance_upgrade_%'").all()).results).toEqual([]);
+    const history = await readTelemetryPerformanceReports(db(), fixture.participantId, { includeSuperseded: true });
+    expect(history.reports).toHaveLength(2);
+    expect(history.reports.every((entry) => entry.fieldDictionaryVersion === PREVIOUS_DICTIONARY)).toBe(true);
+    expect(history.reports.map((entry) => entry.state).sort()).toEqual(["current", "superseded"]);
+    expect(history.reports.every((entry) => entry.cohorts[0]?.speedMode === "standard")).toBe(true);
+    await expect(admitTelemetryPerformanceReport(db(), fixture, currentReport, AUTHORIZATION,
+      "e".repeat(64), NOW)).rejects.toMatchObject({ code: "TELEMETRY_TRANSPORT_BLOCKED" });
+    await expect(grantTelemetryPerformanceSocialAuthorization(db(), fixture, {
+      schemaVersion: "model-performance-daily-v1", fieldDictionaryVersion: PREVIOUS_DICTIONARY,
+      privacyContractVersion: "privacy-safe-model-performance-v1", scope: "model-performance-daily",
+    }, NOW)).rejects.toMatchObject({ code: "TELEMETRY_CONSENT_INVALID" });
+    const renewed = await grantTelemetryPerformanceSocialAuthorization(db(), fixture, {
+      schemaVersion: "model-performance-daily-v1", fieldDictionaryVersion: CURRENT_DICTIONARY,
+      privacyContractVersion: "privacy-safe-model-performance-v1", scope: "model-performance-daily",
+    }, NOW);
+    expect(renewed.authorization).toMatchObject({ capabilityRevision: 2, authorityEpoch: 1 });
+    await expect(admitTelemetryPerformanceReport(db(), fixture, currentReport, AUTHORIZATION,
+      "e".repeat(64), NOW)).rejects.toMatchObject({ code: "TELEMETRY_TRANSPORT_BLOCKED" });
+    await expect(admitTelemetryPerformanceReport(db(), fixture, currentReport, renewed.authorization,
+      "e".repeat(64), NOW)).resolves.toMatchObject({ status: "replaced" });
+    await expect(admitTelemetryPerformanceReport(db(), fixture, currentReport, renewed.authorization,
+      "e".repeat(64), NOW)).resolves.toMatchObject({ status: "idempotent" });
+    const latest = await readTelemetryPerformanceReports(db(), fixture.participantId);
+    expect(latest.reports).toHaveLength(1);
+    expect(latest.reports[0]).toMatchObject({ fieldDictionaryVersion: CURRENT_DICTIONARY,
+      cohorts: [{ modelId: "gpt-6.1-sol", speedMode: "ultrafast",
+        speedModeSource: "turn_context_service_tier", apiServiceTier: "unknown" }],
+    });
+    await expect(db().prepare("UPDATE telemetry_performance_cohorts SET speed_mode='ultrafast' WHERE report_id=?")
+      .bind(second.id).run()).rejects.toThrow(/telemetry_performance_cohort_dictionary_mismatch/u);
+    await expect(db().prepare("UPDATE telemetry_performance_reports SET field_dictionary_version=? WHERE id=?")
+      .bind(CURRENT_DICTIONARY, second.id).run()).rejects.toThrow(/telemetry_performance_report_immutable/u);
+    expect(() => parseTelemetryPerformanceReport(second.body)).toThrow();
+    await eraseTelemetryPerformanceReports(db(), fixture.participantId);
+    expect((await readTelemetryPerformanceReports(db(), fixture.participantId, { includeSuperseded: true })).reports).toEqual([]);
+  });
+
+  it("requires a new accountless grant after the dictionary migration and preserves the old grant", async () => {
+    await migrateFixture(false);
+    const fixture = await createAccountlessPerformanceFixture();
+    await db().prepare("UPDATE telemetry_performance_runtime SET state='active' WHERE id=1").run();
+    const owner = await db().prepare("SELECT enrollment_device_id, expires_at FROM accountless_upload_owners WHERE participant_id=?")
+      .bind(fixture.participantId).first<{ enrollment_device_id: string; expires_at: string }>();
+    if (!owner) throw new Error("missing synthetic performance owner");
+    await db().prepare(`INSERT INTO accountless_telemetry_performance_authorizations (
+      enrollment_device_id, participant_id, device_credential_id, schema_version,
+      policy_version, authorization_basis, performance_schema_version,
+      field_dictionary_version, privacy_contract_version, scope, capability_revision,
+      authority_epoch, authorized_at, expires_at, state
+    ) VALUES (?, ?, ?, 'accountless-performance-owner-v1', 'accountless-telemetry-performance-policy-v1',
+      'accountless-performance-policy-v1', 'model-performance-daily-v1', ?,
+      'privacy-safe-model-performance-v1', 'model-performance-daily', 1, 1, ?, ?, 'active')`)
+      .bind(owner.enrollment_device_id, fixture.participantId, fixture.deviceId,
+        PREVIOUS_DICTIONARY, new Date(NOW).toISOString(), owner.expires_at).run();
+    await db().prepare(`INSERT INTO telemetry_performance_device_capabilities (
+      participant_id, device_id, schema_version, field_dictionary_version,
+      privacy_contract_version, scope, capability_revision, authority_epoch,
+      issued_at, expires_at, state, consented_at
+    ) VALUES (?, ?, 'model-performance-daily-v1', ?, 'privacy-safe-model-performance-v1',
+      'model-performance-daily', 1, 1, ?, ?, 'accepted', ?)`)
+      .bind(fixture.participantId, fixture.deviceId, PREVIOUS_DICTIONARY,
+        new Date(NOW).toISOString(), owner.expires_at, new Date(NOW).toISOString()).run();
+    const oldAuthorization = await db().prepare("SELECT * FROM accountless_telemetry_performance_authorizations").first();
+    const oldCapability = await db().prepare("SELECT * FROM telemetry_performance_device_capabilities").first();
+    await applyD1Migrations(db(), bindings.TEST_INGESTION_ISOLATION_MIGRATIONS.filter(
+      (migration) => migration.name === PERFORMANCE_UPGRADE,
+    ));
+    await expect(readTelemetryPerformanceCapability(db(), fixture, NOW))
+      .rejects.toMatchObject({ code: "TELEMETRY_TRANSPORT_BLOCKED" });
+    const request = {
+      schemaVersion: ACCOUNTLESS_TELEMETRY_PERFORMANCE_SCHEMA_VERSION,
+      policyVersion: ACCOUNTLESS_TELEMETRY_PERFORMANCE_POLICY_VERSION,
+      authorizationBasis: ACCOUNTLESS_TELEMETRY_PERFORMANCE_AUTHORIZATION_BASIS,
+    };
+    await grantTelemetryPerformanceAccountlessAuthorization(db(), fixture, request, NOW);
+    await grantTelemetryPerformanceAccountlessAuthorization(db(), fixture, request, NOW);
+    expect((await readTelemetryPerformanceCapability(db(), fixture, NOW)).authorization)
+      .toMatchObject({ capabilityRevision: 2, authorityEpoch: 1 });
+    expect(await db().prepare("SELECT * FROM accountless_telemetry_performance_authorizations WHERE capability_revision=1").first())
+      .toEqual(oldAuthorization);
+    expect(await db().prepare("SELECT * FROM telemetry_performance_device_capabilities WHERE capability_revision=1").first())
+      .toEqual(oldCapability);
+    expect((await db().prepare("SELECT capability_revision, field_dictionary_version FROM accountless_telemetry_performance_authorizations ORDER BY capability_revision").all()).results)
+      .toEqual([{ capability_revision: 1, field_dictionary_version: PREVIOUS_DICTIONARY },
+        { capability_revision: 2, field_dictionary_version: CURRENT_DICTIONARY }]);
+    expect((await db().prepare("PRAGMA foreign_key_check").all()).results).toEqual([]);
+  });
+
+  it("stores Ultrafast API tier and subscription mode in independent current cohorts", async () => {
+    const fixture = await createV11DeviceFixture(db());
+    await activatePerformance(fixture);
+    const records = [
+      { ...record("gpt-6.1-sol"), speedMode: "ultrafast", apiServiceTier: "unknown" },
+      { ...record("gpt-6-astra"), speedMode: "unknown", speedModeSource: "unobserved", apiServiceTier: "ultrafast" },
+    ].sort((a, b) => canonicalTelemetryPerformanceJson(a).localeCompare(canonicalTelemetryPerformanceJson(b)));
+    await admitTelemetryPerformanceReport(db(), fixture, await report("gpt-6.1-sol", records),
+      AUTHORIZATION, "b".repeat(64), NOW);
+    const actual = await readTelemetryPerformanceReports(db(), fixture.participantId);
+    expect(actual.reports[0]?.cohorts.map((entry) => [entry.speedMode, entry.apiServiceTier]).sort())
+      .toEqual([["ultrafast", "unknown"], ["unknown", "ultrafast"]]);
+    await expect(db().prepare("UPDATE telemetry_performance_cohorts SET speed_mode='ultrafast_future'").run())
+      .rejects.toThrow(/CHECK constraint/u);
+    await expect(db().prepare("UPDATE telemetry_performance_cohorts SET api_service_tier='ultrafast_future'").run())
+      .rejects.toThrow(/CHECK constraint/u);
+  });
+
   it("requires typed performance deployment without requiring v1.2 activation", async () => {
     await db().prepare("UPDATE telemetry_performance_runtime SET state='active' WHERE id=1").run();
     await expect(requireTelemetryPerformanceStorageMode(db(), {
@@ -460,7 +683,7 @@ describe("independent performance report repository", () => {
     )).rejects.toMatchObject({ code: "TELEMETRY_TRANSPORT_BLOCKED" });
     const capability = await grantTelemetryPerformanceSocialAuthorization(db(), fixture, {
       schemaVersion: "model-performance-daily-v1",
-      fieldDictionaryVersion: "telemetry-performance-registry-2026-09-21.1",
+      fieldDictionaryVersion: "telemetry-performance-registry-2026-09-29.1",
       privacyContractVersion: "privacy-safe-model-performance-v1",
       scope: "model-performance-daily",
     }, NOW);
@@ -479,7 +702,7 @@ describe("independent performance report repository", () => {
     if (!initialDevice) throw new Error("missing social performance device");
     const initial = await grantTelemetryPerformanceSocialAuthorization(db(), fixture, {
       schemaVersion: "model-performance-daily-v1",
-      fieldDictionaryVersion: "telemetry-performance-registry-2026-09-21.1",
+      fieldDictionaryVersion: "telemetry-performance-registry-2026-09-29.1",
       privacyContractVersion: "privacy-safe-model-performance-v1",
       scope: "model-performance-daily",
     }, baseNow);
@@ -489,7 +712,7 @@ describe("independent performance report repository", () => {
     const renewalNow = Date.parse(initialDevice.expires_at) + 1_000;
     const renewed = await grantTelemetryPerformanceSocialAuthorization(db(), fixture, {
       schemaVersion: "model-performance-daily-v1",
-      fieldDictionaryVersion: "telemetry-performance-registry-2026-09-21.1",
+      fieldDictionaryVersion: "telemetry-performance-registry-2026-09-29.1",
       privacyContractVersion: "privacy-safe-model-performance-v1",
       scope: "model-performance-daily",
     }, renewalNow);
@@ -520,7 +743,7 @@ describe("independent performance report repository", () => {
     await db().prepare("UPDATE telemetry_performance_runtime SET state='active' WHERE id=1").run();
     const initial = await grantTelemetryPerformanceSocialAuthorization(db(), fixture, {
       schemaVersion: "model-performance-daily-v1",
-      fieldDictionaryVersion: "telemetry-performance-registry-2026-09-21.1",
+      fieldDictionaryVersion: "telemetry-performance-registry-2026-09-29.1",
       privacyContractVersion: "privacy-safe-model-performance-v1",
       scope: "model-performance-daily",
     }, baseNow);
@@ -531,7 +754,7 @@ describe("independent performance report repository", () => {
       .bind(revokedAt, fixture.participantId, fixture.deviceId).run();
     const renewed = await grantTelemetryPerformanceSocialAuthorization(db(), fixture, {
       schemaVersion: "model-performance-daily-v1",
-      fieldDictionaryVersion: "telemetry-performance-registry-2026-09-21.1",
+      fieldDictionaryVersion: "telemetry-performance-registry-2026-09-29.1",
       privacyContractVersion: "privacy-safe-model-performance-v1",
       scope: "model-performance-daily",
     }, baseNow + 2_000);

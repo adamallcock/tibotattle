@@ -80,6 +80,7 @@ export {
   projectTelemetryPerformanceDay,
   initialTelemetryPerformanceSyncState,
   parseTelemetryPerformanceSyncState,
+  resumeTelemetryPerformanceSyncAfterAuthorization,
 } from "../contribution/index.js";
 export { createTelemetryPerformanceClient } from "./telemetry-performance-client.js";
 

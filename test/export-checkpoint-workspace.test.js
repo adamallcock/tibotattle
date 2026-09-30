@@ -174,7 +174,7 @@ test("checkpoint workspace atomically persists an initial tier batch and rejects
       byteOffset: 0,
       lineOrdinal: 0,
       checkpointSeq: 0,
-      parserVersion: "codex-checkpoint-state-v0.2",
+      parserVersion: "codex-checkpoint-state-v0.3",
       parserState: createEmptyCodexCheckpointState(),
       lastBatchSha256: null,
       parentSourceKey: null,
@@ -212,7 +212,7 @@ test("checkpoint workspace atomically persists an initial tier batch and rejects
     const snapshotKey = privateKey("cumulative-snapshot");
     const taskKey = privateKey("open-task");
     const parserState = createEmptyCodexCheckpointState();
-    parserState.tier = { timelineIndex: 1, speedMode: "fast", apiServiceTier: "priority" };
+    parserState.tier = { timelineIndex: 1, speedMode: "fast", apiServiceTier: "priority", tierSource: "rollout_thread_settings" };
     const batch = batchFor({
       sourceKey: source.sourceKey,
       expected: initial,
@@ -227,7 +227,7 @@ test("checkpoint workspace atomically persists an initial tier batch and rejects
         tierIndex: 0,
         eventTimeMs: Date.parse("2026-07-24T12:00:00.000Z"),
         lineOrdinal: 1,
-        tierState: { timelineIndex: 1, speedMode: "fast", apiServiceTier: "priority" },
+        tierState: { timelineIndex: 1, speedMode: "fast", apiServiceTier: "priority", tierSource: "rollout_thread_settings" },
       }],
       openTaskAdds: [taskKey],
       diagnosticDeltas: [{ code: "malformed_lines", count: 2 }],
@@ -251,7 +251,7 @@ test("checkpoint workspace atomically persists an initial tier batch and rejects
       tierIndex: 0,
       eventTimeMs: Date.parse("2026-07-24T12:00:00.000Z"),
       lineOrdinal: 1,
-      tierState: { timelineIndex: 1, speedMode: "fast", apiServiceTier: "priority" },
+      tierState: { timelineIndex: 1, speedMode: "fast", apiServiceTier: "priority", tierSource: "rollout_thread_settings" },
     }]);
     assert.deepEqual(workspace.sourceOpenTaskKeys(source.sourceKey), [taskKey]);
     assert.deepEqual(workspace.diagnostics(), [{ code: "malformed_lines", count: 2 }]);

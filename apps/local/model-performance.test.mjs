@@ -124,7 +124,7 @@ test("model performance mode selectors preserve optional exact windows and rejec
   } });
   const endAt = '2026-09-01T12:34:56.000Z';
   const route = `${base}/api/local/model-performance`;
-  for (const speedMode of ['standard', 'fast']) for (const anchored of [false, true]) {
+  for (const speedMode of ['standard', 'fast', 'ultrafast']) for (const anchored of [false, true]) {
     const response = await fetch(`${route}?period=1&speedMode=${speedMode}${anchored ? `&endAt=${endAt}` : ''}`);
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), { period: '1', speedMode, ...(anchored ? { endAt } : {}) });
@@ -134,5 +134,5 @@ test("model performance mode selectors preserve optional exact windows and rejec
     'speedMode=fast&period=all', 'speedMode=fast&extra=1']) {
     assert.equal((await fetch(`${route}?period=all&${query}`)).status, 400, query);
   }
-  assert.equal(calls.length, 4);
+  assert.equal(calls.length, 6);
 });

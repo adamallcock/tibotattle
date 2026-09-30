@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEPLOYMENT_ENDPOINTS } from "../../config/deployment-endpoints.js";
@@ -133,7 +133,7 @@ test("accountless performance scheduler obtains its own grant, backfills seven d
     supportedSpeedMethods: ["receipt", "tool_free"],
     requiredConsent: {
       schemaVersion: PERFORMANCE_RECORD_SCHEMA_VERSION,
-      fieldDictionaryVersion: "telemetry-performance-registry-2026-09-21.1",
+      fieldDictionaryVersion: "telemetry-performance-registry-2026-09-29.1",
       privacyContractVersion: "privacy-safe-model-performance-v1",
       scope: "model-performance-daily",
     },
@@ -195,7 +195,7 @@ test("accountless performance scheduler obtains its own grant, backfills seven d
       parserVersion: "codex-inference-timing-v17",
     });
   };
-  const selected = createLocalAccountlessContribution({
+  const createSelected = () => createLocalAccountlessContribution({
     environment: {
       USAGE_MONITOR_ACCOUNTLESS_ORIGIN: origin,
       USAGE_MONITOR_TEST_LANE: "accountless-local-lab-v1",
@@ -222,6 +222,7 @@ test("accountless performance scheduler obtains its own grant, backfills seven d
       },
     },
   });
+  let selected = createSelected();
   selected.start();
   const unavailable = await selected.performanceRunNow();
   assert.equal(unavailable.state, "retry_wait");
@@ -259,10 +260,38 @@ test("accountless performance scheduler obtains its own grant, backfills seven d
     grantFailure = failure;
     host.invalidate();
     await new Promise(resolve => setImmediate(resolve));
+    const before = requests.length;
     const rejected = await selected.performanceRunNow();
     assert.equal(rejected.state, "paused", failure);
+    assert.equal(requests.length, before + 1, "each renewed preference must re-prove the grant");
+    const persisted = JSON.parse(await readFile(join(stateRoot, "private", "accountless-performance-sync-state-v1.json"), "utf8"));
+    assert.equal(persisted.pausedReason, failure === "invalid" ? "response_invalid" : "authorization_rejected");
+    assert.equal(persisted.cursorDay, "2026-09-14", "reauthorization preserves acknowledged progress");
     assert.equal(requests.filter(item => item.path === "/api/v1/device/telemetry/performance/reports").length, 16);
   }
+  grantFailure = false;
+  const beforeUnapprovedRetry = requests.length;
+  assert.equal((await selected.performanceRunNow()).state, "paused");
+  assert.equal(requests.length, beforeUnapprovedRetry, "a terminal failure never retries on an ordinary poll");
+  host.invalidate();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal((await selected.performanceRunNow()).state, "up_to_date");
+  assert.equal(requests.filter(item => item.path === "/api/v1/device/telemetry/performance/reports").length, 24);
+  grantFailure = "forbidden";
+  host.invalidate();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal((await selected.performanceRunNow()).state, "paused");
+  await selected.stop();
+  grantFailure = false;
+  const beforeRestart = requests.length;
+  selected = createSelected();
+  selected.start();
+  assert.equal((await selected.performanceRunNow()).state, "up_to_date");
+  assert.equal(requests.slice(beforeRestart).filter(item => item.path === "/api/v1/accountless/telemetry-performance-authorization").length, 1,
+    "a fresh process must re-prove the grant before recovering a persisted authorization pause");
+  assert.equal(requests.filter(item => item.path === "/api/v1/device/telemetry/performance/reports").length, 32);
+  assert.equal(JSON.parse(await readFile(join(stateRoot, "private", "accountless-performance-sync-state-v1.json"), "utf8")).cursorDay,
+    "2026-09-14", "restart recovery preserves the prior acknowledged day");
   await selected.stop();
   host.dispose();
 });

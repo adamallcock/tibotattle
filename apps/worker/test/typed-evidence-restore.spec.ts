@@ -183,7 +183,7 @@ async function seedSuccessorStreams() {
   await source().prepare(`INSERT INTO telemetry_performance_device_capabilities (
     participant_id, device_id, schema_version, field_dictionary_version, privacy_contract_version,
     scope, capability_revision, authority_epoch, issued_at, expires_at, state, consented_at
-  ) VALUES (?, ?, 'model-performance-daily-v1', 'telemetry-performance-registry-2026-09-21.1',
+  ) VALUES (?, ?, 'model-performance-daily-v1', 'telemetry-performance-registry-2026-09-29.1',
     'privacy-safe-model-performance-v1', 'model-performance-daily', 1, 1,
     '2026-09-20T00:00:00.000Z', '2099-01-01T00:00:00.000Z', 'accepted', '2026-09-20T00:00:00.000Z')`)
     .bind(fixture.participantId, fixture.deviceId).run();
@@ -192,7 +192,7 @@ async function seedSuccessorStreams() {
     expiresAt: "2099-01-01T00:00:00.000Z", scope: "model-performance-daily" as const };
   const body = { schemaVersion: "telemetry-performance-report-v1", day, sourceGeneration: "source:v1:restore",
     sourceDigest: "c".repeat(64), sourceRevision: 1, methodVersion: "performance-daily-histogram-v1",
-    parserVersion: "synthetic-restore-v17", fieldDictionaryVersion: "telemetry-performance-registry-2026-09-21.1",
+    parserVersion: "synthetic-restore-v17", fieldDictionaryVersion: "telemetry-performance-registry-2026-09-29.1",
     privacyContractVersion: "privacy-safe-model-performance-v1", bucketSchemeVersion: "performance-histogram-v1",
     measurementVersion: "model-performance-samples-v1", records: [{ schemaVersion: "model-performance-daily-v1",
       day, provider: "openai_codex", modelId: "gpt-5.6-luna", reasoningEffort: "high", speedMethod: "receipt",

@@ -195,7 +195,7 @@ const ARTIFACTS = Object.freeze({
       fast_hourly: [
         "timestamp", "hour_start_utc", "hour_end_utc", "hour_end_utc_label",
         "hour_end_eastern_label", "api_cost_usd", "tier_weighted_cost_usd", "usage_events",
-        "fast_events", "standard_events", "unknown_events", "series", "quota_change_pp",
+        "fast_events", "ultrafast_events", "standard_events", "unknown_events", "series", "quota_change_pp",
       ],
       fast_two_hour: [
         "timestamp", "window_end_utc_label", "window_end_eastern_label", "api_cost_usd",
@@ -486,6 +486,12 @@ function validWeeklyReset(row) {
           minimum: 0,
           maximum: 1,
         }))
+      || (row.ultrafastFractionOfKnown !== undefined
+        && !finiteWeeklyNumber(row.ultrafastFractionOfKnown, {
+          nullable: true,
+          minimum: 0,
+          maximum: 1,
+        }))
       || (row.speedEventCounts !== undefined
         && !validSpeedEventCounts(row.speedEventCounts))
       || !finiteWeeklyNumber(
@@ -525,7 +531,9 @@ function validSpeedEventCounts(value) {
     && !Array.isArray(value)
     && ["standard", "fast", "unknown"].every((key) => (
       Number.isSafeInteger(value[key]) && value[key] >= 0
-    ));
+    ))
+    && (value.ultrafast === undefined
+      || (Number.isSafeInteger(value.ultrafast) && value.ultrafast >= 0));
 }
 
 // The composition-aware per-model calibration a v0.7 cache carries. Absent
@@ -1043,7 +1051,7 @@ function lastAuthoritativeReplaySafeCache(read, reason) {
       || cache === null
       || typeof cache !== "object"
       || descriptor?.mode !== "unified"
-      || descriptor?.contextBehavior !== "legacy_zero"
+      || descriptor?.contextBehavior !== "source_native"
       || descriptor?.fallbackCount !== 0
       || !["complete", "partial"].includes(descriptor?.coverageStatus)
       || !hasGeneration
@@ -1766,6 +1774,9 @@ function fastModeCalibrationWindows(weekly) {
     apiPriceEquivalentUsd: row.apiPriceEquivalentUsd,
     knownSpeedFraction: row.knownSpeedFraction ?? null,
     fastFractionOfKnown: row.fastFractionOfKnown ?? null,
+    ...(row.ultrafastFractionOfKnown === undefined ? {} : {
+      ultrafastFractionOfKnown: row.ultrafastFractionOfKnown,
+    }),
     eligibleTransitions: row.eligibleTransitions,
     uniqueBoundaries: row.uniqueBoundaries,
     observedSpanPercentagePoints: row.observedSpanPercentagePoints,
@@ -1804,8 +1815,8 @@ function fastModeProjection(period, { inference, nowMs }) {
   });
   return {
     unresolvedScenario: summary.unresolvedScenario,
-    // Codex records a tier only when the setting is applied or changed, never
-    // at session start. Observed values forward-fill and always win; turns
+    // Applied settings and supported turn contexts provide tier evidence.
+    // Observed values forward-fill and always win; turns
     // that precede the first observation in their session and carry no
     // covering declaration are attributed to Standard as a visible
     // assumption.
@@ -2426,7 +2437,7 @@ export async function buildLocalCompanionSnapshot({
           ? { sourceMode: "legacy" }
           : {}),
         ...(accountingSourceMode === "unified"
-          ? { contextBehavior: "legacy_zero" }
+          ? { contextBehavior: "source_native" }
           : {}),
       }),
       accountingSourceMode === "legacy"
@@ -2491,7 +2502,7 @@ export async function buildLocalCompanionSnapshot({
         now: () => nowMs,
         maximumAgeMs: MAX_REPLAY_SAFE_CACHE_AGE_MS,
         sourceMode: "unified",
-        contextBehavior: "legacy_zero",
+        contextBehavior: "source_native",
         expectedGeneration: unified.generation,
       });
     }
@@ -3386,7 +3397,7 @@ export async function buildLocalCompanionSnapshot({
           id: "fast_mode",
           title: "Fast-mode accounting",
           status: fastModeGapStatus(displayFastMode.coverage),
-          explanation: "Codex records the speed mode only when it is applied or changed, never at session start, so turns before the first change in a session carry no recorded tier. Observed tiers always win; a timestamp-covered config declaration comes next, then the owner's stated mode. Window-level inference is diagnostic only and never changes the money. Only an explicit mixed/unknown choice can leave the remainder unknown.",
+          explanation: "Codex can record speed in turn context or applied thread settings; older records can omit it. Observed tiers always win; a timestamp-covered config declaration comes next, then the owner's stated mode. Window-level inference is diagnostic only and never changes the money. Only an explicit mixed/unknown choice can leave the remainder unknown.",
         },
         {
           id: "subagents",

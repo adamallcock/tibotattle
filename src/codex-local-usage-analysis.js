@@ -4,6 +4,7 @@ import {
   aggregateLocalApiPriceResults,
   costWarningCodes,
   fastModeModelFamilyKey,
+  quotaWeightedApiPriceEquivalent,
   priceCodexProviderToolUnits,
   priceCodexUsageEvent,
 } from "@app-usagemonitor/accounting";
@@ -39,6 +40,12 @@ export async function scanAndPriceCodexLogs({
   const usageBearingRollouts = new Set();
   const warningCounts = {};
   const tierUsageEventCounts = {};
+  const ultrafast = {
+    weightedUsd: 0,
+    unweightedUsd: 0,
+    complete: true,
+    modelMultipliers: {},
+  };
   const providerToolGroups = new Map();
   let tokenCostUsdExact = "0";
   let eventCount = 0;
@@ -88,6 +95,28 @@ export async function scanAndPriceCodexLogs({
     modelSummary.costUsdExact = addUsdStrings(modelSummary.costUsdExact, priced.totalUsd);
     const speedMode = event.tierSemantics?.codexSpeedMode ?? "unknown";
     tierUsageEventCounts[speedMode] = (tierUsageEventCounts[speedMode] ?? 0) + 1;
+    if (speedMode === "ultrafast") {
+      // Qualify each retained event before its context and card ids are folded
+      // into model totals. A later model aggregate cannot prove eligibility.
+      const weighted = quotaWeightedApiPriceEquivalent({
+        apiPriceEquivalentUsd: cost,
+        model: event.model,
+        mode: "ultrafast",
+        eventTime: event.timestamp,
+        totalInputContextTokens: event.raw.input_tokens,
+        standardPriceCardIds: priced.selectedPriceCardIds,
+      });
+      if (weighted.usd === null) {
+        ultrafast.complete = false;
+        ultrafast.unweightedUsd += cost;
+        ultrafast.modelMultipliers[event.model] = null;
+      } else {
+        ultrafast.weightedUsd += weighted.usd;
+        if (ultrafast.modelMultipliers[event.model] !== null) {
+          ultrafast.modelMultipliers[event.model] = weighted.multiplier;
+        }
+      }
+    }
     if (priced.coverageStatus === "fully_priced") pricingDiagnostics.pricedEvents += 1;
     else if (priced.coverageStatus === "partially_priced") pricingDiagnostics.partiallyPricedEvents += 1;
     else pricingDiagnostics.unpricedEvents += 1;
@@ -170,6 +199,23 @@ export async function scanAndPriceCodexLogs({
   const tokenSubscriptionSpeedSensitivity = subscriptionSpeedSensitivity(byModel, "unknown", {
     speedWeightingByModel,
   });
+  // Preserve the counterfactual Standard/Fast scenarios. An Ultrafast result
+  // is available only when every retained token event actually recorded it;
+  // mixed, unknown, empty and manifest-only populations cannot select it.
+  if (eventCount > 0 && tierUsageEventCounts.ultrafast === eventCount) {
+    tokenSubscriptionSpeedSensitivity.basis = "codex_speed_api_price_ratio_applied_to_standard_api_equivalent";
+    tokenSubscriptionSpeedSensitivity.observedSpeedMode = "ultrafast";
+    tokenSubscriptionSpeedSensitivity.selectedScenario = "ultrafast";
+    tokenSubscriptionSpeedSensitivity.scenarios.ultrafast = {
+      relativeQuotaWeight: "model_specific",
+      weightedStandardApiEquivalentUsd: ultrafast.complete
+        ? Math.round((ultrafast.weightedUsd + Number.EPSILON) * 1e12) / 1e12 : null,
+      unweightedStandardApiEquivalentUsd:
+        Math.round((ultrafast.unweightedUsd + Number.EPSILON) * 1e12) / 1e12,
+      complete: ultrafast.complete,
+      modelMultipliers: ultrafast.modelMultipliers,
+    };
+  }
   const providerToolPricedGroups = [...providerToolGroups.values()].map((group) => ({
     group,
     priced: priceCodexProviderToolUnits(group.serverBillableUnits, {
@@ -323,7 +369,7 @@ export async function scanAndPriceCodexLogs({
       "Codex token_count logs do not expose API service tier; standard service-tier prices are used only as an explicit API-price-equivalent assumption",
       "historical events use the official card effective at each usable event timestamp; events without usable timing remain explicitly unpriced",
       "typed provider web/file tool units are priced separately; client wrappers and hosted-container calls without exact billable units remain unpriced",
-      "Codex Fast is tracked separately from API Priority/Flex/Batch; unknown speed emits sensitivity scenarios and selects neither",
+      "Codex Fast and Ultrafast are tracked separately from API service tiers; unknown speed emits unselected sensitivity scenarios, and observed Ultrafast uses only eligible API-rate equivalents, not subscription allowance weights",
     ],
   };
 }

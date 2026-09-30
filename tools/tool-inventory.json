@@ -1689,9 +1689,11 @@
       "stableAliasReason": "The cross-platform manifest policy is an imported validation helper, not a standalone command.",
       "additionalAliases": [],
       "callers": [
+        "scripts/lib/electron-public-site.mjs",
         "scripts/release-evidence-descriptor.js",
         "scripts/release-evidence-output.js",
         "scripts/release-evidence.js",
+        "test/electron-public-site.test.js",
         "test/release-evidence.test.js"
       ],
       "decision": "retain_as_checked_in_release_contract",

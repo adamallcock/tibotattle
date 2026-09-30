@@ -83,4 +83,6 @@ test("tier coverage labels mixed or unavailable local attribution as unknown", (
     observedUsageEventCounts: { standard: 1, fast: 1 },
   });
   assert.equal(summarizeTierCoverage({ runcost: { observedTierUsageEventCounts: {} } }).codexSpeedMode, "unknown");
+  assert.equal(summarizeTierCoverage(localUsage({ ultrafast: 3 })).codexSpeedMode, "ultrafast");
+  assert.equal(summarizeTierCoverage(localUsage({ ultrafast: 3, unknown: 1 })).codexSpeedMode, "unknown");
 });

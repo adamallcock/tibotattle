@@ -21,14 +21,23 @@ const REQUIRED_TURN_COLUMNS = Object.freeze([
   'key', 'source', 'offset', ...PRIMARY_TURN_COLUMNS.filter(column => !V12_TURN_COLUMNS.includes(column)),
 ]);
 const REQUIRED_SOURCE_COLUMNS = Object.freeze([
-  'id', 'digest', 'fingerprint', 'cursor', 'snapshot', 'state', 'revision', 'telemetry_revision',
+  'id', 'digest', 'fingerprint', 'cursor', 'snapshot', 'state', 'revision', 'telemetry_revision', 'parser_version', 'replay_parser_version',
 ]);
+const TURN_SCHEMA = `(key BLOB PRIMARY KEY, source INTEGER NOT NULL, offset INTEGER NOT NULL,
+  at INTEGER NOT NULL, model TEXT, effort TEXT, tokens INTEGER, reasoning INTEGER,
+  duration INTEGER, ttft INTEGER, responses INTEGER NOT NULL, covered INTEGER NOT NULL,
+  quality TEXT NOT NULL, sample_tokens INTEGER, sample_reasoning INTEGER,
+  sample_duration INTEGER, sample_responses INTEGER NOT NULL,
+  sample_total_responses INTEGER NOT NULL, sample_method TEXT,
+  turn_duration INTEGER, speed_mode TEXT, speed_mode_source TEXT,
+  api_service_tier TEXT) WITHOUT ROWID`;
 const safe = (ok, code) => { if (!ok) throw new Error(code); };
 
 // Parser methods identify the HMAC/keying semantics of each projection.  The
-// SQLite schema method is separate so a pre-v1.2 writer (methods 2/3) cannot
-// reopen a migrated file and overwrite the additive performance columns.
-const STORE_SCHEMA_METHODS = Object.freeze({ 2: 4, 3: 5 });
+// SQLite schema method is separate so older writers cannot reopen a migrated
+// file and overwrite additive performance columns or parser provenance.
+const STORE_SCHEMA_METHODS = Object.freeze({ 2: 6, 3: 7 });
+const PREVIOUS_STORE_SCHEMA_METHODS = Object.freeze({ 2: 4, 3: 5 });
 
 function schemaMethodFor(method) {
   safe(Number.isSafeInteger(method) && method >= 1, 'invalid_method');
@@ -44,7 +53,7 @@ function migrateTimingSchema(db, schemaMethod) {
   const sourceColumns = tableColumns(db, 'source');
   safe(REQUIRED_TURN_COLUMNS.every(column => turnColumns.has(column))
     && REQUIRED_SOURCE_COLUMNS.every(column => sourceColumns.has(column)
-      || column === 'revision' || column === 'telemetry_revision'),
+      || ['revision', 'telemetry_revision', 'parser_version', 'replay_parser_version'].includes(column)),
   'incompatible_database');
   const additions = [];
   for (const column of V12_TURN_COLUMNS) {
@@ -52,6 +61,11 @@ function migrateTimingSchema(db, schemaMethod) {
   }
   if (!sourceColumns.has('revision')) additions.push('ALTER TABLE source ADD COLUMN revision INTEGER NOT NULL DEFAULT 0');
   if (!sourceColumns.has('telemetry_revision')) additions.push('ALTER TABLE source ADD COLUMN telemetry_revision INTEGER NOT NULL DEFAULT 0');
+  if (!sourceColumns.has('parser_version')) additions.push('ALTER TABLE source ADD COLUMN parser_version INTEGER NOT NULL DEFAULT 0');
+  if (!sourceColumns.has('replay_parser_version')) additions.push('ALTER TABLE source ADD COLUMN replay_parser_version INTEGER NOT NULL DEFAULT 0');
+  const replayColumns = tableColumns(db, 'parser_replay_turn');
+  if (!replayColumns.size) additions.push(`CREATE TABLE parser_replay_turn ${TURN_SCHEMA}`);
+  else safe(['key', 'source', 'offset', ...PRIMARY_TURN_COLUMNS].every(column => replayColumns.has(column)), 'incompatible_database');
   if (!additions.length) {
     db.exec(`PRAGMA user_version=${schemaMethod}`);
     return;
@@ -77,7 +91,7 @@ function revisionToken(db, supplement = null) {
 }
 
 function sourceFacts(db) {
-  return db.prepare('SELECT id,digest,fingerprint,revision,telemetry_revision,snapshot FROM source ORDER BY id').all()
+  return db.prepare('SELECT id,digest,fingerprint,revision,telemetry_revision,parser_version,replay_parser_version,snapshot FROM source ORDER BY id').all()
     .map(row => {
       let parsed;
       try { parsed = JSON.parse(row.snapshot); } catch { throw new Error('invalid_source_snapshot'); }
@@ -87,6 +101,8 @@ function sourceFacts(db) {
         && typeof row.fingerprint === 'string' && /^[0-9a-f]{64}$/u.test(row.fingerprint)
         && Number.isSafeInteger(row.revision) && row.revision >= 0
         && Number.isSafeInteger(row.telemetry_revision) && row.telemetry_revision >= 0
+        && Number.isSafeInteger(row.parser_version) && row.parser_version >= 0
+        && Number.isSafeInteger(row.replay_parser_version) && row.replay_parser_version >= 0
         && parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed), 'invalid_source_snapshot');
       return {
         id: row.id,
@@ -94,6 +110,8 @@ function sourceFacts(db) {
         fingerprint: row.fingerprint,
         revision: row.revision,
         telemetryRevision: row.telemetry_revision,
+        parserVersion: row.parser_version,
+        replayParserVersion: row.replay_parser_version,
         exhausted: parsed.exhausted === true,
       };
     });
@@ -114,10 +132,11 @@ function setAttemptedBytes(error, attemptedBytes) {
   } catch { /* Preserve arbitrary thrown values and frozen errors. */ }
 }
 
-export async function openTimingStore(directory, { createParser, digest, METHOD, MAX_STATE_BYTES, correlationKey,
+export async function openTimingStore(directory, { createParser, digest, METHOD, MAX_STATE_BYTES, correlationKey, parserVersion = 0,
   filesystem = createTimingFilesystem(),
   databaseFactory = (file, options) => new DatabaseSync(file, options) }) {
   const schemaMethod = schemaMethodFor(METHOD);
+  safe(Number.isSafeInteger(parserVersion) && parserVersion >= 0, 'invalid_parser_version');
   safe(correlationKey === undefined || Buffer.isBuffer(correlationKey) && correlationKey.length === 32, 'invalid_metadata');
   const lease = await filesystem.prepare(directory);
   const { file, created } = lease;
@@ -162,7 +181,8 @@ export async function openTimingStore(directory, { createParser, digest, METHOD,
     const version = db.prepare('PRAGMA user_version').get().user_version;
     const application = db.prepare('PRAGMA application_id').get().application_id;
     safe(created || (application === APPLICATION
-      && (version === METHOD || version === schemaMethod)), 'incompatible_database');
+      && (version === METHOD || version === schemaMethod
+        || version === PREVIOUS_STORE_SCHEMA_METHODS[METHOD])), 'incompatible_database');
     db.exec('PRAGMA busy_timeout=100; PRAGMA cache_size=-2048; PRAGMA synchronous=FULL; PRAGMA max_page_count=65536;');
     if (created) {
       db.exec(`BEGIN IMMEDIATE;
@@ -171,15 +191,11 @@ export async function openTimingStore(directory, { createParser, digest, METHOD,
           fingerprint TEXT NOT NULL, cursor INTEGER NOT NULL, snapshot TEXT NOT NULL,
           state TEXT NOT NULL CHECK(length(state)<=${MAX_STATE_BYTES}),
           revision INTEGER NOT NULL DEFAULT 0,
-          telemetry_revision INTEGER NOT NULL DEFAULT 0);
-        CREATE TABLE turn (key BLOB PRIMARY KEY, source INTEGER NOT NULL, offset INTEGER NOT NULL,
-          at INTEGER NOT NULL, model TEXT, effort TEXT, tokens INTEGER, reasoning INTEGER,
-          duration INTEGER, ttft INTEGER, responses INTEGER NOT NULL, covered INTEGER NOT NULL,
-          quality TEXT NOT NULL, sample_tokens INTEGER, sample_reasoning INTEGER,
-          sample_duration INTEGER, sample_responses INTEGER NOT NULL,
-          sample_total_responses INTEGER NOT NULL, sample_method TEXT,
-          turn_duration INTEGER, speed_mode TEXT, speed_mode_source TEXT,
-          api_service_tier TEXT) WITHOUT ROWID;
+          telemetry_revision INTEGER NOT NULL DEFAULT 0,
+          parser_version INTEGER NOT NULL DEFAULT 0,
+          replay_parser_version INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE turn ${TURN_SCHEMA};
+        CREATE TABLE parser_replay_turn ${TURN_SCHEMA};
         CREATE INDEX turn_time ON turn(at);
         PRAGMA application_id=${APPLICATION}; PRAGMA user_version=${schemaMethod};`);
       db.prepare('INSERT INTO metadata VALUES (?)').run(correlationKey ?? randomBytes(32));
@@ -191,8 +207,16 @@ export async function openTimingStore(directory, { createParser, digest, METHOD,
     const key = Buffer.from(db.prepare('SELECT key FROM metadata').get().key);
     safe(key.length === 32, 'invalid_metadata');
     safe(correlationKey === undefined || key.equals(correlationKey), 'correlation_mismatch');
+    if (!created && tableColumns(db, 'source').has('parser_version')) {
+      const newest = db.prepare('SELECT COALESCE(MAX(parser_version),0) AS version FROM source').get().version;
+      safe(Number.isSafeInteger(newest) && newest >= 0 && newest <= parserVersion, 'incompatible_parser_version');
+    }
+    if (!created && tableColumns(db, 'source').has('replay_parser_version')) {
+      const newest = db.prepare('SELECT COALESCE(MAX(replay_parser_version),0) AS version FROM source').get().version;
+      safe(Number.isSafeInteger(newest) && newest >= 0 && newest <= parserVersion, 'incompatible_parser_version');
+    }
     if (!created) migrateTimingSchema(db, schemaMethod);
-    return { db, key, file, createParser, digest, filesystem, method: METHOD, close: () => {
+    return { db, key, file, createParser, digest, filesystem, method: METHOD, parserVersion, close: () => {
       const error = closeOwnedResources();
       if (error !== null) throw error;
     } };
@@ -229,18 +253,25 @@ export async function ingestTimingFile(store, path, { maxBytes = CHUNK, signal, 
     const cursor = old?.cursor ?? 0;
     let previous = null;
     let replay = false;
+    let upgradingParser = false;
     if (old) {
       previous = JSON.parse(old.snapshot);
+      safe(Number.isSafeInteger(old.parser_version) && old.parser_version >= 0
+        && old.parser_version <= store.parserVersion
+        && Number.isSafeInteger(old.replay_parser_version) && old.replay_parser_version >= 0
+        && old.replay_parser_version <= store.parserVersion, 'incompatible_parser_version');
+      upgradingParser = old.parser_version !== store.parserVersion;
       safe(sameFile(before, previous) && before.size >= previous.size, 'source_replaced');
       if (before.size === previous.size) {
         safe(before.mtime === previous.mtime && before.ctime === previous.ctime, 'source_rewritten');
-        if (cursor === before.size || previous.exhausted === true) return { bytes: 0, unchanged: true };
+        if (!upgradingParser && (cursor === before.size || previous.exhausted === true)) return { bytes: 0, unchanged: true };
       }
       // A source that was completely scanned can later gain a delayed record.
       // Rebuild its logical rows from the beginning in the same transaction so
       // stale measurements disappear even when the late record is not itself
       // a second completion. Stable HMAC keys preserve logical identities.
-      replay = before.size > previous.size && previous.exhausted === true;
+      replay = upgradingParser ? old.replay_parser_version !== store.parserVersion
+        : before.size > previous.size && previous.exhausted === true;
       safe(await fingerprint(handle, cursor, key, digest) === old.fingerprint, 'source_rewritten');
     }
     if (signal?.aborted) throw new Error('cancelled');
@@ -251,12 +282,16 @@ export async function ingestTimingFile(store, path, { maxBytes = CHUNK, signal, 
       if (!old) db.prepare('INSERT INTO source(digest,fingerprint,cursor,snapshot,state) VALUES (?,?,?,?,?)')
         .run(sourceKey, '', 0, JSON.stringify(before), '{}');
       const source = old?.id ?? Number(db.prepare('SELECT last_insert_rowid() AS id').get().id);
-      if (replay) db.prepare('DELETE FROM turn WHERE source=?').run(source);
-      const insert = db.prepare(`INSERT OR IGNORE INTO turn
+      // Parser repairs may span many bounded reads. Keep the prior live rows
+      // and their parser provenance until the verified replay is complete.
+      const table = upgradingParser ? 'parser_replay_turn' : 'turn';
+      if (replay) db.prepare(`DELETE FROM ${table} WHERE source=?`).run(source);
+      const insert = db.prepare(`INSERT OR IGNORE INTO ${table}
         (key,source,offset,${PRIMARY_TURN_COLUMNS.join(',')})
         VALUES (${new Array(3 + PRIMARY_TURN_COLUMNS.length).fill('?').join(',')})`);
-      const existing = db.prepare(`SELECT ${PRIMARY_TURN_COLUMNS.join(',')} FROM turn WHERE key=?`);
-      const conflict = db.prepare("UPDATE turn SET model=NULL,effort=NULL,duration=NULL,ttft=NULL,sample_tokens=NULL,sample_reasoning=NULL,sample_duration=NULL,sample_responses=0,sample_method=NULL,turn_duration=NULL,speed_mode=NULL,speed_mode_source=NULL,api_service_tier=NULL,quality='conflicting_duplicate' WHERE key=?");
+      const existing = db.prepare(`SELECT ${PRIMARY_TURN_COLUMNS.join(',')} FROM ${table} WHERE key=?`);
+      const conflictFields = "model=NULL,effort=NULL,duration=NULL,ttft=NULL,sample_tokens=NULL,sample_reasoning=NULL,sample_duration=NULL,sample_responses=0,sample_method=NULL,turn_duration=NULL,speed_mode=NULL,speed_mode_source=NULL,api_service_tier=NULL,quality='conflicting_duplicate'";
+      const conflict = db.prepare(`UPDATE ${table} SET ${conflictFields} WHERE key=?`);
       const saved = replay ? null : old ? JSON.parse(old.state) : null;
       let discardLine = saved?.discardLine === true;
       const parser = createParser(key, saved, t => {
@@ -290,20 +325,36 @@ export async function ingestTimingFile(store, path, { maxBytes = CHUNK, signal, 
       }
       const state = parser.state(); state.discardLine = discardLine;
       after.exhausted = end === before.size;
+      if (state.blocked) db.prepare(`UPDATE ${table} SET model=NULL,effort=NULL,duration=NULL,ttft=NULL,sample_tokens=NULL,sample_reasoning=NULL,sample_duration=NULL,sample_responses=0,sample_method=NULL,turn_duration=NULL,speed_mode=NULL,speed_mode_source=NULL,api_service_tier=NULL,quality='blocked_source' WHERE source=?`).run(source);
+      const repairComplete = upgradingParser && after.exhausted;
+      if (repairComplete) {
+        db.prepare('DELETE FROM turn WHERE source=?').run(source);
+        // Preserve the original cross-source duplicate/conflict policy when
+        // the staged replacement joins the live measurement set.
+        db.prepare(`UPDATE turn SET ${conflictFields} WHERE key IN (
+          SELECT staged.key FROM parser_replay_turn staged JOIN turn live ON live.key=staged.key
+          WHERE staged.source=? AND (${PRIMARY_TURN_COLUMNS.map(column => `live.${column} IS NOT staged.${column}`).join(' OR ')})
+        )`).run(source);
+        const columns = ['key', 'source', 'offset', ...PRIMARY_TURN_COLUMNS].join(',');
+        db.prepare(`INSERT OR IGNORE INTO turn (${columns}) SELECT ${columns} FROM parser_replay_turn WHERE source=?`).run(source);
+        db.prepare('DELETE FROM parser_replay_turn WHERE source=?').run(source);
+      }
       const previousRevision = old === undefined ? 0 : old.revision;
       const previousTelemetryRevision = old === undefined ? 0 : old.telemetry_revision;
       safe(Number.isSafeInteger(previousRevision) && previousRevision >= 0, 'invalid_revision');
       safe(Number.isSafeInteger(previousTelemetryRevision) && previousTelemetryRevision >= 0, 'invalid_telemetry_revision');
-      const revision = previousRevision + (replay ? 1 : 0);
+      const invalidated = upgradingParser ? repairComplete : replay;
+      const revision = previousRevision + (invalidated ? 1 : 0);
       const telemetryRevision = previousTelemetryRevision + 1;
       safe(Number.isSafeInteger(revision) && revision >= 0, 'invalid_revision');
       safe(Number.isSafeInteger(telemetryRevision) && telemetryRevision >= 1, 'invalid_telemetry_revision');
-      db.prepare('UPDATE source SET fingerprint=?,cursor=?,snapshot=?,state=?,revision=?,telemetry_revision=? WHERE id=?')
+      db.prepare('UPDATE source SET fingerprint=?,cursor=?,snapshot=?,state=?,revision=?,telemetry_revision=?,parser_version=?,replay_parser_version=? WHERE id=?')
         .run(await fingerprint(handle, nextOffset, key, digest), nextOffset,
-          JSON.stringify(after), JSON.stringify(state), revision, telemetryRevision, source);
-      if (state.blocked) db.prepare("UPDATE turn SET model=NULL,effort=NULL,duration=NULL,ttft=NULL,sample_tokens=NULL,sample_reasoning=NULL,sample_duration=NULL,sample_responses=0,sample_method=NULL,turn_duration=NULL,speed_mode=NULL,speed_mode_source=NULL,api_service_tier=NULL,quality='blocked_source' WHERE source=?").run(source);
+          JSON.stringify(after), JSON.stringify(state), revision, telemetryRevision,
+          upgradingParser && !repairComplete ? old.parser_version : store.parserVersion,
+          upgradingParser && !repairComplete ? store.parserVersion : 0, source);
       db.exec('COMMIT');
-      return { bytes: end - start, unchanged: false, replayed: replay, invalidated: replay,
+      return { bytes: end - start, unchanged: false, replayed: replay || upgradingParser, invalidated,
         revision, cursor: nextOffset, remaining: before.size - nextOffset, partial: receipt.partialDeferred };
     } catch (e) {
       try { db.exec('ROLLBACK'); } catch { /* Preserve the operation failure. */ }

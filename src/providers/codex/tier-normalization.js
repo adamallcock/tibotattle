@@ -1,6 +1,6 @@
 const BILLING_SURFACES = new Set(["chatgpt_subscription", "openai_api", "unknown"]);
-const CODEX_SPEED_MODES = new Set(["standard", "fast", "unknown", "other"]);
-const API_SERVICE_TIERS = new Set(["standard", "priority", "flex", "batch", "unknown", "other"]);
+const CODEX_SPEED_MODES = new Set(["standard", "fast", "ultrafast", "unknown", "other"]);
+const API_SERVICE_TIERS = new Set(["standard", "priority", "ultrafast", "flex", "batch", "unknown", "other"]);
 const TIER_SOURCES = new Set([
   "app_server_effective",
   "turn_override",
@@ -33,6 +33,26 @@ function requireIsoTimestampOrNull(value, field) {
 
 export function isCodexSpeedMode(value) {
   return CODEX_SPEED_MODES.has(value);
+}
+
+// Read only the reviewed classification field. Turn context is explicit
+// applied-turn evidence; sparse omission is not a clear. No payload is copied.
+export function codexTierObservation(record) {
+  const turn = record?.type === "turn_context";
+  const settingsEvent = record?.type === "event_msg"
+    && record?.payload?.type === "thread_settings_applied";
+  if (!turn && !settingsEvent) return null;
+  const settings = turn ? record.payload : record.payload?.thread_settings;
+  const tierSource = turn ? "turn_override" : "rollout_thread_settings";
+  if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
+    return { status: "malformed", tierSource };
+  }
+  if (!Object.hasOwn(settings, "service_tier")) return { status: "omitted", tierSource };
+  const rawTier = settings.service_tier;
+  if (rawTier !== null && safeRawTier(rawTier) === null) {
+    return { status: "malformed", tierSource };
+  }
+  return { status: "observed", rawTier, tierSource };
 }
 
 export function validateTierDeclaration(value) {
@@ -69,10 +89,12 @@ export function normalizeProviderTier(rawTier, {
   if (billingSurface === "chatgpt_subscription") {
     if (normalized === "default" || normalized === "standard") codexSpeedMode = "standard";
     else if (normalized === "priority" || normalized === "fast") codexSpeedMode = "fast";
+    else if (normalized === "ultrafast") codexSpeedMode = "ultrafast";
     else if (normalized !== null) codexSpeedMode = "other";
   } else if (billingSurface === "openai_api") {
     if (normalized === "default" || normalized === "standard") apiServiceTier = "standard";
-    else if (["priority", "flex", "batch"].includes(normalized)) apiServiceTier = normalized;
+    else if (normalized === "fast") apiServiceTier = "priority";
+    else if (["priority", "ultrafast", "flex", "batch"].includes(normalized)) apiServiceTier = normalized;
     else if (normalized !== null) apiServiceTier = "other";
   }
   return {

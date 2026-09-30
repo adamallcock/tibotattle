@@ -290,9 +290,9 @@ function recordShape(row) {
   return {
     observedAt: new Date(Number(row.observed_at_ms)).toISOString(),
     model: row.model_id,
-    // Match the unified accounting adapter's legacy_zero compatibility:
-    // retain observed context, but never re-infer a NULL from component sums.
-    totalInputContextTokens: row.total_input_context ?? 0,
+    // Missing source context remains unavailable; an explicit zero remains an
+    // observed value. Only the pricing owner may infer a complete input sum.
+    totalInputContextTokens: nullableTokenCount(row.total_input_context),
     components: {
       input_uncached_tokens: nullableTokenCount(row.tokens_in_uncached),
       input_cache_read_tokens: nullableTokenCount(row.tokens_in_cache_read),

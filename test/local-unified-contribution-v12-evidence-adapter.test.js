@@ -97,7 +97,7 @@ test("local evidence accepts retained variants but withholds unknown provenance"
     row("unknown", {
       eventTime: `${DAY}T12:01:00.000Z`,
       sourceOffset: 200,
-      parserVersion: "unified-rollout-typed-v19",
+      parserVersion: "unified-rollout-typed-v20",
       boundary: boundary(1),
     }),
     row("bad-boundary", {

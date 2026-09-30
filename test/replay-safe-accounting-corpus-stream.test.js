@@ -249,6 +249,40 @@ const DECLARED_SPEED_BASELINES = [{
   mode: "standard",
 }];
 
+test("streamed calibration preserves unavailable inputs like the scan and refuses a fabricated short-context fit", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-corpus-unavailable-context-"));
+  try {
+    const corpus = syntheticCorpus({
+      resetStarts: Array.from({ length: 8 }, (_, week) => Date.parse("2026-05-07T00:00:00.000Z") + week * WEEK_MS),
+      boundariesPerReset: 40,
+      usagePerBoundary: 1,
+      percentFor: (boundary) => boundary * 2,
+    });
+    for (const row of corpus.usage) {
+      Object.assign(row, { model: "gpt-5.6-sol", speed: "standard", totalInputContext: null,
+        tokensInUncached: null, tokensInCacheRead: null, tokensInCacheWrite: null,
+        tokensOutText: 1_000, tokensOutReasoning: 0, tokensOutCombined: null });
+    }
+    const indexFile = join(directory, "local-unified-index-v1.sqlite");
+    await writeCorpusIndex(indexFile, corpus);
+    const resident = await buildReplaySafeAccountingCache({
+      now: () => NOW,
+      scan: oracleScan(corpus),
+    });
+    const streamed = await buildReplaySafeAccountingCache({
+      now: () => NOW, unifiedIndexFile: indexFile,
+      scan: async () => ({ diagnostics: {} }),
+    });
+    assert.equal(resident.periods.find((row) => row.id === "all").pricingCoverage.unpricedEvents, corpus.usage.length);
+    assert.deepEqual(streamed.weeklyCalibration, resident.weeklyCalibration);
+    assert.deepEqual(streamed.allowanceCapacityByScenario, resident.allowanceCapacityByScenario);
+    assert.notEqual(streamed.weeklyCalibration.status, "estimated");
+    assert.equal(streamed.weeklyCalibrationInput.retainedUsageEvents, corpus.usage.length);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("streamed unified calibration is byte-identical to the same corpus held resident, across the batched derivation path", async () => {
   const directory = await mkdtemp(join(tmpdir(), "usage-monitor-corpus-stream-equivalence-"));
   try {
@@ -760,7 +794,7 @@ test("the default production rebuild is isolated in a child and byte-identical t
       nowMs: NOW,
       windowDays: 365,
       sourceMode: "unified",
-      contextBehavior: "legacy_zero",
+      contextBehavior: "source_native",
       codexHome: directory,
       unifiedIndexFile: fixture.indexFile,
       expectedGeneration: fixture.expectedGeneration,
@@ -819,7 +853,7 @@ test("the fused single-read build is byte-identical to the separate full-history
       sourceMode: "unified",
       expectedGeneration: fixture.expectedGeneration,
       unifiedIndexFile: fixture.indexFile,
-      contextBehavior: "legacy_zero",
+      contextBehavior: "source_native",
       now: () => NOW,
       declaredSpeedBaselines: DECLARED_SPEED_BASELINES,
     };
@@ -830,7 +864,7 @@ test("the fused single-read build is byte-identical to the separate full-history
       indexFile: fixture.indexFile,
       requireComplete: true,
       expectedGeneration: fixture.expectedGeneration,
-      contextBehavior: "legacy_zero",
+      contextBehavior: "source_native",
     });
     let reads = 0;
     const separate = await buildReplaySafeAccountingCache({

@@ -44,9 +44,9 @@ function crossing(cells) {
 }
 
 test("published Priority (Fast) API price ratios are derived, sourced, and dated", () => {
-  // The published Priority API price is 2x Standard for GPT-5.6 and GPT-5.4
-  // and 2.5x for GPT-5.5 - notably NOT the superseded credit-rate statement's
-  // 2.5x for GPT-5.6.
+  // Published Priority API prices preserve their own historical series:
+  // 2x Standard for GPT-5.6 and GPT-5.4; 2.5x for GPT-5.5. Included-allowance
+  // weights are a separate policy and do not replace these money ratios.
   assert.deepEqual({ ...FAST_MODE_QUOTA_MULTIPLIERS }, {
     "gpt-4.1": 1.75,
     "gpt-4.1-mini": 1.75,
@@ -66,6 +66,7 @@ test("published Priority (Fast) API price ratios are derived, sourced, and dated
     "gpt-6-astra": 2,
     "gpt-6-sol": 2,
     "gpt-6-luna": 2,
+    "gpt-6.1-sol": 2,
   });
   assert.equal(Object.isFrozen(FAST_MODE_QUOTA_MULTIPLIERS), true);
   // The map is derived from the price registry and re-deriving it is exact.
@@ -89,27 +90,33 @@ test("published Priority (Fast) API price ratios are derived, sourced, and dated
     /not uniform/,
   );
   assert.equal(FAST_MODE_MULTIPLIER_SOURCE.publisher, "openai");
-  assert.equal(FAST_MODE_MULTIPLIER_SOURCE.recordedAt, "2026-08-30");
+  assert.equal(FAST_MODE_MULTIPLIER_SOURCE.recordedAt, "2026-09-29");
   assert.equal(
     FAST_MODE_MULTIPLIER_SOURCE.basis,
-    "published_priority_api_price_ratio_relative_to_standard",
+    "published_api_speed_price_ratio_relative_to_standard",
   );
+  assert.equal(FAST_MODE_MULTIPLIER_SOURCE.appliesTo, "api_price_equivalent_only");
   assert.equal(FAST_MODE_ASSUMED_MULTIPLIER, 2);
   assert.equal(FAST_MODE_ASSUMED_MULTIPLIER_SOURCE.recordedAt, "2026-08-30");
   assert.equal(
     FAST_MODE_MULTIPLIER_SOURCE.observability,
-    "rollout_thread_settings_changes_only_no_session_baseline",
+    "rollout_thread_settings_and_supported_turn_context",
   );
-  // The log proves tier CHANGES, never the session baseline. Any surface that
-  // claims the mode is wholly unrecorded is wrong.
+  // There is no guaranteed session_meta baseline, but supported turn contexts
+  // can carry their own observed tier alongside settings changes.
   assert.equal(CODEX_SPEED_MODE_OBSERVABILITY.sessionBaselineRecorded, false);
   assert.equal(
     CODEX_SPEED_MODE_OBSERVABILITY.recordedEvent,
     "event_msg.payload.thread_settings_applied.service_tier",
   );
+  assert.equal(CODEX_SPEED_MODE_OBSERVABILITY.recordedTurnContext,
+    "turn_context.payload.service_tier");
   assert.deepEqual({ ...CODEX_SPEED_MODE_OBSERVABILITY.observedValues }, {
     priority: "fast",
+    fast: "fast",
     default: "standard",
+    standard: "standard",
+    ultrafast: "ultrafast",
   });
   assert.match(FAST_MODE_MULTIPLIER_SOURCE.statement, /exact registered models/u);
 });

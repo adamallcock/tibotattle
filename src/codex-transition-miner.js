@@ -11,6 +11,7 @@ import {
   costWarningCodes,
   FAST_MODE_ASSUMED_MULTIPLIER,
   fastModeModelFamilyKey,
+  quotaWeightedApiPriceEquivalent,
   priceCodexUsageEvent,
 } from "@app-usagemonitor/accounting";
 import {
@@ -23,7 +24,7 @@ import {
 const SCHEMA_VERSION = "0.3";
 const { scanCodexLogEvents } = localCodexLogScanner;
 export const PARSER_VERSION = "0.3.2";
-const ESTIMATOR_VERSION = "provider-neutral-api-price-equivalent-v0.2";
+const ESTIMATOR_VERSION = "provider-neutral-api-price-equivalent-v0.3";
 const COMPONENT_NAMES = [
   "input_uncached_tokens",
   "input_cache_read_tokens",
@@ -104,19 +105,23 @@ function priceUsageEvent(event, priceCards) {
   });
   const fastWeightedEquivalentUsd = costUsd * (multiplier ?? FAST_MODE_ASSUMED_MULTIPLIER);
   const observedSpeedMode = event.tierSemantics?.codexSpeedMode ?? "unknown";
-  const speedMode = ["standard", "fast"].includes(observedSpeedMode)
+  const speedMode = ["standard", "fast", "ultrafast"].includes(observedSpeedMode)
     ? observedSpeedMode
-    : ["standard", "fast"].includes(event.declaredSpeed)
+    : ["standard", "fast", "ultrafast"].includes(event.declaredSpeed)
       ? event.declaredSpeed
       : "unknown";
+  const ultrafastUsd = speedMode === "ultrafast" ? quotaWeightedApiPriceEquivalent({
+    apiPriceEquivalentUsd: costUsd, model: event.model, mode: speedMode,
+    eventTime: event.timestamp, standardPriceCardIds: ledger.selectedPriceCardIds,
+  }).usd : null;
   return {
     ...event,
     costUsd,
     costUsdExact: ledger.totalUsd,
     pricingCoverageStatus: ledger.coverageStatus,
     fastWeightedEquivalentUsd,
-    quotaWeightedLowerUsd: speedMode === "fast" ? fastWeightedEquivalentUsd : costUsd,
-    quotaWeightedUpperUsd: speedMode === "standard" ? costUsd : fastWeightedEquivalentUsd,
+    quotaWeightedLowerUsd: speedMode === "ultrafast" ? ultrafastUsd : speedMode === "fast" ? fastWeightedEquivalentUsd : costUsd,
+    quotaWeightedUpperUsd: speedMode === "ultrafast" ? ultrafastUsd : speedMode === "standard" ? costUsd : fastWeightedEquivalentUsd,
     warningCodes: costWarningCodes(ledger),
     coverageWarningCodes: ledger.warnings.coverage.map((warning) => warning.code).sort(),
     priceCardIds: ledger.selectedPriceCardIds,

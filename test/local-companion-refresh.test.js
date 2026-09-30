@@ -896,7 +896,7 @@ test("unified accounting mode never advances the legacy archive and passes expli
   const result = await runner();
   assert.deepEqual(order, ["unified", "accounting"]);
   assert.equal(accountingOptions.sourceMode, "unified");
-  assert.equal(accountingOptions.contextBehavior, "legacy_zero");
+  assert.equal(accountingOptions.contextBehavior, "source_native");
   assert.equal(
     accountingOptions.unifiedIndexFile,
     "/private/local-unified-index-v1.sqlite",
@@ -1611,7 +1611,7 @@ test("unified mode fails closed when the authoritative generation is missing or 
         status: "unavailable",
         sourceMode: "unified",
         errorCode: fixture.expectedAccountingError,
-        compatibilityBehavior: "legacy_zero",
+        compatibilityBehavior: "source_native",
         coverageStatus: fixture.expectedCoverage,
         generation: fixture.expectedGeneration,
         generationFingerprint: fixture.expectedFingerprint,
@@ -1666,7 +1666,7 @@ test("unified accounting reader errors stay unavailable without legacy fallback"
     refreshAccounting: async (options) => {
       accountingCalls += 1;
       assert.equal(options.sourceMode, "unified");
-      assert.equal(options.contextBehavior, "legacy_zero");
+      assert.equal(options.contextBehavior, "source_native");
       assert.equal(options.expectedGeneration.id, expectedGeneration.id);
       assert.equal(
         options.expectedGeneration.fingerprint,
@@ -1688,7 +1688,7 @@ test("unified accounting reader errors stay unavailable without legacy fallback"
     status: "unavailable",
     sourceMode: "unified",
     errorCode: "accounting_unified_generation_changed",
-    compatibilityBehavior: "legacy_zero",
+    compatibilityBehavior: "source_native",
     coverageStatus: "complete",
     generation: 8,
     generationFingerprint: "c".repeat(64),

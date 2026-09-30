@@ -46,13 +46,14 @@ function recordFromRow(row) {
   return {
     observedAt: new Date(Number(row.observed_at_ms)).toISOString(),
     model: row.model_id,
+    totalInputContextTokens: nullableTokenCount(row.total_input_context),
     components: {
-      input_uncached_tokens: tokenCount(row.tokens_in_uncached),
-      input_cache_read_tokens: tokenCount(row.tokens_in_cache_read),
-      input_cache_write_tokens: tokenCount(row.tokens_in_cache_write),
-      output_text_tokens: tokenCount(row.tokens_out_text),
-      output_reasoning_tokens: tokenCount(row.tokens_out_reasoning),
-      output_combined_tokens: tokenCount(row.tokens_out_combined),
+      input_uncached_tokens: nullableTokenCount(row.tokens_in_uncached),
+      input_cache_read_tokens: nullableTokenCount(row.tokens_in_cache_read),
+      input_cache_write_tokens: nullableTokenCount(row.tokens_in_cache_write),
+      output_text_tokens: nullableTokenCount(row.tokens_out_text),
+      output_reasoning_tokens: nullableTokenCount(row.tokens_out_reasoning),
+      output_combined_tokens: nullableTokenCount(row.tokens_out_combined),
     },
     tierSemantics: {
       codexSpeedMode: row.codex_speed_mode,
@@ -65,8 +66,8 @@ function recordFromRow(row) {
   };
 }
 
-function tokenCount(value) {
-  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+function nullableTokenCount(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
 /**
@@ -93,6 +94,8 @@ export function summarizeWindowBreakdownRows(rows, { pricer = null } = {}) {
   let tokens = 0;
   let fastCostUsd = 0;
   let fastEvents = 0;
+  let ultrafastEvents = 0;
+  let ultrafastCostUsd = 0;
   let sparkEvents = 0;
   let sparkCostUsd = 0;
 
@@ -118,6 +121,7 @@ export function summarizeWindowBreakdownRows(rows, { pricer = null } = {}) {
       fastEvents += 1;
     }
 
+    if (speed === "ultrafast") { ultrafastCostUsd += cost; ultrafastEvents += 1; }
     const model = projection.model;
     const modelRow = byModel.get(model) ?? {
       model,
@@ -188,6 +192,8 @@ export function summarizeWindowBreakdownRows(rows, { pricer = null } = {}) {
     tokens,
     fastCostUsd: roundUsd(fastCostUsd),
     fastEvents,
+    ultrafastEvents,
+    ultrafastCostUsd: roundUsd(ultrafastCostUsd),
     byModel: [...byModel.values()]
       .map(finalizeModel)
       .sort((left, right) => right.costUsd - left.costUsd
@@ -217,6 +223,7 @@ const USAGE_WINDOW_SELECT = `
          m.model_id AS model_id,
          t.codex_speed_mode AS codex_speed_mode,
          t.api_service_tier AS api_service_tier,
+         u.total_input_context AS total_input_context,
          u.tokens_in_uncached AS tokens_in_uncached,
          u.tokens_in_cache_read AS tokens_in_cache_read,
          u.tokens_in_cache_write AS tokens_in_cache_write,

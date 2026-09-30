@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createAccountingPricer } from "../src/replay-safe-accounting-cache.js";
 
 import {
   LOCAL_WINDOW_BREAKDOWN_SCHEMA_VERSION,
@@ -19,12 +20,14 @@ function usageRow({
   outputText = 0,
   outputReasoning = 0,
   outputCombined = 0,
+  totalInputContext = null,
 }) {
   return {
     observed_at_ms: Date.parse(observedAt),
     model_id: model,
     codex_speed_mode: speed,
     api_service_tier: "unknown",
+    total_input_context: totalInputContext,
     tokens_in_uncached: inputUncached,
     tokens_in_cache_read: cacheRead,
     tokens_in_cache_write: cacheWrite,
@@ -96,6 +99,29 @@ test("unpriced share reflects models with no published price card", () => {
   const unknownRow = summary.byModel.find((row) => row.model === "unknown");
   assert.ok(unknownRow, "unrecognized identity is grouped as unknown");
   assert.equal(unknownRow.unpricedShare, 1);
+});
+
+test("window repricing preserves missing inputs and uses observed context for output-only evidence", () => {
+  for (const pricer of [null, createAccountingPricer()]) {
+    for (const { context, inputs, expectedCost, unpriced } of [
+      { context: null, inputs: null, expectedCost: 0, unpriced: 1 },
+      { context: null, inputs: 0, expectedCost: 0.0002, unpriced: 0 },
+      { context: 0, inputs: null, expectedCost: 0.0002, unpriced: 0 },
+      { context: 272_001, inputs: null, expectedCost: 0.0003, unpriced: 0 },
+    ]) {
+      const result = summarizeWindowBreakdownRows([usageRow({
+        model: "gpt-6.1-sol", observedAt: "2026-09-29T12:00:00.000Z",
+        inputUncached: inputs, cacheRead: inputs, cacheWrite: inputs,
+        outputText: 20, outputReasoning: 0, outputCombined: null,
+        totalInputContext: context,
+      })], { pricer });
+      assert.equal(result.events, 1);
+      assert.equal(result.tokens, 20);
+      assert.equal(result.costUsd, expectedCost);
+      assert.equal(result.unpricedEvents, unpriced);
+      assert.equal(result.byModel[0].costUsd, expectedCost);
+    }
+  }
 });
 
 test("readLocalUnifiedWindowBreakdown validates the range before touching disk", async () => {

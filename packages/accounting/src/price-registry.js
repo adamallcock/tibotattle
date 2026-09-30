@@ -1,5 +1,5 @@
 // Reviewed provider price evidence shared by local and edge accounting adapters.
-export const APP_PRICE_REGISTRY_OBSERVED_AT = "2026-09-23T14:52:10Z";
+export const APP_PRICE_REGISTRY_OBSERVED_AT = "2026-09-29T18:16:22Z";
 // First official-page review. This is the review boundary, not a lower bound
 // on the reviewed model rates: recognized OpenAI/Codex events before this date
 // remain priceable unless a card has an explicit vendor-effective boundary.
@@ -10,7 +10,7 @@ export const OPENAI_PRICE_EVIDENCE_START_DATE = OPENAI_FIRST_OBSERVED_DATE;
 // lower bound on the reviewed model rates.
 const ANTHROPIC_OBSERVED_AT = "2026-07-25T14:18:33Z";
 const PER_MILLION = "1000000";
-export const APP_PRICE_REGISTRY_VERSION = "app-official-api-prices-v0.8";
+export const APP_PRICE_REGISTRY_VERSION = "app-official-api-prices-v0.9";
 
 export const OFFICIAL_PRICE_SOURCE_URLS = Object.freeze({
   openai: "https://developers.openai.com/api/docs/pricing",
@@ -94,6 +94,19 @@ const SOURCE_DEFINITIONS = Object.freeze({
       "https://platform.claude.com/docs/en/release-notes/overview",
     ]),
   }),
+  openaiSol61Ultrafast: Object.freeze({
+    provider: "openai",
+    name: "openai-official-sol61-ultrafast-api-pricing",
+    url: OFFICIAL_PRICE_SOURCE_URLS.openai,
+    observedAt: APP_PRICE_REGISTRY_OBSERVED_AT,
+    evidenceVersion: "openai-sol61-ultrafast-api-pricing-reviewed-2026-09-29",
+    evidenceUrls: Object.freeze([
+      OFFICIAL_PRICE_SOURCE_URLS.openai,
+      "https://developers.openai.com/api/docs/models/gpt-6.1-sol",
+      "https://developers.openai.com/api/docs/models/gpt-6-astra",
+      "https://developers.openai.com/codex/models",
+    ]),
+  }),
 });
 
 // Astra's release-date lower bound is independent of the later review time.
@@ -129,6 +142,23 @@ const OPENAI_SOL_LUNA_ROWS = Object.freeze([
   ["gpt-6-luna", "flex", "0.1", "0.01", "0.125", "0.375", "long", "from-2026-09-22"],
   ["gpt-6-luna", "priority", "0.2", "0.02", "0.25", "1", "short", "from-2026-09-22"],
   ["gpt-6-luna", "priority", "0.4", "0.04", "0.5", "1.5", "long", "from-2026-09-22"],
+]);
+
+// September 29 launch evidence has its own provenance so older cards retain
+// their exact bytes. Sol 6.1 is a distinct model with lower cache-read prices
+// than Sol 6. Ultrafast is published only for Astra; absent model/tier pairs
+// remain unpriced instead of inheriting Astra's 6x API ratio.
+const OPENAI_SOL61_ULTRAFAST_ROWS = Object.freeze([
+  ["gpt-6.1-sol", "standard", "2", "0.1", "2.5", "10", "short", "from-2026-09-29"],
+  ["gpt-6.1-sol", "standard", "4", "0.2", "5", "15", "long", "from-2026-09-29"],
+  ["gpt-6.1-sol", "batch", "1", "0.05", "1.25", "5", "short", "from-2026-09-29"],
+  ["gpt-6.1-sol", "batch", "2", "0.1", "2.5", "7.5", "long", "from-2026-09-29"],
+  ["gpt-6.1-sol", "flex", "1", "0.05", "1.25", "5", "short", "from-2026-09-29"],
+  ["gpt-6.1-sol", "flex", "2", "0.1", "2.5", "7.5", "long", "from-2026-09-29"],
+  ["gpt-6.1-sol", "priority", "4", "0.2", "5", "20", "short", "from-2026-09-29"],
+  ["gpt-6.1-sol", "priority", "8", "0.4", "10", "30", "long", "from-2026-09-29"],
+  ["gpt-6-astra", "ultrafast", "60", "6", "75", "300", "short", "from-2026-09-29"],
+  ["gpt-6-astra", "ultrafast", "120", "12", "150", "450", "long", "from-2026-09-29"],
 ]);
 
 const OPENAI_ROWS = Object.freeze([
@@ -367,6 +397,7 @@ export const NORMALIZED_PRICE_EVIDENCE_ROWS = deepFreeze({
   openaiAstra: [OPENAI_ASTRA_ROWS],
   openaiSolLuna: [OPENAI_SOL_LUNA_ROWS],
   anthropicLatest: [ANTHROPIC_LATEST_ROWS],
+  openaiSol61Ultrafast: [OPENAI_SOL61_ULTRAFAST_ROWS],
 });
 
 // These hashes are generated from the normalized reviewed rows during an
@@ -378,6 +409,7 @@ const EVIDENCE_HASHES = Object.freeze({
   anthropic: "7653380aa58230fef8a39a17f141fe04bd763ca39390a69671825e6f6109d76e",
   openaiAstra: "546af74276392ac5cd4f3faab783fff6d2b62235c7a5288012e8a24fd309301b",
   anthropicLatest: "3762998c98a2d9c058b9e698f3d3b8b77b652d0c838ada78cc2ba550de4740c7",
+  openaiSol61Ultrafast: "aaba22387dcf21551b86be6abe7ffea6d88a33447fa46e91b442f5d6ef265687",
 });
 
 function component(usageComponent, amount, conditions) {
@@ -496,14 +528,18 @@ const OPENAI_ALIAS_ASSUMPTIONS = Object.freeze({
 });
 
 function hasStrictAbove272KBoundary(model) {
-  return model === "gpt-6-astra" || model === "gpt-6-sol" || model === "gpt-6-luna";
+  return model === "gpt-6-astra" || model === "gpt-6-sol" || model === "gpt-6-luna"
+    || model === "gpt-6.1-sol";
 }
 
 function openAiCard([model, tier, input, cacheRead, cacheWrite, output, contextBand = null, period = null]) {
   const isAstra = model === "gpt-6-astra";
   const isSolLuna = model === "gpt-6-sol" || model === "gpt-6-luna";
+  const isSol61 = model === "gpt-6.1-sol";
   const strictAbove272K = hasStrictAbove272KBoundary(model);
-  const sourceKey = isAstra ? "openaiAstra" : isSolLuna ? "openaiSolLuna" : "openai";
+  const sourceKey = isSol61 || (isAstra && tier === "ultrafast")
+    ? "openaiSol61Ultrafast"
+    : isAstra ? "openaiAstra" : isSolLuna ? "openaiSolLuna" : "openai";
   const contextConditions = contextBand === "short"
     ? { max_total_input_tokens: strictAbove272K ? "272000" : "271999" }
     : contextBand === "long"
@@ -544,6 +580,8 @@ function openAiCard([model, tier, input, cacheRead, cacheWrite, output, contextB
       ...(contextBand ? {
         coverage_note: isAstra
           ? "Astra short-context prices apply through 272,000 total request input tokens; above 272,000, long prices apply to the entire request."
+          : isSol61
+          ? "GPT-6.1 Sol short-context prices apply through 272,000 total request input tokens; above 272,000, long prices apply to the entire request."
           : isSolLuna
           ? "GPT-6 Sol and Luna short-context prices apply through 272,000 total request input tokens; above 272,000, long prices apply to the entire request."
           : contextBand === "short"
@@ -654,7 +692,10 @@ function providerToolCard(provider, model, rows) {
   };
 }
 
-export const OPENAI_OFFICIAL_PRICE_CARDS = deepFreeze([...OPENAI_ROWS, ...OPENAI_ASTRA_ROWS, ...OPENAI_SOL_LUNA_ROWS].map(openAiCard));
+export const OPENAI_OFFICIAL_PRICE_CARDS = deepFreeze([
+  ...OPENAI_ROWS, ...OPENAI_ASTRA_ROWS, ...OPENAI_SOL_LUNA_ROWS,
+  ...OPENAI_SOL61_ULTRAFAST_ROWS,
+].map(openAiCard));
 export const ANTHROPIC_OFFICIAL_PRICE_CARDS = deepFreeze([
   ...ANTHROPIC_ROWS.map((row) => anthropicCard(row)),
   ...ANTHROPIC_LATEST_ROWS.map((row) => anthropicCard(row, "anthropicLatest")),
@@ -670,7 +711,7 @@ export const APP_OFFICIAL_PRICE_CARDS = deepFreeze([
 ]);
 
 export const APP_PRICE_REGISTRY_SHA256 =
-  "48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9";
+  "d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d";
 
 export const APP_PRICE_REGISTRY_MANIFEST = deepFreeze({
   version: APP_PRICE_REGISTRY_VERSION,
@@ -689,7 +730,7 @@ export const APP_PRICE_REGISTRY_MANIFEST = deepFreeze({
 });
 
 const ALLOWED_TIERS = Object.freeze({
-  openai: new Set(["standard", "batch", "flex", "priority"]),
+  openai: new Set(["standard", "batch", "flex", "priority", "ultrafast"]),
   anthropic: new Set(["standard", "batch", "fast"]),
 });
 

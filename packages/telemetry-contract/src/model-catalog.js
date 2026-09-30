@@ -3,7 +3,7 @@
 // The published identities match the accounting package's reviewed text-model
 // cards; synthetic provider-tool cards are deliberately excluded. Explicit
 // aliases retain their own identity even when a caller shares a price card.
-export const REVIEWED_MODEL_CATALOG_VERSION = "reviewed-model-catalog-2026-09-23.1";
+export const REVIEWED_MODEL_CATALOG_VERSION = "reviewed-model-catalog-2026-09-29.1";
 
 const reviewedOpenAiModelRows = [
   ["codex-auto-review", "Codex Auto-review", "assumed_alias", "gpt-5.4"],
@@ -74,6 +74,12 @@ export const REVIEWED_MODEL_CATALOG = Object.freeze([
     id, label, provider: "anthropic_claude_code", allowanceTrack: "primary",
     pricingStatus: "published", priceModelId: id,
   })),
+  // Append after all existing providers so persisted telemetry enum positions
+  // stay stable for both Codex and Claude identities.
+  Object.freeze({
+    id: "gpt-6.1-sol", label: "GPT-6.1 Sol", provider: "openai_codex",
+    allowanceTrack: "primary", pricingStatus: "published", priceModelId: "gpt-6.1-sol",
+  }),
 ]);
 
 export const REVIEWED_CODEX_MODEL_IDS = Object.freeze(

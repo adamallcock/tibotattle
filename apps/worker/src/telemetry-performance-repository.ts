@@ -18,6 +18,12 @@ import {
 } from "./telemetry-performance-policy";
 
 const REPORT_SCHEMA_VERSION = "telemetry-performance-report-v1";
+// Historical rows keep the dictionary under which they were authorized. This
+// read allowlist does not broaden the current parser or write authorization.
+const STORED_FIELD_DICTIONARY_VERSIONS = [
+  "telemetry-performance-registry-2026-09-21.1",
+  PERFORMANCE_FIELD_DICTIONARY_VERSION,
+] as const;
 const REPORT_KEYS = [
   "bucketSchemeVersion", "day", "fieldDictionaryVersion", "measurementVersion",
   "methodVersion", "parserVersion", "privacyContractVersion", "records", "reportRevision",
@@ -76,6 +82,7 @@ interface ReportRow {
   source_revision: number;
   method_version: string;
   parser_version: string;
+  field_dictionary_version: string;
   record_count: number;
   canonical_bytes: number;
   created_at: string;
@@ -157,6 +164,7 @@ export interface TelemetryPerformanceReportRead {
   readonly sourceGeneration: string;
   readonly sourceDigest: string;
   readonly sourceRevision: number;
+  readonly fieldDictionaryVersion: string;
   readonly state: ReportRow["state"];
   readonly createdAt: string;
   readonly cohorts: readonly TelemetryPerformanceCohortRead[];
@@ -368,6 +376,7 @@ function validateStoredReportMetadata(row: ReportRow): void {
       || !integer(row.source_revision)
       || !safeString(row.method_version, TOKEN)
       || !safeString(row.parser_version, TOKEN)
+      || !STORED_FIELD_DICTIONARY_VERSIONS.some((version) => version === row.field_dictionary_version)
       || !integer(row.record_count, MAX_REPORT_RECORDS)
       || !integer(row.canonical_bytes, MAX_REPORT_BYTES)
       || row.canonical_bytes < 1
@@ -550,7 +559,8 @@ export async function readTelemetryPerformanceReports(
     ? "state IN ('current', 'superseded')" : "state = 'current'";
   const rows = await db.prepare(
     `SELECT id, report_day, report_revision, source_generation, source_digest, source_revision,
-            method_version, parser_version, record_count, canonical_bytes, created_at, state
+            method_version, parser_version, field_dictionary_version,
+            record_count, canonical_bytes, created_at, state
        FROM telemetry_performance_reports
       WHERE participant_id = ? AND ${statePredicate}
         AND (? IS NULL OR report_day >= ?) AND (? IS NULL OR report_day <= ?)
@@ -649,6 +659,7 @@ export async function readTelemetryPerformanceReports(
     sourceGeneration: row.source_generation,
     sourceDigest: row.source_digest,
     sourceRevision: row.source_revision,
+    fieldDictionaryVersion: row.field_dictionary_version,
     state: row.state,
     createdAt: row.created_at,
     cohorts: Object.freeze((cohortsByReport.get(row.id) ?? []).map((cohort) => {

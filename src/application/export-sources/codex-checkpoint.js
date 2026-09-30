@@ -3,6 +3,7 @@ import {
   canonicalComponents,
   canonicalRateLimitSnapshot,
   codexSessionMetaIdentity,
+  codexTierObservation,
   cumulativeSnapshotKey,
   deltaComponentPresence,
   extractToolObservations,
@@ -141,7 +142,7 @@ function tierSemantics(tierEvent) {
     billingSurface: "chatgpt_subscription",
     codexSpeedMode: tierEvent?.tierState.speedMode ?? "unknown",
     apiServiceTier: tierEvent?.tierState.apiServiceTier ?? "unknown",
-    tierSource: tierEvent ? "rollout_thread_settings" : "unobserved",
+    tierSource: tierEvent?.tierState.tierSource ?? "unobserved",
     tierObservedAt: tierEvent ? new Date(tierEvent.eventTimeMs).toISOString() : null,
   };
 }
@@ -212,18 +213,20 @@ async function scanTierPhase({ workspace, source, checkpoint, resourceGuard, fai
       cursor.lineOrdinal = entry.lineOrdinal;
       lineCounts.lines += 1;
       if (entry.line === null) lineCounts.oversized += 1;
-      if (entry.line?.includes('"type":"thread_settings_applied"')) {
+      if (entry.line?.includes('"type":"thread_settings_applied"')
+          || entry.line?.includes('"type":"turn_context"')) {
         try {
           const record = JSON.parse(entry.line);
-          if (record.type === "event_msg" && record.payload?.type === "thread_settings_applied") {
+          const observation = codexTierObservation(record);
+          if (observation?.status === "observed") {
             const timestampMs = typeof record?.timestamp === "string"
               ? Date.parse(record.timestamp)
               : Number.NaN;
-            const rawTier = record.payload?.thread_settings?.service_tier;
+            const rawTier = observation.rawTier;
             if (Number.isFinite(timestampMs) && (rawTier === null || typeof rawTier === "string")) {
               const normalized = normalizeProviderTier(rawTier, {
                 billingSurface: "chatgpt_subscription",
-                tierSource: "rollout_thread_settings",
+                tierSource: observation.tierSource,
                 tierObservedAt: record.timestamp,
               });
               const tierIndex = state.tier.timelineIndex;
@@ -231,6 +234,7 @@ async function scanTierPhase({ workspace, source, checkpoint, resourceGuard, fai
                 timelineIndex: tierIndex + 1,
                 speedMode: normalized.codexSpeedMode,
                 apiServiceTier: normalized.apiServiceTier,
+                tierSource: observation.tierSource,
               };
               batch.tierEvents.push({
                 tierIndex,
@@ -384,6 +388,7 @@ async function scanRecordPhase({ workspace, source, checkpoint, secret, bounds, 
         }
         state.sessionMetaSeen = true;
       } else if (record.type === "turn_context") {
+        if (codexTierObservation(record)?.status === "malformed") contentInvalid();
         if (typeof record.payload?.model === "string") {
           state.currentModel = safeExportModelDeclaration(secret, record.payload.model);
         }

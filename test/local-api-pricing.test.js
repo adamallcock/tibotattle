@@ -99,6 +99,113 @@ test("Sol and Luna event pricing counts cache writes and reasoning once and pres
   }
 });
 
+test("Sol 6.1 and Astra Ultrafast preserve exact event-time token accounting", () => {
+  const expected = [
+    ["gpt-6.1-sol", "standard", "1.39", "2.28"],
+    ["gpt-6.1-sol", "batch", "0.695", "1.14"],
+    ["gpt-6.1-sol", "flex", "0.695", "1.14"],
+    ["gpt-6.1-sol", "priority", "2.78", "4.56"],
+    ["gpt-6-astra", "ultrafast", "42", "69"],
+  ];
+  for (const [model, apiServiceTier, short, long] of expected) {
+    const event = {
+      timestamp: "2026-09-29T00:00:00.000Z", model,
+      totalInputContextTokens: 272_000, raw: { input_tokens: 999_999 },
+      components: { input_uncached_tokens: 100_000, input_cache_read_tokens: 100_000,
+        input_cache_write_tokens: 72_000, output_text_tokens: 40_000, output_reasoning_tokens: 60_000 },
+      componentAvailability: { input_uncached_tokens: true, input_cache_read_tokens: true,
+        input_cache_write_tokens: true, output_text_tokens: true, output_reasoning_tokens: true },
+    };
+    const atLaunch = priceCodexUsageEvent(event, { apiServiceTier });
+    assert.equal(atLaunch.totalUsd, short, `${model}/${apiServiceTier}/short`);
+    assert.equal(atLaunch.coverageStatus, "fully_priced");
+    assert.equal(priceCodexUsageEvent({ ...event, totalInputContextTokens: 272_001 },
+      { apiServiceTier }).totalUsd, long, `${model}/${apiServiceTier}/long`);
+    assert.equal(priceCodexUsageEvent(event, { apiServiceTier,
+      priceEpochBasis: "current_price_sensitivity" }).totalUsd, short);
+    const beforeLaunch = priceCodexUsageEvent({ ...event, timestamp: "2026-09-28T23:59:59.999Z" },
+      { apiServiceTier });
+    assert.equal(beforeLaunch.totalUsd, "0");
+    assert.equal(beforeLaunch.coverageStatus, "unpriced");
+    const unavailableCacheWrites = priceCodexUsageEvent({ ...event, componentAvailability: {
+      ...event.componentAvailability, input_cache_write_tokens: false,
+    } }, { apiServiceTier });
+    assert.equal(unavailableCacheWrites.coverageStatus, "partially_priced");
+    assert.equal(unavailableCacheWrites.coverageCounts.unavailableComponents, 1);
+  }
+});
+
+test("unpublished Ultrafast pairs never borrow Standard prices or Astra's multiplier", () => {
+  for (const model of ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol"]) {
+    for (const totalInputContextTokens of [272_000, 272_001]) {
+      const result = priceCodexUsageEvent({
+        timestamp: "2026-09-29T12:00:00.000Z", model, totalInputContextTokens,
+        components: { input_uncached_tokens: 1_000_000, output_text_tokens: 1_000_000 },
+      }, { apiServiceTier: "ultrafast" });
+      assert.equal(result.totalUsd, "0", `${model}/${totalInputContextTokens}`);
+      assert.equal(result.coverageStatus, "unpriced");
+      assert.deepEqual(result.selectedPriceCardIds, []);
+      assert.ok(result.warnings.coverage.some((warning) => warning.code === "service_tier_exact_card_missing"));
+      assert.ok(result.components.every((component) => component.reasonCode === "service_tier_exact_card_missing"));
+    }
+  }
+});
+
+test("context-dependent Sol 6.1 and Astra rates require observed input context", () => {
+  const prices = [
+    ["gpt-6.1-sol", "standard", "0.01", "0.015"],
+    ["gpt-6.1-sol", "batch", "0.005", "0.0075"],
+    ["gpt-6.1-sol", "flex", "0.005", "0.0075"],
+    ["gpt-6.1-sol", "priority", "0.02", "0.03"],
+    ["gpt-6-astra", "standard", "0.05", "0.075"],
+    ["gpt-6-astra", "priority", "0.1", "0.15"],
+    ["gpt-6-astra", "ultrafast", "0.3", "0.45"],
+  ];
+  for (const [model, apiServiceTier, short, long] of prices) {
+    const event = {
+      timestamp: "2026-09-29T00:00:00.000Z", model, totalInputContextTokens: null,
+      components: { input_uncached_tokens: null, input_cache_read_tokens: null,
+        input_cache_write_tokens: null, output_text_tokens: 600, output_reasoning_tokens: 400 },
+    };
+    for (const missing of [event, {
+      ...event,
+      raw: { input_tokens: 0 }, rawAvailability: { input_tokens: false },
+      components: { ...event.components, input_uncached_tokens: 0, input_cache_read_tokens: 0, input_cache_write_tokens: 0 },
+      componentAvailability: { input_uncached_tokens: false, input_cache_read_tokens: false, input_cache_write_tokens: false },
+    }, { ...event, components: { output_text_tokens: 600, output_reasoning_tokens: 400 } }, {
+      ...event, components: { ...event.components, input_uncached_tokens: 10 },
+    }]) {
+      const result = priceCodexUsageEvent(missing, { apiServiceTier });
+      assert.equal(result.coverageStatus, "unpriced", `${model}/${apiServiceTier}`);
+      assert.equal(result.totalUsd, "0");
+      assert.deepEqual(result.selectedPriceCardIds, []);
+      assert.ok(result.components.filter((component) => component.pricingStatus === "unpriced")
+        .every((component) => component.reasonCode === "total_input_context_missing"));
+      assert.ok(result.warnings.coverage.some((warning) => warning.code === "total_input_context_missing"));
+      assert.equal(result.warnings.coverage.some((warning) => warning.code === "unknown_model"), false);
+    }
+    for (const [totalInputContextTokens, expected] of [[272_000, short], [272_001, long]]) {
+      for (const known of [
+        { ...event, totalInputContextTokens },
+        { ...event, raw: { input_tokens: totalInputContextTokens } },
+        { ...event, raw: { input_tokens: totalInputContextTokens }, rawAvailability: { input_tokens: true } },
+      ]) {
+        const result = priceCodexUsageEvent(known, { apiServiceTier });
+        assert.equal(result.coverageStatus, "partially_priced");
+        assert.equal(result.totalUsd, expected, `${model}/${apiServiceTier}/${totalInputContextTokens}`);
+        assert.equal(result.coverageCounts.unavailableComponents, 3);
+        assert.equal(result.warnings.coverage.some((warning) => warning.code === "total_input_context_missing"), false);
+      }
+    }
+    const knownZero = priceCodexUsageEvent({ ...event,
+      components: { ...event.components, input_uncached_tokens: 0, input_cache_read_tokens: 0, input_cache_write_tokens: 0 },
+    }, { apiServiceTier });
+    assert.equal(knownZero.coverageStatus, "fully_priced");
+    assert.equal(knownZero.totalUsd, short);
+    assert.equal(knownZero.methodVersion, "provider-neutral-api-price-equivalent-v0.3");
+  }
+});
+
 test("Codex component availability reaches the ledger and never becomes observed zero", () => {
   const result = priceCodexUsageEvent({
     timestamp: "2026-07-26T15:00:00.000Z",

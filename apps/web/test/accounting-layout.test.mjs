@@ -35,7 +35,7 @@ test("the live price headline shows one amount and moves its Standard comparison
   assert.equal(value, "$6200.00");
   assert.equal(note, "Last 7 days");
   assert.match(explanation, /not a bill or a subscription limit/u);
-  assert.match(explanation, /\$5929\.64 at Standard rates before Fast weighting/u);
+  assert.match(explanation, /\$5929\.64 at Standard rates before speed-mode weighting/u);
   assert.doesNotMatch(note, /\$|Standard|Fast/u);
   assert.match(appSource, /:\s*\[\s*accountingPriceHeadline\(accounting\),/u);
 

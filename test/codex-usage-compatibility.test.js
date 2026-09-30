@@ -200,7 +200,7 @@ test("missing cache components remain null; explicit zero remains observed acros
     const refreshed = await ingestLocalUnifiedIndexIncrement({ ...options, indexFile: incremental });
     assert.equal(refreshed.sourcesReparsedForParserVersion, 1);
     assert.deepEqual(rows(incremental), expected);
-    assert.equal(LOCAL_UNIFIED_INDEX_PARSER_VERSION, "unified-rollout-typed-v18");
+    assert.equal(LOCAL_UNIFIED_INDEX_PARSER_VERSION, "unified-rollout-typed-v19");
   } finally { await rm(value.root, { recursive: true }); }
 });
 
@@ -287,8 +287,89 @@ test("response totals/checkpoint copies are not additive usage and authored conf
 });
 
 
-test("v18 keeps reviewed historical boundary provenance and refuses unqualified variants", () => {
-  for (const version of [15, 16, 17, 18]) {
+test("thread and applied-turn tier evidence agrees across scanner, full and incremental index", async () => {
+  const value = await fixture([
+    line(0, "turn_context", { model: "gpt-6-astra", service_tier: "default" }),
+    count(1, vector(100), vector(100)),
+    line(2, "event_msg", { type: "thread_settings_applied", thread_settings: { service_tier: "priority" } }),
+    count(3, vector(200), vector(100)),
+    line(4, "turn_context", { model: "gpt-6-astra", service_tier: "ultrafast" }),
+    count(5, vector(300), vector(100)),
+    line(6, "turn_context", { model: "gpt-6-astra", service_tier: null }),
+    count(7, vector(400), vector(100)),
+  ].map((record) => record.replaceAll("2026-09-03", "2026-09-29")));
+  const options = { codexHome: value.root, secretFile: join(value.root, "salt"), contractVersion: "usage-event-v0.2" };
+  const expected = ["standard", "fast", "ultrafast", "unknown"];
+  const readModes = (file) => {
+    const db = openLocalUnifiedIndex(file, { readOnly: true });
+    try { return db.prepare(`SELECT codex_speed_mode, tier_source FROM usage_event
+      JOIN tier_semantics ON tier_semantics.id = usage_event.tier_id ORDER BY observed_at_ms`).all(); }
+    finally { db.close(); }
+  };
+  try {
+    const events = [];
+    await localCodexLogScanner.scanCodexLogEvents({ codexHome: value.root,
+      startAt: "2026-09-03T00:00:00.000Z", endAt: "2026-09-30T00:00:00.000Z",
+      onUsage: (event) => events.push(event) });
+    assert.deepEqual(events.map((event) => event.tierSemantics.codexSpeedMode), expected);
+    for (const [name, build] of [["full", rebuildLocalUnifiedIndex], ["incremental", ingestLocalUnifiedIndexIncrement]]) {
+      const indexFile = join(value.root, `${name}.sqlite`);
+      await build({ ...options, indexFile });
+      const modes = readModes(indexFile);
+      assert.deepEqual(modes.map((row) => row.codex_speed_mode), expected);
+      assert.deepEqual(modes.map((row) => row.tier_source), ["turn_override", "rollout_thread_settings", "turn_override", "turn_override"]);
+      await ingestLocalUnifiedIndexIncrement({ ...options, indexFile });
+      assert.deepEqual(readModes(indexFile), modes);
+      assert.equal(rows(indexFile).length, 4);
+    }
+  } finally { await rm(value.root, { recursive: true }); }
+});
+
+test("model catalog repair reparses retained Sol 6.1 sources once without changing token evidence", async () => {
+  const selected = vector(100, 90);
+  const value = await fixture([
+    line(0, "turn_context", { model: "gpt-6.1-sol", effort: "low" }),
+    count(1, selected, selected),
+  ].map((record) => record.replaceAll("2026-09-03", "2026-09-29")));
+  const indexFile = join(value.root, "index.sqlite");
+  const options = { codexHome: value.root, indexFile, secretFile: join(value.root, "salt"), contractVersion: "usage-event-v0.2" };
+  try {
+    await ingestLocalUnifiedIndexIncrement(options);
+    const initialTokens = rows(indexFile);
+    // Reproduce the prior catalog's derived unknown model, preserving source
+    // and occurrence identity. A price refresh alone cannot restore this id.
+    const previous = openLocalUnifiedIndex(indexFile);
+    try {
+      previous.prepare("INSERT OR IGNORE INTO model(model_id, recognition) VALUES ('unknown', 'unrecognized')").run();
+      previous.exec("UPDATE usage_event SET model_id = (SELECT id FROM model WHERE model_id = 'unknown')");
+      previous.exec("UPDATE parser_version SET parser_version = 'unified-rollout-typed-v18'");
+    } finally { previous.close(); }
+    const repaired = await ingestLocalUnifiedIndexIncrement(options);
+    assert.equal(repaired.sourcesReparsedForParserVersion, 1);
+    assert.equal(repaired.totalUsageEvents, 1);
+    assert.deepEqual(rows(indexFile), initialTokens);
+    const current = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.deepEqual({ ...current.prepare(`SELECT model.model_id, recognition FROM model
+        JOIN usage_event ON usage_event.model_id = model.id`).get() }, {
+        model_id: "gpt-6.1-sol", recognition: "recognized",
+      });
+    } finally { current.close(); }
+    const projected = usageProjection({ observedAt: "2026-09-29T12:00:01.000Z", model: "gpt-6.1-sol",
+      totalInputContextTokens: 100, components: { input_uncached_tokens: 10, input_cache_read_tokens: 90,
+        input_cache_write_tokens: 0, output_text_tokens: 10, output_reasoning_tokens: 0, output_combined_tokens: 10 } });
+    assert.equal(projected.model, "gpt-6.1-sol");
+    assert.equal(projected.apiPriceEquivalentUsd, 0.000129);
+    const replay = await ingestLocalUnifiedIndexIncrement(options);
+    assert.equal(replay.sourcesReparsedForParserVersion, 0);
+    assert.equal(replay.insertedUsageEvents, 0);
+    assert.equal(replay.totalUsageEvents, 1);
+    assert.deepEqual(rows(indexFile), initialTokens);
+  } finally { await rm(value.root, { recursive: true }); }
+});
+
+test("v19 keeps reviewed historical boundary provenance and refuses unqualified variants", () => {
+  for (const version of [15, 16, 17, 18, 19]) {
     for (const suffix of ["", "-partial", "-parent-model", "-parent-model-partial"]) {
       const parser = `unified-rollout-typed-v${version}${suffix}`;
       assert.equal(isLocalUnifiedIndexBoundaryParserVersion(parser), true, parser);
@@ -297,7 +378,7 @@ test("v18 keeps reviewed historical boundary provenance and refuses unqualified 
     }
   }
   for (const parser of [null, undefined, "", "unified-rollout-typed-v14",
-    "unified-rollout-typed-v19", "unified-rollout-typed-v018",
+    "unified-rollout-typed-v20", "unified-rollout-typed-v018",
     "unified-rollout-typed-v18-future", "unified-rollout-typed-v18 ",
     "unified-rollout-typed-v18-partial-parent-model"]) {
     assert.equal(isLocalUnifiedIndexBoundaryParserVersion(parser), false, String(parser));

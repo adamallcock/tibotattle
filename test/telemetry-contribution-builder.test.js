@@ -201,6 +201,38 @@ test("builder removes private scopes, normalizes components, and prices usage", 
   }
 });
 
+test("builder preserves exact Ultrafast API valuation and leaves unsupported Sol unpriced", () => {
+  const eventTime = "2026-09-29T20:00:00.000Z";
+  const input = bundle({ quotaSnapshots: [], usageEvents: [usage(1, {
+    eventTime,
+    modelId: "gpt-6-astra",
+    billingSurface: "api",
+    speedMode: "ultrafast",
+    apiServiceTier: "ultrafast",
+    components: {
+      inputUncachedTokens: 1000,
+      inputCacheReadTokens: 0,
+      inputCacheWriteTokens: 0,
+      outputTextTokens: 0,
+      outputReasoningTokens: 0,
+    },
+    totalInputContextTokens: 1000,
+  })] });
+  input.createdAt = eventTime;
+  input.coveredAt = { startAt: eventTime, endAt: eventTime };
+  const [contribution] = buildTelemetryContributionsFromBundle(input);
+  assert.equal(contribution.usageEvents[0].apiServiceTier, "ultrafast");
+  assert.equal(contribution.usageEvents[0].accounting.estimatedApiCostUsd, "0.060000");
+  assert.equal(contribution.accounting.estimatedApiCostUsd, "0.060000");
+  input.records.usageEvents[0].totalInputContextTokens = 272001;
+  const [longContext] = buildTelemetryContributionsFromBundle(input);
+  assert.equal(longContext.usageEvents[0].accounting.estimatedApiCostUsd, "0.120000");
+  input.records.usageEvents[0].modelId = "gpt-6.1-sol";
+  const [unsupported] = buildTelemetryContributionsFromBundle(input);
+  assert.equal(unsupported.usageEvents[0].accounting.estimatedApiCostUsd, null);
+  assert.equal(unsupported.usageEvents[0].accounting.priceBasis, "unpriced");
+});
+
 test("builder splits large canonical bundles into bounded transport batches", () => {
   const contributions = buildTelemetryContributionsFromBundle(bundle({
     usageEvents: Array.from({ length: 222 }, (_, index) => usage(index + 1)),

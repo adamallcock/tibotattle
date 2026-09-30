@@ -36,10 +36,26 @@ Usage activation requires the common primary forward rows through
 `0008_telemetry_v12.sql` and the final typed v1/v1.1 and successor usage
 objects. The independent `0009_performance_reports.sql` migration, performance
 tables, and histogram bucket checks may be absent or remain staged. Performance
-activation requires the complete primary prefix through `0009`, every pinned
-performance object, and the exact report bucket and measurement checks. Both
-targets require typed storage, the same valid source namespace for v1 and v1.1,
+activation requires the complete primary prefix through `0009`, the exact
+`0013_performance_ultrafast.sql` ledger pin, every pinned performance object,
+and the exact report bucket and measurement checks. The additional migration
+SHA-256 is `88ac498493c869009e322e029ccff805236afd8d08ef299c39a3befda72d4aad`;
+required objects include `telemetry_performance_cohort_dictionary_insert` and
+`telemetry_performance_cohort_dictionary_update`. Missing or changed migration
+evidence or either missing trigger refuses performance activation without
+blocking independent usage activation. Both targets require typed storage,
+the same valid source namespace for v1 and v1.1,
 and enabled upload registration and processing controls.
+
+Migration `0013` preserves the runtime state and advances its existing
+`policy_revision` by one. A fresh staged fixture advances from 1 to 2 before
+activation, then activation advances 2 to 3; these are synthetic fixture values,
+not revisions to assume for an existing environment. Already-active rows remain
+active. Historical September 21 reports and grants remain retained, while new September 29
+dictionary writes require matching new authorization. The historical forward
+operator retains its closed pins through `0009`; applying `0013` therefore needs
+a reviewed environment-specific migration plan and rehearsal before using this
+activation sequence. Do not broaden those operator pins as an implicit upgrade.
 
 The runtime row must still be `staged`. Record its current `policy_revision`
 from a read-only post-deploy check and use that value as `expectedRevision`.

@@ -107,7 +107,7 @@ allowance. Unknown labels are withheld or fingerprinted at the existing export
 boundary, never copied into admin labels. Legacy telemetry enum positions remain
 stable; newly reviewed values append.
 
-The export registry advances to `telemetry-v0.1-registry-2026-09-03.1` with its
+The export registry advances to `telemetry-v0.1-registry-2026-09-29.1` with its
 closed schema and generated compatibility dictionary. Disabled legacy upload
 contracts remain disabled; this vocabulary change does not enable contribution
 or alter consent. Reparse retained source before claiming to recover a model that
@@ -115,12 +115,45 @@ an older extractor normalized to unknown. Admin model history has an independent
 versioned compact projection; historical absence is not zero observations for a
 newly added model.
 
+### Performance speed vocabulary and retained authorization
+
+The performance dictionary advances to `telemetry-performance-registry-2026-09-29.1`
+for the appended GPT-6.1 Sol identity and separate Ultrafast cohort. Existing
+enum positions stay stable. Worker isolation migration
+`0013_performance_ultrafast.sql` admits the new dictionary without rewriting
+historical migration `0009`. Historical reports and their Sep21 authorizations
+retain their original dictionary; they remain readable and erasable, rather
+than authorizing the expanded contract. New writes require the Sep29
+dictionary and matching current authorization. Local SQL tests cover historical
+preservation, refusal before migration, old-consent refusal, new admission,
+rollback, retry and erasure. Remote application remains a separate gate: the
+existing historical forward operator has closed pins through `0009`, so `0013`
+needs an environment-specific reviewed migration plan and rehearsal.
+The independent performance activation predicate requires the exact `0009` and
+`0013` ledger hashes and both current cohort dictionary triggers. Usage
+activation does not acquire those performance requirements. Migration `0013`
+preserves runtime state while incrementing the existing policy revision; an
+activation request must use the reconciled current revision rather than an
+assumed initial value.
+
 ## Compatibility and versioning
 
 Use a new contract version when a consumer could assign a different meaning to
 the same valid bytes. Additive fields are not automatically compatible when
 objects are closed; producer, consumer, consent, storage, relay, public
 projection, and deletion/export paths must declare the same transition.
+
+Local API valuation methodology is `provider-neutral-api-price-equivalent-v0.3`
+and replay materialization is `local-replay-safe-accounting-v0.18`. Current
+companion readers and writers require `source_native` context behavior: absent
+context remains unavailable rather than becoming observed zero. An inferred
+input total is usable only when its component observations are complete; known
+explicit context, including observed zero, remains authoritative. The memoized
+pricer derives context thresholds from the reviewed public cards and falls back
+to the full ledger for incomplete evidence. Old materialization is withheld for
+rebuild; an explicitly requested `legacy_zero` compatibility adapter retains its
+original meaning rather than becoming the current default. This does not
+rewrite stored source observations or alter retained price-card evidence.
 
 A version change includes:
 
@@ -164,6 +197,15 @@ is required, not permission to delete it to make an upgrade succeed.
 The v1.1 wire format does not carry a complete quantity-interval proof. Hosted
 allowance remains explicitly conditional even when a record has an account
 pseudonym. This is not a provider-authoritative account billing contract.
+
+The source-verified `promax` identifier is accepted by local v0.1 export and
+staged v1.1/v1.2 schemas. The frozen v0.2
+contribution schema retains its original vocabulary: its local projection
+writes `unknown` for this value, while v1.1/v1.2 can retain the exact identifier.
+The reviewed installed-binary evidence does not yet cover `promax`. Product
+policy names `pro` Pro 10x and `promax` Pro Max 25x, without changing the
+existing `pro` identity or discarding its history. Provider allowance and
+window semantics remain unverified; the release contract check stays blocked.
 
 ## Staged continuity successor v1.2
 
@@ -257,11 +299,11 @@ capability and authorization routes, encrypted report delivery, typed cohort and
 bucket storage, idempotent per-device report revisions, and owner-erasure/restore
 coverage. Usage consent cannot authorize performance. Local timing source and
 scheduler integration are qualified separately from hosted chart publication.
-Timing SQLite schemas advance from 2/3 to 4/5 while parser methods remain 2/3.
-Older writers refuse the upgraded stores. Old rows retain existing TPS/TTFT
+Timing SQLite schemas advance to primary 6 and supplement 7 while parser methods remain 2/3. Source parser version 18 recognizes GPT-6.1 Sol and Ultrafast. Still-present, verified sources replay through bounded staging; completed old rows remain readable through cancellation and restart until the final verified chunk atomically replaces them. Missing or rewritten sources retain their last good rows and prior parser provenance. Older writers refuse the upgraded stores.
+Old rows retain existing TPS/TTFT
 with unavailable new fields. Receipt timing
 wins when qualified; tool-free timing is a single-sample fallback, never a
-second speed sample for the same turn. The field dictionary is `telemetry-performance-registry-2026-09-21.1`.
+second speed sample for the same turn. The field dictionary is `telemetry-performance-registry-2026-09-29.1`.
 The [performance specification](../design/2026-09-20-performance-telemetry-contract.md)
 records the measurement, overlap, policy, delivery, erasure, restore and UI requirements.
 Those gates must not delay continuity collection or alter cache calculations.

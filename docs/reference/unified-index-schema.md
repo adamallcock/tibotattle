@@ -31,7 +31,7 @@ one another:
 | Stable filename | `local-unified-index-v1.sqlite` | Machine path continuity across app releases. |
 | Schema-family metadata | `local-unified-index-v2` | Logical family stored in `meta.schema_version`. |
 | SQLite `PRAGMA user_version` | `11` | Physical table/index/migration generation. |
-| Parser version | `unified-rollout-typed-v18` | Meaning and provenance of facts extracted from rollout sources, including structural record classification, a 512 KiB default line cap, paginated history boundaries, and exact selected input/output totals. |
+| Parser version | `unified-rollout-typed-v19` | Meaning and provenance of facts extracted from rollout sources, including reviewed GPT-6.1 Sol identity refresh and Standard/Fast/Ultrafast turn-context tier observations, structural record classification, a 512 KiB default line cap, paginated history boundaries, and exact selected input/output totals. |
 | Source identity version | `codex-immutable-rollout-v1` | Rules for physical rollout identity/generation. |
 
 The application id is a separate SQLite format guard. A file with the wrong
@@ -149,6 +149,8 @@ and their dependent children; absent sources keep their existing facts and
 provenance. The physical schema, source identities, replay rules, timing fields,
 and hosted contribution contracts are unchanged. Reprocessing is required before
 new facts acquire v18 provenance; changing a stored parser label is not recovery.
+
+Parser v19 recognizes the reviewed GPT-6.1 Sol identity and explicit Standard, Fast and Ultrafast `turn_context.service_tier` evidence. Sparse omission preserves the preceding setting; explicit null clears it. Present sources reparse through the existing staged generation boundary without changing physical schema 11 or source identity. Absent sources retain their prior facts and parser provenance.
 
 The opt-in local contribution reader `readDayWithV12Evidence(day)` derives
 successor boundary masks and same-session/millisecond ranks from these existing

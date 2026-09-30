@@ -96,6 +96,24 @@ test("profiles collector freshness, reset jitter, quantization, and prioritized 
   assert.match(renderMonitoringQualityReport(report), /TiboTattle Quality Diagnostic/);
 });
 
+test("Ultrafast receipts count as known speed evidence without erasing unresolved receipts", () => {
+  assert.equal(classifyMonitoringInterval(interval({
+    tierUsageEventCounts: { ultrafast: 1 },
+  })).speedCoverage, "known");
+  assert.equal(classifyMonitoringInterval(interval({
+    tierUsageEventCounts: { ultrafast: 1, unknown: 1 },
+  })).speedCoverage, "mixed");
+  const transitions = fixture();
+  transitions.snapshotIntervals = transitions.snapshotIntervals.map((row) => ({
+    ...row,
+    marginalUsageEventCount: 4,
+    tierUsageEventCounts: { ultrafast: 3, unknown: 1 },
+  }));
+  const report = analyzeMonitoringQuality({ transitions, now: "2026-07-24T12:00:00.000Z" });
+  assert.equal(report.metadata.knownSpeedEventFraction, 0.75);
+  assert.match(renderMonitoringQualityReport(report), /Known Standard\/Fast\/Ultrafast usage events: 75\.0%/);
+});
+
 test("keeps continuity as a P0 when a refresh follows a long app-server gap", () => {
   const report = analyzeMonitoringQuality({
     transitions: fixture(),

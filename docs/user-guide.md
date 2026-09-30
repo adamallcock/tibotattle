@@ -129,9 +129,14 @@ These historical estimates are conditional on the locally observed plan, not
 proof of which provider account generated every token. Known plan switches and
 ambiguous boundary quantities are excluded narrowly; coherent older history is
 still useful. **Usage and costs** continues to retain all-plan accounting totals.
-Community chart lines and headline values retain their common Pro 20x-equivalent
-scale. In By plan, the smaller card value shows that plan's own weekly allowance
-at API prices: divide the headline by 1 for Pro 20x, 4 for Pro 5x, or 20 for Plus.
+The Aggregate and By model community views use a Pro 10x-equivalent weekly
+basis. By plan charts each plan's own weekly API-price value on its own scale;
+the card shows that value first and the Pro 10x equivalent underneath. The
+plan value is the reference estimate divided by 1 for Pro 10x, 2 for Pro 5x,
+0.4 for Pro Max 25x, or 10 for Plus. The Pro Max 25x factor assumes the
+same Plus baseline as the existing tiers and awaits provider confirmation.
+The Pro 10x rename retains the existing Pro history; it does not start a new
+account or discard earlier evidence.
 This is an estimated API value, not the subscription price, and does not authorize
 mixing personal Plus and Pro allowance histories.
 
@@ -187,21 +192,28 @@ and use the shared **Reporting period** above the page. The 0.1.24 desktop
 release includes this page, including on Windows x64. Local timing analysis is
 separate from activation of optional hosted performance telemetry.
 
-The page starts in **Standard** mode. Use the **Standard / Fast** toggle to show
+The page starts in **Standard** mode. Use the **Standard / Fast / Ultrafast** controls to show
 only the selected mode; counts, medians, bands and both charts use that same
 population. The choice lasts while the page is mounted, including period/model
-changes and refreshes. Fast mode can have few or no observations. Hollow points
+changes and refreshes. Fast and Ultrafast can have few or no observations. Hollow points
 have fewer than five measured turns, and those bins have no percentile bands.
-Unknown or mixed modes are excluded from both views, with their excluded turn
+Unknown or mixed modes are excluded from all three views, with their excluded turn
 count shown. Older saved measurements without mode evidence stay unclassified.
 
 After the initial dashboard loads, the app prepares all four shared reporting
-periods in both Standard and Fast in the background. Once ready, opening the
+periods in Standard, Fast and Ultrafast in the background. Once ready, opening the
 page or switching either control displays its cached result immediately while
 checking for updates. A first history scan may still show progress until its
 measurements are ready. Browser results stay in memory only; restarting the app
 starts a fresh page cache. Speculative requests pause while the app document is
 hidden.
+
+If approved performance sharing is paused, **Community → Review performance
+sharing again** lets you review and renew its independent authorization. A valid
+renewal can resume an earlier authorization or response-version rejection while
+preserving upload progress. Opt-outs, disconnections and invalid measurements
+remain protected. Accountless sharing rechecks its protected preference and
+current hosted grant when the client restarts or that preference changes.
 
 **Output speed** includes response-timed measurements plus eligible tool-free
 turn estimates from older logs. Each turn contributes once: covered response

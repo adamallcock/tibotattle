@@ -143,6 +143,11 @@ test("performance daily cohorts preserve the closed measurement shape", () => {
     speedModeSource: "turn_context_service_tier",
   });
   assert.equal(parseTelemetryPerformanceRecord(turnContext), turnContext);
+  for (const speedModeSource of ["rollout_thread_settings", "turn_context_service_tier", "lineage_inherited"]) {
+    const ultrafast = performanceRecord({ speedMode: "ultrafast", speedModeSource, apiServiceTier: "ultrafast" });
+    assert.equal(parseTelemetryPerformanceRecord(ultrafast), ultrafast);
+    assert.deepEqual(browser.parseTelemetryPerformanceRecord(ultrafast), ultrafast);
+  }
   const mixed = performanceRecord({
     speedMode: "mixed",
     speedModeSource: "mixed",
@@ -190,6 +195,8 @@ test("performance validation rejects privacy, version, bounds, and relation viol
   expectInvalid(performanceRecord({ speedMode: "mixed", speedModeSource: "unobserved" }), "mixed mode requires mixed source");
   expectInvalid(performanceRecord({ speedMode: "standard", speedModeSource: "unobserved" }), "known mode requires evidence source");
   expectInvalid(performanceRecord({ speedMode: "fast", speedModeSource: "mixed" }), "fast mode requires own or inherited evidence");
+  expectInvalid(performanceRecord({ speedMode: "ultrafast", speedModeSource: "unobserved" }), "ultrafast requires observed evidence");
+  expectInvalid(performanceRecord({ speedMode: "ultrafast-private" }), "unreviewed speed mode");
   expectInvalid(performanceRecord({ reasoningEffort: "not-known" }), "unknown reasoning effort");
   expectInvalid(performanceRecord({ speedMethod: "inferred" }), "unknown speed method");
   expectInvalid(performanceRecord({ measurementVersion: "model-performance-samples-v0" }), "unknown measurement version");
@@ -259,6 +266,12 @@ test("performance JSON Schemas express closed shape and simple runtime relations
   assert.equal(validateHistogram({ ...completionHistogram(), buckets: { 0: 1 }, min: 0, max: 0 }), false);
   assert.equal(validateHistogram({ ...speedHistogram(), min: null }), false);
   assert.equal(validateRecord(performanceRecord()), true);
+  for (const speedMode of ["standard", "fast", "ultrafast", "other"]) {
+    const record = performanceRecord({ speedMode, speedModeSource: "turn_context_service_tier", apiServiceTier: "ultrafast" });
+    assert.equal(validateRecord(record), true, JSON.stringify(validateRecord.errors));
+    assert.equal(parseTelemetryPerformanceRecord(record), record);
+  }
+  assert.equal(validateRecord(performanceRecord({ speedMode: "ultrafast", speedModeSource: "unobserved" })), false);
   assert.equal(validateRecord(performanceRecord({
     provider: "anthropic_claude_code",
     modelId: "claude-sonnet-5",
