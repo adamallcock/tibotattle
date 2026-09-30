@@ -1353,10 +1353,20 @@ it('folds mixed v1 and v1.1 evidence once through resumable model and fit graphs
  expect({sourceRows:metadata.length,proofRows:proofs.results.length,digestMismatches:digestMismatches.slice(0,3)})
    .toEqual({sourceRows:metadata.length,proofRows:metadata.length,digestMismatches:[]});
  await activateTelemetryV11Domain(source(),v11Device,manifest);
- for(let attempt=0;attempt<30;attempt++)if((await advanceStorageAnalytics(bindings())).state==='idle')break;
+ // Predecessor closure includes the current UTC day. Every synthetic day fits
+ // one projection page; allow its day step, the final acknowledgement and the
+ // idle proof instead of assuming the calendar span always fits 30 calls.
+ let deliveryIdle=false;
+ for(let attempt=0;attempt<days.length+2;attempt++){
+   if((await advanceStorageAnalytics(bindings())).state==='idle'){deliveryIdle=true;break;}
+ }
+ expect(deliveryIdle).toBe(true);
 
  const owner=(await readStorageCommunityOwnerPage(source())).find(row=>row.participantId===before.participantId)!;
  expect(owner).toMatchObject({hasV1:true,hasV11:true,hasEffective:true});
+ expect(await target().prepare(`SELECT state,authority_epoch FROM analytics_owner_state
+   WHERE source_id=? AND owner_digest=?`).bind(sourceId,owner.ownerDigest).first())
+   .toEqual({state:'active',authority_epoch:owner.authorityEpoch});
  const inputDays=[...byDay.keys()].sort();
  const dependencies=await effectiveHistory.createEffectiveHistoryDayDependencyReader(source(),owner,namespace,
   inputDays,{includeSessions:true});
