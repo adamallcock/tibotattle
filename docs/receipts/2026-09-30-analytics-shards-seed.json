@@ -1,0 +1,62 @@
+{
+  "planSha256": "b1423ed5c523299b11be4b3b94115d0bd696caf90877ec412e95adab1c8e5877",
+  "completedAt": "2026-09-30T22:53:08.910Z",
+  "baseline": {
+    "target": -1,
+    "records": 9811828,
+    "resumedRecords": 5815348,
+    "pages": 422,
+    "wallMs": 380354.544083,
+    "measurementComplete": false,
+    "rowsRead": 7994225,
+    "rowsWritten": 7994224,
+    "databaseMs": 7214.770299999998
+  },
+  "shards": [
+    {
+      "target": 0,
+      "records": 2521345,
+      "resumedRecords": 0,
+      "pages": 254,
+      "wallMs": 222834.013125,
+      "measurementComplete": true,
+      "rowsRead": 5043451,
+      "rowsWritten": 5043450,
+      "databaseMs": 4705.362299999997
+    },
+    {
+      "target": 1,
+      "records": 2414275,
+      "resumedRecords": 0,
+      "pages": 250,
+      "wallMs": 236818.43033399998,
+      "measurementComplete": true,
+      "rowsRead": 4829299,
+      "rowsWritten": 4829298,
+      "databaseMs": 3997.506000000001
+    },
+    {
+      "target": 2,
+      "records": 2414351,
+      "resumedRecords": 0,
+      "pages": 249,
+      "wallMs": 198050.73037499993,
+      "measurementComplete": true,
+      "rowsRead": 4829448,
+      "rowsWritten": 4829447,
+      "databaseMs": 3772.589899999999
+    },
+    {
+      "target": 3,
+      "records": 2461857,
+      "resumedRecords": 0,
+      "pages": 258,
+      "wallMs": 263642.24475,
+      "measurementComplete": true,
+      "rowsRead": 4924487,
+      "rowsWritten": 4924486,
+      "databaseMs": 12888.541299999984
+    }
+  ],
+  "shardWallMs": 263643.13041599997
+}

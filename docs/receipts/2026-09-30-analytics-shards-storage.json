@@ -1,0 +1,40 @@
+{
+  "schema": "synthetic-shard-final-storage-v1",
+  "recordedAt": "2026-09-30T23:06:36.839Z",
+  "dataKind": "synthetic",
+  "environment": "private-synthetic-shadow",
+  "planSha256": "b1423ed5c523299b11be4b3b94115d0bd696caf90877ec412e95adab1c8e5877",
+  "remoteWrites": false,
+  "targets": [
+    {
+      "target": -1,
+      "records": 9811828,
+      "bytes": 1268297728,
+      "state": "ready"
+    },
+    {
+      "target": 0,
+      "records": 2521345,
+      "bytes": 320270336,
+      "state": "ready"
+    },
+    {
+      "target": 1,
+      "records": 2414275,
+      "bytes": 313872384,
+      "state": "ready"
+    },
+    {
+      "target": 2,
+      "records": 2414351,
+      "bytes": 314048512,
+      "state": "ready"
+    },
+    {
+      "target": 3,
+      "records": 2461857,
+      "bytes": 320192512,
+      "state": "ready"
+    }
+  ]
+}

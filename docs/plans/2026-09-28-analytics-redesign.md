@@ -1209,3 +1209,22 @@ September 28 for the platform claims linked above. The system diagram was
 rendered and visually inspected in Chrome. Documentation/link governance and
 the preflight documentation/guidance suite passed; these checks validate the
 document, not the proposed architecture's performance or deployment readiness.
+
+## September 30 physical sharding experiment
+
+After the qualified direct-index build was refused with `SQLITE_NOMEM`, the
+owner approved one-versus-four private shadow databases. The isolated source
+candidate remains recoverable at `2fc43efc`; it was not deployed after that
+refusal. Production remains at `d43c8f92` as last reconciled.
+
+See the [physical shard experiment](2026-09-30-analytics-shard-experiment.md)
+for the running checklist. Local synthetic native D1 seeding and query parity
+are complete at the full 9,811,828-record cardinality. The online experiment
+sealed both layouts at 9,811,828 synthetic headers. At concurrency four, an
+indexed count/checksum scan over the complete dataset measured 1.55 times
+faster across four databases; short indexed reads were slightly slower. Only
+aggregate rows were returned; header transfer and analytical computation were
+not measured. Required indexes were created before loading. The next local
+slice qualifies one complete rebuilt source store and then resumes shared
+preparation and dependency summaries. Real-source migration, all-output parity,
+publication throughput and a production cutover remain separate gates.

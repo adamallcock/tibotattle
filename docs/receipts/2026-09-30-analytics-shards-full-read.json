@@ -1,0 +1,247 @@
+{
+  "schema": "whole-synthetic-header-read-v1",
+  "recordedAt": "2026-09-30T23:02:56.883Z",
+  "planSha256": "b1423ed5c523299b11be4b3b94115d0bd696caf90877ec412e95adab1c8e5877",
+  "toolSha256": "791890a2aab16178aeabbb62f8e642647c490753d40ce3918dfadb852638b5bb",
+  "environment": "private-synthetic-shadow",
+  "dataKind": "synthetic",
+  "remoteWrites": false,
+  "workload": "whole-synthetic-header-acquisition",
+  "rows": 9811828,
+  "results": [
+    {
+      "layout": "baseline",
+      "concurrency": 1,
+      "trial": 0,
+      "queries": 4,
+      "records": 9811828,
+      "checksum": 48135989256706,
+      "wallMs": 2625.1535000000003,
+      "rowsRead": 9811935,
+      "databaseMs": 1586.6168
+    },
+    {
+      "layout": "shards",
+      "concurrency": 1,
+      "trial": 0,
+      "queries": 4,
+      "records": 9811828,
+      "checksum": 48135989256706,
+      "wallMs": 2518.8563749999994,
+      "rowsRead": 9811932,
+      "databaseMs": 1401.3189000000002
+    },
+    {
+      "layout": "shards",
+      "concurrency": 1,
+      "trial": 1,
+      "queries": 4,
+      "records": 9811828,
+      "checksum": 48135989256706,
+      "wallMs": 2766.462041999999,
+      "rowsRead": 9811932,
+      "databaseMs": 1532.0021000000002
+    },
+    {
+      "layout": "baseline",
+      "concurrency": 1,
+      "trial": 1,
+      "queries": 4,
+      "records": 9811828,
+      "checksum": 48135989256706,
+      "wallMs": 1888.546542,
+      "rowsRead": 9811935,
+      "databaseMs": 964.1926
+    },
+    {
+      "layout": "baseline",
+      "concurrency": 1,
+      "trial": 2,
+      "queries": 4,
+      "records": 9811828,
+      "checksum": 48135989256706,
+      "wallMs": 2081.007834,
+      "rowsRead": 9811935,
+      "databaseMs": 1023.9612999999999
+    },
+    {
+      "layout": "shards",
+      "concurrency": 1,
+      "trial": 2,
+      "queries": 4,
+      "records": 9811828,
+      "checksum": 48135989256706,
+      "wallMs": 3493.7192079999986,
+      "rowsRead": 9811932,
+      "databaseMs": 1436.4263
+    },
+    {
+      "layout": "baseline",
+      "concurrency": 2,
+      "trial": 0,
+      "queries": 4,
+      "records": 9811828,
+      "checksum": 48135989256706,
+      "wallMs": 1536.6093340000007,
+      "rowsRead": 9811935,
+      "databaseMs": 1008.5853999999999
+    },
+    {
+      "layout": "shards",
+      "concurrency": 2,
+      "trial": 0,
+      "queries": 4,
+      "records": 9811828,
+      "checksum": 48135989256706,
+      "wallMs": 2115.5547920000026,
+      "rowsRead": 9811932,
+      "databaseMs": 1502.9759
+    },
+    {
+      "layout": "shards",
+      "concurrency": 2,
+      "trial": 1,
+      "queries": 4,
+      "records": 9811828,
+      "checksum": 48135989256706,
+      "wallMs": 1952.5683749999953,
+      "rowsRead": 9811932,
+      "databaseMs": 1507.051
+    },
+    {
+      "layout": "baseline",
+      "concurrency": 2,
+      "trial": 1,
+      "queries": 4,
+      "records": 9811828,
+      "checksum": 48135989256706,
+      "wallMs": 1583.2011249999996,
+      "rowsRead": 9811935,
+      "databaseMs": 1076.2086
+    },
+    {
+      "layout": "baseline",
+      "concurrency": 2,
+      "trial": 2,
+      "queries": 4,
+      "records": 9811828,
+      "checksum": 48135989256706,
+      "wallMs": 1570.081833999997,
+      "rowsRead": 9811935,
+      "databaseMs": 967.479
+    },
+    {
+      "layout": "shards",
+      "concurrency": 2,
+      "trial": 2,
+      "queries": 4,
+      "records": 9811828,
+      "checksum": 48135989256706,
+      "wallMs": 1645.3581670000058,
+      "rowsRead": 9811932,
+      "databaseMs": 1377.5028
+    },
+    {
+      "layout": "baseline",
+      "concurrency": 4,
+      "trial": 0,
+      "queries": 4,
+      "records": 9811828,
+      "checksum": 48135989256706,
+      "wallMs": 1423.919915999999,
+      "rowsRead": 9811935,
+      "databaseMs": 1080.3718999999999
+    },
+    {
+      "layout": "shards",
+      "concurrency": 4,
+      "trial": 0,
+      "queries": 4,
+      "records": 9811828,
+      "checksum": 48135989256706,
+      "wallMs": 826.9602500000037,
+      "rowsRead": 9811932,
+      "databaseMs": 1428.4279000000001
+    },
+    {
+      "layout": "shards",
+      "concurrency": 4,
+      "trial": 1,
+      "queries": 4,
+      "records": 9811828,
+      "checksum": 48135989256706,
+      "wallMs": 774.3120829999971,
+      "rowsRead": 9811932,
+      "databaseMs": 1299.0918000000001
+    },
+    {
+      "layout": "baseline",
+      "concurrency": 4,
+      "trial": 1,
+      "queries": 4,
+      "records": 9811828,
+      "checksum": 48135989256706,
+      "wallMs": 1215.846875000003,
+      "rowsRead": 9811935,
+      "databaseMs": 917.0033000000001
+    },
+    {
+      "layout": "baseline",
+      "concurrency": 4,
+      "trial": 2,
+      "queries": 4,
+      "records": 9811828,
+      "checksum": 48135989256706,
+      "wallMs": 1275.7048749999958,
+      "rowsRead": 9811935,
+      "databaseMs": 982.8552999999999
+    },
+    {
+      "layout": "shards",
+      "concurrency": 4,
+      "trial": 2,
+      "queries": 4,
+      "records": 9811828,
+      "checksum": 48135989256706,
+      "wallMs": 821.9470839999994,
+      "rowsRead": 9811932,
+      "databaseMs": 1538.9666
+    }
+  ],
+  "summary": [
+    {
+      "concurrency": 1,
+      "baselineMs": 2081.007834,
+      "shardMs": 2766.462041999999,
+      "wallRatio": 0.7522271415282266,
+      "baselineRowsRead": 9811935,
+      "shardRowsRead": 9811932,
+      "baselineDatabaseMs": 1023.9612999999999,
+      "shardDatabaseMs": 1436.4263,
+      "parity": true
+    },
+    {
+      "concurrency": 2,
+      "baselineMs": 1570.081833999997,
+      "shardMs": 1952.5683749999953,
+      "wallRatio": 0.8041110642284169,
+      "baselineRowsRead": 9811935,
+      "shardRowsRead": 9811932,
+      "baselineDatabaseMs": 1008.5853999999999,
+      "shardDatabaseMs": 1502.9759,
+      "parity": true
+    },
+    {
+      "concurrency": 4,
+      "baselineMs": 1275.7048749999958,
+      "shardMs": 821.9470839999994,
+      "wallRatio": 1.5520523155721746,
+      "baselineRowsRead": 9811935,
+      "shardRowsRead": 9811932,
+      "baselineDatabaseMs": 982.8552999999999,
+      "shardDatabaseMs": 1428.4279000000001,
+      "parity": true
+    }
+  ],
+  "claim": "four bounded range queries over synthetic headers; not application output or production throughput"
+}
