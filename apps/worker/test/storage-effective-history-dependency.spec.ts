@@ -47,6 +47,7 @@ import { encodeTypedTelemetryId, typedTelemetryDayNumber } from "../src/typed-te
 import dependencySqlBaseline from "./fixtures/effective-history-dependency-32bd4091.json";
 import occurrenceSqlBaseline from "./fixtures/effective-history-dependency-c7dcdc6f.json";
 import correctionSeekSqlBaseline from "./fixtures/effective-history-dependency-9a59dd27.json";
+import selectedChunkSqlBaseline from "./fixtures/effective-history-dependency-90c38f6e.json";
 
 const b = env as Env & {
   TEST_MIGRATIONS: D1Migration[];
@@ -906,6 +907,50 @@ describe("bounded shared effective day dependencies", () => {
       await annotate(JSON.stringify({ includeSessions,
         unrelatedOwnerRecords: 1_200, current: current.meta.rows_read,
         prior: prior.meta.rows_read, noIn: noIn.meta.rows_read }), "effective-occurrence-seek-cost");
+    }
+  }, 60_000);
+
+  it.for(["v1", "v11"] as const)("does not recount unrelated retained %s chunk records for one selected day", async (family, { annotate }) => {
+    const selectedDay = day();
+    const fixture = await createV11DeviceFixture(db(), { grant: family === "v11" });
+    const selectedOccurrence = "synthetic:selective-proof:chosen";
+    const candidates: Staged[] = [];
+    if (family === "v1") await insertV1HistoryDay(fixture, selectedDay, 1, null, selectedOccurrence);
+    else candidates.push(await stage(fixture, await makeV11Day(selectedDay, {
+      usage: [v11UsageRecord(selectedDay, "a", { eventId: selectedOccurrence })],
+    })));
+    for (let offset = 1; offset <= 8; offset++) {
+      const retainedDay = new Date(Date.parse(selectedDay) + offset * 86_400_000).toISOString().slice(0,10);
+      const ids = Array.from({length:200}, (_, index) => `synthetic:selective-proof:unlinked:${offset}:${index}`);
+      if (family === "v1") await insertV1HistoryDay(fixture, retainedDay, 1, null, ids);
+      else candidates.push(await stage(fixture, await makeV11Day(retainedDay, {
+        usage: ids.map(eventId => v11UsageRecord(retainedDay, "b", {eventId})),
+      })));
+    }
+    if (family === "v11") await activate(fixture, candidates);
+    const owner = (await readStorageCommunityOwnerPage(db()))
+      .find(value => value.participantId === fixture.participantId)!;
+    for (const includeSessions of [false,true]) {
+      const observed = observeDependencyQueries(db());
+      const dependency = await effectiveHistoryDependency(observed.database,owner,namespace,
+        selectedDay,selectedDay,{includeSessions});
+      const query = observed.queries.find(value => value.sql.includes("selected(occurrence_id)"))!;
+      const baseline = includeSessions ? selectedChunkSqlBaseline.sql
+        .replaceAll("('usage','quota')", "('usage','quota','session')")
+        .replaceAll("(1,2)", "(1,2,3)") : selectedChunkSqlBaseline.sql;
+      const current = await db().prepare(query.sql).bind(...query.values).all<{family:string}>();
+      const prior = await db().prepare(baseline).bind(...query.values).all<{family:string}>();
+      expect(selectedChunkSqlBaseline.sourceCommit).toBe("90c38f6ef8a73aabe6b1baae0cb9b0cb9b42e2e2");
+      expect(dependency.occurrenceLinks).toEqual([]);
+      expect(current.results).toEqual(prior.results);
+      expect(canonicalJson({...dependency,occurrenceLinks:prior.results.filter(row =>
+        row.family !== "__correction_runtime__")})).toBe(canonicalJson(dependency));
+      expect(current.meta.rows_read).toBeLessThan(prior.meta.rows_read / 2);
+      expect(observed.queries).toHaveLength(7);
+      await annotate(JSON.stringify({family,includeSessions,unrelatedRetainedRecords:1600,
+        current:current.meta.rows_read,prior:prior.meta.rows_read}),"selective-chunk-proof-cost");
+      console.log("selective-chunk-proof-cost",JSON.stringify({family,includeSessions,
+        current:current.meta.rows_read,prior:prior.meta.rows_read}));
     }
   }, 60_000);
 

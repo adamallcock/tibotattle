@@ -250,17 +250,19 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
         json_extract(day.value,'$[0]'),json_extract(day.value,'$[0]'),
         json_extract(day.value,'$[1]'),json_extract(day.value,'$[2]')
         FROM scope s CROSS JOIN json_each(?) day
-    ), `:''}complete_v1_chunks AS MATERIALIZED (
+    ), `:''}complete_v1_selected_chunks AS MATERIALIZED (
       SELECT chunk.id FROM scope s
         JOIN telemetry_v1_chunks chunk ON chunk.participant_id=s.participant_id
-       WHERE chunk.stream IN ${sourceStreams} AND chunk.superseded_at IS NULL
+       WHERE chunk.chunk_day>=s.from_day AND chunk.chunk_day<=s.through_day
+         AND chunk.stream IN ${sourceStreams} AND chunk.superseded_at IS NULL
          AND chunk.accepted_record_count=chunk.record_count
          AND chunk.record_count=(SELECT count(*) FROM typed_v1_record_admissions complete
            WHERE complete.chunk_id=chunk.id)
-    ), complete_v11_chunks AS MATERIALIZED (
+    ), complete_v11_selected_chunks AS MATERIALIZED (
       SELECT chunk.id FROM scope s
         JOIN telemetry_v11_chunks chunk ON chunk.participant_id=s.participant_id
-       WHERE chunk.stream IN ${sourceStreams}
+       WHERE chunk.chunk_day>=s.from_day AND chunk.chunk_day<=s.through_day
+         AND chunk.stream IN ${sourceStreams}
          AND chunk.record_count=${TYPED_V11_CHUNK_PROOF_COUNT_SQL}
     ), ${retainedV12} selected(${target()}occurrence_id) AS MATERIALIZED (
       SELECT ${target('s')}scoped_record.occurrence_id
@@ -284,7 +286,7 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
           AND chunk.participant_id=r.participant_id AND chunk.device_id=r.device_id
           AND chunk.stream IN ${sourceStreams} AND chunk.superseded_at IS NULL
           AND chunk.accepted_record_count=chunk.record_count
-        JOIN complete_v1_chunks complete_chunk ON complete_chunk.id=chunk.id
+        JOIN complete_v1_selected_chunks complete_chunk ON complete_chunk.id=chunk.id
         JOIN typed_v1_event_sources event ON event.chunk_id=chunk.id
           AND event.owner_digest=s.owner_digest AND event.source_namespace=v1.source_namespace
        WHERE r.participant_id=s.participant_id AND r.source_namespace=v1.source_namespace
@@ -309,7 +311,7 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
           AND typed_owner.namespace_id=v11.namespace_id
         JOIN typed_v11_record_admissions admission ON admission.typed_record_id=r.storage_row_id
         JOIN telemetry_v11_chunks chunk ON chunk.id=admission.chunk_id AND chunk.stream IN ${sourceStreams}
-        JOIN complete_v11_chunks complete_chunk ON complete_chunk.id=chunk.id
+        JOIN complete_v11_selected_chunks complete_chunk ON complete_chunk.id=chunk.id
         JOIN telemetry_v11_domain_days domain_day ON domain_day.manifest_id=admission.manifest_id
         JOIN telemetry_v11_day_manifests manifest ON manifest.id=domain_day.manifest_id AND manifest.state='ready'
         JOIN typed_v11_manifest_memberships manifest_membership ON manifest_membership.manifest_id=domain_day.manifest_id
@@ -332,15 +334,10 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
         JOIN telemetry_usage_correction_history h ON h.id=f.history_id
         JOIN ${selectionScope} s ON h.participant_id=s.participant_id AND lower(hex(h.owner_digest))=s.owner_digest
        WHERE h.event_time_ms>=s.from_ms AND h.event_time_ms<s.through_ms
-${selectedV12}    ), linked(${target()}family,source_day,source_key,source_digest) AS (
-      /* Only outside-window chunk headers enter the dependency. Collapse
-       * matching occurrences here instead of materializing each record's
-       * decoded identity and digest before throwing those columns away.
-       * Drive retained-history expansion from selected occurrences: its
-       * owned device/manifest and stream/occurrence seeks must not scan the
-       * owner's entire retained stream. They remain independent of observed
-       * time and preserve the complete canonical BLOB identity. */
-      SELECT DISTINCT ${target('wanted')}'v1',r.observed_day,chunk.id,chunk.chunk_digest
+${selectedV12}    ), /* Count completeness only for selected-day chunks and distinct matching
+       * outside headers. Unrelated retained chunks cannot affect this identity. */
+    linked_v1_headers(${target()}family,source_day,source_key,source_digest,chunk_id) AS MATERIALIZED (
+      SELECT DISTINCT ${target('wanted')}'v1',r.observed_day,chunk.id,chunk.chunk_digest,chunk.id AS chunk_id
         FROM scope s
         CROSS JOIN typed_v1_owner_memberships scoped_owner
           ON scoped_owner.participant_id=s.participant_id
@@ -354,25 +351,24 @@ ${selectedV12}    ), linked(${target()}family,source_day,source_key,source_diges
           AND scoped_record.occurrence_id=wanted.occurrence_id
           ${physicalOutside} ${selectedOutside}
         CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=scoped_record.id
-        JOIN typed_v1_admission_state v1 ON v1.id=1 AND v1.runtime_contract_version=1
+        CROSS JOIN typed_v1_admission_state v1 ON v1.id=1 AND v1.runtime_contract_version=1
           AND v1.source_namespace=s.source_namespace
-        JOIN typed_v1_owner_memberships owner_membership ON owner_membership.participant_id=r.participant_id
-        JOIN typed_telemetry_owners typed_owner ON typed_owner.id=owner_membership.typed_owner_id
+        CROSS JOIN typed_v1_owner_memberships owner_membership ON owner_membership.participant_id=r.participant_id
+        CROSS JOIN typed_telemetry_owners typed_owner ON typed_owner.id=owner_membership.typed_owner_id
           AND typed_owner.namespace_id=v1.namespace_id
-        JOIN typed_v1_record_admissions admission ON admission.typed_record_id=r.storage_row_id
-        JOIN telemetry_v1_chunks chunk ON chunk.id=admission.chunk_id
+        CROSS JOIN typed_v1_record_admissions admission ON admission.typed_record_id=r.storage_row_id
+        CROSS JOIN telemetry_v1_chunks chunk ON chunk.id=admission.chunk_id
           AND chunk.participant_id=r.participant_id AND chunk.device_id=r.device_id
           AND chunk.stream IN ${sourceStreams} AND chunk.superseded_at IS NULL
           AND chunk.accepted_record_count=chunk.record_count
-        JOIN complete_v1_chunks complete_chunk ON complete_chunk.id=chunk.id
-        JOIN typed_v1_event_sources event ON event.chunk_id=chunk.id
+        CROSS JOIN typed_v1_event_sources event ON event.chunk_id=chunk.id
           AND event.owner_digest=s.owner_digest AND event.source_namespace=v1.source_namespace
        WHERE r.participant_id=s.participant_id AND r.source_namespace=v1.source_namespace
          AND r.namespace_id=v1.namespace_id AND r.owner_id=typed_owner.id
          AND r.format_code=10 AND r.stream IN ${sourceStreams}
          AND ${outside('r.observed_day')}
-      UNION
-      SELECT DISTINCT ${target('wanted')}'v11',domain_day.observed_day,chunk.id||':'||manifest.id,manifest.manifest_digest
+    ), linked_v11_headers(${target()}family,source_day,source_key,source_digest,chunk_id) AS MATERIALIZED (
+      SELECT DISTINCT ${target('wanted')}'v11',domain_day.observed_day,chunk.id||':'||manifest.id,manifest.manifest_digest,chunk.id AS chunk_id
         FROM scope s
         CROSS JOIN typed_v11_owner_memberships scoped_owner
           ON scoped_owner.participant_id=s.participant_id
@@ -386,21 +382,20 @@ ${selectedV12}    ), linked(${target()}family,source_day,source_key,source_diges
           AND scoped_record.occurrence_id=wanted.occurrence_id
           ${physicalOutside} ${selectedOutside}
         CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=scoped_record.id
-        JOIN typed_v11_admission_state v11 ON v11.id=1 AND v11.runtime_contract_version=1
-        JOIN typed_v11_owner_memberships owner_membership ON owner_membership.participant_id=r.participant_id
-        JOIN typed_telemetry_owners typed_owner ON typed_owner.id=owner_membership.typed_owner_id
+        CROSS JOIN typed_v11_admission_state v11 ON v11.id=1 AND v11.runtime_contract_version=1
+        CROSS JOIN typed_v11_owner_memberships owner_membership ON owner_membership.participant_id=r.participant_id
+        CROSS JOIN typed_telemetry_owners typed_owner ON typed_owner.id=owner_membership.typed_owner_id
           AND typed_owner.namespace_id=v11.namespace_id
-        JOIN typed_v11_record_admissions admission ON admission.typed_record_id=r.storage_row_id
-        JOIN telemetry_v11_chunks chunk ON chunk.id=admission.chunk_id AND chunk.stream IN ${sourceStreams}
-        JOIN complete_v11_chunks complete_chunk ON complete_chunk.id=chunk.id
-        JOIN telemetry_v11_domain_days domain_day ON domain_day.manifest_id=admission.manifest_id
-        JOIN telemetry_v11_day_manifests manifest ON manifest.id=domain_day.manifest_id AND manifest.state='ready'
-        JOIN typed_v11_manifest_memberships manifest_membership ON manifest_membership.manifest_id=domain_day.manifest_id
-        JOIN storage_v11_event_sources event ON event.generation_id=domain_day.generation_id
+        CROSS JOIN typed_v11_record_admissions admission ON admission.typed_record_id=r.storage_row_id
+        CROSS JOIN telemetry_v11_chunks chunk ON chunk.id=admission.chunk_id AND chunk.stream IN ${sourceStreams}
+        CROSS JOIN telemetry_v11_domain_days domain_day ON domain_day.manifest_id=admission.manifest_id
+        CROSS JOIN telemetry_v11_day_manifests manifest ON manifest.id=domain_day.manifest_id AND manifest.state='ready'
+        CROSS JOIN typed_v11_manifest_memberships manifest_membership ON manifest_membership.manifest_id=domain_day.manifest_id
+        CROSS JOIN storage_v11_event_sources event ON event.generation_id=domain_day.generation_id
           AND event.owner_digest=s.owner_digest AND event.participant_id=s.participant_id
-        JOIN storage_v11_owner_links owner_link ON owner_link.participant_id=event.participant_id
+        CROSS JOIN storage_v11_owner_links owner_link ON owner_link.participant_id=event.participant_id
           AND owner_link.owner_digest=event.owner_digest AND owner_link.state='active'
-        JOIN telemetry_v11_domains generation ON generation.id=event.generation_id
+        CROSS JOIN telemetry_v11_domains generation ON generation.id=event.generation_id
           AND generation.id=domain_day.generation_id AND generation.participant_id=chunk.participant_id
           AND generation.device_id=chunk.device_id AND event.manifest_digest=generation.manifest_digest
           AND event.from_day=generation.from_day AND event.through_day=generation.through_day
@@ -409,6 +404,21 @@ ${selectedV12}    ), linked(${target()}family,source_day,source_key,source_diges
          AND r.source_namespace=v11.source_namespace AND r.namespace_id=v11.namespace_id
          AND r.owner_id=typed_owner.id AND r.format_code=11 AND r.stream IN ${sourceStreams}
          AND ${outside('domain_day.observed_day')}
+    ), complete_v1_chunks AS MATERIALIZED (
+      SELECT chunk.id FROM (SELECT DISTINCT chunk_id FROM linked_v1_headers) candidate
+        CROSS JOIN telemetry_v1_chunks chunk ON chunk.id=candidate.chunk_id
+       WHERE chunk.record_count=(SELECT count(*) FROM typed_v1_record_admissions complete
+          WHERE complete.chunk_id=chunk.id)
+    ), complete_v11_chunks AS MATERIALIZED (
+      SELECT chunk.id FROM (SELECT DISTINCT chunk_id FROM linked_v11_headers) candidate
+        CROSS JOIN telemetry_v11_chunks chunk ON chunk.id=candidate.chunk_id
+       WHERE chunk.record_count=${TYPED_V11_CHUNK_PROOF_COUNT_SQL}
+    ), linked(${target()}family,source_day,source_key,source_digest) AS (
+      SELECT ${target('header')}header.family,header.source_day,header.source_key,header.source_digest
+        FROM linked_v1_headers header JOIN complete_v1_chunks complete_chunk ON complete_chunk.id=header.chunk_id
+      UNION
+      SELECT ${target('header')}header.family,header.source_day,header.source_key,header.source_digest
+        FROM linked_v11_headers header JOIN complete_v11_chunks complete_chunk ON complete_chunk.id=header.chunk_id
 ${includeV12?batched?`      UNION
       SELECT DISTINCT wanted.target_day,'v12',chunk.source_day,chunk.id,chunk.manifest_digest
         FROM retained_v12_chunks chunk
