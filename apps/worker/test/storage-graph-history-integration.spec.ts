@@ -546,7 +546,15 @@ it('folds mixed v1 and v1.1 evidence once through resumable model and fit graphs
  expect({sourceRows:metadata.length,proofRows:proofs.results.length,digestMismatches:digestMismatches.slice(0,3)})
    .toEqual({sourceRows:metadata.length,proofRows:metadata.length,digestMismatches:[]});
  await activateTelemetryV11Domain(source(),v11Device,manifest);
- for(let attempt=0;attempt<30;attempt++)if((await advanceStorageAnalytics(bindings())).state==='idle')break;
+ // The predecessor includes today, so this fixture's number of empty days
+ // grows with the calendar. Each fixture day fits in one projection page;
+ // allow one step per day, then owner promotion and the terminal idle read.
+ // Prove the prerequisite completed before exercising graph checkpoints.
+ let projectionIdle=false;
+ for(let attempt=0;attempt<days.length+2;attempt++){
+   if((await advanceStorageAnalytics(bindings())).state==='idle'){projectionIdle=true;break;}
+ }
+ expect(projectionIdle).toBe(true);
 
  const owner=(await readStorageCommunityOwnerPage(source())).find(row=>row.participantId===before.participantId)!;
  expect(owner).toMatchObject({hasV1:true,hasV11:true,hasEffective:true});

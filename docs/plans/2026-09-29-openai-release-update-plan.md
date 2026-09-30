@@ -50,6 +50,30 @@ The new recovery helper is explicitly included in both closed public-API
 allowlist tests. Isolated-candidate validation is recorded with the PR; earlier
 combined-tree receipts below remain point-in-time evidence.
 
+## Client merge qualification on 2026-09-30
+
+[PR #257](https://github.com/adamallcock/tibotattle/pull/257) isolates the client
+and required shared/hosted compatibility changes. Its initial OSV scan exposed
+new dependency advisories. The candidate now pins Electron 43.5.0, fast-uri
+3.1.8 and the patched brace-expansion 1.1.21/2.1.7/5.0.12 lineages. Runtime
+closure and local-review pins follow the lockfile; Linux download checksums come
+from the [official Electron release checksums](https://github.com/electron/electron/releases/download/v43.5.0/SHASUMS256.txt).
+The [fast-uri advisory](https://github.com/advisories/GHSA-hrr3-gc8f-f4qj) and
+[brace-expansion advisory](https://github.com/advisories/GHSA-q2hr-2g5m-vwhr)
+identify the patched versions. Historical artifact receipts remain unchanged.
+
+The isolated UI suite passed 1,070 tests, local companion 407, facade contracts
+12 and affected packaging/archive contracts 68. The initial full Worker run
+passed 2,016 tests and found a date-dependent setup limit in mixed v1/v1.1 graph
+integration: its domain includes today but its prerequisite projection stopped
+after 30 steps. Setup now budgets the actual fixture days plus promotion and
+idle observation, and explicitly asserts completion. All 13 graph-integration
+tests pass after that correction; graph behavior and checkpoint assertions are
+unchanged. The embedded admin assets were regenerated from the exact canonical
+sources in this PR. Final root, dependency CI and remaining Worker checks are
+recorded in the PR before merge. Protected R7 receipt refresh, packaged/native
+qualification, remote migrations and deployments remain separate gates.
+
 ## Implementation progress on 2026-09-29
 
 | Component | Current local result | Remaining boundary |
