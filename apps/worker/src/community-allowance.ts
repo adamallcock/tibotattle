@@ -48,20 +48,20 @@ import { currentAnalysisPublicationStatements, type CurrentAnalysisQueueClaim } 
  * community figure and the numbers people screenshot from their own app are
  * the same methodology. `spanFloorPp` carries the floor explicitly.
  *
- * Personal-plan fits are normalized to one Pro 20x-equivalent basis before
+ * Personal-plan fits are normalized to one Pro 10x-equivalent basis before
  * they are combined. This is the same deliberately narrow merge trial shown
  * in the private admin dashboard: Pro stays unchanged, Pro 5x is multiplied
- * by four, and Plus by twenty. Unsupported or unknown plan labels do not enter
+ * by two, Pro Max 25x by 0.4, and Plus by ten. Unsupported or unknown plan labels do not enter
  * the estimate. The daily payload carries the resulting combined summary;
  * the optional public breakdown adds reviewed plan/model summaries, while
  * identifiers and operational diagnostics remain private admin evidence.
  */
 
 export const COMMUNITY_ALLOWANCE_BASIS =
-  "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d";
+  "seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25";
 export const COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE = "pro";
 export const COMMUNITY_ALLOWANCE_NORMALIZATION =
-  "pro_x1_prolite_x4_plus_x20";
+  "pro_x1_prolite_x2_promax_x0_4_plus_x10";
 export const COMMUNITY_ALLOWANCE_TRAILING_DAYS = 30;
 export const COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS =
   V1_ANALYSIS_WINDOW_DAYS - COMMUNITY_ALLOWANCE_TRAILING_DAYS;
@@ -113,6 +113,10 @@ export const COMMUNITY_ATTRIBUTION_METHOD_VERSION =
     // fit caches when the dollar-equivalent pricing semantics change.
     V11_DOMAIN_METHOD_VERSION, SERVER_PRICING_METHOD_VERSION,
     COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION].join(":");
+// Derived publication and model-day values depend on the personal-plan roster.
+// Fit and per-participant composition caches retain their own method identity.
+export const COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION =
+  `${COMMUNITY_ATTRIBUTION_METHOD_VERSION}:${COMMUNITY_ALLOWANCE_NORMALIZATION}`;
 // The tail of every v1 fit-cache key beyond the participant's chunk epoch.
 // One constant serves the writer and both readers so they can never diverge
 // (a 2026-08-30 regression had the corpus reader expecting one fewer segment,
@@ -214,9 +218,10 @@ export function parsedCachedFits(json: string, participantId: string): Community
 }
 
 export const COMMUNITY_ALLOWANCE_PERSONAL_PLAN_CONFIG = Object.freeze([
-  Object.freeze({ planType: "pro", label: "Pro 20x", multiplier: 1 }),
-  Object.freeze({ planType: "prolite", label: "Pro 5x", multiplier: 4 }),
-  Object.freeze({ planType: "plus", label: "Plus", multiplier: 20 }),
+  Object.freeze({ planType: "pro", label: "Pro 10x", multiplier: 1 }),
+  Object.freeze({ planType: "prolite", label: "Pro 5x", multiplier: 2 }),
+  Object.freeze({ planType: "promax", label: "Pro Max 25x", multiplier: 0.4 }),
+  Object.freeze({ planType: "plus", label: "Plus", multiplier: 10 }),
 ] as const);
 
 export type CommunityAllowancePersonalPlanType =
@@ -688,7 +693,7 @@ export type CommunityCapacityByPlanType = Record<string, CommunityPlanCapacity>;
  * Additive observability: the median observed seven-day capacity per plan_type
  * over the SAME trailing-30d window and fit gates as the published band. It lets
  * the pro:prolite:plus capacity ratios be watched at READ time against the
- * plans' stated multipliers (pro = 20x, prolite = 5x, so pro:prolite ~= 4x).
+ * plans' stated multipliers (pro = 10x, prolite = 5x, so pro:prolite ~= 2x).
  * A sustained divergence flags plan_type mislabeling at the source or an OpenAI
  * multiplier change — the signal the retired plan-timeline guesswork used to
  * (badly) approximate. Ratios are never stored (only per-plan medians), so no

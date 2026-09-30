@@ -11,7 +11,7 @@ import { assertV1SourcePinCurrent, loadV1SourcePin } from './telemetry-v1-source
 import { modelHistoryWindow } from './model-history-window';
 import { communityAnalysisCacheVersion, loadCommunitySourcePin, parsedCachedFits,
   selectCommunityAllowanceAnalysisFits, validCompleteCachedComposition, validCompleteScalarAnalysis,
-  COMMUNITY_ALLOWANCE_FIT_METHOD,
+  COMMUNITY_ALLOWANCE_FIT_METHOD, COMMUNITY_ALLOWANCE_NORMALIZATION,
   type CommunityAllowanceFit } from './community-allowance';
 import { captureStorageCommunityAuthority, sameStorageCommunityCalculationAuthority,
   storageCommunityCalculationAuthorityIsCurrent,
@@ -33,6 +33,8 @@ import { caughtStorageGraphFailureFields, withStorageGraphFailureStage,
   type StorageGraphFailureFields } from './storage-analytics-failure';
 
 export const STORAGE_GRAPH_METHOD = communityAnalysisCacheVersion() + ':separate-results-1';
+// Derived cohort values depend on plan ratios; raw owner fits and checkpoints do not.
+export const STORAGE_GRAPH_PROJECTION_METHOD = `${STORAGE_GRAPH_METHOD}:${COMMUNITY_ALLOWANCE_NORMALIZATION}`;
 // Checkpoint storage is an implementation detail, separate from the semantic
 // result identity above. Bump only this namespace when a prior generation's
 // permanent anti-resurrection tombstones must remain valid but must not block

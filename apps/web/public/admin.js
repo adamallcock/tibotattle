@@ -1220,7 +1220,7 @@ function growthPlanCohortCard(snapshots) {
     const item = document.createElement("li");
     const name = document.createElement("span");
     name.className = "admin-plan-name";
-    name.textContent = row.plan;
+    name.textContent = ADMIN_ALLOWANCE_PLAN_STYLES[row.plan]?.label ?? row.plan;
     const stat = document.createElement("span");
     stat.className = "admin-plan-stat";
     const people = `${count(row.people)} on plan`;
@@ -2547,9 +2547,10 @@ const ADMIN_ALLOWANCE_DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
 const ADMIN_ALLOWANCE_CHART_WIDTH = 960;
 const ADMIN_ALLOWANCE_CHART_HEIGHT = 300;
 const ADMIN_ALLOWANCE_PLAN_STYLES = Object.freeze({
-  pro: Object.freeze({ label: "Pro 20×", className: "allowance-series-0" }),
+  pro: Object.freeze({ label: "Pro 10×", className: "allowance-series-0" }),
   prolite: Object.freeze({ label: "Pro 5×", className: "allowance-series-1" }),
-  plus: Object.freeze({ label: "Plus", className: "allowance-series-2" }),
+  promax: Object.freeze({ label: "Pro Max 25×", className: "allowance-series-2" }),
+  plus: Object.freeze({ label: "Plus", className: "allowance-series-3" }),
 });
 
 function adminAllowanceTickStep(span, target = 4) {
@@ -2586,7 +2587,7 @@ function adminAllowanceSegments(points) {
 
 /**
  * Pure geometry for the admin-only merge preview. Every line shares the same
- * UTC date and Pro-20x-equivalent dollar axes, so switching views changes the
+ * UTC date and Pro-10x-equivalent dollar axes, so switching views changes the
  * evidence shown rather than the meaning of the scale.
  */
 export function adminAllowanceChartModel(preview, {
@@ -2934,14 +2935,14 @@ function appendAdminAllowanceChart(container, preview) {
     viewBox: `0 0 ${model.width} ${model.height}`,
     role: "img",
     tabindex: 0,
-    "aria-description": "Weekly API-equivalent USD on a Pro 20× basis. Hover, tap or use arrow keys to inspect each day's estimate. Missing days stay gaps.",
+    "aria-description": "Weekly API-equivalent USD on a Pro 10× basis. Hover, tap or use arrow keys to inspect each day's estimate. Missing days stay gaps.",
     "aria-label": state.allowanceMode === "combined"
-      ? "Combined Pro 20x-equivalent community allowance by day"
+      ? "Combined Pro 10x-equivalent community allowance by day"
       : state.allowanceMode === "models"
-        ? "Pro 20x-equivalent per-model allowance by day"
+        ? "Pro 10x-equivalent per-model allowance by day"
         : model.activePlanFilter === null
-          ? "Pro 20x-equivalent community allowance by plan and day"
-          : `${model.series[0].label} Pro 20x-equivalent community allowance by day`,
+          ? "Pro 10x-equivalent community allowance by plan and day"
+          : `${model.series[0].label} Pro 10x-equivalent community allowance by day`,
   });
   for (const tick of model.dollarTicks) {
     svg.append(adminAllowanceSvg("line", "chart-grid", {
@@ -3017,7 +3018,7 @@ function appendAdminAllowanceChart(container, preview) {
     }
     const markers = new Set(series.markerPoints);
     for (const point of series.points) {
-      const detail = `${series.label} · ${point.day} · ${allowanceUsd(point.value)}/Pro 20× week at API prices`
+      const detail = `${series.label} · ${point.day} · ${allowanceUsd(point.value)}/Pro 10× week at API prices`
         + ` · ${allowanceCountLabel(point.participantCount, "account")}`
         + (model.mode === "models" ? "" : ` · ${allowanceCountLabel(point.fitCount, "fit")}`);
       const dot = adminAllowanceSvg(
@@ -3063,7 +3064,7 @@ function appendAdminAllowanceChart(container, preview) {
   if (model.mode === "plans") {
     const method = document.createElement("p");
     method.className = "admin-allowance-meta";
-    method.textContent = "Chart scaled to Pro 20×: Pro 20× ×1, Pro 5× ×4, Plus ×20."
+    method.textContent = "Chart scaled to Pro 10×: Pro 10× ×1, Pro 5× ×2, Pro Max 25× ×0.4, Plus ×10."
       + " Smaller card values show each plan’s own week at API prices."
       + " Shading: middle 80% of qualifying reset fits. Missing days stay gaps.";
     container.append(method);
@@ -3080,7 +3081,7 @@ function appendCombinedAllowanceSummary(container, preview) {
   value.textContent = allowanceUsd(latest.summary.centralUsd);
   const unit = document.createElement("span");
   unit.className = "admin-allowance-unit";
-  unit.textContent = "API-equivalent USD / Pro 20× week";
+  unit.textContent = "API-equivalent USD / Pro 10× week";
   const meta = document.createElement("p");
   meta.className = "admin-allowance-meta";
   const evidence = document.createElement("span");
@@ -3149,7 +3150,7 @@ function appendPlanAllowanceSummaries(container, preview) {
 function appendAllowanceCardsCaption(container) {
   const caption = document.createElement("p");
   caption.className = "allowance-summary-caption";
-  caption.textContent = "API-equivalent USD / Pro 20× week";
+  caption.textContent = "API-equivalent USD / Pro 10× week";
   container.append(caption);
 }
 

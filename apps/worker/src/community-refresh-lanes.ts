@@ -1,4 +1,4 @@
-import { communityAnalysisCacheVersion } from "./community-allowance";
+import { communityAnalysisCacheVersion, COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION } from "./community-allowance";
 import { COMMUNITY_DAILY_SPEND_PRICING_METHOD, COMMUNITY_DAILY_SPEND_REGISTRY_SHA256,
   DAILY_SPEND_CAPACITY_POLICY } from "./community-daily-spend";
 
@@ -12,7 +12,7 @@ export interface CommunityRefreshLanePin {
 }
 
 export function communityRefreshLaneMethod(lane: CommunityRefreshLane): string {
-  return lane === "daily" ? `${communityAnalysisCacheVersion()}:${COMMUNITY_DAILY_SPEND_PRICING_METHOD}:${COMMUNITY_DAILY_SPEND_REGISTRY_SHA256}:${DAILY_SPEND_CAPACITY_POLICY}`
+  return lane === "daily" ? `${communityAnalysisCacheVersion()}:${COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION}:${COMMUNITY_DAILY_SPEND_PRICING_METHOD}:${COMMUNITY_DAILY_SPEND_REGISTRY_SHA256}:${DAILY_SPEND_CAPACITY_POLICY}`
     : communityAnalysisCacheVersion();
 }
 

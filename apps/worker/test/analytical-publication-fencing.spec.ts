@@ -2,7 +2,7 @@ import { env } from "cloudflare:workers";
 import { applyD1Migrations, reset } from "cloudflare:test";
 import type { D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import { COMMUNITY_ATTRIBUTION_METHOD_VERSION, COMMUNITY_ALLOWANCE_BASIS,
+import { COMMUNITY_ATTRIBUTION_METHOD_VERSION, COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION, COMMUNITY_ALLOWANCE_BASIS,
   COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS, selectCommunityAllowanceAnalysisFits } from "../src/community-allowance";
 import { warmAdminCommunityAllowancePreviewCache, buildCommunityModelCompositionDay,
   readCachedAdminCommunityAllowancePreview } from "../src/admin-community-allowance";
@@ -76,10 +76,10 @@ describe("analytical input and publication fencing", () => {
     await seedCurrentChunk();
     const db = database();
     await db.prepare(`UPDATE community_allowance_publication_state SET publication_state='ready',
-      attribution_method_version=? WHERE singleton=1`).bind(COMMUNITY_ATTRIBUTION_METHOD_VERSION).run();
+      attribution_method_version=? WHERE singleton=1`).bind(COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION).run();
     await db.prepare(`INSERT INTO admin_community_allowance_preview_cache
       (singleton,generated_at,payload_json,attribution_method_version,source_mutation_epoch) VALUES (1,?,'{}',?,0)`)
-      .bind(NOW,COMMUNITY_ATTRIBUTION_METHOD_VERSION).run();
+      .bind(NOW,COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION).run();
     await db.prepare("UPDATE telemetry_v1_chunks SET superseded_at=? WHERE id='fence-chunk'").bind(NOW).run();
     expect(await db.prepare("SELECT publication_state FROM community_allowance_publication_state WHERE singleton=1").first())
       .toEqual({ publication_state: "updating" });
@@ -131,11 +131,11 @@ describe("analytical input and publication fencing", () => {
       unsupportedSourceParticipantCount:0,refusedParticipantCount:1},"2026-08-29");
     await db.prepare(`INSERT INTO community_model_composition_days
       (day,payload_json,computed_at,attribution_method_version,source_mutation_epoch) VALUES (?,?,?,?,0)`)
-      .bind(historical.day,JSON.stringify(historical),NOW,COMMUNITY_ATTRIBUTION_METHOD_VERSION).run();
+      .bind(historical.day,JSON.stringify(historical),NOW,COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION).run();
     // An ordinary upload correction preserves the model history.
     await db.prepare("UPDATE telemetry_v1_chunks SET chunk_digest=? WHERE id='fence-chunk'").bind("d".repeat(64)).run();
     expect((await db.prepare("SELECT attribution_method_version FROM community_model_composition_days").first())?.attribution_method_version)
-      .toBe(COMMUNITY_ATTRIBUTION_METHOD_VERSION);
+      .toBe(COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION);
     await db.prepare("UPDATE participants SET state='deleting' WHERE id='fence-participant'").run();
     // The retained 0042 withdrawal trigger removes aggregate snapshots whose
     // contributor membership cannot be reconstructed; no new erasure path.
@@ -157,7 +157,7 @@ describe("analytical input and publication fencing", () => {
       .bind(day,payload,await sha256Hex(payload),NOW).run();
     await db.prepare(`UPDATE community_allowance_publication_state SET publication_state='ready',
       expected_basis=?,attribution_method_version=?,safe_from_day=?,safe_to_day=? WHERE singleton=1`)
-      .bind(COMMUNITY_ALLOWANCE_BASIS,COMMUNITY_ATTRIBUTION_METHOD_VERSION,fromDay,day).run();
+      .bind(COMMUNITY_ALLOWANCE_BASIS,COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION,fromDay,day).run();
     const capture=async (hours:number) => {
       const instant=Date.parse(NOW)+hours*3600000;
       expect((await captureAdminMetricSnapshot(db,instant)).code).toBe("SNAPSHOT_CAPTURED");
@@ -171,7 +171,7 @@ describe("analytical input and publication fencing", () => {
     await db.prepare("UPDATE community_allowance_publication_state SET publication_state='ready',attribution_method_version='old-method' WHERE singleton=1").run();
     expect(await capture(2)).not.toHaveProperty("bandParticipantCount");
     await db.prepare("UPDATE community_allowance_publication_state SET attribution_method_version=? WHERE singleton=1")
-      .bind(COMMUNITY_ATTRIBUTION_METHOD_VERSION).run();
+      .bind(COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION).run();
     expect(await capture(24)).not.toHaveProperty("bandFitCount");
   });
 });

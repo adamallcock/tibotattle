@@ -1,7 +1,7 @@
 import { captureStorageCommunityAuthority, readStorageCommunityDeliveredTerminalEpoch,
  readStorageCommunitySourceTerminalEpoch, storageCommunityCalculationAuthorityIsCurrent,
  storageCommunityPublicationVisible, type StorageCommunityAuthority } from './storage-community-authority';
-import { STORAGE_GRAPH_METHOD } from './storage-community-graph';
+import { STORAGE_GRAPH_METHOD, STORAGE_GRAPH_PROJECTION_METHOD } from './storage-community-graph';
 import { ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS } from './admin-community-allowance';
 import { COMMUNITY_MODEL_REFUSAL_REASONS } from './community-allowance';
 import type { StorageAnalyticsBindings } from './analytics-delivery';
@@ -227,9 +227,9 @@ export async function readStorageCommunityProgress(bindings: StorageAnalyticsBin
   const metadata = await bindings.target.batch([
    bindings.target.prepare(`SELECT day,authority_json,payload_json,payload_sha256,computed_ms FROM analytics_community_model_publications
     WHERE source_id=? AND day>=? AND day<? AND method=? ORDER BY day LIMIT ?`)
-    .bind(bindings.sourceId, from, today, STORAGE_GRAPH_METHOD, requiredDays + 1),
+    .bind(bindings.sourceId, from, today, STORAGE_GRAPH_PROJECTION_METHOD, requiredDays + 1),
    bindings.target.prepare(`SELECT authority_json,generated_at,inputs_current FROM analytics_community_graph_previews
-    WHERE source_id=? AND method=?`).bind(bindings.sourceId, STORAGE_GRAPH_METHOD),
+    WHERE source_id=? AND method=?`).bind(bindings.sourceId, STORAGE_GRAPH_PROJECTION_METHOD),
    bindings.target.prepare('SELECT updated_ms FROM analytics_community_graph_scan WHERE source_id=?').bind(bindings.sourceId),
    bindings.target.prepare('SELECT day FROM analytics_community_daily_queue WHERE source_id=? ORDER BY day LIMIT 1').bind(bindings.sourceId),
    // 4: active owner census. Withdrawn and erased owners are excluded here and

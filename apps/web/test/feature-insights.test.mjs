@@ -24,7 +24,7 @@ test('synthetic cohorts satisfy the real cache matrix contract and preserve volu
  for(const model of impact.byModel)assert.equal(cacheReuseMatrixBuckets(model).length,10);
 });
 test('all example speed periods satisfy the actual closed app contract',()=>{
- for(const period of ['7','30','all']) for(const speedMode of ['standard','fast']) {const payload=exampleModelSpeeds(period,speedMode);assert.equal(normalizeModelPerformance(payload),payload);assert.equal(payload.speedMode,speedMode);if(speedMode==='fast')assert.deepEqual(payload.models,[]);}
+ for(const period of ['7','30','all']) for(const speedMode of ['standard','fast','ultrafast']) {const payload=exampleModelSpeeds(period,speedMode);assert.equal(normalizeModelPerformance(payload),payload);assert.equal(payload.speedMode,speedMode);if(speedMode!=='standard')assert.deepEqual(payload.models,[]);}
  assert.deepEqual(exampleModelSpeeds('all').models.map(model=>model.id),
   PUBLIC_ALLOWANCE_MODEL_CONFIG.map(model=>model.modelId));
 });

@@ -8,7 +8,7 @@ import { initializeStorageAnalyticsRuntime } from "../src/storage-analytics-runt
 import { drainCommunityPublicSourceBootstrap } from "../src/community-daily-aggregates";
 import { captureStorageCommunityAuthority } from "../src/storage-community-authority";
 import { parsedCachedFits } from "../src/community-allowance";
-import { STORAGE_GRAPH_METHOD } from "../src/storage-community-graph";
+import { STORAGE_GRAPH_METHOD, STORAGE_GRAPH_PROJECTION_METHOD } from "../src/storage-community-graph";
 import { ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS } from "../src/admin-community-allowance";
 import { sha256Hex } from "../src/crypto";
 import { readStorageCommunityProgress } from "../src/storage-community-progress";
@@ -96,7 +96,7 @@ async function publishDay(day: string) {
   const authority = await captureStorageCommunityAuthority(source(), bindings());
   await target().prepare(`INSERT INTO analytics_community_model_publications(source_id,day,revision,method,
     cohort_digest,authority_json,payload_json,payload_sha256,computed_ms) VALUES(?,?,1,?,?,?,?,?,?)`)
-    .bind(sourceId, day, STORAGE_GRAPH_METHOD, hex("c"), JSON.stringify(authority), payload,
+    .bind(sourceId, day, STORAGE_GRAPH_PROJECTION_METHOD, hex("c"), JSON.stringify(authority), payload,
       await sha256Hex(payload), Date.parse(`${day}T03:00:00.000Z`)).run();
 }
 async function selection(input: {

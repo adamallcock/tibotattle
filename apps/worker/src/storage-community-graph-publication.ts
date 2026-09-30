@@ -10,7 +10,7 @@ import { COMMUNITY_MODEL_CACHE_MAX_PAGES, parsedCachedFits, validCompleteCachedC
   type CommunityAllowanceFit, type CachedCommunityModelCompositions } from './community-allowance';
 import { MODEL_HISTORY_METHOD_VERSION, type V1ModelCompositionResult } from './quota-analysis-v1';
 import { V11_PLAN_ATTRIBUTION_ADAPTER_VERSION } from './quota-analysis-v11';
-import { STORAGE_GRAPH_METHOD, storageGraphDependencyDigest } from './storage-community-graph';
+import { STORAGE_GRAPH_METHOD, STORAGE_GRAPH_PROJECTION_METHOD, storageGraphDependencyDigest } from './storage-community-graph';
 import { effectiveHistoryDependency } from './storage-effective-history';
 import { modelHistoryWindow } from './model-history-window';
 import { MAX_V1_SOURCE_CHUNKS, selectV1SourceDayDependencies, type V1SourceChunk } from './telemetry-v1-source-selection';
@@ -329,7 +329,7 @@ export async function publishStorageCommunityModelDay(bindings:StorageAnalyticsB
   }
   const payload=buildCommunityModelCompositionDay(collection,options.day),payloadJson=canonicalJson(payload);
   if(bytes(payloadJson)>16*1024)return {state:'deferred',reason:'capacity',memberCount:captured.members.length};
-  const cohortDigest=await sha256Hex(canonicalJson([STORAGE_GRAPH_METHOD,options.day,cohortProof(captured),hardAuthority(captured.authority)]));
+  const cohortDigest=await sha256Hex(canonicalJson([STORAGE_GRAPH_PROJECTION_METHOD,options.day,cohortProof(captured),hardAuthority(captured.authority)]));
   const previous=await bindings.target.prepare(`SELECT revision,cohort_digest,payload_json,payload_sha256 FROM analytics_community_model_publications
     WHERE source_id=? AND day=?`).bind(bindings.sourceId,options.day).first<{
       revision:number;cohort_digest:string;payload_json:string;payload_sha256:string}>();
@@ -348,7 +348,7 @@ export async function publishStorageCommunityModelDay(bindings:StorageAnalyticsB
     WHERE analytics_community_model_publications.revision=?
       AND json_extract(analytics_community_model_publications.authority_json,'$.sourceEpoch')<=?
       AND analytics_community_model_publications.computed_ms<=?`).bind(bindings.sourceId,options.day,(previous?.revision??0)+1,
-      STORAGE_GRAPH_METHOD,cohortDigest,canonicalJson(pinned),payloadJson,payloadHash,computedMs,
+      STORAGE_GRAPH_PROJECTION_METHOD,cohortDigest,canonicalJson(pinned),payloadJson,payloadHash,computedMs,
       previous?.revision??0,pinned.sourceEpoch,computedMs).run();}catch{ /* Reconcile an uncertain write by its exact cohort receipt. */ }
   const receipt=await bindings.target.prepare(`SELECT cohort_digest,payload_json,payload_sha256 FROM analytics_community_model_publications
     WHERE source_id=? AND day=?`).bind(bindings.sourceId,options.day)
@@ -373,7 +373,7 @@ export async function publishStorageCommunityGraphPreview(bindings:StorageAnalyt
   const results=await bindings.target.batch([
     bindings.target.prepare(`SELECT day,payload_json,payload_sha256,authority_json FROM analytics_community_model_publications
       WHERE source_id=? AND day BETWEEN ? AND ? AND method=? ORDER BY day LIMIT ?`)
-      .bind(bindings.sourceId,from,today,STORAGE_GRAPH_METHOD,ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS+1),
+      .bind(bindings.sourceId,from,today,STORAGE_GRAPH_PROJECTION_METHOD,ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS+1),
     bindings.target.prepare(`SELECT model_revision FROM analytics_community_graph_publication_state WHERE source_id=?`).bind(bindings.sourceId),
     bindings.target.prepare(`SELECT revision,cohort_digest,payload_json,payload_sha256,authority_json,
       snapshot_source_epoch,inputs_current,oldest_computed_ms,newest_computed_ms
@@ -396,7 +396,7 @@ export async function publishStorageCommunityGraphPreview(bindings:StorageAnalyt
   const payloadJson=canonicalJson(preview);
   if(!validCachedAdminCommunityAllowancePreview(preview,preview.generatedAt,nowMs)
     ||bytes(payloadJson)>PREVIEW_CACHE_JSON_LIMIT_BYTES)return {state:'deferred',reason:'capacity',memberCount:captured.members.length};
-  const cohortDigest=await sha256Hex(canonicalJson([STORAGE_GRAPH_METHOD,today,cohortProof(captured),modelRevision,hardAuthority(captured.authority)]));
+  const cohortDigest=await sha256Hex(canonicalJson([STORAGE_GRAPH_PROJECTION_METHOD,today,cohortProof(captured),modelRevision,hardAuthority(captured.authority)]));
   const previous=results[2]!.results[0] as (PreviewFreshness&{revision:number;cohort_digest:string;payload_json:string;
     payload_sha256:string;authority_json:string})|undefined;
   const pinned=await current(bindings,captured);
@@ -439,7 +439,7 @@ export async function publishStorageCommunityGraphPreview(bindings:StorageAnalyt
       inputs_current=excluded.inputs_current,oldest_computed_ms=excluded.oldest_computed_ms,newest_computed_ms=excluded.newest_computed_ms
     WHERE analytics_community_graph_previews.revision=?
       AND analytics_community_graph_previews.snapshot_source_epoch<=?
-      AND analytics_community_graph_previews.generated_at<=?`).bind(bindings.sourceId,(previous?.revision??0)+1,STORAGE_GRAPH_METHOD,
+      AND analytics_community_graph_previews.generated_at<=?`).bind(bindings.sourceId,(previous?.revision??0)+1,STORAGE_GRAPH_PROJECTION_METHOD,
       cohortDigest,authorityJson,modelRevision,payloadJson,payloadHash,preview.generatedAt,
       freshness.snapshot_source_epoch,freshness.inputs_current,freshness.oldest_computed_ms,freshness.newest_computed_ms,
       bindings.sourceId,modelRevision,previous?.revision??0,pinned.sourceEpoch,preview.generatedAt).run();}catch{ /* Exact readback owns uncertain success. */ }
@@ -462,7 +462,7 @@ export async function readPublishedStorageCommunityGraph(bindings:StorageAnalyti
   const row=await bindings.target.prepare(`SELECT payload_json,payload_sha256,authority_json,generated_at,
     snapshot_source_epoch,inputs_current,oldest_computed_ms,newest_computed_ms
     FROM analytics_community_graph_previews WHERE source_id=? AND method=?`)
-    .bind(bindings.sourceId,STORAGE_GRAPH_METHOD).first<PreviewFreshness&{payload_json:string;payload_sha256:string;authority_json:string;generated_at:string}>();
+    .bind(bindings.sourceId,STORAGE_GRAPH_PROJECTION_METHOD).first<PreviewFreshness&{payload_json:string;payload_sha256:string;authority_json:string;generated_at:string}>();
   if(!row)return null;
   const publishedAuthority=JSON.parse(row.authority_json) as StorageCommunityAuthority;
   if(!storageCommunityPublicationVisible(publishedAuthority,authority,containment)
@@ -500,13 +500,13 @@ export async function retireStorageCommunityGraphPublications(bindings:StorageAn
        OR json_extract(authority_json,'$.sourceNamespace') IS NOT ?4
        OR json_extract(authority_json,'$.policyRevision') IS NOT ?5 OR json_extract(authority_json,'$.collectionRevision') IS NOT ?6
        OR COALESCE(json_extract(authority_json,'$.publicAuthorityEpoch'),-1)<?7) ORDER BY day LIMIT 4)`)
-      .bind(bindings.sourceId,from,STORAGE_GRAPH_METHOD,authority.sourceNamespace,authority.policyRevision,
+      .bind(bindings.sourceId,from,STORAGE_GRAPH_PROJECTION_METHOD,authority.sourceNamespace,authority.policyRevision,
         authority.collectionRevision,containment),
     bindings.target.prepare(`DELETE FROM analytics_community_graph_previews WHERE source_id=?1 AND (method!=?2
       OR json_extract(authority_json,'$.sourceId') IS NOT ?1 OR json_extract(authority_json,'$.sourceNamespace') IS NOT ?3
       OR json_extract(authority_json,'$.policyRevision') IS NOT ?4 OR json_extract(authority_json,'$.collectionRevision') IS NOT ?5
       OR COALESCE(json_extract(authority_json,'$.publicAuthorityEpoch'),-1)<?6)`)
-      .bind(bindings.sourceId,STORAGE_GRAPH_METHOD,authority.sourceNamespace,authority.policyRevision,
+      .bind(bindings.sourceId,STORAGE_GRAPH_PROJECTION_METHOD,authority.sourceNamespace,authority.policyRevision,
         authority.collectionRevision,containment),
   ]);
   return results.reduce((n,r)=>n+r.meta.changes,0);

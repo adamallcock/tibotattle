@@ -22,7 +22,7 @@ import { sha256Hex } from "../src/crypto";
 import { createD1InvocationBudget } from "../src/d1-invocation-budget";
 import { initializeTypedV1Admission } from "../src/typed-v1-admission";
 import { initializeStorageAnalyticsRuntime, advanceStorageAnalytics, runStorageAnalyticsPass } from "../src/storage-analytics-runtime";
-import { captureStorageGraphScope, computeStorageGraphResult, STORAGE_GRAPH_METHOD,
+import { captureStorageGraphScope, computeStorageGraphResult, STORAGE_GRAPH_METHOD, STORAGE_GRAPH_PROJECTION_METHOD,
   STORAGE_GRAPH_V11_CHECKPOINT_METHOD } from "../src/storage-community-graph";
 import { readStorageCommunityOwnerPage } from "../src/storage-community-authority";
 import { drainCommunityPublicSourceBootstrap } from "../src/community-daily-aggregates";
@@ -342,6 +342,26 @@ describe('isolated allowance graph publication',()=>{
    (await readStorageCommunityOwnerPage(typed()))[0]!.ownerDigest!])expect(text).not.toContain(value);
   expect(await typed().prepare('SELECT count(*) n FROM community_allowance_fit_cache').first('n')).toBe(0);
   expect(await typed().prepare('SELECT count(*) n FROM community_model_composition_days').first('n')).toBe(0);
+ });
+ it('reprojects obsolete plan publications while reusing raw owner fits and model results',async()=>{
+  await fixture();await compute('fits');await compute('model');
+  await publishStorageCommunityModelDay(bindings(),{day:day()});
+  await publishStorageCommunityGraphPreview(bindings());
+  const rawBefore=(await b.STORAGE_ANALYTICS_DB.prepare('SELECT * FROM analytics_community_graph_results ORDER BY metric,day').all()).results;
+  await b.STORAGE_ANALYTICS_DB.prepare('UPDATE analytics_community_model_publications SET method=?,cohort_digest=?')
+    .bind(STORAGE_GRAPH_METHOD,'0'.repeat(64)).run();
+  await b.STORAGE_ANALYTICS_DB.prepare('UPDATE analytics_community_graph_previews SET method=?,cohort_digest=?')
+    .bind(STORAGE_GRAPH_METHOD,'0'.repeat(64)).run();
+  expect(await readPublishedStorageCommunityGraph(bindings())).toBeNull();
+  expect(await publishStorageCommunityModelDay(bindings(),{day:day()})).toMatchObject({state:'published'});
+  expect(await publishStorageCommunityGraphPreview(bindings())).toMatchObject({state:'published'});
+  expect((await b.STORAGE_ANALYTICS_DB.prepare('SELECT * FROM analytics_community_graph_results ORDER BY metric,day').all()).results)
+    .toEqual(rawBefore);
+  expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT method FROM analytics_community_model_publications').first('method'))
+    .toBe(STORAGE_GRAPH_PROJECTION_METHOD);
+  const preview=await readPublishedStorageCommunityAdminPreview(bindings());
+  expect(preview?.plans.map(plan=>[plan.planType,plan.multiplier])).toEqual([
+    ['pro',1],['prolite',2],['promax',0.4],['plus',10]]);
  });
  it('fits allowance for an owner who has only ever uploaded v1.2',async()=>{
   const f=await v12Fixture();

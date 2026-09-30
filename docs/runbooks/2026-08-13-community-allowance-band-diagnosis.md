@@ -150,8 +150,10 @@ separate, low-priority historical model backfill. Source implementation is
 not proof that the migration or Worker has been deployed.
 
 - Each closed UTC day uses its own preceding 100-day acquisition horizon and
-  only observations through that day. The NNLS identification gates, pricing,
-  and Pro 20x normalization are unchanged. Today's fitted vector is never
+  only observations through that day. The NNLS identification gates and
+  pricing remain bound to the recorded method. Current normalization uses
+  Pro 10x; retained legacy publications keep their declared Pro 20x basis.
+  Today's fitted vector is never
   copied backward, and later Astra usage cannot create pre-Astra points.
 - Up to 69 missing dates before today are reconstructed, newest first. A day
   publishes only after the complete bounded cohort resolves. Sparse, unstable,
@@ -191,8 +193,10 @@ scheduled progress, the exact admin response and the rendered multi-day chart.
 The public chart uses only the daily API's optional closed
 [`allowanceBreakdowns`](../reference/api-surface.md#public-allowance-breakdowns),
 not an admin endpoint. View and date-range selection are client-side over that
-one periodically refreshed read. All views share date and dollar axes; plan values are normalized to
-Pro 20x and model values estimate a full weekly allowance on that model.
+one periodically refreshed read. Aggregate and model views use the payload's
+declared reference basis: current Pro 10x or retained legacy Pro 20x. The plan
+view shows each plan's own weekly value; model values estimate a full reference
+week on that model. Never relabel a legacy publication as the current basis.
 
 If activity works but a breakdown does not, check publication state and the
 source-fenced preview cache first. Age alone no longer removes the graph. A

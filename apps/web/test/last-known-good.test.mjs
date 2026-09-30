@@ -334,6 +334,7 @@ test("the community projection stores only what this reader validated, and re-no
     "allowanceBreakdowns", "allowanceReadState", "allowanceState", "days", "from", "schemaVersion", "to",
   ]);
   assert.equal(projected.allowanceReadState, "confirmed");
+  assert.equal(projected.allowanceBreakdowns.schemaVersion, "community-allowance-breakdowns-v1.2");
 
   // Re-reading days later only ever gets stricter, so a retained payload can
   // never be promoted into acceptance by the passage of time.
@@ -347,6 +348,22 @@ test("the community projection stores only what this reader validated, and re-no
     projectCommunityDailyPayloadForCache({ ...raw, schemaVersion: "community-daily-read-v9.9" }, { nowMs: NOW_MS }),
     null,
   );
+});
+
+test("the community cache preserves a legacy allowance basis instead of relabeling it", () => {
+  const raw = publicAllowanceFixture(NOW_MS);
+  delete raw.allowanceBreakdowns;
+  for (const day of raw.days) {
+    day.payload.allowance.basis = "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d";
+    day.payload.allowance.normalization = "pro_x1_prolite_x4_plus_x20";
+  }
+  const projected = projectCommunityDailyPayloadForCache(raw, { nowMs: NOW_MS });
+  assert.deepEqual(
+    normalizeCommunityDailySeries(projected, { nowMs: NOW_MS }),
+    normalizeCommunityDailySeries(raw, { nowMs: NOW_MS }),
+  );
+  assert.equal(projected.days[0].payload.allowance.basis,
+    "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d");
 });
 
 test("a community payload retained by the store still renders through the real reader", () => {

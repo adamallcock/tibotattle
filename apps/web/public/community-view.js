@@ -173,7 +173,7 @@ function valueAxis(maximum, plotTop, plotBottom, minimum = 0) {
   const step = chartTickStep(top);
   const axisTop = Math.ceil(top / step) * step;
   // A zero baseline wastes most of the panel when a band sits well above it:
-  // three plans on their own axes only read if each one fills its own panel.
+  // plans on their own axes only read if each one fills its own panel.
   // The floor still snaps to a whole tick, so the gridlines stay round and the
   // axis never implies a precision the step does not have. Zero is kept when
   // the data actually reaches down toward it.
@@ -528,7 +528,11 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
   const breakdownDays = new Map(series.breakdowns.days.map(day => [day.day, day]));
   const definitions = [
     { key: "aggregate", view: "aggregate", label: null, className: "" },
-    ...[ ["plus", "Plus", 2], ["prolite", "Pro 5×", 1], ["pro", "Pro 20×", 0] ].map(([key, label, color]) => ({
+    ...[ ["plus", "Plus", 3], ["prolite", "Pro 5×", 1],
+      ["pro", series.breakdowns.isCurrent === false ? "Pro 20×" : "Pro 10×", 0],
+      ["promax", "Pro Max 25×", 2] ]
+      .filter(([key]) => (series.breakdowns.planIds ?? Object.keys(series.breakdowns.days.at(-1)?.byPlanType ?? {})).includes(key))
+      .map(([key, label, color]) => ({
       key, label, view: "plans", className: `allowance-series-${color}`,
     })),
     ...PUBLIC_ALLOWANCE_MODEL_CONFIG.map(({ modelId, label }, index) => ({
@@ -556,17 +560,17 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
     days = days.slice(first, last + 1);
   }
   // A plan series is plotted at ITS OWN week at API prices, matching the value
-  // its card leads with. `centralUsd` is the Pro 20x equivalent, so the inverse
+  // its card leads with. `centralUsd` is the published reference equivalent, so the inverse
   // of the published normalization is applied per series; every other view is
   // already in reference terms and passes through unchanged.
   // Applied only when a single series is requested — the small-multiples path.
   // The whole-view model still carries reference-normalized values, because the
   // summary cards derive the plan's own week from them themselves; scaling here
-  // too would divide twice and show a Pro 5x week as a quarter of itself.
+  // too would divide twice and divide a plan’s own week a second time.
   const seriesScale = (value, definition) => {
     if (value == null) return null;
     if (seriesKeys === null || definition.view !== "plans") return value;
-    const own = planWeeklyApiEquivalentUsd(value, definition.key);
+    const own = planWeeklyApiEquivalentUsd(value, definition.key, series.breakdowns.normalization);
     return own === null ? value : own;
   };
   // Each view gets a scale from its own visible series. A plan small multiple
@@ -1551,6 +1555,8 @@ export function renderCommunityAllowanceSection({
   documentRef,
   container,
   sourceContainer = null,
+  headingNode = null,
+  heroNode = null,
   stateNode = null,
   payload,
   rangeDays = null,
@@ -1559,14 +1565,30 @@ export function renderCommunityAllowanceSection({
 }) {
   const { clear, node } = createDomHelpers(documentRef);
   const locale = documentRef?.documentElement?.lang ?? "en-US";
-  const t = (key, values = {}) => translate(key, values, locale);
+  const series = normalizeCommunityDailySeries(payload);
+  // v1.0 breakdowns contain only plan/model rows: the aggregate still comes
+  // from independently published daily values. Later breakdowns own their
+  // combined estimate, so labels must follow the selected value's source.
+  const usesDailyAllowance = view === "aggregate" && !series.breakdowns?.hasCombined;
+  const legacyBasis = usesDailyAllowance
+    ? series.allowanceIsCurrent === false && series.days.some(day => day.allowance !== null)
+    : series.breakdowns?.isCurrent === false;
+  const t = (key, values = {}) => translate(legacyBasis
+    && ["community.allowance.chartDescription", "community.allowance.modelChartDescription"].includes(key)
+    ? `${key}Legacy` : key, values, locale);
+  for (const [element, key] of [[headingNode, "community.allowance.heading"],
+    [heroNode, "community.allowance.heroCopy"]]) {
+    if (element === null) continue;
+    const basisKey = legacyBasis ? `${key}Legacy` : key;
+    element.textContent = t(basisKey);
+    element.setAttribute?.("data-i18n", basisKey);
+  }
   const plural = (key, count) => translatePlural(key, count, {}, locale);
   const previousInspection = allowanceInspectionByContainer.get(container)?.();
   const inspection = previousInspection?.view === view ? previousInspection : null;
   allowanceInspectionByContainer.delete(container);
   clear(container);
   sourceContainer?.replaceChildren();
-  const series = normalizeCommunityDailySeries(payload);
   const retained = cachedEvidence(cache);
   const setChip = (labelKey, published) => {
     if (!stateNode) return;
@@ -1619,7 +1641,8 @@ export function renderCommunityAllowanceSection({
   const dollars = usdFormatter();
   const sourceDisclosure = sourceDisclosureDetails(node, t,
     view === "aggregate"
-      ? ["community.allowance.smallSampleDisclosure", "community.allowance.methodNote"]
+      ? ["community.allowance.smallSampleDisclosure",
+        legacyBasis ? "community.allowance.methodNoteLegacy" : "community.allowance.methodNote"]
       : ["community.allowance.smallSampleDisclosure"]);
   (sourceContainer ?? container).append(sourceDisclosure);
   if (view !== "aggregate") {
@@ -1633,16 +1656,17 @@ export function renderCommunityAllowanceSection({
       const icon = modelThemeIcon(documentRef, seriesCard.theme);
       if (icon) heading.append(icon);
       // A plan cohort leads with ITS OWN week at API prices, because that is
-      // the number a reader on that plan is asking about. The Pro 20x
+      // the number a reader on that plan is asking about. The reference
       // equivalent stays underneath as the comparable figure the basis names.
       const planUsd = view === "plans" && latest !== null
-        ? planWeeklyApiEquivalentUsd(latest.centralUsd, latest.seriesKey) : null;
+        ? planWeeklyApiEquivalentUsd(latest.centralUsd, latest.seriesKey, series.breakdowns.normalization) : null;
       card.append(heading,
         node("strong", "allowance-summary-value",
           latest === null ? "—" : dollars.format(planUsd === null ? latest.centralUsd : planUsd)));
       if (planUsd !== null) {
         card.append(node("p", "allowance-plan-value",
-          t("community.allowance.referenceEquivalent", { value: dollars.format(latest.centralUsd) })));
+          t(series.breakdowns?.isCurrent === false
+            ? "community.allowance.referenceEquivalentLegacy" : "community.allowance.referenceEquivalent", { value: dollars.format(latest.centralUsd) })));
       }
       card.append(node("p", "allowance-headline-caveat", latest === null
         ? t("community.allowance.noModelEstimate")
@@ -1651,7 +1675,7 @@ export function renderCommunityAllowanceSection({
     }
     container.append(cards);
     if (view === "plans") {
-      // Small multiples. Three plans whose own weeks span roughly twentyfold
+      // Small multiples. Plans whose own weeks span a wide range
       // cannot share a linear axis — the smallest is pinned to the baseline and
       // its band becomes a sliver. One panel per plan gives each its own value
       // axis and full vertical resolution, and it removes the need to explain a
@@ -1673,7 +1697,8 @@ export function renderCommunityAllowanceSection({
       appendCommunityAllowanceChart({ documentRef, container, model, t, inspection });
     }
     container.append(node("p", "snapshot-disclosure", t(view === "models"
-      ? "community.allowance.modelMethod" : "community.allowance.planMethod")));
+      ? series.breakdowns?.isCurrent === false ? "community.allowance.modelMethodLegacy" : "community.allowance.modelMethod"
+      : series.breakdowns?.isCurrent ? "community.allowance.planMethod" : "community.allowance.planMethodLegacy")));
     return "published";
   }
   const headline = node("div", "allowance-headline");
