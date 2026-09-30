@@ -868,7 +868,14 @@ describe("bounded shared effective day dependencies", () => {
         const typedSeeks = plan.filter(row => row.detail.includes("scoped_record"));
         expect(typedSeeks).toHaveLength(4);
         const timed = typedSeeks.filter(row => row.detail.includes("typed_telemetry_owner_time"));
-        expect(timed).toHaveLength(2);
+        // V1 selects through one sealed chunk proof and record PKs; V11
+        // retains the owner/time seek. Both outside occurrence seeks remain.
+        expect(timed).toHaveLength(1);
+        expect(typedSeeks.filter(row => row.detail.includes("USING INTEGER PRIMARY KEY (rowid=?)")))
+          .toHaveLength(1);
+        expect(plan.filter(row => row.detail === "MATERIALIZE admitted_v1_selected_chunks")).toHaveLength(1);
+        expect(plan.find(row => row.detail.includes("SEARCH admission USING COVERING INDEX typed_v1_admissions_chunk"))?.detail)
+          .toContain("chunk_id=?");
         for (const row of timed) expect(row.detail).toContain(
           "owner_id=? AND stream=? AND observed_at_ms>? AND observed_at_ms<?");
         expect(typedSeeks.find(row => row.detail.includes("typed_telemetry_v1_occurrence"))?.detail)
