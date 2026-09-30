@@ -396,7 +396,8 @@ describe('independent public daily publication',()=>{
     const queuedDay=new Date(Date.parse(today())+86_400_000).toISOString().slice(0,10);
     await target().prepare('INSERT INTO analytics_community_daily_queue(source_id,day,revision) VALUES(?,?,1)')
       .bind(sourceId,queuedDay).run();
-    expect(await advanceNextStorageCommunityDaily({...options(),preferStaleHead:true})).toMatchObject({state:'published'});
+    expect(await advanceNextStorageCommunityDaily({...options(),preferStaleHead:true,preferNewestQueued:true}))
+      .toMatchObject({state:'published',day:today()});
     expect(await target().prepare('SELECT revision FROM analytics_community_daily_heads WHERE source_id=? AND day=?')
       .bind(sourceId,today()).first('revision')).toBe(2);
     expect(await target().prepare('SELECT count(*) n FROM analytics_community_daily_queue WHERE source_id=? AND day=?')
@@ -404,6 +405,42 @@ describe('independent public daily publication',()=>{
     expect(await advanceNextStorageCommunityDaily(options())).toMatchObject({state:'published'});
     expect(await target().prepare('SELECT count(*) n FROM analytics_community_daily_queue WHERE source_id=? AND day=?')
       .bind(sourceId,queuedDay).first('n')).toBe(0);
+  });
+  it('admits newest and oldest queued days without losing the middle day',async()=>{
+    await fixture();await ready();await publish();
+    const at=(offset:number)=>new Date(Date.parse(today())+offset*86_400_000).toISOString().slice(0,10);
+    const oldest=at(-2),middle=at(-1),newest=at(1);
+    await target().batch([oldest,middle,newest].map(day=>target().prepare(
+      'INSERT INTO analytics_community_daily_queue(source_id,day,revision) VALUES(?,?,1)'
+    ).bind(sourceId,day)));
+    expect(await advanceNextStorageCommunityDaily({...options(),preferNewestQueued:true}))
+      .toMatchObject({state:'published',day:newest});
+    expect((await target().prepare('SELECT day FROM analytics_community_daily_queue WHERE source_id=? ORDER BY day')
+      .bind(sourceId).all<{day:string}>()).results.map(row=>row.day)).toEqual([oldest,middle]);
+    expect(await advanceNextStorageCommunityDaily({...options(),preferNewestQueued:false}))
+      .toMatchObject({state:'published',day:oldest});
+    expect((await target().prepare('SELECT day FROM analytics_community_daily_queue WHERE source_id=? ORDER BY day')
+      .bind(sourceId).all<{day:string}>()).results.map(row=>row.day)).toEqual([middle]);
+    expect(await advanceNextStorageCommunityDaily({...options(),preferNewestQueued:true,skipDays:[middle]}))
+      .toMatchObject({state:'idle'});
+    expect(await advanceNextStorageCommunityDaily({...options(),preferNewestQueued:true}))
+      .toMatchObject({state:'published',day:middle});
+    expect(await target().prepare('SELECT count(*) n FROM analytics_community_daily_queue WHERE source_id=?')
+      .bind(sourceId).first<number>('n')).toBe(0);
+    await expect(advanceNextStorageCommunityDaily({...options(),preferNewestQueued:'yes' as unknown as boolean}))
+      .rejects.toThrow();
+  });
+  it('falls back to the queued direction when a stale head is also queued',async()=>{
+    await fixture();await ready();await publish();
+    await source().prepare('UPDATE community_snapshot_policy SET maturity_days=maturity_days+1 WHERE singleton_id=1').run();
+    const recent=new Date(Date.parse(today())+86_400_000).toISOString().slice(0,10);
+    await target().batch([today(),recent].map(day=>target().prepare(
+      'INSERT INTO analytics_community_daily_queue(source_id,day,revision) VALUES(?,?,1)'
+    ).bind(sourceId,day)));
+    expect(await advanceNextStorageCommunityDaily({...options(),preferStaleHead:true,preferNewestQueued:true}))
+      .toMatchObject({state:'published',day:recent});
+    expect(await target().prepare('SELECT count(*) n FROM analytics_community_daily_queue WHERE source_id=? AND day=?')
+      .bind(sourceId,today()).first<number>('n')).toBe(1);
   });
   it('advances several prepared days in one bounded public pass while preserving the graph query floor',async()=>{
     await fixture();await ready();await publish();
@@ -577,6 +614,30 @@ describe('independent public daily publication',()=>{
     expect(result.dailyPublications).toBe(1);expect(result.graphFailure).toBeUndefined();
     expect((await target().prepare('SELECT day FROM analytics_community_daily_queue WHERE source_id=? ORDER BY day').bind(sourceId).all())
       .results.map(row=>row.day)).toEqual([blocked]);
+  });
+  it('retains a deferred newest day while the next queued day publishes in the same pass',async()=>{
+    const first=await seedV1();await insertTypedTelemetryV1Chunk(source(),first.insert,namespace);await ready();await publish();
+    const owner=(await target().prepare('SELECT * FROM analytics_community_daily_owners').first<Record<string,unknown>>())!;
+    const next=new Date(Date.parse(today())+86_400_000).toISOString().slice(0,10);
+    const blocked=new Date(Date.parse(today())+2*86_400_000).toISOString().slice(0,10);
+    await target().batch([
+      target().prepare(`INSERT INTO analytics_community_daily_owners (${Object.keys(owner).join(',')}) VALUES(${Object.keys(owner).map(()=>'?').join(',')})`)
+        .bind(...Object.values({...owner,day:blocked,values_json:JSON.stringify({pad:'a'.repeat(2*1024*1024+1)})})),
+      target().prepare('INSERT INTO analytics_community_daily_queue(source_id,day,revision) VALUES(?,?,1)').bind(sourceId,next),
+      target().prepare('INSERT INTO analytics_community_daily_queue(source_id,day,revision) VALUES(?,?,1)').bind(sourceId,blocked),
+    ]);
+    const minute=Math.floor(Date.now()/60_000);
+    const newestSlot=minute+((7-minute%8+8)%8);
+    const fixedNow=newestSlot*60_000;
+    const clock=vi.spyOn(Date,'now').mockReturnValue(fixedNow);
+    try{
+      const result=await runStorageAnalyticsPass({...options(),publishCommunity:true,publicOnly:true,
+        publicationOnly:true,maxSteps:1,maxQueries:900,deadlineMs:fixedNow+55_000});
+      expect(result.dailyPublications).toBe(1);
+      expect(result.graphFailure).toBeUndefined();
+      expect((await target().prepare('SELECT day FROM analytics_community_daily_queue WHERE source_id=? ORDER BY day')
+        .bind(sourceId).all<{day:string}>()).results.map(row=>row.day)).toEqual([blocked]);
+    }finally{clock.mockRestore();}
   });
   it('records a daily lane failure and still claims graph work in the same pass',async()=>{
     await fixture();await ready();await publish();

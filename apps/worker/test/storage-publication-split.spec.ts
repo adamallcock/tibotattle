@@ -3,7 +3,7 @@ import {
   runStoragePublicationSchedule,
   storagePublicationLaneEnabled,
 } from "../src/storage-publication-worker";
-import { runStorageAnalyticsPass } from "../src/storage-analytics-runtime";
+import { runStorageAnalyticsPass, storageDailyAdmissionForSlot } from "../src/storage-analytics-runtime";
 
 const database = () => ({ prepare() { throw new Error("no query expected"); } }) as unknown as D1Database;
 
@@ -70,5 +70,22 @@ describe("the split's two halves cannot overlap", () => {
         ...bindings(), publishCommunity: true, publicOnly: true, ...half,
       })).rejects.toThrow(/no query expected|STORAGE_/u);
     }
+  });
+});
+
+describe("daily admission cadence", () => {
+  it("retains three stale-head slots and alternates the queue's old and recent turns", () => {
+    const slots=Array.from({length:16},(_,slot)=>storageDailyAdmissionForSlot(slot));
+    expect(slots.flatMap((entry,slot)=>entry.preferStaleHead?[]:[slot])).toEqual([3,7,11,15]);
+    expect([3,7,11,15].map(slot=>slots[slot])).toEqual([
+      {preferStaleHead:false,preferNewestQueued:false},
+      {preferStaleHead:false,preferNewestQueued:true},
+      {preferStaleHead:false,preferNewestQueued:false},
+      {preferStaleHead:false,preferNewestQueued:true},
+    ]);
+    for(const slot of [0,1,2,4,5,6,8,9,10,12,13,14])
+      expect(slots[slot]!.preferStaleHead).toBe(true);
+    expect(()=>storageDailyAdmissionForSlot(-1)).toThrow();
+    expect(()=>storageDailyAdmissionForSlot(0.5)).toThrow();
   });
 });

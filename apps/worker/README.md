@@ -207,6 +207,17 @@ of retained-data eligibility. See the
 for source identity, overlap and activation gates. Legacy sealed weekly
 snapshots keep their original transport and cohort policy.
 
+
+Daily publication alternates the queue-first turns between its oldest and
+newest days, while retaining three stale-head-first turns for each queue-first
+turn. One admission minute is captured per pass and the slot advances with each
+attempt. Deferred days yield within that pass through a bounded skip list;
+source changes stop the pass. This gives recent days regular admission alongside
+historical refreshes. It does not guarantee fairness when a day consumes the
+whole deadline or new work arrives continuously. Each day still requires the
+complete current cohort, correction method and authority before publication;
+partial owner progress remains private and resumable.
+
 Self-service `DELETE /api/v1/me` is retired: the unknown API response is
 `404 NOT_FOUND`, without D1 access or participant mutation. `GET /api/v1/me`,
 legacy personal statistics, weekly aggregate, recovery,

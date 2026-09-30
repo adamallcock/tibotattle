@@ -342,20 +342,26 @@ const hardAuthority=(authority:StorageCommunityAuthority)=>({sourceId:authority.
  * An older public epoch alone is not staleness: the durable per-day queue
  * already names every day whose inputs actually changed. */
 export async function advanceNextStorageCommunityDaily(options:StorageCommunityDailyBindings & {
-  nowMs?:number;maxOwners?:number;preferStaleHead?:boolean;
+  nowMs?:number;maxOwners?:number;preferStaleHead?:boolean;preferNewestQueued?:boolean;
   sharedFeatures?:boolean;sharedFeatureBudget?:SharedAnalyticsFeatureBudget;
   /** Days already deferred in this pass; they yield to the next candidate. */
   skipDays?:readonly string[];
 }):Promise<(StorageCommunityDailyProgress&{day:string})|{state:'idle';ownersAdvanced:0}> {
   if(options.preferStaleHead!==undefined&&typeof options.preferStaleHead!=='boolean')throw unavailable();
+  if(options.preferNewestQueued!==undefined&&typeof options.preferNewestQueued!=='boolean')throw unavailable();
   const skipDays=options.skipDays??[];
   if(!Array.isArray(skipDays)||skipDays.length>64)throw unavailable();
   for(const value of skipDays)day(value);
   const skipJson=JSON.stringify(skipDays);
   await assertTarget(options);
   const authority=await captureStorageCommunityAuthority(options.source,options);
-  const queuedDay=()=>options.target.prepare(`SELECT day FROM analytics_community_daily_queue
-    WHERE source_id=? AND day NOT IN(SELECT value FROM json_each(?)) ORDER BY day LIMIT 1`)
+  // Both orders seek the queue's (source_id,day) primary key. Keep the choice
+  // closed so a recent-day admission never changes the durable queue contract.
+  const queuedDay=()=>options.target.prepare(options.preferNewestQueued===true
+    ? `SELECT day FROM analytics_community_daily_queue
+      WHERE source_id=? AND day NOT IN(SELECT value FROM json_each(?)) ORDER BY day DESC LIMIT 1`
+    : `SELECT day FROM analytics_community_daily_queue
+      WHERE source_id=? AND day NOT IN(SELECT value FROM json_each(?)) ORDER BY day ASC LIMIT 1`)
     .bind(options.sourceId,skipJson).first<string>('day');
   const staleHead=()=>options.target.prepare(`SELECT h.day FROM analytics_community_daily_heads h
       LEFT JOIN analytics_community_daily_publications p ON p.source_id=h.source_id AND p.day=h.day AND p.revision=h.revision

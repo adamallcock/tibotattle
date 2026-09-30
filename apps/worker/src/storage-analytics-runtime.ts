@@ -299,6 +299,16 @@ export interface StorageGraphDayProjectionFields {
 export interface StorageAnalyticsCatchupMetrics {
  decodedBytes:number;sourceReadMs:number;foldMs:number;sourceRecheckMs:number;targetWriteMs:number;pageDurationMs:number;
 }
+/** A queued day gets the first turn on one slot in four. Alternate that turn
+ * between the oldest backlog and newest delivered day without weakening the
+ * stale-head lane's existing three slots. */
+export function storageDailyAdmissionForSlot(slot:number):{
+ preferStaleHead:boolean;preferNewestQueued:boolean;
+}{
+ if(!Number.isSafeInteger(slot)||slot<0)throw invalid();
+ return {preferStaleHead:slot%4!==3,preferNewestQueued:slot%8===7};
+}
+
 /** Runs in an independent scheduled invocation. The actual query meter is
  * shared by BOTH databases; a batch counts all statements. A failed calculation
  * cannot participate in, roll back or delay an upload transaction. */
@@ -387,7 +397,8 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
    ||(options.foldGraphDayProjections!==undefined&&typeof options.foldGraphDayProjections!=='boolean')
    ||(options.projectionLaneFirst!==undefined&&typeof options.projectionLaneFirst!=='boolean')
    ||(options.graphDayProjectionLongPass!==undefined&&typeof options.graphDayProjectionLongPass!=='boolean'))throw invalid();
- const graphLaneFirst=options.graphLaneFirst??Math.floor(Date.now()/60_000)%2===1;
+ const admissionMinute=Math.floor(Date.now()/60_000);
+ const graphLaneFirst=options.graphLaneFirst??admissionMinute%2===1;
  const projectionLaneFirst=options.projectionLaneFirst
   ??Math.floor(Date.now()/60_000)%GRAPH_DAY_PROJECTION_OPEN_EVERY===GRAPH_DAY_PROJECTION_OPEN_MINUTE;
  const graphAdmission=options.graphOnly?GRAPH_ONLY_ADMISSION_QUERIES:GRAPH_LANE_ADMISSION_QUERIES;
@@ -395,6 +406,7 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
  const scoped={...options,source:meter.wrap(options.source),target:meter.wrap(options.target)};
  let steps=0,recordsRead=0,dailyPublications=0,graphCalculations=0,modelBlockAdoptedDates=0,
   graphFailure:StorageGraphFailureFields|undefined;
+ let dailyAdmissionAttempt=0;
  let graphCheckpointAdvances=0;
  let graphDayProjection:StorageGraphDayProjectionFields|undefined;
  // Attribute actual retirement spend separately from useful calculation work.
@@ -700,8 +712,8 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
       const skipDays:string[]=[];
       try{
        for(let attempt=0;attempt<dailyAttempts&&deadlineMs-Date.now()>=(attempt===0?5_000:15_000);attempt++){
-        const slot=Math.floor(Date.now()/60_000)+attempt;
-        const daily=await advanceNextStorageCommunityDaily({...dailyScoped,preferStaleHead:slot%4!==3,skipDays,
+        const slot=admissionMinute+dailyAdmissionAttempt++;
+        const daily=await advanceNextStorageCommunityDaily({...dailyScoped,...storageDailyAdmissionForSlot(slot),skipDays,
          ...(options.sharedFeatures===true?{sharedFeatures:true,sharedFeatureBudget:{
           remainingQueries:()=>Math.min(meter.remainingQueries,dailyMeter.remainingQueries),
           deadlineMs,now:Date.now}}:{})});
