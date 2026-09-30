@@ -9,6 +9,7 @@ import { initializeTypedV1Admission, insertTypedTelemetryV1Chunk } from "../src/
 import { currentTelemetryV1Chunk } from "../src/telemetry-v1-repository";
 import { parseTelemetryV1Chunk, type TelemetryV1UsageEvent } from "../src/telemetry-v1";
 import { telemetryV11LegacyProjection } from "../src/telemetry-v11-compatibility";
+import { decodeTypedTelemetryId } from "../src/typed-telemetry-codec";
 import { readEffectiveUsageOwnerDayPage, readEffectiveTelemetryOwnerDayPage,
   readEffectiveTelemetryOwnerDays } from "../src/telemetry-usage-effective-reader";
 
@@ -201,8 +202,107 @@ it("bounds candidate decoding to the indexed owner stream and UTC window without
     .bind(...sources[0]!.values).all<{ detail: string }>();
   const sourcePhysical = sourcePlan.results.filter(row => row.detail.includes("scoped_record"));
   expect(sourcePhysical).toHaveLength(2);
-  for (const row of sourcePhysical) expect(row.detail).toMatch(
-    /SEARCH scoped_record USING (?:COVERING )?INDEX typed_telemetry_owner_time \(owner_id=\? AND stream=\?\)/u);
+  expect(sourcePhysical.find(row => row.detail.includes("typed_telemetry_v1_occurrence"))?.detail)
+    .toContain("device_id=? AND stream=? AND occurrence_id=?");
+  expect(sourcePhysical.find(row => row.detail.includes("typed_telemetry_v11_occurrence"))?.detail)
+    .toContain("manifest_id=? AND stream=? AND occurrence_id=?");
+  expect(sourcePlan.results.find(row => row.detail.includes("scoped_device"))?.detail)
+    .toContain("USING COVERING INDEX typed_telemetry_device_owner (owner_id=?)");
+  expect(sourcePlan.results.find(row => row.detail.includes("scoped_manifest"))?.detail)
+    .toContain("USING COVERING INDEX typed_telemetry_manifest_owner (owner_id=?)");
+  expect(sources[0]!.values[1]).toBeInstanceOf(ArrayBuffer);
+  expect(sources[0]!.sql).not.toContain("json_each(?)");
+  const sourceResult = await db().prepare(sources[0]!.sql).bind(...sources[0]!.values).all();
+  expect(sourceResult.results).toHaveLength(2);
+  const priorSourceSql = sources[0]!.sql
+    .replace(/      CROSS JOIN typed_telemetry_devices scoped_device INDEXED BY typed_telemetry_device_owner\n       ON scoped_device.owner_id=owner_membership.typed_owner_id\n/u, "")
+    .replace(/      CROSS JOIN typed_telemetry_manifests scoped_manifest INDEXED BY typed_telemetry_manifest_owner\n       ON scoped_manifest.owner_id=owner_membership.typed_owner_id\n/u, "")
+    .replace("ON scoped_record.device_id=scoped_device.id\n        AND scoped_record.owner_id", "ON scoped_record.owner_id")
+    .replace("ON scoped_record.manifest_id=scoped_manifest.id\n        AND scoped_record.owner_id", "ON scoped_record.owner_id")
+    .replaceAll("INDEXED BY typed_telemetry_v1_occurrence", "INDEXED BY typed_telemetry_owner_time")
+    .replaceAll("INDEXED BY typed_telemetry_v11_occurrence", "INDEXED BY typed_telemetry_owner_time");
+  expect(priorSourceSql).not.toContain("scoped_device");
+  expect(priorSourceSql).not.toContain("scoped_manifest");
+  const priorSource = await db().prepare(priorSourceSql).bind(...sources[0]!.values).all();
+  expect(sourceResult.results).toEqual(priorSource.results);
+  // Both plans pay for the same immutable completeness proof. The difference
+  // isolates the owner's 200 unrelated retained rows from source expansion.
+  expect(sourceResult.meta.rows_read).toBeLessThan(priorSource.meta.rows_read * 0.6);
+  console.info("effective-reader-source-rows", {
+    current: sourceResult.meta.rows_read, prior: priorSource.meta.rows_read,
+  });
+}, 30_000);
+
+it("batches the maximum selected page as canonical BLOB seeks and keeps cross-day variants in both readers", async () => {
+  const fixture = await createV11DeviceFixture(db());
+  const otherDevice = await createV11DeviceFixture(db(), { participantId: fixture.participantId });
+  const occurrences = Array.from({ length: 200 }, (_, index) =>
+    `event:v2:${(index + 1).toString(16).padStart(64, "0")}`);
+  await insertTypedTelemetryV1Chunk(db(), await makeInsert(fixture, 1, occurrences, true), sourceNamespace);
+  await insertTypedTelemetryV1Chunk(db(), await makeInsert(otherDevice, 1,
+    [occurrences[199]!], true, null, "2026-09-21"), sourceNamespace);
+  const owner = await ownerFor(fixture.participantId);
+  const options = { sourceNamespace, ownerDigest: owner.owner_digest, ownerRevision: owner.revision,
+    authorityEpoch: owner.authority_epoch, day, limit: 200 };
+  const observed = recordDirectQueries(db());
+  const usage = await readEffectiveUsageOwnerDayPage(observed.database, options);
+  expect(usage.next).toBeNull();
+  expect(usage.rows.map(row => row.occurrenceId)).toEqual(occurrences);
+  expect(usage.rows[199]).toMatchObject({ eventTimeConflict: true, status: "base_conflict", sourceCount: 2 });
+  const generic = await readEffectiveTelemetryOwnerDayPage(observed.database,
+    { ...options, stream: "usage" });
+  expect(generic.next).toBeNull();
+  expect(generic.rows.map(row => row.occurrenceId)).toEqual(occurrences);
+  expect(generic.rows[199]).toMatchObject({ eventTimeConflict: true, status: "conflict" });
+  const sourceQueries = observed.queries.filter(query => query.sql.includes("selected_stream("));
+  expect(sourceQueries).toHaveLength(6);
+  for (const query of sourceQueries) {
+    expect(query.values.length).toBeLessThan(100);
+    expect(query.values[1]).toBeInstanceOf(ArrayBuffer);
+    expect(query.sql).toContain("requested(occurrence_id) AS MATERIALIZED (VALUES");
+  }
+  // Three individually bounded batches can still exceed the whole-page
+  // source-variant cap. Inflate only this synthetic source result and require
+  // the public reader to refuse before decoding a partial page.
+  let sourceBatches = 0;
+  const inflated = new Proxy(db(), { get(target, property) {
+    if (property === "prepare") return (sql: string) => {
+      if (!sql.includes("requested(occurrence_id) AS MATERIALIZED")) return target.prepare(sql);
+      return { bind: (...values: unknown[]) => ({ all: async () => {
+        sourceBatches += 1;
+        const occurrenceId = decodeTypedTelemetryId(new Uint8Array(values[1] as ArrayBuffer));
+        const count = sourceBatches < 3 ? 1_600 : 1;
+        return { results: Array.from({ length: count }, (_, index) => ({
+          storage_row_id: index + 1, source_namespace: sourceNamespace,
+          participant_id: fixture.participantId, occurrence_id: occurrenceId,
+        })) };
+      } }) } as unknown as D1PreparedStatement;
+    };
+    const value = Reflect.get(target, property);
+    return typeof value === "function" ? value.bind(target) : value;
+  } });
+  await expect(readEffectiveUsageOwnerDayPage(inflated, options))
+    .rejects.toMatchObject({ code: "EFFECTIVE_USAGE_LIMIT" });
+  expect(sourceBatches).toBe(3);
+}, 30_000);
+
+it("fails closed when either additive owner metadata index is absent", async () => {
+  const fixture = await createV11DeviceFixture(db());
+  const occurrence = `event:v2:${"1".repeat(64)}`;
+  await insertTypedTelemetryV1Chunk(db(), await makeInsert(fixture, 1, [occurrence], true), sourceNamespace);
+  const owner = await ownerFor(fixture.participantId);
+  const options = { sourceNamespace, ownerDigest: owner.owner_digest, ownerRevision: owner.revision,
+    authorityEpoch: owner.authority_epoch, day, limit: 1 };
+  for (const [index, table] of [
+    ["typed_telemetry_device_owner", "typed_telemetry_devices"],
+    ["typed_telemetry_manifest_owner", "typed_telemetry_manifests"],
+  ] as const) {
+    await db().prepare(`DROP INDEX ${index}`).run();
+    await expect(readEffectiveUsageOwnerDayPage(db(), options))
+      .rejects.toMatchObject({ code: "EFFECTIVE_USAGE_UNAVAILABLE" });
+    await db().prepare(`CREATE INDEX ${index} ON ${table}(owner_id,id)`).run();
+  }
+  expect((await readEffectiveUsageOwnerDayPage(db(), options)).rows).toHaveLength(1);
 }, 30_000);
 
 describe("effective mixed v1 usage reader", () => {

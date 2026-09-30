@@ -23,6 +23,7 @@ import {
 } from "./telemetry-usage-reconciliation";
 import { sha256Hex } from "./crypto";
 import { TYPED_V11_CHUNK_PROOF_COUNT_SQL } from "./typed-v11-chunk-completeness";
+import { encodeTypedTelemetryId } from "./typed-telemetry-codec";
 import {
   readTelemetryV12EffectiveCandidatePage,
   readTelemetryV12EffectiveOccurrences,
@@ -49,6 +50,9 @@ export const MAX_EFFECTIVE_USAGE_PAGE = 200;
  * distinct variants still fails closed instead of dropping evidence. */
 export const MAX_EFFECTIVE_USAGE_ARCHIVE_ROWS = MAX_TELEMETRY_USAGE_CORRECTION_SOURCE_VARIANTS;
 export const MAX_EFFECTIVE_USAGE_SOURCE_ROWS = 3_200;
+// Leave room for the fixed owner/source/stream/admission binds under D1's
+// 100-parameter limit, including the generic quota/session source query.
+const MAX_EFFECTIVE_SOURCE_OCCURRENCE_BATCH = 80;
 const MAX_EFFECTIVE_USAGE_ARCHIVE_PAGES = Math.ceil(
   MAX_EFFECTIVE_USAGE_ARCHIVE_ROWS / MAX_TELEMETRY_USAGE_CORRECTION_PAGE,
 ) + 1;
@@ -488,24 +492,30 @@ async function readDirectCandidates(db: D1Database, scope: OwnerScope, options: 
   }
 }
 
+// The requested values are complete canonical BLOB identities, not TEXT from
+// json_each. The page is split into bounded batches before binding these VALUES.
+const REQUESTED_BLOB_VALUES = "__REQUESTED_BLOB_VALUES__";
 const DIRECT_SOURCE_SQL = `
-  WITH ${COMPLETE_CHUNKS_SQL}, requested(occurrence_id) AS MATERIALIZED (SELECT value FROM json_each(?)),
+  WITH ${COMPLETE_CHUNKS_SQL}, requested(occurrence_id) AS MATERIALIZED (VALUES ${REQUESTED_BLOB_VALUES}),
   selected_stream(stream_code) AS (SELECT ?),
   direct AS (
     SELECT r.storage_row_id,r.source_namespace,r.participant_id,r.device_id,r.occurrence_id,
            r.observed_at_ms,r.canonical_sha256,r.format_code
       FROM typed_v1_owner_memberships owner_membership
+      CROSS JOIN requested wanted
+      CROSS JOIN typed_telemetry_devices scoped_device INDEXED BY typed_telemetry_device_owner
+       ON scoped_device.owner_id=owner_membership.typed_owner_id
       CROSS JOIN selected_stream stream
-      CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_time
-       ON scoped_record.owner_id=owner_membership.typed_owner_id AND scoped_record.format=10
-        AND scoped_record.stream=stream.stream_code
+      CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_v1_occurrence
+       ON scoped_record.device_id=scoped_device.id
+        AND scoped_record.owner_id=owner_membership.typed_owner_id AND scoped_record.format=10
+        AND scoped_record.stream=stream.stream_code AND scoped_record.occurrence_id=wanted.occurrence_id
       CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=scoped_record.id
       JOIN typed_v1_admission_state v1
        ON v1.id=1 AND v1.runtime_contract_version=1 AND v1.source_namespace=?
       JOIN typed_telemetry_owners typed_owner
        ON typed_owner.id=owner_membership.typed_owner_id
       AND typed_owner.namespace_id=v1.namespace_id
-      JOIN requested wanted ON wanted.occurrence_id=r.occurrence_id
       JOIN typed_v1_record_admissions admission ON admission.typed_record_id=r.storage_row_id
       JOIN telemetry_v1_chunks chunk ON chunk.id=admission.chunk_id
        AND chunk.participant_id=r.participant_id AND chunk.device_id=r.device_id
@@ -522,17 +532,20 @@ const DIRECT_SOURCE_SQL = `
     SELECT r.storage_row_id,r.source_namespace,r.participant_id,r.device_id,r.occurrence_id,
            r.observed_at_ms,r.canonical_sha256,r.format_code
       FROM typed_v11_owner_memberships owner_membership
+      CROSS JOIN requested wanted
+      CROSS JOIN typed_telemetry_manifests scoped_manifest INDEXED BY typed_telemetry_manifest_owner
+       ON scoped_manifest.owner_id=owner_membership.typed_owner_id
       CROSS JOIN selected_stream stream
-      CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_time
-       ON scoped_record.owner_id=owner_membership.typed_owner_id AND scoped_record.format=11
-        AND scoped_record.stream=stream.stream_code
+      CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_v11_occurrence
+       ON scoped_record.manifest_id=scoped_manifest.id
+        AND scoped_record.owner_id=owner_membership.typed_owner_id AND scoped_record.format=11
+        AND scoped_record.stream=stream.stream_code AND scoped_record.occurrence_id=wanted.occurrence_id
       CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=scoped_record.id
       JOIN typed_v11_admission_state v11
        ON v11.id=1 AND v11.runtime_contract_version=1
       JOIN typed_telemetry_owners typed_owner
        ON typed_owner.id=owner_membership.typed_owner_id
       AND typed_owner.namespace_id=v11.namespace_id
-      JOIN requested wanted ON wanted.occurrence_id=r.occurrence_id
       JOIN typed_v11_record_admissions admission ON admission.typed_record_id=r.storage_row_id
       JOIN telemetry_v11_chunks chunk ON chunk.id=admission.chunk_id AND chunk.stream='usage'
       JOIN telemetry_v11_domain_days domain_day ON domain_day.manifest_id=admission.manifest_id
@@ -569,16 +582,42 @@ const DIRECT_SOURCE_SQL = `
   SELECT storage_row_id,source_namespace,participant_id,occurrence_id FROM grouped
    ORDER BY occurrence_id,storage_row_id LIMIT ?`;
 
+async function readSourceBatches(
+  db: D1Database, sql: string, participantId: string, occurrenceIds: readonly string[],
+  remainingBindings: readonly (string | number)[],
+): Promise<DirectSourceRow[]> {
+  const rows: DirectSourceRow[] = [];
+  // Selected candidate pages are unique; deduplication also keeps a caller's
+  // repeated ID from consuming extra binds or duplicating a source variant.
+  const unique = [...new Set(occurrenceIds)];
+  for (let offset = 0; offset < unique.length; offset += MAX_EFFECTIVE_SOURCE_OCCURRENCE_BATCH) {
+    const batch = unique.slice(offset, offset + MAX_EFFECTIVE_SOURCE_OCCURRENCE_BATCH);
+    const requested = new Set(batch);
+    const values = batch.map((occurrenceId) => Uint8Array.from(encodeTypedTelemetryId(occurrenceId)).buffer);
+    const statement = sql.replace(REQUESTED_BLOB_VALUES, batch.map(() => "(?)").join(","));
+    const part = (await db.prepare(statement).bind(participantId, ...values, ...remainingBindings)
+      .all<DirectSourceRow>()).results;
+    // The compatibility view decodes the same typed record. Retain the old
+    // requested-ID fence at this boundary even if that decoding ever drifts.
+    if (part.some((row) => !requested.has(row.occurrence_id))) fail("EFFECTIVE_USAGE_SOURCE_CONFLICT");
+    rows.push(...part);
+    if (rows.length > MAX_EFFECTIVE_USAGE_SOURCE_ROWS) fail("EFFECTIVE_USAGE_LIMIT");
+  }
+  // OCCURRENCE_ID permits ASCII characters only, so JS code-point order is
+  // SQLite BINARY TEXT order. Each occurrence belongs to exactly one batch.
+  // Restore the original whole-page ORDER BY before decoding/folding variants.
+  return rows.sort((left, right) => left.occurrence_id < right.occurrence_id ? -1
+    : left.occurrence_id > right.occurrence_id ? 1 : left.storage_row_id - right.storage_row_id);
+}
+
 async function readDirectSourceRows(db: D1Database, scope: OwnerScope, options: ReturnType<typeof normalizeOptions>, occurrenceIds: readonly string[]): Promise<DirectSourceRow[]> {
   if (occurrenceIds.length < 1 || occurrenceIds.length > MAX_EFFECTIVE_USAGE_PAGE) return [];
   try {
-    const rows = (await db.prepare(DIRECT_SOURCE_SQL).bind(
-      scope.participant_id,
-      JSON.stringify(occurrenceIds), 1, options.sourceNamespace, options.ownerDigest, scope.participant_id,
+    const rows = await readSourceBatches(db, DIRECT_SOURCE_SQL, scope.participant_id, occurrenceIds, [
+      1, options.sourceNamespace, options.ownerDigest, scope.participant_id,
       options.ownerDigest, scope.participant_id, options.sourceNamespace, scope.participant_id,
       MAX_EFFECTIVE_USAGE_SOURCE_ROWS + 1,
-    ).all<DirectSourceRow>()).results;
-    if (rows.length > MAX_EFFECTIVE_USAGE_SOURCE_ROWS) fail("EFFECTIVE_USAGE_LIMIT");
+    ]);
     return rows.map((row) => ({
       storage_row_id: integer(row.storage_row_id, 1),
       source_namespace: identifier(row.source_namespace),
@@ -841,13 +880,11 @@ async function readGenericSourceRows(
 ): Promise<GenericSourceRow[]> {
   if (occurrenceIds.length < 1 || occurrenceIds.length > MAX_EFFECTIVE_USAGE_PAGE) return [];
   try {
-    const rows = (await db.prepare(GENERIC_SOURCE_SQL).bind(
-      scope.participant_id,
-      JSON.stringify(occurrenceIds), effectiveStreamCode(options.stream), options.sourceNamespace, options.stream, options.ownerDigest,
+    const rows = await readSourceBatches(db, GENERIC_SOURCE_SQL, scope.participant_id, occurrenceIds, [
+      effectiveStreamCode(options.stream), options.sourceNamespace, options.stream, options.ownerDigest,
       scope.participant_id, options.stream, options.stream, options.ownerDigest, scope.participant_id,
       options.sourceNamespace, scope.participant_id, options.stream, MAX_EFFECTIVE_USAGE_SOURCE_ROWS + 1,
-    ).all<GenericSourceRow>()).results;
-    if (rows.length > MAX_EFFECTIVE_USAGE_SOURCE_ROWS) fail("EFFECTIVE_USAGE_LIMIT");
+    ]);
     return rows.map((row) => ({ storage_row_id: integer(row.storage_row_id, 1),
       source_namespace: identifier(row.source_namespace), participant_id: identifier(row.participant_id),
       occurrence_id: identifier(row.occurrence_id, OCCURRENCE_ID) }));
