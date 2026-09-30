@@ -658,15 +658,25 @@ controls. Do not restore a writer that predates correction archival.
 
 ### Effective-history lookup and cache scheduling prerequisites
 
-The effective dependency reader requires typed-ingestion migration
-`0005_owner_occurrence_lookup.sql` before its new source is deployed. The
-`typed_telemetry_device_owner` and `typed_telemetry_manifest_owner` indexes
-scope the small metadata dictionaries. The reader then seeks selected canonical
-occurrence IDs through the existing format-specific device/manifest indexes,
-retaining explicit owner, format and stream predicates. No new index is built
-over the retained record table. Date restrictions must not replace these
-cross-day links: they carry correction and conflict dependencies outside the
-requested output window. A missing metadata index refuses the new query.
+The effective dependency reader's metadata fallback requires typed-ingestion
+migration `0005_owner_occurrence_lookup.sql`. Its `typed_telemetry_device_owner`
+and `typed_telemetry_manifest_owner` indexes scope the small dictionaries before
+format-specific device/manifest occurrence seeks. A missing metadata index
+refuses that fallback. Date restrictions must not replace cross-day links: they
+carry correction and conflict dependencies outside the requested output window.
+
+Optional typed-ingestion migration `0006_direct_owner_occurrence.sql` adds one
+non-unique record index on owner, encoded occurrence, format, stream and observed
+day. When present, the reader seeks v1/v1.1 variants directly while retaining
+namespace, admission, complete-chunk, source, correction and outside-day proofs.
+Dependency v3 bytes and source statement counts remain unchanged; missing this
+optional index retains the metadata fallback. SQLite maintains index entries
+atomically with source admission, replacement and erasure. Its production
+migration and deployment remain separate from local qualification. Building it
+scans retained typed records, consumes storage and adds a write per future typed
+record. The closed two-role operator below does not admit this new migration.
+Qualify a guarded target and exact before/after schemas before any production
+write; an index trial does not require the optional source-day catalog.
 
 Analytics migration `0033_cache_retention_owner_cursor.sql` must also precede
 the new cache Worker. Its table stores a numeric position and revision for each

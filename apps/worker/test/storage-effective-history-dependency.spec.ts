@@ -128,7 +128,8 @@ async function insertV1HistoryDay(fixture: Fixture, selectedDay: string, revisio
 
 async function setupDependencyFixture(includeCatalog = true) {
   await reset();
-  for (const migrations of [b.TEST_MIGRATIONS, b.TEST_TYPED_INGESTION_MIGRATIONS,
+  for (const migrations of [b.TEST_MIGRATIONS, b.TEST_TYPED_INGESTION_MIGRATIONS
+    .filter(migration => !migration.name.startsWith("0006_")),
     b.TEST_INGESTION_BRIDGE_MIGRATIONS, b.TEST_TYPED_V1_ADMISSION_MIGRATIONS,
     b.TEST_TYPED_V11_ADMISSION_MIGRATIONS]) await applyD1Migrations(db(), migrations);
   await initializeStorageSource(db(), namespace);
@@ -142,6 +143,13 @@ async function setupDependencyFixture(includeCatalog = true) {
     sourceId: namespace, sourceNamespace: namespace});
 }
 beforeEach(() => setupDependencyFixture());
+async function enableDirectOccurrenceLookup() {
+  const migration = b.TEST_TYPED_INGESTION_MIGRATIONS.find(value =>
+    value.name === "0006_direct_owner_occurrence.sql");
+  expect(migration).toBeDefined();
+  await applyD1Migrations(db(), [migration!]);
+}
+
 
 async function activate(fixture: Fixture, candidates: Staged[]) {
   const predecessor = await createTelemetryV11DomainPredecessor(db(), fixture);
@@ -253,7 +261,8 @@ async function readDependency(options: { includeSessions?: boolean } = {}) {
   return readDependencyAt(day(), options);
 }
 
-describe("closed effective history dependency", () => {
+describe.each([false, true])("closed effective history dependency (direct=%s)", directOccurrence => {
+  beforeEach(async () => { if (directOccurrence) await enableDirectOccurrenceLookup(); });
   it("keeps occurrence-link reads scoped to the owner while retaining outside-day conflicts", async () => {
     const selectedDay = day(), outsideDay = dayAfter(selectedDay);
     await db().prepare("UPDATE telemetry_v12_runtime SET state='active' WHERE id=1").run();
@@ -477,7 +486,8 @@ const emptyDependencyOwner: StorageCommunityOwner = {
   hasV1: false, hasV11: false, hasV12: false, hasLegacy: false, hasEffective: true,
 };
 
-describe("bounded shared effective day dependencies", () => {
+describe.each([false, true])("bounded shared effective day dependencies (direct=%s)", directOccurrence => {
+  beforeEach(async () => { if (directOccurrence) await enableDirectOccurrenceLookup(); });
   it("changes exact singleton and batched identities when correction reading activates without an owner revision", async () => {
     const selectedDay=day(),days=[selectedDay,dayAfter(selectedDay)];
     const staged=await effectiveHistoryDependency(db(),emptyDependencyOwner,namespace,
@@ -856,7 +866,7 @@ describe("bounded shared effective day dependencies", () => {
     }
   }, 30_000);
 
-  it("seeks selected canonical IDs through owned metadata and existing format-specific indexes in both dependency modes", async () => {
+  it("seeks selected canonical IDs through the migrated index or owned metadata in both dependency modes", async () => {
     for (const includeSessions of [false, true]) {
       const observed = observeDependencyQueries(db());
       await effectiveHistoryDependency(observed.database, emptyDependencyOwner, namespace, day(), day(),
@@ -884,20 +894,28 @@ describe("bounded shared effective day dependencies", () => {
         expect(plan.filter(row => row.detail === "MATERIALIZE admitted_v1_selected_chunks")).toHaveLength(1);
         expect(plan.find(row => row.detail.includes("SEARCH admission USING COVERING INDEX typed_v1_admissions_chunk"))?.detail)
           .toContain("chunk_id=?");
-        expect(typedSeeks.find(row => row.detail.includes("typed_telemetry_v1_occurrence"))?.detail)
-          .toContain("device_id=? AND stream=? AND occurrence_id=?");
-        expect(typedSeeks.find(row => row.detail.includes("typed_telemetry_v11_occurrence"))?.detail)
-          .toContain("manifest_id=? AND stream=? AND occurrence_id=?");
-        expect(plan.find(row => row.detail.includes("scoped_device"))?.detail)
-          .toContain("USING COVERING INDEX typed_telemetry_device_owner (owner_id=?)");
-        expect(plan.find(row => row.detail.includes("scoped_manifest"))?.detail)
-          .toContain("USING COVERING INDEX typed_telemetry_manifest_owner (owner_id=?)");
-        expect(query.sql).not.toContain("typed_telemetry_owner_occurrence");
+        if (directOccurrence) {
+          const direct = typedSeeks.filter(row => row.detail.includes("typed_telemetry_owner_occurrence"));
+          expect(direct).toHaveLength(2);
+          expect(direct.every(row => row.detail.includes("owner_id=? AND occurrence_id=? AND format=? AND stream=?"))).toBe(true);
+          expect(plan.some(row => /scoped_device|scoped_manifest/.test(row.detail))).toBe(false);
+        } else {
+          expect(typedSeeks.find(row => row.detail.includes("typed_telemetry_v1_occurrence"))?.detail)
+            .toContain("device_id=? AND stream=? AND occurrence_id=?");
+          expect(typedSeeks.find(row => row.detail.includes("typed_telemetry_v11_occurrence"))?.detail)
+            .toContain("manifest_id=? AND stream=? AND occurrence_id=?");
+          expect(plan.find(row => row.detail.includes("scoped_device"))?.detail)
+            .toContain("USING COVERING INDEX typed_telemetry_device_owner (owner_id=?)");
+          expect(plan.find(row => row.detail.includes("scoped_manifest"))?.detail)
+            .toContain("USING COVERING INDEX typed_telemetry_manifest_owner (owner_id=?)");
+          expect(query.sql).not.toContain("typed_telemetry_owner_occurrence");
+        }
       }
     }
   });
 
-  it("refuses the occurrence lookup before its additive index migration and succeeds after it", async () => {
+  it("refuses the legacy occurrence lookup before its metadata index migration and succeeds after it", async () => {
+    if (directOccurrence) await db().prepare("DROP INDEX typed_telemetry_owner_occurrence").run();
     const selectedDay = day();
     const before = await effectiveHistoryDependency(db(), emptyDependencyOwner, namespace, selectedDay, selectedDay);
     for (const index of ["typed_telemetry_device_owner", "typed_telemetry_manifest_owner"]) {
@@ -1312,6 +1330,37 @@ describe("bounded shared effective day dependencies", () => {
     // occurrences times owned manifests; this is not a time-bound shortcut.
     await annotate(JSON.stringify({ ownedManifests: 166, selectedMatches: 200,
       admittedRecords: 564, costs }), "effective-occurrence-owned-manifest-fanout-cost");
+    if (directOccurrence) {
+      const report=[];
+      for (const mode of ["singleton", "batched"] as const) {
+        const measure=async(source:D1Database)=>{
+          const profile=createAnalyticsProfile();
+          const observed=profileAnalyticsDatabase(source,"source",profile,()=>"dependency");
+          const started=performance.now();
+          const digests=[];
+          if(mode==="singleton") digests.push(await sha256Hex(canonicalJson(
+            await effectiveHistoryDependency(observed,owner,namespace,selectedDay,selectedDay))));
+          else {
+            const reader=await createEffectiveHistoryDayDependencyReader(observed,owner,namespace,
+              days.slice(0,16),{occurrenceLinks:"batched"});
+            expect(reader).toBeDefined();
+            for(const targetDay of days.slice(0,16))digests.push(await reader!.readDigest(targetDay));
+          }
+          const values=Object.values(profile.costs);
+          return {digests,statements:values.reduce((sum,value)=>sum+value.statements,0),
+            rowsRead:values.reduce((sum,value)=>sum+value.rowsRead,0),
+            databaseMs:values.reduce((sum,value)=>sum+value.databaseMs,0),wallMs:performance.now()-started};
+        };
+        const before=await measure(withoutDirectOccurrenceLookup()),after=await measure(db());
+        expect(after.digests).toEqual(before.digests);
+        expect(after.statements).toBe(before.statements);
+        expect(after.rowsRead).toBeLessThan(before.rowsRead/10);
+        const {digests:oldDigests,...beforeCosts}=before,{digests:newDigests,...afterCosts}=after;
+        report.push({mode,outputs:newDigests.length,before:beforeCosts,after:afterCosts});
+      }
+      await annotate(JSON.stringify(report),"direct-occurrence-complete-phase-cost");
+      console.log("direct-occurrence-complete-phase-cost",JSON.stringify(report));
+    }
   }, 120_000);
 
   it("matches exact singleton digests across v1, v1.1, v1.2, sessions, corrections, and selected-day links", async () => {
@@ -1517,6 +1566,14 @@ function preCatalogSource() {
       ? rows.filter(row => !names.includes(row.name as string)) : rows;
   } }).database;
 }
+/** Only hide optional index discovery. The legacy SQL remains forced to its
+ * original metadata/format indexes over exactly the same retained records. */
+function withoutDirectOccurrenceLookup() {
+  return observeDependencyQueries(db(), { rows(query, rows) {
+    return query.sql.startsWith("SELECT name,type FROM sqlite_master")
+      ? rows.filter(row => row.name !== "typed_telemetry_owner_occurrence") : rows;
+  } }).database;
+}
 async function measuredDependency(source: D1Database, owner: StorageCommunityOwner,
   fromDay: string, throughDay: string, includeSessions = true) {
   const profile = createAnalyticsProfile();
@@ -1528,6 +1585,109 @@ async function measuredDependency(source: D1Database, owner: StorageCommunityOwn
     rowsRead:costs.reduce((sum,cost)=>sum+cost.rowsRead,0),
     databaseMs:costs.reduce((sum,cost)=>sum+cost.databaseMs,0),wallMs:performance.now()-started};
 }
+
+describe("maintained direct occurrence index", () => {
+  it("reduces complete positive 101-day reads at least tenfold over 166 populated manifests", async ({annotate}) => {
+    const days=Array.from({length:166},(_,index)=>new Date(Date.parse(day())-(165-index)*86_400_000).toISOString().slice(0,10));
+    const selectedDay=days[65]!,outsideDay=days[0]!,throughDay=days.at(-1)!;
+    const fixture=await createV11DeviceFixture(db(),{grant:true});
+    const ids=Array.from({length:2_000},(_,index)=>`synthetic:direct-dense-window:${index}`);
+    const candidates=[await stage(fixture,await makeV11Day(selectedDay,{
+      usage:ids.map(eventId=>v11UsageRecord(selectedDay,"a",{eventId})),
+    })),await stage(fixture,await makeV11Day(outsideDay,{
+      quota:ids.map(observationId=>({schemaVersion:"quota-observation-v1.1",observationId,
+        observedTime:`${outsideDay}T12:05:00.000Z`,provider:"openai_codex",planType:"pro",
+        planVariant:"unknown",limitId:"codex",slot:"seven_day",usedPercent:20,windowDurationMinutes:10_080,
+        resetsAt:null,accountPlanAttribution:{accountBasis:"unavailable",accountTrackId:null,
+          planBasis:"same_source_occurrence",planType:"pro",planEraId:null}})),
+    }))];
+    for(const retainedDay of days.filter(value=>value!==selectedDay&&value!==outsideDay))
+      candidates.push(await stage(fixture,await makeV11Day(retainedDay,{
+        usage:[v11UsageRecord(retainedDay,"b",{eventId:`synthetic:direct-unrelated:${retainedDay}`})],
+      })));
+    await activate(fixture,candidates);
+    const owner=(await readStorageCommunityOwnerPage(db())).find(value=>value.participantId===fixture.participantId)!;
+    const before=[];
+    for(const sessions of [false,true])before.push(await measuredDependency(db(),owner,selectedDay,throughDay,sessions));
+    const count=await db().prepare("SELECT count(*) AS n FROM typed_telemetry_records").all<{n:number}>();
+    expect(count.results[0]!.n).toBe(4_164);
+    const migration=b.TEST_TYPED_INGESTION_MIGRATIONS.find(value=>value.name==="0006_direct_owner_occurrence.sql")!;
+    const started=performance.now();
+    const applied=await db().batch(migration.queries.map(sql=>db().prepare(sql)));
+    const buildMs=performance.now()-started;
+    const report=[];
+    for(const [index,sessions]of [false,true].entries()){
+      const after=await measuredDependency(db(),owner,selectedDay,throughDay,sessions);
+      expect(canonicalJson(after.dependency)).toBe(canonicalJson(before[index]!.dependency));
+      expect(after.dependency.occurrenceLinks).toHaveLength(10);
+      expect(after.dependency.occurrenceLinks.every(row=>row.family==="v11"&&row.source_day===outsideDay)).toBe(true);
+      expect(after.statements).toBe(7);
+      expect(before[index]!.statements).toBe(7);
+      expect(after.rowsRead).toBeLessThan(before[index]!.rowsRead/10);
+      const costs=(value:typeof after)=>({statements:value.statements,rowsRead:value.rowsRead,databaseMs:value.databaseMs,wallMs:value.wallMs});
+      report.push({includeSessions:sessions,before:costs(before[index]!),after:costs(after)});
+    }
+    const measurement={windowDays:101,ownedManifests:166,selectedMatches:2_000,admittedRecords:4_164,
+      index:{buildMs,rowsRead:applied[0]!.meta.rows_read,rowsWritten:applied[0]!.meta.rows_written,
+        allocatedBytes:applied[0]!.meta.size_after-count.meta.size_after},phases:report};
+    await annotate(JSON.stringify(measurement),"direct-occurrence-positive-range-cost");
+    console.log("direct-occurrence-positive-range-cost",JSON.stringify(measurement));
+  },120_000);
+
+  it("builds over populated input, preserves bytes, follows replacement and removes erased records", async ({annotate}) => {
+    const selectedDay=day(),outsideDay=dayAfter(selectedDay);
+    const fixture=await createV11DeviceFixture(db());
+    const otherDevice=await createV11DeviceFixture(db(),{participantId:fixture.participantId});
+    const occurrence="synthetic:direct-migration:chosen";
+    await insertV1HistoryDay(fixture,selectedDay,1,null,occurrence);
+    await insertV1HistoryDay(otherDevice,outsideDay,1,null,[occurrence,"synthetic:direct-migration:other"]);
+    let owner=(await readStorageCommunityOwnerPage(db())).find(value=>value.participantId===fixture.participantId)!;
+    const before=await measuredDependency(db(),owner,selectedDay,selectedDay);
+    const oldRows=await db().prepare("SELECT count(*) AS n FROM typed_telemetry_records").all<{n:number}>();
+    const migration=b.TEST_TYPED_INGESTION_MIGRATIONS.find(value=>value.name==="0006_direct_owner_occurrence.sql")!;
+    expect(migration.queries).toHaveLength(1);
+    const started=performance.now();
+    const applied=await db().batch(migration.queries.map(sql=>db().prepare(sql)));
+    const indexBuildMs=performance.now()-started;
+    expect((await db().prepare("PRAGMA index_info(typed_telemetry_owner_occurrence)").all<{name:string}>())
+      .results.map(row=>row.name)).toEqual(["owner_id","occurrence_id","format","stream","observed_day"]);
+    const after=await measuredDependency(db(),owner,selectedDay,selectedDay);
+    expect(canonicalJson(after.dependency)).toBe(canonicalJson(before.dependency));
+    expect(after.statements).toBe(7);
+    expect(after.dependency.occurrenceLinks).toHaveLength(1);
+    const budget=createD1InvocationBudget(7);
+    expect(await effectiveHistoryDependency(budget.wrap(db()),owner,namespace,selectedDay,selectedDay,{includeSessions:true})).toEqual(after.dependency);
+    expect(budget.queriesUsed).toBe(7);
+    await db().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+    const previous=await currentTelemetryV1Chunk(db(),fixture.participantId,fixture.deviceId,"usage",selectedDay,0);
+    await insertV1HistoryDay(fixture,selectedDay,2,previous,occurrence);
+    owner=(await readStorageCommunityOwnerPage(db())).find(value=>value.participantId===fixture.participantId)!;
+    const replacement=await effectiveHistoryDependency(db(),owner,namespace,selectedDay,selectedDay);
+    expect(replacement).toEqual(await effectiveHistoryDependency(withoutDirectOccurrenceLookup(),owner,namespace,selectedDay,selectedDay));
+    expect(replacement.corrections).toHaveLength(1);
+    // Erasure remains the native guarded lifecycle. This local fixture exercises
+    // the participant cascade rather than creating an index-only cleanup path.
+    await db().prepare("DELETE FROM participants WHERE id=?").bind(fixture.participantId).run();
+    expect(await db().prepare("SELECT count(*) AS n FROM typed_telemetry_records INDEXED BY typed_telemetry_owner_occurrence")
+      .first<number>("n")).toBe(0);
+    expect((await db().prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='typed_telemetry_owner_occurrence'").all()).results).toHaveLength(1);
+    const report={populatedRecords:oldRows.results[0]!.n,indexBuildMs,indexRowsRead:applied[0]!.meta.rows_read,
+      indexRowsWritten:applied[0]!.meta.rows_written,allocatedBytes:applied[0]!.meta.size_after-oldRows.meta.size_after};
+    await annotate(JSON.stringify(report),"direct-occurrence-index-build-cost");
+    console.log("direct-occurrence-index-build-cost",JSON.stringify(report));
+  });
+
+  it("falls back to exact metadata lookup when the optional index is absent or hidden", async () => {
+    const selectedDay=day();
+    const baseline=await effectiveHistoryDependency(db(),emptyDependencyOwner,namespace,selectedDay,selectedDay);
+    await enableDirectOccurrenceLookup();
+    const after=await effectiveHistoryDependency(db(),emptyDependencyOwner,namespace,selectedDay,selectedDay);
+    expect(after).toEqual(baseline);
+    expect(after).toEqual(await effectiveHistoryDependency(withoutDirectOccurrenceLookup(),emptyDependencyOwner,namespace,selectedDay,selectedDay));
+    await db().prepare("DROP INDEX typed_telemetry_owner_occurrence").run();
+    expect(await effectiveHistoryDependency(db(),emptyDependencyOwner,namespace,selectedDay,selectedDay)).toEqual(baseline);
+  });
+});
 
 describe("maintained effective source-day catalog", () => {
   it("backfills populated v1, v1.1, v1.2 and correction days with exact bytes and fewer reads", async ({annotate}) => {
@@ -1755,7 +1915,8 @@ async function retainedDailyFingerprint(selectedDay: string): Promise<string | n
     WHERE source_id=? AND day=?`).bind(namespace, selectedDay).first<string>("fingerprint");
 }
 
-describe("effective quota preparation source fences", () => {
+describe.each([false, true])("effective quota preparation source fences (direct=%s)", directOccurrence => {
+  beforeEach(async () => { if (directOccurrence) await enableDirectOccurrenceLookup(); });
   it("skips exact cached days in an incomplete window without decoding or preparing them again", async () => {
     const fixture = await quotaCacheFixture();
     fixture.observed.clear();

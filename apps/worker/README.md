@@ -241,12 +241,34 @@ and is removed with participant erasure.
 The effective dependency reader uses two indexed outside-range seeks inside
 its existing occurrence-link statement. When no outside source day exists,
 it skips selected-occurrence acquisition and retains the exact v3 identity.
-Positive lookups and multi-target batches retain the existing exact scan.
+Positive lookups and multi-target batches retain exact occurrence expansion.
+The optional direct occurrence index described below changes its acquisition.
 The statement count, correction runtime fence, source authority checks and
 publication requirements are unchanged. Before this optional migration, the
 original reader remains available; a partially present catalog or missing
 backfill seal cannot authorize the shortcut. Deployment and remote migration
 are separate operations.
+
+### Optional direct occurrence lookup
+
+Typed-ingestion migration `0006_direct_owner_occurrence.sql` adds one non-unique
+index on raw owner, exact encoded occurrence ID, format, stream and observed day.
+The dependency reader discovers it in the existing schema statement and seeks
+matching v1/v1.1 variants directly, instead of multiplying selected occurrences
+by every owned device or manifest. Namespace, admission, retained-source,
+complete-chunk, correction and outside-day checks remain in the exact query.
+v1.2 and correction expansion keep their existing native indexes. Dependency
+v3 bytes, query budgets and publication gates are unchanged.
+
+The index is maintained by SQLite in the admission/replacement transaction and
+removed entries follow native erasure. It copies no payload, creates no cache or
+new work queue, and does not select authority. Without this optional migration,
+the metadata/format-index lookup remains available. It can be deployed without
+the source-day catalog; each migration and deployment is a separate operation.
+Building the index scans existing typed records, adds storage and adds an index
+write per future typed record. Measure those costs and qualify the guarded
+forward operation before production migration; local savings are not evidence
+of production throughput.
 
 Self-service `DELETE /api/v1/me` is retired: the unknown API response is
 `404 NOT_FOUND`, without D1 access or participant mutation. `GET /api/v1/me`,

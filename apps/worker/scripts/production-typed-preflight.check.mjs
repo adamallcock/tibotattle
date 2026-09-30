@@ -259,12 +259,12 @@ test('canonical expected schemas are generated from local migration inputs only'
   for (const role of ['primary', 'analytics', 'ledger']) {
     assert.ok(/^[a-f0-9]{64}$/.test(generated.expectedSchemas[role].schemaSha256));
     assert.ok(generated.expectedSchemas[role].requiredObjects.length > 0);
-    assert.equal(generated.migrationCounts[role], TYPED_SCHEMA_INPUT_DIRECTORIES[role].reduce((count, directory) => count + (directory === 'migrations' ? 62 : directory === 'typed-ingestion-migrations' ? 5 : directory === 'ingestion-bridge-migrations' ? 2 : directory === 'typed-v11-admission-migrations' ? 6 : directory === 'typed-v1-admission-migrations' ? 3 : directory === 'ingestion-isolation-migrations' ? 13 : directory === 'analytics-migrations' ? 32 : 3), 0));
+    assert.equal(generated.migrationCounts[role], TYPED_SCHEMA_INPUT_DIRECTORIES[role].reduce((count, directory) => count + (directory === 'migrations' ? 62 : directory === 'typed-ingestion-migrations' ? 6 : directory === 'ingestion-bridge-migrations' ? 2 : directory === 'typed-v11-admission-migrations' ? 6 : directory === 'typed-v1-admission-migrations' ? 3 : directory === 'ingestion-isolation-migrations' ? 13 : directory === 'analytics-migrations' ? 32 : 3), 0));
   }
   for (const name of ['typed_telemetry_device_owner', 'typed_telemetry_manifest_owner']) {
     assert.ok(generated.expectedSchemas.primary.requiredObjects.some(object => object.type === 'index' && object.name === name));
   }
-  assert.equal(generated.expectedSchemas.primary.requiredObjects.some(object => object.name === 'typed_telemetry_owner_occurrence'), false);
+  assert.ok(generated.expectedSchemas.primary.requiredObjects.some(object => object.type === 'index' && object.name === 'typed_telemetry_owner_occurrence'));
   for (const name of ['storage_effective_source_days', 'storage_effective_source_days_runtime']) {
     assert.ok(generated.expectedSchemas.primary.requiredObjects.some(object => object.type === 'table' && object.name === name));
   }

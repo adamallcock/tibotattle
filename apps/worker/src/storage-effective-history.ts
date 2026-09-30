@@ -24,6 +24,7 @@ const DAY_MS = 86_400_000;
 const MAX_EFFECTIVE_DEPENDENCY_ROWS = 30_000;
 const MAX_EFFECTIVE_DEPENDENCY_BYTES = 4 * 1024 * 1024;
 const EFFECTIVE_DEPENDENCY_BATCH_DAYS = 16;
+const EFFECTIVE_OWNER_OCCURRENCE_INDEX = 'typed_telemetry_owner_occurrence';
 const V12_DEPENDENCY_TABLES = [
   'telemetry_v12_runtime', 'telemetry_v12_device_capabilities',
   'accountless_v12_device_authorizations', 'telemetry_v12_day_manifests',
@@ -151,20 +152,22 @@ function dependencyRows(rows:readonly Record<string, unknown>[]):readonly Record
   return Object.freeze(copy);
 }
 function bytes(value:string):number { return new TextEncoder().encode(value).byteLength; }
-async function dependencySchemas(source:D1Database):Promise<{v12Available:boolean;dayCatalogAvailable:boolean}>{
+async function dependencySchemas(source:D1Database):Promise<{v12Available:boolean;dayCatalogAvailable:boolean;directOccurrenceAvailable:boolean}>{
   const tables=[...V12_DEPENDENCY_TABLES,...EFFECTIVE_DAY_CATALOG_TABLES];
   const rows=(await source.prepare(`SELECT name,type FROM sqlite_master
     WHERE (type='table' AND name IN (${tables.map(()=>'?').join(',')}))
        OR (type='view' AND name='telemetry_v12_active_authorizations')
-       OR (type='trigger' AND name IN (${EFFECTIVE_DAY_CATALOG_TRIGGERS.map(()=>'?').join(',')}))`)
-    .bind(...tables,...EFFECTIVE_DAY_CATALOG_TRIGGERS).all<{name:string;type:string}>()).results;
+       OR (type='trigger' AND name IN (${EFFECTIVE_DAY_CATALOG_TRIGGERS.map(()=>'?').join(',')}))
+       OR (type='index' AND name=?)`)
+    .bind(...tables,...EFFECTIVE_DAY_CATALOG_TRIGGERS,EFFECTIVE_OWNER_OCCURRENCE_INDEX).all<{name:string;type:string}>()).results;
   const dayCatalogAvailable=effectiveDayCatalogAvailable(rows);
+  const directOccurrenceAvailable=rows.some(row=>row.type==='index'&&row.name===EFFECTIVE_OWNER_OCCURRENCE_INDEX);
   const v12Rows=rows.filter(row=>(row.type==='table'&&(V12_DEPENDENCY_TABLES as readonly string[]).includes(row.name))
     ||(row.type==='view'&&row.name==='telemetry_v12_active_authorizations'));
-  if(v12Rows.length===0)return {v12Available:false,dayCatalogAvailable};
+  if(v12Rows.length===0)return {v12Available:false,dayCatalogAvailable,directOccurrenceAvailable};
   if(v12Rows.length!==V12_DEPENDENCY_TABLES.length+1
     ||!v12Rows.some(row=>row.type==='view'&&row.name==='telemetry_v12_active_authorizations'))throw fail();
-  return {v12Available:true,dayCatalogAvailable};
+  return {v12Available:true,dayCatalogAvailable,directOccurrenceAvailable};
 }
 
 /** Return bounded immutable header identities for retained variants of
@@ -174,14 +177,15 @@ async function dependencySchemas(source:D1Database):Promise<{v12Available:boolea
  * expansion without storing one dependency row per in-window record. */
 async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCommunityOwner,
   sourceNamespace:string,fromDay:string,throughDay:string,includeV12:boolean,includeSessions:boolean,
-  selectedDays?:readonly string[],dayCatalogAvailable=false):Promise<{
+  selectedDays?:readonly string[],dayCatalogAvailable=false,directOccurrenceAvailable=false):Promise<{
     rows:readonly Record<string,unknown>[];correctionRuntime:EffectiveHistoryDependency['correctionRuntime'];
   }|undefined> {
   const batched=selectedDays!==undefined;
   const useDayCatalog=dayCatalogAvailable&&!batched;
   // A day inside a multi-day batch is still outside another target day.
   // Preserve the original per-target expansion for batches and for every
-  // positive (including conservative) catalog lookup.
+  // positive (including conservative) catalog lookup. The optional direct
+  // occurrence index changes acquisition only, never dependency identity.
   // Correction history stores raw digest bytes. Keep the text scope for the
   // admission joins, and bind its exact BLOB once for indexed occurrence seeks.
   const ownerDigest=owner.ownerDigest;
@@ -393,11 +397,12 @@ ${selectedV12}    ), /* Count completeness only for selected-day chunks and dist
         CROSS JOIN typed_v1_owner_memberships scoped_owner
           ON scoped_owner.participant_id=s.participant_id
         CROSS JOIN selected wanted
-        CROSS JOIN typed_telemetry_devices scoped_device INDEXED BY typed_telemetry_device_owner
+        ${directOccurrenceAvailable?`CROSS JOIN typed_telemetry_records scoped_record INDEXED BY ${EFFECTIVE_OWNER_OCCURRENCE_INDEX}
+          ON scoped_record.owner_id=scoped_owner.typed_owner_id`: `CROSS JOIN typed_telemetry_devices scoped_device INDEXED BY typed_telemetry_device_owner
           ON scoped_device.owner_id=scoped_owner.typed_owner_id
         CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_v1_occurrence
           ON scoped_record.device_id=scoped_device.id
-          AND scoped_record.owner_id=scoped_owner.typed_owner_id AND scoped_record.format=10
+          AND scoped_record.owner_id=scoped_owner.typed_owner_id`} AND scoped_record.format=10
           AND scoped_record.stream IN ${typedStreams}
           AND scoped_record.occurrence_id=wanted.occurrence_id
           ${physicalOutside} ${selectedOutside}
@@ -424,11 +429,12 @@ ${selectedV12}    ), /* Count completeness only for selected-day chunks and dist
         CROSS JOIN typed_v11_owner_memberships scoped_owner
           ON scoped_owner.participant_id=s.participant_id
         CROSS JOIN selected wanted
-        CROSS JOIN typed_telemetry_manifests scoped_manifest INDEXED BY typed_telemetry_manifest_owner
+        ${directOccurrenceAvailable?`CROSS JOIN typed_telemetry_records scoped_record INDEXED BY ${EFFECTIVE_OWNER_OCCURRENCE_INDEX}
+          ON scoped_record.owner_id=scoped_owner.typed_owner_id`: `CROSS JOIN typed_telemetry_manifests scoped_manifest INDEXED BY typed_telemetry_manifest_owner
           ON scoped_manifest.owner_id=scoped_owner.typed_owner_id
         CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_v11_occurrence
           ON scoped_record.manifest_id=scoped_manifest.id
-          AND scoped_record.owner_id=scoped_owner.typed_owner_id AND scoped_record.format=11
+          AND scoped_record.owner_id=scoped_owner.typed_owner_id`} AND scoped_record.format=11
           AND scoped_record.stream IN ${typedStreams}
           AND scoped_record.occurrence_id=wanted.occurrence_id
           ${physicalOutside} ${selectedOutside}
@@ -562,7 +568,7 @@ function validateDependencyScope(owner:StorageCommunityOwner,sourceNamespace:str
     ||typeof sourceNamespace!=='string'||sourceNamespace.length<1||sourceNamespace.length>256)throw fail();
 }
 type EffectiveHistoryHeaders=Pick<EffectiveHistoryDependency,'correctionRuntime'|'v1'|'v11'|'v12'|'corrections'>;
-interface EffectiveHistoryHeaderSnapshot extends EffectiveHistoryHeaders { v12Available:boolean;dayCatalogAvailable:boolean }
+interface EffectiveHistoryHeaderSnapshot extends EffectiveHistoryHeaders { v12Available:boolean;dayCatalogAvailable:boolean;directOccurrenceAvailable:boolean }
 
 async function readCorrectionRuntime(source:D1Database):Promise<EffectiveHistoryDependency['correctionRuntime']>{
   const result=await source.prepare(`SELECT id,schema_version,method_version,state,
@@ -599,7 +605,7 @@ async function readEffectiveHistoryHeaders(source:D1Database,owner:StorageCommun
     return totalBytes<=MAX_EFFECTIVE_DEPENDENCY_BYTES;
   };
   if(optionalAggregate&&canContinue?.()===false)return undefined;
-  const {v12Available,dayCatalogAvailable}=await dependencySchemas(source);
+  const {v12Available,dayCatalogAvailable,directOccurrenceAvailable}=await dependencySchemas(source);
   if(optionalAggregate&&canContinue?.()===false)return undefined;
   const v1=(await source.prepare(`SELECT c.id,c.device_id,c.stream,c.chunk_day,c.chunk_seq,c.revision,
       c.chunk_digest,c.accepted_record_count
@@ -691,7 +697,7 @@ async function readEffectiveHistoryHeaders(source:D1Database,owner:StorageCommun
   if(!accept(corrections,101))return undefined;
   if(optionalAggregate&&canContinue?.()===false)return undefined;
   const correctionRuntime=await readCorrectionRuntime(source);
-  return {v1,v11,v12,corrections,v12Available,dayCatalogAvailable,correctionRuntime};
+  return {v1,v11,v12,corrections,v12Available,dayCatalogAvailable,directOccurrenceAvailable,correctionRuntime};
 }
 
 function assembleEffectiveHistoryDependency(owner:StorageCommunityOwner,fromDay:string,throughDay:string,
@@ -721,7 +727,7 @@ export async function effectiveHistoryDependency(source:D1Database,owner:Storage
   if(Object.keys(options).some(key=>key!=='includeSessions'))throw fail();
   const headers=await readEffectiveHistoryHeaders(source,owner,sourceNamespace,fromDay,throughDay,includeSessions);
   if(!headers)throw fail();
-  const occurrenceLinks=await effectiveHistoryOccurrenceLinks(source,owner,sourceNamespace,fromDay,throughDay,headers.v12Available,includeSessions,undefined,headers.dayCatalogAvailable);
+  const occurrenceLinks=await effectiveHistoryOccurrenceLinks(source,owner,sourceNamespace,fromDay,throughDay,headers.v12Available,includeSessions,undefined,headers.dayCatalogAvailable,headers.directOccurrenceAvailable);
   if(!occurrenceLinks)throw fail();
   if(occurrenceLinks.correctionRuntime!==headers.correctionRuntime)throw fail();
   return assembleEffectiveHistoryDependency(owner,fromDay,throughDay,includeSessions,headers,occurrenceLinks.rows);
@@ -763,7 +769,7 @@ export async function createEffectiveHistoryDayDependencyReader(source:D1Databas
       selected.get(day)?.[family].push(row);
     }
   }
-  const {v12Available,dayCatalogAvailable}=headers;
+  const {v12Available,dayCatalogAvailable,directOccurrenceAvailable}=headers;
   const selectedDays=[...days];
   const oversizedBlocks=new Set<number>();
   let blockIndex=-1;
@@ -782,7 +788,7 @@ export async function createEffectiveHistoryDayDependencyReader(source:D1Databas
         if(!oversizedBlocks.has(index)){
           const block=selectedDays.slice(index*EFFECTIVE_DEPENDENCY_BATCH_DAYS,(index+1)*EFFECTIVE_DEPENDENCY_BATCH_DAYS);
           const rows=await effectiveHistoryOccurrenceLinks(source,owner,sourceNamespace,
-            block[0]!,block.at(-1)!,v12Available,includeSessions,block);
+            block[0]!,block.at(-1)!,v12Available,includeSessions,block,dayCatalogAvailable,directOccurrenceAvailable);
           if(options.canContinue?.()===false)return undefined;
           if(rows){
             if(rows.correctionRuntime!==headers.correctionRuntime)return undefined;
@@ -808,7 +814,7 @@ export async function createEffectiveHistoryDayDependencyReader(source:D1Databas
     }
     if(!links){
       if(options.canContinue?.()===false)return undefined;
-      const snapshot=await effectiveHistoryOccurrenceLinks(source,owner,sourceNamespace,day,day,v12Available,includeSessions,undefined,dayCatalogAvailable);
+      const snapshot=await effectiveHistoryOccurrenceLinks(source,owner,sourceNamespace,day,day,v12Available,includeSessions,undefined,dayCatalogAvailable,directOccurrenceAvailable);
       if(snapshot?.correctionRuntime!==headers.correctionRuntime)return undefined;
       links=snapshot?.rows;
     }
