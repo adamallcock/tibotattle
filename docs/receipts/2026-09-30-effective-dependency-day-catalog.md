@@ -118,3 +118,59 @@ pending. The historical failed benchmark above is retained as the earlier
 snapshot, not the current acceptance result. No production change occurred.
 
 Approved dependency log SHA-256: `287b7e6ceaed959caf4e4e5f4427dd661fffd03ebe29a83c3f47a6de50eff074`.
+
+## Qualification closure and production hold
+
+Snapshot: 2026-09-30T18:28:19+00:00. Runtime and migration bytes remain identical
+to `26b21fd1`; the source was frozen at `3686c56a` after test-only repairs.
+Changes since the runtime commit are the schema-count fixture and two
+historical-schema fixtures. No source, migration, package or lockfile changed
+while the broad runtime suite ran.
+
+The owning qualification was completed by retaining unchanged passing steps
+and repairing only the failing fixtures:
+
+- Workspace guards, endpoint checks, generated bindings and TypeScript passed
+  in the initial owning run. The schema test's count was corrected to 91
+  primary inputs and now explicitly requires both catalog tables and 12 guards.
+- All script checks passed in the continuation. The full runtime run covered
+  191 files / 2,440 tests: 2,431 passed and nine failed during fixture migration.
+  Those two files intentionally omit correction or v1.2 prerequisites but had
+  unintentionally selected the dependent catalog migration.
+- The two fixtures now omit the catalog only in those historical schema cases.
+  Every assertion is retained. Both complete files passed all 26 tests, covering
+  the nine failures and their 17 previously passing cases. There was no new
+  single all-green full-suite run; this is combined broad and focused evidence.
+- Final default and staging dry builds passed on the clean frozen source.
+  The earlier explicit production dry build retains unchanged runtime-code
+  evidence. No resources, assets or schedules were published.
+
+A version/binding-fenced read-only live check sampled the eligible source with
+the largest retained header volume in a 101-day usage/quota window. It returned
+outside-day v1.1 and v1.2 candidates; v1 and correction candidates were absent.
+The owner/source revisions and deployed Worker version remained unchanged
+across the read. The negative shortcut is **ineligible for that sampled scope**.
+This one sample does not estimate coverage for other sources or dates.
+
+The catalog is therefore retained as a qualified local component. The approved
+10-times minimum applies to its eligible dense local benchmark, not a measured
+production speedup. A production rollout is held while the positive-range path
+is investigated. The next bounded comparison should avoid manifest/device
+fanout when seeking exact encoded occurrence IDs, retain all native admission,
+namespace, correction and outside-header proofs, and measure complete phase
+rows/time plus any new index/storage cost.
+
+The local migration review package is non-executable. It contains the exact
+19-statement catalog migration and its atomic 20-result ledger envelope, plus
+all-role before/after schema evidence. The existing closed forward operator
+does not admit this new file. Fresh production fences, a guarded execution
+operator and post-migration rollback qualification remain pending.
+
+| Additional private evidence | SHA-256 |
+|---|---|
+| tibotattle-dependency-catalog-owning-gate-26b21fd1-20260930.log | `3bf909dd44c99f7cedd61e3be1595463f4ef9b103bfb529f5b178436059a445f` |
+| tibotattle-dependency-catalog-owning-continuation-20260930.log | `d074209bb0931a39f64ae9b49ab24939ec47f9a78eabdd35d715a80b05924f73` |
+| tibotattle-dependency-catalog-preflight-fixture-20260930.log | `2638cc83ca8ad8ce8f2b6f322081958b44b7ad8a651a975d57f3ba56a2e4b8ee` |
+| tibotattle-dependency-catalog-historical-fixtures-20260930.log | `fc000e8b673bc234ad580fc9ecd4b9ee17b6fb6cf38e8affe3e3af4cb71d14c0` |
+| tibotattle-dependency-catalog-final-builds-20260930.log | `593407f8501b2d56828f61239663a3a204ee9bcd09c73d94bbede86cb2fd8a3e` |
+| tibotattle-dependency-catalog-live-eligibility-20260930.jsonl | `cbd3fed67a6092f410cc354faffe5278abeafbff23f8295e67b7c1dba90560d5` |
