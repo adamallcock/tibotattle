@@ -1287,7 +1287,7 @@ export function createLocalCollectorRefreshRunner({
             sourceMode: accountingSourceMode,
             ...(accountingSourceMode === "unified"
               ? {
-                contextBehavior: "legacy_zero",
+                contextBehavior: "source_native",
                 expectedGeneration: unifiedIndex.generation,
               }
               : {}),
@@ -1357,7 +1357,7 @@ export function createLocalCollectorRefreshRunner({
               ? { expectedGeneration: unifiedIndex.generation }
               : {}),
             ...(accountingSourceMode === "unified"
-              ? { contextBehavior: "legacy_zero" }
+              ? { contextBehavior: "source_native" }
               : {}),
             declaredSpeedBaselines,
             signal,
@@ -1406,7 +1406,7 @@ export function createLocalCollectorRefreshRunner({
                 sourceMode: accountingSourceMode,
                 ...(accountingSourceMode === "unified"
                   ? {
-                    contextBehavior: "legacy_zero",
+                    contextBehavior: "source_native",
                     expectedGeneration: unifiedIndex.generation,
                   }
                   : {}),
@@ -1536,7 +1536,7 @@ export function createLocalCollectorRefreshRunner({
               errorCode: safeAccountingUnavailableCode(
                 accountingUnavailableCode,
               ),
-              compatibilityBehavior: "legacy_zero",
+              compatibilityBehavior: "source_native",
               coverageStatus: unifiedIndex?.generation?.status ?? "unavailable",
               generation: unifiedIndex?.generation?.id ?? null,
               generationFingerprint:
@@ -1700,7 +1700,7 @@ function publicRefreshResult(result, now = Date.now()) {
           ? "accounting_unified_source_unavailable"
           : result.accounting.errorCode,
       ),
-      compatibilityBehavior: "legacy_zero",
+      compatibilityBehavior: "source_native",
       coverageStatus: ["complete", "partial"].includes(
         result.accounting.coverageStatus,
       ) ? result.accounting.coverageStatus : "unavailable",

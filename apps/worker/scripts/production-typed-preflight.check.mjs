@@ -259,8 +259,15 @@ test('canonical expected schemas are generated from local migration inputs only'
   for (const role of ['primary', 'analytics', 'ledger']) {
     assert.ok(/^[a-f0-9]{64}$/.test(generated.expectedSchemas[role].schemaSha256));
     assert.ok(generated.expectedSchemas[role].requiredObjects.length > 0);
-    assert.equal(generated.migrationCounts[role], TYPED_SCHEMA_INPUT_DIRECTORIES[role].reduce((count, directory) => count + (directory === 'migrations' ? 62 : directory === 'typed-ingestion-migrations' ? 4 : directory === 'ingestion-bridge-migrations' ? 2 : directory === 'typed-v11-admission-migrations' ? 6 : directory === 'typed-v1-admission-migrations' ? 3 : directory === 'ingestion-isolation-migrations' ? 12 : directory === 'analytics-migrations' ? 29 : 3), 0));
+    assert.equal(generated.migrationCounts[role], TYPED_SCHEMA_INPUT_DIRECTORIES[role].reduce((count, directory) => count + (directory === 'migrations' ? 62 : directory === 'typed-ingestion-migrations' ? 4 : directory === 'ingestion-bridge-migrations' ? 2 : directory === 'typed-v11-admission-migrations' ? 6 : directory === 'typed-v1-admission-migrations' ? 3 : directory === 'ingestion-isolation-migrations' ? 13 : directory === 'analytics-migrations' ? 29 : 3), 0));
   }
+  for (const name of ['telemetry_performance_cohort_dictionary_insert', 'telemetry_performance_cohort_dictionary_update']) {
+    assert.deepEqual(generated.expectedSchemas.primary.requiredObjects.find(object => object.name === name), {
+      type: 'trigger', name, tbl_name: 'telemetry_performance_cohorts',
+    });
+  }
+  assert.equal(generated.expectedSchemas.primary.requiredObjects.some(object => object.name.startsWith('performance_upgrade_')
+    || object.name === 'telemetry_performance_upgrade_guard'), false);
   assert.equal(generated.expectedSchemas.primary.optionalObjects.length, 17);
   assert.equal(generated.expectedSchemas.primary.restoredSchemaSha256.length, 3);
   assert.deepEqual(validateTypedProductionConfiguration({ roles, expectedSchemas: generated.expectedSchemas, config }), { ok: true, code: null });

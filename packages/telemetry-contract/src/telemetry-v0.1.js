@@ -198,12 +198,14 @@ function validateUsage(value) {
     || !isTelemetryMember(value.speedMode, [
       "standard",
       "fast",
+      "ultrafast",
       "unknown",
       "other",
     ])
     || !isTelemetryMember(value.apiServiceTier, [
       "standard",
       "priority",
+      "ultrafast",
       "flex",
       "batch",
       "unknown",

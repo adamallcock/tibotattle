@@ -18,6 +18,7 @@ export const TELEMETRY_PLAN_TYPES: readonly [
   "plus",
   "pro",
   "prolite",
+  "promax",
   "team",
   "self_serve_business_prolite",
   "self_serve_business_usage_based",
@@ -101,6 +102,12 @@ export const TELEMETRY_MODEL_IDS: readonly [
   "o4-mini",
   "gpt-6-sol",
   "gpt-6-luna",
+  "gpt-6.1-astra",
+  "claude-fable-5-1",
+  "claude-mythos-5-1",
+  "claude-opus-5",
+  "claude-opus-5-5",
+  "gpt-6.1-sol",
 ];
 export type TelemetryModelId = typeof TELEMETRY_MODEL_IDS[number];
 
@@ -112,7 +119,7 @@ export interface ReviewedModelIdentity {
   readonly pricingStatus: "published" | "assumed_alias" | "unpriced";
   readonly priceModelId: Exclude<TelemetryModelId, "unknown"> | null;
 }
-export const REVIEWED_MODEL_CATALOG_VERSION: "reviewed-model-catalog-2026-09-22.1";
+export const REVIEWED_MODEL_CATALOG_VERSION: "reviewed-model-catalog-2026-09-29.1";
 export const REVIEWED_MODEL_CATALOG: readonly ReviewedModelIdentity[];
 export const REVIEWED_CODEX_MODEL_IDS: readonly Exclude<TelemetryModelId, "unknown">[];
 export const REVIEWED_CLAUDE_MODEL_IDS: readonly Exclude<TelemetryModelId, "unknown">[];
@@ -227,10 +234,11 @@ export interface TelemetryUsageEvent {
     | "openai_api"
     | "claude_subscription"
     | "unknown";
-  speedMode: "standard" | "fast" | "unknown" | "other";
+  speedMode: "standard" | "fast" | "ultrafast" | "unknown" | "other";
   apiServiceTier:
     | "standard"
     | "priority"
+    | "ultrafast"
     | "flex"
     | "batch"
     | "unknown"
@@ -720,7 +728,7 @@ export function telemetryV12DomainManifestDigestInput(value: TelemetryV12DomainM
 export const PERFORMANCE_RECORD_SCHEMA_VERSION: "model-performance-daily-v1";
 export const PERFORMANCE_MEASUREMENT_VERSION: "model-performance-samples-v1";
 export const PERFORMANCE_BUCKET_SCHEME_VERSION: "performance-histogram-v1";
-export const PERFORMANCE_FIELD_DICTIONARY_VERSION: "telemetry-performance-registry-2026-09-21.1";
+export const PERFORMANCE_FIELD_DICTIONARY_VERSION: "telemetry-performance-registry-2026-09-29.1";
 export const PERFORMANCE_PRIVACY_CONTRACT_VERSION: "privacy-safe-model-performance-v1";
 export const PERFORMANCE_CONTRACT_STATE: "staged";
 export const PERFORMANCE_HISTOGRAM_SCHEMA_VERSION: "performance-histogram-v1";
@@ -731,15 +739,30 @@ export const MAX_PERFORMANCE_SPEED_CENTI_TOKENS_PER_SECOND: 9007199254740991;
 export const MAX_PERFORMANCE_TURN_DURATION_MILLISECONDS: 9007199254740991;
 export const MAX_PERFORMANCE_TTFT_MILLISECONDS: 9007199254740991;
 export const PERFORMANCE_API_SERVICE_TIERS: readonly [
-  "standard", "priority", "flex", "batch", "unknown", "other", "mixed"
+  "standard",
+  "priority",
+  "flex",
+  "batch",
+  "unknown",
+  "other",
+  "mixed",
+  "ultrafast",
 ];
 export const PERFORMANCE_SPEED_METHODS: readonly ["receipt", "legacy", "tool_free", "unavailable"];
 export const PERFORMANCE_SPEED_MODE_SOURCES: readonly [
-  "rollout_thread_settings", "turn_context_service_tier", "lineage_inherited",
-  "unobserved", "mixed"
+  "rollout_thread_settings",
+  "turn_context_service_tier",
+  "lineage_inherited",
+  "unobserved",
+  "mixed",
 ];
 export const PERFORMANCE_SPEED_MODES: readonly [
-  "fast", "standard", "unknown", "other", "mixed"
+  "fast",
+  "standard",
+  "unknown",
+  "other",
+  "mixed",
+  "ultrafast",
 ];
 export const PERFORMANCE_REASONING_EFFORTS: readonly [
   "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "unknown"

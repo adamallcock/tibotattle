@@ -461,7 +461,7 @@ function normalizeClaudeTranscriptUsageCandidate(secret, candidate) {
   if (candidate.candidateVersion !== "claude-transcript-usage-candidate-v0.2"
       || candidate.provider !== "anthropic_claude_code"
       || candidate.billingSurface !== "claude_subscription"
-      || !["standard", "fast", "unknown", "other"].includes(candidate.speedMode)
+      || !["standard", "fast", "ultrafast", "unknown", "other"].includes(candidate.speedMode)
       || !["subagent", "local_interactive_unclassified"].includes(candidate.surface)
       || !["root", "subagent"].includes(candidate.agentScope)
       || !["standalone", "parent_linked"].includes(candidate.lineageDisposition)

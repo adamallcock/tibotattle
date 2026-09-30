@@ -286,6 +286,26 @@ export function parseTelemetryPerformanceSyncState(value) {
   return normalizedState(value);
 }
 
+/**
+ * Rearm transport failures only after the composition root renews the
+ * applicable authorization. This preserves acknowledged progress; the next
+ * sync must still validate the hosted capability before preparing any data.
+ * An opt-out, disconnect or invalid report is not an authorization failure.
+ */
+export function resumeTelemetryPerformanceSyncAfterAuthorization(value) {
+  const state = normalizedState(value);
+  if (!state.paused || !["authorization_rejected", "response_invalid"].includes(state.pausedReason)) {
+    return state;
+  }
+  return freeze({
+    ...state,
+    paused: false,
+    pausedReason: null,
+    retryCount: 0,
+    nextAttemptAt: null,
+  });
+}
+
 function capability(value, nowEpoch) {
   if (!exact(value, CAPABILITY_KEYS)
       || value.schemaVersion !== TELEMETRY_PERFORMANCE_CAPABILITIES_VERSION

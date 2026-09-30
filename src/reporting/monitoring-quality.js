@@ -110,7 +110,7 @@ export function classifyMonitoringInterval(row, {
   const eventCount = row.marginalUsageEventCount ?? 0;
   const quotaDelta = (row.nextUsedPercent ?? 0) - (row.priorUsedPercent ?? 0);
   const speed = row.tierUsageEventCounts ?? {};
-  const knownSpeedEvents = (speed.standard ?? 0) + (speed.fast ?? 0);
+  const knownSpeedEvents = (speed.standard ?? 0) + (speed.fast ?? 0) + (speed.ultrafast ?? 0);
   const unknownSpeedEvents = speed.unknown ?? 0;
   const totalSpeedEvents = knownSpeedEvents + unknownSpeedEvents;
   const coverageFraction = row.quality?.localCoverage?.elapsedTimeCoverageFraction
@@ -226,7 +226,7 @@ export function createCollectorQualityAccumulator({
         if (record.accountScope?.status === "available" && record.accountScope?.scopeId) {
           accountScopedUsageRecords += 1;
         }
-        if (["standard", "fast"].includes(record.tierSemantics?.codexSpeedMode)) {
+        if (["standard", "fast", "ultrafast"].includes(record.tierSemantics?.codexSpeedMode)) {
           knownSpeedUsageRecords += 1;
         }
         if (trackStaleness && Number.isFinite(record.stalenessMs)) {
@@ -344,7 +344,8 @@ export function analyzeMonitoringQuality({
   const skipped = flags.filter((row) => row.quotaSignal === "skipped_value").length;
   const totalEvents = sum(intervals, (row) => row.marginalUsageEventCount);
   const unknownSpeedEvents = sum(intervals, (row) => row.tierUsageEventCounts?.unknown);
-  const knownSpeedEvents = sum(intervals, (row) => (row.tierUsageEventCounts?.standard ?? 0) + (row.tierUsageEventCounts?.fast ?? 0));
+  const knownSpeedEvents = sum(intervals, (row) => (row.tierUsageEventCounts?.standard ?? 0)
+    + (row.tierUsageEventCounts?.fast ?? 0) + (row.tierUsageEventCounts?.ultrafast ?? 0));
   const cadence = intervals.map((row) => row.elapsedMs).filter(Number.isFinite);
   const collector = collectorSummary && typeof collectorSummary === "object"
     ? collectorSummary
@@ -430,8 +431,8 @@ export function analyzeMonitoringQuality({
     opportunities.push(opportunity(
       "P1",
       "speed_mode_coverage",
-      "Tighten per-request Standard/Fast attribution",
-      `${round((metadata.knownSpeedEventFraction ?? 0) * 100, 1)}% of usage events in the dominant reset have a known Standard/Fast mode.`,
+      "Tighten per-request Standard/Fast/Ultrafast attribution",
+      `${round((metadata.knownSpeedEventFraction ?? 0) * 100, 1)}% of usage events in the dominant reset have a known Standard/Fast/Ultrafast mode.`,
       "Emit a privacy-safe tier marker whenever settings change and track unknown-speed share as a report gate.",
     ));
   }
@@ -535,7 +536,7 @@ export function renderMonitoringQualityReport(report) {
     "## Observability findings",
     "",
     `- Account-known intervals: ${percent(report.metadata.accountKnownIntervalFraction)}.`,
-    `- Known Standard/Fast usage events: ${percent(report.metadata.knownSpeedEventFraction)}.`,
+    `- Known Standard/Fast/Ultrafast usage events: ${percent(report.metadata.knownSpeedEventFraction)}.`,
     `- Intervals with known provider snapshot age: ${percent(report.metadata.providerSnapshotAgeKnownIntervalFraction)}.`,
     `- Flat integer-display intervals: ${percent(report.quantization.flatIntervalFraction)}; regressions: ${report.quantization.regressionIntervals}; skipped values: ${report.quantization.skippedValueIntervals}.`,
     `- Median flat run before an increase: ${report.quantization.elapsedSecondsP50} seconds and ${report.quantization.usageEventsP50} usage events; p90: ${report.quantization.elapsedSecondsP90} seconds and ${report.quantization.usageEventsP90} events.`,

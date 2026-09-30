@@ -237,9 +237,10 @@ test("the ratio map holds every registered published Priority model", () => {
     "gpt-6-astra": 2,
     "gpt-6-sol": 2,
     "gpt-6-luna": 2,
+    "gpt-6.1-sol": 2,
   });
-  // Every ratio is strictly greater than 1x: Fast never costs less quota
-  // than Standard, and is never accidentally recorded as 1x (which would
+  // Every API price ratio is strictly greater than 1x and is never
+  // accidentally recorded as 1x (which would
   // make it indistinguishable from "unknown treated as Standard"). The
   // assumed multiplier for unlisted models obeys the same rule.
   for (const multiplier of Object.values(FAST_MODE_QUOTA_MULTIPLIERS)) {

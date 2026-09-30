@@ -232,7 +232,10 @@ async function spawnWorkload(manifest, { timeoutMs, spawnProcess = spawn }) {
       "-",
     ];
     if (manifest.tierDeclaration.billingSurface !== "openai_api" && manifest.tierDeclaration.codexSpeedMode !== "unknown") {
-      const providerTier = manifest.tierDeclaration.codexSpeedMode === "standard" ? "default" : "priority";
+      const providerTier = {
+        standard: "default", fast: "priority", ultrafast: "ultrafast",
+      }[manifest.tierDeclaration.codexSpeedMode];
+      if (!providerTier) throw new Error("unsupported_experiment_speed_mode");
       args.splice(args.length - 2, 0, "-c", `service_tier=\"${providerTier}\"`);
     }
     const workloadEnvironment = environmentForWorkload();
@@ -405,7 +408,8 @@ export async function runExperiment({
       subscriptionSpeedSensitivity: {
         ...local.runcost.subscriptionSpeedSensitivity,
         observedSpeedMode: manifest.tierDeclaration.codexSpeedMode,
-        selectedScenario: ["standard", "fast"].includes(manifest.tierDeclaration.codexSpeedMode)
+        selectedScenario: Object.hasOwn(local.runcost.subscriptionSpeedSensitivity?.scenarios ?? {},
+          manifest.tierDeclaration.codexSpeedMode)
           ? manifest.tierDeclaration.codexSpeedMode : null,
       },
     },

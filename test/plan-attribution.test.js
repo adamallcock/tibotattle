@@ -112,6 +112,29 @@ test("Pro to Plus to Pro produces distinct eras even if reset labels are reused"
   assert.equal(classifyUsageAttribution(index, usage(700)).disposition, "legacy_conditional");
 });
 
+test("the Pro 10x rename retains the same raw plan identity and prior history", () => {
+  const before = Date.parse("2026-09-28T12:00:00.000Z");
+  const after = Date.parse("2026-09-29T12:00:00.000Z");
+  const index = buildPlanAttributionIndex([observation(before, "pro"), observation(after, "pro")]);
+  assert.equal(index.eras.length, 1);
+  assert.equal(index.eras[0].planType, "pro");
+  assert.equal(classifyUsageAttribution(index, usage(before - 1)).disposition, "legacy_conditional");
+  assert.equal(planEraForInterval(index, usage(after, { intervalStartMs: before })).era.eraKey,
+    index.eras[0].eraKey);
+});
+
+test("Pro to Pro Max 25x to Pro keeps three separate plan eras", () => {
+  const index = buildPlanAttributionIndex([
+    observation(100, "pro"), observation(200, "pro"),
+    observation(300, "promax"), observation(400, "promax"),
+    observation(500, "pro"), observation(600, "pro"),
+  ]);
+  assert.deepEqual(index.eras.map((era) => era.planType), ["pro", "promax", "pro"]);
+  assert.notEqual(index.eras[0].eraKey, index.eras[2].eraKey);
+  assert.equal(planEraForInterval(index, usage(350)).era.planType, "promax");
+  assert.equal(planEraForInterval(index, usage(350, { intervalStartMs: 150 })).status, "conflicted");
+});
+
 test("declared same-plan continuity changes and returns create distinct eras without account proof", () => {
   const rows = [
     observation(100, "pro", { continuityId: "era-a" }), observation(200, "pro", { continuityId: "era-a" }),

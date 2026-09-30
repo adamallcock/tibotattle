@@ -198,6 +198,41 @@ test("non-Standard tiers require a card that explicitly declares the exact tier"
   assert.equal(priced.selectedPriceCardId, "priority");
 });
 
+test("missing input context preserves independent prices while withholding context-conditioned components", () => {
+  const mixed = card({
+    id: "openai:gpt-test:context-and-tools", provider: "openai", model: "gpt-test", tier: "standard",
+    components: [
+      { ...component("output_text_tokens", "15"), conditions: { max_total_input_tokens: "272000" } },
+      { ...component("output_text_tokens", "30"), conditions: { min_total_input_tokens: "272001" } },
+      component("web_search_units", "10", "search", "1000"),
+    ],
+  });
+  const event = {
+    provider: "openai", model: "gpt-test",
+    components: { inputUncachedTokens: null, inputCacheReadTokens: null, inputCacheWriteTokens: null,
+      outputTextTokens: 1000, outputReasoningTokens: 1000 },
+    billableToolUnits: [{ provider: "openai", name: "web_search_units", quantity: 2, unit: "search", billingSource: "provider" }],
+  };
+  const priceCards = [mixed];
+  const result = priceUsageEvent(event, { priceCards });
+  assert.equal(result.coverageStatus, "partially_priced");
+  assert.equal(result.totalUsd, "0.02");
+  assert.deepEqual(result.selectedPriceCardIds, [mixed.id]);
+  assert.equal(result.components.find((entry) => entry.name === "web_search_units").costUsd, "0.02");
+  assert.equal(result.components.find((entry) => entry.name === "output_text_tokens").reasonCode, "total_input_context_missing");
+  assert.equal(result.components.find((entry) => entry.name === "output_reasoning_tokens").reasonCode, "total_input_context_missing");
+
+  const independent = priceUsageEvent({ ...event, billableToolUnits: [] }, { priceCards: [OPENAI_STANDARD] });
+  assert.equal(independent.coverageStatus, "partially_priced");
+  assert.equal(independent.totalUsd, "0.03");
+  assert.equal(independent.warnings.coverage.some((entry) => entry.code === "total_input_context_missing"), false);
+
+  // Catalogs for unknown and observed context must not poison one another.
+  const known = priceUsageEvent({ ...event, totalInputContextTokens: 272001 }, { priceCards });
+  assert.equal(known.totalUsd, "0.08");
+  assert.equal(priceUsageEvent(event, { priceCards }).totalUsd, "0.02");
+});
+
 test("unknown models and positive components fail closed while non-coverage warnings remain informational", () => {
   const unknownModel = priceUsageEvent({
     provider: "openai",

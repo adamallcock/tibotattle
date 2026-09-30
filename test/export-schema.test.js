@@ -125,6 +125,26 @@ function privacyReceipt() {
   };
 }
 
+test("compatibility admits the current export tuple and refuses stale or unknown parser and registry versions", () => {
+  const current = exportCompatibilityTuple();
+  assert.equal(validateExportRecord("compatibility", current).valid, true);
+  for (const [path, stale] of [
+    [["implementation", "checkpointParserVersion"], "codex-checkpoint-state-v0.2"],
+    [["implementation", "checkpointScanVersion"], "codex-export-checkpoint-scan-v0.5"],
+    [["providerAdapters", "openaiCodex", "sourceFormats", "rollout", "parserVersion"], "codex-log-scan-v9"],
+    [["registry", "version"], "telemetry-v0.1-registry-2026-09-22.1"],
+  ]) {
+    for (const version of [stale, "unreviewed-future-version"]) {
+      const candidate = structuredClone(current);
+      const parent = path.slice(0, -1).reduce((value, key) => value[key], candidate);
+      parent[path.at(-1)] = version;
+      const result = validateExportRecord("compatibility", candidate);
+      assert.equal(result.valid, false);
+      assert.ok(result.errors.some((error) => error.path === `/${path.join("/")}` && error.keyword === "const"));
+    }
+  }
+});
+
 test("allowlist schema accepts a valid usage event and rejects unknown nested fields", () => {
   assert.equal(validateExportRecord("usageEvent", usageEvent()).valid, true);
   const contaminated = usageEvent();
@@ -173,8 +193,16 @@ test("reviewed registries and schemas expose the same closed model, limit, and d
   const registry = exportRegistrySnapshot();
   assert.deepEqual(
     exportSchemas.usageEvent.properties.modelId.enum,
-    ["unknown", ...registry.providers.openai_codex.modelIds, ...registry.providers.anthropic_claude_code.modelIds],
+    // New export identities append to the combined vocabulary so existing
+    // Claude enum positions survive the addition of another Codex model.
+    [
+      "unknown",
+      ...registry.providers.openai_codex.modelIds.filter((model) => model !== "gpt-6.1-sol"),
+      ...registry.providers.anthropic_claude_code.modelIds,
+      "gpt-6.1-sol",
+    ],
   );
+  assert.ok(registry.providers.openai_codex.modelIds.includes("gpt-6.1-sol"));
   assert.deepEqual(
     exportSchemas.quotaSnapshot.properties.limitId.enum,
     ["unknown", ...registry.providers.openai_codex.limitIds],

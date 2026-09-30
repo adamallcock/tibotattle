@@ -36,9 +36,9 @@ const FORECAST_METHODS = [
 
 const CANDIDATES = [
   { id: "standard_api", label: "Standard API cost", kind: "standard" },
-  { id: "speed_lower", label: "Captured speed lower bound", kind: "lower" },
-  { id: "speed_midpoint", label: "Captured speed midpoint", kind: "midpoint" },
-  { id: "speed_upper", label: "Captured speed upper bound", kind: "upper" },
+  { id: "speed_lower", label: "Captured speed; unresolved as Standard", kind: "lower" },
+  { id: "speed_midpoint", label: "Captured speed; unresolved Standard/Fast midpoint", kind: "midpoint" },
+  { id: "speed_upper", label: "Captured speed; unresolved as Fast", kind: "upper" },
 ];
 
 const LAG_CANDIDATES = [
@@ -333,7 +333,7 @@ function summarizeEvidence(
   const totalTokens = Object.values(components).reduce((sum, value) => sum + value, 0);
   const totalModelCost = Object.values(models).reduce((sum, value) => sum + value.costUsd, 0);
   const totalTierEvents = Object.values(tierEvents).reduce((sum, value) => sum + value, 0);
-  const knownTierEvents = (tierEvents.standard ?? 0) + (tierEvents.fast ?? 0);
+  const knownTierEvents = (tierEvents.standard ?? 0) + (tierEvents.fast ?? 0) + (tierEvents.ultrafast ?? 0);
   return {
     tokenComponents: components,
     componentTokenShares: Object.fromEntries(Object.entries(components).map(([key, value]) => [key, totalTokens > 0 ? round(value / totalTokens) : null])),
@@ -933,12 +933,12 @@ function speedCounts(rows, windowDurationMinutes = WEEKLY_WINDOW_MINS) {
     }
   }
   const total = Object.values(counts).reduce((sum, value) => sum + value, 0);
+  const known = (counts.standard ?? 0) + (counts.fast ?? 0) + (counts.ultrafast ?? 0);
   return {
     counts,
-    knownFraction: total > 0 ? ((counts.standard ?? 0) + (counts.fast ?? 0)) / total : null,
-    fastFractionOfKnown: (counts.standard ?? 0) + (counts.fast ?? 0) > 0
-      ? (counts.fast ?? 0) / ((counts.standard ?? 0) + (counts.fast ?? 0))
-      : null,
+    knownFraction: total > 0 ? known / total : null,
+    fastFractionOfKnown: known > 0 ? (counts.fast ?? 0) / known : null,
+    ultrafastFractionOfKnown: known > 0 ? (counts.ultrafast ?? 0) / known : null,
   };
 }
 
@@ -1154,6 +1154,7 @@ export function analyzeWeeklyCalibration(
       holdoutPoints: row.selectedFit.holdoutScore.pointCount,
       speedKnownFraction: row.speed.knownFraction,
       fastFractionOfKnown: row.speed.fastFractionOfKnown,
+      ultrafastFractionOfKnown: row.speed.ultrafastFractionOfKnown,
       evidenceProfile: row.evidenceProfile,
     };
   }).sort((left, right) => right.absoluteErrorPp - left.absoluteErrorPp);
@@ -1602,9 +1603,11 @@ function projectWeeklyPlanSummary(dataset, options) {
       // well-covered. Older Codex versions are the only source of this
       // evidence, so both fractions decay toward null over time.
       fastFractionOfKnown: row.speedEvidence?.fastFractionOfKnown ?? null,
+      ultrafastFractionOfKnown: row.speedEvidence?.ultrafastFractionOfKnown ?? null,
       speedEventCounts: {
         standard: safeSpeedEventCount(row.speedEvidence?.counts?.standard),
         fast: safeSpeedEventCount(row.speedEvidence?.counts?.fast),
+        ultrafast: safeSpeedEventCount(row.speedEvidence?.counts?.ultrafast),
         unknown: safeSpeedEventCount(row.speedEvidence?.counts?.unknown),
       },
       holdoutMeanAbsoluteErrorPercentagePoints:

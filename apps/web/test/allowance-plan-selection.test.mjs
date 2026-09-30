@@ -8,7 +8,7 @@ import {
 import { SUPPORTED_LOCALES, translate } from "../public/localization.js";
 
 const BASIS_FAMILY =
-  "codex_primary:speed_priced_api_equivalent:v3:priority_card_ratio_2026_08_30:event_time:observed_declared_scenario";
+  "codex_primary:speed_priced_api_equivalent:v4:published_speed_card_ratio_2026_09_29:event_time:observed_declared_scenario";
 const COHORT_ID = "a".repeat(64);
 
 function planScope(planType) {

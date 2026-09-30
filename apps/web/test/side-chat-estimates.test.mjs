@@ -5,7 +5,7 @@ import test from "node:test";
 import { normalizeDashboardPayload } from "../public/data-client.js";
 
 const ALLOWANCE_BASIS_FAMILY =
-  "codex_primary:speed_priced_api_equivalent:v3:priority_card_ratio_2026_08_30:event_time:observed_declared_scenario";
+  "codex_primary:speed_priced_api_equivalent:v4:published_speed_card_ratio_2026_09_29:event_time:observed_declared_scenario";
 const allowanceBasisId = (scenario) =>
   `${ALLOWANCE_BASIS_FAMILY}:${scenario}`;
 const MATCHED_COHORT_ID =
@@ -281,6 +281,7 @@ function historicalGapProbe(overrides = {}) {
         unknownSpeedEvents: 1,
       },
       bySpeed: {
+        ultrafast: { events: 0, totalTokens: 0, standardApiPriceEquivalentUsd: 0 },
         fast: {
           events: 1,
           totalTokens: 101_000,

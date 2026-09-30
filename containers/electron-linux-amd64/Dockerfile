@@ -78,15 +78,15 @@ RUN pnpm install --frozen-lockfile --ignore-scripts
 # manager or network work. A direct archive fetch also avoids the asynchronous
 # installer path, which aborts under local QEMU amd64 emulation.
 RUN curl --fail --silent --show-error --location --retry 3 \
-    --output /tmp/electron-v43.2.0-linux-x64.zip \
-    https://github.com/electron/electron/releases/download/v43.2.0/electron-v43.2.0-linux-x64.zip \
+    --output /tmp/electron-v43.5.0-linux-x64.zip \
+    https://github.com/electron/electron/releases/download/v43.5.0/electron-v43.5.0-linux-x64.zip \
   && printf '%s  %s\n' \
-    f77ca6ed67bbc68702b69b56ad499bca6ae090705ade7d04f0ac545e409dec68 \
-    /tmp/electron-v43.2.0-linux-x64.zip \
+    3d93fb0b9517fcd74107c628f61990bff60d3c2543694c28b26b1ef78b80def1 \
+    /tmp/electron-v43.5.0-linux-x64.zip \
     | sha256sum --check --strict \
-  && unzip -q /tmp/electron-v43.2.0-linux-x64.zip -d /workspace/node_modules/electron/dist \
+  && unzip -q /tmp/electron-v43.5.0-linux-x64.zip -d /workspace/node_modules/electron/dist \
   && printf 'electron' > /workspace/node_modules/electron/path.txt \
-  && rm -f /tmp/electron-v43.2.0-linux-x64.zip
+  && rm -f /tmp/electron-v43.5.0-linux-x64.zip
 
 COPY apps/electron ./apps/electron
 COPY native/macos-keychain/contract.js ./native/macos-keychain/contract.js

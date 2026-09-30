@@ -13,12 +13,12 @@
     "transportReady": false
   },
   "fieldContract": {
-    "sha256": "f91a4eba54b7b8df9f82b9f1f17d1927ebf2f4e9a606ab48a48ff5517a2afd08",
+    "sha256": "fbf646dddbf4e47360ff7041bada9d89dc38f825ca7a15876eba9681bc4dba09",
     "version": "telemetry-field-dictionary-v0.1"
   },
   "implementation": {
-    "checkpointParserVersion": "codex-checkpoint-state-v0.2",
-    "checkpointScanVersion": "codex-export-checkpoint-scan-v0.5",
+    "checkpointParserVersion": "codex-checkpoint-state-v0.3",
+    "checkpointScanVersion": "codex-export-checkpoint-scan-v0.6",
     "exporterVersion": "0.3.0-draft.3",
     "packageName": "app-usagemonitor",
     "packageVersion": "0.1.26",
@@ -63,7 +63,7 @@
         },
         "rollout": {
           "adapterVersion": "codex-metadata-export-v6",
-          "parserVersion": "codex-log-scan-v9",
+          "parserVersion": "codex-log-scan-v10",
           "sourceFormat": "codex-rollout-jsonl",
           "status": "implemented"
         }
@@ -72,8 +72,8 @@
     }
   },
   "registry": {
-    "sha256": "6ba530b92c4dcb1795df7fc5b00acbcee6c79df19f9136f53622e33a20bc0af6",
-    "version": "telemetry-v0.1-registry-2026-09-22.1"
+    "sha256": "d35c5adfef14cde87abb5ea39d59ec1061290a02e0dfa30ce1b8beef1c8ef2f1",
+    "version": "telemetry-v0.1-registry-2026-09-29.1"
   },
   "schemas": {
     "members": [
@@ -90,7 +90,7 @@
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/compatibility.schema.json",
         "name": "compatibility.schema.json",
-        "sha256": "92bb083fdd622dff8dd7719dc6e0790d7b9ab7a3806ab2a536076cf6d7dfdf03"
+        "sha256": "ca5742db52ed18e8eb70ece9ffe41a8620df6e9e5e21b72fcd69b64371020745"
       },
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/privacy-receipt.schema.json",
@@ -105,10 +105,10 @@
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/usage-event.schema.json",
         "name": "usage-event.schema.json",
-        "sha256": "43693e9cbce396e451d918e129c54de91e0059250e937c5a533b898b7b21aed0"
+        "sha256": "2c98005fec25e31581b05cd8a4e7e11c80e5cd7d7cca985d66002fe2e48454f6"
       }
     ],
-    "setSha256": "b45e90c7fe7f62bef4921515b48e8e22bbe22517167ca7b723842cce4b9f97e7"
+    "setSha256": "05c7445fd412a00cd5a26f55bf6ef9517e52be2e94b47f1541a52ac1ae96cb78"
   },
   "tupleVersion": "usage-export-compatibility-v0.1"
 }

@@ -15,7 +15,7 @@ export const PERFORMANCE_RECORD_SCHEMA_VERSION = "model-performance-daily-v1";
 export const PERFORMANCE_MEASUREMENT_VERSION = "model-performance-samples-v1";
 export const PERFORMANCE_BUCKET_SCHEME_VERSION = "performance-histogram-v1";
 export const PERFORMANCE_FIELD_DICTIONARY_VERSION =
-  "telemetry-performance-registry-2026-09-21.1";
+  "telemetry-performance-registry-2026-09-29.1";
 export const PERFORMANCE_PRIVACY_CONTRACT_VERSION =
   "privacy-safe-model-performance-v1";
 export const PERFORMANCE_CONTRACT_STATE = "staged";
@@ -31,14 +31,14 @@ export const PERFORMANCE_SPEED_METHODS = Object.freeze([
   "receipt", "legacy", "tool_free", "unavailable",
 ]);
 export const PERFORMANCE_SPEED_MODES = Object.freeze([
-  "fast", "standard", "unknown", "other", "mixed",
+  "fast", "standard", "unknown", "other", "mixed", "ultrafast",
 ]);
 export const PERFORMANCE_SPEED_MODE_SOURCES = Object.freeze([
   "rollout_thread_settings", "turn_context_service_tier", "lineage_inherited",
   "unobserved", "mixed",
 ]);
 export const PERFORMANCE_API_SERVICE_TIERS = Object.freeze([
-  "standard", "priority", "flex", "batch", "unknown", "other", "mixed",
+  "standard", "priority", "flex", "batch", "unknown", "other", "mixed", "ultrafast",
 ]);
 export const PERFORMANCE_REASONING_EFFORTS = Object.freeze([
   "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "unknown",
@@ -133,7 +133,7 @@ function performanceV1ValidateRecord(value) {
   }
   if ((value.speedMode === "unknown" && value.speedModeSource !== "unobserved")
       || (value.speedMode === "mixed" && value.speedModeSource !== "mixed")
-      || (["fast", "standard", "other"].includes(value.speedMode)
+      || (["fast", "standard", "ultrafast", "other"].includes(value.speedMode)
         && !["rollout_thread_settings", "turn_context_service_tier", "lineage_inherited"]
           .includes(value.speedModeSource))) {
     performanceV1Invalid("performance_speed_mode_source_mismatch");

@@ -26,6 +26,7 @@ import {
 } from "./providers/codex/logs.js";
 import { localCodexLogScanner } from "./local-node-runtime.js";
 import {
+  codexTierObservation,
   normalizeProviderTier,
   unknownCodexTier,
 } from "./providers/codex/logs.js";
@@ -377,10 +378,14 @@ function trimRecentKeys(checkpoint, recentSet, maximumRecentEventKeys) {
 }
 
 function tierUpdateFromRecord(record, diagnostics) {
-  if (record?.type !== "event_msg" || record.payload?.type !== "thread_settings_applied") return null;
-  const settings = record.payload?.thread_settings;
-  if (!settings || typeof settings !== "object" || !Object.hasOwn(settings, "service_tier")) {
+  const observation = codexTierObservation(record);
+  if (observation === null) return null;
+  if (observation.status === "omitted") {
     diagnostics.tierSettingOmissions = (diagnostics.tierSettingOmissions ?? 0) + 1;
+    return null;
+  }
+  if (observation.status === "malformed") {
+    diagnostics.malformedTierSettingEvents = (diagnostics.malformedTierSettingEvents ?? 0) + 1;
     return null;
   }
   const observedAtMs = Date.parse(record.timestamp);
@@ -388,14 +393,14 @@ function tierUpdateFromRecord(record, diagnostics) {
     diagnostics.malformedTierSettingEvents = (diagnostics.malformedTierSettingEvents ?? 0) + 1;
     return null;
   }
-  const rawTier = settings.service_tier;
+  const rawTier = observation.rawTier;
   if (rawTier !== null && typeof rawTier !== "string") {
     diagnostics.malformedTierSettingEvents = (diagnostics.malformedTierSettingEvents ?? 0) + 1;
     return null;
   }
   const tier = normalizeProviderTier(rawTier, {
     billingSurface: "chatgpt_subscription",
-    tierSource: "rollout_thread_settings",
+    tierSource: observation.tierSource,
     tierObservedAt: record.timestamp,
   });
   if (rawTier !== null && tier.providerTierRaw === null) {
@@ -405,14 +410,14 @@ function tierUpdateFromRecord(record, diagnostics) {
   diagnostics.tierSettingEvents = (diagnostics.tierSettingEvents ?? 0) + 1;
   diagnostics.tierSettingCounts ??= {};
   diagnostics.tierSettingCounts[tier.codexSpeedMode] = (diagnostics.tierSettingCounts[tier.codexSpeedMode] ?? 0) + 1;
-  return { providerTierRaw: tier.providerTierRaw, observedAt: record.timestamp, observedAtMs };
+  return { providerTierRaw: tier.providerTierRaw, tierSource: observation.tierSource, observedAt: record.timestamp, observedAtMs };
 }
 
 function updateTierState(state, update) {
   if (!update) return;
   const priorMs = Date.parse(state.tierState?.observedAt);
   if (Number.isFinite(priorMs) && priorMs > update.observedAtMs) return;
-  state.tierState = { providerTierRaw: update.providerTierRaw, observedAt: update.observedAt };
+  state.tierState = { providerTierRaw: update.providerTierRaw, tierSource: update.tierSource, observedAt: update.observedAt };
 }
 
 function tierForUsage(state, observedAt) {
@@ -422,7 +427,7 @@ function tierForUsage(state, observedAt) {
   if (!tierState || !Number.isFinite(usageMs) || !Number.isFinite(tierMs) || tierMs > usageMs) return unknownCodexTier();
   return normalizeProviderTier(tierState.providerTierRaw, {
     billingSurface: "chatgpt_subscription",
-    tierSource: "rollout_thread_settings",
+    tierSource: tierState.tierSource ?? "rollout_thread_settings",
     tierObservedAt: tierState.observedAt,
   });
 }

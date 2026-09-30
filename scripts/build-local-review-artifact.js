@@ -109,7 +109,7 @@ const PINNED_RUNTIME_PACKAGES = Object.freeze({
     license: "MIT",
   }),
   "fast-uri": Object.freeze({
-    version: "3.1.7",
+    version: "3.1.8",
     license: "BSD-3-Clause",
   }),
   "json-schema-traverse": Object.freeze({
@@ -132,6 +132,7 @@ export const LOCAL_REVIEW_WORKSPACE_RUNTIME_FILES = Object.freeze({
   "@app-usagemonitor/quota-analysis": Object.freeze([
     "index.js",
     "package.json",
+    "src/included-allowance-speed.js",
     "src/model-composition.js",
     "src/plan-attribution.js",
     "src/quota-calibration.js",

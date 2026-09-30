@@ -4,7 +4,7 @@ import {
 } from "@app-usagemonitor/telemetry-contract";
 import {
   emptySpeedWeightingCrossing,
-  fastModeModelFamilyKey,
+  speedModeModelFamilyKey,
   summarizeQuotaWeightedAccounting,
 } from "@app-usagemonitor/accounting";
 import { codexPrimaryAllowanceBasis } from "./codex-primary-allowance-basis.js";
@@ -333,14 +333,13 @@ function nanosToUsdString(value) {
 }
 
 function observedCodexSpeed(row) {
-  return row?.codex_speed_mode === "standard" || row?.codex_speed_mode === "fast"
+  return ["standard", "fast", "ultrafast"].includes(row?.codex_speed_mode)
     ? row.codex_speed_mode
     : "unknown";
 }
 
 function declaredCodexSpeed(row, declaredSpeedBaselines) {
-  if (row?.declared_speed_mode === "standard"
-      || row?.declared_speed_mode === "fast") {
+  if (["standard", "fast", "ultrafast"].includes(row?.declared_speed_mode)) {
     return row.declared_speed_mode;
   }
   const observedMs = Number(row?.observed_at_ms);
@@ -353,7 +352,8 @@ function premiumCrossingFor(row, premiumNanos, declaredSpeedBaselines) {
   // members of the priced subtotal or its speed-provenance denominator.
   if (premiumNanos === null) return null;
   const observedSpeed = observedCodexSpeed(row);
-  const family = fastModeModelFamilyKey(row?.model_id, {
+  const family = speedModeModelFamilyKey(row?.model_id, observedSpeed === "unknown"
+    ? declaredCodexSpeed(row, declaredSpeedBaselines) : observedSpeed, {
     eventTime: new Date(Number(row.observed_at_ms)).toISOString(),
     totalInputContextTokens: currentInputTokens(row),
   });

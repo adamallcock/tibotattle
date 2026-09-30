@@ -4,6 +4,7 @@ import { opendir, lstat, mkdir, realpath } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
+import { canonicalTelemetryPerformanceJson } from '@app-usagemonitor/telemetry-contract';
 import { openTimingStore, ingestTimingFile, readTimingRows } from '../../src/platform/index.js';
 import {
   createModelPerformanceContext,
@@ -24,7 +25,6 @@ export function modelPerformanceSupplementDirectory({ directory, timingRoot, pla
   return join(dirname(timingRoot), 'inference-timing-tool-free-v1', basename(directory));
 }
 
-const PERFORMANCE_PARSER_VERSION = 'codex-inference-timing-v17';
 const PERFORMANCE_DAY = /^\d{4}-\d{2}-\d{2}$/u;
 const PERFORMANCE_PROVIDER = 'openai_codex';
 
@@ -56,9 +56,11 @@ async function run() {
         day: message.day,
         provider: message.provider,
         now: message.nowEpoch,
-      });
-      const facts = JSON.stringify(result.sources.map(({ id, digest, fingerprint, revision, telemetryRevision, exhausted, role }) => ({
-        id, digest, fingerprint, revision, telemetryRevision, exhausted, role,
+      }).map(record => ({ record, canonical: canonicalTelemetryPerformanceJson(record) }))
+        .sort((left, right) => left.canonical < right.canonical ? -1 : left.canonical > right.canonical ? 1 : 0)
+        .map(({ record }) => record);
+      const facts = JSON.stringify(result.sources.map(({ id, digest, fingerprint, revision, telemetryRevision, parserVersion, replayParserVersion, exhausted, role }) => ({
+        id, digest, fingerprint, revision, telemetryRevision, parserVersion, replayParserVersion, exhausted, role,
       })));
       // The timing store's persistent mutation counter advances for every
       // source write, including ordinary appends and replay corrections.  It
@@ -73,7 +75,8 @@ async function run() {
         sourceGeneration: `timing:${result.revision}`,
         sourceDigest,
         sourceRevision,
-        parserVersion: PERFORMANCE_PARSER_VERSION,
+        parserVersion: result.sources.every(source => source.parserVersion === context.parserVersion)
+          ? `codex-inference-timing-v${context.parserVersion}` : 'codex-inference-timing-mixed',
       });
       parentPort.postMessage({ type: 'performance-report', requestId: message.requestId, report });
     } catch {
@@ -91,7 +94,7 @@ async function run() {
     if (message?.type === 'stop') stop();
     else if (message?.type === 'window' && ['1','7','30','all'].includes(message.period)
       && Number.isSafeInteger(message.end) && message.end >= 0 && message.end <= Date.now()
-      && ['standard', 'fast'].includes(message.speedMode)
+      && ['standard', 'fast', 'ultrafast'].includes(message.speedMode)
       && message.requestKey === `${message.period}:${message.speedMode}:${message.end}`) {
       windows.set(message.requestKey, message); windowsChanged = true;
       while (windows.size > 8) windows.delete(windows.keys().next().value);
@@ -129,14 +132,18 @@ async function run() {
   }
   let lastPublished = 0, lastCollecting = null;
   function publish(collecting) {
-    let rows, revision;
+    let rows, revision, parserIncomplete;
     try {
       const result = readTimingRows(store, { supplement, withRevision: true });
       rows = result.rows; revision = result.revision;
+      parserIncomplete = result.sources.some(source => source.parserVersion !== context.parserVersion
+        || source.replayParserVersion !== 0);
     } catch {
       degraded = true; passFailed = true;
       const result = readTimingRows(store, { withRevision: true });
       rows = result.rows; revision = result.revision;
+      parserIncomplete = result.sources.some(source => source.parserVersion !== context.parserVersion
+        || source.replayParserVersion !== 0);
     }
     if (publishedRevision !== null && revision !== publishedRevision) {
       // A completed source grew after its last scan. The store replay has
@@ -148,12 +155,12 @@ async function run() {
     const now = Date.now();
     lastPublished = now; lastCollecting = collecting; windowsChanged = false;
     parentPort.postMessage({ type: 'snapshots', revision, values: [
-      ...['1', '7', '30', 'all'].flatMap(period => ['standard', 'fast'].map(speedMode => ({ period, speedMode, end: now }))), ...windows.values(),
+      ...['1', '7', '30', 'all'].flatMap(period => ['standard', 'fast', 'ultrafast'].map(speedMode => ({ period, speedMode, end: now }))), ...windows.values(),
     ].map(({period, speedMode, end, requestKey}) => ({
       ...(requestKey ? { requestKey } : {}),
       ...context.project(rows, { period, speedMode, now: end, rolling: Boolean(requestKey), historyProgress: files === null ? null : {
         checked: Math.min(cursor, files.length), total: files.length,
-      } }), updatedAt: new Date(now).toISOString(), collecting, stale: degraded,
+      } }), updatedAt: new Date(now).toISOString(), collecting, stale: degraded || parserIncomplete,
     })) });
   }
   try {

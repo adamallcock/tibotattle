@@ -1,6 +1,8 @@
 // Pure, bounded projections of diagnostic timing. No accounting totals.
 const DAY = 86_400_000;
+const SPEED_MODES = ['standard', 'fast', 'ultrafast'];
 const LABELS = new Map([
+  ['gpt-6.1-sol', 'GPT-6.1 Sol'],
   ['gpt-6-luna', 'GPT-6 Luna'], ['gpt-6-sol', 'GPT-6 Sol'],
   ['gpt-5.6-luna', 'Luna'], ['gpt-5.6-terra', 'Terra'],
   ['gpt-6-astra', 'Astra'], ['gpt-5.6-sol', 'Sol'],
@@ -35,7 +37,7 @@ function add(bins, at, value) {
   bins.get(at).push(value);
 }
 export function modelPerformanceProjection(rows, { period = 'all', speedMode = 'standard', now = Date.now(), historyProgress = null, rolling = false } = {}) {
-  if (!['1', '7', '30', 'all'].includes(period) || !['standard', 'fast'].includes(speedMode) || !count(now) || !Array.isArray(rows) || rows.length > 100000
+  if (!['1', '7', '30', 'all'].includes(period) || !SPEED_MODES.includes(speedMode) || !count(now) || !Array.isArray(rows) || rows.length > 100000
       || !progress(historyProgress) || typeof rolling !== 'boolean')
     throw new Error('invalid_timing_projection');
   const known = rows.filter(r => r && LABELS.has(r.model) && count(r.at) && r.at <= now);
@@ -43,7 +45,7 @@ export function modelPerformanceProjection(rows, { period = 'all', speedMode = '
   const windowStart = period === 'all' ? 0
     : rolling || period === '1' ? Math.max(0, now - Number(period) * DAY)
     : Math.floor(now / DAY) * DAY - (Number(period) - 1) * DAY;
-  const excludedUnknownTurns = known.filter(r => !['standard', 'fast'].includes(r.speed_mode)
+  const excludedUnknownTurns = known.filter(r => !SPEED_MODES.includes(r.speed_mode)
     && r.at >= windowStart).length;
   const end = now;
   const start = period === 'all' ? (selected.length ? selected.reduce((min, r) => Math.min(min, r.at), now) : null)

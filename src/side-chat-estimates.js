@@ -10,7 +10,7 @@ import {
   DEFAULT_UNRESOLVED_SPEED_SCENARIO,
   FAST_MODE_ASSUMED_MULTIPLIER,
   emptySpeedWeightingCrossing,
-  fastModeModelFamilyKey,
+  speedModeModelFamilyKey,
   priceCodexUsageEvent,
   summarizeQuotaWeightedAccounting,
 } from "@app-usagemonitor/accounting";
@@ -88,6 +88,7 @@ const HISTORICAL_GAP_PRICE_EPOCH_BASIS =
   "event_time_when_registry_has_effective_evidence";
 const HISTORICAL_GAP_TIME_ZONE = "America/New_York";
 const HISTORICAL_GAP_SPEEDS = Object.freeze([
+  "ultrafast",
   "fast",
   "standard",
   "unknown",
@@ -468,7 +469,7 @@ function emptyHistoricalGapSpeedSummary() {
 }
 
 function addHistoricalGapWeighting(crossing, speed, family, cost) {
-  const speedKey = ["standard", "fast", "unknown"].includes(speed)
+  const speedKey = ["standard", "fast", "ultrafast", "unknown"].includes(speed)
     ? speed
     : "unknown";
   const cell = crossing[speedKey][family];
@@ -624,7 +625,7 @@ function historicalGapExactUsage(database, {
     const speed = historicalGapSpeedKey(projection.speed);
     bySpeed[speed].events += 1;
     bySpeed[speed].totalTokens += projection.totalTokens;
-    const family = fastModeModelFamilyKey(projection.model, {
+    const family = speedModeModelFamilyKey(projection.model, projection.speed === "unknown" ? declaredMode : projection.speed, {
       eventTime: observedAt,
       standardPriceCardIds: priced?.selectedPriceCardIds ?? [],
     });
@@ -635,7 +636,7 @@ function historicalGapExactUsage(database, {
       pricedCompletely ? cost : 0,
     );
     if (projection.speed === "unknown"
-        && (declaredMode === "standard" || declaredMode === "fast")) {
+        && ["standard", "fast", "ultrafast"].includes(declaredMode)) {
       addHistoricalGapWeighting(
         declaredSpeedWeighting,
         declaredMode,
@@ -1545,7 +1546,11 @@ function estimatedTimeline(calls, declaredSpeedBaselines = []) {
       0,
     );
     bucket.apiPriceEquivalentUsd += call.estimatedApiPriceEquivalentUsd;
-    const family = fastModeModelFamilyKey(call.model, {
+    const declaredMode = declaredSpeedModeAt(
+      declaredSpeedBaselines,
+      call.observedAtMs,
+    );
+    const family = speedModeModelFamilyKey(call.model, declaredMode ?? "unknown", {
       eventTime: new Date(call.observedAtMs).toISOString(),
       totalInputContextTokens: call.point.components.input_uncached_tokens
         + call.point.components.input_cache_read_tokens
@@ -1555,11 +1560,8 @@ function estimatedTimeline(calls, declaredSpeedBaselines = []) {
     weightingCell.events += 1;
     weightingCell.apiPriceEquivalentUsd +=
       call.estimatedApiPriceEquivalentUsd;
-    const declaredMode = declaredSpeedModeAt(
-      declaredSpeedBaselines,
-      call.observedAtMs,
-    );
-    if (declaredMode === "standard" || declaredMode === "fast") {
+
+    if (["standard", "fast", "ultrafast"].includes(declaredMode)) {
       const declaredCell = bucket.declaredSpeedWeighting[declaredMode][family];
       declaredCell.events += 1;
       declaredCell.apiPriceEquivalentUsd +=

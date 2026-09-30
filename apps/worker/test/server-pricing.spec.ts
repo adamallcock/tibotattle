@@ -231,6 +231,155 @@ describe("server pricing", () => {
     expect(priceTelemetryUsageEvent({ ...event, eventTime: "2026-09-02T12:00:00.000Z" }).coverageStatus).toBe("unpriced");
   });
 
+  it("prices Sol 6.1 through admitted telemetry at every API tier and both subscription speeds", () => {
+    const expected = {
+      standard: ["1.389998", "1.39", "2.280004"],
+      batch: ["0.694999", "0.695", "1.140002"],
+      flex: ["0.694999", "0.695", "1.140002"],
+      priority: ["2.779996", "2.78", "4.560008"],
+    } as const;
+    for (const [index, totalInputContextTokens] of [271_999, 272_000, 272_001].entries()) {
+      const baseline = fixture({
+        modelId: "gpt-6.1-sol", eventTime: "2026-09-29T00:00:00.000Z", totalInputContextTokens,
+        components: { ...fixture().components,
+          inputUncachedTokens: totalInputContextTokens - 172_000,
+          inputCacheReadTokens: 100_000, inputCacheWriteTokens: 72_000,
+          outputTextTokens: 40_000, outputReasoningTokens: 60_000, outputCombinedTokens: null,
+        },
+      });
+      for (const apiServiceTier of ["standard", "batch", "flex", "priority"] as const) {
+        const event = validateIngestibleEvent({ ...baseline, billingSurface: "openai_api", apiServiceTier });
+        const worker = priceTelemetryUsageEvent(event);
+        const local = priceCodexUsageEvent({ model: event.modelId, timestamp: event.eventTime,
+          totalInputContextTokens, components: event.components,
+        }, { apiServiceTier, priceEpochBasis: "event_time" });
+        expect(worker).toMatchObject({ exactCostUsd: expected[apiServiceTier][index],
+          coverageStatus: "fully_priced", coveragePercent: 100, unknownBillableUnits: 0,
+          apiServiceTier, tierBasis: "observed_api_service_tier", speedMultiplier: null,
+        });
+        expect(worker.exactCostUsd).toBe(local.totalUsd);
+        expect(worker.selectedPriceCardIds).toEqual(local.selectedPriceCardIds);
+        expect(worker.registrySha256).toBe(local.registry?.sha256);
+        expect(priceTelemetryUsageEvent({ ...event, eventTime: "2026-09-28T23:59:59.999Z" }).coverageStatus).toBe("unpriced");
+        expect(priceTelemetryUsageEvent({ ...event, totalInputContextTokens: null })).toMatchObject({
+          coverageStatus: "unpriced", unpricedReasonCodes: ["total_input_context_missing"],
+        });
+      }
+      for (const speedMode of ["standard", "fast"] as const) {
+        const event = validateIngestibleEvent({ ...baseline, billingSurface: "chatgpt_subscription",
+          apiServiceTier: "unknown", speedMode });
+        const worker = priceTelemetryUsageEvent(event);
+        const standard = priceCodexUsageEvent({ model: event.modelId, timestamp: event.eventTime,
+          totalInputContextTokens, components: event.components,
+        }, { apiServiceTier: "standard" });
+        const local = quotaWeightedApiPriceEquivalent({ apiPriceEquivalentUsd: Number(standard.totalUsd),
+          model: event.modelId, mode: speedMode, eventTime: event.eventTime, totalInputContextTokens,
+          standardPriceCardIds: standard.selectedPriceCardIds });
+        expect(worker.exactCostUsd).toBe(expected[speedMode === "fast" ? "priority" : "standard"][index]);
+        expect(Number(worker.exactCostUsd)).toBe(local.usd);
+        expect(worker.speedMultiplier).toBe(speedMode === "fast" ? 2 : null);
+        expect(worker.selectedPriceCardIds).toEqual(standard.selectedPriceCardIds);
+        expect(worker.coverageStatus).toBe("fully_priced");
+      }
+    }
+  });
+
+  it("prices Astra Ultrafast once at the exact API card for API and subscription surfaces", () => {
+    const expected = ["41.99994", "42", "69.00012"];
+    for (const [index, totalInputContextTokens] of [271_999, 272_000, 272_001].entries()) {
+      for (const billingSurface of ["openai_api", "chatgpt_subscription"] as const) {
+        const event = validateIngestibleEvent(fixture({ modelId: "gpt-6-astra", billingSurface,
+          eventTime: "2026-09-29T00:00:00.000Z", totalInputContextTokens,
+          apiServiceTier: billingSurface === "openai_api" ? "ultrafast" : "unknown", speedMode: "ultrafast",
+          components: { ...fixture().components,
+            inputUncachedTokens: totalInputContextTokens - 172_000,
+            inputCacheReadTokens: 100_000, inputCacheWriteTokens: 72_000,
+            outputTextTokens: 40_000, outputReasoningTokens: 60_000, outputCombinedTokens: null,
+          },
+        }));
+        const worker = priceTelemetryUsageEvent(event);
+        const local = priceCodexUsageEvent({ model: event.modelId, timestamp: event.eventTime,
+          totalInputContextTokens, components: event.components,
+        }, { apiServiceTier: "ultrafast", priceEpochBasis: "event_time" });
+        const standard = priceCodexUsageEvent({ model: event.modelId, timestamp: event.eventTime,
+          totalInputContextTokens, components: event.components,
+        }, { apiServiceTier: "standard", priceEpochBasis: "event_time" });
+        const weighted = quotaWeightedApiPriceEquivalent({ apiPriceEquivalentUsd: Number(standard.totalUsd),
+          model: event.modelId, mode: "ultrafast", eventTime: event.eventTime, totalInputContextTokens,
+          standardPriceCardIds: standard.selectedPriceCardIds });
+        expect(worker).toMatchObject({ exactCostUsd: expected[index], coverageStatus: "fully_priced",
+          coveragePercent: 100, unknownBillableUnits: 0, speedMultiplier: null, apiServiceTier: "ultrafast",
+          tierBasis: billingSurface === "openai_api" ? "observed_api_service_tier" : "subscription_speed_exact_ultrafast_card",
+          subscriptionSpeedMode: "ultrafast", methodVersion: "server-api-price-equivalent-v0.6" });
+        expect(worker.exactCostUsd).toBe(local.totalUsd);
+        expect(Number(worker.exactCostUsd)).toBe(weighted.usd);
+        expect(weighted.multiplier).toBe(6);
+        expect(worker.selectedPriceCardIds).toEqual(local.selectedPriceCardIds);
+        expect(worker.selectedPriceCardIds.every((id) => id.includes("ultrafast"))).toBe(true);
+        expect(worker.registrySha256).toBe(local.registry?.sha256);
+      }
+    }
+  });
+
+  it("keeps unsupported Ultrafast models, pre-release epochs and unknown contexts unpriced", () => {
+    for (const billingSurface of ["openai_api", "chatgpt_subscription"] as const) {
+      const baseline = fixture({ billingSurface, modelId: "gpt-6-astra", eventTime: "2026-09-29T00:00:00.000Z",
+        speedMode: "ultrafast", apiServiceTier: billingSurface === "openai_api" ? "ultrafast" : "unknown" });
+      const unsupported = [
+        ...(["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol"] as const).map((modelId) => ({ ...baseline, modelId })),
+        { ...baseline, eventTime: "2026-09-28T23:59:59.999Z" },
+        { ...baseline, totalInputContextTokens: null },
+      ];
+      for (const rawEvent of unsupported) {
+        const event = validateIngestibleEvent(rawEvent);
+        const worker = priceTelemetryUsageEvent(event);
+        const local = priceCodexUsageEvent({ model: event.modelId, timestamp: event.eventTime,
+          totalInputContextTokens: event.totalInputContextTokens, components: event.components,
+        }, { apiServiceTier: "ultrafast", priceEpochBasis: "event_time" });
+        expect(worker).toMatchObject({ exactCostUsd: "0", costNanousd: 0,
+          coverageStatus: "unpriced", coveragePercent: 0, priceBasis: "unpriced",
+          selectedPriceCardIds: [], speedMultiplier: null, apiServiceTier: "ultrafast" });
+        expect(worker.unknownBillableUnits).toBeGreaterThan(0);
+        expect(worker.unpricedReasonCodes.length).toBeGreaterThan(0);
+        // The server has an explicit context guard; the local kernel may
+        // recover input context from known token components when none is supplied.
+        if (event.totalInputContextTokens !== null) {
+          expect(local.coverageStatus).toBe("unpriced");
+          expect(local.selectedPriceCardIds).toEqual([]);
+        } else expect(worker.unpricedReasonCodes).toEqual(["total_input_context_missing"]);
+      }
+    }
+    const claude = validateIngestibleEvent(fixture({ provider: "anthropic_claude_code", modelId: "claude-sonnet-4-6",
+      eventTime: "2026-09-29T00:00:00.000Z", billingSurface: "claude_subscription", speedMode: "ultrafast",
+      apiServiceTier: "unknown", reasoningEffort: "unknown", components: { ...fixture().components,
+        inputCacheWrite5mTokens: 0, inputCacheWrite1hTokens: 0,
+        outputTextTokens: null, outputReasoningTokens: null, outputCombinedTokens: 75 },
+    }));
+    expect(priceTelemetryUsageEvent(claude)).toMatchObject({ exactCostUsd: "0", costNanousd: 0,
+      coverageStatus: "unpriced", apiServiceTier: "unknown", selectedPriceCardIds: [],
+      speedMultiplier: null, unpricedReasonCodes: ["api_service_tier_unavailable"] });
+  });
+
+  it("does not turn unsupported zero-token Ultrafast into a fully priced event", () => {
+    const baseline = fixture({ eventTime: "2026-09-29T00:00:00.000Z", speedMode: "ultrafast", apiServiceTier: "ultrafast",
+      components: { ...fixture().components, inputUncachedTokens: 0, inputCacheReadTokens: 0,
+        inputCacheWriteTokens: 0, outputTextTokens: 0, outputReasoningTokens: 0 } });
+    for (const billingSurface of ["openai_api", "chatgpt_subscription"] as const) {
+      for (const modelId of ["gpt-6.1-sol", "gpt-6-astra"] as const) {
+        for (const eventTime of ["2026-09-29T00:00:00.000Z", "2026-09-28T23:59:59.999Z"]) {
+          const event = validateIngestibleEvent({ ...baseline, billingSurface, modelId, eventTime });
+          const worker = priceTelemetryUsageEvent(event);
+          if (modelId === "gpt-6-astra" && eventTime === baseline.eventTime) {
+            expect(worker).toMatchObject({ exactCostUsd: "0", coverageStatus: "fully_priced" });
+          } else {
+            expect(worker).toMatchObject({ exactCostUsd: "0", coverageStatus: "unpriced", coveragePercent: 0,
+              selectedPriceCardIds: [], speedMultiplier: null, unpricedReasonCodes: ["service_tier_exact_card_missing"] });
+          }
+        }
+      }
+    }
+  });
+
   it("prices every registry Priority model, alias and epoch identically to the local kernel", () => {
     let checked = 0;
     let checkedAstra = 0;
@@ -272,8 +421,8 @@ describe("server pricing", () => {
       }
     }
     expect(checkedAstra).toBe(2);
-    expect(checked - checkedAstra).toBe(30);
-    expect(checked).toBe(32);
+    expect(checked - checkedAstra).toBe(32);
+    expect(checked).toBe(34);
     const provenance: SpeedModeProvenance = "assumed_fast_scenario";
     expect(resolveEffectiveSpeedMode({ unresolvedScenario: "unresolved_as_fast" }).provenance).toBe(provenance);
   });
@@ -296,7 +445,7 @@ describe("server pricing", () => {
     const missing = priceTelemetryUsageEvent(registryModelPricingFixture("gpt-5.6-sol-wm", { totalInputContextTokens: null }));
     expect(missing.coverageStatus).toBe("unpriced");
     expect(missing.unpricedReasonCodes).toContain("total_input_context_missing");
-    expect(SERVER_PRICING_METHOD_VERSION).toBe("server-api-price-equivalent-v0.5");
+    expect(SERVER_PRICING_METHOD_VERSION).toBe("server-api-price-equivalent-v0.6");
   });
 
   it("matches the frozen accounting kernel projection on supported fixtures", () => {

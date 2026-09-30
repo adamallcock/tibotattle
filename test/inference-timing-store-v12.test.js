@@ -4,7 +4,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { chmod, mkdir, mkdtemp, realpath, rm, writeFile, appendFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createParser, digest, METHOD, MAX_STATE_BYTES } from '../src/providers/codex/logs.js';
+import { createParser, createToolFreeParser, digest, METHOD, TOOL_FREE_METHOD, MAX_STATE_BYTES, INFERENCE_TIMING_PARSER_VERSION } from '../src/providers/codex/logs.js';
 import { ingestTimingFile, openTimingStore, readTimingRows } from '../src/platform/inference-timing-store.js';
 
 const BASE = Date.parse('2026-09-01T12:00:00Z');
@@ -57,7 +57,9 @@ test('opens the prior method-2 schema, adds nullable v1.2 columns, and preserves
     const sourceColumns = new Set(store.db.prepare('PRAGMA table_info(source)').all().map(row => row.name));
     assert.ok(sourceColumns.has('revision'));
     assert.ok(sourceColumns.has('telemetry_revision'));
-    assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 4);
+    assert.ok(sourceColumns.has('parser_version'));
+    assert.ok(sourceColumns.has('replay_parser_version'));
+    assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 6);
     assert.notEqual(store.db.prepare('PRAGMA user_version').get().user_version, METHOD,
       'the pre-v1.2 writer method cannot reopen the upgraded store');
     const rows = readTimingRows(store);
@@ -65,6 +67,127 @@ test('opens the prior method-2 schema, adds nullable v1.2 columns, and preserves
     assert.equal(rows[0].duration, 1000);
     assert.equal(Object.hasOwn(rows[0], 'turn_duration'), false, 'old rows keep the legacy reporting shape');
   } finally { store.close(); }
+});
+
+test('parser upgrades replay unchanged verified sources once without changing stable turn identities', async t => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'timing-parser-replay-')));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const file = join(root, 'source.jsonl');
+  const rows = fixture();
+  Object.assign(rows.find(row => row.type === 'turn_context').payload, { model: 'gpt-6.1-sol', service_tier: 'ultrafast' });
+  await writeFile(file, lines(rows), { mode: 0o600 });
+  for (const [name, parser, method, oldSchema, newSchema] of [
+    ['primary', createParser, METHOD, 4, 6],
+    ['supplement', createToolFreeParser, TOOL_FREE_METHOD, 5, 7],
+  ]) {
+    const directory = join(root, name);
+    const config = { ...options, createParser: parser, METHOD: method };
+    const old = await openTimingStore(directory, config);
+    await ingestTimingFile(old, file);
+    old.db.prepare("UPDATE turn SET speed_mode='other',model=NULL").run();
+    const oldKey = Buffer.from(old.db.prepare('SELECT key FROM turn').get().key);
+    const oldRows = readTimingRows(old);
+    old.db.exec(`DROP TABLE parser_replay_turn; ALTER TABLE source DROP COLUMN parser_version;
+      ALTER TABLE source DROP COLUMN replay_parser_version; PRAGMA user_version=${oldSchema}`);
+    old.close();
+    const current = await openTimingStore(directory, { ...config, parserVersion: INFERENCE_TIMING_PARSER_VERSION });
+    try {
+      assert.equal(current.db.prepare('PRAGMA user_version').get().user_version, newSchema);
+      assert.deepEqual(readTimingRows(current), oldRows, 'opening only adds provenance; it does not relabel old evidence');
+      assert.equal(readTimingRows(current, { withRevision: true }).sources[0].parserVersion, 0);
+      const before = current.db.prepare('SELECT * FROM source').get();
+      const cancel = new AbortController();
+      await assert.rejects(ingestTimingFile(current, file, { signal: cancel.signal, onReadLine: () => cancel.abort() }), /cancelled/u);
+      assert.deepEqual(current.db.prepare('SELECT * FROM source').get(), before);
+      assert.deepEqual(readTimingRows(current), oldRows, 'cancelled replay preserves earlier measurements');
+      const replay = await ingestTimingFile(current, file);
+      assert.equal(replay.replayed, true);
+      assert.equal(replay.invalidated, true);
+      assert.equal(replay.revision, 1);
+      assert.deepEqual(Buffer.from(current.db.prepare('SELECT key FROM turn').get().key), oldKey);
+      const after = readTimingRows(current, { withRevision: true });
+      assert.equal(after.rows.length, 1);
+      assert.equal(after.rows[0].model, 'gpt-6.1-sol');
+      assert.equal(after.rows[0].speed_mode, 'ultrafast');
+      assert.equal(after.rows[0].api_service_tier, 'unknown');
+      assert.equal(after.sources[0].parserVersion, INFERENCE_TIMING_PARSER_VERSION);
+      assert.equal(after.sources[0].telemetryRevision, 2);
+      assert.deepEqual(await ingestTimingFile(current, file), { bytes: 0, unchanged: true });
+      await assert.rejects(openTimingStore(directory, { ...config, parserVersion: INFERENCE_TIMING_PARSER_VERSION - 1 }), /incompatible_parser_version/u);
+    } finally { current.close(); }
+  }
+});
+
+test('bounded parser repair keeps last-good rows until the complete replay commits after restart', async t => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'timing-parser-staging-')));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const file = join(root, 'source.jsonl'), directory = join(root, 'timing');
+  const first = fixture();
+  Object.assign(first.find(row => row.type === 'turn_context').payload, { model: 'gpt-6.1-sol', service_tier: 'ultrafast' });
+  const second = JSON.parse(JSON.stringify(first.slice(1)).replaceAll('synthetic-turn', 'synthetic-next-turn')
+    .replaceAll('synthetic-response', 'synthetic-next-response'));
+  for (const row of second) {
+    row.timestamp = new Date(Date.parse(row.timestamp) + 2000).toISOString();
+    for (const key of ['started_at_ms', 'completed_at_ms']) if (Object.hasOwn(row.payload, key)) row.payload[key] += 2000;
+  }
+  await writeFile(file, lines([...first, ...second]), { mode: 0o600 });
+  const priorVersion = INFERENCE_TIMING_PARSER_VERSION - 1;
+  const old = await openTimingStore(directory, { ...options, parserVersion: priorVersion });
+  await ingestTimingFile(old, file);
+  old.db.exec("UPDATE turn SET model=NULL,speed_mode='other'");
+  const before = readTimingRows(old);
+  assert.equal(before.length, 2);
+  old.close();
+  const currentOptions = { ...options, parserVersion: INFERENCE_TIMING_PARSER_VERSION };
+  let current = await openTimingStore(directory, currentOptions);
+  try {
+    const partial = await ingestTimingFile(current, file, { maxBytes: Buffer.byteLength(lines(first)) });
+    assert.equal(partial.replayed, true);
+    assert.equal(partial.invalidated, false);
+    assert.equal(partial.revision, 0);
+    assert.deepEqual(readTimingRows(current), before);
+    assert.equal(current.db.prepare('SELECT COUNT(*) AS count FROM parser_replay_turn').get().count, 1);
+    const source = current.db.prepare('SELECT * FROM source').get();
+    assert.equal(source.parser_version, priorVersion);
+    assert.equal(source.replay_parser_version, INFERENCE_TIMING_PARSER_VERSION);
+    const cancel = new AbortController();
+    await assert.rejects(ingestTimingFile(current, file, { signal: cancel.signal, onReadLine: () => cancel.abort() }), /cancelled/u);
+    assert.deepEqual(current.db.prepare('SELECT * FROM source').get(), source);
+    assert.deepEqual(readTimingRows(current), before);
+    current.close();
+    await assert.rejects(openTimingStore(directory, { ...options, parserVersion: priorVersion }), /incompatible_parser_version/u);
+    current = await openTimingStore(directory, currentOptions);
+    assert.deepEqual(readTimingRows(current), before);
+    const complete = await ingestTimingFile(current, file);
+    assert.equal(complete.replayed, true);
+    assert.equal(complete.invalidated, true);
+    assert.equal(complete.revision, 1);
+    const after = readTimingRows(current, { withRevision: true });
+    assert.equal(after.rows.length, 2);
+    assert.ok(after.rows.every(row => row.model === 'gpt-6.1-sol' && row.speed_mode === 'ultrafast'));
+    assert.equal(after.sources[0].parserVersion, INFERENCE_TIMING_PARSER_VERSION);
+    assert.equal(after.sources[0].replayParserVersion, 0);
+    assert.equal(current.db.prepare('SELECT COUNT(*) AS count FROM parser_replay_turn').get().count, 0);
+    assert.deepEqual(await ingestTimingFile(current, file), { bytes: 0, unchanged: true });
+  } finally { current.close(); }
+});
+
+test('parser repair preserves retained evidence when a source is unavailable or rewritten', async t => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'timing-parser-source-')));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const file = join(root, 'source.jsonl'), directory = join(root, 'timing');
+  await writeFile(file, lines(fixture()), { mode: 0o600 });
+  const old = await openTimingStore(directory, options);
+  await ingestTimingFile(old, file);
+  const before = readTimingRows(old, { withRevision: true });
+  old.close();
+  const current = await openTimingStore(directory, { ...options, parserVersion: INFERENCE_TIMING_PARSER_VERSION });
+  try {
+    await assert.rejects(ingestTimingFile(current, join(root, 'missing.jsonl')));
+    await writeFile(file, lines(fixture()).replace('gpt-5.6-sol', 'gpt-6-astra'), { mode: 0o600 });
+    await assert.rejects(ingestTimingFile(current, file), /source_rewritten/u);
+    assert.deepEqual(readTimingRows(current, { withRevision: true }), before);
+  } finally { current.close(); }
 });
 
 test('replays an exhausted source after append and advances a content-free revision fence', async t => {

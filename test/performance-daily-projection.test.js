@@ -286,10 +286,11 @@ test("projects the public Codex parser output, including full-turn tool wait evi
   assert.equal(oldRecord.apiServiceTier, "unknown");
 });
 
-test("keeps fast, standard, and mixed mode evidence in separate cohorts", () => {
+test("keeps ultrafast, fast, standard, and mixed mode evidence in separate cohorts", () => {
   const records = project([
     row(),
     row({ speed_mode: "fast", speed_mode_source: "lineage_inherited" }),
+    row({ speed_mode: "ultrafast", speed_mode_source: "turn_context_service_tier", api_service_tier: "ultrafast" }),
     row({ speed_mode: "mixed", speed_mode_source: "mixed" }),
     row({ speed_mode: "fast", speed_mode_source: "mixed" }),
     row({ effort: "not-an-effort" }),
@@ -302,9 +303,11 @@ test("keeps fast, standard, and mixed mode evidence in separate cohorts", () => 
     ["high", "fast", "lineage_inherited"],
     ["high", "mixed", "mixed"],
     ["high", "standard", "rollout_thread_settings"],
+    ["high", "ultrafast", "turn_context_service_tier"],
     ["high", "unknown", "unobserved"],
     ["unknown", "standard", "rollout_thread_settings"],
   ]);
+  assert.equal(records.find(record => record.speedMode === "ultrafast").apiServiceTier, "unknown");
 });
 
 test("disjoint single-row projections merge to the same fixed histograms", () => {

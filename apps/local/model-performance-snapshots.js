@@ -4,10 +4,11 @@ import { createValidatedSnapshotStore } from '../../src/platform/index.js';
 
 export const MODEL_PERFORMANCE_PERIODS = Object.freeze(['1', '7', '30', 'all']);
 export const MODEL_PERFORMANCE_MAX_WINDOWS = 8;
-export const MODEL_PERFORMANCE_SPEED_MODES = Object.freeze(['standard', 'fast']);
+export const MODEL_PERFORMANCE_SPEED_MODES = Object.freeze(['standard', 'fast', 'ultrafast']);
 export const modelPerformanceSnapshotKey = (period, speedMode) => `${period}:${speedMode}`;
 const DAY = 86_400_000;
 const MODEL_NAMES = Object.freeze({
+  'gpt-6.1-sol': 'GPT-6.1 Sol',
   'gpt-6-luna': 'GPT-6 Luna', 'gpt-6-sol': 'GPT-6 Sol',
   'gpt-5.6-luna': 'Luna', 'gpt-5.6-terra': 'Terra', 'gpt-5.6-sol': 'Sol',
   'gpt-6-astra': 'Astra', 'gpt-5.5': 'GPT-5.5', 'gpt-5.4': 'GPT-5.4',

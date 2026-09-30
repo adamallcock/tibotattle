@@ -1,12 +1,12 @@
 // Shared decorative model identity for public charts and local usage tables.
-// GPT-6 Sol/Luna reuse their GPT-5.6 family icons. The canonical catalog
+// GPT-6/6.1 Sol and GPT-6 Luna reuse their GPT-5.6 family icons. The canonical catalog
 // and accounting package own recognition and pricing separately.
 const MODEL_PRESENTATION_ORDER = Object.freeze([
-  "gpt-6-astra", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6-terra",
+  "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6-terra",
   "gpt-6-luna", "gpt-5.6-luna", "gpt-5.5",
 ]);
 const MODEL_PRESENTATION_THEMES = Object.freeze([
-  "astra", "sol", "sol", "terra", "luna", "luna", "classic",
+  "astra", "sol", "sol", "sol", "terra", "luna", "luna", "classic",
 ]);
 
 // Shared visual identity only. Admin retains its private preview contract and

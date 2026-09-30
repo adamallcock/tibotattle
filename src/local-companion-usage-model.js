@@ -3,7 +3,7 @@ import {
   addUsdStrings,
   emptySpeedWeightingCrossing,
   FAST_MODE_MODEL_FAMILY_KEYS,
-  fastModeModelFamilyKey,
+  speedModeModelFamilyKey,
   OBSERVED_SPEED_MODE_KEYS,
   priceCodexUsageEvent,
 } from "@app-usagemonitor/accounting";
@@ -42,8 +42,8 @@ export const COMPONENT_KEYS = Object.freeze([
 // drift apart and disagree about what counts as recognised.
 const SPARK_MODEL = OPENAI_CODEX_SPARK_MODEL_ID;
 
-export const KNOWN_SPEEDS = new Set(["standard", "fast", "flex", "batch", "unknown"]);
-export const KNOWN_API_TIERS = new Set(["standard", "priority", "flex", "batch", "unknown"]);
+export const KNOWN_SPEEDS = new Set(["standard", "fast", "ultrafast", "flex", "batch", "unknown"]);
+export const KNOWN_API_TIERS = new Set(["standard", "priority", "ultrafast", "flex", "batch", "unknown"]);
 export const KNOWN_SURFACES = new Set([
   "extension_or_ide",
   "scheduled_task",
@@ -237,7 +237,21 @@ export function usageProjection(record, declaredSpeed = "unknown", pricer = null
   const totalTokens = recorded.totalTokens ?? 0;
   if (totalTokens === 0) return null;
   const model = safeModel(record.model);
-  const pricingEvent = { timestamp: record.observedAt, model };
+  const pricingComponents = { ...recorded.components };
+  // The combined output alias is intentionally absent when the selected
+  // representation is the split. It is not a missing billable component.
+  if (pricingComponents.output_combined_tokens === null) {
+    delete pricingComponents.output_combined_tokens;
+  }
+  // Display totals sum the observed quantities. Pricing must retain missing
+  // components as unavailable so they cannot establish a zero-input context
+  // or turn an output-only observation into a complete price.
+  const pricingEvent = {
+    timestamp: record.observedAt,
+    model,
+    componentAvailability: Object.fromEntries(Object.entries(pricingComponents)
+      .map(([key, value]) => [key, value !== null])),
+  };
   if (Number.isSafeInteger(record.totalInputContextTokens)
       && record.totalInputContextTokens >= 0) {
     pricingEvent.totalInputContextTokens = record.totalInputContextTokens;
@@ -249,10 +263,10 @@ export function usageProjection(record, declaredSpeed = "unknown", pricer = null
     // whenever its per-(model, band, date) plan cannot be proven exact, so
     // the figures are identical either way — only the wall time differs.
     priced = pricer !== null
-      ? pricer(pricingEvent, components)
+      ? pricer(pricingEvent, pricingComponents)
       : priceCodexUsageEvent({
         ...pricingEvent,
-        components,
+        components: pricingComponents,
       }, {
         // Subscription speed and the API billing tier are separate concepts.
         // Standard is the explicit counterfactual until an API tier is
@@ -303,7 +317,8 @@ export function usageProjection(record, declaredSpeed = "unknown", pricer = null
     : [];
   return {
     model,
-    fastModeFamily: fastModeModelFamilyKey(model, {
+    fastModeFamily: speedModeModelFamilyKey(model, ["standard", "fast", "ultrafast"].includes(record.tierSemantics?.codexSpeedMode)
+      ? record.tierSemantics.codexSpeedMode : declaredSpeed, {
       eventTime: record.observedAt,
       standardPriceCardIds: priceCardIds,
     }),
@@ -399,7 +414,8 @@ function addDeclaredSpeedWeighting(crossing, projection) {
   // Only a declaration that resolved to a real mode is recorded, and only for
   // events the log left unobserved; everything else is left unattributed.
   if (projection.declaredSpeed !== "standard"
-      && projection.declaredSpeed !== "fast") return;
+      && projection.declaredSpeed !== "fast"
+      && projection.declaredSpeed !== "ultrafast") return;
   const family = projection.fastModeFamily ?? "unsupported";
   const row = crossing[projection.declaredSpeed] ??= {};
   const cell = row[family] ??= { events: 0, apiPriceEquivalentUsd: 0 };

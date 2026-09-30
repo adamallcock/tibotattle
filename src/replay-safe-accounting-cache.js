@@ -43,10 +43,12 @@ import {
   addUsdStrings,
   costWarningCodes,
   emptySpeedWeightingCrossing,
-  fastModeModelFamilyKey,
+  speedModeModelFamilyKey,
+  quotaWeightedApiPriceEquivalent,
   FAST_MODE_ASSUMED_MULTIPLIER,
   FAST_MODE_QUOTA_MULTIPLIERS,
   priceCodexUsageEvent,
+  APP_OFFICIAL_PRICE_CARDS,
   APP_PRICE_REGISTRY_MANIFEST,
 } from "@app-usagemonitor/accounting";
 import { codexPrimaryAllowanceBasis } from "./codex-primary-allowance-basis.js";
@@ -140,8 +142,13 @@ import {
 // and stores a plan-separated five-hour fit. A v0.15 cache discarded every
 // 300-minute main-track snapshot, so that evidence cannot be reconstructed at
 // read time and the five-hour history must remain unavailable until rebuild.
+// v0.17: third-mode crossings and explicit unavailable Ultrafast scenarios.
+// Never reuse a binary-speed cache under the new weighting contract.
+// v0.18: preserve unavailable context/components and derive fast-plan context
+// bands from reviewed cards. Rebuild prior totals rather than treating unknown
+// context as zero or reusing a short-context plan above a model's threshold.
 export const REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION =
-  "local-replay-safe-accounting-v0.16";
+  "local-replay-safe-accounting-v0.18";
 const { scanCodexLogEvents } = localCodexLogScanner;
 const ALLOWANCE_CAPACITY_SCHEMA_VERSION =
   "codex-primary-allowance-capacity-v0.1";
@@ -163,7 +170,7 @@ export const REPLAY_SAFE_ACCOUNTING_CONTEXT_BEHAVIORS = Object.freeze([
   "source_native",
 ]);
 
-const DEFAULT_ACCOUNTING_CONTEXT_BEHAVIOR = "legacy_zero";
+const DEFAULT_ACCOUNTING_CONTEXT_BEHAVIOR = "source_native";
 const SOURCE_DESCRIPTOR_VERSION = "local-accounting-source-descriptor-v1";
 const GENERATION_TOKEN = /^[A-Za-z0-9._:-]{1,256}$/u;
 const ACCOUNTING_SOURCE_ERROR_CODES = Object.freeze({
@@ -542,8 +549,8 @@ const COMPONENT_KEYS = Object.freeze([
   "output_reasoning_tokens",
   "output_combined_tokens",
 ]);
-const SPEEDS = new Set(["standard", "fast", "flex", "batch", "unknown"]);
-const API_TIERS = new Set(["standard", "priority", "flex", "batch", "unknown"]);
+const SPEEDS = new Set(["standard", "fast", "ultrafast", "flex", "batch", "unknown"]);
+const API_TIERS = new Set(["standard", "priority", "ultrafast", "flex", "batch", "unknown"]);
 const SURFACES = new Set([
   "extension_or_ide",
   "scheduled_task",
@@ -1213,18 +1220,56 @@ function flushExactUsd(target, key) {
 // same pricer the replay-safe cache itself accounts with.
 export function createAccountingPricer() {
   const plans = new Map();
+  const contextFloors = new Map();
   return (event, components) => {
-    // The reviewed pricer bands by the provider-reported total input context
-    // when present, and otherwise by the sum of the input token components.
-    // The plan key must reproduce that rule exactly: keying the band off the
-    // reported total alone silently priced every 272k+ event whose record
-    // lacks the field at short-context rates.
-    const reportedTotal = Number(event.totalInputContextTokens);
+    // Incomplete observations need the full ledger's coverage and context
+    // checks. Zero-filled display totals cannot establish an exact unit plan.
+    if (COMPONENT_KEYS.some((name) => (
+      components[name] === null
+      || event.componentAvailability?.[name] === false
+      || (name.startsWith("input_") && !Number.isSafeInteger(components[name]))
+    ))) {
+      return priceCodexUsageEvent({ ...event, components }, {
+        apiServiceTier: "standard", priceEpochBasis: "event_time",
+      });
+    }
+    // Derive the threshold from the public reviewed cards. Older models begin
+    // the long band at 272,000; GPT6 models begin at 272,001. The representative
+    // template must itself belong to the keyed band.
+    if (!contextFloors.has(event.model)) {
+      const floors = new Set(APP_OFFICIAL_PRICE_CARDS
+        .filter((card) => card.provider === "openai"
+          && card.service_tier === "standard"
+          && (card.model === event.model || card.aliases?.includes(event.model)))
+        .flatMap((card) => card.components
+          .filter((component) => component.unit === "token")
+          .map((component) => component.conditions?.min_total_input_tokens)
+          .filter((floor) => floor !== undefined)
+          .map(Number)));
+      contextFloors.set(event.model, floors.size === 1
+        ? [...floors][0] : floors.size === 0 ? Infinity : null);
+    }
+    const contextFloor = contextFloors.get(event.model);
+    if (contextFloor === null) {
+      return priceCodexUsageEvent({ ...event, components }, {
+        apiServiceTier: "standard", priceEpochBasis: "event_time",
+      });
+    }
+    const suppliedTotal = event.totalInputContextTokens
+      ?? (event.rawAvailability === undefined || event.rawAvailability?.input_tokens === true
+        ? event.raw?.input_tokens : null);
+    const reportedTotal = suppliedTotal === undefined || suppliedTotal === null
+      ? null : Number(suppliedTotal);
+    if (reportedTotal !== null && (!Number.isSafeInteger(reportedTotal) || reportedTotal < 0)) {
+      return priceCodexUsageEvent({ ...event, components }, {
+        apiServiceTier: "standard", priceEpochBasis: "event_time",
+      });
+    }
     const inputSum = (components.input_uncached_tokens ?? 0)
       + (components.input_cache_read_tokens ?? 0)
       + (components.input_cache_write_tokens ?? 0);
     const contextBand =
-      (Number.isFinite(reportedTotal) ? reportedTotal : inputSum) >= 272_000
+      (reportedTotal ?? inputSum) >= contextFloor
         ? "long"
         : "short";
     // Keep the effective date in the fast-plan key: official price cards may
@@ -1243,7 +1288,7 @@ export function createAccountingPricer() {
       const template = priceCodexUsageEvent({
         ...event,
         totalInputContextTokens:
-          contextBand === "long" ? 272_000 : 0,
+          contextBand === "long" ? contextFloor : 0,
         components: templateComponents,
       }, {
         apiServiceTier: "standard",
@@ -1385,18 +1430,23 @@ function eventProjection(event, price) {
   if (totalTokens === 0) return null;
   const model = safeModel(event.model);
   const combinedOnly = components.output_combined_tokens > 0;
-  const pricingComponents = combinedOnly
-    ? {
-      ...components,
-      output_text_tokens: components.output_combined_tokens,
-      output_combined_tokens: 0,
-    }
-    : components;
+  const pricingComponents = { ...event.components };
+  const pricingAvailability = { ...event.componentAvailability };
+  // An unselected aggregate alias is not a missing independent quantity.
+  delete pricingComponents.output_combined_tokens;
+  delete pricingAvailability.output_combined_tokens;
+  if (combinedOnly) {
+    pricingComponents.output_text_tokens = components.output_combined_tokens;
+    pricingComponents.output_reasoning_tokens = 0;
+    pricingAvailability.output_text_tokens = true;
+    pricingAvailability.output_reasoning_tokens = true;
+  }
   let priced;
   try {
     priced = price({
       ...event,
       model,
+      componentAvailability: pricingAvailability,
     }, pricingComponents);
     if (combinedOnly) {
       priced = {
@@ -1423,7 +1473,7 @@ function eventProjection(event, price) {
   return {
     timestamp: event.timestamp,
     model,
-    fastModeFamily: fastModeModelFamilyKey(model, {
+    fastModeFamily: speedModeModelFamilyKey(model, event.tierSemantics?.codexSpeedMode, {
       eventTime: event.timestamp,
       standardPriceCardIds: priced.selectedPriceCardIds ?? [],
     }),
@@ -1472,17 +1522,19 @@ function transitionUsageProjection(event, projection) {
   // Standard cost separately in the explicit unsupported/assumed bucket.
   const fastWeightedEquivalentUsd =
     costUsd * (multiplier ?? FAST_MODE_ASSUMED_MULTIPLIER);
-  const effectiveSpeed = ["standard", "fast"].includes(projection.speed)
+  const effectiveSpeed = ["standard", "fast", "ultrafast"].includes(projection.speed)
     ? projection.speed
-    : ["standard", "fast"].includes(projection.declaredSpeed)
+    : ["standard", "fast", "ultrafast"].includes(projection.declaredSpeed)
       ? projection.declaredSpeed
       : "unknown";
-  const quotaWeightedLowerUsd = effectiveSpeed === "fast"
-    ? fastWeightedEquivalentUsd
-    : costUsd;
-  const quotaWeightedUpperUsd = effectiveSpeed === "standard"
-    ? costUsd
-    : fastWeightedEquivalentUsd;
+  const ultrafastUsd = effectiveSpeed === "ultrafast" ? quotaWeightedApiPriceEquivalent({
+    apiPriceEquivalentUsd: costUsd, model: projection.model, mode: effectiveSpeed,
+    eventTime: event.timestamp, standardPriceCardIds: projection.priced.selectedPriceCardIds,
+  }).usd : null;
+  const quotaWeightedLowerUsd = effectiveSpeed === "ultrafast" ? ultrafastUsd
+    : effectiveSpeed === "fast" ? fastWeightedEquivalentUsd : costUsd;
+  const quotaWeightedUpperUsd = effectiveSpeed === "ultrafast" ? ultrafastUsd
+    : effectiveSpeed === "standard" ? costUsd : fastWeightedEquivalentUsd;
   return [
     canonicalInstant(event.timestamp),
     projection.model,
@@ -2152,12 +2204,16 @@ function projectWeeklyPaceForecast(rows, endMs) {
 }
 
 function addSpeedWeighting(crossing, event) {
-  // "fast", "standard" and "unknown" are the only observed values; anything
+  // Standard, Fast, Ultrafast and unknown are the reviewed values; anything
   // else collapses to unknown rather than being treated as Standard.
-  const speed = ["standard", "fast", "unknown"].includes(event.speed)
+  const speed = ["standard", "fast", "ultrafast", "unknown"].includes(event.speed)
     ? event.speed : "unknown";
   const row = crossing[speed] ??= {};
-  const cell = row[event.fastModeFamily ?? "unsupported"] ??= {
+  const effectiveMode = speed === "unknown" ? event.declaredSpeed : speed;
+  const family = speedModeModelFamilyKey(event.model, effectiveMode, {
+    eventTime: event.timestamp, standardPriceCardIds: event.priced.selectedPriceCardIds ?? [],
+  });
+  const cell = row[family] ??= {
     events: 0, apiPriceEquivalentUsd: 0,
   };
   cell.events += 1;
@@ -2167,11 +2223,14 @@ function addSpeedWeighting(crossing, event) {
 function addDeclaredSpeedWeighting(crossing, event) {
   // Only a declaration that resolved to a real mode is recorded, and only for
   // events the log left unobserved; everything else is left unattributed.
-  if (event.declaredSpeed !== "standard" && event.declaredSpeed !== "fast") {
+  if (!["standard", "fast", "ultrafast"].includes(event.declaredSpeed)) {
     return;
   }
   const row = crossing[event.declaredSpeed] ??= {};
-  const cell = row[event.fastModeFamily ?? "unsupported"] ??= {
+  const family = speedModeModelFamilyKey(event.model, event.declaredSpeed, {
+    eventTime: event.timestamp, standardPriceCardIds: event.priced.selectedPriceCardIds ?? [],
+  });
+  const cell = row[family] ??= {
     events: 0, apiPriceEquivalentUsd: 0,
   };
   cell.events += 1;
@@ -2577,8 +2636,8 @@ function compactPlanScopedTimelineEvent(row, declaredSpeedBaselines) {
       ? row[index + 3] : null,
   ]));
   const standardUsd = Number(row[10]);
-  const standardScenarioUsd = Number(row[14]);
-  const fastScenarioUsd = Number(row[15]);
+  const standardScenarioUsd = row[14];
+  const fastScenarioUsd = row[15];
   if (timestamp === null || Object.values(components).includes(null)
       || !Number.isFinite(standardUsd) || standardUsd < 0
       || !Number.isFinite(standardScenarioUsd) || standardScenarioUsd < 0
@@ -2586,13 +2645,13 @@ function compactPlanScopedTimelineEvent(row, declaredSpeedBaselines) {
       || !["fully_priced", "partially_priced", "unpriced"].includes(row[12])) {
     return null;
   }
-  const speed = ["standard", "fast"].includes(row[9]) ? row[9] : "unknown";
+  const speed = ["standard", "fast", "ultrafast"].includes(row[9]) ? row[9] : "unknown";
   // Re-run the same timestamped declaration lookup used when the compact row
   // was constructed. Dollar equality is not provenance: it can also arise for
   // a zero-cost event (or a future 1x rate), so inferring a declaration from
   // equal scenario totals would silently relabel unknown evidence.
   const declarationResolved = speed === "unknown"
-    && ["standard", "fast"].includes(
+    && ["standard", "fast", "ultrafast"].includes(
       declaredSpeedModeAt(declaredSpeedBaselines, Date.parse(timestamp)),
     );
   return {
@@ -3761,11 +3820,13 @@ async function openUnifiedIndexCalibrationCorpus({
       await cooperativeYield();
     }
   };
-  const tokenValue = (value) => (
-    Number.isSafeInteger(Number(value)) && Number(value) >= 0
+  const nullableTokenValue = (value) => (
+    value !== null && value !== undefined
+      && Number.isSafeInteger(Number(value)) && Number(value) >= 0
       ? Number(value)
-      : 0
+      : null
   );
+  const tokenValue = (value) => nullableTokenValue(value) ?? 0;
   // Mirrors exactly the rows the priced projection below retains, without
   // paying for pricing: eventProjection returns null only for an all-zero
   // component total, and Spark rows are excluded from the calibration corpus.
@@ -3797,18 +3858,18 @@ async function openUnifiedIndexCalibrationCorpus({
       ...attributionAt(row, position),
       model: row.model_id,
       // NULL means "the record did not report a total"; it must stay
-      // absent so the pricer bands by the summed input components exactly
-      // as it does on the scan path, instead of reading NULL as zero.
+      // absent so the pricer can infer from complete observed inputs, or
+      // withhold conditional prices when those inputs are unavailable.
       ...(row.total_input_context === null
         ? {}
         : { totalInputContextTokens: Number(row.total_input_context) }),
       components: {
-        input_uncached_tokens: tokenValue(row.tokens_in_uncached),
-        input_cache_read_tokens: tokenValue(row.tokens_in_cache_read),
-        input_cache_write_tokens: tokenValue(row.tokens_in_cache_write),
-        output_text_tokens: tokenValue(row.tokens_out_text),
-        output_reasoning_tokens: tokenValue(row.tokens_out_reasoning),
-        output_combined_tokens: tokenValue(row.tokens_out_combined),
+        input_uncached_tokens: nullableTokenValue(row.tokens_in_uncached),
+        input_cache_read_tokens: nullableTokenValue(row.tokens_in_cache_read),
+        input_cache_write_tokens: nullableTokenValue(row.tokens_in_cache_write),
+        output_text_tokens: nullableTokenValue(row.tokens_out_text),
+        output_reasoning_tokens: nullableTokenValue(row.tokens_out_reasoning),
+        output_combined_tokens: nullableTokenValue(row.tokens_out_combined),
       },
       tierSemantics: {
         codexSpeedMode: row.codex_speed_mode,

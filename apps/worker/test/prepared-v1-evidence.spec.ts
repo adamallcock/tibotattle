@@ -158,7 +158,7 @@ describe("reusable elected source-day preparation", () => {
     await ensurePreparedV1Window(db(), source, { maxPages: 1, pageSize: 3, deadlineMs: Date.now() + 60000 });
     await db().prepare("UPDATE community_prepared_source_days SET control_json='{}' WHERE participant_id=?").bind(PID).run();
     await expectUnavailable(prepare(source), "control_invalid");
-    expect(V1_PREPARATION_METHOD_VERSION).toContain("server-api-price-equivalent-v0.5");
+    expect(V1_PREPARATION_METHOD_VERSION).toContain("server-api-price-equivalent-v0.6");
   });
 
   it.each(["control shape", "run shape", "plan row", "fit row"] as const)(

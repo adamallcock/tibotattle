@@ -89,8 +89,8 @@ export interface ContributionRow {
   quota_used_percent_after: number;
   quota_display_precision: number;
   model_id: string;
-  subscription_speed: "standard" | "fast";
-  api_tier_assumption: "standard" | "priority" | "flex";
+  subscription_speed: "standard" | "fast" | "ultrafast";
+  api_tier_assumption: "standard" | "priority" | "ultrafast" | "flex";
   input_uncached_tokens: number;
   input_cached_tokens: number;
   output_text_tokens: number;

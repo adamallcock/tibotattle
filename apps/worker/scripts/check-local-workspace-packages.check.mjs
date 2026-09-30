@@ -177,6 +177,7 @@ test("quota analysis uses the generic byte-exact workspace package guard", async
       "index.d.ts",
       "index.js",
       "package.json",
+      "src/included-allowance-speed.js",
       "src/model-composition.js",
       "src/plan-attribution.js",
       "src/quota-calibration.js",

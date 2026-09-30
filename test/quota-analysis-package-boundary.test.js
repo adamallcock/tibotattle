@@ -10,6 +10,10 @@ const TRACK_EXPORTS = Object.freeze([
   "continuityKey",
   "resetKey",
 ]);
+const INCLUDED_ALLOWANCE_SPEED_EXPORTS = Object.freeze([
+  "CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY",
+  "includedAllowanceSpeedWeight",
+]);
 const CALIBRATION_EXPORTS = Object.freeze([
   "QUOTA_CALIBRATION_POLICY",
   "analyzeQuotaCalibration",
@@ -150,6 +154,7 @@ test("quota analysis exposes one exact runtime-neutral package root", async () =
     Object.keys(quotaAnalysis).sort(),
     [
       ...TRACK_EXPORTS,
+      ...INCLUDED_ALLOWANCE_SPEED_EXPORTS,
       ...CALIBRATION_EXPORTS,
       ...ROLLING_EXPORTS,
       ...PACE_EXPORTS,
@@ -218,6 +223,7 @@ test("root and Worker resolve only the reviewed package root", async () => {
     "buildResetEvidence",
     "analyzeQuotaCalibration",
     "buildRollingQuotaComparisons",
+    "includedAllowanceSpeedWeight",
   ]) {
     assert.match(
       declarationSource,

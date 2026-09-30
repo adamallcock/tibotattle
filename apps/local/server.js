@@ -4,6 +4,7 @@ import {
   createWorkUsageService,
   initialTelemetryPerformanceSyncState,
   parseTelemetryPerformanceSyncState,
+  resumeTelemetryPerformanceSyncAfterAuthorization,
   TELEMETRY_PERFORMANCE_AUTHORIZATION_VERSION,
   TELEMETRY_PERFORMANCE_CAPABILITIES_VERSION,
   TELEMETRY_PERFORMANCE_METHOD_VERSION,
@@ -315,7 +316,7 @@ function openImmutableLocalUnifiedIndex(indexFile) {
   });
 }
 
-const COLD_REFRESH_V18_PREDECESSOR_PARSERS = Object.freeze([
+const COLD_REFRESH_V19_PREDECESSOR_PARSERS = Object.freeze([
   "unified-rollout-typed-v10",
   "unified-rollout-typed-v11",
   "unified-rollout-typed-v12",
@@ -324,21 +325,23 @@ const COLD_REFRESH_V18_PREDECESSOR_PARSERS = Object.freeze([
   "unified-rollout-typed-v15",
   "unified-rollout-typed-v16",
   "unified-rollout-typed-v17",
+  "unified-rollout-typed-v18",
 ]);
 
 function publishedParserUpgradeNeedsColdRefresh(database, compatibility, schemaVersion) {
   // This is a deadline decision, not permission to read or publish facts. The
-  // worker still validates the complete index. Only reviewed v10 through v17
-  // predecessors can receive the v18 rescan window. Their physical schema and
+  // worker still validates the complete index. Only reviewed v10 through v18
+  // predecessors can receive the v19 rescan window. Their physical schema and
   // immutable source identity remain compatible; v12 nullable counters and
   // v13 ordinal-bearing compaction headers and v14 paginated setting boundaries
   // and v15 historical parent-model fallback require reparsing present sources.
   // v16 adds the explicitly approved missing-cache-write assumption with row provenance.
   // v17 retains exact selected input/output totals without changing those assumptions.
   // v18 fixes structural classification and increases the bounded line cap.
+  // v19 refreshes reviewed model identity without changing recorded usage.
   // Keep the target pinned too: a future parser needs an explicit review and
   // must not silently inherit this longer deadline for every mismatch.
-  if (LOCAL_UNIFIED_INDEX_PARSER_VERSION !== "unified-rollout-typed-v18"
+  if (LOCAL_UNIFIED_INDEX_PARSER_VERSION !== "unified-rollout-typed-v19"
       || schemaVersion !== LOCAL_UNIFIED_INDEX_SCHEMA_VERSION
       || !compatibility.metadataPresent
       || compatibility.formatUserVersion !== LOCAL_UNIFIED_INDEX_USER_VERSION
@@ -380,7 +383,7 @@ function publishedParserUpgradeNeedsColdRefresh(database, compatibility, schemaV
           AND g.tool_provenance_complete = 0)
       )
   `).get(generationId);
-  return COLD_REFRESH_V18_PREDECESSOR_PARSERS.includes(generation?.parser_version)
+  return COLD_REFRESH_V19_PREDECESSOR_PARSERS.includes(generation?.parser_version)
     && generation.parser_contract_version === TELEMETRY_SCHEMA_VERSION
     && generation.contract_version === TELEMETRY_SCHEMA_VERSION
     && Number.isSafeInteger(generation.completed_at_ms)
@@ -3284,11 +3287,10 @@ function createPreparedLocalCompanionServer({
   // legacy is retained only for an explicit rollback selection.
   accountingSourceMode =
     configuredAccountingSourceMode(environment),
-  // The declared Codex speed-mode baseline. Codex records the mode only when
-  // it is applied or changed, never at session start, so the baseline lives
-  // nowhere but the configuration's top-level `service_tier` key - and only
-  // that key is ever read from that file. Each reading is stamped with the
-  // moment it happened and attributes only turns from then on.
+  // A declared speed baseline supplements missing per-turn/applied-settings
+  // evidence. Only the configuration's top-level `service_tier` key is read;
+  // each timestamped observation covers its established time interval and
+  // never backfills retained history or overrides explicit tier evidence.
   codexSpeedBaseline = createCodexSpeedBaselineController({
     ledgerFile: statePaths.codexSpeedBaselineFile,
     configFile: join(codexHome, "config.toml"),
@@ -4339,6 +4341,7 @@ function createPreparedLocalCompanionServer({
   let socialPerformanceClient = null;
   let socialPerformanceScheduler = null;
   let socialPerformanceReviewInProgress = false;
+  let socialPerformanceApprovalInProgress = false;
   const purgeReviewedPerformanceAuthorizations = (now) => {
     for (const [token, authorization] of reviewedPerformanceAuthorizations) {
       if (authorization.expiresAt <= now) reviewedPerformanceAuthorizations.delete(token);
@@ -4519,7 +4522,9 @@ function createPreparedLocalCompanionServer({
     return socialPerformanceClient;
   };
   const startSocialPerformanceIfApproved = async () => {
+    if (socialPerformanceApprovalInProgress) return false;
     const consent = await readSocialPerformanceConsent();
+    if (socialPerformanceApprovalInProgress) return false;
     if (consent === null) return false;
     createSocialPerformanceRuntime();
     socialPerformanceScheduler?.start();
@@ -5238,7 +5243,7 @@ function createPreparedLocalCompanionServer({
             || url.searchParams.getAll("endAt").length > 1
             || url.searchParams.getAll("speedMode").length > 1
             || entries.some(([key]) => !["period", "endAt", "speedMode"].includes(key))
-            || !["standard", "fast"].includes(speedMode)
+            || !["standard", "fast", "ultrafast"].includes(speedMode)
             || !["1", "7", "30", "all"].includes(period)
             || (endAt !== null && (!Number.isSafeInteger(end) || end < 0
               || end > Date.now() || new Date(end).toISOString() !== endAt))) {
@@ -5512,7 +5517,15 @@ function createPreparedLocalCompanionServer({
           sendError(response, 409, "performance_not_configured");
           return;
         }
+        if (socialPerformanceApprovalInProgress) {
+          sendError(response, 409, "performance_approval_in_progress");
+          return;
+        }
+        socialPerformanceApprovalInProgress = true;
         try {
+          // Drain the old writer before changing its durable pause. Otherwise
+          // an in-flight rejection can overwrite the renewed approval.
+          await stopSocialPerformance();
           const capability = await readSocialPerformanceDeviceCapability();
           if (!capability || capability.deviceId !== authorization.grantDeviceId) {
             sendError(response, 409, "performance_device_unavailable");
@@ -5534,6 +5547,13 @@ function createPreparedLocalCompanionServer({
             sendError(response, 409, "performance_review_expired_or_changed");
             return;
           }
+          const syncState = parseTelemetryPerformanceSyncState(
+            await readJsonIfExists(socialPerformanceStateFile, null),
+          );
+          const resumedState = resumeTelemetryPerformanceSyncAfterAuthorization(syncState);
+          if (syncState.paused && !resumedState.paused) {
+            await writeJsonOwnerOnlyAtomic(socialPerformanceStateFile, resumedState);
+          }
           await saveSocialPerformanceConsent({
             schemaVersion: LOCAL_PERFORMANCE_CONSENT_STATE_SCHEMA_VERSION,
             approvedAt: new Date(clock()).toISOString(),
@@ -5552,6 +5572,8 @@ function createPreparedLocalCompanionServer({
           });
         } catch {
           sendError(response, 409, "performance_authorization_unavailable");
+        } finally {
+          socialPerformanceApprovalInProgress = false;
         }
         return;
       }

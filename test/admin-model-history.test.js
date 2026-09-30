@@ -59,6 +59,22 @@ test("admin model history fails closed on extra fields, raw IDs, invalid tuples 
   }
 });
 
+test("GPT-6.1 Sol preserves prior catalog coverage and stays separate from GPT-6 Sol", () => {
+  const prior = { ...current(), catalogVersion: "reviewed-model-catalog-2026-09-23.1",
+    values: [["gpt-6-sol", 1_000, 2]] };
+  const old = expandAdminModelHistoryDay(prior);
+  assert.equal(old.catalogVersion, prior.catalogVersion);
+  assert.deepEqual(old.byModel["gpt-6-sol"], { capacityUsd: 1_000, participantCount: 2 });
+  assert.deepEqual(old.byModel["gpt-6.1-astra"], { capacityUsd: null, participantCount: 0 });
+  assert.deepEqual(old.byModel["gpt-6.1-sol"], { capacityUsd: null, participantCount: null });
+  assert.equal(projectAdminModelHistoryDay({ ...prior, values: [["gpt-6.1-sol", 1_000, 1]] }), null);
+  const fresh = expandAdminModelHistoryDay({ ...current(),
+    values: [["gpt-6-sol", 1_000, 2], ["gpt-6.1-sol", 1_200, 1]] });
+  assert.deepEqual(fresh.byModel["gpt-6-sol"], { capacityUsd: 1_000, participantCount: 2 });
+  assert.deepEqual(fresh.byModel["gpt-6.1-sol"], { capacityUsd: 1_200, participantCount: 1 });
+  assert.deepEqual(browser.expandAdminModelHistoryDay(prior), old);
+});
+
 test("70 complete catalog days remain bounded even at maximum count/number serialization", () => {
   const day = { ...current(), ...Object.fromEntries(Object.keys(counts()).map((key) => [key, 0])),
     fittedParticipantCount: Number.MAX_SAFE_INTEGER,

@@ -48,7 +48,7 @@ let reconciliationProof!: TelemetryRuntimeActivationRequest["reconciliation"];
 
 function request(
   target: "usage_v12" | "performance",
-  expectedRevision = 1,
+  expectedRevision = target === "usage_v12" ? 1 : 2,
   idempotencyKey = target === "usage_v12"
     ? "22222222-2222-4222-8222-222222222222"
     : "33333333-3333-4333-8333-333333333333",
@@ -198,12 +198,12 @@ describe("protected telemetry runtime activation", () => {
       request("usage_v12"), NOW_EPOCH);
     expect(usage).toMatchObject({ target: "usage_v12", state: "active", fromRevision: 1, toRevision: 2 });
     expect(await runtimeRow("usage_v12")).toEqual({ state: "active", policy_revision: 2 });
-    expect(await runtimeRow("performance")).toEqual({ state: "staged", policy_revision: 1 });
+    expect(await runtimeRow("performance")).toEqual({ state: "staged", policy_revision: 2 });
 
     const performance = await activateTelemetryRuntimeAsOwner(db(), settings, ACTOR_IDENTITY_KEY,
       request("performance"), NOW_EPOCH);
-    expect(performance).toMatchObject({ target: "performance", state: "active", fromRevision: 1, toRevision: 2 });
-    expect(await runtimeRow("performance")).toEqual({ state: "active", policy_revision: 2 });
+    expect(performance).toMatchObject({ target: "performance", state: "active", fromRevision: 2, toRevision: 3 });
+    expect(await runtimeRow("performance")).toEqual({ state: "active", policy_revision: 3 });
   });
 
   it("refuses a wrong revision and only replays an exact active operation", async () => {
@@ -213,6 +213,12 @@ describe("protected telemetry runtime activation", () => {
       code: "ADMIN_ACTION_CONFLICT",
     });
     expect(await runtimeRow("usage_v12")).toEqual({ state: "staged", policy_revision: 1 });
+    await expect(activateTelemetryRuntimeAsOwner(db(), settings, ACTOR_IDENTITY_KEY,
+      request("performance", 1), NOW_EPOCH)).rejects.toMatchObject({
+      status: 409,
+      code: "ADMIN_ACTION_CONFLICT",
+    });
+    expect(await runtimeRow("performance")).toEqual({ state: "staged", policy_revision: 2 });
 
     await activateTelemetryRuntimeAsOwner(db(), settings, ACTOR_IDENTITY_KEY,
       request("usage_v12"), NOW_EPOCH);
@@ -467,6 +473,9 @@ describe("protected telemetry runtime activation", () => {
 
   it("activates usage when the independent performance schema is absent", async () => {
     await removePerformanceSchema();
+    await db().prepare(
+      "DELETE FROM d1_storage_migrations WHERE name IN (?, ?)",
+    ).bind("0009_performance_reports.sql", "0013_performance_ultrafast.sql").run();
     await installReconciliationProof();
     const usage = await activateTelemetryRuntimeAsOwner(
       db(), settings, ACTOR_IDENTITY_KEY, request("usage_v12"), NOW_EPOCH,
@@ -497,7 +506,51 @@ describe("protected telemetry runtime activation", () => {
       status: 503,
       code: "TELEMETRY_RUNTIME_ACTIVATION_UNAVAILABLE",
     });
-    expect(await runtimeRow("performance")).toEqual({ state: "staged", policy_revision: 1 });
+    expect(await runtimeRow("performance")).toEqual({ state: "staged", policy_revision: 2 });
+  });
+
+  it.each(["missing", "hash mismatch"] as const)("refuses performance activation with a %s Ultrafast migration ledger entry", async (failure) => {
+    if (failure === "missing") {
+      await db().prepare("DELETE FROM d1_storage_migrations WHERE name = ?")
+        .bind("0013_performance_ultrafast.sql").run();
+    } else {
+      await db().prepare("UPDATE d1_storage_migrations SET sha256 = ? WHERE name = ?")
+        .bind("0".repeat(64), "0013_performance_ultrafast.sql").run();
+    }
+    // A fresh proof of an incomplete installation must not authorize it.
+    await installReconciliationProof();
+    await expect(activateTelemetryRuntimeAsOwner(db(), settings, ACTOR_IDENTITY_KEY,
+      request("performance"), NOW_EPOCH)).rejects.toMatchObject({
+      status: 503,
+      code: "TELEMETRY_RUNTIME_ACTIVATION_UNAVAILABLE",
+    });
+    expect(await runtimeRow("performance")).toEqual({ state: "staged", policy_revision: 2 });
+    expect(await db().prepare("SELECT COUNT(*) AS count FROM admin_action_audit")
+      .first<{ count: number }>()).toEqual({ count: 0 });
+    await expect(activateTelemetryRuntimeAsOwner(db(), settings, ACTOR_IDENTITY_KEY,
+      request("usage_v12"), NOW_EPOCH)).resolves.toMatchObject({
+      target: "usage_v12", state: "active", fromRevision: 1, toRevision: 2,
+    });
+  });
+
+  it.each([
+    "telemetry_performance_cohort_dictionary_insert",
+    "telemetry_performance_cohort_dictionary_update",
+  ])("requires the performance dictionary guard %s", async (trigger) => {
+    await db().prepare(`DROP TRIGGER ${trigger}`).run();
+    await installReconciliationProof();
+    await expect(activateTelemetryRuntimeAsOwner(db(), settings, ACTOR_IDENTITY_KEY,
+      request("performance"), NOW_EPOCH)).rejects.toMatchObject({
+      status: 503,
+      code: "TELEMETRY_RUNTIME_ACTIVATION_UNAVAILABLE",
+    });
+    expect(await runtimeRow("performance")).toEqual({ state: "staged", policy_revision: 2 });
+    expect(await db().prepare("SELECT COUNT(*) AS count FROM admin_action_audit")
+      .first<{ count: number }>()).toEqual({ count: 0 });
+    await expect(activateTelemetryRuntimeAsOwner(db(), settings, ACTOR_IDENTITY_KEY,
+      request("usage_v12"), NOW_EPOCH)).resolves.toMatchObject({
+      target: "usage_v12", state: "active", fromRevision: 1, toRevision: 2,
+    });
   });
 
   it("refuses a forward migration ledger hash mismatch", async () => {
@@ -538,7 +591,7 @@ describe("protected telemetry runtime activation", () => {
     await expect(activateTelemetryRuntimeAsOwner(
       db(), settings, ACTOR_IDENTITY_KEY, request("usage_v12"), NOW_EPOCH,
     )).resolves.toMatchObject({ target: "usage_v12", state: "active", toRevision: 2 });
-    expect(await runtimeRow("performance")).toEqual({ state: "staged", policy_revision: 1 });
+    expect(await runtimeRow("performance")).toEqual({ state: "staged", policy_revision: 2 });
   });
 
   it.each(["primary", "analytics"] as const)("refuses a 129-row %s ledger before activation", async (role) => {
@@ -555,7 +608,7 @@ describe("protected telemetry runtime activation", () => {
       db(), settings, ACTOR_IDENTITY_KEY, request("usage_v12"), NOW_EPOCH,
     )).rejects.toMatchObject({ code: "TELEMETRY_RUNTIME_ACTIVATION_UNAVAILABLE" });
     expect(await runtimeRow("usage_v12")).toEqual({ state: "staged", policy_revision: 1 });
-    expect(await runtimeRow("performance")).toEqual({ state: "staged", policy_revision: 1 });
+    expect(await runtimeRow("performance")).toEqual({ state: "staged", policy_revision: 2 });
     expect(await db().prepare("SELECT COUNT(*) AS count FROM admin_action_audit")
       .first<{ count: number }>()).toEqual({ count: 0 });
   });
@@ -586,7 +639,7 @@ describe("protected telemetry runtime activation", () => {
     )).rejects.toMatchObject({ code: "TELEMETRY_RUNTIME_ACTIVATION_UNAVAILABLE" });
     expect(schemaReads).toBe(1);
     expect(await runtimeRow("usage_v12")).toEqual({ state: "staged", policy_revision: 1 });
-    expect(await runtimeRow("performance")).toEqual({ state: "staged", policy_revision: 1 });
+    expect(await runtimeRow("performance")).toEqual({ state: "staged", policy_revision: 2 });
     expect(await db().prepare("SELECT COUNT(*) AS count FROM admin_action_audit")
       .first<{ count: number }>()).toEqual({ count: 0 });
   });

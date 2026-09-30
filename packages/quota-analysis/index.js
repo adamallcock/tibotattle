@@ -5,6 +5,11 @@ export {
 } from "./src/quota-tracks.js";
 
 export {
+  CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY,
+  includedAllowanceSpeedWeight,
+} from "./src/included-allowance-speed.js";
+
+export {
   classifyQuotaResetTimeline,
   createResetEventClassifier,
   mergeQuotaResetEvents,

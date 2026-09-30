@@ -5,6 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { createModelPerformanceController } from "./model-performance-controller.js";
+import { modelPerformanceSourceScope } from "./model-performance-snapshots.js";
+import { createParser, digest, METHOD, MAX_STATE_BYTES, INFERENCE_TIMING_PARSER_VERSION } from "../../src/providers/codex/logs.js";
+import { openTimingStore, ingestTimingFile, readTimingRows } from "../../src/platform/index.js";
 
 const BASE = Date.parse("2026-09-01T12:00:00.000Z");
 const DAY = "2026-09-01";
@@ -83,7 +86,7 @@ function totalTurns(snapshot) {
 async function waitForReady(controller, expectedTurns) {
   const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
-    const snapshots = await Promise.all(["standard", "fast"].map(speedMode => controller.read("all", { speedMode })));
+    const snapshots = await Promise.all(["standard", "fast", "ultrafast"].map(speedMode => controller.read("all", { speedMode })));
     if (snapshots.every(snapshot => snapshot.status === "ready" && !snapshot.collecting && !snapshot.stale)
         && snapshots.reduce((sum, snapshot) => sum + totalTurns(snapshot), 0) === expectedTurns) return snapshots;
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -193,4 +196,62 @@ test("real performance worker advances report provenance through append and late
   assert.equal(correctedStandard.speedHistogram.sampleCount, 2);
   assert.equal(correctedStandard.ttftHistogram.sampleCount, 2);
   assert.equal(correctedStandard.completionHistogram.sampleCount, 2);
+
+  // A later Ultrafast declaration remains independent of both paid modes and
+  // cannot claim an API tier from the subscription-mode setting.
+  await appendFile(sourceB, lines(completeTurn({
+    sessionId: "synthetic-session-b",
+    turnId: "synthetic-ultrafast",
+    start: 1_000_000,
+    serviceTier: "ultrafast",
+  })));
+  const ultrafast = await readPreparedReport(options, 4);
+  assert.equal(ultrafast.records.length, 3);
+  assert.equal(recordFor(ultrafast, "standard").turns, 2);
+  assert.equal(recordFor(ultrafast, "fast").turns, 1);
+  assert.equal(recordFor(ultrafast, "ultrafast").turns, 1);
+  assert.equal(recordFor(ultrafast, "ultrafast").apiServiceTier, "unknown");
+  assert.notEqual(ultrafast.reportRevision, corrected.reportRevision);
+});
+
+test("unavailable parser-repair sources retain stale measurements and explicit mixed provenance", async t => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "model-performance-retained-")));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const codexHome = join(root, "codex"), directory = join(root, "timing");
+  await mkdir(join(codexHome, "sessions"), { recursive: true, mode: 0o700 });
+  await mkdir(directory, { mode: 0o700 });
+  const source = join(root, "synthetic-retained.jsonl");
+  await writeFile(source, lines([
+    record(0, "session_meta", { id: "synthetic-retained-session" }),
+    ...completeTurn({ sessionId: "synthetic-retained-session", turnId: "synthetic-retained-turn", start: 0, serviceTier: "standard" }),
+  ]), { mode: 0o600 });
+  const scopedDirectory = join(directory, `source-${modelPerformanceSourceScope(codexHome)}`);
+  const config = { createParser, digest, METHOD, MAX_STATE_BYTES, parserVersion: INFERENCE_TIMING_PARSER_VERSION - 1 };
+  const old = await openTimingStore(scopedDirectory, config);
+  await ingestTimingFile(old, source);
+  const retained = readTimingRows(old);
+  old.close();
+  await rm(source);
+  const controller = createModelPerformanceController({ directory, codexHome });
+  try {
+    let snapshot;
+    const deadline = Date.now() + 10_000;
+    do {
+      snapshot = await controller.read("all");
+      if (snapshot.status === "ready" && !snapshot.collecting) break;
+      await new Promise(resolve => setTimeout(resolve, 20));
+    } while (Date.now() < deadline);
+    assert.equal(snapshot.status, "ready");
+    assert.equal(snapshot.collecting, false);
+    assert.equal(snapshot.stale, true);
+    assert.equal(totalTurns(snapshot), 1);
+    const report = await controller.preparePerformanceDay({ day: DAY, nowEpoch: NOW });
+    assert.equal(report.parserVersion, "codex-inference-timing-mixed");
+    assert.equal(recordFor(report, "standard").turns, 1);
+  } finally { await controller.close(); }
+  const saved = await openTimingStore(scopedDirectory, config);
+  try {
+    assert.deepEqual(readTimingRows(saved), retained);
+    assert.equal(readTimingRows(saved, { withRevision: true }).sources[0].parserVersion, INFERENCE_TIMING_PARSER_VERSION - 1);
+  } finally { saved.close(); }
 });

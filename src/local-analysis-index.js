@@ -2299,7 +2299,7 @@ function buildDiagnostics(database, sources, startMs, endMs) {
     WHERE timestamp_ms >= ? AND timestamp_ms <= ?
   `).get(startMs, endMs).count);
   diagnostics.tierSettingCounts = {};
-  for (const speed of ["standard", "fast", "flex", "batch", "unknown"]) {
+  for (const speed of ["standard", "fast", "ultrafast", "flex", "batch", "unknown"]) {
     const count = diagnosticCount(
       database,
       `tierSettingCount:${speed}`,

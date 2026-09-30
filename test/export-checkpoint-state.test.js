@@ -36,7 +36,7 @@ function stateWithCumulativeTotals() {
     reasoning_output_tokens: false,
     total_tokens: true,
   };
-  value.tier = { timelineIndex: 7, speedMode: "fast", apiServiceTier: "unknown" };
+  value.tier = { timelineIndex: 7, speedMode: "fast", apiServiceTier: "unknown", tierSource: "rollout_thread_settings" };
   value.pendingToolCounts.localShell = 2;
   value.pendingToolCounts.subagent = 1;
   return value;
@@ -51,7 +51,7 @@ test("empty Codex checkpoint state is closed and independently mutable", () => {
   assert.equal(first.previousTotalsPresence, null);
   assert.equal(first.reAnchored, false);
   assert.equal(first.sessionMetaSeen, false);
-  assert.deepEqual(first.tier, { timelineIndex: 0, speedMode: "unknown", apiServiceTier: "unknown" });
+  assert.deepEqual(first.tier, { timelineIndex: 0, speedMode: "unknown", apiServiceTier: "unknown", tierSource: "unobserved" });
   first.pendingToolCounts.mcp = 3;
   assert.equal(second.pendingToolCounts.mcp, 0);
 });
@@ -71,7 +71,7 @@ test("serialization and digest are deterministic across input key order", () => 
   const source = stateWithCumulativeTotals();
   const reordered = {
     pendingToolCounts: Object.fromEntries(Object.entries(source.pendingToolCounts).reverse()),
-    tier: { apiServiceTier: "unknown", speedMode: "fast", timelineIndex: 7 },
+    tier: { apiServiceTier: "unknown", speedMode: "fast", timelineIndex: 7, tierSource: "rollout_thread_settings" },
     previousTotalsPresence: Object.fromEntries(Object.entries(source.previousTotalsPresence).reverse()),
     previousTotals: Object.fromEntries(Object.entries(source.previousTotals).reverse()),
     sessionMetaSeen: source.sessionMetaSeen,

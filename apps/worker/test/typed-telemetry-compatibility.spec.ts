@@ -4,6 +4,7 @@ import { canonicalTelemetryV11Json, type TelemetryV11Attribution, type Telemetry
 import { encodeTypedTelemetryId, encodeTypedTelemetryRecord, type TypedTelemetryFormat } from "../src/typed-telemetry-codec";
 import { persistTypedTelemetryBatch, type TypedTelemetrySourceRecord } from "../src/typed-telemetry-repository";
 import { telemetryV11LegacyProjection } from "../src/telemetry-v11-repository";
+import { priceChunkUsageRecord } from "../src/quota-analysis-v1";
 import {
   readTypedTelemetryCompatibilityPage, readTypedTelemetryRowsByStorageIds,
   TYPED_TELEMETRY_COMPATIBILITY_COLUMNS, TYPED_TELEMETRY_COMPATIBILITY_PAGE_SQL,
@@ -67,6 +68,34 @@ function expectExact(actual: TypedTelemetryCompatibilityRecord, expected: TypedT
 beforeEach(async () => { await reset(); await applyD1Migrations(db(), migrations()); });
 
 describe("typed raw SQL compatibility and exact bounded JSON reader", () => {
+  it("preserves new model and Ultrafast fields through both typed formats before exact repricing", async () => {
+    const eventTime = "2026-09-29T00:00:00.000Z";
+    const rows = (["v1", "v11"] as const).flatMap((format) => [
+      { modelId: "gpt-6.1-sol", speedMode: "fast", apiServiceTier: "priority", expectedNanousd: 2_400_000 },
+      { modelId: "gpt-6-astra", speedMode: "ultrafast", apiServiceTier: "ultrafast", expectedNanousd: 36_000_000 },
+    ].map(({ expectedNanousd, ...selection }, index) => ({
+      expectedNanousd,
+      row: source(format, index + 1, { ...usage(format, `event:v2:${String(index + 1).repeat(64)}`),
+        ...selection, provider: "openai_codex", billingSurface: "chatgpt_subscription", eventTime,
+        totalInputContextTokens: 100, components: { inputUncachedTokens: 100,
+          inputCacheReadTokens: 0, inputCacheWriteTokens: 0, outputTextTokens: 100,
+          outputReasoningTokens: 0, outputCombinedTokens: null },
+      }, { chunkDay: eventTime.slice(0, 10), observedDay: eventTime.slice(0, 10) }),
+    })));
+    await persistTypedTelemetryBatch(db(), rows.map(({ row }) => row));
+    const result = await readTypedTelemetryCompatibilityPage(db(), options("usage"));
+    expect(result.records).toHaveLength(4);
+    for (const actual of result.records) {
+      const expected = rows.find(({ row }) => row.format === actual.format && row.sourceRowId === actual.source_row_id)!;
+      expectExact(actual, expected.row);
+      expect(actual.speed_mode).toBe(Reflect.get(expected.row.record as object, "speedMode"));
+      expect(actual.api_service_tier).toBe(Reflect.get(expected.row.record as object, "apiServiceTier"));
+      expect(priceChunkUsageRecord(actual.record_json, eventTime)).toEqual({
+        costNanousd: expected.expectedNanousd, pricingStatus: "fully_priced", modelId: actual.model_id,
+      });
+    }
+  });
+
   it("reconstructs authority-selected physical rows in requested order across streams", async () => {
     const rows = [source("v11", 17, usage("v11")), source("v11", 41, quota("v11")), source("v11", 90, session("v11"))];
     await persistTypedTelemetryBatch(db(), rows);

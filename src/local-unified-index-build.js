@@ -294,6 +294,7 @@ function tierRow(tier) {
   let codexSpeedMode = "unknown";
   if (normalized === "default" || normalized === "standard") codexSpeedMode = "standard";
   else if (normalized === "priority" || normalized === "fast") codexSpeedMode = "fast";
+  else if (normalized === "ultrafast") codexSpeedMode = "ultrafast";
   else if (normalized !== null) codexSpeedMode = "other";
   return {
     apiServiceTier: "unknown",
@@ -305,7 +306,7 @@ function tierRow(tier) {
     // still prices Fast — the label only records where the value came from.
     tierSource: tier.inherited === true
       ? "lineage_inherited"
-      : "rollout_thread_settings",
+      : tier.tierSource ?? "rollout_thread_settings",
     providerTierRaw: raw ?? null,
   };
 }

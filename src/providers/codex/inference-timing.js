@@ -3,10 +3,12 @@
 import { createHmac } from 'node:crypto';
 
 export const METHOD = 2;
+// Parsing semantics can advance without changing stable timing HMAC identities.
+export const INFERENCE_TIMING_PARSER_VERSION = 18;
 export const MAX_STATE_BYTES = 128 * 1024;
 const MAX_TIER_EVENTS = 512;
 const MAX_CONTEXT_HISTORY = 512;
-const MODELS = new Set(['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra',
+const MODELS = new Set(['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra',
   'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex',
   'gpt-5.3-codex-spark', 'gpt-5.2-codex', 'gpt-5.2', 'auto-review']);
 const EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
@@ -16,7 +18,7 @@ const NEEDLES = ['response_item', 'token_count', 'session_meta', 'turn_context',
   'token_usage_record', 'task_started', 'task_complete', 'turn_aborted', 'compacted',
   'thread_settings_applied'].map(x => Buffer.from(x));
 const TIER_NEEDLE = Buffer.from('thread_settings_applied');
-const MODES = new Set(['standard', 'fast', 'unknown', 'other']);
+const MODES = new Set(['standard', 'fast', 'ultrafast', 'unknown', 'other']);
 const MODE_SOURCES = new Set([
   'rollout_thread_settings', 'turn_context_service_tier', 'unobserved',
 ]);
@@ -36,7 +38,7 @@ function modeFromRawTier(rawTier, source = 'rollout_thread_settings') {
   return {
     mode: ['priority', 'fast'].includes(normalized) ? 'fast'
       : ['default', 'standard'].includes(normalized) ? 'standard'
-        : 'other',
+        : normalized === 'ultrafast' ? 'ultrafast' : 'other',
     modeSource: source,
     invalid: false,
   };
@@ -136,7 +138,7 @@ function normalizeSavedTierState(value) {
       ? entry?.mode === 'unknown'
       : entry?.mode !== 'unknown';
     if (!entry || typeof entry !== 'object' || !integer(entry.at)
-        || !['standard', 'fast', 'unknown', 'other'].includes(entry.mode)
+        || !MODES.has(entry.mode)
         || !['rollout_thread_settings', 'unobserved'].includes(entry.source)
         || !validModeSource
         || (previous !== null && entry.at < previous)) {

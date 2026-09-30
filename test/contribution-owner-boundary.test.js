@@ -73,6 +73,7 @@ const CONTRIBUTION_PUBLIC_EXPORTS = Object.freeze([
   "TELEMETRY_PERFORMANCE_SYNC_STATE_VERSION",
   "initialTelemetryPerformanceSyncState",
   "parseTelemetryPerformanceSyncState",
+  "resumeTelemetryPerformanceSyncAfterAuthorization",
   "prepareTelemetryPerformanceDay",
   "runTelemetryPerformanceSync",
   "readTelemetryV12Capabilities",

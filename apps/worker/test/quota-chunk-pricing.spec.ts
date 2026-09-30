@@ -26,13 +26,13 @@ function record(overrides: Partial<TelemetryV1UsageEvent> = {}): TelemetryV1Usag
 function price(value: TelemetryV1UsageEvent) {
   // Exercise the actual admitted nullable v1 domain, not an impossible pricer-only shape.
   const chunk = parseTelemetryV1Chunk({
-    schemaVersion: "telemetry-contribution-v1.0", chunkId: "usage:2026-09-05:0", chunkRevision: 1,
+    schemaVersion: "telemetry-contribution-v1.0", chunkId: `usage:${value.eventTime.slice(0, 10)}:0`, chunkRevision: 1,
     chunkDigest: "0".repeat(64), parserVersion: "synthetic-pricing-boundaries",
     consent: { telemetrySchemaVersion: "telemetry-contribution-v1.0",
       fieldDictionaryVersion: "telemetry-v1.0-registry-2026-08-07.1",
       privacyContractVersion: "ongoing-privacy-safe-telemetry-v1.0" }, records: [value],
   });
-  return priceChunkUsageRecord(JSON.stringify(chunk.records[0]), AT);
+  return priceChunkUsageRecord(JSON.stringify(chunk.records[0]), value.eventTime);
 }
 
 describe("admitted chunk usage pricing evidence boundaries", () => {
@@ -60,8 +60,9 @@ describe("admitted chunk usage pricing evidence boundaries", () => {
       coverage: "complete", usageEvents: 1, fullyPricedUsageEvents: 1, partiallyPricedUsageEvents: 0,
       unpricedUsageEvents: 0, registrySha256: COMMUNITY_DAILY_SPEND_REGISTRY_SHA256,
       pricingMethodVersion: COMMUNITY_DAILY_SPEND_PRICING_METHOD };
-    expect(COMMUNITY_DAILY_SPEND_PRICING_METHOD).toBe("server-api-price-equivalent-v0.5");
+    expect(COMMUNITY_DAILY_SPEND_PRICING_METHOD).toBe("server-api-price-equivalent-v0.6");
     expect(isCurrentCommunityDailySpend(spend)).toBe(true);
+    expect(isCurrentCommunityDailySpend({ ...spend, pricingMethodVersion: "server-api-price-equivalent-v0.5" })).toBe(false);
     expect(isCurrentCommunityDailySpend({ ...spend, pricingMethodVersion: "server-api-price-equivalent-v0.4" })).toBe(false);
   });
 
@@ -119,5 +120,41 @@ describe("admitted chunk usage pricing evidence boundaries", () => {
       components: { inputUncachedTokens: 100, inputCacheReadTokens: 0, inputCacheWriteTokens: 0,
         outputTextTokens: null, outputReasoningTokens: null, outputCombinedTokens: 100 } });
     expect(price(value)).toEqual({ costNanousd: 0, pricingStatus: "unpriced", modelId: value.modelId });
+  });
+
+  it("retains Sol 6.1 and Astra Ultrafast pricing through admitted stored records", () => {
+    const cases = [
+      { modelId: "gpt-6.1-sol", speedMode: "standard", apiServiceTier: "unknown", billingSurface: "chatgpt_subscription", expected: [1_200_000, 1_201_500_000] },
+      { modelId: "gpt-6.1-sol", speedMode: "fast", apiServiceTier: "unknown", billingSurface: "chatgpt_subscription", expected: [2_400_000, 2_403_000_000] },
+      { modelId: "gpt-6.1-sol", speedMode: "standard", apiServiceTier: "batch", billingSurface: "openai_api", expected: [600_000, 600_750_000] },
+      { modelId: "gpt-6.1-sol", speedMode: "standard", apiServiceTier: "flex", billingSurface: "openai_api", expected: [600_000, 600_750_000] },
+      { modelId: "gpt-6.1-sol", speedMode: "standard", apiServiceTier: "priority", billingSurface: "openai_api", expected: [2_400_000, 2_403_000_000] },
+      { modelId: "gpt-6-astra", speedMode: "ultrafast", apiServiceTier: "unknown", billingSurface: "chatgpt_subscription", expected: [36_000_000, 36_045_000_000] },
+      { modelId: "gpt-6-astra", speedMode: "ultrafast", apiServiceTier: "ultrafast", billingSurface: "openai_api", expected: [36_000_000, 36_045_000_000] },
+    ] as const;
+    for (const { expected, ...selection } of cases) {
+      for (const [index, totalInputContextTokens] of [100, 300_000].entries()) {
+        const value = record({ ...selection, eventTime: "2026-09-29T00:00:00.000Z", totalInputContextTokens,
+          components: { ...record().components, inputUncachedTokens: totalInputContextTokens } });
+        expect(price(value)).toEqual({ costNanousd: expected[index], pricingStatus: "fully_priced", modelId: value.modelId });
+        // A complete known input sum may recover the exact same context for
+        // legacy rows; the adapter must retain both speed and API tier.
+        expect(price({ ...value, totalInputContextTokens: null })).toEqual(price(value));
+      }
+    }
+  });
+
+  it("stored Ultrafast rows fail closed for unpublished models, pre-launch dates and unavailable context", () => {
+    for (const billingSurface of ["chatgpt_subscription", "openai_api"]) {
+      const baseline = record({ billingSurface, speedMode: "ultrafast", apiServiceTier: "ultrafast",
+        eventTime: "2026-09-29T00:00:00.000Z", totalInputContextTokens: 100 });
+      for (const value of [
+        { ...baseline, modelId: "gpt-6.1-sol" },
+        { ...baseline, eventTime: "2026-09-28T23:59:59.999Z" },
+        { ...baseline, totalInputContextTokens: null, components: { ...baseline.components, inputCacheReadTokens: null } },
+      ]) {
+        expect(price(value)).toEqual({ costNanousd: 0, pricingStatus: "unpriced", modelId: value.modelId });
+      }
+    }
   });
 });

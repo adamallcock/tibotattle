@@ -2226,7 +2226,7 @@ test("the Fast-mode blind spot reports a share instead of a bare not-observed", 
   // The copy must state the cause, not assert an unqualified absence.
   assert.match(
     result.monitoringGaps[0].explanation,
-    /only when it is applied or changed, never at session start/u
+    /turn context or applied thread settings/u
   );
   assert.doesNotMatch(result.monitoringGaps[0].explanation, /NOT OBSERVED/iu);
 });
@@ -2300,7 +2300,7 @@ test("the closed accounting normalizer keeps the speed-priced metric and its cov
   assert.equal(accounting.fastMode.metricLabel, "Speed-priced API-price equivalent");
   assert.equal(accounting.fastMode.inference.appliedToWeighting, false);
   assert.equal(accounting.fastMode.inference.inferredFastWindows, 2);
-  assert.equal(accounting.fastMode.logRecordsTierChangesOnly, true);
+  assert.equal(accounting.fastMode.logRecordsTierChangesOnly, false);
   assert.equal(accounting.speedWeighting.fast["gpt-5.6-sol"].events, 4);
   assert.equal(accounting.speedWeighting.unknown.unsupported.apiPriceEquivalentUsd, 8);
   assert.equal(accounting.speedWeighting.fast["gpt-5.5"].events, 0);
@@ -2547,7 +2547,7 @@ test("web timeline expands the compact weighted tuple and rejects encoding drift
   const encoding = {
     schemaVersion: "quota-weighted-timeline-v0.1",
     basisFamilyId:
-      "codex_primary:speed_priced_api_equivalent:v3:priority_card_ratio_2026_08_30:event_time:observed_declared_scenario",
+      "codex_primary:speed_priced_api_equivalent:v4:published_speed_card_ratio_2026_09_29:event_time:observed_declared_scenario",
     scenarioOrder: [
       "unresolved_as_standard",
       "unresolved_as_fast"
@@ -6241,10 +6241,10 @@ test("the historical allowance headline and shared history use one selected plan
   assert.match(plus.label, /Plus/u);
   assert.match(plus.estimate, /\$85/u);
   assert.match(plus.range, /\$68.*\$102/u);
-  assert.match(pro.label, /Pro \(20×\)/u);
+  assert.match(pro.label, /Pro \(10×\)/u);
   assert.match(pro.estimate, /\$2400/u);
   assert.match(pro.range, /\$1920.*\$2880/u);
-  assert.match(proInSpanish.label, /Pro \(20×\)/u);
+  assert.match(proInSpanish.label, /Pro \(10×\)/u);
   assert.match(proInSpanish.estimate, /\$2400/u);
   for (const [view, planType, value, shown] of [
     [plus, "plus", 85, 2], [pro, "pro", 2_400, 1], [proInSpanish, "pro", 2_400, 2],
@@ -9093,8 +9093,9 @@ test("the share card names only a known, most-recent Codex plan", async () => {
   const { SHARE_CARD_PLAN_LABELS, shareCardPlanLabel, shareCardPlan } =
     await loadShareCardPlan();
 
-  assert.equal(shareCardPlanLabel("pro"), "Pro (20×)");
+  assert.equal(shareCardPlanLabel("pro"), "Pro (10×)");
   assert.equal(shareCardPlanLabel("prolite"), "Pro Lite (5×)");
+  assert.equal(shareCardPlanLabel("promax"), "Pro Max 25×");
   assert.equal(shareCardPlanLabel("plus"), "Plus");
   assert.equal(shareCardPlanLabel("edu_plus"), "Edu Plus");
   assert.equal(shareCardPlanLabel("edu_pro"), "Edu Pro");
@@ -9119,23 +9120,23 @@ test("the share card names only a known, most-recent Codex plan", async () => {
       { planType: "plus", observedAt: "2026-08-01T00:00:00.000Z" },
       { planType: "pro", observedAt: "2026-08-13T00:00:00.000Z" },
     ]),
-    "Pro (20×)",
+    "Pro (10×)",
   );
   assert.equal(
     shareCardPlan([
       { planType: "pro", observedAt: "2026-08-13T00:00:00.000Z" },
       { planType: "plus", observedAt: "2026-08-01T00:00:00.000Z" },
     ]),
-    "Pro (20×)",
+    "Pro (10×)",
   );
   assert.equal(
     shareCardPlan([
       { planType: "pro", observedAt: "2026-08-13T00:00:00.000Z" },
       { planType: "unknown", observedAt: "2026-08-20T00:00:00.000Z" },
     ]),
-    "Pro (20×)",
+    "Pro (10×)",
   );
-  assert.equal(shareCardPlan([{ planType: "pro", observedAt: "" }]), "Pro (20×)");
+  assert.equal(shareCardPlan([{ planType: "pro", observedAt: "" }]), "Pro (10×)");
   assert.equal(
     shareCardPlan([
       { planType: "plus", observedAt: "2026-08-13T00:00:00.000Z" },
@@ -9182,8 +9183,8 @@ test("the share card wires plan copy through the canvas and transcript", async (
   assert.ok(Object.hasOwn(WEB_MESSAGES, "share.plan"));
   assert.equal(WEB_MESSAGES["share.plan"].length, SUPPORTED_LOCALES.length);
   for (const locale of SUPPORTED_LOCALES) {
-    const copy = translate("share.plan", { plan: "Pro (20×)" }, locale);
-    assert.match(copy, /Pro \(20×\)/u, locale);
+    const copy = translate("share.plan", { plan: "Pro (10×)" }, locale);
+    assert.match(copy, /Pro \(10×\)/u, locale);
     assert.doesNotMatch(copy, /\{plan\}/u, locale);
   }
 
@@ -10391,7 +10392,7 @@ test("the inspection list keeps every row and restarts paging when the selection
 // ---------------------------------------------------------------------------
 
 const TEST_ALLOWANCE_BASIS_FAMILY =
-  "codex_primary:speed_priced_api_equivalent:v3:priority_card_ratio_2026_08_30:event_time:observed_declared_scenario";
+  "codex_primary:speed_priced_api_equivalent:v4:published_speed_card_ratio_2026_09_29:event_time:observed_declared_scenario";
 const testAllowanceBasisId = (scenario) =>
   `${TEST_ALLOWANCE_BASIS_FAMILY}:${scenario}`;
 const testAllowanceWeighting = (selectedUsd, { available = true } = {}) => ({
@@ -12389,6 +12390,20 @@ test("divergence window-breakdown normalizer sanitizes to content-free numbers",
   assert.equal(normalized.byModel[0].model, "gpt-5.6-sol");
   assert.equal(normalized.byModel[0].fastModeMultiplier, 2.5);
   assert.equal(normalized.bySpeed.fast.costUsd, 3);
+  assert.equal(normalized.ultrafastCostUsd, null);
+  assert.equal(normalized.ultrafastEvents, null);
+  const withUltrafast = normalizeWindowBreakdown({
+    ...payload,
+    breakdown: { ...payload.breakdown, ultrafastCostUsd: 6, ultrafastEvents: 2 },
+  });
+  assert.equal(withUltrafast.ultrafastCostUsd, 6);
+  assert.equal(withUltrafast.ultrafastEvents, 2);
+  const explicitZero = normalizeWindowBreakdown({
+    ...payload,
+    breakdown: { ...payload.breakdown, ultrafastCostUsd: 0, ultrafastEvents: 0 },
+  });
+  assert.equal(explicitZero.ultrafastCostUsd, 0);
+  assert.equal(explicitZero.ultrafastEvents, 0);
   assert.equal(normalized.spark.events, 2);
 
   // Wrong schema, unavailable status, and a null payload all read back as
@@ -13900,4 +13915,14 @@ test("responsive charts keep tooltips in bounds and interrupt an anchored cycle"
   markers.at(-1).dispatchEvent({ type: 'focus' });
   const [left] = tooltip.getAttribute('transform').match(/[\d.]+/g).map(Number);
   assert.ok(left + 264 <= 360);
+});
+
+test("local accounting preserves distinct subscription and API Ultrafast dimensions", () => {
+  const row = { events: 2, totalTokens: 1234, apiPriceEquivalentUsd: 0.06 };
+  const result = normalizeDashboardPayload({ mode: "real_local_evidence", accounting: {
+    bySpeed: { ultrafast: row }, byApiServiceTier: { ultrafast: row, private_canary: row },
+  } });
+  assert.deepEqual(result.accounting.bySpeed.ultrafast, row);
+  assert.deepEqual(result.accounting.byApiServiceTier.ultrafast, row);
+  assert.equal(Object.hasOwn(result.accounting.byApiServiceTier, "private_canary"), false);
 });

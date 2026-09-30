@@ -2697,16 +2697,17 @@ const SHARE_CARD_WINDOW_KEYS = Object.freeze({
   seven_day: "share.window.sevenDay",
 });
 // The friendly name the card prints for a reported Codex plan. The keys are
-// Codex's own KnownPlan vocabulary (TELEMETRY_PLAN_TYPES) verbatim, so the
-// card never invents a plan label. The usage multiplier is intrinsic to the
-// plan (pro = 20x, prolite = 5x), so a plan that documents one states it
-// inline; a plan that documents none is named without a fabricated number.
+// Codex's own KnownPlan vocabulary (TELEMETRY_PLAN_TYPES) verbatim. Product
+// labels state the configured personal-plan ratios independently of upstream
+// display aliases; the Pro rename does not alter the recorded plan identity.
+// Plans without a configured ratio are named without a fabricated number.
 // "unknown" is Codex's sentinel for an unnamed plan and is deliberately
 // absent, so it — like any unmapped or empty reading — draws no chip.
 const SHARE_CARD_PLAN_LABELS = Object.freeze({
   ...TELEMETRY_PLAN_DISPLAY_NAMES,
-  pro: `${TELEMETRY_PLAN_DISPLAY_NAMES.pro} (20×)`,
-  prolite: `${TELEMETRY_PLAN_DISPLAY_NAMES.prolite} (5×)`,
+  pro: "Pro (10×)",
+  prolite: "Pro Lite (5×)",
+  promax: "Pro Max 25×",
   self_serve_business_prolite: "Business · Pro Lite (5×)",
   self_serve_business_usage_based: "Business · usage-based",
   enterprise_cbp_automation: "Enterprise · automation",
@@ -5377,7 +5378,7 @@ function renderUsageTimeline(data) {
         ? "Speed-priced API equivalent"
         : "Standard-rate API-price equivalent",
       quotaComparable
-        ? "Standard API prices with Fast increments priced at the published Priority (Fast) API rate, compared only with a capacity fitted on the same basis. It is not a bill."
+        ? "Standard API prices with Fast and Ultrafast increments priced at their published API rates, compared only with a capacity fitted on the same basis. This is a comparison, not a bill or included-allowance formula."
         : "A Standard-rate accounting series. Provider allowance is hidden because no matching weighted capacity is available.",
       total === null ? "—" : formatApiMoney(total)
     ]
@@ -6386,7 +6387,7 @@ function divergenceRangeContext(data) {
         ? t("accounting.model.unrecognized")
         : formatModelName(topModel.model) || topModel.model;
   const bySpeed = accounting.bySpeed ?? {};
-  const rankedSpeed = ["fast", "standard", "unknown"]
+  const rankedSpeed = ["ultrafast", "fast", "standard", "unknown"]
     .map((key) => [key, finite(bySpeed?.[key]?.events, 0)])
     .sort((left, right) => right[1] - left[1]);
   const topSpeed = rankedSpeed[0]?.[1] > 0 ? rankedSpeed[0][0] : null;
@@ -6401,6 +6402,7 @@ function divergenceRangeContext(data) {
 // computed `t(\`divergence.speed.${key}\`)` would resolve at runtime but read
 // as no key to the source scanner.
 function divergenceSpeedLabel(key) {
+  if (key === "ultrafast") return t("divergence.speed.ultrafast");
   if (key === "fast") return t("divergence.speed.fast");
   if (key === "standard") return t("divergence.speed.standard");
   return t("divergence.speed.unknown");
@@ -6662,6 +6664,10 @@ function renderDivergenceBreakdown(panel, breakdown, rangeContext) {
       "divergence.breakdown.fastCost",
       { cost: formatApiMoney(breakdown.fastCostUsd) },
     ));
+  }
+  if (breakdown.ultrafastCostUsd > 0) {
+    panel.append(localizedNode("p", "divergence-breakdown-fast", "divergence.breakdown.ultrafastCost",
+      { cost: formatApiMoney(breakdown.ultrafastCostUsd) }));
   }
   if (breakdown.unpricedShare > 0) {
     panel.append(localizedNode(
@@ -10309,6 +10315,7 @@ function renderSideChatHistoricalGapProbe(probe) {
   }
   note.textContent = t("accounting.sideChat.historicalGap.note", {
     fast: formatCount(exact.bySpeed.fast.events),
+    ultrafast: formatCount(exact.bySpeed.ultrafast.events),
     standard: formatCount(exact.bySpeed.standard.events),
     unknown: formatCount(exact.bySpeed.unknown.events),
     standardSensitivity: t("accounting.sideChat.historicalGap.moneyRange", {
@@ -14126,13 +14133,18 @@ function renderTelemetryPerformanceContribution() {
     && telemetryPerformanceStatus.consent.current === true;
   const busy = telemetryPerformanceBusy || contributionDisconnectBusy
     || contributionDisconnectDialogOpen();
+  const syncState = telemetryPerformanceStatus?.scheduler?.state;
+  const needsReview = approved && ["paused", "off"].includes(syncState);
   const reviewButton = $("#performance-review-open");
-  reviewButton.hidden = approved;
+  reviewButton.hidden = approved && !needsReview;
   reviewButton.disabled = busy;
+  setLocalizedText(reviewButton, needsReview
+    ? "performanceConsent.reviewAgain" : "performanceConsent.review");
   const state = $("#performance-consent-state");
   setLocalizedText(state, approved ? "performanceConsent.approved" : "performanceConsent.notApproved");
-  setLocalizedText($("#performance-consent-description"), approved
-    ? "performanceConsent.approvedDescription" : "performanceConsent.description");
+  setLocalizedText($("#performance-consent-description"), approved && syncState === "paused"
+    ? "performanceConsent.pausedDescription" : approved
+      ? "performanceConsent.approvedDescription" : "performanceConsent.description");
   const review = telemetryPerformanceReview;
   $("#performance-review").hidden = review === null;
   if (review !== null) {
@@ -14161,7 +14173,7 @@ function renderTelemetryPerformanceContribution() {
   const syncLine = $("#performance-sync-status");
   if (approved && telemetryPerformanceStatus?.scheduler?.state !== "off") {
     setLocalizedText(syncLine, "performanceConsent.syncing", {
-      state: telemetryPerformanceStatus.scheduler.state,
+      state: t(`performanceConsent.state.${syncState}`),
     });
     syncLine.hidden = false;
   } else {

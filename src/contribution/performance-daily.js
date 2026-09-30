@@ -165,7 +165,7 @@ function performanceDailyMode(row) {
   if (mode === "mixed" && source === "mixed") {
     return { speedMode: mode, speedModeSource: source };
   }
-  if (["fast", "standard", "other"].includes(mode)
+  if (["fast", "standard", "ultrafast", "other"].includes(mode)
       && ["rollout_thread_settings", "turn_context_service_tier", "lineage_inherited"]
         .includes(source)) {
     return { speedMode: mode, speedModeSource: source };

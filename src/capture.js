@@ -39,15 +39,15 @@ function canonicalWindows(limit) {
 export function summarizeTierCoverage(rawLocal) {
   const rawCounts = rawLocal?.runcost?.observedTierUsageEventCounts ?? {};
   const observedUsageEventCounts = Object.fromEntries(
-    ["standard", "fast", "unknown", "other"]
+    ["standard", "fast", "ultrafast", "unknown", "other"]
       .map((mode) => [mode, rawCounts[mode]])
       .filter(([, count]) => Number.isSafeInteger(count) && count > 0),
   );
   const total = Object.values(observedUsageEventCounts).reduce((sum, count) => sum + count, 0);
-  const standard = observedUsageEventCounts.standard ?? 0;
-  const fast = observedUsageEventCounts.fast ?? 0;
-  const exactlyOneKnownMode = total > 0 && standard + fast === total && (standard === 0 || fast === 0);
-  const codexSpeedMode = exactlyOneKnownMode ? (fast > 0 ? "fast" : "standard") : "unknown";
+  const known = ["standard", "fast", "ultrafast"].filter((mode) => (observedUsageEventCounts[mode] ?? 0) > 0);
+  const exactlyOneKnownMode = known.length === 1 && observedUsageEventCounts[known[0]] === total;
+  const codexSpeedMode = exactlyOneKnownMode
+    ? known[0] : "unknown";
 
   return {
     billingSurface: "chatgpt_subscription",

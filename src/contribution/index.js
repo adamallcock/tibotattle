@@ -79,6 +79,7 @@ export {
   TELEMETRY_PERFORMANCE_SYNC_STATE_VERSION,
   initialTelemetryPerformanceSyncState,
   parseTelemetryPerformanceSyncState,
+  resumeTelemetryPerformanceSyncAfterAuthorization,
   prepareTelemetryPerformanceDay,
   runTelemetryPerformanceSync,
 } from "./telemetry-performance-sync.js";
