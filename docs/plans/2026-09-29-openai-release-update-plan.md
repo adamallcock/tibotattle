@@ -74,6 +74,19 @@ sources in this PR. Final root, dependency CI and remaining Worker checks are
 recorded in the PR before merge. Protected R7 receipt refresh, packaged/native
 qualification, remote migrations and deployments remain separate gates.
 
+The unsigned macOS arm64 package at `a348c9999d8555cc80943aaaeed1b761d2e6802f`
+passed native synthetic-profile smoke, including startup refresh, dashboard,
+sharing/settings controls, tray customization and persistence across relaunch,
+and clean quit. Its ASAR SHA-256 is
+`dcb981f4e59a47fbec61240feaa4638d81fa63d20afc9ec354ccacd671c8f4ac`.
+The first capture attempt lacked an output directory; after creating that
+directory, the unchanged artifact passed. Local-review runtime qualification
+also passed all 12 lifecycle invocations with byte-identical same-epoch builds
+and no covered network attempts. The security update's Linux checksum contract
+suites passed all 34 tests. Worker script checks passed. Worker deploy dry-run
+stopped at the absent generated public release manifest before any deployment;
+public-asset preparation is part of the subsequent Worker release work.
+
 ## Implementation progress on 2026-09-29
 
 | Component | Current local result | Remaining boundary |
