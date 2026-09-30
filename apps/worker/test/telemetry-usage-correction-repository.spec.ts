@@ -45,9 +45,11 @@ async function migrate(includeCorrection = true): Promise<void> {
   await applyD1Migrations(db(), bindings.TEST_INGESTION_BRIDGE_MIGRATIONS);
   await applyD1Migrations(db(), bindings.TEST_TYPED_V11_ADMISSION_MIGRATIONS);
   await applyD1Migrations(db(), bindings.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
+  // The optional catalog depends on correction history; keep this fixture at
+  // its intended pre-correction schema when testing refusal before 0006.
   await applyD1Migrations(db(), includeCorrection
     ? bindings.TEST_INGESTION_ISOLATION_MIGRATIONS
-    : bindings.TEST_INGESTION_ISOLATION_MIGRATIONS.filter((migration) => !migration.name.startsWith("0006_")));
+    : bindings.TEST_INGESTION_ISOLATION_MIGRATIONS.filter((migration) => !/^(0006|0013)_/u.test(migration.name)));
   await initializeStorageSource(db(), sourceId);
   await initializeTypedV1Admission(db(), sourceNamespace);
 }
