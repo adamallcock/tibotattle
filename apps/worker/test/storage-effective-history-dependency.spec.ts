@@ -32,6 +32,8 @@ import { registerTelemetryV11DayManifest } from "../src/telemetry-v11-repository
 import { grantTelemetryV12Consent } from "../src/telemetry-transport-policy";
 import { persistTelemetryV12StagedChunk, registerTelemetryV12DayManifest } from "../src/telemetry-v12-repository";
 import { canonicalJson } from "../src/canonical-json";
+import { createAnalyticsProfile, profileAnalyticsDatabase } from "./helpers/analytics-profile";
+import { EFFECTIVE_DAY_CATALOG_TABLES, EFFECTIVE_DAY_CATALOG_TRIGGERS } from "../src/storage-effective-dependency-days";
 import { sha256Hex } from "../src/crypto";
 import { initializeStorageAnalyticsRuntime } from "../src/storage-analytics-runtime";
 import { captureStorageGraphScope, computeStorageGraphResult } from "../src/storage-community-graph";
@@ -124,7 +126,7 @@ async function insertV1HistoryDay(fixture: Fixture, selectedDay: string, revisio
     createdAt: new Date().toISOString(), supersedes }, namespace);
 }
 
-beforeEach(async () => {
+async function setupDependencyFixture(includeCatalog = true) {
   await reset();
   for (const migrations of [b.TEST_MIGRATIONS, b.TEST_TYPED_INGESTION_MIGRATIONS,
     b.TEST_INGESTION_BRIDGE_MIGRATIONS, b.TEST_TYPED_V1_ADMISSION_MIGRATIONS,
@@ -132,12 +134,14 @@ beforeEach(async () => {
   await initializeStorageSource(db(), namespace);
   await initializeTypedV1Admission(db(), namespace);
   await initializeTypedV11Admission(db(), namespace);
-  await applyD1Migrations(db(), b.TEST_INGESTION_ISOLATION_MIGRATIONS);
+  await applyD1Migrations(db(), b.TEST_INGESTION_ISOLATION_MIGRATIONS
+    .filter(migration => includeCatalog || !migration.name.startsWith("0013_")));
   await drainCommunityPublicSourceBootstrap(db());
   await applyD1Migrations(b.STORAGE_ANALYTICS_DB, b.TEST_ANALYTICS_MIGRATIONS);
   await initializeStorageAnalyticsRuntime({source: db(), target: b.STORAGE_ANALYTICS_DB,
     sourceId: namespace, sourceNamespace: namespace});
-});
+}
+beforeEach(() => setupDependencyFixture());
 
 async function activate(fixture: Fixture, candidates: Staged[]) {
   const predecessor = await createTelemetryV11DomainPredecessor(db(), fixture);
@@ -1471,7 +1475,7 @@ describe("bounded shared effective day dependencies", () => {
       b.TEST_INGESTION_BRIDGE_MIGRATIONS, b.TEST_TYPED_V1_ADMISSION_MIGRATIONS,
       b.TEST_TYPED_V11_ADMISSION_MIGRATIONS]) await applyD1Migrations(db(), migrations);
     await applyD1Migrations(db(), b.TEST_INGESTION_ISOLATION_MIGRATIONS
-      .filter(migration => !/^(0008|0010|0011|0012)_/u.test(migration.name)));
+      .filter(migration => !/^(0008|0010|0011|0012|0013)_/u.test(migration.name)));
     const selectedDay = day();
     const observed = observeDependencyQueries(db());
     const reader = await createEffectiveHistoryDayDependencyReader(observed.database, emptyDependencyOwner,
@@ -1499,6 +1503,163 @@ describe("bounded shared effective day dependencies", () => {
       .rejects.toThrow("STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE");
     await expect(effectiveHistoryDependency(db(), emptyDependencyOwner, namespace, selectedDay, selectedDay))
       .rejects.toThrow("STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE");
+  });
+});
+
+
+/** The pre-migration path is the unchanged deployed SQL. Hide only the new
+ * catalog objects from schema discovery to compare both algorithms over the
+ * same immutable synthetic source; never alter source rows or results. */
+function preCatalogSource() {
+  const names: readonly string[] = [...EFFECTIVE_DAY_CATALOG_TABLES, ...EFFECTIVE_DAY_CATALOG_TRIGGERS];
+  return observeDependencyQueries(db(), { rows(query, rows) {
+    return query.sql.startsWith("SELECT name,type FROM sqlite_master")
+      ? rows.filter(row => !names.includes(row.name as string)) : rows;
+  } }).database;
+}
+async function measuredDependency(source: D1Database, owner: StorageCommunityOwner,
+  fromDay: string, throughDay: string, includeSessions = true) {
+  const profile = createAnalyticsProfile();
+  const observed = profileAnalyticsDatabase(source, "source", profile, () => "dependency");
+  const started = performance.now();
+  const dependency = await effectiveHistoryDependency(observed, owner, namespace, fromDay, throughDay, {includeSessions});
+  const costs = Object.values(profile.costs);
+  return {dependency,statements:costs.reduce((sum,cost)=>sum+cost.statements,0),
+    rowsRead:costs.reduce((sum,cost)=>sum+cost.rowsRead,0),
+    databaseMs:costs.reduce((sum,cost)=>sum+cost.databaseMs,0),wallMs:performance.now()-started};
+}
+
+describe("maintained effective source-day catalog", () => {
+  it("backfills populated v1, v1.1, v1.2 and correction days with exact bytes and fewer reads", async ({annotate}) => {
+    await setupDependencyFixture(false);
+    const selectedDay=day();
+    const v1=await createV11DeviceFixture(db());
+    await insertV1HistoryDay(v1,selectedDay,1);
+    const old=await currentTelemetryV1Chunk(db(),v1.participantId,v1.deviceId,"usage",selectedDay,0);
+    await db().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+    await insertV1HistoryDay(v1,selectedDay,2,old);
+    const v11=await createV11DeviceFixture(db(),{grant:true});
+    await activate(v11,[await stage(v11,await makeV11Day(selectedDay,{
+      usage:Array.from({length:2_000},(_,index)=>v11UsageRecord(selectedDay,"a",{
+        eventId:`synthetic:catalog-dense:${index}`})),
+    }))]);
+    await db().prepare("UPDATE telemetry_v12_runtime SET state='active' WHERE id=1").run();
+    const v12=await createV11DeviceFixture(db());
+    await grantTelemetryV12Consent(db(),v12,telemetryV12RequiredConsent());
+    await activateV12(v12,[await stageV12Day(v12,selectedDay,[v12UsageRecord(selectedDay,"synthetic:catalog-v12")])]);
+    const owners=await readStorageCommunityOwnerPage(db());
+    const selected=[v1,v11,v12].map(fixture=>owners.find(owner=>owner.participantId===fixture.participantId)!);
+    const before=[];
+    for(const owner of selected)before.push(await measuredDependency(db(),owner,selectedDay,selectedDay));
+    expect(await db().prepare("SELECT count(*) FROM sqlite_master WHERE name='storage_effective_source_days'").first<number>("count(*)")).toBe(0);
+    const migration=b.TEST_INGESTION_ISOLATION_MIGRATIONS.find(value=>value.name.startsWith("0013_"))!;
+    await applyD1Migrations(db(),[migration]);
+    const catalog=(await db().prepare("SELECT participant_id,stream,source_day FROM storage_effective_source_days ORDER BY participant_id")
+      .all<{participant_id:string;stream:number;source_day:string}>()).results;
+    expect(catalog).toHaveLength(3);
+    expect(catalog.every(row=>row.stream===1&&row.source_day===selectedDay)).toBe(true);
+    const report=[];
+    for(const [index,owner]of selected.entries()){
+      const after=await measuredDependency(db(),owner,selectedDay,selectedDay);
+      expect(canonicalJson(after.dependency)).toBe(canonicalJson(before[index]!.dependency));
+      expect(after.dependency.occurrenceLinks).toEqual([]);
+      expect(after.statements).toBe(7);
+      report.push({family:["v1","v11","v12"][index],before:{statements:before[index]!.statements,
+        rowsRead:before[index]!.rowsRead,databaseMs:before[index]!.databaseMs,wallMs:before[index]!.wallMs},
+        after:{statements:after.statements,rowsRead:after.rowsRead,databaseMs:after.databaseMs,wallMs:after.wallMs}});
+    }
+    await annotate(JSON.stringify(report),"source-day-catalog-local-cost");
+    console.log("source-day-catalog-local-cost",JSON.stringify(report));
+    const dense=report[1]!;
+    // Owner-approved acceptance for this first slice: at least 10× fewer reads.
+    // Exact dependency bytes and the unchanged seven-statement budget are separate gates.
+    expect(dense.after.rowsRead).toBeLessThan(dense.before.rowsRead/10);
+  },60_000);
+
+  it("keeps staged outside chunks conservative and discovers a late cross-day occurrence link", async () => {
+    const selectedDay=day(),outsideDay=dayAfter(selectedDay);
+    const fixture=await createV11DeviceFixture(db(),{grant:true});
+    const occurrence="synthetic:catalog-late-duplicate";
+    const selected=await stage(fixture,await makeV11Day(selectedDay,{usage:[v11UsageRecord(selectedDay,"a",{eventId:occurrence})]}));
+    await activate(fixture,[selected]);
+    let owner=(await readStorageCommunityOwnerPage(db())).find(value=>value.participantId===fixture.participantId)!;
+    const before=await effectiveHistoryDependency(db(),owner,namespace,selectedDay,selectedDay);
+    expect(before.occurrenceLinks).toEqual([]);
+    expect(before).toEqual(await effectiveHistoryDependency(preCatalogSource(),owner,namespace,selectedDay,selectedDay));
+    const outside=await stage(fixture,await makeV11Day(outsideDay,{quota:[{
+      schemaVersion:"quota-observation-v1.1",observationId:occurrence,
+      observedTime:`${outsideDay}T12:05:00.000Z`,provider:"openai_codex",planType:"pro",
+      planVariant:"unknown",limitId:"codex",slot:"seven_day",usedPercent:20,
+      windowDurationMinutes:10_080,resetsAt:null,accountPlanAttribution:{
+        accountBasis:"unavailable",accountTrackId:null,planBasis:"same_source_occurrence",planType:"pro",planEraId:null},
+    }]}));
+    // Catalog presence is visible before admission; it may only cause fallback.
+    expect(await db().prepare("SELECT count(*) FROM storage_effective_source_days WHERE participant_id=? AND source_day=?")
+      .bind(fixture.participantId,outsideDay).first<number>("count(*)")).toBe(1);
+    expect(await effectiveHistoryDependency(db(),owner,namespace,selectedDay,selectedDay)).toEqual(before);
+    await activate(fixture,[selected,outside]);
+    owner=(await readStorageCommunityOwnerPage(db())).find(value=>value.participantId===fixture.participantId)!;
+    const after=await effectiveHistoryDependency(db(),owner,namespace,selectedDay,selectedDay);
+    expect(after.occurrenceLinks).toEqual([expect.objectContaining({family:"v11",source_day:outsideDay})]);
+    expect(after).toEqual(await effectiveHistoryDependency(preCatalogSource(),owner,namespace,selectedDay,selectedDay));
+    const whole=await effectiveHistoryDependency(db(),owner,namespace,selectedDay,outsideDay);
+    expect(whole.occurrenceLinks).toEqual([]);
+    expect(whole).toEqual(await effectiveHistoryDependency(preCatalogSource(),owner,namespace,selectedDay,outsideDay));
+    // Batched targets must still link to one another inside this range.
+    const reader=await createEffectiveHistoryDayDependencyReader(db(),owner,namespace,[selectedDay,outsideDay],{occurrenceLinks:"batched"});
+    for(const targetDay of [selectedDay,outsideDay])expect(await reader!.readDigest(targetDay))
+      .toBe(await sha256Hex(canonicalJson(await effectiveHistoryDependency(db(),owner,namespace,targetDay,targetDay))));
+  });
+
+  it("does not confuse session-only outside days with usage/quota evidence", async () => {
+    const selectedDay=day(),outsideDay=dayAfter(selectedDay),occurrence="session:catalog-cross-stream";
+    const fixture=await createV11DeviceFixture(db(),{grant:true});
+    const selected=await stage(fixture,await makeV11Day(selectedDay,{usage:[v11UsageRecord(selectedDay,"a",{eventId:occurrence})]}));
+    const outside=await stage(fixture,await makeV11Day(outsideDay,{session:[{
+      schemaVersion:"session-dimension-v1.1",sessionUuid:occurrence,provider:"openai_codex",
+      firstEventTime:`${outsideDay}T12:00:00.000Z`,toolClassCounts:{shell:1,other:0},
+    }]}));
+    await activate(fixture,[selected,outside]);
+    const owner=(await readStorageCommunityOwnerPage(db())).find(value=>value.participantId===fixture.participantId)!;
+    for(const includeSessions of [false,true]){
+      const measured=await measuredDependency(db(),owner,selectedDay,selectedDay,includeSessions);
+      const reference=await measuredDependency(preCatalogSource(),owner,selectedDay,selectedDay,includeSessions);
+      expect(canonicalJson(measured.dependency)).toBe(canonicalJson(reference.dependency));
+      expect(measured.statements).toBe(7);
+      expect(measured.dependency.occurrenceLinks).toHaveLength(includeSessions?1:0);
+    }
+  });
+
+  it("refuses missing catalog guards and malformed seal evidence", async () => {
+    await db().prepare("DROP TRIGGER storage_effective_days_v1_insert").run();
+    await expect(effectiveHistoryDependency(db(),emptyDependencyOwner,namespace,day(),day()))
+      .rejects.toThrow("STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE");
+    await setupDependencyFixture();
+    await db().prepare("DROP TRIGGER storage_effective_days_runtime_retained").run();
+    // Simulate an interrupted/unsealed migration while retaining the expected
+    // schema objects. Presence without the completed backfill seal is unsafe.
+    await db().prepare("CREATE TRIGGER storage_effective_days_runtime_retained BEFORE DELETE ON storage_effective_source_days_runtime BEGIN SELECT 1; END").run();
+    await db().prepare("DELETE FROM storage_effective_source_days_runtime").run();
+    await expect(effectiveHistoryDependency(db(),emptyDependencyOwner,namespace,day(),day()))
+      .rejects.toThrow("STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE");
+  });
+
+  it("retains source-day presence through replacement and erases it with its participant", async () => {
+    const fixture=await createV11DeviceFixture(db());
+    const selectedDay=day();
+    await insertV1HistoryDay(fixture,selectedDay,1);
+    const old=await currentTelemetryV1Chunk(db(),fixture.participantId,fixture.deviceId,"usage",selectedDay,0);
+    await db().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+    await insertV1HistoryDay(fixture,selectedDay,2,old);
+    expect(await db().prepare("SELECT count(*) FROM storage_effective_source_days WHERE participant_id=?")
+      .bind(fixture.participantId).first<number>("count(*)")).toBe(1);
+    await expect(db().prepare("DELETE FROM storage_effective_source_days WHERE participant_id=?").bind(fixture.participantId).run())
+      .rejects.toThrow("storage_effective_days_retained");
+    await expect(db().prepare("UPDATE storage_effective_source_days SET source_day=? WHERE participant_id=?")
+      .bind(dayAfter(selectedDay),fixture.participantId).run()).rejects.toThrow("storage_effective_days_immutable");
+    await db().prepare("DELETE FROM participants WHERE id=?").bind(fixture.participantId).run();
+    expect(await db().prepare("SELECT count(*) FROM storage_effective_source_days WHERE participant_id=?")
+      .bind(fixture.participantId).first<number>("count(*)")).toBe(0);
   });
 });
 

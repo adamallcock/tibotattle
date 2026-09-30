@@ -228,6 +228,26 @@ must not be summed as a pass total. The log contains no owner, day, SQL,
 bindings, payload, or provider error message. These timings diagnose slow work;
 they do not change deadlines, budgets, retries, or publication eligibility.
 
+### Optional effective dependency day catalog
+
+Ingestion-isolation migration `0013_effective_dependency_day_catalog.sql`
+adds an internal presence summary with one row per participant, stream and
+source day across v1, v1.1 and v1.2. It backfills chunk headers and correction
+history, then seals the backfill. Chunk/history insertion maintains the
+summary in the source transaction; it adds no per-record copy. Staged and
+retired chunks remain conservative candidates. Presence survives replacement
+and is removed with participant erasure.
+
+The effective dependency reader uses two indexed outside-range seeks inside
+its existing occurrence-link statement. When no outside source day exists,
+it skips selected-occurrence acquisition and retains the exact v3 identity.
+Positive lookups and multi-target batches retain the existing exact scan.
+The statement count, correction runtime fence, source authority checks and
+publication requirements are unchanged. Before this optional migration, the
+original reader remains available; a partially present catalog or missing
+backfill seal cannot authorize the shortcut. Deployment and remote migration
+are separate operations.
+
 Self-service `DELETE /api/v1/me` is retired: the unknown API response is
 `404 NOT_FOUND`, without D1 access or participant mutation. `GET /api/v1/me`,
 legacy personal statistics, weekly aggregate, recovery,
