@@ -20,6 +20,8 @@ import { countStorageDailyContributingDevices, STORAGE_DAILY_DEVICE_METHOD } fro
 import type { EffectiveUsageReaderCursor } from './telemetry-usage-effective-reader';
 import { effectiveHistoryDependency } from './storage-effective-history';
 import { advanceSharedAnalyticsFeatureDay, type SharedAnalyticsFeatureBudget } from './storage-analytics-shared-features';
+import { rethrowStorageGraphFailure, withStorageGraphFailureStage,
+  withStoragePublicationTiming } from './storage-analytics-failure';
 import { STORAGE_DAILY_PENDING_DAYS_SQL } from './storage-community-daily-pending';
 export { STORAGE_DAILY_PENDING_DAYS_SQL } from './storage-community-daily-pending';
 
@@ -148,11 +150,11 @@ async function advanceEffectiveDailyValues(options: StorageCommunityDailyBinding
   for (const stream of EFFECTIVE_STREAMS) {
     const after = cursor[stream];
     if (after === null) continue;
-    const page = await readEffectiveTelemetryOwnerDayPage(options.source, {
+    const page = await withStorageGraphFailureStage('daily_effective_reader', () => readEffectiveTelemetryOwnerDayPage(options.source, {
       sourceNamespace: options.sourceNamespace, ownerDigest: owner.ownerDigest!,
       ownerRevision: owner.ownerRevision, authorityEpoch: owner.authorityEpoch,
       day: dayValue, stream, limit: 50, ...(after === undefined ? {} : {after}),
-    });
+    }));
     // Do not persist a folded prefix without its cursor: retrying a page that
     // contains a conflict must never count its preceding valid rows twice.
     if (page.rows.some(row => row.status !== 'compatible' || row.recordJson === null)) return {values,complete:false,blocked:true};
@@ -177,8 +179,14 @@ async function ownerPage(options: StorageCommunityDailyBindings, observedDay: st
   let dependencyDigest: string | null = null;
   if (effective && sharedFeatures && sharedFeatureBudget) {
     try {
-      const feature = await advanceSharedAnalyticsFeatureDay({source,target,sourceId,sourceNamespace,
-        owner:{...owner,ownerDigest},day:observedDay,budget:sharedFeatureBudget});
+      let observer:SharedAnalyticsFeatureBudget['observePhase'];
+      let statementsUsed:SharedAnalyticsFeatureBudget['statementCount'];
+      try{observer=sharedFeatureBudget.observePhase;statementsUsed=sharedFeatureBudget.statementCount;}
+      catch{/* diagnosis is optional */}
+      const feature = await withStoragePublicationTiming('daily_shared_feature',
+        observer,statementsUsed,
+        ()=>advanceSharedAnalyticsFeatureDay({source,target,sourceId,sourceNamespace,
+          owner:{...owner,ownerDigest},day:observedDay,budget:sharedFeatureBudget}));
       if (feature.state === 'deferred') return 'deferred';
       if (feature.state === 'complete') {
         validateV11DailyProjectionValues(feature.value.daily);
@@ -188,11 +196,13 @@ async function ownerPage(options: StorageCommunityDailyBindings, observedDay: st
     } catch (error) {
       // An older target without the optional feature migration retains the
       // existing effective reader. Other failures remain visible to the pass.
-      if (!(error instanceof Error) || !/no such table|no such column/i.test(error.message)) throw error;
+      if (!(error instanceof Error) || !/no such table|no such column/i.test(error.message))
+        rethrowStorageGraphFailure('daily_shared_feature',error);
     }
   }
-  dependencyDigest ??= effective ? await sha256Hex(canonicalJson(await effectiveHistoryDependency(
-    source,owner,sourceNamespace,observedDay,observedDay,{includeSessions:true}))) : null;
+  dependencyDigest ??= effective ? await sha256Hex(canonicalJson(await withStorageGraphFailureStage(
+    'daily_source_dependency', () => effectiveHistoryDependency(
+      source,owner,sourceNamespace,observedDay,observedDay,{includeSessions:true})))) : null;
   const oldCursor = effective && old?.source_format === 'effective' && old.method === method
     ? readEffectiveCursor(old.fingerprint,dependencyDigest!) : null;
   // A later upload for another day advances the owner's authority revision,

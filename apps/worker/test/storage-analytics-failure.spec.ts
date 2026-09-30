@@ -2,8 +2,10 @@ import { describe,expect,it } from 'vitest';
 import { D1InvocationBudgetExceededError } from '../src/d1-invocation-budget';
 import { V11ProjectionDeadlineExceededError } from '../src/v11-daily-projection';
 import { TypedTelemetryError } from '../src/typed-telemetry-codec';
+import { EffectiveUsageReaderError } from '../src/telemetry-usage-effective-reader';
 import { caughtStorageGraphFailureFields,classifyStorageGraphFailure,storageGraphFailureDetail,storageGraphFailureFields,
- StorageGraphOperationError,withStorageGraphFailureStage } from '../src/storage-analytics-failure';
+ createStoragePublicationTiming, STORAGE_PUBLICATION_TIMING_PHASES,StorageGraphOperationError,
+ withStorageGraphFailureStage,withStoragePublicationTiming } from '../src/storage-analytics-failure';
 
 describe('storage analytics graph failure diagnostics',()=>{
  it.each([
@@ -114,5 +116,93 @@ describe('storage analytics graph failure diagnostics',()=>{
   first.cause=second;
   expect(classifyStorageGraphFailure(first)).toBe('application');
   expect(storageGraphFailureDetail(first)).toBe('818d3d27');
+ });
+
+ it('classifies only genuine unavailable effective-reader causes without exposing them',async()=>{
+  const cause=new Error('D1_ERROR: query timed out SELECT private_column WHERE owner=synthetic-owner');
+  const unavailable=new EffectiveUsageReaderError('EFFECTIVE_USAGE_UNAVAILABLE',{cause});
+  const plain=new EffectiveUsageReaderError('EFFECTIVE_USAGE_UNAVAILABLE');
+  expect(unavailable.message).toBe(plain.message);
+  expect(JSON.stringify(unavailable)).toBe(JSON.stringify(plain));
+  expect(Object.keys(unavailable)).not.toContain('cause');
+  expect(classifyStorageGraphFailure(unavailable)).toBe('d1_timeout');
+  const classified=await withStorageGraphFailureStage('daily_effective_reader',async()=>{throw unavailable;})
+    .catch(error=>error);
+  expect(storageGraphFailureFields(classified)).toEqual({phase:'daily_effective_reader',reason:'d1_timeout'});
+  expect(classified).not.toHaveProperty('cause');
+  expect(classified.detail).toBeUndefined();
+  expect(JSON.stringify(classified)).not.toMatch(/private_column|synthetic-owner|SELECT/u);
+  expect(classifyStorageGraphFailure(plain)).toBe('application');
+  expect(classifyStorageGraphFailure(new Error('ordinary failure',{cause}))).toBe('application');
+  const nonUnavailable=new EffectiveUsageReaderError('EFFECTIVE_USAGE_LIMIT',{cause});
+  expect(nonUnavailable).not.toHaveProperty('cause');
+  expect(classifyStorageGraphFailure(nonUnavailable)).toBe('application');
+  const forged=Object.assign(Object.create(EffectiveUsageReaderError.prototype) as EffectiveUsageReaderError,
+    {code:'EFFECTIVE_USAGE_UNAVAILABLE',cause});
+  expect(classifyStorageGraphFailure(forged)).toBe('application');
+ });
+
+ it.each([new D1InvocationBudgetExceededError(),new V11ProjectionDeadlineExceededError()])(
+  'preserves controlled deferrals hidden in an effective-reader error',async cause=>{
+   const unavailable=new EffectiveUsageReaderError('EFFECTIVE_USAGE_UNAVAILABLE',{cause});
+   await expect(withStorageGraphFailureStage('daily_source_dependency',async()=>{throw unavailable;}))
+    .rejects.toBe(cause);
+   expect(caughtStorageGraphFailureFields('daily_source_dependency',unavailable)).toBeUndefined();
+  });
+
+ it('keeps the innermost stage and bounds mixed wrapper cycles',async()=>{
+  const inner=new StorageGraphOperationError('graph_history_reader','d1_cpu_limit');
+  const unavailable=new EffectiveUsageReaderError('EFFECTIVE_USAGE_UNAVAILABLE',{cause:inner});
+  await expect(withStorageGraphFailureStage('daily_shared_feature',async()=>{throw unavailable;}))
+   .rejects.toBe(inner);
+  const cycle=new EffectiveUsageReaderError('EFFECTIVE_USAGE_UNAVAILABLE',{cause:unavailable});
+  unavailable.cause=cycle;
+  expect(classifyStorageGraphFailure(unavailable)).toBe('application');
+  expect(caughtStorageGraphFailureFields('daily_shared_feature',unavailable))
+   .toEqual({phase:'daily_shared_feature',reason:'application'});
+ });
+
+ it('records inclusive successful and throwing timings from actual statement deltas',async()=>{
+  const timing=createStoragePublicationTiming();let statements=0;
+  const result=await withStoragePublicationTiming('daily_attempt',timing.observe,()=>statements,
+   async()=>withStoragePublicationTiming('feature_source_page',timing.observe,()=>statements,
+    async()=>{statements+=3;return 'complete' as const;}));
+  expect(result).toBe('complete');
+  const failure=new Error('synthetic private failure');
+  await expect(withStoragePublicationTiming('feature_save',timing.observe,()=>statements,
+   async()=>{statements+=2;throw failure;})).rejects.toBe(failure);
+  const deferred=await withStoragePublicationTiming('feature_dependency',timing.observe,()=>statements,
+   async()=>{statements+=1;return {state:'deferred' as const};});
+  expect(deferred).toEqual({state:'deferred'});
+  const snapshot=timing.snapshot();
+  expect(Object.keys(snapshot)).toEqual([...STORAGE_PUBLICATION_TIMING_PHASES]);
+  expect(snapshot.daily_attempt).toMatchObject({count:1,totalStatements:3,maxStatements:3});
+  expect(snapshot.feature_source_page).toMatchObject({count:1,totalStatements:3,maxStatements:3});
+  expect(snapshot.feature_save).toMatchObject({count:1,totalStatements:2,maxStatements:2});
+  expect(snapshot.feature_dependency).toMatchObject({count:1,totalStatements:1,maxStatements:1});
+  expect(snapshot.daily_attempt.totalWallMs).toBeGreaterThanOrEqual(snapshot.feature_source_page.totalWallMs);
+  for(const value of Object.values(snapshot)){
+   expect(Object.keys(value)).toEqual(['count','totalWallMs','maxWallMs','totalStatements','maxStatements']);
+   expect(Object.values(value).every(number=>Number.isSafeInteger(number)&&number>=0)).toBe(true);
+  }
+  expect(JSON.stringify(snapshot)).not.toContain('private failure');
+ });
+
+ it('isolates broken observers and counters from results, errors, and work',async()=>{
+  const failure=new Error('original work error');let work=0;
+  const broken=()=>{throw new Error('observer failure');};
+  expect(await withStoragePublicationTiming('daily_attempt',broken,()=>0,
+   async()=>{work++;return 'same result';})).toBe('same result');
+  await expect(withStoragePublicationTiming('feature_save',broken,()=>0,
+   async()=>{work++;throw failure;})).rejects.toBe(failure);
+  expect(await withStoragePublicationTiming('daily_attempt',broken,()=>{throw failure;},
+   async()=>{work++;return 'counter ignored';})).toBe('counter ignored');
+  expect(work).toBe(3);
+  const timing=createStoragePublicationTiming();
+  for(let count=0;count<8;count++)timing.observe('daily_attempt',1,1);
+  timing.observe('owner:synthetic' as never,1,1);
+  timing.observe('feature_save',Number.NaN,1);
+  expect(timing.snapshot().daily_attempt).toMatchObject({count:4,totalStatements:4});
+  expect(Object.keys(timing.snapshot())).toEqual([...STORAGE_PUBLICATION_TIMING_PHASES]);
  });
 });

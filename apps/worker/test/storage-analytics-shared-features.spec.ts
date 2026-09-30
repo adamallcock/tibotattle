@@ -35,6 +35,24 @@ function input(owner: Awaited<ReturnType<typeof setup>>['owner'],day:string) {
       deadlineMs:Date.now()+60_000,now:Date.now}};
   return {value,meter};
 }
+
+it('keeps shared-feature work and its statement cap when optional timing observers fail',async()=>{
+  const corpus=await setup(),day=corpus.graphDates[0]!;
+  const first=input(corpus.owner,day);
+  const thrown=await advanceSharedAnalyticsFeatureDay({...first.value,budget:{...first.value.budget,
+    statementCount:()=>first.meter.queriesUsed,observePhase:()=>{throw new Error('private observer');}}});
+  expect(['deferred','complete']).toContain(thrown.state);
+  expect(first.meter.queriesUsed).toBeGreaterThan(0);
+  expect(first.meter.queriesUsed).toBeLessThanOrEqual(950);
+  const second=input(corpus.owner,day);
+  const budget=Object.defineProperties({...second.value.budget},{
+    observePhase:{get(){throw new Error('private observer getter');}},
+    statementCount:{get(){throw new Error('private counter getter');}},
+  }) as SharedAnalyticsFeatureInput['budget'];
+  const continued=await advanceSharedAnalyticsFeatureDay({...second.value,budget});
+  expect(['deferred','complete']).toContain(continued.state);
+  expect(second.meter.queriesUsed).toBeLessThanOrEqual(950);
+},30_000);
 async function finish(owner:Awaited<ReturnType<typeof setup>>['owner'],day:string) {
   let deferred=0;
   for (let attempt=0;attempt<24;attempt++) {

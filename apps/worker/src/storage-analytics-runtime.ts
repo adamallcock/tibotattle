@@ -19,7 +19,8 @@ import { readCollectionControls } from './collection-controls';
 import { advanceStorageErasureJobs } from './storage-erasure';
 import { captureStorageAdminMetricSnapshot, warmStorageAdminMetricsHistoryCache } from './admin-metrics-history';
 import { caughtStorageGraphFailureFields, storageGraphFailureDetail,
- type StorageGraphFailureFields } from './storage-analytics-failure';
+ withStoragePublicationTiming, type StorageGraphFailureFields,
+ type StoragePublicationTimingObserver } from './storage-analytics-failure';
 
 import type { StorageAnalyticsBindings } from './analytics-delivery';
 export type { StorageAnalyticsBindings } from './analytics-delivery';
@@ -337,6 +338,9 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
  modelBlocks?:boolean;
  /** Reuse durable shared features across daily and graph consumers. */
  sharedFeatures?:boolean;
+ /** Optional content-free timing for the first four daily attempts in this
+  * pass. The scheduled publication worker owns the aggregate and its log. */
+ publicationTimingObserver?:StoragePublicationTimingObserver;
  /** Fixed graph selection clock for local qualification. Omitted in the
   * scheduled Worker so ordinary calls use the live UTC day. */
  graphSelectionNowMs?:number;
@@ -407,6 +411,7 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
  let steps=0,recordsRead=0,dailyPublications=0,graphCalculations=0,modelBlockAdoptedDates=0,
   graphFailure:StorageGraphFailureFields|undefined;
  let dailyAdmissionAttempt=0;
+ let timedDailyAttempts=0;
  let graphCheckpointAdvances=0;
  let graphDayProjection:StorageGraphDayProjectionFields|undefined;
  // Attribute actual retirement spend separately from useful calculation work.
@@ -713,10 +718,17 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
       try{
        for(let attempt=0;attempt<dailyAttempts&&deadlineMs-Date.now()>=(attempt===0?5_000:15_000);attempt++){
         const slot=admissionMinute+dailyAdmissionAttempt++;
-        const daily=await advanceNextStorageCommunityDaily({...dailyScoped,...storageDailyAdmissionForSlot(slot),skipDays,
-         ...(options.sharedFeatures===true?{sharedFeatures:true,sharedFeatureBudget:{
-          remainingQueries:()=>Math.min(meter.remainingQueries,dailyMeter.remainingQueries),
-          deadlineMs,now:Date.now}}:{})});
+        let observer:StoragePublicationTimingObserver|undefined;
+        if(timedDailyAttempts++<4){
+         try{observer=options.publicationTimingObserver;}catch{/* diagnosis is optional */}
+        }
+        const statementsUsed=()=>meter.queriesUsed;
+        const daily=await withStoragePublicationTiming('daily_attempt',observer,statementsUsed,
+         ()=>advanceNextStorageCommunityDaily({...dailyScoped,...storageDailyAdmissionForSlot(slot),skipDays,
+          ...(options.sharedFeatures===true?{sharedFeatures:true,sharedFeatureBudget:{
+           remainingQueries:()=>Math.min(meter.remainingQueries,dailyMeter.remainingQueries),
+           deadlineMs,now:Date.now,
+           ...(observer?{observePhase:observer,statementCount:statementsUsed}:{})}}:{})}));
         if(daily.state==='published'){dailyPublications++;emptyRetirement.delete('daily');}
         if(daily.state==='idle'){dailyIdle=true;break;}
         // A day waiting on a pending projection or on capacity yields to the

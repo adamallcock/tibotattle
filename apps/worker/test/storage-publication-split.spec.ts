@@ -1,9 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   runStoragePublicationSchedule,
   storagePublicationLaneEnabled,
 } from "../src/storage-publication-worker";
 import { runStorageAnalyticsPass, storageDailyAdmissionForSlot } from "../src/storage-analytics-runtime";
+import { STORAGE_PUBLICATION_TIMING_PHASES } from "../src/storage-analytics-failure";
 
 const database = () => ({ prepare() { throw new Error("no query expected"); } }) as unknown as D1Database;
 
@@ -30,6 +31,24 @@ describe("the publication lane's own worker", () => {
       PUBLICATION_LANE: "enabled", STORAGE_ANALYTICS_MODE: "enabled",
       PUBLIC_ANALYTICS_MODE: "enabled",
     })).rejects.toThrow("STORAGE_PUBLICATION_CONFIGURATION_INVALID");
+  });
+
+  it("logs only closed numeric phase timing if the publication pass fails",async()=>{
+    const logs=vi.spyOn(console,'error').mockImplementation(()=>{});
+    try{
+      await expect(runStoragePublicationSchedule({
+        PUBLICATION_LANE:'enabled',STORAGE_ANALYTICS_MODE:'enabled',PUBLIC_ANALYTICS_MODE:'enabled',
+        STORAGE_INGESTION_DB:database(),STORAGE_ANALYTICS_DB:database(),DELETION_LEDGER:database(),
+        STORAGE_SOURCE_ID:'synthetic-source',TELEMETRY_STORAGE_NAMESPACE:'synthetic-namespace',
+      })).rejects.toThrow('STORAGE_PUBLICATION_UNAVAILABLE');
+      expect(logs).toHaveBeenCalledTimes(1);
+      const row=JSON.parse(String(logs.mock.calls[0]![0])) as Record<string,unknown>;
+      expect(row).toMatchObject({event:'storage_publication_schedule',state:'unavailable'});
+      const timing=row.phaseTiming as Record<string,Record<string,number>>;
+      expect(Object.keys(timing)).toEqual([...STORAGE_PUBLICATION_TIMING_PHASES]);
+      expect(Object.values(timing).every(value=>Object.values(value).every(number=>number===0))).toBe(true);
+      expect(JSON.stringify(row)).not.toContain('no query expected');
+    }finally{logs.mockRestore();}
   });
 });
 

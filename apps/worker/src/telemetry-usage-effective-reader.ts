@@ -64,10 +64,21 @@ export type EffectiveUsageReaderErrorCode =
   | "EFFECTIVE_USAGE_CAS_MISMATCH"
   | "EFFECTIVE_USAGE_SOURCE_CONFLICT";
 
+const effectiveUsageReaderErrors = new WeakSet<EffectiveUsageReaderError>();
 export class EffectiveUsageReaderError extends Error {
-  constructor(readonly code: EffectiveUsageReaderErrorCode) {
-    super(code);
+  constructor(readonly code: EffectiveUsageReaderErrorCode, options?: ErrorOptions) {
+    // Keep the outward code unchanged. Only a genuine unavailable error may
+    // retain a non-enumerable cause for the scheduler's closed classifier.
+    super(code, code === "EFFECTIVE_USAGE_UNAVAILABLE" && options?.cause instanceof Error ? options : undefined);
     this.name = "EffectiveUsageReaderError";
+    effectiveUsageReaderErrors.add(this);
+  }
+
+  static diagnosticCause(error: unknown): Error | undefined {
+    if (!(error instanceof EffectiveUsageReaderError)
+      || !effectiveUsageReaderErrors.has(error)
+      || error.code !== "EFFECTIVE_USAGE_UNAVAILABLE") return undefined;
+    return error.cause instanceof Error ? error.cause : undefined;
   }
 }
 
@@ -266,7 +277,7 @@ async function readV12Availability(db: D1Database): Promise<boolean> {
     return true;
   } catch (error) {
     if (error instanceof EffectiveUsageReaderError) throw error;
-    fail("EFFECTIVE_USAGE_UNAVAILABLE");
+    throw new EffectiveUsageReaderError("EFFECTIVE_USAGE_UNAVAILABLE", { cause: error });
   }
 }
 
@@ -349,7 +360,7 @@ async function readOwnerScope(
     return row;
   } catch (error) {
     if (error instanceof EffectiveUsageReaderError) throw error;
-    fail("EFFECTIVE_USAGE_UNAVAILABLE");
+    throw new EffectiveUsageReaderError("EFFECTIVE_USAGE_UNAVAILABLE", { cause: error });
   }
 }
 
@@ -488,7 +499,7 @@ async function readDirectCandidates(db: D1Database, scope: OwnerScope, options: 
     return rows.map((row) => ({ occurrence_id: identifier(row.occurrence_id, OCCURRENCE_ID), observed_at_ms: integer(row.observed_at_ms, -8_640_000_000_000_000, 8_640_000_000_000_000) }));
   } catch (error) {
     if (error instanceof EffectiveUsageReaderError) throw error;
-    fail("EFFECTIVE_USAGE_UNAVAILABLE");
+    throw new EffectiveUsageReaderError("EFFECTIVE_USAGE_UNAVAILABLE", { cause: error });
   }
 }
 
@@ -626,7 +637,7 @@ async function readDirectSourceRows(db: D1Database, scope: OwnerScope, options: 
     }));
   } catch (error) {
     if (error instanceof EffectiveUsageReaderError) throw error;
-    fail("EFFECTIVE_USAGE_UNAVAILABLE");
+    throw new EffectiveUsageReaderError("EFFECTIVE_USAGE_UNAVAILABLE", { cause: error });
   }
 }
 
@@ -868,7 +879,7 @@ async function readGenericDirectCandidates(
       observed_at_ms: integer(row.observed_at_ms, -8_640_000_000_000_000, 8_640_000_000_000_000) }));
   } catch (error) {
     if (error instanceof EffectiveUsageReaderError) throw error;
-    fail("EFFECTIVE_USAGE_UNAVAILABLE");
+    throw new EffectiveUsageReaderError("EFFECTIVE_USAGE_UNAVAILABLE", { cause: error });
   }
 }
 
@@ -890,7 +901,7 @@ async function readGenericSourceRows(
       occurrence_id: identifier(row.occurrence_id, OCCURRENCE_ID) }));
   } catch (error) {
     if (error instanceof EffectiveUsageReaderError) throw error;
-    fail("EFFECTIVE_USAGE_UNAVAILABLE");
+    throw new EffectiveUsageReaderError("EFFECTIVE_USAGE_UNAVAILABLE", { cause: error });
   }
 }
 

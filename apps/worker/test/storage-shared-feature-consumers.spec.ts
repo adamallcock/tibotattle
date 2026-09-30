@@ -11,6 +11,7 @@ import { CACHE_RETENTION_EFFECTIVE_DEVICE_ID, CACHE_RETENTION_EFFECTIVE_MANIFEST
   type CacheRetentionDayCandidate } from '../src/cache-retention-day';
 import { runCacheRetentionDaySchedule } from '../src/cache-retention-day-worker';
 import { runStoragePublicationSchedule } from '../src/storage-publication-worker';
+import { STORAGE_PUBLICATION_TIMING_PHASES } from '../src/storage-analytics-failure';
 import { initializeSharedAnalyticsCorpusDatabases, seedSharedAnalyticsCorpus } from './fixtures/shared-analytics-corpus';
 import * as sharedStore from '../src/storage-analytics-shared-features';
 
@@ -335,10 +336,24 @@ it('publishes a dense effective day from cold shared features through the schedu
       if(published!==null)break;
     }
     const schedules=logs.mock.calls.map(([value])=>JSON.parse(String(value)) as {
-      event:string;queriesUsed:number;state:string;dailyPublications:number}).filter(row=>
+      event:string;queriesUsed:number;state:string;dailyPublications:number;
+      phaseTiming:Record<string,{count:number;totalWallMs:number;maxWallMs:number;
+        totalStatements:number;maxStatements:number}>}).filter(row=>
         row.event==='storage_publication_schedule');
     expect(schedules).toHaveLength(progress.length);
     expect(schedules.every(row=>row.queriesUsed<=900)).toBe(true);
+    for(const schedule of schedules){
+      expect(Object.keys(schedule.phaseTiming)).toEqual([...STORAGE_PUBLICATION_TIMING_PHASES]);
+      expect(schedule.phaseTiming.daily_attempt?.count).toBeLessThanOrEqual(4);
+      for(const value of Object.values(schedule.phaseTiming)){
+        expect(Object.keys(value)).toEqual(['count','totalWallMs','maxWallMs','totalStatements','maxStatements']);
+        expect(Object.values(value).every(number=>Number.isSafeInteger(number)&&number>=0)).toBe(true);
+      }
+      expect(JSON.stringify(schedule.phaseTiming)).not.toContain(corpus.owner.ownerDigest);
+    }
+    expect(schedules.some(row=>(row.phaseTiming.feature_dependency?.count??0)>0)).toBe(true);
+    expect(schedules.some(row=>(row.phaseTiming.feature_source_page?.count??0)>0)).toBe(true);
+    expect(schedules.some(row=>(row.phaseTiming.feature_save?.count??0)>0)).toBe(true);
     expect(progress.length).toBeGreaterThan(0);
     expect(progress.at(-1)).toBeGreaterThan(0);
     expect(schedules.some(row=>row.dailyPublications>0)).toBe(true);

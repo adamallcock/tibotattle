@@ -1,7 +1,7 @@
 import { createD1InvocationBudget } from './d1-invocation-budget';
 import { publicAnalyticsEnabled } from './public-analytics-gate';
 import { runStorageAnalyticsPass } from './storage-analytics-runtime';
-import { storageGraphFailureFields } from './storage-analytics-failure';
+import { createStoragePublicationTiming, storageGraphFailureFields } from './storage-analytics-failure';
 import { analyticsFeatureControls,type AnalyticsFeatureControlEnv } from './analytics-feature-controls';
 
 /**
@@ -64,6 +64,7 @@ export async function runStoragePublicationSchedule(
   }
   const event = 'storage_publication_schedule';
   const features=analyticsFeatureControls(env);
+  const phaseTiming=createStoragePublicationTiming();
   try {
     const meter = createD1InvocationBudget(900);
     const started = Date.now();
@@ -75,14 +76,16 @@ export async function runStoragePublicationSchedule(
       sourceNamespace: env.TELEMETRY_STORAGE_NAMESPACE,
       publishCommunity: true, publicOnly: true, publicationOnly: true,
       ...(features.sharedFeatures?{sharedFeatures:true}:{}),
+      publicationTimingObserver:phaseTiming.observe,
       maxSteps: 32, maxQueries: meter.remainingQueries,
       deadlineMs: started + PUBLICATION_WINDOW_MS,
     });
     console.log(JSON.stringify({ event, ...result,
-      elapsedMs: Date.now() - started, queriesUsed: meter.queriesUsed }));
+      elapsedMs: Date.now() - started, queriesUsed: meter.queriesUsed,
+      phaseTiming:phaseTiming.snapshot() }));
   } catch (error) {
     console.error(JSON.stringify({ event, state: 'unavailable',
-      ...storageGraphFailureFields(error) }));
+      ...storageGraphFailureFields(error),phaseTiming:phaseTiming.snapshot() }));
     throw new Error('STORAGE_PUBLICATION_UNAVAILABLE');
   }
 }

@@ -218,6 +218,16 @@ whole deadline or new work arrives continuously. Each day still requires the
 complete current cohort, correction method and authority before publication;
 partial owner progress remains private and resumable.
 
+The scheduled publication log includes one content-free `phaseTiming` aggregate
+for at most four daily attempts per pass. Its fixed phases are `daily_attempt`,
+`daily_shared_feature`, `feature_dependency`, `feature_source_page`, and
+`feature_save`; each carries a count and total/maximum wall milliseconds and
+actual metered statements. Inner feature phases are included in their enclosing
+daily attempt, and a save may include a dependency recheck, so phase totals
+must not be summed as a pass total. The log contains no owner, day, SQL,
+bindings, payload, or provider error message. These timings diagnose slow work;
+they do not change deadlines, budgets, retries, or publication eligibility.
+
 Self-service `DELETE /api/v1/me` is retired: the unknown API response is
 `404 NOT_FOUND`, without D1 access or participant mutation. `GET /api/v1/me`,
 legacy personal statistics, weekly aggregate, recovery,

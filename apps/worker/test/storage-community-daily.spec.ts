@@ -365,6 +365,56 @@ describe('independent public daily publication',()=>{
     expect((await publish()).state).toBe('published');
     expect(JSON.parse((await publicRead()).rows[0]!.payload_json).totals.usageEvents).toBe(121);
   });
+
+  it.each([
+    ['SELECT r.revision,r.authority_epoch FROM storage_owner_revisions r','daily_shared_feature',true],
+    ['SELECT name,type FROM sqlite_master','daily_source_dependency',false],
+    ['requested(occurrence_id) AS MATERIALIZED','daily_effective_reader',false],
+  ] as const)('reports a closed %s source failure at %s',async(fragment,phase,sharedFeatures)=>{
+    const first=await seedV1();
+    await insertTypedTelemetryV1Chunk(source(),first.insert,namespace);
+    await source().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+    await ready();
+    const raw='D1_ERROR: query timed out SELECT private_column WHERE owner=synthetic-owner';
+    let intercepted=0;
+    const failing=new Proxy(source(),{get(db,key){
+      if(key==='prepare')return(sql:string)=>{
+        if(sql.includes(fragment)){intercepted++;throw new Error(raw);}
+        return db.prepare(sql);
+      };
+      const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;
+    }});
+    const result=await advanceStorageCommunityDaily({...options(),source:failing,
+      ...(sharedFeatures?{sharedFeatures:true,sharedFeatureBudget:{
+        remainingQueries:()=>900,deadlineMs:Date.now()+55_000,now:()=>Date.now(),
+      }}:{})}).catch(error=>error);
+    expect(intercepted).toBeGreaterThan(0);
+    expect(result).toBeInstanceOf(StorageGraphOperationError);
+    expect(result).toMatchObject({stage:phase,reason:'d1_timeout'});
+    expect(result.detail).toBeUndefined();
+    expect(JSON.stringify(result)).not.toMatch(/private_column|synthetic-owner|SELECT/u);
+    expect(await target().prepare('SELECT count(*) n FROM analytics_community_daily_owners').first('n')).toBe(0);
+  });
+
+  it('keeps the optional missing-column feature fallback before classifying failure',async()=>{
+    const first=await seedV1();
+    await insertTypedTelemetryV1Chunk(source(),first.insert,namespace);
+    await source().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+    await ready();
+    let intercepted=0;
+    const oldFeature=new Proxy(source(),{get(db,key){
+      if(key==='prepare')return(sql:string)=>{
+        if(sql.includes('SELECT r.revision,r.authority_epoch FROM storage_owner_revisions r')
+          && intercepted===0){intercepted++;throw new Error('no such column: synthetic_old_feature');}
+        return db.prepare(sql);
+      };
+      const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;
+    }});
+    expect(await advanceStorageCommunityDaily({...options(),source:oldFeature,sharedFeatures:true,
+      sharedFeatureBudget:{remainingQueries:()=>900,deadlineMs:Date.now()+55_000,now:()=>Date.now()}}))
+      .toMatchObject({state:'published'});
+    expect(intercepted).toBe(1);
+  });
   it('never folds a valid prefix twice when a later effective page contains a conflict',async()=>{
     const first=await seedV1('usage',120);
     await insertTypedTelemetryV1Chunk(source(),first.insert,namespace);

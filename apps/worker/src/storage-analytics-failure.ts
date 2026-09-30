@@ -1,6 +1,7 @@
 import { D1InvocationBudgetExceededError } from './d1-invocation-budget';
 import { V11ProjectionDeadlineExceededError } from './v11-daily-projection';
 import { TypedTelemetryError } from './typed-telemetry-codec';
+import { EffectiveUsageReaderError } from './telemetry-usage-effective-reader';
 
 export const STORAGE_GRAPH_OPERATION_STAGES=[
  'graph_scope','graph_historical_pin','graph_checkpoint_load',
@@ -13,7 +14,7 @@ export const STORAGE_GRAPH_OPERATION_STAGES=[
  'graph_prepared_days',
  // Scheduler lanes: a failure in one lane is recorded here and the pass
  // continues with the others instead of abandoning the whole invocation.
- 'daily_publish','graph_work',
+ 'daily_publish','daily_shared_feature','daily_source_dependency','daily_effective_reader','graph_work',
 ] as const;
 export type StorageGraphOperationStage=typeof STORAGE_GRAPH_OPERATION_STAGES[number];
 export const STORAGE_GRAPH_FAILURE_REASONS=[
@@ -21,6 +22,63 @@ export const STORAGE_GRAPH_FAILURE_REASONS=[
  'checkpoint_unavailable','checkpoint_mismatch','source_changed','application',
 ] as const;
 export type StorageGraphFailureReason=typeof STORAGE_GRAPH_FAILURE_REASONS[number];
+
+/** Publication-only diagnostics. Inner feature timings are inclusive of work
+ * also counted by their enclosing daily attempt; never sum phase totals to
+ * estimate the pass's wall time or statement count. */
+export const STORAGE_PUBLICATION_TIMING_PHASES=[
+ 'daily_attempt','daily_shared_feature','feature_dependency','feature_source_page','feature_save',
+] as const;
+export type StoragePublicationTimingPhase=typeof STORAGE_PUBLICATION_TIMING_PHASES[number];
+export type StoragePublicationTimingObserver=(phase:StoragePublicationTimingPhase,
+ wallMs:number,statements:number)=>void;
+type PhaseTiming={count:number;totalWallMs:number;maxWallMs:number;
+ totalStatements:number;maxStatements:number};
+
+/** One numeric, content-free aggregate per scheduled publication pass. */
+export function createStoragePublicationTiming():{
+ observe:StoragePublicationTimingObserver;
+ snapshot:()=>Record<StoragePublicationTimingPhase,PhaseTiming>;
+}{
+ const totals=Object.fromEntries(STORAGE_PUBLICATION_TIMING_PHASES.map(phase=>[phase,
+  {count:0,totalWallMs:0,maxWallMs:0,totalStatements:0,maxStatements:0}])) as
+  Record<StoragePublicationTimingPhase,PhaseTiming>;
+ return {
+  observe:(phase,wallMs,statements)=>{
+   if(!Object.hasOwn(totals,phase)||!Number.isFinite(wallMs)||wallMs<0
+     ||!Number.isSafeInteger(statements)||statements<0)return;
+   const row=totals[phase];
+   if(row.count>=4096||(phase==='daily_attempt'&&row.count>=4))return;
+   const ms=Math.round(wallMs);
+   if(!Number.isSafeInteger(ms)||!Number.isSafeInteger(row.totalWallMs+ms)
+     ||!Number.isSafeInteger(row.totalStatements+statements))return;
+   row.count++;row.totalWallMs+=ms;row.maxWallMs=Math.max(row.maxWallMs,ms);
+   row.totalStatements+=statements;row.maxStatements=Math.max(row.maxStatements,statements);
+  },
+  snapshot:()=>Object.fromEntries(STORAGE_PUBLICATION_TIMING_PHASES.map(phase=>
+   [phase,{...totals[phase]}])) as Record<StoragePublicationTimingPhase,PhaseTiming>,
+ };
+}
+
+/** Measure only already awaited work. A missing or broken observer/counter
+ * cannot change the operation's result, thrown error, query cap, or deadline. */
+export async function withStoragePublicationTiming<T>(phase:StoragePublicationTimingPhase,
+ observer:StoragePublicationTimingObserver|undefined,statementsUsed:(()=>number)|undefined,
+ operation:()=>Promise<T>):Promise<T>{
+ let started:number|undefined,before:number|undefined;
+ if(typeof observer==='function'&&typeof statementsUsed==='function'){
+  try{started=performance.now();before=statementsUsed();}catch{/* diagnosis is optional */}
+ }
+ try{return await operation();}
+ finally{
+  if(started!==undefined&&before!==undefined){
+   try{
+    const elapsed=Math.max(0,performance.now()-started),statements=statementsUsed!()-before;
+    observer!(phase,elapsed,statements);
+   }catch{/* diagnosis must not replace an operation's result or error */}
+  }
+ }
+}
 
 export class StorageGraphOperationError extends Error {
  readonly stage:StorageGraphOperationStage;readonly reason:StorageGraphFailureReason;
@@ -31,13 +89,17 @@ export class StorageGraphOperationError extends Error {
  }
 }
 
-/** The typed reader keeps its content-free outward error code. Only this
- * recognized unavailable wrapper may reveal its internal cause to the graph
- * classifier; arbitrary application causes are not diagnostic authority.
- * Bound traversal even if a malformed error chain contains a cycle. */
+/** Readers keep content-free outward error codes. Only recognized unavailable
+ * wrappers may reveal an internal cause to this closed classifier; arbitrary
+ * application causes are not diagnostic authority. Bound cycles and depth. */
 function diagnosticCause(error:unknown):unknown {
- for(let depth=0;depth<4&&error instanceof TypedTelemetryError&&error.code==='TYPED_TELEMETRY_UNAVAILABLE';depth++){
-  const cause=error.cause;if(!(cause instanceof Error)||cause===error)break;error=cause;
+ const seen=new Set<Error>();
+ for(let depth=0;depth<4&&error instanceof Error&&!seen.has(error);depth++){
+  seen.add(error);
+  const cause=error instanceof TypedTelemetryError&&error.code==='TYPED_TELEMETRY_UNAVAILABLE'
+   ? error.cause : EffectiveUsageReaderError.diagnosticCause(error);
+  if(!(cause instanceof Error)||seen.has(cause))break;
+  error=cause;
  }
  return error;
 }
@@ -87,7 +149,11 @@ export function rethrowStorageGraphFailure(stage:StorageGraphOperationStage,erro
  error=diagnosticCause(error);
  if(error instanceof D1InvocationBudgetExceededError||error instanceof V11ProjectionDeadlineExceededError
    ||error instanceof StorageGraphOperationError)throw error;
- throw new StorageGraphOperationError(stage,classifyStorageGraphFailure(error),storageGraphFailureDetail(error));
+ // Daily diagnostics need only a closed phase and reason; do not derive a
+ // correlation token from a provider message that may contain source SQL.
+ const detail=stage==='daily_shared_feature'||stage==='daily_source_dependency'
+  ||stage==='daily_effective_reader'?undefined:storageGraphFailureDetail(error);
+ throw new StorageGraphOperationError(stage,classifyStorageGraphFailure(error),detail);
 }
 
 export async function withStorageGraphFailureStage<T>(stage:StorageGraphOperationStage,

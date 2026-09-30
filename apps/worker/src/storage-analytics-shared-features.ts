@@ -9,12 +9,17 @@ import { assertEffectiveHistoryOwner, createEffectiveHistoryDayDependencyReader,
 import type { StorageCommunityOwner } from './storage-community-authority';
 import { readEffectiveTelemetryOwnerDayPage,
   type EffectiveTelemetryStream } from './telemetry-usage-effective-reader';
+import { withStoragePublicationTiming, type StoragePublicationTimingObserver,
+  type StoragePublicationTimingPhase } from './storage-analytics-failure';
 
 export type { SharedAnalyticsFeatureDay } from './analytics-shared-features';
 export interface SharedAnalyticsFeatureBudget {
   remainingQueries(): number;
   deadlineMs: number;
   now(): number;
+  /** Internal, optional publication diagnostics; never part of source policy. */
+  statementCount?:()=>number;
+  observePhase?:StoragePublicationTimingObserver;
 }
 export interface SharedAnalyticsFeatureInput {
   source: D1Database; target: D1Database; sourceId: string; sourceNamespace: string;
@@ -57,6 +62,14 @@ function checkInput(input: SharedAnalyticsFeatureInput): void {
 function available(budget: SharedAnalyticsFeatureBudget, reserve: number): boolean {
   return budget.now() < budget.deadlineMs - 1_500 && budget.remainingQueries() >= reserve;
 }
+function timed<T>(input:SharedAnalyticsFeatureInput,phase:StoragePublicationTimingPhase,
+ work:()=>Promise<T>):Promise<T>{
+ let observer:SharedAnalyticsFeatureBudget['observePhase'];
+ let statementsUsed:SharedAnalyticsFeatureBudget['statementCount'];
+ try{observer=input.budget.observePhase;statementsUsed=input.budget.statementCount;}
+ catch{/* an optional diagnostic getter cannot stop source work */}
+ return withStoragePublicationTiming(phase,observer,statementsUsed,work);
+}
 async function supported(target: D1Database): Promise<boolean> {
   try {
     const result = await target.prepare(`SELECT count(*) n FROM sqlite_schema
@@ -93,8 +106,8 @@ async function targetCurrent(input: SharedAnalyticsFeatureInput): Promise<boolea
   return row === 1;
 }
 async function dependencyDigest(input: SharedAnalyticsFeatureInput): Promise<string> {
-  return sha256Hex(canonicalJson(await effectiveHistoryDependency(input.source,input.owner,
-    input.sourceNamespace,input.day,input.day,{includeSessions:true})));
+  return timed(input,'feature_dependency',async()=>sha256Hex(canonicalJson(await effectiveHistoryDependency(
+    input.source,input.owner,input.sourceNamespace,input.day,input.day,{includeSessions:true}))));
 }
 async function methodDigest(): Promise<string> {
   return sha256Hex(canonicalJson(SHARED_ANALYTICS_FEATURE_METHOD));
@@ -406,21 +419,22 @@ Promise<SharedAnalyticsFeatureResult> {
       if (!available(input.budget, 90)) break;
       if (!await sourceCurrent(input)) return {state:'deferred',reason:'source_changed'};
       const stream = STREAMS[pending.streamIndex]!;
-      const page = await readEffectiveTelemetryOwnerDayPage(input.source, {
+      const page = await timed(input,'feature_source_page',()=>readEffectiveTelemetryOwnerDayPage(input.source, {
         sourceNamespace:input.sourceNamespace,ownerDigest:input.owner.ownerDigest,
         ownerRevision:input.owner.ownerRevision,authorityEpoch:input.owner.authorityEpoch,
-        day:input.day,stream,limit:200,...(pending.after?{after:pending.after}:{})});
+        day:input.day,stream,limit:200,...(pending.after?{after:pending.after}:{})}));
       pending = await appendSharedAnalyticsFeaturePage(pending,stream,page.rows,page.next);
     }
     const complete = pending.streamIndex === STREAMS.length;
     const frame: Frame = complete ? {kind:'complete',value:await finishSharedAnalyticsFeatureDay(pending)}
       : {kind:'pending',value:pending};
-    if (!await saveFrame(input,job,claim,frame)) return {state:'deferred',reason:'source_changed_or_budget'};
+    if (!await timed(input,'feature_save',()=>saveFrame(input,job,claim,frame)))
+      return {state:'deferred',reason:'source_changed_or_budget'};
     return complete ? {state:'complete',value:(frame as {kind:'complete';value:SharedAnalyticsFeatureDay}).value,
       dependencyDigest:digest,reused:false} : {state:'deferred',reason:'incomplete'};
   } catch (error) {
     if (error instanceof SharedFeatureRefused) {
-      if (!await saveFrame(input,job,claim,{kind:'refused',reason:error.reason}))
+      if (!await timed(input,'feature_save',()=>saveFrame(input,job,claim,{kind:'refused',reason:error.reason})))
         return {state:'deferred',reason:'source_changed_or_budget'};
       return {state:'refused',reason:error.reason};
     }

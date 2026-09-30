@@ -10,7 +10,7 @@ import { currentTelemetryV1Chunk } from "../src/telemetry-v1-repository";
 import { parseTelemetryV1Chunk, type TelemetryV1UsageEvent } from "../src/telemetry-v1";
 import { telemetryV11LegacyProjection } from "../src/telemetry-v11-compatibility";
 import { decodeTypedTelemetryId } from "../src/typed-telemetry-codec";
-import { readEffectiveUsageOwnerDayPage, readEffectiveTelemetryOwnerDayPage,
+import { EffectiveUsageReaderError, readEffectiveUsageOwnerDayPage, readEffectiveTelemetryOwnerDayPage,
   readEffectiveTelemetryOwnerDays } from "../src/telemetry-usage-effective-reader";
 
 interface Bindings extends Env {
@@ -303,6 +303,30 @@ it("fails closed when either additive owner metadata index is absent", async () 
     await db().prepare(`CREATE INDEX ${index} ON ${table}(owner_id,id)`).run();
   }
   expect((await readEffectiveUsageOwnerDayPage(db(), options)).rows).toHaveLength(1);
+}, 30_000);
+
+it("retains a private D1 cause when the bounded occurrence source read fails", async () => {
+  const fixture = await createV11DeviceFixture(db());
+  const occurrence = `event:v2:${"1".repeat(64)}`;
+  await insertTypedTelemetryV1Chunk(db(), await makeInsert(fixture, 1, [occurrence], true), sourceNamespace);
+  const owner = await ownerFor(fixture.participantId);
+  const cause = new Error("D1_ERROR: query timed out SELECT private_column WHERE owner=synthetic-owner");
+  const failing = new Proxy(db(), { get(target, property) {
+    if (property === "prepare") return (sql: string) => {
+      if (!sql.includes("requested(occurrence_id) AS MATERIALIZED")) return target.prepare(sql);
+      return { bind: () => ({ all: async () => { throw cause; } }) } as unknown as D1PreparedStatement;
+    };
+    const value = Reflect.get(target, property);
+    return typeof value === "function" ? value.bind(target) : value;
+  } });
+  const error = await readEffectiveUsageOwnerDayPage(failing, {
+    sourceNamespace, ownerDigest: owner.owner_digest, ownerRevision: owner.revision,
+    authorityEpoch: owner.authority_epoch, day, limit: 1,
+  }).catch(error => error);
+  expect(error).toBeInstanceOf(EffectiveUsageReaderError);
+  expect(error).toMatchObject({ code: "EFFECTIVE_USAGE_UNAVAILABLE" });
+  expect(error.cause).toBe(cause);
+  expect(JSON.stringify(error)).not.toMatch(/private_column|synthetic-owner|SELECT/u);
 }, 30_000);
 
 describe("effective mixed v1 usage reader", () => {
