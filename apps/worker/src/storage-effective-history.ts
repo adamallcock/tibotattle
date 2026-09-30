@@ -264,35 +264,48 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
        WHERE chunk.chunk_day>=s.from_day AND chunk.chunk_day<=s.through_day
          AND chunk.stream IN ${sourceStreams}
          AND chunk.record_count=${TYPED_V11_CHUNK_PROOF_COUNT_SQL}
+    ), admitted_v1_selected_chunks AS MATERIALIZED (
+      /* Admission seals every record's namespace, owner, device, chunk and day.
+       * Retain the complete proof count, validate its immutable header once,
+       * then keep raw row keys/time bounds below instead of decoding each row. */
+      SELECT chunk.id,chunk.chunk_day AS source_day,r.namespace_id,r.owner_id,
+        header_record.device_id AS device_key,header_record.chunk_id AS chunk_key,
+        header_record.stream AS stream_code
+        FROM scope s
+        CROSS JOIN complete_v1_selected_chunks complete_chunk
+        CROSS JOIN telemetry_v1_chunks chunk ON chunk.id=complete_chunk.id
+        CROSS JOIN typed_v1_record_admissions representative ON representative.typed_record_id=(
+          SELECT proof.typed_record_id FROM typed_v1_record_admissions proof INDEXED BY typed_v1_admissions_chunk
+           WHERE proof.chunk_id=chunk.id ORDER BY proof.typed_record_id LIMIT 1)
+        CROSS JOIN typed_telemetry_records header_record ON header_record.id=representative.typed_record_id
+        CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=header_record.id
+        CROSS JOIN typed_v1_admission_state v1 ON v1.id=1 AND v1.runtime_contract_version=1
+          AND v1.source_namespace=s.source_namespace
+        CROSS JOIN typed_v1_owner_memberships owner_membership ON owner_membership.participant_id=r.participant_id
+        CROSS JOIN typed_telemetry_owners typed_owner ON typed_owner.id=owner_membership.typed_owner_id
+          AND typed_owner.namespace_id=v1.namespace_id
+        CROSS JOIN typed_v1_event_sources event ON event.chunk_id=chunk.id
+          AND event.owner_digest=s.owner_digest AND event.source_namespace=v1.source_namespace
+       WHERE r.participant_id=s.participant_id AND r.source_namespace=v1.source_namespace
+         AND r.namespace_id=v1.namespace_id AND r.owner_id=typed_owner.id
+         AND chunk.participant_id=r.participant_id AND chunk.device_id=r.device_id
+         AND r.format_code=10 AND r.stream IN ${sourceStreams}
+         AND r.observed_day>=s.from_day AND r.observed_day<=s.through_day
     ), ${retainedV12} selected(${target()}occurrence_id) AS MATERIALIZED (
       SELECT ${target('s')}scoped_record.occurrence_id
         FROM ${selectionScope} s
-        CROSS JOIN typed_v1_owner_memberships scoped_owner
-          ON scoped_owner.participant_id=s.participant_id
-        CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_time
-          ON scoped_record.owner_id=scoped_owner.typed_owner_id AND scoped_record.format=10
+        CROSS JOIN admitted_v1_selected_chunks header
+          ON header.source_day>=s.from_day AND header.source_day<=s.through_day
+        CROSS JOIN typed_v1_record_admissions admission INDEXED BY typed_v1_admissions_chunk
+          ON admission.chunk_id=header.id
+        CROSS JOIN typed_telemetry_records scoped_record ON scoped_record.id=admission.typed_record_id
+          AND scoped_record.namespace_id=header.namespace_id AND scoped_record.owner_id=header.owner_id
+          AND scoped_record.device_id=header.device_key AND scoped_record.chunk_id=header.chunk_key
+          AND scoped_record.format=10 AND scoped_record.stream=header.stream_code
           AND scoped_record.stream IN ${typedStreams}
           AND scoped_record.observed_at_ms>=s.from_ms AND scoped_record.observed_at_ms<s.through_ms
           AND scoped_record.observed_day>=CAST(s.from_ms/86400000 AS INTEGER)
           AND scoped_record.observed_day<CAST(s.through_ms/86400000 AS INTEGER)
-        CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=scoped_record.id
-        JOIN typed_v1_admission_state v1 ON v1.id=1 AND v1.runtime_contract_version=1
-          AND v1.source_namespace=s.source_namespace
-        JOIN typed_v1_owner_memberships owner_membership ON owner_membership.participant_id=r.participant_id
-        JOIN typed_telemetry_owners typed_owner ON typed_owner.id=owner_membership.typed_owner_id
-          AND typed_owner.namespace_id=v1.namespace_id
-        JOIN typed_v1_record_admissions admission ON admission.typed_record_id=r.storage_row_id
-        JOIN telemetry_v1_chunks chunk ON chunk.id=admission.chunk_id
-          AND chunk.participant_id=r.participant_id AND chunk.device_id=r.device_id
-          AND chunk.stream IN ${sourceStreams} AND chunk.superseded_at IS NULL
-          AND chunk.accepted_record_count=chunk.record_count
-        JOIN complete_v1_selected_chunks complete_chunk ON complete_chunk.id=chunk.id
-        JOIN typed_v1_event_sources event ON event.chunk_id=chunk.id
-          AND event.owner_digest=s.owner_digest AND event.source_namespace=v1.source_namespace
-       WHERE r.participant_id=s.participant_id AND r.source_namespace=v1.source_namespace
-         AND r.namespace_id=v1.namespace_id AND r.owner_id=typed_owner.id
-         AND r.format_code=10 AND r.stream IN ${sourceStreams}
-         AND r.observed_day>=s.from_day AND r.observed_day<=s.through_day
       UNION
       SELECT ${target('s')}scoped_record.occurrence_id
         FROM ${selectionScope} s

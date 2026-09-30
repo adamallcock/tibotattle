@@ -92,7 +92,7 @@ async function stage(fixture: Fixture, prepared: Prepared): Promise<Staged> {
 
 async function insertV1HistoryDay(fixture: Fixture, selectedDay: string, revision: number,
   supersedes: Awaited<ReturnType<typeof currentTelemetryV1Chunk>> = null,
-  occurrenceId: string | readonly string[] = `event:v2:synthetic-v1-${selectedDay}`) {
+  occurrenceId: string | readonly string[] = `event:v2:synthetic-v1-${selectedDay}`, chunkSequence = 0) {
   const ids = typeof occurrenceId === "string" ? [occurrenceId] : occurrenceId;
   const records = ids.map(eventId => {
     const projected = telemetryV11LegacyProjection("usage", v11UsageRecord(selectedDay, "a", {
@@ -111,7 +111,7 @@ async function insertV1HistoryDay(fixture: Fixture, selectedDay: string, revisio
     envelopeDigest, bodyBytes: 1000, contentType: "application/json",
   });
   const chunk = parseTelemetryV1Chunk({ schemaVersion: "telemetry-contribution-v1.0",
-    chunkId: `usage:${selectedDay}:0`, chunkRevision: revision,
+    chunkId: `usage:${selectedDay}:${chunkSequence}`, chunkRevision: revision,
     chunkDigest: await sha256Hex(canonicalJson(records)), parserVersion: "synthetic-history-v1",
     consent: { telemetrySchemaVersion: "telemetry-contribution-v1.0",
       fieldDictionaryVersion: "telemetry-v1.0-registry-2026-08-07.1",
@@ -1015,6 +1015,55 @@ describe("bounded shared effective day dependencies", () => {
     }, 60_000);
 
   }
+
+  it("reuses immutable chunk header proofs across dense selected v1 occurrences", async ({ annotate }) => {
+    const selectedDay = day(), outsideDay = dayAfter(selectedDay);
+    const costs: {chunks: number; mode: string; includeSessions: boolean; current: number; prior: number}[] = [];
+    for (const chunks of [1, 10]) {
+      const fixture = await createV11DeviceFixture(db());
+      const outsideFixture = await createV11DeviceFixture(db(), {participantId: fixture.participantId});
+      for (let sequence=0;sequence<chunks;sequence++) {
+        const ids=Array.from({length:200},(_,index)=>`synthetic:dense-selected:${chunks}:${sequence}:${index}`);
+        await insertV1HistoryDay(fixture, selectedDay, 1, null, ids, sequence);
+        if (sequence===0) await insertV1HistoryDay(outsideFixture, outsideDay, 1, null, ids);
+      }
+      const owner=(await readStorageCommunityOwnerPage(db()))
+        .find(value=>value.participantId===fixture.participantId)!;
+      for (const includeSessions of [false,true]) {
+        const observed=observeDependencyQueries(db());
+        const dependency=await effectiveHistoryDependency(observed.database,owner,namespace,selectedDay,selectedDay,{includeSessions});
+        expect(dependency.occurrenceLinks).toEqual([expect.objectContaining({family:"v1",source_day:outsideDay})]);
+        const batched=observeDependencyQueries(db());
+        const reader=await createEffectiveHistoryDayDependencyReader(batched.database,owner,namespace,
+          [selectedDay,outsideDay],{includeSessions,occurrenceLinks:"batched"});
+        expect(await reader!.readDigest(selectedDay)).toBe(await sha256Hex(canonicalJson(dependency)));
+        for (const [mode,query] of [
+          ["singleton",observed.queries.find(value=>value.sql.includes("selected(occurrence_id)"))!],
+          ["batched",batched.queries.find(value=>value.sql.startsWith("/* batched occurrence links */"))!],
+        ] as const) {
+          const oldSql=mode==="singleton"?selectedChunkSqlBaseline.sql:selectedChunkSqlBaseline.batchedSql;
+          const baseline=includeSessions?oldSql.replaceAll("('usage','quota')","('usage','quota','session')")
+            .replaceAll("(1,2)","(1,2,3)"):oldSql;
+          const current=await db().prepare(query.sql).bind(...query.values).all();
+          const prior=await db().prepare(baseline).bind(...query.values).all();
+          expect(current.results).toEqual(prior.results);
+          expect(current.meta.rows_read).toBeLessThan(prior.meta.rows_read);
+          const marker="\n    SELECT "+(mode==="batched"?"target_day,":"")+"family,occurrence_id,source_day,record_day,observed_at_ms,source_key,source_digest,canonical_digest,";
+          const selectedCount=(sql:string)=>{
+            const index=sql.lastIndexOf(marker);
+            expect(index).toBeGreaterThan(0);
+            return sql.slice(0,index)+"\n SELECT count(*) AS selected_count FROM selected LIMIT ?";
+          };
+          const nextSelected=await db().prepare(selectedCount(query.sql)).bind(...query.values).all();
+          const priorSelected=await db().prepare(selectedCount(baseline)).bind(...query.values).all();
+          expect(nextSelected.results).toEqual(priorSelected.results);
+          expect(nextSelected.meta.rows_read).toBeLessThan(priorSelected.meta.rows_read/3);
+          costs.push({chunks,mode,includeSessions,current:nextSelected.meta.rows_read,prior:priorSelected.meta.rows_read});
+        }
+      }
+    }
+    await annotate(JSON.stringify(costs),"dense-selected-v1-proof-cost");
+  }, 60_000);
 
   it("checks each complete chunk once when many selected occurrences match one outside chunk", async ({ annotate }) => {
     const selectedDay = day(), outsideDay = dayAfter(selectedDay);
