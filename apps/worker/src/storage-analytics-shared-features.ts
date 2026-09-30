@@ -185,24 +185,31 @@ async function saveFrame(input: SharedAnalyticsFeatureInput, job: Job, claimToke
   if (!validFrame(frame)) throw fail();
   const payload = canonicalJson(frame);
   if (byteSize(payload) > SHARED_ANALYTICS_FEATURE_MAX_BYTES) throw new SharedFeatureRefused('day_feature_limit');
-  const parts = splitPayload(payload), now = Math.trunc(input.budget.now());
+  const parts = splitPayload(payload);
+  const payloadDigest = await sha256Hex(payload);
+  const partDigests = await Promise.all(parts.map(part=>sha256Hex(part)));
   if (!available(input.budget, parts.length + 60) || !await sourceCurrent(input)
     || await dependencyDigest(input) !== job.dependency_digest
     || !await targetCurrent(input)) return false;
+  // Source validation can be slow. Bind the promotion to the current clock,
+  // not the clock from before the final dependency proof.
+  const now = Math.trunc(input.budget.now());
+  if (!available(input.budget, parts.length + 2)
+    || job.claim_expires_ms === null || job.claim_expires_ms <= now + 1_500) return false;
   const statements: D1PreparedStatement[] = [];
   for (const [index, part] of parts.entries()) statements.push(input.target.prepare(
     `INSERT INTO analytics_shared_feature_parts
       (job_key,source_id,owner_digest,revision,part_index,payload,payload_bytes,payload_digest,claim_token,saved_ms)
       VALUES(?,?,?,?,?,?,?,?,?,?)`)
     .bind(job.job_key,input.sourceId,input.owner.ownerDigest,job.head_revision+1,index,
-      part,byteSize(part),await sha256Hex(part),claimToken,now));
+      part,byteSize(part),partDigests[index],claimToken,now));
   statements.push(input.target.prepare(`UPDATE analytics_shared_feature_days SET
     head_revision=?,state=?,payload_digest=?,payload_bytes=?,part_count=?,
     claim_token=NULL,claim_expires_ms=NULL,updated_ms=?
     WHERE job_key=? AND head_revision=? AND claim_token=? AND claim_expires_ms>?
       AND owner_revision=? AND input_revision=?`)
     .bind(job.head_revision+1,frame.kind==='pending'?'building':frame.kind,
-      await sha256Hex(payload),byteSize(payload),parts.length,now,
+      payloadDigest,byteSize(payload),parts.length,now,
       job.job_key,job.head_revision,claimToken,now,
       input.owner.ownerRevision,input.owner.inputRevision));
   let results: D1Result[];
@@ -225,18 +232,25 @@ function resultFromFrame(frame: Frame, digest: string): SharedAnalyticsFeatureRe
   if (frame.kind === 'refused') return {state:'refused',reason:frame.reason};
   return {state:'absent'};
 }
-/** Read only. An unchanged historical day may reuse a lower owner input
- * revision, but exact source metadata and target erasure/epoch are re-proved. */
-export async function readSharedAnalyticsFeatureDay(input: SharedAnalyticsFeatureInput):
-Promise<SharedAnalyticsFeatureReadResult> {
+type FeatureDaySnapshot = Exclude<SharedAnalyticsFeatureReadResult,{state:'absent'}>
+  | {state:'absent';method:string;digest:string;key:string;dependencyElapsedMs:number};
+
+/** Keep the initial dependency proof private so an advancing cache miss can
+ * reuse it. Completed reads and every save still require a fresh final proof. */
+async function readFeatureDaySnapshot(input: SharedAnalyticsFeatureInput):
+Promise<FeatureDaySnapshot> {
   checkInput(input);
   if (!available(input.budget, 60)) return {state:'deferred',reason:'query_budget'};
   if (!await supported(input.target)) return {state:'refused',reason:'migration_required'};
   if (!await sourceCurrent(input) || !await targetCurrent(input))
     return {state:'deferred',reason:'source_changed'};
-  const digest = await dependencyDigest(input), key = await jobKey(input,await methodDigest(),digest);
+  const dependencyStarted = input.budget.now();
+  const digest = await dependencyDigest(input);
+  const dependencyElapsedMs = Math.max(0,input.budget.now()-dependencyStarted);
+  const method = await methodDigest(), key = await jobKey(input,method,digest);
   const job = await lookup(input,key);
-  if (!job || job.state === 'building') return {state:'absent'};
+  if (!job || job.state === 'building')
+    return {state:'absent',method,digest,key,dependencyElapsedMs};
   let frame:Frame;
   try { frame = await loadOne(input.target,job); }
   catch (error) {
@@ -252,7 +266,16 @@ Promise<SharedAnalyticsFeatureReadResult> {
     return {state:'deferred',reason:'source_changed'};
   if (!await sourceCurrent(input) || await dependencyDigest(input) !== digest
     || !await targetCurrent(input)) return {state:'deferred',reason:'source_changed'};
-  return resultFromFrame(frame,digest);
+  const result = resultFromFrame(frame,digest);
+  if (result.state === 'absent') throw fail();
+  return result;
+}
+/** Read only. An unchanged historical day may reuse a lower owner input
+ * revision, but exact source metadata and target erasure/epoch are re-proved. */
+export async function readSharedAnalyticsFeatureDay(input: SharedAnalyticsFeatureInput):
+Promise<SharedAnalyticsFeatureReadResult> {
+  const snapshot = await readFeatureDaySnapshot(input);
+  return snapshot.state === 'absent' ? {state:'absent'} : snapshot;
 }
 export type SharedAnalyticsFeatureRetirementResult =
   | {state:'complete';scanned:number;headsRemoved:number;partsRemoved:number}
@@ -268,6 +291,11 @@ Promise<SharedAnalyticsFeatureRetirementResult> {
   if (!await sourceCurrent(input) || !await targetCurrent(input))
     return {state:'deferred',reason:'source_changed'};
   const method = await methodDigest(), digest = await dependencyDigest(input);
+  return retireFeatureDaySnapshot(input,method,digest);
+}
+async function retireFeatureDaySnapshot(input:SharedAnalyticsFeatureInput,method:string,digest:string):
+Promise<SharedAnalyticsFeatureRetirementResult> {
+  if (!available(input.budget,60)) return {state:'deferred',reason:'query_budget'};
   if (!await sourceCurrent(input) || !await targetCurrent(input))
     return {state:'deferred',reason:'source_changed'};
   const now = Math.trunc(input.budget.now());
@@ -362,15 +390,14 @@ export async function advanceSharedAnalyticsFeatureDay(input: SharedAnalyticsFea
 Promise<SharedAnalyticsFeatureResult> {
   checkInput(input);
   if (!available(input.budget, 100)) return {state:'deferred',reason:'query_budget'};
-  const cached = await readSharedAnalyticsFeatureDay(input);
+  const cached = await readFeatureDaySnapshot(input);
   if (cached.state !== 'absent') return cached;
-  const method = await methodDigest(), digest = await dependencyDigest(input);
+  const {method,digest,key} = cached;
   if (!await sourceCurrent(input) || !await targetCurrent(input))
     return {state:'deferred',reason:'source_changed'};
-  const key = await jobKey(input,method,digest);
   let job = await lookup(input,key);
   if (!job) {
-    const retirement=await retireSharedAnalyticsFeatureDay(input);
+    const retirement=await retireFeatureDaySnapshot(input,method,digest);
     if (retirement.state!=='complete') return retirement;
     try { await input.target.prepare(`INSERT INTO analytics_shared_feature_days
       (job_key,source_id,source_namespace,owner_digest,day,method_digest,dependency_digest,
@@ -386,6 +413,8 @@ Promise<SharedAnalyticsFeatureResult> {
   if (job.state !== 'building') {
     const frame = await loadOne(input.target,job);
     if (!frameScopeCurrent(input,frame)) throw fail();
+    if (!await sourceCurrent(input) || await dependencyDigest(input) !== digest
+      || !await targetCurrent(input)) return {state:'deferred',reason:'source_changed'};
     return resultFromFrame(frame,digest) as SharedAnalyticsFeatureResult;
   }
   if (!available(input.budget, 80)) return {state:'deferred',reason:'query_budget'};
@@ -414,15 +443,23 @@ Promise<SharedAnalyticsFeatureResult> {
     if (!frameScopeCurrent(input,frame)) throw fail();
     pending = frame.value;
   }
+  // Leave enough time for the measured dependency proof and the next page's
+  // observed latency. A saved partial generation makes progress on the next run.
+  const saveHeadroomMs = cached.dependencyElapsedMs + 1_500;
+  const saveDeadlineMs = Math.min(input.budget.deadlineMs,leaseUntil);
+  let sourcePageElapsedMs = 0;
   try {
     for (let pageIndex = 0; pageIndex < 4 && pending.streamIndex < STREAMS.length; pageIndex++) {
-      if (!available(input.budget, 90)) break;
+      if (!available(input.budget, 90)
+        || input.budget.now()+saveHeadroomMs+sourcePageElapsedMs >= saveDeadlineMs) break;
       if (!await sourceCurrent(input)) return {state:'deferred',reason:'source_changed'};
       const stream = STREAMS[pending.streamIndex]!;
+      const pageStarted = input.budget.now();
       const page = await timed(input,'feature_source_page',()=>readEffectiveTelemetryOwnerDayPage(input.source, {
         sourceNamespace:input.sourceNamespace,ownerDigest:input.owner.ownerDigest,
         ownerRevision:input.owner.ownerRevision,authorityEpoch:input.owner.authorityEpoch,
         day:input.day,stream,limit:200,...(pending.after?{after:pending.after}:{})}));
+      sourcePageElapsedMs = Math.max(sourcePageElapsedMs,input.budget.now()-pageStarted);
       pending = await appendSharedAnalyticsFeaturePage(pending,stream,page.rows,page.next);
     }
     const complete = pending.streamIndex === STREAMS.length;

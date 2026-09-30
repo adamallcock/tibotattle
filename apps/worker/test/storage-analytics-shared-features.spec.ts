@@ -367,3 +367,92 @@ it('does not publish a feature if its source day changes at the save boundary',a
   const reference=await completeSourceDay(corrected!,day);
   expect(finalizeV11DailyProjectionValues(current.result.value.daily)).toEqual(reference.daily);
 },180_000);
+
+it('saves resumable pages within a slow dependency budget without repeating its initial proof',async()=>{
+  const corpus=await setup(true),day=corpus.graphDates[0]!;
+  let firstReads=0;
+  for(let attempt=0;attempt<2;attempt++) {
+    const {value,meter}=input(corpus.owner,day);
+    let now=Date.now(),dependencies=0,pages=0;
+    const budget={...value.budget,now:()=>now,deadlineMs:now+55_000,
+      statementCount:()=>meter.queriesUsed,observePhase:(phase:string)=>{
+        if(phase==='feature_dependency') {dependencies++;now+=22_000;}
+        if(phase==='feature_source_page') {pages++;now+=4_000;}
+      }};
+    const result=await advanceSharedAnalyticsFeatureDay({...value,budget});
+    expect(result).toMatchObject({state:'deferred',reason:'incomplete'});
+    expect(dependencies).toBe(2); // Initial identity and fresh final save proof.
+    expect(pages).toBe(2);
+    expect(now).toBeLessThan(budget.deadlineMs);
+    const head=await target().prepare(`SELECT head_revision,payload_bytes FROM analytics_shared_feature_days
+      WHERE source_id=? AND owner_digest=? AND day=?`)
+      .bind(sourceId,corpus.owner.ownerDigest,day).first<{head_revision:number;payload_bytes:number}>();
+    expect(head?.head_revision).toBe(attempt+1);
+    expect(head!.payload_bytes).toBeGreaterThan(firstReads);
+    firstReads=head!.payload_bytes;
+  }
+  const completed=await finish(corpus.owner,day);
+  const reference=await completeSourceDay(corpus.owner,day);
+  expect(finalizeV11DailyProjectionValues(completed.result.value.daily)).toEqual(reference.daily);
+},180_000);
+
+it('rejects an advancing cache miss whose source changes after its initial proof',async()=>{
+  const corpus=await setup(),day=corpus.correctionDay;
+  const {value}=input(corpus.owner,day);
+  let corrected:Awaited<ReturnType<typeof corpus.mutateCorrection>>|null=null;
+  const delegate=value.target;
+  let mutate=false;
+  const racing=new Proxy(delegate,{get(object,key){
+    if(key==='prepare') return (sql:string)=>{
+      const statement=object.prepare(sql);
+      if(!sql.startsWith('SELECT * FROM analytics_shared_feature_days WHERE job_key=?')) return statement;
+      return new Proxy(statement,{get(prepared,member){
+        if(member==='bind') return (...params:unknown[])=>{
+          const bound=prepared.bind(...params);
+          return new Proxy(bound,{get(operation,method){
+            if(method==='first') return async()=>{
+              const result=await operation.first();
+              if(!mutate) {mutate=true;corrected=await corpus.mutateCorrection();}
+              return result;
+            };
+            const fn=Reflect.get(operation,method);
+            return typeof fn==='function'?fn.bind(operation):fn;
+          }});
+        };
+        const fn=Reflect.get(prepared,member);
+        return typeof fn==='function'?fn.bind(prepared):fn;
+      }});
+    };
+    const fn=Reflect.get(object,key);
+    return typeof fn==='function'?fn.bind(object):fn;
+  }}) as D1Database;
+  await expect(advanceSharedAnalyticsFeatureDay({...value,target:racing}))
+    .rejects.toThrow('STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE');
+  expect(corrected).not.toBeNull();
+  expect(await target().prepare(`SELECT count(*) n FROM analytics_shared_feature_days
+    WHERE source_id=? AND owner_digest=? AND day=? AND head_revision>0`)
+    .bind(sourceId,corpus.owner.ownerDigest,day).first<number>('n')).toBe(0);
+  const replacement=await finish(corrected!,day);
+  expect(finalizeV11DailyProjectionValues(replacement.result.value.daily))
+    .toEqual((await completeSourceDay(corrected!,day)).daily);
+},180_000);
+
+it.each(['deadline','lease'] as const)('does not promote after final validation exceeds its %s',async boundary=>{
+  const corpus=await setup(),day=corpus.correctionDay;
+  const {value,meter}=input(corpus.owner,day);
+  let now=Date.now(),dependencies=0;
+  const budget={...value.budget,now:()=>now,deadlineMs:now+(boundary==='deadline'?55_000:180_000),
+    statementCount:()=>meter.queriesUsed,observePhase:(phase:string)=>{
+      if(phase==='feature_dependency'&&++dependencies===2)
+        now=boundary==='deadline'?budget.deadlineMs:now+60_001;
+    }};
+  expect(await advanceSharedAnalyticsFeatureDay({...value,budget}))
+    .toEqual({state:'deferred',reason:'source_changed_or_budget'});
+  expect(dependencies).toBe(2);
+  expect(await target().prepare(`SELECT count(*) n FROM analytics_shared_feature_days
+    WHERE source_id=? AND owner_digest=? AND day=? AND head_revision>0`)
+    .bind(sourceId,corpus.owner.ownerDigest,day).first<number>('n')).toBe(0);
+  expect(await target().prepare(`SELECT count(*) n FROM analytics_shared_feature_parts
+    WHERE source_id=? AND owner_digest=?`)
+    .bind(sourceId,corpus.owner.ownerDigest).first<number>('n')).toBe(0);
+},180_000);
