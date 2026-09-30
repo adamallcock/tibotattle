@@ -171,6 +171,12 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
     rows:readonly Record<string,unknown>[];correctionRuntime:EffectiveHistoryDependency['correctionRuntime'];
   }|undefined> {
   const batched=selectedDays!==undefined;
+  // Correction history stores raw digest bytes. Keep the text scope for the
+  // admission joins, and bind its exact BLOB once for indexed occurrence seeks.
+  const ownerDigest=owner.ownerDigest;
+  if(!ownerDigest)throw fail();
+  const ownerDigestBlob=Uint8Array.from({length:32},(_,index)=>
+    Number.parseInt(ownerDigest.slice(index*2,index*2+2),16));
   const target=(alias='')=>batched?`${alias?`${alias}.`:''}target_day,`:'';
   const selectionScope=batched?'selection_scopes':'scope';
   const outside=(column:string)=>batched?`${column}<>wanted.target_day`:`(${column}<s.from_day OR ${column}>s.through_day)`;
@@ -237,8 +243,8 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
         CROSS JOIN telemetry_v12_records v12_record ON v12_record.chunk_id=chunk.id
           AND v12_record.manifest_id=chunk.manifest_id AND v12_record.stream=chunk.stream
 ` : '';
-  const rows=(await source.prepare(`${batched?'/* batched occurrence links */ ':''}WITH scope(owner_digest,participant_id,source_namespace,from_day,through_day,from_ms,through_ms) AS (
-      SELECT ?,?,?,?,?,?,?
+  const rows=(await source.prepare(`${batched?'/* batched occurrence links */ ':''}WITH scope(owner_digest,participant_id,source_namespace,from_day,through_day,from_ms,through_ms,owner_digest_blob) AS (
+      SELECT ?,?,?,?,?,?,?,?
     ), ${batched?`selection_scopes(target_day,owner_digest,participant_id,source_namespace,from_day,through_day,from_ms,through_ms) AS MATERIALIZED (
       SELECT json_extract(day.value,'$[0]'),s.owner_digest,s.participant_id,s.source_namespace,
         json_extract(day.value,'$[0]'),json_extract(day.value,'$[0]'),
@@ -426,10 +432,13 @@ ${includeV12?batched?`      UNION
        * PRIMARY KEY frontiers is an exact compact identity. */
       SELECT ${target('wanted')}date(h.event_time_ms/1000,'unixepoch') AS source_day,
         count(*) AS history_fact_count,max(h.id) AS max_history_id,max(f.id) AS max_fact_id
-        FROM telemetry_usage_correction_facts f
-        JOIN telemetry_usage_correction_history h ON h.id=f.history_id
-        JOIN scope s ON h.participant_id=s.participant_id AND lower(hex(h.owner_digest))=s.owner_digest
-        JOIN selected wanted ON wanted.occurrence_id=h.occurrence_id
+        FROM scope s
+        CROSS JOIN selected wanted
+        CROSS JOIN telemetry_usage_correction_history h INDEXED BY telemetry_usage_correction_history_owner_time
+          ON h.owner_digest=s.owner_digest_blob AND h.participant_id=s.participant_id
+          AND h.occurrence_id=wanted.occurrence_id
+        CROSS JOIN telemetry_usage_correction_facts f INDEXED BY telemetry_usage_correction_facts_history
+          ON f.history_id=h.id
        WHERE ${outside("date(h.event_time_ms/1000,'unixepoch')")}
        GROUP BY ${target('wanted')}date(h.event_time_ms/1000,'unixepoch')
     ), outside_headers AS (
@@ -462,7 +471,7 @@ ${includeV12?batched?`      UNION
       record_digest,base_digest,history_fact_count,max_history_id,max_fact_id
       FROM fenced_headers ORDER BY ${target()}family,source_day,source_key LIMIT ?`)
     .bind(owner.ownerDigest,owner.participantId,sourceNamespace,fromDay,throughDay,
-      Date.parse(`${fromDay}T00:00:00.000Z`),Date.parse(`${throughDay}T00:00:00.000Z`)+DAY_MS,
+      Date.parse(`${fromDay}T00:00:00.000Z`),Date.parse(`${throughDay}T00:00:00.000Z`)+DAY_MS,ownerDigestBlob,
       ...(selectedDays?[JSON.stringify(selectedDays.map(day=>[day,Date.parse(day),Date.parse(day)+DAY_MS]))]:[]),
       MAX_EFFECTIVE_DEPENDENCY_ROWS+(selectedDays?.length??1)+1).all<Record<string,unknown>>()).results;
   const runtimeRows=rows.filter(row=>row.family==='__correction_runtime__');

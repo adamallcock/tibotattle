@@ -46,6 +46,7 @@ import { createD1InvocationBudget } from "../src/d1-invocation-budget";
 import { encodeTypedTelemetryId, typedTelemetryDayNumber } from "../src/typed-telemetry-codec";
 import dependencySqlBaseline from "./fixtures/effective-history-dependency-32bd4091.json";
 import occurrenceSqlBaseline from "./fixtures/effective-history-dependency-c7dcdc6f.json";
+import correctionSeekSqlBaseline from "./fixtures/effective-history-dependency-9a59dd27.json";
 
 const b = env as Env & {
   TEST_MIGRATIONS: D1Migration[];
@@ -90,15 +91,18 @@ async function stage(fixture: Fixture, prepared: Prepared): Promise<Staged> {
 
 async function insertV1HistoryDay(fixture: Fixture, selectedDay: string, revision: number,
   supersedes: Awaited<ReturnType<typeof currentTelemetryV1Chunk>> = null,
-  occurrenceId = `event:v2:synthetic-v1-${selectedDay}`) {
-  const projected = telemetryV11LegacyProjection("usage", v11UsageRecord(selectedDay, "a", {
-    eventId: occurrenceId,
-    totalInputContextTokens: revision > 1 ? 150 : null,
-    components: { inputUncachedTokens: 100, inputCacheReadTokens: null, inputCacheWriteTokens: null,
-      outputTextTokens: 50, outputReasoningTokens: 25, outputCombinedTokens: revision > 1 ? 75 : null },
-  }));
-  if (!projected) throw new Error("synthetic history v1 projection missing");
-  const records = [JSON.parse(projected.canonicalRecord) as TelemetryV1UsageEvent];
+  occurrenceId: string | readonly string[] = `event:v2:synthetic-v1-${selectedDay}`) {
+  const ids = typeof occurrenceId === "string" ? [occurrenceId] : occurrenceId;
+  const records = ids.map(eventId => {
+    const projected = telemetryV11LegacyProjection("usage", v11UsageRecord(selectedDay, "a", {
+      eventId,
+      totalInputContextTokens: revision > 1 ? 150 : null,
+      components: { inputUncachedTokens: 100, inputCacheReadTokens: null, inputCacheWriteTokens: null,
+        outputTextTokens: 50, outputReasoningTokens: 25, outputCombinedTokens: revision > 1 ? 75 : null },
+    }));
+    if (!projected) throw new Error("synthetic history v1 projection missing");
+    return JSON.parse(projected.canonicalRecord) as TelemetryV1UsageEvent;
+  });
   const envelopeDigest = await sha256Hex(`synthetic-history-v1:${crypto.randomUUID()}`);
   const principal = await authenticateDevice(db(), fixture.authorization);
   const upload = await createDeviceUploadAuthorization(db(), principal, envelopeDigest, 1000);
@@ -453,6 +457,14 @@ function observeDependencyQueries(source: D1Database, options: {
   return { database, queries };
 }
 
+// Native predecessor fixtures predate only the extra raw owner-digest bind.
+// Preserve every original scope coordinate, batch JSON and limit unchanged.
+function predecessorDependencyBindings(values: readonly unknown[]): readonly unknown[] {
+  expect(values[7]).toBeInstanceOf(Uint8Array);
+  expect((values[7] as Uint8Array).byteLength).toBe(32);
+  return [...values.slice(0,7),...values.slice(8)];
+}
+
 const emptyDependencyOwner: StorageCommunityOwner = {
   participantId: "participant:synthetic-empty-history", ownerDigest: "a".repeat(64),
   inputRevision: 1, ownerRevision: 1, authorityEpoch: 1,
@@ -535,7 +547,7 @@ describe("bounded shared effective day dependencies", () => {
         .replaceAll("('usage','quota')", "('usage','quota','session')")
         .replaceAll("(1,2)", "(1,2,3)") : dependencySqlBaseline.sql;
       const current = await db().prepare(query.sql).bind(...query.values).all<Record<string, unknown>>();
-      const prior = await db().prepare(priorSql).bind(...query.values).all<Record<string, unknown>>();
+      const prior = await db().prepare(priorSql).bind(...predecessorDependencyBindings(query.values)).all<Record<string, unknown>>();
       expect(dependencySqlBaseline.revision).toBe("32bd4091");
       expect(dependency.occurrenceLinks).toEqual([]);
       expect(current.results.filter(row=>row.family!=='__correction_runtime__')).toEqual(prior.results);
@@ -590,8 +602,8 @@ describe("bounded shared effective day dependencies", () => {
     const dependency = await effectiveHistoryDependency(observed.database, owner, namespace, selectedDay, selectedDay);
     expect(dependency.occurrenceLinks).toEqual([expect.objectContaining({ family, source_day: outsideDay })]);
     const query = observed.queries.find(value => value.sql.includes("selected(occurrence_id)"))!;
-    const prior = await db().prepare(dependencySqlBaseline.sql).bind(...query.values).all();
-    const recent = await db().prepare(occurrenceSqlBaseline.sql).bind(...query.values).all<{family:string}>();
+    const prior = await db().prepare(dependencySqlBaseline.sql).bind(...predecessorDependencyBindings(query.values)).all();
+    const recent = await db().prepare(occurrenceSqlBaseline.sql).bind(...predecessorDependencyBindings(query.values)).all<{family:string}>();
     expect(prior.results).toEqual(dependency.occurrenceLinks);
     expect(recent.results.filter(row => row.family !== "__correction_runtime__"))
       .toEqual(dependency.occurrenceLinks);
@@ -628,7 +640,7 @@ describe("bounded shared effective day dependencies", () => {
       expect(priorSql).not.toBe(dependencySqlBaseline.sql);
       expect(batchedSql).not.toBe(batchQuery.sql);
       const current = await db().prepare(currentSql).bind(...query.values).all<{family:string}>();
-      const priorMissing = await db().prepare(priorSql).bind(...query.values).all();
+      const priorMissing = await db().prepare(priorSql).bind(...predecessorDependencyBindings(query.values)).all();
       const batchedMissing = await db().prepare(batchedSql).bind(...batchQuery.values).all<{family:string}>();
       expect(current.results.filter(row=>row.family!=='__correction_runtime__')).toEqual([]);
       expect(current.results.filter(row=>row.family!=='__correction_runtime__')).toEqual(priorMissing.results);
@@ -657,8 +669,8 @@ describe("bounded shared effective day dependencies", () => {
       const observed = observeDependencyQueries(db());
       const dependency = await effectiveHistoryDependency(observed.database, owner, namespace, windowDay, windowDay);
       const query = observed.queries.find(value => value.sql.includes("selected(occurrence_id)"))!;
-      const prior = await db().prepare(dependencySqlBaseline.sql).bind(...query.values).all();
-      const recent = await db().prepare(occurrenceSqlBaseline.sql).bind(...query.values).all<{family:string}>();
+      const prior = await db().prepare(dependencySqlBaseline.sql).bind(...predecessorDependencyBindings(query.values)).all();
+      const recent = await db().prepare(occurrenceSqlBaseline.sql).bind(...predecessorDependencyBindings(query.values)).all<{family:string}>();
       expect(dependency.occurrenceLinks).toEqual([expect.objectContaining({ family, source_day: sourceDay })]);
       expect(dependency.occurrenceLinks).toEqual(prior.results);
       expect(recent.results.filter(row => row.family !== "__correction_runtime__"))
@@ -672,6 +684,75 @@ describe("bounded shared effective day dependencies", () => {
       expect(await batched!.readDigest(targetDay)).toBe(await sha256Hex(canonicalJson(exact)));
     }
   }, 30_000);
+
+  it("seeks correction-only outside history without rescanning the owner for every selected occurrence", async ({ annotate }) => {
+    const selectedDay = day(), outsideDay = dayAfter(selectedDay), unrelatedDay = dayAfter(outsideDay);
+    const days = Array.from({ length: 16 }, (_, index) => new Date(Date.parse(selectedDay) + index * 86_400_000)
+      .toISOString().slice(0,10));
+    await db().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+    for (const matches of [20,200]) {
+      const selectedDevice = await createV11DeviceFixture(db());
+      const outsideDevice = await createV11DeviceFixture(db(), { participantId: selectedDevice.participantId });
+      const unrelatedDevice = await createV11DeviceFixture(db(), { participantId: selectedDevice.participantId });
+      const occurrences = Array.from({ length: matches }, (_, index) =>
+        "synthetic:correction-match:" + matches + ":" + index);
+      await insertV1HistoryDay(selectedDevice, selectedDay, 1, null, occurrences);
+      await insertV1HistoryDay(outsideDevice, outsideDay, 1, null, occurrences);
+      await insertV1HistoryDay(unrelatedDevice, unrelatedDay, 1, null,
+        Array.from({ length: 200 }, (_, index) => "synthetic:correction-unrelated:" + matches + ":" + index));
+      for (const [fixture,observedDay] of [[outsideDevice,outsideDay],[unrelatedDevice,unrelatedDay]] as const) {
+        const previous = await currentTelemetryV1Chunk(db(), fixture.participantId, fixture.deviceId, "usage", observedDay, 0);
+        expect(previous).not.toBeNull();
+        await insertV1HistoryDay(fixture, observedDay, 2, previous, "synthetic:correction-survivor:" + observedDay);
+      }
+      const owner = (await readStorageCommunityOwnerPage(db()))
+        .find(value => value.participantId === selectedDevice.participantId)!;
+      const observed = observeDependencyQueries(db());
+      const dependency = await effectiveHistoryDependency(observed.database, owner, namespace,
+        selectedDay,selectedDay,{includeSessions:true});
+      expect(dependency.occurrenceLinks).toEqual([expect.objectContaining({ family:"correction",
+        source_day:outsideDay,history_fact_count:matches })]);
+      const batched = observeDependencyQueries(db());
+      const dayReader = await createEffectiveHistoryDayDependencyReader(batched.database,owner,namespace,days,
+        {includeSessions:true,occurrenceLinks:"batched"});
+      expect(dayReader).toBeDefined();
+      expect(await dayReader!.readDigest(selectedDay)).toBe(await sha256Hex(canonicalJson(dependency)));
+      for (const [mode,query] of [
+        ["singleton",observed.queries.find(value => value.sql.includes("selected(occurrence_id)"))!],
+        ["batched",batched.queries.find(value => value.sql.startsWith("/* batched occurrence links */"))!],
+      ] as const) {
+        expect(query).toBeDefined();
+        const baseline = (mode === "singleton" ? correctionSeekSqlBaseline.sql : correctionSeekSqlBaseline.batchedSql)
+          .replaceAll("('usage','quota')","('usage','quota','session')").replaceAll("(1,2)","(1,2,3)");
+        const current = await db().prepare(query.sql).bind(...query.values).all<Record<string,unknown> & {family:string;target_day?:string}>();
+        const prior = await db().prepare(baseline).bind(...predecessorDependencyBindings(query.values))
+          .all<Record<string,unknown> & {family:string;target_day?:string}>();
+        expect(correctionSeekSqlBaseline.sourceCommit).toBe("9a59dd2796f9927fa935930d056238741d8bff9f");
+        expect(current.results).toEqual(prior.results);
+        expect(current.meta.rows_read).toBeLessThan(prior.meta.rows_read);
+        const plan = (await db().prepare("EXPLAIN QUERY PLAN " + query.sql).bind(...query.values)
+          .all<{detail:string}>()).results;
+        expect(plan.some(row => row.detail.includes("telemetry_usage_correction_history_owner_time")
+          && row.detail.includes("owner_digest=? AND occurrence_id=?"))).toBe(true);
+        expect(plan.some(row => row.detail.includes("telemetry_usage_correction_facts_history")
+          && row.detail.includes("history_id=?"))).toBe(true);
+        if (mode === "singleton") {
+          expect(canonicalJson({ ...dependency,
+            occurrenceLinks:prior.results.filter(row => row.family!=="__correction_runtime__") })).toBe(canonicalJson(dependency));
+        } else {
+          for (const targetDay of days) {
+            const exact = await effectiveHistoryDependency(db(),owner,namespace,targetDay,targetDay,{includeSessions:true});
+            const legacyLinks = prior.results.filter(row => row.target_day===targetDay && row.family!=="__correction_runtime__")
+              .map(({target_day,...row}) => row);
+            expect(canonicalJson({...exact,occurrenceLinks:legacyLinks})).toBe(canonicalJson(exact));
+            expect(await dayReader!.readDigest(targetDay)).toBe(await sha256Hex(canonicalJson(exact)));
+          }
+        }
+        await annotate(JSON.stringify({mode,matches,unrelatedArchivedOccurrences:200,
+          current:current.meta.rows_read,prior:prior.meta.rows_read}),"correction-occurrence-index-cost");
+      }
+    }
+  }, 60_000);
 
   it("preserves compact, plain, and escaped occurrence IDs without conflating codec tags", async () => {
     const selectedDay = day(), outsideDay = dayAfter(selectedDay), differentIdDay = dayAfter(outsideDay);
@@ -694,8 +775,8 @@ describe("bounded shared effective day dependencies", () => {
     const observed = observeDependencyQueries(db());
     const dependency = await effectiveHistoryDependency(observed.database, owner, namespace, selectedDay, selectedDay);
     const query = observed.queries.find(value => value.sql.includes("selected(occurrence_id)"))!;
-    const prior = await db().prepare(dependencySqlBaseline.sql).bind(...query.values).all();
-    const recent = await db().prepare(occurrenceSqlBaseline.sql).bind(...query.values).all<{family:string}>();
+    const prior = await db().prepare(dependencySqlBaseline.sql).bind(...predecessorDependencyBindings(query.values)).all();
+    const recent = await db().prepare(occurrenceSqlBaseline.sql).bind(...predecessorDependencyBindings(query.values)).all<{family:string}>();
     expect(dependency.occurrenceLinks).toEqual([expect.objectContaining({ family: "v12", source_day: outsideDay })]);
     expect(dependency.occurrenceLinks).toEqual(prior.results);
     expect(recent.results.filter(row => row.family !== "__correction_runtime__"))
@@ -812,10 +893,10 @@ describe("bounded shared effective day dependencies", () => {
         .replaceAll("('usage','quota')", "('usage','quota','session')")
         .replaceAll("(1,2)", "(1,2,3)") : occurrenceSqlBaseline.sql;
       const current = await db().prepare(query.sql).bind(...query.values).all();
-      const prior = await db().prepare(baseline).bind(...query.values).all();
+      const prior = await db().prepare(baseline).bind(...predecessorDependencyBindings(query.values)).all();
       const noIn = await db().prepare(baseline.replaceAll(
         "AND scoped_record.occurrence_id IN (SELECT occurrence_id FROM selected)", ""))
-        .bind(...query.values).all();
+        .bind(...predecessorDependencyBindings(query.values)).all();
       expect(current.results).toEqual(prior.results);
       expect(current.results).toEqual(noIn.results);
       expect(current.meta.rows_read).toBeLessThan(prior.meta.rows_read);
@@ -857,7 +938,7 @@ describe("bounded shared effective day dependencies", () => {
       ]);
       const query = observed.queries.find(value => value.sql.includes("selected(occurrence_id)"))!;
       const current = await db().prepare(query.sql).bind(...query.values).all();
-      const prior = await db().prepare(occurrenceSqlBaseline.sql).bind(...query.values).all();
+      const prior = await db().prepare(occurrenceSqlBaseline.sql).bind(...predecessorDependencyBindings(query.values)).all();
       expect(current.results).toEqual(prior.results);
       const plan = (await db().prepare(`EXPLAIN QUERY PLAN ${query.sql}`).bind(...query.values)
         .all<{ detail: string }>()).results;
@@ -979,14 +1060,14 @@ describe("bounded shared effective day dependencies", () => {
       expect(query).toBeDefined();
       const current = await db().prepare(query.sql).bind(...query.values).all();
       const baseline = mode === "singleton" ? occurrenceSqlBaseline.sql : occurrenceSqlBaseline.batchedSql;
-      const prior = await db().prepare(baseline).bind(...query.values).all();
+      const prior = await db().prepare(baseline).bind(...predecessorDependencyBindings(query.values)).all();
       expect(current.results).toEqual(prior.results);
       const currentDurations = [current.meta.duration], priorDurations = [prior.meta.duration];
       // Alternate order after the first pair so the reported local duration
       // does not consistently favor the query that runs second.
       for (const currentFirst of [false, true]) {
         for (const candidate of currentFirst ? [true, false] : [false, true]) {
-          const result = await db().prepare(candidate ? query.sql : baseline).bind(...query.values).all();
+          const result = await db().prepare(candidate ? query.sql : baseline).bind(...(candidate ? query.values : predecessorDependencyBindings(query.values))).all();
           expect(result.results).toEqual(prior.results);
           (candidate ? currentDurations : priorDurations).push(result.meta.duration);
         }
