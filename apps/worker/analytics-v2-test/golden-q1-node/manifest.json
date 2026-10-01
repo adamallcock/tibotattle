@@ -68,11 +68,12 @@
   "graphDayProjection": "disabled (deployment default)",
   "cadence": {
    "lanesPerSimulatedMinute": [
-    "analytics",
+    "analytics x1",
     "publication x1",
     "cache"
    ],
    "longPassEveryMinutes": 10,
+   "clockStepMsPerMinute": 0,
    "q1Cadence": true
   },
   "basis": "Q-1's reading of the production-scheduled-analytics-deploy refresh plan at d43c8f92; not verified against live configuration"

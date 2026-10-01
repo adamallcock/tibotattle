@@ -33,7 +33,7 @@
  "tierF": {
   "scope": "all",
   "total": {
-   "ms": 580874,
+   "ms": 463482,
    "statements": 2472226,
    "jobs": 6
   },
@@ -52,12 +52,12 @@
      }
     },
     "cost": {
-     "ms": 843738,
+     "ms": 674519,
      "statements": 607274,
      "invocations": 702,
      "maxCheckpointBytes": 689044,
      "fits": {
-      "ms": 12173,
+      "ms": 9723,
       "statements": 8713,
       "invocations": 10,
       "maxCheckpointParts": 7,
@@ -79,12 +79,12 @@
      }
     },
     "cost": {
-     "ms": 940363,
+     "ms": 698206,
      "statements": 615453,
      "invocations": 710,
      "maxCheckpointBytes": 699164,
      "fits": {
-      "ms": 12784,
+      "ms": 9808,
       "statements": 8794,
       "invocations": 10,
       "maxCheckpointParts": 8,
@@ -106,12 +106,12 @@
      }
     },
     "cost": {
-     "ms": 710065,
+     "ms": 595118,
      "statements": 632048,
      "invocations": 781,
      "maxCheckpointBytes": 690937,
      "fits": {
-      "ms": 10086,
+      "ms": 7930,
       "statements": 9026,
       "invocations": 11,
       "maxCheckpointParts": 8,
@@ -133,12 +133,12 @@
      }
     },
     "cost": {
-     "ms": 945530,
+     "ms": 767817,
      "statements": 617451,
      "invocations": 710,
      "maxCheckpointBytes": 721657,
      "fits": {
-      "ms": 14181,
+      "ms": 11201,
       "statements": 8769,
       "invocations": 10,
       "maxCheckpointParts": 8,
