@@ -1161,11 +1161,24 @@ test("PG17 v1.0 refusals keep the Worker's status, code and order, and write not
   assert.deepEqual(await counts(), { chunks: 1, records: 1, pending: 1, abandoned: 8, other: 1 });
   assert.equal(store.objects.size, 1);
 
+  // An explicit-id import that left a typed identity behind its rows (TL-1)
+  // refuses live allocation until the identities are restarted.
+  const nsId = (await pool.query(`SELECT namespace_id FROM "${schema}".typed_v1_admission_state`)).rows[0].namespace_id;
+  await pool.query(`INSERT INTO "${schema}".typed_telemetry_owners (id, namespace_id, original_id)
+    VALUES (5000, $1, $2)`, [nsId, Buffer.from("\u0000synthetic-imported-owner")]);
+  const lagging = await syntheticChunk({ stream: "session", seed: "lagging" });
+  assert.deepEqual(await refused(device, lagging), { status: 503, code: "BACKEND_STORAGE_UNAVAILABLE", details: null });
+  assert.deepEqual(await counts(), { chunks: 1, records: 1, pending: 1, abandoned: 9, other: 1 });
+  await pool.query(`SELECT "${schema}".typed_telemetry_restart_identities()`);
+  const resumed = await service.upload(device, lagging);
+  assert.equal(resumed.response.status, 202);
+  assert.equal(store.objects.size, 2);
+
   // An unpinned typed target refuses before decrypting or writing.
   await pool.query(`UPDATE "${schema}".typed_v1_admission_state SET runtime_contract_version = 0 WHERE id = 1`);
   assert.deepEqual(await refused(device, await syntheticChunk({ seq: 4, seed: "unpinned" })),
     { status: 503, code: "BACKEND_STORAGE_UNAVAILABLE", details: null });
-  assert.equal(store.objects.size, 1);
+  assert.equal(store.objects.size, 2);
 }));
 
 // ---------------------------------------------------------------------------

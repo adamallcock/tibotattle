@@ -58,6 +58,7 @@ import {
   type PostgresSchemaOptions,
 } from "./postgres-client";
 import { assertPostgresTelemetryTransportWriteAllowed } from "./postgres-transport-write-authority";
+import { verifyPostgresTypedIdentityHeadroom } from "./postgres-typed-live-allocators";
 import { priceTelemetryUsageEvent, type ServerPricingResult } from "./server-pricing";
 import {
   telemetryContributionAdmissionWindow,
@@ -686,6 +687,7 @@ interface PersistInput {
   readonly createdAt: string;
   readonly sourceNamespace: string;
   readonly nowEpoch: number;
+  readonly schemaConfig: PostgresSchemaConfig;
 }
 
 /**
@@ -777,6 +779,9 @@ async function persistTypedChunk(
   }
 
   const records = await prepareTypedRecords(chunk);
+  // Live allocation through the 0052 identities is safe only while every
+  // typed identity is above its imported rows (TL-1); refuse otherwise.
+  await verifyPostgresTypedIdentityHeadroom(client, input.schemaConfig);
 
   // community_graph_update_scope: the PostgreSQL marker the retained
   // mutation-epoch trigger (analytical_mutation, 0010) consumes.
@@ -1246,7 +1251,7 @@ export async function admitPostgresTelemetryV1Contribution(
   const authorizationEnvelopeDigest = await sha256Hex(input.body.raw);
   const persistInput: PersistInput = {
     principal, chunk, chunkRowId, r2Key, envelopeDigest, authorizationEnvelopeDigest,
-    authorizationId: input.authorization.authorizationId, createdAt, sourceNamespace, nowEpoch,
+    authorizationId: input.authorization.authorizationId, createdAt, sourceNamespace, nowEpoch, schemaConfig,
   };
   let result: { acceptedRecords: number; replay: boolean };
   try {
