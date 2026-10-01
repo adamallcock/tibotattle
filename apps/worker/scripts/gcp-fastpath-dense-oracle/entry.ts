@@ -7,7 +7,7 @@
 export {
   canonicalTelemetryV11Json, canonicalTelemetryV12Json, telemetryV11DomainManifestDigestInput,
   telemetryV12DayManifestDigestInput, telemetryV12DomainManifestDigestInput, telemetryV12RequiredConsent,
-  parseTelemetryV12Record, validateTelemetryV12DayUsageOrder,
+  parseTelemetryV12Record, validateTelemetryV12DayUsageOrder, projectAdminModelHistoryDay,
 } from "@app-usagemonitor/telemetry-contract";
 export { initializeSharedAnalyticsCorpusDatabases } from "./fixtures/shared-analytics-corpus";
 export { createV11DeviceFixture, makeV11Day } from "./helpers/telemetry-v11";
@@ -40,6 +40,9 @@ export { captureStorageGraphScope, computeStorageGraphResult } from "../src/stor
 export { advanceStorageEffectiveAnalysis, effectiveHistoryDependency, effectiveHistoryPin } from "../src/storage-effective-history";
 export { selectCommunityAllowanceAnalysisFits, validCompleteCachedComposition,
   validCompleteScalarAnalysis } from "../src/community-allowance";
-export { buildCommunityModelCompositionDay } from "../src/admin-community-allowance";
+export { ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG, ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS,
+  ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE, ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS, buildAdminCommunityAllowancePreview,
+  buildCommunityModelCompositionDay, validCachedAdminCommunityAllowancePreview } from "../src/admin-community-allowance";
+export { projectPublicAllowanceGraph } from "../src/public-allowance-breakdowns";
 export { V11_PLAN_ATTRIBUTION_ADAPTER_VERSION } from "../src/quota-analysis-v11";
 export { readAnalyticsModelBlock } from "../src/analytics-model-block";

@@ -86,7 +86,7 @@ const RUN_SPECIFIC_ANALYTICS_COLUMNS = Object.freeze({
 
 function parseArgs(argv) {
   const options = { workDir: null, corpus: null, scale: 1, goldenOut: null, verifyAgainst: null,
-    forcedNative: "withheld", maxTicks: 200_000, keepScratch: false, resume: null };
+    forcedNative: "withheld", maxTicks: 200_000, keepScratch: false, resume: null, publicationPasses: 1 };
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index], next = () => argv[++index];
     if (arg === "--work-dir") options.workDir = resolve(next());
@@ -98,6 +98,7 @@ function parseArgs(argv) {
     else if (arg === "--max-ticks") options.maxTicks = Number(next());
     else if (arg === "--keep-scratch") options.keepScratch = true;
     else if (arg === "--resume") options.resume = resolve(next());
+    else if (arg === "--publication-passes") options.publicationPasses = Number(next());
     else throw new Error(`DENSE_ORACLE_ARGUMENT_INVALID:${arg}`);
   }
   if (!options.workDir || !isAbsolute(options.workDir) || !relative(REPO_ROOT, options.workDir).startsWith("..")) {
@@ -109,6 +110,9 @@ function parseArgs(argv) {
   }
   if (!["all", "withheld", "none"].includes(options.forcedNative)) throw new Error("DENSE_ORACLE_FORCED_NATIVE_INVALID");
   if (!Number.isSafeInteger(options.maxTicks) || options.maxTicks < 1) throw new Error("DENSE_ORACLE_MAX_TICKS_INVALID");
+  if (!Number.isSafeInteger(options.publicationPasses) || options.publicationPasses < 1 || options.publicationPasses > 16) {
+    throw new Error("DENSE_ORACLE_PUBLICATION_PASSES_INVALID");
+  }
   return options;
 }
 
@@ -238,7 +242,8 @@ if (q1.schemaVersion !== "gcp-fastpath-oracle-corpus-v1" || q1.sourceCommit !== 
   || q1.pinnedNow !== DENSE_CORPUS_PINNED_NOW) throw new Error("DENSE_ORACLE_Q1_CORPUS_INVALID");
 const dense = options.corpus === "dense" ? createDenseOwner({ pricer: P.priceTelemetryUsageEvent, scale: options.scale }) : null;
 const corpusOwners = [...q1.owners, ...(dense ? [dense.spec] : [])];
-note("corpus", { owners: corpusOwners.map((owner) => owner.key), dense: dense?.spec ?? null });
+note("corpus", { owners: corpusOwners.map((owner) => owner.key), dense: dense?.spec ?? null,
+  publicationPasses: options.publicationPasses });
 
 // ---------------------------------------------------------------- seeding --
 // A port of the Q-1 oracle's seeding (gcp-fastpath-oracle.spec.ts), unchanged
@@ -519,9 +524,18 @@ async function progressDigest() {
   return hash.digest("hex");
 }
 
+/** Q-1's lane order per simulated minute. `--publication-passes k` (default 1,
+ * Q-1's cadence) runs the publication worker k times per minute: production's
+ * daily lane folds a dense owner-day 50 records per stream per attempt, at most
+ * four attempts per pass, so one pass per minute needs about a thousand
+ * minutes per 48,000-occurrence day. Published daily payloads, fits, model
+ * results and the preview are functions of the source, not of lane
+ * interleaving; cache-retention marks are not (Q-1's parity basis), so a run
+ * with k > 1 records its cadence and its cache values are informational. */
 const lanes = () => [
   ["analytics", (minuteMs) => P.runStorageAnalyticsSchedule(ANALYTICS_ENV(), { nowMs: minuteMs })],
-  ["publication", (minuteMs) => P.runStoragePublicationSchedule(PUBLICATION_ENV(), { nowMs: minuteMs })],
+  ...Array.from({ length: options.publicationPasses }, () =>
+    ["publication", (minuteMs) => P.runStoragePublicationSchedule(PUBLICATION_ENV(), { nowMs: minuteMs })]),
   ["cache", (minuteMs) => P.runCacheRetentionDaySchedule(CACHE_ENV(), { nowMs: minuteMs })],
 ];
 
@@ -750,7 +764,8 @@ if (prior === null) {
     errors: convergence.errors.length, failures: convergence.failures, laneMs: convergence.laneMs,
     laneStats: convergence.laneStats, slowestLane: convergence.slowestLane });
 } else {
-  if (JSON.stringify(prior.corpus.owners) !== JSON.stringify(corpusOwners.map((owner) => owner.key))
+  if ((prior.corpus.publicationPasses ?? 1) !== options.publicationPasses
+    || JSON.stringify(prior.corpus.owners) !== JSON.stringify(corpusOwners.map((owner) => owner.key))
     || JSON.stringify(prior.corpus.dense) !== JSON.stringify(dense?.spec ?? null)) throw new Error("DENSE_ORACLE_RESUME_CORPUS_MISMATCH");
   seedMs = prior.seeded.seedMs;
   participants = new Map(corpusOwners.map((owner) => [owner.key, owner.participantId]));
@@ -874,6 +889,8 @@ const cacheValueRows = (await target().prepare(`SELECT v.owner_digest,v.day,v.me
   JOIN analytics_cache_retention_day_bands b ON b.value_key=v.value_key
   WHERE v.source_id=? ORDER BY v.owner_digest,v.day,m.source_layout,v.model,v.effort,b.band`).bind(SOURCE_ID).all()).results;
 
+const publishedModelPayloads = new Map((await target().prepare(`SELECT day,payload_json FROM analytics_community_model_publications
+  WHERE source_id=? ORDER BY day`).bind(SOURCE_ID).all()).results.map((row) => [row.day, row.payload_json]));
 const queuedDailyDays = (await target().prepare(`SELECT day FROM analytics_community_daily_queue WHERE source_id=? ORDER BY day`)
   .bind(SOURCE_ID).all()).results.map((row) => row.day);
 const finalFingerprint = await targetFingerprint();
@@ -962,7 +979,8 @@ for (const owner of roster) {
     const tierN = graph.find((row) => row.metric === "model" && row.day === day) ?? null;
     const f = forcedOwner?.model[day] ?? null;
     model[day] = {
-      tierN: tierN ? { sourceKind: tierN.source_kind, sha256: sha256Text(tierN.payload_json) } : null,
+      tierN: tierN ? { sourceKind: tierN.source_kind, sha256: sha256Text(tierN.payload_json),
+        result: JSON.parse(tierN.payload_json) } : null,
       forced: f === null ? null : f.state === "complete" ? { sourceKind: f.sourceKind, sha256: sha256Text(f.payload),
         result: JSON.parse(f.payload) } : { state: f.state, reason: f.reason ?? f.code, failure: f.failure ?? null },
       equal: tierN && f?.state === "complete" ? tierN.payload_json === f.payload : null,
@@ -1021,6 +1039,73 @@ const tierNEqualsForced = Object.fromEntries(Object.entries(ownerResults).map(([
   modelEqual: Object.values(value.model).filter((item) => item.equal === true).length,
 }]));
 
+/**
+ * Owner decision 2 (2026-10-01): the fast path publishes every model date with
+ * the owners production could not evaluate excluded and counted, instead of
+ * withholding the date until every owner has a result. This is that per-date
+ * publication computed entirely by d43c8f92's own functions from production's
+ * own per-owner results: each owner's scheduled (Tier N) result, else its
+ * forced native (Tier F) result; an owner whose native computation fails is
+ * counted in v1ParticipantCount and refusedParticipantCount. The collection,
+ * the day payload (buildCommunityModelCompositionDay), its admin projection
+ * (projectAdminModelHistoryDay), the preview over every date
+ * (buildAdminCommunityAllowancePreview over the current fits in production's
+ * owner-digest result order and the member list in owner-page order) and the
+ * served allowanceBreakdowns (projectPublicAllowanceGraph) follow
+ * publishStorageCommunityModelDay and publishStorageCommunityGraphPreview.
+ * A date with any owner lacking both a result and a recorded failure is
+ * reported, not guessed.
+ */
+const perDate = (() => {
+  const byDigest = [...roster].sort((left, right) => left.ownerDigest < right.ownerDigest ? -1 : 1);
+  const days = [], unresolved = [];
+  for (const day of modelDates) {
+    const collection = { compositions: [], v1ParticipantCount: 0, unsupportedSourceParticipantCount: 0,
+      refusedParticipantCount: 0, storeAvailable: true };
+    const refusedOwners = [], basis = {};
+    let complete = true;
+    for (const owner of byDigest) {
+      const entry = ownerResults[owner.key].model[day];
+      const result = entry.tierN?.result ?? (entry.forced?.result ?? null);
+      basis[owner.key] = entry.tierN ? "tierN" : entry.forced?.result ? "forced" : entry.forced ? "failed" : "absent";
+      if (result !== null) {
+        collection.v1ParticipantCount++;
+        if (result.status === "ready") collection.compositions.push({ participantId: owner.ownerDigest, composition: result });
+        else collection.refusedParticipantCount++;
+      } else if (entry.forced && entry.forced.state === "failed") {
+        collection.v1ParticipantCount++; collection.refusedParticipantCount++; refusedOwners.push(owner.key);
+      } else complete = false;
+    }
+    if (!complete) { unresolved.push(day); continue; }
+    const payload = P.buildCommunityModelCompositionDay(collection, day);
+    const projected = P.projectAdminModelHistoryDay(JSON.parse(P.canonicalJson(payload)));
+    if (!projected || projected.day !== day) throw new Error("DENSE_ORACLE_PER_DATE_PROJECTION");
+    days.push({ day, basis, refusedOwners, payload, projected });
+  }
+  const fitsOwners = byDigest.filter((owner) => ownerResults[owner.key].fits.tierN || ownerResults[owner.key].fits.forced?.fits);
+  const fits = fitsOwners.flatMap((owner) => ownerResults[owner.key].fits.tierN?.fits ?? ownerResults[owner.key].fits.forced.fits);
+  const members = ownerPage.filter((owner) => owner.hasV1 || owner.hasV11 || owner.hasV12 || owner.hasEffective || owner.hasLegacy)
+    .map((owner) => owner.ownerDigest);
+  let preview = null, allowanceBreakdowns = null;
+  if (unresolved.length === 0 && fitsOwners.length === byDigest.length) {
+    preview = P.buildAdminCommunityAllowancePreview(fits, nowMs, members, {
+      modelConfig: P.ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG, basis: P.ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS,
+      gate: P.ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE, days: days.map((value) => value.projected) });
+    if (!P.validCachedAdminCommunityAllowancePreview(preview, preview.generatedAt, nowMs)) throw new Error("DENSE_ORACLE_PER_DATE_PREVIEW_INVALID");
+    allowanceBreakdowns = P.projectPublicAllowanceGraph({ generated_at: preview.generatedAt, payload_json: P.canonicalJson(preview) },
+      { publishedDays, nowMs })?.breakdowns ?? null;
+  }
+  // On every date production published, the per-date payload must be the
+  // published one byte for byte: the two publications differ only on dates
+  // production withholds.
+  const publishedCheck = days.filter((value) => publishedModelPayloads.has(value.day))
+    .map((value) => [value.day, P.canonicalJson(value.payload) === publishedModelPayloads.get(value.day)]);
+  if (publishedCheck.some(([, equal]) => !equal)) note("per-date-published-mismatch", { days: publishedCheck.filter(([, equal]) => !equal).map(([day]) => day) });
+  return { schemaVersion: "gcp-fastpath-dense-per-date-v1",
+    publishedDatesEqual: { compared: publishedCheck.length, equal: publishedCheck.filter(([, equal]) => equal).length }, decision: "owner decision 2, 2026-10-01: per-date model publication with refused owners excluded and counted",
+    nowMs, today, unresolved, days: days.map(({ projected: _projected, ...value }) => value), preview, allowanceBreakdowns };
+})();
+
 const cacheByOwnerDay = {};
 for (const row of cacheValueRows) {
   const key = `${ownerKey(row.owner_digest)}:${row.day}`;
@@ -1052,6 +1137,8 @@ const manifest = {
     publication: { PUBLICATION_LANE: "enabled", STORAGE_ANALYTICS_SHARED_FEATURES: "enabled", STORAGE_ANALYTICS_MODEL_BLOCKS: "disabled" },
     cache: { CACHE_RETENTION_BUILD: "enabled", CACHE_RETENTION_SHARED_FEATURES: "enabled", shards: 1 },
     graphDayProjection: "disabled (deployment default)",
+    cadence: { lanesPerSimulatedMinute: ["analytics", `publication x${options.publicationPasses}`, "cache"],
+      longPassEveryMinutes: 10, q1Cadence: options.publicationPasses === 1 },
     basis: "Q-1's reading of the production-scheduled-analytics-deploy refresh plan at d43c8f92; not verified against live configuration",
   },
   convergence: { converged: convergence.converged, scheduleErrors: convergence.errors.length, quietTicks: QUIET_TICKS,
@@ -1072,7 +1159,10 @@ const manifest = {
     schemaVersion: body.schemaVersion, allowanceState: body.allowanceState, allowanceReadState: body.allowanceReadState,
     publishedDays: publishedDays.length, modelPublicationDays: publishedModelDays.length, previewRow },
   forcedNative: options.forcedNative !== "none" ? { scope: options.forcedNative, sampleDates: FORCED_SAMPLE, configuration: "computeStorageGraphResult(preparedFold:false, preparedEffectiveUsage:false, persistResult:false, no sharedFeatures), re-invoked at production's 1,000-statement invocation meter until complete, on a scratch copy with every graph cache cleared and a read-only source; production's model-block fallback",
-    owners: forcedSummary, tierNEqualsForced } : null,
+    // Deterministic work counts only; wall-clock costs are in run-cost.json.
+    owners: Object.fromEntries(Object.entries(forcedSummary).map(([key, value]) => [key, { ...value,
+      cost: { statements: value.cost.statements, invocations: value.cost.invocations,
+        maxCheckpointBytes: value.cost.maxCheckpointBytes } }])), tierNEqualsForced } : null,
   cacheRetention: { marks: cacheMarks,
     windowAdjacencies: Object.fromEntries((cacheRetention?.windows ?? []).map((window) =>
       [window.window, window.bands.reduce((n, band) => n + band.adjacencies, 0)])) },
@@ -1081,7 +1171,7 @@ const manifest = {
   sourceDump: { tables: usageDump.tables, rows: usageDump.rows, schemaSha256: usageDump.schemaSha256,
     rowCountsSha256: usageDump.rowCountsSha256, jsonBytes: usageDump.bytes, jsonSha256: usageDump.sha256,
     sealedSqlite: sealed, sourceUnchangedByAnalysis: sourceBeforeAnalysis === null ? null : sourceBeforeAnalysis === sourceAfterAnalysis,
-    reproduce: `node --max-old-space-size=16384 apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs --work-dir <dir> --corpus ${options.corpus}${options.scale === 1 ? "" : ` --scale ${options.scale}`}` },
+    reproduce: `node --max-old-space-size=16384 apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs --work-dir <dir> --corpus ${options.corpus}${options.scale === 1 ? "" : ` --scale ${options.scale}`}${options.publicationPasses === 1 ? "" : ` --publication-passes ${options.publicationPasses}`}` },
 };
 const diagnostics = { header: { ...header, seedMs, convergenceMs: convergence.elapsedMs, forcedCost,
   wallMs: Math.round(performance.now() - wallStarted), randomBytesDrawn: runtime.randomBytesDrawn() },
@@ -1096,6 +1186,14 @@ const files = {
   "manifest.json": pretty(manifest),
   "owner-results.json": pretty({ schemaVersion: "gcp-fastpath-dense-owner-results-v1", sourceCommit: DENSE_ORACLE_SOURCE_COMMIT,
     nowMs, today, modelDates, owners: ownerResults }),
+  "per-date-expected.json": pretty(perDate),
+  // Measured cost of this run (timings vary between runs; never compared).
+  "run-cost.json": pretty({ schemaVersion: "gcp-fastpath-dense-run-cost-v1", note: "wall-clock measurements of this run on its host; not reproducible and never compared",
+    runtime: header.runtime, seedMs, tierN: { ticks: convergence.ticks, elapsedMs: convergence.elapsedMs, laneMs: convergence.laneMs,
+      laneStats: convergence.laneStats ?? null, slowestLane: convergence.slowestLane ?? null, publicationPasses: options.publicationPasses,
+      resumedFrom: prior === null ? null : "converged run (--resume)" },
+    tierF: { scope: options.forcedNative, total: forcedCost, owners: Object.fromEntries(Object.entries(forcedSummary)
+      .map(([key, value]) => [key, { pages: value.pages, cost: value.cost }])) } }),
   "cache-owner-days.json": pretty({ schemaVersion: "gcp-fastpath-dense-cache-owner-days-v1", basis: "Tier N cache-retention values as production's interleaved lanes left them (see manifest.cacheRetention.marks)", ownerDays: cacheByOwnerDay }),
 };
 if (denseSummary) {
@@ -1130,7 +1228,7 @@ if (options.verifyAgainst) {
   // Byte equality of every golden file present in the reference directory; for
   // a Q-1 golden (G0) also its publishedRowDigests and sourceDumpShape.
   const verdict = {};
-  for (const name of Object.keys(files)) {
+  for (const name of Object.keys(files).filter((name) => name !== "SOURCE.json" && name !== "run-cost.json")) {
     const path = join(options.verifyAgainst, name);
     if (existsSync(path)) verdict[name] = readFileSync(path, "utf8") === files[name];
   }
