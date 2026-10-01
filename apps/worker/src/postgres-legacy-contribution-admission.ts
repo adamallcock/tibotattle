@@ -1948,11 +1948,11 @@ async function persistV01Contribution(
 ): Promise<{ acceptedRecords: number; deduplicatedRecords: number }> {
   const { principal, record } = input;
   const nowIso = input.checkedAt;
-  // Primary 0011's telemetry_contributions trigger functions name their
-  // tables unqualified and carry no search_path of their own, so they resolve
-  // through the session's path; the origin's pools set none. Pin it to this
-  // schema for this transaction only, as the migration runner does.
-  await client.query(`SET LOCAL search_path TO ${schema}, pg_catalog`);
+  // No session search_path is set or needed: every statement below names its
+  // schema, and primary 0062 pinned the path of the one telemetry_contributions
+  // trigger function (0011's active-participant check) that used to resolve
+  // its table through the caller's session. The origin's pools set none, and
+  // the origin serves this route only on a schema whose receipts include 0062.
   const participant = await client.query<{ state: string; owner_kind: string }>(
     `SELECT state, owner_kind FROM ${table(schema, "participants")} WHERE id = $1 FOR UPDATE`,
     [principal.participantId],

@@ -335,7 +335,7 @@ test("configuration is pinned to the one-task tibotattle migration Job and exact
   const config = parseTestMigrationsConfig(validEnv(), TEST_MIGRATIONS_SERVICE_ACCOUNT);
   assert.equal(config.job, TEST_MIGRATIONS_JOB);
   assert.equal(config.project, TEST_MIGRATIONS_PROJECT);
-  assert.equal(manifest.roles.primary.length, 61);
+  assert.equal(manifest.roles.primary.length, 62);
   assert.equal(manifest.roles.ledger.length, 7);
   assert.equal(TEST_MIGRATIONS_TARGETS.primary.schema, "tibotattle_v12_a2_20260925");
   assert.equal(TEST_MIGRATIONS_TARGETS.ledger.schema, "tibotattle_ledger_v12_a2_20260925");
@@ -464,11 +464,11 @@ test("primary and ledger migrations are checksum-read back and repeated runs are
   const first = await runTestMigrations({ env: validEnv(), dependencies: harness.dependencies });
   const second = await runTestMigrations({ env: validEnv(), dependencies: harness.dependencies });
   assert.deepEqual(first, second);
-  assert.equal(first.migrations.primary.applied, 61);
+  assert.equal(first.migrations.primary.applied, 62);
   assert.equal(first.migrations.ledger.applied, 7);
   assert.match(first.migrations.primary.manifestSha256, /^[0-9a-f]{64}$/u);
   assert.match(first.migrations.ledger.latest.sha256, /^[0-9a-f]{64}$/u);
-  assert.equal(harness.state.primary.receipts.length, 61);
+  assert.equal(harness.state.primary.receipts.length, 62);
   assert.equal(harness.state.ledger.receipts.length, 7);
   assert.equal(harness.applyCalls, 4);
   assert.equal(harness.cleanupCalls, 2);
@@ -503,7 +503,7 @@ test("primary and ledger migrations are checksum-read back and repeated runs are
     false, "only the exact A2 schemas may receive grants");
 });
 
-test("benchmark profile applies 61 receipts and verifies runtime grants on every exact primary schema", async () => {
+test("benchmark profile applies 62 receipts and verifies runtime grants on every exact primary schema", async () => {
   const harness = makeHarness(manifest, { graphBenchmark: true });
   const result = await runTestMigrations({
     env: validBenchmarkEnv(),
@@ -514,7 +514,7 @@ test("benchmark profile applies 61 receipts and verifies runtime grants on every
   assert.equal(result.profile, GRAPH_BENCHMARK_MIGRATION_PROFILE);
   assert.equal(result.migrations.primarySchemas.length, 7);
   assert.deepEqual(result.migrations.primarySchemas.map(({ schema, applied }) => [schema, applied]),
-    GRAPH_BENCHMARK_MIGRATION_TARGETS.map(({ schema }) => [schema, 61]));
+    GRAPH_BENCHMARK_MIGRATION_TARGETS.map(({ schema }) => [schema, 62]));
   assert.equal(harness.poolCount, 1, "both schemas use only the pinned primary database pool");
   assert.equal(harness.applyCalls, 7);
   assert.equal(harness.cleanupCalls, 1);
@@ -522,7 +522,7 @@ test("benchmark profile applies 61 receipts and verifies runtime grants on every
   assert.equal(harness.events.some(({ role }) => role === "ledger"), false);
 
   for (const { schema } of GRAPH_BENCHMARK_MIGRATION_TARGETS) {
-    assert.equal(harness.schemaReceipts.get(schema).length, 61);
+    assert.equal(harness.schemaReceipts.get(schema).length, 62);
     assert.equal(harness.schemaOwners.get(schema), TEST_MIGRATIONS_IAM_USER);
     const quoted = `"${schema}"`;
     assert.equal(harness.events.some(({ sql }) => sql === `CREATE SCHEMA ${quoted}`), true);

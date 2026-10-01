@@ -1901,11 +1901,9 @@ test("v1.1 admission answers the Worker's caps, conflicts, v0.2 refusal and conc
        ) VALUES ($1, $2, $3, $4, $5, 256, 'application/json', 'consumed', now(), now() + interval '1 day', now())`,
       [legacyUpload, legacyOwner.participantId, legacyOwner.deviceId, randomBytes(32), randomBytes(32).toString("hex")],
     );
-    // 0011's participant guard resolves its table through search_path.
-    const legacyClient = await primaryPool.connect();
-    try {
-      await legacyClient.query(`SET search_path TO "${primarySchema}"`);
-      await legacyClient.query(
+    // The pool sets no search_path: primary 0062 pins 0011's participant
+    // guard, so the insert needs no session path (it used to).
+    await primaryPool.query(
       `INSERT INTO ${q(primarySchema, "telemetry_contributions")} (
          id, participant_id, plaintext_digest, envelope_digest, r2_key, status, schema_version,
          transport_schema_version, range_start, range_end, client_platform, provider_policy_epoch,
@@ -1915,10 +1913,7 @@ test("v1.1 admission answers the Worker's caps, conflicts, v0.2 refusal and conc
          now() - interval '1 day', now(), 'synthetic', 'synthetic', 100, 0, 0, 'synthetic', 0, $6, now())`,
       [`contribution:${randomUUID()}`, legacyOwner.participantId, randomBytes(32).toString("hex"),
         randomBytes(32).toString("hex"), `synthetic/v02-${randomUUID()}`, legacyUpload],
-      );
-    } finally {
-      legacyClient.release(true);
-    }
+    );
     const blocked = { status: 403, code: "TELEMETRY_TRANSPORT_BLOCKED" };
     await assert.rejects(grantV11ConsentRow(primaryPool, primarySchema, legacyOwner), { message: "telemetry_transport_blocked" });
     assert.deepEqual(await refusal(domain.createPredecessor(legacyOwner.principal)), blocked);

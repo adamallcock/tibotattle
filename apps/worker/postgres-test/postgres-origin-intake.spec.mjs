@@ -209,7 +209,7 @@ async function withOrigin(run) {
       created.push(schema);
     }
     const primary = await applyPostgresMigrations({ role: "primary", schema: primarySchema, pool: base });
-    assert.equal(primary.migrations.at(-1)?.name, "0061_legacy_contribution_admission.sql");
+    assert.equal(primary.migrations.at(-1)?.name, "0062_telemetry_contribution_trigger_search_path.sql");
     await applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool: base });
     const t = (name) => `"${primarySchema}"."${name}"`;
     await base.query(`UPDATE ${t("collection_controls")}

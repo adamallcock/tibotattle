@@ -43,7 +43,7 @@ test("PostgreSQL typed v1/v1.1 base preserves source keys and blocks erasure unt
     await pool.query(`CREATE SCHEMA "${schema}"`);
     created = true;
     const migration = await applyPostgresMigrations({ role: "primary", schema, pool });
-    assert.equal(migration.applied, 61);
+    assert.equal(migration.applied, 62);
 
     const s = `"${schema}"`;
     const participantId = `synthetic-typed-owner-${randomBytes(4).toString("hex")}`;

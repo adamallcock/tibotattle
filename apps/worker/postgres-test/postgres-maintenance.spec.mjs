@@ -97,7 +97,7 @@ test("PostgreSQL scheduled slice purges expired identity state, fences orphan cl
     primaryCreated = true;
     await pool.query(`CREATE SCHEMA "${ledgerSchema}"`);
     ledgerCreated = true;
-    assert.equal((await applyPostgresMigrations({ role: "primary", schema: primarySchema, pool })).applied, 61);
+    assert.equal((await applyPostgresMigrations({ role: "primary", schema: primarySchema, pool })).applied, 62);
     assert.equal((await applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool })).applied, 7);
 
     vite = await createServer({

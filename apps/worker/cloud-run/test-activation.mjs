@@ -19,8 +19,8 @@ export const TEST_ACTIVATION_MIGRATION_ROOT = "/app/apps/worker/postgres/migrati
 export const TEST_ACTIVATION_TARGET = CLOUD_RUN_IAM_TEST_TARGET.postgres.primary;
 
 const TEST_ACTIVATION_PROJECT = CLOUD_RUN_IAM_TEST_TARGET.project;
-const EXPECTED_MIGRATION_COUNT = 61;
-const EXPECTED_MIGRATION_TAIL = "0061_legacy_contribution_admission.sql";
+const EXPECTED_MIGRATION_COUNT = 62;
+const EXPECTED_MIGRATION_TAIL = "0062_telemetry_contribution_trigger_search_path.sql";
 const METADATA_EMAIL_URL =
   "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email";
 const EXECUTION_PATTERN = /^[a-z][a-z0-9-]{0,62}$/u;
