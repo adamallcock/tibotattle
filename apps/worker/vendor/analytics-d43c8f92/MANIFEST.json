@@ -24,7 +24,7 @@
       "apps/worker/test/quota-analysis-v1-shared-finish.spec.ts"
     ],
     "packageRule": "packages/{accounting,quota-analysis,telemetry-contract}/{package.json,index.js,index.d.ts,src/**}",
-    "typeOnlyImports": "erased by esbuild and not vendored",
+    "typeOnlyImports": "erased by esbuild; not vendored; typeStubs declare the modules that vendored files name",
     "externals": [
       "jsonc-parser",
       "runcost",
@@ -71,6 +71,7 @@
     "package": 40,
     "exportPatched": 5,
     "exportPatchedFiles": 2,
+    "typeStubs": 3,
     "parityTests": 10
   },
   "files": [
@@ -997,6 +998,29 @@
       "sha256": "97ff428000324447644d4f3817497b8d706f279fbfe52838110686902a64a84a",
       "patch": "none",
       "reach": "package"
+    }
+  ],
+  "typeStubs": [
+    {
+      "path": "apps/worker/src/telemetry-performance-envelope.d.ts",
+      "source": "apps/worker/src/telemetry-performance-envelope.ts",
+      "sourceBlob": "0b16431cf414c6d467b7b37a71276b82411baa87",
+      "sha256": "a2d126481c8d0e33e557f867abc297221784201c9575beaf1777c9a3c68977c2",
+      "tool": "tsc --declaration --emitDeclarationOnly"
+    },
+    {
+      "path": "apps/worker/src/upload-ingress-admission.d.ts",
+      "source": "apps/worker/src/upload-ingress-admission.ts",
+      "sourceBlob": "5c034168dc2e3faa5aba03f6f82c980fb291ed52",
+      "sha256": "c88c2c34d9fbf680a87204011a83687d282dccc4dab1463e4c8dbd98ae43856f",
+      "tool": "tsc --declaration --emitDeclarationOnly"
+    },
+    {
+      "path": "apps/worker/src/validation.d.ts",
+      "source": "apps/worker/src/validation.ts",
+      "sourceBlob": "46cc459a18c53972f96f770eea50f352c6e7478e",
+      "sha256": "576fc21468c52dbbde8890fe56e09bf2d657a7bb8f6f4c7f7fe05707b08c53eb",
+      "tool": "tsc --declaration --emitDeclarationOnly"
     }
   ],
   "parityTests": [

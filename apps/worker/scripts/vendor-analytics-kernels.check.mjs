@@ -4,9 +4,11 @@
 // It needs the git object for d43c8f92 and fails closed without it. The
 // identity arithmetic (git blob ids, export-token removal and the parity
 // rewrite reversal) is implemented here independently of the generator; only
-// the reviewed lists are shared, and the export patches are pinned below.
+// the reviewed lists are shared, and the export patches are pinned below. The
+// generated type stubs are checked by re-emitting them, and by typechecking the
+// app program plus one consumer of entry.ts with this checkout's tsc.
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -16,7 +18,7 @@ import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   AUTHORED_FILES, EXPORT_PATCHES, MANIFEST_FILE, MANIFEST_SCHEMA, PARITY_HELPERS, PARITY_RELATIVE, PARITY_SPECS,
-  SOURCE_COMMIT, VENDOR_RELATIVE, VENDORED_PACKAGES, WEB_ROOTS,
+  regenerateTypeStubs, SOURCE_COMMIT, VENDOR_RELATIVE, VENDORED_PACKAGES, WEB_ROOTS,
 } from "./vendor-analytics-kernels.mjs";
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -104,8 +106,8 @@ test("every vendored file equals git rev-parse d43c8f92:<path> after export-toke
 });
 
 test("the vendor directory holds exactly the manifest files and the authored facade", () => {
-  assert.deepEqual(listFiles(VENDOR_ROOT),
-    [...manifest.files.map((file) => file.path), ...AUTHORED_FILES, MANIFEST_FILE].sort());
+  assert.deepEqual(listFiles(VENDOR_ROOT), [...manifest.files.map((file) => file.path),
+    ...manifest.typeStubs.map((stub) => stub.path), ...AUTHORED_FILES, MANIFEST_FILE].sort());
   assert.deepEqual(manifest.authoredFiles, [...AUTHORED_FILES]);
   assert.equal(manifest.counts.files, manifest.files.length);
   assert.equal(new Set(manifest.files.map((file) => file.path)).size, manifest.files.length);
@@ -228,6 +230,55 @@ test("the facade bundles for Node and prepares an empty owner-day", async () => 
     assert.equal(day.daily.counts.usage + day.daily.counts.quota + day.daily.counts.session, 0);
     assert.equal(typeof kernels.publicInputs, "function");
     assert.equal(typeof kernels.reconcileGroups, "function");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("type stubs are this tsc's declarations of the d43c8f92 modules vendored files name only for types", async () => {
+  assert.equal(manifest.counts.typeStubs, manifest.typeStubs.length);
+  const vendored = new Set(manifest.files.map((file) => file.path));
+  const expected = revParse(manifest.typeStubs.map((stub) => stub.source));
+  for (const stub of manifest.typeStubs) {
+    assert.equal(stub.path, stub.source.replace(/\.ts$/, ".d.ts"));
+    assert.ok(stub.source.startsWith("apps/worker/src/") && !vendored.has(stub.source), `${stub.source} must be unvendored Worker source`);
+    assert.equal(stub.sourceBlob, expected.get(stub.source), `${stub.source} differs from d43c8f92`);
+    assert.equal(digest(readFileSync(join(VENDOR_ROOT, stub.path))), stub.sha256, `${stub.path} differs from the manifest`);
+  }
+  const { frontier, stubs } = await regenerateTypeStubs(manifest);
+  assert.deepEqual(frontier, manifest.typeStubs.map((stub) => stub.source));
+  for (const stub of manifest.typeStubs) {
+    assert.ok(stubs.get(stub.path)?.equals(readFileSync(join(VENDOR_ROOT, stub.path))), `${stub.path} is not the emitted declaration`);
+  }
+});
+
+test("a tsc-checked consumer can import the facade with this checkout's tsconfig", () => {
+  // The probe extends apps/worker/tsconfig.json from inside apps/worker so the
+  // program is exactly `npm run typecheck` plus one consumer of entry.ts.
+  const dir = mkdtempSync(join(WORKER_ROOT, ".vendor-tsc-probe-"));
+  try {
+    writeFileSync(join(dir, "probe.ts"), [
+      "import { prepareSharedAnalyticsDay, publicInputs, reconcileGroups, type SharedAnalyticsDay }",
+      `  from ${JSON.stringify(relative(dir, join(VENDOR_ROOT, "entry")).split(sep).join("/"))};`,
+      "export const probe: (day: string) => Promise<SharedAnalyticsDay> = (day) =>",
+      "  prepareSharedAnalyticsDay({ day, ownerDigest: \"a\".repeat(64), usage: [], quota: [], session: [] });",
+      "export const helpers = [publicInputs, reconcileGroups] as const;",
+      "",
+    ].join("\n"));
+    // The whole app program plus the probe, as if the probe lived in src/. `types`
+    // and `include` resolve from the project that uses them, so re-anchor them.
+    const app = JSON.parse(readFileSync(join(WORKER_ROOT, "tsconfig.json"), "utf8"));
+    const anchor = (entry) => relative(dir, resolve(WORKER_ROOT, entry)).split(sep).join("/");
+    writeFileSync(join(dir, "tsconfig.json"), JSON.stringify({
+      extends: "../tsconfig.json",
+      compilerOptions: { noEmit: true,
+        types: (app.compilerOptions.types ?? []).map((entry) => (entry.startsWith(".") ? anchor(entry) : entry)) },
+      include: (app.include ?? []).map(anchor),
+      files: ["probe.ts"],
+    }));
+    const result = spawnSync(join(WORKER_ROOT, "node_modules", ".bin", "tsc"), ["-p", dir, "--pretty", "false"],
+      { cwd: WORKER_ROOT, encoding: "utf8" });
+    assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -9,7 +9,10 @@
 // input. Each input is then written byte-for-byte from its git blob. The three
 // workspace packages are vendored whole (package.json, index.js, index.d.ts and
 // src/**). The only edits are the five `export ` tokens in EXPORT_PATCHES.
-// Type-only imports are erased by esbuild and are deliberately not vendored.
+// Type-only imports are erased by esbuild and are deliberately not vendored;
+// for the few Worker modules that vendored files name only for types, tsc
+// emits declaration stubs from the d43c8f92 sources so that tsc-checked
+// consumers of entry.ts still typecheck.
 //
 // Usage (from apps/worker): node scripts/vendor-analytics-kernels.mjs
 // Verify with:              node scripts/vendor-analytics-kernels.check.mjs
@@ -17,7 +20,8 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
-  existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmdirSync, rmSync, unlinkSync, writeFileSync,
+  existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmdirSync, rmSync, symlinkSync, unlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -67,6 +71,8 @@ export const EXPORT_TOKEN = "export ";
 
 const WORKER_SRC = "apps/worker/src";
 const WORKER_TEST = "apps/worker/test";
+/** d43c8f92's Worker ambient types; extracted only to emit type stubs, never vendored. */
+const WORKER_TYPES = "apps/worker/worker-configuration.d.ts";
 const PACKAGE_RULE = /^packages\/([a-z-]+)\/(package\.json|index\.js|index\.d\.ts|src\/.+)$/;
 
 export class VendorError extends Error {
@@ -313,7 +319,7 @@ function removePreviousOutput(previous) {
   if (previous.schemaVersion !== MANIFEST_SCHEMA) throw new VendorError("MANIFEST_SCHEMA_UNKNOWN", previous.schemaVersion);
   // Resolve and validate every target before deleting any of them.
   const targets = [];
-  for (const file of previous.files ?? []) {
+  for (const file of [...(previous.files ?? []), ...(previous.typeStubs ?? [])]) {
     const target = resolve(VENDOR_ROOT, file.path);
     if (!target.startsWith(`${VENDOR_ROOT}${sep}`) || !isVendoredPath(file.path)) {
       throw new VendorError("MANIFEST_PATH_UNEXPECTED", file.path);
@@ -330,27 +336,104 @@ function removePreviousOutput(previous) {
   removeEmptyDirectories(PARITY_ROOT);
 }
 
-export async function vendorAnalyticsKernels({ log = console.log } = {}) {
-  const root = repoRoot();
+function assertSourceCommit(root) {
   const resolved = execFileSync("git", ["rev-parse", "--verify", `${SOURCE_COMMIT}^{commit}`], { cwd: root, encoding: "utf8" }).trim();
   if (resolved !== SOURCE_COMMIT) throw new VendorError("SOURCE_COMMIT_UNAVAILABLE", SOURCE_COMMIT);
+}
+
+/**
+ * Runs `fn` over a throwaway extraction of the commit laid out like the vendor
+ * directory (export patches applied, authored files copied), then deletes it.
+ */
+export async function withSourceExtraction(fn) {
+  const root = repoRoot();
+  assertSourceCommit(root);
   for (const file of AUTHORED_FILES) {
     if (!existsSync(join(VENDOR_ROOT, file))) throw new VendorError("AUTHORED_FILE_MISSING", file);
   }
-
-  // 1. A throwaway extraction of the commit, laid out like the vendor directory.
-  const tree = listTree(root, [WORKER_SRC, "apps/web/public",
+  const tree = listTree(root, [WORKER_SRC, WORKER_TYPES, "apps/web/public",
     ...VENDORED_PACKAGES.map((pkg) => `packages/${pkg}`), ...paritySources().map(({ source }) => source)]);
   for (const { source } of paritySources()) if (!tree.has(source)) throw new VendorError("PARITY_SOURCE_MISSING", source);
   const extractable = [...tree.keys()].filter((path) => path.startsWith(`${WORKER_SRC}/`) || PACKAGE_RULE.test(path)
-    || (path.startsWith("apps/web/public/") && path.endsWith(".js")) || path.startsWith(`${WORKER_TEST}/`));
+    || (path.startsWith("apps/web/public/") && path.endsWith(".js")) || path.startsWith(`${WORKER_TEST}/`)
+    || path === WORKER_TYPES);
   const blobs = readBlobs(root, extractable.map((path) => tree.get(path).blob));
   const scratch = mkdtempSync(join(tmpdir(), "vendor-analytics-kernels-"));
   try {
     for (const path of extractable) writeFile(join(scratch, path), applyExportPatches(path, blobs.get(tree.get(path).blob)));
     for (const file of AUTHORED_FILES) writeFile(join(scratch, file), readFileSync(join(VENDOR_ROOT, file)));
+    return await fn({ scratch, tree, blobs: (path) => blobs.get(tree.get(path).blob) });
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
 
-    // 2. Runtime closure from the facade, the website normalizer and the parity specs.
+const RELATIVE_SPECIFIER = /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+)["'](\.{1,2}\/[^"']+)["']/g;
+
+/**
+ * Worker modules that vendored TypeScript names but that are not vendored.
+ * The runtime closure is complete, so every such import is type-only; tsc
+ * still resolves it. `exists` tells whether a path exists at the commit.
+ */
+export function typeOnlyFrontier(vendored, readVendored, exists) {
+  const frontier = new Set();
+  for (const path of [...vendored].sort()) {
+    if (!path.endsWith(".ts") || path.endsWith(".d.ts")) continue;
+    for (const match of readVendored(path).toString("utf8").matchAll(RELATIVE_SPECIFIER)) {
+      const base = posix.normalize(posix.join(posix.dirname(path), match[1]));
+      const target = [`${base}.ts`, `${base}/index.ts`, base].find((candidate) => vendored.has(candidate) || exists(candidate));
+      if (!target) throw new VendorError("UNRESOLVED_RELATIVE_IMPORT", `${path} -> ${match[1]}`);
+      if (!vendored.has(target)) frontier.add(target);
+    }
+  }
+  return [...frontier].sort();
+}
+
+export const typeStubPath = (source) => source.replace(/\.ts$/, ".d.ts");
+
+/**
+ * Declaration stubs for the type-only frontier, emitted by this checkout's tsc
+ * from the d43c8f92 sources. They let tsc-checked consumers import entry.ts
+ * (with skipLibCheck, imports inside a stub that stay unresolved are not
+ * reported); esbuild and Vitest never load them.
+ */
+function emitTypeStubs(scratch, frontier) {
+  if (!frontier.length) return new Map();
+  const compilerOptions = JSON.parse(readFileSync(join(scratch, "tsconfig.json"), "utf8")).compilerOptions;
+  writeFileSync(join(scratch, "tsconfig.stubs.json"), JSON.stringify({
+    compilerOptions: { ...compilerOptions, types: [`./${WORKER_TYPES}`], noEmit: false, declaration: true,
+      emitDeclarationOnly: true, noEmitOnError: false, rootDir: ".", outDir: "./.type-stubs" },
+    files: frontier,
+  }));
+  symlinkSync(join(WORKER_ROOT, "node_modules"), join(scratch, "node_modules"), "dir");
+  const tsc = join(WORKER_ROOT, "node_modules", ".bin", "tsc");
+  const result = spawnSync(tsc, ["-p", "tsconfig.stubs.json", "--pretty", "false"], { cwd: scratch, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  if (result.error || ![0, 1, 2].includes(result.status)) throw new VendorError("TYPE_STUB_EMIT_FAILED", String(result.error ?? result.status));
+  const own = (result.stdout ?? "").split("\n").filter((line) => frontier.some((path) => line.startsWith(`${path}(`)));
+  if (own.length) throw new VendorError("TYPE_STUB_SOURCE_ERRORS", own.join("; "));
+  const stubs = new Map();
+  for (const source of frontier) {
+    const emitted = join(scratch, ".type-stubs", typeStubPath(source));
+    if (!existsSync(emitted)) throw new VendorError("TYPE_STUB_NOT_EMITTED", source);
+    const bytes = readFileSync(emitted);
+    if (bytes.toString("utf8").includes("cloudflare:")) throw new VendorError("CLOUDFLARE_IMPORT_IN_TYPE_STUB", source);
+    stubs.set(typeStubPath(source), bytes);
+  }
+  return stubs;
+}
+
+/** Re-emits the stubs for the manifest's vendored files (used by the check). */
+export async function regenerateTypeStubs(manifest) {
+  return withSourceExtraction(async ({ scratch, tree }) => {
+    const vendored = new Set(manifest.files.map((file) => file.path));
+    const frontier = typeOnlyFrontier(vendored, (path) => readFileSync(join(scratch, path)), (path) => tree.has(path));
+    return { frontier, stubs: emitTypeStubs(scratch, frontier) };
+  });
+}
+
+export async function vendorAnalyticsKernels({ log = console.log } = {}) {
+  return withSourceExtraction(async ({ scratch, tree, blobs }) => {
+    // 1. Runtime closure from the facade, the website normalizer and the parity specs.
     const esbuild = loadEsbuild();
     const parityInputs = new Set(paritySources().map(({ source }) => source));
     const closure = await computeRuntimeClosure({ esbuild, root: scratch,
@@ -362,22 +445,28 @@ export async function vendorAnalyticsKernels({ log = console.log } = {}) {
     }
     const reach = classifyClosure(closure.byEntry, { isParityInput: (input) => parityInputs.has(input) });
 
-    // 3. Files: the closure plus the whole of each vendored package.
+    // 2. Files: the closure plus the whole of each vendored package.
     const files = [];
     for (const path of [...tree.keys()].sort()) {
       const pkg = PACKAGE_RULE.exec(path);
       const value = pkg && VENDORED_PACKAGES.includes(pkg[1]) ? "package" : reach.get(path);
       if (!value) continue;
-      const original = blobs.get(tree.get(path).blob);
-      const vendored = applyExportPatches(path, original);
+      const vendored = applyExportPatches(path, blobs(path));
       files.push({ path, blob: tree.get(path).blob, sha256: sha256(vendored),
         patch: EXPORT_PATCHES.some((patch) => patch.path === path) ? "export" : "none", reach: value, bytes: vendored });
     }
     for (const path of reach.keys()) if (!files.some((file) => file.path === path)) throw new VendorError("CLOSURE_INPUT_NOT_IN_TREE", path);
 
+    // 3. Declaration stubs for type-only imports that leave the runtime closure.
+    const vendoredPaths = new Set(files.map((file) => file.path));
+    const frontier = typeOnlyFrontier(vendoredPaths, (path) => readFileSync(join(scratch, path)), (path) => tree.has(path));
+    const stubs = emitTypeStubs(scratch, frontier);
+    const typeStubs = frontier.map((source) => ({ path: typeStubPath(source), source, sourceBlob: tree.get(source).blob,
+      sha256: sha256(stubs.get(typeStubPath(source))), bytes: stubs.get(typeStubPath(source)) }));
+
     const parityTests = paritySources().map(({ rel, source }) => {
       const rewrite = parityRewrite(rel);
-      const original = blobs.get(tree.get(source).blob);
+      const original = blobs(source);
       const text = applyParityRewrite(original.toString("utf8"), rewrite);
       if (reverseParityRewrite(text, rewrite) !== original.toString("utf8")) throw new VendorError("PARITY_REWRITE_IRREVERSIBLE", source);
       return { path: `${PARITY_RELATIVE}/${rel}`, source, blob: tree.get(source).blob, rewrite, bytes: Buffer.from(text, "utf8") };
@@ -385,7 +474,7 @@ export async function vendorAnalyticsKernels({ log = console.log } = {}) {
 
     // 4. Replace previous output, then write.
     removePreviousOutput(readManifest());
-    for (const file of files) writeFile(join(VENDOR_ROOT, file.path), file.bytes);
+    for (const file of [...files, ...typeStubs]) writeFile(join(VENDOR_ROOT, file.path), file.bytes);
     for (const test of parityTests) writeFile(join(WORKER_ROOT, test.path), test.bytes);
     const manifest = {
       schemaVersion: MANIFEST_SCHEMA,
@@ -398,7 +487,7 @@ export async function vendorAnalyticsKernels({ log = console.log } = {}) {
         esbuildVersion: closure.esbuildVersion,
         entryPoints: Object.values(closureEntryPoints((spec) => `${WORKER_TEST}/${spec}`)),
         packageRule: "packages/{accounting,quota-analysis,telemetry-contract}/{package.json,index.js,index.d.ts,src/**}",
-        typeOnlyImports: "erased by esbuild and not vendored",
+        typeOnlyImports: "erased by esbuild; not vendored; typeStubs declare the modules that vendored files name",
         externals: closure.externals,
       },
       exportPatches: EXPORT_PATCHES.map(({ path, line, symbol, original }) => ({ path, line, symbol, original })),
@@ -410,17 +499,18 @@ export async function vendorAnalyticsKernels({ log = console.log } = {}) {
         package: files.filter((file) => file.reach === "package").length,
         exportPatched: EXPORT_PATCHES.length,
         exportPatchedFiles: files.filter((file) => file.patch === "export").length,
+        typeStubs: typeStubs.length,
         parityTests: parityTests.length,
       },
       files: files.map(({ path, blob, sha256: digest, patch, reach: value }) => ({ path, blob, sha256: digest, patch, reach: value })),
+      typeStubs: typeStubs.map(({ path, source, sourceBlob, sha256: digest }) => ({ path, source, sourceBlob, sha256: digest,
+        tool: "tsc --declaration --emitDeclarationOnly" })),
       parityTests: parityTests.map(({ path, source, blob, rewrite }) => ({ path, source, blob, rewrite })),
     };
     writeFileSync(join(VENDOR_ROOT, MANIFEST_FILE), `${JSON.stringify(manifest, null, 2)}\n`);
     log(JSON.stringify({ status: "ok", sourceCommit: SOURCE_COMMIT, ...manifest.counts, externals: closure.externals }));
     return manifest;
-  } finally {
-    rmSync(scratch, { recursive: true, force: true });
-  }
+  });
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
