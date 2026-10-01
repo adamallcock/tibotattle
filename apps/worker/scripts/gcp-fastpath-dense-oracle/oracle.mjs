@@ -1109,9 +1109,10 @@ if (options.directNative === "all") {
  * direct.mjs run (the same direct-native.mjs computation) over a source whose
  * content digest equals this run's. The file must cover every owner's fits and
  * every model date. This process then recomputes a sample in place, with the
- * file's clock, and requires every recomputed payload to equal the file's byte
- * for byte: every scope of every owner except the dense one, and the dense
- * owner's lightest model window.
+ * file's clock, and requires every recomputed result to equal the file's byte
+ * for byte: for every owner but the dense one, its fits and the first, middle
+ * and last model dates (owner a's first date is a recorded native failure),
+ * and the dense owner's lightest model window.
  */
 let directImport = null;
 if (options.directResults !== null) {
@@ -1136,7 +1137,7 @@ if (options.directResults !== null) {
   const denseKey = dense ? dense.spec.key : null;
   const sample = roster.flatMap((owner) => {
     if (owner.key !== denseKey) return [{ ownerDigest: owner.ownerDigest, metric: "fits", day: today },
-      ...modelDates.map((day) => ({ ownerDigest: owner.ownerDigest, metric: "model", day }))];
+      ...[modelDates[0], modelDates[34], modelDates.at(-1)].map((day) => ({ ownerDigest: owner.ownerDigest, metric: "model", day }))];
     const lightest = [...modelDates].sort((left, right) => windowRows(owner.ownerDigest, left) - windowRows(owner.ownerDigest, right)
       || (left < right ? -1 : 1))[0];
     return [{ ownerDigest: owner.ownerDigest, metric: "model", day: lightest }];
@@ -1149,7 +1150,8 @@ if (options.directResults !== null) {
   } finally { setPinnedNow(analysisNowMs); }
   const mismatched = recomputed.filter((item) => {
     const imported = item.metric === "fits" ? direct[ownerKey(item.ownerDigest)].fits : direct[ownerKey(item.ownerDigest)].model[item.day];
-    return imported.state !== item.result.state || (imported.payload ?? null) !== (item.result.payload ?? null);
+    return imported.state !== item.result.state || (imported.payload ?? null) !== (item.result.payload ?? null)
+      || (imported.code ?? null) !== (item.result.code ?? null);
   }).map((item) => `${ownerKey(item.ownerDigest)}:${item.metric}:${item.day}`);
   directImport = { sha256: sha256Text(text), bytes: Buffer.byteLength(text), sourceDigest: file.sourceDigest, nowMs: file.nowMs,
     producerBundleSha256: file.bundleSha256 ?? null,

@@ -30,10 +30,51 @@
   "publicationPasses": 1,
   "resumedFrom": "converged run (--resume)"
  },
+ "direct": {
+  "total": {
+   "ms": 416573,
+   "jobs": 6,
+   "statements": 1763553,
+   "steps": 143303,
+   "taskMs": 2451885
+  },
+  "owners": {
+   "a": {
+    "ms": 655046,
+    "fitsMs": 9391,
+    "maxModelMs": 10468
+   },
+   "b": {
+    "ms": 658075,
+    "fitsMs": 9004,
+    "maxModelMs": 10002
+   },
+   "c": {
+    "ms": 478890,
+    "fitsMs": 6811,
+    "maxModelMs": 7703
+   },
+   "d": {
+    "ms": 659874,
+    "fitsMs": 9149,
+    "maxModelMs": 10623
+   }
+  }
+ },
+ "cache": {
+  "settledLaneMs": 24434,
+  "reference": {
+   "ms": 31373,
+   "jobs": 6,
+   "tasks": 680,
+   "taskMs": 184381
+  }
+ },
+ "windowRoutingNote": "window routing time is in oracle.log (window-routing)",
  "tierF": {
   "scope": "all",
   "total": {
-   "ms": 463482,
+   "ms": 456683,
    "statements": 2472226,
    "jobs": 6
   },
@@ -52,12 +93,12 @@
      }
     },
     "cost": {
-     "ms": 674519,
+     "ms": 650619,
      "statements": 607274,
      "invocations": 702,
      "maxCheckpointBytes": 689044,
      "fits": {
-      "ms": 9723,
+      "ms": 8552,
       "statements": 8713,
       "invocations": 10,
       "maxCheckpointParts": 7,
@@ -79,12 +120,12 @@
      }
     },
     "cost": {
-     "ms": 698206,
+     "ms": 714960,
      "statements": 615453,
      "invocations": 710,
      "maxCheckpointBytes": 699164,
      "fits": {
-      "ms": 9808,
+      "ms": 9702,
       "statements": 8794,
       "invocations": 10,
       "maxCheckpointParts": 8,
@@ -106,12 +147,12 @@
      }
     },
     "cost": {
-     "ms": 595118,
+     "ms": 578852,
      "statements": 632048,
      "invocations": 781,
      "maxCheckpointBytes": 690937,
      "fits": {
-      "ms": 7930,
+      "ms": 8477,
       "statements": 9026,
       "invocations": 11,
       "maxCheckpointParts": 8,
@@ -133,12 +174,12 @@
      }
     },
     "cost": {
-     "ms": 767817,
+     "ms": 758242,
      "statements": 617451,
      "invocations": 710,
      "maxCheckpointBytes": 721657,
      "fits": {
-      "ms": 11201,
+      "ms": 10551,
       "statements": 8769,
       "invocations": 10,
       "maxCheckpointParts": 8,

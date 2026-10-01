@@ -2,16 +2,23 @@
  "schemaVersion": "gcp-fastpath-dense-golden-source-v1",
  "note": "Produced by the dense production-code oracle (Tier N scheduled lanes and Tier F forced native) running d43c8f92's Worker code unmodified under Node over sealed SQLite files. Regenerate with the command below; never edit by hand.",
  "sourceCommit": "d43c8f92a059d9c577776f7eca8a331eb305b8a6",
- "command": "node --max-old-space-size=16384 apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs --work-dir <dir> --corpus q1",
+ "command": "node --max-old-space-size=16384 apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs --work-dir <dir> --corpus q1 --forced-native all --direct-native all --direct-jobs <n> --settle-cache both --golden-out apps/worker/analytics-v2-test/golden-q1-node",
  "oracleFiles": {
-  "apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs": "bb19bc6b3a5e8253cbcc175f01c1e31ab56b02fd",
+  "apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs": "55f687aa979f2ceab2944e6a9b08999d06d2195b",
   "apps/worker/scripts/gcp-fastpath-dense-oracle/build.mjs": "b58898bc8bab267d6a7b0c392dacebb46abce58e",
   "apps/worker/scripts/gcp-fastpath-dense-oracle/runtime.mjs": "21371a42b003d3ff68fc02e601f37b1b1e34fba9",
   "apps/worker/scripts/gcp-fastpath-dense-oracle/forced-native.mjs": "a55bad51ec8bf5ff8a90f7def5121409ccfac9c8",
   "apps/worker/scripts/gcp-fastpath-dense-oracle/forced-native-child.mjs": "57f533e58eb2467f7426be594daee1b37a344dbc",
+  "apps/worker/scripts/gcp-fastpath-dense-oracle/direct.mjs": "cbf91d81bc1b799c648f163b1f1d216d24505cd8",
+  "apps/worker/scripts/gcp-fastpath-dense-oracle/direct-native.mjs": "040eef9f825c8664c5f96ac8c78f34ec3302755d",
+  "apps/worker/scripts/gcp-fastpath-dense-oracle/direct-native-child.mjs": "5531ac38d8a70c1212f92fd5a751a61dc5b4b202",
+  "apps/worker/scripts/gcp-fastpath-dense-oracle/source-digest.mjs": "40e811336d2ddb1d86e5d9b22434541606c8585d",
+  "apps/worker/scripts/gcp-fastpath-dense-oracle/settled-cache.mjs": "fea543c4eccd508f6882193c417e387e9b925651",
+  "apps/worker/scripts/gcp-fastpath-dense-oracle/cache-days.mjs": "8c036ab7b83ceac3a01d49dacd4f5f638f7ecf03",
+  "apps/worker/scripts/gcp-fastpath-dense-oracle/cache-days-child.mjs": "d7699aaad0c9321f0aa1dfecfe27a75ecb7c8a62",
   "apps/worker/scripts/gcp-fastpath-dense-oracle/dense-corpus.mjs": "7b70de472308e747b97c492dac8629d3faea1b01",
   "apps/worker/scripts/gcp-fastpath-dense-oracle/corpus-summary.mjs": "3ec613a5835cd4a156f6d8ff85cd9ffb461ca0a1",
-  "apps/worker/scripts/gcp-fastpath-dense-oracle/entry.ts": "e85bcf6a30712fb096974ba613384d46585a9040",
+  "apps/worker/scripts/gcp-fastpath-dense-oracle/entry.ts": "a9890018e89b391263b661a1df8c6f2a77172fd4",
   "apps/worker/scripts/gcp-fastpath-dense-oracle/shims/cloudflare-workers.mjs": "b5c054ed4a30fe7d29e050489cf1049cee19a3c9",
   "apps/worker/scripts/gcp-fastpath-dense-oracle/shims/cloudflare-test.mjs": "cbdb32aa68e946efc954e17ba5057bd7868bbb2c"
  },
@@ -19,7 +26,8 @@
   "path": "apps/worker/cloud-run/sealed-sqlite-d1-adapter.mjs",
   "blob": "b39018ba15bbcccc5d1fb5285f33a9c88914c4b7"
  },
- "resumedFrom": "a converged run of the same corpus, scale and cadence (--resume): its seeding, convergence and lease-expiry probe ran in that run's process and their recorded outcomes were carried forward; every file here was computed by this process from that converged state",
+ "resumedFrom": "a run of the same corpus, scale and cadence that converged or stopped by its stop rule (--resume): its seeding, scheduled lanes and lease-expiry probe ran in that run's process and their recorded outcomes were carried forward; every file here was computed by this process from that state, except the direct references when directResults is set",
+ "directResults": null,
  "bundleNote": "bundleSha256 identifies this build only: the bundle embeds work-directory paths",
  "q1Corpus": {
   "path": "apps/worker/analytics-v2-test/golden/corpus/",
@@ -28,7 +36,7 @@
  "build": {
   "verifiedFiles": 392,
   "listingSha256": "6e8335b8056297b853900673ff3a58b0a20cdd595136905e1dbd6c5a7870f75a",
-  "bundleSha256": "3ea4a043164730eac4c7bc7e166d3cf35d89fbdc951cc66248dffefe2e11c28c",
+  "bundleSha256": "fb5c04eb422441e6379cc0f41b7c2f6ab227050eb3c1f1624456c2d7be403690",
   "esbuildVersion": "0.28.1",
   "dependencies": {
    "jsonc-parser": "3.3.1",

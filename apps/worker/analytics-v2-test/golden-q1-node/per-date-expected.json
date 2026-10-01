@@ -12,9 +12,9 @@
   {
    "day": "2026-07-24",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
     "a": "failed"
    },
    "refusedOwners": [
@@ -35,9 +35,9 @@
   {
    "day": "2026-07-25",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
     "a": "failed"
    },
    "refusedOwners": [
@@ -58,9 +58,9 @@
   {
    "day": "2026-07-26",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
     "a": "failed"
    },
    "refusedOwners": [
@@ -81,9 +81,9 @@
   {
    "day": "2026-07-27",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
     "a": "failed"
    },
    "refusedOwners": [
@@ -104,10 +104,10 @@
   {
    "day": "2026-07-28",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "forced",
-    "a": "forced"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -125,10 +125,10 @@
   {
    "day": "2026-07-29",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "forced",
-    "a": "forced"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -162,10 +162,10 @@
   {
    "day": "2026-07-30",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "forced",
-    "a": "forced"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -199,10 +199,10 @@
   {
    "day": "2026-07-31",
    "basis": {
-    "c": "tierN",
-    "d": "forced",
-    "b": "forced",
-    "a": "forced"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -236,10 +236,10 @@
   {
    "day": "2026-08-01",
    "basis": {
-    "c": "tierN",
-    "d": "forced",
-    "b": "forced",
-    "a": "forced"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -273,10 +273,10 @@
   {
    "day": "2026-08-02",
    "basis": {
-    "c": "forced",
-    "d": "forced",
-    "b": "forced",
-    "a": "forced"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -310,10 +310,10 @@
   {
    "day": "2026-08-03",
    "basis": {
-    "c": "forced",
-    "d": "forced",
-    "b": "forced",
-    "a": "forced"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -347,10 +347,10 @@
   {
    "day": "2026-08-04",
    "basis": {
-    "c": "forced",
-    "d": "forced",
-    "b": "forced",
-    "a": "forced"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -384,10 +384,10 @@
   {
    "day": "2026-08-05",
    "basis": {
-    "c": "forced",
-    "d": "forced",
-    "b": "forced",
-    "a": "forced"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -405,10 +405,10 @@
   {
    "day": "2026-08-06",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "forced"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -426,10 +426,10 @@
   {
    "day": "2026-08-07",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -447,10 +447,10 @@
   {
    "day": "2026-08-08",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -484,10 +484,10 @@
   {
    "day": "2026-08-09",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -521,10 +521,10 @@
   {
    "day": "2026-08-10",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -558,10 +558,10 @@
   {
    "day": "2026-08-11",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -595,10 +595,10 @@
   {
    "day": "2026-08-12",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -616,10 +616,10 @@
   {
    "day": "2026-08-13",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -637,10 +637,10 @@
   {
    "day": "2026-08-14",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -658,10 +658,10 @@
   {
    "day": "2026-08-15",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -679,10 +679,10 @@
   {
    "day": "2026-08-16",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -700,10 +700,10 @@
   {
    "day": "2026-08-17",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -721,10 +721,10 @@
   {
    "day": "2026-08-18",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -742,10 +742,10 @@
   {
    "day": "2026-08-19",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -763,10 +763,10 @@
   {
    "day": "2026-08-20",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -784,10 +784,10 @@
   {
    "day": "2026-08-21",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -805,10 +805,10 @@
   {
    "day": "2026-08-22",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -826,10 +826,10 @@
   {
    "day": "2026-08-23",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -847,10 +847,10 @@
   {
    "day": "2026-08-24",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -868,10 +868,10 @@
   {
    "day": "2026-08-25",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -889,10 +889,10 @@
   {
    "day": "2026-08-26",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -910,10 +910,10 @@
   {
    "day": "2026-08-27",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -931,10 +931,10 @@
   {
    "day": "2026-08-28",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -952,10 +952,10 @@
   {
    "day": "2026-08-29",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -973,10 +973,10 @@
   {
    "day": "2026-08-30",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -994,10 +994,10 @@
   {
    "day": "2026-08-31",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1015,10 +1015,10 @@
   {
    "day": "2026-09-01",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1036,10 +1036,10 @@
   {
    "day": "2026-09-02",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1057,10 +1057,10 @@
   {
    "day": "2026-09-03",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1078,10 +1078,10 @@
   {
    "day": "2026-09-04",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1099,10 +1099,10 @@
   {
    "day": "2026-09-05",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1120,10 +1120,10 @@
   {
    "day": "2026-09-06",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1141,10 +1141,10 @@
   {
    "day": "2026-09-07",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1173,10 +1173,10 @@
   {
    "day": "2026-09-08",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1194,10 +1194,10 @@
   {
    "day": "2026-09-09",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1215,10 +1215,10 @@
   {
    "day": "2026-09-10",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1247,10 +1247,10 @@
   {
    "day": "2026-09-11",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1279,10 +1279,10 @@
   {
    "day": "2026-09-12",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1311,10 +1311,10 @@
   {
    "day": "2026-09-13",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1343,10 +1343,10 @@
   {
    "day": "2026-09-14",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1375,10 +1375,10 @@
   {
    "day": "2026-09-15",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1407,10 +1407,10 @@
   {
    "day": "2026-09-16",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1439,10 +1439,10 @@
   {
    "day": "2026-09-17",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1471,10 +1471,10 @@
   {
    "day": "2026-09-18",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1503,10 +1503,10 @@
   {
    "day": "2026-09-19",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1535,10 +1535,10 @@
   {
    "day": "2026-09-20",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1567,10 +1567,10 @@
   {
    "day": "2026-09-21",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1599,10 +1599,10 @@
   {
    "day": "2026-09-22",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1631,10 +1631,10 @@
   {
    "day": "2026-09-23",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1663,10 +1663,10 @@
   {
    "day": "2026-09-24",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1695,10 +1695,10 @@
   {
    "day": "2026-09-25",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1727,10 +1727,10 @@
   {
    "day": "2026-09-26",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1759,10 +1759,10 @@
   {
    "day": "2026-09-27",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1791,10 +1791,10 @@
   {
    "day": "2026-09-28",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1823,10 +1823,10 @@
   {
    "day": "2026-09-29",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1855,10 +1855,10 @@
   {
    "day": "2026-09-30",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
@@ -1887,10 +1887,10 @@
   {
    "day": "2026-10-01",
    "basis": {
-    "c": "tierN",
-    "d": "tierN",
-    "b": "tierN",
-    "a": "tierN"
+    "c": "direct",
+    "d": "direct",
+    "b": "direct",
+    "a": "direct"
    },
    "refusedOwners": [],
    "payload": {
