@@ -20,11 +20,12 @@
 //     omission list that is NOT NULL, or a target NOT NULL column without a
 //     default that the allowlist does not map, refuses the copy.
 //   * Everything runs in ONE transaction: emptiness re-check under table
-//     locks, inserts with row triggers suppressed (session_replication_role =
-//     replica), an explicit foreign-key re-check with triggers restored,
-//     per-table count and canonical-row digest parity, and (by default) parity
-//     of community_public_source_owners with the source view. Any failure
-//     rolls back everything.
+//     locks, inserts in foreign-key order with the copied tables' user
+//     triggers suppressed (ALTER TABLE ... DISABLE TRIGGER USER; foreign keys
+//     stay enforced), the triggers restored and proven enabled, an explicit
+//     foreign-key re-check, per-table count and canonical-row digest parity,
+//     and (by default) parity of community_public_source_owners with the
+//     source view. Any failure rolls back everything, trigger DDL included.
 //   * Errors are closed codes; details name only a table, a column or a
 //     SQLSTATE, never a value. The receipt holds counts, digests and names.
 //
@@ -35,9 +36,11 @@
 // (owner revisions without journal rows, retention markers without an import
 // run). Those derived tables are therefore NOT created by this copy; the
 // analytics path does not read them, but live intake for a copied device
-// would need its transport floors. session_replication_role is a superuser
-// setting, so the copy needs a superuser connection to the disposable
-// rehearsal cluster (it is refused otherwise).
+// would need its transport floors. Suppression is table-owner DDL, not the
+// superuser-only session_replication_role, so the copy runs as the schema's
+// owner: a local superuser or a Cloud SQL migrator (cloudsqlsuperuser member,
+// not a superuser) alike. Every user trigger must be enabled in origin mode,
+// exactly the triggers replica mode would have suppressed.
 //
 // Selection: participants, devices, owner links, input versions, grants,
 // consents and singletons are copied whole. web_sessions and device_pairings
@@ -926,6 +929,24 @@ async function assertTargetEmpty(client, schema, spec) {
   if (Number(result.rows?.[0]?.n) > limit) fail("FASTPATH_IDENTITY_TARGET_NOT_EMPTY", { table: spec.name });
 }
 
+/**
+ * Foreign keys stay enforced while rows are inserted (only user triggers are
+ * suppressed), so a child row whose parent is missing fails its own write or
+ * the deferred-constraint flush. Either reports the closed code of the
+ * post-insert re-check, FASTPATH_IDENTITY_FOREIGN_KEY_UNSATISFIED, naming
+ * the child table; any other refusal is a write failure with its SQLSTATE.
+ */
+async function checkedWrite(client, text, values, table = undefined) {
+  try {
+    return await client.query(text, values);
+  } catch (error) {
+    // Without a statement table (the flush), PostgreSQL's own error names it.
+    const named = table ?? (typeof error?.table === "string" ? error.table : undefined);
+    if (sqlStateOf(error) === "23503") fail("FASTPATH_IDENTITY_FOREIGN_KEY_UNSATISFIED", { table: named });
+    return fail("FASTPATH_IDENTITY_TARGET_WRITE_FAILED", { table: named, sqlState: sqlStateOf(error) });
+  }
+}
+
 async function insertRows(client, schema, spec, parameterRows) {
   const width = spec.columns.length;
   const batch = Math.max(1, Math.min(MAX_INSERT_ROWS, Math.floor(MAX_INSERT_PARAMETERS / width)));
@@ -934,8 +955,8 @@ async function insertRows(client, schema, spec, parameterRows) {
     const page = parameterRows.slice(start, start + batch);
     const values = page.map((_, rowIndex) => `(${spec.columns.map((__, columnIndex) =>
       `$${rowIndex * width + columnIndex + 1}`).join(", ")})`).join(", ");
-    await q(client, `INSERT INTO ${relation(schema, spec.name)} (${list}) VALUES ${values}`, page.flat(),
-      "FASTPATH_IDENTITY_TARGET_WRITE_FAILED", { table: spec.name });
+    await checkedWrite(client, `INSERT INTO ${relation(schema, spec.name)} (${list}) VALUES ${values}`, page.flat(),
+      spec.name);
   }
 }
 
@@ -946,6 +967,67 @@ async function readTargetTable(client, schema, spec) {
   const rows = result.rows.map(row => spec.columns.map(column =>
     fromTarget(column.type, row[column.target], spec.name, column.target)));
   return Object.freeze({ rows: rows.length, sha256: sortedDigest(spec, rows) });
+}
+
+/** Every user (non-internal) trigger on the copied tables, with its tgenabled state. */
+async function userTriggers(client, schema, tableNames) {
+  const result = await q(client, `SELECT rel.relname::text AS table_name, trigger.tgname::text AS name,
+        trigger.tgenabled::text AS enabled
+      FROM pg_catalog.pg_trigger trigger
+      JOIN pg_catalog.pg_class rel ON rel.oid = trigger.tgrelid
+      JOIN pg_catalog.pg_namespace namespace ON namespace.oid = rel.relnamespace
+     WHERE namespace.nspname = $1 AND rel.relname = ANY($2::text[]) AND NOT trigger.tgisinternal
+     ORDER BY rel.relname, trigger.tgname`, [schema, tableNames],
+  "FASTPATH_IDENTITY_TARGET_QUERY_FAILED");
+  return result.rows;
+}
+
+/**
+ * Suppress every user row and statement trigger of the copied tables for
+ * the inserts with ALTER TABLE ... DISABLE TRIGGER USER, which needs only
+ * table ownership. (session_replication_role needs a superuser, and a
+ * Cloud SQL migrator owns the tables without being one.) Every user trigger
+ * must be enabled in origin mode ('O'), the state ENABLE TRIGGER USER
+ * restores exactly and the only one session_replication_role = replica
+ * would have suppressed; any other state is refused before a write.
+ * Internally generated constraint triggers (foreign keys, deferrable unique
+ * constraints) are never disabled, so the allowlist's foreign-key order is
+ * enforced as rows are inserted, and assertForeignKeys still re-checks it.
+ * The DDL is transactional: restoreRowTriggers re-enables the triggers
+ * before COMMIT, and ROLLBACK (or a lost session) restores them.
+ */
+async function suppressRowTriggers(client, schema, tables) {
+  const triggers = await userTriggers(client, schema, tables.map(spec => spec.name));
+  const unexpected = triggers.find(trigger => trigger.enabled !== "O");
+  if (unexpected !== undefined) fail("FASTPATH_IDENTITY_TRIGGER_STATE_UNEXPECTED", { table: unexpected.table_name });
+  const names = [...new Set(triggers.map(trigger => trigger.table_name))];
+  for (const name of names) {
+    await q(client, `ALTER TABLE ${relation(schema, name)} DISABLE TRIGGER USER`, [],
+      "FASTPATH_IDENTITY_TRIGGER_SUPPRESSION_REFUSED", { table: name });
+  }
+  return Object.freeze({
+    tables: Object.freeze(names),
+    triggers: Object.freeze(triggers.map(trigger => `${trigger.table_name}.${trigger.name}`)),
+  });
+}
+
+/**
+ * Fire every deferred constraint check the inserts queued (ALTER TABLE
+ * refuses a table with pending trigger events), re-enable the suppressed
+ * triggers and prove each one is back in origin mode.
+ */
+async function restoreRowTriggers(client, schema, suppressed) {
+  await checkedWrite(client, "SET CONSTRAINTS ALL IMMEDIATE", []);
+  for (const name of suppressed.tables) {
+    await q(client, `ALTER TABLE ${relation(schema, name)} ENABLE TRIGGER USER`, [],
+      "FASTPATH_IDENTITY_TRIGGER_RESTORE_FAILED", { table: name });
+  }
+  const restored = await userTriggers(client, schema, suppressed.tables);
+  if (restored.length !== suppressed.triggers.length
+      || restored.some((trigger, index) => trigger.enabled !== "O"
+        || `${trigger.table_name}.${trigger.name}` !== suppressed.triggers[index])) {
+    fail("FASTPATH_IDENTITY_TRIGGER_RESTORE_FAILED");
+  }
 }
 
 /** Re-check every foreign key whose child is a copied table (MATCH SIMPLE). */
@@ -1118,7 +1200,7 @@ async function copyTablesInOneTransaction({
       [], "FASTPATH_IDENTITY_TARGET_LOCK_FAILED");
     for (const spec of tables) await assertTargetEmpty(client, schema, spec);
 
-    await q(client, "SET LOCAL session_replication_role = replica", [], "FASTPATH_IDENTITY_TRIGGER_SUPPRESSION_REFUSED");
+    const suppressed = await suppressRowTriggers(client, schema, tables);
     for (const spec of tables) {
       if (spec.seeded) {
         await q(client, `DELETE FROM ${relation(schema, spec.name)}`, [], "FASTPATH_IDENTITY_TARGET_WRITE_FAILED",
@@ -1126,7 +1208,7 @@ async function copyTablesInOneTransaction({
       }
       await insertRows(client, schema, spec, sourceTables.get(spec.name).parameters);
     }
-    await q(client, "SET LOCAL session_replication_role = origin", [], "FASTPATH_IDENTITY_TRIGGER_SUPPRESSION_REFUSED");
+    await restoreRowTriggers(client, schema, suppressed);
 
     const foreignKeysChecked = await assertForeignKeys(client, schema, tables);
     const receiptTables = {};

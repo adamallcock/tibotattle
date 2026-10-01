@@ -16,6 +16,10 @@
  * transfer and the ingestion journal (prefix-guarded fast-path target), then
  * T-1's roster, public-owner and owner-revision verifications. So
  * analytics-refresh and the origin read on GCP what they read locally.
+ * The whole chain runs as the migrator IAM user, which owns what it seeds
+ * but is not a superuser (a cloudsqlsuperuser member with CREATEDB and
+ * CREATEROLE): no stage needs superuser privileges, and, like the local
+ * superuser rehearsal, it is never an ingestion-journal transfer session.
  *
  *   node scripts/gcp-fastpath-seed.mjs seed --target=gcp-fastpath --commit=<ref>
  *        [--golden=<dir>] [--schema-suffix=<8 hex>] [--replace]
