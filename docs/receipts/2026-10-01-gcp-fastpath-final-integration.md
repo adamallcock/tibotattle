@@ -12,7 +12,10 @@ commit `298afb15`, built on the frozen `claude/gcp-fastpath` `f0b6158a`
 (whose [local rehearsal receipt](./2026-10-01-gcp-fastpath-local-rehearsal.md)
 stays the record for that commit). A later section,
 [Intake merge and primary 0062](#intake-merge-and-primary-0062), records code
-commit `0fea08b0`, which merges the IN-2/IN-3 intake composition on top. It records **local, synthetic** evidence
+commit `0fea08b0`, which merges the IN-2/IN-3 intake composition on top. The
+section [Cloud SQL seed preparation](#cloud-sql-seed-preparation) records code
+commit `6850ba06`, which prepares the seed for a non-superuser Cloud SQL
+session. It records **local, synthetic** evidence
 only: one macOS arm64 workstation, a local PostgreSQL 17 cluster on a private
 Unix socket and the Q-1 oracle's content-free four-owner corpus. Nothing was
 pushed, deployed or seeded; no GCP or Cloudflare resource was read or
@@ -276,13 +279,109 @@ Not run: root `npm test`, root `npm run check`, the Worker's full `check`
 and default Vitest suite, a Docker build, and anything on GCP or
 Cloudflare.
 
+## Cloud SQL seed preparation
+
+Code commit `6850ba06` on `claude/gcp-fastpath-final`, on top of the merge
+`6080e617`. Evidence is local and synthetic only, under the same limits as
+above. Nothing was pushed, deployed or seeded, and no GCP, Cloudflare or
+production resource was read or written.
+
+### What changed
+
+1. **Non-superuser T-1 merged** (`6080e617`): `claude/gcp-fp-seed-cloudsql`
+   `2a7d6d1f`, with no conflict. The T-1 identity copy suppresses the copied
+   tables' user triggers with owner DDL (`ALTER TABLE ... DISABLE/ENABLE
+   TRIGGER USER`) inside its one transaction, in place of the superuser-only
+   `session_replication_role`. Its commit message records the cloud seed
+   failing at T-1 with `FASTPATH_IDENTITY_TRIGGER_SUPPRESSION_REFUSED`
+   (42501). It adds a check that seeds the golden as a stand-in Cloud SQL
+   migrator (not a superuser) and requires the superuser's result.
+2. **The journal importer's one cloud exception** (`6850ba06`). The seed
+   reaches Cloud SQL through the Cloud SQL Node connector, a TCP session, so
+   `inet_server_addr()` is not NULL. The ingestion-journal importer accepts
+   only a local PostgreSQL 17 on its Unix socket. It would have refused the
+   seed with `INGESTION_JOURNAL_LOCAL_POSTGRES_17_REQUIRED`, after T-1,
+   typed-legacy, T-2 and usage-correction had already written.
+   - This is the only server-locality guard in the seed's chain. Typed-legacy,
+     T-2, usage-correction and T-1 check only for PostgreSQL 17. T-1's
+     `PGHOST` check is in its CLI only, which the seed does not use.
+   - `transferPostgresIngestionJournal` takes `cloudFastpathTarget`. Only
+     `gcp-fastpath-seed.mjs` passes `true`, through
+     `loadFastpathRehearsalImporters`; the local rehearsal never does.
+   - With the option, a session that fails the local check is admitted only
+     when `scripts/gcp-fastpath-cloud-target.mjs` finds all four conditions:
+     the database is `tibotattle_fastpath`, the schema is a
+     `typed_legacy_transfer_rehearsal_target_fastpath_<8 hex>` target, the
+     server is PostgreSQL 17, and neither the session user nor the current
+     user is a superuser.
+   - Anything else keeps the original refusal and code. The prefix and
+     disposable-schema guards run first and are unchanged. The journal's own
+     `storage_journal_transfer_target_` prefix is never a cloud target.
+   - The seed's checkout plan also requires the helper to equal the deployed
+     commit.
+3. **Checks.** The journal-transfer PG17 spec and the seed check gain cases
+   that need loopback TCP to the same cluster (`PG_TEST_TCP_HOST`). Without
+   it they skip; the shared socket-only cluster rejects TCP. The stand-in is
+   a local `tibotattle_fastpath` database owned by a NOLOGIN
+   CREATEDB/CREATEROLE group, with a non-superuser migrator reached over TCP.
+   Checks that share a cluster serialize on an advisory lock while the
+   database exists.
+   - Journal spec: (a) without the option, refused with the original code;
+     (b) the option in another database, refused; (d) a superuser with the
+     option, refused before and after the import; the journal's own prefix,
+     refused. None of these writes anything. (c) The option with the right
+     database, prefix and migrator imports the whole journal (6 rows, 3
+     pages) and replays as `already_complete`.
+   - Seed check: `runGcpFastpathSeed`, the deploy's entry point, runs with
+     only the pool swapped, as that TCP migrator in `tibotattle_fastpath`. It
+     equals the superuser's local-socket seed in importer receipts, imported
+     row counts (the rehearsal's, below), per-table content digests and
+     trigger states.
+   - Unit checks cover a fake TCP session (with every single failing
+     condition refused before any lock or write), the helper's refusal
+     reasons, a plan refusal when the helper differs, and a ratchet that only
+     the seed passes `cloudFastpathTarget: true`.
+   - With the importer change reverted, both PG checks fail with
+     `INGESTION_JOURNAL_LOCAL_POSTGRES_17_REQUIRED`. The TCP seed fails only
+     at the journal, after T-1, typed-legacy, T-2 and usage-correction
+     complete over TCP as the non-superuser.
+
+### Gates at `6850ba06`
+
+Run serially in this order with Node 26.2.0, from `apps/worker` unless they
+start with the repository root. The PostgreSQL gates used the PG17 cluster
+on port 55433 (`PG_TEST_SOCKET`, plus `PG_TEST_TCP_HOST=127.0.0.1` where
+listed; `PG_TEST_HOST` unset).
+
+| Gate | Result |
+|---|---|
+| Rehearsal (root, socket only) | Exit 1 `gate_failed`, on model-days only (127 compared, 119 equal, 91 differences); every other gate is true. Migrations 62/7. The importer receipts, imported row counts and parity report equal the post-merge, pre-change run. Served body 396337 bytes, sha256 `a27aee711cabc056eea2ecb5c89b7f4de3ec4a9f85b72455057c1f760ffa680d`; response file `04f7a277a9d8616f…` and preview `b3722cc98b7a82ef…`, as at `0fea08b0` |
+| `npm run gcp:fastpath:scripts-check` with TCP | rc 0, 23/23. This includes the three PG17 seed runs: the superuser over the socket, the stand-in migrator over the socket, and the stand-in migrator over TCP in `tibotattle_fastpath` |
+| T-1 identity-copy spec | 11/11 |
+| T-2 v1.2 transfer spec | 5/6, 1 skipped (the opt-in Q-1-dump case) |
+| Journal-transfer spec with TCP | 2/2 |
+| `npm run postgres:domain:check` with TCP | rc 0. Vitest 12 files, 76/76. node:test 327: 325 pass, 0 fail, 2 skipped (the same two as before) |
+| `npm run scripts:check` | rc 0, 967/967 |
+| `npx tsc --noEmit` | rc 0 (895 files) |
+| Root `npm run architecture:check` | passed (917 production files, 3,900 imports, 0 debt edges) |
+| `node scripts/gcp-fastpath-test-deploy.mjs all --commit=HEAD --dry-run` (root) | rc 0, and nothing ran: every command is printed as dry-run. The migrate Job would get 62/7. The seed plan is `run`, with all 7 stages present. Refresh and origin take the seeded schema and `--now=2026-10-01T12:00:00.000Z`, and the origin takes `ANALYTICS_V2_TEST_NOW_MS=1790856000000` |
+
+The seeded schema's suffix comes from the deployed commit and the golden
+dump, so each commit seeds a fresh schema. A partial schema from an earlier
+commit's attempt is left in place, and nothing reuses it.
+
 ## Remaining gates and owner decisions
 
 - Model-day semantics: port production's block-and-withhold rule or accept
   per-date publication.
-- The D-1 deploy and seed have not run against the test project. Seeding
-  needs Node 26 on the operator workstation and a checkout equal to the
-  deployed commit.
+- No D-1 seed has completed on the test project. Seeding needs Node 26 on
+  the operator workstation, a checkout equal to the deployed commit, and
+  installed `apps/worker` and `apps/worker/cloud-run` dependencies (Vite
+  for T-2's effective reader; the Cloud SQL connector, google-auth-library
+  and pg). The Cloud SQL exceptions in this receipt are proven against a
+  local stand-in only. Cloud SQL's own role and catalog behaviour, and the
+  seed's runtime grant and read-back as the runtime IAM user, are not
+  exercised locally.
 - The image's build context, the A2 and benchmark migrate profiles and the
   activation, benchmark, readback and cleanup jobs now pin 62/7 (tail 0062).
   Keep the promoted chain (0053, ledger 0007) off every non-disposable
