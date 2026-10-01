@@ -88,6 +88,12 @@ The target keeps every published output contract and every intake contract.
   and Cloud Run's front end verifies it. The EP-6 origin boundary accepts only
   the EP-0 `x-tibotattle-*` contract. Verifier service accounts may only
   `GET /api/health` and `/api/ready`.
+- Cloudflare adds the client address, in `CF-Connecting-IP`, to every edge
+  subrequest to the `*.run.app` origin or Google's token endpoint, and no
+  Worker code can remove it. Google therefore receives it unless the origin
+  moves behind a Cloudflare-proxied hostname. The switch waits for that owner
+  choice, OD-E6
+  ([decision record, section 5](../decisions/2026-10-01-thin-worker-edge-proxy.md#5-client-address-privacy)).
 
 ### Origin
 
@@ -485,6 +491,9 @@ approves that policy.
 - Cutover is not tonight. The remaining critical path covers intake, the edge,
   the importers and seal, the dense path and memo, and production resources and
   secrets from the owner's custody.
+- The edge cannot keep the client address from Google on a `*.run.app` origin
+  (OD-E6). Choosing a Cloudflare-proxied origin hostname changes the contract,
+  the EP-7 and EP-9 templates and DNS. Accepting it changes the privacy page.
 - Dense owners are excluded from tonight's parity gate, so tonight's parity
   covers effective, non-dense owners on synthetic data only.
 - The oracle may not converge under the Workers test pool. The fallback is a

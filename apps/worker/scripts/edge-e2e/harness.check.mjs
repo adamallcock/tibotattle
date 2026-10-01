@@ -220,8 +220,8 @@ test("S4's production limits are the checked-in env.production values", async ()
 
 test("the edge-mode dry run fails a gcp candidate that keeps storage or a main module with other exports", async () => {
   const { dryRunViolations } = await import("./edge-mode-dry-run.mjs");
-  const exports = ["UploadIngressBudget", "default", "handleRequest", "isPostgresWorkerRequestPathSupported",
-    "runScheduledMaintenance"];
+  const exports = ["UploadIngressBudget", "contributionRequestPreflight", "default", "handleRequest",
+    "isPostgresWorkerRequestPathSupported", "runScheduledMaintenance"];
   const storage = { d1: ["ANALYTICS_DB", "DELETION_LEDGER", "USAGE_MONITOR_DB"], r2: ["QUARANTINE", "SPARKLE_RELEASES"] };
   const good = [
     { mode: "worker", main: "src/edge-entry.ts", modeVar: "worker", exports, ...storage },

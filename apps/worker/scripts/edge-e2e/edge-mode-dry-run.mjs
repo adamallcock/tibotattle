@@ -126,8 +126,8 @@ export async function dryRunEdgeModes({ env = process.env } = {}) {
 }
 
 const DATA_BINDINGS = Object.freeze(["ANALYTICS_DB", "DELETION_LEDGER", "QUARANTINE", "USAGE_MONITOR_DB"]);
-const MAIN_MODULE_EXPORTS = Object.freeze(["UploadIngressBudget", "default", "handleRequest",
-  "isPostgresWorkerRequestPathSupported", "runScheduledMaintenance"]);
+const MAIN_MODULE_EXPORTS = Object.freeze(["UploadIngressBudget", "contributionRequestPreflight", "default",
+  "handleRequest", "isPostgresWorkerRequestPathSupported", "runScheduledMaintenance"]);
 
 /** The properties each candidate must have; returns the violations. */
 export function dryRunViolations(results) {

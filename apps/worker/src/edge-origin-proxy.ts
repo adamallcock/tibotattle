@@ -4,9 +4,10 @@
  * In gcp mode the production Worker is a thin edge in front of the
  * IAM-private Cloud Run origin. This module is that edge's request path. All
  * I/O is injected: the Worker's own handleRequest (for the classes the edge
- * answers itself), the Google ID-token source, the Workers Rate Limiting
- * bindings, and the network fetcher. It never imports index.ts; the entry
- * module (edge-entry.ts) owns that import and passes handleRequest in.
+ * answers itself) and contribution preflight, the Google ID-token source, the
+ * Workers Rate Limiting bindings, and the network fetcher. It never imports
+ * index.ts; the entry module (edge-entry.ts) owns that import and passes both
+ * functions in.
  *
  * Per request:
  * 1. classifyEdgeRequest decides, without I/O, whether the edge answers the
@@ -20,21 +21,29 @@
  *    handleRequest runs (verifyAdminAccessAssertion, then authorizeAdminEmail).
  *    A refusal is rendered as handleRequest's catch renders it, without the
  *    diagnostic write.
- * 3. A declared content-length above EDGE_MAX_FORWARD_BODY_BYTES on a request
+ * 3. A policy route's pre-admission guard (EDGE_PRE_ADMISSION_GUARDS) runs
+ *    next: the refusals the Worker gives before its limiter that depend only
+ *    on the request (a session cookie on the accountless routes,
+ *    assertSameOrigin on enrollment and sign-in start, and the contribution
+ *    preflight). A refusal is answered locally, rendered as handleRequest
+ *    renders it, so it spends no budget and never reaches the origin.
+ * 4. A declared content-length above EDGE_MAX_FORWARD_BODY_BYTES on a request
  *    whose body is forwarded is refused locally with 413 BODY_TOO_LARGE before
  *    any budget is spent. Anything else about the header is the origin's to
  *    judge. A body is never buffered.
- * 4. Address-keyed admission runs here (evaluateEdgeAdmission); only its
+ * 5. Address-keyed admission runs here (evaluateEdgeAdmission); only its
  *    purpose and outcome travel to the origin.
- * 5. The upstream request carries only the contract's allowlisted client
- *    headers, the contract headers and the edge-minted ID token. Nothing
- *    derived from the client address or the edge client-key secret is ever
- *    forwarded.
- * 6. Only a response carrying the origin marker passes through, with the
+ * 6. The upstream request carries only the contract's allowlisted client
+ *    headers, the contract headers, the edge-minted ID token and x-real-ip
+ *    set to the constant EDGE_SUBREQUEST_REAL_IP. This module never sets a
+ *    value derived from the client address or the edge client-key secret.
+ *    Cloudflare itself adds CF-Connecting-IP, carrying the client address, to
+ *    a subrequest for a non-Cloudflare host (edge-google-subrequest.ts).
+ * 7. Only a response carrying the origin marker passes through, with the
  *    contract's dropped headers removed and each Set-Cookie kept separate.
  *    A network or TLS failure, a headers timeout, a token failure or an
  *    unmarked response becomes 503 EDGE_ORIGIN_UNAVAILABLE with retry-after.
- * 7. For the admin overview, the Cloudflare download analytics are read here,
+ * 8. For the admin overview, the Cloudflare download analytics are read here,
  *    in parallel with the forward, and merged into the origin's body.
  *
  * Logging is content-free JSON: an event name, the edge request id, the
@@ -51,6 +60,7 @@ import {
 import type { CloudflareDistributionSegment } from "./distribution-analytics";
 import { evaluateEdgeAdmission } from "./edge-admission-policy";
 import type { EdgeAdmissionLimiters } from "./edge-admission-policy";
+import { EDGE_SUBREQUEST_REAL_IP, EDGE_SUBREQUEST_REAL_IP_HEADER } from "./edge-google-subrequest";
 import {
   ADMIN_ONLY_FORWARDED_REQUEST_HEADERS,
   DROPPED_RESPONSE_HEADERS,
@@ -76,6 +86,7 @@ import type {
   WorkerRouteMatch,
   WorkerRouteMethod,
 } from "./route-registry";
+import { assertSameOrigin, hasSessionCookie } from "./session";
 
 // ---------------------------------------------------------------------------
 // Public vocabulary
@@ -126,6 +137,46 @@ export const EDGE_ADMIN_API_ROUTE_IDS = Object.freeze([
   "admin_action",
 ] as const satisfies readonly ExactWorkerRouteId[]);
 
+/**
+ * The request-only refusals d43c8f92 gives on a policy route before it calls
+ * its limiter, as the edge reproduces them before evaluateEdgeAdmission:
+ * - session_cookie: the accountless handlers refuse a session cookie with
+ *   401 AUTH_INVALID first (index.ts handleAccountlessEnrollment and its four
+ *   siblings);
+ * - same_origin: handleEnroll and both sign-in start handlers run
+ *   assertSameOrigin first (403 CSRF_INVALID);
+ * - contribution_preflight: handleContribution runs
+ *   contributionRequestPreflight after its configuration checks.
+ * Every later pre-limiter guard of these routes, and every guard of the other
+ * policy routes, reads configuration or stored state (an enrollment mode, a
+ * collection control, the publication control); those stay at the origin, and
+ * the edge charges its budget for them (decision record, deviation 4).
+ * test/edge-pre-admission-guards.spec.ts holds this map to handleRequest.
+ * Frozen and prototype-free, like EDGE_ADMISSION_POLICY.
+ */
+export type EdgePreAdmissionGuard = "session_cookie" | "same_origin" | "contribution_preflight";
+
+const PRE_ADMISSION_GUARD_ENTRIES = {
+  accountless_enrollment: "session_cookie",
+  accountless_ownership: "session_cookie",
+  accountless_telemetry_v12_authorization: "session_cookie",
+  accountless_telemetry_performance_authorization: "session_cookie",
+  accountless_renewal: "session_cookie",
+  enroll: "same_origin",
+  identity_google_start: "same_origin",
+  identity_apple_start: "same_origin",
+  contributions: "contribution_preflight",
+} as const satisfies Readonly<Partial<Record<ExactWorkerRouteId, EdgePreAdmissionGuard>>>;
+
+export const EDGE_PRE_ADMISSION_GUARDS: Readonly<
+  Partial<Record<ExactWorkerRouteId, EdgePreAdmissionGuard>>
+> = Object.freeze(
+  Object.assign(
+    Object.create(null) as Record<string, EdgePreAdmissionGuard>,
+    PRE_ADMISSION_GUARD_ENTRIES,
+  ),
+);
+
 export type EdgeLocalReason =
   | "www"
   | "asset"
@@ -165,6 +216,12 @@ export interface EdgeOriginProxyOptions {
   readonly config: EdgeOriginConfiguration;
   /** index.ts handleRequest, injected by the entry module. */
   readonly handleRequest: (request: Request, env: Env) => Promise<Response>;
+  /**
+   * index.ts contributionRequestPreflight, injected by the entry module. It
+   * reads only the request's headers and whether it has a body, and throws
+   * the Worker's ApiError for a request it refuses.
+   */
+  readonly contributionRequestPreflight: (request: Request) => unknown;
   readonly idTokenSource: EdgeIdTokenSource;
   /** Edge-only HMAC secret for client rate-limit keys; never forwarded. */
   readonly clientKeySecret: string;
@@ -423,6 +480,8 @@ export function createEdgeOriginProxy(options: EdgeOriginProxyOptions): EdgeOrig
   const config = validatedConfig(options.config);
   const handleRequest = options.handleRequest;
   if (typeof handleRequest !== "function") invalidOptions();
+  const contributionRequestPreflight = options.contributionRequestPreflight;
+  if (typeof contributionRequestPreflight !== "function") invalidOptions();
   const idTokenSource = options.idTokenSource;
   if (idTokenSource === null || typeof idTokenSource !== "object"
       || typeof idTokenSource.getToken !== "function") {
@@ -506,6 +565,35 @@ export function createEdgeOriginProxy(options: EdgeOriginProxyOptions): EdgeOrig
       // handleRequest's catch renders a chokepoint refusal with no Allow
       // header; the edge has no diagnostic table, so nothing is written.
       return noStore(errorResponse(apiError, requestId));
+    }
+  }
+
+  /**
+   * The Worker's request-only refusal ahead of the route's limiter, or null.
+   * A throw that is not an ApiError is rendered as handleRequest's catch
+   * renders it, 500 INTERNAL_ERROR.
+   */
+  function preAdmissionRefusal(request: Request, routeId: ExactWorkerRouteId): ApiError | null {
+    const guard = Object.hasOwn(EDGE_PRE_ADMISSION_GUARDS, routeId)
+      ? EDGE_PRE_ADMISSION_GUARDS[routeId]
+      : undefined;
+    if (guard === undefined) return null;
+    try {
+      switch (guard) {
+        case "session_cookie":
+          if (hasSessionCookie(request.headers.get("cookie"))) {
+            return new ApiError(401, "AUTH_INVALID");
+          }
+          return null;
+        case "same_origin":
+          assertSameOrigin(request);
+          return null;
+        case "contribution_preflight":
+          contributionRequestPreflight(request);
+          return null;
+      }
+    } catch (error) {
+      return error instanceof ApiError ? error : new ApiError(500, "INTERNAL_ERROR");
     }
   }
 
@@ -607,6 +695,11 @@ export function createEdgeOriginProxy(options: EdgeOriginProxyOptions): EdgeOrig
       if (refusal !== null) return refusal;
     }
 
+    // The Worker refuses these before its limiter from the request alone, so
+    // the edge answers them before it spends any budget (d43c8f92 order).
+    const guardRefusal = preAdmissionRefusal(request, routeId);
+    if (guardRefusal !== null) return noStore(errorResponse(guardRefusal, requestId));
+
     // GET and HEAD never forward a body, so their declared length is neither
     // checked nor forwarded; index.ts reads a declared length only where it
     // reads a body.
@@ -650,6 +743,11 @@ export function createEdgeOriginProxy(options: EdgeOriginProxyOptions): EdgeOrig
       const value = request.headers.get(name);
       if (value !== null) upstreamHeaders.set(name, value);
     }
+    // Cloudflare puts the client address into x-real-ip (and CF-Connecting-IP)
+    // of a subrequest for a non-Cloudflare host unless the Worker sets
+    // x-real-ip itself; CF-Connecting-IP cannot be set (see
+    // edge-google-subrequest.ts).
+    upstreamHeaders.set(EDGE_SUBREQUEST_REAL_IP_HEADER, EDGE_SUBREQUEST_REAL_IP);
     upstreamHeaders.set(EDGE_HEADERS.host, hostKind);
     upstreamHeaders.set(EDGE_HEADERS.requestId, requestId);
     if (admission !== null) {

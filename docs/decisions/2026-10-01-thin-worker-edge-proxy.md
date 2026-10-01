@@ -135,7 +135,10 @@ integration commit that also records that production is typed-rendered.
   the owner-designated production release line (OD-E1). The lead then ports EP-0
   to EP-3, EP-9 (with its `production-live-config.mjs` change), E4, E5 and the
   release-guard migration, each blob-identical to the fast-path line. E10 is
-  built against that line's deploy tooling.
+  built against that line's deploy tooling. The entry also imports
+  `contributionRequestPreflight` from `./index`, which `d43c8f92` does not
+  export, so the port adds the `export` keyword to that one function in
+  `index.ts` and changes nothing else in it.
 - The origin side (EP-6, EP-7, EORIGIN and the future production composition)
   stays on the GCP line. The contract-blob rule in
   [section 11](#11-identity-split-and-the-contract-blob-rule) is what makes two
@@ -184,27 +187,63 @@ integration commit that also records that production is typed-rendered.
 
 ## 5. Client address privacy
 
-No raw client address, and no value derived from one, reaches Google.
+**In the topology this record describes, Google receives the raw client
+address on every forwarded request.** The edge's own code sets no value
+derived from the client address, but Cloudflare's network adds one. An earlier
+draft of this section said that no raw client address reaches Google; that is
+withdrawn. OD-E6 ([section 15](#15-open-owner-choices-this-record-does-not-settle))
+decides what replaces it, and the gcp switch waits for that decision.
+
+### What Cloudflare adds to the edge's subrequests
+
+Cloudflare's [HTTP headers reference](https://developers.cloudflare.com/fundamentals/reference/http-headers/)
+says that a Worker subrequest to a host outside any Cloudflare zone carries the
+client's address in both `CF-Connecting-IP` and `x-real-ip`, and that a Worker
+can change only `x-real-ip`. Both of the edge's subrequests to Google are of
+that kind:
+
+- the forward to the Cloud Run origin, a `*.run.app` host, on every forwarded
+  request;
+- the ID-token exchange with `oauth2.googleapis.com`, which runs inside the
+  client request that finds the cache empty, so it carries that client's
+  address, about once an hour per isolate.
+
+The edge therefore sets `x-real-ip` to the constant `2a06:98c0:3600::103` on
+both (`src/edge-google-subrequest.ts`), the address Cloudflare itself
+substitutes for a cross-zone Worker subrequest. It cannot change
+`CF-Connecting-IP`. Google's front end and the Cloud Run container receive that
+header. EP-6 copies only the allowlisted headers to the application, so no
+handler, PostgreSQL row, origin log or response sees it. What Google's own
+platform does with it is outside this record's evidence.
+
+Cloudflare does not document every header it adds to such a subrequest, and
+Miniflare adds none of them. E12's S7 proves what the edge's code and workerd
+send, not what Cloudflare's network adds. Only an observation on Cloudflare's
+network can establish that.
+
+### What the edge's code controls
 
 - **Request headers are allowlisted.** The edge copies only
   `FORWARDED_REQUEST_HEADERS` from the contract, plus `cf-access-jwt-assertion`
-  on the admin host. It drops `cf-connecting-ip`, every other `cf-*` header,
-  `x-forwarded-*`, `forwarded`, `x-real-ip`, `true-client-ip`, `user-agent` and
-  any client-sent `x-tibotattle-*` header.
-- **The edge sets five headers:** `x-tibotattle-edge-host` (apex or admin),
+  on the admin host. It drops the client's `cf-connecting-ip`, every other
+  `cf-*` header, `x-forwarded-*`, `forwarded`, `x-real-ip`, `true-client-ip`,
+  `user-agent` and any client-sent `x-tibotattle-*` header.
+- **The edge sets six headers:** `x-tibotattle-edge-host` (apex or admin),
   `x-tibotattle-edge-request-id` (a fresh UUID v4), `x-tibotattle-edge-admission`
   (policy routes only), `x-tibotattle-google-callback-query` (the apex Google
-  callback only) and `x-serverless-authorization`.
+  callback only), `x-serverless-authorization` and `x-real-ip` (the constant
+  above). E12's S7 requires exactly that `x-real-ip` value, once, on every
+  exchange.
 - **Edge keys.** `EDGE_CLIENT_KEY_SECRET` is used only as the edge admission
   environment's `IDENTITY_LINK_SECRET`, so every address rate-limit key is an
   HMAC under a secret that exists only at the edge. No client-key header exists
   in the contract, and the origin refuses a legacy `x-tibotattle-edge-client-key`
   with its 421.
-- **Replay at the origin.** The origin receives no client address. When it
-  replays a helper, the helper derives its key from the "unavailable" subject
-  under the origin's own `IDENTITY_LINK_SECRET`. The replay bindings check only
-  that key's shape; the outcome comes from the edge header. No PostgreSQL row,
-  log or header on Google Cloud carries a per-address value.
+- **Replay at the origin.** No contract header carries a client address. When
+  the origin replays a helper, the helper derives its key from the
+  "unavailable" subject under the origin's own `IDENTITY_LINK_SECRET`. The
+  replay bindings check only that key's shape; the outcome comes from the edge
+  header. No PostgreSQL row or origin log carries a per-address value.
 - **Google callback.** The forwarded callback URL always has an empty query.
   When the query is valid and at most 8,192 characters, it travels in its
   header, on the apex only, so it never appears in a Cloud Run request URL.
@@ -213,6 +252,33 @@ No raw client address, and no value derived from one, reaches Google.
   the ID token, key material or bodies.
 - **Unchanged exposure.** Workers observability already records request URLs at
   the edge. That is existing Cloudflare exposure, not a new flow to Google.
+
+### OD-E6: the two ways forward
+
+- **A. A Cloudflare-proxied origin hostname.** The edge forwards to a hostname
+  in a Cloudflare zone that fronts the Cloud Run service. Cloudflare then
+  substitutes the Worker address `2a06:98c0:3600::103` in `CF-Connecting-IP`
+  for a subrequest to another zone, and copies `x-real-ip` (the constant) into
+  it for the same zone. This needs a contract change (`canonicalRunAppOrigin`
+  accepts only `*.run.app`), new EP-7 and EP-9 templates, a DNS record and a
+  way for that hostname to reach an IAM-private service (for example a Google
+  load balancer with a serverless network endpoint group, or a Cloudflare host
+  override). It conflicts with the runbook's "no load balancer, no DNS change"
+  rule, so it needs its own owner decision. It does not cover the token
+  exchange, which still goes to Google directly; that needs the exchange moved
+  out of client requests or the exposure accepted for it.
+- **B. Accept and disclose.** Keep `*.run.app` and state that Google's front
+  end receives the client's network address in a header Cloudflare adds, which
+  the origin discards before any handler runs. Section 12's privacy-page text
+  changes to say so.
+
+Either way, before the switch an owner-authorized staging edge on Cloudflare's
+network must forward to an origin that records the names of the request
+headers it receives and, for each address-bearing header (`cf-connecting-ip`,
+`x-real-ip`, `x-forwarded-for`, `forwarded`, `true-client-ip`), only whether
+its value is the constant. A header derived from the address, such as
+`cf-ipcountry`, counts as address-bearing. No value is recorded. The result
+must match the chosen option, and no local gate can replace it.
 
 ## 6. Request handling in gcp mode
 
@@ -253,16 +319,30 @@ from either host. The order at the edge is:
 
 1. the admin-host Access chokepoint (`verifyAdminAccessAssertion`, then
    `authorizeAdminEmail`);
-2. a request whose body would be forwarded, with a declared `content-length`
+2. the pre-admission guard of a policy route (`EDGE_PRE_ADMISSION_GUARDS`):
+   the refusals `d43c8f92` gives before its limiter that depend only on the
+   request. The five accountless routes refuse a session cookie
+   (`401 AUTH_INVALID`). `enroll` and both sign-in starts run
+   `assertSameOrigin` (`403 CSRF_INVALID`). `contributions` runs the Worker's
+   own `contributionRequestPreflight`, which `index.ts` exports for the entry
+   to inject: session cookie (401), content type (415), declared length (400 or
+   413 above 2 MiB), body, and the `Upload` bearer's shape (401). A refusal is
+   rendered as `handleRequest`'s catch renders it, spends no budget and never
+   reaches the origin. `test/edge-pre-admission-guards.spec.ts` holds the map
+   to `handleRequest` for every policy route, method and a matrix of request
+   variants;
+3. a request whose body would be forwarded, with a declared `content-length`
    above 8 MiB, gets a local `413 BODY_TOO_LARGE`. Any other problem with that
    header is left to the origin;
-3. edge admission ([section 7](#7-rate-limit-tiering-against-d43c8f92));
-4. the forward.
+4. edge admission ([section 7](#7-rate-limit-tiering-against-d43c8f92));
+5. the forward.
 
 The forward:
 
 - The upstream URL is `EDGE_UPSTREAM_ORIGIN` with the path and query assigned as
   fields, so no path can change the host. The method is unchanged.
+- The headers are the allowlist, the contract headers, the ID token and
+  `x-real-ip` set to the constant of [section 5](#5-client-address-privacy).
 - The body is streamed. It is never buffered and never retried.
 - The request uses `redirect: "manual"` and `cache: "no-store"`. The headers
   timeout is `EDGE_UPSTREAM_HEADERS_TIMEOUT_SECONDS` (default 100, bounds 5 to
@@ -480,6 +560,11 @@ state that only a gcp deploy produces, or that lacks the ingestion database.
   it does not serve `/api/ready` (finding F8). A gcp deploy therefore cannot
   pass against any fast-path origin. It can pass only once the production
   origin composition (CR-6 and CR-7) serves Worker-shaped health and readiness.
+- **Blocked on OD-E6.** Lifting F8 does not clear the switch. Until the owner
+  decides OD-E6 and the Cloudflare-network probe confirms the result
+  ([section 5](#5-client-address-privacy)), no gcp deploy may run, and the
+  privacy page cannot carry the gcp text (section 12). E10 has no code check
+  for this, so it is an owner gate.
 
 ## 12. Privacy-marker rule
 
@@ -488,7 +573,13 @@ state that only a gcp deploy produces, or that lacks the ingestion database.
   - Cloudflare remains the edge: TLS, address-keyed rate limiting, download
     analytics and release hosting;
   - Google Cloud (Cloud SQL and Cloud Storage) holds hosted data;
-  - Google receives no raw client address and no value derived from one.
+  - what Google receives of the client's network address, as OD-E6 settles it
+    ([section 5](#5-client-address-privacy)). Under option A, once the
+    Cloudflare-network probe shows no client value reaching the origin, the
+    page may say that Google receives no client address. Under option B it must
+    say that Google's front end receives the client's network address in a
+    header Cloudflare adds, and that the origin discards it before processing.
+    The page must not claim more than the probe showed.
 - The new text carries `data-hosting-topology="cloudflare-edge-gcp-origin"`.
 - A gcp deploy requires a candidate site, built from its own source, whose
   privacy page carries the marker (`EDGE_PRIVACY_PAGE_NOT_CUTOVER` otherwise).
@@ -504,16 +595,35 @@ These are deliberate and accepted with this record:
 1. Fenced 503 responses carry `retry-after: 300`.
 2. The edge's own `503 EDGE_ORIGIN_UNAVAILABLE` and `503 EDGE_NOT_CONFIGURED`
    carry `retry-after: 60`.
-3. A forwarded body declared above 8 MiB gets a local `413 BODY_TOO_LARGE` before
-   admission. For `contributions` this equals the Worker, whose preflight 413
-   precedes its limiter. For other routes the Worker would charge its limiter
-   first and could answer 429; the edge answers 413.
-4. Edge budgets are charged before configuration and other preconditions. The
-   edge charges a policy route's limiter for every request with a registry
-   method, including requests that the Worker would refuse earlier, for example
-   while accountless enrollment is disabled or when a session cookie is present.
-   Responses stay equal because the origin replays the outcome at the Worker's
-   call point.
+3. A forwarded body declared above 8 MiB gets a local `413 BODY_TOO_LARGE` after
+   the pre-admission guard and before admission. For `contributions` the guard
+   is the Worker's own preflight, so the edge answers exactly as the Worker
+   does: 401 for a session cookie, 415 for a non-JSON type, and 413 for any
+   declared length above 2 MiB. The same holds for a session cookie on an
+   accountless route and a cross-origin enrollment or sign-in start. On every
+   other body route the Worker can refuse first, after the edge's guard: on
+   configuration or stored state (503), at its limiter (429), at
+   authentication (401), or at a later check such as `admin_action`'s CSRF
+   (403) or content type (415) on the admin host. There the edge answers 413.
+   No shipped client sends a body over 2 MiB.
+4. The edge charges a policy route's budget before the Worker's preconditions
+   that read configuration or stored state. In `d43c8f92` these come before
+   the limiter: the accountless enrollment and ownership modes, the
+   enrollment, upload-registration and publication collection controls, the
+   hosted sign-in start switch, and the admission-binding checks. A request
+   the Worker refuses there spends no budget in the Worker. At the edge it
+   spends the per-address budget and the coarse (global) budget of its
+   purpose. Each response is still equal, because the origin replays the
+   outcome at the Worker's call point. Later requests are not: within the same
+   60-second window, a request the Worker would admit can get
+   `429 ATTEMPT_LIMIT_REACHED` or `429 UPLOAD_INGRESS_LIMIT_REACHED` from the
+   edge. The global budgets are 20 per 60 s for sign-in start, enrollment and
+   recovery, so this shows mainly while a collection control or mode is off
+   and in the window after it is turned back on. The refusals that depend only
+   on the request are answered at the edge before admission and spend nothing
+   (step 2 of [forwarded requests](#forwarded-requests); E12's S4 rows). The
+   state-dependent ones would need the origin's state before every admission,
+   a second round trip per request.
 5. Address rate-limit keys are re-derived under `EDGE_CLIENT_KEY_SECRET`, so
    every per-address window resets once, at the gcp switch. Rotating that
    secret resets them again.
@@ -528,6 +638,11 @@ These are deliberate and accepted with this record:
    answer reached the client only when the held body closed, while the Worker
    answers at once. The 8 MiB forward cap and the origin's own body deadline
    bound the cost.
+10. The edge runs the contribution preflight without the upload-ingress
+    configuration checks that precede it in the Worker's `handleContribution`.
+    If the origin's upload-ingress configuration is invalid, the Worker would
+    answer 503 first, while the edge answers a preflight refusal (400, 401, 413
+    or 415) itself.
 
 ## 14. Relationship to accepted decisions
 
@@ -563,8 +678,15 @@ These are deliberate and accepted with this record:
 - OD-E4: the admin, export, security-reset, performance and Apple and Google
   sign-in routes stay outside the fast path. CR-6 and CR-7 own them before any
   gcp switch.
-- OD-E5: re-derive EP-1 if production's admission call sites change before the
-  switch.
+- OD-E5: re-derive EP-1, and `EDGE_PRE_ADMISSION_GUARDS`, if production's
+  admission call sites or the request-only guards ahead of them change before
+  the switch.
+- OD-E6: the client address Google receives
+  ([section 5](#5-client-address-privacy)). Option A routes the origin through
+  a Cloudflare-proxied hostname, and option B accepts and discloses the
+  `CF-Connecting-IP` that Cloudflare adds. The choice, and an owner-authorized
+  probe on Cloudflare's network that confirms it, must come before any gcp
+  switch, together with the privacy-page text it implies (section 12).
 - The rollback policy after the switch. Gcp to worker is forbidden by the
   matrix; a rollback window would need its own owner decision and a reviewed
   matrix change.

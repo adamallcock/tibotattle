@@ -10,6 +10,7 @@ import {
   type GoogleIdTokenFetcher,
   type GoogleIdTokenSource,
 } from "../src/edge-google-id-token";
+import { EDGE_SUBREQUEST_REAL_IP } from "../src/edge-google-subrequest";
 
 // Every key, account and token here is synthetic and generated in-process.
 const SERVICE_ACCOUNT = "tibotattle-edge-invoker@tibotattle-synthetic.iam.gserviceaccount.com";
@@ -296,6 +297,12 @@ describe("edge Google ID-token source: the JWT-bearer exchange", () => {
     expect(exchange!.init.method).toBe("POST");
     expect(new Headers(exchange!.init.headers).get("content-type"))
       .toBe("application/x-www-form-urlencoded");
+    // Cloudflare would otherwise fill x-real-ip of this subrequest to Google
+    // with the address of the client whose request started the exchange.
+    expect([...new Headers(exchange!.init.headers).keys()].sort())
+      .toEqual(["accept", "content-type", "x-real-ip"]);
+    expect(new Headers(exchange!.init.headers).get("x-real-ip")).toBe(EDGE_SUBREQUEST_REAL_IP);
+    expect(EDGE_SUBREQUEST_REAL_IP).toBe("2a06:98c0:3600::103");
     expect(exchange!.init.redirect).toBe("manual");
     expect(exchange!.init.cache).toBe("no-store");
     expect(exchange!.init.signal).toBeInstanceOf(AbortSignal);

@@ -80,6 +80,7 @@ import {
 import {
   MATRIX_VALUES,
   PUBLICATION_DISABLED_ROW,
+  SAME_ORIGIN,
   UNKNOWN_DEVICE_BEARER,
   UNKNOWN_UPLOAD_BEARER,
   adminRows,
@@ -126,6 +127,12 @@ const RATE_LIMIT_PURPOSES = Object.freeze([
  * subrequest; its value is the zone, never client data), and the
  * cache-control/pragma pair workerd renders for the edge's cache: 'no-store'.
  * Miniflare's own mf-* transport headers never leave the harness.
+ *
+ * Claim boundary: this is what the edge's code and workerd send. Miniflare
+ * does not add the headers Cloudflare's network adds to a production
+ * subrequest; Cloudflare documents that a subrequest for a non-Cloudflare host
+ * carries the client address in CF-Connecting-IP, which no Worker can change.
+ * S7 cannot observe that (decision record, section 5, OD-E6).
  */
 const PLATFORM_REQUEST_HEADERS = Object.freeze({
   "cf-worker": /^[a-z0-9.-]+$/u,
@@ -165,7 +172,7 @@ async function loadModules() {
     logLevel: "silent",
   });
   const load = (path) => vite.ssrLoadModule(path);
-  const [registry, policy, contract, edgeMode, session, codec, constants] = await Promise.all([
+  const [registry, policy, contract, edgeMode, session, codec, constants, subrequest] = await Promise.all([
     load("/src/route-registry.ts"),
     load("/src/edge-admission-policy.ts"),
     load("/src/edge-origin-contract.ts"),
@@ -173,8 +180,9 @@ async function loadModules() {
     load("/src/session.ts"),
     load("/src/typed-telemetry-codec.ts"),
     load("/src/constants.ts"),
+    load("/src/edge-google-subrequest.ts"),
   ]);
-  return { registry, policy, contract, edgeMode, session, codec, constants };
+  return { registry, policy, contract, edgeMode, session, codec, constants, subrequest };
 }
 
 async function localSocket() {
@@ -431,6 +439,7 @@ function materialize(row, f) {
   for (const [name, value] of Object.entries(row.headers ?? {})) {
     if (value === UNKNOWN_DEVICE_BEARER) headers[name] = unknownDeviceBearer();
     else if (value === UNKNOWN_UPLOAD_BEARER) headers[name] = unknownUploadBearer();
+    else if (value === SAME_ORIGIN) headers[name] = HOST_ORIGINS[row.host];
     else headers[name] = value;
   }
   if (row.accessToken !== undefined && row.accessToken !== null) {
@@ -536,6 +545,7 @@ function privacyViolations(f, exchange, { ip, hostKind = null }) {
     ...contract.FORWARDED_REQUEST_HEADERS,
     ...contract.EDGE_CONTRACT_REQUEST_HEADERS,
     contract.EDGE_HEADERS.invokerToken,
+    f.m.subrequest.EDGE_SUBREQUEST_REAL_IP_HEADER,
     "host",
     "transfer-encoding",
   ]);
@@ -550,8 +560,14 @@ function privacyViolations(f, exchange, { ip, hostKind = null }) {
       if (platform === undefined) violations.push(`header ${name} forwarded`);
       else if (!platform.test(value)) violations.push(`platform header ${name} carries a client value`);
     }
-    if (/^(?:x-forwarded-|forwarded$|x-real-ip$|true-client-ip$|user-agent$)/u.test(name)) {
+    if (/^(?:x-forwarded-|forwarded$|true-client-ip$|user-agent$)/u.test(name)) {
       violations.push(`forbidden header ${name}`);
+    }
+    // The edge sets x-real-ip, and only to the constant placeholder (the one
+    // address header a Worker can set on a subrequest; Cloudflare fills it
+    // with the client address otherwise).
+    if (name === f.m.subrequest.EDGE_SUBREQUEST_REAL_IP_HEADER && value !== f.m.subrequest.EDGE_SUBREQUEST_REAL_IP) {
+      violations.push(`x-real-ip is not the placeholder`);
     }
     if (name.startsWith("cf-") && name !== "cf-worker" && !(name === "cf-access-jwt-assertion" && kind === "admin")) {
       violations.push(`cf header ${name}`);
@@ -563,6 +579,8 @@ function privacyViolations(f, exchange, { ip, hostKind = null }) {
   for (const secret of secrets) {
     if (exchange.url.toLowerCase().includes(secret)) violations.push("URL carries the client address or its key");
   }
+  const realIps = exchange.requestHeaders.filter(([name]) => name === f.m.subrequest.EDGE_SUBREQUEST_REAL_IP_HEADER);
+  if (realIps.length !== 1) violations.push(`x-real-ip sent ${realIps.length} times`);
   const requestId = exchange.requestHeaders.find(([name]) => name === contract.EDGE_HEADERS.requestId)?.[1];
   if (!UUID_V4.test(requestId ?? "")) violations.push("request id is not a UUID v4");
   const path = exchange.url.split("?")[0];
@@ -672,7 +690,7 @@ test("S0 modes: fenced, absent and invalid gcp answer at the edge; worker mode e
   assert.equal(f.compatibility.e2e.date, f.compatibility.checkedIn.date);
   assert.deepEqual(f.compatibility.e2e.flags, f.compatibility.checkedIn.flags);
   // workerd starts the bundle only when every named export is a handler or function.
-  assert.deepEqual([...f.bundle.exports], ["UploadIngressBudget", "default", "handleRequest",
+  assert.deepEqual([...f.bundle.exports], ["UploadIngressBudget", "contributionRequestPreflight", "default", "handleRequest",
     "isPostgresWorkerRequestPathSupported", "runScheduledMaintenance"]);
 
   const fenced = await createEdgeInstance({ ...f.common, mode: "fenced", invokerKeyJson: f.invoker.keyJson });
@@ -1725,6 +1743,23 @@ test("S10 detectors: each injected fault is caught, and the same row passes once
     assertUpstreamUnavailable(unknown.edgeAnswer, f.edge, "EDGE_UPSTREAM_UNMARKED", "unknown email");
     f.frontEnd.clearHooks();
     assert.equal((await send(healthRow)).edgeAnswer.status, 200);
+
+    // (e) S7 flags an x-real-ip that carries the client address, a missing
+    // one and a repeated one; the recorded exchange itself passes.
+    const ip = nextIp();
+    const { url, options } = materialize(healthRow, f);
+    const mark = f.frontEnd.mark();
+    assert.equal((await f.edge.fetch(url, { ...options, ip })).status, 200);
+    const [recorded] = f.frontEnd.since(mark);
+    assert.deepEqual(privacyViolations(f, recorded, { ip }), []);
+    const realIp = f.m.subrequest.EDGE_SUBREQUEST_REAL_IP_HEADER;
+    const withHeaders = (requestHeaders) => ({ ...recorded, requestHeaders });
+    const others = recorded.requestHeaders.filter(([name]) => name !== realIp);
+    assert.ok(privacyViolations(f, withHeaders([...others, [realIp, ip]]), { ip })
+      .includes("x-real-ip is not the placeholder"));
+    assert.ok(privacyViolations(f, withHeaders(others), { ip }).includes("x-real-ip sent 0 times"));
+    assert.ok(privacyViolations(f, withHeaders([...recorded.requestHeaders, [realIp, f.m.subrequest.EDGE_SUBREQUEST_REAL_IP]]), { ip })
+      .includes("x-real-ip sent 2 times"));
   } finally {
     f.frontEnd.clearHooks();
   }
@@ -1951,6 +1986,43 @@ test("S4 admission: every EP-1 policy route the origin serves is limited exactly
   assert.equal(over.edgeAnswer.header("retry-after"), "60");
   assert.ok(admissionOf(over.exchanges)?.endsWith(";limited"));
   f.rows.push({ stage: "S4", id: "ingress-production-edge", pairs: answers.length + 1, compared: 1_000 });
+
+  // F. Request-only refusals spend no budget, as in the Worker, where they come
+  // before its limiter: from one address, more refused requests than the
+  // client limit, then a request each side admits.
+  await windowWithRoom(WINDOW_MS);
+  const enrollment = byRoute("accountless_enrollment");
+  const cookieIp = nextIp();
+  for (let index = 0; index < limits.CLIENT_ATTEMPT_RATE_LIMIT + 2; index += 1) {
+    const refused = await pairOnce(f, { ...enrollment, id: "accountless enrollment with a session cookie",
+      headers: { ...enrollment.headers, cookie: MATRIX_VALUES.sessionCookie } }, { ...pair, ip: cookieIp });
+    assert.deepEqual(workerMismatches(refused.edgeAnswer, refused.referenceAnswer), [], `cookie ${index + 1}`);
+    assert.equal(errorEnvelope(refused.edgeAnswer)?.code, "AUTH_INVALID");
+    assert.equal(refused.exchanges.length, 0, "answered at the edge");
+  }
+  const afterCookies = await pairOnce(f, { ...enrollment, id: "accountless enrollment after refused ones" },
+    { ...pair, ip: cookieIp });
+  assert.deepEqual(verdictMismatches(afterCookies.edgeAnswer, afterCookies.referenceAnswer), []);
+  assert.notEqual(afterCookies.edgeAnswer.status, 429);
+  assert.equal(admissionOf(afterCookies.exchanges), "v1;enrollment;allowed");
+  // enroll is not served by the test origin, so its admitted request is
+  // checked by its admission verdict alone.
+  const enroll = registry.find((route) => route.id === "enroll");
+  const foreignRow = { id: "enroll from a foreign origin", routeId: "enroll", host: "apex", method: "POST",
+    path: enroll.pathname, headers: { "content-type": "application/json", origin: "https://evil.example" }, body: "{}",
+    comparators: [] };
+  const foreignIp = nextIp();
+  for (let index = 0; index < limits.CLIENT_ATTEMPT_RATE_LIMIT + 2; index += 1) {
+    const refused = await pairOnce(f, foreignRow, { ...pair, ip: foreignIp });
+    assert.deepEqual(workerMismatches(refused.edgeAnswer, refused.referenceAnswer), [], `foreign ${index + 1}`);
+    assert.equal(errorEnvelope(refused.edgeAnswer)?.code, "CSRF_INVALID");
+    assert.equal(refused.exchanges.length, 0, "answered at the edge");
+  }
+  const sameOrigin = await pairOnce(f, { ...foreignRow, id: "enroll same-origin after refused ones",
+    headers: { "content-type": "application/json", origin: SAME_ORIGIN } }, { ...pair, ip: foreignIp, compare: false });
+  assert.notEqual(sameOrigin.edgeAnswer.status, 429);
+  assert.equal(admissionOf(sameOrigin.exchanges), "v1;enrollment;allowed");
+  f.rows.push({ stage: "S4", id: "refusals-spend-no-attempt-budget", refused: 2 * (limits.CLIENT_ATTEMPT_RATE_LIMIT + 2) });
 });
 
 test("S4 ingress: a pair with 100/60 ingress limits shows the client, coarse, preflight and held-body rows equal the Worker", {
@@ -2008,6 +2080,28 @@ test("S4 ingress: a pair with 100/60 ingress limits shows the client, coarse, pr
   assert.equal(errorEnvelope(edgeHeld)?.code, "UPLOAD_INGRESS_LIMIT_REACHED");
   f.rows.push({ stage: "S4", id: "held-body-limited", workerMs: Math.round(referenceMs), edgeMs: Math.round(edgeMs),
     holdMs, originAnsweredEarly: heldExchange.earlyAnswer === true });
+  // Refused uploads spend no ingress budget, as in the Worker, whose preflight
+  // precedes its limiter: more refusals from one address than the 100/60
+  // client limit, then a well-formed upload that both sides admit.
+  await windowWithRoom(WINDOW_MS);
+  const refusedIp = nextIp();
+  const refusals = [
+    ["no Upload header", { "content-type": "application/json" }, 401],
+    ["session cookie", { ...row.headers, cookie: MATRIX_VALUES.sessionCookie }, 401],
+    ["text/plain", { ...row.headers, "content-type": "text/plain" }, 415],
+  ];
+  for (let index = 0; index < 102; index += 1) {
+    const [label, headers, status] = refusals[index % refusals.length];
+    const refused = await pairOnce(f, { ...row, id: `refused upload: ${label}`, headers }, { ...pair, ip: refusedIp });
+    assert.deepEqual(workerMismatches(refused.edgeAnswer, refused.referenceAnswer), [], label);
+    assert.equal(refused.edgeAnswer.status, status, label);
+    assert.equal(refused.exchanges.length, 0, `${label}: answered at the edge`);
+  }
+  const afterRefusals = await pairOnce(f, { ...row, id: "upload after refused ones" }, { ...pair, ip: refusedIp });
+  assert.deepEqual(workerMismatches(afterRefusals.edgeAnswer, afterRefusals.referenceAnswer), []);
+  assert.notEqual(afterRefusals.edgeAnswer.status, 429);
+  assert.equal(admissionOf(afterRefusals.exchanges), "v1;upload_ingress;allowed");
+  f.rows.push({ stage: "S4", id: "refusals-spend-no-ingress-budget", refused: 102 });
   // Coarse: 101 addresses in a fresh window.
   await windowWithRoom(WINDOW_MS);
   const coarse = await burst(f, row, { ...pair, count: 100, concurrency: 10 });

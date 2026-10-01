@@ -45,7 +45,9 @@
  * ./ingress-budget, never ./cloudflare-entry (which exists only on the GCP
  * line), so the file builds unchanged on the production line too, where
  * index.ts also exports UploadIngressBudget and the explicit export below
- * shadows the star export.
+ * shadows the star export. It needs one export that d43c8f92's index.ts lacks,
+ * contributionRequestPreflight; the edge port adds the `export` keyword there
+ * as this line does, and nothing else in that function changes.
  */
 import { adminHostname, canonicalPublicOrigin, isAdminSurfacePath } from "./admin-ui";
 import { JSON_HEADERS } from "./constants";
@@ -63,7 +65,7 @@ import {
 import type { EdgeOriginConfiguration } from "./edge-origin-contract";
 import { classifyEdgeRequest, createEdgeOriginProxy } from "./edge-origin-proxy";
 import type { EdgeDistributionConfiguration, EdgeOriginProxy } from "./edge-origin-proxy";
-import worker, { handleRequest } from "./index";
+import worker, { contributionRequestPreflight, handleRequest } from "./index";
 import { mutationBarrierBlocksDynamicRequest } from "./mutation-barrier";
 import { matchWorkerRoute } from "./route-registry";
 
@@ -227,6 +229,7 @@ async function constructEdgeProxy(settings: EdgeGcpSettings): Promise<EdgeOrigin
     config: settings.config,
     // Two arguments: the barrier always takes its deployed constant here.
     handleRequest: (request, env) => handleRequest(request, env),
+    contributionRequestPreflight,
     idTokenSource,
     clientKeySecret: settings.clientKeySecret,
     limiters: settings.limiters,

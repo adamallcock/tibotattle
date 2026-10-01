@@ -685,7 +685,12 @@ describe("edge entry module surface", () => {
     expect(specifiers.every((specifier) => specifier?.startsWith("./"))).toBe(true);
     expect(edgeEntrySource).toContain("export * from \"./index\";");
     expect(edgeEntrySource).toContain("export { UploadIngressBudget } from \"./ingress-budget\";");
-    expect(edgeEntrySource).toMatch(/^import worker, \{ handleRequest \} from "\.\/index";$/mu);
+    // The Worker's default export, handleRequest and the contribution
+    // preflight, nothing else: the preflight is the one export the edge port
+    // adds to d43c8f92's index.ts.
+    expect(edgeEntrySource)
+      .toMatch(/^import worker, \{ contributionRequestPreflight, handleRequest \} from "\.\/index";$/mu);
+    expect(edgeEntrySource).toMatch(/^\s+contributionRequestPreflight,$/mu);
   });
 
   it("reads the deployed env only by name and never spreads it", () => {

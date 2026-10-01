@@ -618,8 +618,10 @@ const DEVICE_UPLOAD_AUTHORIZATION_HEADER =
  * Reject requests that cannot possibly be a contribution before spending a
  * Rate Limit key or shared ingress slot. The bound reader rechecks these
  * fields before consuming the body; this is a cheap pre-body fence only.
+ * Exported for the thin edge (edge-entry.ts), which runs it before its own
+ * address-keyed admission so a refused request spends no edge budget.
  */
-function contributionRequestPreflight(request: Request): string {
+export function contributionRequestPreflight(request: Request): string {
   if (hasSessionCookie(request.headers.get("cookie"))) {
     throw new ApiError(401, "UPLOAD_AUTH_INVALID");
   }

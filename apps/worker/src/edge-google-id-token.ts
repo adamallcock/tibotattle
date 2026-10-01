@@ -1,4 +1,5 @@
 import { encodeBase64Url } from "./crypto";
+import { EDGE_SUBREQUEST_REAL_IP, EDGE_SUBREQUEST_REAL_IP_HEADER } from "./edge-google-subrequest";
 
 /**
  * Google ID-token source for the thin edge.
@@ -31,6 +32,10 @@ import { encodeBase64Url } from "./crypto";
  * - The injected fetcher is always called as a plain function, never as a
  *   method: workerd's global fetch throws "Illegal invocation" when called
  *   with a foreign `this`, so passing `fetch` itself must keep working.
+ * - The exchange sets x-real-ip to EDGE_SUBREQUEST_REAL_IP: an exchange runs
+ *   inside a client request, and Cloudflare would otherwise put that client's
+ *   address in x-real-ip of this subrequest to Google. It cannot keep it out
+ *   of CF-Connecting-IP (edge-google-subrequest.ts).
  *
  * Redirects are refused with `redirect: "manual"` plus the exact-200 check.
  * workerd rejects `redirect: "error"` outright ("won't be implemented since it
@@ -449,6 +454,7 @@ async function mintIdToken(context: MintContext, nowMilliseconds: number): Promi
         headers: {
           accept: "application/json",
           "content-type": "application/x-www-form-urlencoded",
+          [EDGE_SUBREQUEST_REAL_IP_HEADER]: EDGE_SUBREQUEST_REAL_IP,
         },
         body,
         redirect: "manual",

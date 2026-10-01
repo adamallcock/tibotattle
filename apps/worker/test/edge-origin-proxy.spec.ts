@@ -26,12 +26,14 @@ import {
   parseEdgeOriginConfiguration,
 } from "../src/edge-origin-contract";
 import type { EdgeOriginConfiguration } from "../src/edge-origin-contract";
+import { EDGE_SUBREQUEST_REAL_IP, EDGE_SUBREQUEST_REAL_IP_HEADER } from "../src/edge-google-subrequest";
 import {
   EDGE_ADMIN_API_ROUTE_IDS,
   EDGE_DISTRIBUTION_MERGE_SKIP_REASONS,
   EDGE_PROXY_LOG_EVENTS,
   EDGE_PROXY_OPTIONS_INVALID,
   EDGE_PROXY_UPSTREAM_FAILURE_CODES,
+  EDGE_PRE_ADMISSION_GUARDS,
   classifyEdgeRequest,
   createEdgeOriginProxy,
 } from "../src/edge-origin-proxy";
@@ -40,7 +42,8 @@ import type {
   EdgeOriginProxyOptions,
   EdgeRequestClass,
 } from "../src/edge-origin-proxy";
-import { handleRequest } from "../src/index";
+import { contributionRequestPreflight, handleRequest } from "../src/index";
+import { MAX_REQUEST_BYTES } from "../src/constants";
 import { WORKER_ROUTE_POLICY } from "../src/route-registry";
 import type { WorkerRouteDefinition } from "../src/route-registry";
 
@@ -59,6 +62,9 @@ const CLIENT_KEY_SECRET = "edge-proxy-spec-synthetic-client-key-secret-0000";
 const ID_TOKEN = "eyJzeW50aGV0aWMiOiJoZWFkZXIifQ.eyJzeW50aGV0aWMiOiJjbGFpbXMifQ.c3ludGhldGljLXNpZ25hdHVyZQ";
 const COOKIE_VALUE = "um_session=synthetic-cookie-value-0001";
 const AUTHORIZATION_VALUE = "Bearer synthetic-device-bearer-value-0001";
+/** The shape index.ts's contribution preflight accepts; a synthetic credential. */
+const UPLOAD_AUTHORIZATION_VALUE = `Upload um_device_upload_00000000-0000-4000-8000-000000000001.${"A".repeat(43)}`;
+const SESSION_COOKIE = "__Host-usage_monitor_session=synthetic-session-value-0001";
 const BODY_MARKER = "synthetic-body-marker-0001";
 const ACCESS_TEAM_DOMAIN = "synthetic.cloudflareaccess.com";
 const ACCESS_AUD = "b".repeat(64);
@@ -97,6 +103,8 @@ const issuedSecrets = new Set<string>([
   DISTRIBUTION_API_TOKEN,
   "synthetic-cookie-value-0001",
   "synthetic-device-bearer-value-0001",
+  UPLOAD_AUTHORIZATION_VALUE,
+  "synthetic-session-value-0001",
 ]);
 
 function base64UrlBytes(value: Uint8Array): string {
@@ -271,6 +279,7 @@ function harness(options: HarnessOptions = {}): Harness {
       handled.push(env);
       return (options.handle ?? handleRequest)(request, env);
     },
+    contributionRequestPreflight,
     idTokenSource: {
       getToken: () => {
         tokens += 1;
@@ -349,6 +358,22 @@ function requestFor(
       ...init.headers,
     },
     body: bodied ? (init.body ?? `{"marker":"${BODY_MARKER}"}`) : null,
+  });
+}
+
+/**
+ * requestFor plus what every pre-admission guard admits: the request's own
+ * origin (assertSameOrigin) and a well-formed upload bearer (the contribution
+ * preflight). No session cookie.
+ */
+function admittedRequestFor(
+  origin: string,
+  route: WorkerRouteDefinition,
+  init: RequestOptions = {},
+): Request {
+  return requestFor(origin, route, {
+    ...init,
+    headers: { origin, authorization: UPLOAD_AUTHORIZATION_VALUE, ...init.headers },
   });
 }
 
@@ -466,6 +491,7 @@ describe("createEdgeOriginProxy options", () => {
     return {
       config: CONFIG,
       handleRequest,
+      contributionRequestPreflight,
       idTokenSource: { getToken: async () => ID_TOKEN },
       clientKeySecret: CLIENT_KEY_SECRET,
       limiters: {},
@@ -481,6 +507,8 @@ describe("createEdgeOriginProxy options", () => {
       { config: { ...CONFIG, upstreamOrigin: "https://origin.example.test" } },
       { config: { ...CONFIG, invokerServiceAccount: "someone@example.test" } },
       { handleRequest: undefined },
+      { contributionRequestPreflight: undefined },
+      { contributionRequestPreflight: "preflight" },
       { idTokenSource: {} },
       { clientKeySecret: "x".repeat(31) },
       { limiters: null },
@@ -883,7 +911,7 @@ describe("admission", () => {
         const reference = recordingLimiters(scenario.answer);
         const expected = await evaluateEdgeAdmission({
           routeId,
-          request: requestFor(PUBLIC_ORIGIN, route),
+          request: admittedRequestFor(PUBLIC_ORIGIN, route),
           limiters: reference.limiters,
           clientKeySecret: CLIENT_KEY_SECRET,
         });
@@ -891,7 +919,7 @@ describe("admission", () => {
         expect(expected!.outcome).toBe(expectedOutcome);
 
         const h = harness({ limiterAnswer: scenario.answer });
-        await h.proxy(requestFor(PUBLIC_ORIGIN, route), localEnv(), guardEnv());
+        await h.proxy(admittedRequestFor(PUBLIC_ORIGIN, route), localEnv(), guardEnv());
         const upstream = onlyUpstream(h);
         expect(upstream.headers.get(EDGE_HEADERS.admission), routeId)
           .toBe(encodeEdgeAdmission(expected!));
@@ -928,11 +956,19 @@ describe("admission", () => {
 
 describe("request bodies", () => {
   const contributions = exactRoute("contributions");
+  // A body route with no pre-admission guard, so only the edge's own forward
+  // cap stands between the request and admission.
+  const deviceDisconnect = exactRoute("device_disconnect");
+
+  it("has no pre-admission guard on the cap's reference route", () => {
+    expect(Object.hasOwn(EDGE_PRE_ADMISSION_GUARDS, deviceDisconnect.id)).toBe(false);
+    expect(deviceDisconnect.methods).toStrictEqual(["POST"]);
+  });
 
   it("refuses a declared length above 8 MiB locally, before any limiter", async () => {
     const h = harness();
     const response = await h.proxy(
-      requestFor(PUBLIC_ORIGIN, contributions, {
+      requestFor(PUBLIC_ORIGIN, deviceDisconnect, {
         headers: { "content-length": String(EDGE_MAX_FORWARD_BODY_BYTES + 1) },
       }),
       localEnv(),
@@ -952,7 +988,7 @@ describe("request bodies", () => {
     for (const declared of [String(EDGE_MAX_FORWARD_BODY_BYTES), "12abc", "-1", "1e3"]) {
       const h = harness();
       await h.proxy(
-        requestFor(PUBLIC_ORIGIN, contributions, { headers: { "content-length": declared } }),
+        requestFor(PUBLIC_ORIGIN, deviceDisconnect, { headers: { "content-length": declared } }),
         localEnv(),
         guardEnv(),
       );
@@ -992,7 +1028,7 @@ describe("request bodies", () => {
     const responsePromise = h.proxy(
       new Request(`${PUBLIC_ORIGIN}${contributions.pathname}`, {
         method: "POST",
-        headers: { "content-type": "application/json", authorization: AUTHORIZATION_VALUE },
+        headers: { "content-type": "application/json", authorization: UPLOAD_AUTHORIZATION_VALUE },
         body: clientBody,
       }),
       localEnv(),
@@ -1010,6 +1046,222 @@ describe("request bodies", () => {
     clientController.enqueue(encoder.encode(`"${BODY_MARKER}"}`));
     clientController.close();
     expect(await response.text()).toBe(`{"first":"${BODY_MARKER}"}`);
+  });
+});
+
+describe("pre-admission guards", () => {
+  const contributions = exactRoute("contributions");
+  const NINE_MIB = String(9 * 1024 * 1024);
+
+  async function expectLocalRefusal(
+    h: Harness,
+    response: Response,
+    status: number,
+    code: string,
+    label: string,
+  ): Promise<void> {
+    expect(response.status, label).toBe(status);
+    expect(Object.fromEntries(response.headers), label).toStrictEqual({ ...JSON_HEADERS });
+    const body = await envelope(response) as { error: { code: string; requestId: string } };
+    expect(Object.keys(body.error), label).toStrictEqual(["code", "requestId"]);
+    expect(body.error.code, label).toBe(code);
+    expect(isEdgeRequestId(body.error.requestId), label).toBe(true);
+    expect(h.fetched, label).toHaveLength(0);
+    expect(h.tokenCalls(), label).toBe(0);
+    expect(h.limiterCalls, label).toStrictEqual([]);
+    expect(h.handled, label).toHaveLength(0);
+  }
+
+  it("guards only EP-1 policy routes, from a frozen prototype-free map", () => {
+    expect(Object.isFrozen(EDGE_PRE_ADMISSION_GUARDS)).toBe(true);
+    expect(Object.getPrototypeOf(EDGE_PRE_ADMISSION_GUARDS)).toBeNull();
+    expect(Object.hasOwn(EDGE_PRE_ADMISSION_GUARDS, "constructor")).toBe(false);
+    for (const routeId of Object.keys(EDGE_PRE_ADMISSION_GUARDS)) {
+      expect(Object.hasOwn(EDGE_ADMISSION_POLICY, routeId), routeId).toBe(true);
+    }
+    expect({ ...EDGE_PRE_ADMISSION_GUARDS }).toStrictEqual({
+      accountless_enrollment: "session_cookie",
+      accountless_ownership: "session_cookie",
+      accountless_telemetry_v12_authorization: "session_cookie",
+      accountless_telemetry_performance_authorization: "session_cookie",
+      accountless_renewal: "session_cookie",
+      enroll: "same_origin",
+      identity_google_start: "same_origin",
+      identity_apple_start: "same_origin",
+      contributions: "contribution_preflight",
+    });
+  });
+
+  it("answers the contribution preflight in the Worker's order, before the 8 MiB cap and any limiter", async () => {
+    const rows: { name: string; headers: Record<string, string>; status: number; code: string }[] = [
+      // d43c8f92 index.ts:621-644: session cookie, content type, declared
+      // length, body, then the Upload bearer.
+      { name: "9 MiB, text/plain", headers: { "content-type": "text/plain", "content-length": NINE_MIB }, status: 415, code: "CONTENT_TYPE_INVALID" },
+      { name: "9 MiB, session cookie", headers: { cookie: SESSION_COOKIE, "content-length": NINE_MIB }, status: 401, code: "UPLOAD_AUTH_INVALID" },
+      { name: "session cookie and text/plain", headers: { cookie: SESSION_COOKIE, "content-type": "text/plain" }, status: 401, code: "UPLOAD_AUTH_INVALID" },
+      { name: "content type is case-sensitive", headers: { "content-type": "Application/JSON" }, status: 415, code: "CONTENT_TYPE_INVALID" },
+      { name: "9 MiB, JSON", headers: { "content-length": NINE_MIB }, status: 413, code: "BODY_TOO_LARGE" },
+      { name: "one byte over the Worker cap", headers: { "content-length": String(MAX_REQUEST_BYTES + 1) }, status: 413, code: "BODY_TOO_LARGE" },
+      { name: "malformed declared length", headers: { "content-length": "12abc" }, status: 400, code: "BODY_INVALID" },
+      { name: "no Upload bearer", headers: { authorization: AUTHORIZATION_VALUE }, status: 401, code: "UPLOAD_AUTH_INVALID" },
+    ];
+    for (const row of rows) {
+      const h = harness();
+      const response = await h.proxy(
+        admittedRequestFor(PUBLIC_ORIGIN, contributions, { headers: row.headers }),
+        localEnv(),
+        guardEnv(),
+      );
+      await expectLocalRefusal(h, response, row.status, row.code, row.name);
+    }
+    const noBody = harness();
+    await expectLocalRefusal(
+      noBody,
+      await noBody.proxy(
+        new Request(`${PUBLIC_ORIGIN}${contributions.pathname}`, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: UPLOAD_AUTHORIZATION_VALUE },
+        }),
+        localEnv(),
+        guardEnv(),
+      ),
+      400,
+      "BODY_INVALID",
+      "no body",
+    );
+  });
+
+  it("forwards a contribution the preflight admits, with its admission", async () => {
+    const admitted: Record<string, string>[] = [
+      {},
+      { cookie: "unrelated=1" },
+      { "content-type": "application/json; charset=utf-8" },
+      { "content-length": String(MAX_REQUEST_BYTES) },
+    ];
+    for (const headers of admitted) {
+      const h = harness();
+      await h.proxy(admittedRequestFor(PUBLIC_ORIGIN, contributions, { headers }), localEnv(), guardEnv());
+      expect(onlyUpstream(h).headers.get(EDGE_HEADERS.admission), JSON.stringify(headers))
+        .toBe("v1;upload_ingress;allowed");
+      expect(h.limiterCalls, JSON.stringify(headers)).toHaveLength(2);
+    }
+  });
+
+  it("refuses a session cookie on every accountless route before any limiter, whatever the body size", async () => {
+    const accountless = Object.entries(EDGE_PRE_ADMISSION_GUARDS)
+      .filter(([, guard]) => guard === "session_cookie")
+      .map(([routeId]) => routeId);
+    expect(accountless).toHaveLength(5);
+    for (const routeId of accountless) {
+      const extras: Record<string, string>[] = [{}, { "content-length": NINE_MIB }];
+      for (const extra of extras) {
+        const h = harness();
+        const response = await h.proxy(
+          admittedRequestFor(PUBLIC_ORIGIN, exactRoute(routeId), {
+            headers: { cookie: `other=1; ${SESSION_COOKIE}`, ...extra },
+          }),
+          localEnv(),
+          guardEnv(),
+        );
+        await expectLocalRefusal(h, response, 401, "AUTH_INVALID", `${routeId} ${JSON.stringify(extra)}`);
+      }
+      const admitted = harness();
+      await admitted.proxy(
+        admittedRequestFor(PUBLIC_ORIGIN, exactRoute(routeId), { headers: { cookie: "other=1" } }),
+        localEnv(),
+        guardEnv(),
+      );
+      expect(upstreamOnly(admitted), routeId).toHaveLength(1);
+      expect(admitted.limiterCalls, routeId).toHaveLength(2);
+    }
+  });
+
+  it("refuses a cross-origin enrollment or sign-in start before any limiter", async () => {
+    const sameOrigin = Object.entries(EDGE_PRE_ADMISSION_GUARDS)
+      .filter(([, guard]) => guard === "same_origin")
+      .map(([routeId]) => routeId);
+    expect(sameOrigin.sort()).toStrictEqual(["enroll", "identity_apple_start", "identity_google_start"]);
+    for (const routeId of sameOrigin) {
+      const route = exactRoute(routeId);
+      const crossOrigin: Record<string, string>[] = [
+        { origin: "https://evil.example" },
+        { origin: ADMIN_ORIGIN },
+        { "sec-fetch-site": "cross-site" },
+        { origin: PUBLIC_ORIGIN, "sec-fetch-site": "same-site" },
+      ];
+      for (const headers of crossOrigin) {
+        const h = harness();
+        const response = await h.proxy(admittedRequestFor(PUBLIC_ORIGIN, route, { headers }), localEnv(), guardEnv());
+        await expectLocalRefusal(h, response, 403, "CSRF_INVALID", `${routeId} ${JSON.stringify(headers)}`);
+      }
+      const missing = harness();
+      await expectLocalRefusal(
+        missing,
+        await missing.proxy(requestFor(PUBLIC_ORIGIN, route), localEnv(), guardEnv()),
+        403,
+        "CSRF_INVALID",
+        `${routeId} without origin`,
+      );
+      const admitted = harness();
+      await admitted.proxy(
+        admittedRequestFor(PUBLIC_ORIGIN, route, { headers: { "sec-fetch-site": "same-origin" } }),
+        localEnv(),
+        guardEnv(),
+      );
+      expect(upstreamOnly(admitted), routeId).toHaveLength(1);
+    }
+  });
+
+  it("runs the admin-host chokepoint before a guard", async () => {
+    const refused = harness();
+    const response = await refused.proxy(
+      admittedRequestFor(ADMIN_ORIGIN, contributions, { headers: { cookie: SESSION_COOKIE } }),
+      localEnv(),
+      guardEnv(),
+    );
+    expect(response.status).toBe(403);
+    expect((await envelope(response) as { error: { code: string } }).error.code).toBe("ACCESS_REQUIRED");
+    expectNoUpstreamCalls(refused);
+    const owner = harness();
+    await expectLocalRefusal(
+      owner,
+      await owner.proxy(
+        admittedRequestFor(ADMIN_ORIGIN, contributions, {
+          headers: { cookie: SESSION_COOKIE, "cf-access-jwt-assertion": await accessJwt() },
+        }),
+        localEnv(),
+        guardEnv(),
+      ),
+      401,
+      "UPLOAD_AUTH_INVALID",
+      "owner on the admin host",
+    );
+  });
+
+  it("renders a preflight failure that is not an ApiError as handleRequest does, 500 INTERNAL_ERROR", async () => {
+    const fetched: Request[] = [];
+    const { calls, limiters } = recordingLimiters();
+    const proxy = createEdgeOriginProxy({
+      config: CONFIG,
+      handleRequest,
+      contributionRequestPreflight: () => {
+        throw new TypeError("synthetic preflight failure");
+      },
+      idTokenSource: { getToken: async () => ID_TOKEN },
+      clientKeySecret: CLIENT_KEY_SECRET,
+      limiters,
+      distribution: null,
+      fetcher: async (request) => {
+        fetched.push(request);
+        return markedResponse();
+      },
+      logger: { warn: (line: string) => ALL_LOG_LINES.push(line), error: (line: string) => ALL_LOG_LINES.push(line) },
+    });
+    const response = await proxy(admittedRequestFor(PUBLIC_ORIGIN, contributions), localEnv(), guardEnv());
+    expect(response.status).toBe(500);
+    expect((await envelope(response) as { error: { code: string } }).error.code).toBe("INTERNAL_ERROR");
+    expect(fetched).toHaveLength(0);
+    expect(calls).toHaveLength(0);
   });
 });
 
@@ -1071,7 +1323,9 @@ describe("upstream request headers", () => {
       EDGE_HEADERS.host,
       EDGE_HEADERS.requestId,
       EDGE_HEADERS.invokerToken,
+      EDGE_SUBREQUEST_REAL_IP_HEADER,
     ].sort());
+    expect(upstream.headers.get(EDGE_SUBREQUEST_REAL_IP_HEADER)).toBe(EDGE_SUBREQUEST_REAL_IP);
     for (const [name, value] of Object.entries(allowlisted)) {
       expect(upstream.headers.get(name), name).toBe(value);
     }
@@ -1108,7 +1362,9 @@ describe("upstream request headers", () => {
       EDGE_HEADERS.host,
       EDGE_HEADERS.requestId,
       EDGE_HEADERS.invokerToken,
+      EDGE_SUBREQUEST_REAL_IP_HEADER,
     ].sort());
+    expect(upstream.headers.get(EDGE_SUBREQUEST_REAL_IP_HEADER)).toBe(EDGE_SUBREQUEST_REAL_IP);
     expect(upstream.headers.get("cf-access-jwt-assertion")).toBe(token);
     const forbidden = await forbiddenValues();
     for (const [name, value] of upstream.headers) {
@@ -1116,6 +1372,36 @@ describe("upstream request headers", () => {
         expect(value.includes(candidate), `${name} carries a client-derived value`).toBe(false);
       }
     }
+  });
+
+  it("sets x-real-ip to the constant, once, on every forwarded route of both hosts", async () => {
+    // Cloudflare fills x-real-ip of a subrequest for a non-Cloudflare host
+    // with the client address unless the Worker sets it, and only x-real-ip
+    // can be set (CF-Connecting-IP cannot); see edge-google-subrequest.ts.
+    expect(EDGE_SUBREQUEST_REAL_IP_HEADER).toBe("x-real-ip");
+    expect(EDGE_SUBREQUEST_REAL_IP).toBe("2a06:98c0:3600::103");
+    const owner = await accessJwt();
+    let checked = 0;
+    for (const route of WORKER_ROUTE_POLICY) {
+      for (const origin of [PUBLIC_ORIGIN, ADMIN_ORIGIN]) {
+        const request = admittedRequestFor(origin, route, {
+          headers: {
+            "x-real-ip": CLIENT_ADDRESS,
+            "cf-connecting-ip": CLIENT_ADDRESS,
+            ...(origin === ADMIN_ORIGIN ? { "cf-access-jwt-assertion": owner } : {}),
+          },
+        });
+        if (classifyEdgeRequest(request, localEnv()).kind !== "forward") continue;
+        const h = harness();
+        await h.proxy(request, localEnv(), guardEnv());
+        const forwarded = upstreamOnly(h);
+        expect(forwarded, `${origin} ${route.id}`).toHaveLength(1);
+        expect(forwarded[0]!.headers.get("x-real-ip"), `${origin} ${route.id}`).toBe(EDGE_SUBREQUEST_REAL_IP);
+        expect(forwarded[0]!.headers.has("cf-connecting-ip"), `${origin} ${route.id}`).toBe(false);
+        checked += 1;
+      }
+    }
+    expect(checked).toBeGreaterThan(80);
   });
 
   it("builds the upstream URL on the configured origin with the request path and query", async () => {

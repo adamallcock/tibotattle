@@ -31,6 +31,8 @@ export const MATRIX_VALUES = Object.freeze({
 
 export const UNKNOWN_DEVICE_BEARER = "unknown_device_bearer";
 export const UNKNOWN_UPLOAD_BEARER = "unknown_upload_bearer";
+/** Resolved to the row's own host origin: a same-origin browser request. */
+export const SAME_ORIGIN = "same_origin";
 
 /** The six admin API route ids (E4's EDGE_ADMIN_API_ROUTE_IDS). */
 export const ADMIN_API_ROUTE_IDS = Object.freeze([
@@ -202,22 +204,33 @@ export function forwardedRows({ registry }) {
     }
   }
   const upload = { "content-type": "application/json", authorization: UNKNOWN_UPLOAD_BEARER };
+  // The Worker's request-only refusals before its limiter (the contribution
+  // preflight, a session cookie on an accountless route, assertSameOrigin on
+  // enrollment and sign-in start) are answered at the edge, before any budget
+  // is spent, so these rows are local. A declared body over 8 MiB still meets
+  // the earlier refusal first, as in the Worker.
   rows.push(
     row({ id: "contributions-session-cookie", routeId: "contributions", method: "POST", path: "/api/v1/contributions",
       headers: { ...upload, cookie: MATRIX_VALUES.sessionCookie }, body: "{}",
-      comparators: ["worker", "transparency"], expect: { status: 401, code: "UPLOAD_AUTH_INVALID" } }),
+      comparators: ["worker", "local"], expect: { status: 401, code: "UPLOAD_AUTH_INVALID" } }),
     row({ id: "contributions-content-type", routeId: "contributions", method: "POST", path: "/api/v1/contributions",
       headers: { ...upload, "content-type": "text/plain" }, body: "{}",
-      comparators: ["worker", "transparency"], expect: { status: 415, code: "CONTENT_TYPE_INVALID" } }),
+      comparators: ["worker", "local"], expect: { status: 415, code: "CONTENT_TYPE_INVALID" } }),
     row({ id: "contributions-declared-3mib", routeId: "contributions", method: "POST", path: "/api/v1/contributions",
       headers: upload, bodyBytes: 3 * 1024 * 1024,
-      comparators: ["worker", "transparency"], expect: { status: 413, code: "BODY_TOO_LARGE" } }),
+      comparators: ["worker", "local"], expect: { status: 413, code: "BODY_TOO_LARGE" } }),
     row({ id: "contributions-declared-9mib", routeId: "contributions", method: "POST", path: "/api/v1/contributions",
       headers: upload, bodyBytes: 9 * 1024 * 1024,
       comparators: ["worker", "local"], expect: { status: 413, code: "BODY_TOO_LARGE" } }),
+    row({ id: "contributions-9mib-content-type", routeId: "contributions", method: "POST", path: "/api/v1/contributions",
+      headers: { ...upload, "content-type": "text/plain" }, bodyBytes: 9 * 1024 * 1024,
+      comparators: ["worker", "local"], expect: { status: 415, code: "CONTENT_TYPE_INVALID" } }),
+    row({ id: "contributions-9mib-session-cookie", routeId: "contributions", method: "POST", path: "/api/v1/contributions",
+      headers: { ...upload, cookie: MATRIX_VALUES.sessionCookie }, bodyBytes: 9 * 1024 * 1024,
+      comparators: ["worker", "local"], expect: { status: 401, code: "UPLOAD_AUTH_INVALID" } }),
     row({ id: "contributions-no-upload-header", routeId: "contributions", method: "POST", path: "/api/v1/contributions",
       headers: { "content-type": "application/json" }, body: "{}",
-      comparators: ["worker", "transparency"], expect: { status: 401, code: "UPLOAD_AUTH_INVALID" } }),
+      comparators: ["worker", "local"], expect: { status: 401, code: "UPLOAD_AUTH_INVALID" } }),
     row({ id: "contributions-chunked-3mib", routeId: "contributions", method: "POST", path: "/api/v1/contributions",
       headers: upload, bodyBytes: 3 * 1024 * 1024, chunked: true,
       comparators: ["worker", "transparency"], expect: { status: 413, code: "BODY_TOO_LARGE" } }),
@@ -233,7 +246,26 @@ export function forwardedRows({ registry }) {
     row({ id: "accountless-enrollment-session-cookie", routeId: "accountless_enrollment", method: "POST",
       path: "/api/v1/accountless/enrollment",
       headers: { "content-type": "application/json", cookie: MATRIX_VALUES.sessionCookie }, body: "{}",
-      comparators: ["worker", "transparency"], expect: { status: 401, code: "AUTH_INVALID" } }),
+      comparators: ["worker", "local"], expect: { status: 401, code: "AUTH_INVALID" } }),
+    row({ id: "accountless-enrollment-9mib-session-cookie", routeId: "accountless_enrollment", method: "POST",
+      path: "/api/v1/accountless/enrollment",
+      headers: { "content-type": "application/json", cookie: MATRIX_VALUES.sessionCookie }, bodyBytes: 9 * 1024 * 1024,
+      comparators: ["worker", "local"], expect: { status: 401, code: "AUTH_INVALID" } }),
+    row({ id: "accountless-renewal-session-cookie", routeId: "accountless_renewal", method: "POST",
+      path: routeById(registry, "accountless_renewal").pathname,
+      headers: { "content-type": "application/json", cookie: `${MATRIX_VALUES.unrelatedCookie}; ${MATRIX_VALUES.sessionCookie}` },
+      body: "{}", comparators: ["worker", "local"], expect: { status: 401, code: "AUTH_INVALID" } }),
+    row({ id: "enroll-foreign-origin", routeId: "enroll", method: "POST", path: routeById(registry, "enroll").pathname,
+      headers: { "content-type": "application/json", origin: "https://evil.example" }, body: "{}",
+      comparators: ["worker", "local"], expect: { status: 403, code: "CSRF_INVALID" } }),
+    row({ id: "google-start-no-origin", routeId: "identity_google_start", method: "POST",
+      path: routeById(registry, "identity_google_start").pathname,
+      headers: { "content-type": "application/json" }, body: "{}",
+      comparators: ["worker", "local"], expect: { status: 403, code: "CSRF_INVALID" } }),
+    row({ id: "apple-start-cross-site", routeId: "identity_apple_start", method: "POST",
+      path: routeById(registry, "identity_apple_start").pathname,
+      headers: { "content-type": "application/json", origin: SAME_ORIGIN, "sec-fetch-site": "cross-site" }, body: "{}",
+      comparators: ["worker", "local"], expect: { status: 403, code: "CSRF_INVALID" } }),
     row({ id: "health", routeId: "health", path: "/api/health", comparators: ["transparency"],
       expect: { status: 200 } }),
     row({ id: "callback-query", routeId: "identity_google_callback",
@@ -261,7 +293,10 @@ export function sweepRows({ registry, servedRouteIds }) {
         routeId: route.id,
         method,
         path: route.pathname + (route.id === "community_daily" ? MATRIX_VALUES.dailyQuery : ""),
+        // Same-origin, with a well-formed bearer and JSON body: every
+        // request-only guard the edge runs before admission admits it.
         headers: {
+          origin: SAME_ORIGIN,
           authorization: route.id === "contributions" ? UNKNOWN_UPLOAD_BEARER : UNKNOWN_DEVICE_BEARER,
           ...(post ? { "content-type": "application/json" } : {}),
         },

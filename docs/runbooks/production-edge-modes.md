@@ -37,7 +37,9 @@ Authority:
 
 - No load balancer in front of Cloud Run, no Transform Rule, no DNS change and
   no custom-domain removal or move. The three hostnames stay custom domains of
-  the same Worker in every mode.
+  the same Worker in every mode. Option A of OD-E6 (a Cloudflare-proxied
+  origin hostname) would change this rule; it needs its own owner decision
+  first.
 - No guard-only Worker. The Sparkle appcast guard stays in the production
   Worker.
 - No deploy from the checked-in `env.production`, and no raw `wrangler deploy`.
@@ -64,6 +66,15 @@ Authority:
   ([section 7](#7-local-proof-and-the-optional-live-check)) must also be green
   for the edge commit against the origin commit. E12's cross-line option builds
   the edge from the edge-port tree and checks that the contract blob matches.
+- No gcp deploy runs until the owner has decided OD-E6. Cloudflare adds the
+  client address, in `CF-Connecting-IP`, to every subrequest the edge sends to a
+  `*.run.app` origin and to Google's token endpoint, and a Worker cannot remove
+  it. An owner-authorized staging edge on Cloudflare's network must also have
+  shown which address-bearing headers reach the origin for the chosen option,
+  recording header names and whether each value is the edge's constant, never
+  the values. See
+  [the decision record, section 5](../decisions/2026-10-01-thin-worker-edge-proxy.md#5-client-address-privacy).
+  E10 does not check this, so the operator must confirm it before the switch.
 - Before the first production use of each mode, rehearse worker, fenced (with
   an EP-8 drill) and gcp on a staging Worker with its own hostnames, Access
   application and Cloud Run service. EP-9 provides a staging overlay for this.
@@ -328,7 +339,8 @@ creates.
     a Cloud Run front-end emulator;
   - EP-6 and the real fast-path origin on PostgreSQL 17;
   - shipped-client flows through the edge;
-  - privacy and transparency assertions on every forwarded exchange;
+  - privacy and transparency assertions on every forwarded exchange, for the
+    headers the edge's code and workerd send;
   - parity with the unchanged Worker on comparable rows, including admission
     under the checked-in production limits.
 - **Behaviour it found that operators should know:**
@@ -341,7 +353,8 @@ creates.
   - the Worker's own upload budget (1200 starts per minute) sheds load before
     the 3000/60 ingress limits; the fast-path origin has no such budget.
 - **It does not qualify:** Google's front end, Cloudflare's network and real
-  client addresses, Workers Rate Limiting across locations, Access, custom
+  client addresses (in particular the `CF-Connecting-IP` Cloudflare adds to a
+  subrequest for a non-Cloudflare host, which Miniflare does not add), Workers Rate Limiting across locations, Access, custom
   domains, the production origin composition (CR-6 and CR-7) or production
   data.
 
