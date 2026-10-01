@@ -1,6 +1,11 @@
 /**
  * One-call composition of the v1.1 intake family for the PostgreSQL origin
- * (GCP fast path, IN-2), for the integration lead's server.mjs wiring.
+ * (GCP fast path, IN-2). ../origin-intake-composition.mjs composes it for
+ * server.mjs: it mounts `dispatch` on the private origin before the v1.2
+ * dispatch, registers the envelope next to v1.2 with the
+ * telemetry-contribution-v1.1 format, and the contributions preamble claims
+ * non-v1.2 envelopes under the v1.1 accountless gate. The notes below record
+ * why each hand-off has its shape.
  *
  * It binds the four v1.1 route modules and the telemetry-envelope-v1.1
  * registration to the origin's PostgreSQL adapters. `adapters` are the

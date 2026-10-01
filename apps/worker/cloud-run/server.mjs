@@ -32,7 +32,7 @@ import {
   assertUploadAuthorizationAllowed,
   assertUploadAuthorizationBindings,
 } from "../src/admission.ts";
-import { MAX_REQUEST_BYTES } from "../src/constants.ts";
+import { MAX_REQUEST_BYTES, TELEMETRY_CONSENT_VERSION } from "../src/constants.ts";
 import { readBoundedRequestBody } from "../src/bounded-body.ts";
 import { createGcsQuarantineObjectStore } from "../src/gcs-quarantine-object-store.ts";
 import { createGcsErasureBucketHistoryProof } from "../src/gcs-erasure-object-store.ts";
@@ -99,6 +99,19 @@ import { validateTelemetryV12Envelope } from "@app-usagemonitor/telemetry-contra
 import { assertPostgresTelemetryTransportWriteAllowed } from "../src/postgres-telemetry-format-authority.ts";
 import { TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION } from "@app-usagemonitor/telemetry-contract";
 import { hasPostgresDeletionTombstone } from "../src/postgres-ledger-authority.ts";
+// Legacy intake adapters (IN-2 v1.1, IN-3 v1.0/v0.1), composed by
+// ./origin-intake-composition.mjs beside the v1.2 routes.
+import * as postgresTelemetryV11Live from "../src/postgres-telemetry-v11-live-admission.ts";
+import * as postgresDeviceBearerAuth from "../src/postgres-device-bearer-auth.ts";
+import * as postgresTypedV12Transport from "../src/postgres-typed-v12-transport.ts";
+import * as postgresLedgerAuthority from "../src/postgres-ledger-authority.ts";
+import * as postgresPersonalDevices from "../src/postgres-personal-devices.ts";
+import * as postgresCollectionControls from "../src/postgres-collection-controls.ts";
+import * as workerCrypto from "../src/crypto.ts";
+import * as boundedBody from "../src/bounded-body.ts";
+import * as postgresLegacyContributionAdmission from "../src/postgres-legacy-contribution-admission.ts";
+import * as postgresTransportWriteAuthority from "../src/postgres-transport-write-authority.ts";
+import * as postgresUploadAuthorization from "../src/postgres-upload-authorization.ts";
 import { setTimingSafeEqualImplementation } from "../src/crypto.ts";
 import { createIamPool, createGoogleAccessTokenProvider, closeCloudSqlResources, normalizeIamUser } from "./cloud-sql.mjs";
 import {
@@ -117,9 +130,11 @@ import {
   createPostgresTestTelemetryV12ConsentDispatch,
   createPostgresTestV12DayManifestDispatch,
   createPostgresTestHealthDispatch,
+  createPostgresTestStorageReceiptCheck,
   dispatchCloudRunHostRequest,
   isPrivatePostgresTestHost,
 } from "./postgres-test-dispatch.mjs";
+import { createOriginIntakeComposition } from "./origin-intake-composition.mjs";
 import { Connector } from "@google-cloud/cloud-sql-connector";
 import { POSTGRES_RUNTIME_MIGRATIONS } from "../src/postgres-runtime-schema.ts";
 import { WORKER_ROUTE_POLICY } from "../src/route-registry.ts";
@@ -648,20 +663,71 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
           healthDispatch: googleHealthDispatch,
         })
         : null;
-      // Route modules may replace only the overridable built-ins, and only a
-      // fastpath-test origin mounts any tonight; the other modes build an
-      // empty registry, so every route keeps its built-in.
+      Object.freeze(admissionEnv);
+      const assertPostgresV12UploadAllowed = (pool, device, nowEpoch, { schema }) =>
+        assertPostgresTelemetryTransportWriteAllowed(
+          pool,
+          device,
+          TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+          { nowEpoch, schema },
+        );
+      // Legacy intake beside the v1.2 routes (IN-2 and IN-3 hand-offs): the
+      // v1.1, v1.0 and v0.1 envelopes with their upload-authorization
+      // formats, the upload-authorization route module and the v1.1 routes,
+      // all gated on the same migration receipts as the built-in routes.
+      const intake = createOriginIntakeComposition({
+        adapters: {
+          live: postgresTelemetryV11Live,
+          bearer: postgresDeviceBearerAuth,
+          transport: postgresTypedV12Transport,
+          ledgerAuthority: postgresLedgerAuthority,
+          personalDevices: postgresPersonalDevices,
+          controls: postgresCollectionControls,
+          crypto: workerCrypto,
+          boundedBody,
+          legacyAdmission: postgresLegacyContributionAdmission,
+          transportWriteAuthority: postgresTransportWriteAuthority,
+          uploadAuthorization: postgresUploadAuthorization,
+        },
+        primaryPool,
+        ledgerPool,
+        schemaOptions,
+        admissionEnv,
+        assertAdmissionBindings,
+        assertAttemptAllowed,
+        assertUploadAuthorizationBindings,
+        assertUploadAuthorizationAllowed,
+        assertV12UploadAllowed: assertPostgresV12UploadAllowed,
+        assertStorageCurrent: createPostgresTestStorageReceiptCheck({
+          primaryPool,
+          ledgerPool,
+          schemaOptions,
+          expectedMigrations: POSTGRES_RUNTIME_MIGRATIONS,
+        }),
+        routePolicy: WORKER_ROUTE_POLICY,
+        maxRequestBytes: MAX_REQUEST_BYTES,
+        socialConsentVersion: TELEMETRY_CONSENT_VERSION,
+        sourceNamespace: backend.sourceIdentity.sourceNamespace,
+        envelopePublicJwk,
+        envelopePrivateJwk,
+      });
+      // Route modules may replace only the overridable built-ins. Every mode
+      // that serves the v1.2 routes mounts the intake's upload-authorization
+      // module; only a fastpath-test origin adds the analytics-v2 module.
       const routeModules = createOriginRouteModuleRegistry({
-        modules: postgresTestMode === FASTPATH_TEST_MODE
-          ? fastpathTestRouteModules({
-            env: process.env,
-            primaryPool,
-            primarySchema: database.primary.schema,
-            createAnalyticsV2CommunityDailyRoute:
-              dependencies.createAnalyticsV2CommunityDailyRoute ?? null,
-            clock: dependencies.analyticsV2Clock ?? null,
-          })
-          : [],
+        modules: [
+          ...intake.routeModules,
+          ...(postgresTestMode === FASTPATH_TEST_MODE
+            ? fastpathTestRouteModules({
+              env: process.env,
+              primaryPool,
+              primarySchema: database.primary.schema,
+              createAnalyticsV2CommunityDailyRoute:
+                dependencies.createAnalyticsV2CommunityDailyRoute ?? null,
+              clock: dependencies.analyticsV2Clock ?? null,
+            })
+            : []),
+        ],
         routePolicy: WORKER_ROUTE_POLICY,
       });
       const routeModuleContext = Object.freeze({ origin: hostOrigin, hostMode: privateHost.mode });
@@ -688,6 +754,12 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
           if (origin === hostOrigin && ORIGIN_OVERRIDABLE_BUILT_INS.includes(pathname)) {
             const routeModule = routeModules.resolve(request.method, pathname);
             if (routeModule !== null) return routeModule.handler(request, routeModuleContext);
+          }
+          // The v1.1 intake routes answer every method of their own paths on
+          // the private origin (a wrong method gets the Worker's 405).
+          if (origin === hostOrigin && intake.pathnames.includes(pathname)) {
+            const response = await intake.dispatch(request);
+            if (response !== null) return response;
           }
           if (pathname === "/api/v1/community/daily") return communityDailyDispatch(request);
           if (pathname === "/api/v1/me/devices"
@@ -741,18 +813,12 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
           expectedMigrations: POSTGRES_RUNTIME_MIGRATIONS,
           privateOrigin: hostOrigin,
           healthDispatch,
-          admissionEnv: Object.freeze(admissionEnv),
+          admissionEnv,
           assertAdmissionBindings,
           assertAttemptAllowed,
           assertUploadAuthorizationBindings,
           assertUploadAuthorizationAllowed,
-          assertPostgresV12UploadAllowed: (pool, device, nowEpoch, { schema }) =>
-            assertPostgresTelemetryTransportWriteAllowed(
-              pool,
-              device,
-              TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
-              { nowEpoch, schema },
-            ),
+          assertPostgresV12UploadAllowed,
           createPostgresDeviceUploadAuthorization,
           authenticatePostgresDevice,
           disconnectPostgresAuthenticatedDevice,
@@ -779,6 +845,9 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
           envelopePrivateJwk,
           readBoundedRequestBody,
           maxRequestBytes: MAX_REQUEST_BYTES,
+          contributionEnvelopes: intake.contributionEnvelopes,
+          uploadAuthorizationFormats: intake.uploadAuthorizationFormats,
+          recordPostgresDeviceUploadReceipt: intake.recordPostgresDeviceUploadReceipt,
         })),
       };
     }

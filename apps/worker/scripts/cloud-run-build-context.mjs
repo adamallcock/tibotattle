@@ -81,6 +81,11 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/origin-route-modules.mjs", destination: "apps/worker/cloud-run/origin-route-modules.mjs" }),
   Object.freeze({ source: "cloud-run/origin-fastpath-mode.mjs", destination: "apps/worker/cloud-run/origin-fastpath-mode.mjs" }),
   Object.freeze({ source: "cloud-run/contribution-envelope-registry.mjs", destination: "apps/worker/cloud-run/contribution-envelope-registry.mjs" }),
+  // The legacy intake the origin composes (IN-2 v1.1, IN-3 v1.0/v0.1).
+  Object.freeze({ source: "cloud-run/origin-intake-composition.mjs", destination: "apps/worker/cloud-run/origin-intake-composition.mjs" }),
+  Object.freeze({ source: "cloud-run/upload-authorization-formats.mjs", destination: "apps/worker/cloud-run/upload-authorization-formats.mjs" }),
+  Object.freeze({ source: "cloud-run/envelopes", destination: "apps/worker/cloud-run/envelopes" }),
+  Object.freeze({ source: "cloud-run/routes", destination: "apps/worker/cloud-run/routes" }),
   Object.freeze({ source: "cloud-run/postgres-migrations.mjs", destination: "apps/worker/cloud-run/postgres-migrations.mjs" }),
   Object.freeze({ source: "cloud-run/cloud-sql.mjs", destination: "apps/worker/cloud-run/cloud-sql.mjs" }),
   Object.freeze({ source: "cloud-run/assets.mjs", destination: "apps/worker/cloud-run/assets.mjs" }),
