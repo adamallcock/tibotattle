@@ -97,7 +97,7 @@ const RETRY_FENCE = Object.freeze({
   cursor_sequence: "0",
   cursor_epoch: "0",
   policy_singleton: 1,
-  publication_state: "updating",
+  publication_state: "ready",
   policy_revision: "1",
   latest_sequence: "0",
   terminal_sequence: "0",
@@ -184,7 +184,7 @@ function harness({
   retainedPublication = RETAINED_PUBLICATION,
   retryFence = RETRY_FENCE,
   selectedDay = { v1_selected_records_present: false, v11_selected_records_present: false },
-  policy = { singleton: 1, publication_state: "updating", policy_revision: 1 },
+  policy = { singleton: 1, publication_state: "ready", policy_revision: 1 },
 } = {}) {
   const state = {
     controls: structuredClone(controls),
@@ -505,9 +505,40 @@ test("retry prepare refuses any changed retained event before enabling controls"
   assert.equal(h.events.filter(({ sql }) => sql === "ROLLBACK").length, 1);
 });
 
-test("prepare accepts ready policy at the exact singleton and revision", async () => {
+test("retry prepare still accepts a pre-retirement updating policy row in the retry fence and refuses any other fence", async () => {
+  // The A2 test deployment predates the upload-path retirement and holds
+  // publication_state='updating'; a retry there must keep working.
+  const accepted = harness({
+    controls: RESTORED,
+    prepared: true,
+    publicationCount: 1,
+    retryFence: { ...RETRY_FENCE, publication_state: "updating" },
+  });
+  const receipt = await preparePostgresCommunityDailyRetryTestActivation({
+    env: validEnv("prepare"), dependencies: accepted.dependencies,
+  });
+  assert.equal(receipt.status, "retry_prepared");
+  assert.equal(receipt.collectionControlsRevision, 5);
+  assert.deepEqual(accepted.state.controls, RETRY_ACTIVE);
+
+  for (const retryFence of [
+    { ...RETRY_FENCE, publication_state: "contained" },
+    { ...RETRY_FENCE, policy_revision: "2" },
+  ]) {
+    const h = harness({ controls: RESTORED, prepared: true, publicationCount: 1, retryFence });
+    await assert.rejects(preparePostgresCommunityDailyRetryTestActivation({
+      env: validEnv("prepare"), dependencies: h.dependencies,
+    }), /RETRY_FENCE_INVALID/u);
+    assert.equal(h.state.insertCount, 0);
+    assert.deepEqual(h.state.controls, RESTORED);
+    assert.equal(h.events.some(({ sql }) => sql.includes("SET revision=5")), false);
+    assert.equal(h.events.filter(({ sql }) => sql === "ROLLBACK").length, 1);
+  }
+});
+
+test("prepare still accepts a pre-retirement updating policy row at the exact singleton and revision", async () => {
   const h = harness({
-    policy: { singleton: 1, publication_state: "ready", policy_revision: 1 },
+    policy: { singleton: 1, publication_state: "updating", policy_revision: 1 },
   });
   const receipt = await preparePostgresCommunityDailyTestActivation({
     env: validEnv("prepare"), dependencies: h.dependencies,
@@ -521,11 +552,11 @@ test("prepare refuses missing or invalid publication policy before fixture inser
   const cases = [
     { policy: null, code: "POLICY_READ_FAILED" },
     {
-      policy: { singleton: 2, publication_state: "updating", policy_revision: 1 },
+      policy: { singleton: 2, publication_state: "ready", policy_revision: 1 },
       code: "POLICY_INVALID",
     },
     {
-      policy: { singleton: 1, publication_state: "updating", policy_revision: 2 },
+      policy: { singleton: 1, publication_state: "ready", policy_revision: 2 },
       code: "POLICY_INVALID",
     },
     {
@@ -670,7 +701,8 @@ test("retry restore refuses controls outside exact revision 5 without writes", a
   assert.equal(h.events.filter(({ sql }) => sql === "ROLLBACK").length, 1);
 });
 
-async function createDisposableSchema(pool, migrationRoot) {
+async function createDisposableSchema(pool, migrationRoot, { policyState = "ready" } = {}) {
+  assert.ok(policyState === "ready" || policyState === "updating");
   const schema = `a2_daily_activation_${randomBytes(6).toString("hex")}`;
   const runtimeRole = `${schema}_runtime`;
   const quoted = `"${schema}"`;
@@ -701,20 +733,25 @@ async function createDisposableSchema(pool, migrationRoot) {
       RETURNING singleton`);
     assert.equal(seedControls.rowCount, 1, "fresh migrations must match the exact contained baseline");
     assert.deepEqual(seedControls.rows, [{ singleton: 1 }]);
-    // Graph analytical mutation can leave the shared row `updating`; daily
-    // activation follows the publisher's exact policy revision, control, and
-    // caught-up cursor fences instead of requiring graph publication to be ready.
-    const seedPolicy = await pool.query(`UPDATE ${quoted}.publication_state
-      SET publication_state='updating',policy_revision=1 WHERE singleton=1
-      RETURNING singleton,publication_state,policy_revision`);
-    assert.equal(
-      seedPolicy.rowCount,
-      1,
-      "fresh migrations must have the singleton publication policy",
-    );
-    assert.equal(Number(seedPolicy.rows[0]?.singleton), 1);
-    assert.equal(seedPolicy.rows[0]?.publication_state, "updating");
-    assert.equal(Number(seedPolicy.rows[0]?.policy_revision), 1);
+    // publication_state is only the policy row: daily activation follows the
+    // publisher's exact policy revision, control, and caught-up cursor fences
+    // and never writes it. Fresh migrations leave it ready.
+    const policy = await pool.query(`SELECT singleton,publication_state,policy_revision
+      FROM ${quoted}.publication_state`);
+    assert.equal(policy.rowCount, 1, "fresh migrations must have the singleton publication policy");
+    assert.equal(Number(policy.rows[0]?.singleton), 1);
+    assert.equal(policy.rows[0]?.publication_state, "ready");
+    assert.equal(Number(policy.rows[0]?.policy_revision), 1);
+    if (policyState === "updating") {
+      // The pinned chain predates the upload-path retirement, and the A2 test
+      // deployment it mirrors holds an `updating` row. Keep activation proven
+      // against that row until the pins move past the promoted retirement,
+      // whose policy guard then refuses this UPDATE.
+      const seedPolicy = await pool.query(`UPDATE ${quoted}.publication_state
+        SET publication_state='updating' WHERE singleton=1 AND policy_revision=1
+        RETURNING publication_state`);
+      assert.deepEqual(seedPolicy.rows, [{ publication_state: "updating" }]);
+    }
     const privileges = await pool.query(`SELECT
       has_table_privilege($1,$2::regclass,'SELECT') AS migration_select,
       has_table_privilege($1,$2::regclass,'UPDATE') AS migration_update,
@@ -803,7 +840,7 @@ test("real disposable PostgreSQL 17 runs prepare, restore, conflict rollback, an
     migrationRoot = pinned.root;
     const migrations = pinned.migrations;
 
-    const preparedSchema = await createDisposableSchema(pool, migrationRoot);
+    const preparedSchema = await createDisposableSchema(pool, migrationRoot, { policyState: "updating" });
     created.push(preparedSchema);
     const config = disposableConfig(preparedSchema.schema);
     const migrationLockClient = await pool.connect();
