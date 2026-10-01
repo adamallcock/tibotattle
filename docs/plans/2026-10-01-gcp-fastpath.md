@@ -10,8 +10,11 @@ status: in-progress
 ## Status and claim boundary
 
 - This is an in-progress plan for the overnight build that started on
-  2026-10-01 at about 03:30 UTC (23:30 EDT on 2026-09-30). It describes
-  intended work, not implementation, deployment or release state.
+  2026-10-01 at about 03:30 UTC (23:30 EDT on 2026-09-30). Its architecture
+  and backlog sections describe intended work. What the night delivered is in
+  [Results on 2026-10-01](#results-on-2026-10-01), with the evidence in the
+  [local rehearsal receipt](../receipts/2026-10-01-gcp-fastpath-local-rehearsal.md)
+  and the [final-integration receipt](../receipts/2026-10-01-gcp-fastpath-final-integration.md).
 - Tonight's deliverable is a local, synthetic, production-oracle parity
   rehearsal. It is not a GCP deploy, a production change or a cutover-readiness
   claim. Production cutover is estimated at 2 to 4 working days after tonight;
@@ -20,11 +23,11 @@ status: in-progress
   project needs the owner's explicit authorization in chat (OD-7).
 - The plan depends on the
   [append-only contributions decision](../decisions/2026-09-26-append-only-contributions.md),
-  which awaits owner sign-off. Where this plan relies on it, the dependency is
-  named.
+  which the owner approved in chat on 2026-09-30. Where this plan relies on
+  it, the dependency is named.
 - The [GCP source integration plan](./2026-09-24-gcp-source-integration.md)
-  keeps its cutover gate board and checkpoints as dated evidence. If the
-  decision is approved, this plan replaces that plan's analytics publication
+  keeps its cutover gate board and checkpoints as dated evidence. With the
+  decision accepted, this plan replaces that plan's analytics publication
   approach and its independent erasure-ledger approach on the GCP line.
 - Work-item IDs such as IN-, EP-, PT-, OPS-, SIMP-, CR- and HX- refer to the GCP
   planning workspace (plan-v4) and to tonight's package list. Register IDs
@@ -59,14 +62,14 @@ Recorded read-only by the fast-path analysis at the start of the night:
 
 | ID | Choice | State |
 |---|---|---|
-| D1 to D6 | No withdrawals; Variant B offline erasure; incremental analytics before the cutover cadence; database scaling deferred; Cloudflare stays the edge and release host; simplify the GCP line | Owner decisions; the record awaits sign-off (OD-6) |
+| D1 to D6 | No withdrawals; Variant B offline erasure; incremental analytics before the cutover cadence; database scaling deferred; Cloudflare stays the edge and release host; simplify the GCP line | Owner decisions; the record was accepted on 2026-09-30 (OD-6) |
 | OD-1 | The claude line is canonical; the Codex GCP line is a read-only reference | Default taken |
 | OD-2 | The 2026-09-26 SIMP-0, SIMP-1 and SIMP-4 briefs supersede the 2026-09-27 ones. The integration lead is the only migration-numbering authority (0057 ISO-1, 0058 ISO-2, 0059 analytics_v2; later numbers assigned at landing) | Default taken; no SIMP code tonight |
 | OD-3 | Production-parity eligibility: `community_public_source_owners` as production computes it. The gap from D1 is documented | Default taken |
 | OD-4 | Owner-run, read-only production checks: the correction-runtime row; owner counts by source routing; owners whose 101-day window exceeds 120,000 usage rows | Owner action; Claude does not run production reads |
 | OD-5 | Serve production's `community-allowance-breakdowns-v1.1` contract | Default taken |
-| OD-6 | Approve the decision record text | Pending |
-| OD-7 | The D-1 test-project deploy stretch, on new test-only resources only | Not authorized unless the owner says so |
+| OD-6 | Approve the decision record text | Approved in chat on 2026-09-30 |
+| OD-7 | The D-1 test-project deploy stretch, on new test-only resources only | Relayed to the final integration as owner-approved for the `tibotattle` test project, including seeding `tibotattle_fastpath`. D-1's tooling is merged and checked locally; nothing was deployed or seeded during the integration |
 | OD-8 | Whether v0.1 and v0.2 intake retire at cutover | Open. v1.0 and v1.1 intake are required either way |
 | OD-9 | Nothing touches production; ingestion-side D1 schema on Cloudflare stays frozen until the seal | In force |
 | OD-10 | Optional read-only export of published (day, revision) pairs so GCP revisions continue above them | Open |
@@ -127,7 +130,9 @@ same image), triggered by Cloud Scheduler. Each run:
    - `prepareSharedAnalyticsDay` per owner-day;
    - `evaluateSharedScalarDate` for today;
    - `evaluateSharedModelDate` for 70 dates, each over a 101-day window;
-   - `evaluateSharedCacheDay` with the 7-day carry;
+   - `evaluateSharedCacheDay` with the 7-day carry, for every day from the
+     first evidence day (production builds every delivered day and its `all`
+     window has no lower bound);
    - a cross-owner fold using the vendored `publicInputs`;
    - `buildCommunityDailyPayload`;
    - `selectCommunityAllowanceAnalysisFits` and the summarizers;
@@ -371,6 +376,42 @@ disconnected or contained owners.
 | H+6:30 | Code freeze; fix-forward only, each fix with a test. D-1 decision (OD-7) |
 | H+7:00 | Full gates; D-1 in parallel only if authorized |
 | H+8:00 | Receipt, IN-2 and IN-3 status notes and the next-day backlog |
+
+## Results on 2026-10-01
+
+Local and synthetic only: one macOS arm64 workstation, a local PostgreSQL 17
+cluster and the Q-1 oracle's four-owner corpus. Nothing was pushed, deployed
+or seeded on GCP or Cloudflare, and no production data was read.
+
+- **Delivered.** `claude/gcp-fastpath` (frozen at `8d2cb423`) lands A-0 to
+  A-4, IN-1, T-1, T-2, the Q-1 golden and the 0059 promotion.
+  `claude/gcp-fastpath-final` adds this record and the accepted decision
+  (DOC-1L), the D-1 deploy and seed tooling, the D-1 hand-offs and the cache
+  history horizon. IN-2 and IN-3 stay branch-only.
+- **The one-command rehearsal** ran as the Gates section expects, with one
+  exception: it exits 1 because model-days differ. Every importer completes
+  (owner roster 4/4, public source owners and owner revisions equal to D1);
+  analytics-refresh publishes 168 days with 2026-04-17 and 2026-04-18 blocked
+  (owner (a)'s crossed-day conflict) and 15 refusals listed by reason; the
+  fastpath-test origin serves `community/daily` with 200; a second run
+  creates no revision.
+- **Parity with the d43c8f92 oracle.** Equal: every daily payload (168 days),
+  the allowance breakdowns, the preview apart from its model days, and the
+  cache-retention structure. Different: 14 model dates
+  (2026-07-24 to 2026-08-06) that the oracle withholds as a block and the fast
+  path publishes per date with the refused owner counted
+  (`refusedParticipantCount`). Cache counts are informational by the oracle's
+  parity basis. The final integration reproduced the frozen tree's served
+  response and preview byte for byte.
+- **Cache history.** The fast path now keeps cache bands from the first
+  evidence day, as production does; the earlier today-162 default is gone.
+  The 70 model dates, the 101-day windows and the 366-day read range stay:
+  they are production method and contract constants.
+- **Open owner decisions.** Port production's block-and-withhold model-day
+  rule or accept and disclose per-date publication.
+- **Not yet attempted.** A Docker build of the image, the D-1 test-project
+  deploy and seed, the edge, production volumes, dense owners, the native
+  dense fallback and the memo.
 
 ## Cutover backlog
 
