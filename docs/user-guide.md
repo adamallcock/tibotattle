@@ -487,30 +487,28 @@ that an older installed app already has the new flow.
 
 ## Optional community contribution
 
-Community participation requires sign-in and explicit consent. Before the first
-upload, TiboTattle presents the derived, allowlisted contribution. Contributions
-are pseudonymous and omit session content; pseudonymous does not mean anonymous.
+Electron uses accountless, content-free sharing under the
+[accepted sharing policy](./decisions/2026-09-04-accountless-sharing-policy.md).
+Identified fresh installations default on. Existing saved choices are preserved;
+existing installations without a choice receive three visible notices before
+activation. Community and Settings display the same persisted sharing choice
+and current upload status. Contributions are pseudonymous and omit session
+content; pseudonymous does not mean anonymous. Local analysis remains available
+when sharing is off or uploads are unavailable.
 
-A staged successor contribution format can add account/plan attribution only
-after a separate field review and explicit new consent, and only if the hosted
-service enables that format. Existing consent is not upgraded automatically.
-Its pseudonyms can link observations within an enrollment/destination; they
-never include raw provider account identifiers. Interrupted replacement uploads
-remain staged while the previous complete hosted history stays selected.
-Missing identity proof does not erase local usage or imply zero usage.
-
-Re-pairing or renewing this Mac's contribution credential pauses delivery while
-the credential changes. If completion cannot be verified, delivery stays paused
-and the app offers device repair; an ordinary refresh cannot bypass that pause.
-Local usage analysis and previously contributed history remain available.
-
-Signing in, pairing a device, local indexing, successful upload, aggregate
-publication, and device disconnect are separate states. Keep the app’s
-displayed state or sanitized error if support is needed.
+The shared dashboard no longer presents Google/Apple sign-in, legacy field
+review, consent, pairing or device-disconnect controls. Their backend contracts
+remain available to legacy clients. Successful collection, upload and aggregate
+publication are separate states. Keep the displayed status or sanitized error
+if support is needed.
 
 ### Stop sharing from this Mac
 
-Choose **Disconnect this Mac** and review the confirmation. Confirming revokes
+Turn off **Share usage measurements** in Community or Settings to stop future
+accountless uploads and save your choice across restart. This preserves accepted
+hosted history, local analysis and the existing enrollment.
+
+Older clients may offer **Disconnect this Mac** with a confirmation. It revokes
 this Mac's hosted contribution authority, clears its local device credential
 and binding, and pauses delivery. It preserves previously contributed hosted
 history, other devices, and local analysis. Signing out only ends the browser
@@ -534,7 +532,7 @@ privacy notice is at `https://tibotattle.com/privacy.html`.
 Uninstalling the app bundle does not imply that accumulated local indexes,
 preferences, logs, or Keychain items were erased. That separation prevents an
 ordinary application replacement from destroying history. Use documented
-local erase, identity-reset, and device-disconnect controls only for their
+local erase, identity-reset, sharing and legacy device-disconnect controls only for their
 separate effects. None erases hosted history; private owner erasure is separate.
 Follow the support guide for intentional cleanup and never remove broad
 Application Support or Keychain locations blindly.

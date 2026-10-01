@@ -105,7 +105,7 @@ test("Electron sharing UI uses the accountless bridge and visible receipt gate",
   assert.match(appSource, /setSharingEnabled\(enabled\)/u);
   assert.match(appSource, /sharingNoticePresented\(index\)/u);
   assert.match(appSource, /case "recovery_required":/u);
-  assert.match(appSource, /document\.visibilityState === "visible"/u);
+  assert.match(appSource, /document\.visibilityState !== "visible"/u);
   assert.match(appSource, /getBoundingClientRect\(\)/u);
   assert.match(appSource, /innerWidth/u);
   assert.match(appSource, /listen\(globalThis\.window, "scroll", retry\)/u);

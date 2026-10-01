@@ -46,9 +46,10 @@ Scope: all files under `apps/web/`. Apply the repository root guidance first.
   them to accounting DTOs, reports, share cards, diagnostics, or contributions.
 - Preserve restrictive network and content-security assumptions. A local preview
   convenience must not weaken the packaged or public surface.
-- Offer confirmed **Disconnect this Mac**, not self-service hosted deletion.
-  State that disconnect preserves hosted and local history; never present
-  sign-out, local erase, or owner-only erasure as equivalent actions.
+- Electron is the main app and uses the shared dashboard. Preserve its existing
+  collection, Settings and accountless sharing through their current owners.
+  Preserve saved sharing opt-outs and owner-only hosted erasure; retired social
+  sign-in and disconnect flows belong to legacy backend contracts, not this UI.
 - Run the narrow `apps/web/test/*.test.mjs` files while iterating, then
   `npm run product:ui:test`. Add `npm run product:release-site:test` for public
   install/release surface changes and the relevant local or Worker gate for API

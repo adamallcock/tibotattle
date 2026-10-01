@@ -62,6 +62,15 @@ Architecture ownership is mechanically checked by
 `npm run architecture:check`. Cross-surface imports must use reviewed public
 facades; no application may reach through another application's private files.
 
+Electron is the main app and uses the shared dashboard HTML, modules and
+styles. Collection retains companion readiness, bounded refresh, cancellation
+and host-owned cadence. Settings and accountless sharing use their existing
+versioned preload actions; no separate dashboard mode or presentation flags
+are required.
+The dashboard contains no social sign-in, legacy consent/pairing or device
+disconnect UI. Legacy backend contracts remain available to their existing
+consumers, independently of this presentation change.
+
 ## Local trust boundary
 
 The installed app creates an owner-only state root at
@@ -182,20 +191,29 @@ retrying an old bearer. Local analysis and accepted history remain available.
 
 ## Hosted data flow
 
+Electron uses accountless installation enrollment, authorization, lease renewal
+and the persisted sharing choice under the
+[accepted sharing policy](../decisions/2026-09-04-accountless-sharing-policy.md).
+Its dashboard and Settings present the existing main-process policy owner.
+A missing sharing bridge cannot authorize enrollment or uploads.
+
+The following social enrollment flow remains a legacy backend compatibility
+contract. The shared dashboard no longer presents its controls:
+
 1. A participant starts Google or Apple sign-in. The Worker owns the provider
    callback; loopback receives only a bounded restart/result handoff.
 2. Enrollment creates or reattaches the participant after explicit consent and
    configured admission controls.
 3. Device pairing creates a short-lived claim. The native app stores the
    claimed credential in Keychain and retains only a content-free binding file.
-4. The app shows an exact local contribution preview before first approval.
+4. Legacy clients show an exact local contribution preview before first approval.
 5. Each upload uses a one-use authorization, closed JSON Schema validation,
    encryption, idempotency/deduplication, ingress budgets, and staged D1/R2
    bookkeeping.
 6. Scheduled aggregation publishes only eligible derived cohorts. Missing,
    stale, or unavailable evidence remains explicit rather than becoming zero.
 7. Participant export and device revoke/disconnect are separate authenticated
-   lifecycles. Confirmed **Disconnect this Mac** removes this device's authority,
+   lifecycles. Legacy device disconnect removes this device's authority,
    not hosted or local history.
 8. Private owner erasure uses the existing admin maintenance action, not a
    participant session or device capability. It preserves the upload fence,

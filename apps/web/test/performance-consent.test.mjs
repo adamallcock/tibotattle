@@ -1,7 +1,5 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { readFile } from "node:fs/promises";
-import { translate } from "../public/localization.js";
 
 import {
   CommunityClient,
@@ -11,37 +9,6 @@ import {
 
 const DEVICE_ID = "11111111-1111-4111-8111-111111111111";
 
-test("paused performance sharing exposes reapproval without bypassing review or sign-in", async () => {
-  const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  const start = source.indexOf("function renderTelemetryPerformanceContribution(");
-  const end = source.indexOf("\nasync function loadTelemetryPerformanceStatus(", start);
-  assert.ok(start >= 0 && end > start);
-  for (const locale of ["en-US", "zh-Hans", "es"]) {
-    for (const state of ["off", "paused", "up_to_date", "retry_wait"]) {
-      const elements = new Map();
-      const $ = selector => {
-        if (!elements.has(selector)) elements.set(selector, { hidden: false, disabled: false, checked: false, textContent: "" });
-        return elements.get(selector);
-      };
-      const t = (key, values) => translate(key, values, locale);
-      const dependencies = { $, t, telemetryPerformanceAvailable: () => true,
-        telemetryPerformanceStatus: { consent: { approved: true, current: true }, scheduler: { state } },
-        telemetryPerformanceBusy: false, contributionDisconnectBusy: false,
-        contributionDisconnectDialogOpen: () => false, telemetryPerformanceReview: null,
-        telemetryPerformanceNotice: null, hostedSignInRequired: () => true,
-        setLocalizedText: (element, key, values) => { element.textContent = t(key, values); },
-        forgetLocalizedNode: () => {}, setRawText: () => assert.fail("no unreviewed details") };
-      Function(...Object.keys(dependencies), `${source.slice(start, end)}\nrenderTelemetryPerformanceContribution();`)(...Object.values(dependencies));
-      assert.equal($("#performance-review-open").hidden, !["paused", "off"].includes(state));
-      assert.equal($("#performance-consent-approve").disabled, true);
-      assert.equal($("#performance-review").hidden, true);
-      assert.doesNotMatch($("#performance-sync-status").textContent, /retry_wait|up_to_date|performanceConsent\./u);
-      if (["paused", "off"].includes(state)) {
-        assert.equal($("#performance-review-open").textContent, t("performanceConsent.reviewAgain"));
-      }
-    }
-  }
-});
 const METHODS = ["receipt", "tool_free"];
 const CONSENT = {
   schemaVersion: "model-performance-daily-v1",

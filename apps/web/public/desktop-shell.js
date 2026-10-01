@@ -218,13 +218,6 @@ function installCommandBridge(documentRef, windowRef, applyLanguage, applySideba
       navigateToDashboardSection(documentRef, windowRef, command.section);
       return;
     }
-    if (command.command === "hostedSignInReturn") {
-      // The desktop host has already validated and reduced the external app
-      // link to this one semantic command.  Do not forward a URL, argv, or
-      // token into the page; wake the existing page-local handoff instead.
-      dispatchFixedDesktopEvent(windowRef, "tibotattle:hosted-sign-in-return");
-      return;
-    }
     if (command.command === "sidebar") {
       applySidebar(command.collapsed);
       return;
@@ -269,6 +262,8 @@ export function mountDesktopShell({
   const shareButton = documentRef.querySelector?.("#electron-share-button");
   const settingsButton = documentRef.querySelector?.("#electron-settings-button");
   if (!settingsButton) return Object.freeze({ teardown() {} });
+  settingsButton.hidden = false;
+  if (shareButton) shareButton.hidden = false;
   const onShare = () => {
     // The share card lives on the Allowance page. Navigating to Overview
     // first leaves that page inert, so focus() can succeed in a unit fake yet
@@ -345,26 +340,10 @@ export function mountDesktopShell({
 
 function autoMountDesktopShell() {
   if (typeof document === "undefined") return;
-  const mount = () => {
-    // Electron's preload normally stamps the marker before this module runs.
-    // The DOM-ready retry covers the legitimate startup ordering where the
-    // marker is applied while the document body is still being constructed.
-    mountDesktopShell();
-  };
-  mount();
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", () => {
-      mount();
-      // The preload lives in Electron's isolated world. Its DOMContentLoaded
-      // listener is not ordered relative to this page-world listener, so a
-      // marker can land immediately after the callback above. One macrotask
-      // gives the remaining DOM-ready listeners a chance to stamp it; the
-      // idempotent mount then installs the controls without starting a poll.
-      const schedule = typeof globalThis.window?.setTimeout === "function"
-        ? globalThis.window.setTimeout.bind(globalThis.window)
-        : globalThis.setTimeout;
-      if (typeof schedule === "function") schedule(mount, 0);
-    }, { once: true });
+    document.addEventListener("DOMContentLoaded", () => mountDesktopShell(), { once: true });
+  } else {
+    mountDesktopShell();
   }
 }
 

@@ -135,34 +135,9 @@ test("accounting period history labels preserve three-locale parity", () => {
   }
 });
 
-test("Keychain connection and denied-access copy never recommends approval prompts or credential clearing", async () => {
+test("dashboard and translation copy never recommends blanket Keychain approval", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
-  const denied = appSource.match(/contribution_device_keychain_access_denied:\n\s*"([^"]+)"/u)?.[1];
-  const pairing = appSource.match(/device_pairing: Object\.freeze\(\{[\s\S]*?progress: "([^"]+)"/u)?.[1];
-  const note = html.match(/id="incremental-keychain-pairing-note">([\s\S]*?)<\/p>/u)?.[1]
-    .replace(/\s+/gu, " ").trim();
-  assert.ok(denied);
-  assert.ok(pairing);
-  assert.ok(note);
-  assert.match(denied, /Uploads are paused/u);
-  assert.match(denied, /credential and local history are unchanged/u);
-  assert.match(denied, /Nothing was uploaded/u);
-  const forbiddenAdvice = /Always Allow|Permitir siempre|始终允许|password|contraseña|密码|Clear .*credential|borra.*credencial|清除.*凭据/iu;
-  for (const locale of SUPPORTED_LOCALES) {
-    for (const copy of [denied, pairing, note]) {
-      const translated = translateLegacyText(copy, locale);
-      assert.equal(typeof translated, "string");
-      assert.notEqual(translated.trim(), "");
-      assert.doesNotMatch(translated, forbiddenAdvice, `${locale} ${copy}`);
-      if (locale !== "en-US") assert.notEqual(translated, copy, `${locale} has its own translation`);
-    }
-  }
-  assert.deepEqual(SUPPORTED_LOCALES.map((locale) => translateLegacyText(denied, locale)), [
-    "Uploads are paused because TiboTattle could not access this Mac's upload credential. The existing credential and local history are unchanged. Nothing was uploaded. You can try again later.",
-    "TiboTattle 无法访问这台 Mac 的上传凭据，因此上传已暂停。现有凭据和本地历史记录均未改变。没有上传任何内容。你可以稍后重试。",
-    "Las cargas están en pausa porque TiboTattle no pudo acceder a la credencial de carga de este Mac. La credencial existente y el historial local no han cambiado. No se ha subido nada. Puedes volver a intentarlo más tarde.",
-  ]);
   const blanketApproval = /Always Allow|Permitir siempre|始终允许/iu;
   assert.doesNotMatch(appSource, blanketApproval);
   assert.doesNotMatch(html, blanketApproval);

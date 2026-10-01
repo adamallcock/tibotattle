@@ -21,7 +21,10 @@ update to the latest published stable release, read the
 
 ## Hosted history and privacy requests
 
-In the [2026-08-30 source contract](docs/decisions/2026-08-30-self-service-deletion-retirement.md),
+Electron's sharing toggle in Community or Settings saves a persistent opt-out
+and stops future uploads without deleting hosted history or local analysis.
+The shared dashboard no longer exposes social sign-in or device disconnect.
+In the legacy [2026-08-30 source contract](docs/decisions/2026-08-30-self-service-deletion-retirement.md),
 **Disconnect this Mac** requires confirmation and stops this device's hosted
 contribution authority without deleting hosted history or local analysis.
 Signing out is not device disconnect. Self-service hosted deletion is retired;

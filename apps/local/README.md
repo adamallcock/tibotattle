@@ -99,11 +99,13 @@ The participant relay is intentionally narrow rather than a generic reverse
 proxy. It validates bounded JSON request and response bodies, forwards only the
 fixed TiboTattle session cookie and route-appropriate CSRF value, rejects
 incoming `Authorization`, and rejects unexpected upstream cookies. This lets
-the local dashboard complete its current identity/pairing journey from one
-origin without exposing raw logs or granting arbitrary network access.
+legacy clients complete their identity/pairing journey from one origin without
+exposing raw logs or granting arbitrary network access. The shared dashboard
+has no social sign-in, consent or pairing controls; Electron uses its existing
+accountless sharing controller and persisted preference.
 
 Retired self-service `DELETE /api/v1/me` and private owner erasure are not
-participant-relay permissions. Confirmed **Disconnect this Mac** uses
+participant-relay permissions. Legacy confirmed **Disconnect this Mac** uses
 `POST /api/local/contribution/device-disconnect` and the collector's fixed
 hosted device client; it does not widen the relay or delete hosted/local
 history. This describes the
@@ -299,7 +301,8 @@ or cancelled refreshes do not claim a new index publication.
 The accountless production profile exposes a read-only scheduler snapshot through
 `GET /api/local/diagnostics/contribution`. Its closed `accountless` object contains
 `state`, `lastAttemptAt`, `lastSuccessfulSyncAt`, `lastAcceptedAt`, `nextAttemptAt`
-and `lastFailureCode`; the browser's **Copy diagnostics** preserves these fields.
+and `lastFailureCode`. The retired browser **Copy diagnostics** control is no
+longer presented; the closed diagnostic route remains available to its clients.
 Journey phases distinguish `accountless_active`, `accountless_off` and
 `accountless_unavailable`, without inventing legacy consent, sign-in or pairing.
 A successful bounded pass need not accept new chunks or finish historical
@@ -350,9 +353,9 @@ beyond the eight most-recent accepted sets, removes artifacts before compacting
 accepted queue rows, removes at most sixteen eligible sets per pass, and never
 removes retryable, in-flight, or rejected work.
 
-The ordinary browser journey has no recovery-code, account-reset,
-personal-export, multi-device-management, or self-service hosted-deletion flow.
-**Disconnect this Mac** asks for confirmation, revokes this device's hosted
+The shared dashboard presents accountless sharing through Electron's existing
+bridge. It has no legacy social contribution or device-disconnect controls.
+The retained legacy **Disconnect this Mac** contract asks for confirmation, revokes this device's hosted
 authority, clears its local credential/binding, and pauses delivery. Previously
 hosted history, other devices, and local analysis remain. Browser sign-out is
 not device disconnect; private hosted erasure is an owner operation.

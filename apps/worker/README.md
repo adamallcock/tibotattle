@@ -215,7 +215,7 @@ routes have been retired. Hosted export, security reset, and selected-device
 management remain exact Worker session surfaces but are not granted through
 the loopback participant relay.
 
-Confirmed **Disconnect this Mac** uses the existing device-disconnect path;
+Legacy confirmed **Disconnect this Mac** uses the existing device-disconnect path;
 it preserves hosted and local history. Private owner erasure instead uses
 `POST /api/v1/admin/action` with `action: "run_maintenance"` and an explicit
 `participantErasure` object containing the exact `participant:<UUID>` target

@@ -329,7 +329,7 @@ reconciliation. Opt-out stops future uploads and retains accepted history.
 | `https://tibotattle.com` | Public community reads, hosted identity/session, optional contribution, participant export, device disconnect, app compatibility/preflight. | Route-specific closed requests; contribution requires consent and one-use/device authority. No self-service hosted deletion. |
 | `https://admin.tibotattle.com` | Owner operations only, including explicitly targeted participant erasure. | Cloudflare Access owner assertion and bounded admin reads/actions with CSRF on mutations. The app is not an admin client. |
 | `https://updates.tibotattle.com/appcast.xml` | Sparkle update checks. | Standard update request metadata; the signed appcast declares the artifact. |
-| Google or Apple identity endpoints | User starts hosted sign-in in the system browser. | Provider-controlled sign-in. The provider callback goes to TiboTattle's Worker, not loopback. |
+| Legacy Google or Apple identity endpoints | A legacy client starts hosted sign-in in the system browser; the shared dashboard has no sign-in controls. | Provider-controlled sign-in. The provider callback goes to TiboTattle's Worker, not loopback. |
 | Artifact URL from the verified appcast | User/automatic updater downloads an update. | Standard artifact request; signature, length, and digest/provenance gates remain separate. |
 
 The loopback companion is not a general proxy. It forwards only fixed routes
@@ -390,13 +390,15 @@ about applicable privacy rights or how a particular request should be resolved.
 | --- | --- | --- |
 | **Erase local data** | Moves the installed app's Application Support state root to Trash and clears TiboTattle WebKit data. | Provider source files, Keychain capabilities, or hosted data. |
 | **Reset identity and device** | Reviewed TiboTattle Keychain capabilities plus their associated local binding/app state. | General local analysis state unless the reset contract explicitly reports it; hosted contribution records. |
-| **Disconnect this Mac** (confirmed) | Hosted authority for this device plus its local device credential/binding; pauses delivery. | Other devices, hosted participant data, or local analysis. |
+| **Disconnect this Mac** (legacy backend contract) | Hosted authority for this device plus its local device credential/binding; pauses delivery. | Other devices, hosted participant data, or local analysis. |
 | Private owner participant erasure | Hosted participant/account, contribution, session, and device state through the protected pipeline; affected aggregates are withdrawn/rebuilt. | Local analysis, provider source files, retained safeguards/audit, or immutable withdrawn aggregate revisions. |
 | Ordinary app/Homebrew uninstall | Application binaries. | By design, local state and Keychain survive ordinary uninstall. |
 | Homebrew `--zap` | Declared app Application Support/cache/WebKit/preferences. | `~/.codex`, Keychain identities, or previously hosted data. |
 
 Use the app's explicit controls before uninstall when the intent includes
-local cleanup or device disconnect. They cannot perform private owner erasure.
+local cleanup. Electron's saved sharing-off choice stops accountless delivery;
+the shared dashboard no longer offers legacy device disconnect. These controls
+cannot perform private owner erasure.
 Do not manually delete the only local index as a repair technique; follow
 [`../runbooks/unified-index-recovery.md`](../runbooks/unified-index-recovery.md).
 
