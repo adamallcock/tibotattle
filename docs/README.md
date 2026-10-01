@@ -41,6 +41,7 @@ an informal archive.
 | Sidebar recovery | [Collapsed dashboard sidebar rescue](./runbooks/sidebar-stranded-collapsed-rescue.md) | Current 0.1.16 recovery for persisted collapsed navigation; removes only exact window-geometry defaults |
 | Platform support | [Platform support and qualification](./reference/platform-support.md) | Released Electron 0.1.24 across four targets, exact artifact assurances and owner-accepted unperformed qualification |
 | Production | [Production service operations](./runbooks/production-operations.md) | Read-only observation, deploy/migration gates, private owner erasure, containment, rollback, and recovery boundaries |
+| Production edge modes | [Production edge modes](./runbooks/production-edge-modes.md) | Maintained; not yet operational until P1, the first typed worker-mode edge deploy. Until then Production service operations governs Cloudflare. Follows the proposed edge-proxy decision; grants no deploy, fence or cutover authority |
 | Telemetry activation | [Protected telemetry runtime activation](./runbooks/2026-09-22-telemetry-runtime-activation.md) | Migration, reconciliation, deploy, post-deploy verification, and owner-only independent usage/performance activation |
 | Community diagnostics | [Community allowance-band diagnosis](./runbooks/2026-08-13-community-allowance-band-diagnosis.md) | Current fit-cache and aggregate diagnosis; production writes remain owner-run |
 | Contribution diagnosis | [Contribution completion funnel](./runbooks/2026-09-22-contribution-completion-funnel.md) | Aggregate-only receipt, activation, projection and publication queries; schema-qualified, read-only plans |
@@ -68,6 +69,7 @@ their status changes; current Cloudflare behavior follows the authorities above.
 | Area | Document | Status | Boundary |
 |---|---|---|---|
 | GCP fast path | [GCP fast path](./plans/2026-10-01-gcp-fastpath.md) | In progress | Analytics-refresh architecture, redesign register mapping, local synthetic parity rehearsal and sized cutover backlog; no production change |
+| GCP edge proxy | [Thin Worker edge proxy](./decisions/2026-10-01-thin-worker-edge-proxy.md) | Proposed; owner sign-off pending | Production Worker as a thin edge (worker, fenced, gcp) in front of an IAM-private Cloud Run origin, from an owner-authorized cutover; current Cloudflare behavior unchanged; no readiness claim |
 
 ## Lifecycle evidence
 
