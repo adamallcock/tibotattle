@@ -1077,6 +1077,34 @@ test("PG17 re-uploading the same chunk is idempotent: same receipt id, no new ro
   assert.deepEqual(counts.rows[0], { chunks: 1, records: 2, journal: 1, pending: 1 });
 }));
 
+test("PG17 two concurrent uploads of one v1.0 envelope converge on one chunk and retire the losing object", {
+  skip: SKIP, timeout: 300_000,
+}, () => withTwin(async ({ twin, pool, schema }) => {
+  const { schemaOptions } = await initializeTypedTargets(twin, schema);
+  const store = memoryObjectStore();
+  const service = await origin(pool, schemaOptions, store);
+  await socialParticipant(twin, "in3-race");
+  const device = await socialDevice(twin, "in3-race", randomUUID());
+  const chunk = await syntheticChunk({ stream: "quota", count: 1, seed: "race" });
+  const raw = JSON.stringify(await encryptedEnvelope(chunk));
+  const body = { envelopeDigest: sha256Hex(raw), contentLengthBytes: Buffer.byteLength(raw),
+    contentType: "application/json", telemetrySchemaVersion: "telemetry-contribution-v1.0" };
+  const grants = [await service.authorizeUpload(device, body), await service.authorizeUpload(device, body)];
+  const results = await Promise.all(grants.map((grant) => service.contribute(grant.uploadAuthorization, raw)));
+  assert.deepEqual(results.map((result) => result.response.status), [202, 202]);
+  const ids = new Set(results.map((result) => result.receipt.contributionId));
+  assert.equal(ids.size, 1, "both requests acknowledge the one committed chunk");
+  assert.deepEqual(results.map((result) => result.receipt.replayed === true).sort(), [false, true]);
+  const rows = await pool.query(`SELECT (SELECT count(*)::int FROM "${schema}".telemetry_v1_chunks) AS chunks,
+    (SELECT count(*)::int FROM "${schema}".typed_telemetry_records) AS records,
+    (SELECT count(*)::int FROM "${schema}".storage_ingestion_changes) AS journal,
+    (SELECT count(*)::int FROM "${schema}".pending_objects) AS pending,
+    (SELECT count(*)::int FROM "${schema}".device_upload_authorizations
+      WHERE state = 'consumed' AND consumed_contribution_id = $1) AS consumed`, [[...ids][0]]);
+  assert.deepEqual(rows.rows[0], { chunks: 1, records: 1, journal: 1, pending: 1, consumed: 2 });
+  assert.equal(store.objects.size, 1, "the losing request's object is retired");
+}));
+
 test("PG17 v1.0 refusals keep the Worker's status, code and order, and write nothing", {
   skip: SKIP, timeout: 300_000,
 }, () => withTwin(async ({ twin, pool, schema }) => {

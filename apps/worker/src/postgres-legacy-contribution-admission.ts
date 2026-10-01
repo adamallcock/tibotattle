@@ -823,19 +823,26 @@ async function persistTypedChunk(
     `SELECT id FROM ${table(schema, "typed_telemetry_owners")} WHERE namespace_id = $1 AND original_id = $2`,
     [namespaceId, ownerOriginal]);
   // D1 typed_v1_owner_memberships(participant_id, typed_owner_id) is
-  // PostgreSQL's per-format typed_telemetry_owner_memberships row.
-  await client.query(
-    `INSERT INTO ${table(schema, "typed_telemetry_owner_memberships")}
-       (namespace_id, source_format, owner_id, participant_id, source_namespace)
-     VALUES ($1, ${POSTGRES_TYPED_V1_FORMAT}, $2, $3, $4) ON CONFLICT DO NOTHING`,
-    [namespaceId, ownerId, principal.participantId, input.sourceNamespace],
-  );
-  const membership = await client.query<{ owner_id: string; participant_id: string; source_namespace: string }>(
+  // PostgreSQL's per-format typed_telemetry_owner_memberships row. Insert it
+  // only when absent: its BEFORE INSERT guard (0030) refuses a participant
+  // whose owner link is withdrawn, which D1 never checks for an existing
+  // mapping, and a BEFORE trigger runs even when ON CONFLICT would skip.
+  const readMembership = () => client.query<{ owner_id: string; participant_id: string; source_namespace: string }>(
     `SELECT owner_id::text AS owner_id, participant_id, source_namespace
        FROM ${table(schema, "typed_telemetry_owner_memberships")}
       WHERE source_format = ${POSTGRES_TYPED_V1_FORMAT} AND participant_id = $1`,
     [principal.participantId],
   );
+  let membership = await readMembership();
+  if (membership.rows.length === 0) {
+    await client.query(
+      `INSERT INTO ${table(schema, "typed_telemetry_owner_memberships")}
+         (namespace_id, source_format, owner_id, participant_id, source_namespace)
+       VALUES ($1, ${POSTGRES_TYPED_V1_FORMAT}, $2, $3, $4)`,
+      [namespaceId, ownerId, principal.participantId, input.sourceNamespace],
+    );
+    membership = await readMembership();
+  }
   if (membership.rows.length !== 1 || membership.rows[0]!.owner_id !== ownerId
       || membership.rows[0]!.source_namespace !== input.sourceNamespace) {
     throw unavailable();
