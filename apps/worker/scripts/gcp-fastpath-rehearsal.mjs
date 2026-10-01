@@ -270,6 +270,9 @@ async function refusalSummary(pool, schema) {
       refusalOwnersByReason: Object.fromEntries(Object.entries(Object.groupBy(row.refusals ?? [],
         (refusal) => `${refusal.family}:${refusal.reason}`)).map(([key, list]) =>
         [key, [...new Set(list.map((refusal) => refusal.ownerDigest.slice(0, 8)))].sort()]).sort()),
+      refusalDaysByReason: Object.fromEntries(Object.entries(Object.groupBy(row.refusals ?? [],
+        (refusal) => `${refusal.family}:${refusal.reason}`)).map(([key, list]) =>
+        [key, [...new Set(list.map((refusal) => refusal.day ?? "owner"))].sort()]).sort()),
       publication: {
         published: row.publication?.published?.length ?? null,
         unchanged: row.publication?.unchanged?.length ?? null,
