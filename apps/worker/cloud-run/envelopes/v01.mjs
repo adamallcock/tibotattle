@@ -1,0 +1,76 @@
+/**
+ * telemetry-envelope-v0.1 contribution envelope for the PostgreSQL origin
+ * (GCP fast path, IN-3). A registry entry, not a route, dispatched after the
+ * shared contributions preamble exactly like envelopes/v10.mjs.
+ *
+ * Not retired: d43c8f92 still routes telemetry-envelope-v0.1 to
+ * handleTelemetryContribution, and the D1 format table keeps
+ * telemetry-contribution-v0.1 'accepted' (migrations/0044), so a social
+ * participant whose transport floor is still rank 1 can upload it. The port
+ * is admitPostgresTelemetryV01Contribution in
+ * src/postgres-legacy-contribution-admission.ts, injected here. It needs the
+ * staged legacy_contribution_admission migration (weekly admission window)
+ * and the retained v0.1 upload-authorization format
+ * (upload-authorization-formats.mjs RETAINED_V0_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS);
+ * register all three together or none.
+ *
+ * Arguments are those of envelopes/v10.mjs; the context needs primaryPool,
+ * schema, objectStore, envelopePublicJwk and envelopePrivateJwk.
+ */
+import { registerContributionEnvelope } from "../contribution-envelope-registry.mjs";
+
+export const TELEMETRY_V01_ENVELOPE_SCHEMA_VERSION = "telemetry-envelope-v0.1";
+
+const CONTEXT_KEYS = Object.freeze([
+  "primaryPool", "schema", "objectStore", "envelopePublicJwk", "envelopePrivateJwk",
+]);
+
+function configurationError(message) {
+  return new Error("TELEMETRY_V01_ENVELOPE_CONFIGURATION_INVALID: " + message);
+}
+
+function storageUnavailable() {
+  return Object.assign(new Error("BACKEND_STORAGE_UNAVAILABLE"), {
+    code: "BACKEND_STORAGE_UNAVAILABLE", status: 503,
+  });
+}
+
+/**
+ * @param {{
+ *   admitTelemetryV01Contribution: (input: object) => Promise<Response>,
+ * }} dependencies
+ */
+export function createTelemetryV01ContributionEnvelope({ admitTelemetryV01Contribution } = {}) {
+  if (typeof admitTelemetryV01Contribution !== "function") {
+    throw configurationError("admitTelemetryV01Contribution must be a function");
+  }
+  return registerContributionEnvelope(
+    TELEMETRY_V01_ENVELOPE_SCHEMA_VERSION,
+    async function handleTelemetryV01Envelope(body, participant, sourceDeviceId, claimed, context) {
+      if (context === null || typeof context !== "object"
+          || CONTEXT_KEYS.some((key) => context[key] === undefined || context[key] === null)) {
+        throw storageUnavailable();
+      }
+      if (body === null || typeof body !== "object" || typeof body.raw !== "string"
+          || participant === null || typeof participant !== "object"
+          || claimed === null || typeof claimed !== "object") {
+        throw storageUnavailable();
+      }
+      return admitTelemetryV01Contribution({
+        pool: context.primaryPool,
+        schema: context.schema,
+        objectStore: context.objectStore,
+        envelopePublicJwk: context.envelopePublicJwk,
+        envelopePrivateJwk: context.envelopePrivateJwk,
+        body: { raw: body.raw, value: body.value },
+        participant: { id: participant.id, consentVersion: participant.consentVersion ?? null },
+        deviceId: sourceDeviceId,
+        authorization: {
+          authorizationId: claimed.authorizationId,
+          authorizationKind: claimed.authorizationKind,
+        },
+        ...(context.nowEpoch === undefined ? {} : { nowEpoch: context.nowEpoch }),
+      });
+    },
+  );
+}

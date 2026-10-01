@@ -7,7 +7,8 @@ import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
 import pg from "pg";
 import { createServer } from "vite";
-import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
+import { readPostgresMigrations } from "../scripts/postgres-migrations.mjs";
+import { applyStockAndStagedMigrations, listStagedMigrations } from "./staged-migrations-harness.mjs";
 import {
   createContributionEnvelopeRegistry,
   createUploadAuthorizationFormats,
@@ -24,6 +25,10 @@ import {
   TELEMETRY_V10_ENVELOPE_SCHEMA_VERSION,
   createTelemetryV10ContributionEnvelope,
 } from "../cloud-run/envelopes/v10.mjs";
+import {
+  TELEMETRY_V01_ENVELOPE_SCHEMA_VERSION,
+  createTelemetryV01ContributionEnvelope,
+} from "../cloud-run/envelopes/v01.mjs";
 
 /*
  * IN-3: the telemetry-envelope-v1.0 contribution envelope and the legacy
@@ -34,9 +39,12 @@ import {
  * (src/typed-v1-admission.ts insertTypedTelemetryV1Chunk with
  * telemetry-v1-repository.ts) and transport policy, running unmodified on an
  * in-memory node:sqlite database built from the D1 migration directories the
- * live ingestion D1 applies. ORACLE_SOURCES pins every oracle file to its
- * d43c8f92 git blob, so a drift in the GCP line fails here instead of
- * silently changing the oracle.
+ * live ingestion D1 applies. fixtures/legacy-contribution-oracle-blobs.json
+ * pins every oracle file to its d43c8f92 git blob, so a drift in the GCP
+ * line fails here instead of silently changing the oracle. The same holds
+ * for telemetry-envelope-v0.1 (handleTelemetryContribution with
+ * insertTelemetryContribution and its server repricing), which d43c8f92 has
+ * not retired.
  *
  * Every upload runs through the envelope registry: a spec-local stand-in for
  * the IN-1b contributions preamble claims the one-use authorization, enforces
@@ -74,22 +82,23 @@ const V1_CONSENT = Object.freeze({
 });
 
 /*
- * git blob ids at d43c8f92 (`git rev-parse d43c8f92:apps/worker/<path>`)
- * of every file whose behaviour the oracle reproduces. Equal blob ids mean
- * the oracle runs production's exact code and D1 schema for this path.
+ * Every file whose behaviour the oracle reproduces, relative to apps/worker:
+ * the Worker sources and D1 migrations the oracle loads, and the
+ * @app-usagemonitor package copies vite resolves for them (server repricing
+ * and the telemetry contract). The fixture pins each to its git blob id at
+ * d43c8f92, so equal ids mean the oracle runs production's exact code.
  */
-const ORACLE_SOURCES = Object.freeze({
-  "src/typed-v1-admission.ts": null,
-  "src/telemetry-v1-repository.ts": null,
-  "src/typed-telemetry-repository.ts": null,
-  "src/telemetry-v1.ts": null,
-  "src/telemetry-transport-policy.ts": null,
-  "typed-v1-admission-migrations/0001_typed_v1_chunk_admission.sql": null,
-  "ingestion-isolation-migrations/0003_v1_append_classification.sql": null,
-  "ingestion-isolation-migrations/0004_v1_multidevice_source_update.sql": null,
-  "typed-ingestion-migrations/0001_typed_telemetry.sql": null,
-  "typed-ingestion-migrations/0002_delivery_journal.sql": null,
-});
+const ORACLE_REQUIRED = Object.freeze([
+  "src/typed-v1-admission.ts", "src/telemetry-v1-repository.ts", "src/typed-telemetry-repository.ts",
+  "src/telemetry-v1.ts", "src/telemetry-transport-policy.ts", "src/telemetry-repository.ts",
+  "src/telemetry-validation.ts", "src/server-pricing.ts", "migrations/0014_bounded_contribution_admission.sql",
+  "typed-v1-admission-migrations/0001_typed_v1_chunk_admission.sql",
+  "ingestion-isolation-migrations/0003_v1_append_classification.sql",
+  "ingestion-isolation-migrations/0004_v1_multidevice_source_update.sql",
+  "typed-ingestion-migrations/0001_typed_telemetry.sql", "typed-ingestion-migrations/0002_delivery_journal.sql",
+  "node_modules/@app-usagemonitor/accounting/src/price-registry.js",
+  "node_modules/@app-usagemonitor/telemetry-contract/index.js",
+]);
 
 let vite;
 const modules = new Map();
@@ -165,10 +174,15 @@ function d1Database(database) {
     async batch(statements) {
       database.exec("BEGIN");
       try {
-        const results = statements.map((entry) => ({
-          success: true, meta: {},
-          results: database.prepare(entry.sql).all(...entry.values.map(toSqlite)).map(fromSqlite),
-        }));
+        const results = statements.map((entry) => {
+          const values = entry.values.map(toSqlite);
+          if (/\bRETURNING\b/iu.test(entry.sql) || /^\s*(SELECT|WITH)\b/iu.test(entry.sql)) {
+            return { success: true, meta: {},
+              results: database.prepare(entry.sql).all(...values).map(fromSqlite) };
+          }
+          const run = database.prepare(entry.sql).run(...values);
+          return { success: true, meta: { changes: Number(run.changes) }, results: [] };
+        });
         database.exec("COMMIT");
         return results;
       } catch (error) {
@@ -198,6 +212,17 @@ async function endpoint() {
   return { host: PG_TEST_HOST, port: PG_TEST_PORT, socket: false };
 }
 
+/** The IN-3 migration by name suffix, staged or promoted (plan-v5 numbering rule). */
+async function legacyAdmissionMigration() {
+  const suffix = "_legacy_contribution_admission.sql";
+  const names = [
+    ...(await listStagedMigrations("primary")).map((migration) => migration.name),
+    ...(await readPostgresMigrations({ role: "primary" })).map((migration) => migration.name),
+  ].filter((name) => name.endsWith(suffix));
+  assert.equal(names.length, 1, "exactly one legacy_contribution_admission migration, staged or promoted");
+  return names[0];
+}
+
 async function withTwin(operation) {
   const local = await endpoint();
   const schema = `in3_legacy_${randomBytes(6).toString("hex")}`;
@@ -217,7 +242,9 @@ async function withTwin(operation) {
     else assert.ok(["127.0.0.1", "::1"].includes(server.rows[0].address));
     await pool.query(`CREATE SCHEMA "${schema}"`);
     created = true;
-    await applyPostgresMigrations({ role: "primary", schema, pool });
+    await applyStockAndStagedMigrations({
+      role: "primary", schema, pool, stagedFiles: [await legacyAdmissionMigration()],
+    });
     return await operation({ twin: new Twin(d1, pool), pool, schema, d1 });
   } finally {
     if (created) await pool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => {});
@@ -342,7 +369,7 @@ async function envelopeKeys() {
   return keyPair;
 }
 
-async function encryptedEnvelope(plaintext) {
+async function encryptedEnvelope(plaintext, schemaVersion = TELEMETRY_V10_ENVELOPE_SCHEMA_VERSION) {
   const { encodeBase64Url } = await workerModule("/src/crypto.ts");
   const { canonicalJson } = await workerModule("/src/canonical-json.ts");
   const { publicJwk } = await envelopeKeys();
@@ -352,7 +379,7 @@ async function encryptedEnvelope(plaintext) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   try {
     return {
-      schemaVersion: TELEMETRY_V10_ENVELOPE_SCHEMA_VERSION, synthetic: false, keyId: KEY_ID,
+      schemaVersion, synthetic: false, keyId: KEY_ID,
       wrappedKey: encodeBase64Url(new Uint8Array(await crypto.subtle.encrypt({ name: "RSA-OAEP" }, rsa, raw))),
       iv: encodeBase64Url(iv),
       ciphertext: encodeBase64Url(new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key,
@@ -437,10 +464,14 @@ async function origin(pool, schemaOptions, objectStore) {
   const keys = await envelopeKeys();
   const formats = createUploadAuthorizationFormats(legacyUploadAuthorizationFormatEntries({
     assertTelemetryTransportWriteAllowed: authority.assertPostgresTelemetryTransportWriteAllowed,
+    schemaVersions: [...LEGACY_V1_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS, ...RETAINED_V0_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS],
   }));
   const registry = createContributionEnvelopeRegistry([
     createTelemetryV10ContributionEnvelope({
       admitTelemetryV1Contribution: admission.admitPostgresTelemetryV1Contribution,
+    }),
+    createTelemetryV01ContributionEnvelope({
+      admitTelemetryV01Contribution: admission.admitPostgresTelemetryV01Contribution,
     }),
   ]);
   const context = Object.freeze({
@@ -475,7 +506,7 @@ async function origin(pool, schemaOptions, objectStore) {
       await authority.assertPostgresTelemetryTransportWriteAllowed(pool, principal,
         authority.telemetryTransportSchemaForEnvelope(value.schemaVersion), { schema: schemaOptions });
       const handler = registry.resolve(value.schemaVersion);
-      assert.ok(handler, "the v1.0 envelope is registered");
+      assert.ok(handler, "the envelope version is registered");
       const response = await handler({ raw, value },
         { id: participantRow.id, consentVersion: participantRow.consent_version, ownerKind: participantRow.owner_kind },
         deviceId, claim, context);
@@ -500,7 +531,16 @@ async function origin(pool, schemaOptions, objectStore) {
     return { raw, ...await contribute(authorization.uploadAuthorization, raw) };
   }
 
-  return { formats, registry, authorizeUpload, contribute, upload, admission };
+  async function uploadV01(device, record, { envelope } = {}) {
+    const raw = JSON.stringify(envelope ?? await encryptedEnvelope(record, TELEMETRY_V01_ENVELOPE_SCHEMA_VERSION));
+    const authorization = await authorizeUpload(device, {
+      envelopeDigest: sha256Hex(raw), contentLengthBytes: Buffer.byteLength(raw), contentType: "application/json",
+      telemetrySchemaVersion: "telemetry-contribution-v0.1",
+    });
+    return { raw, ...await contribute(authorization.uploadAuthorization, raw) };
+  }
+
+  return { formats, registry, authorizeUpload, contribute, upload, uploadV01, admission };
 }
 
 /** The Worker's typed v1 admission for the same chunk, ids and clock, on D1. */
@@ -785,9 +825,10 @@ test("the oracle is production's code: every oracle source is byte-identical to 
   const pinned = JSON.parse(await readFile(join(WORKER_ROOT, "postgres-test", "fixtures",
     "legacy-contribution-oracle-blobs.json"), "utf8"));
   assert.equal(pinned.commit, "d43c8f92");
-  assert.deepEqual(Object.keys(pinned.blobs).sort(), Object.keys(ORACLE_SOURCES).sort());
-  for (const path of Object.keys(ORACLE_SOURCES)) {
-    assert.equal(gitBlobId(await readFile(join(WORKER_ROOT, path))), pinned.blobs[path], path);
+  for (const path of ORACLE_REQUIRED) assert.ok(Object.hasOwn(pinned.sources, path), `${path} is pinned`);
+  for (const [path, { production, blob }] of Object.entries(pinned.sources)) {
+    assert.ok(production === `apps/worker/${path}` || production.startsWith("packages/"), path);
+    assert.equal(gitBlobId(await readFile(join(WORKER_ROOT, path))), blob, `${path} equals d43c8f92:${production}`);
   }
 });
 
@@ -1098,3 +1139,318 @@ test("PG17 v1.0 refusals keep the Worker's status, code and order, and write not
     { status: 503, code: "BACKEND_STORAGE_UNAVAILABLE", details: null });
   assert.equal(store.objects.size, 1);
 }));
+
+// ---------------------------------------------------------------------------
+// telemetry-envelope-v0.1 (not retired at d43c8f92; see envelopes/v01.mjs).
+
+function v01Contribution(suffix = "a") {
+  const toolClassCounts = {
+    webSearch: 1, fileSearch: 0, codeInterpreter: 0, hostedShell: 0, computerUse: 0, mcp: 0,
+    applyPatch: 1, localShell: 2, subagent: 0, toolGateway: 1, other: 0, unknown: 0,
+  };
+  return {
+    schemaVersion: "telemetry-contribution-v0.1", synthetic: false, createdAt: "2026-07-25T13:00:00.000Z",
+    coveredAt: { startAt: "2026-07-25T12:00:00.000Z", endAt: "2026-07-25T12:30:00.000Z" },
+    clientPlatform: "macos", providerPolicyEpoch: "openai_agentic_pool_2026_07_09",
+    usageEvents: [{
+      schemaVersion: "usage-event-v0.1", eventTime: "2026-07-25T12:05:00.000Z", provider: "openai_codex",
+      modelId: "gpt-5.6-sol", modelRecognition: "recognized", modelFingerprint: null,
+      billingSurface: "chatgpt_subscription", speedMode: "fast", apiServiceTier: "priority", reasoningEffort: "xhigh",
+      components: {
+        inputUncachedTokens: 100, inputCacheReadTokens: 900, inputCacheWriteTokens: 0, inputCacheWrite5mTokens: null,
+        inputCacheWrite1hTokens: null, outputTextTokens: 50, outputReasoningTokens: 25, outputCombinedTokens: null,
+      },
+      totalInputContextTokens: 1000, surface: "local_interactive_unclassified", agentScope: "root",
+      lineageDisposition: "standalone", toolClassCounts, outcome: "completed", eventId: `event:v2:${suffix.repeat(64)}`,
+      accounting: { estimatedApiCostUsd: "1.000000", pricingCoveragePercent: 100, unknownBillableUnits: 0,
+        priceBasis: "current_api_prices" },
+    }],
+    quotaSnapshots: [{
+      schemaVersion: "quota-snapshot-v0.1", observedTime: "2026-07-25T12:10:00.000Z",
+      receivedTime: "2026-07-25T12:10:01.000Z", provider: "openai_codex", planType: "pro", planVariant: "pro-20x",
+      limitId: "codex", slot: "seven_day", usedPercent: 31, displayPrecision: 0, windowDurationMinutes: 10080,
+      resetsAt: "2026-07-31T12:00:00.000Z", snapshotSource: "rollout", providerSurface: "account_shared_unallocated",
+      snapshotId: `snapshot:v2:${suffix.repeat(64)}`,
+    }],
+    activityMarkers: [],
+    accounting: { estimatedApiCostUsd: "1.000000", pricedEventCoveragePercent: 100, unknownModelEventCount: 0,
+      unknownBillableUnits: 0, priceBasis: "current_api_prices" },
+  };
+}
+
+/** The Worker's insertTelemetryContribution for the same ids and clock, on D1. */
+async function oracleV01Admission(twin, schema, contributionId, raw) {
+  const { insertTelemetryContribution, telemetryEnvelopeDigest, telemetryPlaintextDigest } =
+    await workerModule("/src/telemetry-repository.ts");
+  const { validateTelemetryContribution, validateTelemetryEnvelope } = await workerModule("/src/telemetry-validation.ts");
+  const { decryptSyntheticEnvelope } = await workerModule("/src/crypto.ts");
+  const keys = await envelopeKeys();
+  const row = (await twin.pgOnly(
+    `SELECT c.*, to_char(c.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_iso,
+            a.issued_by_device_id FROM "${schema}".telemetry_contributions c
+       JOIN "${schema}".device_upload_authorizations a ON a.id = c.device_upload_authorization_id
+      WHERE c.id = ?`, [contributionId])).rows[0];
+  assert.ok(row, "PostgreSQL committed the contribution");
+  const expires = new Date(Date.now() + 5 * 60_000).toISOString();
+  twin.d1Only(
+    `INSERT INTO device_upload_authorizations (id, participant_id, issued_by_device_id, secret_hash, envelope_digest,
+       body_bytes, content_type, state, issued_at, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'application/json', 'unused', ?, ?)`,
+    [row.device_upload_authorization_id, row.participant_id, row.issued_by_device_id, bytes32(), sha256Hex(raw),
+      Buffer.byteLength(raw), new Date(Date.parse(row.created_iso) - 1_000).toISOString(), expires]);
+  twin.d1Only("UPDATE device_upload_authorizations SET state = 'consuming', consume_lease_expires_at = ? WHERE id = ?",
+    [expires, row.device_upload_authorization_id]);
+  const envelope = validateTelemetryEnvelope(JSON.parse(raw));
+  const record = validateTelemetryContribution(
+    await decryptSyntheticEnvelope(envelope, keys.publicText, keys.privateText));
+  const envelopeDigest = await telemetryEnvelopeDigest(envelope);
+  const plaintextDigest = await telemetryPlaintextDigest(record);
+  assert.equal(row.envelope_digest, envelopeDigest);
+  assert.equal(row.plaintext_digest, plaintextDigest);
+  return insertTelemetryContribution(d1Database(twin.d1), row.participant_id,
+    { authorizationId: row.device_upload_authorization_id, authorizationKind: "device" },
+    contributionId, row.r2_key, envelopeDigest, plaintextDigest, record, row.created_iso);
+}
+
+const V01_TIMESTAMPS = new Set(["range_start", "range_end", "created_at", "dataset_range_start", "dataset_range_end",
+  "quarantine_deleted_at", "server_price_event_time_start", "server_price_event_time_end", "observed_at", "resets_at",
+  "server_price_event_time", "window_started_at", "last_accepted_at"]);
+const V01_JSON = new Set(["record_json", "server_price_card_ids", "server_unpriced_reason_codes"]);
+const V01_NUMBERS = new Set(["estimated_api_cost_usd", "priced_event_coverage_percent", "server_cost_usd",
+  "server_cost_nanousd", "used_percent", "pricing_coverage_percent", "server_pricing_coverage_percent",
+  "input_uncached_tokens", "input_cache_read_tokens", "input_cache_write_tokens", "output_text_tokens",
+  "output_reasoning_tokens", "output_combined_tokens", "tool_units", "total_input_context_tokens"]);
+
+async function v01Snapshot(twin, schema, participantId) {
+  const { canonicalJson } = await workerModule("/src/canonical-json.ts");
+  const normalize = (row) => Object.fromEntries(Object.entries(row).filter(([key]) => key !== "id" || !("record_kind" in row))
+    .map(([key, value]) => {
+      if (value === null || value === undefined) return [key, null];
+      if (value instanceof Date) return [key, value.toISOString()];
+      if (V01_TIMESTAMPS.has(key)) return [key, new Date(value).toISOString()];
+      if (V01_JSON.has(key)) return [key, canonicalJson(typeof value === "string" ? JSON.parse(value) : value)];
+      if (V01_NUMBERS.has(key)) return [key, Number(value)];
+      return [key, value];
+    }));
+  const s = `"${schema}".`;
+  const pg = async (sql) => (await twin.pool.query(sql, [participantId])).rows.map(normalize);
+  const d1 = (sql) => twin.d1.prepare(sql).all(participantId).map((row) => normalize({ ...row }));
+  const columns = (table) => twin.d1.prepare(`PRAGMA table_info(${table})`).all().map((column) => column.name)
+    .filter((name) => name !== "id" || table === "telemetry_contributions");
+  const list = (table) => columns(table).join(", ");
+  return {
+    pg: {
+      contributions: await pg(`SELECT ${list("telemetry_contributions")} FROM ${s}telemetry_contributions
+        WHERE participant_id = $1 ORDER BY id`),
+      records: await pg(`SELECT ${list("telemetry_records")} FROM ${s}telemetry_records
+        WHERE participant_id = $1 ORDER BY record_kind, occurrence_id`),
+      occurrences: await pg(`SELECT ${list("telemetry_contribution_occurrences")}
+        FROM ${s}telemetry_contribution_occurrences WHERE participant_id = $1 ORDER BY contribution_id, record_kind, occurrence_id`),
+      windows: await pg(`SELECT ${list("telemetry_contribution_admission_windows")}
+        FROM ${s}telemetry_contribution_admission_windows WHERE participant_id = $1 ORDER BY window_started_at`),
+      grants: await pg(`SELECT id, state, consumed_contribution_id, consume_lease_expires_at IS NULL AS lease_cleared
+        FROM ${s}device_upload_authorizations WHERE participant_id = $1
+         AND id IN (SELECT device_upload_authorization_id FROM ${s}telemetry_contributions) ORDER BY id`),
+    },
+    d1: {
+      contributions: d1(`SELECT ${list("telemetry_contributions")} FROM telemetry_contributions
+        WHERE participant_id = ? ORDER BY id`),
+      records: d1(`SELECT ${list("telemetry_records")} FROM telemetry_records
+        WHERE participant_id = ? ORDER BY record_kind, occurrence_id`),
+      occurrences: d1(`SELECT ${list("telemetry_contribution_occurrences")}
+        FROM telemetry_contribution_occurrences WHERE participant_id = ? ORDER BY contribution_id, record_kind, occurrence_id`),
+      windows: d1(`SELECT ${list("telemetry_contribution_admission_windows")}
+        FROM telemetry_contribution_admission_windows WHERE participant_id = ? ORDER BY window_started_at`),
+      grants: d1(`SELECT id, state, consumed_contribution_id, consume_lease_expires_at IS NULL AS lease_cleared
+        FROM device_upload_authorizations WHERE participant_id = ?
+         AND id IN (SELECT device_upload_authorization_id FROM telemetry_contributions) ORDER BY id`)
+        .map((row) => ({ ...row, lease_cleared: Boolean(row.lease_cleared) })),
+    },
+  };
+}
+
+test("PG17 a v0.1 contribution is admitted through the registry with the d43c8f92 rows, repriced, and replays idempotently", {
+  skip: SKIP, timeout: 300_000,
+}, () => withTwin(async ({ twin, pool, schema }) => {
+  const { schemaOptions } = await initializeTypedTargets(twin, schema);
+  const store = memoryObjectStore();
+  const service = await origin(pool, schemaOptions, store);
+  await socialParticipant(twin, "in3-v01");
+  const device = await socialDevice(twin, "in3-v01", randomUUID(), { consent: false });
+
+  const first = await service.uploadV01(device, v01Contribution("a"));
+  assert.equal(first.response.status, 202);
+  assert.deepEqual({ ...first.receipt, contributionId: "<id>" }, {
+    contributionId: "<id>", status: "accepted",
+    recordCounts: { usageEvents: 1, quotaSnapshots: 1, activityMarkers: 0, accepted: 2, deduplicated: 0 },
+    accountingVerification: "server_repriced",
+  });
+  assert.match(first.receipt.contributionId, /^contribution:[0-9a-f-]{36}$/u);
+  assert.deepEqual(await oracleV01Admission(twin, schema, first.receipt.contributionId, first.raw),
+    { acceptedRecords: 2, deduplicatedRecords: 0 });
+  // A second contribution re-sends the usage event (the client's replay
+  // overlap) and adds a new snapshot: one record is deduplicated, as on D1.
+  const overlap = v01Contribution("b");
+  overlap.usageEvents = v01Contribution("a").usageEvents;
+  const second = await service.uploadV01(device, overlap);
+  assert.equal(second.response.status, 202);
+  assert.deepEqual(second.receipt.recordCounts,
+    { usageEvents: 1, quotaSnapshots: 1, activityMarkers: 0, accepted: 1, deduplicated: 1 });
+  assert.deepEqual(await oracleV01Admission(twin, schema, second.receipt.contributionId, second.raw),
+    { acceptedRecords: 1, deduplicatedRecords: 1 });
+
+  const rows = await v01Snapshot(twin, schema, "in3-v01");
+  for (const key of Object.keys(rows.d1)) {
+    assert.deepEqual(rows.pg[key], rows.d1[key], `${key} matches the d43c8f92 v0.1 admission`);
+  }
+  assert.equal(rows.pg.contributions.length, 2);
+  assert.equal(rows.pg.records.length, 3);
+  assert.ok(rows.pg.records.some((row) => row.server_pricing_status !== null), "usage is server-repriced");
+  assert.deepEqual(rows.pg.windows.map((row) => row.accepted_count), [2]);
+  const pending = await pool.query(`SELECT count(*)::int AS n FROM "${schema}".pending_objects`);
+  assert.equal(pending.rows[0].n, 0, "D1 clears the pending registration once the contribution references it");
+  assert.equal(store.objects.size, 2);
+  const object = store.objects.get(rows.pg.contributions.find((row) => row.id === first.receipt.contributionId).r2_key);
+  assert.equal(object.value, JSON.stringify(JSON.parse(first.raw)));
+  assert.deepEqual(object.options.customMetadata, { contributionId: first.receipt.contributionId,
+    schemaVersion: "telemetry-envelope-v0.1", plaintextSchemaVersion: "telemetry-contribution-v0.1", synthetic: "false" });
+
+  // Envelope and content replays answer the retained contribution.
+  for (const replay of [
+    await service.uploadV01(device, null, { envelope: JSON.parse(first.raw) }),
+    await service.uploadV01(device, v01Contribution("a")),
+  ]) {
+    assert.equal(replay.response.status, 202);
+    assert.equal(replay.response.headers.get("idempotency-replayed"), "true");
+    assert.deepEqual(replay.receipt, {
+      contributionId: first.receipt.contributionId, status: "accepted", replayed: true,
+      recordCounts: { declared: 2, accepted: 2, deduplicated: 0 }, accountingVerification: "server_repriced",
+    });
+  }
+  const after = await v01Snapshot(twin, schema, "in3-v01");
+  assert.deepEqual(after.pg.contributions, rows.pg.contributions);
+  assert.deepEqual(after.pg.records, rows.pg.records);
+  assert.deepEqual(after.pg.windows, rows.pg.windows, "a replay takes no admission slot");
+  assert.equal(store.objects.size, 2);
+}));
+
+test("PG17 v0.1 keeps the Worker's weekly window, consent and transport refusals", {
+  skip: SKIP, timeout: 300_000,
+}, () => withTwin(async ({ twin, pool, schema }) => {
+  const { schemaOptions } = await initializeTypedTargets(twin, schema);
+  const store = memoryObjectStore();
+  const service = await origin(pool, schemaOptions, store);
+  const repository = await workerModule("/src/telemetry-repository.ts");
+  await socialParticipant(twin, "in3-v01-window");
+  const device = await socialDevice(twin, "in3-v01-window", randomUUID(), { consent: false });
+  const refused = async (principal, record) => {
+    try {
+      await service.uploadV01(principal, record);
+    } catch (error) {
+      return outcomeOf(error);
+    }
+    assert.fail("the upload was expected to be refused");
+  };
+  // A full window: both stores hold the same counter row.
+  const window = repository.telemetryContributionAdmissionWindow(Date.now());
+  await twin.run(`INSERT INTO telemetry_contribution_admission_windows (participant_id, window_started_at,
+      accepted_count, last_accepted_at) VALUES (?, ?, 100, ?)`, ["in3-v01-window", window.startsAt, iso()]);
+  const expected = await repository.telemetryContributionAdmission(d1Database(twin.d1), "in3-v01-window");
+  const limit = await refused(device, v01Contribution("c"));
+  assert.equal(limit.status, 429);
+  assert.equal(limit.code, "CONTRIBUTION_LIMIT_REACHED");
+  assert.deepEqual(limit.details, { admission: expected, retryAt: expected.window.endsAt });
+  assert.equal(store.objects.size, 0);
+
+  // The account-scoped consent is the deployed Worker's refusal.
+  await socialParticipant(twin, "in3-v01-scoped", "privacy-safe-telemetry-v0.2");
+  const scoped = { ...await socialDevice(twin, "in3-v01-scoped", randomUUID(), { consent: false }),
+    participantConsentVersion: "privacy-safe-telemetry-v0.2" };
+  assert.deepEqual(await refused(scoped, v01Contribution("d")),
+    { status: 503, code: "ACCOUNT_SCOPED_INGEST_DISABLED", details: null });
+
+  // A raised floor blocks v0.1 at authorization, as the Worker does.
+  await socialParticipant(twin, "in3-v01-floor");
+  const raised = await socialDevice(twin, "in3-v01-floor", randomUUID(), { consent: false });
+  await twin.run("UPDATE telemetry_transport_formats SET lifecycle = 'accepted' WHERE schema_version = ?",
+    ["telemetry-contribution-v1.1"]);
+  await twin.run(`INSERT INTO telemetry_v11_device_consents (participant_id, device_id, telemetry_schema_version,
+      field_dictionary_version, privacy_contract_version, consented_at)
+    VALUES (?, ?, 'telemetry-contribution-v1.1', 'telemetry-v1.1-registry-2026-08-31.1',
+      'ongoing-privacy-safe-telemetry-v1.1', ?)`, [raised.participantId, raised.deviceId, iso()]);
+  assert.deepEqual(await refused(raised, v01Contribution("e")),
+    { status: 403, code: "TELEMETRY_TRANSPORT_BLOCKED", details: null });
+  const counts = await pool.query(`SELECT (SELECT count(*)::int FROM "${schema}".telemetry_contributions) AS contributions,
+    (SELECT count(*)::int FROM "${schema}".pending_objects) AS pending`);
+  assert.deepEqual(counts.rows[0], { contributions: 0, pending: 0 });
+}));
+
+test("PG17 the staged migration replaces the lifetime cap with D1's weekly window, backfilled as D1 0014", {
+  skip: SKIP, timeout: 120_000,
+}, async () => {
+  const local = await endpoint();
+  const schema = `in3_backfill_${randomBytes(6).toString("hex")}`;
+  const pool = new pg.Pool({
+    host: local.host, port: local.port, user: PG_TEST_USER, password: PG_TEST_PASSWORD, database: PG_TEST_DATABASE,
+    ssl: false, max: 2, connectionTimeoutMillis: 5_000, application_name: "pg-legacy-contribution-backfill-test",
+    options: `-c search_path=${schema},pg_catalog`,
+  });
+  let created = false;
+  try {
+    await pool.query(`CREATE SCHEMA "${schema}"`);
+    created = true;
+    // Stock migrations only, then pre-existing contributions, then the staged file.
+    await applyStockAndStagedMigrations({ role: "primary", schema, pool, stagedFiles: [] });
+    await pool.query(`INSERT INTO "${schema}".participants (id, owner_kind, access_token_id, access_token_hash,
+        recovery_token_id, recovery_token_hash, state, consent_version, consented_at, created_at)
+      VALUES ('in3-history', 'social', 'access-in3-history', $1, 'recovery-in3-history', $2, 'active', $3, now(), now())`,
+    [bytes32(), bytes32(), PARTICIPANT_CONSENT]);
+    const created_at = ["2026-09-28T00:00:00.000Z", "2026-10-01T06:00:00.000Z", "2026-10-04T23:59:59.000Z",
+      "2026-10-05T00:00:00.000Z"];
+    for (const [index, at] of created_at.entries()) {
+      await pool.query(`INSERT INTO "${schema}".telemetry_contributions (id, participant_id, plaintext_digest,
+          envelope_digest, r2_key, status, schema_version, range_start, range_end, client_platform,
+          provider_policy_epoch, priced_event_coverage_percent, unknown_model_event_count, unknown_billable_units,
+          price_basis, declared_record_count, created_at)
+        VALUES ($1, 'in3-history', $2, $3, $4, 'accepted', 'telemetry-contribution-v0.1', $5, $5, 'synthetic',
+          'synthetic', 0, 0, 0, 'synthetic', 0, $5)`,
+      [`contribution:history-${index}`, sha256Hex(`p${index}`), sha256Hex(`e${index}`), `synthetic/${index}`, at]);
+    }
+    const sql = await readFile(join(WORKER_ROOT, "postgres", "staged-migrations", "primary",
+      await legacyAdmissionMigration()), "utf8").catch(() => null);
+    if (sql !== null) {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query(`SET LOCAL search_path TO "${schema}", pg_catalog`);
+        await client.query(sql);
+        await client.query("COMMIT");
+      } finally {
+        client.release();
+      }
+    }
+    const windows = await pool.query(`SELECT window_started_at, accepted_count, last_accepted_at
+      FROM "${schema}".telemetry_contribution_admission_windows ORDER BY window_started_at`);
+    const repository = await workerModule("/src/telemetry-repository.ts");
+    const startOf = (value) => repository.telemetryContributionAdmissionWindow(Date.parse(value)).startsAt;
+    assert.deepEqual(windows.rows.map((row) => ({
+      start: row.window_started_at.toISOString(), count: row.accepted_count, last: row.last_accepted_at.toISOString(),
+    })), [
+      { start: startOf(created_at[0]), count: 3, last: created_at[2] },
+      { start: startOf(created_at[3]), count: 1, last: created_at[3] },
+    ]);
+    const triggers = await pool.query(`SELECT tgname FROM pg_catalog.pg_trigger
+      WHERE tgrelid = '"${schema}".telemetry_contributions'::regclass AND NOT tgisinternal ORDER BY tgname`);
+    const names = triggers.rows.map((row) => row.tgname);
+    assert.ok(!names.includes("telemetry_contributions_participant_limit"), "the lifetime cap is gone");
+    assert.ok(names.includes("telemetry_contributions_enforce_admission_window"));
+    assert.ok(names.includes("telemetry_contributions_record_admission_window"));
+    for (const at of ["2026-10-05T00:00:00Z", "2026-10-04T23:59:59.999Z", "2026-10-01T06:00:00Z", "1999-12-31T12:00:00Z"]) {
+      const start = await pool.query(`SELECT "${schema}".telemetry_contribution_admission_window_start($1) AS start`, [at]);
+      assert.equal(start.rows[0].start.toISOString(), startOf(at), at);
+    }
+  } finally {
+    if (created) await pool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => {});
+    await pool.end();
+  }
+});

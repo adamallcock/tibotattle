@@ -35,7 +35,12 @@
  */
 import type { TelemetryV11UsageEvent } from "@app-usagemonitor/telemetry-contract";
 import { canonicalJson } from "./canonical-json";
-import { TELEMETRY_CONSENT_VERSION } from "./constants";
+import {
+  ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION,
+  MAX_TELEMETRY_CONTRIBUTIONS_PER_ADMISSION_WINDOW,
+  TELEMETRY_CONSENT_VERSION,
+  TELEMETRY_CONTRIBUTION_ADMISSION_WINDOW_MILLISECONDS,
+} from "./constants";
 import { decryptSyntheticEnvelope, sha256, sha256Hex } from "./crypto";
 import { ApiError, jsonResponse } from "./errors";
 import {
@@ -48,7 +53,18 @@ import {
   type PostgresSchemaConfig,
   type PostgresSchemaOptions,
 } from "./postgres-client";
-import { telemetryEnvelopeDigest } from "./telemetry-repository";
+import { assertPostgresTelemetryTransportWriteAllowed } from "./postgres-transport-write-authority";
+import { priceTelemetryUsageEvent, type ServerPricingResult } from "./server-pricing";
+import {
+  telemetryContributionAdmissionWindow,
+  telemetryEnvelopeDigest,
+  type TelemetryContributionAdmission,
+} from "./telemetry-repository";
+import {
+  validateTelemetryContribution,
+  validateTelemetryEnvelope,
+  type TelemetryContribution,
+} from "./telemetry-validation";
 import {
   assertTelemetryV1ConsentCurrent,
   MAX_TELEMETRY_V1_CHUNK_CANONICAL_BYTES,
@@ -1022,15 +1038,23 @@ async function persistTypedChunk(
 
 function validPendingObject(
   row: { contribution_id?: unknown; object_key?: unknown; object_kind?: unknown; reconciliation_state?: unknown } | undefined,
-  contributionId: string, objectKey: string, state = "registered",
+  contributionId: string, objectKey: string, state = "registered", kind = POSTGRES_TELEMETRY_V1_PENDING_OBJECT_KIND,
 ): boolean {
   return row?.contribution_id === contributionId && row.object_key === objectKey
-    && row.object_kind === POSTGRES_TELEMETRY_V1_PENDING_OBJECT_KIND && row.reconciliation_state === state;
+    && row.object_kind === kind && row.reconciliation_state === state;
 }
 
 /** pending_objects registration before the PUT (D1 putTrackedQuarantineObject). */
 async function registerPendingObject(
   pool: PostgresPool, schema: string, contributionId: string, objectKey: string, nowIso: string,
+): Promise<void> {
+  return registerPendingObjectOfKind(pool, schema, contributionId, objectKey, nowIso,
+    POSTGRES_TELEMETRY_V1_PENDING_OBJECT_KIND);
+}
+
+async function registerPendingObjectOfKind(
+  pool: PostgresPool, schema: string, contributionId: string, objectKey: string, nowIso: string,
+  kind: string,
 ): Promise<void> {
   const pending = table(schema, "pending_objects");
   const read = () => withPostgresRead(pool, async (client) => {
@@ -1041,14 +1065,14 @@ async function registerPendingObject(
         WHERE contribution_id = $1`,
       [contributionId],
     );
-    return validPendingObject(result.rows[0], contributionId, objectKey);
+    return validPendingObject(result.rows[0], contributionId, objectKey, "registered", kind);
   }, { operation: "telemetry_v1.pending_read" });
   try {
     await withPostgresMutation(pool, async (client) => {
       const inserted = await client.query(
-        `INSERT INTO ${pending} (contribution_id, object_key, object_kind, registered_at, reconciliation_state)
+        `INSERT INTO ${table(schema, "pending_objects")} (contribution_id, object_key, object_kind, registered_at, reconciliation_state)
          VALUES ($1, $2, $3, $4::timestamptz, 'registered') ON CONFLICT (contribution_id) DO NOTHING`,
-        [contributionId, objectKey, POSTGRES_TELEMETRY_V1_PENDING_OBJECT_KIND, nowIso],
+        [contributionId, objectKey, kind, nowIso],
       );
       if (inserted.rowCount !== 1) throw unavailable();
     }, { operation: "telemetry_v1.pending_register" });
@@ -1069,8 +1093,17 @@ async function retireUnreferencedObject(
   pool: PostgresPool, schema: string, objectStore: PostgresTelemetryV1ObjectStore,
   input: { chunkRowId: string; objectKey: string; authorizationId: string },
 ): Promise<boolean> {
+  return retireUnreferencedObjectOfKind(pool, schema, objectStore, input,
+    POSTGRES_TELEMETRY_V1_PENDING_OBJECT_KIND, "telemetry_v1_chunks");
+}
+
+async function retireUnreferencedObjectOfKind(
+  pool: PostgresPool, schema: string, objectStore: PostgresTelemetryV1ObjectStore,
+  input: { chunkRowId: string; objectKey: string; authorizationId: string },
+  kind: string, referencingTable: "telemetry_v1_chunks" | "telemetry_contributions",
+): Promise<boolean> {
   const pending = table(schema, "pending_objects");
-  const chunks = table(schema, "telemetry_v1_chunks");
+  const chunks = table(schema, referencingTable);
   const leaseId = crypto.randomUUID();
   const reference = `SELECT EXISTS (SELECT 1 FROM ${chunks}
     WHERE id = $1 OR r2_key = $2 OR device_upload_authorization_id = $3) AS referenced`;
@@ -1082,7 +1115,7 @@ async function retireUnreferencedObject(
         WHERE contribution_id = $1 FOR UPDATE`,
       [input.chunkRowId],
     );
-    if (!validPendingObject(row.rows[0], input.chunkRowId, input.objectKey)) return false;
+    if (!validPendingObject(row.rows[0], input.chunkRowId, input.objectKey, "registered", kind)) return false;
     const referenced = await client.query<{ referenced: boolean }>(
       reference, [input.chunkRowId, input.objectKey, input.authorizationId]);
     if (referenced.rows[0]?.referenced !== false) return false;
@@ -1090,7 +1123,7 @@ async function retireUnreferencedObject(
       `UPDATE ${pending} SET reconciliation_state = 'deleting', reconciliation_lease_id = $2
         WHERE contribution_id = $1 AND object_key = $3 AND object_kind = $4
           AND reconciliation_state = 'registered'`,
-      [input.chunkRowId, leaseId, input.objectKey, POSTGRES_TELEMETRY_V1_PENDING_OBJECT_KIND],
+      [input.chunkRowId, leaseId, input.objectKey, kind],
     );
     return updated.rowCount === 1;
   }, { operation: "telemetry_v1.object_claim" });
@@ -1103,7 +1136,7 @@ async function retireUnreferencedObject(
     const removed = await client.query(
       `DELETE FROM ${pending} WHERE contribution_id = $1 AND object_key = $2 AND object_kind = $3
           AND reconciliation_state = 'deleting' AND reconciliation_lease_id = $4`,
-      [input.chunkRowId, input.objectKey, POSTGRES_TELEMETRY_V1_PENDING_OBJECT_KIND, leaseId],
+      [input.chunkRowId, input.objectKey, kind, leaseId],
     );
     return removed.rowCount === 1;
   }, { operation: "telemetry_v1.object_retire" });
@@ -1336,4 +1369,446 @@ export async function recordPostgresDeviceUploadReceipt(
     if (error instanceof ApiError) throw error;
     throw unavailable();
   }
+}
+
+// ---------------------------------------------------------------------------
+// telemetry-envelope-v0.1: handleTelemetryContribution (src/index.ts at
+// d43c8f92) with insertTelemetryContribution (telemetry-repository.ts) and the
+// D1 insert triggers on telemetry_contributions as explicit steps. The weekly
+// admission window is enforced by the staged legacy_contribution_admission
+// migration's triggers, exactly as D1 migrations/0014 does.
+//
+// Deliberate differences, each a refusal:
+//   - The account-scoped (v0.2 consent) branch answers the Worker's deployed
+//     refusal, 503 ACCOUNT_SCOPED_INGEST_DISABLED: production never runs the
+//     loopback-only local preview it requires, and the origin cannot.
+//   - A replayed contribution whose accounting step never finished
+//     (accepted_record_count NULL, repaired from its records by D1) is
+//     refused with 503 instead of being repaired; a PostgreSQL admission
+//     commits header, records and accounting in one transaction, so only an
+//     imported row can be in that state.
+// ---------------------------------------------------------------------------
+
+export const POSTGRES_TELEMETRY_V01_PENDING_OBJECT_KIND = "telemetry";
+
+interface V01ReplayRow {
+  id: string;
+  status: string;
+  declared_record_count: number;
+  accepted_record_count: number | null;
+}
+
+function v01ReplayResponse(row: V01ReplayRow): Response {
+  if (row.accepted_record_count === null) throw unavailable();
+  const declared = safeInteger(row.declared_record_count);
+  const accepted = safeInteger(row.accepted_record_count);
+  return jsonResponse({
+    contributionId: row.id,
+    status: row.status,
+    replayed: true,
+    recordCounts: { declared, accepted, deduplicated: declared - accepted },
+    accountingVerification: "server_repriced",
+  }, 202, { "idempotency-replayed": "true" });
+}
+
+async function v01ContributionByDigest(
+  client: PostgresClient, schema: string, participantId: string, digest: string,
+  kind: "plaintext" | "envelope",
+): Promise<V01ReplayRow | null> {
+  const column = kind === "plaintext" ? "plaintext_digest" : "envelope_digest";
+  const result = await client.query<V01ReplayRow>(
+    `SELECT id, status, declared_record_count, accepted_record_count
+       FROM ${table(schema, "telemetry_contributions")}
+      WHERE participant_id = $1 AND ${column} = $2`,
+    [participantId, digest],
+  );
+  return result.rows[0] ?? null;
+}
+
+/** Port of telemetryContributionAdmission (telemetry-repository.ts). */
+async function v01Admission(
+  client: PostgresClient, schema: string, participantId: string, nowEpoch: number,
+): Promise<TelemetryContributionAdmission> {
+  const window = telemetryContributionAdmissionWindow(nowEpoch);
+  const result = await client.query<{ accepted_count: number }>(
+    `SELECT accepted_count FROM ${table(schema, "telemetry_contribution_admission_windows")}
+      WHERE participant_id = $1 AND window_started_at = $2::timestamptz`,
+    [participantId, window.startsAt],
+  );
+  const acceptedBatches = Math.max(0, Math.min(MAX_TELEMETRY_CONTRIBUTIONS_PER_ADMISSION_WINDOW,
+    Number(result.rows[0]?.accepted_count ?? 0)));
+  const remainingBatches = Math.max(0, MAX_TELEMETRY_CONTRIBUTIONS_PER_ADMISSION_WINDOW - acceptedBatches);
+  return {
+    schemaVersion: "telemetry-contribution-admission-v0.1",
+    state: remainingBatches > 0 ? "available" : "exhausted",
+    window: {
+      kind: "fixed_utc",
+      anchor: "monday_00_00_utc",
+      startsAt: window.startsAt,
+      endsAt: window.endsAt,
+      durationMilliseconds: TELEMETRY_CONTRIBUTION_ADMISSION_WINDOW_MILLISECONDS,
+    },
+    acceptedBatches,
+    remainingBatches,
+    maximumBatches: MAX_TELEMETRY_CONTRIBUTIONS_PER_ADMISSION_WINDOW,
+    slotRefundPolicy: "not_refunded_by_contribution_deletion",
+  };
+}
+
+/** Port of telemetryContributionLimitError (src/index.ts, private there). */
+function v01LimitError(admission: TelemetryContributionAdmission, nowEpoch = Date.now()): ApiError {
+  const retryAtEpoch = Date.parse(admission.window.endsAt);
+  const retryAfterSeconds = Number.isFinite(retryAtEpoch)
+    ? Math.max(1, Math.ceil((retryAtEpoch - nowEpoch) / 1000))
+    : 1;
+  return new ApiError(429, "CONTRIBUTION_LIMIT_REACHED", {
+    publicDetails: { admission, retryAt: admission.window.endsAt },
+    responseHeaders: { "retry-after": String(retryAfterSeconds) },
+  });
+}
+
+/** The D1 per-statement server-price totals (storedServerPricingTotals). */
+function v01StoredPricingTotals(serverPricing: readonly ServerPricingResult[], stored: readonly boolean[]) {
+  let costNanousd = 0;
+  let fullyPricedEvents = 0;
+  let partiallyPricedEvents = 0;
+  let unpricedEvents = 0;
+  const priceBases = new Set<string>();
+  const priceEpochBases = new Set<string>();
+  const eventTimes: string[] = [];
+  let missingEventTime = false;
+  for (const [index, pricing] of serverPricing.entries()) {
+    if (!stored[index]) continue;
+    costNanousd += pricing.costNanousd;
+    if (pricing.coverageStatus === "fully_priced") fullyPricedEvents += 1;
+    else if (pricing.coverageStatus === "partially_priced") partiallyPricedEvents += 1;
+    else unpricedEvents += 1;
+    priceBases.add(pricing.priceBasis);
+    priceEpochBases.add(pricing.priceEpochBasis);
+    if (pricing.priceEventTime === null) missingEventTime = true;
+    else eventTimes.push(pricing.priceEventTime);
+  }
+  eventTimes.sort();
+  return {
+    costNanousd, fullyPricedEvents, partiallyPricedEvents, unpricedEvents,
+    priceBasis: priceBases.size === 0 ? "unpriced" : priceBases.size === 1 ? [...priceBases][0]! : "mixed_api_prices",
+    priceEpochBasis: priceEpochBases.size === 1 ? [...priceEpochBases][0]! : null,
+    eventTimeStart: missingEventTime ? null : eventTimes[0] ?? null,
+    eventTimeEnd: missingEventTime ? null : eventTimes.at(-1) ?? null,
+  };
+}
+
+interface V01PersistInput {
+  readonly principal: PostgresTelemetryV1Principal;
+  readonly authorizationId: string;
+  readonly contributionId: string;
+  readonly r2Key: string;
+  readonly envelopeDigest: string;
+  readonly plaintextDigest: string;
+  readonly record: TelemetryContribution;
+  readonly createdAt: string;
+  readonly nowEpoch: number;
+}
+
+class V01AdmissionWindowExhausted extends Error {}
+
+/**
+ * The D1 batch plus its accounting UPDATE as one PostgreSQL transaction.
+ * D1's BEFORE INSERT guards run first under row locks: active social
+ * participant, consuming device grant, participant-floor transport check
+ * (telemetry_transport_legacy_insert reads only the participant floor) and
+ * the pending-object reconciliation fence; its AFTER INSERT effects follow:
+ * grant consumption and the pending registration cleared.
+ */
+async function persistV01Contribution(
+  client: PostgresClient, schema: string, input: V01PersistInput,
+): Promise<{ acceptedRecords: number; deduplicatedRecords: number }> {
+  const { principal, record } = input;
+  const nowIso = new Date(input.nowEpoch).toISOString();
+  const participant = await client.query<{ state: string; owner_kind: string }>(
+    `SELECT state, owner_kind FROM ${table(schema, "participants")} WHERE id = $1 FOR UPDATE`,
+    [principal.participantId],
+  );
+  if (participant.rows[0]?.state !== "active" || participant.rows[0]?.owner_kind !== "social") {
+    throw new ApiError(409, "PARTICIPANT_DELETING");
+  }
+  const grant = await client.query<{ id: string }>(
+    `SELECT id FROM ${table(schema, "device_upload_authorizations")}
+      WHERE id = $1 AND participant_id = $2 AND issued_by_device_id = $3 AND state = 'consuming'
+        AND consume_lease_expires_at > $4::timestamptz AND expires_at > $4::timestamptz
+      FOR UPDATE`,
+    [input.authorizationId, principal.participantId, principal.deviceId, nowIso],
+  );
+  if (grant.rows.length !== 1) throw uploadUnavailable();
+  const floor = await client.query<{ allowed: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM ${table(schema, "telemetry_transport_formats")} format_row
+         JOIN ${table(schema, "telemetry_transport_participant_floors")} floor_row
+           ON floor_row.participant_id = $1
+        WHERE format_row.schema_version = 'telemetry-contribution-v0.1'
+          AND format_row.lifecycle = 'accepted' AND format_row.format_rank >= floor_row.minimum_rank
+     ) AS allowed`,
+    [principal.participantId],
+  );
+  if (floor.rows[0]?.allowed !== true) throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
+  const pending = await client.query<{ object_key: string; reconciliation_state: string }>(
+    `SELECT object_key, reconciliation_state FROM ${table(schema, "pending_objects")}
+      WHERE contribution_id = $1 FOR UPDATE`,
+    [input.contributionId],
+  );
+  if (pending.rows[0]?.object_key !== input.r2Key || pending.rows[0]?.reconciliation_state !== "registered") {
+    throw unavailable();
+  }
+
+  const declared = record.usageEvents.length + record.quotaSnapshots.length + record.activityMarkers.length;
+  try {
+    await client.query(
+      `INSERT INTO ${table(schema, "telemetry_contributions")} (
+         id, participant_id, plaintext_digest, envelope_digest, r2_key, status, schema_version,
+         range_start, range_end, client_platform, provider_policy_epoch, estimated_api_cost_usd,
+         priced_event_coverage_percent, unknown_model_event_count, unknown_billable_units, price_basis,
+         declared_record_count, created_at, upload_authorization_id, device_upload_authorization_id,
+         transport_schema_version
+       ) VALUES ($1, $2, $3, $4, $5, 'accepted', $6, $7::timestamptz, $8::timestamptz, $9, $10, $11,
+         $12, $13, $14, $15, $16, $17::timestamptz, NULL, $18, 'telemetry-contribution-v0.1')`,
+      [input.contributionId, principal.participantId, input.plaintextDigest, input.envelopeDigest, input.r2Key,
+        record.schemaVersion, record.coveredAt.startAt, record.coveredAt.endAt, record.clientPlatform,
+        record.providerPolicyEpoch, record.accounting.estimatedApiCostUsd,
+        record.accounting.pricedEventCoveragePercent, record.accounting.unknownModelEventCount,
+        record.accounting.unknownBillableUnits, record.accounting.priceBasis, declared, input.createdAt,
+        input.authorizationId],
+    );
+  } catch (error) {
+    // The staged window trigger (D1 0014) raises a constant P1003.
+    if (error !== null && typeof error === "object" && Reflect.get(error, "code") === "P1003") {
+      throw new V01AdmissionWindowExhausted();
+    }
+    throw error;
+  }
+
+  const serverPricing = record.usageEvents.map(priceTelemetryUsageEvent);
+  const stored: boolean[] = [];
+  const occurrence = async (kind: string, occurrenceId: string) => {
+    await client.query(
+      `INSERT INTO ${table(schema, "telemetry_contribution_occurrences")}
+         (contribution_id, participant_id, record_kind, occurrence_id, dataset_id, account_track_id, policy_epoch)
+       VALUES ($1, $2, $3, $4, NULL, 'unattributed', NULL)`,
+      [input.contributionId, principal.participantId, kind, occurrenceId],
+    );
+  };
+  for (const [index, row] of record.usageEvents.entries()) {
+    const pricing = serverPricing[index]!;
+    const inserted = await client.query(
+      `INSERT INTO ${table(schema, "telemetry_records")} (
+         origin_contribution_id, participant_id, record_kind, occurrence_id, observed_at, provider, model_id,
+         model_fingerprint, speed_mode, api_service_tier, surface, billing_surface, total_input_context_tokens,
+         reasoning_effort, agent_scope, input_uncached_tokens, input_cache_read_tokens, input_cache_write_tokens,
+         output_text_tokens, output_reasoning_tokens, output_combined_tokens, tool_units, estimated_api_cost_usd,
+         pricing_coverage_percent, unknown_billable_units, server_cost_usd, server_cost_nanousd,
+         server_pricing_coverage_percent, server_unknown_billable_units, server_pricing_status,
+         server_pricing_method_version, server_price_registry_version, server_price_registry_sha256,
+         server_price_card_ids, server_unpriced_reason_codes, server_price_epoch_basis, server_tier_basis,
+         server_api_service_tier, server_price_basis, server_price_event_time, dataset_id, account_track_id,
+         policy_epoch, record_json
+       ) VALUES ($1, $2, 'usage', $3, $4::timestamptz, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+         $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33::jsonb, $34::jsonb,
+         $35, $36, $37, $38, $39::timestamptz, NULL, 'unattributed', NULL, $40::jsonb)
+       ON CONFLICT (participant_id, record_kind, occurrence_id) DO NOTHING`,
+      [input.contributionId, principal.participantId, row.eventId, row.eventTime, row.provider, row.modelId,
+        row.modelFingerprint, row.speedMode, row.apiServiceTier, row.surface, row.billingSurface,
+        row.totalInputContextTokens ?? null, row.reasoningEffort, row.agentScope,
+        row.components.inputUncachedTokens ?? null, row.components.inputCacheReadTokens ?? null,
+        row.components.inputCacheWriteTokens ?? null, row.components.outputTextTokens ?? null,
+        row.components.outputReasoningTokens ?? null, row.components.outputCombinedTokens ?? null,
+        Object.values(row.toolClassCounts).reduce((sum, value) => sum + value, 0),
+        row.accounting.estimatedApiCostUsd, row.accounting.pricingCoveragePercent,
+        row.accounting.unknownBillableUnits, pricing.exactCostUsd, pricing.costNanousd, pricing.coveragePercent,
+        pricing.unknownBillableUnits, pricing.coverageStatus, pricing.methodVersion, pricing.registryVersion,
+        pricing.registrySha256, canonicalJson(pricing.selectedPriceCardIds),
+        canonicalJson(pricing.unpricedReasonCodes), pricing.priceEpochBasis, pricing.tierBasis,
+        pricing.apiServiceTier, pricing.priceBasis, pricing.priceEventTime, canonicalJson(row)],
+    );
+    stored.push(inserted.rowCount === 1);
+    await occurrence("usage", row.eventId);
+  }
+  for (const row of record.quotaSnapshots) {
+    const inserted = await client.query(
+      `INSERT INTO ${table(schema, "telemetry_records")} (
+         origin_contribution_id, participant_id, record_kind, occurrence_id, observed_at, provider, plan_type,
+         plan_variant, limit_id, slot, used_percent, window_duration_minutes, resets_at, dataset_id,
+         account_track_id, policy_epoch, record_json
+       ) VALUES ($1, $2, 'quota', $3, $4::timestamptz, $5, $6, $7, $8, $9, $10, $11, $12::timestamptz, NULL,
+         'unattributed', NULL, $13::jsonb)
+       ON CONFLICT (participant_id, record_kind, occurrence_id) DO NOTHING`,
+      [input.contributionId, principal.participantId, row.snapshotId, row.observedTime, row.provider,
+        row.planType, row.planVariant, row.limitId, row.slot, row.usedPercent, row.windowDurationMinutes,
+        row.resetsAt, canonicalJson(row)],
+    );
+    stored.push(inserted.rowCount === 1);
+    await occurrence("quota", row.snapshotId);
+  }
+  for (const row of record.activityMarkers) {
+    const inserted = await client.query(
+      `INSERT INTO ${table(schema, "telemetry_records")} (
+         origin_contribution_id, participant_id, record_kind, occurrence_id, observed_at, surface, plan_type,
+         plan_variant, dataset_id, account_track_id, policy_epoch, record_json
+       ) VALUES ($1, $2, 'activity', $3, $4::timestamptz, $5, $6, $7, NULL, 'unattributed', NULL, $8::jsonb)
+       ON CONFLICT (participant_id, record_kind, occurrence_id) DO NOTHING`,
+      [input.contributionId, principal.participantId, row.markerId, row.observedTime, row.surface,
+        row.planType, row.planVariant, canonicalJson(row)],
+    );
+    stored.push(inserted.rowCount === 1);
+    await occurrence("activity", row.markerId);
+  }
+  const acceptedRecords = stored.filter(Boolean).length;
+  const accounting = v01StoredPricingTotals(serverPricing, stored.slice(0, serverPricing.length));
+  const updated = await client.query(
+    `UPDATE ${table(schema, "telemetry_contributions")}
+        SET server_cost_nanousd = $1, server_priced_event_count = $2,
+            server_partially_priced_event_count = $3, server_unpriced_event_count = $4,
+            server_pricing_method_version = $5, server_price_registry_version = $6,
+            server_price_registry_sha256 = $7, server_price_basis = $8, server_price_epoch_basis = $9,
+            server_price_event_time_start = $10::timestamptz, server_price_event_time_end = $11::timestamptz,
+            accepted_record_count = $12
+      WHERE id = $13 AND participant_id = $14`,
+    [accounting.costNanousd, accounting.fullyPricedEvents, accounting.partiallyPricedEvents,
+      accounting.unpricedEvents, serverPricing[0]?.methodVersion ?? null, serverPricing[0]?.registryVersion ?? null,
+      serverPricing[0]?.registrySha256 ?? null, accounting.priceBasis, accounting.priceEpochBasis,
+      accounting.eventTimeStart, accounting.eventTimeEnd, acceptedRecords, input.contributionId,
+      principal.participantId],
+  );
+  if (updated.rowCount !== 1) throw unavailable();
+  // D1 telemetry_contributions_consume_device_upload and
+  // telemetry_contributions_clear_pending_quarantine.
+  const consumed = await client.query(
+    `UPDATE ${table(schema, "device_upload_authorizations")}
+        SET state = 'consumed', consumed_at = $2::timestamptz, consume_lease_expires_at = NULL,
+            consumed_contribution_id = $3
+      WHERE id = $1 AND participant_id = $4 AND state = 'consuming'`,
+    [input.authorizationId, input.createdAt, input.contributionId, principal.participantId],
+  );
+  if (consumed.rowCount !== 1) throw uploadUnavailable();
+  await client.query(
+    `DELETE FROM ${table(schema, "pending_objects")}
+      WHERE contribution_id = $1 AND object_key = $2 AND reconciliation_state = 'registered'`,
+    [input.contributionId, input.r2Key],
+  );
+  return { acceptedRecords, deduplicatedRecords: declared - acceptedRecords };
+}
+
+/**
+ * telemetry-envelope-v0.1 after the shared preamble: the port of
+ * handleTelemetryContribution (src/index.ts at d43c8f92). Returns the
+ * Worker's 202 receipt (fresh or replayed) or throws the Worker's ApiError.
+ */
+export async function admitPostgresTelemetryV01Contribution(
+  input: Omit<PostgresTelemetryV1ContributionInput, "sourceNamespace">,
+): Promise<Response> {
+  const nowEpoch = requestEpoch(input.nowEpoch);
+  const schemaConfig: PostgresSchemaConfig = createPostgresSchemaConfig(input.schema ?? {});
+  const schema = schemaName(schemaConfig);
+  const { pool, objectStore } = input;
+  if (input.participant.consentVersion === ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION) {
+    // assertAccountScopedLocalPreview outside ACCOUNT_SCOPED_INGEST_MODE=local_preview.
+    throw new ApiError(503, "ACCOUNT_SCOPED_INGEST_DISABLED");
+  }
+  if (input.participant.consentVersion !== TELEMETRY_CONSENT_VERSION) {
+    throw new ApiError(400, "TELEMETRY_REQUIRED");
+  }
+  if (typeof input.deviceId !== "string" || input.deviceId.length < 1) throw uploadUnavailable();
+  const principal: PostgresTelemetryV1Principal = Object.freeze({
+    participantId: input.participant.id, deviceId: input.deviceId,
+  });
+  await assertPostgresTelemetryTransportWriteAllowed(pool, principal, "telemetry-contribution-v0.1",
+    { schema: schemaConfig, nowEpoch });
+  const envelope = validateTelemetryEnvelope(input.body.value);
+  const envelopeDigest = await telemetryEnvelopeDigest(envelope);
+  const envelopeReplay = await withPostgresRead(pool,
+    (client) => v01ContributionByDigest(client, schema, principal.participantId, envelopeDigest, "envelope"),
+    { operation: "telemetry_v01.envelope_replay", preserveSafeError });
+  if (envelopeReplay) return v01ReplayResponse(envelopeReplay);
+  const admission = await withPostgresRead(pool,
+    (client) => v01Admission(client, schema, principal.participantId, nowEpoch),
+    { operation: "telemetry_v01.admission", preserveSafeError });
+  if (admission.state === "exhausted") throw v01LimitError(admission, nowEpoch);
+
+  const plaintext = await decryptSyntheticEnvelope(envelope, input.envelopePublicJwk, input.envelopePrivateJwk);
+  const record = validateTelemetryContribution(plaintext);
+  const plaintextDigest = await sha256Hex(canonicalJson(record));
+  const contentReplay = await withPostgresRead(pool,
+    (client) => v01ContributionByDigest(client, schema, principal.participantId, plaintextDigest, "plaintext"),
+    { operation: "telemetry_v01.content_replay", preserveSafeError });
+  if (contentReplay) return v01ReplayResponse(contentReplay);
+
+  const contributionId = `contribution:${crypto.randomUUID()}`;
+  const r2Key = `telemetry/${crypto.randomUUID()}`;
+  const createdAt = new Date(nowEpoch).toISOString();
+  await registerPendingObjectOfKind(pool, schema, contributionId, r2Key, createdAt,
+    POSTGRES_TELEMETRY_V01_PENDING_OBJECT_KIND);
+  try {
+    await objectStore.put(r2Key, JSON.stringify(envelope), {
+      contentType: "application/json",
+      customMetadata: {
+        contributionId,
+        schemaVersion: envelope.schemaVersion,
+        plaintextSchemaVersion: record.schemaVersion,
+        synthetic: "false",
+      },
+    });
+  } catch {
+    throw unavailable();
+  }
+  let result: { acceptedRecords: number; deduplicatedRecords: number };
+  try {
+    result = await withPostgresMutation(pool, (client) => persistV01Contribution(client, schema, {
+      principal, authorizationId: input.authorization.authorizationId, contributionId, r2Key, envelopeDigest,
+      plaintextDigest, record, createdAt, nowEpoch,
+    }), {
+      operation: "telemetry_v01.admit",
+      isolationLevel: "read_committed",
+      statementTimeoutMilliseconds: 60_000,
+      lockTimeoutMilliseconds: 5_000,
+      preserveSafeError: (error) => error instanceof V01AdmissionWindowExhausted ? error : preserveSafeError(error),
+    });
+  } catch (error) {
+    // A committed write whose acknowledgement was lost is answered from the
+    // canonical row; only a completed lookup with no row allows cleanup.
+    let replay: V01ReplayRow | null;
+    try {
+      replay = await withPostgresRead(pool,
+        (client) => v01ContributionByDigest(client, schema, principal.participantId, plaintextDigest, "plaintext"),
+        { operation: "telemetry_v01.recover", preserveSafeError });
+    } catch {
+      throw unavailable();
+    }
+    if (replay) return v01ReplayResponse(replay);
+    try {
+      await retireUnreferencedObjectOfKind(pool, schema, objectStore, {
+        chunkRowId: contributionId, objectKey: r2Key, authorizationId: input.authorization.authorizationId,
+      }, POSTGRES_TELEMETRY_V01_PENDING_OBJECT_KIND, "telemetry_contributions");
+    } catch { /* the durable pending row stays the reconciliation journal */ }
+    let retryAdmission: TelemetryContributionAdmission;
+    try {
+      retryAdmission = await withPostgresRead(pool,
+        (client) => v01Admission(client, schema, principal.participantId, Date.now()),
+        { operation: "telemetry_v01.admission_retry", preserveSafeError });
+    } catch {
+      throw unavailable();
+    }
+    if (retryAdmission.state === "exhausted") throw v01LimitError(retryAdmission);
+    if (error instanceof ApiError) throw error;
+    throw unavailable();
+  }
+  return jsonResponse({
+    contributionId,
+    status: "accepted",
+    recordCounts: {
+      usageEvents: record.usageEvents.length,
+      quotaSnapshots: record.quotaSnapshots.length,
+      activityMarkers: record.activityMarkers.length,
+      accepted: result.acceptedRecords,
+      deduplicated: result.deduplicatedRecords,
+    },
+    accountingVerification: "server_repriced",
+  }, 202);
 }
