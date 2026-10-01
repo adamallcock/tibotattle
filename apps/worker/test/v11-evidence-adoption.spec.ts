@@ -163,6 +163,21 @@ describe("owner adoption of accepted v1.1 uploads", () => {
     expect(await headDays(device.participantId)).toEqual([]);
   });
 
+  it("prunes a stuck client's oldest open predecessors, as the client does, instead of refusing at the cap", async () => {
+    const device = await accountlessDevice();
+    await uploadDay(device, day(3), [1]);
+    // Every failed pass leaves an open predecessor; the table holds at most eight.
+    const earlier = Date.now() - 30 * 60_000;
+    for (let n = 0; n < 8; n += 1) await createTelemetryV11DomainPredecessor(source(), device, earlier + n * 1_000);
+    const open = async () => source().prepare(`SELECT count(*) AS n FROM telemetry_v11_domain_predecessors
+      WHERE participant_id = ? AND consumed_at IS NULL`).bind(device.participantId).first("n");
+    expect(await open()).toBe(8);
+    expect(await adoptV11UploadedEvidence(source(), request(false))).toMatchObject({ outcomes: { adopted: 1, refused: 0 } });
+    expect((await headDays(device.participantId)).map((row) => row.day)).toEqual([day(3)]);
+    // Still bounded: the client's seven newest stay open; adoption's own was consumed.
+    expect(await open()).toBe(7);
+  });
+
   it("leaves a device alone while its client may be mid-pass", async () => {
     const device = await accountlessDevice();
     await uploadDay(device, day(3), [1]);
