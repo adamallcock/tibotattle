@@ -34,11 +34,16 @@ export function jsonResponse(status, value, additionalHeaders = {}) {
   });
 }
 
-/** The Worker's errorResponse; anything that is not a closed ApiError-shaped error is a 503. */
+/**
+ * The Worker's catch path (index.ts, family contract FC-5): a closed
+ * ApiError-shaped error keeps its status, code, details and headers; anything
+ * else is 500 INTERNAL_ERROR, and no thrown message reaches the body. Storage
+ * failures arrive here already closed as 503 BACKEND_STORAGE_UNAVAILABLE.
+ */
 export function routeErrorResponse(error) {
   const closed = Number.isSafeInteger(error?.status) && error.status >= 400 && error.status <= 599
     && typeof error?.code === "string" && /^[A-Z0-9_]+$/u.test(error.code);
-  const effective = closed ? error : storageUnavailable();
+  const effective = closed ? error : routeFailure(500, "INTERNAL_ERROR");
   const headers = {};
   if (effective.responseHeaders) {
     for (const [name, value] of new Headers(effective.responseHeaders)) headers[name] = value;

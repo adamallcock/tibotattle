@@ -129,16 +129,16 @@ test("v1.1 device routes answer the Worker's preamble codes before storage", asy
   )), 400, "BODY_INVALID");
 });
 
-test("a non-closed storage failure is a masked 503 without provider text", async () => {
+test("a failure that is not a closed error is the Worker's 500 without its text", async () => {
   const route = createTelemetryV11DomainActivateRouteModule(deviceDependencies({
     createDomain() {
       return { async activate() { throw new TypeError("relation \"secret_table\" does not exist"); } };
     },
   }));
   const response = await route.handler(request("/api/v1/me/telemetry-v11/domain-activate", { body: "{}" }));
-  assert.equal(response.status, 503);
+  assert.equal(response.status, 500);
   const text = await response.text();
-  assert.match(text, /"code":"BACKEND_STORAGE_UNAVAILABLE"/u);
+  assert.match(text, /"code":"INTERNAL_ERROR"/u);
   assert.doesNotMatch(text, /secret_table|relation/u);
 });
 
