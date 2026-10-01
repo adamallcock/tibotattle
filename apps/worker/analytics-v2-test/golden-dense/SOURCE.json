@@ -2,7 +2,7 @@
  "schemaVersion": "gcp-fastpath-dense-golden-source-v1",
  "note": "Produced by the dense production-code oracle running d43c8f92's Worker code unmodified under Node over sealed SQLite files: the scheduled lanes (Tier N) and the forced native (Tier F), direct native and cache-retention references the command selects. Regenerate with the command below; never edit by hand.",
  "sourceCommit": "d43c8f92a059d9c577776f7eca8a331eb305b8a6",
- "command": "node --max-old-space-size=16384 apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs --work-dir <dir> --corpus q1 --forced-native all --direct-native all --direct-jobs <n> --settle-cache both --golden-out apps/worker/analytics-v2-test/golden-q1-node",
+ "command": "node --max-old-space-size=32768 apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs --work-dir <dir> --corpus dense --publication-passes 4 --analytics-passes 2 --clock-step-ms 15000 --stop-when daily-published --converge-on daily --forced-native none --direct-results <direct.mjs work dir>/direct-results.json --settle-cache both --golden-out apps/worker/analytics-v2-test/golden-dense",
  "oracleFiles": {
   "apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs": "1a504d1bf532bd057d5d8db76be8ad23556f0cfa",
   "apps/worker/scripts/gcp-fastpath-dense-oracle/build.mjs": "b58898bc8bab267d6a7b0c392dacebb46abce58e",
@@ -27,7 +27,21 @@
   "blob": "b39018ba15bbcccc5d1fb5285f33a9c88914c4b7"
  },
  "resumedFrom": "a run of the same corpus, scale and cadence that converged or stopped by its stop rule (--resume): its seeding, scheduled lanes and lease-expiry probe ran in that run's process and their recorded outcomes were carried forward; every file here was computed by this process from that state, except the direct references when directResults is set",
- "directResults": null,
+ "directResults": {
+  "command": "node apps/worker/scripts/gcp-fastpath-dense-oracle/direct.mjs --work-dir <dir> --source <seeded usage-monitor.sqlite> --expect-source-digest <sourceDigest> --jobs 12",
+  "sha256": "c395b60d0c8f452620dc8bb432fc59f807901dc9c150be592e541c2b7c678f27",
+  "sourceDigest": "bdbec7f71134bf4b6455b9562e6c340494f2fe3e31dc9a6d8223a3c065c7804a",
+  "nowMs": 1790856000000,
+  "producerFiles": "apps/worker/scripts/gcp-fastpath-dense-oracle/{direct.mjs,direct-native.mjs,direct-native-child.mjs,source-digest.mjs} at the blobs listed in oracleFiles",
+  "recomputedInThisProcess": {
+   "scopes": 17,
+   "equal": 17,
+   "mismatched": [],
+   "denseOwnerDates": [
+    "2026-08-26"
+   ]
+  }
+ },
  "bundleNote": "bundleSha256 identifies this build only: the bundle embeds work-directory paths",
  "q1Corpus": {
   "path": "apps/worker/analytics-v2-test/golden/corpus/",
@@ -36,7 +50,7 @@
  "build": {
   "verifiedFiles": 392,
   "listingSha256": "6e8335b8056297b853900673ff3a58b0a20cdd595136905e1dbd6c5a7870f75a",
-  "bundleSha256": "3783fb9a9df8b21b6a9bd7cff5af8644b415c38c077b686f085b0c5b0d0a9705",
+  "bundleSha256": "f657b156f32336751d17b013f0e596998997c3f7db220036d2cd8f8680693e82",
   "esbuildVersion": "0.28.1",
   "dependencies": {
    "jsonc-parser": "3.3.1",
@@ -52,12 +66,12 @@
  "dump": {
   "note": "Not committed when larger than ~50 MB; the command above regenerates it byte for byte into <work-dir>/dump/.",
   "usageMonitorJson": {
-   "bytes": 12535087,
-   "sha256": "c371aab16859bafb724007f542e0ac68598ed8aae6a34b5fa3964e300fa64a40"
+   "bytes": 163950762,
+   "sha256": "1d0bef8ee1dab81bd33533012b8b4cbed673c9ccea22295210f7ec2336d0501a"
   },
   "usageMonitorSealedSqlite": {
-   "sha256": "b7ff47a9f99b9aac1e321867b79f405d9f9f4a4ea885f8f7f33715d1e4811aa3",
-   "bytes": 19083264,
+   "sha256": "cb04f41191aff1cba7873011c0a8846818027a52a3e248dd677781c0fb005ad0",
+   "bytes": 247812096,
    "integrityCheck": "ok",
    "sealReady": true,
    "populatedTables": 85,
@@ -65,8 +79,8 @@
    "node": "v26.2.0"
   },
   "storageAnalyticsJson": {
-   "bytes": 994806,
-   "sha256": "46f1234797873381966ad32f8fe2eba77da14a9c89cfc1b2bb15cba8f57ac9bd"
+   "bytes": 688637,
+   "sha256": "be7b05ba453994a3a7a6d097310ce3b131e91df3e4c082a9c902bbe0bab9407b"
   }
  }
 }

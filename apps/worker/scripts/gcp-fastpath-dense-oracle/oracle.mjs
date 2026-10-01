@@ -1170,7 +1170,7 @@ if (options.directResults !== null) {
  * owner-day with usage (cache-days.mjs). Every day the settled lane built in
  * the effective layout must equal the reference.
  */
-let settled = null, settledModes = null, cacheDays = null, settledResponse = null;
+let settled = null, settledModes = null, settledLaneMs = null, cacheDays = null, settledResponse = null;
 if (options.settleCache !== "none") {
   const modes = options.settleCache === "both" ? ["enabled", "disabled"] : [options.settleCache];
   const runs = {};
@@ -1195,7 +1195,10 @@ if (options.settleCache !== "none") {
     note("settled-cache", { mode, lane: runs[mode].lane, marks: runs[mode].marks.length, ownerDays: Object.keys(runs[mode].ownerDays).length });
   }
   settled = runs[modes[0]];
-  settledModes = Object.fromEntries(modes.map((mode) => [mode, { lane: runs[mode].lane,
+  // Wall-clock time goes to run-cost.json; the manifest keeps deterministic counts.
+  const laneCounts = ({ ms: _ms, ...lane }) => lane;
+  settledLaneMs = Object.fromEntries(modes.map((mode) => [mode, runs[mode].lane.ms]));
+  settledModes = Object.fromEntries(modes.map((mode) => [mode, { lane: laneCounts(runs[mode].lane),
     ownerDaysSha256: sha256Text(JSON.stringify(runs[mode].ownerDays)), seriesSha256: sha256Text(JSON.stringify(runs[mode].series)) }]));
   if (modes.length === 2) settledModes.equal = settledModes.enabled.ownerDaysSha256 === settledModes.disabled.ownerDaysSha256
     && settledModes.enabled.seriesSha256 === settledModes.disabled.seriesSha256;
@@ -1565,7 +1568,7 @@ const manifest = {
       [window.window, window.bands.reduce((n, band) => n + band.adjacencies, 0)])),
     settledWindowAdjacencies: settledResponse ? Object.fromEntries((settledResponse.body.cacheRetention?.windows ?? []).map((window) =>
       [window.window, window.bands.reduce((n, band) => n + band.adjacencies, 0)])) : null,
-    settledLane: settled ? { lane: settled.lane, modes: settledModes,
+    settledLane: settled ? { lane: settledModes[options.settleCache === "disabled" ? "disabled" : "enabled"].lane, modes: settledModes,
       marks: settled.marks.reduce((n, mark) => ({ ...n, [`${mark.owner}:${mark.layout}${mark.refusal ? `:${mark.refusal}` : ""}`]:
         (n[`${mark.owner}:${mark.layout}${mark.refusal ? `:${mark.refusal}` : ""}`] ?? 0) + 1 }), {}),
       markedDays: Object.fromEntries(roster.map((owner) => [owner.key, settled.marks.filter((mark) => mark.owner === owner.key)
@@ -1605,11 +1608,11 @@ const files = {
   "run-cost.json": pretty({ schemaVersion: "gcp-fastpath-dense-run-cost-v1", note: "wall-clock measurements of this run on its host; not reproducible and never compared",
     runtime: header.runtime, seedMs, tierN: { ticks: convergence.ticks, elapsedMs: convergence.elapsedMs, laneMs: convergence.laneMs,
       laneStats: convergence.laneStats ?? null, slowestLane: convergence.slowestLane ?? null, publicationPasses: options.publicationPasses,
-      resumedFrom: prior === null ? null : "converged run (--resume)" },
+      resumedFrom: prior === null ? null : "a prior run of the same corpus and cadence (--resume)" },
     direct: directCost === null ? null : { total: directCost, owners: Object.fromEntries(Object.entries(direct).map(([key, value]) => [key,
       { ms: Object.values(value.model).reduce((n, item) => n + item.cost.ms, value.fits.cost.ms), fitsMs: value.fits.cost.ms,
         maxModelMs: Math.max(0, ...Object.values(value.model).map((item) => item.cost.ms)) }])) },
-    cache: settled ? { settledLaneMs: settled.lane.ms, reference: cacheDays.cost } : null,
+    cache: settled ? { settledLaneMs, reference: cacheDays.cost } : null,
     windowRoutingNote: "window routing time is in oracle.log (window-routing)",
     tierF: { scope: options.forcedNative, total: forcedCost, owners: Object.fromEntries(Object.entries(forcedSummary)
       .map(([key, value]) => [key, { pages: value.pages, cost: value.cost }])) } }),
@@ -1628,7 +1631,7 @@ if (denseSummary) {
 // SOURCE.json: what produced these files, so a reader can regenerate and check them.
 files["SOURCE.json"] = pretty({
   schemaVersion: "gcp-fastpath-dense-golden-source-v1",
-  note: "Produced by the dense production-code oracle (Tier N scheduled lanes and Tier F forced native) running d43c8f92's Worker code unmodified under Node over sealed SQLite files. Regenerate with the command below; never edit by hand.",
+  note: "Produced by the dense production-code oracle running d43c8f92's Worker code unmodified under Node over sealed SQLite files: the scheduled lanes (Tier N) and the forced native (Tier F), direct native and cache-retention references the command selects. Regenerate with the command below; never edit by hand.",
   sourceCommit: DENSE_ORACLE_SOURCE_COMMIT,
   command: manifest.sourceDump.reproduce + (options.goldenOut ? ` --golden-out ${relative(REPO_ROOT, options.goldenOut)}` : ""),
   oracleFiles: LOADED_BLOBS,
@@ -1650,7 +1653,9 @@ files["SOURCE.json"] = pretty({
 });
 for (const [name, text] of Object.entries(files)) writeFileSync(join(outDir, name), text);
 writeFileSync(join(options.workDir, "diagnostics.json"), pretty(diagnostics));
-const privacy = privacyScan([join(outDir, "community-daily-response.json"), join(outDir, "preview.json"),
+// A run that stops before the graph lane publishes a preview stores none
+// (preview.json is `null`); the scanner reads objects only.
+const privacy = privacyScan([join(outDir, "community-daily-response.json"), ...(preview === null ? [] : [join(outDir, "preview.json")]),
   ...(settledResponse ? [join(outDir, "community-daily-response-settled.json")] : [])]);
 note("golden", { outDir, files: Object.fromEntries(Object.entries(files).map(([name, text]) => [name, { bytes: Buffer.byteLength(text), sha256: sha256Text(text) }])),
   privacy: { ok: privacy.ok, findings: privacy.findingCount } });

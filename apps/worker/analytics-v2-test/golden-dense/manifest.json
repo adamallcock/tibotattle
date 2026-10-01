@@ -14,7 +14,7 @@
   }
  },
  "corpus": {
-  "schemaVersion": "gcp-fastpath-oracle-corpus-v1",
+  "schemaVersion": "gcp-fastpath-dense-corpus-v1",
   "q1": {
    "path": "apps/worker/analytics-v2-test/golden/corpus/corpus.json",
    "sha256": "be042b9a72c00a8bbeef592619d7d7ab00be5b02a557629340d27bbf36b5521e",
@@ -41,10 +41,128 @@
     }
    }
   },
-  "dense": null
+  "dense": {
+   "generator": "apps/worker/scripts/gcp-fastpath-dense-oracle/dense-corpus.mjs",
+   "scale": 1,
+   "layout": "compact",
+   "spec": {
+    "key": "e",
+    "kind": "social",
+    "format": "v12",
+    "layout": "compact",
+    "classDays": {
+     "Q": [
+      "2026-04-15"
+     ],
+     "X": [
+      "2026-09-29"
+     ],
+     "H": [
+      "2026-09-24"
+     ],
+     "M": [
+      "2026-09-10",
+      "2026-09-18"
+     ],
+     "S": [
+      "2026-08-27",
+      "2026-08-28",
+      "2026-08-29",
+      "2026-08-30",
+      "2026-08-31",
+      "2026-09-01",
+      "2026-09-02",
+      "2026-09-03",
+      "2026-09-04",
+      "2026-09-05",
+      "2026-09-06",
+      "2026-09-07",
+      "2026-09-08",
+      "2026-09-09",
+      "2026-09-11",
+      "2026-09-12",
+      "2026-09-13",
+      "2026-09-14",
+      "2026-09-15",
+      "2026-09-16",
+      "2026-09-17",
+      "2026-09-19",
+      "2026-09-20",
+      "2026-09-21",
+      "2026-09-22",
+      "2026-09-23",
+      "2026-09-25",
+      "2026-09-26",
+      "2026-09-27",
+      "2026-09-28"
+     ]
+    },
+    "participantId": "participant:291ba2ac-c79e-4a6f-bb41-22ed1c153259",
+    "pinnedOwnerDigest": "49a16990ce1ced5df1b259e629d2a70ae890bfee191b98be75e0d4e3a89b378a",
+    "planType": "pro",
+    "accountTrackId": "account-track:v2:976cec3b27c62011487c9e31c00ce0bf1ff4e4c97ab9600aa5d029ae41d300ba",
+    "models": [
+     "gpt-5.6-sol",
+     "gpt-5.6-terra",
+     "gpt-5.5"
+    ],
+    "capacitiesUsdPerWindow": {
+     "gpt-5.6-sol": 77267.07,
+     "gpt-5.6-terra": 36057.97,
+     "gpt-5.5": 60096.61
+    },
+    "capacityScale": 85.8523,
+    "peakPercent": 80,
+    "resets": [
+     "2026-04-08T17:43:00.000Z",
+     "2026-04-15T17:43:00.000Z",
+     "2026-04-22T17:43:00.000Z",
+     "2026-04-29T17:43:00.000Z",
+     "2026-05-06T17:43:00.000Z",
+     "2026-05-13T17:43:00.000Z",
+     "2026-05-20T17:43:00.000Z",
+     "2026-05-27T17:43:00.000Z",
+     "2026-06-03T17:43:00.000Z",
+     "2026-06-10T17:43:00.000Z",
+     "2026-06-17T17:43:00.000Z",
+     "2026-06-24T17:43:00.000Z",
+     "2026-07-01T17:43:00.000Z",
+     "2026-07-08T17:43:00.000Z",
+     "2026-07-15T17:43:00.000Z",
+     "2026-07-22T17:43:00.000Z",
+     "2026-07-29T17:43:00.000Z",
+     "2026-08-05T17:43:00.000Z",
+     "2026-08-12T17:43:00.000Z",
+     "2026-08-19T17:43:00.000Z",
+     "2026-08-26T17:43:00.000Z",
+     "2026-09-01T15:43:00.000Z",
+     "2026-09-08T15:43:00.000Z",
+     "2026-09-15T15:43:00.000Z",
+     "2026-09-22T15:43:00.000Z",
+     "2026-09-29T15:43:00.000Z",
+     "2026-10-06T15:43:00.000Z"
+    ],
+    "storage": {
+     "v12": [
+      "2026-04-15",
+      "2026-10-01"
+     ]
+    },
+    "dayCount": 170,
+    "usageEvents": 294198
+   },
+   "classes": {
+    "Q": 1,
+    "X": 1,
+    "H": 1,
+    "M": 2,
+    "S": 30,
+    "L": 135
+   }
+  }
  },
- "nowMs": 1790856000000,
- "now": "2026-10-01T12:00:00.000Z",
+ "nowMs": 1790858760000,
+ "now": "2026-10-01T12:46:00.000Z",
  "pinnedNow": "2026-10-01T12:00:00.000Z",
  "seedClock": "2026-10-01T07:26:31.714Z",
  "correctionRuntimeState": "active",
@@ -68,51 +186,53 @@
   "graphDayProjection": "disabled (deployment default)",
   "cadence": {
    "lanesPerSimulatedMinute": [
-    "analytics x1",
-    "publication x1",
+    "analytics x2",
+    "publication x4",
     "cache"
    ],
    "longPassEveryMinutes": 10,
-   "clockStepMsPerMinute": 0,
-   "q1Cadence": true
+   "clockStepMsPerMinute": 15000,
+   "q1Cadence": false
   },
   "basis": "Q-1's reading of the production-scheduled-analytics-deploy refresh plan at d43c8f92; not verified against live configuration"
  },
  "convergence": {
-  "converged": true,
-  "stoppedBy": null,
+  "converged": false,
+  "stoppedBy": "daily-published",
   "scheduleErrors": 0,
   "quietTicks": 21,
-  "rule": "progress digest (counts, integer sums, text lengths, checkpoint/block/feature heads of every analytics table) unchanged for quietTicks consecutive ticks",
+  "rule": "stopped at the first simulated minute with every non-conflict corpus day published and nothing else queued; graph work was still in progress (graphProgress)",
   "graphProgress": {
-   "results": 251,
+   "results": 34,
    "byOwner": {
     "a": {
      "fits": true,
-     "modelDates": 56
+     "modelDates": 6
     },
     "b": {
      "fits": true,
-     "modelDates": 61
+     "modelDates": 11
     },
     "c": {
      "fits": true,
-     "modelDates": 66
+     "modelDates": 5
     },
     "d": {
      "fits": true,
-     "modelDates": 64
+     "modelDates": 8
+    },
+    "e": {
+     "fits": false,
+     "modelDates": 0
     }
    },
-   "publishedModelDays": 56,
-   "previewRevision": 44
+   "publishedModelDays": 0,
+   "previewRevision": null
   }
  },
  "directPublisherCalls": {
-  "preview": "unchanged",
-  "modelDays": {
-   "unchanged": 56
-  }
+  "preview": "deferred",
+  "modelDays": {}
  },
  "owners": [
   {
@@ -154,7 +274,7 @@
     {
      "metric": "model",
      "sourceKind": "effective",
-     "results": 56
+     "results": 6
     }
    ]
   },
@@ -193,7 +313,7 @@
     {
      "metric": "model",
      "sourceKind": "effective",
-     "results": 61
+     "results": 11
     }
    ]
   },
@@ -232,7 +352,7 @@
     {
      "metric": "model",
      "sourceKind": "effective",
-     "results": 66
+     "results": 5
     }
    ]
   },
@@ -275,31 +395,73 @@
     {
      "metric": "model",
      "sourceKind": "effective",
-     "results": 64
+     "results": 8
     }
    ]
+  },
+  {
+   "key": "e",
+   "kind": "social",
+   "planType": "pro",
+   "storage": {
+    "v12": [
+     "2026-04-15",
+     "2026-10-01"
+    ]
+   },
+   "ownerDigest": "49a16990ce1ced5df1b259e629d2a70ae890bfee191b98be75e0d4e3a89b378a",
+   "pinnedOwnerDigest": "49a16990ce1ced5df1b259e629d2a70ae890bfee191b98be75e0d4e3a89b378a",
+   "flags": {
+    "hasV1": false,
+    "hasV11": false,
+    "hasV12": true,
+    "hasLegacy": false,
+    "hasEffective": true
+   },
+   "expectedSourceRouting": "effective",
+   "dailySourceFormats": [
+    {
+     "sourceFormat": "effective",
+     "days": 168
+    }
+   ],
+   "graphSources": []
   }
  ],
  "routingEvidence": {
   "sharedFeatures": [
    {
+    "owner": "e",
+    "state": "complete",
+    "n": 163,
+    "first": "2026-04-16",
+    "last": "2026-10-01"
+   },
+   {
+    "owner": "e",
+    "state": "refused",
+    "n": 5,
+    "first": "2026-04-15",
+    "last": "2026-09-29"
+   },
+   {
     "owner": "c",
     "state": "complete",
-    "n": 177,
+    "n": 175,
     "first": "2026-04-08",
     "last": "2026-10-01"
    },
    {
     "owner": "d",
     "state": "complete",
-    "n": 177,
+    "n": 175,
     "first": "2026-04-08",
     "last": "2026-10-01"
    },
    {
     "owner": "b",
     "state": "complete",
-    "n": 177,
+    "n": 175,
     "first": "2026-04-08",
     "last": "2026-10-01"
    },
@@ -319,6 +481,13 @@
    }
   ],
   "sharedFeatureRefusedDays": {
+   "e": [
+    "2026-04-15",
+    "2026-09-10",
+    "2026-09-18",
+    "2026-09-24",
+    "2026-09-29"
+   ],
    "a": [
     "2026-04-17",
     "2026-04-18"
@@ -341,64 +510,165 @@
     },
     "b": {
      "counts": {
-      "shared-features": 70
+      "missing:2026-04-17": 3,
+      "missing:2026-04-18": 1,
+      "shared-features": 66
      },
-     "notShared": {}
+     "notShared": {
+      "2026-07-24": "missing:2026-04-17",
+      "2026-07-25": "missing:2026-04-17",
+      "2026-07-26": "missing:2026-04-17",
+      "2026-07-27": "missing:2026-04-18"
+     }
     },
     "c": {
      "counts": {
-      "shared-features": 70
+      "missing:2026-04-17": 3,
+      "missing:2026-04-18": 1,
+      "shared-features": 66
      },
-     "notShared": {}
+     "notShared": {
+      "2026-07-24": "missing:2026-04-17",
+      "2026-07-25": "missing:2026-04-17",
+      "2026-07-26": "missing:2026-04-17",
+      "2026-07-27": "missing:2026-04-18"
+     }
     },
     "d": {
      "counts": {
-      "shared-features": 70
+      "missing:2026-04-17": 3,
+      "missing:2026-04-18": 1,
+      "shared-features": 66
      },
-     "notShared": {}
+     "notShared": {
+      "2026-07-24": "missing:2026-04-17",
+      "2026-07-25": "missing:2026-04-17",
+      "2026-07-26": "missing:2026-04-17",
+      "2026-07-27": "missing:2026-04-18"
+     }
+    },
+    "e": {
+     "counts": {
+      "refused:prepared_day_refused": 1,
+      "missing:2026-04-17": 2,
+      "missing:2026-04-18": 1,
+      "refused:window_byte_limit": 66
+     },
+     "notShared": {
+      "2026-07-24": "refused:prepared_day_refused",
+      "2026-07-25": "missing:2026-04-17",
+      "2026-07-26": "missing:2026-04-17",
+      "2026-07-27": "missing:2026-04-18",
+      "2026-07-28": "refused:window_byte_limit",
+      "2026-07-29": "refused:window_byte_limit",
+      "2026-07-30": "refused:window_byte_limit",
+      "2026-07-31": "refused:window_byte_limit",
+      "2026-08-01": "refused:window_byte_limit",
+      "2026-08-02": "refused:window_byte_limit",
+      "2026-08-03": "refused:window_byte_limit",
+      "2026-08-04": "refused:window_byte_limit",
+      "2026-08-05": "refused:window_byte_limit",
+      "2026-08-06": "refused:window_byte_limit",
+      "2026-08-07": "refused:window_byte_limit",
+      "2026-08-08": "refused:window_byte_limit",
+      "2026-08-09": "refused:window_byte_limit",
+      "2026-08-10": "refused:window_byte_limit",
+      "2026-08-11": "refused:window_byte_limit",
+      "2026-08-12": "refused:window_byte_limit",
+      "2026-08-13": "refused:window_byte_limit",
+      "2026-08-14": "refused:window_byte_limit",
+      "2026-08-15": "refused:window_byte_limit",
+      "2026-08-16": "refused:window_byte_limit",
+      "2026-08-17": "refused:window_byte_limit",
+      "2026-08-18": "refused:window_byte_limit",
+      "2026-08-19": "refused:window_byte_limit",
+      "2026-08-20": "refused:window_byte_limit",
+      "2026-08-21": "refused:window_byte_limit",
+      "2026-08-22": "refused:window_byte_limit",
+      "2026-08-23": "refused:window_byte_limit",
+      "2026-08-24": "refused:window_byte_limit",
+      "2026-08-25": "refused:window_byte_limit",
+      "2026-08-26": "refused:window_byte_limit",
+      "2026-08-27": "refused:window_byte_limit",
+      "2026-08-28": "refused:window_byte_limit",
+      "2026-08-29": "refused:window_byte_limit",
+      "2026-08-30": "refused:window_byte_limit",
+      "2026-08-31": "refused:window_byte_limit",
+      "2026-09-01": "refused:window_byte_limit",
+      "2026-09-02": "refused:window_byte_limit",
+      "2026-09-03": "refused:window_byte_limit",
+      "2026-09-04": "refused:window_byte_limit",
+      "2026-09-05": "refused:window_byte_limit",
+      "2026-09-06": "refused:window_byte_limit",
+      "2026-09-07": "refused:window_byte_limit",
+      "2026-09-08": "refused:window_byte_limit",
+      "2026-09-09": "refused:window_byte_limit",
+      "2026-09-10": "refused:window_byte_limit",
+      "2026-09-11": "refused:window_byte_limit",
+      "2026-09-12": "refused:window_byte_limit",
+      "2026-09-13": "refused:window_byte_limit",
+      "2026-09-14": "refused:window_byte_limit",
+      "2026-09-15": "refused:window_byte_limit",
+      "2026-09-16": "refused:window_byte_limit",
+      "2026-09-17": "refused:window_byte_limit",
+      "2026-09-18": "refused:window_byte_limit",
+      "2026-09-19": "refused:window_byte_limit",
+      "2026-09-20": "refused:window_byte_limit",
+      "2026-09-21": "refused:window_byte_limit",
+      "2026-09-22": "refused:window_byte_limit",
+      "2026-09-23": "refused:window_byte_limit",
+      "2026-09-24": "refused:window_byte_limit",
+      "2026-09-25": "refused:window_byte_limit",
+      "2026-09-26": "refused:window_byte_limit",
+      "2026-09-27": "refused:window_byte_limit",
+      "2026-09-28": "refused:window_byte_limit",
+      "2026-09-29": "refused:window_byte_limit",
+      "2026-09-30": "refused:window_byte_limit",
+      "2026-10-01": "refused:window_byte_limit"
+     }
     }
    }
   },
   "checkpointHeads": {
-   "heads": 9,
+   "heads": 11,
    "retired": 0
   },
   "checkpointParts": {
-   "parts": 54,
-   "bytes": 4595590,
-   "maxPartIndex": 7
+   "parts": 143,
+   "bytes": 15368891,
+   "maxPartIndex": 35
   },
   "modelBlocks": [
    {
+    "owner": "e",
+    "state": "pending",
+    "n": 1
+   },
+   {
     "owner": "c",
     "state": "complete",
-    "n": 3
+    "n": 1
    },
    {
     "owner": "d",
     "state": "complete",
-    "n": 3
+    "n": 1
    },
    {
     "owner": "b",
     "state": "complete",
-    "n": 3
+    "n": 1
    },
    {
     "owner": "a",
     "state": "complete",
-    "n": 2
-   },
-   {
-    "owner": "a",
-    "state": "pending",
     "n": 1
    }
   ]
  },
  "modelPublications": {
   "expectedDates": 70,
-  "published": 56,
+  "published": 0,
   "missing": [
    "2026-07-24",
    "2026-07-25",
@@ -413,52 +683,172 @@
    "2026-08-03",
    "2026-08-04",
    "2026-08-05",
-   "2026-08-06"
+   "2026-08-06",
+   "2026-08-07",
+   "2026-08-08",
+   "2026-08-09",
+   "2026-08-10",
+   "2026-08-11",
+   "2026-08-12",
+   "2026-08-13",
+   "2026-08-14",
+   "2026-08-15",
+   "2026-08-16",
+   "2026-08-17",
+   "2026-08-18",
+   "2026-08-19",
+   "2026-08-20",
+   "2026-08-21",
+   "2026-08-22",
+   "2026-08-23",
+   "2026-08-24",
+   "2026-08-25",
+   "2026-08-26",
+   "2026-08-27",
+   "2026-08-28",
+   "2026-08-29",
+   "2026-08-30",
+   "2026-08-31",
+   "2026-09-01",
+   "2026-09-02",
+   "2026-09-03",
+   "2026-09-04",
+   "2026-09-05",
+   "2026-09-06",
+   "2026-09-07",
+   "2026-09-08",
+   "2026-09-09",
+   "2026-09-10",
+   "2026-09-11",
+   "2026-09-12",
+   "2026-09-13",
+   "2026-09-14",
+   "2026-09-15",
+   "2026-09-16",
+   "2026-09-17",
+   "2026-09-18",
+   "2026-09-19",
+   "2026-09-20",
+   "2026-09-21",
+   "2026-09-22",
+   "2026-09-23",
+   "2026-09-24",
+   "2026-09-25",
+   "2026-09-26",
+   "2026-09-27",
+   "2026-09-28",
+   "2026-09-29",
+   "2026-09-30",
+   "2026-10-01"
   ],
   "ownersWithResultOnMissingDates": {
-   "2026-07-24": [
-    "b",
-    "c",
-    "d"
-   ],
-   "2026-07-25": [
-    "b",
-    "c",
-    "d"
-   ],
-   "2026-07-26": [
-    "b",
-    "c",
-    "d"
-   ],
-   "2026-07-27": [
-    "b",
-    "c",
-    "d"
-   ],
-   "2026-07-28": [
-    "c",
-    "d"
-   ],
-   "2026-07-29": [
-    "c",
-    "d"
-   ],
-   "2026-07-30": [
-    "c",
-    "d"
-   ],
-   "2026-07-31": [
-    "c"
-   ],
-   "2026-08-01": [
-    "c"
-   ],
+   "2026-07-24": [],
+   "2026-07-25": [],
+   "2026-07-26": [],
+   "2026-07-27": [],
+   "2026-07-28": [],
+   "2026-07-29": [],
+   "2026-07-30": [],
+   "2026-07-31": [],
+   "2026-08-01": [],
    "2026-08-02": [],
    "2026-08-03": [],
    "2026-08-04": [],
    "2026-08-05": [],
-   "2026-08-06": [
+   "2026-08-06": [],
+   "2026-08-07": [],
+   "2026-08-08": [],
+   "2026-08-09": [],
+   "2026-08-10": [],
+   "2026-08-11": [],
+   "2026-08-12": [],
+   "2026-08-13": [],
+   "2026-08-14": [],
+   "2026-08-15": [],
+   "2026-08-16": [],
+   "2026-08-17": [],
+   "2026-08-18": [],
+   "2026-08-19": [],
+   "2026-08-20": [],
+   "2026-08-21": [],
+   "2026-08-22": [],
+   "2026-08-23": [],
+   "2026-08-24": [],
+   "2026-08-25": [],
+   "2026-08-26": [],
+   "2026-08-27": [],
+   "2026-08-28": [],
+   "2026-08-29": [],
+   "2026-08-30": [],
+   "2026-08-31": [],
+   "2026-09-01": [],
+   "2026-09-02": [],
+   "2026-09-03": [],
+   "2026-09-04": [],
+   "2026-09-05": [],
+   "2026-09-06": [],
+   "2026-09-07": [],
+   "2026-09-08": [
+    "a",
+    "b",
+    "c",
+    "d"
+   ],
+   "2026-09-09": [
+    "a",
+    "b",
+    "c",
+    "d"
+   ],
+   "2026-09-10": [
+    "a",
+    "b",
+    "c",
+    "d"
+   ],
+   "2026-09-11": [
+    "a",
+    "b",
+    "d"
+   ],
+   "2026-09-12": [
+    "b",
+    "d"
+   ],
+   "2026-09-13": [
+    "b",
+    "d"
+   ],
+   "2026-09-14": [
+    "b"
+   ],
+   "2026-09-15": [
+    "b"
+   ],
+   "2026-09-16": [
+    "b"
+   ],
+   "2026-09-17": [],
+   "2026-09-18": [],
+   "2026-09-19": [],
+   "2026-09-20": [],
+   "2026-09-21": [],
+   "2026-09-22": [],
+   "2026-09-23": [],
+   "2026-09-24": [],
+   "2026-09-25": [],
+   "2026-09-26": [],
+   "2026-09-27": [],
+   "2026-09-28": [],
+   "2026-09-29": [],
+   "2026-09-30": [
+    "a",
+    "b",
+    "c",
+    "d"
+   ],
+   "2026-10-01": [
+    "a",
     "b",
     "c",
     "d"
@@ -486,19 +876,13 @@
  },
  "response": {
   "status": 200,
-  "cacheControl": "public, max-age=300",
+  "cacheControl": "no-store",
   "schemaVersion": "community-daily-read-v1.0",
-  "allowanceState": "ready",
-  "allowanceReadState": "confirmed",
+  "allowanceState": "updating",
+  "allowanceReadState": "temporarily_unavailable",
   "publishedDays": 168,
-  "modelPublicationDays": 56,
-  "previewRow": {
-   "revision": 44,
-   "method": "48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9:v1-fit-7:server-api-price-equivalent-v0.5:plan-attribution-v1:legacy-day-or-complete-domain-3:legacy-day-or-complete-domain-3:plan-attribution-v1:v1-era-buckets-2:legacy-day-or-complete-domain-3:plan-attribution-v1:v1-era-buckets-3:v1-quota-acquisition-2:plan-attribution-v1:v11-account-era-buckets-1:v11-complete-domain-1:server-api-price-equivalent-v0.5:community-public-sources-v1:48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9:v1-composition-3:server-api-price-equivalent-v0.5:plan-attribution-v1:legacy-day-or-complete-domain-3:legacy-day-or-complete-domain-3:plan-attribution-v1:v1-era-buckets-2:legacy-day-or-complete-domain-3:plan-attribution-v1:v1-era-buckets-3:v1-quota-acquisition-2:plan-attribution-v1:v11-account-era-buckets-1:v11-complete-domain-1:server-api-price-equivalent-v0.5:community-public-sources-v1:separate-results-1",
-   "generated_at": "2026-10-01T12:00:00.000Z",
-   "inputs_current": 1,
-   "snapshot_source_epoch": 8
-  },
+  "modelPublicationDays": 0,
+  "previewRow": null,
   "servedFrom": "the replay's databases (community-daily-response.json)",
   "settled": {
    "file": "community-daily-response-settled.json",
@@ -513,10 +897,10 @@
   "cacheRetention": "community-daily-response.json and cache-owner-days.json: the lane replay at capture; community-daily-response-settled.json: production's lane settled without the per-pass budget (cacheRetention.settledLane) and read by the public route; cache-reference.json: production's effective day build for every owner-day with usage (cacheRetention.reference)",
   "ownerFitsAndModelResults": "direct native calls (advanceStorageEffectiveAnalysis with an unbounded budget, direct-native.mjs); the lane replay's and the budget-sliced forced path's results are cross-checked wherever they exist (directNative.referenceAgreement)",
   "perDateExpected": "d43c8f92's buildCommunityModelCompositionDay, projectAdminModelHistoryDay, buildAdminCommunityAllowancePreview and projectPublicAllowanceGraph over the owner results above",
-  "communityDailyResponse": "lane replay, converged in every lane"
+  "communityDailyResponse": "lane replay captured when delivery, daily and cache lanes stood still; its allowance fields show the graph lane's progress at capture, and per-date-expected.json is the allowance reference"
  },
  "directNative": {
-  "computedBy": "this process",
+  "computedBy": "a direct.mjs run imported with --direct-results (directImport)",
   "nowMs": 1790856000000,
   "configuration": "advanceStorageEffectiveAnalysis over the read-only source with no preparedQuota, preparedUsage or preparedUsageReader (what computeEffective passes when shared features are refused or off, STORAGE_V11_PREPARED_FOLD being false at d43c8f92; also the model-block fallback), budget {remainingQueries: 1e9, deadlineMs: far future}, looping on 'deferred' with the checkpoint in memory; fits validated with validCompleteScalarAnalysis and serialized as canonicalJson(selectCommunityAllowanceAnalysisFits(ownerDigest, [{source:'v1.1', analysis}])), model validated with validCompleteCachedComposition and serialized as canonicalJson(analysis)",
   "owners": {
@@ -573,190 +957,90 @@
      "statements": 438993,
      "fitsSteps": 506
     }
+   },
+   "e": {
+    "fits": "complete",
+    "model": {
+     "complete": 70
+    },
+    "failures": {},
+    "work": {
+     "steps": 83807,
+     "statements": 1513432,
+     "fitsSteps": 2148
+    }
    }
   },
   "referenceAgreement": {
    "a": {
     "directEqualsTierN": {
-     "compared": 57,
-     "equal": 57
+     "compared": 7,
+     "equal": 7
     },
     "directEqualsForced": {
-     "compared": 67,
-     "equal": 67
+     "compared": 0,
+     "equal": 0
     }
    },
    "b": {
     "directEqualsTierN": {
-     "compared": 62,
-     "equal": 62
+     "compared": 12,
+     "equal": 12
     },
     "directEqualsForced": {
-     "compared": 71,
-     "equal": 71
+     "compared": 0,
+     "equal": 0
     }
    },
    "c": {
     "directEqualsTierN": {
-     "compared": 67,
-     "equal": 67
+     "compared": 6,
+     "equal": 6
     },
     "directEqualsForced": {
-     "compared": 71,
-     "equal": 71
+     "compared": 0,
+     "equal": 0
     }
    },
    "d": {
     "directEqualsTierN": {
-     "compared": 65,
-     "equal": 65
+     "compared": 9,
+     "equal": 9
     },
     "directEqualsForced": {
-     "compared": 71,
-     "equal": 71
+     "compared": 0,
+     "equal": 0
+    }
+   },
+   "e": {
+    "directEqualsTierN": {
+     "compared": 0,
+     "equal": 0
+    },
+    "directEqualsForced": {
+     "compared": 0,
+     "equal": 0
     }
    }
   },
   "referenceMismatches": []
  },
- "directImport": null,
- "forcedNative": {
-  "scope": "all",
-  "sampleDates": [
-   "2026-07-24",
-   "2026-08-10",
-   "2026-08-27",
-   "2026-09-13",
-   "2026-10-01"
-  ],
-  "configuration": "computeStorageGraphResult(preparedFold:false, preparedEffectiveUsage:false, persistResult:false, no sharedFeatures), re-invoked at production's 1,000-statement invocation meter until complete, on a scratch copy with every graph cache cleared and a read-only source; production's model-block fallback",
-  "owners": {
-   "a": {
-    "pages": {
-     "fits": {
-      "usagePages": 101,
-      "quotaPages": 101,
-      "usageRows": 1395
-     },
-     "modelDates": {
-      "usagePages": 7070,
-      "quotaPages": 7070,
-      "dates": 70
-     }
-    },
-    "fits": "complete",
-    "model": {
-     "failed": 4,
-     "complete": 66
-    },
-    "failures": {
-     "2026-07-24": "STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE",
-     "2026-07-25": "STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE",
-     "2026-07-26": "STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE",
-     "2026-07-27": "STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE"
-    },
-    "cost": {
-     "statements": 607274,
-     "invocations": 702,
-     "maxCheckpointBytes": 689044
-    }
-   },
-   "b": {
-    "pages": {
-     "fits": {
-      "usagePages": 101,
-      "quotaPages": 101,
-      "usageRows": 1417
-     },
-     "modelDates": {
-      "usagePages": 7070,
-      "quotaPages": 7070,
-      "dates": 70
-     }
-    },
-    "fits": "complete",
-    "model": {
-     "complete": 70
-    },
-    "failures": {},
-    "cost": {
-     "statements": 615453,
-     "invocations": 710,
-     "maxCheckpointBytes": 699164
-    }
-   },
-   "c": {
-    "pages": {
-     "fits": {
-      "usagePages": 101,
-      "quotaPages": 101,
-      "usageRows": 1372
-     },
-     "modelDates": {
-      "usagePages": 7070,
-      "quotaPages": 7070,
-      "dates": 70
-     }
-    },
-    "fits": "complete",
-    "model": {
-     "complete": 70
-    },
-    "failures": {},
-    "cost": {
-     "statements": 632048,
-     "invocations": 781,
-     "maxCheckpointBytes": 690937
-    }
-   },
-   "d": {
-    "pages": {
-     "fits": {
-      "usagePages": 101,
-      "quotaPages": 101,
-      "usageRows": 1425
-     },
-     "modelDates": {
-      "usagePages": 7070,
-      "quotaPages": 7070,
-      "dates": 70
-     }
-    },
-    "fits": "complete",
-    "model": {
-     "complete": 70
-    },
-    "failures": {},
-    "cost": {
-     "statements": 617451,
-     "invocations": 710,
-     "maxCheckpointBytes": 721657
-    }
-   }
-  },
-  "tierNEqualsForced": {
-   "a": {
-    "fits": true,
-    "modelCompared": 56,
-    "modelEqual": 56
-   },
-   "b": {
-    "fits": true,
-    "modelCompared": 61,
-    "modelEqual": 61
-   },
-   "c": {
-    "fits": true,
-    "modelCompared": 66,
-    "modelEqual": 66
-   },
-   "d": {
-    "fits": true,
-    "modelCompared": 64,
-    "modelEqual": 64
-   }
+ "directImport": {
+  "sha256": "c395b60d0c8f452620dc8bb432fc59f807901dc9c150be592e541c2b7c678f27",
+  "bytes": 390240,
+  "sourceDigest": "bdbec7f71134bf4b6455b9562e6c340494f2fe3e31dc9a6d8223a3c065c7804a",
+  "nowMs": 1790856000000,
+  "producerBundleSha256": "5fe400fa627fceed001c63cdc407a5b74590eac77310fc5dd678f1a490706977",
+  "recomputedInThisProcess": {
+   "scopes": 17,
+   "equal": 17,
+   "mismatched": [],
+   "denseOwnerDates": [
+    "2026-08-26"
+   ]
   }
  },
+ "forcedNative": null,
  "cacheRetention": {
   "marks": [
    {
@@ -769,16 +1053,16 @@
    {
     "owner": "d",
     "source_layout": "effective",
-    "n": 2,
+    "n": 1,
     "first": "2026-04-15",
-    "last": "2026-04-16"
+    "last": "2026-04-15"
    },
    {
     "owner": "d",
     "source_layout": "typed-v11",
-    "n": 32,
+    "n": 22,
     "first": "2026-04-15",
-    "last": "2026-05-17"
+    "last": "2026-05-06"
    },
    {
     "owner": "b",
@@ -804,30 +1088,30 @@
    {
     "owner": "a",
     "source_layout": "typed-v11",
-    "n": 101,
+    "n": 59,
     "first": "2026-04-15",
-    "last": "2026-07-24"
+    "last": "2026-06-12"
    }
   ],
   "windowAdjacencies": {
    "day": 0,
    "week": 0,
    "month": 0,
-   "all": 67
+   "all": 36
   },
   "settledWindowAdjacencies": {
    "day": 0,
    "week": 0,
    "month": 0,
-   "all": 8
+   "all": 1645
   },
   "settledLane": {
    "lane": {
-    "calls": 66,
-    "built": 14,
-    "staged": 0,
+    "calls": 67,
+    "built": 16,
+    "staged": 4,
     "refused": 0,
-    "skipped": 262,
+    "skipped": 332,
     "outcome": "stalled",
     "stalledAt": {
      "state": "progress",
@@ -841,25 +1125,25 @@
      "budget": "target, source and shared statement allowances and the deadline unbounded"
     },
     "cleared": {
-     "analytics_cache_retention_day_marks": 143,
-     "analytics_cache_retention_day_values": 146,
-     "analytics_cache_retention_day_bands": 1460,
-     "analytics_cache_retention_day_carry": 1008,
-     "analytics_cache_retention_day_progress": 0,
+     "analytics_cache_retention_day_marks": 90,
+     "analytics_cache_retention_day_values": 91,
+     "analytics_cache_retention_day_bands": 910,
+     "analytics_cache_retention_day_carry": 630,
+     "analytics_cache_retention_day_progress": 1,
      "analytics_cache_retention_owner_cursor": 1
     },
     "events": {
-     "cache_retention_day_skipped:owner_source_unavailable": 262
+     "cache_retention_day_skipped:owner_source_unavailable": 332
     }
    },
    "modes": {
     "enabled": {
      "lane": {
-      "calls": 66,
-      "built": 14,
-      "staged": 0,
+      "calls": 67,
+      "built": 16,
+      "staged": 4,
       "refused": 0,
-      "skipped": 262,
+      "skipped": 332,
       "outcome": "stalled",
       "stalledAt": {
        "state": "progress",
@@ -873,27 +1157,27 @@
        "budget": "target, source and shared statement allowances and the deadline unbounded"
       },
       "cleared": {
-       "analytics_cache_retention_day_marks": 143,
-       "analytics_cache_retention_day_values": 146,
-       "analytics_cache_retention_day_bands": 1460,
-       "analytics_cache_retention_day_carry": 1008,
-       "analytics_cache_retention_day_progress": 0,
+       "analytics_cache_retention_day_marks": 90,
+       "analytics_cache_retention_day_values": 91,
+       "analytics_cache_retention_day_bands": 910,
+       "analytics_cache_retention_day_carry": 630,
+       "analytics_cache_retention_day_progress": 1,
        "analytics_cache_retention_owner_cursor": 1
       },
       "events": {
-       "cache_retention_day_skipped:owner_source_unavailable": 262
+       "cache_retention_day_skipped:owner_source_unavailable": 332
       }
      },
-     "ownerDaysSha256": "adb750fad05aaa84e81887252b80e5e0bfde67fe27daadea4d8f5847ab9f0ffa",
-     "seriesSha256": "b902c9e1bbcd95a42af95766d7caa41e1a621a42264d9d5d36ebd66cbefaf6bf"
+     "ownerDaysSha256": "82a20dd00dd0f5e3201e44c976394c278de0f00b542b4ddb1ccc6f0fc1789c03",
+     "seriesSha256": "3f256809b08aca18ce4b47e9c0ed52fb020fb0ea68385f197530c144a5a8fa8b"
     },
     "disabled": {
      "lane": {
-      "calls": 66,
-      "built": 14,
-      "staged": 0,
+      "calls": 67,
+      "built": 16,
+      "staged": 4,
       "refused": 0,
-      "skipped": 262,
+      "skipped": 332,
       "outcome": "stalled",
       "stalledAt": {
        "state": "progress",
@@ -907,23 +1191,24 @@
        "budget": "target, source and shared statement allowances and the deadline unbounded"
       },
       "cleared": {
-       "analytics_cache_retention_day_marks": 143,
-       "analytics_cache_retention_day_values": 146,
-       "analytics_cache_retention_day_bands": 1460,
-       "analytics_cache_retention_day_carry": 1008,
-       "analytics_cache_retention_day_progress": 0,
+       "analytics_cache_retention_day_marks": 90,
+       "analytics_cache_retention_day_values": 91,
+       "analytics_cache_retention_day_bands": 910,
+       "analytics_cache_retention_day_carry": 630,
+       "analytics_cache_retention_day_progress": 1,
        "analytics_cache_retention_owner_cursor": 1
       },
       "events": {
-       "cache_retention_day_skipped:owner_source_unavailable": 262
+       "cache_retention_day_skipped:owner_source_unavailable": 332
       }
      },
-     "ownerDaysSha256": "adb750fad05aaa84e81887252b80e5e0bfde67fe27daadea4d8f5847ab9f0ffa",
-     "seriesSha256": "b902c9e1bbcd95a42af95766d7caa41e1a621a42264d9d5d36ebd66cbefaf6bf"
+     "ownerDaysSha256": "82a20dd00dd0f5e3201e44c976394c278de0f00b542b4ddb1ccc6f0fc1789c03",
+     "seriesSha256": "3f256809b08aca18ce4b47e9c0ed52fb020fb0ea68385f197530c144a5a8fa8b"
     },
     "equal": true
    },
    "marks": {
+    "e:effective": 2,
     "c:effective": 2,
     "d:effective": 2,
     "d:typed-v11": 2,
@@ -954,15 +1239,19 @@
      "2026-04-16:effective",
      "2026-04-17:typed-v11",
      "2026-04-18:typed-v11"
+    ],
+    "e": [
+     "2026-04-15:effective",
+     "2026-04-16:effective"
     ]
    },
    "unpromotedProgress": []
   },
   "reference": {
    "rule": "cache-days.mjs: createCacheRetentionEffectiveDayBuild for every owner-day with effective usage, the candidate and carry digests being the source dependency digests the lane's source build proves",
-   "ownerDays": 680,
+   "ownerDays": 850,
    "outcomes": {
-    "built": 671,
+    "built": 841,
     "refused:usage_row_refused": 9
    },
    "notBuilt": {
@@ -976,10 +1265,10 @@
     "a:2026-04-24": "refused:usage_row_refused",
     "a:2026-04-25": "refused:usage_row_refused"
    },
-   "withValues": 480,
+   "withValues": 650,
    "settledAgreement": {
-    "compared": 8,
-    "equal": 8,
+    "compared": 10,
+    "equal": 10,
     "mismatched": []
    }
   }
@@ -1003,48 +1292,36 @@
   },
   "publishedRowDigests": {
    "analytics_cache_retention_day_bands": {
-    "rows": 1460,
-    "sha256": "73e4dad78b37ef0f06972c7a10a29e041b892108338441adafe0de6e3c22889d"
+    "rows": 910,
+    "sha256": "05ac1f6746d7b1826650dd88ee97540b4b140a9940743db96c0852ff4bd02e0e"
    },
    "analytics_cache_retention_day_values": {
-    "rows": 146,
-    "sha256": "5ed9ed764e8f5aae8d32a4b0c0650efebe5d9fc3f38aa24fe52e88cb495368b5"
+    "rows": 91,
+    "sha256": "84882d96da5f125ec795645b6198b0581b26fcf55d9c420c53ad940419203551"
    },
    "analytics_community_daily_publications": {
     "rows": 168,
-    "sha256": "7c62ac1eef1a48201c20271ec7d83d1eed2e74155e401cad7759ad750cd75d5c"
-   },
-   "analytics_community_graph_previews": {
-    "rows": 1,
-    "sha256": "1212b46e908b10ff2953df325b6c53f00a14c3609f2e8727b02db467bb723414"
-   },
-   "analytics_community_graph_publication_state": {
-    "rows": 1,
-    "sha256": "9ad78b42a93c9dd9286467f16026ad0e2c055ac3ce5357fd459dcb8349fd11cd"
-   },
-   "analytics_community_model_publications": {
-    "rows": 56,
-    "sha256": "efecfbb2232dfec0b23dc690ef0359478c95cf05e850458de88777c4ec1cb2c8"
+    "sha256": "b65607b819a4653d0be48e58d7671c9ae16b24d6f9f6cd14f31d008cb95d879f"
    }
   }
  },
  "leaseExpiryProbe": {
   "steps": 12,
   "stepMinutes": 10,
-  "through": "2026-10-01T14:00:00.000Z",
+  "through": "2026-10-01T14:46:00.000Z",
   "changedOutputs": [],
   "errors": 0
  },
  "sourceDump": {
   "tables": 85,
-  "rows": 58048,
+  "rows": 791849,
   "schemaSha256": "f63ad44aef250a0a54aa6e4eee064a19d20ddb96ff7416535a6fc1a2410901d4",
-  "rowCountsSha256": "a07ba315d18057da0008eb20693537a6b50d9f9bad62525ec949192777fe7775",
-  "jsonBytes": 12535087,
-  "jsonSha256": "c371aab16859bafb724007f542e0ac68598ed8aae6a34b5fa3964e300fa64a40",
+  "rowCountsSha256": "8ceb17bb87fdb0639aa8803d6d4effd9358bcedb8dfe841fa2a3549209afe0e8",
+  "jsonBytes": 163950762,
+  "jsonSha256": "1d0bef8ee1dab81bd33533012b8b4cbed673c9ccea22295210f7ec2336d0501a",
   "sealedSqlite": {
-   "sha256": "b7ff47a9f99b9aac1e321867b79f405d9f9f4a4ea885f8f7f33715d1e4811aa3",
-   "bytes": 19083264,
+   "sha256": "cb04f41191aff1cba7873011c0a8846818027a52a3e248dd677781c0fb005ad0",
+   "bytes": 247812096,
    "integrityCheck": "ok",
    "sealReady": true,
    "populatedTables": 85,
@@ -1053,9 +1330,9 @@
   },
   "sourceUnchangedByAnalysis": true,
   "contentDigest": {
-   "sha256": "3239f1ca6b95778f2575aa7bfaf373e8906755f219d864b99597f6715e15757c",
+   "sha256": "bdbec7f71134bf4b6455b9562e6c340494f2fe3e31dc9a6d8223a3c065c7804a",
    "rule": "source-digest.mjs: every table's rows in a total order (independent of page layout)"
   },
-  "reproduce": "node --max-old-space-size=16384 apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs --work-dir <dir> --corpus q1 --forced-native all --direct-native all --direct-jobs <n> --settle-cache both"
+  "reproduce": "node --max-old-space-size=32768 apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs --work-dir <dir> --corpus dense --publication-passes 4 --analytics-passes 2 --clock-step-ms 15000 --stop-when daily-published --converge-on daily --forced-native none --direct-results <direct.mjs work dir>/direct-results.json --settle-cache both"
  }
 }

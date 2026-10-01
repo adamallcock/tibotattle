@@ -28,53 +28,56 @@
    "lane": "analytics"
   },
   "publicationPasses": 1,
-  "resumedFrom": "converged run (--resume)"
+  "resumedFrom": "a prior run of the same corpus and cadence (--resume)"
  },
  "direct": {
   "total": {
-   "ms": 416573,
+   "ms": 413636,
    "jobs": 6,
    "statements": 1763553,
    "steps": 143303,
-   "taskMs": 2451885
+   "taskMs": 2440482
   },
   "owners": {
    "a": {
-    "ms": 655046,
-    "fitsMs": 9391,
-    "maxModelMs": 10468
+    "ms": 640986,
+    "fitsMs": 9281,
+    "maxModelMs": 10099
    },
    "b": {
-    "ms": 658075,
-    "fitsMs": 9004,
-    "maxModelMs": 10002
+    "ms": 641931,
+    "fitsMs": 9530,
+    "maxModelMs": 10017
    },
    "c": {
-    "ms": 478890,
-    "fitsMs": 6811,
-    "maxModelMs": 7703
+    "ms": 481139,
+    "fitsMs": 6878,
+    "maxModelMs": 7384
    },
    "d": {
-    "ms": 659874,
-    "fitsMs": 9149,
-    "maxModelMs": 10623
+    "ms": 676426,
+    "fitsMs": 9685,
+    "maxModelMs": 10068
    }
   }
  },
  "cache": {
-  "settledLaneMs": 24434,
+  "settledLaneMs": {
+   "enabled": 25668,
+   "disabled": 24566
+  },
   "reference": {
-   "ms": 31373,
+   "ms": 34736,
    "jobs": 6,
    "tasks": 680,
-   "taskMs": 184381
+   "taskMs": 204630
   }
  },
  "windowRoutingNote": "window routing time is in oracle.log (window-routing)",
  "tierF": {
   "scope": "all",
   "total": {
-   "ms": 456683,
+   "ms": 448131,
    "statements": 2472226,
    "jobs": 6
   },
@@ -93,12 +96,12 @@
      }
     },
     "cost": {
-     "ms": 650619,
+     "ms": 655233,
      "statements": 607274,
      "invocations": 702,
      "maxCheckpointBytes": 689044,
      "fits": {
-      "ms": 8552,
+      "ms": 8918,
       "statements": 8713,
       "invocations": 10,
       "maxCheckpointParts": 7,
@@ -120,12 +123,12 @@
      }
     },
     "cost": {
-     "ms": 714960,
+     "ms": 706903,
      "statements": 615453,
      "invocations": 710,
      "maxCheckpointBytes": 699164,
      "fits": {
-      "ms": 9702,
+      "ms": 10310,
       "statements": 8794,
       "invocations": 10,
       "maxCheckpointParts": 8,
@@ -147,12 +150,12 @@
      }
     },
     "cost": {
-     "ms": 578852,
+     "ms": 535072,
      "statements": 632048,
      "invocations": 781,
      "maxCheckpointBytes": 690937,
      "fits": {
-      "ms": 8477,
+      "ms": 7253,
       "statements": 9026,
       "invocations": 11,
       "maxCheckpointParts": 8,
@@ -174,12 +177,12 @@
      }
     },
     "cost": {
-     "ms": 758242,
+     "ms": 747728,
      "statements": 617451,
      "invocations": 710,
      "maxCheckpointBytes": 721657,
      "fits": {
-      "ms": 10551,
+      "ms": 10514,
       "statements": 8769,
       "invocations": 10,
       "maxCheckpointParts": 8,
