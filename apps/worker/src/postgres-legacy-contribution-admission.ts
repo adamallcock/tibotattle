@@ -1,9 +1,11 @@
 /**
- * PostgreSQL port of the d43c8f92 Worker's telemetry-envelope-v1.0
- * contribution path (handleTelemetryV1Contribution in src/index.ts with the
- * typed storage mode: typed-v1-admission.ts insertTypedTelemetryV1Chunk,
- * telemetry-v1-repository.ts prepareTelemetryV1ChunkWrite and the D1
- * typed-v1-admission 0001 / ingestion-isolation 0004 triggers).
+ * PostgreSQL ports of the d43c8f92 Worker's legacy contribution envelopes:
+ * telemetry-envelope-v1.0 (handleTelemetryV1Contribution in src/index.ts
+ * with the typed storage mode: typed-v1-admission.ts
+ * insertTypedTelemetryV1Chunk, telemetry-v1-repository.ts
+ * prepareTelemetryV1ChunkWrite and the D1 typed-v1-admission 0001 /
+ * ingestion-isolation 0004 triggers) and, further below,
+ * telemetry-envelope-v0.1 (handleTelemetryContribution).
  *
  * It runs only after the origin's shared contributions preamble
  * (contribution-envelope-registry.mjs): bearer authentication, the
@@ -18,12 +20,14 @@
  * telemetry_v1_records), and one typed_v1_event_sources receipt plus one
  * exact journal row (storage_journal_append) publishes the chunk.
  *
- * Deliberate differences, each a refusal rather than an invented behaviour:
+ * Deliberate v1.0 differences, each a refusal rather than an invented
+ * behaviour:
  *   - A correction (chunkRevision > 1 over a current chunk) is refused with
  *     503 BACKEND_STORAGE_UNAVAILABLE. Production deletes the superseded
  *     typed chunk and, for usage, records usage-correction facts; on
  *     PostgreSQL typed_telemetry_chunk_delete_guard (0030) refuses that
- *     delete and the correction-fact writer is not ported. Exact replays of
+ *     delete, the correction-fact writer is not ported, and primary 0034
+ *     pins the PostgreSQL usage-correction runtime to staged. Exact replays of
  *     current and already-superseded chunks are answered.
  *   - D1's database-size admission probe (typed-storage-capacity.ts) has no
  *     PostgreSQL meaning and is not run.
@@ -87,7 +91,6 @@ import {
 } from "./telemetry-v1-repository";
 import {
   decodeTypedTelemetryId,
-  decodeTypedTelemetryRecord,
   encodeTypedTelemetryId,
   encodeTypedTelemetryRecord,
   typedTelemetryCanonicalRecords,
