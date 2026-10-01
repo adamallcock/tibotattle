@@ -1,0 +1,1118 @@
+{
+  "schemaVersion": "analytics-kernel-vendor-manifest-v1",
+  "sourceCommit": "d43c8f92a059d9c577776f7eca8a331eb305b8a6",
+  "generator": "apps/worker/scripts/vendor-analytics-kernels.mjs",
+  "check": "apps/worker/scripts/vendor-analytics-kernels.check.mjs",
+  "authoredFiles": [
+    "entry.ts",
+    "tsconfig.json"
+  ],
+  "closure": {
+    "tool": "esbuild-metafile",
+    "esbuildVersion": "0.28.1",
+    "entryPoints": [
+      "entry.ts",
+      "apps/web/public/community-data.js",
+      "apps/worker/test/analytics-shared-reducers.spec.ts",
+      "apps/worker/test/effective-quota-day.spec.ts",
+      "apps/worker/test/analytics-shared-input.spec.ts",
+      "apps/worker/test/quota-analysis-v11-features.spec.ts",
+      "apps/worker/test/v11-daily-projection-values.spec.ts",
+      "apps/worker/test/admin-community-allowance.spec.ts",
+      "apps/worker/test/public-allowance-breakdowns.spec.ts",
+      "apps/worker/test/quota-endpoint-collapse.spec.ts",
+      "apps/worker/test/quota-analysis-v1-shared-finish.spec.ts"
+    ],
+    "packageRule": "packages/{accounting,quota-analysis,telemetry-contract}/{package.json,index.js,index.d.ts,src/**}",
+    "typeOnlyImports": "erased by esbuild; not vendored; typeStubs declare the modules that vendored files name",
+    "externals": [
+      "jsonc-parser",
+      "runcost",
+      "vitest"
+    ]
+  },
+  "exportPatches": [
+    {
+      "path": "apps/worker/src/telemetry-usage-effective-reader.ts",
+      "line": 704,
+      "symbol": "reconciledAttribution",
+      "original": "function reconciledAttribution("
+    },
+    {
+      "path": "apps/worker/src/telemetry-usage-effective-reader.ts",
+      "line": 725,
+      "symbol": "reconcileGroups",
+      "original": "async function reconcileGroups("
+    },
+    {
+      "path": "apps/worker/src/telemetry-usage-effective-reader.ts",
+      "line": 999,
+      "symbol": "genericRecordJson",
+      "original": "function genericRecordJson("
+    },
+    {
+      "path": "apps/worker/src/telemetry-usage-effective-reader.ts",
+      "line": 1021,
+      "symbol": "genericOccurrence",
+      "original": "function genericOccurrence("
+    },
+    {
+      "path": "apps/worker/src/storage-community-daily.ts",
+      "line": 292,
+      "symbol": "publicInputs",
+      "original": "function publicInputs("
+    }
+  ],
+  "counts": {
+    "files": 132,
+    "kernel": 84,
+    "web": 2,
+    "parity": 6,
+    "package": 40,
+    "exportPatched": 5,
+    "exportPatchedFiles": 2,
+    "typeStubs": 3,
+    "parityTests": 10
+  },
+  "files": [
+    {
+      "path": "apps/web/public/community-data.js",
+      "blob": "9f0f8e69eb19a33b831eece7c1bcbaf7ebcbfbcf",
+      "sha256": "77a99c6f52552db156e8c0037c8aa663ceccfefc5d459d51de26db1aa89a404b",
+      "patch": "none",
+      "reach": "web"
+    },
+    {
+      "path": "apps/web/public/model-catalog.generated.js",
+      "blob": "ddc50f2becde137d2f8a252653bcc88afac2e9ea",
+      "sha256": "0229d655d6f54b8204ef13bd2877a4502edb05b6cdb47ffac071a99e60dedfcf",
+      "patch": "none",
+      "reach": "web"
+    },
+    {
+      "path": "apps/worker/src/accountless-enrollment.ts",
+      "blob": "5796b3bc24828b54963d18e9a3799af2672c4f6b",
+      "sha256": "92f08e4f671fa826583d420d63f8f77c82f5b1f483c07b90702d41a5f9768ea3",
+      "patch": "none",
+      "reach": "parity"
+    },
+    {
+      "path": "apps/worker/src/admin-community-allowance.ts",
+      "blob": "c836c294112eda15e11bb9f9a81f24bbafcb135c",
+      "sha256": "62f60992584e7716cf898ff9f90bb65c77991b021a2cda0a1553437aeb82fb9f",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/admin-operations.ts",
+      "blob": "088bba367efa4017ea03d7f94cfffb4a02c337d8",
+      "sha256": "04351e779646d3ee660848d8930347a65f18665bf3ab374ce3502fc6217493f4",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/analytics-delivery.ts",
+      "blob": "637f9a069f43c476733ec5a4a998cc9b91df33ca",
+      "sha256": "738c04407b5d8b60ce8b99ec4f1f23bb32bcb906b1871c5215aa513747ae8a58",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/analytics-model-block-contract.ts",
+      "blob": "018123af319c9c6fc614ab6e46aee2b2916151a2",
+      "sha256": "36b627690bd34e0fab17ea0ca7cdc0dbbab7d780325db61d59c6067d55bd710e",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/analytics-shared-features.ts",
+      "blob": "7d157e8d4d45574a999a664543c50df0b40534e4",
+      "sha256": "21a4039e7c508ee8801ae3eb2ce3c683d40c33a566e2ddb795328d718f02d523",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/analytics-shared-input.ts",
+      "blob": "401cf5643a050b639feae075d058c774d5585fe7",
+      "sha256": "076b1cb516ab5043a13809221b9f1510d5852635b22375a2ace52c47c9d5f865",
+      "patch": "none",
+      "reach": "parity"
+    },
+    {
+      "path": "apps/worker/src/analytics-shared-reducers.ts",
+      "blob": "743116a177d31537dad5193b89a0915006776fa3",
+      "sha256": "1b8dee053c6d13420f9c05a960b458e7b4e27f4b3bb1f875e86277f1a97a231a",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/cache-retention-day.ts",
+      "blob": "a8a7286e31669048d5f8df498697537c359598b5",
+      "sha256": "2d7c8210c9a55f137ce3ae00ca16ce064dc653cf8504b2947acbb784f4f8d93c",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/cache-retention-events.ts",
+      "blob": "9fc1d37a9d046f386ccc74eccee87a9f23cd4af5",
+      "sha256": "04fd3a5bd487e87c3187a03cb31fbe7f6c4ad9770b5e63543cb1da1e982c6d45",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/cache-retention-values.ts",
+      "blob": "a265243572e4b880ecca3b98c647dd8acd367f74",
+      "sha256": "c5c2418897c0405e7b786f5c56da98292e6c63579c9f63e26df4113c64a1f6ef",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/canonical-json.ts",
+      "blob": "90aedc47f76e92a6266863801cc4d704cd4fc6fd",
+      "sha256": "cde44ad2fdaa007df0e9ad07adaf158167a83685b86d836400cf3387cbf3bc38",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/collection-controls.ts",
+      "blob": "08385f79edb9d8a50b34f01ea464bc9ca268c800",
+      "sha256": "964d9a623cc627cba9a5fc0df05581f303fa4377f2016a56f5f96236c0bd34dd",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/community-allowance.ts",
+      "blob": "a6125dd8725a412058d06d469510ad6e81822083",
+      "sha256": "ceb3c50e39830b53753e7c876a75edb549214240ed268d6e14a0046cf0322877",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/community-analysis-queue.ts",
+      "blob": "189cc24efcfd7b8644682b8f3691682311630b1c",
+      "sha256": "9e974830680c5fe5489e29c41f8dd431a415eb86558ff0166a6f0db12494babb",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/community-daily-aggregates.ts",
+      "blob": "c2b5cc6c6a0d0be7b1ad45c96d5c3039fca28503",
+      "sha256": "1266fc1456166397fc42357cf563ac70b224ee3b8b74085e056d411e069c0859",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/community-daily-spend.ts",
+      "blob": "6e43a609fa7842a0c2285b59d95cc8304d76f787",
+      "sha256": "1eb8944e693fdc2a6ce2ad1b079079f2bc7336df5970a305399724ba4a141bae",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/community-publication.ts",
+      "blob": "524856a2a7d081df523b85b4d244e9538198f97f",
+      "sha256": "fd712e9d143cb331444354723f42d82db5db8bb2b3b9df1961c16cc7e706dafc",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/community-refresh-lanes.ts",
+      "blob": "aea999f9fbcdffb7371fc10e740a18a805670b24",
+      "sha256": "54d8140f63ed42bb37166450b02932c7dff67b6557ffa2f412b4ad2a3f8b82fc",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/constants.ts",
+      "blob": "2345fe7bf71711311487bb6cc883602abf29d552",
+      "sha256": "76cd6b587a2d72d4f46896437925cf75e26fe2812a3cc75bd48d7520377ea921",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/crypto.ts",
+      "blob": "a8430f8d20a80e08381fc950755cd5a5e06a2a9e",
+      "sha256": "2257219006184c343ae769ac80d45ec954524b0d1d70561272ee9d3b265ab593",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/d1-invocation-budget.ts",
+      "blob": "3c13f4f4b9a7fb42555105c9d5afdfc419aee29a",
+      "sha256": "4ff9627cb005e2d0603d917b69c4b2ec18c18ed073a84a02e95e3efea5ea381a",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/device-auth.ts",
+      "blob": "b21ad7007f4377dab496d39af3369cab7a86ae9d",
+      "sha256": "67ee777d345f0a7292f3c4f30f47cbe272bff105200ed0e4fc4755fa060ca807",
+      "patch": "none",
+      "reach": "parity"
+    },
+    {
+      "path": "apps/worker/src/effective-quota-day.ts",
+      "blob": "8b9bf05f2823dce5dfaf8cd6088ca57d8751a559",
+      "sha256": "e6597052cc2dc6ffcd00aae4256370795f851c6babc61e9bf6c0c7911ba0c65f",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/effective-usage-day.ts",
+      "blob": "fc771253bde450a9562aac6b83c53831501707cd",
+      "sha256": "0db08f20566c74c4c7d45e5bd6281c57e1ff361bbb0509d378b4b82fd9723d62",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/errors.ts",
+      "blob": "55f3d967d3ee45694271b3ca07df81a4844e2140",
+      "sha256": "a3ed53fd4aef9b904796a14a2d57a030ab3152f4424905e685b60fe75d25aee5",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/graph-day-projection-values.ts",
+      "blob": "cb8ca7f41d83c272056ffcf840ec04cc88699eec",
+      "sha256": "2c3865bf07a0328c2aa3cbee77379417e62125ef64409d2a8c6ec8c4e0b9d847",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/graph-day-projection.ts",
+      "blob": "ad5a3dee4bc85a4bcc59b47b316956b227ba26ce",
+      "sha256": "9c31d726de06e4d84370fff0a78675fae5c0de7ed39903b3c910292255ad0502",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/model-history-window.ts",
+      "blob": "ce32d1fc804fa03d57eb68196b77827ec1f3ca5f",
+      "sha256": "4b41357c770e8a55950b326f0bcbb411fe87dc784c73c49219d14e83166a92f7",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/prepared-v1-day.ts",
+      "blob": "c1db2820bb748c1b23302c68c0c6e2dc4bc26df7",
+      "sha256": "8428aebc6c868d45523dd4602ba64794c757bd64584ffa64b3ade246c9db5ac1",
+      "patch": "none",
+      "reach": "parity"
+    },
+    {
+      "path": "apps/worker/src/public-allowance-breakdowns.ts",
+      "blob": "d9012c3cf37a483d42bc4ef2a20551747706cbd4",
+      "sha256": "5eb493b0302fac21c40a7738f9384d19fadcffed63808418b23641182b911b2f",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/quarantine-reconciliation.ts",
+      "blob": "a775bb6c5416d95f1c7f61582314ad4ad26d522a",
+      "sha256": "abc1291a16c813804c560be1180d6c2c3b8278fe56f56c3f250ef247106a2b2c",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/quota-analysis-v1-reader.ts",
+      "blob": "e5fb54a139d742bc44db0f5c6747eb8baaa770ee",
+      "sha256": "f9c2d039a331e3653d4c70b63e082fe0fe9416eafdde3e07ba1a549408697b96",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/quota-analysis-v1.ts",
+      "blob": "fd0240f1dece5e7826b9065af2fca3a2ca9ad471",
+      "sha256": "5cde7bfc7e386fd492b5a7871312babdb261b11541428bef2ba4b9f762f81867",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/quota-analysis-v11-contract.ts",
+      "blob": "af5ca93df10701a24310ba203eece6396ca15704",
+      "sha256": "6d9f51b5edb8779211c4ab9256032de457108b296d6247ff97e160d4779478b1",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/quota-analysis-v11-reader.ts",
+      "blob": "4bfb81df81a2b5c9c2f2be6ff74927ed6243d3d3",
+      "sha256": "f6d1ec4242825c1df62fa1e26c959187dbe549818509ed44643d82d85387e209",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/quota-analysis-v11.ts",
+      "blob": "a7da16db679a2b309b36121b4bda3239113f8e4c",
+      "sha256": "6b1e1b9f94a9b31653e5c02218cb3a696190bef24c2a3e77e7e3dd2e86be06f6",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/quota-analysis.ts",
+      "blob": "1dc5b020e902e414479781173f03581be9ec8ab8",
+      "sha256": "142a6c9999fe4f7e882c5c72dce90f5aec0fb7d40f19213aadd038be9ab3b048",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/quota-endpoint-collapse.ts",
+      "blob": "0d9c262364c86a16e66002543f6f0bb7f6438d39",
+      "sha256": "fecdbf30827db10ff59b751b915985a46a94381e47866dfa2349d8a571e9cf82",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/quota-fit-projection.ts",
+      "blob": "0f31ac0f9a1a510a653edcb6d37d8151293400d9",
+      "sha256": "bf20f9afa88d2087f5e39bac4175b472b60c53ea4be87684dd8617dc3872764e",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/server-pricing.ts",
+      "blob": "19c42635234bc3a1f5bfb27ae1e813b6900bc4a7",
+      "sha256": "8460e62792a628e1389d53f58b691b94df1f35afd651228d9f198ed26445eb3d",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/session.ts",
+      "blob": "b0df530b3830a4922b66dda9502cd8eb351a0e6b",
+      "sha256": "c436381ca6ec489dc9c6ced56d8bff755bd95458266f4546a2a9ea282f0a21bf",
+      "patch": "none",
+      "reach": "parity"
+    },
+    {
+      "path": "apps/worker/src/storage-admin-overview.ts",
+      "blob": "2e4e83a689ad6da8e6636c20f46b195e130e4d0f",
+      "sha256": "cafcc7ec6ea0702e1720ee28347bc911f946f4db588d43c70d981c0ba5b9fb76",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/storage-analytics-failure.ts",
+      "blob": "3e2eb1ccc6544a83c815c5d82d981d30c984d1ec",
+      "sha256": "b1bd639101c9d0ae38ef074fecf5bde01d17228695bf71a2569e2a6f6919aa49",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/storage-analytics-shared-features.ts",
+      "blob": "4f2602d6b18eb15382ad18b2c9fcf4f293f8879c",
+      "sha256": "7bed2c13a8151520369e87d510fd8361aed391b2b8e6e78d6913dd5090042b56",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/storage-community-authority.ts",
+      "blob": "7bdaa8d7611b351bb1f2baccbb99c48479b40af0",
+      "sha256": "5733ba28a9c900a46dcf91b71e16a1791bc893cc9242a904d628fb4058d9be42",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/storage-community-daily-devices.ts",
+      "blob": "b7a35bab3be226e39f9af7d935b042a760a934db",
+      "sha256": "48a9338cf4d00b3228c865a25b1c1d18ee8f2dd9b6a2ca96d13dea4b42e29980",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/storage-community-daily-pending.ts",
+      "blob": "5a6ab7a7b6ed40a9fa4f5fd2f7d276cc3f4512f3",
+      "sha256": "0315625615d58650183b6cd355c35aeb8ea10c6d98603597ddf7665ac544fdb7",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/storage-community-daily.ts",
+      "blob": "04408c88b1e55c8347e8da8e1f3494913f344fa0",
+      "sha256": "8b0a07e8174fc73e016ac7b343a4be33b6518175c6d02f371d9561b137d37c38",
+      "patch": "export",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/storage-community-graph-publication.ts",
+      "blob": "83ca47ca17f3450ee53a676a3d2f31a69d838672",
+      "sha256": "9499d1f1142868749b76b93a4ebe493fbe0f7d75b87da981618f2c2c41609e40",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/storage-community-graph.ts",
+      "blob": "7c95204ab879b07dc0664dfc84e0de48e26904dd",
+      "sha256": "11c8ec5e24a33488bd094de81231f4655a2ecaca23212b1c6bc0da6252cf38a2",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/storage-effective-history.ts",
+      "blob": "2c78c02c29e75174f2c91e218ae1ea578f08111c",
+      "sha256": "11899c7c2b76b158ce5965c7590206fb03c79dfaea2c3c79493235f9677f6a2f",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/storage-effective-quota-days.ts",
+      "blob": "f2f250d3d92c93e866e8369ee7adb0018ddfdaee",
+      "sha256": "00b6da2a23487cff631df8b415cba468c8bc0b1c109802bd42184828b85e2156",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/storage-effective-usage-days.ts",
+      "blob": "8906620e08ee2b440247bf4eace7aedb2241c733",
+      "sha256": "fcf297443306252e9f0de33097660aa4680d719e7d3c78d12c4a5f5d5870c90d",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/storage-history-checkpoint.ts",
+      "blob": "3c7d0adf5640f8f876e2e646bb47aa69cb94ae9c",
+      "sha256": "e47b61ab8b7ae571322ff193da09cd946074f3e6d0c586741607e31babc52c40",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/storage-routing-batch-budget.ts",
+      "blob": "4417f250b1ee831b5899b491dc54163b780d1f2b",
+      "sha256": "643ded8c24d444bdfc9ec801805f95d5debf6a68c00684cc1bcfe01437e9be13",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/storage-v1-history.ts",
+      "blob": "ba3099f9c03fdfba5f40cb931202792081c0ac4b",
+      "sha256": "80549ff93bb9bedcf41f44b47608a4ab6ffd3955a8ad5b57e44d08b30226c3fa",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/storage-v11-history.ts",
+      "blob": "0b28e98852860dc7a1c6eab762f55d65a8c447ef",
+      "sha256": "8f7585b65c33f60be9d6f2a6337b0fbdf109b5ebaab9d5c695cf7240560b4094",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/stored-record.ts",
+      "blob": "80979cd36434aef15578f918a3704e63b3e0d84f",
+      "sha256": "714ae24d54f75e3f484b23161e00c145afdd8a14cc9c35f8b62499a036bf0948",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/strict-json.ts",
+      "blob": "13cfb22c057c07d2394717922d59569ee1d508e1",
+      "sha256": "137866597bebc2239e34a24aa2dc1b97069e4b2bd3b4203ce24df21570a2137b",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/telemetry-transport-policy.ts",
+      "blob": "5bad30d1e1c71233bc5d4c56975b90307ca53141",
+      "sha256": "d21cce0375594d4a7531ecf66c9a05a6bf57e46ac951e971445f3c0ef2d11f1d",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/telemetry-usage-correction-repository.ts",
+      "blob": "d9daf8a0bc6c6b6adda8774d183370cd17f54517",
+      "sha256": "998e138bf58a1d08c40891b907b6d9c7af8d433aa8a31626291a5b8bb86d1b4f",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/telemetry-usage-effective-reader.ts",
+      "blob": "ffa88be6734fa65a3b4134d138d15ba21e1edc01",
+      "sha256": "c255ad88120b03487bccd7ac4ca2594cb5f6d0bf05da6722e32f519c8215887e",
+      "patch": "export",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/telemetry-usage-reconciliation.ts",
+      "blob": "bd511909d1fe7122e088f639acee4d8cf2eba723",
+      "sha256": "35458510a2f2c69710bf7cf78e701cdd0e504cbbe903ba3a0ecc1ace6271d15c",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/telemetry-v1-repository.ts",
+      "blob": "ce812ccdf34461849ae3a28126b0458a512dce36",
+      "sha256": "e390af242da7aa48aed6c38a6498acb335c2a372a235892c2c8ad75442e0e1f6",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/telemetry-v1-source-selection.ts",
+      "blob": "1ee5df7860f8b74017b0c7a92a851614d29ba512",
+      "sha256": "3d9a6db45b9808285fc3bb3be040e7a329e3cdca1789593368219a0466baa6d2",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/telemetry-v1.ts",
+      "blob": "62eabd530b9fad9712808d79de90f3ca28b02e17",
+      "sha256": "b37cf8ee84e616a5a81bf1ec31f319dc5273f095b0bdc97dadac4e387f04821b",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/telemetry-v11-compatibility.ts",
+      "blob": "30f99179142595ddf1678bd2d7deda64c2d20b77",
+      "sha256": "7e354e98b670b7b0aaa24c3c016d85a5e9bf32d786a2893a4a7ad64362e8bb79",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/telemetry-v11-domain.ts",
+      "blob": "c195633c130241b43daf04d9b1d99270ddcf6f0b",
+      "sha256": "6818293775c656553052e4788d03467a40e75a71f3c3ac3866feadf1413eebee",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/telemetry-v11-repository.ts",
+      "blob": "5c6d50702d5a11f7a1ba07c5c3616559afd53b41",
+      "sha256": "753f1efb99b7ce168e6fcb355c17bb4c4ada53ce75ad2c3618f6d45b3d10140e",
+      "patch": "none",
+      "reach": "parity"
+    },
+    {
+      "path": "apps/worker/src/telemetry-v12-effective-reader.ts",
+      "blob": "91dcec914c72db011e6738daf029434c107e9d1b",
+      "sha256": "54a9e5b01e5b7fd0cbe9668063a300b8988ecafa5c6b8134402df0c5e93812c0",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/telemetry-v12-repository.ts",
+      "blob": "3a27d49b39d69c72ebd96afd9110c7cc8b5629cf",
+      "sha256": "efda5424649775901b1d2c4c906a391ae1f0fb741b9954a93f5db1715278e1c4",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/telemetry-v12-table.ts",
+      "blob": "186674f3e4f5aae6ec54160ab134fbe0720d3b24",
+      "sha256": "2f7427247d4707a77f17fea0ce1b33d7fad45f7e1972b170d12a98d598efcf6f",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/telemetry-v12-typed-codec.ts",
+      "blob": "d96ed51366ae12450dff17a3064830b09b6507fa",
+      "sha256": "fd1d114599e2af30c57ffbcdd7f6e6af8183dfcd2f8e4e4bf60e7af5c8d534a9",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/telemetry-validation.ts",
+      "blob": "5311dd7d1691f7a53765f697413bcc64b05f08cb",
+      "sha256": "70f6a612d5e511b2f3c5ace5ca47ac73ad9d3c5c5b8b2942885be5cf606ec3a9",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/typed-storage-capacity.ts",
+      "blob": "afb2045799458949ae68e2249a94f3ea50b61c3b",
+      "sha256": "05b4d818b9987b5549a9842c32f3f54b9b3e1d44c9894817b08d113e04e97e0d",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/typed-telemetry-codec.ts",
+      "blob": "6adfdb412af949ca0c505fb664f122fcef2649de",
+      "sha256": "f337847897fdbbf92a0efbbb8f9e1f935c00753e7d2e9c2a51828371d97d18df",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/typed-telemetry-compatibility.ts",
+      "blob": "f39e89538e74d90e1f0223bfcde8729f214ffed4",
+      "sha256": "984eeb9f8a3fc07691791df17cbbc823970afcdeb9610441a0a01a5c5d7fd827",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/typed-telemetry-read-layout.ts",
+      "blob": "9c3832014b7cc7cdaa9abac9c41e534ed1113c6d",
+      "sha256": "d25f8782942e27f2226983375418be87ee11575dd1b3d8cee8911bf06c1b4a81",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/typed-telemetry-repository.ts",
+      "blob": "2d0ad5621b7b9e982085fdcd309f43f9e93c7d96",
+      "sha256": "3a96adab27c4c5ae07f19bec0e25b05171295a30b9b304e72ba8bca408e5a5a2",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/typed-v1-admission.ts",
+      "blob": "db661dd4b7004bfad7bd5b3e78affb1c5ff7fb0a",
+      "sha256": "b1881b967c0813f6c189e83b68a507d4561fbabc102cc02aee176cf7dba96ca6",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/typed-v1-analysis-reader.ts",
+      "blob": "a74c4e86bd20a3327b57e577f5cc6efa0f7fcb40",
+      "sha256": "4cca5680fe51edcbdebdcaa7c50fdf90b9a4fc2fabcceeebc4aaac668468dc44",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/typed-v11-analysis-reader.ts",
+      "blob": "2db88e275125e67dfb9e3536c1d8b3bb0d18f588",
+      "sha256": "0fbe96117d314ec107f3f8c06c665bb3a435489d1a9488ca76ba9282168e43e2",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/typed-v11-chunk-completeness.ts",
+      "blob": "f8adb788998dcbc65f625f25a08f501350600fcd",
+      "sha256": "4c8675979ffd4988a3d128fccdb99073eec7e9bc578fde2f83f94ecc86276568",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/typed-v11-quota-reader.ts",
+      "blob": "eee5b02be125a027cb939f8db58d3c4b327c22ae",
+      "sha256": "b7646f52cac392f6b52fbfb15421c4c87e6b3eea02adba8e8e5de883741de204",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/typed-v11-record-reader.ts",
+      "blob": "09e60f2c54b964aa72cfb76a825266ddf49e7b3b",
+      "sha256": "3f2be320a0a3e5f2c920aae773d6a962d5c0181ab424f707bf04373bb34977fa",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/v1-daily-projection.ts",
+      "blob": "940d102fa5fe0f252d10b1678fdab327c8745f2a",
+      "sha256": "15697ff17dc11921b3ca140a2f4700cfb72460124ca129a383066e35b6830e56",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/v11-daily-projection-values.ts",
+      "blob": "d8630374eebdbc5615c964cce3deb61a1ac9755d",
+      "sha256": "64ddc7d045cef6b8ec585febd9d9c6a1d0d95dc96a09e6761bbacefbf55e2952",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/v11-daily-projection.ts",
+      "blob": "2acd2e32357de9db2ef0af5918d252f6758ffb61",
+      "sha256": "c6d1d7ece2ea5ab1bc4c6533c8996ba0185ba9d7c0495d6a07cebbefec6f4084",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "apps/worker/src/v11-storage-journal.ts",
+      "blob": "f92d412983853c6a596362deb72ba4fb763f6754",
+      "sha256": "388aec7d906bdcec159f473c9254d7f258fd8039c7cbf1c9af6a2dfa7fcdfce0",
+      "patch": "none",
+      "reach": "kernel"
+    },
+    {
+      "path": "packages/accounting/index.d.ts",
+      "blob": "5e18ee8c794179370f264b8fb7c0f22f5a1070c6",
+      "sha256": "ebcc70d1e0d54a5d65a4eff39969a823db6f3e69eb08394a19a36ee82a48c07f",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/accounting/index.js",
+      "blob": "fd2f4365a843da7c609ae8e1ef1cb118ba710b5b",
+      "sha256": "eaf74f813058fa5a4bef8d27406312acf497f3a0f3fa1cc92339ab4f856d3f7f",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/accounting/package.json",
+      "blob": "5f0009a0f580797df79c5207f6a3e6ca11ab8c19",
+      "sha256": "694c40333fa323313b1feaeb81551ab4ff9cc9685c8d1277b5813bc6c09f74e9",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/accounting/src/cost-ledger.js",
+      "blob": "5a500675260c9ca79c9f8148bc38886e435f114a",
+      "sha256": "9b8b370513489e99194035553dc135379a2d842a8b22e531640f47a0f630111e",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/accounting/src/local-api-pricing.js",
+      "blob": "b2d35f378eac72a0f65b1dc20bdc9434ad615178",
+      "sha256": "1099623342523adcca23c9b79144ae3d4f82caa0f9c021d01f8b1290a68755b0",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/accounting/src/price-registry.js",
+      "blob": "f134a490f0dd81962a7974070bdc7c0f0470d551",
+      "sha256": "599c8e5244cde99db1cadc0d26797e2e55039ec4a649341b7c6829fab0e882d0",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/accounting/src/subscription-speed.js",
+      "blob": "a226588462c8b220e2b012a395bafbef2b1f8577",
+      "sha256": "0ab9661a970060a974eff0adec8674522f487e86fe8a6efd6cfff142cc792d74",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/quota-analysis/index.d.ts",
+      "blob": "44546856040854bfcb653b393b5eb5f2d14a84c3",
+      "sha256": "238bb0c88cd7307ceba83eb8f527eb043618067482be09c28e9aa7f3b6a57973",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/quota-analysis/index.js",
+      "blob": "d73207b777fcc605fe6190bb875319a14d104517",
+      "sha256": "df0a75b751d1be9e16ff5d5155af7dadc79644f0315abec1b12659ff1f758d7c",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/quota-analysis/package.json",
+      "blob": "e31435a56b5423b9266496061c06e1a1e96ad266",
+      "sha256": "7ef317bb5d4b073729481aa96dfdc0faf787c8e5fd523bb34c2af765be9d0fea",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/quota-analysis/src/model-composition.js",
+      "blob": "7b63d7c0fdae0ac006ac82720b1dc32ce36c970f",
+      "sha256": "9f33f8f128ffda704cbf2ea587e11b0b801470bde229275f43890e8b166e86fd",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/quota-analysis/src/plan-attribution.js",
+      "blob": "752e033130daa98f610e82c153a2fcdc97238e56",
+      "sha256": "04a5c118d1c4081f411c20b50c54b0496a48b5ef85b82cce459fe53e708f748d",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/quota-analysis/src/quota-calibration.js",
+      "blob": "e313f2489854e32405282c1d8dc911ab193827a6",
+      "sha256": "7d19a7a0184c65378c3214b439c2cac647747457823d91d2999991847a552bbc",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/quota-analysis/src/quota-pace-forecast.js",
+      "blob": "33dd967ef318bc78d42f41b856287eeaaf60c458",
+      "sha256": "793ee450768a193609e1659ce62c33f11af897e5e562b8a7393f4644d0a24891",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/quota-analysis/src/quota-rolling.js",
+      "blob": "c8b2e7d63c652694987edd1ca82bcf1e1e0fd4d1",
+      "sha256": "2afca11d40c61c463524cc8f4d267c128dbe427c72fb6c2e3ed68b056ca70977",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/quota-analysis/src/quota-tracks.js",
+      "blob": "5f417a9f3b960d5ac1619ea2e357013d595d5dbd",
+      "sha256": "922350e53fd58920fd9f9a9354db1a67b131cb302490b898cb4a5ca8379f9645",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/quota-analysis/src/quota-windows.js",
+      "blob": "39f5d9d0b2334a1d94da91a1339515da9ee2c7aa",
+      "sha256": "a5bb5c759351892f101e0e69fe71f9391b4b22ed533d75f74ce41f6de71e9597",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/quota-analysis/src/reset-events.js",
+      "blob": "5da9937abdcaca320249480b09902a549ee15661",
+      "sha256": "aa53ad1547d45df04c1ae4375c2e14bb67fecefc934c15621054d2de6ec3071e",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/telemetry-contract/index.d.ts",
+      "blob": "f86a2bbd9213e04cbfd4ac8bccd8c3b558ae920b",
+      "sha256": "c5a4939b5659d48d2b681c0133180b02884a41cb01a780571ca6dfd8809770a3",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/telemetry-contract/index.js",
+      "blob": "e9fcb569c38e20f851eeb2c697819392d5e4f8bd",
+      "sha256": "24f2cc26c301ac484745dc9af63f6a59c7249a5c3b1842fc06d5dc950fec3b57",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/telemetry-contract/package.json",
+      "blob": "1c03b0ca19d75c529a9cfdbdc9f5c73c9cffdca9",
+      "sha256": "9de5be746aae7b2fae1f8cafbbcb8cee1568bec61eff396319361d0ce4883cc1",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/telemetry-contract/src/admin-model-history.js",
+      "blob": "d1536fdf5a0e0d004afee2333f5d5d60a44aa079",
+      "sha256": "0962af8e4d3d1f81b62c0bb97de97d06ad32e9d6ef2c2c5918f533b369a007fd",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/telemetry-contract/src/constants.js",
+      "blob": "228daf81c7c869452094a8bf9b691e5315fac21f",
+      "sha256": "599601afdc0cff648af06ed1d14a9d75e2c216b0e259e3953a8a0696e849db38",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/telemetry-contract/src/envelope.js",
+      "blob": "6ec82a937cb0e6f29a22eb2b3c00568fe47599be",
+      "sha256": "80309856ab01e302262c8ecd25a5449d8a966530341d6be8ada857a70518a108",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/telemetry-contract/src/errors.js",
+      "blob": "281b464a08a0ef19184e6654c8d3a15f30777de3",
+      "sha256": "d6ffa67dbc6f45f1adeb934fe8e8bfc4c176642528360e4e7941a323a296ae0b",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/telemetry-contract/src/model-catalog-contract.js",
+      "blob": "039ef0c20b4e7856b6025e0005a7163fb00e4047",
+      "sha256": "6e2770023f536b333c70a03c51a40ff56c3265206e595a553863a71c078b2aec",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/telemetry-contract/src/model-catalog.js",
+      "blob": "875ea365b2f5d93419eb66746eff3827f5008a93",
+      "sha256": "837b3e592e554b762c81da03115776df5f0e9d8660ecd16f5df02abd25494c02",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/telemetry-contract/src/performance-histogram.js",
+      "blob": "7b53c9b14410968e1b3661a3c30f81285654f4f4",
+      "sha256": "f4e5fa0d42070db1fe394b3be74a63269c4c49f39fddc6d880fdc65432b3e587",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/telemetry-contract/src/primitives.js",
+      "blob": "80d47d2e8c4c557ef180cb707f6244f4f4c5e340",
+      "sha256": "6f883333bf39759f0f42b7c8f6fa5524d0b6cd421ed0cc7fe3d61c338c20aa2e",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/telemetry-contract/src/telemetry-performance-v1-schemas.js",
+      "blob": "b8e505b8c5b3cb27650fc7492886a90297e8b6da",
+      "sha256": "ca52595ed972525540206b4d0556f561e603e176fd50b4f599a28d10cf6c8f29",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/telemetry-contract/src/telemetry-performance-v1.js",
+      "blob": "622aa2a06ca1ef63707b8b39d7aeef8563bd204e",
+      "sha256": "9cb14d6ad79afdcfb4fce37b4f130a80ef616a4b67ec92de6aca70bb6de69087",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/telemetry-contract/src/telemetry-v0.1.js",
+      "blob": "ad3c475e70aab61cea10601920208f0cd1aeb4a8",
+      "sha256": "8662a6907c6e421cdd8e24d0bddb61fb996dde30644c64f57c36fc9c6959dcdf",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/telemetry-contract/src/telemetry-v0.2.js",
+      "blob": "0fa03b0c982f0d6b0b55d9c37e40d37d9c1c3422",
+      "sha256": "44993a2e7811235672b0b1aad62a756c6b98e8ba1fdcffa7dc7060f6a676659b",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/telemetry-contract/src/telemetry-v1.1-domain.js",
+      "blob": "c10da9b5ac8000e7f03e14c8f391d4e77441bdcc",
+      "sha256": "a31dfee9b28253d9b14fd323bfe69cdee1f3f135c03c404c38375f5345575069",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/telemetry-contract/src/telemetry-v1.1-schemas.js",
+      "blob": "56f5efb6b2d4192ca429d0cccd1e7fa37c57299d",
+      "sha256": "4ef0289f6ae49077f9a97e21a7b46c08d00043f2fd9b8799fdf64410d08d696e",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/telemetry-contract/src/telemetry-v1.1.js",
+      "blob": "d22f74679c864fd89d88a210ddff3f9505bbb15f",
+      "sha256": "096d62571a490710b03cd9d0428c53ed76402a9c7c2bb2015a1b20635c8a25e5",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/telemetry-contract/src/telemetry-v1.2-domain.js",
+      "blob": "7679a2eb6eb7dbcc6091f762d6cc9b7d5a3fcfdc",
+      "sha256": "021e809baf8c672afe8b35de7d6727683eeb189526d850381b981307a3d02794",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/telemetry-contract/src/telemetry-v1.2-schemas.js",
+      "blob": "94f6df4cfa89e8ee8ebc16073ecf871d73d7a56c",
+      "sha256": "0195b5ef30c6ae0c6f586a873ce827a2a98d5a8ae419a47f2c3ef80910556f50",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/telemetry-contract/src/telemetry-v1.2.js",
+      "blob": "801cbc2ff5a0d0f462e76790e2cb23a23253a988",
+      "sha256": "f0d7960ce512a98a36aff567ccff0fc7a41492428e43dd7e9b0647556e87ab75",
+      "patch": "none",
+      "reach": "package"
+    },
+    {
+      "path": "packages/telemetry-contract/src/upload.js",
+      "blob": "c630a12e85472ffbf4f8f1bde5d3470276814e28",
+      "sha256": "97ff428000324447644d4f3817497b8d706f279fbfe52838110686902a64a84a",
+      "patch": "none",
+      "reach": "package"
+    }
+  ],
+  "typeStubs": [
+    {
+      "path": "apps/worker/src/telemetry-performance-envelope.d.ts",
+      "source": "apps/worker/src/telemetry-performance-envelope.ts",
+      "sourceBlob": "0b16431cf414c6d467b7b37a71276b82411baa87",
+      "sha256": "a2d126481c8d0e33e557f867abc297221784201c9575beaf1777c9a3c68977c2",
+      "tool": "tsc --declaration --emitDeclarationOnly"
+    },
+    {
+      "path": "apps/worker/src/upload-ingress-admission.d.ts",
+      "source": "apps/worker/src/upload-ingress-admission.ts",
+      "sourceBlob": "5c034168dc2e3faa5aba03f6f82c980fb291ed52",
+      "sha256": "c88c2c34d9fbf680a87204011a83687d282dccc4dab1463e4c8dbd98ae43856f",
+      "tool": "tsc --declaration --emitDeclarationOnly"
+    },
+    {
+      "path": "apps/worker/src/validation.d.ts",
+      "source": "apps/worker/src/validation.ts",
+      "sourceBlob": "46cc459a18c53972f96f770eea50f352c6e7478e",
+      "sha256": "576fc21468c52dbbde8890fe56e09bf2d657a7bb8f6f4c7f7fe05707b08c53eb",
+      "tool": "tsc --declaration --emitDeclarationOnly"
+    }
+  ],
+  "parityTests": [
+    {
+      "path": "analytics-v2-test/kernel-parity/analytics-shared-reducers.spec.ts",
+      "source": "apps/worker/test/analytics-shared-reducers.spec.ts",
+      "blob": "66dabf149b95d26ee420999877d8555de799b971",
+      "rewrite": {
+        "from": "../src/",
+        "to": "../../vendor/analytics-d43c8f92/apps/worker/src/"
+      }
+    },
+    {
+      "path": "analytics-v2-test/kernel-parity/effective-quota-day.spec.ts",
+      "source": "apps/worker/test/effective-quota-day.spec.ts",
+      "blob": "57a8a21e7d1e4fa07752e3292f49198e76a4e49e",
+      "rewrite": {
+        "from": "../src/",
+        "to": "../../vendor/analytics-d43c8f92/apps/worker/src/"
+      }
+    },
+    {
+      "path": "analytics-v2-test/kernel-parity/analytics-shared-input.spec.ts",
+      "source": "apps/worker/test/analytics-shared-input.spec.ts",
+      "blob": "cf8e0bc2a368a6cf6c7946be6641aea0a4d84ea7",
+      "rewrite": {
+        "from": "../src/",
+        "to": "../../vendor/analytics-d43c8f92/apps/worker/src/"
+      }
+    },
+    {
+      "path": "analytics-v2-test/kernel-parity/quota-analysis-v11-features.spec.ts",
+      "source": "apps/worker/test/quota-analysis-v11-features.spec.ts",
+      "blob": "13b6a6165f437a3e667bf154910c58de13656df8",
+      "rewrite": {
+        "from": "../src/",
+        "to": "../../vendor/analytics-d43c8f92/apps/worker/src/"
+      }
+    },
+    {
+      "path": "analytics-v2-test/kernel-parity/v11-daily-projection-values.spec.ts",
+      "source": "apps/worker/test/v11-daily-projection-values.spec.ts",
+      "blob": "3f4436faeb7b01ba9721a6473886fc025c116e21",
+      "rewrite": {
+        "from": "../src/",
+        "to": "../../vendor/analytics-d43c8f92/apps/worker/src/"
+      }
+    },
+    {
+      "path": "analytics-v2-test/kernel-parity/admin-community-allowance.spec.ts",
+      "source": "apps/worker/test/admin-community-allowance.spec.ts",
+      "blob": "368b79f4ea92d3529f58cb51fdd14eaf237eed94",
+      "rewrite": {
+        "from": "../src/",
+        "to": "../../vendor/analytics-d43c8f92/apps/worker/src/"
+      }
+    },
+    {
+      "path": "analytics-v2-test/kernel-parity/public-allowance-breakdowns.spec.ts",
+      "source": "apps/worker/test/public-allowance-breakdowns.spec.ts",
+      "blob": "884f981e78a2352f610b34f6ce804fb9e3308dd4",
+      "rewrite": {
+        "from": "../src/",
+        "to": "../../vendor/analytics-d43c8f92/apps/worker/src/"
+      }
+    },
+    {
+      "path": "analytics-v2-test/kernel-parity/quota-endpoint-collapse.spec.ts",
+      "source": "apps/worker/test/quota-endpoint-collapse.spec.ts",
+      "blob": "31300ec39bbbae9efdab73e3b16c0163663e83aa",
+      "rewrite": {
+        "from": "../src/",
+        "to": "../../vendor/analytics-d43c8f92/apps/worker/src/"
+      }
+    },
+    {
+      "path": "analytics-v2-test/kernel-parity/quota-analysis-v1-shared-finish.spec.ts",
+      "source": "apps/worker/test/quota-analysis-v1-shared-finish.spec.ts",
+      "blob": "89c906dea2223e4533542c004e1e2115c4b0e7d5",
+      "rewrite": {
+        "from": "../src/",
+        "to": "../../vendor/analytics-d43c8f92/apps/worker/src/"
+      }
+    },
+    {
+      "path": "analytics-v2-test/kernel-parity/helpers/telemetry-v11.ts",
+      "source": "apps/worker/test/helpers/telemetry-v11.ts",
+      "blob": "e27f2ded8d9e5e2039d495011c401c74af233635",
+      "rewrite": {
+        "from": "../../src/",
+        "to": "../../../vendor/analytics-d43c8f92/apps/worker/src/"
+      }
+    }
+  ]
+}
