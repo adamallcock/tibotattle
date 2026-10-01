@@ -227,7 +227,6 @@ async function buildJournalSqlite(dumpPath, outPath) {
       if (!entry || typeof entry.sql !== "string") fail("REHEARSAL_JOURNAL_DDL_MISSING", { name });
       database.exec(entry.sql);
     }
-    const rows = {};
     for (const name of ["storage_source_state", "storage_ingestion_changes"]) {
       const table = dump.tables.find((item) => item.name === name);
       if (!table) fail("REHEARSAL_JOURNAL_TABLE_MISSING", { name });
@@ -235,7 +234,6 @@ async function buildJournalSqlite(dumpPath, outPath) {
       const insert = database.prepare(`INSERT INTO "${name}" (${columns.join(",")})
         VALUES (${columns.map(() => "?").join(",")})`);
       for (const row of table.rows) insert.run(...row);
-      rows[name] = table.rows.length;
     }
     database.exec("COMMIT");
   } finally {
