@@ -17,8 +17,10 @@ import {
   defaultSuffix,
   GCP_FASTPATH_SEED,
   goldenPath,
+  goldenSourceIdentity,
   loadSeedStages,
   planSeed,
+  readSeedGolden,
   runGcpFastpathSeed,
   SEED_STAGES,
   seededSchemas,
@@ -195,6 +197,28 @@ test("the connection targets only the disposable fast-path database", () => {
 });
 
 // ---------------------------------------------------------------------------
+test("the golden pins one typed-storage source, which the origin over a seeded schema must be told", async () => {
+  const table = (name, columns, rows) => ({ name, columns, rows });
+  const dump = (sourceId, v1, v11) => ({ tables: [
+    table("storage_source_state", ["singleton", "source_id", "authority_epoch"], [[1, sourceId, 0]]),
+    table("typed_v1_admission_state", ["id", "source_namespace"], [[1, v1]]),
+    table("typed_v11_admission_state", ["id", "source_namespace"], [[1, v11]]),
+  ] });
+  assert.deepEqual({ ...goldenSourceIdentity(dump("synthetic-source", "synthetic-ns", "synthetic-ns")) },
+    { sourceId: "synthetic-source", sourceNamespace: "synthetic-ns" });
+  for (const [label, bad] of [
+    ["formats disagree", dump("s", "ns-a", "ns-b")],
+    ["no source", dump(undefined, "ns", "ns")],
+    ["comma", dump("s,t", "ns", "ns")],
+    ["no tables", {}],
+    ["two source rows", { tables: [table("storage_source_state", ["source_id"], [["a"], ["b"]])] }],
+  ]) {
+    assert.throws(() => goldenSourceIdentity(bad), (error) => error?.code === "GCP_FASTPATH_SEED_GOLDEN_SOURCE_INVALID", label);
+  }
+  assert.deepEqual({ ...(await readSeedGolden()).sourceIdentity },
+    { sourceId: "gcp-fastpath-oracle", sourceNamespace: "gcp-fastpath-oracle" });
+});
+
 // The seed against a local PostgreSQL 17 (the GCP pool swapped for a local one)
 // ---------------------------------------------------------------------------
 
@@ -260,6 +284,9 @@ test("PG17: the seed runs the rehearsal's chain into one schema, is idempotent a
       for (const [name, entry] of Object.entries(first.steps.importVerification)) {
         assert.equal(entry.equal, true, name);
       }
+      // Read back from the schema: the source the deployed origin is configured with.
+      assert.deepEqual({ ...first.sourceIdentity },
+        { sourceId: "gcp-fastpath-oracle", sourceNamespace: "gcp-fastpath-oracle" });
       assert.equal(first.steps.typedLegacy.status, "staged_rehearsal_complete");
       assert.equal(first.steps.v12.status, "staged_rehearsal_complete");
       assert.equal(first.steps.ingestionJournal.status, "synthetic_storage_ingestion_journal_transfer_complete");
@@ -276,6 +303,14 @@ test("PG17: the seed runs the rehearsal's chain into one schema, is idempotent a
         log: (line) => lines.push(line) });
       assert.equal(again.status, "already-seeded");
       assert.equal(again.steps, null, "the importers are not re-run");
+      assert.deepEqual({ ...again.sourceIdentity }, { ...first.sourceIdentity });
+
+      // A seeded schema that no longer pins the golden's source is refused, never handed to the origin.
+      const t = (name) => `"${schemas.target}"."${name}"`;
+      await pools[0].query(`UPDATE ${t("storage_source_state")} SET source_id = 'synthetic-other' WHERE singleton = 1`);
+      await assert.rejects(runGcpFastpathSeed({ commit: "HEAD", schemaSuffix: suffix, dependencies,
+        log: (line) => lines.push(line) }), (error) => error?.code === "GCP_FASTPATH_SEED_SOURCE_IDENTITY_MISMATCH");
+      await pools[0].query(`UPDATE ${t("storage_source_state")} SET source_id = 'gcp-fastpath-oracle' WHERE singleton = 1`);
 
       await pools[0].query(`COMMENT ON SCHEMA "${schemas.target}" IS NULL`);
       await assert.rejects(runGcpFastpathSeed({ commit: "HEAD", schemaSuffix: suffix, dependencies,

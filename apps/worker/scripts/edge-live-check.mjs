@@ -83,8 +83,11 @@ export function liveCheckPlan() {
     "Edge live check (OD-E3): plan only. Nothing below has been run.",
     "",
     "Owner authorization in chat is required for each step:",
-    "1. Redeploy the fast-path test origin as the direct edge-test variant (a GCP write):",
+    "1. Redeploy the fast-path test origin as the direct edge-test variant over the seeded schema (a GCP write);",
+    "   the deploy adds the golden's POSTGRES_SOURCE_ID/POSTGRES_SOURCE_NAMESPACE and env.production's",
+    "   enrollment, accountless and sign-in settings:",
     `   node scripts/gcp-fastpath-test-deploy.mjs origin --image=<image digest> --origin-variant=direct \\`,
+    "     --schema=<seeded schema> --now=<golden manifest now> \\",
     "     --origin-env=EDGE_ORIGIN_MODE=edge-test \\",
     `     --origin-env=EDGE_ORIGIN_AUDIENCE=${EDGE_LIVE_CHECK_ORIGIN} \\`,
     `     --origin-env=EDGE_INVOKER_SERVICE_ACCOUNT=${EDGE_LIVE_CHECK_INVOKER}`,
@@ -335,8 +338,11 @@ async function syntheticV12Day(day) {
  * destinations, so (as in E12's S5) it is configured for the loopback
  * laboratory origin and the run maps that origin to the edge's public origin,
  * and the capability answers' destinationOrigin back; nothing else changes.
+ * Exported for E12's S9, which runs it locally against the golden-seeded
+ * schema; `send(id, path, init)` resolves to { answer } with the edge's
+ * { status, headers (pairs), body }.
  */
-async function liveWriteRows({ send, publicOrigin }) {
+export async function liveWriteRows({ send, publicOrigin }) {
   const deviceId = randomUUID();
   const secret = randomBytes(32);
   const secretHash = createHash("sha256").update(`app-usagemonitor/device/v1\0${deviceId}\0`).update(secret).digest("hex");

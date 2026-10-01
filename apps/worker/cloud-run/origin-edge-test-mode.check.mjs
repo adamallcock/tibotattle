@@ -1047,6 +1047,9 @@ test("the direct deploy variant renders an env readEdgeTestOriginConfiguration a
   assert.equal(configuration.invokerServiceAccount, deploy.FASTPATH_TEST.journeyServiceAccount);
   // The fast-path cloud pins still apply to the same env.
   assert.equal(fastpathMode.fastpathTestDatabaseConfig(env).primary.database, deploy.FASTPATH_TEST.database);
+  // The deploy recognises this mode by the same value, and gives it env.production's admission settings.
+  assert.equal(deploy.EDGE_TEST_ORIGIN_MODE, mode.EDGE_TEST_ORIGIN_MODE);
+  for (const [name, value] of deploy.edgeTestProductionEnv()) assert.equal(env[name], value, name);
   // The sidecar variant keeps the loopback origin, which edge-test refuses on Cloud Run.
   const sidecar = { ...renderedEnv(deploy.renderOriginService({
     image, variant: "sidecar", originEnv, bucketHistoryProof })), ...cloudRunEnv };

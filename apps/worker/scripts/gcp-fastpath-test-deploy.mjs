@@ -22,11 +22,13 @@
 
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { parse as parseJsonc } from "jsonc-parser";
 
 import { FASTPATH_TEST_CLOUD_TARGET } from "../cloud-run/origin-fastpath-mode.mjs";
 
@@ -85,6 +87,30 @@ const BUILD_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$
 const SCHEMA_OVERRIDE = /^(?:tibotattle_fastpath_20261001|typed_legacy_transfer_rehearsal_target_fastpath_[0-9a-f]{8})$/u;
 /** The origin's injected route clock (cloud-run/origin-fastpath-mode.mjs analyticsV2TestClock). */
 export const ORIGIN_TEST_CLOCK_ENV = "ANALYTICS_V2_TEST_NOW_MS";
+/** cloud-run/origin-edge-test-mode.mjs EDGE_TEST_ORIGIN_MODE (its check pins them equal). */
+export const EDGE_TEST_ORIGIN_MODE = "edge-test";
+/**
+ * The settings the fastpath-test origin's admission env reads
+ * (cloud-run/server.mjs originAdmissionEnv) that wrangler.jsonc
+ * env.production fixes. An edge-test origin serves the participant write
+ * routes behind the edge, so it runs them at production's values, read from
+ * the checked-in config, instead of the composition's closed defaults
+ * (disabled, 120).
+ */
+export const EDGE_TEST_PRODUCTION_SETTINGS = Object.freeze([
+  "ENROLLMENT_MODE", "ACCOUNTLESS_ENROLLMENT_MODE", "ACCOUNTLESS_OWNERSHIP_MODE", "SIGN_IN_START_MAX_PER_MINUTE",
+]);
+/** The rest of that admission env, and why an edge-test origin does not take production's value. */
+export const EDGE_TEST_UNMIRRORED_SETTINGS = Object.freeze({
+  ENVIRONMENT: "production's value makes every client rate-limit key need IDENTITY_LINK_SECRET, a production "
+    + "secret this test origin never holds (src/admission.ts); it keeps its synthetic-development label",
+  IDENTITY_LINK_SECRET: "a production secret, for the Google enrollment routes only cloud-run-iam composes",
+  IDENTITY_LINK_SECRET_VERSION: "names that secret; Google enrollment routes only (cloud-run-iam)",
+  GOOGLE_OIDC_CLIENT_ID: "production's OAuth client, for the Google sign-in routes only cloud-run-iam composes",
+  GOOGLE_OIDC_CLIENT_SECRET: "a production secret; Google sign-in routes only (cloud-run-iam)",
+});
+/** A source id or typed-storage namespace the origin and an env flag both accept. */
+const SOURCE_IDENTITY = /^[A-Za-z0-9._:-]{1,200}$/u;
 const STEPS = Object.freeze([
   "build", "database", "migrate", "verify-database", "seed", "refresh", "origin", "verify", "protected", "all",
 ]);
@@ -149,6 +175,32 @@ function mergeEnv(base, overrides) {
   const merged = new Map(base);
   for (const [key, value] of overrides) merged.set(key, value);
   return [...merged.entries()];
+}
+
+/** EDGE_TEST_PRODUCTION_SETTINGS at wrangler.jsonc env.production's values, as env pairs. */
+export function edgeTestProductionEnv(configText = readFileSync(join(WORKER_ROOT, "wrangler.jsonc"), "utf8")) {
+  const errors = [];
+  const vars = parseJsonc(configText, errors)?.env?.production?.vars;
+  if (errors.length > 0 || vars === null || typeof vars !== "object") fail("FASTPATH_DEPLOY_PRODUCTION_CONFIG_INVALID");
+  return EDGE_TEST_PRODUCTION_SETTINGS.map((name) => {
+    if (typeof vars[name] !== "string" || vars[name].length === 0) fail("FASTPATH_DEPLOY_PRODUCTION_CONFIG_INVALID", name);
+    return [name, vars[name]];
+  });
+}
+
+/**
+ * POSTGRES_SOURCE_ID and POSTGRES_SOURCE_NAMESPACE for the typed-storage
+ * source a schema pins (scripts/gcp-fastpath-seed.mjs goldenSourceIdentity for
+ * a seeded schema). The origin's typed routes refuse any other source with
+ * 503 BACKEND_STORAGE_UNAVAILABLE, and an unset pair means the composition's
+ * default source, which no seeded schema holds.
+ */
+export function originSourceEnv(sourceIdentity) {
+  if (!SOURCE_IDENTITY.test(sourceIdentity?.sourceId ?? "")
+      || !SOURCE_IDENTITY.test(sourceIdentity?.sourceNamespace ?? "")) {
+    fail("FASTPATH_DEPLOY_SOURCE_IDENTITY_INVALID");
+  }
+  return [["POSTGRES_SOURCE_ID", sourceIdentity.sourceId], ["POSTGRES_SOURCE_NAMESPACE", sourceIdentity.sourceNamespace]];
 }
 
 /** gcloud command that creates or updates the fast-path migrate Job. */
@@ -279,6 +331,10 @@ function yamlLabels(indent) {
  * Knative service document for the origin. `sidecar` runs the image's
  * loopback-only test mode unchanged behind the edge container; `direct`
  * expects a Cloud Run listen-host variant of the test mode in the image.
+ * A seeded schema needs its `sourceIdentity` (or both POSTGRES_SOURCE_*
+ * values in originEnv); with EDGE_ORIGIN_MODE=edge-test in originEnv the
+ * origin also takes `productionEnv` (default: edgeTestProductionEnv()).
+ * originEnv overrides everything.
  */
 export function renderOriginService({
   image,
@@ -287,12 +343,21 @@ export function renderOriginService({
   originEnv = [],
   bucketHistoryProof,
   schema,
+  sourceIdentity = null,
+  productionEnv,
 }) {
   if (!IMAGE_REFERENCE.test(image ?? "")) fail("FASTPATH_DEPLOY_IMAGE_DIGEST_REQUIRED");
   if (!["sidecar", "direct"].includes(variant)) fail("FASTPATH_DEPLOY_ORIGIN_VARIANT_INVALID");
   if (typeof bucketHistoryProof !== "string" || bucketHistoryProof.length === 0) {
     fail("FASTPATH_DEPLOY_BUCKET_HISTORY_PROOF_REQUIRED");
   }
+  const explicit = new Map(originEnv);
+  const sourceEnv = sourceIdentity === null ? [] : originSourceEnv(sourceIdentity);
+  if (primarySchemaOf(schema).startsWith(FASTPATH_TEST_CLOUD_TARGET.seededSchemaPrefix) && sourceEnv.length === 0
+      && !(explicit.has("POSTGRES_SOURCE_ID") && explicit.has("POSTGRES_SOURCE_NAMESPACE"))) {
+    fail("FASTPATH_DEPLOY_SOURCE_IDENTITY_REQUIRED", String(schema));
+  }
+  const edgeTest = explicit.get("EDGE_ORIGIN_MODE") === EDGE_TEST_ORIGIN_MODE;
   const loopbackOrigin = `http://127.0.0.1:${FASTPATH_TEST.originLoopbackPort}`;
   const env = mergeEnv([
     ...databaseEnv(schema),
@@ -305,6 +370,8 @@ export function renderOriginService({
     ...(variant === "sidecar"
       ? [["HOST", "127.0.0.1"], ["HOST_ORIGIN", loopbackOrigin]]
       : [["HOST", "0.0.0.0"], ["HOST_ORIGIN", FASTPATH_TEST.originUrl]]),
+    ...sourceEnv,
+    ...(edgeTest ? productionEnv ?? edgeTestProductionEnv() : []),
   ], originEnv);
   for (const [key] of env) {
     if (!ENV_KEY.test(key) || key === "PORT" || key.startsWith("K_")) fail("FASTPATH_DEPLOY_ENV_INVALID", key);
@@ -460,7 +527,7 @@ function parseArgs(argv) {
     step, dryRun: false, commit: undefined, image: undefined, now: undefined, out: undefined,
     variant: "sidecar", mode: "fastpath-test", refreshEnv: [], refreshArgs: [], originEnv: [],
     query: "from=2026-04-15&to=2026-10-01", skip: new Set(), noExecute: false,
-    schema: undefined, golden: undefined, schemaSuffix: undefined, replaceSeed: false,
+    schema: undefined, golden: undefined, schemaSuffix: undefined, replaceSeed: false, sourceIdentity: undefined,
   };
   for (const argument of rest) {
     if (argument === "--dry-run") { options.dryRun = true; continue; }
@@ -512,7 +579,10 @@ Steps:
                    skips with its reason when a chain stage is absent at --commit; refresh and origin then read
                    that schema at the golden's clock unless --schema/--now say otherwise
   refresh          deploy + execute ${FASTPATH_TEST.refreshJob} (2 vCPU, 4 GiB, 1 h)
-  origin           deploy IAM-private ${FASTPATH_TEST.originService}; journey SA is the only invoker
+  origin           deploy IAM-private ${FASTPATH_TEST.originService}; journey SA is the only invoker; a seeded
+                   schema's origin gets the golden's POSTGRES_SOURCE_ID/POSTGRES_SOURCE_NAMESPACE, and
+                   --origin-env=EDGE_ORIGIN_MODE=edge-test adds wrangler.jsonc env.production's
+                   ${EDGE_TEST_PRODUCTION_SETTINGS.join(", ")}
   verify           GET /api/health and /api/v1/community/daily with a journey-SA ID token; save body
   protected        read the shared test services' revisions (never written)
   all              build, database, migrate, verify-database, seed, refresh, origin, verify, protected
@@ -827,7 +897,8 @@ async function stepSeed(runner, options) {
         ?? seedModule.defaultSuffix(commit, golden.dumpSha256)).target;
       if (options.schema === undefined) options.schema = schema;
       if (options.now === undefined) options.now = golden.nowIso;
-      return { step: "seed", dryRun: true, schema, nowIso: golden.nowIso, plan };
+      if (options.schema === schema) options.sourceIdentity ??= golden.sourceIdentity;
+      return { step: "seed", dryRun: true, schema, nowIso: golden.nowIso, sourceIdentity: golden.sourceIdentity, plan };
     }
     return { step: "seed", dryRun: true, plan };
   }
@@ -838,6 +909,8 @@ async function stepSeed(runner, options) {
     // told otherwise, so they serve what the local rehearsal serves.
     if (options.schema === undefined) options.schema = result.schema;
     if (options.now === undefined) options.now = result.nowIso;
+    // The origin over this schema is told the source it pins (read back by the seed).
+    if (options.schema === result.schema) options.sourceIdentity ??= result.sourceIdentity;
   }
   const receipt = { ...result, path: await runner.receipt(`seed-${commit.slice(0, 12)}.json`, result) };
   return receipt;
@@ -882,8 +955,14 @@ function ensureOriginBucket(runner) {
 async function stepOrigin(runner, options, image) {
   const bucketHistoryProof = ensureOriginBucket(runner);
   const originEnv = originClockEnv(options.originEnv, options.now);
+  let sourceIdentity = options.sourceIdentity ?? null;
+  if (sourceIdentity === null && primarySchemaOf(options.schema).startsWith(FASTPATH_TEST_CLOUD_TARGET.seededSchemaPrefix)) {
+    // Without the seed step in this run: a seeded schema holds the golden's source.
+    const seedModule = await import("./gcp-fastpath-seed.mjs");
+    sourceIdentity = (await seedModule.readSeedGolden(options.golden)).sourceIdentity;
+  }
   const yaml = renderOriginService({ image, variant: options.variant, mode: options.mode, originEnv,
-    bucketHistoryProof, schema: options.schema });
+    bucketHistoryProof, schema: options.schema, sourceIdentity });
   await mkdir(runner.out, { recursive: true, mode: 0o700 });
   const yamlPath = join(runner.out, "origin-service.yaml");
   await writeFile(yamlPath, yaml, { mode: 0o600 });
@@ -899,7 +978,7 @@ async function stepOrigin(runner, options, image) {
     `--project=${FASTPATH_TEST.project}`, `--region=${FASTPATH_TEST.region}`, "--format=json"]),
   { read: true, placeholderJson: {} });
   const receipt = { step: "origin", image, schema: primarySchemaOf(options.schema), variant: options.variant,
-    mode: options.mode, yamlPath, ...invokers,
+    mode: options.mode, sourceIdentity, yamlPath, ...invokers,
     revision: service?.status?.latestReadyRevisionName ?? null, url: service?.status?.url ?? null };
   if (!runner.dryRun) receipt.path = await runner.receipt("origin.json", receipt);
   return receipt;

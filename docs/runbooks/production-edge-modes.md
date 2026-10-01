@@ -324,7 +324,9 @@ PG_TEST_SOCKET=<local PostgreSQL 17 socket> PG_TEST_PORT=<port> \
 `npm run edge:e2e` runs the same two commands with the `node` on PATH, and
 `npm run edge:e2e:check` runs the offline harness and live-check checks (also
 part of `scripts:check`). Set `EDGE_E2E_GOLDEN=analytics-v2-test/golden` to
-add the golden stage; it seeds through the fast-path rehearsal, whose importers
+add the golden stage: the community/daily read, then the live check's write
+tier against an origin with the settings the deploy gives it over a seeded
+schema. It seeds through the fast-path rehearsal, whose importers
 need a newer `node:sqlite` than Node 22.16 (`EDGE_E2E_REHEARSAL_NODE`, default
 the `node` on PATH). `EDGE_E2E_EDGE_TREE=<edge-port worktree>/apps/worker`
 builds the edge from that tree and refuses unless its
@@ -364,9 +366,15 @@ The live check runs the local edge in gcp mode against the GCP fast-path test
 origin. It adds Google's front end and nothing else. It needs owner
 authorization in chat for each of these:
 
-1. Redeploy the fast-path test origin as the direct edge-test variant. This is
-   a GCP write. The deployed sidecar variant has no origin boundary, so every
-   response would map to 503.
+1. Redeploy the fast-path test origin as the direct edge-test variant over the
+   seeded schema (`--schema=<seeded schema>`). This is a GCP write. The
+   deployed sidecar variant has no origin boundary, so every response would
+   map to 503. The deploy gives the origin the golden's
+   `POSTGRES_SOURCE_ID` and `POSTGRES_SOURCE_NAMESPACE`, without which every
+   typed route the write tier uses answers `503 BACKEND_STORAGE_UNAVAILABLE`,
+   and, in edge-test mode, `wrangler.jsonc` env.production's
+   `ENROLLMENT_MODE`, `ACCOUNTLESS_ENROLLMENT_MODE`,
+   `ACCOUNTLESS_OWNERSHIP_MODE` and `SIGN_IN_START_MAX_PER_MINUTE`.
 2. Run the read-only tier:
    `node scripts/edge-live-check.mjs run --authorize=EDGE_LIVE_CHECK_READ_ONLY`.
 3. Separately, run the write tier, which enrolls synthetic accountless devices

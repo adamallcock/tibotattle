@@ -2,25 +2,31 @@
 
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { readdir } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import http from "node:http";
 import { dirname, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { parse as parseJsonc } from "jsonc-parser";
 import {
   countMigrationsAtCommit,
   EDGE_PROXY_SOURCE,
+  EDGE_TEST_PRODUCTION_SETTINGS,
+  EDGE_TEST_UNMIRRORED_SETTINGS,
+  edgeTestProductionEnv,
   executeJobCommand,
   FASTPATH_TEST,
   migrateJobCommand,
   ORIGIN_TEST_CLOCK_ENV,
   originClockEnv,
   originInvokerCommand,
+  originSourceEnv,
   primarySchemaOf,
   refreshJobCommand,
   renderOriginService,
   validateOriginPolicy,
 } from "./gcp-fastpath-test-deploy.mjs";
+import { readSeedGolden } from "./gcp-fastpath-seed.mjs";
 import {
   analyticsV2TestClock,
   FASTPATH_TEST_CLOUD_TARGET,
@@ -35,6 +41,7 @@ const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const IMAGE = `${FASTPATH_TEST.imageRepository}@sha256:${"a".repeat(64)}`;
 const PROOF = JSON.stringify({ bucket: FASTPATH_TEST.originBucket, bucketGeneration: "1",
   bucketMetageneration: "1", softDeleteRetentionDurationSeconds: "0" });
+const SOURCE = Object.freeze({ sourceId: "synthetic-source", sourceNamespace: "synthetic-namespace" });
 
 function expectCode(fn, code) {
   assert.throws(fn, (error) => error?.code === code);
@@ -195,7 +202,7 @@ test("refresh and origin follow an explicit seeded rehearsal schema; migrate sta
   assert.equal(refresh.some((arg) => arg.includes(`--schema=${seeded}`)), true);
   assert.equal(refresh.some((arg) => arg.includes(`PRIMARY_SCHEMA=${seeded}`)), true);
   assert.equal(refresh.some((arg) => arg.includes(`LEDGER_SCHEMA=${FASTPATH_TEST.ledgerSchema}`)), true);
-  const origin = renderOriginService({ image: IMAGE, bucketHistoryProof: PROOF, schema: seeded });
+  const origin = renderOriginService({ image: IMAGE, bucketHistoryProof: PROOF, schema: seeded, sourceIdentity: SOURCE });
   assert.match(origin, new RegExp(`name: PRIMARY_SCHEMA\\n {10}value: "${seeded}"`, "u"));
   const migrate = migrateJobCommand({ image: IMAGE, expectedCounts: { primary: 62, ledger: 7 } });
   assert.equal(migrate.some((arg) => arg.includes(`PRIMARY_SCHEMA=${FASTPATH_TEST.primarySchema}`)), true);
@@ -236,7 +243,7 @@ test("the deploy script and the composition roots agree on the clock, database, 
   const seeded = "typed_legacy_transfer_rehearsal_target_fastpath_0a1b2c3d";
   // Origin: the clock the deploy sets is the one the composition root reads.
   assert.equal(ORIGIN_TEST_CLOCK_ENV, "ANALYTICS_V2_TEST_NOW_MS");
-  const yaml = renderOriginService({ image: IMAGE, bucketHistoryProof: PROOF, schema: seeded,
+  const yaml = renderOriginService({ image: IMAGE, bucketHistoryProof: PROOF, schema: seeded, sourceIdentity: SOURCE,
     originEnv: originClockEnv([], now) });
   const env = { ...originContainerEnv(yaml), K_SERVICE: FASTPATH_TEST.originService };
   assert.equal(env.POSTGRES_TEST_HTTP_MODE, "fastpath-test");
@@ -260,4 +267,85 @@ test("the deploy script and the composition roots agree on the clock, database, 
     kind: "cloud-sql", instanceConnectionName: FASTPATH_TEST.instanceConnectionName,
     database: "tibotattle_fastpath", iamUser: FASTPATH_TEST.runtimeIamUser,
   });
+});
+
+const SEEDED = "typed_legacy_transfer_rehearsal_target_fastpath_cd40451d";
+const EDGE_TEST_ENV = Object.freeze([["EDGE_ORIGIN_MODE", "edge-test"], ["EDGE_ORIGIN_AUDIENCE", FASTPATH_TEST.originUrl],
+  ["EDGE_INVOKER_SERVICE_ACCOUNT", FASTPATH_TEST.journeyServiceAccount]]);
+
+// The live write tier's 503 at GET /api/v1/device/sync-capabilities-v1.2
+// (2026-10-01, revision 00008): the origin over a seeded schema ran with the
+// composition's default source (canonical-v1-primary / telemetry-v1), while
+// the schema pins the golden's, so every typed route answered 503
+// BACKEND_STORAGE_UNAVAILABLE without logging.
+test("an origin over a seeded schema is configured with the source the golden pins, or does not render", async () => {
+  expectCode(() => renderOriginService({ image: IMAGE, bucketHistoryProof: PROOF, schema: SEEDED }),
+    "FASTPATH_DEPLOY_SOURCE_IDENTITY_REQUIRED");
+  expectCode(() => renderOriginService({ image: IMAGE, bucketHistoryProof: PROOF, schema: SEEDED, originEnv: EDGE_TEST_ENV }),
+    "FASTPATH_DEPLOY_SOURCE_IDENTITY_REQUIRED");
+  const golden = await readSeedGolden();
+  // The Q-1 golden's USAGE_MONITOR_DB pins one source for storage and both typed formats.
+  const dump = JSON.parse(await readFile(golden.dumpPath, "utf8"));
+  const cell = (table, column) => {
+    const entry = dump.tables.find(({ name }) => name === table);
+    return entry.rows[0][entry.columns.indexOf(column)];
+  };
+  assert.deepEqual({ ...golden.sourceIdentity }, {
+    sourceId: cell("storage_source_state", "source_id"),
+    sourceNamespace: cell("typed_v1_admission_state", "source_namespace"),
+  });
+  assert.equal(cell("typed_v11_admission_state", "source_namespace"), golden.sourceIdentity.sourceNamespace);
+  for (const variant of ["sidecar", "direct"]) {
+    const env = originContainerEnv(renderOriginService({ image: IMAGE, variant, bucketHistoryProof: PROOF, schema: SEEDED,
+      sourceIdentity: golden.sourceIdentity, originEnv: variant === "direct" ? EDGE_TEST_ENV : [] }));
+    assert.equal(env.POSTGRES_SOURCE_ID, golden.sourceIdentity.sourceId, variant);
+    assert.equal(env.POSTGRES_SOURCE_NAMESPACE, golden.sourceIdentity.sourceNamespace, variant);
+  }
+  // An explicit pair satisfies (and overrides) it; the pinned migrate-Job schema keeps the default source.
+  const explicit = originContainerEnv(renderOriginService({ image: IMAGE, bucketHistoryProof: PROOF, schema: SEEDED,
+    originEnv: originSourceEnv(SOURCE) }));
+  assert.deepEqual([explicit.POSTGRES_SOURCE_ID, explicit.POSTGRES_SOURCE_NAMESPACE], [SOURCE.sourceId, SOURCE.sourceNamespace]);
+  const pinned = originContainerEnv(renderOriginService({ image: IMAGE, bucketHistoryProof: PROOF }));
+  assert.equal("POSTGRES_SOURCE_ID" in pinned || "POSTGRES_SOURCE_NAMESPACE" in pinned, false);
+  for (const bad of [{}, { sourceId: "a,b", sourceNamespace: "n" }, { sourceId: "s", sourceNamespace: "" },
+    { sourceId: "s", sourceNamespace: "n\nx" }, { sourceId: "s".repeat(201), sourceNamespace: "n" }]) {
+    expectCode(() => renderOriginService({ image: IMAGE, bucketHistoryProof: PROOF, schema: SEEDED, sourceIdentity: bad }),
+      "FASTPATH_DEPLOY_SOURCE_IDENTITY_INVALID");
+  }
+});
+
+/** The names cloud-run/server.mjs's fastpath-test originAdmissionEnv reads from the environment. */
+async function originAdmissionEnvNames() {
+  const source = await readFile(resolve(WORKER_ROOT, "cloud-run/server.mjs"), "utf8");
+  const start = source.indexOf("const originAdmissionEnv = {");
+  assert.ok(start > 0, "server.mjs composes originAdmissionEnv");
+  const block = source.slice(start, source.indexOf("};", start));
+  return [...block.matchAll(/optional\("([A-Z0-9_]+)"/gu)].map(([, name]) => name).sort();
+}
+
+test("an edge-test origin runs the participant routes at wrangler.jsonc env.production's settings", async () => {
+  const production = parseJsonc(await readFile(resolve(WORKER_ROOT, "wrangler.jsonc"), "utf8")).env.production.vars;
+  const expected = Object.fromEntries(EDGE_TEST_PRODUCTION_SETTINGS.map((name) => [name, production[name]]));
+  assert.deepEqual(expected, { ENROLLMENT_MODE: "open", ACCOUNTLESS_ENROLLMENT_MODE: "enabled",
+    ACCOUNTLESS_OWNERSHIP_MODE: "enabled", SIGN_IN_START_MAX_PER_MINUTE: production.SIGN_IN_START_MAX_PER_MINUTE });
+  assert.deepEqual(Object.fromEntries(edgeTestProductionEnv()), expected);
+  // Every setting the origin's admission env reads is mirrored or deliberately not.
+  assert.deepEqual(await originAdmissionEnvNames(),
+    [...EDGE_TEST_PRODUCTION_SETTINGS, ...Object.keys(EDGE_TEST_UNMIRRORED_SETTINGS)].sort());
+  for (const variant of ["direct", "sidecar"]) {
+    const edgeTest = originContainerEnv(renderOriginService({ image: IMAGE, variant, bucketHistoryProof: PROOF,
+      schema: SEEDED, sourceIdentity: SOURCE, originEnv: EDGE_TEST_ENV }));
+    for (const [name, value] of Object.entries(expected)) assert.equal(edgeTest[name], value, `${variant} ${name}`);
+    assert.equal(edgeTest.ENVIRONMENT, "synthetic-development");
+  }
+  // Without edge-test the composition's closed defaults stay; an explicit value always wins.
+  const plain = originContainerEnv(renderOriginService({ image: IMAGE, bucketHistoryProof: PROOF }));
+  for (const name of EDGE_TEST_PRODUCTION_SETTINGS) assert.equal(name in plain, false, name);
+  const overridden = originContainerEnv(renderOriginService({ image: IMAGE, bucketHistoryProof: PROOF,
+    originEnv: [...EDGE_TEST_ENV, ["ENROLLMENT_MODE", "disabled"]] }));
+  assert.equal(overridden.ENROLLMENT_MODE, "disabled");
+  assert.equal(overridden.ACCOUNTLESS_ENROLLMENT_MODE, "enabled");
+  expectCode(() => edgeTestProductionEnv('{"env":{"production":{"vars":{"ENROLLMENT_MODE":"open"}}}}'),
+    "FASTPATH_DEPLOY_PRODUCTION_CONFIG_INVALID");
+  expectCode(() => edgeTestProductionEnv("{"), "FASTPATH_DEPLOY_PRODUCTION_CONFIG_INVALID");
 });

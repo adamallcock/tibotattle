@@ -196,17 +196,57 @@ export function seedMarker(commit, dumpSha256) {
   return `${SEED_MARKER_VERSION} complete commit=${commit} dump=${dumpSha256}`;
 }
 
-async function sha256File(path) {
-  return createHash("sha256").update(await readFile(path)).digest("hex");
+/** A source id or typed-storage namespace the origin and its env flag both accept. */
+const SOURCE_IDENTITY = /^[A-Za-z0-9._:-]{1,200}$/u;
+
+function dumpCell(dump, tableName, column) {
+  const table = Array.isArray(dump?.tables) ? dump.tables.find((entry) => entry?.name === tableName) : undefined;
+  const index = Array.isArray(table?.columns) ? table.columns.indexOf(column) : -1;
+  if (index < 0 || !Array.isArray(table.rows) || table.rows.length !== 1) return undefined;
+  return table.rows[0][index];
 }
 
-/** The golden's manifest, dump path, dump digest and pinned clock (read-only). */
+/**
+ * The typed-storage source the golden's USAGE_MONITOR_DB dump pins, which the
+ * T-1 copy carries into the seeded schema unchanged: storage_source_state's
+ * source id and the namespace both typed admission states name. An origin
+ * serving that schema must be configured with exactly these
+ * (POSTGRES_SOURCE_ID, POSTGRES_SOURCE_NAMESPACE): its typed routes refuse
+ * any other source with 503 BACKEND_STORAGE_UNAVAILABLE.
+ */
+export function goldenSourceIdentity(dump) {
+  const sourceId = dumpCell(dump, "storage_source_state", "source_id");
+  const v1 = dumpCell(dump, "typed_v1_admission_state", "source_namespace");
+  const v11 = dumpCell(dump, "typed_v11_admission_state", "source_namespace");
+  if (!SOURCE_IDENTITY.test(sourceId ?? "") || !SOURCE_IDENTITY.test(v1 ?? "") || v1 !== v11) {
+    fail("GCP_FASTPATH_SEED_GOLDEN_SOURCE_INVALID");
+  }
+  return Object.freeze({ sourceId, sourceNamespace: v1 });
+}
+
+/** The golden's manifest, dump path, dump digest, pinned clock and source identity (read-only). */
 export async function readSeedGolden(golden = GCP_FASTPATH_SEED.defaultGolden) {
   const directory = join(REPOSITORY_ROOT, goldenPath(golden));
   const manifest = JSON.parse(await readFile(join(directory, "manifest.json"), "utf8"));
   const dumpPath = join(directory, "dump", "usage-monitor-db.json");
   if (typeof manifest?.now !== "string" || !Array.isArray(manifest?.owners)) fail("GCP_FASTPATH_SEED_GOLDEN_INVALID");
-  return Object.freeze({ manifest, dumpPath, dumpSha256: await sha256File(dumpPath), nowIso: manifest.now });
+  const dump = await readFile(dumpPath);
+  return Object.freeze({ manifest, dumpPath, dumpSha256: createHash("sha256").update(dump).digest("hex"),
+    nowIso: manifest.now, sourceIdentity: goldenSourceIdentity(JSON.parse(dump.toString("utf8"))) });
+}
+
+/** The source the seeded schema pins, read back as the typed routes read it. */
+async function seededSourceIdentity(pool, schema) {
+  const result = await pool.query(`SELECT source.source_id, v1.source_namespace AS v1_namespace,
+      v11.source_namespace AS v11_namespace,
+      (v1.runtime_contract_version = 1 AND v11.runtime_contract_version = 1) AS runtime_current
+    FROM "${schema}".storage_source_state source
+    JOIN "${schema}".typed_v1_admission_state v1 ON v1.id = 1
+    JOIN "${schema}".typed_v11_admission_state v11 ON v11.id = 1
+    WHERE source.singleton = 1`);
+  const row = result.rows.length === 1 ? result.rows[0] : null;
+  if (row === null || row.v1_namespace !== row.v11_namespace || row.runtime_current !== true) return null;
+  return Object.freeze({ sourceId: row.source_id, sourceNamespace: row.v1_namespace });
 }
 
 async function loadStage(stage) {
@@ -292,7 +332,9 @@ function verificationsEqual(verification) {
 /**
  * Seed one fast-path rehearsal target from the golden through the local
  * rehearsal's loader. Returns a receipt whose `status` is "seeded",
- * "already-seeded" or "skipped". `dependencies` exists for the local PG17
+ * "already-seeded" or "skipped"; a seeded receipt's `sourceIdentity` is the
+ * source the schema pins (read back), which the origin serving it must be
+ * configured with. `dependencies` exists for the local PG17
  * check: spawn (git), createPool for the migrator, expectedOwner (null skips
  * the owner check), grantRuntime and readBack.
  */
@@ -312,7 +354,7 @@ export async function runGcpFastpathSeed({
     return Object.freeze({ step: "seed", status: "skipped", reason: plan.reason, plan });
   }
   if (plan.decision === "refuse") fail("GCP_FASTPATH_SEED_CHECKOUT_MISMATCH", plan.reason);
-  const { manifest, dumpPath, dumpSha256 } = await readSeedGolden(plan.golden);
+  const { manifest, dumpPath, dumpSha256, sourceIdentity } = await readSeedGolden(plan.golden);
   const loader = await loadSeedStages();
   const suffix = schemaSuffix ?? defaultSuffix(commit, dumpSha256);
   const schemas = seededSchemas(suffix);
@@ -346,9 +388,17 @@ export async function runGcpFastpathSeed({
     await ensureOwnedSchema(migrator.pool, schemas.target, owner);
     await ensureOwnedSchema(migrator.pool, schemas.control, owner);
     const migrations = await applyPrimaryMigrations(migrator.pool, schemas.target);
+    // The origin is configured with the golden's source; the schema must pin it.
+    const assertSourceIdentity = async () => {
+      const seeded = await seededSourceIdentity(migrator.pool, schemas.target);
+      if (seeded?.sourceId !== sourceIdentity.sourceId || seeded?.sourceNamespace !== sourceIdentity.sourceNamespace) {
+        fail("GCP_FASTPATH_SEED_SOURCE_IDENTITY_MISMATCH", schemas.target);
+      }
+    };
     if (existing !== null && existing.marker === marker) {
       status = "already-seeded";
       log(`# seed: ${schemas.target} already holds this commit's seed of this golden; importers not re-run`);
+      await assertSourceIdentity();
     } else {
       workDirectory = await realpath(await mkdtemp(join(tmpdir(), "gcp-fastpath-seed-")));
       const sealed = await loader.sealFastpathRehearsalSource({ dumpPath, workDirectory });
@@ -363,13 +413,14 @@ export async function runGcpFastpathSeed({
       if (!verificationsEqual(steps.importVerification)) {
         fail("GCP_FASTPATH_SEED_VERIFICATION_FAILED", JSON.stringify(steps.importVerification));
       }
+      await assertSourceIdentity();
       // The marker is written last: a schema without it is a partial seed.
       await migrator.pool.query(`COMMENT ON SCHEMA "${schemas.target}" IS '${marker}'`);
     }
     await (dependencies.grantRuntime ?? grantRuntime)(migrator.pool, schemas.target);
     const readback = await (dependencies.readBack ?? readBackAsRuntime)(schemas.target);
     return Object.freeze({ step: "seed", status, commit, golden: plan.golden, dumpSha256,
-      schema: schemas.target, controlSchema: schemas.control, nowIso: manifest.now, migrations, steps,
+      schema: schemas.target, controlSchema: schemas.control, nowIso: manifest.now, sourceIdentity, migrations, steps,
       timingsMs: timings, readback, plan, durationSeconds: (Date.now() - started) / 1000 });
   } finally {
     if (workDirectory !== null) await rm(workDirectory, { recursive: true, force: true });

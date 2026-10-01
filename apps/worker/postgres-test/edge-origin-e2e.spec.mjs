@@ -18,7 +18,8 @@
 // S2 the admin host, S3 forwarded rows and the route sweep, S4 admission under
 // the checked-in production limits, S5 shipped-client flows, S6 upstream
 // failures, S7 privacy on every exchange, S8 the Sparkle guard, S9 the golden
-// community/daily read (EDGE_E2E_GOLDEN), S10 detector controls.
+// community/daily read and the live check's write tier on the golden-seeded
+// schema (EDGE_E2E_GOLDEN), S10 detector controls.
 //
 // Local only: nothing is deployed, nothing reaches Cloudflare or Google, and
 // every key, token, account, address and row is synthetic and content-free.
@@ -101,6 +102,9 @@ import {
   syncPreparedContributionEntryOnce,
 } from "../test/helpers/contribution-shipped-client.js";
 import { createTelemetryV12Envelope } from "../../../src/platform/telemetry-v12-envelope.js";
+import { liveWriteRows } from "../scripts/edge-live-check.mjs";
+import { goldenSourceIdentity } from "../scripts/gcp-fastpath-seed.mjs";
+import { edgeTestProductionEnv, originSourceEnv } from "../scripts/gcp-fastpath-test-deploy.mjs";
 
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
 const PG_TEST_PORT = Number(process.env.PG_TEST_PORT ?? "55432");
@@ -289,8 +293,11 @@ async function seedSchema(base, m, schema, ledgerSchema) {
 
 let serverModule = null;
 
-/** cloud-run/dist/server.mjs composed and served as the rehearsal's startOrigin does, behind EP-6. */
-async function startOrigin({ socket, schema, ledgerSchema, keys, nowMs = null, objects }) {
+/**
+ * cloud-run/dist/server.mjs composed and served as the rehearsal's startOrigin does, behind EP-6.
+ * `settings` replaces env values (S9: what the deploy gives an origin over a seeded schema).
+ */
+async function startOrigin({ socket, schema, ledgerSchema, keys, nowMs = null, objects, settings = {} }) {
   serverModule ??= await import(pathToFileURL(DIST_SERVER).href);
   const port = await freePort();
   const hostOrigin = `http://127.0.0.1:${port}`;
@@ -323,6 +330,7 @@ async function startOrigin({ socket, schema, ledgerSchema, keys, nowMs = null, o
     EDGE_ORIGIN_AUDIENCE: EDGE_E2E_AUDIENCE,
     EDGE_INVOKER_SERVICE_ACCOUNT: EDGE_E2E_INVOKER,
     EDGE_ORIGIN_VERIFIER_SERVICE_ACCOUNTS: EDGE_E2E_VERIFIER,
+    ...settings,
   };
   const sigterm = process.listeners("SIGTERM");
   const sigint = process.listeners("SIGINT");
@@ -2155,7 +2163,8 @@ async function seededRehearsal() {
   }
 }
 
-test("S9 golden: the community/daily read is byte-equal through the edge and reproduces the rehearsal's parity table", {
+test("S9 golden: the community/daily read is byte-equal through the edge and reproduces the rehearsal's parity table; "
+  + "the live check's write tier completes on the seeded schema at the deploy's origin settings", {
   skip: SKIP || GOLDEN === null, timeout: 3_600_000,
 }, async () => {
   const f = await fixture();
@@ -2172,8 +2181,14 @@ test("S9 golden: the community/daily read is byte-equal through the edge and rep
     assert.ok(rehearsal.parity?.families, "the rehearsal produced a parity table");
     const [schema, ledgerSchema] = kept;
     assert.equal(ledgerSchema, `${schema}_ledger`);
+    // What scripts/gcp-fastpath-test-deploy.mjs gives an edge-test origin over a
+    // seeded schema: the golden's source (without it every typed route of the
+    // live write tier answered 503 BACKEND_STORAGE_UNAVAILABLE, 2026-10-01) and
+    // env.production's enrollment, accountless and sign-in settings.
+    const dump = JSON.parse(await readFile(join(GOLDEN, "dump", "usage-monitor-db.json"), "utf8"));
+    const settings = Object.fromEntries([...originSourceEnv(goldenSourceIdentity(dump)), ...edgeTestProductionEnv()]);
     origin = await startOrigin({ socket: f.socket, schema, ledgerSchema, keys: f.keys, nowMs: manifest.nowMs,
-      objects: new Map() });
+      objects: new Map(), settings });
     const frontEnd = createGoogleFrontEnd({ invoker: f.invoker, verifiers: [EDGE_E2E_VERIFIER], audience: EDGE_E2E_AUDIENCE,
       upstreamOrigin: EDGE_E2E_UPSTREAM_ORIGIN, origin: loopbackOrigin(origin.port) });
     instance = await createEdgeInstance({ ...f.common, mode: "gcp", frontEnd, invokerKeyJson: f.invoker.keyJson });
@@ -2200,6 +2215,21 @@ test("S9 golden: the community/daily read is byte-equal through the edge and rep
       sha256: createHash("sha256").update(answer.body).digest("hex"), cacheControl: answer.header("cache-control"),
       unexpectedDiffs: parity.unexpectedDiffs, unexpectedFamilies: parity.unexpectedFamilies,
       families: familyTable(parity), rehearsalStatus: rehearsal.status });
+
+    // The live check's write tier, unchanged, through the same edge: accountless
+    // enrollment, ownership and v1.2 authorization, then one shipped-client v1.2
+    // sync (capabilities, predecessor, day manifest, upload, activation).
+    const writes = [];
+    await liveWriteRows({ publicOrigin: EDGE_E2E_PUBLIC_ORIGIN, send: async (id, path, init = {}) => {
+      const written = await instance.fetch(`${EDGE_E2E_PUBLIC_ORIGIN}${path}`, { ip: nextIp(), ...init });
+      writes.push({ id, path: new URL(path, EDGE_E2E_PUBLIC_ORIGIN).pathname, status: written.status });
+      return { answer: written, row: writes.at(-1) };
+    } });
+    assert.deepEqual(writes.slice(0, 3).map(({ status }) => status), [201, 201, 201]);
+    const capabilities = writes.filter(({ path }) => path === "/api/v1/device/sync-capabilities-v1.2");
+    assert.ok(capabilities.length >= 1 && capabilities.every(({ status }) => status === 200), JSON.stringify(writes));
+    assert.ok(writes.some(({ path, status }) => path === "/api/v1/me/telemetry-v12/domain-activate" && status === 201));
+    f.rows.push({ stage: "S9", id: "golden-write-tier", statuses: writes.map(({ id, status }) => [id, status]) });
   } finally {
     await instance?.dispose().catch(() => {});
     await origin?.close().catch(() => {});
