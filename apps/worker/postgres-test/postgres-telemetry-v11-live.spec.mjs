@@ -757,10 +757,29 @@ test("PostgreSQL 17 runs a full v1.1 upload cycle with Worker-equal rows, replay
     const grownCandidate = await (await manifestPost.handler(deviceRequest(
       "/api/v1/device/telemetry/v1.1/day-manifests", "POST", grown.manifest,
     ))).json();
-    for (const chunk of grown.chunks) {
-      const uploaded = await contribute(chunk);
-      assert.equal(uploaded.response?.status, 202, uploaded.error?.code);
+    // Two concurrent uploads of one chunk under two grants: the manifest
+    // lock orders them, one stages and the other is its exact replay.
+    assert.equal(grown.chunks.length, 1);
+    const racing = await Promise.all([contribute(grown.chunks[0]), contribute(grown.chunks[0])]);
+    const raced = await Promise.all(racing.map(async (entry) => {
+      assert.equal(entry.response?.status, 202, entry.error?.code);
+      return entry.response.json();
+    }));
+    assert.deepEqual(raced.map((body) => body.replayed).sort(), [false, true]);
+    assert.equal(raced[0].contributionId, raced[1].contributionId);
+    for (const entry of racing) {
+      assert.deepEqual(await grantState(entry.authorizationId),
+        { state: "consumed", consumed_contribution_id: raced[0].contributionId });
     }
+    assert.equal((await primaryPool.query(
+      `SELECT count(*)::int AS n FROM ${q(primarySchema, "typed_v11_record_admissions")} WHERE chunk_id = $1`,
+      [raced[0].contributionId],
+    )).rows[0].n, grown.chunks[0].records.length);
+    const retained = await primaryPool.query(
+      `SELECT array_agg(r2_key ORDER BY r2_key) AS keys FROM ${q(primarySchema, "telemetry_v11_chunks")}`,
+    );
+    assert.deepEqual([...objects.keys()].sort(), retained.rows[0].keys,
+      "exactly the referenced envelope objects remain; a losing attempt's object is retired");
     const growing = await (await predecessorRoute.handler(deviceRequest(
       "/api/v1/me/telemetry-v11/domain-predecessor", "POST", {},
     ))).json();
