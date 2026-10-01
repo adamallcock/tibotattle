@@ -80,12 +80,13 @@ async function seedSocialDevice({ pool, schema, nowEpoch, consentVersion }) {
      ) VALUES ($1,$2,'social',$3,$4,'active',$5,$6,$5,$5)`,
     [deviceId, participantId, pairingId, deviceSecretHash(deviceId, secret), now, expiresAt],
   );
-  await pool.query(
-    `INSERT INTO ${q(schema, "telemetry_transport_participant_floors")} (
-       participant_id, minimum_rank, changed_at
-     ) VALUES ($1,1,$2)`,
-    [participantId, now],
-  );
+  // Primary 0051 (D1 parity) gives a social participant its creation floor
+  // (rank 1, revision 0) on insert; the fixture only checks it.
+  assert.deepEqual((await pool.query(
+    `SELECT minimum_rank, revision FROM ${q(schema, "telemetry_transport_participant_floors")}
+      WHERE participant_id=$1`,
+    [participantId],
+  )).rows, [{ minimum_rank: 1, revision: 0 }]);
   return {
     participantId,
     deviceId,
@@ -283,6 +284,13 @@ test("PostgreSQL enforces per-format lifecycle, floors, consent, and successor a
       `UPDATE ${q(schema, "telemetry_transport_participant_floors")}
           SET minimum_rank=11, revision=revision+1, changed_at=$2 WHERE participant_id=$1`,
       [social.participantId, now],
+    );
+    // Primary 0051 (D1 parity) created this device's floor with the device and
+    // raised it with the v1.1 consent; the scenario needs a rank-10 device
+    // floor under a rank-11 participant floor, so the row is replaced.
+    await pool.query(
+      `DELETE FROM ${q(schema, "telemetry_transport_device_floors")} WHERE participant_id=$1 AND device_id=$2`,
+      [social.participantId, social.deviceId],
     );
     await pool.query(
       `INSERT INTO ${q(schema, "telemetry_transport_device_floors")} (
