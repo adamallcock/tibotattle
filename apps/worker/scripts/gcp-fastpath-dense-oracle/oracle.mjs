@@ -8,7 +8,7 @@
 //     apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs \
 //       --work-dir <absolute dir outside the repository> --corpus dense|q1 [--layout compact|spread] [--scale 0.1] \
 //       [--golden-out <dir>] [--verify-against <dir>] [--forced-native withheld|all|none] \
-//       [--max-ticks N] [--resume <converged work dir>] [--keep-scratch]
+//       [--max-ticks N] [--resume <converged work dir>] [--keep-scratch] [--forced-jobs N]
 //
 //  1. build.mjs materializes d43c8f92 (blob-verified) and bundles it for Node;
 //  2. runtime.mjs pins the clock and seeds every random source, so a run is
@@ -87,7 +87,7 @@ const RUN_SPECIFIC_ANALYTICS_COLUMNS = Object.freeze({
 function parseArgs(argv) {
   const options = { workDir: null, corpus: null, scale: 1, goldenOut: null, verifyAgainst: null,
     forcedNative: "withheld", maxTicks: 200_000, keepScratch: false, resume: null, publicationPasses: 1,
-    layout: DENSE_DEFAULT_LAYOUT };
+    layout: DENSE_DEFAULT_LAYOUT, forcedJobs: 6 };
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index], next = () => argv[++index];
     if (arg === "--work-dir") options.workDir = resolve(next());
@@ -101,6 +101,7 @@ function parseArgs(argv) {
     else if (arg === "--resume") options.resume = resolve(next());
     else if (arg === "--publication-passes") options.publicationPasses = Number(next());
     else if (arg === "--layout") options.layout = next();
+    else if (arg === "--forced-jobs") options.forcedJobs = Number(next());
     else throw new Error(`DENSE_ORACLE_ARGUMENT_INVALID:${arg}`);
   }
   if (!options.workDir || !isAbsolute(options.workDir) || !relative(REPO_ROOT, options.workDir).startsWith("..")) {
@@ -111,6 +112,9 @@ function parseArgs(argv) {
     throw new Error("DENSE_ORACLE_SCALE_INVALID");
   }
   if (!["all", "withheld", "none"].includes(options.forcedNative)) throw new Error("DENSE_ORACLE_FORCED_NATIVE_INVALID");
+  if (!Number.isSafeInteger(options.forcedJobs) || options.forcedJobs < 1 || options.forcedJobs > 32) {
+    throw new Error("DENSE_ORACLE_FORCED_JOBS_INVALID");
+  }
   if (!Object.hasOwn(DENSE_LAYOUTS, options.layout) || (options.corpus === "q1" && options.layout !== DENSE_DEFAULT_LAYOUT)) {
     throw new Error("DENSE_ORACLE_LAYOUT_INVALID");
   }
@@ -145,7 +149,7 @@ const prior = (() => {
   return events;
 })();
 /** Git blob ids of the oracle files as this process loaded them (SOURCE.json). */
-const ORACLE_FILES = ["oracle.mjs", "build.mjs", "runtime.mjs", "forced-native.mjs", "dense-corpus.mjs",
+const ORACLE_FILES = ["oracle.mjs", "build.mjs", "runtime.mjs", "forced-native.mjs", "forced-native-child.mjs", "dense-corpus.mjs",
   "corpus-summary.mjs", "entry.ts", "shims/cloudflare-workers.mjs", "shims/cloudflare-test.mjs"];
 const blobOf = (path) => {
   const bytes = readFileSync(path);
@@ -921,7 +925,9 @@ if (options.forcedNative !== "none") {
     const run = await runForcedNative({ P, openSealedSqliteD1, dbDir, scratchDir: join(options.workDir, "scratch-forced"),
       files: { source: DB_FILES.USAGE_MONITOR_DB, target: DB_FILES.STORAGE_ANALYTICS_DB },
       bindings: { sourceId: SOURCE_ID, sourceNamespace: NAMESPACE }, nowMs: PINNED_NOW_MS, today, modelDates,
-      ownerKeyOf: ownerKey, datesFor: forcedDatesFor, keepScratch: options.keepScratch,
+      ownerKeyOf: ownerKey, datesFor: forcedDatesFor, keepScratch: options.keepScratch, jobs: options.forcedJobs,
+      child: { node: process.execPath, execArgv: ["--max-old-space-size=8192"], script: join(HERE, "forced-native-child.mjs"),
+        spec: { bundlePath: build.bundle.path, adapterPath: join(WORKER_ROOT, "cloud-run/sealed-sqlite-d1-adapter.mjs") } },
       onOwner: (key, entry) => {
         restoreConsole();
         note("forced-owner", { key, fits: entry.fits.state,
