@@ -37,6 +37,14 @@ export interface PostgresDeviceAuthenticationOptions
 export interface PostgresDeviceUploadClaimOptions {
   readonly nowEpoch?: number;
   readonly schema?: PostgresSchemaConfig;
+  /**
+   * The accountless authority a claim requires. Omitted means `'v1.2'`, the
+   * v1.2 origin's claim (the base v1.1 lease graph plus the typed-v1.2
+   * grant). `'v1.1'` is d43c8f92 claimDeviceUploadAuthorization's own gate,
+   * the base v1.1 lease graph alone, which every non-v1.2 envelope (v1.1,
+   * v1.0) is claimed under; its format and handler recheck the rest.
+   */
+  readonly accountlessAuthorizationVersion?: PostgresAccountlessAuthorizationVersion;
 }
 
 export interface PostgresDeviceUploadClaimRequest {
@@ -146,9 +154,13 @@ export async function authenticatePostgresDevice(
  * Claim a device upload grant once. The header is purpose-bound, the envelope
  * digest, byte length, and content type must exactly match the minted grant,
  * and current device/owner authority is checked in the same transaction that
- * advances `unused` to `consuming`. Accountless claims require both the shared
- * v1.1 bearer/upload authorization used by the generic Worker transport gate
- * and the additional v1.2 schema authorization checked by v1.2 admission.
+ * advances `unused` to `consuming`. By default accountless claims require both
+ * the shared v1.1 bearer/upload authorization used by the generic Worker
+ * transport gate and the additional v1.2 schema authorization checked by v1.2
+ * admission; `accountlessAuthorizationVersion: 'v1.1'` requires the shared
+ * v1.1 authorization alone, as d43c8f92 claimDeviceUploadAuthorization does
+ * for every envelope, so a v1.1-only accountless client can redeem a v1.1
+ * (or v1.0) upload.
  */
 export async function claimPostgresDeviceUploadAuthorization(
   pool: PostgresPool,
@@ -169,6 +181,10 @@ export async function claimPostgresDeviceUploadAuthorization(
   const leaseExpiresAt = new Date(nowEpoch + UPLOAD_CONSUME_LEASE_MILLISECONDS);
   if (!Number.isFinite(leaseExpiresAt.getTime())) throw new ApiError(401, "UPLOAD_AUTH_INVALID");
   const schema = schemaName(options);
+  const accountlessAuthorizationVersion = options.accountlessAuthorizationVersion ?? "v1.2";
+  if (accountlessAuthorizationVersion !== "v1.1" && accountlessAuthorizationVersion !== "v1.2") {
+    throw new TypeError("invalid accountless authorization version");
+  }
 
   try {
     return await withPostgresMutation(pool, async (client) => {
@@ -209,7 +225,7 @@ export async function claimPostgresDeviceUploadAuthorization(
             enrollmentDeviceId: row.accountless_enrollment_device_id,
             deviceExpiresAt: row.device_expires_at,
             nowEpoch,
-            authorizationVersion: "v1.2",
+            authorizationVersion: accountlessAuthorizationVersion,
           })) {
         throw new ApiError(401, "UPLOAD_AUTH_INVALID");
       }

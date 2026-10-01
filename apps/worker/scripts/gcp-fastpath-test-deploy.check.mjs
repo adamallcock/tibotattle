@@ -42,7 +42,7 @@ function expectCode(fn, code) {
 
 test("every write command targets only fast-path resources in the tibotattle project", () => {
   const commands = [
-    migrateJobCommand({ image: IMAGE, expectedCounts: { primary: 59, ledger: 7 } }),
+    migrateJobCommand({ image: IMAGE, expectedCounts: { primary: 61, ledger: 7 } }),
     refreshJobCommand({ image: IMAGE }),
     refreshJobCommand({ image: IMAGE, now: "2026-10-01T00:00:00Z" }),
     executeJobCommand(FASTPATH_TEST.migrateJob),
@@ -61,18 +61,18 @@ test("every write command targets only fast-path resources in the tibotattle pro
   expectCode(() => executeJobCommand("tibotattle-test-database-migrate"),
     "FASTPATH_DEPLOY_TARGET_NOT_FASTPATH");
   expectCode(() => migrateJobCommand({ image: "us-east1-docker.pkg.dev/tibotattle/tibotattle-test/tibotattle-host:latest",
-    expectedCounts: { primary: 59, ledger: 7 } }), "FASTPATH_DEPLOY_IMAGE_DIGEST_REQUIRED");
-  expectCode(() => migrateJobCommand({ image: IMAGE, expectedCounts: { primary: 59 } }),
+    expectedCounts: { primary: 61, ledger: 7 } }), "FASTPATH_DEPLOY_IMAGE_DIGEST_REQUIRED");
+  expectCode(() => migrateJobCommand({ image: IMAGE, expectedCounts: { primary: 61 } }),
     "FASTPATH_DEPLOY_EXPECTED_COUNTS_INVALID");
 });
 
 test("migrate and refresh Jobs carry the exact database targets, identities and sizes", () => {
-  const migrate = migrateJobCommand({ image: IMAGE, expectedCounts: { primary: 59, ledger: 7 } });
+  const migrate = migrateJobCommand({ image: IMAGE, expectedCounts: { primary: 61, ledger: 7 } });
   const env = migrate.find((arg) => arg.startsWith("--set-env-vars="));
   for (const pair of [
     "PRIMARY_DATABASE=tibotattle_fastpath", "LEDGER_DATABASE=tibotattle_fastpath",
     "PRIMARY_SCHEMA=tibotattle_fastpath_20261001", "LEDGER_SCHEMA=tibotattle_fastpath_ledger_20261001",
-    "PRIMARY_EXPECTED_MIGRATIONS=59", "LEDGER_EXPECTED_MIGRATIONS=7",
+    "PRIMARY_EXPECTED_MIGRATIONS=61", "LEDGER_EXPECTED_MIGRATIONS=7",
     "POSTGRES_MIGRATOR_IAM_USER=tibotattle-test-migrator@tibotattle.iam",
   ]) assert.equal(env.includes(pair), true, pair);
   assert.equal(migrate.includes(`--service-account=${FASTPATH_TEST.migratorServiceAccount}`), true);
@@ -197,7 +197,7 @@ test("refresh and origin follow an explicit seeded rehearsal schema; migrate sta
   assert.equal(refresh.some((arg) => arg.includes(`LEDGER_SCHEMA=${FASTPATH_TEST.ledgerSchema}`)), true);
   const origin = renderOriginService({ image: IMAGE, bucketHistoryProof: PROOF, schema: seeded });
   assert.match(origin, new RegExp(`name: PRIMARY_SCHEMA\\n {10}value: "${seeded}"`, "u"));
-  const migrate = migrateJobCommand({ image: IMAGE, expectedCounts: { primary: 59, ledger: 7 } });
+  const migrate = migrateJobCommand({ image: IMAGE, expectedCounts: { primary: 61, ledger: 7 } });
   assert.equal(migrate.some((arg) => arg.includes(`PRIMARY_SCHEMA=${FASTPATH_TEST.primarySchema}`)), true);
   assert.equal(primarySchemaOf(undefined), FASTPATH_TEST.primarySchema);
   for (const bad of ["tibotattle_v12_a2_20260925", "tibotattle", "typed_legacy_transfer_rehearsal_target_x",

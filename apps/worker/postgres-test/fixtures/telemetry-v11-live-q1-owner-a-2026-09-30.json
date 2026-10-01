@@ -1,0 +1,2313 @@
+{
+ "schemaVersion": "telemetry-v11-live-q1-day-v1",
+ "synthetic": true,
+ "source": {
+  "oracle": "gcp-fastpath-q1",
+  "sourceCommit": "d43c8f92a059d9c577776f7eca8a331eb305b8a6",
+  "corpusSeed": "gcp-fastpath-oracle-2026-10-01",
+  "owner": "a",
+  "ownerKind": "social"
+ },
+ "participantId": "participant:14c71dae-0182-49fb-89b1-5dc3d6473e71",
+ "ownerOriginalHex": "0214c71dae018249fb89b15dc3d6473e71",
+ "day": "2026-09-30",
+ "parserVersion": "synthetic-gcp-oracle-v11",
+ "records": {
+  "quota": [
+   {
+    "schemaVersion": "quota-observation-v1.1",
+    "observationId": "quota-occurrence:v1:45e06bb78a21b36f6fc38c9d27626c91646a5f5cc0073162773ac43d48082b0a",
+    "observedTime": "2026-09-30T06:12:25.000Z",
+    "provider": "openai_codex",
+    "planType": "pro",
+    "planVariant": "unknown",
+    "limitId": "codex",
+    "slot": "seven_day",
+    "usedPercent": 5.0838,
+    "windowDurationMinutes": 10080,
+    "resetsAt": "2026-10-05T00:00:00.000Z",
+    "accountPlanAttribution": {
+     "accountBasis": "same_source",
+     "accountTrackId": "account-track:v2:85bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+     "planBasis": "same_source_occurrence",
+     "planType": "pro",
+     "planEraId": null
+    }
+   },
+   {
+    "schemaVersion": "quota-observation-v1.1",
+    "observationId": "quota-occurrence:v1:2abc51011f4c84aa78e2d9f415d101bd3b09e3710443364780da7a6ca4375d38",
+    "observedTime": "2026-09-30T10:46:45.000Z",
+    "provider": "openai_codex",
+    "planType": "pro",
+    "planVariant": "unknown",
+    "limitId": "codex",
+    "slot": "seven_day",
+    "usedPercent": 7.6312,
+    "windowDurationMinutes": 10080,
+    "resetsAt": "2026-10-05T00:00:00.000Z",
+    "accountPlanAttribution": {
+     "accountBasis": "same_source",
+     "accountTrackId": "account-track:v2:85bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+     "planBasis": "same_source_occurrence",
+     "planType": "pro",
+     "planEraId": null
+    }
+   },
+   {
+    "schemaVersion": "quota-observation-v1.1",
+    "observationId": "quota-occurrence:v1:5383534dcfaae8dadbdbecf9af12d399a5edbf9480379e59ff3d33d652731e3b",
+    "observedTime": "2026-09-30T14:39:04.000Z",
+    "provider": "openai_codex",
+    "planType": "pro",
+    "planVariant": "unknown",
+    "limitId": "codex",
+    "slot": "seven_day",
+    "usedPercent": 10.2018,
+    "windowDurationMinutes": 10080,
+    "resetsAt": "2026-10-05T00:00:00.000Z",
+    "accountPlanAttribution": {
+     "accountBasis": "same_source",
+     "accountTrackId": "account-track:v2:85bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+     "planBasis": "same_source_occurrence",
+     "planType": "pro",
+     "planEraId": null
+    }
+   },
+   {
+    "schemaVersion": "quota-observation-v1.1",
+    "observationId": "quota-occurrence:v1:69fcda1c44f85b9b6544332d5603e21c9bad8aff8903cbced3c909f6bc47e053",
+    "observedTime": "2026-09-30T18:36:10.000Z",
+    "provider": "openai_codex",
+    "planType": "pro",
+    "planVariant": "unknown",
+    "limitId": "codex",
+    "slot": "seven_day",
+    "usedPercent": 12.1849,
+    "windowDurationMinutes": 10080,
+    "resetsAt": "2026-10-05T00:00:00.000Z",
+    "accountPlanAttribution": {
+     "accountBasis": "same_source",
+     "accountTrackId": "account-track:v2:85bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+     "planBasis": "same_source_occurrence",
+     "planType": "pro",
+     "planEraId": null
+    }
+   },
+   {
+    "schemaVersion": "quota-observation-v1.1",
+    "observationId": "quota-occurrence:v1:31cb362a8c4286c66b7434afdd7cbce385af19cfb5dc040021205c7edcee632b",
+    "observedTime": "2026-09-30T20:13:08.000Z",
+    "provider": "openai_codex",
+    "planType": "pro",
+    "planVariant": "unknown",
+    "limitId": "codex",
+    "slot": "seven_day",
+    "usedPercent": 13.327,
+    "windowDurationMinutes": 10080,
+    "resetsAt": "2026-10-05T00:00:00.000Z",
+    "accountPlanAttribution": {
+     "accountBasis": "same_source",
+     "accountTrackId": "account-track:v2:85bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+     "planBasis": "same_source_occurrence",
+     "planType": "pro",
+     "planEraId": null
+    }
+   }
+  ],
+  "session": [
+   {
+    "schemaVersion": "session-dimension-v1.1",
+    "sessionUuid": "61b67b84-e212-4171-9332-385842953f11",
+    "firstEventTime": "2026-09-30T06:08:15.000Z",
+    "provider": "openai_codex",
+    "toolClassCounts": {
+     "localShell": 39,
+     "web": 6,
+     "other": 9
+    }
+   },
+   {
+    "schemaVersion": "session-dimension-v1.1",
+    "sessionUuid": "a5138445-0576-4764-8e91-35d891b6edd4",
+    "firstEventTime": "2026-09-30T09:33:22.000Z",
+    "provider": "openai_codex",
+    "toolClassCounts": {
+     "localShell": 1,
+     "web": 1,
+     "other": 4
+    }
+   },
+   {
+    "schemaVersion": "session-dimension-v1.1",
+    "sessionUuid": "156f6a57-098f-4ef5-95c6-03c8e94e9f9c",
+    "firstEventTime": "2026-09-30T12:55:56.000Z",
+    "provider": "openai_codex",
+    "toolClassCounts": {
+     "localShell": 2,
+     "web": 4,
+     "other": 1
+    }
+   },
+   {
+    "schemaVersion": "session-dimension-v1.1",
+    "sessionUuid": "54ace8d4-07ac-4e3a-9936-fb510232ebd2",
+    "firstEventTime": "2026-09-30T16:30:12.000Z",
+    "provider": "openai_codex",
+    "toolClassCounts": {
+     "localShell": 10,
+     "web": 4,
+     "other": 6
+    }
+   },
+   {
+    "schemaVersion": "session-dimension-v1.1",
+    "sessionUuid": "5dd2b7d2-e266-4cd0-8bcc-10959530c76d",
+    "firstEventTime": "2026-09-30T19:44:51.000Z",
+    "provider": "openai_codex",
+    "toolClassCounts": {
+     "localShell": 22,
+     "web": 7,
+     "other": 4
+    }
+   }
+  ],
+  "usage": [
+   {
+    "schemaVersion": "usage-event-v1.1",
+    "eventId": "event:v2:b7d9c53a82d40fd0f05b4ff04785039edaa56e2ddfaa1d0e72ec64ccc0edd400",
+    "eventTime": "2026-09-30T06:08:15.000Z",
+    "sessionUuid": "61b67b84-e212-4171-9332-385842953f11",
+    "provider": "openai_codex",
+    "modelId": "gpt-5.6-terra",
+    "speedMode": "standard",
+    "apiServiceTier": "default",
+    "surface": "local_interactive_unclassified",
+    "billingSurface": "chatgpt_subscription",
+    "reasoningEffort": "medium",
+    "agentScope": "root",
+    "outcome": "completed",
+    "totalInputContextTokens": 17988,
+    "components": {
+     "inputUncachedTokens": 17988,
+     "inputCacheReadTokens": 0,
+     "inputCacheWriteTokens": 0,
+     "outputTextTokens": 2187,
+     "outputReasoningTokens": 7184,
+     "outputCombinedTokens": null
+    },
+    "accountPlanAttribution": {
+     "accountBasis": "same_source",
+     "accountTrackId": "account-track:v2:85bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+     "planBasis": "same_source_occurrence",
+     "planType": "pro",
+     "planEraId": null
+    }
+   },
+   {
+    "schemaVersion": "usage-event-v1.1",
+    "eventId": "event:v2:49b4ff1342318ed09f6ec40838e26f8fc3e396191ec4ddb0ddda4ce3fb86da94",
+    "eventTime": "2026-09-30T06:09:06.000Z",
+    "sessionUuid": "61b67b84-e212-4171-9332-385842953f11",
+    "provider": "openai_codex",
+    "modelId": "gpt-5.5",
+    "speedMode": "standard",
+    "apiServiceTier": "default",
+    "surface": "local_interactive_unclassified",
+    "billingSurface": "chatgpt_subscription",
+    "reasoningEffort": "medium",
+    "agentScope": "root",
+    "outcome": "completed",
+    "totalInputContextTokens": 477527,
+    "components": {
+     "inputUncachedTokens": 7288,
+     "inputCacheReadTokens": 470239,
+     "inputCacheWriteTokens": 0,
+     "outputTextTokens": 14203,
+     "outputReasoningTokens": 451,
+     "outputCombinedTokens": null
+    },
+    "accountPlanAttribution": {
+     "accountBasis": "same_source",
+     "accountTrackId": "account-track:v2:85bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+     "planBasis": "same_source_occurrence",
+     "planType": "pro",
+     "planEraId": null
+    }
+   },
+   {
+    "schemaVersion": "usage-event-v1.1",
+    "eventId": "event:v2:c044bf96c70d7dabb74958b07254c4f609f9b82a19541f816ee3efcfdea4df46",
+    "eventTime": "2026-09-30T09:33:22.000Z",
+    "sessionUuid": "a5138445-0576-4764-8e91-35d891b6edd4",
+    "provider": "openai_codex",
+    "modelId": "gpt-5.5",
+    "speedMode": "standard",
+    "apiServiceTier": "default",
+    "surface": "local_interactive_unclassified",
+    "billingSurface": "chatgpt_subscription",
+    "reasoningEffort": "medium",
+    "agentScope": "root",
+    "outcome": "completed",
+    "totalInputContextTokens": 383167,
+    "components": {
+     "inputUncachedTokens": 33050,
+     "inputCacheReadTokens": 350117,
+     "inputCacheWriteTokens": 0,
+     "outputTextTokens": 13575,
+     "outputReasoningTokens": 2901,
+     "outputCombinedTokens": null
+    },
+    "accountPlanAttribution": {
+     "accountBasis": "same_source",
+     "accountTrackId": "account-track:v2:85bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+     "planBasis": "same_source_occurrence",
+     "planType": "pro",
+     "planEraId": null
+    }
+   },
+   {
+    "schemaVersion": "usage-event-v1.1",
+    "eventId": "event:v2:ecfbd120806734d9ed0dacf008d7ada2f3f4ad2696033757847d6ee426b30b70",
+    "eventTime": "2026-09-30T10:08:50.000Z",
+    "sessionUuid": "a5138445-0576-4764-8e91-35d891b6edd4",
+    "provider": "openai_codex",
+    "modelId": "gpt-5.6-terra",
+    "speedMode": "standard",
+    "apiServiceTier": "default",
+    "surface": "local_interactive_unclassified",
+    "billingSurface": "chatgpt_subscription",
+    "reasoningEffort": "low",
+    "agentScope": "root",
+    "outcome": "completed",
+    "totalInputContextTokens": 305199,
+    "components": {
+     "inputUncachedTokens": 20908,
+     "inputCacheReadTokens": 284291,
+     "inputCacheWriteTokens": 0,
+     "outputTextTokens": 15406,
+     "outputReasoningTokens": 7691,
+     "outputCombinedTokens": null
+    },
+    "accountPlanAttribution": {
+     "accountBasis": "same_source",
+     "accountTrackId": "account-track:v2:85bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+     "planBasis": "same_source_occurrence",
+     "planType": "pro",
+     "planEraId": null
+    }
+   },
+   {
+    "schemaVersion": "usage-event-v1.1",
+    "eventId": "event:v2:d00d6de32f5fc95da914b6a6777f3221e943b783eadb0995190e8c6aeaa6f993",
+    "eventTime": "2026-09-30T10:09:45.000Z",
+    "sessionUuid": "a5138445-0576-4764-8e91-35d891b6edd4",
+    "provider": "openai_codex",
+    "modelId": "gpt-5.6-terra",
+    "speedMode": "standard",
+    "apiServiceTier": "default",
+    "surface": "local_interactive_unclassified",
+    "billingSurface": "chatgpt_subscription",
+    "reasoningEffort": "high",
+    "agentScope": "root",
+    "outcome": "completed",
+    "totalInputContextTokens": 194536,
+    "components": {
+     "inputUncachedTokens": 20389,
+     "inputCacheReadTokens": 174147,
+     "inputCacheWriteTokens": 0,
+     "outputTextTokens": 1567,
+     "outputReasoningTokens": 8226,
+     "outputCombinedTokens": null
+    },
+    "accountPlanAttribution": {
+     "accountBasis": "same_source",
+     "accountTrackId": "account-track:v2:85bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+     "planBasis": "same_source_occurrence",
+     "planType": "pro",
+     "planEraId": null
+    }
+   },
+   {
+    "schemaVersion": "usage-event-v1.1",
+    "eventId": "event:v2:7f5f36b08982e03b78bb0f81517cfd02690e3bb980eb5904dc642ae8a252419d",
+    "eventTime": "2026-09-30T10:19:35.000Z",
+    "sessionUuid": "a5138445-0576-4764-8e91-35d891b6edd4",
+    "provider": "openai_codex",
+    "modelId": "gpt-5.5",
+    "speedMode": "standard",
+    "apiServiceTier": "default",
+    "surface": "local_interactive_unclassified",
+    "billingSurface": "chatgpt_subscription",
+    "reasoningEffort": "low",
+    "agentScope": "root",
+    "outcome": "completed",
+    "totalInputContextTokens": 427171,
+    "components": {
+     "inputUncachedTokens": 30140,
+     "inputCacheReadTokens": 397031,
+     "inputCacheWriteTokens": 0,
+     "outputTextTokens": 11270,
+     "outputReasoningTokens": 8241,
+     "outputCombinedTokens": null
+    },
+    "accountPlanAttribution": {
+     "accountBasis": "same_source",
+     "accountTrackId": "account-track:v2:85bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+     "planBasis": "same_source_occurrence",
+     "planType": "pro",
+     "planEraId": null
+    }
+   },
+   {
+    "schemaVersion": "usage-event-v1.1",
+    "eventId": "event:v2:7ff47359cb87c91d4af2d468cadac7bc8d69d5354b22b97db0052aed579d1637",
+    "eventTime": "2026-09-30T10:23:57.000Z",
+    "sessionUuid": "a5138445-0576-4764-8e91-35d891b6edd4",
+    "provider": "openai_codex",
+    "modelId": "gpt-5.6-terra",
+    "speedMode": "standard",
+    "apiServiceTier": "default",
+    "surface": "local_interactive_unclassified",
+    "billingSurface": "chatgpt_subscription",
+    "reasoningEffort": "medium",
+    "agentScope": "root",
+    "outcome": "completed",
+    "totalInputContextTokens": 259666,
+    "components": {
+     "inputUncachedTokens": 16559,
+     "inputCacheReadTokens": 243107,
+     "inputCacheWriteTokens": 0,
+     "outputTextTokens": 1225,
+     "outputReasoningTokens": 2215,
+     "outputCombinedTokens": null
+    },
+    "accountPlanAttribution": {
+     "accountBasis": "same_source",
+     "accountTrackId": "account-track:v2:85bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+     "planBasis": "same_source_occurrence",
+     "planType": "pro",
+     "planEraId": null
+    }
+   },
+   {
+    "schemaVersion": "usage-event-v1.1",
+    "eventId": "event:v2:96b51e7db0b46003ae359edfec7ef942fb52a9afa38832d85863b34e1ddaa1a5",
+    "eventTime": "2026-09-30T12:55:56.000Z",
+    "sessionUuid": "156f6a57-098f-4ef5-95c6-03c8e94e9f9c",
+    "provider": "openai_codex",
+    "modelId": "gpt-5.6-sol",
+    "speedMode": "standard",
+    "apiServiceTier": "default",
+    "surface": "local_interactive_unclassified",
+    "billingSurface": "chatgpt_subscription",
+    "reasoningEffort": "low",
+    "agentScope": "root",
+    "outcome": "completed",
+    "totalInputContextTokens": 580233,
+    "components": {
+     "inputUncachedTokens": 23779,
+     "inputCacheReadTokens": 556454,
+     "inputCacheWriteTokens": 0,
+     "outputTextTokens": 3994,
+     "outputReasoningTokens": 9091,
+     "outputCombinedTokens": null
+    },
+    "accountPlanAttribution": {
+     "accountBasis": "same_source",
+     "accountTrackId": "account-track:v2:85bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+     "planBasis": "same_source_occurrence",
+     "planType": "pro",
+     "planEraId": null
+    }
+   },
+   {
+    "schemaVersion": "usage-event-v1.1",
+    "eventId": "event:v2:721aa2558cb99cfc9107cbfb64fc80eb29dccd6da3f5f59c2308d649d551db62",
+    "eventTime": "2026-09-30T13:00:43.000Z",
+    "sessionUuid": "156f6a57-098f-4ef5-95c6-03c8e94e9f9c",
+    "provider": "openai_codex",
+    "modelId": "gpt-5.6-sol",
+    "speedMode": "standard",
+    "apiServiceTier": "default",
+    "surface": "local_interactive_unclassified",
+    "billingSurface": "chatgpt_subscription",
+    "reasoningEffort": "medium",
+    "agentScope": "root",
+    "outcome": "completed",
+    "totalInputContextTokens": 70768,
+    "components": {
+     "inputUncachedTokens": 24984,
+     "inputCacheReadTokens": 45784,
+     "inputCacheWriteTokens": 0,
+     "outputTextTokens": 13313,
+     "outputReasoningTokens": 3448,
+     "outputCombinedTokens": null
+    },
+    "accountPlanAttribution": {
+     "accountBasis": "same_source",
+     "accountTrackId": "account-track:v2:85bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+     "planBasis": "same_source_occurrence",
+     "planType": "pro",
+     "planEraId": null
+    }
+   },
+   {
+    "schemaVersion": "usage-event-v1.1",
+    "eventId": "event:v2:53bd8d7dbd40e4db8005b45052b65ddf4594d423da4a788b8e70167d0d901e7c",
+    "eventTime": "2026-09-30T14:11:17.000Z",
+    "sessionUuid": "156f6a57-098f-4ef5-95c6-03c8e94e9f9c",
+    "provider": "openai_codex",
+    "modelId": "gpt-5.5",
+    "speedMode": "standard",
+    "apiServiceTier": "default",
+    "surface": "local_interactive_unclassified",
+    "billingSurface": "chatgpt_subscription",
+    "reasoningEffort": "medium",
+    "agentScope": "root",
+    "outcome": "completed",
+    "totalInputContextTokens": 373043,
+    "components": {
+     "inputUncachedTokens": 24018,
+     "inputCacheReadTokens": 349025,
+     "inputCacheWriteTokens": 0,
+     "outputTextTokens": 5466,
+     "outputReasoningTokens": 5607,
+     "outputCombinedTokens": null
+    },
+    "accountPlanAttribution": {
+     "accountBasis": "same_source",
+     "accountTrackId": "account-track:v2:85bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+     "planBasis": "same_source_occurrence",
+     "planType": "pro",
+     "planEraId": null
+    }
+   },
+   {
+    "schemaVersion": "usage-event-v1.1",
+    "eventId": "event:v2:80228fbb2d22a8e27aacaf27dd00f94ee0d584fb11a421f30affc9145feb40be",
+    "eventTime": "2026-09-30T14:26:01.000Z",
+    "sessionUuid": "156f6a57-098f-4ef5-95c6-03c8e94e9f9c",
+    "provider": "openai_codex",
+    "modelId": "gpt-5.6-terra",
+    "speedMode": "standard",
+    "apiServiceTier": "default",
+    "surface": "local_interactive_unclassified",
+    "billingSurface": "chatgpt_subscription",
+    "reasoningEffort": "medium",
+    "agentScope": "root",
+    "outcome": "completed",
+    "totalInputContextTokens": 150478,
+    "components": {
+     "inputUncachedTokens": 22447,
+     "inputCacheReadTokens": 128031,
+     "inputCacheWriteTokens": 0,
+     "outputTextTokens": 2016,
+     "outputReasoningTokens": 8146,
+     "outputCombinedTokens": null
+    },
+    "accountPlanAttribution": {
+     "accountBasis": "same_source",
+     "accountTrackId": "account-track:v2:85bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+     "planBasis": "same_source_occurrence",
+     "planType": "pro",
+     "planEraId": null
+    }
+   },
+   {
+    "schemaVersion": "usage-event-v1.1",
+    "eventId": "event:v2:a40977353d35dcf84caeddedb35425cfa665d3ec1b32c0297f74e0228fb84442",
+    "eventTime": "2026-09-30T14:28:49.000Z",
+    "sessionUuid": "156f6a57-098f-4ef5-95c6-03c8e94e9f9c",
+    "provider": "openai_codex",
+    "modelId": "gpt-5.5",
+    "speedMode": "standard",
+    "apiServiceTier": "default",
+    "surface": "local_interactive_unclassified",
+    "billingSurface": "chatgpt_subscription",
+    "reasoningEffort": "high",
+    "agentScope": "subagent",
+    "outcome": "completed",
+    "totalInputContextTokens": 596570,
+    "components": {
+     "inputUncachedTokens": 32809,
+     "inputCacheReadTokens": 563761,
+     "inputCacheWriteTokens": 0,
+     "outputTextTokens": 22889,
+     "outputReasoningTokens": 2362,
+     "outputCombinedTokens": null
+    },
+    "accountPlanAttribution": {
+     "accountBasis": "same_source",
+     "accountTrackId": "account-track:v2:85bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+     "planBasis": "same_source_occurrence",
+     "planType": "pro",
+     "planEraId": null
+    }
+   },
+   {
+    "schemaVersion": "usage-event-v1.1",
+    "eventId": "event:v2:404a2ed8c14a2686ddb080258287304c2b68f258f1106e4d5d4195923d21bda4",
+    "eventTime": "2026-09-30T16:30:12.000Z",
+    "sessionUuid": "54ace8d4-07ac-4e3a-9936-fb510232ebd2",
+    "provider": "openai_codex",
+    "modelId": "gpt-5.5",
+    "speedMode": "standard",
+    "apiServiceTier": "default",
+    "surface": "local_interactive_unclassified",
+    "billingSurface": "chatgpt_subscription",
+    "reasoningEffort": "medium",
+    "agentScope": "root",
+    "outcome": "completed",
+    "totalInputContextTokens": 3245,
+    "components": {
+     "inputUncachedTokens": 3245,
+     "inputCacheReadTokens": 0,
+     "inputCacheWriteTokens": 0,
+     "outputTextTokens": 6664,
+     "outputReasoningTokens": 2796,
+     "outputCombinedTokens": null
+    },
+    "accountPlanAttribution": {
+     "accountBasis": "same_source",
+     "accountTrackId": "account-track:v2:85bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+     "planBasis": "same_source_occurrence",
+     "planType": "pro",
+     "planEraId": null
+    }
+   },
+   {
+    "schemaVersion": "usage-event-v1.1",
+    "eventId": "event:v2:944beacc4f48fcb1a8619e8ac6433c04ffc185e703d94c1442c6cc2c2d19d2db",
+    "eventTime": "2026-09-30T16:33:39.000Z",
+    "sessionUuid": "54ace8d4-07ac-4e3a-9936-fb510232ebd2",
+    "provider": "openai_codex",
+    "modelId": "gpt-5.6-terra",
+    "speedMode": "standard",
+    "apiServiceTier": "default",
+    "surface": "local_interactive_unclassified",
+    "billingSurface": "chatgpt_subscription",
+    "reasoningEffort": "high",
+    "agentScope": "root",
+    "outcome": "completed",
+    "totalInputContextTokens": 226908,
+    "components": {
+     "inputUncachedTokens": 1897,
+     "inputCacheReadTokens": 225011,
+     "inputCacheWriteTokens": 0,
+     "outputTextTokens": 5727,
+     "outputReasoningTokens": 2578,
+     "outputCombinedTokens": null
+    },
+    "accountPlanAttribution": {
+     "accountBasis": "same_source",
+     "accountTrackId": "account-track:v2:85bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+     "planBasis": "same_source_occurrence",
+     "planType": "pro",
+     "planEraId": null
+    }
+   },
+   {
+    "schemaVersion": "usage-event-v1.1",
+    "eventId": "event:v2:9f74825de4dce655cab2042887b19697e02cab60ab1f3d51f83dd2550efe464e",
+    "eventTime": "2026-09-30T16:47:52.000Z",
+    "sessionUuid": "54ace8d4-07ac-4e3a-9936-fb510232ebd2",
+    "provider": "openai_codex",
+    "modelId": "gpt-5.5",
+    "speedMode": "standard",
+    "apiServiceTier": "default",
+    "surface": "local_interactive_unclassified",
+    "billingSurface": "chatgpt_subscription",
+    "reasoningEffort": "high",
+    "agentScope": "root",
+    "outcome": "completed",
+    "totalInputContextTokens": 795168,
+    "components": {
+     "inputUncachedTokens": 37573,
+     "inputCacheReadTokens": 757595,
+     "inputCacheWriteTokens": 0,
+     "outputTextTokens": 9823,
+     "outputReasoningTokens": 2893,
+     "outputCombinedTokens": null
+    },
+    "accountPlanAttribution": {
+     "accountBasis": "same_source",
+     "accountTrackId": "account-track:v2:85bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+     "planBasis": "same_source_occurrence",
+     "planType": "pro",
+     "planEraId": null
+    }
+   },
+   {
+    "schemaVersion": "usage-event-v1.1",
+    "eventId": "event:v2:9f4acf3e04783b5ecf6125035950e0fd796eba2fc07814c91c95db578582a95d",
+    "eventTime": "2026-09-30T17:23:07.000Z",
+    "sessionUuid": "54ace8d4-07ac-4e3a-9936-fb510232ebd2",
+    "provider": "openai_codex",
+    "modelId": "gpt-5.6-terra",
+    "speedMode": "standard",
+    "apiServiceTier": "default",
+    "surface": "local_interactive_unclassified",
+    "billingSurface": "chatgpt_subscription",
+    "reasoningEffort": "high",
+    "agentScope": "root",
+    "outcome": "completed",
+    "totalInputContextTokens": 762214,
+    "components": {
+     "inputUncachedTokens": 38067,
+     "inputCacheReadTokens": 724147,
+     "inputCacheWriteTokens": 0,
+     "outputTextTokens": 8854,
+     "outputReasoningTokens": 1063,
+     "outputCombinedTokens": null
+    },
+    "accountPlanAttribution": {
+     "accountBasis": "same_source",
+     "accountTrackId": "account-track:v2:85bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+     "planBasis": "same_source_occurrence",
+     "planType": "pro",
+     "planEraId": null
+    }
+   },
+   {
+    "schemaVersion": "usage-event-v1.1",
+    "eventId": "event:v2:21abbdf5200ab7591ceff48b6501528267ed0af7d22075b31360e6e5894d1859",
+    "eventTime": "2026-09-30T17:25:14.000Z",
+    "sessionUuid": "54ace8d4-07ac-4e3a-9936-fb510232ebd2",
+    "provider": "openai_codex",
+    "modelId": "gpt-5.5",
+    "speedMode": "standard",
+    "apiServiceTier": "default",
+    "surface": "local_interactive_unclassified",
+    "billingSurface": "chatgpt_subscription",
+    "reasoningEffort": "medium",
+    "agentScope": "root",
+    "outcome": "completed",
+    "totalInputContextTokens": 70577,
+    "components": {
+     "inputUncachedTokens": 8260,
+     "inputCacheReadTokens": 62317,
+     "inputCacheWriteTokens": 0,
+     "outputTextTokens": 4820,
+     "outputReasoningTokens": 1191,
+     "outputCombinedTokens": null
+    },
+    "accountPlanAttribution": {
+     "accountBasis": "same_source",
+     "accountTrackId": "account-track:v2:85bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+     "planBasis": "same_source_occurrence",
+     "planType": "pro",
+     "planEraId": null
+    }
+   },
+   {
+    "schemaVersion": "usage-event-v1.1",
+    "eventId": "event:v2:315fc0865d378ddb4adab0a33fca99df6e17a6abe216d841433f98a16f51b756",
+    "eventTime": "2026-09-30T19:44:51.000Z",
+    "sessionUuid": "5dd2b7d2-e266-4cd0-8bcc-10959530c76d",
+    "provider": "openai_codex",
+    "modelId": "gpt-5.6-terra",
+    "speedMode": "standard",
+    "apiServiceTier": "default",
+    "surface": "local_interactive_unclassified",
+    "billingSurface": "chatgpt_subscription",
+    "reasoningEffort": "medium",
+    "agentScope": "root",
+    "outcome": "completed",
+    "totalInputContextTokens": 621012,
+    "components": {
+     "inputUncachedTokens": 9569,
+     "inputCacheReadTokens": 611443,
+     "inputCacheWriteTokens": 0,
+     "outputTextTokens": 18304,
+     "outputReasoningTokens": 7144,
+     "outputCombinedTokens": null
+    },
+    "accountPlanAttribution": {
+     "accountBasis": "same_source",
+     "accountTrackId": "account-track:v2:85bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+     "planBasis": "same_source_occurrence",
+     "planType": "pro",
+     "planEraId": null
+    }
+   },
+   {
+    "schemaVersion": "usage-event-v1.1",
+    "eventId": "event:v2:0cb0dfb4ee8fea57cd800ba9ab18f8fc0a9f9fcf075d39593feeed7756a7f205",
+    "eventTime": "2026-09-30T19:54:40.000Z",
+    "sessionUuid": "5dd2b7d2-e266-4cd0-8bcc-10959530c76d",
+    "provider": "openai_codex",
+    "modelId": "gpt-5.5",
+    "speedMode": "standard",
+    "apiServiceTier": "default",
+    "surface": "local_interactive_unclassified",
+    "billingSurface": "chatgpt_subscription",
+    "reasoningEffort": "high",
+    "agentScope": "root",
+    "outcome": "completed",
+    "totalInputContextTokens": 188238,
+    "components": {
+     "inputUncachedTokens": 1694,
+     "inputCacheReadTokens": 186544,
+     "inputCacheWriteTokens": 0,
+     "outputTextTokens": 5510,
+     "outputReasoningTokens": 3485,
+     "outputCombinedTokens": null
+    },
+    "accountPlanAttribution": {
+     "accountBasis": "same_source",
+     "accountTrackId": "account-track:v2:85bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+     "planBasis": "same_source_occurrence",
+     "planType": "pro",
+     "planEraId": null
+    }
+   },
+   {
+    "schemaVersion": "usage-event-v1.1",
+    "eventId": "event:v2:61dc22122bc92313a670467b992cf253629579158b6be5b9a18d4e69d9ebc5c3",
+    "eventTime": "2026-09-30T20:09:00.000Z",
+    "sessionUuid": "5dd2b7d2-e266-4cd0-8bcc-10959530c76d",
+    "provider": "openai_codex",
+    "modelId": "gpt-5.6-sol",
+    "speedMode": "standard",
+    "apiServiceTier": "default",
+    "surface": "local_interactive_unclassified",
+    "billingSurface": "chatgpt_subscription",
+    "reasoningEffort": "low",
+    "agentScope": "root",
+    "outcome": "completed",
+    "totalInputContextTokens": 231029,
+    "components": {
+     "inputUncachedTokens": 6803,
+     "inputCacheReadTokens": 224226,
+     "inputCacheWriteTokens": 0,
+     "outputTextTokens": 14455,
+     "outputReasoningTokens": 7483,
+     "outputCombinedTokens": null
+    },
+    "accountPlanAttribution": {
+     "accountBasis": "same_source",
+     "accountTrackId": "account-track:v2:85bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+     "planBasis": "same_source_occurrence",
+     "planType": "pro",
+     "planEraId": null
+    }
+   }
+  ]
+ },
+ "expected": {
+  "manifest": {
+   "chunkDay": "2026-09-30",
+   "manifestDigest": "9f71010a8a5c7561a0827288e5c4605ca036b5bded0dd1051f40f29a1cf439bd",
+   "parserVersion": "synthetic-gcp-oracle-v11",
+   "manifestJson": "{\"chunks\":[{\"chunkDigest\":\"4af7aa86c429874fab329ce40a550d310c59c60feb07d2d484cb08570733124e\",\"chunkId\":\"quota:2026-09-30:0\",\"recordCount\":5},{\"chunkDigest\":\"dd441235260db500ebdf3d2bdac75dd1f3fd5412f3f582e6a824b45c9bd7463e\",\"chunkId\":\"session:2026-09-30:0\",\"recordCount\":5},{\"chunkDigest\":\"5bc148dbf563005651a4404961469b63915aa49fd78eaecc3cba6e477f4ba683\",\"chunkId\":\"usage:2026-09-30:0\",\"recordCount\":20}],\"consent\":{\"fieldDictionaryVersion\":\"telemetry-v1.1-registry-2026-08-31.1\",\"privacyContractVersion\":\"ongoing-privacy-safe-telemetry-v1.1\",\"telemetrySchemaVersion\":\"telemetry-contribution-v1.1\"},\"day\":\"2026-09-30\",\"excluded\":{\"quota\":0,\"session\":0,\"usage\":0},\"manifestDigest\":\"9f71010a8a5c7561a0827288e5c4605ca036b5bded0dd1051f40f29a1cf439bd\",\"parserVersion\":\"synthetic-gcp-oracle-v11\",\"schemaVersion\":\"telemetry-day-manifest-v1.1\"}",
+   "expectedChunkCount": 3,
+   "state": "ready",
+   "typedManifest": {
+    "owner": "0214c71dae018249fb89b15dc3d6473e71",
+    "chunkDay": 20726
+   }
+  },
+  "ownerIsParticipant": true,
+  "chunks": [
+   {
+    "chunkId": "quota:2026-09-30:0",
+    "stream": "quota",
+    "chunkDay": "2026-09-30",
+    "chunkSeq": 0,
+    "chunkDigest": "4af7aa86c429874fab329ce40a550d310c59c60feb07d2d484cb08570733124e",
+    "parserVersion": "synthetic-gcp-oracle-v11",
+    "recordCount": 5,
+    "allocation": {
+     "recordCount": 5
+    },
+    "typedChunk": {
+     "format": 11,
+     "stream": "quota",
+     "chunkDay": 20726,
+     "owner": "0214c71dae018249fb89b15dc3d6473e71",
+     "manifestIsMember": true
+    },
+    "records": [
+     {
+      "offset": 0,
+      "format": 11,
+      "stream": "quota",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "0845e06bb78a21b36f6fc38c9d27626c91646a5f5cc0073162773ac43d48082b0a",
+      "observedAtMs": 1790748745000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "cd1e48fd76e3edf4b86e1f40c3456a08ab9b5113e39701ebf0896d6489321b9a",
+      "usage": null,
+      "quota": {
+       "planType": "pro",
+       "planVariant": "unknown",
+       "attribution": {
+        "owner": "0214c71dae018249fb89b15dc3d6473e71",
+        "accountBasis": 1,
+        "accountTrack": "0985bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+        "planBasis": 1,
+        "planType": "pro",
+        "planEra": ""
+       },
+       "limit": "codex",
+       "slot": "seven_day",
+       "usedPercent": 5.0838,
+       "windowDurationMinutes": 10080,
+       "resetsAtMs": 1791158400000,
+       "analysis": [
+        null,
+        null,
+        null
+       ]
+      },
+      "tools": null,
+      "proof": {
+       "stream": "quota",
+       "occurrence": "0845e06bb78a21b36f6fc38c9d27626c91646a5f5cc0073162773ac43d48082b0a",
+       "baseDigest": "04478956f653302654f3618b7b0d8bd8a68fdaf937e4d9108b5f1544a873bc55",
+       "legacyOccurrence": "00713a313739303734383734353030303a636f6465783a736576656e5f646179",
+       "legacyDigest": "0d9308a850af26bd9ee9da586d53cef554b509b644c2d55203c5349859924cf7",
+       "observedAtMs": 1790748745000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     },
+     {
+      "offset": 1,
+      "format": 11,
+      "stream": "quota",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "082abc51011f4c84aa78e2d9f415d101bd3b09e3710443364780da7a6ca4375d38",
+      "observedAtMs": 1790765205000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "53ffa5021734bb1a6dc2bf2d518423b18298fb4e85da9e88da6c6b0d4ad327b9",
+      "usage": null,
+      "quota": {
+       "planType": "pro",
+       "planVariant": "unknown",
+       "attribution": {
+        "owner": "0214c71dae018249fb89b15dc3d6473e71",
+        "accountBasis": 1,
+        "accountTrack": "0985bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+        "planBasis": 1,
+        "planType": "pro",
+        "planEra": ""
+       },
+       "limit": "codex",
+       "slot": "seven_day",
+       "usedPercent": 7.6312,
+       "windowDurationMinutes": 10080,
+       "resetsAtMs": 1791158400000,
+       "analysis": [
+        null,
+        null,
+        null
+       ]
+      },
+      "tools": null,
+      "proof": {
+       "stream": "quota",
+       "occurrence": "082abc51011f4c84aa78e2d9f415d101bd3b09e3710443364780da7a6ca4375d38",
+       "baseDigest": "12aba7b4578049a14e567237541b0239cceaadaa9cf285648135952d1bc9d6cf",
+       "legacyOccurrence": "00713a313739303736353230353030303a636f6465783a736576656e5f646179",
+       "legacyDigest": "14197931b277403dc65a18fa4e66a1e1f8f05b9cae46beaa66c0c45d6baa679f",
+       "observedAtMs": 1790765205000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     },
+     {
+      "offset": 2,
+      "format": 11,
+      "stream": "quota",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "085383534dcfaae8dadbdbecf9af12d399a5edbf9480379e59ff3d33d652731e3b",
+      "observedAtMs": 1790779144000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "8abc92c7dff59c20c53e0102acac1a899edb0e2349f2c66d692e8b316eae10a9",
+      "usage": null,
+      "quota": {
+       "planType": "pro",
+       "planVariant": "unknown",
+       "attribution": {
+        "owner": "0214c71dae018249fb89b15dc3d6473e71",
+        "accountBasis": 1,
+        "accountTrack": "0985bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+        "planBasis": 1,
+        "planType": "pro",
+        "planEra": ""
+       },
+       "limit": "codex",
+       "slot": "seven_day",
+       "usedPercent": 10.2018,
+       "windowDurationMinutes": 10080,
+       "resetsAtMs": 1791158400000,
+       "analysis": [
+        null,
+        null,
+        null
+       ]
+      },
+      "tools": null,
+      "proof": {
+       "stream": "quota",
+       "occurrence": "085383534dcfaae8dadbdbecf9af12d399a5edbf9480379e59ff3d33d652731e3b",
+       "baseDigest": "dbd1f6d18d87c3c98b95af778327a7836291d2008ad268288d1dbffb05f6cf2c",
+       "legacyOccurrence": "00713a313739303737393134343030303a636f6465783a736576656e5f646179",
+       "legacyDigest": "c3bf7e6f9ad7881eb5c7df90642e0f3c32803fc0166e46718f22313a38ddc549",
+       "observedAtMs": 1790779144000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     },
+     {
+      "offset": 3,
+      "format": 11,
+      "stream": "quota",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "0869fcda1c44f85b9b6544332d5603e21c9bad8aff8903cbced3c909f6bc47e053",
+      "observedAtMs": 1790793370000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "c3ff5444bb5b724fe454af2c73027073a0c3d3c2637d5846f68d87c2742b1fb0",
+      "usage": null,
+      "quota": {
+       "planType": "pro",
+       "planVariant": "unknown",
+       "attribution": {
+        "owner": "0214c71dae018249fb89b15dc3d6473e71",
+        "accountBasis": 1,
+        "accountTrack": "0985bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+        "planBasis": 1,
+        "planType": "pro",
+        "planEra": ""
+       },
+       "limit": "codex",
+       "slot": "seven_day",
+       "usedPercent": 12.1849,
+       "windowDurationMinutes": 10080,
+       "resetsAtMs": 1791158400000,
+       "analysis": [
+        null,
+        null,
+        null
+       ]
+      },
+      "tools": null,
+      "proof": {
+       "stream": "quota",
+       "occurrence": "0869fcda1c44f85b9b6544332d5603e21c9bad8aff8903cbced3c909f6bc47e053",
+       "baseDigest": "4053eab07c016bd93d9ff798ffb67368a396da30afde581a49fb5c881ed60a54",
+       "legacyOccurrence": "00713a313739303739333337303030303a636f6465783a736576656e5f646179",
+       "legacyDigest": "de6b60974e9be63a9436048511299d81bf3c7c329a2c46e6d2779ff4d3a1ad27",
+       "observedAtMs": 1790793370000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     },
+     {
+      "offset": 4,
+      "format": 11,
+      "stream": "quota",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "0831cb362a8c4286c66b7434afdd7cbce385af19cfb5dc040021205c7edcee632b",
+      "observedAtMs": 1790799188000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "0c879234d23b19baa74bf3fc2db6cacfe22b8cf62a125fc2c5db9d12fc76762b",
+      "usage": null,
+      "quota": {
+       "planType": "pro",
+       "planVariant": "unknown",
+       "attribution": {
+        "owner": "0214c71dae018249fb89b15dc3d6473e71",
+        "accountBasis": 1,
+        "accountTrack": "0985bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+        "planBasis": 1,
+        "planType": "pro",
+        "planEra": ""
+       },
+       "limit": "codex",
+       "slot": "seven_day",
+       "usedPercent": 13.327,
+       "windowDurationMinutes": 10080,
+       "resetsAtMs": 1791158400000,
+       "analysis": [
+        null,
+        null,
+        null
+       ]
+      },
+      "tools": null,
+      "proof": {
+       "stream": "quota",
+       "occurrence": "0831cb362a8c4286c66b7434afdd7cbce385af19cfb5dc040021205c7edcee632b",
+       "baseDigest": "310b4f9ff919fe1abb1c3c1fce052b72fad0f59b2154af15a3e328c88acf354b",
+       "legacyOccurrence": "00713a313739303739393138383030303a636f6465783a736576656e5f646179",
+       "legacyDigest": "dd534642b58ff1fdb782ce9cae7bbeb820945b962c7ebaa003d8a442a45f3bfb",
+       "observedAtMs": 1790799188000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     }
+    ]
+   },
+   {
+    "chunkId": "session:2026-09-30:0",
+    "stream": "session",
+    "chunkDay": "2026-09-30",
+    "chunkSeq": 0,
+    "chunkDigest": "dd441235260db500ebdf3d2bdac75dd1f3fd5412f3f582e6a824b45c9bd7463e",
+    "parserVersion": "synthetic-gcp-oracle-v11",
+    "recordCount": 5,
+    "allocation": {
+     "recordCount": 5
+    },
+    "typedChunk": {
+     "format": 11,
+     "stream": "session",
+     "chunkDay": 20726,
+     "owner": "0214c71dae018249fb89b15dc3d6473e71",
+     "manifestIsMember": true
+    },
+    "records": [
+     {
+      "offset": 0,
+      "format": 11,
+      "stream": "session",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "0161b67b84e21241719332385842953f11",
+      "observedAtMs": 1790748495000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "93479c178e282ec196f8c69f6e3cefb1d903817134d23326136e25e02f0c8af4",
+      "usage": null,
+      "quota": null,
+      "tools": [
+       [
+        "localShell",
+        39
+       ],
+       [
+        "other",
+        9
+       ],
+       [
+        "web",
+        6
+       ]
+      ],
+      "proof": {
+       "stream": "session",
+       "occurrence": "0161b67b84e21241719332385842953f11",
+       "baseDigest": "93479c178e282ec196f8c69f6e3cefb1d903817134d23326136e25e02f0c8af4",
+       "legacyOccurrence": "0161b67b84e21241719332385842953f11",
+       "legacyDigest": "472e8bac5bd56fe1e6167a1214f443f1932c5588a3ebe4069783606953b9e57f",
+       "observedAtMs": 1790748495000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     },
+     {
+      "offset": 1,
+      "format": 11,
+      "stream": "session",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "01a5138445057647648e9135d891b6edd4",
+      "observedAtMs": 1790760802000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "eb4e205cb76ad06d0300a7002f55016cb31e54d156ffdc1895a0149df6209a82",
+      "usage": null,
+      "quota": null,
+      "tools": [
+       [
+        "localShell",
+        1
+       ],
+       [
+        "other",
+        4
+       ],
+       [
+        "web",
+        1
+       ]
+      ],
+      "proof": {
+       "stream": "session",
+       "occurrence": "01a5138445057647648e9135d891b6edd4",
+       "baseDigest": "eb4e205cb76ad06d0300a7002f55016cb31e54d156ffdc1895a0149df6209a82",
+       "legacyOccurrence": "01a5138445057647648e9135d891b6edd4",
+       "legacyDigest": "462301ecc387397a7165f2b341d4fa9879456d0ae8ef2f4c4b51c7d189bfafe8",
+       "observedAtMs": 1790760802000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     },
+     {
+      "offset": 2,
+      "format": 11,
+      "stream": "session",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "01156f6a57098f4ef595c603c8e94e9f9c",
+      "observedAtMs": 1790772956000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "de542f7c32a5182139f15eaaf5220ba9dba26781b99ded27e54d1e09ccaaddff",
+      "usage": null,
+      "quota": null,
+      "tools": [
+       [
+        "localShell",
+        2
+       ],
+       [
+        "other",
+        1
+       ],
+       [
+        "web",
+        4
+       ]
+      ],
+      "proof": {
+       "stream": "session",
+       "occurrence": "01156f6a57098f4ef595c603c8e94e9f9c",
+       "baseDigest": "de542f7c32a5182139f15eaaf5220ba9dba26781b99ded27e54d1e09ccaaddff",
+       "legacyOccurrence": "01156f6a57098f4ef595c603c8e94e9f9c",
+       "legacyDigest": "c29c3215163c636931233db2c4059372177ac861881f45d5045718b2fcec9f24",
+       "observedAtMs": 1790772956000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     },
+     {
+      "offset": 3,
+      "format": 11,
+      "stream": "session",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "0154ace8d407ac4e3a9936fb510232ebd2",
+      "observedAtMs": 1790785812000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "c3d5e76774592ee9ebe9ea501fdff453403378b02671610b73af86900b3ebd46",
+      "usage": null,
+      "quota": null,
+      "tools": [
+       [
+        "localShell",
+        10
+       ],
+       [
+        "other",
+        6
+       ],
+       [
+        "web",
+        4
+       ]
+      ],
+      "proof": {
+       "stream": "session",
+       "occurrence": "0154ace8d407ac4e3a9936fb510232ebd2",
+       "baseDigest": "c3d5e76774592ee9ebe9ea501fdff453403378b02671610b73af86900b3ebd46",
+       "legacyOccurrence": "0154ace8d407ac4e3a9936fb510232ebd2",
+       "legacyDigest": "7dfbc4d10de1cecf0a8f3e1be52799acf6484cd34163f063650d77bf69f3c34d",
+       "observedAtMs": 1790785812000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     },
+     {
+      "offset": 4,
+      "format": 11,
+      "stream": "session",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "015dd2b7d2e2664cd08bcc10959530c76d",
+      "observedAtMs": 1790797491000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "c4392864b99c6e1f186bf6740e5eea6df4b93f1e412376e653074fae243786b0",
+      "usage": null,
+      "quota": null,
+      "tools": [
+       [
+        "localShell",
+        22
+       ],
+       [
+        "other",
+        4
+       ],
+       [
+        "web",
+        7
+       ]
+      ],
+      "proof": {
+       "stream": "session",
+       "occurrence": "015dd2b7d2e2664cd08bcc10959530c76d",
+       "baseDigest": "c4392864b99c6e1f186bf6740e5eea6df4b93f1e412376e653074fae243786b0",
+       "legacyOccurrence": "015dd2b7d2e2664cd08bcc10959530c76d",
+       "legacyDigest": "3f54f12d5f4cb5798e4b57b2bba252f64f75f478b0e8f094f2269a79ba716235",
+       "observedAtMs": 1790797491000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     }
+    ]
+   },
+   {
+    "chunkId": "usage:2026-09-30:0",
+    "stream": "usage",
+    "chunkDay": "2026-09-30",
+    "chunkSeq": 0,
+    "chunkDigest": "5bc148dbf563005651a4404961469b63915aa49fd78eaecc3cba6e477f4ba683",
+    "parserVersion": "synthetic-gcp-oracle-v11",
+    "recordCount": 20,
+    "allocation": {
+     "recordCount": 20
+    },
+    "typedChunk": {
+     "format": 11,
+     "stream": "usage",
+     "chunkDay": 20726,
+     "owner": "0214c71dae018249fb89b15dc3d6473e71",
+     "manifestIsMember": true
+    },
+    "records": [
+     {
+      "offset": 0,
+      "format": 11,
+      "stream": "usage",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "07b7d9c53a82d40fd0f05b4ff04785039edaa56e2ddfaa1d0e72ec64ccc0edd400",
+      "observedAtMs": 1790748495000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "d34e9052e29244e6ea38d2f204bb2508455473f433c08e03a12a7355c0bca7f6",
+      "usage": {
+       "session": "0161b67b84e21241719332385842953f11",
+       "model": "gpt-5.6-terra",
+       "speedMode": "standard",
+       "apiServiceTier": "default",
+       "surface": "local_interactive_unclassified",
+       "billingSurface": "chatgpt_subscription",
+       "reasoningEffort": "medium",
+       "agentScope": "root",
+       "outcome": "completed",
+       "attribution": {
+        "owner": "0214c71dae018249fb89b15dc3d6473e71",
+        "accountBasis": 1,
+        "accountTrack": "0985bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+        "planBasis": 1,
+        "planType": "pro",
+        "planEra": ""
+       },
+       "tokens": [
+        17988,
+        17988,
+        0,
+        0,
+        2187,
+        7184,
+        null
+       ]
+      },
+      "quota": null,
+      "tools": null,
+      "proof": {
+       "stream": "usage",
+       "occurrence": "07b7d9c53a82d40fd0f05b4ff04785039edaa56e2ddfaa1d0e72ec64ccc0edd400",
+       "baseDigest": "d9b6301f32fc30ed8b0286823b9ac95f633f38c9b6aba6ad02fe05ec9f3846ce",
+       "legacyOccurrence": "07b7d9c53a82d40fd0f05b4ff04785039edaa56e2ddfaa1d0e72ec64ccc0edd400",
+       "legacyDigest": "d86d211cbb48a69eb57bd4eb32afed1b11063f37ca88a07f9c36b9160593c00b",
+       "observedAtMs": 1790748495000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     },
+     {
+      "offset": 1,
+      "format": 11,
+      "stream": "usage",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "0749b4ff1342318ed09f6ec40838e26f8fc3e396191ec4ddb0ddda4ce3fb86da94",
+      "observedAtMs": 1790748546000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "8c8608d8deb76a6bf264513aa829de05d6f1242deb82fcf86ad507c8db7e92fb",
+      "usage": {
+       "session": "0161b67b84e21241719332385842953f11",
+       "model": "gpt-5.5",
+       "speedMode": "standard",
+       "apiServiceTier": "default",
+       "surface": "local_interactive_unclassified",
+       "billingSurface": "chatgpt_subscription",
+       "reasoningEffort": "medium",
+       "agentScope": "root",
+       "outcome": "completed",
+       "attribution": {
+        "owner": "0214c71dae018249fb89b15dc3d6473e71",
+        "accountBasis": 1,
+        "accountTrack": "0985bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+        "planBasis": 1,
+        "planType": "pro",
+        "planEra": ""
+       },
+       "tokens": [
+        477527,
+        7288,
+        470239,
+        0,
+        14203,
+        451,
+        null
+       ]
+      },
+      "quota": null,
+      "tools": null,
+      "proof": {
+       "stream": "usage",
+       "occurrence": "0749b4ff1342318ed09f6ec40838e26f8fc3e396191ec4ddb0ddda4ce3fb86da94",
+       "baseDigest": "88720e24db979e487ec99f5c00ad5b7ab7a380bfe9c4bf1d4b10faf0c28a6dd8",
+       "legacyOccurrence": "0749b4ff1342318ed09f6ec40838e26f8fc3e396191ec4ddb0ddda4ce3fb86da94",
+       "legacyDigest": "cc74769443cf6e3b86d89e068f3336906b31e2246e225078db65fd9a46316509",
+       "observedAtMs": 1790748546000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     },
+     {
+      "offset": 2,
+      "format": 11,
+      "stream": "usage",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "07c044bf96c70d7dabb74958b07254c4f609f9b82a19541f816ee3efcfdea4df46",
+      "observedAtMs": 1790760802000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "a529e4cd09fc47f255e16934f2bc42e3b8b37f593f2e3f1c19dd806fcba19b6d",
+      "usage": {
+       "session": "01a5138445057647648e9135d891b6edd4",
+       "model": "gpt-5.5",
+       "speedMode": "standard",
+       "apiServiceTier": "default",
+       "surface": "local_interactive_unclassified",
+       "billingSurface": "chatgpt_subscription",
+       "reasoningEffort": "medium",
+       "agentScope": "root",
+       "outcome": "completed",
+       "attribution": {
+        "owner": "0214c71dae018249fb89b15dc3d6473e71",
+        "accountBasis": 1,
+        "accountTrack": "0985bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+        "planBasis": 1,
+        "planType": "pro",
+        "planEra": ""
+       },
+       "tokens": [
+        383167,
+        33050,
+        350117,
+        0,
+        13575,
+        2901,
+        null
+       ]
+      },
+      "quota": null,
+      "tools": null,
+      "proof": {
+       "stream": "usage",
+       "occurrence": "07c044bf96c70d7dabb74958b07254c4f609f9b82a19541f816ee3efcfdea4df46",
+       "baseDigest": "85dc94bc7d05c0765ab760ff90d85e0fab7a7a770932f841a31b45add2ef7dd3",
+       "legacyOccurrence": "07c044bf96c70d7dabb74958b07254c4f609f9b82a19541f816ee3efcfdea4df46",
+       "legacyDigest": "bdea4b4e6591468d8dbc550157fa8ee2051256f2b8b51d7a6ffd624aec16279b",
+       "observedAtMs": 1790760802000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     },
+     {
+      "offset": 3,
+      "format": 11,
+      "stream": "usage",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "07ecfbd120806734d9ed0dacf008d7ada2f3f4ad2696033757847d6ee426b30b70",
+      "observedAtMs": 1790762930000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "c7239185725ec3701a1afa420b6ff42306c456bdaa50dc4c32a7943a009a9000",
+      "usage": {
+       "session": "01a5138445057647648e9135d891b6edd4",
+       "model": "gpt-5.6-terra",
+       "speedMode": "standard",
+       "apiServiceTier": "default",
+       "surface": "local_interactive_unclassified",
+       "billingSurface": "chatgpt_subscription",
+       "reasoningEffort": "low",
+       "agentScope": "root",
+       "outcome": "completed",
+       "attribution": {
+        "owner": "0214c71dae018249fb89b15dc3d6473e71",
+        "accountBasis": 1,
+        "accountTrack": "0985bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+        "planBasis": 1,
+        "planType": "pro",
+        "planEra": ""
+       },
+       "tokens": [
+        305199,
+        20908,
+        284291,
+        0,
+        15406,
+        7691,
+        null
+       ]
+      },
+      "quota": null,
+      "tools": null,
+      "proof": {
+       "stream": "usage",
+       "occurrence": "07ecfbd120806734d9ed0dacf008d7ada2f3f4ad2696033757847d6ee426b30b70",
+       "baseDigest": "2ae157647714325b2057a21ab08680019df08286f789a5036149beb3893abe2b",
+       "legacyOccurrence": "07ecfbd120806734d9ed0dacf008d7ada2f3f4ad2696033757847d6ee426b30b70",
+       "legacyDigest": "108a677be0c4afd7bcd342b72a273f785d06256cca18811ebbdffcef45d444d2",
+       "observedAtMs": 1790762930000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     },
+     {
+      "offset": 4,
+      "format": 11,
+      "stream": "usage",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "07d00d6de32f5fc95da914b6a6777f3221e943b783eadb0995190e8c6aeaa6f993",
+      "observedAtMs": 1790762985000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "929234c21e2984722eb484b9fe7e612b38568791aadd8d2826f4eac608d8fef3",
+      "usage": {
+       "session": "01a5138445057647648e9135d891b6edd4",
+       "model": "gpt-5.6-terra",
+       "speedMode": "standard",
+       "apiServiceTier": "default",
+       "surface": "local_interactive_unclassified",
+       "billingSurface": "chatgpt_subscription",
+       "reasoningEffort": "high",
+       "agentScope": "root",
+       "outcome": "completed",
+       "attribution": {
+        "owner": "0214c71dae018249fb89b15dc3d6473e71",
+        "accountBasis": 1,
+        "accountTrack": "0985bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+        "planBasis": 1,
+        "planType": "pro",
+        "planEra": ""
+       },
+       "tokens": [
+        194536,
+        20389,
+        174147,
+        0,
+        1567,
+        8226,
+        null
+       ]
+      },
+      "quota": null,
+      "tools": null,
+      "proof": {
+       "stream": "usage",
+       "occurrence": "07d00d6de32f5fc95da914b6a6777f3221e943b783eadb0995190e8c6aeaa6f993",
+       "baseDigest": "b3dde2b19a589c4a8a2fea898dc1fc36ef5947d9a5629ae627d8179dd5fd2d08",
+       "legacyOccurrence": "07d00d6de32f5fc95da914b6a6777f3221e943b783eadb0995190e8c6aeaa6f993",
+       "legacyDigest": "3c562de2d645653950b999b91ab05b56da35184e2a90d76cbe3e022563dfaff2",
+       "observedAtMs": 1790762985000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     },
+     {
+      "offset": 5,
+      "format": 11,
+      "stream": "usage",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "077f5f36b08982e03b78bb0f81517cfd02690e3bb980eb5904dc642ae8a252419d",
+      "observedAtMs": 1790763575000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "7a18a76fd7e3d778b063a133e220e5ed9f0589b9ac7e095800e7b68d52dfc557",
+      "usage": {
+       "session": "01a5138445057647648e9135d891b6edd4",
+       "model": "gpt-5.5",
+       "speedMode": "standard",
+       "apiServiceTier": "default",
+       "surface": "local_interactive_unclassified",
+       "billingSurface": "chatgpt_subscription",
+       "reasoningEffort": "low",
+       "agentScope": "root",
+       "outcome": "completed",
+       "attribution": {
+        "owner": "0214c71dae018249fb89b15dc3d6473e71",
+        "accountBasis": 1,
+        "accountTrack": "0985bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+        "planBasis": 1,
+        "planType": "pro",
+        "planEra": ""
+       },
+       "tokens": [
+        427171,
+        30140,
+        397031,
+        0,
+        11270,
+        8241,
+        null
+       ]
+      },
+      "quota": null,
+      "tools": null,
+      "proof": {
+       "stream": "usage",
+       "occurrence": "077f5f36b08982e03b78bb0f81517cfd02690e3bb980eb5904dc642ae8a252419d",
+       "baseDigest": "8821d6f8e262651ea4e658ca1962b842bcb3a956beb5350d8ddb064c60cc0ad1",
+       "legacyOccurrence": "077f5f36b08982e03b78bb0f81517cfd02690e3bb980eb5904dc642ae8a252419d",
+       "legacyDigest": "6e4b877b38e115b9bf82a753f2c0b56fa1b198318a987498fb604f77e1b496e7",
+       "observedAtMs": 1790763575000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     },
+     {
+      "offset": 6,
+      "format": 11,
+      "stream": "usage",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "077ff47359cb87c91d4af2d468cadac7bc8d69d5354b22b97db0052aed579d1637",
+      "observedAtMs": 1790763837000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "044303735421724e972e8845e3808e297900c95b157b6b35293817ddf8500ea0",
+      "usage": {
+       "session": "01a5138445057647648e9135d891b6edd4",
+       "model": "gpt-5.6-terra",
+       "speedMode": "standard",
+       "apiServiceTier": "default",
+       "surface": "local_interactive_unclassified",
+       "billingSurface": "chatgpt_subscription",
+       "reasoningEffort": "medium",
+       "agentScope": "root",
+       "outcome": "completed",
+       "attribution": {
+        "owner": "0214c71dae018249fb89b15dc3d6473e71",
+        "accountBasis": 1,
+        "accountTrack": "0985bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+        "planBasis": 1,
+        "planType": "pro",
+        "planEra": ""
+       },
+       "tokens": [
+        259666,
+        16559,
+        243107,
+        0,
+        1225,
+        2215,
+        null
+       ]
+      },
+      "quota": null,
+      "tools": null,
+      "proof": {
+       "stream": "usage",
+       "occurrence": "077ff47359cb87c91d4af2d468cadac7bc8d69d5354b22b97db0052aed579d1637",
+       "baseDigest": "a0e00fc1edca7ed005d2d5af9b6123aab7227e80a7fdf7658f0bf31c24f9e764",
+       "legacyOccurrence": "077ff47359cb87c91d4af2d468cadac7bc8d69d5354b22b97db0052aed579d1637",
+       "legacyDigest": "a0ef01e3c26d686aaeb53633c8476152c33edb136af9fee579fcfc28d3e269c6",
+       "observedAtMs": 1790763837000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     },
+     {
+      "offset": 7,
+      "format": 11,
+      "stream": "usage",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "0796b51e7db0b46003ae359edfec7ef942fb52a9afa38832d85863b34e1ddaa1a5",
+      "observedAtMs": 1790772956000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "2061c6486119db53457c1c50cf96a1ecbae606e78457923582c10386d4c1ae2a",
+      "usage": {
+       "session": "01156f6a57098f4ef595c603c8e94e9f9c",
+       "model": "gpt-5.6-sol",
+       "speedMode": "standard",
+       "apiServiceTier": "default",
+       "surface": "local_interactive_unclassified",
+       "billingSurface": "chatgpt_subscription",
+       "reasoningEffort": "low",
+       "agentScope": "root",
+       "outcome": "completed",
+       "attribution": {
+        "owner": "0214c71dae018249fb89b15dc3d6473e71",
+        "accountBasis": 1,
+        "accountTrack": "0985bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+        "planBasis": 1,
+        "planType": "pro",
+        "planEra": ""
+       },
+       "tokens": [
+        580233,
+        23779,
+        556454,
+        0,
+        3994,
+        9091,
+        null
+       ]
+      },
+      "quota": null,
+      "tools": null,
+      "proof": {
+       "stream": "usage",
+       "occurrence": "0796b51e7db0b46003ae359edfec7ef942fb52a9afa38832d85863b34e1ddaa1a5",
+       "baseDigest": "ed3e7fb48478e8eccdac57202ee1beb25e81062792d9bdf8319864777133b03e",
+       "legacyOccurrence": "0796b51e7db0b46003ae359edfec7ef942fb52a9afa38832d85863b34e1ddaa1a5",
+       "legacyDigest": "dd0a82c37822b5ffd698b6e766527805e9adb5d5c4674bd34b2dee3aaa5351ac",
+       "observedAtMs": 1790772956000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     },
+     {
+      "offset": 8,
+      "format": 11,
+      "stream": "usage",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "07721aa2558cb99cfc9107cbfb64fc80eb29dccd6da3f5f59c2308d649d551db62",
+      "observedAtMs": 1790773243000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "2dc340c56915ec9cdd5c0218592e6fafb16a24f7cdb15770d613a863bc509124",
+      "usage": {
+       "session": "01156f6a57098f4ef595c603c8e94e9f9c",
+       "model": "gpt-5.6-sol",
+       "speedMode": "standard",
+       "apiServiceTier": "default",
+       "surface": "local_interactive_unclassified",
+       "billingSurface": "chatgpt_subscription",
+       "reasoningEffort": "medium",
+       "agentScope": "root",
+       "outcome": "completed",
+       "attribution": {
+        "owner": "0214c71dae018249fb89b15dc3d6473e71",
+        "accountBasis": 1,
+        "accountTrack": "0985bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+        "planBasis": 1,
+        "planType": "pro",
+        "planEra": ""
+       },
+       "tokens": [
+        70768,
+        24984,
+        45784,
+        0,
+        13313,
+        3448,
+        null
+       ]
+      },
+      "quota": null,
+      "tools": null,
+      "proof": {
+       "stream": "usage",
+       "occurrence": "07721aa2558cb99cfc9107cbfb64fc80eb29dccd6da3f5f59c2308d649d551db62",
+       "baseDigest": "5d776027cfc8519b507cba2f010261528ec2248378ef35bb5c6725ee9037e386",
+       "legacyOccurrence": "07721aa2558cb99cfc9107cbfb64fc80eb29dccd6da3f5f59c2308d649d551db62",
+       "legacyDigest": "38904256e9822a9dd94f97095f855c8e4a76124e564b3d098edc829a2b9ae420",
+       "observedAtMs": 1790773243000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     },
+     {
+      "offset": 9,
+      "format": 11,
+      "stream": "usage",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "0753bd8d7dbd40e4db8005b45052b65ddf4594d423da4a788b8e70167d0d901e7c",
+      "observedAtMs": 1790777477000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "9f824e98dd95146c3de55bb4528daa7b5e2e28ccccda672f6f8f8296420cee71",
+      "usage": {
+       "session": "01156f6a57098f4ef595c603c8e94e9f9c",
+       "model": "gpt-5.5",
+       "speedMode": "standard",
+       "apiServiceTier": "default",
+       "surface": "local_interactive_unclassified",
+       "billingSurface": "chatgpt_subscription",
+       "reasoningEffort": "medium",
+       "agentScope": "root",
+       "outcome": "completed",
+       "attribution": {
+        "owner": "0214c71dae018249fb89b15dc3d6473e71",
+        "accountBasis": 1,
+        "accountTrack": "0985bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+        "planBasis": 1,
+        "planType": "pro",
+        "planEra": ""
+       },
+       "tokens": [
+        373043,
+        24018,
+        349025,
+        0,
+        5466,
+        5607,
+        null
+       ]
+      },
+      "quota": null,
+      "tools": null,
+      "proof": {
+       "stream": "usage",
+       "occurrence": "0753bd8d7dbd40e4db8005b45052b65ddf4594d423da4a788b8e70167d0d901e7c",
+       "baseDigest": "a6a81b4bfbd4731c3d7df4c3bf2e3c5eabae6fa8503a4c43ce73026b5e361930",
+       "legacyOccurrence": "0753bd8d7dbd40e4db8005b45052b65ddf4594d423da4a788b8e70167d0d901e7c",
+       "legacyDigest": "fbdd06a7a4e3af7ae8de78a793415fb49dfcc8bd54b0aae8d79e786bfb2e477d",
+       "observedAtMs": 1790777477000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     },
+     {
+      "offset": 10,
+      "format": 11,
+      "stream": "usage",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "0780228fbb2d22a8e27aacaf27dd00f94ee0d584fb11a421f30affc9145feb40be",
+      "observedAtMs": 1790778361000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "7a0fa82c1bd5b429f550eafd42d9a0605f5abfb7b3a2219418cc6426a6551682",
+      "usage": {
+       "session": "01156f6a57098f4ef595c603c8e94e9f9c",
+       "model": "gpt-5.6-terra",
+       "speedMode": "standard",
+       "apiServiceTier": "default",
+       "surface": "local_interactive_unclassified",
+       "billingSurface": "chatgpt_subscription",
+       "reasoningEffort": "medium",
+       "agentScope": "root",
+       "outcome": "completed",
+       "attribution": {
+        "owner": "0214c71dae018249fb89b15dc3d6473e71",
+        "accountBasis": 1,
+        "accountTrack": "0985bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+        "planBasis": 1,
+        "planType": "pro",
+        "planEra": ""
+       },
+       "tokens": [
+        150478,
+        22447,
+        128031,
+        0,
+        2016,
+        8146,
+        null
+       ]
+      },
+      "quota": null,
+      "tools": null,
+      "proof": {
+       "stream": "usage",
+       "occurrence": "0780228fbb2d22a8e27aacaf27dd00f94ee0d584fb11a421f30affc9145feb40be",
+       "baseDigest": "17f3c2461b53eac26dcb662d99d93c5b456c222aa786551d6da93d23e7f50241",
+       "legacyOccurrence": "0780228fbb2d22a8e27aacaf27dd00f94ee0d584fb11a421f30affc9145feb40be",
+       "legacyDigest": "245ac2f774e078b4948cacd3fa3c5d676e05b1b53cee9e6ec227ea7d472344c4",
+       "observedAtMs": 1790778361000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     },
+     {
+      "offset": 11,
+      "format": 11,
+      "stream": "usage",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "07a40977353d35dcf84caeddedb35425cfa665d3ec1b32c0297f74e0228fb84442",
+      "observedAtMs": 1790778529000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "e7eec2991cfeb213c059a12bed97e4986a63a18757085903d21595552e8786df",
+      "usage": {
+       "session": "01156f6a57098f4ef595c603c8e94e9f9c",
+       "model": "gpt-5.5",
+       "speedMode": "standard",
+       "apiServiceTier": "default",
+       "surface": "local_interactive_unclassified",
+       "billingSurface": "chatgpt_subscription",
+       "reasoningEffort": "high",
+       "agentScope": "subagent",
+       "outcome": "completed",
+       "attribution": {
+        "owner": "0214c71dae018249fb89b15dc3d6473e71",
+        "accountBasis": 1,
+        "accountTrack": "0985bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+        "planBasis": 1,
+        "planType": "pro",
+        "planEra": ""
+       },
+       "tokens": [
+        596570,
+        32809,
+        563761,
+        0,
+        22889,
+        2362,
+        null
+       ]
+      },
+      "quota": null,
+      "tools": null,
+      "proof": {
+       "stream": "usage",
+       "occurrence": "07a40977353d35dcf84caeddedb35425cfa665d3ec1b32c0297f74e0228fb84442",
+       "baseDigest": "350ea1eaab2df3095eaf65a8b28d14493479ff69a82cdf58a5725bb0adcce119",
+       "legacyOccurrence": "07a40977353d35dcf84caeddedb35425cfa665d3ec1b32c0297f74e0228fb84442",
+       "legacyDigest": "ce8ad04c2b56464baeb4d5d3180fdb54b1231a6439779d5c93a78ef898ae63bc",
+       "observedAtMs": 1790778529000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     },
+     {
+      "offset": 12,
+      "format": 11,
+      "stream": "usage",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "07404a2ed8c14a2686ddb080258287304c2b68f258f1106e4d5d4195923d21bda4",
+      "observedAtMs": 1790785812000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "05a458a380eac7949adac829460b1de693dfd2f80d5cacede7f1802740664ab4",
+      "usage": {
+       "session": "0154ace8d407ac4e3a9936fb510232ebd2",
+       "model": "gpt-5.5",
+       "speedMode": "standard",
+       "apiServiceTier": "default",
+       "surface": "local_interactive_unclassified",
+       "billingSurface": "chatgpt_subscription",
+       "reasoningEffort": "medium",
+       "agentScope": "root",
+       "outcome": "completed",
+       "attribution": {
+        "owner": "0214c71dae018249fb89b15dc3d6473e71",
+        "accountBasis": 1,
+        "accountTrack": "0985bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+        "planBasis": 1,
+        "planType": "pro",
+        "planEra": ""
+       },
+       "tokens": [
+        3245,
+        3245,
+        0,
+        0,
+        6664,
+        2796,
+        null
+       ]
+      },
+      "quota": null,
+      "tools": null,
+      "proof": {
+       "stream": "usage",
+       "occurrence": "07404a2ed8c14a2686ddb080258287304c2b68f258f1106e4d5d4195923d21bda4",
+       "baseDigest": "8c618f7ee657a132e1cc86e8bccbc0e3c103b0a2038a6a99c12c70858d9cb00f",
+       "legacyOccurrence": "07404a2ed8c14a2686ddb080258287304c2b68f258f1106e4d5d4195923d21bda4",
+       "legacyDigest": "ee737d907b7b84da6556e2eb5b476b5accf7459bd492e8e8fb0faeeb48f51f90",
+       "observedAtMs": 1790785812000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     },
+     {
+      "offset": 13,
+      "format": 11,
+      "stream": "usage",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "07944beacc4f48fcb1a8619e8ac6433c04ffc185e703d94c1442c6cc2c2d19d2db",
+      "observedAtMs": 1790786019000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "da5f559e08cb7266f891946145ff0ceee2e55ca8e05b7e9333d65d369c98fb31",
+      "usage": {
+       "session": "0154ace8d407ac4e3a9936fb510232ebd2",
+       "model": "gpt-5.6-terra",
+       "speedMode": "standard",
+       "apiServiceTier": "default",
+       "surface": "local_interactive_unclassified",
+       "billingSurface": "chatgpt_subscription",
+       "reasoningEffort": "high",
+       "agentScope": "root",
+       "outcome": "completed",
+       "attribution": {
+        "owner": "0214c71dae018249fb89b15dc3d6473e71",
+        "accountBasis": 1,
+        "accountTrack": "0985bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+        "planBasis": 1,
+        "planType": "pro",
+        "planEra": ""
+       },
+       "tokens": [
+        226908,
+        1897,
+        225011,
+        0,
+        5727,
+        2578,
+        null
+       ]
+      },
+      "quota": null,
+      "tools": null,
+      "proof": {
+       "stream": "usage",
+       "occurrence": "07944beacc4f48fcb1a8619e8ac6433c04ffc185e703d94c1442c6cc2c2d19d2db",
+       "baseDigest": "1cba5206a87ffa67396f6c91891725b118de4eebc532be700c6900aaa3e23edb",
+       "legacyOccurrence": "07944beacc4f48fcb1a8619e8ac6433c04ffc185e703d94c1442c6cc2c2d19d2db",
+       "legacyDigest": "5722d33aacc3faa11334da6fabd17350e0d0654c3d1d18a263bd46931c407ceb",
+       "observedAtMs": 1790786019000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     },
+     {
+      "offset": 14,
+      "format": 11,
+      "stream": "usage",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "079f74825de4dce655cab2042887b19697e02cab60ab1f3d51f83dd2550efe464e",
+      "observedAtMs": 1790786872000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "d817b0867d732cf27d66aeb9000f3406130b13a2bb5bcea149c39fe408735ed0",
+      "usage": {
+       "session": "0154ace8d407ac4e3a9936fb510232ebd2",
+       "model": "gpt-5.5",
+       "speedMode": "standard",
+       "apiServiceTier": "default",
+       "surface": "local_interactive_unclassified",
+       "billingSurface": "chatgpt_subscription",
+       "reasoningEffort": "high",
+       "agentScope": "root",
+       "outcome": "completed",
+       "attribution": {
+        "owner": "0214c71dae018249fb89b15dc3d6473e71",
+        "accountBasis": 1,
+        "accountTrack": "0985bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+        "planBasis": 1,
+        "planType": "pro",
+        "planEra": ""
+       },
+       "tokens": [
+        795168,
+        37573,
+        757595,
+        0,
+        9823,
+        2893,
+        null
+       ]
+      },
+      "quota": null,
+      "tools": null,
+      "proof": {
+       "stream": "usage",
+       "occurrence": "079f74825de4dce655cab2042887b19697e02cab60ab1f3d51f83dd2550efe464e",
+       "baseDigest": "a5e4c392d8c0fa400b3623905bbfde24f8ace29a7544597d0cfbf1b026e7584a",
+       "legacyOccurrence": "079f74825de4dce655cab2042887b19697e02cab60ab1f3d51f83dd2550efe464e",
+       "legacyDigest": "bab33f6174e498efe8c4f217bfb9ffa857d8a0d6d73df246f7826bd745131e21",
+       "observedAtMs": 1790786872000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     },
+     {
+      "offset": 15,
+      "format": 11,
+      "stream": "usage",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "079f4acf3e04783b5ecf6125035950e0fd796eba2fc07814c91c95db578582a95d",
+      "observedAtMs": 1790788987000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "1813796f70f3018ed5d5a1ec9a86c769901b44bcb8aa67ad76949a7a9d96a12f",
+      "usage": {
+       "session": "0154ace8d407ac4e3a9936fb510232ebd2",
+       "model": "gpt-5.6-terra",
+       "speedMode": "standard",
+       "apiServiceTier": "default",
+       "surface": "local_interactive_unclassified",
+       "billingSurface": "chatgpt_subscription",
+       "reasoningEffort": "high",
+       "agentScope": "root",
+       "outcome": "completed",
+       "attribution": {
+        "owner": "0214c71dae018249fb89b15dc3d6473e71",
+        "accountBasis": 1,
+        "accountTrack": "0985bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+        "planBasis": 1,
+        "planType": "pro",
+        "planEra": ""
+       },
+       "tokens": [
+        762214,
+        38067,
+        724147,
+        0,
+        8854,
+        1063,
+        null
+       ]
+      },
+      "quota": null,
+      "tools": null,
+      "proof": {
+       "stream": "usage",
+       "occurrence": "079f4acf3e04783b5ecf6125035950e0fd796eba2fc07814c91c95db578582a95d",
+       "baseDigest": "18e95fbc962530021ac676920b4a9859beb1cf697c19f00e770a8cba7c702457",
+       "legacyOccurrence": "079f4acf3e04783b5ecf6125035950e0fd796eba2fc07814c91c95db578582a95d",
+       "legacyDigest": "bc4465fc7022e8ed87197987dbcdcca7e09bfdd480204158d570b8a3fba791ae",
+       "observedAtMs": 1790788987000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     },
+     {
+      "offset": 16,
+      "format": 11,
+      "stream": "usage",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "0721abbdf5200ab7591ceff48b6501528267ed0af7d22075b31360e6e5894d1859",
+      "observedAtMs": 1790789114000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "d19099d1b78622dcafbdd8d97102875952e79f72252cb1981d36bf54e6d7b5ef",
+      "usage": {
+       "session": "0154ace8d407ac4e3a9936fb510232ebd2",
+       "model": "gpt-5.5",
+       "speedMode": "standard",
+       "apiServiceTier": "default",
+       "surface": "local_interactive_unclassified",
+       "billingSurface": "chatgpt_subscription",
+       "reasoningEffort": "medium",
+       "agentScope": "root",
+       "outcome": "completed",
+       "attribution": {
+        "owner": "0214c71dae018249fb89b15dc3d6473e71",
+        "accountBasis": 1,
+        "accountTrack": "0985bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+        "planBasis": 1,
+        "planType": "pro",
+        "planEra": ""
+       },
+       "tokens": [
+        70577,
+        8260,
+        62317,
+        0,
+        4820,
+        1191,
+        null
+       ]
+      },
+      "quota": null,
+      "tools": null,
+      "proof": {
+       "stream": "usage",
+       "occurrence": "0721abbdf5200ab7591ceff48b6501528267ed0af7d22075b31360e6e5894d1859",
+       "baseDigest": "5de2eb02f9b018fd09094579d1c086e308cbcfb9b3fc13ef7a316920f54c04c7",
+       "legacyOccurrence": "0721abbdf5200ab7591ceff48b6501528267ed0af7d22075b31360e6e5894d1859",
+       "legacyDigest": "0b229cebf07a99320c84c5b2c2eeb5dff104178196461dc9674d40a72fdaf42f",
+       "observedAtMs": 1790789114000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     },
+     {
+      "offset": 17,
+      "format": 11,
+      "stream": "usage",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "07315fc0865d378ddb4adab0a33fca99df6e17a6abe216d841433f98a16f51b756",
+      "observedAtMs": 1790797491000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "4fde99d46f61b5ad39d993b51fe221edd667eb48e796bd42acb6f6791b4590a3",
+      "usage": {
+       "session": "015dd2b7d2e2664cd08bcc10959530c76d",
+       "model": "gpt-5.6-terra",
+       "speedMode": "standard",
+       "apiServiceTier": "default",
+       "surface": "local_interactive_unclassified",
+       "billingSurface": "chatgpt_subscription",
+       "reasoningEffort": "medium",
+       "agentScope": "root",
+       "outcome": "completed",
+       "attribution": {
+        "owner": "0214c71dae018249fb89b15dc3d6473e71",
+        "accountBasis": 1,
+        "accountTrack": "0985bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+        "planBasis": 1,
+        "planType": "pro",
+        "planEra": ""
+       },
+       "tokens": [
+        621012,
+        9569,
+        611443,
+        0,
+        18304,
+        7144,
+        null
+       ]
+      },
+      "quota": null,
+      "tools": null,
+      "proof": {
+       "stream": "usage",
+       "occurrence": "07315fc0865d378ddb4adab0a33fca99df6e17a6abe216d841433f98a16f51b756",
+       "baseDigest": "d1e1c3ebb03a6f9c4141214de938a4b440a9eddac05edd765abbec4e2d6c71e5",
+       "legacyOccurrence": "07315fc0865d378ddb4adab0a33fca99df6e17a6abe216d841433f98a16f51b756",
+       "legacyDigest": "a58dd0667c43452a932f087ff1ef50490b8b24d14eccc0ddd6ffb04fcdc60d9d",
+       "observedAtMs": 1790797491000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     },
+     {
+      "offset": 18,
+      "format": 11,
+      "stream": "usage",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "070cb0dfb4ee8fea57cd800ba9ab18f8fc0a9f9fcf075d39593feeed7756a7f205",
+      "observedAtMs": 1790798080000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "3e51842855d579fca21564cfd57ba02bc9c7bf0217137167a1ed0d4fc1ae4a08",
+      "usage": {
+       "session": "015dd2b7d2e2664cd08bcc10959530c76d",
+       "model": "gpt-5.5",
+       "speedMode": "standard",
+       "apiServiceTier": "default",
+       "surface": "local_interactive_unclassified",
+       "billingSurface": "chatgpt_subscription",
+       "reasoningEffort": "high",
+       "agentScope": "root",
+       "outcome": "completed",
+       "attribution": {
+        "owner": "0214c71dae018249fb89b15dc3d6473e71",
+        "accountBasis": 1,
+        "accountTrack": "0985bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+        "planBasis": 1,
+        "planType": "pro",
+        "planEra": ""
+       },
+       "tokens": [
+        188238,
+        1694,
+        186544,
+        0,
+        5510,
+        3485,
+        null
+       ]
+      },
+      "quota": null,
+      "tools": null,
+      "proof": {
+       "stream": "usage",
+       "occurrence": "070cb0dfb4ee8fea57cd800ba9ab18f8fc0a9f9fcf075d39593feeed7756a7f205",
+       "baseDigest": "6de50179943745b49f1cafca261f89e988ee42ac598135e3316260e3606c7ead",
+       "legacyOccurrence": "070cb0dfb4ee8fea57cd800ba9ab18f8fc0a9f9fcf075d39593feeed7756a7f205",
+       "legacyDigest": "28a8f172ab2f79e3c7d1af6d9488b7b643863da04a02dbcce59e55c435878522",
+       "observedAtMs": 1790798080000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     },
+     {
+      "offset": 19,
+      "format": 11,
+      "stream": "usage",
+      "owner": "0214c71dae018249fb89b15dc3d6473e71",
+      "occurrence": "0761dc22122bc92313a670467b992cf253629579158b6be5b9a18d4e69d9ebc5c3",
+      "observedAtMs": 1790798940000,
+      "observedDay": 20726,
+      "provider": "openai_codex",
+      "canonicalDigest": "d1a8d63cb5cef98277b9c5b39752270962f2839365601a6e848d54d3784aaf17",
+      "usage": {
+       "session": "015dd2b7d2e2664cd08bcc10959530c76d",
+       "model": "gpt-5.6-sol",
+       "speedMode": "standard",
+       "apiServiceTier": "default",
+       "surface": "local_interactive_unclassified",
+       "billingSurface": "chatgpt_subscription",
+       "reasoningEffort": "low",
+       "agentScope": "root",
+       "outcome": "completed",
+       "attribution": {
+        "owner": "0214c71dae018249fb89b15dc3d6473e71",
+        "accountBasis": 1,
+        "accountTrack": "0985bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+        "planBasis": 1,
+        "planType": "pro",
+        "planEra": ""
+       },
+       "tokens": [
+        231029,
+        6803,
+        224226,
+        0,
+        14455,
+        7483,
+        null
+       ]
+      },
+      "quota": null,
+      "tools": null,
+      "proof": {
+       "stream": "usage",
+       "occurrence": "0761dc22122bc92313a670467b992cf253629579158b6be5b9a18d4e69d9ebc5c3",
+       "baseDigest": "efbd40d03e3e62e43bc35639c2d6216b54c12ebbebbf21060536f98981022efa",
+       "legacyOccurrence": "0761dc22122bc92313a670467b992cf253629579158b6be5b9a18d4e69d9ebc5c3",
+       "legacyDigest": "678885ffa22f388478dc3573612f8cc75d1173d8c84175359df8ba16a4e9e72f",
+       "observedAtMs": 1790798940000,
+       "keyedToRecordChunk": true,
+       "keyedToTypedManifest": true
+      }
+     }
+    ]
+   }
+  ]
+ },
+ "bootstrapPredecessor": {
+  "inputRevision": 0,
+  "winnersJson": "[]",
+  "legacyFingerprint": "dfcb0bc64676c29112e64b47f730dc76cab7428b5c42951ee10061d07e009ec2"
+ }
+}

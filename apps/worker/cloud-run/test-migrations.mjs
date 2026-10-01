@@ -26,7 +26,7 @@ export const TEST_MIGRATIONS_TARGETS = Object.freeze({
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle",
     schema: "tibotattle_v12_a2_20260925",
-    expectedMigrations: 59,
+    expectedMigrations: 61,
   }),
   ledger: Object.freeze({
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-ledger-20260922",
@@ -41,49 +41,49 @@ export const GRAPH_BENCHMARK_MIGRATION_TARGETS = Object.freeze([
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle",
     schema: "tibotattle_graph_benchmark_10k_20260925",
-    expectedMigrations: 59,
+    expectedMigrations: 61,
   }),
   Object.freeze({
     name: "100k",
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle",
     schema: "tibotattle_graph_benchmark_100k_20260925",
-    expectedMigrations: 59,
+    expectedMigrations: 61,
   }),
   Object.freeze({
     name: "100k-insights",
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle",
     schema: "tibotattle_graph_benchmark_100k_insights_20260925",
-    expectedMigrations: 59,
+    expectedMigrations: 61,
   }),
   Object.freeze({
     name: "100k-paged",
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle",
     schema: "tibotattle_graph_benchmark_100k_paged_20260925",
-    expectedMigrations: 59,
+    expectedMigrations: 61,
   }),
   Object.freeze({
     name: "100k-readpaged",
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle",
     schema: "tibotattle_graph_benchmark_100k_readpaged_20260925",
-    expectedMigrations: 59,
+    expectedMigrations: 61,
   }),
   Object.freeze({
     name: "100k-readindexed",
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle",
     schema: "tibotattle_graph_benchmark_100k_readindexed_20260925",
-    expectedMigrations: 59,
+    expectedMigrations: 61,
   }),
   Object.freeze({
     name: "100k-batched",
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle",
     schema: "tibotattle_graph_benchmark_100k_batched_20260925",
-    expectedMigrations: 59,
+    expectedMigrations: 61,
   }),
 ]);
 
@@ -717,7 +717,7 @@ async function runConfiguredTestMigrations({ env, dependencies, profile }) {
     ?? readAttachedServiceAccountEmail)({ fetchImpl: dependencies.fetchImpl });
   const config = parseTestMigrationsConfig(env, attachedServiceAccountEmail, profile);
   const migrationRoot = TEST_MIGRATIONS_ROOT;
-  // A2 and the benchmark keep their pinned 59/7 targets; the fastpath profile
+  // A2 and the benchmark keep their pinned target counts; the fastpath profile
   // checks the image manifest against the deploying commit's counts instead.
   const countPolicy = profile === FASTPATH_PROFILE
     ? { expectedCounts: config.expectedCounts,

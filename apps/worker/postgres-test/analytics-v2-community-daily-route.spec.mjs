@@ -10,7 +10,8 @@
 // branches, the cache-retention withholding gate, and the test-clock refusal.
 //
 // Schema: the full promoted primary chain through the production runner,
-// which ends at A-3's 0059_analytics_v2.sql (asserted). 0059 keeps published
+// which carries A-3's 0059_analytics_v2.sql and ends at the promoted tail
+// 0061_legacy_contribution_admission.sql (both asserted). 0059 keeps published
 // heads append-only, so published rows are seeded once and never updated or
 // deleted; scenarios vary only the preview and cache rows.
 //
@@ -30,6 +31,7 @@ import { VENDORED_PACKAGE_ENTRIES, usesVendoredPackages } from "../vitest.analyt
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const A3_MIGRATION = "0059_analytics_v2.sql";
+const PRIMARY_TAIL = "0061_legacy_contribution_admission.sql";
 
 const NOW_MS = Date.parse("2026-10-01T12:00:00.000Z");
 const GENERATED_AT = "2026-10-01T12:00:00.000Z";
@@ -102,8 +104,10 @@ async function createSchema() {
   quotedSchema = `"${schema}"`;
   await pool.query(`CREATE SCHEMA ${quotedSchema}`);
   const applied = await applyPostgresMigrations({ role: "primary", schema, pool });
-  assert.equal(applied.migrations.at(-1)?.name, A3_MIGRATION, "the promoted chain ends at A-3's 0059");
-  ddl = `promoted primary chain through ${A3_MIGRATION}`;
+  assert.equal(applied.migrations.at(-1)?.name, PRIMARY_TAIL, "the promoted chain ends at 0061");
+  assert.equal(applied.migrations.filter(({ name }) => name === A3_MIGRATION).length, 1,
+    "the promoted chain carries A-3's 0059");
+  ddl = `promoted primary chain through ${PRIMARY_TAIL}`;
 }
 
 /** A run id of the column's type, and a parent run row when the schema has a runs table. */

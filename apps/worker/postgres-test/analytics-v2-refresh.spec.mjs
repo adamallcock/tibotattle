@@ -438,7 +438,7 @@ test("contract constants: the Job mirrors the lock key and the build entry", () 
   assert.equal(contract.ANALYTICS_V2_MIGRATION.name, STAGED_FILE);
 });
 
-test("PG17: 0059 applies on the 58 stock primary migrations and creates exactly the contract tables", {
+test("PG17: 0059 applies within the primary migration chain and creates exactly the contract tables", {
   skip: PG_SKIP,
   timeout: 180_000,
 }, async () => {
@@ -446,7 +446,7 @@ test("PG17: 0059 applies on the 58 stock primary migrations and creates exactly 
     const stock = await readPostgresMigrations({ role: "primary" });
     const { schema, applied } = await createSchema();
     const stagedCount = applied.staged.length;
-    assert.equal(stock.length + stagedCount, 59, "58 stock migrations plus the staged 0059");
+    assert.equal(stock.length + stagedCount, 61, "the 61-migration primary chain, 0059 staged or promoted");
     const history = await pool.query(`SELECT count(*)::integer AS n FROM ${quoted(schema, "_tibotattle_migration_history")}`);
     assert.equal(history.rows[0].n, stock.length, "staged SQL is not recorded as a migration receipt");
 

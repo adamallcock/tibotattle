@@ -224,6 +224,43 @@ async function readSchemaReceipt(pool, schema, expected) {
 }
 
 /**
+ * The storage gate every PostgreSQL test route runs before it touches a
+ * pool: both the primary and the ledger migration receipts must equal the
+ * expected manifests, read in a bounded read-only transaction. The returned
+ * assertStorageCurrent() resolves when both are current and otherwise
+ * throws 503 BACKEND_STORAGE_UNAVAILABLE, the refusal the v1.2 dispatch
+ * gives. Route modules composed beside the dispatch (the upload-authorization
+ * route module, the v1.1 intake routes) bind this check so a stale or newer
+ * schema refuses them exactly as it refuses the built-in routes.
+ */
+export function createPostgresTestStorageReceiptCheck({
+  primaryPool,
+  ledgerPool,
+  schemaOptions,
+  expectedMigrations,
+}) {
+  if (primaryPool === null || typeof primaryPool !== "object"
+      || typeof primaryPool.connect !== "function"
+      || ledgerPool === null || typeof ledgerPool !== "object"
+      || typeof ledgerPool.connect !== "function"
+      || primaryPool === ledgerPool) {
+    configurationError("POSTGRES_TEST_POOLS_INVALID");
+  }
+  const schemas = validatedSchemas(schemaOptions);
+  const expected = Object.freeze({
+    primary: validateExpectedMigrations(expectedMigrations?.primary, "primary"),
+    ledger: validateExpectedMigrations(expectedMigrations?.ledger, "ledger"),
+  });
+  return async function assertStorageCurrent() {
+    const [primaryReceipt, ledgerReceipt] = await Promise.all([
+      readSchemaReceipt(primaryPool, schemas.primary, expected.primary),
+      readSchemaReceipt(ledgerPool, schemas.ledger, expected.ledger),
+    ]);
+    if (primaryReceipt !== "current" || ledgerReceipt !== "current") throw storageUnavailable();
+  };
+}
+
+/**
  * Construct a read-only health dispatcher for a private local GCP test host.
  * It deliberately receives pools only: unsupported requests cannot reach the
  * Worker handler or any D1 binding.
@@ -1701,9 +1738,14 @@ function createPostgresTestV12ContributionHandler({
  * bounded body, fatal UTF-8 JSON; the envelope's registered pre-claim check
  * (an unregistered version gets the v1.2-only origin's refusal, before any
  * claim); then the upload-authorization claim, the claimed principal and
- * participant, the device_sync attempt limit, the processing control, the
- * deletion tombstone and the format's transport floor. Only then does the
- * registered handler run. After it returns, the preamble records the receipt
+ * participant, the processing control, the deletion tombstone and the
+ * format's transport floor. Only then does the registered handler run. As in
+ * d43c8f92 handleContribution, no upload draws the device_sync attempt
+ * limiter (RECOVERY, one global 20-per-minute key shared with every sync
+ * read): production meters this route with the upload-ingress limiters and
+ * the per-device chunk windows, and a shipped client reads 429
+ * ATTEMPT_LIMIT_REACHED here as a service failure that stalls its backfill.
+ * After the handler returns, the preamble records the receipt
  * against the response's contributionId (d43c8f92 handleContribution's
  * recordDeviceUploadReceipt), unless the registration owns its receipt.
  * Until the handler marks its persist started, any failure abandons the
@@ -1716,8 +1758,6 @@ async function handlePostgresTestContribution({
   primaryPool,
   ledgerPool,
   schema,
-  admissionEnv,
-  assertAttemptAllowed,
   hasPostgresDeletionTombstone,
   claimPostgresDeviceUploadAuthorization,
   abandonPostgresDeviceUploadAuthorization,
@@ -1781,23 +1821,24 @@ async function handlePostgresTestContribution({
     if (format === null) throw storageUnavailable();
     const envelopeDigest = await sha256Hex(bytes);
     const bodyBytes = bytes.byteLength;
+    // d43c8f92 claims every envelope under the shared v1.1 accountless grant
+    // chain (device-auth.ts claimDeviceUploadAuthorization). v1.2 keeps this
+    // origin's stricter default, which also requires the typed-v1.2 grant;
+    // any other registered envelope is claimed exactly as the Worker claims
+    // it, so a shipped accountless client holding only the v1.1 grant chain
+    // is not refused 401 UPLOAD_AUTH_INVALID.
     claim = await claimPostgresDeviceUploadAuthorization(
       primaryPool,
       request.headers.get("authorization"),
       { envelopeDigest, bodyBytes, contentType },
-      { schema },
+      registration.schemaVersion === TELEMETRY_V12_ENVELOPE_SCHEMA_VERSION
+        ? { schema }
+        : { schema, accountlessAuthorizationVersion: "v1.1" },
     );
     const claimed = await readClaimedContributionPrincipal(
       primaryPool, schema.primarySchema, claim, envelopeDigest, bodyBytes,
     );
     principal = claimed.principal;
-    await assertAttemptAllowed(
-      admissionEnv.RECOVERY_RATE_LIMIT,
-      admissionEnv.CLIENT_ATTEMPT_RATE_LIMIT,
-      request,
-      admissionEnv,
-      "device_sync",
-    );
     await assertPostgresProcessingEnabled(primaryPool, schema.primarySchema);
     if (await hasPostgresDeletionTombstone(
       ledgerPool, principal.participantId, Date.now(), { schema },
@@ -2491,8 +2532,6 @@ export function createPostgresTestV12DayManifestDispatch({
           primaryPool,
           ledgerPool,
           schema,
-          admissionEnv,
-          assertAttemptAllowed,
           hasPostgresDeletionTombstone,
           claimPostgresDeviceUploadAuthorization,
           abandonPostgresDeviceUploadAuthorization,

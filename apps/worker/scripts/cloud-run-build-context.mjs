@@ -36,9 +36,9 @@ const SECRET_PATH_PARTS = new Set([
   "credentials.json",
   "service-account.json",
 ]);
-const EXPECTED_PRIMARY_MIGRATION_COUNT = 59;
+const EXPECTED_PRIMARY_MIGRATION_COUNT = 61;
 const EXPECTED_LEDGER_MIGRATION_COUNT = 7;
-const EXPECTED_PRIMARY_MIGRATION_TAIL = "0059_analytics_v2.sql";
+const EXPECTED_PRIMARY_MIGRATION_TAIL = "0061_legacy_contribution_admission.sql";
 const REQUIRED_LEDGER_DIAGNOSTIC_PATHS = new Set([
   "apps/worker/cloud-run/ledger-reconciliation-diagnostic.mjs",
   "apps/worker/cloud-run/ledger-reconciliation-diagnostic.check.mjs",
@@ -81,6 +81,11 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/origin-route-modules.mjs", destination: "apps/worker/cloud-run/origin-route-modules.mjs" }),
   Object.freeze({ source: "cloud-run/origin-fastpath-mode.mjs", destination: "apps/worker/cloud-run/origin-fastpath-mode.mjs" }),
   Object.freeze({ source: "cloud-run/contribution-envelope-registry.mjs", destination: "apps/worker/cloud-run/contribution-envelope-registry.mjs" }),
+  // The legacy intake the origin composes (IN-2 v1.1, IN-3 v1.0/v0.1).
+  Object.freeze({ source: "cloud-run/origin-intake-composition.mjs", destination: "apps/worker/cloud-run/origin-intake-composition.mjs" }),
+  Object.freeze({ source: "cloud-run/upload-authorization-formats.mjs", destination: "apps/worker/cloud-run/upload-authorization-formats.mjs" }),
+  Object.freeze({ source: "cloud-run/envelopes", destination: "apps/worker/cloud-run/envelopes" }),
+  Object.freeze({ source: "cloud-run/routes", destination: "apps/worker/cloud-run/routes" }),
   Object.freeze({ source: "cloud-run/postgres-migrations.mjs", destination: "apps/worker/cloud-run/postgres-migrations.mjs" }),
   Object.freeze({ source: "cloud-run/cloud-sql.mjs", destination: "apps/worker/cloud-run/cloud-sql.mjs" }),
   Object.freeze({ source: "cloud-run/assets.mjs", destination: "apps/worker/cloud-run/assets.mjs" }),
@@ -242,12 +247,14 @@ const RELATIVE_IMPORT = /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+)["'](\.{1,2}\
  * (statically or through a literal dynamic import) must itself be in the
  * context, or the image build would bundle a module the audited context
  * does not carry. Checked over the included apps/worker/cloud-run and
- * apps/worker/scripts JavaScript modules other than *.check.mjs (repository
- * checks that the image never builds or runs); src/ and vendor/ enter whole.
+ * apps/worker/scripts JavaScript modules, including those in included
+ * subdirectories (cloud-run/envelopes and cloud-run/routes), other than
+ * *.check.mjs (repository checks that the image never builds or runs);
+ * src/ and vendor/ enter whole.
  */
 async function assertImportClosure(files, includedPaths) {
   for (const file of files) {
-    if (!/^apps\/worker\/(?:cloud-run|scripts)\/[^/]+\.mjs$/u.test(file.destination)
+    if (!/^apps\/worker\/(?:cloud-run|scripts)\/(?:[^/]+\/)*[^/]+\.mjs$/u.test(file.destination)
         || file.destination.endsWith(".check.mjs")) continue;
     const text = await readFile(file.source, "utf8");
     for (const match of text.matchAll(RELATIVE_IMPORT)) {

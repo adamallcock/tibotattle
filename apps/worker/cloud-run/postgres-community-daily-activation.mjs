@@ -36,8 +36,8 @@ export const POSTGRES_COMMUNITY_DAILY_ACTIVATION_SOURCE_NAMESPACE =
 export const POSTGRES_COMMUNITY_DAILY_ACTIVATION_TARGET =
   CLOUD_RUN_IAM_TEST_TARGET.postgres.primary;
 
-const EXPECTED_MIGRATION_COUNT = 59;
-const EXPECTED_MIGRATION_TAIL = "0059_analytics_v2.sql";
+const EXPECTED_MIGRATION_COUNT = 61;
+const EXPECTED_MIGRATION_TAIL = "0061_legacy_contribution_admission.sql";
 const METADATA_EMAIL_URL =
   "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email";
 const EXECUTION_PATTERN = /^[a-z][a-z0-9-]{0,62}$/u;

@@ -167,10 +167,12 @@ test("Worker migration receipt source is generated exactly from canonical SQL", 
     '"0057_upload_path_analytics_retirement.sql"',
     '"0058_owner_journal_emitter_head_precheck.sql"',
     '"0059_analytics_v2.sql"',
+    '"0060_telemetry_v11_live_admission.sql"',
+    '"0061_legacy_contribution_admission.sql"',
     '"0007_production_transfer_control.sql"',
   ]) {
     assert.equal(renderPostgresRuntimeSchema(manifest).includes(migration), true);
   }
-  assert.equal(manifest.roles.primary.length, 59);
+  assert.equal(manifest.roles.primary.length, 61);
   assert.equal(manifest.roles.ledger.length, 7);
 });
