@@ -176,15 +176,19 @@ export function telemetryV11DayShape(tables, { participantId, day, ownerOriginal
   };
 }
 
-/** Normalize one D1 dump table ({columns, rows}) to row objects with hex blobs. */
+/** Normalize one D1 dump table ({columns, rows}) to row objects with hex blobs and plain numbers. */
 export function d1DumpRows(table) {
   if (!table || !Array.isArray(table.columns) || !Array.isArray(table.rows)) {
     throw new Error("telemetry-v11-row-shape: invalid dump table");
   }
   return table.rows.map((values) => Object.fromEntries(table.columns.map((column, index) => {
     const value = values[index];
-    return [column, value !== null && typeof value === "object" && typeof value.$blob === "string"
-      ? value.$blob.toLowerCase() : value];
+    if (value !== null && typeof value === "object" && typeof value.$blob === "string") {
+      return [column, value.$blob.toLowerCase()];
+    }
+    // The dump marks a SQLite REAL holding an integral value, e.g. 0.0.
+    if (value !== null && typeof value === "object" && typeof value.$real === "number") return [column, value.$real];
+    return [column, value];
   })));
 }
 

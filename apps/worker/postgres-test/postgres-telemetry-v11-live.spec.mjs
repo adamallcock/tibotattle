@@ -554,6 +554,48 @@ test("PostgreSQL 17 runs a full v1.1 upload cycle with Worker-equal rows, replay
       participantId, day: fixture.day, ownerOriginalHex: fixture.ownerOriginalHex,
     });
     assert.deepEqual(shape, fixture.expected);
+    // The oracle's base digest omits accountPlanAttribution: it equals the
+    // typed canonical digest for session rows only, so 0033's equality could
+    // not admit any production usage or quota proof.
+    for (const chunk of fixture.expected.chunks) {
+      for (const record of chunk.records) {
+        assert.equal(record.proof.baseDigest === record.canonicalDigest, record.stream === "session",
+          `${record.stream} base and canonical digests`);
+      }
+    }
+    // 0060 keeps that equality for session rows. Re-prove one session and one
+    // quota row with a wrong base digest inside a rolled-back transaction.
+    const guardClient = await primaryPool.connect();
+    try {
+      for (const [stream, admitted] of [["session", false], ["quota", true]]) {
+        await guardClient.query("BEGIN");
+        try {
+          const proof = (await guardClient.query(
+            `SELECT p.* FROM ${q(primarySchema, "typed_v11_record_proofs")} p
+              WHERE p.stream_code = $1 ORDER BY p.typed_record_id LIMIT 1`,
+            [stream === "session" ? 3 : 2],
+          )).rows[0];
+          await guardClient.query(
+            `DELETE FROM ${q(primarySchema, "typed_v11_record_proofs")} WHERE typed_record_id = $1`,
+            [proof.typed_record_id],
+          );
+          const reinsert = guardClient.query(
+            `INSERT INTO ${q(primarySchema, "typed_v11_record_proofs")} (
+               typed_record_id, chunk_key, manifest_key, stream_code, occurrence_blob, base_digest,
+               legacy_occurrence_blob, legacy_digest, observed_at_ms
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+            [proof.typed_record_id, proof.chunk_key, proof.manifest_key, proof.stream_code, proof.occurrence_blob,
+              Buffer.alloc(32, 7), proof.legacy_occurrence_blob, proof.legacy_digest, proof.observed_at_ms],
+          );
+          if (admitted) await reinsert;
+          else await assert.rejects(reinsert, { message: "typed_legacy_admission_parent_missing" });
+        } finally {
+          await guardClient.query("ROLLBACK");
+        }
+      }
+    } finally {
+      guardClient.release();
+    }
 
     // -------------------------------------------- predecessor and activate --
     await apiError(await predecessorRoute.handler(deviceRequest(
@@ -701,11 +743,345 @@ test("PostgreSQL 17 runs a full v1.1 upload cycle with Worker-equal rows, replay
     await assert.rejects(primaryPool.query(
       `UPDATE ${q(primarySchema, "telemetry_v11_chunks")} SET chunk_digest = repeat('0', 64) WHERE manifest_id = $1`,
       [candidate.manifestId],
-    ), { message: "telemetry_chunk_immutable" });
+    ), { message: "telemetry_source_immutable" });
   } finally {
     if (primaryCreated) await primaryPool.query(`DROP SCHEMA "${primarySchema}" CASCADE`);
     if (ledgerCreated) await ledgerPool.query(`DROP SCHEMA "${ledgerSchema}" CASCADE`);
     await primaryPool.end();
     await ledgerPool.end();
+  }
+});
+
+// ------------------------------------------------- shared setup (tests 2-3) --
+
+async function openSchemas(label, stagedFiles) {
+  const poolOptions = {
+    host: endpoint.host, port: endpoint.port, user: endpoint.user, database: endpoint.database,
+    password: endpoint.password ?? "synthetic-local-only", ssl: false, max: 6, connectionTimeoutMillis: 5_000,
+  };
+  const primaryPool = new pg.Pool({ ...poolOptions, application_name: `pg-v11-${label}-primary-test` });
+  const ledgerPool = new pg.Pool({ ...poolOptions, application_name: `pg-v11-${label}-ledger-test` });
+  const suffix = randomBytes(5).toString("hex");
+  const schema = Object.freeze({ primarySchema: `v11${label}_${suffix}`, ledgerSchema: `v11${label}_l_${suffix}` });
+  const created = [];
+  const close = async () => {
+    for (const [pool, name] of created.reverse()) await pool.query(`DROP SCHEMA "${name}" CASCADE`);
+    await primaryPool.end();
+    await ledgerPool.end();
+  };
+  try {
+    const server = await primaryPool.query("SELECT current_setting('server_version_num')::integer AS version");
+    assert.equal(Math.floor(server.rows[0].version / 10_000), 17);
+    await primaryPool.query(`CREATE SCHEMA "${schema.primarySchema}"`);
+    created.push([primaryPool, schema.primarySchema]);
+    await ledgerPool.query(`CREATE SCHEMA "${schema.ledgerSchema}"`);
+    created.push([ledgerPool, schema.ledgerSchema]);
+    await applyStockAndStagedMigrations({ role: "primary", schema: schema.primarySchema, pool: primaryPool, stagedFiles });
+    await applyPostgresMigrations({ role: "ledger", schema: schema.ledgerSchema, pool: ledgerPool });
+  } catch (error) {
+    await close();
+    throw error;
+  }
+  return { primaryPool, ledgerPool, schema, close };
+}
+
+async function loadModules() {
+  return {
+    live: await load("/src/postgres-telemetry-v11-live-admission.ts"),
+    bearer: await load("/src/postgres-device-bearer-auth.ts"),
+    transport: await load("/src/postgres-typed-v12-transport.ts"),
+    ledgerAuthority: await load("/src/postgres-ledger-authority.ts"),
+    controls: await load("/src/postgres-collection-controls.ts"),
+    crypto: await load("/src/crypto.ts"),
+    boundedBody: await load("/src/bounded-body.ts"),
+    constants: await load("/src/constants.ts"),
+  };
+}
+
+function envelopeDependencies(modules, keys, overrides = {}) {
+  const { live, transport, crypto, constants } = modules;
+  return {
+    readStorageReplay: live.readPostgresTelemetryV11StorageReplay,
+    persistStagedChunk: live.persistPostgresTypedV11StagedChunk,
+    readUploadOutcome: live.readPostgresTelemetryV11UploadOutcome,
+    recordUploadReceipt: live.recordPostgresTelemetryV11UploadReceipt,
+    registerPendingObject: live.registerPostgresTelemetryV11PendingObject,
+    retirePendingObject: live.retirePostgresTelemetryV11PendingObject,
+    abandonUploadAuthorization: transport.abandonPostgresDeviceUploadAuthorization,
+    validateStagedChunk: live.validatePostgresTelemetryV11StagedChunk,
+    decryptSyntheticEnvelope: crypto.decryptSyntheticEnvelope,
+    sha256Hex: crypto.sha256Hex,
+    socialConsentVersion: constants.TELEMETRY_CONSENT_VERSION,
+    sourceNamespace: SOURCE_NAMESPACE,
+    envelopePublicJwk: keys.publicJwkRaw,
+    envelopePrivateJwk: keys.privateJwkRaw,
+    ...overrides,
+  };
+}
+
+test("an accountless v1.1 owner negotiates successors, matches the Q-1 rows, and uncertain persists resolve exactly", {
+  skip: endpoint === null,
+  timeout: 300_000,
+}, async () => {
+  const ownerB = JSON.parse(await readFile(
+    resolve(WORKER_ROOT, "postgres-test/fixtures/telemetry-v11-live-q1-owner-b-2026-09-30.json"), "utf8",
+  ));
+  assert.equal(ownerB.source.ownerKind, "accountless");
+  const { primaryPool, ledgerPool, schema, close } = await openSchemas("acct", [STAGED]);
+  try {
+    const modules = await loadModules();
+    const { live, bearer, transport, ledgerAuthority, controls, boundedBody, constants } = modules;
+    const { primarySchema } = schema;
+    await primaryPool.query(
+      `UPDATE ${q(primarySchema, "collection_controls")}
+          SET control_state = 'operational', enrollment_enabled = true, upload_registration_enabled = true,
+              processing_enabled = true, publication_enabled = true, revision = revision + 1,
+              updated_at = clock_timestamp()
+        WHERE singleton = 1`,
+    );
+    await primaryPool.query(
+      `UPDATE ${q(primarySchema, "telemetry_transport_formats")} SET lifecycle = 'accepted'
+        WHERE schema_version = 'telemetry-contribution-v1.1'`,
+    );
+    const options = { schema, sourceNamespace: SOURCE_NAMESPACE };
+    await live.initializePostgresTypedV11Admission(primaryPool, options);
+
+    // Owner (b): accountless, holding only the v1.1 lease graph (no v1.2 grant).
+    const nowEpoch = Date.now();
+    const now = new Date(nowEpoch).toISOString();
+    const expiresAt = new Date(nowEpoch + 30 * DAY_MS).toISOString();
+    const participantId = ownerB.participantId;
+    const deviceId = randomUUID();
+    const secret = randomBytes(32).toString("base64url");
+    await primaryPool.query(
+      `INSERT INTO ${q(primarySchema, "participants")} (id, owner_kind, state, consent_version, created_at)
+       VALUES ($1, 'accountless', 'active', NULL, $2)`, [participantId, now],
+    );
+    // The accountless enrollment writer, not a trigger, gives an accountless
+    // participant its attribution enrollment and creation floor (rank 11).
+    await primaryPool.query(
+      `INSERT INTO ${q(primarySchema, "attribution_enrollments")} (participant_id, namespace, created_at)
+       VALUES ($1, $2, $3)`, [participantId, sha256Hex(`v11-live-namespace-${participantId}`), now],
+    );
+    await primaryPool.query(
+      `INSERT INTO ${q(primarySchema, "telemetry_transport_participant_floors")} (
+         participant_id, minimum_rank, revision, changed_at
+       ) VALUES ($1, 11, 0, $2)`, [participantId, now],
+    );
+    await primaryPool.query(
+      `INSERT INTO ${q(primarySchema, "accountless_enrollment_ledger")} (
+         device_id, device_secret_hash, installation_principal_id, schema_version,
+         policy_version, authorization_basis, state, issued_at, expires_at
+       ) VALUES ($1, $2, $3, 'accountless-enrollment-v1', 'accountless-opt-out-v1',
+         'accountless-policy-v1', 'active', $4, $5)`,
+      [deviceId, bearerSecretHash(deviceId, secret), `synthetic-install-${deviceId}`, now, expiresAt],
+    );
+    await primaryPool.query(
+      `INSERT INTO ${q(primarySchema, "device_credentials")} (
+         id, participant_id, authority_kind, accountless_enrollment_device_id,
+         secret_hash, state, issued_at, expires_at, last_used_at
+       ) VALUES ($1, $2, 'accountless', $1, $3, 'active', $4, $5, $4)`,
+      [deviceId, participantId, bearerSecretHash(deviceId, secret), now, expiresAt],
+    );
+    await primaryPool.query(
+      `INSERT INTO ${q(primarySchema, "accountless_upload_owners")} (
+         enrollment_device_id, participant_id, device_credential_id, policy_version,
+         authorization_basis, authorized_at, expires_at, state
+       ) VALUES ($1, $2, $1, 'accountless-opt-out-v1', 'accountless-policy-v1', $3, $4, 'active')`,
+      [deviceId, participantId, now, expiresAt],
+    );
+    await primaryPool.query(
+      `INSERT INTO ${q(primarySchema, "accountless_v11_device_authorizations")} (
+         enrollment_device_id, participant_id, device_credential_id, telemetry_schema_version,
+         field_dictionary_version, privacy_contract_version, authorized_at, expires_at, state
+       ) VALUES ($1, $2, $1, 'telemetry-contribution-v1.1', 'telemetry-v1.1-registry-2026-08-31.1',
+         'ongoing-privacy-safe-telemetry-v1.1', $3, $4, 'active')`,
+      [deviceId, participantId, now, expiresAt],
+    );
+    const deviceAuthorization = `Device um_device_${deviceId}.${secret}`;
+    const principal = Object.freeze({ participantId, deviceId });
+
+    const keys = await envelopeKeys();
+    const objects = new Map();
+    const objectStore = {
+      async put(key, bytes) { objects.set(key, Uint8Array.from(bytes)); },
+      async delete(key) { objects.delete(key); },
+    };
+    const deviceRouteDependencies = {
+      primaryPool, ledgerPool, schema, admissionEnv: {},
+      assertAdmissionBindings() {},
+      async assertAttemptAllowed() {},
+      authenticateDevice: (pool, header, routeOptions) => bearer.authenticatePostgresDeviceBearer(pool, header, routeOptions),
+      hasDeletionTombstone: ledgerAuthority.hasPostgresDeletionTombstone,
+      assertCollectionControl: controls.assertPostgresCollectionControlFromPool,
+      readBoundedRequestBody: boundedBody.readBoundedRequestBody,
+      maxRequestBytes: constants.MAX_REQUEST_BYTES,
+    };
+    const [, manifestPost] = createTelemetryV11DayManifestRouteModules({
+      ...deviceRouteDependencies,
+      registerDayManifest: live.registerPostgresTelemetryV11DayManifest,
+      readDayChunkVector: live.readPostgresTelemetryV11DayChunkVector,
+      readDayCandidates: live.readPostgresTelemetryV11DayCandidates,
+    });
+    const domainDependencies = { ...deviceRouteDependencies, createDomain: live.createPostgresTelemetryV11Domain };
+    const predecessorRoute = createTelemetryV11DomainPredecessorRouteModule(domainDependencies);
+    const activateRoute = createTelemetryV11DomainActivateRouteModule(domainDependencies);
+    const deviceRequest = (path, body) => new Request(`${ORIGIN}${path}`, {
+      method: "POST",
+      headers: { authorization: deviceAuthorization, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    let persistFault = null;
+    const handler = createContributionEnvelopeRegistry([createTelemetryV11ContributionEnvelope(
+      envelopeDependencies(modules, keys, {
+        async persistStagedChunk(...args) {
+          if (persistFault === "before") throw Object.assign(new Error("connection reset"), { code: "ECONNRESET" });
+          const result = await live.persistPostgresTypedV11StagedChunk(...args);
+          if (persistFault === "after") throw Object.assign(new Error("commit acknowledgement lost"), { code: "ECONNRESET" });
+          return result;
+        },
+      }),
+    )]).resolve("telemetry-envelope-v1.1");
+
+    // The contributions preamble claims through claimPostgresDeviceUploadAuthorization,
+    // which requires an accountless v1.2 grant (hand-off: v1.1 needs the v1.1
+    // lease graph, as the Worker's claimDeviceUploadAuthorization). The test
+    // writes the claimed state that preamble would produce.
+    async function claimFor(raw) {
+      const authorizationId = randomUUID();
+      const uploadSecret = randomBytes(32).toString("base64url");
+      const bodyBytes = new TextEncoder().encode(raw).byteLength;
+      const envelopeDigest = sha256Hex(raw);
+      await primaryPool.query(
+        `INSERT INTO ${q(primarySchema, "device_upload_authorizations")} (
+           id, participant_id, issued_by_device_id, secret_hash, envelope_digest,
+           body_bytes, content_type, state, issued_at, expires_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, 'application/json', 'unused', $7, $8)`,
+        [authorizationId, participantId, deviceId, uploadSecretHash(authorizationId, uploadSecret), envelopeDigest,
+          bodyBytes, new Date(Date.now() - 1_000).toISOString(), new Date(Date.now() + 5 * 60_000).toISOString()],
+      );
+      await assert.rejects(transport.claimPostgresDeviceUploadAuthorization(primaryPool,
+        `Upload um_device_upload_${authorizationId}.${uploadSecret}`,
+        { envelopeDigest, bodyBytes, contentType: "application/json" }, { schema }),
+      { code: "UPLOAD_AUTH_INVALID" });
+      await primaryPool.query(
+        `UPDATE ${q(primarySchema, "device_upload_authorizations")}
+            SET state = 'consuming', consume_lease_expires_at = $2 WHERE id = $1 AND state = 'unused'`,
+        [authorizationId, new Date(Date.now() + 60_000).toISOString()],
+      );
+      return { claimed: { authorizationId, participantId, authorizationKind: "device" }, envelopeDigest, authorizationId };
+    }
+    const participantRow = { id: participantId, consentVersion: null, ownerKind: "accountless" };
+    async function contribute(chunk) {
+      const raw = JSON.stringify(await encryptV11Envelope(chunk, keys.publicJwk));
+      const { claimed, envelopeDigest, authorizationId } = await claimFor(raw);
+      let persistStarted = false;
+      try {
+        const response = await handler({ raw, value: JSON.parse(raw) }, participantRow, deviceId, claimed, {
+          raw, envelopeDigest, primaryPool, schema, objectStore, markPersistStarted() { persistStarted = true; },
+        });
+        return { response, authorizationId, persistStarted };
+      } catch (error) {
+        if (!persistStarted) await transport.abandonPostgresDeviceUploadAuthorization(primaryPool, claimed, principal, { schema });
+        return { error, authorizationId, persistStarted };
+      }
+    }
+    const grant = async (authorizationId) => (await primaryPool.query(
+      `SELECT state, consumed_contribution_id FROM ${q(primarySchema, "device_upload_authorizations")} WHERE id = $1`,
+      [authorizationId],
+    )).rows[0];
+
+    // An accountless participant holds no social consent version.
+    const prepared = makeV11Day(ownerB.day, ownerB.records, ownerB.parserVersion);
+    assert.equal(prepared.manifest.manifestDigest, ownerB.expected.manifest.manifestDigest);
+    const candidate = await (await manifestPost.handler(deviceRequest(
+      "/api/v1/device/telemetry/v1.1/day-manifests", prepared.manifest,
+    ))).json();
+    assert.equal(candidate.state, "staged", JSON.stringify(candidate));
+
+    // Uncertain persist, absent: nothing committed. The claim is abandoned,
+    // this attempt's object and journal row are retired, the answer is 503.
+    persistFault = "before";
+    const absent = await contribute(prepared.chunks[0]);
+    assert.equal(absent.persistStarted, true);
+    assert.deepEqual({ status: absent.error?.status, code: absent.error?.code }, { status: 503, code: "BACKEND_STORAGE_UNAVAILABLE" });
+    assert.equal((await grant(absent.authorizationId)).state, "revoked");
+    assert.equal(objects.size, 0, "the never-referenced object was retired");
+    assert.equal((await primaryPool.query(
+      `SELECT count(*)::int AS n FROM ${q(primarySchema, "pending_objects")}`,
+    )).rows[0].n, 0);
+
+    // Uncertain persist, committed: the readback proves this attempt's own
+    // row, so the answer is the original (not replayed) receipt.
+    persistFault = "after";
+    const committed = await contribute(prepared.chunks[0]);
+    assert.equal(committed.response?.status, 202, committed.error?.code);
+    const committedBody = await committed.response.json();
+    assert.equal(committedBody.replayed, false);
+    assert.deepEqual(await grant(committed.authorizationId), {
+      state: "consumed", consumed_contribution_id: committedBody.contributionId,
+    });
+    persistFault = null;
+    for (const chunk of prepared.chunks.slice(1)) {
+      const uploaded = await contribute(chunk);
+      assert.equal(uploaded.response?.status, 202, uploaded.error?.code);
+    }
+    const replay = await contribute(prepared.chunks[1]);
+    assert.equal(replay.response.headers.get("idempotency-replayed"), "true");
+    assert.equal(objects.size, prepared.chunks.length);
+
+    const shape = telemetryV11DayShape(await shapeTables(primaryPool, primarySchema), {
+      participantId, day: ownerB.day, ownerOriginalHex: ownerB.ownerOriginalHex,
+    });
+    assert.deepEqual(shape, ownerB.expected);
+
+    // negotiateSuccessors: bootstrap predecessor, activation, then a
+    // successor over an unchanged vector is acknowledged without a write.
+    const predecessor = await (await predecessorRoute.handler(deviceRequest(
+      "/api/v1/me/telemetry-v11/domain-predecessor", {},
+    ))).json();
+    assert.equal(predecessor.previousGenerationId, null);
+    const today = new Date().toISOString().slice(0, 10);
+    const days = [{ day: ownerB.day, manifestId: candidate.manifestId, manifestDigest: candidate.manifestDigest }];
+    for (const day of utcDays(ownerB.day, today).slice(1)) {
+      const empty = await (await manifestPost.handler(deviceRequest(
+        "/api/v1/device/telemetry/v1.1/day-manifests", makeV11Day(day, {}, ownerB.parserVersion).manifest,
+      ))).json();
+      days.push({ day, manifestId: empty.manifestId, manifestDigest: empty.manifestDigest });
+    }
+    const activated = await activateRoute.handler(deviceRequest(
+      "/api/v1/me/telemetry-v11/domain-activate", domainManifest(predecessor, days),
+    ));
+    assert.equal(activated.status, 201);
+    const generation = await activated.json();
+    assert.equal(generation.replay, false);
+    const successor = await (await predecessorRoute.handler(deviceRequest(
+      "/api/v1/me/telemetry-v11/domain-predecessor", {},
+    ))).json();
+    assert.equal(successor.previousGenerationId, generation.generationId);
+    const acknowledged = await (await activateRoute.handler(deviceRequest(
+      "/api/v1/me/telemetry-v11/domain-activate", domainManifest(successor, days),
+    ))).json();
+    assert.deepEqual({ unchanged: acknowledged.unchanged, replay: acknowledged.replay, generationId: acknowledged.generationId },
+      { unchanged: true, replay: true, generationId: generation.generationId });
+
+    // A revoked v1.1 grant stops future uploads and domain changes (the
+    // bearer's accountless lease graph no longer holds, so 401 as the Worker
+    // answers); it does not withdraw what was admitted.
+    await primaryPool.query(
+      `UPDATE ${q(primarySchema, "accountless_v11_device_authorizations")}
+          SET state = 'revoked', revoked_at = clock_timestamp(), revocation_reason = 'user_opt_out'
+        WHERE participant_id = $1`, [participantId],
+    );
+    await apiError(await predecessorRoute.handler(deviceRequest(
+      "/api/v1/me/telemetry-v11/domain-predecessor", {},
+    )), 401, "DEVICE_AUTH_INVALID");
+    assert.equal((await primaryPool.query(
+      `SELECT count(*)::int AS n FROM ${q(primarySchema, "telemetry_v11_domain_heads")} WHERE participant_id = $1`,
+      [participantId],
+    )).rows[0].n, 1);
+  } finally {
+    await close();
   }
 });

@@ -19,7 +19,7 @@ import { d1DumpRows, telemetryV11DayShape, TELEMETRY_V11_SHAPE_TABLES } from "./
 const PARSER_VERSION = "synthetic-gcp-oracle-v11";
 
 function typedIdHex(value) {
-  // encodeTypedTelemetryId for the 'participant:' UUID form (prefix byte 2).
+  // encodeTypedTelemetryId for the "participant:" UUID form (prefix byte 2).
   const match = /^participant:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/u.exec(value);
   if (!match) throw new Error("participant id is not the participant UUID form");
   return "02" + match[1].replaceAll("-", "");

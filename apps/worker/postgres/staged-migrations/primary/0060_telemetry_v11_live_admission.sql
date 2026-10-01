@@ -9,23 +9,16 @@
 -- manifest, then one chunk at a time, then flips the manifest to ready, which
 -- is the order D1's typed-v1.1 admission uses (typed-v11-admission 0001,
 -- 0004, 0006). This file adapts the import-shaped guards to that order and
--- ports the D1 live guards the import never needed:
+-- ports the D1 live guards the import never needed. 0014's published-row
+-- guard (telemetry_published_source_row_immutable) already serves the v1.1
+-- header tables and is unchanged:
 --
---   (1) 0014's telemetry_published_source_row_immutable() was written for
---       v1.2: on a telemetry_v11_day_manifests UPDATE it reads OLD.manifest_id,
---       a column v1.1 manifests do not have, so every staged-to-ready flip
---       raises; and it checks v1.1 rows against v1.2 domain days. The three
---       v1.1 header tables get their own guard, ported from D1 0058's
---       telemetry_v11_manifest_immutable / telemetry_v11_chunk_immutable /
---       telemetry_v11_record_immutable plus the 0014 delete rule (no delete
---       of a row whose manifest an active owner's generation published).
---       The shared function keeps serving the v1.2 tables unchanged.
+--   (1) typed_v11_record_admissions, D1 0006's view over the compact proofs,
+--       so admission and activation read the same relation D1 reads.
 --   (2) The staged-to-ready flip is admitted only when the manifest is
 --       complete through typed proofs (D1 typed-v11 0001
 --       telemetry_v11_manifest_ready).
---   (3) typed_v11_record_admissions, D1 0006's view over the compact proofs,
---       so admission and activation read the same relation D1 reads.
---   (4) 0033's proof guard required a ready manifest: an import proves rows
+--   (3) 0033's proof guard required a ready manifest: an import proves rows
 --       of complete days only. A live chunk is proven while its manifest is
 --       still staged, so the guard also admits a staged manifest whose chunk
 --       is not yet fully proven (D1 0006 typed_v11_record_membership: state
@@ -34,12 +27,12 @@
 --       usage or quota proof D1 writes can satisfy (see the predicate); that
 --       equality now binds session rows only. Every other lineage predicate
 --       is unchanged. OWNER/LEAD REVIEW: this corrects an import guard too.
---   (5) The admission state allocator only moves forward by exactly one
+--   (4) The admission state allocator only moves forward by exactly one
 --       committed allocation, and the runtime contract only qualifies 0 -> 1
 --       (D1 typed-v11 0001 typed_v11_state_immutable, 0004
 --       typed_v11_runtime_contract_qualify, without the D1-only migration
 --       inventory).
---   (6) Once the typed runtime contract is qualified, a raw JSON v1.1 record
+--   (5) Once the typed runtime contract is qualified, a raw JSON v1.1 record
 --       is refused (D1 typed-v11 0001 typed_v11_legacy_record_refusal).
 --
 -- Not here (documented gaps, IN-2 continuation): the v1.1 owner bridge
@@ -52,86 +45,7 @@
 -- Every RAISE carries a constant message and ERRCODE; no value is
 -- interpolated. Nothing here deletes, rewrites or backfills a row.
 
--- (1) v1.1 header immutability.
-CREATE FUNCTION telemetry_v11_source_row_immutable()
-RETURNS trigger
-LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
-DECLARE
-  target_manifest_id text;
-BEGIN
-  IF TG_OP = 'UPDATE' THEN
-    IF TG_TABLE_NAME = 'telemetry_v11_day_manifests' THEN
-      IF NEW.id IS DISTINCT FROM OLD.id
-         OR NEW.participant_id IS DISTINCT FROM OLD.participant_id
-         OR NEW.device_id IS DISTINCT FROM OLD.device_id
-         OR NEW.chunk_day IS DISTINCT FROM OLD.chunk_day
-         OR NEW.manifest_digest IS DISTINCT FROM OLD.manifest_digest
-         OR NEW.parser_version IS DISTINCT FROM OLD.parser_version
-         OR NEW.manifest_json IS DISTINCT FROM OLD.manifest_json
-         OR NEW.expected_chunk_count IS DISTINCT FROM OLD.expected_chunk_count
-         OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
-        RAISE EXCEPTION 'telemetry_manifest_immutable' USING ERRCODE = 'P1005';
-      END IF;
-      RETURN NEW;
-    ELSIF TG_TABLE_NAME = 'telemetry_v11_chunks' THEN
-      -- quarantine_deleted_at is the one retention-owned mutable column.
-      IF NEW.id IS DISTINCT FROM OLD.id
-         OR NEW.manifest_id IS DISTINCT FROM OLD.manifest_id
-         OR NEW.participant_id IS DISTINCT FROM OLD.participant_id
-         OR NEW.device_id IS DISTINCT FROM OLD.device_id
-         OR NEW.stream IS DISTINCT FROM OLD.stream
-         OR NEW.chunk_day IS DISTINCT FROM OLD.chunk_day
-         OR NEW.chunk_seq IS DISTINCT FROM OLD.chunk_seq
-         OR NEW.chunk_id IS DISTINCT FROM OLD.chunk_id
-         OR NEW.chunk_digest IS DISTINCT FROM OLD.chunk_digest
-         OR NEW.envelope_digest IS DISTINCT FROM OLD.envelope_digest
-         OR NEW.parser_version IS DISTINCT FROM OLD.parser_version
-         OR NEW.record_count IS DISTINCT FROM OLD.record_count
-         OR NEW.r2_key IS DISTINCT FROM OLD.r2_key
-         OR NEW.device_upload_authorization_id IS DISTINCT FROM OLD.device_upload_authorization_id
-         OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
-        RAISE EXCEPTION 'telemetry_chunk_immutable' USING ERRCODE = 'P1005';
-      END IF;
-      RETURN NEW;
-    END IF;
-    RAISE EXCEPTION 'telemetry_record_immutable' USING ERRCODE = 'P1005';
-  END IF;
-  -- DELETE: a row whose manifest an active owner's generation published is
-  -- retained (0014's rule, now read from the v1.1 domain tables).
-  -- Separate branches: one CASE expression would resolve OLD.manifest_id
-  -- against a manifest row too, the very fault (1) removes.
-  IF TG_TABLE_NAME = 'telemetry_v11_day_manifests' THEN
-    target_manifest_id := OLD.id;
-  ELSE
-    target_manifest_id := OLD.manifest_id;
-  END IF;
-  IF EXISTS (
-    SELECT 1 FROM telemetry_v11_domain_days day_row
-      JOIN telemetry_v11_domains domain ON domain.id = day_row.generation_id
-      JOIN participants participant
-        ON participant.id = domain.participant_id AND participant.state = 'active'
-     WHERE day_row.manifest_id = target_manifest_id
-  ) THEN
-    RAISE EXCEPTION 'telemetry_source_immutable' USING ERRCODE = 'P1005';
-  END IF;
-  RETURN OLD;
-END;
-$$;
-
-DROP TRIGGER telemetry_v11_manifest_immutable_guard ON telemetry_v11_day_manifests;
-CREATE TRIGGER telemetry_v11_manifest_immutable_guard
-  BEFORE UPDATE OR DELETE ON telemetry_v11_day_manifests
-  FOR EACH ROW EXECUTE FUNCTION telemetry_v11_source_row_immutable();
-DROP TRIGGER telemetry_v11_chunk_immutable_guard ON telemetry_v11_chunks;
-CREATE TRIGGER telemetry_v11_chunk_immutable_guard
-  BEFORE UPDATE OR DELETE ON telemetry_v11_chunks
-  FOR EACH ROW EXECUTE FUNCTION telemetry_v11_source_row_immutable();
-DROP TRIGGER telemetry_v11_record_immutable_guard ON telemetry_v11_records;
-CREATE TRIGGER telemetry_v11_record_immutable_guard
-  BEFORE UPDATE OR DELETE ON telemetry_v11_records
-  FOR EACH ROW EXECUTE FUNCTION telemetry_v11_source_row_immutable();
-
--- (3) D1 typed-v11 0006 typed_v11_record_admissions.
+-- (1) D1 typed-v11 0006 typed_v11_record_admissions.
 CREATE VIEW typed_v11_record_admissions AS
 SELECT proof.typed_record_id,
        allocation.chunk_id,
@@ -176,7 +90,7 @@ CREATE TRIGGER telemetry_v11_manifest_ready_guard
   BEFORE UPDATE OF state ON telemetry_v11_day_manifests
   FOR EACH ROW EXECUTE FUNCTION telemetry_v11_manifest_ready_guard();
 
--- (4) 0033's proof guard, admitting a live staged manifest. Only the
+-- (3) 0033's proof guard, admitting a live staged manifest. Only the
 -- manifest-state predicate changes; every lineage predicate is 0033's.
 CREATE OR REPLACE FUNCTION typed_legacy_v11_record_proof_guard()
 RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
@@ -255,7 +169,7 @@ BEGIN
 END;
 $$;
 
--- (5) D1 typed-v11 0001 typed_v11_state_immutable and 0004
+-- (4) D1 typed-v11 0001 typed_v11_state_immutable and 0004
 -- typed_v11_runtime_contract_qualify (without D1's migration inventory).
 CREATE FUNCTION typed_v11_admission_state_guard()
 RETURNS trigger
@@ -285,7 +199,7 @@ CREATE TRIGGER typed_v11_admission_state_guard
   BEFORE UPDATE ON typed_v11_admission_state
   FOR EACH ROW EXECUTE FUNCTION typed_v11_admission_state_guard();
 
--- (6) D1 typed-v11 0001 typed_v11_legacy_record_refusal, once qualified.
+-- (5) D1 typed-v11 0001 typed_v11_legacy_record_refusal, once qualified.
 CREATE FUNCTION telemetry_v11_typed_json_refusal()
 RETURNS trigger
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
