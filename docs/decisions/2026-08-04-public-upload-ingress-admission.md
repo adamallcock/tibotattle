@@ -7,6 +7,13 @@ status: complete
 
 # Public upload ingress admission decision
 
+> **Proposed gcp-mode supersession.** The proposed
+> [thin Worker edge proxy decision](./2026-10-01-thin-worker-edge-proxy.md#14-relationship-to-accepted-decisions)
+> would replace this record's rate-limit carrier and ingress tiering (layers 3
+> to 5) in gcp mode only, from an owner-authorized cutover. This record stays
+> authoritative for the current service and for the worker and fenced edge
+> modes.
+
 ## Decision
 
 The public contribution path uses layered admission rather than treating the
