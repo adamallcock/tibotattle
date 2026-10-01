@@ -6,17 +6,23 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import pg from "pg";
+import { gcpFastpathCloudTargetRefusal } from "../scripts/gcp-fastpath-cloud-target.mjs";
 import {
   createSealedSqliteIngestionJournalSource,
   transferPostgresIngestionJournal,
 } from "../scripts/postgres-ingestion-journal-transfer.mjs";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
+import { localFastpathTcpHost, withLocalFastpathCloudDatabase } from "./fixtures/fastpath-cloud-database.mjs";
 
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
 const PG_TEST_PORT = Number(process.env.PG_TEST_PORT ?? "55432");
 const PG_TEST_USER = process.env.PG_TEST_USER || "postgres";
 const PG_TEST_PASSWORD = process.env.PG_TEST_PASSWORD || "synthetic-local-only";
 const PG_TEST_DATABASE = process.env.PG_TEST_DATABASE || "postgres";
+// Loopback TCP to the same cluster (inet_server_addr() is not NULL there), for
+// the GCP fast-path cloud-target exception; the shared socket-only cluster
+// leaves it unset.
+const PG_TEST_TCP_HOST = localFastpathTcpHost();
 const SOURCE_ID = "synthetic-ingestion-journal-source";
 
 function digest(n) { return BigInt(n).toString(16).padStart(64, "0"); }
@@ -187,3 +193,103 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL 17 sealed ingestion journal transfe
     }
   }, 120_000);
 });
+
+describe.skipIf(!PG_TEST_SOCKET || !PG_TEST_TCP_HOST)(
+  "PostgreSQL 17 ingestion journal transfer into the GCP fast-path cloud target (local TCP stand-in)", () => {
+    it("admits a non-local session only with cloudFastpathTarget, in tibotattle_fastpath, for a fast-path target, "
+      + "without a superuser; everything else keeps the local-socket refusal", async () => {
+      const socket = await localSocket();
+      const admin = { ...socket, user: PG_TEST_USER, password: PG_TEST_PASSWORD, database: PG_TEST_DATABASE, ssl: false };
+      let fixture;
+      try {
+        fixture = await makeSealedSource();
+        await withLocalFastpathCloudDatabase({ admin, tcpHost: PG_TEST_TCP_HOST, port: PG_TEST_PORT },
+          async ({ database, roles, tcpPool }) => {
+            expect(database).toBe("tibotattle_fastpath");
+            const migrator = tcpPool({ user: roles.migrator, max: 2 });
+            const superuser = tcpPool({ user: PG_TEST_USER, max: 2 });
+            const elsewhere = tcpPool({ user: roles.migrator, database: PG_TEST_DATABASE, max: 2 });
+            const session = await migrator.query(`SELECT inet_server_addr() IS NOT NULL AS tcp,
+                current_database()::text AS db, rolsuper, rolcreaterole
+              FROM pg_catalog.pg_roles WHERE rolname = session_user`);
+            expect(session.rows[0]).toEqual({ tcp: true, db: "tibotattle_fastpath", rolsuper: false, rolcreaterole: true });
+
+            const schema = `typed_legacy_transfer_rehearsal_target_fastpath_${randomBytes(4).toString("hex")}`;
+            await migrator.query(`CREATE SCHEMA "${schema}"`);
+            const migration = await applyPostgresMigrations({ role: "primary", schema, pool: migrator });
+            expect(migration.applied).toBe(62);
+            const table = name => `"${schema}"."${name}"`;
+            const transferId = "synthetic-ingestion-journal-cloud-fastpath";
+            const attempt = (pool, options = {}) => transferPostgresIngestionJournal({ source: fixture.source,
+              destinationPool: pool, targetSchema: schema, transferId, pageSize: 2, ...options });
+            const refusal = async (pool, target = schema) => {
+              const client = await pool.connect();
+              try { return await gcpFastpathCloudTargetRefusal(client, target); } finally { client.release(); }
+            };
+
+            // (a) The cloud-shaped session without the option keeps the original refusal.
+            await expect(attempt(migrator)).rejects.toMatchObject({ code: "INGESTION_JOURNAL_LOCAL_POSTGRES_17_REQUIRED" });
+            await expect(attempt(migrator, { cloudFastpathTarget: "true" }))
+              .rejects.toMatchObject({ code: "INGESTION_JOURNAL_LOCAL_POSTGRES_17_REQUIRED" });
+            // (b) The option in any other database is refused.
+            expect(await refusal(elsewhere)).toBe("database");
+            await expect(attempt(elsewhere, { cloudFastpathTarget: true }))
+              .rejects.toMatchObject({ code: "INGESTION_JOURNAL_LOCAL_POSTGRES_17_REQUIRED" });
+            // (d) A superuser is never the cloud target, even with the option.
+            expect(await refusal(superuser)).toBe("superuser");
+            await expect(attempt(superuser, { cloudFastpathTarget: true }))
+              .rejects.toMatchObject({ code: "INGESTION_JOURNAL_LOCAL_POSTGRES_17_REQUIRED" });
+            // The journal's own disposable prefix is not a cloud target, and the
+            // disposable-schema guard still refuses a non-rehearsal schema first.
+            const ownPrefix = `storage_journal_transfer_target_${randomBytes(4).toString("hex")}`;
+            expect(await refusal(migrator, ownPrefix)).toBe("schema");
+            await expect(transferPostgresIngestionJournal({ source: fixture.source, destinationPool: migrator,
+              targetSchema: ownPrefix, transferId, pageSize: 2, cloudFastpathTarget: true }))
+              .rejects.toMatchObject({ code: "INGESTION_JOURNAL_LOCAL_POSTGRES_17_REQUIRED" });
+            await expect(transferPostgresIngestionJournal({ source: fixture.source, destinationPool: migrator,
+              targetSchema: "public", transferId, pageSize: 2, cloudFastpathTarget: true }))
+              .rejects.toMatchObject({ code: "INGESTION_JOURNAL_DISPOSABLE_SCHEMA_REQUIRED" });
+            // Every refusal came before a write.
+            const untouched = await migrator.query(`SELECT to_regclass($1) IS NULL AS no_runs,
+                (SELECT count(*)::int FROM ${table("storage_ingestion_changes")}) AS journal,
+                (SELECT count(*)::int FROM ${table("storage_source_state")}) AS states`,
+            [`"${schema}"."_storage_ingestion_journal_transfer_runs_v1"`]);
+            expect(untouched.rows[0]).toEqual({ no_runs: true, journal: 0, states: 0 });
+
+            // (c) The option, tibotattle_fastpath, the fast-path prefix and a
+            // non-superuser: the whole journal imports and replays as complete.
+            expect(await refusal(migrator)).toBeNull();
+            const result = await attempt(migrator, { cloudFastpathTarget: true });
+            expect(result).toMatchObject({
+              status: "synthetic_storage_ingestion_journal_transfer_complete",
+              targetSchema: schema,
+              sourceSnapshotSha256: fixture.expectedSha256,
+              eventRows: "6",
+              targetRows: "6",
+              postgresMajor: 17,
+              pagesCommitted: 3,
+              rowsInserted: "6",
+              resumed: false,
+              analyticsCursorAdvanced: false,
+              ownerStateWritten: false,
+              appliedReceiptsWritten: false,
+            });
+            expect(result.eventRowsSha256).toBe(result.targetRowsSha256);
+            const imported = await migrator.query(`SELECT count(*)::int AS rows, max(sequence)::text AS last_sequence
+              FROM ${table("storage_ingestion_changes")}`);
+            expect(imported.rows[0]).toEqual({ rows: 6, last_sequence: "6" });
+            const replay = await attempt(migrator, { cloudFastpathTarget: true });
+            expect(replay.status).toBe("already_complete");
+            expect(replay.eventRowsSha256).toBe(result.targetRowsSha256);
+            // The superuser is still refused after the import, and wrote nothing.
+            await expect(attempt(superuser, { cloudFastpathTarget: true }))
+              .rejects.toMatchObject({ code: "INGESTION_JOURNAL_LOCAL_POSTGRES_17_REQUIRED" });
+            expect((await migrator.query(`SELECT count(*)::int AS rows FROM ${table("storage_ingestion_changes")}`))
+              .rows[0]?.rows).toBe(6);
+          });
+      } finally {
+        fixture?.source.close();
+        if (fixture) await rm(fixture.directory, { recursive: true, force: true });
+      }
+    }, 180_000);
+  });

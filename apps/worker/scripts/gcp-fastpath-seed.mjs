@@ -20,6 +20,11 @@
  * but is not a superuser (a cloudsqlsuperuser member with CREATEDB and
  * CREATEROLE): no stage needs superuser privileges, and, like the local
  * superuser rehearsal, it is never an ingestion-journal transfer session.
+ * Its connector session is TCP, not the local Unix socket the
+ * ingestion-journal importer otherwise requires, so the seed alone passes
+ * `cloudFastpathTarget: true`, accepted only in tibotattle_fastpath, for a
+ * fast-path target schema, on PostgreSQL 17 and without a superuser
+ * (scripts/gcp-fastpath-cloud-target.mjs).
  *
  *   node scripts/gcp-fastpath-seed.mjs seed --target=gcp-fastpath --commit=<ref>
  *        [--golden=<dir>] [--schema-suffix=<8 hex>] [--replace]
@@ -57,6 +62,11 @@ export const GCP_FASTPATH_SEED = Object.freeze({
     "apps/worker/postgres/migrations",
     "apps/worker/cloud-run/postgres-migrations.mjs",
     "apps/worker/scripts/postgres-migrations.mjs",
+  ]),
+  // Not a stage, but it decides whether the ingestion-journal stage accepts
+  // the cloud target, so it too must equal the deployed commit's.
+  supportPaths: Object.freeze([
+    "apps/worker/scripts/gcp-fastpath-cloud-target.mjs",
   ]),
 });
 
@@ -147,7 +157,7 @@ export function planSeed(commit, { spawn = spawnSync, golden = GCP_FASTPATH_SEED
     return { ...stage, status: checkoutMatches(commit, [stage.path], spawn) ? "present" : "checkout-mismatch" };
   });
   const goldenInCommit = git(["cat-file", "-e", `${commit}:${goldenDirectory}/manifest.json`], spawn).status === 0;
-  const dataPaths = [...GCP_FASTPATH_SEED.migrationPaths, goldenDirectory];
+  const dataPaths = [...GCP_FASTPATH_SEED.migrationPaths, ...GCP_FASTPATH_SEED.supportPaths, goldenDirectory];
   const dataMatch = checkoutMatches(commit, dataPaths, spawn);
   const missing = stages.filter((stage) => stage.status === "absent");
   const mismatched = stages.filter((stage) => stage.status === "checkout-mismatch");
@@ -342,9 +352,13 @@ export async function runGcpFastpathSeed({
     } else {
       workDirectory = await realpath(await mkdtemp(join(tmpdir(), "gcp-fastpath-seed-")));
       const sealed = await loader.sealFastpathRehearsalSource({ dumpPath, workDirectory });
+      // The Cloud SQL connector session is not a local Unix socket: the seed,
+      // and only the seed, names its fast-path cloud target to the importers
+      // (scripts/gcp-fastpath-cloud-target.mjs holds the exact conditions).
       steps = { sqlite: sealed.report, ...await loader.loadFastpathRehearsalImporters({
         pool: migrator.pool, schema: schemas.target, controlSchema: schemas.control, suffix,
         sealedSource: sealed.sealedSource, dumpPath, workDirectory, roster: manifest.owners, timings,
+        cloudFastpathTarget: true,
       }) };
       if (!verificationsEqual(steps.importVerification)) {
         fail("GCP_FASTPATH_SEED_VERIFICATION_FAILED", JSON.stringify(steps.importVerification));

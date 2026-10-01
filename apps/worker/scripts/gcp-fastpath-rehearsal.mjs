@@ -289,10 +289,15 @@ export async function sealFastpathRehearsalSource({ dumpPath, workDirectory }) {
  * this, so refresh and origin read the same imported data in either place.
  * `pool` is any pg-compatible pool that may write `schema` and
  * `controlSchema`; `timings` collects per-importer wall times. Every source
- * it opens is closed before it returns.
+ * it opens is closed before it returns. Only the GCP seed passes
+ * `cloudFastpathTarget: true`, which the ingestion-journal importer accepts
+ * in place of a local Unix-socket session solely for the fast-path Cloud SQL
+ * target (scripts/gcp-fastpath-cloud-target.mjs); the local rehearsal never
+ * passes it.
  */
 export async function loadFastpathRehearsalImporters({
   pool, schema, controlSchema, suffix, sealedSource, dumpPath, workDirectory, roster, timings = {},
+  cloudFastpathTarget = false,
 }) {
   if (typeof schema !== "string" || !schema.startsWith(POSTGRES_FASTPATH_REHEARSAL_TARGET_SCHEMA_PREFIX)) {
     fail("REHEARSAL_TARGET_SCHEMA_INVALID");
@@ -384,6 +389,7 @@ export async function loadFastpathRehearsalImporters({
       const receipt = await transferPostgresIngestionJournal({
         source: journalSource, destinationPool: pool, targetSchema: schema,
         transferId: `synthetic-ingestion-journal-fastpath-${suffix}`,
+        cloudFastpathTarget: cloudFastpathTarget === true,
       });
       return { status: receipt.status, rows: receipt.rowCount ?? receipt.rows ?? null,
         lastSequence: receipt.lastSequence ?? null };

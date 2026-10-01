@@ -4,6 +4,7 @@ import { lstat, open, realpath } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { POSTGRES_MIGRATION_ROOT, readPostgresMigrations } from "./postgres-migrations.mjs";
+import { gcpFastpathCloudTargetRefusal } from "./gcp-fastpath-cloud-target.mjs";
 import { POSTGRES_FASTPATH_REHEARSAL_TARGET_SCHEMA_PREFIX } from "./postgres-typed-legacy-transfer.mjs";
 
 export const POSTGRES_INGESTION_JOURNAL_TRANSFER_SCHEMA = "sealed-d1-ingestion-journal-to-postgres-v1";
@@ -462,7 +463,11 @@ function relation(schema, name) {
   return `${quoteSchema(schema)}."${name}"`;
 }
 
-async function validateTarget(client, schema) {
+// A local PostgreSQL 17 over its Unix socket, or, only when the GCP
+// fast-path seed passes cloudFastpathTarget, its Cloud SQL target
+// (scripts/gcp-fastpath-cloud-target.mjs: the fast-path database and target
+// prefix, PostgreSQL 17, no superuser). Anything else keeps this refusal.
+async function validateTarget(client, schema, cloudFastpathTarget) {
   let locality;
   try {
     locality = await client.query("SELECT inet_server_addr() AS address,current_setting('server_version_num')::integer AS version");
@@ -470,7 +475,8 @@ async function validateTarget(client, schema) {
     fail("INGESTION_JOURNAL_TARGET_UNAVAILABLE");
   }
   const serverVersion = Number(locality.rows[0]?.version);
-  if (locality.rows[0]?.address !== null || Math.floor(serverVersion / 10_000) !== 17) {
+  if ((locality.rows[0]?.address !== null || Math.floor(serverVersion / 10_000) !== 17)
+      && (cloudFastpathTarget !== true || await gcpFastpathCloudTargetRefusal(client, schema) !== null)) {
     fail("INGESTION_JOURNAL_LOCAL_POSTGRES_17_REQUIRED");
   }
   const expected = await readPostgresMigrations({ role: "primary", rootDirectory: POSTGRES_MIGRATION_ROOT });
@@ -799,6 +805,8 @@ async function completeRun(client, schema, transferId) {
  * Each bounded page and its durable checkpoint commit atomically. This imports
  * only version-1 storage_ingestion_changes tuples; it never advances analytics
  * cursors, writes owner state, or synthesizes applied-event receipts.
+ * `cloudFastpathTarget: true` is the GCP fast-path seed's alone: it admits
+ * that seed's Cloud SQL target (see validateTarget) and nothing else.
  */
 export async function transferPostgresIngestionJournal({
   source,
@@ -806,6 +814,7 @@ export async function transferPostgresIngestionJournal({
   targetSchema: rawTargetSchema,
   transferId,
   pageSize = POSTGRES_INGESTION_JOURNAL_DEFAULT_PAGE_SIZE,
+  cloudFastpathTarget = false,
 } = {}) {
   const schema = targetSuffix(rawTargetSchema);
   const size = validatePageSize(pageSize);
@@ -821,7 +830,7 @@ export async function transferPostgresIngestionJournal({
   }
   let lockHeld = false;
   try {
-    const postgresVersion = await validateTarget(client, schema);
+    const postgresVersion = await validateTarget(client, schema, cloudFastpathTarget);
     await acquireTargetLock(client, schema, transferId);
     lockHeld = true;
     await createControls(client, schema);

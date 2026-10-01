@@ -203,3 +203,73 @@ test("the journal importer writes only its own or the fast-path rehearsal dispos
     await assert.rejects(attempt(targetSchema), { code: "INGESTION_JOURNAL_DISPOSABLE_SCHEMA_REQUIRED" }, targetSchema);
   }
 });
+
+test("only the GCP seed's cloudFastpathTarget admits a non-local session, and only the fast-path cloud target", async () => {
+  // A fake destination: a TCP session (inet_server_addr() not NULL) whose
+  // catalog facts each case sets. Past the locality guard the next query is
+  // the migration history, which this fake refuses, so acceptance shows as
+  // INGESTION_JOURNAL_TARGET_MIGRATION_REQUIRED and no write is attempted.
+  const cloud = { address: "10.20.30.40/32", version: 170006, database: "tibotattle_fastpath",
+    sessionSuperuser: false, currentSuperuser: "off" };
+  const fakePool = (facts, statements) => ({
+    connect: async () => ({
+      query: async (text) => {
+        statements.push(text.trim().split(/\s+/u).slice(0, 2).join(" "));
+        if (text.includes("inet_server_addr()")) return { rows: [{ address: facts.address, version: facts.version }] };
+        if (text.includes("current_database()")) {
+          return { rows: [{ database: facts.database, version: facts.version,
+            session_superuser: facts.sessionSuperuser, current_superuser: facts.currentSuperuser }] };
+        }
+        throw new Error("synthetic: no migration history");
+      },
+      release() {},
+    }),
+  });
+  const fixture = await makeSource();
+  let source;
+  try {
+    source = await createSealedSqliteIngestionJournalSource({ ...fixture, expectedSourceId: SOURCE_ID });
+    const attempt = async (facts, { targetSchema = "typed_legacy_transfer_rehearsal_target_fastpath_a1b2c3d4",
+      ...options } = {}) => {
+      const statements = [];
+      const outcome = await transferPostgresIngestionJournal({ source, destinationPool: fakePool(facts, statements),
+        targetSchema, transferId: "synthetic-ingestion-journal-cloud-guard", pageSize: 2, ...options })
+        .then(() => "accepted", (error) => error?.code);
+      assert.equal(statements.some((statement) => /^(?:INSERT|CREATE|UPDATE|BEGIN|SELECT pg_advisory_lock)/u.test(statement)),
+        false, "no lock or write before the target is accepted");
+      return outcome;
+    };
+    const ACCEPTED = "INGESTION_JOURNAL_TARGET_MIGRATION_REQUIRED";
+    const REFUSED = "INGESTION_JOURNAL_LOCAL_POSTGRES_17_REQUIRED";
+    // The local Unix socket on PostgreSQL 17 is accepted as before, with or without the option.
+    assert.equal(await attempt({ ...cloud, address: null, database: "postgres", sessionSuperuser: true,
+      currentSuperuser: "on" }), ACCEPTED);
+    // A non-local session without the option (or with anything but true) keeps the original refusal.
+    assert.equal(await attempt(cloud), REFUSED);
+    assert.equal(await attempt(cloud, { cloudFastpathTarget: "true" }), REFUSED);
+    assert.equal(await attempt(cloud, { cloudFastpathTarget: 1 }), REFUSED);
+    // With the option: every condition is required.
+    assert.equal(await attempt(cloud, { cloudFastpathTarget: true }), ACCEPTED);
+    assert.equal(await attempt({ ...cloud, database: "tibotattle" }, { cloudFastpathTarget: true }), REFUSED);
+    assert.equal(await attempt({ ...cloud, database: "postgres" }, { cloudFastpathTarget: true }), REFUSED);
+    assert.equal(await attempt({ ...cloud, version: 160004 }, { cloudFastpathTarget: true }), REFUSED);
+    assert.equal(await attempt({ ...cloud, address: null, version: 180000 }, { cloudFastpathTarget: true }), REFUSED);
+    assert.equal(await attempt({ ...cloud, sessionSuperuser: true }, { cloudFastpathTarget: true }), REFUSED);
+    assert.equal(await attempt({ ...cloud, sessionSuperuser: null }, { cloudFastpathTarget: true }), REFUSED);
+    assert.equal(await attempt({ ...cloud, currentSuperuser: "on" }, { cloudFastpathTarget: true }), REFUSED);
+    // The journal's own disposable prefix is never a cloud target; the schema
+    // guards still refuse anything else before a connection.
+    assert.equal(await attempt(cloud, { cloudFastpathTarget: true,
+      targetSchema: "storage_journal_transfer_target_a1b2c3d4" }), REFUSED);
+    assert.equal(await attempt(cloud, { cloudFastpathTarget: true,
+      targetSchema: "typed_legacy_transfer_rehearsal_target_fastpath_a1b2c3d4e5" }), REFUSED);
+    for (const targetSchema of ["public", "tibotattle", "tibotattle_fastpath_20261001",
+      "typed_legacy_transfer_rehearsal_target_a1b2c3d4"]) {
+      assert.equal(await attempt(cloud, { cloudFastpathTarget: true, targetSchema }),
+        "INGESTION_JOURNAL_DISPOSABLE_SCHEMA_REQUIRED", targetSchema);
+    }
+  } finally {
+    source?.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});

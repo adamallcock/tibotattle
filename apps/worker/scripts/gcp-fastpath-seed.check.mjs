@@ -3,9 +3,14 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { lstat, realpath, stat } from "node:fs/promises";
+import { lstat, readdir, readFile, realpath, stat } from "node:fs/promises";
+import { dirname, join, relative, resolve } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import pg from "pg";
+import { localFastpathTcpHost, withLocalFastpathCloudDatabase } from "../postgres-test/fixtures/fastpath-cloud-database.mjs";
+import { GCP_FASTPATH_CLOUD_TARGET, GCP_FASTPATH_CLOUD_TARGET_REFUSALS,
+  gcpFastpathCloudTargetRefusal } from "./gcp-fastpath-cloud-target.mjs";
 import { GCP_FASTPATH_CONNECTION, validateTarget } from "./gcp-fastpath-connection.mjs";
 import { fastpathRehearsalSchemas } from "./gcp-fastpath-rehearsal.mjs";
 import {
@@ -81,7 +86,8 @@ test("seed skips with its reason when any chain stage or the golden is absent at
 test("seed runs only from a checkout equal to the commit in stages, migrations and golden", () => {
   const present = [...ALL_STAGES, GOLDEN_MANIFEST];
   assert.equal(planSeed(COMMIT, { spawn: fakeGit({ present }) }).decision, "run");
-  for (const dirty of [stagePath("v12"), stagePath("rehearsal-loader"), "apps/worker/postgres/migrations", GOLDEN]) {
+  for (const dirty of [stagePath("v12"), stagePath("rehearsal-loader"), "apps/worker/postgres/migrations", GOLDEN,
+    "apps/worker/scripts/gcp-fastpath-cloud-target.mjs"]) {
     const plan = planSeed(COMMIT, { spawn: fakeGit({ present, dirty: [dirty] }) });
     assert.equal(plan.decision, "refuse", dirty);
     assert.match(plan.reason, /run the seed from a checkout of the deployed commit/u);
@@ -109,6 +115,73 @@ test("seeded schemas are the rehearsal's names and pass every importer's prefix 
     assert.throws(() => seededSchemas(bad), (error) => error?.code === "GCP_FASTPATH_SEED_SUFFIX_INVALID");
   }
   assert.match(seedMarker(COMMIT, "a".repeat(64)), /^gcp-fastpath-seed-v1 complete commit=4{40} dump=a{64}$/u);
+});
+
+test("the cloud-target exception names the seed's database, prefix and PostgreSQL major, and refuses by reason", async () => {
+  assert.deepEqual(GCP_FASTPATH_CLOUD_TARGET, { database: "tibotattle_fastpath",
+    schemaPrefix: "typed_legacy_transfer_rehearsal_target_fastpath_", postgresMajor: 17 });
+  assert.equal(GCP_FASTPATH_CLOUD_TARGET.database, GCP_FASTPATH_CONNECTION.database);
+  assert.equal(GCP_FASTPATH_CLOUD_TARGET.schemaPrefix, GCP_FASTPATH_SEED.targetPrefix);
+  const cloud = { database: "tibotattle_fastpath", version: 170006, session_superuser: false, current_superuser: "off" };
+  const client = (facts) => ({ query: async () => (facts instanceof Error ? Promise.reject(facts) : { rows: [facts] }) });
+  const schema = seededSchemas("0a1b2c3d").target;
+  assert.equal(await gcpFastpathCloudTargetRefusal(client(cloud), schema), null);
+  const cases = [
+    [client(cloud), seededSchemas("0a1b2c3d").control, "schema"],
+    [client(cloud), "storage_journal_transfer_target_0a1b2c3d", "schema"],
+    [client(cloud), `${schema}0`, "schema"],
+    [client(cloud), "typed_legacy_transfer_rehearsal_target_fastpath_ABCDEF12", "schema"],
+    [client(cloud), undefined, "schema"],
+    [client(new Error("synthetic")), schema, "unavailable"],
+    [{ query: async () => ({ rows: [] }) }, schema, "unavailable"],
+    [client({ ...cloud, database: "tibotattle" }), schema, "database"],
+    [client({ ...cloud, database: "postgres" }), schema, "database"],
+    [client({ ...cloud, version: 160004 }), schema, "postgres-major"],
+    [client({ ...cloud, version: "not-a-number" }), schema, "postgres-major"],
+    [client({ ...cloud, session_superuser: true }), schema, "superuser"],
+    [client({ ...cloud, session_superuser: null }), schema, "superuser"],
+    [client({ ...cloud, current_superuser: "on" }), schema, "superuser"],
+  ];
+  for (const [fake, target, reason] of cases) {
+    assert.equal(await gcpFastpathCloudTargetRefusal(fake, target), reason, `${target} ${reason}`);
+    assert.ok(GCP_FASTPATH_CLOUD_TARGET_REFUSALS.includes(reason));
+  }
+});
+
+const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const PRODUCTION_SCAN_ROOTS = ["scripts", "cloud-run", "src", "gcp-test"];
+const PRODUCTION_SKIPPED_DIRECTORIES = new Set(["node_modules", "dist", ".wrangler", "fixtures"]);
+const TEST_FILE = /\.(?:check|test|spec|bench)\.[cm]?[jt]s$|\.d\.ts$/u;
+
+async function productionSources(directory) {
+  const files = [];
+  for (const entry of await readdir(directory, { withFileTypes: true }).catch(() => [])) {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) {
+      if (!PRODUCTION_SKIPPED_DIRECTORIES.has(entry.name)) files.push(...await productionSources(path));
+    } else if (entry.isFile() && /\.(?:[cm]?[jt]s)$/u.test(entry.name) && !TEST_FILE.test(entry.name)) {
+      files.push(path);
+    }
+  }
+  return files;
+}
+
+test("only the seed passes cloudFastpathTarget: the rehearsal loader forwards it, the journal importer reads it", async () => {
+  const mentions = {};
+  for (const root of PRODUCTION_SCAN_ROOTS) {
+    for (const path of await productionSources(join(WORKER_ROOT, root))) {
+      // Code lines only: doc comments may describe the option.
+      const code = (await readFile(path, "utf8")).split("\n")
+        .filter((line) => !/^\s*(?:\*|\/\*|\/\/)/u.test(line)).join("\n");
+      if (!code.includes("cloudFastpathTarget")) continue;
+      mentions[relative(WORKER_ROOT, path)] = (code.match(/cloudFastpathTarget\s*:\s*true\b/gu) ?? []).length;
+    }
+  }
+  assert.deepEqual(mentions, {
+    "scripts/gcp-fastpath-rehearsal.mjs": 0,
+    "scripts/gcp-fastpath-seed.mjs": 1,
+    "scripts/postgres-ingestion-journal-transfer.mjs": 0,
+  });
 });
 
 test("the connection targets only the disposable fast-path database", () => {
@@ -338,3 +411,69 @@ test("PG17: as a Cloud SQL-like migrator (not a superuser) the seed equals the s
       await admin.end().catch(() => {});
     }
   });
+
+const TCP_HOST = LOCAL_SKIP ? null : localFastpathTcpHost();
+
+test("PG17 over TCP: the seed's chain passes the cloud-target exception as a non-superuser in tibotattle_fastpath "
+  + "and equals the local rehearsal's chain", {
+  skip: LOCAL_SKIP || (TCP_HOST === null && "needs PG_TEST_TCP_HOST (loopback TCP to the same PostgreSQL 17)"),
+  timeout: 900_000,
+}, async () => {
+  // Cloud SQL through the connector: a TCP session (inet_server_addr() is not
+  // NULL) as a non-superuser migrator into tibotattle_fastpath. The seed runs
+  // through runGcpFastpathSeed, the deploy's entrypoint, with only the pool
+  // swapped; the baseline is the superuser over the local Unix socket, the
+  // rehearsal's own session.
+  const options = await localPoolOptions();
+  assert.ok(options.host.startsWith("/"), "the baseline runs over the local Unix socket (PG_TEST_SOCKET)");
+  await withLocalFastpathCloudDatabase({ admin: { ...options }, tcpHost: TCP_HOST, port: options.port },
+    async ({ database, roles, tcpPool }) => {
+      const runs = {
+        socketSuperuser: { pool: new pg.Pool({ ...options, max: 4 }), user: options.user, expectedOwner: null },
+        cloudMigrator: { pool: tcpPool({ user: roles.migrator, max: 4 }), user: roles.migrator,
+          expectedOwner: roles.migrator },
+      };
+      runs.socketSuperuser.pool.on("error", () => {});
+      const seeds = {};
+      try {
+        const facts = await runs.cloudMigrator.pool.query(`SELECT inet_server_addr() IS NOT NULL AS tcp,
+            current_database()::text AS db, rolsuper FROM pg_catalog.pg_roles WHERE rolname = session_user`);
+        assert.deepEqual(facts.rows[0], { tcp: true, db: database, rolsuper: false });
+        for (const [name, run] of Object.entries(runs)) {
+          const schemas = seededSchemas(randomBytes(4).toString("hex"));
+          seeds[name] = { pool: run.pool, schemas };
+          const receipt = await runGcpFastpathSeed({ commit: "HEAD", schemaSuffix: schemas.suffix, log: () => {},
+            dependencies: {
+              spawn: cleanCheckoutGit,
+              createPool: async () => ({ pool: run.pool, identity: run.user, close: async () => {} }),
+              expectedOwner: run.expectedOwner,
+              grantRuntime: async () => {},
+              readBack: async (schema) => ({ schema }),
+            } });
+          assert.equal(receipt.status, "seeded", name);
+          assert.equal(receipt.steps.ingestionJournal.status, "synthetic_storage_ingestion_journal_transfer_complete");
+          seeds[name].receipt = receipt;
+        }
+        const { socketSuperuser, cloudMigrator } = seeds;
+        assert.deepEqual(cloudMigrator.receipt.steps, socketSuperuser.receipt.steps);
+        // Every table the rehearsal counts, at the local rehearsal's counts.
+        assert.deepEqual(cloudMigrator.receipt.steps.importedRows, { participants: 4, storage_v11_owner_links: 4,
+          typed_telemetry_records: 11183, telemetry_v12_records: 0, telemetry_v12_day_manifests: 170,
+          telemetry_v1_chunks: 2, telemetry_v11_chunks: 1530, telemetry_v11_day_manifests: 510,
+          telemetry_v11_domain_days: 510, typed_v11_record_proofs: 11181, typed_v1_record_admissions: 2,
+          storage_v11_event_sources: 3, typed_v1_event_sources: 2, storage_v12_event_sources: 1,
+          storage_ingestion_changes: 6, telemetry_usage_correction_facts: 0 });
+        assert.deepEqual(await seededFingerprint(cloudMigrator.pool, cloudMigrator.schemas.target),
+          await seededFingerprint(socketSuperuser.pool, socketSuperuser.schemas.target));
+        const triggers = await userTriggerStates(cloudMigrator.pool, cloudMigrator.schemas.target);
+        assert.deepEqual(triggers.filter((trigger) => trigger.enabled !== "O"), []);
+        assert.deepEqual(triggers, await userTriggerStates(socketSuperuser.pool, socketSuperuser.schemas.target));
+      } finally {
+        const baseline = seeds.socketSuperuser?.schemas;
+        for (const schema of baseline ? [baseline.target, baseline.control] : []) {
+          await runs.socketSuperuser.pool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => {});
+        }
+        await runs.socketSuperuser.pool.end().catch(() => {});
+      }
+    });
+});
