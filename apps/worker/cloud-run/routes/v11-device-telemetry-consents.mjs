@@ -10,8 +10,9 @@
  * BODY_INVALID otherwise); then grantPostgresTelemetryV11Consent, answered
  * 201 with Vary: Cookie.
  *
- * Not a built-in of the origin: registering it needs the additive-module
- * extension of origin-route-modules.mjs (IN-2 hand-off to the lead).
+ * Not a built-in of the origin: it is mounted through v11-composition.mjs's
+ * pathname dispatch, which hands every method to this handler so a wrong one
+ * gets the Worker's 405 (IN-2 hand-off to the lead).
  */
 
 import { defineOriginRouteModule } from "../origin-route-modules.mjs";

@@ -12,7 +12,11 @@
  *   - domain:         telemetry-v11-domain.ts createTelemetryV11DomainPredecessor,
  *                     activateTelemetryV11Domain, with the D1 trigger chain they
  *                     rely on (D1 0058 v1.1 admission, typed-v11-admission
- *                     0001/0003/0006 and the head publish triggers).
+ *                     0001/0006, and the two BEFORE INSERT closures production
+ *                     runs last: ingestion-isolation 0007's
+ *                     typed_v1_v11_transition_unqualified, which fires first,
+ *                     and telemetry_v11_domain_complete_before_insert, with
+ *                     its active-correction exact-total tolerance).
  *
  * D1 enforces most of that chain in triggers that SQLite runs inside one
  * batch. Here each operation is one bounded PostgreSQL transaction that
@@ -33,10 +37,15 @@
  *     503 BACKEND_STORAGE_UNAVAILABLE; D1 throws a TypedTelemetryError, which
  *     its top-level handler turns into 500 INTERNAL_ERROR;
  *   - D1's community_snapshot_mutation_control and
- *     community_daily_aggregate_rebuilds head side effects and the
- *     storage_v11 owner bridge (ingestion-bridge 0001) are not written; the
- *     analytics_v2 job reads storage_ingestion_changes instead, and the v1.1
- *     bridge is the next IN-2 item.
+ *     community_daily_aggregate_rebuilds head side effects are not written;
+ *     the analytics_v2 job reads storage_ingestion_changes instead. The
+ *     storage_v11 owner bridge (ingestion-bridge 0001, with ingestion-
+ *     isolation 0002's append classification) is staged migration 0060's
+ *     head trigger, not this module;
+ *   - D1 keeps the usage-correction runtime state in
+ *     telemetry_usage_correction_runtime.state; PostgreSQL keeps the
+ *     transferred D1 state in source_state (0034), so every "correction
+ *     runtime active" test here reads source_state = 'active'.
  *
  * Every failure is an ApiError; provider messages, SQL and bind values never
  * leave this module.
@@ -236,7 +245,9 @@ function admissionError(error: unknown): Error | null {
       || (code === "23505" && table.startsWith("telemetry_v11_"))) {
     return manifestConflict();
   }
-  if (code === "40001" || code === "40P01") return manifestConflict();
+  // A serialization failure or deadlock (40001, 40P01) is transient lock
+  // contention, not a manifest conflict: it stays a retryable 503, as every
+  // other Worker storage failure is, so a client keeps its progress journal.
   return null;
 }
 
@@ -274,7 +285,14 @@ export async function grantPostgresTelemetryV11Consent(
   options: PostgresTelemetryV11Options = {},
 ): Promise<Readonly<{ consent: TelemetryV11Consent; minimumWriteRank: 11 }>> {
   if (!isTelemetryV11ConsentCurrent(consent)) throw new ApiError(403, "TELEMETRY_CONSENT_INVALID");
-  validPrincipal(principal);
+  // The device id is caller-supplied body text on this session route. D1
+  // simply finds no preflight row for an id no device can have, so any
+  // malformed principal is its 403, never the device protocol's 401.
+  try {
+    validPrincipal(principal);
+  } catch {
+    throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
+  }
   if (typeof principal.sessionId !== "string" || principal.sessionId.length < 1) {
     throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
   }
@@ -437,7 +455,12 @@ export async function registerPostgresTelemetryV11DayManifest(
         if (existing.manifest_json !== canonical) throw manifestConflict();
         return candidate(existing);
       }
-      // D1 0058: at most 8192 manifests per device and UTC creation day.
+      // D1 0058: at most 8192 manifests per device and UTC creation day. D1
+      // counts inside its single-writer batch; here concurrent registrations
+      // for one device serialize on a transaction-scoped advisory lock taken
+      // after the TA-1 row locks, so each count sees every committed insert.
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 11011))",
+        [JSON.stringify(["telemetry-v11-manifest-admission", principal.participantId, principal.deviceId])]);
       const dayStart = `${now.toISOString().slice(0, 10)}T00:00:00.000Z`;
       const admitted = await client.query<{ total: string }>(
         `SELECT count(*)::text AS total FROM (
@@ -1760,9 +1783,19 @@ export function createPostgresTelemetryV11Domain(
       const tokenHash = await sha256Hex(manifest.predecessor.token);
       const daysJson = canonicalTelemetryV11Json(manifest.days);
       const now = nowDate(nowEpoch).toISOString();
+      // D1 runs assertTelemetryTransportWriteAllowed before its replay read
+      // and outside the try whose catch acknowledges a replay, so a refused
+      // principal (blocked format, missing consent, revoked device) gets that
+      // refusal, never a replayed activation.
+      let transportRefusal: unknown = null;
       try {
         return await withPostgresMutation(pool, async (client) => {
-          await assertV11WriteAllowed(client, principal, config, nowEpoch);
+          try {
+            await assertV11WriteAllowed(client, principal, config, nowEpoch);
+          } catch (error) {
+            transportRefusal = error;
+            throw error;
+          }
           const existing = await activeDomainByDigest(client, s, principal, manifest.manifestDigest);
           if (existing) return activationResult(existing, true);
           const state = await domainState(client, s, principal.participantId);
@@ -1863,6 +1896,7 @@ export function createPostgresTelemetryV11Domain(
             ? domainError(error) : null),
         });
       } catch (error) {
+        if (transportRefusal !== null) throw domainError(error);
         // An uncertain response or concurrent identical retry is safe.
         const replay = await withPostgresRead(pool,
           (client) => activeDomainByDigest(client, s, principal, manifest.manifestDigest),
@@ -1875,8 +1909,124 @@ export function createPostgresTelemetryV11Domain(
 }
 
 /**
- * typed-v11-admission 0003 telemetry_v11_domain_complete_before_insert, the
- * closure D1 runs before a generation row exists, in the same order.
+ * ingestion-isolation 0007's usage-correction tolerance, as one SQL
+ * predicate over a retained (before) and a successor (after) typed record
+ * id: while the correction runtime is active, two usage rows whose every
+ * shared typed field (namespace, owner, occurrence, clock, day, provider,
+ * session, every dimension and every split) is identical are the same
+ * occurrence when each exact total (total input context, output combined)
+ * is unchanged or NULL on either side. Attribution is not compared, as in
+ * D1. No other stream and no raw JSON proof gets a tolerance.
+ */
+function correctedUsageEquivalent(s: string, beforeId: string, afterId: string): string {
+  const shared = (row: string, usage: string) => `ROW(${row}.namespace_id, ${row}.owner_id, ${row}.occurrence_id,
+      ${row}.observed_at_ms, ${row}.observed_day, ${row}.provider_id, ${usage}.session_id, ${usage}.model_id,
+      ${usage}.speed_mode_id, ${usage}.api_service_tier_id, ${usage}.surface_id, ${usage}.billing_surface_id,
+      ${usage}.reasoning_effort_id, ${usage}.agent_scope_id, ${usage}.outcome_id, ${usage}.input_uncached_tokens,
+      ${usage}.input_cache_read_tokens, ${usage}.input_cache_write_tokens, ${usage}.output_text_tokens,
+      ${usage}.output_reasoning_tokens)`;
+  return `EXISTS (
+    SELECT 1 FROM ${t(s, "typed_telemetry_records")} before_row
+      JOIN ${t(s, "typed_telemetry_usage")} before_usage ON before_usage.record_id = before_row.id
+      JOIN ${t(s, "typed_telemetry_records")} after_row ON after_row.id = ${afterId}
+      JOIN ${t(s, "typed_telemetry_usage")} after_usage ON after_usage.record_id = after_row.id
+     WHERE before_row.id = ${beforeId}
+       AND EXISTS (SELECT 1 FROM ${t(s, "telemetry_usage_correction_runtime")} runtime
+                    WHERE runtime.id = 1 AND runtime.source_state = 'active')
+       AND before_row.stream = 1 AND after_row.stream = 1
+       AND ${shared("after_row", "after_usage")} IS NOT DISTINCT FROM ${shared("before_row", "before_usage")}
+       AND (before_usage.total_input_context_tokens IS NULL OR after_usage.total_input_context_tokens IS NULL
+         OR after_usage.total_input_context_tokens = before_usage.total_input_context_tokens)
+       AND (before_usage.output_combined_tokens IS NULL OR after_usage.output_combined_tokens IS NULL
+         OR after_usage.output_combined_tokens = before_usage.output_combined_tokens))`;
+}
+
+/**
+ * ingestion-isolation 0007 typed_v1_v11_transition_unqualified: once any
+ * typed v1 admission state exists, the owner's typed v1 history must carry
+ * into the candidate. Both runtimes must be qualified over one namespace;
+ * no current winner chunk of the predecessor may be partially admitted (the
+ * header count is authoritative and its event source must exist); and every
+ * typed v1 winner occurrence must reappear in the candidate day with its
+ * legacy occurrence and a legacy digest equal to the typed canonical digest
+ * (or, under an active correction runtime, as an exact-total correction).
+ * The decoded owner, device, chunk and occurrence ids are D1's
+ * typed_telemetry_compatibility_records columns; comparisons keep D1's
+ * NULL-propagating != so an undecodable id behaves as it does there.
+ */
+async function assertTypedV1Transition(
+  client: PostgresClient,
+  s: string,
+  principal: PostgresTelemetryV11Principal,
+  predecessor: PredecessorRow,
+  candidateDays: string,
+): Promise<void> {
+  const present = await client.query<{ present: boolean }>(
+    `SELECT EXISTS (SELECT 1 FROM ${t(s, "typed_v1_admission_state")}) AS present`,
+  );
+  if (present.rows[0]?.present !== true) return;
+  const qualified = await client.query(
+    `SELECT 1 FROM ${t(s, "typed_v1_admission_state")} a
+       JOIN ${t(s, "typed_v11_admission_state")} b
+         ON b.namespace_id = a.namespace_id AND b.source_namespace = a.source_namespace
+      WHERE a.id = 1 AND b.id = 1 AND a.runtime_contract_version = 1 AND b.runtime_contract_version = 1`,
+  );
+  if (qualified.rows.length !== 1) throw new DomainRefusal("compatibility_unproven");
+  const winners = `winners AS MATERIALIZED (
+       SELECT winner->>0 AS participant_id, (winner->>1)::date AS chunk_day, winner->>2 AS device_id
+         FROM jsonb_array_elements($2::jsonb) winner)`;
+  const partial = await client.query(
+    `WITH ${winners}
+     SELECT 1 FROM ${t(s, "telemetry_v1_chunks")} c
+      WHERE c.participant_id = $1 AND c.superseded_at IS NULL
+        AND (c.participant_id, c.chunk_day, c.device_id) IN (SELECT participant_id, chunk_day, device_id FROM winners)
+        AND (c.record_count <> c.accepted_record_count
+          OR c.record_count <> (SELECT count(*) FROM ${t(s, "typed_v1_record_admissions")} p WHERE p.chunk_id = c.id)
+          OR NOT EXISTS (SELECT 1 FROM ${t(s, "typed_v1_event_sources")} e
+                          WHERE e.chunk_id = c.id AND e.participant_id = c.participant_id
+                            AND e.source_namespace = (SELECT source_namespace FROM ${t(s, "typed_v1_admission_state")})))
+      LIMIT 1`,
+    [principal.participantId, predecessor.winners_json],
+  );
+  if (partial.rows.length) throw new DomainRefusal("compatibility_unproven");
+  const uncovered = await client.query(
+    `WITH ${winners},
+     candidate_days AS MATERIALIZED (
+       SELECT entry.day::date AS day, entry.manifest_id
+         FROM jsonb_to_recordset($3::jsonb) AS entry(day text, manifest_id text))
+     SELECT 1 FROM ${t(s, "telemetry_v1_chunks")} c
+       JOIN ${t(s, "typed_v1_record_admissions")} p ON p.chunk_id = c.id
+       JOIN ${t(s, "typed_telemetry_records")} r ON r.id = p.typed_record_id
+       JOIN ${t(s, "typed_telemetry_owners")} old_owner ON old_owner.id = r.owner_id
+       JOIN ${t(s, "typed_telemetry_devices")} old_device ON old_device.id = r.device_id
+       JOIN ${t(s, "typed_telemetry_chunks")} old_chunk ON old_chunk.id = r.chunk_id
+       LEFT JOIN candidate_days candidate ON candidate.day = c.chunk_day
+      WHERE c.participant_id = $1 AND c.superseded_at IS NULL
+        AND (c.participant_id, c.chunk_day, c.device_id) IN (SELECT participant_id, chunk_day, device_id FROM winners)
+        AND (candidate.manifest_id IS NULL OR r.format <> 10
+          OR r.namespace_id <> (SELECT namespace_id FROM ${t(s, "typed_v1_admission_state")})
+          OR ${t(s, "typed_legacy_admission_decode_id")}(old_owner.original_id) <> c.participant_id
+          OR ${t(s, "typed_legacy_admission_decode_id")}(old_device.original_id) <> c.device_id
+          OR ${t(s, "typed_legacy_admission_decode_id")}(old_chunk.original_id) <> c.id
+          OR r.observed_day <> (c.chunk_day - DATE '1970-01-01')
+          OR NOT EXISTS (
+            SELECT 1 FROM ${t(s, "typed_v11_record_admissions")} successor
+             WHERE successor.manifest_id = candidate.manifest_id AND successor.stream = c.stream
+               AND successor.legacy_occurrence_id = ${t(s, "typed_legacy_admission_decode_id")}(r.occurrence_id)
+               AND (successor.legacy_digest = r.canonical_digest
+                 OR ${correctedUsageEquivalent(s, "r.id", "successor.typed_record_id")})))
+      LIMIT 1`,
+    [principal.participantId, predecessor.winners_json, candidateDays],
+  );
+  if (uncovered.rows.length) throw new DomainRefusal("compatibility_unproven");
+}
+
+/**
+ * The closure D1 runs before a generation row exists, as production's final
+ * triggers order it: SQLite fires the most recently created BEFORE trigger
+ * first, so ingestion-isolation 0007's typed_v1_v11_transition_unqualified
+ * runs before its telemetry_v11_domain_complete_before_insert, whose checks
+ * follow in their own order.
  */
 async function assertDomainClosure(
   client: PostgresClient,
@@ -1885,6 +2035,9 @@ async function assertDomainClosure(
   manifest: ReturnType<typeof parseTelemetryV11DomainManifest>,
   predecessor: PredecessorRow,
 ): Promise<void> {
+  const days = manifest.days;
+  const candidateDays = JSON.stringify(days.map((entry) => ({ day: entry.day, manifest_id: entry.manifestId })));
+  await assertTypedV1Transition(client, s, principal, predecessor, candidateDays);
   const compatibility = await client.query<{ typed: boolean; raw: boolean }>(
     `SELECT EXISTS (SELECT 1 FROM ${t(s, "typed_v11_admission_state")} WHERE id = 1) AS typed,
             EXISTS (SELECT 1 FROM ${t(s, "telemetry_v11_records")}) AS raw`,
@@ -1895,7 +2048,6 @@ async function assertDomainClosure(
   if (predecessor.from_day < manifest.fromDay || predecessor.through_day > manifest.throughDay) {
     throw new DomainRefusal("predecessor_changed");
   }
-  const days = manifest.days;
   const ids = days.map((day) => day.manifestId);
   const budget = await client.query<{ total: string }>(
     `SELECT COALESCE(sum(expected_chunk_count), 0)::text AS total
@@ -1938,7 +2090,6 @@ async function assertDomainClosure(
     [ids],
   );
   if (duplicate.rows.length) throw new DomainRefusal("occurrence_conflict");
-  const candidateDays = JSON.stringify(days.map((entry) => ({ day: entry.day, manifest_id: entry.manifestId })));
   // Every legacy winning occurrence must survive with identical base semantics.
   const legacyGap = await client.query(
     `WITH candidate_days AS MATERIALIZED (
@@ -1962,6 +2113,8 @@ async function assertDomainClosure(
     [principal.participantId, predecessor.winners_json, candidateDays],
   );
   if (legacyGap.rows.length) throw new DomainRefusal("compatibility_unproven");
+  // Every admitted row of the previous generation must survive: the same
+  // base digest, or (active correction runtime) an exact-total correction.
   if (manifest.predecessor.previousGenerationId !== null) {
     const previousGap = await client.query(
       `WITH candidate_days AS MATERIALIZED (
@@ -1973,7 +2126,9 @@ async function assertDomainClosure(
         WHERE previous_day.generation_id = $1 AND (candidate.manifest_id IS NULL OR NOT EXISTS (
           SELECT 1 FROM ${t(s, "typed_v11_record_admissions")} new_row
            WHERE new_row.manifest_id = candidate.manifest_id AND new_row.stream = old_row.stream
-             AND new_row.occurrence_id = old_row.occurrence_id AND new_row.base_digest = old_row.base_digest))
+             AND new_row.occurrence_id = old_row.occurrence_id
+             AND (new_row.base_digest = old_row.base_digest
+               OR ${correctedUsageEquivalent(s, "old_row.typed_record_id", "new_row.typed_record_id")})))
         LIMIT 1`,
       [manifest.predecessor.previousGenerationId, candidateDays],
     );

@@ -37,10 +37,17 @@ import { telemetryV11DayShape, TELEMETRY_V11_SHAPE_TABLES } from "./fixtures/tel
  * Q-1 D1 dump by fixtures/extract-telemetry-v11-q1-day.mjs).
  *
  * The route modules and the envelope registration are driven directly: the
- * origin cannot mount additive (non built-in) route modules yet, and the
- * contributions preamble is IN-1b's. The test plays the preamble's part
- * (claim, then abandon on a failure before persistence) with the production
- * PostgreSQL claim and abandon adapters. Rate-limit adapters are stubs.
+ * origin mounts neither yet (the composition's pathname dispatch and the
+ * envelope registration are lead hand-offs), and the contributions preamble
+ * is IN-1b's. The test plays the preamble's part with the production
+ * PostgreSQL adapters: claim (under the v1.1 accountless gate for the
+ * accountless owner), the telemetry-contribution-v1.1 transport gate, then
+ * abandon on a failure before persistence. Rate-limit adapters are stubs.
+ *
+ * Further tests cover what the Q-1 owners cannot: typed v1 history carried
+ * into a v1.1 domain (ingestion-isolation 0007's transition proof), the
+ * active usage-correction exact-total tolerance, admission caps and their
+ * retry-after, occurrence conflicts, v0.2 history and concurrent activation.
  *
  * Connection: PG_TEST_SOCKET or loopback PG_TEST_HOST; without either the
  * test skips (a skip is not a pass). Every row is synthetic and content-free.
@@ -187,7 +194,8 @@ async function bridgeState(pool, schema, participantId) {
   )).rows;
   const journal = link === null ? [] : (await pool.query(
     `SELECT kind, revision::int AS revision, event_digest, object_digest, content_digest,
-            event_tuple_version::int AS event_tuple_version
+            event_tuple_version::int AS event_tuple_version, authority_epoch::int AS authority_epoch,
+            public_authority_epoch::int AS public_authority_epoch
        FROM ${q(schema, "storage_ingestion_changes")} WHERE owner_digest = $1 ORDER BY sequence`,
     [link.owner_digest],
   )).rows;
@@ -242,6 +250,7 @@ test("PostgreSQL 17 runs a full v1.1 upload cycle with Worker-equal rows, replay
     const constants = await load("/src/constants.ts");
     const sessionModule = await load("/src/session.ts");
     const routeRegistry = await load("/src/route-registry.ts");
+    const transportAuthority = await load("/src/postgres-transport-write-authority.ts");
 
     await primaryPool.query(
       `UPDATE ${q(primarySchema, "collection_controls")}
@@ -343,6 +352,27 @@ test("PostgreSQL 17 runs a full v1.1 upload cycle with Worker-equal rows, replay
       assert.ok(policy && (policy.methods === "all" || policy.methods.includes(routeModule.method)),
         `${routeModule.method} ${routeModule.pathname} is a Worker registry route`);
     }
+    // The pathname dispatch the lead mounts serves every method of the four
+    // paths, so a wrong method gets the Worker registry's 405 and Allow.
+    assert.deepEqual(intake.pathnames, [
+      "/api/v1/me/device-telemetry-consents",
+      "/api/v1/device/telemetry/v1.1/day-manifests",
+      "/api/v1/me/telemetry-v11/domain-predecessor",
+      "/api/v1/me/telemetry-v11/domain-activate",
+    ]);
+    for (const pathname of intake.pathnames) {
+      const policy = routeRegistry.WORKER_ROUTE_POLICY.find((entry) => entry.pathname === pathname);
+      for (const method of ["GET", "PUT", "DELETE"].filter((candidate) => !policy.methods.includes(candidate))) {
+        const refused = await intake.dispatch(new Request(`${ORIGIN}${pathname}`, { method }));
+        await apiError(refused, 405, "METHOD_NOT_ALLOWED");
+        assert.equal(refused.headers.get("allow"), policy.methods.join(", "), `${method} ${pathname}`);
+      }
+    }
+    assert.equal(await intake.dispatch(new Request(`${ORIGIN}/api/v1/me/telemetry-v12/domain-activate`,
+      { method: "POST" })), null, "another path is not this dispatch's");
+    // The handler resolves its own claim. The IN-1a seam on this branch drops
+    // the option; the landed IN-1b registry keeps it.
+    if ("ownsReceipt" in intake.envelopeRegistration) assert.equal(intake.envelopeRegistration.ownsReceipt, true);
 
     const deviceRequest = (path, method, body, headers = {}) => new Request(`${ORIGIN}${path}`, {
       method,
@@ -365,6 +395,12 @@ test("PostgreSQL 17 runs a full v1.1 upload cycle with Worker-equal rows, replay
     await apiError(await consentRoute.handler(consentRequest({
       ...consentBody, consent: { ...telemetryV11RequiredConsent(), unknown: "field" },
     })), 403, "TELEMETRY_CONSENT_INVALID");
+    // A device id no device can have finds no preflight row, as in D1: 403,
+    // not the device protocol's 401.
+    for (const unknownDevice of ["", "dev ice", randomUUID()]) {
+      await apiError(await consentRoute.handler(consentRequest({ ...consentBody, deviceId: unknownDevice })),
+        403, "TELEMETRY_TRANSPORT_BLOCKED");
+    }
     // Before consent the v1.1 transport is refused for this device.
     await apiError(await manifestPost.handler(deviceRequest(
       "/api/v1/device/telemetry/v1.1/day-manifests", "POST",
@@ -446,6 +482,11 @@ test("PostgreSQL 17 runs a full v1.1 upload cycle with Worker-equal rows, replay
       const { claimed, envelopeDigest, authorizationId } = await claimFor(raw);
       let persistStarted = false;
       try {
+        // The preamble's telemetry-contribution-v1.1 format gate (IN-3's
+        // entry: TA-1), the Worker's pre-dispatch transport check.
+        await transportAuthority.assertPostgresTelemetryTransportWriteAllowed(
+          primaryPool, principal, "telemetry-contribution-v1.1", { schema, nowEpoch: Date.now() },
+        );
         const response = await v11Handler({ raw, value: JSON.parse(raw) }, participantRow, deviceId, claimed, {
           raw, envelopeDigest, primaryPool, schema, objectStore,
           markPersistStarted() { persistStarted = true; },
@@ -661,6 +702,28 @@ test("PostgreSQL 17 runs a full v1.1 upload cycle with Worker-equal rows, replay
       "/api/v1/me/telemetry-v11/domain-activate", "POST", activation,
     ))).json();
     assert.deepEqual(activationReplay, { ...generation, replay: true });
+    // D1 runs the transport gate before any replay read, so a refused
+    // principal gets the refusal, never a replayed activation or chunk.
+    const setLifecycle = (lifecycle) => primaryPool.query(
+      `UPDATE ${q(primarySchema, "telemetry_transport_formats")} SET lifecycle = $1
+        WHERE schema_version = 'telemetry-contribution-v1.1'`, [lifecycle],
+    );
+    await setLifecycle("blocked");
+    await apiError(await activateRoute.handler(deviceRequest(
+      "/api/v1/me/telemetry-v11/domain-activate", "POST", activation,
+    )), 403, "TELEMETRY_TRANSPORT_BLOCKED");
+    await apiError(await predecessorRoute.handler(deviceRequest(
+      "/api/v1/me/telemetry-v11/domain-predecessor", "POST", {},
+    )), 403, "TELEMETRY_TRANSPORT_BLOCKED");
+    await apiError(await manifestPost.handler(deviceRequest(
+      "/api/v1/device/telemetry/v1.1/day-manifests", "POST", prepared.manifest,
+    )), 403, "TELEMETRY_TRANSPORT_BLOCKED");
+    const blockedReplay = await contribute(prepared.chunks[0]);
+    assert.deepEqual({ status: blockedReplay.error?.status, code: blockedReplay.error?.code },
+      { status: 403, code: "TELEMETRY_TRANSPORT_BLOCKED" });
+    assert.equal((await grantState(blockedReplay.authorizationId)).state, "revoked",
+      "the refused replay's grant is abandoned, not consumed against the retained chunk");
+    await setLifecycle("accepted");
     const head = await primaryPool.query(
       `SELECT h.generation_id, h.revision, (SELECT count(*)::int FROM ${q(primarySchema, "telemetry_v11_domain_days")} d
                 WHERE d.generation_id = h.generation_id) AS days,
@@ -689,6 +752,7 @@ test("PostgreSQL 17 runs a full v1.1 upload cycle with Worker-equal rows, replay
     assert.deepEqual(firstBridge.journal, [{
       kind: "owner-active", revision: 1, event_digest: firstReceipt.event_digest,
       object_digest: firstReceipt.event_digest, content_digest: activation.manifestDigest, event_tuple_version: 1,
+      authority_epoch: 1, public_authority_epoch: 1,
     }]);
 
     // --------------------------------------- successor negotiation (v1.1) --
@@ -793,10 +857,29 @@ test("PostgreSQL 17 runs a full v1.1 upload cycle with Worker-equal rows, replay
       owner_digest: firstReceipt.owner_digest, state: "active", generation_id: successorGeneration.generationId,
       head_revision: 2, object_digest: secondReceipt.event_digest, manifest_digest: successorGeneration.manifestDigest,
     });
-    assert.deepEqual(secondBridge.journal.map((row) => [row.kind, row.revision, row.object_digest, row.content_digest]), [
-      ["owner-active", 1, firstReceipt.event_digest, activation.manifestDigest],
-      ["owner-active", 2, secondReceipt.event_digest, successorGeneration.manifestDigest],
+    // D1 ingestion-isolation 0002 (v11-append-classification.spec.ts, "keeps
+    // hard epochs across actual empty-day and same-day appends"): replacing
+    // today's empty manifest with one holding records keeps every old row,
+    // so the move is an append, journalled 'source-updated' with both epochs
+    // unchanged.
+    assert.deepEqual(secondBridge.journal.map((row) => [row.kind, row.revision, row.object_digest, row.content_digest,
+      row.authority_epoch, row.public_authority_epoch]), [
+      ["owner-active", 1, firstReceipt.event_digest, activation.manifestDigest, 1, 1],
+      ["source-updated", 2, secondReceipt.event_digest, successorGeneration.manifestDigest, 1, 1],
     ]);
+    const transitions = async () => (await primaryPool.query(
+      `SELECT generation_id, previous_generation_id, head_revision::int AS head_revision, is_append::int AS is_append,
+              compared_records FROM ${q(primarySchema, "storage_v11_append_transitions")}
+        WHERE participant_id = $1 ORDER BY head_revision`, [participantId],
+    )).rows;
+    assert.deepEqual(await transitions(), [{
+      generation_id: successorGeneration.generationId, previous_generation_id: generation.generationId,
+      head_revision: 2, is_append: 1, compared_records: 0,
+    }]);
+    const sourceEpoch = async () => (await primaryPool.query(
+      `SELECT authority_epoch::int AS epoch FROM ${q(primarySchema, "storage_source_state")} WHERE singleton = 1`,
+    )).rows[0].epoch;
+    assert.equal(await sourceEpoch(), 1, "an append leaves the public authority epoch where the first activation put it");
     // The published day's rows are immutable while the owner is active.
     await assert.rejects(primaryPool.query(
       `DELETE FROM ${q(primarySchema, "telemetry_v11_day_manifests")} WHERE id = $1`, [candidate.manifestId],
@@ -805,6 +888,37 @@ test("PostgreSQL 17 runs a full v1.1 upload cycle with Worker-equal rows, replay
       `UPDATE ${q(primarySchema, "telemetry_v11_chunks")} SET chunk_digest = repeat('0', 64) WHERE manifest_id = $1`,
       [candidate.manifestId],
     ), { message: "telemetry_source_immutable" });
+
+    // A successor that keeps every row but re-parses a day is not an append
+    // (D1: "hard-invalidates changed parser metadata"): 'owner-active', and
+    // both epochs advance.
+    const reparsed = makeV11Day(fixture.day, fixture.records, `${fixture.parserVersion}-reparsed`);
+    const reparsedCandidate = await (await manifestPost.handler(deviceRequest(
+      "/api/v1/device/telemetry/v1.1/day-manifests", "POST", reparsed.manifest,
+    ))).json();
+    for (const chunk of reparsed.chunks) {
+      const uploaded = await contribute(chunk);
+      assert.equal(uploaded.response?.status, 202, uploaded.error?.code);
+    }
+    const reparsing = await (await predecessorRoute.handler(deviceRequest(
+      "/api/v1/me/telemetry-v11/domain-predecessor", "POST", {},
+    ))).json();
+    const reparsedActivation = await activateRoute.handler(deviceRequest(
+      "/api/v1/me/telemetry-v11/domain-activate", "POST", domainManifest(reparsing, grownDays.map((entry) => (
+        entry.day === fixture.day
+          ? { day: entry.day, manifestId: reparsedCandidate.manifestId, manifestDigest: reparsedCandidate.manifestDigest }
+          : entry))),
+    ));
+    assert.equal(reparsedActivation.status, 201);
+    const reparsedGeneration = await reparsedActivation.json();
+    const thirdBridge = await bridgeState(primaryPool, primarySchema, participantId);
+    assert.deepEqual(thirdBridge.journal.map((row) => [row.kind, row.revision, row.authority_epoch, row.public_authority_epoch]), [
+      ["owner-active", 1, 1, 1], ["source-updated", 2, 1, 1], ["owner-active", 3, 2, 2],
+    ]);
+    assert.deepEqual((await transitions()).map((row) => [row.generation_id, row.head_revision, row.is_append]), [
+      [successorGeneration.generationId, 2, 1], [reparsedGeneration.generationId, 3, 0],
+    ]);
+    assert.equal(await sourceEpoch(), 2);
   } finally {
     if (primaryCreated) await primaryPool.query(`DROP SCHEMA "${primarySchema}" CASCADE`);
     if (ledgerCreated) await ledgerPool.query(`DROP SCHEMA "${ledgerSchema}" CASCADE`);
@@ -856,6 +970,8 @@ async function loadModules() {
     crypto: await load("/src/crypto.ts"),
     boundedBody: await load("/src/bounded-body.ts"),
     constants: await load("/src/constants.ts"),
+    codec: await load("/src/typed-telemetry-codec.ts"),
+    compatibility: await load("/src/telemetry-v11-compatibility.ts"),
   };
 }
 
@@ -1005,10 +1121,11 @@ test("an accountless v1.1 owner negotiates successors, matches the Q-1 rows, and
       }),
     )]).resolve("telemetry-envelope-v1.1");
 
-    // The contributions preamble claims through claimPostgresDeviceUploadAuthorization,
-    // which requires an accountless v1.2 grant (hand-off: v1.1 needs the v1.1
-    // lease graph, as the Worker's claimDeviceUploadAuthorization). The test
-    // writes the claimed state that preamble would produce.
+    // The contributions preamble claims through claimPostgresDeviceUploadAuthorization.
+    // Its default ('v1.2') gate also demands the typed-v1.2 grant this owner
+    // never held, so a shipped v1.1-only client would get 401; a v1.1
+    // envelope is claimed under 'v1.1', d43c8f92 claimDeviceUploadAuthorization's
+    // own gate (the v1.1 lease graph).
     async function claimFor(raw) {
       const authorizationId = randomUUID();
       const uploadSecret = randomBytes(32).toString("base64url");
@@ -1022,16 +1139,15 @@ test("an accountless v1.1 owner negotiates successors, matches the Q-1 rows, and
         [authorizationId, participantId, deviceId, uploadSecretHash(authorizationId, uploadSecret), envelopeDigest,
           bodyBytes, new Date(Date.now() - 1_000).toISOString(), new Date(Date.now() + 5 * 60_000).toISOString()],
       );
-      await assert.rejects(transport.claimPostgresDeviceUploadAuthorization(primaryPool,
-        `Upload um_device_upload_${authorizationId}.${uploadSecret}`,
-        { envelopeDigest, bodyBytes, contentType: "application/json" }, { schema }),
-      { code: "UPLOAD_AUTH_INVALID" });
-      await primaryPool.query(
-        `UPDATE ${q(primarySchema, "device_upload_authorizations")}
-            SET state = 'consuming', consume_lease_expires_at = $2 WHERE id = $1 AND state = 'unused'`,
-        [authorizationId, new Date(Date.now() + 60_000).toISOString()],
-      );
-      return { claimed: { authorizationId, participantId, authorizationKind: "device" }, envelopeDigest, authorizationId };
+      const header = `Upload um_device_upload_${authorizationId}.${uploadSecret}`;
+      const request = { envelopeDigest, bodyBytes, contentType: "application/json" };
+      await assert.rejects(transport.claimPostgresDeviceUploadAuthorization(primaryPool, header, request, { schema }),
+        { code: "UPLOAD_AUTH_INVALID" });
+      assert.equal((await grant(authorizationId)).state, "unused", "a refused claim leaves the grant redeemable");
+      const claimed = await transport.claimPostgresDeviceUploadAuthorization(primaryPool, header, request,
+        { schema, accountlessAuthorizationVersion: "v1.1" });
+      assert.deepEqual(claimed, { authorizationId, participantId, authorizationKind: "device" });
+      return { claimed, envelopeDigest, authorizationId };
     }
     const participantRow = { id: participantId, consentVersion: null, ownerKind: "accountless" };
     async function contribute(chunk, { bareClaim = false } = {}) {
@@ -1076,12 +1192,14 @@ test("an accountless v1.1 owner negotiates successors, matches the Q-1 rows, and
     )).rows[0].n, 0);
 
     // Uncertain persist, committed: the readback proves this attempt's own
-    // row, so the answer is the original (not replayed) receipt.
+    // row, and d43c8f92's catch answers a retained matching chunk as a
+    // replay (replayed: true, idempotency-replayed), whoever committed it.
     persistFault = "after";
     const committed = await contribute(prepared.chunks[0]);
     assert.equal(committed.response?.status, 202, committed.error?.code);
+    assert.equal(committed.response.headers.get("idempotency-replayed"), "true");
     const committedBody = await committed.response.json();
-    assert.equal(committedBody.replayed, false);
+    assert.equal(committedBody.replayed, true);
     assert.deepEqual(await grant(committed.authorizationId), {
       state: "consumed", consumed_contribution_id: committedBody.contributionId,
     });
@@ -1246,6 +1364,550 @@ test("a v1.1 head accepted before storage_source_state is reported pending and b
       ["active", generation.generationId, 1]);
     await assert.rejects(primaryPool.query(`SELECT ${q(primarySchema, "storage_v11_bridge_backfill")}(0)`),
       { message: "storage_v11_bridge_limit_invalid" });
+  } finally {
+    await close();
+  }
+});
+
+// ------------------------------------------- closure and admission edges --
+
+/**
+ * A social owner with an active device. With consent (the default) its v1.1
+ * device consent row is written too, which raises both floors to rank 11
+ * (0051's consent floor trigger), as the consent route does.
+ */
+async function seedSocialOwner(pool, primarySchema, constants, { consent = true } = {}) {
+  const now = new Date().toISOString();
+  const expiry = new Date(Date.now() + 30 * DAY_MS).toISOString();
+  const participantId = `participant:${randomUUID()}`;
+  const deviceId = randomUUID();
+  const sessionId = randomUUID();
+  const pairingId = randomUUID();
+  await pool.query(
+    `INSERT INTO ${q(primarySchema, "participants")} (id, owner_kind, state, consent_version, created_at)
+     VALUES ($1, 'social', 'active', $2, $3)`, [participantId, constants.TELEMETRY_CONSENT_VERSION, now],
+  );
+  await pool.query(
+    `INSERT INTO ${q(primarySchema, "web_sessions")} (
+       id, participant_id, secret_hash, csrf_hash, issued_at, expires_at, last_used_at
+     ) VALUES ($1, $2, $3, $4, $5, $6, $5)`,
+    [sessionId, participantId, randomBytes(32), randomBytes(32), now, expiry],
+  );
+  await pool.query(
+    `INSERT INTO ${q(primarySchema, "device_pairings")} (
+       id, participant_id, issued_by_session_id, secret_hash, consent_version,
+       transport_consent_version, state, issued_at, expires_at, consumed_at, claimed_device_id
+     ) VALUES ($1, $2, $3, $4, $5, 'ongoing-privacy-safe-telemetry-v1.0', 'consumed', $6, $7, $6, $8)`,
+    [pairingId, participantId, sessionId, randomBytes(32), constants.TELEMETRY_CONSENT_VERSION, now, expiry, deviceId],
+  );
+  await pool.query(
+    `INSERT INTO ${q(primarySchema, "device_credentials")} (
+       id, participant_id, authority_kind, paired_via_pairing_id, secret_hash,
+       state, issued_at, expires_at, last_used_at, social_verified_at
+     ) VALUES ($1, $2, 'social', $3, $4, 'active', $5, $6, $5, $5)`,
+    [deviceId, participantId, pairingId, randomBytes(32), now, expiry],
+  );
+  const owner = Object.freeze({ participantId, deviceId, principal: Object.freeze({ participantId, deviceId }) });
+  if (consent) await grantV11ConsentRow(pool, primarySchema, owner);
+  return owner;
+}
+
+async function grantV11ConsentRow(pool, primarySchema, owner) {
+  await pool.query(
+    `INSERT INTO ${q(primarySchema, "telemetry_v11_device_consents")} (
+       participant_id, device_id, telemetry_schema_version, field_dictionary_version,
+       privacy_contract_version, consented_at
+     ) VALUES ($1, $2, 'telemetry-contribution-v1.1', 'telemetry-v1.1-registry-2026-08-31.1',
+       'ongoing-privacy-safe-telemetry-v1.1', $3)`, [owner.participantId, owner.deviceId, new Date().toISOString()],
+  );
+}
+
+/** One chunk through the production claim, object journal and persist, as the envelope handler runs them. */
+async function persistDirect(modules, pool, schema, owner, chunk, options) {
+  const authorizationId = randomUUID();
+  const secret = randomBytes(32).toString("base64url");
+  const envelopeDigest = randomBytes(32).toString("hex");
+  await pool.query(
+    `INSERT INTO ${q(schema.primarySchema, "device_upload_authorizations")} (
+       id, participant_id, issued_by_device_id, secret_hash, envelope_digest,
+       body_bytes, content_type, state, issued_at, expires_at
+     ) VALUES ($1, $2, $3, $4, $5, 256, 'application/json', 'unused', $6, $7)`,
+    [authorizationId, owner.participantId, owner.deviceId, uploadSecretHash(authorizationId, secret), envelopeDigest,
+      new Date(Date.now() - 1_000).toISOString(), new Date(Date.now() + 5 * 60_000).toISOString()],
+  );
+  const claimed = await modules.transport.claimPostgresDeviceUploadAuthorization(pool,
+    `Upload um_device_upload_${authorizationId}.${secret}`,
+    { envelopeDigest, bodyBytes: 256, contentType: "application/json" },
+    { schema, accountlessAuthorizationVersion: "v1.1" });
+  const chunkRowId = `chunk:${randomUUID()}`;
+  const objectKey = `telemetry/v11-${randomUUID()}`;
+  await modules.live.registerPostgresTelemetryV11PendingObject(pool, chunkRowId, objectKey, Date.now(), options);
+  return modules.live.persistPostgresTypedV11StagedChunk(pool, owner.principal, chunk, {
+    chunkRowId, r2Key: objectKey, envelopeDigest, deviceUploadAuthorizationId: claimed.authorizationId,
+  }, Date.now(), options);
+}
+
+/** Register a day, stage every chunk, and return its (now ready) candidate. */
+async function stageDay(modules, pool, schema, owner, prepared, options) {
+  await modules.live.registerPostgresTelemetryV11DayManifest(pool, owner.principal, prepared.manifest, Date.now(), options);
+  for (const chunk of prepared.chunks) await persistDirect(modules, pool, schema, owner, chunk, options);
+  const ready = await modules.live.registerPostgresTelemetryV11DayManifest(
+    pool, owner.principal, prepared.manifest, Date.now(), options,
+  );
+  assert.equal(ready.state, "ready");
+  return { day: ready.day, manifestId: ready.manifestId, manifestDigest: ready.manifestDigest };
+}
+
+/** Empty, immediately ready day manifests for every day in the range. */
+async function emptyDays(modules, pool, owner, fromDay, throughDay, parserVersion, options) {
+  const days = [];
+  for (const day of utcDays(fromDay, throughDay)) {
+    const ready = await modules.live.registerPostgresTelemetryV11DayManifest(
+      pool, owner.principal, makeV11Day(day, {}, parserVersion).manifest, Date.now(), options,
+    );
+    days.push({ day, manifestId: ready.manifestId, manifestDigest: ready.manifestDigest });
+  }
+  return days;
+}
+
+function withDay(days, replacement) {
+  return days.map((entry) => (entry.day === replacement.day ? replacement : entry));
+}
+
+async function refusal(promise) {
+  try {
+    await promise;
+  } catch (error) {
+    return { status: error?.status, code: error?.code };
+  }
+  return { status: "resolved" };
+}
+
+/**
+ * One typed v1.0 chunk in the shape the D1 transfer and typed v1 admission
+ * leave it (0033): the header with its consumed grant and object journal row
+ * first; `admit` then writes the typed records, their allocation and record
+ * admissions, and the typed v1 event source.
+ */
+async function seedTypedV1Chunk(modules, pool, primarySchema, owner, { day, stream, chunkSeq, records }) {
+  const table = (name) => q(primarySchema, name);
+  const now = new Date().toISOString();
+  const authorizationId = randomUUID();
+  const chunkRowId = `chunk:${randomUUID()}`;
+  const r2Key = `synthetic/${chunkRowId}`;
+  await pool.query(
+    `INSERT INTO ${table("device_upload_authorizations")} (
+       id, participant_id, issued_by_device_id, secret_hash, envelope_digest, body_bytes, content_type,
+       state, issued_at, expires_at, consumed_at
+     ) VALUES ($1, $2, $3, $4, $5, 256, 'application/json', 'consumed', $6, $7, $6)`,
+    [authorizationId, owner.participantId, owner.deviceId, randomBytes(32), randomBytes(32).toString("hex"),
+      now, new Date(Date.now() + DAY_MS).toISOString()],
+  );
+  await pool.query(
+    `INSERT INTO ${table("pending_objects")} (contribution_id, object_key, object_kind) VALUES ($1, $2, 'telemetry_v1')`,
+    [chunkRowId, r2Key],
+  );
+  await pool.query(
+    `INSERT INTO ${table("telemetry_v1_chunks")} (
+       id, participant_id, device_id, stream, chunk_day, chunk_seq, revision, chunk_digest, envelope_digest,
+       parser_version, record_count, accepted_record_count, r2_key, device_upload_authorization_id, created_at
+     ) VALUES ($1, $2, $3, $4, $5::date, $6, 1, $7, $8, 'synthetic-typed-v1', $9, $9, $10, $11, $12)`,
+    [chunkRowId, owner.participantId, owner.deviceId, stream, day, chunkSeq,
+      sha256Hex(canonicalTelemetryV11Json(records)), randomBytes(32).toString("hex"), records.length, r2Key,
+      authorizationId, now],
+  );
+  async function admit({ ownerDigest, firstSourceRowId }) {
+    const { codec } = modules;
+    const original = (value) => Buffer.from(codec.encodeTypedTelemetryId(value));
+    const state = (await pool.query(
+      `SELECT namespace_id::text AS namespace_id, source_namespace FROM ${table("typed_v1_admission_state")} WHERE id = 1`,
+    )).rows[0];
+    const ns = state.namespace_id;
+    const ensure = async (insertSql, selectSql, values) => {
+      await pool.query(insertSql, values);
+      return (await pool.query(selectSql, values)).rows[0].id;
+    };
+    const ownerId = await ensure(
+      `INSERT INTO ${table("typed_telemetry_owners")} (namespace_id, original_id) VALUES ($1, $2)
+       ON CONFLICT (namespace_id, original_id) DO NOTHING`,
+      `SELECT id::text AS id FROM ${table("typed_telemetry_owners")} WHERE namespace_id = $1 AND original_id = $2`,
+      [ns, original(owner.participantId)],
+    );
+    await pool.query(
+      `INSERT INTO ${table("typed_telemetry_owner_memberships")} (
+         namespace_id, source_format, owner_id, participant_id, source_namespace
+       ) VALUES ($1, 10, $2, $3, $4) ON CONFLICT DO NOTHING`,
+      [ns, ownerId, owner.participantId, state.source_namespace],
+    );
+    await pool.query(
+      `INSERT INTO ${table("typed_telemetry_devices")} (namespace_id, owner_id, original_id) VALUES ($1, $2, $3)
+       ON CONFLICT (namespace_id, original_id) DO NOTHING`,
+      [ns, ownerId, original(owner.deviceId)],
+    );
+    const deviceStorageId = (await pool.query(
+      `SELECT id::text AS id FROM ${table("typed_telemetry_devices")} WHERE namespace_id = $1 AND original_id = $2`,
+      [ns, original(owner.deviceId)],
+    )).rows[0].id;
+    const streamCode = { usage: 1, quota: 2, session: 3 }[stream];
+    const dayNumber = Date.parse(`${day}T00:00:00.000Z`) / DAY_MS;
+    const typedChunkId = (await pool.query(
+      `INSERT INTO ${table("typed_telemetry_chunks")} (
+         namespace_id, format, owner_id, device_id, manifest_id, original_id, stream, chunk_day
+       ) VALUES ($1, 10, $2, $3, NULL, $4, $5, $6) RETURNING id::text AS id`,
+      [ns, ownerId, deviceStorageId, original(chunkRowId), streamCode, dayNumber],
+    )).rows[0].id;
+    await pool.query(
+      `INSERT INTO ${table("typed_v1_chunk_allocations")} (
+         chunk_id, namespace_id, chunk_original, first_source_row_id, record_count
+       ) VALUES ($1, $2, $3, $4, $5)`,
+      [chunkRowId, ns, original(chunkRowId), firstSourceRowId, records.length],
+    );
+    const word = (value) => ensure(
+      `INSERT INTO ${table("typed_telemetry_dictionary")} (value) VALUES ($1) ON CONFLICT (value) DO NOTHING`,
+      `SELECT id::text AS id FROM ${table("typed_telemetry_dictionary")} WHERE value = $1`, [value],
+    );
+    const canonicalDigests = [];
+    for (const [index, record] of records.entries()) {
+      const fields = codec.encodeTypedTelemetryRecord("v1", record);
+      const canonical = codec.typedTelemetryCanonicalRecords(fields).canonicalRecord;
+      const digest = createHash("sha256").update(canonical).digest();
+      canonicalDigests.push(digest.toString("hex"));
+      const recordId = (await pool.query(
+        `INSERT INTO ${table("typed_telemetry_records")} (
+           namespace_id, format, source_row_id, owner_id, device_id, chunk_id, manifest_id, stream,
+           occurrence_id, observed_at_ms, observed_day, provider_id, canonical_digest
+         ) VALUES ($1, 10, $2, $3, $4, $5, NULL, $6, $7, $8, $9, $10, $11) RETURNING id::text AS id`,
+        [ns, firstSourceRowId + index, ownerId, deviceStorageId, typedChunkId, streamCode,
+          Buffer.from(fields.occurrenceId), fields.observedAtMs, Math.floor(fields.observedAtMs / DAY_MS),
+          await word(fields.provider), digest],
+      )).rows[0].id;
+      if (fields.usage) {
+        const usage = fields.usage;
+        const sessionId = await ensure(
+          `INSERT INTO ${table("typed_telemetry_identifiers")} (namespace_id, owner_id, value) VALUES ($1, $2, $3)
+           ON CONFLICT (namespace_id, owner_id, value) DO NOTHING`,
+          `SELECT id::text AS id FROM ${table("typed_telemetry_identifiers")}
+            WHERE namespace_id = $1 AND owner_id = $2 AND value = $3`,
+          [ns, ownerId, Buffer.from(usage.sessionId)],
+        );
+        await pool.query(
+          `INSERT INTO ${table("typed_telemetry_usage")} (
+             record_id, session_id, model_id, speed_mode_id, api_service_tier_id, surface_id, billing_surface_id,
+             reasoning_effort_id, agent_scope_id, outcome_id, attribution_id, total_input_context_tokens,
+             input_uncached_tokens, input_cache_read_tokens, input_cache_write_tokens, output_text_tokens,
+             output_reasoning_tokens, output_combined_tokens
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, $11, $12, $13, $14, $15, $16, $17)`,
+          [recordId, sessionId, await word(usage.modelId), await word(usage.speedMode), await word(usage.apiServiceTier),
+            await word(usage.surface), await word(usage.billingSurface), await word(usage.reasoningEffort),
+            await word(usage.agentScope), await word(usage.outcome), usage.totalInputContextTokens,
+            usage.components.inputUncachedTokens, usage.components.inputCacheReadTokens,
+            usage.components.inputCacheWriteTokens, usage.components.outputTextTokens,
+            usage.components.outputReasoningTokens, usage.components.outputCombinedTokens],
+        );
+      }
+      for (const [tool, total] of Object.entries(fields.tools ?? {})) {
+        await pool.query(
+          `INSERT INTO ${table("typed_telemetry_session_tools")} (record_id, tool_class_id, count) VALUES ($1, $2, $3)`,
+          [recordId, await word(tool), total],
+        );
+      }
+      await pool.query(
+        `INSERT INTO ${table("typed_v1_record_admissions")} (typed_record_id, chunk_id) VALUES ($1, $2)`,
+        [recordId, chunkRowId],
+      );
+    }
+    await pool.query(
+      `INSERT INTO ${table("typed_v1_event_sources")} (
+         event_digest, owner_digest, participant_id, chunk_id, source_namespace
+       ) VALUES ($1, $2, $3, $4, $5)`,
+      [randomBytes(32).toString("hex"), ownerDigest, owner.participantId, chunkRowId, state.source_namespace],
+    );
+    return canonicalDigests;
+  }
+  return { chunkRowId, admit };
+}
+
+test("typed v1 history carries into a v1.1 domain only through ingestion-isolation 0007's transition proof", {
+  skip: endpoint === null,
+  timeout: 300_000,
+}, async () => {
+  const { primaryPool, schema, close } = await openSchemas("tv1", [STAGED]);
+  try {
+    const modules = await loadModules();
+    const { live, constants, compatibility, codec } = modules;
+    const { primarySchema } = schema;
+    const options = { schema, sourceNamespace: SOURCE_NAMESPACE };
+    await primaryPool.query(
+      `UPDATE ${q(primarySchema, "telemetry_transport_formats")} SET lifecycle = 'accepted'
+        WHERE schema_version = 'telemetry-contribution-v1.1'`,
+    );
+    await live.initializePostgresTypedV11Admission(primaryPool, options);
+    // Typed v1 admission pinned to the same namespace, qualified as D1's is.
+    await primaryPool.query(
+      `INSERT INTO ${q(primarySchema, "typed_v1_admission_state")} (
+         id, source_namespace, namespace_id, runtime_contract_version, next_source_row_id
+       ) SELECT 1, source_namespace, namespace_id, 1, 1000 FROM ${q(primarySchema, "typed_v11_admission_state")}`,
+    );
+    // The v1.0 history predates the owner's v1.1 consent (floor rank 1 then 11).
+    const owner = await seedSocialOwner(primaryPool, primarySchema, constants, { consent: false });
+    const ownerDigest = randomBytes(32).toString("hex");
+    await primaryPool.query(
+      `INSERT INTO ${q(primarySchema, "storage_v11_owner_links")} (participant_id, owner_digest, state)
+       VALUES ($1, $2, 'active')`, [owner.participantId, ownerDigest],
+    );
+
+    // The owner's v1.0 history for the Q-1 day is the exact legacy projection
+    // of three v1.1 records: two usage rows in one chunk, one session row in
+    // another. The session chunk's typed rows are not admitted yet.
+    const day = fixture.day;
+    const usage = fixture.records.usage.slice(0, 2);
+    const sessionRecord = fixture.records.session[0];
+    const legacy = (stream, record) => JSON.parse(compatibility.telemetryV11LegacyProjection(stream, record).canonicalRecord);
+    const usageChunk = await seedTypedV1Chunk(modules, primaryPool, primarySchema, owner, {
+      day, stream: "usage", chunkSeq: 0, records: usage.map((record) => legacy("usage", record)),
+    });
+    const usageDigests = await usageChunk.admit({ ownerDigest, firstSourceRowId: 1 });
+    // The typed v1 canonical digest is exactly what a v1.1 proof's legacy digest carries.
+    assert.deepEqual(usageDigests, usage.map((record) =>
+      sha256Hex(compatibility.telemetryV11LegacyProjection("usage", record).canonicalRecord)));
+    const sessionChunk = await seedTypedV1Chunk(modules, primaryPool, primarySchema, owner, {
+      day, stream: "session", chunkSeq: 0, records: [legacy("session", sessionRecord)],
+    });
+    assert.equal(codec.typedTelemetryCanonicalRecords(codec.encodeTypedTelemetryRecord("v1", legacy("session", sessionRecord)))
+      .canonicalRecord, compatibility.telemetryV11LegacyProjection("session", sessionRecord).canonicalRecord);
+    await grantV11ConsentRow(primaryPool, primarySchema, owner);
+
+    const domain = live.createPostgresTelemetryV11Domain(primaryPool, options);
+    const predecessor = await domain.createPredecessor(owner.principal);
+    const stored = (await primaryPool.query(
+      `SELECT winners_json FROM ${q(primarySchema, "telemetry_v11_domain_predecessors")} WHERE token_hash = $1`,
+      [sha256Hex(predecessor.token)],
+    )).rows[0];
+    assert.deepEqual(JSON.parse(stored.winners_json), [[owner.participantId, day, owner.deviceId]],
+      "the bootstrap predecessor pins the typed v1 winner");
+    const today = new Date().toISOString().slice(0, 10);
+    assert.deepEqual([predecessor.fromDay, predecessor.throughDay], [day, today]);
+    const empties = await emptyDays(modules, primaryPool, owner, day, today, fixture.parserVersion, options);
+
+    const full = await stageDay(modules, primaryPool, schema, owner,
+      makeV11Day(day, { usage, session: [sessionRecord] }, fixture.parserVersion), options);
+    const dropping = await stageDay(modules, primaryPool, schema, owner,
+      makeV11Day(day, { usage: usage.slice(0, 1), session: [sessionRecord] }, fixture.parserVersion), options);
+    const activate = (dayEntry) => domain.activate(owner.principal, domainManifest(predecessor, withDay(empties, dayEntry)));
+    const unproven = { status: 409, code: "TELEMETRY_COMPATIBILITY_PROOF_UNAVAILABLE" };
+
+    // (b) a partially admitted current winner chunk refuses before any row proof.
+    assert.deepEqual(await refusal(activate(full)), unproven);
+    await sessionChunk.admit({ ownerDigest, firstSourceRowId: 3 });
+    // (a) both typed runtimes must be qualified over one namespace.
+    await primaryPool.query(`UPDATE ${q(primarySchema, "typed_v1_admission_state")} SET runtime_contract_version = 0`);
+    assert.deepEqual(await refusal(activate(full)), unproven);
+    await primaryPool.query(`UPDATE ${q(primarySchema, "typed_v1_admission_state")} SET runtime_contract_version = 1`);
+    // (c) a candidate day that leaves out a typed v1 winner occurrence.
+    assert.deepEqual(await refusal(activate(dropping)), unproven);
+    const ownerRevision = async () => (await primaryPool.query(
+      `SELECT (SELECT count(*)::int FROM ${q(primarySchema, "telemetry_v11_domain_heads")} WHERE participant_id = $1) AS heads,
+              (SELECT revision::int FROM ${q(primarySchema, "community_analytical_input_versions")} WHERE participant_id = $1) AS input`,
+      [owner.participantId],
+    )).rows[0];
+    assert.deepEqual(await ownerRevision(), { heads: 0, input: 0 }, "a refused activation moves nothing");
+
+    // Every typed v1 occurrence present with its legacy digest: admitted.
+    const generation = await activate(full);
+    assert.equal(generation.replay, false);
+    assert.deepEqual(await ownerRevision(), { heads: 1, input: 1 });
+  } finally {
+    await close();
+  }
+});
+
+test("an active usage-correction runtime admits an exact-total restatement and nothing else", {
+  skip: endpoint === null,
+  timeout: 300_000,
+}, async () => {
+  const { primaryPool, schema, close } = await openSchemas("corr", [STAGED]);
+  try {
+    const modules = await loadModules();
+    const { live, constants } = modules;
+    const { primarySchema } = schema;
+    const options = { schema, sourceNamespace: SOURCE_NAMESPACE };
+    await primaryPool.query(
+      `UPDATE ${q(primarySchema, "telemetry_transport_formats")} SET lifecycle = 'accepted'
+        WHERE schema_version = 'telemetry-contribution-v1.1'`,
+    );
+    await live.initializePostgresTypedV11Admission(primaryPool, options);
+    const owner = await seedSocialOwner(primaryPool, primarySchema, constants);
+    const today = new Date().toISOString().slice(0, 10);
+    const base = { ...fixture.records.usage[0], eventTime: `${today}T00:00:01.000Z`, totalInputContextTokens: null };
+    const domain = live.createPostgresTelemetryV11Domain(primaryPool, options);
+    const first = await stageDay(modules, primaryPool, schema, owner, makeV11Day(today, { usage: [base] }, "synthetic-corr"), options);
+    const generation = await domain.activate(owner.principal, domainManifest(await domain.createPredecessor(owner.principal), [first]));
+    assert.equal(generation.replay, false);
+
+    // The same occurrence restating its exact total, and one changing a split.
+    const restated = await stageDay(modules, primaryPool, schema, owner, makeV11Day(today, {
+      usage: [{ ...base, totalInputContextTokens: 17_988 }],
+    }, "synthetic-corr"), options);
+    const resplit = await stageDay(modules, primaryPool, schema, owner, makeV11Day(today, {
+      usage: [{ ...base, totalInputContextTokens: 17_988, components: { ...base.components, outputTextTokens: 1 } }],
+    }, "synthetic-corr"), options);
+    const successor = await domain.createPredecessor(owner.principal);
+    const unproven = { status: 409, code: "TELEMETRY_COMPATIBILITY_PROOF_UNAVAILABLE" };
+    // Without an active correction runtime the base digests must be equal.
+    assert.deepEqual(await refusal(domain.activate(owner.principal, domainManifest(successor, [restated]))), unproven);
+    await primaryPool.query(
+      `INSERT INTO ${q(primarySchema, "telemetry_usage_correction_runtime")} (
+         id, schema_version, method_version, source_state, max_capture_rows, max_history_page
+       ) VALUES (1, 'telemetry-usage-correction-v1', 'usage-total-correction-v1', 'active', 200, 200)`,
+    );
+    // Active: a changed split is still not the same occurrence.
+    assert.deepEqual(await refusal(domain.activate(owner.principal, domainManifest(successor, [resplit]))), unproven);
+    const corrected = await domain.activate(owner.principal, domainManifest(successor, [restated]));
+    assert.equal(corrected.replay, false);
+    assert.equal(corrected.generationId === generation.generationId, false);
+  } finally {
+    await close();
+  }
+});
+
+test("v1.1 admission answers the Worker's caps, conflicts, v0.2 refusal and concurrent activations", {
+  skip: endpoint === null,
+  timeout: 300_000,
+}, async () => {
+  const { primaryPool, schema, close } = await openSchemas("edge", [STAGED]);
+  try {
+    const modules = await loadModules();
+    const { live, constants } = modules;
+    const { primarySchema } = schema;
+    const options = { schema, sourceNamespace: SOURCE_NAMESPACE };
+    await primaryPool.query(
+      `UPDATE ${q(primarySchema, "telemetry_transport_formats")} SET lifecycle = 'accepted'
+        WHERE schema_version = 'telemetry-contribution-v1.1'`,
+    );
+    await live.initializePostgresTypedV11Admission(primaryPool, options);
+    const owner = await seedSocialOwner(primaryPool, primarySchema, constants);
+    const today = new Date().toISOString().slice(0, 10);
+    const yesterday = new Date(Date.now() - DAY_MS).toISOString().slice(0, 10);
+    const usageAt = (dayValue, suffix) => ({
+      ...fixture.records.usage[0], eventId: `event:v2:${sha256Hex(`v11-edge-${suffix}`)}`, eventTime: `${dayValue}T00:00:01.000Z`,
+    });
+    const domain = live.createPostgresTelemetryV11Domain(primaryPool, options);
+
+    // 429 CHUNK_ADMISSION_LIMIT_REACHED, retry-after 60: the per-device daily
+    // chunk window (20,000 while the device is under a week old).
+    const limited = makeV11Day(yesterday, { usage: [usageAt(yesterday, "limited")] }, "synthetic-edge");
+    await live.registerPostgresTelemetryV11DayManifest(primaryPool, owner.principal, limited.manifest, Date.now(), options);
+    await primaryPool.query(
+      `INSERT INTO ${q(primarySchema, "telemetry_v1_chunk_admission_windows")} (
+         participant_id, device_id, window_day, accepted_count, last_accepted_at
+       ) VALUES ($1, $2, $3::date, 20000, now())`, [owner.participantId, owner.deviceId, today],
+    );
+    await assert.rejects(persistDirect(modules, primaryPool, schema, owner, limited.chunks[0], options), (error) =>
+      error?.status === 429 && error.code === "CHUNK_ADMISSION_LIMIT_REACHED"
+        && new Headers(error.responseHeaders).get("retry-after") === "60");
+    await primaryPool.query(
+      `DELETE FROM ${q(primarySchema, "telemetry_v1_chunk_admission_windows")} WHERE participant_id = $1`,
+      [owner.participantId],
+    );
+
+    // 409 TELEMETRY_OCCURRENCE_CONFLICT: one occurrence in two candidate days.
+    const shared = usageAt(yesterday, "shared");
+    const first = await stageDay(modules, primaryPool, schema, owner, makeV11Day(yesterday, { usage: [shared] }, "synthetic-edge"), options);
+    const second = await stageDay(modules, primaryPool, schema, owner, makeV11Day(today, {
+      usage: [{ ...shared, eventTime: `${today}T00:00:01.000Z` }],
+    }, "synthetic-edge"), options);
+    const conflictPredecessor = await domain.createPredecessor(owner.principal);
+    assert.deepEqual(await refusal(domain.activate(owner.principal, domainManifest(conflictPredecessor, [first, second]))),
+      { status: 409, code: "TELEMETRY_OCCURRENCE_CONFLICT" });
+
+    // Concurrent activations under one predecessor: the identical pair
+    // converges on one generation (one write, one replay); a different
+    // manifest racing it is a manifest conflict.
+    const todayEmpty = (await emptyDays(modules, primaryPool, owner, today, today, "synthetic-edge", options))[0];
+    const winner = domainManifest(conflictPredecessor, [first, todayEmpty]);
+    const racing = await Promise.all([
+      domain.activate(owner.principal, winner), domain.activate(owner.principal, winner),
+    ]);
+    assert.deepEqual(racing.map((result) => result.replay).sort(), [false, true]);
+    assert.equal(racing[0].generationId, racing[1].generationId);
+    const loserPredecessor = await domain.createPredecessor(owner.principal);
+    const challenger = await stageDay(modules, primaryPool, schema, owner, makeV11Day(today, {
+      usage: [usageAt(today, "challenger")],
+    }, "synthetic-edge"), options);
+    const outcomes = await Promise.all([
+      refusal(domain.activate(owner.principal, domainManifest(loserPredecessor, [first, challenger]))),
+      refusal(domain.activate(owner.principal, domainManifest(loserPredecessor, [first, todayEmpty]))),
+    ]);
+    assert.deepEqual(outcomes.map((outcome) => outcome.status).sort(), [409, "resolved"]);
+    assert.ok(outcomes.some((outcome) => outcome.code === "TELEMETRY_MANIFEST_CONFLICT"));
+
+    // 429 for the 8,192nd-plus manifest of one device and UTC day, even
+    // under concurrent registration.
+    await primaryPool.query(
+      `INSERT INTO ${q(primarySchema, "telemetry_v11_day_manifests")} (
+         id, participant_id, device_id, chunk_day, manifest_digest, parser_version, manifest_json,
+         expected_chunk_count, state, created_at
+       ) SELECT gen_random_uuid()::text, $1, $2, DATE '2026-01-01' + (n % 200),
+                encode(sha256(convert_to('v11-edge-cap-' || n, 'UTF8')), 'hex'), 'synthetic-edge', '{}', 1, 'staged', now()
+           FROM generate_series(1, 8192 - (
+             SELECT count(*)::int FROM ${q(primarySchema, "telemetry_v11_day_manifests")}
+              WHERE participant_id = $1 AND device_id = $2 AND created_at >= date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+           ) - 1) n`,
+      [owner.participantId, owner.deviceId],
+    );
+    const capDays = ["2025-06-01", "2025-06-02", "2025-06-03", "2025-06-04"];
+    const registered = await Promise.all(capDays.map((dayValue) => refusal(live.registerPostgresTelemetryV11DayManifest(
+      primaryPool, owner.principal, makeV11Day(dayValue, { usage: [usageAt(dayValue, "cap")] }, "synthetic-edge").manifest,
+      Date.now(), options,
+    ))));
+    assert.deepEqual(registered.map((outcome) => outcome.status).sort(), [429, 429, 429, "resolved"],
+      "concurrent registrations stop exactly at the cap");
+    assert.equal((await primaryPool.query(
+      `SELECT count(*)::int AS n FROM ${q(primarySchema, "telemetry_v11_day_manifests")}
+        WHERE participant_id = $1 AND device_id = $2 AND created_at >= date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'`,
+      [owner.participantId, owner.deviceId],
+    )).rows[0].n, 8192);
+
+    // Accepted v0.2 history: the transport gate refuses every v1.1 write
+    // with 403 TELEMETRY_TRANSPORT_BLOCKED before consent is even read, as
+    // the Worker's does, so the closure's own v0.2 refusal is defence in depth.
+    const legacyOwner = await seedSocialOwner(primaryPool, primarySchema, constants, { consent: false });
+    const legacyUpload = randomUUID();
+    await primaryPool.query(
+      `INSERT INTO ${q(primarySchema, "device_upload_authorizations")} (
+         id, participant_id, issued_by_device_id, secret_hash, envelope_digest, body_bytes, content_type,
+         state, issued_at, expires_at, consumed_at
+       ) VALUES ($1, $2, $3, $4, $5, 256, 'application/json', 'consumed', now(), now() + interval '1 day', now())`,
+      [legacyUpload, legacyOwner.participantId, legacyOwner.deviceId, randomBytes(32), randomBytes(32).toString("hex")],
+    );
+    // 0011's participant guard resolves its table through search_path.
+    const legacyClient = await primaryPool.connect();
+    try {
+      await legacyClient.query(`SET search_path TO "${primarySchema}"`);
+      await legacyClient.query(
+      `INSERT INTO ${q(primarySchema, "telemetry_contributions")} (
+         id, participant_id, plaintext_digest, envelope_digest, r2_key, status, schema_version,
+         transport_schema_version, range_start, range_end, client_platform, provider_policy_epoch,
+         priced_event_coverage_percent, unknown_model_event_count, unknown_billable_units, price_basis,
+         declared_record_count, device_upload_authorization_id, created_at
+       ) VALUES ($1, $2, $3, $4, $5, 'accepted', 'telemetry-contribution-v0.1', 'telemetry-contribution-v0.2',
+         now() - interval '1 day', now(), 'synthetic', 'synthetic', 100, 0, 0, 'synthetic', 0, $6, now())`,
+      [`contribution:${randomUUID()}`, legacyOwner.participantId, randomBytes(32).toString("hex"),
+        randomBytes(32).toString("hex"), `synthetic/v02-${randomUUID()}`, legacyUpload],
+      );
+    } finally {
+      legacyClient.release(true);
+    }
+    const blocked = { status: 403, code: "TELEMETRY_TRANSPORT_BLOCKED" };
+    await assert.rejects(grantV11ConsentRow(primaryPool, primarySchema, legacyOwner), { message: "telemetry_transport_blocked" });
+    assert.deepEqual(await refusal(domain.createPredecessor(legacyOwner.principal)), blocked);
+    assert.deepEqual(await refusal(live.registerPostgresTelemetryV11DayManifest(
+      primaryPool, legacyOwner.principal, makeV11Day(today, {}, "synthetic-edge").manifest, Date.now(), options,
+    )), blocked);
+    assert.deepEqual(await refusal(domain.activate(legacyOwner.principal, domainManifest(
+      { token: randomUUID(), previousGenerationId: null, legacyFingerprint: "0".repeat(64) },
+      [{ day: today, manifestId: randomUUID(), manifestDigest: "1".repeat(64) }],
+    ))), blocked);
   } finally {
     await close();
   }

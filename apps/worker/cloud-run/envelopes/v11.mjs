@@ -25,9 +25,30 @@
  *      the retained contribution), 409 on a different chunk
  *   7. register the object journal, write the object, persist in one
  *      transaction, record the receipt           202 staged
- * A persist failure is resolved by an exact readback: our own committed row
- * answers as committed, an identical retained chunk as a replay, and only an
- * absent or conflicting outcome abandons the claim and retires the object.
+ * A persist failure is resolved by an exact readback. A retained chunk with
+ * this content answers as a replay (replayed: true and idempotency-replayed),
+ * whether it is this attempt's own row whose commit acknowledgement was lost
+ * or another attempt's, exactly as handleTelemetryV11Contribution's catch
+ * does; only an absent or conflicting outcome abandons the claim and retires
+ * the object.
+ *
+ * The handler resolves its claim on every path (it records the receipt
+ * itself, and abandons after an uncertain persist only when nothing was
+ * stored), so it registers with ownsReceipt: true and the IN-1b preamble
+ * records nothing after it.
+ *
+ * Steps the shared preamble owns, not this handler: the v1.1 transport write
+ * gate the Worker runs before dispatch (assertTelemetryTransportWriteAllowed
+ * for telemetry-contribution-v1.1). The IN-1b preamble runs it as the
+ * telemetry-contribution-v1.1 upload-authorization format's
+ * assertUploadAllowed (IN-3's legacyUploadAuthorizationFormatEntries, TA-1),
+ * and assertContributionEnvelopeFormats refuses to start an origin that
+ * registers this envelope without that format, so the replay in step 6 never
+ * runs for a refused principal. The Worker checks the exact key set (step 1)
+ * before its participant, tombstone and transport checks; the preamble runs
+ * those first, so a body with a wrong key set from a tombstoned or
+ * transport-refused principal is 401/403 here instead of 400. Shipped clients
+ * always send the exact key set.
  */
 
 import {
@@ -245,8 +266,10 @@ export function createTelemetryV11ContributionEnvelope(dependencies) {
         throw unavailable();
       }
       if (outcome.outcome === "committed" && outcome.row) {
+        // d43c8f92 answers its own lost-acknowledgement commit through the
+        // retained-row readback, as a replay.
         await deps.recordUploadReceipt(pool, claim.authorizationId, outcome.row.id, Date.now(), options);
-        return receipt(outcome.row.id, outcome.row.manifestId, chunk, false);
+        return receipt(outcome.row.id, outcome.row.manifestId, chunk, true);
       }
       if (outcome.outcome === "replay" && outcome.row) {
         await deps.recordUploadReceipt(pool, claim.authorizationId, outcome.row.id, Date.now(), options);
@@ -275,5 +298,9 @@ export function createTelemetryV11ContributionEnvelope(dependencies) {
     return receipt(result.contributionId, result.manifestId, chunk, result.replay);
   }
 
-  return registerContributionEnvelope(TELEMETRY_V11_ENVELOPE_SCHEMA_VERSION, handleTelemetryV11Contribution);
+  // ownsReceipt: the handler records (or, after an uncertain persist that
+  // stored nothing, abandons) its claim itself. The IN-1a seam ignores the
+  // option; the landed IN-1b seam honours it.
+  return registerContributionEnvelope(TELEMETRY_V11_ENVELOPE_SCHEMA_VERSION, handleTelemetryV11Contribution,
+    { ownsReceipt: true });
 }

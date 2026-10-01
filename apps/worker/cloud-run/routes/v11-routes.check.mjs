@@ -132,6 +132,56 @@ test("v1.1 device routes answer the Worker's preamble codes before storage", asy
   )), 400, "BODY_INVALID");
 });
 
+test("the composition's pathname dispatch answers the Worker's 405 and Allow for every wrong method", async () => {
+  const stub = () => async () => { throw new Error("storage is not used by this check"); };
+  const adapter = (names) => Object.fromEntries(names.map((name) => [name, stub()]));
+  const intake = createTelemetryV11OriginIntake({
+    adapters: {
+      live: adapter([
+        "grantPostgresTelemetryV11Consent", "registerPostgresTelemetryV11DayManifest",
+        "readPostgresTelemetryV11DayChunkVector", "readPostgresTelemetryV11DayCandidates",
+        "createPostgresTelemetryV11Domain", "readPostgresTelemetryV11StorageReplay",
+        "persistPostgresTypedV11StagedChunk", "readPostgresTelemetryV11UploadOutcome",
+        "recordPostgresTelemetryV11UploadReceipt", "registerPostgresTelemetryV11PendingObject",
+        "retirePostgresTelemetryV11PendingObject", "validatePostgresTelemetryV11StagedChunk",
+      ]),
+      bearer: adapter(["authenticatePostgresDeviceBearer"]),
+      transport: adapter(["abandonPostgresDeviceUploadAuthorization"]),
+      ledgerAuthority: adapter(["hasPostgresDeletionTombstone"]),
+      personalDevices: adapter(["authenticatePostgresPersonalSession", "assertPostgresPersonalSessionCsrf"]),
+      controls: adapter(["assertPostgresCollectionControlFromPool"]),
+      crypto: adapter(["decryptSyntheticEnvelope", "sha256Hex"]),
+      boundedBody: adapter(["readBoundedRequestBody"]),
+    },
+    primaryPool: pool, ledgerPool: { connect: pool.connect }, schema, admissionEnv: {},
+    assertAdmissionBindings() { throw new Error("a 405 precedes admission"); },
+    async assertAttemptAllowed() { throw new Error("a 405 precedes the attempt limit"); },
+    maxRequestBytes: 64,
+    socialConsentVersion: "privacy-safe-telemetry-v0.1",
+    sourceNamespace: "synthetic-namespace",
+    envelopePublicJwk: "{}",
+    envelopePrivateJwk: "{}",
+  });
+  // d43c8f92 route-registry.ts methods for these four exact routes.
+  const allowed = new Map([
+    ["/api/v1/me/device-telemetry-consents", "POST"],
+    ["/api/v1/device/telemetry/v1.1/day-manifests", "GET, POST"],
+    ["/api/v1/me/telemetry-v11/domain-predecessor", "POST"],
+    ["/api/v1/me/telemetry-v11/domain-activate", "POST"],
+  ]);
+  assert.deepEqual(intake.pathnames, [...allowed.keys()]);
+  for (const [pathname, allow] of allowed) {
+    for (const method of ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]) {
+      if (allow.split(", ").includes(method)) continue;
+      const response = await expectError(await intake.dispatch(request(pathname, { method })), 405, "METHOD_NOT_ALLOWED");
+      assert.equal(response.headers.get("allow"), allow, `${method} ${pathname}`);
+    }
+  }
+  assert.equal(await intake.dispatch(request("/api/v1/contributions")), null);
+  assert.equal(await intake.dispatch(request("/api/v1/me/telemetry-v11/domain-activate/extra")), null);
+  if ("ownsReceipt" in intake.envelopeRegistration) assert.equal(intake.envelopeRegistration.ownsReceipt, true);
+});
+
 test("a failure that is not a closed error is the Worker's 500 without its text", async () => {
   const route = createTelemetryV11DomainActivateRouteModule(deviceDependencies({
     createDomain() {

@@ -8,8 +8,9 @@
  * JSON body, which must be exactly {} (400 BODY_INVALID), then
  * createPostgresTelemetryV11Domain().createPredecessor; 201.
  *
- * Not a built-in of the origin: registering it needs the additive-module
- * extension of origin-route-modules.mjs (IN-2 hand-off to the lead).
+ * Not a built-in of the origin: it is mounted through v11-composition.mjs's
+ * pathname dispatch, which hands every method to this handler so a wrong one
+ * gets the Worker's 405 (IN-2 hand-off to the lead).
  */
 
 import { defineOriginRouteModule } from "../origin-route-modules.mjs";

@@ -8,11 +8,29 @@
  * and esbuild bundles them); nothing here opens a pool, reads process.env or
  * picks a runtime adapter (family contract FC-3).
  *
- * The route modules are additive (overridesBuiltIn: false): the IN-1
- * registry must accept registry routes the origin has no built-in for before
- * they can be mounted. The envelope registration goes to
- * createContributionEnvelopeRegistry next to v1.2, and its transport needs
- * the telemetry-contribution-v1.1 upload-authorization format (IN-3).
+ * Mounting the four routes (lead hand-off). The IN-1 route-module seam
+ * replaces only named built-ins and resolves a module by exact method and
+ * pathname, so it refuses these additive modules, and even an additive
+ * extension would let a wrong method fall through to the origin's
+ * non-module path instead of the Worker's registry 405 (assertWorkerRouteMethod
+ * with its Allow header). `dispatch(request)` therefore serves every method of
+ * `pathnames` and answers null for any other path: the lead mounts it on the
+ * private origin before the v1.2 dispatch, as server.mjs mounts the other
+ * pathname dispatches, and a wrong method reaches the module's own 405 with
+ * the Worker's Allow value (POST, or GET, POST for day manifests). The
+ * `routeModules` stay for a seam that answers that 405 itself.
+ *
+ * Contributions (lead hand-off). The envelope registration goes to
+ * createContributionEnvelopeRegistry next to v1.2 with ownsReceipt: true (the
+ * handler resolves its claim itself). Its transport needs the
+ * telemetry-contribution-v1.1 upload-authorization format (IN-3), which the
+ * preamble runs before dispatch as the Worker's transport write gate. The
+ * preamble must claim a non-v1.2 envelope with
+ * claimPostgresDeviceUploadAuthorization(..., { schema,
+ * accountlessAuthorizationVersion: "v1.1" }), d43c8f92's claim gate: the
+ * default ("v1.2") also demands the typed-v1.2 grant, which refuses a shipped
+ * accountless client that holds only the v1.1 lease graph with 401
+ * UPLOAD_AUTH_INVALID.
  */
 
 import { createTelemetryV11ContributionEnvelope } from "../envelopes/v11.mjs";
@@ -119,8 +137,20 @@ export function createTelemetryV11OriginIntake(options) {
     envelopePublicJwk: options.envelopePublicJwk,
     envelopePrivateJwk: options.envelopePrivateJwk,
   });
+  const routeModules = Object.freeze([consent, ...dayManifests, predecessor, activate]);
+  // One handler per pathname: the two day-manifest modules share theirs, and
+  // every handler checks the method first, before any other step.
+  const byPathname = new Map(routeModules.map((routeModule) => [routeModule.pathname, routeModule.handler]));
+  async function dispatch(request) {
+    let pathname;
+    try { ({ pathname } = new URL(request.url)); } catch { return null; }
+    const handler = byPathname.get(pathname);
+    return handler === undefined ? null : handler(request);
+  }
   return Object.freeze({
-    routeModules: Object.freeze([consent, ...dayManifests, predecessor, activate]),
+    routeModules,
+    pathnames: Object.freeze([...byPathname.keys()]),
+    dispatch,
     envelopeRegistration,
   });
 }

@@ -35,13 +35,17 @@
 --   (5) Once the typed runtime contract is qualified, a raw JSON v1.1 record
 --       is refused (D1 typed-v11 0001 typed_v11_legacy_record_refusal).
 --
---   (6) The v1.1 owner bridge (D1 ingestion-bridge 0001): an eligible
---       accepted head change records a storage_v11_event_sources receipt and
---       one exact owner-active journal row, as 0055 does for v1.2.
+--   (6) The v1.1 owner bridge (D1 ingestion-bridge 0001 with the
+--       ingestion-isolation 0002 event classification): an eligible accepted
+--       head change records a storage_v11_event_sources receipt and one exact
+--       journal row, 'source-updated' (no epoch change) for a classified
+--       append-only successor and 'owner-active' otherwise.
 --   (7) The bridge's pending read (storage_v11_bridge_pending_count) and
 --       bounded maintenance backfill (storage_v11_bridge_backfill), as 0055
 --       has for v1.2, without a one-time backfill (imported heads carry D1's
 --       receipts).
+--   (8) D1 ingestion-isolation 0002 storage_v11_append_transitions and its
+--       BEFORE UPDATE head classification, which (6) reads.
 --
 -- Not here (documented gaps, IN-2 continuation): D1's
 -- community_snapshot_mutation_control / community_daily_aggregate_rebuilds
@@ -224,16 +228,147 @@ CREATE TRIGGER telemetry_v11_typed_json_refusal
   BEFORE INSERT ON telemetry_v11_records
   FOR EACH ROW EXECUTE FUNCTION telemetry_v11_typed_json_refusal();
 
+-- (8) first, because (6) reads it. D1 ingestion-isolation 0002: every head
+-- UPDATE records whether the successor only appends to the generation the
+-- head named before. A successor is an append when the owner's link and
+-- journal head were active at that generation and revision, the typed
+-- runtime is qualified, the successor names that generation as its
+-- predecessor for the same participant and device, every previous day is
+-- still present with a ready manifest of the same participant, device, day,
+-- parser, consent and exclusions, and every usage or quota row of a
+-- replaced chunk (at most 200 rows compared) reappears in the successor's
+-- day with the same full typed canonical digest. Session chunks and reused
+-- chunks need no row scan. The row is immutable and lives as long as its
+-- generation.
+CREATE TABLE storage_v11_append_transitions (
+  generation_id text PRIMARY KEY REFERENCES telemetry_v11_domains(id) ON DELETE CASCADE,
+  previous_generation_id text NOT NULL,
+  participant_id text NOT NULL,
+  head_revision bigint NOT NULL CHECK (head_revision > 1),
+  is_append smallint NOT NULL CHECK (is_append IN (0, 1)),
+  compared_records integer NOT NULL CHECK (compared_records BETWEEN 0 AND 201)
+);
+
+CREATE FUNCTION storage_v11_append_transition_guard()
+RETURNS trigger
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+  IF TG_OP = 'UPDATE' THEN
+    RAISE EXCEPTION 'storage_v11_transition_immutable' USING ERRCODE = 'P1005';
+  END IF;
+  IF EXISTS (SELECT 1 FROM telemetry_v11_domains domain WHERE domain.id = OLD.generation_id) THEN
+    RAISE EXCEPTION 'storage_v11_transition_retained' USING ERRCODE = 'P1005';
+  END IF;
+  RETURN OLD;
+END;
+$$;
+CREATE TRIGGER storage_v11_append_transition_guard
+  BEFORE UPDATE OR DELETE ON storage_v11_append_transitions
+  FOR EACH ROW EXECUTE FUNCTION storage_v11_append_transition_guard();
+
+CREATE FUNCTION storage_v11_classify_head()
+RETURNS trigger
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+  INSERT INTO storage_v11_append_transitions (
+    generation_id, previous_generation_id, participant_id, head_revision, is_append, compared_records
+  )
+  WITH days AS MATERIALIZED (
+    SELECT prior_day.observed_day, prior_day.manifest_id AS old_manifest, next_day.manifest_id AS new_manifest
+      FROM telemetry_v11_domain_days prior_day
+      LEFT JOIN telemetry_v11_domain_days next_day
+        ON next_day.generation_id = NEW.generation_id AND next_day.observed_day = prior_day.observed_day
+     WHERE prior_day.generation_id = OLD.generation_id
+  ), unmatched AS MATERIALIZED (
+    SELECT chunk.id, chunk.manifest_id, chunk.stream, chunk.record_count, days.new_manifest
+      FROM days
+      JOIN telemetry_v11_chunks chunk ON chunk.manifest_id = days.old_manifest
+     WHERE days.old_manifest IS DISTINCT FROM days.new_manifest AND chunk.stream IN ('usage', 'quota')
+       AND NOT EXISTS (
+         SELECT 1 FROM telemetry_v11_chunks reused
+          WHERE reused.manifest_id = days.new_manifest AND reused.chunk_id = chunk.chunk_id
+            AND reused.stream = chunk.stream AND reused.chunk_digest = chunk.chunk_digest
+            AND reused.record_count = chunk.record_count AND reused.parser_version = chunk.parser_version)
+     LIMIT 201
+  ), counted AS MATERIALIZED (
+    SELECT least(201, COALESCE(sum(unmatched.record_count), 0))::integer AS n FROM unmatched
+  )
+  SELECT NEW.generation_id, OLD.generation_id, NEW.participant_id, NEW.revision,
+    CASE
+      WHEN NOT EXISTS (
+             SELECT 1 FROM storage_v11_owner_links owner_link
+               JOIN storage_source_state source ON source.singleton = 1
+               JOIN storage_owner_revisions owner_head
+                 ON owner_head.source_id = source.source_id AND owner_head.owner_digest = owner_link.owner_digest
+              WHERE owner_link.participant_id = OLD.participant_id
+                AND owner_link.generation_id = OLD.generation_id
+                AND owner_link.head_revision = OLD.revision
+                AND owner_link.state = 'active' AND owner_head.state = 'active')
+        OR NOT EXISTS (
+             SELECT 1 FROM typed_v11_admission_state admission
+              WHERE admission.id = 1 AND admission.runtime_contract_version = 1)
+        OR NOT EXISTS (
+             SELECT 1 FROM telemetry_v11_domains next_domain
+               JOIN telemetry_v11_domains old_domain ON old_domain.id = OLD.generation_id
+              WHERE next_domain.id = NEW.generation_id AND next_domain.previous_generation_id = old_domain.id
+                AND next_domain.participant_id = old_domain.participant_id
+                AND next_domain.participant_id = NEW.participant_id
+                AND next_domain.device_id = old_domain.device_id)
+        OR EXISTS (
+             SELECT 1 FROM days
+               LEFT JOIN telemetry_v11_day_manifests old_manifest ON old_manifest.id = days.old_manifest
+               LEFT JOIN telemetry_v11_day_manifests new_manifest ON new_manifest.id = days.new_manifest
+              WHERE new_manifest.id IS NULL OR new_manifest.state <> 'ready' OR old_manifest.state <> 'ready'
+                 OR new_manifest.participant_id IS DISTINCT FROM old_manifest.participant_id
+                 OR new_manifest.device_id IS DISTINCT FROM old_manifest.device_id
+                 OR new_manifest.chunk_day IS DISTINCT FROM old_manifest.chunk_day
+                 OR new_manifest.parser_version IS DISTINCT FROM old_manifest.parser_version
+                 -- Both columns hold canonical JSON, so jsonb equality is
+                 -- D1's equality of the extracted canonical text.
+                 OR (new_manifest.manifest_json::jsonb -> 'consent')
+                      IS DISTINCT FROM (old_manifest.manifest_json::jsonb -> 'consent')
+                 OR (new_manifest.manifest_json::jsonb -> 'excluded')
+                      IS DISTINCT FROM (old_manifest.manifest_json::jsonb -> 'excluded'))
+        THEN 0
+      WHEN counted.n > 200 THEN 0
+      WHEN EXISTS (
+             SELECT 1 FROM unmatched replaced
+               JOIN typed_v11_record_admissions old_row ON old_row.chunk_id = replaced.id
+               JOIN typed_telemetry_records old_record ON old_record.id = old_row.typed_record_id
+              WHERE NOT EXISTS (
+                SELECT 1 FROM typed_v11_record_admissions next_row
+                  JOIN typed_telemetry_records next_record ON next_record.id = next_row.typed_record_id
+                 WHERE next_row.manifest_id = replaced.new_manifest AND next_row.stream = old_row.stream
+                   AND next_row.occurrence_id = old_row.occurrence_id
+                   AND next_record.canonical_digest = old_record.canonical_digest
+                   AND next_record.namespace_id = old_record.namespace_id
+                   AND next_record.format = 11 AND old_record.format = 11))
+        THEN 0
+      ELSE 1
+    END,
+    counted.n
+  FROM counted;
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER storage_v11_classify_head
+  BEFORE UPDATE ON telemetry_v11_domain_heads
+  FOR EACH ROW EXECUTE FUNCTION storage_v11_classify_head();
+
 -- (6) v1.1 owner bridge: D1 ingestion-bridge 0001 storage_v11_head_insert /
 -- storage_v11_head_update -> storage_v11_head_request_apply ->
--- storage_v11_event_publish, as 0055 ports the v1.2 bridge. An eligible
--- accepted v1.1 head change mints or reuses the shared owner link, records
--- one storage_v11_event_sources receipt and appends one exact owner-active
--- journal row (storage_journal_append, 0046) whose object digest is that
--- receipt and whose content digest is the generation's manifest digest; the
--- link then names the head (D1 updates generation_id, head_revision,
--- object_digest and manifest_digest). D1 skips the receipt when the active
--- link already names this generation and revision.
+-- storage_v11_event_publish (as ingestion-isolation 0002 replaced it), as
+-- 0055 ports the v1.2 bridge. An eligible accepted v1.1 head change mints or
+-- reuses the shared owner link, records one storage_v11_event_sources
+-- receipt and appends one exact journal row (storage_journal_append, 0046)
+-- whose object digest is that receipt and whose content digest is the
+-- generation's manifest digest; the link then names the head (D1 updates
+-- generation_id, head_revision, object_digest and manifest_digest). D1 skips
+-- the receipt when the active link already names this generation and
+-- revision. The row is 'source-updated' with both epochs unchanged when (8)
+-- classified this exact head move as an append and the link and the owner's
+-- journal head are active at the generation and revision it replaces;
+-- otherwise it is 'owner-active' and both epochs advance.
 --
 -- The 0014 telemetry_v11_domain_head_source_revision trigger stays: AFTER
 -- triggers fire in name order, so this bridge runs first, and once the owner
@@ -259,6 +394,7 @@ DECLARE
   link_generation text;
   link_revision bigint;
   event_digest_value text;
+  append_value boolean;
 BEGIN
   IF participant_id_value IS NULL OR generation_id_value IS NULL
      OR head_revision_value IS NULL OR head_revision_value < 1 THEN
@@ -315,6 +451,20 @@ BEGIN
     RETURN false;
   END IF;
 
+  -- D1 ingestion-isolation 0002 storage_v11_event_publish: classified
+  -- against the link as it stands before this head is recorded on it.
+  append_value := link_state = 'active' AND EXISTS (
+    SELECT 1 FROM storage_v11_append_transitions transition
+      JOIN storage_source_state source ON source.singleton = 1
+      JOIN storage_owner_revisions prior
+        ON prior.source_id = source.source_id AND prior.owner_digest = owner_digest_value
+       AND prior.state = 'active'
+     WHERE transition.generation_id = generation_id_value
+       AND transition.participant_id = participant_id_value
+       AND transition.head_revision = head_revision_value AND transition.is_append = 1
+       AND link_generation = transition.previous_generation_id
+       AND link_revision + 1 = transition.head_revision);
+
   -- Random and opaque, like D1's lower(hex(randomblob(32))); recorded_ms is
   -- whole seconds, like D1's strftime('%s','now')*1000.
   event_digest_value := encode(
@@ -328,8 +478,9 @@ BEGIN
     head_revision_value, domain_row.input_revision,
     floor(extract(epoch FROM clock_timestamp()))::bigint * 1000
   );
-  PERFORM storage_journal_append('owner-active', owner_digest_value, event_digest_value,
-    event_digest_value, domain_row.manifest_digest);
+  PERFORM storage_journal_append(
+    CASE WHEN append_value THEN 'source-updated' ELSE 'owner-active' END,
+    owner_digest_value, event_digest_value, event_digest_value, domain_row.manifest_digest);
   UPDATE storage_v11_owner_links
      SET state = 'active', generation_id = generation_id_value, head_revision = head_revision_value,
          object_digest = event_digest_value, manifest_digest = domain_row.manifest_digest
