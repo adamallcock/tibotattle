@@ -6,8 +6,10 @@
  * through the table createUploadAuthorizationFormats() builds
  * (contribution-envelope-registry.mjs, IN-1). This module supplies the
  * entries for the formats the d43c8f92 Worker still authorizes besides v1.2,
- * plus the Worker's request-body parser, so the origin answers exactly as
- * handleDeviceUploadAuthorization (apps/worker/src/index.ts at d43c8f92):
+ * plus the Worker's request-body parser. The route module that uses both,
+ * routes/upload-authorizations.mjs, must replace the v1.2-only built-in
+ * route whenever these formats are registered, so the origin answers exactly
+ * as handleDeviceUploadAuthorization (apps/worker/src/index.ts at d43c8f92):
  *
  *   1. The body is an object with 3 or 4 keys drawn from envelopeDigest,
  *      contentLengthBytes, contentType and telemetrySchemaVersion; the digest

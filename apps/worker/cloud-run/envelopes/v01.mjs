@@ -15,9 +15,12 @@
  * register all three together or none.
  *
  * Arguments are those of envelopes/v10.mjs; the context needs primaryPool,
- * schema, objectStore, envelopePublicJwk and envelopePrivateJwk.
+ * schema, objectStore, envelopePublicJwk and envelopePrivateJwk. As there,
+ * the exact envelope key occurrences are checked first (400
+ * ENVELOPE_INVALID) and the preamble abandons the claim on every throw.
  */
 import { registerContributionEnvelope } from "../contribution-envelope-registry.mjs";
+import { hasExactEnvelopeKeyOccurrences } from "./legacy-envelope-keys.mjs";
 
 export const TELEMETRY_V01_ENVELOPE_SCHEMA_VERSION = "telemetry-envelope-v0.1";
 
@@ -33,6 +36,10 @@ function storageUnavailable() {
   return Object.assign(new Error("BACKEND_STORAGE_UNAVAILABLE"), {
     code: "BACKEND_STORAGE_UNAVAILABLE", status: 503,
   });
+}
+
+function envelopeInvalid() {
+  return Object.assign(new Error("ENVELOPE_INVALID"), { code: "ENVELOPE_INVALID", status: 400 });
 }
 
 /**
@@ -56,6 +63,7 @@ export function createTelemetryV01ContributionEnvelope({ admitTelemetryV01Contri
           || claimed === null || typeof claimed !== "object") {
         throw storageUnavailable();
       }
+      if (!hasExactEnvelopeKeyOccurrences(body.raw)) throw envelopeInvalid();
       return admitTelemetryV01Contribution({
         pool: context.primaryPool,
         schema: context.schema,

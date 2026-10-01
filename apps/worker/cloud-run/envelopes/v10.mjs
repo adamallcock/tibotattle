@@ -8,27 +8,35 @@
  * port in src/postgres-legacy-contribution-admission.ts, injected here so
  * this file stays plain JavaScript that node:test can load.
  *
- * Handler arguments, as the preamble supplies them:
- *   body           { raw: string, value: unknown } - the exact claimed HTTP
- *                  body and its parsed JSON (the Worker's readBoundedJson).
+ * Handler arguments, as the postgres-test-dispatch.mjs preamble supplies
+ * them (contribution-envelope-registry.mjs ContributionEnvelopeContext):
+ *   body           { bytes, raw, value } - the exact claimed HTTP body, its
+ *                  text and its parsed JSON (the Worker's readBoundedJson).
  *   participant    { id, consentVersion, ownerKind } - the active participant
  *                  the claim resolved.
  *   sourceDeviceId issued_by_device_id of the claimed upload authorization.
  *   claimed        { authorizationId, participantId, authorizationKind }.
- *   context        { primaryPool, schema, objectStore, envelopePublicJwk,
- *                    envelopePrivateJwk, typedV1SourceNamespace, nowEpoch? }.
+ *   context        the preamble context; this handler reads primaryPool,
+ *                  schema ({ primarySchema, ledgerSchema }), objectStore,
+ *                  envelopePublicJwk, envelopePrivateJwk and sourceNamespace,
+ *                  plus an optional test clock nowEpoch.
  *
- * It returns the Worker's 202 receipt (fresh or replayed) or throws the
- * Worker's ApiError; the preamble abandons the claim on a throw and records
- * the receipt (recordPostgresDeviceUploadReceipt) after a 202.
+ * Like the Worker's handleContribution, the exact envelope key occurrences
+ * are checked first (400 ENVELOPE_INVALID). It returns the Worker's 202
+ * receipt (fresh or replayed) or throws the Worker's ApiError. It never
+ * calls markPersistStarted: as on the Worker, the preamble abandons the
+ * claim on every throw, which is a no-op once the persist transaction has
+ * consumed it. The preamble records the receipt
+ * (recordPostgresDeviceUploadReceipt) after a 202.
  */
 import { registerContributionEnvelope } from "../contribution-envelope-registry.mjs";
+import { hasExactEnvelopeKeyOccurrences } from "./legacy-envelope-keys.mjs";
 
 export const TELEMETRY_V10_ENVELOPE_SCHEMA_VERSION = "telemetry-envelope-v1.0";
 
 const CONTEXT_KEYS = Object.freeze([
   "primaryPool", "schema", "objectStore", "envelopePublicJwk", "envelopePrivateJwk",
-  "typedV1SourceNamespace",
+  "sourceNamespace",
 ]);
 
 function configurationError(message) {
@@ -39,6 +47,10 @@ function storageUnavailable() {
   return Object.assign(new Error("BACKEND_STORAGE_UNAVAILABLE"), {
     code: "BACKEND_STORAGE_UNAVAILABLE", status: 503,
   });
+}
+
+function envelopeInvalid() {
+  return Object.assign(new Error("ENVELOPE_INVALID"), { code: "ENVELOPE_INVALID", status: 400 });
 }
 
 /**
@@ -65,13 +77,14 @@ export function createTelemetryV10ContributionEnvelope({ admitTelemetryV1Contrib
           || claimed === null || typeof claimed !== "object") {
         throw storageUnavailable();
       }
+      if (!hasExactEnvelopeKeyOccurrences(body.raw)) throw envelopeInvalid();
       return admitTelemetryV1Contribution({
         pool: context.primaryPool,
         schema: context.schema,
         objectStore: context.objectStore,
         envelopePublicJwk: context.envelopePublicJwk,
         envelopePrivateJwk: context.envelopePrivateJwk,
-        sourceNamespace: context.typedV1SourceNamespace,
+        sourceNamespace: context.sourceNamespace,
         body: { raw: body.raw, value: body.value },
         participant: { id: participant.id, consentVersion: participant.consentVersion ?? null },
         deviceId: sourceDeviceId,

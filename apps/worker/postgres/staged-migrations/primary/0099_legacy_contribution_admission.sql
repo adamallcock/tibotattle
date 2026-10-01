@@ -24,9 +24,10 @@
 --
 -- The window start is D1's: floor((epoch seconds + 259200) / 604800) *
 -- 604800 - 259200, in whole seconds (strftime('%s')), as UTC. Every RAISE
--- carries a constant message and ERRCODE; no value is interpolated. On
--- promotion, add telemetry_contribution_admission_windows to the
--- participant-table inventories that enumerate participant-owned tables.
+-- carries a constant message and ERRCODE; no value is interpolated.
+-- telemetry_contribution_admission_windows is already listed in both owner
+-- erasers' participant-table inventories (social preflight and accountless
+-- eraser), so promotion does not stop erasure.
 
 CREATE FUNCTION telemetry_contribution_admission_window_start(created timestamptz)
 RETURNS timestamptz

@@ -34,6 +34,14 @@
       "production": "apps/worker/src/server-pricing.ts",
       "blob": "19c42635234bc3a1f5bfb27ae1e813b6900bc4a7"
     },
+    "src/device-auth.ts": {
+      "production": "apps/worker/src/device-auth.ts",
+      "blob": "b21ad7007f4377dab496d39af3369cab7a86ae9d"
+    },
+    "src/telemetry-storage-mode.ts": {
+      "production": "apps/worker/src/telemetry-storage-mode.ts",
+      "blob": "fe5799b01406bf969460268b26b156e590be9ee2"
+    },
     "migrations/0014_bounded_contribution_admission.sql": {
       "production": "apps/worker/migrations/0014_bounded_contribution_admission.sql",
       "blob": "040e6aef1d44dab8a5f0c8e2ca06a12f5ffb4953"

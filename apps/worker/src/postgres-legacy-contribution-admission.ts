@@ -20,16 +20,28 @@
  * telemetry_v1_records), and one typed_v1_event_sources receipt plus one
  * exact journal row (storage_journal_append) publishes the chunk.
  *
+ * A correction (chunkRevision = current + 1) supersedes the current chunk
+ * and deletes its typed rows exactly as D1 does, through the staged
+ * legacy_contribution_admission migration's retention allowance, and is
+ * refused (503) exactly where D1's typed_v1_supersession_guard refuses it:
+ * for a participant with a v1.1 domain head or an accepted v0.1
+ * contribution, which gets no graph-scope marker on D1.
+ *
  * Deliberate v1.0 differences, each a refusal rather than an invented
  * behaviour:
- *   - A correction (chunkRevision = current + 1) supersedes the current
- *     chunk and deletes its typed rows exactly as D1 does, through the
- *     staged legacy_contribution_admission migration's retention
- *     allowance. A usage correction while the imported usage-correction
- *     runtime was active (0034 source_state) is refused with 503
- *     BACKEND_STORAGE_UNAVAILABLE: D1 then also records usage-correction
- *     facts, whose writer is not ported (0034 keeps the PostgreSQL runtime
- *     staged).
+ *   - OPEN OWNER DECISION (OD-4 question 1). A usage correction while the
+ *     imported usage-correction runtime was active (0034 source_state) is
+ *     refused with 503 BACKEND_STORAGE_UNAVAILABLE. D1 accepts the same
+ *     correction (202) and also records usage-correction facts. That writer
+ *     is not ported, and 0034 keeps the PostgreSQL runtime staged with
+ *     correction writes disabled. If production's runtime is active at
+ *     cutover, shipped clients are affected: the d43c8f92 v1.0 sync engine
+ *     retries a 503 as service_unavailable and uploads oldest day first, so
+ *     a device whose last usage segment changed stops advancing its v1.0
+ *     sync at that correction until this is resolved. The ways out (port
+ *     the capture writer, or accept corrections without capture and record
+ *     the correction history as incomplete) are owner decisions, not port
+ *     choices.
  *   - D1's database-size admission probe (typed-storage-capacity.ts) has no
  *     PostgreSQL meaning and is not run.
  *   - D1's JSON-era analytics side effects that 0057 retired on PostgreSQL
@@ -704,6 +716,12 @@ interface PersistInput {
   readonly createdAt: string;
   readonly sourceNamespace: string;
   readonly nowEpoch: number;
+  /**
+   * The clock the header-authority and consume checks compare against: the
+   * time the persist starts, after the object write (D1's triggers read
+   * strftime('now') at insert), or the injected test clock.
+   */
+  readonly checkedAt: string;
   readonly schemaConfig: PostgresSchemaConfig;
 }
 
@@ -713,12 +731,23 @@ interface PersistInput {
  * grant, v1.0 consent, typed v1 admission state, current slot, admission
  * window, then (through begin_graph_scope, the chunk triggers and
  * storage_journal_append) mutation_control, owner link and storage source.
+ *
+ * Refusal codes follow D1's typed mode (persistTelemetryV1StorageChunk):
+ * a header-authority or consume failure is 'upload unavailable', which
+ * insertTypedTelemetryV1Chunk maps to 401 UPLOAD_AUTH_INVALID; an
+ * allocator conflict is 409 UPLOAD_IN_PROGRESS; a record owned by another
+ * chunk is 409 RECORD_OWNED_BY_OTHER_CHUNK. Every other in-batch abort
+ * (a raced revision or slot, the admission window filled by a concurrent
+ * upload, a supersession without D1's graph-scope marker) is unmapped there
+ * and answered 503 BACKEND_STORAGE_UNAVAILABLE, which a shipped client
+ * retries. The pre-write checks in admitPostgresTelemetryV1Contribution
+ * keep the Worker's 409 and 429 answers for the same conditions.
  */
 async function persistTypedChunk(
   client: PostgresClient, schema: string, input: PersistInput,
 ): Promise<{ acceptedRecords: number; replay: boolean; supersededRevision: number | null }> {
   const { principal, chunk } = input;
-  const nowIso = new Date(input.nowEpoch).toISOString();
+  const nowIso = input.checkedAt;
   // D1 typed_v1_header_authority: any failure is 'upload unavailable'.
   const participant = await client.query<{ state: string; owner_kind: string }>(
     `SELECT state, owner_kind FROM ${table(schema, "participants")} WHERE id = $1 FOR UPDATE`,
@@ -764,29 +793,46 @@ async function persistTypedChunk(
     return { acceptedRecords: chunk.records.length, replay: true, supersededRevision: null };
   }
 
+  // The pre-write checks already answered a stale revision with 409; here a
+  // mismatch can only be a concurrent upload of the same slot, which D1's
+  // batch refuses with an unmapped conflict (503).
   const current = await currentChunk(client, schema, principal, chunk, true);
   if (current) {
     if (current.chunk_digest === chunk.chunkDigest) {
       await validateReceipt(client, schema, current, principal.deviceId, input.sourceNamespace);
       return { acceptedRecords: chunk.records.length, replay: true, supersededRevision: null };
     }
-    if (chunk.chunkRevision !== current.revision + 1) throw new ApiError(409, "CHUNK_REVISION_CONFLICT");
+    if (chunk.chunkRevision !== current.revision + 1) throw unavailable();
     // A usage correction under an active correction runtime also records
     // usage-correction facts on D1 (prepareTelemetryUsageCorrectionForV1Replacement);
     // that writer is not ported and 0034 keeps the PostgreSQL runtime staged.
     if (chunk.stream === "usage" && await usageCorrectionRuntimeActive(client, schema)) throw unavailable();
+    // D1 writes the supersede graph-scope marker only for a participant with
+    // no v1.1 domain head and no accepted v0.1 contribution
+    // (prepareTelemetryV1ChunkWrite); without it typed_v1_supersession_guard
+    // aborts the batch, which typed mode answers 503. The participant row
+    // lock above serializes this read with v0.1 admission.
+    const unscoped = await client.query<{ found: boolean }>(
+      `SELECT (EXISTS (SELECT 1 FROM ${table(schema, "telemetry_v11_domain_heads")} WHERE participant_id = $1)
+            OR EXISTS (SELECT 1 FROM ${table(schema, "telemetry_contributions")}
+                        WHERE participant_id = $1 AND status = 'accepted')) AS found`,
+      [principal.participantId],
+    );
+    if (unscoped.rows[0]?.found !== false) throw unavailable();
   } else {
-    if (chunk.chunkRevision !== 1) throw new ApiError(409, "CHUNK_REVISION_CONFLICT");
+    if (chunk.chunkRevision !== 1) throw unavailable();
     const slotUsed = await client.query<{ found: boolean }>(
       `SELECT EXISTS (SELECT 1 FROM ${table(schema, "telemetry_v1_chunks")}
         WHERE participant_id = $1 AND device_id = $2 AND stream = $3 AND chunk_day = $4::date
           AND chunk_seq = $5) AS found`,
       [principal.participantId, principal.deviceId, chunk.stream, chunk.chunkDay, chunk.chunkSeq],
     );
-    if (slotUsed.rows[0]?.found !== false) throw new ApiError(409, "CHUNK_REVISION_CONFLICT");
+    if (slotUsed.rows[0]?.found !== false) throw unavailable();
   }
 
-  // D1 baseline chunk-admission trigger pair, on the request day.
+  // D1 baseline chunk-admission trigger pair, on the request day. The
+  // pre-write check answered an exhausted window with 429; a window a
+  // concurrent upload filled since is D1's unmapped trigger abort (503).
   const windowDay = input.createdAt.slice(0, 10);
   const windowRow = await client.query<{ accepted_count: number }>(
     `SELECT accepted_count FROM ${table(schema, "telemetry_v1_chunk_admission_windows")}
@@ -794,9 +840,7 @@ async function persistTypedChunk(
     [principal.participantId, principal.deviceId, windowDay],
   );
   const admission = await chunkAdmission(client, schema, principal, input.nowEpoch);
-  if (Number(windowRow.rows[0]?.accepted_count ?? 0) >= admission.maximumChunks) {
-    throw new ApiError(429, "CHUNK_ADMISSION_LIMIT_REACHED", { responseHeaders: { "retry-after": "60" } });
-  }
+  if (Number(windowRow.rows[0]?.accepted_count ?? 0) >= admission.maximumChunks) throw unavailable();
 
   const records = await prepareTypedRecords(chunk);
   // Live allocation through the 0052 identities is safe only while every
@@ -830,7 +874,7 @@ async function persistTypedChunk(
         WHERE id = $1 AND participant_id = $2 AND superseded_at IS NULL`,
       [current.id, principal.participantId, input.createdAt],
     );
-    if (superseded.rowCount !== 1) throw new ApiError(409, "CHUNK_REVISION_CONFLICT");
+    if (superseded.rowCount !== 1) throw unavailable();
     await client.query(
       `DELETE FROM ${table(schema, "typed_telemetry_chunks")}
         WHERE namespace_id = $1 AND format = ${POSTGRES_TYPED_V1_FORMAT}
@@ -872,16 +916,35 @@ async function persistTypedChunk(
   // D1 typed_v1_owner_memberships(participant_id, typed_owner_id) is
   // PostgreSQL's per-format typed_telemetry_owner_memberships row. Insert it
   // only when absent: its BEFORE INSERT guard (0030) refuses a participant
-  // whose owner link is withdrawn, which D1 never checks for an existing
-  // mapping, and a BEFORE trigger runs even when ON CONFLICT would skip.
+  // whose owner link is withdrawn, which D1 never checks, and a BEFORE
+  // trigger runs even when ON CONFLICT would skip.
   const readMembership = () => client.query<{ owner_id: string; participant_id: string; source_namespace: string }>(
     `SELECT owner_id::text AS owner_id, participant_id, source_namespace
        FROM ${table(schema, "typed_telemetry_owner_memberships")}
       WHERE source_format = ${POSTGRES_TYPED_V1_FORMAT} AND participant_id = $1`,
     [principal.participantId],
   );
+  // A withdrawn link without a mapping (for example D1 opt-out history with
+  // no v1.0 upload yet) is admitted on D1, whose publish trigger reactivates
+  // the link after journaling. The guard needs the link active before the
+  // mapping, so it is reactivated here, in this transaction; the journal
+  // classification below still uses D1's pre-publish (withdrawn) state.
+  let reactivatedWithdrawnLink = false;
   let membership = await readMembership();
   if (membership.rows.length === 0) {
+    const link = await client.query<{ state: string }>(
+      `SELECT state FROM ${table(schema, "storage_v11_owner_links")} WHERE participant_id = $1 FOR UPDATE`,
+      [principal.participantId],
+    );
+    if (link.rows[0]?.state === "withdrawn") {
+      const reactivated = await client.query(
+        `UPDATE ${table(schema, "storage_v11_owner_links")} SET state = 'active'
+          WHERE participant_id = $1 AND state = 'withdrawn'`,
+        [principal.participantId],
+      );
+      if (reactivated.rowCount !== 1) throw unavailable();
+      reactivatedWithdrawnLink = true;
+    }
     await client.query(
       `INSERT INTO ${table(schema, "typed_telemetry_owner_memberships")}
          (namespace_id, source_format, owner_id, participant_id, source_namespace)
@@ -1055,7 +1118,10 @@ async function persistTypedChunk(
      ) AS append`,
     [input.chunkRowId, digest],
   );
-  const kind = classification.rows[0]?.append === true ? "source-updated" : "owner-active";
+  // D1 classifies against the link as it was before this upload published:
+  // a link reactivated above was withdrawn, so the event is owner-active.
+  const kind = !reactivatedWithdrawnLink && classification.rows[0]?.append === true
+    ? "source-updated" : "owner-active";
   await client.query(
     `SELECT ${schema}.storage_journal_append($1, $2, $3, $3, $4)`,
     [kind, digest, eventDigest, chunk.chunkDigest],
@@ -1074,8 +1140,8 @@ async function persistTypedChunk(
         SET state = 'consumed', consumed_at = $2::timestamptz, consume_lease_expires_at = NULL,
             consumed_contribution_id = $3
       WHERE id = $1 AND state = 'consuming' AND envelope_digest = $4
-        AND consume_lease_expires_at > $2::timestamptz AND expires_at > $2::timestamptz`,
-    [input.authorizationId, input.createdAt, input.chunkRowId, input.authorizationEnvelopeDigest],
+        AND consume_lease_expires_at > $5::timestamptz AND expires_at > $5::timestamptz`,
+    [input.authorizationId, input.createdAt, input.chunkRowId, input.authorizationEnvelopeDigest, nowIso],
   );
   if (consumed.rowCount !== 1) throw uploadUnavailable();
   await client.query(
@@ -1295,6 +1361,7 @@ export async function admitPostgresTelemetryV1Contribution(
   const persistInput: PersistInput = {
     principal, chunk, chunkRowId, r2Key, envelopeDigest, authorizationEnvelopeDigest,
     authorizationId: input.authorization.authorizationId, createdAt, sourceNamespace, nowEpoch, schemaConfig,
+    checkedAt: new Date(input.nowEpoch === undefined ? Date.now() : nowEpoch).toISOString(),
   };
   let result: { acceptedRecords: number; replay: boolean; supersededRevision: number | null };
   try {
@@ -1324,16 +1391,10 @@ export async function admitPostgresTelemetryV1Contribution(
       return response;
     }
     await bestEffortRetire(pool, schema, objectStore, objectInput);
+    // Typed mode never reaches the Worker's admission recheck:
+    // persistTelemetryV1StorageChunk turns every non-ApiError into 503, so a
+    // storage failure is 503 even when the window has since filled.
     if (error instanceof ApiError) throw error;
-    let retryAdmission: TelemetryV1ChunkAdmission;
-    try {
-      retryAdmission = await withPostgresRead(pool,
-        (client) => chunkAdmission(client, schema, principal, Date.now()),
-        { operation: "telemetry_v1.admission_retry", preserveSafeError });
-    } catch {
-      throw unavailable();
-    }
-    if (retryAdmission.state === "exhausted") throw telemetryV1ChunkAdmissionError(retryAdmission);
     throw unavailable();
   }
 
@@ -1419,8 +1480,11 @@ export async function recordPostgresDeviceUploadReceipt(
         [authorizationId],
       );
       const row = existing.rows[0];
+      // d43c8f92 recordDeviceUploadReceipt answers an unrecordable receipt
+      // with 500 INTERNAL_ERROR, which a shipped client retries; a 401 here
+      // would pause its sync as upload_rejected.
       if (row?.state !== "consumed" || row.consumed_contribution_id !== contributionId) {
-        throw new ApiError(401, "UPLOAD_AUTH_INVALID");
+        throw new ApiError(500, "INTERNAL_ERROR");
       }
     }, { operation: "device_upload.receipt", preserveSafeError });
   } catch (error) {
@@ -1566,9 +1630,21 @@ interface V01PersistInput {
   readonly record: TelemetryContribution;
   readonly createdAt: string;
   readonly nowEpoch: number;
+  /** The clock the grant lease is checked against (persistTypedChunk's checkedAt). */
+  readonly checkedAt: string;
 }
 
 class V01AdmissionWindowExhausted extends Error {}
+
+/**
+ * A D1 v0.1 insert guard's RAISE(ABORT): insertTelemetryContribution and
+ * handleTelemetryContribution rethrow it unmapped, so the Worker answers
+ * 500 INTERNAL_ERROR, which a shipped client retries. The pre-write checks
+ * keep the Worker's 401/403 answers; these guards only catch a race.
+ */
+function v01InsertAborted(): ApiError {
+  return new ApiError(500, "INTERNAL_ERROR");
+}
 
 /**
  * The D1 batch plus its accounting UPDATE as one PostgreSQL transaction.
@@ -1582,13 +1658,14 @@ async function persistV01Contribution(
   client: PostgresClient, schema: string, input: V01PersistInput,
 ): Promise<{ acceptedRecords: number; deduplicatedRecords: number }> {
   const { principal, record } = input;
-  const nowIso = new Date(input.nowEpoch).toISOString();
+  const nowIso = input.checkedAt;
   const participant = await client.query<{ state: string; owner_kind: string }>(
     `SELECT state, owner_kind FROM ${table(schema, "participants")} WHERE id = $1 FOR UPDATE`,
     [principal.participantId],
   );
+  // telemetry_contributions_require_active_participant / _require_social_owner.
   if (participant.rows[0]?.state !== "active" || participant.rows[0]?.owner_kind !== "social") {
-    throw new ApiError(409, "PARTICIPANT_DELETING");
+    throw v01InsertAborted();
   }
   const grant = await client.query<{ id: string }>(
     `SELECT id FROM ${table(schema, "device_upload_authorizations")}
@@ -1597,7 +1674,8 @@ async function persistV01Contribution(
       FOR UPDATE`,
     [input.authorizationId, principal.participantId, principal.deviceId, nowIso],
   );
-  if (grant.rows.length !== 1) throw uploadUnavailable();
+  // telemetry_contributions_require_consuming_upload ('upload unavailable').
+  if (grant.rows.length !== 1) throw v01InsertAborted();
   const floor = await client.query<{ allowed: boolean }>(
     `SELECT EXISTS (
        SELECT 1 FROM ${table(schema, "telemetry_transport_formats")} format_row
@@ -1608,14 +1686,18 @@ async function persistV01Contribution(
      ) AS allowed`,
     [principal.participantId],
   );
-  if (floor.rows[0]?.allowed !== true) throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
+  // telemetry_transport_legacy_insert ('telemetry_transport_blocked').
+  if (floor.rows[0]?.allowed !== true) throw v01InsertAborted();
   const pending = await client.query<{ object_key: string; reconciliation_state: string }>(
     `SELECT object_key, reconciliation_state FROM ${table(schema, "pending_objects")}
       WHERE contribution_id = $1 FOR UPDATE`,
     [input.contributionId],
   );
+  // telemetry_contributions_block_reconciling_quarantine refuses a 'deleting'
+  // registration; a missing one is refused too rather than reference an
+  // object reconciliation may already have removed.
   if (pending.rows[0]?.object_key !== input.r2Key || pending.rows[0]?.reconciliation_state !== "registered") {
-    throw unavailable();
+    throw v01InsertAborted();
   }
 
   const declared = record.usageEvents.length + record.quotaSnapshots.length + record.activityMarkers.length;
@@ -1745,7 +1827,7 @@ async function persistV01Contribution(
       WHERE id = $1 AND participant_id = $4 AND state = 'consuming'`,
     [input.authorizationId, input.createdAt, input.contributionId, principal.participantId],
   );
-  if (consumed.rowCount !== 1) throw uploadUnavailable();
+  if (consumed.rowCount !== 1) throw v01InsertAborted();
   await client.query(
     `DELETE FROM ${table(schema, "pending_objects")}
       WHERE contribution_id = $1 AND object_key = $2 AND reconciliation_state = 'registered'`,
@@ -1821,6 +1903,7 @@ export async function admitPostgresTelemetryV01Contribution(
     result = await withPostgresMutation(pool, (client) => persistV01Contribution(client, schema, {
       principal, authorizationId: input.authorization.authorizationId, contributionId, r2Key, envelopeDigest,
       plaintextDigest, record, createdAt, nowEpoch,
+      checkedAt: new Date(input.nowEpoch === undefined ? Date.now() : nowEpoch).toISOString(),
     }), {
       operation: "telemetry_v01.admit",
       isolationLevel: "read_committed",

@@ -1,18 +1,23 @@
 import assert from "node:assert/strict";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { lstat, readdir, readFile, realpath, stat } from "node:fs/promises";
+import { copyFile, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
 import pg from "pg";
 import { createServer } from "vite";
-import { readPostgresMigrations } from "../scripts/postgres-migrations.mjs";
+import { applyPostgresMigrations, readPostgresMigrations } from "../scripts/postgres-migrations.mjs";
 import { applyStockAndStagedMigrations, listStagedMigrations } from "./staged-migrations-harness.mjs";
+import * as contributionEnvelopeSeam from "../cloud-run/contribution-envelope-registry.mjs";
 import {
   createContributionEnvelopeRegistry,
   createUploadAuthorizationFormats,
 } from "../cloud-run/contribution-envelope-registry.mjs";
+import { createOriginRouteModuleRegistry } from "../cloud-run/origin-route-modules.mjs";
+import { createPostgresTestV12DayManifestDispatch } from "../cloud-run/postgres-test-dispatch.mjs";
+import { validateTelemetryV12Envelope } from "@app-usagemonitor/telemetry-contract";
 import {
   DEFAULT_UPLOAD_AUTHORIZATION_SCHEMA_VERSION,
   LEGACY_V1_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS,
@@ -29,6 +34,7 @@ import {
   TELEMETRY_V01_ENVELOPE_SCHEMA_VERSION,
   createTelemetryV01ContributionEnvelope,
 } from "../cloud-run/envelopes/v01.mjs";
+import { createUploadAuthorizationRouteModule } from "../cloud-run/routes/upload-authorizations.mjs";
 
 /*
  * IN-3: the telemetry-envelope-v1.0 contribution envelope and the legacy
@@ -46,13 +52,16 @@ import {
  * insertTelemetryContribution and its server repricing), which d43c8f92 has
  * not retired.
  *
- * Every upload runs through the envelope registry: a spec-local stand-in for
- * the IN-1b contributions preamble claims the one-use authorization, enforces
- * the transport floor, dispatches on body.schemaVersion, then records the
- * receipt (or abandons the claim). The PostgreSQL rows are then compared,
- * normalized to original identifiers, with the rows the Worker's typed v1
- * admission writes for the same chunk, ids and clock on D1.
- * All data is synthetic and content-free.
+ * Every upload is authorized through the IN-3 upload-authorization route
+ * module (shipped v1.0 clients send three body keys) and runs through the
+ * envelope registry: a spec-local stand-in for the landed IN-1b
+ * contributions preamble claims the one-use authorization, enforces the
+ * transport floor, dispatches on body.schemaVersion with the landed context
+ * keys, then records the receipt (or abandons the claim). Where the landed
+ * preamble exists (claude/gcp-fastpath), one case drives it for real. The
+ * PostgreSQL rows are then compared, normalized to original identifiers,
+ * with the rows the Worker's typed v1 admission writes for the same chunk,
+ * ids and clock on D1. All data is synthetic and content-free.
  */
 
 const PG_TEST_HOST = process.env.PG_TEST_HOST;
@@ -91,7 +100,8 @@ const V1_CONSENT = Object.freeze({
 const ORACLE_REQUIRED = Object.freeze([
   "src/typed-v1-admission.ts", "src/telemetry-v1-repository.ts", "src/typed-telemetry-repository.ts",
   "src/telemetry-v1.ts", "src/telemetry-transport-policy.ts", "src/telemetry-repository.ts",
-  "src/telemetry-validation.ts", "src/server-pricing.ts", "migrations/0014_bounded_contribution_admission.sql",
+  "src/telemetry-validation.ts", "src/server-pricing.ts", "src/device-auth.ts", "src/telemetry-storage-mode.ts",
+  "migrations/0014_bounded_contribution_admission.sql",
   "typed-v1-admission-migrations/0001_typed_v1_chunk_admission.sql",
   "ingestion-isolation-migrations/0003_v1_append_classification.sql",
   "ingestion-isolation-migrations/0004_v1_multidevice_source_update.sql",
@@ -223,9 +233,10 @@ async function legacyAdmissionMigration() {
   return names[0];
 }
 
-async function withTwin(operation) {
+async function withTwin(operation, { ledger = false } = {}) {
   const local = await endpoint();
   const schema = `in3_legacy_${randomBytes(6).toString("hex")}`;
+  let ledgerCreated = false;
   const pool = new pg.Pool({
     host: local.host, port: local.port, user: PG_TEST_USER, password: PG_TEST_PASSWORD, database: PG_TEST_DATABASE,
     ssl: false, max: 6, connectionTimeoutMillis: 5_000, application_name: "pg-legacy-contribution-admission-test",
@@ -245,8 +256,14 @@ async function withTwin(operation) {
     await applyStockAndStagedMigrations({
       role: "primary", schema, pool, stagedFiles: [await legacyAdmissionMigration()],
     });
+    if (ledger) {
+      await pool.query(`CREATE SCHEMA "${schema}_ledger"`);
+      ledgerCreated = true;
+      await applyPostgresMigrations({ role: "ledger", schema: `${schema}_ledger`, pool });
+    }
     return await operation({ twin: new Twin(d1, pool), pool, schema, d1 });
   } finally {
+    if (ledgerCreated) await pool.query(`DROP SCHEMA IF EXISTS "${schema}_ledger" CASCADE`).catch(() => {});
     if (created) await pool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => {});
     await pool.end();
     d1.close();
@@ -299,7 +316,13 @@ async function socialParticipant(twin, participantId, consentVersion = PARTICIPA
   );
 }
 
-async function socialDevice(twin, participantId, deviceId, { consent = true } = {}) {
+/** The Worker's device secret hash, so a known bearer authenticates (device-auth.ts). */
+function deviceSecretHash(deviceId, secret) {
+  return createHash("sha256").update(`app-usagemonitor/device/v1\0${deviceId}\0`)
+    .update(Buffer.from(secret, "base64url")).digest();
+}
+
+async function socialDevice(twin, participantId, deviceId, { consent = true, secret } = {}) {
   const now = iso();
   const pairing = `pairing-${deviceId}`;
   await twin.run(
@@ -312,7 +335,8 @@ async function socialDevice(twin, participantId, deviceId, { consent = true } = 
     `INSERT INTO device_credentials (id, participant_id, authority_kind, paired_via_pairing_id, secret_hash,
        state, issued_at, expires_at, last_used_at, social_verified_at)
      VALUES (?, ?, 'social', ?, ?, 'active', ?, ?, ?, ?)`,
-    [deviceId, participantId, pairing, bytes32(), now, iso(30 * DAY_MS), now, now],
+    [deviceId, participantId, pairing, secret === undefined ? bytes32() : deviceSecretHash(deviceId, secret), now,
+      iso(30 * DAY_MS), now, now],
   );
   await twin.run(
     "UPDATE device_pairings SET state = 'consumed', consumed_at = ?, claimed_device_id = ? WHERE id = ?",
@@ -435,12 +459,14 @@ async function syntheticChunk({ stream = "usage", count = 1, revision = 1, seq =
   };
 }
 
-function memoryObjectStore() {
+/** An in-memory object store; beforePut runs between the pre-write checks and the persist. */
+function memoryObjectStore({ beforePut } = {}) {
   const objects = new Map();
   return {
     objects,
     async put(key, value, options) {
       objects.set(key, { value: String(value), options });
+      if (beforePut) await beforePut(key);
     },
     async delete(key) {
       objects.delete(key);
@@ -452,20 +478,65 @@ function outcomeOf(error) {
   return { status: error?.status, code: error?.code, details: error?.publicDetails ?? null };
 }
 
+const ORIGIN = "http://127.0.0.1:43933";
+const UPLOAD_AUTHORIZATIONS_PATH = "/api/v1/device/upload-authorizations";
+const V12_UPLOAD_FORMAT = "telemetry-contribution-v1.2";
+
+/** The upload-registration and processing controls a live origin runs with. */
+async function enableCollection(pool, schema) {
+  await pool.query(`UPDATE "${schema}".collection_controls
+      SET revision = 2, control_state = 'operational', enrollment_enabled = true,
+          upload_registration_enabled = true, processing_enabled = true, publication_enabled = true,
+          updated_at = $1
+    WHERE singleton = 1`, [iso()]);
+}
+
+/** A device bearer the spec's authenticateDevice stand-in resolves. */
+const bearerOf = (device) => `Device um_device_${device.deviceId}.synthetic`;
+
+/** A refusal rendered by the origin, as the closed error a caller sees. */
+async function refusalOf(response) {
+  const body = await response.json();
+  return Object.assign(new Error(body.error.code), {
+    status: response.status, code: body.error.code, publicDetails: body.error.details ?? null,
+    responseHeaders: Object.fromEntries(response.headers), body,
+  });
+}
+
 /**
- * The origin wiring a later IN-1b/lead change composes: formats, the
- * registry with the v1.0 entry, and the context the preamble hands it.
+ * The origin wiring the composition root mounts for IN-3: the legacy formats
+ * next to v1.2, the upload-authorization route module that replaces the
+ * built-in route, the registry with the v1.0 and v0.1 entries, and a
+ * contributions preamble. The preamble is a stand-in for
+ * postgres-test-dispatch.mjs on claude/gcp-fastpath: it hands the handler
+ * the same body ({ bytes, raw, value }) and context keys, records the
+ * receipt the same way (500 INTERNAL_ERROR without a contributionId) and
+ * abandons the claim on the same conditions. "PG17 ... through the landed
+ * origin dispatch" below drives the real dispatch where it exists. The
+ * route module's device-bearer and tombstone steps are stand-ins; its body
+ * rules, format table, controls and authorization writes are real.
  */
 async function origin(pool, schemaOptions, objectStore) {
   const authority = await workerModule("/src/postgres-transport-write-authority.ts");
   const admission = await workerModule("/src/postgres-legacy-contribution-admission.ts");
   const transport = await workerModule("/src/postgres-typed-v12-transport.ts");
   const uploads = await workerModule("/src/postgres-upload-authorization.ts");
+  const controls = await workerModule("/src/postgres-collection-controls.ts");
+  const { readBoundedRequestBody } = await workerModule("/src/bounded-body.ts");
   const keys = await envelopeKeys();
-  const formats = createUploadAuthorizationFormats(legacyUploadAuthorizationFormatEntries({
+  await enableCollection(pool, schemaOptions.primarySchema);
+  const legacyFormats = legacyUploadAuthorizationFormatEntries({
     assertTelemetryTransportWriteAllowed: authority.assertPostgresTelemetryTransportWriteAllowed,
     schemaVersions: [...LEGACY_V1_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS, ...RETAINED_V0_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS],
-  }));
+  });
+  // The origin's whole table: v1.2 as postgres-test-dispatch.mjs registers it, plus IN-3's.
+  const formats = createUploadAuthorizationFormats(new Map([
+    [V12_UPLOAD_FORMAT, {
+      assertUploadAllowed: (formatPool, device, nowEpoch, { schema }) =>
+        authority.assertPostgresTelemetryTransportWriteAllowed(formatPool, device, V12_UPLOAD_FORMAT, { nowEpoch, schema }),
+    }],
+    ...Object.entries(legacyFormats),
+  ]));
   const registry = createContributionEnvelopeRegistry([
     createTelemetryV10ContributionEnvelope({
       admitTelemetryV1Contribution: admission.admitPostgresTelemetryV1Contribution,
@@ -474,26 +545,53 @@ async function origin(pool, schemaOptions, objectStore) {
       admitTelemetryV01Contribution: admission.admitPostgresTelemetryV01Contribution,
     }),
   ]);
-  const context = Object.freeze({
-    primaryPool: pool, schema: schemaOptions, objectStore,
-    envelopePublicJwk: keys.publicText, envelopePrivateJwk: keys.privateText,
-    typedV1SourceNamespace: NAMESPACE,
+  const devices = new Map();
+  const steps = [];
+  const uploadAuthorizations = createUploadAuthorizationRouteModule({
+    primaryPool: pool, ledgerPool: pool, schema: schemaOptions, maxRequestBytes: MAX_REQUEST_BYTES,
+    admissionEnv: Object.freeze({ synthetic: true }), formats,
+    assertStorageCurrent: async () => { steps.push("storage"); },
+    assertAdmissionBindings: () => { steps.push("admission"); },
+    assertUploadAuthorizationBindings: () => { steps.push("upload-bindings"); },
+    assertUploadAuthorizationAllowed: async () => { steps.push("rate-limit"); },
+    assertUploadRegistrationEnabled: (controlPool, primarySchema) => {
+      steps.push("upload-registration");
+      return controls.assertPostgresCollectionControlFromPool(controlPool, primarySchema, "uploadRegistration");
+    },
+    authenticateDevice: async (_pool, header) => {
+      steps.push("device");
+      const device = devices.get(header);
+      if (!device) throw Object.assign(new Error("DEVICE_AUTH_INVALID"), { code: "DEVICE_AUTH_INVALID", status: 401 });
+      return device;
+    },
+    hasDeletionTombstone: async () => { steps.push("tombstone"); return false; },
+    readBoundedRequestBody,
+    createDeviceUploadAuthorization: uploads.createPostgresDeviceUploadAuthorization,
   });
 
-  /** POST /api/v1/device/upload-authorizations after device auth. */
-  async function authorizeUpload(device, body) {
-    const request = parseUploadAuthorizationRequest(body, { maxRequestBytes: MAX_REQUEST_BYTES });
-    const format = resolveUploadAuthorizationFormat(formats, request.telemetrySchemaVersion);
-    await format.assertUploadAllowed(pool, device, Date.now(), { schema: schemaOptions });
-    return uploads.createPostgresDeviceUploadAuthorization(pool, device,
-      { envelopeDigest: request.envelopeDigest, bodyBytes: request.contentLengthBytes }, { schema: schemaOptions });
+  /** POST /api/v1/device/upload-authorizations through the route module. */
+  async function authorizeUploadResponse(device, body, { headers = {}, search = "", raw } = {}) {
+    devices.set(bearerOf(device), device);
+    return uploadAuthorizations.handler(new Request(`${ORIGIN}${UPLOAD_AUTHORIZATIONS_PATH}${search}`, {
+      method: "POST",
+      headers: { authorization: bearerOf(device), "content-type": "application/json", ...headers },
+      body: raw ?? JSON.stringify(body),
+    }), Object.freeze({ origin: ORIGIN, hostMode: "fastpath-test" }));
   }
 
-  /** POST /api/v1/contributions: a stand-in for the IN-1b preamble. */
-  async function contribute(upload, raw) {
+  async function authorizeUpload(device, body, options) {
+    const response = await authorizeUploadResponse(device, body, options);
+    if (response.status !== 201) throw await refusalOf(response);
+    return response.json();
+  }
+
+  /** POST /api/v1/contributions: a stand-in for the landed IN-1b preamble. */
+  async function contribute(upload, raw, { store = objectStore } = {}) {
+    const bytes = new TextEncoder().encode(raw);
     const value = JSON.parse(raw);
+    const envelopeDigest = sha256Hex(raw);
     const claim = await transport.claimPostgresDeviceUploadAuthorization(pool, `Upload ${upload}`, {
-      envelopeDigest: sha256Hex(raw), bodyBytes: Buffer.byteLength(raw), contentType: "application/json",
+      envelopeDigest, bodyBytes: bytes.byteLength, contentType: "application/json",
     }, { schema: schemaOptions });
     const participantRow = (await pool.query(
       `SELECT id, consent_version, owner_kind FROM "${schemaOptions.primarySchema}".participants WHERE id = $1`,
@@ -501,46 +599,65 @@ async function origin(pool, schemaOptions, objectStore) {
     const deviceId = (await pool.query(
       `SELECT issued_by_device_id FROM "${schemaOptions.primarySchema}".device_upload_authorizations WHERE id = $1`,
       [claim.authorizationId])).rows[0].issued_by_device_id;
-    const principal = { participantId: claim.participantId, deviceId };
+    const principal = Object.freeze({ participantId: claim.participantId, deviceId });
+    let persistStarted = false;
+    let handlerReturned = false;
     try {
-      await authority.assertPostgresTelemetryTransportWriteAllowed(pool, principal,
-        authority.telemetryTransportSchemaForEnvelope(value.schemaVersion), { schema: schemaOptions });
       const handler = registry.resolve(value.schemaVersion);
       assert.ok(handler, "the envelope version is registered");
-      const response = await handler({ raw, value },
-        { id: participantRow.id, consentVersion: participantRow.consent_version, ownerKind: participantRow.owner_kind },
-        deviceId, claim, context);
-      const receipt = await response.clone().json();
+      await formats.resolve(value.schemaVersion.replace("telemetry-envelope-", "telemetry-contribution-"))
+        .assertUploadAllowed(pool, principal, Date.now(), { schema: schemaOptions });
+      const response = await handler(Object.freeze({ bytes, raw, value }),
+        Object.freeze({ id: participantRow.id, consentVersion: participantRow.consent_version,
+          ownerKind: participantRow.owner_kind }),
+        deviceId, claim, Object.freeze({
+          primaryPool: pool, ledgerPool: pool, objectStore: store,
+          envelopePublicJwk: keys.publicText, envelopePrivateJwk: keys.privateText, sourceNamespace: NAMESPACE,
+          request: new Request(`${ORIGIN}/api/v1/contributions`, { method: "POST" }),
+          envelopeDigest, bodyBytes: bytes.byteLength, contentType: "application/json", principal,
+          schema: schemaOptions, markPersistStarted() { persistStarted = true; },
+        }));
+      handlerReturned = true;
+      let receipt;
+      try { receipt = await response.clone().json(); } catch { /* no JSON receipt */ }
+      if (typeof receipt?.contributionId !== "string") {
+        throw Object.assign(new Error("INTERNAL_ERROR"), { code: "INTERNAL_ERROR", status: 500 });
+      }
       await admission.recordPostgresDeviceUploadReceipt(pool, claim.authorizationId, receipt.contributionId,
         { schema: schemaOptions });
       return { response, receipt, claim };
     } catch (error) {
-      await transport.abandonPostgresDeviceUploadAuthorization(pool, claim, {
-        participantId: claim.participantId, deviceId,
-      }, { schema: schemaOptions }).catch(() => {});
+      if (!persistStarted || handlerReturned) {
+        await transport.abandonPostgresDeviceUploadAuthorization(pool, claim, principal, { schema: schemaOptions })
+          .catch(() => {});
+      }
       throw error;
     }
   }
 
-  async function upload(device, chunk, { envelope } = {}) {
-    const raw = JSON.stringify(envelope ?? await encryptedEnvelope(chunk));
+  /** A v1.0 upload as the shipped d43c8f92 sync engine sends it: three authorization keys. */
+  async function upload(device, chunk, { envelope, raw: rawEnvelope, store } = {}) {
+    const raw = rawEnvelope ?? JSON.stringify(envelope ?? await encryptedEnvelope(chunk));
     const authorization = await authorizeUpload(device, {
       envelopeDigest: sha256Hex(raw), contentLengthBytes: Buffer.byteLength(raw), contentType: "application/json",
-      telemetrySchemaVersion: "telemetry-contribution-v1.0",
     });
-    return { raw, ...await contribute(authorization.uploadAuthorization, raw) };
+    return { raw, ...await contribute(authorization.uploadAuthorization, raw, store ? { store } : {}) };
   }
 
-  async function uploadV01(device, record, { envelope } = {}) {
-    const raw = JSON.stringify(envelope ?? await encryptedEnvelope(record, TELEMETRY_V01_ENVELOPE_SCHEMA_VERSION));
+  async function uploadV01(device, record, { envelope, raw: rawEnvelope, store } = {}) {
+    const raw = rawEnvelope
+      ?? JSON.stringify(envelope ?? await encryptedEnvelope(record, TELEMETRY_V01_ENVELOPE_SCHEMA_VERSION));
     const authorization = await authorizeUpload(device, {
       envelopeDigest: sha256Hex(raw), contentLengthBytes: Buffer.byteLength(raw), contentType: "application/json",
       telemetrySchemaVersion: "telemetry-contribution-v0.1",
     });
-    return { raw, ...await contribute(authorization.uploadAuthorization, raw) };
+    return { raw, ...await contribute(authorization.uploadAuthorization, raw, store ? { store } : {}) };
   }
 
-  return { formats, registry, authorizeUpload, contribute, upload, uploadV01, admission };
+  return {
+    formats, registry, uploadAuthorizations, steps, authorizeUploadResponse, authorizeUpload, contribute, upload,
+    uploadV01, admission,
+  };
 }
 
 /** The Worker's typed v1 admission for the same chunk, ids and clock, on D1. */
@@ -947,23 +1064,26 @@ test("PG17 upload authorization: each legacy format answers as the Worker on D1,
     "telemetry-contribution-v0.1": "allowed",
     "telemetry-contribution-v0.2": "403 TELEMETRY_TRANSPORT_BLOCKED",
   });
-  // The rendered refusal is the Worker's errorResponse body.
+  // The route module's rendered refusal is the Worker's errorResponse body.
   const raw = JSON.stringify({ synthetic: true });
   for (const [body, status, code] of [
     [{ envelopeDigest: sha256Hex(raw), contentLengthBytes: MAX_REQUEST_BYTES + 1, contentType: "application/json",
       telemetrySchemaVersion: "telemetry-contribution-v1.0" }, 400, "BODY_INVALID"],
     [{ envelopeDigest: sha256Hex(raw), contentLengthBytes: 10, contentType: "application/json",
       telemetrySchemaVersion: "telemetry-contribution-v1.1" }, 403, "TELEMETRY_CONSENT_INVALID"],
+    [{ envelopeDigest: sha256Hex(raw), contentLengthBytes: 10, contentType: "application/json",
+      telemetrySchemaVersion: "telemetry-contribution-v1.3" }, 403, "TELEMETRY_TRANSPORT_BLOCKED"],
   ]) {
     let refusal;
     await assert.rejects(service.authorizeUpload(device, body), (error) => {
       refusal = error;
       return true;
     });
-    const rendered = errorResponse(new ApiError(refusal.status, refusal.code), "request-synthetic");
     const expected = errorResponse(new ApiError(status, code), "request-synthetic");
-    assert.equal(rendered.status, expected.status);
-    assert.deepEqual(await rendered.json(), await expected.json());
+    assert.equal(refusal.status, expected.status);
+    assert.match(refusal.body.error.requestId, /^[0-9a-f-]{36}$/u);
+    assert.deepEqual({ ...refusal.body, error: { ...refusal.body.error, requestId: "request-synthetic" } },
+      await expected.json());
   }
   const unissued = await pool.query(`SELECT count(*)::int AS n FROM "${schema}".device_upload_authorizations`);
   assert.equal(unissued.rows[0].n, 0, "a refused request issues nothing");
@@ -1511,11 +1631,28 @@ test("PG17 the staged migration replaces the lifetime cap with D1's weekly windo
     options: `-c search_path=${schema},pg_catalog`,
   });
   let created = false;
+  let stockRoot = null;
   try {
     await pool.query(`CREATE SCHEMA "${schema}"`);
     created = true;
-    // Stock migrations only, then pre-existing contributions, then the staged file.
-    await applyStockAndStagedMigrations({ role: "primary", schema, pool, stagedFiles: [] });
+    // The stock migrations numbered below the legacy admission migration,
+    // wherever it lives (staged today, promoted later), then pre-existing
+    // contributions, then its SQL: the backfill runs over existing rows in
+    // both states instead of being skipped once the file moves.
+    const name = await legacyAdmissionMigration();
+    const version = Number(name.slice(0, 4));
+    const promotedDirectory = join(WORKER_ROOT, "postgres", "migrations", "primary");
+    const promoted = (await readdir(promotedDirectory)).includes(name);
+    const sql = await readFile(join(promoted ? promotedDirectory
+      : join(WORKER_ROOT, "postgres", "staged-migrations", "primary"), name), "utf8");
+    stockRoot = await mkdtemp(join(tmpdir(), "in3-backfill-"));
+    await mkdir(join(stockRoot, "primary"));
+    for (const file of await readdir(promotedDirectory)) {
+      if (/^\d{4}_.+\.sql$/u.test(file) && Number(file.slice(0, 4)) < version) {
+        await copyFile(join(promotedDirectory, file), join(stockRoot, "primary", file));
+      }
+    }
+    await applyStockAndStagedMigrations({ role: "primary", schema, pool, stagedFiles: [], rootDirectory: stockRoot });
     await pool.query(`INSERT INTO "${schema}".participants (id, owner_kind, access_token_id, access_token_hash,
         recovery_token_id, recovery_token_hash, state, consent_version, consented_at, created_at)
       VALUES ('in3-history', 'social', 'access-in3-history', $1, 'recovery-in3-history', $2, 'active', $3, now(), now())`,
@@ -1531,18 +1668,17 @@ test("PG17 the staged migration replaces the lifetime cap with D1's weekly windo
           'synthetic', 0, 0, 0, 'synthetic', 0, $5)`,
       [`contribution:history-${index}`, sha256Hex(`p${index}`), sha256Hex(`e${index}`), `synthetic/${index}`, at]);
     }
-    const sql = await readFile(join(WORKER_ROOT, "postgres", "staged-migrations", "primary",
-      await legacyAdmissionMigration()), "utf8").catch(() => null);
-    if (sql !== null) {
-      const client = await pool.connect();
-      try {
-        await client.query("BEGIN");
-        await client.query(`SET LOCAL search_path TO "${schema}", pg_catalog`);
-        await client.query(sql);
-        await client.query("COMMIT");
-      } finally {
-        client.release();
-      }
+    const before = await pool.query(`SELECT count(*)::int AS n FROM pg_catalog.pg_tables
+      WHERE schemaname = $1 AND tablename = 'telemetry_contribution_admission_windows'`, [schema]);
+    assert.equal(before.rows[0].n, 0, "the window table does not exist before the migration");
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(`SET LOCAL search_path TO "${schema}", pg_catalog`);
+      await client.query(sql);
+      await client.query("COMMIT");
+    } finally {
+      client.release();
     }
     const windows = await pool.query(`SELECT window_started_at, accepted_count, last_accepted_at
       FROM "${schema}".telemetry_contribution_admission_windows ORDER BY window_started_at`);
@@ -1565,7 +1701,598 @@ test("PG17 the staged migration replaces the lifetime cap with D1's weekly windo
       assert.equal(start.rows[0].start.toISOString(), startOf(at), at);
     }
   } finally {
+    if (stockRoot !== null) await rm(stockRoot, { recursive: true, force: true });
     if (created) await pool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => {});
     await pool.end();
   }
 });
+
+// ---------------------------------------------------------------------------
+// The upload-authorization route, the receipt, in-batch refusals, supersession
+// scope, withdrawn owners, the erasure inventory and the landed preamble.
+
+const ROUTE_STEPS = Object.freeze(["storage", "admission", "device", "tombstone", "upload-bindings",
+  "upload-registration", "rate-limit"]);
+const sleep = (milliseconds) => new Promise((resolveSleep) => setTimeout(resolveSleep, milliseconds));
+const duplicateIv = (raw) => raw.replace('"iv":', `"iv":"${"A".repeat(16)}","iv":`);
+
+/** The route's answer equals the Worker's errorResponse for the same code, request id aside. */
+async function assertWorkerRefusal(response, status, code, label = code) {
+  const { errorResponse, ApiError } = await workerModule("/src/errors.ts");
+  const body = await response.json();
+  const expected = errorResponse(new ApiError(status, code), "request-synthetic");
+  assert.equal(response.status, expected.status, label);
+  assert.match(body.error.requestId, /^[0-9a-f-]{36}$/u, label);
+  assert.deepEqual({ ...body, error: { ...body.error, requestId: "request-synthetic" } }, await expected.json(), label);
+}
+
+/**
+ * One d43c8f92 typed-mode v1.0 persist on D1 (persistTelemetryV1StorageChunk,
+ * or insertTypedTelemetryV1Chunk itself with direct: true) under a fresh
+ * consuming grant, for a request PostgreSQL refuses. Returns the outcome.
+ */
+async function d1Attempt(twin, { participantId, deviceId, chunk, raw, supersedesId = null,
+  leaseExpiresAt = iso(5 * 60_000), direct = false }) {
+  const { persistTelemetryV1StorageChunk } = await workerModule("/src/telemetry-storage-mode.ts");
+  const { insertTypedTelemetryV1Chunk } = await workerModule("/src/typed-v1-admission.ts");
+  const { parseTelemetryV1Chunk } = await workerModule("/src/telemetry-v1.ts");
+  const { telemetryEnvelopeDigest } = await workerModule("/src/telemetry-repository.ts");
+  const authorizationId = randomUUID();
+  twin.d1Only(
+    `INSERT INTO device_upload_authorizations (id, participant_id, issued_by_device_id, secret_hash, envelope_digest,
+       body_bytes, content_type, state, issued_at, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'application/json', 'unused', ?, ?)`,
+    [authorizationId, participantId, deviceId, bytes32(), sha256Hex(raw), Buffer.byteLength(raw), iso(-1_000),
+      iso(5 * 60_000)]);
+  twin.d1Only("UPDATE device_upload_authorizations SET state = 'consuming', consume_lease_expires_at = ? WHERE id = ?",
+    [leaseExpiresAt, authorizationId]);
+  const insert = {
+    participantId, deviceId, deviceUploadAuthorizationId: authorizationId, chunkRowId: `chunk:${randomUUID()}`,
+    r2Key: `telemetry/v1-${randomUUID()}`, envelopeDigest: await telemetryEnvelopeDigest(JSON.parse(raw)),
+    chunk: parseTelemetryV1Chunk(chunk),
+    supersedes: supersedesId === null ? null
+      : fromSqlite(twin.d1.prepare("SELECT * FROM telemetry_v1_chunks WHERE id = ?").get(supersedesId)),
+    createdAt: iso(), authorizationEnvelopeDigest: sha256Hex(raw),
+  };
+  try {
+    const result = direct
+      ? await insertTypedTelemetryV1Chunk(d1Database(twin.d1), insert, NAMESPACE)
+      : await persistTelemetryV1StorageChunk(d1Database(twin.d1), { kind: "typed", sourceNamespace: NAMESPACE }, insert);
+    return { accepted: result };
+  } catch (error) {
+    return direct ? { thrown: String(error?.message ?? error) } : outcomeOf(error);
+  }
+}
+
+test("PG17 the upload-authorization route module issues for shipped three-key bodies and refuses as the Worker", {
+  skip: SKIP, timeout: 240_000,
+}, () => withTwin(async ({ twin, pool, schema }) => {
+  const { schemaOptions } = await initializeTypedTargets(twin, schema);
+  const service = await origin(pool, schemaOptions, memoryObjectStore());
+  const { WORKER_ROUTE_POLICY } = await workerModule("/src/route-registry.ts");
+  const worker = await workerModule("/src/telemetry-transport-policy.ts");
+
+  // It mounts on the IN-1 seam as the override of exactly this built-in.
+  const mounted = createOriginRouteModuleRegistry({
+    modules: [service.uploadAuthorizations], routePolicy: WORKER_ROUTE_POLICY,
+  });
+  assert.deepEqual(mounted.pathnames, [UPLOAD_AUTHORIZATIONS_PATH]);
+  assert.equal(mounted.resolve("POST", UPLOAD_AUTHORIZATIONS_PATH), service.uploadAuthorizations);
+  assert.equal(mounted.resolve("GET", UPLOAD_AUTHORIZATIONS_PATH), null);
+  // A table without v1.2 would stop v1.2 issuance, so the module cannot start with one.
+  const noop = () => {};
+  assert.throws(() => createUploadAuthorizationRouteModule({
+    primaryPool: pool, ledgerPool: pool, schema: schemaOptions, maxRequestBytes: MAX_REQUEST_BYTES,
+    formats: createUploadAuthorizationFormats(legacyUploadAuthorizationFormatEntries({
+      assertTelemetryTransportWriteAllowed: noop })),
+    assertStorageCurrent: noop, assertAdmissionBindings: noop, assertUploadAuthorizationBindings: noop,
+    assertUploadAuthorizationAllowed: noop, assertUploadRegistrationEnabled: noop, authenticateDevice: noop,
+    hasDeletionTombstone: noop, readBoundedRequestBody: noop, createDeviceUploadAuthorization: noop,
+  }), /UPLOAD_AUTHORIZATION_ROUTE_CONFIGURATION_INVALID/u);
+
+  await socialParticipant(twin, "in3-route");
+  const device = await socialDevice(twin, "in3-route", randomUUID());
+  const raw = JSON.stringify({ synthetic: "route" });
+  const base = { envelopeDigest: sha256Hex(raw), contentLengthBytes: 10, contentType: "application/json" };
+  const issuedCount = async () => (await pool.query(
+    `SELECT count(*)::int AS n FROM "${schema}".device_upload_authorizations`)).rows[0].n;
+
+  // Shipped d43c8f92 sync engines send three keys: a v1.0 authorization, as on D1.
+  service.steps.length = 0;
+  const shipped = await service.authorizeUploadResponse(device, base);
+  assert.equal(shipped.status, 201);
+  assert.match((await shipped.json()).uploadAuthorization, /^um_device_upload_[0-9a-f-]{36}\.[A-Za-z0-9_-]{43}$/u);
+  assert.deepEqual(service.steps, ROUTE_STEPS, "the built-in route's order");
+  // An explicit null is the same default (the Worker's `??`).
+  assert.equal((await service.authorizeUploadResponse(device, { ...base, telemetrySchemaVersion: null })).status, 201);
+  // Four keys naming v1.2 reach the v1.2 format as on the built-in route, with the Worker's answer.
+  let workerV12 = 201;
+  try {
+    await worker.assertTelemetryTransportWriteAllowed(d1Database(twin.d1), device, V12_UPLOAD_FORMAT);
+  } catch (error) {
+    workerV12 = `${error.status} ${error.code}`;
+  }
+  const v12 = await service.authorizeUploadResponse(device, { ...base, telemetrySchemaVersion: V12_UPLOAD_FORMAT });
+  assert.equal(v12.status === 201 ? 201 : `${v12.status} ${(await v12.json()).error.code}`, workerV12);
+  const issued = await issuedCount();
+  assert.equal(issued, workerV12 === 201 ? 3 : 2);
+
+  for (const [label, body, options, status, code] of [
+    ["an unknown version", { ...base, telemetrySchemaVersion: "telemetry-contribution-v1.3" }, {}, 403,
+      "TELEMETRY_TRANSPORT_BLOCKED"],
+    ["the blocked v0.2 format", { ...base, telemetrySchemaVersion: "telemetry-contribution-v0.2" }, {}, 403,
+      "TELEMETRY_TRANSPORT_BLOCKED"],
+    ["five keys", { ...base, telemetrySchemaVersion: "telemetry-contribution-v1.0", extra: 1 }, {}, 400, "BODY_INVALID"],
+    ["two keys", { envelopeDigest: base.envelopeDigest, contentLengthBytes: 10 }, {}, 400, "BODY_INVALID"],
+    ["a body that is not JSON", null, { raw: "{" }, 400, "BODY_INVALID"],
+    ["a text body", base, { headers: { "content-type": "text/plain" } }, 415, "CONTENT_TYPE_INVALID"],
+    ["an unknown bearer", base, { headers: { authorization: "Device um_device_unknown.synthetic" } }, 401,
+      "DEVICE_AUTH_INVALID"],
+    ["a cookie", base, { headers: { cookie: "session=synthetic" } }, 401, "DEVICE_AUTH_INVALID"],
+  ]) {
+    service.steps.length = 0;
+    await assertWorkerRefusal(await service.authorizeUploadResponse(device, body, options), status, code, label);
+    if (label === "a cookie") assert.deepEqual(service.steps, ["storage", "admission"], "refused before the bearer");
+  }
+  const query = await service.authorizeUploadResponse(device, base, { search: "?synthetic=1" });
+  assert.equal(query.status, 503);
+  assert.deepEqual(await query.json(), { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
+  // A disabled upload-registration control refuses before the body.
+  await pool.query(`UPDATE "${schema}".collection_controls SET revision = 3, control_state = 'degraded',
+      upload_registration_enabled = false, updated_at = $1 WHERE singleton = 1`, [iso()]);
+  service.steps.length = 0;
+  await assertWorkerRefusal(await service.authorizeUploadResponse(device, base), 503, "UPLOAD_REGISTRATION_DISABLED");
+  assert.deepEqual(service.steps, ROUTE_STEPS.slice(0, -1));
+  assert.equal(await issuedCount(), issued, "a refused request issues nothing");
+}));
+
+test("PG17 an unrecordable upload receipt answers 500 INTERNAL_ERROR, as d43c8f92 recordDeviceUploadReceipt does", {
+  skip: SKIP, timeout: 240_000,
+}, () => withTwin(async ({ twin, pool, schema }) => {
+  const { schemaOptions } = await initializeTypedTargets(twin, schema);
+  const service = await origin(pool, schemaOptions, memoryObjectStore());
+  const transport = await workerModule("/src/postgres-typed-v12-transport.ts");
+  const { recordDeviceUploadReceipt } = await workerModule("/src/device-auth.ts");
+  await socialParticipant(twin, "in3-receipt");
+  const device = await socialDevice(twin, "in3-receipt", randomUUID());
+  const d1 = d1Database(twin.d1);
+  const outcome = async (work) => {
+    try {
+      await work();
+      return "recorded";
+    } catch (error) {
+      return `${error.status} ${error.code}`;
+    }
+  };
+  /** A claimed grant on PostgreSQL and the same consuming grant on D1. */
+  const claimed = async (label) => {
+    const raw = JSON.stringify({ synthetic: label });
+    const { uploadAuthorization } = await service.authorizeUpload(device, {
+      envelopeDigest: sha256Hex(raw), contentLengthBytes: Buffer.byteLength(raw), contentType: "application/json",
+    });
+    const claim = await transport.claimPostgresDeviceUploadAuthorization(pool, `Upload ${uploadAuthorization}`, {
+      envelopeDigest: sha256Hex(raw), bodyBytes: Buffer.byteLength(raw), contentType: "application/json",
+    }, { schema: schemaOptions });
+    twin.d1Only(
+      `INSERT INTO device_upload_authorizations (id, participant_id, issued_by_device_id, secret_hash, envelope_digest,
+         body_bytes, content_type, state, issued_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'application/json', 'unused', ?, ?)`,
+      [claim.authorizationId, device.participantId, device.deviceId, bytes32(), sha256Hex(raw),
+        Buffer.byteLength(raw), iso(-1_000), iso(5 * 60_000)]);
+    twin.d1Only("UPDATE device_upload_authorizations SET state = 'consuming', consume_lease_expires_at = ? WHERE id = ?",
+      [iso(5 * 60_000), claim.authorizationId]);
+    return claim.authorizationId;
+  };
+  const record = (authorizationId, contributionId) => Promise.all([
+    outcome(() => recordDeviceUploadReceipt(d1, authorizationId, contributionId)),
+    outcome(() => service.admission.recordPostgresDeviceUploadReceipt(pool, authorizationId, contributionId,
+      { schema: schemaOptions })),
+  ]);
+
+  // The consume lease lapsed before the receipt step (a slow replay).
+  const lapsed = await claimed("lapsed");
+  await pool.query(`UPDATE "${schema}".device_upload_authorizations
+      SET consume_lease_expires_at = now() - interval '1 second' WHERE id = $1`, [lapsed]);
+  twin.d1Only("UPDATE device_upload_authorizations SET consume_lease_expires_at = ? WHERE id = ?", [iso(-1_000), lapsed]);
+  assert.deepEqual(await record(lapsed, "chunk:synthetic-receipt"), ["500 INTERNAL_ERROR", "500 INTERNAL_ERROR"]);
+  // Consumed against another contribution: refused; against the same one: accepted.
+  const consumed = await claimed("consumed");
+  await twin.run(`UPDATE device_upload_authorizations SET state = 'consumed', consumed_at = ?,
+      consumed_contribution_id = 'chunk:synthetic-first', consume_lease_expires_at = NULL WHERE id = ?`,
+  [iso(), consumed]);
+  assert.deepEqual(await record(consumed, "chunk:synthetic-other"), ["500 INTERNAL_ERROR", "500 INTERNAL_ERROR"]);
+  assert.deepEqual(await record(consumed, "chunk:synthetic-first"), ["recorded", "recorded"]);
+  // A live claim is recorded on both.
+  assert.deepEqual(await record(await claimed("live"), "chunk:synthetic-live"), ["recorded", "recorded"]);
+}));
+
+test("PG17 a duplicated envelope key is refused 400 ENVELOPE_INVALID after the claim, for v1.0 and v0.1", {
+  skip: SKIP, timeout: 240_000,
+}, () => withTwin(async ({ twin, pool, schema }) => {
+  const { schemaOptions } = await initializeTypedTargets(twin, schema);
+  const store = memoryObjectStore();
+  const service = await origin(pool, schemaOptions, store);
+  await socialParticipant(twin, "in3-duplicate");
+  const device = await socialDevice(twin, "in3-duplicate", randomUUID());
+  const v10 = await encryptedEnvelope(await syntheticChunk({ seed: "duplicate" }));
+  const v01 = await encryptedEnvelope(v01Contribution("d"), TELEMETRY_V01_ENVELOPE_SCHEMA_VERSION);
+  for (const [envelope, send] of [[v10, service.upload], [v01, service.uploadV01]]) {
+    const raw = duplicateIv(JSON.stringify(envelope));
+    assert.deepEqual(JSON.parse(raw), envelope, "JSON.parse keeps the last duplicate, so the parsed envelope is valid");
+    await assert.rejects(send(device, null, { raw }),
+      (error) => error.status === 400 && error.code === "ENVELOPE_INVALID");
+  }
+  const counts = async () => (await pool.query(`SELECT
+      (SELECT count(*)::int FROM "${schema}".telemetry_v1_chunks) AS chunks,
+      (SELECT count(*)::int FROM "${schema}".telemetry_contributions) AS contributions,
+      (SELECT count(*)::int FROM "${schema}".pending_objects) AS pending,
+      (SELECT count(*)::int FROM "${schema}".device_upload_authorizations WHERE state = 'revoked') AS abandoned`)).rows[0];
+  assert.deepEqual(await counts(), { chunks: 0, contributions: 0, pending: 0, abandoned: 2 });
+  assert.equal(store.objects.size, 0);
+  // The same envelopes, each key once, are admitted.
+  assert.equal((await service.upload(device, null, { envelope: v10 })).response.status, 202);
+  assert.equal((await service.uploadV01(device, null, { envelope: v01 })).response.status, 202);
+}));
+
+test("PG17 a withdrawn owner link is admitted and reactivated with D1's rows, with and without a v1.0 mapping", {
+  skip: SKIP, timeout: 300_000,
+}, () => withTwin(async ({ twin, pool, schema }) => {
+  const { schemaOptions } = await initializeTypedTargets(twin, schema);
+  const service = await origin(pool, schemaOptions, memoryObjectStore());
+  await socialParticipant(twin, "in3-withdrawn");
+  const device = await socialDevice(twin, "in3-withdrawn", randomUUID());
+  // Imported D1 opt-out history: a withdrawn link and no v1.0 mapping yet.
+  await twin.run("INSERT INTO storage_v11_owner_links (participant_id, owner_digest, state) VALUES (?, ?, 'withdrawn')",
+    ["in3-withdrawn", sha256Hex("synthetic-withdrawn-owner")]);
+  const compare = async (label) => {
+    const rows = await snapshot(twin, schema, "in3-withdrawn");
+    for (const key of Object.keys(rows.d1)) assert.deepEqual(rows.pg[key], rows.d1[key], `${label}: ${key}`);
+    return rows;
+  };
+  const first = await syntheticChunk({ stream: "usage", count: 2, seed: "withdrawn" });
+  const admitted = await service.upload(device, first);
+  assert.equal(admitted.response.status, 202);
+  await oracleAdmission(twin, schema, admitted.receipt.contributionId, first, admitted.raw);
+  let rows = await compare("first upload");
+  assert.deepEqual(rows.pg.events.map((event) => [event.kind, event.linkState]), [["owner-active", "active"]]);
+  assert.equal(rows.pg.membership.length, 1);
+
+  // Withdrawn again, now with the mapping in place. D1's storage_v11_owner_terminal
+  // trigger journals the withdrawal; PostgreSQL's withdrawal path appends the same row.
+  const link = (await pool.query(`SELECT owner_digest, object_digest, manifest_digest
+    FROM "${schema}".storage_v11_owner_links WHERE participant_id = $1`, ["in3-withdrawn"])).rows[0];
+  twin.d1Only("UPDATE storage_v11_owner_links SET state = 'withdrawn' WHERE participant_id = ?", ["in3-withdrawn"]);
+  await pool.query(`UPDATE "${schema}".storage_v11_owner_links SET state = 'withdrawn' WHERE participant_id = $1`,
+    ["in3-withdrawn"]);
+  await pool.query(`SELECT "${schema}".storage_journal_append('owner-withdrawn', $1, $2, $3, $4)`,
+    [link.owner_digest, sha256Hex("synthetic-withdrawal-event"), link.object_digest, link.manifest_digest]);
+  const second = await syntheticChunk({ stream: "quota", count: 1, seed: "withdrawn-again" });
+  const readmitted = await service.upload(device, second);
+  assert.equal(readmitted.response.status, 202);
+  await oracleAdmission(twin, schema, readmitted.receipt.contributionId, second, readmitted.raw);
+  rows = await compare("second upload");
+  assert.deepEqual(rows.pg.events.map((event) => event.kind), ["owner-active", "owner-active"]);
+}));
+
+test("PG17 a v1.0 correction is refused 503 where D1's supersession guard refuses it (accepted v0.1 history)", {
+  skip: SKIP, timeout: 300_000,
+}, () => withTwin(async ({ twin, pool, schema }) => {
+  const { schemaOptions } = await initializeTypedTargets(twin, schema);
+  const store = memoryObjectStore();
+  const service = await origin(pool, schemaOptions, store);
+  await socialParticipant(twin, "in3-mixed");
+  const device = await socialDevice(twin, "in3-mixed", randomUUID());
+  const legacy = await service.uploadV01(device, v01Contribution("e"));
+  assert.equal(legacy.response.status, 202);
+  await oracleV01Admission(twin, schema, legacy.receipt.contributionId, legacy.raw);
+  // A first revision is admitted on both stores: no graph-scope marker, and no guard on insert.
+  const chunk = await syntheticChunk({ stream: "usage", count: 1, seed: "mixed" });
+  const first = await service.upload(device, chunk);
+  assert.equal(first.response.status, 202);
+  await oracleAdmission(twin, schema, first.receipt.contributionId, chunk, first.raw);
+
+  const correction = await syntheticChunk({ stream: "usage", count: 2, seed: "mixed-2", revision: 2 });
+  const raw = JSON.stringify(await encryptedEnvelope(correction));
+  const attempt = { participantId: "in3-mixed", deviceId: device.deviceId, chunk: correction, raw,
+    supersedesId: first.receipt.contributionId };
+  const direct = await d1Attempt(twin, { ...attempt, direct: true });
+  assert.match(direct.thrown ?? "", /typed_v1_supersession_conflict/u, "D1 aborts in typed_v1_supersession_guard");
+  assert.deepEqual(await d1Attempt(twin, attempt), { status: 503, code: "BACKEND_STORAGE_UNAVAILABLE", details: null });
+  await assert.rejects(service.upload(device, null, { raw }),
+    (error) => error.status === 503 && error.code === "BACKEND_STORAGE_UNAVAILABLE");
+  const rows = await snapshot(twin, schema, "in3-mixed");
+  for (const key of Object.keys(rows.d1)) assert.deepEqual(rows.pg[key], rows.d1[key], key);
+  assert.equal(rows.pg.chunkHeaders.filter((row) => row.superseded_at !== null).length, 0);
+  assert.equal(store.objects.size, 2, "the refused correction's object is retired");
+}));
+
+test("PG17 refusals raised inside the persist transaction keep D1's codes: typed v1.0 503 or 401, v0.1 500", {
+  skip: SKIP, timeout: 300_000,
+}, () => withTwin(async ({ twin, pool, schema }) => {
+  const { schemaOptions } = await initializeTypedTargets(twin, schema);
+  const { TELEMETRY_V1_LAUNCH_WEEK_CHUNKS_PER_DAY } = await workerModule("/src/telemetry-v1-repository.ts");
+  const { insertTelemetryContribution, telemetryEnvelopeDigest, telemetryPlaintextDigest } =
+    await workerModule("/src/telemetry-repository.ts");
+  const { validateTelemetryContribution } = await workerModule("/src/telemetry-validation.ts");
+  const { ApiError } = await workerModule("/src/errors.ts");
+  // The race window: between the pre-write checks and the persist, the object write runs this hook once.
+  let hook = null;
+  const store = memoryObjectStore({ beforePut: async () => {
+    const run = hook;
+    hook = null;
+    if (run) await run();
+  } });
+  const service = await origin(pool, schemaOptions, store);
+  // Production runs with v1.1 accepted; a v1.1 consent then raises the floor above v1.0.
+  await twin.run("UPDATE telemetry_transport_formats SET lifecycle = 'accepted' WHERE schema_version = ?",
+    ["telemetry-contribution-v1.1"]);
+  const s = `"${schema}".`;
+  const v11Consent = `INSERT INTO telemetry_v11_device_consents (participant_id, device_id, telemetry_schema_version,
+      field_dictionary_version, privacy_contract_version, consented_at)
+    VALUES (?, ?, 'telemetry-contribution-v1.1', 'telemetry-v1.1-registry-2026-08-31.1',
+      'ongoing-privacy-safe-telemetry-v1.1', ?)`;
+  const refusedUpload = async (send) => {
+    try {
+      await send();
+    } catch (error) {
+      assert.equal(hook, null, `the refusal came after the object write: ${JSON.stringify(outcomeOf(error))}`);
+      return outcomeOf(error);
+    }
+    assert.fail("the upload was expected to be refused");
+  };
+
+  // (1) The day's chunk window fills between the pre-write admission and the persist.
+  await socialParticipant(twin, "in3-window-race");
+  const windowDevice = await socialDevice(twin, "in3-window-race", randomUUID());
+  const windowRow = `INSERT INTO telemetry_v1_chunk_admission_windows (participant_id, device_id, window_day,
+      accepted_count, last_accepted_at) VALUES (?, ?, ?, ?, ?)`;
+  const windowValues = ["in3-window-race", windowDevice.deviceId, day(), TELEMETRY_V1_LAUNCH_WEEK_CHUNKS_PER_DAY, iso()];
+  const windowChunk = await syntheticChunk({ seed: "window-race" });
+  hook = () => twin.pgOnly(windowRow, windowValues);
+  assert.deepEqual(await refusedUpload(() => service.upload(windowDevice, windowChunk)),
+    { status: 503, code: "BACKEND_STORAGE_UNAVAILABLE", details: null });
+  twin.d1Only(windowRow, windowValues);
+  assert.deepEqual(await d1Attempt(twin, { participantId: "in3-window-race", deviceId: windowDevice.deviceId,
+    chunk: windowChunk, raw: JSON.stringify(await encryptedEnvelope(windowChunk)) }),
+  { status: 503, code: "BACKEND_STORAGE_UNAVAILABLE", details: null });
+
+  // (2) The transport floor rises between the preamble's check and the chunk insert (P1007).
+  await socialParticipant(twin, "in3-floor-race");
+  const floorDevice = await socialDevice(twin, "in3-floor-race", randomUUID());
+  const floorChunk = await syntheticChunk({ seed: "floor-race" });
+  hook = () => twin.pgOnly(v11Consent, [floorDevice.participantId, floorDevice.deviceId, iso()]);
+  assert.deepEqual(await refusedUpload(() => service.upload(floorDevice, floorChunk)),
+    { status: 503, code: "BACKEND_STORAGE_UNAVAILABLE", details: null });
+  twin.d1Only(v11Consent, [floorDevice.participantId, floorDevice.deviceId, iso()]);
+  assert.deepEqual(await d1Attempt(twin, { participantId: "in3-floor-race", deviceId: floorDevice.deviceId,
+    chunk: floorChunk, raw: JSON.stringify(await encryptedEnvelope(floorChunk)) }),
+  { status: 503, code: "BACKEND_STORAGE_UNAVAILABLE", details: null });
+
+  // (3) The claim's consume lease lapses during the object write: D1's header
+  // authority reads the clock at insert, so the request-start clock must not admit it.
+  await socialParticipant(twin, "in3-lease-race");
+  const leaseDevice = await socialDevice(twin, "in3-lease-race", randomUUID());
+  const lapse = (participantId) => async () => {
+    await pool.query(`UPDATE ${s}device_upload_authorizations
+        SET consume_lease_expires_at = clock_timestamp() + interval '50 milliseconds'
+      WHERE participant_id = $1 AND state = 'consuming'`, [participantId]);
+    await sleep(250);
+  };
+  const leaseChunk = await syntheticChunk({ seed: "lease-race" });
+  hook = lapse("in3-lease-race");
+  assert.deepEqual(await refusedUpload(() => service.upload(leaseDevice, leaseChunk)),
+    { status: 401, code: "UPLOAD_AUTH_INVALID", details: null });
+  assert.deepEqual(await d1Attempt(twin, { participantId: "in3-lease-race", deviceId: leaseDevice.deviceId,
+    chunk: leaseChunk, raw: JSON.stringify(await encryptedEnvelope(leaseChunk)), leaseExpiresAt: iso(-1_000) }),
+  { status: 401, code: "UPLOAD_AUTH_INVALID", details: null });
+
+  // (4) The same lapse for v0.1: D1's 'upload unavailable' abort is rethrown
+  // unmapped (handleTelemetryContribution), which the Worker answers 500.
+  hook = lapse("in3-lease-race");
+  assert.deepEqual(await refusedUpload(() => service.uploadV01(leaseDevice, v01Contribution("c"))),
+    { status: 500, code: "INTERNAL_ERROR", details: null });
+  const keys = await envelopeKeys();
+  const { decryptSyntheticEnvelope } = await workerModule("/src/crypto.ts");
+  const v01Envelope = await encryptedEnvelope(v01Contribution("c"), TELEMETRY_V01_ENVELOPE_SCHEMA_VERSION);
+  const v01Record = validateTelemetryContribution(
+    await decryptSyntheticEnvelope(v01Envelope, keys.publicText, keys.privateText));
+  const v01Grant = randomUUID();
+  twin.d1Only(
+    `INSERT INTO device_upload_authorizations (id, participant_id, issued_by_device_id, secret_hash, envelope_digest,
+       body_bytes, content_type, state, issued_at, expires_at, consume_lease_expires_at)
+     VALUES (?, ?, ?, ?, ?, 10, 'application/json', 'consuming', ?, ?, ?)`,
+    [v01Grant, "in3-lease-race", leaseDevice.deviceId, bytes32(), "b".repeat(64), iso(-60_000), iso(5 * 60_000),
+      iso(-1_000)]);
+  await assert.rejects(insertTelemetryContribution(d1Database(twin.d1), "in3-lease-race",
+    { authorizationId: v01Grant, authorizationKind: "device" }, `contribution:${randomUUID()}`,
+    `telemetry/${randomUUID()}`, await telemetryEnvelopeDigest(v01Envelope), await telemetryPlaintextDigest(v01Record),
+    v01Record, iso()), (error) => !(error instanceof ApiError) && /upload unavailable/u.test(String(error?.message)));
+
+  const counts = await pool.query(`SELECT (SELECT count(*)::int FROM ${s}telemetry_v1_chunks) AS chunks,
+      (SELECT count(*)::int FROM ${s}typed_telemetry_records) AS records,
+      (SELECT count(*)::int FROM ${s}telemetry_contributions) AS contributions,
+      (SELECT count(*)::int FROM ${s}pending_objects) AS pending`);
+  assert.deepEqual(counts.rows[0], { chunks: 0, records: 0, contributions: 0, pending: 0 });
+  assert.equal(store.objects.size, 0, "every refused request's object is retired");
+}));
+
+test("PG17 a record another chunk of the device owns is 409 RECORD_OWNED_BY_OTHER_CHUNK, as on D1", {
+  skip: SKIP, timeout: 300_000,
+}, () => withTwin(async ({ twin, pool, schema }) => {
+  const { schemaOptions } = await initializeTypedTargets(twin, schema);
+  const service = await origin(pool, schemaOptions, memoryObjectStore());
+  await socialParticipant(twin, "in3-owned");
+  const device = await socialDevice(twin, "in3-owned", randomUUID());
+  const owner = await syntheticChunk({ stream: "usage", count: 1, seed: "owned", seq: 0 });
+  const admitted = await service.upload(device, owner);
+  assert.equal(admitted.response.status, 202);
+  await oracleAdmission(twin, schema, admitted.receipt.contributionId, owner, admitted.raw);
+  // The same record in another slot of the same device and stream.
+  const other = await syntheticChunk({ stream: "usage", count: 1, seed: "owned", seq: 1 });
+  const raw = JSON.stringify(await encryptedEnvelope(other));
+  assert.deepEqual(await d1Attempt(twin, { participantId: "in3-owned", deviceId: device.deviceId, chunk: other, raw }),
+    { status: 409, code: "RECORD_OWNED_BY_OTHER_CHUNK", details: null });
+  await assert.rejects(service.upload(device, null, { raw }),
+    (error) => error.status === 409 && error.code === "RECORD_OWNED_BY_OTHER_CHUNK");
+  const rows = await snapshot(twin, schema, "in3-owned");
+  for (const key of Object.keys(rows.d1)) assert.deepEqual(rows.pg[key], rows.d1[key], key);
+}));
+
+test("PG17 the social owner erasure preflight accepts a schema carrying the v0.1 admission-window table", {
+  skip: SKIP, timeout: 120_000,
+}, () => withTwin(async ({ twin, pool, schema }) => {
+  const { schemaOptions } = await initializeTypedTargets(twin, schema);
+  const preflight = await workerModule("/src/postgres-social-owner-erasure-preflight.ts");
+  const table = await pool.query(`SELECT count(*)::int AS n FROM pg_catalog.pg_tables
+    WHERE schemaname = $1 AND tablename = 'telemetry_contribution_admission_windows'`, [schema]);
+  assert.equal(table.rows[0].n, 1, "the staged migration created the participant-owned window table");
+  const participantId = `participant:${randomUUID()}`;
+  await socialParticipant(twin, participantId);
+  const inventory = await preflight.inspectPostgresSocialOwnerErasureTarget({
+    primaryPool: pool, participantId, schema: schemaOptions,
+  });
+  assert.equal(inventory.status, "inspectable", "the fail-closed participant-table inventory knows the table");
+}));
+
+// The landed IN-1b preamble (claude/gcp-fastpath) exports the pairing check;
+// the IN-1a seam this branch is based on does not, so the case below runs
+// only once IN-3 is composed onto the fast path.
+const LANDED_PREAMBLE = typeof contributionEnvelopeSeam.assertContributionEnvelopeFormats === "function";
+
+test("PG17 through the landed origin dispatch: a shipped client authorizes with three keys and uploads v1.0 and v0.1", {
+  skip: SKIP || (LANDED_PREAMBLE ? false : "needs the landed IN-1b contributions preamble (claude/gcp-fastpath)"),
+  timeout: 300_000,
+}, () => withTwin(async ({ twin, pool, schema }) => {
+  const { schemaOptions } = await initializeTypedTargets(twin, schema);
+  await enableCollection(pool, schema);
+  const [authority, admission, transport, uploads, controls, ledgerAuthority, runtimeSchema, workerAdmission,
+    workerCrypto, bounded, routes] = await Promise.all([
+    "/src/postgres-transport-write-authority.ts", "/src/postgres-legacy-contribution-admission.ts",
+    "/src/postgres-typed-v12-transport.ts", "/src/postgres-upload-authorization.ts",
+    "/src/postgres-collection-controls.ts", "/src/postgres-ledger-authority.ts", "/src/postgres-runtime-schema.ts",
+    "/src/admission.ts", "/src/crypto.ts", "/src/bounded-body.ts", "/src/route-registry.ts",
+  ].map((path) => workerModule(path)));
+  const keys = await envelopeKeys();
+  const store = memoryObjectStore();
+  const allowAll = () => ({ async limit() { return { success: true }; } });
+  const admissionEnv = Object.freeze({
+    ENVIRONMENT: "test", ENROLLMENT_RATE_LIMIT: allowAll(), RECOVERY_RATE_LIMIT: allowAll(),
+    CLIENT_ATTEMPT_RATE_LIMIT: allowAll(), PUBLIC_READ_RATE_LIMIT: allowAll(),
+    UPLOAD_AUTHORIZATION_RATE_LIMIT: allowAll(), UPLOAD_PRINCIPAL_RATE_LIMIT: allowAll(),
+  });
+  const mustNotCall = (name) => async () => { throw new Error(`${name} must not be called`); };
+  const assertV12UploadAllowed = (formatPool, device, nowEpoch, { schema: formatSchema }) =>
+    authority.assertPostgresTelemetryTransportWriteAllowed(formatPool, device, V12_UPLOAD_FORMAT,
+      { nowEpoch, schema: formatSchema });
+  const legacyFormats = legacyUploadAuthorizationFormatEntries({
+    assertTelemetryTransportWriteAllowed: authority.assertPostgresTelemetryTransportWriteAllowed,
+    schemaVersions: ["telemetry-contribution-v1.0", "telemetry-contribution-v0.1"],
+  });
+  const dispatch = createPostgresTestV12DayManifestDispatch({
+    primaryPool: pool, ledgerPool: pool, schemaOptions,
+    expectedMigrations: runtimeSchema.POSTGRES_RUNTIME_MIGRATIONS, privateOrigin: ORIGIN,
+    healthDispatch: mustNotCall("healthDispatch"), admissionEnv,
+    assertAdmissionBindings: workerAdmission.assertAdmissionBindings,
+    assertAttemptAllowed: workerAdmission.assertAttemptAllowed,
+    assertUploadAuthorizationBindings: workerAdmission.assertUploadAuthorizationBindings,
+    assertUploadAuthorizationAllowed: workerAdmission.assertUploadAuthorizationAllowed,
+    authenticatePostgresDevice: transport.authenticatePostgresDevice,
+    disconnectPostgresAuthenticatedDevice: mustNotCall("disconnectPostgresAuthenticatedDevice"),
+    hasPostgresDeletionTombstone: ledgerAuthority.hasPostgresDeletionTombstone,
+    readPostgresDeviceSyncCapabilities: mustNotCall("readPostgresDeviceSyncCapabilities"),
+    readPostgresV12DayCandidates: mustNotCall("readPostgresV12DayCandidates"),
+    readPostgresTelemetryV12EffectivePage: mustNotCall("readPostgresTelemetryV12EffectivePage"),
+    publicEnvelopeKey: workerCrypto.publicEnvelopeKey, sourceNamespace: NAMESPACE,
+    createPostgresTypedV12Domain: mustNotCall("createPostgresTypedV12Domain"),
+    assertPostgresV12UploadAllowed: assertV12UploadAllowed,
+    createPostgresDeviceUploadAuthorization: uploads.createPostgresDeviceUploadAuthorization,
+    registerPostgresTypedV12DayManifest: mustNotCall("registerPostgresTypedV12DayManifest"),
+    claimPostgresDeviceUploadAuthorization: transport.claimPostgresDeviceUploadAuthorization,
+    abandonPostgresDeviceUploadAuthorization: transport.abandonPostgresDeviceUploadAuthorization,
+    recordPostgresDeviceUploadReceipt: admission.recordPostgresDeviceUploadReceipt,
+    persistPostgresTypedV12StagedChunk: mustNotCall("persistPostgresTypedV12StagedChunk"),
+    decryptSyntheticEnvelope: mustNotCall("decryptSyntheticEnvelope"),
+    validateTelemetryV12Envelope,
+    validateTelemetryV12StagedChunk: mustNotCall("validateTelemetryV12StagedChunk"),
+    sha256Hex: workerCrypto.sha256Hex, objectStore: store,
+    envelopePublicJwk: keys.publicText, envelopePrivateJwk: keys.privateText,
+    readBoundedRequestBody: bounded.readBoundedRequestBody, maxRequestBytes: MAX_REQUEST_BYTES,
+    contributionEnvelopes: [
+      createTelemetryV10ContributionEnvelope({ admitTelemetryV1Contribution: admission.admitPostgresTelemetryV1Contribution }),
+      createTelemetryV01ContributionEnvelope({ admitTelemetryV01Contribution: admission.admitPostgresTelemetryV01Contribution }),
+    ],
+    uploadAuthorizationFormats: legacyFormats,
+  });
+  const routeModule = createUploadAuthorizationRouteModule({
+    primaryPool: pool, ledgerPool: pool, schema: schemaOptions, maxRequestBytes: MAX_REQUEST_BYTES, admissionEnv,
+    formats: createUploadAuthorizationFormats(new Map([
+      [V12_UPLOAD_FORMAT, { assertUploadAllowed: assertV12UploadAllowed }], ...Object.entries(legacyFormats),
+    ])),
+    // The composition root binds the dispatch's schema-receipt check here.
+    assertStorageCurrent: async () => {},
+    assertAdmissionBindings: workerAdmission.assertAdmissionBindings,
+    assertUploadAuthorizationBindings: workerAdmission.assertUploadAuthorizationBindings,
+    assertUploadAuthorizationAllowed: workerAdmission.assertUploadAuthorizationAllowed,
+    assertUploadRegistrationEnabled: (controlPool, primarySchema) =>
+      controls.assertPostgresCollectionControlFromPool(controlPool, primarySchema, "uploadRegistration"),
+    authenticateDevice: transport.authenticatePostgresDevice,
+    hasDeletionTombstone: ledgerAuthority.hasPostgresDeletionTombstone,
+    readBoundedRequestBody: bounded.readBoundedRequestBody,
+    createDeviceUploadAuthorization: uploads.createPostgresDeviceUploadAuthorization,
+  });
+  const mounted = createOriginRouteModuleRegistry({ modules: [routeModule], routePolicy: routes.WORKER_ROUTE_POLICY });
+  // server.mjs: a module on an overridable path answers first, the built-in otherwise.
+  const serve = (request) => {
+    const routeModuleFor = mounted.resolve(request.method, new URL(request.url).pathname);
+    return routeModuleFor === null ? dispatch(request)
+      : routeModuleFor.handler(request, Object.freeze({ origin: ORIGIN, hostMode: "fastpath-test" }));
+  };
+  await socialParticipant(twin, "in3-landed");
+  const secret = randomBytes(32).toString("base64url");
+  const device = await socialDevice(twin, "in3-landed", randomUUID(), { secret });
+  const bearer = `Device um_device_${device.deviceId}.${secret}`;
+  const post = (handler, path, authorization, body) => handler(new Request(`${ORIGIN}${path}`, {
+    method: "POST", headers: { authorization, "content-type": "application/json" }, body,
+  }));
+  const threeKeys = (raw) => JSON.stringify({
+    envelopeDigest: sha256Hex(raw), contentLengthBytes: Buffer.byteLength(raw), contentType: "application/json",
+  });
+
+  // The built-in route alone refuses the shipped three-key body: the module is what admits it.
+  const builtIn = await post(dispatch, UPLOAD_AUTHORIZATIONS_PATH, bearer, threeKeys("{}"));
+  assert.equal(builtIn.status, 400);
+  assert.equal((await builtIn.json()).error.code, "BODY_INVALID");
+  const shippedUpload = async (raw) => {
+    const authorization = await post(serve, UPLOAD_AUTHORIZATIONS_PATH, bearer, threeKeys(raw));
+    assert.equal(authorization.status, 201);
+    const { uploadAuthorization } = await authorization.json();
+    return post(serve, "/api/v1/contributions", `Upload ${uploadAuthorization}`, raw);
+  };
+
+  const chunk = await syntheticChunk({ stream: "usage", count: 2, seed: "landed" });
+  const raw = JSON.stringify(await encryptedEnvelope(chunk));
+  const accepted = await shippedUpload(raw);
+  assert.equal(accepted.status, 202);
+  const receipt = await accepted.json();
+  assert.equal(receipt.status, "accepted");
+  await oracleAdmission(twin, schema, receipt.contributionId, chunk, raw);
+  const rows = await snapshot(twin, schema, "in3-landed");
+  for (const key of Object.keys(rows.d1)) assert.deepEqual(rows.pg[key], rows.d1[key], key);
+  // A replay through the landed preamble and its receipt step.
+  const replay = await shippedUpload(raw);
+  assert.equal(replay.status, 202);
+  assert.equal(replay.headers.get("idempotency-replayed"), "true");
+  assert.equal((await replay.json()).contributionId, receipt.contributionId);
+  // A duplicated key: 400 ENVELOPE_INVALID.
+  const duplicate = await shippedUpload(duplicateIv(raw));
+  assert.equal(duplicate.status, 400);
+  assert.equal((await duplicate.json()).error.code, "ENVELOPE_INVALID");
+  // v0.1 from the same device, authorized with three keys as src/contribution-device-sync.js does.
+  const legacy = await shippedUpload(JSON.stringify(
+    await encryptedEnvelope(v01Contribution("f"), TELEMETRY_V01_ENVELOPE_SCHEMA_VERSION)));
+  assert.equal(legacy.status, 202);
+  assert.equal((await legacy.json()).status, "accepted");
+  const grants = await pool.query(`SELECT state, count(*)::int AS n FROM "${schema}".device_upload_authorizations
+    GROUP BY state ORDER BY state`);
+  assert.deepEqual(grants.rows, [{ state: "consumed", n: 3 }, { state: "revoked", n: 1 }]);
+}, { ledger: true }));
