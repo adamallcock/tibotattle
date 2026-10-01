@@ -1212,12 +1212,17 @@ test("token mix and share bars preserve amounts and omit unknown or empty visual
   const view=mountWorkUsageView({root,windowRef,t:mountedTranslator,fetchRef:async()=>httpResponse(report)});
   try {
     await settleMountedView();
-    const mix=findMounted(root,n=>n.classList.contains("work-usage-mix-strip"))[0];
-    assert.equal(mix.getAttribute("aria-hidden"),"true");
-    assert.deepEqual(mix.children.map(n=>n.style.width),["70%","20%","10%"]);
-    const legends=findMounted(root,n=>n.classList.contains("work-usage-mix-legend"))[0];
-    assert.match(legends.textContent,/Combined output/);
-    assert.doesNotMatch(legends.textContent,/Reasoning output/);
+    const mixes=findMounted(root,n=>n.classList.contains("work-usage-mix-strip"));
+    assert.equal(mixes.length,2);
+    assert.ok(mixes.every(n=>n.getAttribute("aria-hidden")==="true"));
+    assert.deepEqual(mixes.map(mix=>mix.children.map(n=>n.style.width)),[
+      [`${70 / 90 * 100}%`,`${20 / 90 * 100}%`],["100%"],
+    ]);
+    const legends=findMounted(root,n=>n.classList.contains("work-usage-mix-legend"));
+    assert.match(legends[1].textContent,/Combined output/);
+    assert.doesNotMatch(legends[1].textContent,/Reasoning output/);
+    assert.match(legends[0].textContent,/77.8%/);
+    assert.match(legends[1].textContent,/100\.0%/);
     const bars=findMounted(root,n=>n.classList.contains("work-usage-bar"));
     assert.equal(bars[0].children[0].style.width,"60%");
     assert.ok(bars.every(n=>n.getAttribute("aria-hidden")==="true"));
@@ -1227,6 +1232,64 @@ test("token mix and share bars preserve amounts and omit unknown or empty visual
     assert.equal(findMounted(root,n=>n.classList.contains("work-usage-mix-strip")).length,0);
     assert.equal(findMounted(root,n=>n.classList.contains("work-usage-bar")).length,0);
   } finally {view.destroy();}
+});
+
+test("input and output token mixes use separate totals and preserve the recorded categories", async (t) => {
+  for (const scenario of [
+    {
+      name: "text excludes reasoning in the two-line split",
+      components: { input_cache_read_tokens: 20, input_uncached_tokens: 80, input_cache_write_tokens: 0,
+        output_text_tokens: 16, output_reasoning_tokens: 8 },
+      totals: [100, 24], labels: ["Input tokens", "Output tokens"],
+      widths: [[20, 80], [16 / 24 * 100, 8 / 24 * 100]],
+      legends: [["Cache read", "Uncached input"], ["Output text", "Reasoning output"]],
+      percentages: [["20.0%", "80.0%"], ["66.7%", "33.3%"]],
+    },
+    {
+      name: "cache writes and combined-only events remain distinct",
+      components: { input_cache_read_tokens: 70, input_uncached_tokens: 20, input_cache_write_tokens: 10,
+        output_text_tokens: 10, output_reasoning_tokens: 5, output_combined_tokens: 5 },
+      totals: [100, 20], labels: ["Input tokens", "Output tokens"],
+      widths: [[70, 20, 10], [50, 25, 25]],
+      legends: [["Cache read", "Uncached input", "Cache write"], ["Output text", "Reasoning output", "Combined output"]],
+      percentages: [["70.0%", "20.0%", "10.0%"], ["50.0%", "25.0%", "25.0%"]],
+    },
+    {
+      name: "unknown output does not become a zero output row",
+      components: { input_cache_read_tokens: 20 },
+      totals: [20], labels: ["Input tokens"], widths: [[100]],
+      legends: [["Cache read"]], percentages: [["100.0%"]],
+    },
+    {
+      name: "zero input does not produce an empty input bar",
+      components: { input_cache_read_tokens: 0, input_uncached_tokens: 0, input_cache_write_tokens: 0,
+        output_text_tokens: 16, output_reasoning_tokens: 8 },
+      totals: [24], labels: ["Output tokens"], widths: [[16 / 24 * 100, 8 / 24 * 100]],
+      legends: [["Output text", "Reasoning output"]], percentages: [["66.7%", "33.3%"]],
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const report = structuredClone(PROJECT_ROWS_RESPONSE);
+      report.totals.tokens = scenario.totals.reduce((sum, amount) => sum + amount, 0);
+      report.totals.components = completeComponents(scenario.components);
+      const { root, windowRef } = mountedRoot();
+      const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator, fetchRef: async () => httpResponse(report) });
+      try {
+        await settleMountedView();
+        const groups = findMounted(root, n => n.classList.contains("work-usage-mix-group"));
+        assert.deepEqual(groups.map(n => n.getAttribute("aria-label")), scenario.labels);
+        groups.forEach((group, index) => {
+          const heading = findMounted(group, n => n.classList.contains("work-usage-mix-heading"))[0];
+          assert.equal(heading.children[1].textContent, String(scenario.totals[index]));
+          const strip = findMounted(group, n => n.classList.contains("work-usage-mix-strip"))[0];
+          assert.deepEqual(strip.children.map(n => n.style.width), scenario.widths[index].map(n => `${n}%`));
+          const legend = findMounted(group, n => n.classList.contains("work-usage-mix-legend"))[0];
+          assert.deepEqual(legend.children.map(n => n.children[1].textContent), scenario.legends[index]);
+          assert.deepEqual(legend.children.map(n => n.children[2].textContent), scenario.percentages[index]);
+        });
+      } finally { view.destroy(); }
+    });
+  }
 });
 
 test("primary and expanded model names reuse decorative model icons without extra requests", async () => {

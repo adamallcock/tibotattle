@@ -308,10 +308,13 @@ Results update as you type after two characters and a short pause (300 ms).
 Deleting the text or shortening it below two characters restores the project
 list automatically. Names and search terms stay local.
 
-Small bars beside token and cost shares show their relative size. The token-mix
-strip separates cached and uncached input from recorded output categories;
-combined output stays combined when no split was recorded. Numeric labels remain
-available alongside the graphics. Model rows reuse the app's decorative icons.
+Small bars beside token and cost shares show their relative size. Token mix uses
+two rows: input tokens split into cached, uncached and any recorded cache writes;
+output tokens split into output text and reasoning. Output text excludes reasoning.
+Each row shows its recorded total, with percentages calculated within that row.
+Combined output stays separate when no split was recorded, and rows without
+positive recorded counts are omitted. Numeric labels remain available alongside
+the graphics. Model rows reuse the app's decorative icons.
 
 Choose a period and model to compare token and API-equivalent shares. These are
 estimates of recorded usage, not subscription charges or quota shares. Omitted
