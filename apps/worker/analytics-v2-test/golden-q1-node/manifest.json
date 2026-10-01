@@ -441,7 +441,7 @@
   }
  },
  "forcedNative": {
-  "scope": "withheld",
+  "scope": "all",
   "sampleDates": [
    "2026-07-24",
    "2026-08-10",
@@ -459,15 +459,15 @@
       "usageRows": 1395
      },
      "modelDates": {
-      "usagePages": 1818,
-      "quotaPages": 1818,
-      "dates": 18
+      "usagePages": 7070,
+      "quotaPages": 7070,
+      "dates": 70
      }
     },
     "fits": "complete",
     "model": {
      "failed": 4,
-     "complete": 14
+     "complete": 66
     },
     "failures": {
      "2026-07-24": "STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE",
@@ -476,8 +476,8 @@
      "2026-07-27": "STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE"
     },
     "cost": {
-     "statements": 155804,
-     "invocations": 182,
+     "statements": 607274,
+     "invocations": 702,
      "maxCheckpointBytes": 689044
     }
    },
@@ -489,19 +489,19 @@
       "usageRows": 1417
      },
      "modelDates": {
-      "usagePages": 1414,
-      "quotaPages": 1414,
-      "dates": 14
+      "usagePages": 7070,
+      "quotaPages": 7070,
+      "dates": 70
      }
     },
     "fits": "complete",
     "model": {
-     "complete": 14
+     "complete": 70
     },
     "failures": {},
     "cost": {
-     "statements": 130132,
-     "invocations": 150,
+     "statements": 615453,
+     "invocations": 710,
      "maxCheckpointBytes": 699164
     }
    },
@@ -513,19 +513,19 @@
       "usageRows": 1372
      },
      "modelDates": {
-      "usagePages": 909,
-      "quotaPages": 909,
-      "dates": 9
+      "usagePages": 7070,
+      "quotaPages": 7070,
+      "dates": 70
      }
     },
     "fits": "complete",
     "model": {
-     "complete": 9
+     "complete": 70
     },
     "failures": {},
     "cost": {
-     "statements": 89041,
-     "invocations": 110,
+     "statements": 632048,
+     "invocations": 781,
      "maxCheckpointBytes": 690937
     }
    },
@@ -537,19 +537,19 @@
       "usageRows": 1425
      },
      "modelDates": {
-      "usagePages": 1111,
-      "quotaPages": 1111,
-      "dates": 11
+      "usagePages": 7070,
+      "quotaPages": 7070,
+      "dates": 70
      }
     },
     "fits": "complete",
     "model": {
-     "complete": 11
+     "complete": 70
     },
     "failures": {},
     "cost": {
-     "statements": 104425,
-     "invocations": 120,
+     "statements": 617451,
+     "invocations": 710,
      "maxCheckpointBytes": 721657
     }
    }
@@ -557,23 +557,23 @@
   "tierNEqualsForced": {
    "a": {
     "fits": true,
-    "modelCompared": 4,
-    "modelEqual": 4
+    "modelCompared": 56,
+    "modelEqual": 56
    },
    "b": {
     "fits": true,
-    "modelCompared": 5,
-    "modelEqual": 5
+    "modelCompared": 61,
+    "modelEqual": 61
    },
    "c": {
     "fits": true,
-    "modelCompared": 5,
-    "modelEqual": 5
+    "modelCompared": 66,
+    "modelEqual": 66
    },
    "d": {
     "fits": true,
-    "modelCompared": 5,
-    "modelEqual": 5
+    "modelCompared": 64,
+    "modelEqual": 64
    }
   }
  },

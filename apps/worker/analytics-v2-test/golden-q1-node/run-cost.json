@@ -31,10 +31,11 @@
   "resumedFrom": "converged run (--resume)"
  },
  "tierF": {
-  "scope": "withheld",
+  "scope": "all",
   "total": {
-   "ms": 394209,
-   "statements": 479402
+   "ms": 580874,
+   "statements": 2472226,
+   "jobs": 6
   },
   "owners": {
    "a": {
@@ -45,18 +46,18 @@
       "usageRows": 1395
      },
      "modelDates": {
-      "usagePages": 1818,
-      "quotaPages": 1818,
-      "dates": 18
+      "usagePages": 7070,
+      "quotaPages": 7070,
+      "dates": 70
      }
     },
     "cost": {
-     "ms": 133296,
-     "statements": 155804,
-     "invocations": 182,
+     "ms": 843738,
+     "statements": 607274,
+     "invocations": 702,
      "maxCheckpointBytes": 689044,
      "fits": {
-      "ms": 6956,
+      "ms": 12173,
       "statements": 8713,
       "invocations": 10,
       "maxCheckpointParts": 7,
@@ -72,18 +73,18 @@
       "usageRows": 1417
      },
      "modelDates": {
-      "usagePages": 1414,
-      "quotaPages": 1414,
-      "dates": 14
+      "usagePages": 7070,
+      "quotaPages": 7070,
+      "dates": 70
      }
     },
     "cost": {
-     "ms": 112488,
-     "statements": 130132,
-     "invocations": 150,
+     "ms": 940363,
+     "statements": 615453,
+     "invocations": 710,
      "maxCheckpointBytes": 699164,
      "fits": {
-      "ms": 8021,
+      "ms": 12784,
       "statements": 8794,
       "invocations": 10,
       "maxCheckpointParts": 8,
@@ -99,18 +100,18 @@
       "usageRows": 1372
      },
      "modelDates": {
-      "usagePages": 909,
-      "quotaPages": 909,
-      "dates": 9
+      "usagePages": 7070,
+      "quotaPages": 7070,
+      "dates": 70
      }
     },
     "cost": {
-     "ms": 55739,
-     "statements": 89041,
-     "invocations": 110,
+     "ms": 710065,
+     "statements": 632048,
+     "invocations": 781,
      "maxCheckpointBytes": 690937,
      "fits": {
-      "ms": 5554,
+      "ms": 10086,
       "statements": 9026,
       "invocations": 11,
       "maxCheckpointParts": 8,
@@ -126,18 +127,18 @@
       "usageRows": 1425
      },
      "modelDates": {
-      "usagePages": 1111,
-      "quotaPages": 1111,
-      "dates": 11
+      "usagePages": 7070,
+      "quotaPages": 7070,
+      "dates": 70
      }
     },
     "cost": {
-     "ms": 92219,
-     "statements": 104425,
-     "invocations": 120,
+     "ms": 945530,
+     "statements": 617451,
+     "invocations": 710,
      "maxCheckpointBytes": 721657,
      "fits": {
-      "ms": 7718,
+      "ms": 14181,
       "statements": 8769,
       "invocations": 10,
       "maxCheckpointParts": 8,

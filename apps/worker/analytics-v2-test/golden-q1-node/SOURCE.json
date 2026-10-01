@@ -4,10 +4,11 @@
  "sourceCommit": "d43c8f92a059d9c577776f7eca8a331eb305b8a6",
  "command": "node --max-old-space-size=16384 apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs --work-dir <dir> --corpus q1",
  "oracleFiles": {
-  "apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs": "a072168f4db95e0c8b520e375babc8075a7d444a",
+  "apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs": "47c4a876dd11c1c31a91cd08ee53d7ee3b920f81",
   "apps/worker/scripts/gcp-fastpath-dense-oracle/build.mjs": "b58898bc8bab267d6a7b0c392dacebb46abce58e",
   "apps/worker/scripts/gcp-fastpath-dense-oracle/runtime.mjs": "21371a42b003d3ff68fc02e601f37b1b1e34fba9",
-  "apps/worker/scripts/gcp-fastpath-dense-oracle/forced-native.mjs": "433be08aaa63c722dbf5ad35660c17d7851e86aa",
+  "apps/worker/scripts/gcp-fastpath-dense-oracle/forced-native.mjs": "a55bad51ec8bf5ff8a90f7def5121409ccfac9c8",
+  "apps/worker/scripts/gcp-fastpath-dense-oracle/forced-native-child.mjs": "57f533e58eb2467f7426be594daee1b37a344dbc",
   "apps/worker/scripts/gcp-fastpath-dense-oracle/dense-corpus.mjs": "edf7320956a0acca86f24159432ad5ac878d81a1",
   "apps/worker/scripts/gcp-fastpath-dense-oracle/corpus-summary.mjs": "3ec613a5835cd4a156f6d8ff85cd9ffb461ca0a1",
   "apps/worker/scripts/gcp-fastpath-dense-oracle/entry.ts": "e85bcf6a30712fb096974ba613384d46585a9040",
@@ -27,7 +28,7 @@
  "build": {
   "verifiedFiles": 392,
   "listingSha256": "6e8335b8056297b853900673ff3a58b0a20cdd595136905e1dbd6c5a7870f75a",
-  "bundleSha256": "067a1d9c421d579453ecd900b7a7e468271ba6cffd7bfc7429ed54d211e26409",
+  "bundleSha256": "87f2296adc0ada3cb6699c3d107ce4c0d16536cfd851861c6165f5c5be33d793",
   "esbuildVersion": "0.28.1",
   "dependencies": {
    "jsonc-parser": "3.3.1",
