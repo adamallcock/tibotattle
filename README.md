@@ -173,15 +173,15 @@ for the provenance and future-locale policy.
   `account/read`, `account/rateLimits/read`, and `account/usage/read`. Source
   records are processed locally; prompt and response text is not retained in
   derived state.
-- Contribution to the optional hosted community-aggregate service is **off by
-  default**, requires an explicit review of the exact retained metadata, and is
-  pseudonymous and content-free. Confirmed **Disconnect this Mac** stops this
-  device's contribution authority while preserving hosted and local history.
-  Self-service hosted deletion is retired in current source; hosted erasure is
-  a separate private owner operation, not an app control.
-- Contributing requires signing in with Google or Apple so that one person
-  counts once. The service stores only an irreversible hash of that sign-in,
-  never your name or email, and local-only use needs no account at all.
+- Electron's optional community sharing is accountless, pseudonymous and
+  content-free. The [accepted sharing policy](docs/decisions/2026-09-04-accountless-sharing-policy.md)
+  enables it for identified fresh installations and preserves saved opt-outs.
+  Existing installations without a choice receive the policy's visible notices
+  before activation. Community and Settings expose the same saved choice.
+- The shared dashboard contains no Google/Apple sign-in or legacy social
+  controls. Legacy enrollment and device-disconnect backend contracts remain
+  compatible with their existing consumers. Hosted erasure is a separate
+  private owner operation, not an app control; local-only use needs no account.
 - Derived artifacts (reports, exports, telemetry) are schema-validated to
   exclude prompts, responses, commands, paths, URLs, and raw identifiers.
 
