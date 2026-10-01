@@ -10,8 +10,10 @@
  * content-free source model (two spec-owned tables in the same schema)
  * through the Job's snapshot read pool and derives contract-shaped outputs
  * from it, so these cases prove the schema, the store and the Job
- * orchestration, not the kernels. The final case runs the real A-1/A-2
- * modules over A-1's direct-seed fixture once those land on this branch.
+ * orchestration, not the kernels. The default wiring
+ * (createAnalyticsV2Pipeline) is proven twice: against stub modules with the
+ * A-1/A-2 shapes, and end to end with the real A-1 readers and A-2 compute
+ * over A-1's direct-seed corpus.
  *
  * Run: PG_TEST_SOCKET=/private/tmp/tibotattle-pg-fanout-20260926/socket \
  *      PG_TEST_PORT=55433 node --test postgres-test/analytics-v2-refresh.spec.mjs
@@ -22,10 +24,10 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { access, readdir } from "node:fs/promises";
+import { access } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { after, before, test } from "node:test";
 import pg from "pg";
@@ -36,6 +38,9 @@ import {
 } from "./staged-migrations-harness.mjs";
 import { readPostgresMigrations } from "../cloud-run/postgres-migrations.mjs";
 import * as job from "../cloud-run/analytics-refresh.mjs";
+import analyticsV2Config from "../vitest.analytics-v2.config.mjs";
+import * as seedFixture from "./fixtures/analytics-v2/direct-seed.mjs";
+import * as synthetic from "../analytics-v2-test/fixtures/synthetic-occurrences.mjs";
 
 const execFileAsync = promisify(execFile);
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -56,21 +61,46 @@ const OWNER_LEGACY = digest("owner-legacy");
 const DAY_1 = "2026-09-28";
 const DAY_2 = "2026-09-29";
 const DAY_3 = "2026-09-30";
+/** The stand-in recomputes every source day; the spec's days all follow this. */
+const STAND_IN_HORIZON = Object.freeze({ ownerDayFromDay: "2026-01-01", cacheBandsFromDay: "2026-01-01" });
 
 let vite;
 let contract;
 let store;
+/** The real A-1 readers and A-2 compute core, as the Job bundles them. */
+let a1;
+let a2;
+/** The Worker modules A-1's direct-seed fixture digests its rows with. */
+let seedModules;
 
 before(async () => {
+  // The analytics-v2 resolution: the vendored d43c8f92 kernels import the
+  // packages vendored with them, as esbuild resolves them in the Job bundle.
   vite = await createServer({
     root: WORKER_ROOT,
     configFile: false,
-    server: { middlewareMode: true },
+    plugins: analyticsV2Config.plugins,
+    resolve: analyticsV2Config.resolve,
+    server: { middlewareMode: true, hmr: false, watch: null },
     appType: "custom",
     logLevel: "silent",
   });
-  contract = await vite.ssrLoadModule("/src/analytics-v2/contract.ts");
-  store = await vite.ssrLoadModule("/src/analytics-v2/store.ts");
+  const load = (path) => vite.ssrLoadModule(path);
+  contract = await load("/src/analytics-v2/contract.ts");
+  store = await load("/src/analytics-v2/store.ts");
+  a1 = {
+    owners: await load("/src/analytics-v2/owners.ts"),
+    occurrences: await load("/src/analytics-v2/occurrence-source.ts"),
+    devices: await load("/src/analytics-v2/devices.ts"),
+    queuedDays: await load("/src/analytics-v2/queued-days.ts"),
+  };
+  a2 = await load("/src/analytics-v2/compute.ts");
+  seedModules = {
+    codec: await load("/src/typed-telemetry-codec.ts"),
+    v12codec: await load("/src/telemetry-v12-typed-codec.ts"),
+    reconciliation: await load("/src/telemetry-usage-reconciliation.ts"),
+    sha256Hex: (await load("/src/crypto.ts")).sha256Hex,
+  };
 });
 
 after(async () => {
@@ -356,6 +386,7 @@ function createSpecPipeline(hooks = {}) {
         preview: { schemaVersion: "synthetic-preview", owners: effective.length },
         refusals,
         journal: { lastSequence: inputs.lastSequence },
+        horizon: STAND_IN_HORIZON,
         timings: { prepare: 1, community: 1 },
       };
     },
@@ -601,19 +632,20 @@ test("PG17 (a)(b)(c): full runs write every family, rerun publishes nothing, one
       'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS computed_at FROM ${quoted(schema, "analytics_v2_preview")}`);
     assert.deepEqual(preview.rows[0], { preview: { schemaVersion: "synthetic-preview", owners: 2 }, computed_at: NOW_1 });
 
-    // (b) An identical second run: every head is recomputed, none changes, so no
-    // revision moves and the run row records the unchanged days.
+    // (b) An identical second run: nothing is queued (production's queue), so no
+    // head is recomputed and no revision moves.
     const second = await runJob({ schema });
     assert.equal(second.state, "complete");
     assert.deepEqual(second.published, []);
-    assert.equal(second.unchanged, 3);
+    assert.equal(second.unchanged, 0);
     assert.equal(second.cursor, "4");
     const runs2 = await runRows(pool, schema);
     assert.equal(runs2.length, 2);
-    assert.deepEqual(runs2[1].publication, { published: [], unchanged: [DAY_1, DAY_2, DAY_3], blocked: [] });
+    assert.deepEqual(runs2[1].publication, { published: [], unchanged: [], blocked: [] });
     assert.deepEqual(await publishedRows(pool, schema), heads1, "published heads are byte-identical");
-    // Journal events without a source change, at a later --now: the digests
-    // exclude releasedAt, so still nothing moves.
+    // Journal events re-queue the days without a source change, at a later
+    // --now: the digests exclude releasedAt, so the run row records the three
+    // days as unchanged and no revision moves.
     for (const day of [DAY_1, DAY_2, DAY_3]) {
       await pool.query(`INSERT INTO ${quoted(schema, "spec_source_journal")} (sequence, day)
         SELECT max(sequence) + 1, $1::date FROM ${quoted(schema, "spec_source_journal")}`, [day]);
@@ -623,13 +655,15 @@ test("PG17 (a)(b)(c): full runs write every family, rerun publishes nothing, one
     assert.deepEqual(third.published, []);
     assert.equal(third.unchanged, 3);
     assert.equal(third.cursor, "7");
+    assert.deepEqual((await runRows(pool, schema))[2].publication,
+      { published: [], unchanged: [DAY_1, DAY_2, DAY_3], blocked: [] });
     assert.deepEqual(await publishedRows(pool, schema), heads1, "published heads are byte-identical");
 
     // (c) One owner-day changes: exactly that day's revision moves by one.
     await setUsage(pool, schema, OWNER_B, DAY_3, 12);
     const fourth = await runJob({ schema, now: NOW_3 });
     assert.deepEqual(fourth.published, [DAY_3]);
-    assert.equal(fourth.unchanged, 2);
+    assert.equal(fourth.unchanged, 0, "only the queued day is recomputed");
     const heads4 = await publishedRows(pool, schema);
     assert.deepEqual(heads4.get(DAY_1), heads1.get(DAY_1));
     assert.deepEqual(heads4.get(DAY_2), heads1.get(DAY_2));
@@ -740,7 +774,7 @@ test("PG17: the store refuses to write without the refresh lock when another ses
       assert.equal(lock.rows[0].acquired, true);
       const before = await analyticsSnapshot(pool, schema);
       await assert.rejects(store.writeRunOutputs(writer, minimalOutputs(), {
-        schema, runId: randomUUID(), startedAtMs: Date.parse(NOW_1), expectedCursor: null,
+        schema, runId: randomUUID(), startedAtMs: Date.parse(NOW_1), expectedCursor: null, horizon: STAND_IN_HORIZON,
       }), { code: "ANALYTICS_V2_REFRESH_LOCK_NOT_HELD" });
       assert.deepEqual(await analyticsSnapshot(pool, schema), before);
     } finally {
@@ -843,7 +877,8 @@ test("PG17: the store refuses invalid outputs before writing", {
       const payload = { day: DAY_1, totals: { usageEvents: 1 } };
       const good = await store.analyticsV2DailyContentSha256(payload);
       const write = (outputs, options = {}) => store.writeRunOutputs(client, outputs, {
-        schema, runId: randomUUID(), startedAtMs: Date.now(), expectedCursor: null, ...options,
+        schema, runId: randomUUID(), startedAtMs: Date.now(), expectedCursor: null, horizon: STAND_IN_HORIZON,
+        ...options,
       });
       await assert.rejects(write(minimalOutputs({
         dailyCandidates: [{ day: DAY_1, payload, payloadSha256: "0".repeat(64) }],
@@ -916,7 +951,7 @@ test("PG17: bulk owner families are written in bounded chunks with exact row cou
         release: () => {},
       };
       const receipt = await store.writeRunOutputs(counting, minimalOutputs({ cacheBands }), {
-        schema, runId: randomUUID(), startedAtMs: Date.now(), expectedCursor: null,
+        schema, runId: randomUUID(), startedAtMs: Date.now(), expectedCursor: null, horizon: STAND_IN_HORIZON,
       });
       assert.equal(receipt.state, "complete");
       assert.equal(await count(pool, schema, "analytics_v2_cache_bands"), 6_000);
@@ -1036,7 +1071,7 @@ test("PG17 (g): a blocked conflict day keeps its prior row, stays pending, and i
     assert.deepEqual(heads2.get(DAY_2), heads1.get(DAY_2), "the blocked day keeps its prior row exactly");
     assert.equal(heads2.get(DAY_3).revision, 2);
     const runs = await runRows(pool, schema);
-    assert.deepEqual(runs.at(-1).publication, { published: [DAY_3], unchanged: [DAY_1], blocked: [DAY_2] });
+    assert.deepEqual(runs.at(-1).publication, { published: [DAY_3], unchanged: [], blocked: [DAY_2] });
     assert.deepEqual(runs.at(-1).refusals.filter((refusal) => refusal.family === "daily"),
       [{ ownerDigest: OWNER_A, day: DAY_2, family: "daily", reason: "source_conflict_or_order" }]);
     const refusedDay = await pool.query(`SELECT daily, refusal FROM ${quoted(schema, "analytics_v2_owner_day")}
@@ -1075,36 +1110,156 @@ test("PG17 (g): a blocked conflict day keeps its prior row, stays pending, and i
 // Full-mode owner replacement and the read snapshot
 // ---------------------------------------------------------------------------
 
-test("PG17: a full run replaces owner families wholesale and retires absent owners' rows only", {
+test("PG17: a full run replaces only computed owners' families; absent owners' rows and untouched heads are retained", {
   skip: PG_SKIP,
   timeout: 240_000,
 }, async () => {
-  await withDatabase("retire", async ({ pool, createSchema }) => {
+  await withDatabase("retain", async ({ pool, createSchema }) => {
     const { schema } = await createSchema();
     await seedBaseCorpus(pool, schema);
-    await runJob({ schema });
+    const first = await runJob({ schema });
     const heads1 = await publishedRows(pool, schema);
+    const ownerTables = ["analytics_v2_owner_day", "analytics_v2_cache_bands", "analytics_v2_owner_fits",
+      "analytics_v2_owner_model_dates"];
+    const ownerRows = async (ownerDigest) => {
+      const rows = {};
+      for (const table of ownerTables) {
+        rows[table] = (await pool.query(
+          `SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text), '[]'::jsonb)::text AS rows
+             FROM ${quoted(schema, table)} t WHERE owner_digest = $1`, [ownerDigest])).rows[0].rows;
+      }
+      return rows;
+    };
+    const ownerB1 = await ownerRows(OWNER_B);
+    for (const table of ownerTables) assert.notEqual(ownerB1[table], "[]", table);
+
+    // OWNER_B leaves the roster (opt-out, disconnect, expiry): no journal event.
     await pool.query(`DELETE FROM ${quoted(schema, "spec_source_usage")} WHERE owner_digest = $1`, [OWNER_B]);
     const receipt = await runJob({ schema, now: NOW_2 });
-    assert.equal(receipt.retiredOwners, 1);
+    assert.equal(receipt.state, "complete");
     assert.equal(receipt.owners, 2);
-    for (const table of ["analytics_v2_owner_day", "analytics_v2_cache_bands", "analytics_v2_owner_fits",
-      "analytics_v2_owner_model_dates"]) {
-      const rows = await pool.query(`SELECT count(*)::integer AS n FROM ${quoted(schema, table)} WHERE owner_digest = $1`,
-        [OWNER_B]);
-      assert.equal(rows.rows[0].n, 0, table);
-      const runIds = await pool.query(`SELECT DISTINCT run_id::text AS run_id FROM ${quoted(schema, table)}`);
-      assert.deepEqual(runIds.rows.map((row) => row.run_id), [receipt.runId], `${table} rows belong to the latest run`);
+    assert.equal(receipt.retainedOwners, 1);
+    assert.deepEqual(receipt.published, [], "no head is recomputed without a queued day");
+    assert.deepEqual(await ownerRows(OWNER_B), ownerB1, "the absent owner's rows are retained exactly");
+    for (const table of ownerTables) {
+      const runIds = await pool.query(`SELECT DISTINCT run_id::text AS run_id FROM ${quoted(schema, table)}
+        WHERE owner_digest = $1`, [OWNER_A]);
+      assert.deepEqual(runIds.rows.map((row) => row.run_id), [receipt.runId], `${table}: computed owner replaced`);
     }
-    // Published rows are never retracted: the heads OWNER_B contributed to are
-    // republished at the next revision, the untouched head keeps its row.
-    const heads2 = await publishedRows(pool, schema);
-    assert.deepEqual([...heads2.keys()], [DAY_1, DAY_2, DAY_3]);
-    assert.deepEqual(heads2.get(DAY_1), heads1.get(DAY_1));
-    assert.equal(heads2.get(DAY_2).revision, 2);
-    assert.equal(heads2.get(DAY_2).payload.totals.usageEvents, 5);
-    assert.equal(heads2.get(DAY_3).revision, 2);
-    assert.equal(heads2.get(DAY_3).payload.totals.usageEvents, 0);
+    assert.deepEqual(await publishedRows(pool, schema), heads1, "published history is not rewritten");
+
+    // A later journal event re-queues DAY_3: that day alone is recomputed from
+    // the current roster (production's queue semantics).
+    await setUsage(pool, schema, OWNER_A, DAY_3, 4);
+    const requeued = await runJob({ schema, now: NOW_3 });
+    assert.deepEqual(requeued.published, [DAY_3]);
+    const heads3 = await publishedRows(pool, schema);
+    assert.deepEqual(heads3.get(DAY_1), heads1.get(DAY_1));
+    assert.deepEqual(heads3.get(DAY_2), heads1.get(DAY_2));
+    assert.equal(heads3.get(DAY_3).revision, 2);
+    assert.equal(heads3.get(DAY_3).payload.totals.usageEvents, 4);
+    assert.deepEqual(await ownerRows(OWNER_B), ownerB1);
+    assert.notEqual(first.runId, requeued.runId);
+  });
+});
+
+test("PG17: the store replaces computed owners' rows only inside the run horizon and reports the cache floor", {
+  skip: PG_SKIP,
+  timeout: 180_000,
+}, async () => {
+  await withDatabase("horizon", async ({ pool, createSchema }) => {
+    const { schema } = await createSchema();
+    const client = await pool.connect();
+    try {
+      const counters = (adjacencies) => ({
+        adjacencies, reused_more_than_half: 1, matched_or_exceeded: 1, unordered_ties: 0,
+        excluded_insufficient_evidence: 0, excluded_context_contracted: 0, sessions: 1,
+      });
+      const band = (day, adjacencies) => ({
+        ownerDigest: OWNER_A, day, model: "model-a", effort: "high", band: "under_one_minute",
+        counters: counters(adjacencies),
+      });
+      const ownerDay = (day, usageEvents) => ({ ownerDigest: OWNER_A, day, daily: { usageEvents }, refusal: null });
+      const write = (outputs, horizon) => store.writeRunOutputs(client, minimalOutputs(outputs), {
+        schema, runId: randomUUID(), startedAtMs: Date.parse(NOW_1), expectedCursor: null, horizon,
+      });
+      const state0 = await store.readAnalyticsV2RefreshState(client, { schema });
+      assert.deepEqual({ ...state0 }, { cursor: null, carriedBlockedDays: [], cacheFloorDay: null });
+
+      await write({
+        ownerDays: [ownerDay("2026-03-01", 1), ownerDay("2026-09-28", 2)],
+        cacheBands: [band("2026-03-01", 3), band("2026-09-28", 4)],
+      }, { ownerDayFromDay: "2026-01-01", cacheBandsFromDay: "2026-01-01" });
+      const state1 = await store.readAnalyticsV2RefreshState(client, { schema });
+      assert.equal(state1.cacheFloorDay, "2026-03-01");
+
+      // A later horizon recomputes 2026-09-28 only; the older rows are retained.
+      const receipt = await write({
+        ownerDays: [ownerDay("2026-09-28", 5)],
+        cacheBands: [band("2026-09-28", 6)],
+      }, { ownerDayFromDay: "2026-09-01", cacheBandsFromDay: "2026-09-08" });
+      assert.equal(receipt.retainedOwners, 0);
+      const days = await pool.query(`SELECT to_char(day, 'YYYY-MM-DD') AS day, daily
+        FROM ${quoted(schema, "analytics_v2_owner_day")} ORDER BY day`);
+      assert.deepEqual(days.rows, [
+        { day: "2026-03-01", daily: { usageEvents: 1 } },
+        { day: "2026-09-28", daily: { usageEvents: 5 } },
+      ]);
+      const bands = await pool.query(`SELECT to_char(day, 'YYYY-MM-DD') AS day, adjacencies::integer AS adjacencies
+        FROM ${quoted(schema, "analytics_v2_cache_bands")} ORDER BY day`);
+      assert.deepEqual(bands.rows, [{ day: "2026-03-01", adjacencies: 3 }, { day: "2026-09-28", adjacencies: 6 }]);
+      assert.equal((await store.readAnalyticsV2RefreshState(client, { schema })).cacheFloorDay, "2026-03-01");
+
+      // Rows outside the horizon, rows of an owner the run did not compute and
+      // a missing horizon are refused before any write.
+      const before = await analyticsSnapshot(pool, schema);
+      const horizon = { ownerDayFromDay: "2026-09-01", cacheBandsFromDay: "2026-09-08" };
+      await assert.rejects(write({ cacheBands: [band("2026-09-07", 1)] }, horizon),
+        { code: "ANALYTICS_V2_OUTPUTS_INVALID", field: "cacheBands.day" });
+      await assert.rejects(write({ ownerDays: [ownerDay("2026-08-31", 1)] }, horizon),
+        { code: "ANALYTICS_V2_OUTPUTS_INVALID", field: "ownerDays.day" });
+      await assert.rejects(write({
+        owners: [contractOwner(OWNER_A, "effective"), contractOwner(OWNER_LEGACY, "v0.2")],
+        ownerDays: [{ ownerDigest: OWNER_LEGACY, day: "2026-09-28", daily: {}, refusal: null }],
+      }, horizon), { code: "ANALYTICS_V2_OUTPUTS_INVALID", field: "ownerDays.ownerDigest" });
+      await assert.rejects(write({}, undefined), { code: "ANALYTICS_V2_RUN_INVALID", field: "horizon" });
+      await assert.rejects(write({}, { ownerDayFromDay: "2026-02-30", cacheBandsFromDay: "2026-09-01" }),
+        { code: "ANALYTICS_V2_RUN_INVALID", field: "horizon" });
+      assert.deepEqual(await analyticsSnapshot(pool, schema), before);
+    } finally {
+      client.release();
+    }
+  });
+});
+
+test("PG17: a payload over the cap in its jsonb text form is refused with its own code, atomically", {
+  skip: PG_SKIP,
+  timeout: 180_000,
+}, async () => {
+  await withDatabase("payload-size", async ({ pool, createSchema }) => {
+    const { schema } = await createSchema();
+    const client = await pool.connect();
+    try {
+      // Compact JSON stays under the cap; jsonb's text form (", " and ": ")
+      // does not, and that is what 0059's CHECK measures.
+      const payload = { day: DAY_1, cells: Array.from({ length: 17_800 }, (_, index) => ({ a: index % 10, b: 1 })) };
+      const stampedBytes = Buffer.byteLength(JSON.stringify(store.stampAnalyticsV2DailyPayload(payload,
+        { day: DAY_1, revision: 1, releasedAt: NOW_1 })));
+      assert.ok(stampedBytes < store.ANALYTICS_V2_MAX_DAILY_PAYLOAD_BYTES, `compact ${stampedBytes}`);
+      const jsonbBytes = (await client.query("SELECT octet_length($1::jsonb::text) AS n",
+        [JSON.stringify(payload)])).rows[0].n;
+      assert.ok(jsonbBytes > store.ANALYTICS_V2_MAX_DAILY_PAYLOAD_BYTES, `jsonb ${jsonbBytes}`);
+      const before = await analyticsSnapshot(pool, schema);
+      await assert.rejects(store.writeRunOutputs(client, minimalOutputs({
+        dailyCandidates: [{ day: DAY_1, payload, payloadSha256: await store.analyticsV2DailyContentSha256(payload) }],
+      }), {
+        schema, runId: randomUUID(), startedAtMs: Date.parse(NOW_1), expectedCursor: null, horizon: STAND_IN_HORIZON,
+      }), { code: "ANALYTICS_V2_DAILY_PAYLOAD_TOO_LARGE", field: "dailyCandidates.payload" });
+      assert.deepEqual(await analyticsSnapshot(pool, schema), before);
+      assert.equal((await client.query("SELECT 1 AS ok")).rows[0].ok, 1, "the client left no open transaction");
+    } finally {
+      client.release();
+    }
   });
 });
 
@@ -1181,73 +1336,365 @@ test("PG17: a leaked reader client is discarded, and outputs that ignore the run
 });
 
 // ---------------------------------------------------------------------------
-// Integration: the real A-1 readers and A-2 compute (enable after they land)
+// The default wiring (createAnalyticsV2Pipeline) over the A-1/A-2 shapes
 // ---------------------------------------------------------------------------
 
-const INTEGRATION_MODULES = [
-  "src/analytics-v2/owners.ts",
-  "src/analytics-v2/occurrence-source.ts",
-  "src/analytics-v2/devices.ts",
-  "src/analytics-v2/queued-days.ts",
-  "src/analytics-v2/compute.ts",
-  "postgres-test/fixtures/analytics-v2/direct-seed.mjs",
-];
+const WIRING_NOW_MS = Date.parse(NOW_1);
+const WIRING_OWNER_B = { participantId: "participant-wiring-b", ownerDigest: OWNER_B, hasV1: false, hasV11: true,
+  hasV12: false, hasLegacy: false, hasEffective: false, source: "v1.1" };
+const occurrence = (ownerDigest, day) => ({ ownerDigest, day, occurrenceId: `wiring-${day}` });
 
-async function missingIntegrationModules() {
-  const missing = [];
-  for (const path of INTEGRATION_MODULES) {
-    try {
-      await access(join(WORKER_ROOT, path));
-    } catch {
-      missing.push(path);
-    }
-  }
-  return missing;
+/**
+ * Stub A-1 readers with the landed signatures, and A-2's real range helpers
+ * around a recording computeAnalyticsV2. Evidence: OWNER_A (effective) on
+ * 2026-03-02 and 2026-09-29, OWNER_B (v1.1, typed) on 2026-09-30.
+ */
+function wiringModules({ unlinked = [], failOwner = null } = {}) {
+  const calls = { owners: 0, queued: [], occurrences: [], devices: [], compute: null };
+  const evidence = new Map([[OWNER_A, ["2026-03-02", "2026-09-29"]], [OWNER_B, ["2026-09-30"]]]);
+  const pages = new Map([
+    [0, { days: ["2026-09-30"], lastSequence: 5, terminalOwners: [digest("terminal")], events: 5, complete: false }],
+    [5, { days: ["2026-03-02", "2026-09-29"], lastSequence: 9, terminalOwners: [], events: 4, complete: true }],
+  ]);
+  return {
+    calls,
+    modules: {
+      owners: {
+        async listAnalyticsV2Owners(context) {
+          assert.equal(arguments.length, 1);
+          assert.equal(context.nowMs, WIRING_NOW_MS);
+          calls.owners += 1;
+          return { owners: [contractOwner(OWNER_LEGACY, "v0.2"), WIRING_OWNER_B, contractOwner(OWNER_A, "effective")],
+            unlinked, correctionRuntimeActive: false };
+        },
+      },
+      queuedDays: {
+        async readQueuedDays(context, options) {
+          calls.queued.push(options.afterSequence);
+          return pages.get(options.afterSequence);
+        },
+      },
+      occurrences: {
+        MAX_ANALYTICS_V2_OCCURRENCE_DAYS: 30,
+        async readOwnerOccurrences(context, options) {
+          assert.equal(context.nowMs, WIRING_NOW_MS);
+          calls.occurrences.push({ ...options });
+          if (options.ownerDigest === failOwner) {
+            throw Object.assign(new Error("ANALYTICS_V2_SOURCE_CONFLICT"), { code: "ANALYTICS_V2_SOURCE_CONFLICT" });
+          }
+          const result = new Map();
+          if (options.stream !== "usage") return result;
+          for (const day of evidence.get(options.ownerDigest) ?? []) {
+            if (day >= options.fromDay && day <= options.throughDay) {
+              result.set(day, [occurrence(options.ownerDigest, day)]);
+            }
+          }
+          return result;
+        },
+      },
+      devices: {
+        async countContributingDevices(context, options) {
+          calls.devices.push(new Map([...options.days].map(([day, owners]) => [day, owners.map((owner) => ({ ...owner }))])));
+          return new Map([...options.days].map(([day, owners]) =>
+            [day, new Map(owners.map((owner) => [owner.ownerDigest, 2]))]));
+        },
+      },
+      compute: {
+        ANALYTICS_V2_ANALYSIS_DAYS: a2.ANALYTICS_V2_ANALYSIS_DAYS,
+        analyticsV2RequiredOccurrenceRange: a2.analyticsV2RequiredOccurrenceRange,
+        async computeAnalyticsV2(input) {
+          calls.compute = input;
+          return {
+            contractVersion: contract.ANALYTICS_V2_CONTRACT_VERSION, mode: "full", nowMs: input.nowMs,
+            today: utcDay(input.nowMs), revisionSeed: input.revisionSeed, owners: input.owners, ownerDays: [],
+            cacheBands: [], ownerFits: [], ownerModelDates: [], preview: null, refusals: [], timings: {},
+            dailyCandidates: input.queuedDays.filter((day) => day !== "2026-04-10")
+              .map((day) => ({ day, payload: { day }, payloadSha256: "0".repeat(64) })),
+            blockedDays: ["2026-04-10"],
+            journal: { lastSequence: null },
+          };
+        },
+      },
+    },
+  };
 }
 
-const MISSING = await missingIntegrationModules();
+const WIRING_STATE = Object.freeze({ cursor: null, carriedBlockedDays: ["2026-04-10"], cacheFloorDay: "2026-02-20" });
 
-test("PG17 integration: real A-1 readers and A-2 compute over A-1's direct-seed corpus", {
-  skip: PG_SKIP || (MISSING.length > 0 ? `A-1/A-2 not on this branch yet: ${MISSING.join(", ")}` : false),
-  timeout: 600_000,
-}, async () => {
-  // INTEGRATION: the lead confirms the direct-seed export name and the seed
-  // arguments when A-1 merges; the Job wiring itself is createAnalyticsV2Pipeline.
-  const kernelConfig = (await readdir(WORKER_ROOT)).includes("vitest.analytics-v2.config.mjs")
-    ? join(WORKER_ROOT, "vitest.analytics-v2.config.mjs") : false;
-  const integrationVite = await createServer({
-    root: WORKER_ROOT,
-    configFile: kernelConfig,
-    server: { middlewareMode: true },
-    appType: "custom",
-    logLevel: "silent",
+function spannedDays(ranges) {
+  const days = [];
+  for (const { fromDay, throughDay } of ranges) {
+    for (let day = fromDay; day <= throughDay;
+      day = new Date(Date.parse(`${day}T00:00:00.000Z`) + 86_400_000).toISOString().slice(0, 10)) days.push(day);
+  }
+  return days;
+}
+
+test("default wiring: A-1 shapes in, one contiguous A-2 range out, non-effective owners read on queued days only", async () => {
+  const { calls, modules } = wiringModules();
+  const pipeline = job.createAnalyticsV2Pipeline(modules);
+  const inputs = await pipeline.read({ pool: {}, schema: "s", nowMs: WIRING_NOW_MS, state: WIRING_STATE });
+
+  // The journal is read page by page from the cursor until complete.
+  assert.deepEqual(calls.queued, [0, 5]);
+  const queued = ["2026-03-02", "2026-04-10", "2026-09-29", "2026-09-30"];
+  assert.deepEqual(inputs.queuedDays, queued, "journal days plus the carried blocked day; no published heads");
+  // Cache history reaches the stored floor; the range is A-2's required range.
+  assert.equal(inputs.cacheFromDay, "2026-02-20");
+  const required = a2.analyticsV2RequiredOccurrenceRange({ nowMs: WIRING_NOW_MS, queuedDays: queued,
+    cacheFromDay: "2026-02-20" });
+  assert.deepEqual({ ...inputs.occurrenceRange }, required);
+  assert.deepEqual(required, { fromDay: "2026-02-13", throughDay: "2026-10-01" });
+
+  // The effective owner: every stream over the whole range, in contiguous chunks of at most 30 days.
+  const rangeDays = spannedDays([required]);
+  for (const stream of ["usage", "quota", "session"]) {
+    const reads = calls.occurrences.filter((call) => call.ownerDigest === OWNER_A && call.stream === stream);
+    assert.ok(reads.every((call) => spannedDays([call]).length <= 30));
+    assert.deepEqual(spannedDays(reads), rangeDays, stream);
+  }
+  // The non-effective typed owner: the queued days only. The v0.2 owner: never read.
+  const ownerBReads = calls.occurrences.filter((call) => call.ownerDigest === OWNER_B);
+  assert.deepEqual(ownerBReads.filter((call) => call.stream === "usage").map(({ fromDay, throughDay }) =>
+    ({ fromDay, throughDay })), [
+    { fromDay: "2026-03-02", throughDay: "2026-03-02" },
+    { fromDay: "2026-04-10", throughDay: "2026-04-10" },
+    { fromDay: "2026-09-29", throughDay: "2026-09-30" },
+  ]);
+  assert.equal(ownerBReads.length, 9);
+  assert.equal(calls.occurrences.some((call) => call.ownerDigest === OWNER_LEGACY), false);
+  assert.deepEqual([...inputs.occurrencesByOwner.keys()], [OWNER_B, OWNER_A].sort());
+  assert.deepEqual([...inputs.occurrencesByOwner.get(OWNER_B).keys()], ["2026-09-30"]);
+  assert.deepEqual(inputs.occurrencesByOwner.get(OWNER_A).get("2026-09-29"),
+    { usage: [occurrence(OWNER_A, "2026-09-29")], quota: [], session: [] });
+
+  // Devices: every queued day, with the effective owners that have evidence on it.
+  assert.equal(calls.devices.length, 1);
+  const effectiveA = { participantId: contractOwner(OWNER_A, "effective").participantId, ownerDigest: OWNER_A,
+    source: "effective" };
+  assert.deepEqual([...calls.devices[0]], [
+    ["2026-03-02", [effectiveA]], ["2026-04-10", []], ["2026-09-29", [effectiveA]], ["2026-09-30", []],
+  ]);
+
+  const outputs = await pipeline.compute(inputs, { nowMs: WIRING_NOW_MS, revisionSeed: 3 });
+  assert.equal(calls.compute.occurrenceRange, inputs.occurrenceRange);
+  assert.equal(calls.compute.cacheFromDay, "2026-02-20");
+  assert.deepEqual(calls.compute.queuedDays, queued);
+  assert.equal(calls.compute.devicesByDay, inputs.devicesByDay);
+  assert.equal(calls.compute.revisionSeed, 3);
+  assert.deepEqual(outputs.journal, { lastSequence: 9 });
+  assert.deepEqual(outputs.horizon, { ownerDayFromDay: "2026-02-13", cacheBandsFromDay: "2026-02-20" });
+  assert.deepEqual(outputs.readSummary, { unlinkedTypedOwners: 0, terminalOwners: 1, nonEffectiveUnread: 0 });
+  assert.deepEqual(outputs.dailyCandidates.map((candidate) => candidate.day), ["2026-03-02", "2026-09-29", "2026-09-30"]);
+  assert.deepEqual(outputs.blockedDays, ["2026-04-10"]);
+});
+
+test("default wiring: an unlinked typed owner blocks every queued day; a non-effective source refusal fails closed", async () => {
+  const unlinked = [
+    { participantId: "participant-unlinked-legacy", hasV1: false, hasV11: false, hasV12: false, hasLegacy: true,
+      hasEffective: false, source: "v0.2" },
+  ];
+  // An unlinked owner without typed evidence is not a daily-cohort member.
+  const legacyOnly = wiringModules({ unlinked });
+  const legacyPipeline = job.createAnalyticsV2Pipeline(legacyOnly.modules);
+  const legacyOutputs = await legacyPipeline.compute(
+    await legacyPipeline.read({ pool: {}, schema: "s", nowMs: WIRING_NOW_MS, state: WIRING_STATE }),
+    { nowMs: WIRING_NOW_MS, revisionSeed: 0 });
+  assert.equal(legacyOutputs.dailyCandidates.length, 3);
+
+  // A typed one makes production's daily lane unavailable: nothing publishes.
+  const typed = wiringModules({ unlinked: [...unlinked, { ...unlinked[0], participantId: "participant-unlinked-v1",
+    hasV1: true, source: "mixed" }], failOwner: OWNER_B });
+  const pipeline = job.createAnalyticsV2Pipeline(typed.modules);
+  const inputs = await pipeline.read({ pool: {}, schema: "s", nowMs: WIRING_NOW_MS, state: WIRING_STATE });
+  // OWNER_B's closed source refusal leaves it unread: A-2 then blocks every queued day for it.
+  assert.equal(inputs.occurrencesByOwner.has(OWNER_B), false);
+  assert.equal(inputs.occurrencesByOwner.has(OWNER_A), true);
+  const outputs = await pipeline.compute(inputs, { nowMs: WIRING_NOW_MS, revisionSeed: 0 });
+  assert.deepEqual(outputs.dailyCandidates, []);
+  assert.deepEqual(outputs.blockedDays, ["2026-03-02", "2026-04-10", "2026-09-29", "2026-09-30"]);
+  assert.deepEqual(outputs.readSummary, { unlinkedTypedOwners: 1, terminalOwners: 1, nonEffectiveUnread: 1 });
+
+  // The same refusal for an effective owner fails the run.
+  const failing = wiringModules({ failOwner: OWNER_A });
+  await assert.rejects(job.createAnalyticsV2Pipeline(failing.modules)
+    .read({ pool: {}, schema: "s", nowMs: WIRING_NOW_MS, state: WIRING_STATE }), { code: "ANALYTICS_V2_SOURCE_CONFLICT" });
+
+  // Shapes other than the landed ones are refused, never coerced.
+  const arrayOwners = wiringModules();
+  arrayOwners.modules.owners.listAnalyticsV2Owners = async () => [contractOwner(OWNER_A, "effective")];
+  await assert.rejects(job.createAnalyticsV2Pipeline(arrayOwners.modules)
+    .read({ pool: {}, schema: "s", nowMs: WIRING_NOW_MS, state: WIRING_STATE }), { code: "ANALYTICS_V2_REFRESH_OWNERS_INVALID" });
+  const stalled = wiringModules();
+  stalled.modules.queuedDays.readQueuedDays = async (context, options) =>
+    ({ days: [], lastSequence: options.afterSequence, terminalOwners: [], events: 0, complete: false });
+  await assert.rejects(job.createAnalyticsV2Pipeline(stalled.modules)
+    .read({ pool: {}, schema: "s", nowMs: WIRING_NOW_MS, state: WIRING_STATE }), { code: "ANALYTICS_V2_REFRESH_JOURNAL_INVALID" });
+  const { compute: _compute, ...withoutCompute } = wiringModules().modules;
+  assert.throws(() => job.createAnalyticsV2Pipeline({ ...withoutCompute, compute: { computeAnalyticsV2() {} } }),
+    { code: "ANALYTICS_V2_REFRESH_PIPELINE_UNAVAILABLE" });
+});
+
+test("cache horizon and day spans: history is retained back to the floor; reads are chunked and contiguous", () => {
+  assert.equal(job.analyticsRefreshCacheFromDay({ today: "2026-10-01", analysisDays: 170, queuedDays: [],
+    cacheFloorDay: null }), "2026-04-15");
+  assert.equal(job.analyticsRefreshCacheFromDay({ today: "2026-10-01", analysisDays: 170,
+    queuedDays: ["2026-04-01", "2026-11-01"], cacheFloorDay: "2026-05-01" }), "2026-04-01");
+  assert.equal(job.analyticsRefreshCacheFromDay({ today: "2027-06-01", analysisDays: 170, queuedDays: [],
+    cacheFloorDay: "2026-07-12" }), "2026-07-12", "a later run never drops stored cache history");
+  assert.deepEqual(job.analyticsRefreshDaySpans(["2026-01-03", "2026-01-01", "2026-01-02", "2026-01-05"], 2), [
+    { fromDay: "2026-01-01", throughDay: "2026-01-02" },
+    { fromDay: "2026-01-03", throughDay: "2026-01-03" },
+    { fromDay: "2026-01-05", throughDay: "2026-01-05" },
+  ]);
+  assert.deepEqual(job.analyticsRefreshRangeChunks({ fromDay: "2026-01-30", throughDay: "2026-02-03" }, 2), [
+    { fromDay: "2026-01-30", throughDay: "2026-01-31" },
+    { fromDay: "2026-02-01", throughDay: "2026-02-02" },
+    { fromDay: "2026-02-03", throughDay: "2026-02-03" },
+  ]);
+  assert.deepEqual(job.analyticsRefreshPublicationDays(["2026-09-30", "2026-09-28"],
+    { carriedBlockedDays: ["2026-09-28", "2026-09-01"] }), ["2026-09-01", "2026-09-28", "2026-09-30"]);
+});
+
+// ---------------------------------------------------------------------------
+// Integration: the real A-1 readers and A-2 compute over A-1's direct-seed corpus
+// ---------------------------------------------------------------------------
+
+function realPipeline() {
+  return job.createAnalyticsV2Pipeline({
+    owners: a1.owners,
+    occurrences: a1.occurrences,
+    devices: a1.devices,
+    queuedDays: a1.queuedDays,
+    compute: a2,
   });
-  try {
-    const load = (path) => integrationVite.ssrLoadModule(`/${path}`);
-    const pipeline = job.createAnalyticsV2Pipeline({
-      owners: await load("src/analytics-v2/owners.ts"),
-      occurrences: await load("src/analytics-v2/occurrence-source.ts"),
-      devices: await load("src/analytics-v2/devices.ts"),
-      queuedDays: await load("src/analytics-v2/queued-days.ts"),
-      compute: await load("src/analytics-v2/compute.ts"),
-    });
-    const seedModule = await import(pathToFileURL(join(WORKER_ROOT, INTEGRATION_MODULES[5])).href);
-    const seed = seedModule.seedAnalyticsV2DirectCorpus ?? seedModule.seedDirectCorpus ?? seedModule.default;
-    assert.equal(typeof seed, "function", "direct-seed exports its corpus seeder");
-    await withDatabase("integration", async ({ pool, createSchema }) => {
+}
+
+async function ownerScopedRows(pool, schema, table) {
+  // run_id names the writing run; the content must not depend on it.
+  const result = await pool.query(
+    `SELECT COALESCE(jsonb_agg(to_jsonb(t) - 'run_id' ORDER BY (to_jsonb(t) - 'run_id')::text), '[]'::jsonb)::text AS rows
+       FROM ${quoted(schema, table)} t`,
+  );
+  return result.rows[0].rows;
+}
+
+for (const correctionRuntime of ["active", "staged"]) {
+  test(`PG17 integration (${correctionRuntime} correction runtime): real A-1 readers and A-2 compute over direct-seed`, {
+    skip: PG_SKIP,
+    timeout: 600_000,
+  }, async () => {
+    await withDatabase(`integration-${correctionRuntime}`, async ({ pool, createSchema }) => {
       const { schema } = await createSchema();
-      await seed({ pool, schema, nowMs: Date.parse(NOW_1) });
-      const first = await runJob({ schema, pipeline });
+      const fixture = await seedFixture.seedAnalyticsV2Fixture({ pool, schema, modules: seedModules, correctionRuntime });
+      const pipeline = realPipeline();
+      const now = new Date(seedFixture.NOW_MS).toISOString();
+
+      // (a) First full run over the real readers and kernels.
+      const first = await runJob({ schema, now, pipeline });
       assert.equal(first.state, "complete");
+      assert.equal(first.cursor, String(fixture.sequences.last), "the whole journal was consumed");
+      assert.equal(first.unlinkedTypedOwners, 0, "golf is unlinked without typed evidence");
+      assert.equal(first.nonEffectiveUnread, 0);
       const runs = await runRows(pool, schema);
       assert.equal(runs[0].state, "complete");
-      assert.ok(Array.isArray(runs[0].refusals));
+      assert.ok(Array.isArray(runs[0].refusals) && runs[0].refusals.length > 0, "refusals are listed");
+      assert.ok(first.refusalsByReason.non_effective_source_unported >= 1, "charlie (v0.2) is refused");
+      // Staged runtime: bravo (mixed) and echo (v1.1) are typed, non-effective
+      // members of the daily cohort with evidence on D1 only. They block D1
+      // and nothing else; with the runtime active they are computed.
+      const nonEffectiveDaily = runs[0].refusals
+        .filter((refusal) => refusal.family === "daily" && refusal.reason === "non_effective_source_unported")
+        .map((refusal) => refusal.day);
+      assert.deepEqual(nonEffectiveDaily, correctionRuntime === "staged" ? [seedFixture.D1, seedFixture.D1] : []);
+      // The crossed-midnight occurrence is a conflict on D1 and D2: both stay blocked.
+      assert.deepEqual(first.blocked.filter((day) => [seedFixture.D1, seedFixture.D2].includes(day)),
+        [seedFixture.D1, seedFixture.D2]);
+      // D3 holds only an excluded owner's evidence. A non-effective owner blocks
+      // only the queued days it has evidence on, so D3 publishes at both runtimes.
+      assert.deepEqual(first.published, [seedFixture.D3]);
       const heads = await publishedRows(pool, schema);
-      const second = await runJob({ schema, pipeline });
-      assert.deepEqual(second.published, [], "an identical rerun publishes no new revision");
+      assert.deepEqual([...heads.keys()], [seedFixture.D3]);
+      assert.equal(heads.get(seedFixture.D3).revision, 1);
+      for (const table of ["analytics_v2_owner_day", "analytics_v2_owner_model_dates", "analytics_v2_preview"]) {
+        assert.ok(await count(pool, schema, table) > 0, table);
+      }
+
+      // (b) An identical rerun queues nothing new: only the carried blocked
+      // days are recomputed, and no revision moves.
+      const second = await runJob({ schema, now, pipeline });
+      assert.equal(second.state, "complete");
+      assert.deepEqual(second.published, []);
+      assert.deepEqual(second.blocked, first.blocked);
+      assert.deepEqual(await publishedRows(pool, schema), heads);
+      const ownerDays2 = await ownerScopedRows(pool, schema, "analytics_v2_owner_day");
+      const cacheBands2 = await ownerScopedRows(pool, schema, "analytics_v2_cache_bands");
+
+      // Months later with no new evidence: stored owner-day and cache-band
+      // history is neither dropped nor changed, and no head is republished.
+      const later = new Date(seedFixture.NOW_MS + 200 * 86_400_000).toISOString();
+      const third = await runJob({ schema, now: later, pipeline });
+      assert.equal(third.state, "complete");
+      assert.deepEqual(third.published, []);
+      assert.equal(await ownerScopedRows(pool, schema, "analytics_v2_owner_day"), ownerDays2);
+      assert.equal(await ownerScopedRows(pool, schema, "analytics_v2_cache_bands"), cacheBands2);
       assert.deepEqual(await publishedRows(pool, schema), heads);
     });
-  } finally {
-    await integrationVite.close();
-  }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Cache history with the real A-2 kernels: not a rolling window
+// ---------------------------------------------------------------------------
+
+test("PG17: real A-2 cache-band history survives later runs unchanged (retention, not a display window)", {
+  skip: PG_SKIP,
+  timeout: 600_000,
+}, async () => {
+  const corpus = synthetic.composeProofCorpus();
+  const facts = new Map(synthetic.COMPOSE_OWNERS.map((owner) => [owner.digest, synthetic.composeFacts(owner)]));
+  // The compose-proof corpus behind stub A-1 readers with the landed shapes;
+  // the compute core is the real A-2 module.
+  const pipeline = job.createAnalyticsV2Pipeline({
+    owners: { listAnalyticsV2Owners: async () => ({ owners: corpus.owners, unlinked: [], correctionRuntimeActive: true }) },
+    queuedDays: {
+      readQueuedDays: async (context, { afterSequence }) => (afterSequence === 0
+        ? { days: corpus.publishedDays, lastSequence: 7, terminalOwners: [], events: 7, complete: true }
+        : { days: [], lastSequence: afterSequence, terminalOwners: [], events: 0, complete: true }),
+    },
+    occurrences: {
+      readOwnerOccurrences: async (context, { ownerDigest, stream, fromDay, throughDay }) => new Map(
+        [...facts.get(ownerDigest)].filter(([day, streams]) => day >= fromDay && day <= throughDay
+          && streams[stream].length > 0).map(([day, streams]) => [day, streams[stream]])),
+    },
+    devices: {
+      countContributingDevices: async (context, { days }) => new Map([...days].map(([day, owners]) =>
+        [day, new Map(owners.map((owner) => [owner.ownerDigest, 1]))])),
+    },
+    compute: a2,
+  });
+  await withDatabase("cache-history", async ({ pool, createSchema }) => {
+    const { schema } = await createSchema();
+    const first = await runJob({ schema, now: new Date(synthetic.NOW_MS).toISOString(), pipeline });
+    assert.equal(first.state, "complete");
+    assert.deepEqual(first.published, corpus.publishedDays);
+    const bands = await ownerScopedRows(pool, schema, "analytics_v2_cache_bands");
+    assert.equal(await count(pool, schema, "analytics_v2_cache_bands"), 210, "7 days x 3 owners x 10 bands");
+    const ownerDays = await ownerScopedRows(pool, schema, "analytics_v2_owner_day");
+    const heads = await publishedRows(pool, schema);
+    // 120 and 400 days later, nothing new: the history the first run computed
+    // (back to today-80) is recomputed exactly, never dropped.
+    for (const daysLater of [120, 400]) {
+      const later = await runJob({ schema, now: new Date(synthetic.NOW_MS + daysLater * 86_400_000).toISOString(),
+        pipeline });
+      assert.equal(later.state, "complete");
+      assert.deepEqual(later.published, []);
+      assert.equal(await ownerScopedRows(pool, schema, "analytics_v2_cache_bands"), bands, `${daysLater} days later`);
+      const bandRuns = await pool.query(`SELECT DISTINCT run_id::text AS run_id
+        FROM ${quoted(schema, "analytics_v2_cache_bands")}`);
+      assert.deepEqual(bandRuns.rows.map((row) => row.run_id), [later.runId], "every stored cache day was recomputed");
+      assert.equal(await ownerScopedRows(pool, schema, "analytics_v2_owner_day"), ownerDays, `${daysLater} days later`);
+      assert.deepEqual(await publishedRows(pool, schema), heads);
+    }
+  });
 });

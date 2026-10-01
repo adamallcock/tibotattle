@@ -9,9 +9,15 @@
  *     refused) and re-reads the journal cursor FOR UPDATE, refusing a cursor
  *     that moved since the Job's read snapshot;
  *  2. it replaces the owner-scoped families (owner_day, cache_bands,
- *     owner_fits, owner_model_dates). A full run's owner list is the complete
- *     eligible population, so rows of owners absent from it are retired with
- *     the rest and are recomputed if those owners return;
+ *     owner_fits, owner_model_dates) of the owners this run computed (source
+ *     'effective'), and only inside the run's horizon: owner_day rows from
+ *     horizon.ownerDayFromDay and cache_bands rows from
+ *     horizon.cacheBandsFromDay. Rows of owners the run did not compute
+ *     (opted out, disconnected, expired, unlinked or not ported) and rows
+ *     older than the horizon are retained, never retired: a roster change
+ *     stops future contributions only, and a display window is not a
+ *     retention policy. The manual offline erasure runbook is the only path
+ *     that deletes an owner's rows;
  *  3. it publishes each daily candidate whose content digest differs from the
  *     stored head: revision = max(previous, revisionSeed) + 1 and
  *     releasedAt = nowMs. An unchanged digest keeps the row untouched, and a
@@ -80,7 +86,11 @@ export const ANALYTICS_V2_DAILY_REVISION_FIELDS = Object.freeze([
   "releasedAt",
 ] as const);
 
-/** Production's community_daily_aggregates payload cap (0037), in bytes. */
+/**
+ * Cap on one published daily payload, in bytes of its jsonb text form: the
+ * same measure as 0059's CHECK (octet_length(payload::text)), so the store
+ * refuses an oversized payload with its own code before the CHECK can.
+ */
 export const ANALYTICS_V2_MAX_DAILY_PAYLOAD_BYTES = 262_144;
 /** Highest revisionSeed accepted; revision is a PostgreSQL integer. */
 export const ANALYTICS_V2_MAX_REVISION_SEED = 2_000_000_000;
@@ -295,6 +305,8 @@ interface PreparedOutputs {
   readonly nowMs: number;
   readonly revisionSeed: number;
   readonly ownerDigests: readonly string[];
+  /** Owners this run computed (source 'effective'); only their rows are replaced. */
+  readonly computedOwnerDigests: readonly string[];
   readonly dailyCandidates: readonly PreparedDailyCandidate[];
   readonly blockedDays: readonly AnalyticsV2Day[];
   readonly refusals: readonly AnalyticsV2Refusal[];
@@ -323,11 +335,32 @@ function validTimings(value: unknown, field: string): Partial<Record<AnalyticsV2
  * before any database work, and verify every daily candidate's digest.
  * Exported so the Job and specs can check outputs without writing.
  */
-export async function assertAnalyticsV2RunOutputs(outputs: AnalyticsV2RunOutputs): Promise<void> {
-  await prepareOutputs(outputs);
+export async function assertAnalyticsV2RunOutputs(
+  outputs: AnalyticsV2RunOutputs,
+  horizon: AnalyticsV2RunHorizon,
+): Promise<void> {
+  await prepareOutputs(outputs, validHorizon(horizon));
 }
 
-async function prepareOutputs(outputs: AnalyticsV2RunOutputs): Promise<PreparedOutputs> {
+/**
+ * The owner-scoped rows one run recomputes. A computed owner's owner_day rows
+ * from ownerDayFromDay and cache_bands rows from cacheBandsFromDay are
+ * replaced; its older rows are retained untouched.
+ */
+export interface AnalyticsV2RunHorizon {
+  readonly ownerDayFromDay: AnalyticsV2Day;
+  readonly cacheBandsFromDay: AnalyticsV2Day;
+}
+
+function validHorizon(value: unknown): AnalyticsV2RunHorizon {
+  if (!plainObject(value) || !isAnalyticsV2Day(value.ownerDayFromDay)
+      || !isAnalyticsV2Day(value.cacheBandsFromDay)) {
+    fail("ANALYTICS_V2_RUN_INVALID", "horizon");
+  }
+  return { ownerDayFromDay: value.ownerDayFromDay, cacheBandsFromDay: value.cacheBandsFromDay };
+}
+
+async function prepareOutputs(outputs: AnalyticsV2RunOutputs, horizon: AnalyticsV2RunHorizon): Promise<PreparedOutputs> {
   if (!plainObject(outputs)) invalid("outputs");
   if (outputs.contractVersion !== ANALYTICS_V2_CONTRACT_VERSION) invalid("contractVersion");
   if (!(ANALYTICS_V2_MODES as readonly string[]).includes(outputs.mode)) invalid("mode");
@@ -339,6 +372,7 @@ async function prepareOutputs(outputs: AnalyticsV2RunOutputs): Promise<PreparedO
   assertArray(outputs.owners, "owners");
   assertCapacity(outputs.owners.length, ANALYTICS_V2_OUTPUT_LIMITS.owners, "owners");
   const owners = new Set<string>();
+  const computed = new Set<string>();
   for (const owner of outputs.owners) {
     if (!plainObject(owner) || typeof owner.ownerDigest !== "string"
         || !ANALYTICS_V2_OWNER_DIGEST_PATTERN.test(owner.ownerDigest)
@@ -350,14 +384,15 @@ async function prepareOutputs(outputs: AnalyticsV2RunOutputs): Promise<PreparedO
       invalid("owners");
     }
     owners.add(owner.ownerDigest);
+    if (owner.source === "effective") computed.add(owner.ownerDigest);
   }
 
   assertArray(outputs.ownerDays, "ownerDays");
   assertCapacity(outputs.ownerDays.length, ANALYTICS_V2_OUTPUT_LIMITS.ownerDays, "ownerDays");
   for (const row of outputs.ownerDays) {
     if (!plainObject(row)) invalid("ownerDays");
-    assertOwnerDigest(row.ownerDigest, owners, "ownerDays.ownerDigest");
-    assertDay(row.day, "ownerDays.day");
+    assertOwnerDigest(row.ownerDigest, computed, "ownerDays.ownerDigest");
+    if (assertDay(row.day, "ownerDays.day") < horizon.ownerDayFromDay) invalid("ownerDays.day");
     const hasDaily = row.daily !== null && row.daily !== undefined;
     const hasRefusal = row.refusal !== null && row.refusal !== undefined;
     if (hasDaily === hasRefusal) invalid("ownerDays.daily");
@@ -371,8 +406,8 @@ async function prepareOutputs(outputs: AnalyticsV2RunOutputs): Promise<PreparedO
   assertCapacity(outputs.cacheBands.length, ANALYTICS_V2_OUTPUT_LIMITS.cacheBands, "cacheBands");
   for (const row of outputs.cacheBands) {
     if (!plainObject(row)) invalid("cacheBands");
-    assertOwnerDigest(row.ownerDigest, owners, "cacheBands.ownerDigest");
-    assertDay(row.day, "cacheBands.day");
+    assertOwnerDigest(row.ownerDigest, computed, "cacheBands.ownerDigest");
+    if (assertDay(row.day, "cacheBands.day") < horizon.cacheBandsFromDay) invalid("cacheBands.day");
     if (typeof row.model !== "string" || !CACHE_LABEL.test(row.model)) invalid("cacheBands.model");
     if (typeof row.effort !== "string" || !CACHE_LABEL.test(row.effort)) invalid("cacheBands.effort");
     if (!(ANALYTICS_V2_CACHE_BANDS as readonly string[]).includes(row.band)) invalid("cacheBands.band");
@@ -397,7 +432,7 @@ async function prepareOutputs(outputs: AnalyticsV2RunOutputs): Promise<PreparedO
   assertCapacity(outputs.ownerFits.length, ANALYTICS_V2_OUTPUT_LIMITS.owners, "ownerFits");
   for (const row of outputs.ownerFits) {
     if (!plainObject(row)) invalid("ownerFits");
-    assertOwnerDigest(row.ownerDigest, owners, "ownerFits.ownerDigest");
+    assertOwnerDigest(row.ownerDigest, computed, "ownerFits.ownerDigest");
     assertDay(row.asOfDay, "ownerFits.asOfDay");
     if (row.fits === null || row.fits === undefined) invalid("ownerFits.fits");
     assertJsonValue(row.fits, "ownerFits.fits");
@@ -407,7 +442,7 @@ async function prepareOutputs(outputs: AnalyticsV2RunOutputs): Promise<PreparedO
   assertCapacity(outputs.ownerModelDates.length, ANALYTICS_V2_OUTPUT_LIMITS.ownerModelDates, "ownerModelDates");
   for (const row of outputs.ownerModelDates) {
     if (!plainObject(row)) invalid("ownerModelDates");
-    assertOwnerDigest(row.ownerDigest, owners, "ownerModelDates.ownerDigest");
+    assertOwnerDigest(row.ownerDigest, computed, "ownerModelDates.ownerDigest");
     assertDay(row.day, "ownerModelDates.day");
     if (row.result === null || row.result === undefined) invalid("ownerModelDates.result");
     assertJsonValue(row.result, "ownerModelDates.result");
@@ -477,6 +512,7 @@ async function prepareOutputs(outputs: AnalyticsV2RunOutputs): Promise<PreparedO
     nowMs,
     revisionSeed,
     ownerDigests: [...owners].sort(compareText),
+    computedOwnerDigests: [...computed].sort(compareText),
     dailyCandidates,
     blockedDays: sortedDays(blocked),
     refusals,
@@ -499,6 +535,8 @@ export interface WriteAnalyticsV2RunOptions {
    * means another writer advanced it, and the run is refused.
    */
   readonly expectedCursor: string | null;
+  /** The owner-scoped rows this run recomputes (required; see AnalyticsV2RunHorizon). */
+  readonly horizon: AnalyticsV2RunHorizon;
   /** Phases the caller measured (for example "read"); merged into the run row. */
   readonly timings?: Readonly<Partial<Record<AnalyticsV2Phase, number>>>;
   /** Wall clock for finished_at and the write timing; defaults to Date.now. */
@@ -511,8 +549,8 @@ export interface AnalyticsV2WriteReceipt {
   readonly mode: AnalyticsV2Mode;
   readonly owners: number;
   readonly ownerDays: number;
-  /** Owners whose stale owner-scoped rows a full run retired. */
-  readonly retiredOwners: number;
+  /** Owners with stored owner-scoped rows this run did not compute; their rows are retained. */
+  readonly retainedOwners: number;
   readonly refusals: number;
   readonly publication: AnalyticsV2PublicationSummary;
   /** The journal cursor after the run, as a decimal string, or null when absent. */
@@ -543,19 +581,15 @@ function rowCountOf(result: unknown): number | null {
  * Insert JSON rows through jsonb_to_recordset in bounded chunks; every chunk
  * must affect exactly its own row count.
  */
-async function insertRecordset(
-  client: PostgresClient,
-  statement: string,
+async function forEachRecordsetChunk(
   rows: readonly unknown[],
-  field: string,
-  shortfall: AnalyticsV2StoreErrorCode = "ANALYTICS_V2_WRITE_FAILED",
+  visit: (json: string, count: number) => Promise<void>,
 ): Promise<void> {
   let parts: string[] = [];
   let bytes = 2;
   const flush = async () => {
     if (parts.length === 0) return;
-    const result = await client.query(statement, [`[${parts.join(",")}]`]);
-    if (rowCountOf(result) !== parts.length) fail(shortfall, field);
+    await visit(`[${parts.join(",")}]`, parts.length);
     parts = [];
     bytes = 2;
   };
@@ -570,8 +604,17 @@ async function insertRecordset(
   await flush();
 }
 
-function utf8Bytes(value: string): number {
-  return new TextEncoder().encode(value).byteLength;
+async function insertRecordset(
+  client: PostgresClient,
+  statement: string,
+  rows: readonly unknown[],
+  field: string,
+  shortfall: AnalyticsV2StoreErrorCode = "ANALYTICS_V2_WRITE_FAILED",
+): Promise<void> {
+  await forEachRecordsetChunk(rows, async (json, count) => {
+    const result = await client.query(statement, [json]);
+    if (rowCountOf(result) !== count) fail(shortfall, field);
+  });
 }
 
 /**
@@ -599,11 +642,13 @@ export async function writeRunOutputs(
     fail("ANALYTICS_V2_RUN_INVALID", "expectedCursor");
   }
   const callerTimings = options.timings === undefined ? {} : validTimings(options.timings, "options.timings");
+  const horizon = validHorizon(options.horizon);
   const wallClock = options.wallClock ?? Date.now;
-  const prepared = await prepareOutputs(outputs);
+  const prepared = await prepareOutputs(outputs, horizon);
   const writeStartedMs = wallClock();
   const runId = options.runId;
   const ownerDigests = prepared.ownerDigests;
+  const computedOwners = prepared.computedOwnerDigests;
   const releasedAt = new Date(prepared.nowMs).toISOString();
   const tables = ANALYTICS_V2_TABLES;
 
@@ -635,20 +680,29 @@ export async function writeRunOutputs(
       fail("ANALYTICS_V2_CURSOR_REGRESSION");
     }
 
-    // Owner-scoped families: a full run replaces them wholesale.
+    // Owner-scoped families: replace the computed owners' rows inside the
+    // horizon; every other owner-scoped row is retained.
     const ownerTables = [tables.ownerDay, tables.cacheBands, tables.ownerFits, tables.ownerModelDates];
-    const retired = rowsOf<{ retired: unknown }>(await client.query(
-      `SELECT count(*)::integer AS retired FROM (
+    const retained = rowsOf<{ retained: unknown }>(await client.query(
+      `SELECT count(*)::integer AS retained FROM (
          ${ownerTables.map((name) => `SELECT owner_digest FROM ${relation(schema, name)}`).join("\nUNION\n")}
        ) present WHERE NOT (owner_digest = ANY($1::text[]))`,
-      [ownerDigests],
+      [computedOwners],
     ), "ANALYTICS_V2_WRITE_FAILED");
-    const retiredOwners = retired[0]?.retired;
-    if (typeof retiredOwners !== "number" || !Number.isSafeInteger(retiredOwners) || retiredOwners < 0) {
-      fail("ANALYTICS_V2_WRITE_FAILED", "retiredOwners");
+    const retainedOwners = retained[0]?.retained;
+    if (typeof retainedOwners !== "number" || !Number.isSafeInteger(retainedOwners) || retainedOwners < 0) {
+      fail("ANALYTICS_V2_WRITE_FAILED", "retainedOwners");
     }
-    for (const name of ownerTables) {
-      await client.query(`DELETE FROM ${relation(schema, name)}`);
+    await client.query(
+      `DELETE FROM ${relation(schema, tables.ownerDay)} WHERE owner_digest = ANY($1::text[]) AND day >= $2::date`,
+      [computedOwners, horizon.ownerDayFromDay],
+    );
+    await client.query(
+      `DELETE FROM ${relation(schema, tables.cacheBands)} WHERE owner_digest = ANY($1::text[]) AND day >= $2::date`,
+      [computedOwners, horizon.cacheBandsFromDay],
+    );
+    for (const name of [tables.ownerFits, tables.ownerModelDates]) {
+      await client.query(`DELETE FROM ${relation(schema, name)} WHERE owner_digest = ANY($1::text[])`, [computedOwners]);
     }
 
     await insertRecordset(client,
@@ -745,9 +799,6 @@ export async function writeRunOutputs(
         revision,
         releasedAt,
       });
-      if (utf8Bytes(JSON.stringify(payload)) > ANALYTICS_V2_MAX_DAILY_PAYLOAD_BYTES) {
-        fail("ANALYTICS_V2_DAILY_PAYLOAD_TOO_LARGE", "dailyCandidates.payload");
-      }
       published.push(candidate.day);
       publishRows.push({
         day: candidate.day,
@@ -758,6 +809,16 @@ export async function writeRunOutputs(
         run_id: runId,
       });
     }
+    // Size each payload exactly as 0059's CHECK does (its jsonb text form), so
+    // an oversized day is refused with its own code rather than as 23514.
+    await forEachRecordsetChunk(publishRows, async (chunk) => {
+      const sizes = rowsOf<{ oversized: unknown }>(await client.query(
+        `SELECT count(*)::integer AS oversized FROM jsonb_array_elements($1::jsonb) AS item
+          WHERE octet_length((item -> 'payload')::text) > $2`,
+        [chunk, ANALYTICS_V2_MAX_DAILY_PAYLOAD_BYTES],
+      ), "ANALYTICS_V2_WRITE_FAILED");
+      if (sizes[0]?.oversized !== 0) fail("ANALYTICS_V2_DAILY_PAYLOAD_TOO_LARGE", "dailyCandidates.payload");
+    });
     // The heads are row-locked above. The upsert is still guarded (a new digest
     // and a strictly higher revision); any shortfall refuses the whole run.
     await insertRecordset(client,
@@ -845,7 +906,7 @@ export async function writeRunOutputs(
       mode: prepared.mode,
       owners: ownerDigests.length,
       ownerDays: outputs.ownerDays.length,
-      retiredOwners,
+      retainedOwners,
       refusals: prepared.refusals.length,
       publication,
       cursor,
@@ -875,15 +936,16 @@ export interface AnalyticsV2RefreshState {
    */
   readonly carriedBlockedDays: readonly AnalyticsV2Day[];
   /**
-   * Days with a published head. A full run recomputes them with the queued
-   * days; an unchanged digest keeps the head's revision.
+   * The earliest day with a stored cache-band row, or null. The next run's
+   * cache horizon reaches back at least this far, so stored cache history is
+   * recomputed rather than dropped.
    */
-  readonly publishedDays: readonly AnalyticsV2Day[];
+  readonly cacheFloorDay: AnalyticsV2Day | null;
 }
 
 /**
- * Read the cursor, the carried blocked days and the published head days. Runs
- * in the caller's transaction (the Job's read snapshot).
+ * Read the cursor, the carried blocked days and the cache floor. Runs in the
+ * caller's transaction (the Job's read snapshot).
  */
 export async function readAnalyticsV2RefreshState(
   client: PostgresClient,
@@ -896,7 +958,7 @@ export async function readAnalyticsV2RefreshState(
   const schema = quoteSchema(options.schema);
   let cursorRows: { last_sequence: unknown }[];
   let runRows: { blocked: unknown }[];
-  let headRows: { day: unknown }[];
+  let floorRows: { day: unknown }[];
   try {
     cursorRows = rowsOf(await client.query(
       `SELECT last_sequence::text AS last_sequence
@@ -909,10 +971,8 @@ export async function readAnalyticsV2RefreshState(
         WHERE state = 'complete'
         ORDER BY finished_at DESC, started_at DESC, run_id DESC LIMIT 1`,
     ), "ANALYTICS_V2_READ_FAILED");
-    headRows = rowsOf(await client.query(
-      `SELECT to_char(day, 'YYYY-MM-DD') AS day
-         FROM ${relation(schema, ANALYTICS_V2_TABLES.publishedDaily)} ORDER BY day LIMIT $1`,
-      [ANALYTICS_V2_OUTPUT_LIMITS.days + 1],
+    floorRows = rowsOf(await client.query(
+      `SELECT to_char(min(day), 'YYYY-MM-DD') AS day FROM ${relation(schema, ANALYTICS_V2_TABLES.cacheBands)}`,
     ), "ANALYTICS_V2_READ_FAILED");
   } catch (error) {
     if (error instanceof AnalyticsV2StoreError) throw error;
@@ -928,13 +988,13 @@ export async function readAnalyticsV2RefreshState(
       || blocked.some((day) => !isAnalyticsV2Day(day))) {
     fail("ANALYTICS_V2_STATE_INVALID", "runs.publication");
   }
-  if (headRows.length > ANALYTICS_V2_OUTPUT_LIMITS.days
-      || headRows.some((row) => !isAnalyticsV2Day(row.day))) {
-    fail("ANALYTICS_V2_STATE_INVALID", "publishedDaily");
+  const cacheFloorDay = floorRows.length === 0 ? null : floorRows[0]?.day ?? null;
+  if (floorRows.length > 1 || (cacheFloorDay !== null && !isAnalyticsV2Day(cacheFloorDay))) {
+    fail("ANALYTICS_V2_STATE_INVALID", "cacheBands");
   }
   return Object.freeze({
     cursor,
     carriedBlockedDays: Object.freeze(sortedDays(blocked as AnalyticsV2Day[])),
-    publishedDays: Object.freeze(headRows.map((row) => row.day as AnalyticsV2Day)),
+    cacheFloorDay: cacheFloorDay as AnalyticsV2Day | null,
   });
 }

@@ -10,11 +10,20 @@
  *      LOCK_HELD having written nothing;
  *   2. open one REPEATABLE READ READ ONLY transaction on that session, export
  *      its snapshot, read the prior analytics_v2 state (journal cursor, the
- *      days the last run left blocked, the published heads), and run every
- *      A-1 reader through a pool whose transactions all import that snapshot;
+ *      days the last run left blocked, the earliest stored cache-band day),
+ *      and run every A-1 reader through a pool whose transactions all import
+ *      that snapshot;
  *   3. compute with A-2 (pure, single-threaded);
  *   4. write everything with store.ts writeRunOutputs in ONE transaction on
  *      the same session, then release the lock.
+ *
+ * Publication follows production's queue (d43c8f92
+ * advanceNextStorageCommunityDaily): a run recomputes and may republish only
+ * the days named by journal events after the cursor plus the days the last
+ * run left blocked. Untouched heads are never recomputed, so a change to the
+ * eligible roster (opt-out, disconnect, expiry) is not applied retroactively
+ * to published history; terminal journal events stop future uploads only and
+ * re-queue nothing (2026-09-26 owner decisions).
  *
  * Flags:
  *   --mode=full            required; the only mode tonight
@@ -77,9 +86,19 @@ const POOL_MAX = 4;
 const READ_STATEMENT_TIMEOUT_MILLISECONDS = 120_000;
 const READ_LOCK_TIMEOUT_MILLISECONDS = 5_000;
 const MILLISECONDS_PER_DAY = 86_400_000;
-/** today-169 .. today: 70 preview dates, each over a 101-day model window. */
-const HISTORY_DAYS = 170;
+const DAY = /^\d{4}-\d{2}-\d{2}$/u;
+const OWNER_DIGEST = /^[0-9a-f]{64}$/u;
 const OCCURRENCE_STREAMS = Object.freeze(["usage", "quota", "session"]);
+/** Days one run may queue for publication (store ANALYTICS_V2_OUTPUT_LIMITS.days). */
+export const ANALYTICS_REFRESH_MAX_QUEUED_DAYS = 4_096;
+/** Widest contiguous occurrence range one run reads (bounded full-history recompute). */
+export const ANALYTICS_REFRESH_MAX_RANGE_DAYS = 4_096;
+/** Journal events per readQueuedDays page, and the page bound of one run. */
+const QUEUE_PAGE_EVENTS = 100_000;
+const MAX_QUEUE_PAGES = 1_000;
+/** A-1's per-call day bound when its module does not export one. */
+const DEFAULT_OCCURRENCE_CHUNK_DAYS = 400;
+const READ_SUMMARY_KEYS = Object.freeze(["unlinkedTypedOwners", "terminalOwners", "nonEffectiveUnread"]);
 
 export const ANALYTICS_REFRESH_USAGE = `Usage: node analytics-refresh.mjs --mode=full [--schema=<identifier>]
        [--now=<ISO instant>] [--revision-seed=<n>]
@@ -359,36 +378,77 @@ function addDays(day, delta) {
     .toISOString().slice(0, 10);
 }
 
-/**
- * Occurrence read ranges: the model-history window plus contiguous runs of
- * queued days outside it (a late correction to an old day still needs that
- * day's evidence for its daily payload).
- */
-export function analyticsRefreshReadRanges(today, queuedDays) {
-  const fromDay = addDays(today, -(HISTORY_DAYS - 1));
-  const ranges = [{ fromDay, throughDay: today }];
-  const outside = [...new Set(queuedDays)].filter((day) => day < fromDay || day > today).sort();
-  for (const day of outside) {
-    const last = ranges.length > 1 ? ranges[ranges.length - 1] : null;
-    if (last !== null && addDays(last.throughDay, 1) === day) last.throughDay = day;
-    else ranges.push({ fromDay: day, throughDay: day });
-  }
-  return ranges.map((range) => Object.freeze({ ...range }));
+function isDay(value) {
+  if (typeof value !== "string" || !DAY.test(value)) return false;
+  const at = Date.parse(`${value}T00:00:00.000Z`);
+  return Number.isFinite(at) && new Date(at).toISOString().slice(0, 10) === value;
+}
+
+function daySpan(fromDay, throughDay) {
+  return Math.round((Date.parse(`${throughDay}T00:00:00.000Z`) - Date.parse(`${fromDay}T00:00:00.000Z`))
+    / MILLISECONDS_PER_DAY) + 1;
 }
 
 /**
- * The days a full run publishes (plan: queue semantics plus existing heads):
- * the days named by journal events after the cursor, the days the last run
- * left blocked (a blocked day is not consumed), and every published head. A
- * recomputed head whose content digest is unchanged keeps its revision.
+ * The days a full run publishes (production's queue): the days named by
+ * journal events after the cursor plus the days the last run left blocked (a
+ * blocked day is not consumed). Published heads that are neither are never
+ * recomputed.
  */
 export function analyticsRefreshPublicationDays(journalDays, state) {
-  return [...new Set([...journalDays, ...state.carriedBlockedDays, ...state.publishedDays])].sort();
+  return [...new Set([...journalDays, ...state.carriedBlockedDays])].sort();
+}
+
+/**
+ * First day that gets cache-band rows. Cache history is retained, not a
+ * rolling window: the horizon reaches back to the earliest stored cache-band
+ * day and the earliest queued day, and never starts later than the analysis
+ * horizon [today-(analysisDays-1), today]. Every stored cache day is therefore
+ * recomputed exactly (with its 7-day carry) instead of being dropped.
+ */
+export function analyticsRefreshCacheFromDay({ today, analysisDays, queuedDays, cacheFloorDay }) {
+  let fromDay = addDays(today, -(analysisDays - 1));
+  for (const day of queuedDays) if (day < fromDay) fromDay = day;
+  if (cacheFloorDay !== null && cacheFloorDay < fromDay) fromDay = cacheFloorDay;
+  return fromDay;
+}
+
+/**
+ * Contiguous runs of `days`, each split into ranges of at most `chunkDays`
+ * days (A-1 reads at most that many days per call).
+ */
+export function analyticsRefreshDaySpans(days, chunkDays) {
+  const spans = [];
+  for (const day of [...new Set(days)].sort()) {
+    const last = spans.at(-1);
+    if (last !== undefined && addDays(last.throughDay, 1) === day
+        && daySpan(last.fromDay, day) <= chunkDays) {
+      last.throughDay = day;
+    } else {
+      spans.push({ fromDay: day, throughDay: day });
+    }
+  }
+  return spans.map((span) => Object.freeze(span));
+}
+
+/** One inclusive range split into consecutive ranges of at most `chunkDays` days. */
+export function analyticsRefreshRangeChunks(range, chunkDays) {
+  const chunks = [];
+  for (let fromDay = range.fromDay; fromDay <= range.throughDay; fromDay = addDays(fromDay, chunkDays)) {
+    const end = addDays(fromDay, chunkDays - 1);
+    chunks.push(Object.freeze({ fromDay, throughDay: end < range.throughDay ? end : range.throughDay }));
+  }
+  return chunks;
 }
 
 function requireFunction(module, name) {
   const value = module?.[name];
   if (typeof value !== "function") fail("ANALYTICS_V2_REFRESH_PIPELINE_UNAVAILABLE", { missing: name });
+  return value;
+}
+
+function requirePositiveInteger(value, name) {
+  if (!Number.isSafeInteger(value) || value < 1) fail("ANALYTICS_V2_REFRESH_PIPELINE_UNAVAILABLE", { missing: name });
   return value;
 }
 
@@ -401,13 +461,45 @@ function sequenceNumber(value) {
   return number;
 }
 
+function hasTypedEvidence(owner) {
+  return owner.hasV1 === true || owner.hasV11 === true || owner.hasV12 === true;
+}
+
+function hasEvidence(day) {
+  return day !== undefined && day.usage.length + day.quota.length + day.session.length > 0;
+}
+
+/** A-1's closed, content-free source failure (owners.ts AnalyticsV2SourceError). */
+function isSourceError(error) {
+  return typeof error?.code === "string" && /^ANALYTICS_V2_SOURCE_[A-Z_]+$/u.test(error.code);
+}
+
+function compareOwners(left, right) {
+  return left.ownerDigest < right.ownerDigest ? -1 : left.ownerDigest > right.ownerDigest ? 1 : 0;
+}
+
 /**
- * The default wiring of the A-1 readers and the A-2 compute core. INTEGRATION:
- * the export names follow the A-1 and A-2 briefs (listAnalyticsV2Owners,
- * readQueuedDays, readOwnerOccurrences, countContributingDevices,
- * computeAnalyticsV2); the lead reconciles them here if a package landed
- * different names. Non-effective owners are not read: A-2 refuses them
- * (non_effective_source_unported) without evidence.
+ * The default wiring of the A-1 readers and the A-2 compute core. It adapts
+ * the shapes the two packages landed with:
+ *
+ * - listAnalyticsV2Owners(context) -> {owners, unlinked, correctionRuntimeActive};
+ * - readQueuedDays(context, {afterSequence, limit}) -> one journal page, read
+ *   until complete;
+ * - readOwnerOccurrences(context, {ownerDigest, stream, fromDay, throughDay})
+ *   -> Map(day -> occurrences), at most MAX_ANALYTICS_V2_OCCURRENCE_DAYS a call;
+ * - countContributingDevices(context, {days: Map(day -> effective owners)});
+ * - computeAnalyticsV2({..., occurrenceRange, cacheFromDay}) over ONE
+ *   contiguous range that covers analyticsV2RequiredOccurrenceRange.
+ *
+ * Effective owners are read over the whole range. A non-effective owner with
+ * typed evidence is a member of production's daily cohort: it is read over
+ * the queued days only, so A-2 blocks exactly the queued days it has evidence
+ * on (a closed A-1 source refusal leaves it unread, and A-2 then blocks every
+ * queued day, never fewer). An eligible typed owner without an active owner
+ * link makes production's daily lane unavailable (d43c8f92
+ * storage-community-daily.ts cohort()): every queued day is blocked and
+ * carried. Legacy-only (v0.2) owners are not daily-cohort members and are not
+ * read.
  */
 export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queuedDays, compute }) {
   const listOwners = requireFunction(owners, "listAnalyticsV2Owners");
@@ -415,65 +507,173 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
   const readOccurrences = requireFunction(occurrences, "readOwnerOccurrences");
   const countDevices = requireFunction(devices, "countContributingDevices");
   const computeOutputs = requireFunction(compute, "computeAnalyticsV2");
-  return Object.freeze({
-    async read({ pool, schema, nowMs, state }) {
-      const context = { pool, schema, nowMs };
-      const ownerList = await listOwners(context);
-      if (!Array.isArray(ownerList)) fail("ANALYTICS_V2_REFRESH_OWNERS_INVALID");
-      const queued = await readQueued({
-        ...context,
-        afterSequence: state.cursor === null ? 0 : sequenceNumber(state.cursor),
-      });
-      if (queued === null || typeof queued !== "object" || !Array.isArray(queued.days)) {
+  const requiredRange = requireFunction(compute, "analyticsV2RequiredOccurrenceRange");
+  const analysisDays = requirePositiveInteger(compute?.ANALYTICS_V2_ANALYSIS_DAYS, "ANALYTICS_V2_ANALYSIS_DAYS");
+  const chunkDays = requirePositiveInteger(
+    occurrences?.MAX_ANALYTICS_V2_OCCURRENCE_DAYS ?? DEFAULT_OCCURRENCE_CHUNK_DAYS,
+    "MAX_ANALYTICS_V2_OCCURRENCE_DAYS",
+  );
+
+  async function readJournal(context, cursor) {
+    let afterSequence = cursor === null ? 0 : sequenceNumber(cursor);
+    const days = new Set();
+    const terminalOwners = new Set();
+    for (let page = 0; page < MAX_QUEUE_PAGES; page += 1) {
+      const result = await readQueued(context, { afterSequence, limit: QUEUE_PAGE_EVENTS });
+      if (result === null || typeof result !== "object" || !Array.isArray(result.days)
+          || !result.days.every(isDay) || !Array.isArray(result.terminalOwners)
+          || !result.terminalOwners.every((owner) => typeof owner === "string" && OWNER_DIGEST.test(owner))
+          || typeof result.complete !== "boolean") {
         fail("ANALYTICS_V2_REFRESH_JOURNAL_INVALID");
       }
-      const days = analyticsRefreshPublicationDays(queued.days, state);
-      const ranges = analyticsRefreshReadRanges(utcDay(nowMs), days);
+      const lastSequence = sequenceNumber(result.lastSequence);
+      if (lastSequence === null || lastSequence < afterSequence) fail("ANALYTICS_V2_REFRESH_JOURNAL_INVALID");
+      for (const day of result.days) days.add(day);
+      for (const owner of result.terminalOwners) terminalOwners.add(owner);
+      if (days.size > ANALYTICS_REFRESH_MAX_QUEUED_DAYS) fail("ANALYTICS_V2_REFRESH_QUEUE_CAPACITY_EXCEEDED");
+      if (result.complete) {
+        return { days: [...days].sort(), lastSequence, terminalOwners: terminalOwners.size };
+      }
+      // An incomplete page must advance, or the loop could never end.
+      if (lastSequence === afterSequence) fail("ANALYTICS_V2_REFRESH_JOURNAL_INVALID");
+      afterSequence = lastSequence;
+    }
+    return fail("ANALYTICS_V2_REFRESH_QUEUE_CAPACITY_EXCEEDED");
+  }
+
+  async function readOwnerDays(context, ownerDigest, ranges) {
+    const byDay = new Map();
+    for (const stream of OCCURRENCE_STREAMS) {
+      for (const range of ranges) {
+        const result = await readOccurrences(context, {
+          ownerDigest,
+          stream,
+          fromDay: range.fromDay,
+          throughDay: range.throughDay,
+        });
+        if (!(result instanceof Map)) fail("ANALYTICS_V2_REFRESH_OCCURRENCES_INVALID");
+        for (const [day, list] of result) {
+          if (!isDay(day) || day < range.fromDay || day > range.throughDay || !Array.isArray(list)) {
+            fail("ANALYTICS_V2_REFRESH_OCCURRENCES_INVALID");
+          }
+          const entry = byDay.get(day) ?? { usage: [], quota: [], session: [] };
+          entry[stream] = list;
+          byDay.set(day, entry);
+        }
+      }
+    }
+    return byDay;
+  }
+
+  return Object.freeze({
+    async read({ pool, schema, nowMs, state }) {
+      const context = Object.freeze({ pool, schema, nowMs });
+      const listing = await listOwners(context);
+      if (listing === null || typeof listing !== "object" || Array.isArray(listing)
+          || !Array.isArray(listing.owners) || !Array.isArray(listing.unlinked)
+          || !listing.owners.every((owner) => owner !== null && typeof owner === "object"
+            && typeof owner.ownerDigest === "string" && OWNER_DIGEST.test(owner.ownerDigest))
+          || !listing.unlinked.every((owner) => owner !== null && typeof owner === "object")) {
+        fail("ANALYTICS_V2_REFRESH_OWNERS_INVALID");
+      }
+      const journal = await readJournal(context, state.cursor);
+      const days = analyticsRefreshPublicationDays(journal.days, state);
+      if (days.length > ANALYTICS_REFRESH_MAX_QUEUED_DAYS) fail("ANALYTICS_V2_REFRESH_QUEUE_CAPACITY_EXCEEDED");
+      const cacheFromDay = analyticsRefreshCacheFromDay({
+        today: utcDay(nowMs),
+        analysisDays,
+        queuedDays: days,
+        cacheFloorDay: state.cacheFloorDay ?? null,
+      });
+      const range = await requiredRange({ nowMs, queuedDays: days, cacheFromDay });
+      if (range === null || typeof range !== "object" || !isDay(range.fromDay) || !isDay(range.throughDay)
+          || range.fromDay > range.throughDay) {
+        fail("ANALYTICS_V2_REFRESH_RANGE_INVALID");
+      }
+      if (daySpan(range.fromDay, range.throughDay) > ANALYTICS_REFRESH_MAX_RANGE_DAYS) {
+        fail("ANALYTICS_V2_REFRESH_RANGE_EXCEEDED");
+      }
+      const occurrenceRange = Object.freeze({ fromDay: range.fromDay, throughDay: range.throughDay });
+      const fullRange = analyticsRefreshRangeChunks(occurrenceRange, chunkDays);
+      const queuedSpans = analyticsRefreshDaySpans(days, chunkDays);
+
+      const ownerList = [...listing.owners].sort(compareOwners);
       const occurrencesByOwner = new Map();
-      const effective = ownerList.filter((owner) => owner?.source === "effective")
-        .sort((left, right) => (left.ownerDigest < right.ownerDigest ? -1 : 1));
-      for (const owner of effective) {
-        const byDay = new Map();
-        for (const stream of OCCURRENCE_STREAMS) {
-          for (const range of ranges) {
-            const result = await readOccurrences({
-              ...context,
-              ownerDigest: owner.ownerDigest,
-              stream,
-              fromDay: range.fromDay,
-              throughDay: range.throughDay,
-            });
-            if (!(result instanceof Map)) fail("ANALYTICS_V2_REFRESH_OCCURRENCES_INVALID");
-            for (const [day, list] of result) {
-              const entry = byDay.get(day) ?? { usage: [], quota: [], session: [] };
-              entry[stream] = list;
-              byDay.set(day, entry);
-            }
+      let nonEffectiveUnread = 0;
+      for (const owner of ownerList) {
+        if (owner.source === "effective") {
+          occurrencesByOwner.set(owner.ownerDigest, await readOwnerDays(context, owner.ownerDigest, fullRange));
+        } else if (hasTypedEvidence(owner)) {
+          try {
+            occurrencesByOwner.set(owner.ownerDigest, await readOwnerDays(context, owner.ownerDigest, queuedSpans));
+          } catch (error) {
+            // Fail closed for publication only: unread, A-2 blocks every queued day.
+            if (!isSourceError(error)) throw error;
+            nonEffectiveUnread += 1;
           }
         }
-        occurrencesByOwner.set(owner.ownerDigest, byDay);
       }
-      const devicesByDay = await countDevices({ ...context, days });
+
+      const contributing = new Map(days.map((day) => [day, ownerList
+        .filter((owner) => owner.source === "effective"
+          && hasEvidence(occurrencesByOwner.get(owner.ownerDigest)?.get(day)))
+        .map((owner) => ({ participantId: owner.participantId, ownerDigest: owner.ownerDigest, source: owner.source }))]));
+      const devicesByDay = await countDevices(context, { days: contributing });
+      if (!(devicesByDay instanceof Map)) fail("ANALYTICS_V2_REFRESH_DEVICES_INVALID");
+
       return {
-        owners: ownerList,
+        owners: listing.owners,
+        unlinkedTypedOwners: listing.unlinked.filter(hasTypedEvidence).length,
         occurrencesByOwner,
+        occurrenceRange,
+        cacheFromDay,
         devicesByDay,
         queuedDays: days,
-        lastSequence: sequenceNumber(queued.lastSequence),
+        lastSequence: journal.lastSequence,
+        terminalOwners: journal.terminalOwners,
+        nonEffectiveUnread,
       };
     },
     async compute(inputs, { nowMs, revisionSeed }) {
       const outputs = await computeOutputs({
         owners: inputs.owners,
         occurrencesByOwner: inputs.occurrencesByOwner,
+        occurrenceRange: inputs.occurrenceRange,
+        cacheFromDay: inputs.cacheFromDay,
         devicesByDay: inputs.devicesByDay,
         queuedDays: inputs.queuedDays,
         nowMs,
         revisionSeed,
       });
-      if (outputs === null || typeof outputs !== "object") fail("ANALYTICS_V2_REFRESH_OUTPUTS_INVALID");
-      // The journal position is the reader's, not the pure compute core's.
-      return { ...outputs, journal: { lastSequence: inputs.lastSequence } };
+      if (outputs === null || typeof outputs !== "object" || !Array.isArray(outputs.dailyCandidates)
+          || !Array.isArray(outputs.blockedDays)) {
+        fail("ANALYTICS_V2_REFRESH_OUTPUTS_INVALID");
+      }
+      let publication = {};
+      if (inputs.unlinkedTypedOwners > 0) {
+        // Production's daily cohort is unavailable while an eligible typed
+        // owner has no owner link: nothing publishes, every queued day is
+        // carried, and each keeps its prior row.
+        publication = {
+          dailyCandidates: [],
+          blockedDays: [...new Set([...outputs.blockedDays,
+            ...outputs.dailyCandidates.map((candidate) => candidate.day)])].sort(),
+        };
+      }
+      return {
+        ...outputs,
+        ...publication,
+        // The journal position is the reader's, not the pure compute core's.
+        journal: { lastSequence: inputs.lastSequence },
+        // The owner-scoped rows this run recomputes: every prepared day from the
+        // start of the occurrence range, and every cache day from cacheFromDay.
+        horizon: { ownerDayFromDay: inputs.occurrenceRange.fromDay, cacheBandsFromDay: inputs.cacheFromDay },
+        readSummary: {
+          unlinkedTypedOwners: inputs.unlinkedTypedOwners,
+          terminalOwners: inputs.terminalOwners,
+          nonEffectiveUnread: inputs.nonEffectiveUnread,
+        },
+      };
     },
   });
 }
@@ -603,9 +803,14 @@ export async function runAnalyticsRefresh({
         runId,
         startedAtMs,
         expectedCursor: state.cursor,
+        horizon: outputs.horizon,
         timings: { read: readMs },
         wallClock,
       });
+      // Content-free read counts the default pipeline reports (closed keys).
+      const readSummary = Object.fromEntries(READ_SUMMARY_KEYS
+        .map((key) => [key, outputs.readSummary?.[key]])
+        .filter(([, value]) => Number.isSafeInteger(value) && value >= 0));
       receipt = Object.freeze({
         ...base,
         status: "ok",
@@ -613,7 +818,8 @@ export async function runAnalyticsRefresh({
         runId: written.runId,
         owners: written.owners,
         ownerDays: written.ownerDays,
-        retiredOwners: written.retiredOwners,
+        retainedOwners: written.retainedOwners,
+        ...readSummary,
         refusals: written.refusals,
         refusalsByReason: countBy(outputs.refusals ?? [], (refusal) => refusal.reason),
         published: written.publication.published,

@@ -136,6 +136,8 @@ CREATE TABLE analytics_v2_published_daily (
   payload jsonb NOT NULL CHECK (jsonb_typeof(payload) = 'object'),
   payload_sha256 char(64) NOT NULL CHECK (payload_sha256 ~ '^[0-9a-f]{64}$'),
   run_id uuid NOT NULL,
+  -- store.ts measures the same jsonb text form before inserting, so an
+  -- oversized payload is refused there as ANALYTICS_V2_DAILY_PAYLOAD_TOO_LARGE.
   CHECK (octet_length(payload::text) <= 262144),
   -- COALESCE: a missing payload field fails the check instead of passing as NULL.
   CHECK (COALESCE(payload ->> 'day' = to_char(day, 'YYYY-MM-DD'), false)),
