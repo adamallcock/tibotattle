@@ -1,15 +1,20 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import {
   buildPostgresMigrationManifest,
   POSTGRES_MIGRATION_ROOT,
 } from "./postgres-migrations.mjs";
 import {
+  FASTPATH_MIGRATION_PROFILE,
+  FASTPATH_MIGRATION_TARGETS,
+  FASTPATH_MIGRATIONS_JOB,
   GRAPH_BENCHMARK_MIGRATION_PROFILE,
   GRAPH_BENCHMARK_MIGRATIONS_JOB,
   GRAPH_BENCHMARK_MIGRATION_TARGETS,
+  grantAndVerifyTestRuntimePrivileges,
   parseTestMigrationsConfig,
   runTestMigrations,
   TEST_MIGRATIONS_IAM_USER,
@@ -55,6 +60,21 @@ function validBenchmarkEnv(overrides = {}) {
   return env;
 }
 
+function validFastpathEnv(overrides = {}) {
+  return validEnv({
+    CLOUD_RUN_JOB: FASTPATH_MIGRATIONS_JOB,
+    PRIMARY_DATABASE: FASTPATH_MIGRATION_TARGETS.primary.database,
+    PRIMARY_SCHEMA: FASTPATH_MIGRATION_TARGETS.primary.schema,
+    PRIMARY_INSTANCE_CONNECTION_NAME: FASTPATH_MIGRATION_TARGETS.primary.instanceConnectionName,
+    LEDGER_DATABASE: FASTPATH_MIGRATION_TARGETS.ledger.database,
+    LEDGER_SCHEMA: FASTPATH_MIGRATION_TARGETS.ledger.schema,
+    LEDGER_INSTANCE_CONNECTION_NAME: FASTPATH_MIGRATION_TARGETS.ledger.instanceConnectionName,
+    PRIMARY_EXPECTED_MIGRATIONS: String(manifest.roles.primary.length),
+    LEDGER_EXPECTED_MIGRATIONS: String(manifest.roles.ledger.length),
+    ...overrides,
+  });
+}
+
 function expectCode(fn, code) {
   assert.throws(fn, (error) => error?.code === code);
 }
@@ -64,11 +84,15 @@ function makeHarness(manifest, {
   corruptPrimaryReceipt = false,
   corruptPrimaryPrivileges = false,
   graphBenchmark = false,
+  fastpath = false,
 } = {}) {
   const schemaNames = {
     primary: [TEST_MIGRATIONS_TARGETS.primary.schema,
       ...(graphBenchmark ? GRAPH_BENCHMARK_MIGRATION_TARGETS.map(({ schema }) => schema) : [])],
     ledger: [TEST_MIGRATIONS_TARGETS.ledger.schema],
+    ...(fastpath
+      ? { fastpath: Object.values(FASTPATH_MIGRATION_TARGETS).map(({ schema }) => schema) }
+      : {}),
   };
   const allSchemas = Object.values(schemaNames).flat();
   const schemaReceipts = new Map(allSchemas.map((schema) => [schema, []]));
@@ -76,10 +100,13 @@ function makeHarness(manifest, {
   if (wrongPrimaryOwner) {
     schemaOwners.set(TEST_MIGRATIONS_TARGETS.primary.schema, "different-owner");
   }
-  const state = Object.fromEntries(Object.keys(TEST_MIGRATIONS_TARGETS).map((role) => [role, {
+  const state = Object.fromEntries([
+    ...Object.keys(TEST_MIGRATIONS_TARGETS),
+    ...(fastpath ? ["fastpath"] : []),
+  ].map((role) => [role, {
     schemaExists: false,
     owner: null,
-    receipts: schemaReceipts.get(TEST_MIGRATIONS_TARGETS[role].schema),
+    receipts: role === "fastpath" ? null : schemaReceipts.get(TEST_MIGRATIONS_TARGETS[role].schema),
     runtimePrivileges: {
       schemaUsage: false,
       schemaCreate: false,
@@ -116,10 +143,18 @@ function makeHarness(manifest, {
     },
     async createPool(options) {
       poolCount += 1;
-      const role = Object.entries(TEST_MIGRATIONS_TARGETS).find(([, target]) =>
-        target.instanceConnectionName === options.instanceConnectionName)?.[0];
+      const role = fastpath
+        ? "fastpath"
+        : Object.entries(TEST_MIGRATIONS_TARGETS).find(([, target]) =>
+          target.instanceConnectionName === options.instanceConnectionName)?.[0];
       assert.ok(role);
-      assert.equal(options.database, TEST_MIGRATIONS_TARGETS[role].database);
+      assert.equal(options.database, fastpath
+        ? FASTPATH_MIGRATION_TARGETS.primary.database
+        : TEST_MIGRATIONS_TARGETS[role].database);
+      if (fastpath) {
+        assert.equal(options.instanceConnectionName,
+          FASTPATH_MIGRATION_TARGETS.primary.instanceConnectionName);
+      }
       assert.equal(options.user, TEST_MIGRATIONS_IAM_USER);
       assert.equal(options.max, 1);
       assert.equal(options.applicationName, "tibotattle-test-database-migrator");
@@ -255,8 +290,9 @@ function makeHarness(manifest, {
     },
     async applyMigrations({ role, schema, pool, rootDirectory }) {
       applyCalls += 1;
-      assert.equal(pool, pools[role]);
-      assert.equal(schemaNames[role].includes(schema), true);
+      const poolRole = fastpath ? "fastpath" : role;
+      assert.equal(pool, pools[poolRole]);
+      assert.equal(schemaNames[poolRole].includes(schema), true);
       assert.equal(rootDirectory, TEST_MIGRATIONS_ROOT);
       const expected = manifest.roles[role].map(({ version, name, sha256 }) => ({
         version,
@@ -538,4 +574,184 @@ test("a receipt checksum mismatch fails closed and still closes database resourc
   );
   assert.equal(harness.applyCalls, 1);
   assert.equal(harness.cleanupCalls, 1);
+});
+
+test("fastpath profile pins a separate disposable database and both role schemas", () => {
+  const config = parseTestMigrationsConfig(
+    validFastpathEnv(), TEST_MIGRATIONS_SERVICE_ACCOUNT, FASTPATH_MIGRATION_PROFILE,
+  );
+  assert.equal(config.job, FASTPATH_MIGRATIONS_JOB);
+  assert.equal(config.profile, FASTPATH_MIGRATION_PROFILE);
+  assert.deepEqual(config.plans.map(({ role, poolKey, target }) => [role, poolKey, target.schema]), [
+    ["primary", "fastpath", "tibotattle_fastpath_20261001"],
+    ["ledger", "fastpath", "tibotattle_fastpath_ledger_20261001"],
+  ]);
+  assert.deepEqual(config.expectedCounts, {
+    primary: manifest.roles.primary.length,
+    ledger: manifest.roles.ledger.length,
+  });
+  for (const target of Object.values(FASTPATH_MIGRATION_TARGETS)) {
+    assert.equal(target.instanceConnectionName, TEST_MIGRATIONS_TARGETS.primary.instanceConnectionName);
+    assert.equal(target.database, "tibotattle_fastpath");
+    assert.notEqual(target.database, TEST_MIGRATIONS_TARGETS.primary.database,
+      "the shared test database must never receive the fast-path control schema");
+    assert.match(target.schema, /^tibotattle_fastpath_/u);
+  }
+  for (const overrides of [
+    { PRIMARY_SCHEMA: TEST_MIGRATIONS_TARGETS.primary.schema },
+    { PRIMARY_DATABASE: TEST_MIGRATIONS_TARGETS.primary.database },
+    { LEDGER_SCHEMA: TEST_MIGRATIONS_TARGETS.ledger.schema },
+    { LEDGER_DATABASE: TEST_MIGRATIONS_TARGETS.ledger.database },
+    { LEDGER_INSTANCE_CONNECTION_NAME: TEST_MIGRATIONS_TARGETS.ledger.instanceConnectionName },
+  ]) {
+    expectCode(() => parseTestMigrationsConfig(
+      validFastpathEnv(overrides), TEST_MIGRATIONS_SERVICE_ACCOUNT, FASTPATH_MIGRATION_PROFILE,
+    ), "POSTGRES_TEST_MIGRATIONS_FASTPATH_TARGET_INVALID");
+  }
+  for (const overrides of [
+    { PRIMARY_EXPECTED_MIGRATIONS: undefined },
+    { LEDGER_EXPECTED_MIGRATIONS: "0" },
+    { PRIMARY_EXPECTED_MIGRATIONS: "58 " },
+    { LEDGER_EXPECTED_MIGRATIONS: "-7" },
+  ]) {
+    expectCode(() => parseTestMigrationsConfig(
+      validFastpathEnv(overrides), TEST_MIGRATIONS_SERVICE_ACCOUNT, FASTPATH_MIGRATION_PROFILE,
+    ), "POSTGRES_TEST_MIGRATIONS_FASTPATH_EXPECTED_COUNT_INVALID");
+  }
+  expectCode(() => parseTestMigrationsConfig(
+    validFastpathEnv({ CLOUD_RUN_JOB: TEST_MIGRATIONS_JOB }),
+    TEST_MIGRATIONS_SERVICE_ACCOUNT, FASTPATH_MIGRATION_PROFILE,
+  ), "CLOUD_RUN_TEST_MIGRATIONS_JOB_CONTEXT_INVALID");
+  expectCode(() => parseTestMigrationsConfig(
+    validEnv(), TEST_MIGRATIONS_SERVICE_ACCOUNT, FASTPATH_MIGRATION_PROFILE,
+  ), "CLOUD_RUN_TEST_MIGRATIONS_JOB_CONTEXT_INVALID");
+});
+
+test("fastpath expected counts must equal the image manifest before any database access", async () => {
+  const harness = makeHarness(manifest, { fastpath: true });
+  await assert.rejects(runTestMigrations({
+    env: validFastpathEnv({ PRIMARY_EXPECTED_MIGRATIONS: String(manifest.roles.primary.length + 1) }),
+    profile: FASTPATH_MIGRATION_PROFILE,
+    dependencies: harness.dependencies,
+  }), (error) => error?.code === "POSTGRES_TEST_MIGRATIONS_FASTPATH_EXPECTED_COUNT_MISMATCH");
+  assert.equal(harness.manifestCount, 1);
+  assert.equal(harness.connectorCount, 0);
+  assert.equal(harness.events.length, 0);
+});
+
+/** The manifest with one synthetic primary migration appended, re-digested as the runner would. */
+function manifestWithExtraPrimaryMigration(base) {
+  const sql = "SELECT 1;\n";
+  const extra = {
+    ...base.roles.primary.at(-1),
+    version: base.roles.primary.length + 1,
+    name: `${String(base.roles.primary.length + 1).padStart(4, "0")}_synthetic_fastpath_probe.sql`,
+    sql,
+    bytes: Buffer.byteLength(sql),
+    sha256: createHash("sha256").update(sql).digest("hex"),
+  };
+  const roles = { primary: [...base.roles.primary, extra], ledger: base.roles.ledger };
+  const canonical = JSON.stringify({
+    schemaVersion: base.schemaVersion,
+    roles: Object.fromEntries(["primary", "ledger"].map((role) => [role,
+      roles[role].map(({ version, name, bytes, sha256 }) => ({ version, name, bytes, sha256 }))])),
+  });
+  return { ...base, roles, sha256: createHash("sha256").update(canonical).digest("hex") };
+}
+
+test("a2 stays pinned at 59/7 while fastpath follows the deploying commit's counts", async () => {
+  const grown = manifestWithExtraPrimaryMigration(manifest);
+  assert.equal(grown.roles.primary.length, TEST_MIGRATIONS_TARGETS.primary.expectedMigrations + 1);
+
+  const a2 = makeHarness(grown);
+  await assert.rejects(runTestMigrations({ env: validEnv(), dependencies: a2.dependencies }),
+    (error) => error?.code === "POSTGRES_TEST_MIGRATIONS_MANIFEST_INVALID",
+    "the A2 profile keeps its pinned primary count");
+  assert.equal(a2.connectorCount, 0);
+
+  const benchmark = makeHarness(grown, { graphBenchmark: true });
+  await assert.rejects(runTestMigrations({
+    env: validBenchmarkEnv(), profile: GRAPH_BENCHMARK_MIGRATION_PROFILE, dependencies: benchmark.dependencies,
+  }), (error) => error?.code === "POSTGRES_TEST_MIGRATIONS_MANIFEST_INVALID");
+  assert.equal(benchmark.connectorCount, 0);
+
+  const stale = makeHarness(grown, { fastpath: true });
+  await assert.rejects(runTestMigrations({
+    env: validFastpathEnv(), profile: FASTPATH_MIGRATION_PROFILE, dependencies: stale.dependencies,
+  }), (error) => error?.code === "POSTGRES_TEST_MIGRATIONS_FASTPATH_EXPECTED_COUNT_MISMATCH",
+  "counts from an older commit do not match a newer image");
+  assert.equal(stale.connectorCount, 0);
+
+  const fastpath = makeHarness(grown, { fastpath: true });
+  const result = await runTestMigrations({
+    env: validFastpathEnv({ PRIMARY_EXPECTED_MIGRATIONS: String(grown.roles.primary.length) }),
+    profile: FASTPATH_MIGRATION_PROFILE,
+    dependencies: fastpath.dependencies,
+  });
+  assert.equal(result.migrations.primary.applied, grown.roles.primary.length);
+  assert.equal(result.migrations.primary.latest.name, grown.roles.primary.at(-1).name);
+  assert.equal(result.migrations.ledger.applied, TEST_MIGRATIONS_TARGETS.ledger.expectedMigrations);
+});
+
+test("fastpath profile applies both roles through one pool and grants only its exact schemas", async () => {
+  const harness = makeHarness(manifest, { fastpath: true });
+  const first = await runTestMigrations({
+    env: validFastpathEnv(), profile: FASTPATH_MIGRATION_PROFILE, dependencies: harness.dependencies,
+  });
+  const second = await runTestMigrations({
+    env: validFastpathEnv(), profile: FASTPATH_MIGRATION_PROFILE, dependencies: harness.dependencies,
+  });
+  assert.deepEqual(first, second);
+  assert.equal(first.job, FASTPATH_MIGRATIONS_JOB);
+  assert.equal(first.profile, FASTPATH_MIGRATION_PROFILE);
+  assert.equal(first.migrations.primary.schema, FASTPATH_MIGRATION_TARGETS.primary.schema);
+  assert.equal(first.migrations.ledger.schema, FASTPATH_MIGRATION_TARGETS.ledger.schema);
+  assert.equal(first.migrations.primary.applied, manifest.roles.primary.length);
+  assert.equal(first.migrations.ledger.applied, manifest.roles.ledger.length);
+  assert.equal(harness.poolCount, 2, "one pool per run, shared by both role schemas");
+  assert.equal(harness.applyCalls, 4);
+  assert.equal(harness.cleanupCalls, 2);
+  for (const { schema } of Object.values(FASTPATH_MIGRATION_TARGETS)) {
+    const quoted = `"${schema}"`;
+    assert.equal(harness.schemaOwners.get(schema), TEST_MIGRATIONS_IAM_USER);
+    assert.equal(harness.events.filter(({ sql }) => sql === `CREATE SCHEMA ${quoted}`).length, 1);
+    assert.equal(harness.events.some(({ sql }) => sql?.includes(
+      `GRANT USAGE ON SCHEMA ${quoted} TO "${TEST_MIGRATIONS_RUNTIME_IAM_USER}"`,
+    )), true);
+  }
+  const grantSql = harness.events.map(({ sql }) => sql ?? "")
+    .filter((sql) => /^(GRANT|REVOKE|ALTER DEFAULT PRIVILEGES)/u.test(sql));
+  assert.equal(grantSql.every((sql) => sql.includes('"tibotattle_fastpath_')), true,
+    "fast-path grants never reach the shared A2 or benchmark schemas");
+  assert.equal(grantSql.filter((sql) => sql.startsWith("GRANT EXECUTE ON FUNCTION "
+    + `"${FASTPATH_MIGRATION_TARGETS.primary.schema}".`)).length, 2,
+  "only the primary role schema carries the v1 admission function grant");
+});
+
+test("the exported runtime-grant routine applies the same policy to one named schema", async () => {
+  const harness = makeHarness(manifest);
+  const pool = await harness.dependencies.createPool({
+    connector: { testConnector: true },
+    instanceConnectionName: TEST_MIGRATIONS_TARGETS.primary.instanceConnectionName,
+    database: TEST_MIGRATIONS_TARGETS.primary.database,
+    user: TEST_MIGRATIONS_IAM_USER,
+    max: 1,
+    applicationName: "tibotattle-test-database-migrator",
+  });
+  const schema = "typed_legacy_transfer_rehearsal_target_fastpath_gcp";
+  await grantAndVerifyTestRuntimePrivileges(pool, "primary", schema);
+  const quoted = `"${schema}"`;
+  const grants = harness.events.map(({ sql }) => sql ?? "")
+    .filter((sql) => /^(GRANT|REVOKE|ALTER DEFAULT PRIVILEGES)/u.test(sql));
+  assert.equal(grants.length > 0 && grants.every((sql) => sql.includes(quoted)), true);
+  assert.equal(grants.includes(
+    `GRANT EXECUTE ON FUNCTION ${quoted}."insert_telemetry_v1_contribution"(jsonb) TO "${TEST_MIGRATIONS_RUNTIME_IAM_USER}"`,
+  ), true);
+  assert.equal(harness.events.some(({ sql, params }) =>
+    sql?.includes("has_schema_privilege($1, $2, 'USAGE')") && params?.[1] === schema), true);
+  await assert.rejects(grantAndVerifyTestRuntimePrivileges(pool, "admin", schema),
+    (error) => error?.code === "POSTGRES_TEST_MIGRATIONS_ROLE_INVALID");
+  await assert.rejects(grantAndVerifyTestRuntimePrivileges(pool, "primary", "Bad-Schema"),
+    (error) => error?.code === "POSTGRES_TEST_MIGRATIONS_PRIMARY_RUNTIME_GRANT_FAILED"
+      || error?.code === "POSTGRES_TEST_MIGRATIONS_SCHEMA_INVALID");
 });
