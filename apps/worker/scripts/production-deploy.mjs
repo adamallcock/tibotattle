@@ -27,7 +27,11 @@ import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { DEPLOYMENT_ENDPOINTS } from "../../../config/deployment-endpoints.js";
 import { parse } from "jsonc-parser";
-import { checkDeploymentEndpointConsumers } from "./check-deployment-endpoints.mjs";
+import {
+  checkDeploymentEndpointConsumers,
+  edgeModeForbiddenPathClass,
+  validateEdgeModePublicSurface,
+} from "./check-deployment-endpoints.mjs";
 import { checkLocalWorkspacePackages } from "./check-local-workspace-packages.mjs";
 import { stageProductionAssets } from "./stage-production-assets.mjs";
 import { ADMIN_UI_SOURCES } from "./generate-admin-ui-assets.mjs";
@@ -59,7 +63,7 @@ const PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS = 10_000;
 // snapshot is taken. Skip only these root entries: identically named paths
 // inside an installed package remain covered by the integrity digest.
 const DEPENDENCY_RUNTIME_STATE_DIRECTORIES = new Set([".cache", ".mf"]);
-const PRODUCTION_PUBLIC_SURFACE_FORBIDDEN_PATHS = Object.freeze([
+export const PRODUCTION_PUBLIC_SURFACE_FORBIDDEN_PATHS = Object.freeze([
   "/app.js",
   "/data-client.js",
   "/navigation.js",
@@ -82,6 +86,23 @@ const PRODUCTION_PUBLIC_RELEASE_MANIFEST_MAX_BYTES = 512 * 1024;
 function localFailure(code) {
   return { ok: false, code };
 }
+
+// Edge-mode support (production-edge-mode.mjs) loads only when an edge mode is
+// requested or pinned, so a deploy without --edge-mode keeps its module graph.
+let productionEdgeModeModule = null;
+async function loadProductionEdgeMode() {
+  productionEdgeModeModule ??= await import("./production-edge-mode.mjs");
+  return productionEdgeModeModule;
+}
+
+// Options only an --edge-mode deploy may carry.
+const PRODUCTION_EDGE_OPTION_NAMES = Object.freeze([
+  "edgePlan",
+  "originCommit",
+  "obtainOriginIdentityToken",
+  "edgeHistory",
+  "edgeTools",
+]);
 
 const PRODUCTION_SOURCE_COMMIT_PATTERN = /^[a-f0-9]{40}$/u;
 const PRODUCTION_SHA256_PATTERN = /^[a-f0-9]{64}$/u;
@@ -419,11 +440,19 @@ export async function revalidateTypedProductionDeployment({
           || snapshot.sourceCommit !== expectedPreviousSourceCommit) {
         return typedFailure("PRODUCTION_TYPED_LIVE_CHANGED");
       }
-    } else if (!typedSnapshotMatches(typedDeployment.baseline, snapshot, {
+    } else if (!typedSnapshotMatches(typedDeployment.edge?.expectedAfter ?? typedDeployment.baseline, snapshot, {
       source: false,
       version: false,
     }) || snapshot.sourceCommit !== sourceCommit) {
       return typedFailure("PRODUCTION_TYPED_POST_DEPLOY_LIVE_MISMATCH");
+    }
+    if (phase === "after" && typedDeployment.edge) {
+      // An edge deploy's post-deploy identity: one version at 100% whose
+      // DEPLOYMENT_SOURCE_COMMIT and EDGE_UPSTREAM_MODE are the deploy's.
+      const live = typedDeployment.edge.verifyLive({ snapshot, sourceCommit });
+      if (!live?.ok) {
+        return typedFailure("PRODUCTION_TYPED_POST_DEPLOY_EDGE_MODE_UNVERIFIED", live?.code);
+      }
     }
 
     const metadata = await lstat(configPath);
@@ -590,6 +619,132 @@ export async function determinePendingProductionMigrations({
           "--remote",
           "--env",
           "production",
+          "--command",
+          PRODUCTION_MIGRATION_LEDGER_SQL,
+          "--json",
+        ],
+        {
+          cwd: workerDirectory,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+          maxBuffer: 4 * 1024 * 1024,
+        },
+      );
+    } catch (error) {
+      return migrationStateUnknown({
+        stage: "wrangler-spawn",
+        binding: database.binding,
+        error: boundedExcerpt(error?.message ?? String(error)),
+      });
+    }
+    if (query?.error || query?.status !== 0) {
+      return migrationStateUnknown({
+        stage: "wrangler-exit",
+        binding: database.binding,
+        status: query?.status ?? null,
+        stderr: boundedExcerpt(query?.stderr),
+        ...(query?.error
+          ? { error: boundedExcerpt(query.error?.message ?? String(query.error)) }
+          : {}),
+      });
+    }
+    const stdout = typeof query?.stdout === "string" ? query.stdout : "";
+    const rows = parseD1ExecuteRows(stdout);
+    if (!Array.isArray(rows)) {
+      return migrationStateUnknown({
+        stage: "ledger-parse",
+        binding: database.binding,
+        stdout: boundedExcerpt(stdout),
+        stderr: boundedExcerpt(query?.stderr),
+      });
+    }
+    if (!rows.every((row, index) => Number(row?.id) === index + 1
+      && typeof row?.name === "string")) {
+      return migrationStateUnknown({
+        stage: "ledger-sequence",
+        binding: database.binding,
+        rowCount: rows.length,
+      });
+    }
+    const applied = rows.map((row) => row.name);
+    if (applied.length > local.length
+        || !applied.every((name, index) => name === local[index])) {
+      const index = applied.findIndex((name, at) => name !== local[at]);
+      return {
+        ok: false,
+        code: "PRODUCTION_MIGRATION_LEDGER_DRIFT",
+        detail: {
+          binding: database.binding,
+          appliedCount: applied.length,
+          localCount: local.length,
+          firstMismatch: {
+            index,
+            applied: applied[index],
+            local: local[index] ?? null,
+          },
+        },
+      };
+    }
+    for (const name of local.slice(applied.length)) {
+      pending.push(`${database.binding}:${name}`);
+    }
+  }
+  return { ok: true, code: null, pending };
+}
+
+const D1_BINDING_PATTERN = /^[A-Z][A-Z0-9_]{0,62}$/u;
+const D1_MIGRATIONS_DIRECTORY_PATTERN = /^[a-z0-9][a-z0-9-]{0,62}$/u;
+
+/**
+ * The same read-only pending-migration listing for an explicit set of D1
+ * bindings under an explicit Wrangler config and environment: the edge gcp
+ * gate reads RELEASE_GUARD_DB through the installed overlay config. Remote
+ * reads are the fixed d1_migrations SELECT only, and the result shapes and
+ * failure codes are determinePendingProductionMigrations's.
+ */
+export async function determinePendingD1Migrations({
+  wrangler,
+  workerDirectory,
+  databases,
+  configPath = null,
+  environment = "production",
+  spawn = spawnSync,
+} = {}) {
+  if (!Array.isArray(databases) || databases.length < 1 || databases.length > 4
+      || databases.some((database) => !D1_BINDING_PATTERN.test(database?.binding ?? "")
+        || !D1_MIGRATIONS_DIRECTORY_PATTERN.test(database?.migrationsDir ?? ""))
+      || new Set(databases.map((database) => database.binding)).size !== databases.length
+      || (configPath !== null && (typeof configPath !== "string" || !isAbsolute(configPath)))
+      || typeof environment !== "string" || !/^[a-z][a-z0-9-]{0,31}$/u.test(environment)) {
+    return migrationStateUnknown({ stage: "gate-input" });
+  }
+  const pending = [];
+  for (const database of databases) {
+    let local;
+    try {
+      local = await listLocalMigrationNames(workerDirectory, database.migrationsDir);
+    } catch {
+      local = null;
+    }
+    if (!Array.isArray(local)) {
+      return migrationStateUnknown({
+        stage: "local-migration-inventory",
+        binding: database.binding,
+        migrationsDir: database.migrationsDir,
+      });
+    }
+    let query;
+    try {
+      query = spawn(
+        wrangler,
+        [
+          "d1",
+          "execute",
+          database.binding,
+          "--remote",
+          ...(configPath === null ? [] : ["--config", configPath]),
+          "--env",
+          environment,
           "--command",
           PRODUCTION_MIGRATION_LEDGER_SQL,
           "--json",
@@ -1336,6 +1491,173 @@ export async function recheckProductionPublicReleaseManifest({
   return { ok: true, code: null, sha256: expectedSha256 };
 }
 
+const PRODUCTION_EDGE_BARRIER_HEALTH_MODE = "migration-mutation-barrier";
+
+/**
+ * Public health under an edge identity rule (E10). Every mode needs the
+ * canonical URL, the secure JSON headers and status "ok". fenced must be the
+ * mutation barrier's own health for the expected source commit; worker and
+ * gcp must not be barrier health and must report the expected source commit:
+ * the edge's for worker, the origin commit the pre-gcp verifier read for
+ * gcp. The fast-path test origin's health (no deployment.sourceCommit) fails.
+ */
+export async function recheckProductionEdgeHealth({
+  fetchImpl = globalThis.fetch,
+  timeoutMs = 10_000,
+  mode,
+  expectedSourceCommit,
+} = {}) {
+  if (!["worker", "fenced", "gcp"].includes(mode)
+      || !PRODUCTION_SOURCE_COMMIT_PATTERN.test(expectedSourceCommit ?? "")) {
+    return localFailure("PRODUCTION_EDGE_HEALTH_INPUT_INVALID");
+  }
+  const healthURL = new URL("/api/health", DEPLOYMENT_ENDPOINTS.public.origin).href;
+  let response;
+  try {
+    response = await fetchImpl(healthURL, {
+      method: "GET",
+      headers: { accept: "application/json" },
+      credentials: "omit",
+      redirect: "error",
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch {
+    return localFailure("PRODUCTION_EDGE_HEALTH_UNREACHABLE");
+  }
+  if (response?.url !== healthURL || response.status !== 200
+      || !secureJsonHeaders(response) || typeof response.text !== "function") {
+    return localFailure("PRODUCTION_EDGE_HEALTH_INVALID");
+  }
+  let body;
+  try {
+    const text = await response.text();
+    if (Buffer.byteLength(text, "utf8") > 64 * 1024) {
+      return localFailure("PRODUCTION_EDGE_HEALTH_INVALID");
+    }
+    body = JSON.parse(text);
+  } catch {
+    return localFailure("PRODUCTION_EDGE_HEALTH_INVALID");
+  }
+  if (!healthyProductionHealth(body)) return localFailure("PRODUCTION_EDGE_HEALTH_UNHEALTHY");
+  const barrier = body.mode === PRODUCTION_EDGE_BARRIER_HEALTH_MODE
+    && body.maintenance?.state === "fenced"
+    && body.maintenance?.storageQualified === false;
+  if (mode === "fenced" ? !barrier : body.mode === PRODUCTION_EDGE_BARRIER_HEALTH_MODE) {
+    return localFailure("PRODUCTION_EDGE_HEALTH_MODE_MISMATCH");
+  }
+  if (body.deployment?.sourceCommit !== expectedSourceCommit) {
+    return localFailure("PRODUCTION_EDGE_HEALTH_SOURCE_MISMATCH");
+  }
+  return { ok: true, code: null, sourceCommit: expectedSourceCommit };
+}
+
+async function fetchEdgeSurface(fetchImpl, url, init) {
+  try {
+    return await fetchImpl(url, { credentials: "omit", ...init });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The public surface of a fenced edge: the mode-independent expectations from
+ * check-deployment-endpoints.mjs (www 308 to the apex root, the retained
+ * release manifest 200), the public root without dashboard markers, and every
+ * PRODUCTION_PUBLIC_SURFACE_FORBIDDEN_PATHS entry as the fenced table says:
+ * 503 MUTATION_BARRIER_ACTIVE with no-store and retry-after 300 for the admin
+ * surface and API paths (a 404 there fails), 404 for the dashboard assets.
+ */
+export async function recheckFencedPublicSurface({
+  fetchImpl = globalThis.fetch,
+  timeoutMs = 10_000,
+} = {}) {
+  let expectations;
+  try {
+    expectations = validateEdgeModePublicSurface();
+  } catch {
+    return localFailure("PRODUCTION_PUBLIC_SURFACE_EXPECTATIONS_INVALID");
+  }
+  const signal = () => AbortSignal.timeout(timeoutMs);
+  const [www, manifest] = expectations.modeIndependent;
+  const wwwResponse = await fetchEdgeSurface(fetchImpl, www.url, {
+    method: "GET",
+    headers: { accept: "text/html" },
+    redirect: "manual",
+    signal: signal(),
+  });
+  if (wwwResponse === null) return localFailure("PRODUCTION_PUBLIC_SURFACE_RECHECK_UNREACHABLE");
+  if (wwwResponse.url !== www.url || wwwResponse.status !== www.status
+      || wwwResponse.headers?.get("location") !== www.location) {
+    return localFailure("PRODUCTION_PUBLIC_SURFACE_WWW_REDIRECT_INVALID");
+  }
+  const manifestResponse = await fetchEdgeSurface(fetchImpl, manifest.url, {
+    method: "GET",
+    headers: { accept: "application/json" },
+    redirect: "error",
+    signal: signal(),
+  });
+  if (manifestResponse === null) return localFailure("PRODUCTION_PUBLIC_SURFACE_RECHECK_UNREACHABLE");
+  if (manifestResponse.url !== manifest.url || manifestResponse.status !== manifest.status
+      || manifestResponse.headers?.get("content-type")?.split(";", 1)[0] !== manifest.contentType) {
+    return localFailure("PRODUCTION_PUBLIC_SURFACE_RELEASE_MANIFEST_INVALID");
+  }
+  const rootURL = new URL("/", DEPLOYMENT_ENDPOINTS.public.origin).href;
+  const rootResponse = await fetchEdgeSurface(fetchImpl, rootURL, {
+    method: "GET",
+    headers: { accept: "text/html" },
+    redirect: "error",
+    signal: signal(),
+  });
+  if (rootResponse === null) return localFailure("PRODUCTION_PUBLIC_SURFACE_RECHECK_UNREACHABLE");
+  let rootBody = null;
+  if (rootResponse.url === rootURL && rootResponse.status === 200
+      && rootResponse.headers?.get("content-type")?.split(";", 1)[0] === "text/html"
+      && typeof rootResponse.text === "function") {
+    try {
+      rootBody = await rootResponse.text();
+    } catch {
+      rootBody = null;
+    }
+  }
+  if (typeof rootBody !== "string" || Buffer.byteLength(rootBody, "utf8") > 1024 * 1024) {
+    return localFailure("PRODUCTION_PUBLIC_SURFACE_RECHECK_INVALID");
+  }
+  if (PRODUCTION_PUBLIC_ROOT_FORBIDDEN_MARKERS.some((marker) => rootBody.includes(marker))) {
+    return localFailure("PRODUCTION_PUBLIC_SURFACE_PRIVATE_ROOT_EXPOSED");
+  }
+  for (const path of PRODUCTION_PUBLIC_SURFACE_FORBIDDEN_PATHS) {
+    const expected = expectations.forbiddenPaths[edgeModeForbiddenPathClass(path)].fenced;
+    const url = new URL(path, DEPLOYMENT_ENDPOINTS.public.origin).href;
+    const response = await fetchEdgeSurface(fetchImpl, url, {
+      method: "GET",
+      redirect: "error",
+      signal: signal(),
+    });
+    if (response === null) return localFailure("PRODUCTION_PUBLIC_SURFACE_RECHECK_UNREACHABLE");
+    if (expected.status === 404) {
+      if (response.url !== url || response.status !== 404) {
+        return localFailure("PRODUCTION_PUBLIC_SURFACE_PRIVATE_ASSET_EXPOSED");
+      }
+      continue;
+    }
+    let code = null;
+    if (response.url === url && response.status === expected.status
+        && response.headers?.get("content-type")?.split(";", 1)[0] === expected.contentType
+        && response.headers.get("cache-control") === expected.cacheControl
+        && response.headers.get("retry-after") === expected.retryAfter
+        && typeof response.text === "function") {
+      try {
+        const text = await response.text();
+        code = Buffer.byteLength(text, "utf8") <= 64 * 1024 ? JSON.parse(text)?.error?.code : null;
+      } catch {
+        code = null;
+      }
+    }
+    if (code !== expected.errorCode) return localFailure("PRODUCTION_PUBLIC_SURFACE_FENCE_INVALID");
+  }
+  return { ok: true, code: null };
+}
+
 async function runProductionDeploymentFromSnapshot({
   confirmedMigrations = null,
   wrangler,
@@ -1369,6 +1691,7 @@ async function runProductionDeploymentFromSnapshot({
   beforeMutation = async () => { throw operationError("PRODUCTION_COORDINATION_REQUIRED"); },
   finalMutationRecheck = null,
   mutationIntent = async () => { throw operationError("PRODUCTION_COORDINATION_REQUIRED"); },
+  edgeDeployment = null,
 }) {
   // The dependency tree the deploy executes from is not under Git provenance, so
   // it is bound by digest instead: reverify it against the snapshot digest
@@ -1445,6 +1768,33 @@ async function runProductionDeploymentFromSnapshot({
         + "This deploy does NOT apply them; run the reviewed migration "
         + "procedure for the exact set above.\n",
     );
+  }
+  // A gcp edge binds only the release guard D1. Its nonce schema must already
+  // be applied: the edge deploy never applies a migration.
+  let releaseGuardPendingMigrations = null;
+  if (edgeDeployment?.mode === "gcp") {
+    const guard = await edgeDeployment.determinePendingD1Migrations({
+      wrangler,
+      workerDirectory,
+      configPath: typedConfigPath,
+      environment: "production",
+      databases: [edgeDeployment.releaseGuardDatabase],
+      spawn,
+    });
+    if (!guard?.ok) {
+      return guard?.code ? guard : migrationStateUnknown({ stage: "release-guard-gate-result" });
+    }
+    if (!Array.isArray(guard.pending)) {
+      return migrationStateUnknown({ stage: "release-guard-gate-pending-list" });
+    }
+    if (guard.pending.length > 0) {
+      return {
+        ok: false,
+        code: "EDGE_MODE_RELEASE_GUARD_MIGRATIONS_PENDING",
+        releaseGuardPendingMigrations: guard.pending,
+      };
+    }
+    releaseGuardPendingMigrations = [];
   }
 
   let preflight;
@@ -1655,23 +2005,47 @@ async function runProductionDeploymentFromSnapshot({
       );
     }
   }
-  let postDeployHealth;
-  try {
-    postDeployHealth = await healthRecheck({
-      fetchImpl,
-      timeoutMs: PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS,
-    });
-  } catch {
-    return localFailure("PRODUCTION_POST_DEPLOY_HEALTH_RECHECK_UNREACHABLE");
+  if (edgeDeployment?.identity === "binding") {
+    // Edge identity (E10): the active version's binding was verified above;
+    // public health must be the barrier's for this source (fenced), the
+    // Worker's for this source (worker), or the verified origin commit's (gcp).
+    let edgeHealth;
+    try {
+      edgeHealth = await edgeDeployment.healthRecheck({
+        fetchImpl,
+        timeoutMs: PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS,
+        mode: edgeDeployment.mode,
+        expectedSourceCommit: edgeDeployment.mode === "gcp" ? edgeDeployment.originCommit : sourceCommit,
+      });
+    } catch {
+      return localFailure("PRODUCTION_POST_DEPLOY_EDGE_HEALTH_UNREACHABLE");
+    }
+    if (edgeHealth?.ok !== true) {
+      const reason = typeof edgeHealth?.code === "string"
+        && edgeHealth.code.startsWith("PRODUCTION_EDGE_HEALTH_")
+        ? edgeHealth.code.slice("PRODUCTION_EDGE_HEALTH_".length)
+        : "AMBIGUOUS";
+      return localFailure(`PRODUCTION_POST_DEPLOY_EDGE_HEALTH_${reason}`);
+    }
+  } else {
+    let postDeployHealth;
+    try {
+      postDeployHealth = await healthRecheck({
+        fetchImpl,
+        timeoutMs: PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS,
+      });
+    } catch {
+      return localFailure("PRODUCTION_POST_DEPLOY_HEALTH_RECHECK_UNREACHABLE");
+    }
+    if (postDeployHealth?.ok !== true) {
+      const reason = typeof postDeployHealth?.code === "string"
+        && postDeployHealth.code.startsWith("PRODUCTION_HEALTH_RECHECK_")
+        ? postDeployHealth.code.slice("PRODUCTION_HEALTH_RECHECK_".length)
+        : "AMBIGUOUS";
+      return localFailure(`PRODUCTION_POST_DEPLOY_HEALTH_RECHECK_${reason}`);
+    }
+    if (postDeployHealth.sourceCommit !== sourceCommit) return localFailure("PRODUCTION_POST_DEPLOY_SOURCE_MISMATCH");
   }
-  if (postDeployHealth?.ok !== true) {
-    const reason = typeof postDeployHealth?.code === "string"
-      && postDeployHealth.code.startsWith("PRODUCTION_HEALTH_RECHECK_")
-      ? postDeployHealth.code.slice("PRODUCTION_HEALTH_RECHECK_".length)
-      : "AMBIGUOUS";
-    return localFailure(`PRODUCTION_POST_DEPLOY_HEALTH_RECHECK_${reason}`);
-  }
-  if (postDeployHealth.sourceCommit !== sourceCommit) return localFailure("PRODUCTION_POST_DEPLOY_SOURCE_MISMATCH");
   let postDeployPublicSurface;
   try {
     postDeployPublicSurface = await publicSurfaceRecheck({
@@ -1708,6 +2082,9 @@ async function runProductionDeploymentFromSnapshot({
     immediateHealthRecheck: "healthy",
     postDeployHealthRecheck: "healthy",
     postDeployPublicSurfaceRecheck: "public-only",
+    ...(edgeDeployment
+      ? { edge: { ...edgeDeployment.receipt, releaseGuardPendingMigrations } }
+      : {}),
   };
 }
 
@@ -1742,6 +2119,7 @@ async function runUncoordinatedProductionDeployment({
   beforeMutation,
   finalMutationRecheck,
   mutationIntent,
+  edgeDeployment = null,
 }) {
   if (confirmation !== PRODUCTION_DEPLOY_CONFIRMATION) {
     return localFailure("CONFIRMATION_REQUIRED");
@@ -1838,6 +2216,23 @@ async function runUncoordinatedProductionDeployment({
       return typedFailure("PRODUCTION_TYPED_OPERATION_PIN_MISMATCH");
     }
     preparedTypedDeployment = prepared;
+    if (edgeDeployment) {
+      const bound = await (await loadProductionEdgeMode()).bindEdgeModePreparation({
+        edge: edgeDeployment,
+        prepared,
+        siteDirectory: join(snapshot.repositoryRoot, ".release-build", "public-release-site"),
+        candidateSite: candidatePublicManifestSha256 !== null,
+      });
+      if (!bound.ok) {
+        try {
+          await snapshot.cleanup();
+        } catch {
+          return { ok: false, code: bound.code, cleanup: "PRODUCTION_SOURCE_SNAPSHOT_CLEANUP_FAILED" };
+        }
+        return { ok: false, code: bound.code };
+      }
+      preparedTypedDeployment = bound.prepared;
+    }
   }
 
   let result;
@@ -1877,6 +2272,7 @@ async function runUncoordinatedProductionDeployment({
       beforeMutation,
       finalMutationRecheck,
       mutationIntent,
+      edgeDeployment,
     });
   } catch (error) {
     result = localFailure(/^PRODUCTION_[A-Z_]+$/.test(error?.code ?? "") ? error.code : "PRODUCTION_DEPLOYMENT_FAILED");
@@ -1891,6 +2287,83 @@ async function runUncoordinatedProductionDeployment({
 }
 
 const EXACT_COMMIT = /^[a-f0-9]{40}$/;
+
+const PRODUCTION_EDGE_TOOL_NAMES = Object.freeze([
+  "determinePendingD1Migrations",
+  "fencedSurfaceRecheck",
+  "healthRecheck",
+  "isAncestor",
+  "readBlob",
+  "verifyOrigin",
+]);
+
+/**
+ * Resolve an --edge-mode deploy before its journal opens: production-edge-
+ * mode.mjs runs the pre-upload gates, and this binds the typed path to the
+ * edge config tools and the edge rechecks. `edgeTools` only replaces local
+ * readers and rechecks (tests); it never relaxes a gate.
+ */
+async function prepareProductionEdgeDeployment({
+  options,
+  workerDirectory,
+  sourceCommit,
+  expectedPreviousSourceCommit,
+  fetchImpl,
+}) {
+  const tools = options.edgeTools ?? {};
+  if (tools === null || typeof tools !== "object" || Array.isArray(tools)
+      || Object.keys(tools).some((name) => !PRODUCTION_EDGE_TOOL_NAMES.includes(name)
+        || typeof tools[name] !== "function")) {
+    return localFailure("EDGE_MODE_INPUT_INVALID");
+  }
+  const edgeMode = await loadProductionEdgeMode();
+  const typedProduction = options.typedProduction;
+  const prepared = await edgeMode.prepareEdgeModeDeployment({
+    edgeMode: options.edgeMode,
+    edgePlan: options.edgePlan,
+    originCommit: options.originCommit,
+    inventory: typedProduction.inventory,
+    baseConfigTools: typedProduction.configTools ?? defaultTypedConfigTools,
+    inspectTyped: typedProduction.inspectTyped ?? runTypedProductionPreflight,
+    workerDirectory,
+    sourceCommit,
+    expectedPreviousSourceCommit,
+    candidatePublicManifestSha256: options.candidatePublicManifestSha256 ?? null,
+    edgeHistory: options.edgeHistory,
+    obtainOriginIdentityToken: options.obtainOriginIdentityToken,
+    fetchImpl,
+    ...Object.fromEntries(["readBlob", "isAncestor", "verifyOrigin"]
+      .filter((name) => tools[name] !== undefined)
+      .map((name) => [name, tools[name]])),
+  });
+  if (!prepared.ok) return prepared;
+  return {
+    ...prepared,
+    typedProduction: {
+      ...typedProduction,
+      configTools: prepared.configTools,
+      inspectTyped: prepared.inspectTyped,
+    },
+    healthRecheck: tools.healthRecheck ?? recheckProductionEdgeHealth,
+    fencedSurfaceRecheck: tools.fencedSurfaceRecheck ?? recheckFencedPublicSurface,
+    determinePendingD1Migrations: tools.determinePendingD1Migrations ?? determinePendingD1Migrations,
+    releaseGuardDatabase: edgeMode.EDGE_MODE_RELEASE_GUARD_DATABASE,
+  };
+}
+
+/**
+ * The edge binding identity's final predecessor check: re-capture the live
+ * version and require the pinned baseline (DEPLOYMENT_SOURCE_COMMIT, version
+ * and configuration fingerprint) after the typed provider reads.
+ */
+async function assertEdgePredecessorBinding({ edgeDeployment, expectedPreviousSourceCommit }) {
+  const { provider, configTools } = edgeDeployment.typedProduction;
+  const snapshot = configTools.createSnapshot(await provider.capture());
+  if (!typedSnapshotMatches(edgeDeployment.baseline, snapshot)
+      || snapshot.sourceCommit !== expectedPreviousSourceCommit) {
+    throw operationError("PRODUCTION_PREVIOUS_SOURCE_MISMATCH");
+  }
+}
 
 export async function runProductionDeployment(options) {
   const { confirmation, workerDirectory, expectedPreviousSourceCommit,
@@ -1946,6 +2419,23 @@ export async function runProductionDeployment(options) {
       return typedFailure("PRODUCTION_TYPED_INPUT_INVALID");
     }
   }
+  let edgeDeployment = null;
+  if (options.edgeMode !== undefined
+      || PRODUCTION_EDGE_OPTION_NAMES.some((name) => options[name] !== undefined)) {
+    if (options.edgeMode === undefined) return localFailure("EDGE_MODE_INPUT_INVALID");
+    if (!options.typedProduction) return localFailure("EDGE_MODE_REQUIRES_TYPED");
+    // Every edge gate that needs no source snapshot runs here, before the
+    // operation journal or the coordination lock exists.
+    edgeDeployment = await prepareProductionEdgeDeployment({
+      options,
+      workerDirectory,
+      sourceCommit: source.sourceCommit,
+      expectedPreviousSourceCommit,
+      fetchImpl,
+    });
+    if (!edgeDeployment.ok) return localFailure(edgeDeployment.code);
+    typedOperationPin = { ...typedOperationPin, edge: edgeDeployment.pin };
+  }
   const repositoryRoot = resolve(workerDirectory, "../..");
   const directory = operationDirectory ?? join(repositoryRoot, ".release-build", "production-operations", source.sourceCommit);
   let operation;
@@ -1971,19 +2461,38 @@ export async function runProductionDeployment(options) {
     await operation.save(state);
     result = await runUncoordinatedProductionDeployment({ ...options,
       typedOperationPin,
+      ...(edgeDeployment
+        ? {
+          typedProduction: edgeDeployment.typedProduction,
+          edgeDeployment,
+          ...(edgeDeployment.mode === "fenced"
+            ? { publicSurfaceRecheck: edgeDeployment.fencedSurfaceRecheck }
+            : {}),
+        }
+        : {}),
       beforeMutation: async () => {
         state.stage = "acquiring_lock"; state.lock = "uncertain"; await operation.save(state);
         lock.acquire(owner); acquired = true;
         state.lock = "held"; state.stage = "predecessor_check"; await operation.save(state);
-        const health = await healthRecheck({ fetchImpl, timeoutMs: PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS });
-        if (!health?.ok || health.sourceCommit !== expectedPreviousSourceCommit) throw operationError("PRODUCTION_PREVIOUS_SOURCE_MISMATCH");
+        // Under an edge binding identity the typed pre-deploy revalidation,
+        // which runs next under this lock, is the predecessor check: it
+        // re-captures the live version and requires the pinned
+        // DEPLOYMENT_SOURCE_COMMIT and configuration.
+        if (edgeDeployment?.identity !== "binding") {
+          const health = await healthRecheck({ fetchImpl, timeoutMs: PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS });
+          if (!health?.ok || health.sourceCommit !== expectedPreviousSourceCommit) throw operationError("PRODUCTION_PREVIOUS_SOURCE_MISMATCH");
+        }
         lock.assertOwned(owner);
       },
       finalMutationRecheck: async () => {
         lock.assertOwned(owner);
-        const health = await healthRecheck({ fetchImpl, timeoutMs: PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS });
-        if (!health?.ok || health.sourceCommit !== expectedPreviousSourceCommit) {
-          throw operationError("PRODUCTION_PREVIOUS_SOURCE_MISMATCH");
+        if (edgeDeployment?.identity === "binding") {
+          await assertEdgePredecessorBinding({ edgeDeployment, expectedPreviousSourceCommit });
+        } else {
+          const health = await healthRecheck({ fetchImpl, timeoutMs: PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS });
+          if (!health?.ok || health.sourceCommit !== expectedPreviousSourceCommit) {
+            throw operationError("PRODUCTION_PREVIOUS_SOURCE_MISMATCH");
+          }
         }
         lock.assertOwned(owner);
       },
@@ -2056,13 +2565,281 @@ export async function reconcileProductionDeployment({ operationDirectory, worker
   finally { operation?.close(); }
 }
 
+/**
+ * Resolve a typed deploy whose provider mutation completed but whose final
+ * verification was interrupted or observed a stale public health response.
+ * This never deploys: it rebinds the journal and its exact remote owner, then
+ * repeats the pinned configuration, three-role schema, manifest, and public
+ * checks before releasing the lock.
+ */
+export async function reconcileTypedProductionDeployment({
+  operationDirectory,
+  workerDirectory,
+  confirmation,
+  executorStopped = false,
+  typedProduction,
+  coordinationFactory = createProductionDeploymentLock,
+  buildSchemas = buildTypedProductionExpectedSchemas,
+  inspectTyped = runTypedProductionPreflight,
+  configTools = defaultTypedConfigTools,
+  healthRecheck = recheckProductionHealth,
+  publicSurfaceRecheck = recheckProductionPublicSurface,
+  publicReleaseManifestRecheck = recheckProductionPublicReleaseManifest,
+  fetchImpl = globalThis.fetch,
+  edgePlan = undefined,
+  edgeTools = {},
+} = {}) {
+  if (confirmation !== "RECONCILE_TYPED_PRODUCTION_DEPLOYMENT"
+      || executorStopped !== true) {
+    return localFailure("RECONCILIATION_CONFIRMATION_REQUIRED");
+  }
+  if (!typedProduction?.inventory
+      || typeof typedProduction.provider?.capture !== "function"
+      || typeof typedProduction.provider?.query !== "function"
+      || typeof buildSchemas !== "function"
+      || typeof inspectTyped !== "function"
+      || typeof configTools?.createSnapshot !== "function"
+      || typeof configTools?.render !== "function"
+      || typeof configTools?.verify !== "function") {
+    return typedFailure("PRODUCTION_TYPED_INPUT_INVALID");
+  }
+  let operation;
+  try {
+    const prior = await readOperation(operationDirectory);
+    const { state } = prior;
+    const pin = state.typed;
+    if (prior.kind !== "production"
+        || !EXACT_COMMIT.test(state.owner ?? "")
+        || !EXACT_COMMIT.test(state.sourceCommit ?? "")
+        || !EXACT_COMMIT.test(state.previousSourceCommit ?? "")
+        || state.confirmedMigrations !== null
+        || state.lock !== "held"
+        || !["deployed_unverified", "outcome_unknown", "verified"].includes(state.outcome)
+        || pin?.schema !== "production-typed-operation-v1"
+        || !PRODUCTION_SHA256_PATTERN.test(pin.liveConfigurationFingerprint ?? "")
+        || pin.predecessorSourceCommit !== state.previousSourceCommit
+        || !EXACT_COMMIT.test(pin.retainedPublicSourceCommit ?? "")
+        || !PRODUCTION_SHA256_PATTERN.test(pin.expectedLiveManifestSha256 ?? "")
+        || (pin.candidatePublicManifestSha256 !== undefined
+          && !PRODUCTION_SHA256_PATTERN.test(pin.candidatePublicManifestSha256))) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_INVALID");
+    }
+    // An edge-mode operation re-binds its pinned mode and plan, and repeats
+    // the local contract rule, before the journal or the lock is touched.
+    let edgeMode = null;
+    let edge = null;
+    if (pin.edge !== undefined || edgePlan !== undefined) {
+      if (edgeTools === null || typeof edgeTools !== "object" || Array.isArray(edgeTools)
+          || Object.keys(edgeTools).some((name) => !["fencedSurfaceRecheck", "healthRecheck", "readBlob"].includes(name)
+            || typeof edgeTools[name] !== "function")) {
+        throw operationError("EDGE_MODE_INPUT_INVALID");
+      }
+      edgeMode = await loadProductionEdgeMode();
+      edge = edgeMode.resolvePinnedEdgeMode({ pin, edgePlan });
+      edgeMode.assertPinnedEdgeContract({
+        edge,
+        sourceCommit: state.sourceCommit,
+        readBlob: edgeTools.readBlob ?? edgeMode.defaultEdgeModeBlobReader(workerDirectory),
+      });
+    }
+    operation = await openOperation({
+      directory: operationDirectory,
+      kind: "production",
+      binding: {
+        sourceCommit: state.sourceCommit,
+        previousSourceCommit: state.previousSourceCommit,
+        confirmedMigrations: null,
+        typed: pin,
+      },
+      resume: true,
+    });
+    if (operation.record.updatedAt !== prior.updatedAt) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_INVALID");
+    }
+    const lock = coordinationFactory({ repositoryRoot: resolve(workerDirectory, "../..") });
+    lock.assertOwned(state.owner);
+    const starting = configTools.createSnapshot(typedProduction.inventory);
+    const currentInventory = await typedProduction.provider.capture();
+    const current = configTools.createSnapshot(currentInventory);
+    if (!typedSnapshotMatches(starting, current)
+        || current.sourceCommit !== state.sourceCommit
+        || current.fingerprint !== (edge?.expectedLiveConfigurationFingerprint ?? pin.liveConfigurationFingerprint)) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_LIVE_MISMATCH");
+    }
+    const expected = await buildSchemas({ workerDirectory });
+    const expectedIdentity = typedSchemaIdentity(expected);
+    if (!expectedIdentity
+        || JSON.stringify(expectedIdentity) !== JSON.stringify(pin.expectedSchemaIdentity)) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_SCHEMA_MISMATCH");
+    }
+    const parseErrors = [];
+    const trackedConfig = parse(
+      await readFile(join(workerDirectory, "wrangler.jsonc"), "utf8"),
+      parseErrors,
+    );
+    if (parseErrors.length || !trackedConfig || typeof trackedConfig !== "object") {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_CONFIG_MISMATCH");
+    }
+    const renderTools = edge
+      ? edgeMode.createEdgeModeConfigTools({ mode: edge.mode, plan: edge.plan, trackedConfig, base: configTools })
+      : configTools;
+    const candidateConfig = renderTools.render({
+      trackedConfig,
+      snapshot: current,
+      sourceCommit: state.sourceCommit,
+    });
+    if (!renderTools.verify({
+      snapshot: current,
+      candidateConfig,
+      sourceCommit: state.sourceCommit,
+    })?.ok) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_CONFIG_MISMATCH");
+    }
+    const vars = typedConfigEnvironment(candidateConfig)?.vars;
+    const inspect = edge
+      ? edgeMode.edgeModeTypedInspector({ mode: edge.mode, inspectTyped })
+      : inspectTyped;
+    const typed = await inspect({
+      roles: typedRoles(),
+      expectedSchemas: expected.expectedSchemas,
+      config: {
+        mode: vars?.TELEMETRY_STORAGE_MODE,
+        sourceNamespace: vars?.TELEMETRY_STORAGE_NAMESPACE,
+      },
+      runQuery: (binding, sql) => typedProduction.provider.query(currentInventory, binding, sql),
+    });
+    if (!typed?.ok) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_PREFLIGHT_BLOCKED");
+    }
+    const afterSchema = configTools.createSnapshot(await typedProduction.provider.capture());
+    if (!typedSnapshotMatches(current, afterSchema)) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_LIVE_MISMATCH");
+    }
+    if (edge && !edgeMode.verifyEdgeModeDeployedSnapshot({
+      snapshot: current,
+      mode: edge.mode,
+      sourceCommit: state.sourceCommit,
+    })?.ok) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_EDGE_MODE_UNVERIFIED");
+    }
+    const manifest = await publicReleaseManifestRecheck({
+      fetchImpl,
+      expectedSha256: pin.candidatePublicManifestSha256 ?? pin.expectedLiveManifestSha256,
+      timeoutMs: PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS,
+    });
+    if (!manifest?.ok) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_PUBLIC_MISMATCH");
+    }
+    let healthVerified;
+    if (edge?.identity === "binding") {
+      // The deploy's edge identity: barrier health for the source (fenced),
+      // Worker health for the source (worker), or the pinned origin commit (gcp).
+      const edgeHealth = await (edgeTools.healthRecheck ?? recheckProductionEdgeHealth)({
+        fetchImpl,
+        timeoutMs: PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS,
+        mode: edge.mode,
+        expectedSourceCommit: edge.mode === "gcp" ? edge.originCommit : state.sourceCommit,
+      });
+      healthVerified = edgeHealth?.ok === true;
+    } else {
+      const health = await healthRecheck({
+        fetchImpl,
+        timeoutMs: PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS,
+      });
+      healthVerified = health?.ok === true && health.sourceCommit === state.sourceCommit;
+    }
+    const surfaceRecheck = edge?.mode === "fenced"
+      ? edgeTools.fencedSurfaceRecheck ?? recheckFencedPublicSurface
+      : publicSurfaceRecheck;
+    const surface = await surfaceRecheck({
+      fetchImpl,
+      timeoutMs: PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS,
+    });
+    const finalSnapshot = configTools.createSnapshot(await typedProduction.provider.capture());
+    if (!healthVerified || !surface?.ok || !typedSnapshotMatches(current, finalSnapshot)) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_UNVERIFIED");
+    }
+    lock.assertOwned(state.owner);
+    state.outcome = "verified";
+    state.stage = "verified";
+    state.code = "PRODUCTION_DEPLOYED";
+    await operation.save(state);
+    lock.release(state.owner);
+    state.lock = "released";
+    await operation.save(state);
+    return {
+      ok: true,
+      code: "PRODUCTION_TYPED_RECONCILED",
+      outcome: "verified",
+      coordination: "released",
+    };
+  } catch (error) {
+    const code = /^(?:PRODUCTION|RELEASE_OPERATION|EDGE)_[A-Z_]+$/.test(error?.code ?? "")
+      ? error.code
+      : "PRODUCTION_TYPED_RECONCILIATION_FAILED";
+    return localFailure(code);
+  } finally {
+    operation?.close();
+  }
+}
+
+// --edge-mode arguments (E10). Each also accepts the --name=value form.
+const PRODUCTION_EDGE_ARGUMENTS = new Map([
+  ["--edge-mode", "edgeMode"],
+  ["--edge-plan", "edgePlanPath"],
+  ["--origin-commit", "originCommit"],
+  ["--origin-verifier-account", "originVerifierAccount"],
+  ["--fence-receipt", "fenceReceiptPath"],
+  ["--fence-receipt-sha256", "fenceReceiptSha256"],
+]);
+
+function splitProductionEdgeArgument(argument) {
+  const separator = typeof argument === "string" ? argument.indexOf("=") : -1;
+  return separator > 0 && PRODUCTION_EDGE_ARGUMENTS.has(argument.slice(0, separator))
+    ? [argument.slice(0, separator), argument.slice(separator + 1)]
+    : [argument];
+}
+
+/**
+ * The edge arguments are closed per confirmation: a typed reconcile takes only
+ * --edge-plan (its mode is pinned), the legacy reconcile none, and a deploy
+ * --edge-mode with exactly its mode's inputs: gcp the plan, the origin commit
+ * and the verifier account; worker optionally the EP-8 fence receipt that
+ * anchors the history check for fenced -> worker; fenced nothing else.
+ */
+function assertProductionEdgeArguments(result) {
+  const present = [...PRODUCTION_EDGE_ARGUMENTS.values()].filter((name) => name in result);
+  if (present.length === 0) return;
+  const invalid = () => { throw operationError("PRODUCTION_ARGUMENTS_INVALID"); };
+  if (result.confirmation === "RECONCILE_TYPED_PRODUCTION_DEPLOYMENT") {
+    if (present.some((name) => name !== "edgePlanPath")) invalid();
+    return;
+  }
+  if (result.confirmation !== PRODUCTION_DEPLOY_CONFIRMATION
+      || !["worker", "fenced", "gcp"].includes(result.edgeMode)) invalid();
+  const allowed = {
+    worker: ["edgeMode", "fenceReceiptPath", "fenceReceiptSha256"],
+    fenced: ["edgeMode"],
+    gcp: ["edgeMode", "edgePlanPath", "originCommit", "originVerifierAccount"],
+  }[result.edgeMode];
+  if (present.some((name) => !allowed.includes(name))
+      || Boolean(result.fenceReceiptPath) !== Boolean(result.fenceReceiptSha256)
+      || (result.fenceReceiptSha256 !== undefined && !PRODUCTION_SHA256_PATTERN.test(result.fenceReceiptSha256))
+      || (result.edgeMode === "gcp" && (!result.edgePlanPath || !result.originVerifierAccount
+        || !PRODUCTION_SOURCE_COMMIT_PATTERN.test(result.originCommit ?? "")))) {
+    invalid();
+  }
+}
+
 export function parseProductionDeploymentArgs(argv) {
+  argv = argv.flatMap(splitProductionEdgeArgument);
   const names = new Map([["--confirm", "confirmation"], ["--confirm-migrations", "confirmedMigrations"],
     ["--expected-previous-source", "expectedPreviousSourceCommit"], ["--operation", "operationDirectory"],
     ["--inventory", "inventoryPath"], ["--inventory-sha256", "inventorySha256"],
     ["--retained-public-source", "retainedPublicSourceCommit"],
     ["--retained-public-source-commit", "retainedPublicSourceCommit"],
-    ["--expected-live-manifest-sha256", "expectedLiveManifestSha256"]]);
+    ["--expected-live-manifest-sha256", "expectedLiveManifestSha256"],
+    ...PRODUCTION_EDGE_ARGUMENTS]);
   const result = {};
   for (let i = 0; i < argv.length; i += 1) {
     if (argv[i] === "--executor-stopped" && !result.executorStopped) { result.executorStopped = true; continue; }
@@ -2070,7 +2847,15 @@ export function parseProductionDeploymentArgs(argv) {
     if (!name || name in result || !value || value.startsWith("--") || value.includes("\0")) throw operationError("PRODUCTION_ARGUMENTS_INVALID");
     result[name] = value;
   }
-  if (result.confirmation === "RECONCILE_PRODUCTION_DEPLOYMENT") {
+  if (result.confirmation === "RECONCILE_TYPED_PRODUCTION_DEPLOYMENT") {
+    if (!result.operationDirectory || !result.executorStopped
+        || !result.inventoryPath || !result.inventorySha256
+        || !PRODUCTION_SHA256_PATTERN.test(result.inventorySha256)
+        || result.confirmedMigrations || result.expectedPreviousSourceCommit
+        || result.retainedPublicSourceCommit || result.expectedLiveManifestSha256) {
+      throw operationError("PRODUCTION_ARGUMENTS_INVALID");
+    }
+  } else if (result.confirmation === "RECONCILE_PRODUCTION_DEPLOYMENT") {
     if (!result.operationDirectory || !result.executorStopped || result.confirmedMigrations || result.expectedPreviousSourceCommit
         || result.inventoryPath || result.inventorySha256 || result.retainedPublicSourceCommit || result.expectedLiveManifestSha256) {
       throw operationError("PRODUCTION_ARGUMENTS_INVALID");
@@ -2086,7 +2871,43 @@ export function parseProductionDeploymentArgs(argv) {
       || (result.retainedPublicSourceCommit !== undefined && !PRODUCTION_SOURCE_COMMIT_PATTERN.test(result.retainedPublicSourceCommit))) {
     throw operationError("PRODUCTION_ARGUMENTS_INVALID");
   }
+  assertProductionEdgeArguments(result);
   return result;
+}
+
+/**
+ * Turn the CLI's edge arguments into runProductionDeployment and
+ * reconcileTypedProductionDeployment inputs: the owner-private plan, the
+ * in-memory gcloud verifier token source and the fence-anchored deployment
+ * history reader. File paths and the verifier account never reach the run.
+ */
+async function productionEdgeRunOptions(runOptions) {
+  const {
+    edgePlanPath,
+    originVerifierAccount,
+    fenceReceiptPath,
+    fenceReceiptSha256,
+    ...rest
+  } = runOptions;
+  if (edgePlanPath === undefined && rest.edgeMode === undefined) return runOptions;
+  const edgeMode = await loadProductionEdgeMode();
+  if (edgePlanPath !== undefined) rest.edgePlan = await edgeMode.readEdgeModePlan(edgePlanPath);
+  if (originVerifierAccount !== undefined) {
+    const { plan } = edgeMode.resolveEdgeModeRequest({ edgeMode: rest.edgeMode, edgePlan: rest.edgePlan });
+    rest.obtainOriginIdentityToken = edgeMode.createGcloudIdentityTokenSource({
+      verifierAccount: originVerifierAccount,
+      audience: plan.originAudience,
+    });
+  }
+  if (fenceReceiptPath !== undefined) {
+    rest.edgeHistory = edgeMode.createFenceHistorySource({
+      receiptPath: fenceReceiptPath,
+      receiptSha256: fenceReceiptSha256,
+      accountId: rest.typedProduction?.inventory?.accountId,
+      workerName: rest.typedProduction?.inventory?.workerName,
+    });
+  }
+  return rest;
 }
 
 async function main() {
@@ -2099,7 +2920,11 @@ async function main() {
         + "[--inventory PRIVATE_JSON --inventory-sha256 SHA256 "
         + "--retained-public-source FULL_SHA --expected-live-manifest-sha256 SHA256] "
         + "[--confirm-migrations BINDING:0000_name.sql,...]\n"
-        + "Reconcile only: --confirm RECONCILE_PRODUCTION_DEPLOYMENT --operation PRIVATE_DIRECTORY --executor-stopped\n",
+        + "Reconcile only: --confirm RECONCILE_PRODUCTION_DEPLOYMENT --operation PRIVATE_DIRECTORY --executor-stopped\n"
+        + "Typed recovery: --confirm RECONCILE_TYPED_PRODUCTION_DEPLOYMENT --operation PRIVATE_DIRECTORY --executor-stopped --inventory PRIVATE_JSON --inventory-sha256 SHA256\n"
+        + "Edge modes (typed only): --edge-mode worker [--fence-receipt PRIVATE_JSON --fence-receipt-sha256 SHA256] | --edge-mode fenced "
+        + "| --edge-mode gcp --edge-plan PRIVATE_JSON --origin-commit FULL_SHA --origin-verifier-account EMAIL; "
+        + "typed recovery of a gcp operation adds --edge-plan PRIVATE_JSON\n",
     );
     process.exit(2);
   }
@@ -2112,7 +2937,11 @@ async function main() {
       ".bin",
       process.platform === "win32" ? "wrangler.cmd" : "wrangler",
     );
-    const run = options.confirmation === "RECONCILE_PRODUCTION_DEPLOYMENT" ? reconcileProductionDeployment : runProductionDeployment;
+    const run = options.confirmation === "RECONCILE_PRODUCTION_DEPLOYMENT"
+      ? reconcileProductionDeployment
+      : options.confirmation === "RECONCILE_TYPED_PRODUCTION_DEPLOYMENT"
+        ? reconcileTypedProductionDeployment
+        : runProductionDeployment;
     const runOptions = {
       ...options,
       wrangler,
@@ -2131,11 +2960,12 @@ async function main() {
         }),
       };
     }
-    result = await run(runOptions);
+    result = await run(await productionEdgeRunOptions(runOptions));
   } catch (error) {
     const code = typeof error?.code === "string"
       && (error.code.startsWith("PRODUCTION_RECONCILE_")
-        || error.code.startsWith("PRODUCTION_LIVE_"))
+        || error.code.startsWith("PRODUCTION_LIVE_")
+        || error.code.startsWith("EDGE_"))
       ? error.code
       : "PRODUCTION_DEPLOYMENT_FAILED";
     result = { ok: false, code };

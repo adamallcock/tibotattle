@@ -932,9 +932,25 @@ Reconciliation does not deploy. It verifies the intended source and public
 surface, then releases only the exact recorded owner. If verification is
 unavailable or the old executor might still run, retain the lock and investigate.
 This generic reconciliation command refuses operations carrying typed deployment
-pins. Preserve their journal and lock for a separately reviewed recovery that
-revalidates the pinned configuration, schemas and public manifest; legacy
-health checks alone cannot qualify them.
+pins. For a typed operation, first prove that the original executor has stopped
+and capture a fresh owner-private inventory of the active Worker version. Use
+the recorded operation directory and exact inventory hash:
+
+```bash
+npm run production:deploy -- --confirm RECONCILE_TYPED_PRODUCTION_DEPLOYMENT \
+  --operation <private-typed-operation-directory> --executor-stopped \
+  --inventory <fresh-private-inventory.json> \
+  --inventory-sha256 <fresh-inventory-sha256>
+```
+
+Typed reconciliation never invokes Wrangler. It binds the exact recorded owner,
+checks the active source and pinned live-configuration fingerprint, rebuilds the
+source-derived schema identity, reruns all three database-role preflights, and
+rechecks the pinned public manifest, health and public surface. It releases the
+lock only after every check passes and a final active-version read still matches.
+A refusal preserves the lock for investigation; do not retry the deploy or use
+raw Wrangler to work around it. The `--executor-stopped` flag is an operator
+assertion, not a way to interrupt a running deploy.
 A proven pre-mutation failure with no retained lock can be retried using a new
 `--operation <fresh-private-directory>`, preserving the old evidence. Cleanup
 warnings do not erase a verified deployment outcome. These are cooperative

@@ -35,11 +35,12 @@ import {
   revalidateTypedProductionDeployment,
   runProductionDeployment,
   reconcileProductionDeployment,
+  reconcileTypedProductionDeployment,
   parseProductionDeploymentArgs,
   recheckProductionHealth,
   recheckProductionPublicSurface,
 } from "./production-deploy.mjs";
-import { readOperation } from "../../../scripts/lib/release-operation.mjs";
+import { openOperation, readOperation } from "../../../scripts/lib/release-operation.mjs";
 import { stageProductionAssets } from "./stage-production-assets.mjs";
 import { EXPECTED_STAGING_MIGRATIONS } from "./staging-readiness-lib.mjs";
 import { workerDirectory as checkedInWorkerDirectory } from "./staging-test-fixtures.mjs";
@@ -538,11 +539,27 @@ test("deployment CLI separates exact predecessor deployment from stopped-executo
   assert.deepEqual(parseProductionDeploymentArgs(["--confirm", "RECONCILE_PRODUCTION_DEPLOYMENT", "--operation", "/private/operation", "--executor-stopped"]), {
     confirmation: "RECONCILE_PRODUCTION_DEPLOYMENT", operationDirectory: "/private/operation", executorStopped: true,
   });
+  assert.deepEqual(parseProductionDeploymentArgs([
+    "--confirm", "RECONCILE_TYPED_PRODUCTION_DEPLOYMENT",
+    "--operation", "/private/operation",
+    "--executor-stopped",
+    "--inventory", "/private/inventory.json",
+    "--inventory-sha256", "1".repeat(64),
+  ]), {
+    confirmation: "RECONCILE_TYPED_PRODUCTION_DEPLOYMENT",
+    operationDirectory: "/private/operation",
+    executorStopped: true,
+    inventoryPath: "/private/inventory.json",
+    inventorySha256: "1".repeat(64),
+  });
   for (const args of [[], ["--confirm", "DEPLOY_PRODUCTION"],
     ["--confirm", "DEPLOY_PRODUCTION", "--expected-previous-source", "abc1234"],
     ["--confirm", "DEPLOY_PRODUCTION", "--expected-previous-source", FIXTURE_PREVIOUS_COMMIT, "--executor-stopped"],
     ["--confirm", "RECONCILE_PRODUCTION_DEPLOYMENT", "--operation", "/private/operation"],
     ["--confirm", "RECONCILE_PRODUCTION_DEPLOYMENT", "--operation", "/private/operation", "--executor-stopped", "--confirm-migrations", "BINDING:0001_test.sql"],
+    ["--confirm", "RECONCILE_TYPED_PRODUCTION_DEPLOYMENT", "--operation", "/private/operation", "--executor-stopped"],
+    ["--confirm", "RECONCILE_TYPED_PRODUCTION_DEPLOYMENT", "--operation", "/private/operation", "--executor-stopped", "--inventory", "/private/inventory.json", "--inventory-sha256", "bad"],
+    ["--confirm", "RECONCILE_TYPED_PRODUCTION_DEPLOYMENT", "--operation", "/private/operation", "--executor-stopped", "--inventory", "/private/inventory.json", "--inventory-sha256", "1".repeat(64), "--confirm-migrations", "BINDING:0001_test.sql"],
     ["--confirm", "DEPLOY_PRODUCTION", "--confirm", "DEPLOY_PRODUCTION", "--expected-previous-source", FIXTURE_PREVIOUS_COMMIT]]) {
     assert.throws(() => parseProductionDeploymentArgs(args), { code: "PRODUCTION_ARGUMENTS_INVALID" });
   }
@@ -2231,6 +2248,132 @@ for (const mode of ["retained", "candidate", "bad-preimage", "bad-postimage", "m
     ok: false,
     code: "PRODUCTION_TYPED_RECONCILIATION_UNSUPPORTED",
   });
+});
+
+test("typed reconciliation rechecks journal pins and all live gates before releasing ownership", async () => {
+  const directory = operationDirectory();
+  const lock = coordinationFixture();
+  const schemaInput = {
+    analytics: "1".repeat(64),
+    ledger: "2".repeat(64),
+    primary: "3".repeat(64),
+  };
+  const schemaSha = {
+    analytics: "4".repeat(64),
+    ledger: "5".repeat(64),
+    primary: "6".repeat(64),
+  };
+  const expected = {
+    schema: "production-typed-schema-v1",
+    inputSha256: schemaInput,
+    expectedSchemas: Object.fromEntries(Object.entries(schemaSha).map(([role, sha]) => [role, { schemaSha256: sha }])),
+    operatorSchemaSourceSha256: "7".repeat(64),
+  };
+  const pin = {
+    schema: "production-typed-operation-v1",
+    liveConfigurationFingerprint: "8".repeat(64),
+    predecessorSourceCommit: FIXTURE_PREVIOUS_COMMIT,
+    retainedPublicSourceCommit: FIXTURE_PREVIOUS_COMMIT,
+    expectedLiveManifestSha256: "9".repeat(64),
+    expectedSchemaIdentity: {
+      schema: "production-typed-schema-v1",
+      inputSha256: schemaInput,
+      schemaSha256: schemaSha,
+      operatorSchemaSourceSha256: "7".repeat(64),
+    },
+  };
+  const binding = {
+    sourceCommit: FIXTURE_SOURCE_COMMIT,
+    previousSourceCommit: FIXTURE_PREVIOUS_COMMIT,
+    confirmedMigrations: null,
+    typed: pin,
+  };
+  const operation = await openOperation({ directory, kind: "production", binding });
+  await operation.save({
+    ...binding,
+    owner: FIXTURE_OWNER,
+    stage: "failed",
+    outcome: "deployed_unverified",
+    code: "PRODUCTION_POST_DEPLOY_SOURCE_MISMATCH",
+    lock: "held",
+  });
+  operation.close();
+  lock.acquire(FIXTURE_OWNER);
+  const live = {
+    sourceCommit: FIXTURE_SOURCE_COMMIT,
+    versionId: "22222222-2222-4222-8222-222222222222",
+    fingerprint: pin.liveConfigurationFingerprint,
+  };
+  let actual = live;
+  let manifestOk = true;
+  let preflightOk = true;
+  let healthSource = FIXTURE_SOURCE_COMMIT;
+  let schema = expected;
+  let captures = 0;
+  const reconcile = {
+    confirmation: "RECONCILE_TYPED_PRODUCTION_DEPLOYMENT",
+    executorStopped: true,
+    operationDirectory: directory,
+    workerDirectory: checkedInWorkerDirectory,
+    typedProduction: {
+      inventory: { snapshot: live },
+      provider: {
+        capture: async () => { captures += 1; return { snapshot: actual }; },
+        query: async () => ({ success: true, results: [] }),
+      },
+    },
+    coordinationFactory: () => lock,
+    buildSchemas: async () => schema,
+    inspectTyped: async () => ({ ok: preflightOk }),
+    configTools: {
+      createSnapshot: (value) => value.snapshot,
+      render: ({ sourceCommit }) => ({ env: { production: { vars: {
+        DEPLOYMENT_SOURCE_COMMIT: sourceCommit,
+        TELEMETRY_STORAGE_MODE: "typed",
+        TELEMETRY_STORAGE_NAMESPACE: "synthetic-namespace",
+      } } } }),
+      verify: () => ({ ok: true }),
+    },
+    healthRecheck: async () => ({ ok: true, sourceCommit: healthSource }),
+    publicSurfaceRecheck: async () => ({ ok: true }),
+    publicReleaseManifestRecheck: async ({ expectedSha256 }) => {
+      assert.equal(expectedSha256, pin.expectedLiveManifestSha256);
+      return { ok: manifestOk };
+    },
+  };
+  assert.equal((await reconcileTypedProductionDeployment({ ...reconcile, executorStopped: false })).code,
+    "RECONCILIATION_CONFIRMATION_REQUIRED");
+  assert.equal(captures, 0);
+  actual = { ...live, fingerprint: "0".repeat(64) };
+  assert.equal((await reconcileTypedProductionDeployment(reconcile)).code,
+    "PRODUCTION_TYPED_RECONCILIATION_LIVE_MISMATCH");
+  actual = live;
+  schema = { ...expected, operatorSchemaSourceSha256: "0".repeat(64) };
+  assert.equal((await reconcileTypedProductionDeployment(reconcile)).code,
+    "PRODUCTION_TYPED_RECONCILIATION_SCHEMA_MISMATCH");
+  schema = expected;
+  preflightOk = false;
+  assert.equal((await reconcileTypedProductionDeployment(reconcile)).code,
+    "PRODUCTION_TYPED_RECONCILIATION_PREFLIGHT_BLOCKED");
+  preflightOk = true;
+  manifestOk = false;
+  assert.equal((await reconcileTypedProductionDeployment(reconcile)).code,
+    "PRODUCTION_TYPED_RECONCILIATION_PUBLIC_MISMATCH");
+  manifestOk = true;
+  healthSource = FIXTURE_PREVIOUS_COMMIT;
+  assert.equal((await reconcileTypedProductionDeployment(reconcile)).code,
+    "PRODUCTION_TYPED_RECONCILIATION_UNVERIFIED");
+  healthSource = FIXTURE_SOURCE_COMMIT;
+  assert.deepEqual(lock.events, ["acquire"]);
+  assert.deepEqual(await reconcileTypedProductionDeployment(reconcile), {
+    ok: true,
+    code: "PRODUCTION_TYPED_RECONCILED",
+    outcome: "verified",
+    coordination: "released",
+  });
+  assert.deepEqual(lock.events, ["acquire", "release"]);
+  assert.equal((await readOperation(directory)).state.outcome, "verified");
+  assert.equal((await readOperation(directory)).state.lock, "released");
 });
 
 test("public release manifest recheck is bounded and exact", async () => {

@@ -31,6 +31,7 @@ import {
   STABLE_RELEASE_CHANNEL,
   resolveReleaseChannel,
 } from "../../../config/release-channels.js";
+import { ADMIN_UI_SOURCES } from "./generate-admin-ui-assets.mjs";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 export const REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..", "..", "..");
@@ -394,6 +395,85 @@ export function validateWorkerDeploymentEndpointGates(workerPackage) {
   });
 }
 
+/**
+ * The fenced edge answers its mutation barrier with this retry-after; it
+ * mirrors EDGE_FENCE_RETRY_AFTER_SECONDS in src/edge-origin-contract.ts.
+ */
+export const EDGE_MODE_FENCE_RETRY_AFTER = "300";
+export const EDGE_MODE_FENCE_ERROR_CODE = "MUTATION_BARRIER_ACTIVE";
+export const EDGE_MODES_IN_ORDER = Object.freeze(["worker", "fenced", "gcp"]);
+
+const EDGE_NOT_FOUND = Object.freeze({ status: 404 });
+const EDGE_MUTATION_BARRIER = Object.freeze({
+  status: 503,
+  contentType: "application/json",
+  cacheControl: "no-store",
+  retryAfter: EDGE_MODE_FENCE_RETRY_AFTER,
+  errorCode: EDGE_MODE_FENCE_ERROR_CODE,
+});
+
+/**
+ * How the apex answers the paths the public origin must never serve, by path
+ * class and edge mode. Worker and gcp agree (the gcp edge answers the apex
+ * admin surface and unknown API paths locally with the Worker's 404s). A
+ * fenced edge runs the Worker's mutation barrier, which refuses every
+ * non-asset route and every admin-surface path with 503
+ * MUTATION_BARRIER_ACTIVE, no-store and retry-after 300, while an asset path
+ * that is not an admin surface still reaches the public bundle and its 404.
+ */
+export const EDGE_MODE_FORBIDDEN_PATH_EXPECTATIONS = Object.freeze({
+  "public-asset": Object.freeze({ worker: EDGE_NOT_FOUND, fenced: EDGE_NOT_FOUND, gcp: EDGE_NOT_FOUND }),
+  "admin-surface": Object.freeze({ worker: EDGE_NOT_FOUND, fenced: EDGE_MUTATION_BARRIER, gcp: EDGE_NOT_FOUND }),
+  api: Object.freeze({ worker: EDGE_NOT_FOUND, fenced: EDGE_MUTATION_BARRIER, gcp: EDGE_NOT_FOUND }),
+});
+
+/** The class of a forbidden apex path, by the barrier's own predicate. */
+export function edgeModeForbiddenPathClass(pathname) {
+  if (typeof pathname !== "string" || !pathname.startsWith("/")) {
+    fail("Edge public-surface paths must be absolute");
+  }
+  if (pathname.startsWith("/api/")) return "api";
+  if (pathname === "/admin" || ADMIN_UI_SOURCES.some(({ route }) => route === pathname)) {
+    return "admin-surface";
+  }
+  return "public-asset";
+}
+
+/**
+ * Public-surface expectations that hold in every edge mode (the www redirect
+ * and the retained release manifest), plus the per-mode table above. Pure
+ * and probe-free: production-deploy.mjs's rechecks consume it.
+ */
+export function validateEdgeModePublicSurface(endpoints = DEPLOYMENT_ENDPOINTS) {
+  assertDeploymentEndpoints(endpoints);
+  const origin = new URL(endpoints.public.origin);
+  const wwwHost = `www.${origin.host}`;
+  if (!endpoints.public.routeHosts.includes(origin.host)
+      || !endpoints.public.routeHosts.includes(wwwHost)
+      || endpoints.public.routeHosts.includes(endpoints.admin.host)) {
+    fail("Edge public surface requires the apex and www route hosts and a separate admin host");
+  }
+  for (const [pathClass, modes] of Object.entries(EDGE_MODE_FORBIDDEN_PATH_EXPECTATIONS)) {
+    exactArray(Object.keys(modes), EDGE_MODES_IN_ORDER, `Edge ${pathClass} expectations`);
+    if (modes.worker !== modes.gcp
+        || modes.fenced !== (pathClass === "public-asset" ? EDGE_NOT_FOUND : EDGE_MUTATION_BARRIER)) {
+      fail(`Edge ${pathClass} expectations must differ from worker mode only behind the fence`);
+    }
+  }
+  const root = new URL("/", origin).href;
+  return Object.freeze({
+    modeIndependent: Object.freeze([
+      Object.freeze({ url: `https://${wwwHost}/`, status: 308, location: root }),
+      Object.freeze({
+        url: new URL("/release-site-manifest.json", origin).href,
+        status: 200,
+        contentType: "application/json",
+      }),
+    ]),
+    forbiddenPaths: EDGE_MODE_FORBIDDEN_PATH_EXPECTATIONS,
+  });
+}
+
 function parseWranglerConfiguration(text) {
   const errors = [];
   const configuration = parse(text, errors, {
@@ -479,8 +559,10 @@ export async function checkDeploymentEndpointConsumers({
   const gates = validateWorkerDeploymentEndpointGates(
     parseWorkerPackage(workerPackageText),
   );
+  const edgeModePublicSurface = validateEdgeModePublicSurface(endpoints);
   return Object.freeze({
     ...consumers,
+    edgeModePublicSurface,
     gates,
     sparkleGuard,
     worker,
