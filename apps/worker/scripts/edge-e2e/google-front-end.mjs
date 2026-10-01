@@ -24,7 +24,8 @@
 //     the origin. The response comes back with Google's response headers
 //     (server, alt-svc, via, x-cloud-trace-context) added.
 // (c) Any other host: refused (the edge's socket is destroyed) and recorded,
-//     so a test fails on it.
+//     so a test fails on it, unless the caller names it as a fixture host
+//     (the synthetic Access JWKS for a production-ENVIRONMENT edge).
 // (d) Mutation hooks for the detector controls and failure rows.
 // (e) A live passthrough mode, used only by scripts/edge-live-check.mjs:
 //     token requests answer with an injected token, and forwards go to the
@@ -284,6 +285,7 @@ export function createGoogleFrontEnd({
   origin = null,
   clock = Date.now,
   live = null,
+  fixtureHosts = {},
 } = {}) {
   if (invoker === null || typeof invoker !== "object" || typeof invoker.email !== "string") {
     throw new TypeError("FRONT_END_INVOKER_INVALID");
@@ -296,6 +298,7 @@ export function createGoogleFrontEnd({
     exchanges: [],
     tokenRequests: [],
     refusals: [],
+    fixtureRequests: [],
     hooks: {},
   };
   const members = () => {
@@ -533,6 +536,12 @@ export function createGoogleFrontEnd({
       cloudRun(req, res).catch(() => destroy(req, res));
       return;
     }
+    if (Object.hasOwn(fixtureHosts, host)) {
+      // A named test fixture (for example a synthetic Access JWKS): recorded, answered by the caller.
+      state.fixtureRequests.push({ at: clock(), method: req.method, host, path: req.url });
+      fixtureHosts[host](req, res);
+      return;
+    }
     state.refusals.push({ at: clock(), method: req.method, host });
     destroy(req, res);
   }
@@ -584,6 +593,7 @@ export function createGoogleFrontEnd({
     get exchanges() { return state.exchanges; },
     get tokenRequests() { return state.tokenRequests; },
     get refusals() { return state.refusals; },
+    get fixtureRequests() { return state.fixtureRequests; },
     setOrigin(value) { state.origin = value; },
     setHooks(hooks) { state.hooks = { ...hooks }; },
     clearHooks() { state.hooks = {}; },

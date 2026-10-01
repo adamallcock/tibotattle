@@ -795,6 +795,40 @@ test("S2 admin: the Access chokepoint equals the Worker; owner admin APIs forwar
 }, async () => {
   const f = await fixture();
   for (const row of adminRows()) await runRow(f, { ...row, stage: "S2" });
+
+  // A production-ENVIRONMENT edge: no test JWKS reaches the Worker code, so
+  // the chokepoint fetches the Access JWKS over the edge's own network, and
+  // with distribution analytics configured an owner overview read starts the
+  // Cloudflare GraphQL reads on that same single path. The front end serves
+  // the synthetic JWKS and refuses api.cloudflare.com; the overview is the
+  // origin's unported 503, so nothing is merged and the answer passes through.
+  const jwksHost = "synthetic-edge.cloudflareaccess.com";
+  const frontEnd = createGoogleFrontEnd({ invoker: f.invoker, verifiers: [EDGE_E2E_VERIFIER], audience: EDGE_E2E_AUDIENCE,
+    upstreamOrigin: EDGE_E2E_UPSTREAM_ORIGIN, origin: loopbackOrigin(f.origin.port),
+    fixtureHosts: { [jwksHost]: (req, res) => {
+      req.resume();
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(f.access.jwksJson);
+    } } });
+  const production = await createEdgeInstance({ ...f.common, mode: "gcp", frontEnd, invokerKeyJson: f.invoker.keyJson,
+    overrides: { ENVIRONMENT: "production", DISTRIBUTION_ANALYTICS_ZONE_ID: "0".repeat(32),
+      DISTRIBUTION_ANALYTICS_API_TOKEN: "synthetic-distribution-token" } });
+  disposers.push(() => production.dispose());
+  const overview = await production.fetch(`${EDGE_E2E_ADMIN_ORIGIN}/api/v1/admin/overview`, { ip: nextIp(),
+    headers: { "cf-access-jwt-assertion": f.access.owner() } });
+  assert.equal(overview.status, 503, overview.text);
+  assert.equal(overview.text, f.m.edgeMode.EDGE_TEST_UNPORTED_BODY);
+  assert.equal(frontEnd.exchanges.length, 1, "the overview was forwarded once");
+  assert.deepEqual(transparencyMismatches(f, overview, frontEnd.exchanges[0]), []);
+  assert.deepEqual(frontEnd.fixtureRequests.map((request) => request.host), [jwksHost], "the JWKS came over the edge's network");
+  const graphql = frontEnd.refusals.filter((refusal) => refusal.host === "api.cloudflare.com");
+  assert.ok(graphql.length > 0 && graphql.length === frontEnd.refusals.length,
+    "the distribution reads used the same single path, and only they were refused");
+  const nonOwner = await production.fetch(`${EDGE_E2E_ADMIN_ORIGIN}/admin`, { ip: nextIp(),
+    headers: { "cf-access-jwt-assertion": f.access.nonOwner() } });
+  assert.equal(nonOwner.status, 403);
+  f.rows.push({ stage: "S2", id: "production-environment-overview", graphqlReads: graphql.length,
+    jwksFetches: frontEnd.fixtureRequests.length });
 });
 
 // ---------------------------------------------------------------------------
