@@ -21,6 +21,7 @@ an informal archive.
 | Architecture | [System architecture](./reference/system-architecture.md) | Current components, trust boundaries, stores, identities, and data flow |
 | Privacy | [Local data, network, and privacy](./reference/local-data-and-privacy.md) | Exact source reads, local and hosted stores, Keychain, network, retention, deletion, and uninstall boundaries |
 | Electron sharing policy | [Accountless sharing defaults](./decisions/2026-09-04-accountless-sharing-policy.md) | Accepted fresh-install default-on and three-notice existing-install transition; persistent opt-out, no sign-in, and distinct source/release gates |
+| GCP contributions and erasure | [Append-only contributions on the Google Cloud service](./decisions/2026-09-26-append-only-contributions.md) | Accepted 2026-09-30 for the GCP target only, from an authorized cutover: revocation stops uploads without withdrawal, Variant B offline owner erasure, deferred database scaling, Cloudflare edge and release hosting; current Cloudflare behavior unchanged |
 | Electron crash doctor | [Opt-in crash capture and support doctor](./decisions/2026-09-21-opt-in-crash-doctor.md) | Reviewed support projection, off-by-default local macOS Crashpad capture, and explicit owner-only private evidence export; no automatic upload or installed-release claim |
 | Electron refresh resilience | [Observable self-healing refresh leases](./decisions/2026-09-21-electron-refresh-resilience.md) | Accepted renderer/preload/IPC lease, heartbeat, watchdog, live-freshness and content-free diagnostics contract; source and release evidence remain separate |
 | Electron startup status | [Start-at-login status and refresh](./decisions/2026-09-21-electron-start-at-login-status.md) | Accepted source behavior for automatic status reads, error retry, and exact Linux XDG ownership; installed-platform qualification remains separate |
@@ -58,6 +59,15 @@ an informal archive.
 | Web-only release | [Web-only release](./runbooks/2026-08-17-web-only-release.md) | Maintained website publication lane and its release boundaries |
 | Windows readiness | [Windows portability environments](./runbooks/2026-08-17-windows-portability-environments.md) | Development/qualification environments only; current release support is defined by the platform authority |
 | R7 evidence | [R7 release-evidence receipt maintenance](./runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md) | Staleness rule and protected dual-runtime regeneration; not a routine documentation check |
+
+## Pending decisions and in-progress plans
+
+These entries are listed for discovery. They are not current authorities until
+their status changes; current Cloudflare behavior follows the authorities above.
+
+| Area | Document | Status | Boundary |
+|---|---|---|---|
+| GCP fast path | [GCP fast path](./plans/2026-10-01-gcp-fastpath.md) | In progress | Analytics-refresh architecture, redesign register mapping, local synthetic parity rehearsal and sized cutover backlog; no production change |
 
 ## Lifecycle evidence
 
