@@ -44,7 +44,9 @@ import {
 } from "../src/edge-origin-contract.ts";
 import {
   EDGE_ORIGIN_BOUNDARY_REFUSAL_REASONS,
+  EDGE_ORIGIN_INVOKER_SCHEME_KINDS,
   EDGE_ORIGIN_INVOKER_TOKEN_REFUSAL_REASONS,
+  MAX_EDGE_ORIGIN_INVOKER_SEPARATOR_SPACES,
   MAX_EDGE_ORIGIN_INVOKER_SHAPE_SEGMENTS,
   MAX_EDGE_ORIGIN_URL_LENGTH,
   MAX_EDGE_ORIGIN_VERIFIER_ACCOUNTS,
@@ -372,15 +374,21 @@ function shapeFlags(value) {
     : [];
 }
 
+function separatorSpaces(value) {
+  return Number.isSafeInteger(value) && value >= 0 && value <= MAX_EDGE_ORIGIN_INVOKER_SEPARATOR_SPACES
+    ? value : null;
+}
+
 /**
  * The log line for one boundary refusal, built field by field from an
  * allowlist: {"event":"edge_origin_boundary_refusal","reason":<code>}, plus,
  * for an EP-6 invoker-token refusal only, "invokerShape" with the delivered
- * header's 'Bearer ' prefix flag, segment count, per-segment empty and
- * base64url flags and whether the third segment is Google's
- * SIGNATURE_REMOVED_BY_GOOGLE. A reason outside the two reason lists is
- * logged as 'unclassified'; nothing else a diagnostic carries (no header
- * value, token, email, host, address or path) can reach the line.
+ * header's exact 'Bearer ' prefix flag, scheme kind, spaces after the scheme
+ * (0-4), segment count, per-segment empty and base64url flags and whether
+ * the third segment is Google's SIGNATURE_REMOVED_BY_GOOGLE. A reason
+ * outside the two reason lists is logged as 'unclassified', and a scheme or
+ * count outside its range as null; nothing else a diagnostic carries (no
+ * header value, token, email, host, address or path) can reach the line.
  */
 export function edgeTestBoundaryRefusalLogLine(diagnostic) {
   const candidate = diagnostic !== null && typeof diagnostic === "object" ? diagnostic.reason : undefined;
@@ -390,6 +398,8 @@ export function edgeTestBoundaryRefusalLogLine(diagnostic) {
   if (shape !== null && typeof shape === "object") {
     line.invokerShape = {
       bearerPrefix: shape.bearerPrefix === true,
+      scheme: EDGE_ORIGIN_INVOKER_SCHEME_KINDS.includes(shape.scheme) ? shape.scheme : null,
+      separatorSpaces: separatorSpaces(shape.separatorSpaces),
       segments: Number.isSafeInteger(shape.segments) && shape.segments >= 0 ? shape.segments : null,
       segmentEmpty: shapeFlags(shape.segmentEmpty),
       segmentBase64url: shapeFlags(shape.segmentBase64url),

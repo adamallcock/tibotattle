@@ -348,8 +348,15 @@ interface ValidClaimsCase {
 
 function validClaimsCases(): readonly ValidClaimsCase[] {
   const token = invokerToken();
+  const segments = token.slice("Bearer ".length);
   return [
     { label: "delivered token", value: token, expected: EXPECTED_CLAIMS },
+    // RFC 7235: the auth-scheme is case-insensitive and 1*SP separates it.
+    { label: "lowercase scheme", value: `bearer ${segments}`, expected: EXPECTED_CLAIMS },
+    { label: "uppercase scheme", value: `BEARER ${segments}`, expected: EXPECTED_CLAIMS },
+    { label: "mixed-case scheme", value: `bEaReR ${segments}`, expected: EXPECTED_CLAIMS },
+    { label: "double space", value: `Bearer  ${segments}`, expected: EXPECTED_CLAIMS },
+    { label: "four spaces after a lowercase scheme", value: `bearer    ${segments}`, expected: EXPECTED_CLAIMS },
     {
       label: "fractional clock reading",
       value: token,
@@ -437,9 +444,16 @@ function invalidClaimsCases(): readonly InvalidClaimsCase[] {
     { label: "array", value: [token] },
     { label: "empty", value: "" },
     { label: "prefix only", value: "Bearer " },
+    { label: "lowercase prefix only", value: "bearer   " },
     { label: "missing scheme", value: segments },
-    { label: "lowercase scheme", value: `bearer ${segments}` },
-    { label: "double space", value: `Bearer  ${segments}` },
+    { label: "scheme without a separator", value: `Bearer${segments}` },
+    { label: "tab separator", value: `Bearer\t${segments}` },
+    { label: "space then tab separator", value: `Bearer \t${segments}` },
+    { label: "line feed separator", value: `bearer\n${segments}` },
+    { label: "no-break space separator", value: `Bearer\u00a0${segments}` },
+    { label: "scheme with a colon", value: `Bearer: ${segments}` },
+    { label: "longer scheme", value: `Bearers ${segments}` },
+    { label: "scheme with a non-ASCII letter", value: `Beare\u0280 ${segments}` },
     { label: "leading space", value: ` ${token}` },
     { label: "Basic scheme", value: `Basic ${segments}` },
     { label: "trailing space", value: `${token} ` },

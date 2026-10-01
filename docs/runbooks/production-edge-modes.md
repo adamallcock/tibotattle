@@ -393,7 +393,14 @@ such as `host_mismatch`) or `EDGE_ORIGIN_BOUNDARY_REFUSAL_REASONS`
 (`cloud-run/postgres-edge-origin-dispatch.mjs`, such as
 `invoker_bearer_prefix_missing`, `invoker_segments` or `audience_mismatch`).
 A refusal of the delivered `x-serverless-authorization` adds `invokerShape`:
-whether it starts with `Bearer `, its segment count, which segments are empty
-or base64url, and whether the third is `SIGNATURE_REMOVED_BY_GOOGLE`. No line
-carries a header value, token, email, host or path. A `421` without such a
-line did not come from the origin.
+whether it starts with exactly `Bearer `, its scheme kind (`Bearer`,
+`bearer-case-variant`, `none` or `other`) and the spaces after it (capped at
+4), its segment count, which segments are empty or base64url, and whether the
+third is `SIGNATURE_REMOVED_BY_GOOGLE`. No line carries a header value, token,
+email, host or path. A `421` without such a line did not come from the origin.
+
+The origin accepts that header as RFC 7235 credentials: the Bearer scheme in
+any ASCII case, one or more spaces, then the token. The edge sends `Bearer `,
+but on 2026-10-01 the test origin received the header without that exact
+prefix. The rule lives in `src/edge-origin-contract.ts`, so the edge and the
+origin must deploy from commits with the same contract blob.

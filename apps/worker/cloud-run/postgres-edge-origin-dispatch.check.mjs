@@ -202,8 +202,8 @@ function recordingSink() {
   return { onRefusal, diagnostics };
 }
 
-const SHAPE_KEYS = Object.freeze(["bearerPrefix", "segments", "segmentEmpty", "segmentBase64url",
-  "signatureRemovedByGoogle"]);
+const SHAPE_KEYS = Object.freeze(["bearerPrefix", "scheme", "separatorSpaces", "segments", "segmentEmpty",
+  "segmentBase64url", "signatureRemovedByGoogle"]);
 
 /**
  * A diagnostic is closed: a listed reason and, only for an invoker-token
@@ -222,6 +222,9 @@ function assertClosedDiagnostic(diagnostic, label) {
   assert.ok(Object.isFrozen(shape), label);
   assert.deepEqual(Object.keys(shape).sort(), [...SHAPE_KEYS].sort(), label);
   assert.equal(typeof shape.bearerPrefix, "boolean", label);
+  assert.ok(dispatchModule.EDGE_ORIGIN_INVOKER_SCHEME_KINDS.includes(shape.scheme), label);
+  assert.ok(Number.isSafeInteger(shape.separatorSpaces) && shape.separatorSpaces >= 0
+    && shape.separatorSpaces <= dispatchModule.MAX_EDGE_ORIGIN_INVOKER_SEPARATOR_SPACES, label);
   assert.ok(Number.isSafeInteger(shape.segments) && shape.segments >= 1, label);
   assert.equal(typeof shape.signatureRemovedByGoogle, "boolean", label);
   for (const flags of [shape.segmentEmpty, shape.segmentBase64url]) {
@@ -272,7 +275,8 @@ const INVALID_CASES = Object.freeze([
   { label: "a token issued in the future", reason: "invoker_claims_invalid", request: { auth: token({ iat: NOW_SECONDS + 120 }) } },
   { label: "a malformed JWT (two segments)", reason: "invoker_segments", request: { auth: token().split(".").slice(0, 2).join(".") } },
   { label: "a malformed JWT (non-JSON payload)", reason: "invoker_claims_invalid", request: { auth: `Bearer ${base64UrlJson({ alg: "RS256" })}.bm90LWpzb24.SIG` } },
-  { label: "a lowercase bearer scheme", reason: "invoker_bearer_prefix_missing", request: { auth: token().replace("Bearer ", "bearer ") } },
+  { label: "a tab after the scheme", reason: "invoker_bearer_prefix_missing", request: { auth: token().replace("Bearer ", "Bearer\t") } },
+  { label: "a colon after the scheme", reason: "invoker_bearer_prefix_missing", request: { auth: token().replace("Bearer ", "Bearer: ") } },
   { label: "a Basic credential", reason: "invoker_bearer_prefix_missing", request: { auth: "Basic c3ludGhldGljOnN5bnRoZXRpYw==" } },
   // Edge identity headers.
   { label: "host kind 'www'", reason: "edge_host_kind_invalid", request: { headers: [["x-tibotattle-edge-host", "www"]] } },
@@ -322,8 +326,10 @@ test("exports the reviewed boundary surface", () => {
   assert.deepEqual(Object.keys(dispatchModule).sort(), [
     "EDGE_ORIGIN_BOUNDARY_REFUSAL_REASONS",
     "EDGE_ORIGIN_DISPATCH_PATHNAMES",
+    "EDGE_ORIGIN_INVOKER_SCHEME_KINDS",
     "EDGE_ORIGIN_INVOKER_TOKEN_REFUSAL_REASONS",
     "EDGE_ORIGIN_VERIFIER_PATHNAMES",
+    "MAX_EDGE_ORIGIN_INVOKER_SEPARATOR_SPACES",
     "MAX_EDGE_ORIGIN_INVOKER_SHAPE_SEGMENTS",
     "MAX_EDGE_ORIGIN_URL_LENGTH",
     "MAX_EDGE_ORIGIN_VERIFIER_ACCOUNTS",
@@ -340,6 +346,9 @@ test("exports the reviewed boundary surface", () => {
   assert.equal(new Set(invokerReasons).size, invokerReasons.length);
   for (const reason of invokerReasons) assert.ok(reasons.includes(reason), reason);
   assert.equal(dispatchModule.MAX_EDGE_ORIGIN_INVOKER_SHAPE_SEGMENTS, 8);
+  assert.deepEqual(dispatchModule.EDGE_ORIGIN_INVOKER_SCHEME_KINDS, ["Bearer", "bearer-case-variant", "none", "other"]);
+  assert.ok(Object.isFrozen(dispatchModule.EDGE_ORIGIN_INVOKER_SCHEME_KINDS));
+  assert.equal(dispatchModule.MAX_EDGE_ORIGIN_INVOKER_SEPARATOR_SPACES, 4);
   assert.deepEqual(dispatchModule.EDGE_ORIGIN_DISPATCH_PATHNAMES, []);
   assert.ok(Object.isFrozen(dispatchModule.EDGE_ORIGIN_DISPATCH_PATHNAMES));
   assert.deepEqual(dispatchModule.EDGE_ORIGIN_VERIFIER_PATHNAMES, ["/api/health", "/api/ready"]);
@@ -751,16 +760,34 @@ function tokenSegments(overrides = {}) {
 }
 
 /** A shape with every segment present and base64url. */
-function plainShape(segments, signatureRemovedByGoogle, bearerPrefix = true) {
+function plainShape(segments, signatureRemovedByGoogle, { scheme = "Bearer", separatorSpaces = 1 } = {}) {
   const described = Math.min(segments, 8);
   return {
-    bearerPrefix,
+    bearerPrefix: scheme === "Bearer" && separatorSpaces >= 1,
+    scheme,
+    separatorSpaces,
     segments,
     segmentEmpty: Array(described).fill(false),
     segmentBase64url: Array(described).fill(true),
     signatureRemovedByGoogle,
   };
 }
+
+test("the Bearer scheme in any ASCII case, then one or more spaces, is accepted", async () => {
+  const { inner, calls } = recordingInner();
+  const sink = recordingSink();
+  const dispatch = createDispatch({ inner, onRefusal: sink.onRefusal });
+  const segments = token().slice("Bearer ".length);
+  for (const auth of [`bearer ${segments}`, `BEARER ${segments}`, `bEaReR ${segments}`, `Bearer  ${segments}`,
+    `bearer    ${segments}`]) {
+    const response = await dispatch(rawRequest({ method: "GET", auth }));
+    assert.equal(response.status, 200, auth.slice(0, 12));
+    assertMarked(response);
+    assert.ok(!calls.at(-1).headers.some(([name]) => name === "x-serverless-authorization"));
+  }
+  assert.equal(calls.length, 5);
+  assert.deepEqual(sink.diagnostics, []);
+});
 
 test("each delivered-header refusal names its reason and the header's shape", async () => {
   const sink = recordingSink();
@@ -774,28 +801,39 @@ test("each delivered-header refusal names its reason and the header's shape", as
     ["an intact signature for another account", `Bearer ${wrongEmail.header}.${wrongEmail.payload}.c3ludGhldGljLXNpZ25hdHVyZQ`,
       "email_mismatch", plainShape(3, false)],
     ["a valid token without 'Bearer '", `${valid.header}.${valid.payload}.SIGNATURE_REMOVED_BY_GOOGLE`,
-      "invoker_bearer_prefix_missing", plainShape(3, true, false)],
+      "invoker_bearer_prefix_missing", plainShape(3, true, { scheme: "none", separatorSpaces: 0 })],
+    ["a lowercase scheme for another audience", `bearer ${wrongAudience.header}.${wrongAudience.payload}.SIGNATURE_REMOVED_BY_GOOGLE`,
+      "audience_mismatch", plainShape(3, true, { scheme: "bearer-case-variant" })],
+    ["five spaces for another account", `BEARER     ${wrongEmail.header}.${wrongEmail.payload}.SIGNATURE_REMOVED_BY_GOOGLE`,
+      "email_mismatch", plainShape(3, true, { scheme: "bearer-case-variant", separatorSpaces: 4 })],
+    ["a tab separator", `Bearer\t${valid.header}.${valid.payload}.SIGNATURE_REMOVED_BY_GOOGLE`,
+      "invoker_bearer_prefix_missing", {
+        bearerPrefix: false, scheme: "Bearer", separatorSpaces: 0, segments: 3, segmentEmpty: [false, false, false],
+        segmentBase64url: [false, true, true], signatureRemovedByGoogle: true,
+      }],
+    ["another scheme", `Basic ${valid.header}.${valid.payload}.SIGNATURE_REMOVED_BY_GOOGLE`,
+      "invoker_bearer_prefix_missing", plainShape(3, true, { scheme: "other" })],
     ["the signature segment dropped", `Bearer ${valid.header}.${valid.payload}`,
       "invoker_segments", plainShape(2, false)],
     ["an empty signature segment", `Bearer ${valid.header}.${valid.payload}.`,
       "invoker_segment_encoding", {
-        bearerPrefix: true, segments: 3, segmentEmpty: [false, false, true],
+        bearerPrefix: true, scheme: "Bearer", separatorSpaces: 1, segments: 3, segmentEmpty: [false, false, true],
         segmentBase64url: [true, true, false], signatureRemovedByGoogle: false,
       }],
     ["a padded signature segment", `Bearer ${valid.header}.${valid.payload}.c2ln=`,
       "invoker_segment_encoding", {
-        bearerPrefix: true, segments: 3, segmentEmpty: [false, false, false],
+        bearerPrefix: true, scheme: "Bearer", separatorSpaces: 1, segments: 3, segmentEmpty: [false, false, false],
         segmentBase64url: [true, true, false], signatureRemovedByGoogle: false,
       }],
     ["twelve segments", `Bearer ${"a.".repeat(11)}a`, "invoker_segments", plainShape(12, false)],
     ["dots only", "Bearer ..", "invoker_segment_encoding", {
-      bearerPrefix: true, segments: 3, segmentEmpty: [true, true, true],
+      bearerPrefix: true, scheme: "Bearer", separatorSpaces: 1, segments: 3, segmentEmpty: [true, true, true],
       segmentBase64url: [false, false, false], signatureRemovedByGoogle: false,
     }],
     // Headers trims the value, so a bare scheme arrives as 'Bearer'.
     ["only the scheme", "Bearer ", "invoker_bearer_prefix_missing", {
-      bearerPrefix: false, segments: 1, segmentEmpty: [false], segmentBase64url: [true],
-      signatureRemovedByGoogle: false,
+      bearerPrefix: false, scheme: "none", separatorSpaces: 0, segments: 1, segmentEmpty: [false],
+      segmentBase64url: [true], signatureRemovedByGoogle: false,
     }],
   ];
   for (const [index, [label, auth, reason, shape]] of rows.entries()) {
@@ -869,7 +907,8 @@ test("diagnostics never carry a token, email, header value, host or path", async
     await assertRefusal(await dispatch(request), JSON.stringify(options).slice(0, 80));
   }
   assert.equal(sink.diagnostics.length, requests.length, "one diagnostic per refusal");
-  const serialized = JSON.stringify(sink.diagnostics);
+  // A scheme kind is a closed constant (assertClosedDiagnostic), not the header's text.
+  const serialized = JSON.stringify(sink.diagnostics).replaceAll(/"scheme":"[a-zA-Z-]+"/gu, "");
   for (const needle of needles) {
     // A reason code is itself never a needle; skip the contract's own words.
     if (dispatchModule.EDGE_ORIGIN_BOUNDARY_REFUSAL_REASONS.some((reason) => reason.includes(needle))) continue;

@@ -705,6 +705,8 @@ test("the refusal log line is closed: event, a listed reason and, for a token re
   assert.equal(mode.EDGE_ORIGIN_BOUNDARY_REFUSAL_EVENT, "edge_origin_boundary_refusal");
   const shape = Object.freeze({
     bearerPrefix: true,
+    scheme: "Bearer",
+    separatorSpaces: 1,
     segments: 3,
     segmentEmpty: Object.freeze([false, false, false]),
     segmentBase64url: Object.freeze([true, true, true]),
@@ -715,8 +717,9 @@ test("the refusal log line is closed: event, a listed reason and, for a token re
     "{\"event\":\"edge_origin_boundary_refusal\",\"reason\":\"host_mismatch\"}");
   assert.equal(line({ reason: "audience_mismatch", invokerShape: shape }),
     "{\"event\":\"edge_origin_boundary_refusal\",\"reason\":\"audience_mismatch\",\"invokerShape\":"
-    + "{\"bearerPrefix\":true,\"segments\":3,\"segmentEmpty\":[false,false,false],"
-    + "\"segmentBase64url\":[true,true,true],\"signatureRemovedByGoogle\":true}}");
+    + "{\"bearerPrefix\":true,\"scheme\":\"Bearer\",\"separatorSpaces\":1,\"segments\":3,"
+    + "\"segmentEmpty\":[false,false,false],\"segmentBase64url\":[true,true,true],"
+    + "\"signatureRemovedByGoogle\":true}}");
   // Only a token refusal carries a shape.
   assert.equal(line({ reason: "edge_host_kind_invalid", invokerShape: shape }),
     "{\"event\":\"edge_origin_boundary_refusal\",\"reason\":\"edge_host_kind_invalid\"}");
@@ -726,8 +729,9 @@ test("the refusal log line is closed: event, a listed reason and, for a token re
     { reason: secret },
     { reason: "host_mismatch", host: secret, path: secret },
     { reason: "email_mismatch", email: secret, invokerShape: {
-      ...shape, token: secret, segments: secret, segmentEmpty: [secret, true], segmentBase64url: secret,
-      signatureRemovedByGoogle: secret, bearerPrefix: "true" } },
+      ...shape, token: secret, scheme: secret, separatorSpaces: secret, segments: secret,
+      segmentEmpty: [secret, true], segmentBase64url: secret, signatureRemovedByGoogle: secret,
+      bearerPrefix: "true" } },
     null,
     undefined,
     secret,
@@ -738,11 +742,20 @@ test("the refusal log line is closed: event, a listed reason and, for a token re
   }
   assert.equal(line({ reason: secret }), "{\"event\":\"edge_origin_boundary_refusal\",\"reason\":\"unclassified\"}");
   assert.equal(line({ reason: "email_mismatch", invokerShape: {
-    ...shape, token: secret, segments: secret, segmentEmpty: [secret, true],
-    segmentBase64url: Array(20).fill(true), bearerPrefix: "true" } }),
+    ...shape, token: secret, scheme: "bearer", separatorSpaces: 5, segments: secret,
+    segmentEmpty: [secret, true], segmentBase64url: Array(20).fill(true), bearerPrefix: "true" } }),
   "{\"event\":\"edge_origin_boundary_refusal\",\"reason\":\"email_mismatch\",\"invokerShape\":"
-    + "{\"bearerPrefix\":false,\"segments\":null,\"segmentEmpty\":[false,true],"
-    + "\"segmentBase64url\":[true,true,true,true,true,true,true,true],\"signatureRemovedByGoogle\":true}}");
+    + "{\"bearerPrefix\":false,\"scheme\":null,\"separatorSpaces\":null,\"segments\":null,"
+    + "\"segmentEmpty\":[false,true],\"segmentBase64url\":[true,true,true,true,true,true,true,true],"
+    + "\"signatureRemovedByGoogle\":true}}");
+  for (const kind of edgeDispatch.EDGE_ORIGIN_INVOKER_SCHEME_KINDS) {
+    for (const spaces of [0, 4]) {
+      const parsed = JSON.parse(line({ reason: "email_mismatch", invokerShape: { ...shape, scheme: kind,
+        separatorSpaces: spaces } }));
+      assert.equal(parsed.invokerShape.scheme, kind);
+      assert.equal(parsed.invokerShape.separatorSpaces, spaces);
+    }
+  }
   // logEdgeTestBoundaryRefusal writes exactly that line once and never throws.
   const written = [];
   mode.logEdgeTestBoundaryRefusal({ reason: "audience_count", invokerShape: shape }, (value) => written.push(value));
@@ -779,19 +792,25 @@ test("serve(): one content-free reason line per refusal; the 421 bytes never cha
       ["no token", { target: secretPath, headers: [["host", host], ["x-tibotattle-edge-host", "apex"],
         ["x-tibotattle-edge-request-id", REQUEST_ID]] }, "invoker_header_missing", null],
       ["another audience", { target: secretPath, headers: [["host", host], ...edge(audienceToken)] },
-        "audience_mismatch", { bearerPrefix: true, segments: 3, segmentEmpty: [false, false, false],
-          segmentBase64url: [true, true, true], signatureRemovedByGoogle: true }],
-      ["another account", { target: secretPath, headers: [["host", host], ...edge(strangerToken)] },
-        "email_mismatch", { bearerPrefix: true, segments: 3, segmentEmpty: [false, false, false],
-          segmentBase64url: [true, true, true], signatureRemovedByGoogle: true }],
+        "audience_mismatch", { bearerPrefix: true, scheme: "Bearer", separatorSpaces: 1, segments: 3,
+          segmentEmpty: [false, false, false], segmentBase64url: [true, true, true], signatureRemovedByGoogle: true }],
+      ["another account with a lowercase scheme", { target: secretPath, headers: [["host", host],
+        ...edge(strangerToken.replace("Bearer ", "bearer  "))] },
+        "email_mismatch", { bearerPrefix: false, scheme: "bearer-case-variant", separatorSpaces: 2, segments: 3,
+          segmentEmpty: [false, false, false], segmentBase64url: [true, true, true], signatureRemovedByGoogle: true }],
       ["no 'Bearer '", { target: secretPath, headers: [["host", host], ...edge(secretToken.slice("Bearer ".length))] },
-        "invoker_bearer_prefix_missing", { bearerPrefix: false, segments: 3, segmentEmpty: [false, false, false],
-          segmentBase64url: [true, true, true], signatureRemovedByGoogle: true }],
+        "invoker_bearer_prefix_missing", { bearerPrefix: false, scheme: "none", separatorSpaces: 0, segments: 3,
+          segmentEmpty: [false, false, false], segmentBase64url: [true, true, true], signatureRemovedByGoogle: true }],
+      ["a tab after the scheme", { target: secretPath, headers: [["host", host],
+        ...edge(secretToken.replace("Bearer ", "Bearer\t"))] },
+        "invoker_bearer_prefix_missing", { bearerPrefix: false, scheme: "Bearer", separatorSpaces: 0, segments: 3,
+          segmentEmpty: [false, false, false], segmentBase64url: [false, true, true], signatureRemovedByGoogle: true }],
       ["an intact signature with a second token", { target: secretPath, headers: [["host", host],
         ...edge(`${secretToken.replace("SIGNATURE_REMOVED_BY_GOOGLE", "c2VjcmV0LXNpZw")}`),
         ["x-serverless-authorization", secretToken]] },
-        "invoker_segments", { bearerPrefix: true, segments: 5, segmentEmpty: [false, false, false, false, false],
-          segmentBase64url: [true, true, false, true, true], signatureRemovedByGoogle: false }],
+        "invoker_segments", { bearerPrefix: true, scheme: "Bearer", separatorSpaces: 1, segments: 5,
+          segmentEmpty: [false, false, false, false, false], segmentBase64url: [true, true, false, true, true],
+          signatureRemovedByGoogle: false }],
       ["client edge key", { target: secretPath, headers: [["host", host], ...edge(secretToken),
         ["x-tibotattle-edge-client-key", "secret-client-key-0123456789abcdef"]] }, "edge_header_unknown", null],
       ["verifier query", { target: "/api/health?secret-query=1",
@@ -809,13 +828,15 @@ test("serve(): one content-free reason line per refusal; the 421 bytes never cha
       assert.deepEqual(loggedReasons(lines.slice(-1)), [reason], label);
       assert.deepEqual(JSON.parse(lines.at(-1)).invokerShape, shape ?? undefined, label);
     }
-    // An admitted request logs nothing.
+    // An admitted request logs nothing, with any case of the scheme and 1*SP.
     const before = lines.length;
-    const admitted = await exchange(port, { headers: [["host", host], ...edge(secretToken)] });
-    assert.equal(admitted.status, 200);
+    for (const auth of [secretToken, secretToken.replace("Bearer ", "bearer "), secretToken.replace("Bearer ", "BEARER   ")]) {
+      const admitted = await exchange(port, { headers: [["host", host], ...edge(auth)] });
+      assert.equal(admitted.status, 200);
+    }
     assert.equal(lines.length, before);
   });
-  assert.equal(innerCalls, 1);
+  assert.equal(innerCalls, 3);
   // Byte for byte (Date aside), every refusal is the same answer.
   for (const [label, raw] of answers) assert.equal(raw, answers[0][1], label);
   // No line carries a token, a segment, an email, a header value, a host or a path.
@@ -825,9 +846,13 @@ test("serve(): one content-free reason line per refusal; the 421 bytes never cha
     needles.add(value);
     for (const fragment of value.split(/[ .,;?=]+/u)) if (fragment.length >= 6) needles.add(fragment);
   }
-  const logged = lines.join("\n");
+  // A scheme kind is a closed constant, not the header's text.
+  const logged = lines.join("\n").replaceAll(/"scheme":"[a-zA-Z-]+"/gu, "");
+  const reasons = [...mode.EDGE_TEST_REQUEST_REFUSAL_REASONS, ...edgeDispatch.EDGE_ORIGIN_BOUNDARY_REFUSAL_REASONS];
   for (const needle of needles) {
     if (needle.length < 4 && needle !== "@") continue;
+    // A reason code is itself never a needle (a 'bearer' fragment is in one).
+    if (reasons.some((reason) => reason.includes(needle))) continue;
     assert.ok(!logged.includes(needle), `a refusal line carries ${JSON.stringify(needle.slice(0, 24))}`);
   }
 }));

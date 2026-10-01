@@ -212,7 +212,9 @@ export interface CloudRunInvokerClaims {
 export const EDGE_INVOKER_CLOCK_SKEW_SECONDS = 60;
 
 const MAX_INVOKER_HEADER_LENGTH = 8_192;
-const INVOKER_BEARER_PREFIX = "Bearer ";
+// RFC 7235 credentials: the auth-scheme is case-insensitive (ASCII only, so
+// no Unicode case folding) and 1*SP separates it from the token.
+const INVOKER_BEARER_SCHEME_PATTERN = /^[Bb][Ee][Aa][Rr][Ee][Rr] +/u;
 const BASE64URL_SEGMENT_PATTERN = /^[A-Za-z0-9_-]+$/u;
 const INVOKER_EMAIL_PATTERN = /^[!-?A-~]{1,64}@[!-?A-~]{1,189}$/u;
 const MAX_INVOKER_AUDIENCES = 16;
@@ -253,9 +255,10 @@ function readInvokerAudiences(value: unknown): readonly string[] | null {
 
 function parseInvokerClaims(value: unknown, nowSeconds: unknown): CloudRunInvokerClaims | null {
   if (typeof nowSeconds !== "number" || !Number.isFinite(nowSeconds) || nowSeconds < 0) return null;
-  if (typeof value !== "string" || value.length > MAX_INVOKER_HEADER_LENGTH
-      || !value.startsWith(INVOKER_BEARER_PREFIX)) return null;
-  const segments = value.slice(INVOKER_BEARER_PREFIX.length).split(".");
+  if (typeof value !== "string" || value.length > MAX_INVOKER_HEADER_LENGTH) return null;
+  const scheme = INVOKER_BEARER_SCHEME_PATTERN.exec(value);
+  if (scheme === null) return null;
+  const segments = value.slice(scheme[0].length).split(".");
   if (segments.length !== 3) return null;
   const [headerSegment, payloadSegment, signatureSegment] = segments as [string, string, string];
   // Cloud Run's front end verifies the token before delivery and may replace
@@ -294,10 +297,15 @@ function parseInvokerClaims(value: unknown, nowSeconds: unknown): CloudRunInvoke
 
 /**
  * Decodes the claims Cloud Run delivers in x-serverless-authorization after
- * its IAM front end has verified the token: 'Bearer ' plus three base64url
- * segments, at most 8192 characters. The payload must carry `email`, `aud`
- * (a string or 1-16 strings) and integer `exp`. When present,
- * `email_verified` must be a boolean and `iat` an integer before `exp`.
+ * its IAM front end has verified the token: the Bearer auth-scheme in any
+ * ASCII case, one or more spaces, then three base64url segments, at most 8192
+ * characters in all (RFC 7235 credentials). The edge sends 'Bearer ', but on
+ * 2026-10-01 the fast-path test origin received the header, after the front
+ * end removed the signature, without that exact prefix. A tab or other
+ * separator, a missing scheme and any other scheme stay refused. The
+ * payload must carry `email`, `aud` (a string or 1-16 strings) and integer
+ * `exp`. When present, `email_verified` must be a boolean and `iat` an
+ * integer before `exp`.
  * Returns null for anything malformed or outside the clock-skew window;
  * never throws and never retains the value. Audience, verification and
  * identity decisions belong to the caller.

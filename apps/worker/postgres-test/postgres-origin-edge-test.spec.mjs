@@ -450,6 +450,8 @@ test("boundary refusals are the unmarked 421 with connection: close, before any 
         "edge_host_kind_invalid"],
       ["undecodable admission", edgeHeaders({ admission: "v2;upload_ingress;allowed" }), "admission_invalid"],
       ["verifier POST", { "x-serverless-authorization": token({ email: VERIFIER }) }, "verifier_method"],
+      ["tab after the scheme", edgeHeaders({ auth: token().replace("Bearer ", "Bearer\t") }),
+        "invoker_bearer_prefix_missing"],
     ]) {
       const request = {
         method: "POST", path: contributions, hold: true, body: "{\"synthetic\":tru",
@@ -487,16 +489,21 @@ test("boundary refusals are the unmarked 421 with connection: close, before any 
       headers: { "x-serverless-authorization": token({ email: VERIFIER }), "content-type": "application/json" } });
     assertBoundaryRefusal(m, verifierPost, "verifier POST");
     assert.equal(reasonOf("verifier POST /api/health"), "verifier_method");
-    // The invoker reads health through the same composition.
-    const invokerHealth = await send(port, { path: "/api/health", headers: edgeHeaders() });
-    assert.equal(invokerHealth.status, 200);
-    assertMarked(invokerHealth, "invoker health");
+    // The invoker reads health through the same composition, with the Bearer
+    // scheme in any case and one or more spaces (RFC 7235).
+    for (const auth of [token(), token().replace("Bearer ", "bearer "), token().replace("Bearer ", "BEARER  ")]) {
+      const invokerHealth = await send(port, { path: "/api/health", headers: edgeHeaders({ auth }) });
+      assert.equal(invokerHealth.status, 200, auth.slice(0, 9));
+      assertMarked(invokerHealth, "invoker health");
+    }
     assert.deepEqual(lines, [], "an admitted invoker read logs nothing");
   } finally {
     logSpy.mock.restore();
   }
   // No line carried a header value (a token, a segment, an email, a key).
-  const logged = logSpy.mock.calls.map((call) => call.arguments.join(" ")).join("\n");
+  // A scheme kind ("scheme":"Bearer" and the like) is a closed constant, not the header's text.
+  const logged = logSpy.mock.calls.map((call) => call.arguments.join(" ")).join("\n")
+    .replaceAll(/"scheme":"[a-zA-Z-]+"/gu, "");
   for (const value of sentValues) {
     for (const fragment of [value, ...value.split(/[ .,;]+/u)]) {
       if (fragment.length >= 6) assert.ok(!logged.includes(fragment), `a line carries ${fragment.slice(0, 24)}`);

@@ -122,6 +122,16 @@ export const EDGE_ORIGIN_INVOKER_TOKEN_REFUSAL_REASONS = Object.freeze([
 export const MAX_EDGE_ORIGIN_INVOKER_SHAPE_SEGMENTS = 8;
 
 /**
+ * An invoker shape's scheme: exactly 'Bearer'; the Bearer scheme in another
+ * ASCII case; none (no whitespace ends a leading run before the first '.');
+ * or any other scheme.
+ */
+export const EDGE_ORIGIN_INVOKER_SCHEME_KINDS = Object.freeze(["Bearer", "bearer-case-variant", "none", "other"]);
+
+/** The cap on an invoker shape's separatorSpaces. */
+export const MAX_EDGE_ORIGIN_INVOKER_SEPARATOR_SPACES = 4;
+
+/**
  * The constant refusal's headers: the Worker JSON headers (JSON, no-store,
  * no-referrer, nosniff) plus connection: close, and never the origin marker.
  */
@@ -133,9 +143,13 @@ export const ORIGIN_BOUNDARY_ERROR_HEADERS = Object.freeze({
 const EDGE_HEADER_PREFIX = "x-tibotattle-";
 const ORIGIN_MARKER_VALUE = "1";
 const ADMIN_HOST_PREFIX = "admin.";
-// The delivered header's documented form (src/edge-origin-contract.ts), used
-// here only to describe a refused header's shape.
+// Used here only to describe a refused header's shape: the prefix the edge
+// sends, a leading auth-scheme (a run without whitespace or '.', ended by
+// whitespace, then the spaces only that follow it) and the contract's ASCII
+// case-insensitive Bearer scheme (src/edge-origin-contract.ts).
 const INVOKER_BEARER_PREFIX = "Bearer ";
+const INVOKER_SCHEME_PATTERN = /^([^\s.]+)(?=\s)( *)/u;
+const BEARER_SCHEME_ANY_CASE_PATTERN = /^[Bb][Ee][Aa][Rr][Ee][Rr]$/u;
 const BASE64URL_SEGMENT_PATTERN = /^[A-Za-z0-9_-]+$/u;
 const SIGNATURE_REMOVED_BY_GOOGLE = "SIGNATURE_REMOVED_BY_GOOGLE";
 
@@ -160,21 +174,31 @@ function refuse(reason, invokerShape = null) {
   throw new OriginBoundaryRefusal(reason, invokerShape);
 }
 
+function invokerSchemeKind(scheme) {
+  if (scheme === "Bearer") return "Bearer";
+  return BEARER_SCHEME_ANY_CASE_PATTERN.test(scheme) ? "bearer-case-variant" : "other";
+}
+
 /**
  * A content-free summary of a delivered invoker header: whether it starts
- * with 'Bearer '; the number of '.'-separated segments after that prefix (or
- * in the whole value when it is absent); for the first
+ * with exactly 'Bearer '; its scheme kind (EDGE_ORIGIN_INVOKER_SCHEME_KINDS)
+ * and the number of spaces right after the scheme, capped at
+ * MAX_EDGE_ORIGIN_INVOKER_SEPARATOR_SPACES (0 when the scheme ends in other
+ * whitespace); the number of '.'-separated segments after the scheme and
+ * those spaces (in the whole value when there is no scheme); for the first
  * MAX_EDGE_ORIGIN_INVOKER_SHAPE_SEGMENTS segments, whether each is empty and
  * whether each matches /^[A-Za-z0-9_-]+$/; and whether the third segment is
  * exactly SIGNATURE_REMOVED_BY_GOOGLE. No character or length of the value
  * is kept.
  */
 function invokerTokenShape(value) {
-  const bearerPrefix = value.startsWith(INVOKER_BEARER_PREFIX);
-  const segments = (bearerPrefix ? value.slice(INVOKER_BEARER_PREFIX.length) : value).split(".");
+  const scheme = INVOKER_SCHEME_PATTERN.exec(value);
+  const segments = (scheme === null ? value : value.slice(scheme[0].length)).split(".");
   const described = segments.slice(0, MAX_EDGE_ORIGIN_INVOKER_SHAPE_SEGMENTS);
   return Object.freeze({
-    bearerPrefix,
+    bearerPrefix: value.startsWith(INVOKER_BEARER_PREFIX),
+    scheme: scheme === null ? "none" : invokerSchemeKind(scheme[1]),
+    separatorSpaces: scheme === null ? 0 : Math.min(scheme[2].length, MAX_EDGE_ORIGIN_INVOKER_SEPARATOR_SPACES),
     segments: segments.length,
     segmentEmpty: Object.freeze(described.map((segment) => segment === "")),
     segmentBase64url: Object.freeze(described.map((segment) => BASE64URL_SEGMENT_PATTERN.test(segment))),
@@ -187,12 +211,15 @@ function refuseInvoker(reason, token) {
 }
 
 /**
- * The reason a present header did not parse, from its shape alone: the
- * prefix, the segment count, a segment's alphabet, else its decoded header
- * or claims (JSON, email, aud, exp, iat or the 8192-character bound).
+ * The reason a present header did not parse, from its shape alone, in the
+ * contract's order: no Bearer scheme followed by a space, the segment count,
+ * a segment's alphabet, else its decoded header or claims (JSON, email, aud,
+ * exp, iat or the 8192-character bound).
  */
 function unparsedInvokerReason(shape) {
-  if (!shape.bearerPrefix) return "invoker_bearer_prefix_missing";
+  if ((shape.scheme !== "Bearer" && shape.scheme !== "bearer-case-variant") || shape.separatorSpaces === 0) {
+    return "invoker_bearer_prefix_missing";
+  }
   if (shape.segments !== 3) return "invoker_segments";
   if (shape.segmentBase64url.includes(false)) return "invoker_segment_encoding";
   return "invoker_claims_invalid";
