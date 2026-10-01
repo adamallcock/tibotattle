@@ -33,7 +33,10 @@
  * Any failure in steps 1-5 answers one constant, unmarked 421 with
  * ORIGIN_BOUNDARY_ERROR_BODY and connection: close, without reading the
  * request body, so every refusal looks the same and the edge maps it to its
- * own 503. Nothing here logs, buffers a body or keeps the token.
+ * own 503. Nothing here logs, buffers a body or keeps the token. Each refusal
+ * site names one constant reason (EDGE_ORIGIN_BOUNDARY_REFUSAL_REASONS); an
+ * optional onRefusal sink receives it, and for a delivered token's refusal
+ * the token's content-free shape, but the answer never carries either.
  */
 
 import { JSON_HEADERS } from "../src/constants.ts";
@@ -65,6 +68,60 @@ export const MAX_EDGE_ORIGIN_VERIFIER_ACCOUNTS = 4;
 export const MAX_EDGE_ORIGIN_URL_LENGTH = 16_384;
 
 /**
+ * The constant reason of each refusal site, for diagnostics only: every one
+ * answers the same 421. boundary_exception is an unexpected throw inside the
+ * checks; rebuilt_url_origin and token_expired guard what the URL parser and
+ * parseCloudRunInvokerClaims already ensure.
+ */
+export const EDGE_ORIGIN_BOUNDARY_REFUSAL_REASONS = Object.freeze([
+  "request_not_request",
+  "boundary_exception",
+  "invoker_header_missing",
+  "clock_invalid",
+  "invoker_bearer_prefix_missing",
+  "invoker_segments",
+  "invoker_segment_encoding",
+  "invoker_claims_invalid",
+  "email_unverified",
+  "audience_count",
+  "audience_mismatch",
+  "token_expired",
+  "email_mismatch",
+  "request_url_invalid",
+  "request_url_shape",
+  "verifier_method",
+  "verifier_edge_header",
+  "verifier_query",
+  "verifier_path",
+  "edge_header_unknown",
+  "edge_host_kind_invalid",
+  "request_id_invalid",
+  "admission_invalid",
+  "callback_raw_query",
+  "callback_query_misplaced",
+  "callback_query_invalid",
+  "rebuilt_url_origin",
+  "rebuilt_url_too_long",
+  "rebuilt_request_invalid",
+]);
+
+/** The refusals of a delivered invoker header; only these carry its shape. */
+export const EDGE_ORIGIN_INVOKER_TOKEN_REFUSAL_REASONS = Object.freeze([
+  "invoker_bearer_prefix_missing",
+  "invoker_segments",
+  "invoker_segment_encoding",
+  "invoker_claims_invalid",
+  "email_unverified",
+  "audience_count",
+  "audience_mismatch",
+  "token_expired",
+  "email_mismatch",
+]);
+
+/** How many leading segments an invoker shape describes one by one. */
+export const MAX_EDGE_ORIGIN_INVOKER_SHAPE_SEGMENTS = 8;
+
+/**
  * The constant refusal's headers: the Worker JSON headers (JSON, no-store,
  * no-referrer, nosniff) plus connection: close, and never the origin marker.
  */
@@ -76,6 +133,11 @@ export const ORIGIN_BOUNDARY_ERROR_HEADERS = Object.freeze({
 const EDGE_HEADER_PREFIX = "x-tibotattle-";
 const ORIGIN_MARKER_VALUE = "1";
 const ADMIN_HOST_PREFIX = "admin.";
+// The delivered header's documented form (src/edge-origin-contract.ts), used
+// here only to describe a refused header's shape.
+const INVOKER_BEARER_PREFIX = "Bearer ";
+const BASE64URL_SEGMENT_PATTERN = /^[A-Za-z0-9_-]+$/u;
+const SIGNATURE_REMOVED_BY_GOOGLE = "SIGNATURE_REMOVED_BY_GOOGLE";
 
 /** The edge context of each rebuilt Request, keyed on that exact object. */
 const edgeContexts = new WeakMap();
@@ -85,10 +147,66 @@ function configurationError(code) {
 }
 
 /** Thrown inside the boundary checks only; always answered as the 421. */
-class OriginBoundaryRefusal extends Error {}
+class OriginBoundaryRefusal extends Error {
+  constructor(reason, invokerShape) {
+    super(reason);
+    this.diagnostic = Object.freeze({ reason, invokerShape });
+  }
+}
 
-function refuse() {
-  throw new OriginBoundaryRefusal();
+const BOUNDARY_EXCEPTION_DIAGNOSTIC = Object.freeze({ reason: "boundary_exception", invokerShape: null });
+
+function refuse(reason, invokerShape = null) {
+  throw new OriginBoundaryRefusal(reason, invokerShape);
+}
+
+/**
+ * A content-free summary of a delivered invoker header: whether it starts
+ * with 'Bearer '; the number of '.'-separated segments after that prefix (or
+ * in the whole value when it is absent); for the first
+ * MAX_EDGE_ORIGIN_INVOKER_SHAPE_SEGMENTS segments, whether each is empty and
+ * whether each matches /^[A-Za-z0-9_-]+$/; and whether the third segment is
+ * exactly SIGNATURE_REMOVED_BY_GOOGLE. No character or length of the value
+ * is kept.
+ */
+function invokerTokenShape(value) {
+  const bearerPrefix = value.startsWith(INVOKER_BEARER_PREFIX);
+  const segments = (bearerPrefix ? value.slice(INVOKER_BEARER_PREFIX.length) : value).split(".");
+  const described = segments.slice(0, MAX_EDGE_ORIGIN_INVOKER_SHAPE_SEGMENTS);
+  return Object.freeze({
+    bearerPrefix,
+    segments: segments.length,
+    segmentEmpty: Object.freeze(described.map((segment) => segment === "")),
+    segmentBase64url: Object.freeze(described.map((segment) => BASE64URL_SEGMENT_PATTERN.test(segment))),
+    signatureRemovedByGoogle: segments[2] === SIGNATURE_REMOVED_BY_GOOGLE,
+  });
+}
+
+function refuseInvoker(reason, token) {
+  refuse(reason, invokerTokenShape(token));
+}
+
+/**
+ * The reason a present header did not parse, from its shape alone: the
+ * prefix, the segment count, a segment's alphabet, else its decoded header
+ * or claims (JSON, email, aud, exp, iat or the 8192-character bound).
+ */
+function unparsedInvokerReason(shape) {
+  if (!shape.bearerPrefix) return "invoker_bearer_prefix_missing";
+  if (shape.segments !== 3) return "invoker_segments";
+  if (shape.segmentBase64url.includes(false)) return "invoker_segment_encoding";
+  return "invoker_claims_invalid";
+}
+
+/** Hands one diagnostic to the sink; a sink that throws or rejects changes nothing. */
+function reportRefusal(onRefusal, diagnostic) {
+  if (onRefusal === null) return;
+  try {
+    const result = onRefusal(diagnostic);
+    if (typeof result?.then === "function") Promise.resolve(result).catch(() => undefined);
+  } catch {
+    // Diagnostics never change the constant answer.
+  }
 }
 
 function originBoundaryRefusalResponse() {
@@ -124,7 +242,7 @@ function verifierAccounts(value, invokerServiceAccount) {
 function nowSecondsFrom(clock) {
   const milliseconds = clock();
   if (typeof milliseconds !== "number" || !Number.isFinite(milliseconds) || milliseconds < 0) {
-    refuse();
+    refuse("clock_invalid");
   }
   return Math.floor(milliseconds / 1000);
 }
@@ -132,20 +250,21 @@ function nowSecondsFrom(clock) {
 /** The caller role the delivered claims prove, or a refusal. */
 function callerRole(headers, config) {
   const token = headers.get(EDGE_HEADERS.invokerToken);
-  if (token === null) refuse();
+  if (token === null) refuse("invoker_header_missing");
   const nowSeconds = nowSecondsFrom(config.clock);
   // Duplicate headers arrive joined with ', ', which never parses.
   const claims = parseCloudRunInvokerClaims(token, nowSeconds);
-  if (claims === null
-      || claims.emailVerified !== true
-      || claims.audiences.length !== 1
-      || claims.audiences[0] !== config.audience
-      || !(claims.expiresAt > nowSeconds - EDGE_INVOKER_CLOCK_SKEW_SECONDS)) {
-    refuse();
+  if (claims === null) {
+    const shape = invokerTokenShape(token);
+    refuse(unparsedInvokerReason(shape), shape);
   }
+  if (claims.emailVerified !== true) refuseInvoker("email_unverified", token);
+  if (claims.audiences.length !== 1) refuseInvoker("audience_count", token);
+  if (claims.audiences[0] !== config.audience) refuseInvoker("audience_mismatch", token);
+  if (!(claims.expiresAt > nowSeconds - EDGE_INVOKER_CLOCK_SKEW_SECONDS)) refuseInvoker("token_expired", token);
   if (claims.email === config.invokerServiceAccount) return "invoker";
   if (config.verifierServiceAccounts.includes(claims.email)) return "verifier";
-  return refuse();
+  return refuseInvoker("email_mismatch", token);
 }
 
 function edgeHeaderNames(headers) {
@@ -158,38 +277,38 @@ function edgeHeaderNames(headers) {
 
 function rawUrlOf(request) {
   let url;
-  try { url = new URL(request.url); } catch { refuse(); }
+  try { url = new URL(request.url); } catch { refuse("request_url_invalid"); }
   if ((url.protocol !== "https:" && url.protocol !== "http:") || !url.pathname.startsWith("/")) {
-    refuse();
+    refuse("request_url_shape");
   }
   return url;
 }
 
 /** Verifier: a plain GET of health or readiness, rebuilt on the apex. */
 function verifierEdge(request, rawUrl, edgeNames) {
-  if (request.method !== "GET" || edgeNames.size !== 0 || rawUrl.search !== ""
-      || !EDGE_ORIGIN_VERIFIER_PATHNAMES.includes(rawUrl.pathname)) {
-    refuse();
-  }
+  if (request.method !== "GET") refuse("verifier_method");
+  if (edgeNames.size !== 0) refuse("verifier_edge_header");
+  if (rawUrl.search !== "") refuse("verifier_query");
+  if (!EDGE_ORIGIN_VERIFIER_PATHNAMES.includes(rawUrl.pathname)) refuse("verifier_path");
   return { hostKind: "apex", requestId: null, admission: null, callbackQuery: null };
 }
 
 /** Invoker: exactly the contract headers, each once and valid. */
 function invokerEdge(request, rawUrl, edgeNames) {
   for (const name of edgeNames) {
-    if (!EDGE_CONTRACT_REQUEST_HEADERS.includes(name)) refuse();
+    if (!EDGE_CONTRACT_REQUEST_HEADERS.includes(name)) refuse("edge_header_unknown");
   }
   const { headers } = request;
   // Headers.get joins repeated values with ', ', which no valid value
   // contains, so a repeated header is refused by its own check.
   const hostKind = headers.get(EDGE_HEADERS.host);
-  if (!EDGE_HOST_KINDS.includes(hostKind)) refuse();
+  if (!EDGE_HOST_KINDS.includes(hostKind)) refuse("edge_host_kind_invalid");
   const requestId = headers.get(EDGE_HEADERS.requestId);
-  if (!isEdgeRequestId(requestId)) refuse();
+  if (!isEdgeRequestId(requestId)) refuse("request_id_invalid");
   let admission = null;
   if (headers.has(EDGE_HEADERS.admission)) {
     admission = decodeEdgeAdmission(headers.get(EDGE_HEADERS.admission));
-    if (admission === null) refuse();
+    if (admission === null) refuse("admission_invalid");
   }
   // The edge never forwards the callback's own query: the OAuth code and state
   // travel only in the callback header, and on the admin host not at all. So
@@ -197,15 +316,14 @@ function invokerEdge(request, rawUrl, edgeNames) {
   // as request-boundary.mjs refuses it: an edge that puts the query on the
   // origin URL (and so in the origin's request logs) fails at once instead of
   // completing the sign-in.
-  if (rawUrl.pathname === GOOGLE_CALLBACK_PATH && rawUrl.search !== "") refuse();
+  if (rawUrl.pathname === GOOGLE_CALLBACK_PATH && rawUrl.search !== "") refuse("callback_raw_query");
   let callbackQuery = null;
   if (headers.has(EDGE_HEADERS.callbackQuery)) {
     callbackQuery = headers.get(EDGE_HEADERS.callbackQuery);
-    if (hostKind !== "apex" || request.method !== "GET"
-        || rawUrl.pathname !== GOOGLE_CALLBACK_PATH
-        || !validGoogleCallbackQuery(callbackQuery)) {
-      refuse();
+    if (hostKind !== "apex" || request.method !== "GET" || rawUrl.pathname !== GOOGLE_CALLBACK_PATH) {
+      refuse("callback_query_misplaced");
     }
+    if (!validGoogleCallbackQuery(callbackQuery)) refuse("callback_query_invalid");
   }
   return { hostKind, requestId, admission, callbackQuery };
 }
@@ -218,10 +336,8 @@ function rebuiltUrl(rawUrl, edge, origins) {
   url.pathname = rawUrl.pathname;
   url.search = edge.callbackQuery ?? rawUrl.search;
   const href = url.href;
-  if (url.origin !== base || !url.pathname.startsWith("/")
-      || href.length > MAX_EDGE_ORIGIN_URL_LENGTH) {
-    refuse();
-  }
+  if (url.origin !== base || !url.pathname.startsWith("/")) refuse("rebuilt_url_origin");
+  if (href.length > MAX_EDGE_ORIGIN_URL_LENGTH) refuse("rebuilt_url_too_long");
   return href;
 }
 
@@ -239,7 +355,7 @@ function forwardedHeaders(rawHeaders, hostKind) {
 
 /** Steps 1-5 and the rebuilt Request, or an OriginBoundaryRefusal. */
 function admittedRequest(rawRequest, config) {
-  if (!(rawRequest instanceof Request)) refuse();
+  if (!(rawRequest instanceof Request)) refuse("request_not_request");
   const role = callerRole(rawRequest.headers, config);
   const rawUrl = rawUrlOf(rawRequest);
   const edgeNames = edgeHeaderNames(rawRequest.headers);
@@ -258,7 +374,7 @@ function admittedRequest(rawRequest, config) {
       signal: rawRequest.signal,
     });
   } catch {
-    refuse();
+    refuse("rebuilt_request_invalid");
   }
   if (edge.requestId !== null) {
     edgeContexts.set(request, Object.freeze({ requestId: edge.requestId, hostKind: edge.hostKind }));
@@ -313,7 +429,14 @@ export const edgeServedAssets = Object.freeze({
 /**
  * Create the boundary. inner is the production request handler
  * (async (request) => Response); admission is createEdgeAdmissionLimiters();
- * clock returns epoch milliseconds (Date.now by default).
+ * clock returns epoch milliseconds (Date.now by default). onRefusal, when
+ * given, is called synchronously once per refusal with a frozen
+ * { reason, invokerShape }: reason is one of
+ * EDGE_ORIGIN_BOUNDARY_REFUSAL_REASONS, and invokerShape is the delivered
+ * header's shape (invokerTokenShape) for
+ * EDGE_ORIGIN_INVOKER_TOKEN_REFUSAL_REASONS, else null. Neither carries a
+ * header value, the token, an email, a host or a path; a sink that throws
+ * changes nothing.
  */
 export function createEdgeOriginDispatch({
   invokerServiceAccount,
@@ -323,6 +446,7 @@ export function createEdgeOriginDispatch({
   admission,
   inner,
   clock = Date.now,
+  onRefusal,
 } = {}) {
   if (!isEdgeServiceAccountEmail(invokerServiceAccount)) {
     throw configurationError("EDGE_ORIGIN_INVOKER_INVALID");
@@ -336,6 +460,10 @@ export function createEdgeOriginDispatch({
   }
   if (typeof inner !== "function") throw configurationError("EDGE_ORIGIN_INNER_INVALID");
   if (typeof clock !== "function") throw configurationError("EDGE_ORIGIN_CLOCK_INVALID");
+  if (onRefusal !== undefined && typeof onRefusal !== "function") {
+    throw configurationError("EDGE_ORIGIN_REFUSAL_SINK_INVALID");
+  }
+  const refusalSink = onRefusal ?? null;
   const config = Object.freeze({
     invokerServiceAccount,
     verifierServiceAccounts: verifiers,
@@ -351,7 +479,9 @@ export function createEdgeOriginDispatch({
     let admitted;
     try {
       admitted = admittedRequest(rawRequest, config);
-    } catch {
+    } catch (error) {
+      reportRefusal(refusalSink, error instanceof OriginBoundaryRefusal
+        ? error.diagnostic : BOUNDARY_EXCEPTION_DIAGNOSTIC);
       return originBoundaryRefusalResponse();
     }
     let response;

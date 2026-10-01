@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
 import { dirname, resolve } from "node:path";
-import { after, before, test } from "node:test";
+import { after, before, mock, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { createServer } from "vite";
 
@@ -125,6 +125,32 @@ function read(env, postgresTestMode = "fastpath-test") {
 
 function assertRefused(work, code, label) {
   assert.throws(work, (error) => error?.code === code, label ?? code);
+}
+
+/**
+ * Runs work with console.log captured (the edge-test refusal log), so each
+ * test can read the lines it caused and nothing reaches the test output.
+ */
+async function withCapturedLog(work) {
+  const lines = [];
+  const spy = mock.method(console, "log", (...args) => { lines.push(args.join(" ")); });
+  try {
+    return await work(lines);
+  } finally {
+    spy.mock.restore();
+  }
+}
+
+/** The reasons of captured refusal lines, each checked to be the closed line. */
+function loggedReasons(lines) {
+  return lines.map((line) => {
+    const parsed = JSON.parse(line);
+    assert.equal(parsed.event, "edge_origin_boundary_refusal", line);
+    const keys = Object.keys(parsed);
+    assert.deepEqual(keys.slice(0, 2), ["event", "reason"], line);
+    assert.ok(keys.length === 2 || (keys.length === 3 && keys[2] === "invokerShape"), line);
+    return parsed.reason;
+  });
 }
 
 async function freePort() {
@@ -406,7 +432,7 @@ function edgeRequest({ method = "GET", path = "/api/health", hostKind = "apex", 
   return new Request(`http://127.0.0.1:43010${path}`, { method, headers: list });
 }
 
-test("composeEdgeTestOrigin: issued configuration only; admin host answers the unported 503 without inner", async () => {
+test("composeEdgeTestOrigin: issued configuration only; admin host answers the unported 503 without inner", () => withCapturedLog(async (lines) => {
   const configuration = read(localEnv(43010, { EDGE_ORIGIN_VERIFIER_SERVICE_ACCOUNTS: VERIFIER }));
   const admission = limiters.createEdgeAdmissionLimiters();
   assertRefused(() => mode.composeEdgeTestOrigin({ configuration: { ...configuration }, admission, inner: async () => {} }),
@@ -450,13 +476,15 @@ test("composeEdgeTestOrigin: issued configuration only; admin host answers the u
   assert.equal(verifier.status, 200);
   assert.equal(seen.length, 2);
   assert.equal(seen[1].url, "https://tibotattle.test/api/health");
-  // EP-6 refusals stay unmarked 421s.
+  // EP-6 refusals stay unmarked 421s, and each logs its one reason line.
+  assert.deepEqual(lines, [], "admitted and unported requests log nothing");
   const refused = await dispatch(edgeRequest({ auth: null }));
   assert.equal(refused.status, 421);
   assert.equal(mode.isEdgeOriginBoundaryRefusal(refused), true);
   assert.equal(mode.isEdgeOriginBoundaryRefusal(apex), false);
   assert.equal(seen.length, 2);
-});
+  assert.deepEqual(lines, ["{\"event\":\"edge_origin_boundary_refusal\",\"reason\":\"invoker_header_missing\"}"]);
+}));
 
 // ---------------------------------------------------------------------------
 // The raw Node request path through the real serve()
@@ -506,7 +534,7 @@ function exchange(port, { method = "GET", target = "/api/health", headers = [], 
         return;
       }
       settled = true;
-      resolveExchange({ status, headers: responseHeaders, text: bodyText, socket });
+      resolveExchange({ status, headers: responseHeaders, text: bodyText, socket, raw: text });
     };
     socket.on("data", (chunk) => { data = Buffer.concat([data, chunk]); finish(); });
     socket.on("end", finish);
@@ -578,28 +606,41 @@ test("edgeTestRequestFromNode: the URL is HOST_ORIGIN plus the raw target, at mo
   const res = { once() {}, writableEnded: false };
   const longest = `/${"q".repeat(16_384 - hostOrigin.length - 1)}`;
   assert.equal(mode.edgeTestRequestFromNode(fake(longest), res, { hostOrigin }).url, hostOrigin + longest);
-  assert.throws(() => mode.edgeTestRequestFromNode(fake(`${longest}q`), res, { hostOrigin }),
-    mode.EdgeTestBoundaryRefusal);
   // A '//host' target stays a path on HOST_ORIGIN.
   assert.equal(mode.edgeTestRequestFromNode(fake("//evil.example/x"), res, { hostOrigin }).url,
     `${hostOrigin}//evil.example/x`);
-  for (const [label, request, options] of [
-    ["asterisk target", fake("*"), { hostOrigin }],
-    ["absolute target", fake("http://evil.example/x"), { hostOrigin }],
-    ["missing Host", fake("/api/health", null), { hostOrigin }],
-    ["Host with another port", fake("/api/health", "127.0.0.1:43021"), { hostOrigin }],
-    ["HOST_ORIGIN with a path", fake("/api/health"), { hostOrigin: `${hostOrigin}/` }],
-    ["no HOST_ORIGIN", fake("/api/health"), {}],
+  const observed = new Set();
+  for (const [label, request, options, reason] of [
+    ["a target over 16384 characters", fake(`${longest}q`), { hostOrigin }, "request_target_too_long"],
+    ["asterisk target", fake("*"), { hostOrigin }, "request_target_invalid"],
+    ["absolute target", fake("http://evil.example/x"), { hostOrigin }, "request_target_invalid"],
+    ["missing Host", fake("/api/health", null), { hostOrigin }, "host_header_missing"],
+    ["Host with another port", fake("/api/health", "127.0.0.1:43021"), { hostOrigin }, "host_mismatch"],
+    ["HOST_ORIGIN with a path", fake("/api/health"), { hostOrigin: `${hostOrigin}/` }, "host_origin_not_canonical"],
+    ["no HOST_ORIGIN", fake("/api/health"), {}, "host_origin_invalid"],
+    ["a raw header Headers refuses", { ...fake("/api/health"), rawHeaders: ["Host", "127.0.0.1:43020", "bad name", "x"] },
+      { hostOrigin }, "raw_headers_invalid"],
+    ["a method Request refuses", { ...fake("/api/health"), method: "TRACE" }, { hostOrigin }, "node_request_invalid"],
   ]) {
-    assert.throws(() => mode.edgeTestRequestFromNode(request, res, options), mode.EdgeTestBoundaryRefusal, label);
+    assert.throws(() => mode.edgeTestRequestFromNode(request, res, options), (error) => {
+      assert.ok(error instanceof mode.EdgeTestBoundaryRefusal, label);
+      assert.equal(error.code, "EDGE_TEST_ORIGIN_BOUNDARY_REFUSED", label);
+      assert.equal(error.reason, reason, label);
+      return true;
+    }, label);
+    observed.add(reason);
   }
+  // request_target_unparseable and request_target_origin guard what the URL
+  // parser already ensures for a target that starts with '/'.
+  assert.deepEqual([...observed].sort(), mode.EDGE_TEST_REQUEST_REFUSAL_REASONS
+    .filter((reason) => !["request_target_unparseable", "request_target_origin"].includes(reason)).sort());
   // The Host comparison is case-insensitive, as HTTP hosts are.
   const named = "http://localhost:43020";
   assert.equal(mode.edgeTestRequestFromNode(fake("/api/health", "LocalHost:43020"), res, { hostOrigin: named }).url,
     `${named}/api/health`);
 });
 
-test("serve(): a wrong Host and an absolute target are refused before EP-6", async () => {
+test("serve(): a wrong Host and an absolute target are refused before EP-6", () => withCapturedLog(async (lines) => {
   const seen = [];
   await withServedRuntime(() => async (request) => {
     seen.push(request);
@@ -621,9 +662,10 @@ test("serve(): a wrong Host and an absolute target are refused before EP-6", asy
     assert.equal(admitted.headers.get("x-tibotattle-origin"), "1");
   });
   assert.equal(seen.length, 1);
-});
+  assert.deepEqual(loggedReasons(lines), ["host_mismatch", "host_mismatch", "request_target_invalid"]);
+}));
 
-test("serve(): EP-6 refusals are written with connection: close while the body is still unread", async () => {
+test("serve(): EP-6 refusals are written with connection: close while the body is still unread", () => withCapturedLog(async (lines) => {
   let innerCalls = 0;
   await withServedRuntime(() => async () => {
     innerCalls += 1;
@@ -650,7 +692,145 @@ test("serve(): EP-6 refusals are written with connection: close while the body i
     }
   });
   assert.equal(innerCalls, 0);
+  assert.deepEqual(loggedReasons(lines), ["invoker_header_missing", "edge_header_unknown", "verifier_method"]);
+}));
+
+test("the refusal log line is closed: event, a listed reason and, for a token refusal, its shape", () => {
+  const requestReasons = mode.EDGE_TEST_REQUEST_REFUSAL_REASONS;
+  const boundaryReasons = edgeDispatch.EDGE_ORIGIN_BOUNDARY_REFUSAL_REASONS;
+  assert.ok(Object.isFrozen(requestReasons));
+  assert.equal(new Set(requestReasons).size, requestReasons.length);
+  assert.deepEqual(requestReasons.filter((reason) => boundaryReasons.includes(reason)), [],
+    "no reason names two sites");
+  assert.equal(mode.EDGE_ORIGIN_BOUNDARY_REFUSAL_EVENT, "edge_origin_boundary_refusal");
+  const shape = Object.freeze({
+    bearerPrefix: true,
+    segments: 3,
+    segmentEmpty: Object.freeze([false, false, false]),
+    segmentBase64url: Object.freeze([true, true, true]),
+    signatureRemovedByGoogle: true,
+  });
+  const line = mode.edgeTestBoundaryRefusalLogLine;
+  assert.equal(line(new mode.EdgeTestBoundaryRefusal("host_mismatch")),
+    "{\"event\":\"edge_origin_boundary_refusal\",\"reason\":\"host_mismatch\"}");
+  assert.equal(line({ reason: "audience_mismatch", invokerShape: shape }),
+    "{\"event\":\"edge_origin_boundary_refusal\",\"reason\":\"audience_mismatch\",\"invokerShape\":"
+    + "{\"bearerPrefix\":true,\"segments\":3,\"segmentEmpty\":[false,false,false],"
+    + "\"segmentBase64url\":[true,true,true],\"signatureRemovedByGoogle\":true}}");
+  // Only a token refusal carries a shape.
+  assert.equal(line({ reason: "edge_host_kind_invalid", invokerShape: shape }),
+    "{\"event\":\"edge_origin_boundary_refusal\",\"reason\":\"edge_host_kind_invalid\"}");
+  // Nothing outside the allowlist reaches the line, whatever a diagnostic carries.
+  const secret = "Bearer synthetic.secret-token.SIGNATURE_REMOVED_BY_GOOGLE edge-invoker@synthetic.example /p?q=secret";
+  for (const diagnostic of [
+    { reason: secret },
+    { reason: "host_mismatch", host: secret, path: secret },
+    { reason: "email_mismatch", email: secret, invokerShape: {
+      ...shape, token: secret, segments: secret, segmentEmpty: [secret, true], segmentBase64url: secret,
+      signatureRemovedByGoogle: secret, bearerPrefix: "true" } },
+    null,
+    undefined,
+    secret,
+  ]) {
+    const written = line(diagnostic);
+    assert.ok(!written.includes("secret") && !written.includes("@") && !written.includes("Bearer"), written);
+    assert.ok(!written.includes("SIGNATURE_REMOVED_BY_GOOGLE"), written);
+  }
+  assert.equal(line({ reason: secret }), "{\"event\":\"edge_origin_boundary_refusal\",\"reason\":\"unclassified\"}");
+  assert.equal(line({ reason: "email_mismatch", invokerShape: {
+    ...shape, token: secret, segments: secret, segmentEmpty: [secret, true],
+    segmentBase64url: Array(20).fill(true), bearerPrefix: "true" } }),
+  "{\"event\":\"edge_origin_boundary_refusal\",\"reason\":\"email_mismatch\",\"invokerShape\":"
+    + "{\"bearerPrefix\":false,\"segments\":null,\"segmentEmpty\":[false,true],"
+    + "\"segmentBase64url\":[true,true,true,true,true,true,true,true],\"signatureRemovedByGoogle\":true}}");
+  // logEdgeTestBoundaryRefusal writes exactly that line once and never throws.
+  const written = [];
+  mode.logEdgeTestBoundaryRefusal({ reason: "audience_count", invokerShape: shape }, (value) => written.push(value));
+  assert.deepEqual(written, [line({ reason: "audience_count", invokerShape: shape })]);
+  assert.doesNotThrow(() => mode.logEdgeTestBoundaryRefusal({ reason: "host_mismatch" }, () => {
+    throw new Error("synthetic log failure");
+  }));
 });
+
+test("serve(): one content-free reason line per refusal; the 421 bytes never change", () => withCapturedLog(async (lines) => {
+  // Synthetic secrets wherever a refused request carries content.
+  const secretSubject = "synthetic-subject-secret-5d2a";
+  const secretToken = token({ sub: secretSubject });
+  const secretPath = "/api/v1/secret-path?secret-query=synthetic-query-secret";
+  const otherAccount = "other-invoker@synthetic-edge-0.iam.gserviceaccount.com";
+  const audienceToken = token({ sub: secretSubject, aud: "https://secret-audience.synthetic.example" });
+  const strangerToken = token({ sub: secretSubject, email: otherAccount });
+  let innerCalls = 0;
+  const answers = [];
+  const sentValues = new Set();
+  await withServedRuntime(() => async () => {
+    innerCalls += 1;
+    return new Response("{}");
+  }, async ({ port, host }) => {
+    const edge = (auth) => [["x-serverless-authorization", auth], ["x-tibotattle-edge-host", "apex"],
+      ["x-tibotattle-edge-request-id", REQUEST_ID]];
+    const rows = [
+      ["wrong Host", { target: secretPath, headers: [["host", "secret-host.synthetic.example"], ...edge(secretToken)] },
+        "host_mismatch", null],
+      ["absolute target", { target: `http://${host}${secretPath}`, headers: [["host", host], ...edge(secretToken)] },
+        "request_target_invalid", null],
+      ["TRACE", { method: "TRACE", target: secretPath, headers: [["host", host], ...edge(secretToken)] },
+        "node_request_invalid", null],
+      ["no token", { target: secretPath, headers: [["host", host], ["x-tibotattle-edge-host", "apex"],
+        ["x-tibotattle-edge-request-id", REQUEST_ID]] }, "invoker_header_missing", null],
+      ["another audience", { target: secretPath, headers: [["host", host], ...edge(audienceToken)] },
+        "audience_mismatch", { bearerPrefix: true, segments: 3, segmentEmpty: [false, false, false],
+          segmentBase64url: [true, true, true], signatureRemovedByGoogle: true }],
+      ["another account", { target: secretPath, headers: [["host", host], ...edge(strangerToken)] },
+        "email_mismatch", { bearerPrefix: true, segments: 3, segmentEmpty: [false, false, false],
+          segmentBase64url: [true, true, true], signatureRemovedByGoogle: true }],
+      ["no 'Bearer '", { target: secretPath, headers: [["host", host], ...edge(secretToken.slice("Bearer ".length))] },
+        "invoker_bearer_prefix_missing", { bearerPrefix: false, segments: 3, segmentEmpty: [false, false, false],
+          segmentBase64url: [true, true, true], signatureRemovedByGoogle: true }],
+      ["an intact signature with a second token", { target: secretPath, headers: [["host", host],
+        ...edge(`${secretToken.replace("SIGNATURE_REMOVED_BY_GOOGLE", "c2VjcmV0LXNpZw")}`),
+        ["x-serverless-authorization", secretToken]] },
+        "invoker_segments", { bearerPrefix: true, segments: 5, segmentEmpty: [false, false, false, false, false],
+          segmentBase64url: [true, true, false, true, true], signatureRemovedByGoogle: false }],
+      ["client edge key", { target: secretPath, headers: [["host", host], ...edge(secretToken),
+        ["x-tibotattle-edge-client-key", "secret-client-key-0123456789abcdef"]] }, "edge_header_unknown", null],
+      ["verifier query", { target: "/api/health?secret-query=1",
+        headers: [["host", host], ["x-serverless-authorization", token({ sub: secretSubject, email: VERIFIER })]] },
+      "verifier_query", null],
+    ];
+    for (const [label, request, reason, shape] of rows) {
+      for (const [, value] of request.headers) sentValues.add(value);
+      sentValues.add(request.target);
+      const before = lines.length;
+      const answer = await exchange(port, request);
+      assertBoundaryRefusal(answer, label);
+      answers.push([label, answer.raw.replace(/\r\nDate: [^\r]*/u, "")]);
+      assert.equal(lines.length, before + 1, `${label}: exactly one line`);
+      assert.deepEqual(loggedReasons(lines.slice(-1)), [reason], label);
+      assert.deepEqual(JSON.parse(lines.at(-1)).invokerShape, shape ?? undefined, label);
+    }
+    // An admitted request logs nothing.
+    const before = lines.length;
+    const admitted = await exchange(port, { headers: [["host", host], ...edge(secretToken)] });
+    assert.equal(admitted.status, 200);
+    assert.equal(lines.length, before);
+  });
+  assert.equal(innerCalls, 1);
+  // Byte for byte (Date aside), every refusal is the same answer.
+  for (const [label, raw] of answers) assert.equal(raw, answers[0][1], label);
+  // No line carries a token, a segment, an email, a header value, a host or a path.
+  const needles = new Set([secretSubject, "secret", "@", "Bearer", "SIGNATURE_REMOVED_BY_GOOGLE", INVOKER,
+    VERIFIER, otherAccount, AUDIENCE, REQUEST_ID, "127.0.0.1", "/api/"]);
+  for (const value of sentValues) {
+    needles.add(value);
+    for (const fragment of value.split(/[ .,;?=]+/u)) if (fragment.length >= 6) needles.add(fragment);
+  }
+  const logged = lines.join("\n");
+  for (const needle of needles) {
+    if (needle.length < 4 && needle !== "@") continue;
+    assert.ok(!logged.includes(needle), `a refusal line carries ${JSON.stringify(needle.slice(0, 24))}`);
+  }
+}));
 
 test("serve(): inner never sees cf-*, x-forwarded-*, the token or x-tibotattle-*; bodies stream", async () => {
   const seen = [];

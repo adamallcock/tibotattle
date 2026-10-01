@@ -161,6 +161,7 @@ import {
   isEdgeOriginBoundaryRefusal,
   isEdgeTestCloudListen,
   lingerAfterEarlyEdgeTestAnswer,
+  logEdgeTestBoundaryRefusal,
   readEdgeTestOriginConfiguration,
   writeEdgeTestBoundaryRefusal,
 } from "./origin-edge-test-mode.mjs";
@@ -1065,11 +1066,14 @@ export async function serve(runtime) {
       let request;
       if (edgeTest) {
         // edge-test keeps the raw headers for EP-6; a refusal here, and EP-6's
-        // unmarked 421 below, end the socket without reading the body.
+        // unmarked 421 below, end the socket without reading the body. Each
+        // logs its one content-free reason line: this one here, EP-6's inside
+        // the composition (composeEdgeTestOrigin).
         try {
           request = runtime.edgeTestRequestFromNode(req, res);
         } catch (error) {
           if (!(error instanceof EdgeTestBoundaryRefusal)) throw error;
+          logEdgeTestBoundaryRefusal(error);
           writeEdgeTestBoundaryRefusal(res);
           return;
         }

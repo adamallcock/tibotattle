@@ -189,6 +189,48 @@ function recordingInner(respond = () => new Response("inner", { status: 200 })) 
   return { inner, calls };
 }
 
+/** Reasons some test in this file observed; the coverage test reads it. */
+const observedReasons = new Set();
+
+/** A refusal sink that records each diagnostic (and its reason for coverage). */
+function recordingSink() {
+  const diagnostics = [];
+  const onRefusal = (diagnostic) => {
+    diagnostics.push(diagnostic);
+    observedReasons.add(diagnostic.reason);
+  };
+  return { onRefusal, diagnostics };
+}
+
+const SHAPE_KEYS = Object.freeze(["bearerPrefix", "segments", "segmentEmpty", "segmentBase64url",
+  "signatureRemovedByGoogle"]);
+
+/**
+ * A diagnostic is closed: a listed reason and, only for an invoker-token
+ * reason, a shape of booleans and one segment count; nothing else.
+ */
+function assertClosedDiagnostic(diagnostic, label) {
+  assert.ok(Object.isFrozen(diagnostic), label);
+  assert.deepEqual(Object.keys(diagnostic).sort(), ["invokerShape", "reason"], label);
+  assert.ok(dispatchModule.EDGE_ORIGIN_BOUNDARY_REFUSAL_REASONS.includes(diagnostic.reason), label);
+  const shaped = dispatchModule.EDGE_ORIGIN_INVOKER_TOKEN_REFUSAL_REASONS.includes(diagnostic.reason);
+  if (!shaped) {
+    assert.equal(diagnostic.invokerShape, null, label);
+    return;
+  }
+  const shape = diagnostic.invokerShape;
+  assert.ok(Object.isFrozen(shape), label);
+  assert.deepEqual(Object.keys(shape).sort(), [...SHAPE_KEYS].sort(), label);
+  assert.equal(typeof shape.bearerPrefix, "boolean", label);
+  assert.ok(Number.isSafeInteger(shape.segments) && shape.segments >= 1, label);
+  assert.equal(typeof shape.signatureRemovedByGoogle, "boolean", label);
+  for (const flags of [shape.segmentEmpty, shape.segmentBase64url]) {
+    assert.ok(Array.isArray(flags) && Object.isFrozen(flags), label);
+    assert.equal(flags.length, Math.min(shape.segments, dispatchModule.MAX_EDGE_ORIGIN_INVOKER_SHAPE_SEGMENTS), label);
+    for (const flag of flags) assert.equal(typeof flag, "boolean", label);
+  }
+}
+
 function createDispatch(overrides = {}) {
   return dispatchModule.createEdgeOriginDispatch({
     invokerServiceAccount: INVOKER,
@@ -216,70 +258,73 @@ function assertMarked(response) {
 
 const INVALID_CASES = Object.freeze([
   // Delivered claims.
-  { label: "a missing token", request: { auth: null } },
-  { label: "a duplicate token", request: { headers: [["x-serverless-authorization", token()], ["x-serverless-authorization", token()]] } },
-  { label: "a wrong audience", request: { auth: token({ aud: "https://origin.synthetic.example/other" }) } },
-  { label: "the audience among others", request: { auth: token({ aud: [AUDIENCE, "https://origin.synthetic.example/other"] }) } },
-  { label: "a wrong email", request: { auth: token({ email: OTHER_ACCOUNT }) } },
-  { label: "a case-changed email", request: { auth: token({ email: INVOKER.toUpperCase() }) } },
-  { label: "email_verified false", request: { auth: token({ email_verified: false }) } },
-  { label: "email_verified missing", request: { auth: token({}, ["email_verified"]) } },
-  { label: "email_verified as a string", request: { auth: token({ email_verified: "true" }) } },
-  { label: "an expired token", request: { auth: token({ exp: NOW_SECONDS - 60, iat: NOW_SECONDS - 3_660 }) } },
-  { label: "a long-expired token", request: { auth: token({ exp: NOW_SECONDS - 86_400, iat: NOW_SECONDS - 90_000 }) } },
-  { label: "a token issued in the future", request: { auth: token({ iat: NOW_SECONDS + 120 }) } },
-  { label: "a malformed JWT (two segments)", request: { auth: token().split(".").slice(0, 2).join(".") } },
-  { label: "a malformed JWT (non-JSON payload)", request: { auth: `Bearer ${base64UrlJson({ alg: "RS256" })}.bm90LWpzb24.SIG` } },
-  { label: "a lowercase bearer scheme", request: { auth: token().replace("Bearer ", "bearer ") } },
-  { label: "a Basic credential", request: { auth: "Basic c3ludGhldGljOnN5bnRoZXRpYw==" } },
+  { label: "a missing token", reason: "invoker_header_missing", request: { auth: null } },
+  { label: "a duplicate token", reason: "invoker_segments", request: { headers: [["x-serverless-authorization", token()], ["x-serverless-authorization", token()]] } },
+  { label: "a wrong audience", reason: "audience_mismatch", request: { auth: token({ aud: "https://origin.synthetic.example/other" }) } },
+  { label: "the audience among others", reason: "audience_count", request: { auth: token({ aud: [AUDIENCE, "https://origin.synthetic.example/other"] }) } },
+  { label: "a wrong email", reason: "email_mismatch", request: { auth: token({ email: OTHER_ACCOUNT }) } },
+  { label: "a case-changed email", reason: "email_mismatch", request: { auth: token({ email: INVOKER.toUpperCase() }) } },
+  { label: "email_verified false", reason: "email_unverified", request: { auth: token({ email_verified: false }) } },
+  { label: "email_verified missing", reason: "email_unverified", request: { auth: token({}, ["email_verified"]) } },
+  { label: "email_verified as a string", reason: "invoker_claims_invalid", request: { auth: token({ email_verified: "true" }) } },
+  { label: "an expired token", reason: "invoker_claims_invalid", request: { auth: token({ exp: NOW_SECONDS - 60, iat: NOW_SECONDS - 3_660 }) } },
+  { label: "a long-expired token", reason: "invoker_claims_invalid", request: { auth: token({ exp: NOW_SECONDS - 86_400, iat: NOW_SECONDS - 90_000 }) } },
+  { label: "a token issued in the future", reason: "invoker_claims_invalid", request: { auth: token({ iat: NOW_SECONDS + 120 }) } },
+  { label: "a malformed JWT (two segments)", reason: "invoker_segments", request: { auth: token().split(".").slice(0, 2).join(".") } },
+  { label: "a malformed JWT (non-JSON payload)", reason: "invoker_claims_invalid", request: { auth: `Bearer ${base64UrlJson({ alg: "RS256" })}.bm90LWpzb24.SIG` } },
+  { label: "a lowercase bearer scheme", reason: "invoker_bearer_prefix_missing", request: { auth: token().replace("Bearer ", "bearer ") } },
+  { label: "a Basic credential", reason: "invoker_bearer_prefix_missing", request: { auth: "Basic c3ludGhldGljOnN5bnRoZXRpYw==" } },
   // Edge identity headers.
-  { label: "host kind 'www'", request: { headers: [["x-tibotattle-edge-host", "www"]] } },
-  { label: "host kind 'APEX'", request: { headers: [["x-tibotattle-edge-host", "APEX"]] } },
-  { label: "a missing host kind", request: { omit: ["x-tibotattle-edge-host"] } },
-  { label: "a duplicate host kind", request: { headers: [["x-tibotattle-edge-host", "apex"], ["x-tibotattle-edge-host", "apex"]] } },
-  { label: "an uppercase request id", request: { headers: [["x-tibotattle-edge-request-id", REQUEST_ID.toUpperCase()]] } },
-  { label: "a version 1 request id", request: { headers: [["x-tibotattle-edge-request-id", "4f2c8a7e-1b3d-1e5f-9a6b-7c8d9e0f1a2b"]] } },
-  { label: "a missing request id", request: { omit: ["x-tibotattle-edge-request-id"] } },
-  { label: "a duplicate request id", request: { headers: [["x-tibotattle-edge-request-id", REQUEST_ID], ["x-tibotattle-edge-request-id", REQUEST_ID]] } },
-  { label: "a legacy x-tibotattle-edge-client-key", request: { headers: [["x-tibotattle-edge-client-key", "0".repeat(64)]] } },
-  { label: "an unknown x-tibotattle-* header", request: { headers: [["x-tibotattle-edge-proof", "synthetic"]] } },
-  { label: "a client-sent origin marker", request: { headers: [["x-tibotattle-origin", "1"]] } },
-  { label: "an admission with a v2 prefix", request: { headers: [["x-tibotattle-edge-admission", "v2;enrollment;allowed"]] } },
-  { label: "an admission for upload_authorization", request: { headers: [["x-tibotattle-edge-admission", "v1;upload_authorization;allowed"]] } },
-  { label: "an empty admission", request: { headers: [["x-tibotattle-edge-admission", ""]] } },
-  { label: "a duplicate admission", request: { headers: [["x-tibotattle-edge-admission", "v1;enrollment;allowed"], ["x-tibotattle-edge-admission", "v1;enrollment;allowed"]] } },
+  { label: "host kind 'www'", reason: "edge_host_kind_invalid", request: { headers: [["x-tibotattle-edge-host", "www"]] } },
+  { label: "host kind 'APEX'", reason: "edge_host_kind_invalid", request: { headers: [["x-tibotattle-edge-host", "APEX"]] } },
+  { label: "a missing host kind", reason: "edge_host_kind_invalid", request: { omit: ["x-tibotattle-edge-host"] } },
+  { label: "a duplicate host kind", reason: "edge_host_kind_invalid", request: { headers: [["x-tibotattle-edge-host", "apex"], ["x-tibotattle-edge-host", "apex"]] } },
+  { label: "an uppercase request id", reason: "request_id_invalid", request: { headers: [["x-tibotattle-edge-request-id", REQUEST_ID.toUpperCase()]] } },
+  { label: "a version 1 request id", reason: "request_id_invalid", request: { headers: [["x-tibotattle-edge-request-id", "4f2c8a7e-1b3d-1e5f-9a6b-7c8d9e0f1a2b"]] } },
+  { label: "a missing request id", reason: "request_id_invalid", request: { omit: ["x-tibotattle-edge-request-id"] } },
+  { label: "a duplicate request id", reason: "request_id_invalid", request: { headers: [["x-tibotattle-edge-request-id", REQUEST_ID], ["x-tibotattle-edge-request-id", REQUEST_ID]] } },
+  { label: "a legacy x-tibotattle-edge-client-key", reason: "edge_header_unknown", request: { headers: [["x-tibotattle-edge-client-key", "0".repeat(64)]] } },
+  { label: "an unknown x-tibotattle-* header", reason: "edge_header_unknown", request: { headers: [["x-tibotattle-edge-proof", "synthetic"]] } },
+  { label: "a client-sent origin marker", reason: "edge_header_unknown", request: { headers: [["x-tibotattle-origin", "1"]] } },
+  { label: "an admission with a v2 prefix", reason: "admission_invalid", request: { headers: [["x-tibotattle-edge-admission", "v2;enrollment;allowed"]] } },
+  { label: "an admission for upload_authorization", reason: "admission_invalid", request: { headers: [["x-tibotattle-edge-admission", "v1;upload_authorization;allowed"]] } },
+  { label: "an empty admission", reason: "admission_invalid", request: { headers: [["x-tibotattle-edge-admission", ""]] } },
+  { label: "a duplicate admission", reason: "admission_invalid", request: { headers: [["x-tibotattle-edge-admission", "v1;enrollment;allowed"], ["x-tibotattle-edge-admission", "v1;enrollment;allowed"]] } },
   // Misplaced or invalid callback queries.
-  { label: "a callback header on another path", request: { method: "GET", path: "/api/v1/identity/google/start", headers: [["x-tibotattle-google-callback-query", "?code=a&state=b"]] } },
-  { label: "a callback header on the admin host", request: { method: "GET", path: CALLBACK_PATH, headers: [["x-tibotattle-edge-host", "admin"], ["x-tibotattle-google-callback-query", "?code=a&state=b"]] } },
-  { label: "a callback header with a raw query", request: { method: "GET", path: `${CALLBACK_PATH}?code=raw`, headers: [["x-tibotattle-google-callback-query", "?code=a&state=b"]] } },
-  { label: "a callback header on POST", request: { method: "POST", path: CALLBACK_PATH, headers: [["x-tibotattle-google-callback-query", "?code=a&state=b"]] } },
-  { label: "a callback query without '?'", request: { method: "GET", path: CALLBACK_PATH, headers: [["x-tibotattle-google-callback-query", "code=a&state=b"]] } },
-  { label: "a callback query with a space", request: { method: "GET", path: CALLBACK_PATH, headers: [["x-tibotattle-google-callback-query", "?code=a b"]] } },
-  { label: "a callback query with '#'", request: { method: "GET", path: CALLBACK_PATH, headers: [["x-tibotattle-google-callback-query", "?code=a#b"]] } },
-  { label: "a callback query with a backslash", request: { method: "GET", path: CALLBACK_PATH, headers: [["x-tibotattle-google-callback-query", "?code=a\\b"]] } },
-  { label: "an 8193-character callback query", request: { method: "GET", path: CALLBACK_PATH, headers: [["x-tibotattle-google-callback-query", `?${"a".repeat(8192)}`]] } },
-  { label: "a duplicate callback query", request: { method: "GET", path: CALLBACK_PATH, headers: [["x-tibotattle-google-callback-query", "?a=1"], ["x-tibotattle-google-callback-query", "?a=1"]] } },
+  { label: "a callback header on another path", reason: "callback_query_misplaced", request: { method: "GET", path: "/api/v1/identity/google/start", headers: [["x-tibotattle-google-callback-query", "?code=a&state=b"]] } },
+  { label: "a callback header on the admin host", reason: "callback_query_misplaced", request: { method: "GET", path: CALLBACK_PATH, headers: [["x-tibotattle-edge-host", "admin"], ["x-tibotattle-google-callback-query", "?code=a&state=b"]] } },
+  { label: "a callback header with a raw query", reason: "callback_raw_query", request: { method: "GET", path: `${CALLBACK_PATH}?code=raw`, headers: [["x-tibotattle-google-callback-query", "?code=a&state=b"]] } },
+  { label: "a callback header on POST", reason: "callback_query_misplaced", request: { method: "POST", path: CALLBACK_PATH, headers: [["x-tibotattle-google-callback-query", "?code=a&state=b"]] } },
+  { label: "a callback query without '?'", reason: "callback_query_invalid", request: { method: "GET", path: CALLBACK_PATH, headers: [["x-tibotattle-google-callback-query", "code=a&state=b"]] } },
+  { label: "a callback query with a space", reason: "callback_query_invalid", request: { method: "GET", path: CALLBACK_PATH, headers: [["x-tibotattle-google-callback-query", "?code=a b"]] } },
+  { label: "a callback query with '#'", reason: "callback_query_invalid", request: { method: "GET", path: CALLBACK_PATH, headers: [["x-tibotattle-google-callback-query", "?code=a#b"]] } },
+  { label: "a callback query with a backslash", reason: "callback_query_invalid", request: { method: "GET", path: CALLBACK_PATH, headers: [["x-tibotattle-google-callback-query", "?code=a\\b"]] } },
+  { label: "an 8193-character callback query", reason: "callback_query_invalid", request: { method: "GET", path: CALLBACK_PATH, headers: [["x-tibotattle-google-callback-query", `?${"a".repeat(8192)}`]] } },
+  { label: "a duplicate callback query", reason: "callback_query_invalid", request: { method: "GET", path: CALLBACK_PATH, headers: [["x-tibotattle-google-callback-query", "?a=1"], ["x-tibotattle-google-callback-query", "?a=1"]] } },
   // The callback route never carries a raw query, with or without the header.
-  { label: "a raw callback query without the header", request: { method: "GET", path: `${CALLBACK_PATH}?code=4%2F0Asynthetic&state=s` } },
-  { label: "a raw callback query on the admin host", request: { method: "GET", path: `${CALLBACK_PATH}?code=4%2F0Asynthetic&state=s`, headers: [["x-tibotattle-edge-host", "admin"]] } },
-  { label: "a raw callback query on POST", request: { method: "POST", path: `${CALLBACK_PATH}?code=4%2F0Asynthetic&state=s` } },
-  { label: "a raw callback query after dot segments", request: { method: "GET", path: `/api/v1/identity/google/../google/callback?code=4%2F0Asynthetic` } },
+  { label: "a raw callback query without the header", reason: "callback_raw_query", request: { method: "GET", path: `${CALLBACK_PATH}?code=4%2F0Asynthetic&state=s` } },
+  { label: "a raw callback query on the admin host", reason: "callback_raw_query", request: { method: "GET", path: `${CALLBACK_PATH}?code=4%2F0Asynthetic&state=s`, headers: [["x-tibotattle-edge-host", "admin"]] } },
+  { label: "a raw callback query on POST", reason: "callback_raw_query", request: { method: "POST", path: `${CALLBACK_PATH}?code=4%2F0Asynthetic&state=s` } },
+  { label: "a raw callback query after dot segments", reason: "callback_raw_query", request: { method: "GET", path: `/api/v1/identity/google/../google/callback?code=4%2F0Asynthetic` } },
   // Verifier restrictions.
-  { label: "a verifier POST", request: { auth: token({ email: VERIFIER }), edge: false, path: "/api/health" } },
-  { label: "a verifier HEAD", request: { auth: token({ email: VERIFIER }), edge: false, method: "HEAD", path: "/api/ready" } },
-  { label: "a verifier with an edge header", request: { auth: token({ email: VERIFIER }), method: "GET", path: "/api/health" } },
-  { label: "a verifier with an admission header", request: { auth: token({ email: VERIFIER }), edge: false, method: "GET", path: "/api/ready", headers: [["x-tibotattle-edge-admission", "v1;enrollment;allowed"]] } },
-  { label: "a verifier with a query", request: { auth: token({ email: VERIFIER }), edge: false, method: "GET", path: "/api/health?deep=1" } },
-  { label: "a verifier on another path", request: { auth: token({ email: VERIFIER }), edge: false, method: "GET", path: "/api/v1/session" } },
-  { label: "a verifier with a trailing slash", request: { auth: token({ email: VERIFIER }), edge: false, method: "GET", path: "/api/health/" } },
+  { label: "a verifier POST", reason: "verifier_method", request: { auth: token({ email: VERIFIER }), edge: false, path: "/api/health" } },
+  { label: "a verifier HEAD", reason: "verifier_method", request: { auth: token({ email: VERIFIER }), edge: false, method: "HEAD", path: "/api/ready" } },
+  { label: "a verifier with an edge header", reason: "verifier_edge_header", request: { auth: token({ email: VERIFIER }), method: "GET", path: "/api/health" } },
+  { label: "a verifier with an admission header", reason: "verifier_edge_header", request: { auth: token({ email: VERIFIER }), edge: false, method: "GET", path: "/api/ready", headers: [["x-tibotattle-edge-admission", "v1;enrollment;allowed"]] } },
+  { label: "a verifier with a query", reason: "verifier_query", request: { auth: token({ email: VERIFIER }), edge: false, method: "GET", path: "/api/health?deep=1" } },
+  { label: "a verifier on another path", reason: "verifier_path", request: { auth: token({ email: VERIFIER }), edge: false, method: "GET", path: "/api/v1/session" } },
+  { label: "a verifier with a trailing slash", reason: "verifier_path", request: { auth: token({ email: VERIFIER }), edge: false, method: "GET", path: "/api/health/" } },
   // Reconstruction bound.
-  { label: "a rebuilt URL over 16384 characters", request: { path: `/${"a".repeat(16_384 - PUBLIC_ORIGIN.length)}` } },
+  { label: "a rebuilt URL over 16384 characters", reason: "rebuilt_url_too_long", request: { path: `/${"a".repeat(16_384 - PUBLIC_ORIGIN.length)}` } },
 ]);
 
 test("exports the reviewed boundary surface", () => {
   assert.deepEqual(Object.keys(dispatchModule).sort(), [
+    "EDGE_ORIGIN_BOUNDARY_REFUSAL_REASONS",
     "EDGE_ORIGIN_DISPATCH_PATHNAMES",
+    "EDGE_ORIGIN_INVOKER_TOKEN_REFUSAL_REASONS",
     "EDGE_ORIGIN_VERIFIER_PATHNAMES",
+    "MAX_EDGE_ORIGIN_INVOKER_SHAPE_SEGMENTS",
     "MAX_EDGE_ORIGIN_URL_LENGTH",
     "MAX_EDGE_ORIGIN_VERIFIER_ACCOUNTS",
     "ORIGIN_BOUNDARY_ERROR_HEADERS",
@@ -287,6 +332,14 @@ test("exports the reviewed boundary surface", () => {
     "edgeRequestContext",
     "edgeServedAssets",
   ]);
+  const reasons = dispatchModule.EDGE_ORIGIN_BOUNDARY_REFUSAL_REASONS;
+  const invokerReasons = dispatchModule.EDGE_ORIGIN_INVOKER_TOKEN_REFUSAL_REASONS;
+  assert.ok(Object.isFrozen(reasons) && Object.isFrozen(invokerReasons));
+  assert.equal(new Set(reasons).size, reasons.length, "one distinct code per refusal site");
+  for (const reason of reasons) assert.match(reason, /^[a-z][a-z0-9_]{2,40}$/u, reason);
+  assert.equal(new Set(invokerReasons).size, invokerReasons.length);
+  for (const reason of invokerReasons) assert.ok(reasons.includes(reason), reason);
+  assert.equal(dispatchModule.MAX_EDGE_ORIGIN_INVOKER_SHAPE_SEGMENTS, 8);
   assert.deepEqual(dispatchModule.EDGE_ORIGIN_DISPATCH_PATHNAMES, []);
   assert.ok(Object.isFrozen(dispatchModule.EDGE_ORIGIN_DISPATCH_PATHNAMES));
   assert.deepEqual(dispatchModule.EDGE_ORIGIN_VERIFIER_PATHNAMES, ["/api/health", "/api/ready"]);
@@ -301,12 +354,21 @@ test("exports the reviewed boundary surface", () => {
 test("every invalid token, header, verifier and callback case gets the identical unmarked 421", async () => {
   assert.ok(INVALID_CASES.length >= 40);
   const { inner, calls } = recordingInner();
-  const dispatch = createDispatch({ inner });
-  for (const { label, request: options } of INVALID_CASES) {
+  const sink = recordingSink();
+  // With and without a refusal sink: the answers are the same constant 421.
+  const dispatch = createDispatch({ inner, onRefusal: sink.onRefusal });
+  const silent = createDispatch({ inner });
+  for (const { label, reason, request: options } of INVALID_CASES) {
     const bodyless = options.method === "GET" || options.method === "HEAD";
     const tracker = bodyless ? null : trackedBody();
     const request = rawRequest({ ...options, ...(tracker ? { body: tracker.stream } : {}) });
+    const before = sink.diagnostics.length;
     await assertRefusal(await dispatch(request), label);
+    assert.equal(sink.diagnostics.length, before + 1, `${label}: exactly one diagnostic`);
+    const diagnostic = sink.diagnostics.at(-1);
+    assert.equal(diagnostic.reason, reason, label);
+    assertClosedDiagnostic(diagnostic, label);
+    await assertRefusal(await silent(rawRequest(options)), `${label} without a sink`);
     if (tracker !== null) {
       assert.equal(tracker.pulls, 0, `${label}: body never pulled`);
       assert.equal(tracker.cancels, 0, `${label}: body left for the host`);
@@ -318,16 +380,24 @@ test("every invalid token, header, verifier and callback case gets the identical
 
 test("the boundary refuses a non-Request and a clock it cannot read", async () => {
   const { inner, calls } = recordingInner();
-  await assertRefusal(await createDispatch({ inner })({ url: `${RAW_ORIGIN}/api/health` }), "plain object");
-  await assertRefusal(await createDispatch({ inner })(undefined), "undefined");
+  const sink = recordingSink();
+  const { onRefusal, diagnostics } = sink;
+  await assertRefusal(await createDispatch({ inner, onRefusal })({ url: `${RAW_ORIGIN}/api/health` }), "plain object");
+  await assertRefusal(await createDispatch({ inner, onRefusal })(undefined), "undefined");
   for (const clock of [() => Number.NaN, () => -1, () => "1800000000000"]) {
-    await assertRefusal(await createDispatch({ inner, clock })(rawRequest()), "unreadable clock");
+    await assertRefusal(await createDispatch({ inner, clock, onRefusal })(rawRequest()), "unreadable clock");
   }
   // A token within the 60 s skew is still accepted; at the skew edge it is not.
-  const dispatch = createDispatch({ inner });
+  const dispatch = createDispatch({ inner, onRefusal });
   assert.equal((await dispatch(rawRequest({ auth: token({ exp: NOW_SECONDS - 59 }) }))).status, 200);
   await assertRefusal(await dispatch(rawRequest({ auth: token({ exp: NOW_SECONDS - 60 }) })), "skew edge");
   assert.equal(calls.length, 1);
+  assert.deepEqual(diagnostics.map(({ reason }) => reason), [
+    "request_not_request", "request_not_request",
+    "clock_invalid", "clock_invalid", "clock_invalid",
+    "invoker_claims_invalid",
+  ]);
+  for (const diagnostic of diagnostics) assertClosedDiagnostic(diagnostic, diagnostic.reason);
 });
 
 test("the production default clock reads epoch milliseconds", async () => {
@@ -640,6 +710,8 @@ test("construction refuses invalid configuration", () => {
     [{ admission: null }, "EDGE_ORIGIN_ADMISSION_INVALID"],
     [{ inner: undefined }, "EDGE_ORIGIN_INNER_INVALID"],
     [{ clock: 1_800_000_000_000 }, "EDGE_ORIGIN_CLOCK_INVALID"],
+    [{ onRefusal: "console.log" }, "EDGE_ORIGIN_REFUSAL_SINK_INVALID"],
+    [{ onRefusal: null }, "EDGE_ORIGIN_REFUSAL_SINK_INVALID"],
   ];
   for (const [overrides, code] of invalid) {
     assert.throws(
@@ -667,6 +739,171 @@ test("with zero verifiers a verifier token is an unknown caller", async () => {
     auth: token({ email: VERIFIER }),
   })), "no verifiers");
   assert.equal(calls.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Refusal reasons and the content-free invoker shape.
+
+/** The header and payload segments of a delivered token, for shape cases. */
+function tokenSegments(overrides = {}) {
+  const [header, payload] = token(overrides).slice("Bearer ".length).split(".");
+  return { header, payload };
+}
+
+/** A shape with every segment present and base64url. */
+function plainShape(segments, signatureRemovedByGoogle, bearerPrefix = true) {
+  const described = Math.min(segments, 8);
+  return {
+    bearerPrefix,
+    segments,
+    segmentEmpty: Array(described).fill(false),
+    segmentBase64url: Array(described).fill(true),
+    signatureRemovedByGoogle,
+  };
+}
+
+test("each delivered-header refusal names its reason and the header's shape", async () => {
+  const sink = recordingSink();
+  const dispatch = createDispatch({ onRefusal: sink.onRefusal });
+  const wrongAudience = tokenSegments({ aud: "https://origin.synthetic.example/other" });
+  const wrongEmail = tokenSegments({ email: OTHER_ACCOUNT });
+  const valid = tokenSegments();
+  const rows = [
+    ["the delivered shape for another audience", `Bearer ${wrongAudience.header}.${wrongAudience.payload}.SIGNATURE_REMOVED_BY_GOOGLE`,
+      "audience_mismatch", plainShape(3, true)],
+    ["an intact signature for another account", `Bearer ${wrongEmail.header}.${wrongEmail.payload}.c3ludGhldGljLXNpZ25hdHVyZQ`,
+      "email_mismatch", plainShape(3, false)],
+    ["a valid token without 'Bearer '", `${valid.header}.${valid.payload}.SIGNATURE_REMOVED_BY_GOOGLE`,
+      "invoker_bearer_prefix_missing", plainShape(3, true, false)],
+    ["the signature segment dropped", `Bearer ${valid.header}.${valid.payload}`,
+      "invoker_segments", plainShape(2, false)],
+    ["an empty signature segment", `Bearer ${valid.header}.${valid.payload}.`,
+      "invoker_segment_encoding", {
+        bearerPrefix: true, segments: 3, segmentEmpty: [false, false, true],
+        segmentBase64url: [true, true, false], signatureRemovedByGoogle: false,
+      }],
+    ["a padded signature segment", `Bearer ${valid.header}.${valid.payload}.c2ln=`,
+      "invoker_segment_encoding", {
+        bearerPrefix: true, segments: 3, segmentEmpty: [false, false, false],
+        segmentBase64url: [true, true, false], signatureRemovedByGoogle: false,
+      }],
+    ["twelve segments", `Bearer ${"a.".repeat(11)}a`, "invoker_segments", plainShape(12, false)],
+    ["dots only", "Bearer ..", "invoker_segment_encoding", {
+      bearerPrefix: true, segments: 3, segmentEmpty: [true, true, true],
+      segmentBase64url: [false, false, false], signatureRemovedByGoogle: false,
+    }],
+    // Headers trims the value, so a bare scheme arrives as 'Bearer'.
+    ["only the scheme", "Bearer ", "invoker_bearer_prefix_missing", {
+      bearerPrefix: false, segments: 1, segmentEmpty: [false], segmentBase64url: [true],
+      signatureRemovedByGoogle: false,
+    }],
+  ];
+  for (const [index, [label, auth, reason, shape]] of rows.entries()) {
+    await assertRefusal(await dispatch(rawRequest({ method: "GET", auth })), label);
+    assert.equal(sink.diagnostics.length, index + 1, `${label}: exactly one diagnostic`);
+    const diagnostic = sink.diagnostics.at(-1);
+    assertClosedDiagnostic(diagnostic, label);
+    assert.equal(diagnostic.reason, reason, label);
+    assert.deepEqual(diagnostic.invokerShape, shape, label);
+  }
+});
+
+test("the remaining refusal sites name their reasons", async () => {
+  const { inner, calls } = recordingInner();
+  const sink = recordingSink();
+  const dispatch = createDispatch({ inner, onRefusal: sink.onRefusal });
+  const headers = rawRequest({ method: "GET" }).headers;
+  class UnreadableUrl extends Request {
+    get url() { return "not a url"; }
+  }
+  class TraceMethod extends Request {
+    get method() { return "TRACE"; }
+  }
+  class ThrowingHeaders extends Request {
+    get headers() { throw new TypeError("synthetic headers failure"); }
+  }
+  const rows = [
+    ["an unparseable request URL", new UnreadableUrl(`${RAW_ORIGIN}/api/health`, { headers }), "request_url_invalid"],
+    ["a non-HTTP request URL", new Request("ftp://127.0.0.1/api/health", { headers }), "request_url_shape"],
+    ["a method the rebuilt Request refuses", new TraceMethod(`${RAW_ORIGIN}/api/health`, { headers }), "rebuilt_request_invalid"],
+    ["an unexpected throw inside the checks", new ThrowingHeaders(`${RAW_ORIGIN}/api/health`, { headers }), "boundary_exception"],
+  ];
+  for (const [label, request, reason] of rows) {
+    await assertRefusal(await dispatch(request), label);
+    assert.equal(sink.diagnostics.at(-1).reason, reason, label);
+    assertClosedDiagnostic(sink.diagnostics.at(-1), label);
+  }
+  assert.equal(sink.diagnostics.length, rows.length);
+  assert.equal(calls.length, 0);
+});
+
+test("diagnostics never carry a token, email, header value, host or path", async () => {
+  // Synthetic secrets in every place a diagnostic could copy them from.
+  const secretSubject = "synthetic-subject-secret-7f3e9a";
+  const secretToken = token({ sub: secretSubject, azp: "synthetic-azp-secret-4b1c" });
+  const sink = recordingSink();
+  const dispatch = createDispatch({ onRefusal: sink.onRefusal });
+  const requests = [
+    ...INVALID_CASES.map(({ request: options }) => options),
+    { auth: secretToken.replace("Bearer ", "") },
+    { auth: `${secretToken}.extra-secret-segment` },
+    { auth: `${secretToken}, ${secretToken}` },
+    { auth: token({ sub: secretSubject, email: OTHER_ACCOUNT })
+      .replace("SIGNATURE_REMOVED_BY_GOOGLE", "c3ludGhldGljLXNpZ25hdHVyZQ") },
+    { auth: token({ sub: secretSubject, aud: "https://origin.synthetic.example/secret-audience" }) },
+    { auth: token({ sub: secretSubject, email: OTHER_ACCOUNT }) },
+    { method: "GET", path: "/api/v1/secret-path?secret-query=synthetic-query-secret",
+      headers: [["x-tibotattle-edge-proof", "synthetic-header-secret"]] },
+  ];
+  const needles = new Set([secretSubject, "synthetic-azp-secret-4b1c", "Bearer", "@", INVOKER, VERIFIER,
+    OTHER_ACCOUNT, AUDIENCE, REQUEST_ID, RAW_ORIGIN, new URL(RAW_ORIGIN).host, "secret"]);
+  for (const options of requests) {
+    const request = rawRequest(options);
+    for (const [, value] of request.headers) {
+      if (value.length >= 6) needles.add(value);
+      for (const fragment of value.split(/[ .,;]+/u)) if (fragment.length >= 6) needles.add(fragment);
+    }
+    const { pathname, search } = new URL(request.url);
+    if (pathname.length >= 6) needles.add(pathname);
+    if (search.length >= 6) needles.add(search);
+    await assertRefusal(await dispatch(request), JSON.stringify(options).slice(0, 80));
+  }
+  assert.equal(sink.diagnostics.length, requests.length, "one diagnostic per refusal");
+  const serialized = JSON.stringify(sink.diagnostics);
+  for (const needle of needles) {
+    // A reason code is itself never a needle; skip the contract's own words.
+    if (dispatchModule.EDGE_ORIGIN_BOUNDARY_REFUSAL_REASONS.some((reason) => reason.includes(needle))) continue;
+    assert.ok(!serialized.includes(needle), `a diagnostic carries ${JSON.stringify(needle.slice(0, 24))}`);
+  }
+  for (const diagnostic of sink.diagnostics) assertClosedDiagnostic(diagnostic, diagnostic.reason);
+});
+
+test("the refusal sink sees only refusals and can never change an answer", async () => {
+  const seen = [];
+  const unhandled = [];
+  const onUnhandled = (reason) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    for (const onRefusal of [
+      (diagnostic) => { seen.push(diagnostic.reason); throw new Error("synthetic sink failure"); },
+      async (diagnostic) => { seen.push(diagnostic.reason); throw new Error("synthetic async sink failure"); },
+    ]) {
+      const dispatch = createDispatch({ onRefusal });
+      await assertRefusal(await dispatch(rawRequest({ auth: null })), "a throwing sink");
+      assert.equal((await dispatch(rawRequest())).status, 200, "an admitted request");
+    }
+    // Inner failures are not boundary refusals: the marked 500, no diagnostic.
+    for (const inner of [async () => { throw new Error("synthetic inner failure"); }, async () => ({})]) {
+      const response = await createDispatch({ inner, onRefusal: (diagnostic) => seen.push(diagnostic.reason) })(rawRequest());
+      assert.equal(response.status, 500);
+      assertMarked(response);
+    }
+    await new Promise((done) => setImmediate(done));
+  } finally {
+    process.removeListener("unhandledRejection", onUnhandled);
+  }
+  assert.deepEqual(seen, ["invoker_header_missing", "invoker_header_missing"]);
+  assert.deepEqual(unhandled, []);
 });
 
 // ---------------------------------------------------------------------------
@@ -792,6 +1029,16 @@ test("50 concurrent boundary requests keep their own outcomes", async () => {
     assert.equal(response.status, status);
     if (status !== 200) assert.equal(body.error.requestId, requestId);
   }
+});
+
+test("every reachable refusal site was observed with its own reason", () => {
+  // token_expired and rebuilt_url_origin guard what parseCloudRunInvokerClaims
+  // and the URL parser already ensure, so no request reaches them.
+  const guards = ["token_expired", "rebuilt_url_origin"];
+  assert.deepEqual(
+    [...observedReasons].sort(),
+    dispatchModule.EDGE_ORIGIN_BOUNDARY_REFUSAL_REASONS.filter((reason) => !guards.includes(reason)).sort(),
+  );
 });
 
 test("no console output", () => {

@@ -24,11 +24,15 @@
  *   fastpath-test serves no admin route;
  * - serve() builds requests with edgeTestRequestFromNode, which keeps the
  *   raw headers EP-6 must see (x-serverless-authorization, x-tibotattle-*),
- *   and writes every boundary refusal with writeEdgeTestBoundaryRefusal.
+ *   and writes every boundary refusal with writeEdgeTestBoundaryRefusal;
+ * - every boundary refusal, here or in EP-6, logs exactly one content-free
+ *   edge_origin_boundary_refusal line naming its constant reason
+ *   (logEdgeTestBoundaryRefusal), so a live 421 can be explained from the
+ *   origin's log while the answer itself stays constant.
  *
  * Plain ESM like origin-fastpath-mode.mjs. It imports only the edge/origin
  * contract, the EP-6 modules and the fastpath constants; it opens no pool,
- * reads no network and logs nothing.
+ * reads no network and logs nothing but those refusal lines.
  */
 
 import {
@@ -39,6 +43,9 @@ import {
   isEdgeServiceAccountEmail,
 } from "../src/edge-origin-contract.ts";
 import {
+  EDGE_ORIGIN_BOUNDARY_REFUSAL_REASONS,
+  EDGE_ORIGIN_INVOKER_TOKEN_REFUSAL_REASONS,
+  MAX_EDGE_ORIGIN_INVOKER_SHAPE_SEGMENTS,
   MAX_EDGE_ORIGIN_URL_LENGTH,
   MAX_EDGE_ORIGIN_VERIFIER_ACCOUNTS,
   ORIGIN_BOUNDARY_ERROR_HEADERS,
@@ -292,7 +299,8 @@ function edgeTestUnportedResponse() {
  * of inner (the fastpath-test postgresTestDispatch). A request EP-6 rebuilt
  * on the admin host answers EDGE_TEST_UNPORTED_BODY (503, JSON, no-store)
  * without reaching inner: fastpath-test serves no admin route. admission must
- * be the instance whose bindings edgeTestAdmissionEnv installed.
+ * be the instance whose bindings edgeTestAdmissionEnv installed. Each EP-6
+ * refusal logs its one reason line (logEdgeTestBoundaryRefusal).
  */
 export function composeEdgeTestOrigin({ configuration, admission, inner, clock = Date.now } = {}) {
   if (!issuedConfigurations.has(configuration)) refuse("EDGE_TEST_ORIGIN_MODE_INVALID");
@@ -306,6 +314,7 @@ export function composeEdgeTestOrigin({ configuration, admission, inner, clock =
     publicOrigin: configuration.publicOrigin,
     admission,
     clock,
+    onRefusal: (diagnostic) => logEdgeTestBoundaryRefusal(diagnostic),
     async inner(request) {
       if (edgeRequestContext(request)?.hostKind === "admin") return edgeTestUnportedResponse();
       return inner(request);
@@ -313,17 +322,95 @@ export function composeEdgeTestOrigin({ configuration, admission, inner, clock =
   });
 }
 
+/**
+ * The constant reason of each edgeTestRequestFromNode refusal site, for
+ * diagnostics only (the answer is EP-6's 421 for every one). They never
+ * overlap EDGE_ORIGIN_BOUNDARY_REFUSAL_REASONS. request_target_unparseable
+ * and request_target_origin guard what the URL parser already ensures for a
+ * target starting with '/'.
+ */
+export const EDGE_TEST_REQUEST_REFUSAL_REASONS = Object.freeze([
+  "host_origin_invalid",
+  "host_origin_not_canonical",
+  "host_header_missing",
+  "host_mismatch",
+  "request_target_invalid",
+  "request_target_too_long",
+  "request_target_unparseable",
+  "request_target_origin",
+  "raw_headers_invalid",
+  "node_request_invalid",
+]);
+
+/** The event of the one log line each edge-test boundary refusal writes. */
+export const EDGE_ORIGIN_BOUNDARY_REFUSAL_EVENT = "edge_origin_boundary_refusal";
+
+const LOGGED_REFUSAL_REASONS = new Set([
+  ...EDGE_TEST_REQUEST_REFUSAL_REASONS,
+  ...EDGE_ORIGIN_BOUNDARY_REFUSAL_REASONS,
+]);
+const SHAPED_REFUSAL_REASONS = new Set(EDGE_ORIGIN_INVOKER_TOKEN_REFUSAL_REASONS);
+const UNCLASSIFIED_REFUSAL_REASON = "unclassified";
+
 /** Thrown by edgeTestRequestFromNode; serve() answers it with the boundary refusal. */
 export class EdgeTestBoundaryRefusal extends Error {
-  constructor() {
+  constructor(reason) {
     super("EDGE_TEST_ORIGIN_BOUNDARY_REFUSED");
     this.name = "EdgeTestBoundaryRefusal";
     this.code = "EDGE_TEST_ORIGIN_BOUNDARY_REFUSED";
+    this.reason = reason;
   }
 }
 
-function boundaryRefusal() {
-  throw new EdgeTestBoundaryRefusal();
+function boundaryRefusal(reason) {
+  throw new EdgeTestBoundaryRefusal(reason);
+}
+
+function shapeFlags(value) {
+  return Array.isArray(value)
+    ? value.slice(0, MAX_EDGE_ORIGIN_INVOKER_SHAPE_SEGMENTS).map((flag) => flag === true)
+    : [];
+}
+
+/**
+ * The log line for one boundary refusal, built field by field from an
+ * allowlist: {"event":"edge_origin_boundary_refusal","reason":<code>}, plus,
+ * for an EP-6 invoker-token refusal only, "invokerShape" with the delivered
+ * header's 'Bearer ' prefix flag, segment count, per-segment empty and
+ * base64url flags and whether the third segment is Google's
+ * SIGNATURE_REMOVED_BY_GOOGLE. A reason outside the two reason lists is
+ * logged as 'unclassified'; nothing else a diagnostic carries (no header
+ * value, token, email, host, address or path) can reach the line.
+ */
+export function edgeTestBoundaryRefusalLogLine(diagnostic) {
+  const candidate = diagnostic !== null && typeof diagnostic === "object" ? diagnostic.reason : undefined;
+  const reason = LOGGED_REFUSAL_REASONS.has(candidate) ? candidate : UNCLASSIFIED_REFUSAL_REASON;
+  const line = { event: EDGE_ORIGIN_BOUNDARY_REFUSAL_EVENT, reason };
+  const shape = SHAPED_REFUSAL_REASONS.has(reason) ? diagnostic.invokerShape : null;
+  if (shape !== null && typeof shape === "object") {
+    line.invokerShape = {
+      bearerPrefix: shape.bearerPrefix === true,
+      segments: Number.isSafeInteger(shape.segments) && shape.segments >= 0 ? shape.segments : null,
+      segmentEmpty: shapeFlags(shape.segmentEmpty),
+      segmentBase64url: shapeFlags(shape.segmentBase64url),
+      signatureRemovedByGoogle: shape.signatureRemovedByGoogle === true,
+    };
+  }
+  return JSON.stringify(line);
+}
+
+/**
+ * Writes edgeTestBoundaryRefusalLogLine(diagnostic) as one line through log
+ * (console.log, looked up when called, by default). A diagnostic is an
+ * EP-6 { reason, invokerShape } or an EdgeTestBoundaryRefusal. Logging never
+ * throws, so it cannot change the constant answer.
+ */
+export function logEdgeTestBoundaryRefusal(diagnostic, log = (line) => console.log(line)) {
+  try {
+    log(edgeTestBoundaryRefusalLogLine(diagnostic));
+  } catch {
+    // The refusal is answered the same way whether or not its line was written.
+  }
 }
 
 /**
@@ -375,7 +462,9 @@ function lazyRequestBody(req) {
  * x-tibotattle-* headers, and strips them), repeated values joined as Headers
  * joins them; a body is streamed with duplex 'half'; an AbortController
  * follows the request's abort and the response's close. Anything else throws
- * EdgeTestBoundaryRefusal.
+ * EdgeTestBoundaryRefusal with its constant reason
+ * (EDGE_TEST_REQUEST_REFUSAL_REASONS); serve() logs it with
+ * logEdgeTestBoundaryRefusal.
  *
  * @param {import("node:http").IncomingMessage} req
  * @param {import("node:http").ServerResponse} res
@@ -383,23 +472,24 @@ function lazyRequestBody(req) {
  */
 export function edgeTestRequestFromNode(req, res, { hostOrigin } = {}) {
   let base;
-  try { base = new URL(hostOrigin); } catch { boundaryRefusal(); }
-  if (base.origin !== hostOrigin) boundaryRefusal();
+  try { base = new URL(hostOrigin); } catch { boundaryRefusal("host_origin_invalid"); }
+  if (base.origin !== hostOrigin) boundaryRefusal("host_origin_not_canonical");
   const host = req.headers.host;
-  if (typeof host !== "string" || host.toLowerCase() !== base.host) boundaryRefusal();
+  if (typeof host !== "string") boundaryRefusal("host_header_missing");
+  if (host.toLowerCase() !== base.host) boundaryRefusal("host_mismatch");
   const path = req.url;
-  if (typeof path !== "string" || !path.startsWith("/")) boundaryRefusal();
+  if (typeof path !== "string" || !path.startsWith("/")) boundaryRefusal("request_target_invalid");
   const href = hostOrigin + path;
-  if (href.length > MAX_EDGE_ORIGIN_URL_LENGTH) boundaryRefusal();
+  if (href.length > MAX_EDGE_ORIGIN_URL_LENGTH) boundaryRefusal("request_target_too_long");
   let url;
-  try { url = new URL(href); } catch { boundaryRefusal(); }
-  if (url.origin !== hostOrigin || !url.pathname.startsWith("/")) boundaryRefusal();
+  try { url = new URL(href); } catch { boundaryRefusal("request_target_unparseable"); }
+  if (url.origin !== hostOrigin || !url.pathname.startsWith("/")) boundaryRefusal("request_target_origin");
   const headers = new Headers();
   try {
     const raw = req.rawHeaders;
     for (let index = 0; index + 1 < raw.length; index += 2) headers.append(raw[index], raw[index + 1]);
   } catch {
-    boundaryRefusal();
+    boundaryRefusal("raw_headers_invalid");
   }
   const method = req.method ?? "GET";
   const init = { method, headers };
@@ -410,7 +500,7 @@ export function edgeTestRequestFromNode(req, res, { hostOrigin } = {}) {
   const controller = new AbortController();
   init.signal = controller.signal;
   let request;
-  try { request = new Request(url.href, init); } catch { boundaryRefusal(); }
+  try { request = new Request(url.href, init); } catch { boundaryRefusal("node_request_invalid"); }
   req.once("aborted", () => controller.abort());
   req.once("close", () => {
     if (!req.complete) controller.abort();

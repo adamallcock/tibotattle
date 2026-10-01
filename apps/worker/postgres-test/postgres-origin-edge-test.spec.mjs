@@ -19,7 +19,7 @@
 // and that fastpath-test without the edge charges its PostgreSQL limiters at
 // the same points.
 import assert from "node:assert/strict";
-import { after, test } from "node:test";
+import { after, mock, test } from "node:test";
 import { randomBytes, randomUUID, webcrypto } from "node:crypto";
 import { lstat, realpath, stat } from "node:fs/promises";
 import http from "node:http";
@@ -424,50 +424,87 @@ function reachableRequest(route, method, { hostKind = "apex", admission = null, 
 test("boundary refusals are the unmarked 421 with connection: close, before any body is read", {
   skip: SKIP, timeout: 300_000,
 }, () => withOrigin({ edge: true }, async ({ m, port }) => {
-  const now = Math.floor(Date.now() / 1000);
-  const contributions = "/api/v1/contributions";
-  for (const [label, headers] of [
-    ["no token", edgeHeaders({ auth: null })],
-    ["wrong audience", edgeHeaders({ auth: token({ aud: "https://another-origin.synthetic.example" }) })],
-    ["unverified email", edgeHeaders({ auth: token({ email_verified: false }) })],
-    ["expired token", edgeHeaders({ auth: token({ exp: now - 120, iat: now - 3_720 }) })],
-    ["unknown email", edgeHeaders({ auth: token({ email: STRANGER }) })],
-    ["client-sent edge client key", { ...edgeHeaders({ admission: "v1;upload_ingress;allowed" }),
-      "x-tibotattle-edge-client-key": "0".repeat(64) }],
-    ["no host kind", { "x-serverless-authorization": token(), "x-tibotattle-edge-request-id": randomUUID() }],
-    ["undecodable admission", edgeHeaders({ admission: "v2;upload_ingress;allowed" })],
-    ["verifier POST", { "x-serverless-authorization": token({ email: VERIFIER }) }],
-  ]) {
-    const answer = await send(port, {
-      method: "POST", path: contributions, hold: true, body: "{\"synthetic\":tru",
-      headers: { ...headers, "content-type": "application/json",
-        authorization: unknownUploadBearer() },
+  // The composition root's one content-free refusal line per refusal.
+  const lines = [];
+  const logSpy = mock.method(console, "log", (...args) => { lines.push(args.join(" ")); });
+  const sentValues = new Set();
+  const reasonOf = (label) => {
+    assert.equal(lines.length, 1, `${label}: exactly one refusal line`);
+    const parsed = JSON.parse(lines.pop());
+    assert.equal(parsed.event, "edge_origin_boundary_refusal", label);
+    return parsed.reason;
+  };
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const contributions = "/api/v1/contributions";
+    for (const [label, headers, reason] of [
+      ["no token", edgeHeaders({ auth: null }), "invoker_header_missing"],
+      ["wrong audience", edgeHeaders({ auth: token({ aud: "https://another-origin.synthetic.example" }) }),
+        "audience_mismatch"],
+      ["unverified email", edgeHeaders({ auth: token({ email_verified: false }) }), "email_unverified"],
+      ["expired token", edgeHeaders({ auth: token({ exp: now - 120, iat: now - 3_720 }) }), "invoker_claims_invalid"],
+      ["unknown email", edgeHeaders({ auth: token({ email: STRANGER }) }), "email_mismatch"],
+      ["client-sent edge client key", { ...edgeHeaders({ admission: "v1;upload_ingress;allowed" }),
+        "x-tibotattle-edge-client-key": "0".repeat(64) }, "edge_header_unknown"],
+      ["no host kind", { "x-serverless-authorization": token(), "x-tibotattle-edge-request-id": randomUUID() },
+        "edge_host_kind_invalid"],
+      ["undecodable admission", edgeHeaders({ admission: "v2;upload_ingress;allowed" }), "admission_invalid"],
+      ["verifier POST", { "x-serverless-authorization": token({ email: VERIFIER }) }, "verifier_method"],
+    ]) {
+      const request = {
+        method: "POST", path: contributions, hold: true, body: "{\"synthetic\":tru",
+        headers: { ...headers, "content-type": "application/json",
+          authorization: unknownUploadBearer() },
+      };
+      for (const value of Object.values(request.headers)) sentValues.add(value);
+      const answer = await send(port, request);
+      assertBoundaryRefusal(m, answer, label);
+      assert.equal(answer.bodyStillOpen, true, `${label}: answered while the body was still open`);
+      assert.equal(reasonOf(label), reason, label);
+    }
+    const callbackHeaders = edgeHeaders();
+    const callback = await send(port, {
+      path: "/api/v1/identity/google/callback?code=synthetic&state=synthetic",
+      headers: callbackHeaders,
     });
-    assertBoundaryRefusal(m, answer, label);
-    assert.equal(answer.bodyStillOpen, true, `${label}: answered while the body was still open`);
-  }
-  const callback = await send(port, {
-    path: "/api/v1/identity/google/callback?code=synthetic&state=synthetic",
-    headers: edgeHeaders(),
-  });
-  assertBoundaryRefusal(m, callback, "raw callback query");
-  const wrongHost = await send(port, { path: "/api/health", headers: { ...edgeHeaders(), host: "tibotattle.test" } });
-  assertBoundaryRefusal(m, wrongHost, "Host other than HOST_ORIGIN's");
+    assertBoundaryRefusal(m, callback, "raw callback query");
+    assert.equal(reasonOf("raw callback query"), "callback_raw_query");
+    const wrongHostHeaders = { ...edgeHeaders(), host: "tibotattle.test" };
+    const wrongHost = await send(port, { path: "/api/health", headers: wrongHostHeaders });
+    assertBoundaryRefusal(m, wrongHost, "Host other than HOST_ORIGIN's");
+    assert.equal(reasonOf("Host other than HOST_ORIGIN's"), "host_mismatch");
+    for (const value of [...Object.values(callbackHeaders), ...Object.values(wrongHostHeaders)]) sentValues.add(value);
 
-  // A verifier may only read health and readiness.
-  const health = await send(port, { path: "/api/health", headers: { "x-serverless-authorization": token({ email: VERIFIER }) } });
-  assert.equal(health.status, 200, health.text);
-  assert.equal(JSON.parse(health.text).status, "ready");
-  assertMarked(health, "verifier health");
-  const ready = await send(port, { path: "/api/ready", headers: { "x-serverless-authorization": token({ email: VERIFIER }) } });
-  assertUnported(m, ready, "verifier ready (fastpath-test serves no /api/ready)");
-  const verifierPost = await send(port, { method: "POST", path: "/api/health", body: "{}",
-    headers: { "x-serverless-authorization": token({ email: VERIFIER }), "content-type": "application/json" } });
-  assertBoundaryRefusal(m, verifierPost, "verifier POST");
-  // The invoker reads health through the same composition.
-  const invokerHealth = await send(port, { path: "/api/health", headers: edgeHeaders() });
-  assert.equal(invokerHealth.status, 200);
-  assertMarked(invokerHealth, "invoker health");
+    // A verifier may only read health and readiness.
+    const health = await send(port, { path: "/api/health", headers: { "x-serverless-authorization": token({ email: VERIFIER }) } });
+    assert.equal(health.status, 200, health.text);
+    assert.equal(JSON.parse(health.text).status, "ready");
+    assertMarked(health, "verifier health");
+    const ready = await send(port, { path: "/api/ready", headers: { "x-serverless-authorization": token({ email: VERIFIER }) } });
+    assertUnported(m, ready, "verifier ready (fastpath-test serves no /api/ready)");
+    assert.deepEqual(lines, [], "admitted verifier reads log nothing");
+    const verifierPost = await send(port, { method: "POST", path: "/api/health", body: "{}",
+      headers: { "x-serverless-authorization": token({ email: VERIFIER }), "content-type": "application/json" } });
+    assertBoundaryRefusal(m, verifierPost, "verifier POST");
+    assert.equal(reasonOf("verifier POST /api/health"), "verifier_method");
+    // The invoker reads health through the same composition.
+    const invokerHealth = await send(port, { path: "/api/health", headers: edgeHeaders() });
+    assert.equal(invokerHealth.status, 200);
+    assertMarked(invokerHealth, "invoker health");
+    assert.deepEqual(lines, [], "an admitted invoker read logs nothing");
+  } finally {
+    logSpy.mock.restore();
+  }
+  // No line carried a header value (a token, a segment, an email, a key).
+  const logged = logSpy.mock.calls.map((call) => call.arguments.join(" ")).join("\n");
+  for (const value of sentValues) {
+    for (const fragment of [value, ...value.split(/[ .,;]+/u)]) {
+      if (fragment.length >= 6) assert.ok(!logged.includes(fragment), `a line carries ${fragment.slice(0, 24)}`);
+    }
+  }
+  for (const needle of ["@", "Bearer", INVOKER, VERIFIER, STRANGER, AUDIENCE, "127.0.0.1", "/api/"]) {
+    assert.ok(!logged.includes(needle), `a line carries ${needle}`);
+  }
 }));
 
 // ---------------------------------------------------------------------------

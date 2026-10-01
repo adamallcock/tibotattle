@@ -383,3 +383,17 @@ other origin, invoker or authorization token is refused before gcloud runs.
 The identity token comes from gcloud impersonation of the test project's
 journey account and is held in memory only. Receipts hold statuses, header
 names, digests and timings, never a token, a key, an email or an address.
+
+To explain an origin `421`, read the edge-test origin's Cloud Run log (a
+separate read-only GCP operation). Each refusal writes one content-free line,
+`{"event":"edge_origin_boundary_refusal","reason":"<code>"}`, while the client
+still gets the constant `421`. The code names the refusal site, from
+`EDGE_TEST_REQUEST_REFUSAL_REASONS` (`cloud-run/origin-edge-test-mode.mjs`,
+such as `host_mismatch`) or `EDGE_ORIGIN_BOUNDARY_REFUSAL_REASONS`
+(`cloud-run/postgres-edge-origin-dispatch.mjs`, such as
+`invoker_bearer_prefix_missing`, `invoker_segments` or `audience_mismatch`).
+A refusal of the delivered `x-serverless-authorization` adds `invokerShape`:
+whether it starts with `Bearer `, its segment count, which segments are empty
+or base64url, and whether the third is `SIGNATURE_REMOVED_BY_GOOGLE`. No line
+carries a header value, token, email, host or path. A `421` without such a
+line did not come from the origin.
