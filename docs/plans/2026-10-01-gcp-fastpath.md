@@ -387,7 +387,10 @@ or seeded on GCP or Cloudflare, and no production data was read.
   A-4, IN-1, T-1, T-2, the Q-1 golden and the 0059 promotion.
   `claude/gcp-fastpath-final` adds this record and the accepted decision
   (DOC-1L), the D-1 deploy and seed tooling, the D-1 hand-offs and the cache
-  history horizon. IN-2 and IN-3 stay branch-only.
+  history horizon. It then merged the IN-2 and IN-3 intake composition
+  (`claude/gcp-fastpath-intake`, primary 0060 and 0061) and added primary
+  0062, which pins 0011's active-participant trigger to its schema. That
+  evidence is local only and is recorded in the final-integration receipt.
 - **The one-command rehearsal** ran as the Gates section expects, with one
   exception: it exits 1 because model-days differ. Every importer completes
   (owner roster 4/4, public source owners and owner revisions equal to D1);

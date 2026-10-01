@@ -10,7 +10,9 @@ status: snapshot
 This is a 2026-10-01 receipt for branch `claude/gcp-fastpath-final` at code
 commit `298afb15`, built on the frozen `claude/gcp-fastpath` `f0b6158a`
 (whose [local rehearsal receipt](./2026-10-01-gcp-fastpath-local-rehearsal.md)
-stays the record for that commit). It records **local, synthetic** evidence
+stays the record for that commit). A later section,
+[Intake merge and primary 0062](#intake-merge-and-primary-0062), records code
+commit `0fea08b0`, which merges the IN-2/IN-3 intake composition on top. It records **local, synthetic** evidence
 only: one macOS arm64 workstation, a local PostgreSQL 17 cluster on a private
 Unix socket and the Q-1 oracle's content-free four-owner corpus. Nothing was
 pushed, deployed or seeded; no GCP or Cloudflare resource was read or
@@ -144,6 +146,136 @@ Not run: root `npm test`, root `npm run check`, the Worker's full `check`
 (it includes Wrangler dry-runs and `deploy:dry`), a Docker build, and
 anything on GCP or Cloudflare.
 
+## Intake merge and primary 0062
+
+Code commit `0fea08b0` on `claude/gcp-fastpath-final`. Evidence is local and
+synthetic only, under the same limits as above. Nothing was pushed, deployed
+or seeded, and no GCP, Cloudflare or production resource was read or
+written.
+
+### What changed
+
+1. **Intake merged** (`2dcdd90f`): `claude/gcp-fastpath-intake` `aa260555`.
+   It brings the IN-2 v1.1 and IN-3 v1.0/v0.1 intake composed into the
+   origin, primary 0060 (v1.1 live admission) and 0061 (legacy contribution
+   admission), and its seven review fixes. There was no textual conflict.
+   The fastpath migrate profile already takes its counts from the deploying
+   commit, so the only count changes were to the A2 and benchmark pins.
+   The build context's import-closure check now also scans the nested
+   `cloud-run/envelopes` and `cloud-run/routes` modules the intake adds.
+   A probe import from a nested route module to a module outside the
+   context now fails; the old pattern let it through.
+2. **Primary 0062** (`f1f13bde`,
+   `0062_telemetry_contribution_trigger_search_path.sql`). It runs
+   `ALTER FUNCTION telemetry_contributions_require_active_participant() SET search_path FROM CURRENT`.
+   That pins the path to the function's own schema, then `pg_catalog`, the
+   pin every other runtime function in the chain carries. A catalog scan of
+   the composed chain found this 0011 trigger function to be the only
+   function in the runtime schemas without a pinned search_path. 0011's
+   other one, the lifetime participant limit, was dropped by 0061.
+   - Without the pin, an insert into `telemetry_contributions` from a pool
+     that sets no search_path failed 42P01 inside the trigger. The origin's
+     pools set none.
+   - The new `postgres-function-search-path.spec.mjs` (2 cases) proves the
+     fix. It shows the 42P01 on the chain up to 0061, then admission (and
+     P1001 for a deleting participant) once the runner applies 0062. It also
+     asserts that every primary and ledger function pins its path. Both
+     cases fail when 0062 is a no-op.
+   - The v0.1 persist's `SET LOCAL search_path` was **removed** as redundant.
+     Its statements are schema-qualified, and the origin serves the route
+     only on a schema whose receipts equal the runtime manifest, which
+     includes 0062. The shipped-client v0.1 case in
+     `postgres-origin-intake.spec.mjs` therefore also proves 0062 through
+     the real path: it fails when 0062 is a no-op.
+   - The v1.1 live spec's session `SET search_path` workaround was removed
+     as well.
+   - Every primary count and tail pin is now 62 with tail 0062. The ledger
+     stays at 7.
+3. **Single-producer ratchet** (`0fea08b0`). `buildJournalSqlite` in
+   `scripts/gcp-fastpath-rehearsal.mjs` writes the oracle dump's journal rows
+   into a sealed, journal-only node:sqlite file in a mkdtemp work directory.
+   That file is the source the already-exempt sealed D1 import
+   (`postgres-ingestion-journal-transfer.mjs`) reads; the rehearsal never
+   writes the PostgreSQL journal. The file now has one entry in
+   `REVIEWED_DYNAMIC_WRITERS` with its one computed write site pinned.
+   Appending a literal PostgreSQL journal INSERT, or a second computed one,
+   still fails the ratchet.
+
+### Behaviour notes (from the intake)
+
+- **Contributions preamble and `device_sync`.** The composed contributions
+  preamble no longer charges the `device_sync` attempt limiter (RECOVERY, one
+  global 20-per-minute key that sync reads also use) for any envelope,
+  v1.2 included. This matches `d43c8f92` `handleContribution`, which meters
+  the route only with the upload-ingress limiters and the per-device chunk
+  windows. Before this change, a shipped v1.0 backfill hit 429
+  `ATTEMPT_LIMIT_REACHED` after 19 chunks.
+- **`cloud-run-iam` stays v1.2-only.** The intake is composed only in the
+  `health-and-v12-day-manifest` and `fastpath-test` host modes
+  (`ORIGIN_INTAKE_HOST_MODES`). In `cloud-run-iam` the only ingress is the
+  OAuth gateway, whose closed route table has no v1.1, sync-capabilities or
+  envelope-key route, so that service keeps its v1.2-only routes.
+
+### Rehearsal at `0fea08b0`
+
+The same command, run with `cloud-run/dist` rebuilt at `0fea08b0` by the
+`cloud-run` check. The run lasted from 2026-10-01T12:45:00Z to 12:45:54Z.
+The rehearsal ran under Node v26.2.0; analytics-refresh and the origin ran
+under Node v22.16.0. Exit 1 (`gate_failed`), as before.
+
+- Migrations: 62 primary (tail `0062_telemetry_contribution_trigger_search_path.sql`)
+  and 7 ledger.
+- Sealed SQLite `3aa696e734efc31c…`, 85 populated tables.
+- Importers, verifications and imported row counts: equal to the
+  `298afb15` run above.
+- First refresh: `complete`, 4 owners, 680 owner-days, 168 days published,
+  2026-04-17 and 2026-04-18 blocked, the same 15 refusals by reason.
+- Read: 200, `public, max-age=300`, 396337 bytes, host mode `fastpath-test`.
+- Second refresh: 0 new revisions, highest revision 1.
+- Cleanup: 3 schemas dropped. No rehearsal or test schema was left in the
+  local cluster.
+- Parity families: identical to the table above. Model-days compares 127,
+  119 equal, 91 differences (the documented 14 dates). Cache-counts is
+  informational, with 395 differences. Every other family is fully equal.
+- Bytes: the raw served body (396337 bytes) has sha256
+  `a27aee711cabc056eea2ecb5c89b7f4de3ec4a9f85b72455057c1f760ffa680d`.
+  The response file is that body plus a newline (`04f7a277a9d8616f…`), and
+  the stored preview is `b3722cc98b7a82ef…`. All three equal the `298afb15`
+  run. The merge and 0062 change no served byte.
+
+### Gates at `0fea08b0`
+
+Run serially in this order. Commands ran from `apps/worker` unless they
+start with the repository root. The PostgreSQL gates used the PG17 cluster
+on port 55433 (`PG_TEST_SOCKET`, `PG_TEST_HOST` unset). Node 26.2.0 was used
+unless a row names Node 22.16.0.
+
+| Gate | Result |
+|---|---|
+| `npx tsc --noEmit` | rc 0 (895 files) |
+| `npm run postgres:domain:check` | rc 0. Vitest 12 files, 75/75. node:test 326 tests: 324 pass, 0 fail, 2 skipped, the same two as before (ledger-authority by design; T-2's opt-in Q-1-dump case). The added tests are the intake's v1.1-live, legacy-admission and origin-intake specs and the new search-path spec |
+| `npm run scripts:check` | rc 0, 967/967. Before the ratchet entry, it failed only on the single-producer ratchet |
+| `npm run check` in `cloud-run` | rc 0. 225 tests: 224 pass, 1 skipped (the opt-in A2 real-PG activation case). Build context reports 62 primary and 7 ledger migrations |
+| `npm run analytics-v2:check` | 11 files, 108/108 under Node 26.2.0 and under Node 22.16.0 |
+| `npm run gcp:fastpath:scripts-check` | rc 0, 19/19, including the local PG17 seed run |
+| Rehearsal (above) | Exit 1 `gate_failed` on model-days only. Every other gate is true. Parity and bytes are unchanged |
+| `postgres-origin-intake.spec.mjs`, Node 22.16.0 | 6/6 |
+| `postgres-function-search-path.spec.mjs`, Node 22.16.0 and inside the domain check | 2/2 each |
+| Root `npm run architecture:check` | passed (917 production files, 3,900 imports, 0 debt edges) |
+| Root `npm run test:preflight` | rc 0: root workspace hygiene clean, documentation governance valid across 299 Markdown files and 1,565 source/config files, 20/20 preflight tests (run on the receipt as committed) |
+| `node scripts/gcp-fastpath-test-deploy.mjs all --commit=HEAD --dry-run` | rc 0, and no command executed. The migrate Job would be given `PRIMARY_EXPECTED_MIGRATIONS=62` and `LEDGER_EXPECTED_MIGRATIONS=7`. The seed plan is `run`, with all 7 stages. Refresh and origin take the seeded schema and `--now=2026-10-01T12:00:00.000Z`. The origin also takes `ANALYTICS_V2_TEST_NOW_MS=1790856000000` and ledger `tibotattle_fastpath_ledger_20261001` |
+
+One environment note: `postgres-legacy-contribution-admission.spec.mjs`
+passes 22/22 under Node 26.2.0, as the domain check runs it. Under Node
+22.16.0, 11 of its cases fail with `ERR_SQLITE_ERROR` ("column index out of
+range") in its `node:sqlite` D1 oracle. The same 11 fail at the intake head
+`aa260555`, so this is a Node 22 `node:sqlite` limit in the test oracle, not
+a product change.
+
+Not run: root `npm test`, root `npm run check`, the Worker's full `check`
+and default Vitest suite, a Docker build, and anything on GCP or
+Cloudflare.
+
 ## Remaining gates and owner decisions
 
 - Model-day semantics: port production's block-and-withhold rule or accept
@@ -151,8 +283,13 @@ anything on GCP or Cloudflare.
 - The D-1 deploy and seed have not run against the test project. Seeding
   needs Node 26 on the operator workstation and a checkout equal to the
   deployed commit.
-- The image's build context still pins 59/7 migrations, as do the A2 and
-  benchmark migrate profiles. Keep the promoted chain (0053, ledger 0007) off
-  every non-disposable database until the SIMP-0 amendments land.
-- IN-2 and IN-3 intake, dense owners, the native dense fallback, the memo,
-  the edge and production remain outside this evidence.
+- The image's build context, the A2 and benchmark migrate profiles and the
+  activation, benchmark, readback and cleanup jobs now pin 62/7 (tail 0062).
+  Keep the promoted chain (0053, ledger 0007) off every non-disposable
+  database until the SIMP-0 amendments land. 0060 to 0062 have run only on
+  local PostgreSQL 17.
+- The IN-2/IN-3 intake is proven only locally, with shipped clients against
+  the composed origin on local PostgreSQL 17. No edge, test-project or
+  production traffic has reached it. Dense owners, the native dense
+  fallback, the memo, the edge and production remain outside this
+  evidence.
