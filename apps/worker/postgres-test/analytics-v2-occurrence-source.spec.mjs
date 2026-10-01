@@ -378,3 +378,35 @@ test("the first evidence day is the earliest candidate day over every stream, wi
     await assert.rejects(modules.occurrences.readOwnerFirstEvidenceDay(context("active"),
       { ownerDigest: "not-a-digest", throughDay: D3 }), (error) => error?.code === "ANALYTICS_V2_SOURCE_INVALID");
   });
+
+test("counts equal the reader's per-day occurrences for every owner, stream and runtime (the Job's memory guard input)",
+  { skip: SKIP, timeout: 180_000 }, async () => {
+    const addDays = (day, delta) => new Date(Date.parse(`${day}T00:00:00.000Z`) + delta * 86_400_000)
+      .toISOString().slice(0, 10);
+    let compared = 0;
+    for (const runtime of ["active", "staged"]) {
+      const listing = await modules.owners.listAnalyticsV2Owners(context(runtime));
+      for (const owner of listing.owners) {
+        for (const stream of ["usage", "quota", "session"]) {
+          const options = { ownerDigest: owner.ownerDigest, stream, fromDay: addDays(D3, -399), throughDay: D3 };
+          const read = await modules.occurrences.readOwnerOccurrences(context(runtime), options);
+          const counts = await modules.occurrences.countOwnerOccurrences(context(runtime), options);
+          assert.deepEqual([...counts], [...read].map(([day, rows]) => [day, rows.length]),
+            `${runtime} ${owner.participantId} ${stream}`);
+          compared += counts.size;
+        }
+      }
+    }
+    // The fixture's union cases are all counted once: the v1/v1.1/v1.2 shared
+    // occurrence, the crossed-midnight conflict on both days and the corrected one.
+    const alpha = fixtures.active.owners.alpha.ownerDigest;
+    assert.deepEqual([...await modules.occurrences.countOwnerOccurrences(context("active"),
+      { ownerDigest: alpha, stream: "usage", fromDay: D1, throughDay: D3 })], [[D1, 3], [D2, 2]]);
+    assert.ok(compared >= 8, "the comparison covered every evidence day of the fixture");
+    await assert.rejects(modules.occurrences.countOwnerOccurrences(context("active"),
+      { ownerDigest: alpha, stream: "usage", fromDay: D1, throughDay: addDays(D1, 400) }),
+    (error) => error?.code === "ANALYTICS_V2_SOURCE_INVALID", "a count spans at most 400 days, as a read");
+    assert.equal(modules.occurrences.MAX_ANALYTICS_V2_CANDIDATES, 2_000_000);
+    assert.equal(modules.occurrences.MAX_ANALYTICS_V2_BATCH_SOURCE_ROWS, 40_000);
+    assert.equal(modules.occurrences.MAX_ANALYTICS_V2_BATCH_V12_ROWS, 40_000);
+  });

@@ -13,7 +13,9 @@
 // the kernels never run against the GCP line's own packages.
 //
 // Do not edit vendored files. To change the vendored revision or closure, edit
-// the generator and this facade, then regenerate.
+// the generator and this facade, then regenerate. The GCP job's larger bounds
+// are not a vendored edit: src/analytics-v2/native-path.ts recomposes the
+// exported kernel steps below and owns the GCP limits (resources.ts).
 
 // Shared per-owner-day reducers (scalar fits, model history, cache continuity).
 export {
@@ -32,6 +34,45 @@ export {
 } from "./apps/worker/src/analytics-shared-features";
 export { evaluatePreparedModelDate } from "./apps/worker/src/analytics-model-block-contract";
 export { createUsageCorrectionOccurrenceAccumulator } from "./apps/worker/src/telemetry-usage-reconciliation";
+
+// The kernel steps that the shared reducers and production's native effective
+// path (storage-effective-history.ts advanceStorageEffectiveAnalysis) are
+// built from. src/analytics-v2/native-path.ts composes them into the
+// in-memory equivalent of the native path, for owner-days and windows that the
+// shared reducers refuse at their bounds. Every module named here is already
+// in the facade's closure, so the vendored file set does not change.
+export {
+  appendEffectiveQuotaDay,
+  finishEffectiveQuotaDay,
+  foldEffectiveQuotaDays,
+  mapEffectiveQuotaPageRow,
+} from "./apps/worker/src/effective-quota-day";
+export type { EffectiveQuotaDay, EffectiveQuotaDayPending } from "./apps/worker/src/effective-quota-day";
+export {
+  appendEffectiveUsageDay,
+  effectiveUsageWindowRepresentable,
+  mapEffectiveUsagePageRow,
+} from "./apps/worker/src/effective-usage-day";
+export type { EffectiveUsageDay, EffectiveUsageDayPending } from "./apps/worker/src/effective-usage-day";
+export { cacheRetentionEventFromRecord, cacheRetentionSessionDigest } from "./apps/worker/src/cache-retention-day";
+export {
+  advanceV11UsageReduction,
+  createV11QuotaAcquisitionIdentity,
+  finishV11UsageReduction,
+  foldV11UsageModelReduction,
+} from "./apps/worker/src/quota-analysis-v11";
+export type { UsageRow, V11UsageReductionCheckpoint } from "./apps/worker/src/quota-analysis-v11";
+export {
+  advanceV11QuotaAcquisition,
+  createV11QuotaAcquisitionCheckpoint,
+} from "./apps/worker/src/quota-analysis-v11-reader";
+export type {
+  V11CompletedQuotaAcquisition,
+  V11QuotaAcquisitionCheckpoint,
+  V11QuotaAcquisitionIdentity,
+  V11QuotaPageReader,
+} from "./apps/worker/src/quota-analysis-v11-reader";
+export type { V11QuotaPageRow } from "./apps/worker/src/typed-v11-quota-reader";
 
 // Community daily activity and API-equivalent value.
 export { buildCommunityDailyPayload, COMMUNITY_DAILY_POLICY_VERSION } from "./apps/worker/src/community-daily-aggregates";
@@ -93,6 +134,7 @@ export {
 export type {
   CacheRetentionBandRow,
   CacheRetentionDayAggregate,
+  CacheRetentionItem,
   CacheRetentionWindowId,
   PublicCacheRetentionSeries,
   PublicCacheRetentionWindow,

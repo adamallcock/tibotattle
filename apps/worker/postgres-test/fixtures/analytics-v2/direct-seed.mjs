@@ -18,9 +18,14 @@
  *   echo    accountless, opted out with a retained public-history marker
  *           (production view semantics: included)
  *   delta   accountless, disconnected (security reset): excluded
+ *   hotel   social, v1.2 only, seeded only with `dense`  effective / effective
  *
  * The usage-correction runtime row is immutable once written, so each runtime
  * state gets its own schema: seedAnalyticsV2Fixture({ correctionRuntime }).
+ *
+ * `dense: { day, usage }` (GCP cap raise) adds hotel with one v1.2 day of
+ * `usage` usage records in 200-record chunks, beyond the d43c8f92 shared
+ * reducers' 20,000-occurrence day bound. Nothing else changes.
  */
 
 import { createHash } from "node:crypto";
@@ -141,7 +146,7 @@ const PLAN_BASES = ["unavailable", "same_source_occurrence", "provisional_marker
  * the spec (typed codecs, the correction assertion and sha256Hex), so stored
  * digests are the bytes the production readers verify.
  */
-export async function seedAnalyticsV2Fixture({ pool, schema, modules, correctionRuntime }) {
+export async function seedAnalyticsV2Fixture({ pool, schema, modules, correctionRuntime, dense = null }) {
   if (correctionRuntime !== "active" && correctionRuntime !== "staged") throw new Error("fixture_runtime_invalid");
   const { codec, v12codec, reconciliation, sha256Hex } = modules;
   const quoted = `"${schema}"`;
@@ -810,6 +815,29 @@ export async function seedAnalyticsV2Fixture({ pool, schema, modules, correction
     ] }] });
   await revokeAccountless(deltaDevice, "security_reset", "2026-09-30T07:00:00.000Z");
 
+  // hotel (opt-in): a v1.2-only social owner with one dense usage day.
+  let hotel = null;
+  if (dense !== null) {
+    if (!Number.isSafeInteger(dense.usage) || dense.usage < 1 || !/^\d{4}-\d{2}-\d{2}$/u.test(dense.day)) {
+      throw new Error("fixture_dense_invalid");
+    }
+    const hotelId = await participant("hotel", "social");
+    const hotelDevice = await socialDevice(hotelId, "hotel-v12", { v12: true });
+    const hotelDigest = await linkOwner(hotelId, "hotel");
+    const start = Date.parse(`${dense.day}T00:00:00.000Z`);
+    const spacing = Math.floor(86_000_000 / dense.usage);
+    const records = Array.from({ length: dense.usage }, (_, index) =>
+      usageRecord("v12", `event:v2:${digest(`occurrence:hotel:${index}`)}`,
+        new Date(start + 1_000 + index * spacing).toISOString()));
+    const chunks = [];
+    for (let offset = 0; offset < records.length; offset += 200) {
+      chunks.push({ stream: "usage", records: records.slice(offset, offset + 200) });
+    }
+    await v12Generation({ participantId: hotelId, deviceId: hotelDevice, name: "hotel-v12",
+      days: [{ day: dense.day, chunks }], head: true });
+    hotel = Object.freeze({ participantId: hotelId, ownerDigest: hotelDigest, devices: Object.freeze([hotelDevice]) });
+  }
+
   const lastSequence = Number((await q(`SELECT COALESCE(max(sequence),0)::text AS sequence
     FROM ${table("storage_ingestion_changes")}`)).rows[0].sequence);
   return Object.freeze({
@@ -821,6 +849,7 @@ export async function seedAnalyticsV2Fixture({ pool, schema, modules, correction
       golf: Object.freeze({ participantId: golfId, ownerDigest: null, devices: Object.freeze([]) }),
       echo: Object.freeze({ participantId: echoId, ownerDigest: echoDigest, devices: Object.freeze([echoDevice]) }),
       delta: Object.freeze({ participantId: deltaId, ownerDigest: deltaDigest, devices: Object.freeze([deltaDevice]) }),
+      ...(hotel === null ? {} : { hotel }),
     }),
     sequences: Object.freeze({
       alphaV1Usage: alphaV1Usage.sequence, alphaV1Quota: alphaV1Quota.sequence,

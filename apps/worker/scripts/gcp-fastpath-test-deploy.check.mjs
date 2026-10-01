@@ -17,6 +17,7 @@ import {
   originClockEnv,
   originInvokerCommand,
   primarySchemaOf,
+  REFRESH_JOB_RESOURCES,
   refreshJobCommand,
   renderOriginService,
   validateOriginPolicy,
@@ -26,7 +27,9 @@ import {
   FASTPATH_TEST_CLOUD_TARGET,
   fastpathTestDatabaseConfig,
 } from "../cloud-run/origin-fastpath-mode.mjs";
+import { GCP_FASTPATH_REHEARSAL_REFRESH_HEAP_MIB } from "./gcp-fastpath-rehearsal.mjs";
 import {
+  analyticsRefreshResources,
   parseAnalyticsRefreshArguments,
   resolveAnalyticsRefreshDatabase,
 } from "../cloud-run/analytics-refresh.mjs";
@@ -79,15 +82,22 @@ test("migrate and refresh Jobs carry the exact database targets, identities and 
   assert.equal(migrate.includes("--args=dist/test-migrations.mjs,--profile=fastpath"), true);
 
   const plain = refreshJobCommand({ image: IMAGE });
-  assert.equal(plain.includes("--args=dist/analytics-refresh.mjs,--mode=full,--schema=tibotattle_fastpath_20261001"), true);
+  assert.equal(plain.includes(
+    "--args=--max-old-space-size=6144,dist/analytics-refresh.mjs,--mode=full,--schema=tibotattle_fastpath_20261001"), true);
   assert.equal(plain.some((arg) => arg.includes("ANALYTICS_V2_TEST_CLOCK")), false);
   const clocked = refreshJobCommand({ image: IMAGE, now: "2026-10-01T00:00:00Z", extraEnv: [["EXTRA_FLAG", "1"]] });
   assert.equal(clocked.some((arg) => arg.endsWith(",--now=2026-10-01T00:00:00Z")), true);
   assert.equal(clocked.some((arg) => arg.includes("ANALYTICS_V2_TEST_CLOCK=1") && arg.includes("EXTRA_FLAG=1")), true);
-  for (const flag of ["--cpu=2", "--memory=4Gi", "--task-timeout=3600s", "--max-retries=0",
+  // An 8 GiB task with a 6,144 MiB heap: the job's default budget plus its reserve.
+  for (const flag of ["--cpu=2", "--memory=8Gi", "--task-timeout=7200s", "--max-retries=0",
     `--service-account=${FASTPATH_TEST.runtimeServiceAccount}`]) {
     assert.equal(clocked.includes(flag), true, flag);
   }
+  const MIB = 1_048_576;
+  const heapLimit = (REFRESH_JOB_RESOURCES.heapMiB + 48) * MIB;
+  assert.ok(analyticsRefreshResources({}, heapLimit).requiredHeapBytes <= REFRESH_JOB_RESOURCES.heapMiB * MIB,
+    "the default budget plus reserve fits the Job's old-space size");
+  assert.equal(GCP_FASTPATH_REHEARSAL_REFRESH_HEAP_MIB, REFRESH_JOB_RESOURCES.heapMiB, "the rehearsal runs the Job's heap");
   expectCode(() => refreshJobCommand({ image: IMAGE, now: "yesterday" }), "FASTPATH_DEPLOY_NOW_INVALID");
   expectCode(() => refreshJobCommand({ image: IMAGE, extraArgs: ["--a,b"] }), "FASTPATH_DEPLOY_ARGS_INVALID");
   expectCode(() => refreshJobCommand({ image: IMAGE, extraEnv: [["bad-key", "1"]] }), "FASTPATH_DEPLOY_ENV_INVALID");
@@ -251,7 +261,10 @@ test("the deploy script and the composition roots agree on the clock, database, 
 
   // Refresh: the Job's args and env parse, take the test clock and reach only tibotattle_fastpath.
   const command = refreshJobCommand({ image: IMAGE, now: "2026-10-01T12:00:00Z", schema: seeded });
-  const args = command.find((arg) => arg.startsWith("--args=")).slice("--args=".length).split(",").slice(1);
+  // node's own flag (the heap) comes before the script; the job parses what follows it.
+  const nodeArgs = command.find((arg) => arg.startsWith("--args=")).slice("--args=".length).split(",");
+  assert.deepEqual(nodeArgs.slice(0, 2), ["--max-old-space-size=6144", "dist/analytics-refresh.mjs"]);
+  const args = nodeArgs.slice(2);
   const jobEnv = { ...commandEnv(command), CLOUD_RUN_JOB: FASTPATH_TEST.refreshJob };
   const parsed = parseAnalyticsRefreshArguments(args, jobEnv);
   assert.equal(parsed.schema, seeded);

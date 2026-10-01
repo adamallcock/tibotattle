@@ -13,7 +13,12 @@
  *      days the last run left blocked, the earliest stored cache-band day),
  *      and run every A-1 reader through a pool whose transactions all import
  *      that snapshot;
- *   3. compute with A-2 (pure, single-threaded);
+ *   3. compute with A-2 (pure, single-threaded), one effective owner at a
+ *      time: A-1's exact evidence counts (countOwnerOccurrences) decide the
+ *      per-owner memory guard and the read spans before anything is read; an
+ *      admitted owner is then read in the same snapshot, computed and
+ *      released, so the heap holds the largest owner, not the corpus. The
+ *      exporting transaction stays open until the last read;
  *   4. write everything with store.ts writeRunOutputs in ONE transaction on
  *      the same session, then release the lock.
  *
@@ -32,6 +37,21 @@
  *                          (ANALYTICS_V2_TEST_CLOCK=1 or a POSTGRES_TEST_HTTP_MODE)
  *   --revision-seed=<n>    published revisions start above n (default 0)
  *   --help
+ *
+ * Resources (environment; defaults sized for an 8 GiB task whose Node heap
+ * is --max-old-space-size=6144; each value must lie within its bounds):
+ *   ANALYTICS_V2_MEMORY_BUDGET_MIB       per-owner memory estimate budget
+ *                                        (default 4608, 1024..30720); an owner
+ *                                        over it is refused with memory_budget
+ *   ANALYTICS_V2_MAX_DAY_OCCURRENCES     owner-day backstop (default 250000,
+ *                                        20000..250000)
+ *   ANALYTICS_V2_MAX_DAY_RECORD_MIB      owner-day record bytes backstop
+ *                                        (default 256, 32..256)
+ *   ANALYTICS_V2_READ_CHUNK_OCCURRENCES  occurrences one read call targets
+ *                                        (default 250000, 10000..2000000)
+ * The run refuses to start (ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT) unless
+ * the heap limit covers the budget plus the reserve: 512 MiB plus 4 KiB per
+ * read-chunk occurrence.
  *
  * Database: in a Cloud Run Job (CLOUD_RUN_JOB set) it connects through
  * cloud-sql.mjs createIamPool and, until cutover, only to the private test
@@ -52,6 +72,7 @@ import { randomUUID } from "node:crypto";
 import { lstat, realpath, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { getHeapStatistics } from "node:v8";
 import { Connector } from "@google-cloud/cloud-sql-connector";
 import pg from "pg";
 import {
@@ -100,6 +121,32 @@ const MAX_QUEUE_PAGES = 1_000;
 /** A-1's per-call day bound when its module does not export one. */
 const DEFAULT_OCCURRENCE_CHUNK_DAYS = 400;
 const READ_SUMMARY_KEYS = Object.freeze(["unlinkedTypedOwners", "terminalOwners", "nonEffectiveUnread"]);
+const MIB = 1_024 * 1_024;
+const ENV_DECIMAL = /^(?:0|[1-9]\d{0,9})$/u;
+/**
+ * The Job's resource environment. The first three mirror resources.ts
+ * ANALYTICS_V2_RESOURCE_BOUNDS (in MiB where named so); the spec pins the
+ * equality. The read chunk is the Job's own: the occurrences one A-1 read
+ * call targets, which bounds the reader's transient memory.
+ */
+export const ANALYTICS_REFRESH_RESOURCE_ENV = Object.freeze({
+  memoryBudgetMiB: Object.freeze({ name: "ANALYTICS_V2_MEMORY_BUDGET_MIB", minimum: 1_024, maximum: 30_720,
+    default: 4_608 }),
+  maxDayOccurrences: Object.freeze({ name: "ANALYTICS_V2_MAX_DAY_OCCURRENCES", minimum: 20_000, maximum: 250_000,
+    default: 250_000 }),
+  maxDayRecordMiB: Object.freeze({ name: "ANALYTICS_V2_MAX_DAY_RECORD_MIB", minimum: 32, maximum: 256, default: 256 }),
+  readChunkOccurrences: Object.freeze({ name: "ANALYTICS_V2_READ_CHUNK_OCCURRENCES", minimum: 10_000,
+    maximum: 2_000_000, default: 250_000 }),
+});
+/**
+ * Heap the Job keeps outside the per-owner budget: fixed headroom for the
+ * accumulated outputs of earlier owners and the community fold, plus the
+ * reader's transient per candidate of one read call (an estimate: decoded
+ * sources and reconciliation state of one expansion batch per candidate).
+ */
+export const ANALYTICS_REFRESH_HEAP_RESERVE = Object.freeze({ fixedBytes: 512 * MIB, bytesPerReadCandidate: 4_096 });
+/** Mirrors occurrence-source.ts MAX_ANALYTICS_V2_CANDIDATES (one read call's ceiling); the spec pins it. */
+export const ANALYTICS_REFRESH_MAX_READ_CANDIDATES = 2_000_000;
 
 export const ANALYTICS_REFRESH_USAGE = `Usage: node analytics-refresh.mjs --mode=full [--schema=<identifier>]
        [--now=<ISO instant>] [--revision-seed=<n>]
@@ -114,6 +161,12 @@ refusal) or 1 (failure).
                          or POSTGRES_TEST_HTTP_MODE
   --revision-seed=<n>    first published revision is above n (default 0)
   --help                 print this text
+
+Resources (environment, within bounds): ANALYTICS_V2_MEMORY_BUDGET_MIB (4608),
+ANALYTICS_V2_MAX_DAY_OCCURRENCES (250000), ANALYTICS_V2_MAX_DAY_RECORD_MIB (256),
+ANALYTICS_V2_READ_CHUNK_OCCURRENCES (250000). The Node heap limit must cover the
+budget plus 512 MiB plus 4 KiB per read-chunk occurrence (run the Job with
+--max-old-space-size=6144 for the defaults).
 `;
 
 function fail(code, extra = {}) {
@@ -180,6 +233,45 @@ export function parseAnalyticsRefreshArguments(argv, env = {}) {
     schema,
     nowMs,
     revisionSeed: Number(seedText),
+  });
+}
+
+function resourceValue(env, entry) {
+  const text = env?.[entry.name];
+  if (text === undefined || text === "") return entry.default;
+  if (typeof text !== "string" || !ENV_DECIMAL.test(text)) {
+    fail("ANALYTICS_V2_REFRESH_RESOURCES_INVALID", { field: entry.name });
+  }
+  const value = Number(text);
+  if (value < entry.minimum || value > entry.maximum) {
+    fail("ANALYTICS_V2_REFRESH_RESOURCES_INVALID", { field: entry.name });
+  }
+  return value;
+}
+
+/**
+ * The run's resources from the environment, and the heap they need. Refused
+ * before any connection: a value outside its bounds
+ * (ANALYTICS_V2_REFRESH_RESOURCES_INVALID), or a heap limit below the budget
+ * plus the reserve (ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT), so an owner the
+ * guard admits cannot exhaust the heap by design.
+ */
+export function analyticsRefreshResources(env, heapLimitBytes) {
+  const spec = ANALYTICS_REFRESH_RESOURCE_ENV;
+  const memoryBudgetBytes = resourceValue(env, spec.memoryBudgetMiB) * MIB;
+  const maxDayOccurrences = resourceValue(env, spec.maxDayOccurrences);
+  const maxDayRecordBytes = resourceValue(env, spec.maxDayRecordMiB) * MIB;
+  const readChunkOccurrences = resourceValue(env, spec.readChunkOccurrences);
+  const requiredHeapBytes = memoryBudgetBytes + ANALYTICS_REFRESH_HEAP_RESERVE.fixedBytes
+    + readChunkOccurrences * ANALYTICS_REFRESH_HEAP_RESERVE.bytesPerReadCandidate;
+  if (!Number.isSafeInteger(heapLimitBytes) || heapLimitBytes < requiredHeapBytes) {
+    fail("ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT");
+  }
+  return Object.freeze({
+    compute: Object.freeze({ memoryBudgetBytes, maxDayOccurrences, maxDayRecordBytes }),
+    readChunkOccurrences,
+    heapLimitBytes,
+    requiredHeapBytes,
   });
 }
 
@@ -460,6 +552,31 @@ export function analyticsRefreshRangeChunks(range, chunkDays) {
   return chunks;
 }
 
+/**
+ * Contiguous read spans covering `range`, for one owner and stream: each at
+ * most `chunkDays` days and, where the exact per-day counts allow, at most
+ * `maxOccurrences` occurrences; a single day larger than that is a span of
+ * its own (A-1 never splits a day). Without counts the spans are
+ * analyticsRefreshRangeChunks(range, chunkDays).
+ */
+export function analyticsRefreshReadSpans(range, chunkDays, dayCounts, maxOccurrences) {
+  const spans = [];
+  let current = null;
+  for (let day = range.fromDay; day <= range.throughDay; day = addDays(day, 1)) {
+    const count = dayCounts.get(day) ?? 0;
+    if (current !== null && daySpan(current.fromDay, day) <= chunkDays
+        && current.occurrences + count <= maxOccurrences) {
+      current.throughDay = day;
+      current.occurrences += count;
+    } else {
+      if (current !== null) spans.push(Object.freeze(current));
+      current = { fromDay: day, throughDay: day, occurrences: count };
+    }
+  }
+  if (current !== null) spans.push(Object.freeze(current));
+  return spans;
+}
+
 function requireFunction(module, name) {
   const value = module?.[name];
   if (typeof value !== "function") fail("ANALYTICS_V2_REFRESH_PIPELINE_UNAVAILABLE", { missing: name });
@@ -484,8 +601,9 @@ function hasTypedEvidence(owner) {
   return owner.hasV1 === true || owner.hasV11 === true || owner.hasV12 === true;
 }
 
-function hasEvidence(day) {
-  return day !== undefined && day.usage.length + day.quota.length + day.session.length > 0;
+/** Heap bytes in use: sampled into each owner's heapPeakBytes (operational metadata only). */
+function defaultMemoryProbe() {
+  return process.memoryUsage().heapUsed;
 }
 
 /** A-1's closed, content-free source failure (owners.ts AnalyticsV2SourceError). */
@@ -504,15 +622,23 @@ function compareOwners(left, right) {
  * - listAnalyticsV2Owners(context) -> {owners, unlinked, correctionRuntimeActive};
  * - readQueuedDays(context, {afterSequence, limit}) -> one journal page, read
  *   until complete;
- * - readOwnerOccurrences(context, {ownerDigest, stream, fromDay, throughDay})
- *   -> Map(day -> occurrences), at most MAX_ANALYTICS_V2_OCCURRENCE_DAYS a call;
+ * - readOwnerOccurrences(context, {ownerDigest, stream, fromDay, throughDay,
+ *   maxCandidates}) -> Map(day -> occurrences), at most
+ *   MAX_ANALYTICS_V2_OCCURRENCE_DAYS a call;
+ * - countOwnerOccurrences(context, {ownerDigest, stream, fromDay, throughDay})
+ *   -> Map(day -> the exact count readOwnerOccurrences returns), same bound;
  * - readOwnerFirstEvidenceDay(context, {ownerDigest, throughDay}) -> the
  *   owner's first evidence day or null (the cache horizon's lower end);
  * - countContributingDevices(context, {days: Map(day -> effective owners)});
- * - computeAnalyticsV2({..., occurrenceRange, cacheFromDay}) over ONE
- *   contiguous range that covers analyticsV2RequiredOccurrenceRange.
+ * - computeAnalyticsV2({..., occurrenceRange, cacheFromDay,
+ *   loadOwnerOccurrences, ownerEvidence, resources}) over ONE contiguous range
+ *   that covers analyticsV2RequiredOccurrenceRange.
  *
- * Effective owners are read over the whole range. A non-effective owner with
+ * Effective owners are counted over the whole range during read and loaded
+ * over it, one at a time, during compute: every stream in contiguous spans of
+ * at most MAX_ANALYTICS_V2_OCCURRENCE_DAYS days and, by the counts, about the
+ * read chunk of occurrences. A-2 skips the load of an owner its memory guard
+ * refuses and refuses a load that differs from the counts. A non-effective owner with
  * typed evidence is a member of production's daily cohort: it is read over
  * the queued days only, so A-2 blocks exactly the queued days it has evidence
  * on (a closed A-1 source refusal leaves it unread, and A-2 then blocks every
@@ -526,6 +652,7 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
   const listOwners = requireFunction(owners, "listAnalyticsV2Owners");
   const readQueued = requireFunction(queuedDays, "readQueuedDays");
   const readOccurrences = requireFunction(occurrences, "readOwnerOccurrences");
+  const countOccurrences = requireFunction(occurrences, "countOwnerOccurrences");
   const readFirstEvidenceDay = requireFunction(occurrences, "readOwnerFirstEvidenceDay");
   const countDevices = requireFunction(devices, "countContributingDevices");
   const computeOutputs = requireFunction(compute, "computeAnalyticsV2");
@@ -563,15 +690,17 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
     return fail("ANALYTICS_V2_REFRESH_QUEUE_CAPACITY_EXCEEDED");
   }
 
-  async function readOwnerDays(context, ownerDigest, ranges) {
+  /** `rangesOf(stream)` -> the ranges to read; a range may carry a candidate bound. */
+  async function readOwnerDays(context, ownerDigest, rangesOf) {
     const byDay = new Map();
     for (const stream of OCCURRENCE_STREAMS) {
-      for (const range of ranges) {
+      for (const range of rangesOf(stream)) {
         const result = await readOccurrences(context, {
           ownerDigest,
           stream,
           fromDay: range.fromDay,
           throughDay: range.throughDay,
+          ...(range.maxCandidates === undefined ? {} : { maxCandidates: range.maxCandidates }),
         });
         if (!(result instanceof Map)) fail("ANALYTICS_V2_REFRESH_OCCURRENCES_INVALID");
         for (const [day, list] of result) {
@@ -587,9 +716,41 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
     return byDay;
   }
 
+  /** One effective owner's exact counts per stream and day over `chunks` (A-1's own candidate selection). */
+  async function countOwnerEvidence(context, ownerDigest, chunks) {
+    const byStream = {};
+    const evidence = new Map();
+    for (const stream of OCCURRENCE_STREAMS) {
+      const counts = new Map();
+      for (const chunk of chunks) {
+        const result = await countOccurrences(context, { ownerDigest, stream, fromDay: chunk.fromDay,
+          throughDay: chunk.throughDay });
+        if (!(result instanceof Map)) fail("ANALYTICS_V2_REFRESH_OCCURRENCES_INVALID");
+        for (const [day, count] of result) {
+          if (!isDay(day) || day < chunk.fromDay || day > chunk.throughDay || counts.has(day)
+              || !Number.isSafeInteger(count) || count < 1) {
+            fail("ANALYTICS_V2_REFRESH_OCCURRENCES_INVALID");
+          }
+          counts.set(day, count);
+          const entry = evidence.get(day) ?? { usage: 0, quota: 0, session: 0 };
+          entry[stream] = count;
+          evidence.set(day, entry);
+        }
+      }
+      byStream[stream] = counts;
+    }
+    for (const [day, entry] of evidence) evidence.set(day, Object.freeze(entry));
+    return { byStream, evidence };
+  }
+
   return Object.freeze({
-    async read({ pool, schema, nowMs, state }) {
+    async read({ pool, schema, nowMs, state, resources }) {
       const context = Object.freeze({ pool, schema, nowMs });
+      const readChunk = resources?.readChunkOccurrences
+        ?? ANALYTICS_REFRESH_RESOURCE_ENV.readChunkOccurrences.default;
+      if (!Number.isSafeInteger(readChunk) || readChunk < 1 || readChunk > ANALYTICS_REFRESH_MAX_READ_CANDIDATES) {
+        fail("ANALYTICS_V2_REFRESH_RESOURCES_INVALID");
+      }
       const listing = await listOwners(context);
       if (listing === null || typeof listing !== "object" || Array.isArray(listing)
           || !Array.isArray(listing.owners) || !Array.isArray(listing.unlinked)
@@ -632,14 +793,20 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
       const fullRange = analyticsRefreshRangeChunks(occurrenceRange, chunkDays);
       const queuedSpans = analyticsRefreshDaySpans(days, chunkDays);
 
+      // Effective owners: exact counts only. Their occurrences are read one
+      // owner at a time during compute, after the memory guard.
+      const ownerEvidence = new Map();
+      const streamCounts = new Map();
       const occurrencesByOwner = new Map();
       let nonEffectiveUnread = 0;
       for (const owner of ownerList) {
         if (owner.source === "effective") {
-          occurrencesByOwner.set(owner.ownerDigest, await readOwnerDays(context, owner.ownerDigest, fullRange));
+          const counted = await countOwnerEvidence(context, owner.ownerDigest, fullRange);
+          ownerEvidence.set(owner.ownerDigest, counted.evidence);
+          streamCounts.set(owner.ownerDigest, counted.byStream);
         } else if (hasTypedEvidence(owner)) {
           try {
-            occurrencesByOwner.set(owner.ownerDigest, await readOwnerDays(context, owner.ownerDigest, queuedSpans));
+            occurrencesByOwner.set(owner.ownerDigest, await readOwnerDays(context, owner.ownerDigest, () => queuedSpans));
           } catch (error) {
             // Fail closed for publication only: unread, A-2 blocks every queued day.
             if (!isSourceError(error)) throw error;
@@ -649,16 +816,31 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
       }
 
       const contributing = new Map(days.map((day) => [day, ownerList
-        .filter((owner) => owner.source === "effective"
-          && hasEvidence(occurrencesByOwner.get(owner.ownerDigest)?.get(day)))
+        .filter((owner) => owner.source === "effective" && ownerEvidence.get(owner.ownerDigest).has(day))
         .map((owner) => ({ participantId: owner.participantId, ownerDigest: owner.ownerDigest, source: owner.source }))]));
       const devicesByDay = await countDevices(context, { days: contributing });
       if (!(devicesByDay instanceof Map)) fail("ANALYTICS_V2_REFRESH_DEVICES_INVALID");
+
+      // One effective owner's occurrences over the whole range, in spans of
+      // about the read chunk by its exact counts. Called by A-2 only while the
+      // run's read snapshot is open (runAnalyticsRefresh closes it after compute).
+      const loadOwnerOccurrences = async (ownerDigest) => {
+        const counts = streamCounts.get(ownerDigest);
+        if (counts === undefined) fail("ANALYTICS_V2_REFRESH_OCCURRENCES_INVALID");
+        return readOwnerDays(context, ownerDigest, (stream) =>
+          analyticsRefreshReadSpans(occurrenceRange, chunkDays, counts[stream], readChunk).map((span) => ({
+            fromDay: span.fromDay,
+            throughDay: span.throughDay,
+            maxCandidates: Math.min(ANALYTICS_REFRESH_MAX_READ_CANDIDATES, Math.max(readChunk, span.occurrences)),
+          })));
+      };
 
       return {
         owners: listing.owners,
         unlinkedTypedOwners: listing.unlinked.filter(hasTypedEvidence).length,
         occurrencesByOwner,
+        ownerEvidence,
+        loadOwnerOccurrences,
         occurrenceRange,
         cacheFromDay,
         devicesByDay,
@@ -667,9 +849,10 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
         lastSequence: journal.lastSequence,
         terminalOwners: journal.terminalOwners,
         nonEffectiveUnread,
+        ...(resources?.compute === undefined ? {} : { resources: resources.compute }),
       };
     },
-    async compute(inputs, { nowMs, revisionSeed }) {
+    async compute(inputs, { nowMs, revisionSeed, memoryProbe = defaultMemoryProbe }) {
       const outputs = await computeOutputs({
         owners: inputs.owners,
         occurrencesByOwner: inputs.occurrencesByOwner,
@@ -679,6 +862,10 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
         queuedDays: inputs.queuedDays,
         nowMs,
         revisionSeed,
+        loadOwnerOccurrences: inputs.loadOwnerOccurrences,
+        ownerEvidence: inputs.ownerEvidence,
+        ...(inputs.resources === undefined ? {} : { resources: inputs.resources }),
+        memoryProbe,
       });
       if (outputs === null || typeof outputs !== "object" || !Array.isArray(outputs.dailyCandidates)
           || !Array.isArray(outputs.blockedDays)) {
@@ -733,6 +920,30 @@ function safeCode(error, fallback) {
   return typeof error?.code === "string" && SAFE_CODE.test(error.code) ? error.code : fallback;
 }
 
+/**
+ * The receipt's content-free memory summary: the bounds applied and the
+ * counts of computed and refused owners, the largest estimate and the largest
+ * sampled heap. Per-owner figures go to analytics_v2_runs.timings only.
+ */
+function memorySummary(resources, recorded) {
+  const owners = Array.isArray(recorded?.owners) ? recorded.owners : [];
+  const toMiB = (bytes) => Math.ceil(bytes / MIB);
+  const largest = (values) => values.reduce((maximum, value) => Math.max(maximum, value), 0);
+  return Object.freeze({
+    model: typeof recorded?.configuration?.memoryModel === "string" ? recorded.configuration.memoryModel : null,
+    budgetMiB: toMiB(resources.compute.memoryBudgetBytes),
+    maxDayOccurrences: resources.compute.maxDayOccurrences,
+    maxDayRecordMiB: toMiB(resources.compute.maxDayRecordBytes),
+    readChunkOccurrences: resources.readChunkOccurrences,
+    heapLimitMiB: Math.floor(resources.heapLimitBytes / MIB),
+    requiredHeapMiB: toMiB(resources.requiredHeapBytes),
+    ownersComputed: owners.filter((owner) => owner.admitted === true).length,
+    ownersRefused: owners.filter((owner) => owner.admitted === false).length,
+    largestEstimateMiB: toMiB(largest(owners.map((owner) => owner.estimateBytes ?? 0))),
+    largestHeapPeakMiB: toMiB(largest(owners.map((owner) => owner.heapPeakBytes ?? 0))),
+  });
+}
+
 function countBy(values, key) {
   const counts = {};
   for (const value of values) counts[key(value)] = (counts[key(value)] ?? 0) + 1;
@@ -742,7 +953,7 @@ function countBy(values, key) {
 /**
  * Run one refresh. dependencies (tests and the composition root only):
  * createPool(database, {connector}), createConnector(), closeResources(),
- * modules ({store, pipeline}), wallClock(), randomUUID().
+ * modules ({store, pipeline}), wallClock(), randomUUID(), heapLimitBytes.
  * Returns the receipt; throws an error carrying a closed code and phase.
  */
 export async function runAnalyticsRefresh({
@@ -773,6 +984,8 @@ export async function runAnalyticsRefresh({
   let receipt;
   let failure;
   try {
+    const resources = analyticsRefreshResources(env,
+      dependencies.heapLimitBytes ?? getHeapStatistics().heap_size_limit);
     const database = await resolveAnalyticsRefreshDatabase(env, { schema: parsed.schema });
     phase = "modules";
     const modules = dependencies.modules ?? await loadAnalyticsV2Modules();
@@ -800,10 +1013,15 @@ export async function runAnalyticsRefresh({
       readOpen = true;
       await client.query(`SET LOCAL statement_timeout='${READ_STATEMENT_TIMEOUT_MILLISECONDS}ms'`);
       await client.query(`SET LOCAL lock_timeout='${READ_LOCK_TIMEOUT_MILLISECONDS}ms'`);
+      // The exporting transaction idles while owners are computed; the snapshot
+      // must outlive the last owner's read.
+      await client.query("SET LOCAL idle_in_transaction_session_timeout=0");
       const snapshot = (await client.query("SELECT pg_export_snapshot() AS snapshot"))?.rows?.[0]?.snapshot;
       const state = await store.readAnalyticsV2RefreshState(client, { schema: parsed.schema });
       const readPool = createSnapshotReadPool(pool, snapshot);
       let inputs;
+      let outputs;
+      let readMs;
       try {
         inputs = await pipeline.read({
           pool: readPool,
@@ -811,20 +1029,21 @@ export async function runAnalyticsRefresh({
           nowMs,
           state,
           revisionSeed: parsed.revisionSeed,
+          resources,
+        });
+        readMs = Math.max(0, wallClock() - readStartedMs);
+        // Owners are read in the same snapshot while they are computed.
+        phase = "compute";
+        outputs = await pipeline.compute(inputs, {
+          mode: parsed.mode,
+          nowMs,
+          revisionSeed: parsed.revisionSeed,
         });
       } finally {
         await readPool.close();
       }
       await client.query("COMMIT");
       readOpen = false;
-      const readMs = Math.max(0, wallClock() - readStartedMs);
-
-      phase = "compute";
-      const outputs = await pipeline.compute(inputs, {
-        mode: parsed.mode,
-        nowMs,
-        revisionSeed: parsed.revisionSeed,
-      });
       // The stored revision fields must follow this run's flags exactly.
       if (outputs === null || typeof outputs !== "object" || outputs.mode !== parsed.mode
           || outputs.nowMs !== nowMs || outputs.revisionSeed !== parsed.revisionSeed) {
@@ -839,7 +1058,8 @@ export async function runAnalyticsRefresh({
         startedAtMs,
         expectedCursor: state.cursor,
         horizon: outputs.horizon,
-        timings: { read: readMs },
+        // The listing, journal and counts, plus the owner loads inside compute.
+        timings: { read: readMs + (Number.isFinite(outputs.timings?.read) ? outputs.timings.read : 0) },
         wallClock,
       });
       // Content-free read counts the default pipeline reports (closed keys).
@@ -862,6 +1082,7 @@ export async function runAnalyticsRefresh({
         blocked: written.publication.blocked,
         cursor: written.cursor,
         timings: written.timings,
+        memory: memorySummary(resources, outputs.resources),
       });
     }
   } catch (error) {

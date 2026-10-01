@@ -176,11 +176,22 @@ export function migrateJobCommand({ image, expectedCounts }) {
   ]);
 }
 
+/**
+ * The analytics-refresh Job's task size. The job's default per-owner memory
+ * budget (4,608 MiB, cloud-run/analytics-refresh.mjs) plus its reserve needs a
+ * 6,144 MiB Node heap, which an 8 GiB task holds with room for the runtime
+ * and native buffers; Cloud Run allows 8 GiB with 2 vCPU (more memory needs
+ * 4 vCPU). One owner's cold recompute is single-threaded and can take tens of
+ * minutes, so the task timeout is two hours.
+ */
+export const REFRESH_JOB_RESOURCES = Object.freeze({ cpu: 2, memory: "8Gi", heapMiB: 6_144, taskTimeoutSeconds: 7_200 });
+
 /** gcloud command that creates or updates the analytics-refresh Job. */
 export function refreshJobCommand({ image, now, schema, extraEnv = [], extraArgs = [] }) {
   if (!IMAGE_REFERENCE.test(image ?? "")) fail("FASTPATH_DEPLOY_IMAGE_DIGEST_REQUIRED");
   if (now !== undefined && !ISO_INSTANT.test(now)) fail("FASTPATH_DEPLOY_NOW_INVALID");
   const args = [
+    `--max-old-space-size=${REFRESH_JOB_RESOURCES.heapMiB}`,
     "dist/analytics-refresh.mjs", "--mode=full", `--schema=${primarySchemaOf(schema)}`,
     ...(now === undefined ? [] : [`--now=${now}`]),
     ...extraArgs,
@@ -197,8 +208,8 @@ export function refreshJobCommand({ image, now, schema, extraEnv = [], extraArgs
       ["POSTGRES_IAM_USER", FASTPATH_TEST.runtimeIamUser],
       ...(now === undefined ? [] : [["ANALYTICS_V2_TEST_CLOCK", "1"]]),
     ], extraEnv)),
-    "--tasks=1", "--parallelism=1", "--max-retries=0", "--task-timeout=3600s",
-    "--cpu=2", "--memory=4Gi", labelsFlag(),
+    "--tasks=1", "--parallelism=1", "--max-retries=0", `--task-timeout=${REFRESH_JOB_RESOURCES.taskTimeoutSeconds}s`,
+    `--cpu=${REFRESH_JOB_RESOURCES.cpu}`, `--memory=${REFRESH_JOB_RESOURCES.memory}`, labelsFlag(),
   ]);
 }
 
