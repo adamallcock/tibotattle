@@ -697,9 +697,22 @@ describe.skipIf(!PG_TEST_SOCKET && !PG_TEST_HOST)("PostgreSQL explicit-day commu
       v11SelectedRecordsPresent: true,
     });
 
-    // The marker pins the exact head too: a successor generation at revision
-    // 2 excludes the retained day. (A head never moves back: primary 0060,
-    // as D1's head classification, refuses a revision-down update.)
+    // The marker pins the exact head too, each column on its own. A revision
+    // bump on the retained generation changes only the revision and excludes
+    // the day. A head never moves back (primary 0060, as D1's head
+    // classification, refuses a revision-down update), so these steps run
+    // last and are not reverted.
+    await pool.query(`UPDATE ${sqlSchema}.telemetry_v11_domain_heads
+      SET revision=revision+1 WHERE participant_id=$1 AND generation_id=$2`,
+    [fixture.participantId, fixture.generationId]);
+    expect((await pool.query(`SELECT generation_id,revision::int AS revision
+      FROM ${sqlSchema}.telemetry_v11_domain_heads WHERE participant_id=$1`, [fixture.participantId])).rows)
+      .toEqual([{ generation_id: fixture.generationId, revision: 2 }]);
+    expect(await readEligibility()).toEqual({
+      v1SelectedRecordsPresent: false,
+      v11SelectedRecordsPresent: false,
+    });
+    // A successor generation excludes it as well.
     const successorToken = "a".repeat(64);
     const successorGeneration = randomUUID();
     await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v11_domain_predecessors(
@@ -715,7 +728,7 @@ describe.skipIf(!PG_TEST_SOCKET && !PG_TEST_HOST)("PostgreSQL explicit-day commu
     [successorGeneration, fixture.participantId, fixture.deviceId, successorToken, fixture.generationId,
       "b".repeat(64), "8".repeat(64), DAY, "2026-09-24T01:00:00.000Z"]);
     await pool.query(`UPDATE ${sqlSchema}.telemetry_v11_domain_heads
-      SET generation_id=$2, revision=2 WHERE participant_id=$1`, [fixture.participantId, successorGeneration]);
+      SET generation_id=$2, revision=3 WHERE participant_id=$1`, [fixture.participantId, successorGeneration]);
     expect(await readEligibility()).toEqual({
       v1SelectedRecordsPresent: false,
       v11SelectedRecordsPresent: false,
