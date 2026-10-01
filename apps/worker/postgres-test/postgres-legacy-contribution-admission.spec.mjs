@@ -362,8 +362,14 @@ async function socialDevice(twin, participantId, deviceId, { consent = true, sec
   });
 }
 
-/** The typed v1 target on both stores: journal source, namespace pin, contract 1. */
-async function initializeTypedTargets(twin, schema) {
+/**
+ * The typed v1 target on both stores: journal source, namespace pin, contract
+ * 1, and the usage-correction runtime. D1 seeds that runtime staged
+ * (ingestion-isolation 0006); PostgreSQL 0034 seeds none and holds the row
+ * the usage-correction transfer copies, so correctionRuntime (staged,
+ * active, or null for an untransferred database) is that copied state.
+ */
+async function initializeTypedTargets(twin, schema, { correctionRuntime = "staged" } = {}) {
   const { initializeStorageSource } = await workerModule("/src/analytics-delivery.ts");
   const { initializeTypedV1Admission } = await workerModule("/src/typed-v1-admission.ts");
   const { encodeTypedTelemetryId } = await workerModule("/src/typed-telemetry-codec.ts");
@@ -378,6 +384,11 @@ async function initializeTypedTargets(twin, schema) {
   await twin.pgOnly(
     `INSERT INTO typed_v1_admission_state (id, source_namespace, namespace_id, runtime_contract_version, next_source_row_id)
      VALUES (1, ?, ?, 1, 1)`, [NAMESPACE, namespace.rows[0].id]);
+  if (correctionRuntime !== null) {
+    await twin.pgOnly(`INSERT INTO telemetry_usage_correction_runtime
+        (id, schema_version, method_version, source_state, max_capture_rows, max_history_page)
+      VALUES (1, 'telemetry-usage-correction-v1', 'usage-total-correction-v1', ?, 200, 200)`, [correctionRuntime]);
+  }
   return { schemaOptions: { primarySchema: schema, ledgerSchema: `${schema}_ledger` } };
 }
 
@@ -1494,16 +1505,13 @@ test("PG17 a v1.0 usage correction is archived exactly as d43c8f92 while the cor
   for (const runtimeState of ["staged", "active"]) {
     await withTwin(async ({ twin, pool, schema }) => {
       const sinceMs = Date.now();
-      const { schemaOptions } = await initializeTypedTargets(twin, schema);
       // D1 seeds its runtime staged (ingestion-isolation 0006) and activates
       // it in place; PostgreSQL carries the sealed D1 state as source_state
       // (primary 0034), which the transfer imports.
+      const { schemaOptions } = await initializeTypedTargets(twin, schema, { correctionRuntime: runtimeState });
       if (runtimeState === "active") {
         twin.d1Only("UPDATE telemetry_usage_correction_runtime SET state = 'active' WHERE id = 1");
       }
-      await twin.pgOnly(`INSERT INTO telemetry_usage_correction_runtime
-          (id, schema_version, method_version, source_state, max_capture_rows, max_history_page)
-        VALUES (1, 'telemetry-usage-correction-v1', 'usage-total-correction-v1', ?, 200, 200)`, [runtimeState]);
       const store = memoryObjectStore();
       const service = await origin(pool, schemaOptions, store);
       const participantId = `in3-capture-${runtimeState}`;
@@ -1596,6 +1604,51 @@ test("PG17 a v1.0 usage correction is archived exactly as d43c8f92 while the cor
     }, { ledger: true });
   }
 });
+
+test("PG17 without the correction runtime row a v1.0 usage correction is 503, as d43c8f92 refuses a missing row", {
+  skip: SKIP, timeout: 300_000,
+}, () => withTwin(async ({ twin, pool, schema }) => {
+  // An untransferred PostgreSQL database (0034 seeds no row), and on D1 the
+  // same missing row, which d43c8f92's validateRuntime refuses (!row). D1
+  // never reaches that state (0006 seeds the row and its retention trigger
+  // keeps it); the oracle twin drops the trigger only to show D1's answer.
+  const { schemaOptions } = await initializeTypedTargets(twin, schema, { correctionRuntime: null });
+  twin.d1Only("DROP TRIGGER telemetry_usage_correction_runtime_retained");
+  twin.d1Only("DELETE FROM telemetry_usage_correction_runtime WHERE id = 1");
+  const store = memoryObjectStore();
+  const service = await origin(pool, schemaOptions, store);
+  const participantId = "in3-capture-missing";
+  await socialParticipant(twin, participantId);
+  const device = await socialDevice(twin, participantId, randomUUID());
+  // A first revision and a quota correction never read the runtime.
+  const ids = {};
+  for (const [stream, revision] of [["usage", 1], ["quota", 1], ["quota", 2]]) {
+    const chunk = await syntheticChunk({ stream, count: 1, seed: `missing-${stream}-${revision}`, revision });
+    const result = await service.upload(device, chunk);
+    assert.equal(result.response.status, 202, `${stream} r${revision}`);
+    await oracleAdmission(twin, schema, result.receipt.contributionId, chunk, result.raw,
+      revision === 1 ? null : ids[stream].receipt.contributionId);
+    ids[stream] = result;
+  }
+  const before = await snapshot(twin, schema, participantId);
+  for (const key of Object.keys(before.d1)) assert.deepEqual(before.pg[key], before.d1[key], `admitted: ${key}`);
+
+  const correction = await syntheticChunk({ stream: "usage", count: 2, seed: "missing-usage-2", revision: 2 });
+  const raw = JSON.stringify(await encryptedEnvelope(correction));
+  assert.deepEqual(await d1Attempt(twin, { participantId, deviceId: device.deviceId, chunk: correction, raw,
+    supersedesId: ids.usage.receipt.contributionId }), { status: 503, code: "BACKEND_STORAGE_UNAVAILABLE", details: null });
+  const objectsBefore = store.objects.size;
+  await assert.rejects(service.upload(device, null, { raw }),
+    (error) => error.status === 503 && error.code === "BACKEND_STORAGE_UNAVAILABLE");
+  assert.equal(store.objects.size, objectsBefore, "the refused correction's object is retired");
+  const after = await snapshot(twin, schema, participantId);
+  for (const key of Object.keys(after.d1)) assert.deepEqual(after.pg[key], after.d1[key], `refused: ${key}`);
+  assert.deepEqual(after.pg, before.pg, "the current revision and its typed rows are kept");
+  assert.deepEqual((await pool.query(`SELECT
+      (SELECT count(*)::int FROM "${schema}".telemetry_usage_correction_history) AS history,
+      (SELECT count(*)::int FROM "${schema}".telemetry_usage_correction_facts) AS facts`)).rows[0],
+  { history: 0, facts: 0 });
+}, { ledger: true }));
 
 // ---------------------------------------------------------------------------
 // telemetry-envelope-v0.1 (not retired at d43c8f92; see envelopes/v01.mjs).

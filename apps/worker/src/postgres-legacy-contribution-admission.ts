@@ -42,7 +42,9 @@
  * event, a page over the runtime's max_capture_rows or the record byte
  * bounds, a source that does not prove itself) is 503 as on D1, which maps
  * every capture failure to BACKEND_STORAGE_UNAVAILABLE in typed mode. With
- * the runtime staged or absent nothing is captured, as on D1. (0034's
+ * the runtime staged nothing is captured, as on D1. Without the runtime row
+ * (the usage-correction transfer has not run) a usage correction is 503, as
+ * D1's validateRuntime refuses a missing row. (0034's
  * header predates this port: importing the sealed state still enables
  * nothing by itself, and this live v1.0 intake is the one writer that acts
  * on an imported source_state of 'active'.)
@@ -369,8 +371,13 @@ interface UsageCorrectionRuntime {
  * The imported D1 usage-correction runtime when it is active
  * (telemetry_usage_correction_runtime.source_state, primary 0034), else
  * null. D1 captures usage-correction history only when its runtime row is
- * active; staged (or, on PostgreSQL, never imported) captures nothing. A
- * row outside D1's runtime contract refuses, as D1's validateRuntime does.
+ * active; staged captures nothing. A missing row, or one outside D1's
+ * runtime contract, refuses, as D1's validateRuntime does (!row). D1 always
+ * has the row (ingestion-isolation 0006 seeds it staged); PostgreSQL has it
+ * only once the usage-correction transfer has copied it, since 0034 seeds
+ * none, and an untransferred state is unknown, not staged: treating it as
+ * staged would delete the superseded chunk's typed rows without archiving
+ * history that an active runtime must keep.
  */
 async function activeUsageCorrectionRuntime(
   client: PostgresClient, schema: string,
@@ -383,8 +390,8 @@ async function activeUsageCorrectionRuntime(
        FROM ${table(schema, "telemetry_usage_correction_runtime")} WHERE id = 1`,
   );
   const row = result.rows[0];
-  if (row === undefined) return null;
-  if (row.schema_version !== USAGE_CORRECTION_SCHEMA_VERSION
+  if (row === undefined
+      || row.schema_version !== USAGE_CORRECTION_SCHEMA_VERSION
       || row.method_version !== USAGE_CORRECTION_METHOD_VERSION
       || (row.source_state !== "staged" && row.source_state !== "active")
       || !Number.isSafeInteger(row.max_capture_rows) || row.max_capture_rows < 1
@@ -897,7 +904,7 @@ async function captureUsageCorrection(
     // historyInsertPage for one source: the archived values are read from
     // the admitted typed row itself, which must still carry this digest.
     const inserted = await client.query<{ id: string; captured_at_ms: string }>(
-      `INSERT INTO ${history} (
+      `INSERT INTO ${table(schema, "telemetry_usage_correction_history")} (
          id, participant_id, owner_digest, owner_revision, authority_epoch, source_format, namespace_id,
          owner_id, device_id, chunk_id, manifest_id, source_storage_row_id, source_row_id, occurrence_id,
          event_time_ms, provider_id, session_id, model_id, speed_mode_id, api_service_tier_id, surface_id,
@@ -931,7 +938,7 @@ async function captureUsageCorrection(
     if (inserted.rows.length === 1) {
       // ingestion-isolation 0006 telemetry_usage_correction_history_fact.
       await client.query(
-        `INSERT INTO ${facts} (id, history_id, method_version, captured_at_ms)
+        `INSERT INTO ${table(schema, "telemetry_usage_correction_facts")} (id, history_id, method_version, captured_at_ms)
          SELECT COALESCE(max(existing.id), 0) + 1, $1, 1, $2 FROM ${facts} existing
          ON CONFLICT (history_id, method_version) DO NOTHING`,
         [inserted.rows[0]!.id, inserted.rows[0]!.captured_at_ms],
@@ -1941,6 +1948,11 @@ async function persistV01Contribution(
 ): Promise<{ acceptedRecords: number; deduplicatedRecords: number }> {
   const { principal, record } = input;
   const nowIso = input.checkedAt;
+  // Primary 0011's telemetry_contributions trigger functions name their
+  // tables unqualified and carry no search_path of their own, so they resolve
+  // through the session's path; the origin's pools set none. Pin it to this
+  // schema for this transaction only, as the migration runner does.
+  await client.query(`SET LOCAL search_path TO ${schema}, pg_catalog`);
   const participant = await client.query<{ state: string; owner_kind: string }>(
     `SELECT state, owner_kind FROM ${table(schema, "participants")} WHERE id = $1 FOR UPDATE`,
     [principal.participantId],
