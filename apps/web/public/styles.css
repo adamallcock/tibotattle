@@ -5227,6 +5227,9 @@ html[data-theme="dark"] .noscript {
 .work-usage-table td:last-child .work-usage-bar span { background:var(--amber); }
 .work-usage-mix { padding:var(--space-4) var(--space-5); margin-bottom:var(--space-4); border:1px solid var(--line); border-radius:var(--radius-sm); background:var(--surface-quiet); }
 .work-usage-mix h3 { margin:0 0 var(--space-3); font:var(--weight-semibold) .8rem var(--sans); color:var(--muted); }
+.work-usage-mix-group + .work-usage-mix-group { margin-top:var(--space-5); }
+.work-usage-mix-heading { display:flex; flex-wrap:wrap; justify-content:space-between; gap:var(--space-2); margin:0 0 var(--space-2); font:var(--weight-semibold) .8rem var(--sans); }
+.work-usage-mix-heading > span:last-child { color:var(--muted); font-variant-numeric:tabular-nums; }
 .work-usage-mix-strip { display:flex; height:12px; border-radius:var(--radius-pill); overflow:hidden; background:var(--line); }
 .work-usage-mix-strip > span { display:block; flex:none; }
 .work-usage-component-0 { background:var(--chart-accent); }

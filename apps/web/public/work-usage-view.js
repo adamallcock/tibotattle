@@ -1075,25 +1075,38 @@ export function mountWorkUsageView(options = {}) {
     if (totalTokens > 0) {
       const mix = el("section", "work-usage-mix");
       mix.append(el("h3", null, tr("tokenMix")));
-      const strip = el("div", "work-usage-mix-strip");
-      strip.setAttribute("aria-hidden", "true");
-      const legend = el("ul", "work-usage-mix-legend");
-      for (const index of [1, 0, 2, 3, 4, 5]) {
-        const amount = response.totals.components[COMPONENTS[index]];
-        if (!(amount > 0)) continue;
-        const style = `work-usage-component-${index}`;
-        const segment = el("span", style);
-        segment.style.width = `${Math.min(100, amount / totalTokens * 100)}%`;
-        strip.append(segment);
-        const item = el("li");
-        const swatch = el("span", `work-usage-mix-swatch ${style}`);
-        swatch.setAttribute("aria-hidden", "true");
-        item.append(swatch, el("span", null, tr(COMPONENT_LABELS[index])),
-          el("strong", null, formatSharePercent(amount, totalTokens)),
-          el("span", "work-usage-mix-count", quantity(amount)));
-        legend.append(item);
+      for (const [label, indices] of [
+        ["inputTokens", [1, 0, 2]],
+        ["outputTokens", [3, 4, 5]],
+      ]) {
+        const amounts = indices.map(index => response.totals.components[COMPONENTS[index]]);
+        const subtotal = amounts.reduce((sum, amount) => sum + (amount ?? 0), 0);
+        if (!(subtotal > 0)) continue;
+        const group = el("section", "work-usage-mix-group");
+        group.setAttribute("aria-label", tr(label));
+        const heading = el("h4", "work-usage-mix-heading");
+        heading.append(el("span", null, tr(label)), el("span", null, quantity(subtotal)));
+        const strip = el("div", "work-usage-mix-strip");
+        strip.setAttribute("aria-hidden", "true");
+        const legend = el("ul", "work-usage-mix-legend");
+        indices.forEach((index, position) => {
+          const amount = amounts[position];
+          if (!(amount > 0)) return;
+          const style = `work-usage-component-${index}`;
+          const segment = el("span", style);
+          segment.style.width = `${Math.min(100, amount / subtotal * 100)}%`;
+          strip.append(segment);
+          const item = el("li");
+          const swatch = el("span", `work-usage-mix-swatch ${style}`);
+          swatch.setAttribute("aria-hidden", "true");
+          item.append(swatch, el("span", null, tr(COMPONENT_LABELS[index])),
+            el("strong", null, formatSharePercent(amount, subtotal)),
+            el("span", "work-usage-mix-count", quantity(amount)));
+          legend.append(item);
+        });
+        group.append(heading, strip, legend);
+        mix.append(group);
       }
-      mix.append(strip, legend);
       body.append(mix);
     }
     if (query.search) body.append(el("p", "annotation work-usage-search-note", tr("searchNote")));
