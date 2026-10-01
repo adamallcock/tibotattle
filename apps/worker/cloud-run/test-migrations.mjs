@@ -87,9 +87,32 @@ export const GRAPH_BENCHMARK_MIGRATION_TARGETS = Object.freeze([
   }),
 ]);
 
+// The fast-path rehearsal target is a separate, disposable database on the
+// test primary instance, so the database-scoped tibotattle_transfer control
+// schema installed by primary 0056 and ledger 0007 never enters the shared
+// `tibotattle` test database. Both roles are schemas of that one database.
+// Expected counts come from the deploying checkout's migration directory
+// (job environment) and must equal the image manifest; they are not pinned.
+export const FASTPATH_MIGRATIONS_JOB = "tibotattle-fastpath-test-migrate";
+export const FASTPATH_MIGRATION_PROFILE = "fastpath";
+export const FASTPATH_MIGRATION_TARGETS = Object.freeze({
+  primary: Object.freeze({
+    instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
+    database: "tibotattle_fastpath",
+    schema: "tibotattle_fastpath_20261001",
+  }),
+  ledger: Object.freeze({
+    instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
+    database: "tibotattle_fastpath",
+    schema: "tibotattle_fastpath_ledger_20261001",
+  }),
+});
+const EXPECTED_MIGRATION_COUNT_PATTERN = /^[1-9]\d{0,3}$/u;
+
 const A2_PROFILE = "a2";
 export const GRAPH_BENCHMARK_MIGRATION_PROFILE = "community-graph-benchmark";
 const GRAPH_BENCHMARK_PROFILE = GRAPH_BENCHMARK_MIGRATION_PROFILE;
+const FASTPATH_PROFILE = FASTPATH_MIGRATION_PROFILE;
 
 const EXECUTION_PATTERN = /^[a-z][a-z0-9-]{0,62}$/u;
 const MIGRATION_NAME_PATTERN = /^\d{4}_[a-z][a-z0-9_-]*\.sql$/u;
@@ -540,15 +563,37 @@ function migrationPlans(profile) {
       Object.freeze({ name: target.name, role: "primary", poolKey: "primary", target }),
     ));
   }
+  if (profile === FASTPATH_PROFILE) {
+    // Both role schemas live in one database, so they share one pool.
+    return Object.freeze(Object.entries(FASTPATH_MIGRATION_TARGETS).map(([role, target]) =>
+      Object.freeze({ name: role, role, poolKey: "fastpath", target }),
+    ));
+  }
   fail("CLOUD_RUN_TEST_MIGRATIONS_PROFILE_INVALID");
+}
+
+function expectedJobForProfile(profile) {
+  if (profile === A2_PROFILE) return TEST_MIGRATIONS_JOB;
+  if (profile === FASTPATH_PROFILE) return FASTPATH_MIGRATIONS_JOB;
+  return GRAPH_BENCHMARK_MIGRATIONS_JOB;
+}
+
+function fastpathExpectedCounts(env) {
+  const counts = {};
+  for (const role of Object.keys(FASTPATH_MIGRATION_TARGETS)) {
+    const raw = env[`${role.toUpperCase()}_EXPECTED_MIGRATIONS`];
+    if (!EXPECTED_MIGRATION_COUNT_PATTERN.test(raw ?? "")) {
+      fail("POSTGRES_TEST_MIGRATIONS_FASTPATH_EXPECTED_COUNT_INVALID");
+    }
+    counts[role] = Number(raw);
+  }
+  return Object.freeze(counts);
 }
 
 /** Validate the exact profile target and one-task Cloud Run Job execution contract. */
 function validateJobEnvironment(env, profile = A2_PROFILE) {
   const plans = migrationPlans(profile);
-  const expectedJob = profile === A2_PROFILE
-    ? TEST_MIGRATIONS_JOB
-    : GRAPH_BENCHMARK_MIGRATIONS_JOB;
+  const expectedJob = expectedJobForProfile(profile);
   if (env === null || typeof env !== "object"
       || env.CLOUD_RUN_JOB !== expectedJob
       || !EXECUTION_PATTERN.test(env.CLOUD_RUN_EXECUTION ?? "")
@@ -571,6 +616,15 @@ function validateJobEnvironment(env, profile = A2_PROFILE) {
         fail(`POSTGRES_TEST_MIGRATIONS_${prefix}_TARGET_INVALID`);
       }
     }
+  } else if (profile === FASTPATH_PROFILE) {
+    for (const [role, target] of Object.entries(FASTPATH_MIGRATION_TARGETS)) {
+      const prefix = role.toUpperCase();
+      if (env[`${prefix}_DATABASE`] !== target.database
+          || env[`${prefix}_SCHEMA`] !== target.schema
+          || env[`${prefix}_INSTANCE_CONNECTION_NAME`] !== target.instanceConnectionName) {
+        fail("POSTGRES_TEST_MIGRATIONS_FASTPATH_TARGET_INVALID");
+      }
+    }
   } else {
     const target = GRAPH_BENCHMARK_MIGRATION_TARGETS[0];
     if (env.PRIMARY_DATABASE !== target.database
@@ -590,6 +644,9 @@ function validateJobEnvironment(env, profile = A2_PROFILE) {
     serviceAccount: TEST_MIGRATIONS_SERVICE_ACCOUNT,
     migratorIamUser: TEST_MIGRATIONS_IAM_USER,
     ...(profile === A2_PROFILE ? { targets: TEST_MIGRATIONS_TARGETS } : {}),
+    ...(profile === FASTPATH_PROFILE
+      ? { targets: FASTPATH_MIGRATION_TARGETS, expectedCounts: fastpathExpectedCounts(env) }
+      : {}),
     plans,
   });
 }
@@ -645,6 +702,11 @@ async function runConfiguredTestMigrations({ env, dependencies, profile }) {
         && /^POSTGRES_TEST_MIGRATIONS_[A-Z0-9_]+$/u.test(error.code)) throw error;
     fail("POSTGRES_TEST_MIGRATIONS_MANIFEST_INVALID");
   }
+  if (profile === FASTPATH_PROFILE
+      && Object.entries(config.expectedCounts).some(([role, count]) =>
+        manifest.roles[role].length !== count)) {
+    fail("POSTGRES_TEST_MIGRATIONS_FASTPATH_EXPECTED_COUNT_MISMATCH");
+  }
 
   const connectorFactory = dependencies.createConnector ?? (() => new Connector());
   const createPool = dependencies.createPool ?? createCloudSqlIamPool;
@@ -660,7 +722,11 @@ async function runConfiguredTestMigrations({ env, dependencies, profile }) {
     } catch {
       fail("CLOUD_SQL_TEST_MIGRATIONS_CONNECTOR_CREATE_FAILED");
     }
-    const poolPlans = new Map(config.plans.map(({ poolKey, role, target }) => [poolKey, { role, target }]));
+    // The first plan for a shared pool names its connect-failure code.
+    const poolPlans = new Map();
+    for (const { poolKey, role, target } of config.plans) {
+      if (!poolPlans.has(poolKey)) poolPlans.set(poolKey, { role, target });
+    }
     for (const [poolKey, { role, target }] of poolPlans) {
       try {
         pools[poolKey] = await createPool({
@@ -700,7 +766,7 @@ async function runConfiguredTestMigrations({ env, dependencies, profile }) {
         ? migrationSummary(role, manifest)
         : Object.freeze({ schema: target.schema, ...migrationSummary(role, manifest) });
     }
-    const migrations = profile === A2_PROFILE
+    const migrations = profile === A2_PROFILE || profile === FASTPATH_PROFILE
       ? Object.freeze({
         primary: targetSummaries.primary,
         ledger: targetSummaries.ledger,
@@ -744,7 +810,9 @@ if (invokedDirectly()) {
     ? A2_PROFILE
     : profileArgument.length === 1 && profileArgument[0] === `--profile=${GRAPH_BENCHMARK_PROFILE}`
       ? GRAPH_BENCHMARK_PROFILE
-      : null;
+      : profileArgument.length === 1 && profileArgument[0] === `--profile=${FASTPATH_PROFILE}`
+        ? FASTPATH_PROFILE
+        : null;
   if (profile === null) {
     console.error(JSON.stringify({ status: "error", code: "CLOUD_RUN_TEST_MIGRATIONS_ARGUMENTS_INVALID" }));
     process.exitCode = 1;
