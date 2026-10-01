@@ -192,9 +192,10 @@ export function createTelemetryV11ContributionEnvelope(dependencies) {
 
     const chunkRowId = "chunk:" + crypto.randomUUID();
     const objectKey = "telemetry/v11-" + crypto.randomUUID();
-    // The one-use authorization binds the exact HTTP body.
-    const envelopeDigest = typeof context.envelopeDigest === "string"
-      ? context.envelopeDigest : await deps.sha256Hex(raw);
+    // As the Worker: the chunk records sha256 of the decoded body text, and
+    // the persist transaction requires the claimed grant to carry that same
+    // digest, so a body the claim bound differently is refused there.
+    const envelopeDigest = await deps.sha256Hex(raw);
     const attempt = Object.freeze({ chunkRowId, objectKey, r2Key: objectKey, authorizationId: claim.authorizationId });
     await deps.registerPendingObject(pool, chunkRowId, objectKey, Date.now(), options);
     try {
