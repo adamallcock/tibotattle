@@ -15,6 +15,8 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 // @ts-expect-error -- test-only Vite ?raw import, checked by rawText below.
 import rawEdgeEntrySource from "../src/edge-entry.ts?raw";
 // @ts-expect-error -- test-only Vite ?raw import, checked by rawText below.
+import rawEdgeEntryEnvSource from "../src/edge-entry-env.ts?raw";
+// @ts-expect-error -- test-only Vite ?raw import, checked by rawText below.
 import rawReleaseGuardMigration from "../release-guard-migrations/0001_sparkle_appcast_guard_nonces.sql?raw";
 // @ts-expect-error -- test-only Vite ?raw import, checked by rawText below.
 import rawWorkerNonceMigration from "../migrations/0029_sparkle_appcast_guard_nonces.sql?raw";
@@ -29,7 +31,7 @@ import {
   buildEdgeGuardEnv,
   buildEdgeLocalEnv,
   createReleaseGuardDatabase,
-} from "../src/edge-entry";
+} from "../src/edge-entry-env";
 import { EDGE_HEADERS } from "../src/edge-origin-contract";
 import * as indexModule from "../src/index";
 import worker, { handleRequest } from "../src/index";
@@ -66,6 +68,9 @@ function rawText(value: unknown): string {
 }
 
 const edgeEntrySource = rawText(rawEdgeEntrySource);
+// The entry and the env builders it imports: together they are every place
+// the edge reads the deployed env.
+const edgeEnvReadSource = `${edgeEntrySource}\n${rawText(rawEdgeEntryEnvSource)}`;
 
 // ---------------------------------------------------------------------------
 // Synthetic, content-free fixtures. Nothing here is a real host, account,
@@ -652,6 +657,26 @@ describe("edge entry module surface", () => {
     }
   });
 
+  it("exports nothing but the default handler and functions, as workerd requires of a main module", () => {
+    // workerd refused to start this entry while it exported a string constant
+    // ("Incorrect type for map entry ...: not of type 'function or
+    // ExportedHandler'"); the e2e harness starts the real bundle, this pins it.
+    for (const [name, value] of Object.entries(edgeEntryModule)) {
+      if (name === "default") continue;
+      expect(typeof value, name).toBe("function");
+    }
+    for (const name of [
+      "EDGE_LOCAL_ENV_KEYS",
+      "EDGE_GUARD_DB_STATEMENT_REFUSED",
+      "EDGE_GUARD_NONCE_TABLE_PATTERN",
+      "buildEdgeLocalEnv",
+      "buildEdgeGuardEnv",
+      "createReleaseGuardDatabase",
+    ]) {
+      expect(Object.hasOwn(edgeEntryModule, name), name).toBe(false);
+    }
+  });
+
   it("imports the Worker through ./index and the Durable Object through ./ingress-budget, never ./cloudflare-entry", () => {
     const specifiers = [...edgeEntrySource.matchAll(/\bfrom\s+"([^"]+)"/gu)].map((match) => match[1]);
     expect(specifiers).toContain("./index");
@@ -664,10 +689,10 @@ describe("edge entry module surface", () => {
   });
 
   it("reads the deployed env only by name and never spreads it", () => {
-    expect(edgeEntrySource).not.toMatch(/\.\.\.\s*env\b/u);
-    expect(edgeEntrySource).not.toMatch(/Object\.(?:keys|values|entries|assign)\(\s*env\b/u);
+    expect(edgeEnvReadSource).not.toMatch(/\.\.\.\s*env\b/u);
+    expect(edgeEnvReadSource).not.toMatch(/Object\.(?:keys|values|entries|assign)\(\s*env\b/u);
     const literalReads = new Set(
-      [...edgeEntrySource.matchAll(/Reflect\.get\(env, "([A-Z0-9_]+)"\)/gu)].map((match) => match[1]),
+      [...edgeEnvReadSource.matchAll(/Reflect\.get\(env, "([A-Z0-9_]+)"\)/gu)].map((match) => match[1]),
     );
     expect([...literalReads].sort()).toEqual([
       ...EDGE_ADMISSION_BINDINGS,
@@ -681,11 +706,11 @@ describe("edge entry module surface", () => {
     ].sort());
     // The two reviewed dynamic reads: the named-key copy and the contract's
     // own configuration getter.
-    const dynamicReads = [...edgeEntrySource.matchAll(/Reflect\.get\(env, ([^")][^)]*)\)/gu)]
+    const dynamicReads = [...edgeEnvReadSource.matchAll(/Reflect\.get\(env, ([^")][^)]*)\)/gu)]
       .map((match) => match[0]);
     expect(dynamicReads).toEqual(["Reflect.get(env, name)", "Reflect.get(env, name)"]);
-    expect(edgeEntrySource).toContain("const value: unknown = Reflect.get(env, name);");
-    expect(edgeEntrySource).toContain(
+    expect(edgeEnvReadSource).toContain("const value: unknown = Reflect.get(env, name);");
+    expect(edgeEnvReadSource).toContain(
       "parseEdgeOriginConfiguration((name) => Reflect.get(env, name))",
     );
   });
