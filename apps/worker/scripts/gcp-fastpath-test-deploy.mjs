@@ -28,30 +28,34 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { FASTPATH_TEST_CLOUD_TARGET } from "../cloud-run/origin-fastpath-mode.mjs";
+
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const REPOSITORY_ROOT = resolve(WORKER_ROOT, "../..");
 
+// The origin and analytics-refresh accept exactly FASTPATH_TEST_CLOUD_TARGET
+// (cloud-run/origin-fastpath-mode.mjs); the shared names come from it.
 export const FASTPATH_TEST = Object.freeze({
-  project: "tibotattle",
+  project: FASTPATH_TEST_CLOUD_TARGET.project,
   projectNumber: "806510610397",
   region: "us-east1",
   instance: "tibotattle-test-primary-20260922",
-  instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
-  database: "tibotattle_fastpath",
-  primarySchema: "tibotattle_fastpath_20261001",
-  ledgerSchema: "tibotattle_fastpath_ledger_20261001",
+  instanceConnectionName: FASTPATH_TEST_CLOUD_TARGET.instanceConnectionName,
+  database: FASTPATH_TEST_CLOUD_TARGET.database,
+  primarySchema: FASTPATH_TEST_CLOUD_TARGET.primarySchema,
+  ledgerSchema: FASTPATH_TEST_CLOUD_TARGET.ledgerSchema,
   imageRepository: "us-east1-docker.pkg.dev/tibotattle/tibotattle-test/tibotattle-host",
   buildBucket: "tibotattle-gcs-test-build-20260922",
   migrateJob: "tibotattle-fastpath-test-migrate",
-  refreshJob: "tibotattle-fastpath-test-analytics-refresh",
-  originService: "tibotattle-fastpath-test-origin",
+  refreshJob: FASTPATH_TEST_CLOUD_TARGET.refreshJob,
+  originService: FASTPATH_TEST_CLOUD_TARGET.originService,
   originUrl: "https://tibotattle-fastpath-test-origin-806510610397.us-east1.run.app",
   originBucket: "tibotattle-fastpath-test-20261001",
   migratorServiceAccount: "tibotattle-test-migrator@tibotattle.iam.gserviceaccount.com",
   runtimeServiceAccount: "tibotattle-test-runtime@tibotattle.iam.gserviceaccount.com",
   journeyServiceAccount: "tibotattle-test-journey@tibotattle.iam.gserviceaccount.com",
   migratorIamUser: "tibotattle-test-migrator@tibotattle.iam",
-  runtimeIamUser: "tibotattle-test-runtime@tibotattle.iam",
+  runtimeIamUser: FASTPATH_TEST_CLOUD_TARGET.iamUser,
   // Read before and after every run; this script never writes them.
   protectedServices: Object.freeze(["tibotattle-test-app", "tibotattle-test-oauth-gateway"]),
   // Existing test-only Secret Manager entries, referenced by name for the
@@ -75,10 +79,12 @@ const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/u;
 const MIGRATION_FILE = /^\d{4}_[a-z][a-z0-9_-]*\.sql$/u;
 const ENV_KEY = /^[A-Z][A-Z0-9_]{0,63}$/u;
 const BUILD_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u;
-const SHA256 = /^[a-f0-9]{64}$/u;
 // Refresh/origin read the pinned primary schema or a rehearsal target seeded
-// into the same fast-path database by scripts/gcp-fastpath-seed.mjs.
-const SCHEMA_OVERRIDE = /^(?:tibotattle_fastpath_20261001|typed_legacy_transfer_rehearsal_target_[a-z][a-z0-9_]{7,23})$/u;
+// into the same fast-path database by scripts/gcp-fastpath-seed.mjs (the
+// local rehearsal's schema name: the fast-path target prefix and 8 hex).
+const SCHEMA_OVERRIDE = /^(?:tibotattle_fastpath_20261001|typed_legacy_transfer_rehearsal_target_fastpath_[0-9a-f]{8})$/u;
+/** The origin's injected route clock (cloud-run/origin-fastpath-mode.mjs analyticsV2TestClock). */
+export const ORIGIN_TEST_CLOCK_ENV = "ANALYTICS_V2_TEST_NOW_MS";
 const STEPS = Object.freeze([
   "build", "database", "migrate", "verify-database", "seed", "refresh", "origin", "verify", "protected", "all",
 ]);
@@ -387,6 +393,20 @@ export function renderOriginService({
   ].join("\n");
 }
 
+/**
+ * The origin env with the injected test clock: the composition root reads
+ * ANALYTICS_V2_TEST_NOW_MS (epoch milliseconds, fastpath-test only), so a
+ * --now instant becomes exactly that variable. An explicit --origin-env
+ * value for it wins.
+ */
+export function originClockEnv(originEnv, now) {
+  const env = [...originEnv];
+  if (now === undefined || env.some(([key]) => key === ORIGIN_TEST_CLOCK_ENV)) return env;
+  if (!ISO_INSTANT.test(now)) fail("FASTPATH_DEPLOY_NOW_INVALID");
+  env.push([ORIGIN_TEST_CLOCK_ENV, String(Date.parse(now))]);
+  return env;
+}
+
 export function originInvokerCommand() {
   return gcloudArgs([
     "run", "services", "add-iam-policy-binding", assertFastpathName(FASTPATH_TEST.originService),
@@ -440,11 +460,12 @@ function parseArgs(argv) {
     step, dryRun: false, commit: undefined, image: undefined, now: undefined, out: undefined,
     variant: "sidecar", mode: "fastpath-test", refreshEnv: [], refreshArgs: [], originEnv: [],
     query: "from=2026-04-15&to=2026-10-01", skip: new Set(), noExecute: false,
-    schema: undefined, sqlitePath: undefined, sqliteSha256: undefined, schemaSuffix: undefined,
+    schema: undefined, golden: undefined, schemaSuffix: undefined, replaceSeed: false,
   };
   for (const argument of rest) {
     if (argument === "--dry-run") { options.dryRun = true; continue; }
     if (argument === "--no-execute") { options.noExecute = true; continue; }
+    if (argument === "--replace-seed") { options.replaceSeed = true; continue; }
     const separator = argument.indexOf("=");
     if (!argument.startsWith("--") || separator < 3) fail("FASTPATH_DEPLOY_ARGUMENT_INVALID", argument);
     const key = argument.slice(2, separator);
@@ -458,8 +479,7 @@ function parseArgs(argv) {
     else if (key === "origin-mode") options.mode = value;
     else if (key === "query") options.query = value;
     else if (key === "schema") options.schema = primarySchemaOf(value);
-    else if (key === "sqlite") options.sqlitePath = resolve(value);
-    else if (key === "sqlite-sha256") options.sqliteSha256 = value;
+    else if (key === "golden") options.golden = value;
     else if (key === "schema-suffix") options.schemaSuffix = value;
     else if (key === "skip") value.split(",").forEach((item) => options.skip.add(item));
     else if (key === "refresh-arg") options.refreshArgs.push(value);
@@ -475,9 +495,8 @@ function parseArgs(argv) {
   }
   if (options.now !== undefined && !ISO_INSTANT.test(options.now)) fail("FASTPATH_DEPLOY_NOW_INVALID");
   if (!/^[A-Za-z0-9=&_.-]{0,256}$/u.test(options.query)) fail("FASTPATH_DEPLOY_QUERY_INVALID");
-  if ((options.sqlitePath === undefined) !== (options.sqliteSha256 === undefined)
-      || (options.sqliteSha256 !== undefined && !SHA256.test(options.sqliteSha256))) {
-    fail("FASTPATH_DEPLOY_SQLITE_ARGUMENTS_INVALID", "--sqlite and --sqlite-sha256 go together");
+  if (options.schemaSuffix !== undefined && !/^[0-9a-f]{8}$/u.test(options.schemaSuffix)) {
+    fail("FASTPATH_DEPLOY_ARGUMENT_INVALID", "--schema-suffix is 8 lower-case hex digits");
   }
   return options;
 }
@@ -488,9 +507,10 @@ Steps:
   database         create database ${FASTPATH_TEST.database} on ${FASTPATH_TEST.instance} if absent
   migrate          deploy + execute ${FASTPATH_TEST.migrateJob} (counts read from --commit's tree)
   verify-database  read-only receipt counts via the migrator IAM user (impersonated, Cloud SQL connector)
-  seed             seed a typed_legacy_transfer_rehearsal_target_* schema in ${FASTPATH_TEST.database} from
-                   --sqlite through the importers present at --commit (scripts/gcp-fastpath-seed.mjs);
-                   skips with its reason when a required importer is absent; later steps use that schema
+  seed             seed a typed_legacy_transfer_rehearsal_target_fastpath_<8 hex> schema in ${FASTPATH_TEST.database}
+                   from the golden through the local rehearsal's own importer chain (scripts/gcp-fastpath-seed.mjs);
+                   skips with its reason when a chain stage is absent at --commit; refresh and origin then read
+                   that schema at the golden's clock unless --schema/--now say otherwise
   refresh          deploy + execute ${FASTPATH_TEST.refreshJob} (2 vCPU, 4 GiB, 1 h)
   origin           deploy IAM-private ${FASTPATH_TEST.originService}; journey SA is the only invoker
   verify           GET /api/health and /api/v1/community/daily with a journey-SA ID token; save body
@@ -499,7 +519,7 @@ Steps:
 Options:
   --commit=<ref>          commit to build (required for build, migrate and all)
   --image=<repo@sha256:>  use an existing image digest instead of building
-  --now=<ISO instant>     injected clock (refresh --now + ANALYTICS_V2_TEST_CLOCK=1; origin test clock env)
+  --now=<ISO instant>     injected clock (refresh --now + ANALYTICS_V2_TEST_CLOCK=1; origin ANALYTICS_V2_TEST_NOW_MS)
   --out=<dir>             receipt directory (default: $TMPDIR/tibotattle-fastpath-d1)
   --origin-variant=sidecar|direct   default sidecar (loopback origin behind an edge container)
   --origin-mode=<mode>    POSTGRES_TEST_HTTP_MODE for the origin (default fastpath-test)
@@ -507,10 +527,11 @@ Options:
   --refresh-env=K=V       extra/override refresh env (repeatable)
   --refresh-arg=<arg>     extra refresh argument (repeatable)
   --query=<qs>            community/daily query (default from=2026-04-15&to=2026-10-01)
-  --sqlite=<path> --sqlite-sha256=<hex>   sealed SQLite dump to seed from (seed runs only with these)
-  --schema-suffix=<s>     seeded schema suffix (default fp_<commit8>_<dump8>)
+  --golden=<dir>          golden to seed from (default apps/worker/analytics-v2-test/golden)
+  --schema-suffix=<hex8>  seeded schema suffix (default: from the commit and the golden dump digest)
+  --replace-seed          drop and re-seed a seeded schema that lacks its completion marker
   --schema=<schema>       primary schema for refresh/origin: ${FASTPATH_TEST.primarySchema}
-                          or typed_legacy_transfer_rehearsal_target_* (default: the seeded schema, else pinned)
+                          or typed_legacy_transfer_rehearsal_target_fastpath_<8 hex> (default: the seeded schema)
   --skip=a,b              skip steps inside "all"
   --no-execute            create/update Jobs without executing them
   --dry-run               print every command; run nothing remote and write nothing remote
@@ -790,27 +811,34 @@ async function stepVerifyDatabase(runner) {
 }
 
 async function stepSeed(runner, options) {
-  if (options.sqlitePath === undefined) {
-    const reason = "no --sqlite/--sqlite-sha256 given; refresh and origin read the empty pinned schema";
-    console.error(`# seed skipped: ${reason}`);
-    return { step: "seed", status: "skipped", reason };
-  }
   const commit = resolveCommit(options.commit);
   const seedModule = await import("./gcp-fastpath-seed.mjs");
-  const plan = seedModule.planSeed(commit);
-  const suffix = options.schemaSuffix ?? seedModule.defaultSuffix(commit, options.sqliteSha256);
-  const schema = seedModule.seededSchemas(suffix).target;
+  const plan = seedModule.planSeed(commit, { golden: options.golden });
   runner.print([process.execPath, join(WORKER_ROOT, "scripts/gcp-fastpath-seed.mjs"), "seed",
-    "--target=gcp-fastpath", `--commit=${commit}`, `--sqlite=${options.sqlitePath}`,
-    `--sqlite-sha256=${options.sqliteSha256}`, `--schema-suffix=${suffix}`],
+    "--target=gcp-fastpath", `--commit=${commit}`, `--golden=${plan.golden}`,
+    ...(options.schemaSuffix === undefined ? [] : [`--schema-suffix=${options.schemaSuffix}`]),
+    ...(options.replaceSeed ? ["--replace"] : [])],
   `plan: ${plan.decision}; stages ${plan.stages.map(({ name, status }) => `${name}=${status}`).join(", ")}`);
   if (runner.dryRun) {
-    if (plan.decision === "run" && options.schema === undefined) options.schema = schema;
-    return { step: "seed", dryRun: true, schema, plan };
+    // Read-only: name the schema and clock the seed would hand to refresh and origin.
+    if (plan.decision === "run") {
+      const golden = await seedModule.readSeedGolden(plan.golden);
+      const schema = seedModule.seededSchemas(options.schemaSuffix
+        ?? seedModule.defaultSuffix(commit, golden.dumpSha256)).target;
+      if (options.schema === undefined) options.schema = schema;
+      if (options.now === undefined) options.now = golden.nowIso;
+      return { step: "seed", dryRun: true, schema, nowIso: golden.nowIso, plan };
+    }
+    return { step: "seed", dryRun: true, plan };
   }
-  const result = await seedModule.runGcpFastpathSeed({ commit, sqlitePath: options.sqlitePath,
-    sqliteSha256: options.sqliteSha256, schemaSuffix: suffix });
-  if (result.status !== "skipped" && options.schema === undefined) options.schema = result.schema;
+  const result = await seedModule.runGcpFastpathSeed({ commit, golden: options.golden,
+    schemaSuffix: options.schemaSuffix, replace: options.replaceSeed });
+  if (result.status !== "skipped") {
+    // Refresh and origin read the seeded schema at the golden's clock unless
+    // told otherwise, so they serve what the local rehearsal serves.
+    if (options.schema === undefined) options.schema = result.schema;
+    if (options.now === undefined) options.now = result.nowIso;
+  }
   const receipt = { ...result, path: await runner.receipt(`seed-${commit.slice(0, 12)}.json`, result) };
   return receipt;
 }
@@ -853,11 +881,7 @@ function ensureOriginBucket(runner) {
 
 async function stepOrigin(runner, options, image) {
   const bucketHistoryProof = ensureOriginBucket(runner);
-  const originEnv = [...options.originEnv];
-  if (options.now !== undefined && !originEnv.some(([key]) => key === "ANALYTICS_V2_TEST_NOW")) {
-    // Name agreed with A-4/IN-1 at integration; override with --origin-env if it differs.
-    originEnv.push(["ANALYTICS_V2_TEST_CLOCK", "1"], ["ANALYTICS_V2_TEST_NOW", options.now]);
-  }
+  const originEnv = originClockEnv(options.originEnv, options.now);
   const yaml = renderOriginService({ image, variant: options.variant, mode: options.mode, originEnv,
     bucketHistoryProof, schema: options.schema });
   await mkdir(runner.out, { recursive: true, mode: 0o700 });

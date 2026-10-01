@@ -13,12 +13,23 @@ import {
   executeJobCommand,
   FASTPATH_TEST,
   migrateJobCommand,
+  ORIGIN_TEST_CLOCK_ENV,
+  originClockEnv,
   originInvokerCommand,
   primarySchemaOf,
   refreshJobCommand,
   renderOriginService,
   validateOriginPolicy,
 } from "./gcp-fastpath-test-deploy.mjs";
+import {
+  analyticsV2TestClock,
+  FASTPATH_TEST_CLOUD_TARGET,
+  fastpathTestDatabaseConfig,
+} from "../cloud-run/origin-fastpath-mode.mjs";
+import {
+  parseAnalyticsRefreshArguments,
+  resolveAnalyticsRefreshDatabase,
+} from "../cloud-run/analytics-refresh.mjs";
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const IMAGE = `${FASTPATH_TEST.imageRepository}@sha256:${"a".repeat(64)}`;
@@ -97,10 +108,10 @@ test("origin service is private, references test secrets by name and keeps the o
   }
   assert.match(sidecar, /name: PRIMARY_DATABASE\n {10}value: "tibotattle_fastpath"/u);
   const direct = renderOriginService({ image: IMAGE, variant: "direct", bucketHistoryProof: PROOF,
-    originEnv: [["ANALYTICS_V2_TEST_NOW", "2026-10-01T00:00:00Z"]] });
+    originEnv: originClockEnv([], "2026-10-01T00:00:00Z") });
   assert.doesNotMatch(direct, /- name: edge\n/u);
   assert.match(direct, /name: HOST_ORIGIN\n {10}value: "https:\/\/tibotattle-fastpath-test-origin-806510610397\.us-east1\.run\.app"/u);
-  assert.match(direct, /name: ANALYTICS_V2_TEST_NOW\n/u);
+  assert.match(direct, /name: ANALYTICS_V2_TEST_NOW_MS\n {10}value: "1790812800000"/u);
   expectCode(() => renderOriginService({ image: IMAGE, bucketHistoryProof: PROOF, originEnv: [["PORT", "1"]] }),
     "FASTPATH_DEPLOY_ENV_INVALID");
   expectCode(() => renderOriginService({ image: IMAGE, variant: "public", bucketHistoryProof: PROOF }),
@@ -179,7 +190,7 @@ test("edge forwards only allowlisted GETs to the loopback origin and strips IAM 
 });
 
 test("refresh and origin follow an explicit seeded rehearsal schema; migrate stays pinned", () => {
-  const seeded = "typed_legacy_transfer_rehearsal_target_fp_483245ad_98936d54";
+  const seeded = "typed_legacy_transfer_rehearsal_target_fastpath_0a1b2c3d";
   const refresh = refreshJobCommand({ image: IMAGE, schema: seeded });
   assert.equal(refresh.some((arg) => arg.includes(`--schema=${seeded}`)), true);
   assert.equal(refresh.some((arg) => arg.includes(`PRIMARY_SCHEMA=${seeded}`)), true);
@@ -190,8 +201,63 @@ test("refresh and origin follow an explicit seeded rehearsal schema; migrate sta
   assert.equal(migrate.some((arg) => arg.includes(`PRIMARY_SCHEMA=${FASTPATH_TEST.primarySchema}`)), true);
   assert.equal(primarySchemaOf(undefined), FASTPATH_TEST.primarySchema);
   for (const bad of ["tibotattle_v12_a2_20260925", "tibotattle", "typed_legacy_transfer_rehearsal_target_x",
-    "typed_legacy_transfer_rehearsal_fp_483245ad_98936d54", "public"]) {
+    "typed_legacy_transfer_rehearsal_fp_483245ad_98936d54", "typed_legacy_transfer_rehearsal_target_fp_483245ad_98936d54",
+    "typed_legacy_transfer_rehearsal_target_fastpath_0A1B2C3D", "public"]) {
     expectCode(() => primarySchemaOf(bad), "FASTPATH_DEPLOY_SCHEMA_INVALID");
     expectCode(() => refreshJobCommand({ image: IMAGE, schema: bad }), "FASTPATH_DEPLOY_SCHEMA_INVALID");
   }
+});
+
+/** --set-env-vars=K=V,... of one gcloud command, as an object. */
+function commandEnv(command) {
+  const flag = command.find((arg) => arg.startsWith("--set-env-vars="));
+  return Object.fromEntries(flag.slice("--set-env-vars=".length).split(",").map((pair) => {
+    const split = pair.indexOf("=");
+    return [pair.slice(0, split), pair.slice(split + 1)];
+  }));
+}
+
+/** The origin container's plain env values from the rendered service YAML. */
+function originContainerEnv(yaml) {
+  const origin = yaml.slice(yaml.indexOf("      - name: origin\n"));
+  return Object.fromEntries([...origin.matchAll(/ {8}- name: ([A-Z0-9_]+)\n {10}value: ("(?:[^"\\]|\\.)*")/gu)]
+    .map(([, key, value]) => [key, JSON.parse(value)]));
+}
+
+test("the deploy script and the composition roots agree on the clock, database, schemas and Cloud Run target", async () => {
+  for (const key of ["project", "instanceConnectionName", "database", "primarySchema", "ledgerSchema"]) {
+    assert.equal(FASTPATH_TEST[key], FASTPATH_TEST_CLOUD_TARGET[key], key);
+  }
+  assert.equal(FASTPATH_TEST.refreshJob, FASTPATH_TEST_CLOUD_TARGET.refreshJob);
+  assert.equal(FASTPATH_TEST.originService, FASTPATH_TEST_CLOUD_TARGET.originService);
+  assert.equal(FASTPATH_TEST.runtimeIamUser, FASTPATH_TEST_CLOUD_TARGET.iamUser);
+
+  const now = "2026-10-01T12:00:00.000Z";
+  const seeded = "typed_legacy_transfer_rehearsal_target_fastpath_0a1b2c3d";
+  // Origin: the clock the deploy sets is the one the composition root reads.
+  assert.equal(ORIGIN_TEST_CLOCK_ENV, "ANALYTICS_V2_TEST_NOW_MS");
+  const yaml = renderOriginService({ image: IMAGE, bucketHistoryProof: PROOF, schema: seeded,
+    originEnv: originClockEnv([], now) });
+  const env = { ...originContainerEnv(yaml), K_SERVICE: FASTPATH_TEST.originService };
+  assert.equal(env.POSTGRES_TEST_HTTP_MODE, "fastpath-test");
+  assert.equal(env.HOST, "127.0.0.1");
+  assert.equal(analyticsV2TestClock(env, env.POSTGRES_TEST_HTTP_MODE)(), Date.parse(now));
+  assert.equal("ANALYTICS_V2_TEST_NOW" in env || "ANALYTICS_V2_TEST_CLOCK" in env, false);
+  const database = fastpathTestDatabaseConfig(env);
+  assert.deepEqual([database.primary.database, database.primary.schema, database.ledger.database,
+    database.ledger.schema], ["tibotattle_fastpath", seeded, "tibotattle_fastpath", FASTPATH_TEST.ledgerSchema]);
+  assert.equal(originClockEnv([[ORIGIN_TEST_CLOCK_ENV, "1"]], now).length, 1, "an explicit value wins");
+  expectCode(() => originClockEnv([], "yesterday"), "FASTPATH_DEPLOY_NOW_INVALID");
+
+  // Refresh: the Job's args and env parse, take the test clock and reach only tibotattle_fastpath.
+  const command = refreshJobCommand({ image: IMAGE, now: "2026-10-01T12:00:00Z", schema: seeded });
+  const args = command.find((arg) => arg.startsWith("--args=")).slice("--args=".length).split(",").slice(1);
+  const jobEnv = { ...commandEnv(command), CLOUD_RUN_JOB: FASTPATH_TEST.refreshJob };
+  const parsed = parseAnalyticsRefreshArguments(args, jobEnv);
+  assert.equal(parsed.schema, seeded);
+  assert.equal(parsed.nowMs, Date.parse(now));
+  assert.deepEqual({ ...await resolveAnalyticsRefreshDatabase(jobEnv, { schema: parsed.schema }) }, {
+    kind: "cloud-sql", instanceConnectionName: FASTPATH_TEST.instanceConnectionName,
+    database: "tibotattle_fastpath", iamUser: FASTPATH_TEST.runtimeIamUser,
+  });
 });

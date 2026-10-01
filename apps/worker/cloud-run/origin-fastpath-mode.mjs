@@ -10,7 +10,14 @@
  * - takes a configurable rehearsal schema: PRIMARY_SCHEMA must start with one
  *   of FASTPATH_TEST_SCHEMA_PREFIXES, and the ledger is the "<schema>_ledger"
  *   schema, which may live on the primary instance and database (the ledger
- *   instance, database and schema default to the primary's);
+ *   instance, database and schema default to the primary's). The one
+ *   explicit alternative is the GCP fast-path database's pinned ledger
+ *   schema (FASTPATH_TEST_CLOUD_TARGET.ledgerSchema, created by the fastpath
+ *   migrate Job), paired with a primary in the same database;
+ * - may run as the GCP fast-path test origin (K_SERVICE set): still on
+ *   127.0.0.1 behind the test edge sidecar, and only as
+ *   FASTPATH_TEST_CLOUD_TARGET's service, instance, database
+ *   (tibotattle_fastpath, never the shared test database) and runtime user;
  * - mounts the analytics-v2 GET /api/v1/community/daily route module, which
  *   overrides the built-in, when ANALYTICS_V2_ENABLED=1;
  * - accepts ANALYTICS_V2_TEST_NOW_MS, the route's injected test clock (a
@@ -30,6 +37,24 @@ export const FASTPATH_TEST_SCHEMA_PREFIXES = Object.freeze([
   "typed_legacy_transfer_rehearsal_target_",
   "tibotattle_fastpath_",
 ]);
+
+/**
+ * The GCP fast-path test resources (D-1, scripts/gcp-fastpath-test-deploy.mjs
+ * FASTPATH_TEST, which a check pins equal): a disposable database on the test
+ * primary instance, its pinned migrate-Job schemas, the runtime IAM user, the
+ * origin service and the analytics-refresh Job.
+ */
+export const FASTPATH_TEST_CLOUD_TARGET = Object.freeze({
+  project: "tibotattle",
+  instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
+  database: "tibotattle_fastpath",
+  primarySchema: "tibotattle_fastpath_20261001",
+  ledgerSchema: "tibotattle_fastpath_ledger_20261001",
+  seededSchemaPrefix: "typed_legacy_transfer_rehearsal_target_fastpath_",
+  iamUser: "tibotattle-test-runtime@tibotattle.iam",
+  originService: "tibotattle-fastpath-test-origin",
+  refreshJob: "tibotattle-fastpath-test-analytics-refresh",
+});
 
 const LEDGER_SCHEMA_SUFFIX = "_ledger";
 const SCHEMA_IDENTIFIER = /^[a-z_][a-z0-9_]{0,62}$/u;
@@ -79,12 +104,31 @@ export function fastpathTestDatabaseConfig(env) {
   if (!isFastpathTestSchema(primarySchema)) {
     configurationError("POSTGRES_FASTPATH_TEST_SCHEMA_INVALID");
   }
-  const ledgerSchema = envValue(env, "LEDGER_SCHEMA") ?? primarySchema + LEDGER_SCHEMA_SUFFIX;
-  if (ledgerSchema !== primarySchema + LEDGER_SCHEMA_SUFFIX) {
-    configurationError("POSTGRES_FASTPATH_TEST_SCHEMA_INVALID");
-  }
   const primaryDatabase = requiredEnv(env, "PRIMARY_DATABASE");
   const primaryInstance = requiredEnv(env, "PRIMARY_INSTANCE_CONNECTION_NAME");
+  const ledgerDatabase = envValue(env, "LEDGER_DATABASE") ?? primaryDatabase;
+  const ledgerInstance = envValue(env, "LEDGER_INSTANCE_CONNECTION_NAME") ?? primaryInstance;
+  const ledgerSchema = envValue(env, "LEDGER_SCHEMA") ?? primarySchema + LEDGER_SCHEMA_SUFFIX;
+  // The ledger is "<schema>_ledger", or the GCP fast-path database's pinned
+  // ledger schema with both roles in that one database.
+  const cloud = FASTPATH_TEST_CLOUD_TARGET;
+  const pinnedCloudLedger = ledgerSchema === cloud.ledgerSchema && ledgerSchema !== primarySchema
+    && primaryDatabase === cloud.database && ledgerDatabase === cloud.database
+    && ledgerInstance === primaryInstance;
+  if (ledgerSchema !== primarySchema + LEDGER_SCHEMA_SUFFIX && !pinnedCloudLedger) {
+    configurationError("POSTGRES_FASTPATH_TEST_SCHEMA_INVALID");
+  }
+  if (envValue(env, "K_SERVICE") !== undefined) {
+    // On Cloud Run: only the fast-path origin service, its disposable
+    // database and runtime user, and a pinned or seeded fast-path schema.
+    if (env.K_SERVICE !== cloud.originService
+        || primaryInstance !== cloud.instanceConnectionName || ledgerInstance !== cloud.instanceConnectionName
+        || primaryDatabase !== cloud.database || ledgerDatabase !== cloud.database
+        || envValue(env, "POSTGRES_IAM_USER") !== cloud.iamUser
+        || !(primarySchema === cloud.primarySchema || primarySchema.startsWith(cloud.seededSchemaPrefix))) {
+      configurationError("POSTGRES_FASTPATH_TEST_CLOUD_TARGET_INVALID");
+    }
+  }
   return {
     primary: {
       role: "primary",
@@ -96,8 +140,8 @@ export function fastpathTestDatabaseConfig(env) {
     ledger: {
       role: "ledger",
       schema: ledgerSchema,
-      database: envValue(env, "LEDGER_DATABASE") ?? primaryDatabase,
-      instanceConnectionName: envValue(env, "LEDGER_INSTANCE_CONNECTION_NAME") ?? primaryInstance,
+      database: ledgerDatabase,
+      instanceConnectionName: ledgerInstance,
       max: 2,
     },
   };

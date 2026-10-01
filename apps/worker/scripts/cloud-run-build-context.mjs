@@ -235,9 +235,34 @@ async function digestFiles(files) {
   return hash.digest("hex");
 }
 
+const RELATIVE_IMPORT = /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+)["'](\.{1,2}\/[^"']+)["']/gu;
+
+/**
+ * Every relative module an included host or tooling module imports
+ * (statically or through a literal dynamic import) must itself be in the
+ * context, or the image build would bundle a module the audited context
+ * does not carry. Checked over the included apps/worker/cloud-run and
+ * apps/worker/scripts JavaScript modules other than *.check.mjs (repository
+ * checks that the image never builds or runs); src/ and vendor/ enter whole.
+ */
+async function assertImportClosure(files, includedPaths) {
+  for (const file of files) {
+    if (!/^apps\/worker\/(?:cloud-run|scripts)\/[^/]+\.mjs$/u.test(file.destination)
+        || file.destination.endsWith(".check.mjs")) continue;
+    const text = await readFile(file.source, "utf8");
+    for (const match of text.matchAll(RELATIVE_IMPORT)) {
+      const imported = join(dirname(file.destination), match[1]);
+      if (!includedPaths.has(imported) && ![...includedPaths].some((path) => path.startsWith(`${imported}/`))) {
+        fail("CLOUD_RUN_CONTEXT_IMPORT_OUTSIDE_CONTEXT");
+      }
+    }
+  }
+}
+
 async function validateSource(assets) {
   const files = await sourceFiles(assets);
   const includedPaths = new Set(files.map((file) => file.destination));
+  await assertImportClosure(files, includedPaths);
   if ([...REQUIRED_LEDGER_DIAGNOSTIC_PATHS].some((path) => !includedPaths.has(path))) {
     fail("CLOUD_RUN_CONTEXT_LEDGER_DIAGNOSTIC_PATH_SET_UNEXPECTED");
   }

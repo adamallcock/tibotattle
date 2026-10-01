@@ -1059,6 +1059,29 @@ test("database targets: Cloud Run reaches only the private test primary; local n
   }
   await assert.rejects(job.resolveAnalyticsRefreshDatabase({ ...cloud, K_SERVICE: "tibotattle-test-app" }),
     { code: "ANALYTICS_V2_REFRESH_CONTEXT_INVALID" });
+
+  // The fast-path refresh Job alone reaches the disposable tibotattle_fastpath
+  // database, and only for the pinned or a seeded fast-path schema.
+  const fastpath = { ...cloud, CLOUD_RUN_JOB: "tibotattle-fastpath-test-analytics-refresh",
+    PRIMARY_DATABASE: "tibotattle_fastpath" };
+  for (const schema of ["tibotattle_fastpath_20261001", "typed_legacy_transfer_rehearsal_target_fastpath_0a1b2c3d"]) {
+    assert.deepEqual({ ...await job.resolveAnalyticsRefreshDatabase(fastpath, { schema }) }, {
+      kind: "cloud-sql", instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
+      database: "tibotattle_fastpath", iamUser: "tibotattle-test-runtime@tibotattle.iam",
+    });
+  }
+  for (const schema of [undefined, "tibotattle_v12_a2_20260925", "tibotattle_fastpath_other",
+    "typed_legacy_transfer_rehearsal_target_other", "public"]) {
+    await assert.rejects(job.resolveAnalyticsRefreshDatabase(fastpath, { schema }),
+      { code: "ANALYTICS_V2_REFRESH_TARGET_FORBIDDEN" }, String(schema));
+  }
+  await assert.rejects(job.resolveAnalyticsRefreshDatabase({ ...fastpath, PRIMARY_DATABASE: "tibotattle" },
+    { schema: "tibotattle_fastpath_20261001" }), { code: "ANALYTICS_V2_REFRESH_TARGET_FORBIDDEN" });
+  await assert.rejects(job.resolveAnalyticsRefreshDatabase({ ...cloud, PRIMARY_DATABASE: "tibotattle_fastpath" },
+    { schema: "tibotattle_fastpath_20261001" }), { code: "ANALYTICS_V2_REFRESH_TARGET_FORBIDDEN" },
+  "another Job never reaches the fast-path database");
+  await assert.rejects(job.resolveAnalyticsRefreshDatabase({ ...fastpath, POSTGRES_IAM_USER: "someone-else@tibotattle.iam" },
+    { schema: "tibotattle_fastpath_20261001" }), { code: "ANALYTICS_V2_REFRESH_TARGET_FORBIDDEN" });
 });
 
 // ---------------------------------------------------------------------------

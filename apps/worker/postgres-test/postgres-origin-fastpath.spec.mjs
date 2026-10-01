@@ -227,6 +227,17 @@ const RUNTIME_ENVIRONMENT_NAMES = Object.freeze([
   "ANALYTICS_V2_ENABLED",
 ]);
 
+/** The GCP fast-path origin's Cloud Run environment (D-1 sidecar variant), minus secrets. */
+const CLOUD_FASTPATH = Object.freeze({
+  K_SERVICE: "tibotattle-fastpath-test-origin",
+  PRIMARY_DATABASE: "tibotattle_fastpath",
+  PRIMARY_INSTANCE_CONNECTION_NAME: "tibotattle:us-east1:tibotattle-test-primary-20260922",
+  LEDGER_DATABASE: "tibotattle_fastpath",
+  LEDGER_INSTANCE_CONNECTION_NAME: "tibotattle:us-east1:tibotattle-test-primary-20260922",
+  LEDGER_SCHEMA: "tibotattle_fastpath_ledger_20261001",
+  POSTGRES_IAM_USER: "tibotattle-test-runtime@tibotattle.iam",
+});
+
 function fastpathEnvironment(primarySchema, overrides = {}) {
   const bucket = "synthetic-fastpath-bucket";
   return {
@@ -332,6 +343,18 @@ test("(e) fastpath-test refuses a non-loopback host or origin and a non-rehearsa
     [{ PRIMARY_SCHEMA: `tibotattle_fastpath_${"x".repeat(40)}` }, "POSTGRES_FASTPATH_TEST_SCHEMA_INVALID"],
     [{ LEDGER_SCHEMA: "tibotattle_ledger" }, "POSTGRES_FASTPATH_TEST_SCHEMA_INVALID"],
     [{ LEDGER_SCHEMA: "tibotattle_fastpath_other_ledger" }, "POSTGRES_FASTPATH_TEST_SCHEMA_INVALID"],
+    // The pinned GCP ledger pairs only with a primary in the fast-path database.
+    [{ LEDGER_SCHEMA: "tibotattle_fastpath_ledger_20261001" }, "POSTGRES_FASTPATH_TEST_SCHEMA_INVALID"],
+    // On Cloud Run: only the fast-path origin, database and runtime user.
+    [{ K_SERVICE: "tibotattle-test-app" }, "POSTGRES_FASTPATH_TEST_CLOUD_TARGET_INVALID"],
+    [{ K_SERVICE: "tibotattle-fastpath-test-origin" }, "POSTGRES_FASTPATH_TEST_CLOUD_TARGET_INVALID"],
+    [{ ...CLOUD_FASTPATH, PRIMARY_DATABASE: "tibotattle", LEDGER_DATABASE: "tibotattle" },
+      "POSTGRES_FASTPATH_TEST_SCHEMA_INVALID"],
+    [{ ...CLOUD_FASTPATH, PRIMARY_DATABASE: "tibotattle", LEDGER_DATABASE: "tibotattle", LEDGER_SCHEMA: undefined },
+      "POSTGRES_FASTPATH_TEST_CLOUD_TARGET_INVALID"],
+    [{ ...CLOUD_FASTPATH, POSTGRES_IAM_USER: "synthetic-fastpath-runtime@synthetic.iam" },
+      "POSTGRES_FASTPATH_TEST_CLOUD_TARGET_INVALID"],
+    [{ ...CLOUD_FASTPATH, HOST: "0.0.0.0" }, "POSTGRES_TEST_PRIVATE_HOST_CONFIGURATION_INVALID"],
   ];
   for (const [overrides, expectedCode] of refusals) {
     const { calls, dependencies } = runtimeDependencies();
@@ -383,6 +406,37 @@ test("(e) fastpath-test refuses a non-loopback host or origin and a non-rehearsa
       await closeRuntime(runtime);
     }
   }
+});
+
+test("fastpath-test runs as the GCP fast-path origin: K_SERVICE, HOST 127.0.0.1, tibotattle_fastpath and an explicit ledger", async () => {
+  const { server } = await loadModules();
+  for (const schema of ["typed_legacy_transfer_rehearsal_target_fastpath_0a1b2c3d", "tibotattle_fastpath_20261001"]) {
+    const { calls, pools, dependencies } = runtimeDependencies();
+    const runtime = await withEnvironment(fastpathEnvironment(schema, CLOUD_FASTPATH),
+      () => server.createRuntime({ dependencies }));
+    try {
+      assert.equal(runtime.postgresTestHostMode, "fastpath-test");
+      assert.equal(runtime.listenHost, "127.0.0.1");
+      assert.equal(runtime.hostOrigin, FASTPATH_ORIGIN);
+      assert.deepEqual(runtime.schemaOptions, { primarySchema: schema, ledgerSchema: "tibotattle_fastpath_ledger_20261001" });
+      assert.deepEqual(pools.map(({ options }) => [options.role, options.schema, options.database,
+        options.instanceConnectionName]), [
+        ["primary", schema, "tibotattle_fastpath", "tibotattle:us-east1:tibotattle-test-primary-20260922"],
+        ["ledger", "tibotattle_fastpath_ledger_20261001", "tibotattle_fastpath",
+          "tibotattle:us-east1:tibotattle-test-primary-20260922"],
+      ]);
+      assert.deepEqual(calls.slice(0, 3), ["connector", "pool:primary", "pool:ledger"]);
+    } finally {
+      await closeRuntime(runtime);
+    }
+  }
+  // A schema outside the pinned primary and the seeded prefix is refused on Cloud Run.
+  const { calls, dependencies } = runtimeDependencies();
+  await withEnvironment(fastpathEnvironment("tibotattle_fastpath_other", CLOUD_FASTPATH), async () => {
+    await assert.rejects(server.createRuntime({ dependencies }),
+      (error) => error?.code === "POSTGRES_FASTPATH_TEST_CLOUD_TARGET_INVALID");
+  });
+  assert.deepEqual(calls, []);
 });
 
 test("(b) a route module for a non-overridable built-in stops fastpath-test startup and closes its pools", async () => {

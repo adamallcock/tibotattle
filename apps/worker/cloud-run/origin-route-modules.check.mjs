@@ -19,6 +19,7 @@ import {
 import {
   analyticsV2TestClock,
   FASTPATH_TEST_SCHEMA_PREFIXES,
+  FASTPATH_TEST_CLOUD_TARGET,
   fastpathTestDatabaseConfig,
   fastpathTestRouteModules,
   isAnalyticsV2Enabled,
@@ -413,6 +414,52 @@ test("fastpath-test accepts only rehearsal schemas and their _ledger pair", () =
   ]) {
     assert.throws(() => fastpathTestDatabaseConfig({ ...env, ...overrides }), (error) => error?.code === code);
   }
+});
+
+test("fastpath-test accepts the GCP fast-path database's explicit ledger and pins its Cloud Run target", () => {
+  const cloud = {
+    PRIMARY_SCHEMA: "typed_legacy_transfer_rehearsal_target_fastpath_0a1b2c3d",
+    PRIMARY_DATABASE: FASTPATH_TEST_CLOUD_TARGET.database,
+    PRIMARY_INSTANCE_CONNECTION_NAME: FASTPATH_TEST_CLOUD_TARGET.instanceConnectionName,
+    LEDGER_DATABASE: FASTPATH_TEST_CLOUD_TARGET.database,
+    LEDGER_INSTANCE_CONNECTION_NAME: FASTPATH_TEST_CLOUD_TARGET.instanceConnectionName,
+    LEDGER_SCHEMA: FASTPATH_TEST_CLOUD_TARGET.ledgerSchema,
+    POSTGRES_IAM_USER: FASTPATH_TEST_CLOUD_TARGET.iamUser,
+  };
+  assert.equal(FASTPATH_TEST_CLOUD_TARGET.database, "tibotattle_fastpath");
+  assert.deepEqual(fastpathTestDatabaseConfig(cloud).ledger, {
+    role: "ledger", schema: "tibotattle_fastpath_ledger_20261001", database: "tibotattle_fastpath",
+    instanceConnectionName: FASTPATH_TEST_CLOUD_TARGET.instanceConnectionName, max: 2,
+  });
+  const onCloudRun = { ...cloud, K_SERVICE: FASTPATH_TEST_CLOUD_TARGET.originService };
+  assert.equal(fastpathTestDatabaseConfig(onCloudRun).primary.database, "tibotattle_fastpath");
+  assert.equal(fastpathTestDatabaseConfig({ ...onCloudRun, PRIMARY_SCHEMA: FASTPATH_TEST_CLOUD_TARGET.primarySchema })
+    .primary.schema, "tibotattle_fastpath_20261001");
+  for (const [overrides, code] of [
+    // The pinned ledger only pairs inside the fast-path database.
+    [{ PRIMARY_DATABASE: "tibotattle" }, "POSTGRES_FASTPATH_TEST_SCHEMA_INVALID"],
+    [{ LEDGER_DATABASE: "tibotattle_ledger" }, "POSTGRES_FASTPATH_TEST_SCHEMA_INVALID"],
+    [{ LEDGER_INSTANCE_CONNECTION_NAME: "tibotattle:us-east1:tibotattle-test-ledger-20260922" },
+      "POSTGRES_FASTPATH_TEST_SCHEMA_INVALID"],
+    [{ LEDGER_SCHEMA: "tibotattle_fastpath_ledger_other" }, "POSTGRES_FASTPATH_TEST_SCHEMA_INVALID"],
+  ]) {
+    assert.throws(() => fastpathTestDatabaseConfig({ ...cloud, ...overrides }), (error) => error?.code === code,
+      JSON.stringify(overrides));
+  }
+  for (const overrides of [
+    { K_SERVICE: "tibotattle-test-app" },
+    { PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic:us-east1:primary",
+      LEDGER_INSTANCE_CONNECTION_NAME: "synthetic:us-east1:primary" },
+    { POSTGRES_IAM_USER: "tibotattle-test-migrator@tibotattle.iam" },
+    { PRIMARY_SCHEMA: "tibotattle_fastpath_a" },
+    { PRIMARY_SCHEMA: "typed_legacy_transfer_rehearsal_target_other" },
+  ]) {
+    assert.throws(() => fastpathTestDatabaseConfig({ ...onCloudRun, ...overrides }),
+      (error) => error?.code === "POSTGRES_FASTPATH_TEST_CLOUD_TARGET_INVALID", JSON.stringify(overrides));
+  }
+  // Locally (no K_SERVICE) any database still works with "<schema>_ledger".
+  assert.equal(fastpathTestDatabaseConfig({ PRIMARY_SCHEMA: "tibotattle_fastpath_a", PRIMARY_DATABASE: "postgres",
+    PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic:us-east1:primary" }).ledger.schema, "tibotattle_fastpath_a_ledger");
 });
 
 test("fastpath-test mounts the analytics-v2 community-daily module only when enabled", () => {

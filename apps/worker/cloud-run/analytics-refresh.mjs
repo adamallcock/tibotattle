@@ -59,6 +59,7 @@ import {
   createIamPool as createCloudSqlIamPool,
   normalizeIamUser,
 } from "./cloud-sql.mjs";
+import { FASTPATH_TEST_CLOUD_TARGET, isFastpathTestSchema } from "./origin-fastpath-mode.mjs";
 import { CLOUD_RUN_IAM_TEST_TARGET } from "./postgres-test-dispatch.mjs";
 
 /** Mirrors contract.ts ANALYTICS_V2_REFRESH_ENTRY; the spec pins the equality. */
@@ -205,15 +206,25 @@ async function privateSocketDirectory(directory) {
 
 /**
  * The database target. A Cloud Run Job may reach only the private test
- * primary until cutover; anywhere else only a loopback or private-socket
- * PostgreSQL is accepted.
+ * primary until cutover: the shared test database, or, for the fast-path
+ * refresh Job alone, the disposable fast-path database and only a pinned or
+ * seeded fast-path schema (`schema`, the parsed --schema). Anywhere else
+ * only a loopback or private-socket PostgreSQL is accepted.
  */
-export async function resolveAnalyticsRefreshDatabase(env = {}) {
+export async function resolveAnalyticsRefreshDatabase(env = {}, { schema } = {}) {
   if (typeof env.CLOUD_RUN_JOB === "string" && env.CLOUD_RUN_JOB.length > 0) {
     if (env.K_SERVICE !== undefined) fail("ANALYTICS_V2_REFRESH_CONTEXT_INVALID");
-    const target = CLOUD_RUN_IAM_TEST_TARGET.postgres.primary;
+    const fastpath = env.CLOUD_RUN_JOB === FASTPATH_TEST_CLOUD_TARGET.refreshJob;
+    const target = fastpath
+      ? { instanceConnectionName: FASTPATH_TEST_CLOUD_TARGET.instanceConnectionName,
+        database: FASTPATH_TEST_CLOUD_TARGET.database }
+      : CLOUD_RUN_IAM_TEST_TARGET.postgres.primary;
     if (env.PRIMARY_INSTANCE_CONNECTION_NAME !== target.instanceConnectionName
         || env.PRIMARY_DATABASE !== target.database) {
+      fail("ANALYTICS_V2_REFRESH_TARGET_FORBIDDEN");
+    }
+    if (fastpath && !(isFastpathTestSchema(schema) && (schema === FASTPATH_TEST_CLOUD_TARGET.primarySchema
+        || schema.startsWith(FASTPATH_TEST_CLOUD_TARGET.seededSchemaPrefix)))) {
       fail("ANALYTICS_V2_REFRESH_TARGET_FORBIDDEN");
     }
     let iamUser;
@@ -762,7 +773,7 @@ export async function runAnalyticsRefresh({
   let receipt;
   let failure;
   try {
-    const database = await resolveAnalyticsRefreshDatabase(env);
+    const database = await resolveAnalyticsRefreshDatabase(env, { schema: parsed.schema });
     phase = "modules";
     const modules = dependencies.modules ?? await loadAnalyticsV2Modules();
     const { store, pipeline } = modules ?? {};
