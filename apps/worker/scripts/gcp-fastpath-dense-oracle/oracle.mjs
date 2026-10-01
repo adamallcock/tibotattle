@@ -9,7 +9,7 @@
 //       --work-dir <absolute dir outside the repository> --corpus dense|q1 [--layout compact|spread] [--scale 0.1] \
 //       [--golden-out <dir>] [--verify-against <dir>] [--forced-native withheld|all|none] \
 //       [--max-ticks N] [--resume <converged work dir>] [--keep-scratch] [--forced-jobs N] \
-//       [--publication-passes k] [--analytics-passes k] [--clock-step-ms S]
+//       [--publication-passes k] [--analytics-passes k] [--clock-step-ms S] [--stop-when converged|daily-published]
 //
 //  1. build.mjs materializes d43c8f92 (blob-verified) and bundles it for Node;
 //  2. runtime.mjs pins the clock and seeds every random source, so a run is
@@ -52,6 +52,7 @@ import { buildDenseOracle, DENSE_ORACLE_SOURCE_COMMIT } from "./build.mjs";
 import { createDenseOwner, DENSE_CORPUS_DAY_LIST, DENSE_CORPUS_PINNED_NOW, DENSE_CORPUS_SCHEMA_VERSION,
   DENSE_DEFAULT_LAYOUT, DENSE_LAYOUTS, denseDayClass } from "./dense-corpus.mjs";
 import { summarizeDenseCorpus } from "./corpus-summary.mjs";
+import { sourceContentDigest as sourceDigestOf, usageRowsByOwnerDay } from "./source-digest.mjs";
 import { runForcedNative } from "./forced-native.mjs";
 import { installDenseOracleRuntime, setPinnedNow } from "./runtime.mjs";
 
@@ -88,7 +89,7 @@ const RUN_SPECIFIC_ANALYTICS_COLUMNS = Object.freeze({
 function parseArgs(argv) {
   const options = { workDir: null, corpus: null, scale: 1, goldenOut: null, verifyAgainst: null,
     forcedNative: "withheld", maxTicks: 200_000, keepScratch: false, resume: null, publicationPasses: 1,
-    layout: DENSE_DEFAULT_LAYOUT, forcedJobs: 6, clockStepMs: 0, analyticsPasses: 1 };
+    layout: DENSE_DEFAULT_LAYOUT, forcedJobs: 6, clockStepMs: 0, analyticsPasses: 1, stopWhen: "converged" };
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index], next = () => argv[++index];
     if (arg === "--work-dir") options.workDir = resolve(next());
@@ -105,6 +106,10 @@ function parseArgs(argv) {
     else if (arg === "--forced-jobs") options.forcedJobs = Number(next());
     else if (arg === "--clock-step-ms") options.clockStepMs = Number(next());
     else if (arg === "--analytics-passes") options.analyticsPasses = Number(next());
+    else if (arg === "--converge-on") options.convergeOn = next();
+    else if (arg === "--direct-native") options.directNative = next();
+    else if (arg === "--direct-jobs") options.directJobs = Number(next());
+    else if (arg === "--stop-when") options.stopWhen = next();
     else throw new Error(`DENSE_ORACLE_ARGUMENT_INVALID:${arg}`);
   }
   if (!options.workDir || !isAbsolute(options.workDir) || !relative(REPO_ROOT, options.workDir).startsWith("..")) {
@@ -114,11 +119,16 @@ function parseArgs(argv) {
   if (!(options.scale > 0 && options.scale <= 1) || (options.corpus === "q1" && options.scale !== 1)) {
     throw new Error("DENSE_ORACLE_SCALE_INVALID");
   }
-  if (!["all", "withheld", "none"].includes(options.forcedNative)) throw new Error("DENSE_ORACLE_FORCED_NATIVE_INVALID");
+  if (!["all", "withheld", "sample", "none"].includes(options.forcedNative)) throw new Error("DENSE_ORACLE_FORCED_NATIVE_INVALID");
+  if (!["all", "daily"].includes(options.convergeOn) || !["all", "none"].includes(options.directNative)
+    || !Number.isSafeInteger(options.directJobs) || options.directJobs < 1 || options.directJobs > 32) {
+    throw new Error("DENSE_ORACLE_MODE_INVALID");
+  }
   if (!Number.isSafeInteger(options.clockStepMs) || options.clockStepMs < 0 || options.clockStepMs > 60_000
     || !Number.isSafeInteger(options.analyticsPasses) || options.analyticsPasses < 1 || options.analyticsPasses > 16) {
     throw new Error("DENSE_ORACLE_CADENCE_INVALID");
   }
+  if (!["converged", "daily-published"].includes(options.stopWhen)) throw new Error("DENSE_ORACLE_STOP_WHEN_INVALID");
   if (!Number.isSafeInteger(options.forcedJobs) || options.forcedJobs < 1 || options.forcedJobs > 32) {
     throw new Error("DENSE_ORACLE_FORCED_JOBS_INVALID");
   }
@@ -148,7 +158,7 @@ const prior = (() => {
     const event = JSON.parse(line);
     events[event.event] = event;
   }
-  if (!events.converged?.converged || !events.probe || events.probe.changedOutputs.length !== 0 || !events.seeded
+  if (!(events.converged?.converged || events.converged?.stoppedBy === "daily-published") || !events.probe || !events.seeded
     || !events.corpus) throw new Error("DENSE_ORACLE_RESUME_SOURCE_INCOMPLETE");
   for (const file of readdirSync(join(options.resume, "db"))) {
     copyFileSync(join(options.resume, "db", file), join(options.workDir, "db", file), fsConstants.COPYFILE_FICLONE);
@@ -260,7 +270,8 @@ const dense = options.corpus === "dense"
   ? createDenseOwner({ pricer: P.priceTelemetryUsageEvent, scale: options.scale, layout: options.layout }) : null;
 const corpusOwners = [...q1.owners, ...(dense ? [dense.spec] : [])];
 note("corpus", { owners: corpusOwners.map((owner) => owner.key), dense: dense?.spec ?? null,
-  publicationPasses: options.publicationPasses, analyticsPasses: options.analyticsPasses, clockStepMs: options.clockStepMs });
+  publicationPasses: options.publicationPasses, analyticsPasses: options.analyticsPasses, clockStepMs: options.clockStepMs,
+  stopWhen: options.stopWhen });
 
 // ---------------------------------------------------------------- seeding --
 // A port of the Q-1 oracle's seeding (gcp-fastpath-oracle.spec.ts), unchanged
@@ -504,12 +515,19 @@ async function targetFingerprint() {
 const ROTATION_TABLES = new Set(["analytics_community_graph_scan", "analytics_shared_feature_sweep_cursor",
   "analytics_cache_retention_owner_cursor"]);
 const ROTATION_COLUMNS = new Set(["analytics_community_graph_work_selection.selection_revision"]);
+/** `--converge-on daily`: the scheduled lanes stop once delivery, the daily
+ * lane and the cache lane stand still; the graph lane's tables (graph results,
+ * model blocks and publications, previews, checkpoints, shared features and
+ * graph-day projections) are left out of the digest and of the probe, and the
+ * fits and model reference comes from the direct native calls instead. */
+const GRAPH_LANE_TABLE = /^analytics_(community_graph_|community_model_|graph_|history_checkpoint_|model_block|shared_feature_)/u;
+const inConvergenceScope = (table) => options.convergeOn === "all" || !GRAPH_LANE_TABLE.test(table);
 let progressQueries = null;
 async function progressDigest() {
   if (progressQueries === null) {
     const tables = (await target().prepare(`SELECT name FROM sqlite_master WHERE type='table'
       AND name LIKE 'analytics_%' AND name NOT LIKE 'analytics_admin_%' ORDER BY name`).all()).results.map((row) => row.name)
-      .filter((table) => !ROTATION_TABLES.has(table));
+      .filter((table) => !ROTATION_TABLES.has(table) && inConvergenceScope(table));
     progressQueries = [];
     for (const table of tables) {
       const columns = (await target().prepare("SELECT name,type FROM pragma_table_info(?) ORDER BY cid").bind(table).all()).results;
@@ -526,11 +544,11 @@ async function progressDigest() {
       }
       progressQueries.push(`SELECT '${table}' AS t,${terms.join("||','||")} AS v FROM "${table}"`);
     }
-    progressQueries.push(`SELECT 'heads' AS t,COALESCE(group_concat(key_digest||':'||COALESCE(generation,'-')||':'||retired,','),'') AS v
+    if (options.convergeOn === "all") progressQueries.push(`SELECT 'heads' AS t,COALESCE(group_concat(key_digest||':'||COALESCE(generation,'-')||':'||retired,','),'') AS v
       FROM (SELECT * FROM analytics_history_checkpoint_heads ORDER BY key_digest)`);
-    progressQueries.push(`SELECT 'blocks' AS t,COALESCE(group_concat(job_key||':'||head_revision||':'||state||':'||COALESCE(checkpoint_digest,'-'),','),'') AS v
+    if (options.convergeOn === "all") progressQueries.push(`SELECT 'blocks' AS t,COALESCE(group_concat(job_key||':'||head_revision||':'||state||':'||COALESCE(checkpoint_digest,'-'),','),'') AS v
       FROM (SELECT * FROM analytics_model_blocks ORDER BY job_key)`);
-    progressQueries.push(`SELECT 'features' AS t,COALESCE(group_concat(job_key||':'||head_revision||':'||state,','),'') AS v
+    if (options.convergeOn === "all") progressQueries.push(`SELECT 'features' AS t,COALESCE(group_concat(job_key||':'||head_revision||':'||state,','),'') AS v
       FROM (SELECT * FROM analytics_shared_feature_days ORDER BY job_key)`);
   }
   const hash = createHash("sha256");
@@ -608,9 +626,28 @@ function interceptConsole(failures, errors, laneStats) {
 }
 function restoreConsole() { Object.assign(console, realConsole); }
 
+/**
+ * `--stop-when daily-published` ends the scheduled run at the first simulated
+ * minute at which the daily lane is finished: every corpus day except the
+ * conflict days production blocks is published and nothing else is queued.
+ * Production's graph lane needs hours more for a dense owner (each forced
+ * native window of owner e takes minutes, and the lane works one at a time),
+ * so the per-owner fits and model results come from Tier F over every scope,
+ * and the run records exactly how far the graph lane had got. Deterministic:
+ * the same corpus, cadence and clock stop at the same minute.
+ */
+async function dailyPublished() {
+  const queued = (await target().prepare("SELECT day FROM analytics_community_daily_queue WHERE source_id=? ORDER BY day")
+    .bind(SOURCE_ID).all()).results.map((row) => row.day);
+  const published = (await target().prepare("SELECT COUNT(DISTINCT day) AS n FROM analytics_community_daily_publications WHERE source_id=?")
+    .bind(SOURCE_ID).first("n"));
+  return queued.every((day) => q1.conflict.days.includes(day))
+    && published === DENSE_CORPUS_DAY_LIST.length - q1.conflict.days.length;
+}
+
 async function converge() {
   const failures = new Map(), errors = [], laneStats = new Map(), laneMs = { analytics: 0, publication: 0, cache: 0 };
-  let quiet = 0, previous = null, tick = 0, slowest = { ms: 0, tick: -1, lane: null };
+  let quiet = 0, previous = null, tick = 0, slowest = { ms: 0, tick: -1, lane: null }, stoppedBy = null;
   const started = performance.now();
   const progress = [];
   interceptConsole(failures, errors, laneStats);
@@ -630,6 +667,12 @@ async function converge() {
       const digest = await progressDigest();
       quiet = digest === previous ? quiet + 1 : 0;
       previous = digest;
+      if (options.stopWhen === "daily-published" && await dailyPublished()) {
+        stoppedBy = "daily-published";
+        note("tick", { tick, stoppedBy, ms: Math.round(performance.now() - started) });
+        tick++;
+        break;
+      }
       if (tick % 10 === 0 || quiet > 0) {
         const print = await targetFingerprint();
         const entry = { tick, ms: Math.round(performance.now() - started), quiet,
@@ -644,7 +687,7 @@ async function converge() {
       }
     }
   } finally { restoreConsole(); }
-  return { ticks: tick, converged: quiet >= QUIET_TICKS, errors, failures: Object.fromEntries(failures),
+  return { ticks: tick, converged: quiet >= QUIET_TICKS, stoppedBy, errors, failures: Object.fromEntries(failures),
     laneStats: Object.fromEntries(laneStats), laneMs: Object.fromEntries(Object.entries(laneMs).map(([k, v]) => [k, Math.round(v)])),
     slowestLane: slowest, progress: progress.slice(-60), elapsedMs: Math.round(performance.now() - started) };
 }
@@ -658,7 +701,9 @@ const CONVERGENCE_KEYS = new Set(["community_daily_publications", "community_dai
   "v11_owner_heads", "v11_day_references", "v1_chunk_values", "model_blocks", "=dailyRevisions", "=modelRevisions",
   "=previewRevision", "=cursor", "=blocksComplete"]);
 async function leaseExpiryProbe() {
-  const keys = (print) => Object.fromEntries(Object.entries(print).filter(([key]) => CONVERGENCE_KEYS.has(key)));
+  const keys = (print) => Object.fromEntries(Object.entries(print).filter(([key]) => CONVERGENCE_KEYS.has(key)
+    && (options.convergeOn === "all" || (!key.startsWith("=") ? inConvergenceScope(`analytics_${key}`)
+      : ["=dailyRevisions", "=cursor"].includes(key)))));
   const before = keys(await targetFingerprint());
   const changed = new Set(), errors = [];
   interceptConsole(new Map(), errors, new Map());
@@ -802,7 +847,8 @@ if (prior === null) {
   setPinnedNow(PINNED_NOW_MS);
   await openDatabases(PINNED_NOW_MS);
   convergence = await converge();
-  note("converged", { analysisNowMs, ticks: convergence.ticks, converged: convergence.converged, elapsedMs: convergence.elapsedMs,
+  note("converged", { analysisNowMs, ticks: convergence.ticks, converged: convergence.converged,
+    stoppedBy: convergence.stoppedBy, elapsedMs: convergence.elapsedMs,
     errors: convergence.errors.length, failures: convergence.failures, laneMs: convergence.laneMs,
     laneStats: convergence.laneStats, slowestLane: convergence.slowestLane });
 } else {
@@ -812,11 +858,16 @@ if (prior === null) {
   seedMs = prior.seeded.seedMs;
   participants = new Map(corpusOwners.map((owner) => [owner.key, owner.participantId]));
   sourceBeforeAnalysis = prior.analyzed?.sourceDigest ?? null;
-  convergence = { ticks: prior.converged.ticks, converged: true, elapsedMs: prior.converged.elapsedMs,
+  if ((prior.converged.stoppedBy ?? null) !== (options.stopWhen === "daily-published" ? "daily-published" : null)) {
+    throw new Error("DENSE_ORACLE_RESUME_STOP_RULE_MISMATCH");
+  }
+  convergence = { ticks: prior.converged.ticks, converged: prior.converged.converged, stoppedBy: prior.converged.stoppedBy ?? null,
+    elapsedMs: prior.converged.elapsedMs,
     errors: Array.from({ length: prior.converged.errors }, () => "recorded in the resumed run"),
     failures: prior.converged.failures, laneMs: prior.converged.laneMs, laneStats: prior.converged.laneStats ?? null,
     slowestLane: prior.converged.slowestLane ?? null, progress: [], resumedFrom: options.resume };
-  if ((prior.corpus.clockStepMs ?? 0) !== options.clockStepMs || (prior.corpus.analyticsPasses ?? 1) !== options.analyticsPasses) {
+  if ((prior.corpus.clockStepMs ?? 0) !== options.clockStepMs || (prior.corpus.analyticsPasses ?? 1) !== options.analyticsPasses
+    || (prior.corpus.convergeOn ?? "all") !== options.convergeOn) {
     throw new Error("DENSE_ORACLE_RESUME_CADENCE_MISMATCH");
   }
   analysisNowMs = prior.converged.analysisNowMs ?? PINNED_NOW_MS;
@@ -831,23 +882,7 @@ for (const owner of corpusOwners) {
   if (!flags.has(participants.get(owner.key))) throw new Error("DENSE_ORACLE_PARTICIPANT_UNPINNED");
 }
 
-function sourceContentDigest() {
-  // Every source table's rows, in a stable order, through a private read-only connection.
-  const database = new DatabaseSync(join(dbDir, DB_FILES.USAGE_MONITOR_DB), { readOnly: true });
-  try {
-    const hash = createHash("sha256");
-    for (const { name } of database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all()) {
-      const columns = database.prepare("SELECT name FROM pragma_table_info(?) ORDER BY cid").all(name).map((row) => `"${row.name}"`);
-      const statement = database.prepare(`SELECT ${columns.join(",")} FROM "${name}" ORDER BY ${columns.join(",")}`);
-      statement.setReadBigInts(true);
-      statement.setReturnArrays(true);
-      hash.update(`${name}\n`);
-      for (const row of statement.iterate()) hash.update(JSON.stringify(row, (_, value) => typeof value === "bigint" ? `${value}n`
-        : value instanceof Uint8Array ? Buffer.from(value).toString("hex") : value));
-    }
-    return hash.digest("hex");
-  } finally { database.close(); }
-}
+function sourceContentDigest() { return sourceDigestOf(join(dbDir, DB_FILES.USAGE_MONITOR_DB)); }
 
 // Direct publisher calls on the converged state (expected: unchanged).
 const publishedModelDays = (await target().prepare(`SELECT day FROM analytics_community_model_publications
@@ -951,6 +986,7 @@ let forcedCost = null;
 const FORCED_SAMPLE = [modelDates[0], modelDates[17], modelDates[34], modelDates[51], modelDates.at(-1)];
 const forcedDatesFor = (key) => {
   if (options.forcedNative === "all") return modelDates;
+  if (options.forcedNative === "sample") return FORCED_SAMPLE;
   const digest = roster.find((owner) => owner.key === key)?.ownerDigest;
   const have = new Set(tierNGraph.filter((row) => row.owner_digest === digest && row.metric === "model").map((row) => row.day));
   return modelDates.filter((day) => !have.has(day) || FORCED_SAMPLE.includes(day));
@@ -1190,8 +1226,15 @@ const manifest = {
       q1Cadence: options.publicationPasses === 1 && options.analyticsPasses === 1 && options.clockStepMs === 0 },
     basis: "Q-1's reading of the production-scheduled-analytics-deploy refresh plan at d43c8f92; not verified against live configuration",
   },
-  convergence: { converged: convergence.converged, scheduleErrors: convergence.errors.length, quietTicks: QUIET_TICKS,
-    rule: "progress digest (counts, integer sums, text lengths, checkpoint/block/feature heads of every analytics table) unchanged for quietTicks consecutive ticks" },
+  convergence: { converged: convergence.converged, stoppedBy: convergence.stoppedBy ?? null,
+    scheduleErrors: convergence.errors.length, quietTicks: QUIET_TICKS,
+    rule: options.stopWhen === "daily-published"
+      ? "stopped at the first simulated minute with every non-conflict corpus day published and nothing else queued; graph work was still in progress (graphProgress)"
+      : "progress digest (counts, integer sums, text lengths, checkpoint/block/feature heads of every analytics table) unchanged for quietTicks consecutive ticks",
+    graphProgress: { results: tierNGraph.length, byOwner: Object.fromEntries(roster.map((owner) => [owner.key, {
+      fits: tierNGraph.some((row) => row.owner_digest === owner.ownerDigest && row.metric === "fits"),
+      modelDates: tierNGraph.filter((row) => row.owner_digest === owner.ownerDigest && row.metric === "model").length }])),
+      publishedModelDays: publishedModelDays.length, previewRevision: previewRow?.revision ?? null } },
   directPublisherCalls: { preview: directPreview.state, modelDays: Object.values(directModel).reduce(
     (n, state) => ({ ...n, [state]: (n[state] ?? 0) + 1 }), {}) },
   owners: roster,
@@ -1220,7 +1263,7 @@ const manifest = {
   sourceDump: { tables: usageDump.tables, rows: usageDump.rows, schemaSha256: usageDump.schemaSha256,
     rowCountsSha256: usageDump.rowCountsSha256, jsonBytes: usageDump.bytes, jsonSha256: usageDump.sha256,
     sealedSqlite: sealed, sourceUnchangedByAnalysis: sourceBeforeAnalysis === null ? null : sourceBeforeAnalysis === sourceAfterAnalysis,
-    reproduce: `node --max-old-space-size=16384 apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs --work-dir <dir> --corpus ${options.corpus}${options.corpus === "dense" && options.layout !== DENSE_DEFAULT_LAYOUT ? ` --layout ${options.layout}` : ""}${options.scale === 1 ? "" : ` --scale ${options.scale}`}${options.publicationPasses === 1 ? "" : ` --publication-passes ${options.publicationPasses}`}${options.analyticsPasses === 1 ? "" : ` --analytics-passes ${options.analyticsPasses}`}${options.clockStepMs === 0 ? "" : ` --clock-step-ms ${options.clockStepMs}`}` },
+    reproduce: `node --max-old-space-size=16384 apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs --work-dir <dir> --corpus ${options.corpus}${options.corpus === "dense" && options.layout !== DENSE_DEFAULT_LAYOUT ? ` --layout ${options.layout}` : ""}${options.scale === 1 ? "" : ` --scale ${options.scale}`}${options.publicationPasses === 1 ? "" : ` --publication-passes ${options.publicationPasses}`}${options.analyticsPasses === 1 ? "" : ` --analytics-passes ${options.analyticsPasses}`}${options.clockStepMs === 0 ? "" : ` --clock-step-ms ${options.clockStepMs}`}${options.stopWhen === "converged" ? "" : ` --stop-when ${options.stopWhen}`}` },
 };
 const diagnostics = { header: { ...header, seedMs, convergenceMs: convergence.elapsedMs, forcedCost,
   wallMs: Math.round(performance.now() - wallStarted), randomBytesDrawn: runtime.randomBytesDrawn() },
