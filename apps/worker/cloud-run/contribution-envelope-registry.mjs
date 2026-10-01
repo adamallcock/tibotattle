@@ -4,16 +4,21 @@
  *
  * POST /api/v1/contributions stays one route. Its shared preamble (bearer
  * auth, upload-authorization claim, deletion-tombstone check, transport
- * floor, receipt, abandon-on-failure) runs first; only then does the origin
- * dispatch on the envelope's body.schemaVersion through a registry built here.
- * Envelope versions are registry entries, not routes: v1.2 is registered by
- * the composition root, and the v1.1/v1.0/v0.1 ports export registrations.
- * An unregistered version must keep the origin's existing refusal unchanged;
- * resolve() returns null and the caller owns that response.
+ * floor, abandon-on-failure) runs first; only then does the origin dispatch
+ * on the envelope's body.schemaVersion through a registry built here.
+ * Envelope versions are registry entries, not routes: postgres-test-dispatch
+ * registers v1.2 from its own dependencies, and the v1.1/v1.0/v0.1 ports
+ * export registrations that the composition root passes in. An unregistered
+ * version keeps the origin's existing refusal unchanged; resolve() returns
+ * null and the caller owns that response.
  *
  * POST /api/v1/device/upload-authorizations likewise validates
  * telemetrySchemaVersion through a format table built by
- * createUploadAuthorizationFormats().
+ * createUploadAuthorizationFormats(). The same table enforces the transport
+ * floor in the contributions preamble: an envelope version is admitted under
+ * the format contributionTransportSchemaVersion() names. A registered
+ * envelope without its format, or a format whose envelope no handler can
+ * redeem, is refused at startup (assertContributionEnvelopeFormats()).
  *
  * Both registries are built once at startup from immutable entries, so
  * registration order and import side effects cannot change routing. This
@@ -22,9 +27,53 @@
  */
 
 /**
+ * The exact claimed request body, as the Worker's readBoundedJson returns it:
+ * bytes is the bounded body, raw its fatal-UTF-8 text and value its JSON.
+ *
+ * @typedef {Readonly<{ bytes: Uint8Array, raw: string, value: unknown }>} ContributionEnvelopeBody
+ */
+
+/**
+ * The active participant the claimed upload authorization belongs to, read in
+ * the preamble (the Worker's participants row).
+ *
+ * @typedef {Readonly<{
+ *   id: string,
+ *   consentVersion: string | null,
+ *   ownerKind: "social" | "accountless",
+ * }>} ContributionEnvelopeParticipant
+ */
+
+/**
+ * The upload-authorization claim the preamble made.
+ *
+ * @typedef {Readonly<{
+ *   authorizationId: string,
+ *   participantId: string,
+ *   authorizationKind: "device",
+ * }>} ContributionEnvelopeClaim
+ */
+
+/**
  * The per-request context the contributions preamble hands an envelope
- * handler. The composition root (IN-1b) fixes its fields; handlers must treat
- * unknown fields as absent.
+ * handler. Handlers must treat unknown fields as absent. On the PostgreSQL
+ * origin (postgres-test-dispatch.mjs) it carries:
+ * - request: the admitted request (its body is already consumed);
+ * - envelopeDigest, bodyBytes, contentType: the values the claim was bound to;
+ * - principal: Readonly<{ participantId, deviceId }>, the device principal the
+ *   PostgreSQL write authorities take;
+ * - schema: Readonly<{ primarySchema, ledgerSchema }>;
+ * - primaryPool, ledgerPool, objectStore: the origin's storage handles;
+ * - envelopePublicJwk, envelopePrivateJwk: the origin's envelope key pair;
+ * - sourceNamespace: the origin's typed-storage source namespace;
+ * - markPersistStarted(): call immediately before the first durable write
+ *   whose outcome can be uncertain. From then on the preamble no longer
+ *   abandons the claim on failure, and the handler resolves the claim itself.
+ *
+ * The preamble does not record the authorization receipt: a handler consumes
+ * the claimed authorization in the same transaction that persists the
+ * contribution (as persistPostgresTypedV12StagedChunk does), and abandons it
+ * explicitly on a replay.
  *
  * @typedef {Readonly<Record<string, unknown>>} ContributionEnvelopeContext
  */
@@ -32,22 +81,32 @@
 /**
  * Runs only after the shared preamble has authenticated the bearer, claimed
  * the upload authorization, refused tombstoned participants and enforced the
- * transport floor. If it throws, the preamble abandons the claim and maps the
- * error; it must not repeat any preamble step.
+ * transport floor. If it throws before markPersistStarted(), the preamble
+ * abandons the claim and the origin maps the error; it must not repeat any
+ * preamble step. It returns the client receipt as a Response.
  *
  * @typedef {(
- *   body: unknown,
- *   participant: unknown,
+ *   body: ContributionEnvelopeBody,
+ *   participant: ContributionEnvelopeParticipant,
  *   sourceDeviceId: string,
- *   claimed: unknown,
+ *   claimed: ContributionEnvelopeClaim,
  *   context: ContributionEnvelopeContext,
  * ) => Response | Promise<Response>} ContributionEnvelopeHandler
+ */
+
+/**
+ * Optional pre-claim validation of the parsed envelope and its exact raw
+ * text. It runs before the bearer is claimed, so it must be pure: no storage,
+ * no network, and it throws the origin's refusal for a malformed envelope.
+ *
+ * @typedef {(envelope: unknown, raw: string) => void} ContributionEnvelopeValidator
  */
 
 /**
  * @typedef {Readonly<{
  *   schemaVersion: string,
  *   handler: ContributionEnvelopeHandler,
+ *   validateEnvelope: ContributionEnvelopeValidator | null,
  * }>} ContributionEnvelopeRegistration
  */
 
@@ -56,6 +115,7 @@
  *   schemaVersions: readonly string[],
  *   has: (schemaVersion: unknown) => boolean,
  *   resolve: (schemaVersion: unknown) => ContributionEnvelopeHandler | null,
+ *   resolveRegistration: (schemaVersion: unknown) => ContributionEnvelopeRegistration | null,
  * }>} ContributionEnvelopeRegistry
  */
 
@@ -86,14 +146,22 @@
 const ENVELOPE_SCHEMA_VERSION = /^telemetry-envelope-v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u;
 const CONTRIBUTION_SCHEMA_VERSION = /^telemetry-contribution-v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u;
 const FORMAT_KEYS = Object.freeze(["assertUploadAllowed"]);
+const REGISTRATION_OPTION_KEYS = Object.freeze(["validateEnvelope"]);
 const DEFINED_REGISTRATIONS = new WeakSet();
 
+// Seam errors carry a stable code so a bad registration stops the origin at
+// startup with a named reason (server.mjs reports error.code) rather than the
+// generic runtime-configuration failure.
 function envelopeError(message) {
-  return new Error("CONTRIBUTION_ENVELOPE_REGISTRY_INVALID: " + message);
+  return Object.assign(new Error("CONTRIBUTION_ENVELOPE_REGISTRY_INVALID: " + message), {
+    code: "CONTRIBUTION_ENVELOPE_REGISTRY_INVALID",
+  });
 }
 
 function formatError(message) {
-  return new Error("UPLOAD_AUTHORIZATION_FORMAT_INVALID: " + message);
+  return Object.assign(new Error("UPLOAD_AUTHORIZATION_FORMAT_INVALID: " + message), {
+    code: "UPLOAD_AUTHORIZATION_FORMAT_INVALID",
+  });
 }
 
 function isPlainObject(value) {
@@ -108,20 +176,95 @@ function isPlainObject(value) {
  * mutate any shared state. Pass registrations to
  * createContributionEnvelopeRegistry().
  *
+ * options.validateEnvelope, when given, runs before the claim (see
+ * ContributionEnvelopeValidator). Without it the envelope is validated only by
+ * the handler, after the preamble.
+ *
  * @param {string} schemaVersion
  * @param {ContributionEnvelopeHandler} handler
+ * @param {{ validateEnvelope?: ContributionEnvelopeValidator }} [options]
  * @returns {ContributionEnvelopeRegistration}
  */
-export function registerContributionEnvelope(schemaVersion, handler) {
+export function registerContributionEnvelope(schemaVersion, handler, options = {}) {
   if (typeof schemaVersion !== "string" || !ENVELOPE_SCHEMA_VERSION.test(schemaVersion)) {
     throw envelopeError("schemaVersion must look like telemetry-envelope-v<major>.<minor>");
   }
   if (typeof handler !== "function") {
     throw envelopeError("handler must be a function");
   }
-  const registration = Object.freeze({ schemaVersion, handler });
+  if (!isPlainObject(options)
+      || Object.keys(options).some((key) => !REGISTRATION_OPTION_KEYS.includes(key))) {
+    throw envelopeError("options may contain only validateEnvelope");
+  }
+  const validateEnvelope = options.validateEnvelope ?? null;
+  if (validateEnvelope !== null && typeof validateEnvelope !== "function") {
+    throw envelopeError("validateEnvelope must be a function");
+  }
+  const registration = Object.freeze({ schemaVersion, handler, validateEnvelope });
   DEFINED_REGISTRATIONS.add(registration);
   return registration;
+}
+
+/**
+ * The transport (upload-authorization format) version a contribution envelope
+ * version is admitted under: telemetry-envelope-vX.Y maps to
+ * telemetry-contribution-vX.Y, as the Worker's
+ * telemetryTransportSchemaForEnvelope() does for every supported version.
+ * Returns null for anything that is not an envelope version string.
+ *
+ * @param {unknown} schemaVersion
+ * @returns {string | null}
+ */
+export function contributionTransportSchemaVersion(schemaVersion) {
+  if (typeof schemaVersion !== "string" || !ENVELOPE_SCHEMA_VERSION.test(schemaVersion)) return null;
+  return schemaVersion.replace("telemetry-envelope-", "telemetry-contribution-");
+}
+
+/**
+ * The envelope version an upload-authorization format admits: the inverse of
+ * contributionTransportSchemaVersion(). Returns null for anything that is not
+ * a contribution transport version string.
+ *
+ * @param {unknown} telemetrySchemaVersion
+ * @returns {string | null}
+ */
+export function contributionEnvelopeSchemaVersion(telemetrySchemaVersion) {
+  if (typeof telemetrySchemaVersion !== "string"
+      || !CONTRIBUTION_SCHEMA_VERSION.test(telemetrySchemaVersion)) return null;
+  return telemetrySchemaVersion.replace("telemetry-contribution-", "telemetry-envelope-");
+}
+
+/**
+ * Fail closed at startup unless the two tables pair exactly: every registered
+ * envelope version has the upload-authorization format its transport floor is
+ * enforced through, and every format has an envelope handler, so the origin
+ * never issues an authorization that POST /api/v1/contributions cannot
+ * redeem.
+ *
+ * @param {ContributionEnvelopeRegistry} envelopes
+ * @param {UploadAuthorizationFormats} formats
+ */
+export function assertContributionEnvelopeFormats(envelopes, formats) {
+  if (envelopes === null || typeof envelopes !== "object"
+      || !Array.isArray(envelopes.schemaVersions) || typeof envelopes.has !== "function"
+      || formats === null || typeof formats !== "object"
+      || !Array.isArray(formats.telemetrySchemaVersions) || typeof formats.has !== "function") {
+    throw envelopeError("envelopes and formats must be built registries");
+  }
+  for (const schemaVersion of envelopes.schemaVersions) {
+    const transport = contributionTransportSchemaVersion(schemaVersion);
+    if (transport === null || !formats.has(transport)) {
+      throw envelopeError(schemaVersion + " has no " + String(transport)
+        + " upload-authorization format for its transport floor");
+    }
+  }
+  for (const telemetrySchemaVersion of formats.telemetrySchemaVersions) {
+    const envelope = contributionEnvelopeSchemaVersion(telemetrySchemaVersion);
+    if (envelope === null || !envelopes.has(envelope)) {
+      throw envelopeError(telemetrySchemaVersion + " has no " + String(envelope)
+        + " handler to redeem its upload authorizations");
+    }
+  }
 }
 
 /**
@@ -135,7 +278,7 @@ export function createContributionEnvelopeRegistry(registrations) {
   if (!Array.isArray(registrations)) {
     throw envelopeError("registrations must be an array");
   }
-  /** @type {Map<string, ContributionEnvelopeHandler>} */
+  /** @type {Map<string, ContributionEnvelopeRegistration>} */
   const byVersion = new Map();
   for (const registration of registrations) {
     if (!DEFINED_REGISTRATIONS.has(registration)) {
@@ -144,7 +287,7 @@ export function createContributionEnvelopeRegistry(registrations) {
     if (byVersion.has(registration.schemaVersion)) {
       throw envelopeError("more than one handler claims " + registration.schemaVersion);
     }
-    byVersion.set(registration.schemaVersion, registration.handler);
+    byVersion.set(registration.schemaVersion, registration);
   }
   const schemaVersions = Object.freeze([...byVersion.keys()]);
   return Object.freeze({
@@ -153,6 +296,10 @@ export function createContributionEnvelopeRegistry(registrations) {
       return typeof schemaVersion === "string" && byVersion.has(schemaVersion);
     },
     resolve(schemaVersion) {
+      if (typeof schemaVersion !== "string") return null;
+      return byVersion.get(schemaVersion)?.handler ?? null;
+    },
+    resolveRegistration(schemaVersion) {
       if (typeof schemaVersion !== "string") return null;
       return byVersion.get(schemaVersion) ?? null;
     },

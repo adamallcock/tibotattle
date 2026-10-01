@@ -122,6 +122,16 @@ import {
 } from "./postgres-test-dispatch.mjs";
 import { Connector } from "@google-cloud/cloud-sql-connector";
 import { POSTGRES_RUNTIME_MIGRATIONS } from "../src/postgres-runtime-schema.ts";
+import { WORKER_ROUTE_POLICY } from "../src/route-registry.ts";
+import {
+  createOriginRouteModuleRegistry,
+  ORIGIN_OVERRIDABLE_BUILT_INS,
+} from "./origin-route-modules.mjs";
+import {
+  FASTPATH_TEST_MODE,
+  fastpathTestDatabaseConfig,
+  fastpathTestRouteModules,
+} from "./origin-fastpath-mode.mjs";
 import {
   buildPublicGoogleRequestUrl,
   buildRequestUrl,
@@ -215,7 +225,9 @@ function configuredRequestOrigins(hostOrigin, publicOrigin) {
 function postgresTestHttpMode() {
   const mode = optional("POSTGRES_TEST_HTTP_MODE");
   if (mode === undefined) return null;
-  if (!new Set(["health-only", "health-and-v12-day-manifest", "cloud-run-iam"]).has(mode)) {
+  if (!new Set([
+    "health-only", "health-and-v12-day-manifest", "cloud-run-iam", FASTPATH_TEST_MODE,
+  ]).has(mode)) {
     configurationError("POSTGRES_TEST_HTTP_MODE_INVALID");
   }
   return mode;
@@ -417,7 +429,11 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
     ? null
     : privateHost?.requestOriginAllowlist ?? configuredRequestOrigins(hostOrigin, publicOrigin);
   const digest = databaseOnly || postgresTestHttpEnabled ? undefined : sourceDigest();
-  const database = databaseConfig();
+  // fastpath-test serves a rehearsal schema pair only; refuse any other
+  // schema before a connector or pool exists.
+  const database = postgresTestMode === FASTPATH_TEST_MODE
+    ? fastpathTestDatabaseConfig(process.env)
+    : databaseConfig();
   const iamUser = normalizeIamUser(required("POSTGRES_IAM_USER"), "POSTGRES_IAM_USER");
   const cloudRunIamResources = postgresTestMode === "cloud-run-iam"
     ? validateCloudRunIamTestResources({
@@ -483,7 +499,8 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
       };
     }
     if (postgresTestMode === "health-and-v12-day-manifest"
-        || postgresTestMode === "cloud-run-iam") {
+        || postgresTestMode === "cloud-run-iam"
+        || postgresTestMode === FASTPATH_TEST_MODE) {
       const rateLimitSecret = required("POSTGRES_RATE_LIMIT_SECRET");
       if (new TextEncoder().encode(rateLimitSecret).byteLength < 32) {
         configurationError("POSTGRES_RATE_LIMIT_SECRET_INVALID");
@@ -629,6 +646,23 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
           healthDispatch: googleHealthDispatch,
         })
         : null;
+      // Route modules may replace only the overridable built-ins, and only a
+      // fastpath-test origin mounts any tonight; the other modes build an
+      // empty registry, so every route keeps its built-in.
+      const routeModules = createOriginRouteModuleRegistry({
+        modules: postgresTestMode === FASTPATH_TEST_MODE
+          ? fastpathTestRouteModules({
+            env: process.env,
+            primaryPool,
+            primarySchema: database.primary.schema,
+            createAnalyticsV2CommunityDailyRoute:
+              dependencies.createAnalyticsV2CommunityDailyRoute ?? null,
+            clock: dependencies.analyticsV2Clock ?? null,
+          })
+          : [],
+        routePolicy: WORKER_ROUTE_POLICY,
+      });
+      const routeModuleContext = Object.freeze({ origin: hostOrigin, hostMode: privateHost.mode });
       return {
         pools,
         connector,
@@ -644,7 +678,15 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         postgresTestHostMode: privateHost.mode,
         postgresTestDispatch: ((v12Dispatch) => async (request) => {
           let pathname;
-          try { pathname = new URL(request.url).pathname; } catch { /* V12 dispatch returns a safe 503. */ }
+          let origin;
+          try { ({ pathname, origin } = new URL(request.url)); } catch { /* V12 dispatch returns a safe 503. */ }
+          // Non-overridable paths never reach a module. On an overridable
+          // path a module registered for the exact method and private origin
+          // answers first; otherwise the built-in below serves it unchanged.
+          if (origin === hostOrigin && ORIGIN_OVERRIDABLE_BUILT_INS.includes(pathname)) {
+            const routeModule = routeModules.resolve(request.method, pathname);
+            if (routeModule !== null) return routeModule.handler(request, routeModuleContext);
+          }
           if (pathname === "/api/v1/community/daily") return communityDailyDispatch(request);
           if (pathname === "/api/v1/me/devices"
               || pathname === "/api/v1/me/devices/revoke") {

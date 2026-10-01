@@ -1,13 +1,21 @@
 import {
+  TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
   TELEMETRY_V12_ENVELOPE_SCHEMA_VERSION,
   parseTelemetryV12ChunkId,
 } from "@app-usagemonitor/telemetry-contract";
+import {
+  assertContributionEnvelopeFormats,
+  contributionTransportSchemaVersion,
+  createContributionEnvelopeRegistry,
+  createUploadAuthorizationFormats,
+  registerContributionEnvelope,
+} from "./contribution-envelope-registry.mjs";
 
 const SCHEMA_IDENTIFIER = /^[a-z_][a-z0-9_]{0,62}$/u;
 const DIGEST = /^[0-9a-f]{64}$/u;
 const MIGRATION_HISTORY_TABLE = "_tibotattle_migration_history";
 const POSTGRES_MAJOR_REQUIRED = 17;
-const V12_CHUNK_UPLOAD_PATH = "/api/v1/contributions";
+const CONTRIBUTIONS_PATH = "/api/v1/contributions";
 const COMMUNITY_DAILY_PATH = "/api/v1/community/daily";
 const PARTICIPANT_DEVICES_PATH = "/api/v1/me/devices";
 const PARTICIPANT_DEVICE_REVOKE_PATH = "/api/v1/me/devices/revoke";
@@ -1299,23 +1307,39 @@ async function registerPendingV12Object(pool, schema, contributionId, objectKey,
   }
 }
 
-async function readClaimedDevicePrincipal(pool, schema, claim, envelopeDigest, bodyBytes) {
-  const table = schemaTable(schema) + '."device_upload_authorizations"';
+// The device principal and the active participant row the claimed upload
+// authorization belongs to (the Worker preamble's participants read). The
+// claim already proved both active; a participant that left 'active' since
+// then is refused like a missing grant.
+async function readClaimedContributionPrincipal(pool, schema, claim, envelopeDigest, bodyBytes) {
+  const grants = schemaTable(schema) + '."device_upload_authorizations"';
+  const participants = schemaTable(schema) + '."participants"';
   return withReadOnlyClient(pool, async (client) => {
     const result = await client.query(
-      "SELECT issued_by_device_id FROM " + table + " "
-        + "WHERE id = $1 AND participant_id = $2 AND state = 'consuming' "
-        + "AND envelope_digest = $3 AND body_bytes = $4 "
-        + "AND content_type = 'application/json'",
+      "SELECT upload.issued_by_device_id, participant.consent_version, participant.owner_kind "
+        + "FROM " + grants + " upload JOIN " + participants + " participant "
+        + "ON participant.id = upload.participant_id AND participant.state = 'active' "
+        + "WHERE upload.id = $1 AND upload.participant_id = $2 AND upload.state = 'consuming' "
+        + "AND upload.envelope_digest = $3 AND upload.body_bytes = $4 "
+        + "AND upload.content_type = 'application/json'",
       [claim.authorizationId, claim.participantId, envelopeDigest, bodyBytes],
     );
     const row = result.rows[0];
-    if (typeof row?.issued_by_device_id !== "string" || row.issued_by_device_id.length < 1) {
+    if (typeof row?.issued_by_device_id !== "string" || row.issued_by_device_id.length < 1
+        || (row.consent_version !== null && typeof row.consent_version !== "string")
+        || (row.owner_kind !== "social" && row.owner_kind !== "accountless")) {
       throw Object.assign(new Error("UPLOAD_AUTH_INVALID"), {
         code: "UPLOAD_AUTH_INVALID", status: 401,
       });
     }
-    return Object.freeze({ participantId: claim.participantId, deviceId: row.issued_by_device_id });
+    return Object.freeze({
+      principal: Object.freeze({ participantId: claim.participantId, deviceId: row.issued_by_device_id }),
+      participant: Object.freeze({
+        id: claim.participantId,
+        consentVersion: row.consent_version,
+        ownerKind: row.owner_kind,
+      }),
+    });
   });
 }
 
@@ -1495,100 +1519,42 @@ function v12ChunkReceipt(contributionId, manifestId, chunk, replayed) {
   }, replayed ? { "idempotency-replayed": "true" } : undefined);
 }
 
-async function handlePostgresTestV12ChunkUpload({
-  request,
+// The pre-claim envelope check of the v1.2-only origin: an exact six-key
+// envelope (400 ENVELOPE_INVALID otherwise), then the closed v1.2 contract.
+function validateV12EnvelopeBeforeClaim(envelope, raw, validateTelemetryV12Envelope) {
+  if (!hasExactV12EnvelopeKeyOccurrences(raw)) {
+    throw Object.assign(new Error("ENVELOPE_INVALID"), { code: "ENVELOPE_INVALID", status: 400 });
+  }
+  validateTelemetryV12Envelope(envelope);
+}
+
+/**
+ * The telemetry-envelope-v1.2 handler: everything the v1.2-only origin did
+ * after the transport floor, unchanged. It decrypts and validates the staged
+ * chunk, journals and writes the object, and persists the chunk; the persist
+ * transaction consumes the claimed upload authorization (the receipt), and a
+ * replay abandons it explicitly.
+ */
+function createPostgresTestV12ContributionHandler({
   primaryPool,
-  ledgerPool,
-  schema,
-  admissionEnv,
   objectStore,
-  assertAttemptAllowed,
-  hasPostgresDeletionTombstone,
-  assertPostgresV12UploadAllowed,
-  claimPostgresDeviceUploadAuthorization,
   abandonPostgresDeviceUploadAuthorization,
   persistPostgresTypedV12StagedChunk,
   decryptSyntheticEnvelope,
-  validateTelemetryV12Envelope,
   validateTelemetryV12StagedChunk,
-  sha256Hex,
-  readBoundedRequestBody,
-  maxRequestBytes,
   envelopePublicJwk,
   envelopePrivateJwk,
 }) {
-  let claim = null;
-  let principal = null;
-  let persistStarted = false;
-  let input = null;
-  try {
-    if (request.headers.has("cookie")) {
-      throw Object.assign(new Error("UPLOAD_AUTH_INVALID"), {
-        code: "UPLOAD_AUTH_INVALID", status: 401,
-      });
-    }
-    const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim();
-    if (contentType !== "application/json") {
-      throw Object.assign(new Error("CONTENT_TYPE_INVALID"), {
-        code: "CONTENT_TYPE_INVALID", status: 415,
-      });
-    }
-    const declared = request.headers.get("content-length");
-    if (declared !== null) {
-      const length = Number(declared);
-      if (!Number.isSafeInteger(length) || length < 0) {
-        throw Object.assign(new Error("BODY_INVALID"), { code: "BODY_INVALID", status: 400 });
-      }
-      if (length > maxRequestBytes) {
-        throw Object.assign(new Error("BODY_TOO_LARGE"), { code: "BODY_TOO_LARGE", status: 413 });
-      }
-    }
-    const bytes = await readBoundedRequestBody(request, maxRequestBytes, {
-      maximumTotalMilliseconds: 15_000,
-      maximumIdleMilliseconds: 5_000,
-    });
-    let raw;
-    let envelope;
-    try {
-      raw = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes);
-      envelope = JSON.parse(raw);
-    } catch {
-      throw Object.assign(new Error("BODY_INVALID"), { code: "BODY_INVALID", status: 400 });
-    }
-    if (!hasExactV12EnvelopeKeyOccurrences(raw)) {
-      throw Object.assign(new Error("ENVELOPE_INVALID"), { code: "ENVELOPE_INVALID", status: 400 });
-    }
-    validateTelemetryV12Envelope(envelope);
-    const envelopeDigest = await sha256Hex(bytes);
-    const bodyBytes = bytes.byteLength;
-    claim = await claimPostgresDeviceUploadAuthorization(
-      primaryPool,
-      request.headers.get("authorization"),
-      { envelopeDigest, bodyBytes, contentType },
-      { schema },
-    );
-    principal = await readClaimedDevicePrincipal(
-      primaryPool, schema.primarySchema, claim, envelopeDigest, bodyBytes,
-    );
-    await assertAttemptAllowed(
-      admissionEnv.RECOVERY_RATE_LIMIT,
-      admissionEnv.CLIENT_ATTEMPT_RATE_LIMIT,
-      request,
-      admissionEnv,
-      "device_sync",
-    );
-    await assertPostgresProcessingEnabled(primaryPool, schema.primarySchema);
-    if (await hasPostgresDeletionTombstone(
-      ledgerPool, principal.participantId, Date.now(), { schema },
-    )) {
-      throw Object.assign(new Error("UPLOAD_AUTH_INVALID"), {
-        code: "UPLOAD_AUTH_INVALID", status: 401,
-      });
-    }
-    await assertPostgresV12UploadAllowed(primaryPool, principal, Date.now(), { schema });
-
+  return async function handlePostgresTestV12Contribution(
+    body,
+    _participant,
+    _sourceDeviceId,
+    claim,
+    { principal, envelopeDigest, schema, markPersistStarted },
+  ) {
+    let input = null;
     const plaintext = await decryptSyntheticEnvelope(
-      envelope, envelopePublicJwk, envelopePrivateJwk,
+      body.value, envelopePublicJwk, envelopePrivateJwk,
     );
     const chunk = await validateTelemetryV12StagedChunk(plaintext);
     const { day } = parseTelemetryV12ChunkId(chunk.chunkId);
@@ -1629,7 +1595,7 @@ async function handlePostgresTestV12ChunkUpload({
       primaryPool, schema.primarySchema, chunkRowId, objectKey, new Date().toISOString(),
     );
     try {
-      await objectStore.put(objectKey, bytes, {
+      await objectStore.put(objectKey, body.bytes, {
         contentType: "application/json",
         customMetadata: {
           contributionId: chunkRowId,
@@ -1644,7 +1610,7 @@ async function handlePostgresTestV12ChunkUpload({
       throw storageUnavailable();
     }
 
-    persistStarted = true;
+    markPersistStarted();
     try {
       const result = await persistPostgresTypedV12StagedChunk(
         primaryPool,
@@ -1723,6 +1689,133 @@ async function handlePostgresTestV12ChunkUpload({
       }
       throw storageUnavailable();
     }
+  };
+}
+
+/**
+ * POST /api/v1/contributions. One route with a shared preamble, then a
+ * dispatch on the envelope's schemaVersion through the envelope registry.
+ *
+ * Preamble, in the v1.2-only origin's order: cookie, content type and length,
+ * bounded body, fatal UTF-8 JSON; the envelope's registered pre-claim check
+ * (an unregistered version gets the v1.2-only origin's refusal, before any
+ * claim); then the upload-authorization claim, the claimed principal and
+ * participant, the device_sync attempt limit, the processing control, the
+ * deletion tombstone and the format's transport floor. Only then does the
+ * registered handler run. Until the handler marks its persist started, any
+ * failure abandons the claim.
+ */
+async function handlePostgresTestContribution({
+  request,
+  primaryPool,
+  ledgerPool,
+  schema,
+  admissionEnv,
+  assertAttemptAllowed,
+  hasPostgresDeletionTombstone,
+  claimPostgresDeviceUploadAuthorization,
+  abandonPostgresDeviceUploadAuthorization,
+  sha256Hex,
+  readBoundedRequestBody,
+  maxRequestBytes,
+  envelopes,
+  formats,
+  refuseUnregisteredEnvelope,
+  handlerContext,
+}) {
+  let claim = null;
+  let principal = null;
+  let persistStarted = false;
+  try {
+    if (request.headers.has("cookie")) {
+      throw Object.assign(new Error("UPLOAD_AUTH_INVALID"), {
+        code: "UPLOAD_AUTH_INVALID", status: 401,
+      });
+    }
+    const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim();
+    if (contentType !== "application/json") {
+      throw Object.assign(new Error("CONTENT_TYPE_INVALID"), {
+        code: "CONTENT_TYPE_INVALID", status: 415,
+      });
+    }
+    const declared = request.headers.get("content-length");
+    if (declared !== null) {
+      const length = Number(declared);
+      if (!Number.isSafeInteger(length) || length < 0) {
+        throw Object.assign(new Error("BODY_INVALID"), { code: "BODY_INVALID", status: 400 });
+      }
+      if (length > maxRequestBytes) {
+        throw Object.assign(new Error("BODY_TOO_LARGE"), { code: "BODY_TOO_LARGE", status: 413 });
+      }
+    }
+    const bytes = await readBoundedRequestBody(request, maxRequestBytes, {
+      maximumTotalMilliseconds: 15_000,
+      maximumIdleMilliseconds: 5_000,
+    });
+    let raw;
+    let envelope;
+    try {
+      raw = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes);
+      envelope = JSON.parse(raw);
+    } catch {
+      throw Object.assign(new Error("BODY_INVALID"), { code: "BODY_INVALID", status: 400 });
+    }
+    const declaredVersion = envelope !== null && typeof envelope === "object"
+      && !Array.isArray(envelope) && Object.hasOwn(envelope, "schemaVersion")
+      ? envelope.schemaVersion : undefined;
+    const registration = envelopes.resolveRegistration(declaredVersion);
+    if (registration === null) {
+      refuseUnregisteredEnvelope(envelope, raw);
+      throw Object.assign(new Error("ENVELOPE_INVALID"), { code: "ENVELOPE_INVALID", status: 400 });
+    }
+    registration.validateEnvelope?.(envelope, raw);
+    const format = formats.resolve(contributionTransportSchemaVersion(registration.schemaVersion));
+    if (format === null) throw storageUnavailable();
+    const envelopeDigest = await sha256Hex(bytes);
+    const bodyBytes = bytes.byteLength;
+    claim = await claimPostgresDeviceUploadAuthorization(
+      primaryPool,
+      request.headers.get("authorization"),
+      { envelopeDigest, bodyBytes, contentType },
+      { schema },
+    );
+    const claimed = await readClaimedContributionPrincipal(
+      primaryPool, schema.primarySchema, claim, envelopeDigest, bodyBytes,
+    );
+    principal = claimed.principal;
+    await assertAttemptAllowed(
+      admissionEnv.RECOVERY_RATE_LIMIT,
+      admissionEnv.CLIENT_ATTEMPT_RATE_LIMIT,
+      request,
+      admissionEnv,
+      "device_sync",
+    );
+    await assertPostgresProcessingEnabled(primaryPool, schema.primarySchema);
+    if (await hasPostgresDeletionTombstone(
+      ledgerPool, principal.participantId, Date.now(), { schema },
+    )) {
+      throw Object.assign(new Error("UPLOAD_AUTH_INVALID"), {
+        code: "UPLOAD_AUTH_INVALID", status: 401,
+      });
+    }
+    await format.assertUploadAllowed(primaryPool, principal, Date.now(), { schema });
+
+    return await registration.handler(
+      Object.freeze({ bytes, raw, value: envelope }),
+      claimed.participant,
+      principal.deviceId,
+      claim,
+      Object.freeze({
+        ...handlerContext,
+        request,
+        envelopeDigest,
+        bodyBytes,
+        contentType,
+        principal,
+        schema,
+        markPersistStarted() { persistStarted = true; },
+      }),
+    );
   } catch (error) {
     if (claim && principal && !persistStarted) {
       try {
@@ -1897,6 +1990,8 @@ export function createPostgresTestV12DayManifestDispatch({
   envelopePrivateJwk,
   readBoundedRequestBody,
   maxRequestBytes,
+  contributionEnvelopes = [],
+  uploadAuthorizationFormats = {},
 }) {
   if (primaryPool === null || typeof primaryPool !== "object"
       || typeof primaryPool.connect !== "function"
@@ -1967,6 +2062,59 @@ export function createPostgresTestV12DayManifestDispatch({
         || deviceCredentialRenewalAuthority.maxRequestBytes !== 2 * 1024 * 1024)) {
     configurationError("POSTGRES_TEST_DEVICE_CREDENTIAL_RENEWAL_CONFIGURATION_INVALID");
   }
+  // POST /api/v1/contributions dispatches on the envelope schemaVersion and
+  // POST /api/v1/device/upload-authorizations on telemetrySchemaVersion. This
+  // origin registers v1.2 itself; contributionEnvelopes and
+  // uploadAuthorizationFormats add other versions, never replace v1.2, and
+  // must pair exactly (assertContributionEnvelopeFormats).
+  if (!Array.isArray(contributionEnvelopes)
+      || uploadAuthorizationFormats === null || typeof uploadAuthorizationFormats !== "object"
+      || Array.isArray(uploadAuthorizationFormats)
+      || (uploadAuthorizationFormats instanceof Map
+        ? uploadAuthorizationFormats.has(TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION)
+        : Object.hasOwn(uploadAuthorizationFormats, TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION))) {
+    configurationError("POSTGRES_TEST_CONTRIBUTION_REGISTRY_CONFIGURATION_INVALID");
+  }
+  const envelopes = createContributionEnvelopeRegistry([
+    registerContributionEnvelope(
+      TELEMETRY_V12_ENVELOPE_SCHEMA_VERSION,
+      createPostgresTestV12ContributionHandler({
+        primaryPool,
+        objectStore,
+        abandonPostgresDeviceUploadAuthorization,
+        persistPostgresTypedV12StagedChunk,
+        decryptSyntheticEnvelope,
+        validateTelemetryV12StagedChunk,
+        envelopePublicJwk,
+        envelopePrivateJwk,
+      }),
+      {
+        validateEnvelope: (envelope, raw) =>
+          validateV12EnvelopeBeforeClaim(envelope, raw, validateTelemetryV12Envelope),
+      },
+    ),
+    ...contributionEnvelopes,
+  ]);
+  const formats = createUploadAuthorizationFormats(new Map([
+    [TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION, { assertUploadAllowed: assertPostgresV12UploadAllowed }],
+    ...(uploadAuthorizationFormats instanceof Map
+      ? uploadAuthorizationFormats.entries()
+      : Object.entries(uploadAuthorizationFormats)),
+  ]));
+  assertContributionEnvelopeFormats(envelopes, formats);
+  // The v1.2-only origin refused every other envelope inside its pre-claim
+  // v1.2 check, before any claim; an unregistered version keeps exactly that
+  // refusal (status, code and body).
+  const refuseUnregisteredEnvelope = (envelope, raw) =>
+    validateV12EnvelopeBeforeClaim(envelope, raw, validateTelemetryV12Envelope);
+  const contributionHandlerContext = Object.freeze({
+    primaryPool,
+    ledgerPool,
+    objectStore,
+    envelopePublicJwk,
+    envelopePrivateJwk,
+    sourceNamespace,
+  });
 
   return async function dispatchPostgresTestV12DayManifest(request) {
     let url;
@@ -1988,8 +2136,8 @@ export function createPostgresTestV12DayManifestDispatch({
       && url.pathname === DEVICE_UPLOAD_AUTHORIZATION_PATH;
     const disconnectPath = url.pathname === DEVICE_DISCONNECT_PATH;
     const disconnectRoute = disconnectPath && request.method === "POST";
-    const v12ChunkUploadRoute = request.method === "POST"
-      && url.pathname === V12_CHUNK_UPLOAD_PATH;
+    const contributionRoute = request.method === "POST"
+      && url.pathname === CONTRIBUTIONS_PATH;
     const syncStatePath = url.pathname === DEVICE_SYNC_STATE_PATH;
     const syncManifestPath = url.pathname === DEVICE_SYNC_MANIFEST_PATH;
     const syncCapabilitiesPath = url.pathname === DEVICE_SYNC_CAPABILITIES_PATH;
@@ -2072,7 +2220,7 @@ export function createPostgresTestV12DayManifestDispatch({
       }), crypto.randomUUID());
     }
     if ((!envelopeKeyRoute && !manifestRoute && !manifestReadRoute
-        && !uploadAuthorizationRoute && !disconnectRoute && !v12ChunkUploadRoute
+        && !uploadAuthorizationRoute && !disconnectRoute && !contributionRoute
         && !syncStateRoute && !syncManifestRoute && !syncCapabilitiesRoute && !syncCapabilitiesV12Route
         && !v12DomainPredecessorRoute && !v12DomainActivateRoute
         && !v12EffectivePageRoute && !accountlessEnrollmentRoute
@@ -2302,28 +2450,24 @@ export function createPostgresTestV12DayManifestDispatch({
           deviceId: disconnected.deviceId,
         });
       }
-      if (v12ChunkUploadRoute) {
-        return await handlePostgresTestV12ChunkUpload({
+      if (contributionRoute) {
+        return await handlePostgresTestContribution({
           request,
           primaryPool,
           ledgerPool,
           schema,
           admissionEnv,
-          objectStore,
           assertAttemptAllowed,
           hasPostgresDeletionTombstone,
-          assertPostgresV12UploadAllowed,
           claimPostgresDeviceUploadAuthorization,
           abandonPostgresDeviceUploadAuthorization,
-          persistPostgresTypedV12StagedChunk,
-          decryptSyntheticEnvelope,
-          validateTelemetryV12Envelope,
-          validateTelemetryV12StagedChunk,
           sha256Hex,
           readBoundedRequestBody,
           maxRequestBytes,
-          envelopePublicJwk,
-          envelopePrivateJwk,
+          envelopes,
+          formats,
+          refuseUnregisteredEnvelope,
+          handlerContext: contributionHandlerContext,
         });
       }
       // The v1.2 capability read is how an accountless install learns that
@@ -2510,11 +2654,12 @@ export function createPostgresTestV12DayManifestDispatch({
             || !Number.isSafeInteger(value.contentLengthBytes)
             || value.contentLengthBytes < 1 || value.contentLengthBytes > maxRequestBytes
             || value.contentType !== "application/json"
-            || value.telemetrySchemaVersion !== "telemetry-contribution-v1.2") {
+            || !formats.has(value.telemetrySchemaVersion)) {
           throw Object.assign(new Error("BODY_INVALID"), { code: "BODY_INVALID", status: 400 });
         }
 
-        await assertPostgresV12UploadAllowed(primaryPool, device, Date.now(), { schema });
+        await formats.resolve(value.telemetrySchemaVersion)
+          .assertUploadAllowed(primaryPool, device, Date.now(), { schema });
         return json(201, await createPostgresDeviceUploadAuthorization(
           primaryPool,
           device,

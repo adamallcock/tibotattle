@@ -42,8 +42,12 @@ export const ORIGIN_OVERRIDABLE_BUILT_INS = Object.freeze([
 /** @typedef {(typeof ORIGIN_OVERRIDABLE_BUILT_INS)[number]} OriginOverridableBuiltIn */
 
 /**
- * Per-request context the origin passes to a module handler. The composition
- * root (IN-1b) fixes its fields; modules must treat unknown fields as absent.
+ * Per-request context the origin passes to a module handler. Modules must
+ * treat unknown fields as absent. server.mjs passes:
+ * - origin: the private host origin the request was admitted on;
+ * - hostMode: the POSTGRES_TEST_HTTP_MODE the origin runs in.
+ * Storage handles, schema and clock are bound when the module is constructed,
+ * not per request.
  *
  * @typedef {Readonly<Record<string, unknown>>} OriginRouteModuleContext
  */
@@ -82,8 +86,11 @@ const ROUTE_METHODS = Object.freeze(["GET", "POST", "DELETE"]);
 const MODULE_KEYS = Object.freeze(["handler", "method", "overridesBuiltIn", "pathname"]);
 const DEFINED_MODULES = new WeakSet();
 
+// The code lets server.mjs stop the origin with a named startup reason.
 function seamError(message) {
-  return new Error("ORIGIN_ROUTE_MODULE_INVALID: " + message);
+  return Object.assign(new Error("ORIGIN_ROUTE_MODULE_INVALID: " + message), {
+    code: "ORIGIN_ROUTE_MODULE_INVALID",
+  });
 }
 
 function isPlainObject(value) {
