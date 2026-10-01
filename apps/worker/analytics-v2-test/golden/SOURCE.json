@@ -61,14 +61,13 @@
       "blob": "f06a450f0a3c6c8ed3cfda79f50a465cb1efd0e0"
     },
     {
-      "path": "corpus/generate-corpus.mjs",
-      "source": "apps/worker/test/fixtures/gcp-fastpath/generate-corpus.mjs",
-      "blob": "69d09ebfafc00e4a420a80be186cbd8fba5efa6f"
-    },
-    {
       "path": "../../scripts/gcp-fastpath-oracle-sqlite.mjs",
       "source": "apps/worker/scripts/gcp-fastpath-oracle-sqlite.mjs",
       "blob": "0bd534fb1354513cbf3df817e7b5171ef63b8001"
     }
-  ]
+  ],
+  "generator": {
+    "path": "apps/worker/test/fixtures/gcp-fastpath/generate-corpus.mjs",
+    "note": "Not copied: the corpus generator stays on the Q-1 branch (it imports Worker source by a computed path). The corpus JSON here is byte-identical to its committed output."
+  }
 }
