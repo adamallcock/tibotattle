@@ -172,6 +172,28 @@ async function shapeTables(pool, schema) {
   return tables;
 }
 
+/** The owner link, receipts and exact journal rows the v1.1 bridge wrote for one participant. */
+async function bridgeState(pool, schema, participantId) {
+  const link = (await pool.query(
+    `SELECT owner_digest, state, generation_id, head_revision::int AS head_revision, object_digest, manifest_digest
+       FROM ${q(schema, "storage_v11_owner_links")} WHERE participant_id = $1`, [participantId],
+  )).rows[0] ?? null;
+  const receipts = (await pool.query(
+    `SELECT event_digest, owner_digest, generation_id, manifest_digest, head_revision::int AS head_revision,
+            input_revision::int AS input_revision, to_char(from_day, 'YYYY-MM-DD') AS from_day,
+            to_char(through_day, 'YYYY-MM-DD') AS through_day
+       FROM ${q(schema, "storage_v11_event_sources")} WHERE participant_id = $1 ORDER BY head_revision`,
+    [participantId],
+  )).rows;
+  const journal = link === null ? [] : (await pool.query(
+    `SELECT kind, revision::int AS revision, event_digest, object_digest, content_digest,
+            event_tuple_version::int AS event_tuple_version
+       FROM ${q(schema, "storage_ingestion_changes")} WHERE owner_digest = $1 ORDER BY sequence`,
+    [link.owner_digest],
+  )).rows;
+  return { link, receipts, journal };
+}
+
 async function apiError(response, status, code) {
   assert.equal(response.status, status, `expected ${status} ${code}`);
   const body = await response.json();
@@ -621,6 +643,12 @@ test("PostgreSQL 17 runs a full v1.1 upload cycle with Worker-equal rows, replay
       assert.equal(emptyCandidate.state, "ready");
       readyDays.push({ day, manifestId: emptyCandidate.manifestId, manifestDigest: emptyCandidate.manifestDigest });
     }
+    // The v1.1 owner bridge journals only once the analytics source exists.
+    await primaryPool.query(
+      `INSERT INTO ${q(primarySchema, "storage_source_state")} (singleton, source_id, authority_epoch)
+       VALUES (1, 'synthetic-v11-live-source', 0)`,
+    );
+    assert.deepEqual(await bridgeState(primaryPool, primarySchema, participantId), { link: null, receipts: [], journal: [] });
     const activation = domainManifest(predecessor, readyDays);
     await apiError(await activateRoute.handler(deviceRequest(
       "/api/v1/me/telemetry-v11/domain-activate", "POST", { ...activation, unknownField: true },
@@ -663,6 +691,23 @@ test("PostgreSQL 17 runs a full v1.1 upload cycle with Worker-equal rows, replay
     assert.deepEqual(head.rows[0], {
       generation_id: generation.generationId, revision: 1, days: readyDays.length, consumed: true, input_revision: 1,
     });
+    // D1 ingestion-bridge 0001: one receipt and one exact owner-active row.
+    const firstBridge = await bridgeState(primaryPool, primarySchema, participantId);
+    assert.equal(firstBridge.receipts.length, 1);
+    const [firstReceipt] = firstBridge.receipts;
+    assert.deepEqual({ ...firstReceipt, event_digest: "<digest>", owner_digest: "<digest>" }, {
+      event_digest: "<digest>", owner_digest: "<digest>", generation_id: generation.generationId,
+      manifest_digest: activation.manifestDigest, head_revision: 1, input_revision: 0,
+      from_day: activation.fromDay, through_day: activation.throughDay,
+    });
+    assert.deepEqual(firstBridge.link, {
+      owner_digest: firstReceipt.owner_digest, state: "active", generation_id: generation.generationId,
+      head_revision: 1, object_digest: firstReceipt.event_digest, manifest_digest: activation.manifestDigest,
+    });
+    assert.deepEqual(firstBridge.journal, [{
+      kind: "owner-active", revision: 1, event_digest: firstReceipt.event_digest,
+      object_digest: firstReceipt.event_digest, content_digest: activation.manifestDigest, event_tuple_version: 1,
+    }]);
 
     // --------------------------------------- successor negotiation (v1.1) --
     const successor = await (await predecessorRoute.handler(deviceRequest(
@@ -676,6 +721,8 @@ test("PostgreSQL 17 runs a full v1.1 upload cycle with Worker-equal rows, replay
     assert.equal(unchanged.unchanged, true);
     assert.equal(unchanged.replay, true);
     assert.equal(unchanged.generationId, generation.generationId);
+    assert.deepEqual(await bridgeState(primaryPool, primarySchema, participantId), firstBridge,
+      "an unchanged acknowledgement writes no generation, head move or journal row");
 
     // A successor that drops an admitted occurrence of the previous generation
     // is refused: the day it replaces must carry every old row unchanged.
@@ -736,6 +783,19 @@ test("PostgreSQL 17 runs a full v1.1 upload cycle with Worker-equal rows, replay
     assert.deepEqual(movedHead.rows[0], {
       generation_id: successorGeneration.generationId, revision: 2, previous_generation_id: generation.generationId,
     });
+    const secondBridge = await bridgeState(primaryPool, primarySchema, participantId);
+    assert.equal(secondBridge.receipts.length, 2);
+    const secondReceipt = secondBridge.receipts[1];
+    assert.deepEqual([secondReceipt.generation_id, secondReceipt.head_revision, secondReceipt.owner_digest],
+      [successorGeneration.generationId, 2, firstReceipt.owner_digest]);
+    assert.deepEqual(secondBridge.link, {
+      owner_digest: firstReceipt.owner_digest, state: "active", generation_id: successorGeneration.generationId,
+      head_revision: 2, object_digest: secondReceipt.event_digest, manifest_digest: successorGeneration.manifestDigest,
+    });
+    assert.deepEqual(secondBridge.journal.map((row) => [row.kind, row.revision, row.object_digest, row.content_digest]), [
+      ["owner-active", 1, firstReceipt.event_digest, activation.manifestDigest],
+      ["owner-active", 2, secondReceipt.event_digest, successorGeneration.manifestDigest],
+    ]);
     // The published day's rows are immutable while the owner is active.
     await assert.rejects(primaryPool.query(
       `DELETE FROM ${q(primarySchema, "telemetry_v11_day_manifests")} WHERE id = $1`, [candidate.manifestId],
@@ -872,7 +932,7 @@ test("an accountless v1.1 owner negotiates successors, matches the Q-1 rows, and
       `INSERT INTO ${q(primarySchema, "accountless_enrollment_ledger")} (
          device_id, device_secret_hash, installation_principal_id, schema_version,
          policy_version, authorization_basis, state, issued_at, expires_at
-       ) VALUES ($1, $2, $3, 'accountless-enrollment-v1', 'accountless-opt-out-v1',
+       ) VALUES ($1, $2, $3, 'accountless-enrollment-v0.1', 'accountless-opt-out-v1',
          'accountless-policy-v1', 'active', $4, $5)`,
       [deviceId, bearerSecretHash(deviceId, secret), `synthetic-install-${deviceId}`, now, expiresAt],
     );
@@ -1050,12 +1110,21 @@ test("an accountless v1.1 owner negotiates successors, matches the Q-1 rows, and
       ))).json();
       days.push({ day, manifestId: empty.manifestId, manifestDigest: empty.manifestDigest });
     }
+    await primaryPool.query(
+      `INSERT INTO ${q(primarySchema, "storage_source_state")} (singleton, source_id, authority_epoch)
+       VALUES (1, 'synthetic-v11-live-source', 0)`,
+    );
     const activated = await activateRoute.handler(deviceRequest(
       "/api/v1/me/telemetry-v11/domain-activate", domainManifest(predecessor, days),
     ));
     assert.equal(activated.status, 201);
     const generation = await activated.json();
     assert.equal(generation.replay, false);
+    // The accountless head is eligible through its device's v1.1 grant chain.
+    const bridged = await bridgeState(primaryPool, primarySchema, participantId);
+    assert.deepEqual(bridged.receipts.map((row) => [row.generation_id, row.head_revision]), [[generation.generationId, 1]]);
+    assert.deepEqual(bridged.journal.map((row) => [row.kind, row.revision]), [["owner-active", 1]]);
+    assert.equal(bridged.link.state, "active");
     const successor = await (await predecessorRoute.handler(deviceRequest(
       "/api/v1/me/telemetry-v11/domain-predecessor", {},
     ))).json();

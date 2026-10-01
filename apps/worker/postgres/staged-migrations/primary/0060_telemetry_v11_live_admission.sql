@@ -35,12 +35,16 @@
 --   (5) Once the typed runtime contract is qualified, a raw JSON v1.1 record
 --       is refused (D1 typed-v11 0001 typed_v11_legacy_record_refusal).
 --
--- Not here (documented gaps, IN-2 continuation): the v1.1 owner bridge
--- (D1 ingestion-bridge 0001 storage_v11_head_* -> storage_v11_event_sources
--- -> storage_ingestion_changes), D1's community_snapshot_mutation_control /
--- community_daily_aggregate_rebuilds head side effects, and the chunk
--- admission window counter (telemetry_v1_chunk_admission_windows), which the
--- admission module enforces in its transaction instead.
+--   (6) The v1.1 owner bridge (D1 ingestion-bridge 0001): an eligible
+--       accepted head change records a storage_v11_event_sources receipt and
+--       one exact owner-active journal row, as 0055 does for v1.2.
+--
+-- Not here (documented gaps, IN-2 continuation): the bridge's pending read
+-- and backfill for heads accepted before storage_source_state existed, D1's
+-- community_snapshot_mutation_control / community_daily_aggregate_rebuilds
+-- head side effects, and the chunk admission window counter
+-- (telemetry_v1_chunk_admission_windows), which the admission module
+-- enforces in its transaction instead.
 --
 -- Every RAISE carries a constant message and ERRCODE; no value is
 -- interpolated. Nothing here deletes, rewrites or backfills a row.
@@ -216,3 +220,134 @@ $$;
 CREATE TRIGGER telemetry_v11_typed_json_refusal
   BEFORE INSERT ON telemetry_v11_records
   FOR EACH ROW EXECUTE FUNCTION telemetry_v11_typed_json_refusal();
+
+-- (6) v1.1 owner bridge: D1 ingestion-bridge 0001 storage_v11_head_insert /
+-- storage_v11_head_update -> storage_v11_head_request_apply ->
+-- storage_v11_event_publish, as 0055 ports the v1.2 bridge. An eligible
+-- accepted v1.1 head change mints or reuses the shared owner link, records
+-- one storage_v11_event_sources receipt and appends one exact owner-active
+-- journal row (storage_journal_append, 0046) whose object digest is that
+-- receipt and whose content digest is the generation's manifest digest; the
+-- link then names the head (D1 updates generation_id, head_revision,
+-- object_digest and manifest_digest). D1 skips the receipt when the active
+-- link already names this generation and revision.
+--
+-- The 0014 telemetry_v11_domain_head_source_revision trigger stays: AFTER
+-- triggers fire in name order, so this bridge runs first, and once the owner
+-- has a journal head the 0058 emitter writes no version-0 row for it. Lock
+-- order is 0055's: participant (held FOR SHARE by the activation's TA-1
+-- check), v1.1 head (the firing statement), retention marker, owner link,
+-- then storage_source_state and the owner revision head inside the append.
+-- Eligibility is 0055's storage_v12_bridge_eligible (community_public_source_
+-- owners with the head's device), read again under the link lock. Without
+-- storage_source_state, in a transfer session, or for an erased owner the
+-- bridge does nothing; a pending read and backfill for such heads are the
+-- next IN-2 item, as 0055's are for v1.2.
+CREATE FUNCTION storage_v11_bridge_head(
+  participant_id_value text,
+  generation_id_value text,
+  head_revision_value bigint
+)
+RETURNS boolean
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+DECLARE
+  domain_row telemetry_v11_domains%ROWTYPE;
+  owner_digest_value text;
+  link_state text;
+  link_generation text;
+  link_revision bigint;
+  event_digest_value text;
+BEGIN
+  IF participant_id_value IS NULL OR generation_id_value IS NULL
+     OR head_revision_value IS NULL OR head_revision_value < 1 THEN
+    RETURN false;
+  END IF;
+  IF storage_journal_transfer_session() THEN
+    RETURN false;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM storage_source_state source WHERE source.singleton = 1) THEN
+    RETURN false;
+  END IF;
+  PERFORM 1 FROM participants participant
+   WHERE participant.id = participant_id_value AND participant.state = 'active'
+   FOR SHARE;
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+  SELECT * INTO domain_row
+    FROM telemetry_v11_domains domain
+   WHERE domain.id = generation_id_value AND domain.participant_id = participant_id_value;
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+  PERFORM 1 FROM accountless_public_history_retention marker
+   WHERE marker.participant_id = participant_id_value
+   FOR SHARE;
+  IF NOT storage_v12_bridge_eligible(participant_id_value, domain_row.device_id) THEN
+    RETURN false;
+  END IF;
+
+  owner_digest_value := storage_owner_link_ensure(participant_id_value, 'withdrawn');
+  SELECT owner_link.state, owner_link.generation_id, owner_link.head_revision
+    INTO link_state, link_generation, link_revision
+    FROM storage_v11_owner_links owner_link
+   WHERE owner_link.participant_id = participant_id_value
+     AND owner_link.owner_digest = owner_digest_value
+   FOR UPDATE;
+  IF NOT FOUND OR link_state = 'erased' THEN
+    RETURN false;
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM storage_owner_revisions head
+     WHERE head.owner_digest = owner_digest_value AND head.state = 'erased'
+  ) THEN
+    RETURN false;
+  END IF;
+  IF NOT storage_v12_bridge_eligible(participant_id_value, domain_row.device_id) THEN
+    RETURN false;
+  END IF;
+  -- D1: (link.generation_id IS NOT NEW.generation_id OR link.head_revision
+  -- IS NOT NEW.head_revision OR link.state != 'active').
+  IF link_state = 'active' AND link_generation IS NOT DISTINCT FROM generation_id_value
+     AND link_revision IS NOT DISTINCT FROM head_revision_value THEN
+    RETURN false;
+  END IF;
+
+  -- Random and opaque, like D1's lower(hex(randomblob(32))); recorded_ms is
+  -- whole seconds, like D1's strftime('%s','now')*1000.
+  event_digest_value := encode(
+    sha256(convert_to(gen_random_uuid()::text || gen_random_uuid()::text, 'UTF8')), 'hex');
+  INSERT INTO storage_v11_event_sources (
+    event_digest, owner_digest, participant_id, device_id, generation_id, manifest_digest,
+    from_day, through_day, head_revision, input_revision, recorded_ms
+  ) VALUES (
+    event_digest_value, owner_digest_value, participant_id_value, domain_row.device_id,
+    domain_row.id, domain_row.manifest_digest, domain_row.from_day, domain_row.through_day,
+    head_revision_value, domain_row.input_revision,
+    floor(extract(epoch FROM clock_timestamp()))::bigint * 1000
+  );
+  PERFORM storage_journal_append('owner-active', owner_digest_value, event_digest_value,
+    event_digest_value, domain_row.manifest_digest);
+  UPDATE storage_v11_owner_links
+     SET state = 'active', generation_id = generation_id_value, head_revision = head_revision_value,
+         object_digest = event_digest_value, manifest_digest = domain_row.manifest_digest
+   WHERE participant_id = participant_id_value AND owner_digest = owner_digest_value;
+  RETURN true;
+END;
+$$;
+
+CREATE FUNCTION storage_v11_head_publication()
+RETURNS trigger
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+  IF TG_OP = 'INSERT'
+     OR OLD.generation_id IS DISTINCT FROM NEW.generation_id
+     OR OLD.revision IS DISTINCT FROM NEW.revision THEN
+    PERFORM storage_v11_bridge_head(NEW.participant_id, NEW.generation_id, NEW.revision::bigint);
+  END IF;
+  RETURN NULL;
+END;
+$$;
+CREATE TRIGGER storage_v11_head_publication
+  AFTER INSERT OR UPDATE ON telemetry_v11_domain_heads
+  FOR EACH ROW EXECUTE FUNCTION storage_v11_head_publication();
