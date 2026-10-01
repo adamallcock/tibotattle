@@ -123,6 +123,7 @@ const surfaceCoverage = Object.entries(local.bySurface).map(([surface, row]) => 
   cost_share: round(row.totalUsd / totalCost),
   standard_events: row.speedModeCounts?.standard ?? 0,
   fast_events: row.speedModeCounts?.fast ?? 0,
+  ultrafast_events: row.speedModeCounts?.ultrafast ?? 0,
   unknown_speed_events: row.speedModeCounts?.unknown ?? 0,
 }));
 
@@ -482,7 +483,7 @@ artifact.manifest.blocks.push(
     id: "plan_account_context",
     type: "markdown",
     sourceId: "provider_crosscheck",
-    body: `### Account scope and plan\n\nThe current account is stored only as a Keychain-HMAC pseudonym; raw email and provider account identifiers are never written. The provider-reported \`planType: ${crosscheck.scope.providerPlanType}\` names the plan directly (pro is the 20x tier, prolite the 5x tier); no separate plan-variant layer is inferred. Historical rollouts remain account-unattributed unless a fresh local marker existed at collection time.\n\nProspective account-scoped collector evidence is currently **${crosscheck.comparisons.prospectiveAccountScoped?.status ?? "unavailable"}** with ${number(crosscheck.comparisons.prospectiveAccountScoped?.eventCount ?? 0, 0)} matched rollout event(s). When available it is partitioned by pseudonymous scope, but remains partial-marker coverage rather than a full-day reconciliation. Report and inference group keys include the account scope and provider plan_type so two accounts cannot be pooled.`,
+    body: `### Account scope and plan\n\nThe current account is stored only as a Keychain-HMAC pseudonym; raw email and provider account identifiers are never written. The provider-reported \`planType: ${crosscheck.scope.providerPlanType}\` names the plan directly (product policy labels pro as Pro 10x, prolite as Pro 5x, and promax as Pro Max 25x); no separate plan-variant layer is inferred. Historical rollouts remain account-unattributed unless a fresh local marker existed at collection time.\n\nProspective account-scoped collector evidence is currently **${crosscheck.comparisons.prospectiveAccountScoped?.status ?? "unavailable"}** with ${number(crosscheck.comparisons.prospectiveAccountScoped?.eventCount ?? 0, 0)} matched rollout event(s). When available it is partitioned by pseudonymous scope, but remains partial-marker coverage rather than a full-day reconciliation. Report and inference group keys include the account scope and provider plan_type so two accounts cannot be pooled.`,
   },
   {
     id: "learning_loop",

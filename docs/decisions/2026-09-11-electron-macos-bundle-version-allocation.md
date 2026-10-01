@@ -64,3 +64,39 @@ all earlier allocations remain unchanged. The semantic version is `0.1.22`,
 while the independently selected provenance build number continues to bind
 source candidates and artifact receipts. Allocation is not evidence of a build,
 signature, installed update, or publication.
+
+
+## 0.1.23 and 0.1.24 allocations
+
+The published 0.1.23 Mac artifacts use allocation `1030`. Release preparation
+reserves `0.1.24` → `1031` for both Mac architectures, preserving every earlier
+allocation. The independently selected provenance build remains separate.
+This allocation permits candidate preparation and does not establish signing,
+installed qualification, update delivery, or publication.
+
+## 2026-09-26 amendment: published 0.1.24 allocation
+
+The `1031` candidate above was superseded before publication after its
+native-upgrade qualification exposed startup diagnostics occupying the migration
+target. The released 0.1.24 allocation is `1032` for both Mac architectures, as
+recorded in `config/macos-bundle-version-plan.cjs`. A successor stable version
+requires a new reviewed allocation; neither `1031` nor an inferred next number
+is available for it. Allocation alone remains separate from signed-artifact and
+installed-update evidence.
+
+## 2026-09-26 amendment: 0.1.25 candidate allocation
+
+For the 0.1.25 successor, allocate stable Mac bundle version `1033` to both
+architectures. This follows the released 0.1.24 allocation `1032`; the
+superseded unpublished `1031` candidate is not reused. The provenance build
+number remains independent. This allocation enables candidate packaging and
+does not claim signing, notarization, installed qualification, or publication.
+
+## 2026-09-27 amendment: 0.1.26 successor allocation
+
+The owner selected 0.1.26 after holding the signed but unpublished 0.1.25
+candidate. Allocate stable Mac bundle version `1034` to both architectures,
+following 0.1.25's `1033` without reusing or altering its tag or artifacts.
+The independently selected provenance build number still binds each new
+artifact. This allocation does not claim a signed build, installed credential
+qualification, updater delivery, or publication.

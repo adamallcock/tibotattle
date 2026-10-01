@@ -17,46 +17,23 @@ const NULL_DEVICE = process.platform === "win32" ? "NUL" : "/dev/null";
 const TEST_REPORTER_ENVIRONMENT_VARIABLE = "USAGE_MONITOR_TEST_LANE_REPORTER";
 const SUPPORTED_TEST_REPORTERS = new Set(["dot", "spec", "tap"]);
 
-// The app-bundle test file explicitly tags its three package-building tests
-// with macOSArtifactTest. The source lane activates that tag's source scope,
-// so a future title edit cannot silently change which test bodies run.
-export const MACOS_SOURCE_TEST_FILES = Object.freeze([
-  "test/release-agent.test.js",
-  "test/release-operation.test.js",
-  "test/macos-release-journal.test.js",
-  "test/i18n-foundation.test.js",
-  "test/macos-localization.test.js",
-  "test/macos-app-bundle.test.js",
+export const MACOS_TRANSITION_TEST_FILES = Object.freeze([
   "test/macos-keychain-migration-artifact.test.js",
-  "test/macos-keychain-migration-runner.test.js",
-  "test/macos-keychain-migration-ui.test.js",
-]);
-
-export const MACOS_ARTIFACT_TEST_FILES = Object.freeze([
-  "test/release-operation.test.js",
-  "test/macos-release-journal.test.js",
-  "test/macos-app-bundle.test.js",
-  "test/macos-keychain-migration-artifact.test.js",
-  "test/macos-keychain-migration-runner.test.js",
-  "test/macos-keychain-migration-ui.test.js",
   "test/macos-updater.test.js",
-  "test/macos-updater-release.test.mjs",
-]);
-
-export const MACOS_SMOKE_TEST_FILES = Object.freeze([
-  "test/macos-test-build.test.mjs",
+  "test/electron-sparkle-transition.test.js",
+  "test/generate-sparkle-appcast-stable-feed.test.js",
+  "test/sparkle-signed-feed-validation.test.js",
+  "test/sparkle-remote-inspection.test.js",
+  "test/publish-sparkle-update.test.js",
 ]);
 
 export const LANE_REGRESSION_TEST_FILES = Object.freeze([
   "test/test-lanes.test.js",
-  "test/benchmark-test-lanes.test.js",
 ]);
 
 const ALL_EXPLICIT_TEST_FILES = Object.freeze([
   ...new Set([
-    ...MACOS_SOURCE_TEST_FILES,
-    ...MACOS_ARTIFACT_TEST_FILES,
-    ...MACOS_SMOKE_TEST_FILES,
+    ...MACOS_TRANSITION_TEST_FILES,
     ...LANE_REGRESSION_TEST_FILES,
     ...PORTABLE_TEST_FILES,
   ]),
@@ -65,10 +42,8 @@ const ALL_EXPLICIT_TEST_FILES = Object.freeze([
 const LANE_ORDER = Object.freeze([
   "public-site",
   "worker",
-  "macos-source",
+  "macos-transition",
   "i18n",
-  "macos-smoke",
-  "macos-artifact",
   "full",
 ]);
 
@@ -78,15 +53,14 @@ const VALID_COMMANDS = new Set([
   "fast",
   "changed",
   "plan",
-  "macos-source",
-  "macos-smoke",
-  "macos-artifact",
+  "macos-transition",
   "public-site",
   "worker",
+  "i18n",
 ]);
 
 // These paths belong only to the hosted/public build boundary. Shared browser
-// assets remain broad because the native app embeds them as well. Unknown
+// assets remain broad because the Electron app embeds them as well. Unknown
 // Worker tools also remain broad: scripts:check is an explicit ownership list.
 const PUBLIC_SITE_TOOL_PATHS = new Set([
   "scripts/build-public-release-site.js", "scripts/preview-public-release-site.js",
@@ -145,58 +119,29 @@ function isDocumentationPath(path) {
     || path.endsWith(".md");
 }
 
-function isNativeAppPath(path) {
-  return path.startsWith("apps/macos/")
-    || path === "scripts/build-macos-app.js";
-}
-
-function nativePathNeedsArtifactLane(path) {
-  return path === "scripts/build-macos-app.js"
-    || path.startsWith("apps/macos/Assets/")
-    || path.startsWith("apps/macos/Resources/");
-}
+const MACOS_TRANSITION_PATHS = new Set([
+  "scripts/prepare-sparkle-framework.js",
+  "scripts/generate-sparkle-appcast.js",
+  "scripts/publish-sparkle-update.js",
+  "scripts/electron-sparkle-transition.js",
+  "scripts/macos-release-core.js",
+  "scripts/macos-updater-core.js",
+  ...MACOS_TRANSITION_TEST_FILES,
+]);
 
 function classifyKnownPath(path, lanes) {
   if (PUBLIC_SITE_TOOL_PATHS.has(path)) { lanes.add("public-site"); return true; }
   if (WORKER_CONFIG_PATHS.has(path) || ["apps/worker/src/", "apps/worker/test/", "apps/worker/migrations/", "apps/worker/deletion-ledger-migrations/"]
     .some((prefix) => path.startsWith(prefix))) { lanes.add("worker"); return true; }
-  if (isNativeAppPath(path)) {
-    lanes.add("macos-source");
-    lanes.add("macos-smoke");
-    if (nativePathNeedsArtifactLane(path)) lanes.add("macos-artifact");
-    return true;
-  }
-  if (path === "scripts/prepare-sparkle-framework.js") {
-    lanes.add("macos-artifact");
-    return true;
-  }
-  if (path === "test/macos-app-bundle.test.js") {
-    lanes.add("macos-source");
-    lanes.add("macos-artifact");
-    return true;
-  }
-  if (path === "test/macos-keychain-migration-artifact.test.js"
-      || path === "test/macos-keychain-migration-runner.test.js"
-      || path === "test/macos-keychain-migration-ui.test.js") {
-    lanes.add("macos-source");
-    lanes.add("macos-artifact");
-    return true;
-  }
-  if (path === "test/macos-localization.test.js") {
-    lanes.add("macos-source");
-    return true;
-  }
-  if (path === "test/macos-test-build.test.mjs") {
-    lanes.add("macos-smoke");
-    return true;
-  }
-  if (path === "test/macos-updater.test.js"
-      || path === "test/macos-updater-release.test.mjs") {
-    lanes.add("macos-artifact");
+  if (MACOS_TRANSITION_PATHS.has(path)) {
+    lanes.add("macos-transition");
     return true;
   }
   if (path.startsWith("packages/i18n/")
-      || path === "scripts/generate-i18n-browser-mirror.js") {
+      || path === "scripts/generate-i18n-browser-mirror.js"
+      || path === "scripts/generate-i18n-electron-copy.js"
+      || path === "apps/electron/desktop-copy-source.js"
+      || path === "apps/electron/desktop-copy.js") {
     lanes.add("i18n");
     return true;
   }
@@ -226,9 +171,6 @@ export function selectTestLanes(paths, { full = false } = {}) {
     if (!classifyKnownPath(path, lanes)) unknownPaths.push(path);
   }
 
-  if (full && (lanes.has("macos-source") || lanes.has("macos-smoke"))) {
-    lanes.add("macos-artifact");
-  }
   if (unknownPaths.length > 0) {
     return Object.freeze({
       lanes: Object.freeze(["full"]),
@@ -418,16 +360,6 @@ async function runNodeTests(arguments_, { environment = process.env } = {}) {
   ], { env: environment });
 }
 
-function assertMacOSSmokeBuildSupported() {
-  if (process.platform !== "darwin"
-      || process.arch !== "arm64"
-      || process.version !== "v26.2.0") {
-    throw new Error(
-      "macos-smoke requires macOS arm64 with pinned Node v26.2.0; no smoke build was run",
-    );
-  }
-}
-
 async function runLane(lane) {
   const hosted = hostedLaneCommands(lane);
   if (hosted) {
@@ -442,60 +374,19 @@ async function runLane(lane) {
     return;
   }
   if (lane === "i18n") {
-    await runNodeTests(["--test-concurrency=1", "test/i18n-foundation.test.js"]);
-    await runCommand(NPM_COMMAND, ["run", "product:ui:test"]);
-    return;
-  }
-  if (lane === "macos-source") {
-    await runNodeTests(["--test-concurrency=1", "test/release-agent.test.js",
-      "test/release-operation.test.js", "test/macos-release-journal.test.js"]);
+    await runCommand(NPM_COMMAND, ["run", "i18n:browser:check"]);
+    await runCommand(NPM_COMMAND, ["run", "i18n:electron:check"]);
     await runNodeTests([
       "--test-concurrency=1",
       "test/i18n-foundation.test.js",
-      "test/macos-localization.test.js",
+      "apps/electron/test/i18n-copy.test.mjs",
+      "apps/electron/test/desktop-menu-tray.test.mjs",
     ]);
-    await runNodeTests([
-      "--test-concurrency=1",
-      "test/macos-app-bundle.test.js",
-      "test/macos-keychain-migration-artifact.test.js",
-      "test/macos-keychain-migration-runner.test.js",
-      "test/macos-keychain-migration-ui.test.js",
-    ], {
-      environment: {
-        ...process.env,
-        USAGE_MONITOR_TEST_LANES: "1",
-        USAGE_MONITOR_MACOS_TEST_SCOPE: "source",
-      },
-    });
+    await runCommand(NPM_COMMAND, ["run", "product:ui:test"]);
     return;
   }
-  if (lane === "macos-smoke") {
-    assertMacOSSmokeBuildSupported();
-    await runNodeTests(["--test-concurrency=1", ...MACOS_SMOKE_TEST_FILES]);
-    return;
-  }
-  if (lane === "macos-artifact") {
-    await runNodeTests(["--test-concurrency=1", "test/release-operation.test.js",
-      "test/macos-release-journal.test.js"]);
-    await runCommand(NPM_COMMAND, ["run", "product:macos:updater:prepare"]);
-    await runNodeTests([
-      "--test-concurrency=1",
-      "test/macos-app-bundle.test.js",
-      "test/macos-keychain-migration-artifact.test.js",
-      "test/macos-keychain-migration-runner.test.js",
-      "test/macos-keychain-migration-ui.test.js",
-    ], {
-      environment: {
-        ...process.env,
-        USAGE_MONITOR_TEST_LANES: "1",
-        USAGE_MONITOR_MACOS_TEST_SCOPE: "artifact",
-      },
-    });
-    await runNodeTests([
-      "--test-concurrency=1",
-      "test/macos-updater.test.js",
-      "test/macos-updater-release.test.mjs",
-    ]);
+  if (lane === "macos-transition") {
+    await runCommand(NPM_COMMAND, ["run", "product:macos:transition:test"]);
     return;
   }
   if (lane === "full") {
@@ -503,7 +394,6 @@ async function runLane(lane) {
       env: {
         ...process.env,
         USAGE_MONITOR_TEST_LANES: "0",
-        USAGE_MONITOR_MACOS_TEST_SCOPE: "all",
       },
     });
     return;
@@ -545,14 +435,13 @@ function usage() {
 Lanes:
   preflight       Validate selected tests, whitespace, docs governance, and agent guidance.
   portable        Run the explicit platform-neutral Node, web, and companion manifest.
-  fast            Run fast macOS source/configuration checks.
+  fast            Run the retained macOS upgrade-transition contract tests.
   changed         Select conservative lanes from branch plus active-worktree paths.
   plan            Print the selected lanes without running them.
-  macos-source    Run only source/configuration assertions from the macOS suite.
-  macos-smoke     Build one test-profile development app and smoke it (pinned builder only).
-  macos-artifact  Prepare Sparkle and run the native artifact and updater tests.
+  macos-transition Prepare Sparkle and test both incoming native upgrade feeds.
+  i18n            Run canonical browser and Electron localization parity gates.
   worker          Run the complete Worker owning gate, including dry builds.
-  public-site     Run public-site/UI and Worker owning gates without native signing.
+  public-site     Run public-site/UI and Worker owning gates.
 
 Options for changed and plan:
   --base <rev>    Include <rev>...HEAD plus staged, unstaged, and untracked paths.
@@ -581,7 +470,7 @@ export async function main(argv = process.argv.slice(2)) {
     console.log(JSON.stringify(selection, null, 2));
     if (options.command === "plan") return;
   } else if (options.command === "fast") {
-    selection = Object.freeze({ lanes: Object.freeze(["macos-source"]) });
+    selection = Object.freeze({ lanes: Object.freeze(["macos-transition"]) });
   } else {
     selection = Object.freeze({ lanes: Object.freeze([options.command]) });
   }

@@ -143,6 +143,12 @@ describe("GitHub distribution snapshot history", () => {
       "v0.1.12",
       "v0.1.11",
     ]);
+    expect(initial.releases[0]?.installerDownloads).toEqual({
+      macArm64: null,
+      macX64: null,
+      windowsX64: null,
+      linuxX64: null,
+    });
 
     const second = await syncGithubDistributionSnapshots(
       db(),
@@ -164,6 +170,57 @@ describe("GitHub distribution snapshot history", () => {
         counterRegressions: 0,
       },
     });
+  });
+
+  it("attributes only named installer assets and keeps absent variants distinct from zero", async () => {
+    const releases = [{
+      id: 24,
+      tag_name: "v0.1.24",
+      published_at: "2026-09-23T10:00:00.000Z",
+      draft: false,
+      prerelease: false,
+      assets: [
+        { id: 1, name: "TiboTattle-0.1.24-mac-arm64.dmg", download_count: 20 },
+        { id: 2, name: "TiboTattle-0.1.24-mac-x64.dmg", download_count: 0 },
+        { id: 3, name: "TiboTattle-0.1.24-Windows-x64.exe", download_count: 15 },
+        { id: 4, name: "TiboTattle-0.1.24-linux-x86_64.AppImage", download_count: 17 },
+        { id: 5, name: "TiboTattle-0.1.24-mac-arm64.zip", download_count: 13 },
+        { id: 6, name: "TiboTattle-0.1.24-mac-arm64.dmg.blockmap", download_count: 14 },
+        { id: 7, name: "TiboTattle-0.1.24-unclassified.dmg", download_count: 3 },
+      ],
+    }, {
+      id: 18,
+      tag_name: "v0.1.18",
+      published_at: "2026-09-05T10:00:00.000Z",
+      draft: false,
+      prerelease: false,
+      assets: [
+        { id: 8, name: "TiboTattle-0.1.18-macOS-arm64.dmg", download_count: 4 },
+        { id: 9, name: "TiboTattle-0.1.18-macOS-x64.dmg", download_count: 5 },
+      ],
+    }];
+    const synced = await syncGithubDistributionSnapshots(
+      db(), { enabled: true }, FIRST_SYNC, githubFetcher(releases),
+    );
+    expect(synced.code).toBe("GITHUB_SYNCED");
+    const snapshot = await readGithubDistributionSnapshot(db(), FIRST_SYNC);
+    expect(snapshot.releases[0]).toMatchObject({
+      installerDownloads: {
+        macArm64: 20,
+        macX64: 0,
+        windowsX64: 15,
+        linuxX64: 17,
+      },
+      dmgDownloads: 23,
+      allAssetDownloads: 82,
+    });
+    expect(snapshot.releases[1]?.installerDownloads).toEqual({
+      macArm64: 4,
+      macX64: 5,
+      windowsX64: null,
+      linuxX64: null,
+    });
+    expect(snapshot.summary?.dmgDownloads).toBe(32);
   });
 
   it("keeps the last complete snapshot visible after a GitHub failure", async () => {

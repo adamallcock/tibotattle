@@ -15,6 +15,10 @@ import {
 } from "@app-usagemonitor/telemetry-contract";
 import { sha256Hex } from "./crypto";
 import { ApiError } from "./errors";
+import { telemetryV11LegacyProjection } from "./telemetry-v11-compatibility";
+import { typedTelemetryReadNamespace } from "./typed-telemetry-read-layout";
+import { readTypedV11ChunkRecords } from "./typed-v11-analysis-reader";
+export { telemetryV11LegacyProjection } from "./telemetry-v11-compatibility";
 import {
   assertTelemetryTransportWriteAllowed,
   type TelemetryTransportPrincipal,
@@ -73,23 +77,6 @@ function mapStagingError(error: unknown): ApiError {
     return new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
   }
   return error instanceof ApiError ? error : new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
-}
-
-/** Server-derived compatibility evidence, never accepted from a client field. */
-export function telemetryV11LegacyProjection(stream: TelemetryV11Stream, record: TelemetryV11Record): {
-  occurrenceId: string; canonicalRecord: string;
-} | null {
-  const copy = { ...record } as Record<string, unknown>;
-  delete copy.accountPlanAttribution;
-  copy.schemaVersion = stream === "usage" ? "usage-event-v1.0"
-    : stream === "quota" ? "quota-observation-v1.0" : "session-dimension-v1.0";
-  const anchor = telemetryV11RecordAnchor(stream, record);
-  const occurrenceId = stream === "quota"
-    ? `q:${Date.parse(anchor.observedAt)}:${copy.limitId}:${copy.slot}` : anchor.occurrenceId;
-  if (stream === "quota" && (copy.usedPercent === null || copy.windowDurationMinutes === null
-      || copy.resetsAt === null || occurrenceId.length > 128)) return null;
-  if (stream === "quota") copy.observationId = occurrenceId;
-  return { occurrenceId, canonicalRecord: canonicalTelemetryV11Json(copy) };
 }
 
 async function manifestByDigest(
@@ -317,6 +304,7 @@ export async function* telemetryV11ExportEntries(
 ): AsyncGenerator<object> {
   if (!participantId || !Number.isFinite(Date.parse(createdThrough))
       || new Date(createdThrough).toISOString() !== createdThrough) throw new ApiError(500, "INTERNAL_ERROR");
+  const typedNamespace = await typedTelemetryReadNamespace(db);
   type Cursor = { createdAt: string; id: string } | null;
   type DayRow = { id: string; created_at: string; manifest_json: string; state: string; active_when_read: number };
   type ChunkRow = { id: string; created_at: string; manifest_id: string; chunk_id: string; chunk_digest: string;
@@ -361,7 +349,9 @@ export async function* telemetryV11ExportEntries(
     ).bind(participantId, createdThrough, ...cursorBindings(cursor))
       .first<ChunkRow>();
     if (!row) break;
-    const stored = await db.prepare(
+    const stored = typedNamespace ? { results: await readTypedV11ChunkRecords(db, {
+      sourceNamespace: typedNamespace, participantId, chunkId: row.id, expectedCount: row.record_count,
+    }) } : await db.prepare(
       "SELECT record_json FROM telemetry_v11_records WHERE chunk_id = ? ORDER BY observed_at, occurrence_id LIMIT 201",
     ).bind(row.id).all<{ record_json: string }>();
     if (stored.results.length > 200 || stored.results.length !== row.record_count) throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");

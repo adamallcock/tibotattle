@@ -30,7 +30,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 1
+          # Documentation validation binds current-status source_commit to a
+          # local ancestor, so this qualification checkout needs full history.
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Verify the selected revision is immutable

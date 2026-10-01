@@ -3,29 +3,39 @@
 // surfaces are shipped as ordinary static ES modules, and a locale choice must
 // work while the local companion is offline.
 
-import { CATALOGS } from "./i18n.generated.js";
+import {
+  CATALOGS,
+  canonicalizeLocale,
+  DEFAULT_LOCALE as CANONICAL_DEFAULT_LOCALE,
+  isLanguagePreference as canonicalIsLanguagePreference,
+  LANGUAGE_OPTIONS as CANONICAL_LANGUAGE_OPTIONS,
+  negotiateLocale as canonicalNegotiateLocale,
+  SUPPORTED_LOCALES as CANONICAL_SUPPORTED_LOCALES,
+  SYSTEM_LOCALE_PREFERENCE,
+} from "./i18n.generated.js";
 
 export const LOCALIZATION_SCHEMA_VERSION = "tibotattle-localization-v2";
-export const SYSTEM_LANGUAGE_PREFERENCE = "system";
-export const DEFAULT_LOCALE = "en-US";
-export const SUPPORTED_LOCALES = Object.freeze([
-  "en-US",
-  "zh-Hans",
-  "es",
-]);
+// Keep these browser names stable while the package owns the locale policy.
+// The generated mirror is static so this remains safe for the offline/public
+// browser boundary.
+export const SYSTEM_LANGUAGE_PREFERENCE = SYSTEM_LOCALE_PREFERENCE;
+export const DEFAULT_LOCALE = CANONICAL_DEFAULT_LOCALE;
+export const SUPPORTED_LOCALES = CANONICAL_SUPPORTED_LOCALES;
 export const LANGUAGE_PREFERENCE_STORAGE_KEY =
   "tibotattle.language-preference.v1";
 
-export const LANGUAGE_OPTIONS = Object.freeze([
+const BROWSER_LANGUAGE_LABELS = Object.freeze({
+  [SYSTEM_LANGUAGE_PREFERENCE]: "System",
+  "en-US": "English",
+  "zh-Hans": "Simplified Chinese",
+  es: "Spanish",
+});
+export const LANGUAGE_OPTIONS = Object.freeze(CANONICAL_LANGUAGE_OPTIONS.map((option) =>
   Object.freeze({
-    id: SYSTEM_LANGUAGE_PREFERENCE,
-    label: "System",
-    nativeLabel: "System",
-  }),
-  Object.freeze({ id: "en-US", label: "English", nativeLabel: "English" }),
-  Object.freeze({ id: "zh-Hans", label: "Simplified Chinese", nativeLabel: "简体中文" }),
-  Object.freeze({ id: "es", label: "Spanish", nativeLabel: "Español" }),
-]);
+    ...option,
+    label: BROWSER_LANGUAGE_LABELS[option.id],
+  })
+));
 
 // These mirror the minimum point/span gates in `fitReset` in the weekly
 // calibration contract. The browser catalog cannot import the Node-only
@@ -59,19 +69,7 @@ const RTL_LANGUAGES = new Set([
 ]);
 const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
 
-export function canonicalLocale(value) {
-  if (typeof value !== "string" || value.trim() === "") return null;
-  try {
-    return Intl.getCanonicalLocales(value.trim())[0] ?? null;
-  } catch {
-    return null;
-  }
-}
-
-function requestedValues(value) {
-  if (Array.isArray(value)) return value;
-  return value == null ? [] : [value];
-}
+export const canonicalLocale = canonicalizeLocale;
 
 function localeParts(value) {
   const canonical = canonicalLocale(value);
@@ -93,64 +91,14 @@ function localeParts(value) {
   };
 }
 
-function normalizedSupportedLocales(supportedLocales) {
-  if (!Array.isArray(supportedLocales) || supportedLocales.length === 0) {
-    throw new TypeError("At least one supported locale is required");
-  }
-  const result = [];
-  for (const value of supportedLocales) {
-    const canonical = canonicalLocale(value);
-    if (canonical === null) {
-      throw new RangeError("Supported locales must be valid BCP 47 tags");
-    }
-    if (!result.includes(canonical)) result.push(canonical);
-  }
-  return result;
-}
-
-/**
- * Resolve a requested locale without treating Traditional Chinese as a match
- * for a Simplified-Chinese translation. Generic `zh` is intentionally not
- * enough evidence to select `zh-Hans`: its script is ambiguous.
- */
-export function negotiateLocale(
-  requestedLocales,
-  supportedLocales = SUPPORTED_LOCALES,
-  fallbackLocale = DEFAULT_LOCALE,
-) {
-  const supported = normalizedSupportedLocales(supportedLocales);
-  const fallback = canonicalLocale(fallbackLocale);
-  const resolvedFallback = fallback && supported.includes(fallback)
-    ? fallback
-    : supported[0];
-
-  for (const requestedValue of requestedValues(requestedLocales)) {
-    const requested = localeParts(requestedValue);
-    if (requested === null) continue;
-    if (supported.includes(requested.canonical)) return requested.canonical;
-
-    if (requested.language === "zh") {
-      const isSimplified = requested.script === "Hans"
-        || ["CN", "SG"].includes(requested.region);
-      if (isSimplified && supported.includes("zh-Hans")) return "zh-Hans";
-      continue;
-    }
-
-    const languageMatch = supported.find((candidate) =>
-      localeParts(candidate)?.language === requested.language);
-    if (languageMatch) return languageMatch;
-  }
-  return resolvedFallback;
-}
+export const negotiateLocale = canonicalNegotiateLocale;
 
 export function directionForLocale(locale) {
   const language = localeParts(locale)?.language;
   return language && RTL_LANGUAGES.has(language) ? "rtl" : "ltr";
 }
 
-export function isLanguagePreference(value) {
-  return value === SYSTEM_LANGUAGE_PREFERENCE || SUPPORTED_LOCALES.includes(value);
-}
+export const isLanguagePreference = canonicalIsLanguagePreference;
 
 function interpolate(message, values = {}) {
   if (typeof message !== "string") return "";
@@ -167,13 +115,26 @@ function interpolate(message, values = {}) {
 // product-owned legacy nodes only.
 export const WEB_MESSAGES = Object.freeze({
   ...Object.fromEntries(Object.keys(CATALOGS[DEFAULT_LOCALE])
-    .filter((key) => key.startsWith("contribution.")
+    .filter((key) => key.startsWith("allowance.")
+      || key.startsWith("trends.")
+      || key.startsWith("contribution.")
+      || key.startsWith("continuityConsent.")
+      || key.startsWith("page.")
+      || key.startsWith("reporting.")
+      || key.startsWith("setup.")
       || key.startsWith("workUsage.")
       || key.startsWith("performance.")
+      || key.startsWith("performanceConsent.")
+      || key === "dashboard.pricing.speedNote"
+      || key === "accounting.pricingDisclosure"
       || key.startsWith("appearance.")
+      || key.startsWith("site.features.")
+      || key.startsWith("accounting.cacheContinuity.matrix.")
+      || key.startsWith("trends.")
       || key.startsWith("electron.")
-      || key.startsWith("weekly.controls.")
-      || key.startsWith("accounting.cacheImpact.bullet"))
+      || key.startsWith("weekly.")
+      || key.startsWith("accounting.cacheImpact.bullet")
+      || key.startsWith("accounting.cacheContinuity.matrix."))
     .map((key) => [key, SUPPORTED_LOCALES.map((locale) => CATALOGS[locale][key])])),
   "dashboard.title": ["Usage overview", "使用概览", "Resumen de uso"],
   "usage.events": ["Usage events: {count}", "使用事件：{count}", "Eventos de uso: {count}"],
@@ -235,6 +196,20 @@ export const WEB_MESSAGES = Object.freeze({
   "dashboard.quota.providerPlan": ["Provider-reported plan: {plan}", "提供方报告的方案：{plan}", "Plan informado por el proveedor: {plan}"],
   "dashboard.quota.providerPlanUnavailable": ["Provider-reported plan unavailable", "提供方报告的方案不可用", "Plan informado por el proveedor no disponible"],
   "shareCard.showInFinder": ["Show in Finder", "在访达中显示", "Mostrar en Finder"],
+  "dashboard.quota.stale": ["Out of date", "已过期", "Desactualizado"],
+  "dashboard.freshness.observation": ["Latest observation", "最新观测", "Última observación"],
+  "dashboard.freshness.stale": ["Observation out of date", "观测数据已过期", "Observación desactualizada"],
+  "dashboard.refresh.recovering": ["Automatic refresh is recovering. The next scheduled update will resume after the safety timer releases this pass.", "自动刷新正在恢复。安全计时器释放本次任务后，将恢复下一次计划更新。", "La actualización automática se está recuperando. La siguiente actualización programada se reanudará cuando el temporizador de seguridad libere esta ejecución."],
+  "dashboard.refresh.waitingForRecovery": ["Automatic refresh is waiting for safety recovery before the next scheduled update.", "自动刷新正在等待安全恢复，然后再进行下一次计划更新。", "La actualización automática espera la recuperación de seguridad antes de la siguiente actualización programada."],
+  "dashboard.stale.observationTitle": ["Results need an update", "结果需要更新", "Los resultados necesitan actualizarse"],
+  "dashboard.stale.observationCopy": ["Showing the last available results. Update local usage to check for newer measurements.", "显示最近可用的结果。更新本地使用量以检查更新的测量数据。", "Se muestran los últimos resultados disponibles. Actualiza el uso local para comprobar si hay mediciones más recientes."],
+  "shareCard.openImage": ["Open image", "打开图片", "Abrir imagen"],
+  "shareCard.downloadRequested": ["Download requested as {filename}.", "已请求下载：{filename}。", "Descarga solicitada como {filename}."],
+  "shareCard.savedToDownloads": ["Saved to Downloads as {filename}.", "已保存到“下载”文件夹：{filename}。", "Guardado en Descargas como {filename}."],
+  "shareCard.downloadStartFailed": ["The image download could not be started.", "无法开始下载图片。", "No se pudo iniciar la descarga de la imagen."],
+  "shareCard.saveFailed": ["The image could not be saved. Try again.", "无法保存图片。请重试。", "No se pudo guardar la imagen. Inténtalo de nuevo."],
+  "shareCard.saveUnconfirmed": ["The save could not be confirmed. Check Downloads before trying again.", "无法确认图片是否已保存。请先检查“下载”文件夹，再重试。", "No se pudo confirmar el guardado. Comprueba Descargas antes de volver a intentarlo."],
+  "shareCard.openFailed": ["The image could not be opened automatically. Find it in Downloads.", "无法自动打开图片。请在“下载”文件夹中查找。", "No se pudo abrir la imagen automáticamente. Búscala en Descargas."],
   "dashboard.quota.remaining": ["{value} remaining", "剩余 {value}", "{value} restante"],
   "dashboard.quota.used": ["{value} used", "已使用 {value}", "{value} usado"],
   "dashboard.quota.usedUnknown": ["Used unknown", "已用量未知", "Uso desconocido"],
@@ -401,7 +376,7 @@ export const WEB_MESSAGES = Object.freeze({
   "accounting.cacheImpact.subtotalStandardOnly": ["Subtotal shown at Standard API rates: {amount}; speed-priced accounting is unavailable.", "按 Standard API 费率显示小计：{amount}；按速度档定价的核算不可用。", "Subtotal con tarifas de API Standard: {amount}; la contabilidad según velocidad no está disponible."],
   "accounting.cacheImpact.subtotalUnpriced": ["Drops excluded for incomplete prices: {unpriced}.", "因价格不完整而排除的下降：{unpriced} 次。", "Caídas excluidas por precios incompletos: {unpriced}."],
   "accounting.cacheSwitch.metricLabel": ["Possible switch overhead", "可能的切换开销", "Posible coste adicional al cambiar"],
-  "accounting.cacheSwitch.metricExplanation": ["A material drop means cache-read tokens fell to at most half the prior request within five minutes, with prior cache-read evidence required. The cache-read drop is observed; its relationship to the adjacent model or reasoning change is inferred. The headline applies the recorded or selected Codex speed and reviewed Fast multiplier to the conservative Standard-price premium. It is not a bill or provider-published allowance.", "大幅下降是指在具有先前缓存读取证据的前提下，缓存读取令牌在五分钟内降至上一请求的一半或更少。缓存读取量的下降是观测结果；它与相邻模型或推理强度更改之间的关系是推断结果。标题金额会把已记录或所选的 Codex 速度以及经审核的 Fast 倍数应用于保守的 Standard 价格溢价。它不是账单或提供方公布的额度。", "Una caída material significa que los tokens de lectura de caché bajaron como máximo a la mitad de la solicitud anterior en cinco minutos, y requiere evidencia previa de lectura de caché. La caída se observa; su relación con el cambio adyacente se infiere. La cifra principal aplica la velocidad de Codex registrada o seleccionada y el multiplicador Fast revisado a la prima conservadora con precio Standard. No es una factura ni una cuota publicada por el proveedor."],
+  "accounting.cacheSwitch.metricExplanation": ["A material drop means cache-read tokens fell to at most half the prior request within five minutes, with prior cache-read evidence required. The cache-read drop is observed; its relationship to the adjacent model or reasoning change is inferred. The headline applies the recorded or selected Codex speed and reviewed API price multiplier to the conservative Standard-price premium. It is not a bill or provider-published allowance.", "大幅下降是指在具有先前缓存读取证据的前提下，缓存读取令牌在五分钟内降至上一请求的一半或更少。缓存读取量的下降是观测结果；它与相邻模型或推理强度更改之间的关系是推断结果。标题金额会把已记录或所选的 Codex 速度以及经审核的 API 价格倍数应用于保守的 Standard 价格溢价。它不是账单或提供方公布的额度。", "Una caída material significa que los tokens de lectura de caché bajaron como máximo a la mitad de la solicitud anterior en cinco minutos, y requiere evidencia previa de lectura de caché. La caída se observa; su relación con el cambio adyacente se infiere. La cifra principal aplica la velocidad de Codex registrada o seleccionada y el multiplicador de precio de API revisado a la prima conservadora con precio Standard. No es una factura ni una cuota publicada por el proveedor."],
   "accounting.cacheSwitch.noteUnavailable": ["This period was not evaluated.", "此期间未进行评估。", "Este período no se evaluó."],
   "accounting.cacheSwitch.noteIncomplete": ["Whole-period total unavailable. Configuration changes without compaction-aware boundary coverage: {uncovered}.", "整个期间的总额不可用。缺少可识别上下文压缩的边界覆盖的配置更改：{uncovered} 次。", "Total del período completo no disponible. Cambios de configuración sin cobertura de límites que reconozca las compactaciones: {uncovered}."],
   "accounting.cacheSwitch.noteIncompleteOrdering": ["Partial estimate; excluded sessions with uncertain event order: {ordering}.", "部分估算；因事件顺序不确定而排除的会话：{ordering} 个。", "Estimación parcial; sesiones excluidas por un orden de eventos incierto: {ordering}."],
@@ -412,7 +387,7 @@ export const WEB_MESSAGES = Object.freeze({
   "accounting.cacheSwitch.noteUnpriced": ["No complete price estimate is available for these drops.", "这些下降没有完整的价格估算。", "No hay una estimación de precio completa para estas caídas."],
   "accounting.cacheSwitch.allowanceMedian": ["Conditional historical allowance estimate (may combine accounts): about {median} percentage points.", "条件性历史额度估计（可能合并多个帐户）：约 {median} 个百分点。", "Estimación histórica condicional de cuota (puede combinar cuentas): unos {median} puntos porcentuales."],
   "accounting.cacheSwitch.allowanceRange": ["Conditional historical allowance range (may combine accounts): {lower}–{upper} percentage points.", "条件性历史额度范围（可能合并多个帐户）：{lower}–{upper} 个百分点。", "Intervalo histórico condicional de cuota (puede combinar cuentas): {lower}–{upper} puntos porcentuales."],
-  "accounting.cacheSwitch.standardPremium": ["Standard-rate accounting equivalent before Fast weighting: {amount}.", "应用 Fast 加权前的 Standard 费率记账等价值：{amount}。", "Equivalente contable con tarifa Standard antes de la ponderación Fast: {amount}."],
+  "accounting.cacheSwitch.standardPremium": ["Standard-rate accounting equivalent before speed-mode weighting: {amount}.", "应用速度模式加权前的 Standard 费率记账等价值：{amount}。", "Equivalente contable con tarifa Standard antes de la ponderación por modo de velocidad: {amount}."],
   "accounting.cacheSwitch.detailsSummary": ["See possible switch overhead", "查看可能的切换开销", "Ver el posible coste adicional al cambiar"],
   "accounting.cacheSwitch.detailsExplanation": ["These recent rows pair an adjacent model or reasoning change with an observed material cache-read drop within five minutes. The cache-read change is observed; its relationship to the setting change is inferred. Effort labels describe recorded request settings, not confirmed backend updates. Astra may retain cache across supported reasoning updates; Ultra’s delegation mode remains a distinct setting.", "这些近期记录将相邻的模型或推理强度更改与五分钟内观测到的缓存读取量大幅下降配对。缓存读取量的变化是观测结果；它与设置更改之间的关系是推断结果。推理标签表示已记录的请求设置，不代表已确认的后端更新。Astra 可在受支持的推理更新期间保留缓存；Ultra 的委派模式仍属于不同的设置。", "Estas filas recientes emparejan un cambio adyacente de modelo o razonamiento con una caída material observada de lectura de caché en un plazo de cinco minutos. El cambio de lectura de caché se observa; su relación con el cambio de configuración se infiere. Los niveles describen la configuración registrada de la solicitud, no actualizaciones confirmadas del servidor. Astra puede conservar la caché con actualizaciones de razonamiento compatibles; el modo de delegación de Ultra sigue siendo una configuración distinta."],
   "accounting.cacheSwitch.detailsEmpty": ["No qualifying material cache-read drops in this period.", "此期间没有符合条件的缓存读取量大幅下降。", "No hay caídas materiales de lectura de caché que cumplan los requisitos en este período."],
@@ -440,7 +415,7 @@ export const WEB_MESSAGES = Object.freeze({
   "accounting.cacheSwitch.effort.ultra": ["Ultra", "Ultra", "Ultra"],
   "accounting.cacheSwitch.effort.unknown": ["Unknown", "未知", "Desconocido"],
   "accounting.cacheContinuity.metricLabel": ["Possible cache-continuity overhead", "可能的缓存连续性开销", "Posible coste adicional de continuidad de caché"],
-  "accounting.cacheContinuity.metricExplanation": ["A conservative estimate for material cache-read drops between adjacent user turns while the effective model, reasoning, routing, and surface stayed unchanged. Elapsed time is evidence rather than an eligibility rule. The headline uses recorded or selected Codex speed weighting when available and otherwise shows the Standard API equivalent before Fast weighting; recorded compactions, contracted contexts, and incomplete boundary coverage are excluded or withheld. It is not a bill or provider-published allowance.", "保守估算：在相邻用户轮次之间，有效模型、推理强度、路由和界面均未改变，但缓存读取量大幅下降。经过时间仅作为证据，而不是资格规则。如有可用的已记录或所选 Codex 速度权重，标题金额会采用该权重；否则显示应用 Fast 加权前的 Standard API 等价值。已记录的上下文压缩、收缩的上下文以及不完整的边界覆盖会被排除或暂缓显示。它不是账单或提供方公布的额度。", "Estimación conservadora de caídas materiales de lectura de caché entre turnos adyacentes sin cambios de modelo, razonamiento, enrutamiento ni superficie. El tiempo es evidencia, no una regla de inclusión. La cifra principal usa la ponderación de velocidad de Codex registrada o seleccionada cuando está disponible y, en caso contrario, muestra el equivalente de API Standard antes de la ponderación Fast; las compactaciones, los contextos reducidos y la cobertura incompleta se excluyen o se omiten. No es una factura ni una cuota publicada por el proveedor."],
+  "accounting.cacheContinuity.metricExplanation": ["A conservative estimate for material cache-read drops between adjacent user turns while the effective model, reasoning, routing, and surface stayed unchanged. Elapsed time is evidence rather than an eligibility rule. The headline uses recorded or selected Codex speed weighting when available and otherwise shows the Standard API equivalent before speed-mode weighting; recorded compactions, contracted contexts, and incomplete boundary coverage are excluded or withheld. It is not a bill or provider-published allowance.", "保守估算：在相邻用户轮次之间，有效模型、推理强度、路由和界面均未改变，但缓存读取量大幅下降。经过时间仅作为证据，而不是资格规则。如有可用的已记录或所选 Codex 速度权重，标题金额会采用该权重；否则显示应用速度模式加权前的 Standard API 等价值。已记录的上下文压缩、收缩的上下文以及不完整的边界覆盖会被排除或暂缓显示。它不是账单或提供方公布的额度。", "Estimación conservadora de caídas materiales de lectura de caché entre turnos adyacentes sin cambios de modelo, razonamiento, enrutamiento ni superficie. El tiempo es evidencia, no una regla de inclusión. La cifra principal usa la ponderación de velocidad de Codex registrada o seleccionada cuando está disponible y, en caso contrario, muestra el equivalente de API Standard antes de la ponderación por modo de velocidad; las compactaciones, los contextos reducidos y la cobertura incompleta se excluyen o se omiten. No es una factura ni una cuota publicada por el proveedor."],
   "accounting.cacheContinuity.noteUnavailable": ["This period was not evaluated.", "此期间未进行评估。", "Este período no se evaluó."],
   "accounting.cacheContinuity.noteIncomplete": ["Whole-period total unavailable. Returns without compaction-aware boundary coverage: {uncovered}.", "整个期间的总额不可用。缺少可识别上下文压缩的边界覆盖的返回：{uncovered} 次。", "Total del período completo no disponible. Retornos sin cobertura de límites que reconozca las compactaciones: {uncovered}."],
   "accounting.cacheContinuity.noteIncompleteOrdering": ["Partial estimate; excluded sessions with uncertain event order: {ordering}.", "部分估算；因事件顺序不确定而排除的会话：{ordering} 个。", "Estimación parcial; sesiones excluidas por un orden de eventos incierto: {ordering}."],
@@ -449,7 +424,7 @@ export const WEB_MESSAGES = Object.freeze({
   "accounting.cacheContinuity.noteObserved": ["{drops} material cache-read drops among {comparable} comparable same-configuration turn pairs.", "{comparable} 对配置相同的可比较轮次中有 {drops} 次缓存读取量大幅下降。", "{drops} caídas materiales de lectura de caché entre {comparable} pares de turnos comparables con la misma configuración."],
   "accounting.cacheContinuity.noteUnpriced": ["Only {priced} of {total} drops had reviewed pricing; the whole-period total is unavailable.", "{total} 次下降中只有 {priced} 次有经审核的价格；整个期间的总额不可用。", "Solo {priced} de {total} caídas tenían precios revisados; el total del período completo no está disponible."],
   "accounting.cacheContinuity.noteCompaction": ["Kept separate: {drops} material drops across {requests} post-compaction requests; no old-prefix cost is assigned.", "单独列出：{requests} 次上下文压缩后请求中有 {drops} 次大幅下降；未分配旧前缀成本。", "Se mantienen aparte: {drops} caídas materiales en {requests} solicitudes posteriores a una compactación; no se asigna un coste al prefijo anterior."],
-  "accounting.cacheContinuity.noteStandardFallback": ["Headline shown at Standard API rates before Fast weighting.", "标题按应用 Fast 加权前的 Standard API 费率显示。", "La cifra principal se muestra con tarifas de API Standard antes de la ponderación Fast."],
+  "accounting.cacheContinuity.noteStandardFallback": ["Headline shown at Standard API rates before speed-mode weighting.", "标题按应用速度模式加权前的 Standard API 费率显示。", "La cifra principal se muestra con tarifas de API Standard antes de la ponderación por modo de velocidad."],
   "accounting.cacheContinuity.detailsSummary": ["See recent large cache drops", "查看近期缓存大幅下降", "Ver las caídas grandes de caché recientes"],
   "accounting.cacheContinuity.outcome.eyebrow": ["Cache reuse between turns", "轮次之间的缓存复用", "Reutilización de caché entre turnos"],
   "accounting.cacheContinuity.outcome.heading": ["Did the cache carry over?", "缓存延续了吗？", "¿Se conservó la caché?"],
@@ -498,7 +473,7 @@ export const WEB_MESSAGES = Object.freeze({
   "accounting.cacheContinuity.column.apiEquivalent": ["API equivalent", "API 等值", "Equivalente de API"],
   "accounting.apiEquivalent.standardRateBasis": ["Calculated at Standard API rates.", "按 Standard API 费率计算。", "Calculado con tarifas Standard de API."],
   "accounting.apiEquivalent.explanation": ["A public API-price measuring stick for the usage observed locally. It is not a bill or a subscription limit.", "使用公开 API 价格衡量本地观测到的用量。它不是账单，也不是订阅额度上限。", "Una referencia de precios públicos de API para el uso observado localmente. No es una factura ni un límite de suscripción."],
-  "accounting.apiEquivalent.standardRateDetail": ["{amount} at Standard rates before Fast weighting.", "应用 Fast 加权前按 Standard 费率计算的金额为 {amount}。", "{amount} con tarifas Standard antes de la ponderación Fast."],
+  "accounting.apiEquivalent.standardRateDetail": ["{amount} at Standard rates before speed-mode weighting.", "应用速度模式加权前按 Standard 费率计算的金额为 {amount}。", "{amount} con tarifas Standard antes de la ponderación por modo de velocidad."],
   "accounting.apiEquivalent.noWeightedUsage": ["No increment in this period could be weighted", "此期间没有可加权的用量增量", "No se pudo ponderar ningún incremento de este período"],
   "accounting.cacheContinuity.premiumUnavailable": ["Unavailable", "不可用", "No disponible"],
   "accounting.cacheContinuity.configuration": ["{model} · {effort}", "{model} · {effort}", "{model} · {effort}"],
@@ -527,7 +502,7 @@ export const WEB_MESSAGES = Object.freeze({
   "accounting.sideChat.historicalGap.backcastValue": ["{standard} Standard API equivalent · {weighted} speed-priced", "{standard} Standard API 等价值 · {weighted} 按速度档定价", "{standard} equivalente de API Standard · {weighted} con precio según velocidad"],
   "accounting.sideChat.historicalGap.backcastRange": ["{standard} Standard API-equivalent range · {weighted} speed-priced range", "{standard} Standard API 等价范围 · {weighted} 按速度档定价范围", "{standard} rango equivalente de API Standard · {weighted} rango con precio según velocidad"],
   "accounting.sideChat.historicalGap.peakValue": ["{residual} pp gap ({observed} observed − {expected} speed-priced)", "缺口 {residual} 个百分点（观测 {observed} − 按速度档定价推算 {expected}）", "Brecha de {residual} pp ({observed} observado − {expected} con precio según velocidad)"],
-  "accounting.sideChat.historicalGap.note": ["Speed evidence: {fast} Fast, {standard} Standard, and {unknown} source-unknown. Source-unknown calls are attributed to Standard at 1x by default. The retained weekly fit uses {resets} resets and paired scenario medians of {capacity} that may combine accounts. Each numerator is divided only by its matching speed scenario. Missing calls are hypothetical and their context was not observed, so their backcast conversion explicitly assumes 2x Standard, not a published Priority rate. The broader backcast sensitivity is {standardSensitivity} in Standard API-equivalent units and {weightedSensitivity} after quota weighting. No July 13 side-chat calls were recovered from retained numeric diagnostics. This value is fitted to observed quota movement, not independently observed, and remains excluded from exact totals, the expected line, and AUC. The 3-hour chart now uses speed-priced cost per bucket.", "速度证据：{fast} 次 Fast、{standard} 次 Standard、{unknown} 次来源未知。来源未知的调用默认按 Standard 的 1× 归因。保留的每周拟合使用 {resets} 次重置，以及可能合并多个账户的 {capacity} 配对情景中位数。每个分子只除以其匹配的速度情景。缺失调用是假设的，其上下文未经观测，因此回推换算明确假定为 Standard 的 2×，而非已公布的 Priority 价格。更广的回推敏感性范围为 Standard API 等价单位的 {standardSensitivity}，按速度档定价后为 {weightedSensitivity}。保留的数值诊断没有恢复任何 7 月 13 日的侧聊调用。该数值是根据观测额度变化拟合的，并非独立观测；仍不计入精确总额、预期线或 AUC。3 小时图表现在使用每个分桶的按速度档定价成本。", "Evidencia de velocidad: {fast} Fast, {standard} Standard y {unknown} con origen desconocido. Las llamadas de origen desconocido se atribuyen a Standard a 1× por defecto. El ajuste semanal conservado usa {resets} restablecimientos y medianas emparejadas por escenario de {capacity}, que pueden combinar cuentas. Cada numerador se divide solo por su escenario de velocidad correspondiente. Las llamadas ausentes son hipotéticas y su contexto no se observó, por lo que su conversión retrospectiva asume explícitamente 2× Standard, no un precio Priority publicado. La sensibilidad más amplia del retrocálculo es {standardSensitivity} en unidades equivalentes de API Standard y {weightedSensitivity} tras ponderar por cuota. No se recuperó ninguna llamada de chat lateral del 13 de julio en los diagnósticos numéricos conservados. Este valor se ajusta al movimiento de cuota observado, no se observa independientemente, y sigue excluido de los totales exactos, la línea esperada y el AUC. El gráfico de 3 horas ahora usa coste con precio según velocidad en cada intervalo."],
+  "accounting.sideChat.historicalGap.note": ["Speed evidence: {ultrafast} Ultrafast, {fast} Fast, {standard} Standard, and {unknown} source-unknown. Source-unknown calls are attributed to Standard at 1x by default. The retained weekly fit uses {resets} resets and paired scenario medians of {capacity} that may combine accounts. Each numerator is divided only by its matching speed scenario. Missing calls are hypothetical and their context was not observed, so their backcast conversion explicitly assumes 2x Standard, not a published Priority rate. The broader backcast sensitivity is {standardSensitivity} in Standard API-equivalent units and {weightedSensitivity} after quota weighting. No July 13 side-chat calls were recovered from retained numeric diagnostics. This value is fitted to observed quota movement, not independently observed, and remains excluded from exact totals, the expected line, and AUC. The 3-hour chart now uses speed-priced cost per bucket.", "速度证据：{ultrafast} 次 Ultrafast、{fast} 次 Fast、{standard} 次 Standard、{unknown} 次来源未知。来源未知的调用默认按 Standard 的 1× 归因。保留的每周拟合使用 {resets} 次重置，以及可能合并多个账户的 {capacity} 配对情景中位数。每个分子只除以其匹配的速度情景。缺失调用是假设的，其上下文未经观测，因此回推换算明确假定为 Standard 的 2×，而非已公布的 Priority 价格。更广的回推敏感性范围为 Standard API 等价单位的 {standardSensitivity}，按速度档定价后为 {weightedSensitivity}。保留的数值诊断没有恢复任何 7 月 13 日的侧聊调用。该数值是根据观测额度变化拟合的，并非独立观测；仍不计入精确总额、预期线或 AUC。3 小时图表现在使用每个分桶的按速度档定价成本。", "Evidencia de velocidad: {ultrafast} Ultrafast, {fast} Fast, {standard} Standard y {unknown} con origen desconocido. Las llamadas de origen desconocido se atribuyen a Standard a 1× por defecto. El ajuste semanal conservado usa {resets} restablecimientos y medianas emparejadas por escenario de {capacity}, que pueden combinar cuentas. Cada numerador se divide solo por su escenario de velocidad correspondiente. Las llamadas ausentes son hipotéticas y su contexto no se observó, por lo que su conversión retrospectiva asume explícitamente 2× Standard, no un precio Priority publicado. La sensibilidad más amplia del retrocálculo es {standardSensitivity} en unidades equivalentes de API Standard y {weightedSensitivity} tras ponderar por cuota. No se recuperó ninguna llamada de chat lateral del 13 de julio en los diagnósticos numéricos conservados. Este valor se ajusta al movimiento de cuota observado, no se observa independientemente, y sigue excluido de los totales exactos, la línea esperada y el AUC. El gráfico de 3 horas ahora usa coste con precio según velocidad en cada intervalo."],
   "accounting.sideChat.noteUnavailable": ["The development estimator is not enabled.", "开发估算器未启用。", "El estimador de desarrollo no está activado."],
   "accounting.sideChat.noteObserved": ["{calls} deduplicated retained sampling markers in {retained} side chats · {detected} side-chat lifecycles began in this period.", "{retained} 个侧聊中保留了 {calls} 个已去重采样标记 · 此期间开始了 {detected} 个侧聊生命周期。", "{calls} marcadores de muestreo conservados y deduplicados en {retained} chats laterales · {detected} ciclos comenzaron en este período."],
   "accounting.sideChat.noteRange": ["Sensitivity range {lower}–{upper}.", "敏感性范围 {lower}–{upper}。", "Intervalo de sensibilidad {lower}–{upper}."],
@@ -614,18 +589,13 @@ export const WEB_MESSAGES = Object.freeze({
   "accounting.period.indexedHistory": ["Indexed history", "已索引历史", "Historial indexado"],
   "accounting.period.indexedHistorySoFar": ["Indexed history so far", "目前已索引的历史", "Historial indexado hasta ahora"],
   "accounting.fastMode.noUsage": ["No usage increments in this period, so there is no speed-mode attribution to report.", "此期间没有使用增量，因此没有可报告的速度模式归因。", "No hay incrementos de uso en este período, por lo que no hay atribución de modo de velocidad que informar."],
-  "accounting.fastMode.observed": ["{count} observed in the logs", "日志中观测到 {count} 个", "{count} observados en los registros"],
-  "accounting.fastMode.declaredFromConfig": ["{count} declared by timestamped Codex config", "带时间戳的 Codex 配置声明 {count} 个", "{count} declarados por la configuración de Codex con fecha y hora"],
-  "accounting.fastMode.stated": ["{count} assumed Standard by default", "默认按 Standard 假定 {count} 个", "{count} asumidos como Standard por defecto"],
+  "accounting.fastMode.coverageSummary": ["Speed coverage: {known} of {total} usage increments have a recorded or configured speed.", "速度覆盖：{total} 个使用增量中，有 {known} 个具有已记录或已配置的速度。", "Cobertura de velocidad: {known} de {total} incrementos de uso tienen una velocidad registrada o configurada."],
+  "accounting.fastMode.coverageAssumed": ["{count} use Standard pricing because no speed was recorded yet.", "由于尚未记录速度，{count} 个使用 Standard 定价。", "{count} usan precios Standard porque todavía no se había registrado una velocidad."],
+  "accounting.fastMode.coverageComplete": ["All usage is included.", "所有使用量均已计入。", "Todo el uso está incluido."],
+  "accounting.fastMode.coverageUnknown": ["{count} could not be speed-priced ({percent}).", "{count} 个无法按速度定价（{percent}）。", "No se pudo aplicar precio según velocidad a {count} ({percent})."],
+  "accounting.fastMode.coverageUnknownCost": ["Their {amount} Standard-rate cost is excluded from the speed-priced total.", "其 {amount} 的 Standard 费率成本未计入按速度定价总额。", "Su coste de {amount} a tarifa Standard se excluye del total con precio según velocidad."],
+  "accounting.fastMode.coverageUnknownExcluded": ["They are excluded from the speed-priced total.", "这些增量未计入按速度定价总额。", "Se excluyen del total con precio según velocidad."],
   "accounting.fastMode.assumedRatio": ["Includes {amount} of Standard-rate cost weighted at an assumed 2x because no published Priority rate matches the model, date or context.", "其中 {amount} 的 Standard 费率成本因没有匹配模型、日期或上下文的已公布 Priority 价格而按假定的 2 倍加权。", "Incluye {amount} de coste a tarifa Standard ponderado por un 2x asumido porque no hay un precio Priority publicado que coincida con el modelo, la fecha o el contexto."],
-  "accounting.fastMode.inferred": ["{count} inferred from calibration residuals", "根据校准残差推断 {count} 个", "{count} inferidos a partir de residuos de calibración"],
-  "accounting.fastMode.unknown": ["{count} still unknown", "仍有 {count} 个未知", "{count} aún desconocidos"],
-  "accounting.fastMode.unknownShare": [" ({percent} of increments).", "（占增量的 {percent}）。", " ({percent} de los incrementos)."],
-  "accounting.fastMode.unweighted": [" {amount} of Standard-rate cost could not be weighted and is excluded from the weighted total rather than counted at 1x.", " 有 {amount} 的标准费率成本无法加权，因此从加权总额中排除，而不是按 1 倍计入。", " {amount} de coste a tarifa Standard no pudo ponderarse y se excluye del total ponderado en lugar de contarse a 1×."],
-  "accounting.fastMode.coverage": ["Of {total} usage increments: {parts}{share}{unweighted} Codex records the mode only when it is applied or changed, so turns before the first change in a session are never observed and a small structural error in the calibration cannot be engineered away.", "在 {total} 个使用增量中：{parts}{share}{unweighted} Codex 只会在模式被应用或更改时记录该模式，因此会话中首次更改前的轮次永远不会被观测到，校准中的小型结构性误差也无法人为消除。", "De {total} incrementos de uso: {parts}{share}{unweighted} Codex registra el modo solo cuando se aplica o cambia, por lo que los turnos anteriores al primer cambio de una sesión nunca se observan y no se puede eliminar mediante ingeniería un pequeño error estructural de la calibración."],
-  "accounting.fastMode.inferenceNotRun": ["Residual inference has not run: there is not yet enough matched calibration evidence to compare a window against a Standard reference.", "残差推断尚未运行：还没有足够的匹配校准证据将某个窗口与 Standard 参考进行比较。", "La inferencia de residuos no se ha ejecutado: todavía no hay suficiente evidencia de calibración coincidente para comparar una ventana con una referencia Standard."],
-  "accounting.fastMode.inferenceNone": ["Residual inference compared {scored} calibration windows against {reference} Standard references and marked none as Fast.", "残差推断将 {scored} 个校准窗口与 {reference} 个 Standard 参考进行了比较，没有标记任何一个为 Fast。", "La inferencia de residuos comparó {scored} ventanas de calibración con {reference} referencias Standard y no marcó ninguna como Fast."],
-  "accounting.fastMode.inferenceSome": ["Residual inference marked {fast} of {scored} calibration windows as inferred Fast, against {reference} Standard references. Inference labels windows, never individual increments, so it is reported here and never folded into the weighted total.", "残差推断在与 {reference} 个 Standard 参考比较后，将 {scored} 个校准窗口中的 {fast} 个标记为推断的 Fast。推断标记的是窗口而非单个增量，因此只在此报告，绝不会并入加权总额。", "La inferencia de residuos marcó {fast} de {scored} ventanas de calibración como Fast inferido, frente a {reference} referencias Standard. La inferencia etiqueta ventanas, nunca incrementos individuales, por lo que se informa aquí y nunca se incorpora al total ponderado."],
   // The stat tiles carry bare figures; their per-point unit lives in the
   // static labels beneath them, so the old sentence-length "perPoint" and
   // "range" values left with the table presentation (owner-directed,
@@ -664,9 +634,9 @@ export const WEB_MESSAGES = Object.freeze({
     "Este gráfico está etiquetado como {claimed}, pero la serie conservada solo abarca {covered}. La contabilidad en caché está retenida, así que la tendencia se dibuja a partir de la proyección en vivo del recolector, más pequeña, hasta que un análisis local la reconstruya.",
   ],
   "dashboard.timeline.title": ["{window} rolling quota change versus cost-implied change", "{window} 滚动额度变化与成本推断变化的对比", "Cambio móvil de cuota de {window} frente al cambio implícito por coste"],
-  "dashboard.timeline.liveCopy": ["Quota movement is compared with speed-priced local usage, applying published Fast (Priority) price ratios; times are shown in {timeZone}.", "额度变化与按速度档定价的本地使用量进行比较，并应用已公布的 Fast（Priority）价格倍率；时间显示为 {timeZone}。", "El movimiento de cuota se compara con el uso local con precio según velocidad, aplicando los multiplicadores de precio Fast (Priority) publicados; las horas se muestran en {timeZone}."],
+  "dashboard.timeline.liveCopy": ["Quota movement is compared with speed-priced local usage, applying published API price ratios to eligible Fast and Ultrafast usage; times are shown in {timeZone}.", "额度变化与按速度档定价的本地使用量进行比较，并对符合条件的 Fast 和 Ultrafast 使用量应用已公布的 API 价格倍率；时间显示为 {timeZone}。", "El movimiento de cuota se compara con el uso local con precio según velocidad, aplicando los multiplicadores de precio de API publicados al uso Fast y Ultrafast elegible; las horas se muestran en {timeZone}."],
   "dashboard.timeline.liveCopySideChatAdjusted": ["Quota movement is compared with speed-priced exact usage plus eligible side-chat estimates surviving in the approximately 10-day active window; expired side-chat history is unknown. Times are shown in {timeZone}.", "额度变化与按速度档定价的精确使用量加上约 10 天当前窗口中仍保留且符合条件的侧聊估算进行比较；已过期侧聊历史为未知。时间显示为 {timeZone}。", "El movimiento de cuota se compara con el uso exacto con precio según velocidad más las estimaciones elegibles de chats laterales que sobreviven en la ventana activa de unos 10 días; el historial caducado es desconocido. Las horas se muestran en {timeZone}."],
-  "dashboard.timeline.liveCopyHistoricalGapCapacity": ["Speed-priced local usage and retained quota movement are shown in {timeZone}. The development probe supplies an account-unattributed weekly median; published Fast (Priority) price ratios are applied to every eligible bucket.", "按速度档定价的本地使用量和保留的额度变化显示为 {timeZone}。开发探针提供账户未归属的每周中位数；每个符合条件的分桶均应用已公布的 Fast（Priority）价格倍率。", "El uso local con precio según velocidad y el movimiento de cuota conservado se muestran en {timeZone}. La sonda aporta una mediana semanal sin atribución de cuenta; se aplican multiplicadores de precio Fast (Priority) publicados a cada intervalo elegible."],
+  "dashboard.timeline.liveCopyHistoricalGapCapacity": ["Speed-priced local usage and retained quota movement are shown in {timeZone}. The development probe supplies an account-unattributed weekly median; published Fast and Ultrafast API price ratios apply to eligible buckets.", "按速度档定价的本地使用量和保留的额度变化显示为 {timeZone}。开发探针提供账户未归属的每周中位数；符合条件的分桶会应用已公布的 Fast 和 Ultrafast API 价格倍率。", "El uso local con precio según velocidad y el movimiento de cuota conservado se muestran en {timeZone}. La sonda aporta una mediana semanal sin atribución de cuenta; los multiplicadores de precio de API Fast y Ultrafast publicados se aplican a los intervalos elegibles."],
   "dashboard.timeline.historicalCopy": ["Historical local calibration artifact from {generatedAt} · recent quota snapshots are too sparse to bracket {window} endpoints", "来自 {generatedAt} 的历史本地校准产物 · 最近的额度快照过于稀疏，无法界定 {window} 的端点", "Artefacto histórico de calibración local de {generatedAt} · las instantáneas recientes de cuota son demasiado escasas para acotar los extremos de {window}"],
   "dashboard.timeline.notComparableYet": ["Not comparable yet", "尚不可比较", "Aún no comparable"],
   "dashboard.timeline.noBracket": ["Cost history exists, but quota observations do not bracket any {window} window in this date range. The calculated line is hidden until there is measured evidence to compare it with.", "存在成本历史记录，但额度观测无法在此日期范围内界定任何 {window} 窗口。在有可供比较的测量证据前，计算线会保持隐藏。", "Existe historial de costes, pero las observaciones de cuota no delimitan ninguna ventana de {window} en este intervalo de fechas. La línea calculada permanece oculta hasta que haya evidencia medida con la que compararla."],
@@ -677,7 +647,7 @@ export const WEB_MESSAGES = Object.freeze({
   "dashboard.timeline.expectedCost": ["Expected from speed-priced API cost", "按按速度档定价 API 成本推断的预期变化", "Esperado según el coste de API con precio según velocidad"],
   "dashboard.timeline.percentagePoints": ["Percentage points", "百分点", "Puntos porcentuales"],
   "dashboard.timeline.movementTitle": ["{window} rolling quota movement", "{window} 滚动额度变化", "Movimiento móvil de cuota de {window}"],
-  "dashboard.timeline.chartDescription": ["Observed quota movement compared with movement implied by speed-priced priced token usage, including published Fast (Priority) price ratios. Times are shown in {timeZone}.", "将观测到的额度变化与按按速度档定价的定价令牌使用量推断的变化进行比较，其中包括已公布的 Fast（Priority）价格倍率。时间显示为 {timeZone}。", "Movimiento de cuota observado comparado con el movimiento implícito por uso de tokens con precio con precio según velocidad, incluidos los multiplicadores de precio Fast (Priority) publicados. Las horas se muestran en {timeZone}."],
+  "dashboard.timeline.chartDescription": ["Observed quota movement compared with movement implied by speed-priced token usage, applying published Fast and Ultrafast API price ratios where eligible. Times are shown in {timeZone}.", "将观测到的额度变化与按速度档定价的令牌使用量推断的变化进行比较，并在符合条件时应用已公布的 Fast 和 Ultrafast API 价格倍率。时间显示为 {timeZone}。", "Movimiento de cuota observado comparado con el movimiento implícito por uso de tokens con precio según velocidad, aplicando los multiplicadores de precio de API Fast y Ultrafast publicados cuando corresponde. Las horas se muestran en {timeZone}."],
   "dashboard.timeline.lowConfidence": ["Low confidence: only {visible}; {excluded}.", "置信度较低：仅显示 {visible}；{excluded}。", "Confianza baja: solo {visible}; {excluded}."],
   "dashboard.timeline.excludedShown": ["{shown}. {excluded}. Excluded windows are shaded above; do not read them as zero usage.", "{shown}。{excluded}。被排除的窗口在上方以阴影显示；不要将它们理解为零使用。", "{shown}. {excluded}. Las ventanas excluidas se muestran sombreadas arriba; no las interpretes como uso cero."],
   "dashboard.timeline.exclusionJoin": ["; ", "；", "; "],
@@ -695,14 +665,14 @@ export const WEB_MESSAGES = Object.freeze({
   // the `data-i18n-skip` attribute the SVG text nodes must keep.
   "chart.seriesValue": ["{label}: {value}", "{label}：{value}", "{label}: {value}"],
   "chart.timeZoneNote": ["Times shown in {timeZone}.", "时间显示为 {timeZone}。", "Las horas se muestran en {timeZone}."],
-  "chart.axis.apiEquivalentPerHour": ["$ Standard API equivalent per hour", "每小时的 Standard API 等价美元", "$ equivalente de API Standard por hora"],
-  "chart.axis.apiEquivalentPerDay": ["$ Standard API equivalent per day", "每天的 Standard API 等价美元", "$ equivalente de API Standard por día"],
-  "chart.axis.apiEquivalentPerWeek": ["$ Standard API equivalent per week", "每周的 Standard API 等价美元", "$ equivalente de API Standard por semana"],
-  "chart.axis.apiEquivalentPerInterval": ["$ Standard API equivalent per interval", "每个间隔的 Standard API 等价美元", "$ equivalente de API Standard por intervalo"],
-  "chart.axis.quotaWeightedPerHour": ["$ speed-priced API equivalent per hour", "每小时的按速度档定价 API 等价美元", "$ equivalente de API con precio según velocidad por hora"],
-  "chart.axis.quotaWeightedPerDay": ["$ speed-priced API equivalent per day", "每天的按速度档定价 API 等价美元", "$ equivalente de API con precio según velocidad por día"],
-  "chart.axis.quotaWeightedPerWeek": ["$ speed-priced API equivalent per week", "每周的按速度档定价 API 等价美元", "$ equivalente de API con precio según velocidad por semana"],
-  "chart.axis.quotaWeightedPerInterval": ["$ speed-priced API equivalent per interval", "每个间隔的按速度档定价 API 等价美元", "$ equivalente de API con precio según velocidad por intervalo"],
+  "chart.axis.apiEquivalentPerHour": ["API equivalent per hour", "每小时 API 等值", "Equivalente de API por hora"],
+  "chart.axis.apiEquivalentPerDay": ["API equivalent per day", "每天 API 等值", "Equivalente de API por día"],
+  "chart.axis.apiEquivalentPerWeek": ["API equivalent per week", "每周 API 等值", "Equivalente de API por semana"],
+  "chart.axis.apiEquivalentPerInterval": ["API equivalent per interval", "每间隔 API 等值", "Equivalente de API por intervalo"],
+  "chart.axis.quotaWeightedPerHour": ["API equivalent per hour", "每小时 API 等值", "Equivalente de API por hora"],
+  "chart.axis.quotaWeightedPerDay": ["API equivalent per day", "每天 API 等值", "Equivalente de API por día"],
+  "chart.axis.quotaWeightedPerWeek": ["API equivalent per week", "每周 API 等值", "Equivalente de API por semana"],
+  "chart.axis.quotaWeightedPerInterval": ["API equivalent per interval", "每间隔 API 等值", "Equivalente de API por intervalo"],
   "chart.axis.apiEquivalentPerSevenDays": ["$ speed-priced API equivalent per seven-day allowance", "每个七天额度的按速度档定价 API 等价美元", "$ equivalente de API con precio según velocidad por asignación de siete días"],
   "chart.axis.sevenDayAllowanceRemaining": ["Seven-day allowance remaining (%)", "七天额度剩余（%）", "Asignación de siete días restante (%)"],
   "chart.series.apiEquivalentUsage": ["API-price-equivalent usage", "API 价格等价使用量", "Uso equivalente al precio de API"],
@@ -710,11 +680,11 @@ export const WEB_MESSAGES = Object.freeze({
   "chart.series.standardApiUsage": ["Standard-rate API-equivalent usage", "Standard 费率 API 等价使用量", "Uso equivalente de API con tarifa Standard"],
   "chart.series.sevenDayAllowanceRemaining": ["Seven-day allowance remaining", "七天额度剩余", "Asignación de siete días restante"],
   "chart.usage.title": ["Real local speed-priced API-equivalent usage over time", "真实本地按速度档定价 API 等价使用量随时间变化", "Uso local real equivalente de API con precio según velocidad a lo largo del tiempo"],
-  "chart.usage.description": ["Local speed-priced API-equivalent usage per {unit}, using recorded or selected Codex speed and published Fast (Priority) price ratios, with the provider-observed seven-day allowance remaining on the right axis. Times are shown in {timeZone}.", "按{unit}显示的本地按速度档定价 API 等价使用量，使用已记录或所选的 Codex 速度及经审核的 Fast 倍数；右轴为提供方观测到的七天额度剩余。时间显示为 {timeZone}。", "Uso local equivalente de API con precio según velocidad por {unit}, con la velocidad de Codex registrada o seleccionada y multiplicadores de precio Fast (Priority) publicados; la cuota restante de siete días observada por el proveedor aparece en el eje derecho. Las horas se muestran en {timeZone}."],
-  "chart.usage.heading": ["Speed-priced API-equivalent usage by {unit} · latest {range}", "按{unit}的按速度档定价 API 等价使用量 · 最近 {range}", "Uso equivalente de API con precio según velocidad por {unit} · periodo reciente: {range}"],
+  "chart.usage.description": ["Local speed-priced API-equivalent usage per {unit}, using recorded or selected Codex speed and published Fast and Ultrafast API price ratios where eligible, with the provider-observed seven-day allowance remaining on the right axis. Times are shown in {timeZone}.", "按{unit}显示的本地按速度档定价 API 等价使用量，使用已记录或所选的 Codex 速度，并在符合条件时应用已公布的 Fast 和 Ultrafast API 价格倍率；右轴为提供方观测到的七天额度剩余。时间显示为 {timeZone}。", "Uso local equivalente de API con precio según velocidad por {unit}, con la velocidad de Codex registrada o seleccionada y multiplicadores de precio de API Fast y Ultrafast publicados cuando corresponde; la cuota restante de siete días observada por el proveedor aparece en el eje derecho. Las horas se muestran en {timeZone}."],
+  "chart.usage.heading": ["Speed-priced API-equivalent usage by {unit}", "按{unit}的按速度档定价 API 等价使用量", "Uso equivalente de API con precio según velocidad por {unit}"],
   "chart.usage.standardTitle": ["Standard-rate API-equivalent usage over time", "Standard 费率 API 等价使用量随时间变化", "Uso equivalente de API con tarifa Standard a lo largo del tiempo"],
   "chart.usage.standardDescription": ["Local Standard-rate API-equivalent usage per {unit}. The allowance series is omitted because no matching speed-priced capacity is available. Times are shown in {timeZone}.", "按{unit}显示的本地 Standard 费率 API 等价使用量。由于没有匹配的按速度档定价容量，因此不显示额度序列。时间显示为 {timeZone}。", "Uso local equivalente de API con tarifa Standard por {unit}. Se omite la serie de cuota porque no hay una capacidad ponderada coincidente. Las horas se muestran en {timeZone}."],
-  "chart.usage.standardHeading": ["Standard-rate API-equivalent usage by {unit} · latest {range}", "按{unit}的 Standard 费率 API 等价使用量 · 最近 {range}", "Uso equivalente de API con tarifa Standard por {unit} · periodo reciente: {range}"],
+  "chart.usage.standardHeading": ["Standard-rate API-equivalent usage by {unit}", "按{unit}的 Standard 费率 API 等价使用量", "Uso equivalente de API con tarifa Standard por {unit}"],
   "chart.usage.emptyTitle": ["No real usage timeline loaded", "未加载真实使用情况时间线", "No se cargó ninguna cronología de uso real"],
   "chart.usage.emptyCopy": ["Analyze local usage to build recent content-free usage buckets.", "分析本地使用情况以构建近期不含内容的使用分桶。", "Analiza el uso local para crear intervalos recientes de uso sin contenido."],
   "chart.usage.newerBuildTitle": ["A newer build is required to read this usage history", "需要较新版本才能读取此使用历史记录", "Se necesita una versión más reciente para leer este historial de uso"],
@@ -730,7 +700,7 @@ export const WEB_MESSAGES = Object.freeze({
   // that.
   "chart.residual.cumulativeSeries": ["Cumulative drift since boundary", "自边界以来的累计漂移", "Deriva acumulada desde el límite"],
   "chart.residual.title": ["Quota movement residuals", "额度变化残差", "Residuos del movimiento de cuota"],
-  "chart.residual.description": ["Observed quota change minus the speed-priced API-cost-implied change, over the same date range as the calibration chart. Reviewed Fast multipliers apply to eligible buckets. Windows with no computable weighted residual are left as shaded gaps. The cumulative line sums each bucket's observed-minus-expected movement and restarts at every window boundary or track change. Times are shown in {timeZone}.", "观测到的额度变化减去按按速度档定价 API 成本推断的变化，日期范围与校准图相同。符合条件的分桶会应用已公布的 Fast（Priority）价格倍率。没有可计算加权残差的窗口保留为阴影缺口。累计线将每个分桶的“观测减预期”变化相加，并在每个窗口边界或额度轨道变化处重新开始。时间显示为 {timeZone}。", "Cambio de cuota observado menos el cambio implícito por coste de API con precio según velocidad, en el mismo intervalo que el gráfico de calibración. Los multiplicadores de precio Fast (Priority) publicados se aplican a los intervalos elegibles. Las ventanas sin residuo ponderado calculable quedan como huecos sombreados. La línea acumulada suma el movimiento observado menos esperado y se reinicia en cada límite o cambio de seguimiento. Las horas se muestran en {timeZone}."],
+  "chart.residual.description": ["Observed quota change minus the speed-priced API-cost-implied change, over the same date range as the calibration chart. Published Fast and Ultrafast API price ratios apply to eligible buckets. Windows with no computable weighted residual are left as shaded gaps. The cumulative line sums each bucket's observed-minus-expected movement and restarts at every window boundary or track change. Times are shown in {timeZone}.", "观测到的额度变化减去按速度档定价 API 成本推断的变化，日期范围与校准图相同。符合条件的分桶会应用已公布的 Fast 和 Ultrafast API 价格倍率。没有可计算加权残差的窗口保留为阴影缺口。累计线将每个分桶的“观测减预期”变化相加，并在每个窗口边界或额度轨道变化处重新开始。时间显示为 {timeZone}。", "Cambio de cuota observado menos el cambio implícito por coste de API con precio según velocidad, en el mismo intervalo que el gráfico de calibración. Los multiplicadores de precio de API Fast y Ultrafast publicados se aplican a los intervalos elegibles. Las ventanas sin residuo ponderado calculable quedan como huecos sombreados. La línea acumulada suma el movimiento observado menos esperado y se reinicia en cada límite o cambio de seguimiento. Las horas se muestran en {timeZone}."],
   "chart.status.matched": ["Matched quota bracket", "匹配的额度区间", "Intervalo de cuota coincidente"],
   "chart.status.inactive": ["No local activity or quota movement", "没有本地活动或额度变化", "Sin actividad local ni movimiento de cuota"],
   "chart.status.unpricedLocalActivity": ["Usage change without reviewed price", "没有经审核价格的使用变化", "Cambio de uso sin precio revisado"],
@@ -763,7 +733,7 @@ export const WEB_MESSAGES = Object.freeze({
   "weekly.headline.insufficient": ["Insufficient evidence", "证据不足", "Evidencia insuficiente"],
   "weekly.headline.range": ["80% across-reset range, all data: {lower}–{upper}", "全部数据的 80% 跨重置区间：{lower}–{upper}", "Intervalo del 80 % entre restablecimientos, todos los datos: {lower}–{upper}"],
   "weekly.headline.rangeUnavailable": ["No evidence interval available", "没有可用的证据区间", "No hay intervalo de evidencia disponible"],
-  "weekly.headline.relationship": ["The headline is the median of all {qualifying} qualifying reset estimates and never moves with the controls below. The chart is currently drawing {shown} of {total} estimates: the selected range, anchored at the newest fit ({anchor}), with observed quota spans of {span}.", "标题为全部 {qualifying} 个合格重置估计的中位数，不会随下方控件变化。图表当前绘制 {total} 个估计中的 {shown} 个：所选范围以最新拟合（{anchor}）为锚点，且观测额度跨度为{span}。", "El titular es la mediana de las {qualifying} estimaciones de restablecimiento válidas y nunca cambia con los controles de abajo. El gráfico dibuja actualmente {shown} de {total} estimaciones: el intervalo seleccionado, anclado en el ajuste más reciente ({anchor}), con intervalos de cuota observada de {span}."],
+  "weekly.headline.relationship": ["The headline is the median of all {qualifying} qualifying reset estimates and never moves with the controls below. The chart is currently drawing {shown} of {total} estimates: the selected reporting range through {anchor}, with observed quota spans of {span}.", "标题为全部 {qualifying} 个合格重置估计的中位数，不会随下方控件变化。图表当前绘制 {total} 个估计中的 {shown} 个：所选报告范围截至 {anchor}，且观测额度跨度为{span}。", "El titular es la mediana de las {qualifying} estimaciones de restablecimiento válidas y nunca cambia con los controles de abajo. El gráfico dibuja actualmente {shown} de {total} estimaciones: el rango de informe seleccionado hasta {anchor}, con intervalos de cuota observada de {span}."],
   "weekly.headline.pending": ["The estimate will appear when enough quota transitions can be matched to priced usage. The headline will then summarize all data, while the controls below filter only the chart.", "当有足够的额度变化可以与已定价的使用量匹配时，估计值就会出现。届时标题将汇总全部数据，而下方控件只会筛选图表。", "La estimación aparecerá cuando haya suficientes transiciones de cuota que puedan asociarse a uso con precio. Entonces el titular resumirá todos los datos, mientras que los controles de abajo solo filtran el gráfico."],
   "weekly.span.all": ["All spans", "全部跨度", "Todos los intervalos"],
   // The slider's own readout says "All spans"; a sentence has to say the same
@@ -852,14 +822,14 @@ export const WEB_MESSAGES = Object.freeze({
     "Mezcla del intervalo (todo el período seleccionado, no solo esta ventana): sobre todo {model}, velocidad {speed}.",
   ],
   "divergence.breakdown.show": [
-    "Show this window's cost mix",
-    "显示此窗口的成本构成",
-    "Mostrar la mezcla de costes de esta ventana",
+    "Models & speeds",
+    "模型与速度",
+    "Modelos y velocidades",
   ],
   "divergence.breakdown.hide": [
-    "Hide this window's cost mix",
-    "隐藏此窗口的成本构成",
-    "Ocultar la mezcla de costes de esta ventana",
+    "Hide breakdown",
+    "隐藏明细",
+    "Ocultar desglose",
   ],
   "divergence.breakdown.loading": [
     "Repricing this window…",
@@ -886,6 +856,11 @@ export const WEB_MESSAGES = Object.freeze({
     "{speed}：{cost}，涵盖 {events} 次用量变化",
     "{speed}: {cost} en {events} cambios de uso",
   ],
+  "divergence.breakdown.ultrafastCost": [
+    "Ultrafast usage: {cost} of this window’s Standard-rate cost.",
+    "超快用量：此窗口标准费率成本中的 {cost}。",
+    "Uso ultrarrápido: {cost} del coste a tarifa estándar de esta ventana.",
+  ],
   "divergence.breakdown.fastCost": [
     "Fast-speed usage: {cost} of this window's priced cost.",
     "快速用量：占此窗口计价成本的 {cost}。",
@@ -902,14 +877,14 @@ export const WEB_MESSAGES = Object.freeze({
     "No hay eventos de uso con precio en esta ventana.",
   ],
   "divergence.breakdown.unavailable": [
-    "Per-window cost mix is unavailable from this companion — range mix instead: mostly {model}, {speed} speed.",
-    "此伴随程序无法提供逐窗口成本构成——改用范围构成：以 {model} 为主，{speed} 速度。",
-    "La mezcla de costes por ventana no está disponible en este acompañante; en su lugar, la mezcla del intervalo: sobre todo {model}, velocidad {speed}.",
+    "This period’s breakdown could not be loaded. For context, the whole selected range is mostly {model}, {speed} speed; that does not describe this period.",
+    "无法加载此时段明细。作为背景，整个所选范围以 {model}、{speed} 速度为主，但这不代表此时段。",
+    "No se pudo cargar el desglose del período. Como contexto, todo el intervalo seleccionado usa principalmente {model}, velocidad {speed}; esto no describe este período.",
   ],
   "divergence.breakdown.unavailablePlain": [
-    "Per-window cost mix is unavailable from this companion.",
-    "此伴随程序无法提供逐窗口成本构成。",
-    "La mezcla de costes por ventana no está disponible en este acompañante.",
+    "This period’s breakdown could not be loaded.",
+    "无法加载此时段明细。",
+    "No se pudo cargar el desglose del período.",
   ],
   "divergence.empty": [
     "No sustained divergence in this range — observed and priced usage track within the noise band.",
@@ -921,16 +896,17 @@ export const WEB_MESSAGES = Object.freeze({
     "此范围尚无累计漂移序列——请在已连接本地伴随程序的情况下打开，以检测背离时段。",
     "Aún no hay una serie de deriva acumulada para este intervalo: ábrelo con el acompañante local conectado para detectar períodos de divergencia.",
   ],
-  "divergence.truncated": [
-    "Showing the {shown} widest of {total} detected periods.",
-    "在检测到的 {total} 个时段中显示最显著的 {shown} 个。",
-    "Mostrando los {shown} más amplios de {total} períodos detectados.",
+  "divergence.pagination.page": [
+    "{start}–{end} of {total} periods · largest gap first",
+    "第 {start}–{end} 个，共 {total} 个时段 · 最大差距优先",
+    "{start}–{end} de {total} períodos · mayor diferencia primero",
   ],
   "divergence.methodCaveat": [
     "Known limitation: the expected line prices every model at one blended rate, so a stretch dominated by a single model can read as divergence. A per-model expected line is planned.",
     "已知局限：预期线以单一混合费率为所有模型计价，因此以单一模型为主的时段可能显示为背离。按模型区分的预期线已在计划中。",
     "Limitación conocida: la línea esperada valora todos los modelos con una única tarifa combinada, por lo que un período dominado por un solo modelo puede aparecer como divergencia. Está prevista una línea esperada por modelo.",
   ],
+  "divergence.speed.ultrafast": ["ultrafast", "超快", "ultrarrápida"],
   "divergence.speed.fast": ["fast", "快速", "rápida"],
   "divergence.speed.standard": ["standard", "标准", "estándar"],
   "divergence.speed.unknown": ["unknown", "未知", "desconocida"],
@@ -986,7 +962,7 @@ export const WEB_MESSAGES = Object.freeze({
   "share.planAllowance": ["Allowance: {plan}", "额度：{plan}", "Cuota: {plan}"],
   "share.caveat.unweighted": ["Not a complete total: {amount} of Standard-rate cost could not be speed-weighted and is excluded rather than counted at 1x.", "不是完整总额：{amount} 的 Standard 费率成本无法按速度加权，因此被排除而不是按 1 倍计入。", "No es un total completo: {amount} de coste a tarifa Standard no pudo ponderarse por velocidad y se excluye en lugar de contarse a 1×."],
   "share.caveat.noWeighted": ["No usage could be speed-weighted, so this is the unchanged Standard-rate total.", "没有使用量可按速度加权，因此这是未变动的 Standard 费率总额。", "No se pudo ponderar ningún uso por velocidad, por lo que este es el total sin cambios a tarifa Standard."],
-  "share.caveat.fastPartial": ["Fast-mode attribution is partial: Codex records the speed mode only when it changes, never at session start.", "Fast 模式归因不完整：Codex 仅在速度模式改变时记录，绝不会在会话开始时记录。", "La atribución del modo Fast es parcial: Codex registra el modo de velocidad solo cuando cambia, nunca al inicio de la sesión."],
+  "share.caveat.fastPartial": ["Speed-mode attribution is partial: some turns lack explicit speed evidence in the retained logs.", "速度模式归因不完整：保留日志中的部分轮次缺少明确的速度证据。", "La atribución del modo de velocidad es parcial: algunos turnos no tienen evidencia explícita de velocidad en los registros conservados."],
   "share.caveat.coverage": ["{percent} of recorded usage changes have a reviewed public price; the remainder is omitted from the estimate.", "记录的使用变化中有 {percent} 具备经审核的公开价格；其余部分不纳入估算。", "El {percent} de los cambios de uso registrados tiene un precio público revisado; el resto queda fuera de la estimación."],
   "share.title": ["What my Codex allowance is really worth", "我的 Codex 额度到底值多少", "Lo que realmente vale mi asignación de Codex"],
   "share.subtitle.demo": ["Illustrative demo data. Not a measurement.", "示例性演示数据。不是测量结果。", "Datos de demostración ilustrativos. No son una medición."],
@@ -1417,8 +1393,19 @@ export const WEB_MESSAGES = Object.freeze({
   "community.daily.seriesAvailable": ["Daily series available", "每日序列可用", "Serie diaria disponible"],
   "community.daily.seriesUnavailable": ["Daily series unavailable", "每日序列不可用", "Serie diaria no disponible"],
   "community.daily.noneYet": ["No daily activity published yet", "尚未发布每日活动", "Aún no se ha publicado actividad diaria"],
+  // Retained-evidence copy, shared by every community view that can serve a
+  // payload this browser already received. It states the age and says plainly
+  // that nothing was estimated, because a reader must never be unable to tell
+  // retained figures from current ones.
+  "community.daily.seriesCached": ["Cached daily series", "缓存的每日序列", "Serie diaria en caché"],
+  "community.cached.chip": ["Showing cached figures", "显示缓存数据", "Mostrando cifras en caché"],
+  "community.cached.notice": ["The service could not be reached, so these are the figures this browser last received, {age}. They are not current, and nothing has been estimated to fill the gap.", "无法连接服务，因此这里显示的是此浏览器上次收到的数据，时间为{age}。这些数据不是最新的，也没有通过估算来填补缺口。", "No se pudo contactar con el servicio, así que estas son las cifras que este navegador recibió por última vez, {age}. No están actualizadas y no se ha estimado nada para rellenar el hueco."],
   "community.daily.failedLoad": ["The daily community series could not be loaded. Nothing is inferred from a failed request.", "无法加载每日社区序列。失败的请求不会推断任何结果。", "No se pudo cargar la serie comunitaria diaria. No se infiere nada de una solicitud fallida."],
-  "community.daily.activitySummary": ["See community activity", "查看社区活动", "Ver la actividad de la comunidad"],
+  // Frames the four figures wherever they are shown outside the activity
+  // band. In the hero they sit above the download, where an unlabelled set of
+  // totals would read as the reader's own usage rather than the community's.
+  "community.contribution.heroHeading": ["Contributed by the community so far", "社区迄今的贡献", "Aportado por la comunidad hasta ahora"],
+  "community.daily.activitySummary": ["Explore the contribution history", "探索贡献历史", "Explorar el historial de contribuciones"],
   "community.daily.activityHeading": ["Community activity over time", "社区活动趋势", "Actividad de la comunidad a lo largo del tiempo"],
   "community.daily.activityCopy": ["Delayed, aggregate daily totals from optional contributions. This public view includes no prompts, responses, or account details.", "来自可选贡献的延迟汇总每日总量。此公开视图不包含提示词、回复或账户详情。", "Totales diarios agregados y diferidos de contribuciones opcionales. Esta vista pública no incluye prompts, respuestas ni datos de cuentas."],
   "community.daily.activityThrough": ["Activity through", "活动截至", "Actividad hasta"],
@@ -1444,13 +1431,46 @@ export const WEB_MESSAGES = Object.freeze({
   "community.daily.day": ["Day", "日期", "Día"],
   "community.daily.quotaObservations": ["Quota observations", "额度观测", "Observaciones de cuota"],
   "community.daily.contributingDevices": ["Contributing devices", "贡献设备", "Dispositivos contribuyentes"],
+  // The community cache-retention lane. The two rate columns keep the names
+  // the lane publishes rather than a friendlier reading of them: the site
+  // presents the published claim and does not redefine it. The measurement
+  // caveats below are part of the claim, not decoration — the gap basis
+  // overstates a real idle pause, so the short bands must not be read as an
+  // answer to "how long can I wait".
+  "community.cacheRetention.summary": ["Cache retention by pause length", "按暂停时长划分的缓存保留情况", "Retención de caché por duración de la pausa"],
+  "community.cacheRetention.caption": ["Cached input kept across pauses between consecutive requests", "连续请求之间的暂停期内保留的缓存输入", "Entrada en caché conservada durante las pausas entre solicitudes consecutivas"],
+  "community.cacheRetention.measuresCopy": ["Each row groups the gaps between two consecutive requests, not the pauses between your turns. A single turn can send several requests, so a row does not describe how you work.", "每一行汇总的是两次连续请求之间的间隔，而不是你两个轮次之间的停顿。一个轮次可能发送多次请求，因此某一行并不能描述你的工作方式。", "Cada fila agrupa los intervalos entre dos solicitudes consecutivas, no las pausas entre tus turnos. Un solo turno puede enviar varias solicitudes, así que una fila no describe cómo trabajas."],
+  "community.cacheRetention.gapBasisCaveat": ["Every gap is measured from the end of one response to the end of the next, so it overstates the real idle pause by the later request\u2019s own duration. That error grows with response time, so the bands under ten minutes do not answer how long you can wait; the bands from ten minutes up do.", "每个间隔都是从上一次响应结束测量到下一次响应结束，因此会把真实的空闲停顿高估后一次请求本身的耗时。该误差随响应时间增大，所以十分钟以下的区间无法回答你能等多久；十分钟及以上的区间可以。", "Cada intervalo se mide desde el final de una respuesta hasta el final de la siguiente, por lo que sobrestima la pausa real en la duración de la solicitud posterior. Ese error crece con el tiempo de respuesta, así que las bandas de menos de diez minutos no responden cuánto puedes esperar; las de diez minutos en adelante sí."],
+  "community.cacheRetention.noEvidenceNote": ["A dash means no gap of that length was measured. It is not a reuse rate of 0%.", "短横线表示未测到该长度的间隔，并不表示复用率为 0%。", "Un guion significa que no se midió ningún intervalo de esa duración. No es una tasa de reutilización del 0 %."],
+  "community.cacheRetention.concentrationNote": ["Sources counts the distinct participants behind a band, and Largest source is the biggest single share of it. A band with few sources, or one dominant source, describes those contributors rather than the community.", "“来源数”表示某个区间背后的不同参与者数量，“最大来源占比”表示其中单个来源所占的最大份额。来源很少或存在一个主导来源的区间，描述的是这些贡献者，而不是整个社区。", "«Fuentes» cuenta los participantes distintos detrás de una banda y «Fuente mayor» es la mayor porción individual. Una banda con pocas fuentes, o con una dominante, describe a esos contribuyentes y no a la comunidad."],
+  "community.cacheRetention.excludedNote": ["Excluded before these rates: {insufficient} without enough evidence, {contracted} where the context contracted, and {ties} unordered ties.", "在计算这些比率前已排除：{insufficient} 个证据不足，{contracted} 个上下文收缩，{ties} 个顺序无法判定。", "Excluidos antes de estas tasas: {insufficient} sin evidencia suficiente, {contracted} con contexto contraído y {ties} empates sin orden."],
+  "community.cacheRetention.column.pause": ["Pause between requests", "请求之间的暂停", "Pausa entre solicitudes"],
+  "community.cacheRetention.column.reusedMoreThanHalf": ["Reused over half", "复用超过一半", "Reutilizó más de la mitad"],
+  "community.cacheRetention.columnNote": ["Both columns compare against the PREVIOUS request's cached amount: over half means more than half of it was still cached, and all of it means at least as much was. The second is a subset of the first.", "两列均与上一次请求的缓存量比较：“复用超过一半”表示其中超过一半仍被缓存，“全部复用”表示缓存量不少于上一次。后者是前者的子集。", "Ambas columnas se comparan con la cantidad en caché de la solicitud ANTERIOR: «más de la mitad» significa que más de la mitad seguía en caché y «todo» que había al menos la misma cantidad. La segunda es un subconjunto de la primera."],
+  "community.cacheRetention.column.matchedOrExceeded": ["Reused all of it", "全部复用", "Reutilizó todo"],
+  "community.cacheRetention.column.adjacencies": ["Gaps measured", "已测间隔数", "Intervalos medidos"],
+  "community.cacheRetention.column.sessions": ["Sessions", "会话数", "Sesiones"],
+  "community.cacheRetention.column.contributors": ["Sources", "来源数", "Fuentes"],
+  "community.cacheRetention.column.topContributorShare": ["Largest source", "最大来源占比", "Fuente mayor"],
+  "community.cacheRetention.band.underOneMinute": ["Under 1 minute", "1 分钟以内", "Menos de 1 minuto"],
+  "community.cacheRetention.band.oneToTwoMinutes": ["1\u20132 minutes", "1\u20132 分钟", "1\u20132 minutos"],
+  "community.cacheRetention.band.twoToFiveMinutes": ["2\u20135 minutes", "2\u20135 分钟", "2\u20135 minutos"],
+  "community.cacheRetention.band.fiveToTenMinutes": ["5\u201310 minutes", "5\u201310 分钟", "5\u201310 minutos"],
+  "community.cacheRetention.band.tenToThirtyMinutes": ["10\u201330 minutes", "10\u201330 分钟", "10\u201330 minutos"],
+  "community.cacheRetention.band.thirtyMinutesToOneHour": ["30 minutes\u20131 hour", "30 分钟\u20131 小时", "30 minutos\u20131 hora"],
+  "community.cacheRetention.band.oneToTwoHours": ["1\u20132 hours", "1\u20132 小时", "1\u20132 horas"],
+  "community.cacheRetention.band.twoToSixHours": ["2\u20136 hours", "2\u20136 小时", "2\u20136 horas"],
+  "community.cacheRetention.band.sixToTwentyFourHours": ["6\u201324 hours", "6\u201324 小时", "6\u201324 horas"],
+  "community.cacheRetention.band.overTwentyFourHours": ["24 hours to 7 days", "24 小时至 7 天", "De 24 horas a 7 días"],
   // The community allowance series. Aggregate dollar-equivalent estimates and
   // participant counts are owner-approved for publication; the participant
   // count is part of the claim and always rendered as visible copy.
   "community.title": ["What the Codex allowance is really worth", "Codex 额度到底值多少", "Cuánto vale realmente la asignación de Codex"],
   "community.hero.context": ["Community view", "社区视图", "Vista de la comunidad"],
-  "community.allowance.heading": ["Pro 20x-equivalent allowance", "Pro 20x 等值额度", "Asignación equivalente a Pro 20x"],
-  "community.allowance.heroCopy": ["API-price value of a Pro 20x-equivalent week: overall, by plan or by model.", "Pro 20x 等值周额度的 API 价格价值：汇总、按方案或按模型比较。", "Valor a precios de API de una semana equivalente a Pro 20x: global, por plan o modelo."],
+  "community.allowance.headingLegacy": ["Pro 20x-equivalent allowance", "Pro 20x 等值额度", "Asignación equivalente a Pro 20x"],
+  "community.allowance.heading": ["Pro 10x-equivalent allowance", "Pro 10x 等值额度", "Asignación equivalente a Pro 10x"],
+  "community.allowance.heroCopyLegacy": ["Estimated weekly API-price value: Pro 20× equivalent overall and by model; each plan's own week in By plan.", "估计每周 API 价格价值：汇总和按模型使用 Pro 20× 等值；按方案显示各方案自身的一周额度。", "Valor semanal estimado a precios de API: equivalente Pro 20× en conjunto y por modelo; la semana propia de cada plan en Por plan."],
+  "community.allowance.heroCopy": ["Estimated weekly API-price value: Pro 10× equivalent overall and by model; each plan's own week in By plan.", "估计每周 API 价格价值：汇总和按模型使用 Pro 10× 等值；按方案显示各方案自身的一周额度。", "Valor semanal estimado a precios de API: equivalente Pro 10× en conjunto y por modelo; la semana propia de cada plan en Por plan."],
   "community.allowance.dialogEyebrow": ["Community view", "社区视图", "Vista de la comunidad"],
   "community.allowance.dialogTitle": ["Community allowance history", "社区额度历史", "Historial de asignación comunitaria"],
   "community.allowance.dialogCopy": ["Hover, tap or use arrow keys to inspect a day.", "悬停、轻点或使用方向键查看某一天。", "Pasa el cursor, toca o usa las flechas para examinar un día."],
@@ -1459,14 +1479,25 @@ export const WEB_MESSAGES = Object.freeze({
   "community.allowance.viewAggregate": ["Aggregate", "汇总", "Agregado"],
   "community.allowance.viewPlans": ["By plan", "按方案", "Por plan"],
   "community.allowance.viewModels": ["By model", "按模型", "Por modelo"],
-  "community.allowance.smallSampleDisclosure": ["Small samples, including a single account, are uncertain and may reveal that contributor’s estimated capacity. Account IDs stay private.", "小样本可能仅有一个账户，存在不确定性，也可能透露该贡献者的估计额度。账户标识不公开。", "Las muestras pequeñas, incluso de una sola cuenta, son inciertas y pueden revelar su capacidad estimada. Los identificadores son privados."],
+  "community.privacy.heading": ["Community publication", "社区发布", "Publicación comunitaria"],
+  "community.privacy.sample": ["Eligible contributions from signed-in or accountless installations can enter the public community sample. A contribution source is an installation/account track, not a unique person or verified OpenAI account. Separate installations may submit overlapping history. Receiving an upload does not itself publish it.", "符合条件的已登录或无需登录安装实例的贡献均可纳入公开社区样本。一个贡献来源指一个安装实例／账户轨迹，不代表唯一用户或经验证的 OpenAI 账户。不同安装实例可能提交重叠历史。收到上传并不等于发布。", "Las contribuciones elegibles de instalaciones con o sin inicio de sesión pueden formar parte de la muestra pública. Una fuente de contribución es un registro de instalación/cuenta, no una persona única ni una cuenta de OpenAI verificada. Distintas instalaciones pueden enviar historial solapado. Recibir una carga no implica publicarla."],
+  "community.privacy.smallSample": ["The daily view publishes activity totals and API-price-equivalent allowance estimates, including comparisons by plan and model. Estimates and visible sample counts may be based on a single source. Small samples are uncertain and can reveal that source’s estimated capacity, even though no source identifiers are published. This is not a guarantee of anonymity.", "每日视图发布活动总量和 API 价格等值额度估计，包括按方案和模型的比较。估计值和可见样本数可能仅基于一个来源。小样本存在不确定性，即使不公开来源标识，也可能透露该来源的估计额度。这不保证匿名性。", "La vista diaria publica totales de actividad y estimaciones de asignación equivalentes a precios de API, con comparaciones por plan y modelo. Las estimaciones y los recuentos visibles pueden basarse en una sola fuente. Las muestras pequeñas son inciertas y pueden revelar su capacidad estimada, aunque no se publiquen identificadores de las fuentes. Esto no garantiza el anonimato."],
+  "community.privacy.publicationRules": ["Daily publication has no minimum source count or per-source cap. Plan and model comparisons use closed UTC dates and omit stale, incomplete, or unstable estimates. Previously released sealed weekly snapshots retain their original eligibility rules, delay, account thresholds, per-account caps, and rounding. Those rules do not apply to the daily view.", "每日发布不设最少来源数或单一来源上限。方案和模型比较使用已结束的 UTC 日期，并省略过时、不完整或不稳定的估计。此前发布并封存的每周快照保留其原有资格规则、延迟、账户数量门槛、单账户上限和取整规则。这些规则不适用于每日视图。", "La publicación diaria no exige un mínimo de fuentes ni impone un límite por fuente. Las comparaciones por plan y modelo usan fechas UTC cerradas y omiten estimaciones obsoletas, incompletas o inestables. Las instantáneas semanales selladas ya publicadas conservan sus reglas originales de elegibilidad, retraso, umbrales de cuentas, límites por cuenta y redondeo. Esas reglas no se aplican a la vista diaria."],
+  "community.sample.sourcesSummary": ["About these sources", "关于这些来源", "Acerca de estas fuentes"],
+  "community.sample.sourcesDisclosure": ["Contributions can come from signed-in or accountless installations. A source is an installation/account track, not a unique person or verified OpenAI account. Separate installations may include overlapping history.", "贡献可来自已登录或无需登录的安装实例。一个来源指一个安装实例／账户轨迹，不代表唯一用户或经验证的 OpenAI 账户。不同安装实例可能包含重叠历史。", "Las contribuciones pueden proceder de instalaciones con o sin inicio de sesión. Una fuente es un registro de instalación/cuenta, no una persona única ni una cuenta de OpenAI verificada. Distintas instalaciones pueden incluir historial solapado."],
+  "community.allowance.smallSampleDisclosure": ["Small samples, including a single source, are uncertain and may reveal that source’s estimated capacity. Source identifiers stay private.", "小样本可能仅有一个来源，存在不确定性，也可能透露该来源的估计额度。来源标识不公开。", "Las muestras pequeñas, incluso de una sola fuente, son inciertas y pueden revelar su capacidad estimada. Los identificadores de las fuentes son privados."],
   "community.allowance.planChartLabel": ["Community allowance by plan", "按方案显示社区额度", "Asignación comunitaria por plan"],
   "community.allowance.modelChartLabel": ["Community allowance by model", "按模型显示社区额度", "Asignación comunitaria por modelo"],
-  "community.allowance.planChartDescription": ["A separate Pro 20×-equivalent weekly estimate for each plan group. Shading shows the middle 80% of qualified reset fits when available. Missing days remain gaps. Arrow keys inspect individual points.", "每个方案分组单独显示 Pro 20× 等值周额度估计。有足够数据时，阴影显示合格重置拟合的中间 80% 范围。缺失日期保持为空缺。使用方向键查看各点。", "Una estimación semanal equivalente a Pro 20× por grupo de planes. El sombreado muestra el 80% central de los ajustes válidos cuando está disponible. Los días ausentes quedan vacíos. Las flechas recorren los puntos."],
-  "community.allowance.modelChartDescription": ["A separate full-week Pro 20×-equivalent estimate for each identified model. Dot size reflects supporting accounts, not reset fits. No uncertainty band is available. Missing days remain gaps. Arrow keys inspect individual points.", "每个可识别模型单独显示完整一周的 Pro 20× 等值估计。点的大小表示支持账户数，而非重置拟合数。不提供不确定性区间。缺失日期保持为空缺。使用方向键查看各点。", "Una estimación semanal completa equivalente a Pro 20× por modelo identificado. El tamaño del punto indica cuentas, no ajustes de reinicio. No hay banda de incertidumbre. Los días ausentes quedan vacíos. Las flechas recorren los puntos."],
-  "community.allowance.planMethod": ["Chart scaled to Pro 20×: Pro 20× ×1, Pro 5× ×4, Plus ×20. Smaller card values show each plan’s own week at API prices. Shading: middle 80% of qualifying reset fits. Missing days stay gaps.", "图表换算为 Pro 20×：Pro 20× 乘以 1，Pro 5× 乘以 4，Plus 乘以 20。卡片的小字金额为各方案实际一周额度的 API 等值。阴影为合格重置拟合的中间 80%。缺失日期保持为空缺。", "Gráfico escalado a Pro 20×: Pro 20× ×1, Pro 5× ×4, Plus ×20. Los importes pequeños muestran la semana propia de cada plan a precios de API. Sombreado: 80% central de ajustes válidos. Los días sin datos quedan vacíos."],
-  "community.allowance.modelMethod": ["A full Pro 20× week spent on one model, at API prices. Only stable, identified fits appear; counts are supporting accounts, not reset fits. History uses evidence through each day; missing or unstable estimates stay gaps. Model availability is not implied.", "将完整的 Pro 20× 周额度用于单一模型，按 API 价格计值。仅展示稳定且可识别的拟合；计数为支持账户数，并非重置拟合数。历史仅使用截至当日的证据；缺失或不稳定的估计保持为空缺。不表示模型当前可用。", "Una semana Pro 20× completa en un modelo, a precios de API. Solo ajustes estables e identificados; se cuentan cuentas, no ajustes de reinicio. El historial usa evidencia hasta cada fecha; las estimaciones ausentes o inestables dejan huecos. No implica disponibilidad del modelo."],
-  "community.allowance.cardsCaption": ["API-equivalent USD / Pro 20× week", "API 等值美元 / Pro 20× 周额度", "USD equivalentes de API / semana Pro 20×"],
+  "community.allowance.planChartDescription": ["Each plan’s own estimated week at API prices, on its own scale. Shading shows the middle 80% of qualified reset fits. Missing days remain gaps. Arrow keys inspect individual points.", "按 API 价格分别估计每个方案自身的一周额度，并使用各自刻度。阴影显示合格重置拟合的中间 80%。缺失日期保持为空缺。使用方向键查看各点。", "La semana estimada de cada plan a precios de API, con su propia escala. El sombreado muestra el 80% central de los ajustes válidos. Los días ausentes quedan vacíos. Las flechas recorren los puntos."],
+  "community.allowance.modelChartDescriptionLegacy": ["A separate full-week Pro 20×-equivalent estimate for each identified model. Dot size reflects contribution sources, not reset fits. No uncertainty band is available. Missing days remain gaps. Arrow keys inspect individual points.", "每个可识别模型单独显示完整一周的 Pro 20× 等值估计。点的大小表示贡献来源数，而非重置拟合数。不提供不确定性区间。缺失日期保持为空缺。使用方向键查看各点。", "Una estimación semanal completa equivalente a Pro 20× por modelo identificado. El tamaño del punto indica fuentes de contribución, no ajustes de reinicio. No hay banda de incertidumbre. Los días ausentes quedan vacíos. Las flechas recorren los puntos."],
+  "community.allowance.modelChartDescription": ["A separate full-week Pro 10×-equivalent estimate for each identified model. Dot size reflects contribution sources, not reset fits. No uncertainty band is available. Missing days remain gaps. Arrow keys inspect individual points.", "每个可识别模型单独显示完整一周的 Pro 10× 等值估计。点的大小表示贡献来源数，而非重置拟合数。不提供不确定性区间。缺失日期保持为空缺。使用方向键查看各点。", "Una estimación semanal completa equivalente a Pro 10× por modelo identificado. El tamaño del punto indica fuentes de contribución, no ajustes de reinicio. No hay banda de incertidumbre. Los días ausentes quedan vacíos. Las flechas recorren los puntos."],
+  "community.allowance.planMethodLegacy": ["Shading shows the middle 80% of qualifying reset fits. Missing days stay gaps.", "阴影表示合格重置拟合的中间 80%。缺失日期保持为空隙。", "El sombreado muestra el 80 % central de los ajustes de restablecimiento válidos. Los días ausentes quedan como huecos."],
+  "community.allowance.planMethod": ["Shading shows the middle 80% of qualifying reset fits. Missing days stay gaps.", "阴影表示合格重置拟合的中间 80%。缺失日期保持为空隙。", "El sombreado muestra el 80 % central de los ajustes de restablecimiento válidos. Los días ausentes quedan como huecos."],
+  "community.allowance.modelMethodLegacy": ["A full Pro 20× week spent on one model, at API prices. Only stable, identified fits appear; counts are contribution sources, not reset fits. History uses evidence through each day; missing or unstable estimates stay gaps. Model availability is not implied.", "将完整的 Pro 20× 周额度用于单一模型，按 API 价格计值。仅展示稳定且可识别的拟合；计数为贡献来源数，并非重置拟合数。历史仅使用截至当日的证据；缺失或不稳定的估计保持为空缺。不表示模型当前可用。", "Una semana Pro 20× completa en un modelo, a precios de API. Solo ajustes estables e identificados; se cuentan fuentes de contribución, no ajustes de reinicio. El historial usa evidencia hasta cada fecha; las estimaciones ausentes o inestables dejan huecos. No implica disponibilidad del modelo."],
+  "community.allowance.modelMethod": ["A full Pro 10× week spent on one model, at API prices. Only stable, identified fits appear; counts are contribution sources, not reset fits. History uses evidence through each day; missing or unstable estimates stay gaps. Model availability is not implied.", "将完整的 Pro 10× 周额度用于单一模型，按 API 价格计值。仅展示稳定且可识别的拟合；计数为贡献来源数，并非重置拟合数。历史仅使用截至当日的证据；缺失或不稳定的估计保持为空缺。不表示模型当前可用。", "Una semana Pro 10× completa en un modelo, a precios de API. Solo ajustes estables e identificados; se cuentan fuentes de contribución, no ajustes de reinicio. El historial usa evidencia hasta cada fecha; las estimaciones ausentes o inestables dejan huecos. No implica disponibilidad del modelo."],
+  "community.allowance.cardsCaption": ["API-equivalent USD / week", "API 等值美元 / 周", "USD equivalentes de API / semana"],
+  "community.allowance.referenceEquivalentLegacy": ["Pro 20x-equivalent: {value}/week", "Pro 20x 等效：每周 {value}", "Equivalente Pro 20x: {value}/semana"],
+  "community.allowance.referenceEquivalent": ["Pro 10x-equivalent: {value}/week", "Pro 10x 等效：每周 {value}", "Equivalente Pro 10x: {value}/semana"],
   "community.allowance.actualPlanValue": ["This plan: {value}/week at API prices", "此方案：按 API 价格每周 {value}", "Este plan: {value}/semana a precios de API"],
   "community.allowance.legendFocus": ["Select a legend to focus; select it again to show all.", "选择图例以聚焦；再次选择以显示全部。", "Selecciona una leyenda para destacar; repite para ver todas."],
   "community.allowance.breakdownsUnavailable": ["This breakdown is not available for public display yet. The aggregate and community activity views remain separate.", "此分类明细尚未提供公开展示。汇总视图与社区活动视图仍然独立。", "Este desglose aún no está disponible para su publicación. Las vistas agregada y de actividad comunitaria siguen siendo independientes."],
@@ -1478,6 +1509,7 @@ export const WEB_MESSAGES = Object.freeze({
   "community.allowance.unavailable": ["Allowance estimates unavailable", "额度估计不可用", "Estimaciones de asignación no disponibles"],
   "community.allowance.accumulating": ["Estimates still accumulating", "估计仍在累积中", "Las estimaciones aún se están acumulando"],
   "community.allowance.modelsAccumulating": ["No identified model estimates are available in the published history yet. A plan or aggregate estimate does not establish a reliable rate for each model; missing or unstable model evidence remains a gap.", "已发布历史中尚无可识别的模型估计。方案或汇总估计并不能确定每个模型的可靠费率；缺失或不稳定的模型证据保持为空缺。", "Aún no hay estimaciones de modelos identificados en el historial publicado. Una estimación por plan o agregada no establece una tasa fiable para cada modelo; la evidencia ausente o inestable deja huecos."],
+  "community.allowance.noModelEstimate": ["No published estimate yet", "暂无已发布估计", "Aún no hay estimación publicada"],
   "community.allowance.updating": ["Merged history updating", "合并历史正在更新", "Actualizando el historial combinado"],
   "community.allowance.updatingCopy": ["The merged allowance history is updating. Daily activity remains available below.", "合并后的额度历史正在更新。下方的每日活动仍然可用。", "El historial combinado de asignación se está actualizando. La actividad diaria sigue disponible más abajo."],
   "community.allowance.stillAccumulating": ["Allowance estimates are still accumulating. Published days exist, but no reset fit has qualified yet — the daily activity below shows contributions arriving.", "额度估计仍在累积中。已有发布的日期，但尚无合格的重置拟合——下方的每日活动显示贡献正在到达。", "Las estimaciones de asignación aún se están acumulando. Existen días publicados, pero ningún ajuste de restablecimiento ha calificado todavía; la actividad diaria más abajo muestra que las contribuciones están llegando."],
@@ -1492,14 +1524,16 @@ export const WEB_MESSAGES = Object.freeze({
   "community.allowance.legendBand": ["Plausible range (middle 80%)", "合理范围（中间 80%）", "Rango plausible (80 % central)"],
   "community.allowance.legendDots": ["Dot size = reset fits behind the day", "圆点大小 = 该日背后的重置拟合数", "Tamaño del punto = ajustes de restablecimiento detrás del día"],
   "community.allowance.chartLabel": ["Community allowance estimate chart", "社区额度估计图表", "Gráfico de estimación de asignación comunitaria"],
-  "community.allowance.chartDescription": ["Combined Pro 20x-equivalent seven-day allowance value in API-equivalent dollars per published day: a central line, a shaded middle-80% range where published, and dots sized by the number of qualifying reset fits. Days without estimates appear as gaps.", "每个已发布日期的合并 Pro 20x 等值七天额度价值（API 等价美元）：一条中心线、发布时的中间 80% 阴影范围，以及按合格重置拟合数量确定大小的圆点。没有估计的日期显示为空缺。", "Valor combinado equivalente a Pro 20x de la asignación de siete días en dólares equivalentes de API por día publicado: una línea central, un rango sombreado del 80 % central donde se publicó y puntos cuyo tamaño refleja el número de ajustes de restablecimiento válidos. Los días sin estimaciones aparecen como huecos."],
+  "community.allowance.chartDescriptionLegacy": ["Combined Pro 20x-equivalent seven-day allowance value in API-equivalent dollars per published day: a central line, a shaded middle-80% range where published, and dots sized by the number of qualifying reset fits. Days without estimates appear as gaps.", "每个已发布日期的合并 Pro 20x 等值七天额度价值（API 等价美元）：一条中心线、发布时的中间 80% 阴影范围，以及按合格重置拟合数量确定大小的圆点。没有估计的日期显示为空缺。", "Valor combinado equivalente a Pro 20x de la asignación de siete días en dólares equivalentes de API por día publicado: una línea central, un rango sombreado del 80 % central donde se publicó y puntos cuyo tamaño refleja el número de ajustes de restablecimiento válidos. Los días sin estimaciones aparecen como huecos."],
+  "community.allowance.chartDescription": ["Combined Pro 10x-equivalent seven-day allowance value in API-equivalent dollars per published day: a central line, a shaded middle-80% range where published, and dots sized by the number of qualifying reset fits. Days without estimates appear as gaps.", "每个已发布日期的合并 Pro 10x 等值七天额度价值（API 等价美元）：一条中心线、发布时的中间 80% 阴影范围，以及按合格重置拟合数量确定大小的圆点。没有估计的日期显示为空缺。", "Valor combinado equivalente a Pro 10x de la asignación de siete días en dólares equivalentes de API por día publicado: una línea central, un rango sombreado del 80 % central donde se publicó y puntos cuyo tamaño refleja el número de ajustes de restablecimiento válidos. Los días sin estimaciones aparecen como huecos."],
   "community.allowance.sparseNote": ["The allowance series is still filling in. Dots mark the few published estimates so far.", "额度序列仍在补充中。圆点标记目前已发布的少量估计。", "La serie de asignación todavía se está completando. Los puntos marcan las pocas estimaciones publicadas hasta ahora."],
   // Compact strings for the on-chart hover tooltip: a small caption under the
   // central dollar value, and a single-line plausible-range row (the legend and
   // headline carry the full-sentence forms).
   "community.allowance.tooltipCentralCaption": ["central estimate", "中心估计", "estimación central"],
   "community.allowance.tooltipRange": ["Plausible range {lower}–{upper}", "合理范围 {lower}–{upper}", "Rango plausible {lower}–{upper}"],
-  "community.allowance.methodNote": ["Each point combines qualifying reset fits from the trailing 30 days after normalizing supported personal plans to a Pro 20x equivalent (Pro ×1, Pro 5x ×4, Plus ×20). The line is the median, the range is the middle 80%, and every fit passes the shared calibration gates including the 40-point observed-span floor. Unsupported plans are excluded; late data republishes the day.", "每个点都汇总过去 30 天内的合格重置拟合，并将支持的个人方案换算为 Pro 20x 等值（Pro ×1、Pro 5x ×4、Plus ×20）。折线为中位数，区间为中间 80%；每个拟合均通过共享校准门槛，包括 40 个百分点的观测跨度下限。不支持的方案会被排除；迟到的数据会重新发布对应日期。", "Cada punto combina los ajustes de restablecimiento válidos de los últimos 30 días tras normalizar los planes personales compatibles a un equivalente de Pro 20x (Pro ×1, Pro 5x ×4 y Plus ×20). La línea es la mediana, el rango es el 80 % central y cada ajuste supera las puertas de calibración compartidas, incluido el mínimo de 40 puntos de amplitud observada. Los planes no compatibles se excluyen; los datos tardíos vuelven a publicar el día."],
+  "community.allowance.methodNote": ["Each point combines qualifying reset fits from the trailing 30 days after normalizing supported personal plans to a Pro 10× equivalent (Pro ×1, Pro 5× ×2, Pro Max 25× ×0.4, Plus ×10). The line is the median, the range is the middle 80%, and every fit passes the shared calibration gates including the 25-point observed-span floor. Unsupported plans are excluded; late data republishes the day.", "每个点都汇总过去 30 天内的合格重置拟合，并将支持的个人方案换算为 Pro 10× 等值（Pro ×1、Pro 5× ×2、Pro Max 25× ×0.4、Plus ×10）。折线为中位数，区间为中间 80%；每个拟合均通过共享校准门槛，包括 25 个百分点的观测跨度下限。不支持的方案会被排除；迟到的数据会重新发布对应日期。", "Cada punto combina los ajustes de restablecimiento válidos de los últimos 30 días tras normalizar los planes personales compatibles a un equivalente de Pro 10× (Pro ×1, Pro 5× ×2, Pro Max 25× ×0,4 y Plus ×10). La línea es la mediana, el rango es el 80 % central y cada ajuste supera las puertas de calibración compartidas, incluido el mínimo de 25 puntos de amplitud observada. Los planes no compatibles se excluyen; los datos tardíos vuelven a publicar el día."],
+  "community.allowance.methodNoteLegacy": ["Each point combines qualifying reset fits from the trailing 30 days after normalizing supported personal plans to a Pro 20x equivalent (Pro ×1, Pro 5x ×4, Plus ×20). The line is the median, the range is the middle 80%, and every fit passes the shared calibration gates recorded with that published basis. Unsupported plans are excluded; late data republishes the day.", "每个点都汇总过去 30 天内的合格重置拟合，并将支持的个人方案换算为 Pro 20x 等值（Pro ×1、Pro 5x ×4、Plus ×20）。折线为中位数，区间为中间 80%；每个拟合均通过共享校准门槛，以已发布的换算基准为准。不支持的方案会被排除；迟到的数据会重新发布对应日期。", "Cada punto combina los ajustes de restablecimiento válidos de los últimos 30 días tras normalizar los planes personales compatibles a un equivalente de Pro 20x (Pro ×1, Pro 5x ×4 y Plus ×20). La línea es la mediana, el rango es el 80 % central y cada ajuste supera las puertas de calibración compartidas, registradas con esa base publicada. Los planes no compatibles se excluyen; los datos tardíos vuelven a publicar el día."],
 });
 
 function catalogIndex(locale) {
@@ -1664,14 +1698,15 @@ export const WEB_PLURAL_MESSAGES = Object.freeze({
     other: ["{count} of these are short observations, drawn as outlined markers.", "其中 {count} 个为短观测，以空心标记绘制。", "{count} de estos son observaciones cortas, dibujadas como marcadores sin relleno."],
   }),
   // The community allowance caveat: the participant count backing every point
-  // is visible copy, so "from 1 contributing account" reads plainly.
+  // is visible copy. API participantCount fields retain their existing meaning;
+  // public labels do not claim unique people or verified provider accounts.
   "community.allowance.accountCount": Object.freeze({
-    one: ["from {count} contributing account", "来自 {count} 个贡献账户", "de {count} cuenta contribuyente"],
-    other: ["from {count} contributing accounts", "来自 {count} 个贡献账户", "de {count} cuentas contribuyentes"],
+    one: ["from {count} contribution source", "来自 {count} 个贡献来源", "de {count} fuente de contribución"],
+    other: ["from {count} contribution sources", "来自 {count} 个贡献来源", "de {count} fuentes de contribución"],
   }),
   "community.allowance.shortAccountCount": Object.freeze({
-    one: ["{count} account", "{count} 个账户", "{count} cuenta"],
-    other: ["{count} accounts", "{count} 个账户", "{count} cuentas"],
+    one: ["{count} source", "{count} 个来源", "{count} fuente"],
+    other: ["{count} sources", "{count} 个来源", "{count} fuentes"],
   }),
   "community.allowance.fitCount": Object.freeze({
     one: ["{count} qualifying reset fit in the trailing 30 days", "过去 30 天内 {count} 个合格重置拟合", "{count} ajuste de restablecimiento que califica en los últimos 30 días"],
@@ -1959,7 +1994,7 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Open TiboTattle and let it calculate your Codex usage locally.": ["打开 TiboTattle，让它在本地计算你的 Codex 使用情况。", "Abre TiboTattle y deja que calcule tu uso de Codex de forma local."],
   "See your week": ["查看你的一周", "Consulta tu semana"],
   "View your allowance estimate and history in the app.": ["在应用中查看额度估计和历史记录。", "Consulta en la app la estimación de tu límite y su historial."],
-  "When available, this leads with one combined Pro 20x-equivalent allowance from delayed, anonymous personal-plan contributions. The daily activity series sits below. A late contribution never edits history: it publishes a replacement revision for its day.": ["如有可用数据，这里会首先展示一个合并后的 Pro 20x 等值额度，数据来自延迟的匿名个人方案贡献。每日活动序列位于下方。迟到的贡献绝不会改写历史：它会为对应日期发布替代修订。", "Cuando está disponible, aquí se muestra primero una única asignación combinada equivalente a Pro 20x a partir de contribuciones anónimas y diferidas de planes personales. La serie de actividad diaria está debajo. Una contribución tardía nunca edita el historial: publica una revisión de reemplazo para su día."],
+  "When available, this leads with one combined Pro 10x-equivalent allowance from delayed, anonymous personal-plan contributions. The daily activity series sits below. A late contribution never edits history: it publishes a replacement revision for its day.": ["如有可用数据，这里会首先展示一个合并后的 Pro 10x 等值额度，数据来自延迟的匿名个人方案贡献。每日活动序列位于下方。迟到的贡献绝不会改写历史：它会为对应日期发布替代修订。", "Cuando está disponible, aquí se muestra primero una única asignación combinada equivalente a Pro 10x a partir de contribuciones anónimas y diferidas de planes personales. La serie de actividad diaria está debajo. Una contribución tardía nunca edita el historial: publica una revisión de reemplazo para su día."],
   "What the Codex allowance is really worth": ["Codex 额度到底值多少", "Cuánto vale realmente la asignación de Codex"],
   "Community view": ["社区视图", "Vista de la comunidad"],
   "See community activity": ["查看社区活动", "Ver la actividad de la comunidad"],
@@ -1969,8 +2004,8 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "A larger view of the same published estimate. Hover, tap, or use the arrow keys to inspect a day.": ["同一已发布估计的放大视图。悬停、轻点或使用方向键查看某一天。", "Una vista ampliada de la misma estimación publicada. Pasa el cursor, toca o usa las flechas para examinar un día."],
   "Close": ["关闭", "Cerrar"],
   "Time range": ["时间范围", "Intervalo de tiempo"],
-  "Combined Pro 20x-equivalent allowance": ["合并后的 Pro 20x 等值额度", "Asignación combinada equivalente a Pro 20x"],
-  "One combined estimate across contributing personal-plan accounts, normalized to a Pro 20x equivalent and valued at API prices.": ["一个合并估计，涵盖参与贡献的个人方案账户，统一换算为 Pro 20x 等值并按 API 价格计值。", "Una sola estimación combinada de las cuentas contribuyentes de planes personales, normalizada a un equivalente de Pro 20x y valorada a precios de API."],
+  "Combined Pro 10x-equivalent allowance": ["合并后的 Pro 10x 等值额度", "Asignación combinada equivalente a Pro 10x"],
+  "One combined estimate across contributing personal-plan accounts, normalized to a Pro 10x equivalent and valued at API prices.": ["一个合并估计，涵盖参与贡献的个人方案账户，统一换算为 Pro 10x 等值并按 API 价格计值。", "Una sola estimación combinada de las cuentas contribuyentes de planes personales, normalizada a un equivalente de Pro 10x y valorada a precios de API."],
   "Checking allowance estimates": ["正在检查额度估计", "Comprobando las estimaciones de asignación"],
   "Checking for published allowance estimates…": ["正在检查已发布的额度估计…", "Comprobando las estimaciones de asignación publicadas…"],
   "Checking daily activity": ["正在检查每日活动", "Comprobando la actividad diaria"],
@@ -2074,7 +2109,6 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Current quota observations and API-price-equivalent usage from your local evidence.": ["来自本地证据的当前额度观测和 API 价格等值使用情况。", "Observaciones actuales de cuota y uso equivalente al precio de API a partir de tu evidencia local."],
   "Speed-priced API-price equivalent": ["按按速度档定价的 API 价格等值", "Equivalente de precio de API con precio según velocidad"],
   "Replay-safe usage cost": ["可重放安全的使用成本", "Coste de uso seguro para reproducción"],
-  "Standard-rate API prices applied to non-overlapping local token increments, then multiplied by the published Priority (Fast) API price ratio for increments whose effective mode is Fast. It tracks relative quota consumption; it is not a subscription charge or a published dollar limit.": ["将标准费率 API 价格应用于不重叠的本地令牌增量，再对有效模式为 Fast 的增量乘以公开的 Fast 抵扣费率。它跟踪相对额度消耗；不是订阅费用或公开的美元限额。", "Precios de API de tarifa estándar aplicados a incrementos locales de tokens no superpuestos y luego multiplicados por la tasa publicada de crédito Fast para incrementos cuyo modo efectivo es Fast. Registra el consumo relativo de cuota; no es un cargo de suscripción ni un límite en dólares publicado."],
   "Recorded period": ["记录期间", "Periodo registrado"],
   "This activity total can exceed the inferred weekly limit: it spans a calendar period, while the weekly estimate describes one observed reset track and may cross resets, credits, or account changes.": ["此活动总量可能超过推断的每周限额：它跨越一个日历期间，而每周估计描述的是一个观测到的重置轨迹，并且可能跨越重置、抵扣或帐户变化。", "Este total de actividad puede superar el límite semanal inferido: abarca un período de calendario, mientras que la estimación semanal describe una trayectoria de reinicio observada y puede cruzar reinicios, créditos o cambios de cuenta."],
   "Measured versus calculated": ["实测与计算", "Medido frente a calculado"],
@@ -2160,7 +2194,6 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "30d": ["30 天", "30 días"],
   "90d": ["90 天", "90 días"],
   "API pricing is a measuring stick, not your bill.": ["API 定价是衡量标尺，不是你的账单。", "Los precios de API son una regla de medida, no tu factura."],
-  "Each local usage change uses the public API price that was in effect when it occurred, with the published Priority (Fast) price ratio when applicable. It is an equivalent for comparison, not an invoice.": ["每个本地使用变化都使用其发生时有效的公开 API 价格，并在适用时采用公开的 Fast 倍数。它是用于比较的等值，而不是账单。", "Cada cambio de uso local usa el precio público de API vigente cuando ocurrió, con el multiplicador Fast publicado cuando corresponde. Es un equivalente para comparar, no una factura."],
   "Token components": ["令牌组成", "Componentes de tokens"],
   "Token count": ["令牌数量", "Recuento de tokens"],
   "Every token belongs to one non-overlapping component. Output text excludes reasoning tokens; combined output is only used when a source does not provide that split.": ["每个令牌只属于一个不重叠的组成部分。输出文本不包括推理令牌；只有在来源未提供该拆分时才使用合并输出。", "Cada token pertenece a un componente no superpuesto. El texto de salida excluye los tokens de razonamiento; la salida combinada solo se usa cuando una fuente no proporciona esa división."],
@@ -2682,4 +2715,9 @@ export function createBrowserLocalization({
     tPlural,
     translateText: (value) => legacyText(value, locale),
   });
+}
+
+// Static public resources share the language chosen on the download page.
+if (typeof document !== "undefined" && document.body?.classList.contains("resource-site")) {
+  createBrowserLocalization();
 }

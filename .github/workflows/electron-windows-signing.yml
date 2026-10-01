@@ -350,6 +350,8 @@ jobs:
             .release-build/electron-production/win32-x64/artifacts/TiboTattle-*-Windows-x64.exe
             .release-build/electron-production/win32-x64/artifacts/TiboTattle-*-Windows-x64.exe.blockmap
             .release-build/electron-production/win32-x64/artifacts/latest.yml
+            .release-build/electron-production/win32-x64/production-source-candidate.json
+            .release-build/electron-production/win32-x64/app-update.yml
             .release-build/electron-production/win32-x64/evidence/windows-signing-operation-ledger.json
             .release-build/electron-production/win32-x64/evidence/windows-builder-failure.envelope.json
             .release-build/electron-production/win32-x64/windows-native-rebinding/rebound.json

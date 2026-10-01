@@ -8,7 +8,7 @@ status: implemented
 # TiboTattle — app icon & identity brief
 
 The approved application icon was produced from this brief. The maintained
-asset provenance is recorded in `apps/macos/Assets/AppIcon.provenance.txt`;
+asset provenance is recorded in `apps/electron/assets/AppIcon.provenance.txt`;
 this file remains only because that provenance points to the original design
 constraints.
 

@@ -72,8 +72,14 @@ describe("owner distribution analytics", () => {
         "Bearer analytics-secret",
       );
       const body = JSON.parse(String(init?.body)) as {
+        query: string;
         variables: { start: string; end: string };
       };
+      expect(body.query).toContain("/intel/appcast.xml");
+      expect(body.query).toContain("/intel/releases/%");
+      expect(body.query).toContain("/electron/stable/darwin-arm64/latest-mac.yml");
+      expect(body.query).toContain("/electron/stable/win32-x64/latest.yml");
+      expect(body.query).toContain("/electron/stable/linux-x64/latest-linux.yml");
       const { start, end } = body.variables;
       segmentStarts.push(start);
       expect(Date.parse(end) - Date.parse(start)).toBe(24 * 60 * 60 * 1_000);
@@ -126,8 +132,48 @@ describe("owner distribution analytics", () => {
           }),
         ]
         : [];
+      const electronMacArm64 = isLast ? [analyticsRow({
+        count: 4,
+        clientIP: "203.0.113.6",
+        userAgent: "TiboTattle/0.1.23 electron-updater",
+      })] : [];
+      const electronMacX64 = isLast ? [analyticsRow({
+        clientIP: "203.0.113.9",
+        userAgent: "TiboTattle/0.1.23 electron-updater",
+      })] : [];
+      const electronWindowsX64 = isLast ? [analyticsRow({
+        count: 2,
+        clientIP: "203.0.113.7",
+        userAgent: "TiboTattle/0.1.22 electron-updater",
+      })] : [];
+      const electronLinuxX64 = isLast ? [analyticsRow({
+        clientIP: "203.0.113.8",
+        userAgent: "Electron/39.0.0 electron-updater",
+      })] : [];
       return jsonResponse({
-        data: { viewer: { zones: [{ appcast, releases }] } },
+        data: { viewer: { zones: [{
+          nativeArm64: appcast,
+          nativeX64: [],
+          electronMacArm64,
+          electronMacX64,
+          electronWindowsX64,
+          electronLinuxX64,
+          releases,
+          intelReleases: isLast ? [
+            analyticsRow({
+              count: 2,
+              clientIP: "203.0.113.10",
+              userAgent: "TiboTattle/0.1.12 Sparkle/2.9.3",
+              edgeResponseStatus: 206,
+            }),
+            analyticsRow({
+              count: 50,
+              clientIP: "203.0.113.11",
+              userAgent: "TiboTattle/0.1.12 Sparkle/2.9.3",
+              edgeResponseStatus: 500,
+            }),
+          ] : [],
+        }] } },
         errors: null,
       });
     }) as unknown as typeof fetch;
@@ -152,7 +198,7 @@ describe("owner distribution analytics", () => {
       status: "available",
       sampled: true,
       bounded: false,
-      activeSourceAddresses: { last24Hours: 3, last7Days: 4 },
+      activeSourceAddresses: { last24Hours: 7, last7Days: 8 },
       preflight: {
         requests: { last24Hours: 3, last7Days: 16 },
         sourceAddresses: { last24Hours: 2, last7Days: 3 },
@@ -161,21 +207,87 @@ describe("owner distribution analytics", () => {
         requests: { last24Hours: 3, last7Days: 3 },
         sourceAddresses: { last24Hours: 1, last7Days: 1 },
       },
+      electronChecks: {
+        requests: { last24Hours: 8, last7Days: 8 },
+        sourceAddresses: { last24Hours: 4, last7Days: 4 },
+      },
       sparkleDownloads: {
-        requests: { last24Hours: 1, last7Days: 1 },
-        sourceAddresses: { last24Hours: 1, last7Days: 1 },
+        requests: { last24Hours: 3, last7Days: 3 },
+        sourceAddresses: { last24Hours: 2, last7Days: 2 },
       },
       currentVersion: "0.1.12",
       currentVersionSourceAddresses: { last24Hours: 2, last7Days: 3 },
       observedVersions: [{
+        client: "native",
+        operatingSystem: "macos",
+        architecture: "arm64",
         version: "0.1.12",
         requestsLast7Days: 18,
         sourceAddressesLast7Days: 3,
       }, {
+        client: "electron",
+        operatingSystem: "macos",
+        architecture: "arm64",
+        version: "0.1.23",
+        requestsLast7Days: 4,
+        sourceAddressesLast7Days: 1,
+      }, {
+        client: "electron",
+        operatingSystem: "windows",
+        architecture: "x64",
+        version: "0.1.22",
+        requestsLast7Days: 2,
+        sourceAddressesLast7Days: 1,
+      }, {
+        client: "electron",
+        operatingSystem: "linux",
+        architecture: "x64",
+        version: null,
+        requestsLast7Days: 1,
+        sourceAddressesLast7Days: 1,
+      }, {
+        client: "electron",
+        operatingSystem: "macos",
+        architecture: "x64",
+        version: "0.1.23",
+        requestsLast7Days: 1,
+        sourceAddressesLast7Days: 1,
+      }, {
+        client: "native",
+        operatingSystem: "macos",
+        architecture: "arm64",
         version: "0.1.11",
         requestsLast7Days: 1,
         sourceAddressesLast7Days: 1,
       }],
+      observedTotals: {
+        macosArchitectures: [{
+          architecture: "arm64",
+          requestsLast7Days: 23,
+          sourceAddressesLast7Days: 5,
+        }, {
+          architecture: "x64",
+          requestsLast7Days: 1,
+          sourceAddressesLast7Days: 1,
+        }],
+        platforms: [{
+          operatingSystem: "macos",
+          requestsLast7Days: 24,
+          sourceAddressesLast7Days: 6,
+        }, {
+          operatingSystem: "windows",
+          requestsLast7Days: 2,
+          sourceAddressesLast7Days: 1,
+        }, {
+          operatingSystem: "linux",
+          requestsLast7Days: 1,
+          sourceAddressesLast7Days: 1,
+        }],
+        overall: {
+          requestsLast7Days: 27,
+          sourceAddressesLast7Days: 8,
+        },
+      },
     });
     expect(overview.cloudflare.bySegment).toHaveLength(7);
     expect(overview.cloudflare.bySegment.slice(0, 2)).toEqual([{
@@ -184,6 +296,7 @@ describe("owner distribution analytics", () => {
       activeSourceAddresses: 2,
       preflightRequests: 3,
       sparkleCheckRequests: 0,
+      electronCheckRequests: 0,
       sparkleDownloadRequests: 0,
       currentVersionSourceAddresses: 2,
     }, {
@@ -192,16 +305,18 @@ describe("owner distribution analytics", () => {
       activeSourceAddresses: 1,
       preflightRequests: 2,
       sparkleCheckRequests: 0,
+      electronCheckRequests: 0,
       sparkleDownloadRequests: 0,
       currentVersionSourceAddresses: 1,
     }]);
     expect(overview.cloudflare.bySegment.at(-1)).toEqual({
       startsAt: "2026-08-16T12:00:00.000Z",
       endsAt: "2026-08-17T12:00:00.000Z",
-      activeSourceAddresses: 3,
+      activeSourceAddresses: 7,
       preflightRequests: 3,
       sparkleCheckRequests: 3,
-      sparkleDownloadRequests: 1,
+      electronCheckRequests: 8,
+      sparkleDownloadRequests: 3,
       currentVersionSourceAddresses: 2,
     });
     expect(overview.github).toMatchObject({
@@ -232,6 +347,119 @@ describe("owner distribution analytics", () => {
     expect(serialized).not.toContain("analytics-secret");
   });
 
+  it("deduplicates observed totals across apps, versions, platforms, and segments before the version cap", async () => {
+    const dayMilliseconds = 24 * 60 * 60 * 1_000;
+    const segmentStarts = Array.from({ length: 7 }, (_, index) =>
+      new Date(NOW - 7 * dayMilliseconds + index * dayMilliseconds).toISOString());
+    const segmentStart = (index: number): string => {
+      const value = segmentStarts[index];
+      if (value === undefined) throw new Error("missing analytics segment");
+      return value;
+    };
+    const rowsBySegment = new Map(segmentStarts.map((startsAt) => [
+      startsAt,
+      {
+        nativeArm64: [] as object[],
+        nativeX64: [] as object[],
+        electronMacArm64: [] as object[],
+        electronMacX64: [] as object[],
+        electronWindowsX64: [] as object[],
+        electronLinuxX64: [] as object[],
+      },
+    ]));
+    rowsBySegment.get(segmentStart(0))?.nativeArm64.push(analyticsRow({
+      count: 2,
+      clientIP: "198.51.100.1",
+      userAgent: "TiboTattle/1.0.0 CFNetwork/1",
+    }));
+    rowsBySegment.get(segmentStart(1))?.nativeX64.push(analyticsRow({
+      count: 3,
+      clientIP: "198.51.100.1",
+      userAgent: "TiboTattle/1.1.0 CFNetwork/1",
+    }));
+    rowsBySegment.get(segmentStart(2))?.electronMacArm64.push(analyticsRow({
+      count: 4,
+      clientIP: "198.51.100.1",
+      userAgent: "TiboTattle/2.0.0 electron-updater",
+    }));
+    rowsBySegment.get(segmentStart(3))?.electronWindowsX64.push(analyticsRow({
+      count: 5,
+      clientIP: "198.51.100.1",
+      userAgent: "TiboTattle/3.0.0 electron-updater",
+    }));
+    rowsBySegment.get(segmentStart(4))?.electronLinuxX64.push(analyticsRow({
+      count: 6,
+      clientIP: "198.51.100.1",
+      userAgent: "Electron/39.0.0 electron-updater",
+    }));
+    rowsBySegment.get(segmentStart(6))?.nativeArm64.push(...Array.from(
+      { length: 20 },
+      (_, index) => analyticsRow({
+        clientIP: `198.51.100.${index + 2}`,
+        userAgent: `TiboTattle/9.${index}.0 CFNetwork/1`,
+      }),
+    ));
+
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === GITHUB_ENDPOINT) return jsonResponse(githubRelease());
+      expect(url).toBe(ANALYTICS_ENDPOINT);
+      const body = JSON.parse(String(init?.body)) as {
+        variables: { start: string };
+      };
+      const rows = rowsBySegment.get(body.variables.start);
+      if (rows === undefined) throw new Error("unexpected analytics segment");
+      return jsonResponse({
+        data: { viewer: { zones: [{
+          ...rows,
+          releases: [],
+          intelReleases: [],
+        }] } },
+        errors: null,
+      });
+    }) as unknown as typeof fetch;
+
+    const overview = await readDistributionAnalytics({
+      enabled: true,
+      cloudflareZoneId: "zone-id",
+      cloudflareApiToken: "analytics-secret",
+    }, NOW, fetcher);
+
+    expect(overview.cloudflare).toMatchObject({
+      status: "available",
+      observedVersionsBounded: true,
+      observedTotals: {
+        macosArchitectures: [{
+          architecture: "arm64",
+          requestsLast7Days: 26,
+          sourceAddressesLast7Days: 21,
+        }, {
+          architecture: "x64",
+          requestsLast7Days: 3,
+          sourceAddressesLast7Days: 1,
+        }],
+        platforms: [{
+          operatingSystem: "macos",
+          requestsLast7Days: 29,
+          sourceAddressesLast7Days: 21,
+        }, {
+          operatingSystem: "windows",
+          requestsLast7Days: 5,
+          sourceAddressesLast7Days: 1,
+        }, {
+          operatingSystem: "linux",
+          requestsLast7Days: 6,
+          sourceAddressesLast7Days: 1,
+        }],
+        overall: {
+          requestsLast7Days: 40,
+          sourceAddressesLast7Days: 21,
+        },
+      },
+    });
+    expect(overview.cloudflare.observedVersions).toHaveLength(24);
+  });
+
   it("does no external work when distribution evidence is disabled", async () => {
     const fetcher = vi.fn() as unknown as typeof fetch;
     const overview = await readDistributionAnalytics(
@@ -243,6 +471,7 @@ describe("owner distribution analytics", () => {
     expect(overview.cloudflare).toMatchObject({
       status: "not_configured",
       reasonCode: "DISTRIBUTION_DISABLED",
+      observedTotals: null,
     });
     expect(overview.github.status).toBe("not_configured");
   });
@@ -319,7 +548,16 @@ describe("owner distribution analytics", () => {
       String(input) === GITHUB_ENDPOINT
         ? jsonResponse(githubRelease())
         : jsonResponse({
-          data: { viewer: { zones: [{ appcast: [], releases: [] }] } },
+          data: { viewer: { zones: [{
+            nativeArm64: [],
+            nativeX64: [],
+            electronMacArm64: [],
+            electronMacX64: [],
+            electronWindowsX64: [],
+            electronLinuxX64: [],
+            releases: [],
+            intelReleases: [],
+          }] } },
           errors: null,
         })) as unknown as typeof fetch;
     const overview = await readDistributionAnalytics({
@@ -335,12 +573,29 @@ describe("owner distribution analytics", () => {
       currentVersion: "0.1.12",
       currentVersionSourceAddresses: { last24Hours: 0, last7Days: 0 },
       observedVersions: [],
+      observedTotals: {
+        platforms: [{
+          operatingSystem: "macos",
+          requestsLast7Days: 0,
+          sourceAddressesLast7Days: 0,
+        }, {
+          operatingSystem: "windows",
+          requestsLast7Days: 0,
+          sourceAddressesLast7Days: 0,
+        }, {
+          operatingSystem: "linux",
+          requestsLast7Days: 0,
+          sourceAddressesLast7Days: 0,
+        }],
+        overall: { requestsLast7Days: 0, sourceAddressesLast7Days: 0 },
+      },
     });
     expect(overview.cloudflare.bySegment).toHaveLength(7);
     expect(overview.cloudflare.bySegment.every((segment) => (
       segment.activeSourceAddresses === 0
       && segment.preflightRequests === 0
       && segment.sparkleCheckRequests === 0
+      && segment.electronCheckRequests === 0
       && segment.sparkleDownloadRequests === 0
       && segment.currentVersionSourceAddresses === 0
     ))).toBe(true);
@@ -360,6 +615,7 @@ describe("owner distribution analytics", () => {
       status: "unavailable",
       reasonCode: "ANALYTICS_UNAVAILABLE",
       bySegment: [],
+      observedTotals: null,
     });
     expect(overview.github).toMatchObject({
       status: "unavailable",
@@ -375,7 +631,7 @@ describe("owner distribution analytics", () => {
           data: {
             viewer: {
               zones: [{
-                appcast: [{
+                nativeArm64: [{
                   count: 1,
                   avg: { sampleInterval: 1 },
                   dimensions: {
@@ -384,7 +640,13 @@ describe("owner distribution analytics", () => {
                     edgeResponseStatus: 200,
                   },
                 }],
+                nativeX64: [],
+                electronMacArm64: [],
+                electronMacX64: [],
+                electronWindowsX64: [],
+                electronLinuxX64: [],
                 releases: [],
+                intelReleases: [],
               }],
             },
           },

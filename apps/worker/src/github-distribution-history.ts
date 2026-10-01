@@ -30,6 +30,18 @@ const FORCED_SYNC_COOLDOWN_MILLISECONDS = 60 * 1_000;
 const SYNC_LEASE_MILLISECONDS = 2 * 60 * 1_000;
 const D1_BATCH_SIZE = 50;
 
+type InstallerVariant = "macArm64" | "macX64" | "windowsX64" | "linuxX64";
+
+export type GithubInstallerDownloads = Readonly<Record<InstallerVariant, number | null>>;
+
+const INSTALLER_VERSION_PREFIX = "TiboTattle-[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?-";
+const INSTALLER_ASSET_PATTERNS: readonly (readonly [InstallerVariant, RegExp])[] = [
+  ["macArm64", new RegExp(`^${INSTALLER_VERSION_PREFIX}(?:mac|macOS)-arm64\\.dmg$`, "iu")],
+  ["macX64", new RegExp(`^${INSTALLER_VERSION_PREFIX}(?:mac|macOS)-x64\\.dmg$`, "iu")],
+  ["windowsX64", new RegExp(`^${INSTALLER_VERSION_PREFIX}Windows-x64\\.exe$`, "iu")],
+  ["linuxX64", new RegExp(`^${INSTALLER_VERSION_PREFIX}linux-x86_64\\.AppImage$`, "iu")],
+];
+
 export interface GithubDistributionRelease {
   readonly id: number;
   readonly tag: string;
@@ -39,6 +51,8 @@ export interface GithubDistributionRelease {
   readonly allAssetDownloads: number;
   readonly dmgAssetCount: number;
   readonly assetCount: number;
+  /** Null means no matching installer asset was published for this release. */
+  readonly installerDownloads: GithubInstallerDownloads;
 }
 
 export interface GithubDistributionSummary {
@@ -208,6 +222,10 @@ function isDmg(name: string): boolean {
   return name.toLowerCase().endsWith(".dmg");
 }
 
+function installerVariant(name: string): InstallerVariant | null {
+  return INSTALLER_ASSET_PATTERNS.find(([, pattern]) => pattern.test(name))?.[0] ?? null;
+}
+
 function githubHeaders(apiToken: string | null): Record<string, string> {
   const headers: Record<string, string> = {
     accept: "application/vnd.github+json",
@@ -355,8 +373,21 @@ function releaseSummary(release: GithubReleaseInventoryRecord): GithubDistributi
   let dmgDownloads = 0;
   let allAssetDownloads = 0;
   let dmgAssetCount = 0;
+  const installerDownloads: Record<InstallerVariant, number | null> = {
+    macArm64: null,
+    macX64: null,
+    windowsX64: null,
+    linuxX64: null,
+  };
   for (const asset of release.assets) {
     allAssetDownloads = safeAdd(allAssetDownloads, asset.downloadCount);
+    const variant = installerVariant(asset.name);
+    if (variant !== null) {
+      installerDownloads[variant] = safeAdd(
+        installerDownloads[variant] ?? 0,
+        asset.downloadCount,
+      );
+    }
     if (isDmg(asset.name)) {
       dmgAssetCount += 1;
       dmgDownloads = safeAdd(dmgDownloads, asset.downloadCount);
@@ -371,6 +402,7 @@ function releaseSummary(release: GithubReleaseInventoryRecord): GithubDistributi
     allAssetDownloads,
     dmgAssetCount,
     assetCount: release.assets.length,
+    installerDownloads,
   };
 }
 

@@ -208,9 +208,9 @@ test("lookup names have exact length and control-character limits without interp
 });
 
 test("duplicate, oversized and noncanonical lookup keys fail closed without truncating mappings", () => {
-  const maximum = { ...payload(), entries: Array.from({ length: 160 }, (_, index) => entry("switch", index)) };
-  assert.equal(normalizeCacheDropThreadLinks(maximum).entries.length, 160);
-  assert.deepEqual(normalizeCacheDropThreadLinks({ ...maximum, entries: [...maximum.entries, entry("switch", 160)] }), UNAVAILABLE);
+  const maximum = { ...payload(), entries: Array.from({ length: 2_000 }, (_, index) => entry("switch", index)) };
+  assert.equal(normalizeCacheDropThreadLinks(maximum).entries.length, 2_000);
+  assert.deepEqual(normalizeCacheDropThreadLinks({ ...maximum, entries: [...maximum.entries, entry("switch", 2_000)] }), UNAVAILABLE);
   const duplicate = payload();
   duplicate.entries.push(structuredClone(duplicate.entries[0]));
   duplicate.entries[1].thread.id = PARENT_ID;

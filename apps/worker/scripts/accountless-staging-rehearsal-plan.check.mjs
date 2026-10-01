@@ -53,8 +53,8 @@ test("accountless hosted rehearsal plan fixes one origin and stays blocked befor
     ["wrangler", "d1", "migrations", "apply", "DELETION_LEDGER", "--remote", "--env", "staging"],
   ]);
   assert.deepEqual(freshBootstrap.expectedFinalMigrations, {
-    USAGE_MONITOR_DB: "0059_accountless_upload_renewal.sql",
-    DELETION_LEDGER: "0002_identity_reenrollment_cooldown.sql",
+    USAGE_MONITOR_DB: "0062_v1_acquisition_vocabulary.sql",
+    DELETION_LEDGER: "0003_storage_erasure_jobs.sql",
   });
   const disabledDeployment = plan.requiredRemoteActions.find(
     (step) => step.kind === "deploy_checked_in_disabled_staging",

@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const FIXTURES = join(ROOT, "test/fixtures/macos-keychain-migration");
-const COMMON = join(ROOT, "apps/macos/Sources/KeychainMigration.swift");
+const COMMON = join(ROOT, "test/fixtures/macos-keychain-migration/KeychainMigration.swift");
 const SCHEMA = "tibotattle-signed-synthetic-keychain-migration-v1";
 const SIGNING_VARIABLE = "TIBOTATTLE_MIGRATION_SIGNING_IDENTITY";
 const HELPER_RELATIVE = "Contents/Helpers/TiboTattleKeychainMigration";

@@ -55,6 +55,11 @@ export const DESKTOP_REFRESH_INTERVAL_SECONDS = Object.freeze([
   1800,
 ]);
 
+export const DESKTOP_REFRESH_MODES = Object.freeze([
+  "quick",
+  "detailed",
+]);
+
 export const DESKTOP_NOTIFICATION_THRESHOLDS = Object.freeze([
   "off",
   "ninety",
@@ -106,10 +111,13 @@ export const DESKTOP_ACTIONS = Object.freeze([
   "installUpdateAndRestart",
   "setAutomaticDownload",
   "revealLatestDownload",
+  "openLatestDownload",
   "openDashboardInBrowser",
   "showDiagnostics",
   "revealLocalData",
+  "getRefreshStatus",
   "refreshStarted",
+  "refreshHeartbeat",
   "refreshSettled",
 ]);
 
@@ -147,10 +155,13 @@ const ACTION_ARGUMENT_KEYS = Object.freeze({
   installUpdateAndRestart: Object.freeze([]),
   setAutomaticDownload: Object.freeze(["enabled"]),
   revealLatestDownload: Object.freeze([]),
+  openLatestDownload: Object.freeze([]),
   openDashboardInBrowser: Object.freeze([]),
   showDiagnostics: Object.freeze([]),
   revealLocalData: Object.freeze([]),
-  refreshStarted: Object.freeze([]),
+  getRefreshStatus: Object.freeze([]),
+  refreshStarted: Object.freeze(["mode"]),
+  refreshHeartbeat: Object.freeze(["lease"]),
   refreshSettled: Object.freeze(["lease"]),
 });
 
@@ -309,6 +320,10 @@ export function validateDesktopRequest(request) {
     case "reorderCodexHomes":
       assertRootIds(args.rootIds);
       break;
+    case "refreshStarted":
+      assertEnum(args.mode, DESKTOP_REFRESH_MODES, "mode");
+      break;
+    case "refreshHeartbeat":
     case "refreshSettled":
       assertRefreshLease(args.lease);
       break;

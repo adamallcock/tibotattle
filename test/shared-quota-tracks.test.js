@@ -147,6 +147,88 @@ test("sequential slot movement is accepted while overlapping slots are refused",
   assert.ok(refused.refusalCodes.includes("simultaneous_slot_conflict"));
 });
 
+test("one instant reported more than once collapses to its highest reading", () => {
+  // A rollout that inherits history replays its ancestor's records carrying the
+  // ancestor's OLD rate-limit reading, and a parallel fan-out emits several at
+  // one instant with several stale values. Used percent only climbs within a
+  // window, so the reading that is not stale is the highest. Refusing the whole
+  // cycle — which `ambiguous_quota_observation` used to do — discarded a real
+  // reset over a disagreement usually smaller than the tolerated jitter.
+  const replayed = fixture({ idOffset: 400 });
+  const original = replayed.quotaSnapshots[5];
+  // Replayed copies carry the ancestor's EARLIER reading, so they are lower
+  // than the true one. They can only be higher if the ancestor read a different
+  // pool — and a different pool carries a different `resets_at`, which lands in
+  // a different reset group and never reaches this collapse.
+  for (const [index, stale] of [1, 2, 3].entries()) {
+    replayed.quotaSnapshots.push({
+      ...original,
+      snapshotId: opaqueId("snapshot", 8_000 + index),
+      usedPercent: stale,
+    });
+  }
+  const collapsed = buildResetEvidence(replayed);
+  assert.equal(collapsed.resetCount, 1);
+  const [reset] = collapsed.resets;
+  assert.ok(!reset.refusalCodes.includes("ambiguous_quota_observation"));
+  // The replayed copies neither add observations nor move the climb: the
+  // highest reading at that instant wins, and here that is the original.
+  assert.equal(reset.snapshotCount, 8);
+  const atInstant = reset.quotaSeries.filter(
+    (row) => row.observedAt === original.observedAt,
+  );
+  assert.equal(atInstant.length, 1);
+  assert.equal(atInstant[0].usedPercent, 5);
+  // And the collapse cannot fabricate a backward step for the splitter to cut.
+  assert.ok(!reset.refusalCodes.includes("backward_quota_observation"));
+});
+
+test("a second slot in the same group never looks like a cycle restart", () => {
+  // `slot` is absent from the group key, so one reset group carries both the
+  // primary and the secondary series. Their levels are unrelated, so in
+  // observation order a primary->secondary step can look like an enormous fall.
+  // Comparing across slots would split a perfectly healthy group and multiply
+  // one real cycle into several partial ones.
+  const twoSlots = fixture({ idOffset: 500 });
+  twoSlots.quotaSnapshots = twoSlots.quotaSnapshots.slice(0, 4)
+    .map((row, index) => ({ ...row, usedPercent: 60 + index * 10 }));
+  for (let index = 0; index < 4; index += 1) {
+    twoSlots.quotaSnapshots.push({
+      ...twoSlots.quotaSnapshots[0],
+      snapshotId: opaqueId("snapshot", 9_500 + index),
+      slot: "secondary",
+      // A disjoint later span, so this is a second pool rather than a slot
+      // conflict — and it sits far below the primary, making the crossover a
+      // large apparent fall.
+      observedAt: instant(4 + index),
+      receivedAt: instant(4 + index),
+      usedPercent: 1 + index,
+    });
+  }
+  const evidence = buildResetEvidence(twoSlots);
+  assert.equal(evidence.resetCount, 1);
+  assert.deepEqual(evidence.resets[0].slots, ["primary", "secondary"]);
+  assert.ok(!evidence.resets[0].refusalCodes.includes("backward_quota_observation"));
+  assert.ok(!evidence.resets[0].refusalCodes.includes("simultaneous_slot_conflict"));
+
+  // A genuine restart INSIDE one slot still splits, with the other slot present.
+  const restartWithinSlot = fixture({ idOffset: 600 });
+  restartWithinSlot.quotaSnapshots = restartWithinSlot.quotaSnapshots.slice(0, 4)
+    .map((row, index) => ({ ...row, usedPercent: 60 + index * 10 }));
+  restartWithinSlot.quotaSnapshots[3].usedPercent = 2;
+  for (let index = 0; index < 4; index += 1) {
+    restartWithinSlot.quotaSnapshots.push({
+      ...restartWithinSlot.quotaSnapshots[0],
+      snapshotId: opaqueId("snapshot", 9_600 + index),
+      slot: "secondary",
+      observedAt: instant(4 + index),
+      receivedAt: instant(4 + index),
+      usedPercent: 1 + index,
+    });
+  }
+  assert.equal(buildResetEvidence(restartWithinSlot).resetCount, 2);
+});
+
 test("partial, stale, backward, and incompletely priced evidence fails closed", () => {
   const partial = fixture();
   partial.datasets[0].complete = false;
@@ -176,15 +258,31 @@ test("partial, stale, backward, and incompletely priced evidence fails closed", 
     ),
   );
 
-  const backward = fixture({ idOffset: 200 });
-  // The kernel deliberately tolerates up to 5pp of measured jitter. Exercise
-  // a reset-sized 6pp drop so this refusal assertion remains above that gate.
-  backward.quotaSnapshots[7].usedPercent = 0;
-  assert.ok(
-    buildResetEvidence(backward).resets[0].refusalCodes.includes(
-      "backward_quota_observation",
-    ),
-  );
+  // A fall past the jitter tolerance is a CYCLE RESTART, not a refusal. The
+  // provider re-reports one `resets_at` across a pool refresh, so a single
+  // reset group can hold a climb, a refresh and a fresh climb; refusing the
+  // group discarded both cycles. It is split instead, and each side is fitted
+  // from its own origin.
+  const restart = fixture({ idOffset: 200 });
+  restart.quotaSnapshots[7].usedPercent = 0;
+  const restarted = buildResetEvidence(restart);
+  assert.equal(restarted.resetCount, 2);
+  assert.ok(restarted.resets.every(
+    (reset) => !reset.refusalCodes.includes("backward_quota_observation"),
+  ));
+  // The first segment keeps the whole climb; the second starts at the low.
+  assert.equal(restarted.resets[0].snapshotCount, 7);
+  assert.equal(restarted.resets[0].boundaries.at(-1).usedPercent, 6);
+  assert.equal(restarted.resets[1].snapshotCount, 1);
+  assert.equal(restarted.resets[1].quotaSeries[0].usedPercent, 0);
+  // A one-observation segment still fails closed on its own terms.
+  assert.ok(restarted.resets[1].refusalCodes.includes(
+    "insufficient_quota_observations",
+  ));
+  // A fall INSIDE the tolerance is still jitter and must not split.
+  const jitter = fixture({ idOffset: 250 });
+  jitter.quotaSnapshots[7].usedPercent = 2;
+  assert.equal(buildResetEvidence(jitter).resetCount, 1);
 
   const unpriced = fixture({ idOffset: 300 });
   unpriced.usageEvents[2].pricingStatus = "partially_priced";

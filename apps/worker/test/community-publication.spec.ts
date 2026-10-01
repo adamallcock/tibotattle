@@ -3,7 +3,7 @@ import { applyD1Migrations,reset,type D1Migration } from "cloudflare:test";
 import { beforeEach,describe,expect,it } from "vitest";
 import { advanceCommunityPublication,readCapturedCommunityPublication,markCommunityPublicationPublished } from "../src/community-publication";
 import { readCachedCommunityAllowanceCorpus,readCachedCommunityModelCompositions,COMMUNITY_ATTRIBUTION_METHOD_VERSION,
-  V1_FIT_CACHE_KEY_SUFFIX,COMPOSITION_CACHE_KEY_SUFFIX,summarizeCommunityAllowanceDay } from "../src/community-allowance";
+  V1_FIT_CACHE_KEY,COMPOSITION_CACHE_KEY_SUFFIX,summarizeCommunityAllowanceDay } from "../src/community-allowance";
 import { warmCommunityAnalysisCaches } from "../src/community-analysis-warmer";
 import { buildAdminCommunityAllowancePreview,readCachedAdminCommunityAllowancePreview,
   warmAdminCommunityAllowancePreviewCache } from "../src/admin-community-allowance";
@@ -198,7 +198,7 @@ describe("restartable captured cohort publication",()=>{
         .bind(id).first<{revision:number}>())!.revision;
       await db().batch([
         db().prepare(`INSERT INTO community_allowance_fit_cache(participant_id,cache_key,fits_json,computed_at,input_fingerprint,source_method_version)
-          VALUES(?,?,'[]','2026-09-08T00:00:00.000Z',?,?)`).bind(id,`v1:${revision}:${from}:${V1_FIT_CACHE_KEY_SUFFIX}`,fp,COMMUNITY_ATTRIBUTION_METHOD_VERSION),
+          VALUES(?,?,'[]','2026-09-08T00:00:00.000Z',?,?)`).bind(id,`v1:${revision}:${from}:${V1_FIT_CACHE_KEY}`,fp,COMMUNITY_ATTRIBUTION_METHOD_VERSION),
         db().prepare(`INSERT INTO community_model_composition_cache(participant_id,cache_key,composition_json,computed_at,input_fingerprint,source_method_version)
           VALUES(?,?,?,'2026-09-08T00:00:00.000Z',?,?)`).bind(id,`v1:${revision}:${from}:${COMPOSITION_CACHE_KEY_SUFFIX}`,
             JSON.stringify({status:"not_testable",reason:"plan_attribution_limit_exceeded"}),fp,COMMUNITY_ATTRIBUTION_METHOD_VERSION),

@@ -16,6 +16,8 @@ import {
   isWindowsCredentialAuditFileGuardContext,
 } from "./windows-credential-audit-file-guard.js";
 
+import { configureGuardedSqliteConnection } from "./windows-protected-sqlite.js";
+
 export const WINDOWS_CREDENTIAL_OPERATION_AUDIT_SCHEMA_VERSION =
   "windows-credential-operation-audit-v1";
 export const WINDOWS_CREDENTIAL_OPERATION_AUDIT_APPLICATION_ID = 0x55434155;
@@ -600,6 +602,7 @@ function openAuditDatabase(filePath, fileGuardContext) {
   let database;
   try {
     database = new DatabaseSync(path, { timeout: 5_000 });
+    if (fileGuardContext !== null) configureGuardedSqliteConnection(database);
     configureDatabase(database);
     if (existing === null || existing.size === 0) initializeSchema(database);
     else validateSchema(database);

@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import {
   TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION,
   telemetryV11RequiredConsent,
+  TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+  telemetryV12RequiredConsent,
 } from "@app-usagemonitor/telemetry-contract";
 
 import {
@@ -20,6 +22,7 @@ import {
 import {
   createOwnerOnlyAutomaticContributionStorageContext,
   createTelemetryV11Envelope,
+  createTelemetryV12Envelope,
 } from "./platform/index.js";
 import {
   accountlessDeviceUnavailableCode,
@@ -29,10 +32,17 @@ import {
   ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
   ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
   createTelemetryV11Day,
+  createTelemetryV12Day,
+  runTelemetryV12Sync,
+  ACCOUNTLESS_V12_UPLOAD_AUTHORIZATION_BASIS,
+  ACCOUNTLESS_V12_UPLOAD_POLICY_VERSION,
+  ACCOUNTLESS_V12_UPLOAD_SCHEMA_VERSION,
   readTelemetryV11Capabilities,
+  readTelemetryV12Capabilities,
   runTelemetryV11Sync,
   sanitizeTelemetryAttributionBinding,
   telemetryV11FieldInventory,
+  telemetryV12FieldInventory,
 } from "./contribution/index.js";
 import { createLocalUnifiedTelemetryV11Reader } from "./local-unified-contribution-attribution.js";
 import {
@@ -192,30 +202,78 @@ function retryAfter(response, now = Date.now()) {
     : MAXIMUM_RETRY_AFTER_MILLISECONDS;
 }
 
+function discardResponseBody(response) {
+  if (!(response instanceof Response)) return;
+  try { void response.body?.cancel().catch(() => {}); } catch { /* best effort */ }
+}
+
+async function readBoundedJson(response, maximumBytes, signal) {
+  const declared = response.headers.get("content-length");
+  if (response.headers.get("cache-control") !== "no-store"
+      || !(response.headers.get("content-type") ?? "").toLowerCase().startsWith("application/json")
+      || (declared !== null && (!/^\d+$/u.test(declared) || Number(declared) > maximumBytes))
+      || !response.body) {
+    discardResponseBody(response);
+    interrupt("response_invalid");
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let bytes = 0;
+  let text = "";
+  let complete = false;
+  const cancel = () => { void reader.cancel().catch(() => {}); };
+  signal?.addEventListener("abort", cancel, { once: true });
+  try {
+    for (;;) {
+      if (signal?.aborted) interrupt("service_unavailable", { retryable: true });
+      let part;
+      try { part = await reader.read(); }
+      catch { interrupt("service_unavailable", { retryable: true }); }
+      if (signal?.aborted) interrupt("service_unavailable", { retryable: true });
+      if (part.done) break;
+      if (!(part.value instanceof Uint8Array)) interrupt("response_invalid");
+      bytes += part.value.byteLength;
+      if (bytes > maximumBytes) interrupt("response_invalid");
+      text += decoder.decode(part.value, { stream: true });
+    }
+    text += decoder.decode();
+    complete = true;
+    return text.length === 0 ? null : JSON.parse(text);
+  } catch (error) {
+    if (error instanceof PassFailure) throw error;
+    interrupt("response_invalid");
+  } finally {
+    signal?.removeEventListener("abort", cancel);
+    if (!complete) cancel();
+    reader.releaseLock();
+  }
+}
+
 async function readJson(response, {
   deviceAuthorized = false,
   maximumBytes = MAX_RESPONSE_BYTES,
+  signal,
 } = {}) {
-  if (!(response instanceof Response)) interrupt("response_invalid");
-  if (response.headers.get("cache-control") !== "no-store"
-      || !(response.headers.get("content-type") ?? "")
-        .toLowerCase().startsWith("application/json")) {
+  if (!(response instanceof Response) || response.redirected) {
+    discardResponseBody(response);
     interrupt("response_invalid");
   }
-  let text;
-  try {
-    text = await response.text();
-  } catch {
-    interrupt("service_unavailable", { retryable: true });
-  }
-  if (Buffer.byteLength(text, "utf8") > maximumBytes) {
-    interrupt("response_invalid");
+  const transient = response.status === 408 || response.status === 429 || response.status >= 500;
+  const serviceUnavailable = () => interrupt("service_unavailable", {
+    retryable: true, retryAfterMilliseconds: retryAfter(response),
+  });
+  // Preserve admission pacing for valid JSON 429s without requiring application
+  // headers or a valid error document from a temporarily unavailable gateway.
+  if (transient && response.status !== 429) {
+    discardResponseBody(response);
+    serviceUnavailable();
   }
   let payload;
-  try {
-    payload = text.length === 0 ? null : JSON.parse(text);
-  } catch {
-    interrupt("response_invalid");
+  try { payload = await readBoundedJson(response, maximumBytes, signal); }
+  catch (error) {
+    if (transient && error instanceof PassFailure
+        && ["response_invalid", "service_unavailable"].includes(error.failureCode)) serviceUnavailable();
+    throw error;
   }
   if (response.ok) return payload;
 
@@ -273,7 +331,7 @@ async function requestJson(fetchImpl, url, options, classification = {}) {
   } catch {
     interrupt("service_unavailable", { retryable: true });
   }
-  return readJson(response, classification);
+  return readJson(response, { ...classification, signal: options.signal });
 }
 
 function isUtcDay(value) {
@@ -372,8 +430,8 @@ function tailPlan(localDays, acknowledgedThroughDay) {
   });
 }
 
-function explicitV11Consent(consent, origin) {
-  const required = telemetryV11RequiredConsent();
+function explicitUsageConsent(consent, origin, successor) {
+  const required = successor ? telemetryV12RequiredConsent() : telemetryV11RequiredConsent();
   if (!consent || typeof consent !== "object" || Array.isArray(consent)
       || Object.keys(consent).length !== 4
       || consent.destinationOrigin !== origin
@@ -395,7 +453,7 @@ function exactKeys(record, keys) {
   }
 }
 
-function accountlessV11Authorization(authorization, origin, laboratory, rehearsal, production) {
+function accountlessUsageAuthorization(authorization, origin, laboratory, rehearsal, production, successor) {
   if (accountlessTransportOrigin({ laboratory, rehearsal, production, origin }) === null
       || !exactKeys(authorization, [
     "authorizationBasis",
@@ -403,11 +461,11 @@ function accountlessV11Authorization(authorization, origin, laboratory, rehearsa
     "schemaVersion",
     "telemetrySchemaVersion",
   ])
-      || authorization.schemaVersion !== ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION
-      || authorization.policyVersion !== ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION
-      || authorization.authorizationBasis !== ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS
+      || authorization.schemaVersion !== (successor ? ACCOUNTLESS_V12_UPLOAD_SCHEMA_VERSION : ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION)
+      || authorization.policyVersion !== (successor ? ACCOUNTLESS_V12_UPLOAD_POLICY_VERSION : ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION)
+      || authorization.authorizationBasis !== (successor ? ACCOUNTLESS_V12_UPLOAD_AUTHORIZATION_BASIS : ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS)
       || authorization.telemetrySchemaVersion
-        !== ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION) {
+        !== (successor ? TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION : ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION)) {
     fail("authorization_invalid");
   }
   return Object.freeze({ ...authorization });
@@ -429,14 +487,14 @@ function v11Publication(database) {
 // This is a private resumability journal, not authority to upload or a record
 // of acknowledged history. The domain runner revalidates its entire context
 // against fresh capabilities/predecessor before using this staged prefix.
-function closedV11Progress(value) {
+function closedV11Progress(value, successor = false) {
   if (value === null) return null;
   const keys = (record, expected) => record !== null && typeof record === "object" && !Array.isArray(record)
     && Object.keys(record).sort().join("\0") === [...expected].sort().join("\0");
   const day = (value) => typeof value === "string" && DAY_PATTERN.test(value)
     && Number.isFinite(Date.parse(`${value}T00:00:00.000Z`))
     && new Date(`${value}T00:00:00.000Z`).toISOString().slice(0, 10) === value;
-  if (!keys(value, V11_PROGRESS_KEYS) || value.schemaVersion !== "telemetry-v11-sync-progress-v1"
+  if (!keys(value, V11_PROGRESS_KEYS) || value.schemaVersion !== (successor ? "telemetry-v12-sync-progress-v1" : "telemetry-v11-sync-progress-v1")
       || [value.contextDigest, value.legacyFingerprint, value.sourceFingerprint]
         .some((value) => typeof value !== "string" || !DIGEST_HEX.test(value))
       || (value.previousGenerationId !== null && (typeof value.previousGenerationId !== "string" || !UUID_V4.test(value.previousGenerationId)))
@@ -460,7 +518,7 @@ function closedV11Progress(value) {
     fromDay: value.fromDay, throughDay: value.throughDay, days };
 }
 
-function localV11ProgressStore({ file, preparation, signal, injected }) {
+function localV11ProgressStore({ file, preparation, signal, injected, successor = false }) {
   const storage = injected === undefined ? createOwnerOnlyAutomaticContributionStorageContext({
     createError: () => new PassFailure("index_unavailable", { retryable: true }),
   }) : null;
@@ -479,11 +537,11 @@ function localV11ProgressStore({ file, preparation, signal, injected }) {
         catch { interrupt("index_unavailable", { retryable: true }); }
       }
       guard();
-      return closedV11Progress(value);
+      return closedV11Progress(value, successor);
     },
     async write(value) {
       guard();
-      const closed = closedV11Progress(value);
+      const closed = closedV11Progress(value, successor);
       const text = JSON.stringify(closed);
       if (Buffer.byteLength(text) > MAX_V11_PROGRESS_BYTES) interrupt("index_unavailable", { retryable: true });
       if (injected !== undefined) await injected.write(closed);
@@ -494,6 +552,8 @@ function localV11ProgressStore({ file, preparation, signal, injected }) {
 }
 
 async function createV11Preparation(database, {
+  successor = false,
+  review = false,
   readAccountMarkers = async () => [],
   loadExistingAccountObservationSecret = async () => null,
 } = {}) {
@@ -506,6 +566,7 @@ async function createV11Preparation(database, {
   });
   let root = null;
   let selectedBinding = null;
+  let selectedActivationTime;
   let projection = null;
   let closed = false;
   const assertCurrent = () => {
@@ -528,8 +589,16 @@ async function createV11Preparation(database, {
       return evidence?.accountBasis === "provisional_marker" && captured !== null
         && captured.destinationOrigin === binding.destinationOrigin && captured.enrollmentNamespace === binding.enrollmentNamespace;
     }));
-  async function preparePublication({ binding }) {
+  async function preparePublication({ binding, activationTime }) {
     assertCurrent();
+    if (successor) {
+      if (!(review && activationTime === null) && (typeof activationTime !== "string" || !Number.isFinite(Date.parse(activationTime))
+          || new Date(activationTime).toISOString() !== activationTime)
+          || (selectedActivationTime !== undefined && selectedActivationTime !== activationTime)) {
+        interrupt("local_index_changed", { retryable: true });
+      }
+      selectedActivationTime = activationTime;
+    }
     const captured = sanitizeTelemetryAttributionBinding(binding);
     if (captured === null || (selectedBinding !== null
         && (captured.destinationOrigin !== selectedBinding.destinationOrigin
@@ -558,19 +627,23 @@ async function createV11Preparation(database, {
       const rootFingerprint = root === null ? (rootRequired ? "unavailable" : "not-required")
         : createHash("sha256").update("telemetry-v11-projection-root-v1\0").update(root).digest("hex");
       return Object.freeze({ fingerprint: createHash("sha256").update(JSON.stringify([
-        "telemetry-v11-local-projection-v2", publication.fingerprint, evidence.fingerprint, rootFingerprint,
+        successor ? "telemetry-v12-local-projection-v1" : "telemetry-v11-local-projection-v2",
+        publication.fingerprint, evidence.fingerprint, rootFingerprint,
+        ...(successor ? [selectedActivationTime] : []),
       ])).digest("hex"), parserVersion: publication.parserVersion });
     })();
     return projection;
   }
   return Object.freeze({
     days: Object.freeze(days), publication, preparePublication, assertCurrent,
-    async readDay(day, { binding }) {
-      await preparePublication({ binding });
+    async readDay(day, { binding, activationTime }) {
+      await preparePublication({ binding, activationTime });
       assertCurrent();
-      const hydrated = reader.readDay(day);
-      const result = createTelemetryV11Day({
+      const hydrated = successor ? reader.readDayWithV12Evidence(day) : reader.readDay(day);
+      const result = (successor ? createTelemetryV12Day : createTelemetryV11Day)({
         day, ...hydrated, binding, accountObservationSecret: root,
+        ...(successor ? { activationTime: selectedActivationTime,
+          continuityForRecord: hydrated.telemetryV12Evidence.continuityForRecord } : {}),
         parserVersion: publication.parserVersion,
       });
       assertCurrent();
@@ -601,7 +674,9 @@ function v11Failure(error, { daysTotal = 0, networkActivity = false } = {}) {
 export async function runIncrementalContributionSyncOnce(options = {}) {
   const hasAccountlessAuthorization = options !== null && typeof options === "object"
     && Object.hasOwn(options, "authorization");
-  if (!hasAccountlessAuthorization
+  const successor = (hasAccountlessAuthorization ? options.authorization : options.consent)
+    ?.telemetrySchemaVersion === TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION;
+  if (!hasAccountlessAuthorization && !successor
       && options.consent?.telemetrySchemaVersion !== TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION) {
     return runTelemetryV1SyncOnce(options);
   }
@@ -612,19 +687,23 @@ export async function runIncrementalContributionSyncOnce(options = {}) {
     requestTimeoutMilliseconds = DEFAULT_REQUEST_TIMEOUT_MILLISECONDS,
     maximumDurationMilliseconds = 60_000, now = Date.now,
     createV11Envelope = createTelemetryV11Envelope,
+    createV12Envelope = createTelemetryV12Envelope,
     runV11Sync = runTelemetryV11Sync,
+    runV12Sync = runTelemetryV12Sync,
     readAccountMarkers = async () => [], loadExistingAccountObservationSecret = async () => null,
     onAttributionBinding = null,
     progressStore = undefined, progressFile = null,
   } = options;
   const selectedOrigin = canonicalOrigin(origin);
-  const selectedConsent = hasAccountlessAuthorization ? null : explicitV11Consent(consent, selectedOrigin);
+  const createEnvelope = successor ? createV12Envelope : createV11Envelope;
+  const runSync = successor ? runV12Sync : runV11Sync;
+  const selectedConsent = hasAccountlessAuthorization ? null : explicitUsageConsent(consent, selectedOrigin, successor);
   const selectedAuthorization = hasAccountlessAuthorization
-    ? accountlessV11Authorization(authorization, selectedOrigin, laboratory, rehearsal, production)
+    ? accountlessUsageAuthorization(authorization, selectedOrigin, laboratory, rehearsal, production, successor)
     : null;
   if (hasAccountlessAuthorization && consent !== undefined) fail("authorization_invalid");
   if (typeof indexFile !== "string" || !indexFile || !backend || typeof backend !== "object"
-      || [fetchImpl, withDeviceSecret, openIndex, now, createV11Envelope, runV11Sync,
+      || [fetchImpl, withDeviceSecret, openIndex, now, createEnvelope, runSync,
         readAccountMarkers, loadExistingAccountObservationSecret].some((value) => typeof value !== "function")
       || (onAttributionBinding !== null && typeof onAttributionBinding !== "function")
       || (progressFile !== null && (typeof progressFile !== "string" || !progressFile))
@@ -651,15 +730,16 @@ export async function runIncrementalContributionSyncOnce(options = {}) {
   };
   try {
     database = openIndex(indexFile, { readOnly: true });
-    preparation = await createV11Preparation(database, { readAccountMarkers, loadExistingAccountObservationSecret });
-    const progress = localV11ProgressStore({ file: progressFile ?? `${indexFile}.telemetry-v11-progress.json`,
-      preparation, signal, injected: progressStore });
+    preparation = await createV11Preparation(database, { readAccountMarkers, loadExistingAccountObservationSecret, successor });
+    const progress = localV11ProgressStore({ file: progressFile ?? `${indexFile}.telemetry-${successor ? "v12" : "v11"}-progress.json`,
+      preparation, signal, injected: progressStore, successor });
     return await withDeviceSecret({ backend,
       ...(stateFile === undefined ? {} : { stateFile }), expectedOrigin: selectedOrigin,
       operation: async (secret, device) => {
         try {
           let envelopeKey = null;
-          const result = await runV11Sync({
+          let envelopeKeyFailure = null;
+          const result = await runSync({
             serverBaseUrl: selectedOrigin,
             deviceAuthorization: `Device um_device_${device.deviceId}.${secret.toString("base64url")}`,
             ...(selectedAuthorization === null
@@ -670,9 +750,9 @@ export async function runIncrementalContributionSyncOnce(options = {}) {
             progressStore: progress,
             maxChunks: maximumChunks, maxDurationMs: maximumDurationMilliseconds,
             requestTimeoutMs: requestTimeoutMilliseconds,
-            readDay: async (day, { binding }) => {
+            readDay: async (day, { binding, activationTime }) => {
               onAttributionBinding?.(binding);
-              try { return await preparation.readDay(day, { binding }); }
+              try { return await preparation.readDay(day, { binding, activationTime }); }
               catch (error) { if (error?.code === "local_index_changed") localIndexChanged = true; throw error; }
             },
             createEnvelope: async (chunk) => {
@@ -681,34 +761,27 @@ export async function runIncrementalContributionSyncOnce(options = {}) {
               if (envelopeKey === null) {
                 const requestSignal = signal === undefined ? AbortSignal.timeout(requestTimeoutMilliseconds)
                   : AbortSignal.any([signal, AbortSignal.timeout(requestTimeoutMilliseconds)]);
-                const response = await fetch(new URL("/api/v1/envelope-key", selectedOrigin), {
-                  credentials: "omit", redirect: "error", signal: requestSignal,
-                  headers: { Accept: "application/json" },
-                });
-                if (!(response instanceof Response) || !response.body) interrupt("response_invalid");
-                const reader = response.body.getReader();
-                const parts = [];
-                let bytes = 0;
                 try {
-                  for (;;) {
-                    const part = await reader.read();
-                    if (part.done) break;
-                    bytes += part.value.byteLength;
-                    if (bytes > MAX_RESPONSE_BYTES) interrupt("response_invalid");
-                    parts.push(part.value);
-                  }
-                } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
-                envelopeKey = await readJson(new Response(Buffer.concat(parts), {
-                  status: response.status, headers: response.headers,
-                }));
-                if (envelopeKey?.algorithm !== "RSA-OAEP-256"
-                    || typeof envelopeKey.keyId !== "string" || !envelopeKey.keyId || envelopeKey.keyId.length > 200
-                    || !envelopeKey.publicJwk || typeof envelopeKey.publicJwk !== "object") interrupt("response_invalid");
+                  envelopeKey = await requestJson(fetch, new URL("/api/v1/envelope-key", selectedOrigin), {
+                    signal: requestSignal, headers: { Accept: "application/json" },
+                  });
+                  if (envelopeKey?.algorithm !== "RSA-OAEP-256"
+                      || typeof envelopeKey.keyId !== "string" || !envelopeKey.keyId || envelopeKey.keyId.length > 200
+                      || !envelopeKey.publicJwk || typeof envelopeKey.publicJwk !== "object") interrupt("response_invalid");
+                } catch (error) {
+                  // The injected envelope port is otherwise classified as a local
+                  // index failure; retain this transport's bounded failure type.
+                  if (error instanceof PassFailure) envelopeKeyFailure = error;
+                  throw error;
+                }
               }
-              return createV11Envelope({ chunk, ...envelopeKey, cryptoImpl });
+              return createEnvelope({ chunk, ...envelopeKey, cryptoImpl });
             },
           });
           if (localIndexChanged) return v11Failure({ code: "local_index_changed" }, {
+            daysTotal: result.daysTotal, networkActivity,
+          });
+          if (envelopeKeyFailure) return v11Failure(envelopeKeyFailure, {
             daysTotal: result.daysTotal, networkActivity,
           });
           return Object.freeze({ ...result, networkActivity: result.networkActivity || networkActivity });
@@ -725,12 +798,12 @@ export async function runIncrementalContributionSyncOnce(options = {}) {
 }
 
 /** Read-only review material; its account binding stays inside the local service. */
-export async function readIncrementalContributionV11Review({
+async function readIncrementalContributionReview({
   indexFile, origin, backend, stateFile, fetchImpl = globalThis.fetch,
   withDeviceSecret = withContributionDeviceSecret, openIndex = openLocalUnifiedIndex,
   readAccountMarkers = async () => [], loadExistingAccountObservationSecret = async () => null,
   signal, now = Date.now,
-} = {}) {
+} = {}, successor = false) {
   const selectedOrigin = canonicalOrigin(origin);
   return withDeviceSecret({ backend, ...(stateFile === undefined ? {} : { stateFile }),
     expectedOrigin: selectedOrigin,
@@ -738,25 +811,29 @@ export async function readIncrementalContributionV11Review({
       let database = null;
       let preparation = null;
       try {
-        const capabilities = await readTelemetryV11Capabilities({
+        const capabilities = await (successor ? readTelemetryV12Capabilities : readTelemetryV11Capabilities)({
           serverBaseUrl: selectedOrigin,
           deviceAuthorization: `Device um_device_${device.deviceId}.${secret.toString("base64url")}`,
           fetchImpl, signal, clock: now,
         });
-        if (!capabilities.formats.some((format) => format.schemaVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
-            && format.lifecycle === "accepted")) return Object.freeze({ status: "unavailable" });
+        if (!(successor ? capabilities.successor.lifecycle === "accepted"
+          : capabilities.formats.some((format) => format.schemaVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
+            && format.lifecycle === "accepted"))) return Object.freeze({ status: "unavailable" });
         database = openIndex(indexFile, { readOnly: true });
-        preparation = await createV11Preparation(database, { readAccountMarkers, loadExistingAccountObservationSecret });
+        preparation = await createV11Preparation(database, { readAccountMarkers, loadExistingAccountObservationSecret, successor, review: true });
         const binding = Object.freeze({ destinationOrigin: capabilities.destinationOrigin,
           enrollmentNamespace: capabilities.enrollmentNamespace });
         const day = preparation.days.at(-1) ?? null;
         if (day === null) return Object.freeze({ status: "index_unavailable" });
-        const prepared = await preparation.readDay(day, { binding });
+        // Review the stable field/count inventory before and after the fresh
+        // grant. It does not prepare an upload or invent an activation instant;
+        // the uploader separately pins the server-issued cutoff for its pass.
+        const prepared = await preparation.readDay(day, { binding, ...(successor ? { activationTime: null } : {}) });
         const recordCounts = Object.fromEntries(["usage", "quota", "session"].map((stream) => [stream,
           prepared.chunks.filter((chunk) => chunk.chunkId.startsWith(`${stream}:${day}:`))
             .reduce((sum, chunk) => sum + chunk.records.length, 0)]));
         return Object.freeze({ status: "ready", capabilities, binding, grantDeviceId: device.deviceId,
-          inventory: telemetryV11FieldInventory(),
+          inventory: (successor ? telemetryV12FieldInventory : telemetryV11FieldInventory)(),
           publicationFingerprint: preparation.publication.fingerprint,
           sample: Object.freeze({ day, manifestDigest: prepared.manifest.manifestDigest,
             recordCounts: Object.freeze(recordCounts) }),
@@ -769,16 +846,16 @@ export async function readIncrementalContributionV11Review({
 }
 
 /** Capability discovery is a GET only; it cannot grant or upgrade consent. */
-export async function readIncrementalContributionV11Capabilities({
+async function readIncrementalContributionCapabilities({
   origin, backend, stateFile, fetchImpl = globalThis.fetch,
   withDeviceSecret = withContributionDeviceSecret, signal, now = Date.now,
-} = {}) {
+} = {}, successor = false) {
   const selectedOrigin = canonicalOrigin(origin);
   return withDeviceSecret({ backend, ...(stateFile === undefined ? {} : { stateFile }),
     expectedOrigin: selectedOrigin,
     operation: async (secret, device) => {
       try {
-        return await readTelemetryV11Capabilities({
+        return await (successor ? readTelemetryV12Capabilities : readTelemetryV11Capabilities)({
           serverBaseUrl: selectedOrigin,
           deviceAuthorization: `Device um_device_${device.deviceId}.${secret.toString("base64url")}`,
           fetchImpl, signal, clock: now,
@@ -787,6 +864,11 @@ export async function readIncrementalContributionV11Capabilities({
     },
   });
 }
+
+export const readIncrementalContributionV11Review = (options) => readIncrementalContributionReview(options);
+export const readIncrementalContributionV12Review = (options) => readIncrementalContributionReview(options, true);
+export const readIncrementalContributionV11Capabilities = (options) => readIncrementalContributionCapabilities(options);
+export const readIncrementalContributionV12Capabilities = (options) => readIncrementalContributionCapabilities(options, true);
 
 async function runTelemetryV1SyncOnce({
   indexFile,

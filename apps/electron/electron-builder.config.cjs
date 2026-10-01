@@ -3,7 +3,7 @@ const path = require("node:path");
 const repositoryRoot = path.resolve(__dirname, "../..");
 const macDevelopmentIcon = path.join(
   repositoryRoot,
-  "apps/macos/Assets/AppIcon.icns",
+  "apps/electron/assets/AppIcon.icns",
 );
 const requestedTarget = process.env.TIBOTATTLE_ELECTRON_TARGET ?? "darwin-arm64";
 const targetAliases = {
@@ -75,6 +75,7 @@ module.exports = {
         "package.json",
         "electron-runtime-manifest.json",
         "apps/electron/**",
+        "scripts/diagnose-desktop-crash.mjs",
         "apps/local/**",
         "apps/web/public/**",
         "config/**",

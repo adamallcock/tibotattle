@@ -23,7 +23,7 @@ in the [current status matrix](docs/current-status.md).
 
 Two distinct surfaces share this repository:
 
-- **Local macOS app** (`apps/macos`, `apps/local`, `apps/web`, `src/`,
+- **Local macOS app** (`apps/electron`, `apps/local`, `apps/web`, `src/`,
   `packages/`): runs entirely on your machine, binds to loopback only, and
   works fully offline. Issues that break the privacy model — uploads that
   bypass the applicable sharing policy, prompts/responses/paths entering derived
@@ -77,9 +77,24 @@ Directory basenames and thread display labels are transient metadata; paths,
 names and project handles are never written into the accounting index, exports,
 diagnostics, contributions or browser storage. Repository grouping describes
 last-observed local workspace mappings, not verified historical ownership.
+On Windows, transient metadata uses the approved native source reader's
+current-owner, single-link and reparse-point checks instead of Unix mode bits.
+Existing SQLite files are held through connection close; metadata never changes
+source permissions or journal mode. Selected rollout-head reads use the same
+boundary and never read titles. On both macOS and Windows, closed databases
+without sidecars use immutable reads with file-state revalidation; live WAL
+reads require existing WAL/SHM files and may update SHM coordination bytes.
+Missing or unsafe native access preserves
+anonymous fallback labels. A saved, unambiguous Codex repository origin may
+supply project grouping when Git is absent from the app's executable search
+path; a current Git rejection is not overridden by that historical observation.
 The new POST query route requires the local header and existing Origin/Host
-checks. Reports are bounded process-local snapshots; publication/scope/filter
-identity and opaque cursors prevent mixing totals across reads.
+checks. Interactive reports are bounded process-local snapshots;
+publication/scope/filter identity and opaque cursors prevent mixing totals across
+reads. A separate owner-only saved snapshot retains usage figures with anonymous,
+snapshot-local aliases. It excludes names, raw thread IDs, source paths and
+original project/worktree/thread join handles. Restored figures are read-only and
+dated until fresh enrichment completes; they never become a name-search index.
 
 ## Do not include session content in reports
 

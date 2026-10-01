@@ -42,7 +42,7 @@ test("legacy Keychain exports are exact identities of the platform owner", () =>
   }
 });
 
-test("the legacy path is implementation-free and macOS packaging excludes keytar", async () => {
+test("the legacy path is implementation-free and current historical validation confines keytar to predecessor receipts", async () => {
   const legacySource = await readFile(
     resolve(REPOSITORY_ROOT, "src/export-identity-keychain.js"),
     "utf8",
@@ -56,47 +56,15 @@ test("the legacy path is implementation-free and macOS packaging excludes keytar
     /\b(?:class|const|function|let|var)\b|node:|@github\/keytar/u,
   );
 
-  const buildSource = await readFile(
-    resolve(REPOSITORY_ROOT, "scripts/build-macos-app.js"),
+  const releaseSource = await readFile(
+    resolve(REPOSITORY_ROOT, "scripts/macos-release-core.js"),
     "utf8",
   );
-  assert.doesNotMatch(
-    buildSource,
-    /DYNAMIC_EXTERNAL_BY_FILE|"@github\/keytar": "7\.10\.6"/u,
+  const currentNormalization = releaseSource.slice(
+    releaseSource.indexOf("const BASE_NORMALIZED_MACH_O_PATHS"),
+    releaseSource.indexOf("const NORMALIZED_MACH_O_PATHS"),
   );
-  const currentNormalizationStart = buildSource.indexOf(
-    "const NORMALIZED_MACH_O_PATHS",
-  );
-  const retiredCompatibilityStart = buildSource.indexOf(
-    "const RETIRED_PREVIEW_NORMALIZED_MACH_O_PATHS",
-  );
-  const noCompatibilityStart = buildSource.indexOf(
-    "const NO_COMPATIBILITY_NORMALIZED_MACH_O_PATHS",
-  );
-  assert.notEqual(currentNormalizationStart, -1);
-  assert.notEqual(retiredCompatibilityStart, -1);
-  assert.notEqual(noCompatibilityStart, -1);
-  assert.ok(retiredCompatibilityStart > currentNormalizationStart);
-  assert.ok(noCompatibilityStart > retiredCompatibilityStart);
-  const currentNormalizationSource = buildSource.slice(
-    currentNormalizationStart,
-    retiredCompatibilityStart,
-  );
-  assert.doesNotMatch(currentNormalizationSource, /@github\/keytar|keytar\.node/u);
-  const retiredCompatibilitySource = buildSource.slice(
-    retiredCompatibilityStart,
-    noCompatibilityStart,
-  );
-  assert.match(
-    retiredCompatibilitySource,
-    /Contents\/Resources\/app\/node_modules\/@github\/keytar\/prebuilds\/darwin-arm64\/keytar\.node/u,
-  );
-  assert.equal(buildSource.match(/keytar\.node/gu)?.length, 1);
-  assert.doesNotMatch(
-    buildSource.slice(
-      buildSource.indexOf("const EXPECTED_EXTERNAL_SPECIFIERS"),
-      buildSource.indexOf("const WORKSPACE_RUNTIME_PACKAGE_EXTERNALS"),
-    ),
-    /@github\/keytar/u,
-  );
+  assert.doesNotMatch(currentNormalization, /@github\/keytar|keytar\.node/u);
+  assert.match(releaseSource, /LEGACY_STABLE_PREVIOUS_RELEASE/u);
+  assert.match(releaseSource, /Contents\/Resources\/app\/node_modules\/@github\/keytar\/prebuilds\/darwin-arm64\/keytar\.node/u);
 });

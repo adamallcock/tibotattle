@@ -1070,6 +1070,7 @@ test("complete-coverage consumers stop before emitting records from a mixed part
 test("Codex SQLite selected heads are owner-controlled hints and stale or missing hints fall back safely", async () => {
   const fixture = await emptyCanonicalHome();
   const databaseFile = join(fixture.codexHome, "state_5.sqlite");
+  const isWindows = process.platform === "win32";
   try {
     assert.equal(await readCodexSelectedRolloutNames(fixture.codexHome), null);
     const database = new DatabaseSync(databaseFile);
@@ -1084,12 +1085,20 @@ test("Codex SQLite selected heads are owner-controlled hints and stale or missin
     );
     database.close();
     await chmod(databaseFile, 0o600);
-    assert.deepEqual(await readCodexSelectedRolloutNames(fixture.codexHome), new Map([
-      [
-        THREAD_A,
-        canonicalName("2026-07-30T12-00-00", THREAD_A, ROLLOUT_A2),
-      ],
-    ]));
+    const selectedHeads = await readCodexSelectedRolloutNames(fixture.codexHome,
+      isWindows ? { loadWindowsBinding() { throw new Error("synthetic binding unavailable"); } } : {});
+    if (isWindows) {
+      // Native platform parity tests cover an authenticated Windows source.
+      // Without the binding, discovery still safely falls back to the sole leaf.
+      assert.equal(selectedHeads, null);
+    } else {
+      assert.deepEqual(selectedHeads, new Map([
+        [
+          THREAD_A,
+          canonicalName("2026-07-30T12-00-00", THREAD_A, ROLLOUT_A2),
+        ],
+      ]));
+    }
 
     const baseRecords = [
       canonicalMeta({ id: THREAD_A }),
@@ -1124,10 +1133,11 @@ test("Codex SQLite selected heads are owner-controlled hints and stale or missin
       codexHome: fixture.codexHome,
       startAt: START_AT,
       endAt: END_AT,
+      ...(isWindows ? { selectedRolloutNames: selectedHeads } : {}),
     });
     assert.equal(
       infos.find((info) => info.rolloutId === ROLLOUT_A2)?.selectedHead,
-      true,
+      isWindows ? false : true,
     );
     assert.equal(
       infos.find((info) => info.rolloutId === ROLLOUT_A2)?.resolvedHead,
@@ -1147,31 +1157,34 @@ test("Codex SQLite selected heads are owner-controlled hints and stale or missin
       codexHome: fixture.codexHome,
       startAt: START_AT,
       endAt: END_AT,
+      ...(isWindows ? { selectedRolloutNames: selectedHeads } : {}),
     });
     assert.equal(
       infos.find((info) => info.rolloutId === THREAD_A)?.selectedHead,
-      true,
+      isWindows ? false : true,
     );
     assert.equal(
       infos.find((info) => info.rolloutId === ROLLOUT_A2)?.resolvedHead,
       true,
     );
 
-    await chmod(databaseFile, 0o666);
-    assert.equal(await readCodexSelectedRolloutNames(fixture.codexHome), null);
-    infos = await discoverCodexRolloutInfos({
-      codexHome: fixture.codexHome,
-      startAt: START_AT,
-      endAt: END_AT,
-    });
-    assert.equal(
-      infos.find((info) => info.rolloutId === ROLLOUT_A2)?.selectedHead,
-      false,
-    );
-    assert.equal(
-      infos.find((info) => info.rolloutId === ROLLOUT_A2)?.resolvedHead,
-      true,
-    );
+    if (!isWindows) {
+      await chmod(databaseFile, 0o666);
+      assert.equal(await readCodexSelectedRolloutNames(fixture.codexHome), null);
+      infos = await discoverCodexRolloutInfos({
+        codexHome: fixture.codexHome,
+        startAt: START_AT,
+        endAt: END_AT,
+      });
+      assert.equal(
+        infos.find((info) => info.rolloutId === ROLLOUT_A2)?.selectedHead,
+        false,
+      );
+      assert.equal(
+        infos.find((info) => info.rolloutId === ROLLOUT_A2)?.resolvedHead,
+        true,
+      );
+    }
   } finally {
     await rm(fixture.codexHome, { recursive: true, force: true });
   }

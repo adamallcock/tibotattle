@@ -28,15 +28,25 @@ function safeErrorCode(error) {
   return PROPAGATED_ERROR_CODES.has(error?.code) ? error.code : WORKER_ERROR;
 }
 
+function normalizeIdentityPart(value) {
+  if (typeof value === "bigint") return value >= 0n ? value : null;
+  return Number.isSafeInteger(value) && value >= 0 ? BigInt(value) : null;
+}
+
+function normalizeIdentity(value) {
+  if (value === null
+      || typeof value !== "object"
+      || Array.isArray(value)
+      || Object.keys(value).sort().join("\0") !== "dev\0ino") {
+    return null;
+  }
+  const dev = normalizeIdentityPart(value.dev);
+  const ino = normalizeIdentityPart(value.ino);
+  return dev === null || ino === null ? null : { dev, ino };
+}
+
 function validIdentity(value) {
-  return value !== null
-    && typeof value === "object"
-    && !Array.isArray(value)
-    && Object.keys(value).sort().join("\0") === "dev\0ino"
-    && Number.isSafeInteger(value.dev)
-    && value.dev >= 0
-    && Number.isSafeInteger(value.ino)
-    && value.ino >= 0;
+  return normalizeIdentity(value) !== null;
 }
 
 function validWorkerOptions(value) {
@@ -47,6 +57,14 @@ function validWorkerOptions(value) {
     && typeof value.stateFile === "string"
     && value.stateFile.length > 0
     && validIdentity(value.expectedIdentity);
+}
+
+function normalizedWorkerOptions(value) {
+  const expectedIdentity = normalizeIdentity(value.expectedIdentity);
+  return expectedIdentity === null ? null : {
+    stateFile: value.stateFile,
+    expectedIdentity,
+  };
 }
 
 /**
@@ -66,7 +84,7 @@ export async function runLocalCollectorStateIntegrityWorkerThread({
     throw fixedError("local_collector_state_integrity_worker_protocol_invalid");
   }
   try {
-    await verifyLocalCollectorStateIntegrity(data.options);
+    await verifyLocalCollectorStateIntegrity(normalizedWorkerOptions(data.options));
     port.postMessage({ type: "result" });
   } catch (error) {
     port.postMessage({ type: "error", code: safeErrorCode(error) });

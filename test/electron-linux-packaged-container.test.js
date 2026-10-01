@@ -5,6 +5,24 @@ import test from "node:test";
 
 const read = (path) => readFile(new URL(`../${path}`, import.meta.url), "utf8");
 
+test("Linux GUI qualification uses bounded isolated shared memory through reload and updater restart", async () => {
+  const workflow = await read(".github/workflows/electron-development-packages.yml");
+  const linux = workflow.slice(workflow.indexOf("  linux-x64:"));
+  const commands = [...linux.replaceAll(/\\\n\s*/gu, " ").matchAll(/(?:timeout \d+s )?docker run [^\n]*/gu)]
+    .map(([command]) => command);
+  const gui = commands.filter(command => command.includes("--entrypoint xvfb-run"));
+  assert.equal(gui.length, 2, "normal application and genuine updater both exercise Chromium");
+  for (const command of gui) {
+    assert.equal((command.match(/--shm-size=512m/gu) ?? []).length, 1);
+    assert.match(command, /--network none/u);
+    assert.match(command, /--cap-add=SYS_ADMIN/u);
+    assert.doesNotMatch(command, /--ipc(?:=| )host|--(?:privileged|disable-dev-shm-usage|no-sandbox|volume|mount)(?:=|\s)|\s-v\s/u);
+    assert.doesNotMatch(command, /--tmpfs \/dev\/shm/u);
+  }
+  assert.ok(gui.some(command => command.includes("scripts/smoke-electron-linux-packaged.mjs")));
+  assert.ok(gui.some(command => command.includes("scripts/smoke-electron-linux-real-appimage-updater.mjs")));
+});
+
 test("the exact embedded Linux proof accepts real TAP lines and refuses zero-exit skips", async () => {
   const workflow = await read(".github/workflows/electron-development-packages.yml");
   const blocks = [...workflow.matchAll(/--input-type=module --eval '([\s\S]*?)^\s*'/gmu)];

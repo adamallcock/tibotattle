@@ -92,6 +92,21 @@ prepared website receipt. It then reports GitHub, ARM feed, Intel feed, tap and
 website separately. Output contains the plan digest and public release identity,
 not the private input paths, credential values or remote command diagnostics.
 
+A missing GitHub tag lookup does not establish that its release is absent:
+[GitHub's tag endpoint returns published releases](https://docs.github.com/en/rest/releases/releases#get-a-release-by-tag-name).
+The reconciler first verifies authenticated push access, which is required for
+[listing drafts](https://docs.github.com/en/rest/releases/releases#list-releases),
+then scans up to 20 pages of 100 releases and re-reads the unique exact-tag match
+by numeric ID. Unknown visibility, malformed entries, duplicate IDs or matching
+tags, incomplete pagination, and changed ID readback fail closed. The fallback
+retains the same source, title, notes, asset and hash checks and makes no writes.
+
+Draft assets may use GitHub's provisional `untagged-` download namespace only
+when the exact repository and 20-character lowercase hexadecimal token match
+the verified draft's `html_url`, and the asset filename matches the plan. The
+provisional URL is retained as observed. Published releases require the exact
+final tag URL; both states download assets by API ID and verify their bytes.
+
 GitHub draft assets are downloaded and hashed before publication. Published
 assets are freshly downloaded and checked against immutable release attestations
 using `gh release verify` and `gh release verify-asset`. GitHub immutability must

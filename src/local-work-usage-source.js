@@ -3,8 +3,7 @@ import { APP_PRICE_REGISTRY_MANIFEST } from "@app-usagemonitor/accounting";
 import { lstat } from "node:fs/promises";
 import { setImmediate as yieldTurn } from "node:timers/promises";
 import {
-  openLocalUnifiedIndex,
-  readUnifiedIndexGenerationDescriptor,
+  withReadOnlyUnifiedIndex,
   readExistingDeviceSalt,
   defaultLocalUnifiedIndexSecretPath,
   localDigest,
@@ -557,20 +556,15 @@ export async function readLocalWorkUsageSnapshot({
     toMs < fromMs
   )
     throw workUsageError("local_unified_index_work_query_invalid");
-  let database;
-  try {
-    database = openLocalUnifiedIndex(indexFile, { readOnly: true });
-  } catch {
+  const onOpenFailure = async () => {
     try {
       await lstat(indexFile);
       return { status: "unavailable" };
     } catch (error) {
       return { status: error.code === "ENOENT" ? "missing" : "unavailable" };
     }
-  }
-  try {
-    database.exec("BEGIN");
-    const generation = readUnifiedIndexGenerationDescriptor(database);
+  };
+  return withReadOnlyUnifiedIndex(indexFile, async ({ database, generation }) => {
     if (!generation || !["complete", "partial"].includes(generation.status))
       return { status: "unavailable" };
     const collector = await prepareWorkUsageCollector({
@@ -622,9 +616,7 @@ export async function readLocalWorkUsageSnapshot({
     if (!period.snapshots[selected])
       throw workUsageError("work_usage_scope_unavailable");
     return period.snapshots[selected];
-  } finally {
-    database.close();
-  }
+  }, { onOpenFailure });
 }
 
 export async function enrichWorkUsageRows({ result, rows, codexHome, purpose }) {

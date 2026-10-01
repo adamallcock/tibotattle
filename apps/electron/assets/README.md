@@ -1,9 +1,13 @@
-# Electron Windows artwork
+# Electron artwork
 
 `tibotattle.ico` is a format conversion of the existing approved
 [`tibotattle-icon.png`](../../web/public/tibotattle-icon.png), matching the macOS
 icon and Linux/web artwork. No artwork was redrawn. Rights and permission are
-recorded in [the application icon provenance](../../macos/Assets/AppIcon.provenance.txt).
+recorded in [the application icon provenance](./AppIcon.provenance.txt).
+
+The signed macOS Electron bundle uses `AppIcon.icns` from this directory. The
+icon bytes and provenance were moved from the former native app without an
+artwork change; every future replacement requires its own rights review.
 
 The Windows release configuration explicitly selects this file for the executable
 and the default NSIS installer/uninstaller icons. The ICO contains 32-bit PNG

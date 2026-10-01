@@ -78,6 +78,7 @@ function quotaRecord({
     longestStreakDays: 7,
     peakDailyTokens: 66,
   },
+  resetEvents = undefined,
 } = {}) {
   if (source === "app_server_notification") {
     officialDailyTokens = [];
@@ -98,6 +99,7 @@ function quotaRecord({
     officialUsageSummary,
     controlledState: "unknown",
     eventKey: "e".repeat(64),
+    ...(resetEvents === undefined ? {} : { resetEvents }),
   };
 }
 
@@ -148,6 +150,19 @@ test("freezes a complete-line prefix and emits only provider-neutral quota candi
       window({ limitName: "Codex allowance" }),
       window({ slot: "secondary", usedPercent: 56, windowDurationMins: 300, resetsAt: 1_784_800_000 }),
     ],
+    resetEvents: [{
+      schemaVersion: "quota-reset-event-v0.1",
+      kind: "banked_reset_used",
+      occurredAt: "2026-07-23T11:00:00.000Z",
+      observedAt: "2026-07-23T12:00:00.000Z",
+      intervalStartedAt: "2026-07-23T10:00:00.000Z",
+      precision: "observation_interval",
+      reason: "credit_count_decreased_before_expiry",
+      provider: "openai_codex",
+      planType: "pro",
+      limitId: "codex",
+      windowDurationMins: 10_080,
+    }],
   });
   const value = await fixture([first], { tail: "PRIVATE-CANARY-partial-line" });
   try {
@@ -165,7 +180,8 @@ test("freezes a complete-line prefix and emits only provider-neutral quota candi
     const serialized = JSON.stringify(result);
     for (const forbidden of [
       "PRIVATE-CANARY", "eventKey", "officialDailyTokens", "officialUsageSummary",
-      "lifetimeTokens", "987654321", "123456789", "Codex allowance", "limitName", value.path,
+      "lifetimeTokens", "987654321", "123456789", "Codex allowance", "limitName",
+      "resetEvents", "banked_reset_used", value.path,
     ]) assert.equal(serialized.includes(forbidden), false, forbidden);
   } finally {
     await rm(value.root, { recursive: true, force: true });

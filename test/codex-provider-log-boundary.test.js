@@ -24,8 +24,10 @@ const CODEX_PROVIDER_ROOT = resolve(
 const PROVIDER_PUBLIC_EXPORTS = [
   "CODEX_LOG_SCAN_VERSION",
   "CodexLogSourceChangedError",
+  "INFERENCE_TIMING_PARSER_VERSION",
   "MAX_STATE_BYTES",
   "METHOD",
+  "TOOL_FREE_METHOD",
   "canonicalComponentAvailability",
   "canonicalComponents",
   "canonicalRateLimitSnapshot",
@@ -34,10 +36,13 @@ const PROVIDER_PUBLIC_EXPORTS = [
   "classifyToolCall",
   "codexSessionMetaIdentity",
   "codexRolloutDiscoveryReceipt",
+  "codexTierObservation",
   "createCodexLogScanner",
+  "createCodexPerformanceTimingParser",
   "createLeadingRateLimitGate",
   "createParser",
   "createSnapshotLineage",
+  "createToolFreeParser",
   "cumulativeSnapshotKey",
   "deltaComponentPresence",
   "digest",
@@ -102,6 +107,7 @@ const PROVIDER_NORMALIZATION_BINDINGS = [
 ];
 
 const TIER_PROVIDER_BINDINGS = [
+  "codexTierObservation",
   "isCodexSpeedMode",
   "normalizeProviderTier",
   "unknownCodexTier",

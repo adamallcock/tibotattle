@@ -9,7 +9,6 @@
 /scripts/release-evidence.js @adamallcock
 /scripts/*release* @adamallcock
 /scripts/*attestation* @adamallcock
-/apps/macos/*.entitlements @adamallcock
 /apps/electron/electron-builder*.cjs @adamallcock
 /apps/web/public/docs.html @adamallcock
 /docs/verify-release.md @adamallcock

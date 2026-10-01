@@ -33,6 +33,13 @@ test("bounded weekly summary rejects malformed datasets", () => {
     ),
     /Unknown forced weekly calibration candidate/,
   );
+  assert.throws(
+    () => projectBoundedWeeklyCalibrationSummary(
+      { transitions: [] },
+      { windowDurationMinutes: 60 },
+    ),
+    /Unsupported allowance calibration window/,
+  );
 });
 
 test("bounded weekly summaries can pin each speed-priced scenario", () => {
@@ -64,6 +71,54 @@ test("bounded weekly summaries can pin each speed-priced scenario", () => {
     lower.recentResets.map((row) => row.resetIdentity),
     upper.recentResets.map((row) => row.resetIdentity),
   );
+});
+
+test("bounded allowance summaries isolate five-hour history by plan and duration", () => {
+  const reset = Math.floor(
+    Date.parse("2026-09-12T15:00:00.000Z") / 1_000,
+  );
+  const proFiveHour = resetTransitions({
+    reset,
+    capacityUsd: 120,
+    windowDurationMins: 300,
+  });
+  const plusFiveHour = resetTransitions({
+    reset: reset + 5 * 60 * 60,
+    capacityUsd: 45,
+    windowDurationMins: 300,
+  }).map((row) => ({
+    ...row,
+    planType: "plus",
+    planVariant: "unknown",
+  }));
+  const weekly = resetTransitions({
+    reset: reset + 7 * 24 * 60 * 60,
+    capacityUsd: 1_900,
+  });
+
+  const summary = projectBoundedWeeklyCalibrationSummary(
+    dataset([...proFiveHour, ...plusFiveHour, ...weekly]),
+    {
+      forcedCandidateId: "speed_lower",
+      planType: "plus",
+      windowDurationMinutes: 300,
+    },
+  );
+
+  assert.equal(summary.windowDurationMinutes, 300);
+  assert.equal(summary.selectedPlanType, "plus");
+  assert.equal(summary.estimate.medianApiPriceEquivalentUsd, 45);
+  assert.deepEqual(
+    summary.planPopulations.map((row) => [
+      row.planType,
+      row.windowDurationMinutes,
+      row.estimate?.medianApiPriceEquivalentUsd ?? null,
+    ]),
+    [["plus", 300, 45], ["pro", 300, 120]],
+  );
+  assert.ok(summary.recentResets.every((row) => (
+    row.planType === "plus"
+  )));
 });
 
 test("bounded weekly summary embeds a defensive composition projection", () => {
@@ -152,6 +207,7 @@ function resetTransitions({
   accountScopeId = "scope-a",
   planVariant = "pro-20x",
   slot = reset < 1_800_000_000 ? "secondary" : "primary",
+  windowDurationMins = 10_080,
 }) {
   const percentages = Array.from({ length: 21 }, (_, index) => index);
   const standard = (percent) => percent * capacityUsd / 100;
@@ -165,7 +221,7 @@ function resetTransitions({
       planType: "pro",
       limitId: "codex",
       slot,
-      windowDurationMins: 10_080,
+      windowDurationMins,
       resetsAt: reset,
       eventTime: new Date((reset - 100_000 + index * 60) * 1000).toISOString(),
       lastPriorObservedAt: new Date((reset - 100_001 + index * 60) * 1000).toISOString(),

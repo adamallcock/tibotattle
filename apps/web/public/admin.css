@@ -62,6 +62,7 @@
 .admin-explainer p { margin: 0 0 10px; color: var(--muted); font-size: .76rem; line-height: 1.55; }
 .admin-explainer p:last-child { margin-bottom: 0; }
 .admin-two-column { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+.admin-two-column.admin-distribution-details { grid-template-columns: minmax(0, 2fr) minmax(300px, 1fr); }
 .admin-form { display: grid; gap: 12px; margin-top: 20px; }
 .admin-form label:not(.admin-field) { display: flex; align-items: center; gap: 9px; font-size: .8rem; }
 .admin-form input[type="checkbox"] { width: 17px; height: 17px; accent-color: var(--green); }
@@ -91,11 +92,22 @@
 .admin-plan-name { font-weight: 640; letter-spacing: .01em; }
 .admin-plan-stat { color: var(--muted); font-variant-numeric: tabular-nums; text-align: right; }
 .admin-table-wrap { overflow-x: auto; }
+.admin-version-table, .admin-github-release-table { min-width: 0; overflow-x: visible; }
+.admin-table-scroll { max-width: 100%; overflow-x: auto; }
 .admin-table-wrap table { width: 100%; border-collapse: collapse; font-size: .74rem; }
 .admin-table-wrap th { color: var(--muted); font-size: .65rem; letter-spacing: .04em; text-align: left; text-transform: uppercase; }
 .admin-table-wrap th, .admin-table-wrap td { padding: 11px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
 .admin-table-wrap td { white-space: nowrap; }
 .admin-table-wrap tr:last-child td { border-bottom: 0; }
+.admin-pipeline-stage { border-top: 3px solid var(--line-strong); }
+.admin-pipeline-stage small { display: block; margin-top: 4px; }
+.admin-pipeline-clear { border-top-color: var(--green); }
+.admin-pipeline-busy { border-top-color: var(--blue); }
+.admin-pipeline-waiting { border-top-color: var(--amber); }
+.admin-adoption-summary { margin-top: 10px; }
+.admin-adoption-summary table { width: auto; min-width: min(100%, 420px); }
+.admin-adoption-summary th { color: var(--ink); font-size: .74rem; font-weight: 500; letter-spacing: 0; text-transform: none; }
+.admin-adoption-summary td { font-variant-numeric: tabular-nums; text-align: right; }
 .admin-empty { color: var(--muted); font-size: .78rem; }
 .admin-status-line strong .admin-label-with-info { vertical-align: text-bottom; }
 .admin-audit-copy { max-width: 760px; }
@@ -146,6 +158,27 @@
 .admin-reconstruction progress { display: block; width: 100%; height: 8px; margin-top: 8px; accent-color: var(--green); }
 .admin-reconstruction-stale { border-color: #ab803a; }
 .admin-reconstruction-stale .admin-reconstruction-freshness { color: #735413; font-weight: 700; }
+.admin-reconstruction-graph .admin-graph-subtitle { margin: 8px 0 0; color: var(--ink); font-size: .76rem; font-weight: 700; }
+/* One cell per day, oldest first. The cells carry no content, so they grow
+   with the panel and wrap at narrow widths instead of clipping or scrolling. */
+/* `auto-fit` collapses the tracks no day occupies, so every cell keeps the
+   same width whether the window fits one row or wraps at phone width. */
+.admin-graph-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(8px, 1fr)); gap: 2px; margin-top: 12px; }
+.admin-graph-day, .admin-graph-key { border: 1px solid var(--line-strong); border-radius: 2px; background: var(--white); }
+.admin-graph-day { max-width: 26px; min-height: 22px; }
+/* Fill, tint and border style all differ, so the four states stay separable
+   without relying on hue alone. */
+.admin-graph-day-published { border-color: var(--green); background: var(--green); }
+.admin-graph-day-complete { border-color: var(--green); background: var(--green-soft); }
+.admin-graph-day-partial { border-color: var(--blue); background: var(--blue-soft); }
+.admin-graph-day-none { border-style: dashed; border-color: rgba(23, 33, 30, .3); background: var(--surface-sunken); }
+.admin-graph-legend { display: flex; flex-wrap: wrap; gap: 5px 14px; margin: 10px 0 0; padding: 0; color: var(--muted); font-size: .68rem; line-height: 1.4; list-style: none; }
+.admin-graph-legend li { display: inline-flex; gap: 6px; align-items: center; min-width: 0; }
+.admin-graph-key { flex: 0 0 auto; width: 11px; height: 11px; }
+.admin-graph-readout { margin: 0; padding: 0; list-style: none; }
+.admin-graph-grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr)); gap: 14px 18px; }
+.admin-graph-refusals { display: grid; gap: 3px; margin: 6px 0 0; padding: 0; color: var(--muted); font-size: .72rem; line-height: 1.45; list-style: none; overflow-wrap: anywhere; }
+.admin-reconstruction .admin-graph-retirement { margin-top: 12px; color: var(--amber); font-weight: 700; }
 .admin-allowance-summary { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: baseline; margin-top: 20px; }
 .admin-allowance-value { margin: 0; font-family: var(--serif); font-size: clamp(2.5rem, 6vw, 4.25rem); font-weight: 500; letter-spacing: -.035em; line-height: .95; }
 .admin-allowance-unit { max-width: 170px; color: var(--muted); font-size: .72rem; line-height: 1.4; }
@@ -198,6 +231,9 @@
   .admin-audit-table td::before { content: attr(data-label); color: var(--muted); font-size: .63rem; font-weight: 760; letter-spacing: .04em; text-transform: uppercase; }
   .admin-notification-controls { padding: 16px 0 0; border-top: 1px solid var(--line); border-left: 0; }
 }
+@media (max-width: 1100px) {
+  .admin-two-column.admin-distribution-details { grid-template-columns: 1fr; }
+}
 @media (max-width: 560px) {
   .admin-card-grid, .admin-two-column, .admin-operator-toolbar { grid-template-columns: 1fr; }
   .admin-toolbar-group { align-items: stretch; }
@@ -210,6 +246,8 @@
   .admin-allowance-controls { justify-content: start; }
   .admin-allowance-plan-summaries { grid-template-columns: 1fr; }
   .admin-reconstruction-grid { grid-template-columns: 1fr; gap: 10px; }
+  .admin-graph-legend { gap: 4px 12px; }
+  .admin-graph-day { min-height: 18px; }
   .admin-attention-item { grid-template-columns: auto minmax(0, 1fr); align-items: start; }
   .admin-attention-dot { margin-top: 5px; }
   .admin-attention-link { grid-column: 2; justify-self: start; }
@@ -219,3 +257,26 @@
   .admin-audit-fields { grid-template-columns: 1fr; gap: 3px; }
   .admin-audit-fields dd { margin-bottom: 7px; }
 }
+
+/* Keep operator actions compact and make the long page navigable. */
+.admin-section-nav { position: sticky; top: 76px; z-index: 19; display: flex; flex-wrap: nowrap; overflow-x: auto; gap: 8px 16px; margin: 0; padding: 14px 0; border-bottom: 1px solid var(--line); background: var(--paper, #f5f1e8); font-size: .78rem; }
+.admin-section-nav a { flex-shrink: 0; }
+.admin-section-nav a { color: var(--green); text-underline-offset: 3px; }
+.admin-toolbar-group { align-content: start; align-items: center; }
+.admin-toolbar-group .admin-toolbar-status { align-self: center; }
+.admin-form fieldset { display: grid; gap: 12px; min-width: 0; padding: 0; border: 0; margin: 0; }
+.admin-form legend { margin-bottom: 12px; color: var(--muted); font-size: .75rem; }
+.admin-control-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.admin-operator-page :is(button, input, select, a):focus-visible { outline: 2px solid var(--green); outline-offset: 3px; }
+.admin-operator-page h2, .admin-operator-page h4 { scroll-margin-top: 150px; }
+
+@media (max-width: 1100px) {
+  .admin-section[aria-labelledby="readiness-title"] .admin-two-column { grid-template-columns: 1fr; }
+}
+
+#distribution-total-rows { border-top: 2px solid var(--line); font-weight: 700; }
+#distribution-total-rows tr:last-child { background: var(--paper, #f5f1e8); }
+#github-release-total-rows { border-top: 2px solid var(--line); font-weight: 700; background: var(--paper, #f5f1e8); }
+.admin-evidence-card summary, .admin-diagnostic-details summary { cursor: pointer; color: var(--green); font-weight: 700; }
+.admin-evidence-card details[open] summary, .admin-diagnostic-details[open] summary { margin-bottom: 16px; }
+.admin-evidence-card { align-self: start; }

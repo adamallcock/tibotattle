@@ -16,21 +16,27 @@
  * never removed or replaced by this script. The harness receives an explicit
  * development export identity file, so this lane never needs the production
  * export-identity Keychain item. Hosted contribution remains disabled.
+ * `interactive` additionally creates a separate profile-owned account-observation
+ * key. This establishes prospective pacing from fresh local observations without
+ * reading production credentials or joining the copied account history.
  *
  * Output and receipts are content-free. Source paths, Codex rows, account
  * identifiers, raw salts, credentials, and renderer text never cross the
  * output boundary.
  */
 
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { constants, mkdtempSync, rmSync } from "node:fs";
 import {
   chmod,
+  link,
   lstat,
   mkdir,
   open,
+  readdir,
   rename,
   rm,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { DatabaseSync, backup } from "node:sqlite";
@@ -49,6 +55,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { loadOrCreateParticipantSecret } from "../src/export-identity.js";
+import { readDevelopmentAccountObservationSecretFile } from "../src/account-observation-secret.js";
 import {
   LOCAL_COLLECTOR_STATE_SCHEMA_VERSION,
 } from "../src/local-collector-state.js";
@@ -79,6 +86,7 @@ const INDEX_NAME = "local-unified-index-v1.sqlite";
 const COLLECTOR_NAME = "local-collector-state-v1.sqlite";
 const DEVICE_SALT_NAME = "local-unified-index-device-salt-v1";
 const IDENTITY_NAME = "export-identity";
+const PACING_IDENTITY_NAME = "account-observation-development";
 const INDEX_APPLICATION_ID = LOCAL_UNIFIED_INDEX_APPLICATION_ID;
 const INDEX_MINIMUM_KNOWN_USER_VERSION = 1;
 const COLLECTOR_APPLICATION_ID = 0x554d4353;
@@ -908,7 +916,7 @@ function relativeProfilePath(profile, candidate) {
   return selected;
 }
 
-function interactiveEnvironment(profile, codexHomePath) {
+export function interactiveEnvironment(profile, codexHomePath, pacingIdentityPath) {
   return Object.fromEntries(Object.entries({
     PATH: process.env.PATH,
     LANG: "en_US.UTF-8",
@@ -925,8 +933,72 @@ function interactiveEnvironment(profile, codexHomePath) {
     USAGE_MONITOR_TEST_LANE: "macos-electron-local-qa-v1",
     USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: "1",
     USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: profile.identityPath,
+    USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: pacingIdentityPath,
     ELECTRON_NO_ATTACH_CONSOLE: "1",
   }).filter(([, value]) => value !== undefined));
+}
+
+// Interactive dogfooding needs its own prospective account continuity. This
+// independent profile key never reads production credentials or relabels the
+// copied history, and automated QA remains opted out. A malformed existing
+// key is an error, never a reason to silently rotate identity.
+export async function prepareInteractivePacingIdentity(profilePath) {
+  const profile = await validateRealHistoryProfile(profilePath);
+  const path = join(profile.roots.identity, PACING_IDENTITY_NAME);
+  let exists;
+  try {
+    await lstat(path);
+    exists = true;
+  } catch (error) {
+    if (error?.code !== "ENOENT") fail("ELECTRON_REAL_HISTORY_PROFILE_PACING_IDENTITY_INVALID");
+    exists = false;
+  }
+  if (!exists) {
+    const bytes = randomBytes(32);
+    const temporary = join(profile.roots.identity, `.${PACING_IDENTITY_NAME}.pending-${randomUUID()}`);
+    try {
+      await writeExclusive(temporary, bytes);
+      // Publish only the complete, fsynced key. link refuses an existing final
+      // name, so concurrent launches cannot overwrite an established identity.
+      try { await link(temporary, path); }
+      catch (error) { if (error?.code !== "EEXIST") throw error; }
+      await unlink(temporary);
+      await syncDirectory(profile.roots.identity);
+    } finally {
+      bytes.fill(0);
+    }
+  }
+  // Recover only the exact second link left by interrupted publication. The
+  // complete final key survives unchanged; unrelated or partial temp files
+  // are preserved and never used as identity.
+  const final = await lstat(path);
+  if (final.nlink === 2 && final.isFile() && !final.isSymbolicLink()
+      && final.size === 32 && (final.mode & 0o777) === 0o600 && uidMatches(final)) {
+    const prefix = `.${PACING_IDENTITY_NAME}.pending-`;
+    for (const name of await readdir(profile.roots.identity)) {
+      if (!name.startsWith(prefix)
+          || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/u.test(name.slice(prefix.length))) continue;
+      const temporary = join(profile.roots.identity, name);
+      const candidate = await lstat(temporary);
+      if (!sameMetadata(metadataIdentity(final), metadataIdentity(candidate))
+          || !candidate.isFile() || candidate.isSymbolicLink() || candidate.nlink !== 2
+          || (candidate.mode & 0o777) !== 0o600 || !uidMatches(candidate)) continue;
+      await unlink(temporary);
+      await syncDirectory(profile.roots.identity);
+      break;
+    }
+  }
+  let secret;
+  try {
+    secret = await readDevelopmentAccountObservationSecretFile(path, {
+      exportIdentityFile: profile.identityPath,
+    });
+  } catch {
+    fail("ELECTRON_REAL_HISTORY_PROFILE_PACING_IDENTITY_INVALID");
+  } finally {
+    secret?.fill(0);
+  }
+  return path;
 }
 
 async function validateIdentityFile(path) {
@@ -1188,13 +1260,14 @@ async function launchInteractiveRealHistoryProfile(options) {
     options.artifactSha256,
   );
   const executable = join(options.appPath, "Contents", "MacOS", "TiboTattle Dev");
+  const pacingIdentityPath = await prepareInteractivePacingIdentity(options.profilePath);
   let child;
   try {
     child = spawn(executable, [
       `--user-data-dir=${join(profile.profile, "user-data")}`,
     ], {
       cwd: join(options.appPath, "Contents", "Resources"),
-      env: interactiveEnvironment(profile, options.codexHomePath),
+      env: interactiveEnvironment(profile, options.codexHomePath, pacingIdentityPath),
       stdio: "ignore",
     });
   } catch {
@@ -1234,6 +1307,8 @@ function printHelp() {
     "",
     "The profile is persistent and private. This command never installs, signs,",
     "publishes, removes, or replaces an app or the native source state.",
+    "Interactive launch uses a separate local pacing identity; a forecast needs",
+    "fresh comparable observations with measured quota movement.",
   ].join("\n") + "\n");
 }
 

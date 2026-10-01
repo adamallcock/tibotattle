@@ -168,7 +168,7 @@ resolve their implementation ambiguities.
 | Hosted consent/floor, erasure, private export and repair | [Successor lifecycle](../../apps/worker/test/telemetry-v11.spec.ts), [device authentication](../../apps/worker/test/device-auth.spec.ts), [dormant v0.2 HTTP admission](../../apps/worker/test/account-scoped-http.spec.ts) |
 | Atomic domain replacement and all analytical consumers | [Domain activation](../../apps/worker/test/telemetry-v11-domain.spec.ts), [source selection](../../apps/worker/test/telemetry-v1-source-selection.spec.ts), [publication fencing](../../apps/worker/test/analytical-publication-fencing.spec.ts), [community allowance](../../apps/worker/test/community-allowance.spec.ts) |
 | Bounded deletion and schema readiness | [Every-table deletion query plans](../../apps/worker/test/deletion-cascade-indexes.spec.ts), [release rehearsal](../../apps/worker/scripts/release-preflight.check.mjs), [staging probe](../../apps/worker/scripts/staging-readiness.check.mjs) |
-| Shipped module closure | [Native bundle](../../test/macos-app-bundle.test.js), [standalone export](../../test/export-tibotattle.test.js) |
+| Shipped module closure | [Native bundle](https://github.com/adamallcock/tibotattle/blob/2d7ba00df9e2f705e5f0e3a2684da5ec9e9112bb/test/macos-app-bundle.test.js), [standalone export](https://github.com/adamallcock/tibotattle/blob/2d7ba00df9e2f705e5f0e3a2684da5ec9e9112bb/test/export-tibotattle.test.js) |
 
 ## Work packages and acceptance gates
 

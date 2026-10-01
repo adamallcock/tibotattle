@@ -186,6 +186,7 @@ function stagingClosure() {
         "package.json",
         "electron-runtime-manifest.json",
         "apps/electron/**",
+        "scripts/diagnose-desktop-crash.mjs",
         "apps/local/**",
         "apps/web/public/**",
         "config/**",
@@ -409,7 +410,7 @@ if (INPUTS.targetSpec.platform === "darwin") {
       { target: "dmg", arch: [INPUTS.targetSpec.architecture] },
       { target: "zip", arch: [INPUTS.targetSpec.architecture] },
     ],
-    icon: path.join(REPOSITORY_ROOT, "apps/macos/Assets/AppIcon.icns"),
+    icon: path.join(REPOSITORY_ROOT, "apps/electron/assets/AppIcon.icns"),
     // osx-sign 1.3.3 must sign the extra Contents/MacOS helper before the
     // actual CFBundleExecutable, which seals the enclosing app bundle.
     sign: "./scripts/electron-macos-sign-order.mjs",

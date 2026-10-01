@@ -240,7 +240,7 @@ test("synthetic cache fixture reaches the ordinary local index-to-link path", as
       sourceMode: "unified",
       unifiedIndexFile: paths.unifiedIndexFile,
       expectedGeneration: projection.generation,
-      contextBehavior: "legacy_zero",
+      contextBehavior: "source_native",
       rebuildIsolation: "in_process",
     });
     const snapshot = await buildLocalCompanionSnapshot({

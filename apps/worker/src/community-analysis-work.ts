@@ -1,6 +1,8 @@
 import { canonicalJson } from "./canonical-json";
 import { sha256Hex } from "./crypto";
 import {
+  V1_QUOTA_ACQUISITION_PHASES,
+  V1_QUOTA_WORK_COMPONENTS,
   validateV1QuotaWorkControl,
   validateV1QuotaWorkPart,
   type V1QuotaWorkControl,
@@ -17,7 +19,9 @@ export const COMMUNITY_ANALYSIS_MAX_PARTS = 1024;
 export const COMMUNITY_ANALYSIS_PARTS_PER_READ = 8;
 export const COMMUNITY_ANALYSIS_MUTATIONS_PER_COMMIT = 32;
 export const COMMUNITY_ANALYSIS_BATCH_BYTES = COMMUNITY_ANALYSIS_PART_BYTES * COMMUNITY_ANALYSIS_MUTATIONS_PER_COMMIT;
-const COMPONENTS = ["plan-anchors", "plan-runs", "plan-equal-time", "fit-stats", "eligible", "endpoint-runs", "endpoints"] as const;
+/** Derived from the reader's own list: a component added to the acquisition
+ * checkpoint must reach this store, and a second copy of the list would drift. */
+const COMPONENTS = V1_QUOTA_WORK_COMPONENTS;
 const HASH = /^[a-f0-9]{64}$/u;
 const RUN_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u;
 const encoder = new TextEncoder();
@@ -62,7 +66,7 @@ export interface CommunityAnalysisWorkHead {
   readerPolicy?: "prepared-source-days-1";
   runId: string;
   progressRevision: number;
-  phase: "plan" | "fitability" | "endpoints" | "complete";
+  phase: typeof V1_QUOTA_ACQUISITION_PHASES[number] | "complete";
   control: V1QuotaWorkControl;
   manifest: CommunityAnalysisPartReference[];
 }
@@ -216,6 +220,11 @@ export function createCommunityAnalysisWorkStore(namespace: "current" | "model-h
   function phaseValid(phase: CommunityAnalysisWorkHead["phase"], control: V1QuotaWorkControl): boolean {
     return phase === control.phase || (phase === "complete" && control.phase === "endpoints");
   }
+  /** The cursor of whichever leg of a phase last advanced. The anchor phase
+   * has two: source anchors, then pool hulls. */
+  function activeCursor(control: V1QuotaWorkControl): V1QuotaWorkControl["cursor"] {
+    return control.clusterCursor ?? control.cursor;
+  }
   function validateHead(head: CommunityAnalysisWorkHead): void {
     const keys = ["identity", "runId", "progressRevision", "phase", "control", "manifest"];
     if (!record(head) || !(exactKeys(head, keys) || (head.readerPolicy === "prepared-source-days-1"
@@ -307,7 +316,8 @@ export function createCommunityAnalysisWorkStore(namespace: "current" | "model-h
       const control: unknown = JSON.parse(row.control_json), manifest: unknown = JSON.parse(row.manifest_json);
       if (!validateV1QuotaWorkControl(control) || !validateManifest(manifest)
         || typeof row.run_id !== "string" || !RUN_ID.test(row.run_id) || !integer(row.progress_revision)
-        || !["plan", "fitability", "endpoints", "complete"].includes(String(row.phase))) return { status: "corrupt" };
+        || !([...V1_QUOTA_ACQUISITION_PHASES, "complete"] as readonly string[])
+          .includes(String(row.phase))) return { status: "corrupt" };
       if (row.reader_policy !== "raw-source-pages-1" && row.reader_policy !== "prepared-source-days-1") return { status: "corrupt" };
       const head: CommunityAnalysisWorkHead = { identity: storedIdentity,
         runId: row.run_id, progressRevision: row.progress_revision,
@@ -367,7 +377,7 @@ export function createCommunityAnalysisWorkStore(namespace: "current" | "model-h
     validateHead(head);
     if (!record(change) || !exactKeys(change, ["control", "phase", "parts"]) || !Array.isArray(change.parts)) invalid();
     const controlJson = encodeControl(change.control);
-    const phases = ["plan", "fitability", "endpoints", "complete"];
+    const phases: readonly string[] = [...V1_QUOTA_ACQUISITION_PHASES, "complete"];
     if (head.phase === "complete" || !phaseValid(change.phase, change.control)
       || phases.indexOf(change.phase) < phases.indexOf(head.phase) || head.progressRevision >= Number.MAX_SAFE_INTEGER - 1) invalid();
     if (change.parts.length > COMMUNITY_ANALYSIS_MUTATIONS_PER_COMMIT) return { status: "deferred" };
@@ -468,14 +478,21 @@ export function createCommunityAnalysisWorkStore(namespace: "current" | "model-h
   function replayMatches(head: CommunityAnalysisWorkHead, target: Pick<CommunityAnalysisStageTarget, "phase" | "control">,
     replay: unknown): replay is V1QuotaPageReplay {
     if (!validateV1QuotaPageReplay(replay) || !replayPolicyMatches(head, replay)
-      || canonicalJson(replay.from) !== canonicalJson({ phase: head.phase, cursor: head.control.cursor })
-      || canonicalJson(replay.through) !== canonicalJson({ phase: target.phase, cursor: target.control.cursor })) return false;
-    const phases = ["plan", "fitability", "endpoints", "complete"];
+      || canonicalJson(replay.from) !== canonicalJson({ phase: head.phase, cursor: activeCursor(head.control) })
+      || canonicalJson(replay.through) !== canonicalJson({ phase: target.phase, cursor: activeCursor(target.control) })) return false;
+    // Entering or leaving the hull sweep is progress inside one phase, and it
+    // deliberately restarts the source cursor, so it is not a cursor rewind.
+    if ((head.control.clusterCursor === null) !== (target.control.clusterCursor === null)) return true;
+    const phases = ["plan", "clusters", "fitability", "endpoints", "complete"];
     const advance = phases.indexOf(replay.through.phase) - phases.indexOf(replay.from.phase);
     if (advance < 0 || advance > 1) return false;
     if (advance === 1) return true;
     const before = replay.from.cursor, after = replay.through.cursor;
-    if (replay.from.phase !== "plan" && before.resetsAt !== after.resetsAt) return before.resetsAt < after.resetsAt;
+    // The fit page is reset-major, and the anchor phase's hull sweep reads it
+    // too, so the guard keys off the leg rather than the phase name: under
+    // `plan` with a hull cursor open the cursor advances by reset first.
+    const resetMajor = replay.from.phase !== "plan" || head.control.clusterCursor !== null;
+    if (resetMajor && before.resetsAt !== after.resetsAt) return before.resetsAt < after.resetsAt;
     return before.observedAt < after.observedAt || (before.observedAt === after.observedAt && before.id < after.id);
   }
   async function stageHash(head: CommunityAnalysisWorkHead, stage: CommunityAnalysisWorkStage): Promise<string> {
@@ -517,7 +534,7 @@ export function createCommunityAnalysisWorkStore(namespace: "current" | "model-h
           : stage.discardInputRevision !== head.identity.inputRevision || !supersessionValid(head, stage.replay))) invalid();
     } else {
       if (stage.discardInputRevision !== null || !validateV1QuotaPageReplay(stage.replay) || !replayPolicyMatches(head, stage.replay)
-        || canonicalJson(stage.replay.through) !== canonicalJson({ phase: stage.target.phase, cursor: stage.target.control.cursor })) invalid();
+        || canonicalJson(stage.replay.through) !== canonicalJson({ phase: stage.target.phase, cursor: activeCursor(stage.target.control) })) invalid();
       if (stage.mode === "garbage_collecting") {
         if (head.progressRevision !== stage.baseProgressRevision + 1 || !headEqual(head, targetHead(head, stage))) invalid();
       } else if (head.progressRevision !== stage.baseProgressRevision || !replayMatches(head, stage.target, stage.replay)) invalid();

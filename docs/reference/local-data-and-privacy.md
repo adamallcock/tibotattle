@@ -46,9 +46,19 @@ credentials and while-open scheduling to the encrypted v1.1 upload transport.
 Enrollment alone grants no upload permission: the server separately binds an
 accountless owner and current versioned authorization to that installation.
 Usage and quota records retain the same owner, provider/account track and
-domain-generation boundaries. Revocation blocks future admission; it is
-separate from private owner erasure of previously accepted records. Accountless
-owners remain excluded from public fits under the current eligibility policy.
+domain-generation boundaries. The accepted
+[upload-only opt-out policy](../decisions/2026-09-15-opt-out-stops-future-uploads.md)
+requires ordinary opt-out and device disconnect to stop future admission while
+retaining accepted evidence in public calculations. They do not erase history
+or restart historical work. Upload expiry has the same retention boundary.
+Security containment and explicit private owner erasure are separate operations.
+The [shared public sample](../decisions/2026-09-11-public-contribution-sources.md)
+admits device-bound accountless v1.1 sources alongside signed-in sources. The
+opt-out decision records implementation and deployment evidence; the policy
+statement alone does not establish that a deployed service has been corrected.
+Public counts describe contribution sources, not unique people or verified
+provider accounts; separate installations can supply overlapping history.
+Sealed legacy weekly snapshots retain their original cohort rules.
 
 Only a validated production distribution manifest enables the hosted client;
 development/QA packages keep it disabled. The server's separate ownership flag
@@ -92,18 +102,29 @@ for runtime and resource limits.
 
 ## Model performance timing in development source
 
-Opening **Model performance** (`#performance`) enables an independent worker
+Opening **Model performance** (`#performance`) or running a separately authorized
+daily-performance delivery enables an independent worker
 for the selected Codex home's plain `.jsonl` session and archived-session files.
 This diagnostic population spans accounts on this device. It reads timestamps,
-allowlisted model metadata, token counters, and response/turn boundaries to
+allowlisted model and speed-mode metadata, token counters, and response/turn boundaries to
 reconstruct timing; raw content and raw IDs are never persisted or returned.
 Compressed-only histories and missing timing remain unavailable.
 
-Reads renew a 60-second page lease. Discovery is capped at 50,000 entries;
+Page reads and daily-report requests renew a 60-second lease. Discovery is capped at 50,000 entries;
 scan passes target at most 32 MiB or 750 ms, checking between chunks of at most
-4 MiB and pausing five seconds between passes. The worker checkpoints progress
-and stops after the lease expires. It does not feed accounting, contribution,
-or network requests. Failures preserve available saved evidence with its
+two 2-MiB reads per source (original timing and supplemental throughput). It
+pauses 250 ms during history collection and five seconds after catching up.
+The worker checkpoints each store independently, finishes an explicitly
+requested history pass, and then stops after the idle lease expires.
+The supplement observes only allowlisted activity kinds and scalar counters;
+unknown activity, tools, steering, ambiguous tokens, or incomplete evidence
+excludes a turn. Full-turn duration includes initial waiting; TTFT is never
+subtracted. Output speed uses response timing when available, otherwise an eligible
+supplemental full-turn estimate. Each turn is counted once; the display discloses
+the fallback count and its inclusion of initial waiting. It does not feed accounting.
+Only the separately authorized performance scheduler can project and send its
+content-free daily histograms; opening the page does not grant sharing consent.
+Failures preserve available saved evidence with its
 stale/unavailable state. Windows remains unavailable until its protected-state
 adapter is qualified. These are source behavior, not installed-release proof.
 
@@ -115,12 +136,24 @@ owner-only permissions. Important entries include:
 | State | Purpose | Retention behavior |
 | --- | --- | --- |
 | `local-unified-index-v1.sqlite` plus device salt | Canonical replay-safe Codex usage/quota/tool projection and source provenance. | Accumulates locally; the 30-day UI horizon is not retention. |
-| `inference-timing-v2/timing-experiment.sqlite` (development source) | Separate owner-only timing sidecar: one row per completed turn, counts/durations/coverage, local HMAC keys, source cursors and bounded pending state. No raw content or IDs. | Maximum 256 MiB; method/SQLite user version 2. Incompatible stores, including version 1, are preserved and refused. Display periods do not delete evidence or migrate the accounting index. |
+| `inference-timing-v2/model-performance-snapshot.json` | At most eight rolling period/mode and eight exact-window completed timing projections, fixed model IDs and numeric bins; 4 MiB owner-only, schema/digest-checked v5 envelope bound to the configured Codex source. | Uses the same atomic snapshot transport as Overview. Earlier mixed-mode receipts are preserved and refused until mode-separated reconstruction produces a v5 replacement. Unknown and mixed-mode turns are excluded from both selectable modes. Restored measurements keep their observation date while background scanning runs or fails; incomplete scans cannot replace them. First result saves immediately, then hourly, with latest completed results flushed on clean shutdown. |
+| `inference-timing-v2/source-<Codex-home digest>/timing-experiment.sqlite` (development source) | Separate owner-only timing sidecar: one row per completed turn, counts/durations/coverage, local HMAC keys, source cursors and bounded pending state. No raw content or IDs. | Maximum 256 MiB per selected source; parser method 2 and SQLite user version 4. The forward migration retains existing TPS/TTFT, adds nullable completion/mode fields and source revision counters, and fences older writers. The legacy unscoped sidecar is preserved without reading or migrating its unknown source provenance; first use rebuilds measurements from retained source logs. Incompatible stores, including version 1, are preserved and refused. Display periods do not delete evidence or migrate the accounting index. |
+| `inference-timing-v2/source-<Codex-home digest>/tool-free-v1/timing-experiment.sqlite` (development source) | Independent supplement for reconciled single-response turns without tools, plus its own source cursors and bounded scalar pending state. Shares the original private timing correlation key for local joins only. | Maximum 256 MiB; parser method 3 and SQLite user version 5. Its forward migration preserves previous supplement measurements and fences older writers; the original primary store remains separate. An incompatible or unavailable supplement does not hide original measurements. |
 | `local-collector-state-v1.sqlite` | App-server quota observations, checkpoints, dedupe, locks, and replay-safe collector state. | Accumulates until explicit local erase or a reviewed migration/retention workflow. |
 | `private/` settings/handoff state | Automatic/incremental contribution settings, bounded OAuth restart handle, fast-mode preference, and speed baselines. | Settings persist; the OAuth handle expires and is bounded. |
 | Prepared contribution/review directories and queue | Exact local review, delivery, retry, and audit state. | Retained for replay-safe completion, explicit cleanup, or local erase. |
 | Diagnostics log | Fixed error/status codes and opaque support references. | Bounded, content-free local diagnostics only. |
+| Electron crash capture (macOS opt-in) | Native Crashpad dumps under Electron's user-data directory, separate from the content-free doctor report. Dumps may contain process memory and private data. | Off by default; stored locally only after an explicit preference change and subsequent launch. TiboTattle does not upload or automatically erase dumps. |
+| Offline private crash-evidence export (explicit CLI action) | Bounded copies of matching Apple crash reports and local companion diagnostic log generations; Crashpad dumps only with a second explicit flag. Originals can contain private paths, text, and process memory. | New owner-only directory chosen by the user, outside the source checkout. No automatic upload, issue attachment, or deletion of originals; a private handoff requires a separate owner decision. |
 | WebKit website data | Loopback dashboard session/local storage and short-lived hosted web session state. | Cleared by **Erase local data**; provider pages use the system browser. |
+
+The derived accounting cache inside collector state uses compact JSON with a
+128 MiB publication and child-result transport ceiling. Existing pretty-printed
+caches remain readable without migration; observation values, source records,
+checkpoint hashes and export serialization are unchanged. The selected-plan
+comparison retains its separate 100,000-row and 4 MiB limits, the retained
+dashboard snapshot retains its 16 MiB limit, and rebuild RSS limits remain
+independent. These resource bounds do not authorize history deletion.
 
 The standalone CLI/developer default uses the platform-specific
 `app-usagemonitor` state directory. The installed app supplies the stable
@@ -259,6 +292,36 @@ replacement adapter exists, this history blocks the stronger-format upgrade
 before consent or admission-floor changes; disjoint dates do not make it safe
 to hide the old source. No local or hosted history is deleted by this refusal.
 
+### Continuity successor and daily performance (source implementation)
+
+V1.2 adds nullable turn-start/preceding-compaction bits, ordering among events
+with the same session and timestamp, and reported five-minute/one-hour cache
+write subdivisions. Unknown evidence stays null. The subdivisions reconcile to
+the existing cache-write total and never add usage. Continuity before the
+server-issued activation instant remains unreported. Current cache calculations
+remain unchanged. Social sharing requires an exact new field review, hosted
+grant and local approval; accountless sharing negotiates a distinct policy grant
+while respecting the existing durable opt-out. Legacy clients retain their own
+closed contracts. Installing the source does not activate the hosted runtime.
+
+The separately authorized performance stream contains daily distributions and
+counts by provider, model, reasoning effort, measurement method, event-time
+speed mode/evidence source and API tier. It covers eligible TPS, first-token
+time and complete-turn duration, including tool waits where qualified. Missing
+measurements remain unavailable. It sends fixed histogram counts and bounded
+integer summaries, not turn identifiers, prompts, responses or timestamps for
+individual turns. Compatible reports are pooled as reported samples: ordinary
+retry/revision deduplication does not remove copied history across devices.
+
+Usage and performance have separate capabilities, consent/policy tuples,
+progress, retry and storage state. Usage authorization never grants performance
+permission. Performance delivery and application composition are still qualified
+independently in the [implementation plan](../plans/2026-09-20-turn-boundary-telemetry-plan.md).
+The source includes owner erasure for both streams and a typed restore role that
+preserves grants, report revisions and correction history. Populated synthetic
+restore/erasure checks do not establish a production migration or deletion-ledger
+reconciliation. Opt-out stops future uploads and retains accepted history.
+
 ## Network destinations
 
 | Destination | When used | Data sent |
@@ -327,7 +390,7 @@ about applicable privacy rights or how a particular request should be resolved.
 | --- | --- | --- |
 | **Erase local data** | Moves the installed app's Application Support state root to Trash and clears TiboTattle WebKit data. | Provider source files, Keychain capabilities, or hosted data. |
 | **Reset identity and device** | Reviewed TiboTattle Keychain capabilities plus their associated local binding/app state. | General local analysis state unless the reset contract explicitly reports it; hosted contribution records. |
-| Legacy device disconnect (existing backend contract) | Hosted authority for this device plus its local device credential/binding; pauses delivery. | Other devices, hosted participant data, or local analysis. |
+| **Disconnect this Mac** (legacy backend contract) | Hosted authority for this device plus its local device credential/binding; pauses delivery. | Other devices, hosted participant data, or local analysis. |
 | Private owner participant erasure | Hosted participant/account, contribution, session, and device state through the protected pipeline; affected aggregates are withdrawn/rebuilt. | Local analysis, provider source files, retained safeguards/audit, or immutable withdrawn aggregate revisions. |
 | Ordinary app/Homebrew uninstall | Application binaries. | By design, local state and Keychain survive ordinary uninstall. |
 | Homebrew `--zap` | Declared app Application Support/cache/WebKit/preferences. | `~/.codex`, Keychain identities, or previously hosted data. |
@@ -401,8 +464,22 @@ report. It expires or is evicted with the report. Search matches are applied
 before pagination and family/project summation, preserving global share
 denominators. Neither search text nor the lookup is serialized, exported or
 uploaded. Refreshing creates a new lookup when names need to be reread.
-Attribution reports are immutable and expire after five minutes without a query
-or lease renewal, with at most two retained per process. The visible Projects &
+Interactive attribution reports are immutable and expire after five minutes without
+a query or lease renewal, with at most two addressable reports per process. Two
+additional last-completed reports may remain in memory for reload continuity;
+search indices are not retained with them. A separate `work-usage-snapshot.json`
+stores at most four completed period/scope projections in a 16 MiB owner-only,
+digest-checked envelope. Project/worktree/thread handles are replaced by anonymous
+snapshot-local aliases before writing; names, raw UUIDs, paths, display metadata
+and search text are absent. Requests match a hashed period/scope key and configured
+source binding; an explicit `endAt` additionally requires the exact saved window. Restored figures retain their original interval and observation
+time and stay read-only while a separate refresh job runs. On companion restart,
+labels explicitly remain anonymous until live enrichment completes. When the
+shared reporting end advances within the same period, the view can keep the dated
+previous figures visible while fetching the exact new window; those figures
+never become the new query's source, cursor or cache entry. Failed,
+cancelled or partial builds preserve the last completed result; an authoritative
+empty result replaces it. The visible Projects &
 threads page renews its lease every minute through a closed, content-free
 `touch` request containing only the schema, action and snapshot handle. This
 performs no aggregation, enrichment or source scan, stops when the page is hidden

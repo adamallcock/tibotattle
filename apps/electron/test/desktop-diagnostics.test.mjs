@@ -33,9 +33,26 @@ test("desktop diagnostics reduce runtime state to content-free enums and boolean
       startAtLogin: { status: "enabled" },
       notifications: { delivery: "ready" },
     },
+    refresh: {
+      schemaVersion: "tibotattle-desktop-refresh-status-v1",
+      state: "running",
+      mode: "detailed",
+      cadenceTimerArmed: false,
+      heartbeatWatchdogArmed: true,
+      deadlineWatchdogArmed: true,
+      activeLease: true,
+      activeLeaseAgeSeconds: 75,
+      lastStartedAt: "2026-09-21T12:00:00.000Z",
+      lastHeartbeatAt: "2026-09-21T12:01:00.000Z",
+      lastSettledAt: null,
+      lastRecoveredAt: null,
+      lastRecoveryReason: null,
+      lease: 41,
+      privatePath: "/Users/adam/.codex",
+    },
   });
   const text = formatDesktopDiagnostics(record);
-  assert.match(text, /tibotattle-electron-diagnostics-v1/u);
+  assert.match(text, /tibotattle-electron-diagnostics-v2/u);
   assert.match(text, /"dashboardReady": true/u);
   assert.doesNotMatch(text, /127\.0\.0\.1|Users|private-codex/u);
   assert.deepEqual(record.settings, {
@@ -45,6 +62,21 @@ test("desktop diagnostics reduce runtime state to content-free enums and boolean
     codexFolder: "custom",
     startAtLogin: "enabled",
     notificationDelivery: "ready",
+  });
+  assert.deepEqual(record.refresh, {
+    schemaVersion: "tibotattle-desktop-refresh-status-v1",
+    state: "running",
+    mode: "detailed",
+    cadenceTimerArmed: false,
+    heartbeatWatchdogArmed: true,
+    deadlineWatchdogArmed: true,
+    activeLease: true,
+    activeLeaseAgeSeconds: 75,
+    lastStartedAt: "2026-09-21T12:00:00.000Z",
+    lastHeartbeatAt: "2026-09-21T12:01:00.000Z",
+    lastSettledAt: null,
+    lastRecoveredAt: null,
+    lastRecoveryReason: null,
   });
   assert.deepEqual(record.privacy, {
     includesPrivateData: false,
@@ -87,6 +119,13 @@ test("desktop diagnostics reject injected top-level and nested fields", () => {
     },
     {
       ...record,
+      refresh: {
+        ...record.refresh,
+        lease: 41,
+      },
+    },
+    {
+      ...record,
       privacy: {
         ...record.privacy,
         injected: true,
@@ -102,6 +141,13 @@ test("desktop diagnostics reject non-plain records and invalid allowlisted value
   const record = createDesktopDiagnostics({ platform: "linux", architecture: "x64" });
   assert.throws(
     () => formatDesktopDiagnostics(Object.assign(Object.create({ inherited: true }), record)),
+    TypeError,
+  );
+  assert.throws(
+    () => formatDesktopDiagnostics({
+      ...record,
+      refresh: { ...record.refresh, lastStartedAt: "/Users/adam/private" },
+    }),
     TypeError,
   );
   assert.throws(

@@ -19,11 +19,22 @@ test("subscription default and protocol priority normalize to Standard and Fast 
 });
 
 test("API Standard, Priority, Flex, and Batch remain independent from Codex speed mode", () => {
-  for (const raw of ["standard", "priority", "flex", "batch"]) {
+  for (const raw of ["standard", "priority", "ultrafast", "flex", "batch"]) {
     const normalized = normalizeProviderTier(raw, { billingSurface: "openai_api", tierSource: "config" });
     assert.equal(normalized.apiServiceTier, raw);
     assert.equal(normalized.codexSpeedMode, "unknown");
   }
+});
+
+test("Ultrafast is a distinct speed and API tier; reasoning Ultra remains unrecognized as a tier", () => {
+  for (const tierSource of ["rollout_thread_settings", "turn_override", "lineage_inherited", "config"]) {
+    const tier = normalizeProviderTier("ultrafast", { billingSurface: "chatgpt_subscription", tierSource });
+    assert.equal(tier.codexSpeedMode, "ultrafast");
+    assert.equal(tier.apiServiceTier, "unknown");
+    assert.equal(validateTierDeclaration(tier), tier);
+  }
+  assert.equal(normalizeProviderTier("fast", { billingSurface: "openai_api" }).apiServiceTier, "priority");
+  assert.equal(normalizeProviderTier("ultra", { billingSurface: "chatgpt_subscription" }).codexSpeedMode, "other");
 });
 
 test("clear, omission, and future values remain explicit unknown or other values", () => {

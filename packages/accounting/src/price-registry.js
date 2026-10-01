@@ -1,5 +1,5 @@
 // Reviewed provider price evidence shared by local and edge accounting adapters.
-export const APP_PRICE_REGISTRY_OBSERVED_AT = "2026-09-04T02:30:56Z";
+export const APP_PRICE_REGISTRY_OBSERVED_AT = "2026-09-29T18:16:22Z";
 // First official-page review. This is the review boundary, not a lower bound
 // on the reviewed model rates: recognized OpenAI/Codex events before this date
 // remain priceable unless a card has an explicit vendor-effective boundary.
@@ -10,7 +10,7 @@ export const OPENAI_PRICE_EVIDENCE_START_DATE = OPENAI_FIRST_OBSERVED_DATE;
 // lower bound on the reviewed model rates.
 const ANTHROPIC_OBSERVED_AT = "2026-07-25T14:18:33Z";
 const PER_MILLION = "1000000";
-export const APP_PRICE_REGISTRY_VERSION = "app-official-api-prices-v0.7";
+export const APP_PRICE_REGISTRY_VERSION = "app-official-api-prices-v0.9";
 
 export const OFFICIAL_PRICE_SOURCE_URLS = Object.freeze({
   openai: "https://developers.openai.com/api/docs/pricing",
@@ -61,12 +61,50 @@ const SOURCE_DEFINITIONS = Object.freeze({
     provider: "openai",
     name: "openai-official-astra-api-pricing",
     url: OFFICIAL_PRICE_SOURCE_URLS.openai,
-    observedAt: APP_PRICE_REGISTRY_OBSERVED_AT,
+    observedAt: "2026-09-04T02:30:56Z",
     evidenceVersion: "openai-astra-api-pricing-reviewed-2026-09-03",
     evidenceUrls: Object.freeze([
       OFFICIAL_PRICE_SOURCE_URLS.openai,
       "https://developers.openai.com/api/docs/models/gpt-6-astra",
       "https://learn.chatgpt.com/docs/changelog",
+    ]),
+  }),
+  openaiSolLuna: Object.freeze({
+    provider: "openai",
+    name: "openai-official-sol-luna-api-pricing",
+    url: OFFICIAL_PRICE_SOURCE_URLS.openai,
+    observedAt: "2026-09-22T18:54:35Z",
+    evidenceVersion: "openai-sol-luna-api-pricing-reviewed-2026-09-22",
+    evidenceUrls: Object.freeze([
+      OFFICIAL_PRICE_SOURCE_URLS.openai,
+      "https://developers.openai.com/api/docs/models/gpt-6-sol",
+      "https://developers.openai.com/api/docs/models/gpt-6-luna",
+      "https://openai.com/index/introducing-gpt-6-sol-and-luna/",
+    ]),
+  }),
+  anthropicLatest: Object.freeze({
+    provider: "anthropic",
+    name: "anthropic-latest-model-pricing",
+    url: OFFICIAL_PRICE_SOURCE_URLS.anthropic,
+    observedAt: "2026-09-23T14:52:10Z",
+    evidenceVersion: "anthropic-latest-model-pricing-reviewed-2026-09-23",
+    evidenceUrls: Object.freeze([
+      OFFICIAL_PRICE_SOURCE_URLS.anthropic,
+      "https://platform.claude.com/docs/en/models/overview",
+      "https://platform.claude.com/docs/en/release-notes/overview",
+    ]),
+  }),
+  openaiSol61Ultrafast: Object.freeze({
+    provider: "openai",
+    name: "openai-official-sol61-ultrafast-api-pricing",
+    url: OFFICIAL_PRICE_SOURCE_URLS.openai,
+    observedAt: APP_PRICE_REGISTRY_OBSERVED_AT,
+    evidenceVersion: "openai-sol61-ultrafast-api-pricing-reviewed-2026-09-29",
+    evidenceUrls: Object.freeze([
+      OFFICIAL_PRICE_SOURCE_URLS.openai,
+      "https://developers.openai.com/api/docs/models/gpt-6.1-sol",
+      "https://developers.openai.com/api/docs/models/gpt-6-astra",
+      "https://developers.openai.com/codex/models",
     ]),
   }),
 });
@@ -83,6 +121,44 @@ const OPENAI_ASTRA_ROWS = Object.freeze([
   ["gpt-6-astra", "flex", "10", "1", "12.5", "37.5", "long", "from-2026-09-03"],
   ["gpt-6-astra", "priority", "20", "2", "25", "100", "short", "from-2026-09-03"],
   ["gpt-6-astra", "priority", "40", "4", "50", "150", "long", "from-2026-09-03"],
+]);
+
+// Launch-date prices reviewed independently of the retained earlier model evidence.
+// Both model pages place the long-context boundary strictly above 272K.
+const OPENAI_SOL_LUNA_ROWS = Object.freeze([
+  ["gpt-6-sol", "standard", "2", "0.2", "2.5", "10", "short", "from-2026-09-22"],
+  ["gpt-6-sol", "standard", "4", "0.4", "5", "15", "long", "from-2026-09-22"],
+  ["gpt-6-sol", "batch", "1", "0.1", "1.25", "5", "short", "from-2026-09-22"],
+  ["gpt-6-sol", "batch", "2", "0.2", "2.5", "7.5", "long", "from-2026-09-22"],
+  ["gpt-6-sol", "flex", "1", "0.1", "1.25", "5", "short", "from-2026-09-22"],
+  ["gpt-6-sol", "flex", "2", "0.2", "2.5", "7.5", "long", "from-2026-09-22"],
+  ["gpt-6-sol", "priority", "4", "0.4", "5", "20", "short", "from-2026-09-22"],
+  ["gpt-6-sol", "priority", "8", "0.8", "10", "30", "long", "from-2026-09-22"],
+  ["gpt-6-luna", "standard", "0.1", "0.01", "0.125", "0.5", "short", "from-2026-09-22"],
+  ["gpt-6-luna", "standard", "0.2", "0.02", "0.25", "0.75", "long", "from-2026-09-22"],
+  ["gpt-6-luna", "batch", "0.05", "0.005", "0.0625", "0.25", "short", "from-2026-09-22"],
+  ["gpt-6-luna", "batch", "0.1", "0.01", "0.125", "0.375", "long", "from-2026-09-22"],
+  ["gpt-6-luna", "flex", "0.05", "0.005", "0.0625", "0.25", "short", "from-2026-09-22"],
+  ["gpt-6-luna", "flex", "0.1", "0.01", "0.125", "0.375", "long", "from-2026-09-22"],
+  ["gpt-6-luna", "priority", "0.2", "0.02", "0.25", "1", "short", "from-2026-09-22"],
+  ["gpt-6-luna", "priority", "0.4", "0.04", "0.5", "1.5", "long", "from-2026-09-22"],
+]);
+
+// September 29 launch evidence has its own provenance so older cards retain
+// their exact bytes. Sol 6.1 is a distinct model with lower cache-read prices
+// than Sol 6. Ultrafast is published only for Astra; absent model/tier pairs
+// remain unpriced instead of inheriting Astra's 6x API ratio.
+const OPENAI_SOL61_ULTRAFAST_ROWS = Object.freeze([
+  ["gpt-6.1-sol", "standard", "2", "0.1", "2.5", "10", "short", "from-2026-09-29"],
+  ["gpt-6.1-sol", "standard", "4", "0.2", "5", "15", "long", "from-2026-09-29"],
+  ["gpt-6.1-sol", "batch", "1", "0.05", "1.25", "5", "short", "from-2026-09-29"],
+  ["gpt-6.1-sol", "batch", "2", "0.1", "2.5", "7.5", "long", "from-2026-09-29"],
+  ["gpt-6.1-sol", "flex", "1", "0.05", "1.25", "5", "short", "from-2026-09-29"],
+  ["gpt-6.1-sol", "flex", "2", "0.1", "2.5", "7.5", "long", "from-2026-09-29"],
+  ["gpt-6.1-sol", "priority", "4", "0.2", "5", "20", "short", "from-2026-09-29"],
+  ["gpt-6.1-sol", "priority", "8", "0.4", "10", "30", "long", "from-2026-09-29"],
+  ["gpt-6-astra", "ultrafast", "60", "6", "75", "300", "short", "from-2026-09-29"],
+  ["gpt-6-astra", "ultrafast", "120", "12", "150", "450", "long", "from-2026-09-29"],
 ]);
 
 const OPENAI_ROWS = Object.freeze([
@@ -297,6 +373,15 @@ const ANTHROPIC_ROWS = Object.freeze([
   ["claude-sonnet-5", "batch", "1.5", "1.875", "3", "0.15", "7.5", "standard-2026-09-01"],
 ]);
 
+// Latest reviewed Claude IDs and official API rates. Mythos 5.1 is invite-only;
+// cataloging its identity and price does not imply general entitlement.
+const ANTHROPIC_LATEST_ROWS = Object.freeze([
+  ["claude-fable-5-1", "standard", "10", "12.5", "20", "0.25", "50", "from-2026-09-01"],
+  ["claude-mythos-5-1", "standard", "10", "12.5", "20", "0.25", "50", "from-2026-09-01"],
+  ["claude-opus-5", "standard", "5", "6.25", "10", "0.5", "25", "from-2026-07-24"],
+  ["claude-opus-5-5", "standard", "4", "5", "8", "0.2", "20", "from-2026-09-22"],
+]);
+
 const OPENAI_TOOL_ROWS = Object.freeze([
   ["web_search_units", "10", "search", "1000"],
   ["file_search_units", "2.5", "call", "1000"],
@@ -310,15 +395,21 @@ export const NORMALIZED_PRICE_EVIDENCE_ROWS = deepFreeze({
   openai: [OPENAI_ROWS, OPENAI_TOOL_ROWS],
   anthropic: [ANTHROPIC_ROWS, ANTHROPIC_TOOL_ROWS],
   openaiAstra: [OPENAI_ASTRA_ROWS],
+  openaiSolLuna: [OPENAI_SOL_LUNA_ROWS],
+  anthropicLatest: [ANTHROPIC_LATEST_ROWS],
+  openaiSol61Ultrafast: [OPENAI_SOL61_ULTRAFAST_ROWS],
 });
 
 // These hashes are generated from the normalized reviewed rows during an
 // evidence refresh and checked independently in Node-side registry tests. They
 // are constants here so the production registry has no Node crypto dependency.
 const EVIDENCE_HASHES = Object.freeze({
+  openaiSolLuna: "1b5bbf4e02b450b689dbd0d5208dabd79363c75aaa9b0a10eab4354a4510aca7",
   openai: "ec99367fb7d91dc68f1501e325384eda7a5cf885c763deebd28e1eff594dad57",
   anthropic: "7653380aa58230fef8a39a17f141fe04bd763ca39390a69671825e6f6109d76e",
   openaiAstra: "546af74276392ac5cd4f3faab783fff6d2b62235c7a5288012e8a24fd309301b",
+  anthropicLatest: "3762998c98a2d9c058b9e698f3d3b8b77b652d0c838ada78cc2ba550de4740c7",
+  openaiSol61Ultrafast: "aaba22387dcf21551b86be6abe7ffea6d88a33447fa46e91b442f5d6ef265687",
 });
 
 function component(usageComponent, amount, conditions) {
@@ -436,13 +527,23 @@ const OPENAI_ALIAS_ASSUMPTIONS = Object.freeze({
     "Work Mode routing alias for gpt-5.6-sol; the picker describes it as a routing alias, so it is billed at the gpt-5.6-sol rates and is not listed separately on the official pricing page.",
 });
 
+function hasStrictAbove272KBoundary(model) {
+  return model === "gpt-6-astra" || model === "gpt-6-sol" || model === "gpt-6-luna"
+    || model === "gpt-6.1-sol";
+}
+
 function openAiCard([model, tier, input, cacheRead, cacheWrite, output, contextBand = null, period = null]) {
   const isAstra = model === "gpt-6-astra";
-  const sourceKey = isAstra ? "openaiAstra" : "openai";
+  const isSolLuna = model === "gpt-6-sol" || model === "gpt-6-luna";
+  const isSol61 = model === "gpt-6.1-sol";
+  const strictAbove272K = hasStrictAbove272KBoundary(model);
+  const sourceKey = isSol61 || (isAstra && tier === "ultrafast")
+    ? "openaiSol61Ultrafast"
+    : isAstra ? "openaiAstra" : isSolLuna ? "openaiSolLuna" : "openai";
   const contextConditions = contextBand === "short"
-    ? { max_total_input_tokens: isAstra ? "272000" : "271999" }
+    ? { max_total_input_tokens: strictAbove272K ? "272000" : "271999" }
     : contextBand === "long"
-      ? { min_total_input_tokens: isAstra ? "272001" : "272000" }
+      ? { min_total_input_tokens: strictAbove272K ? "272001" : "272000" }
       : null;
   const aliases = OPENAI_MODEL_ALIASES[model];
   const validity = openAiEffective(period);
@@ -479,6 +580,10 @@ function openAiCard([model, tier, input, cacheRead, cacheWrite, output, contextB
       ...(contextBand ? {
         coverage_note: isAstra
           ? "Astra short-context prices apply through 272,000 total request input tokens; above 272,000, long prices apply to the entire request."
+          : isSol61
+          ? "GPT-6.1 Sol short-context prices apply through 272,000 total request input tokens; above 272,000, long prices apply to the entire request."
+          : isSolLuna
+          ? "GPT-6 Sol and Luna short-context prices apply through 272,000 total request input tokens; above 272,000, long prices apply to the entire request."
           : contextBand === "short"
           ? "Short-context prices apply through 271,999 total input tokens; the long band begins at 272,000."
           : "Long-context prices apply from 272,000 total input tokens using the official 2x input and 1.5x output rule.",
@@ -507,6 +612,15 @@ function anthropicEffective(period) {
       suffix: "from-2026-09-01",
     };
   }
+  const releaseDate = /^from-(\d{4}-\d{2}-\d{2})$/u.exec(period ?? "")?.[1];
+  if (releaseDate && Number.isFinite(Date.parse(`${releaseDate}T00:00:00.000Z`))) {
+    return {
+      effective: { from: releaseDate },
+      vendorEffectiveFrom: releaseDate,
+      vendorEffectiveTo: null,
+      suffix: `from-${releaseDate}`,
+    };
+  }
   return {
     // No vendor-effective date was published for this row, so the effective
     // range is open in both directions. The review date is provenance and must
@@ -518,11 +632,14 @@ function anthropicEffective(period) {
   };
 }
 
-function anthropicCard([model, tier, input, cacheWrite5m, cacheWrite1h, cacheRead, output, period = null]) {
+function anthropicCard(
+  [model, tier, input, cacheWrite5m, cacheWrite1h, cacheRead, output, period = null],
+  sourceKey = "anthropic",
+) {
   const validity = anthropicEffective(period);
   return {
     schema_version: "0.1",
-    id: cardId("anthropic", model, tier, validity.suffix),
+    id: cardId(sourceKey, model, tier, validity.suffix),
     provider: "anthropic",
     model,
     service_tier: tier,
@@ -536,12 +653,12 @@ function anthropicCard([model, tier, input, cacheWrite5m, cacheWrite1h, cacheRea
       component("output_text_tokens", output),
       providerUnitComponent("web_search_units", "10", "search", "1000"),
     ],
-    source: source("anthropic"),
+    source: source(sourceKey),
     metadata: {
       pricing_basis: "official_api_price_not_subscription_allowance",
       api_service_tier: tier,
       subscription_speed_tier: null,
-      provenance: provenance("anthropic", validity),
+      provenance: provenance(sourceKey, validity),
       ...(tier === "fast" ? {
         coverage_note: "Anthropic first-party API fast mode; unrelated to subscription or Codex Fast modes.",
       } : {}),
@@ -575,8 +692,14 @@ function providerToolCard(provider, model, rows) {
   };
 }
 
-export const OPENAI_OFFICIAL_PRICE_CARDS = deepFreeze([...OPENAI_ROWS, ...OPENAI_ASTRA_ROWS].map(openAiCard));
-export const ANTHROPIC_OFFICIAL_PRICE_CARDS = deepFreeze(ANTHROPIC_ROWS.map(anthropicCard));
+export const OPENAI_OFFICIAL_PRICE_CARDS = deepFreeze([
+  ...OPENAI_ROWS, ...OPENAI_ASTRA_ROWS, ...OPENAI_SOL_LUNA_ROWS,
+  ...OPENAI_SOL61_ULTRAFAST_ROWS,
+].map(openAiCard));
+export const ANTHROPIC_OFFICIAL_PRICE_CARDS = deepFreeze([
+  ...ANTHROPIC_ROWS.map((row) => anthropicCard(row)),
+  ...ANTHROPIC_LATEST_ROWS.map((row) => anthropicCard(row, "anthropicLatest")),
+]);
 export const PROVIDER_TOOL_PRICE_CARDS = deepFreeze([
   providerToolCard("openai", "openai-provider-tools", OPENAI_TOOL_ROWS),
   providerToolCard("anthropic", "anthropic-provider-tools", ANTHROPIC_TOOL_ROWS),
@@ -588,7 +711,7 @@ export const APP_OFFICIAL_PRICE_CARDS = deepFreeze([
 ]);
 
 export const APP_PRICE_REGISTRY_SHA256 =
-  "303374d522e7ef695beefe1fbf6f3d2b5c84b8b9c6130921a70bc5e8ec1d56e0";
+  "d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d";
 
 export const APP_PRICE_REGISTRY_MANIFEST = deepFreeze({
   version: APP_PRICE_REGISTRY_VERSION,
@@ -607,7 +730,7 @@ export const APP_PRICE_REGISTRY_MANIFEST = deepFreeze({
 });
 
 const ALLOWED_TIERS = Object.freeze({
-  openai: new Set(["standard", "batch", "flex", "priority"]),
+  openai: new Set(["standard", "batch", "flex", "priority", "ultrafast"]),
   anthropic: new Set(["standard", "batch", "fast"]),
 });
 
@@ -680,12 +803,12 @@ export function validateOfficialPriceRegistry(cards = APP_OFFICIAL_PRICE_CARDS) 
       assertDecimalString(priceComponent.price?.amount, `${card.id} component price amount`);
       assertDecimalString(priceComponent.price?.per, `${card.id} component price divisor`);
       if (contextBand === "short"
-        && (priceComponent.conditions?.max_total_input_tokens !== (card.model === "gpt-6-astra" ? "272000" : "271999")
+        && (priceComponent.conditions?.max_total_input_tokens !== (hasStrictAbove272KBoundary(card.model) ? "272000" : "271999")
           || priceComponent.conditions?.min_total_input_tokens !== undefined)) {
         throw new TypeError(`${card.id} has a malformed short-context component boundary.`);
       }
       if (contextBand === "long"
-        && (priceComponent.conditions?.min_total_input_tokens !== (card.model === "gpt-6-astra" ? "272001" : "272000")
+        && (priceComponent.conditions?.min_total_input_tokens !== (hasStrictAbove272KBoundary(card.model) ? "272001" : "272000")
           || priceComponent.conditions?.max_total_input_tokens !== undefined)) {
         throw new TypeError(`${card.id} has a malformed long-context component boundary.`);
       }

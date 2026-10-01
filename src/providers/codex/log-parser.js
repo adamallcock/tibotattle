@@ -15,7 +15,7 @@ import {
   throwIfAborted,
   tokenComponentPresence,
 } from "./log-normalization.js";
-import { normalizeProviderTier } from "./tier-normalization.js";
+import { codexTierObservation, normalizeProviderTier } from "./tier-normalization.js";
 
 // Tolerance when deciding that a cumulative delta "materially exceeds" the
 // co-reported per-turn `last_token_usage`. The counters are exact integers
@@ -119,39 +119,34 @@ export function createCodexLogParser({ lineReader, createSha256 }) {
       throwIfAborted(signal);
       if (line === null) continue;
       ordinal += 1;
-      if (!line.includes('"type":"thread_settings_applied"')) continue;
+      if (!line.includes('"type":"thread_settings_applied"')
+          && !line.includes('"type":"turn_context"')) continue;
       let record;
       try {
         record = JSON.parse(line);
       } catch {
         continue;
       }
-      if (record.type !== "event_msg" || record.payload?.type !== "thread_settings_applied") continue;
+      const observation = codexTierObservation(record);
+      if (observation === null || observation.status === "omitted") continue;
       const timestampMs = typeof record?.timestamp === "string"
         ? Date.parse(record.timestamp)
         : Number.NaN;
       if (!Number.isFinite(timestampMs)) continue;
-      const settings = record.payload?.thread_settings;
-      if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
+      if (observation.status === "malformed") {
         diagnostics.malformedTierSettingEvents += 1;
         diagnostics.malformedAccountingRecords += 1;
         continue;
       }
-      if (!Object.hasOwn(settings, "service_tier")) continue;
-      const rawTier = settings.service_tier;
-      if (rawTier !== null && typeof rawTier !== "string") {
-        diagnostics.malformedTierSettingEvents += 1;
-        diagnostics.malformedAccountingRecords += 1;
-        continue;
-      }
+      const rawTier = observation.rawTier;
       const normalized = normalizeProviderTier(rawTier, {
         billingSurface: "chatgpt_subscription",
-        tierSource: "rollout_thread_settings",
+        tierSource: observation.tierSource,
         tierObservedAt: record.timestamp,
       });
       diagnostics.tierSettingEvents += 1;
       diagnostics.tierSettingCounts[normalized.codexSpeedMode] = (diagnostics.tierSettingCounts[normalized.codexSpeedMode] ?? 0) + 1;
-      timeline.push({ ordinal, rawTier, timestamp: record.timestamp, timestampMs });
+      timeline.push({ ordinal, rawTier, tierSource: observation.tierSource, timestamp: record.timestamp, timestampMs });
     }
     return timeline.sort((left, right) => left.timestampMs - right.timestampMs || left.ordinal - right.ordinal);
   }
@@ -208,8 +203,11 @@ export function createCodexLogParser({ lineReader, createSha256 }) {
         : Number.NaN;
       if (!Number.isFinite(timestampMs)) continue;
       if (record.type === "turn_context") {
-        if (typeof record.payload?.model === "string") {
-          model = record.payload.model;
+        if (typeof record.payload?.model === "string") model = record.payload.model;
+        const observation = codexTierObservation(record);
+        if (observation?.status === "observed" && (ownTier === null || timestampMs >= ownTier.timestampMs)) {
+          ownTier = { rawTier: observation.rawTier, tierSource: observation.tierSource,
+            timestamp: record.timestamp, timestampMs, inherited: true };
         }
         continue;
       }
@@ -582,7 +580,7 @@ export function createCodexLogParser({ lineReader, createSha256 }) {
           billingSurface: "chatgpt_subscription",
           tierSource: effectiveTier?.inherited === true
             ? "lineage_inherited"
-            : effectiveTier ? "rollout_thread_settings" : "unobserved",
+            : effectiveTier?.tierSource ?? (effectiveTier ? "rollout_thread_settings" : "unobserved"),
           tierObservedAt: effectiveTier?.timestamp ?? null,
         }),
         surfaceClassification,

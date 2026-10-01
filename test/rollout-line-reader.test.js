@@ -176,12 +176,34 @@ test("an empty range is a no-op", async () => {
   }
 });
 
-test("the default cap leaves 32x headroom over the largest observed relevant line", async () => {
-  // Measured worst case for a record this product parses is a 2 KiB
-  // `turn_context`. The cap must stay comfortably above it while remaining
-  // far below the 80 MiB content records it exists to step over.
-  assert.equal(ROLLOUT_LINE_BYTES, 64 * 1024);
-  assert.ok(ROLLOUT_LINE_BYTES >= 32 * 2 * 1024);
+test("the default 512 KiB cap accepts its boundary and bounds larger lines across chunks", async () => {
+  assert.equal(ROLLOUT_LINE_BYTES, 512 * 1024);
+  const aboveOldCap = "a".repeat(64 * 1024 + 1);
+  const atCap = "b".repeat(512 * 1024);
+  const aboveCap = "c".repeat(512 * 1024 + 1);
+  const huge = "d".repeat(3 * 1024 * 1024);
+  const contents = `${[aboveOldCap, atCap, aboveCap, huge, "tail"].join("\n")}\n`;
+  const { root, path, size } = await fixture(contents);
+  try {
+    const { lines, result } = await readAll(path, size, { highWaterMark: 7 * 1024 });
+    assert.deepEqual(lines.map(({ text, partial }) => ({ bytes: Buffer.byteLength(text), partial })), [
+      { bytes: 64 * 1024 + 1, partial: false },
+      { bytes: 512 * 1024, partial: false },
+      { bytes: 512 * 1024, partial: true },
+      { bytes: 512 * 1024, partial: true },
+      { bytes: 4, partial: false },
+    ]);
+    assert.equal(lines[0].text, aboveOldCap);
+    assert.equal(lines[1].text, atCap);
+    assert.equal(lines[2].text, aboveCap.slice(0, ROLLOUT_LINE_BYTES));
+    assert.equal(lines[3].text, huge.slice(0, ROLLOUT_LINE_BYTES));
+    assert.equal(lines[4].text, "tail");
+    assert.equal(result.oversizedLines, 2);
+    assert.equal(result.completeLines, 5);
+    assert.equal(result.nextOffset, size);
+  } finally {
+    await rm(root, { recursive: true });
+  }
 });
 
 test("the callback is rejected when it is not a function", async () => {

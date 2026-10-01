@@ -26,4 +26,10 @@ test("the browser i18n mirror is current and exposes the canonical contract", as
     browser.formatDate("2026-08-03T12:00:00.000Z", "en-US"),
     canonical.formatDate("2026-08-03T12:00:00.000Z", "en-US"),
   );
+  for (const value of ["en-us", "zh-CN", "zh-Hant-TW", "invalid_locale", null]) {
+    assert.equal(browser.canonicalizeLocale(value), canonical.canonicalizeLocale(value));
+  }
+  for (const value of ["en-US", "en", "zh-CN", "zh-TW", "zh-Hant", "es-MX", null]) {
+    assert.equal(browser.negotiateLocale(value), canonical.negotiateLocale(value));
+  }
 });

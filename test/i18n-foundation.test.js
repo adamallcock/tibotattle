@@ -4,11 +4,13 @@ import test from "node:test";
 
 import {
   CATALOGS,
+  canonicalizeLocale,
   DEFAULT_LOCALE,
   EN_US_CATALOG,
   ES_CATALOG,
   SUPPORTED_LOCALES,
   ZH_HANS_CATALOG,
+  assertCatalogCompleteness,
   formatDate,
   formatNumber,
   formatPercent,
@@ -36,16 +38,57 @@ test("i18n is a dependency-free workspace package with complete initial catalogs
   assert.equal(CATALOGS[DEFAULT_LOCALE], EN_US_CATALOG);
   assert.equal(CATALOGS["zh-Hans"], ZH_HANS_CATALOG);
   assert.equal(CATALOGS.es, ES_CATALOG);
+  assert.equal(canonicalizeLocale(" EN_us "), null);
+  assert.equal(canonicalizeLocale("en-us"), "en-US");
+  assert.equal(canonicalizeLocale("zh-hant-tw"), "zh-Hant-TW");
+  assert.equal(canonicalizeLocale(null), null);
   assert.equal(EN_US_CATALOG["app.name"], "TiboTattle");
-  const keys = Object.keys(EN_US_CATALOG).sort();
-  for (const [locale, catalog] of Object.entries(CATALOGS)) {
-    assert.deepEqual(Object.keys(catalog).sort(), keys, `${locale} key parity`);
-    assert.equal(
-      Object.values(catalog).every((value) => value.trim().length > 0),
-      true,
-      `${locale} contains no blank catalog value`,
-    );
-  }
+  const completeness = assertCatalogCompleteness();
+  assert.deepEqual(completeness.locales, ["en-US", "zh-Hans", "es"]);
+  assert.equal(completeness.keyCount, Object.keys(EN_US_CATALOG).length);
+});
+
+test("catalog completeness names the exact locale gap it refuses", () => {
+  const canonical = { "a.one": "One {count}", "a.two": "Two" };
+  const options = (other) => ({
+    catalogs: { "en-US": canonical, other: other },
+    supportedLocales: ["en-US", "other"],
+  });
+  assert.doesNotThrow(
+    () => assertCatalogCompleteness(options({ "a.one": "Uno {count}", "a.two": "Dos" })),
+  );
+  assert.throws(
+    () => assertCatalogCompleteness(options({ "a.one": "Uno {count}" })),
+    /other catalog is missing 1 canonical key\(s\): a\.two/u,
+  );
+  assert.throws(
+    () => assertCatalogCompleteness(
+      options({ "a.one": "Uno {count}", "a.two": "Dos", "a.three": "Tres" }),
+    ),
+    /other catalog carries 1 key\(s\) the en-US catalog does not define: a\.three/u,
+  );
+  assert.throws(
+    () => assertCatalogCompleteness(options({ "a.one": "Uno {total}", "a.two": "Dos" })),
+    /other catalog changes the placeholders for a\.one: expected \[count\], found \[total\]/u,
+  );
+  assert.throws(
+    () => assertCatalogCompleteness(options({ "a.one": "Uno {count}", "a.two": "  " })),
+    /other catalog has a blank or non-string value for a\.two/u,
+  );
+  assert.throws(
+    () => assertCatalogCompleteness({
+      catalogs: { "en-US": canonical },
+      supportedLocales: ["en-US", "other"],
+    }),
+    /Missing a catalog for shipped locale: other/u,
+  );
+  assert.throws(
+    () => assertCatalogCompleteness({
+      catalogs: { "en-US": canonical, other: canonical },
+      supportedLocales: ["en-US"],
+    }),
+    /Catalog present for an unshipped locale: other/u,
+  );
 });
 
 test("locale negotiation prefers exact and language matches before fallback", () => {

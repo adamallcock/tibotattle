@@ -76,6 +76,7 @@ function fakeBrowser({ hash = "" } = {}) {
   const scrolls = [];
   const documentRef = {
     querySelector(selector) {
+      if (selector === "#reporting-period-toolbar") return null;
       assert.equal(selector, "#community-contribution-disclosure");
       return disclosure;
     },

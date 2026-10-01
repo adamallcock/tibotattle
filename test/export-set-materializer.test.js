@@ -15,6 +15,7 @@ import {
   EXPORT_SET_MANIFEST_BASENAME,
   EXPORT_SET_MANIFEST_RECEIPT_BASENAME,
   ExportSetError,
+  ExportResourceLimitError,
 } from "../src/export/index.js";
 import { exportSetChunkBasenames, validateExportSetManifest } from "../src/export-set-schema.js";
 import {
@@ -607,4 +608,42 @@ test("empty-set materialization enforces its canonical ceiling before side effec
   } finally {
     await rm(value.root, { recursive: true, force: true });
   }
+});
+
+
+test("materializer holds one destination transaction generation across every chunk and final manifest", async () => {
+  const value = await fixture();
+  const identities = [];
+  try {
+    const result = await materializeLocalExportSet({
+      workspaceDirectory: value.workspace, outputDirectory: value.output, secret: SECRET,
+      maximumRecordsPerChunk: 1,
+      async failpoint(stage) {
+        if (stage === "after_chunk_publish" || stage === "after_manifest_publish") {
+          const current = await stat(join(value.output, ".app-usagemonitor-export-transactions"));
+          identities.push({ dev: current.dev, ino: current.ino });
+        }
+      },
+    });
+    assert.ok(result.manifest.chunks.length > 1);
+    assert.equal(identities.length, result.manifest.chunks.length + 1);
+    for (const identity of identities) assert.deepEqual(identity, identities[0]);
+    await assert.rejects(stat(join(value.output, ".app-usagemonitor-export-transactions")), { code: "ENOENT" });
+    assert.equal((await verifyLocalExportSet({ directory: value.output })).verdict, "passed");
+  } finally { await rm(value.root, { recursive: true, force: true }); }
+});
+
+
+test("a later chunk resource refusal survives the batch facade with its exact error type", async () => {
+  const value = await fixture({ resourceLimits: { maximumChunks: 1 } });
+  try {
+    await assert.rejects(materializeLocalExportSet({
+      workspaceDirectory: value.workspace, outputDirectory: value.output, secret: SECRET,
+      maximumRecordsPerChunk: 1,
+    }), (error) => error instanceof ExportResourceLimitError && error.code === "export_resource_chunk_count");
+    const names = exportSetChunkBasenames(0);
+    assert.ok((await stat(join(value.output, names.bundle))).size > 0);
+    await assert.rejects(stat(join(value.output, EXPORT_SET_MANIFEST_BASENAME)), { code: "ENOENT" });
+    await assert.rejects(stat(join(value.output, ".app-usagemonitor-export-transactions")), { code: "ENOENT" });
+  } finally { await rm(value.root, { recursive: true, force: true }); }
 });

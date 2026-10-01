@@ -194,6 +194,7 @@ export interface CodexUsageEvent {
   components?: NormalizedUsageEvent["components"];
   componentAvailability?: NormalizedUsageEvent["componentAvailability"];
   raw?: Readonly<Record<string, unknown>>;
+  rawAvailability?: Readonly<Record<string, boolean | null | undefined>>;
 }
 
 export interface ClaudeUsageRecord {
@@ -237,9 +238,15 @@ export type FastModeModelFamily =
   | "gpt-4.1" | "gpt-4.1-mini" | "gpt-4.1-nano" | "gpt-4o"
   | "gpt-5" | "gpt-5-mini" | "gpt-5.1" | "gpt-5.1-codex" | "gpt-5.2"
   | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.5"
-  | "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-6-astra";
+  | "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-6-astra"
+  | "gpt-6-sol" | "gpt-6-luna" | "gpt-6.1-sol";
 export type FastModeModelFamilyKey = FastModeModelFamily | "unsupported";
-export type ObservedSpeedMode = "standard" | "fast" | "unknown";
+export type UltrafastModeModelFamily = "gpt-6-astra";
+export type SpeedModeModelFamily = FastModeModelFamily | UltrafastModeModelFamily;
+export type SpeedModeModelFamilyKey = SpeedModeModelFamily | "unsupported";
+export type PremiumSpeedMode = "fast" | "ultrafast";
+export type KnownSpeedMode = "standard" | PremiumSpeedMode;
+export type ObservedSpeedMode = KnownSpeedMode | "unknown";
 export type SpeedModeProvenance =
   | "observed"
   | "declared_codex_config"
@@ -272,7 +279,7 @@ export interface SpeedWeightingCell {
 }
 export type SpeedWeightingCrossing = Record<
   ObservedSpeedMode,
-  Record<FastModeModelFamilyKey, SpeedWeightingCell>
+  Record<SpeedModeModelFamilyKey, SpeedWeightingCell>
 >;
 
 export type UnresolvedSpeedScenario =
@@ -317,6 +324,7 @@ export interface FastModeCalibrationWindow {
   apiPriceEquivalentUsd: number;
   knownSpeedFraction?: number | null;
   fastFractionOfKnown?: number | null;
+  ultrafastFractionOfKnown?: number | null;
   eligibleTransitions?: number;
   uniqueBoundaries?: number;
   observedSpanPercentagePoints?: number;
@@ -351,6 +359,7 @@ export interface FastModeInferenceResult {
 export const FAST_MODE_MULTIPLIER_SOURCE: Readonly<Record<string, string>>;
 export const CODEX_SPEED_MODE_OBSERVABILITY: Readonly<{
   recordedEvent: string;
+  recordedTurnContext: string;
   observedValues: Readonly<Record<string, string>>;
   firesOn: string;
   sessionBaselineRecorded: false;
@@ -361,6 +370,11 @@ export const FAST_MODE_QUOTA_MULTIPLIERS: Readonly<
   Record<FastModeModelFamily, number>
 >;
 export const FAST_MODE_MODEL_FAMILY_KEYS: readonly FastModeModelFamilyKey[];
+export const SPEED_MODE_API_MULTIPLIERS: Readonly<{
+  fast: Readonly<Record<FastModeModelFamily, number>>;
+  ultrafast: Readonly<Record<UltrafastModeModelFamily, number>>;
+}>;
+export const SPEED_MODE_MODEL_FAMILY_KEYS: readonly SpeedModeModelFamilyKey[];
 export const OBSERVED_SPEED_MODE_KEYS: readonly ObservedSpeedMode[];
 export const FAST_MODE_ASSUMED_MULTIPLIER: number;
 export const FAST_MODE_ASSUMED_MULTIPLIER_SOURCE: Readonly<Record<string, string>>;
@@ -373,6 +387,16 @@ export interface FastModePriceEvidence {
   totalInputContextTokens?: number | null;
   standardPriceCardIds?: readonly string[];
 }
+export type SpeedModePriceEvidence = FastModePriceEvidence;
+export function speedModeModelFamilyKey(
+  model: unknown, mode: string, evidence?: SpeedModePriceEvidence,
+): SpeedModeModelFamilyKey;
+export function speedModeApiMultiplier(
+  model: unknown, mode: string, evidence?: SpeedModePriceEvidence,
+): number | null;
+export function deriveSpeedModeApiRatiosFromRegistry(
+  mode: PremiumSpeedMode, cards?: readonly PriceCard[],
+): Readonly<Record<string, number>>;
 export function fastModeModelFamilyKey(
   model: unknown, evidence?: FastModePriceEvidence,
 ): FastModeModelFamilyKey;
@@ -388,7 +412,7 @@ export function resolveEffectiveSpeedMode(input?: {
   observedMode?: string;
   declaredMode?: string;
   unresolvedScenario?: string;
-}): { mode: "standard" | "fast"; provenance: SpeedModeProvenance };
+}): { mode: KnownSpeedMode; provenance: SpeedModeProvenance };
 export function quotaWeightedApiPriceEquivalent(input?: {
   apiPriceEquivalentUsd?: number;
   model?: string;

@@ -33,6 +33,7 @@ import {
   LINUX_DASHBOARD_FAILURE_DIAGNOSTIC_SCHEMA,
   validateLinuxDashboardFailureDiagnostic,
   validateStartupRefreshTimeoutDiagnostic,
+  validateLinuxResourceDiagnostic,
 } from "./smoke-electron-linux.mjs";
 import {
   boundedCapture,
@@ -1138,6 +1139,7 @@ export async function runLinuxNormalPackagedSmokeSession(identity, {
   spawnSession = defaultSpawnSession,
   stopSession = stopOwnedSession,
   deadlineMs = SESSION_DEADLINE_MS,
+  writeDiagnostic = (line) => process.stderr.write(line),
 } = {}) {
   if (!identity || !absolutePath(appPath) || !SHA.test(identity.sourceRevision ?? "")
       || !SHA256.test(identity.artifactSha256 ?? "") || typeof spawnSession !== "function"
@@ -1158,6 +1160,16 @@ export async function runLinuxNormalPackagedSmokeSession(identity, {
   const output = stdout.bytes();
   const errors = stderr.bytes();
   if (result[0] !== 0 || result[1] !== null || output === null || errors === null) {
+    // Forward at most one independently validated stderr envelope, never raw child output.
+    // It is intentionally absent from both the receipt and failure classification.
+    if (Buffer.isBuffer(errors)) {
+      const diagnostics = errors.toString("utf8").split("\n").filter((line) => line.length <= 4096)
+        .map((line) => { try { return validateLinuxResourceDiagnostic(JSON.parse(line)); } catch { return null; } })
+        .filter((value) => value !== null);
+      if (diagnostics.length === 1) {
+        try { writeDiagnostic(`${JSON.stringify(diagnostics[0])}\n`); } catch { /* Diagnostic only. */ }
+      }
+    }
     const innerFailure = classifiedInnerFailure(errors);
     if (result[0] !== 0 && result[1] === null && innerFailure !== null) {
       const error = new Error(innerFailure.code);

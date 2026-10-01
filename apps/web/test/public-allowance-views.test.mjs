@@ -25,27 +25,33 @@ function series() {
       days: ["2026-09-01", "2026-09-02", "2026-09-03", "2026-09-04", "2026-09-05"].map((day, index) => ({
         day,
         byPlanType: { pro: summary(2000), prolite: summary(index === 2 ? null : 1000), plus: summary(3000) },
-        models: index === 3 ? [["gpt-5.5", 4500, 2], ["gpt-6-astra", 6000, 3]]
+        models: index === 3 ? [["gpt-5.5", 4500, 2], ["gpt-6-astra", 6000, 3],
+          ["gpt-6.1-sol", 3500, 2], ["gpt-6-sol", 3000, 2], ["gpt-6-luna", 500, 1]]
           : index === 4 ? [["gpt-6-astra", 6500, 3]] : [],
       })),
     },
   };
 }
 
-test("30-day comparisons use identical date and dollar axes", () => {
+test("30-day comparisons keep dates aligned and use view-specific positive dollar axes", () => {
   const models = ["aggregate", "plans", "models"].map(view => buildCommunityAllowanceChartModel(series(), { view, rangeDays: 30 }));
   for (const model of models) {
     assert.ok(model);
     assert.deepEqual(model.dayTicks, models[0].dayTicks);
-    assert.deepEqual(model.dollarTicks, models[0].dollarTicks);
-    assert.deepEqual(model.plot, models[0].plot);
-    assert.ok(model.dollarTicks.at(-1).value >= 6500);
+    assert.equal(model.dollarTicks[0].value > 0, true);
   }
+  assert.notDeepEqual(models[0].dollarTicks, models[2].dollarTicks);
+  assert.equal(models[0].height, models[1].height * 1.5);
+  assert.equal(models[2].height, models[0].height);
+  assert.ok(models[2].dollarTicks.at(-1).value >= 6500);
   assert.equal(models[1].legendSeries.length, 3);
-  assert.deepEqual(models[2].legendSeries.map(item => item.label), ["GPT-6 Astra", "GPT-5.5"]);
+  assert.deepEqual(models[1].cardSeries.map(item => item.key), ["plus", "prolite", "pro"]);
+  assert.deepEqual(models[1].latestSummaries.map(item => item.seriesKey), ["plus", "prolite", "pro"]);
+  assert.deepEqual(models[2].legendSeries.map(item => item.label),
+    ["GPT-6 Astra", "GPT-6.1 Sol", "GPT-6 Sol", "GPT-6 Luna"]);
 });
 
-test("All fits the selected view's evidence dates without changing dollar scales", () => {
+test("All fits the selected view's evidence dates and dollar scale", () => {
   const data = series();
   const aggregate = buildCommunityAllowanceChartModel(data);
   const model = buildCommunityAllowanceChartModel(data, { view: "models" });
@@ -53,21 +59,34 @@ test("All fits the selected view's evidence dates without changing dollar scales
   assert.equal(model.dots[0].x, model.plot.left);
   assert.equal(model.dots.at(-1).x, model.plot.right);
   assert.equal(aggregate.dayTicks[0].day, "2026-09-01");
-  assert.deepEqual(model.dollarTicks, aggregate.dollarTicks);
+  assert.ok(model.dollarTicks[0].value > 0);
+  assert.notDeepEqual(model.dollarTicks, aggregate.dollarTicks);
 });
 
-test("preferred model order is stable for cards, legend and same-day inspection without hiding other models", () => {
+test("each plan's own-week chart gets a rounded positive floor", () => {
   const data = series();
-  const preferred = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"];
+  for (const key of ["plus", "prolite", "pro"]) {
+    const model = buildCommunityAllowanceChartModel(data, { view: "plans", seriesKeys: [key] });
+    assert.equal(model.legendSeries[0].key, key);
+    assert.ok(model.dollarTicks[0].value > 0);
+    assert.ok(model.dollarTicks[0].value < Math.min(...model.dots.map(dot => dot.band80Usd?.lowerUsd ?? dot.centralUsd)));
+  }
+});
+
+test("public model order is exact across cards, legend and same-day inspection", () => {
+  const data = series();
+  const preferred = ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna",
+    "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"];
   const ids = ["gpt-5.4", ...preferred.toReversed()];
   data.breakdowns.modelConfig = ids.map(modelId => ({ modelId, label: modelId }));
-  data.breakdowns.days.at(-1).models = ids.map(id => [id, 1500, 1]);
+  data.breakdowns.days.at(-1).models = [...ids, "gpt-5.5"].map(id => [id, 1500, 1]);
   const model = buildCommunityAllowanceChartModel(data, { view: "models" });
-  const expected = [...preferred, "gpt-5.4"];
-  assert.deepEqual(model.legendSeries.map(item => item.key), expected);
-  assert.deepEqual(model.latestSummaries.map(item => item.seriesKey), expected);
-  assert.deepEqual(model.dots.filter(dot => dot.day === "2026-09-05").map(dot => dot.seriesKey), expected);
-  assert.deepEqual(model.legendSeries.slice(0, 5).map(item => item.theme), ["astra", "sol", "terra", "luna", "classic"]);
+  assert.deepEqual(model.legendSeries.map(item => item.key), preferred);
+  assert.deepEqual(model.cardSeries.map(item => item.key), preferred);
+  assert.deepEqual(model.latestSummaries.map(item => item.seriesKey), preferred);
+  assert.deepEqual(model.dots.filter(dot => dot.day === "2026-09-05").map(dot => dot.seriesKey), preferred);
+  assert.deepEqual(model.legendSeries.map(item => item.theme),
+    ["astra", "sol", "sol", "luna", "terra", "sol", "luna"]);
   assert.deepEqual(data.breakdowns.modelConfig.map(item => item.modelId), ids, "catalog is never reordered in place");
 });
 
@@ -95,7 +114,9 @@ test("model points start with observed evidence and never acquire a fabricated b
   assert.ok(astra.dots.every(dot => dot.fitCount === null && dot.participantCount === 3));
   assert.deepEqual(model.bandSegments, []);
   assert.equal(model.sparse, true);
-  assert.equal(model.latestSummaries.length, 2);
+  assert.equal(model.latestSummaries.length, 4);
+  assert.equal(model.cardSeries.length, 7);
+  assert.equal(model.cardSeries.filter(item => item.latest === null).length, 3);
 });
 
 test("plan lines and uncertainty bands break at missing evidence", () => {
@@ -125,7 +146,7 @@ test("date range and absent public breakdowns fail honestly without affecting ag
 
 test("public view controls and method caveats are translated in every shipped language", () => {
   for (const locale of ["en-US", "zh-Hans", "es"]) {
-    for (const suffix of ["viewLabel", "viewAggregate", "viewPlans", "viewModels", "smallSampleDisclosure", "breakdownsUnavailable", "modelsAccumulating", "planMethod", "modelMethod", "planChartLabel", "modelChartLabel", "planChartDescription", "modelChartDescription", "cardsCaption", "legendFocus"]) {
+    for (const suffix of ["viewLabel", "viewAggregate", "viewPlans", "viewModels", "smallSampleDisclosure", "breakdownsUnavailable", "modelsAccumulating", "noModelEstimate", "planMethod", "modelMethod", "planChartLabel", "modelChartLabel", "planChartDescription", "modelChartDescription", "cardsCaption", "legendFocus"]) {
       const key = `community.allowance.${suffix}`;
       const value = translate(key, {}, locale);
       assert.notEqual(value, key);
@@ -138,8 +159,13 @@ test("public view controls and method caveats are translated in every shipped la
 const NOW = Date.parse("2026-09-07T12:00:00.000Z");
 test("actual plan values invert only the supported reference scaling without rounding or inventing missing values", () => {
   assert.equal(planWeeklyApiEquivalentUsd(2011, "pro"), 2011);
-  assert.equal(planWeeklyApiEquivalentUsd(1916, "prolite"), 479);
-  assert.equal(planWeeklyApiEquivalentUsd(2257, "plus"), 112.85);
+  assert.equal(planWeeklyApiEquivalentUsd(1916, "prolite"), 958);
+  assert.equal(planWeeklyApiEquivalentUsd(2257, "plus"), 225.7);
+  assert.equal(planWeeklyApiEquivalentUsd(2500, "promax"), 6250);
+  assert.equal(planWeeklyApiEquivalentUsd(1916, "prolite", "pro_x1_prolite_x4_plus_x20"), 479);
+  assert.equal(planWeeklyApiEquivalentUsd(2257, "plus", "pro_x1_prolite_x4_plus_x20"), 112.85);
+  assert.equal(planWeeklyApiEquivalentUsd(2500, "promax", "pro_x1_prolite_x4_plus_x20"), null);
+  assert.equal(planWeeklyApiEquivalentUsd(2500, "pro", "future_basis"), null);
   assert.equal(planWeeklyApiEquivalentUsd(0, "plus"), 0);
   for (const value of [null, undefined, NaN, Infinity, -1, "2257"]) {
     assert.equal(planWeeklyApiEquivalentUsd(value, "plus"), null);
@@ -159,6 +185,8 @@ test("the closed public wire survives normalization into all three chart views",
   assert.equal(normalized.state, "published");
   assert.equal(normalized.breakdowns.days.length, 35);
   assert.ok(normalized.breakdowns.modelConfig.some(model => model.modelId === "gpt-6-astra"));
+  assert.deepEqual(normalized.breakdowns.modelConfig.map(model => model.modelId),
+    ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"]);
   assert.ok(normalized.breakdowns.modelConfig.every(model => model.modelId !== "gpt-5.3-codex-spark"));
   for (const view of ["aggregate", "plans", "models"]) {
     assert.ok(buildCommunityAllowanceChartModel(normalized, { view }).dots.length > 0);
@@ -170,7 +198,11 @@ test("the closed public wire survives normalization into all three chart views",
 test("v1.1 keeps all graph views on one publication while daily revisions update independently", () => {
   const payload = publicAllowanceFixture(NOW);
   payload.allowanceBreakdowns.schemaVersion = "community-allowance-breakdowns-v1.1";
+  payload.allowanceBreakdowns.modelBasis = "seven_day_codex_pro20x_equivalent_per_model_composition";
+  payload.allowanceBreakdowns.basis = "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d";
+  payload.allowanceBreakdowns.normalization = "pro_x1_prolite_x4_plus_x20";
   for (const [index, day] of payload.allowanceBreakdowns.days.entries()) {
+    delete day.byPlanType.promax;
     const { centralUsd, participantCount, fitCount, band80Usd } = payload.days[index].payload.allowance;
     day.combined = { centralUsd, participantCount, fitCount, band80Usd };
     delete payload.days[index].payload.allowance;
@@ -284,6 +316,89 @@ function chartParts(container) {
     svg: all.find(element => element.tag === "svg" && element.attributes.has("aria-label")),
     tooltip: all.find(element => element.className === "allowance-tooltip") };
 }
+test("aggregate method copy follows the daily basis when breakdowns are absent", () => {
+  const documentRef = interactiveDocument(), container = documentRef.createElement("div");
+  const headingNode = documentRef.createElement("h2"), heroNode = documentRef.createElement("span");
+  const current = publicAllowanceFixture();
+  delete current.allowanceBreakdowns;
+  assert.equal(renderCommunityAllowanceSection({ documentRef, container,
+    payload: current, headingNode, heroNode, view: "aggregate" }), "published");
+  assert.match(container.text, /Pro Max 25× ×0\.4/u);
+  assert.match(headingNode.text, /Pro 10x-equivalent/u);
+
+  const legacy = publicAllowanceFixture();
+  delete legacy.allowanceBreakdowns;
+  for (const day of legacy.days) {
+    day.payload.allowance.basis = "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d";
+    day.payload.allowance.normalization = "pro_x1_prolite_x4_plus_x20";
+  }
+  assert.equal(renderCommunityAllowanceSection({ documentRef, container,
+    payload: legacy, headingNode, heroNode, view: "aggregate" }), "published");
+  assert.match(container.text, /Pro 5x ×4, Plus ×20/u);
+  assert.match(headingNode.text, /Pro 20x-equivalent/u);
+  assert.match(heroNode.text, /Pro 20× equivalent/u);
+  assert.doesNotMatch(heroNode.text, /Pro 10/u);
+  assert.doesNotMatch(container.text, /Pro Max 25× ×0\.4/u);
+});
+
+test("aggregate labels and accessible descriptions follow the selected value across current and legacy publications", () => {
+  for (const dailyCurrent of [true, false]) {
+    for (const version of [null, "v1.0", "v1.1", "v1.2"]) {
+      const payload = publicAllowanceFixture();
+      for (const day of payload.days) {
+        Object.assign(day.payload.allowance, summary(dailyCurrent ? 1100 : 2200));
+        if (!dailyCurrent) {
+          day.payload.allowance.basis = "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d";
+          day.payload.allowance.normalization = "pro_x1_prolite_x4_plus_x20";
+        }
+      }
+      if (version === null) delete payload.allowanceBreakdowns;
+      else {
+        const breakdowns = payload.allowanceBreakdowns;
+        breakdowns.schemaVersion = `community-allowance-breakdowns-${version}`;
+        if (version !== "v1.2") {
+          breakdowns.basis = "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d";
+          breakdowns.normalization = "pro_x1_prolite_x4_plus_x20";
+          breakdowns.modelBasis = "seven_day_codex_pro20x_equivalent_per_model_composition";
+        }
+        for (const day of breakdowns.days) {
+          if (version !== "v1.2") delete day.byPlanType.promax;
+          if (version === "v1.0") delete day.combined;
+          else day.combined = summary(version === "v1.2" ? 3300 : 4400);
+        }
+      }
+      const context = `${dailyCurrent ? "current" : "legacy"} daily / ${version ?? "no breakdown"}`;
+      const expectedCurrent = version === "v1.2" || (version !== "v1.1" && dailyCurrent);
+      const expectedAmount = version === "v1.2" ? "$3,300" : version === "v1.1" ? "$4,400"
+        : dailyCurrent ? "$1,100" : "$2,200";
+      const documentRef = interactiveDocument(), container = documentRef.createElement("div");
+      const headingNode = documentRef.createElement("h2"), heroNode = documentRef.createElement("span");
+      assert.equal(renderCommunityAllowanceSection({ documentRef, container,
+        payload, headingNode, heroNode, view: "aggregate" }), "published", context);
+      assert.equal(headingNode.attributes.get("data-i18n"),
+        expectedCurrent ? "community.allowance.heading" : "community.allowance.headingLegacy", context);
+      assert.match(headingNode.text, expectedCurrent ? /Pro 10x-equivalent/u : /Pro 20x-equivalent/u, context);
+      assert.match(heroNode.text, expectedCurrent ? /Pro 10× equivalent/u : /Pro 20× equivalent/u, context);
+      assert.match(container.text, expectedCurrent ? /Pro Max 25× ×0\.4/u : /Pro 5x ×4, Plus ×20/u, context);
+      const headline = container.descendants().find(element => element.className === "allowance-headline-value");
+      assert.ok(headline.text.includes(expectedAmount), context);
+      const description = chartParts(container).svg.attributes.get("aria-description");
+      assert.match(description, expectedCurrent ? /Pro 10x-equivalent/u : /Pro 20x-equivalent/u, context);
+
+      // Choosing daily aggregate values never changes the separately rendered
+      // legacy plan/model rows or their inverse reference-plan conversion.
+      if (version === "v1.0" || version === "v1.1") {
+        for (const view of ["plans", "models"]) {
+          assert.equal(renderCommunityAllowanceSection({ documentRef, container,
+            payload, headingNode, heroNode, view }), "published", `${context} / ${view}`);
+          assert.match(headingNode.text, /Pro 20x-equivalent/u, context);
+          assert.doesNotMatch(heroNode.text, /Pro 10/u, context);
+        }
+      }
+    }
+  }
+});
+
 test("real public render shows model sample semantics, per-view labels and disclosure", () => {
   const documentRef = { documentElement: { lang: "en-US" }, createElement: tag => new Element(tag),
     createElementNS: (_, tag) => new Element(tag) };
@@ -291,33 +406,49 @@ test("real public render shows model sample semantics, per-view labels and discl
     const container = new Element("div");
     assert.equal(renderCommunityAllowanceSection({ documentRef, container,
       payload: publicAllowanceFixture(), view }), "published");
-    assert.match(container.text, /single account.*estimated capacity/u);
-    assert.match(container.text, view === "aggregate" ? /per 7 days, API-price equivalent/u : /API-equivalent USD \/ Pro 20× week/u);
+    assert.match(container.text, /single source.*estimated capacity/u);
+    assert.match(container.text, view === "aggregate" ? /per 7 days, API-price equivalent/u : /API-equivalent USD \/ week/u);
     const svg = container.descendants().find(element => element.tag === "svg" && element.attributes.has("aria-label"));
     assert.ok(svg);
     if (view === "models") {
-      assert.doesNotMatch(container.text, /This plan:/u);
+      assert.doesNotMatch(container.text, /Pro 10x-equivalent:/u);
       assert.match(container.text, /GPT-6 Astra/u);
-      assert.match(container.text, /1 account/u);
+      assert.match(container.text, /1 source/u);
       const cards = container.descendants().filter(element => element.tag === "article");
+      assert.deepEqual(cards.map(card => card.descendants().find(element => element.tag === "h3")?.text),
+        ["GPT-6 Astra", "GPT-6.1 Sol", "GPT-6 Sol", "GPT-6 Luna", "GPT-5.6 Terra", "GPT-5.6 Sol", "GPT-5.6 Luna"]);
+      assert.doesNotMatch(container.text, /GPT-5.5/u);
+      assert.match(cards[1].text, /No published estimate yet/u);
+      assert.match(cards[4].text, /No published estimate yet/u);
       assert.match(cards[0].text.trim(), /^GPT-6 Astra/u);
       assert.match(cards[0].className, /allowance-model-astra/u);
+      assert.ok(cards.every(card => !/\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{1,2}, \d{4}\b/u.test(card.text)),
+        "model cards show source counts without repeating the publication day");
       assert.ok(cards.every(card => !card.text.includes("per 7 days")), "one shared unit caption replaces repeated card prose");
       assert.ok(cards.every(card => card.descendants().some(element => element.attributes.get("aria-hidden") === "true")));
       assert.equal(svg.attributes.get("aria-label"), "Community allowance by model");
-      assert.match(svg.attributes.get("aria-description"), /supporting accounts, not reset fits/u);
+      assert.match(svg.attributes.get("aria-description"), /contribution sources, not reset fits/u);
       assert.equal(svg.descendants().filter(element => element.attributes.get("class")?.includes("allowance-band-area")).length, 0);
     } else if (view === "plans") {
-      assert.match(container.text, /Pro 5× ×4, Plus ×20/u);
+      // Nothing is scaled any more: each plan is charted on its own axis at its
+      // own week, so the old "Pro 5× ×4, Plus ×20" note would be a lie.
+      assert.match(container.text, /Shading shows the middle 80% of qualifying reset fits/u);
+      assert.doesNotMatch(container.text, /Each plan is charted|Card values repeat/u);
       assert.equal(svg.attributes.get("aria-label"), "Community allowance by plan");
       const normalized = normalizeCommunityDailySeries(publicAllowanceFixture());
       const summaries = buildCommunityAllowanceChartModel(normalized, { view: "plans" }).latestSummaries;
       const cards = container.descendants().filter(element => element.tag === "article");
-      assert.equal(cards.length, 3);
+      assert.equal(cards.length, 4);
+      assert.ok(cards.every(card => !/\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{1,2}, \d{4}\b/u.test(card.text)),
+        "plan cards show source counts without repeating the publication day");
       cards.forEach((card, index) => {
+        // The card LEADS with the plan's own week and carries the reference
+        // equivalent underneath, which is the inverse of the old layout.
+        const money = value => new Intl.NumberFormat("en-US",
+          { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(value);
         const planValue = planWeeklyApiEquivalentUsd(summaries[index].centralUsd, summaries[index].seriesKey);
-        const formatted = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(planValue);
-        assert.ok(card.text.includes(`This plan: ${formatted}/week at API prices`));
+        assert.ok(card.text.includes(money(planValue)), "own week leads");
+        assert.ok(card.text.includes(`Pro 10x-equivalent: ${money(summaries[index].centralUsd)}/week`));
       });
     } else {
       assert.doesNotMatch(container.text, /This plan:/u);
@@ -329,6 +460,21 @@ test("real public render shows model sample semantics, per-view labels and discl
   assert.equal(renderCommunityAllowanceSection({ documentRef, container, payload: emptyModels, view: "models" }), "estimates_accumulating");
   assert.match(container.text, /No identified model estimates/u);
   assert.doesNotMatch(container.text, /no reset fit has qualified/u);
+});
+
+test("the source disclosure can sit beside the introduction without leaving a result gap", () => {
+  const documentRef = { documentElement: { lang: "en-US" }, createElement: tag => new Element(tag),
+    createElementNS: (_, tag) => new Element(tag) };
+  const container = new Element("div");
+  const sourceContainer = new Element("div");
+  const payload = publicAllowanceFixture(NOW);
+  assert.equal(renderCommunityAllowanceSection({ documentRef, container, sourceContainer, payload }), "published");
+  assert.match(sourceContainer.text, /About these sources/u);
+  assert.match(sourceContainer.text, /single source.*estimated capacity/u);
+  assert.doesNotMatch(container.text, /About these sources/u);
+  payload.allowanceState = "updating";
+  assert.equal(renderCommunityAllowanceSection({ documentRef, container, sourceContainer, payload }), "allowance_updating");
+  assert.equal(sourceContainer.children.length, 0, "unavailable estimates do not leave a stale disclosure");
 });
 
 test("legend focus dims other series without discarding data and limits keyboard inspection to that series", () => {
@@ -354,7 +500,8 @@ test("legend focus dims other series without discarding data and limits keyboard
   assert.equal(astra.attributes.get("aria-pressed"), "false");
   assert.ok(svg.descendants().every(element => element.attributes.get("data-muted") !== "true"));
   svg.fire("keydown", { key: "End" });
-  assert.match(tooltip.text, /GPT-5.5/u);
+  assert.match(tooltip.text, /GPT-5.6 Sol/u);
+  assert.doesNotMatch(container.text, /GPT-5.5/u);
 });
 
 test("a changed publication preserves selected legend, inspected date and chart focus using only new point values", () => {

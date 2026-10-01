@@ -282,7 +282,7 @@ export function analyzeWeeklyLimitHistory(dataset) {
     speedSensitivityEnvelope: descriptive ? {
       allStandardLowerUsd: descriptive.central80PercentAcrossResetsUsd.lower,
       allFastUpperUsd: round(descriptive.central80PercentAcrossResetsUsd.upper * 2.5),
-      interpretation: "Stress-test envelope only; Fast weights are model-specific and tier is not exactly attributable per turn.",
+      interpretation: "Legacy Standard/Fast stress-test scenarios only, not bounds on Ultrafast or actual allowance; Fast weights are model-specific and tier is not exactly attributable per turn.",
     } : null,
     conditionalRecentBallpark: third > 0 ? {
       status: "conditional_not_identified",
@@ -299,7 +299,7 @@ export function analyzeWeeklyLimitHistory(dataset) {
       assumptions: [
         "retained local usage is the complete shared-pool numerator",
         "quota percentage changes belong to the same accounting pool",
-        "provider weighting is bounded by the captured Standard/Fast timeline",
+        "unresolved speed usage follows the retained Standard/Fast sensitivity scenarios",
         "banked resets and display lag do not change the within-reset slope",
       ],
     } : null,

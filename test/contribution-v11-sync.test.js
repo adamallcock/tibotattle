@@ -988,3 +988,78 @@ test("accountless transport requires neutral authorization and cannot borrow soc
     assert.equal(result.recordsUploaded, 1);
   }
 });
+
+
+test("transient gateway responses retry with bounded delays and discard rejected bodies", async () => {
+  for (const status of [408, 429, 502, 503]) {
+    for (const headers of [{ "content-type": "text/html" }, { "content-type": "application/json", "cache-control": "no-store" }]) {
+      let cancelled = false;
+      const fixture = server();
+      const result = await runTelemetryV11Sync({ ...fixture.options, fetchImpl: async () => new Response(
+        new ReadableStream({
+          start(controller) { controller.enqueue(new TextEncoder().encode("<html>synthetic gateway error</html>")); },
+          pull(controller) { controller.close(); },
+          cancel() { cancelled = true; },
+        }), { status, headers: { ...headers, "retry-after": "60" } },
+      ) });
+      assert.equal(result.failure.code, "service_unavailable");
+      assert.equal(result.failure.retryable, true);
+      assert.equal(result.failure.retryAfterMilliseconds, 60_000);
+      assert.equal(result.acknowledgedThroughDay, null);
+      assert.equal(result.chunksUploaded, 0);
+      if (status !== 429 || headers["content-type"] === "text/html") assert.equal(cancelled, true);
+    }
+  }
+  for (const [header, delay] of [["999999999", 604_800_000], ["invalid", null],
+    ["Fri, 28 Aug 2026 13:01:00 GMT", 60_000]]) {
+    const result = await runTelemetryV11Sync({ ...server().options,
+      fetchImpl: async () => new Response(null, { status: 503, headers: { "retry-after": header } }) });
+    assert.equal(result.failure.retryAfterMilliseconds, delay);
+  }
+});
+
+test("body IO interruptions retry while malformed successful receipts and redirects stay terminal", async () => {
+  for (const kind of ["io", "json", "utf8", "redirect", "redirect503", "401", "403"]) {
+    const response = new Response(new ReadableStream({
+      start(controller) {
+        if (kind === "io") controller.error(new Error("private-synthetic-body-error"));
+        else {
+          controller.enqueue(kind === "utf8" ? Uint8Array.of(0xff) : new TextEncoder().encode('{"incomplete":'));
+          controller.close();
+        }
+      },
+    }), { status: kind === "redirect503" ? 503 : ["401", "403"].includes(kind) ? Number(kind) : 200,
+      headers: { "content-type": "application/json", "cache-control": "no-store" } });
+    if (kind.startsWith("redirect")) Object.defineProperty(response, "redirected", { value: true });
+    const result = await runTelemetryV11Sync({ ...server().options, fetchImpl: async () => response });
+    assert.equal(result.failure.code, kind === "io" ? "service_unavailable" : "response_invalid", kind);
+    assert.equal(result.failure.retryable, kind === "io", kind);
+    assert.equal(result.acknowledgedThroughDay, null);
+    assert.equal(JSON.stringify(result).includes("private-synthetic"), false);
+  }
+});
+
+
+test("an interrupted upload acknowledgement retries through server replay without double contribution", async () => {
+  const fixture = server();
+  let lostReceipt = false;
+  const first = await runTelemetryV11Sync({ ...fixture.options, fetchImpl: async (url, request) => {
+    const receipt = await fixture.options.fetchImpl(url, request);
+    if (new URL(url).pathname === "/api/v1/contributions" && !lostReceipt) {
+      lostReceipt = true;
+      return new Response(new ReadableStream({
+        start(controller) { controller.error(new Error("synthetic-connection-reset")); },
+      }), { status: receipt.status, headers: receipt.headers });
+    }
+    return receipt;
+  } });
+  assert.equal(first.failure.code, "service_unavailable");
+  assert.equal(first.failure.retryable, true);
+  assert.equal(first.acknowledgedThroughDay, null);
+  assert.equal(first.chunksUploaded, 0);
+  const second = await runTelemetryV11Sync(fixture.options);
+  assert.equal(second.status, "complete");
+  assert.equal(second.acknowledgedThroughDay, day);
+  assert.ok(second.chunksSkipped >= 1);
+  assert.equal(fixture.calls.filter((call) => call.path === "/api/v1/contributions").length, 1);
+});

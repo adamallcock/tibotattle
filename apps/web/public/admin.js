@@ -8,7 +8,10 @@ import {
   projectAdminAction,
   projectAdminMetricsHistory,
   projectAdminOverview,
+  projectAdminDatabaseHealth,
   projectAdminReconstructionProgress,
+  projectV11EvidenceAdoption,
+  V11_ADOPTION_OUTCOMES,
 } from "./admin-client.js";
 import { formatNumber, formatReportingTime } from "./ui-format.js";
 import { planWeeklyApiEquivalentUsd } from "./community-data.js";
@@ -17,7 +20,13 @@ import { allowanceModelPresentation, modelThemeIcon } from "./community-view.js"
 const state = {
   csrfToken: "",
   overview: null,
+  databaseHealth: null,
   loading: false,
+  overviewUnavailable: true,
+  sourceHealth: { history: "loading", allowance: "loading", progress: "loading", database: "loading" },
+  controlsDirty: false,
+  controlsRevision: null,
+  actionPending: false,
   refreshTimer: null,
   refreshStatusTimer: null,
   nextRefreshAt: null,
@@ -41,6 +50,8 @@ const state = {
   diagnosticLookup: null,
   diagnosticLookupGeneration: 0,
   loadGeneration: 0,
+  v11AdoptionPreview: null,
+  pipelineObservation: null,
 };
 const $ = (selector) => document.querySelector(selector);
 const ADMIN_PAGE_CLASS = "admin-operator-page";
@@ -63,14 +74,36 @@ const RETAINED_SERVICE_REQUEST_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const LOCAL_DIAGNOSTIC_REFERENCE = /^TT-[0-9A-HJKMNP-TV-Z]{6}$/u;
 const ADMIN_TITLE = "TiboTattle operations";
+// Owner adoption of stranded v1.1 uploads pages 25 devices per request. The
+// page bound only stops a runaway loop; it is far above the device population.
+const V11_ADOPTION_PAGE_SIZE = 25;
+const V11_ADOPTION_MAX_PAGES = 200;
+// The service rechecks every device on activation; this only keeps the
+// previewed count on the button from outliving the evidence behind it.
+const V11_ADOPTION_PREVIEW_TTL_MILLISECONDS = 15 * 60 * 1_000;
+const V11_ADOPTION_ROWS = Object.freeze([
+  ["adopted", "Activated"],
+  ["adoptable", "Can be activated"],
+  ["unchanged", "Already current"],
+  ["client_syncing", "Syncing now, left to the app"],
+  ["successor_active", "On v1.2, left to the app"],
+  ["authority_unavailable", "No current sharing authority"],
+  ["unsupported_history", "Older upload history, not supported"],
+  ["no_contiguous_days", "No complete consecutive days"],
+  ["refused", "Refused by database checks"],
+]);
 const isAdminPage = document.body?.classList?.contains(ADMIN_PAGE_CLASS) === true;
 let infoHintSequence = 0;
 
 const INFO_HINTS = Object.freeze({
-  "Approved community accounts": "Approved identities that are currently active and allowed to contribute. This includes approved accounts that have not yet sent accepted data.",
-  "Accounts with accepted data": "Distinct accounts with retained accepted whole contributions or incremental chunks. The exact current value and recent history come from the scheduled aggregate cache, independently of the overview's bounded newest-row sample.",
-  "Approved last 24h": "Identities first approved during the trailing 24 hours. The caption gives the corresponding trailing seven-day count.",
-  "Current incremental chunks": "Accepted incremental journal chunks that have not been superseded. The caption includes every retained chunk row, including older superseded rows.",
+  "Ingestion journal": "Every accepted change (an upload that changes a contributor's evidence, an activation, an opt-out or an erasure) is recorded here in order. The value is the latest change's position in that order.",
+  "Delivery into analytics": "The analytics Worker applies journal changes in order in bounded steps each minute, taking most of the minute while a backlog exists. A device activation is folded in day by day, so a large backlog of activations still takes hours. The movement line is what this page saw between two refreshes.",
+  "Daily publication": "Days waiting to have their public daily figures rebuilt. A day republishes only after every public owner's latest change has been delivered, so a delivery backlog holds the whole queue.",
+  "Allowance graph": "The allowance and model graph is rebuilt separately from daily figures. Its full breakdown is under Allowance diagnostics.",
+  "Active contributor identities": "Active pseudonymous contributor identities, including accountless installations. These are not verified people or a device census and may include identities without accepted data.",
+  "Identities with accepted data": "Distinct contributor identities with retained accepted uploads in the active storage mode. The exact value as of the displayed snapshot and recent history come from the scheduled aggregate cache, independently of the overview's bounded newest-row sample.",
+  "Identities added last 24h": "Contributor identities created during the trailing 24 hours. The caption gives the corresponding trailing seven-day count.",
+  "Current incremental chunks": "Selected source chunks from v1 and v1.1 analytical storage plus v1.2 active domain heads. The caption counts every retained accepted v1, v1.1 and v1.2 chunk, including staged or superseded rows.",
   "Accepted uploads last 24h": "Accepted whole contributions plus incremental chunks received during the trailing 24 hours. One account can send many uploads.",
   "Upload safety registrations": "Crash-safety markers created before uploaded objects are committed to the database. Recent markers are normal; older markers are reconciled.",
   "Recent registrations": "Upload safety markers still inside the one-hour grace period. They are expected and are not yet eligible for reconciliation.",
@@ -90,8 +123,9 @@ const INFO_HINTS = Object.freeze({
   "Active-install proxy": "Distinct source IP addresses seen on first-party app update traffic in the trailing 24 hours. It is a rough activity proxy, not a count of people or devices.",
   "App preflight call-ins": "Requests to the app preflight endpoint. They show running copies checking compatibility, but retries and shared addresses prevent a user census.",
   "Sparkle update checks": "Requests for the Sparkle appcast used to discover updates. A single installation can check more than once.",
+  "Electron update checks": "Requests for the OS-specific Electron update manifest. A single installation can check more than once.",
   "Sparkle artifact fetches": "Requests for update artifacts. Fetches can include retries or automated checks and do not prove a completed installation.",
-  "Current-version reach": "Distinct source addresses whose update traffic identifies the current published app version.",
+  "Latest GitHub tag match": "Source addresses reporting the version of the latest stable GitHub release tag. Native and Electron feeds can have different current versions; this is not cross-platform update compliance.",
   "GitHub DMG downloads": "GitHub's cumulative download counter for every currently published DMG asset. It counts asset downloads, not launches, active users, or unique devices. This optional total does not affect the first-party activity estimates.",
   "GitHub DMG downloads since prior snapshot": "The non-negative change in current GitHub DMG counters since the last complete owner snapshot. It begins after the first successful sync and does not infer downloads before this dashboard started recording snapshots.",
   "Cloudflare analytics": "Whether first-party request analytics were available for this dashboard refresh.",
@@ -102,7 +136,7 @@ const INFO_HINTS = Object.freeze({
   "GitHub snapshot": "When the most recent complete, all-release GitHub asset snapshot was recorded. GitHub exposes cumulative counters; this private dashboard stores snapshots to calculate future changes safely.",
   "GitHub sync": "The most recent owner or scheduled attempt to refresh GitHub release counters. A stale or failed source never erases the last known good totals.",
   "Counter regressions": "How many currently observed DMG assets reported a lower cumulative counter than their previous snapshot. This can happen when an asset is replaced or corrected; the dashboard never presents it as a negative download total.",
-  "Latest release": "The release tag and publication time used for the download totals.",
+  "Latest release": "The latest stable GitHub release tag and its publication time. Download totals below include all listed releases, not only this tag.",
   "Raw source addresses stored": "Whether this dashboard persists the source addresses used for distinct-address estimates. It should always say no.",
   "Upload ingress budget": "Shared admission state that protects the service from too many simultaneous or rapidly starting uploads.",
   "Active leases": "Uploads currently holding a concurrency slot, compared with the maximum simultaneous allowance.",
@@ -115,19 +149,24 @@ const INFO_HINTS = Object.freeze({
   "Quarantine reconciliation": "The latest upload-object housekeeping state and whether its bounded pass cleared all eligible work.",
   "Latest accepted upload": "The newest accepted whole contribution or incremental chunk received by the service.",
   "Weekly rebuild queue": "Weekly community snapshots waiting to be rebuilt from accepted evidence.",
+  "Historical model days": "Dated model-composition publications retained in the typed analytics store. This is recorded publication evidence, not a count of work remaining.",
+  "Latest historical evidence": "The newest evidence day with a retained typed model-composition publication.",
+  "Latest historical calculation": "The most recent calculation time across retained typed model-composition publications.",
+  "Historical graph preview": "Whether the latest typed analytics preview is current with its captured inputs, stale, or not yet published.",
   "Daily rebuild queue": "Daily community aggregates waiting to be rebuilt from accepted evidence.",
   "Latest daily evidence": "The newest evidence day represented by a published daily community aggregate.",
   "Latest daily publication": "When a daily community aggregate was most recently published.",
+  "Last retention completion": "When retention last completed successfully. Readiness requires a valid completion within the service’s two-hour freshness window.",
   "Last maintenance": "When the latest bounded retention, reconciliation, and publication maintenance pass ran.",
   "Failure code": "The latest lifecycle failure identifier. A dash means no failure was recorded.",
-  "New sign-ups": "Community accounts created, from retained participant records over the recent 30-day history window.",
-  "Web sign-ins": "Completed sign-ins on the website, counted from issued web sessions. Sign-in attempts that never completed are not retained and are not counted.",
-  "Device pairings": "Pairing handshakes issued to Macs starting community upload setup.",
-  "Device credentials": "Upload credentials issued to Macs that completed pairing.",
-  "Upload consents": "Devices that recorded an explicit telemetry upload consent.",
-  "Chunks uploaded": "Incremental contribution chunks accepted into the corpus.",
-  "Records uploaded": "Usage records inside accepted chunks, summed per day.",
-  "People uploading": "Distinct accounts that uploaded at least one chunk that day.",
+  "Contributor identities created": "Retained contributor identities created, including accountless installations. The total covers retained records; the chart shows recent UTC calendar days.",
+  "Legacy web sign-ins": "Retained sessions from the legacy website sign-in flow. Accountless Electron sharing does not require a web sign-in; zero here does not indicate broken enrollment.",
+  "Legacy device pairings": "Retained handshakes from legacy device pairing. Accountless Electron enrollment does not use this flow.",
+  "Device credentials": "Retained upload credentials issued through legacy pairing or accountless enrollment. Revoked or expired credentials may still be retained; this is not a count of currently connected devices.",
+  "Legacy upload consents": "Retained consent records from the legacy sharing flow. This is not coverage of the accountless Electron sharing policy.",
+  "Chunks uploaded": "Accepted v1, v1.1 and v1.2 incremental chunks, including staged and later superseded chunks. This is a retained upload total, not a count of currently selected evidence.",
+  "Records uploaded": "Records inside accepted v1, v1.1 and v1.2 chunks, summed per upload day. Overlapping source records can appear more than once here; the effective public series resolves them separately.",
+  "Identities uploading": "Distinct pseudonymous contributor identities with accepted chunks. The headline covers retained evidence; daily points count identities active on each UTC day and must not be summed as unique people.",
   "DMG downloads": "Cumulative installer downloads across all GitHub releases, sampled by the distribution sync. The delta is movement since the prior day's last sample.",
   "Published band cohort": "People inside the published community allowance band (the site's “from N people”).",
   "Plan cohorts": "Distinct contributors on each Codex plan (each counted under their current plan only), and that plan's measured allowance-window value in API-price-equivalent dollars. Ratios are measured from real fits, never assumed from the nominal plan multipliers.",
@@ -376,6 +415,41 @@ function auditResult(label, tone, explanation) {
   return { label, tone, explanation };
 }
 
+const V11_ADOPTION_AUDIT_ACTION = Object.freeze({
+  label: "Stranded upload activation",
+  explanation: "An owner-run pass over stranded v1.1 uploads. A preview changes nothing; an activation makes each device's complete, consecutive days public through the normal database checks.",
+});
+
+function auditCount(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? formatNumber(value) : "unknown";
+}
+
+function v11AdoptionAuditPresentation(outcome, details) {
+  if (outcome === "started") {
+    return {
+      result: auditResult("In progress", "warning", "The request was recorded, but this entry does not contain a final result yet."),
+      summary: "A stranded-upload pass was requested; no final outcome has been recorded.",
+    };
+  }
+  if (outcome === "failure") {
+    return {
+      result: auditResult("Failed", "failure", "The pass failed. Devices it had already activated stay activated; running it again is safe."),
+      summary: details?.code ? `The pass failed with result code ${details.code}.` : "The pass failed before it produced a usable result.",
+    };
+  }
+  const outcomes = plainRecord(details?.outcomes) ?? {};
+  if (details?.dryRun === true) {
+    return {
+      result: auditResult("Previewed", "success", "A preview. Nothing was changed."),
+      summary: `Previewed ${auditCount(details.examined)} examined devices; ${auditCount(outcomes.adoptable)} could be activated.`,
+    };
+  }
+  return {
+    result: auditResult("Completed", "success", "Activation finished for this page of devices."),
+    summary: `Activated ${auditCount(outcomes.adopted)} of ${auditCount(details?.examined)} examined devices, adding ${auditCount(details?.newDays)} new days.`,
+  };
+}
+
 function maintenancePresentation(outcome, details) {
   const code = details?.code;
   if (outcome === "started") {
@@ -400,6 +474,12 @@ function maintenancePresentation(outcome, details) {
         : "The maintenance request failed before it produced a usable result.",
     };
   }
+  if (outcome === "success" && code === "MAINTENANCE_IN_PROGRESS") {
+    return {
+      result: auditResult("Already running", "warning", "An existing maintenance lease is active; this request did not finish a new pass."),
+      summary: "Another maintenance pass is already running. Wait for the next refresh and inspect its audit result.",
+    };
+  }
   if (outcome === "success" && code === "MAINTENANCE_INCOMPLETE") {
     const remaining = MAINTENANCE_COMPLETION_FIELDS
       .filter(([key]) => details?.[key] === false)
@@ -413,6 +493,12 @@ function maintenancePresentation(outcome, details) {
       summary: remaining.length > 0
         ? `The pass ran, but ${listPhrase(remaining)} ${remaining.length === 1 ? "still has" : "still have"} eligible work remaining. Another bounded pass may finish it.`
         : "The pass ran, but some bounded maintenance work remained. Another pass may finish it.",
+    };
+  }
+  if (outcome === "success" && code && code !== "OK") {
+    return {
+      result: auditResult("Review result", "warning", "The service returned a result that needs review before assuming completion."),
+      summary: `Maintenance returned ${code}. Review readiness and the audit record.`,
     };
   }
   if (outcome === "success") {
@@ -518,11 +604,14 @@ function collectionControlPresentation(outcome, details) {
 
 function auditPresentation(item) {
   const details = plainRecord(item.details);
-  const action = AUDIT_ACTIONS[item.action] ?? {
+  const adoption = item.action === "run_maintenance" && details?.task === "v11_evidence_adoption";
+  const action = adoption ? V11_ADOPTION_AUDIT_ACTION : AUDIT_ACTIONS[item.action] ?? {
     label: humanizeToken(item.action),
     explanation: "An owner control action recorded by the service.",
   };
-  const presentation = item.action === "run_maintenance"
+  const presentation = adoption
+    ? v11AdoptionAuditPresentation(item.outcome, details)
+    : item.action === "run_maintenance"
     ? maintenancePresentation(item.outcome, details)
     : item.action === "set_collection_controls"
       ? collectionControlPresentation(item.outcome, details)
@@ -685,14 +774,16 @@ function renderMetricCards(selector, metrics) {
       name,
       number,
       caption,
-      recentHistory(points, label, valueFormatter, historyUnavailable),
     );
+    if (!(selector === "#distribution-counts" && historyUnavailable)) {
+      card.append(recentHistory(points, label, valueFormatter, historyUnavailable));
+    }
     return card;
   }));
 }
 
 const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
-const GROWTH_SCHEMA_VERSION = "admin-metrics-history-v0.2";
+const GROWTH_SCHEMA_VERSION = "admin-metrics-history-v0.3";
 
 /**
  * A day-by-day count series with calendar gaps filled: event tables have no
@@ -885,23 +976,25 @@ export function sparkline(points, description, valueFormatter = count) {
   return shell;
 }
 
-function deltaChip(delta, caption) {
+function deltaChip(delta, caption, windowLabel = "last 24h") {
   const chip = document.createElement("span");
   chip.className = `admin-delta ${delta > 0 ? "admin-delta-up" : "admin-delta-flat"}`;
-  chip.textContent = `${delta > 0 ? "+" : ""}${count(delta)} last 24h`;
+  chip.textContent = delta === null ? "Comparison unavailable" : `${delta > 0 ? "+" : ""}${count(delta)} ${windowLabel}`;
   if (caption) chip.title = caption;
   return chip;
 }
 
-function growthCard({ label, value, delta, deltaCaption, points, seriesLabel }) {
+function growthCard({ label, value, delta, deltaCaption, deltaWindow, points, seriesLabel, valueCaption }) {
   const card = document.createElement("div");
   card.className = "admin-card admin-metric admin-growth-card";
   const name = labelWithInfo(label);
   const number = document.createElement("strong");
   number.textContent = text(value);
   const caption = document.createElement("small");
-  caption.replaceChildren(deltaChip(delta, deltaCaption));
-  card.append(name, number, caption, recentHistory(points, seriesLabel));
+  caption.replaceChildren(deltaChip(delta, deltaCaption, deltaWindow));
+  const basis = document.createElement("small");
+  basis.textContent = valueCaption ?? "Latest recorded value";
+  card.append(name, number, basis, caption, recentHistory(points, seriesLabel));
   return card;
 }
 
@@ -910,6 +1003,7 @@ function eventGrowthCard(label, series, throughDay) {
   return growthCard({
     label,
     value: count(series.total),
+    valueCaption: "Retained total · not limited to chart range",
     delta: series.last24Hours,
     deltaCaption: `${count(series.previous24Hours)} in the prior 24h`,
     points,
@@ -999,28 +1093,30 @@ function renderGrowth(history) {
   const throughDay = history.generatedAt.slice(0, 10);
   const events = history.events;
   const cards = [
-    eventGrowthCard("New sign-ups", events.participants, throughDay),
-    eventGrowthCard("Web sign-ins", events.webSessions, throughDay),
-    eventGrowthCard("Device pairings", events.devicePairings, throughDay),
+    eventGrowthCard("Contributor identities created", events.participants, throughDay),
+    eventGrowthCard("Legacy web sign-ins", events.webSessions, throughDay),
+    eventGrowthCard("Legacy device pairings", events.devicePairings, throughDay),
     eventGrowthCard("Device credentials", events.deviceCredentials, throughDay),
-    eventGrowthCard("Upload consents", events.deviceConsents, throughDay),
+    eventGrowthCard("Legacy upload consents", events.deviceConsents, throughDay),
     eventGrowthCard("Chunks uploaded", events.uploadedChunks, throughDay),
     eventGrowthCard("Records uploaded", events.uploadedRecords, throughDay),
-    eventGrowthCard("People uploading", events.uploadingParticipants, throughDay),
+    eventGrowthCard("Identities uploading", events.uploadingParticipants, throughDay),
   ];
   if (history.downloads.available && history.downloads.byDay.length > 0) {
     const byDay = history.downloads.byDay.map((row) => ({
       day: row.day,
       count: row.cumulativeDmgDownloads,
     }));
-    const points = calendarPoints(byDay, throughDay, "carry").slice(-30);
-    const latest = points.at(-1)?.value ?? 0;
-    const prior = points.length > 1 ? points.at(-2).value : latest;
+    const points = byDay.slice(-30).map(row => ({ at: row.day, value: row.count }));
+    const latest = points.at(-1).value;
+    const prior = points.at(-2)?.value;
     cards.push(growthCard({
       label: "DMG downloads",
       value: count(latest),
-      delta: latest - prior,
-      deltaCaption: "movement since the prior day's last sample",
+      delta: prior === undefined ? null : latest - prior,
+      deltaWindow: "since prior sampled day",
+      deltaCaption: "Difference between recorded day-end snapshots; gaps are not filled as new observations.",
+      valueCaption: `Cumulative DMG counter · ${points.at(-1).at}`,
       points,
       seriesLabel: `Cumulative DMG downloads since ${byDay[0].day}`,
     }));
@@ -1047,9 +1143,11 @@ function growthBandCard(snapshots) {
   return growthCard({
     label: "Published band cohort",
     value: count(published),
-    delta: typeof referenceCount === "number" ? published - referenceCount : 0,
+    delta: typeof referenceCount === "number" ? published - referenceCount : null,
+    deltaWindow: "since comparison snapshot",
+    valueCaption: `Observed ${formatTime(latest.capturedAt)}`,
     deltaCaption: typeof referenceCount === "number"
-      ? `${count(referenceCount)} a day earlier`
+      ? `${count(referenceCount)} at ${formatTime(reference.capturedAt)}`
       : "history starts after the first hourly snapshot",
     points: gaugePoints(snapshots, "bandParticipantCount"),
     seriesLabel: "Published band participant count by snapshot",
@@ -1122,7 +1220,7 @@ function growthPlanCohortCard(snapshots) {
     const item = document.createElement("li");
     const name = document.createElement("span");
     name.className = "admin-plan-name";
-    name.textContent = row.plan;
+    name.textContent = ADMIN_ALLOWANCE_PLAN_STYLES[row.plan]?.label ?? row.plan;
     const stat = document.createElement("span");
     stat.className = "admin-plan-stat";
     const people = `${count(row.people)} on plan`;
@@ -1172,9 +1270,9 @@ function renderCounts(overview) {
     quarantine.pendingObjectsBounded,
   );
   const metrics = [
-    ["Approved community accounts", count(counts.participants.active, counts.participants.bounded), `${count(counts.participants.total, counts.participants.bounded)} total identities`, metricGaugePoints("participantsActive")],
+    ["Active contributor identities", count(counts.participants.active, counts.participants.bounded), `${count(counts.participants.total, counts.participants.bounded)} total identities`, metricGaugePoints("participantsActive")],
     {
-      label: "Accounts with accepted data",
+      label: "Identities with accepted data",
       value: count(contributorEvidence.total, contributorEvidence.totalBounded),
       detail: contributorEvidence.exact
         ? `Exact scheduled aggregate · ${formatTime(state.metricsHistory.generatedAt)}`
@@ -1182,7 +1280,7 @@ function renderCounts(overview) {
       points: contributorHistory.points,
       historyUnavailable: contributorHistory.unavailable,
     },
-    ["Approved last 24h", count(counts.participants.enrolledLast24Hours), `${count(counts.participants.enrolledLast7Days)} in the last 7 days`, eventHistoryPoints("participants")],
+    ["Identities added last 24h", count(counts.participants.enrolledLast24Hours), `${count(counts.participants.enrolledLast7Days)} in the last 7 days`, eventHistoryPoints("participants")],
     ["Current incremental chunks", count(counts.contributions.incrementalChunks.current, counts.contributions.incrementalChunks.bounded), `${count(counts.contributions.incrementalChunks.total, counts.contributions.incrementalChunks.bounded)} journal rows`, metricGaugePoints("corpusCurrentChunks")],
     ["Accepted uploads last 24h", count(counts.contributions.acceptedLast24Hours), `${count(counts.contributions.acceptedLast7Days)} in the last 7 days`, eventHistoryPoints("acceptedUploads")],
     {
@@ -1226,8 +1324,86 @@ function attentionRow({ id, topic, level, title, detail, target, linkLabel }) {
   return row;
 }
 
+function updateSourceHealth(name, health) {
+  state.sourceHealth[name] = health;
+  renderSourceHealth();
+  refreshAttention();
+}
+
+function renderSourceHealth() {
+  if (!isAdminPage) return;
+  if (state.sourceHealth.history === "stale" && state.metricsHistory) {
+    const badge = $("#growth-status");
+    badge.className = "admin-source-badge admin-source-partial";
+    badge.textContent = `Refresh failed · history through ${formatTime(state.metricsHistory.generatedAt)}`;
+  } else if (state.sourceHealth.history === "available" && state.metricsHistory) {
+    $("#growth-status").className = "admin-source-badge admin-source-available";
+    $("#growth-status").textContent = `History through ${formatTime(state.metricsHistory.generatedAt)}`;
+  }
+  const preview = state.allowancePreview;
+  const stale = state.sourceHealth.allowance === "stale";
+  if (preview) {
+    $("#admin-community-status").className = `admin-source-badge ${stale ? "admin-source-partial" : "admin-source-available"}`;
+    $("#admin-community-status").textContent = stale ? "Refresh failed · previous preview" : "Admin preview available";
+  }
+  $("#admin-community-freshness").textContent = preview
+    ? `Calculated ${formatTime(preview.generatedAt)}${stale ? ". Refresh failed; these are the previous dated results." : "."}`
+    : "No usable allowance preview loaded.";
+}
+
+function renderDatabaseHealth() {
+  if (!isAdminPage) return;
+  const snapshot = state.databaseHealth;
+  const health = state.sourceHealth.database;
+  const badge = $("#database-health-status");
+  badge.className = `admin-source-badge ${health === "available" && snapshot?.status === "available" ? "admin-source-available" : "admin-source-partial"}`;
+  badge.textContent = health === "stale" ? "Refresh failed · previous checks"
+    : snapshot ? snapshot.status === "available" ? "All required API databases readable" : "Database checks need attention"
+    : health === "loading" ? "Waiting for database checks" : "Database checks unavailable";
+  $("#database-health-freshness").textContent = snapshot
+    ? `Checked ${formatTime(snapshot.observedAt)} · ${snapshot.databases.length} API database roles · Storage mode: ${snapshot.storageMode}.${health === "stale" ? " These are previous results, not current health." : ""}`
+    : "No usable database check loaded. Refresh to retry; older deployments may not provide this endpoint.";
+  const labels = { primary: "Primary service and telemetry", deletion_ledger: "Deletion ledger", analytics: "Separate analytics" };
+  const statuses = { reachable: "Readable", unavailable: "Read failed", timeout: "Timed out (5 seconds)", not_configured: "Binding unavailable", not_applicable: "Not used in JSON mode" };
+  $("#database-health-rows").replaceChildren(...(snapshot?.databases ?? []).map(row => tableRow([
+    labels[row.role], statuses[row.status], row.responseMs === null ? "Unavailable" : `${formatNumber(row.responseMs)} ms`,
+    row.databaseBytes === null ? "Unavailable" : `${formatNumber(row.databaseBytes / (1024 * 1024), { maximumFractionDigits: 2 })} MiB`,
+  ])));
+}
+
+function refreshAttention() {
+  if (!state.overview || state.overviewUnavailable) return;
+  notifyAttention(renderAttention(state.overview));
+}
+
 function collectAttentionItems(overview) {
   const items = [];
+  if (isAdminPage) {
+    for (const [name, label, target] of [
+      ["history", "Growth history", "#growth-title"],
+      ["allowance", "Allowance preview", "#admin-community-title"],
+      ["progress", "Graph reconstruction progress", "#admin-reconstruction-title"],
+      ["database", "Database checks", "#database-health-title"],
+    ]) {
+      const health = state.sourceHealth[name];
+      const snapshot = name === "history" ? state.metricsHistory : name === "allowance" ? state.allowancePreview : name === "database" ? state.databaseHealth : state.reconstructionProgress;
+      const observedAt = name === "database" ? snapshot?.observedAt : snapshot?.generatedAt;
+      const evidenceAge = Date.parse(overview.generatedAt) - Date.parse(observedAt);
+      if (health === "available" && evidenceAge > 24 * 60 * 60 * 1_000) {
+        addAttentionItem(items, `source-age-${name}`, "evidence", "warning", `${label}: older than 24 hours`,
+          `Observed ${formatTime(observedAt)}. The read succeeded, but the evidence is more than a day behind the service snapshot. Check scheduled refresh progress; retained evidence remains visible.`, target, "Review freshness");
+      }
+      if (health !== "available") addAttentionItem(items, `source-${name}`, "evidence", "warning",
+        `${label}: ${health === "loading" ? "waiting for evidence" : health === "stale" ? "refresh failed" : "unavailable"}`,
+        health === "stale" ? "Previous dated evidence remains visible. Refresh to check for recovery."
+          : "This source has not supplied usable current evidence. Check the section and refresh.", target, "Review source");
+    }
+  }
+  if (state.sourceHealth.database === "available" && state.databaseHealth?.status === "degraded") {
+    addAttentionItem(items, "database-health", "evidence", "warning", "Database checks need attention",
+      "At least one required database could not be read, or the storage configuration is invalid. Review each role and check Cloudflare D1 before retrying.",
+      "#database-health-title", "Review databases");
+  }
   const collection = overview.collection;
   const lifecycle = overview.lifecycle;
   const reconciliation = overview.reconciliation;
@@ -1275,6 +1451,28 @@ function collectAttentionItems(overview) {
     );
   }
 
+  const maintenanceAge = Date.parse(overview.generatedAt) - Date.parse(lifecycle.lastCompletedAt);
+  if (!Number.isFinite(maintenanceAge) || maintenanceAge < 0 || maintenanceAge > 2 * 60 * 60 * 1_000) {
+    addAttentionItem(items, "maintenance-freshness", "maintenance", "warning",
+      "Maintenance observation needs a refresh",
+      `Last completed retention pass: ${formatTime(lifecycle.lastCompletedAt)}. No valid completion within two hours of this snapshot; check scheduled maintenance.`,
+      "#readiness-title", "Review maintenance");
+  }
+  if (lifecycle.state !== "failed" && (lifecycle.state !== "completed"
+      || !lifecycle.quarantineRetentionComplete || !lifecycle.restoreReplayComplete
+      || !reconciliation.reconciliationComplete
+      || reconciliation.maintenanceRunAt !== lifecycle.maintenanceRunAt)) {
+    addAttentionItem(items, "maintenance-incomplete", "maintenance", "warning",
+      "Maintenance readiness is incomplete",
+      "Retention, restore replay and reconciliation must finish in the same maintenance cycle. Review the recorded states before assuming readiness.",
+      "#readiness-title", "Review readiness");
+  }
+  const ingress = overview.ingress;
+  if (ingress && (ingress.activeLeases >= ingress.maximumConcurrent || ingress.availableStartTokens < 1)) {
+    addAttentionItem(items, "ingress-pressure", "collection", "warning", "Upload admission is at capacity",
+      `${ingress.activeLeases}/${ingress.maximumConcurrent} slots in use; ${ingress.availableStartTokens} start tokens. This is a snapshot, not sustained-load evidence.`,
+      "#ingress-title", "Review ingress");
+  }
   const dueObjects = quarantine.dueReferenced + quarantine.dueUnreferenced;
   if (dueObjects > 0) {
     addAttentionItem(
@@ -1289,7 +1487,7 @@ function collectAttentionItems(overview) {
     );
   }
 
-  const queuedRebuilds = overview.pendingHistoricalRebuilds
+  const queuedRebuilds = (overview.pendingHistoricalRebuilds ?? 0)
     + daily.pendingRebuilds;
   if (queuedRebuilds > 0) {
     addAttentionItem(
@@ -1297,8 +1495,10 @@ function collectAttentionItems(overview) {
       "rebuild-queue",
       "maintenance",
       "warning",
-      `${queuedRebuilds} publication ${queuedRebuilds === 1 ? "rebuild is" : "rebuilds are"} queued`,
-      `${overview.pendingHistoricalRebuilds} weekly · ${daily.pendingRebuilds} daily.`,
+      `${count(queuedRebuilds, daily.pendingRebuildsBounded || overview.pendingHistoricalRebuildsBounded)} publication ${queuedRebuilds === 1 ? "rebuild is" : "rebuilds are"} queued`,
+      overview.pendingHistoricalRebuilds === null
+        ? `${count(daily.pendingRebuilds, daily.pendingRebuildsBounded)} daily. Typed historical work is measured by completed publication evidence.`
+        : `${count(overview.pendingHistoricalRebuilds, overview.pendingHistoricalRebuildsBounded)} weekly · ${count(daily.pendingRebuilds, daily.pendingRebuildsBounded)} daily.`,
       "#readiness-title",
       "Review queues",
     );
@@ -1315,7 +1515,7 @@ function collectAttentionItems(overview) {
       detail = "The dashboard could not read the current upload admission budget.";
     } else if (!ingressUnavailable && activityEvidenceUnavailable) {
       title = "App activity evidence is unavailable";
-      detail = "First-party preflight and Sparkle activity counts could not be refreshed.";
+      detail = "First-party preflight, native and Electron update activity could not be refreshed.";
     }
     addAttentionItem(
       items,
@@ -1324,11 +1524,17 @@ function collectAttentionItems(overview) {
       "warning",
       title,
       detail,
-      "#distribution-title",
+      ingressUnavailable && !activityEvidenceUnavailable ? "#ingress-title" : "#distribution-title",
       "Review evidence",
     );
   }
 
+  const analytics = overview.distribution.cloudflare;
+  if (analytics.sampled || analytics.bounded || analytics.observedVersionsBounded) {
+    addAttentionItem(items, "activity-coverage", "evidence", "warning", "App activity evidence has coverage limits",
+      "Sampling or a result cap limits the activity counts or version list. Inspect the source details before comparing adoption.",
+      "#distribution-title", "Review coverage");
+  }
   const github = overview.distribution.github;
   if (github.status !== "available") {
     addAttentionItem(
@@ -1371,8 +1577,8 @@ function collectAttentionItems(overview) {
   }
 
   const generatedAt = Date.parse(overview.generatedAt);
-  const recentServerFailures = overview.errors.recentDiagnostics.filter((event) => {
-    const occurredAt = Date.parse(event.occurredAt);
+  const recentServerFailures = overview.errors.groups.filter((event) => {
+    const occurredAt = Date.parse(event.latestAt);
     const age = generatedAt - occurredAt;
     return event.status >= 500
       && Number.isFinite(age)
@@ -1381,7 +1587,7 @@ function collectAttentionItems(overview) {
   });
   if (recentServerFailures.length > 0) {
     const latest = recentServerFailures
-      .map((event) => event.occurredAt)
+      .map((event) => event.latestAt)
       .sort()
       .at(-1);
     addAttentionItem(
@@ -1389,8 +1595,8 @@ function collectAttentionItems(overview) {
       "sampled-server-failure",
       "failures",
       "warning",
-      `${recentServerFailures.length} sampled server ${recentServerFailures.length === 1 ? "failure" : "failures"} in the last 24 hours`,
-      `Latest retained event: ${formatTime(latest)}.`,
+      `Sampled server failures recorded in the last 24 hours`,
+      `${recentServerFailures.length} error groups have recent events. Latest: ${formatTime(latest)}. This is a bounded sample, not a full error rate.`,
       "#errors-title",
       "Review diagnostics",
     );
@@ -1408,7 +1614,7 @@ function renderAttention(overview) {
     $("#operator-attention").replaceChildren(attentionRow({
       level: "ok",
       title: "No current action is indicated by this snapshot",
-      detail: "Collection is operational, no reconciliation or rebuild work is due, first-party activity evidence is available, and no sampled 5xx event was retained in the last 24 hours.",
+      detail: "Collection is operational, no reconciliation or rebuild work is due, first-party activity evidence is available, and no sampled 5xx group has a retained event in the last 24 hours. This is not an uptime or end-to-end readiness check.",
       target: null,
       linkLabel: null,
     }));
@@ -1541,14 +1747,16 @@ function renderDistribution(distribution) {
     || cloudflare.sampled === true
     || cloudflare.bounded === true;
   const githubAvailable = github.status === "available";
+  const sourcesQualified = cloudflareAvailable && githubAvailable && !cloudflare.sampled && !cloudflare.bounded
+    && !cloudflare.observedVersionsBounded && !github.sync.stale && github.sync.lastFailureCode === null;
   const badge = $("#distribution-status");
   badge.className = `admin-source-badge ${
-    cloudflareAvailable && githubAvailable
+    sourcesQualified
       ? "admin-source-available"
       : "admin-source-partial"
   }`;
   badge.textContent = cloudflareAvailable && githubAvailable
-    ? "Sources available"
+    ? sourcesQualified ? "Sources available" : "Available · review source limits"
     : cloudflareAvailable
       ? "Activity available · GitHub unavailable"
       : cloudflare.status === "not_configured" && github.status === "not_configured"
@@ -1558,6 +1766,7 @@ function renderDistribution(distribution) {
   const active = cloudflare.activeSourceAddresses;
   const preflight = cloudflare.preflight;
   const checks = cloudflare.sparkleChecks;
+  const electronChecks = cloudflare.electronChecks;
   const downloads = cloudflare.sparkleDownloads;
   const current = cloudflare.currentVersionSourceAddresses;
   const release = github.release;
@@ -1567,36 +1776,43 @@ function renderDistribution(distribution) {
     {
       label: "Active-install proxy",
       value: distributionCount(active?.last24Hours, cloudflare),
-      detail: `${distributionCount(active?.last7Days, cloudflare)} distinct source addresses in 7 days`,
+      detail: `Last 24h above · ${distributionCount(active?.last7Days, cloudflare)} distinct source addresses/7d`,
       points: distributionSegmentPoints(cloudflare, "activeSourceAddresses"),
       historyUnavailable: cloudflareHistoryUnavailable,
     },
     {
       label: "App preflight call-ins",
       value: distributionCount(preflight?.requests.last24Hours, cloudflare),
-      detail: `${distributionCount(preflight?.sourceAddresses.last24Hours, cloudflare)} addresses · ${distributionCount(preflight?.requests.last7Days, cloudflare)} requests/7d`,
+      detail: `Last 24h above · ${distributionCount(preflight?.sourceAddresses.last24Hours, cloudflare)} addresses · ${distributionCount(preflight?.requests.last7Days, cloudflare)} requests/7d`,
       points: distributionSegmentPoints(cloudflare, "preflightRequests"),
       historyUnavailable: cloudflareHistoryUnavailable,
     },
     {
       label: "Sparkle update checks",
       value: distributionCount(checks?.requests.last24Hours, cloudflare),
-      detail: `${distributionCount(checks?.sourceAddresses.last24Hours, cloudflare)} addresses · ${distributionCount(checks?.requests.last7Days, cloudflare)} checks/7d`,
+      detail: `Last 24h above · ${distributionCount(checks?.sourceAddresses.last24Hours, cloudflare)} addresses · ${distributionCount(checks?.requests.last7Days, cloudflare)} checks/7d`,
       points: distributionSegmentPoints(cloudflare, "sparkleCheckRequests"),
+      historyUnavailable: cloudflareHistoryUnavailable,
+    },
+    {
+      label: "Electron update checks",
+      value: distributionCount(electronChecks?.requests.last24Hours, cloudflare),
+      detail: `Last 24h above · ${distributionCount(electronChecks?.sourceAddresses.last24Hours, cloudflare)} addresses · ${distributionCount(electronChecks?.requests.last7Days, cloudflare)} checks/7d`,
+      points: distributionSegmentPoints(cloudflare, "electronCheckRequests"),
       historyUnavailable: cloudflareHistoryUnavailable,
     },
     {
       label: "Sparkle artifact fetches",
       value: distributionCount(downloads?.requests.last24Hours, cloudflare),
-      detail: `${distributionCount(downloads?.sourceAddresses.last24Hours, cloudflare)} addresses · ${distributionCount(downloads?.requests.last7Days, cloudflare)} fetches/7d`,
+      detail: `Last 24h above · ${distributionCount(downloads?.sourceAddresses.last24Hours, cloudflare)} addresses · ${distributionCount(downloads?.requests.last7Days, cloudflare)} fetches/7d`,
       points: distributionSegmentPoints(cloudflare, "sparkleDownloadRequests"),
       historyUnavailable: cloudflareHistoryUnavailable,
     },
     {
-      label: "Current-version reach",
+      label: "Latest GitHub tag match",
       value: distributionCount(current?.last24Hours, cloudflare),
       detail: cloudflare.currentVersion
-        ? `v${cloudflare.currentVersion} · ${distributionCount(current?.last7Days, cloudflare)} addresses/7d`
+        ? `v${cloudflare.currentVersion} · last 24h above · ${distributionCount(current?.last7Days, cloudflare)} addresses/7d`
         : "current release could not be matched to traffic",
       points: distributionSegmentPoints(
         cloudflare,
@@ -1625,34 +1841,110 @@ function renderDistribution(distribution) {
     ],
   ]);
 
+  if (isAdminPage) {
+    $("#distribution-estimate-note").textContent = !cloudflareAvailable
+      ? "Update traffic is unavailable. GitHub download counts are a separate source."
+      : `${cloudflare.sampled ? "≈ marks sampled Cloudflare traffic: requests are estimates and distinct addresses cover only the returned sample. " : "Cloudflare returned unsampled traffic for this window. "}${cloudflare.bounded ? "+ marks a query row cap: more traffic may be missing. " : ""}${cloudflareHistoryUnavailable ? "Traffic trends are hidden while coverage is incomplete. " : ""}GitHub download counters are not sampled.`;
+    const syncStatus = github.sync.lastFailureCode
+      ? `GitHub sync failed (${github.sync.lastFailureCode}); check the source details and retry sync.`
+      : github.sync.stale
+        ? "GitHub snapshot is stale; sync releases to refresh it."
+        : githubAvailable ? "GitHub release data is current." : "GitHub release data is unavailable.";
+    $("#distribution-source-summary").textContent = `${cloudflareAvailable
+      ? cloudflare.sampled || cloudflare.bounded
+        ? "Traffic has coverage limits; use it as an activity signal, not an installation count."
+        : "Traffic is available without sampling or a query row cap."
+      : "Traffic analytics are unavailable; activity cannot be assessed."} ${syncStatus}${history.counterRegressions > 0 ? ` ${history.counterRegressions} download counters decreased; comparisons need review.` : ""}`;
+  }
+
   const versions = cloudflare.observedVersions;
   const activeAddresses = active?.last7Days ?? 0;
   $("#distribution-version-rows").replaceChildren(
     ...versions.map((version) => tableRow([
-      version.version,
+      version.client === "native" ? "Native" : "Electron",
+      version.operatingSystem === "macos"
+        ? version.architecture === "arm64" ? "macOS · Apple silicon" : "macOS · Intel"
+        : version.operatingSystem === "windows" ? "Windows" : "Linux",
+      version.version ?? "Unknown",
       percentage(version.sourceAddressesLast7Days, activeAddresses),
       distributionCount(version.sourceAddressesLast7Days, cloudflare),
       distributionCount(version.requestsLast7Days, cloudflare),
     ])),
   );
+  if (isAdminPage) {
+    const totals = cloudflare.observedTotals;
+    const platformName = os => ({ macos: "macOS", windows: "Windows", linux: "Linux" })[os];
+    $("#distribution-total-rows").replaceChildren(...(totals ? [
+      ...(totals.macosArchitectures ?? []).map(row => tableRow([
+        "Architecture total",
+        row.architecture === "arm64" ? "macOS · Apple silicon" : "macOS · Intel",
+        "All versions",
+        percentage(row.sourceAddressesLast7Days, activeAddresses),
+        distributionCount(row.sourceAddressesLast7Days, cloudflare),
+        distributionCount(row.requestsLast7Days, cloudflare),
+      ])),
+      ...totals.platforms.map(row => tableRow([
+        row.operatingSystem === "macos" ? "macOS subtotal" : "Platform total",
+        platformName(row.operatingSystem), "All versions",
+        percentage(row.sourceAddressesLast7Days, activeAddresses),
+        distributionCount(row.sourceAddressesLast7Days, cloudflare),
+        distributionCount(row.requestsLast7Days, cloudflare),
+      ])),
+      tableRow(["Overall total", "All OS", "All versions",
+        percentage(totals.overall.sourceAddressesLast7Days, activeAddresses),
+        distributionCount(totals.overall.sourceAddressesLast7Days, cloudflare),
+        distributionCount(totals.overall.requestsLast7Days, cloudflare)]),
+    ] : []));
+  }
   $("#distribution-version-empty").hidden = versions.length !== 0;
+  $("#distribution-version-empty").textContent = cloudflareAvailable
+    ? "No recognized app-version traffic was observed in this window."
+    : "App-version evidence is unavailable; this does not mean there are no active apps.";
+  if (isAdminPage) $("#distribution-version-coverage").textContent =
+    `${cloudflare.observedVersionsBounded ? "Version list capped; additional rows are omitted. " : ""}macOS architecture comes from the update-feed path. The macOS subtotal counts each address once across Apple silicon and Intel; architecture rows can overlap. Address reach uses all observed active addresses as its denominator. One address can occur in several app, OS, architecture or version rows, so percentages need not sum to 100%. Each total counts an address once across all included apps and versions; platform totals can overlap. ${cloudflare.observedTotals ? "" : "Totals are unavailable from this snapshot. "}Unknown means no usable TiboTattle app version was present in the updater request; it cannot be recovered from the OS or update feed.`;
 
   const releases = github.releases;
   $("#github-release-rows").replaceChildren(
-    ...releases.map((githubRelease) => tableRow([
-      githubRelease.tag,
-      githubRelease.prerelease ? "Prerelease" : "Stable",
-      count(githubRelease.dmgDownloads),
-      percentage(githubRelease.dmgDownloads, summary?.dmgDownloads ?? 0),
-      formatTime(githubRelease.publishedAt),
-    ])),
+    ...releases.map((githubRelease) => {
+      const installers = githubRelease.installerDownloads;
+      const values = [
+        installers.macArm64, installers.macX64,
+        installers.windowsX64, installers.linuxX64,
+      ];
+      const total = values.some(value => value !== null)
+        ? count(values.reduce((sum, value) => sum + (value ?? 0), 0))
+        : "—";
+      return tableRow([
+        githubRelease.tag,
+        githubRelease.prerelease ? "Prerelease" : "Stable",
+        ...values.map(value => value === null ? "—" : count(value)),
+        total,
+        formatTime(githubRelease.publishedAt),
+      ]);
+    }),
   );
+  const installerKeys = ["macArm64", "macX64", "windowsX64", "linuxX64"];
+  const installerTotals = installerKeys.map(key => {
+    const published = releases.some(release => release.installerDownloads[key] !== null);
+    return published
+      ? releases.reduce((sum, release) => sum + (release.installerDownloads[key] ?? 0), 0)
+      : null;
+  });
+  $("#github-release-total-rows").replaceChildren(...(releases.length ? [tableRow([
+    `Grand total · all ${releases.length} releases`,
+    "All versions",
+    ...installerTotals.map(value => value === null ? "—" : count(value)),
+    installerTotals.some(value => value !== null)
+      ? count(installerTotals.reduce((sum, value) => sum + (value ?? 0), 0))
+      : "—",
+    "All time",
+  ])] : []));
   $("#github-release-empty").hidden = releases.length !== 0;
 
   $("#distribution-source-status").replaceChildren(
     statusLine(
       "Cloudflare analytics",
-      cloudflare.status === "not_configured" ? "not configured" : cloudflare.status,
+      `${cloudflare.status === "not_configured" ? "not configured" : cloudflare.status}${cloudflare.reasonCode ? ` · ${cloudflare.reasonCode}` : ""}`,
     ),
     statusLine(
       "Evidence window",
@@ -1704,10 +1996,46 @@ function renderDistribution(distribution) {
 }
 
 function renderControls(controls) {
+  if (state.controlsDirty) {
+    renderControlStatus();
+    return;
+  }
+  state.controlsRevision = controls.revision;
   for (const name of ["enrollment", "uploadRegistration", "processing", "publication"]) {
     $(`input[name="${name}"]`).checked = controls[name] === true;
   }
-  $("#service-state").textContent = `${controls.state}, revision ${controls.revision}`;
+  renderControlStatus();
+}
+
+function renderControlStatus() {
+  if (!isAdminPage) return;
+  $("#controls-fields").disabled = state.overviewUnavailable || state.actionPending;
+  $("#save-controls").disabled = state.overviewUnavailable || state.actionPending || !state.controlsDirty || state.controlsRevision !== state.overview?.collection.revision;
+  $("#discard-controls").disabled = state.actionPending || !state.controlsDirty || state.overviewUnavailable;
+  $("#run-maintenance").disabled = state.overviewUnavailable || state.actionPending;
+  $("#sync-distribution").disabled = state.overviewUnavailable || state.actionPending;
+  $("#preview-v11-adoption").disabled = state.overviewUnavailable || state.actionPending;
+  $("#apply-v11-adoption").disabled = state.overviewUnavailable || state.actionPending
+    || !(state.v11AdoptionPreview?.adoptable > 0);
+  $("#controls-status").textContent = state.overviewUnavailable
+    ? "Load a current service snapshot before changing controls."
+    : state.controlsDirty
+      ? state.controlsRevision !== state.overview.collection.revision
+        ? "Service controls changed since you started editing. Discard your draft and review the current revision before saving."
+        : `Unsaved changes based on revision ${state.controlsRevision}. Refresh keeps this draft.`
+      : `Current revision ${state.controlsRevision}. Checked means enabled.`;
+}
+
+function beginAdminAction() {
+  if (!state.overview || state.overviewUnavailable || state.actionPending) return false;
+  state.actionPending = true;
+  renderControlStatus();
+  return true;
+}
+
+function endAdminAction() {
+  state.actionPending = false;
+  renderControlStatus();
 }
 
 function statusLine(label, value) {
@@ -1759,7 +2087,7 @@ function renderErrors(errors) {
   $("#recent-diagnostic-empty").hidden = errors.recentDiagnostics.length !== 0;
   const summary = $("#diagnostic-retention-summary");
   if (summary) {
-    summary.textContent = `${errors.sampled ? "A bounded sample" : "Retained events"} of service 5xx failures is kept for ${errors.retentionDays} days, capped at ${count(errors.capacity)} events. Retained service request IDs are UUIDs; TT-… references stay only in the reporting Mac’s local diagnostics log.`;
+    summary.textContent = `${errors.sampled ? "A bounded sample" : "Retained events"} of service 5xx failures is kept for ${errors.retentionDays} days, capped at ${count(errors.capacity)} events. Retained service request IDs are UUIDs; TT-… references stay only in the reporting device’s local diagnostics log.`;
   }
   renderDiagnosticLookup();
 }
@@ -1784,14 +2112,14 @@ async function lookupDiagnosticReference() {
   const kind = diagnosticReferenceKind(reference);
   if (kind === "local") {
     state.diagnosticLookup = {
-      message: "TT-… references are local to the reporting Mac and are not uploaded here. Ask for the local diagnostics log or export from that Mac.",
+      message: "TT-… references are local to the reporting device and are not uploaded here. Ask for the local diagnostics log or export from that device.",
     };
     renderDiagnosticLookup();
     return;
   }
   if (kind === "invalid-local") {
     state.diagnosticLookup = {
-      message: "That TT reference is incomplete or malformed. A local reference looks like TT-7QF3K2 and can be checked only in the reporting Mac’s diagnostics log.",
+      message: "That TT reference is incomplete or malformed. A local reference looks like TT-7QF3K2 and can be checked only in the reporting device’s diagnostics log.",
     };
     renderDiagnosticLookup();
     return;
@@ -1821,6 +2149,7 @@ async function lookupDiagnosticReference() {
       lookupGeneration,
       state.diagnosticLookupGeneration,
     )) return;
+    if (refuseAdminAccess(error)) return;
     state.diagnosticLookup = { message: `Lookup unavailable: ${error.message}.` };
   }
   renderDiagnosticLookup();
@@ -1837,27 +2166,45 @@ function renderOperational(overview) {
   const lifecycle = overview.lifecycle;
   const reconciliation = overview.reconciliation;
   const daily = overview.dailyPublication;
+  const historical = overview.historicalPublication;
+  const publicationRows = historical
+    ? [
+      ["Historical model days", count(
+        historical.publishedDays,
+        historical.publishedDaysBounded,
+      )],
+      ["Latest historical evidence", text(historical.latestEvidenceDay)],
+      ["Latest historical calculation", formatTime(historical.latestComputedAt)],
+      ["Historical graph preview", historical.previewState === "not_published"
+        ? "not published"
+        : `${historical.previewState} · ${formatTime(historical.previewGeneratedAt)}`],
+    ]
+    : [["Weekly rebuild queue", count(overview.pendingHistoricalRebuilds, overview.pendingHistoricalRebuildsBounded)]];
   $("#lifecycle-status").replaceChildren(
     ...[
       ["Retention lifecycle", `${lifecycle.state} · ${lifecycle.quarantineRetentionComplete ? "complete" : "incomplete"}`],
       ["Restore replay", lifecycle.restoreReplayComplete ? "complete" : "incomplete"],
       ["Quarantine reconciliation", `${reconciliation.state} · ${reconciliation.reconciliationComplete ? "complete" : "incomplete"}`],
       ["Latest accepted upload", formatTime(overview.counts.contributions.latestAcceptedAt)],
-      ["Weekly rebuild queue", text(overview.pendingHistoricalRebuilds)],
+      ...publicationRows,
       ["Daily rebuild queue", count(daily.pendingRebuilds, daily.pendingRebuildsBounded)],
       ["Latest daily evidence", text(daily.latestEvidenceDay)],
       ["Latest daily publication", formatTime(daily.latestReleasedAt)],
       ["Last maintenance", formatTime(lifecycle.maintenanceRunAt)],
+      ["Last retention completion", formatTime(lifecycle.lastCompletedAt)],
       ["Failure code", text(lifecycle.failureCode)],
     ].map(([label, value]) => statusLine(label, value)),
   );
   const rows = overview.snapshots || [];
   $("#snapshot-rows").replaceChildren(...rows.map((snapshot) => tableRow([
     snapshot.snapshotId,
-    `${snapshot.weekStart} → ${snapshot.weekEnd}`,
+    `${snapshot.weekStart.slice(0, 10)} → ${snapshot.weekEnd.slice(0, 10)}`,
     snapshot.releaseState,
     formatTime(snapshot.releasedAt),
   ])));
+  $("#snapshot-empty").textContent = historical
+    ? "Typed analytics publishes dated model history instead of legacy weekly snapshots."
+    : "No immutable snapshot has been sealed.";
   $("#snapshot-empty").hidden = rows.length !== 0;
 }
 
@@ -2088,6 +2435,9 @@ function notifyAttention(items) {
   if (!isAdminPage) return;
   const allAlerts = items.filter((item) => item.level !== "ok");
   document.title = allAlerts.length > 0 ? `• ${ADMIN_TITLE}` : ADMIN_TITLE;
+  // Initial independent reads are not incidents. Wait until each lane settles
+  // before emitting desktop alerts or clearing prior notification recurrence.
+  if (Object.values(state.sourceHealth).includes("loading")) return;
   const preferences = state.notificationPreferences ?? readNotificationPreferences();
   const alerts = selectedNotificationAlerts(allAlerts, preferences.topics);
   if (alerts.length === 0) {
@@ -2197,9 +2547,10 @@ const ADMIN_ALLOWANCE_DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
 const ADMIN_ALLOWANCE_CHART_WIDTH = 960;
 const ADMIN_ALLOWANCE_CHART_HEIGHT = 300;
 const ADMIN_ALLOWANCE_PLAN_STYLES = Object.freeze({
-  pro: Object.freeze({ label: "Pro 20×", className: "allowance-series-0" }),
+  pro: Object.freeze({ label: "Pro 10×", className: "allowance-series-0" }),
   prolite: Object.freeze({ label: "Pro 5×", className: "allowance-series-1" }),
-  plus: Object.freeze({ label: "Plus", className: "allowance-series-2" }),
+  promax: Object.freeze({ label: "Pro Max 25×", className: "allowance-series-2" }),
+  plus: Object.freeze({ label: "Plus", className: "allowance-series-3" }),
 });
 
 function adminAllowanceTickStep(span, target = 4) {
@@ -2236,7 +2587,7 @@ function adminAllowanceSegments(points) {
 
 /**
  * Pure geometry for the admin-only merge preview. Every line shares the same
- * UTC date and Pro-20x-equivalent dollar axes, so switching views changes the
+ * UTC date and Pro-10x-equivalent dollar axes, so switching views changes the
  * evidence shown rather than the meaning of the scale.
  */
 export function adminAllowanceChartModel(preview, {
@@ -2584,14 +2935,14 @@ function appendAdminAllowanceChart(container, preview) {
     viewBox: `0 0 ${model.width} ${model.height}`,
     role: "img",
     tabindex: 0,
-    "aria-description": "Weekly API-equivalent USD on a Pro 20× basis. Hover, tap or use arrow keys to inspect each day's estimate. Missing days stay gaps.",
+    "aria-description": "Weekly API-equivalent USD on a Pro 10× basis. Hover, tap or use arrow keys to inspect each day's estimate. Missing days stay gaps.",
     "aria-label": state.allowanceMode === "combined"
-      ? "Combined Pro 20x-equivalent community allowance by day"
+      ? "Combined Pro 10x-equivalent community allowance by day"
       : state.allowanceMode === "models"
-        ? "Pro 20x-equivalent per-model allowance by day"
+        ? "Pro 10x-equivalent per-model allowance by day"
         : model.activePlanFilter === null
-          ? "Pro 20x-equivalent community allowance by plan and day"
-          : `${model.series[0].label} Pro 20x-equivalent community allowance by day`,
+          ? "Pro 10x-equivalent community allowance by plan and day"
+          : `${model.series[0].label} Pro 10x-equivalent community allowance by day`,
   });
   for (const tick of model.dollarTicks) {
     svg.append(adminAllowanceSvg("line", "chart-grid", {
@@ -2667,7 +3018,7 @@ function appendAdminAllowanceChart(container, preview) {
     }
     const markers = new Set(series.markerPoints);
     for (const point of series.points) {
-      const detail = `${series.label} · ${point.day} · ${allowanceUsd(point.value)}/Pro 20× week at API prices`
+      const detail = `${series.label} · ${point.day} · ${allowanceUsd(point.value)}/Pro 10× week at API prices`
         + ` · ${allowanceCountLabel(point.participantCount, "account")}`
         + (model.mode === "models" ? "" : ` · ${allowanceCountLabel(point.fitCount, "fit")}`);
       const dot = adminAllowanceSvg(
@@ -2713,7 +3064,7 @@ function appendAdminAllowanceChart(container, preview) {
   if (model.mode === "plans") {
     const method = document.createElement("p");
     method.className = "admin-allowance-meta";
-    method.textContent = "Chart scaled to Pro 20×: Pro 20× ×1, Pro 5× ×4, Plus ×20."
+    method.textContent = "Chart scaled to Pro 10×: Pro 10× ×1, Pro 5× ×2, Pro Max 25× ×0.4, Plus ×10."
       + " Smaller card values show each plan’s own week at API prices."
       + " Shading: middle 80% of qualifying reset fits. Missing days stay gaps.";
     container.append(method);
@@ -2730,7 +3081,7 @@ function appendCombinedAllowanceSummary(container, preview) {
   value.textContent = allowanceUsd(latest.summary.centralUsd);
   const unit = document.createElement("span");
   unit.className = "admin-allowance-unit";
-  unit.textContent = "API-equivalent USD / Pro 20× week";
+  unit.textContent = "API-equivalent USD / Pro 10× week";
   const meta = document.createElement("p");
   meta.className = "admin-allowance-meta";
   const evidence = document.createElement("span");
@@ -2799,7 +3150,7 @@ function appendPlanAllowanceSummaries(container, preview) {
 function appendAllowanceCardsCaption(container) {
   const caption = document.createElement("p");
   caption.className = "allowance-summary-caption";
-  caption.textContent = "API-equivalent USD / Pro 20× week";
+  caption.textContent = "API-equivalent USD / Pro 10× week";
   container.append(caption);
 }
 
@@ -2952,6 +3303,7 @@ function renderAdminCommunityAllowance(preview) {
     empty.textContent = "The allowance preview could not be loaded.";
     container.append(empty);
     renderAdminAllowanceControls();
+    renderSourceHealth();
     return;
   }
   badge.className = "admin-source-badge admin-source-available";
@@ -2969,6 +3321,7 @@ function renderAdminCommunityAllowance(preview) {
   appendAllowanceCoverage(container, preview.coverage);
   appendAdminAllowanceChart(container, preview);
   renderAdminAllowanceControls();
+  renderSourceHealth();
 }
 
 async function loadAdminCommunityAllowance() {
@@ -2983,6 +3336,8 @@ function renderReconstructionProgress(progress, { stale = false } = {}) {
   const details = $("#admin-reconstruction-details");
   if (!panel || !badge || !details) return;
   panel.className = `admin-reconstruction${stale ? " admin-reconstruction-stale" : ""}`;
+  const heading = $("#admin-reconstruction-title");
+  if (heading) heading.textContent = "Graph reconstruction";
   details.replaceChildren();
   const paragraph = (parent, text, className = "") => {
     const node = document.createElement("p");
@@ -3058,6 +3413,321 @@ function renderReconstructionProgress(progress, { stale = false } = {}) {
     "admin-reconstruction-freshness");
 }
 
+// Closed refusal codes carry no owner identity and no raw error. An unmapped
+// code renders verbatim so a newly coded upstream reason stays visible as
+// itself rather than vanishing from the refusal totals.
+const GRAPH_REFUSAL_LABELS = Object.freeze({
+  multi_plan_window_unsupported: "window spans more than one plan",
+  supported_quota_track_unavailable: "no supported quota track",
+  downsampled_quota_limit_exceeded: "too many quota observations",
+  windowed_usage_limit_exceeded: "too many usage events",
+  plan_attribution_limit_exceeded: "plan attribution limit",
+  multi_provider_window_unsupported: "window spans more than one provider",
+  multi_account_window_unsupported: "window spans more than one account",
+  multi_era_window_unsupported: "window spans more than one era",
+  continuity_track_limit_exceeded: "continuity track limit",
+  usage_cost_limit_exceeded: "usage cost limit",
+  other: "other reason",
+});
+const GRAPH_DAY_STATE_LABELS = Object.freeze({
+  published: "Published",
+  complete: "Complete, awaiting publication",
+  partial: "Some results",
+  none: "No results yet",
+});
+
+function graphDayState(day) {
+  if (day.published) return "published";
+  if (day.missing === 0) return "complete";
+  return day.ready + day.refused + day.unsupported > 0 ? "partial" : "none";
+}
+
+/** A day's publication clock is stated in UTC, the basis the rebuild records,
+ * rather than re-expressed in the reader's zone where it would imply a
+ * precision the stored stamp does not carry. */
+function graphUtcClock(value) {
+  const epoch = value === null ? Number.NaN : Date.parse(value);
+  return Number.isFinite(epoch)
+    ? `${new Date(epoch).toISOString().slice(11, 16)} UTC`
+    : "time not recorded";
+}
+
+function graphDayTitle(day) {
+  const state = graphDayState(day);
+  const outcome = {
+    published: `published ${graphUtcClock(day.publishedAt)}`,
+    complete: "complete, awaiting publication",
+    partial: "in progress",
+    none: "no results yet",
+  }[state];
+  return `${day.day} · ${formatNumber(day.ready)} ready · ${formatNumber(day.refused)} refused`
+    + ` · ${formatNumber(day.unsupported)} unsupported · ${formatNumber(day.missing)} missing · ${outcome}`;
+}
+
+function graphCheckpointSize(bytes) {
+  if (bytes < 1024) return `${formatNumber(bytes)} bytes`;
+  if (bytes < 1_048_576) return `${formatNumber(Math.round(bytes / 1024))} KiB`;
+  return `${formatNumber(Math.round(bytes / 1_048_576))} MiB`;
+}
+
+/** Lease remaining is measured against the read instant, not the page clock, so
+ * a stale panel keeps stating what was true when the payload was observed
+ * rather than counting a lease down against time it never saw. */
+function graphLeaseText(expiresAt, observedAt) {
+  const epoch = expiresAt === null ? Number.NaN : Date.parse(expiresAt);
+  const observed = Date.parse(observedAt);
+  if (!Number.isFinite(epoch) || !Number.isFinite(observed)) return "no lease recorded";
+  const remaining = epoch - observed;
+  return remaining <= 0
+    ? "lease expired at last read"
+    : `lease ${formatNumber(Math.ceil(remaining / 60_000))} min at last read`;
+}
+
+function renderGraphRebuild(progress, panel, badge, details) {
+  const { graph, work } = progress;
+  const { window, owners, currentFits, days, refusals, throughput, retirement } = graph;
+  const { selections, checkpoints } = graph.work;
+  panel.className = "admin-reconstruction admin-reconstruction-graph";
+  const heading = $("#admin-reconstruction-title");
+  if (heading) heading.textContent = "Graph rebuild";
+  badge.className = `admin-source-badge admin-source-${graph.work.state === "idle" ? "available" : "partial"}`;
+  badge.textContent = {
+    building: "Rebuilding", queued: "Waiting for a pass", idle: "Up to date",
+  }[graph.work.state];
+  const paragraph = (text, className) => {
+    const node = document.createElement("p");
+    node.textContent = text;
+    if (className) node.className = className;
+    return node;
+  };
+  const publishedDays = days.filter(day => day.published).length;
+  const completeDays = days.filter(day => !day.published && day.missing === 0).length;
+  const subtitle = paragraph(
+    `${formatNumber(publishedDays)} of ${formatNumber(window.days)} days published`
+    + ` · ${formatNumber(completeDays)} complete, awaiting publication`,
+    "admin-graph-subtitle",
+  );
+  const strip = document.createElement("div");
+  strip.className = "admin-graph-strip";
+  strip.setAttribute("role", "img");
+  const readout = document.createElement("ul");
+  readout.className = "admin-graph-readout sr-only";
+  const stateCounts = { published: 0, complete: 0, partial: 0, none: 0 };
+  // Oldest on the left, newest on the right; the contract orders days newest
+  // first, so the strip reverses the projected list rather than the source.
+  for (const day of [...days].reverse()) {
+    const dayState = graphDayState(day);
+    stateCounts[dayState] += 1;
+    const title = graphDayTitle(day);
+    const cell = document.createElement("span");
+    cell.className = `admin-graph-day admin-graph-day-${dayState}`;
+    cell.setAttribute("title", title);
+    cell.setAttribute("aria-hidden", "true");
+    strip.append(cell);
+    const item = document.createElement("li");
+    item.textContent = title;
+    readout.append(item);
+  }
+  strip.setAttribute("aria-label",
+    `${formatNumber(window.days)} days from ${window.from} to ${window.to}:`
+    + ` ${formatNumber(stateCounts.published)} published,`
+    + ` ${formatNumber(stateCounts.complete)} complete awaiting publication,`
+    + ` ${formatNumber(stateCounts.partial)} with some results,`
+    + ` ${formatNumber(stateCounts.none)} with no results yet`);
+  const legend = document.createElement("ul");
+  legend.className = "admin-graph-legend";
+  for (const [dayState, label] of Object.entries(GRAPH_DAY_STATE_LABELS)) {
+    const item = document.createElement("li");
+    const key = document.createElement("span");
+    key.className = `admin-graph-key admin-graph-day-${dayState}`;
+    key.setAttribute("aria-hidden", "true");
+    const text = document.createElement("span");
+    text.textContent = `${label} · ${formatNumber(stateCounts[dayState])}`;
+    item.append(key, text);
+    legend.append(item);
+  }
+  const grid = document.createElement("dl");
+  grid.className = "admin-reconstruction-grid admin-graph-grid";
+  const metric = (label, text) => {
+    const group = document.createElement("div");
+    const term = document.createElement("dt");
+    term.textContent = label;
+    const description = document.createElement("dd");
+    description.textContent = text;
+    group.append(term, description);
+    grid.append(group);
+    return group;
+  };
+  const fitsGroup = metric("Today's fits",
+    `${formatNumber(currentFits.ready)} ready · ${formatNumber(currentFits.noFit)} without a usable fit`
+    + ` · ${formatNumber(currentFits.missing)} missing of ${formatNumber(owners.active)} owners`);
+  fitsGroup.append(paragraph(`Current fits for ${currentFits.day}.`));
+  if (currentFits.missing > 0) {
+    fitsGroup.append(paragraph("A graph preview needs a result for every owner"));
+  }
+  const ownersGroup = metric("Owners", `${formatNumber(owners.active)} active`);
+  if (refusals.length === 0) {
+    ownersGroup.append(paragraph("No refusals recorded."));
+  } else {
+    const list = document.createElement("ul");
+    list.className = "admin-graph-refusals";
+    for (const refusal of refusals) {
+      const item = document.createElement("li");
+      item.textContent = "Model graph"
+        + ` · ${GRAPH_REFUSAL_LABELS[refusal.reason] ?? refusal.reason}`
+        + ` · ${formatNumber(refusal.owners)} ${refusal.owners === 1 ? "owner" : "owners"}`;
+      item.setAttribute("title", refusal.reason);
+      list.append(item);
+    }
+    ownersGroup.append(list);
+  }
+  const activity = graph.work.activeMetric === null
+    ? "Nothing claimed"
+    : graph.work.activeMetric === "fits"
+      ? "current fits"
+      : graph.work.activeDay === null
+        ? "model day not recorded"
+        : `model day ${graph.work.activeDay}`;
+  const activeGroup = metric("In progress", activity);
+  activeGroup.append(paragraph(`${graphLeaseText(graph.work.leaseExpiresAt, progress.generatedAt)}`
+    + ` · ${formatNumber(selections.pending)} selections pending`
+    + ` · ${formatNumber(selections.claimed)} claimed`));
+  activeGroup.append(paragraph(checkpoints === null
+    ? "checkpoints not counted"
+    : `${formatNumber(checkpoints.stages)} stages`
+      + ` · ${formatNumber(checkpoints.parts)} parts · ${graphCheckpointSize(checkpoints.bytes)}`));
+  if (checkpoints !== null && checkpoints.phases.length > 0) {
+    activeGroup.append(paragraph(`Checkpoint phases: ${checkpoints.phases
+      .map(phase => `${phase.phase} ${formatNumber(phase.stages)} stages, ${formatNumber(phase.parts)} parts`)
+      .join(" · ")}`));
+  }
+  const throughputGroup = metric("Throughput",
+    `${throughput.resultsLastHour === null
+      ? "results in the last hour not counted"
+      : `${formatNumber(throughput.resultsLastHour)} results in the last hour`}`
+    + ` · ${throughput.resultsLast6Hours === null
+      ? "6-hour total not counted"
+      : `${formatNumber(throughput.resultsLast6Hours)} in 6 h`}`);
+  throughputGroup.append(paragraph(`${formatNumber(throughput.remainingResults)} results remaining`));
+  throughputGroup.append(paragraph(throughput.estimatedHoursRemaining === null
+    ? "No recent-rate comparison yet."
+    : `At the last 6-hour rate, about ${formatNumber(throughput.estimatedHoursRemaining, { maximumFractionDigits: 1 })} h for the remaining result slots. This is not a completion forecast; staged work may finish unevenly.`));
+  const freshness = paragraph(`${state.reconstructionProgressFailed ? "Progress refresh unavailable. " : ""}Observed ${formatTime(progress.generatedAt)}${work.updatedAt === null ? "" : ` · work updated ${formatTime(work.updatedAt)}`}. Window ${window.from} to ${window.to}.`, "admin-reconstruction-freshness");
+  details.replaceChildren(subtitle, strip, readout, legend, grid,
+    ...(retirement.staleResults === null
+      ? [paragraph("retirement backlog not counted", "admin-graph-retirement")]
+      : retirement.staleResults > 0
+        ? [paragraph(`${formatNumber(retirement.staleResults)} retained intermediate results from an earlier calculation, not a published graph`,
+          "admin-graph-retirement")]
+        : []),
+    freshness);
+}
+
+// Two progress reads closer together than this say too little to show as movement.
+const PIPELINE_OBSERVATION_MIN_MILLISECONDS = 20_000;
+const PIPELINE_DAY = new Intl.DateTimeFormat(undefined, { timeZone: "UTC", month: "short", day: "numeric" });
+
+function pipelineDay(day) {
+  return PIPELINE_DAY.format(new Date(`${day}T00:00:00.000Z`));
+}
+
+function pipelineAge(instant, nowMs) {
+  const minutes = Math.max(0, Math.round((nowMs - Date.parse(instant)) / 60_000));
+  if (minutes < 1) return "just now";
+  if (minutes < 90) return `${formatNumber(minutes)} min ago`;
+  const hours = Math.round(minutes / 60);
+  return hours < 48 ? `${formatNumber(hours)} h ago` : `${formatNumber(Math.round(hours / 24))} days ago`;
+}
+
+function pipelineCard(label, value, lines, tone) {
+  const card = document.createElement("div");
+  card.className = `admin-card admin-metric admin-pipeline-stage admin-pipeline-${tone}`;
+  const number = document.createElement("strong");
+  number.textContent = value;
+  card.append(labelWithInfo(label), number, ...lines.filter(Boolean).map((line) => {
+    const caption = document.createElement("small");
+    caption.textContent = line;
+    return caption;
+  }));
+  return card;
+}
+
+/** Four stages from one progress read. Movement is only what this page saw
+ * between two reads of the same service, measured on the service's clock. */
+function renderPipeline(progress, { stale = false } = {}) {
+  if (!isAdminPage) return;
+  const stages = $("#pipeline-stages");
+  const badge = $("#pipeline-badge");
+  if (!stages || !badge) return;
+  const pipeline = progress?.schemaVersion === 3 ? progress.pipeline : undefined;
+  if (!pipeline) {
+    stages.replaceChildren();
+    state.pipelineObservation = null;
+    badge.textContent = progress && pipeline === null ? "Unavailable · the pipeline read failed"
+      : progress ? "Not reported by this service" : "Unavailable";
+    return;
+  }
+  const { ingestion, delivery, daily } = pipeline;
+  const nowMs = Date.parse(progress.generatedAt);
+  const current = delivery.current;
+  const currentKey = current ? `${current.fromDay}/${current.throughDay}` : null;
+  const previous = state.pipelineObservation;
+  let movement = null;
+  if (!stale && previous && nowMs - previous.atMs >= PIPELINE_OBSERVATION_MIN_MILLISECONDS
+      && delivery.appliedSequence >= previous.appliedSequence) {
+    const changes = delivery.appliedSequence - previous.appliedSequence;
+    const days = current && previous.currentKey === currentKey ? current.daysDone - previous.daysDone : null;
+    movement = `Since the read ${pipelineAge(new Date(previous.atMs).toISOString(), nowMs)}: +${countWith(changes, "change")}`
+      + (days !== null && days >= 0 ? `, +${countWith(days, "day")} folded` : "") + ".";
+  }
+  const waiting = daily.queuedDays > 0 && delivery.pendingChanges > 0 && daily.releasedLastHour === 0;
+  const cards = [
+    pipelineCard("Ingestion journal", formatNumber(ingestion.journalHead), [
+      "changes recorded",
+      ingestion.latestRecordedAt
+        ? `Latest ${formatReportingTime(ingestion.latestRecordedAt)} (${pipelineAge(ingestion.latestRecordedAt, nowMs)})`
+        : "No change recorded yet",
+    ], "clear"),
+    pipelineCard("Delivery into analytics",
+      delivery.pendingChanges === 0 ? "Caught up" : formatNumber(delivery.pendingChanges), [
+        delivery.pendingChanges === 0 ? `Applied through change ${formatNumber(delivery.appliedSequence)}`
+          : `${delivery.pendingChanges === 1 ? "change" : "changes"} behind · `
+            + `${countWith(delivery.pendingActivations, "device activation")}`,
+        current ? `Current device: ${formatNumber(current.daysDone)} of ${countWith(current.daysTotal, "day")} folded`
+          + ` (${pipelineDay(current.fromDay)} – ${pipelineDay(current.throughDay)})` : null,
+        movement,
+      ], delivery.pendingChanges === 0 ? "clear" : "busy"),
+    pipelineCard("Daily publication",
+      daily.queuedDays === 0 ? "Up to date" : formatNumber(daily.queuedDays), [
+        daily.queuedDays > 0 ? `${daily.queuedDays === 1 ? "day" : "days"} queued · `
+          + `${pipelineDay(daily.oldestQueuedDay)} – ${pipelineDay(daily.newestQueuedDay)}` : null,
+        daily.lastReleasedAt
+          ? `Last published ${formatReportingTime(daily.lastReleasedAt)} (${pipelineAge(daily.lastReleasedAt, nowMs)})`
+            + ` · ${formatNumber(daily.releasedLastHour)} in the last hour`
+          : "Nothing published yet",
+        waiting ? "Waiting for delivery: each day waits until every public owner's latest change is delivered." : null,
+      ], waiting ? "waiting" : daily.queuedDays === 0 ? "clear" : "busy"),
+  ];
+  const throughput = progress.graph?.throughput;
+  if (throughput) {
+    const count = (value) => value === null ? "not counted" : formatNumber(value);
+    cards.push(pipelineCard("Allowance graph",
+      throughput.remainingResults === 0 ? "Up to date" : formatNumber(throughput.remainingResults), [
+        `${throughput.remainingResults === 1 ? "result" : "results"} remaining · `
+          + `${count(throughput.resultsLastHour)} in the last hour · ${count(throughput.resultsLast6Hours)} in 6 h`,
+        "Full breakdown under Allowance diagnostics",
+      ], throughput.remainingResults === 0 ? "clear" : "busy"));
+  }
+  stages.replaceChildren(...cards);
+  badge.textContent = stale ? "Stale · the latest refresh failed"
+    : delivery.pendingChanges > 0 ? `Delivering · ${countWith(delivery.pendingChanges, "change")} behind`
+      : daily.queuedDays > 0 ? `Publishing · ${countWith(daily.queuedDays, "day")} queued` : "Caught up";
+  if (!stale) {
+    state.pipelineObservation = { atMs: nowMs, appliedSequence: delivery.appliedSequence, currentKey,
+      daysDone: current ? current.daysDone : 0 };
+  }
+}
+
 function renderCurrentReconstructionProgress() {
   const progress = state.reconstructionProgress;
   if (progress === null) {
@@ -3068,8 +3738,14 @@ function renderCurrentReconstructionProgress() {
   const badge = $("#admin-reconstruction-status");
   const details = $("#admin-reconstruction-details");
   if (!panel || !badge || !details) return;
+  if (progress.schemaVersion === 3 && progress.graph) {
+    renderGraphRebuild(progress, panel, badge, details);
+    return;
+  }
   const { publication, work, history } = progress;
   panel.className = "admin-reconstruction";
+  const heading = $("#admin-reconstruction-title");
+  if (heading) heading.textContent = "Graph reconstruction";
   badge.className = `admin-source-badge admin-source-${work.state === "unavailable" || work.state === "paused" ? "partial" : "available"}`;
   const workLabel = {
     idle: "Up to date", queued: "Update queued", building: "Updating",
@@ -3153,6 +3829,7 @@ function renderCurrentReconstructionProgress() {
 
 function render(overview) {
   state.overview = overview;
+  state.overviewUnavailable = false;
   const attention = renderAttention(overview);
   renderCounts(overview);
   renderQuarantine(overview);
@@ -3169,7 +3846,14 @@ function render(overview) {
 }
 
 function renderOverviewUnavailable() {
+  state.overviewUnavailable = true;
+  renderControlStatus();
   const hasPreviousData = state.overview !== null;
+  if (isAdminPage && hasPreviousData) {
+    const summary = $("#distribution-source-summary");
+    const stalePrefix = "Refresh failed — previous dated evidence. ";
+    if (!summary.textContent.startsWith(stalePrefix)) summary.textContent = stalePrefix + summary.textContent;
+  }
   if (state.reconstructionProgress === null) {
     renderReconstructionProgress(state.overview?.reconstruction, { stale: hasPreviousData });
   }
@@ -3195,6 +3879,11 @@ function refuseAdminAccess(error) {
   // successful response from before the refusal cannot restore private data.
   for (const lane of Object.values(adminReadLanes)) lane.invalidate();
   state.overview = null;
+  state.databaseHealth = null;
+  state.controlsDirty = false;
+  state.controlsRevision = null;
+  state.sourceHealth = { history: "unavailable", allowance: "unavailable", progress: "unavailable", database: "unavailable" };
+  renderDatabaseHealth();
   state.overviewReadSucceeded = false;
   state.metricsHistory = null;
   state.allowancePreview = null;
@@ -3202,9 +3891,14 @@ function refuseAdminAccess(error) {
   state.diagnosticLookup = null;
   state.diagnosticLookupGeneration += 1;
   state.auditRows = [];
+  if (isAdminPage) {
+    resetV11Adoption("Owner access is unavailable. Sign in again before previewing.");
+    renderPipeline(null);
+  }
   for (const id of [
     "counts", "quarantine-counts", "quarantine-status", "distribution-counts",
-    "distribution-version-rows", "distribution-source-status", "github-release-rows",
+    "distribution-version-rows", "distribution-total-rows", "distribution-source-status",
+    "distribution-source-summary", "distribution-estimate-note", "github-release-rows",
     "ingress-status", "lifecycle-status", "snapshot-rows", "error-groups",
     "recent-diagnostic-rows", "diagnostic-lookup", "audit-rows", "operator-attention",
   ]) $(`#${id}`)?.replaceChildren();
@@ -3220,6 +3914,21 @@ function refuseAdminAccess(error) {
 }
 
 const adminReadLanes = {
+  database: createAdminReadLane({
+    read: async ({ signal }) => projectAdminDatabaseHealth(await request("/api/v1/admin/database-health", { signal })),
+    publish: snapshot => {
+      state.databaseHealth = snapshot;
+      updateSourceHealth("database", "available");
+      renderDatabaseHealth();
+    },
+    failed: error => {
+      if (refuseAdminAccess(error)) return;
+      const retained = isTransientAdminReadError(error) && state.databaseHealth !== null;
+      if (!retained) state.databaseHealth = null;
+      updateSourceHealth("database", retained ? "stale" : "unavailable");
+      renderDatabaseHealth();
+    },
+  }),
   overview: createAdminReadLane({
     read: async ({ signal }) => projectAdminOverview(await request("/api/v1/admin/overview", { signal })),
     publish: overview => {
@@ -3239,29 +3948,39 @@ const adminReadLanes = {
   history: createAdminReadLane({
     read: async ({ signal }) => projectAdminMetricsHistory(await request("/api/v1/admin/metrics/history", { signal })),
     publish: history => {
-      if (JSON.stringify(history) === JSON.stringify(state.metricsHistory)) return;
+      const changed = JSON.stringify(history) !== JSON.stringify(state.metricsHistory);
       state.metricsHistory = history;
-      renderHistoryBackedSections();
+      if (changed) renderHistoryBackedSections();
+      updateSourceHealth("history", "available");
     },
     failed: error => {
       if (refuseAdminAccess(error)) return;
-      if (isTransientAdminReadError(error) && state.metricsHistory) return;
+      if (isTransientAdminReadError(error) && state.metricsHistory) {
+        updateSourceHealth("history", "stale");
+        return;
+      }
       state.metricsHistory = null;
       renderHistoryBackedSections();
+      updateSourceHealth("history", "unavailable");
     },
   }),
   allowance: createAdminReadLane({
     read: async ({ signal }) => projectAdminAllowancePreview(await request("/api/v1/admin/community/allowance-preview", { signal })),
     publish: preview => {
-      if (JSON.stringify(preview) === JSON.stringify(state.allowancePreview)) return;
+      const changed = JSON.stringify(preview) !== JSON.stringify(state.allowancePreview);
       state.allowancePreview = preview;
-      renderAdminCommunityAllowance(preview);
+      if (changed) renderAdminCommunityAllowance(preview);
+      updateSourceHealth("allowance", "available");
     },
     failed: error => {
       if (refuseAdminAccess(error)) return;
-      if (isTransientAdminReadError(error) && state.allowancePreview !== null) return;
+      if (isTransientAdminReadError(error) && state.allowancePreview !== null) {
+        updateSourceHealth("allowance", "stale");
+        return;
+      }
       state.allowancePreview = null;
       renderAdminCommunityAllowance(null);
+      updateSourceHealth("allowance", "unavailable");
     },
   }),
   progress: createAdminReadLane({
@@ -3269,21 +3988,26 @@ const adminReadLanes = {
     publish: progress => {
       state.reconstructionProgress = progress;
       state.reconstructionProgressFailed = false;
+      updateSourceHealth("progress", "available");
       if (progress.publication.state === "invalidated") {
         // A confirmed hard-invalidation floor failure, not ordinary queued
         // work. Fence an older in-flight preview before removing it.
         adminReadLanes.allowance.invalidate();
         state.allowancePreview = null;
         renderAdminCommunityAllowance(null);
+        updateSourceHealth("allowance", "unavailable");
       }
       renderCurrentReconstructionProgress();
+      renderPipeline(progress);
     },
     failed: error => {
       if (refuseAdminAccess(error)) return;
       state.reconstructionProgressFailed = true;
+      updateSourceHealth("progress", state.reconstructionProgress ? "stale" : "unavailable");
       // A failed progress read is not authority to remove a graph. Retain its
       // recorded timestamp; old Workers can still supply overview progress.
       if (state.reconstructionProgress !== null) renderCurrentReconstructionProgress();
+      renderPipeline(state.reconstructionProgress, { stale: true });
     },
   }),
 };
@@ -3301,7 +4025,10 @@ async function load() {
   const overviewRead = adminReadLanes.overview.run();
   void loadAdminCommunityAllowance();
   void loadGrowthHistory();
-  if (isAdminPage) void adminReadLanes.progress.run();
+  if (isAdminPage) {
+    void adminReadLanes.progress.run();
+    void adminReadLanes.database.run();
+  }
   try {
     // No app session on the admin host: authentication is Cloudflare Access and
     // the owner-email pin, and CSRF is the always-sent x-usage-monitor-admin
@@ -3322,14 +4049,17 @@ $("#diagnostic-form").addEventListener("submit", (event) => {
 });
 $("#controls-form").addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (!state.controlsDirty || !state.overview || state.overviewUnavailable || state.actionPending
+      || state.controlsRevision !== state.overview.collection.revision) return;
   const form = new FormData(event.currentTarget);
+  if (!beginAdminAction()) return;
   try {
     projectAdminAction(await request("/api/v1/admin/action", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         action: "set_collection_controls",
-        expectedRevision: state.overview?.collection?.revision,
+        expectedRevision: state.controlsRevision,
         enrollment: form.get("enrollment") === "on",
         uploadRegistration: form.get("uploadRegistration") === "on",
         processing: form.get("processing") === "on",
@@ -3337,13 +4067,95 @@ $("#controls-form").addEventListener("submit", async (event) => {
         reasonCode: form.get("reasonCode"),
       }),
     }), "set_collection_controls");
-    showNotice("Collection state saved and audited.", "info");
+    state.controlsDirty = false;
     await load();
+    if (!state.overviewUnavailable) showNotice("Collection state saved and audited.", "info");
   } catch (error) {
-    showNotice(`Collection state was not changed: ${adminActionErrorMessage(error)}`);
+    if (!refuseAdminAccess(error)) showNotice(`Collection-state save could not be confirmed: ${adminActionErrorMessage(error)}`);
+  } finally {
+    endAdminAction();
   }
 });
+function countWith(value, singular, plural = `${singular}s`) {
+  return `${formatNumber(value)} ${value === 1 ? singular : plural}`;
+}
+
+function resetV11Adoption(message) {
+  state.v11AdoptionPreview = null;
+  $("#apply-v11-adoption").textContent = "Activate previewed devices";
+  $("#v11-adoption-rows").replaceChildren();
+  $("#v11-adoption-summary").hidden = true;
+  $("#v11-adoption-status").textContent = message;
+}
+
+function renderV11AdoptionSummary(total) {
+  const headline = total.dryRun ? "adoptable" : "adopted";
+  const rows = [["Devices examined", total.examined]];
+  for (const [key, label] of V11_ADOPTION_ROWS) {
+    if (key === headline || total.outcomes[key] > 0) rows.push([label, total.outcomes[key]]);
+  }
+  for (const [code, value] of Object.entries(total.refusals)) rows.push([`Refusal ${code}`, value]);
+  rows.push(["Days covered", total.daysCovered], ["New days", total.newDays],
+    ["Accepted days kept", total.keptAcceptedDays]);
+  $("#v11-adoption-rows").replaceChildren(...rows.map(([label, value]) => {
+    const row = document.createElement("tr");
+    const name = document.createElement("th");
+    name.setAttribute("scope", "row");
+    name.textContent = label;
+    const cell = document.createElement("td");
+    cell.textContent = formatNumber(value);
+    row.append(name, cell);
+    return row;
+  }));
+  $("#v11-adoption-summary").hidden = false;
+}
+
+/** Pages through every candidate device. The service's cursor stays in this
+ * closure and is never rendered, stored or logged. What completed is returned
+ * even when a later page fails, so a partial activation is reported honestly. */
+async function runV11Adoption(dryRun, onProgress) {
+  const total = {
+    dryRun, pages: 0, examined: 0, truncated: false,
+    outcomes: Object.fromEntries(V11_ADOPTION_OUTCOMES.map((key) => [key, 0])),
+    refusals: {}, daysCovered: 0, newDays: 0, keptAcceptedDays: 0,
+  };
+  let after = null;
+  try {
+    do {
+      const page = projectV11EvidenceAdoption(await request("/api/v1/admin/action", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          action: "run_maintenance",
+          v11EvidenceAdoption: { dryRun, maxDevices: V11_ADOPTION_PAGE_SIZE, afterParticipantId: after },
+        }),
+      }), dryRun);
+      total.pages += 1;
+      total.examined += page.examined;
+      for (const key of V11_ADOPTION_OUTCOMES) total.outcomes[key] += page.outcomes[key];
+      for (const [code, value] of Object.entries(page.refusals)) {
+        total.refusals[code] = (total.refusals[code] ?? 0) + value;
+      }
+      total.daysCovered += page.daysCovered;
+      total.newDays += page.newDays;
+      total.keptAcceptedDays += page.keptAcceptedDays;
+      // The service pages by strictly increasing participant. Anything else
+      // would repeat or skip devices, so stop instead of following it.
+      if (page.nextAfterParticipantId !== null && after !== null && page.nextAfterParticipantId <= after) {
+        throw new AdminResponseError("ADMIN_ACTION_INVALID");
+      }
+      after = page.nextAfterParticipantId;
+      onProgress(total);
+      if (after !== null && total.pages >= V11_ADOPTION_MAX_PAGES) total.truncated = true;
+    } while (after !== null && !total.truncated);
+    return { total, error: null };
+  } catch (error) {
+    return { total, error };
+  }
+}
+
 $("#run-maintenance").addEventListener("click", async () => {
+  if (!beginAdminAction()) return;
   $("#run-maintenance").disabled = true;
   $("#maintenance-result").textContent = "Running bounded maintenance…";
   try {
@@ -3352,16 +4164,25 @@ $("#run-maintenance").addEventListener("click", async () => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ action: "run_maintenance" }),
     }), "run_maintenance");
-    $("#maintenance-result").textContent = `Completed: ${result.result.code}.`;
+    const presentation = maintenancePresentation("success", result.result);
+    $("#maintenance-result").textContent = `${presentation.result.label}: ${presentation.summary}`;
     await load();
   } catch (error) {
-    $("#maintenance-result").textContent = `Maintenance failed: ${adminActionErrorMessage(error)}`;
+    if (!refuseAdminAccess(error)) $("#maintenance-result").textContent = `Maintenance failed: ${adminActionErrorMessage(error)}`;
   } finally {
-    $("#run-maintenance").disabled = false;
+    endAdminAction();
   }
 });
 
 if (isAdminPage) {
+  $("#controls-form").addEventListener("change", () => {
+    state.controlsDirty = true;
+    renderControlStatus();
+  });
+  $("#discard-controls").addEventListener("click", () => {
+    state.controlsDirty = false;
+    if (state.overview) renderControls(state.overview.collection);
+  });
   $("#audit-previous").addEventListener("click", () => {
     state.auditPage -= 1;
     renderAuditPage();
@@ -3504,6 +4325,7 @@ if (isAdminPage) {
     $(selector)?.focus();
   });
   $("#sync-distribution").addEventListener("click", async () => {
+    if (!beginAdminAction()) return;
     const button = $("#sync-distribution");
     button.disabled = true;
     try {
@@ -3520,9 +4342,71 @@ if (isAdminPage) {
       );
       await load();
     } catch (error) {
-      showNotice(`GitHub release sync did not complete: ${adminActionErrorMessage(error)}`);
+      if (!refuseAdminAccess(error)) showNotice(`GitHub release sync did not complete: ${adminActionErrorMessage(error)}`);
     } finally {
-      button.disabled = false;
+      endAdminAction();
+    }
+  });
+  $("#preview-v11-adoption").addEventListener("click", async () => {
+    if (!beginAdminAction()) return;
+    resetV11Adoption("Previewing…");
+    try {
+      const { total, error } = await runV11Adoption(true, (progress) => {
+        $("#v11-adoption-status").textContent = `Previewing… ${countWith(progress.examined, "device")} examined.`;
+      });
+      if (error) {
+        if (!refuseAdminAccess(error)) {
+          resetV11Adoption(`Preview stopped: ${adminActionErrorMessage(error)}. Nothing was changed.`);
+        }
+        return;
+      }
+      const adoptable = total.outcomes.adoptable;
+      renderV11AdoptionSummary(total);
+      state.v11AdoptionPreview = { adoptable, at: Date.now() };
+      if (adoptable > 0) $("#apply-v11-adoption").textContent = `Activate ${countWith(adoptable, "device")}`;
+      $("#v11-adoption-status").textContent = [
+        adoptable > 0
+          ? `Preview: ${countWith(adoptable, "device")} can be activated, adding ${countWith(total.newDays, "new day")}.`
+          : "Preview: nothing to activate.",
+        total.truncated ? `The preview stopped after ${countWith(total.pages, "page")}.` : "",
+        "Nothing was changed.",
+      ].filter(Boolean).join(" ");
+    } finally {
+      endAdminAction();
+    }
+  });
+  $("#apply-v11-adoption").addEventListener("click", async () => {
+    if (!(state.v11AdoptionPreview?.adoptable > 0)) return;
+    if (Date.now() - state.v11AdoptionPreview.at > V11_ADOPTION_PREVIEW_TTL_MILLISECONDS) {
+      resetV11Adoption("The preview is more than 15 minutes old. Preview again before activating.");
+      renderControlStatus();
+      return;
+    }
+    if (!beginAdminAction()) return;
+    // One preview authorizes one activation; the service rechecks every device.
+    state.v11AdoptionPreview = null;
+    $("#apply-v11-adoption").textContent = "Activate previewed devices";
+    $("#v11-adoption-status").textContent = "Activating…";
+    try {
+      const { total, error } = await runV11Adoption(false, (progress) => {
+        $("#v11-adoption-status").textContent = `Activating… ${countWith(progress.outcomes.adopted, "device")} activated so far.`;
+      });
+      if (error && refuseAdminAccess(error)) return;
+      if (total.pages > 0) renderV11AdoptionSummary(total);
+      else $("#v11-adoption-summary").hidden = true;
+      const adopted = total.outcomes.adopted;
+      const refused = total.outcomes.refused;
+      const leftAlone = total.examined - adopted - refused;
+      $("#v11-adoption-status").textContent = [
+        error ? `Activation stopped after ${countWith(total.pages, "page")}: ${adminActionErrorMessage(error)}.` : "",
+        `Activated ${countWith(adopted, "device")}, adding ${countWith(total.newDays, "new day")}.`,
+        refused > 0 ? `${countWith(refused, "device")} refused by database checks.` : "",
+        leftAlone > 0 ? `${countWith(leftAlone, "examined device")} left unchanged; see the table.` : "",
+        error || total.truncated ? "Running it again is safe." : "",
+      ].filter(Boolean).join(" ");
+      await load();
+    } finally {
+      endAdminAction();
     }
   });
   document.addEventListener("visibilitychange", () => {

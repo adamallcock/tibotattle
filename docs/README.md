@@ -21,6 +21,12 @@ an informal archive.
 | Architecture | [System architecture](./reference/system-architecture.md) | Current components, trust boundaries, stores, identities, and data flow |
 | Privacy | [Local data, network, and privacy](./reference/local-data-and-privacy.md) | Exact source reads, local and hosted stores, Keychain, network, retention, deletion, and uninstall boundaries |
 | Electron sharing policy | [Accountless sharing defaults](./decisions/2026-09-04-accountless-sharing-policy.md) | Accepted fresh-install default-on and three-notice existing-install transition; persistent opt-out, no sign-in, and distinct source/release gates |
+| Electron crash doctor | [Opt-in crash capture and support doctor](./decisions/2026-09-21-opt-in-crash-doctor.md) | Reviewed support projection, off-by-default local macOS Crashpad capture, and explicit owner-only private evidence export; no automatic upload or installed-release claim |
+| Electron refresh resilience | [Observable self-healing refresh leases](./decisions/2026-09-21-electron-refresh-resilience.md) | Accepted renderer/preload/IPC lease, heartbeat, watchdog, live-freshness and content-free diagnostics contract; source and release evidence remain separate |
+| Electron startup status | [Start-at-login status and refresh](./decisions/2026-09-21-electron-start-at-login-status.md) | Accepted source behavior for automatic status reads, error retry, and exact Linux XDG ownership; installed-platform qualification remains separate |
+| Public contribution sources | [Shared public community sample](./decisions/2026-09-11-public-contribution-sources.md) | Accepted inclusion of durable accountless sources in current public calculations; source identity, withdrawal, suppression, and activation gates |
+| Published graph continuity | [Published analytics remain visible during recalculation](./decisions/2026-09-16-published-analytics-continuity.md) | Accepted last-completed-result and atomic replacement contract; ordinary input changes queue work without withdrawing published days; implemented by analytics migration 0018 and the last-good publication readers, deployment tracked separately |
+| Opt-out retention | [Opt-out stops future uploads](./decisions/2026-09-15-opt-out-stops-future-uploads.md) | Accepted separation of future upload permission from retained-history eligibility and published graph continuity; implementation and deployment tracked separately |
 | Hosted erasure | [Self-service deletion retirement](./decisions/2026-08-30-self-service-deletion-retirement.md) | Accepted source contract: confirmed device disconnect, private owner erasure, and retained restore safeguards; not deployment evidence |
 | Calibration semantics | [Composition-aware expected-line contract](./design/composition-aware-expected-line.md) | Maintained model-mix, saturation, reset, and lineage carry-forward interpretation; not a provider capacity claim |
 | APIs | [API and integration surface](./reference/api-surface.md) | Stable entry point for the source-checked HTTP, native, process, package, schema, binding, and external-service inventory |
@@ -32,15 +38,17 @@ an informal archive.
 | Local index | [Unified local index schema](./reference/unified-index-schema.md) | Current schema family, physical/parser versions, tables, generation, and migration rules; includes the accepted schema-11 cleanup indexes |
 | Local recovery | [Unified index preservation and recovery](./runbooks/unified-index-recovery.md) | Preservation-first diagnosis and candidate rebuild; never relabel or destroy the only index |
 | Sidebar recovery | [Collapsed dashboard sidebar rescue](./runbooks/sidebar-stranded-collapsed-rescue.md) | Current 0.1.16 recovery for persisted collapsed navigation; removes only exact window-geometry defaults |
-| Platform support | [Platform support and qualification](./reference/platform-support.md) | Released Electron 0.1.22 across four targets, exact artifact assurances and owner-accepted physical limits |
+| Platform support | [Platform support and qualification](./reference/platform-support.md) | Released Electron 0.1.26 across four targets, exact artifact assurances and the accepted Linux physical-test gap |
 | Production | [Production service operations](./runbooks/production-operations.md) | Read-only observation, deploy/migration gates, private owner erasure, containment, rollback, and recovery boundaries |
+| Telemetry activation | [Protected telemetry runtime activation](./runbooks/2026-09-22-telemetry-runtime-activation.md) | Migration, reconciliation, deploy, post-deploy verification, and owner-only independent usage/performance activation |
 | Community diagnostics | [Community allowance-band diagnosis](./runbooks/2026-08-13-community-allowance-band-diagnosis.md) | Current fit-cache and aggregate diagnosis; production writes remain owner-run |
+| Contribution diagnosis | [Contribution completion funnel](./runbooks/2026-09-22-contribution-completion-funnel.md) | Aggregate-only receipt, activation, projection and publication queries; schema-qualified, read-only plans |
 | Retired hosted APIs | [Hosted API retirement data gates](./runbooks/2026-08-27-hosted-api-retirement-data-gates.md) | Owner-run read-only D1 checks required before any future deletion of data retained after source-route retirement |
 | Release verification | [Verify a TiboTattle release](./verify-release.md) | User-facing checksum, native trust, manifest, and evidence verification |
 | Release trust | [Cross-platform release trust](./decisions/2026-08-18-cross-platform-release-trust.md) | Common evidence decision and artifact-specific native trust requirements |
 | Release publication | [Cross-platform release publication](./runbooks/2026-08-18-cross-platform-release-publication.md) | Activation-gated multi-platform evidence and immutable publication order; not a support claim |
-| macOS release | [macOS stable release](./runbooks/macos-stable-release-runbook.md) | Canonical build, signing, notarization, Sparkle, Homebrew, website, and GitHub release sequence |
-| Agent release tooling | [Agent release operations](./runbooks/agent-release-operations.md) | Read-only doctor/status, native phase resume, shared production ownership and explicit recovery; not publication authorization |
+| macOS release | [macOS Electron release and native upgrade feeds](./runbooks/macos-stable-release-runbook.md) | Installed transition qualification, both retained Sparkle feeds and exact-byte publication gates |
+| Production operation recovery | [Production operation ownership](./runbooks/agent-release-operations.md) | Shared production ownership and explicit recovery; not publication authorization |
 | Publication reconciliation | [Exact release publication](./runbooks/release-publication-reconciliation.md) | Manifest-driven GitHub, ARM/Intel feeds, tap and website reconciliation; writes require explicit authorization |
 | Early release qualification | [Synthetic admission and evidence reuse](./runbooks/release-qualification-admission.md) | Reviewed local proof cache and owning test lanes; not R7 or installed-app qualification |
 | Migration rehearsal | [Release migration rehearsal](./runbooks/release-migration-rehearsal.md) | Deployed-prefix observation, populated synthetic upgrades and separately gated disposable remote syntax checks |
@@ -48,7 +56,7 @@ an informal archive.
 | macOS distribution | [Homebrew distribution and macOS support](./decisions/2026-08-15-homebrew-distribution-and-macos-support.md) | First-party tap, uninstall boundary, and supported macOS floor |
 | Public-site preview | [Public site local preview](./runbooks/2026-08-17-public-site-local-preview.md) | Maintained local rendering/inspection path; not deployment proof |
 | Web-only release | [Web-only release](./runbooks/2026-08-17-web-only-release.md) | Maintained website publication lane and its release boundaries |
-| Windows readiness | [Windows portability environments](./runbooks/2026-08-17-windows-portability-environments.md) | Development/qualification environments only; Windows remains unsupported |
+| Windows readiness | [Windows portability environments](./runbooks/2026-08-17-windows-portability-environments.md) | Development/qualification environments only; current release support is defined by the platform authority |
 | R7 evidence | [R7 release-evidence receipt maintenance](./runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md) | Staleness rule and protected dual-runtime regeneration; not a routine documentation check |
 
 ## Lifecycle evidence

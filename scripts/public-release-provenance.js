@@ -102,7 +102,11 @@ export async function verifyPublicReleaseSourceProvenance({
   expectedSourceCommit,
   provenance,
   requiredRoot = "apps/web/public",
+  sourceReader = null,
 }) {
+  if (sourceReader !== null && typeof sourceReader !== "function") {
+    throw new TypeError("Public release provenance source reader is invalid");
+  }
   if (typeof expectedSourceCommit !== "string"
       || !PUBLIC_RELEASE_SOURCE_COMMIT_PATTERN.test(expectedSourceCommit)) {
     throw new TypeError("Expected public release source commit is invalid");
@@ -141,12 +145,27 @@ export async function verifyPublicReleaseSourceProvenance({
     if (!pathWithin(sourceRoot, sourcePath)) {
       throw new TypeError("Generated public release provenance escaped its source root");
     }
-    const digest = await digestRegularFile(
-      sourcePath,
-      `Public release provenance source ${row.path}`,
-      null,
-      sourceRoot,
-    );
+    const digest = sourceReader === null
+      ? await digestRegularFile(
+        sourcePath,
+        `Public release provenance source ${row.path}`,
+        null,
+        sourceRoot,
+      )
+      : await sourceReader({
+        repositoryRoot: resolve(repositoryRoot),
+        sourceRoot,
+        sourcePath,
+        path: row.path,
+      });
+    if (digest === null || typeof digest !== "object"
+        || !Number.isSafeInteger(digest.bytes)
+        || digest.bytes < 1
+        || !/^[a-f0-9]{64}$/u.test(digest.sha256)) {
+      throw new TypeError(
+        "Public release provenance source reader returned an invalid digest",
+      );
+    }
     if (digest.bytes !== row.bytes || digest.sha256 !== row.sha256) {
       throw new TypeError(
         `Generated public release provenance does not match the source snapshot: ${row.path}`,

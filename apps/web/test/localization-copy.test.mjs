@@ -15,6 +15,20 @@ import {
   translateLegacyText,
 } from "../public/localization.js";
 
+test("every explicit dashboard translation key resolves through the browser catalog", async () => {
+  const markup = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  const keys = new Set([...markup.matchAll(/data-i18n(?:-(?:aria-label|alt|title|placeholder))?="([^"]+)"/gu)]
+    .map(match => match[1]));
+  assert.ok(keys.size > 0);
+  for (const key of keys) {
+    for (const locale of SUPPORTED_LOCALES) {
+      const copy = translate(key, {}, locale);
+      assert.ok(copy.trim().length > 0, `${locale}: ${key}`);
+      assert.notEqual(copy, key, `${locale}: ${key} must not leak into the rendered dashboard`);
+    }
+  }
+});
+
 test("unavailable fitted-rate copy follows the weekly calibration contract", async () => {
   const contractSource = await readFile(
     new URL("../../../src/reporting/weekly-calibration.js", import.meta.url),
@@ -118,5 +132,16 @@ test("accounting period history labels preserve three-locale parity", () => {
       expected,
       key,
     );
+  }
+});
+
+test("dashboard and translation copy never recommends blanket Keychain approval", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  const blanketApproval = /Always Allow|Permitir siempre|始终允许/iu;
+  assert.doesNotMatch(appSource, blanketApproval);
+  assert.doesNotMatch(html, blanketApproval);
+  for (const [english, translations] of Object.entries(LEGACY_TEXT_CATALOG)) {
+    for (const copy of [english, ...translations]) assert.doesNotMatch(copy, blanketApproval);
   }
 });

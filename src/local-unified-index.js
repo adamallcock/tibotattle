@@ -135,7 +135,18 @@ export const LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION =
 // assumption of zero when input/cache-read counters are valid and consistent.
 // A per-event suffix retains the assumption; raw delta/replay counters do not
 // change. The base cursor stamp forces historical sources to be reparsed.
-export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v16";
+// v17 (2026-09-21): retain exact selected input/output totals in the existing
+// total columns. Reject contradictory totals without inventing missing splits.
+// Replay identity, additive components, and boundary semantics are unchanged.
+// v18 (2026-09-22): classify bounded records by structural envelope type,
+// not nested accounting markers, and raise the default line cap to 512 KiB.
+// Reparse present sources, including quarantined lineage; retained absent
+// sources keep their original facts and parser provenance.
+// v19 (2026-09-29): reclassify retained GPT-6.1 Sol declarations through the
+// reviewed catalog and retain explicit turn-context service tiers. Present
+// sources are reparsed, while absent sources retain
+// their original unknown identity and provenance. Physical schema is unchanged.
+export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v19";
 export const LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION =
   "codex-immutable-rollout-v1";
 
@@ -146,14 +157,32 @@ export const LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION =
 // degraded row is recorded. Kept in lockstep with the main constant: salvaged
 // rows run the same delta derivation.
 export const LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION =
-  "unified-rollout-typed-v16-partial";
+  "unified-rollout-typed-v19-partial";
 
 // Per-row provenance variants retain the inherited-model assumption without
-// changing the physical schema. Ingest cursors keep the base v16 stamp.
+// changing the physical schema. Ingest cursors keep the base v19 stamp.
 export const LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION =
-  "unified-rollout-typed-v16-parent-model";
+  "unified-rollout-typed-v19-parent-model";
 export const LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION =
-  "unified-rollout-typed-v16-parent-model-partial";
+  "unified-rollout-typed-v19-parent-model-partial";
+
+// Cache continuity and dormant successor preparation both accept these exact
+// row-level provenance variants. Keep the reviewed v15-v18 families readable after a
+// v19 reparse; future parser labels remain unsupported until their semantics
+// are reviewed explicitly.
+const QUALIFIED_LOCAL_PARSER_VERSIONS = new Set([
+  ...["unified-rollout-typed-v15", "unified-rollout-typed-v16", "unified-rollout-typed-v17", "unified-rollout-typed-v18"].flatMap((version) =>
+    [version, `${version}-partial`, `${version}-parent-model`, `${version}-parent-model-partial`]),
+  LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION,
+].flatMap((version) => version.startsWith("unified-rollout-typed-v15")
+  ? [version] : [version, `${version}-cache-write-zero`]));
+
+export function isLocalUnifiedIndexBoundaryParserVersion(value) {
+  return QUALIFIED_LOCAL_PARSER_VERSIONS.has(value);
+}
 
 export const LOCAL_UNIFIED_INDEX_APPLICATION_ID = 0x554d5549;
 const INDEX_APPLICATION_ID = LOCAL_UNIFIED_INDEX_APPLICATION_ID;
@@ -1878,6 +1907,65 @@ export function readUnifiedIndexGenerationDescriptor(database, generationId = nu
     toolFactFingerprint: row.tool_fact_fingerprint ?? null,
     toolProvenanceComplete: Number(row.tool_provenance_complete) === 1,
   };
+}
+
+/**
+ * Run one asynchronous reader against one stable, read-only publication.
+ *
+ * The callback owns the connection until its promise settles. It must not
+ * commit or roll back the transaction; the helper rolls the transaction back
+ * on every exit and closes the connection afterwards. A caller may provide an
+ * open-failure handler when it has a more specific missing/unavailable
+ * envelope to preserve. That handler runs only when opening the connection
+ * fails; descriptor, callback, cancellation and cleanup failures are left to
+ * the caller.
+ */
+export async function withReadOnlyUnifiedIndex(
+  indexFile,
+  callback,
+  { openIndex = openLocalUnifiedIndex, onOpenFailure = null } = {},
+) {
+  if (typeof callback !== "function") {
+    throw new TypeError("read-only unified-index callback must be a function");
+  }
+  if (typeof openIndex !== "function") {
+    throw new TypeError("read-only unified-index opener must be a function");
+  }
+  if (onOpenFailure !== null && typeof onOpenFailure !== "function") {
+    throw new TypeError("read-only unified-index open-failure handler must be a function");
+  }
+
+  let database;
+  let primaryFailure = false;
+  try {
+    try {
+      database = openIndex(indexFile, { readOnly: true });
+    } catch (error) {
+      if (onOpenFailure !== null) return await onOpenFailure(error);
+      throw error;
+    }
+    database.exec("BEGIN");
+    const generation = readUnifiedIndexGenerationDescriptor(database);
+    return await callback({ database, generation });
+  } catch (error) {
+    primaryFailure = true;
+    throw error;
+  } finally {
+    let cleanupError = null;
+    if (database && database.isOpen !== false) {
+      try {
+        database.exec("ROLLBACK");
+      } catch (error) {
+        cleanupError = error;
+      }
+      try {
+        database.close();
+      } catch (error) {
+        cleanupError ??= error;
+      }
+    }
+    if (!primaryFailure && cleanupError !== null) throw cleanupError;
+  }
 }
 
 /**

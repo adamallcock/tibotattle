@@ -57,20 +57,21 @@ describe("public allowance breakdown allowlist", () => {
   it("publishes approved single-account dollars/counts without private admin diagnostics", () => {
     const projected = projectPublicAllowanceBreakdowns(cacheRow(), OPTIONS);
     expect(projected).toEqual({
-      schemaVersion: "community-allowance-breakdowns-v1.1",
+      schemaVersion: "community-allowance-breakdowns-v1.2",
       basis: COMMUNITY_ALLOWANCE_BASIS,
       referencePlanType: "pro",
-      normalization: "pro_x1_prolite_x4_plus_x20",
+      normalization: "pro_x1_prolite_x2_promax_x0_4_plus_x10",
       modelBasis: ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS,
       modelGate: ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE,
       generatedAt: new Date(NOW).toISOString(),
       days: [{
         day: YESTERDAY,
-        combined: { centralUsd: 1_200, participantCount: 2, fitCount: 2, band80Usd: null },
+        combined: { centralUsd: 900, participantCount: 2, fitCount: 2, band80Usd: null },
         byPlanType: {
           pro: { centralUsd: 1_200, participantCount: 1, fitCount: 1, band80Usd: null },
           prolite: { centralUsd: null, participantCount: 0, fitCount: 0, band80Usd: null },
-          plus: { centralUsd: 1_200, participantCount: 1, fitCount: 1, band80Usd: null },
+          promax: { centralUsd: null, participantCount: 0, fitCount: 0, band80Usd: null },
+          plus: { centralUsd: 600, participantCount: 1, fitCount: 1, band80Usd: null },
         },
         models: [["gpt-6-astra", 1_166, 1]],
       }],

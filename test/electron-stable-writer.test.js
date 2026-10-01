@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, readFile, rm, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -17,6 +18,15 @@ async function fixture(run, { predecessors = false } = {}) {
   const proposal = { schemaVersion: 'tibotattle-electron-stable-publication-v1', sourceRevision: 'a'.repeat(40), version: RELEASE_VERSION, buildNumber: '2026091001', targets: [] };
   const put = async (path, value) => { const bytes = Buffer.from(value); await writeFile(join(root, path), bytes); return { path, ...fingerprint(bytes) }; };
   try {
+    await mkdir(join(root, 'release-notes'));
+    await put('package.json', JSON.stringify({ version: RELEASE_VERSION }));
+    await put(`release-notes/${RELEASE_VERSION}.md`, '# Synthetic release\n');
+    await put('CHANGELOG.md', `# Changelog\n\n## Provenance and acknowledgements\n\nSynthetic fixture.\n\n## [Unreleased]\n\n## [${RELEASE_VERSION}](./release-notes/${RELEASE_VERSION}.md) - 2026-09-11\n\n**Provenance:** https://github.com/adamallcock/tibotattle/releases/tag/v${RELEASE_VERSION}\nhttps://github.com/adamallcock/tibotattle/tree/v${RELEASE_VERSION}\nhttps://github.com/adamallcock/tibotattle/commits/v${RELEASE_VERSION}\n`);
+    const git = args => execFileSync('git', ['-c', 'user.name=Synthetic Release', '-c', 'user.email=release@example.invalid', ...args], { cwd: root, stdio: 'pipe' });
+    git(['init', '--quiet']);
+    git(['add', 'package.json', 'CHANGELOG.md', 'release-notes']);
+    git(['-c', 'commit.gpgsign=false', 'commit', '--quiet', '-m', 'Synthetic release documentation']);
+    git(['-c', 'tag.gpgsign=false', 'tag', '-a', `v${RELEASE_VERSION}`, '-m', 'Synthetic stable tag']);
     for (const target of STABLE_TARGETS) {
       await mkdir(join(root, target)); const spec = distribution.PRODUCTION_ELECTRON_TARGETS[target];
       const source = productionElectronCandidatePlan({ target, sourceRevision: proposal.sourceRevision, buildNumber: proposal.buildNumber, hostPlatform: spec.platform, hostArchitecture: spec.architecture });
@@ -43,7 +53,7 @@ async function fixture(run, { predecessors = false } = {}) {
     const objects = new Map(), calls = [], owner = 'b'.repeat(40);
     if (predecessors) for (const target of plan.targets) objects.set(target.feed.objectKey, { ...target.feed, bytes: await readFile(join(root, target.predecessor.localPath)) });
     let ownership = true;
-    const options = { artifactRoot: root, proposal, operationDirectory, approvedPlanSha256: identityDigest(plan), coordinationOwner: owner,
+    const options = { artifactRoot: root, proposal, operationDirectory, approvedPlanSha256: identityDigest(plan), coordinationOwner: owner, repositoryRoot: root,
       coordination: { assertOwned: value => { assert.equal(value, owner); if (!ownership) throw new Error('ownership lost'); } },
       transport: {
         get: async (bucket, key) => { calls.push(['get', key]); return objects.has(key) ? fingerprint(objects.get(key).bytes) : null; },
@@ -75,6 +85,28 @@ test('publication verifies all immutable artifacts before feeds; explicit rollba
 test('wrong approved digest and lost ownership dispatch nothing', async () => fixture(async ({ options, calls, loseOwnership }) => {
   await assert.rejects(publishElectronStableFeed({ ...options, approvedPlanSha256: 'f'.repeat(64) }), /APPROVED_PLAN_CHANGED/);
   loseOwnership(); await assert.rejects(publishElectronStableFeed(options), /ownership lost/); assert.equal(calls.length, 0);
+}));
+test('missing release notes or changelog refuses before publication state or remote I/O', async t => {
+  for (const file of [`release-notes/${RELEASE_VERSION}.md`, 'CHANGELOG.md']) await t.test(file, async () => fixture(async ({ root, options, calls, readJournal }) => {
+    await rm(join(root, file));
+    await assert.rejects(publishElectronStableFeed(options), /RELEASE_DOCUMENTATION_INVALID/);
+    assert.deepEqual(calls, []);
+    assert.equal((await readJournal()).state.writer, undefined);
+  }));
+});
+test('an untagged documented candidate cannot publish the stable feed', async () => fixture(async ({ root, options, calls, readJournal }) => {
+  execFileSync('git', ['tag', '-d', `v${RELEASE_VERSION}`], { cwd: root, stdio: 'pipe' });
+  await writeFile(join(root, 'CHANGELOG.md'), `# Changelog\n\n## Provenance and acknowledgements\n\nSynthetic fixture.\n\n## [Unreleased]\n\n**Candidate notes:** [${RELEASE_VERSION}](./release-notes/${RELEASE_VERSION}.md)\n`);
+  await assert.rejects(publishElectronStableFeed(options), /RELEASE_DOCUMENTATION_INVALID/);
+  assert.deepEqual(calls, []);
+  assert.equal((await readJournal()).state.writer, undefined);
+}));
+test('documentation drift cannot block an explicitly owned rollback', async () => fixture(async ({ root, options, plan, objects }) => {
+  await publishElectronStableFeed(options);
+  await rm(join(root, `release-notes/${RELEASE_VERSION}.md`));
+  const result = await publishElectronStableFeed({ ...options, phase: 'rollback' });
+  assert.equal(result.status, 'completed');
+  assert.equal(objects.size, plan.targets.flatMap(t => t.artifacts).length);
 }));
 test('immutable collision refuses and leaves every feed unchanged', async () => fixture(async ({ options, plan, objects, calls }) => {
   objects.set(plan.targets[0].artifacts[0].objectKey, { bytes: Buffer.from('conflict') });

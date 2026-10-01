@@ -148,6 +148,35 @@ test("v1.1 requires an explicit exact destination-bound approval and survives co
   await restarted.controller.stop();
 });
 
+test("v1.2 requires an explicit exact destination-bound approval and survives controller restart", async () => {
+  const seen = [];
+  const runner = async ({ consent }) => { seen.push(consent); return runOutcome(); };
+  const first = harness({ runner });
+  await first.controller.start();
+  await first.controller.approve();
+  await first.controller.runDue();
+  assert.equal(seen[0].telemetrySchemaVersion, "telemetry-contribution-v1.0");
+  const consent = incrementalContributionRequiredConsent({ destinationOrigin: ORIGIN,
+    telemetrySchemaVersion: "telemetry-contribution-v1.2" });
+  for (const invalid of [
+    { ...consent, destinationOrigin: "https://other.example" },
+    { ...consent, fieldDictionaryVersion: "telemetry-v1.0-registry-2026-08-07.1" },
+    { ...consent, consentedAt: first.nowIso() },
+  ]) await assert.rejects(first.controller.approve({ consent: invalid }), { code: "incremental_contribution_consent_unavailable" });
+  assert.equal((await first.controller.inspect()).contractVersion, "telemetry-contribution-v1.0");
+  const approved = await first.controller.approve({ consent });
+  assert.equal(approved.contractVersion, "telemetry-contribution-v1.2");
+  assert.equal(approved.progress, null, "old v1 acknowledged days are not v1.2 activation evidence");
+  await first.controller.stop();
+  const restarted = harness({ storage: first.storage, runner });
+  await restarted.controller.start();
+  assert.equal((await restarted.controller.inspect()).consent.current, true);
+  await restarted.controller.runDue();
+  assert.deepEqual(seen[1], consent);
+  assert.equal(Object.isFrozen(seen[1]), true);
+  await restarted.controller.stop();
+});
+
 test("approval records the exact v1.0 consent once and syncing runs without further action", async () => {
   const { controller, storage, runs, advance, nowIso } = harness();
   await controller.start();

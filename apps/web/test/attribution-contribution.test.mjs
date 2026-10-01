@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { createContext, runInContext } from "node:vm";
 import test from "node:test";
-import { telemetryV11FieldInventory } from "../../../src/contribution/index.js";
+import { telemetryV11FieldInventory, telemetryV12FieldInventory } from "../../../src/contribution/index.js";
 import { normalizeAttributionContributionReview, normalizeIncrementalContributionSyncStatus, CommunityClient } from "../public/data-client.js";
 import { WEB_MESSAGES, translate } from "../public/localization.js";
 
@@ -59,4 +59,14 @@ test("all attribution approval copy has explicit English, Chinese and Spanish me
     assert.equal(WEB_MESSAGES[key]?.length, 3, key);
     assert.ok(WEB_MESSAGES[key].every((message) => message.length > 0), key);
   }
+});
+
+test("successor review validates the exact v1.2 contract", () => {
+  const inventory = telemetryV12FieldInventory();
+  const source = { ...payload(), schemaVersion: "local-incremental-contribution-review-v1.2", inventory,
+    consent: { ...inventory.consent, destinationOrigin: "https://telemetry.example" } };
+  const review = normalizeAttributionContributionReview(source);
+  assert.equal(review.consent.telemetrySchemaVersion, "telemetry-contribution-v1.2");
+  assert.ok(review.inventory.fields.usage.includes("boundaryFlags"));
+  assert.equal(normalizeAttributionContributionReview({ ...source, consent: payload().consent }), null);
 });

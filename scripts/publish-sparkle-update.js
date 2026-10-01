@@ -419,6 +419,29 @@ function readAppcastAtomicGuardToken(envName) {
   return normalizeAppcastAtomicGuardToken(value);
 }
 
+// Multi-target callers retain this private guard, not the credential or its
+// environment variable. Standalone publication keeps its one-call behavior.
+export function createAppcastAtomicGuardFromEnvironment({
+  channel = "stable",
+  architecture = "arm64",
+  endpoint,
+  tokenEnv = APPCAST_ATOMIC_GUARD_TOKEN_ENV,
+  fetchGuard = defaultPublicFetch,
+} = {}) {
+  const releaseChannel = resolveReleaseChannel(channel, { architecture });
+  const normalizedEndpoint = normalizeAppcastAtomicGuardEndpoint(endpoint, releaseChannel);
+  const normalizedTokenEnv = normalizeAppcastAtomicGuardTokenEnv(tokenEnv);
+  if (normalizedEndpoint === null || normalizedTokenEnv === null || typeof fetchGuard !== "function") {
+    fail("Remote appcast guard options are required", "SPARKLE_UPDATE_ATOMIC_GUARD_OPTIONS_REQUIRED");
+  }
+  return Object.freeze(createRemoteAppcastAtomicGuard({
+    channel: releaseChannel,
+    endpoint: normalizedEndpoint,
+    token: readAppcastAtomicGuardToken(normalizedTokenEnv),
+    fetchGuard,
+  }));
+}
+
 async function readRegularInput(path, { label, maximumBytes }) {
   const selected = resolve(requiredOption(path, label));
   const metadata = await lstat(selected).catch((error) => {

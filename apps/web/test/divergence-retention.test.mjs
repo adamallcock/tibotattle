@@ -3,8 +3,10 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
 const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
 const start = source.indexOf("let nextDivergenceBreakdownId = 0;");
-const end = source.indexOf("// A tick label's resolution", start);
+const end = source.indexOf("\n/**\n * Whether a series draws its data points", start);
 assert.ok(start >= 0 && end > start);
 
 function deferred() {
@@ -47,9 +49,13 @@ function harness() {
     focus() { document.activeElement = this; }
     get textContent() { return this.text + this.children.map((child) => child.textContent).join(""); }
   }
-  const elements = new Map(["list", "empty", "summary", "caveat"]
+  const elements = new Map([
+    "list", "empty", "summary", "caveat", "pagination", "page-status",
+    "page-prev", "page-next",
+  ]
     .map((key) => [`#divergence-${key}`, new Element("div")]));
   const requests = [];
+  const focusedPeriods = [];
   const node = (...args) => new Element(...args);
   const translate = (key, values = {}) => `${key} ${Object.values(values).join(" ")}`;
   const dependencies = {
@@ -61,6 +67,7 @@ function harness() {
     $: (id) => elements.get(id), t: translate,
     detectDeviationPeriods: (periods) => ({ periods, totalFound: periods.length }),
     accountingPeriod: () => null,
+    focusTrendsPeriod: period => focusedPeriods.push(period),
     localClient: { windowBreakdown(from, to) {
       const request = { from, to, ...deferred() }; requests.push(request); return request.promise;
     } },
@@ -69,13 +76,35 @@ function harness() {
     "formatSignedPp", "formatSignedPpHours", "formatApiMoney", "compact",
     "formatPercent", "formatNumber", "formatModelName"]) dependencies[name] = String;
   const api = Function(...Object.keys(dependencies), `${source.slice(start, end)}
-    return { render: renderDivergencePeriods, state: divergenceDetails };`
+    return {
+      render: renderDivergencePeriods,
+      state: divergenceDetails,
+      next() { divergenceTablePage += 1; renderDivergencePeriodPage(); },
+      previous() { divergenceTablePage -= 1; renderDivergencePeriodPage(); },
+    };`
   )(...Object.values(dependencies));
-  return { ...api, requests, document,
+  return { ...api, requests, document, focusedPeriods,
+    element: (id) => elements.get(id),
+    card: () => elements.get("#divergence-list").children[0],
     toggle: () => elements.get("#divergence-list").children[0].children.at(-2),
     panel: () => elements.get("#divergence-list").children[0].children.at(-1),
   };
 }
+
+test("divergence cards lead with the signed peak gap and focus the exact period without fetching details", () => {
+  for (const direction of ["under_costed", "over_costed"]) {
+    const h = harness(), selected = { ...period(), direction, peakDriftPp: direction === "under_costed" ? 2 : -2 };
+    h.render(snapshot(), [selected]);
+    const card = h.card();
+    assert.equal(card.children[1].children[0].textContent, String(selected.peakDriftPp));
+    assert.match(card.children[1].getAttribute("title"), /trends.gapExplanation/);
+    assert.match(card.children[2].textContent, direction === "under_costed" ? /trends.faster/ : /trends.slower/);
+    card.children.find(child => child.className.includes("divergence-focus")).click();
+    assert.deepEqual(h.focusedPeriods, [selected]);
+    assert.equal(h.requests.length, 0);
+    assert.equal(h.panel().hidden, true);
+  }
+});
 
 test("expanded details and keyboard focus survive unchanged snapshots without another request", async () => {
   const h = harness();
@@ -89,6 +118,40 @@ test("expanded details and keyboard focus survive unchanged snapshots without an
   assert.equal(h.panel().hidden, false);
   assert.match(h.panel().textContent, /gpt-6-astra/);
   assert.equal(h.requests.length, 1);
+});
+
+test("period breakdowns use the keyed speed contract and explain their purpose", async () => {
+  const h = harness(); h.render(snapshot(), [period()]); h.toggle().click();
+  h.requests[0].resolve({ ...result(), bySpeed: {
+    standard: { costUsd: 1, events: 2 }, fast: { costUsd: .8, events: 1 }, unknown: { costUsd: .2, events: 1 },
+  } });
+  await settle();
+  assert.match(h.panel().textContent, /trends.mixPurpose/);
+  assert.match(h.panel().textContent, /divergence.speed.standard/);
+  assert.match(h.panel().textContent, /divergence.speed.fast/);
+  assert.equal(h.panel().textContent.match(/divergence.speed.unknown/g).length, 1);
+  assert.equal(h.panel().children.some(child => child.className.includes("divergence-retry")), false);
+});
+
+test("failed initial and retained breakdowns offer a bounded retry without closing the panel", async () => {
+  const h = harness(); h.render(snapshot(), [period()]); h.toggle().click();
+  h.requests[0].resolve(null); await settle();
+  let retry = h.panel().children.find(child => child.className.includes("divergence-retry"));
+  assert.ok(retry);
+  retry.click(); retry.click();
+  assert.equal(h.requests.length, 2, "pending retries cannot duplicate a request");
+  assert.equal(h.document.activeElement, h.toggle(), "loading must not discard keyboard focus with the retry button");
+  assert.equal(h.panel().hidden, false);
+  h.requests[1].resolve(result()); await settle();
+  assert.match(h.panel().textContent, /gpt-6-astra/);
+  h.render(snapshot("2"), [period()]);
+  h.requests[2].resolve(null); await settle();
+  assert.match(h.panel().textContent, /gpt-6-astra/);
+  assert.match(h.panel().textContent, /trends.mixRetained/);
+  retry = h.panel().children.find(child => child.className.includes("divergence-retry"));
+  retry.click(); h.requests[3].resolve(result("updated")); await settle();
+  assert.match(h.panel().textContent, /updated/);
+  assert.doesNotMatch(h.panel().textContent, /trends.mixRetained/);
 });
 
 test("new revisions refresh behind retained details and failed refreshes can retry", async () => {
@@ -137,14 +200,93 @@ test("different windows, evidence, plan cohorts and demo do not inherit pending 
   }
 });
 
-test("retention is bounded to displayed windows and discarded when no periods remain", () => {
+test("detail retention covers every pageable window and clears with the result set", () => {
   const h = harness();
   h.render(snapshot(), Array.from({ length: 25 }, (_, i) => period(100 * i)));
-  assert.equal(h.state.size, 20);
+  assert.equal(h.state.size, 25);
   h.render(snapshot(), [period(999)]);
   assert.equal(h.state.size, 1);
   h.render(snapshot(), []);
   assert.equal(h.state.size, 0);
+});
+
+test("all divergence periods are reachable ten rows at a time", () => {
+  const h = harness();
+  h.render(snapshot(), Array.from({ length: 25 }, (_, i) => period(100 * i)));
+
+  assert.equal(h.element("#divergence-list").children.length, 10);
+  assert.equal(h.element("#divergence-pagination").hidden, false);
+  assert.equal(h.element("#divergence-page-prev").disabled, true);
+  assert.equal(h.element("#divergence-page-next").disabled, false);
+  assert.match(h.element("#divergence-page-status").textContent, /1 10 25/u);
+
+  h.next();
+  assert.equal(h.element("#divergence-list").children.length, 10);
+  assert.equal(h.element("#divergence-page-prev").disabled, false);
+  assert.equal(h.element("#divergence-page-next").disabled, false);
+  assert.match(h.element("#divergence-page-status").textContent, /11 20 25/u);
+
+  h.next();
+  assert.equal(h.element("#divergence-list").children.length, 5);
+  assert.equal(h.element("#divergence-page-prev").disabled, false);
+  assert.equal(h.element("#divergence-page-next").disabled, true);
+  assert.match(h.element("#divergence-page-status").textContent, /21 25 25/u);
+
+  h.next();
+  assert.equal(h.element("#divergence-list").children.length, 5);
+  h.previous();
+  assert.equal(h.element("#divergence-list").children.length, 10);
+});
+
+test("a changed divergence population returns to the first page", () => {
+  const h = harness();
+  h.render(snapshot(), Array.from({ length: 25 }, (_, i) => period(100 * i)));
+  h.next();
+  assert.match(h.element("#divergence-page-status").textContent, /11 20 25/u);
+
+  h.render(snapshot(), Array.from({ length: 12 }, (_, i) => period(1_000 + 100 * i)));
+  assert.equal(h.element("#divergence-list").children.length, 10);
+  assert.equal(h.element("#divergence-page-prev").disabled, true);
+  assert.match(h.element("#divergence-page-status").textContent, /1 10 12/u);
+});
+
+test("paging away and back preserves an expanded loaded breakdown", async () => {
+  const h = harness();
+  h.render(snapshot(), Array.from({ length: 25 }, (_, i) => period(100 * i)));
+  h.toggle().click();
+  h.requests[0].resolve(result());
+  await settle();
+
+  h.next();
+  h.previous();
+  assert.equal(h.toggle().getAttribute("aria-expanded"), "true");
+  assert.equal(h.panel().hidden, false);
+  assert.match(h.panel().textContent, /gpt-6-astra/u);
+  assert.equal(h.requests.length, 1);
+});
+
+test("single-page divergence results hide the pager", () => {
+  const h = harness();
+  h.render(snapshot(), Array.from({ length: 10 }, (_, i) => period(100 * i)));
+  assert.equal(h.element("#divergence-list").children.length, 10);
+  assert.equal(h.element("#divergence-pagination").hidden, true);
+});
+
+test("the Trends page ships accessible divergence pager controls", () => {
+  assert.match(html, /id="divergence-pagination"[^>]*hidden/u);
+  assert.match(
+    html,
+    /id="divergence-page-prev"[^>]*aria-controls="divergence-list"/u,
+  );
+  assert.match(html, /id="divergence-page-status"[^>]*role="status"/u);
+  assert.match(
+    html,
+    /id="divergence-page-next"[^>]*aria-controls="divergence-list"/u,
+  );
+  assert.match(
+    styles,
+    /@media \(max-width: 520px\)[\s\S]*?\.divergence-panel \.table-pagination-status \{[\s\S]*?grid-column: 1 \/ -1;/u,
+  );
 });
 
 

@@ -39,11 +39,11 @@ Those remain separate verification gates in the relevant runbooks.
 
 | Surface | Boundary | Implemented surface |
 |---|---|---:|
-| Local companion API | Browser/native shell → loopback Node companion | 29 paths, 31 method/path operations |
+| Local companion API | Browser/native shell → loopback Node companion | 33 paths, 35 method/path operations |
 | Local report pages | Browser → fixed loopback report allowlist | 4 `GET` paths |
 | Central public relay | Loopback companion → configured hosted origin | 1 fixed `GET` path |
-| Participant relay | Loopback companion → configured hosted origin | 9 paths, 9 method/path operations |
-| Hosted Worker API | Internet/native collector → Cloudflare Worker | 39 API paths, 40 method/path operations |
+| Participant relay | Loopback companion → configured hosted origin | 11 paths, 11 method/path operations |
+| Hosted Worker API | Internet/native collector → Cloudflare Worker | 50 API paths, 53 method/path operations |
 | Deliberate negative Worker route | Internet → fixed non-API interception | 1 always-`404` path |
 | Native/browser bridge | WKWebView ↔ macOS shell | 4 message handlers, 4 DOM events, 1 fixed URL scheme |
 | Process protocols | Native shell, Codex plugin, companion, analysis owners ↔ child/worker | 11 explicit runtime protocol families |
@@ -94,7 +94,7 @@ flowchart LR
   Local --> |read-only local files| Evidence
   Local <--> |sanitized account protocol| Codex
   Native <--> |four capabilities; get / set / delete| Keychain
-  Local --> |health-only central relay + 9 participant relays| Worker
+  Local --> |health-only central relay + 11 participant relays| Worker
   Local --> |device bearer + one-use Upload authority| Worker
   Worker <--> Data
   Worker <--> Objects
@@ -148,8 +148,10 @@ enforce their closed JSON shape and byte ceiling.
 
 `GET /api/local/timeline/window-breakdown` accepts only `from` and `to` as
 bounded base-ten safe integers. `GET /api/local/model-performance` requires
-exactly one `period` parameter with value `7`, `30`, or `all`; other query
-shapes are rejected. Health, desktop status, contribution diagnostics, diagnostic notes, the
+exactly one `period` parameter with value `1`, `7`, `30`, or `all`, and optionally
+a canonical ISO `endAt` no later than the current time. An explicit end uses
+rolling 24-hour, 7-day or 30-day bounds; omitted ends preserve legacy calendar
+windows for 7/30-day consumers. Other query shapes are rejected. Health, desktop status, contribution diagnostics, diagnostic notes, the
 hosted-sign-in handoff, and model performance can answer without a completed
 Codex accounting snapshot.
 
@@ -165,8 +167,8 @@ Codex accounting snapshot.
 | `GET` | `/api/local/onboarding` | Local installation and evidence-source readiness |
 | `GET` | `/api/local/overview` | Personal dashboard headline and evidence coverage |
 | `GET` | `/api/local/cache-drop-thread-links` | Optional, generation-bound local thread-name/parent lookup for the two recent cache-drop tables; requires `X-Usage-Monitor-Local: 1` and no foreign Origin |
-| `POST` | `/api/local/work-usage/query` | Read-only local project/worktree/thread reports; closed JSON, local header and Origin/Host checks; bounded cancellable snapshots with lightweight `touch` lease renewal, transient names and bounded project/task name search before pagination |
-| `GET` | `/api/local/model-performance` | Independent device-local Codex timing aggregates for `period=7`, `period=30`, or `period=all`; reads renew a 60-second background-worker lease |
+| `POST` | `/api/local/work-usage/query` | Read-only local project/worktree/thread reports; optional canonical ISO `endAt` pins the selected period and rejects older snapshot substitution; closed JSON, local header and Origin/Host checks; bounded cancellable snapshots with lightweight `touch` lease renewal, transient names and bounded project/task name search before pagination; retained read-only figures use a separate refresh job identity and durable anonymous snapshots |
+| `GET` | `/api/local/model-performance` | Independent device-local Codex timing aggregates for `period=1`, `period=7`, `period=30`, or `period=all`, optionally pinned by `endAt`; restores validated saved measurements before background work; reads renew a 60-second background-worker lease; schema 4/method 5 combines response speed and tool-free fallback estimates, preferring response timing per turn, with a fallback count and unchanged TTFT |
 | `GET` | `/api/local/gradient` | Quota-versus-cost gradient report data |
 | `GET` | `/api/local/weekly` | Weekly calibration report data |
 | `GET` | `/api/local/weekly-pace-outlook` | Privacy-safe weekly allowance pace projection bound to the current observed window |
@@ -184,6 +186,10 @@ Codex accounting snapshot.
 | `POST` | `/api/local/contribution/sync-inspect-exact` | Inspect exact next-upload bytes and authority without sending |
 | `GET` | `/api/local/contribution/incremental-status` | Inspect incremental v1 eligibility, watermark, and state |
 | `POST` | `/api/local/contribution/incremental-review-v11` | Review the capability-gated v1.1 field inventory and derived sample; issue a publication/destination/contract-bound single-use token without uploading |
+| `POST` | `/api/local/contribution/incremental-review-v12` | Review the capability-gated v1.2 field inventory and derived sample; issue a publication/destination/contract-bound single-use token without uploading |
+| `GET` | `/api/local/performance/status` | Read separate performance consent and synchronization status |
+| `POST` | `/api/local/performance/review` | Prepare a content-free histogram review and one-use device/destination/dictionary/method-bound approval token |
+| `POST` | `/api/local/performance/approve` | Verify that review token and independent hosted grant before enabling daily performance delivery |
 | `POST` | `/api/local/contribution/incremental-approve` | Record explicit approval for the incremental contract |
 | `POST` | `/api/local/contribution/incremental-run` | Run one bounded incremental preparation/delivery cycle |
 
@@ -218,6 +224,15 @@ unprovable session order still withholds the whole-period money/allowance
 claim. Clients must identify the subtotal's scope and must not substitute it
 into `allowanceImpact` or hide excluded sessions. No priced observations means
 `coveredSubtotal: null`, not a zero-valued placeholder.
+
+Cache continuity also carries an optional `byModel` array on the selected
+impact and each reporting period. Each reviewed model ID has the same aggregate
+counts, gap/outcome buckets, pricing, coverage and bounded recent-detail shape.
+Cohorts partition the complete comparable evidence, never the recent-detail
+sample. Unattributable ordering gaps conservatively qualify every model total.
+The breakdown is bounded to 128 models; missing, unsupported or inconsistent
+breakdowns normalize to `null` while All models remains available. An empty
+array means no eligible same-configuration models were found.
 
 When contribution preparation encounters a preserved legacy export identity
 whose bounded silent migration has not completed, it returns the fixed
@@ -285,6 +300,8 @@ relayed through loopback.
 | `POST` | `/api/v1/logout` | End the hosted browser session |
 | `POST` | `/api/v1/me/device-pairings` | Create a one-use local-device pairing code |
 | `POST` | `/api/v1/me/device-telemetry-consents` | Relay explicit v1.1 consent under the hosted personal session and CSRF; never substitute device authority |
+| `POST` | `/api/v1/me/device-telemetry-v12-consents` | Relay explicit v1.2 consent under the hosted personal session and CSRF; never substitute device authority |
+| `POST` | `/api/v1/me/device-telemetry-performance-consents` | Relay explicit independent daily-performance consent under the hosted personal session and CSRF; never substitute device authority |
 
 ## 3. Hosted Cloudflare Worker HTTP API
 
@@ -350,6 +367,7 @@ Authority vocabulary:
 | `GET` | `/api/v1/admin/overview` | Admin | Read owner operations state, bounded optional distribution integrations, and failure-isolated reconstruction progress; no calculation on refresh |
 | `GET` | `/api/v1/admin/metrics/history` | Admin | Read cached owner metrics history |
 | `GET` | `/api/v1/admin/community/allowance-preview` | Admin | Preview the cached owner-only allowance merge without publishing it |
+| `GET` | `/api/v1/admin/database-health` | Admin | Reads content-free connectivity, response time and reported size for API-bound D1 roles; no mutations or schema qualification |
 | `GET` | `/api/v1/admin/reconstruction-progress` | Admin | Read bounded, content-free refresh and publication progress without advancing calculations; exact optional `detail=preparation` adds a capped retained-input census as version 2, while query-free version 1 is unchanged |
 | `POST` | `/api/v1/admin/action` | Admin | Run an allowlisted operations action; explicit owner participant erasure is a task of `run_maintenance`, not a new action or route |
 | `POST` | `/api/v1/me/security-reset` | Session | Rotate participant recovery and session authority |
@@ -361,6 +379,16 @@ Authority vocabulary:
 | `GET` | `/api/v1/device/sync/state` | Device | Read the device's accepted-through and synchronization state |
 | `GET` | `/api/v1/device/sync/manifest` | Device | Read the bounded manifest for `fromDay` and `toDay` ISO-day bounds |
 | `GET` | `/api/v1/device/sync-capabilities` | Device | Read accepted formats, consent/floor state and authenticated enrollment/destination binding |
+| `GET` | `/api/v1/device/sync-capabilities-v1.2` | Device | Read independent successor lifecycle, exact consent and server-issued activation instant; never grant authority |
+| `POST` | `/api/v1/me/device-telemetry-v12-consents` | Session | Grant the exact v1.2 contract for one reviewed device |
+| `GET`, `POST` | `/api/v1/device/telemetry/v1.2/day-manifests` | Device | Read or register bounded immutable successor manifests and staged chunk receipts |
+| `POST` | `/api/v1/me/telemetry-v12/domain-predecessor` | Device | Pin a complete mixed-client predecessor for successor activation |
+| `POST` | `/api/v1/me/telemetry-v12/domain-activate` | Device | Activate a complete proven successor domain under the pinned predecessor |
+| `POST` | `/api/v1/accountless/telemetry-v1.2-authorization` | Device | Record the independent accountless successor policy for the current enrollment and device |
+| `POST` | `/api/v1/accountless/telemetry-performance-authorization` | Device | Record the independent accountless performance policy for the current enrollment and device |
+| `GET` | `/api/v1/device/telemetry/performance/capabilities` | Device | Read the separate daily-performance capability and authorization |
+| `POST` | `/api/v1/me/device-telemetry-performance-consents` | Session | Grant separate performance consent to a reviewed device |
+| `GET`, `POST` | `/api/v1/device/telemetry/performance/reports` | Device | Read bounded report revisions or admit an encrypted daily histogram report; preserve ordinary replay and replacement semantics |
 | `POST` | `/api/v1/me/device-telemetry-consents` | Session | Grant the exact v1.1 contract for a selected device with explicit ongoing-upload approval |
 | `GET`, `POST` | `/api/v1/device/telemetry/v1.1/day-manifests` | Device | Read bounded date-range candidates, or register/resume an immutable staged day manifest and return the exact accepted chunk vector |
 | `POST` | `/api/v1/me/telemetry-v11/domain-predecessor` | Device | Pin the prior analytical domain and legacy source vector for complete replacement |
@@ -509,199 +537,51 @@ or community route registry.
 
 ## 5. Native, browser, and child-process APIs
 
-### macOS shell ↔ companion launch contract
+### Electron shell ↔ loopback companion
 
-**Source of truth:**
-[`apps/macos/UsageMonitorApp.swift`](../../apps/macos/UsageMonitorApp.swift).
+**Sources of truth:** [`apps/electron/main.js`](../../apps/electron/main.js),
+[`apps/electron/companion-supervisor.js`](../../apps/electron/companion-supervisor.js),
+[`apps/electron/ready-line.js`](../../apps/electron/ready-line.js), and
+[`apps/electron/loopback-policy.js`](../../apps/electron/loopback-policy.js).
 
-The shell starts the bundled Node companion with an ephemeral port and passes
-only fixed configuration values: parent PID, resource root, state root,
-selected `CODEX_HOME`, the inherited safe environment subset, optional fixed
-central origin, and the private Keychain-broker descriptor. A successful child
-announces exactly:
+Electron starts its bundled companion as one owned child, accepts only the
+fixed loopback readiness line and confines renderer navigation to that origin.
+Shutdown and refresh cancellation preserve the last verified local state.
+The narrow preload/IPC bridge is owned by
+[`apps/electron/preload.cjs`](../../apps/electron/preload.cjs) and the main
+process. Renderer content cannot supply arbitrary filesystem paths, network
+origins or process commands. The registered `usagemonitor://open` deep link is
+an app wake-up signal, not an OAuth-code transport; the canonical outbound
+`codex://threads/<UUID>` target remains separately validated.
 
-```text
-USAGE_MONITOR_READY http://127.0.0.1:<port>/
-```
-
-The shell accepts only the fixed loopback pattern and loads only that exact
-origin in its `WKWebView`.
-
-The custom URL `usagemonitor://open` is a wake-up signal after a hosted browser
-sign-in. Its scheme, host, empty query, and empty fragment are fixed by
-[`config/product-brand.js`](../../config/product-brand.js); it never transports
-an OAuth code, state, identity, or provider response.
-
-The outbound-only `codex://threads/<UUID>` target opens a user-selected thread
-in Codex. It is not a registered TiboTattle callback. Only a canonical UUID
-without credentials, port, query, fragment, encoding, or extra path is allowed.
-The native-owned isolated-world click bridge requires a trusted DOM click
-(including keyboard activation) in the pinned companion main frame. Generic
-WebKit navigation/new-window requests cannot open Codex programmatically.
-
-### WKWebView bridge
-
-| Direction | Name | Closed payload / purpose |
-|---|---|---|
-| Web → native | `tibotattleLocalization` | `{type: "set-language-preference", preference}` with preference restricted to the native locale enum |
-| Web → native | `tibotattleDownloads` | `{type: "reveal-latest-download"}`; the path never crosses the bridge |
-| Web → native | `tibotattleHostedSignIn` | `{inFlight: boolean}` only; carries no provider or identity data |
-| Isolated local click → native | `tibotattleCodexThreadLink` | `{threadId}` only, from the native-owned non-page content world after `event.isTrusted`; canonical UUID and pinned main-frame origin revalidated; never persisted or logged |
-| Native → web | `tibotattle:hosted-sign-in-return` | DOM event telling the live page to collect its opaque result |
-| Native → web | `tibotattle:local-evidence-updated` | DOM event telling the live page that the snapshot changed |
-| Native → web | `tibotattle:locale-override` | `CustomEvent` with one closed language preference |
-| Native → web | `tibotattle:appearance-override` | `CustomEvent` with schema version, native host, closed appearance preference, and resolved theme |
-
-At document start the shell also injects the fixed
-`window.__TIBOTATTLE_LOCALIZATION__` handoff and a native-dashboard marker. The
-native diagnostics reader calls only the allowlisted
-`window.__tibotattleContributionDiagnostics()` function and independently
-decodes a fixed boolean vocabulary.
-
-### Private Keychain broker protocol
+### macOS credential and predecessor migration protocols
 
 **Sources of truth:**
-[`apps/macos/Sources/KeychainBroker.swift`](../../apps/macos/Sources/KeychainBroker.swift)
-and
-[`src/contribution-device-keychain-broker.js`](../../src/contribution-device-keychain-broker.js).
+[`apps/electron/desktop-macos-keychain.js`](../../apps/electron/desktop-macos-keychain.js),
+[`apps/electron/desktop-keychain-broker.js`](../../apps/electron/desktop-keychain-broker.js),
+[`src/contribution-device-keychain-broker.js`](../../src/contribution-device-keychain-broker.js),
+[`apps/electron/desktop-native-migration.js`](../../apps/electron/desktop-native-migration.js),
+and the signed
+[`NativeElectronHandoverHelper.swift`](../../apps/electron/native/NativeElectronHandoverHelper.swift).
 
-The signed app and its spawned companion share a kernel-held socketpair. The
-child receives its endpoint as standard input; the environment contains only
-the descriptor announcement needed to select the broker transport. Frames are
-newline-delimited JSON protocol v2, strictly ordered, and at most 4,096 bytes.
-The wire names one of four logical capabilities; service and account strings
-never cross the channel:
+The signed Electron main process owns the reviewed macOS credential adapter
+and companion broker pipe. The wire selects closed logical capabilities; it
+never accepts arbitrary Keychain service/account names. An announced failed
+broker cannot silently fall back to an unrelated credential implementation.
+Existing native data and settings are imported through a private, journaled,
+no-clobber handover. The Swift helper authenticates its signed enclosing app,
+uses a fixed protocol, and cannot reset credentials or enable sharing. Unknown
+or newer data schemas preserve the predecessor state and stop startup.
+The [handover runbook](../runbooks/2026-09-07-macos-native-to-electron-handover.md)
+describes the recovery and exact signed-artifact gate.
 
-| Wire capability | App-owned modern Keychain service | Purpose |
-|---|---|---|
-| `export_identity` | `app-usagemonitor.export-identity.app.v1` | Stable local export pseudonym authority |
-| `account_observation` | `app-usagemonitor.account-observation.app.v1` | Account-continuity observation secret |
-| `claude_session_pseudonym` | `app-usagemonitor.claude-session-pseudonym.app.v1` | Local Claude-session pseudonymization |
-| `contribution_device` | `app-usagemonitor.contribution-device.app.v1` | Hosted collector device bearer |
-
-| Operation | Request | Successful response |
-|---|---|---|
-| `get` | `{v: 2, id, op: "get", capability}` | `{id, ok: true, secret: string|null}` |
-| `set` | `{v: 2, id, op: "set", capability, secret}` | `{id, ok: true}` |
-| `delete` | `{v: 2, id, op: "delete", capability}` | `{id, ok: true}` |
-
-The broker reads the `.app.v1` generation first. When only the corresponding
-legacy keytar-backed `.v1` item exists, it attempts a noninteractive read through
-`Contents/Helpers/TiboTattleKeychainMigration`. The helper retains the legacy
-`node` Developer ID identity, has no entitlements, and authenticates its native
-parent's live audit token and signing identity. The parent authenticates the
-spawned helper and pins its code hash. The helper accepts only the four fixed
-capabilities; stable/Preview storage identity comes from the authenticated
-parent, never the request. Its private descriptor frames and lifetime are
-bounded, including when the parent exits during a Keychain call.
-
-Up to three silent attempts use 250 ms and 750 ms backoff after the first
-attempt. The app-process budget survives companion replacement. Each automatic
-read forbids Keychain interaction. Adoption is create-if-absent with exact
-readback, preserves a conflicting modern item, and retains the legacy recovery
-copy. Failure returns `migration_required`; it never invents a fresh identity.
-After exhaustion a quiet native Settings action offers an explanation with
-Cancel as the default. Only deliberate **Approve migration** enables an
-interactive legacy read. Denial preserves the key and stops the approval pass;
-another prompt requires another explicit review. Teardown fences both admission
-and adoption. All four adapters preserve a fixed, content-free migration-required
-diagnostic. No broker operation approves migration or resets its retry budget.
-Protocol v1 remains accepted only for the historical contribution-device-only
-client and cannot name a wider capability. The
-[migration decision](../decisions/2026-08-31-silent-keychain-migration.md)
-records signed qualification and the retained-copy explicit-reset gate.
-
-The broker protocol admits exactly these four capabilities. The packaged
-companion's current runtime graph injects it for export identity, account
-observation, and contribution device; that graph's audited dependency closure
-excludes `@github/keytar`. Claude callback is reached from the standalone CLI
-and local-review compositions, which retain the keytar adapter for
-compatibility. Invalid or uncorrelatable frames close the channel; ordinary
-operation failures return a fixed error code and matching `id`. Native smoke
-modes use process-memory storage and never inspect or migrate the developer's
-login Keychain.
-
-The Electron macOS production adapter has a fifth native capability,
-`accountless_installation`, distinct from the four-capability broker. Only its
-main-process accountless backend can select that capability; `store` and
-`remove` reject it, leaving `createIfMissing` and `deleteExact` as the permitted
-mutations. The separate inherited FD3 accountless channel carries closed
-preference, credential and status operations for the owned companion. Its
-`credential_recovery_required` marker contains no path, secret or native
-error detail and pauses the scheduler. Neither native capability names nor
-secret operations are exposed through renderer IPC or HTTP. The
-[adapter contract](../../native/macos-keychain/README.md) defines the source
-boundary; it is not installed or signed-candidate qualification.
-
-The Linux Electron companion now has a separate, source-only Secret Service
-broker at inherited FD4. Its main-owned factory must provide the existing
-native backend with a qualified cross-process mutation lease; the child never
-loads Secret Service or keytar. Protocol v1 admits only `export_identity` and
-`account_observation`, with `read`, `create_if_missing`, `replace_exact`, and
-`delete_exact`. Requests carry strictly increasing IDs and canonical 32-byte
-secrets, with a 4096-byte per-frame limit and at most 32 pending operations.
-Malformed replies or transport failure permanently refuse further requests.
-The Linux descriptor announcement is mutually exclusive with the Mac broker.
-The three local-server identity/observation entrypoints share one cached
-transport and preserve explicit development overrides. An absent or malformed
-broker cannot select a child-side credential fallback. Conditional mutations
-execute under the parent-owned lease; locked account observation stays
-unattributed with its fixed diagnostic. This does not change the private FD3
-upload-only authority, enable production selection, or establish installed
-Linux qualification. Abandoned mutations require recovery and the underlying
-backend still reports `crashRecoveryComplete: false` and `productionSafe: false`.
-
-The Linux shell package requires the exact native mutex `.node` and sidecar
-from `native/linux-credential-mutex/build/qualification`, alongside the pinned
-Linux Keytar prebuild. Both mutex files are unpacked physical files so the
-loader's descriptor-based checks remain effective. Module-owned path mapping
-handles only the fixed `app.asar` to `app.asar.unpacked` layout; source paths
-remain unchanged. Staging and artifact verification use
-`validateLinuxCredentialMutexBindingManifest` for the closed sidecar schema,
-then independently compare its size/digest against captured bytes. The runtime
-manifest keeps its existing schema and records the pair as `linux_native_binding`
-inventory rows. These three exact unpacked files are required for Linux and
-cannot broaden another target's native inventory. Native execution and
-installed qualification remain separate.
-
-The dormant Linux accountless adapter uses a separate owner-private XDG-state
-record, not the legacy provider or social credential store. Its
-[fixed native boundary](../../native/linux-credential-mutex/README.md) exposes
-only `readAccountlessInstallationCredential`,
-`createAccountlessInstallationCredentialIfMissing`, and
-`deleteAccountlessInstallationCredentialExact`, with no caller-supplied path
-or capability number. The record is exactly 32 bytes under owner-only file
-permissions; it is not encrypted at rest and remains accessible to an
-authorized process while the desktop is locked. The native-private slot `4`
-does not expand the generic `0..3` lease API or the legacy FD4 protocol. Only
-the main-owned adapter can compose this record into the existing private FD3
-accountless channel. Invalid fixed records and uncertain mutations preserve
-recovery state instead of permitting silent identity replacement. The source
-keeps `productionSafe: false` and leaves runtime selection disabled; native
-qualification, installed lifecycle and release remain separate gates.
-
-The dormant Windows accountless adapter likewise owns a separate,
-owner-private protected-state record, not a fifth legacy Credential Manager
-capability. Its [fixed native boundary](../../native/windows-filesystem/README.md)
-exposes only `read`, `createIfMissing`, and `deleteExact` for an upload-only
-32-byte installation secret; callers cannot select a capability, record name,
-or path. The fixed record and `active`/`normal` journal are plaintext at rest.
-The two private native mutex methods,
-`acquireAccountlessInstallationCredentialMutex()` and
-`releaseAccountlessInstallationCredentialMutex(lease)`, have no capability
-argument and sit outside generic IDs `0..3` and FD4. They serialize cooperating
-processes only in the current owner's `Local\` Windows session: backup copies,
-same-owner processes that bypass the contract, and other sessions remain outside
-that protection. Before a create or exact delete, the backend writes `active`;
-an uncertain mutation, malformed record, failed release, or interruption retains
-it when the write can be verified and then returns fixed recovery rather than
-silently replacing identity. If it cannot retain that marker, it returns a
-content-free operation failure without a restart-persistence claim. The
-main-owned adapter may carry the secret only through the existing private FD3
-accountless channel, never renderer IPC or HTTP. `productionSafe` remains
-`false` and runtime selection remains disabled pending native Windows x64 build,
-manifest, security, physical-runner, installed-lifecycle, signing, and release
-evidence.
+Native 0.1.18 still consumes `/appcast.xml` on Apple silicon and
+`/intel/appcast.xml` on Intel. Those incoming Sparkle transport contracts are
+owned by [`scripts/generate-sparkle-appcast.js`](../../scripts/generate-sparkle-appcast.js),
+[`scripts/publish-sparkle-update.js`](../../scripts/publish-sparkle-update.js),
+and the signed Electron transition validator. Electron-to-Electron updates use
+the separate Electron updater feeds. The old AppKit shell, WKWebView bridge and
+native Keychain broker are no longer source-owned APIs in this checkout.
 
 ### Codex plugin MCP and installed-agent protocols
 
@@ -786,7 +666,7 @@ module facades, but their message shapes are security- and resource-relevant:
 | Owner / source | Input boundary | Output boundary |
 |---|---|---|
 | [Replay-safe accounting rebuild child](../../src/replay-safe-accounting-rebuild-child.js) | Two owner-private temporary paths on argv: versioned JSON request and exclusive result target; parent-held stdin is the death watchdog | Canonical result file plus one bounded stdout envelope containing status and either byte count/SHA-256 or a fixed error code |
-| [Model performance worker](../../apps/local/model-performance-worker.js) | Fixed private state and Codex-home anchors, then a `stop` message; starts only through a recent timing-page reader | Bounded timing aggregate snapshots for three periods, or a fixed unavailable indication; one independent sidecar, no accounting/contribution data flow |
+| [Model performance worker](../../apps/local/model-performance-worker.js) | Fixed private state and Codex-home anchors, then bounded reporting-window requests or a `stop` message; starts only through a recent timing-page reader | Bounded timing aggregate snapshots for four periods and at most eight pinned windows, or a fixed unavailable indication; original timing and independent tool-free supplement, no accounting/contribution data flow |
 | [Unified-index worker](../../src/local-unified-index-worker.js) | `workerData` with bounded lineage components, source paths/sizes, and maximum line bytes | Typed `batch` messages containing minimized events/boundaries/tools/snapshot keys, or one content-free `failed` code |
 | [Local-analysis extraction worker](../../src/local-analysis-extract-worker.js) | `workerData` with an owner-private shard path and bounded source byte-range tasks | One `{ok: true, result}` aggregate or `{ok: false, code}` fixed failure |
 
@@ -802,16 +682,12 @@ runbooks.
 
 ### Apple platform APIs
 
-The native shell uses these external platform APIs directly:
-
-| Framework/API | Use |
-|---|---|
-| WebKit (`WKWebView`, website data store, script messages) | Render and bridge the fixed loopback dashboard |
-| Security (`SecItem*`) | App-owned export identity and contribution-device secrets |
-| ServiceManagement (`SMAppService.mainApp`) | User-controlled launch-at-login registration |
-| UserNotifications | Optional local-only allowance notifications |
-| AppKit / `NSWorkspace` | System-browser handoff, reveal-download, settings, and app lifecycle |
-| Sparkle 2 | Signed appcast and update-artifact verification in distribution builds |
+Electron composes macOS login-item, notification, Keychain, signature and
+installed-updater behavior through its reviewed platform adapters. The retained
+Swift handover helper uses AppKit to authenticate and coordinate with a
+same-identity predecessor. Pinned Sparkle tools sign the incoming native
+appcasts; the Electron application uses its own updater after transition.
+Qualification is artifact- and architecture-specific.
 
 ## 6. Reviewed internal module APIs
 
@@ -855,7 +731,7 @@ topology and calibration policy.
 
 #### `@app-usagemonitor/telemetry-contract` — 63 public symbols
 
-- Reviewed model catalog: `REVIEWED_MODEL_CATALOG_VERSION`, `REVIEWED_MODEL_CATALOG`, `REVIEWED_CODEX_MODEL_IDS`, `REVIEWED_CLAUDE_MODEL_IDS`, `reviewedModelIdentity`, `codexRequestReasoningEffort`, `codexCacheReasoningConfiguration`.
+- Reviewed model catalog: `REVIEWED_MODEL_CATALOG_VERSION`, `REVIEWED_MODEL_CATALOG`, `REVIEWED_CODEX_MODEL_IDS`, `REVIEWED_CLAUDE_MODEL_IDS`, `reviewedModelIdentity`, `assertReviewedModelCatalogCompleteness`, `codexRequestReasoningEffort`, `codexCacheReasoningConfiguration`.
 - Admin model history: `ADMIN_MODEL_CONFIG`, `ADMIN_MODEL_HISTORY_CATALOG_VERSION`, `LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION`, `projectAdminModelHistoryDay`, `expandAdminModelHistoryDay`.
 - Constants: `ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION`, `ACCOUNT_SCOPED_TELEMETRY_ENVELOPE_SCHEMA_VERSION`, `ACCOUNT_SCOPED_TELEMETRY_SCHEMA_VERSION`, `MAX_TELEMETRY_BROWSER_BYTES`, `TELEMETRY_CONTRIBUTION_SCHEMA_VERSION`, `TELEMETRY_ENVELOPE_SCHEMA_VERSION`, `TELEMETRY_MODEL_IDS`, `TELEMETRY_PLAN_DISPLAY_NAMES`, `TELEMETRY_PLAN_TYPES`, `TELEMETRY_SCHEMA_VERSION`, `TELEMETRY_TOOL_CLASSES`.
 - Errors: `TELEMETRY_CONTRACT_ERROR_CODES`, `TelemetryContractError`, `isTelemetryContractError`.
@@ -869,10 +745,10 @@ topology and calibration policy.
 
 `deriveExportPseudonym`, `deriveExportPseudonymV2`.
 
-#### `@app-usagemonitor/i18n` — 17 public symbols
+#### `@app-usagemonitor/i18n` — 18 public symbols
 
 - Catalogs and policy: `DEFAULT_LOCALE`, `SYSTEM_LOCALE_PREFERENCE`, `SUPPORTED_LOCALES`, `LANGUAGE_OPTIONS`, `EN_US_CATALOG`, `ZH_HANS_CATALOG`, `ES_CATALOG`, `CATALOGS`.
-- Resolution and copy: `negotiateLocale`, `resolveLocalePreference`, `isLanguagePreference`, `getMessage`, `interpolateMessage`, `translate`.
+- Resolution and copy: `canonicalizeLocale`, `negotiateLocale`, `resolveLocalePreference`, `isLanguagePreference`, `getMessage`, `interpolateMessage`, `translate`.
 - Formatting: `formatNumber`, `formatPercent`, `formatDate`.
 
 The accounting and quota package roots were narrowed by 20 and 7 symbols
@@ -952,7 +828,7 @@ The owned local SQLite surfaces are:
 | Domain | Storage owners |
 |---|---|
 | Local evidence and accounting | [`local-collector-state.js`](../../src/local-collector-state.js), [`local-unified-index.js`](../../src/local-unified-index.js), [`local-analysis-index.js`](../../src/local-analysis-index.js), and its private [`local-analysis-extract-worker.js`](../../src/local-analysis-extract-worker.js) shard writer |
-| Model performance timing | [`inference-timing-store.js`](../../src/platform/inference-timing-store.js): owner-only `inference-timing-v2/timing-experiment.sqlite` below the companion state root; method and SQLite user version 2, maximum 256 MiB |
+| Model performance timing | [`inference-timing-store.js`](../../src/platform/inference-timing-store.js): owner-only `inference-timing-v2/source-<Codex-home digest>/timing-experiment.sqlite` below the companion state root; method and SQLite user version 2, maximum 256 MiB; additive `tool-free-v1/timing-experiment.sqlite` within that source directory uses version 3 and its own 256 MiB cap, preserving the original store |
 | Claude shadow pipeline | [`claude-desktop-incremental-canonicalizer.js`](../../src/claude-desktop-incremental-canonicalizer.js), [`claude-desktop-ledger-prototype.js`](../../src/claude-desktop-ledger-prototype.js), [`claude-desktop-pricing-cache.js`](../../src/claude-desktop-pricing-cache.js), [`claude-desktop-shadow-store.js`](../../src/claude-desktop-shadow-store.js) |
 | Contribution and export | [`local-contribution-sync-queue-storage.js`](../../src/platform/local-contribution-sync-queue-storage.js), [`owner-only-export-workspace-storage.js`](../../src/platform/owner-only-export-workspace-storage.js), [`export-set-verification-storage.js`](../../src/platform/export-set-verification-storage.js) |
 | Windows qualification | [`windows-credential-operation-audit.js`](../../src/platform/windows-credential-operation-audit.js), a bounded local audit store rather than a shipping credential backend |

@@ -24,4 +24,5 @@ export {
   sanitizeCodexAccountSnapshot,
   sanitizeCodexAccountSnapshotWithSecretLoader,
   sanitizeRateLimit,
+  volatileResetCreditInventory,
 } from "./app-server.js";

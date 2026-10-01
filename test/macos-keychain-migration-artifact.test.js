@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,12 +16,7 @@ import {
   MACOS_KEYCHAIN_MIGRATION_HELPER,
   MACOS_KEYCHAIN_MIGRATION_HELPER_SOURCES,
   assertMacOSKeychainMigrationManifest,
-  calculateMacOSSourceInputDigest,
-  collectMacOSKeychainMigrationHelperSources,
-  collectMacOSSwiftSources,
   normalizeMacOSBuildArchitecture,
-} from "../scripts/build-macos-app.js";
-import {
   createMacOSSignedReplacementContract,
   inspectMacOSApp,
   macOSReleaseManifestArchitecture,
@@ -37,8 +32,6 @@ import { SPARKLE_FRAMEWORK_SHA256, SPARKLE_VERSION } from "../scripts/macos-upda
 const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SHARED_SOURCE = "apps/macos/Sources/KeychainMigration.swift";
 const ENTRYPOINT_SOURCE = "apps/macos/Helpers/KeychainMigrationHelper.swift";
-const ELECTRON_HANDOVER_ENTRYPOINT_SOURCE =
-  "apps/macos/Helpers/NativeElectronHandoverHelper.swift";
 const SIGNATURE_ERROR = { code: "MACOS_KEYCHAIN_MIGRATION_SIGNATURE_INVALID" };
 const ARTIFACT_ERROR = { code: "MACOS_KEYCHAIN_MIGRATION_ARTIFACT_INVALID" };
 const TEAM = "A1B2C3D4E5";
@@ -84,94 +77,7 @@ function buildManifest() {
   };
 }
 
-async function helperSourceFixture() {
-  const root = await mkdtemp(join(await realpath(tmpdir()), "tibotattle-helper-inventory-"));
-  for (const [relativePath, source] of [
-    [SHARED_SOURCE, "struct MigrationProtocol {}\n"],
-    [ENTRYPOINT_SOURCE, "@main struct MigrationHelper { static func main() {} }\n"],
-    ["apps/macos/UsageMonitorApp.swift", "@main struct App { static func main() {} }\n"],
-  ]) {
-    const path = join(root, relativePath);
-    await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, source);
-  }
-  return { root, options: { repositoryRoot: root, sourceRoot: join(root, "apps/macos") } };
-}
-
-test("migration helper source inventory is closed and its @main never enters the launcher", async () => {
-  const { root, options } = await helperSourceFixture();
-  try {
-    const first = await collectMacOSKeychainMigrationHelperSources(options);
-    assert.deepEqual(first.relativeFiles, [ENTRYPOINT_SOURCE, SHARED_SOURCE]);
-    assert.deepEqual(await collectMacOSKeychainMigrationHelperSources(options), first);
-    assert.deepEqual((await collectMacOSSwiftSources(options)).relativeFiles, [
-      SHARED_SOURCE, "apps/macos/UsageMonitorApp.swift",
-    ]);
-    await writeFile(
-      join(root, ELECTRON_HANDOVER_ENTRYPOINT_SOURCE),
-      "@main struct NativeElectronHandover { static func main() {} }\n",
-    );
-    // The Electron handover entrypoint may share Helpers, but must never enter
-    // the native launcher or Keychain helper compilation closure.
-    assert.deepEqual(
-      (await collectMacOSKeychainMigrationHelperSources(options)).relativeFiles,
-      [ENTRYPOINT_SOURCE, SHARED_SOURCE],
-    );
-    assert.deepEqual((await collectMacOSSwiftSources(options)).relativeFiles, [
-      SHARED_SOURCE, "apps/macos/UsageMonitorApp.swift",
-    ]);
-    await writeFile(join(options.sourceRoot, "Helpers/Extra.swift"), "struct Unreviewed {}\n");
-    await assert.rejects(collectMacOSKeychainMigrationHelperSources(options),
-      /only reviewed helper entrypoints/u);
-    await assert.rejects(collectMacOSSwiftSources(options), /only reviewed helper entrypoints/u);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test("migration helper discovery refuses missing and symlinked inputs", async () => {
-  const { root, options } = await helperSourceFixture();
-  try {
-    const entrypoint = join(root, ENTRYPOINT_SOURCE);
-    await rm(entrypoint);
-    await assert.rejects(collectMacOSKeychainMigrationHelperSources(options),
-      /only reviewed helper entrypoints/u);
-    await symlink(join(root, SHARED_SOURCE), entrypoint);
-    await assert.rejects(collectMacOSKeychainMigrationHelperSources(options),
-      /only reviewed helper entrypoints/u);
-    await rm(entrypoint);
-    await writeFile(entrypoint, "@main struct MigrationHelper { static func main() {} }\n");
-    await rm(join(root, SHARED_SOURCE));
-    await assert.rejects(collectMacOSKeychainMigrationHelperSources(options), { code: "ENOENT" });
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test("the reviewed helper entrypoint and shared protocol bytes affect source reproducibility", async () => {
-  const sharedFile = join(REPOSITORY_ROOT, SHARED_SOURCE);
-  const entrypointFile = join(REPOSITORY_ROOT, ENTRYPOINT_SOURCE);
-  const capturedSources = new Map([
-    [sharedFile, "struct SharedV1 {}\n"],
-    [entrypointFile, "@main struct HelperV1 {}\n"],
-  ]);
-  const options = {
-    graph: { files: [] },
-    runtimeAssets: [],
-    swiftSources: { files: [sharedFile] },
-    keychainMigrationHelperSources: { files: [entrypointFile, sharedFile] },
-    readSource: async (file) => Buffer.from(capturedSources.get(file) ?? "synthetic build input\n"),
-  };
-  const initial = await calculateMacOSSourceInputDigest(options);
-  capturedSources.set(entrypointFile, "@main struct ChangedHelper {}\n");
-  assert.notEqual(await calculateMacOSSourceInputDigest(options), initial);
-  capturedSources.set(entrypointFile, "@main struct HelperV1 {}\n");
-  assert.equal(await calculateMacOSSourceInputDigest(options), initial);
-  capturedSources.set(sharedFile, "struct ChangedSharedProtocol {}\n");
-  assert.notEqual(await calculateMacOSSourceInputDigest(options), initial);
-});
-
-test("new artifact contracts require the exact helper identity, sources, mode and normalization", () => {
+test("historical native artifact contracts require the exact helper identity, sources, mode and normalization", () => {
   assert.doesNotThrow(() => assertMacOSKeychainMigrationManifest(buildManifest()));
   const mutations = [
     (manifest) => { delete manifest.runtime.keychainMigrationHelper; },
@@ -497,7 +403,7 @@ test("the public legacy boolean and forged stable capability cannot bypass artif
 
 function releaseSourceSection(source, startMarker, endMarker) {
   const start = source.indexOf(startMarker);
-  const end = source.indexOf(endMarker, start);
+  const end = endMarker === null ? source.length : source.indexOf(endMarker, start);
   assert.equal(start >= 0 && end > start, true, startMarker);
   return source.slice(start, end).replace(/^export /u, "");
 }
@@ -533,7 +439,7 @@ test("historical receipt artifact reading rejects changed DMG bytes and size bef
 test("historical stable DMG validation rechecks exact bytes before native trust commands", async () => {
   const source = await readFile(join(REPOSITORY_ROOT, "scripts/macos-release-core.js"), "utf8");
   const dmgSource = releaseSourceSection(source,
-    "export async function validateMacOSDMG(", "\nasync function writeAtomic(");
+    "export async function validateMacOSDMG(", null);
   const pin = releaseSourceSection(source,
     "const LEGACY_STABLE_PREVIOUS_RELEASE =", "// This immutable rc2");
   const capabilityValidator = releaseSourceSection(source,
@@ -628,7 +534,7 @@ test("stable previous capabilities expire on success and failure before candidat
 test("historical stable inspection binds the app build digests before accepting legacy payload shape", async () => {
   const source = await readFile(join(REPOSITORY_ROOT, "scripts/macos-release-core.js"), "utf8");
   const inspectorSource = releaseSourceSection(source,
-    "export async function inspectMacOSApp(", "\nexport function readMacOSReleaseCredentials(");
+    "export async function inspectMacOSApp(", "\nfunction macOSBundleVersionParts(");
   const pin = releaseSourceSection(source,
     "const LEGACY_STABLE_PREVIOUS_RELEASE =", "// This immutable rc2");
   const capabilityValidator = releaseSourceSection(source,
@@ -729,82 +635,4 @@ test("stable previous payload compatibility accepts only the exact normalized Ke
   });
   await assert.rejects(harness.verifyMacOSBuildPayload("/synthetic", manifest), ARTIFACT_ERROR,
     "without historical authority the current migration helper remains mandatory");
-});
-
-test("native helper compilation and inside-out signing exclude keytar and Node runtime exceptions", async () => {
-  const [builder, release] = await Promise.all([
-    readFile(join(REPOSITORY_ROOT, "scripts/build-macos-app.js"), "utf8"),
-    readFile(join(REPOSITORY_ROOT, "scripts/macos-release-core.js"), "utf8"),
-  ]);
-  assert.match(builder, /keychainMigrationHelperSources,\s*\{ architecture, buildProfile, migrationHelper: true \}/u);
-  assert.match(builder, /\? \["-framework", "Foundation", "-framework", "Security"\]/u);
-  const nodeSign = release.indexOf("sign(NODE_EXECUTABLE, { entitlements: NODE_ENTITLEMENTS })");
-  const helperSign = release.indexOf("sign(MACOS_KEYCHAIN_MIGRATION_HELPER.executable, {");
-  const launcherSign = release.indexOf("sign(APP_EXECUTABLE)");
-  const appSign = release.indexOf('sign("")');
-  assert.equal(nodeSign > 0 && nodeSign < helperSign && helperSign < launcherSign && launcherSign < appSign, true);
-  assert.match(release.slice(helperSign, release.indexOf("});", helperSign)),
-    /identifier: MACOS_KEYCHAIN_MIGRATION_HELPER.signingIdentifier/u);
-  assert.doesNotMatch(release.slice(helperSign, release.indexOf("});", helperSign)),
-    /entitlements|preserveEntitlements/u);
-});
-
-test("both actual native compile invocations link audit-token symbols through libbsm", async () => {
-  const builder = await readFile(join(REPOSITORY_ROOT, "scripts/build-macos-app.js"), "utf8");
-  const start = builder.indexOf("async function compileNativeExecutable(");
-  const end = builder.indexOf("\nasync function copyPinnedSparkleFramework", start);
-  assert.equal(start >= 0 && end > start, true);
-  const compileSource = builder.slice(start, end);
-  const architectureStart = builder.indexOf("function machOArchitecture(");
-  const architectureEnd = builder.indexOf("\n}\n", architectureStart) + 2;
-  assert.equal(architectureStart >= 0 && architectureEnd > architectureStart, true);
-  const architectureSource = builder.slice(architectureStart, architectureEnd);
-  for (const buildProfile of ["release", "test"]) {
-    for (const migrationHelper of [false, true]) {
-      for (const [architecture, nativeArchitecture] of [["arm64", "arm64"], ["x64", "x86_64"]]) {
-        const calls = [];
-        const compile = runInNewContext(`${architectureSource}; (${compileSource})`, {
-          PINNED_NODE_ARCHITECTURE: "arm64",
-          MACOS_BUILD_PROFILE_RELEASE: "release",
-          MACOS_BUILD_PROFILE_TEST: "test",
-          MINIMUM_MACOS_VERSION: "14.0",
-          FIXED_EPOCH_SECONDS: 946_684_800,
-          PRODUCT_BRAND,
-          normalizeMacOSBuildProfile: (value) => value,
-          dirname,
-          join,
-          mkdtemp: async () => "/synthetic/compiler-scratch",
-          prepareTestCompilerModuleCache: async () => "/synthetic/module-cache",
-          chmod: async () => {},
-          utimes: async () => {},
-          rm: async () => {},
-          fail: (message) => { throw new Error(message); },
-          run(command, arguments_) {
-            calls.push({ command, arguments_: Array.from(arguments_) });
-            if (command === "/usr/bin/file") return `Mach-O 64-bit executable ${nativeArchitecture}`;
-            if (arguments_.includes("--show-sdk-path")) return "/synthetic/macos-sdk";
-            if (arguments_.includes("--version")) return "synthetic Swift toolchain";
-            return "";
-          },
-        });
-        const destination = migrationHelper
-          ? "/synthetic/TiboTattleKeychainMigration" : "/synthetic/TiboTattle";
-        await compile(destination, { enabled: false }, {
-          files: migrationHelper ? [ENTRYPOINT_SOURCE, SHARED_SOURCE] : [SHARED_SOURCE],
-        }, { architecture, buildProfile, migrationHelper });
-        const compileCalls = calls.filter(({ command, arguments_ }) =>
-          command === "/usr/bin/xcrun" && arguments_.includes("swiftc")
-          && !arguments_.includes("--version"));
-        assert.equal(compileCalls.length, 1);
-        const arguments_ = compileCalls[0].arguments_;
-        assert.equal(arguments_[arguments_.indexOf("-target") + 1], `${nativeArchitecture}-apple-macos14.0`);
-        assert.equal(arguments_.filter((value) => value === "-lbsm").length, 1);
-        assert.equal(arguments_.includes("WebKit"), !migrationHelper);
-        assert.equal(arguments_.includes("Security"), migrationHelper);
-        assert.equal(arguments_[arguments_.indexOf("-o") + 1], destination);
-        assert.equal(arguments_.includes(ENTRYPOINT_SOURCE), migrationHelper);
-        assert.equal(calls.some(({ command }) => command.includes("codesign")), false);
-      }
-    }
-  }
 });

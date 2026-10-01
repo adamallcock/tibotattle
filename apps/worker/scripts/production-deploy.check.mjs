@@ -8,6 +8,7 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, realpathSync } from "node:fs";
 import {
+  chmod,
   lstat,
   mkdir,
   mkdtemp,
@@ -26,15 +27,20 @@ import {
   PRODUCTION_DEPLOY_CONFIRMATION,
   PRODUCTION_MIGRATION_LEDGER_SQL,
   createImmutableSourceSnapshot,
+  createTypedProductionOperationPin,
   dependencyTreeDigest,
   determinePendingProductionMigrations,
+  prepareTypedProductionDeployment,
+  recheckProductionPublicReleaseManifest,
+  revalidateTypedProductionDeployment,
   runProductionDeployment,
   reconcileProductionDeployment,
+  reconcileTypedProductionDeployment,
   parseProductionDeploymentArgs,
   recheckProductionHealth,
   recheckProductionPublicSurface,
 } from "./production-deploy.mjs";
-import { readOperation } from "../../../scripts/lib/release-operation.mjs";
+import { openOperation, readOperation } from "../../../scripts/lib/release-operation.mjs";
 import { stageProductionAssets } from "./stage-production-assets.mjs";
 import { EXPECTED_STAGING_MIGRATIONS } from "./staging-readiness-lib.mjs";
 import { workerDirectory as checkedInWorkerDirectory } from "./staging-test-fixtures.mjs";
@@ -533,14 +539,65 @@ test("deployment CLI separates exact predecessor deployment from stopped-executo
   assert.deepEqual(parseProductionDeploymentArgs(["--confirm", "RECONCILE_PRODUCTION_DEPLOYMENT", "--operation", "/private/operation", "--executor-stopped"]), {
     confirmation: "RECONCILE_PRODUCTION_DEPLOYMENT", operationDirectory: "/private/operation", executorStopped: true,
   });
+  assert.deepEqual(parseProductionDeploymentArgs([
+    "--confirm", "RECONCILE_TYPED_PRODUCTION_DEPLOYMENT",
+    "--operation", "/private/operation",
+    "--executor-stopped",
+    "--inventory", "/private/inventory.json",
+    "--inventory-sha256", "1".repeat(64),
+  ]), {
+    confirmation: "RECONCILE_TYPED_PRODUCTION_DEPLOYMENT",
+    operationDirectory: "/private/operation",
+    executorStopped: true,
+    inventoryPath: "/private/inventory.json",
+    inventorySha256: "1".repeat(64),
+  });
   for (const args of [[], ["--confirm", "DEPLOY_PRODUCTION"],
     ["--confirm", "DEPLOY_PRODUCTION", "--expected-previous-source", "abc1234"],
     ["--confirm", "DEPLOY_PRODUCTION", "--expected-previous-source", FIXTURE_PREVIOUS_COMMIT, "--executor-stopped"],
     ["--confirm", "RECONCILE_PRODUCTION_DEPLOYMENT", "--operation", "/private/operation"],
     ["--confirm", "RECONCILE_PRODUCTION_DEPLOYMENT", "--operation", "/private/operation", "--executor-stopped", "--confirm-migrations", "BINDING:0001_test.sql"],
+    ["--confirm", "RECONCILE_TYPED_PRODUCTION_DEPLOYMENT", "--operation", "/private/operation", "--executor-stopped"],
+    ["--confirm", "RECONCILE_TYPED_PRODUCTION_DEPLOYMENT", "--operation", "/private/operation", "--executor-stopped", "--inventory", "/private/inventory.json", "--inventory-sha256", "bad"],
+    ["--confirm", "RECONCILE_TYPED_PRODUCTION_DEPLOYMENT", "--operation", "/private/operation", "--executor-stopped", "--inventory", "/private/inventory.json", "--inventory-sha256", "1".repeat(64), "--confirm-migrations", "BINDING:0001_test.sql"],
     ["--confirm", "DEPLOY_PRODUCTION", "--confirm", "DEPLOY_PRODUCTION", "--expected-previous-source", FIXTURE_PREVIOUS_COMMIT]]) {
     assert.throws(() => parseProductionDeploymentArgs(args), { code: "PRODUCTION_ARGUMENTS_INVALID" });
   }
+  assert.deepEqual(parseProductionDeploymentArgs([
+    "--confirm", "DEPLOY_PRODUCTION",
+    "--expected-previous-source", FIXTURE_PREVIOUS_COMMIT,
+    "--inventory", "/private/inventory.json",
+    "--inventory-sha256", "1".repeat(64),
+    "--retained-public-source", FIXTURE_PREVIOUS_COMMIT,
+    "--expected-live-manifest-sha256", "2".repeat(64),
+  ]), {
+    confirmation: "DEPLOY_PRODUCTION",
+    expectedPreviousSourceCommit: FIXTURE_PREVIOUS_COMMIT,
+    inventoryPath: "/private/inventory.json",
+    inventorySha256: "1".repeat(64),
+    retainedPublicSourceCommit: FIXTURE_PREVIOUS_COMMIT,
+    expectedLiveManifestSha256: "2".repeat(64),
+  });
+  for (const args of [
+    ["--confirm", "DEPLOY_PRODUCTION", "--expected-previous-source", FIXTURE_PREVIOUS_COMMIT, "--inventory", "/private/inventory.json"],
+    ["--confirm", "DEPLOY_PRODUCTION", "--expected-previous-source", FIXTURE_PREVIOUS_COMMIT, "--inventory", "/private/inventory.json", "--inventory-sha256", "1".repeat(64)],
+    ["--confirm", "DEPLOY_PRODUCTION", "--expected-previous-source", FIXTURE_PREVIOUS_COMMIT, "--retained-public-source", FIXTURE_PREVIOUS_COMMIT],
+  ]) {
+    assert.throws(() => parseProductionDeploymentArgs(args), { code: "PRODUCTION_ARGUMENTS_INVALID" });
+  }
+});
+
+test("deployment CLI captures the current clean candidate when no candidate override is supplied", async () => {
+  const configured = readyOptions();
+  delete configured.expectedSourceCommit;
+  Object.assign(configured, parseProductionDeploymentArgs([
+    "--confirm", "DEPLOY_PRODUCTION", "--expected-previous-source", FIXTURE_PREVIOUS_COMMIT,
+  ]));
+  const result = await runProductionDeployment(configured);
+  assert.equal(result.ok, true);
+  const journal = await readOperation(configured.operationDirectory);
+  assert.equal(journal.state.sourceCommit, FIXTURE_SOURCE_COMMIT);
+  assert.equal(journal.state.outcome, "verified");
 });
 
 test("dependency digest ignores only root Wrangler runtime state", async (t) => {
@@ -1362,6 +1419,9 @@ test("reconciled production ledger preserves the historical prefix and refuses a
     "USAGE_MONITOR_DB:0057_accountless_enrollment_ledger.sql",
     "USAGE_MONITOR_DB:0058_accountless_upload_ownership.sql",
     "USAGE_MONITOR_DB:0059_accountless_upload_renewal.sql",
+    "USAGE_MONITOR_DB:0060_public_contribution_sources.sql",
+    "USAGE_MONITOR_DB:0061_accountless_history_retention.sql",
+    "USAGE_MONITOR_DB:0062_v1_acquisition_vocabulary.sql",
   ];
   const ledgerRows = (names) => names.map((name, index) => ({ id: index + 1, name }));
   const historicalPrefix = expected.USAGE_MONITOR_DB.slice(0, 41);
@@ -1427,7 +1487,7 @@ test("reconciled production ledger preserves the historical prefix and refuses a
     code: null,
     pending: ["USAGE_MONITOR_DB:0049_preserve_published_graph.sql", ...incrementalPending],
   });
-  for (const count of [49, 50, 51, 52, 53, 54, 55, 56, 57, 58]) {
+  for (const count of [49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61]) {
     assert.deepEqual(await inspect(expected.USAGE_MONITOR_DB.slice(0, count)), {
       ok: true, code: null, pending: incrementalPending.slice(count - 49),
     });
@@ -1439,7 +1499,7 @@ test("reconciled production ledger preserves the historical prefix and refuses a
     [...through45, "0046_v1_quota_fit_projection.sql", "0047_unreviewed_work.sql"],
     [...expected.USAGE_MONITOR_DB.slice(0, 47), "0048_unreviewed_model_history.sql"],
     [...expected.USAGE_MONITOR_DB.slice(0, 48), "0049_unreviewed_graph_preservation.sql"],
-    ...[50, 51, 52, 53, 54, 55, 56, 57, 58, 59].map(number => [...expected.USAGE_MONITOR_DB.slice(0, number - 1),
+    ...[50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62].map(number => [...expected.USAGE_MONITOR_DB.slice(0, number - 1),
       `${String(number).padStart(4, "0")}_unreviewed.sql`]),
   ]) {
     const index = applied.findIndex((name, item) => name !== expected.USAGE_MONITOR_DB[item]);
@@ -1449,7 +1509,7 @@ test("reconciled production ledger preserves the historical prefix and refuses a
       detail: {
         binding: "USAGE_MONITOR_DB",
         appliedCount: applied.length,
-        localCount: 59,
+        localCount: 62,
         firstMismatch: { index, applied: applied[index], local: expected.USAGE_MONITOR_DB[index] },
       },
     });
@@ -1470,7 +1530,7 @@ test("reconciled production ledger preserves the historical prefix and refuses a
       detail: {
         binding: "USAGE_MONITOR_DB",
         appliedCount: applied.length,
-        localCount: 59,
+        localCount: 62,
         firstMismatch: { index, applied: applied[index], local: expected.USAGE_MONITOR_DB[index] },
       },
     });
@@ -1646,13 +1706,17 @@ test("production public-surface recheck requires a public root and real 404s for
   assert.equal(calls[2].url, PUBLIC_SITEMAP_URL);
   assert.equal(calls[3].url, PUBLIC_WWW_ROOT_URL);
   assert.equal(calls[3].request.redirect, "manual");
-  assert.equal(calls.length, 15);
+  assert.equal(calls.length, 16);
   assert.equal(calls.some(({ url }) => url === new URL(
     "/telemetry-shared.generated.js",
     PUBLIC_ROOT_URL,
   ).href), true);
   assert.equal(calls.some(({ url }) => url === new URL(
     "/api/v1/admin/community/allowance-preview",
+    PUBLIC_ROOT_URL,
+  ).href), true);
+  assert.equal(calls.some(({ url }) => url === new URL(
+    "/api/v1/admin/database-health",
     PUBLIC_ROOT_URL,
   ).href), true);
   assert.equal(calls.some(({ url }) => url === new URL(
@@ -1708,4 +1772,634 @@ test("production public-surface recheck rejects any publicly served private asse
     ok: false,
     code: "PRODUCTION_PUBLIC_SURFACE_PRIVATE_ASSET_EXPOSED",
   });
+});
+
+test("typed deployment preparation binds the pinned predecessor, candidate config, and read-only schema gate", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "production-typed-candidate-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(join(root, "wrangler.jsonc"), "{}\n");
+  const previous = FIXTURE_PREVIOUS_COMMIT;
+  const source = FIXTURE_SOURCE_COMMIT;
+  const baseline = {
+    schema: "production-live-config-v1",
+    sourceCommit: previous,
+    versionId: "11111111-1111-4111-8111-111111111111",
+    fingerprint: "f".repeat(64),
+  };
+  const inventory = { snapshot: baseline };
+  let captures = 0;
+  const provider = {
+    capture: async () => {
+      captures += 1;
+      return { snapshot: { ...baseline } };
+    },
+    query: async () => ({ success: true, results: [] }),
+  };
+  const candidate = {
+    env: {
+      production: {
+        vars: {
+          TELEMETRY_STORAGE_MODE: "typed",
+          TELEMETRY_STORAGE_NAMESPACE: "synthetic-namespace",
+        },
+      },
+    },
+  };
+  const configTools = {
+    createSnapshot: (value) => value.snapshot,
+    render: ({ sourceCommit }) => ({
+      ...candidate,
+      env: {
+        production: {
+          vars: {
+            ...candidate.env.production.vars,
+            DEPLOYMENT_SOURCE_COMMIT: sourceCommit,
+          },
+        },
+      },
+    }),
+    verify: () => ({ ok: true, code: null }),
+  };
+  const prepared = await prepareTypedProductionDeployment({
+    inventory,
+    provider,
+    workerDirectory: root,
+    sourceCommit: source,
+    expectedPreviousSourceCommit: previous,
+    configTools,
+    buildSchemas: async () => ({ expectedSchemas: { primary: {}, analytics: {}, ledger: {} } }),
+    inspectTyped: async ({ config }) => {
+      assert.equal(config.mode, "typed");
+      assert.equal(config.sourceNamespace, "synthetic-namespace");
+      return { ok: true, code: "TYPED_PRODUCTION_PREFLIGHT_PASSED" };
+    },
+  });
+  assert.equal(prepared.ok, true);
+  assert.equal(captures, 1);
+  assert.equal(prepared.configSha256.length, 64);
+  assert.equal(prepared.baseline.sourceCommit, previous);
+});
+
+test("typed operation identity pins live config, schema inputs, and retained public release", async () => {
+  const previous = FIXTURE_PREVIOUS_COMMIT;
+  const result = await createTypedProductionOperationPin({
+    inventory: { snapshot: {
+      sourceCommit: previous,
+      fingerprint: "f".repeat(64),
+    } },
+    workerDirectory: "/synthetic/worker",
+    expectedPreviousSourceCommit: previous,
+    retainedPublicSourceCommit: "d".repeat(40),
+    expectedLiveManifestSha256: "e".repeat(64),
+    configTools: { createSnapshot: (value) => value.snapshot },
+    buildSchemas: async () => ({
+      schema: "production-typed-schema-v1",
+      inputSha256: {
+        primary: "1".repeat(64),
+        analytics: "2".repeat(64),
+        ledger: "3".repeat(64),
+      },
+      expectedSchemas: {
+        primary: { schemaSha256: "4".repeat(64) },
+        analytics: { schemaSha256: "5".repeat(64) },
+        ledger: { schemaSha256: "6".repeat(64) },
+      },
+      operatorSchemaSourceSha256: "7".repeat(64),
+    }),
+  });
+  assert.deepEqual(result, {
+    ok: true,
+    pin: {
+      schema: "production-typed-operation-v1",
+      liveConfigurationFingerprint: "f".repeat(64),
+      predecessorSourceCommit: previous,
+      retainedPublicSourceCommit: "d".repeat(40),
+      expectedLiveManifestSha256: "e".repeat(64),
+      expectedSchemaIdentity: {
+        schema: "production-typed-schema-v1",
+        inputSha256: {
+          primary: "1".repeat(64),
+          analytics: "2".repeat(64),
+          ledger: "3".repeat(64),
+        },
+        schemaSha256: {
+          primary: "4".repeat(64),
+          analytics: "5".repeat(64),
+          ledger: "6".repeat(64),
+        },
+        operatorSchemaSourceSha256: "7".repeat(64),
+      },
+    },
+  });
+});
+
+test("typed deployment revalidation allows only the intended source movement after Wrangler", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "production-typed-revalidate-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const configPath = join(root, "wrangler.jsonc");
+  const configBytes = Buffer.from('{"env":{"production":{"vars":{"TELEMETRY_STORAGE_MODE":"typed","TELEMETRY_STORAGE_NAMESPACE":"synthetic"}}}}\n');
+  await writeFile(configPath, configBytes);
+  await chmod(configPath, 0o600);
+  const previous = FIXTURE_PREVIOUS_COMMIT;
+  const source = FIXTURE_SOURCE_COMMIT;
+  const baseline = {
+    sourceCommit: previous,
+    versionId: "11111111-1111-4111-8111-111111111111",
+    fingerprint: "f".repeat(64),
+  };
+  const after = {
+    sourceCommit: source,
+    versionId: "22222222-2222-4222-8222-222222222222",
+    fingerprint: baseline.fingerprint,
+  };
+  let current = { ...baseline, versionId: "33333333-3333-4333-8333-333333333333" };
+  const provider = {
+    capture: async () => ({ snapshot: current }),
+    query: async () => ({ success: true, results: [] }),
+  };
+  const typedDeployment = {
+    baseline,
+    currentInventory: { snapshot: baseline },
+    configSha256: createHash("sha256").update(configBytes).digest("hex"),
+    expectedSchemas: { primary: {}, analytics: {}, ledger: {} },
+    provider,
+    inspectTyped: async () => ({ ok: true, code: "TYPED_PRODUCTION_PREFLIGHT_PASSED" }),
+    configTools: {
+      createSnapshot: (value) => value.snapshot,
+      verify: () => ({ ok: true, code: null }),
+    },
+  };
+  assert.deepEqual(await revalidateTypedProductionDeployment({
+    typedDeployment,
+    configPath,
+    sourceCommit: source,
+    expectedPreviousSourceCommit: previous,
+    phase: "before",
+  }), { ok: false, code: "PRODUCTION_TYPED_LIVE_CHANGED" });
+  current = after;
+  assert.deepEqual(await revalidateTypedProductionDeployment({
+    typedDeployment,
+    configPath,
+    sourceCommit: source,
+    expectedPreviousSourceCommit: previous,
+    phase: "after",
+  }), { ok: true, code: null, phase: "after" });
+  current = { ...after, fingerprint: "e".repeat(64) };
+  assert.deepEqual(await revalidateTypedProductionDeployment({
+    typedDeployment,
+    configPath,
+    sourceCommit: source,
+    expectedPreviousSourceCommit: previous,
+    phase: "after",
+  }), { ok: false, code: "PRODUCTION_TYPED_POST_DEPLOY_LIVE_MISMATCH" });
+});
+
+test("typed pre-deploy revalidation refuses live drift during schema queries", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "production-typed-revalidate-drift-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const configPath = join(root, "wrangler.jsonc");
+  const configBytes = Buffer.from(
+    '{"env":{"production":{"vars":{"TELEMETRY_STORAGE_MODE":"typed","TELEMETRY_STORAGE_NAMESPACE":"synthetic"}}}}\n',
+  );
+  await writeFile(configPath, configBytes);
+  await chmod(configPath, 0o600);
+  const previous = FIXTURE_PREVIOUS_COMMIT;
+  const baseline = {
+    sourceCommit: previous,
+    versionId: "11111111-1111-4111-8111-111111111111",
+    fingerprint: "f".repeat(64),
+  };
+  const drifted = { ...baseline, fingerprint: "e".repeat(64) };
+  let current = baseline;
+  let captures = 0;
+  let queries = 0;
+  const provider = {
+    capture: async () => {
+      captures += 1;
+      return { snapshot: current };
+    },
+    query: async () => {
+      queries += 1;
+      current = drifted;
+      return { success: true, results: [] };
+    },
+  };
+  const typedDeployment = {
+    baseline,
+    currentInventory: { snapshot: baseline },
+    configSha256: createHash("sha256").update(configBytes).digest("hex"),
+    expectedSchemas: { primary: {}, analytics: {}, ledger: {} },
+    provider,
+    inspectTyped: async ({ runQuery }) => {
+      await runQuery("USAGE_MONITOR_DB", "fixed-schema-query");
+      return { ok: true, code: "TYPED_PRODUCTION_PREFLIGHT_PASSED" };
+    },
+    configTools: {
+      createSnapshot: (value) => value.snapshot,
+      verify: () => ({ ok: true, code: null }),
+    },
+  };
+  assert.deepEqual(await revalidateTypedProductionDeployment({
+    typedDeployment,
+    configPath,
+    sourceCommit: FIXTURE_SOURCE_COMMIT,
+    expectedPreviousSourceCommit: previous,
+    phase: "before",
+  }), { ok: false, code: "PRODUCTION_TYPED_LIVE_CHANGED" });
+  assert.equal(captures, 2);
+  assert.equal(queries, 1);
+});
+
+test("typed deployment refuses an unqualified inventory before Wrangler", async () => {
+  const calls = [];
+  const result = await runProductionDeployment(readyOptions({
+    typedProduction: {
+      inventory: {},
+      provider: { capture: async () => {}, query: async () => {} },
+    },
+    retainedPublicSourceCommit: FIXTURE_PREVIOUS_COMMIT,
+    expectedLiveManifestSha256: "1".repeat(64),
+    migrationGateCheck: { ok: true, code: null, pending: ["USAGE_MONITOR_DB:0001_schema.sql"] },
+    stageAssets: async () => calls.push("assets"),
+    spawn: () => calls.push("deploy"),
+  }));
+  assert.equal(result.ok, false);
+  assert.equal(result.code, "PRODUCTION_LIVE_CONFIG_INVENTORY_INVALID");
+  assert.deepEqual(calls, []);
+});
+
+test("legacy deployment refuses typed public asset pins before snapshot", async () => {
+  for (const pins of [
+    { candidatePublicManifestSha256: "2".repeat(64) },
+    { retainedPublicSourceCommit: FIXTURE_PREVIOUS_COMMIT },
+    { expectedLiveManifestSha256: "1".repeat(64) },
+    {
+      retainedPublicSourceCommit: FIXTURE_PREVIOUS_COMMIT,
+      expectedLiveManifestSha256: "1".repeat(64),
+    },
+  ]) {
+    const calls = [];
+    const result = await runProductionDeployment(readyOptions({
+      ...pins,
+      createSourceSnapshot: async () => {
+        calls.push("snapshot");
+        throw new Error("snapshot must not run");
+      },
+      stageAssets: async () => calls.push("assets"),
+      spawn: () => calls.push("deploy"),
+    }));
+    assert.deepEqual(result, { ok: false, code: "PRODUCTION_TYPED_INPUT_INVALID" });
+    assert.deepEqual(calls, []);
+  }
+});
+
+test("typed deployment refuses a caller-supplied manifest gate bypass", async () => {
+  const calls = [];
+  const baseline = {
+    sourceCommit: FIXTURE_PREVIOUS_COMMIT,
+    fingerprint: "f".repeat(64),
+  };
+  const result = await runProductionDeployment(readyOptions({
+    typedProduction: {
+      inventory: { snapshot: baseline },
+      provider: { capture: async () => {}, query: async () => {} },
+      configTools: { createSnapshot: (value) => value.snapshot },
+      buildSchemas: async () => ({
+        schema: "production-typed-schema-v1",
+        inputSha256: {
+          primary: "1".repeat(64),
+          analytics: "2".repeat(64),
+          ledger: "3".repeat(64),
+        },
+        expectedSchemas: {
+          primary: { schemaSha256: "4".repeat(64) },
+          analytics: { schemaSha256: "5".repeat(64) },
+          ledger: { schemaSha256: "6".repeat(64) },
+        },
+        operatorSchemaSourceSha256: "7".repeat(64),
+      }),
+    },
+    retainedPublicSourceCommit: FIXTURE_PREVIOUS_COMMIT,
+    expectedLiveManifestSha256: "1".repeat(64),
+    publicReleaseManifestRecheck: null,
+    stageAssets: async () => calls.push("assets"),
+    spawn: () => calls.push("deploy"),
+  }));
+  assert.deepEqual(result, { ok: false, code: "PRODUCTION_TYPED_INPUT_INVALID" });
+  assert.deepEqual(calls, []);
+});
+
+test("typed deployment rejects a contradictory nested predecessor before pinning", async () => {
+  const calls = [];
+  const result = await runProductionDeployment(readyOptions({
+    typedProduction: {
+      expectedPreviousSourceCommit: FIXTURE_SOURCE_COMMIT,
+      inventory: {},
+      provider: { capture: async () => {}, query: async () => {} },
+    },
+    retainedPublicSourceCommit: FIXTURE_PREVIOUS_COMMIT,
+    expectedLiveManifestSha256: "1".repeat(64),
+    createSourceSnapshot: async () => calls.push("snapshot"),
+    coordinationFactory: () => calls.push("coordination"),
+  }));
+  assert.deepEqual(result, {
+    ok: false,
+    code: "PRODUCTION_TYPED_PREDECESSOR_MISMATCH",
+  });
+  assert.deepEqual(calls, []);
+});
+
+for (const mode of ["retained", "candidate", "bad-preimage", "bad-postimage", "mutated-options"]) test(`typed deployment preserves immutable config and manifest transition: ${mode}`, async (t) => {
+  const candidate = mode === "retained" ? null : "2".repeat(64);
+  const manifestChecks = [];
+  const fixture = await immutableSnapshotFixture();
+  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+  const baseline = {
+    sourceCommit: FIXTURE_PREVIOUS_COMMIT,
+    versionId: "11111111-1111-4111-8111-111111111111",
+    fingerprint: "f".repeat(64),
+  };
+  const source = {
+    sourceCommit: fixture.sourceCommit,
+    versionId: "22222222-2222-4222-8222-222222222222",
+    fingerprint: baseline.fingerprint,
+  };
+  let deployed = false;
+  let captures = 0;
+  const provider = {
+    capture: async () => ({
+      snapshot: (++captures >= 3 && deployed) ? source : baseline,
+    }),
+    query: async () => ({ success: true, results: [] }),
+  };
+  const configTools = {
+    createSnapshot: (value) => value.snapshot,
+    render: ({ sourceCommit }) => ({
+      env: {
+        production: {
+          vars: {
+            DEPLOYMENT_SOURCE_COMMIT: sourceCommit,
+            TELEMETRY_STORAGE_MODE: "typed",
+            TELEMETRY_STORAGE_NAMESPACE: "synthetic-namespace",
+          },
+        },
+      },
+    }),
+    verify: () => ({ ok: true, code: null }),
+  };
+  const healthRecheck = async () => ({
+    ok: true,
+    code: null,
+    sourceCommit: deployed ? fixture.sourceCommit : FIXTURE_PREVIOUS_COMMIT,
+  });
+  const configured = options({
+    workerDirectory: fixture.workerDirectory,
+    expectedSourceCommit: fixture.sourceCommit,
+    sourceCommitCheck: (directory) => git(directory, ["rev-parse", "HEAD"]).trim(),
+    sourceTreeCleanCheck: (directory) => git(
+      directory,
+      ["status", "--porcelain=v1", "--untracked-files=all"],
+    ).trim() === "",
+    createSourceSnapshot: (arguments_) => {
+      if (mode === "mutated-options") configured.candidatePublicManifestSha256 = "3".repeat(64);
+      return createImmutableSourceSnapshot(arguments_);
+    },
+    dependencyDigestCheck: undefined,
+    typedProduction: {
+      inventory: { snapshot: baseline },
+      provider,
+      configTools,
+      buildSchemas: async () => ({
+        schema: "production-typed-schema-v1",
+        inputSha256: {
+          primary: "1".repeat(64),
+          analytics: "2".repeat(64),
+          ledger: "3".repeat(64),
+        },
+        expectedSchemas: {
+          primary: { schemaSha256: "4".repeat(64) },
+          analytics: { schemaSha256: "5".repeat(64) },
+          ledger: { schemaSha256: "6".repeat(64) },
+        },
+        operatorSchemaSourceSha256: "7".repeat(64),
+      }),
+      inspectTyped: async ({ config }) => {
+        assert.equal(config.mode, "typed");
+        return { ok: true, code: "TYPED_PRODUCTION_PREFLIGHT_PASSED" };
+      },
+    },
+    retainedPublicSourceCommit: FIXTURE_PREVIOUS_COMMIT,
+    expectedLiveManifestSha256: "1".repeat(64),
+    candidatePublicManifestSha256: candidate,
+    migrationGateCheck: null,
+    determinePendingMigrations: async () => assert.fail("Qualified typed roles must not query the legacy migration ledger"),
+    releasePreflight: async () => ({ state: "ready", blockers: [] }),
+    checkWorkspacePackages: async () => {},
+    checkEndpoints: async () => {},
+    stageAssets: async ({ repositoryRoot, expectedSourceCommit, retainedPublicSourceCommit, expectedLiveManifestSha256 }) => {
+      assert.equal(expectedSourceCommit, fixture.sourceCommit);
+      assert.equal(retainedPublicSourceCommit, candidate === null ? FIXTURE_PREVIOUS_COMMIT : fixture.sourceCommit);
+      assert.equal(expectedLiveManifestSha256, candidate ?? "1".repeat(64));
+      assert.equal(realpathSync(repositoryRoot), repositoryRoot);
+      const configMetadata = await lstat(
+        join(repositoryRoot, "apps", "worker", "wrangler.jsonc"),
+      );
+      assert.equal(configMetadata.mode & 0o777, 0o600);
+    },
+    publicReleaseManifestRecheck: async ({ expectedSha256 }) => {
+      manifestChecks.push(expectedSha256);
+      assert.equal(expectedSha256, deployed ? candidate ?? "1".repeat(64) : "1".repeat(64));
+      return { ok: !(mode === "bad-preimage" && !deployed) && !(mode === "bad-postimage" && deployed), code: null };
+    },
+    publicSurfaceRecheck: async () => ({ ok: true, code: null }),
+    healthRecheck,
+    spawn: () => {
+      deployed = true;
+      return { status: 0, stdout: "deployed", stderr: "" };
+    },
+  });
+  const result = await runProductionDeployment(configured);
+  if (["bad-preimage", "bad-postimage"].includes(mode)) {
+    assert.equal(result.ok, false);
+    assert.equal(deployed, mode === "bad-postimage");
+    assert.equal(result.outcome, mode === "bad-postimage" ? "deployed_unverified" : "not_started");
+    assert.equal(result.coordination, mode === "bad-postimage" ? "held" : "not_acquired");
+    assert.equal(result.code, "PRODUCTION_TYPED_PUBLIC_RELEASE_MANIFEST_INVALID");
+    return;
+  }
+  assert.deepEqual(manifestChecks, ["1".repeat(64), candidate ?? "1".repeat(64)]);
+  assert.equal(result.ok, true);
+  assert.equal(result.code, "PRODUCTION_DEPLOYED");
+  assert.equal(captures, 4);
+  const record = await readOperation(configured.operationDirectory);
+  assert.equal(record.state.typed.candidatePublicManifestSha256 ?? null, candidate);
+  assert.equal(record.state.typed.schema, "production-typed-operation-v1");
+  assert.equal(record.state.typed.liveConfigurationFingerprint, baseline.fingerprint);
+  assert.equal(record.state.typed.retainedPublicSourceCommit, FIXTURE_PREVIOUS_COMMIT);
+  assert.equal(record.state.typed.expectedLiveManifestSha256, "1".repeat(64));
+  assert.equal(record.state.typed.expectedSchemaIdentity.schema, "production-typed-schema-v1");
+  assert.deepEqual(await reconcileProductionDeployment({
+    operationDirectory: configured.operationDirectory,
+    workerDirectory: fixture.workerDirectory,
+    confirmation: "RECONCILE_PRODUCTION_DEPLOYMENT",
+    executorStopped: true,
+  }), {
+    ok: false,
+    code: "PRODUCTION_TYPED_RECONCILIATION_UNSUPPORTED",
+  });
+});
+
+test("typed reconciliation rechecks journal pins and all live gates before releasing ownership", async () => {
+  const directory = operationDirectory();
+  const lock = coordinationFixture();
+  const schemaInput = {
+    analytics: "1".repeat(64),
+    ledger: "2".repeat(64),
+    primary: "3".repeat(64),
+  };
+  const schemaSha = {
+    analytics: "4".repeat(64),
+    ledger: "5".repeat(64),
+    primary: "6".repeat(64),
+  };
+  const expected = {
+    schema: "production-typed-schema-v1",
+    inputSha256: schemaInput,
+    expectedSchemas: Object.fromEntries(Object.entries(schemaSha).map(([role, sha]) => [role, { schemaSha256: sha }])),
+    operatorSchemaSourceSha256: "7".repeat(64),
+  };
+  const pin = {
+    schema: "production-typed-operation-v1",
+    liveConfigurationFingerprint: "8".repeat(64),
+    predecessorSourceCommit: FIXTURE_PREVIOUS_COMMIT,
+    retainedPublicSourceCommit: FIXTURE_PREVIOUS_COMMIT,
+    expectedLiveManifestSha256: "9".repeat(64),
+    expectedSchemaIdentity: {
+      schema: "production-typed-schema-v1",
+      inputSha256: schemaInput,
+      schemaSha256: schemaSha,
+      operatorSchemaSourceSha256: "7".repeat(64),
+    },
+  };
+  const binding = {
+    sourceCommit: FIXTURE_SOURCE_COMMIT,
+    previousSourceCommit: FIXTURE_PREVIOUS_COMMIT,
+    confirmedMigrations: null,
+    typed: pin,
+  };
+  const operation = await openOperation({ directory, kind: "production", binding });
+  await operation.save({
+    ...binding,
+    owner: FIXTURE_OWNER,
+    stage: "failed",
+    outcome: "deployed_unverified",
+    code: "PRODUCTION_POST_DEPLOY_SOURCE_MISMATCH",
+    lock: "held",
+  });
+  operation.close();
+  lock.acquire(FIXTURE_OWNER);
+  const live = {
+    sourceCommit: FIXTURE_SOURCE_COMMIT,
+    versionId: "22222222-2222-4222-8222-222222222222",
+    fingerprint: pin.liveConfigurationFingerprint,
+  };
+  let actual = live;
+  let manifestOk = true;
+  let preflightOk = true;
+  let healthSource = FIXTURE_SOURCE_COMMIT;
+  let schema = expected;
+  let captures = 0;
+  const reconcile = {
+    confirmation: "RECONCILE_TYPED_PRODUCTION_DEPLOYMENT",
+    executorStopped: true,
+    operationDirectory: directory,
+    workerDirectory: checkedInWorkerDirectory,
+    typedProduction: {
+      inventory: { snapshot: live },
+      provider: {
+        capture: async () => { captures += 1; return { snapshot: actual }; },
+        query: async () => ({ success: true, results: [] }),
+      },
+    },
+    coordinationFactory: () => lock,
+    buildSchemas: async () => schema,
+    inspectTyped: async () => ({ ok: preflightOk }),
+    configTools: {
+      createSnapshot: (value) => value.snapshot,
+      render: ({ sourceCommit }) => ({ env: { production: { vars: {
+        DEPLOYMENT_SOURCE_COMMIT: sourceCommit,
+        TELEMETRY_STORAGE_MODE: "typed",
+        TELEMETRY_STORAGE_NAMESPACE: "synthetic-namespace",
+      } } } }),
+      verify: () => ({ ok: true }),
+    },
+    healthRecheck: async () => ({ ok: true, sourceCommit: healthSource }),
+    publicSurfaceRecheck: async () => ({ ok: true }),
+    publicReleaseManifestRecheck: async ({ expectedSha256 }) => {
+      assert.equal(expectedSha256, pin.expectedLiveManifestSha256);
+      return { ok: manifestOk };
+    },
+  };
+  assert.equal((await reconcileTypedProductionDeployment({ ...reconcile, executorStopped: false })).code,
+    "RECONCILIATION_CONFIRMATION_REQUIRED");
+  assert.equal(captures, 0);
+  actual = { ...live, fingerprint: "0".repeat(64) };
+  assert.equal((await reconcileTypedProductionDeployment(reconcile)).code,
+    "PRODUCTION_TYPED_RECONCILIATION_LIVE_MISMATCH");
+  actual = live;
+  schema = { ...expected, operatorSchemaSourceSha256: "0".repeat(64) };
+  assert.equal((await reconcileTypedProductionDeployment(reconcile)).code,
+    "PRODUCTION_TYPED_RECONCILIATION_SCHEMA_MISMATCH");
+  schema = expected;
+  preflightOk = false;
+  assert.equal((await reconcileTypedProductionDeployment(reconcile)).code,
+    "PRODUCTION_TYPED_RECONCILIATION_PREFLIGHT_BLOCKED");
+  preflightOk = true;
+  manifestOk = false;
+  assert.equal((await reconcileTypedProductionDeployment(reconcile)).code,
+    "PRODUCTION_TYPED_RECONCILIATION_PUBLIC_MISMATCH");
+  manifestOk = true;
+  healthSource = FIXTURE_PREVIOUS_COMMIT;
+  assert.equal((await reconcileTypedProductionDeployment(reconcile)).code,
+    "PRODUCTION_TYPED_RECONCILIATION_UNVERIFIED");
+  healthSource = FIXTURE_SOURCE_COMMIT;
+  assert.deepEqual(lock.events, ["acquire"]);
+  assert.deepEqual(await reconcileTypedProductionDeployment(reconcile), {
+    ok: true,
+    code: "PRODUCTION_TYPED_RECONCILED",
+    outcome: "verified",
+    coordination: "released",
+  });
+  assert.deepEqual(lock.events, ["acquire", "release"]);
+  assert.equal((await readOperation(directory)).state.outcome, "verified");
+  assert.equal((await readOperation(directory)).state.lock, "released");
+});
+
+test("public release manifest recheck is bounded and exact", async () => {
+  const bytes = Buffer.from('{"schemaVersion":"synthetic"}\n');
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  const response = {
+    url: `${DEPLOYMENT_ENDPOINTS.public.origin}/release-site-manifest.json`,
+    status: 200,
+    headers: { get: (name) => name === "content-type" ? "application/json" : null },
+    arrayBuffer: async () => bytes,
+  };
+  assert.deepEqual(await recheckProductionPublicReleaseManifest({
+    expectedSha256: sha256,
+    fetchImpl: async () => response,
+  }), { ok: true, code: null, sha256 });
+  assert.deepEqual(await recheckProductionPublicReleaseManifest({
+    expectedSha256: "0".repeat(64),
+    fetchImpl: async () => response,
+  }), { ok: false, code: "PRODUCTION_PUBLIC_RELEASE_MANIFEST_MISMATCH" });
+});
+
+test("typed candidate manifest rejects malformed values before provider or snapshot work", async () => {
+ for (const candidatePublicManifestSha256 of ["", "no", 42, {}, "A".repeat(64)]) {
+  const result=await runProductionDeployment(readyOptions({candidatePublicManifestSha256,
+   retainedPublicSourceCommit:FIXTURE_PREVIOUS_COMMIT,expectedLiveManifestSha256:"1".repeat(64),
+   typedProduction:{inventory:{},provider:{capture:()=>assert.fail("provider must not run")}},
+   createSourceSnapshot:()=>assert.fail("snapshot must not run")}));
+  assert.deepEqual(result,{ok:false,code:"PRODUCTION_TYPED_INPUT_INVALID"});
+ }
 });

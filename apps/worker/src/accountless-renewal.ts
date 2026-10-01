@@ -332,6 +332,16 @@ async function authenticatedRenewableGraph(
   return { ledger, presentedHash, graph };
 }
 
+/** The successor grant exists only after isolation 0008 and becomes
+ * renewable only with 0010's trigger. One schema read per renewal keeps older
+ * databases on the unchanged four-row renewal. A grant a race leaves behind is
+ * reported as not current and caught up by its next authorization request. */
+async function v12RenewalInstalled(db: D1Database): Promise<boolean> {
+  return await db.prepare(`SELECT 1 AS present FROM sqlite_schema
+    WHERE type = 'trigger' AND name = 'accountless_v12_authorization_immutable'
+      AND sql LIKE '%renewal_generation%'`).first<number>("present") === 1;
+}
+
 /**
  * Extend only an exact, active accountless owner graph. A replay of the
  * original enrollment remains finite; this explicit bearer action is what
@@ -507,6 +517,40 @@ export async function renewAccountlessUploadOwner(
         nextGeneration,
         renewedAt,
       ),
+      // The optional v1.2 successor grant moves with the same lease. Before
+      // isolation 0010 its trigger forbids any expiry change and would abort
+      // this whole renewal, so the row is only addressed once the
+      // renewal-aware trigger is installed; an absent grant matches nothing.
+      ...(await v12RenewalInstalled(db) ? [db.prepare(`
+        UPDATE accountless_v12_device_authorizations
+           SET expires_at = ?
+         WHERE enrollment_device_id = ? AND participant_id = ?
+           AND device_credential_id = ? AND state = 'active' AND expires_at = ?
+           AND EXISTS (
+             SELECT 1
+               FROM accountless_enrollment_ledger ledger
+               JOIN device_credentials device
+                 ON device.id = accountless_v12_device_authorizations.device_credential_id
+               JOIN accountless_upload_owners owner
+                 ON owner.enrollment_device_id = ledger.device_id
+                AND owner.participant_id = accountless_v12_device_authorizations.participant_id
+                AND owner.device_credential_id = device.id
+              WHERE ledger.device_id = accountless_v12_device_authorizations.enrollment_device_id
+                AND ledger.state = 'active' AND ledger.expires_at = ?
+                AND ledger.renewal_generation = ? AND ledger.renewed_at = ?
+                AND device.state = 'active' AND device.expires_at = ledger.expires_at
+                AND owner.state = 'active' AND owner.expires_at = ledger.expires_at
+           )
+      `).bind(
+        expiresAt,
+        ledger.device_id,
+        graph.participant_id,
+        ledger.device_id,
+        ledger.expires_at,
+        expiresAt,
+        nextGeneration,
+        renewedAt,
+      )] : []),
     ]);
     // RETURNING identifies the exact fenced ledger row without relying on D1
     // change counts, which can include trigger work. Exact graph/generation

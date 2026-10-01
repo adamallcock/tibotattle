@@ -2,7 +2,7 @@ import { createCodexLogIngestion } from "./log-ingestion.js";
 import { createCodexLogParser } from "./log-parser.js";
 import { createCodexLogSources } from "./log-sources.js";
 
-export const CODEX_LOG_SCAN_VERSION = "codex-log-scan-v9";
+export const CODEX_LOG_SCAN_VERSION = "codex-log-scan-v10";
 
 const FILESYSTEM_METHODS = Object.freeze([
   "defaultCodexHome",
@@ -134,10 +134,22 @@ export {
 } from "./log-sources.js";
 export { classifySessionSurface } from "./surface-classification.js";
 export {
+  codexTierObservation,
   isCodexSpeedMode,
   normalizeProviderTier,
   unknownCodexTier,
   validateTierDeclaration,
 } from "./tier-normalization.js";
 
-export { createParser, digest, METHOD, MAX_STATE_BYTES } from './inference-timing.js';
+// The performance parser is deliberately exposed under a projection-specific
+// name so callers cannot mistake it for the accounting/log-normalization path.
+export {
+  createParser,
+  createToolFreeParser,
+  createParser as createCodexPerformanceTimingParser,
+  digest,
+  METHOD,
+  INFERENCE_TIMING_PARSER_VERSION,
+  TOOL_FREE_METHOD,
+  MAX_STATE_BYTES,
+} from "./inference-timing.js";

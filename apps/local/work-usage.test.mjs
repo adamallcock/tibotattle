@@ -336,3 +336,44 @@ test("work-usage route searches local saved task names through the real enrichme
     await closeFixture(fixture);
   }
 });
+
+test("loopback companion restart restores anonymous saved figures before a delayed build", async () => {
+  const first = await serverFixture({ workUsageEnrich: async () => ({}), workUsageBuild: async q => {
+    const item = event({ project: "synthetic-project", tokens: 45 });
+    item.at = q.toMs - 1;
+    return { ...buildResult([item]), fromMs: q.fromMs, toMs: q.toMs,
+      generation: { status: "complete", fingerprint: "synthetic-generation" },
+      scopes: [{ id: "device", status: "available" }],
+      metadata: { status: "available", observedAt: q.toMs },
+      pricing: { basis: "event_time", fingerprint: "synthetic-price" } };
+  } });
+  let second;
+  try {
+    const request = { port: first.app.port, headers: localHeaders(), body: requestBody() };
+    let reply = await jsonRequest(request);
+    for (let i = 0; i < 50 && reply.json.status === "preparing"; i++) {
+      await new Promise(resolve => setTimeout(resolve, 2));
+      reply = await jsonRequest({ ...request, body: requestBody({ snapshotId: reply.json.snapshotId }) });
+    }
+    assert.equal(reply.json.status, "available");
+    assert.equal(reply.json.totals.tokens, 45);
+    const toMs = reply.json.toMs;
+    await first.app.close();
+    second = await serverFixture({
+      stateRoot: join(first.root, "state"), codexHome: join(first.root, "codex"),
+      workUsageBuild: () => new Promise(() => {}),
+      workUsageEnrich: () => { throw new Error("saved anonymous rows must not enrich"); },
+    });
+    const restored = await jsonRequest({ ...request, port: second.app.port });
+    assert.equal(restored.status, 200);
+    assert.equal(restored.json.retained, true);
+    assert.equal(restored.json.refreshing, true);
+    assert.equal(restored.json.namesAvailable, false);
+    assert.equal(restored.json.totals.tokens, 45);
+    assert.equal(restored.json.toMs, toMs);
+    assert.deepEqual(restored.json.display, {});
+  } finally {
+    if (second) await closeFixture(second);
+    await closeFixture(first);
+  }
+});

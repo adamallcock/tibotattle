@@ -238,6 +238,11 @@ function db(): D1Database {
   return bindings().USAGE_MONITOR_DB;
 }
 
+// This spec qualifies the historical rebuild, independently of later policy migrations.
+function migrationsThrough0059(): D1Migration[] {
+  return bindings().TEST_MIGRATIONS.filter(migration => migration.name < '0060');
+}
+
 function migrationsBefore0058(): D1Migration[] {
   const migrations = bindings().TEST_MIGRATIONS;
   const index = migrations.findIndex((migration) => migration.name.startsWith("0058"));
@@ -821,11 +826,11 @@ describe("migration 0058 accountless owner rebuild", () => {
     expect(activeNames).not.toContain("0047_accountless_upload_ownership.sql");
     expect(activeNames).not.toContain("0048_accountless_upload_renewal.sql");
 
-    await applyD1Migrations(db(), bindings().TEST_MIGRATIONS);
+    await applyD1Migrations(db(), migrationsThrough0059());
     const freshSchema = await completeSchemaObjects();
     await reset();
     await applyD1Migrations(db(), migrationsBefore0058());
-    await applyD1Migrations(db(), bindings().TEST_MIGRATIONS);
+    await applyD1Migrations(db(), migrationsThrough0059());
     expect(await completeSchemaObjects()).toEqual(freshSchema);
     expect((await db().prepare("PRAGMA foreign_key_check").all()).results).toEqual([]);
   });
@@ -843,7 +848,7 @@ describe("migration 0058 accountless owner rebuild", () => {
     const preMigrationRows = await sourceRows(preMigrationShapes);
     expect(await sourceGraphCounts()).toEqual(expectedCounts);
 
-    await applyD1Migrations(db(), bindings().TEST_MIGRATIONS);
+    await applyD1Migrations(db(), migrationsThrough0059());
     expect(await sourceGraphCounts()).toEqual(expectedCounts);
     expect(await sourceRows(preMigrationShapes)).toEqual(preMigrationRows);
     const foreignKeys = await db().prepare("PRAGMA foreign_key_check").all();
@@ -986,7 +991,7 @@ describe("migration 0058 accountless owner rebuild", () => {
       expect(preMigrationCounts).toEqual(expectedScaleCounts);
       const preMigrationDigest = await sourceGraphDigest(preMigrationShapes);
 
-      await applyD1Migrations(db(), bindings().TEST_MIGRATIONS);
+      await applyD1Migrations(db(), migrationsThrough0059());
 
       expect(await sourceGraphCounts()).toEqual(preMigrationCounts);
       expect(await sourceGraphDigest(preMigrationShapes)).toBe(preMigrationDigest);

@@ -1,3 +1,4 @@
+import { PUBLIC_SOURCE_SCHEMA_SQL } from "./public-source-schema-contract.mjs";
 import { spawnSync } from "node:child_process";
 import { readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -120,12 +121,23 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
     "0057_accountless_enrollment_ledger.sql",
     "0058_accountless_upload_ownership.sql",
     "0059_accountless_upload_renewal.sql",
+    "0060_public_contribution_sources.sql",
+    "0061_accountless_history_retention.sql",
+    "0062_v1_acquisition_vocabulary.sql",
   ]),
   DELETION_LEDGER: Object.freeze([
     "0001_deletion_tombstones.sql",
     "0002_identity_reenrollment_cooldown.sql",
+    "0003_storage_erasure_jobs.sql",
   ]),
 });
+
+// JSON staging does not use the separate typed analytics erasure job ledger.
+// Its deployed two-migration ledger remains compatible; local source inventory
+// still requires the complete reviewed additive migration set above.
+const JSON_STAGING_LEDGER_MIGRATIONS = Object.freeze(
+  EXPECTED_STAGING_MIGRATIONS.DELETION_LEDGER.slice(0, 2),
+);
 
 // A prior synthetic-only staging rehearsal applied a divergent 0046–0048
 // accountless lineage. It must never be replayed or treated as current: its
@@ -1090,7 +1102,7 @@ function exactStoredSchemaProbe(objects, omittedNames = []) {
   return Object.entries(objects).filter(([name]) => !omitted.has(name)).map(([name, sql]) => `EXISTS (
   SELECT 1 FROM sqlite_master WHERE name = ${sqlStringLiteral(name)}
     AND type = ${sqlStringLiteral(sql.startsWith("CREATE TABLE") ? "table"
-      : sql.startsWith("CREATE INDEX") ? "index" : "trigger")}
+      : sql.startsWith("CREATE INDEX") ? "index" : sql.startsWith("CREATE VIEW") ? "view" : "trigger")}
     AND sql IS ${sqlStringLiteral(sql)}
 )`).join(" AND ");
 }
@@ -1553,6 +1565,139 @@ NOT EXISTS (
      AND dflt_value IS NULL AND pk = 0
 ) AS scale_columns;
 `;
+// The current public-source probes retain all unaffected 0059 contracts. Every replaced or
+// new object is checked separately against exact stored DDL in a third bounded
+// metadata query, including the eligibility view and withdrawal/bootstrap guards.
+function unaffectedPublicSourceProbe(objects, historicalSocialNames = [], omittedNames = []) {
+  const replacements = Object.keys(PUBLIC_SOURCE_SCHEMA_SQL);
+  const remainingSocialNames = historicalSocialNames.filter(name => !replacements.includes(name));
+  return exactStoredSchemaProbe(objects, [...replacements, ...historicalSocialNames, ...omittedNames])
+    + (remainingSocialNames.length ? ` AND ${socialOwnerGatedTriggerProbe(remainingSocialNames)}` : "");
+}
+const publicSourceComponentProbe = (objects, socialNames, field) =>
+  `SELECT ${unaffectedPublicSourceProbe(objects, socialNames)} AS ${field}`;
+export const PUBLIC_SOURCE_ATTRIBUTION_SCHEMA_PROBE_SQL = POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL
+  .replace(POST_ACCOUNTLESS_COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL,
+    publicSourceComponentProbe(CURRENT_MODEL_HISTORY_SCHEMA_SQL, ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.history, "community_model_history_schema"))
+  .replace(POST_ACCOUNTLESS_COMMUNITY_GRAPH_PRESERVATION_SCHEMA_PROBE_SQL,
+    publicSourceComponentProbe(CURRENT_GRAPH_PRESERVATION_SCHEMA_SQL, ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.graph, "community_graph_preservation_schema"))
+  .replace(POST_ACCOUNTLESS_REFRESH_LANE_SCHEMA_PROBE_SQL,
+    publicSourceComponentProbe(REFRESH_LANE_SCHEMA_SQL, ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.refresh, "refresh_lane_schema"));
+export const ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_SQL = Object.freeze({
+  accountless_public_history_retention: `CREATE TABLE accountless_public_history_retention (
+  participant_id TEXT PRIMARY KEY NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+  enrollment_device_id TEXT NOT NULL UNIQUE,
+  device_credential_id TEXT NOT NULL UNIQUE,
+  generation_id TEXT NOT NULL,
+  head_revision INTEGER NOT NULL CHECK (head_revision > 0),
+  retained_at TEXT NOT NULL,
+  CHECK (retained_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*Z')
+) STRICT`,
+  accountless_public_history_retention_insert: `CREATE TRIGGER accountless_public_history_retention_insert
+BEFORE INSERT ON accountless_public_history_retention
+WHEN NOT EXISTS (
+  SELECT 1
+    FROM community_public_source_owners public_owner
+    JOIN accountless_upload_owners owner
+      ON owner.participant_id = public_owner.participant_id
+    JOIN accountless_enrollment_ledger ledger
+      ON ledger.device_id = owner.enrollment_device_id
+    JOIN device_credentials device
+      ON device.id = owner.device_credential_id
+    JOIN accountless_v11_device_authorizations grant_row
+      ON grant_row.enrollment_device_id = owner.enrollment_device_id
+     AND grant_row.participant_id = owner.participant_id
+     AND grant_row.device_credential_id = owner.device_credential_id
+    JOIN telemetry_v11_domain_heads head
+      ON head.participant_id = owner.participant_id
+   WHERE public_owner.owner_kind = 'accountless'
+     AND public_owner.participant_id = NEW.participant_id
+     AND public_owner.device_id = NEW.device_credential_id
+     AND owner.enrollment_device_id = NEW.enrollment_device_id
+     AND owner.device_credential_id = NEW.device_credential_id
+     AND ledger.state = 'active' AND owner.state = 'active'
+     AND device.state = 'active' AND grant_row.state = 'active'
+     AND head.generation_id = NEW.generation_id
+     AND head.revision = NEW.head_revision
+)
+BEGIN SELECT RAISE(ABORT, 'accountless_history_retention_unavailable'); END`,
+  accountless_public_history_retention_immutable: `CREATE TRIGGER accountless_public_history_retention_immutable
+BEFORE UPDATE ON accountless_public_history_retention
+BEGIN SELECT RAISE(ABORT, 'accountless_history_retention_immutable'); END`,
+});
+export const ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_PROBE_SQL = `
+SELECT ${exactStoredSchemaProbe(ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_SQL)}
+  AS accountless_history_retention_objects
+`;
+export const accountlessHistoryRetentionSchemaComplete = row =>
+  row?.accountless_history_retention_objects === 1;
+// Migration 0061 is part of the current attribution contract. Folding its
+// exact three-object proof into the existing bounded query keeps release and
+// live staging gates aligned without an extra remote round trip.
+export const ACCOUNTLESS_HISTORY_ATTRIBUTION_SCHEMA_PROBE_SQL =
+  PUBLIC_SOURCE_ATTRIBUTION_SCHEMA_PROBE_SQL.replace(
+    " AS attribution_objects,",
+    ` AND (${exactStoredSchemaProbe(ACCOUNTLESS_HISTORY_RETENTION_SCHEMA_SQL)}) AS attribution_objects,`,
+  );
+// Migration 0062 widens the component vocabulary of the two part tables and
+// changes nothing else: the parents, the stage tables and the immutable
+// triggers keep the definitions every earlier proof already pins, so only
+// these two objects carry a new expectation. Each earlier readiness proof
+// keeps its own pre-0062 text rather than being rewritten in place.
+const widenedPartVocabulary = (sql) => sql.replace(
+  "'plan-anchors', 'plan-runs', 'plan-equal-time', 'fit-stats', 'eligible', 'endpoint-runs', 'endpoints'",
+  "'plan-anchors', 'plan-runs', 'plan-equal-time', 'reset-clusters', 'fit-stats', 'eligible', "
+    + "'endpoint-runs', 'endpoint-holds', 'endpoints'");
+export const V1_ACQUISITION_VOCABULARY_SCHEMA_SQL = Object.freeze({
+  community_analysis_work_parts:
+    widenedPartVocabulary(CURRENT_ANALYSIS_WORK_SCHEMA_SQL.community_analysis_work_parts),
+  community_model_history_work_parts:
+    widenedPartVocabulary(CURRENT_MODEL_HISTORY_SCHEMA_SQL.community_model_history_work_parts),
+});
+export const V1_ACQUISITION_VOCABULARY_SCHEMA_PROBE_SQL = `
+SELECT ${exactStoredSchemaProbe(V1_ACQUISITION_VOCABULARY_SCHEMA_SQL)}
+  AS v1_acquisition_vocabulary_objects
+`;
+export const v1AcquisitionVocabularySchemaComplete = row =>
+  row?.v1_acquisition_vocabulary_objects === 1;
+// The two part tables move, so the work and history component probes drop them
+// and the widened pair is proved once, exactly, alongside them.
+const V1_VOCABULARY_REPLACED_NAMES = Object.keys(V1_ACQUISITION_VOCABULARY_SCHEMA_SQL);
+export const CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL = ACCOUNTLESS_HISTORY_ATTRIBUTION_SCHEMA_PROBE_SQL
+  .replace(COMMUNITY_ANALYSIS_WORK_SCHEMA_PROBE_SQL, `
+SELECT ${exactStoredSchemaProbe(CURRENT_ANALYSIS_WORK_SCHEMA_SQL, V1_VOCABULARY_REPLACED_NAMES)} AS community_analysis_work_schema
+`)
+  .replace(
+    publicSourceComponentProbe(CURRENT_MODEL_HISTORY_SCHEMA_SQL,
+      ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.history, "community_model_history_schema"),
+    `SELECT ${unaffectedPublicSourceProbe(CURRENT_MODEL_HISTORY_SCHEMA_SQL,
+      ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.history, V1_VOCABULARY_REPLACED_NAMES)} AS community_model_history_schema`)
+  .replace(
+    " AS attribution_objects,",
+    ` AND (${exactStoredSchemaProbe(V1_ACQUISITION_VOCABULARY_SCHEMA_SQL)}) AS attribution_objects,`,
+  );
+export const CURRENT_SCALE_SCHEMA_PROBE_SQL = POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL.replace(
+  exactStoredSchemaProbe(SCALE_SCHEMA_SQL, ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.scale)
+    + " AND " + socialOwnerGatedTriggerProbe(ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.scale),
+  unaffectedPublicSourceProbe(SCALE_SCHEMA_SQL, ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.scale),
+);
+// Remote D1 preserves these migration comments; local Wrangler removes them.
+// Construct the two exact expected definitions, without normalizing observed SQL.
+const PUBLIC_SOURCE_COUNTER_GAP = "\n  \n  \n  \n  UPDATE community_preparation_progress_counters";
+const PUBLIC_SOURCE_COUNTER_COMMENT = "\n  -- Count only this OLD source's indexed prepared heads while authority is\n  -- still valid. Later ledger/owner/device/grant withdrawals see no eligible\n  -- source and cannot subtract it again. No telemetry or JSON is read.\n  UPDATE community_preparation_progress_counters";
+export const PUBLIC_SOURCE_SCHEMA_PROBE_SQL = `WITH expected(name, type, definition) AS (VALUES
+${Object.entries(PUBLIC_SOURCE_SCHEMA_SQL).map(([name, sql]) => `(${sqlStringLiteral(name)},
+  ${sqlStringLiteral(sql.startsWith("CREATE TABLE") ? "table" : sql.startsWith("CREATE VIEW") ? "view" : "trigger")},
+  ${sqlStringLiteral(sql)})`).join(",\n")}
+) SELECT NOT EXISTS (
+  SELECT 1 FROM expected e WHERE NOT EXISTS (
+    SELECT 1 FROM sqlite_master actual WHERE actual.name=e.name AND actual.type=e.type
+      AND (actual.sql IS e.definition OR actual.sql IS replace(e.definition,
+        ${sqlStringLiteral(PUBLIC_SOURCE_COUNTER_GAP)}, ${sqlStringLiteral(PUBLIC_SOURCE_COUNTER_COMMENT)}))
+  )
+) AS public_source_objects`;
+export const publicSourceSchemaComplete = row => row?.public_source_objects === 1;
+
 export function scaleSchemaComplete(row) {
   return row?.scale_objects === 1 && row?.scale_columns === 1;
 }
@@ -1567,11 +1712,14 @@ export const REQUIRED_RATE_LIMITS = Object.freeze([
   Object.freeze({ name: "UPLOAD_INGRESS_CLIENT_RATE_LIMIT", limit: 20 }),
 ]);
 export const REQUIRED_STAGING_VARIABLES = Object.freeze({
+  PUBLIC_ANALYTICS_MODE: "enabled",
   ENVIRONMENT: "staging",
   ENROLLMENT_MODE: "disabled",
   ACCOUNTLESS_ENROLLMENT_MODE: "disabled",
   ACCOUNTLESS_OWNERSHIP_MODE: "disabled",
   ACCOUNT_SCOPED_INGEST_MODE: "disabled",
+  TELEMETRY_STORAGE_MODE: "json",
+  TELEMETRY_STORAGE_NAMESPACE: "",
   UPLOAD_INGRESS_QUEUE_MODE: "disabled",
   UPLOAD_INGRESS_MAX_CONCURRENT: "8",
   UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE: "120",
@@ -2297,7 +2445,7 @@ function migrationNames(value) {
 function classifyMigrationProbe(
   result,
   expectedNames,
-  { legacyLineage = null } = {},
+  { legacyLineage = null, compatibleLineage = null } = {},
 ) {
   if (!result.ok) {
     const output = `${result.stdout}${result.stderr}`;
@@ -2318,7 +2466,8 @@ function classifyMigrationProbe(
   if (!sameStringArray(names, [...new Set(names)])) {
     return { status: "drift", code: "REMOTE_MIGRATION_INVENTORY_DRIFT" };
   }
-  if (sameStringArray(names, expectedNames)) {
+  if (sameStringArray(names, expectedNames)
+      || (compatibleLineage !== null && sameStringArray(names, compatibleLineage))) {
     return { status: "current", code: null };
   }
   if (legacyLineage !== null && sameStringArray(names, legacyLineage)) {
@@ -2825,7 +2974,7 @@ export function probeStagingLive({
         EXPECTED_STAGING_MIGRATIONS[entry.binding],
         entry.binding === "USAGE_MONITOR_DB"
           ? { legacyLineage: RETAINED_LEGACY_STAGING_MIGRATION_LINEAGE }
-          : undefined,
+          : { compatibleLineage: JSON_STAGING_LEDGER_MIGRATIONS },
       );
       return Object.freeze({
         binding: entry.binding,
@@ -2927,7 +3076,7 @@ export function probeStagingLive({
         [
           "d1", "execute", "USAGE_MONITOR_DB",
           "--remote", "--env", "staging",
-          "--command", POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL,
+          "--command", CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL,
           "--json",
         ],
         spawn,
@@ -2942,7 +3091,7 @@ export function probeStagingLive({
         [
           "d1", "execute", "USAGE_MONITOR_DB",
           "--remote", "--env", "staging",
-          "--command", POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL,
+          "--command", CURRENT_SCALE_SCHEMA_PROBE_SQL,
           "--json",
         ],
         spawn,
@@ -2950,6 +3099,13 @@ export function probeStagingLive({
       checks.attributionSchemaCurrent = checks.attributionSchemaCurrent
         && scaleSchemaProbe.ok
         && scaleSchemaComplete(collectionControlRow(parseJson(scaleSchemaProbe.stdout)));
+      const publicSourceSchemaProbe = runWrangler(wrangler, workerDirectory, [
+        "d1", "execute", "USAGE_MONITOR_DB", "--remote", "--env", "staging",
+        "--command", PUBLIC_SOURCE_SCHEMA_PROBE_SQL, "--json",
+      ], spawn);
+      checks.attributionSchemaCurrent = checks.attributionSchemaCurrent
+        && publicSourceSchemaProbe.ok
+        && publicSourceSchemaComplete(collectionControlRow(parseJson(publicSourceSchemaProbe.stdout)));
       if (!checks.attributionSchemaCurrent) {
         blockers.push("REMOTE_ATTRIBUTION_SCHEMA_INCOMPLETE");
       }

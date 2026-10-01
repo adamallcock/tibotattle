@@ -53,6 +53,8 @@ const SHELL_FILES = [
   "apps/electron/desktop-command.js",
   "apps/electron/desktop-contract.js",
   "apps/electron/desktop-contribution-credential.js",
+  "apps/electron/desktop-crash-capture.js",
+  "apps/electron/desktop-startup-diagnostics.js",
   "apps/electron/desktop-codex-roots.js",
   "apps/electron/desktop-deep-links.js",
   "apps/electron/desktop-diagnostics.js",
@@ -82,6 +84,7 @@ const SHELL_FILES = [
   "apps/electron/desktop-notification-policy.js",
   "apps/electron/desktop-windows-notification-identity.js",
   "apps/electron/desktop-platform-services.js",
+  "apps/electron/linux-autostart.js",
   "apps/electron/desktop-runtime.js",
   "apps/electron/desktop-settings-backends.js",
   "apps/electron/desktop-settings-store.js",
@@ -135,6 +138,8 @@ const SHELL_FILES = [
   "src/platform/windows-credential-mutex.js",
   "src/platform/windows-credential-operation-audit.js",
   "src/platform/windows-credential-audit-file-guard.js",
+  "src/platform/windows-protected-sqlite.js",
+  "scripts/diagnose-desktop-crash.mjs",
 ];
 const KEYTAR = Object.freeze({
   "darwin-arm64": "node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node",
@@ -185,7 +190,7 @@ function archiveLookupPath(path) {
   return process.platform === "win32" ? path.replaceAll("/", "\\") : path;
 }
 
-function syntheticWindowsFilesystemBinding() {
+function syntheticWindowsFilesystemBinding({ sourceRead = false } = {}) {
   return {
     contractVersion: "windows-filesystem-v1",
     securityContractVersion: "windows-filesystem-security-v1",
@@ -195,16 +200,23 @@ function syntheticWindowsFilesystemBinding() {
     pathWalkRaceSafe: false,
     credentialMutexSafe: true,
     credentialAuditFileGuardSafe: true,
+    ...(sourceRead ? {
+      sourceReadContractVersion: "windows-source-read-v1",
+      openSourceFile() {},
+      statSourceFile() {},
+      readSourceFile() {},
+      closeSourceFile() {},
+    } : {}),
     ...Object.fromEntries(
       WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS.map((method) => [method, () => undefined]),
     ),
   };
 }
 
-function bindingManifest(bytes) {
+function bindingManifest(bytes, options = {}) {
   return createWindowsFilesystemBindingManifest({
     bytes,
-    binding: syntheticWindowsFilesystemBinding(),
+    binding: syntheticWindowsFilesystemBinding(options),
   });
 }
 
@@ -223,6 +235,7 @@ async function makeFixture(
     keytarMutation = null,
     physicalUnpackedMutation = null,
     packageMetadata = {},
+    sourceReadBinding = false,
     unpackPattern = target === "linux-x64" ? "{**/*.node,**/linux_credential_mutex.node.manifest.json}" : "**/*.node",
   } = {},
 ) {
@@ -263,7 +276,7 @@ async function makeFixture(
     files.set(WINDOWS_BINDING, binding);
     // Exercise the JSON value emitted by the real generator while keeping
     // mutation cases independent from its frozen in-memory return value.
-    sidecar = JSON.parse(JSON.stringify(bindingManifest(binding)));
+    sidecar = JSON.parse(JSON.stringify(bindingManifest(binding, { sourceRead: sourceReadBinding })));
     bindingManifestMutation?.(sidecar);
     files.set(
       WINDOWS_BINDING_MANIFEST,
@@ -480,6 +493,17 @@ test("verifies Windows x64 binding and sidecar digests without promoting provena
   });
 });
 
+test("accepts the approved optional source-read sidecar while retaining old sidecars", async () => {
+  await withFixture("win32-x64", { sourceReadBinding: true }, async (fixture) => {
+    assert.deepEqual(fixture.bindingManifest.sourceRead, {
+      approved: true,
+      contractVersion: "windows-source-read-v1",
+    });
+    const result = await verify(fixture, "win32-x64");
+    assert.equal(result.status, FIXED_STATUS.verified);
+  });
+});
+
 test("round-trips every Windows ASAR list entry through native lookups", {
   skip: process.platform !== "win32",
 }, async () => {
@@ -591,6 +615,28 @@ test("requires the exact versioned Windows sidecar schema and policy consistency
       label: "missing approved policy field",
       mutate: (sidecar) => {
         delete sidecar.approvedPolicy.pathWalkRaceSafe;
+      },
+    },
+    {
+      label: "malformed source-read contract",
+      mutate: (sidecar) => {
+        sidecar.sourceRead = { approved: false, contractVersion: "future-contract" };
+      },
+    },
+    {
+      label: "source-read approval disagrees with code policy",
+      mutate: (sidecar) => {
+        sidecar.sourceRead = { approved: false, contractVersion: "windows-source-read-v1" };
+      },
+    },
+    {
+      label: "extra source-read field",
+      mutate: (sidecar) => {
+        sidecar.sourceRead = {
+          approved: false,
+          contractVersion: "windows-source-read-v1",
+          extra: true,
+        };
       },
     },
   ];

@@ -154,6 +154,101 @@ async function createCodexRolloutFixture() {
   return { codexHome, rolloutPath };
 }
 
+async function scanSpeedFixture(events, priceCards = null) {
+  const codexHome = await mkdtemp(join(tmpdir(), "usage-monitor-speed-boundary-"));
+  try {
+    const sessions = join(codexHome, "sessions");
+    await mkdir(sessions);
+    for (const [index, event] of events.entries()) {
+      const day = event.day ?? "2026-09-29";
+      const timestamp = (second) => `${day}T12:00:${String(second).padStart(2, "0")}.000Z`;
+      const usage = {
+        input_tokens: event.inputTokens ?? 1_000,
+        cached_input_tokens: 0,
+        cache_write_input_tokens: 0,
+        output_tokens: 10,
+        reasoning_output_tokens: 0,
+        total_tokens: (event.inputTokens ?? 1_000) + 10,
+      };
+      const records = [
+        { timestamp: timestamp(0), type: "session_meta", payload: { id: `synthetic-speed-${index}`, source: "cli" } },
+        { timestamp: timestamp(1), type: "turn_context", payload: {
+          model: event.model ?? "gpt-6-astra",
+          ...(event.mode === undefined ? {} : { service_tier: event.mode }),
+        } },
+        ...(event.tool ? [{ timestamp: timestamp(2), type: "response_item", payload: { type: "web_search_call", id: `synthetic-tool-${index}` } }] : []),
+        { timestamp: timestamp(3), type: "event_msg", payload: { type: "token_count", info: {
+          total_token_usage: usage, last_token_usage: usage,
+        } } },
+      ];
+      await writeFile(join(sessions, `rollout-${day}T12-00-00-speed-${index}.jsonl`),
+        `${records.map((record) => JSON.stringify(record)).join("\n")}\n`);
+    }
+    return await codexLocalUsageAnalysis.scanAndPriceCodexLogs({
+      codexHome, startAt: "2026-09-01T00:00:00.000Z", endAt: "2026-10-01T00:00:00.000Z", priceCards,
+    });
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
+}
+
+test("observed Ultrafast scanner sensitivity qualifies every event and excludes provider tool charges", async () => {
+  const result = await scanSpeedFixture([
+    { mode: "ultrafast", tool: true },
+    { mode: "ultrafast", inputTokens: 272_001 },
+  ]);
+  assert.deepEqual(result.runcost.observedTierUsageEventCounts, { ultrafast: 2 });
+  assert.ok(result.runcost.providerToolCostUsd > 0);
+  const sensitivity = result.runcost.subscriptionSpeedSensitivity;
+  assert.equal(sensitivity.observedSpeedMode, "ultrafast");
+  assert.equal(sensitivity.selectedScenario, "ultrafast");
+  assert.deepEqual(sensitivity.scenarios.ultrafast, {
+    relativeQuotaWeight: "model_specific",
+    weightedStandardApiEquivalentUsd: 32.70762,
+    unweightedStandardApiEquivalentUsd: 0,
+    complete: true,
+    modelMultipliers: { "gpt-6-astra": 6 },
+  });
+  assert.equal(sensitivity.scenarios.standard.weightedStandardApiEquivalentUsd, result.runcost.tokenCostUsd);
+  assert.equal(sensitivity.scenarios.fast.weightedStandardApiEquivalentUsd,
+    Math.round(result.runcost.tokenCostUsd * 2 * 1e12) / 1e12);
+});
+
+test("Ultrafast scanner sensitivity withholds unsupported models, dates and non-registry cards", async () => {
+  for (const events of [
+    [{ mode: "ultrafast", model: "gpt-6.1-sol" }],
+    [{ mode: "ultrafast", day: "2026-09-28" }, { mode: "ultrafast" }],
+  ]) {
+    const result = await scanSpeedFixture(events);
+    const sensitivity = result.runcost.subscriptionSpeedSensitivity;
+    assert.equal(sensitivity.selectedScenario, "ultrafast");
+    assert.equal(sensitivity.scenarios.ultrafast.complete, false);
+    assert.equal(sensitivity.scenarios.ultrafast.weightedStandardApiEquivalentUsd, null);
+    assert.ok(sensitivity.scenarios.ultrafast.unweightedStandardApiEquivalentUsd > 0);
+    assert.equal(sensitivity.scenarios.ultrafast.modelMultipliers[events[0].model ?? "gpt-6-astra"], null);
+  }
+  const result = await scanSpeedFixture([{ mode: "ultrafast" }], [{
+    ...PRICE_CARDS[0], id: "openai:gpt-6-astra:synthetic-unreviewed", model: "gpt-6-astra",
+  }]);
+  assert.equal(result.runcost.subscriptionSpeedSensitivity.scenarios.ultrafast.complete, false);
+  assert.equal(result.runcost.subscriptionSpeedSensitivity.scenarios.ultrafast.weightedStandardApiEquivalentUsd, null);
+});
+
+test("mixed, unknown and empty scanner populations cannot invent an Ultrafast scenario", async () => {
+  for (const events of [
+    [{ mode: "ultrafast" }, { mode: "standard" }],
+    [{ mode: "ultrafast" }, {}],
+    [{}],
+    [],
+  ]) {
+    const result = await scanSpeedFixture(events);
+    const sensitivity = result.runcost.subscriptionSpeedSensitivity;
+    assert.equal(sensitivity.observedSpeedMode, "unknown");
+    assert.equal(sensitivity.selectedScenario, null);
+    assert.equal(Object.hasOwn(sensitivity.scenarios, "ultrafast"), false);
+  }
+});
+
 test("Codex pricing analysis has one public entry point and stays out of the scanner owner", async () => {
   assert.deepEqual(
     Object.keys(codexLocalUsageAnalysis),

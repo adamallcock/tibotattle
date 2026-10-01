@@ -3,7 +3,7 @@ import {
   expandAdminModelHistoryDay,
 } from "./telemetry-shared.generated.js";
 
-const ADMIN_OVERVIEW_SCHEMA_VERSION = "admin-overview-v0.3";
+const ADMIN_OVERVIEW_SCHEMA_VERSION = "admin-overview-v0.5";
 const ADMIN_RECONSTRUCTION_SCHEMA_VERSION = "admin-reconstruction-progress-v0.1";
 const ADMIN_RECONSTRUCTION_STATUSES = new Set(["available", "unavailable"]);
 const ADMIN_RECONSTRUCTION_MODES = new Set([
@@ -14,25 +14,36 @@ const ADMIN_RECONSTRUCTION_PUBLICATION_STATES = new Set([
 ]);
 const ADMIN_ACTION_SCHEMA_VERSION = "admin-action-v0.1";
 const ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION =
-  "admin-community-allowance-preview-v0.3";
+  "admin-community-allowance-preview-v0.4";
 const ADMIN_ALLOWANCE_PREVIEW_BASIS =
-  "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview";
+  "seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25_preview";
 const ADMIN_ALLOWANCE_PREVIEW_DAYS = 70;
-const ADMIN_METRICS_HISTORY_SCHEMA_VERSION = "admin-metrics-history-v0.2";
+const ADMIN_METRICS_HISTORY_SCHEMA_VERSION = "admin-metrics-history-v0.3";
 const ADMIN_METRICS_HISTORY_MAX_DAYS = 30;
 const ADMIN_METRICS_HISTORY_MAX_SNAPSHOTS = 400;
 const ADMIN_METRICS_HISTORY_MAX_GAUGES = 128;
 const ADMIN_ALLOWANCE_PREVIEW_PLANS = Object.freeze([
-  Object.freeze({ planType: "pro", label: "Pro 20x", multiplier: 1 }),
-  Object.freeze({ planType: "prolite", label: "Pro 5x", multiplier: 4 }),
-  Object.freeze({ planType: "plus", label: "Plus", multiplier: 20 }),
+  Object.freeze({ planType: "pro", label: "Pro 10x", multiplier: 1 }),
+  Object.freeze({ planType: "prolite", label: "Pro 5x", multiplier: 2 }),
+  Object.freeze({ planType: "promax", label: "Pro Max 25x", multiplier: 0.4 }),
+  Object.freeze({ planType: "plus", label: "Plus", multiplier: 10 }),
 ]);
 const ADMIN_ALLOWANCE_PREVIEW_MODELS = ADMIN_MODEL_CONFIG;
 const ADMIN_ALLOWANCE_MODELS_BASIS =
-  "seven_day_codex_pro20x_equivalent_per_model_composition";
+  "seven_day_codex_pro10x_equivalent_per_model_composition";
 const ADMIN_ALLOWANCE_MODELS_GATE =
   "shared_composition_kernel_identification";
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
+const ADMIN_GRAPH_WORK_STATES = new Set(["building", "queued", "idle"]);
+const ADMIN_GRAPH_METRICS = new Set(["model", "fits"]);
+// Refusal reasons and checkpoint phases are closed code words, not free text:
+// bounded snake_case tokens that carry no identifier, path or raw error. The
+// set itself stays open so a newly coded upstream reason reaches the operator
+// as its code rather than silently disappearing from the refusal totals.
+const ADMIN_GRAPH_CODE_PATTERN = /^[a-z][a-z0-9_]{2,63}$/u;
+const ADMIN_GRAPH_MAX_WINDOW_DAYS = 400;
+const ADMIN_GRAPH_MAX_REFUSALS = 64;
+const ADMIN_GRAPH_MAX_PHASES = 32;
 const ADMIN_ACTIONS = new Set([
   "set_collection_controls",
   "run_maintenance",
@@ -53,6 +64,9 @@ const DISTRIBUTION_SOURCE_STATUSES = new Set([
   "not_configured",
   "unavailable",
 ]);
+const DISTRIBUTION_CLIENTS = new Set(["native", "electron"]);
+const DISTRIBUTION_OPERATING_SYSTEMS = new Set(["macos", "windows", "linux"]);
+const DISTRIBUTION_ARCHITECTURES = new Set(["arm64", "x64"]);
 const ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{2,79}$/u;
 const REQUEST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
@@ -197,6 +211,35 @@ function isoTimestamp(value, code) {
   return timestamp;
 }
 
+export function projectAdminDatabaseHealth(value) {
+  const code = "ADMIN_DATABASE_HEALTH_INVALID";
+  const source = record(value, code);
+  if (source.schemaVersion !== "admin-database-health-v0.1") invalid(code);
+  const storageMode = enumValue(source.storageMode, new Set(["json", "typed", "unknown"]), code);
+  const roles = ["primary", "deletion_ledger", "analytics"];
+  const rows = array(source.databases, code);
+  if (rows.length !== roles.length) invalid(code);
+  const databases = rows.map((value, index) => {
+    const row = record(value, code);
+    if (row.role !== roles[index]) invalid(code);
+    const status = enumValue(row.status, new Set([
+      "reachable", "unavailable", "timeout", "not_configured", "not_applicable",
+    ]), code);
+    const unused = row.role === "analytics" && storageMode === "json";
+    if ((status === "not_applicable") !== unused) invalid(code);
+    if (status !== "reachable" && (row.responseMs !== null || row.databaseBytes !== null)) invalid(code);
+    if (status === "reachable" && row.responseMs === null) invalid(code);
+    return { role: row.role, status,
+      responseMs: row.responseMs === null ? null : count(row.responseMs, code),
+      databaseBytes: row.databaseBytes === null ? null : count(row.databaseBytes, code) };
+  });
+  const status = storageMode !== "unknown" && databases.every(row =>
+    row.status === "reachable" || row.status === "not_applicable") ? "available" : "degraded";
+  if (source.status !== status) invalid(code);
+  return { schemaVersion: source.schemaVersion, observedAt: isoTimestamp(source.observedAt, code),
+    storageMode, status, databases };
+}
+
 /** Closed, aggregate-only owner progress. It describes recorded work and
  * publication generations, never estimates remaining time or missing counts. */
 export function projectAdminReconstructionProgress(value) {
@@ -216,10 +259,19 @@ export function projectAdminReconstructionProgress(value) {
   const nullableCount = value => value === null ? null : count(value, code);
   const nullableEnum = (value, values) => value === null ? null : enumValue(value, new Set(values), code);
   const candidate = record(value, code);
-  if (candidate.schemaVersion !== 1 && candidate.schemaVersion !== 2) invalid(code);
+  if (![1, 2, 3].includes(candidate.schemaVersion)) invalid(code);
+  // v3 keeps every v2 key and adds `graph`; `preparation` becomes optional
+  // there, so a v2 payload relabelled as v3 still fails the closed-key check.
+  const optionalPreparation = candidate.schemaVersion === 3
+    && Object.hasOwn(candidate, "preparation");
+  // v3 Workers since the pipeline view add `pipeline` (null when that block
+  // alone was unreadable); older v3 payloads simply omit it.
+  const hasPipeline = candidate.schemaVersion === 3 && Object.hasOwn(candidate, "pipeline");
   const progress = closed(candidate, [
     "schemaVersion", "generatedAt", "publication", "work", "history",
-    ...(candidate.schemaVersion === 2 ? ["preparation"] : []),
+    ...(candidate.schemaVersion === 2 || optionalPreparation ? ["preparation"] : []),
+    ...(candidate.schemaVersion === 3 ? ["graph"] : []),
+    ...(hasPipeline ? ["pipeline"] : []),
   ]);
   const publication = closed(progress.publication, [
     "state", "requestedGeneration", "preparedGeneration", "publishedGeneration", "publishedAt",
@@ -250,7 +302,8 @@ export function projectAdminReconstructionProgress(value) {
       || (projectedHistory.completeAccounts !== null && projectedHistory.requiredAccounts !== null
         && projectedHistory.completeAccounts > projectedHistory.requiredAccounts)) invalid(code);
   let preparation = null;
-  if (progress.schemaVersion === 2 && progress.preparation !== null) {
+  const hasPreparation = progress.schemaVersion === 2 || optionalPreparation;
+  if (hasPreparation && progress.preparation !== null) {
     const source = closed(progress.preparation, [
       "trackedDays", "completeDays", "buildingDays", "retiringDays", "checkpointSteps",
       "quotaObservations", "usageEvents",
@@ -279,7 +332,200 @@ export function projectAdminReconstructionProgress(value) {
       restartReason: nullableEnum(work.restartReason, ["input_changed", "lease_expired", "method_changed", "retry"]),
     }),
     history: projectedHistory,
-    ...(progress.schemaVersion === 2 ? { preparation } : {}),
+    ...(hasPreparation ? { preparation } : {}),
+    ...(progress.schemaVersion === 3
+      ? { graph: projectGraphRebuild(progress.graph, code, closed, nullableTime) }
+      : {}),
+    ...(hasPipeline ? { pipeline: projectPipeline(progress.pipeline, code, closed, nullableTime) } : {}),
+  });
+}
+
+/** Where analytics processing stands, as counts, UTC days and instants only.
+ * A contradiction between the counts is a broken read, never something to
+ * clamp: the view then reports the pipeline as unreadable. */
+function projectPipeline(value, code, closed, nullableTime) {
+  if (value === null) return null;
+  const pipeline = closed(value, ["ingestion", "delivery", "daily"]);
+  const ingestion = closed(pipeline.ingestion, ["journalHead", "latestRecordedAt"]);
+  const delivery = closed(pipeline.delivery, ["appliedSequence", "pendingChanges", "pendingActivations", "current"]);
+  const daily = closed(pipeline.daily, [
+    "queuedDays", "oldestQueuedDay", "newestQueuedDay", "lastReleasedAt", "releasedLastHour",
+  ]);
+  const nullableDay = (day) => day === null ? null : calendarDay(day, code);
+  let current = null;
+  if (delivery.current !== null) {
+    const position = closed(delivery.current, ["fromDay", "throughDay", "nextDay", "daysDone", "daysTotal"]);
+    current = Object.freeze({
+      fromDay: calendarDay(position.fromDay, code),
+      throughDay: calendarDay(position.throughDay, code),
+      nextDay: calendarDay(position.nextDay, code),
+      daysDone: count(position.daysDone, code),
+      daysTotal: positiveInteger(position.daysTotal, code),
+    });
+    if (current.fromDay > current.throughDay || current.daysDone > current.daysTotal) invalid(code);
+  }
+  const projected = Object.freeze({
+    ingestion: Object.freeze({
+      journalHead: count(ingestion.journalHead, code),
+      latestRecordedAt: nullableTime(ingestion.latestRecordedAt),
+    }),
+    delivery: Object.freeze({
+      appliedSequence: count(delivery.appliedSequence, code),
+      pendingChanges: count(delivery.pendingChanges, code),
+      pendingActivations: count(delivery.pendingActivations, code),
+      current,
+    }),
+    daily: Object.freeze({
+      queuedDays: count(daily.queuedDays, code),
+      oldestQueuedDay: nullableDay(daily.oldestQueuedDay),
+      newestQueuedDay: nullableDay(daily.newestQueuedDay),
+      lastReleasedAt: nullableTime(daily.lastReleasedAt),
+      releasedLastHour: count(daily.releasedLastHour, code),
+    }),
+  });
+  const { delivery: sent, daily: queue } = projected;
+  if (sent.appliedSequence > projected.ingestion.journalHead || sent.pendingActivations > sent.pendingChanges
+      || (queue.queuedDays === 0) !== (queue.oldestQueuedDay === null)
+      || (queue.oldestQueuedDay === null) !== (queue.newestQueuedDay === null)
+      || (queue.oldestQueuedDay !== null && queue.oldestQueuedDay > queue.newestQueuedDay)) invalid(code);
+  return projected;
+}
+
+/** The typed-storage rebuild view: a closed, aggregate-only description of the
+ * graph window. Every count is an exact integer the reader recorded, so a
+ * violated invariant is a broken read, never something to round or infer. */
+function projectGraphRebuild(value, code, closed, nullableTime) {
+  const graph = closed(value, [
+    "window", "owners", "currentFits", "days", "refusals", "work",
+    "throughput", "retirement",
+  ]);
+  const codeWord = candidate => {
+    if (!ADMIN_GRAPH_CODE_PATTERN.test(string(candidate, code))) invalid(code);
+    return candidate;
+  };
+  const nullableCount = candidate => candidate === null ? null : count(candidate, code);
+  const source = closed(graph.window, ["days", "from", "to"]);
+  const window = Object.freeze({
+    days: count(source.days, code),
+    from: calendarDay(source.from, code),
+    to: calendarDay(source.to, code),
+  });
+  const span = (Date.parse(`${window.to}T00:00:00.000Z`)
+    - Date.parse(`${window.from}T00:00:00.000Z`)) / 86_400_000;
+  if (window.days > ADMIN_GRAPH_MAX_WINDOW_DAYS || span !== window.days - 1) invalid(code);
+  const owners = Object.freeze({
+    active: count(closed(graph.owners, ["active"]).active, code),
+  });
+  // Fits are stored as JSON arrays, so an unusable fit is an empty array with
+  // no recorded reason: the day-level refusal buckets have no fits counterpart.
+  const fitsSource = closed(graph.currentFits, ["day", "ready", "noFit", "missing"]);
+  const currentFits = Object.freeze({
+    day: calendarDay(fitsSource.day, code),
+    ready: count(fitsSource.ready, code),
+    noFit: count(fitsSource.noFit, code),
+    missing: count(fitsSource.missing, code),
+  });
+  if (currentFits.ready + currentFits.noFit + currentFits.missing !== owners.active) invalid(code);
+  const entries = array(graph.days, code);
+  if (entries.length !== window.days) invalid(code);
+  const days = Object.freeze(entries.map((candidate, index) => {
+    const entry = closed(candidate, [
+      "day", "ready", "refused", "unsupported", "missing", "published", "publishedAt",
+    ]);
+    const projected = Object.freeze({
+      day: calendarDay(entry.day, code),
+      ready: count(entry.ready, code),
+      refused: count(entry.refused, code),
+      unsupported: count(entry.unsupported, code),
+      missing: count(entry.missing, code),
+      published: boolean(entry.published, code),
+      publishedAt: nullableTime(entry.publishedAt),
+    });
+    if (projected.ready + projected.refused + projected.unsupported + projected.missing
+        !== owners.active) invalid(code);
+    // Newest first, strictly descending, anchored on the declared window.
+    const expectedEdge = index === 0 ? window.to : index === entries.length - 1 ? window.from : null;
+    if (expectedEdge !== null && projected.day !== expectedEdge) invalid(code);
+    if (index > 0 && projected.day >= calendarDay(entries[index - 1].day, code)) invalid(code);
+    return projected;
+  }));
+  const refusalEntries = boundedArray(graph.refusals, ADMIN_GRAPH_MAX_REFUSALS, code);
+  const seenRefusals = new Set();
+  const refusals = Object.freeze(refusalEntries.map(candidate => {
+    const refusal = closed(candidate, ["reason", "owners"]);
+    const projected = Object.freeze({
+      reason: codeWord(refusal.reason),
+      owners: count(refusal.owners, code),
+    });
+    if (seenRefusals.has(projected.reason)) invalid(code);
+    seenRefusals.add(projected.reason);
+    return projected;
+  }));
+  const work = closed(graph.work, [
+    "state", "activeDay", "activeMetric", "leaseExpiresAt", "selections", "checkpoints",
+  ]);
+  const selections = closed(work.selections, ["pending", "claimed"]);
+  // A counter the reader could not finish within its cap is null, never 0.
+  const checkpoints = work.checkpoints === null
+    ? null
+    : closed(work.checkpoints, ["stages", "parts", "bytes", "phases"]);
+  const phases = checkpoints === null
+    ? []
+    : boundedArray(checkpoints.phases, ADMIN_GRAPH_MAX_PHASES, code);
+  const seenPhases = new Set();
+  const throughput = closed(graph.throughput, [
+    "resultsLastHour", "resultsLast6Hours", "remainingResults", "estimatedHoursRemaining",
+  ]);
+  const resultsLastHour = nullableCount(throughput.resultsLastHour);
+  const resultsLast6Hours = nullableCount(throughput.resultsLast6Hours);
+  const estimate = throughput.estimatedHoursRemaining;
+  if (estimate !== null
+      && (typeof estimate !== "number" || !Number.isFinite(estimate) || estimate < 0)) invalid(code);
+  // An estimate cannot survive the rate it was derived from going uncounted.
+  if (estimate !== null && (resultsLastHour === null || resultsLast6Hours === null)) invalid(code);
+  return Object.freeze({
+    window,
+    owners,
+    currentFits,
+    days,
+    refusals,
+    work: Object.freeze({
+      state: enumValue(work.state, ADMIN_GRAPH_WORK_STATES, code),
+      activeDay: work.activeDay === null ? null : calendarDay(work.activeDay, code),
+      activeMetric: work.activeMetric === null
+        ? null
+        : enumValue(work.activeMetric, ADMIN_GRAPH_METRICS, code),
+      leaseExpiresAt: nullableTime(work.leaseExpiresAt),
+      selections: Object.freeze({
+        pending: count(selections.pending, code),
+        claimed: count(selections.claimed, code),
+      }),
+      checkpoints: checkpoints === null ? null : Object.freeze({
+        stages: count(checkpoints.stages, code),
+        parts: count(checkpoints.parts, code),
+        bytes: count(checkpoints.bytes, code),
+        phases: Object.freeze(phases.map(candidate => {
+          const entry = closed(candidate, ["phase", "stages", "parts"]);
+          const phase = codeWord(entry.phase);
+          if (seenPhases.has(phase)) invalid(code);
+          seenPhases.add(phase);
+          return Object.freeze({
+            phase,
+            stages: count(entry.stages, code),
+            parts: count(entry.parts, code),
+          });
+        })),
+      }),
+    }),
+    throughput: Object.freeze({
+      resultsLastHour,
+      resultsLast6Hours,
+      remainingResults: count(throughput.remainingResults, code),
+      estimatedHoursRemaining: estimate,
+    }),
+    retirement: Object.freeze({
+      staleResults: nullableCount(closed(graph.retirement, ["staleResults"]).staleResults),
+    }),
   });
 }
 
@@ -414,8 +660,8 @@ export function projectAdminAllowancePreview(value) {
       || preview.basis !== ADMIN_ALLOWANCE_PREVIEW_BASIS
       || preview.referencePlanType !== "pro"
       || preview.trailingDays !== 30
-      || preview.qualification !== "shared_reset_fit_gates_40pp_span_floor"
-      || preview.spanFloorPp !== 40) {
+      || preview.qualification !== "shared_reset_fit_gates_25pp_span_floor"
+      || preview.spanFloorPp !== 25) {
     invalid(code);
   }
   const from = calendarDay(preview.from, code);
@@ -471,7 +717,7 @@ export function projectAdminAllowancePreview(value) {
     referencePlanType: "pro",
     trailingDays: 30,
     qualification: preview.qualification,
-    spanFloorPp: 40,
+    spanFloorPp: preview.spanFloorPp,
     plans: Object.freeze(plans),
     days: Object.freeze(days),
     coverage: projectAllowancePreviewCoverage(preview.coverage),
@@ -814,6 +1060,38 @@ function projectDailyPublication(value) {
   });
 }
 
+function projectHistoricalPublication(value) {
+  if (value === null) return null;
+  const publication = record(value, "ADMIN_OVERVIEW_INVALID");
+  return Object.freeze({
+    publishedDays: count(
+      publication.publishedDays,
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+    publishedDaysBounded: boolean(
+      publication.publishedDaysBounded,
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+    latestEvidenceDay: nullableString(
+      publication.latestEvidenceDay,
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+    latestComputedAt: nullableString(
+      publication.latestComputedAt,
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+    previewState: enumValue(
+      publication.previewState,
+      new Set(["current", "stale", "not_published"]),
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+    previewGeneratedAt: nullableString(
+      publication.previewGeneratedAt,
+      "ADMIN_OVERVIEW_INVALID",
+    ),
+  });
+}
+
 function projectDistributionWindow(value) {
   const window = record(value, "ADMIN_OVERVIEW_INVALID");
   return Object.freeze({
@@ -853,8 +1131,22 @@ function projectDistribution(value) {
     "ADMIN_OVERVIEW_INVALID",
   ).map((value) => {
     const version = record(value, "ADMIN_OVERVIEW_INVALID");
+    const client = enumValue(version.client, DISTRIBUTION_CLIENTS, "ADMIN_OVERVIEW_INVALID");
+    const operatingSystem = enumValue(
+      version.operatingSystem, DISTRIBUTION_OPERATING_SYSTEMS, "ADMIN_OVERVIEW_INVALID",
+    );
+    const architecture = enumValue(
+      version.architecture, DISTRIBUTION_ARCHITECTURES, "ADMIN_OVERVIEW_INVALID",
+    );
+    if ((client === "native" && operatingSystem !== "macos")
+        || (operatingSystem !== "macos" && architecture !== "x64")) {
+      invalid("ADMIN_OVERVIEW_INVALID");
+    }
     return Object.freeze({
-      version: string(version.version, "ADMIN_OVERVIEW_INVALID"),
+      client,
+      operatingSystem,
+      architecture,
+      version: nullableString(version.version, "ADMIN_OVERVIEW_INVALID"),
       requestsLast7Days: count(
         version.requestsLast7Days,
         "ADMIN_OVERVIEW_INVALID",
@@ -865,6 +1157,59 @@ function projectDistribution(value) {
       ),
     });
   });
+  // Older overview caches do not include totals. Never sum version rows: addresses overlap.
+  let observedTotals = null;
+  if (cloudflare.observedTotals != null) {
+    const totals = record(cloudflare.observedTotals, "ADMIN_OVERVIEW_INVALID");
+    const projectCounts = (value) => {
+      const row = record(value, "ADMIN_OVERVIEW_INVALID");
+      return Object.freeze({
+        requestsLast7Days: count(row.requestsLast7Days, "ADMIN_OVERVIEW_INVALID"),
+        sourceAddressesLast7Days: count(row.sourceAddressesLast7Days, "ADMIN_OVERVIEW_INVALID"),
+      });
+    };
+    const overall = projectCounts(totals.overall);
+    const platforms = boundedArray(totals.platforms, 3, "ADMIN_OVERVIEW_INVALID").map(value => {
+      const row = record(value, "ADMIN_OVERVIEW_INVALID");
+      return Object.freeze({
+        operatingSystem: enumValue(row.operatingSystem, DISTRIBUTION_OPERATING_SYSTEMS, "ADMIN_OVERVIEW_INVALID"),
+        ...projectCounts(row),
+      });
+    });
+    if (platforms.length !== 3 || new Set(platforms.map(row => row.operatingSystem)).size !== 3
+        || platforms.some(row => row.sourceAddressesLast7Days > overall.sourceAddressesLast7Days)
+        || platforms.reduce((sum, row) => sum + row.requestsLast7Days, 0) !== overall.requestsLast7Days) {
+      invalid("ADMIN_OVERVIEW_INVALID");
+    }
+    // Older cached overviews only contain OS totals. Keep the macOS subtotal
+    // available without inventing an architecture breakdown for those reads.
+    const macosArchitectures = totals.macosArchitectures === undefined
+      ? null
+      : boundedArray(totals.macosArchitectures, 2, "ADMIN_OVERVIEW_INVALID").map(value => {
+        const row = record(value, "ADMIN_OVERVIEW_INVALID");
+        return Object.freeze({
+          architecture: enumValue(row.architecture, DISTRIBUTION_ARCHITECTURES, "ADMIN_OVERVIEW_INVALID"),
+          ...projectCounts(row),
+        });
+      });
+    if (macosArchitectures !== null) {
+      const macos = platforms.find(row => row.operatingSystem === "macos");
+      if (macosArchitectures.length !== 2
+          || new Set(macosArchitectures.map(row => row.architecture)).size !== 2
+          || macosArchitectures.some(row => row.sourceAddressesLast7Days > macos.sourceAddressesLast7Days)
+          || macosArchitectures.reduce((sum, row) => sum + row.requestsLast7Days, 0)
+            !== macos.requestsLast7Days
+          || macosArchitectures.reduce((sum, row) => sum + row.sourceAddressesLast7Days, 0)
+            < macos.sourceAddressesLast7Days) {
+        invalid("ADMIN_OVERVIEW_INVALID");
+      }
+    }
+    observedTotals = Object.freeze({
+      platforms: Object.freeze(platforms),
+      macosArchitectures: macosArchitectures === null ? null : Object.freeze(macosArchitectures),
+      overall,
+    });
+  }
   const bySegment = boundedArray(
     cloudflare.bySegment ?? [],
     32,
@@ -884,6 +1229,10 @@ function projectDistribution(value) {
       preflightRequests: count(segment.preflightRequests, "ADMIN_OVERVIEW_INVALID"),
       sparkleCheckRequests: count(
         segment.sparkleCheckRequests,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+      electronCheckRequests: count(
+        segment.electronCheckRequests,
         "ADMIN_OVERVIEW_INVALID",
       ),
       sparkleDownloadRequests: count(
@@ -907,6 +1256,7 @@ function projectDistribution(value) {
   let activeSourceAddresses = null;
   let preflight = null;
   let sparkleChecks = null;
+  let electronChecks = null;
   let sparkleDownloads = null;
   if (cloudflareStatus === "available") {
     if (cloudflare.reasonCode !== null
@@ -918,18 +1268,24 @@ function projectDistribution(value) {
     activeSourceAddresses = projectDistributionWindow(
       cloudflare.activeSourceAddresses,
     );
+    if (observedTotals && observedTotals.overall.sourceAddressesLast7Days !== activeSourceAddresses.last7Days) {
+      invalid("ADMIN_OVERVIEW_INVALID");
+    }
     preflight = projectDistributionRequests(cloudflare.preflight);
     sparkleChecks = projectDistributionRequests(cloudflare.sparkleChecks);
+    electronChecks = projectDistributionRequests(cloudflare.electronChecks);
     sparkleDownloads = projectDistributionRequests(cloudflare.sparkleDownloads);
   } else if (cloudflare.window !== null
       || cloudflare.activeSourceAddresses !== null
       || cloudflare.preflight !== null
       || cloudflare.sparkleChecks !== null
+      || cloudflare.electronChecks !== null
       || cloudflare.sparkleDownloads !== null
       || cloudflare.sampled !== null
       || cloudflare.bounded !== null
       || cloudflare.currentVersion !== null
       || cloudflare.currentVersionSourceAddresses !== null
+      || observedTotals !== null
       || observedVersions.length !== 0
       || bySegment.length !== 0
       || cloudflare.observedVersionsBounded !== false
@@ -961,6 +1317,16 @@ function projectDistribution(value) {
   );
   const projectGithubRelease = (value) => {
     const candidate = record(value, "ADMIN_OVERVIEW_INVALID");
+    const installerSource = record(candidate.installerDownloads, "ADMIN_OVERVIEW_INVALID");
+    const installerKeys = ["macArm64", "macX64", "windowsX64", "linuxX64"];
+    if (Object.keys(installerSource).length !== installerKeys.length
+        || installerKeys.some(key => !Object.hasOwn(installerSource, key))) {
+      invalid("ADMIN_OVERVIEW_INVALID");
+    }
+    const installerDownloads = Object.freeze(Object.fromEntries(
+      installerKeys.map(key => [key, installerSource[key] === null
+        ? null : count(installerSource[key], "ADMIN_OVERVIEW_INVALID")]),
+    ));
     const release = Object.freeze({
       id: positiveInteger(candidate.id, "ADMIN_OVERVIEW_INVALID"),
       tag: string(candidate.tag, "ADMIN_OVERVIEW_INVALID"),
@@ -973,9 +1339,14 @@ function projectDistribution(value) {
       ),
       dmgAssetCount: count(candidate.dmgAssetCount, "ADMIN_OVERVIEW_INVALID"),
       assetCount: count(candidate.assetCount, "ADMIN_OVERVIEW_INVALID"),
+      installerDownloads,
     });
     if (release.dmgDownloads > release.allAssetDownloads
-        || release.dmgAssetCount > release.assetCount) {
+        || release.dmgAssetCount > release.assetCount
+        || (installerDownloads.macArm64 ?? 0) + (installerDownloads.macX64 ?? 0)
+          > release.dmgDownloads
+        || Object.values(installerDownloads).reduce((sum, value) => sum + (value ?? 0), 0)
+          > release.allAssetDownloads) {
       invalid("ADMIN_OVERVIEW_INVALID");
     }
     return release;
@@ -1155,10 +1526,12 @@ function projectDistribution(value) {
       activeSourceAddresses,
       preflight,
       sparkleChecks,
+      electronChecks,
       sparkleDownloads,
       currentVersion,
       currentVersionSourceAddresses,
       observedVersions: Object.freeze(observedVersions),
+      observedTotals,
       bySegment: Object.freeze(bySegment),
       observedVersionsBounded: boolean(
         cloudflare.observedVersionsBounded,
@@ -1191,6 +1564,7 @@ function projectLifecycle(value) {
       lifecycle.restoreReplayComplete,
       "ADMIN_OVERVIEW_INVALID",
     ),
+    lastCompletedAt: nullableString(lifecycle.lastCompletedAt ?? null, "ADMIN_OVERVIEW_INVALID"),
     maintenanceRunAt: nullableString(
       lifecycle.maintenanceRunAt,
       "ADMIN_OVERVIEW_INVALID",
@@ -1436,6 +1810,11 @@ export function projectAdminOverview(value) {
     invalid("ADMIN_OVERVIEW_INVALID");
   }
   const service = record(overview.service, "ADMIN_OVERVIEW_INVALID");
+  const storageMode = enumValue(service.telemetryStorageMode, new Set(["json", "typed"]), "ADMIN_OVERVIEW_INVALID");
+  const typed = storageMode === "typed";
+  if (!typed && overview.historicalPublication !== null) {
+    invalid("ADMIN_OVERVIEW_INVALID");
+  }
   const snapshots = array(overview.snapshots, "ADMIN_OVERVIEW_INVALID").map((value) => {
     const snapshot = record(value, "ADMIN_OVERVIEW_INVALID");
     return Object.freeze({
@@ -1459,10 +1838,17 @@ export function projectAdminOverview(value) {
       createdAt: string(item.createdAt, "ADMIN_OVERVIEW_INVALID"),
     });
   });
+  const historicalPublication = typed
+    ? projectHistoricalPublication(overview.historicalPublication)
+    : null;
+  if (typed && historicalPublication === null) {
+    invalid("ADMIN_OVERVIEW_INVALID");
+  }
   return Object.freeze({
     generatedAt: string(overview.generatedAt, "ADMIN_OVERVIEW_INVALID"),
     service: Object.freeze({
       environment: string(service.environment, "ADMIN_OVERVIEW_INVALID"),
+      telemetryStorageMode: typed ? "typed" : "json",
     }),
     collection: projectCollection(overview.collection),
     counts: projectOverviewCounts(overview.counts),
@@ -1474,10 +1860,15 @@ export function projectAdminOverview(value) {
     distribution: projectDistribution(overview.distribution),
     snapshots: Object.freeze(snapshots),
     dailyPublication: projectDailyPublication(overview.dailyPublication),
-    pendingHistoricalRebuilds: count(
-      overview.pendingHistoricalRebuilds,
-      "ADMIN_OVERVIEW_INVALID",
-    ),
+    pendingHistoricalRebuildsBounded: typed
+      ? overview.pendingHistoricalRebuildsBounded === null ? null : invalid("ADMIN_OVERVIEW_INVALID")
+      : boolean(overview.pendingHistoricalRebuildsBounded, "ADMIN_OVERVIEW_INVALID"),
+    pendingHistoricalRebuilds: typed
+      ? overview.pendingHistoricalRebuilds === null
+        ? null
+        : invalid("ADMIN_OVERVIEW_INVALID")
+      : count(overview.pendingHistoricalRebuilds, "ADMIN_OVERVIEW_INVALID"),
+    historicalPublication,
     errors: projectErrors(overview.errors),
     audit: Object.freeze(audit),
   });
@@ -1502,6 +1893,44 @@ export function projectAdminAction(value, expectedAction) {
     result: Object.freeze({
       code: string(result.code, "ADMIN_ACTION_INVALID"),
     }),
+  });
+}
+
+export const V11_ADOPTION_OUTCOMES = Object.freeze([
+  "adopted", "adoptable", "unchanged", "authority_unavailable", "client_syncing",
+  "successor_active", "unsupported_history", "no_contiguous_days", "refused",
+]);
+const V11_ADOPTION_METHOD = "v11-uploaded-evidence-adoption-1";
+const V11_ADOPTION_CURSOR_PATTERN = /^[A-Za-z0-9._:-]{1,256}$/u;
+const V11_ADOPTION_MAX_REFUSAL_CODES = 32;
+
+/** One page of the owner's stranded v1.1 upload adoption. Counts are closed;
+ * `nextAfterParticipantId` is the service's paging cursor and is returned only
+ * for the next request, never for display or storage. */
+export function projectV11EvidenceAdoption(value, expectedDryRun) {
+  const code = "ADMIN_ACTION_INVALID";
+  const action = record(value, code);
+  if (action.schemaVersion !== ADMIN_ACTION_SCHEMA_VERSION || action.action !== "run_maintenance") invalid(code);
+  const result = record(action.result, code);
+  if (result.task !== "v11_evidence_adoption" || result.method !== V11_ADOPTION_METHOD
+      || boolean(result.dryRun, code) !== expectedDryRun) invalid(code);
+  const outcomes = record(result.outcomes, code);
+  if (Object.keys(outcomes).sort().join("\0") !== [...V11_ADOPTION_OUTCOMES].sort().join("\0")) invalid(code);
+  const refusals = record(result.refusals, code);
+  const refusalEntries = Object.entries(refusals);
+  if (refusalEntries.length > V11_ADOPTION_MAX_REFUSAL_CODES
+      || refusalEntries.some(([key]) => !ERROR_CODE_PATTERN.test(key))) invalid(code);
+  const cursor = result.nextAfterParticipantId;
+  if (cursor !== null && (typeof cursor !== "string" || !V11_ADOPTION_CURSOR_PATTERN.test(cursor))) invalid(code);
+  return Object.freeze({
+    dryRun: expectedDryRun,
+    examined: count(result.examined, code),
+    outcomes: Object.freeze(Object.fromEntries(V11_ADOPTION_OUTCOMES.map((key) => [key, count(outcomes[key], code)]))),
+    refusals: Object.freeze(Object.fromEntries(refusalEntries.map(([key, value]) => [key, positiveInteger(value, code)]))),
+    daysCovered: count(result.daysCovered, code),
+    newDays: count(result.newDays, code),
+    keptAcceptedDays: count(result.keptAcceptedDays, code),
+    nextAfterParticipantId: cursor,
   });
 }
 

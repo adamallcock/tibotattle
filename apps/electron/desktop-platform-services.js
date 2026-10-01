@@ -14,6 +14,7 @@ import { DESKTOP_LANGUAGES } from "./desktop-contract.js";
 import { desktopText } from "./desktop-menu.js";
 import { validateHostedSignInAuthorizeUrl } from "./desktop-hosted-signin.js";
 import { parseCodexThreadURL } from "./loopback-policy.js";
+import { createLinuxAutostartOwner } from "./linux-autostart.js";
 
 const EXTERNAL_URLS = Object.freeze({
   website: "https://tibotattle.com",
@@ -299,6 +300,8 @@ export function createDesktopPlatformServices({
   platform = process.platform,
   homeDirectory = homedir(),
   environment = process.env,
+  linuxAutostartOwner,
+  linuxExecutablePath = environment.APPIMAGE || process.execPath,
   locale = "system",
   systemLocales,
   getUpdater = () => null,
@@ -322,6 +325,23 @@ export function createDesktopPlatformServices({
 
   const defaultCodexHome = resolve(join(homeDirectory, ".codex"));
   const textOptions = { locale, systemLocales };
+  let autostartOwner = linuxAutostartOwner ?? null;
+  if (platform === "linux" && linuxAutostartOwner === undefined && app.isPackaged === true) {
+    try {
+      autostartOwner = createLinuxAutostartOwner({
+        platform,
+        configRoot: environment.XDG_CONFIG_HOME ?? join(homeDirectory, ".config"),
+        executablePath: linuxExecutablePath,
+      });
+    } catch {
+      // An invalid XDG root or executable disables the control without
+      // exposing a private path through the settings bridge.
+    }
+  }
+
+  function loginResult(status, canSet) {
+    return Object.freeze({ status, canSet, detail: loginDetail(status, textOptions) });
+  }
 
   function selectedUpdater() {
     try {
@@ -361,44 +381,68 @@ export function createDesktopPlatformServices({
     return true;
   }
 
-  function loginItemStatus() {
+  async function loginItemStatus() {
+    if (platform === "linux") {
+      if (app.isPackaged !== true || autostartOwner === null) {
+        return loginResult("unavailable", false);
+      }
+      try {
+        const observed = await autostartOwner.status();
+        if ((observed?.status === "enabled" || observed?.status === "disabled")
+            && observed.canSet === true) {
+          return loginResult(observed.status, true);
+        }
+        return loginResult(observed?.status === "error" ? "error" : "unavailable", false);
+      } catch {
+        return loginResult("error", false);
+      }
+    }
     const canSet = app.isPackaged === true
       && (platform === "darwin" || platform === "win32")
       && typeof app.getLoginItemSettings === "function"
       && typeof app.setLoginItemSettings === "function";
     if (!canSet) {
       const status = "unavailable";
-      return Object.freeze({ status, canSet: false, detail: loginDetail(status, textOptions) });
+      return loginResult(status, false);
     }
     try {
       const settings = app.getLoginItemSettings();
       const status = platform === "darwin"
         ? normalizeMacLoginItem(settings)
         : normalizeWindowsLoginItem(settings);
-      return Object.freeze({ status, canSet: true, detail: loginDetail(status, textOptions) });
+      return loginResult(status, true);
     } catch {
       const status = "error";
-      return Object.freeze({ status, canSet: true, detail: loginDetail(status, textOptions) });
+      return loginResult(status, true);
     }
   }
 
-  function setStartAtLogin(enabled) {
+  async function setStartAtLogin(enabled) {
     if (typeof enabled !== "boolean") throw new TypeError("enabled is required");
-    const before = loginItemStatus();
+    const before = await loginItemStatus();
     if (!before.canSet) return before;
+    if (platform === "linux") {
+      try {
+        await (enabled ? autostartOwner.enable() : autostartOwner.disable());
+      } catch {
+        return loginResult("error", false);
+      }
+      const after = await loginItemStatus();
+      return after.status === (enabled ? "enabled" : "disabled")
+        ? after
+        : loginResult("error", false);
+    }
     try {
       app.setLoginItemSettings({ openAtLogin: enabled });
     } catch {
-      const status = "error";
-      return Object.freeze({ status, canSet: true, detail: loginDetail(status, textOptions) });
+      return loginResult("error", true);
     }
-    const after = loginItemStatus();
+    const after = await loginItemStatus();
     const confirmed = enabled
       ? after.status === "enabled" || after.status === "needs-approval"
       : after.status === "disabled";
     if (confirmed) return after;
-    const status = "error";
-    return Object.freeze({ status, canSet: true, detail: loginDetail(status, textOptions) });
+    return loginResult("error", true);
   }
 
   function notificationStatus() {

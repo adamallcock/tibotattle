@@ -7,7 +7,7 @@ import { createV11DeviceFixture, makeV11Day, stageV11Day } from "./helpers/telem
 import { authenticateDevice, createDeviceUploadAuthorization, claimDeviceUploadAuthorization } from "../src/device-auth";
 import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor } from "../src/telemetry-v11-domain";
 import { telemetryV11DomainManifestDigestInput, type TelemetryV11DomainManifest } from "@app-usagemonitor/telemetry-contract";
-import { V1_QUOTA_ACQUISITION_VERSION, createV1QuotaAcquisitionCheckpoint, createV1QuotaWorkInterner,
+import { V1_QUOTA_ACQUISITION_PAGE_SIZE, V1_QUOTA_ACQUISITION_VERSION, createV1QuotaAcquisitionCheckpoint, createV1QuotaWorkInterner,
   encodeV1QuotaWorkCheckpoint, decodeV1QuotaWorkCheckpoint, type V1QuotaWorkControl, type V1QuotaWorkComponent,
   advanceV1QuotaAcquisitionPage, type V1QuotaPageReplay, type V1PlanSourceRow,
   type V1QuotaAcquisitionIdentity } from "../src/quota-analysis-v1-reader";
@@ -32,7 +32,7 @@ const IDENTITY: CommunityAnalysisWorkIdentity = {
   windowMinutes: 10080, maxQuotaRows: 60000,
 };
 const control = (): V1QuotaWorkControl => ({ version: V1_QUOTA_ACQUISITION_VERSION, phase: "plan",
-  cursor: { observedAt: IDENTITY.observedAtCutoff, resetsAt: IDENTITY.resetsAtCutoff, id: 0 }, planTime: null, reset: null });
+  cursor: { observedAt: IDENTITY.observedAtCutoff, resetsAt: IDENTITY.resetsAtCutoff, id: 0 }, planTime: null, reset: null, clusterCursor: null });
 const budget = (remainingQueries = 1000, reserveQueries = 0) => ({ remainingQueries, reserveQueries, deadlineMs: 1, now: () => 0 });
 const anchor = (day = "2026-08-01") => ({ sourceContext: JSON.stringify(["openai_codex", "codex"]),
   contextKey: "openai_codex|codex", observedAtMs: Date.parse(`${day}T00:00:00.000Z`),
@@ -80,6 +80,171 @@ beforeEach(async () => {
   await reset();
   await applyD1Migrations(db(), (env as TestBindings).TEST_MIGRATIONS);
   await participant();
+});
+
+describe("acquisition vocabulary schema", () => {
+  it("admits the pool-hull and endpoint-hold components and the hull-sweep phase", async () => {
+    const head = await begin();
+    const part = (component: string) => db().prepare(`INSERT INTO community_analysis_work_parts
+      (participant_id,run_id,component,payload_json,payload_sha256,payload_bytes) VALUES (?,?,?,'[]',?,2)`)
+      .bind(IDENTITY.participantId, head.runId, component, component.padEnd(64, "0").slice(0, 64)
+        .replace(/[^0-9a-f]/g, "a")).run();
+    // The two components the clustered acquisition persists.
+    for (const component of ["reset-clusters", "endpoint-holds"]) await part(component);
+    expect(await db().prepare(`SELECT count(*) n FROM community_analysis_work_parts
+      WHERE component IN ('reset-clusters','endpoint-holds')`).first("n")).toBe(2);
+    // The vocabulary is still closed.
+    await expect(part("pool-hulls")).rejects.toThrow();
+    // The phase vocabulary is deliberately unchanged: the reader settles pool
+    // hulls as a second leg of `plan`, so no new phase name is ever written.
+    await expect(db().prepare("UPDATE community_analysis_work SET phase='clusters'").run()).rejects.toThrow();
+    await expect(db().prepare("UPDATE community_analysis_work SET phase='endpoints'").run()).resolves.toBeDefined();
+    // The parent is never rebuilt, so the column 0052 added is untouched.
+    expect(await db().prepare("SELECT reader_policy FROM community_analysis_work").first("reader_policy"))
+      .toBe("raw-source-pages-1");
+  });
+
+  it("admits a hull sweep that crosses a reset boundary backwards in time", async () => {
+    // The fit page is reset-major, and the anchor phase's hull sweep reads it,
+    // so a sweep page can end in a later reset group at an earlier
+    // `observed_at`. Keyed off the phase name that reads as a cursor rewind and
+    // every stage of the sweep is refused; keyed off the leg it is progress.
+    const day = "2026-08-01";
+    // The first reset group fills a whole physical page, so the sweep needs a
+    // second page; the later reset group is observed EARLIER, so that page
+    // ends with the reset ascending while `observed_at` descends — the case
+    // that used to read as a cursor rewind.
+    // Two full groups, so the page that crosses from the first to the second
+    // is not also the page that ends the sweep — otherwise the phase advance
+    // would mask the rewind the guard has to get right.
+    const counts = [V1_QUOTA_ACQUISITION_PAGE_SIZE, V1_QUOTA_ACQUISITION_PAGE_SIZE, 3];
+    const fit = counts.flatMap((count, group) => Array.from({ length: count }, (_, index) => ({
+      id: group * 100_000 + index + 1, occurrence_id: `q-sweep-${group}-${index}`,
+      observed_at: new Date(Date.parse(`${day}T06:00:00.000Z`) - group * 3_600_000 + index * 1_000).toISOString(),
+      observed_day: day, device_id: "synthetic-winner", provider: "openai_codex",
+      plan_type: "pro", plan_variant: "unknown", limit_id: "codex", slot: "seven_day",
+      used_percent: 10 + index % 17 * 5, window_duration_minutes: 10_080,
+      resets_at: new Date(Date.parse(`${day}T00:00:00.000Z`) + 7 * 86_400_000 + group * 60_000).toISOString(),
+    })));
+    const plan = [{ id: 1, observed_at: `${day}T06:00:00.000Z`, observed_day: day,
+      device_id: "synthetic-winner", provider: "openai_codex", limit_id: "codex",
+      plan_type: "pro", plan_variant: "unknown" }];
+    let head = await begin();
+    let components: unknown = emptyComponents();
+    let crossed = false;
+    // One physical page per call, so every leg boundary and every reset
+    // boundary inside the sweep is a separate staged, promoted page.
+    const reader = {
+      async readPlanPage() { return plan; },
+      async readFitPage(cursor: { resetsAt: string; observedAt: string; id: number }) {
+        const after = fit.filter((row) => row.resets_at > cursor.resetsAt
+          || (row.resets_at === cursor.resetsAt && (row.observed_at > cursor.observedAt
+            || (row.observed_at === cursor.observedAt && row.id > cursor.id))))
+          .sort((left, right) => left.resets_at.localeCompare(right.resets_at)
+            || left.observed_at.localeCompare(right.observed_at) || left.id - right.id);
+        return after.slice(0, V1_QUOTA_ACQUISITION_PAGE_SIZE);
+      },
+    } as unknown as Parameters<typeof advanceV1QuotaAcquisitionPage>[0];
+    for (let page = 0; page < 40; page += 1) {
+      const identity = head.identity;
+      const state = decodeV1QuotaWorkCheckpoint({ participantId: identity.participantId,
+        inputFingerprint: identity.inputFingerprint, sourceMethodVersion: identity.sourceMethodVersion,
+        observedAtCutoff: identity.observedAtCutoff, resetsAtCutoff: identity.resetsAtCutoff,
+        windowMinutes: identity.windowMinutes, maxQuotaRows: identity.maxQuotaRows },
+        head.control, components);
+      const step = await advanceV1QuotaAcquisitionPage(reader, state.identity,
+        new Map([[day, "synthetic-winner"]]), budget(1), state);
+      if (step.replay === null || step.checkpoint === null) break;
+      const encoded = encodeV1QuotaWorkCheckpoint(step.checkpoint);
+      const target = { phase: step.replay.through.phase, control: encoded.control,
+        components: encoded.components } satisfies CommunityAnalysisStageTarget;
+      // Every page of the sweep must be admitted, not read as a rewind.
+      if (step.replay.from.phase === "plan" && step.replay.through.phase === "plan"
+        && step.replay.from.cursor.resetsAt !== step.replay.through.cursor.resetsAt
+        && step.replay.through.cursor.observedAt < step.replay.from.cursor.observedAt) crossed = true;
+      const staged = await beginCommunityAnalysisStage(db(), head, target, step.replay, budget());
+      expect(staged.status, `page ${page} phase ${step.replay.from.phase}`).toBe("ready");
+      // Admission is what this test is about; release the stage row so the
+      // head can advance by the ordinary page commit.
+      await db().prepare("DELETE FROM community_analysis_work_stage").run();
+      const committed = await commitCommunityAnalysisWorkPage(db(), head,
+        { phase: target.phase, control: target.control, parts: [] }, budget());
+      if (committed.status !== "ready") throw new Error("synthetic page did not commit");
+      head = committed.head;
+      components = encoded.components;
+      if (step.result.status === "complete") {
+        // The fixture must actually produce the case under test.
+        expect(crossed).toBe(true);
+        return;
+      }
+    }
+    throw new Error("sweep did not finish");
+  });
+
+  it("rebuilds only the part tables and leaves every other object untouched", async () => {
+    // 0062 rebuilds the two `*_parts` tables and nothing else. The databases
+    // this chain runs against do not all carry the same objects -- the typed
+    // upload database has no `community_model_history_participant_state`
+    // trigger -- so the migration must neither drop nor recreate anything on
+    // `participants`, and the parents it never rebuilds keep `reader_policy`
+    // and every other later column by construction rather than by a copy list.
+    const all = (env as TestBindings).TEST_MIGRATIONS;
+    const index = all.findIndex((entry) => entry.name.startsWith("0062"));
+    expect(index).toBeGreaterThan(0);
+    await reset();
+    await applyD1Migrations(db(), all.slice(0, index));
+    await participant();
+    const head = await saved(await begin());
+    const stage = (table: string, runId: string) => db().prepare(`INSERT INTO ${table}
+      (participant_id,run_id,stage_id,base_progress_revision,stage_revision,mode,target_phase,
+       target_control_json,target_manifest_json,write_manifest_json,target_state_sha256,replay_json,
+       write_offset,verified_offset,gc_component,gc_sha256,discard_input_revision,state_sha256)
+      VALUES (?,?,'synthetic-stage',0,0,'writing','plan','{}','[]','[]',?,'{}',0,0,'','',NULL,?)`)
+      .bind(IDENTITY.participantId, runId, "c".repeat(64), "d".repeat(64)).run();
+    await stage("community_analysis_work_stage", head.runId);
+    // The model-history family is rebuilt by the same migration, so it carries
+    // a parent, a part and a stage row across it too.
+    await db().prepare(`INSERT INTO community_model_history_work (participant_id,run_id,input_revision,
+      input_fingerprint,source_kind,source_method_version,fixed_now,observed_at_cutoff,resets_at_cutoff,
+      window_minutes,max_quota_rows,phase,progress_revision,control_json,manifest_json,state_sha256)
+      VALUES (?,'synthetic-history-run',0,?,'v1','synthetic-history-1',?,?,?,10080,60000,'plan',0,'{}','[]',?)`)
+      .bind(IDENTITY.participantId, "a".repeat(64), NOW, IDENTITY.observedAtCutoff,
+        IDENTITY.resetsAtCutoff, "b".repeat(64)).run();
+    await db().prepare(`INSERT INTO community_model_history_work_parts
+      (participant_id,run_id,component,payload_json,payload_sha256,payload_bytes)
+      VALUES (?,'synthetic-history-run','plan-anchors','[]',?,2)`)
+      .bind(IDENTITY.participantId, "e".repeat(64)).run();
+    await stage("community_model_history_work_stage", "synthetic-history-run");
+    const rows = async (sql: string) => (await db().prepare(sql).all()).results;
+    const snapshot = async () => ({
+      participantTriggers: await rows(`SELECT name,sql FROM sqlite_master
+        WHERE type='trigger' AND tbl_name='participants' ORDER BY name`),
+      analysisWork: await rows("SELECT * FROM community_analysis_work ORDER BY run_id"),
+      analysisStage: await rows("SELECT * FROM community_analysis_work_stage ORDER BY run_id"),
+      analysisParts: await payloads(),
+      historyWork: await rows("SELECT * FROM community_model_history_work ORDER BY run_id"),
+      historyStage: await rows("SELECT * FROM community_model_history_work_stage ORDER BY run_id"),
+      historyParts: await rows(`SELECT component,payload_sha256 FROM community_model_history_work_parts
+        ORDER BY component,payload_sha256`),
+    });
+    const before = await snapshot();
+    expect(before.participantTriggers.length).toBeGreaterThan(0);
+    await applyD1Migrations(db(), all.slice(index, index + 1));
+    // Same triggers on `participants`, same parent rows, same stage rows, same
+    // parts -- the only difference is the vocabulary the part tables accept.
+    expect(await snapshot()).toEqual(before);
+    const insert = (component: string, key: string) => db().prepare(`INSERT INTO community_analysis_work_parts
+      (participant_id,run_id,component,payload_json,payload_sha256,payload_bytes) VALUES (?,?,?,'[]',?,2)`)
+      .bind(IDENTITY.participantId, head.runId, component, key.repeat(64)).run();
+    await expect(insert("reset-clusters", "1")).resolves.toBeDefined();
+    await expect(insert("endpoint-holds", "2")).resolves.toBeDefined();
+    await expect(insert("pool-hulls", "3")).rejects.toThrow();
+    // Dropping a table drops its triggers, so both rebuilds restored theirs.
+    await expect(db().prepare("UPDATE community_analysis_work_parts SET payload_bytes=2").run())
+      .rejects.toThrow();
+    await expect(db().prepare("UPDATE community_model_history_work_parts SET payload_bytes=2").run())
+      .rejects.toThrow();
+  });
 });
 
 describe("participant-scoped resumable analysis work", () => {
@@ -360,7 +525,8 @@ describe("participant-scoped resumable analysis work", () => {
   it("frames components by bytes and emits only changed chunks or explicit staging deferral", async () => {
     let head = await begin();
     const components = { "plan-anchors": Array.from({ length: 1800 }, () => anchor()),
-      "plan-runs": [], "plan-equal-time": [], "fit-stats": [], eligible: [], "endpoint-runs": [], endpoints: [] };
+      "plan-runs": [], "plan-equal-time": [], "reset-clusters": [], "fit-stats": [], eligible: [],
+      "endpoint-runs": [], "endpoint-holds": [], endpoints: [] };
     const delta = await prepareCommunityAnalysisWorkDelta(head, components);
     expect(delta.status).toBe("ready");
     if (delta.status !== "ready") throw new Error("expected delta");
@@ -400,7 +566,8 @@ describe("participant-scoped resumable analysis work", () => {
       { control: encoded.control, phase: "endpoints", parts: delta.parts }, budget());
     if (save.status !== "ready") throw new Error("expected save");
     const components: Record<V1QuotaWorkComponent, unknown[]> = { "plan-anchors": [], "plan-runs": [],
-      "plan-equal-time": [], "fit-stats": [], eligible: [], "endpoint-runs": [], endpoints: [] };
+      "plan-equal-time": [], "reset-clusters": [], "fit-stats": [], eligible: [],
+      "endpoint-runs": [], "endpoint-holds": [], endpoints: [] };
     const interner = createV1QuotaWorkInterner();
     try {
       let offset = 0;
@@ -424,8 +591,10 @@ describe("participant-scoped resumable analysis work", () => {
 });
 
 function emptyComponents() {
-  return { "plan-anchors": [] as ReturnType<typeof anchor>[], "plan-runs": [], "plan-equal-time": [],
-    "fit-stats": [], eligible: [], "endpoint-runs": [], endpoints: [] };
+  return { "plan-anchors": [] as ReturnType<typeof anchor>[], "plan-runs": [] as unknown[],
+    "plan-equal-time": [] as unknown[], "reset-clusters": [] as unknown[], "fit-stats": [] as unknown[],
+    eligible: [] as unknown[], "endpoint-runs": [] as unknown[], "endpoint-holds": [] as unknown[],
+    endpoints: [] as unknown[] };
 }
 async function onePageTarget(head: CommunityAnalysisWorkHead, components: unknown = emptyComponents(),
   sourceRows: V1PlanSourceRow[] = [{ id: 1, observed_at: "2026-08-01T00:00:00.000Z", observed_day: "2026-08-01",
@@ -703,7 +872,11 @@ describe("staged immutable checkpoint promotion", () => {
     }
     const promoted = await promoteCommunityAnalysisStage(db(), seeded.head, stage, budget());
     if (promoted.status !== "ready") throw new Error("expected promotion");
-    expect(promoted.head.phase).toBe("fitability");
+    // The anchor phase now finishes into its own second leg, which settles
+    // the pool hulls, so one page past the anchors is still `plan` with the
+    // hull sweep open rather than the next phase.
+    expect(promoted.head.phase).toBe("plan");
+    expect(promoted.head.control.clusterCursor).not.toBeNull();
     expect(await readCommunityAnalysisWorkParts(db(), seeded.head, 0, budget())).toEqual({ status: "stale" });
     const followup = await onePageTarget(promoted.head, replayed.target.components, []);
     expect(await beginCommunityAnalysisStage(db(), promoted.head, followup.target, followup.replay, budget())).toEqual({ status: "stale" });

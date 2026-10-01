@@ -44,10 +44,27 @@ const APPLICATION_PUBLIC_EXPORTS = [
   "createLocalMetadataExportContext",
   "createLocalMetadataBundleVerificationContext",
   "createModelPerformanceContext",
+  "createTelemetryPerformanceClient",
+  "createTelemetryPerformanceDayRunner",
+  "createTelemetryPerformanceScheduler",
+  "TELEMETRY_PERFORMANCE_AUTHORIZATION_VERSION",
+  "TELEMETRY_PERFORMANCE_CAPABILITIES_VERSION",
+  "TELEMETRY_PERFORMANCE_METHOD_VERSION",
+  "TELEMETRY_PERFORMANCE_PRIVACY_CONTRACT_VERSION",
+  "TELEMETRY_PERFORMANCE_REPORT_SCHEMA_VERSION",
+  "TELEMETRY_PERFORMANCE_SCOPE",
+  "TELEMETRY_PERFORMANCE_SUPPORTED_SPEED_METHODS",
+  "TELEMETRY_PERFORMANCE_SYNC_STATE_VERSION",
+  "initialTelemetryPerformanceSyncState",
+  "parseTelemetryPerformanceSyncState",
+  "resumeTelemetryPerformanceSyncAfterAuthorization",
   "createUsageExplainerService",
   "createWorkUsageService",
+  "createWorkUsageSnapshotStore",
   "validateWorkUsageQuery",
   "fitUsageExplanationEnvelope",
+  "prepareTelemetryPerformanceDay",
+  "projectTelemetryPerformanceDay",
   "selectProductionParticipantIdentity",
   "selectProductionClaudeCallbackBackend",
   "usageExplanationCatalog",
@@ -239,6 +256,61 @@ test("application sensitivity retains event-qualified model/context mixtures and
     assert.equal(invalid.scenarios.fast.assumedRatioStandardApiEquivalentUsd, 3);
     assert.equal(invalid.modelMultipliers["gpt-5.5"], null);
   }
+});
+
+test("observed Ultrafast selects an exact API-price scenario without changing unknown-mode sensitivities", () => {
+  const byModel = { "gpt-6-astra": { costUsd: 3, priceEvidence: {
+    eventTime: "2026-09-29T12:00:00.000Z", totalInputContextTokens: 300_000,
+  } } };
+  const result = application.subscriptionSpeedSensitivity(byModel, "ultrafast");
+  assert.equal(result.selectedScenario, "ultrafast");
+  assert.equal(result.basis, "codex_speed_api_price_ratio_applied_to_standard_api_equivalent");
+  assert.deepEqual(result.scenarios.ultrafast, {
+    relativeQuotaWeight: "model_specific",
+    weightedStandardApiEquivalentUsd: 18,
+    unweightedStandardApiEquivalentUsd: 0,
+    complete: true,
+    modelMultipliers: { "gpt-6-astra": 6 },
+  });
+  // The API comparison is 2x/6x, never the included-allowance weights 2.5x/8x.
+  assert.equal(result.scenarios.fast.weightedStandardApiEquivalentUsd, 6);
+  assert.equal(result.scenarios.standard.weightedStandardApiEquivalentUsd, 3);
+  for (const mode of ["unknown", "other"]) {
+    const unresolved = application.subscriptionSpeedSensitivity(byModel, mode);
+    assert.equal(unresolved.selectedScenario, null);
+    assert.deepEqual(Object.keys(unresolved.scenarios), ["standard", "fast"]);
+  }
+});
+
+test("Ultrafast remains unavailable for unsupported models or incomplete event evidence, including zero cost", () => {
+  const evidence = { eventTime: "2026-09-29T12:00:00.000Z", totalInputContextTokens: 1_000 };
+  for (const [model, priceEvidence, costUsd] of [
+    ["gpt-6.1-sol", evidence, 2],
+    ["gpt-6-astra-future", evidence, 2],
+    ["gpt-6-astra", undefined, 2],
+    ["gpt-6-astra", { eventTime: evidence.eventTime }, 2],
+    ["gpt-6-astra", { ...evidence, eventTime: "2026-09-28T12:00:00.000Z" }, 2],
+    ["gpt-6-astra", { ...evidence, totalInputContextTokens: -1 }, 2],
+    ["gpt-6.1-sol", evidence, 0],
+  ]) {
+    const result = application.subscriptionSpeedSensitivity({ [model]: { costUsd, priceEvidence } }, "ultrafast", {
+      // Even a wholly Fast-qualified crossing cannot prove Ultra eligibility.
+      speedWeightingByModel: { [model]: { unknown: { [model]: { events: 1, apiPriceEquivalentUsd: costUsd } } } },
+    });
+    assert.equal(result.selectedScenario, "ultrafast");
+    assert.equal(result.scenarios.ultrafast.complete, false);
+    assert.equal(result.scenarios.ultrafast.weightedStandardApiEquivalentUsd, null);
+    assert.equal(result.scenarios.ultrafast.unweightedStandardApiEquivalentUsd, costUsd);
+    assert.equal(result.scenarios.ultrafast.modelMultipliers[model], null);
+  }
+  const mixed = application.subscriptionSpeedSensitivity({
+    "gpt-6-astra": { costUsd: 3, priceEvidence: evidence },
+    "gpt-6.1-sol": { costUsd: 2, priceEvidence: evidence },
+  }, "ultrafast");
+  assert.equal(mixed.scenarios.ultrafast.complete, false);
+  assert.equal(mixed.scenarios.ultrafast.weightedStandardApiEquivalentUsd, null);
+  assert.equal(mixed.scenarios.ultrafast.unweightedStandardApiEquivalentUsd, 2);
+  assert.deepEqual(mixed.scenarios.ultrafast.modelMultipliers, { "gpt-6-astra": 6, "gpt-6.1-sol": null });
 });
 
 test("production modules no longer depend on the legacy tier shim", async () => {

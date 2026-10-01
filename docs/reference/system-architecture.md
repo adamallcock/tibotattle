@@ -52,7 +52,7 @@ navigation allowlist.
 | `src/` | Local/domain ingestion, accounting, identity, exports, contribution preparation, and durable state contracts. | UI composition, deployments, or native OS presentation. |
 | `apps/local/` | Loopback HTTP composition, refresh lifecycle, dashboard projections, and fixed relays. | Arbitrary proxying or hosted persistence. |
 | `apps/web/` | Shared dashboard/static public UI and browser localization. | Local filesystem or platform credential access. |
-| `apps/macos/` | Native lifecycle, menus/settings, login item, Keychain broker, updater, and WKWebView policy. | Accounting semantics or hosted authorization. |
+| `apps/electron/` | Cross-platform shell lifecycle, exact preload/IPC bridge, tray popup, settings, updater, macOS Keychain and predecessor migration, and automatic-refresh cadence. | Local analysis, provider parsing, or arbitrary renderer commands. |
 | `apps/worker/` | Public website, identity, participant/session/device lifecycle, ingestion, aggregates, admin operations, D1/R2/DO composition. | Local source discovery or private Mac state. |
 | `packages/` | Runtime-neutral accounting, quota, identity, localization, and telemetry public APIs. | App-to-app imports or platform-specific side effects. |
 | `scripts/` and `tools/` | Build, validation, release, migration, and operator entrypoints. | Runtime product dependencies. |
@@ -94,6 +94,21 @@ blob downloads. Provider identity pages open in the system browser. Native/web
 bridge messages use a closed vocabulary documented in
 [`api-surface.md`](./api-surface.md).
 
+Electron main owns one persisted automatic-refresh cadence timer. After the
+loopback companion accepts a renderer request, the renderer acquires a closed
+`quick` or `detailed` lease through the exact preload and IPC boundary and sends
+a numeric heartbeat every 30 seconds. Main applies a three-minute quick or
+ten-minute detailed missing-heartbeat watchdog plus a non-renewable 243-minute
+operation deadline. Settlement is idempotent for the latest lease; heartbeat
+timeout, absolute deadline and dashboard replacement release an abandoned lease
+and rearm one timer. Main diagnostics project only closed state, booleans,
+mode, age, canonical timestamps and a fixed recovery reason.
+
+Dashboard and tray freshness both derive observation age from
+`latestObservedAt` against the live clock. The serialized age remains transport
+evidence rather than a presentation clock, so an open surface crosses the stale
+boundary and withdraws current allowance/pacing claims without a new payload.
+
 ## Independent model performance diagnostics
 
 The development source adds web/native `#performance` navigation and a fixed
@@ -106,6 +121,18 @@ sources across accounts, independently of account-scoped accounting.
 The worker starts on a timing-page read and stops after a 60-second idle lease.
 It scans plain session/archive JSONL in bounded, checkpointed passes and stores
 one aggregate per turn in an owner-only, capped version-2 timing database.
+A version-3 supplement under `inference-timing-v2/source-<Codex-home digest>/tool-free-v1/` independently
+backfills single-response turns without tools, using the original sidecar's
+private correlation key. Its own cursor and pending state do not change original
+measurements or checkpoints. Joins require matching turn identity and original
+scalar evidence. The schema-4/method-5 display contract combines response speed and full-turn
+throughput in one Output speed distribution. Response timing takes precedence
+per turn; eligible tool-free throughput is used only as a fallback, including
+initial waiting. Percentiles are computed from individual samples, never merged
+from aggregate percentiles. The fallback count and bins identify that subset;
+TTFT and original stored measurements remain unchanged.
+If the supplement cannot open or be read, the worker still serves the original
+measurements with an explicit stale state.
 Neither timing data nor failures enter accounting or contribution; no network
 service is involved. Incompatible storage is preserved and refused. See the
 [privacy inventory](./local-data-and-privacy.md#model-performance-timing-in-development-source)
@@ -225,8 +252,12 @@ and existing cohort limits are unchanged.
 The staged v1.1 path adds immutable day manifests and a complete-domain head.
 First activation uses a null predecessor plus the observed legacy fingerprint;
 successors preserve every selected prior occurrence's base accounting. Candidate
-arrival is not publication. A transactional head switch selects v1.1 for the
-whole participant domain, queues daily rebuilds and invalidates prior caches.
+arrival is not publication. A transactional head switch records the new v1.1 write cursor, queues daily
+rebuilds and invalidates prior caches. With the correction runtime staged, the
+legacy reader selects that complete participant domain. Once the correction
+runtime is active, effective readers retain all admitted v1/v1.1 device
+generations and activated v1.2 generations, grouping observations by occurrence
+before folding. A newer device head cannot discard unique older-device rows.
 Even an explicit admission-floor rollback cannot silently select a legacy day
 outside that domain. Any accepted v0.2 corpus prevents a v1.1 consent upgrade
 and activation until a semantic replacement mapping is proven, including when
@@ -247,6 +278,24 @@ records); larger transfers pause without deleting or silently truncating history
 Hosted fitting has a bounded 100-day evidence horizon and remains conditional:
 the wire format does not prove complete historical quantity intervals. No
 scoped-primary account billing claim is introduced by the new transport.
+
+The v1.2 source path adds independent successor capability and authorization,
+an exact local field review, a separate progress journal, encrypted transport,
+typed admission and complete-domain activation. Its three usage extensions are
+continuity bits, same-time order and non-additive cache-write TTL detail. They
+are excluded from current cache arithmetic. Exact-total corrections preserve
+immutable source variants so later older-client uploads cannot erase known
+totals or their own unique occurrences. Every analytical pathway must use the
+qualified occurrence reader before the correction runtime is activated; see the
+[current implementation plan](../plans/2026-09-20-turn-boundary-telemetry-plan.md).
+
+Daily performance is a separate stream with its own policy, grants, encrypted
+reports and typed cohort/bucket storage. It has fixed mergeable distributions
+for TPS, TTFT and full turn duration, plus measurement and mode provenance.
+Per-device report revisions are idempotent; pooled values describe reported
+samples and may include cross-device overlap. Timing fields do not enter usage
+events. Both new runtimes start staged, and source availability proves neither
+hosted activation nor installed-client operation.
 
 ## Hosted storage
 

@@ -51,6 +51,15 @@ revocation fails. Unknown or failed local persistence blocks sending. An app
 restart, missing credential, expired receipt or policy upgrade cannot reset an
 explicit opt-out. A later affirmative user action may re-enable sharing.
 
+The owner clarified on 2026-09-15 that opt-out and ordinary device disconnect
+stop future uploads only. Already accepted records remain eligible for analysis;
+these actions must not delete history, withdraw published graphs, invalidate
+completed calculations, or restart historical work. Credential revocation still
+blocks new admission. This supersedes the earlier coupling of user-requested
+revocation to public-source withdrawal. The
+[upload-only opt-out decision](./2026-09-15-opt-out-stops-future-uploads.md) records
+the implementation and deployment boundary.
+
 Policy or destination changes require a reviewed migration contract; do not
 silently reuse a choice for another destination. Preserve existing identity,
 account-track and accepted-history continuity where it can be verified.
@@ -64,7 +73,11 @@ requires the same secret, active installation/owner/device/authorization graph,
 and unchanged policy. It renews within the final seven days or after an offline
 period, keeping the same identities and accepted upload history. Ordinary
 enrollment replay does not renew. Lost responses converge on the existing
-renewed lease, without consuming another installation slot.
+renewed lease, without consuming another installation slot. The optional v1.2
+successor grant belongs to the same lease: renewal extends it with the rest of
+the graph (ingestion-isolation migration `0010`, 2026-09-25), and a grant that
+a renewal left behind is reported as not current and caught up by the next
+successor authorization request instead of silently blocking v1.2 uploads.
 
 Revocation, erasure, containment, conflicting identities and policy mismatches
 remain terminal. Renewal never clears a local opt-out, recreates an erased

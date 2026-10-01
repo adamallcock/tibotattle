@@ -316,6 +316,7 @@ function fakeRemote({
           attribution_objects: 1,
           attribution_columns: 1,
           scale_objects: 1,
+          public_source_objects: 1,
           scale_columns: 1,
           primary_cooldown_table: 1,
           primary_participant_cooldown_digest: 1,

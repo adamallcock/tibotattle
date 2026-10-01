@@ -5,11 +5,13 @@ import {
   LOCAL_COMPANION_STATIC_FILES,
 } from "../apps/local/static-assets.js";
 import {
-  collectMacOSWebModuleGraph,
-} from "../scripts/build-macos-app.js";
+  collectWebModuleGraph,
+} from "../scripts/lib/runtime-closure.mjs";
 
 test("every transitive browser module is served by loopback and every served module is in the closure", async () => {
-  const discovered = await collectMacOSWebModuleGraph();
+  const discovered = await collectWebModuleGraph({
+    surface: "local companion",
+  });
   const servedModules = Object.entries(LOCAL_COMPANION_STATIC_FILES)
     .filter(([, { file }]) => /\.(?:m?js)$/u.test(file))
     .map(([route, { file, type }]) => ({

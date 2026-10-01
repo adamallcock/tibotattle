@@ -59,6 +59,12 @@ The maintained field, storage, retention, and deletion inventory is in the
 
 ## Calculation and scale boundary
 
+When pricing changes, daily publication rebuilds stale v1/v1.1 summaries from
+the same admitted source records. Repricing checkpoints one source chunk or
+one generation page at a time; it preserves source selection, immutable
+projection records, and delivery cursors. Incomplete or invalid evidence is
+never relabeled with the new registry or published as a complete day.
+
 Migrations 0054–0056 add a fair dirty-account queue, restartable captured-cohort
 publication, and constant-size preparation counters. Unchanged current work is
 a metadata check, not an account scan. New inputs coalesce per account, and a
@@ -78,9 +84,13 @@ traffic to a hosted environment. The
 [1,000-contributor qualification review](../../docs/reviews/2026-09-08-thousand-contributor-qualification.md)
 records the workload, measurements and unqualified capacity boundaries.
 
-The shared 900-statement budget, 40-second optional-work admission deadline and
-one-minute scheduled cadence are unchanged. A population of 1,000 is not a
-claim of 1,000 simultaneous imports or 1,000 full recalculations per minute.
+The shared 900-statement budget and one-minute scheduled cadence cover the whole
+invocation. Graph calculations receive a 40-second admission window starting
+after required maintenance and bounded weekly publication finish; earlier
+housekeeping does not consume that window. Weekly publication retains its source
+and privacy fences, reserves query headroom for graph work, and reports failures
+independently. A population of 1,000 is not a claim of 1,000 simultaneous imports
+or 1,000 full recalculations per minute.
 Historical cohort readers still cap eligible contributors at 1,024 and retain
 exact-date publication guards; larger cohorts and sustained arrival rates need
 separate qualification. See the [operations boundary](../../docs/runbooks/production-operations.md)
@@ -187,6 +197,16 @@ requires separate owner authorization and rehearsal; source tests are not a
 production cutover receipt.
 
 The current public product series is `GET /api/v1/community/daily`.
+Its current activity, allowance and model calculations admit both signed-in
+and accountless contribution sources. Migration `0060` defines the exact
+durable accountless owner/device/v1.1 authority chain, immediate withdrawal
+fences and bounded retained-source bootstrap. It does not grant social consent
+or verify a person/provider account. Upload credential expiry is independent
+of retained-data eligibility. See the
+[public sample decision](../../docs/decisions/2026-09-11-public-contribution-sources.md)
+for source identity, overlap and activation gates. Legacy sealed weekly
+snapshots keep their original transport and cohort policy.
+
 Self-service `DELETE /api/v1/me` is retired: the unknown API response is
 `404 NOT_FOUND`, without D1 access or participant mutation. `GET /api/v1/me`,
 legacy personal statistics, weekly aggregate, recovery,
@@ -195,7 +215,7 @@ routes have been retired. Hosted export, security reset, and selected-device
 management remain exact Worker session surfaces but are not granted through
 the loopback participant relay.
 
-Confirmed **Disconnect this Mac** uses the existing device-disconnect path;
+Legacy confirmed **Disconnect this Mac** uses the existing device-disconnect path;
 it preserves hosted and local history. Private owner erasure instead uses
 `POST /api/v1/admin/action` with `action: "run_maintenance"` and an explicit
 `participantErasure` object containing the exact `participant:<UUID>` target

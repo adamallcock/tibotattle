@@ -2,11 +2,10 @@
 //
 // WHY THIS EXISTS
 // ---------------
-// Codex writes the speed mode into the rollout log only when it is applied or
-// changed (`thread_settings_applied`), never at session start. The session
-// baseline is therefore unobservable from the log alone. `~/.codex/config.toml`
-// holds a top-level `service_tier` key with the CURRENT setting, which is the
-// only place the baseline exists at all.
+// Explicit per-turn context or applied settings may supply speed evidence.
+// When retained records omit it, `~/.codex/config.toml` supplies a top-level
+// `service_tier` key with the CURRENT setting. Reading that key supports only
+// a time-bounded declared observation, not historical session attribution.
 //
 // WHY IT MAY ONLY BE READ, NEVER MINED
 // ------------------------------------

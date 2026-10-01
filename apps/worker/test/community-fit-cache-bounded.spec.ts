@@ -1,14 +1,16 @@
 import { env } from "cloudflare:workers";
-import { reset } from "cloudflare:test";
+import { reset, type D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import { APP_PRICE_REGISTRY_MANIFEST } from "@app-usagemonitor/accounting";
-import { CACHED_COMMUNITY_ALLOWANCE_PAYLOADS_SQL,COMMUNITY_ATTRIBUTION_METHOD_VERSION, readCachedCommunityAllowanceCorpus } from "../src/community-allowance";
-import { SERVER_PRICING_METHOD_VERSION } from "../src/server-pricing";
+import { CACHED_COMMUNITY_ALLOWANCE_PAYLOADS_SQL,COMMUNITY_ATTRIBUTION_METHOD_VERSION, V1_FIT_CACHE_KEY,
+  V1_FIT_CACHE_KEY_SUFFIX, readCachedCommunityAllowanceCorpus } from "../src/community-allowance";
 import { createD1InvocationBudget } from "../src/d1-invocation-budget";
 
+import { installPublicSourceOwnersForCacheFixture } from "./helpers/public-source-owners";
+
+interface Bindings extends Env { TEST_MIGRATIONS: D1Migration[] }
 const db = () => env.USAGE_MONITOR_DB;
 const NOW = Date.parse("2026-09-01T00:00:00.000Z"), FROM = "2026-05-24", FP="a".repeat(64);
-const suffix = `${APP_PRICE_REGISTRY_MANIFEST.sha256}:v1-fit-7:${SERVER_PRICING_METHOD_VERSION}:${COMMUNITY_ATTRIBUTION_METHOD_VERSION}`;
+const suffix = V1_FIT_CACHE_KEY;
 const budget = (remainingQueries=30) => ({remainingQueries, deadlineMs:1, now:()=>0});
 async function fixture() {
   await db().batch([
@@ -24,6 +26,7 @@ async function fixture() {
     "CREATE TABLE telemetry_v11_domain_heads(participant_id TEXT PRIMARY KEY)",
     "CREATE TABLE community_allowance_fit_cache(participant_id TEXT PRIMARY KEY,cache_key TEXT,fits_json TEXT,input_fingerprint TEXT,source_method_version TEXT)",
   ].map(query=>db().prepare(query)));
+  await installPublicSourceOwnersForCacheFixture(db(), (env as Bindings).TEST_MIGRATIONS);
 }
 function fit(participantId: string) { return {participantId,planType:"pro",capacityNanousd:123_000_000_000,lastObservedAt:"2026-08-20T00:00:00.000Z"}; }
 async function participant(id: string, source="v1", state="active") {
@@ -32,7 +35,7 @@ async function participant(id: string, source="v1", state="active") {
     db().prepare("INSERT INTO community_current_analysis_queue(participant_id) VALUES(?)").bind(id)];
   if (["v1","mixed","v1.1"].includes(source)) statements.push(db().prepare("INSERT INTO telemetry_v1_chunks VALUES(?,NULL)").bind(id));
   if (["v0.2","mixed","v1.1"].includes(source)) statements.push(db().prepare("INSERT INTO telemetry_contributions VALUES(?,'accepted','telemetry-contribution-v0.2')").bind(id));
-  if (source==="v1.1") statements.push(db().prepare("INSERT INTO telemetry_v11_domain_heads VALUES(?)").bind(id));
+  if (source==="v1.1") statements.push(db().prepare("INSERT INTO telemetry_v11_domain_heads(participant_id) VALUES(?)").bind(id));
   statements.push(db().prepare("INSERT INTO community_allowance_fit_cache VALUES(?,?,?,?,?)")
     .bind(id,`${source}:1:${FROM}:${suffix}`,JSON.stringify([fit(id)]),FP,COMMUNITY_ATTRIBUTION_METHOD_VERSION));
   await db().batch(statements);
@@ -51,7 +54,8 @@ describe("bounded cache-only scalar fit corpus",()=>{
   });
   it("returns no partial cohort when a later cache is missing, stale or corrupt",async()=>{
     await participant("a"); await participant("b");
-    for (const [column,value] of [["cache_key","old"],["fits_json","[false]"],["input_fingerprint","not-a-fingerprint"],
+    const shortenedFitKey = `v1:1:${FROM}:${V1_FIT_CACHE_KEY_SUFFIX}`;
+    for (const [column,value] of [["cache_key","old"],["cache_key",shortenedFitKey],["fits_json","[false]"],["input_fingerprint","not-a-fingerprint"],
       ["source_method_version","obsolete"]]) {
       const old=await db().prepare(`SELECT ${column} AS value FROM community_allowance_fit_cache WHERE participant_id='b'`).first<{value:string}>();
       await db().prepare(`UPDATE community_allowance_fit_cache SET ${column}=? WHERE participant_id='b'`).bind(value).run();

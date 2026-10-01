@@ -19,6 +19,7 @@ import {
   ACCOUNTLESS_UPLOAD_OWNER_SCOPE,
   ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
 } from "../src/contribution/index.js";
+import { telemetryV12RequiredConsent } from "@app-usagemonitor/telemetry-contract";
 import { DEPLOYMENT_ENDPOINTS } from "../config/deployment-endpoints.js";
 
 const ORIGIN = "https://usage.example";
@@ -1118,5 +1119,144 @@ test("expiry between enrollment and ownership gets one authenticated recovery at
     assert.equal(ownershipCalls, 2);
     assert.deepEqual(requests, ["/api/v1/accountless/enrollment", "/api/v1/accountless/ownership",
       "/api/v1/accountless/renewal", "/api/v1/accountless/ownership", ...(recover ? ["sync"] : [])]);
+  }
+});
+
+
+function successorCapabilities({ lifecycle = "accepted", granted = false } = {}) {
+  return { schemaVersion: "device-sync-capabilities-v1.2", destinationOrigin: LABORATORY_ORIGIN,
+    enrollmentNamespace: "synthetic_enrollment_0001", identityVersion: "account-track-v2", authorityKind: "accountless",
+    successor: { schemaVersion: "telemetry-contribution-v1.2", envelopeSchemaVersion: "telemetry-envelope-v1.2",
+      lifecycle, consentCurrent: false, authorizationCurrent: granted,
+      requiredConsent: telemetryV12RequiredConsent(), activationTime: granted ? "2026-09-01T00:00:00.000Z" : null } };
+}
+
+test("new accountless client negotiates an exact successor policy before selecting v1.2", async () => {
+  const calls = [];
+  let selected;
+  const result = await runAccountlessContributionSyncOnce(renewalRunnerOptions({
+    negotiateSuccessors: true, progressFile: "/synthetic/private/usage-progress.json",
+    enroll: async () => ({}), claimOwnership: async () => ownershipReceipt(),
+    fetchImpl: async (url, options) => {
+      const path = new URL(url).pathname; calls.push(path);
+      if (path.endsWith("sync-capabilities-v1.2")) return jsonResponse(successorCapabilities());
+      assert.equal(path, "/api/v1/accountless/telemetry-v1.2-authorization");
+      const body = JSON.parse(options.body);
+      assert.deepEqual(body, { schemaVersion: "accountless-upload-owner-v1.2",
+        policyVersion: "accountless-telemetry-v1.2-policy-v1", authorizationBasis: "accountless-policy-v1.2",
+        telemetrySchemaVersion: "telemetry-contribution-v1.2" });
+      return jsonResponse(body, 201);
+    },
+    runIncrementalSync: async (options) => { selected = options; return { status: "complete" }; },
+  }));
+  assert.equal(result.status, "complete");
+  assert.equal(selected.authorization.telemetrySchemaVersion, "telemetry-contribution-v1.2");
+  assert.equal(selected.progressFile, "/synthetic/private/usage-progress.json.v12");
+  assert.equal(Object.hasOwn(selected, "consent"), false);
+  assert.equal(calls.length, 2);
+});
+
+for (const state of ["staged", "unavailable", "malformed"]) {
+  test(`accountless successor ${state} leaves legacy contribution available`, async () => {
+    const calls = [];
+    const result = await runAccountlessContributionSyncOnce(renewalRunnerOptions({
+      negotiateSuccessors: true,
+      enroll: async () => ({}), claimOwnership: async () => ownershipReceipt(),
+      fetchImpl: async (url) => {
+        calls.push(new URL(url).pathname);
+        return state === "staged" ? jsonResponse(successorCapabilities({ lifecycle: "staged" }))
+          : state === "unavailable" ? jsonResponse({ error: { code: "NOT_FOUND" } }, 404)
+            : jsonResponse({ unexpected: true });
+      },
+      runIncrementalSync: async (options) => {
+        assert.equal(options.authorization.telemetrySchemaVersion, "telemetry-contribution-v1.1");
+        return { status: "complete" };
+      },
+    }));
+    assert.equal(result.status, "complete");
+    assert.deepEqual(calls, ["/api/v1/device/sync-capabilities-v1.2"]);
+  });
+}
+
+test("opt-out between successor discovery and authorization prevents both grant and usage", async () => {
+  let enabled = true;
+  const calls = [];
+  const result = await runAccountlessContributionSyncOnce(renewalRunnerOptions({
+    negotiateSuccessors: true,
+    readPreference: async () => preference({ destinationOrigin: LABORATORY_ORIGIN, enabled }),
+    enroll: async () => ({}), claimOwnership: async () => ownershipReceipt(),
+    fetchImpl: async (url) => { calls.push(new URL(url).pathname); enabled = false;
+      return jsonResponse(successorCapabilities()); },
+    runIncrementalSync: async () => assert.fail("Opt-out must prevent usage"),
+  }));
+  assert.equal(result.status, "failed");
+  assert.deepEqual(calls, ["/api/v1/device/sync-capabilities-v1.2"]);
+});
+
+test("enrollment retries transient gateway statuses without consuming their bodies", async () => {
+  for (const status of [408, 429, 502, 503]) {
+    let cancelled = false;
+    let reads = 0;
+    await assert.rejects(enrollAccountlessContribution({
+      origin: ORIGIN, readPreference: async () => preference(), now: () => NOW,
+      ensureCapability: async () => capability(),
+      fetchImpl: async () => new Response(new ReadableStream({
+        pull() { reads += 1; return new Promise(() => {}); },
+        cancel() { cancelled = true; },
+      }, { highWaterMark: 0 }), { status, headers: { "content-type": "text/html", "retry-after": "60" } }),
+    }), (error) => {
+      assert.equal(error.code, "contribution_accountless_client_service_unavailable");
+      assert.equal(error.retryable, true);
+      assert.equal(error.retryAfterMilliseconds, 60_000);
+      return true;
+    });
+    assert.equal(cancelled, true);
+    assert.equal(reads, 0);
+  }
+});
+
+test("enrollment keeps redirects and terminal gateway rejections fail closed", async () => {
+  for (const status of [200, 401, 403, 409, 503]) {
+    const response = new Response("<html>synthetic</html>", { status });
+    if ([200, 503].includes(status)) Object.defineProperty(response, "redirected", { value: true });
+    await assert.rejects(enrollAccountlessContribution({
+      origin: ORIGIN, readPreference: async () => preference(), now: () => NOW,
+      ensureCapability: async () => capability(), fetchImpl: async () => response,
+    }), isClientError("response_invalid", { retryable: false }));
+  }
+});
+
+test("enrollment retries body IO errors but rejects completed truncated JSON and invalid UTF8", async () => {
+  for (const kind of ["io", "json", "utf8"]) {
+    const response = new Response(new ReadableStream({
+      start(controller) {
+        if (kind === "io") controller.error(new Error("private-synthetic-body-error"));
+        else {
+          controller.enqueue(kind === "utf8" ? Uint8Array.of(0xff) : new TextEncoder().encode('{"state":'));
+          controller.close();
+        }
+      },
+    }), { headers: { "content-type": "application/json", "cache-control": "no-store" } });
+    await assert.rejects(enrollAccountlessContribution({
+      origin: ORIGIN, readPreference: async () => preference(), now: () => NOW,
+      ensureCapability: async () => capability(), fetchImpl: async () => response,
+    }), isClientError(kind === "io" ? "service_unavailable" : "response_invalid", { retryable: kind === "io" }));
+  }
+});
+
+
+test("gateway Retry-After dates and invalid or excessive delays remain bounded", async () => {
+  for (const [value, expected] of [["Fri, 04 Sep 2026 00:01:00 GMT", 60_000],
+    ["999999999", null], ["invalid", null], ["-1", null]]) {
+    await assert.rejects(enrollAccountlessContribution({
+      origin: ORIGIN, readPreference: async () => preference(), now: () => NOW,
+      ensureCapability: async () => capability(), fetchImpl: async () => new Response(null, {
+        status: 503, headers: { "retry-after": value },
+      }),
+    }), (error) => {
+      assert.equal(error.retryable, true);
+      assert.equal(error.retryAfterMilliseconds, expected);
+      return true;
+    });
   }
 });

@@ -5,10 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { startLocalCompanionServer } from "./server.js";
-import { CLIENT_WEB_FILES } from "../../scripts/export-tibotattle.mjs";
-import { MACOS_WEB_MODULE_ENTRYPOINTS, MACOS_RUNTIME_STATIC_ASSETS } from "../../scripts/build-macos-app.js";
+import {
+  RUNTIME_WEB_MODULE_ENTRYPOINTS,
+} from "../../scripts/lib/runtime-closure.mjs";
+import { surfaceFiles } from "../../scripts/lib/surface-manifest.mjs";
 
-const ASSETS = ["desktop-shell.js", "electron-tray-popup.html", "electron-tray-popup.js",
+const ASSETS = ["cache-reuse-matrix.js", "cache-reuse-matrix.css", "cache-reuse-metrics.js", "allowance-tanks.js", "allowance-tank-renderer.js", "codex-color.svg", "desktop-appearance.js", "desktop-shell.js", "electron-tray-popup.html", "electron-tray-popup.js",
   "electron-tray-popup.css", "electron-settings.html", "electron-settings.js",
   "electron-tray-settings.js", "electron-tray-preferences.js", "electron-settings.css", "icon-panel-left.svg", "icon-refresh-cw.svg", "icon-settings.svg"];
 
@@ -34,9 +36,10 @@ test("Electron settings and bridge have a real loopback route and retained clien
       assert.equal(response.status, 200, file);
       assert.equal(await response.text(), await readFile(join(staticRoot, file), "utf8"), file);
       assert.equal(response.headers.get("access-control-allow-origin"), null);
-      assert.ok(CLIENT_WEB_FILES.includes(`apps/web/public/${file}`), `client export: ${file}`);
-      assert.ok([...MACOS_WEB_MODULE_ENTRYPOINTS, ...MACOS_RUNTIME_STATIC_ASSETS]
-        .includes(`apps/web/public/${file}`), `native closure: ${file}`);
+      assert.ok(surfaceFiles("history-free-export").includes(`apps/web/public/${file}`),
+        `history-free export: ${file}`);
+      assert.ok([...RUNTIME_WEB_MODULE_ENTRYPOINTS, ...surfaceFiles("electron-runtime")]
+        .includes(`apps/web/public/${file}`), `Electron closure: ${file}`);
     }
     const health = await (await fetch(`${origin}/api/local/health`)).json();
     assert.equal(health.capabilities.centralServiceProxy, false);

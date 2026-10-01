@@ -1,9 +1,12 @@
 // Shared decorative model identity for public charts and local usage tables.
+// GPT-6/6.1 Sol and GPT-6 Luna reuse their GPT-5.6 family icons. The canonical catalog
+// and accounting package own recognition and pricing separately.
 const MODEL_PRESENTATION_ORDER = Object.freeze([
-  "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
+  "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6-terra",
+  "gpt-6-luna", "gpt-5.6-luna", "gpt-5.5",
 ]);
 const MODEL_PRESENTATION_THEMES = Object.freeze([
-  "astra", "sol", "terra", "luna", "classic",
+  "astra", "sol", "sol", "sol", "terra", "luna", "luna", "classic",
 ]);
 
 // Shared visual identity only. Admin retains its private preview contract and
@@ -34,6 +37,21 @@ export function modelUsagePresentation(modelId) {
   const aliases = { "gpt-5.5-codex": "gpt-5.5", "gpt-5.6-sol-wm": "gpt-5.6-sol" };
   const presentation = allowanceModelPresentation(aliases[modelId] ?? modelId);
   return presentation.theme ? presentation : { theme: "generic", className: "allowance-model-classic" };
+}
+
+// Keep known families in the same order as the shared model identity catalog.
+// Preserve exact IDs (including aliases) because these are filter values.
+export function compareModelPresentation(left, right) {
+  const rank = (id) => {
+    const aliases = { "gpt-5.5-codex": "gpt-5.5", "gpt-5.6-sol-wm": "gpt-5.6-sol" };
+    const index = MODEL_PRESENTATION_ORDER.indexOf(aliases[id] ?? id);
+    return index < 0
+      ? MODEL_PRESENTATION_ORDER.length + (modelUsagePresentation(id).theme === "generic" ? 1 : 0)
+      : index;
+  };
+  return rank(left) - rank(right)
+    || (right.startsWith(`${left}-`) ? -1 : left.startsWith(`${right}-`) ? 1 : 0)
+    || right.localeCompare(left, "en", { numeric: true });
 }
 
 export function modelThemeIcon(documentRef, theme) {

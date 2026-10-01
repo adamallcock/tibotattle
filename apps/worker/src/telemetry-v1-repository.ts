@@ -282,10 +282,12 @@ export interface TelemetryV1ChunkInsert {
  * new revision's records land; the daily-aggregate rebuild for the chunk's
  * day is enqueued by the journal trigger inside the same transaction.
  */
-export async function insertTelemetryV1Chunk(
+export function prepareTelemetryV1ChunkWrite(
   db: D1Database,
   insert: TelemetryV1ChunkInsert,
-): Promise<{ acceptedRecords: number }> {
+  records?: { insertStatements: readonly D1PreparedStatement[];
+    authorizationEnvelopeDigest?: string; deleteSupersededStatements: readonly D1PreparedStatement[] },
+): { statements: D1PreparedStatement[]; chunkStatementIndex: number } {
   const { chunk } = insert;
   const statements: D1PreparedStatement[] = [];
   // Scoped preservation is not an authorization bypass: the normal admission
@@ -301,7 +303,7 @@ export async function insertTelemetryV1Chunk(
     JOIN device_credentials d ON d.id=?2 AND d.participant_id=p.id AND d.state='active'
       AND d.expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')
     JOIN device_upload_authorizations a ON a.id=?12 AND a.participant_id=p.id
-      AND a.issued_by_device_id=d.id AND a.state='consuming' AND a.envelope_digest=?13
+      AND a.issued_by_device_id=d.id AND a.state='consuming' AND a.envelope_digest=?19
       AND a.consume_lease_expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')
     JOIN telemetry_v1_device_consents consent ON consent.participant_id=p.id AND consent.device_id=d.id
       AND consent.telemetry_schema_version=?16 AND consent.field_dictionary_version=?17
@@ -318,7 +320,8 @@ export async function insertTelemetryV1Chunk(
       insert.supersedes?.id ?? null, insert.chunkRowId, chunk.chunkRevision, chunk.chunkDigest,
       chunk.parserVersion, chunk.records.length, insert.deviceUploadAuthorizationId, insert.envelopeDigest,
       insert.createdAt, insert.supersedes ? "supersede" : "insert", TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
-      TELEMETRY_V1_FIELD_DICTIONARY_VERSION, TELEMETRY_V1_PRIVACY_CONTRACT_VERSION));
+      TELEMETRY_V1_FIELD_DICTIONARY_VERSION, TELEMETRY_V1_PRIVACY_CONTRACT_VERSION,
+      records?.authorizationEnvelopeDigest ?? insert.envelopeDigest));
   // The prior revision leaves the current view before the new revision
   // enters it: the partial current-identity uniqueness would otherwise see
   // two current rows for one chunk mid-batch. The batch is one transaction,
@@ -329,7 +332,8 @@ export async function insertTelemetryV1Chunk(
           SET superseded_at = ?
         WHERE id = ? AND participant_id = ? AND superseded_at IS NULL`,
     ).bind(insert.createdAt, insert.supersedes.id, insert.participantId));
-    statements.push(db.prepare(
+    if (records) statements.push(...records.deleteSupersededStatements);
+    else statements.push(db.prepare(
       "DELETE FROM telemetry_v1_records WHERE chunk_row_id = ?",
     ).bind(insert.supersedes.id));
   }
@@ -358,7 +362,8 @@ export async function insertTelemetryV1Chunk(
     insert.deviceUploadAuthorizationId,
     insert.createdAt,
   ));
-  for (const record of chunk.records) {
+  if (records) statements.push(...records.insertStatements);
+  else for (const record of chunk.records) {
     statements.push(recordStatement(
       db,
       insert.chunkRowId,
@@ -370,6 +375,14 @@ export async function insertTelemetryV1Chunk(
   }
   statements.push(db.prepare("DELETE FROM community_graph_update_scope WHERE new_chunk_id = ?")
     .bind(insert.chunkRowId));
+  return { statements, chunkStatementIndex };
+}
+
+export async function insertTelemetryV1Chunk(
+  db: D1Database,
+  insert: TelemetryV1ChunkInsert,
+): Promise<{ acceptedRecords: number }> {
+  const { statements, chunkStatementIndex } = prepareTelemetryV1ChunkWrite(db, insert);
   let results: D1Result<unknown>[];
   try {
     results = await db.batch(statements);
@@ -381,7 +394,7 @@ export async function insertTelemetryV1Chunk(
       || Reflect.get(inserted[0], "id") !== insert.chunkRowId) {
     throw new ApiError(409, "PARTICIPANT_DELETING");
   }
-  return { acceptedRecords: chunk.records.length };
+  return { acceptedRecords: insert.chunk.records.length };
 }
 
 /**

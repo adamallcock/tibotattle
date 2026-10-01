@@ -21,9 +21,11 @@ import {
   REVIEWED_CODEX_MODEL_IDS,
   TELEMETRY_PLAN_TYPES,
   TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION,
+  TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
   TELEMETRY_V11_ACCOUNT_BASES,
   TELEMETRY_V11_PLAN_BASES,
   telemetryV11RequiredConsent,
+  telemetryV12RequiredConsent,
 } from "./telemetry-shared.generated.js";
 
 export {
@@ -874,11 +876,11 @@ export function normalizeIncrementalContributionSyncStatus(payload) {
   return Object.freeze({
     status: "available",
     keychainPrompt,
-    ...(payload.contractVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
+    ...([TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION, TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION].includes(payload.contractVersion)
       ? { contractVersion: payload.contractVersion } : {}),
     ...(payload.attributionUpgrade?.available === true
-      && payload.attributionUpgrade?.contractVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
-      ? { attributionUpgradeAvailable: true } : {}),
+      && [TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION, TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION].includes(payload.attributionUpgrade?.contractVersion)
+      ? { attributionUpgradeAvailable: true, attributionUpgradeVersion: payload.attributionUpgrade.contractVersion } : {}),
     consent: Object.freeze({
       approved: payload.consent.approved,
       current: payload.consent.current,
@@ -898,7 +900,8 @@ export function normalizeIncrementalContributionSyncStatus(payload) {
 }
 
 export function normalizeAttributionContributionReview(payload) {
-  const required = telemetryV11RequiredConsent();
+  const successor = payload?.schemaVersion === "local-incremental-contribution-review-v1.2";
+  const required = (successor ? telemetryV12RequiredConsent : telemetryV11RequiredConsent)();
   const consent = payload?.consent;
   const inventory = payload?.inventory;
   const fields = inventory?.fields;
@@ -906,7 +909,7 @@ export function normalizeAttributionContributionReview(payload) {
   try { destination = new URL(consent?.destinationOrigin); } catch { return null; }
   const loopback = destination.protocol === "http:"
     && ["localhost", "127.0.0.1", "[::1]"].includes(destination.hostname);
-  if (payload?.schemaVersion !== "local-incremental-contribution-review-v1.1" || payload.status !== "ready"
+  if ((!successor && payload?.schemaVersion !== "local-incremental-contribution-review-v1.1") || payload.status !== "ready"
       || payload.includesContent !== false || payload.includesPaths !== false
       || payload.includesAccountIdentifiers !== false || payload.includesCredentials !== false
       || !/^[A-Za-z0-9_-]{43}$/u.test(payload.reviewToken ?? "")
@@ -914,7 +917,7 @@ export function normalizeAttributionContributionReview(payload) {
       || (destination.protocol !== "https:" && !loopback) || destination.origin !== consent.destinationOrigin
       || !consent || Object.keys(consent).length !== 4
       || Object.entries(required).some(([key, value]) => consent[key] !== value || inventory?.consent?.[key] !== value)
-      || inventory?.schemaVersion !== "telemetry-field-inventory-v1.1"
+      || inventory?.schemaVersion !== (successor ? "telemetry-field-inventory-v1.2" : "telemetry-field-inventory-v1.1")
       || !/^[0-9a-f]{64}$/u.test(inventory.inventoryDigest ?? "")
       || !fields || Object.keys(fields).length !== 4
       || ["usage", "quota", "session", "accountPlanAttribution"].some((stream) =>
@@ -940,6 +943,118 @@ export function normalizeAttributionContributionReview(payload) {
       recordCounts: Object.freeze(Object.fromEntries(["usage", "quota", "session"]
         .map((stream) => [stream, payload.sample.recordCounts[stream]]))) }),
     hostedConsentCurrent: payload.hostedConsentCurrent,
+  });
+}
+
+const PERFORMANCE_SPEED_METHODS = Object.freeze(["receipt", "tool_free"]);
+const PERFORMANCE_METHOD_VERSION = "performance-daily-histogram-v1";
+const PERFORMANCE_SCOPE = "model-performance-daily";
+const PERFORMANCE_RECORD_SCHEMA_VERSION = "model-performance-daily-v1";
+const PERFORMANCE_FIELD_DICTIONARY_VERSION = "telemetry-performance-registry-2026-09-29.1";
+const PERFORMANCE_PRIVACY_CONTRACT_VERSION = "privacy-safe-model-performance-v1";
+
+function performanceOrigin(value) {
+  if (typeof value !== "string") return null;
+  try {
+    const parsed = new URL(value);
+    if (!parsed.origin || !["http:", "https:"].includes(parsed.protocol)
+        || parsed.origin !== value) return null;
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+}
+
+function performanceBinding(value) {
+  const destinationOrigin = performanceOrigin(value?.destinationOrigin);
+  if (destinationOrigin === null
+      || !hasExactKeys(value, [
+        "destinationOrigin", "fieldDictionaryVersion", "methodVersion",
+        "privacyContractVersion", "scope", "stream", "supportedSpeedMethods",
+      ])
+      || value.destinationOrigin !== destinationOrigin
+      || value.fieldDictionaryVersion !== PERFORMANCE_FIELD_DICTIONARY_VERSION
+      || value.methodVersion !== PERFORMANCE_METHOD_VERSION
+      || value.privacyContractVersion !== PERFORMANCE_PRIVACY_CONTRACT_VERSION
+      || value.scope !== PERFORMANCE_SCOPE
+      || value.stream !== PERFORMANCE_SCOPE
+      || JSON.stringify(value.supportedSpeedMethods) !== JSON.stringify(PERFORMANCE_SPEED_METHODS)) {
+    return null;
+  }
+  return Object.freeze({
+    ...value,
+    supportedSpeedMethods: Object.freeze([...PERFORMANCE_SPEED_METHODS]),
+  });
+}
+
+export function normalizeTelemetryPerformanceReview(payload) {
+  const required = {
+    schemaVersion: PERFORMANCE_RECORD_SCHEMA_VERSION,
+    fieldDictionaryVersion: PERFORMANCE_FIELD_DICTIONARY_VERSION,
+    privacyContractVersion: PERFORMANCE_PRIVACY_CONTRACT_VERSION,
+    scope: PERFORMANCE_SCOPE,
+  };
+  const binding = performanceBinding(payload?.binding);
+  if (payload?.schemaVersion !== "local-telemetry-performance-review-v1"
+      || payload.status !== "ready"
+      || !/^[A-Za-z0-9_-]{43}$/u.test(payload.reviewToken ?? "")
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(payload.grantDeviceId ?? "")
+      || !hasExactKeys(payload.consent, Object.keys(required))
+      || Object.entries(required).some(([key, value]) => payload.consent[key] !== value)
+      || binding === null
+      || payload.grantDeviceId === ""
+      || payload.includesContent !== false
+      || payload.includesPaths !== false
+      || payload.includesIdentifiers !== false
+      || payload.includesCredentials !== false
+      || !payload.sample || payload.sample.status !== "available"
+      || !INCREMENTAL_SYNC_DAY_PATTERN.test(payload.sample.day ?? "")
+      || payload.sample.recordCount !== null
+      || payload.sample.content !== false) return null;
+  return Object.freeze({
+    reviewToken: payload.reviewToken,
+    grantDeviceId: payload.grantDeviceId,
+    consent: Object.freeze({ ...required }),
+    binding,
+    sample: Object.freeze({ ...payload.sample }),
+  });
+}
+
+export function normalizeTelemetryPerformanceStatus(payload) {
+  const unavailable = Object.freeze({
+    configured: false,
+    destinationOrigin: null,
+    supportedSpeedMethods: Object.freeze([]),
+    consent: Object.freeze({ approved: false, current: false, approvedAt: null }),
+    scheduler: Object.freeze({ state: "off", lastAcceptedAt: null, nextAttemptAt: null }),
+  });
+  const destinationOrigin = performanceOrigin(payload?.destinationOrigin);
+  if (payload?.schemaVersion !== "local-telemetry-performance-status-v1"
+      || typeof payload.configured !== "boolean"
+      || (payload.destinationOrigin !== null && destinationOrigin === null)
+      || JSON.stringify(payload.supportedSpeedMethods) !== JSON.stringify(PERFORMANCE_SPEED_METHODS)
+      || !payload.consent || typeof payload.consent.approved !== "boolean"
+      || typeof payload.consent.current !== "boolean"
+      || (payload.consent.approvedAt !== null && !Number.isFinite(Date.parse(payload.consent.approvedAt)))
+      || !payload.scheduler || !["off", "up_to_date", "retry_wait", "paused"].includes(payload.scheduler.state)
+      || (payload.scheduler.lastAcceptedAt !== null && !Number.isFinite(Date.parse(payload.scheduler.lastAcceptedAt)))
+      || (payload.scheduler.nextAttemptAt !== null && !Number.isFinite(Date.parse(payload.scheduler.nextAttemptAt)))) {
+    return unavailable;
+  }
+  return Object.freeze({
+    configured: payload.configured,
+    destinationOrigin,
+    supportedSpeedMethods: Object.freeze([...PERFORMANCE_SPEED_METHODS]),
+    consent: Object.freeze({
+      approved: payload.consent.approved,
+      current: payload.consent.current,
+      approvedAt: payload.consent.approvedAt,
+    }),
+    scheduler: Object.freeze({
+      state: payload.scheduler.state,
+      lastAcceptedAt: payload.scheduler.lastAcceptedAt,
+      nextAttemptAt: payload.scheduler.nextAttemptAt,
+    }),
   });
 }
 
@@ -1188,6 +1303,8 @@ export function normalizeWindowBreakdown(payload) {
     tokens: 0,
     fastCostUsd: 0,
     fastEvents: 0,
+    ultrafastCostUsd: null,
+    ultrafastEvents: null,
     byModel: [],
     bySpeed: {},
     spark: { events: 0, costUsd: 0 },
@@ -1231,6 +1348,8 @@ export function normalizeWindowBreakdown(payload) {
     tokens: count(breakdown.tokens, 0),
     fastCostUsd: nonNegative(breakdown.fastCostUsd, 0),
     fastEvents: count(breakdown.fastEvents, 0),
+    ultrafastCostUsd: nonNegative(breakdown.ultrafastCostUsd, null),
+    ultrafastEvents: count(breakdown.ultrafastEvents, null),
     byModel,
     bySpeed,
     spark: {
@@ -1343,6 +1462,9 @@ const CONTRIBUTION_DIAGNOSTIC_PHASES = new Set([
   "approved_paused",
   "approved_syncing",
   "approved_idle",
+  "accountless_active",
+  "accountless_off",
+  "accountless_unavailable",
 ]);
 const CONTRIBUTION_DIAGNOSTIC_QUEUE_STATES = new Set([
   "unavailable",
@@ -1355,6 +1477,28 @@ const CONTRIBUTION_DIAGNOSTIC_PREVIEW_STATES = new Set([
   "not_observed",
   ...CONTRIBUTION_DIAGNOSTIC_QUEUE_STATES,
 ]);
+const ACCOUNTLESS_DIAGNOSTIC_STATES = new Set([
+  "off", "unavailable", "uploading", "recovery_required", "paused", "pending", "up_to_date", "retry_wait",
+]);
+const ACCOUNTLESS_DIAGNOSTIC_FAILURE_CODES = new Set([
+  null, "transient_failure", "terminal_failure", "credential_recovery_required", "preference_unavailable",
+]);
+
+function validAccountlessDiagnostics(value) {
+  return hasExactKeys(value, [
+    "state", "lastAttemptAt", "lastSuccessfulSyncAt", "lastAcceptedAt", "nextAttemptAt", "lastFailureCode",
+  ]) && ACCOUNTLESS_DIAGNOSTIC_STATES.has(value.state)
+    && ACCOUNTLESS_DIAGNOSTIC_FAILURE_CODES.has(value.lastFailureCode)
+    && ["lastAttemptAt", "lastSuccessfulSyncAt", "lastAcceptedAt", "nextAttemptAt"].every((key) =>
+      value[key] === null || (typeof value[key] === "string" && Number.isFinite(Date.parse(value[key]))
+        && new Date(value[key]).toISOString() === value[key]));
+}
+
+function accountlessDiagnosticPhase(state) {
+  if (state === "off") return "accountless_off";
+  return ["unavailable", "paused", "recovery_required"].includes(state)
+    ? "accountless_unavailable" : "accountless_active";
+}
 
 export function normalizeLocalContributionDiagnostics(payload) {
   const unavailable = Object.freeze({
@@ -1368,6 +1512,7 @@ export function normalizeLocalContributionDiagnostics(payload) {
     recentDiagnosticReferences: Object.freeze([]),
   });
   const references = payload?.recentDiagnosticReferences;
+  const hasAccountless = payload !== null && typeof payload === "object" && Object.hasOwn(payload, "accountless");
   if (!hasExactKeys(payload, [
         "schemaVersion",
         "journeyPhase",
@@ -1384,7 +1529,14 @@ export function normalizeLocalContributionDiagnostics(payload) {
         "includesAccountIdentifiers",
         "includesContent",
         "includesPaths",
+        ...(hasAccountless ? ["accountless"] : []),
       ])
+      || (hasAccountless && !validAccountlessDiagnostics(payload.accountless))
+      || (payload?.journeyPhase?.startsWith?.("accountless_") === true) !== hasAccountless
+      || (hasAccountless && (payload.journeyPhase !== accountlessDiagnosticPhase(payload.accountless.state)
+        || payload.consent?.approved !== false || payload.consent?.current !== false
+        || payload.signedIn?.observed !== false || payload.signedIn?.value !== false
+        || payload.pairing?.observed !== false || payload.pairing?.paired !== false))
       || payload.schemaVersion !== LOCAL_CONTRIBUTION_DIAGNOSTICS_SCHEMA_VERSION
       || !CONTRIBUTION_DIAGNOSTIC_PHASES.has(payload?.journeyPhase)
       || !CONTRIBUTION_DIAGNOSTIC_PREVIEW_STATES.has(payload?.previewState)
@@ -1441,6 +1593,14 @@ export function normalizeLocalContributionDiagnostics(payload) {
       paired: payload.pairing.paired,
     }),
     recentDiagnosticReferences: Object.freeze(normalizedReferences),
+    ...(hasAccountless ? { accountless: Object.freeze({
+      state: payload.accountless.state,
+      lastAttemptAt: payload.accountless.lastAttemptAt,
+      lastSuccessfulSyncAt: payload.accountless.lastSuccessfulSyncAt,
+      lastAcceptedAt: payload.accountless.lastAcceptedAt,
+      nextAttemptAt: payload.accountless.nextAttemptAt,
+      lastFailureCode: payload.accountless.lastFailureCode,
+    }) } : {}),
   });
 }
 
@@ -2167,10 +2327,11 @@ const CACHE_SWITCH_CHANGE_TYPES = Object.freeze([
 ]);
 const CACHE_SWITCH_CHANGE_TYPE_SET = new Set(CACHE_SWITCH_CHANGE_TYPES);
 const CACHE_SWITCH_PERIOD_IDS = new Set(["24h", "7d", "30d", "all", "history"]);
-const CACHE_SWITCH_RECENT_LIMIT = 20;
+const CACHE_SWITCH_RECENT_LIMIT = 250;
 const CACHE_SWITCH_PROXIMITY_CEILING_SECONDS = 300;
 const CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO = 0.5;
 const CACHE_CONTINUITY_MINIMUM_GAP_SECONDS = 0;
+const MAX_CACHE_CONTINUITY_MODELS = 128;
 const CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_SECONDS = 7 * 24 * 60 * 60;
 const CACHE_CONTINUITY_GAP_BANDS = Object.freeze({
   under_one_minute: [0, 60],
@@ -2285,12 +2446,12 @@ const CACHE_SWITCH_ALLOWANCE_INTERPRETATION =
 const MONITORING_GAP_COPY = Object.freeze({
   quota_snapshots: ["Quota snapshots", "Current provider quota windows and their freshness."],
   account_attribution: ["Account attribution", "Whether quota and usage can be tied safely to one pseudonymous local account scope."],
-  fast_mode: ["Fast-mode accounting", "Codex records the speed mode only when it is applied or changed, never at session start, so turns before the first change in a session carry no recorded tier. An observed tier always wins; a timestamp-covered config declaration comes next, and anything neither covers is attributed to Standard as a visible assumption. Fast increments are priced at the published Priority (Fast) API rate for the model. Window-level inference is diagnostic only and never changes the money."],
+  fast_mode: ["Fast-mode accounting", "Codex can record speed in turn context or applied thread settings; older records can omit it. An observed tier always wins; a timestamp-covered config declaration comes next, and anything neither covers is attributed to Standard as a visible assumption. Fast and Ultrafast increments use published API rates for the exact model, context and date; unsupported Ultrafast remains unpriced. Window-level inference is diagnostic only and never changes the money."],
   subagents: ["Subagents and child rollouts", "Lineage-aware accounting excludes inherited parent snapshots before attributing genuine child-rollout increments; ambiguous lineage remains unknown."],
   shared_pool_surfaces: ["Work, Workspace Agents, Excel and connected Voice", "These shared-pool surfaces may not write complete local Codex evidence."],
   third_party_auth: ["Third-party ChatGPT-authenticated apps", "No complete local accounting source is available for third-party authenticated apps."],
   reasoning_effort: ["Reasoning effort", "The unified index can identify known reasoning changes for the switch diagnostic, but ordinary usage accounting does not yet provide a complete per-request reasoning-effort breakdown."],
-  api_service_tier: ["API service tier", "Subscription speed is separate; API standard, priority and flex are never inferred from it."],
+  api_service_tier: ["API service tier", "Subscription speed is separate; API standard, priority, ultrafast, batch and flex are never inferred from it."],
   provider_accounting_changes: ["Provider resets and accounting changes", "Reset propagation, credits, account tracks, and provider-side rule changes can move the observed allowance without a matching local usage increment."],
   unknown_token_components: ["Combined output components", "Some older snapshots expose only one combined output count. It is retained once and never added to separated text and reasoning output."],
   calculation_disagreement: ["Calculated usage versus observed quota", "Residual periods remain visible for review and may reflect missing surfaces, uncertain prices, reset contamination, or provider-side accounting."],
@@ -2535,7 +2696,7 @@ function normalizeCachePremiumWeighting(value, pricedDrops, standardPremium) {
       const premium = scenarios[scenario]?.quotaWeightedPremiumUsd;
       if (premium !== null && premium !== undefined
           && (premium + 0.000002 < standardPremium
-            || premium > standardPremium * 2.5 + 0.000002)) return null;
+            || premium > standardPremium * 6 + 0.000002)) return null;
     }
   }
   return {
@@ -2676,7 +2837,7 @@ function normalizeCacheSwitchState(value) {
 // its names or raw thread identifiers to normalized accounting/report DTOs.
 const LOCAL_CACHE_DROP_THREAD_LINKS_SCHEMA = "local-cache-drop-thread-links-v1";
 const CACHE_DROP_THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
-const MAX_CACHE_DROP_THREAD_LINKS = 160;
+const MAX_CACHE_DROP_THREAD_LINKS = 2_000;
 
 function normalizeAccountingGeneration(value) {
   if (typeof value !== "number"
@@ -3113,7 +3274,59 @@ function normalizeCacheContinuityRecent(rows, maximumRows) {
     .slice(0, Math.min(CACHE_SWITCH_RECENT_LIMIT, maximumRows));
 }
 
-function normalizeCacheContinuitySummary(value) {
+function cacheContinuityCohortsMatch(total, cohorts) {
+  if (CACHE_CONTINUITY_BREAKDOWN_FIELDS.some((field) => cohorts.reduce(
+    (sum, cohort) => sum + cohort[field], 0
+  ) !== total[field])) return false;
+  if (!cacheCoveredSubtotalsMatch(total, cohorts)) return false;
+  if (total.estimatedPremiumUsd !== null && (cohorts.some(
+    (cohort) => cohort.estimatedPremiumUsd === null
+  ) || Math.abs(cohorts.reduce((sum, cohort) => sum + cohort.estimatedPremiumUsd, 0)
+    - total.estimatedPremiumUsd) > 1e-9)) return false;
+  return true;
+}
+
+function normalizeCacheContinuityModels(value, total) {
+  // Missing older snapshots remain useful for All models; they do not
+  // masquerade as a completed model breakdown with zero evidence.
+  if (!Array.isArray(value?.byModel)
+      || value.byModel.length > MAX_CACHE_CONTINUITY_MODELS) return null;
+  const models = new Set();
+  const cohorts = [];
+  for (const candidate of value.byModel) {
+    const model = candidate?.model;
+    if (model === "unknown" || !LOCAL_MODELS.has(model) || models.has(model)) return null;
+    const summary = normalizeCacheContinuitySummary(candidate, false);
+    if (summary === null || summary.sameConfigurationReturns === 0
+        || summary.orderingCoverageGaps !== total.orderingCoverageGaps
+        || summary.recent.some((row) => row.configuration.model !== model)) return null;
+    models.add(model);
+    cohorts.push({
+      model,
+      ...summary,
+      allowanceImpact: value.periodId === "7d"
+        ? summary.allowanceImpact
+        : unavailableAllowanceImpact("period_denominator_mismatch")
+    });
+  }
+  if (!cacheContinuityCohortsMatch(total, cohorts)) return null;
+  // Compaction-only models are not picker options, so these counts may be a
+  // subset of the all-model total, but they must never exceed it.
+  if (["postCompactionRequests", "postCompactionCacheReadDrops"].some(
+    (field) => cohorts.reduce((sum, cohort) => sum + cohort[field], 0) > total[field]
+  )) return null;
+  for (const [field, keys] of [
+    ["byGapBand", CACHE_CONTINUITY_GAP_BAND_IDS],
+    ["byOutcomeBucket", CACHE_CONTINUITY_OUTCOME_BUCKET_IDS]
+  ]) {
+    if (keys.some((key) => !cacheContinuityCohortsMatch(
+      total[field][key], cohorts.map((cohort) => cohort[field][key])
+    ))) return null;
+  }
+  return cohorts;
+}
+
+function normalizeCacheContinuitySummary(value, includeModels = true) {
   const totals = normalizeCacheContinuityBreakdown(value, true);
   if (totals === null) return null;
   const allowanceWeighting = normalizeCachePremiumWeighting(
@@ -3181,7 +3394,7 @@ function normalizeCacheContinuitySummary(value) {
   if (postCompactionRequests === null
       || postCompactionCacheReadDrops === null
       || postCompactionCacheReadDrops > postCompactionRequests) return null;
-  return {
+  const summary = {
     ...totals,
     standardApiPremiumUsd: totals.estimatedPremiumUsd,
     allowanceWeighting,
@@ -3193,6 +3406,10 @@ function normalizeCacheContinuitySummary(value) {
     allowanceImpact: totals.estimatedPremiumUsd === null
       ? unavailableAllowanceImpact("weighting_evidence_incomplete")
       : normalizeCacheSwitchAllowanceImpact(value?.allowanceImpact)
+  };
+  return {
+    ...summary,
+    ...(includeModels ? { byModel: normalizeCacheContinuityModels(value, summary) } : {})
   };
 }
 
@@ -3228,6 +3445,7 @@ function unavailableCacheContinuityImpact(errorCode = null) {
     postCompactionCacheReadDrops: 0,
     byGapBand: {},
     byOutcomeBucket: {},
+    byModel: null,
     recent: [],
     allowanceImpact: unavailableAllowanceImpact(),
     minimumGapSeconds: CACHE_CONTINUITY_MINIMUM_GAP_SECONDS,
@@ -3338,7 +3556,7 @@ function normalizeCacheContinuityImpact(value) {
   };
 }
 
-const OBSERVED_SPEED_KEYS = Object.freeze(["standard", "fast", "unknown"]);
+const OBSERVED_SPEED_KEYS = Object.freeze(["standard", "fast", "ultrafast", "unknown"]);
 // Published Priority (Fast) API price ratios over Standard, mirrored so the
 // dashboard never has to trust a server-supplied number to explain its own
 // arithmetic. Keys are canonical registered models; uncovered model/context/
@@ -3359,7 +3577,10 @@ const FAST_MODE_MULTIPLIERS = Object.freeze({
   "gpt-5.6-luna": 2,
   "gpt-5.6-sol": 2,
   "gpt-5.6-terra": 2,
-  "gpt-6-astra": 2
+  "gpt-6-astra": 2,
+  "gpt-6-sol": 2,
+  "gpt-6-luna": 2,
+  "gpt-6.1-sol": 2
 });
 const FAST_MODE_FAMILY_KEYS = Object.freeze([
   ...Object.keys(FAST_MODE_MULTIPLIERS), "unsupported"
@@ -3369,13 +3590,13 @@ const FAST_MODE_METRIC_LABEL = "Speed-priced API-price equivalent";
 const FAST_MODE_METRIC_SHORT_LABEL = "Speed-priced API equivalent";
 const FAST_MODE_STANDARD_METRIC_LABEL = "Standard-rate API-price equivalent";
 const FAST_MODE_METRIC_EXPLAINER =
-  "Standard-rate API prices, with Fast increments priced at the published Priority API rate for the exact model, context, and date. Where no eligible Priority rate exists, a disclosed assumed 2x Standard is used. This is a comparison, not a bill.";
+  "Standard-rate API prices, with Fast and Ultrafast increments priced at published API rates for the exact model, context, and date. Where no eligible Priority rate exists, Fast retains a disclosed assumed 2x Standard; unsupported Ultrafast remains unpriced. These comparisons do not measure included subscription allowance consumption.";
 const ALLOWANCE_SCENARIOS = Object.freeze([
   "unresolved_as_standard",
   "unresolved_as_fast"
 ]);
 const ALLOWANCE_BASIS_FAMILY_ID =
-  "codex_primary:speed_priced_api_equivalent:v3:priority_card_ratio_2026_08_30:event_time:observed_declared_scenario";
+  "codex_primary:speed_priced_api_equivalent:v4:published_speed_card_ratio_2026_09_29:event_time:observed_declared_scenario";
 const TIMELINE_ALLOWANCE_WEIGHTING_SCHEMA_VERSION =
   "quota-weighted-timeline-v0.1";
 const PLAN_SCOPED_TIMELINE_SCHEMA_VERSION =
@@ -3434,12 +3655,12 @@ function normalizeAllowanceScenario(value, scenario, usageEvents, standardUsd) {
   if (value?.basisId !== allowanceBasisId(scenario)
       || sourceWeightingStatus === null || coveredSubtotalUsd === null
       || coverage === null
-      || coveredSubtotalUsd > standardUsd * 2.5 + 0.00002
+      || coveredSubtotalUsd > standardUsd * 6 + 0.00002
       || (sourceWeightingStatus === "complete"
         ? quotaWeightedUsd === null
           || Math.abs(coveredSubtotalUsd - quotaWeightedUsd) > 0.00002
           || quotaWeightedUsd + 0.00002 < standardUsd
-          || quotaWeightedUsd > standardUsd * 2.5 + 0.00002
+          || quotaWeightedUsd > standardUsd * 6 + 0.00002
         : quotaWeightedUsd !== null)) return null;
   return {
     basisId: allowanceBasisId(scenario),
@@ -3618,16 +3839,15 @@ function normalizeFastMode(value) {
     unresolvedScenario: value?.unresolvedScenario === "unresolved_as_fast"
       ? "unresolved_as_fast"
       : "unresolved_as_standard",
-    // Codex records a tier only when the setting is applied or changed, never
-    // at session start, so turns before the first change in a session carry no
-    // recorded tier. The dashboard states this itself rather than reflecting a
-    // server claim.
-    logRecordsTierChangesOnly: true,
+    // Applied thread settings and explicit turn contexts provide speed
+    // evidence. Older sources can still omit the initial tier.
+    logRecordsTierChangesOnly: false,
     metricLabel: FAST_MODE_METRIC_LABEL,
     metricShortLabel: FAST_MODE_METRIC_SHORT_LABEL,
     metricExplainer: FAST_MODE_METRIC_EXPLAINER,
     standardMetricLabel: FAST_MODE_STANDARD_METRIC_LABEL,
     multipliers: { ...FAST_MODE_MULTIPLIERS },
+    ultrafastMultipliers: { "gpt-6-astra": 6 },
     quotaWeightedApiPriceEquivalentUsd: nonNegative(
       value?.quotaWeightedApiPriceEquivalentUsd,
       null
@@ -3648,6 +3868,8 @@ function normalizeFastMode(value) {
       0
     ),
     appliedMultipliers: {
+      ...(finite(value?.appliedMultipliers?.["ultrafast:gpt-6-astra"], null) !== null
+        ? { "ultrafast:gpt-6-astra": 6 } : {}),
       ...Object.fromEntries(
         Object.keys(FAST_MODE_MULTIPLIERS)
           .filter((family) => finite(value?.appliedMultipliers?.[family], null) !== null)
@@ -4211,11 +4433,102 @@ function normalizeLocalTimeline(value = {}) {
     allowanceCapacity,
     planScoped,
     quota,
+    resetEvents: normalizeLocalResetEvents(value.resetEvents),
     history: normalizeTimelineHistory({
       ...value.history,
       source: value.history?.source ?? value.source,
     })
   };
+}
+
+const LOCAL_RESET_EVENT_CONTRACT = Object.freeze({
+  scheduled_reset: Object.freeze({
+    precision: "provider_schedule",
+    reasons: Object.freeze(["scheduled_boundary"]),
+    lifecycle: false
+  }),
+  banked_reset_used: Object.freeze({
+    precision: "observation_interval",
+    reasons: Object.freeze(["credit_count_decreased_before_expiry"]),
+    lifecycle: false
+  }),
+  unknown_reset: Object.freeze({
+    precision: null,
+    reasons: Object.freeze([
+      "confirmed_unscheduled_quota_drop",
+      "overlapping_scheduled_and_credit_evidence"
+    ]),
+    lifecycle: false
+  }),
+  reset_credit_granted: Object.freeze({
+    precision: "provider_timestamp",
+    reasons: Object.freeze(["reset_credit_id_added"]),
+    lifecycle: true
+  }),
+  reset_credit_expired: Object.freeze({
+    precision: "provider_timestamp",
+    reasons: Object.freeze(["reset_credit_expiry_elapsed"]),
+    lifecycle: true
+  })
+});
+
+const LOCAL_RESET_EVENT_KEYS = Object.freeze([
+  "schemaVersion", "kind", "occurredAt", "observedAt", "intervalStartedAt",
+  "precision", "reason", "provider", "planType", "limitId", "windowDurationMins"
+]);
+
+function normalizeLocalResetEvents(value, maximumRows = 100_000) {
+  return array(value).slice(-maximumRows).flatMap((row) => {
+    if (!row || typeof row !== "object" || Array.isArray(row)
+        || Object.keys(row).length !== LOCAL_RESET_EVENT_KEYS.length
+        || LOCAL_RESET_EVENT_KEYS.some(key => !Object.hasOwn(row, key))) return [];
+    const contract = Object.hasOwn(LOCAL_RESET_EVENT_CONTRACT, row.kind)
+      ? LOCAL_RESET_EVENT_CONTRACT[row.kind] : undefined;
+    const occurredAt = canonicalInstant(row?.occurredAt);
+    const observedAt = canonicalInstant(row?.observedAt);
+    const intervalStartedAt = canonicalInstant(row?.intervalStartedAt);
+    if (row?.schemaVersion !== "quota-reset-event-v0.1"
+        || contract === undefined
+        || occurredAt === null || observedAt === null
+        || intervalStartedAt === null
+        || Date.parse(intervalStartedAt) >= Date.parse(observedAt)
+        || Date.parse(occurredAt) < Date.parse(intervalStartedAt)
+        || Date.parse(occurredAt) > Date.parse(observedAt)
+        || row.provider !== "openai_codex"
+        || !contract.reasons.includes(row.reason)
+        || !["provider_schedule", "observation_interval", "provider_timestamp"]
+          .includes(row.precision)
+        || (contract.precision !== null && row.precision !== contract.precision)) {
+      return [];
+    }
+    const planType = row.planType === null ? null : normalizePlanType(row.planType);
+    const limitId = row.limitId === null ? null : normalizeQuotaLimitId(row.limitId);
+    const windowDurationMins = row.windowDurationMins;
+    if (contract.lifecycle
+      ? planType !== null || limitId !== null || windowDurationMins !== null
+      : planType === null || row.planType !== planType
+        || limitId === null || row.limitId !== limitId
+        || !isValidQuotaWindowDuration(windowDurationMins)) return [];
+    if (row.kind === "unknown_reset"
+        && row.reason === "overlapping_scheduled_and_credit_evidence"
+        && row.precision !== "provider_schedule") return [];
+    if (row.kind === "unknown_reset"
+        && row.reason === "confirmed_unscheduled_quota_drop"
+        && row.precision !== "observation_interval") return [];
+    return [{
+      schemaVersion: "quota-reset-event-v0.1",
+      kind: row.kind,
+      occurredAt,
+      observedAt,
+      intervalStartedAt,
+      precision: row.precision,
+      reason: row.reason,
+      provider: "openai_codex",
+      planType,
+      limitId,
+      windowDurationMins
+    }];
+  });
 }
 
 function normalizeLocalQuotaTimeline(value, maximumRows = 10_000) {
@@ -4374,7 +4687,7 @@ function normalizeSideChatHistoricalGap(value) {
   );
   const observedModels = array(exact?.observedModels)
     .filter((model) => LOCAL_MODELS.has(model));
-  const speedKeys = ["fast", "standard", "unknown", "other"];
+  const speedKeys = ["fast", "standard", "ultrafast", "unknown", "other"];
   const bySpeed = Object.fromEntries(speedKeys.map((speed) => {
     const row = exact?.bySpeed?.[speed];
     return [speed, {
@@ -5246,11 +5559,11 @@ function normalizeLocalAccounting(value = {}, {
     modelUsage,
     bySpeed: normalizeAccountingDimension(
       value.bySpeed,
-      new Set(["standard", "fast", "flex", "batch", "unknown"])
+      new Set(["standard", "fast", "ultrafast", "flex", "batch", "unknown"])
     ),
     byApiServiceTier: normalizeAccountingDimension(
       value.byApiServiceTier,
-      new Set(["standard", "priority", "flex", "batch", "unknown"])
+      new Set(["standard", "priority", "ultrafast", "flex", "batch", "unknown"])
     ),
     bySurface: normalizeAccountingDimension(
       value.bySurface,
@@ -5328,6 +5641,15 @@ function normalizeLocalAccounting(value = {}, {
       && /^\d{4}-\d{2}-\d{2}$/u.test(value.evidenceStartDate)
       ? value.evidenceStartDate
       : null,
+    reportingWindow: (() => {
+      const endAt = canonicalInstant(value.reportingWindow?.endAt);
+      const startAt = canonicalInstant(value.reportingWindow?.startAt);
+      const days = { "24h": 1, "7d": 7, "30d": 30 }[value.periodId];
+      if (!endAt || (days && (!startAt
+          || Date.parse(startAt) !== Math.max(0, Date.parse(endAt) - days * 86_400_000)))) return null;
+      if (!days && value.reportingWindow?.startAt !== null) return null;
+      return { startAt: days ? startAt : null, endAt };
+    })(),
     generatedAt: text(value.generatedAt, ""),
     coveredAt: {
       startAt: text(value?.coveredAt?.startAt, ""),
@@ -5988,7 +6310,15 @@ export function selectAllowancePlanPopulation(data, requestedPlanType = null) {
   const selectedPlanType = populations.some((row) => row.planType === requestedPlanType)
     ? requestedPlanType : currentPlanType;
   let views = allowancePlanViews.get(root);
-  if (views?.has(selectedPlanType)) return views.get(selectedPlanType);
+  if (views?.has(selectedPlanType)) {
+    const view = views.get(selectedPlanType);
+    // The header selection is attached to the root after normalization and
+    // changes without replacing it. Keep this cached plan view in sync so
+    // Trends and other plan-scoped renderers see the selected date range.
+    view.reportingWindow = root.reportingWindow;
+    view.reportingAccountingPeriod = root.reportingAccountingPeriod;
+    return view;
+  }
   const population = populations.find((row) => row.planType === selectedPlanType)
     ?? normalizeWeeklyPopulation({ planType: selectedPlanType });
   const isCurrentPlan = selectedPlanType === currentPlanType;
@@ -6081,6 +6411,25 @@ export function normalizeDashboardPayload(payload = {}, fragments = {}) {
     observedAt: window?.observedAt ?? quota?.observedAt,
     accountAttribution: window?.accountAttribution ?? quota?.accountAttribution
   }, index));
+  const weekly = normalizeWeekly(payload?.weekly ?? fragments.weekly);
+  // The companion keeps the established seven-day artifact at `weekly` and
+  // publishes a separately fitted five-hour history in this duration-keyed
+  // lane. Keeping the two inputs distinct prevents a shorter window from
+  // being relabeled as weekly; unknown durations are omitted.
+  const allowanceHistoryByWindow = {
+    [CODEX_WEEKLY_ALLOWANCE_MINUTES]: weekly,
+  };
+  const fiveHourHistory = (
+    payload?.allowanceHistoryByWindow
+    ?? payload?.weekly?.allowanceHistoryByWindow
+    ?? fragments.weekly?.allowanceHistoryByWindow
+    ?? fragments.weekly?.weekly?.allowanceHistoryByWindow
+  )?.[String(CODEX_FIVE_HOUR_ALLOWANCE_MINUTES)];
+  if (fiveHourHistory && typeof fiveHourHistory === "object"
+      && !Array.isArray(fiveHourHistory)) {
+    allowanceHistoryByWindow[CODEX_FIVE_HOUR_ALLOWANCE_MINUTES] =
+      normalizeWeekly(fiveHourHistory);
+  }
   return {
     schemaVersion: text(overview?.schemaVersion ?? payload?.schemaVersion, "local-dashboard-unknown"),
     mode,
@@ -6200,7 +6549,8 @@ export function normalizeDashboardPayload(payload = {}, fragments = {}) {
       }
     },
     gradient: normalizeGradient(payload?.gradient ?? fragments.gradient),
-    weekly: normalizeWeekly(payload?.weekly ?? fragments.weekly),
+    weekly,
+    allowanceHistoryByWindow: Object.freeze(allowanceHistoryByWindow),
     quality: normalizeQuality(payload?.quality ?? fragments.quality)
   };
 }
@@ -6316,9 +6666,17 @@ export class LocalCompanionClient {
     return normalizeDashboardPayload({}, fragments);
   }
 
-  modelPerformance(period = "all", { signal } = {}) {
-    if (!["7", "30", "all"].includes(period)) throw new RangeError("Unsupported display period");
-    return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/model-performance?period=${period}`, {
+  modelPerformance(period = "all", { signal, endAt, speedMode = "standard" } = {}) {
+    if (!["1", "7", "30", "all"].includes(period)) throw new RangeError("Unsupported display period");
+    if (!["standard", "fast", "ultrafast"].includes(speedMode)) throw new RangeError("Unsupported speed mode");
+    const query = new URLSearchParams({ period, speedMode });
+    if (endAt !== undefined) {
+      const end = Date.parse(endAt);
+      if (typeof endAt !== "string" || !Number.isSafeInteger(end) || end < 0
+          || new Date(end).toISOString() !== endAt) throw new RangeError("Unsupported display window");
+      query.set("endAt", endAt);
+    }
+    return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/model-performance?${query}`, {
       cache: "no-store", signal, headers: { "X-Usage-Monitor-Local": "1" },
     });
   }
@@ -6664,9 +7022,10 @@ export class LocalCompanionClient {
     });
   }
 
-  async reviewAttributionContribution() {
+  async reviewAttributionContribution(contractVersion = TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION) {
+    if (![TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION, TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION].includes(contractVersion)) throw new TypeError("Unsupported contribution review.");
     const review = normalizeAttributionContributionReview(
-      await this.localContributionMutation("incremental-review-v11"),
+      await this.localContributionMutation(contractVersion === TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION ? "incremental-review-v12" : "incremental-review-v11"),
     );
     if (review === null) throw new Error("Attribution review is unavailable.");
     return review;
@@ -6679,6 +7038,36 @@ export class LocalCompanionClient {
     });
   }
 
+  async telemetryPerformanceStatus() {
+    try {
+      return normalizeTelemetryPerformanceStatus(await fetchJson(
+        this.fetchImpl, `${LOCAL_ROOT}/performance/status`, { cache: "no-store" },
+      ));
+    } catch {
+      return normalizeTelemetryPerformanceStatus(null);
+    }
+  }
+
+  async reviewTelemetryPerformance() {
+    const review = normalizeTelemetryPerformanceReview(
+      await this.localPerformanceMutation("review"),
+    );
+    if (review === null) throw new Error("Telemetry performance review is unavailable.");
+    return review;
+  }
+
+  approveTelemetryPerformance(review) {
+    if (!review || typeof review !== "object") {
+      throw new TypeError("Telemetry performance approval requires a review.");
+    }
+    return this.localPerformanceMutation("approve", {
+      reviewToken: review.reviewToken,
+      consent: review.consent,
+      binding: review.binding,
+      grantDeviceId: review.grantDeviceId,
+    });
+  }
+
   localContributionMutation(path, body = {}) {
     return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/contribution/${path}`, {
       method: "POST",
@@ -6687,6 +7076,20 @@ export class LocalCompanionClient {
         "X-Usage-Monitor-Local": "1"
       },
       body: JSON.stringify(body)
+    });
+  }
+
+  localPerformanceMutation(path, body = {}) {
+    if (!["review", "approve"].includes(path)) {
+      throw new TypeError("Unsupported local performance mutation.");
+    }
+    return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/performance/${path}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Usage-Monitor-Local": "1",
+      },
+      body: JSON.stringify(body),
     });
   }
 
@@ -6863,12 +7266,33 @@ export class CommunityClient {
   }
 
   grantAttributionContribution(review) {
-    const consent = telemetryV11RequiredConsent();
+    const successor = review?.consent?.telemetrySchemaVersion === TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION;
+    const consent = (successor ? telemetryV12RequiredConsent : telemetryV11RequiredConsent)();
     if (!review || Object.entries(consent).some(([key, value]) => review.consent?.[key] !== value)
         || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(review.grantDeviceId ?? "")) {
       throw new TypeError("Attribution consent requires a reviewed device target.");
     }
-    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/me/device-telemetry-consents`, this.mutationOptions({
+    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/me/${successor ? "device-telemetry-v12-consents" : "device-telemetry-consents"}`, this.mutationOptions({
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deviceId: review.grantDeviceId, consent, ongoingUpload: true }),
+    }));
+  }
+
+  grantTelemetryPerformanceContribution(review) {
+    const consent = {
+      schemaVersion: PERFORMANCE_RECORD_SCHEMA_VERSION,
+      fieldDictionaryVersion: PERFORMANCE_FIELD_DICTIONARY_VERSION,
+      privacyContractVersion: PERFORMANCE_PRIVACY_CONTRACT_VERSION,
+      scope: PERFORMANCE_SCOPE,
+    };
+    if (!review
+        || !review.binding
+        || Object.entries(consent).some(([key, value]) => review.consent?.[key] !== value)
+        || performanceBinding(review.binding) === null
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(review.grantDeviceId ?? "")) {
+      throw new TypeError("Telemetry performance consent requires a reviewed device target.");
+    }
+    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/me/device-telemetry-performance-consents`, this.mutationOptions({
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ deviceId: review.grantDeviceId, consent, ongoingUpload: true }),
     }));
@@ -6926,6 +7350,25 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
       pairwise_p90_usd: [2370, 2310, 2240, 2170, 2080, 2100, 2120][index],
       holdout_mae_pp: [2.1, 2.8, 2.2, 3.4, 2.5, 1.9, 2.2][index],
       eligible_transitions: 70 + index * 9
+    };
+  });
+  // Labeled preview evidence for the selected UI prototype. It is reachable
+  // only through demoDashboard(), never through a production fallback, so an
+  // absent five-hour artifact remains honestly unavailable in the live app.
+  const fiveHourValues = Array.from({ length: 30 }, (_, index) => {
+    const dueMs = nowMs - (29 - index) * 5 * HOUR - HOUR;
+    const value = 116 + Math.sin(index / 3) * 8 + Math.cos(index / 5) * 4;
+    return {
+      sequence: index + 1,
+      reset_due_at: iso(dueMs),
+      first_observed_at: iso(dueMs - 5 * HOUR),
+      last_observed_at: iso(dueMs),
+      displayed_span_pp: 58 + (index * 11) % 39,
+      value_usd: Number(value.toFixed(2)),
+      pairwise_p10_usd: Number((value * .86).toFixed(2)),
+      pairwise_p90_usd: Number((value * 1.14).toFixed(2)),
+      holdout_mae_pp: Number((1.7 + (index % 5) * .2).toFixed(1)),
+      eligible_transitions: 18 + index,
     };
   });
   const lastResetMs = nowMs - 3 * DAY - 2 * HOUR;
@@ -7151,6 +7594,10 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
         duplicateSnapshotsExcluded: Math.round(11_800 * factor),
         missingLineageParents: Math.round(37 * factor)
       },
+      reportingWindow: {
+        startAt: id === "all" ? null : iso(nowMs - ({ "24h": 1, "7d": 7, "30d": 30 }[id]) * DAY),
+        endAt: nowIso,
+      },
       generatedAt: nowIso,
       coveredAt: { startAt: iso(nowMs - 7 * DAY), endAt: nowIso },
       unknownModelEvents: Math.round(events * .05),
@@ -7249,8 +7696,24 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
       window_sensitivity: [{ smoothing_hours: 1, mae_pp: 3.1 }, { smoothing_hours: 2, mae_pp: 2.4 }, { smoothing_hours: 3, mae_pp: 2.7 }]
     },
     weekly: {
+      planType: "pro",
       summary: [{ median_weekly_value_usd: 1878.75, lower_80_across_resets_usd: 1640.96, upper_80_across_resets_usd: 2280.38, qualifying_resets: 14, selected_holdout_mae_pp: 2.16, prior_reset_p80_absolute_error_pp: 7.39 }],
       weekly_values: weeklyValues
+    },
+    allowanceHistoryByWindow: {
+      [CODEX_FIVE_HOUR_ALLOWANCE_MINUTES]: {
+        planType: "pro",
+        status: "available",
+        summary: [{
+          median_weekly_value_usd: 116.4,
+          lower_80_across_resets_usd: 101.2,
+          upper_80_across_resets_usd: 130.8,
+          qualifying_resets: fiveHourValues.length,
+          selected_holdout_mae_pp: 2.1,
+          prior_reset_p80_absolute_error_pp: 6.8,
+        }],
+        weekly_values: fiveHourValues,
+      },
     },
     quality: {
       summary: [{ fit_eligible_fraction: .0088, known_speed_fraction: .912, collector_age_hours: 0.1 }],

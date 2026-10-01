@@ -23,32 +23,36 @@ function safeErrorCode(value) {
   return PROPAGATED_ERROR_CODES.has(value) ? value : WORKER_ERROR;
 }
 
-function validIdentity(value) {
-  return value !== null
-    && typeof value === "object"
-    && !Array.isArray(value)
-    && Object.keys(value).sort().join("\0") === "dev\0ino"
-    && Number.isSafeInteger(value.dev)
-    && value.dev >= 0
-    && Number.isSafeInteger(value.ino)
-    && value.ino >= 0;
+function normalizeIdentityPart(value) {
+  if (typeof value === "bigint") return value >= 0n ? value : null;
+  return Number.isSafeInteger(value) && value >= 0 ? BigInt(value) : null;
+}
+
+function normalizeIdentity(value) {
+  if (value === null
+      || typeof value !== "object"
+      || Array.isArray(value)
+      || Object.keys(value).sort().join("\0") !== "dev\0ino") {
+    return null;
+  }
+  const dev = normalizeIdentityPart(value.dev);
+  const ino = normalizeIdentityPart(value.ino);
+  return dev === null || ino === null ? null : { dev, ino };
 }
 
 function validateOptions(options) {
+  const expectedIdentity = normalizeIdentity(options?.expectedIdentity);
   if (options === null || typeof options !== "object" || Array.isArray(options)
       || Object.keys(options).sort().join("\0") !== "expectedIdentity\0stateFile") {
     throw new TypeError("collector state integrity options must be an object");
   }
   if (typeof options.stateFile !== "string" || options.stateFile.length < 1
-      || !validIdentity(options.expectedIdentity)) {
+      || expectedIdentity === null) {
     throw new TypeError("collector state integrity options are invalid");
   }
   return {
     stateFile: options.stateFile,
-    expectedIdentity: {
-      dev: options.expectedIdentity.dev,
-      ino: options.expectedIdentity.ino,
-    },
+    expectedIdentity,
   };
 }
 

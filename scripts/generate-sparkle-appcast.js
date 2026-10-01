@@ -529,24 +529,34 @@ function defaultRunGenerateAppcastTool({
 
 /** Sign an official generated Electron entry without changing the signed app. */
 export async function signElectronTransitionFeed({ appcastOutputPath, dmgPath, account = null,
-  edKeyFile = null, signUpdatePath, runSignUpdate = (path, args) => runTool(path, args,
+  edKeyFile = null, sparklePublicEdKey, signUpdatePath, runSignUpdate = (path, args) => runTool(path, args,
     { label: "sign_update transition", timeout: SIGN_TIMEOUT_MS }) }) {
   const keys = edKeyFile !== null ? ["--ed-key-file", edKeyFile]
     : account !== null ? ["--account", account] : [];
-  const signature = normalizeSignature(await runSignUpdate(signUpdatePath, [...keys, "-p", dmgPath]), "Transition archive");
   const text = await readFile(appcastOutputPath, "utf8");
+  // A successor retaining the native public key lets the official generator
+  // sign its enclosure. A fully signed feed is adopted unchanged and both
+  // signatures are checked by validateSignedSparkleFeed below.
+  if (text.includes("sparkle-signatures:")) return;
   const enclosures = [...text.matchAll(/<enclosure\b([^>]*?)>/gu)];
-  if (enclosures.length !== 1 || /sparkle-signatures:|sparkle:edSignature/u.test(text)
-      || /<!DOCTYPE|<!ENTITY/u.test(text)) {
-    fail("Transition requires one unsigned official enclosure", "SPARKLE_TRANSITION_FEED_INVALID");
+  if (enclosures.length !== 1 || /<!DOCTYPE|<!ENTITY/u.test(text)) {
+    fail("Transition requires one official enclosure", "SPARKLE_TRANSITION_FEED_INVALID");
   }
   const enclosure = enclosures[0][0];
-  // The pinned tool emits a self-closing enclosure for unsigned Electron
-  // archives. Normalize it to the existing signed-feed validator's paired
-  // form before the official tool signs the resulting XML.
+  const signatures = [...enclosure.matchAll(/sparkle:edSignature="([^"]+)"/gu)];
+  if (signatures.length > 1 || (text.match(/sparkle:edSignature=/gu) ?? []).length !== signatures.length) {
+    fail("Unexpected official enclosure signature", "SPARKLE_TRANSITION_FEED_INVALID");
+  }
+  const signature = normalizeSignature(signatures.length === 1 ? signatures[0][1]
+    : await runSignUpdate(signUpdatePath, [...keys, "-p", dmgPath]), "Transition archive");
+  const publicKey = importPublicEdKey(sparklePublicEdKey);
+  if (publicKey === null) fail("Transition requires the pinned public key", "SPARKLE_TRANSITION_FEED_INVALID");
+  assertLocalSignature({ bytes: await readFile(dmgPath), signature, publicKey, label: "Transition archive" });
+  // Normalize self-closing unsigned output before the official feed signature.
   const ending = enclosure.endsWith("/>") ? "/>" : ">";
+  const attributes = enclosure.slice(0, -ending.length);
   await writeFile(appcastOutputPath, text.replace(enclosure,
-    `${enclosure.slice(0, -ending.length)} sparkle:edSignature="${signature}">${ending === "/>" ? "</enclosure>" : ""}`));
+    `${attributes}${signatures.length === 0 ? ` sparkle:edSignature="${signature}"` : ""}>${ending === "/>" ? "</enclosure>" : ""}`));
   await runSignUpdate(signUpdatePath, [...keys, appcastOutputPath]);
 }
 
@@ -589,7 +599,7 @@ async function generateOfficialSignedAppcast({
     });
     if (options.electronTransition) {
       await signElectronTransitionFeed({ appcastOutputPath, dmgPath: join(stagingDirectory, dmgFileName),
-        account: options.account, edKeyFile: options.edKeyFile, signUpdatePath,
+        account: options.account, edKeyFile: options.edKeyFile, sparklePublicEdKey: options.sparklePublicEdKey, signUpdatePath,
         runSignUpdate: options.runSignUpdate });
     }
     const bytes = await readFile(appcastOutputPath).catch(() => null);

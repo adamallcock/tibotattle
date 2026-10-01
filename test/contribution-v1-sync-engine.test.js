@@ -615,3 +615,53 @@ test("an out-of-range request timeout fails closed before any network activity",
     assert.equal(service.calls.length, 0);
   });
 });
+
+test("v1 transient gateway responses retry independently of application headers or error JSON", async () => {
+  await withIndex(async (file) => {
+    for (const status of [408, 429, 502, 503]) {
+      for (const headers of [{}, { "content-type": "text/html" },
+        { "content-type": "application/json", "cache-control": "no-store" }]) {
+        const service = createFakeService({ stateStatus: () => new Response("<html>synthetic</html>", {
+          status, headers: { ...headers, "retry-after": "60" },
+        }) });
+        const result = await runIncrementalContributionSyncOnce(engineOptions(file, service));
+        assert.equal(result.failure.code, "service_unavailable");
+        assert.equal(result.failure.retryable, true);
+        assert.equal(result.failure.retryAfterMilliseconds, 60_000);
+        assert.equal(result.chunksUploaded, 0);
+        assert.equal(result.acknowledgedThroughDay, null);
+      }
+    }
+  });
+});
+
+test("v1 body IO retries while invalid UTF8, truncated JSON, oversized bodies and redirects fail closed", async () => {
+  await withIndex(async (file) => {
+    for (const kind of ["io", "utf8", "json", "oversize", "redirect", "redirect503", "401", "403"]) {
+      let cancelled = false;
+      const service = createFakeService({ stateStatus: () => {
+        const result = new Response(new ReadableStream({
+          start(controller) {
+            if (kind === "io") controller.error(new Error("synthetic-private-body-error"));
+            else {
+              controller.enqueue(kind === "utf8" ? Uint8Array.of(0xff) : new TextEncoder().encode(
+                kind === "oversize" ? "x".repeat(2_000_000) : '{"incomplete":'));
+              if (kind !== "oversize") controller.close();
+            }
+          },
+          cancel() { cancelled = true; },
+        }), { status: kind === "redirect503" ? 503 : ["401", "403"].includes(kind) ? Number(kind) : 200,
+          headers: { "content-type": "application/json", "cache-control": "no-store" } });
+        if (kind.startsWith("redirect")) Object.defineProperty(result, "redirected", { value: true });
+        return result;
+      } });
+      const result = await runIncrementalContributionSyncOnce(engineOptions(file, service));
+      assert.equal(result.failure.code, kind === "io" ? "service_unavailable" : "response_invalid", kind);
+      assert.equal(result.failure.retryable, kind === "io", kind);
+      assert.equal(result.acknowledgedThroughDay, null);
+      assert.equal(result.chunksUploaded, 0);
+      if (kind === "oversize") assert.equal(cancelled, true);
+      assert.equal(JSON.stringify(result).includes("synthetic-private"), false);
+    }
+  });
+});

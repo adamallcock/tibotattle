@@ -1,19 +1,22 @@
 ---
 title: User guide
-date: 2026-09-07
+date: 2026-09-23
 type: guide
 status: maintained
 ---
 
 # TiboTattle user guide
 
-TiboTattle is a local-first macOS companion for understanding AI-tool usage,
+TiboTattle is a local-first desktop application for understanding AI-tool usage,
 cost, quota windows, and trends. Local analysis works without an account and
-keeps session content on this Mac. Optional community contribution is a separate,
+keeps session content on your device. Optional community contribution is a separate,
 content-free, consented feature.
 
-Current support is macOS 14 or later on Apple silicon and Intel. Windows and Linux are not
-supported; see [platform support](./reference/platform-support.md).
+See [platform support](./reference/platform-support.md) for the current macOS,
+Windows x64 and Linux x86_64 distribution matrix and its qualification limits.
+Choose the artifact for your platform from the published release manifest.
+The Mac installation steps below apply to macOS 14 or later on Apple silicon
+and Intel.
 
 ## Install and first launch
 
@@ -48,6 +51,33 @@ states are meaningful; TiboTattle does not replace missing evidence with zero.
 
 ## Reading the dashboard
 
+Overview shows one glass fuel tank for each observed allowance. Five-hour vessels
+are visually narrower (40% of standard width); this styling is not a measured
+capacity ratio. GPT-5.3 Codex Spark uses its shared model name and icon.
+Liquid motion is illustrative: the level stays at the observed percentage. Only
+a matching fresh forecast drives the outlet; greater pace produces more flow,
+with amber or red overflow for excessive pace. Overflow is a pace cue, not wasted
+quota. A discreet pause icon in the forecast header stops both tank and forecast-bar
+motion. The control is hidden when all tanks are stale, empty or unavailable.
+The system reduced-motion preference is respected silently and hides the motion control.
+The forecast bar has a subtle moving sheen; its extent and time markers do not
+move with the animation. Offscreen tanks stop animating. Unavailable capacity retains its text
+state and stale observations have no animated flow. The fill
+and percentage both represent remaining capacity. A single current Codex weekly
+forecast appears beneath the tanks when usable pacing evidence exists. Otherwise,
+a waiting panel explains that fresh or sufficient allowance evidence is needed;
+it does not display a guessed rate or run-out time. Choosing a historical plan
+on the Allowance Value page does not change that current forecast.
+
+The forecast names its pace assessment, estimated run-out, reset countdown and
+any time without allowance. Its timeline represents time until reset, not quota
+percentage. Countdown labels use days and hours (less than an hour stays explicit).
+Hover, focus or tap an underlined time for the exact timestamp and time zone.
+Expand **Forecast basis and assumptions** for observation coverage, overall and
+active rates, and the uninterrupted-use estimate. Unknown amounts have no fill;
+stale or earlier observations retain their evidence qualifiers.
+
+
 - **Overview and trends** summarize locally derived activity and quota evidence.
 - **Usage and costs** use the repository’s accounting/pricing contracts. A cost
   estimate is not a provider bill.
@@ -67,13 +97,46 @@ selected population. The newest observed plan is selected even if it does not
 yet have enough usable evidence; older-plan estimates remain selectable rather
 than being presented as the current plan's allowance.
 
+The allowance history automatically draws a **Robust LOWESS** trend alongside
+its all-data median reference, raw dots and slope-agreement ranges. It uses only
+the selected plan and visible, filtered reset estimates. The social share graph
+uses exactly the same fitted values, gaps, axes and date range; saving or copying
+the image needs no separate trend setting. The headline remains the all-data
+median. LOWESS is not a confidence interval or proof that the
+provider changed a limit.
+
+LOWESS requires six distinct reset timestamps spanning 14 days. Gaps longer
+than 28 days interrupt fitting, and ambiguous duplicate timestamps are excluded
+from the fit. Above 250 visible resets, select a shorter range to enable fitting.
+Both graphs explicitly label insufficient evidence and preserve raw estimates
+instead of extrapolating through unsupported history.
+The Allowance window control defaults to **7-day** whenever seven-day evidence
+is available. Choose **5-hour** to replace the headline, history graph and reset
+table with the selected plan's five-hour capacity history. Pace forecasts and
+share cards remain seven-day-only. A grey five-hour choice is an evidence state,
+not a timer: run **Update local usage** so the detailed refresh can rebuild the
+local accounting cache. The choice becomes available only when that retained
+history contains a plan-specific five-hour reset with enough observed quota
+movement to fit; missing evidence is never presented as zero.
+
+**Save image** exports the share card as a PNG named with the local save time,
+such as `2026-09-28-19-15-tibotattle-results.png`. Desktop builds confirm the
+completed save in Downloads and offer **Open image** in the default app. A
+second save within the same minute receives a numeric suffix. In a browser,
+the destination follows that browser's download settings.
+
 These historical estimates are conditional on the locally observed plan, not
 proof of which provider account generated every token. Known plan switches and
 ambiguous boundary quantities are excluded narrowly; coherent older history is
 still useful. **Usage and costs** continues to retain all-plan accounting totals.
-Community chart lines and headline values retain their common Pro 20x-equivalent
-scale. In By plan, the smaller card value shows that plan's own weekly allowance
-at API prices: divide the headline by 1 for Pro 20x, 4 for Pro 5x, or 20 for Plus.
+The Aggregate and By model community views use a Pro 10x-equivalent weekly
+basis. By plan charts each plan's own weekly API-price value on its own scale;
+the card shows that value first and the Pro 10x equivalent underneath. The
+plan value is the reference estimate divided by 1 for Pro 10x, 2 for Pro 5x,
+0.4 for Pro Max 25x, or 10 for Plus. The Pro Max 25x factor assumes the
+same Plus baseline as the existing tiers and awaits provider confirmation.
+The Pro 10x rename retains the existing Pro history; it does not start a new
+account or discard earlier evidence.
 This is an estimated API value, not the subscription price, and does not authorize
 mixing personal Plus and Pro allowance histories.
 
@@ -85,6 +148,17 @@ and disclosed; that subtotal is not the whole-period total or a percentage of
 your allowance. A subtotal with no priceable comparisons stays unavailable,
 not a zero-valued placeholder.
 
+The **Did the cache carry over?** memory matrix compares follow-up turns with
+unchanged model and settings across nine time gaps, ending at **24h+**. The
+percentage above each column is the share that reused more than half of the
+previous cached input; **n** is the number of checked follow-ups. Light counts
+use one shared count scale, with partly filled lights for remainders. Hover,
+tap, or use the arrow keys to inspect percentages, counts, lost reuse and
+Standard API-equivalent estimates. The model picker filters complete comparison
+aggregates and retains your choice when the reporting period changes. Missing
+model breakdowns and periods without eligible follow-ups remain explicit;
+zero eligible follow-ups does not mean a 0% cache reuse rate.
+
 The **Thread name** column in both recent cache-drop tables opens the associated
 Codex thread. A worker row shows a parent-name link and a separate bracketed
 subworker link. Hover a link for the local event time; keyboard users receive
@@ -93,20 +167,68 @@ uses a shortened thread ID. If attribution cannot be proven, it stays unlinked.
 Names are looked up locally and are not included in reports, share cards,
 diagnostics, or community contributions.
 
-## Model performance in development source
+## Shared reporting period
+
+The app header's **Reporting period** control offers **24hr**, **7d**,
+**30d**, and **All**. Your selection persists across pages and restarts.
+Hover over or open the adjacent information control to see the exact dates.
+The start and end dates come from the selected accounting
+snapshot and apply to historical charts, usage totals, model performance, and
+Projects & threads. If matching accounting evidence is unavailable, the page says
+so instead of choosing a different period. All available history describes the
+evidence retained locally; coverage and indexing notices still qualify it.
+
+Current allowance readings and Community sharing preferences are unaffected.
+The Allowance headline remains the median of its full qualifying plan population;
+the reporting period filters its history chart. Plan, allowance-window, model,
+grouping, chart zoom, and minimum-span controls remain beside the data they affect.
+Updating local usage can advance the displayed reporting dates when a new
+accounting snapshot becomes available.
+
+## Model performance
 
 Open **Model performance** from the dashboard sidebar, then choose a model
-and **7 days**, **30 days**, or **All time**. The web and native navigation
-include this page in development source; an installed release must contain
-these changes before the page is available there.
+and use the shared **Reporting period** above the page. The 0.1.24 desktop
+release includes this page, including on Windows x64. Local timing analysis is
+separate from activation of optional hosted performance telemetry.
 
-**Output speed** estimates tokens per second from covered response windows.
+The page starts in **Standard** mode. Use the **Standard / Fast / Ultrafast** controls to show
+only the selected mode; counts, medians, bands and both charts use that same
+population. The choice lasts while the page is mounted, including period/model
+changes and refreshes. Fast and Ultrafast can have few or no observations. Hollow points
+have fewer than five measured turns, and those bins have no percentile bands.
+Unknown or mixed modes are excluded from all three views, with their excluded turn
+count shown. Older saved measurements without mode evidence stay unclassified.
+
+After the initial dashboard loads, the app prepares all four shared reporting
+periods in Standard, Fast and Ultrafast in the background. Once ready, opening the
+page or switching either control displays its cached result immediately while
+checking for updates. A first history scan may still show progress until its
+measurements are ready. Browser results stay in memory only; restarting the app
+starts a fresh page cache. Speculative requests pause while the app document is
+hidden.
+
+If approved performance sharing is paused, **Community → Review performance
+sharing again** lets you review and renew its independent authorization. A valid
+renewal can resume an earlier authorization or response-version rejection while
+preserving upload progress. Opt-outs, disconnections and invalid measurements
+remain protected. Accountless sharing rechecks its protected preference and
+current hosted grant when the client restarts or that preference changes.
+
+**Output speed** includes response-timed measurements plus eligible tool-free
+turn estimates from older logs. Each turn contributes once: covered response
+windows take precedence; otherwise a completed, single-response turn without
+tools may use reconciled output tokens divided by its full duration. These
+fallback estimates include initial waiting and can be lower than response-timed
+speed. The chart identifies how many measurements use each method; its medians
+and bands summarize the combined population. Reasoning tokens are included once.
 **First-token latency** uses independently available turn timing, so its sample
-count can be much larger. The plots show median trends and middle-50% bands
-where enough observations exist. Newer and older timing methods stay separate;
-missing timing is unavailable, never zero.
+count can be larger. Missing evidence remains unavailable, never zero.
 
-Sweep horizontally anywhere in a chart to inspect the same date in both metrics.
+The plots show daily or weekly medians and percentile bands where enough
+observations exist.
+
+Sweep horizontally anywhere in a chart to inspect the same date across the charts.
 Use arrow keys after focusing a chart point, or Escape to dismiss the tooltip.
 Empty dates explicitly show no measurements. Expand **About these measurements**
 for interpretation and coverage.
@@ -115,13 +237,13 @@ These diagnostics cover Codex files on this device across accounts. Tool waits
 are excluded from matched output windows, but the estimate is not a provider
 benchmark or a billing measure. All reasoning efforts remain included. Opening
 the page collects timing in bounded background passes; saved data can appear
-before collection finishes. Leaving the page lets the worker stop, and a later
-visit resumes progress. Timing failures do not block usage accounting.
+before collection finishes. An explicitly requested history pass finishes even after leaving the page;
+once complete, the worker stops after its idle lease expires. Later visits resume
+from saved checkpoints. Timing failures do not block usage accounting.
 
 ## Customize the menu bar and popup
 
-Tray customization is implemented in the development source; the published
-0.1.18 app does not gain these controls until an update containing them ships.
+The 0.1.24 desktop release includes tray customization.
 Open **Customize menu bar…** from the native popup's More menu or General
 Settings. Electron's Settings includes the corresponding **Menu bar** or
 **Tray** controls and the popup opens the same page.
@@ -198,24 +320,37 @@ input counters support it; **Includes assumed counts** distinguishes them from
 observed values. Other missing counts remain labelled partial.
 
 **Refresh report** updates this view from the existing local index. Use the app's
-main **Refresh** to collect new usage first. Each report displays its own as-of
-time; opening another section does not rewrite an existing report's snapshot.
+main **Refresh** to collect new usage first. Each report displays its as-of time
+and the shared reporting bounds. Opening another section preserves the selection.
+A period switch with the same accounting end bound displays its prepared figures
+while validating the report lease. An expired lease or a new accounting bound
+requires a new report for those exact dates.
 While Projects & threads is visible, a lightweight keep-alive preserves its
 cached report without recalculating usage. Reports may be released after five
 minutes away from the page; returning automatically rebuilds an expired report.
 A fresh refresh can still require accounting work when the underlying cache
 is no longer valid.
-This feature is qualified in a local development build and has not been released.
+
+The app prepares this page and its standard periods after the initial dashboard
+loads, using the same accounting snapshot. A warmed report displays immediately
+on the first visit or a period switch; drill-down controls wait for
+its report to be validated. Changing filters or refreshing the report discards
+incompatible warmed results. Preloading does not collect logs or repeat the
+underlying accounting calculation.
+
+Projects & threads is included in the 0.1.24 desktop release. See
+[platform support](./reference/platform-support.md) for installed qualification
+and its remaining limits.
 
 ## Refresh, progress, and recovery
 
-Use **Refresh** (or Cmd-R in the native app) to update quota, retained history,
+Use **Refresh** to update quota, retained history,
 and detailed Usage-and-costs and Trends evidence together. A valid
 generation-bound accounting cache is reused; a changed generation is
 recalculated. There is no separate detailed-accounting button. The app keeps
 verified prior figures visible, with their current freshness state, while work
 is in progress. If another refresh is already running, the shared controller
-keeps that single operation authoritative. Native controls follow its progress;
+keeps that single operation authoritative. Desktop controls follow its progress;
 the browser shows an informational notice without starting a second operation.
 
 Startup and frequent automatic quota checks stay light. While the app remains
@@ -223,6 +358,83 @@ open it may make one automatic detailed attempt after an hour. Failed,
 cancelled, and interrupted detailed attempts count toward that hour so they do
 not become a retry loop. After an already-running quick quota check finishes,
 you can choose Refresh again to request detailed work.
+
+In the Electron app, the shell pauses its one-shot schedule only after the
+dashboard's local request has been accepted. The dashboard then sends a
+content-free heartbeat while that exact quick or detailed pass is active. A
+missing heartbeat recovers quickly; an independent 243-minute limit releases
+even a continuously renewed pass after the dashboard's 241-minute polling
+window. Replacing the dashboard also releases the reservation. Recovery rearms
+one timer from the latest saved interval and never starts a second companion
+operation while the first remains authoritative.
+
+The Overview timestamp and the menu-bar popup calculate observation age from
+the same recorded timestamp and current clock. An open window therefore changes
+to stale, qualifies its allowance values, and removes the current pacing claim
+without waiting for another response. If a completed dashboard operation still
+has an Electron reservation, the freshness card says automatic refresh is
+waiting for safety recovery. **Show diagnostics** runs a content-free doctor
+with app state, settings categories, timer/watchdog state, and local crash-capture
+status. It never includes the lease value, paths, accounts, credentials, session
+content, or a native crash dump. You can review and copy the report or prepare
+an editable GitHub support issue. On macOS, local crash capture is a separate
+off-by-default choice that takes effect after restart. See [support](../SUPPORT.md)
+before sharing a native report. If the app will not open, the source checkout's
+independent macOS crash doctor can inspect Apple reports without launching it;
+the support page gives the exact command, a more detailed `--verbose` mode, and
+an explicitly requested local export for private evidence review.
+
+Trends shows three linked views: **Allowance and activity**, the **three-hour
+observed versus calculated comparison**, and **Cumulative drift**. The first
+view keeps remaining percentage separate from API-price-equivalent activity.
+Warm and cool fills in the comparison show movement above and below the
+estimate; the signed difference has its own strip. Cycle drift uses the existing
+cycle anchor calculation, not a sum of overlapping three-hour windows.
+
+Hover or tap a chart, or use the history slider, to inspect a shared time across
+all views. **Play history** advances that cursor; **Latest** returns to the end
+of the displayed range. The bright daytime and moonlit nighttime Horizon follows
+local clock time, not astronomical sunrise or sunset. Replay stops when the page
+is hidden and is omitted when reduced motion is enabled. The slider and exact
+sample timestamps remain available. Range and zoom controls move the views
+together; detailed comparison assumptions and exact evidence remain expandable.
+
+The Horizon readouts show allowance remaining at the selected time and a
+three-hour moving average of recorded API-equivalent usage per hour. The spending
+rate uses completed usage buckets, independently of whether allowance observations
+can be compared. It updates at fifteen-minute boundaries for the selected plan.
+The caption names the actual averaging window, which shortens after a coverage
+break. Quiet time within known coverage lowers the average, reaching $0 after
+three hours without recorded activity. Missing pricing or coverage displays a
+dash; the rate does not extend beyond the recorded usage history. Allowance
+readings also become unavailable when stale. These amounts are API equivalents,
+not subscription charges.
+
+Reset markers distinguish scheduled resets, banked resets, unknown types,
+and account-level credit grants or expiry when that evidence is available.
+Select a marker to inspect it; nearby events share a numbered marker with every
+event listed. Interval observations show both interval ends; scheduled and
+provider timestamps retain their precision. Markers use the companion’s existing
+reset classifications: schedule updates and comparison recovery points do not
+add extra resets. Credit grants and expiries have a separate count; a mixed group
+uses an ellipsis instead of a combined reset count. An unknown type means the
+evidence does not establish the reset mechanism.
+Plan-incompatible allowance events stay excluded.
+
+**When usage and allowance disagree** lists sustained divergence periods as compact
+rows ranked by their largest signed percentage-point gap. The gap accumulates from the cycle comparison
+anchor, not just within the listed period. **View on charts** focuses all views
+on that period. **Models & speeds** shows the recorded activity behind the period;
+it helps investigate a mismatch but cannot establish its cause. Failed lookups
+have a **Retry breakdown** action, and a failed update preserves and labels the
+previous successful result.
+
+The exact-window table names the measured span and explains each comparison.
+**Comparable** means measured and estimated values cover the same allowance cycle,
+not that the values agree. Missing or stale readings, reset or allowance changes,
+unavailable pricing, backwards readings and exhausted allowance each have a
+specific explanation. Unknown quality stays unknown. Differences are percentage
+points of allowance: falling from 60% to 50% remaining is 10 pp used.
 
 Trends compares the selected plan's compatible usage and quota history. Earlier
 history on another plan does not disable a usable current-plan fit, and it is
@@ -275,30 +487,28 @@ that an older installed app already has the new flow.
 
 ## Optional community contribution
 
-Community participation requires sign-in and explicit consent. Before the first
-upload, TiboTattle presents the derived, allowlisted contribution. Contributions
-are pseudonymous and omit session content; pseudonymous does not mean anonymous.
+Electron uses accountless, content-free sharing under the
+[accepted sharing policy](./decisions/2026-09-04-accountless-sharing-policy.md).
+Identified fresh installations default on. Existing saved choices are preserved;
+existing installations without a choice receive three visible notices before
+activation. Community and Settings display the same persisted sharing choice
+and current upload status. Contributions are pseudonymous and omit session
+content; pseudonymous does not mean anonymous. Local analysis remains available
+when sharing is off or uploads are unavailable.
 
-A staged successor contribution format can add account/plan attribution only
-after a separate field review and explicit new consent, and only if the hosted
-service enables that format. Existing consent is not upgraded automatically.
-Its pseudonyms can link observations within an enrollment/destination; they
-never include raw provider account identifiers. Interrupted replacement uploads
-remain staged while the previous complete hosted history stays selected.
-Missing identity proof does not erase local usage or imply zero usage.
-
-Re-pairing or renewing this Mac's contribution credential pauses delivery while
-the credential changes. If completion cannot be verified, delivery stays paused
-and the app offers device repair; an ordinary refresh cannot bypass that pause.
-Local usage analysis and previously contributed history remain available.
-
-Signing in, pairing a device, local indexing, successful upload, aggregate
-publication, and device disconnect are separate states. Keep the app’s
-displayed state or sanitized error if support is needed.
+The shared dashboard no longer presents Google/Apple sign-in, legacy field
+review, consent, pairing or device-disconnect controls. Their backend contracts
+remain available to legacy clients. Successful collection, upload and aggregate
+publication are separate states. Keep the displayed status or sanitized error
+if support is needed.
 
 ### Stop sharing from this Mac
 
-Choose **Disconnect this Mac** and review the confirmation. Confirming revokes
+Turn off **Share usage measurements** in Community or Settings to stop future
+accountless uploads and save your choice across restart. This preserves accepted
+hosted history, local analysis and the existing enrollment.
+
+Older clients may offer **Disconnect this Mac** with a confirmation. It revokes
 this Mac's hosted contribution authority, clears its local device credential
 and binding, and pauses delivery. It preserves previously contributed hosted
 history, other devices, and local analysis. Signing out only ends the browser
@@ -322,16 +532,18 @@ privacy notice is at `https://tibotattle.com/privacy.html`.
 Uninstalling the app bundle does not imply that accumulated local indexes,
 preferences, logs, or Keychain items were erased. That separation prevents an
 ordinary application replacement from destroying history. Use documented
-local erase, identity-reset, and device-disconnect controls only for their
+local erase, identity-reset, sharing and legacy device-disconnect controls only for their
 separate effects. None erases hosted history; private owner erasure is separate.
 Follow the support guide for intentional cleanup and never remove broad
 Application Support or Keychain locations blindly.
 
 ## Updates and help
 
-Stable builds check the signed Sparkle feed at
-`https://updates.tibotattle.com/appcast.xml`. A temporary network failure should
-leave the installed app usable; it does not prove an update exists or failed to
+In Electron, check for updates in **Settings → About**. An installed native Mac
+0.1.18 app can use **Check for Updates** on its retained signed Sparkle feed to
+transition to Electron on Apple silicon or Intel.
+A temporary network failure should leave the installed app usable; it does not
+prove an update exists or failed to
 publish. Verify the current release independently if an update looks stale.
 
 For bugs, diagnostics, privacy questions, and security reporting, start at

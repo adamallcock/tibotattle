@@ -242,17 +242,20 @@ test("an invalid clock never opens a window even when the ledger starts empty", 
 // including near-miss casing/whitespace, resolves to null - never a guess.
 // ---------------------------------------------------------------------------
 
-test("codexServiceTierSpeedMode only recognises the two published tokens", () => {
+test("codexServiceTierSpeedMode recognises reviewed speed tokens and rejects near misses", () => {
   assert.equal(codexServiceTierSpeedMode("priority"), "fast");
   assert.equal(codexServiceTierSpeedMode("default"), "standard");
+  assert.equal(codexServiceTierSpeedMode("fast"), "fast");
+  assert.equal(codexServiceTierSpeedMode("standard"), "standard");
+  assert.equal(codexServiceTierSpeedMode("ultrafast"), "ultrafast");
   for (const token of [
     "turbo",
     "PRIORITY",
     "Default",
     "priority ",
     " default",
-    "fast",
-    "standard",
+    "ultra",
+    "ULTRAFAST",
     "",
     null,
     undefined,

@@ -466,18 +466,21 @@ test("the companion projection accounts money by component per model, as the rep
     usageRecord("gpt-5.6-sol", "2026-08-01T10:00:00.000Z", {
       input_cache_read_tokens: 1_000_000,
       input_uncached_tokens: 200_000,
+      input_cache_write_tokens: 0,
       output_text_tokens: 40_000,
       output_reasoning_tokens: 10_000,
     }),
     usageRecord("gpt-5.6-sol", "2026-08-01T11:00:00.000Z", {
       input_cache_read_tokens: 500_000,
       input_uncached_tokens: 100_000,
+      input_cache_write_tokens: 0,
       output_text_tokens: 20_000,
       output_reasoning_tokens: 5_000,
     }),
     usageRecord("gpt-5.6-luna", "2026-08-01T12:00:00.000Z", {
       input_cache_read_tokens: 2_000_000,
       input_uncached_tokens: 50_000,
+      input_cache_write_tokens: 0,
       output_text_tokens: 8_000,
       output_reasoning_tokens: 4_000,
     }),

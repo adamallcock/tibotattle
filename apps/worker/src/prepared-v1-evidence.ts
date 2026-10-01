@@ -32,11 +32,24 @@ interface Head {
   plan_count: number; fit_count: number; fragment_count: number; control_json: string; control_sha256: string;
 }
 
+export type V1PreparedEvidenceUnavailableReason =
+  | "invalid_evidence"
+  | "source_not_current"
+  | "control_invalid"
+  | "day_count_mismatch";
+
 export class V1PreparedEvidenceUnavailableError extends Error {
   readonly code = "V1_PREPARED_EVIDENCE_UNAVAILABLE";
-  constructor() { super("v1 prepared evidence unavailable"); }
+  readonly reason: V1PreparedEvidenceUnavailableReason;
+  constructor(reason: V1PreparedEvidenceUnavailableReason = "invalid_evidence") {
+    super("v1 prepared evidence unavailable");
+    this.reason = reason === "source_not_current" || reason === "control_invalid" || reason === "day_count_mismatch"
+      ? reason : "invalid_evidence";
+  }
 }
-function unavailable(): never { throw new V1PreparedEvidenceUnavailableError(); }
+function unavailable(reason: V1PreparedEvidenceUnavailableReason = "invalid_evidence"): never {
+  throw new V1PreparedEvidenceUnavailableError(reason);
+}
 function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -53,47 +66,47 @@ function validateRow(value: unknown, fit: boolean): void {
   if (!record(value) || !exactKeys(value, ["id", "observed_at", "observed_day", "device_id", "provider", "limit_id",
     "plan_type", "plan_variant", ...(fit ? ["occurrence_id", "slot", "used_percent", "window_duration_minutes", "resets_at"] : [])])
     || !safeCount(value.id) || value.id === 0 || !validTime(value.observed_at)
-    || value.observed_day !== value.observed_at.slice(0, 10) || typeof value.device_id !== "string") unavailable();
+    || value.observed_day !== value.observed_at.slice(0, 10) || typeof value.device_id !== "string") unavailable("control_invalid");
   for (const key of ["provider", "limit_id", "plan_type", "plan_variant"]) {
-    if (typeof value[key] !== "string" && (fit || value[key] !== null)) unavailable();
+    if (typeof value[key] !== "string" && (fit || value[key] !== null)) unavailable("control_invalid");
   }
   if (fit && (typeof value.occurrence_id !== "string" || typeof value.slot !== "string"
     || typeof value.used_percent !== "number" || !Number.isFinite(value.used_percent)
-    || value.window_duration_minutes !== 10080 || !validTime(value.resets_at))) unavailable();
+    || value.window_duration_minutes !== 10080 || !validTime(value.resets_at))) unavailable("control_invalid");
 }
 async function runsForHead(head: Head): Promise<PreparedQuotaRuns> {
   if (!safeCount(head.progress_revision) || !safeCount(head.cursor_id) || !validTime(head.cursor_time)
     || ![head.quota_count, head.usage_count, head.plan_count, head.fit_count, head.fragment_count].every(safeCount)
-    || encoder.encode(head.control_json).byteLength > 16384 || await sha256Hex(head.control_json) !== head.control_sha256) unavailable();
+    || encoder.encode(head.control_json).byteLength > 16384 || await sha256Hex(head.control_json) !== head.control_sha256) unavailable("control_invalid");
   const value: unknown = JSON.parse(head.control_json);
   if (!record(value) || !exactKeys(value, ["plan", "fit", "lastTime", "lastSignature", "equalTimeChanged"])
     || value.lastTime !== null && !validTime(value.lastTime)
     || value.lastSignature !== null && typeof value.lastSignature !== "string"
-    || typeof value.equalTimeChanged !== "boolean") unavailable();
+    || typeof value.equalTimeChanged !== "boolean") unavailable("control_invalid");
   for (const key of ["plan", "fit"] as const) {
     const run = value[key];
     if (run === null) continue;
-    if (!record(run) || !exactKeys(run, ["first", "last"])) unavailable();
+    if (!record(run) || !exactKeys(run, ["first", "last"])) unavailable("control_invalid");
     validateRow(run.first, key === "fit"); validateRow(run.last, key === "fit");
   }
   return value as unknown as PreparedQuotaRuns;
 }
 
 async function dependencies(db: D1Database, pin: V1SourcePin): Promise<Dependency[]> {
-  if (!("participantId" in pin.scope) || pin.inputRevision === null) unavailable();
+  if (!("participantId" in pin.scope) || pin.inputRevision === null) unavailable("source_not_current");
   if (!canPrepareV1Window(pin)) unavailable();
   const participantId = pin.scope.participantId;
   let items = pin.dayDependencies;
   if (!items) {
     const loaded = await loadV1SourcePin(db, pin.scope, { includeDayDependencies: true });
-    if (loaded.fingerprint !== pin.fingerprint || loaded.inputRevision !== pin.inputRevision) unavailable();
+    if (loaded.fingerprint !== pin.fingerprint || loaded.inputRevision !== pin.inputRevision) unavailable("source_not_current");
     items = loaded.dayDependencies!;
   }
-  if (items.length !== pin.winners.length) unavailable();
+  if (items.length !== pin.winners.length) unavailable("source_not_current");
   return Promise.all(items.map(async (item, index) => {
     const winner = pin.winners[index];
     if (item.participantId !== participantId || item.day !== winner?.observed_day
-      || item.deviceId !== winner.device_id || !/^[0-9a-f]{64}$/u.test(item.fingerprint)) unavailable();
+      || item.deviceId !== winner.device_id || !/^[0-9a-f]{64}$/u.test(item.fingerprint)) unavailable("source_not_current");
     return { ...item, generation: await sha256Hex(canonicalJson([V1_PREPARATION_METHOD_VERSION, item.fingerprint])) };
   }));
 }
@@ -104,7 +117,7 @@ async function readHeads(db: D1Database, participantId: string, revision: number
     FROM json_each(?3) d LEFT JOIN community_prepared_source_days h
       ON h.participant_id=?1 AND h.source_day=json_extract(d.value,'$.day')
     WHERE ${SOURCE_GUARD}`).bind(participantId, revision, JSON.stringify(days.length ? days : [{ day: "" }])).all<Head & { requested_day: string }>();
-  if (result.results.length !== Math.max(days.length, 1)) unavailable();
+  if (result.results.length !== Math.max(days.length, 1)) unavailable("source_not_current");
   return new Map(result.results.filter(row => row.generation !== null).map(({ requested_day: _day, ...row }) => [row.source_day, row]));
 }
 
@@ -261,7 +274,7 @@ export async function ensurePreparedV1Window(db: D1Database, pin: V1SourcePin, o
         } else {
           head.cursor_time = physical.at(-1)!.observed_at; head.cursor_id = physical.at(-1)!.id;
         }
-        if (head.phase === "complete" && (head.quota_count !== day.quotaRecordCount || head.usage_count !== day.usageRecordCount)) unavailable();
+        if (head.phase === "complete" && (head.quota_count !== day.quotaRecordCount || head.usage_count !== day.usageRecordCount)) unavailable("day_count_mismatch");
         head.control_json = canonicalJson(runs); head.control_sha256 = await sha256Hex(head.control_json);
         outputs.push(db.prepare(`UPDATE community_prepared_source_days SET phase=?7,progress_revision=?8,cursor_time=?9,cursor_id=?10,
           quota_count=?11,usage_count=?12,plan_count=?13,fit_count=?14,fragment_count=?15,control_json=?16,control_sha256=?17

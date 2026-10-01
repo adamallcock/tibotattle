@@ -310,7 +310,7 @@ test("the growth loader wiring stays pinned to the metrics-history contract", as
   assert.match(source, /request\("\/api\/v1\/admin\/metrics\/history", \{ signal \}\)/u);
   assert.match(
     source,
-    /GROWTH_SCHEMA_VERSION = "admin-metrics-history-v0\.2"/u,
+    /GROWTH_SCHEMA_VERSION = "admin-metrics-history-v0\.3"/u,
   );
   assert.match(
     source,

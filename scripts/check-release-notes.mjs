@@ -59,32 +59,51 @@ async function readOptionalText(path) {
   }
 }
 
-async function discoverStableTags(rootDirectory) {
+async function discoverStableTags(rootDirectory, tagScope) {
+  if (tagScope === "reachable") {
+    const shallow = await execFile("git", ["-C", rootDirectory, "rev-parse", "--is-shallow-repository"], { encoding: "utf8" });
+    if (shallow.stdout.trim() !== "false") {
+      throw new Error("Reachable release-tag checks require complete Git history.");
+    }
+  }
   const result = await execFile(
     "git",
     [
       "-C",
       rootDirectory,
       "for-each-ref",
-      "--format=%(refname:short)%09%(objecttype)%09%(objectname)%09%(*objectname)",
+      "--format=%(refname:short)%09%(objecttype)%09%(objectname)%09%(*objectname)%09%(*objecttype)",
       "refs/tags/v*",
     ],
     { encoding: "utf8" },
   );
-  return result.stdout
+  const records = result.stdout
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean)
     .map((line) => {
-      const [tag, objectType, objectName, peeledObjectName = ""] = line.split("\t");
+      const [tag, objectType, objectName, peeledObjectName = "", peeledObjectType = ""] = line.split("\t");
       return {
+        tag,
         objectName,
         objectType,
         peeledObjectName,
+        peeledObjectType,
         version: normalizeStableVersion(tag),
       };
     })
     .filter((record) => record.version !== null);
+  // Git's ancestry filter silently omits tags pointing to blobs/trees. Reject
+  // malformed release targets before applying the narrower PR history scope.
+  if (records.some(({ objectType, peeledObjectType }) =>
+    objectType === "tag" ? peeledObjectType !== "commit" : objectType !== "commit")) {
+    throw new Error("Stable release tags must target commits.");
+  }
+  if (tagScope === "all") return records;
+  const merged = await execFile("git", ["-C", rootDirectory, "for-each-ref",
+    "--merged=HEAD", "--format=%(refname:short)", "refs/tags/v*"], { encoding: "utf8" });
+  const reachable = new Set(merged.stdout.trim().split("\n"));
+  return records.filter(({ tag }) => reachable.has(tag));
 }
 
 export function classifyStableTagRecord(record) {
@@ -193,13 +212,19 @@ function addIssue(issues, seenIssues, code, path, detail) {
  * so release preparation is checked before the next tag exists. tagVersions is
  * injectable for deterministic fixture tests that do not create a Git
  * repository. tagRecords injects exact Git-ref records for tag-classification
- * fixtures.
+ * fixtures. PR-only reachable scope excludes tags on unrelated branches; it
+ * still requires the package candidate and every release in HEAD's ancestry.
+ * All publication callers retain the default complete inventory.
  */
 export async function checkReleaseNotes({
   rootDirectory = DEFAULT_REPOSITORY_ROOT,
   tagRecords = null,
   tagVersions = null,
+  tagScope = "all",
 } = {}) {
+  if (!["all", "reachable"].includes(tagScope)) {
+    throw new Error("Release tag scope must be all or reachable.");
+  }
   const absoluteRoot = resolve(rootDirectory);
   const issues = [];
   const seenIssues = new Set();
@@ -246,7 +271,7 @@ export async function checkReleaseNotes({
   if (tagVersions === null) {
     try {
       const stableTags = tagRecords === null
-        ? await discoverStableTags(absoluteRoot)
+        ? await discoverStableTags(absoluteRoot, tagScope)
         : tagRecords
           .map((record) => ({
             ...record,
@@ -591,6 +616,7 @@ export async function checkReleaseNotes({
     ok: issues.length === 0,
     packageVersion,
     stableTagVersions,
+    tagScope,
   };
 }
 
@@ -599,6 +625,7 @@ export function formatReleaseNotesReport(result) {
     return [
       "Release documentation is complete.",
       "Package version: " + result.packageVersion,
+      "Tag scope: " + result.tagScope,
       "Stable tags covered: " + result.stableTagVersions.length,
       ...(result.annotatedStableTagCount === null
         ? []
@@ -623,8 +650,13 @@ export function formatReleaseNotesReport(result) {
 
 function parseArguments(arguments_) {
   let rootDirectory = process.cwd();
+  let tagScope = "all";
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
+    if (argument === "--reachable-tags" && tagScope === "all") {
+      tagScope = "reachable";
+      continue;
+    }
     if (argument === "--root") {
       const value = arguments_[index + 1];
       if (!value || value.startsWith("--")) {
@@ -639,17 +671,19 @@ function parseArguments(arguments_) {
     }
     throw new Error("Unknown argument: " + argument);
   }
-  return { help: false, rootDirectory };
+  return { help: false, rootDirectory, tagScope };
 }
 
 function usage() {
   return [
-    "Usage: node ./scripts/check-release-notes.mjs [--root <directory>]",
+    "Usage: node ./scripts/check-release-notes.mjs [--root <directory>] [--reachable-tags]",
     "",
     "Require provenance and Unreleased sections, one dated changelog entry",
     "with release/tag/history links per tagged stable version, and one",
     "non-empty release-notes/X.Y.Z.md file for each stable or package",
     "candidate. Untagged package work must remain linked from Unreleased.",
+    "PR checks may use --reachable-tags to inspect only HEAD's release ancestry.",
+    "Publication checks retain the default complete stable-tag inventory.",
   ].join("\n");
 }
 

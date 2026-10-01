@@ -93,6 +93,7 @@ function priceUsage(record, components) {
         model: record.modelRecognition === "recognized"
           ? record.modelId
           : "unknown",
+        totalInputContextTokens: record.totalInputContextTokens,
         components: sourceComponents,
         componentAvailability: Object.fromEntries(
           Object.entries(sourceComponents).map(([key, value]) => [
@@ -102,6 +103,7 @@ function priceUsage(record, components) {
         ),
       }, {
         apiServiceTier: record.apiServiceTier === "priority"
+          || record.apiServiceTier === "ultrafast"
           || record.apiServiceTier === "flex"
           || record.apiServiceTier === "batch"
           ? record.apiServiceTier

@@ -24,8 +24,8 @@ export interface SyntheticContribution {
   };
   usage: {
     modelId: string;
-    subscriptionSpeed: "standard" | "fast";
-    apiTierAssumption: "standard" | "priority" | "flex";
+    subscriptionSpeed: "standard" | "fast" | "ultrafast";
+    apiTierAssumption: "standard" | "priority" | "ultrafast" | "flex";
     inputUncachedTokens: number;
     inputCachedTokens: number;
     outputTextTokens: number;
@@ -214,8 +214,8 @@ export function validateSyntheticContribution(value: unknown): SyntheticContribu
     ])
     || typeof usage.modelId !== "string"
     || !/^[A-Za-z0-9._:-]{1,80}$/.test(usage.modelId)
-    || !["standard", "fast"].includes(String(usage.subscriptionSpeed))
-    || !["standard", "priority", "flex"].includes(String(usage.apiTierAssumption))
+    || !["standard", "fast", "ultrafast"].includes(String(usage.subscriptionSpeed))
+    || !["standard", "priority", "ultrafast", "flex"].includes(String(usage.apiTierAssumption))
     || !isSafeInteger(usage.inputUncachedTokens, 1_000_000_000_000)
     || !isSafeInteger(usage.inputCachedTokens, 1_000_000_000_000)
     || !isSafeInteger(usage.outputTextTokens, 1_000_000_000_000)

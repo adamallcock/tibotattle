@@ -123,6 +123,7 @@ async function registryFixture({
   ids = [ID_ONE, ID_TWO, ID_THREE],
   maxEntries,
   reveal = async () => {},
+  open,
 } = {}) {
   const randomUUID = sequence(...ids);
   const registry = await createDesktopOwnedDownloadRegistry({
@@ -130,6 +131,7 @@ async function registryFixture({
     fs: fsFixture.fs,
     path: fakePath,
     reveal,
+    ...(open === undefined ? {} : { open }),
     randomUUID,
     ...(maxEntries === undefined ? {} : { maxEntries }),
   });
@@ -162,7 +164,7 @@ test("registration generates an opaque UUID and keeps destination main-process-o
   assert.equal(registered.kind, "share_card");
   assert.equal(registered.mime, "image/png");
   assert.equal(registered.filename, "tibotattle-results.png");
-  assert.equal(registered.destination, `${CANONICAL_ROOT}/${ID_ONE}-tibotattle-results.png`);
+  assert.equal(registered.destination, `${CANONICAL_ROOT}/tibotattle-results.png`);
   assert.deepEqual(registry.inspect(ID_ONE), {
     id: ID_ONE,
     kind: "share_card",
@@ -207,17 +209,15 @@ test("registration rejects paths, URLs, caller identifiers, extra fields, and un
   assert.equal(registry.size, 0);
 });
 
-test("registration never claims an existing or inaccessible destination", async () => {
-  const destination = `${CANONICAL_ROOT}/${ID_ONE}-tibotattle-results.png`;
+test("registration suffixes an existing name and rejects an inaccessible destination", async () => {
+  const destination = `${CANONICAL_ROOT}/tibotattle-results.png`;
   const existing = fakeFs({
     finalPaths: new Map([[destination, fileStats()]]),
   });
   const existingRegistry = await registryFixture({ fsFixture: existing });
-  await assert.rejects(
-    () => existingRegistry.registry.registerDownload(metadata()),
-    (error) => error instanceof TypeError && !error.message.includes(destination),
-  );
-  assert.equal(existingRegistry.registry.size, 0);
+  const suffixed = await existingRegistry.registry.registerDownload(metadata());
+  assert.equal(suffixed.destination, `${CANONICAL_ROOT}/tibotattle-results-1.png`);
+  assert.equal(suffixed.filename, "tibotattle-results-1.png");
 
   const permissionError = new Error("private path");
   permissionError.code = "EACCES";
@@ -232,6 +232,16 @@ test("registration never claims an existing or inaccessible destination", async 
       && !error.message.includes(destination),
   );
   assert.equal(inaccessibleRegistry.registry.size, 0);
+});
+
+test("same-minute saves reserve distinct names without exposing the registry UUID", async () => {
+  const { registry } = await registryFixture();
+  const filename = "2026-09-28-19-15-tibotattle-results.png";
+  const first = registry.prepareDownload(metadata(filename));
+  const second = registry.prepareDownload(metadata(filename));
+  assert.equal(first.destination, `${CANONICAL_ROOT}/${filename}`);
+  assert.equal(second.destination, `${CANONICAL_ROOT}/2026-09-28-19-15-tibotattle-results-1.png`);
+  assert.equal(second.filename, "2026-09-28-19-15-tibotattle-results-1.png");
 });
 
 test("completion requires the registered UUID and verifies a regular unlinked file twice", async () => {
@@ -300,7 +310,7 @@ test("symlinks, hard links, missing files, and outside-root canonical paths fail
     const fsFixture = fakeFs({
       finalPaths,
       realpathOverrides: new Map([
-        [`${CANONICAL_ROOT}/${ID_ONE}-tibotattle-results.png`, "/outside/escape.png"],
+        [`${CANONICAL_ROOT}/tibotattle-results.png`, "/outside/escape.png"],
       ]),
     });
     const { registry } = await registryFixture({ fsFixture });
@@ -376,6 +386,38 @@ test("failed downloads are removed and reveal errors remain fixed-status only", 
   assert.equal(await revealed.registry.revealLatest(), "unavailable");
 });
 
+test("open uses only the verified completed file and fails gracefully", async () => {
+  const finalPaths = new Map();
+  const opened = [];
+  const { registry } = await registryFixture({
+    fsFixture: fakeFs({ finalPaths }),
+    open: async (path) => { opened.push(path); return true; },
+  });
+  assert.equal(await registry.openLatest(), "none");
+  const saved = await registry.registerDownload(metadata("2026-09-28-19-15-tibotattle-results.png"));
+  await assert.rejects(() => registry.openLatest("/private/path"), TypeError);
+  assert.equal(await registry.openLatest(), "none");
+  finalPaths.set(saved.destination, fileStats());
+  assert.equal(await registry.completeDownload(saved.id), true);
+  assert.equal(await registry.openLatest(), "opened");
+  assert.deepEqual(opened, [saved.destination]);
+  finalPaths.delete(saved.destination);
+  assert.equal(await registry.openLatest(), "unavailable");
+  assert.deepEqual(opened, [saved.destination]);
+});
+
+test("open rejects a failed default-app launch without disclosing its error", async () => {
+  const finalPaths = new Map();
+  const { registry } = await registryFixture({
+    fsFixture: fakeFs({ finalPaths }),
+    open: async () => { throw new Error("private platform detail"); },
+  });
+  const saved = await registry.registerDownload(metadata("2026-09-28-19-15-tibotattle-results.png"));
+  finalPaths.set(saved.destination, fileStats());
+  assert.equal(await registry.completeDownload(saved.id), true);
+  assert.equal(await registry.openLatest(), "unavailable");
+});
+
 test("clear removes all internal ownership without exposing content", async () => {
   const { registry } = await registryFixture();
   await registry.registerDownload(metadata());
@@ -386,7 +428,7 @@ test("clear removes all internal ownership without exposing content", async () =
 });
 
 class FakeDownloadItem extends EventEmitter {
-  constructor({ url, mime = "image/png", filename = "tibotattle-results-TT-012345.png" } = {}) {
+  constructor({ url, mime = "image/png", filename = "2026-09-28-19-15-tibotattle-results.png" } = {}) {
     super();
     this.url = url;
     this.mime = mime;
@@ -412,14 +454,27 @@ test("share-card download metadata requires the current loopback blob origin and
     origin: "http://127.0.0.1:8791",
     url: validBlobURL(),
     mime: "image/png",
-    filename: "tibotattle-results-TT-012345.png",
+    filename: "2026-09-28-19-15-tibotattle-results.png",
   });
   assert.deepEqual(valid, {
     kind: "share_card",
     mime: "image/png",
-    filename: "tibotattle-results-TT-012345.png",
+    filename: "2026-09-28-19-15-tibotattle-results.png",
     url: validBlobURL(),
   });
+  const blobPrefixed = shareCardDownloadMetadata({
+    origin: "http://127.0.0.1:8791",
+    url: validBlobURL(),
+    mime: "image/png",
+    filename: `4a4e02e8-2cbf-4dfb-bb2a-4f6e4c0efb90-${valid.filename}`,
+  });
+  assert.deepEqual(blobPrefixed, valid);
+  assert.deepEqual(shareCardDownloadMetadata({
+    origin: "http://127.0.0.1:8791",
+    url: validBlobURL(),
+    mime: "image/png",
+    filename: "4a4e02e8-2cbf-4dfb-bb2a-4f6e4c0efb90-2026-09-28-19-15-tibotattle-results",
+  }), valid);
   for (const invalid of [
     { url: "https://127.0.0.1:8791/card.png", mime: "image/png", filename: valid.filename },
     { url: "blob:http://127.0.0.1:8792/id", mime: "image/png", filename: valid.filename },
@@ -427,12 +482,42 @@ test("share-card download metadata requires the current loopback blob origin and
     { url: `${validBlobURL()}?redirect=1`, mime: "image/png", filename: valid.filename },
     { url: validBlobURL(), mime: "image/jpeg", filename: valid.filename },
     { url: validBlobURL(), mime: "image/png", filename: "private.png" },
+    { url: validBlobURL(), mime: "image/png", filename: "ffffffff-ffff-ffff-ffff-ffffffffffff-2026-09-28-19-15-tibotattle-results.png" },
   ]) {
     assert.equal(
       shareCardDownloadMetadata({ origin: "http://127.0.0.1:8791", ...invalid }),
       null,
     );
   }
+});
+
+test("blob-UUID-prefixed Electron names save under the requested timestamp", async () => {
+  const finalPaths = new Map();
+  const states = [];
+  const { registry } = await registryFixture({ fsFixture: fakeFs({ finalPaths }) });
+  const session = new EventEmitter();
+  const dashboard = new EventEmitter();
+  const installed = installDesktopOwnedDownloadHandler({
+    session,
+    dashboardWebContents: dashboard,
+    origin: "http://127.0.0.1:8791",
+    registry,
+    onState: (state) => states.push(state),
+  });
+  const item = new FakeDownloadItem({
+    url: validBlobURL(),
+    filename: "4a4e02e8-2cbf-4dfb-bb2a-4f6e4c0efb90-2026-09-28-19-15-tibotattle-results.png",
+  });
+  session.emit("will-download", { preventDefault() {} }, item, dashboard);
+  assert.equal(item.savePath, `${CANONICAL_ROOT}/2026-09-28-19-15-tibotattle-results.png`);
+  finalPaths.set(item.savePath, fileStats());
+  item.finish("completed");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(states, [{
+    command: "shareCardDownloadCompleted",
+    filename: "2026-09-28-19-15-tibotattle-results.png",
+  }]);
+  installed.remove();
 });
 
 test("will-download reserves an internal destination and completes only a clean dashboard download", async () => {
@@ -462,13 +547,13 @@ test("will-download reserves an internal destination and completes only a clean 
   });
   session.emit("will-download", { preventDefault() { prevented = true; } }, item, dashboard);
   assert.equal(prevented, false);
-  assert.match(item.savePath, /00000000-0000-4000-8000-000000000001-tibotattle-results-TT-012345\.png$/u);
+  assert.equal(item.savePath, `${CANONICAL_ROOT}/2026-09-28-19-15-tibotattle-results.png`);
   finalPaths.set(item.savePath, fileStats());
   item.finish("completed");
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(registry.inspect("00000000-0000-4000-8000-000000000001").state, "completed");
   assert.deepEqual(states, [{
-    state: { command: "shareCardDownloadCompleted" },
+    state: { command: "shareCardDownloadCompleted", filename: item.filename },
     registryState: "completed",
   }]);
   assert.equal(Object.isFrozen(states[0].state), true);
@@ -556,7 +641,7 @@ test("a timed-out renderer attempt cannot accept a second item while the first i
 
   const first = new FakeDownloadItem({ url: validBlobURL() });
   session.emit("will-download", { preventDefault() {} }, first, dashboard);
-  assert.match(first.savePath, /00000000-0000-4000-8000-000000000001-/u);
+  assert.equal(first.savePath, `${CANONICAL_ROOT}/2026-09-28-19-15-tibotattle-results.png`);
 
   // Model the renderer's bounded save timeout: it starts a new user-visible
   // attempt while Electron still owns the first item's completion callback.
@@ -578,7 +663,7 @@ test("a timed-out renderer attempt cannot accept a second item while the first i
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(states, [
     { command: "shareCardDownloadFailed" },
-    { command: "shareCardDownloadCompleted" },
+    { command: "shareCardDownloadCompleted", filename: first.filename },
   ]);
   assert.equal(registry.inspect(ID_ONE).state, "completed");
   assert.equal(registry.inspect(ID_TWO), null);

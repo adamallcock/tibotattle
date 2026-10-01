@@ -791,7 +791,7 @@ async function openSettings(cdp, port, origin, smoke) {
   await settings.request("Page.enable");
   await waitFor(async () => {
     const value = await settings.evaluate(`(() => document.title === "TiboTattle Settings"
-      && document.querySelector("#settings-bridge-status")?.classList.contains("is-ready") === true)()`);
+      && document.querySelector("#settings-bridge-status")?.hidden === true)()`);
     return value === true;
   }, STARTUP_TIMEOUT_MS, "settings_render_invalid", "settings");
   return settings;

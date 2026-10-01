@@ -1,0 +1,11 @@
+{
+  "schemaVersion": "admin-database-health-v0.1",
+  "observedAt": "2026-09-21T17:00:00.000Z",
+  "storageMode": "typed",
+  "status": "available",
+  "databases": [
+    { "role": "primary", "status": "reachable", "responseMs": 12, "databaseBytes": 104857600 },
+    { "role": "deletion_ledger", "status": "reachable", "responseMs": 5, "databaseBytes": 1048576 },
+    { "role": "analytics", "status": "reachable", "responseMs": 8, "databaseBytes": null }
+  ]
+}

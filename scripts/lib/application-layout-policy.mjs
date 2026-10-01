@@ -14,11 +14,6 @@ const APPLICATION_DEFINITIONS = [
     allowedPackages: [],
   },
   {
-    name: "macos",
-    root: "apps/macos",
-    allowedPackages: [],
-  },
-  {
     name: "web",
     root: "apps/web",
     allowedPackages: [],

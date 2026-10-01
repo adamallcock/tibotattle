@@ -21,6 +21,8 @@ export const PRODUCTION_ELECTRON_UPDATE_ORIGIN = distribution.PRODUCTION_ELECTRO
 export const PRODUCTION_ELECTRON_UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60_000;
 
 const SOURCE_REVISION_PATTERN = /^[0-9a-f]{40}$/u;
+const UPDATE_USER_AGENT_VERSION_PATTERN =
+  /^[0-9]+(?:\.[0-9]+){1,3}(?:[-+][0-9A-Za-z.-]+)?$/u;
 const UPDATE_STATES = new Set([
   "unavailable",
   "ready",
@@ -237,6 +239,15 @@ function assertUpdater(value) {
   return value;
 }
 
+function updateUserAgent(app, metadata) {
+  const version = metadata?.semanticVersion ?? app.getVersion?.();
+  if (typeof version !== "string"
+      || !UPDATE_USER_AGENT_VERSION_PATTERN.test(version)) {
+    throw new TypeError("Electron app version is invalid");
+  }
+  return `TiboTattle/${version} electron-updater`;
+}
+
 function safePercent(value) {
   if (typeof value !== "number" || !Number.isFinite(value)) return null;
   return Math.max(0, Math.min(100, Math.round(value)));
@@ -352,6 +363,7 @@ export function createProductionDesktopUpdater({
   }
   const handoverRehearsal = metadata?.channel
     === PRODUCTION_ELECTRON_NATIVE_TO_ELECTRON_HANDOVER_REHEARSAL_CHANNEL;
+  const requestUserAgent = packaged ? updateUserAgent(app, metadata) : null;
   // The current candidate may consume only the named next candidate. The
   // second candidate closes the exercise: it never treats a later feed entry
   // as an update. Metadata validation above establishes the exact pair.
@@ -486,6 +498,10 @@ export function createProductionDesktopUpdater({
       updater.allowPrerelease = metadata?.channel
         === PRODUCTION_ELECTRON_NATIVE_TO_ELECTRON_HANDOVER_REHEARSAL_CHANNEL;
       updater.allowDowngrade = false;
+      updater.requestHeaders = {
+        ...(updater.requestHeaders ?? {}),
+        "User-Agent": requestUserAgent,
+      };
       installEventHandlers();
     } catch {
       return publish({

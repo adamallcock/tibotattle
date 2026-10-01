@@ -23,6 +23,7 @@ const REPORTING_IMPLEMENTATIONS = Object.freeze({
   // reads it from that package's public entrypoint instead of restating
   // 10_080 and letting the two definitions drift apart.
   "src/reporting/weekly-calibration.js": Object.freeze([
+    "@app-usagemonitor/accounting",
     "@app-usagemonitor/quota-analysis",
   ]),
   "src/reporting/work-usage.js": Object.freeze([
@@ -36,20 +37,34 @@ const REPORTING_ALLOWED_PACKAGES = Object.freeze([
 const REPORTING_PUBLIC_EXPORTS = Object.freeze([
   "BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT",
   "CANDIDATES",
+  "USAGE_EXPLAINER_FRESHNESS_MS",
+  "USAGE_EXPLAINER_MAX_RESPONSE_BYTES",
+  "USAGE_EXPLAINER_MAX_ROWS",
+  "USAGE_EXPLAINER_PLANS",
+  "USAGE_EXPLAINER_SCHEMA_VERSION",
   "WORK_USAGE_COMPONENTS",
   "WORK_USAGE_SCHEMA",
   "analyzeMonitoringQuality",
   "analyzeWeeklyCalibration",
+  "assessUsageExplanationCoverage",
   "classifyMonitoringInterval",
   "createCollectorQualityAccumulator",
+  "createUsageExplainerSelectorCodec",
   "createWorkUsageAccumulator",
   "modelPerformanceProjection",
+  "parseUsageExplainerCursor",
   "projectBoundedWeeklyCalibrationSummary",
   "projectRecordedTokenComponents",
+  "projectUsageExplanation",
   "queryWorkUsageSnapshot",
   "renderMonitoringQualityReport",
   "renderWeeklyCalibrationReport",
+  "unavailableUsageExplanation",
+  "usageExplanationBounds",
+  "usageExplanationCatalog",
   "validWeeklyPlanPopulations",
+  "validateUsageExplanationFixedBounds",
+  "validateUsageExplanationRequest",
   "workUsageError",
 ]);
 const REPORTING_CALLERS = Object.freeze([
@@ -71,7 +86,7 @@ async function source(relativePath) {
   return readFile(join(REPOSITORY_ROOT, relativePath), "utf8");
 }
 
-test("reporting publishes only the reviewed monitoring, weekly calibration and work usage API", () => {
+test("reporting publishes only the reviewed monitoring, calibration, work usage and explanation API", () => {
   assert.deepEqual(Object.keys(reporting).sort(), REPORTING_PUBLIC_EXPORTS);
 });
 

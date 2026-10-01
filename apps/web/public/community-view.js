@@ -6,11 +6,14 @@ export { allowanceModelPresentation, modelThemeIcon } from "./model-visuals.js";
 // retired in favour of daily revisions, so no snapshot render path lives here
 // any more.
 
-import { normalizeCommunityDailySeries, planWeeklyApiEquivalentUsd } from "./community-data.js";
+import { normalizeCommunityDailySeries, planWeeklyApiEquivalentUsd,
+  PUBLIC_ALLOWANCE_MODEL_CONFIG } from "./community-data.js";
 import {
   compact,
+  compactPrecise,
   createDomHelpers,
   dateTimeFormatter,
+  formatAge,
   formatUtcCalendarDay,
   numberFormatter,
 } from "./ui-format.js";
@@ -35,6 +38,31 @@ const COMMUNITY_DAILY_STATE_KEYS = Object.freeze({
   none_published: "community.daily.state.nonePublished",
 });
 
+/**
+ * Retained-evidence provenance, as the last-known-good store reports it.
+ *
+ * A view is handed this only when it is rendering a payload that genuinely
+ * arrived earlier and could not be refreshed. It is validated here rather
+ * than trusted, because an unusable age would turn a truthful "from two hours
+ * ago" into a claim nobody checked. Anything unusable renders as live-state
+ * copy for a live payload, never as an unlabelled stale one.
+ */
+function cachedEvidence(cache) {
+  const ageMs = cache?.ageMs;
+  return typeof cache?.fetchedAt === "string"
+    && typeof ageMs === "number"
+    && Number.isFinite(ageMs)
+    && ageMs >= 0
+    ? { fetchedAt: cache.fetchedAt, ageMs }
+    : null;
+}
+
+function cachedEvidenceNotice(node, t, retained) {
+  return node("p", "annotation", t("community.cached.notice", {
+    age: formatAge(retained.ageMs / 1000),
+  }));
+}
+
 const COMMUNITY_DAILY_COLUMN_KEYS = Object.freeze([
   "community.daily.day",
   "community.metric.usageEvents",
@@ -48,6 +76,7 @@ const COMMUNITY_DAILY_NUMERIC_COLUMNS = Object.freeze(new Set([1, 2, 3, 4]));
 // Container-scoped interaction only: no response or point values are retained.
 // Replacing an unavailable view drops its state rather than reviving old data.
 const dailyDisclosureByContainer = new WeakMap();
+const cacheRetentionDisclosureByContainer = new WeakMap();
 const allowanceInspectionByContainer = new WeakMap();
 
 /**
@@ -139,17 +168,42 @@ function chartTickStep(span, target = 4) {
   return factor * magnitude;
 }
 
-function valueAxis(maximum, plotTop, plotBottom) {
+function valueAxis(maximum, plotTop, plotBottom, minimum = 0) {
   const top = Math.max(1, maximum);
   const step = chartTickStep(top);
   const axisTop = Math.ceil(top / step) * step;
+  // A zero baseline wastes most of the panel when a band sits well above it:
+  // plans on their own axes only read if each one fills its own panel.
+  // The floor still snaps to a whole tick, so the gridlines stay round and the
+  // axis never implies a precision the step does not have. Zero is kept when
+  // the data actually reaches down toward it.
+  const flooredBase = Math.max(0, Math.floor(minimum / step) * step - step);
+  const axisBase = flooredBase > 0 && axisTop - flooredBase >= step * 2 ? flooredBase : 0;
   const y = (value) => plotBottom
-    - (value / axisTop) * (plotBottom - plotTop);
+    - ((value - axisBase) / (axisTop - axisBase)) * (plotBottom - plotTop);
   const ticks = [];
-  for (let value = 0; value <= axisTop + step / 100; value += step) {
+  for (let value = axisBase; value <= axisTop + step / 100; value += step) {
     ticks.push({ value, y: y(value) });
   }
-  return { axisTop, y, ticks };
+  return { axisTop, axisBase, y, ticks };
+}
+
+// Allowance estimates occupy a narrow positive range. Derive a rounded floor
+// from the visible estimates and uncertainty bands instead of spending most of
+// the chart on empty space below them. Activity counts keep their zero axes.
+function allowanceValueAxis(minimum, maximum, plotTop, plotBottom) {
+  const spread = Math.max(maximum - minimum, maximum * 0.1, 1);
+  const padding = spread * 0.12;
+  const step = chartTickStep(spread + padding * 2);
+  const roundedBase = Math.floor(Math.max(minimum - padding, minimum * 0.5) / step) * step;
+  const axisBase = roundedBase > 0 ? roundedBase : chartTickStep(minimum * 0.5, 1);
+  const axisTop = axisBase + Math.ceil((maximum + padding - axisBase) / step) * step;
+  const y = value => plotBottom - (value - axisBase) / (axisTop - axisBase) * (plotBottom - plotTop);
+  const ticks = [];
+  for (let value = axisBase; value <= axisTop + step / 100; value += step) {
+    ticks.push({ value, y: y(value) });
+  }
+  return { axisBase, axisTop, y, ticks };
 }
 
 /**
@@ -359,12 +413,10 @@ function buildCommunityAllowanceSingleChartModel(series, {
     ? margin.left + plotWidth / 2
     : margin.left + ((atMs - startMs) / (endMs - startMs)) * plotWidth);
 
-  const dollars = valueAxis(
-    Math.max(...points.map((point) => (
-      point.band80Usd === null ? point.centralUsd : point.band80Usd.upperUsd
-    ))),
-    plotTop,
-    plotBottom,
+  const dollars = allowanceValueAxis(
+    Math.min(...points.map(point => point.band80Usd?.lowerUsd ?? point.centralUsd)),
+    Math.max(...points.map(point => point.band80Usd?.upperUsd ?? point.centralUsd)),
+    plotTop, plotBottom,
   );
 
   const dots = points.map((point) => ({
@@ -458,12 +510,13 @@ function buildCommunityAllowanceSingleChartModel(series, {
 /** Presentation only: validated public series in, shared dollar axes and gap-aware
  * geometry out. No owner data access, pricing, fitting, or inferred history. */
 export function buildCommunityAllowanceChartModel(series, options = {}) {
-  const { view = "aggregate", rangeDays = null,
+  const { view = "aggregate", rangeDays = null, seriesKeys = null,
     width = COMMUNITY_ALLOWANCE_CHART_WIDTH,
-    height = COMMUNITY_ALLOWANCE_CHART_HEIGHT } = options;
+    height = view === "models" || view === "aggregate"
+      ? COMMUNITY_ALLOWANCE_CHART_HEIGHT * 1.5 : COMMUNITY_ALLOWANCE_CHART_HEIGHT } = options;
   if (!["aggregate", "plans", "models"].includes(view)) return null;
   if (!series?.breakdowns) {
-    return view === "aggregate" ? buildCommunityAllowanceSingleChartModel(series, options) : null;
+    return view === "aggregate" ? buildCommunityAllowanceSingleChartModel(series, { ...options, height }) : null;
   }
   if (series.state !== "published" || series.days.length === 0) return null;
   const anchor = series.breakdowns.hasCombined
@@ -475,12 +528,17 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
   const breakdownDays = new Map(series.breakdowns.days.map(day => [day.day, day]));
   const definitions = [
     { key: "aggregate", view: "aggregate", label: null, className: "" },
-    ...[ ["pro", "Pro 20×"], ["prolite", "Pro 5×"], ["plus", "Plus"] ].map(([key, label], index) => ({
-      key, label, view: "plans", className: `allowance-series-${index}`,
+    ...[ ["plus", "Plus", 3], ["prolite", "Pro 5×", 1],
+      ["pro", series.breakdowns.isCurrent === false ? "Pro 20×" : "Pro 10×", 0],
+      ["promax", "Pro Max 25×", 2] ]
+      .filter(([key]) => (series.breakdowns.planIds ?? Object.keys(series.breakdowns.days.at(-1)?.byPlanType ?? {})).includes(key))
+      .map(([key, label, color]) => ({
+      key, label, view: "plans", className: `allowance-series-${color}`,
     })),
-    ...series.breakdowns.modelConfig.map(({ modelId, label }, index) => ({
+    ...PUBLIC_ALLOWANCE_MODEL_CONFIG.map(({ modelId, label }, index) => ({
       key: modelId, label, view: "models", ...allowanceModelPresentation(modelId, index),
-    })).sort((left, right) => left.order - right.order),
+      order: index,
+    })),
   ];
   const summaryFor = (day, definition) => {
     const breakdown = breakdownDays.get(day.day);
@@ -489,7 +547,8 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
     const value = breakdown?.models.find(([id]) => id === definition.key);
     return value ? { centralUsd: value[1], participantCount: value[2], fitCount: null, band80Usd: null } : null;
   };
-  const viewDefinitions = definitions.filter(definition => definition.view === view);
+  const viewDefinitions = definitions.filter(definition => definition.view === view
+    && (seriesKeys === null || seriesKeys.includes(definition.key)));
   // "All" means all estimates for this view, not the unrelated activity year.
   // Keep real dates and interior gaps; never stretch each series independently.
   let days = rangeDaysWithActivity;
@@ -500,14 +559,36 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
     const last = days.findLastIndex(hasEstimate);
     days = days.slice(first, last + 1);
   }
-  // Dollar axes stay comparable across tabs, even when date coverage differs.
+  // A plan series is plotted at ITS OWN week at API prices, matching the value
+  // its card leads with. `centralUsd` is the published reference equivalent, so the inverse
+  // of the published normalization is applied per series; every other view is
+  // already in reference terms and passes through unchanged.
+  // Applied only when a single series is requested — the small-multiples path.
+  // The whole-view model still carries reference-normalized values, because the
+  // summary cards derive the plan's own week from them themselves; scaling here
+  // too would divide twice and divide a plan’s own week a second time.
+  const seriesScale = (value, definition) => {
+    if (value == null) return null;
+    if (seriesKeys === null || definition.view !== "plans") return value;
+    const own = planWeeklyApiEquivalentUsd(value, definition.key, series.breakdowns.normalization);
+    return own === null ? value : own;
+  };
+  // Each view gets a scale from its own visible series. A plan small multiple
+  // narrows that further to one plan's own weekly value.
+  const axisDefinitions = viewDefinitions;
   let maximum = 0;
-  for (const day of rangeDaysWithActivity) for (const definition of definitions) {
+  let minimum = Infinity;
+  for (const day of rangeDaysWithActivity) for (const definition of axisDefinitions) {
     const summary = summaryFor(day, definition);
-    if (summary?.centralUsd != null) maximum = Math.max(maximum,
-      summary.centralUsd, summary.band80Usd?.upperUsd ?? 0);
+    if (summary?.centralUsd == null) continue;
+    const central = seriesScale(summary.centralUsd, definition);
+    const upper = seriesScale(summary.band80Usd?.upperUsd ?? summary.centralUsd, definition);
+    const lower = seriesScale(summary.band80Usd?.lowerUsd ?? summary.centralUsd, definition);
+    maximum = Math.max(maximum, central, upper);
+    minimum = Math.min(minimum, central, lower);
   }
   if (maximum <= 0) return null;
+  if (!Number.isFinite(minimum)) minimum = 0;
   const margin = { top: 16, right: 24, bottom: 32, left: 64 };
   const plot = { top: margin.top, bottom: height - margin.bottom,
     left: margin.left, right: width - margin.right };
@@ -515,7 +596,7 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
   const endMs = communityDayStartMs(days.at(-1).day);
   const x = day => startMs === endMs ? (plot.left + plot.right) / 2
     : plot.left + (communityDayStartMs(day) - startMs) / (endMs - startMs) * (plot.right - plot.left);
-  const dollars = valueAxis(maximum, plot.top, plot.bottom);
+  const dollars = allowanceValueAxis(minimum, maximum, plot.top, plot.bottom);
   const split = points => {
     const segments = [];
     for (const point of points) {
@@ -531,7 +612,15 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
     const dots = days.flatMap(day => {
       const summary = summaryFor(day, definition);
       if (summary?.centralUsd == null) return [];
-      return [{ ...summary, day: day.day, x: x(day.day), y: dollars.y(summary.centralUsd),
+      const central = seriesScale(summary.centralUsd, definition);
+      return [{ ...summary, day: day.day, x: x(day.day),
+        centralUsd: central,
+        band80Usd: summary.band80Usd == null ? null : {
+          ...summary.band80Usd,
+          lowerUsd: seriesScale(summary.band80Usd.lowerUsd, definition),
+          upperUsd: seriesScale(summary.band80Usd.upperUsd, definition),
+        },
+        y: dollars.y(central),
         radius: Math.min(5, Math.max(1.6, daySpacing * .3), 2.6 + Math.sqrt(summary.fitCount ?? summary.participantCount)),
         seriesKey: definition.key, seriesLabel: definition.label, seriesClass: definition.className,
         seriesTheme: definition.theme ?? null, seriesOrder }];
@@ -548,6 +637,10 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
     return { ...definition, dots, markerDots, centralSegments, bandSegments: split(band), latest: dots.at(-1) ?? null };
   }).filter(definition => definition.dots.length > 0);
   if (visible.length === 0) return null;
+  const visibleByKey = new Map(visible.map(definition => [definition.key, definition]));
+  const cardSeries = view === "models"
+    ? viewDefinitions.map(definition => visibleByKey.get(definition.key)
+      ?? { ...definition, latest: null }) : visible;
   const dots = visible.flatMap(definition => definition.dots)
     .sort((a, b) => a.day.localeCompare(b.day) || a.seriesOrder - b.seriesOrder);
   const dayTicks = Array.from({ length: 6 }, (_, index) => {
@@ -558,6 +651,7 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
   return { width, height, margin, plot, dots, view,
     markerDots: visible.flatMap(definition => definition.markerDots),
     latest: dots.at(-1), legendSeries: view === "aggregate" ? null : visible,
+    cardSeries,
     latestSummaries: visible.map(definition => definition.latest),
     spanDays: 1 + Math.round((endMs - startMs) / MILLISECONDS_PER_DAY),
     sparse: new Set(dots.map(dot => dot.day)).size <= 2,
@@ -692,6 +786,132 @@ function appendCommunityDailyChart({ documentRef, container, series, t }) {
   container.append(figure);
 }
 
+// The cache-retention lane. Band identifiers are contract values, never copy,
+// so every published band maps to its own translated label.
+const COMMUNITY_CACHE_RETENTION_BAND_KEYS = Object.freeze({
+  under_one_minute: "community.cacheRetention.band.underOneMinute",
+  one_to_two_minutes: "community.cacheRetention.band.oneToTwoMinutes",
+  two_to_five_minutes: "community.cacheRetention.band.twoToFiveMinutes",
+  five_to_ten_minutes: "community.cacheRetention.band.fiveToTenMinutes",
+  ten_to_thirty_minutes: "community.cacheRetention.band.tenToThirtyMinutes",
+  thirty_minutes_to_one_hour: "community.cacheRetention.band.thirtyMinutesToOneHour",
+  one_to_two_hours: "community.cacheRetention.band.oneToTwoHours",
+  two_to_six_hours: "community.cacheRetention.band.twoToSixHours",
+  six_to_twenty_four_hours: "community.cacheRetention.band.sixToTwentyFourHours",
+  over_twenty_four_hours: "community.cacheRetention.band.overTwentyFourHours",
+});
+
+const COMMUNITY_CACHE_RETENTION_COLUMN_KEYS = Object.freeze([
+  "community.cacheRetention.column.pause",
+  "community.cacheRetention.column.reusedMoreThanHalf",
+  "community.cacheRetention.column.matchedOrExceeded",
+  "community.cacheRetention.column.adjacencies",
+  "community.cacheRetention.column.sessions",
+  "community.cacheRetention.column.contributors",
+  "community.cacheRetention.column.topContributorShare",
+]);
+
+/**
+ * A rate the lane declined to publish stays the shared em-dash, exactly as the
+ * neighbouring cards render an unavailable number. A measured zero formats as
+ * `0%` and must never collapse into the same glyph.
+ */
+function retentionRate(value) {
+  return value === null
+    ? compact(null)
+    : numberFormatter({ style: "percent", maximumFractionDigits: 1 }).format(value);
+}
+
+/**
+ * Renders the community cache-retention bands. A band with no measured gap is
+ * still listed, with its counts at zero and its rates as the unavailable
+ * em-dash: dropping thin or empty bands would turn missing evidence into an
+ * apparent floor, and rendering their rates as 0% would turn it into an
+ * apparent absence of reuse.
+ */
+function appendCommunityCacheRetention({ documentRef, container, retention, t, wasOpen }) {
+  const { node } = createDomHelpers(documentRef);
+  const disclosure = node("details", "journey-disclosure snapshot-breakdown");
+  disclosure.open = wasOpen;
+  const summary = node("summary");
+  summary.append(node("span", "", t("community.cacheRetention.summary")));
+  disclosure.append(summary);
+  // The measurement caveats travel with the numbers rather than sitting
+  // outside the disclosure, so a reader cannot reach a rate without them.
+  disclosure.append(
+    node("p", "snapshot-disclosure", t("community.cacheRetention.measuresCopy")),
+    node("p", "snapshot-disclosure", t("community.cacheRetention.gapBasisCaveat")),
+  );
+
+  const wrap = node("div", "table-wrap snapshot-table");
+  const table = documentRef.createElement("table");
+  table.append(node("caption", "sr-only", t("community.cacheRetention.caption")));
+  const thead = documentRef.createElement("thead");
+  const header = documentRef.createElement("tr");
+  COMMUNITY_CACHE_RETENTION_COLUMN_KEYS.forEach((key, index) => {
+    const th = documentRef.createElement("th");
+    th.scope = "col";
+    if (index > 0) th.className = "numeric";
+    th.textContent = t(key);
+    header.append(th);
+  });
+  thead.append(header);
+  const tbody = documentRef.createElement("tbody");
+  for (const band of retention.bands) {
+    const row = documentRef.createElement("tr");
+    const identity = documentRef.createElement("th");
+    identity.scope = "row";
+    identity.textContent = t(COMMUNITY_CACHE_RETENTION_BAND_KEYS[band.band]);
+    row.append(identity);
+    const cells = [
+      retentionRate(band.reusedMoreThanHalfRate),
+      retentionRate(band.matchedOrExceededRate),
+      compact(band.adjacencies),
+      compact(band.sessions),
+      compact(band.contributors),
+      retentionRate(band.topContributorShare),
+    ];
+    cells.forEach((value, index) => {
+      const cell = documentRef.createElement("td");
+      cell.className = "numeric";
+      // Narrow layouts stack each row into a labelled card; the label is the
+      // translated column header carried on the cell itself.
+      cell.setAttribute(
+        "data-label",
+        t(COMMUNITY_CACHE_RETENTION_COLUMN_KEYS[index + 1] ?? ""),
+      );
+      cell.textContent = value;
+      row.append(cell);
+    });
+    tbody.append(row);
+  }
+  table.append(thead, tbody);
+  wrap.append(table);
+  disclosure.append(wrap);
+
+  if (retention.bands.some((band) => band.adjacencies === 0)) {
+    disclosure.append(node("p", "annotation", t("community.cacheRetention.noEvidenceNote")));
+  }
+  // What the two rate columns are a fraction OF. Without this a reader has to
+  // guess the referent, and the likeliest guess -- the whole prompt prefix --
+  // is the wrong one.
+  disclosure.append(node("p", "annotation", t("community.cacheRetention.columnNote")));
+  disclosure.append(node("p", "annotation", t("community.cacheRetention.concentrationNote")));
+  const excluded = retention.bands.reduce((total, band) => total
+    + band.excludedInsufficientEvidence
+    + band.excludedContextContracted
+    + band.unorderedTies, 0);
+  if (excluded > 0) {
+    disclosure.append(node("p", "annotation", t("community.cacheRetention.excludedNote", {
+      insufficient: compact(retention.bands.reduce((total, band) => total + band.excludedInsufficientEvidence, 0)),
+      contracted: compact(retention.bands.reduce((total, band) => total + band.excludedContextContracted, 0)),
+      ties: compact(retention.bands.reduce((total, band) => total + band.unorderedTies, 0)),
+    })));
+  }
+  container.append(disclosure);
+  return disclosure;
+}
+
 /**
  * Renders the day-partitioned community series. Publication revisions remain
  * part of the read contract, but the reader-facing summary describes the
@@ -705,22 +925,42 @@ export function renderCommunityDailySeries({
   container,
   stateNode = null,
   payload,
+  cache = null,
+  /** Where the four headline figures go, when they belong somewhere other than
+   * at the top of `container`.
+   *
+   * They are the community's contribution totals and read as social proof, so
+   * the page may want them in the hero while the chart and tables stay in the
+   * band below. Absent, they stay exactly where they were. The node is
+   * emptied before the grid is placed, so a re-render replaces rather than
+   * accumulates -- `container` is rebuilt each time and this one is not. */
+  summaryContainer = null,
 }) {
   const { clear, node } = createDomHelpers(documentRef);
   const locale = documentRef?.documentElement?.lang ?? "en-US";
   const t = (key, values = {}) => translate(key, values, locale);
   const wasOpen = dailyDisclosureByContainer.get(container)?.open === true;
+  const retentionWasOpen =
+    cacheRetentionDisclosureByContainer.get(container)?.open === true;
   dailyDisclosureByContainer.delete(container);
+  cacheRetentionDisclosureByContainer.delete(container);
   clear(container);
   const series = normalizeCommunityDailySeries(payload);
+  const retained = cachedEvidence(cache);
   if (stateNode) {
-    stateNode.textContent = series.state === "published"
-      ? t("community.daily.seriesAvailable")
-      : t("community.daily.seriesUnavailable");
-    stateNode.className = series.state === "published"
+    stateNode.textContent = retained !== null
+      ? t("community.cached.chip")
+      : series.state === "published"
+        ? t("community.daily.seriesAvailable")
+        : t("community.daily.seriesUnavailable");
+    // Retained figures never take the live chip. The neutral chip and the
+    // notice below carry the same claim, so neither a glance nor a read can
+    // mistake them for current evidence.
+    stateNode.className = series.state === "published" && retained === null
       ? "evidence-chip"
       : "evidence-chip neutral";
   }
+  if (retained !== null) container.append(cachedEvidenceNotice(node, t, retained));
   if (series.state !== "published") {
     container.append(node("p", "", t(COMMUNITY_DAILY_STATE_KEYS[series.state])));
     return series.state;
@@ -748,12 +988,12 @@ export function renderCommunityDailySeries({
     ],
     [
       t("community.daily.turnsCounted"),
-      compact(usageEvents),
+      compactPrecise(usageEvents),
       t("community.daily.turnsCountedDetail", { days: historyDays }),
     ],
     [
       t("community.daily.allTokensCounted"),
-      compact(tokens),
+      compactPrecise(tokens),
       t("community.daily.allTokensCountedDetail", { days: historyDays }),
     ],
   ]) {
@@ -765,12 +1005,14 @@ export function renderCommunityDailySeries({
     );
     quality.append(item);
   }
-  container.append(quality);
-  container.append(node(
-    "p",
-    "snapshot-disclosure",
-    t("community.daily.recomputeNote"),
-  ));
+  // A separate host is emptied first: `container` is rebuilt on every render
+  // but a hero node outside it is not, so appending blindly would stack a
+  // second copy of the figures under the first on the next refresh.
+  if (summaryContainer) {
+    summaryContainer.replaceChildren(quality);
+  } else {
+    container.append(quality);
+  }
 
   appendCommunityDailyChart({ documentRef, container, series, t });
 
@@ -784,6 +1026,9 @@ export function renderCommunityDailySeries({
   ));
   breakdown.append(summary);
   const wrap = node("div", "table-wrap snapshot-table");
+  wrap.setAttribute("role", "region");
+  wrap.setAttribute("aria-label", t("community.daily.metricsCaption"));
+  wrap.setAttribute("tabindex", "0");
   const table = documentRef.createElement("table");
   const caption = node("caption", "sr-only", t("community.daily.metricsCaption"));
   const thead = documentRef.createElement("thead");
@@ -846,7 +1091,23 @@ export function renderCommunityDailySeries({
   wrap.append(table);
   breakdown.append(wrap);
   container.append(breakdown);
+  // After the table, not before the chart. It is a footnote about the sample,
+  // and the day-detail disclosure above is the one whose open state is carried
+  // across refreshes — leading with a second `details` would shadow it.
+  container.append(sourceDisclosureDetails(node, t, ["community.daily.recomputeNote"]));
   dailyDisclosureByContainer.set(container, breakdown);
+
+  // Optional and community-wide: absent until the lane publishes, and an
+  // absent lane leaves the rest of the day series untouched.
+  if (series.cacheRetention !== null) {
+    cacheRetentionDisclosureByContainer.set(container, appendCommunityCacheRetention({
+      documentRef,
+      container,
+      retention: series.cacheRetention,
+      t,
+      wasOpen: retentionWasOpen,
+    }));
+  }
   return series.state;
 }
 
@@ -870,6 +1131,31 @@ function usdFormatter(maximumFractionDigits = 0) {
  * where days published one, the central line, and per-day dots sized by fit
  * count. Same CSP-strict plain-SVG construction as the daily chart.
  */
+/** The source qualifiers, collapsed into one line.
+ *
+ * These are a privacy disclosure, not decoration: a reader must be able to
+ * learn that a "source" is an installation/account track rather than a verified
+ * person, and that separate installations may overlap. A guard test asserts
+ * both sentences render in every public language, in the allowance section and
+ * in the daily series.
+ *
+ * They were several lines of prose above each figure, which pushed the chart
+ * itself below the fold. A closed `details` still renders its text, so the
+ * disclosure costs one line until a reader opens it and the contract is
+ * unchanged. Built with `node` so it matches the sibling disclosure in the
+ * daily view rather than introducing a second construction style. `node` is a
+ * per-render closure over the document, so it is passed in rather than
+ * reached for. */
+function sourceDisclosureDetails(node, t, extraKeys = []) {
+  const details = node("details", "snapshot-disclosure-details");
+  const summary = node("summary");
+  summary.append(node("span", "", t("community.sample.sourcesSummary")));
+  details.append(summary);
+  details.append(node("p", "snapshot-disclosure", t("community.sample.sourcesDisclosure")));
+  for (const key of extraKeys) details.append(node("p", "snapshot-disclosure", t(key)));
+  return details;
+}
+
 function appendCommunityAllowanceChart({ documentRef, container, model, t, inspection = null }) {
   const { node } = createDomHelpers(documentRef);
   const dollars = usdFormatter();
@@ -878,18 +1164,30 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t, inspe
   const legend = node("div", "community-daily-legend allowance-series-legend");
   const legendButtons = [];
   const legendItems = model.legendSeries?.map(series => [
-    `daily-legend-swatch allowance-central ${series.className}`, series.label, series.key,
+    `daily-legend-swatch allowance-central ${series.className}`, series.label, series.key, true,
   ]) ?? [
     ["daily-legend-swatch allowance-central", "community.allowance.legendCentral"],
     ["daily-legend-swatch allowance-band", "community.allowance.legendBand"],
     ["daily-legend-swatch allowance-dot", "community.allowance.legendDots"],
   ].map(([className, key]) => [className, t(key)]);
-  for (const [swatchClass, label, seriesKey] of legendItems) {
-    const item = node(seriesKey ? "button" : "span", seriesKey ? "allowance-legend-button" : "");
+  if (model.view === "models") {
+    legendItems.splice(0, legendItems.length, ...model.cardSeries.map(series => [
+      `daily-legend-swatch allowance-central ${series.className}`,
+      series.label, series.key, series.latest !== null,
+    ]));
+  }
+  for (const [swatchClass, label, seriesKey, hasEstimate] of legendItems) {
+    const item = node(seriesKey && hasEstimate ? "button" : "span",
+      seriesKey ? `allowance-legend-button${hasEstimate ? "" : " unavailable"}` : "");
     if (seriesKey) {
-      item.setAttribute("type", "button");
-      item.setAttribute("aria-pressed", "false");
-      legendButtons.push({ item, seriesKey });
+      if (hasEstimate) {
+        item.setAttribute("type", "button");
+        item.setAttribute("aria-pressed", "false");
+        legendButtons.push({ item, seriesKey });
+      } else {
+        item.setAttribute("role", "note");
+        item.setAttribute("aria-label", `${label}: ${t("community.allowance.noModelEstimate")}`);
+      }
     }
     const swatch = node("span", swatchClass);
     swatch.setAttribute("aria-hidden", "true");
@@ -897,7 +1195,6 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t, inspe
     legend.append(item);
   }
   figure.append(legend);
-  if (legendButtons.length) figure.append(node("p", "allowance-legend-hint", t("community.allowance.legendFocus")));
 
   const svg = svgNode(documentRef, "svg", "", {
     viewBox: `0 0 ${model.width} ${model.height}`,
@@ -1257,25 +1554,50 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t, inspe
 export function renderCommunityAllowanceSection({
   documentRef,
   container,
+  sourceContainer = null,
+  headingNode = null,
+  heroNode = null,
   stateNode = null,
   payload,
   rangeDays = null,
   view = "aggregate",
+  cache = null,
 }) {
   const { clear, node } = createDomHelpers(documentRef);
   const locale = documentRef?.documentElement?.lang ?? "en-US";
-  const t = (key, values = {}) => translate(key, values, locale);
+  const series = normalizeCommunityDailySeries(payload);
+  // v1.0 breakdowns contain only plan/model rows: the aggregate still comes
+  // from independently published daily values. Later breakdowns own their
+  // combined estimate, so labels must follow the selected value's source.
+  const usesDailyAllowance = view === "aggregate" && !series.breakdowns?.hasCombined;
+  const legacyBasis = usesDailyAllowance
+    ? series.allowanceIsCurrent === false && series.days.some(day => day.allowance !== null)
+    : series.breakdowns?.isCurrent === false;
+  const t = (key, values = {}) => translate(legacyBasis
+    && ["community.allowance.chartDescription", "community.allowance.modelChartDescription"].includes(key)
+    ? `${key}Legacy` : key, values, locale);
+  for (const [element, key] of [[headingNode, "community.allowance.heading"],
+    [heroNode, "community.allowance.heroCopy"]]) {
+    if (element === null) continue;
+    const basisKey = legacyBasis ? `${key}Legacy` : key;
+    element.textContent = t(basisKey);
+    element.setAttribute?.("data-i18n", basisKey);
+  }
   const plural = (key, count) => translatePlural(key, count, {}, locale);
   const previousInspection = allowanceInspectionByContainer.get(container)?.();
   const inspection = previousInspection?.view === view ? previousInspection : null;
   allowanceInspectionByContainer.delete(container);
   clear(container);
-  const series = normalizeCommunityDailySeries(payload);
+  sourceContainer?.replaceChildren();
+  const retained = cachedEvidence(cache);
   const setChip = (labelKey, published) => {
     if (!stateNode) return;
-    stateNode.textContent = t(labelKey);
-    stateNode.className = published ? "evidence-chip" : "evidence-chip neutral";
+    stateNode.textContent = t(retained === null ? labelKey : "community.cached.chip");
+    stateNode.className = published && retained === null
+      ? "evidence-chip"
+      : "evidence-chip neutral";
   };
+  if (retained !== null) container.append(cachedEvidenceNotice(node, t, retained));
   if (series.state !== "published") {
     setChip("community.allowance.unavailable", false);
     container.append(
@@ -1317,27 +1639,66 @@ export function renderCommunityAllowanceSection({
 
   setChip("community.allowance.available", true);
   const dollars = usdFormatter();
-  container.append(node("p", "snapshot-disclosure", t("community.allowance.smallSampleDisclosure")));
+  const sourceDisclosure = sourceDisclosureDetails(node, t,
+    view === "aggregate"
+      ? ["community.allowance.smallSampleDisclosure",
+        legacyBasis ? "community.allowance.methodNoteLegacy" : "community.allowance.methodNote"]
+      : ["community.allowance.smallSampleDisclosure"]);
+  (sourceContainer ?? container).append(sourceDisclosure);
   if (view !== "aggregate") {
     container.append(node("p", "allowance-summary-caption", t("community.allowance.cardsCaption")));
     const cards = node("div", "allowance-summary-cards");
-    for (const latest of model.latestSummaries) {
-      const card = node("article", `allowance-summary-card ${latest.seriesClass}`.trim());
+    for (const seriesCard of model.cardSeries) {
+      const latest = seriesCard.latest;
+      const card = node("article", `allowance-summary-card ${seriesCard.className}`.trim());
       const heading = node("div", "allowance-summary-heading");
-      heading.append(node("h3", "", latest.seriesLabel));
-      const icon = modelThemeIcon(documentRef, latest.seriesTheme);
+      heading.append(node("h3", "", seriesCard.label));
+      const icon = modelThemeIcon(documentRef, seriesCard.theme);
       if (icon) heading.append(icon);
+      // A plan cohort leads with ITS OWN week at API prices, because that is
+      // the number a reader on that plan is asking about. The reference
+      // equivalent stays underneath as the comparable figure the basis names.
+      const planUsd = view === "plans" && latest !== null
+        ? planWeeklyApiEquivalentUsd(latest.centralUsd, latest.seriesKey, series.breakdowns.normalization) : null;
       card.append(heading,
-        node("strong", "allowance-summary-value", dollars.format(latest.centralUsd)));
-      const planUsd = view === "plans" ? planWeeklyApiEquivalentUsd(latest.centralUsd, latest.seriesKey) : null;
-      if (planUsd !== null) card.append(node("p", "allowance-plan-value", t("community.allowance.actualPlanValue", { value: dollars.format(planUsd) })));
-      card.append(node("p", "allowance-headline-caveat", `${formatUtcCalendarDay(latest.day)} · ${plural("community.allowance.shortAccountCount", latest.participantCount)}`));
+        node("strong", "allowance-summary-value",
+          latest === null ? "—" : dollars.format(planUsd === null ? latest.centralUsd : planUsd)));
+      if (planUsd !== null) {
+        card.append(node("p", "allowance-plan-value",
+          t(series.breakdowns?.isCurrent === false
+            ? "community.allowance.referenceEquivalentLegacy" : "community.allowance.referenceEquivalent", { value: dollars.format(latest.centralUsd) })));
+      }
+      card.append(node("p", "allowance-headline-caveat", latest === null
+        ? t("community.allowance.noModelEstimate")
+        : plural("community.allowance.shortAccountCount", latest.participantCount)));
       cards.append(card);
     }
     container.append(cards);
-    appendCommunityAllowanceChart({ documentRef, container, model, t, inspection });
+    if (view === "plans") {
+      // Small multiples. Plans whose own weeks span a wide range
+      // cannot share a linear axis — the smallest is pinned to the baseline and
+      // its band becomes a sliver. One panel per plan gives each its own value
+      // axis and full vertical resolution, and it removes the need to explain a
+      // scaling factor, because nothing is scaled any more. Cross-plan
+      // comparison becomes deliberate rather than automatic, which is the
+      // honest trade now that the cards lead with each plan's own week.
+      const panels = node("div", "allowance-small-multiples");
+      for (const latest of model.latestSummaries) {
+        const panelModel = buildCommunityAllowanceChartModel(series,
+          { rangeDays, view, seriesKeys: [latest.seriesKey] });
+        if (panelModel === null) continue;
+        const panel = node("div", `allowance-panel ${latest.seriesClass}`.trim());
+        panel.append(node("h4", "allowance-panel-title", latest.seriesLabel));
+        appendCommunityAllowanceChart({ documentRef, container: panel, model: panelModel, t, inspection });
+        panels.append(panel);
+      }
+      container.append(panels);
+    } else {
+      appendCommunityAllowanceChart({ documentRef, container, model, t, inspection });
+    }
     container.append(node("p", "snapshot-disclosure", t(view === "models"
-      ? "community.allowance.modelMethod" : "community.allowance.planMethod")));
+      ? series.breakdowns?.isCurrent === false ? "community.allowance.modelMethodLegacy" : "community.allowance.modelMethod"
+      : series.breakdowns?.isCurrent ? "community.allowance.planMethod" : "community.allowance.planMethodLegacy")));
     return "published";
   }
   const headline = node("div", "allowance-headline");
@@ -1358,7 +1719,7 @@ export function renderCommunityAllowanceSection({
     ));
   }
   // The participant count is a visible claim beside the number, never a
-  // tooltip: "from 1 contributing account" is part of the estimate.
+  // tooltip: "from 1 contribution source" is part of the estimate.
   headline.append(node(
     "p",
     "allowance-headline-caveat",
@@ -1377,10 +1738,5 @@ export function renderCommunityAllowanceSection({
 
   appendCommunityAllowanceChart({ documentRef, container, model, t, inspection });
 
-  container.append(node(
-    "p",
-    "snapshot-disclosure",
-    t("community.allowance.methodNote"),
-  ));
   return "published";
 }

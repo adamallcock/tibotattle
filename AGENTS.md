@@ -21,7 +21,7 @@ Prefer principles, constraints and verifiable outcomes over canned examples.
 | Contribution projection or prepared sets | `src/contribution/AGENTS.md` |
 | Local companion, dashboard API, or unified index | `apps/local/AGENTS.md` |
 | Browser dashboard or public web UI | `apps/web/AGENTS.md` |
-| Native macOS, app bundles, updater, or signing | `apps/macos/AGENTS.md` |
+| Electron macOS bundles, updater, migration, or signing | `apps/electron/AGENTS.md` |
 | Electron desktop lifecycle, IPC, settings, or shell integration | `apps/electron/AGENTS.md` |
 | Hosted Worker, D1/R2, auth, or deployment | `apps/worker/AGENTS.md` |
 | Standalone local-review CLI, artifact, install, or deletion | `local-review/AGENTS.md` |
@@ -45,11 +45,11 @@ and updated authoritative documentation.
 - Local analysis must work offline, and local HTTP services bind only to loopback.
 - Unexpected Keychain security prompts block release. Routine access must be
   non-interactive; never weaken protection to suppress prompts. Follow
-  `apps/macos/AGENTS.md` for silent migration, explicit recovery, and proof.
-- Prompts, responses, raw session commands, credentials, private session paths
-  and filenames, raw account identifiers, and other session content must not
-  enter derived artifacts, fixtures, logs, diagnostics, issues, commits, or
-  pull requests.
+  `apps/electron/AGENTS.md` for migration, explicit recovery, and proof.
+- Prompts, responses, raw commands, credentials, private paths/filenames, raw
+  account IDs and session content must not enter derived artifacts, fixtures,
+  logs, diagnostics, issues, commits, or PRs. Opt-in Crashpad dumps and explicit
+  owner-only raw crash exports are sole local exceptions; never project/upload them (`docs/decisions/2026-09-21-opt-in-crash-doctor.md`).
 - Hosted contribution is optional, content-free and pseudonymous. Follow the
   accountless Electron defaults and transition in
   `docs/decisions/2026-09-04-accountless-sharing-policy.md`; preserve durable
@@ -133,9 +133,10 @@ and updated authoritative documentation.
 
 - Use pnpm for the root workspace. The Worker app has an independent npm
   lockfile. Do not mix lockfile ownership.
-- Root tooling requires Node.js 22.13 or newer. Native macOS bundle work requires
-  macOS arm64 and exactly Node.js 26.2.0; unsupported environments must fail
-  honestly rather than produce partial proof.
+- Root tooling requires Node.js 22.13 or newer. Production Electron candidate
+  preparation requires exactly Node.js 26.2.0; macOS packaging and installed
+  checks require their supported Mac target and GUI context. Unsupported
+  environments must fail honestly rather than produce partial proof.
 - Run the smallest meaningful validation first, then broaden according to impact.
   Direct test-file execution is preferred while iterating.
 - Use `npm run test:preflight` for documentation, root-layout, and whitespace

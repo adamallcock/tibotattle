@@ -4,7 +4,7 @@ Scope: all files under `native/`. Apply the repository root guidance first.
 
 ## macOS Keychain adapter
 
-- For `macos-keychain/`, read its README and `apps/macos/AGENTS.md`.
+- For `macos-keychain/`, read its README and `apps/electron/AGENTS.md`.
 - Keep only the fixed logical credential capabilities. The signed Electron
   main process owns the adapter; renderer input cannot select Keychain items.
 - Preserve existing credential bytes and ACLs. Locked, denied, unknown and

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { createHash, createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto";
+import { createHash, createHmac, createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto";
 import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -22,6 +22,7 @@ import {
   CANONICAL_APPCAST_URL,
   CANONICAL_UPDATE_ORIGIN,
   IMMUTABLE_CACHE_CONTROL,
+  createAppcastAtomicGuardFromEnvironment,
   parseSparkleUpdatePublisherArguments,
   publishSparkleUpdate as publishSparkleUpdateProduction,
   verifyReleaseManifestSourceProvenance,
@@ -1525,6 +1526,59 @@ test("publishes through the explicit owner guard endpoint without exposing its t
     } else {
       process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV] = previousToken;
     }
+    await fixture.cleanup();
+  }
+});
+
+test("a private environment guard supports consecutive canonical publications without restoring its credential", async () => {
+  const fixture = await createReleaseFixture();
+  const token = "synthetic-reusable-guard-token-0123456789";
+  const previousToken = process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV];
+  process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV] = token;
+  const guardCalls = [];
+  try {
+    assert.throws(() => createAppcastAtomicGuardFromEnvironment({ endpoint: "https://example.invalid/guard" }),
+      { code: "SPARKLE_UPDATE_ATOMIC_GUARD_ENDPOINT_INVALID" });
+    assert.equal(process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV], token);
+    const guard = createAppcastAtomicGuardFromEnvironment({
+      endpoint: `${STABLE_CHANNEL.serviceOrigin}${APPCAST_ATOMIC_GUARD_ROUTE}`,
+      fetchGuard: async (url, options) => {
+        guardCalls.push({ url, options });
+        assert.equal(process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV], undefined);
+        const timestamp = options.headers["x-usage-monitor-release-timestamp"];
+        const nonce = options.headers["x-usage-monitor-release-nonce"];
+        const signedRequest = `${APPCAST_ATOMIC_GUARD_SCHEMA}\0POST\0${APPCAST_ATOMIC_GUARD_ROUTE}\0${timestamp}\0${nonce}\0${sha256(Buffer.from(options.body))}`;
+        assert.equal(options.headers["x-usage-monitor-release-signature"],
+          createHmac("sha256", token).update(signedRequest).digest("base64url"));
+        return Response.json({ schemaVersion: APPCAST_ATOMIC_GUARD_SCHEMA, status: "committed" });
+      },
+    });
+    assert.equal(process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV], undefined);
+    const receipts = [];
+    for (let index = 0; index < 2; index += 1) {
+      const runner = missingRemoteObjectRunner();
+      receipts.push(await publishSparkleUpdateRaw({
+        appcastPath: fixture.appcastPath, atomicAppcastGuard: guard,
+        bucket: APPROVED_R2_BUCKET, channel: "stable", dmgPath: fixture.dmgPath,
+        publish: true, releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY, stableBootstrap: true,
+        runWrangler: async (...args) => {
+          assert.equal(process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV], undefined);
+          return runner.run(...args);
+        },
+        fetchPublic: publicReadbackFixture(fixture).fetch,
+        validateDMG: async () => assert.equal(process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV], undefined),
+      }));
+    }
+    assert.deepEqual(receipts.map(receipt => receipt.status), ["published", "published"]);
+    assert.equal(guardCalls.length, 2);
+    assert.ok(!JSON.stringify({ guard, guardCalls, receipts }).includes(token));
+    assert.throws(() => createAppcastAtomicGuardFromEnvironment({
+      endpoint: `${STABLE_CHANNEL.serviceOrigin}${APPCAST_ATOMIC_GUARD_ROUTE}`,
+    }), { code: "SPARKLE_UPDATE_ATOMIC_GUARD_TOKEN_REQUIRED" });
+  } finally {
+    if (previousToken === undefined) delete process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV];
+    else process.env[APPCAST_ATOMIC_GUARD_TOKEN_ENV] = previousToken;
     await fixture.cleanup();
   }
 });

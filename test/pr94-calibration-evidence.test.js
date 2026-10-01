@@ -436,8 +436,8 @@ test("PR94 unknown-account independence executes actual original fits and report
   assert.equal(known.unknownAccountCheck.rowsChecked, 0);
   assert.equal(known.unknownAccountCheck.fragmentCandidatesChecked, 0);
   const variant = await policyVariant("unknown-account-excluded", (source) => source.replace(
-    'const ordered = [...rows].filter(isEligible).sort((left, right) => left.eventTime.localeCompare(right.eventTime));',
-    'const ordered = [...rows].filter(isEligible).filter((row) => row.accountScopeId !== "unattributed").sort((left, right) => left.eventTime.localeCompare(right.eventTime));'));
+    '.filter((row) => isEligible(row, windowDurationMinutes))\n    .sort((left, right) => left.eventTime.localeCompare(right.eventTime));',
+    '.filter((row) => isEligible(row, windowDurationMinutes))\n    .filter((row) => row.accountScopeId !== "unattributed")\n    .sort((left, right) => left.eventTime.localeCompare(right.eventTime));'));
   const rejected = evidence(rows(), { internals: variant, analyzeWeeklyCalibration: variant.analyzeWeeklyCalibration });
   assert.equal(rejected.status, "fail");
   assert.equal(rejected.unknownAccountCheck.fragmentCandidatesChecked, 4);

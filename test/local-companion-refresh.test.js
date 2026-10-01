@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   mkdir,
   mkdtemp,
+  realpath,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -895,7 +896,7 @@ test("unified accounting mode never advances the legacy archive and passes expli
   const result = await runner();
   assert.deepEqual(order, ["unified", "accounting"]);
   assert.equal(accountingOptions.sourceMode, "unified");
-  assert.equal(accountingOptions.contextBehavior, "legacy_zero");
+  assert.equal(accountingOptions.contextBehavior, "source_native");
   assert.equal(
     accountingOptions.unifiedIndexFile,
     "/private/local-unified-index-v1.sqlite",
@@ -1610,7 +1611,7 @@ test("unified mode fails closed when the authoritative generation is missing or 
         status: "unavailable",
         sourceMode: "unified",
         errorCode: fixture.expectedAccountingError,
-        compatibilityBehavior: "legacy_zero",
+        compatibilityBehavior: "source_native",
         coverageStatus: fixture.expectedCoverage,
         generation: fixture.expectedGeneration,
         generationFingerprint: fixture.expectedFingerprint,
@@ -1665,7 +1666,7 @@ test("unified accounting reader errors stay unavailable without legacy fallback"
     refreshAccounting: async (options) => {
       accountingCalls += 1;
       assert.equal(options.sourceMode, "unified");
-      assert.equal(options.contextBehavior, "legacy_zero");
+      assert.equal(options.contextBehavior, "source_native");
       assert.equal(options.expectedGeneration.id, expectedGeneration.id);
       assert.equal(
         options.expectedGeneration.fingerprint,
@@ -1687,7 +1688,7 @@ test("unified accounting reader errors stay unavailable without legacy fallback"
     status: "unavailable",
     sourceMode: "unified",
     errorCode: "accounting_unified_generation_changed",
-    compatibilityBehavior: "legacy_zero",
+    compatibilityBehavior: "source_native",
     coverageStatus: "complete",
     generation: 8,
     generationFingerprint: "c".repeat(64),
@@ -4628,4 +4629,189 @@ test("Claude usage shadow failure is contained and abort releases a non-cooperat
   const result = await running;
   assert.equal(result.rolloutRecordsWritten, 1);
   assert.equal(Object.hasOwn(result, "claudeShadow"), false);
+});
+
+
+test("interactive macOS QA uses a separate prospective account key and disposes each refresh loader", {
+  skip: process.platform === "win32"
+    ? "macOS development identity QA is not a Windows test"
+    : false,
+}, async (t) => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "refresh-development-account-")));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const identity = join(root, "identity");
+  await mkdir(identity, { mode: 0o700 });
+  const accountFile = join(identity, "account-observation-development");
+  const exportFile = join(identity, "export-identity");
+  const secret = Buffer.alloc(32, 17);
+  await writeFile(accountFile, secret, { mode: 0o600 });
+  await writeFile(exportFile, `${Buffer.alloc(32, 18).toString("base64url")}\n`, { mode: 0o600 });
+  const environment = {
+    USAGE_MONITOR_TEST_LANE: "macos-electron-local-qa-v1",
+    USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: "1",
+    USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: accountFile,
+    USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: exportFile,
+  };
+  let loader;
+  let failCollector = false;
+  const runner = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified", environment, platform: "darwin",
+    selectAccountObservationSecret: () => assert.fail("QA must never select production credentials"),
+    runCollector: async (options) => {
+      loader = options.loadAccountObservationSecret;
+      const loaded = await loader();
+      assert.deepEqual(loaded, secret);
+      loaded.fill(0);
+      if (failCollector) throw new Error("synthetic collector failure");
+      return { rolloutRecordsWritten: 0, filesDiscovered: 0,
+        refresh: { attempted: true, recordWritten: true, errorCode: null }, indexing: COMPLETE_INDEX };
+    },
+  });
+  await runner({ mode: "quick" });
+  await assert.rejects(loader(), { code: "account_observation_credential_unavailable" });
+  failCollector = true;
+  await assert.rejects(runner({ mode: "quick" }), /synthetic collector failure/u);
+  await assert.rejects(loader(), { code: "account_observation_credential_unavailable" });
+
+  for (const patch of [
+    { platform: "linux" },
+    { platform: "win32" },
+    { USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: undefined },
+    { USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE: `${accountFile}-absent` },
+    { USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: undefined },
+    { USAGE_MONITOR_CENTRAL_ORIGIN: "https://example.invalid" },
+    { USAGE_MONITOR_ACCOUNTLESS_MODE: "production-v1" },
+    { APP_USAGEMONITOR_EXPORT_SECRET: "synthetic-ambient-secret" },
+  ]) {
+    const closed = createLocalCollectorRefreshRunner({
+      accountingSourceMode: "unified", platform: patch.platform ?? "darwin",
+      environment: { ...environment, ...patch },
+      selectAccountObservationSecret: () => assert.fail("invalid QA cannot fall back to Keychain"),
+      runCollector: async (options) => {
+        assert.equal(options.loadAccountObservationSecret, null);
+        return { rolloutRecordsWritten: 0, filesDiscovered: 0,
+          refresh: { attempted: true, recordWritten: true, errorCode: null }, indexing: COMPLETE_INDEX };
+      },
+    });
+    await closed({ mode: "quick" });
+  }
+
+  let productionSelections = 0;
+  const productionLoader = async () => null;
+  const ordinary = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified", platform: "darwin",
+    environment: { ...environment, USAGE_MONITOR_TEST_LANE: undefined },
+    selectAccountObservationSecret: (options) => {
+      productionSelections += 1;
+      assert.deepEqual(options, {});
+      return { loadAccountObservationSecret: productionLoader };
+    },
+    runCollector: async (options) => {
+      assert.equal(options.loadAccountObservationSecret, productionLoader);
+      return { rolloutRecordsWritten: 0, filesDiscovered: 0,
+        refresh: { attempted: true, recordWritten: true, errorCode: null }, indexing: COMPLETE_INDEX };
+    },
+  });
+  await ordinary({ mode: "quick" });
+  assert.equal(productionSelections, 1);
+});
+
+test("quick polling omits reset details only after a successful startup read; detailed refreshes retain them", async () => {
+  const optionsSeen = [];
+  const classifiersSeen = [];
+  let succeeds = false;
+  const makeRunner = () => createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified",
+    selectAccountObservationSecret: () => ({ loadAccountObservationSecret: null }),
+    runCollector: async (options) => {
+      optionsSeen.push(options.excludeResetCreditDetails);
+      classifiersSeen.push(options.resetEventClassifier);
+      return { refresh: { attempted: true, recordWritten: succeeds, errorCode: succeeds ? null : "app_server_unavailable" } };
+    },
+    readAccountingCache: async () => null,
+  });
+  const runner = makeRunner();
+  await runner({ mode: "quick" });
+  succeeds = true;
+  await runner({ mode: "quick" });
+  await runner({ mode: "quick" });
+  await runner({ mode: "detailed" });
+  await makeRunner()({ mode: "quick" });
+  assert.deepEqual(optionsSeen, [false, false, true, false, false]);
+  assert.equal(classifiersSeen.slice(0, 4).every(
+    (classifier) => classifier === classifiersSeen[0],
+  ), true, "one volatile baseline is reused across a companion runner's polls");
+  assert.notEqual(classifiersSeen[4], classifiersSeen[0]);
+  assert.equal(typeof classifiersSeen[0].observe, "function");
+  assert.equal(typeof classifiersSeen[0].reset, "function");
+});
+
+const PUBLISHED_INDEX_FOR_UPLOAD = Object.freeze({
+  status: "ingested", unchanged: false,
+  generation: {
+    id: 1, fingerprint: `generation-v2-${"a".repeat(64)}`, status: "complete",
+    discoveryComplete: true, diagnosticsComplete: true,
+    usageProvenanceComplete: true, sourceOrderComplete: true,
+    quotaProvenanceComplete: true, toolProvenanceComplete: true,
+  },
+});
+
+test("index publication observer follows validated detailed reload, excluding non-publications", async (t) => {
+  for (const [name, mode, unifiedIndex, expected] of [
+    ["changed detailed", "detailed", PUBLISHED_INDEX_FOR_UPLOAD, 1],
+    ["quick", "quick", PUBLISHED_INDEX_FOR_UPLOAD, 0],
+    ["unchanged", "detailed", { ...PUBLISHED_INDEX_FOR_UPLOAD, unchanged: true }, 0],
+    ["unknown change status", "detailed", { ...PUBLISHED_INDEX_FOR_UPLOAD, unchanged: undefined }, 0],
+    ["failed", "detailed", { status: "failed" }, 0],
+    ["missing descriptor", "detailed", { status: "ingested" }, 0],
+    ["partial", "detailed", { ...PUBLISHED_INDEX_FOR_UPLOAD, generation: {
+      ...PUBLISHED_INDEX_FOR_UPLOAD.generation, status: "partial",
+    } }, 0],
+    ["unproven completeness", "detailed", { ...PUBLISHED_INDEX_FOR_UPLOAD, generation: {
+      ...PUBLISHED_INDEX_FOR_UPLOAD.generation, discoveryComplete: false,
+    } }, 0],
+  ]) {
+    await t.test(name, async () => {
+      let reloaded = false;
+      const observed = [];
+      const controller = new LocalCompanionRefreshController({
+        runner: async () => ({ unifiedIndex }),
+        dataStore: { async reload() { reloaded = true; } },
+        onIndexPublished: (...args) => {
+          assert.equal(reloaded, true);
+          observed.push(args);
+        },
+      });
+      assert.equal(controller.start({ mode }), true);
+      await flushControllerSettlement(controller);
+      assert.equal(observed.length, expected);
+      if (expected) assert.deepEqual(observed, [[]], "no generation identifiers leave observer");
+    });
+  }
+});
+
+test("index publication observer is fenced on failed or cancelled reload and cannot break success", async (t) => {
+  for (const outcome of ["failed_reload", "cancelled_reload", "throwing_observer", "rejecting_observer"]) {
+    await t.test(outcome, async () => {
+      let calls = 0;
+      let controller;
+      controller = new LocalCompanionRefreshController({
+        runner: async () => ({ unifiedIndex: PUBLISHED_INDEX_FOR_UPLOAD }),
+        dataStore: { async reload() {
+          if (outcome === "failed_reload") throw new Error("synthetic reload failure");
+          if (outcome === "cancelled_reload") controller.cancel();
+        } },
+        onIndexPublished: () => {
+          calls += 1;
+          if (outcome === "throwing_observer") throw new Error("synthetic observer failure");
+          return Promise.reject(new Error("synthetic observer rejection"));
+        },
+      });
+      controller.start();
+      await flushControllerSettlement(controller);
+      assert.equal(calls, outcome.endsWith("observer") ? 1 : 0);
+      if (outcome === "cancelled_reload") assert.equal(controller.getStatus().status, "cancelled");
+      if (outcome.endsWith("observer")) assert.equal(controller.getStatus().status, "succeeded");
+    });
+  }
 });

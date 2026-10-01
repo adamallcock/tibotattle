@@ -17,6 +17,11 @@ import {
 } from "./desktop-runtime.js";
 import { createDesktopTrayIconFactory } from "./desktop-tray.js";
 import {
+  createDesktopCrashCapture,
+  createDesktopCrashCaptureBackend,
+} from "./desktop-crash-capture.js";
+import { createDesktopStartupDiagnostics } from "./desktop-startup-diagnostics.js";
+import {
   PRODUCTION_ELECTRON_CHANNEL,
   validateProductionDistributionMetadata,
 } from "./desktop-updater.js";
@@ -97,6 +102,27 @@ const WINDOWS_ELECTRON_SMOKE_CREDENTIAL_OPERATIONS = Object.freeze({
   "credential-read-v1": "read-v1",
   "credential-delete-v1": "delete-v1",
 });
+
+async function markStartupDiagnostics(startupDiagnostics, phase) {
+  try {
+    if (typeof startupDiagnostics?.checkpoint === "function") {
+      await startupDiagnostics.checkpoint(phase);
+    } else {
+      await startupDiagnostics?.mark?.(phase);
+    }
+  } catch {
+    // Startup diagnostics are observational and never control startup.
+  }
+}
+
+async function writeStartupDiagnostics(startupDiagnostics, operation, ...args) {
+  try {
+    await startupDiagnostics?.[operation]?.(...args);
+  } catch {
+    // Startup diagnostics are observational and never control startup.
+  }
+}
+
 function isPackagedElectronApp(app) {
   return app?.isPackaged === true;
 }
@@ -366,6 +392,21 @@ function emitEntryFailureDiagnostic(writeDiagnostic = process.stderr?.write?.bin
       // Diagnostic delivery must never prevent fail-closed shutdown.
     }
   }
+}
+
+function quitAfterEntryFailure({ app, dialog, writeDiagnostic } = {}) {
+  emitEntryFailureDiagnostic(writeDiagnostic);
+  try {
+    // showErrorBox works before app readiness. Keep the copy fixed: a startup
+    // exception may contain private paths, account data, or child output.
+    dialog?.showErrorBox?.(
+      "TiboTattle could not start",
+      `TiboTattle stopped before opening the dashboard.\n\nSupport code: ${ELECTRON_ENTRY_FAILURE_DIAGNOSTIC}\n\nPlease report this code with the app and operating system versions. Preserve your local data.`,
+    );
+  } catch {
+    // A missing or broken native dialog must not prevent fail-closed shutdown.
+  }
+  app?.quit?.();
 }
 
 function isCompanionProcessLifecycleEvent(value) {
@@ -1030,6 +1071,8 @@ async function prepareElectronShellBootstrap({
   environment = process.env,
   platform = process.platform,
   architecture = process.arch,
+  onStartupPhase,
+  startStartupDiagnostics,
   getuid = typeof process.getuid === "function" ? process.getuid.bind(process) : undefined,
   getUserInfo = userInfo,
 } = {}) {
@@ -1038,8 +1081,16 @@ async function prepareElectronShellBootstrap({
   if (!app || typeof app.on !== "function") {
     throw new TypeError("Electron app runtime is unavailable");
   }
+  const markStartupPhase = async (phase) => {
+    try {
+      if (typeof onStartupPhase === "function") await onStartupPhase(phase);
+    } catch {
+      // Startup diagnostics are observational and never control startup.
+    }
+  };
   // Read and validate every package marker before constructing any companion
   // or platform service. This also preserves the existing mixed-marker gate.
+  await markStartupPhase("package_metadata");
   const productionDistribution = await readProductionDistribution({ app, platform, architecture });
   const accountlessHostedRehearsal = await readAccountlessHostedRehearsal({ app, platform, architecture });
   const accountlessSignedStagingRehearsal = await readAccountlessSignedStagingRehearsal({
@@ -1062,16 +1113,41 @@ async function prepareElectronShellBootstrap({
     platform,
     architecture,
   });
+  await markStartupPhase("profile_selection");
   const signedStagingProfile = await configureAccountlessSignedStagingProfile(
     app,
     accountlessSignedStagingRehearsal,
     { expectedOwnerUid: accountContext?.expectedTestUID },
   );
+  try {
+    if (typeof startStartupDiagnostics === "function") {
+      await startStartupDiagnostics();
+    }
+  } catch {
+    // Startup diagnostics are observational and never control startup.
+  }
+  await markStartupPhase("crash_capture");
+  let crashCapture = null;
+  if (platform === "darwin" && typeof runtime.crashReporter?.start === "function") {
+    try {
+      const backend = createDesktopCrashCaptureBackend({
+        platform,
+        rootPath: join(app.getPath("userData"), "desktop-settings"),
+      });
+      crashCapture = createDesktopCrashCapture({ backend, crashReporter: runtime.crashReporter });
+      await crashCapture.initialize();
+    } catch {
+      // Crash capture is optional. A malformed or unavailable preference must
+      // never prevent the ordinary desktop launch or enable native dumps.
+      crashCapture = null;
+    }
+  }
   return Object.freeze({
     [ELECTRON_SHELL_BOOTSTRAP]: true,
     accountlessHostedRehearsal,
     accountlessSignedStagingRehearsal,
     app,
+    crashCapture,
     productionDistribution,
     runtime,
     signedStagingProfile,
@@ -1103,6 +1179,7 @@ export async function launchElectronShell({
   emitFailureDiagnostic = false,
   writeDiagnostic,
   startupPreparation = null,
+  startupDiagnostics = null,
 } = {}) {
   const runtime = electron ?? await import("electron");
   const app = runtime?.app;
@@ -1110,6 +1187,7 @@ export async function launchElectronShell({
     throw new TypeError("Electron app runtime is unavailable");
   }
   try {
+    await markStartupDiagnostics(startupDiagnostics, "runtime_qualification");
     const qualificationContext = await createWindowsElectronQualificationContext({
       app,
       environment,
@@ -1132,6 +1210,8 @@ export async function launchElectronShell({
       environment,
       platform,
       architecture,
+      onStartupPhase: (phase) => markStartupDiagnostics(startupDiagnostics, phase),
+      startStartupDiagnostics: () => writeStartupDiagnostics(startupDiagnostics, "start"),
       getuid,
       getUserInfo,
     });
@@ -1140,11 +1220,14 @@ export async function launchElectronShell({
         || preparation.app !== app) {
       throw shellError("electron_configuration_invalid");
     }
+    await writeStartupDiagnostics(startupDiagnostics, "start");
     const {
       accountlessHostedRehearsal,
       accountlessSignedStagingRehearsal,
+      crashCapture,
       productionDistribution,
     } = preparation;
+    await markStartupDiagnostics(startupDiagnostics, "platform_gate");
     assertElectronPlatformGate({
       platform,
       architecture,
@@ -1152,6 +1235,7 @@ export async function launchElectronShell({
       qualificationContext: qualificationContext ?? linuxQualificationContext,
       productionDistribution,
     });
+    await markStartupDiagnostics(startupDiagnostics, "runtime_paths");
     const paths = resolveCompanionLaunchPaths({
       app,
       companionScript,
@@ -1213,6 +1297,7 @@ export async function launchElectronShell({
       && architecture === "x64"
       && productionDistribution.target === "win32-x64"
       ? createWindowsNormalCandidateCredentialHandover() : null;
+    await markStartupDiagnostics(startupDiagnostics, "credential_wiring");
     // Signed staging retains the verified native handover and its main-process
     // FD3 factory, but it never gives the companion the normal FD4 broker or
     // reads normal broker services during startup.
@@ -1276,8 +1361,11 @@ export async function launchElectronShell({
       qualificationContext,
       platform,
       architecture,
+      crashCapture,
       productionDistribution: productionEnabled ? productionDistribution : undefined,
       prepareNativeHandover: macCredentialHandover?.prepareNativeHandover,
+      onStartupPhase: (phase) => markStartupDiagnostics(startupDiagnostics, phase),
+      onStartupStop: (code) => writeStartupDiagnostics(startupDiagnostics, "stop", code),
       accountlessProduction: accountlessProductionEnabled ? {
         origin: DEPLOYMENT_ENDPOINTS.public.origin,
         policyVersion: productionDistribution.contributionPolicy,
@@ -1312,12 +1400,24 @@ export async function launchElectronShell({
       platform,
       qualificationContext,
     });
+    if (desktop.lifecycle === null) {
+      const stop = desktop.secureStorageReason === undefined
+        ? desktop.status
+        : `secure_storage_${desktop.secureStorageReason}`;
+      await writeStartupDiagnostics(startupDiagnostics, "stop", stop);
+    } else {
+      await writeStartupDiagnostics(startupDiagnostics, "complete");
+    }
     return desktop.lifecycle;
   } catch (error) {
     // This includes platform-gate and dependency/configuration failures that
     // occur before the lifecycle owns a shutdown path.
-    if (emitFailureDiagnostic) emitEntryFailureDiagnostic(writeDiagnostic);
-    app.quit?.();
+    await writeStartupDiagnostics(startupDiagnostics, "fail", error);
+    if (emitFailureDiagnostic) {
+      quitAfterEntryFailure({ app, dialog: runtime.dialog, writeDiagnostic });
+    } else {
+      app.quit?.();
+    }
     throw error;
   }
 }
@@ -1326,20 +1426,26 @@ export async function launchElectronShell({
 // a desktop launch. An actual Electron process is the only executable caller.
 if (process.versions.electron) {
   const runtime = await import("electron");
+  const startupDiagnostics = createDesktopStartupDiagnostics({ app: runtime?.app });
   let startupPreparation;
   try {
     // Keep this small awaited phase ahead of the ordinary launch promise. In
     // an ESM main process an unawaited launch can lose the race with `ready`.
-    startupPreparation = await prepareElectronShellBootstrap({ electron: runtime });
-  } catch {
-    emitEntryFailureDiagnostic();
-    runtime?.app?.quit?.();
+    startupPreparation = await prepareElectronShellBootstrap({
+      electron: runtime,
+      onStartupPhase: (phase) => markStartupDiagnostics(startupDiagnostics, phase),
+      startStartupDiagnostics: () => writeStartupDiagnostics(startupDiagnostics, "start"),
+    });
+  } catch (error) {
+    await writeStartupDiagnostics(startupDiagnostics, "fail", error);
+    quitAfterEntryFailure({ app: runtime?.app, dialog: runtime?.dialog });
     process.exitCode = 1;
   }
   if (startupPreparation !== undefined) {
     launchElectronShell({
       electron: runtime,
       startupPreparation,
+      startupDiagnostics,
       emitFailureDiagnostic: true,
     })
       .then((lifecycle) => {

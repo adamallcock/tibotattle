@@ -28,13 +28,14 @@ function atomic(db,sql){db.exec('BEGIN IMMEDIATE');try{db.exec(sql);db.exec('COM
 
 export async function prepareBoundedQualification({outputDirectory}={}) {
  assert(typeof outputDirectory==='string'&&outputDirectory.length>0,'OUTPUT_REQUIRED');
- const names=(await readdir(join(root,'migrations'))).filter(n=>/^\d{4}.*\.sql$/.test(n)).sort();assert(names.length===59,'SOURCE_COUNT');
+ // This retained qualification proves only the original 0057–0059 transition.
+ const names=(await readdir(join(root,'migrations'))).filter(n=>/^\d{4}.*\.sql$/.test(n)&&Number(n.slice(0,4))<=59).sort();assert(names.length===59,'SOURCE_COUNT');
  const sources=await Promise.all(names.map(async name=>({name,sql:await readFile(join(root,'migrations',name),'utf8')})));
  assert(sha(sources[57].sql)==='b435fd92d41e7ce8067cc183d7ac153359a9c130a971cba2e1b8b8c1c9cab61b'&&sha(sources[58].sql)==='98afb99dd91e56a96960e6d99096e44c41eec0cd52d5a1e2969dea4ddee3d312','SOURCE_HASH');
  const head=spawnSync('git',['rev-parse','HEAD'],{cwd:root,encoding:'utf8',timeout:5000,maxBuffer:1024});
  assert(head.status===0&&/^[a-f0-9]{40}\s*$/.test(head.stdout),'SOURCE_REVISION');const sourceRevision=head.stdout.trim();
  const committedNames=spawnSync('git',['ls-tree','--full-tree','--name-only',`${sourceRevision}:apps/worker/migrations`],{cwd:root,encoding:'utf8',timeout:5000,maxBuffer:32768});
- assert(committedNames.status===0&&JSON.stringify(committedNames.stdout.trim().split('\n').sort())===JSON.stringify(names),'CANONICAL_NAME_DRIFT');
+ assert(committedNames.status===0&&JSON.stringify(committedNames.stdout.trim().split('\n').filter(n=>Number(n.slice(0,4))<=59).sort())===JSON.stringify(names),'CANONICAL_NAME_DRIFT');
  for(const source of sources){const committed=spawnSync('git',['show',`${sourceRevision}:apps/worker/migrations/${source.name}`],{cwd:root,timeout:5000,maxBuffer:2*1024*1024});source.matchesCommit=committed.status===0&&sha(committed.stdout)===sha(source.sql);}
  const db=new DatabaseSync(':memory:');db.exec('PRAGMA foreign_keys=ON;PRAGMA max_page_count=32768');
  const steps=[];

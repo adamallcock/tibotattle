@@ -235,8 +235,10 @@ function validDesktopCommand(value) {
       : null;
   }
   if (value?.command === "shareCardDownloadCompleted") {
-    return exactObject(value, ["command"], "command")
-      ? Object.freeze({ command: "shareCardDownloadCompleted" })
+    return exactObject(value, ["command", "filename"], "command")
+      && typeof value.filename === "string"
+      && /^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-tibotattle-results(?:-[1-9][0-9]{0,2})?\.png$/u.test(value.filename)
+      ? Object.freeze({ command: "shareCardDownloadCompleted", filename: value.filename })
       : null;
   }
   if (value?.command === "shareCardDownloadFailed") {
@@ -407,13 +409,27 @@ function installDesktopBridge() {
       "revealLatestDownload",
       values,
     ),
+    openLatestDownload: (...values) => noArguments(
+      "openLatestDownload",
+      values,
+    ),
     openDashboardInBrowser: (...values) => noArguments(
       "openDashboardInBrowser",
       values,
     ),
     showDiagnostics: (...values) => noArguments("showDiagnostics", values),
     revealLocalData: (...values) => noArguments("revealLocalData", values),
-    refreshStarted: (...values) => noArguments("refreshStarted", values),
+    getRefreshStatus: (...values) => noArguments("getRefreshStatus", values),
+    refreshStarted: (...values) => oneArgument(
+      "refreshStarted",
+      values,
+      (mode) => enumMethod("refreshStarted", mode, AUTOMATIC_REFRESH_MODES, "mode"),
+    ),
+    refreshHeartbeat: (...values) => oneArgument(
+      "refreshHeartbeat",
+      values,
+      (lease) => refreshLeaseMethod("refreshHeartbeat", lease),
+    ),
     refreshSettled: (...values) => oneArgument(
       "refreshSettled",
       values,

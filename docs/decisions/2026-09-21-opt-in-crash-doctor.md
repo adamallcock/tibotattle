@@ -1,0 +1,75 @@
+---
+title: Opt-in crash capture and support doctor
+date: 2026-09-21
+type: decision-record
+status: current
+---
+
+# Opt-in crash capture and support doctor
+
+The Electron **Show diagnostics** action is the small support doctor. It displays
+the closed, content-free diagnostics projection before offering copy or a
+prefilled GitHub issue. Opening the issue form is a deliberate action; the user
+can edit it before submitting. The issue body contains no raw crash report,
+dump, private path, account identifier, session content, or native error text.
+The GitHub issue form is an external destination, so even its URL may be logged
+by GitHub when opened. Do not add automatic submission or a second support
+ingest route under this decision.
+
+On macOS, native Electron crash capture is separately opt-in and defaults off.
+Its owner-only preference is independent of contribution sharing. A stored opt-in
+starts Electron's Crashpad reporter during early main-process bootstrap with
+`uploadToServer: false` and no submit URL. Dumps may contain process memory and
+private data; they stay in Electron's local Crashpad directory and are never
+attached to the doctor or uploaded by TiboTattle. The doctor can open that
+directory for manual review. Preference changes take effect on the next launch,
+because Electron cannot stop an already-started reporter. A corrupt or
+unavailable preference fails closed. Other platforms do not offer this capture
+path yet.
+
+This captures crashes only after the reporter starts and does not diagnose
+every failure that prevents app startup. The source checkout now has a separate
+read-only macOS command, `npm run diagnose:desktop-crash`, which runs under Node
+without starting Electron. It reads recent Apple crash reports through a bounded
+allowlist, and inspects the local capture preference and dump counts without
+reading dump bytes. It never changes preferences or sends data. Reports it cannot
+parse stay unavailable; the user can inspect them in Console and share only
+reviewed exception type, termination reason, and crashed-thread top frames.
+An explicit `--verbose` mode expands the local result to at most 20 safe symbol
+tokens per crashed thread and at most 40 recent, revalidated companion
+diagnostic notes per profile, including fixed status codes and support references.
+It still excludes raw Apple report text, Crashpad memory dumps, native free-form
+messages, and private paths. No mode automatically sends output.
+The Electron main process also overwrites one owner-only, content-free startup
+result per launch in `startup-diagnostics/startup-diagnostic-v1.json` under the
+selected Electron user-data root, separate from migration-owned settings and
+companion state. Early recording therefore does not occupy a native handover
+target. The independent doctor and explicit private export read this location
+first, falling back to the older `desktop-settings` location only when the new
+record is absent; unsafe or invalid current evidence is not hidden by an older
+record. It contains only version/platform labels, timestamps, the
+last fixed startup phase, outcome, and an allowlisted code. Each startup phase
+now attempts to save its checkpoint before work begins, and deliberate early
+quit paths attempt to save a stopped result before quitting. A handled startup
+failure attempts to save its result before the deliberate quit. When these
+writes succeed, the independent doctor can distinguish credential,
+settings, lifecycle, and updater failure families without retaining an exception
+message or path. The released v0.1.24 journal wrote only its initial and terminal states:
+`in_progress at profile_selection` in that release does not prove the process
+stopped during profile selection; it may have proceeded to a later phase and
+quit before the terminal write.
+The separate `--export-private` mode is an explicit owner action that creates a
+new owner-only local directory outside the source checkout. It copies bounded,
+matching original Apple reports and companion diagnostic log generations under
+fixed names, with a content-free hash manifest. `--include-dumps` is a second
+explicit choice for up to four local Crashpad dumps; total copied bytes are
+capped. The directory is never attached, projected into ordinary diagnostics,
+or transmitted by TiboTattle. Raw contents may contain paths and process memory;
+the owner must review them and choose a private handoff with the maintainer.
+Public issues continue to receive only reviewed summary text.
+The doctor script is included in the reviewed Electron runtime closure and can
+be run through the installed executable with `ELECTRON_RUN_AS_NODE=1`, which
+bypasses the app entrypoint. Source tests validate the preference, startup
+journal, and projection boundaries. Packaged-source validation establishes the
+file is present; installed, signed-release, and updater behavior require their
+separate evidence.

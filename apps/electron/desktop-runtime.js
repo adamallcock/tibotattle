@@ -117,6 +117,7 @@ const ACCOUNTLESS_HOSTED_REHEARSAL_ENVIRONMENT_KEYS = Object.freeze([
   "USAGE_MONITOR_CENTRAL_ORIGIN",
   "USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE",
   "USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE",
+  "USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE",
   "USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY",
   "USAGE_MONITOR_PREPARED_DIRECTORY",
   "USAGE_MONITOR_RESOURCE_ROOT",
@@ -587,6 +588,9 @@ async function createRuntimeOwnedDownloadsRegistry({
     return await createDesktopOwnedDownloadRegistry({
       rootPath,
       reveal: (path) => runtime.shell.showItemInFolder(path),
+      open: typeof runtime.shell.openPath === "function"
+        ? async (path) => await runtime.shell.openPath(path) === ""
+        : undefined,
     });
   } catch {
     // A real Electron runtime must not silently fall back to the browser's
@@ -703,6 +707,7 @@ export async function launchDesktopRuntime({
   firstRunReceiptBackend,
   ownedDownloadsRegistry,
   automaticRefreshCadence,
+  crashCapture = null,
   argv,
   accountlessLaboratory,
   accountlessProduction,
@@ -710,6 +715,8 @@ export async function launchDesktopRuntime({
   accountlessSignedStagingRehearsal,
   productionDistribution,
   prepareNativeHandover,
+  onStartupPhase,
+  onStartupStop,
   getuid = typeof process.getuid === "function" ? process.getuid.bind(process) : undefined,
   getUserInfo = userInfo,
   loadProductionUpdater = () => import("electron-updater"),
@@ -724,6 +731,20 @@ export async function launchDesktopRuntime({
     throw new TypeError("companion launch paths are invalid");
   }
   assertObject(environment, "environment");
+  const markStartupPhase = async (phase) => {
+    try {
+      if (typeof onStartupPhase === "function") await onStartupPhase(phase);
+    } catch {
+      // Startup diagnostics are observational and never control startup.
+    }
+  };
+  const stopStartup = async (code) => {
+    try {
+      if (typeof onStartupStop === "function") await onStartupStop(code);
+    } catch {
+      // Startup diagnostics are observational and never control shutdown.
+    }
+  };
   // Test-only loopback composition. Normal main.js does not provide this port.
   // Production is a separate packaged-manifest selection below.
   if (accountlessLaboratory !== undefined) {
@@ -944,6 +965,7 @@ export async function launchDesktopRuntime({
   });
   if (productionDistribution !== undefined) {
     childEnvironment.USAGE_MONITOR_STATE_ROOT = join(userDataPath(app), "companion-state");
+    delete childEnvironment.USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE;
   }
   const sharingDestinationOrigin = selectedAccountlessRehearsal?.origin
     ?? accountlessProduction?.origin ?? accountlessLaboratory?.origin
@@ -998,6 +1020,7 @@ export async function launchDesktopRuntime({
     args: companionArgs,
     cwd: paths.companionCwd,
     environment: childEnvironment,
+    platform,
     attachPrivateChannel: accountlessEnabled ? (channel) => attachAccountlessParentChannel({
       channel,
       readPreference: () => sharingCoordinator.readAuthorization(),
@@ -1037,6 +1060,7 @@ export async function launchDesktopRuntime({
     ? app.requestSingleInstanceLock()
     : true;
   if (!singleInstanceLockAcquired) {
+    await stopStartup("secondary_instance");
     app.quit?.();
     return Object.freeze({
       firstRun: null,
@@ -1095,8 +1119,10 @@ export async function launchDesktopRuntime({
   if (platform !== "darwin") acceptDeepLinkArgv(argv ?? process.argv);
   // Electron's native dialog must be shown only after the app is ready. This
   // does not start the companion, register a login item, or enable updates.
+  await markStartupPhase("app_ready");
   await app.whenReady?.();
   if (prepareNativeHandover !== undefined) {
+    await markStartupPhase("native_handover");
     while (true) {
       let handover;
       try {
@@ -1120,6 +1146,7 @@ export async function launchDesktopRuntime({
           continue;
         }
         deepLinkIntakeCleanup();
+        await stopStartup(`secure_storage_${reason}`);
         app.quit?.();
         return Object.freeze({
           status: "native_handover_blocked",
@@ -1147,6 +1174,7 @@ export async function launchDesktopRuntime({
         buttons: ["Quit"], defaultId: 0, cancelId: 0, noLink: true,
       });
       deepLinkIntakeCleanup();
+      await stopStartup("native_handover_blocked");
       app.quit?.();
       return Object.freeze({ status: "native_handover_blocked", firstRun: null,
         lifecycle: null, supervisor: null, controller: null, settingsStore: null,
@@ -1175,6 +1203,7 @@ export async function launchDesktopRuntime({
   }
   // Establish provenance before the first-run receipt or settings create a new
   // managed marker. Injected test backends never inspect real profile state.
+  await markStartupPhase("installation_state");
   const installationState = sharingInstallationState ?? (injectedSettings
     ? "unknown"
     : await classifyDesktopSharingInstallation({
@@ -1258,10 +1287,14 @@ export async function launchDesktopRuntime({
       rootPath: settingsRootPath,
       windowsProtectedStateStore,
     });
+  await markStartupPhase("first_run");
   const firstRun = await ensureDesktopFirstRunAcknowledged({
     dialog: runtime.dialog,
     receiptBackend: firstRunBackend,
-    quit: () => app.quit?.(),
+    quit: async () => {
+      await stopStartup("startup_stopped");
+      app.quit?.();
+    },
     locale: firstRunLocale,
     systemLocales: desktopSystemLocales,
     production: productionDistribution !== undefined
@@ -1300,6 +1333,7 @@ export async function launchDesktopRuntime({
         enabled: false, policyVersion: null, destinationOrigin: null }),
       updateTransport() {}, dispose() {} };
   }
+  await markStartupPhase("secure_storage");
   if (accountlessNativeCredentialUsesMac && initialSharingSnapshot?.enabled === true) {
     while (true) {
       try {
@@ -1312,6 +1346,7 @@ export async function launchDesktopRuntime({
         }
         deepLinkIntakeCleanup();
         sharingCoordinator.dispose();
+        await stopStartup(`secure_storage_${reason}`);
         app.quit?.();
         return Object.freeze({
           status: "secure_storage_blocked",
@@ -1328,6 +1363,7 @@ export async function launchDesktopRuntime({
       }
     }
   }
+  await markStartupPhase("runtime_services");
   const runtimeOwnedDownloadsRegistry = await createRuntimeOwnedDownloadsRegistry({
     app,
     runtime,
@@ -1422,6 +1458,7 @@ export async function launchDesktopRuntime({
       build: snapshot?.about?.build ?? environment.TIBOTATTLE_BUILD_ID,
       lifecycle: lifecycle?.state,
       settings: snapshot?.settings,
+      refresh: controller?.refreshStatus?.(),
     }));
   }
 
@@ -1433,21 +1470,65 @@ export async function launchDesktopRuntime({
       locale: activeDesktopLocale,
       systemLocales: desktopSystemLocales,
     };
-    const detail = await collectDesktopDiagnostics();
+    const capture = crashCapture === null ? null : await crashCapture.get();
+    const detail = `${await collectDesktopDiagnostics()}\n`
+      + `crash_capture_available: ${capture?.available === true}\n`
+      + `crash_capture_next_launch: ${platform !== "darwin" ? "unsupported"
+        : capture?.available !== true ? "unavailable" : capture.enabled}\n`
+      + `crash_capture_active_this_launch: ${capture?.active === true}\n`
+      + "crash_report_upload: false\n";
+    const captureAction = capture?.available === true
+      ? desktopText(capture.enabled
+        ? "electron.diagnostics.disableCapture" : "electron.diagnostics.enableCapture", {}, textOptions)
+      : null;
+    const openCrashFolder = platform === "darwin"
+      && capture !== null
+      && typeof runtime.shell?.openPath === "function";
+    const actions = ["copy", ...(captureAction === null ? [] : ["capture"]),
+      ...(openCrashFolder ? ["folder"] : []), "support", "done"];
+    const buttons = actions.map((action) => action === "capture" ? captureAction
+      : desktopText(`electron.diagnostics.${action === "folder" ? "openCrashFolder"
+        : action === "support" ? "prepareSupportIssue" : action}`, {}, textOptions));
     const response = await runtime.dialog.showMessageBox({
       type: "info",
       title: desktopText("electron.diagnostics.title", {}, textOptions),
       message: desktopText("electron.diagnostics.message", {}, textOptions),
       detail,
-      buttons: [
-        desktopText("electron.diagnostics.copy", {}, textOptions),
-        desktopText("electron.diagnostics.done", {}, textOptions),
-      ],
-      defaultId: 1,
-      cancelId: 1,
+      buttons,
+      defaultId: buttons.length - 1,
+      cancelId: buttons.length - 1,
       noLink: true,
     });
-    if (response?.response !== 0) return Object.freeze({ status: "shown" });
+    const action = actions[response?.response] ?? "done";
+    if (action === "capture") {
+      const next = await crashCapture.setEnabled(!capture.enabled);
+      return Object.freeze({ status: next.enabled === capture.enabled
+        ? "capture_preference_unavailable" : "capture_changed_next_launch" });
+    }
+    if (action === "folder") {
+      try {
+        const error = await runtime.shell.openPath(app.getPath("crashDumps"));
+        return Object.freeze({ status: error === ""
+          ? "crash_folder_opened" : "crash_folder_unavailable" });
+      } catch {
+        return Object.freeze({ status: "crash_folder_unavailable" });
+      }
+    }
+    if (action === "support") {
+      const url = new URL("https://github.com/adamallcock/tibotattle/issues/new");
+      url.searchParams.set("title", "TiboTattle doctor report");
+      url.searchParams.set("body", `Please describe what happened and review this report before submitting. Do not attach raw crash dumps or unreviewed Apple reports.\n\n\`\`\`text\n${detail}\`\`\``);
+      if (url.href.length > 4096 || typeof runtime.shell?.openExternal !== "function") {
+        return Object.freeze({ status: "support_unavailable" });
+      }
+      try {
+        await runtime.shell.openExternal(url.href);
+        return Object.freeze({ status: "support_prepared" });
+      } catch {
+        return Object.freeze({ status: "support_unavailable" });
+      }
+    }
+    if (action !== "copy") return Object.freeze({ status: "shown" });
     if (typeof runtime.clipboard?.writeText !== "function") {
       return Object.freeze({ status: "copy_unavailable" });
     }
@@ -1639,6 +1720,7 @@ export async function launchDesktopRuntime({
   let initialDesktopSnapshot;
   let firstRunLogin = Object.freeze({ status: "not_requested" });
   let recoverySettingsAction;
+  await markStartupPhase("settings");
   try {
     initialDesktopSnapshot = await controller.initialize();
     const firstRunLoginRegistrar = createDesktopFirstRunLoginRegistrar({
@@ -1807,7 +1889,9 @@ export async function launchDesktopRuntime({
               { sender: event?.sender },
             ) === true;
           }
-          if (action !== "refreshStarted"
+          if (action !== "getRefreshStatus"
+              && action !== "refreshStarted"
+              && action !== "refreshHeartbeat"
               && action !== "refreshSettled"
               && action !== "toggleSidebar") return true;
           return lifecycle?.isAuthorizedDashboardFrame?.(
@@ -1837,8 +1921,10 @@ export async function launchDesktopRuntime({
         runtime.nativeTheme.removeListener?.("updated", onNativeThemeUpdated);
       };
     }
+    await markStartupPhase("lifecycle");
     await lifecycle.start();
     if (productionDistribution !== undefined) {
+      await markStartupPhase("updater");
       // Electron's built-in autoUpdater has no supported Linux implementation
       // and lacks electron-updater's explicit download contract on every
       // platform. The selected package consistently uses the pinned updater.
@@ -1858,6 +1944,7 @@ export async function launchDesktopRuntime({
       });
       await updater.start();
     }
+    await markStartupPhase("ready");
   } catch (error) {
     deepLinkIntakeCleanup();
     await disposeControllerAndIpc();
@@ -1894,6 +1981,7 @@ export async function launchDesktopRuntime({
     isAuthorizedSettingsFrame: lifecycle.isAuthorizedSettingsFrame,
     isAuthorizedDesktopDownloadContext: lifecycle.isAuthorizedDesktopDownloadContext,
     revealLatestDownload: lifecycle.revealLatestDownload,
+    openLatestDownload: lifecycle.openLatestDownload,
     get state() {
       return lifecycle.state;
     },

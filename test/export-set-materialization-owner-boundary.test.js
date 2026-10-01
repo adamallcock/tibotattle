@@ -65,6 +65,7 @@ function deferredMaterializer({ onLease = null, onOpen = null } = {}) {
       },
       projectOwnerOnlyExportArtifactPath: noop,
       readOwnerOnlyExportArtifactIfPresent: noop,
+      withOwnerOnlyExportDestinationBatch: async (destination, callback) => callback(destination),
       recoverOwnerOnlyPairTransactionsForDestination: noop,
       writeOwnerOnlyPairNoClobberForDestination: noop,
     },
@@ -237,6 +238,7 @@ function lifecycleHarness({
         const bytes = artifacts.get(basename);
         return bytes === undefined ? { status: "absent" } : { status: "present", bytes };
       },
+      withOwnerOnlyExportDestinationBatch: async (destination, callback) => callback(destination),
       recoverOwnerOnlyPairTransactionsForDestination: async () => {},
       writeOwnerOnlyPairNoClobberForDestination: async (_destination, request) => {
         calls.write += 1;

@@ -1,4 +1,7 @@
 import {
+  speedModeApiMultiplier,
+} from "@app-usagemonitor/accounting";
+import {
   MODEL_COMPOSITION_POLICY,
   SEVEN_DAY_WINDOW_MINUTES,
   compositionExpectedPp,
@@ -456,13 +459,54 @@ function buildRollingResidual(rolling) {
 
 function intervalSpeedMode(row) {
   const counts = row.tierUsageEventCounts ?? {};
-  if ((counts.fast ?? 0) > 0 && (counts.standard ?? 0) === 0 && (counts.unknown ?? 0) === 0) return "fast";
-  if ((counts.standard ?? 0) > 0 && (counts.fast ?? 0) === 0 && (counts.unknown ?? 0) === 0) return "standard";
+  const present = Object.entries(counts).filter(([, count]) => count > 0);
+  if (present.length === 1 && ["standard", "fast", "ultrafast"].includes(present[0][0])) return present[0][0];
   return "unknown";
+}
+
+function ultrafastApiCost(row) {
+  // The interval carries model costs and price cards, but no cost-by-speed
+  // crossing. Event counts cannot allocate differently priced dollars between
+  // modes, so only a wholly Ultrafast interval can be priced exactly here.
+  if (intervalSpeedMode(row) !== "ultrafast"
+      || row.tierUsageEventCounts.ultrafast !== row.marginalUsageEventCount
+      || (row.quality?.pricingWarnings?.length ?? 0) > 0) return null;
+  if (typeof row.priorObservedAt !== "string" || typeof row.eventTime !== "string") return null;
+  const start = Date.parse(row.priorObservedAt);
+  const end = Date.parse(row.eventTime);
+  // Price epochs are day-granular. Without per-event timestamps, a missing
+  // start or a date-spanning aggregate cannot prove eligibility for every event.
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start > end
+      || row.priorObservedAt.slice(0, 10) !== row.eventTime.slice(0, 10)) return null;
+  const models = Object.entries(row.modelMix ?? {});
+  if (models.length === 0) return null;
+  let rawCost = 0;
+  let events = 0;
+  let weightedCost = 0;
+  for (const [model, summary] of models) {
+    if (!Number.isFinite(summary?.costUsd) || summary.costUsd < 0
+        || !Number.isSafeInteger(summary?.events) || summary.events < 0) return null;
+    const multiplier = speedModeApiMultiplier(model, "ultrafast", {
+      eventTime: row.eventTime,
+      standardPriceCardIds: row.priceCardIds ?? [],
+    });
+    if (multiplier === null) return null;
+    rawCost += summary.costUsd;
+    events += summary.events;
+    weightedCost += summary.costUsd * multiplier;
+  }
+  return events === row.marginalUsageEventCount
+    && Math.abs(rawCost - row.marginalApiPricedUsd) <= 1e-8
+    ? weightedCost : null;
+}
+
+function addKnownCosts(left, right) {
+  return Number.isFinite(left) && Number.isFinite(right) ? left + right : null;
 }
 
 function tierWeightedCost(row, fastMultiplier) {
   const counts = row.tierUsageEventCounts ?? {};
+  if ((counts.ultrafast ?? 0) > 0) return ultrafastApiCost(row);
   const fast = counts.fast ?? 0;
   const standard = counts.standard ?? 0;
   const unknown = counts.unknown ?? 0;
@@ -474,20 +518,21 @@ function tierWeightedCost(row, fastMultiplier) {
 function summarizeIntervalSegment(rows, { fastMultiplier }) {
   if (rows.length === 0) return null;
   const ordered = [...rows].sort((left, right) => left.eventTime.localeCompare(right.eventTime));
-  const costs = { fast: 0, standard: 0, unknown: 0 };
-  const events = { fast: 0, standard: 0, unknown: 0 };
+  const costs = { fast: 0, standard: 0, ultrafast: 0, unknown: 0 };
+  const events = { fast: 0, standard: 0, ultrafast: 0, unknown: 0 };
   let weightedCost = 0;
   let endUsed = ordered[0].priorUsedPercent;
   for (const row of ordered) {
     const mode = intervalSpeedMode(row);
     costs[mode] += row.marginalApiPricedUsd;
-    events[mode] += row.marginalUsageEventCount ?? 0;
-    weightedCost += tierWeightedCost(row, fastMultiplier);
+    for (const speed of Object.keys(events)) events[speed] += row.tierUsageEventCounts?.[speed] ?? 0;
+    if (!row.tierUsageEventCounts) events.unknown += row.marginalUsageEventCount ?? 0;
+    weightedCost = addKnownCosts(weightedCost, tierWeightedCost(row, fastMultiplier));
     endUsed = Math.max(endUsed, row.nextUsedPercent);
   }
   const startUsed = ordered[0].priorUsedPercent;
   const quotaChange = endUsed - startUsed;
-  const rawCost = costs.fast + costs.standard + costs.unknown;
+  const rawCost = costs.fast + costs.standard + costs.ultrafast + costs.unknown;
   return {
     firstObservedAt: ordered[0].eventTime,
     lastObservedAt: ordered.at(-1).eventTime,
@@ -500,11 +545,13 @@ function summarizeIntervalSegment(rows, { fastMultiplier }) {
     endUsedPercent: endUsed,
     quotaChangePp: quotaChange,
     rawImpliedCapacityUsd: quotaChange > 0 ? round(rawCost * 100 / quotaChange) : null,
-    tierWeightedImpliedCapacityUsd: quotaChange > 0 ? round(weightedCost * 100 / quotaChange) : null,
+    tierWeightedImpliedCapacityUsd: quotaChange > 0 && weightedCost !== null ? round(weightedCost * 100 / quotaChange) : null,
   };
 }
 
 export function analyzeFastDiagnostic(diagnostic, {
+  // Preserved assumption for the dated July incident diagnostic. It is not a
+  // current included-allowance policy and must not be reused as an Ultra rate.
   fastMultiplier = 2.5,
   fastStart = "2026-07-13T14:00:00.000Z",
   fastEnd = "2026-07-13T18:00:00.000Z",
@@ -524,6 +571,13 @@ export function analyzeFastDiagnostic(diagnostic, {
   if (!fast || !reference || !Number.isFinite(reference.rawImpliedCapacityUsd)) {
     throw new Error("Fast diagnostic cannot form the requested Fast and reference segments");
   }
+  if (reference.eventCounts.ultrafast > 0) {
+    throw new Error("Fast diagnostic cannot use Ultrafast usage as a Standard reference");
+  }
+  const hasUltrafast = intervals.some((row) => (row.tierUsageEventCounts?.ultrafast ?? 0) > 0);
+  const weightedSeries = hasUltrafast
+    ? "Expected with captured speed pricing"
+    : `Expected with captured Fast ${fastMultiplier}x`;
 
   const buckets = new Map();
   let monotonicUsed = intervals[0].priorUsedPercent;
@@ -537,15 +591,17 @@ export function analyzeFastDiagnostic(diagnostic, {
       weightedCostUsd: 0,
       eventCount: 0,
       fastEventCount: 0,
+      ultrafastEventCount: 0,
       standardEventCount: 0,
       unknownEventCount: 0,
       startUsedPercent: canonicalPrior,
       endUsedPercent: monotonicUsed,
     };
     bucket.rawCostUsd += row.marginalApiPricedUsd;
-    bucket.weightedCostUsd += tierWeightedCost(row, fastMultiplier);
+    bucket.weightedCostUsd = addKnownCosts(bucket.weightedCostUsd, tierWeightedCost(row, fastMultiplier));
     bucket.eventCount += row.marginalUsageEventCount ?? 0;
     bucket.fastEventCount += row.tierUsageEventCounts?.fast ?? 0;
+    bucket.ultrafastEventCount += row.tierUsageEventCounts?.ultrafast ?? 0;
     bucket.standardEventCount += row.tierUsageEventCounts?.standard ?? 0;
     bucket.unknownEventCount += row.tierUsageEventCounts?.unknown ?? 0;
     bucket.endUsedPercent = monotonicUsed;
@@ -564,6 +620,7 @@ export function analyzeFastDiagnostic(diagnostic, {
       weightedCostUsd: 0,
       eventCount: 0,
       fastEventCount: 0,
+      ultrafastEventCount: 0,
       standardEventCount: 0,
       unknownEventCount: 0,
       startUsedPercent: carryUsed,
@@ -586,13 +643,14 @@ export function analyzeFastDiagnostic(diagnostic, {
       tier_weighted_cost_usd: round(bucket.weightedCostUsd),
       usage_events: bucket.eventCount,
       fast_events: bucket.fastEventCount,
+      ultrafast_events: bucket.ultrafastEventCount,
       standard_events: bucket.standardEventCount,
       unknown_events: bucket.unknownEventCount,
     };
     return [
       { ...shared, series: "Observed quota change", quota_change_pp: round(bucket.endUsedPercent - bucket.startUsedPercent) },
       { ...shared, series: "Expected if all Standard", quota_change_pp: round(bucket.rawCostUsd * 100 / reference.rawImpliedCapacityUsd) },
-      { ...shared, series: `Expected with captured Fast ${fastMultiplier}x`, quota_change_pp: round(bucket.weightedCostUsd * 100 / reference.rawImpliedCapacityUsd) },
+      { ...shared, series: weightedSeries, quota_change_pp: bucket.weightedCostUsd === null ? null : round(bucket.weightedCostUsd * 100 / reference.rawImpliedCapacityUsd) },
     ];
   });
 
@@ -603,10 +661,10 @@ export function analyzeFastDiagnostic(diagnostic, {
       const window = contiguousBuckets.slice(index, index + windowHours);
       const windowEnd = new Date(Date.parse(bucket.timestamp) + 3_600_000).toISOString();
       const rawCost = window.reduce((sum, row) => sum + row.rawCostUsd, 0);
-      const weightedCost = window.reduce((sum, row) => sum + row.weightedCostUsd, 0);
+      const weightedCost = window.reduce((sum, row) => addKnownCosts(sum, row.weightedCostUsd), 0);
       const observedChange = bucket.endUsedPercent - window[0].startUsedPercent;
       const rawExpected = rawCost * 100 / reference.rawImpliedCapacityUsd;
-      const weightedExpected = weightedCost * 100 / reference.rawImpliedCapacityUsd;
+      const weightedExpected = weightedCost === null ? null : weightedCost * 100 / reference.rawImpliedCapacityUsd;
       return {
         window_end_utc: windowEnd,
         window_end_utc_label: displayHour(windowEnd, "UTC", "short"),
@@ -616,33 +674,34 @@ export function analyzeFastDiagnostic(diagnostic, {
         raw_expected_quota_change_pp: round(rawExpected),
         weighted_expected_quota_change_pp: round(weightedExpected),
         raw_residual_pp: round(observedChange - rawExpected),
-        weighted_residual_pp: round(observedChange - weightedExpected),
+        weighted_residual_pp: weightedExpected === null ? null : round(observedChange - weightedExpected),
         api_cost_usd: round(rawCost),
         tier_weighted_cost_usd: round(weightedCost),
         usage_events: window.reduce((sum, row) => sum + row.eventCount, 0),
         fast_events: window.reduce((sum, row) => sum + row.fastEventCount, 0),
+        ultrafast_events: window.reduce((sum, row) => sum + row.ultrafastEventCount, 0),
       };
     });
     windowRowsByHours[windowHours] = windowRows;
     const focal = windowRows.filter((row) => row.window_end_utc > fastStart && row.window_end_utc <= fastEnd);
-    const meanAbsolute = (field) => focal.length > 0
+    const meanAbsolute = (field) => focal.length > 0 && focal.every((row) => Number.isFinite(row[field]))
       ? focal.reduce((sum, row) => sum + Math.abs(row[field]), 0) / focal.length
       : null;
     const rawMae = meanAbsolute("raw_residual_pp");
     const weightedMae = meanAbsolute("weighted_residual_pp");
     windowDiagnostics.push({
       window_hours: windowHours,
-      focal_window: "July 13 captured Fast period",
+      focal_window: hasUltrafast ? "Captured speed-mode period" : "July 13 captured Fast period",
       focal_points: focal.length,
       raw_mae_pp: round(rawMae),
       weighted_mae_pp: round(weightedMae),
-      weighted_mae_reduction_fraction: Number.isFinite(rawMae) && rawMae > 0
+      weighted_mae_reduction_fraction: Number.isFinite(rawMae) && rawMae > 0 && Number.isFinite(weightedMae)
         ? round(1 - weightedMae / rawMae)
         : null,
       raw_peak_absolute_residual_pp: focal.length > 0
         ? round(Math.max(...focal.map((row) => Math.abs(row.raw_residual_pp))))
         : null,
-      weighted_peak_absolute_residual_pp: focal.length > 0
+      weighted_peak_absolute_residual_pp: focal.length > 0 && focal.every((row) => Number.isFinite(row.weighted_residual_pp))
         ? round(Math.max(...focal.map((row) => Math.abs(row.weighted_residual_pp))))
         : null,
     });
@@ -650,10 +709,10 @@ export function analyzeFastDiagnostic(diagnostic, {
 
   const segmentTable = [
     {
-      segment: "Captured Fast run",
+      segment: fast.eventCounts.ultrafast > 0 ? "Captured speed-mode run" : "Captured Fast run",
       first_observed_at: fast.firstObservedAt,
       last_observed_at: fast.lastObservedAt,
-      speed_evidence: `${fast.eventCounts.fast} Fast events`,
+      speed_evidence: `${fast.eventCounts.fast} Fast events${fast.eventCounts.ultrafast > 0 ? ` + ${fast.eventCounts.ultrafast} Ultrafast events` : ""}`,
       quota_change_pp: fast.quotaChangePp,
       standard_api_cost_usd: fast.rawCostUsd,
       weighted_api_equivalent_usd: fast.tierWeightedCostUsd,
@@ -675,6 +734,7 @@ export function analyzeFastDiagnostic(diagnostic, {
 
   return {
     fastMultiplier,
+    ...(hasUltrafast ? { ultrafastWeightingBasis: "published_api_price_ratio_not_included_allowance" } : {}),
     referenceCapacityUsd: reference.rawImpliedCapacityUsd,
     fast,
     reference,

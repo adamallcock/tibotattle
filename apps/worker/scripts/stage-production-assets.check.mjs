@@ -6,6 +6,7 @@ import {
   mkdir,
   readFile,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -46,11 +47,13 @@ async function fixture() {
     "community-view.js": "export const communityView = true;\n",
     "community.html": '<!doctype html><script type="module" src="./community.js"></script>\n',
     "community.js": 'import "./install-cta.js";\nconsole.log("community");\n',
+    "dashboard-ui.js": "export const dashboardUi = true;\n",
     "docs.html": "<!doctype html><title>public docs</title>\n",
     "github.svg": "<svg></svg>\n",
     "i18n.generated.js": "export const messages = {};\n",
     "index.html": '<!doctype html><script type="module" src="./community.js"></script>\n',
     "install-cta.js": "export const installCta = true;\n",
+    "last-known-good.js": "export const retainedPublicCache = true;\n",
     "localization.js": "export const localization = true;\n",
     "model-catalog.generated.js": "export const REVIEWED_MODEL_CATALOG = [];\n",
     "privacy.html": "<!doctype html><title>public privacy</title>\n",
@@ -65,7 +68,21 @@ async function fixture() {
     "social-preview.png": "reviewed social preview\n",
     "styles.css": "body { color: green; }\n",
     "tibotattle-icon.png": Buffer.from("reviewed public brand asset\n"),
-    "tibotattle-weekly-preview.jpg": "reviewed weekly preview\n",
+    "allowance-tank-renderer.js": "export const allowanceTankRenderer = true;\n",
+    "allowance-tanks.js": "export const allowanceTanks = true;\n",
+    "cache-reuse-matrix.css": ".cache-reuse-matrix { color: green; }\n",
+    "cache-reuse-matrix.js": "export const cacheReuseMatrix = true;\n",
+    "codex-color.svg": "<svg></svg>\n",
+    "feature-allowance.jpg": Buffer.from("reviewed feature poster\n"),
+    "feature-allowance.mp4": Buffer.from("reviewed feature recording\n"),
+    "feature-insights.js": "export const featureInsights = true;\n",
+    "feature-tour.css": ".feature-tour { color: green; }\n",
+    "feature-tour.js": "export const featureTour = true;\n",
+    "feature-value.png": Buffer.from("reviewed feature still\n"),
+    "feature-week.js": "export const featureWeek = true;\n",
+    "model-performance.css": ".performance-card { color: green; }\n",
+    "model-performance.js": "export const modelPerformance = true;\n",
+    "trends-horizon.js": "export const trendsHorizon = true;\n",
     "ui-format.js": "export const uiFormat = true;\n",
     "x.svg": "<svg></svg>\n",
   };
@@ -102,6 +119,7 @@ async function fixture() {
     publicSource,
     destination: join(root, ".release-build", "worker-assets"),
     generatedFiles,
+    sourceCommit: git(root, ["rev-parse", "HEAD"]).trim(),
   };
 }
 
@@ -222,6 +240,13 @@ test("stages only verified generated public assets and maps the community entry 
     await readFile(join(value.destination, "tibotattle-icon.png")),
     value.generatedFiles["tibotattle-icon.png"],
   );
+  for (const media of ["feature-allowance.mp4", "feature-allowance.jpg", "feature-value.png"]) {
+    assert.deepEqual(
+      await readFile(join(value.destination, media)),
+      value.generatedFiles[media],
+      media,
+    );
+  }
   for (const publicRoute of [
     "404.html",
     "community.html",
@@ -262,6 +287,66 @@ test("stages only verified generated public assets and maps the community entry 
       destinationDirectory: value.destination,
     }),
     /does not match the source snapshot/u,
+  );
+
+  const manifestSha256 = createHash("sha256")
+    .update(await readFile(join(value.source, "release-site-manifest.json")))
+    .digest("hex");
+  const retained = await stageProductionAssets({
+    repositoryRoot: value.root,
+    sourceDirectory: value.source,
+    destinationDirectory: value.destination,
+    retainedPublicSourceCommit: value.sourceCommit,
+    expectedLiveManifestSha256: manifestSha256,
+  });
+  assert.equal(retained.sourceCommit, git(value.root, ["rev-parse", "HEAD"]).trim());
+  assert.equal(retained.publicSourceCommit, value.sourceCommit);
+  assert.equal(retained.manifestSha256, manifestSha256);
+
+  await assert.rejects(
+    stageProductionAssets({
+      repositoryRoot: value.root,
+      sourceDirectory: value.source,
+      destinationDirectory: value.destination,
+      retainedPublicSourceCommit: value.sourceCommit,
+      expectedLiveManifestSha256: "0".repeat(64),
+    }),
+    /does not match the expected live manifest/u,
+  );
+  await assert.rejects(
+    stageProductionAssets({
+      repositoryRoot: value.root,
+      sourceDirectory: value.source,
+      destinationDirectory: value.destination,
+      retainedPublicSourceCommit: value.sourceCommit.slice(0, 7),
+      expectedLiveManifestSha256: manifestSha256,
+    }),
+    /40-character lowercase Git commit/u,
+  );
+  await assert.rejects(
+    stageProductionAssets({
+      repositoryRoot: value.root,
+      sourceDirectory: value.source,
+      destinationDirectory: value.destination,
+      retainedPublicSourceCommit: value.sourceCommit,
+    }),
+    /must be supplied together/u,
+  );
+
+  await rm(join(value.publicSource, "community.js"));
+  await symlink("community.html", join(value.publicSource, "community.js"));
+  git(value.root, ["add", "-A", "apps/web/public/community.js"]);
+  git(value.root, ["commit", "--quiet", "-m", "symlink source candidate"]);
+  const symlinkCommit = git(value.root, ["rev-parse", "HEAD"]).trim();
+  await assert.rejects(
+    stageProductionAssets({
+      repositoryRoot: value.root,
+      sourceDirectory: value.source,
+      destinationDirectory: value.destination,
+      retainedPublicSourceCommit: symlinkCommit,
+      expectedLiveManifestSha256: manifestSha256,
+    }),
+    /not a regular file/u,
   );
 });
 

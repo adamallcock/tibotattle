@@ -314,6 +314,13 @@ export function createLocalUnifiedCompanionProjectionReader({
     if (typeof constructor !== "function") throw new TypeError("WorkerClass must be a constructor");
     if (closed) throw error("reader_closed");
     if (signal?.aborted) throw error("aborted");
+    // A deferred projection is a fixed unavailable result. It does not read
+    // the index, so it must not wait behind a full-history worker job: the
+    // quick quota snapshot depends on this answer while that job may take
+    // minutes against an owner's accumulated history.
+    if (selected.operation !== "work-usage" && selected.mode === "deferred") {
+      return readLocalUnifiedCompanionProjection({ ...selected, signal });
+    }
     if (queue.length >= maxQueueSize) throw error("queue_full");
     return new Promise((resolve, reject) => {
       const job = { id: ++nextId, options: selected, signal, WorkerClass: constructor,

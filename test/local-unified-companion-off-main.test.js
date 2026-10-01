@@ -322,6 +322,38 @@ test("persistent deferred reads never construct a worker", async () => {
   } finally { await reader.close(); }
 });
 
+test("deferred reads bypass an occupied full-history worker queue", async () => {
+  let instance;
+  class HeldWorker extends EventEmitter {
+    constructor() { super(); instance = this; this.requests = []; }
+    postMessage(message) { this.requests.push(message); }
+    terminate() { return Promise.resolve(1); }
+    ref() {}
+    unref() {}
+  }
+  const reader = createLocalUnifiedCompanionProjectionReader({
+    platform: "darwin", WorkerClass: HeldWorker, maxQueueSize: 1,
+  });
+  const active = reader({ indexFile: "/absent" });
+  const queued = reader({ indexFile: "/absent" });
+  const activeClosed = assert.rejects(active, { code: "local_unified_companion_projection_reader_closed" });
+  const queuedClosed = assert.rejects(queued, { code: "local_unified_companion_projection_reader_closed" });
+  try {
+    const deferred = await reader({ indexFile: "/absent", mode: "deferred" });
+    assert.equal(deferred.status, "deferred");
+    assert.equal(deferred.errorCode, "local_unified_index_deferred");
+    assert.equal(instance.requests.length, 1);
+    const aborted = new AbortController();
+    aborted.abort();
+    await assert.rejects(reader({ indexFile: "/absent", mode: "deferred" }, {
+      signal: aborted.signal,
+    }), { code: "local_unified_companion_projection_aborted" });
+  } finally {
+    await reader.close();
+    await Promise.all([activeClosed, queuedClosed]);
+  }
+});
+
 test("direct fallback cancels active reads, recovers, and closes outstanding reads", async () => {
   const { root, indexFile } = await createProjectionIndex("unified-companion-persistent-direct-");
   class RefusingWorker { constructor() { throw new Error("must not start"); } }

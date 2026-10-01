@@ -533,6 +533,44 @@ bool SearchScopeContainsKeychain(
   return false;
 }
 
+// A locked Keychain can return errSecAuthFailed for a secret read, the same
+// code used for an ACL denial. Recheck only the fixed modern item without
+// requesting secret bytes. A unique item in the captured scope whose own
+// Keychain is locked is sufficient to report retryable locked storage; every
+// other authorization failure remains denied.
+ItemStatus StatusForModernAuthFailureNoInteraction(
+    const CapabilitySpec& capability,
+    const CapturedSearchScope& search_scope,
+    OSStatus status) {
+  if (status != errSecAuthFailed) return StatusFromSecurity(status);
+  CFMutableDictionaryRef query = BaseQuery(capability, false, search_scope.value);
+  if (query == nullptr) return ItemStatus::kDenied;
+  CFDictionarySetValue(query, kSecMatchLimit, kSecMatchLimitAll);
+  CFDictionarySetValue(query, kSecReturnRef, kCFBooleanTrue);
+  CFTypeRef items = nullptr;
+  const OSStatus lookup_status = SecItemCopyMatching(query, &items);
+  CFRelease(query);
+  if (lookup_status != errSecSuccess || items == nullptr
+      || CFGetTypeID(items) != CFArrayGetTypeID()
+      || CFArrayGetCount(static_cast<CFArrayRef>(items)) != 1) {
+    if (items != nullptr) CFRelease(items);
+    return ItemStatus::kDenied;
+  }
+  const CFTypeRef item = CFArrayGetValueAtIndex(static_cast<CFArrayRef>(items), 0);
+  SecKeychainRef owner = nullptr;
+  const OSStatus owner_status = item != nullptr
+      && CFGetTypeID(item) == SecKeychainItemGetTypeID()
+    ? SecKeychainItemCopyKeychain(
+        static_cast<SecKeychainItemRef>(const_cast<void*>(item)), &owner)
+    : errSecParam;
+  const bool owner_is_locked = owner_status == errSecSuccess
+    && SearchScopeContainsKeychain(search_scope, owner)
+    && KeychainStatusForAbsenceNoInteraction(owner) == ItemStatus::kLocked;
+  if (owner != nullptr) CFRelease(owner);
+  CFRelease(items);
+  return owner_is_locked ? ItemStatus::kLocked : ItemStatus::kDenied;
+}
+
 // SecItemAdd does not accept kSecMatchSearchList. After modern and legacy
 // absence have both been proven against that list, choose one unlocked default
 // keychain from the same captured list explicitly with kSecUseKeychain.
@@ -611,7 +649,8 @@ ReadResult ReadModernSecret(const CapabilitySpec& capability) {
     CFTypeRef item = nullptr;
     const OSStatus status = SecItemCopyMatching(query, &item);
     CFRelease(query);
-    result.status = StatusFromSecurity(status);
+    result.status = StatusForModernAuthFailureNoInteraction(
+        capability, search_scope, status);
     if (status == errSecItemNotFound) {
       const ItemStatus absence_scope =
           SearchScopeStatusForAbsenceNoInteraction(search_scope);
@@ -762,7 +801,8 @@ ItemStatus StoreModernSecret(
       result = update_status == errSecSuccess
         ? ItemStatus::kPresent
         : (update_status == errSecItemNotFound ? ItemStatus::kUnknown
-          : StatusFromSecurity(update_status));
+          : StatusForModernAuthFailureNoInteraction(
+              capability, search_scope, update_status));
       return update_status;
     }
 
@@ -805,7 +845,8 @@ ItemStatus RemoveModernSecret(const CapabilitySpec& capability) {
     }
     const OSStatus status = SecItemDelete(query);
     CFRelease(query);
-    result = StatusFromSecurity(status);
+    result = StatusForModernAuthFailureNoInteraction(
+        capability, search_scope, status);
     if (status == errSecItemNotFound) {
       const ItemStatus absence_scope =
           SearchScopeStatusForAbsenceNoInteraction(search_scope);
@@ -928,7 +969,9 @@ ConditionalStatus DeleteModernSecretExact(
     if (read_status != errSecSuccess || item == nullptr
         || CFGetTypeID(item) != CFDictionaryGetTypeID()) {
       if (item != nullptr) CFRelease(item);
-      result = ConditionalStatusFromItemStatus(StatusFromSecurity(read_status));
+      result = ConditionalStatusFromItemStatus(
+          StatusForModernAuthFailureNoInteraction(
+              capability, search_scope, read_status));
       return read_status;
     }
     const CFDictionaryRef attributes = static_cast<CFDictionaryRef>(item);

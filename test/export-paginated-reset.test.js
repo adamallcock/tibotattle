@@ -406,7 +406,7 @@ test("prior checkpoint-scan compatibility refuses resume before recovering a pen
   const value = await fixture(t, [source({ paginated: false })]);
   const sourcePlan = await createCodexExportSourcePlan({ codexHome: value.home, startAt: START_AT, endAt: END_AT });
   const compatibility = structuredClone(exportCompatibilityTuple());
-  assert.equal(compatibility.implementation.checkpointScanVersion, "codex-export-checkpoint-scan-v0.5");
+  assert.equal(compatibility.implementation.checkpointScanVersion, "codex-export-checkpoint-scan-v0.6");
   compatibility.implementation.checkpointScanVersion = "codex-export-checkpoint-scan-v0.4";
   const descriptor = buildExportWorkspaceDescriptor({
     participantId: deriveParticipantId(SECRET), createdAt: END_AT,

@@ -15,9 +15,11 @@ import {
   readReplaySafeAccountingCache as readReplaySafeAccountingCacheImpl,
   refreshReplaySafeAccountingCache as refreshReplaySafeAccountingCacheImpl,
 } from "../src/replay-safe-accounting-cache.js";
-import { addUsdStrings } from "@app-usagemonitor/accounting";
+import { addUsdStrings, priceCodexUsageEvent, summarizeQuotaWeightedAccounting } from "@app-usagemonitor/accounting";
+import { stableJson } from "../src/storage.js";
 import {
   readLocalCollectorAccountingCache,
+  serializeLocalCollectorAccountingCache,
   writeLocalCollectorAccountingCache,
 } from "../src/local-collector-state.js";
 import {
@@ -56,6 +58,37 @@ async function writeTestCache(stateFile, cache) {
 async function readTestCache(stateFile) {
   return (await readLocalCollectorAccountingCache({ stateFile })).cache;
 }
+
+test("a full year of usage can publish a compact cache above the former 16 MiB ceiling", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-cache-byte-budget-"));
+  const stateFile = join(directory, "state.sqlite");
+  const bucketCount = 365 * 24 * 4;
+  try {
+    const cache = await refreshReplaySafeAccountingCache({
+      cacheFile: stateFile,
+      now: () => NOW,
+      scan: async ({ onUsage }) => {
+        for (let bucket = 0; bucket < bucketCount; bucket += 1) {
+          onUsage(usageEvent({
+            timestamp: new Date(NOW - bucket * 15 * 60_000).toISOString(),
+            components: { input_uncached_tokens: 1_000 },
+          }));
+        }
+        return { diagnostics: {} };
+      },
+    });
+    const size = Buffer.byteLength(serializeLocalCollectorAccountingCache(cache));
+    assert.ok(size > 16 * 1024 * 1024, "the actual compact cache crosses the former publication ceiling");
+    assert.ok(size < 128 * 1024 * 1024);
+    assert.equal(cache.timeline.length, bucketCount);
+    assert.equal(cache.periods.find((period) => period.id === "all").events, bucketCount);
+    const read = await readReplaySafeAccountingCache({ cacheFile: stateFile, now: () => NOW });
+    assert.equal(read.status, "available");
+    assert.deepEqual(read.cache, cache);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test("production replay-cache APIs reject the retired JSON cacheFile option", async () => {
   await assert.rejects(
@@ -126,6 +159,7 @@ test("explicit legacy refresh keeps the injected characterization scanner on leg
   const cache = await refreshReplaySafeAccountingCacheImpl({
     stateFile: join(directory, "local-collector-state-v1.sqlite"),
     sourceMode: "legacy",
+    contextBehavior: "legacy_zero",
     scan: scanner([]),
     now: () => NOW,
   });
@@ -248,13 +282,13 @@ test("cache reads invalidate when the unified generation no longer matches", asy
     stateFile,
     sourceMode: "unified",
     expectedGeneration: "generation-test-1",
-    contextBehavior: "legacy_zero",
+    contextBehavior: "source_native",
   });
   assert.equal(available.status, "available");
   assert.deepEqual(available.cache.sourceDescriptor, {
     schemaVersion: "local-accounting-source-descriptor-v1",
     mode: "unified",
-    contextBehavior: "legacy_zero",
+    contextBehavior: "source_native",
     readerVersion: "test-unified-reader-v1",
     schemaVersionUsed: "test-unified-schema-v1",
     parserVersion: "test-parser-v1",
@@ -298,7 +332,7 @@ test("cache reads invalidate when the unified generation no longer matches", asy
     stateFile,
     sourceMode: "unified",
     expectedGeneration: "generation-test-1",
-    contextBehavior: "source_native",
+    contextBehavior: "legacy_zero",
   });
   assert.deepEqual(contextInvalidated, {
     status: "unavailable",
@@ -309,7 +343,7 @@ test("cache reads invalidate when the unified generation no longer matches", asy
     stateFile,
     sourceMode: "unified",
     expectedGeneration: "generation-test-2",
-    contextBehavior: "legacy_zero",
+    contextBehavior: "source_native",
   });
   assert.deepEqual(invalidated, {
     status: "unavailable",
@@ -337,7 +371,7 @@ test("cache reads invalidate when the unified generation no longer matches", asy
       id: "generation-test-1",
       fingerprint: "generation-fingerprint-stale",
     },
-    contextBehavior: "legacy_zero",
+    contextBehavior: "source_native",
   });
   assert.deepEqual(fingerprintInvalidated, {
     status: "unavailable",
@@ -371,7 +405,7 @@ test("cache reads invalidate when the unified generation no longer matches", asy
       id: "generation-test-1",
       fingerprint: "generation-fingerprint-current",
     },
-    contextBehavior: "legacy_zero",
+    contextBehavior: "source_native",
   });
   assert.deepEqual(historyInvalidated, {
     status: "unavailable",
@@ -1300,7 +1334,7 @@ test("the same lineage-aware scan produces a bounded weekly calibration summary"
   assert.equal(fastCapacity.basis.unresolvedScenario, "unresolved_as_fast");
   assert.equal(
     standardCapacity.basis.multiplierRegistryRecordedAt,
-    "2026-08-30",
+    "2026-09-29",
   );
   assert.equal(
     standardCapacity.calibration.validation.selectedCostBasis,
@@ -1343,6 +1377,66 @@ test("the same lineage-aware scan produces a bounded weekly calibration summary"
     "insufficient_observations",
   );
   assert.equal(cache.weeklyCalibration.composition.capacityUsdByModel, null);
+});
+
+test("the replay cache retains and fits plan-scoped five-hour allowance history", async () => {
+  const resetStarts = [
+    Date.parse("2026-09-11T00:00:00.000Z"),
+    Date.parse("2026-09-11T05:00:00.000Z"),
+    Date.parse("2026-09-11T10:00:00.000Z"),
+  ];
+  const cache = await buildReplaySafeAccountingCache({
+    now: () => Date.parse("2026-09-12T12:00:00.000Z"),
+    windowDays: 365,
+    scan: async ({ onUsage, onRateLimitSnapshot }) => {
+      for (const [resetIndex, resetStart] of resetStarts.entries()) {
+        const resetsAt = (resetStart + 5 * 60 * 60 * 1_000) / 1_000;
+        for (let boundary = 0; boundary < 10; boundary += 1) {
+          const observedMs = resetStart + boundary * 20 * 60 * 1_000;
+          if (boundary > 0) {
+            onUsage(usageEvent({
+              timestamp: new Date(observedMs).toISOString(),
+              speed: "unknown",
+              components: {
+                input_uncached_tokens:
+                  200_000 + resetIndex * 20_000,
+              },
+            }));
+          }
+          onRateLimitSnapshot(weeklySnapshot({
+            timestamp: new Date(observedMs).toISOString(),
+            usedPercent: boundary,
+            planType: "pro",
+            durationMinutes: 300,
+            resetsAt,
+          }));
+        }
+      }
+      return { diagnostics: {} };
+    },
+  });
+
+  assert.equal(cache.fiveHourAllowanceCalibration.windowDurationMinutes, 300);
+  assert.equal(cache.fiveHourAllowanceCalibration.selectedPlanType, "pro");
+  assert.equal(cache.fiveHourAllowanceCalibration.status, "estimated");
+  assert.equal(
+    cache.fiveHourAllowanceCalibration.estimate.qualifyingResets,
+    3,
+  );
+  assert.equal(
+    cache.fiveHourAllowanceCalibration.sourceCounts.rateLimitSnapshots,
+    30,
+  );
+  assert.equal(cache.weeklyCalibration.sourceCounts.rateLimitSnapshots, 0);
+  assert.ok(cache.fiveHourAllowanceCalibration.recentResets.every((row) => (
+    row.planType === "pro"
+  )));
+  assert.equal(
+    cache.weeklyCalibration.composition.observationCount,
+    0,
+    "five-hour-only quota evidence cannot feed the seven-day composition fit",
+  );
+  assert.equal(cache.quotaTimeline.length, 0);
 });
 
 test("refresh publishes a fitted reset after an earlier diagnostic-only transition", async (t) => {
@@ -1510,11 +1604,15 @@ function compactSnapshotRow(
   usedPercent,
   resetsAtSeconds,
   planType = "pro",
+  durationMinutes = 10_080,
 ) {
   const row = new Array(9).fill(null);
   row[0] = new Date(timestampMs).toISOString();
   row[1] = timestampMs;
+  row[2] = "openai_codex";
   row[3] = planType;
+  row[4] = "codex";
+  row[6] = durationMinutes;
   row[7] = resetsAtSeconds;
   row[8] = usedPercent;
   return row;
@@ -1669,7 +1767,7 @@ function referencePerEventComposition({
   }
   const quotaRows = [];
   for (const row of weeklyRateLimitSnapshots) {
-    if (!Array.isArray(row)) continue;
+    if (!Array.isArray(row) || row[6] !== 10_080) continue;
     const observedAtMs = Number(row[1]);
     const resetsAtSeconds = Number(row[7]);
     const usedPercent = Number(row[8]);
@@ -1756,6 +1854,15 @@ test("the streaming composition binning matches the per-event kernel path exactl
   const negativeCost = compactUsageRow(resetStartMs, "gpt-5.6-sol", 1);
   negativeCost[0] = "not-a-timestamp";
   rawUsageEvents.push(negativeCost);
+  // A separately fitted five-hour lane shares the compact corpus but cannot
+  // become an extra point in the seven-day composition fit.
+  weeklyRateLimitSnapshots.push(compactSnapshotRow(
+    resetStartMs + 30 * 60_000,
+    80,
+    Math.floor((resetStartMs + 5 * 60 * 60 * 1_000) / 1_000),
+    "pro",
+    300,
+  ));
   weeklyRateLimitSnapshots.push(null);
   const malformedSnapshot = compactSnapshotRow(resetStartMs, 50, resetsAtSeconds);
   malformedSnapshot[1] = Number.NaN;
@@ -1992,11 +2099,13 @@ test("a composition fit that trips the RSS ceiling mid-way fails soft into a com
 async function writeUnifiedCalibrationFixture(indexFile, {
   resets,
   boundaries = 10,
+  durationMinutes = 10_080,
+  earlierPlanBuckets = 0,
 }) {
   const database = openLocalUnifiedIndex(indexFile, { create: true });
   const sourceLocal = Buffer.alloc(32, 8);
   const sessionLocal = Buffer.alloc(32, 7);
-  const sourceBytes = resets.length * boundaries * 256;
+  const sourceBytes = (earlierPlanBuckets + resets.length * boundaries) * 256;
   const sourceCount = sourceBytes > 0 ? 1 : 0;
   const generation = beginUnifiedIndexGeneration(database, {
     contractVersion: "unified-calibration-test-v1",
@@ -2030,10 +2139,72 @@ async function writeUnifiedCalibrationFixture(indexFile, {
     scopeLocal: null,
   });
   let eventNumber = 0;
+  for (let bucket = 0; bucket < earlierPlanBuckets; bucket += 1) {
+    const observedMs = resets[0] - (earlierPlanBuckets - bucket) * 15 * 60_000;
+    const resetsAtMs = observedMs + 7 * 24 * 60 * 60 * 1_000;
+    const isPlanAnchor = bucket === 0 || bucket === earlierPlanBuckets - 1;
+    const canonicalObservationId = isPlanAnchor ? writer.internQuota({
+      observedAtMs: observedMs,
+      limitId: "codex",
+      slot: "secondary",
+      planType: "plus",
+      usedPercent: 0,
+      resetsAtMs,
+      durationMins: 10_080,
+    }) : null;
+    eventNumber += 1;
+    const eventKey = Buffer.alloc(32);
+    eventKey.writeUInt32BE(eventNumber);
+    const sourceOffset = (eventNumber - 1) * 256;
+    writer.writeUsageEvent({
+      eventKey,
+      generationId: generation.generationId,
+      sourceLocal,
+      sourceOffset,
+      sourceOrdinal: 0,
+      observedAtMs: observedMs,
+      sessionLocal,
+      accountScopeId,
+      modelId,
+      tierId,
+      surfaceId,
+      quotaObservationId: canonicalObservationId,
+      reasoningEffort: 8,
+      outcome: 5,
+      tokensInUncached: 1_000,
+      tokensInCacheRead: 0,
+      tokensInCacheWrite: 0,
+      tokensOutText: 0,
+      tokensOutReasoning: 0,
+      tokensOutCombined: 0,
+    });
+    if (isPlanAnchor) {
+      writer.writeQuotaOccurrence({
+        generationId: generation.generationId,
+        sourceLocal,
+        sourceOffset,
+        sourceOrdinal: 0,
+        surfaceId,
+        canonicalObservationId,
+        observedAtMs: observedMs,
+        provider: "openai_codex",
+        planType: "plus",
+        limitId: "codex",
+        slot: "secondary",
+        slotOrder: 0,
+        usedPercent: 0,
+        resetsAtMs,
+        durationMins: 10_080,
+        admission: "admitted",
+      });
+    }
+  }
   for (const [resetIndex, resetStartMs] of resets.entries()) {
-    const resetsAtMs = resetStartMs + 7 * 24 * 60 * 60 * 1_000;
+    const resetsAtMs = resetStartMs + durationMinutes * 60 * 1_000;
+    const boundaryIntervalMinutes = durationMinutes === 300 ? 20 : 60;
     for (let boundary = 0; boundary < boundaries; boundary += 1) {
-      const observedMs = resetStartMs + boundary * 60 * 60 * 1_000;
+      const observedMs = resetStartMs
+        + boundary * boundaryIntervalMinutes * 60 * 1_000;
       eventNumber += 1;
       const eventKey = Buffer.alloc(32);
       eventKey.writeUInt32BE(eventNumber);
@@ -2045,7 +2216,7 @@ async function writeUnifiedCalibrationFixture(indexFile, {
         planType: "pro",
         usedPercent: boundary,
         resetsAtMs,
-        durationMins: 10_080,
+        durationMins: durationMinutes,
       });
       // The first boundary is a real quota-only token record. It anchors the
       // historical interval without becoming a fabricated usage increment.
@@ -2065,6 +2236,11 @@ async function writeUnifiedCalibrationFixture(indexFile, {
         reasoningEffort: 8,
         outcome: 5,
         tokensInUncached: boundary > 0 ? 1_000_000 + resetIndex * 100_000 : null,
+        tokensInCacheRead: 0,
+        tokensInCacheWrite: 0,
+        tokensOutText: 0,
+        tokensOutReasoning: 0,
+        tokensOutCombined: 0,
       });
       writer.writeQuotaOccurrence({
         generationId: generation.generationId,
@@ -2081,7 +2257,7 @@ async function writeUnifiedCalibrationFixture(indexFile, {
         slotOrder: 0,
         usedPercent: boundary,
         resetsAtMs,
-        durationMins: 10_080,
+        durationMins: durationMinutes,
         admission: "admitted",
       });
     }
@@ -2145,17 +2321,24 @@ test("a fitted unified plan timeline survives cache validation and the productio
   t.after(() => rm(directory, { recursive: true, force: true }));
   const indexFile = join(directory, "local-unified-index-v1.sqlite");
   const stateFile = join(directory, "local-collector-state-v1.sqlite");
+  const earlierPlanBuckets = 365 * 24 * 4;
   await writeUnifiedCalibrationFixture(indexFile, {
     resets: [1, 8, 15].map((day) => Date.UTC(2026, 7, day)), boundaries: 10,
+    earlierPlanBuckets,
   });
   const now = () => Date.parse("2026-08-30T12:00:00Z");
   const cache = await refreshReplaySafeAccountingCacheImpl({
     sourceMode: "unified", unifiedIndexFile: indexFile, expectedGeneration: 1,
-    stateFile, now,
+    stateFile, now, windowDays: 730,
   });
+  assert.ok(Buffer.byteLength(serializeLocalCollectorAccountingCache(cache)) > 16 * 1024 * 1024,
+    "ordinary all-plan history crosses the former ceiling without dropping the valid comparison lane");
+  assert.equal(cache.timeline.length, earlierPlanBuckets + 27);
   assert.equal(cache.planScopedTimeline.status, "available");
   assert.equal(cache.planScopedTimeline.encoding, "plan_bucket_v1");
   assert.equal(cache.planScopedTimeline.usage.length, 27);
+  assert.ok(Buffer.byteLength(stableJson(cache.planScopedTimeline)) < 4 * 1024 * 1024,
+    "the selected Pro comparison remains inside its independent unchanged lane budget");
   assert.ok(cache.planScopedTimeline.quota.length > 0);
   assert.doesNotThrow(() => assertReplaySafeAccountingCache(cache));
   const read = await readReplaySafeAccountingCacheImpl({ stateFile, sourceMode: "unified", expectedGeneration: 1, now });
@@ -2179,6 +2362,143 @@ test("a fitted unified plan timeline survives cache validation and the productio
   assert.equal(selected.timeline.selectedPlanUsage.length, 27);
   assert.equal(selected.timeline.quota.length, scoped.quota.length);
   assert.ok(selected.timeline.quota.every((row) => row.planType === "pro"));
+});
+
+test("the production companion and browser payload expose fitted five-hour history", async (t) => {
+  const directory = await mkdtemp(join(
+    tmpdir(),
+    "usage-monitor-five-hour-dashboard-roundtrip-",
+  ));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const indexFile = join(directory, "local-unified-index-v1.sqlite");
+  const stateFile = join(directory, "local-collector-state-v1.sqlite");
+  await writeUnifiedCalibrationFixture(indexFile, {
+    resets: [0, 5, 10].map((hour) => Date.UTC(2026, 8, 11, hour)),
+    boundaries: 10,
+    durationMinutes: 300,
+  });
+  const now = () => Date.parse("2026-09-12T12:00:00Z");
+  const cache = await refreshReplaySafeAccountingCacheImpl({
+    sourceMode: "unified",
+    unifiedIndexFile: indexFile,
+    expectedGeneration: 1,
+    stateFile,
+    now,
+  });
+  assert.equal(cache.fiveHourAllowanceCalibration.status, "estimated");
+
+  const { buildLocalCompanionSnapshot } = await import(
+    "../src/local-companion-data.js"
+  );
+  const snapshot = await buildLocalCompanionSnapshot({
+    root: directory,
+    collectorStateFile: stateFile,
+    unifiedIndexFile: indexFile,
+    accountingSourceMode: "unified",
+    allowDevelopmentArtifactFallback: false,
+    now,
+  });
+  assert.equal(
+    snapshot.weekly.allowanceHistoryByWindow[300].status,
+    "available",
+  );
+  assert.equal(
+    snapshot.weekly.allowanceHistoryByWindow[300]
+      .datasets.weekly_values.length,
+    3,
+  );
+
+  const { normalizeDashboardPayload } = await import(
+    "../apps/web/public/data-client.js"
+  );
+  const dashboard = normalizeDashboardPayload(snapshot);
+  assert.equal(dashboard.allowanceHistoryByWindow[300].status, "available");
+  assert.equal(
+    dashboard.allowanceHistoryByWindow[300].weeklyValues.length,
+    3,
+  );
+  assert.equal(dashboard.allowanceHistoryByWindow[300].planType, "pro");
+});
+
+test("five-hour history remains selectable when only an earlier plan has a fit", async (t) => {
+  const directory = await mkdtemp(join(
+    tmpdir(),
+    "usage-monitor-five-hour-historical-plan-",
+  ));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const stateFile = join(directory, "local-collector-state-v1.sqlite");
+  const fiveHourStart = Date.parse("2026-09-11T00:00:00.000Z");
+  const weeklyStart = Date.parse("2026-09-12T00:00:00.000Z");
+  const now = () => Date.parse("2026-09-12T12:00:00.000Z");
+  const cache = await refreshReplaySafeAccountingCacheImpl({
+    stateFile,
+    sourceMode: "legacy",
+    now,
+    windowDays: 365,
+    scan: async ({ onUsage, onRateLimitSnapshot }) => {
+      for (let boundary = 0; boundary < 10; boundary += 1) {
+        const observedMs = fiveHourStart + boundary * 20 * 60 * 1_000;
+        if (boundary > 0) onUsage(usageEvent({
+          timestamp: new Date(observedMs).toISOString(),
+          components: { input_uncached_tokens: 200_000 },
+        }));
+        onRateLimitSnapshot(weeklySnapshot({
+          timestamp: new Date(observedMs).toISOString(),
+          usedPercent: boundary,
+          planType: "pro",
+          durationMinutes: 300,
+          resetsAt: (fiveHourStart + 5 * 60 * 60 * 1_000) / 1_000,
+        }));
+      }
+      for (let boundary = 0; boundary < 2; boundary += 1) {
+        const observedMs = weeklyStart + boundary * 60 * 60 * 1_000;
+        if (boundary > 0) onUsage(usageEvent({
+          timestamp: new Date(observedMs).toISOString(),
+          components: { input_uncached_tokens: 200_000 },
+        }));
+        onRateLimitSnapshot(weeklySnapshot({
+          timestamp: new Date(observedMs).toISOString(),
+          usedPercent: boundary,
+          planType: "plus",
+          resetsAt: (weeklyStart + 7 * 24 * 60 * 60 * 1_000) / 1_000,
+        }));
+      }
+      return { diagnostics: {} };
+    },
+  });
+  assert.equal(cache.fiveHourAllowanceCalibration.selectedPlanType, "plus");
+  assert.equal(cache.fiveHourAllowanceCalibration.status, "insufficient_evidence");
+  assert.equal(
+    cache.fiveHourAllowanceCalibration.planPopulations.find(
+      (population) => population.planType === "pro",
+    )?.status,
+    "estimated",
+  );
+
+  const { buildLocalCompanionSnapshot } = await import(
+    "../src/local-companion-data.js"
+  );
+  const snapshot = await buildLocalCompanionSnapshot({
+    root: directory,
+    collectorStateFile: stateFile,
+    accountingSourceMode: "legacy",
+    allowDevelopmentArtifactFallback: false,
+    now,
+  });
+  assert.equal(
+    snapshot.weekly.allowanceHistoryByWindow[300].status,
+    "insufficient_evidence",
+  );
+
+  const { normalizeDashboardPayload, selectAllowancePlanPopulation } =
+    await import("../apps/web/public/data-client.js");
+  const dashboard = normalizeDashboardPayload(snapshot);
+  const historical = selectAllowancePlanPopulation({
+    ...dashboard,
+    weekly: dashboard.allowanceHistoryByWindow[300],
+  }, "pro");
+  assert.equal(historical.weekly.status, "available");
+  assert.equal(historical.allowancePlanSelection.planType, "pro");
 });
 
 test("the unified index supplies the full-history calibration corpus with no scan window", async () => {
@@ -3348,7 +3668,7 @@ test("replay cache rejects the old prefix-priced version and unreviewed model cr
       components: { input_uncached_tokens: 1_000 },
     })]),
   });
-  assert.equal(cache.schemaVersion, "local-replay-safe-accounting-v0.15");
+  assert.equal(cache.schemaVersion, "local-replay-safe-accounting-v0.18");
   assert.doesNotThrow(() => assertReplaySafeAccountingCache(cache));
   const oldVersion = structuredClone(cache);
   oldVersion.schemaVersion = "local-replay-safe-accounting-v0.12";
@@ -4286,4 +4606,98 @@ test("a failed refresh leaves the last good owner-only cache intact", async () =
 
   assert.deepEqual(await readTestCache(cacheFile), before);
   assert.equal((await stat(cacheFile)).mode & 0o777, 0o600);
+});
+
+test("Ultrafast replay weights Astra once and withholds unsupported Sol without losing Standard totals", async () => {
+  const instant = Date.parse("2026-09-29T20:00:00.000Z");
+  for (const model of ["gpt-6-astra", "gpt-6.1-sol"]) {
+    const cache = await buildReplaySafeAccountingCache({
+      now: () => instant,
+      scan: scanner([usageEvent({ timestamp: new Date(instant - 1_000).toISOString(),
+        model, speed: "ultrafast", components: { input_uncached_tokens: 1_000 } })]),
+    });
+    assert.doesNotThrow(() => assertReplaySafeAccountingCache(cache));
+    const period = cache.periods.find((row) => row.id === "all");
+    assert.equal(period.bySpeed.ultrafast.events, 1);
+    const weighted = summarizeQuotaWeightedAccounting({ speedWeighting: period.speedWeighting });
+    assert.equal(weighted.coverage.observedEvents, 1);
+    const standard = model === "gpt-6-astra" ? .01 : .002;
+    assert.equal(period.apiPriceEquivalentUsd, standard);
+    if (model === "gpt-6-astra") {
+      assert.equal(weighted.quotaWeightedApiPriceEquivalentUsd, .06);
+      assert.equal(weighted.weightingStatus, "complete");
+    } else {
+      assert.equal(weighted.quotaWeightedApiPriceEquivalentUsd, null);
+      assert.equal(weighted.weightingStatus, "unknown");
+      assert.equal(weighted.unweightedUnknownApiPriceEquivalentUsd, standard);
+    }
+  }
+});
+
+test("memoized accounting matches reviewed context boundaries and nullable observations", () => {
+  const pricer = createAccountingPricer();
+  for (const model of ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol"]) {
+    for (const totalInputContextTokens of [272_001, 272_000, 271_999, 300_000, 0, null]) {
+      const event = usageEvent({ timestamp: "2026-09-29T20:00:00.000Z", model,
+        components: { input_uncached_tokens: 300_000, input_cache_read_tokens: 1_000,
+          output_text_tokens: 1_000, output_reasoning_tokens: 500 } });
+      event.totalInputContextTokens = totalInputContextTokens;
+      const expected = priceCodexUsageEvent(event);
+      const actual = pricer(event, event.components);
+      assert.equal(actual.totalUsd, expected.totalUsd, `${model}/${totalInputContextTokens}`);
+      assert.equal(actual.coverageStatus, expected.coverageStatus);
+      assert.deepEqual(actual.selectedPriceCardIds, expected.selectedPriceCardIds);
+    }
+  }
+  const knownRawContext = usageEvent({ timestamp: "2026-09-29T20:00:00.000Z",
+    model: "gpt-6.1-sol", components: { output_text_tokens: 1_000 } });
+  knownRawContext.totalInputContextTokens = null;
+  knownRawContext.raw = { input_tokens: 272_001 };
+  assert.equal(pricer(knownRawContext, knownRawContext.components).totalUsd, "0.015");
+
+  for (const rawAvailability of [undefined, {}, { input_tokens: false }, { input_tokens: true }]) {
+    const event = usageEvent({ timestamp: "2026-09-29T20:00:00.000Z",
+      model: "gpt-6.1-sol", components: { input_uncached_tokens: 300_000, output_text_tokens: 1_000 } });
+    event.totalInputContextTokens = null;
+    event.raw = { input_tokens: 0 };
+    event.rawAvailability = rawAvailability;
+    assert.equal(pricer(event, event.components).totalUsd, priceCodexUsageEvent(event).totalUsd);
+  }
+
+  for (const model of ["gpt-6.1-sol", "gpt-6-astra"]) {
+    for (const totalInputContextTokens of [null, 272_001]) {
+      const event = usageEvent({ timestamp: "2026-09-29T20:00:00.000Z", model,
+        components: { output_text_tokens: 1_000 } });
+      event.totalInputContextTokens = totalInputContextTokens;
+      for (const name of ["input_uncached_tokens", "input_cache_read_tokens", "input_cache_write_tokens"]) {
+        event.components[name] = null;
+        event.componentAvailability[name] = false;
+      }
+      const expected = priceCodexUsageEvent(event);
+      assert.deepEqual(pricer(event, event.components), expected);
+      assert.equal(expected.coverageStatus, totalInputContextTokens === null ? "unpriced" : "partially_priced");
+      assert.equal(expected.totalUsd, totalInputContextTokens === null ? "0" : model === "gpt-6.1-sol" ? "0.015" : "0.075");
+    }
+  }
+});
+
+test("replay accounting preserves unknown context coverage instead of publishing a short-priced event", async () => {
+  const instant = Date.parse("2026-09-29T20:00:00.000Z");
+  const event = usageEvent({ timestamp: new Date(instant - 1_000).toISOString(),
+    model: "gpt-6.1-sol", components: { output_text_tokens: 1_000 } });
+  event.totalInputContextTokens = null;
+  event.raw = { input_tokens: 0 };
+  event.rawAvailability = { input_tokens: false };
+  for (const name of ["input_uncached_tokens", "input_cache_read_tokens", "input_cache_write_tokens"]) {
+    event.components[name] = null;
+    event.componentAvailability[name] = false;
+  }
+  const cache = await buildReplaySafeAccountingCache({ now: () => instant, scan: scanner([event]) });
+  const period = cache.periods.find((row) => row.id === "all");
+  assert.equal(period.totalTokens, 1_000);
+  assert.equal(period.apiPriceEquivalentUsd, 0);
+  assert.equal(period.pricingCoverage.unpricedEvents, 1);
+  assert.equal(period.pricingCoverage.fullyPricedEvents, 0);
+  assert.equal(cache.weeklyCalibrationInput.retainedUsageEvents, 1);
+  assert.doesNotThrow(() => assertReplaySafeAccountingCache(cache));
 });

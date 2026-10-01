@@ -5,10 +5,10 @@ import {
   validCachedAdminCommunityAllowancePreview,
 } from "./admin-community-allowance";
 import type { AdminCommunityAllowanceSummary } from "./admin-community-allowance";
-import { COMMUNITY_ALLOWANCE_BASIS } from "./community-allowance";
+import { COMMUNITY_ALLOWANCE_BASIS, COMMUNITY_ALLOWANCE_NORMALIZATION } from "./community-allowance";
 
 export const PUBLIC_ALLOWANCE_BREAKDOWNS_SCHEMA_VERSION =
-  "community-allowance-breakdowns-v1.1";
+  "community-allowance-breakdowns-v1.2";
 
 /** Internal storage projection only. Never serialize this cache row itself. */
 export interface PublicAllowanceBreakdownsCacheRow {
@@ -19,7 +19,7 @@ export interface PublicAllowanceBreakdownsCacheRow {
 export interface PublicAllowanceBreakdownDay {
   readonly day: string;
   readonly combined: AdminCommunityAllowanceSummary;
-  readonly byPlanType: Readonly<Record<"pro" | "prolite" | "plus", {
+  readonly byPlanType: Readonly<Record<"pro" | "prolite" | "promax" | "plus", {
     readonly centralUsd: number | null;
     readonly participantCount: number;
     readonly fitCount: number;
@@ -36,7 +36,7 @@ export interface PublicAllowanceBreakdowns {
   readonly schemaVersion: typeof PUBLIC_ALLOWANCE_BREAKDOWNS_SCHEMA_VERSION;
   readonly basis: typeof COMMUNITY_ALLOWANCE_BASIS;
   readonly referencePlanType: "pro";
-  readonly normalization: "pro_x1_prolite_x4_plus_x20";
+  readonly normalization: typeof COMMUNITY_ALLOWANCE_NORMALIZATION;
   readonly modelBasis: typeof ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS;
   readonly modelGate: typeof ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE;
   readonly generatedAt: string;
@@ -97,6 +97,7 @@ export function projectPublicAllowanceGraph(
       byPlanType: {
         pro: publicSummary(day.byPlanType.pro),
         prolite: publicSummary(day.byPlanType.prolite),
+        promax: publicSummary(day.byPlanType.promax),
         plus: publicSummary(day.byPlanType.plus),
       },
       // A missing historical fit remains a gap, never today's fit carried back.
@@ -108,7 +109,7 @@ export function projectPublicAllowanceGraph(
     schemaVersion: PUBLIC_ALLOWANCE_BREAKDOWNS_SCHEMA_VERSION,
     basis: COMMUNITY_ALLOWANCE_BASIS,
     referencePlanType: "pro",
-    normalization: "pro_x1_prolite_x4_plus_x20",
+    normalization: COMMUNITY_ALLOWANCE_NORMALIZATION,
     modelBasis: ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS,
     modelGate: ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE,
     generatedAt: preview.generatedAt,

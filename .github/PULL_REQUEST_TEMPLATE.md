@@ -5,14 +5,14 @@
 ## Verification gates
 
 <!-- Check each gate you ran. If one is not runnable on your platform
-     (product:macos:test requires macOS arm64 with Node v26.2.0), say so
+     (installed Mac upgrade tests require signed artifacts and both architectures), say so
      instead of leaving it unchecked silently. -->
 
 - [ ] `npm test`
 - [ ] `npm run docs:check`
 - [ ] `npm run codex:contract:check`
 - [ ] `npm run product:worker:check`
-- [ ] `npm run product:macos:test`
+- [ ] `npm run product:macos:transition:test`
 - [ ] `npm run architecture:check`
 - [ ] `npm run check` (or the environment-blocked lanes are named below)
 

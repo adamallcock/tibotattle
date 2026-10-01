@@ -6,10 +6,41 @@ import {
 } from "@app-usagemonitor/quota-analysis";
 import type { PlanAttributionIndex } from "@app-usagemonitor/quota-analysis";
 import { TELEMETRY_PLAN_TYPES } from "@app-usagemonitor/telemetry-contract";
+import {
+  addQuotaFragmentValue,
+  addQuotaReset,
+  closeQuotaClusterSpacing,
+  createQuotaClusterSpacing,
+  createQuotaResetClusterState,
+  offerQuotaClusterEndpoint,
+  quotaClusterHold,
+  quotaFragmentEligible,
+  quotaResetClusterEntries,
+  quotaResetRepresentativeMs,
+  restoreQuotaClusterSpacing,
+  validQuotaResetClusterEntries,
+  type QuotaClusterHold,
+  type QuotaClusterSpacing,
+  type QuotaEndpointView,
+  type QuotaFragmentStats,
+  type QuotaResetClusterEntry,
+} from "./quota-endpoint-collapse";
 
 /** Internal server acquisition state; never a public DTO or a completed fit. */
-export const V1_QUOTA_ACQUISITION_VERSION = "v1-quota-acquisition-1";
+export const V1_QUOTA_ACQUISITION_VERSION = "v1-quota-acquisition-2";
 export const V1_QUOTA_ACQUISITION_PAGE_SIZE = 1_024;
+/** The persisted phase vocabulary, in order. The pool sweep is a second leg of
+ * `plan` rather than a phase of its own: the work stores pin this vocabulary in
+ * a column CHECK, and settling hulls is not a durable phase boundary.
+ *
+ * The sweep does not absorb `fitability` either, for the same two reasons the
+ * v1.1 reader records: a checkpoint parked mid-sweep carries no stats and its
+ * `clusterCursor` is the proof that only hulls were taken from the prefix, so a
+ * merged leg resuming there would decide eligibility on the suffix alone; and
+ * stats taken before the hulls settle must key on the raw restated instant,
+ * which this reset-major reader fragments further still, where the decoder
+ * bounds `fit-stats` by `maxEras`. */
+export const V1_QUOTA_ACQUISITION_PHASES = ["plan", "fitability", "endpoints"] as const;
 export const V1_PLAN_ANCHOR_LIMIT = 120_000;
 export const V1_QUOTA_ENDPOINT_LIMIT = 60_000;
 const SAFE_TOKEN = /^[a-z0-9][a-z0-9_.:-]{0,127}$/u;
@@ -98,10 +129,15 @@ export interface V1PlanAnchor {
 }
 type PlanAnchor = V1PlanAnchor;
 interface PlanRun { first: PlanAnchor; last: PlanAnchor }
-interface FragmentStats { values: number[]; minimum: number; maximum: number }
+type FragmentStats = QuotaFragmentStats;
 interface Endpoint { id: number; row: V1AcquiredQuotaRow }
 interface EndpointRun { firstId: number; last: Endpoint }
 type EndpointRunEntry = [eraKey: string, slot: string, run: EndpointRun];
+/** Spacing state that outlives a reset group, keyed by the cluster the rows
+ * settled into. Only the four held rows are durable; the kept instants, values
+ * and ids are rebuilt from the emitted endpoints, which carry the cluster's
+ * representative instant as their `resets_at`. */
+type EndpointHoldEntry = [clusterKey: string, hold: QuotaClusterHold<Endpoint>];
 
 /** Persist only under the matching participant revision/fingerprint fence.
  * Large checkpoints must be integrity-bound parts, not one oversized D1 row.
@@ -111,8 +147,12 @@ type EndpointRunEntry = [eraKey: string, slot: string, run: EndpointRun];
 export interface V1QuotaAcquisitionCheckpoint {
   version: typeof V1_QUOTA_ACQUISITION_VERSION;
   identity: V1QuotaAcquisitionIdentity;
-  phase: "plan" | "fitability" | "endpoints";
+  phase: typeof V1_QUOTA_ACQUISITION_PHASES[number];
   cursor: V1ResetCursor;
+  /** Non-null while the second leg of `plan` sweeps the source for pool hulls.
+   * It is the active cursor for that leg; `cursor` stays where the anchor leg
+   * finished, so a resume knows which leg it is in and where it stopped. */
+  clusterCursor: V1ResetCursor | null;
   plan: {
     time: string | null;
     equalTime: PlanAnchor[];
@@ -120,19 +160,23 @@ export interface V1QuotaAcquisitionCheckpoint {
     anchors: PlanAnchor[];
   };
   reset: string | null;
+  /** Pool hulls per plan era, settled before any key is derived from a reset. */
+  clusters: QuotaResetClusterEntry[];
   stats: Array<[string, FragmentStats]>;
   eligible: string[];
   runs: EndpointRunEntry[];
+  holds: EndpointHoldEntry[];
   endpoints: Endpoint[];
 }
 
 export const V1_QUOTA_WORK_COMPONENTS = ["plan-anchors", "plan-runs", "plan-equal-time",
-  "fit-stats", "eligible", "endpoint-runs", "endpoints"] as const;
+  "reset-clusters", "fit-stats", "eligible", "endpoint-runs", "endpoint-holds", "endpoints"] as const;
 export type V1QuotaWorkComponent = typeof V1_QUOTA_WORK_COMPONENTS[number];
 export interface V1QuotaWorkControl {
   version: typeof V1_QUOTA_ACQUISITION_VERSION;
   phase: V1QuotaAcquisitionCheckpoint["phase"];
   cursor: V1ResetCursor;
+  clusterCursor: V1ResetCursor | null;
   planTime: string | null;
   reset: string | null;
 }
@@ -140,9 +184,11 @@ export interface V1QuotaWorkComponents {
   "plan-anchors": PlanAnchor[];
   "plan-runs": Array<[string, PlanRun]>;
   "plan-equal-time": PlanAnchor[];
+  "reset-clusters": QuotaResetClusterEntry[];
   "fit-stats": Array<[string, FragmentStats]>;
   eligible: string[];
   "endpoint-runs": EndpointRunEntry[];
+  "endpoint-holds": EndpointHoldEntry[];
   endpoints: Endpoint[];
 }
 
@@ -182,6 +228,9 @@ function fail(reason: "plan_attribution_limit_exceeded" | "downsampled_quota_lim
   return { status: "not_testable", reason };
 }
 function invalid(): never { throw new Error("v1 quota acquisition checkpoint invalid"); }
+/** The one coded failure for a structurally impossible acquisition state. The
+ * direct reader shares it so both v1 quota paths fail with the same code. */
+export function invalidV1QuotaAcquisition(): never { invalid(); }
 
 function closed(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -260,7 +309,22 @@ export function validateV1QuotaWorkPart(component: V1QuotaWorkComponent, value: 
       && entry[0] === entry[1].first.sourceContext && entry[1].first.sourceContext === entry[1].last.sourceContext
       && entry[1].first.planType === entry[1].last.planType && entry[1].first.planVariant === entry[1].last.planVariant
       && entry[1].first.observedAtMs <= entry[1].last.observedAtMs);
-    case "fit-stats": return value.every((entry: unknown) => pair(entry) && validEraKey(entry[0])
+    case "reset-clusters": return validQuotaResetClusterEntries(value)
+      && value.every((entry: unknown) => validEraKey((entry as unknown[])[0]));
+    case "endpoint-holds": return value.every((entry: unknown) => {
+      if (!pair(entry)) return false;
+      const fields = canonicalTuple(entry[0], 3, 1024);
+      return fields !== null && validEraKey(fields[0]) && token(fields[1]) && instant(fields[2])
+        && closed(entry[1], ["earliest", "latest", "minimum", "maximum"])
+        && ["earliest", "latest", "minimum", "maximum"].every((role) => {
+          const held = (entry[1] as Record<string, unknown>)[role];
+          return held === null || validEndpoint(held) && (held as Endpoint).row.plan_era_key === fields[0]
+            && (held as Endpoint).row.slot === fields[1] && (held as Endpoint).row.resets_at === fields[2];
+        });
+    });
+    case "fit-stats": return value.every((entry: unknown) => pair(entry)
+      && canonicalTuple(entry[0], 2, 1024) !== null
+      && instant(canonicalTuple(entry[0], 2, 1024)![0]) && validEraKey(canonicalTuple(entry[0], 2, 1024)![1])
       && closed(entry[1], ["values", "minimum", "maximum"]) && Array.isArray(entry[1].values)
       && entry[1].values.length >= 1 && entry[1].values.length <= QUOTA_CALIBRATION_POLICY.minimumBoundaries
       && entry[1].values.every(percent) && new Set(entry[1].values).size === entry[1].values.length
@@ -281,17 +345,22 @@ export function validateV1QuotaWorkPart(component: V1QuotaWorkComponent, value: 
 }
 
 export function validateV1QuotaWorkControl(value: unknown): value is V1QuotaWorkControl {
-  return closed(value, ["version", "phase", "cursor", "planTime", "reset"])
-    && value.version === V1_QUOTA_ACQUISITION_VERSION && ["plan", "fitability", "endpoints"].includes(value.phase as string)
-    && closed(value.cursor, ["resetsAt", "observedAt", "id"]) && instant(value.cursor.resetsAt)
-    && (value.cursor.observedAt === "" || instant(value.cursor.observedAt))
-    && Number.isSafeInteger(value.cursor.id) && (value.cursor.id as number) >= 0
+  const cursorValid = (candidate: unknown): boolean => closed(candidate, ["resetsAt", "observedAt", "id"])
+    && instant(candidate.resetsAt) && (candidate.observedAt === "" || instant(candidate.observedAt))
+    && Number.isSafeInteger(candidate.id) && (candidate.id as number) >= 0;
+  return closed(value, ["version", "phase", "cursor", "clusterCursor", "planTime", "reset"])
+    && value.version === V1_QUOTA_ACQUISITION_VERSION
+    && (V1_QUOTA_ACQUISITION_PHASES as readonly string[]).includes(value.phase as string)
+    && cursorValid(value.cursor)
+    // Only the anchor phase has a second leg, and only it may be mid-sweep.
+    && (value.clusterCursor === null || value.phase === "plan" && cursorValid(value.clusterCursor))
     && (value.planTime === null || instant(value.planTime)) && (value.reset === null || instant(value.reset));
 }
 
 export function validateV1QuotaPageReplay(value: unknown): value is V1QuotaPageReplay {
   const point = (candidate: unknown, complete: boolean): boolean => closed(candidate, ["phase", "cursor"])
-    && (complete && candidate.phase === "complete" || ["plan", "fitability", "endpoints"].includes(candidate.phase as string))
+    && (complete && candidate.phase === "complete"
+      || (V1_QUOTA_ACQUISITION_PHASES as readonly string[]).includes(candidate.phase as string))
     && closed(candidate.cursor, ["resetsAt", "observedAt", "id"]) && instant(candidate.cursor.resetsAt)
     && (candidate.cursor.observedAt === "" || instant(candidate.cursor.observedAt))
     && Number.isSafeInteger(candidate.cursor.id) && (candidate.cursor.id as number) >= 0;
@@ -344,7 +413,13 @@ export function createV1QuotaWorkInterner() {
         case "plan-anchors": case "plan-equal-time": (value as PlanAnchor[]).forEach(anchor); break;
         case "plan-runs": for (const [, run] of value as Array<[string, PlanRun]>) { anchor(run.first); anchor(run.last); } break;
         case "fit-stats": for (const entry of value as Array<[string, FragmentStats]>) entry[0] = internText(entry[0]); break;
-        case "eligible": break;
+        case "eligible": case "reset-clusters": break;
+        case "endpoint-holds": for (const entry of value as EndpointHoldEntry[]) {
+          for (const role of ["earliest", "latest", "minimum", "maximum"] as const) {
+            const held = entry[1][role];
+            if (held !== null) entry[1][role] = endpoint(held);
+          }
+        } break;
         case "endpoint-runs": for (const entry of value as EndpointRunEntry[]) {
           entry[0] = internText(entry[0]); entry[2].last = endpoint(entry[2].last);
         } break;
@@ -363,9 +438,10 @@ export function encodeV1QuotaWorkCheckpoint(state: V1QuotaAcquisitionCheckpoint)
   control: V1QuotaWorkControl; components: V1QuotaWorkComponents;
 } {
   return { control: { version: state.version, phase: state.phase, cursor: state.cursor,
-    planTime: state.plan.time, reset: state.reset }, components: {
+    clusterCursor: state.clusterCursor, planTime: state.plan.time, reset: state.reset }, components: {
     "plan-anchors": state.plan.anchors, "plan-runs": state.plan.runs, "plan-equal-time": state.plan.equalTime,
-    "fit-stats": state.stats, eligible: state.eligible, "endpoint-runs": state.runs, endpoints: state.endpoints,
+    "reset-clusters": state.clusters, "fit-stats": state.stats, eligible: state.eligible,
+    "endpoint-runs": state.runs, "endpoint-holds": state.holds, endpoints: state.endpoints,
   } };
 }
 
@@ -381,9 +457,11 @@ export function decodeV1QuotaWorkCheckpoint(identity: V1QuotaAcquisitionIdentity
   for (const component of V1_QUOTA_WORK_COMPONENTS) interner.internPart(component, values[component]);
   interner.release();
   const state: V1QuotaAcquisitionCheckpoint = { version: control.version, identity: { ...identity }, phase: control.phase,
-    cursor: control.cursor, plan: { time: control.planTime, anchors: values["plan-anchors"],
+    cursor: control.cursor, clusterCursor: control.clusterCursor,
+    plan: { time: control.planTime, anchors: values["plan-anchors"],
       runs: values["plan-runs"], equalTime: values["plan-equal-time"] }, reset: control.reset,
-    stats: values["fit-stats"], eligible: values.eligible, runs: values["endpoint-runs"], endpoints: values.endpoints };
+    clusters: values["reset-clusters"], stats: values["fit-stats"], eligible: values.eligible,
+    runs: values["endpoint-runs"], holds: values["endpoint-holds"], endpoints: values.endpoints };
   validateCheckpoint(state, identity);
   for (const entries of [state.plan.runs, state.stats]) {
     if (new Set(entries.map(([key]) => key)).size !== entries.length) invalid();
@@ -427,8 +505,9 @@ export function createV1QuotaAcquisitionCheckpoint(
   return {
     version: V1_QUOTA_ACQUISITION_VERSION, identity: { ...identity }, phase: "plan",
     cursor: { observedAt: identity.observedAtCutoff, resetsAt: identity.resetsAtCutoff, id: 0 },
+    clusterCursor: null,
     plan: { time: null, equalTime: [], runs: [], anchors: [] },
-    reset: null, stats: [], eligible: [], runs: [], endpoints: [],
+    reset: null, clusters: [], stats: [], eligible: [], runs: [], holds: [], endpoints: [],
   };
 }
 
@@ -438,7 +517,7 @@ function validateCheckpoint(state: V1QuotaAcquisitionCheckpoint, identity: V1Quo
       || Object.keys(identity).length !== Object.keys(state.identity).length
       || (Object.keys(identity) as Array<keyof V1QuotaAcquisitionIdentity>)
         .some((key) => state.identity[key] !== identity[key])
-      || !["plan", "fitability", "endpoints"].includes(state.phase)
+      || !(V1_QUOTA_ACQUISITION_PHASES as readonly string[]).includes(state.phase)
       || !Number.isSafeInteger(state.cursor.id) || state.cursor.id < 0
       || typeof state.cursor.observedAt !== "string" || typeof state.cursor.resetsAt !== "string"
       || state.plan.anchors.length > V1_PLAN_ANCHOR_LIMIT
@@ -447,7 +526,8 @@ function validateCheckpoint(state: V1QuotaAcquisitionCheckpoint, identity: V1Quo
       || state.plan.anchors.length + state.plan.equalTime.length > V1_PLAN_ANCHOR_LIMIT
       || state.stats.length > PLAN_ATTRIBUTION_POLICY.maxEras
       || state.eligible.length > identity.maxQuotaRows
-      || state.runs.length > identity.maxQuotaRows || state.endpoints.length > identity.maxQuotaRows) invalid();
+      || state.runs.length > identity.maxQuotaRows || state.endpoints.length > identity.maxQuotaRows
+      || state.holds.length > identity.maxQuotaRows) invalid();
 }
 
 function attributionIndex(anchors: PlanAnchor[]): PlanAttributionIndex {
@@ -466,7 +546,7 @@ export async function advanceV1QuotaAcquisition(
   winningDayDevices: ReadonlyMap<string, string>,
   budget: V1QuotaInvocationBudget,
   state: V1QuotaAcquisitionCheckpoint = createV1QuotaAcquisitionCheckpoint(identity),
-  options: { maxPages?: number } = {},
+  options: { maxPages?: number; stopAtPhaseBoundary?: boolean } = {},
 ): Promise<V1QuotaAcquisitionStep> {
   const pageSize = reader.pageSize ?? V1_QUOTA_ACQUISITION_PAGE_SIZE;
   if (pageSize !== 128 && pageSize !== V1_QUOTA_ACQUISITION_PAGE_SIZE) throw new Error("v1 quota reader page policy invalid");
@@ -496,7 +576,50 @@ export async function advanceV1QuotaAcquisition(
     slots.set(slot, run);
   }
   state.runs = [];
-  let index: PlanAttributionIndex | null = state.phase === "plan" ? null : attributionIndex(state.plan.anchors);
+  const clusters = createQuotaResetClusterState(state.clusters);
+  state.clusters = [];
+  // Spacing outlives a reset group, so it is keyed by the cluster the rows
+  // settled into. Its decision index is rebuilt from the endpoints already
+  // emitted, which carry that cluster's representative as `resets_at`, so a
+  // resumed pass makes exactly the decisions an uninterrupted one made.
+  const spacingKey = (value: Endpoint) =>
+    JSON.stringify([value.row.plan_era_key, value.row.slot, value.row.resets_at]);
+  const endpointView = (value: Endpoint): QuotaEndpointView => ({ id: value.id,
+    observedAtMs: Date.parse(value.row.observed_at), usedPercent: value.row.used_percent });
+  const spacing = new Map<string, QuotaClusterSpacing<Endpoint>>();
+  for (const [key, hold] of state.holds) spacing.set(key, createQuotaClusterSpacing(hold));
+  state.holds = [];
+  const emitted = new Map<string, Endpoint[]>();
+  for (const value of state.endpoints) {
+    const key = spacingKey(value);
+    let rows = emitted.get(key);
+    if (!rows) { rows = []; emitted.set(key, rows); }
+    rows.push(value);
+  }
+  // Only a resume needs the index rebuilt: within one call the incremental
+  // path already holds it, and this sorts up to `maxQuotaRows` instants.
+  if (state.endpoints.length > 0) {
+    for (const [key, rows] of emitted) {
+      let value = spacing.get(key);
+      if (!value) { value = createQuotaClusterSpacing(); spacing.set(key, value); }
+      restoreQuotaClusterSpacing(value, rows, endpointView);
+    }
+  }
+  emitted.clear();
+  const emitEndpoint = (value: Endpoint) => {
+    state.endpoints.push(value);
+    return state.endpoints.length <= identity.maxQuotaRows;
+  };
+  const offerEndpoint = (value: Endpoint): boolean => {
+    const key = spacingKey(value);
+    let cluster = spacing.get(key);
+    if (!cluster) { cluster = createQuotaClusterSpacing(); spacing.set(key, cluster); }
+    return offerQuotaClusterEndpoint(cluster, value, endpointView, emitEndpoint);
+  };
+  // The anchor leg has no index yet; every later leg, including a resumed hull
+  // sweep still inside the anchor phase, rebuilds it from the settled anchors.
+  let index: PlanAttributionIndex | null = state.phase === "plan" && state.clusterCursor === null
+    ? null : attributionIndex(state.plan.anchors);
   if (index?.status === "limit_exceeded") return fail("plan_attribution_limit_exceeded");
 
   const flushPlanTime = (): boolean => {
@@ -530,11 +653,12 @@ export async function advanceV1QuotaAcquisition(
     equalTime.clear();
     return true;
   };
+  // Stats are keyed by the settled pool, so they accumulate across every reset
+  // group of a cluster and are decided once, at the end of the sub-phase.
   const finishStats = (): boolean => {
-    for (const [eraKey, stat] of stats) {
-      if (stat.values.length >= QUOTA_CALIBRATION_POLICY.minimumBoundaries
-          && stat.maximum - stat.minimum >= QUOTA_CALIBRATION_POLICY.minimumDisplayedSpanPp) {
-        eligible.add(JSON.stringify([state.reset, eraKey]));
+    for (const [key, stat] of stats) {
+      if (quotaFragmentEligible(stat)) {
+        eligible.add(key);
         // Each proven-fitable fragment contains at least this many distinct
         // percentages, each represented by some retained run endpoint. This
         // lower bound is the EXISTING post-fitability cap, not a raw/group cap.
@@ -544,21 +668,37 @@ export async function advanceV1QuotaAcquisition(
     stats.clear();
     return true;
   };
+  // Runs stay keyed by the restated instant, because only inside one of those
+  // blocks does this reader deliver rows in observation order. Their endpoints
+  // are then offered to the cluster, whose spacing does not assume an order.
   const finishRuns = (): boolean => {
     for (const slots of endpointRuns.values()) for (const run of slots.values()) {
-      if (run.last.id !== run.firstId) state.endpoints.push(run.last);
-      if (state.endpoints.length > identity.maxQuotaRows) return false;
+      if (run.last.id !== run.firstId && !offerEndpoint(run.last)) return false;
     }
     endpointRuns.clear();
+    return true;
+  };
+  const closeSpacing = (): boolean => {
+    for (const cluster of spacing.values()) {
+      if (!closeQuotaClusterSpacing(cluster, endpointView, emitEndpoint)) return false;
+    }
     return true;
   };
   const defer = (): V1QuotaAcquisitionStep => {
     state.plan.runs = [...planRuns];
     state.plan.equalTime = [...equalTime.values()];
+    state.clusters = quotaResetClusterEntries(clusters);
     state.stats = [...stats];
     state.eligible = [...eligible];
     state.runs = [];
     for (const [era, slots] of endpointRuns) for (const [slot, run] of slots) state.runs.push([era, slot, run]);
+    state.holds = [];
+    for (const [key, cluster] of spacing) {
+      const hold = quotaClusterHold(cluster);
+      if (hold.earliest !== null || hold.latest !== null || hold.minimum !== null || hold.maximum !== null) {
+        state.holds.push([key, hold]);
+      }
+    }
     return { status: "deferred", checkpoint: state };
   };
 
@@ -566,7 +706,7 @@ export async function advanceV1QuotaAcquisition(
   while (budget.remainingQueries > 0 && pagesRead < (options.maxPages ?? Infinity) && now() < budget.deadlineMs) {
     budget.remainingQueries -= 1;
     pagesRead += 1;
-    if (state.phase === "plan") {
+    if (state.phase === "plan" && state.clusterCursor === null) {
       const rows = await reader.readPlanPage(state.cursor, pageSize);
       if (rows.length > pageSize) throw new Error("v1 quota acquisition page overflow");
       let previous: V1TimeCursor = state.cursor;
@@ -606,14 +746,20 @@ export async function advanceV1QuotaAcquisition(
       state.plan.equalTime = [];
       index = attributionIndex(state.plan.anchors);
       if (index.status !== "ready") return fail("plan_attribution_limit_exceeded");
-      state.phase = "fitability";
-      state.cursor = initialCursor(identity);
+      // Second leg of the anchor phase: settle the pool hulls before any key
+      // is derived from a restated instant. Hull settling is not a durable
+      // phase of its own, so the persisted phase stays `plan` and the leg is
+      // carried by `clusterCursor`, which is also its active cursor.
+      state.clusterCursor = initialCursor(identity);
+      if (options.stopAtPhaseBoundary) return defer();
       continue;
     }
 
-    const rows = await reader.readFitPage(state.cursor, pageSize);
+    const sweeping = state.phase === "plan";
+    const active = sweeping ? state.clusterCursor! : state.cursor;
+    const rows = await reader.readFitPage(active, pageSize);
     if (rows.length > pageSize) throw new Error("v1 quota acquisition page overflow");
-    let previous: V1ResetCursor = state.cursor;
+    let previous: V1ResetCursor = active;
     for (const row of rows) {
       const order = textOrder(row.resets_at, previous.resetsAt) || textOrder(row.observed_at, previous.observedAt)
         || row.id - previous.id;
@@ -625,54 +771,81 @@ export async function advanceV1QuotaAcquisition(
           || row.resets_at < identity.resetsAtCutoff || row.limit_id !== "codex"
           || row.window_duration_minutes !== identity.windowMinutes
           || winningDayDevices.get(row.observed_day) !== row.device_id) continue;
-      if (state.reset !== null && state.reset !== row.resets_at) {
-        if (!(state.phase === "fitability" ? finishStats() : finishRuns())) return fail("downsampled_quota_limit_exceeded");
-      }
-      state.reset = row.resets_at;
+      // Every rejection an acquired row would face, applied once for all three
+      // source-reading sub-phases, so a row that can never be emitted shapes
+      // neither a pool hull nor an eligibility decision. The direct read
+      // rejects exactly these rows before it clusters.
+      if (!SAFE_TOKEN.test(row.provider) || !PLAN_TYPES.has(row.plan_type)
+          || !SAFE_TOKEN.test(row.plan_variant) || !token(row.slot) || !percent(row.used_percent)
+          || Date.parse(row.resets_at) <= Date.parse(row.observed_at)) continue;
       const match = planEraForInterval(index!, { contextKey: `${row.provider}|${row.limit_id}`,
         observedAtMs: Date.parse(row.observed_at) });
       if (match.status !== "matched" || match.era.planType !== row.plan_type
           || match.era.planVariant !== row.plan_variant) continue;
       const eraKey = match.era.eraKey;
-      if (state.phase === "fitability") {
-        let stat = stats.get(eraKey);
-        if (!stat) {
-          stat = { values: [], minimum: row.used_percent, maximum: row.used_percent };
-          stats.set(eraKey, stat);
-        }
-        stat.minimum = Math.min(stat.minimum, row.used_percent);
-        stat.maximum = Math.max(stat.maximum, row.used_percent);
-        if (stat.values.length < QUOTA_CALIBRATION_POLICY.minimumBoundaries && !stat.values.includes(row.used_percent)) {
-          stat.values.push(row.used_percent);
+      if (!validEraKey(eraKey)) continue;
+      // Pool identity, not the restated instant.
+      if (sweeping) {
+        if (!addQuotaReset(clusters, eraKey, Date.parse(row.resets_at))) {
+          return fail("downsampled_quota_limit_exceeded");
         }
         continue;
       }
-      if (!eligible.has(JSON.stringify([row.resets_at, eraKey]))) continue;
+      const representative = quotaResetRepresentativeMs(clusters, eraKey, Date.parse(row.resets_at));
+      if (representative === null) invalid();
+      const reset = new Date(representative).toISOString();
+      const key = JSON.stringify([reset, eraKey]);
+      if (state.phase === "fitability") {
+        addQuotaFragmentValue(stats, key, row.used_percent);
+        continue;
+      }
+      if (!eligible.has(key)) continue;
+      // Run collapse holds only inside one restated instant's block, which is
+      // the only stretch this reader delivers in observation order, so the run
+      // map is flushed whenever that instant changes.
+      if (state.reset !== null && state.reset !== row.resets_at && !finishRuns()) {
+        return fail("downsampled_quota_limit_exceeded");
+      }
+      state.reset = row.resets_at;
       let slots = endpointRuns.get(eraKey);
       if (!slots) { slots = new Map(); endpointRuns.set(eraKey, slots); }
       const endpoint: Endpoint = { id: row.id, row: { occurrence_id: row.occurrence_id, observed_at: row.observed_at,
         provider: interner.internText(row.provider), plan_type: row.plan_type, plan_variant: interner.internText(row.plan_variant),
         limit_id: row.limit_id, slot: row.slot, used_percent: row.used_percent,
-        window_duration_minutes: row.window_duration_minutes, resets_at: row.resets_at, plan_era_key: eraKey } };
+        window_duration_minutes: row.window_duration_minutes, resets_at: reset, plan_era_key: eraKey } };
       const run = slots.get(row.slot);
       if (run && run.last.row.used_percent === row.used_percent) run.last = endpoint;
       else {
-        if (run && run.last.id !== run.firstId) state.endpoints.push(run.last);
-        state.endpoints.push(endpoint);
-        if (state.endpoints.length > identity.maxQuotaRows) return fail("downsampled_quota_limit_exceeded");
+        if (run && run.last.id !== run.firstId && !offerEndpoint(run.last)) {
+          return fail("downsampled_quota_limit_exceeded");
+        }
+        if (!offerEndpoint(endpoint)) return fail("downsampled_quota_limit_exceeded");
         slots.set(row.slot, { firstId: row.id, last: endpoint });
       }
     }
-    state.cursor = previous;
+    if (sweeping) state.clusterCursor = previous; else state.cursor = previous;
     if (rows.length === pageSize) continue;
+    if (sweeping) {
+      state.phase = "fitability";
+      state.clusterCursor = null;
+      state.reset = null;
+      state.cursor = initialCursor(identity);
+      if (options.stopAtPhaseBoundary) return defer();
+      continue;
+    }
     if (state.phase === "fitability") {
       if (!finishStats()) return fail("downsampled_quota_limit_exceeded");
       state.phase = "endpoints";
       state.reset = null;
       state.cursor = initialCursor(identity);
+      if (options.stopAtPhaseBoundary) return defer();
       continue;
     }
     if (!finishRuns()) return fail("downsampled_quota_limit_exceeded");
+    if (!closeSpacing()) return fail("downsampled_quota_limit_exceeded");
+    // The caller persists this exact state as the completed endpoints-phase
+    // checkpoint, so the pools its endpoints were keyed by travel with it.
+    state.clusters = quotaResetClusterEntries(clusters);
     state.endpoints.sort((left, right) => textOrder(left.row.observed_at, right.row.observed_at) || left.id - right.id);
     return { status: "complete", attributionIndex: index!, planAnchors: state.plan.anchors,
       quotaRows: state.endpoints.map(({ row }) => row) };
@@ -690,7 +863,8 @@ export async function advanceV1QuotaAcquisitionPage(reader: V1QuotaPageReader, i
   state: V1QuotaAcquisitionCheckpoint = createV1QuotaAcquisitionCheckpoint(identity),
 ): Promise<{ result: V1QuotaAcquisitionStep; replay: V1QuotaPageReplay | null;
   checkpoint: V1QuotaAcquisitionCheckpoint | null }> {
-  const from = { phase: state.phase, cursor: { ...state.cursor } };
+  const activeCursor = (value: V1QuotaAcquisitionCheckpoint) => ({ ...(value.clusterCursor ?? value.cursor) });
+  const from = { phase: state.phase, cursor: activeCursor(state) };
   const queriesBefore = budget.remainingQueries;
   const result = await advanceV1QuotaAcquisition(reader, identity, winningDayDevices, budget, state, { maxPages: 1 });
   if (queriesBefore === budget.remainingQueries || result.status === "not_testable") {
@@ -703,6 +877,6 @@ export async function advanceV1QuotaAcquisitionPage(reader: V1QuotaPageReader, i
   return { result, checkpoint: state, replay: { ...(reader.pageSize === 128
     ? { version: "v1-quota-page-replay-2" as const, readerPolicy: "prepared-source-days-1" as const, pageSize: 128 as const }
     : { version: "v1-quota-page-replay-1" as const }), from,
-    through: { phase: result.status === "complete" ? "complete" : result.checkpoint.phase, cursor: { ...state.cursor } },
+    through: { phase: result.status === "complete" ? "complete" : result.checkpoint.phase, cursor: activeCursor(state) },
     sourceQueryCount: 1, resolution: "resolved" } };
 }

@@ -1,3 +1,4 @@
+import { createResetEventClassifier, mergeQuotaResetEvents } from "@app-usagemonitor/quota-analysis";
 import { declaredSpeedModeAt } from "./codex-speed-baseline.js";
 import {
   addTimelineUsage,
@@ -86,6 +87,7 @@ export async function readLocalCollectorProjection(
         quota: [],
         sparkUsage: [],
         sparkQuota: [],
+        resetEvents: [],
       },
       recordCounts: { usage: 0, quota: 0, tools: 0, other: 0 },
       paceForecast,
@@ -119,6 +121,9 @@ export async function readLocalCollectorProjection(
   const timelineBuckets = new Map();
   const sparkTimelineBuckets = new Map();
   const quotaTimeline = [];
+  const historicalResetClassifier = createResetEventClassifier();
+  const reconstructedResetEvents = [];
+  const prospectiveResetEvents = [];
   const weeklyPaceSnapshots = [];
   let toolTotal = 0;
   let recordCount = indexedSummary?.recordCount ?? 0;
@@ -182,6 +187,21 @@ export async function readLocalCollectorProjection(
               0,
               weeklyPaceSnapshots.length - MAX_WEEKLY_PACE_OBSERVATIONS,
             );
+          }
+        }
+        if (observedMs <= nowMs + 5 * 60_000) {
+          if (value.source === "app_server_read") {
+            reconstructedResetEvents.push(...historicalResetClassifier.observe({
+              observedAt: new Date(observedMs).toISOString(),
+              accountScopeId: value.accountScope?.status === "available"
+                ? value.accountScope.scopeId
+                : null,
+              windows: Array.isArray(value.windows) ? value.windows : [],
+              resetCredits: null,
+            }));
+          }
+          if (Array.isArray(value.resetEvents)) {
+            prospectiveResetEvents.push(...value.resetEvents);
           }
         }
         if (observedMs >= recentStartMs && observedMs <= nowMs + 5 * 60_000) {
@@ -292,6 +312,10 @@ export async function readLocalCollectorProjection(
       ),
       sparkQuota: finalizeQuotaTimeline(
         quotaTimeline.filter((row) => SPARK_QUOTA_LIMIT_IDS.includes(row.limitId)),
+      ),
+      resetEvents: mergeQuotaResetEvents(
+        reconstructedResetEvents,
+        prospectiveResetEvents,
       ),
     },
     recordCounts,

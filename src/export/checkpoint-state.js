@@ -55,8 +55,8 @@ const TOOL_FIELDS = Object.freeze([
   "unknown",
 ]);
 const MODEL_IDS = new Set(OPENAI_CODEX_MODEL_IDS);
-const SPEED_MODES = new Set(["standard", "fast", "unknown", "other"]);
-const API_SERVICE_TIERS = new Set(["standard", "priority", "flex", "batch", "unknown", "other"]);
+const SPEED_MODES = new Set(["standard", "fast", "ultrafast", "unknown", "other"]);
+const API_SERVICE_TIERS = new Set(["standard", "priority", "ultrafast", "flex", "batch", "unknown", "other"]);
 const FINGERPRINT = /^model:v1:[a-f0-9]{64}$/;
 
 const STATE_KEYS = Object.freeze([
@@ -70,7 +70,7 @@ const STATE_KEYS = Object.freeze([
   "pendingToolCounts",
 ]);
 const MODEL_KEYS = Object.freeze(["modelId", "modelRecognition", "modelFingerprint"]);
-const TIER_KEYS = Object.freeze(["timelineIndex", "speedMode", "apiServiceTier"]);
+const TIER_KEYS = Object.freeze(["timelineIndex", "speedMode", "apiServiceTier", "tierSource"]);
 
 function invalid() {
   // Deliberately do not interpolate values: state may have come from a raw log.
@@ -136,11 +136,13 @@ function normalizeTier(value) {
   if (!hasExactlyKeys(value, TIER_KEYS)
       || !nonNegativeInteger(value.timelineIndex)
       || !SPEED_MODES.has(value.speedMode)
-      || !API_SERVICE_TIERS.has(value.apiServiceTier)) invalid();
+      || !API_SERVICE_TIERS.has(value.apiServiceTier)
+      || !["unobserved", "turn_override", "rollout_thread_settings"].includes(value.tierSource)) invalid();
   return {
     timelineIndex: value.timelineIndex,
     speedMode: value.speedMode,
     apiServiceTier: value.apiServiceTier,
+    tierSource: value.tierSource,
   };
 }
 
@@ -172,6 +174,7 @@ function createEmptyCodexCheckpointState() {
       timelineIndex: 0,
       speedMode: "unknown",
       apiServiceTier: "unknown",
+      tierSource: "unobserved",
     },
     pendingToolCounts: emptyPendingTools(),
   };

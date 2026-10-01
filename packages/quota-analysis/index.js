@@ -5,6 +5,25 @@ export {
 } from "./src/quota-tracks.js";
 
 export {
+  CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY,
+  includedAllowanceSpeedWeight,
+} from "./src/included-allowance-speed.js";
+
+export {
+  classifyQuotaResetTimeline,
+  createResetEventClassifier,
+  mergeQuotaResetEvents,
+  normalizeResetEventContinuity,
+  normalizeQuotaResetEvent,
+  RESET_EVENT_CONTINUITY_SCHEMA_VERSION,
+  QUOTA_RESET_CLASSIFICATION_POLICY,
+  QUOTA_RESET_EVENT_KINDS,
+  QUOTA_RESET_EVENT_PRECISIONS,
+  QUOTA_RESET_EVENT_REASONS,
+  QUOTA_RESET_EVENT_SCHEMA_VERSION,
+} from "./src/reset-events.js";
+
+export {
   PLAN_ATTRIBUTION_POLICY,
   buildPlanAttributionIndex,
   classifyUsageAttribution,

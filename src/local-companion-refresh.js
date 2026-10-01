@@ -3,9 +3,14 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import {
+  createResetEventClassifier,
   isValidQuotaWindowDuration,
 } from "@app-usagemonitor/quota-analysis";
 import { selectProductionAccountObservationSecret } from "./account-observation-production.js";
+import {
+  createDevelopmentAccountObservationSecretLoader,
+  readDevelopmentAccountObservationSecretFile,
+} from "./account-observation-secret.js";
 import {
   LOCAL_COLLECTOR_LEGACY_REFRESH_USE_MAX,
   LOCAL_COLLECTOR_LEGACY_REFRESH_USE_SCHEMA_VERSION,
@@ -888,6 +893,7 @@ export function createLocalCollectorRefreshRunner({
   accountObservationOperationLockFile = null,
   selectAccountObservationSecret = selectProductionAccountObservationSecret,
   environment = process.env,
+  platform = process.platform,
   readAccountAttributionBinding = null,
   runCollector = runCollectorOnce,
   readAccountingCache = readReplaySafeAccountingCache,
@@ -977,8 +983,9 @@ export function createLocalCollectorRefreshRunner({
   }
   // The packaged macOS real-history QA lane runs against a copied profile and
   // must not read or mint the account-observation Keychain secret. Keep the
-  // ordinary quota result but leave its account scope unavailable; the
-  // development export identity is deliberately not an account-scope secret.
+  // ordinary quota result but leave its account scope unavailable by default.
+  // Interactive development can opt into a separate owner-only file identity;
+  // the export identity is deliberately never an account-scope secret.
   const accountObservationSecretDisabled =
     environment.USAGE_MONITOR_TEST_LANE === MACOS_ELECTRON_LOCAL_QA_TEST_LANE;
   // Cross-invocation backoff for a memory-budget miss. Held in the runner
@@ -992,6 +999,11 @@ export function createLocalCollectorRefreshRunner({
   // distinguish one soft miss from a rebuild that is never landing (the
   // 2026-08-19 livelock ran for hours behind a bare unavailable estimate).
   let accountingRebuildDeferredStreak = 0;
+  let hasReadQuota = false;
+  // Raw provider credit IDs never enter the collector store. The classifier's
+  // bounded keyed-fingerprint checkpoint is committed with the existing
+  // collector state so an ordinary companion restart preserves continuity.
+  const resetEventClassifier = createResetEventClassifier();
   return async function refreshLocalCollector({
     signal = null,
     onProgress = null,
@@ -1021,6 +1033,7 @@ export function createLocalCollectorRefreshRunner({
       }
       throw error;
     };
+    let developmentAccountLoader = null;
     try {
       return await (async () => {
     // Legacy is an explicit rollback authority, never an error fallback. Stamp
@@ -1059,7 +1072,29 @@ export function createLocalCollectorRefreshRunner({
       signal,
     );
     let selection = { loadAccountObservationSecret: null };
-    if (!accountObservationSecretDisabled) {
+    if (accountObservationSecretDisabled) {
+      let secret = null;
+      try {
+        if (platform === "darwin" && environment.USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY === "1"
+            && environment.USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE !== undefined
+            && !environment.USAGE_MONITOR_CENTRAL_ORIGIN
+            && !environment.USAGE_MONITOR_ACCOUNTLESS_ORIGIN
+            && !environment.USAGE_MONITOR_ACCOUNTLESS_MODE
+            && environment.APP_USAGEMONITOR_EXPORT_SECRET === undefined) {
+          secret = await readDevelopmentAccountObservationSecretFile(
+            environment.USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE,
+            { exportIdentityFile: environment.USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE },
+          );
+          developmentAccountLoader = createDevelopmentAccountObservationSecretLoader(secret);
+          selection = { loadAccountObservationSecret: developmentAccountLoader };
+        }
+      } catch {
+        // Broken opt-in stays unattributed and cannot fall through to Keychain.
+        selection = { loadAccountObservationSecret: null };
+      } finally {
+        secret?.fill(0);
+      }
+    } else {
       try {
         selection = selectAccountObservationSecret(
           accountObservationOperationLockFile === null
@@ -1078,6 +1113,9 @@ export function createLocalCollectorRefreshRunner({
       ...(stateFile === null ? {} : { stateFile }),
       staleAfterMs: 0,
       refreshStale: true,
+      // First read after companion startup and explicit detailed refreshes
+      // retain reset details; subsequent automatic quick polls need only usage.
+      excludeResetCreditDetails: !detailed && hasReadQuota,
       // Quick refresh reads only provider quota/headline evidence regardless
       // of storage authority. Unified detailed refresh also leaves usage facts
       // to its index; only detailed legacy collection may backfill rollouts.
@@ -1097,6 +1135,7 @@ export function createLocalCollectorRefreshRunner({
       maximumRecordBatchSize: 500,
       maximumRecentEventKeys: 5_000,
       loadAccountObservationSecret: selection.loadAccountObservationSecret,
+      resetEventClassifier,
       ...(readAccountAttributionBinding === null ? {} : { readAccountAttributionBinding }),
     };
     // The headline pass uses the collector's ordinary atomic SQLite state
@@ -1110,6 +1149,9 @@ export function createLocalCollectorRefreshRunner({
       maximumRecentPreludeBytes: EARLY_HEADLINE_RECENT_PRELUDE_BYTES,
       maximumBufferedLineBytes: EARLY_HEADLINE_BUFFERED_LINE_BYTES,
     });
+    if (result?.refresh?.recordWritten === true && !result.refresh.errorCode) {
+      hasReadQuota = true;
+    }
     let headlinePublished = false;
     let collectorResourceLimitDeferred = false;
     const publishHeadline = async (indexing) => {
@@ -1245,7 +1287,7 @@ export function createLocalCollectorRefreshRunner({
             sourceMode: accountingSourceMode,
             ...(accountingSourceMode === "unified"
               ? {
-                contextBehavior: "legacy_zero",
+                contextBehavior: "source_native",
                 expectedGeneration: unifiedIndex.generation,
               }
               : {}),
@@ -1315,7 +1357,7 @@ export function createLocalCollectorRefreshRunner({
               ? { expectedGeneration: unifiedIndex.generation }
               : {}),
             ...(accountingSourceMode === "unified"
-              ? { contextBehavior: "legacy_zero" }
+              ? { contextBehavior: "source_native" }
               : {}),
             declaredSpeedBaselines,
             signal,
@@ -1364,7 +1406,7 @@ export function createLocalCollectorRefreshRunner({
                 sourceMode: accountingSourceMode,
                 ...(accountingSourceMode === "unified"
                   ? {
-                    contextBehavior: "legacy_zero",
+                    contextBehavior: "source_native",
                     expectedGeneration: unifiedIndex.generation,
                   }
                   : {}),
@@ -1494,7 +1536,7 @@ export function createLocalCollectorRefreshRunner({
               errorCode: safeAccountingUnavailableCode(
                 accountingUnavailableCode,
               ),
-              compatibilityBehavior: "legacy_zero",
+              compatibilityBehavior: "source_native",
               coverageStatus: unifiedIndex?.generation?.status ?? "unavailable",
               generation: unifiedIndex?.generation?.id ?? null,
               generationFingerprint:
@@ -1519,6 +1561,8 @@ export function createLocalCollectorRefreshRunner({
       })();
     } catch (error) {
       stampStep(error);
+    } finally {
+      developmentAccountLoader?.dispose();
     }
   };
 }
@@ -1656,7 +1700,7 @@ function publicRefreshResult(result, now = Date.now()) {
           ? "accounting_unified_source_unavailable"
           : result.accounting.errorCode,
       ),
-      compatibilityBehavior: "legacy_zero",
+      compatibilityBehavior: "source_native",
       coverageStatus: ["complete", "partial"].includes(
         result.accounting.coverageStatus,
       ) ? result.accounting.coverageStatus : "unavailable",
@@ -1754,6 +1798,7 @@ export class LocalCompanionRefreshController {
   #inFlight = null;
   #onDegradedOutcome;
   #onTerminalFailure;
+  #onIndexPublished;
   #runner;
   #setTimeoutImpl;
   #state;
@@ -1785,6 +1830,9 @@ export class LocalCompanionRefreshController {
     // can file a content-free note keeping the trail the terminal recorder no
     // longer sees. At most once per run; its own failures are swallowed.
     onDegradedOutcome = null,
+    // Signals a validated, changed index only after the local snapshot reload.
+    // Observers cannot change refresh success or authorize contribution.
+    onIndexPublished = null,
   }) {
     if (typeof runner !== "function") throw new TypeError("runner must be a function");
     if (!dataStore || typeof dataStore.reload !== "function") {
@@ -1831,6 +1879,9 @@ export class LocalCompanionRefreshController {
     if (onDegradedOutcome !== null && typeof onDegradedOutcome !== "function") {
       throw new TypeError("onDegradedOutcome must be a function or null");
     }
+    if (onIndexPublished !== null && typeof onIndexPublished !== "function") {
+      throw new TypeError("onIndexPublished must be a function or null");
+    }
     this.#runner = runner;
     this.#dataStore = dataStore;
     this.#timeoutMs = timeoutMs;
@@ -1844,6 +1895,7 @@ export class LocalCompanionRefreshController {
     this.#createRefreshId = createRefreshId;
     this.#onTerminalFailure = onTerminalFailure;
     this.#onDegradedOutcome = onDegradedOutcome;
+    this.#onIndexPublished = onIndexPublished;
     this.#state = {
       status: "idle",
       refreshId: null,
@@ -2121,6 +2173,11 @@ export class LocalCompanionRefreshController {
               : {}),
           });
         }
+        // A cancellation/deadline can arrive while reload yields. Do not turn
+        // that terminal outcome into success or wake an uploader afterward.
+        if (this.#cancelRequested || timedOut || controller.signal.aborted) {
+          throw new Error("Refresh interrupted during snapshot reload");
+        }
         const finalProgress = publicIndexingResult(result?.indexing);
         const degradation = unifiedIndexDegradation(result);
         this.#state = {
@@ -2142,6 +2199,17 @@ export class LocalCompanionRefreshController {
         // retained cache. File the degraded-event note (kept from the incident)
         // now that the terminal-failure path no longer sees it.
         this.#notifyDegradedOutcome(result);
+        const publication = publicUnifiedIndexResult(result?.unifiedIndex);
+        if (mode === "detailed" && this.#state.status === "succeeded"
+            && !this.#cancelRequested && !timedOut && !controller.signal.aborted
+            && publication.status === "ingested" && result?.unifiedIndex?.unchanged === false
+            && publication.generation.status === "complete"
+            && unifiedGenerationAuthoritative(publication)
+            && this.#onIndexPublished !== null) {
+          try {
+            Promise.resolve(this.#onIndexPublished()).catch(() => {});
+          } catch { /* Publication observers cannot change the refresh result. */ }
+        }
       })
       .catch(async (error) => {
         if (this.#cancelRequested) {

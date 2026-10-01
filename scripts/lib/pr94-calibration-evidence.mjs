@@ -1,10 +1,10 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 
 // The runner authenticates the revision and its export-only loader. Pin the
-// unchanged fit body as well: the explanatory branches below must never become
+// reviewed fit body as well: the explanatory branches below must never become
 // a second, silently drifting calibration policy. All numerical fits are still
-// evaluated by the original revision's helpers and public reporter.
-const FIT_RESET_SHA256 = "c35467f3159d5c1d4188a8534b9dd8e4e93a2ca7316c7e1a81d9004dbf71c8b3";
+// evaluated by the selected revision's helpers and public reporter.
+const FIT_RESET_SHA256 = "b6972527fa25de2917ca88819a26d433711eda2053b87dbef9f9a18fd4b297d5";
 const SCHEMA = "pr94-calibration-evidence-v2";
 const LIMITS = Object.freeze({ parents: 10_000, transitions: 200_000, fragments: 40_000 });
 const CANDIDATES = Object.freeze([

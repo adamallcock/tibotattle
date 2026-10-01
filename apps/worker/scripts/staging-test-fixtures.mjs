@@ -125,6 +125,7 @@ export function successSpawn(
             attribution_objects: missingAttributionSchema ? 0 : 1,
             attribution_columns: missingAttributionSchema ? 0 : 1,
             scale_objects: missingScaleSchema ? 0 : 1,
+            public_source_objects: 1,
             scale_columns: missingScaleSchema ? 0 : 1,
             primary_cooldown_table: missingPrimarySchema ? 0 : 1,
             primary_participant_cooldown_digest: missingPrimarySchema ? 0 : 1,

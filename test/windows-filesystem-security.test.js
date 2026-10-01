@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   link,
@@ -6,6 +7,7 @@ import {
   rename,
   rm,
   symlink,
+  writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,6 +19,14 @@ import {
 } from "../src/platform/windows-filesystem.js";
 import { createWindowsCredentialAuditFileGuardContext } from "../src/platform/windows-credential-audit-file-guard.js";
 import { createWindowsCredentialOperationAuditStore } from "../src/platform/windows-credential-operation-audit.js";
+import {
+  classifyWindowsSyntheticSourceOwnerFailure,
+  createWindowsSyntheticOwnedSource,
+} from "../scripts/lib/windows-synthetic-source-owner.mjs";
+
+import { createTimingFilesystem } from '../src/platform/inference-timing-filesystem.js';
+import { openTimingStore, ingestTimingFile, readTimingRows } from '../src/platform/inference-timing-store.js';
+import { createParser, digest, METHOD, MAX_STATE_BYTES } from '../src/providers/codex/logs.js';
 
 const NATIVE_WINDOWS = process.platform === "win32" && process.arch === "x64";
 const NATIVE_SKIP = NATIVE_WINDOWS ? false : "native Windows x64 only";
@@ -31,6 +41,83 @@ async function withSyntheticRoot(run) {
     await rm(parent, { recursive: true, force: true });
   }
 }
+
+async function writeSyntheticOwnedSource(path, contents) {
+  // An elevated Windows token can default new files to a group owner.
+  // Create this disposable fixture with the current-user owner directly,
+  // retaining ordinary source access instead of protected derived state.
+  createWindowsSyntheticOwnedSource(path, contents);
+}
+
+test("synthetic owner child removes inherited module paths without changing its parent", () => {
+  const path = String.raw`C:\runner\owned\synthetic.jsonl`;
+  const parent = Object.freeze({
+    PSModulePath: "synthetic-pwsh7-modules",
+    pSmOdUlEpAtH: "synthetic-other-inherited-modules",
+    PATH: "synthetic-executable-search",
+    SystemRoot: "synthetic-windows-root",
+    TIBOTATTLE_SYNTHETIC_SOURCE_FILE: "synthetic-previous-source",
+  });
+  const before = { ...parent };
+  let child;
+  createWindowsSyntheticOwnedSource(path, "synthetic\n", {
+    environment: parent,
+    run: (_command, _args, options) => {
+      child = options.env;
+      assert.equal(options.input.toString(), "synthetic\n");
+      return { status: 0, stdout: "", stderr: "" };
+    },
+  });
+  assert.deepEqual(child, {
+    PATH: parent.PATH,
+    SystemRoot: parent.SystemRoot,
+    TIBOTATTLE_SYNTHETIC_SOURCE_FILE: path,
+    TIBOTATTLE_SYNTHETIC_SOURCE_LENGTH: "10",
+  });
+  assert.deepEqual(parent, before);
+});
+
+test("synthetic owner creation failures report fixed categories without subprocess details", () => {
+  const canary = "private-fixture-path-or-owner-canary";
+  const path = String.raw`C:\runner\owned\synthetic.jsonl`;
+  const failureCategories = {
+    41: "create_identity_failed", 42: "create_native_setup_failed",
+    43: "create_token_owner_failed", 44: "create_file_write_failed",
+    45: "create_input_length_failed", 46: "create_close_failed",
+    47: "create_owner_read_failed", 48: "create_owner_missing",
+    49: "create_owner_mismatch", 50: "create_dacl_failed",
+    51: "create_content_length_failed",
+  };
+  for (const [result, category] of [
+    ...Object.entries(failureCategories).map(([status, category]) => (
+      [{ status: Number(status) }, category]
+    )),
+    [{ status: 1 }, "create_unexpected_exit"],
+    [{ status: null, error: { code: "ETIMEDOUT", message: canary } }, "create_timed_out"],
+    [{ status: null, error: { code: canary, message: canary } }, "create_launch_failed"],
+  ]) {
+    assert.throws(() => createWindowsSyntheticOwnedSource(path, "synthetic\n", {
+      run: () => ({ ...result, stdout: canary, stderr: canary }),
+    }), (error) => {
+      assert.equal(classifyWindowsSyntheticSourceOwnerFailure(error), `synthetic_owner_${category}`);
+      assert.equal(error.message.includes(canary), false);
+      return true;
+    });
+  }
+  createWindowsSyntheticOwnedSource(path, "synthetic\n", {
+    run: () => ({ status: 0, stdout: "", stderr: "" }),
+  });
+  for (const field of ["stdout", "stderr"]) {
+    assert.throws(() => createWindowsSyntheticOwnedSource(path, "synthetic\n", {
+      run: () => ({ status: 0, stdout: "", stderr: "", [field]: canary }),
+    }), (error) => {
+      assert.equal(classifyWindowsSyntheticSourceOwnerFailure(error),
+        "synthetic_owner_create_unexpected_exit");
+      assert.equal(error.message.includes(canary), false);
+      return true;
+    });
+  }
+});
 
 function fixedNativeError(code) {
   return (error) => {
@@ -310,4 +397,119 @@ test("native audit guard rejects hard-linked and reparse-point database files", 
     }
     throw error;
   }
+}));
+
+
+test("native source handle holds its name, bounds reads and rejects links and foreign leases", {
+  skip: NATIVE_SKIP,
+}, () => withSyntheticRoot(async ({ adapter, root }) => {
+  adapter.ensureDirectory(root);
+  const native = loadWindowsFilesystemBinding();
+  const source = join(root, "source Ω.jsonl");
+  // Codex's ordinary source ACL is accepted; derived state still requires
+  // the stricter owner-only protected DACL.
+  await writeSyntheticOwnedSource(source, "synthetic\n");
+  // Audit guards authenticate the file and its two nearest parent directories.
+  const privateRoot = join(root, "private");
+  adapter.ensureDirectory(privateRoot);
+  const protectedFile = join(privateRoot, "protected.sqlite");
+  adapter.createFile(protectedFile, Buffer.alloc(0));
+  const protectedLease = native.acquireCredentialAuditFileGuard(protectedFile);
+  try {
+    assert.throws(() => native.closeSourceFile(protectedLease.guard));
+    assert.throws(() => native.readSourceFile(protectedLease.guard, 0, 1));
+  } finally { native.releaseCredentialAuditFileGuard(protectedLease.guard); }
+  const lease = native.openSourceFile(source);
+  try {
+    assert.equal(native.statSourceFile(lease).size, 10);
+    assert.equal(native.readSourceFile(lease, 0, 65536).toString(), "synthetic\n");
+    assert.throws(() => native.readSourceFile(lease, 0, 65537));
+    assert.throws(() => native.readSourceFile(lease, -1, 1));
+    assert.throws(() => native.statSourceFile({}));
+    await assert.rejects(rename(source, join(root, "moved.jsonl")));
+    await assert.rejects(rename(root, `${root}-moved`));
+  } finally { native.closeSourceFile(lease); }
+  assert.throws(() => native.statSourceFile(lease));
+  await rename(source, join(root, "moved.jsonl"));
+  const linked = join(root, "hardlink.jsonl");
+  await link(join(root, "moved.jsonl"), linked);
+  assert.throws(() => native.openSourceFile(linked));
+  const junction = `${root}-junction`;
+  try {
+    await symlink(root, junction, "junction");
+    assert.throws(() => native.openSourceFile(join(junction, "moved.jsonl")));
+  } finally { await rm(junction, { force: true }); }
+}));
+
+function syntheticTimingRecords() {
+  const at = 1789200000000;
+  return [
+    { type: "session_meta", payload: { id: "synthetic-session" } },
+    { type: "event_msg", payload: { type: "task_started", turn_id: "synthetic-turn" } },
+    { type: "turn_context", payload: { turn_id: "synthetic-turn", model: "gpt-5.6-sol" } },
+    { type: "event_msg", payload: { type: "task_complete", turn_id: "synthetic-turn",
+      duration_ms: 2_000, time_to_first_token_ms: 200 } },
+  ].map((record, index) => ({
+    ...record, timestamp: new Date(at + index * 1_000).toISOString(),
+  }));
+}
+
+test("native timing fixture qualifies a 200 ms TTFT with a valid task boundary", () => {
+  const parse = (records) => {
+    const turns = [];
+    const parser = createParser(Buffer.alloc(32, 7), null, (turn) => turns.push(turn));
+    records.forEach((record, index) => (
+      parser.line(Buffer.from(JSON.stringify(record)), index + 1, false)
+    ));
+    assert.equal(turns.length, 1);
+    return turns[0];
+  };
+  const qualified = parse(syntheticTimingRecords());
+  assert.equal(qualified.ttft, 200);
+  assert.equal(qualified.duration, null, "TTFT does not manufacture generation timing");
+  const missingDuration = syntheticTimingRecords();
+  delete missingDuration.at(-1).payload.duration_ms;
+  const unqualified = parse(missingDuration);
+  assert.equal(unqualified.ttft, null);
+  assert.equal(unqualified.quality, "invalid_boundary");
+});
+
+test("native timing SQLite retains guarded journal, reconstructs TTFT and reopens without duplication", {
+  skip: NATIVE_SKIP,
+}, () => withSyntheticRoot(async ({ adapter, root }) => {
+  adapter.ensureDirectory(root);
+  const native = loadWindowsFilesystemBinding();
+  // Explicit qualification injection does not change production policy.
+  const filesystem = createTimingFilesystem({ platform: "win32", loadWindowsBinding: () => native });
+  const options = { createParser, digest, METHOD, MAX_STATE_BYTES, filesystem };
+  const source = join(root, "synthetic.jsonl"), dir = join(root, "timing");
+  await writeSyntheticOwnedSource(source,
+    syntheticTimingRecords().map((record) => JSON.stringify(record)).join("\n") + "\n");
+  let store = await openTimingStore(dir, options);
+  try {
+    await ingestTimingFile(store, source);
+    assert.equal(readTimingRows(store)[0].ttft, 200);
+    assert.equal(store.db.prepare("PRAGMA journal_mode").get().journal_mode, "persist");
+    await assert.rejects(rename(store.file, `${store.file}.moved`));
+    await assert.rejects(rename(`${store.file}-journal`, `${store.file}-journal.moved`));
+    store.close();
+    store = await openTimingStore(dir, options);
+    assert.equal((await ingestTimingFile(store, source)).unchanged, true);
+    assert.equal(readTimingRows(store).length, 1);
+    store.close();
+    const crash = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import { createTimingFilesystem } from './src/platform/inference-timing-filesystem.js';
+      import { loadWindowsFilesystemBinding } from './src/platform/windows-filesystem.js';
+      import { openTimingStore } from './src/platform/inference-timing-store.js';
+      import { createParser, digest, METHOD, MAX_STATE_BYTES } from './src/providers/codex/logs.js';
+      const filesystem = createTimingFilesystem({ platform: 'win32', loadWindowsBinding: loadWindowsFilesystemBinding });
+      const store = await openTimingStore(process.argv[1], { createParser, digest, METHOD, MAX_STATE_BYTES, filesystem });
+      store.db.exec('PRAGMA cache_size=1; BEGIN IMMEDIATE; CREATE TABLE uncommitted(x BLOB); INSERT INTO uncommitted VALUES(zeroblob(1048576));');
+      process.exit(0);
+    `, dir], { encoding: 'utf8', timeout: 10000, windowsHide: true });
+    assert.equal(crash.status, 0, 'synthetic crash writer completed');
+    store = await openTimingStore(dir, options);
+    assert.equal(readTimingRows(store).length, 1, 'hot journal recovery preserves committed timing');
+    assert.equal(store.db.prepare("SELECT count(*) AS n FROM sqlite_master WHERE name='uncommitted'").get().n, 0);
+  } finally { store.close(); }
 }));

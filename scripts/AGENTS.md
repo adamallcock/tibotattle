@@ -21,7 +21,7 @@ Scope: all files under `scripts/`. Apply the repository root guidance first.
 - Routine build, test, and dry-run modes must not request Keychain passwords or
   touch real credentials. Keep signing-key provisioning an explicit owner step;
   never automate prompt approval or broaden key access to unblock a build.
-  Apply the native prompt-free release gate in `apps/macos/AGENTS.md`.
+  Apply the macOS Electron migration and credential gates in `apps/electron/AGENTS.md`.
 
 ## Generators and builds
 
@@ -52,13 +52,17 @@ Scope: all files under `scripts/`. Apply the repository root guidance first.
 
 ## Validation
 
+- macOS packaging and smoke commands that launch an Electron or app GUI need
+  WindowServer access from the start. Run those native checks in a permitted
+  execution context, or stop before launch and report the environment gap;
+  do not use an expected AppKit abort as a capability probe.
 - Add unit tests for argument parsing, refusal paths, path safety, interruption,
   recovery, deterministic output, and dry-run/mutation separation.
 - Run `node --check` and the narrow owning tests while iterating. Run
   `npm run test:preflight` for layout/docs tooling and
   `npm run architecture:check` when dependency scanning or boundaries change.
-- Use the owning surface gate for build/release tooling. Changes to the macOS
-  builder, Worker deployment, release trust, or public site require those exact
-  gates; `npm test` alone is insufficient.
+- Use the owning surface gate for build/release tooling. Changes to macOS
+  Electron packaging or transition, Worker deployment, release trust, or the
+  public site require those exact gates; `npm test` alone is insufficient.
 - Test only safe modes unless the user explicitly authorizes the exact external
   or destructive operation. State protected or unavailable validation separately.

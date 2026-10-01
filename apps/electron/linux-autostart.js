@@ -314,8 +314,30 @@ export function createLinuxAutostartOwner({
     }
   }
 
-  async function existingAutostartDirectory({ create = false } = {}) {
+  async function configDirectory({ create = false } = {}) {
+    try {
+      return await validateDirectory(selectedConfigRoot);
+    } catch (error) {
+      if (error?.code !== "linux_autostart_directory_unavailable") throw error;
+    }
+    const parent = posix.dirname(selectedConfigRoot);
+    const parentIdentity = await validateDirectory(parent);
+    if (!create) return null;
+    try {
+      await fs.mkdir(selectedConfigRoot, { mode: 0o700 });
+    } catch (error) {
+      if (error?.code !== "EEXIST") fail("directory_unavailable");
+    }
     const configIdentity = await validateDirectory(selectedConfigRoot);
+    if (!sameDirectoryIdentity(parentIdentity, await validateDirectory(parent))) {
+      fail("directory_replaced");
+    }
+    return configIdentity;
+  }
+
+  async function existingAutostartDirectory({ create = false } = {}) {
+    const configIdentity = await configDirectory({ create });
+    if (configIdentity === null) return null;
     let metadata;
     try {
       metadata = await fs.lstat(directory);

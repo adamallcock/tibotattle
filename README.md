@@ -8,12 +8,13 @@ confident answer.
 
 Personal analysis runs locally and works without an account. Raw source logs do
 not leave your machine, and prompts, responses, file paths, and raw account
-identifiers do not enter TiboTattle's derived artifacts. The released native app's hosted contribution path remains off by default,
-with local review and an explicit send. The unified Electron workstream adopts
-[accountless automatic sharing](docs/decisions/2026-09-04-accountless-sharing-policy.md):
-fresh installs default on, existing users receive three notices, and a persistent
-opt-out is available without sign-in. The current Electron candidate implements
-the preference and notices; its accountless upload transport is not yet active.
+identifiers do not enter TiboTattle's derived artifacts. Electron implements
+[accountless optional sharing](docs/decisions/2026-09-04-accountless-sharing-policy.md):
+fresh installs default on, existing installations without a recorded choice
+receive three notices, and a persistent opt-out is available without sign-in.
+Uploads honor the recorded preference and negotiated hosted capabilities.
+Local analysis remains available independently of hosted service availability.
+Native Mac version 0.1.18 retains its default-off, review-and-send behavior.
 
 
 > **The name:** TiboTattle is named with affection for the Codex community and
@@ -34,11 +35,12 @@ the preference and notices; its accountless upload transport is not yet active.
   explicit uncertainty band.
 - **Timelines** — hourly/daily/weekly usage against allowance, entirely from
   local evidence.
-- **Fast-mode pricing** — Codex Fast mode is the API's Priority processing
-  tier, so Fast turns are priced at the provider's published Priority (Fast)
-  API rates: 2x Standard for the GPT-5.6 and GPT-5.4 families, 2.5x for
+- **Fast-mode pricing** — API-price-equivalent estimates for Codex Fast turns
+  use the provider's published Priority (Fast) API rates: 2x Standard for
+  GPT-6 Astra, Sol and Luna and the GPT-5.6 and GPT-5.4 families, 2.5x for
   GPT-5.5, and a clearly disclosed assumed 2x for models with no published
-  Priority rate. Codex records the speed mode only when it is applied or
+  Priority rate. These estimates are not subscription charges or quota formulas.
+  Codex records the speed mode only when it is applied or
   changed, so turns before the first change in a session are attributed to
   Standard as a visible assumption unless a timestamped configuration reading
   covers them.
@@ -64,9 +66,10 @@ Alternatively, choose the **macOS Apple silicon** or **macOS Intel** DMG from
 If you are unsure, **Apple menu → About This Mac** shows either an Apple chip or
 an Intel processor. Open the DMG, drag TiboTattle to Applications, and launch it.
 When both refer to the same published version, those channels point to the same
-architecture-specific Developer ID artifact; the app continues to use its signed Sparkle feed for
-updates. A missing website slot is not a release claim—use the GitHub release
-page for the exact version and digest. A v1 release manifest may explicitly
+architecture-specific Developer ID artifact. In Electron, check for updates in
+Settings → About. Native Mac version 0.1.18 uses its retained Sparkle feed to
+transition to Electron. A missing website slot is not a release claim—use the
+GitHub release page for the exact version and digest. A v1 release manifest may explicitly
 leave SBOM or provenance fields `null`; source-to-binary provenance is claimed
 only when a trusted hosted workflow generated/finalized and cryptographically
 verified the exact final bytes for that specific release. This repository is
@@ -80,15 +83,10 @@ GitHub provenance evidence yourself.
 ## Build from source (developers)
 
 These requirements are for development, not installation of the released app.
-The native app builder runs on macOS 14 or later on Apple silicon. Repository
-tooling requires Node.js ≥ 22.13,
-[pnpm](https://pnpm.io) 11, and the Xcode command-line tools. The app-bundle
-build itself requires exactly Node v26.2.0 on macOS arm64: it fails on any
-other runtime rather than producing an unverifiable bundle.
-The default target is Apple silicon. To build an Intel target on that same
-builder, follow the explicit target and verified-runtime instructions in
-[the native developer guide](apps/macos/README.md#developer-build). A native
-Intel build host is not currently supported by this builder.
+Repository tooling requires Node.js ≥ 22.13 and
+[pnpm](https://pnpm.io) 11. macOS Electron packaging also requires the
+supported macOS build host and Xcode command-line tools; the production
+candidate procedure is in the [macOS release runbook](docs/runbooks/macos-stable-release-runbook.md).
 
 The root workspace uses pnpm; the Worker keeps its own npm lockfile, which is
 needed only for hosted-service checks and the full gates:
@@ -101,8 +99,7 @@ npm --prefix apps/worker ci
 Build and open the self-contained desktop app:
 
 ```bash
-npm run product:macos:build
-open ".release-build/macos/TiboTattle.app"
+npm run package:electron:development
 ```
 
 For development only, run the local dashboard in an external browser without
@@ -178,8 +175,8 @@ for the provenance and future-locale policy.
   Existing installations without a choice receive the policy's visible notices
   before activation. Community and Settings expose the same saved choice.
 - The shared dashboard contains no Google/Apple sign-in or legacy social
-  controls. Legacy enrollment and device-disconnect backend contracts remain
-  compatible with their existing consumers. Hosted erasure is a separate
+  controls. Legacy enrollment and **Disconnect this Mac** backend contracts
+  remain compatible with their existing consumers. Hosted erasure is a separate
   private owner operation, not an app control; local-only use needs no account.
 - Derived artifacts (reports, exports, telemetry) are schema-validated to
   exclude prompts, responses, commands, paths, URLs, and raw identifiers.
@@ -202,7 +199,7 @@ compatibility fallback until they are explicitly migrated.
 
 | Path | Contents |
 | --- | --- |
-| `apps/macos`, `apps/local`, `apps/web` | Desktop app shell, loopback companion server, and browser dashboard |
+| `apps/electron`, `apps/local`, `apps/web` | Desktop app shell, loopback companion server, and browser dashboard |
 | `apps/worker` | Optional hosted contribution service (off by default) |
 | `packages/` | Workspace packages: accounting, quota analysis, telemetry contract, identity core, and i18n |
 | `src/` | Product source: `application/`, `platform/`, `export/`, `contribution/`, `reporting/`, `providers/` owners plus compatibility roots |
@@ -248,35 +245,21 @@ separate source, native, installed, release, updater, and platform gates.
 npm run product:check
 ```
 
-For native iteration, start with a deterministic preflight and the source-only
-macOS lane:
+For iteration, run the preflight and the retained native-upgrade transition
+contract gate:
 
 ```bash
-npm run test:fast
-npm run test:macos:smoke
+npm run test:preflight
+npm run product:macos:transition:test
 ```
 
-`test:macos:smoke` builds one development-only app with the test compiler
-profile; that profile cannot create preview or external-distribution output.
-Use `npm run test:changed -- --base <revision>` to select known changed paths,
-which includes `<revision>...HEAD` plus staged, unstaged, and untracked local
-paths. It narrows only reviewed native app/build and i18n paths: native source
-changes include the test-profile smoke, and `--full` adds the expensive
-bundle-artifact lane. Web, local-server, shared configuration, runner, and
-unfamiliar paths conservatively run the complete `npm run check` gate. The
-smoke lane requires macOS arm64 with the pinned Node v26.2.0 builder; it fails
-rather than falsely reporting a smoke result on another platform. The retained
-release-quality macOS gate is always:
-
-```bash
-npm run product:macos:test
-```
-
-`npm test` and lane execution remain serial by design. The artifact lane itself
-uses two isolated OS-level builder processes for its reproducibility check;
-each build has a separate output and compiler scratch directory. Measure the
-local lanes with `npm run test:benchmark` (or `test:benchmark:release` to
-include the retained release gate).
+The transition gate prepares the pinned Sparkle tools and tests historical
+signed-artifact validation, both incoming appcast paths, and Electron handover
+contracts. It does not build the retired native app or qualify an installed
+upgrade. Use `npm run test:changed -- --base <revision>` to select known changed
+paths; unfamiliar or shared changes run the complete `npm run check` gate.
+Both-architecture installed upgrade qualification remains a separate release
+gate in the [macOS release runbook](docs/runbooks/macos-stable-release-runbook.md).
 
 `npm run architecture:check` enforces ownership boundaries. Maintained current
 references are deliberately split by authority:
@@ -293,9 +276,9 @@ vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 
 ## Status
 
-TiboTattle is a published macOS product with an operational optional hosted
-service. The current published version and user-facing history are listed in
-the [changelog](CHANGELOG.md) and on the
+TiboTattle publishes desktop installers for macOS, Windows x64 and Linux x64,
+with an operational optional hosted service. The current published version and
+user-facing history are listed in the [changelog](CHANGELOG.md) and on the
 [GitHub Releases page](https://github.com/adamallcock/tibotattle/releases).
 TiboTattle is not a provider-authoritative billing dashboard: quota estimates
 carry explicit uncertainty, and unknown models or tiers remain explicit rather

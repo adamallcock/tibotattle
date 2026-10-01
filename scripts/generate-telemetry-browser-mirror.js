@@ -40,9 +40,19 @@ const CANONICAL_MODULES = Object.freeze([
     basename: "model-catalog.js",
     expectedImports: Object.freeze([]),
   }),
+  // Ordered after the catalog it validates and after the public slice, so the
+  // public model mirror carries the vocabulary alone.
+  Object.freeze({
+    basename: "model-catalog-contract.js",
+    expectedImports: Object.freeze(["./model-catalog.js"]),
+  }),
   Object.freeze({
     basename: "admin-model-history.js",
     expectedImports: Object.freeze(["./model-catalog.js"]),
+    privateExports: Object.freeze([
+      "PREVIOUS_ADMIN_MODEL_HISTORY_CATALOG_VERSION",
+      "OLDER_ADMIN_MODEL_HISTORY_CATALOG_VERSION",
+    ]),
   }),
   Object.freeze({
     basename: "constants.js",
@@ -105,6 +115,30 @@ const CANONICAL_MODULES = Object.freeze([
     basename: "telemetry-v1.1-domain.js",
     expectedImports: Object.freeze([
       "./errors.js", "./primitives.js", "./telemetry-v1.1.js",
+    ]),
+  }),
+  Object.freeze({
+    basename: "telemetry-v1.2.js",
+    expectedImports: Object.freeze([
+      "./constants.js", "./errors.js", "./primitives.js",
+    ]),
+  }),
+  Object.freeze({
+    basename: "telemetry-v1.2-domain.js",
+    expectedImports: Object.freeze([
+      "./errors.js", "./primitives.js", "./telemetry-v1.2.js",
+    ]),
+  }),
+  Object.freeze({
+    basename: "performance-histogram.js",
+    expectedImports: Object.freeze([
+      "./primitives.js", "./errors.js",
+    ]),
+  }),
+  Object.freeze({
+    basename: "telemetry-performance-v1.js",
+    expectedImports: Object.freeze([
+      "./errors.js", "./model-catalog.js", "./performance-histogram.js", "./primitives.js",
     ]),
   }),
 ]);

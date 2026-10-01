@@ -3,7 +3,7 @@ import { applyD1Migrations, reset, type D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { readAdminGraphRefreshProgress, readAdminPreparationProgress } from "../src/admin-graph-refresh-progress";
 import { readCommunityRefreshLane, recordCommunityRefreshLane } from "../src/community-refresh-lanes";
-import { COMMUNITY_ATTRIBUTION_METHOD_VERSION } from "../src/community-allowance";
+import { COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION } from "../src/community-allowance";
 import { seedModelHistoryFixture, MODEL_HISTORY_TEST_PARTICIPANT, MODEL_HISTORY_TEST_DAY } from "./helpers/model-history";
 import { loadV1SourcePin } from "../src/telemetry-v1-source-selection";
 import { ensurePreparedV1Window } from "../src/prepared-v1-evidence";
@@ -74,12 +74,24 @@ describe("independent owner refresh progress", () => {
     expect(Object.hasOwn(legacy, "preparation")).toBe(false);
   });
 
-  it("returns closed content-free metadata without advancing or inventing completion", async () => {
-    const result = await readAdminGraphRefreshProgress(db(), NOW, "resumable");
+  it("reports the migration policy invalidation without advancing or inventing completion", async () => {
+    // 0060 deliberately retires the old public policy, even on an otherwise
+    // empty database. An invalidation marker is distinct from never published.
+    const before = await db().prepare("SELECT * FROM community_snapshot_mutation_control WHERE singleton_id=1").first();
+    expect(before?.graph_last_invalidated_at).toEqual(expect.any(String));
+    const statements: string[] = [];
+    const database = new Proxy(db(), { get(target, key) {
+      if (key === "prepare") return (sql: string) => { statements.push(sql); return target.prepare(sql); };
+      const value = Reflect.get(target,key,target); return typeof value === "function" ? value.bind(target) : value;
+    } });
+    const result = await readAdminGraphRefreshProgress(database, NOW, "resumable");
+    expect(statements.every(sql => /^\s*(?:SELECT|WITH)\b/u.test(sql))).toBe(true);
+    for (const sql of statements) expect(sql).not.toMatch(/\b(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER)\b/u);
+    expect(await db().prepare("SELECT * FROM community_snapshot_mutation_control WHERE singleton_id=1").first()).toEqual(before);
     const epoch = (await readCommunityRefreshLane(db(), "current", NOW)).sourceEpoch;
     expect(Object.keys(result).sort()).toEqual(["generatedAt", "history", "publication", "schemaVersion", "work"]);
     expect(result.schemaVersion).toBe(1);
-    expect(result.publication).toEqual({ state: "empty", requestedGeneration: epoch, preparedGeneration: null,
+    expect(result.publication).toEqual({ state: "invalidated", requestedGeneration: epoch, preparedGeneration: null,
       publishedGeneration: null, publishedAt: null });
     expect(result.work).toMatchObject({ state: "queued", phase: "current", trigger: null, restartReason: null });
     expect(result.history.resolvedDays).toBe(0);
@@ -94,7 +106,7 @@ describe("independent owner refresh progress", () => {
     await recordCommunityRefreshLane(db(), pin, true, NOW);
     await db().prepare(`INSERT INTO admin_community_allowance_preview_cache
       (singleton,generated_at,payload_json,attribution_method_version,source_mutation_epoch) VALUES(1,?,'{}',?,?)`)
-      .bind(new Date(NOW).toISOString(), COMMUNITY_ATTRIBUTION_METHOD_VERSION, epoch).run();
+      .bind(new Date(NOW).toISOString(), COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION, epoch).run();
     const before = await readAdminGraphRefreshProgress(db(), NOW, "resumable");
     expect(before.publication).toMatchObject({ state: "ready", requestedGeneration: epoch, preparedGeneration: null, publishedGeneration: epoch });
     await db().prepare(`UPDATE community_snapshot_mutation_control SET mutation_epoch=mutation_epoch+1,
@@ -127,7 +139,7 @@ describe("independent owner refresh progress", () => {
             const epoch=(await readCommunityRefreshLane(base,"current",NOW)).sourceEpoch;
             await base.prepare(`INSERT INTO admin_community_allowance_preview_cache
               (singleton,generated_at,payload_json,attribution_method_version,source_mutation_epoch)
-              VALUES(1,?,'{}',?,?)`).bind(new Date(NOW).toISOString(),COMMUNITY_ATTRIBUTION_METHOD_VERSION,epoch).run();
+              VALUES(1,?,'{}',?,?)`).bind(new Date(NOW).toISOString(),COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION,epoch).run();
             return inner.first();
           };
           const value=Reflect.get(inner,property,inner);return typeof value==="function"?value.bind(inner):value;

@@ -1,0 +1,702 @@
+{
+  "schemaVersion": 3,
+  "generatedAt": "2026-09-17T12:00:00.000Z",
+  "publication": {
+    "state": "ready",
+    "requestedGeneration": 42,
+    "preparedGeneration": null,
+    "publishedGeneration": 40,
+    "publishedAt": "2026-09-17T09:41:00.000Z"
+  },
+  "work": {
+    "state": "building",
+    "phase": "history",
+    "updatedAt": "2026-09-17T11:59:00.000Z",
+    "trigger": "correction",
+    "restartReason": "input_changed"
+  },
+  "history": {
+    "resolvedDays": 6,
+    "requiredDays": 69,
+    "activeDay": "2026-09-04",
+    "completeAccounts": 8,
+    "requiredAccounts": 19
+  },
+  "graph": {
+    "window": {
+      "days": 69,
+      "from": "2026-07-10",
+      "to": "2026-09-16"
+    },
+    "owners": {
+      "active": 19
+    },
+    "currentFits": {
+      "day": "2026-09-17",
+      "ready": 7,
+      "noFit": 9,
+      "missing": 3
+    },
+    "days": [
+      {
+        "day": "2026-09-16",
+        "ready": 10,
+        "refused": 8,
+        "unsupported": 1,
+        "missing": 0,
+        "published": true,
+        "publishedAt": "2026-09-17T09:41:00.000Z"
+      },
+      {
+        "day": "2026-09-15",
+        "ready": 10,
+        "refused": 8,
+        "unsupported": 1,
+        "missing": 0,
+        "published": true,
+        "publishedAt": "2026-09-16T09:41:00.000Z"
+      },
+      {
+        "day": "2026-09-14",
+        "ready": 10,
+        "refused": 8,
+        "unsupported": 1,
+        "missing": 0,
+        "published": true,
+        "publishedAt": "2026-09-15T09:41:00.000Z"
+      },
+      {
+        "day": "2026-09-13",
+        "ready": 10,
+        "refused": 8,
+        "unsupported": 1,
+        "missing": 0,
+        "published": true,
+        "publishedAt": "2026-09-14T09:41:00.000Z"
+      },
+      {
+        "day": "2026-09-12",
+        "ready": 10,
+        "refused": 8,
+        "unsupported": 1,
+        "missing": 0,
+        "published": true,
+        "publishedAt": "2026-09-13T09:41:00.000Z"
+      },
+      {
+        "day": "2026-09-11",
+        "ready": 10,
+        "refused": 8,
+        "unsupported": 1,
+        "missing": 0,
+        "published": true,
+        "publishedAt": "2026-09-12T09:41:00.000Z"
+      },
+      {
+        "day": "2026-09-10",
+        "ready": 11,
+        "refused": 7,
+        "unsupported": 1,
+        "missing": 0,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-09-09",
+        "ready": 11,
+        "refused": 7,
+        "unsupported": 1,
+        "missing": 0,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-09-08",
+        "ready": 6,
+        "refused": 4,
+        "unsupported": 1,
+        "missing": 8,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-09-07",
+        "ready": 5,
+        "refused": 5,
+        "unsupported": 0,
+        "missing": 9,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-09-06",
+        "ready": 4,
+        "refused": 3,
+        "unsupported": 1,
+        "missing": 11,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-09-05",
+        "ready": 3,
+        "refused": 6,
+        "unsupported": 0,
+        "missing": 10,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-09-04",
+        "ready": 2,
+        "refused": 2,
+        "unsupported": 1,
+        "missing": 14,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-09-03",
+        "ready": 6,
+        "refused": 1,
+        "unsupported": 0,
+        "missing": 12,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-09-02",
+        "ready": 1,
+        "refused": 8,
+        "unsupported": 0,
+        "missing": 10,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-09-01",
+        "ready": 5,
+        "refused": 4,
+        "unsupported": 1,
+        "missing": 9,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-31",
+        "ready": 2,
+        "refused": 7,
+        "unsupported": 0,
+        "missing": 10,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-30",
+        "ready": 4,
+        "refused": 1,
+        "unsupported": 1,
+        "missing": 13,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-29",
+        "ready": 3,
+        "refused": 2,
+        "unsupported": 0,
+        "missing": 14,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-28",
+        "ready": 1,
+        "refused": 0,
+        "unsupported": 1,
+        "missing": 17,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-27",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-26",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-25",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-24",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-23",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-22",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-21",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-20",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-19",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-18",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-17",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-16",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-15",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-14",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-13",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-12",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-11",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-10",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-09",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-08",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-07",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-06",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-05",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-04",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-03",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-02",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-08-01",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-07-31",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-07-30",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-07-29",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-07-28",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-07-27",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-07-26",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-07-25",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-07-24",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-07-23",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-07-22",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-07-21",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-07-20",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-07-19",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-07-18",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-07-17",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-07-16",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-07-15",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-07-14",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-07-13",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-07-12",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-07-11",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      },
+      {
+        "day": "2026-07-10",
+        "ready": 0,
+        "refused": 0,
+        "unsupported": 0,
+        "missing": 19,
+        "published": false,
+        "publishedAt": null
+      }
+    ],
+    "refusals": [
+      {
+        "reason": "multi_plan_window_unsupported",
+        "owners": 8
+      },
+      {
+        "reason": "supported_quota_track_unavailable",
+        "owners": 1
+      },
+      {
+        "reason": "downsampled_quota_limit_exceeded",
+        "owners": 4
+      },
+      {
+        "reason": "newly_coded_upstream_reason",
+        "owners": 2
+      }
+    ],
+    "work": {
+      "state": "building",
+      "activeDay": "2026-09-04",
+      "activeMetric": "model",
+      "leaseExpiresAt": "2026-09-17T12:04:00.000Z",
+      "selections": {
+        "pending": 3,
+        "claimed": 1
+      },
+      "checkpoints": null
+    },
+    "throughput": {
+      "resultsLastHour": null,
+      "resultsLast6Hours": null,
+      "remainingResults": 1042,
+      "estimatedHoursRemaining": null
+    },
+    "retirement": {
+      "staleResults": null
+    }
+  }
+}

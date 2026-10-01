@@ -620,7 +620,7 @@ test("historical side-chat gap probe keeps exact usage separate from its quota-r
       Object.fromEntries(Object.entries(result.exactUsage.bySpeed).map(
         ([speed, row]) => [speed, row.events],
       )),
-      { fast: 1, standard: 1, unknown: 1, other: 0 },
+      { ultrafast: 0, fast: 1, standard: 1, unknown: 1, other: 0 },
     );
     assert.ok(
       result.exactUsage.quotaWeightedApiPriceEquivalentRangeUsd.upper

@@ -3,7 +3,7 @@
 // The published identities match the accounting package's reviewed text-model
 // cards; synthetic provider-tool cards are deliberately excluded. Explicit
 // aliases retain their own identity even when a caller shares a price card.
-export const REVIEWED_MODEL_CATALOG_VERSION = "reviewed-model-catalog-2026-09-03.1";
+export const REVIEWED_MODEL_CATALOG_VERSION = "reviewed-model-catalog-2026-09-29.1";
 
 const reviewedOpenAiModelRows = [
   ["codex-auto-review", "Codex Auto-review", "assumed_alias", "gpt-5.4"],
@@ -45,12 +45,21 @@ const reviewedOpenAiModelRows = [
   ["o3-mini", "o3 Mini"],
   ["o3-pro", "o3 Pro"],
   ["o4-mini", "o4 Mini"],
+  // Append identities to preserve every existing telemetry enum position.
+  ["gpt-6-sol", "GPT-6 Sol"],
+  ["gpt-6-luna", "GPT-6 Luna"],
+  // User-requested forecast, not a verified OpenAI model or alias.
+  ["gpt-6.1-astra", "GPT-6.1 Astra (forecast)", "unpriced", null],
 ];
 
 const reviewedClaudeModelRows = [
   ["claude-fable-5", "Claude Fable 5"],
+  ["claude-fable-5-1", "Claude Fable 5.1"],
   ["claude-haiku-4-5-20251001", "Claude Haiku 4.5"],
+  ["claude-mythos-5-1", "Claude Mythos 5.1"],
   ["claude-opus-4-8", "Claude Opus 4.8"],
+  ["claude-opus-5", "Claude Opus 5"],
+  ["claude-opus-5-5", "Claude Opus 5.5"],
   ["claude-sonnet-4-6", "Claude Sonnet 4.6"],
   ["claude-sonnet-5", "Claude Sonnet 5"],
 ];
@@ -65,6 +74,12 @@ export const REVIEWED_MODEL_CATALOG = Object.freeze([
     id, label, provider: "anthropic_claude_code", allowanceTrack: "primary",
     pricingStatus: "published", priceModelId: id,
   })),
+  // Append after all existing providers so persisted telemetry enum positions
+  // stay stable for both Codex and Claude identities.
+  Object.freeze({
+    id: "gpt-6.1-sol", label: "GPT-6.1 Sol", provider: "openai_codex",
+    allowanceTrack: "primary", pricingStatus: "published", priceModelId: "gpt-6.1-sol",
+  }),
 ]);
 
 export const REVIEWED_CODEX_MODEL_IDS = Object.freeze(
@@ -93,6 +108,7 @@ export function codexRequestReasoningEffort(modelId, effort) {
   if (effort !== "ultra") return effort;
   const model = reviewedModelIdentity(modelId);
   if (model?.provider !== "openai_codex") return effort;
+  if (model.id === "gpt-6.1-astra") return effort;
   return model.id === "gpt-6-astra" ? "xhigh" : "max";
 }
 

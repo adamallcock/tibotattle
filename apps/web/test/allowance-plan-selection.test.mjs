@@ -8,7 +8,7 @@ import {
 import { SUPPORTED_LOCALES, translate } from "../public/localization.js";
 
 const BASIS_FAMILY =
-  "codex_primary:speed_priced_api_equivalent:v3:priority_card_ratio_2026_08_30:event_time:observed_declared_scenario";
+  "codex_primary:speed_priced_api_equivalent:v4:published_speed_card_ratio_2026_09_29:event_time:observed_declared_scenario";
 const COHORT_ID = "a".repeat(64);
 
 function planScope(planType) {
@@ -288,6 +288,34 @@ test("historical-plan selection changes the fitted population but never current 
   assert.strictEqual(plus.weekly.paceForecast, data.weekly.paceForecast);
   assert.strictEqual(selectAllowancePlanPopulation(data, "pro"), pro,
     "stable selected views preserve the chart's identity-based memoization");
+});
+
+test("cached plan views follow the header reporting period across Trends renders", () => {
+  const data = dashboard({ current: "pro" });
+  data.reportingWindow = {
+    period: "all", startAt: null, endAt: "2026-09-23T12:00:00.000Z",
+  };
+  data.reportingAccountingPeriod = "history";
+  const selected = selectAllowancePlanPopulation(data);
+  assert.equal(selected.reportingWindow.startAt, null);
+
+  data.reportingWindow = {
+    period: "7d", startAt: "2026-09-16T12:00:00.000Z",
+    endAt: "2026-09-23T12:00:00.000Z",
+  };
+  data.reportingAccountingPeriod = "7d";
+  assert.strictEqual(selectAllowancePlanPopulation(data), selected);
+  assert.strictEqual(selected.reportingWindow, data.reportingWindow);
+  assert.equal(selected.reportingAccountingPeriod, "7d");
+
+  data.reportingWindow = {
+    period: "24h", startAt: "2026-09-22T12:00:00.000Z",
+    endAt: "2026-09-23T12:00:00.000Z",
+  };
+  data.reportingAccountingPeriod = null;
+  assert.strictEqual(selectAllowancePlanPopulation(selected), selected);
+  assert.strictEqual(selected.reportingWindow, data.reportingWindow);
+  assert.equal(selected.reportingAccountingPeriod, null);
 });
 
 test("only an exact current-plan generation/cohort match preserves the comparison", () => {

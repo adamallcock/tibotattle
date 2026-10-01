@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { execFile as execFileCallback } from "node:child_process";
 import {
+  chmod,
+  mkdir,
   mkdtemp,
   readFile,
   rm,
@@ -17,6 +19,7 @@ import {
   compareBinaryPlanTypes,
   compareProductPlanRegistry,
   compareUpstreamPlanRegistry,
+  discoverInstalledCodexBinaries,
   inspectCodexBinaryContract,
   parseCodexContractArguments,
   parseKnownPlanSource,
@@ -53,9 +56,49 @@ async function fixtureLedger() {
   return JSON.parse(await readFile(LEDGER_FILE, "utf8"));
 }
 
+test("contract drift checks the same modern, legacy, and user bundle locations", {
+  skip: process.platform === "win32",
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), "codex-bundle-discovery-"));
+  const applicationsDir = join(root, "system-apps");
+  const home = join(root, "user");
+  const modern = join(applicationsDir, "ChatGPT.app/Contents/Resources/codex-cli/bin/codex");
+  const legacy = join(applicationsDir, "ChatGPT.app/Contents/Resources/codex");
+  const userModern = join(home, "Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex");
+  const discover = () => discoverInstalledCodexBinaries({
+    applicationsDir,
+    platform: "darwin",
+    environment: { HOME: home, PATH: "" },
+  });
+  try {
+    await mkdir(join(applicationsDir, "ChatGPT.app/Contents/Resources/codex-cli/bin"), { recursive: true });
+    await writeFile(modern, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    await writeFile(legacy, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    assert.equal((await discover()).binaries.find((row) => row.channel === "chatgpt_bundled")?.binaryPath, modern);
+
+    await chmod(modern, 0o644);
+    assert.equal((await discover()).binaries.find((row) => row.channel === "chatgpt_bundled")?.binaryPath, legacy);
+
+    await rm(legacy);
+    await mkdir(join(home, "Applications/ChatGPT.app/Contents/Resources/codex-cli/bin"), { recursive: true });
+    await writeFile(userModern, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const userDiscovery = await discover();
+    assert.equal(userDiscovery.binaries.find((row) => row.channel === "chatgpt_bundled")?.binaryPath, userModern);
+    assert.equal(userDiscovery.missingChannels.includes("chatgpt_bundled"), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("checked-in Codex contract ledger is valid and matches the product registry", async () => {
   const ledger = validateCodexContractLedger(await fixtureLedger());
   assert.equal(ledger.schemaVersion, CODEX_CONTRACT_LEDGER_VERSION);
+  for (const channel of ledger.binaryChannels.filter((row) => (
+    row.id === "chatgpt_bundled" || row.id === "codex_bundled"
+  ))) {
+    assert.match(channel.locator, /codex-cli\/bin\/codex/u);
+    assert.match(channel.locator, /Contents\/Resources\/codex(?:\s|$)/u);
+  }
   assert.deepEqual(compareProductPlanRegistry(ledger), { issues: [], ok: true });
   assert.deepEqual(
     ledger.plans.map((plan) => plan.rawValue),
@@ -80,15 +123,37 @@ test("checked-in Codex contract ledger is valid and matches the product registry
   assert.deepEqual(premium.mappingEvidence, []);
 });
 
+test("Pro Max 25x is explicit and blocks release qualification", async () => {
+  const ledger = validateCodexContractLedger(await fixtureLedger());
+  const candidate = ledger.plans.find((plan) => plan.rawValue === "promax");
+  assert.equal(candidate.lifecycle, "provisional");
+  assert.equal(candidate.displayName, "Pro (Max)");
+  assert.match(candidate.note, /source revision/u);
+  const result = await checkCodexContractDrift({
+    binaries: [{ binaryPath: "/not/reported", channel: "fixture" }],
+    inspectBinary: async ({ channel }) => ({
+      channel,
+      generatorMode: "stable",
+      planTypes: TELEMETRY_PLAN_TYPES.filter((plan) => plan !== "promax"),
+      planTypesSha256: planTypesSha256(TELEMETRY_PLAN_TYPES.filter((plan) => plan !== "promax")),
+      version: "codex-cli 1.2.3",
+    }),
+    requireBinary: true,
+  });
+  assert.equal(result.result.ok, false);
+  assert.equal(result.result.issues.some((entry) => entry.code === "provisional_plan_unverified_for_release"), true);
+});
+
 test("source fixture yields the current exhaustive raw/display plan pairs", async () => {
   const pairs = parseKnownPlanSource(await fixtureText(SOURCE_FIXTURE));
+  const verifiedPlans = (await fixtureLedger()).plans;
   assert.deepEqual(
     pairs.map(({ rawValue }) => rawValue),
-    TELEMETRY_PLAN_TYPES.filter((plan) => plan !== "unknown"),
+    verifiedPlans.map((plan) => plan.rawValue),
   );
   assert.deepEqual(
     Object.fromEntries(pairs.map(({ rawValue, displayName }) => [rawValue, displayName])),
-    TELEMETRY_PLAN_DISPLAY_NAMES,
+    Object.fromEntries(verifiedPlans.map((plan) => [plan.rawValue, plan.displayName])),
   );
 });
 
@@ -128,14 +193,17 @@ test("deprecated historical values may disappear without weakening telemetry acc
   assert.deepEqual(compareUpstreamPlanRegistry(ledger, pairs), {
     issues: [],
     ok: true,
-    warnings: [],
+    warnings: [{
+      code: "provisional_plan_observed",
+      message: "Provisional plan promax is present upstream; resolve remaining release gates before activation",
+    }],
   });
   assert.equal(TELEMETRY_PLAN_TYPES.includes("go"), true);
 });
 
 test("generated PlanType parser accepts only a literal union", async () => {
   const parsed = parsePlanTypeScript(await fixtureText(PLAN_TYPE_FIXTURE));
-  assert.deepEqual(parsed, TELEMETRY_PLAN_TYPES);
+  assert.deepEqual(parsed, TELEMETRY_PLAN_TYPES.filter((plan) => plan !== "promax"));
   assert.throws(
     () => parsePlanTypeScript("export type PlanType = string;\n"),
     { code: "CODEX_SCHEMA_INVALID" },
@@ -181,7 +249,7 @@ test("binary inspector supports stable generation and the older experimental fal
   });
   assert.equal(stable.generatorMode, "stable");
   assert.equal(stable.version, "codex-cli 1.2.3");
-  assert.equal(stable.planTypesSha256, planTypesSha256(TELEMETRY_PLAN_TYPES));
+  assert.equal(stable.planTypesSha256, planTypesSha256(TELEMETRY_PLAN_TYPES.filter((plan) => plan !== "promax")));
   assert.equal(stableCalls.some((args) => args.includes("--experimental")), false);
 
   const fallback = await inspectCodexBinaryContract({

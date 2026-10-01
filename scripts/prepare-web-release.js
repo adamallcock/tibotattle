@@ -103,6 +103,7 @@ export async function prepareWebRelease({
     repositoryRoot: repository,
     scope,
     ...(receiptPath ? { receiptPath: resolve(receiptPath) } : {}),
+    ...(git ? { git } : {}),
     replace: replaceReceipt,
   });
   return Object.freeze({ ...result, scope, receipt });

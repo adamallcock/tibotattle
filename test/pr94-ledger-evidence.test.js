@@ -115,6 +115,44 @@ test("missing, unavailable and observed zero components/context never collapse",
   assert.equal(comparePr94LedgerEvidence(unavailableEvidence, zeroEvidence).status, "different");
 });
 
+test("missing-context pricing reasons remain bounded and preserve the legacy warning-counter shape", async () => {
+  const row = usage();
+  row.components.input_cache_read_tokens = null;
+  row.totalInputContextTokens = null;
+  const price = priceCodexUsageEvent(row);
+  const reason = "total_input_context_missing";
+  assert.equal(price.components.find((component) => component.name === "input_uncached_tokens").reasonCode, reason);
+  const evidence = accumulate([row]);
+  assert.equal(evidence.usage.coverage.unpriced, 1);
+  assert.equal(evidence.usage.components.input_uncached_tokens.unpricedQuantity, "20000");
+  assert.equal(evidence.usage.warnings.coverage[reason], 1);
+  assert.equal(Object.hasOwn(evidence.usage.warnings.informational, reason), false);
+  assert.equal(validatePr94LedgerEvidenceAggregate(evidence), evidence);
+  const restored = await importPr94LedgerEvidencePrivate(frames(evidence), { hmacKey: KEY });
+  assert.equal(comparePr94LedgerEvidence(evidence, restored).status, "equal");
+
+  for (const legacy of [accumulate(), accumulate([usage()])]) {
+    for (const kind of ["coverage", "informational"]) {
+      assert.equal(Object.hasOwn(legacy.usage.warnings[kind], reason), false);
+    }
+    assert.equal(validatePr94LedgerEvidenceAggregate(legacy), legacy);
+    const zeroExtension = clone(legacy);
+    zeroExtension.usage.warnings.coverage[reason] = 0;
+    assert.throws(() => validatePr94LedgerEvidenceAggregate(zeroExtension), { code: "pr94_ledger_invalid" });
+  }
+
+  for (const mutate of [
+    (result) => { result.components.find((component) => component.reasonCode === reason).reasonCode = "unreviewed_context_reason"; },
+    (result) => { result.warnings.coverage.find((warning) => warning.code === reason).code = "unreviewed_context_reason"; },
+  ]) {
+    const invalid = clone(price);
+    mutate(invalid);
+    const ledger = createPr94LedgerEvidence({ hmacKey: KEY });
+    assert.throws(() => ledger.consumeUsage(row, invalid), { code: "pr94_ledger_row_rejected" });
+    assert.throws(() => ledger.finish(), { code: "pr94_ledger_state" });
+  }
+});
+
 test("component availability preserves the raw value privately without pricing unavailable quantity", () => {
   const row = usage(1, { componentAvailability: { input_uncached_tokens: false, output_combined_tokens: false } });
   const evidence = accumulate([row]);

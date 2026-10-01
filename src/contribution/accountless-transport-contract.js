@@ -12,6 +12,12 @@ export const ACCOUNTLESS_UPLOAD_OWNER_SCOPE = "upload_registration";
 export const ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION =
   "telemetry-contribution-v1.1";
 
+// Successor policy is independent of the frozen v1.1 installation grant.
+// Merely discovering v1.2 support never creates this authorization.
+export const ACCOUNTLESS_V12_UPLOAD_SCHEMA_VERSION = "accountless-upload-owner-v1.2";
+export const ACCOUNTLESS_V12_UPLOAD_POLICY_VERSION = "accountless-telemetry-v1.2-policy-v1";
+export const ACCOUNTLESS_V12_UPLOAD_AUTHORIZATION_BASIS = "accountless-policy-v1.2";
+
 // These server outcomes mean the enrollment ledger or the derived ownership
 // grant can no longer authorize the installation. They are deliberately
 // distinct from a malformed request or policy-contract mismatch: callers

@@ -1,11 +1,123 @@
 # Signed synthetic Keychain migration fixture
 
-These Swift mains are test-only compositions for
-`test/helpers/verify-signed-keychain-migration.mjs`. They exercise the shared
-production migration protocol and adoption algorithm without reading
+The original Swift mains and the preserved
+`KeychainMigration.swift` are test-only compositions for
+`test/helpers/verify-signed-keychain-migration.mjs`. They exercise the
+historical native migration protocol and adoption algorithm without reading
 application credentials from or changing the login/default Keychain. The
 explicit signing stage may use the operator's existing approved signing key;
 that is separate from the fixture's Keychain access.
+
+`ElectronCredentialMain.swift` is a separate, narrowly scoped installed-Electron
+fixture described below. It shares the ownership journal, not the original
+native migration harness's execution or qualification claims.
+
+## Hosted installed Electron credentials
+
+[`prepare-electron-macos-credential-fixture.mjs`](../../../scripts/prepare-electron-macos-credential-fixture.mjs)
+defaults to `--plan`. Its explicit `--compile-only --operation-id <UUIDv4>
+--output <new-absolute-directory>` builds an unsigned ARM fixture with a fixed
+operation nonce and runner root. Compilation never opens Keychain items. Signing
+the fixture with the existing reviewed app designated requirement, inspecting
+its hardened runtime and empty entitlements, and publishing its immutable ZIP
+are separate owner-authorized operations. Do not execute this fixture locally.
+
+The fixture accepts only `modern`, `invalid` and `locked`, and refuses before
+Security interaction unless the actual account is the disposable GitHub-hosted
+ARM `runner` account. Its bounded stdin protocol permits only seeding,
+snapshotting, selecting, checking scope, locking/unlocking, restoring and
+cleaning its one journal-owned synthetic keychain. The random keychain password remains in
+process memory. Synthetic modern values use the existing three active app
+capabilities and the app-only ACL. Only content-free item/value/ACL digests leave
+the helper. No real login items are read.
+
+Unlike the original native fixture, this hosted fixture temporarily selects
+its keychain as the disposable runner's sole **user-domain** search member and
+explicit user default. The ordinary default must agree and the current
+preference domain must be user. The dynamic domain must be empty. The common
+domain may be empty or contain only the exact root-owned, regular file with one hard link and
+no group/other write permission at `/Library/Keychains/System.keychain`; its ancestors,
+reference path and pinned file metadata must validate. For every one of the
+native adapter's five capabilities, both modern and legacy service queries must
+return `errSecItemNotFound` and the System keychain must report read permission.
+These ten existence/status-only queries use only that explicit System reference,
+fixed account `installation`, no return-data/ref/attributes flag and no result
+pointer. They never retrieve System values, unlock or modify System, or query
+login/user items. A namespace parity test refuses native capability drift.
+
+The aggregate list must equal dynamic, user, then common in exact order and
+multiplicity. macOS's aggregate list includes common members even after setting
+the user list ([Apple Security implementation](https://github.com/apple-oss-distributions/Security/blob/main/OSX/libsecurity_keychain/lib/StorageManager.cpp)).
+The fixture retains prior domain/default metadata in memory, rechecks containment
+before each app launch and after it stops, and restores only the exactly verified
+user list/default while preserving common/dynamic unchanged. Each selected
+scenario retains a closed `mac-credential-isolated-scope-v1` proof in the result;
+no path, attributes or item values enter that proof. Interrupted or unverified
+journals never authorize adoption or deletion. A failed restoration remains a failed job; destroy the
+disposable runner rather than repairing it through guessed ownership.
+
+[`electron-macos-credentials.yml`](../../../.github/workflows/electron-macos-credentials.yml)
+admits a closed intake plus the source-candidate receipt before dependency
+installation. Required extra identity fields are `schemaVersion`
+(`signed-macos-credential-qualification-v1`), `operationId`,
+`fixtureExecutableSha256`, `fixtureArchiveSha256` and `predecessorAsarSha256`.
+The remaining app/runner identity fields match the empty-profile lane. The ZIP
+must contain only the signed fixture's Info.plist, executable and CodeResources.
+The only fixture transport is the immutable
+`electron/test/mac-credentials/<runnerRevision>/<operationId>/<zipSha256>/fixture.zip`
+namespace on the existing updates host. The workflow does not upload it.
+
+The default workflow mode plans only. Explicit execution requires
+`RUN_DISPOSABLE_SIGNED_MAC_CREDENTIALS`. The hosted runner downloads and
+verifies both signed apps and the fixture before installing a temporary PF
+anchor that blocks outbound TCP and UDP outside `lo0` for the runner UID. It
+checks the installed rules, PF enabled state, a reachable external connection
+before activation, its denial after activation, and working loopback. The
+guard is rechecked before every ordinary signed-app launch and released after
+all owned app processes stop. A missing or ineffective guard fails before app
+launch. No endpoint, proxy, app bytes or Keychain ACL is changed.
+
+Each journey first completes the signed predecessor's ordinary first run with
+external traffic blocked and before selecting the synthetic Keychain or placing
+synthetic Codex usage. It then seeds existing modern items, restarts that
+predecessor, and replaces the app.
+The v1 journey verifies those values through the exact signed
+Electron 0.1.20 predecessor and installed candidate replacement, a completed
+local refresh, three controlled candidate restarts, and persistent sharing
+preferences. Every readback must retain the item identity, bytes and ACL.
+The separately pinned v2 current-stable journey selects the published 0.1.24
+ARM DMG and the unchanged signed 0.1.25 candidate. Its intake admits only
+those exact source, build and artifact identities; it does not turn a v1
+0.1.20 startup failure into a passing legacy upgrade result.
+The v3 current-stable journey keeps the published 0.1.24 predecessor and pins
+the signed 0.1.26 ARM DMG, app payload, source revision and build number. The
+v2 0.1.25 intake remains historical and cannot admit the new candidate.
+Malformed and locked cases inspect the actual candidate's reason, explicit
+silent Retry and native Quit completion; the locked fixture is unlocked only
+with its in-memory password for unchanged-value verification. Only the closed
+result JSON is uploaded. It explicitly leaves denied, unavailable/timeout,
+partial migration, legacy-only migration, ordinary native clean quit and
+successful hosted upload unqualified. A passing scoped receipt is not admission
+of the complete credential failure matrix or overall release.
+
+Failures retain the outer journey phase and, for a recognized helper failure,
+only its fixed allowlisted code, scenario and protocol command. Unknown codes,
+extra fields, raw stderr, error text and credential values are never copied into
+the result. A failed fixture operation is not classified as an app defect until
+its specific cause is established.
+The predecessor also records only whether the journal-owned synthetic Keychain
+keeps the same device and inode after launch, settings, opt-out and stop. A
+changed identity remains a failed fixture receipt, never an adoption authority.
+The separate `audit` command can compare the three seeded synthetic values,
+item references and ACLs on a replacement inode. It reports only four booleans,
+does not advance the ownership journal, and cannot authorize mutation,
+restoration or cleanup. The fixture records an immutable observation intent
+before each ordinary signed app launch. Only after that app stops and the
+fixture rechecks its exact synthetic values, item references, ACLs, isolated
+scope and database metadata does `attest` complete the journal transition.
+A failed or incomplete transition remains closed and cannot authorize cleanup.
+
+## Original native migration fixture
 
 The runner is deliberately inert unless `--run-signed` is supplied. A live run
 also requires an explicitly selected legacy app, and a signing-identity label in

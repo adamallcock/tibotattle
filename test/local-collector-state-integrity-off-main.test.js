@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import test from "node:test";
+import { Worker } from "node:worker_threads";
 
 import {
   commitLocalCollectorState,
@@ -15,6 +16,8 @@ import {
 } from "../src/local-collector-state-integrity-off-main.js";
 
 const CLOCK = () => Date.parse("2026-09-08T00:00:00.000Z");
+const LARGE_DEVICE = 72057594039371911n;
+const LARGE_INODE = 72057594039371911n;
 
 function checkpoint() {
   return {
@@ -48,8 +51,32 @@ async function fixture() {
 }
 
 async function stateIdentity(stateFile) {
-  const metadata = await lstat(stateFile);
+  const metadata = await lstat(stateFile, { bigint: true });
   return { dev: metadata.dev, ino: metadata.ino };
+}
+
+function workerClassWithIdentity(stateFile, { dev, ino }) {
+  return class LargeIdentityWorker extends Worker {
+    constructor(url, options = {}) {
+      const script = `
+        import fs from "node:fs/promises";
+        const target = ${JSON.stringify(stateFile)};
+        const device = ${dev}n;
+        const inode = ${ino}n;
+        const originalLstat = fs.lstat;
+        fs.lstat = async (path, options) => {
+          const metadata = await originalLstat(path, options);
+          if (path === target && options?.bigint === true) {
+            metadata.dev = device;
+            metadata.ino = inode;
+          }
+          return metadata;
+        };
+        await import(${JSON.stringify(url.href)});
+      `;
+      super(script, { ...options, eval: true });
+    }
+  };
 }
 
 test("integrity worker verifies an exact owner state without returning metadata", async () => {
@@ -65,13 +92,70 @@ test("integrity worker verifies an exact owner state without returning metadata"
   }
 });
 
+test("real worker preserves large filesystem identities across repeated scans", async () => {
+  const value = await fixture();
+  try {
+    const WorkerClass = workerClassWithIdentity(value.stateFile, {
+      dev: LARGE_DEVICE,
+      ino: LARGE_INODE,
+    });
+    const options = {
+      stateFile: value.stateFile,
+      expectedIdentity: { dev: LARGE_DEVICE, ino: LARGE_INODE },
+    };
+    await verifyLocalCollectorStateIntegrityOffMain(options, { WorkerClass });
+    await verifyLocalCollectorStateIntegrityOffMain(options, { WorkerClass });
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("large adjacent identities do not compare equal at the worker boundary", async () => {
+  const value = await fixture();
+  try {
+    assert.equal(Number(LARGE_INODE), Number(LARGE_INODE + 1n));
+    const WorkerClass = workerClassWithIdentity(value.stateFile, {
+      dev: LARGE_DEVICE,
+      ino: LARGE_INODE,
+    });
+    await assert.rejects(
+      verifyLocalCollectorStateIntegrityOffMain({
+        stateFile: value.stateFile,
+        expectedIdentity: { dev: LARGE_DEVICE, ino: LARGE_INODE + 1n },
+      }, { WorkerClass }),
+      { code: "local_collector_state_unavailable" },
+    );
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("unsafe numeric identities are rejected before crossing the worker boundary", async () => {
+  await assert.rejects(
+    verifyLocalCollectorStateIntegrityOffMain({
+      stateFile: "/private/collector-state.sqlite",
+      expectedIdentity: { dev: Number(LARGE_DEVICE), ino: Number(LARGE_INODE) },
+    }),
+    TypeError,
+  );
+  await assert.rejects(
+    verifyLocalCollectorStateIntegrityOffMain({
+      stateFile: "/private/collector-state.sqlite",
+      expectedIdentity: { dev: -1n, ino: LARGE_INODE },
+    }),
+    TypeError,
+  );
+});
+
 test("integrity worker refuses a same-path identity mismatch with a fixed error", async () => {
   const value = await fixture();
   try {
     const identity = await stateIdentity(value.stateFile);
     const differentIdentity = {
       dev: identity.dev,
-      ino: identity.ino === Number.MAX_SAFE_INTEGER ? identity.ino - 1 : identity.ino + 1,
+      ino: identity.ino === BigInt(Number.MAX_SAFE_INTEGER)
+        ? identity.ino - 1n
+        : identity.ino + 1n,
     };
     await assert.rejects(
       verifyLocalCollectorStateIntegrityOffMain({

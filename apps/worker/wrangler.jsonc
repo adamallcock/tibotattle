@@ -18,9 +18,12 @@
     "crons": ["* * * * *"]
   },
   "vars": {
+    "PUBLIC_ANALYTICS_MODE": "enabled",
     "ENVIRONMENT": "synthetic-development",
     "ENROLLMENT_MODE": "local_open",
     "ACCOUNT_SCOPED_INGEST_MODE": "disabled",
+    "TELEMETRY_STORAGE_MODE": "json",
+    "TELEMETRY_STORAGE_NAMESPACE": "",
     // Queue ingestion is deliberately deferred: a 2 MiB envelope requires an
     // R2-pointer/consumer-receipt protocol rather than a direct Queue body.
     "UPLOAD_INGRESS_QUEUE_MODE": "disabled",
@@ -150,6 +153,7 @@
         "crons": ["* * * * *"]
       },
       "vars": {
+        "PUBLIC_ANALYTICS_MODE": "enabled",
         "ENVIRONMENT": "staging",
         "ENROLLMENT_MODE": "disabled",
         // Accountless admission stays explicitly closed in the checked-in
@@ -158,6 +162,8 @@
         "ACCOUNTLESS_ENROLLMENT_MODE": "disabled",
         "ACCOUNTLESS_OWNERSHIP_MODE": "disabled",
         "ACCOUNT_SCOPED_INGEST_MODE": "disabled",
+        "TELEMETRY_STORAGE_MODE": "json",
+        "TELEMETRY_STORAGE_NAMESPACE": "",
         "UPLOAD_INGRESS_QUEUE_MODE": "disabled",
         "UPLOAD_INGRESS_MAX_CONCURRENT": "8",
         "UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE": "120",
@@ -288,6 +294,7 @@
         "crons": ["* * * * *"]
       },
       "vars": {
+        "PUBLIC_ANALYTICS_MODE": "enabled",
         "ENVIRONMENT": "production",
         // Owner-approved hosted recovery. Deploy only after migrations 0046/0047
         // and the maintained Worker checks pass; paused remains the incident brake.
@@ -297,7 +304,12 @@
         // containment-era "disabled" default was never a product choice, and
         // the operator collection-control row remains the incident brake.
         "ENROLLMENT_MODE": "open",
+        // Activate only after canonical 0059 and the reviewed production canary admission.
+        "ACCOUNTLESS_ENROLLMENT_MODE": "enabled",
+        "ACCOUNTLESS_OWNERSHIP_MODE": "enabled",
         "ACCOUNT_SCOPED_INGEST_MODE": "disabled",
+        "TELEMETRY_STORAGE_MODE": "json",
+        "TELEMETRY_STORAGE_NAMESPACE": "",
         "UPLOAD_INGRESS_QUEUE_MODE": "disabled",
         "UPLOAD_INGRESS_MAX_CONCURRENT": "64",
         "UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE": "1200",

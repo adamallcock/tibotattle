@@ -107,7 +107,7 @@ test("service reports cached accounting bounds and passes the selected period", 
     const query = { schemaVersion: WORK_USAGE_SCHEMA, period: "all" };
     const pending = await service.query(query);
     await new Promise(resolve => setImmediate(resolve));
-    const result = await service.query({ ...query, snapshotId: pending.snapshotId });
+    const result = await service.query({ ...query, snapshotId: pending.refreshSnapshotId ?? pending.snapshotId });
     assert.equal(input.period, "all");
     assert.equal(result.status, "available");
     assert.equal(result.fromMs, 0);
@@ -201,7 +201,7 @@ test("related periods reuse accounting even when a cold build outlasts moving-wi
   async function settle(query) {
     const pending = await service.query({ schemaVersion: WORK_USAGE_SCHEMA, ...query });
     await new Promise(resolve => setImmediate(resolve));
-    return service.query({ schemaVersion: WORK_USAGE_SCHEMA, period: query.period, snapshotId: pending.snapshotId });
+    return service.query({ schemaVersion: WORK_USAGE_SCHEMA, period: query.period, snapshotId: pending.refreshSnapshotId ?? pending.snapshotId });
   }
   try {
     let report = await settle({ period: "7d" });
@@ -236,4 +236,54 @@ test("closing the shared reader aborts work and prevents builds after asynchrono
   await reader.close();
   assert.equal(calls, 0);
   assert.equal(closes, 1);
+});
+
+test("exact reporting windows reuse only identical anchors even within a cache membership lease", async () => {
+  let reads = 0;
+  const reader = createCachedLocalUnifiedProjectionReader({
+    reader: async o => { reads++; return combined(o.nowMs, reads); },
+    readGeneration: async () => generation,
+    validUntil: async o => o.nowMs + 1000,
+  });
+  const read = async end => selectSharedWorkUsageSnapshot(await reader({ ...options(end), exactWindow: true }), { period: 'all', scope: 'account-a' });
+  assert.equal((await read(100)).toMs, 100);
+  assert.equal((await read(100)).toMs, 100);
+  assert.equal(reads, 1);
+  assert.equal((await read(101)).toMs, 101);
+  assert.equal(reads, 2);
+  assert.equal((await read(100)).toMs, 100);
+  assert.equal(reads, 3);
+});
+
+test("warming every period preserves the selected report and shares one accounting projection within two snapshots", async () => {
+  let reads = 0;
+  const now = 40 * 86400000;
+  const cached = createCachedLocalUnifiedProjectionReader({
+    readGeneration: async () => generation,
+    validUntil: async o => o.nowMs + 1,
+    reader: async o => { reads++; return combined(o.nowMs); },
+  });
+  const service = createWorkUsageService({ clock: () => now,
+    build: async (q, controls) => selectSharedWorkUsageSnapshot(await cached(options(q.toMs), controls), q),
+  });
+  const query = q => service.query({ schemaVersion: WORK_USAGE_SCHEMA, ...q });
+  async function ready(q) {
+    const pending = await query(q);
+    await new Promise(resolve => setImmediate(resolve));
+    return query({ period: q.period, snapshotId: pending.snapshotId });
+  }
+  try {
+    const selected = await ready({ period: "7d" });
+    let previous = null;
+    for (const period of ["24h", "30d", "all"]) {
+      const warmed = await ready({ period, sourceSnapshotId: selected.snapshotId });
+      assert.equal(warmed.status, "available");
+      assert.equal(warmed.toMs, selected.toMs);
+      assert.equal(reads, 1, "preloading must not repeat accounting");
+      assert.equal((await query({ period: "7d", snapshotId: selected.snapshotId })).status, "available");
+      if (previous) await assert.rejects(query({ period: previous.period, snapshotId: previous.id }),
+        { code: "work_usage_snapshot_expired" });
+      previous = { period, id: warmed.snapshotId };
+    }
+  } finally { service.close(); await cached.close(); }
 });

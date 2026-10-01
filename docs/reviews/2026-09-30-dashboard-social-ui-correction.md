@@ -11,7 +11,8 @@ social sign-in UI. The previous general read-only dashboard interpretation was
 incorrect; its flags, module and control suppression are removed.
 
 Source revision: `1c5538cec8ae9860f410af1e02433b1010753855` on
-`codex/shared-dashboard-capabilities`. Subsequent changes only record evidence.
+`codex/shared-dashboard-capabilities`. This record applies to that earlier
+source and package; integration with newer main requires separate validation.
 Current contract: [system architecture](../reference/system-architecture.md).
 Collection uses companion readiness; Settings and sharing use the existing
 versioned Electron bridge. Refresh/cancellation, cadence, notice receipts,

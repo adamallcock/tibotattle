@@ -21,6 +21,7 @@ import {
   COMMUNITY_ALLOWANCE_BASIS,
   COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS,
   COMMUNITY_ATTRIBUTION_METHOD_VERSION,
+  COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION,
 } from "../src/community-allowance";
 import type { PublicAllowanceBreakdowns } from "../src/public-allowance-breakdowns";
 import {
@@ -37,6 +38,7 @@ interface TestBindings extends Env {
 function testBindings(overrides: Partial<Env> = {}): Env {
   const bindings = env as TestBindings;
   return {
+    PUBLIC_ANALYTICS_MODE: "enabled",
     ASSETS: bindings.ASSETS,
     DELETION_LEDGER: bindings.DELETION_LEDGER,
     ENROLLMENT_MODE: bindings.ENROLLMENT_MODE,
@@ -171,7 +173,7 @@ async function seedReadyAllowanceState(nowMs: number): Promise<void> {
     (singleton, publication_state, expected_basis, safe_from_day, safe_to_day,
      changed_at, attribution_method_version) VALUES (1,'ready',?,?,?,?,?)`)
     .bind(COMMUNITY_ALLOWANCE_BASIS, utcDay(nowMs, 1 - COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS),
-      utcDay(nowMs), new Date(nowMs).toISOString(), COMMUNITY_ATTRIBUTION_METHOD_VERSION).run();
+      utcDay(nowMs), new Date(nowMs).toISOString(), COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION).run();
 }
 
 async function seedBreakdownCache(nowMs: number, options: {
@@ -183,7 +185,7 @@ async function seedBreakdownCache(nowMs: number, options: {
     (singleton, generated_at, payload_json, attribution_method_version, source_mutation_epoch)
     VALUES (1,?,?,?,?)`).bind(options.generatedAt ?? new Date(nowMs).toISOString(),
       options.payload ?? JSON.stringify(breakdownPreview(nowMs)),
-      options.method ?? COMMUNITY_ATTRIBUTION_METHOD_VERSION,
+      options.method ?? COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION,
       options.epoch === undefined ? source!.mutation_epoch : options.epoch).run();
 }
 
@@ -221,7 +223,7 @@ describe("GET /api/v1/community/daily", () => {
     expect(body.allowanceBreakdowns.days[0]?.models).toEqual([]);
     expect(body.allowanceBreakdowns.days[1]?.models).toEqual([["gpt-6-astra", 1_166, 1]]);
     expect(body.allowanceBreakdowns.days[1]?.byPlanType.plus).toEqual({
-      centralUsd: 1_200, participantCount: 1, fitCount: 1, band80Usd: null,
+      centralUsd: 600, participantCount: 1, fitCount: 1, band80Usd: null,
     });
     for (const privateField of ["capacityByPlanType", "synthetic-private", "coverage", "catalogVersion",
       "modelConfig", "source_mutation_epoch", "refusedParticipantCount", "unsupportedSourceParticipantCount"]) {
@@ -277,7 +279,7 @@ describe("GET /api/v1/community/daily", () => {
     const published = await updating.json();
     expect(published).toMatchObject({ allowanceState: "ready", days: [{ day }], allowanceBreakdowns: {
       generatedAt: new Date(nowMs).toISOString(),
-      days: [{ day, combined: { centralUsd: 1200, participantCount: 1, fitCount: 1 } }],
+      days: [{ day, combined: { centralUsd: 600, participantCount: 1, fitCount: 1 } }],
     } });
     // Partially recomputed daily amounts cannot displace any graph mode.
     await seedDailyRevision({ day, revision: 2, payload: { allowance: { centralUsd: 9999 } } });
@@ -512,14 +514,14 @@ describe("GET /api/v1/community/daily", () => {
 
     const mergedAllowance = {
       basis:
-        "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d",
+        "seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25",
       limitId: "codex",
       referencePlanType: "pro",
-      normalization: "pro_x1_prolite_x4_plus_x20",
+      normalization: "pro_x1_prolite_x2_promax_x0_4_plus_x10",
       windowDurationMinutes: 10_080,
       trailingDays: 30,
-      qualification: "shared_reset_fit_gates_40pp_span_floor",
-      spanFloorPp: 40,
+      qualification: "shared_reset_fit_gates_25pp_span_floor",
+      spanFloorPp: 25,
       fitCount: 8,
       participantCount: 4,
       centralUsd: 2_232,
@@ -549,7 +551,7 @@ describe("GET /api/v1/community/daily", () => {
     expect(updatingState).toMatchObject({
       publication_state: "updating",
       expected_basis:
-        "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d",
+        "seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25",
       safe_to_day: today,
     });
 
@@ -591,7 +593,7 @@ describe("GET /api/v1/community/daily", () => {
     expect(readyBody.allowanceState).toBe("ready");
     expect(readyBody.days[0]?.payload.allowance).toMatchObject({
       basis:
-        "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d",
+        "seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25",
       fitCount: 0,
       participantCount: 0,
       centralUsd: null,
@@ -695,5 +697,37 @@ describe("GET /api/v1/community/daily", () => {
     await expect(response.json()).resolves.toMatchObject({
       error: { code: "PUBLICATION_DISABLED" },
     });
+  });
+
+  it("fails closed at the deployment gate before database and rate-limit reads", async () => {
+    const calls: string[] = [];
+    const limiter = {
+      async limit(): Promise<{ success: boolean }> {
+        calls.push("rate-limit");
+        return { success: true };
+      },
+    } satisfies RateLimit;
+    const unavailable = {
+      prepare(): never {
+        calls.push("database");
+        throw new Error("database must not be read");
+      },
+    } as unknown as D1Database;
+    for (const mode of [undefined, "disabled", "unexpected"] as const) {
+      const response = await api(
+        "/api/v1/community/daily?from=2026-08-01&to=2026-08-02",
+        {},
+        testBindings({
+          PUBLIC_ANALYTICS_MODE: mode,
+          PUBLIC_READ_RATE_LIMIT: limiter,
+          USAGE_MONITOR_DB: unavailable,
+        } as Partial<Env>),
+      );
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "PUBLICATION_DISABLED" },
+      });
+    }
+    expect(calls).toEqual([]);
   });
 });

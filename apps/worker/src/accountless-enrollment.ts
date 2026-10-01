@@ -376,6 +376,21 @@ export type AccountlessRevocationReason =
  * upload grants lose authority immediately. The ledger remains the tombstone
  * that prevents a later bearer retry from recreating the owner.
  */
+/** One schema read: whether the v1.2 successor grant exists (isolation 0008)
+ * and whether the opt-out marker may name a v1.2 head (isolation 0011). */
+async function successorSchema(db: D1Database): Promise<{ grantTable: boolean; markerAcceptsV12: boolean }> {
+  const rows = (await db.prepare(`SELECT type, sql FROM sqlite_schema
+    WHERE (type = 'table' AND name = 'accountless_v12_device_authorizations')
+       OR (type = 'trigger' AND name = 'accountless_public_history_retention_insert')`)
+    .all<{ type: string; sql: string | null }>()).results;
+  const grantTable = rows.some((row) => row.type === "table");
+  return {
+    grantTable,
+    markerAcceptsV12: grantTable && rows.some((row) => row.type === "trigger"
+      && typeof row.sql === "string" && row.sql.includes("telemetry_v12_domain_heads")),
+  };
+}
+
 export async function revokeAccountlessEnrollment(
   db: D1Database,
   deviceId: string,
@@ -388,12 +403,97 @@ export async function revokeAccountlessEnrollment(
   }
   try {
     const now = new Date(nowEpoch).toISOString();
-    const results = await db.batch([
+    // Read the head in the same batch as revocation. A missing final bridge
+    // makes an existing head fail the marker's NOT NULL contract; no head
+    // produces no marker row and remains a valid no-history disconnect.
+    const retainHistory = reason === "user_opt_out" ? [db.prepare(`
+      INSERT INTO accountless_public_history_retention (
+        participant_id, enrollment_device_id, device_credential_id,
+        generation_id, head_revision, retained_at
+      )
+      SELECT owner.participant_id, owner.enrollment_device_id,
+             owner.device_credential_id,
+             CASE WHEN (
+               SELECT COUNT(*) = 5
+                 FROM sqlite_schema
+                WHERE type = 'trigger'
+                  AND name IN (
+                    'accountless_public_history_retention_withdraw_delete',
+                    'storage_v11_ledger_withdraw_update',
+                    'storage_v11_owner_withdraw_update',
+                    'storage_v11_grant_withdraw_update',
+                    'storage_v11_device_withdraw_update'
+                  )
+                  AND (
+                    name = 'accountless_public_history_retention_withdraw_delete'
+                    OR instr(sql, 'accountless_public_history_retention') > 0
+                  )
+             ) THEN head.generation_id ELSE NULL END,
+             head.revision, ?
+        FROM accountless_upload_owners owner
+        JOIN telemetry_v11_domain_heads head
+          ON head.participant_id = owner.participant_id
+       WHERE owner.enrollment_device_id = ?
+         AND owner.state = 'active'
+         AND owner.revoked_at IS NULL
+         AND owner.revocation_reason IS NULL
+    `).bind(now, deviceId)] : [];
+    // A device with no v1.1 head keeps its accepted v1.2 head on the same
+    // prospective terms once isolation 0011 lets the marker name one. The
+    // marker is written only for a currently eligible device, so an
+    // ineligible one still disconnects without retaining rather than failing.
+    const successor = await successorSchema(db);
+    const retainSuccessorHistory = reason === "user_opt_out" && successor.markerAcceptsV12 ? [db.prepare(`
+      INSERT INTO accountless_public_history_retention (
+        participant_id, enrollment_device_id, device_credential_id,
+        generation_id, head_revision, retained_at
+      )
+      SELECT owner.participant_id, owner.enrollment_device_id,
+             owner.device_credential_id, head.generation_id, head.revision, ?
+        FROM accountless_upload_owners owner
+        JOIN telemetry_v12_domain_heads head
+          ON head.participant_id = owner.participant_id
+        JOIN telemetry_v12_domains domain
+          ON domain.id = head.generation_id
+         AND domain.participant_id = owner.participant_id
+         AND domain.device_id = owner.device_credential_id
+       WHERE owner.enrollment_device_id = ?
+         AND owner.state = 'active'
+         AND owner.revoked_at IS NULL
+         AND owner.revocation_reason IS NULL
+         AND NOT EXISTS (SELECT 1 FROM telemetry_v11_domain_heads legacy_head
+           WHERE legacy_head.participant_id = owner.participant_id)
+         AND EXISTS (SELECT 1 FROM community_public_source_owners public_owner
+           WHERE public_owner.participant_id = owner.participant_id
+             AND public_owner.device_id = owner.device_credential_id)
+    `).bind(now, deviceId)] : [];
+    const retireHistory = reason === "user_opt_out" ? [] : [db.prepare(`
+      DELETE FROM accountless_public_history_retention
+       WHERE enrollment_device_id = ?
+    `).bind(deviceId)];
+    // The v1.2 successor grant is revoked with the rest of the lease graph and
+    // the same reason, which is what its retained-history readers recognise.
+    const revokeSuccessor = successor.grantTable ? [db.prepare(`
+      UPDATE accountless_v12_device_authorizations
+         SET state = 'revoked', revoked_at = ?, revocation_reason = ?
+       WHERE enrollment_device_id = ? AND state = 'active'
+         AND EXISTS (
+           SELECT 1 FROM accountless_enrollment_ledger ledger
+            WHERE ledger.device_id = accountless_v12_device_authorizations.enrollment_device_id
+              AND ledger.state = 'revoked'
+         )
+    `).bind(now, reason, deviceId)] : [];
+    const results = await db.batch<{ device_id: string }>([
+      ...retainHistory,
+      ...retainSuccessorHistory,
+      ...retireHistory,
       db.prepare(`
         UPDATE accountless_enrollment_ledger
            SET state = 'revoked', revoked_at = ?, revocation_reason = ?
          WHERE device_id = ? AND state = 'active'
+         RETURNING device_id
       `).bind(now, reason, deviceId),
+      ...revokeSuccessor,
       db.prepare(`
         UPDATE accountless_upload_owners
            SET state = 'revoked', revoked_at = ?, revocation_reason = ?
@@ -432,7 +532,10 @@ export async function revokeAccountlessEnrollment(
            AND state IN ('unused', 'consuming')
       `).bind(now, deviceId),
     ]);
-    return results[0]?.meta.changes === 1;
+    // Authority-withdrawal triggers may change many rows in this transaction.
+    // Acknowledge the exact enrollment transition, not that aggregate count.
+    const ledgerResult = results[retainHistory.length + retainSuccessorHistory.length + retireHistory.length];
+    return ledgerResult?.results.length === 1 && ledgerResult.results[0]?.device_id === deviceId;
   } catch {
     throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
   }

@@ -4,9 +4,9 @@
     "repository": "openai/codex",
     "branch": "main",
     "path": "codex-rs/protocol/src/auth.rs",
-    "reviewedRevision": "b68acc4d4b56fdfa1d5b6a2c36102c66876e0c46",
-    "reviewedOn": "2026-08-26",
-    "sourceSha256": "c7293c4b592e7429b6aeb969b15ba0cfe056729f33b09583912fec250b00c756"
+    "reviewedRevision": "b1e72963c3b71a9265a551e54beff078384efed9",
+    "reviewedOn": "2026-09-29",
+    "sourceSha256": "0ab901e92eaaa9ac87d1aa5ba94c1bdc72696e922062f318e2c8e308462a3856"
   },
   "binaryChannels": [
     {
@@ -15,11 +15,11 @@
     },
     {
       "id": "chatgpt_bundled",
-      "locator": "/Applications/ChatGPT.app/Contents/Resources/codex"
+      "locator": "ChatGPT.app in /Applications or ~/Applications: Contents/Resources/codex-cli/bin/codex, then Contents/Resources/codex"
     },
     {
       "id": "codex_bundled",
-      "locator": "/Applications/Codex.app/Contents/Resources/codex"
+      "locator": "Codex.app in /Applications or ~/Applications: Contents/Resources/codex-cli/bin/codex, then Contents/Resources/codex"
     },
     {
       "id": "path",
@@ -51,15 +51,22 @@
     },
     {
       "rawValue": "pro",
-      "displayName": "Pro",
+      "displayName": "Pro (More)",
       "lifecycle": "active",
       "firstReviewedOn": "2026-08-25"
     },
     {
       "rawValue": "prolite",
-      "displayName": "Pro Lite",
+      "displayName": "Pro",
       "lifecycle": "active",
       "firstReviewedOn": "2026-08-25"
+    },
+    {
+      "rawValue": "promax",
+      "displayName": "Pro (Max)",
+      "lifecycle": "provisional",
+      "firstReviewedOn": "2026-09-24",
+      "note": "The raw value and display name match openai/codex KnownPlan at the reviewed source revision. No reviewed installed binary exposes the value yet. Product policy uses Pro Max 25x; provider allowance and window semantics remain unverified."
     },
     {
       "rawValue": "team",

@@ -7,10 +7,7 @@ import {
   REPLAY_SAFE_ACCOUNTING_REBUILD_REQUEST_VERSION,
 } from "./replay-safe-accounting-cache.js";
 import { createIndexedCodexLogScan } from "./local-analysis-index.js";
-// The reviewed canonical-JSON entrypoint, NOT legacy storage: the child needs
-// only the stable serialization (the byte layer of the parent's integrity
-// check), and the legacy storage module's direct-caller ledger is frozen.
-import { stableJson } from "./export/canonical-json.js";
+import { serializeLocalCollectorAccountingCache } from "./local-collector-state.js";
 
 // The accounting-rebuild child. refreshReplaySafeAccountingCache runs the full
 // cache build in this short-lived subprocess so the RSS budget is charged to a
@@ -36,7 +33,7 @@ import { stableJson } from "./export/canonical-json.js";
 // subset of the build options; non-serializable characterization seams
 // (injected scan/rss functions) never cross the boundary, so those callers
 // stay on the in-process build. The child writes the finished cache artifact
-// to the result file as canonical stable JSON and prints ONE envelope line on
+// to the result file as compact cache JSON and prints ONE envelope line on
 // stdout naming the payload's byte count and SHA-256, which the parent
 // verifies before parsing. A build failure becomes a typed error envelope
 // carrying only the fixed error code (never message text, never paths); a
@@ -194,7 +191,7 @@ export async function runReplaySafeAccountingRebuildChild({
     const cache = await buildReplaySafeAccountingCache(
       buildOptionsForRequest(request, signal),
     );
-    const payload = stableJson(cache);
+    const payload = serializeLocalCollectorAccountingCache(cache);
     // 'wx' keeps the write honest: the parent created a fresh private work
     // directory, so a pre-existing result file means the protocol was not
     // followed and the write must refuse rather than overwrite.

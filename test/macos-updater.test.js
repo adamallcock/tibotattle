@@ -25,8 +25,6 @@ import {
   SPARKLE_VERSION,
   inspectPinnedSparkleFramework,
   inspectPinnedSparkleTools,
-  normalizeMacOSUpdaterConfiguration,
-  normalizeMacOSUpdaterMetadata,
 } from "../scripts/macos-updater-core.js";
 
 const REPOSITORY_ROOT = resolve(
@@ -34,7 +32,7 @@ const REPOSITORY_ROOT = resolve(
   "..",
 );
 
-test("Sparkle dependency is exact, licensed, and development-disabled", async () => {
+test("Sparkle signing dependency is exact and licensed", async () => {
   assert.equal(SPARKLE_VERSION, "2.9.3");
   assert.equal(
     SPARKLE_ARCHIVE_URL,
@@ -56,47 +54,7 @@ test("Sparkle dependency is exact, licensed, and development-disabled", async ()
     ))).digest("hex"),
     SPARKLE_LICENSE_SHA256,
   );
-  assert.deepEqual(
-    await normalizeMacOSUpdaterConfiguration({
-      externalDistribution: false,
-    }),
-    {
-      appcastURL: null,
-      automaticChecks: false,
-      automaticUpdatesEnabledByDefault: false,
-      allowsAutomaticUpdateOptIn: false,
-      enabled: false,
-      framework: null,
-      publicEdKey: null,
-      version: null,
-    },
-  );
-  await assert.rejects(
-    normalizeMacOSUpdaterConfiguration({
-      appcastURL: "https://updates.example/appcast.xml",
-      externalDistribution: false,
-    }),
-    { code: "MACOS_UPDATER_FORBIDDEN_IN_DEVELOPMENT" },
-  );
-  await assert.rejects(
-    normalizeMacOSUpdaterConfiguration({
-      externalDistribution: true,
-    }),
-    { code: "MACOS_UPDATER_REQUIRED_FOR_DISTRIBUTION" },
-  );
-  await assert.rejects(
-    normalizeMacOSUpdaterConfiguration({
-      previewDistribution: true,
-    }),
-    { code: "MACOS_UPDATER_REQUIRED_FOR_DISTRIBUTION" },
-  );
-  await assert.rejects(
-    normalizeMacOSUpdaterConfiguration({
-      externalDistribution: true,
-      previewDistribution: true,
-    }),
-    { code: "MACOS_UPDATER_CHANNEL_CONFLICT" },
-  );
+
 });
 
 test("prepared Sparkle framework matches the reviewed tree when present", async (context) => {
@@ -177,56 +135,6 @@ test("Sparkle appcast tools fail closed on aliases and unexpected files", async 
   }
 });
 
-test("preview updater metadata rejects unsafe feeds and malformed public keys", () => {
-  const publicEdKey = Buffer.alloc(32, 3).toString("base64");
-  assert.deepEqual(
-    normalizeMacOSUpdaterMetadata({
-      appcastURL: "https://updates.example.test/tibotattle/appcast.xml",
-      publicEdKey,
-    }),
-    {
-      appcastURL: "https://updates.example.test/tibotattle/appcast.xml",
-      publicEdKey,
-    },
-  );
-  for (const appcastURL of [
-    "http://updates.example.test/appcast.xml",
-    "https://localhost/appcast.xml",
-    "https://10.0.0.1/appcast.xml",
-    "https://[::ffff:7f00:1]/appcast.xml",
-    "https://updates.example.test/",
-    "https://user:secret@updates.example.test/appcast.xml",
-    "https://updates.example.test/appcast.xml?channel=preview",
-  ]) {
-    assert.throws(
-      () => normalizeMacOSUpdaterMetadata({ appcastURL, publicEdKey }),
-      { code: "MACOS_UPDATER_CONFIGURATION_INVALID" },
-      appcastURL,
-    );
-  }
-  for (const invalidKey of [
-    "not-base64",
-    Buffer.alloc(31, 3).toString("base64"),
-    `${Buffer.alloc(32, 3).toString("base64").slice(0, -1)}A`,
-  ]) {
-    assert.throws(
-      () => normalizeMacOSUpdaterMetadata({
-        appcastURL: "https://updates.example.test/appcast.xml",
-        publicEdKey: invalidKey,
-      }),
-      { code: "MACOS_UPDATER_CONFIGURATION_INVALID" },
-      invalidKey,
-    );
-  }
-  assert.throws(
-    () => normalizeMacOSUpdaterMetadata({
-      appcastURL: "https://updates.example.test/appcast.xml",
-      publicEdKey: "",
-    }),
-    { code: "MACOS_UPDATER_REQUIRED_FOR_DISTRIBUTION" },
-  );
-});
-
 test("Sparkle framework input fails closed on aliases and modified trees", async () => {
   const temporaryRoot = await mkdtemp(
     join(await realpath(tmpdir()), "usage-monitor-updater-test-"),
@@ -247,27 +155,5 @@ test("Sparkle framework input fails closed on aliases and modified trees", async
     );
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
-  }
-});
-
-
-test("updater configuration accepts only explicit thin release architectures", async () => {
-  const publicEdKey = Buffer.alloc(32, 3).toString("base64");
-  const intelURL = "https://updates.tibotattle.com/intel/appcast.xml";
-  assert.equal(normalizeMacOSUpdaterMetadata({
-    architecture: "x64", appcastURL: intelURL, publicEdKey,
-  }).appcastURL, intelURL);
-  assert.throws(() => normalizeMacOSUpdaterMetadata({
-    appcastURL: intelURL, publicEdKey,
-  }), { code: "MACOS_UPDATER_ARCHITECTURE_MISMATCH" });
-  assert.throws(() => normalizeMacOSUpdaterMetadata({
-    architecture: "x64", appcastURL: "https://updates.tibotattle.com/appcast.xml", publicEdKey,
-  }), { code: "MACOS_UPDATER_ARCHITECTURE_MISMATCH" });
-  for (const architecture of ["universal", "x86_64", null]) {
-    assert.throws(() => normalizeMacOSUpdaterMetadata({
-      architecture, appcastURL: intelURL, publicEdKey,
-    }), { code: "RELEASE_ARCHITECTURE_INVALID" });
-    await assert.rejects(normalizeMacOSUpdaterConfiguration({ architecture }),
-      { code: "RELEASE_ARCHITECTURE_INVALID" });
   }
 });

@@ -87,18 +87,23 @@ nothing differs, nothing republishes — a correct fit set that never reaches a
 changed day will not surface until a day's expected value moves.
 
 The resumable scheduler budgets both D1 bindings together and runs essential
-maintenance first. Check `BOUNDED_ANALYSIS_PROGRESS`, deferred reasons and
-`queriesUsed` across natural scheduled invocations. Heavy required work may
-defer a large completed checkpoint before loading it. New activity-only days
-retain their queue entry for a later complete allowance rebuild.
+maintenance first. Its 40-second graph window begins after required work and
+bounded weekly publication, without resetting the statement budget. Inspect
+`scheduled_graph_admission` for preceding phase durations and the newly available
+window. Check `BOUNDED_ANALYSIS_PROGRESS`, deferred reasons and `queriesUsed`
+across natural scheduled invocations. Heavy required work can still consume
+enough statements to defer a large checkpoint. Weekly build failures are isolated
+and cannot abort graph admission; losing the outer maintenance lease still stops
+the invocation. New activity-only days retain their queue entry for a later
+complete allowance rebuild.
 
 For a preview that is not advancing despite current account caches, inspect the natural
 invocation's wall time and `admin_allowance_preview_cache` phase timing, not
 only lifecycle `last_completed_at`. That stamp is written before optional
-analytics. Even UTC minutes attempt `before_analysis` publication; incomplete
-inputs retry `after_analysis`. Odd minutes preserve reconstruction's full budget
-and only attempt `after_analysis` publication. Both run before daily
-reconciliation. Refreshed rows and
+analytics. A three-minute rotation gives preview publication, current account
+calculation, and historical reconstruction first use of the graph window in
+turn. Incomplete preview inputs retry `after_analysis`; daily publication and
+remaining historical work use the available budget. Refreshed rows and
 deferrals log `queriesUsed`, `phaseQueries`, `elapsedMs` and
 `deadlineRemainingMs`. An unchanged same-day preview is quiet; it no longer
 rebuilds after an age threshold. Changed inputs or newly completed model dates
@@ -113,6 +118,17 @@ Even-minute passes give these self-throttled caches an early opportunity after
 allowance publication. `admin_metrics_snapshot` and `admin_metrics_history_cache`
 log refresh/failure timing or `OWNER_METRICS_BUDGET_DEFERRED`; a current cache is
 quiet. Their failure must not be reported as an allowance or database outage.
+
+In typed storage these are analytics tables, and the analytics scheduler writes
+them without logging the outcome. It captures `analytics_admin_metric_snapshots`
+and writes one `analytics_admin_metrics_history_publications` row per source
+and payload contract. The main Worker serves only its own contract's row. Before
+analytics migration 0027 it used the single source-keyed
+`analytics_admin_metrics_history_cache` row, which it still reads only when that
+row carries the same contract. A 503 `ADMIN_METRICS_HISTORY_CACHE_UNAVAILABLE`
+beside a fresh publication for another `schema_version` means the scheduler has
+not published the main Worker's contract yet. Deploy the Worker that is behind;
+do not edit or relabel rows. Compare `schema_version` and `generated_at` only.
 
 The independent owner-only `/api/v1/admin/reconstruction-progress` request
 shows exact requested/prepared/published generations and historical progress.
@@ -134,8 +150,10 @@ separate, low-priority historical model backfill. Source implementation is
 not proof that the migration or Worker has been deployed.
 
 - Each closed UTC day uses its own preceding 100-day acquisition horizon and
-  only observations through that day. The NNLS identification gates, pricing,
-  and Pro 20x normalization are unchanged. Today's fitted vector is never
+  only observations through that day. The NNLS identification gates and
+  pricing remain bound to the recorded method. Current normalization uses
+  Pro 10x; retained legacy publications keep their declared Pro 20x basis.
+  Today's fitted vector is never
   copied backward, and later Astra usage cannot create pre-Astra points.
 - Up to 69 missing dates before today are reconstructed, newest first. A day
   publishes only after the complete bounded cohort resolves. Sparse, unstable,
@@ -175,8 +193,10 @@ scheduled progress, the exact admin response and the rendered multi-day chart.
 The public chart uses only the daily API's optional closed
 [`allowanceBreakdowns`](../reference/api-surface.md#public-allowance-breakdowns),
 not an admin endpoint. View and date-range selection are client-side over that
-one periodically refreshed read. All views share date and dollar axes; plan values are normalized to
-Pro 20x and model values estimate a full weekly allowance on that model.
+one periodically refreshed read. Aggregate and model views use the payload's
+declared reference basis: current Pro 10x or retained legacy Pro 20x. The plan
+view shows each plan's own weekly value; model values estimate a full reference
+week on that model. Never relabel a legacy publication as the current basis.
 
 If activity works but a breakdown does not, check publication state and the
 source-fenced preview cache first. Age alone no longer removes the graph. A

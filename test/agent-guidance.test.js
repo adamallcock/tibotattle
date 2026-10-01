@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile as execFileCallback } from "node:child_process";
-import { readFile, readdir } from "node:fs/promises";
+import { lstat, readFile, readdir } from "node:fs/promises";
 import { dirname, join, posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
@@ -39,7 +39,16 @@ async function discoverGuidancePaths() {
     "--",
     ":(glob)**/AGENTS.md",
   ], { encoding: "utf8" });
-  return stdout.split("\0").filter(Boolean).sort();
+  const candidates = stdout.split("\0").filter(Boolean);
+  const present = await Promise.all(candidates.map(async (path) => {
+    try {
+      return (await lstat(join(REPOSITORY_ROOT, path))).isFile() ? path : null;
+    } catch (error) {
+      if (error?.code === "ENOENT") return null;
+      throw error;
+    }
+  }));
+  return present.filter(Boolean).sort();
 }
 
 async function directSubdirectories(path) {
@@ -215,26 +224,19 @@ test("agent guidance preserves owner erasure and restore after self-service reti
 });
 
 test("agent guidance treats unexpected Keychain prompts as a release blocker without weakening security", async () => {
-  const [root, native, scripts, runbook] = await Promise.all([
+  const [root, electron, scripts, runbook] = await Promise.all([
     readRepositoryFile("AGENTS.md"),
-    readRepositoryFile("apps/macos/AGENTS.md"),
+    readRepositoryFile("apps/electron/AGENTS.md"),
     readRepositoryFile("scripts/AGENTS.md"),
     readRepositoryFile("docs/runbooks/macos-stable-release-runbook.md"),
   ]);
 
   assert.match(root, /Unexpected Keychain security prompts block release/u);
   assert.match(root, /never weaken protection to suppress prompts/u);
-  assert.match(native, /Disable Keychain interaction for startup, refresh, background work/u);
-  assert.match(native, /bounded silent retries/u);
-  assert.match(native, /signing identity and designated\s+requirement/u);
-  assert.match(native, /deliberate approval can enable an OS\s+dialog/u);
-  assert.match(native, /Cancel must be the default/u);
-  assert.match(native, /denial\/cancellation preserve credentials\s+and history/u);
-  assert.match(native, /Never broaden ACLs, entitlements, or access groups/u);
-  assert.match(native, /same-identity upgrades with exact signed artifacts/u);
-  assert.match(native, /prompts block dogfood replacement and public release/u);
-  assert.match(native, /`--prepare-candidate` flag continues into signing and\s+notarization/u);
+  assert.match(electron, /Never reuse the retired native app's/u);
+  assert.match(electron, /Never mutate or downgrade the native app's databases/u);
   assert.match(scripts, /never automate prompt approval or broaden key access/u);
+  assert.match(runbook, /Unexpected Keychain prompts block\s+release/u);
   assert.match(runbook, /Signing-key access on the release machine is a separate owner provisioning\s+step/u);
   assert.doesNotMatch(runbook, /choose \*\*Always Allow\*\*/u);
 });

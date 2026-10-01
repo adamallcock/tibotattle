@@ -19,6 +19,8 @@ export const CATALOGS: Readonly<{
   es: MessageCatalog;
 }>;
 
+export function canonicalizeLocale(value: unknown): string | null;
+
 export function negotiateLocale(
   requestedLocales?: LocaleRequest,
   supportedLocales?: readonly string[],
@@ -33,6 +35,21 @@ export function resolveLocalePreference(
 ): string;
 
 export function isLanguagePreference(value: unknown): boolean;
+
+export interface CatalogCompletenessOptions {
+  catalogs?: MessageCatalogs;
+  supportedLocales?: readonly string[];
+  defaultLocale?: string;
+}
+
+export interface CatalogCompleteness {
+  readonly locales: readonly string[];
+  readonly keyCount: number;
+}
+
+export function assertCatalogCompleteness(
+  options?: CatalogCompletenessOptions,
+): CatalogCompleteness;
 
 export function getMessage(
   catalog: MessageCatalog,

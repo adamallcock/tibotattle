@@ -5,6 +5,8 @@ import {
 import {
   TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION,
   telemetryV11RequiredConsent,
+  TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+  telemetryV12RequiredConsent,
 } from "@app-usagemonitor/telemetry-contract";
 
 // The incremental full-history sync controller: consent-once, then sync
@@ -169,9 +171,10 @@ export function incrementalContributionRequiredConsent({
   destinationOrigin = null,
   telemetrySchemaVersion = TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
 } = {}) {
-  if (![TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION, TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION]
+  if (![TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION, TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION, TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION]
     .includes(telemetrySchemaVersion)) fail("configuration_invalid");
-  const required = telemetrySchemaVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
+  const required = telemetrySchemaVersion === TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION
+    ? telemetryV12RequiredConsent() : telemetrySchemaVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
     ? telemetryV11RequiredConsent() : telemetryV1RequiredConsent();
   return Object.freeze({
     ...required,
@@ -376,9 +379,10 @@ class IncrementalContributionSyncController {
   }
 
   #selectedRequiredConsent() {
-    return this.#settings.consent?.telemetrySchemaVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
+    return [TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION, TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION]
+      .includes(this.#settings.consent?.telemetrySchemaVersion)
       ? incrementalContributionRequiredConsent({ destinationOrigin: this.#destinationOrigin,
-        telemetrySchemaVersion: TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION })
+        telemetrySchemaVersion: this.#settings.consent.telemetrySchemaVersion })
       : this.#requiredConsent;
   }
 

@@ -1,7 +1,7 @@
 {
-  "schemaVersion": "admin-overview-v0.3",
+  "schemaVersion": "admin-overview-v0.5",
   "generatedAt": "2026-08-02T12:00:00.000Z",
-  "service": { "environment": "production" },
+  "service": { "environment": "production", "telemetryStorageMode": "json" },
   "collection": {
     "state": "operational",
     "revision": 7,
@@ -15,5 +15,6 @@
   "snapshots": [],
   "pendingHistoricalRebuilds": 0,
   "errors": { "groups": [], "lookup": null },
-  "audit": []
+  "audit": [],
+  "historicalPublication": null
 }

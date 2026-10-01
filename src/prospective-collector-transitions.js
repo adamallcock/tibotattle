@@ -17,7 +17,7 @@ const COMPONENT_NAMES = Object.freeze([
   "output_text_tokens",
   "output_reasoning_tokens",
 ]);
-const SPEED_MODES = Object.freeze(["standard", "fast", "unknown", "other"]);
+const SPEED_MODES = Object.freeze(["standard", "fast", "ultrafast", "unknown", "other"]);
 const TOOL_CLASSES = Object.freeze([
   "web_search",
   "file_search",

@@ -51,7 +51,7 @@ import {
 // machine; applied to a 78.99 GiB corpus it would need ~53 runs to reach
 // coverage, which is why a complete index had never actually been produced.
 // This path has no per-run byte budget at all. It is safe to remove because
-// peak memory here is a function of the 64 KiB bounded-line cap and the commit
+// peak memory here is a function of the 512 KiB bounded-line cap and the commit
 // batch size, not of corpus or file size, and because the whole rebuild lands
 // in a staging file that is published by atomic rename — an interruption
 // leaves the previous index untouched and costs only the work done so far.
@@ -294,6 +294,7 @@ function tierRow(tier) {
   let codexSpeedMode = "unknown";
   if (normalized === "default" || normalized === "standard") codexSpeedMode = "standard";
   else if (normalized === "priority" || normalized === "fast") codexSpeedMode = "fast";
+  else if (normalized === "ultrafast") codexSpeedMode = "ultrafast";
   else if (normalized !== null) codexSpeedMode = "other";
   return {
     apiServiceTier: "unknown",
@@ -305,7 +306,7 @@ function tierRow(tier) {
     // still prices Fast — the label only records where the value came from.
     tierSource: tier.inherited === true
       ? "lineage_inherited"
-      : "rollout_thread_settings",
+      : tier.tierSource ?? "rollout_thread_settings",
     providerTierRaw: raw ?? null,
   };
 }
@@ -712,8 +713,8 @@ export function createEventSink({
         tokensInCacheWrite1h: null,
         tokensOutText: components?.outputTextTokens ?? null,
         tokensOutReasoning: components?.outputReasoningTokens ?? null,
-        tokensOutCombined: null,
-        totalInputContext: null,
+        tokensOutCombined: event.outputCombinedTokens ?? null,
+        totalInputContext: event.totalInputContextTokens ?? null,
         partial: event.partial === true,
         modelInherited: event.modelInherited === true,
         cacheWriteAssumedZero: event.cacheWriteAssumedZero === true,

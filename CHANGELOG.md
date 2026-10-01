@@ -7,7 +7,8 @@ version labels; it does not imply API stability before 1.0.
 ## Provenance and acknowledgements
 
 - A release heading links to its checked-in notes. The date is the UTC calendar
-  date on which the public GitHub Release was published.
+  date on which the public GitHub Release was published, except the explicitly
+  marked, unpublished 0.1.25 tagged candidate, whose date is its source freeze.
 - Every released entry links to the public GitHub Release, its exact source
   revision, and the comparison with the preceding release source. Stable tags
   are annotated except for the protected historical v0.1.10 anomaly recorded
@@ -37,10 +38,104 @@ remains accountable for release wording, validation, signing, and publication.
 
 No changes yet.
 
+## [0.1.26](./release-notes/0.1.26.md) - 2026-09-27
+
+**Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.26) ·
+[annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.26) ·
+[changes since the v0.1.25 tagged candidate](https://github.com/adamallcock/tibotattle/compare/v0.1.25...v0.1.26) ·
+[changes since the last public v0.1.24 release](https://github.com/adamallcock/tibotattle/compare/v0.1.24...v0.1.26)
+
+Version 0.1.25 was tagged and signed but never published. Version 0.1.26
+carries those changes forward from the last public 0.1.24 release.
+
+- Restore direct Codex allowance refresh for newer bundled CLI layouts and
+  report selected CLI source without private paths. Keep quota freshness
+  independent of local usage and bound the dashboard's timeout cleanup wait.
+- Distinguish a locked Mac Keychain from an item access denial when macOS
+  reports the same authorization error. Keep credential reads silent and leave
+  existing items and access controls intact.
+- Add Mac update visibility, preserve startup checkpoints and cached reports
+  during refresh, correct cached Trends header ranges, and retain newly
+  recognized Claude model names. Keep forecast-only GPT-6.1 Astra unpriced.
+
+## [0.1.25](./release-notes/0.1.25.md) - 2026-09-27
+
+**Status:** Tagged and signed candidate only. No public GitHub Release or
+stable update was published. The source and artifacts remain frozen on hold.
+
+**Provenance:** [GitHub release location (unpublished)](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.25) ·
+[annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.25) ·
+[changes since v0.1.24](https://github.com/adamallcock/tibotattle/compare/v0.1.24...v0.1.25)
+
+- Restore direct Codex allowance refresh when a current ChatGPT or Codex app
+  bundles its CLI under `codex-cli/bin/codex`; retain legacy bundle and explicit
+  CLI locations, with path-free selection diagnostics. Keep quota freshness
+  independent of newer usage, show a fresh allowance while longer local analysis
+  continues, and bound the UI wait after a terminal timeout.
+- Improve Mac update visibility and prevent a tray cleanup crash during updater
+  shutdown. Persist startup checkpoints before early quits, warm cached dashboard
+  reports across periods and speed modes, and correct the Trends header range
+  for cached plan views.
+- Keep the forecast-only GPT-6.1 Astra identity explicitly unpriced in local
+  Codex usage reports.
+
+## [0.1.24](./release-notes/0.1.24.md) - 2026-09-23
+
+**Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.24) ·
+[annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.24) ·
+[changes since v0.1.23](https://github.com/adamallcock/tibotattle/compare/v0.1.23...v0.1.24)
+
+- Add GPT-6 Sol and Luna recognition and shared client/server prices for all
+  four processing modes and both context bands, using the existing family icons.
+- Enable local Model performance on Windows x64, following protected-reader and
+  packaged-source qualification in [PR #199](https://github.com/adamallcock/tibotattle/pull/199).
+- Repair Windows task names and project grouping reported in
+  [issue #208](https://github.com/adamallcock/tibotattle/issues/208).
+- Align macOS and Windows task metadata and selected-history reads, preserving
+  valid paginated forks and avoiding sidecar creation for closed source databases.
+- Add tool-free turn throughput, retain performance and work reports during
+  refresh, and improve automatic refresh recovery.
+- Keep Standard and Fast performance measurements separate, default to Standard,
+  and identify historical measurements with unknown mode as excluded.
+- Add telemetry v1.2 turn-boundary and continuity evidence for optional sharing
+  while retaining older-client compatibility and existing cache calculations.
+- Improve tray pace and run-out forecasts, login status updates, and local
+  opt-in crash diagnostics.
+- Correct history record classification, accept rollout lines up to 512 KiB,
+  and preserve existing usage through parser recovery and restart.
+- Recover optional uploads from temporary service failures and trigger a
+  coalesced upload after a successful index update, preserving opt-outs and backoff.
+
+## [0.1.23](./release-notes/0.1.23.md) - 2026-09-14
+
+**Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.23) ·
+[annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.23) ·
+[changes since v0.1.22](https://github.com/adamallcock/tibotattle/compare/v0.1.22...v0.1.23)
+
+- Redesign remaining allowances as animated fuel tanks with one shared pace
+  forecast, explicit waiting states, reset countdowns and run-out timing.
+- Add the interactive Trends horizon with linked allowance, spending, quota
+  comparison and cumulative-drift charts, plus typed reset evidence.
+- Rename Allowance to Allowance Value and add plan-specific five-hour history
+  alongside seven-day estimates.
+- Add the cache continuity matrix with all time buckets visible, sample counts,
+  percentage-first inspection and model filtering.
+- Unify dashboard headers, reporting periods, model pickers, tables and loading
+  states; preload reports and preserve cached results during refresh.
+- Add the local usage coach and Codex plugin through the bounded, content-free
+  agent protocol.
+- Preserve exact Windows file identities and recover collector/model-timing
+  storage safely. Windows model performance remains unavailable until its
+  separate native qualification gate passes.
+- Restore four-platform release reconciliation and strengthen Mac update and
+  empty-profile qualification, with final-package Linux runtime checks.
+No changes yet.
+
 ## [0.1.22](./release-notes/0.1.22.md) - 2026-09-11
 
 **Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.22) ·
 [annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.22) ·
+[exact application source](https://github.com/adamallcock/tibotattle/commit/16a0d4dffad4b1213b28adaae139fc9ee6705837) ·
 [changes since v0.1.21](https://github.com/adamallcock/tibotattle/compare/v0.1.21...v0.1.22)
 
 Add Projects & threads and local model-performance views, with scoped cached
@@ -53,6 +148,7 @@ See the [release notes](./release-notes/0.1.22.md).
 
 **Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.21) ·
 [annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.21) ·
+[exact application source](https://github.com/adamallcock/tibotattle/commit/a651ea130dd1460e4443a037c4434f57b911fec4) ·
 [changes since v0.1.20](https://github.com/adamallcock/tibotattle/compare/v0.1.20...v0.1.21)
 
 Complete native 0.1.18's update path to Electron, preserving local history,
@@ -95,6 +191,7 @@ compact website download controls with GitHub asset links. See the
 
 This release's native Mac handover requires preserving the old app and does not
 provide an ordinary replacement upgrade. Native Sparkle updates remain separate.
+The 0.1.20 release above addresses that limitation; the checked-in 0.1.19 notes
 The 0.1.20 candidate above addresses that limitation; the checked-in 0.1.19 notes
 preserve the published release wording.
 

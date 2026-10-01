@@ -29,6 +29,18 @@ const SIGNED_MACOS_BUNDLE_VERSION_PLAN = Object.freeze({
   "0.1.21": Object.freeze({ stable: "1028" }),
   // Combined desktop follow-up; preserve native and Electron update ordering.
   "0.1.22": Object.freeze({ stable: "1029" }),
+  // Next desktop candidate; allocation alone is not signed artifact evidence.
+  "0.1.23": Object.freeze({ stable: "1030" }),
+  // Supersede unpublished candidate 1031 after its native-upgrade qualification
+  // found startup diagnostics occupying the migration target. Qualification
+  // and publication of this replacement allocation remain separate gates.
+  "0.1.24": Object.freeze({ stable: "1032" }),
+  // The 0.1.25 successor advances both signed Mac architectures together.
+  // Source, artifact, installed-upgrade and publication proof remain distinct.
+  "0.1.25": Object.freeze({ stable: "1033" }),
+  // Owner-selected successor after the held 0.1.25 candidate. Allocation is
+  // not signed, installed, or published release evidence.
+  "0.1.26": Object.freeze({ stable: "1034" }),
 });
 
 module.exports = { SIGNED_MACOS_BUNDLE_VERSION_PLAN };

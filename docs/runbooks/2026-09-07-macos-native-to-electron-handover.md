@@ -65,7 +65,7 @@ private file and directory permissions; migration does not change permissions
 on the native source.
 
 The helper in
-[`NativeElectronHandoverHelper.swift`](../../apps/macos/Helpers/NativeElectronHandoverHelper.swift)
+[`NativeElectronHandoverHelper.swift`](../../apps/electron/native/NativeElectronHandoverHelper.swift)
 accepts the legacy `--prepare --native-app <absolute bundle path>` operation and
 the pathless `--prepare-retained-state` replacement operation.
 It verifies the enclosing Electron app identity and selected old app, asks

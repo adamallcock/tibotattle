@@ -118,6 +118,7 @@ export function createLocalExportSetMaterialization(configuration = {}) {
     "enumerateOwnerOnlyExportDestinationEntries", "openOwnerOnlyExportDestination",
     "projectOwnerOnlyExportArtifactPath", "readOwnerOnlyExportArtifactIfPresent",
     "recoverOwnerOnlyPairTransactionsForDestination", "writeOwnerOnlyPairNoClobberForDestination",
+    "withOwnerOnlyExportDestinationBatch",
   ]);
   const identity = snapshotPorts(configuration, "identity", ["deriveParticipantId"]);
   const resource = snapshotPorts(configuration, "resource", ["createGuard"]);
@@ -174,7 +175,7 @@ export function createLocalExportSetMaterialization(configuration = {}) {
       throw new TypeError("maximumEncodedArtifactBytes exceeds the resource policy");
     }
     const opened = await destination.openOwnerOnlyExportDestination({ directory: outputDirectory });
-    const destinationCapability = own(opened, "destination");
+    const openedDestination = own(opened, "destination");
     const destinationStatus = own(opened, "status");
     const localWorkspace = await workspace.openExportWorkspace({ directory: workspaceDirectory });
     let resourceGuard = null;
@@ -187,19 +188,6 @@ export function createLocalExportSetMaterialization(configuration = {}) {
           || maximumCanonicalBundleBytes > descriptor.resourceLimits.maximumCanonicalBundleBytes
           || maximumEncodedArtifactBytes > descriptor.resourceLimits.maximumEncodedArtifactBytes) {
         throw new TypeError("Materialization limits exceed the workspace resource policy");
-      }
-      if (destinationStatus === "present") {
-        await destination.recoverOwnerOnlyPairTransactionsForDestination(destinationCapability);
-        let entries;
-        try { entries = await destination.enumerateOwnerOnlyExportDestinationEntries(destinationCapability); }
-        catch (error) {
-          if (exactResourceLimitError(error, "directory_entries")) throw error;
-          contract.fail("artifact_read");
-        }
-        if (entries.length > descriptor.resourceLimits.maximumDirectoryEntries) {
-          throw new ExportResourceLimitError("directory_entries");
-        }
-        if (entries.some((name) => /^chunk-\d{6}\.bundle\.json$/.test(name))) contract.fail("mixed_representation");
       }
       localWorkspace.beginInvocation();
       resourceGuard = resource.createGuard({
@@ -217,7 +205,7 @@ export function createLocalExportSetMaterialization(configuration = {}) {
       let recordOffset = 0; let chunkIndex = 0; const chunks = [];
       const totals = { recordCounts: { usageEvents: 0, quotaSnapshots: 0, activityMarkers: 0 }, logicalRecordsSha256: logicalDigest, decodedBundleBytes: 0, encodedArtifactBytes: 0, receiptBytes: 0 };
       const emptySet = next.done;
-      while (!next.done || carry.length > 0 || (emptySet && chunkIndex === 0)) {
+      function prepareChunk() {
         resourceGuard.observeChunkCount(chunkIndex + 1);
         while (!next.done && carry.length < maximumRecordsPerChunk && carryBytes <= maximumCanonicalBundleBytes) { carry.push(next.value); carryBytes += next.value.recordBytes; next = iterator.next(); }
         const bundleId = contract.deterministicBundleId(secret, exportSetId, chunkIndex);
@@ -235,47 +223,70 @@ export function createLocalExportSetMaterialization(configuration = {}) {
         const receipt = contract.verifyPrivacySafeBundle(selected.bundle, { createdAt: descriptor.createdAt });
         const receiptText = contract.stableJson(receipt);
         const metadata = { index: chunkIndex, bundleId, participantId: descriptor.participantId, createdAt: descriptor.createdAt, coveredAt: structuredClone(descriptor.coveredAt), bundleSha256: contract.sha256(selected.bundleText), bundleBytes: selected.bundleBytes, contentEncoding: gzipProfile.contentEncoding, compressionProfile: gzipProfile.profile, artifactSha256: contract.sha256(selected.artifactContent), artifactBytes: selected.artifactBytes, receiptSha256: contract.sha256(receiptText), receiptBytes: Buffer.byteLength(receiptText), recordStart: recordOffset, recordEndExclusive: recordOffset + selectedCount, recordCounts: structuredClone(selected.bundle.recordCounts) };
-        localWorkspace.recordChunk(chunkIndex, "planned", metadata); resourceGuard.observeWorkspace(await localWorkspace.storageBytes()); await failpoint("after_chunk_plan", chunkIndex);
-        const bundleBasename = `chunk-${String(chunkIndex).padStart(6, "0")}.bundle.json.gz`;
-        const receiptBasename = `chunk-${String(chunkIndex).padStart(6, "0")}.receipt.json`;
-        const currentBundle = await destination.readOwnerOnlyExportArtifactIfPresent(destinationCapability, { basename: bundleBasename, maximumBytes: metadata.artifactBytes });
-        const currentReceipt = await destination.readOwnerOnlyExportArtifactIfPresent(destinationCapability, { basename: receiptBasename, maximumBytes: metadata.receiptBytes });
-        if ((currentBundle.status === "present") !== (currentReceipt.status === "present")) contract.fail("chunk_conflict");
-        if (currentBundle.status === "absent") { await destination.writeOwnerOnlyPairNoClobberForDestination(destinationCapability, { firstBasename: bundleBasename, firstContent: selected.artifactContent, secondBasename: receiptBasename, secondContent: receiptText }); await failpoint("after_chunk_publish", chunkIndex); }
-        const artifact = (await destination.readOwnerOnlyExportArtifactIfPresent(destinationCapability, { basename: bundleBasename, maximumBytes: metadata.artifactBytes })).bytes;
-        const receiptBytes = (await destination.readOwnerOnlyExportArtifactIfPresent(destinationCapability, { basename: receiptBasename, maximumBytes: metadata.receiptBytes })).bytes;
-        if (!artifact || !receiptBytes || artifact.length !== metadata.artifactBytes || contract.sha256(artifact) !== metadata.artifactSha256 || receiptBytes.length !== metadata.receiptBytes || contract.sha256(receiptBytes) !== metadata.receiptSha256) contract.fail("chunk_conflict");
-        try {
-          const bundleBytes = contract.decompressExportBytes(artifact, { maximumEncodedBytes: metadata.artifactBytes, maximumDecodedBytes: metadata.bundleBytes });
-          if (bundleBytes.length !== metadata.bundleBytes || contract.sha256(bundleBytes) !== metadata.bundleSha256) contract.fail("chunk_conflict");
-          contract.assertVerifiedChunk(contract.loadVerifiedLocalMetadataBundleBytes({ bundleBytes, receiptBytes }), metadata);
-        } catch (error) {
-          if (exactError(error, ExportSetError, "export_set_chunk_conflict")) throw error;
-          contract.fail("chunk_conflict");
-        }
-        localWorkspace.recordChunk(chunkIndex, "verified", metadata); resourceGuard.observeWorkspace(await localWorkspace.storageBytes()); await failpoint("after_chunk_verify", chunkIndex);
-        chunks.push({ index: metadata.index, bundleId: metadata.bundleId, bundleSha256: metadata.bundleSha256,
-          bundleBytes: metadata.bundleBytes, contentEncoding: metadata.contentEncoding,
-          compressionProfile: metadata.compressionProfile, artifactSha256: metadata.artifactSha256,
-          artifactBytes: metadata.artifactBytes, receiptSha256: metadata.receiptSha256,
-          receiptBytes: metadata.receiptBytes, recordStart: metadata.recordStart,
-          recordEndExclusive: metadata.recordEndExclusive, recordCounts: metadata.recordCounts });
-        addCounts(totals.recordCounts, metadata.recordCounts); totals.decodedBundleBytes += metadata.bundleBytes; totals.encodedArtifactBytes += metadata.artifactBytes; totals.receiptBytes += metadata.receiptBytes; recordOffset += selectedCount; carry = carry.slice(selectedCount); carryBytes = carry.reduce((sum, row) => sum + row.recordBytes, 0); chunkIndex += 1; if (emptySet) break;
+        return { metadata, selected, receiptText, selectedCount };
       }
-      const manifest = { schemaVersion: manifestVersion, manifestContract: { version: contractVersion, schemaSha256 }, compatibility: structuredClone(descriptor.compatibility), exportSetId, participantId: descriptor.participantId, createdAt: descriptor.createdAt, coveredAt: structuredClone(descriptor.coveredAt), sourceProviders: [...descriptor.sourceProviders], clientPlatform: descriptor.clientPlatform, transportReady: false, completionStatus: "complete", compressionRuntime: { nodeVersion: process.versions.node, zlibVersion: process.versions.zlib }, sourcePlan: { sha256: combinedSourcePlan.sha256, sourceFiles: combinedSourcePlan.sourceFiles, sourceBytes: combinedSourcePlan.sourceBytes }, chunking, totals, chunks };
-      contract.assertValidExportSetManifest(manifest); const manifestText = contract.stableJson(manifest); resourceGuard.observeManifest(Buffer.byteLength(manifestText)); const manifestReceipt = contract.manifestReceipt(manifestText);
-      const existingManifest = await destination.readOwnerOnlyExportArtifactIfPresent(destinationCapability, { basename: manifestBasename, maximumBytes: resourceGuard.limits.maximumManifestBytes });
-      const existingReceipt = await destination.readOwnerOnlyExportArtifactIfPresent(destinationCapability, { basename: manifestReceiptBasename, maximumBytes: 1024 * 1024 });
-      if ((existingManifest.status === "present") !== (existingReceipt.status === "present")) contract.fail("manifest_conflict");
-      if (existingManifest.status === "present") {
-        try { if (existingManifest.bytes.toString("utf8") !== manifestText || contract.stableJson(JSON.parse(existingReceipt.bytes.toString("utf8"))) !== contract.stableJson(manifestReceipt)) contract.fail("manifest_conflict"); }
-        catch (error) {
-          if (exactError(error, ExportSetError, "export_set_manifest_conflict")) throw error;
-          contract.fail("artifact_read");
+      // Admit the first encoded/canonical chunk before creating an absent
+      // destination. The remaining pairs then share one pinned batch lease.
+      let firstChunk = prepareChunk();
+      return await destination.withOwnerOnlyExportDestinationBatch(openedDestination, async (destinationCapability) => {
+        if (destinationStatus === "present") {
+          await destination.recoverOwnerOnlyPairTransactionsForDestination(destinationCapability);
+          let entries;
+          try { entries = await destination.enumerateOwnerOnlyExportDestinationEntries(destinationCapability); }
+          catch (error) {
+            if (exactResourceLimitError(error, "directory_entries")) throw error;
+            contract.fail("artifact_read");
+          }
+          if (entries.length > descriptor.resourceLimits.maximumDirectoryEntries) {
+            throw new ExportResourceLimitError("directory_entries");
+          }
+          if (entries.some((name) => /^chunk-\d{6}\.bundle\.json$/.test(name))) contract.fail("mixed_representation");
         }
-      } else { await destination.writeOwnerOnlyPairNoClobberForDestination(destinationCapability, { firstBasename: manifestBasename, firstContent: manifestText, secondBasename: manifestReceiptBasename, secondContent: contract.stableJson(manifestReceipt) }); await failpoint("after_manifest_publish", null); }
-      localWorkspace.markManifestComplete({ exportSetId, manifestSha256: manifestReceipt.manifestSha256, manifestBytes: manifestReceipt.manifestBytes, chunkCount: chunks.length }); resourceGuard.observeWorkspace(await localWorkspace.storageBytes());
-      return { manifest, manifestReceipt, manifestFile: await destination.projectOwnerOnlyExportArtifactPath(destinationCapability, { basename: manifestBasename, maximumBytes: resourceGuard.limits.maximumManifestBytes }), manifestReceiptFile: await destination.projectOwnerOnlyExportArtifactPath(destinationCapability, { basename: manifestReceiptBasename, maximumBytes: 1024 * 1024 }), resourceUsage: resourceGuard.snapshot() };
+        while (!next.done || carry.length > 0 || (emptySet && chunkIndex === 0)) {
+          const { metadata, selected, receiptText, selectedCount } = firstChunk ?? prepareChunk();
+          firstChunk = null;
+          localWorkspace.recordChunk(chunkIndex, "planned", metadata); resourceGuard.observeWorkspace(await localWorkspace.storageBytes()); await failpoint("after_chunk_plan", chunkIndex);
+          const bundleBasename = `chunk-${String(chunkIndex).padStart(6, "0")}.bundle.json.gz`;
+          const receiptBasename = `chunk-${String(chunkIndex).padStart(6, "0")}.receipt.json`;
+          const currentBundle = await destination.readOwnerOnlyExportArtifactIfPresent(destinationCapability, { basename: bundleBasename, maximumBytes: metadata.artifactBytes });
+          const currentReceipt = await destination.readOwnerOnlyExportArtifactIfPresent(destinationCapability, { basename: receiptBasename, maximumBytes: metadata.receiptBytes });
+          if ((currentBundle.status === "present") !== (currentReceipt.status === "present")) contract.fail("chunk_conflict");
+          if (currentBundle.status === "absent") { await destination.writeOwnerOnlyPairNoClobberForDestination(destinationCapability, { firstBasename: bundleBasename, firstContent: selected.artifactContent, secondBasename: receiptBasename, secondContent: receiptText }); await failpoint("after_chunk_publish", chunkIndex); }
+          const artifact = (await destination.readOwnerOnlyExportArtifactIfPresent(destinationCapability, { basename: bundleBasename, maximumBytes: metadata.artifactBytes })).bytes;
+          const receiptBytes = (await destination.readOwnerOnlyExportArtifactIfPresent(destinationCapability, { basename: receiptBasename, maximumBytes: metadata.receiptBytes })).bytes;
+          if (!artifact || !receiptBytes || artifact.length !== metadata.artifactBytes || contract.sha256(artifact) !== metadata.artifactSha256 || receiptBytes.length !== metadata.receiptBytes || contract.sha256(receiptBytes) !== metadata.receiptSha256) contract.fail("chunk_conflict");
+          try {
+            const bundleBytes = contract.decompressExportBytes(artifact, { maximumEncodedBytes: metadata.artifactBytes, maximumDecodedBytes: metadata.bundleBytes });
+            if (bundleBytes.length !== metadata.bundleBytes || contract.sha256(bundleBytes) !== metadata.bundleSha256) contract.fail("chunk_conflict");
+            contract.assertVerifiedChunk(contract.loadVerifiedLocalMetadataBundleBytes({ bundleBytes, receiptBytes }), metadata);
+          } catch (error) {
+            if (exactError(error, ExportSetError, "export_set_chunk_conflict")) throw error;
+            contract.fail("chunk_conflict");
+          }
+          localWorkspace.recordChunk(chunkIndex, "verified", metadata); resourceGuard.observeWorkspace(await localWorkspace.storageBytes()); await failpoint("after_chunk_verify", chunkIndex);
+          chunks.push({ index: metadata.index, bundleId: metadata.bundleId, bundleSha256: metadata.bundleSha256,
+            bundleBytes: metadata.bundleBytes, contentEncoding: metadata.contentEncoding,
+            compressionProfile: metadata.compressionProfile, artifactSha256: metadata.artifactSha256,
+            artifactBytes: metadata.artifactBytes, receiptSha256: metadata.receiptSha256,
+            receiptBytes: metadata.receiptBytes, recordStart: metadata.recordStart,
+            recordEndExclusive: metadata.recordEndExclusive, recordCounts: metadata.recordCounts });
+          addCounts(totals.recordCounts, metadata.recordCounts); totals.decodedBundleBytes += metadata.bundleBytes; totals.encodedArtifactBytes += metadata.artifactBytes; totals.receiptBytes += metadata.receiptBytes; recordOffset += selectedCount; carry = carry.slice(selectedCount); carryBytes = carry.reduce((sum, row) => sum + row.recordBytes, 0); chunkIndex += 1; if (emptySet) break;
+        }
+        const manifest = { schemaVersion: manifestVersion, manifestContract: { version: contractVersion, schemaSha256 }, compatibility: structuredClone(descriptor.compatibility), exportSetId, participantId: descriptor.participantId, createdAt: descriptor.createdAt, coveredAt: structuredClone(descriptor.coveredAt), sourceProviders: [...descriptor.sourceProviders], clientPlatform: descriptor.clientPlatform, transportReady: false, completionStatus: "complete", compressionRuntime: { nodeVersion: process.versions.node, zlibVersion: process.versions.zlib }, sourcePlan: { sha256: combinedSourcePlan.sha256, sourceFiles: combinedSourcePlan.sourceFiles, sourceBytes: combinedSourcePlan.sourceBytes }, chunking, totals, chunks };
+        contract.assertValidExportSetManifest(manifest); const manifestText = contract.stableJson(manifest); resourceGuard.observeManifest(Buffer.byteLength(manifestText)); const manifestReceipt = contract.manifestReceipt(manifestText);
+        const existingManifest = await destination.readOwnerOnlyExportArtifactIfPresent(destinationCapability, { basename: manifestBasename, maximumBytes: resourceGuard.limits.maximumManifestBytes });
+        const existingReceipt = await destination.readOwnerOnlyExportArtifactIfPresent(destinationCapability, { basename: manifestReceiptBasename, maximumBytes: 1024 * 1024 });
+        if ((existingManifest.status === "present") !== (existingReceipt.status === "present")) contract.fail("manifest_conflict");
+        if (existingManifest.status === "present") {
+          try { if (existingManifest.bytes.toString("utf8") !== manifestText || contract.stableJson(JSON.parse(existingReceipt.bytes.toString("utf8"))) !== contract.stableJson(manifestReceipt)) contract.fail("manifest_conflict"); }
+          catch (error) {
+            if (exactError(error, ExportSetError, "export_set_manifest_conflict")) throw error;
+            contract.fail("artifact_read");
+          }
+        } else { await destination.writeOwnerOnlyPairNoClobberForDestination(destinationCapability, { firstBasename: manifestBasename, firstContent: manifestText, secondBasename: manifestReceiptBasename, secondContent: contract.stableJson(manifestReceipt) }); await failpoint("after_manifest_publish", null); }
+        localWorkspace.markManifestComplete({ exportSetId, manifestSha256: manifestReceipt.manifestSha256, manifestBytes: manifestReceipt.manifestBytes, chunkCount: chunks.length }); resourceGuard.observeWorkspace(await localWorkspace.storageBytes());
+        return { manifest, manifestReceipt, manifestFile: await destination.projectOwnerOnlyExportArtifactPath(destinationCapability, { basename: manifestBasename, maximumBytes: resourceGuard.limits.maximumManifestBytes }), manifestReceiptFile: await destination.projectOwnerOnlyExportArtifactPath(destinationCapability, { basename: manifestReceiptBasename, maximumBytes: 1024 * 1024 }), resourceUsage: resourceGuard.snapshot() };
+      });
     } catch (error) {
       bodyFailed = true;
       throw error;

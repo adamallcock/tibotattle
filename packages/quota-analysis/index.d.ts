@@ -1,9 +1,165 @@
 export type IsoInstant = string;
 export type OpaqueId = string;
+
+export const CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY: Readonly<{
+  version: "codex-included-allowance-speed-v0.1";
+  basis: "documented_included_allowance_relative_to_standard";
+  unit: "dimensionless";
+  reviewedFrom: "2026-09-29";
+  historicalApplicability: "unavailable_before_reviewed_from";
+  source: Readonly<{ publisher: "openai"; url: string; statement: string }>;
+  weights: Readonly<{ standard: 1; fast: 2.5; ultrafast: 8 }>;
+  supportedFastModels: readonly string[];
+  supportedUltrafastModels: readonly ["gpt-6-astra"];
+  establishesModeAvailability: false;
+  infersConsumptionBasis: false;
+  changesCalibrationBasis: false;
+}>;
+export type IncludedAllowanceConsumptionBasis =
+  | "included_allowance" | "purchased_credits" | "api_billing" | "unknown";
+export interface IncludedAllowanceSpeedWeight {
+  readonly policyVersion: typeof CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY.version;
+  readonly basis: typeof CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY.basis;
+  readonly reviewedFrom: typeof CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY.reviewedFrom;
+  readonly unit: "dimensionless";
+  readonly status: "documented" | "unavailable" | "not_applicable";
+  readonly reasonCode:
+    | "documented_speed_weight"
+    | "separate_credit_or_api_basis"
+    | "consumption_basis_unavailable"
+    | "provider_or_billing_surface_unavailable"
+    | "provider_or_billing_surface_not_supported"
+    | "event_time_unavailable"
+    | "before_reviewed_policy"
+    | "speed_mode_unavailable"
+    | "model_not_reviewed"
+    | "model_speed_not_supported";
+  readonly weight: 1 | 2.5 | 8 | null;
+}
+export function includedAllowanceSpeedWeight(input?: {
+  provider?: string | null;
+  billingSurface?: string | null;
+  consumptionBasis?: IncludedAllowanceConsumptionBasis | null;
+  modelId?: string | null;
+  mode?: string | null;
+  eventTime?: string | null;
+}): IncludedAllowanceSpeedWeight;
+
 // Runtime validation is required; this type intentionally does not encode the
 // provider-reported duration bounds.
 export type QuotaWindowDurationMinutes = number;
 export type SupportedQuotaWindowDurationMinutes = QuotaWindowDurationMinutes;
+
+export const QUOTA_RESET_EVENT_SCHEMA_VERSION: "quota-reset-event-v0.1";
+export const RESET_EVENT_CONTINUITY_SCHEMA_VERSION: "reset-event-continuity-v0.1";
+export const QUOTA_RESET_EVENT_KINDS: readonly [
+  "scheduled_reset",
+  "banked_reset_used",
+  "unknown_reset",
+  "reset_credit_granted",
+  "reset_credit_expired",
+];
+export const QUOTA_RESET_EVENT_PRECISIONS: readonly [
+  "provider_schedule",
+  "observation_interval",
+  "provider_timestamp",
+];
+export const QUOTA_RESET_EVENT_REASONS: readonly [
+  "scheduled_boundary",
+  "credit_count_decreased_before_expiry",
+  "confirmed_unscheduled_quota_drop",
+  "reset_credit_id_added",
+  "reset_credit_expiry_elapsed",
+  "overlapping_scheduled_and_credit_evidence",
+];
+export const QUOTA_RESET_CLASSIFICATION_POLICY: Readonly<{
+  materialDropPercentagePoints: 5;
+  resetScheduleJitterMs: number;
+  maximumObservations: 100000;
+  maximumCredits: 1024;
+  maximumWindowsPerObservation: 256;
+  maximumEventsPerObservation: 2304;
+  maximumCreditContinuityGapMs: number;
+}>;
+
+export type QuotaResetEventKind = typeof QUOTA_RESET_EVENT_KINDS[number];
+export type QuotaResetEventPrecision =
+  typeof QUOTA_RESET_EVENT_PRECISIONS[number];
+export type QuotaResetEventReason = typeof QUOTA_RESET_EVENT_REASONS[number];
+
+export interface QuotaResetEvent {
+  readonly schemaVersion: "quota-reset-event-v0.1";
+  readonly kind: QuotaResetEventKind;
+  readonly occurredAt: IsoInstant;
+  readonly observedAt: IsoInstant;
+  readonly intervalStartedAt: IsoInstant;
+  readonly precision: QuotaResetEventPrecision;
+  readonly reason: QuotaResetEventReason;
+  readonly provider: string;
+  readonly planType: string | null;
+  readonly limitId: string | null;
+  readonly windowDurationMins: number | null;
+}
+
+export interface QuotaResetTimelineWindow {
+  provider: string;
+  planType: string;
+  limitId: string;
+  usedPercent: number;
+  resetsAt?: number;
+  resetAt?: IsoInstant;
+  windowDurationMins?: number;
+  durationMinutes?: number;
+}
+
+export interface QuotaResetTimelineObservation {
+  observedAt: IsoInstant;
+  accountScopeId: string | null;
+  windows: readonly QuotaResetTimelineWindow[];
+}
+
+export interface VolatileResetCredit {
+  /** Account-keyed fingerprint; never persist a provider credit identifier. */
+  id: string;
+  grantedAt: IsoInstant | null;
+  expiresAt: IsoInstant | null;
+}
+
+export interface VolatileResetCreditInventory {
+  availableCount: number;
+  detailsStatus: "complete" | "partial" | "unavailable";
+  credits: readonly VolatileResetCredit[];
+}
+
+export interface ResetEventObservation extends QuotaResetTimelineObservation {
+  resetCredits: VolatileResetCreditInventory | null;
+}
+
+export interface ResetEventClassifier {
+  reset(): void;
+  snapshot(): ResetEventContinuity;
+  restore(value: unknown): boolean;
+  observe(value: ResetEventObservation): readonly QuotaResetEvent[];
+}
+
+export interface ResetEventContinuity {
+  schemaVersion: "reset-event-continuity-v0.1";
+  timeline: QuotaResetTimelineObservation[];
+  creditBaseline: ResetEventObservation | null;
+}
+
+export function normalizeQuotaResetEvent(value: unknown): QuotaResetEvent | null;
+export function classifyQuotaResetTimeline(
+  values: readonly QuotaResetTimelineObservation[],
+): QuotaResetEvent[];
+export function createResetEventClassifier(): ResetEventClassifier;
+export function normalizeResetEventContinuity(
+  value: unknown,
+): ResetEventContinuity | null;
+export function mergeQuotaResetEvents(
+  reconstructed: readonly unknown[],
+  prospective: readonly unknown[],
+): QuotaResetEvent[];
 
 export const FIVE_HOUR_WINDOW_MINUTES: 300;
 export const SEVEN_DAY_WINDOW_MINUTES: 10080;

@@ -3,8 +3,8 @@ import {
   REVIEWED_CLAUDE_MODEL_IDS,
 } from "@app-usagemonitor/telemetry-contract";
 
-export const TELEMETRY_V01_REGISTRY_VERSION = "telemetry-v0.1-registry-2026-09-03.1";
-export const TELEMETRY_V01_REVIEWED_AT = "2026-09-03";
+export const TELEMETRY_V01_REGISTRY_VERSION = "telemetry-v0.1-registry-2026-09-29.1";
+export const TELEMETRY_V01_REVIEWED_AT = "2026-09-29";
 
 export const OPENAI_CODEX_MODEL_IDS = REVIEWED_CODEX_MODEL_IDS;
 
@@ -23,6 +23,8 @@ export const OPENAI_CODEX_UNPRICED_MODEL_IDS = Object.freeze([
   // merely unpriced - an API-equivalent figure for it is not comparable with
   // the primary pool at all.
   "gpt-5.3-codex-spark",
+  // Reviewed as a forecast identity, with no published API price card.
+  "gpt-6.1-astra",
 ]);
 
 export const OPENAI_CODEX_SPARK_MODEL_ID = "gpt-5.3-codex-spark";

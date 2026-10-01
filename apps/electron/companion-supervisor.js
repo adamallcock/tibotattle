@@ -1,4 +1,5 @@
 import { spawn as nodeSpawn } from "node:child_process";
+import { posix } from "node:path";
 
 import {
   LINUX_ACCOUNT_OBSERVATION_BROKER_IPC_ENV,
@@ -110,7 +111,7 @@ function disposeCredentialBroker(broker) {
   try { broker?.dispose?.(); } catch { /* Child teardown must still complete. */ }
 }
 
-function companionEnvironment(environment, parentPid, credentialBrokerKind = null) {
+function companionEnvironment(environment, parentPid, credentialBrokerKind = null, platform = process.platform) {
   const selected = {};
   for (const key of COMPANION_ENVIRONMENT_KEYS) {
     if (Object.hasOwn(environment, key) && typeof environment[key] === "string") {
@@ -121,8 +122,9 @@ function companionEnvironment(environment, parentPid, credentialBrokerKind = nul
   // Never pass secret bytes or silently fall back to Keychain on a broken pair.
   if (environment.USAGE_MONITOR_TEST_LANE === "macos-electron-local-qa-v1") {
     const file = environment.USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE;
+    const accountFile = environment.USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE;
     const enabled = environment.USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY;
-    if (file !== undefined || enabled !== undefined) {
+    if (file !== undefined || enabled !== undefined || accountFile !== undefined) {
       if (typeof file !== "string" || !file.startsWith("/") || file.includes("\0")
           || enabled !== "1" || environment.USAGE_MONITOR_CENTRAL_ORIGIN
           || environment.APP_USAGEMONITOR_EXPORT_SECRET !== undefined) {
@@ -130,6 +132,19 @@ function companionEnvironment(environment, parentPid, credentialBrokerKind = nul
       }
       selected.USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE = file;
       selected.USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY = "1";
+      if (accountFile !== undefined) {
+        // These are Darwin paths even when a contract test runs on Windows.
+        if (platform !== "darwin" || typeof accountFile !== "string"
+            || !posix.isAbsolute(accountFile) || accountFile.includes("\0")
+            || posix.resolve(accountFile) !== accountFile || posix.resolve(file) !== file
+            || posix.basename(file) !== "export-identity" || posix.basename(posix.dirname(file)) !== "identity"
+            || accountFile !== posix.join(posix.dirname(file), "account-observation-development")
+            || environment.USAGE_MONITOR_ACCOUNTLESS_ORIGIN
+            || environment.USAGE_MONITOR_ACCOUNTLESS_MODE || credentialBrokerKind !== null) {
+          throw shellError("electron_configuration_invalid");
+        }
+        selected.USAGE_MONITOR_DEVELOPMENT_ACCOUNT_SECRET_FILE = accountFile;
+      }
     }
   }
   // The child is a Node companion launched by Electron, never another GUI.
@@ -165,6 +180,7 @@ export function createCompanionSupervisor({
   args = [],
   cwd,
   environment = process.env,
+  platform = process.platform,
   startupTimeoutMs = DEFAULT_STARTUP_TIMEOUT_MS,
   shutdownTimeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS,
   parentPid = process.pid,
@@ -421,7 +437,7 @@ export function createCompanionSupervisor({
       try {
         currentChild = spawnChild(command, [...args], {
           cwd,
-          env: companionEnvironment(environment, parentPid, credentialBrokerKind),
+          env: companionEnvironment(environment, parentPid, credentialBrokerKind, platform),
           // Fixed Windows/Linux observation and accountless messages share
           // one inherited Node IPC channel with distinct closed schemas.
           // macOS and legacy Linux qualification retain their FD4 pipes.

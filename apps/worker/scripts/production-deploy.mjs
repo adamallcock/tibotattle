@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import {
   cp,
+  chmod,
   lstat,
   mkdir,
   mkdtemp,
@@ -33,6 +34,18 @@ import { ADMIN_UI_SOURCES } from "./generate-admin-ui-assets.mjs";
 import { runReleasePreflight } from "./release-preflight.mjs";
 import { openOperation, operationError, readOperation } from "../../../scripts/lib/release-operation.mjs";
 import { createProductionDeploymentLock } from "./production-deployment-lock.mjs";
+import { readPrivateProductionInventory } from "./production-reconcile.mjs";
+import { createProductionLiveProvider } from "./production-live-provider.mjs";
+import {
+  createProductionLiveConfigSnapshot,
+  renderProductionLiveConfig,
+  verifyProductionLiveConfig,
+} from "./production-live-config.mjs";
+import { buildTypedProductionExpectedSchemas } from "./production-typed-schema.mjs";
+import {
+  runTypedProductionPreflight,
+  TYPED_PRODUCTION_ROLE_BINDINGS,
+} from "./production-typed-preflight.mjs";
 
 // Renamed from DEPLOY_CONTAINED_PRODUCTION on 2026-08-07: production deploys
 // no longer assert a contained/paused intake posture, so the old token lied.
@@ -54,6 +67,7 @@ const PRODUCTION_PUBLIC_SURFACE_FORBIDDEN_PATHS = Object.freeze([
   ...ADMIN_UI_SOURCES.map(({ route }) => route),
   "/api/v1/admin/community/allowance-preview",
   "/api/v1/admin/reconstruction-progress",
+  "/api/v1/admin/database-health",
 ]);
 const PRODUCTION_PUBLIC_ROOT_FORBIDDEN_MARKERS = Object.freeze([
   'src="./app.js"',
@@ -62,9 +76,421 @@ const PRODUCTION_PUBLIC_ROOT_FORBIDDEN_MARKERS = Object.freeze([
   'id="contribution-cta"',
   'id="blind-spot-list"',
 ]);
+const PRODUCTION_PUBLIC_RELEASE_MANIFEST_PATH = "/release-site-manifest.json";
+const PRODUCTION_PUBLIC_RELEASE_MANIFEST_MAX_BYTES = 512 * 1024;
 
 function localFailure(code) {
   return { ok: false, code };
+}
+
+const PRODUCTION_SOURCE_COMMIT_PATTERN = /^[a-f0-9]{40}$/u;
+const PRODUCTION_SHA256_PATTERN = /^[a-f0-9]{64}$/u;
+
+const defaultTypedConfigTools = Object.freeze({
+  createSnapshot: createProductionLiveConfigSnapshot,
+  render: renderProductionLiveConfig,
+  verify: verifyProductionLiveConfig,
+});
+
+function typedFailure(code, typedCode = null) {
+  return {
+    ok: false,
+    code,
+    ...(typeof typedCode === "string" ? { typedCode } : {}),
+  };
+}
+
+function typedSnapshotMatches(left, right, { source = true, version = true } = {}) {
+  return left?.fingerprint === right?.fingerprint
+    && (!source || left?.sourceCommit === right?.sourceCommit)
+    && (!version || left?.versionId === right?.versionId);
+}
+
+function typedConfigDigest(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function typedConfigEnvironment(config) {
+  return config?.env?.production && typeof config.env.production === "object"
+    ? config.env.production
+    : config;
+}
+
+function typedRoles() {
+  return Object.entries(TYPED_PRODUCTION_ROLE_BINDINGS)
+    .map(([role, binding]) => ({ role, binding }));
+}
+
+const TYPED_SCHEMA_IDENTITY_ROLES = Object.freeze(
+  Object.keys(TYPED_PRODUCTION_ROLE_BINDINGS).sort(),
+);
+
+function typedSchemaIdentity(expected) {
+  if (expected?.schema !== "production-typed-schema-v1"
+      || !expected?.inputSha256
+      || typeof expected.inputSha256 !== "object"
+      || Array.isArray(expected.inputSha256)
+      || !expected?.expectedSchemas
+      || typeof expected.expectedSchemas !== "object"
+      || Array.isArray(expected.expectedSchemas)
+      || !PRODUCTION_SHA256_PATTERN.test(expected.operatorSchemaSourceSha256 ?? "")) {
+    return null;
+  }
+  const roleKey = TYPED_SCHEMA_IDENTITY_ROLES.join(",");
+  if (Object.keys(expected.inputSha256).sort().join(",") !== roleKey
+      || Object.keys(expected.expectedSchemas).sort().join(",") !== roleKey) {
+    return null;
+  }
+  const inputSha256 = {};
+  const schemaSha256 = {};
+  for (const role of TYPED_SCHEMA_IDENTITY_ROLES) {
+    const input = expected.inputSha256[role];
+    const schema = expected.expectedSchemas[role]?.schemaSha256;
+    if (!PRODUCTION_SHA256_PATTERN.test(input ?? "")
+        || !PRODUCTION_SHA256_PATTERN.test(schema ?? "")) {
+      return null;
+    }
+    inputSha256[role] = input;
+    schemaSha256[role] = schema;
+  }
+  return {
+    schema: expected.schema,
+    inputSha256,
+    schemaSha256,
+    operatorSchemaSourceSha256: expected.operatorSchemaSourceSha256,
+  };
+}
+
+/**
+ * Compute the immutable, content-free identity that is written into the
+ * production operation journal before any provider mutation is attempted.
+ * The live configuration fingerprint and schema/asset pins let a later
+ * operator distinguish a typed operation from the legacy reconciliation path;
+ * no binding IDs, names, or other private inventory values are persisted.
+ */
+export async function createTypedProductionOperationPin({
+  inventory,
+  workerDirectory,
+  expectedPreviousSourceCommit,
+  retainedPublicSourceCommit,
+  expectedLiveManifestSha256,
+  candidatePublicManifestSha256 = null,
+  buildSchemas = buildTypedProductionExpectedSchemas,
+  configTools = defaultTypedConfigTools,
+} = {}) {
+  if (!PRODUCTION_SOURCE_COMMIT_PATTERN.test(expectedPreviousSourceCommit ?? "")
+      || !PRODUCTION_SOURCE_COMMIT_PATTERN.test(retainedPublicSourceCommit ?? "")
+      || !PRODUCTION_SHA256_PATTERN.test(expectedLiveManifestSha256 ?? "")
+      || (candidatePublicManifestSha256 !== null && !PRODUCTION_SHA256_PATTERN.test(candidatePublicManifestSha256))
+      || typeof buildSchemas !== "function"
+      || typeof configTools?.createSnapshot !== "function") {
+    return typedFailure("PRODUCTION_TYPED_INPUT_INVALID");
+  }
+  let baseline;
+  let expected;
+  try {
+    baseline = configTools.createSnapshot(inventory);
+    if (baseline.sourceCommit !== expectedPreviousSourceCommit) {
+      return typedFailure("PRODUCTION_TYPED_PREDECESSOR_MISMATCH");
+    }
+    expected = await buildSchemas({ workerDirectory });
+  } catch (error) {
+    const code = typeof error?.code === "string"
+      && (error.code.startsWith("PRODUCTION_LIVE_CONFIG_")
+        || error.code.startsWith("PRODUCTION_LIVE_")
+        || error.code.startsWith("PRODUCTION_TYPED_SCHEMA_")
+        || error.code.startsWith("PRODUCTION_TYPED_"))
+      ? error.code
+      : "PRODUCTION_TYPED_SCHEMA_IDENTITY_FAILED";
+    return typedFailure(code);
+  }
+  if (!PRODUCTION_SHA256_PATTERN.test(baseline?.fingerprint ?? "")) {
+    return typedFailure("PRODUCTION_TYPED_LIVE_CONFIG_FINGERPRINT_INVALID");
+  }
+  const schemaIdentity = typedSchemaIdentity(expected);
+  if (!schemaIdentity) return typedFailure("PRODUCTION_TYPED_SCHEMA_IDENTITY_INVALID");
+  return {
+    ok: true,
+    pin: {
+      schema: "production-typed-operation-v1",
+      liveConfigurationFingerprint: baseline.fingerprint,
+      predecessorSourceCommit: expectedPreviousSourceCommit,
+      retainedPublicSourceCommit,
+      expectedLiveManifestSha256,
+      ...(candidatePublicManifestSha256 === null ? {} : { candidatePublicManifestSha256 }),
+      expectedSchemaIdentity: schemaIdentity,
+    },
+  };
+}
+
+async function installTypedProductionConfig({ configPath, configBytes }) {
+  let metadata;
+  try {
+    metadata = await lstat(configPath);
+  } catch {
+    throw operationError("PRODUCTION_TYPED_CONFIG_PATH_INVALID");
+  }
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1) {
+    throw operationError("PRODUCTION_TYPED_CONFIG_PATH_INVALID");
+  }
+  try {
+    await chmod(configPath, 0o600);
+    await writeFile(configPath, configBytes, { flag: "w" });
+    const written = await lstat(configPath);
+    if (!written.isFile() || written.isSymbolicLink() || written.nlink !== 1
+        || (written.mode & 0o077) !== 0) {
+      throw operationError("PRODUCTION_TYPED_CONFIG_PATH_INVALID");
+    }
+  } catch (error) {
+    if (error?.code === "PRODUCTION_TYPED_CONFIG_PATH_INVALID") throw error;
+    throw operationError("PRODUCTION_TYPED_CONFIG_WRITE_FAILED");
+  }
+}
+
+// The generated live config intentionally replaces the checked-in config in
+// the disposable snapshot. It is the only expected tracked-file difference;
+// every other source change remains visible to the public asset clean-tree
+// gate. The checked-out source tree is still verified independently before and
+// after the provider mutation.
+function gitWithGeneratedConfigException({ snapshotGit, repositoryRoot, configPath }) {
+  const relativeConfig = relative(repositoryRoot, configPath).split(sep).join("/");
+  const marker = ` M ${relativeConfig}`;
+  return (root, arguments_) => {
+    const output = snapshotGit(root, arguments_);
+    if (root !== repositoryRoot || arguments_?.[0] !== "status") return output;
+    return output
+      .split(/\r?\n/u)
+      .filter((line) => line !== marker)
+      .join("\n");
+  };
+}
+
+/**
+ * Prepare the typed production candidate against an owner-private inventory.
+ * This performs only provider reads and local config/schema qualification; the
+ * caller must still install the returned config into its disposable snapshot
+ * and pass the immutable source/lock gates before Wrangler is invoked.
+ */
+export async function prepareTypedProductionDeployment({
+  inventory,
+  provider,
+  workerDirectory,
+  sourceCommit,
+  expectedPreviousSourceCommit,
+  buildSchemas = buildTypedProductionExpectedSchemas,
+  inspectTyped = runTypedProductionPreflight,
+  configTools = defaultTypedConfigTools,
+} = {}) {
+  if (!PRODUCTION_SOURCE_COMMIT_PATTERN.test(sourceCommit ?? "")
+      || !PRODUCTION_SOURCE_COMMIT_PATTERN.test(expectedPreviousSourceCommit ?? "")
+      || !inventory || typeof inventory !== "object"
+      || typeof provider?.capture !== "function"
+      || typeof provider?.query !== "function"
+      || typeof buildSchemas !== "function"
+      || typeof inspectTyped !== "function"
+      || typeof configTools?.createSnapshot !== "function"
+      || typeof configTools?.render !== "function"
+      || typeof configTools?.verify !== "function") {
+    return typedFailure("PRODUCTION_TYPED_INPUT_INVALID");
+  }
+
+  let baseline;
+  let currentInventory;
+  let current;
+  let trackedConfig;
+  let candidateConfig;
+  let expected;
+  let typed;
+  try {
+    baseline = configTools.createSnapshot(inventory);
+    if (baseline.sourceCommit !== expectedPreviousSourceCommit) {
+      return typedFailure("PRODUCTION_TYPED_PREDECESSOR_MISMATCH");
+    }
+    currentInventory = await provider.capture();
+    current = configTools.createSnapshot(currentInventory);
+    if (!typedSnapshotMatches(baseline, current)
+        || current.sourceCommit !== expectedPreviousSourceCommit) {
+      return typedFailure("PRODUCTION_TYPED_LIVE_CHANGED");
+    }
+
+    const parseErrors = [];
+    trackedConfig = parse(
+      await readFile(join(workerDirectory, "wrangler.jsonc"), "utf8"),
+      parseErrors,
+    );
+    if (parseErrors.length || !trackedConfig || typeof trackedConfig !== "object") {
+      return typedFailure("PRODUCTION_TYPED_CONFIG_INVALID");
+    }
+    candidateConfig = configTools.render({
+      trackedConfig,
+      snapshot: current,
+      sourceCommit,
+    });
+    const preservation = configTools.verify({
+      snapshot: current,
+      candidateConfig,
+      sourceCommit,
+    });
+    if (!preservation?.ok) {
+      return typedFailure(
+        "PRODUCTION_TYPED_CONFIG_UNVERIFIED",
+        preservation?.code,
+      );
+    }
+
+    expected = await buildSchemas({ workerDirectory });
+    const production = typedConfigEnvironment(candidateConfig);
+    const vars = production?.vars;
+    typed = await inspectTyped({
+      roles: typedRoles(),
+      expectedSchemas: expected?.expectedSchemas,
+      config: {
+        mode: vars?.TELEMETRY_STORAGE_MODE,
+        sourceNamespace: vars?.TELEMETRY_STORAGE_NAMESPACE,
+      },
+      runQuery: (binding, sql) => provider.query(currentInventory, binding, sql),
+    });
+  } catch (error) {
+    const code = typeof error?.code === "string"
+      && (error.code.startsWith("PRODUCTION_LIVE_CONFIG_")
+        || error.code.startsWith("PRODUCTION_LIVE_")
+        || error.code.startsWith("TYPED_PREFLIGHT_")
+        || error.code.startsWith("PRODUCTION_TYPED_"))
+      ? error.code
+      : "PRODUCTION_TYPED_PREPARATION_FAILED";
+    return typedFailure(code);
+  }
+  if (!typed?.ok) {
+    return typedFailure("PRODUCTION_TYPED_PREFLIGHT_BLOCKED", typed?.code);
+  }
+  const configBytes = Buffer.from(
+    `${JSON.stringify(candidateConfig, null, 2)}\n`,
+    "utf8",
+  );
+  return {
+    ok: true,
+    baseline,
+    current,
+    currentInventory,
+    candidateConfig,
+    configBytes,
+    configSha256: typedConfigDigest(configBytes),
+    expectedSchemas: expected.expectedSchemas,
+    expectedSchemaIdentity: typedSchemaIdentity(expected),
+    provider,
+    inspectTyped,
+    configTools,
+  };
+}
+
+/**
+ * Re-read the pinned live configuration and all fixed typed SELECTs at a
+ * deployment boundary. Before Wrangler the active version/source must still
+ * be the pinned predecessor; after Wrangler only the source/version may move,
+ * while the effective configuration and typed schema must remain identical.
+ */
+export async function revalidateTypedProductionDeployment({
+  typedDeployment,
+  configPath,
+  sourceCommit,
+  expectedPreviousSourceCommit,
+  phase,
+} = {}) {
+  if (!typedDeployment?.baseline
+      || !typedDeployment?.currentInventory
+      || typeof typedDeployment.provider?.capture !== "function"
+      || typeof typedDeployment.provider?.query !== "function"
+      || typeof typedDeployment.inspectTyped !== "function"
+      || typeof typedDeployment.configTools?.createSnapshot !== "function"
+      || typeof typedDeployment.configTools?.verify !== "function"
+      || !["before", "after"].includes(phase)
+      || !PRODUCTION_SOURCE_COMMIT_PATTERN.test(sourceCommit ?? "")
+      || !PRODUCTION_SOURCE_COMMIT_PATTERN.test(expectedPreviousSourceCommit ?? "")) {
+    return typedFailure("PRODUCTION_TYPED_INPUT_INVALID");
+  }
+  let inventory;
+  let snapshot;
+  let candidateConfig;
+  try {
+    inventory = await typedDeployment.provider.capture();
+    snapshot = typedDeployment.configTools.createSnapshot(inventory);
+    if (phase === "before") {
+      if (!typedSnapshotMatches(typedDeployment.baseline, snapshot)
+          || snapshot.sourceCommit !== expectedPreviousSourceCommit) {
+        return typedFailure("PRODUCTION_TYPED_LIVE_CHANGED");
+      }
+    } else if (!typedSnapshotMatches(typedDeployment.baseline, snapshot, {
+      source: false,
+      version: false,
+    }) || snapshot.sourceCommit !== sourceCommit) {
+      return typedFailure("PRODUCTION_TYPED_POST_DEPLOY_LIVE_MISMATCH");
+    }
+
+    const metadata = await lstat(configPath);
+    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1
+        || (metadata.mode & 0o077) !== 0) {
+      return typedFailure("PRODUCTION_TYPED_CONFIG_PATH_INVALID");
+    }
+    const bytes = await readFile(configPath);
+    if (typedConfigDigest(bytes) !== typedDeployment.configSha256) {
+      return typedFailure("PRODUCTION_TYPED_CONFIG_CHANGED");
+    }
+    const parseErrors = [];
+    candidateConfig = parse(bytes.toString("utf8"), parseErrors);
+    if (parseErrors.length || !candidateConfig || typeof candidateConfig !== "object") {
+      return typedFailure("PRODUCTION_TYPED_CONFIG_INVALID");
+    }
+    const preservation = typedDeployment.configTools.verify({
+      snapshot,
+      candidateConfig,
+      sourceCommit,
+    });
+    if (!preservation?.ok) {
+      return typedFailure(
+        "PRODUCTION_TYPED_CONFIG_UNVERIFIED",
+        preservation?.code,
+      );
+    }
+    const production = typedConfigEnvironment(candidateConfig);
+    const vars = production?.vars;
+    const typed = await typedDeployment.inspectTyped({
+      roles: typedRoles(),
+      expectedSchemas: typedDeployment.expectedSchemas,
+      config: {
+        mode: vars?.TELEMETRY_STORAGE_MODE,
+        sourceNamespace: vars?.TELEMETRY_STORAGE_NAMESPACE,
+      },
+      runQuery: (binding, sql) => typedDeployment.provider.query(inventory, binding, sql),
+    });
+    if (!typed?.ok) {
+      return typedFailure("PRODUCTION_TYPED_PREFLIGHT_BLOCKED", typed?.code);
+    }
+    if (phase === "before") {
+      // Schema qualification performs ten fixed provider queries. Re-capture
+      // the compact live configuration once after those reads so a
+      // predecessor/config change during the query window cannot reach the
+      // final lock/source/dependency boundary. The after-deploy phase already
+      // has its own post-mutation capture and does not repeat this read.
+      const postSchemaInventory = await typedDeployment.provider.capture();
+      const postSchemaSnapshot = typedDeployment.configTools.createSnapshot(
+        postSchemaInventory,
+      );
+      if (!typedSnapshotMatches(typedDeployment.baseline, postSchemaSnapshot)
+          || postSchemaSnapshot.sourceCommit !== expectedPreviousSourceCommit) {
+        return typedFailure("PRODUCTION_TYPED_LIVE_CHANGED");
+      }
+    }
+  } catch (error) {
+    const code = typeof error?.code === "string"
+      && (error.code.startsWith("PRODUCTION_LIVE_CONFIG_")
+        || error.code.startsWith("PRODUCTION_LIVE_")
+        || error.code.startsWith("TYPED_PREFLIGHT_")
+        || error.code.startsWith("PRODUCTION_TYPED_"))
+      ? error.code
+      : `PRODUCTION_TYPED_${phase.toUpperCase()}_REVALIDATION_FAILED`;
+    return typedFailure(code);
+  }
+  return { ok: true, code: null, phase };
 }
 
 function boundedExcerpt(text) {
@@ -311,7 +737,7 @@ function checkedOutSourceTreeClean(workerDirectory) {
 
 function verifySourceSnapshot({
   workerDirectory,
-  expectedSourceCommit,
+  expectedSourceCommit = null,
   sourceCommitCheck,
   sourceTreeCleanCheck,
 }) {
@@ -483,9 +909,9 @@ export async function createImmutableSourceSnapshot({
   sourceCommit,
 }) {
   const repositoryRoot = sourceRepositoryRoot(workerDirectory);
-  const snapshotParent = await mkdtemp(
+  const snapshotParent = realpathSync(await mkdtemp(
     join(tmpdir(), "usage-monitor-production-source-"),
-  );
+  ));
   const snapshotRoot = join(snapshotParent, "repository");
   let worktreeAdded = false;
   try {
@@ -860,6 +1286,56 @@ export async function recheckProductionPublicSurface({
   return { ok: true, code: null };
 }
 
+/**
+ * Verify the retained public release manifest independently of the Worker
+ * deployment. The manifest is public, but its exact bytes are a release input:
+ * a backend deploy must not silently replace the live public site with a
+ * different release tree.
+ */
+export async function recheckProductionPublicReleaseManifest({
+  fetchImpl = globalThis.fetch,
+  expectedSha256,
+  timeoutMs = 10_000,
+} = {}) {
+  if (!PRODUCTION_SHA256_PATTERN.test(expectedSha256 ?? "")) {
+    return localFailure("PRODUCTION_PUBLIC_RELEASE_MANIFEST_EXPECTATION_INVALID");
+  }
+  const manifestURL = new URL(
+    PRODUCTION_PUBLIC_RELEASE_MANIFEST_PATH,
+    DEPLOYMENT_ENDPOINTS.public.origin,
+  ).href;
+  let response;
+  try {
+    response = await fetchImpl(manifestURL, {
+      method: "GET",
+      headers: { accept: "application/json" },
+      credentials: "omit",
+      redirect: "error",
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch {
+    return localFailure("PRODUCTION_PUBLIC_RELEASE_MANIFEST_UNREACHABLE");
+  }
+  if (response?.url !== manifestURL
+      || response.status !== 200
+      || response.headers?.get("content-type")?.split(";", 1)[0]
+        !== "application/json"
+      || typeof response.arrayBuffer !== "function") {
+    return localFailure("PRODUCTION_PUBLIC_RELEASE_MANIFEST_INVALID");
+  }
+  let bytes;
+  try {
+    bytes = Buffer.from(await response.arrayBuffer());
+  } catch {
+    return localFailure("PRODUCTION_PUBLIC_RELEASE_MANIFEST_INVALID");
+  }
+  if (bytes.length < 1 || bytes.length > PRODUCTION_PUBLIC_RELEASE_MANIFEST_MAX_BYTES
+      || typedConfigDigest(bytes) !== expectedSha256) {
+    return localFailure("PRODUCTION_PUBLIC_RELEASE_MANIFEST_MISMATCH");
+  }
+  return { ok: true, code: null, sha256: expectedSha256 };
+}
+
 async function runProductionDeploymentFromSnapshot({
   confirmedMigrations = null,
   wrangler,
@@ -884,7 +1360,14 @@ async function runProductionDeploymentFromSnapshot({
   fetchImpl = globalThis.fetch,
   healthRecheck = recheckProductionHealth,
   publicSurfaceRecheck = recheckProductionPublicSurface,
+  publicReleaseManifestRecheck = null,
+  typedDeployment = null,
+  typedConfigPath = null,
+  retainedPublicSourceCommit = null,
+  expectedLiveManifestSha256 = null,
+  candidatePublicManifestSha256 = null,
   beforeMutation = async () => { throw operationError("PRODUCTION_COORDINATION_REQUIRED"); },
+  finalMutationRecheck = null,
   mutationIntent = async () => { throw operationError("PRODUCTION_COORDINATION_REQUIRED"); },
 }) {
   // The dependency tree the deploy executes from is not under Git provenance, so
@@ -904,14 +1387,39 @@ async function runProductionDeploymentFromSnapshot({
     }
     return null;
   };
+  if (typedDeployment) {
+    if (typeof typedConfigPath !== "string"
+        || !PRODUCTION_SOURCE_COMMIT_PATTERN.test(typedDeployment.baseline?.sourceCommit ?? "")
+        || !PRODUCTION_SOURCE_COMMIT_PATTERN.test(retainedPublicSourceCommit ?? "")
+        || !PRODUCTION_SHA256_PATTERN.test(expectedLiveManifestSha256 ?? "")
+        || typeof publicReleaseManifestRecheck !== "function"
+        || typeof finalMutationRecheck !== "function") {
+      return typedFailure("PRODUCTION_TYPED_INPUT_INVALID");
+    }
+    try {
+      await installTypedProductionConfig({
+        configPath: typedConfigPath,
+        configBytes: typedDeployment.configBytes,
+      });
+    } catch (error) {
+      return typedFailure(error?.code ?? "PRODUCTION_TYPED_CONFIG_WRITE_FAILED");
+    }
+  }
   // Migration gate: the deploy source is the snapshot, so pending migrations
   // are computed from the snapshot's migration directories against the remote
   // production ledgers before any other gate runs.
-  const pendingCheck = migrationGateCheck ?? await determinePendingMigrations({
+  if (typedDeployment && confirmedMigrations !== null) {
+    return typedFailure("PRODUCTION_TYPED_MIGRATIONS_UNSUPPORTED");
+  }
+  // Typed roles have already passed independent exact-schema qualification.
+  // Their restore lineage does not use the legacy JSON migration ledger.
+  const pendingCheck = migrationGateCheck ?? (typedDeployment
+    ? { ok: true, code: null, pending: [] }
+    : await determinePendingMigrations({
     wrangler,
     workerDirectory,
     spawn,
-  });
+  }));
   if (!pendingCheck?.ok) {
     return pendingCheck?.code
       ? pendingCheck
@@ -926,6 +1434,9 @@ async function runProductionDeploymentFromSnapshot({
   });
   if (!migrationGate.ok) return migrationGate;
   const pendingMigrations = migrationGate.pendingMigrations;
+  if (typedDeployment && pendingMigrations.length > 0) {
+    return typedFailure("PRODUCTION_TYPED_MIGRATIONS_UNSUPPORTED");
+  }
   if (pendingMigrations.length > 0) {
     log(
       "Production deploy carries unapplied D1 migrations "
@@ -983,10 +1494,40 @@ async function runProductionDeploymentFromSnapshot({
         "worker-assets",
       ),
       expectedSourceCommit: sourceCommit,
-      git: snapshotGit,
+      ...(retainedPublicSourceCommit === null
+        ? {}
+        : { retainedPublicSourceCommit: candidatePublicManifestSha256 === null ? retainedPublicSourceCommit : sourceCommit }),
+      ...(expectedLiveManifestSha256 === null
+        ? {}
+        : { expectedLiveManifestSha256: candidatePublicManifestSha256 ?? expectedLiveManifestSha256 }),
+      git: typedDeployment
+        ? gitWithGeneratedConfigException({
+          snapshotGit,
+          repositoryRoot: snapshotRepositoryRoot,
+          configPath: typedConfigPath,
+        })
+        : snapshotGit,
     });
   } catch {
     return localFailure("PRODUCTION_PUBLIC_ASSETS_INVALID");
+  }
+  if (typedDeployment) {
+    let manifest;
+    try {
+      manifest = await publicReleaseManifestRecheck({
+        fetchImpl,
+        expectedSha256: expectedLiveManifestSha256,
+        timeoutMs: PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS,
+      });
+    } catch {
+      return typedFailure("PRODUCTION_TYPED_PUBLIC_RELEASE_MANIFEST_UNREACHABLE");
+    }
+    if (!manifest?.ok) {
+      return typedFailure(
+        "PRODUCTION_TYPED_PUBLIC_RELEASE_MANIFEST_INVALID",
+        manifest?.code,
+      );
+    }
   }
   let health;
   try {
@@ -1025,6 +1566,29 @@ async function runProductionDeploymentFromSnapshot({
   if (!lockedSource.ok) return lockedSource;
   const lockedDependencies = await verifyDependencyDigest();
   if (lockedDependencies) return lockedDependencies;
+  if (typedDeployment) {
+    const typedBefore = await revalidateTypedProductionDeployment({
+      typedDeployment,
+      configPath: typedConfigPath,
+      sourceCommit,
+      expectedPreviousSourceCommit: typedDeployment.baseline.sourceCommit,
+      phase: "before",
+    });
+    if (!typedBefore.ok) return typedBefore;
+    // The typed preflight performs multiple provider reads. Re-establish the
+    // coordination lock and predecessor health after those reads, then bind
+    // the source and dependency bytes directly to the mutation boundary.
+    await finalMutationRecheck();
+    const finalSource = verifySourceSnapshot({
+      workerDirectory: sourceCheckDirectory,
+      expectedSourceCommit: sourceCommit,
+      sourceCommitCheck,
+      sourceTreeCleanCheck,
+    });
+    if (!finalSource.ok) return finalSource;
+    const finalDependencies = await verifyDependencyDigest();
+    if (finalDependencies) return finalDependencies;
+  }
   await mutationIntent();
 
   let deployment;
@@ -1064,6 +1628,32 @@ async function runProductionDeploymentFromSnapshot({
   if (postDeployDependency) return postDeployDependency;
   if (deployment?.error || deployment?.status !== 0) {
     return localFailure("PRODUCTION_DEPLOY_FAILED");
+  }
+  if (typedDeployment) {
+    const typedAfter = await revalidateTypedProductionDeployment({
+      typedDeployment,
+      configPath: typedConfigPath,
+      sourceCommit,
+      expectedPreviousSourceCommit: typedDeployment.baseline.sourceCommit,
+      phase: "after",
+    });
+    if (!typedAfter.ok) return typedAfter;
+    let manifest;
+    try {
+      manifest = await publicReleaseManifestRecheck({
+        fetchImpl,
+        expectedSha256: candidatePublicManifestSha256 ?? expectedLiveManifestSha256,
+        timeoutMs: PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS,
+      });
+    } catch {
+      return typedFailure("PRODUCTION_TYPED_PUBLIC_RELEASE_MANIFEST_UNREACHABLE");
+    }
+    if (!manifest?.ok) {
+      return typedFailure(
+        "PRODUCTION_TYPED_PUBLIC_RELEASE_MANIFEST_INVALID",
+        manifest?.code,
+      );
+    }
   }
   let postDeployHealth;
   try {
@@ -1134,6 +1724,7 @@ async function runUncoordinatedProductionDeployment({
   determinePendingMigrations = determinePendingProductionMigrations,
   log = (line) => process.stderr.write(line),
   expectedSourceCommit = null,
+  expectedPreviousSourceCommit = null,
   sourceCommitCheck = checkedOutSourceCommit,
   sourceTreeCleanCheck = checkedOutSourceTreeClean,
   createSourceSnapshot = createImmutableSourceSnapshot,
@@ -1142,7 +1733,14 @@ async function runUncoordinatedProductionDeployment({
   fetchImpl = globalThis.fetch,
   healthRecheck = recheckProductionHealth,
   publicSurfaceRecheck = recheckProductionPublicSurface,
+  publicReleaseManifestRecheck = recheckProductionPublicReleaseManifest,
+  typedProduction = null,
+  typedOperationPin = null,
+  retainedPublicSourceCommit = null,
+  expectedLiveManifestSha256 = null,
+  candidatePublicManifestSha256 = null,
   beforeMutation,
+  finalMutationRecheck,
   mutationIntent,
 }) {
   if (confirmation !== PRODUCTION_DEPLOY_CONFIRMATION) {
@@ -1156,6 +1754,13 @@ async function runUncoordinatedProductionDeployment({
   });
   if (!initialSource.ok) return initialSource;
   const sourceCommit = initialSource.sourceCommit;
+  if (typedProduction
+      && (retainedPublicSourceCommit === null
+        || !PRODUCTION_SOURCE_COMMIT_PATTERN.test(retainedPublicSourceCommit)
+        || !PRODUCTION_SHA256_PATTERN.test(expectedLiveManifestSha256 ?? "")
+        || typeof publicReleaseManifestRecheck !== "function")) {
+    return typedFailure("PRODUCTION_TYPED_INPUT_INVALID");
+  }
 
   let snapshot;
   try {
@@ -1186,6 +1791,55 @@ async function runUncoordinatedProductionDeployment({
     return localFailure("PRODUCTION_SOURCE_SNAPSHOT_UNAVAILABLE");
   }
 
+  let preparedTypedDeployment = null;
+  if (typedProduction) {
+    let prepared;
+    try {
+      prepared = await prepareTypedProductionDeployment({
+        ...typedProduction,
+        workerDirectory: snapshot.workerDirectory,
+        sourceCommit,
+        // The operation-level predecessor is authoritative. The public
+        // execution API rejects a contradictory nested value below, and this
+        // keeps preparation bound to the same pin even when an adapter passes
+        // an equal nested value.
+        expectedPreviousSourceCommit,
+      });
+    } catch (error) {
+      prepared = typedFailure(
+        typeof error?.code === "string"
+          && error.code.startsWith("PRODUCTION_")
+          ? error.code
+          : "PRODUCTION_TYPED_PREPARATION_FAILED",
+      );
+    }
+    if (!prepared.ok) {
+      try {
+        await snapshot.cleanup();
+      } catch {
+        return { ...prepared, cleanup: "PRODUCTION_SOURCE_SNAPSHOT_CLEANUP_FAILED" };
+      }
+      return prepared;
+    }
+    if (!typedOperationPin
+        || (typedOperationPin.candidatePublicManifestSha256 ?? null) !== candidatePublicManifestSha256
+        || prepared.baseline?.fingerprint !== typedOperationPin.liveConfigurationFingerprint
+        || JSON.stringify(prepared.expectedSchemaIdentity)
+          !== JSON.stringify(typedOperationPin.expectedSchemaIdentity)) {
+      try {
+        await snapshot.cleanup();
+      } catch {
+        return {
+          ok: false,
+          code: "PRODUCTION_TYPED_OPERATION_PIN_MISMATCH",
+          cleanup: "PRODUCTION_SOURCE_SNAPSHOT_CLEANUP_FAILED",
+        };
+      }
+      return typedFailure("PRODUCTION_TYPED_OPERATION_PIN_MISMATCH");
+    }
+    preparedTypedDeployment = prepared;
+  }
+
   let result;
   try {
     result = await runProductionDeploymentFromSnapshot({
@@ -1212,7 +1866,16 @@ async function runUncoordinatedProductionDeployment({
       fetchImpl,
       healthRecheck,
       publicSurfaceRecheck,
+      publicReleaseManifestRecheck,
+      typedDeployment: preparedTypedDeployment,
+      typedConfigPath: typedProduction
+        ? join(snapshot.workerDirectory, "wrangler.jsonc")
+        : null,
+      retainedPublicSourceCommit,
+      expectedLiveManifestSha256,
+      candidatePublicManifestSha256,
       beforeMutation,
+      finalMutationRecheck,
       mutationIntent,
     });
   } catch (error) {
@@ -1240,6 +1903,49 @@ export async function runProductionDeployment(options) {
     sourceCommitCheck, sourceTreeCleanCheck });
   if (!source.ok) return source;
   if (!EXACT_COMMIT.test(source.sourceCommit)) return localFailure("PRODUCTION_SOURCE_COMMIT_INVALID");
+  const hasRetainedPublicSourceCommit = options.retainedPublicSourceCommit !== undefined
+    && options.retainedPublicSourceCommit !== null;
+  const hasExpectedLiveManifestSha256 = options.expectedLiveManifestSha256 !== undefined
+    && options.expectedLiveManifestSha256 !== null;
+  if (!options.typedProduction
+      && (hasRetainedPublicSourceCommit || hasExpectedLiveManifestSha256 || options.candidatePublicManifestSha256 != null)) {
+    return typedFailure("PRODUCTION_TYPED_INPUT_INVALID");
+  }
+  if (options.typedProduction?.expectedPreviousSourceCommit !== undefined
+      && options.typedProduction.expectedPreviousSourceCommit !== expectedPreviousSourceCommit) {
+    return typedFailure("PRODUCTION_TYPED_PREDECESSOR_MISMATCH");
+  }
+  let typedOperationPin = null;
+  if (options.typedProduction) {
+    // Establish the content-free typed identity before opening the operation
+    // journal. The binding is immutable, so a later reconciliation attempt can
+    // never silently reinterpret a typed operation as a legacy deploy.
+    let pinResult;
+    try {
+      pinResult = await createTypedProductionOperationPin({
+        ...options.typedProduction,
+        workerDirectory,
+        expectedPreviousSourceCommit,
+        retainedPublicSourceCommit: options.retainedPublicSourceCommit,
+        expectedLiveManifestSha256: options.expectedLiveManifestSha256,
+        candidatePublicManifestSha256: options.candidatePublicManifestSha256 ?? null,
+      });
+    } catch (error) {
+      pinResult = typedFailure(
+        typeof error?.code === "string"
+          && (error.code.startsWith("PRODUCTION_") || error.code.startsWith("TYPED_"))
+          ? error.code
+          : "PRODUCTION_TYPED_OPERATION_PIN_FAILED",
+      );
+    }
+    if (!pinResult?.ok) return pinResult ?? typedFailure("PRODUCTION_TYPED_OPERATION_PIN_FAILED");
+    typedOperationPin = pinResult.pin;
+    if (options.publicReleaseManifestRecheck === null
+        || (options.publicReleaseManifestRecheck !== undefined
+          && typeof options.publicReleaseManifestRecheck !== "function")) {
+      return typedFailure("PRODUCTION_TYPED_INPUT_INVALID");
+    }
+  }
   const repositoryRoot = resolve(workerDirectory, "../..");
   const directory = operationDirectory ?? join(repositoryRoot, ".release-build", "production-operations", source.sourceCommit);
   let operation;
@@ -1251,22 +1957,34 @@ export async function runProductionDeployment(options) {
   try {
     lock = coordinationFactory({ repositoryRoot });
     if (!lock.isAncestor(expectedPreviousSourceCommit, source.sourceCommit)) return localFailure("PRODUCTION_PREVIOUS_SOURCE_NOT_ANCESTOR");
-    operation = await openOperation({ directory, kind: "production", binding: {
+    const binding = {
       sourceCommit: source.sourceCommit, previousSourceCommit: expectedPreviousSourceCommit,
       confirmedMigrations: options.confirmedMigrations ?? null,
-    } });
+      ...(typedOperationPin ? { typed: typedOperationPin } : {}),
+    };
+    operation = await openOperation({ directory, kind: "production", binding });
     const owner = lock.createOwner({ id: operation.record.id, sourceCommit: source.sourceCommit, previousSourceCommit: expectedPreviousSourceCommit });
     state = { owner, sourceCommit: source.sourceCommit, previousSourceCommit: expectedPreviousSourceCommit,
       confirmedMigrations: options.confirmedMigrations ?? null,
+      ...(typedOperationPin ? { typed: typedOperationPin } : {}),
       stage: "preflight", outcome: "not_started", code: null, lock: "not_acquired" };
     await operation.save(state);
     result = await runUncoordinatedProductionDeployment({ ...options,
+      typedOperationPin,
       beforeMutation: async () => {
         state.stage = "acquiring_lock"; state.lock = "uncertain"; await operation.save(state);
         lock.acquire(owner); acquired = true;
         state.lock = "held"; state.stage = "predecessor_check"; await operation.save(state);
         const health = await healthRecheck({ fetchImpl, timeoutMs: PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS });
         if (!health?.ok || health.sourceCommit !== expectedPreviousSourceCommit) throw operationError("PRODUCTION_PREVIOUS_SOURCE_MISMATCH");
+        lock.assertOwned(owner);
+      },
+      finalMutationRecheck: async () => {
+        lock.assertOwned(owner);
+        const health = await healthRecheck({ fetchImpl, timeoutMs: PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS });
+        if (!health?.ok || health.sourceCommit !== expectedPreviousSourceCommit) {
+          throw operationError("PRODUCTION_PREVIOUS_SOURCE_MISMATCH");
+        }
         lock.assertOwned(owner);
       },
       mutationIntent: async () => {
@@ -1317,6 +2035,13 @@ export async function reconcileProductionDeployment({ operationDirectory, worker
     // Binding is independently checked by reading the closed deployment fields.
     const { state } = prior;
     if (!EXACT_COMMIT.test(state.sourceCommit ?? "") || !EXACT_COMMIT.test(state.previousSourceCommit ?? "") || !EXACT_COMMIT.test(state.owner ?? "")) throw operationError("PRODUCTION_RECONCILIATION_INVALID");
+    // Typed operations carry provider/schema/public-release pins that this
+    // legacy reconciler cannot revalidate. Refuse the operation before
+    // opening or releasing its mutex; a dedicated typed reconciliation path
+    // must establish the same reads as the deploy wrapper.
+    if (state.typed !== undefined) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_UNSUPPORTED");
+    }
     operation = await openOperation({ directory: operationDirectory, kind: "production", binding: { sourceCommit: state.sourceCommit,
       previousSourceCommit: state.previousSourceCommit, confirmedMigrations: state.confirmedMigrations ?? null }, resume: true });
     const lock = coordinationFactory({ repositoryRoot: resolve(workerDirectory, "../..") });
@@ -1331,9 +2056,182 @@ export async function reconcileProductionDeployment({ operationDirectory, worker
   finally { operation?.close(); }
 }
 
+/**
+ * Resolve a typed deploy whose provider mutation completed but whose final
+ * verification was interrupted or observed a stale public health response.
+ * This never deploys: it rebinds the journal and its exact remote owner, then
+ * repeats the pinned configuration, three-role schema, manifest, and public
+ * checks before releasing the lock.
+ */
+export async function reconcileTypedProductionDeployment({
+  operationDirectory,
+  workerDirectory,
+  confirmation,
+  executorStopped = false,
+  typedProduction,
+  coordinationFactory = createProductionDeploymentLock,
+  buildSchemas = buildTypedProductionExpectedSchemas,
+  inspectTyped = runTypedProductionPreflight,
+  configTools = defaultTypedConfigTools,
+  healthRecheck = recheckProductionHealth,
+  publicSurfaceRecheck = recheckProductionPublicSurface,
+  publicReleaseManifestRecheck = recheckProductionPublicReleaseManifest,
+  fetchImpl = globalThis.fetch,
+} = {}) {
+  if (confirmation !== "RECONCILE_TYPED_PRODUCTION_DEPLOYMENT"
+      || executorStopped !== true) {
+    return localFailure("RECONCILIATION_CONFIRMATION_REQUIRED");
+  }
+  if (!typedProduction?.inventory
+      || typeof typedProduction.provider?.capture !== "function"
+      || typeof typedProduction.provider?.query !== "function"
+      || typeof buildSchemas !== "function"
+      || typeof inspectTyped !== "function"
+      || typeof configTools?.createSnapshot !== "function"
+      || typeof configTools?.render !== "function"
+      || typeof configTools?.verify !== "function") {
+    return typedFailure("PRODUCTION_TYPED_INPUT_INVALID");
+  }
+  let operation;
+  try {
+    const prior = await readOperation(operationDirectory);
+    const { state } = prior;
+    const pin = state.typed;
+    if (prior.kind !== "production"
+        || !EXACT_COMMIT.test(state.owner ?? "")
+        || !EXACT_COMMIT.test(state.sourceCommit ?? "")
+        || !EXACT_COMMIT.test(state.previousSourceCommit ?? "")
+        || state.confirmedMigrations !== null
+        || state.lock !== "held"
+        || !["deployed_unverified", "outcome_unknown", "verified"].includes(state.outcome)
+        || pin?.schema !== "production-typed-operation-v1"
+        || !PRODUCTION_SHA256_PATTERN.test(pin.liveConfigurationFingerprint ?? "")
+        || pin.predecessorSourceCommit !== state.previousSourceCommit
+        || !EXACT_COMMIT.test(pin.retainedPublicSourceCommit ?? "")
+        || !PRODUCTION_SHA256_PATTERN.test(pin.expectedLiveManifestSha256 ?? "")
+        || (pin.candidatePublicManifestSha256 !== undefined
+          && !PRODUCTION_SHA256_PATTERN.test(pin.candidatePublicManifestSha256))) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_INVALID");
+    }
+    operation = await openOperation({
+      directory: operationDirectory,
+      kind: "production",
+      binding: {
+        sourceCommit: state.sourceCommit,
+        previousSourceCommit: state.previousSourceCommit,
+        confirmedMigrations: null,
+        typed: pin,
+      },
+      resume: true,
+    });
+    if (operation.record.updatedAt !== prior.updatedAt) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_INVALID");
+    }
+    const lock = coordinationFactory({ repositoryRoot: resolve(workerDirectory, "../..") });
+    lock.assertOwned(state.owner);
+    const starting = configTools.createSnapshot(typedProduction.inventory);
+    const currentInventory = await typedProduction.provider.capture();
+    const current = configTools.createSnapshot(currentInventory);
+    if (!typedSnapshotMatches(starting, current)
+        || current.sourceCommit !== state.sourceCommit
+        || current.fingerprint !== pin.liveConfigurationFingerprint) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_LIVE_MISMATCH");
+    }
+    const expected = await buildSchemas({ workerDirectory });
+    const expectedIdentity = typedSchemaIdentity(expected);
+    if (!expectedIdentity
+        || JSON.stringify(expectedIdentity) !== JSON.stringify(pin.expectedSchemaIdentity)) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_SCHEMA_MISMATCH");
+    }
+    const parseErrors = [];
+    const trackedConfig = parse(
+      await readFile(join(workerDirectory, "wrangler.jsonc"), "utf8"),
+      parseErrors,
+    );
+    if (parseErrors.length || !trackedConfig || typeof trackedConfig !== "object") {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_CONFIG_MISMATCH");
+    }
+    const candidateConfig = configTools.render({
+      trackedConfig,
+      snapshot: current,
+      sourceCommit: state.sourceCommit,
+    });
+    if (!configTools.verify({
+      snapshot: current,
+      candidateConfig,
+      sourceCommit: state.sourceCommit,
+    })?.ok) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_CONFIG_MISMATCH");
+    }
+    const vars = typedConfigEnvironment(candidateConfig)?.vars;
+    const typed = await inspectTyped({
+      roles: typedRoles(),
+      expectedSchemas: expected.expectedSchemas,
+      config: {
+        mode: vars?.TELEMETRY_STORAGE_MODE,
+        sourceNamespace: vars?.TELEMETRY_STORAGE_NAMESPACE,
+      },
+      runQuery: (binding, sql) => typedProduction.provider.query(currentInventory, binding, sql),
+    });
+    if (!typed?.ok) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_PREFLIGHT_BLOCKED");
+    }
+    const afterSchema = configTools.createSnapshot(await typedProduction.provider.capture());
+    if (!typedSnapshotMatches(current, afterSchema)) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_LIVE_MISMATCH");
+    }
+    const manifest = await publicReleaseManifestRecheck({
+      fetchImpl,
+      expectedSha256: pin.candidatePublicManifestSha256 ?? pin.expectedLiveManifestSha256,
+      timeoutMs: PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS,
+    });
+    if (!manifest?.ok) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_PUBLIC_MISMATCH");
+    }
+    const health = await healthRecheck({
+      fetchImpl,
+      timeoutMs: PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS,
+    });
+    const surface = await publicSurfaceRecheck({
+      fetchImpl,
+      timeoutMs: PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS,
+    });
+    const finalSnapshot = configTools.createSnapshot(await typedProduction.provider.capture());
+    if (!health?.ok || health.sourceCommit !== state.sourceCommit
+        || !surface?.ok || !typedSnapshotMatches(current, finalSnapshot)) {
+      throw operationError("PRODUCTION_TYPED_RECONCILIATION_UNVERIFIED");
+    }
+    lock.assertOwned(state.owner);
+    state.outcome = "verified";
+    state.stage = "verified";
+    state.code = "PRODUCTION_DEPLOYED";
+    await operation.save(state);
+    lock.release(state.owner);
+    state.lock = "released";
+    await operation.save(state);
+    return {
+      ok: true,
+      code: "PRODUCTION_TYPED_RECONCILED",
+      outcome: "verified",
+      coordination: "released",
+    };
+  } catch (error) {
+    const code = /^(?:PRODUCTION|RELEASE_OPERATION)_[A-Z_]+$/.test(error?.code ?? "")
+      ? error.code
+      : "PRODUCTION_TYPED_RECONCILIATION_FAILED";
+    return localFailure(code);
+  } finally {
+    operation?.close();
+  }
+}
+
 export function parseProductionDeploymentArgs(argv) {
   const names = new Map([["--confirm", "confirmation"], ["--confirm-migrations", "confirmedMigrations"],
-    ["--expected-previous-source", "expectedPreviousSourceCommit"], ["--operation", "operationDirectory"]]);
+    ["--expected-previous-source", "expectedPreviousSourceCommit"], ["--operation", "operationDirectory"],
+    ["--inventory", "inventoryPath"], ["--inventory-sha256", "inventorySha256"],
+    ["--retained-public-source", "retainedPublicSourceCommit"],
+    ["--retained-public-source-commit", "retainedPublicSourceCommit"],
+    ["--expected-live-manifest-sha256", "expectedLiveManifestSha256"]]);
   const result = {};
   for (let i = 0; i < argv.length; i += 1) {
     if (argv[i] === "--executor-stopped" && !result.executorStopped) { result.executorStopped = true; continue; }
@@ -1341,9 +2239,30 @@ export function parseProductionDeploymentArgs(argv) {
     if (!name || name in result || !value || value.startsWith("--") || value.includes("\0")) throw operationError("PRODUCTION_ARGUMENTS_INVALID");
     result[name] = value;
   }
-  if (result.confirmation === "RECONCILE_PRODUCTION_DEPLOYMENT") {
-    if (!result.operationDirectory || !result.executorStopped || result.confirmedMigrations || result.expectedPreviousSourceCommit) throw operationError("PRODUCTION_ARGUMENTS_INVALID");
-  } else if (result.confirmation !== PRODUCTION_DEPLOY_CONFIRMATION || !EXACT_COMMIT.test(result.expectedPreviousSourceCommit ?? "") || result.executorStopped) throw operationError("PRODUCTION_ARGUMENTS_INVALID");
+  if (result.confirmation === "RECONCILE_TYPED_PRODUCTION_DEPLOYMENT") {
+    if (!result.operationDirectory || !result.executorStopped
+        || !result.inventoryPath || !result.inventorySha256
+        || !PRODUCTION_SHA256_PATTERN.test(result.inventorySha256)
+        || result.confirmedMigrations || result.expectedPreviousSourceCommit
+        || result.retainedPublicSourceCommit || result.expectedLiveManifestSha256) {
+      throw operationError("PRODUCTION_ARGUMENTS_INVALID");
+    }
+  } else if (result.confirmation === "RECONCILE_PRODUCTION_DEPLOYMENT") {
+    if (!result.operationDirectory || !result.executorStopped || result.confirmedMigrations || result.expectedPreviousSourceCommit
+        || result.inventoryPath || result.inventorySha256 || result.retainedPublicSourceCommit || result.expectedLiveManifestSha256) {
+      throw operationError("PRODUCTION_ARGUMENTS_INVALID");
+    }
+  } else if (result.confirmation !== PRODUCTION_DEPLOY_CONFIRMATION
+      || !EXACT_COMMIT.test(result.expectedPreviousSourceCommit ?? "")
+      || result.executorStopped
+      || (Boolean(result.inventoryPath) !== Boolean(result.inventorySha256))
+      || (Boolean(result.retainedPublicSourceCommit) !== Boolean(result.expectedLiveManifestSha256))
+      || Boolean(result.inventoryPath) !== Boolean(result.retainedPublicSourceCommit)
+      || (result.inventorySha256 !== undefined && !PRODUCTION_SHA256_PATTERN.test(result.inventorySha256))
+      || (result.expectedLiveManifestSha256 !== undefined && !PRODUCTION_SHA256_PATTERN.test(result.expectedLiveManifestSha256))
+      || (result.retainedPublicSourceCommit !== undefined && !PRODUCTION_SOURCE_COMMIT_PATTERN.test(result.retainedPublicSourceCommit))) {
+    throw operationError("PRODUCTION_ARGUMENTS_INVALID");
+  }
   return result;
 }
 
@@ -1354,8 +2273,11 @@ async function main() {
       "Usage: production-deploy.mjs "
         + `--confirm ${PRODUCTION_DEPLOY_CONFIRMATION} `
         + "--expected-previous-source FULL_SHA [--operation PRIVATE_DIRECTORY] "
+        + "[--inventory PRIVATE_JSON --inventory-sha256 SHA256 "
+        + "--retained-public-source FULL_SHA --expected-live-manifest-sha256 SHA256] "
         + "[--confirm-migrations BINDING:0000_name.sql,...]\n"
-        + "Reconcile only: --confirm RECONCILE_PRODUCTION_DEPLOYMENT --operation PRIVATE_DIRECTORY --executor-stopped\n",
+        + "Reconcile only: --confirm RECONCILE_PRODUCTION_DEPLOYMENT --operation PRIVATE_DIRECTORY --executor-stopped\n"
+        + "Typed recovery: --confirm RECONCILE_TYPED_PRODUCTION_DEPLOYMENT --operation PRIVATE_DIRECTORY --executor-stopped --inventory PRIVATE_JSON --inventory-sha256 SHA256\n",
     );
     process.exit(2);
   }
@@ -1368,14 +2290,37 @@ async function main() {
       ".bin",
       process.platform === "win32" ? "wrangler.cmd" : "wrangler",
     );
-    const run = options.confirmation === "RECONCILE_PRODUCTION_DEPLOYMENT" ? reconcileProductionDeployment : runProductionDeployment;
-    result = await run({
+    const run = options.confirmation === "RECONCILE_PRODUCTION_DEPLOYMENT"
+      ? reconcileProductionDeployment
+      : options.confirmation === "RECONCILE_TYPED_PRODUCTION_DEPLOYMENT"
+        ? reconcileTypedProductionDeployment
+        : runProductionDeployment;
+    const runOptions = {
       ...options,
       wrangler,
       workerDirectory,
-    });
-  } catch {
-    result = { ok: false, code: "PRODUCTION_DEPLOYMENT_FAILED" };
+    };
+    if (options.inventoryPath) {
+      const inventory = await readPrivateProductionInventory(
+        options.inventoryPath,
+        options.inventorySha256,
+      );
+      runOptions.typedProduction = {
+        inventory,
+        provider: createProductionLiveProvider({
+          accountId: inventory.accountId,
+          workerName: inventory.workerName,
+        }),
+      };
+    }
+    result = await run(runOptions);
+  } catch (error) {
+    const code = typeof error?.code === "string"
+      && (error.code.startsWith("PRODUCTION_RECONCILE_")
+        || error.code.startsWith("PRODUCTION_LIVE_"))
+      ? error.code
+      : "PRODUCTION_DEPLOYMENT_FAILED";
+    result = { ok: false, code };
   }
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   process.exit(result.ok ? 0 : 1);

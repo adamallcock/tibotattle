@@ -99,7 +99,7 @@ automatically included in the retained validation run.
 - [macOS release runbook](../runbooks/macos-stable-release-runbook.md)
 - [Unified index preservation and recovery](../runbooks/unified-index-recovery.md)
 - [R7 receipt maintenance](../runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md)
-- [Native app lifecycle and distribution](../../apps/macos/README.md)
+- [Native app lifecycle and distribution](https://github.com/adamallcock/tibotattle/blob/2d7ba00df9e2f705e5f0e3a2684da5ec9e9112bb/apps/macos/README.md)
 
 ## Evidence and remaining gates
 

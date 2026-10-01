@@ -1,0 +1,96 @@
+---
+title: Windows project grouping and task names
+date: 2026-09-22
+type: plan
+status: awaiting-native-qualification
+---
+
+Fix issue [#208](https://github.com/adamallcock/tibotattle/issues/208) against the
+0.1.24 release candidate. The acceptance boundary is real saved task names and
+Git project grouping through the local reporting API and packaged Windows UI,
+including refresh and restart. Model-performance qualification alone is not
+proof of these paths.
+
+## Implementation and validation
+
+- Replace POSIX-only metadata admission on Windows with the reviewed native
+  source-handle boundary; retain bounded local-only names, read-only SQLite,
+  owner/link/reparse refusal and handle lifetime protection.
+- Diagnose and repair project attribution, including exact source identity and
+  platform-specific path/Git handling. Preserve accounting totals and replay.
+- Add focused regression tests and native Windows qualification coverage.
+- Extend the packaged synthetic Windows journey to assert names and grouping
+  before and after restart, with content-free receipts.
+- Run focused tests, affected companion/UI gates, architecture, documentation
+  and preflight. Native Windows and signed release evidence remain separate.
+
+No publication, signing, installation, hosted migration, or remote issue/comment
+mutation is part of this local implementation. Record exact validation and any
+remaining native qualification gate here before handoff.
+
+## Implemented result
+
+- Windows names, ancestry and repository hints use native held source leases.
+  POSIX checks remain unchanged. Live WAL main/sidecars stay leased through
+  SQLite close; all-sidecars-absent databases use immutable reads and state
+  revalidation. Failed closes retain bounded strong references until retry.
+- Missing Git can use a saved unambiguous origin. Current Git rejection remains
+  non-project; CRLF output and Windows repository basenames are handled.
+- Native qualification includes a shared macOS/Windows metadata contract. The packaged normal journey
+  now checks real Git grouping, saved task name and the rendered task link on both
+  launches. The signed-installed validator requires that content-free receipt.
+- Database/WAL content and journal mode are preserved. Normal read-only WAL
+  connections may update existing SHM coordination bytes; no source permissions
+  are changed and absent sidecars are not created.
+
+## Initial implementation validation on macOS, Node 26.2.0
+
+- Metadata/privacy/discovery: 90 passed, including 12 Windows orchestration cases.
+- Project/source accounting: 51 passed, including actual Git repositories.
+- Local companion: 398 passed. Affected UI/privacy: 106 passed.
+- Normal/signed Windows packaging contracts: 64 passed, including real local
+  ingestion, API lookup and restart. These are not native Windows receipts.
+- Export/release/qualification contracts: 27 passed; four native Windows tests
+  correctly require Windows x64 and were not executed on this host.
+- Architecture, documentation and preflight passed.
+- The full root run reported 5,946 passed, 14 failed and 53 skipped. Targeted
+  reruns resolved two missing Worker dependency failures (seven tests passed)
+  after installing the locked dependencies. Synthetic R7 environment/sampler
+  tests passed outside the outer sandbox (31 and 13 tests), as did the native
+  audit and macOS watchdog smoke (one test each).
+- The root run also found an omitted tool-inventory caller for the new native
+  Windows test. The inventory is corrected; all six owning tests passed.
+- Two retained R7 receipt assertions remain stale, as already disclosed in
+  [release PR #204](https://github.com/adamallcock/tibotattle/pull/204). Retained
+  receipt regeneration was not performed. The initial full root run is not a
+  passing release gate; targeted reruns are separate evidence.
+
+## macOS and Windows parity follow-up
+
+The parity audit found a remaining POSIX-only check in selected rollout-head
+lookup. Windows could refuse an otherwise valid database, preventing resolution
+of a paginated replacement and its inline child. The reader now uses the same
+guarded database boundary as names, ancestry and repository hints, while querying
+only IDs and rollout paths. Both platforms also use validated immutable reads
+when sidecars are absent, avoiding source coordination-file creation on macOS.
+
+The shared `test/work-usage-platform-parity.test.js` runs the same nine cases
+against each platform's real filesystem adapter. It covers saved and explicit
+names, opt-in titles, rename refresh, timestamp conflicts, malformed metadata,
+nested workers, guardian navigation, origin ambiguity, live and checkpointed WAL,
+hardlink refusal, and actual database-to-discovery paginated-fork resolution.
+Portable Git cases now run both path conventions against identical grouping and
+missing-Git expectations. Native Windows qualification requires this shared suite.
+
+The final focused run passed all 204 metadata, discovery, project, accounting,
+qualification and inventory tests, including all nine native cases on macOS.
+The local companion passed all 398 tests. Architecture and preflight passed.
+These results do not establish a Windows execution result; the Windows native
+and packaged checks below remain required. No broad root-suite success is claimed.
+
+## Remaining release gate
+
+Run the manual native Windows security workflow and unsigned Windows runtime
+packaging workflow on the exact fix commit. Their dispatch and a remote branch
+push require explicit owner authorization under repository guidance. No native
+Windows result, signed installer, updater delivery or public release is claimed.

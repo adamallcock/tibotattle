@@ -543,3 +543,40 @@ test('transition rehearsal refuses arbitrary destinations, missing stable key, r
     }
   } finally { await fixture.cleanup(); }
 });
+
+for (const mode of ['archive_signed', 'feed_signed', 'invalid_archive_signature', 'invalid_feed_signature']) {
+  test(`Electron successor official ${mode} output is verified without redundant signing`, async () => {
+    const fixture = await createStableFixture({ bundleVersion: '1028', shortVersion: '0.1.21' });
+    const calls = [];
+    try {
+      const options = stableOptions(fixture, ['--electron-transition', '--skip-retain']);
+      const operation = generateSparkleAppcast({ ...options,
+        runGenerateAppcastTool: fakeGenerateAppcastTool(fixture, { mutateOutput: text => {
+          if (mode === 'feed_signed') return text;
+          if (mode === 'invalid_feed_signature') return text.replace('IMPORTANT:', 'IMPORXANT:');
+          const unsignedFeed = text.replace(/<!-- sparkle-sign-warning:[\s\S]*?-->/u, '')
+            .replace(/<!-- sparkle-signatures:[\s\S]*$/u, '');
+          return mode === 'invalid_archive_signature'
+            ? unsignedFeed.replace(/sparkle:edSignature="[^"]+"/u, `sparkle:edSignature="${Buffer.alloc(64).toString('base64')}"`)
+            : unsignedFeed;
+        } }),
+        runSignUpdate: async (_path, args) => {
+          calls.push(args); assert.equal(args.includes('-p'), false, 'existing archive signature must be reused');
+          const path = args.at(-1);
+          const text = (await readFile(path, 'utf8')).replace('<?xml version="1.0" standalone="yes"?>',
+            '<?xml version="1.0" standalone="yes"?><!-- sparkle-sign-warning:\nOfficial fixture signing warning\n-->');
+          const signature = sign(null, Buffer.from(text), TEST_KEY_PAIR.privateKey).toString('base64');
+          await writeFile(path, `${text}<!-- sparkle-signatures:\nedSignature: ${signature}\nlength: ${Buffer.byteLength(text)}\n-->\n`);
+        } });
+      if (mode.startsWith('invalid_')) {
+        await assert.rejects(operation, { code: mode === 'invalid_archive_signature'
+          ? 'SPARKLE_APPCAST_SIGNATURE_INVALID' : 'SPARKLE_SIGNED_FEED_ENVELOPE_SIGNATURE_INVALID' });
+        assert.equal(calls.length, 0);
+      } else {
+        const result = await operation; assert.equal(result.feedSigned, true);
+        assert.equal(calls.length, mode === 'feed_signed' ? 0 : 1);
+      }
+      assert.deepEqual(await readFile(fixture.dmgPath), fixture.dmgBytes);
+    } finally { await fixture.cleanup(); }
+  });
+}

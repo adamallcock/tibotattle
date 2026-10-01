@@ -516,10 +516,13 @@ export function createDesktopTrayPopover({
       return false;
     }
     const candidate = window;
+    // BrowserWindow.webContents is a native getter and throws after closed.
+    // Retain the EventEmitter while alive so teardown never reads that getter.
+    const candidateContents = candidate.webContents;
     const initialURL = selectedPageURL;
     try {
       policy = installDesktopTrayPopoverPolicy({
-        webContents: candidate.webContents,
+        webContents: candidateContents,
         initialURL,
         onContentHeight: (height) => {
           const next = clamp(height, POPOVER_MIN_CONTENT_HEIGHT, POPOVER_MAX_HEIGHT);
@@ -563,13 +566,14 @@ export function createDesktopTrayPopover({
     candidate.on?.("show", onShow);
     candidate.on?.("hide", onHide);
     candidate.on?.("closed", onClosed);
-    candidate.webContents?.on?.("before-input-event", onBeforeInputEvent);
+    candidateContents?.on?.("before-input-event", onBeforeInputEvent);
     windowCleanup = () => {
+      windowCleanup = () => {};
       candidate.off?.("blur", onBlur);
       candidate.off?.("show", onShow);
       candidate.off?.("hide", onHide);
       candidate.off?.("closed", onClosed);
-      candidate.webContents?.off?.("before-input-event", onBeforeInputEvent);
+      candidateContents?.off?.("before-input-event", onBeforeInputEvent);
       policy?.remove?.();
       policy = null;
     };

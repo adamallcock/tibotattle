@@ -66,7 +66,8 @@ export async function* readBoundedUtf8LineEntries(path, {
   }
   throwIfAborted(signal);
   if (maximumTotalBytes === 0 || startByte === maximumTotalBytes) return;
-  const callerOwnedHandle = path && typeof path === "object" && Number.isInteger(path.fd);
+  const callerOwnedHandle = path && typeof path === "object"
+    && typeof path.stat === "function" && typeof path.read === "function";
   const compressed = isCompressedRolloutSource(path);
   const input = callerOwnedHandle || compressed ? null : createReadStream(path, {
     highWaterMark,

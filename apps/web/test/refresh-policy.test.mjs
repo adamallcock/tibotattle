@@ -4,7 +4,10 @@ import test from "node:test";
 import { createContext, runInContext } from "node:vm";
 import { SUPPORTED_LOCALES, translate } from "../public/localization.js";
 import { refreshAccountingStatus, refreshQuickResultStatus } from "../public/lib.js";
+import { observationRecency } from "../public/dashboard-ui.js";
 import { createDomHelpers } from "../public/ui-format.js";
+import { createElectronRefreshLease } from "../public/electron-refresh-lifecycle.js";
+import { DESKTOP_AUTOMATIC_REFRESH_CADENCE_INTERVAL_MS } from "../../electron/desktop-automatic-refresh-cadence.js";
 
 const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
 
@@ -47,6 +50,7 @@ function refreshHarness({
   electron = false,
   bridge = undefined,
   detailedSnapshot = false,
+  now = Date.parse("2026-09-22T12:00:00.000Z"),
   refreshStates = [],
 } = {}) {
   const calls = [];
@@ -56,6 +60,7 @@ function refreshHarness({
   const buttons = new Map();
   const pendingRefreshStates = [...refreshStates];
   const progressFrames = [];
+  const globalStates = [];
   const document = {
     createElement: refreshElement,
     createTextNode: (textContent) => ({ textContent }),
@@ -65,12 +70,21 @@ function refreshHarness({
     state: "stale",
     activity: { lastScanAt: "2026-09-02T00:00:00.000Z" },
     accounting: {
+      generationMatched: detailedSnapshot,
       projection: detailedSnapshot
         ? { status: "available", reason: null, terminal: false }
         : { status: "unavailable", reason: "local_unified_index_deferred", terminal: true },
     },
+    timeline: {
+      history: {
+        status: "complete",
+        source: "unified_local_index",
+        generatedAt: new Date(now).toISOString(),
+      },
+    },
   };
   const context = createContext({
+    Date: class extends Date { static now() { return now; } },
     dashboard: priorDashboard,
     localActionBusy: false,
     localRefreshInProgress: false,
@@ -83,8 +97,14 @@ function refreshHarness({
     electronStartupRefreshTriggered: false,
     electronStartupRefreshDeferred: false,
     activeLocalDashboardLoad: null,
-    ELECTRON_REFRESH_LIFECYCLE_SIGNAL_TIMEOUT_MS: 1_000,
+    globalState: { state: "stale", companionReachable: true },
+    electronRefreshLifecycleState: null,
     tibotattleDesktop: bridge,
+    createElectronRefreshLease: (options) => createElectronRefreshLease({
+      ...options,
+      heartbeatIntervalMs: 60_000,
+      signalTimeoutMs: 1,
+    }),
     document,
     ...createDomHelpers(document),
     $: (selector) => {
@@ -126,24 +146,40 @@ function refreshHarness({
     runsInsideElectronDashboard: () => electron,
     refreshAccountingStatus,
     refreshQuickResultStatus,
-    setGlobalState() {},
+    observationRecency,
+    setGlobalState(state, options = {}) {
+      globalStates.push({ state, ...options });
+      context.globalState = { state, ...options };
+    },
     setTimeout: (resolve) => resolve(),
     clearTimeout() {},
-    window: { setTimeout: (callback) => timers.push(callback) },
+    window: {
+      setTimeout: (callback) => timers.push(callback),
+      clearTimeout() {},
+    },
     showConnectionNotice: (notice) => notices.push(notice),
     refreshNeedsContinuation: () => false,
     scheduleReindexAutoContinuation: () => calls.push("continuation-check"),
     loadLocalDashboard: async () => calls.push("reload"),
     describeFailure: async () => { calls.push("diagnostic"); return { text: "An update could not be started." }; },
+    setLocalizedText(element, key) {
+      element.textContent = translate(key, {}, "en-US");
+    },
     t: (key) => translate(key, {}, "en-US"),
   });
-  for (const name of ["localAnalysisLabel", "renderRefreshProgress", "updateLocalActionButtons"]) {
+  for (const name of [
+    "localAnalysisLabel",
+    "renderRefreshProgress",
+    "startRefreshProgressClock",
+    "updateLocalActionButtons",
+  ]) {
     runInContext(productionFunction(name), context);
   }
-  runInContext(productionFunction("signalElectronRefreshLifecycle"), context);
+  runInContext(productionFunction("refreshElectronCadenceHealth"), context);
+  runInContext(productionFunction("dashboardObservationPresentation"), context);
   runInContext(productionFunction("requestRefresh"), context);
   runInContext(productionFunction("scheduleReturningUserRefresh"), context);
-  return { context, calls, routes, notices, timers, buttons, priorDashboard, progressFrames };
+  return { context, calls, routes, notices, timers, buttons, priorDashboard, progressFrames, globalStates };
 }
 
 test("refresh progress reserves distinct count and timer slots and clears them when idle", () => {
@@ -178,6 +214,104 @@ test("refresh progress reserves distinct count and timer slots and clears them w
   assert.equal(button.getAttribute("title"), null);
   assert.equal(button.textContent, "Update local usage");
   assert.equal(harness.context.$("#cancel-refresh").hidden, true);
+});
+
+test("refresh elapsed clock follows wall-second boundaries independently of status polling", () => {
+  const harness = refreshHarness();
+  const button = harness.context.$("#refresh-button");
+  const scheduled = [];
+  const cancelled = [];
+  let nowMs = 0;
+  let nextTimer = 0;
+  const clock = harness.context.startRefreshProgressClock(button, "Analyzing files…", {
+    processed: 1,
+    selected: 100,
+    startedAtMs: 0,
+    now: () => nowMs,
+    schedule(callback, delayMs) {
+      const timer = ++nextTimer;
+      scheduled.push({ timer, callback, delayMs });
+      return timer;
+    },
+    cancel: (timer) => cancelled.push(timer),
+  });
+
+  assert.deepEqual(button.children.map((child) => child.textContent), [
+    "Analyzing files…", "1/100", "0:00",
+  ]);
+  assert.equal(scheduled[0].delayMs, 1_000);
+
+  // A companion poll at 750 ms may change the count, but it cannot advance or
+  // stall the elapsed clock; the timer still targets the one-second boundary.
+  nowMs = 750;
+  clock.update("Analyzing files…", { processed: 2, selected: 100 });
+  assert.equal(button.children[2].textContent, "0:00");
+  assert.equal(scheduled.length, 1);
+
+  nowMs = 1_000;
+  scheduled.shift().callback();
+  assert.equal(button.children[2].textContent, "0:01");
+  assert.equal(scheduled[0].delayMs, 1_000);
+
+  // If the renderer is busy, use real elapsed time and shorten the following
+  // delay so that callback latency is not accumulated into a repeating beat.
+  nowMs = 3_750;
+  scheduled.shift().callback();
+  assert.equal(button.children[2].textContent, "0:03");
+  assert.equal(scheduled[0].delayMs, 250);
+  nowMs = 4_000;
+  scheduled.shift().callback();
+  assert.equal(button.children[2].textContent, "0:04");
+
+  clock.reset("Continuing local analysis…");
+  assert.equal(button.children[2].textContent, "0:00");
+  assert.equal(cancelled.length, 1);
+  clock.stop();
+  assert.equal(cancelled.length, 2);
+});
+
+test("an active refresh keeps its progress affordance and cancellation action after a load lock is released", () => {
+  const harness = refreshHarness();
+  const button = harness.context.$("#refresh-button");
+  button.textContent = "Update local usage";
+  harness.context.localActionBusy = false;
+  harness.context.localRefreshInProgress = true;
+
+  harness.context.updateLocalActionButtons();
+
+  assert.equal(button.disabled, true, "the refresh action remains locked while active");
+  assert.equal(button.classList.contains("refresh-progress"), true);
+  assert.equal(button.textContent, "Update running…");
+  const cancel = harness.context.$("#cancel-refresh");
+  assert.equal(cancel.hidden, false, "Cancel remains available for the active refresh");
+  assert.equal(cancel.disabled, false);
+  assert.equal(cancel.textContent, "Cancel");
+});
+
+test("a terminal refresh restores the last dashboard status after showing Running", async () => {
+  const harness = refreshHarness();
+
+  await harness.context.requestRefresh({ detailed: true });
+
+  assert.deepEqual(harness.globalStates, [
+    { state: "updating" },
+    { state: "stale", companionReachable: true },
+  ]);
+  assert.equal(harness.context.localActionBusy, false);
+  assert.equal(harness.context.localRefreshInProgress, false);
+  assert.equal(harness.context.$("#refresh-button").textContent, "Update local usage");
+});
+
+test("a terminal refresh recovers the prior stable state when the dashboard still says updating", async () => {
+  const harness = refreshHarness();
+  harness.context.dashboard = { ...harness.priorDashboard, state: "updating" };
+
+  await harness.context.requestRefresh();
+
+  assert.deepEqual(harness.globalStates.at(-1), {
+    state: "stale",
+    companionReachable: true,
+  });
 });
 
 test("refresh polling preserves counted indexing and count-free accounting phases", async () => {
@@ -302,6 +436,85 @@ test("Electron startup stays quick when a trusted detailed projection is present
   assert.deepEqual(harness.routes, ["/api/local/refresh/quick"]);
 });
 
+test("Electron startup only trusts recent unified publication evidence", async (t) => {
+  const now = Date.parse("2026-09-22T12:00:00.000Z");
+  const interval = DESKTOP_AUTOMATIC_REFRESH_CADENCE_INTERVAL_MS;
+  for (const [name, edit, expected] of [
+    ["just under hourly cadence", (data) => {
+      data.timeline.history.generatedAt = new Date(now - interval + 1).toISOString();
+    }, "quick"],
+    ["at hourly cadence", (data) => {
+      data.timeline.history.generatedAt = new Date(now - interval).toISOString();
+    }, "detailed"],
+    ["stale despite fresh quota and accounting", (data) => {
+      data.timeline.history.generatedAt = new Date(now - 3 * interval).toISOString();
+      data.generatedAt = data.accounting.generatedAt = data.activity.lastScanAt = new Date(now).toISOString();
+    }, "detailed"],
+    ["missing publication", (data) => { delete data.timeline.history.generatedAt; }, "detailed"],
+    ["null publication", (data) => { data.timeline.history.generatedAt = null; }, "detailed"],
+    ["malformed publication", (data) => { data.timeline.history.generatedAt = "invalid"; }, "detailed"],
+    ["noncanonical publication", (data) => { data.timeline.history.generatedAt = "2026-09-22"; }, "detailed"],
+    ["future publication", (data) => {
+      data.timeline.history.generatedAt = new Date(now + 1).toISOString();
+    }, "detailed"],
+    ["unavailable projection", (data) => { data.accounting.projection.status = "unavailable"; }, "detailed"],
+    ["mismatched generation", (data) => { data.accounting.generationMatched = false; }, "detailed"],
+    ["collector timeline", (data) => { data.timeline.history.source = "recent_collector_window"; }, "detailed"],
+    ["loading history", (data) => { data.timeline.history.status = "loading"; }, "detailed"],
+    ["available partial history", (data) => { data.timeline.history.status = "partial"; }, "quick"],
+  ]) {
+    await t.test(name, async () => {
+      const harness = refreshHarness({ electron: true, detailedSnapshot: true, now });
+      edit(harness.priorDashboard);
+      runInContext(productionFunction("startElectronStartupRefresh"), harness.context);
+      assert.equal(harness.context.startElectronStartupRefresh(), true);
+      assert.equal(harness.context.startElectronStartupRefresh(), false);
+      await new Promise(setImmediate);
+      assert.equal(harness.calls[0], expected);
+      assert.equal(harness.routes.length, 1);
+    });
+  }
+});
+
+test("short Electron relaunches eventually ingest old history without resetting its freshness", async () => {
+  const publishedMs = Date.parse("2026-09-22T12:00:00.000Z");
+  const interval = DESKTOP_AUTOMATIC_REFRESH_CADENCE_INTERVAL_MS;
+  for (const [age, expected] of [
+    [interval / 2, "quick"],
+    [interval - 1, "quick"],
+    [interval, "detailed"],
+    [interval + 1, "detailed"],
+  ]) {
+    const harness = refreshHarness({ electron: true, detailedSnapshot: true, now: publishedMs + age });
+    harness.priorDashboard.timeline.history.generatedAt = new Date(publishedMs).toISOString();
+    runInContext(productionFunction("startElectronStartupRefresh"), harness.context);
+    harness.context.startElectronStartupRefresh();
+    await new Promise(setImmediate);
+    assert.equal(harness.calls[0], expected);
+    assert.equal(harness.priorDashboard.timeline.history.generatedAt, new Date(publishedMs).toISOString(),
+      "starting or completing a renderer refresh cannot manufacture a publication timestamp");
+  }
+});
+
+test("Electron startup evaluates publication evidence after its barrier clears", async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const harness = refreshHarness({ electron: true, detailedSnapshot: true });
+  harness.context.__TIBOTATTLE_ELECTRON_MACOS_SMOKE__ = {
+    version: "v1",
+    waitForStartupRefresh: () => gate,
+  };
+  runInContext(productionFunction("startElectronStartupRefresh"), harness.context);
+  harness.context.startElectronStartupRefresh();
+  await new Promise(setImmediate);
+  assert.deepEqual(harness.calls, []);
+  harness.priorDashboard.timeline.history.generatedAt = null;
+  release();
+  await new Promise(setImmediate);
+  assert.equal(harness.calls[0], "detailed");
+  assert.equal(harness.routes.length, 1);
+});
+
 test("qualified Electron startup waits for the preload smoke barrier", async () => {
   let release;
   const gate = new Promise((resolve) => { release = resolve; });
@@ -380,11 +593,17 @@ test("accepted Electron refreshes acquire and settle the main-process lease", as
   const harness = refreshHarness({
     electron: true,
     bridge: {
-      refreshStarted() {
-        lifecycle.push("started");
+      refreshStarted(mode) {
+        lifecycle.push(["started", mode]);
         return 41;
       },
-      refreshSettled({ lease }) {
+      refreshHeartbeat() {
+        lifecycle.push("heartbeat");
+        return true;
+      },
+      refreshSettled(lease) {
+        assert.equal(Number.isSafeInteger(lease), true,
+          "the renderer must pass the numeric lease accepted by the preload bridge");
         lifecycle.push(["settled", lease]);
         return true;
       },
@@ -395,7 +614,57 @@ test("accepted Electron refreshes acquire and settle the main-process lease", as
   await new Promise(setImmediate);
 
   assert.deepEqual(harness.calls, ["quick", "status", "reload"]);
-  assert.deepEqual(lifecycle, ["started", ["settled", 41]]);
+  assert.deepEqual(lifecycle, [["started", "quick"], ["settled", 41]]);
+});
+
+test("a stranded main-process lease is visible until cadence recovery is armed", async () => {
+  let status = {
+    schemaVersion: "tibotattle-desktop-refresh-status-v1",
+    activeLease: true,
+    cadenceTimerArmed: false,
+  };
+  const harness = refreshHarness({
+    electron: true,
+    bridge: {
+      getRefreshStatus: async () => status,
+    },
+  });
+  await harness.context.refreshElectronCadenceHealth();
+  const health = harness.context.$("#automatic-refresh-health");
+  assert.equal(health.hidden, false);
+  assert.match(health.textContent, /waiting for safety recovery/u);
+
+  status = { ...status, activeLease: false, cadenceTimerArmed: true };
+  await harness.context.refreshElectronCadenceHealth();
+  assert.equal(health.hidden, true);
+});
+
+test("a late Electron lease is settled with the preload's numeric contract", async () => {
+  let releaseLease;
+  const started = new Promise((resolve) => { releaseLease = resolve; });
+  const settled = [];
+  const harness = refreshHarness({
+    electron: true,
+    bridge: {
+      refreshStarted: (mode) => {
+        assert.equal(mode, "quick");
+        return started;
+      },
+      refreshHeartbeat: () => true,
+      refreshSettled(lease) {
+        assert.equal(Number.isSafeInteger(lease), true);
+        settled.push(lease);
+        return true;
+      },
+    },
+  });
+
+  await harness.context.requestRefresh();
+  assert.deepEqual(settled, []);
+  releaseLease(73);
+  await new Promise(setImmediate);
+
+  assert.deepEqual(settled, [73]);
 });
 
 test("an initial controller conflict is informational and cannot queue detailed work", async () => {

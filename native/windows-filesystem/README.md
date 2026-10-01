@@ -1,10 +1,12 @@
 # Windows native security adapter
 
-This is a fail-closed readiness component, not a supported Windows product
-lane. The current published application remains macOS-only; source compilation,
-native unit tests, a valid sidecar, or an approved mutex capability cannot by
-itself establish installed Windows, packaging, signing, updater, or release
-support. See the [current status matrix](../../docs/current-status.md).
+This is a fail-closed capability boundary. The published Electron application
+has a Windows x64 release, but this binding's general production/path-walk
+policy remains disabled. Its narrow source-reader is enabled in this unreleased
+source candidate, with native and packaged qualification pending. Source
+compilation, native unit tests, or a valid sidecar do not establish that the
+candidate works in the installed app. See the
+[current status matrix](../../docs/current-status.md).
 
 This directory contains the reviewed Windows-only filesystem and credential
 mutex boundary for private TiboTattle state. The binding is deliberately a
@@ -176,3 +178,62 @@ disabled production flags, native Windows x64 physical and adversarial
 qualification, cross-session decision, protected-state and audit lifecycle,
 and authenticated installer/binding provenance remain separate production
 gates.
+
+
+## Shared source handles (pending native qualification)
+
+The `windows-source-read-v1` extension supplies `openSourceFile(path)`,
+`statSourceFile(lease)`, `readSourceFile(lease, offset, length)` and
+`closeSourceFile(lease)`. It accepts ordinary inherited source ACLs only when the
+current user owns the regular, single-link file. It does not change Codex source
+permissions. Components are traversed relative to held handles with reparse
+rejection; ancestors and source remain open without delete sharing until close.
+Each native read is capped at 64 KiB before allocation. Source leases share the
+bounded 64-slot guard registry, with source-only validation at their public close
+entrypoint. The common JavaScript source-file adapter splits larger buffer reads
+and exposes a FileHandle-like interface to the existing readers.
+
+Timing and credential audit use `windows-protected-sqlite.js` for protected
+owner-only database/journal creation and the existing native guard lifecycle.
+Before any schema query, it enters EXCLUSIVE locking, selects PERSIST journaling,
+forces recovery, then returns to NORMAL locking and releases the temporary lock
+with a read. PERSIST alone does not prevent journal deletion during hot-journal
+recovery. The shared sequence has portable SQLite crash/reopen coverage; native
+Windows recovery remains a qualification gate. SQLite closes before guards
+release. Timing refuses WAL/SHM residue and non-rollback headers without deletion;
+no schema migration is introduced.
+
+An optional closed `sourceRead` manifest capability binds the generic methods and
+contract to the native digest. Existing manifests remain compatible for their
+existing consumers. Source-read approval is separate from the still-disabled
+general production/path-walk policies and requires the approved audit guard.
+`WINDOWS_SOURCE_READ_APPROVED` is true in the unreleased source candidate; the
+loader still rejects a missing or mismatched binding, manifest, contract, or
+audit guard. A sidecar-only approval edit is rejected. Run the native security
+suite against a rebuilt exact binary and manifest on Windows x64, then the
+packaged worker smoke before merging this candidate. See the
+[implementation and qualification plan](../../docs/plans/2026-09-13-windows-model-performance.md).
+
+The native and packaged timing qualifications use disposable synthetic Codex
+sources. On elevated hosted runners a new file can take the Administrators
+group as its default owner. Fixture setup gives its isolated child process a
+current-user default owner before creating the source, so Windows assigns its
+ordinary inherited/default DACL at creation. Real Codex sources are never
+modified by this setup; the native reader still refuses a foreign owner.
+
+Projects & threads also uses these source leases for local display metadata.
+Selected rollout-head hints use the same leases, without reading titles, so
+paginated replacement histories and inline children resolve across platforms.
+The main SQLite database and existing sidecars remain leased through connection
+close. With no sidecars, an immutable read avoids creating coordination files
+and rejects main-file or sidecar-presence changes. Live WAL reads require both
+existing WAL and SHM files; SQLite may update existing SHM coordination bytes,
+but the reader does not write database/WAL content or change journal mode or
+source permissions. A transient create/remove of an absent sidecar by a hostile
+same-owner process is outside the lease guarantee. Unsafe metadata retains the
+anonymous fallback. Native metadata tests and the packaged project/task journey
+are required in addition to model-performance qualification; see the
+[issue #208 plan](../../docs/plans/2026-09-22-windows-project-task-names.md).
+The shared `test/work-usage-platform-parity.test.js` runs identical metadata
+assertions against the real macOS and Windows adapters. A macOS result does not
+qualify the native Windows binding.

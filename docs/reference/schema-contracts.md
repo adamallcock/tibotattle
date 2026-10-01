@@ -20,6 +20,8 @@ versioning, and retirement rules.
 | Telemetry v0.1 export | `schemas/telemetry-v0.1/*.schema.json` plus `contracts/telemetry-v0.1/field-policy.json` | `generated/telemetry-v0.1-field-dictionary.json` and `generated/telemetry-v0.1-compatibility.json` | `npm run telemetry:check` |
 | Telemetry contribution v0.2 | `packages/telemetry-contract/schemas/v0.2/*.schema.json` and package source | `schemas/telemetry-contribution-v0.2/*.schema.json` byte-canonical mirrors | `npm run telemetry:upload-schemas:check` |
 | Attribution contribution v1.1 (staged) | `packages/telemetry-contract/src/telemetry-v1.1.js`, `telemetry-v1.1-domain.js`, and `telemetry-v1.1-schemas.js` | Eight package JSON Schemas and eight root mirrors in `schemas/telemetry-contribution-v1.1/` | `npm run telemetry:upload-schemas:check`, contract and Worker staging/activation tests |
+| Continuity contribution v1.2 (staged) | `packages/telemetry-contract/src/telemetry-v1.2.js`, `telemetry-v1.2-domain.js`, and `telemetry-v1.2-schemas.js` | Eight package JSON Schemas and eight root mirrors in `schemas/telemetry-contribution-v1.2/` | Upload/browser mirror checks and v1.2 contract tests; hosted runtime starts staged |
+| Daily model performance (staged) | `packages/telemetry-contract/src/performance-histogram.js`, `telemetry-performance-v1.js`, and `telemetry-performance-v1-schemas.js` | Two package JSON Schemas and two root mirrors in `schemas/telemetry-performance-v1/` | Histogram/record tests and schema/browser parity; no transport or source-coverage authority |
 | Telemetry browser mirror | Telemetry contract package/source | Browser-consumable generated mirror | `npm run telemetry:browser:check` |
 | Public model identity mirror | `packages/telemetry-contract/src/model-catalog.js` only | `apps/web/public/model-catalog.generated.js`; excludes telemetry and admin-history contracts | `npm run telemetry:browser:check` and browser parity/public-asset isolation tests |
 | Reviewed model identities and admin history | `packages/telemetry-contract/src/model-catalog.js` and `admin-model-history.js` | Public package exports and the telemetry browser mirror; closed export/upload model enums checked against the catalog | Catalog tests, `npm run telemetry:check`, browser and upload mirror checks |
@@ -47,6 +49,8 @@ The root schema families are grouped as follows:
 | `telemetry-v0.1/` | 6 | Activity, usage, quota, bundle, compatibility, and privacy receipt for the original reviewed export. |
 | `telemetry-contribution-v0.2/` | 4 | Mirrored activity, usage, quota, and contribution upload schemas. |
 | `telemetry-contribution-v1.1/` | 8 | Generated attribution, usage, quota, session, chunk, envelope, day-manifest and complete-domain-manifest contracts. |
+| `telemetry-contribution-v1.2/` | 8 | Independently authorized successor with nullable continuity and non-additive cache-write TTL detail; hosted runtime starts staged. |
+| `telemetry-performance-v1/` | 2 | Independent staged daily measurement and histogram contracts; not a v1.2 usage stream. |
 | `export-deletion-v0.1/` | 4 | Recoverable deletion preflight/journal/commit/receipt. |
 | `export-workspace-discard-v0.1/` | 4 | Recoverable workspace-discard preflight/journal/commit/receipt. |
 | `export-set-v0.1/`, `export-set-v0.2/` | 2 | Versioned export-set manifests. |
@@ -54,19 +58,24 @@ The root schema families are grouped as follows:
 | Claude, provider accounting, release manifest, R7 release, R7 resource | 5 | One schema per listed family. |
 
 Package-owned schema copies are not additional independent contracts. v0.2
-package JSON files are canonical; v1.1 JSON files are generated from its package
-schema factory. Telemetry v1.0 remains code-defined and frozen; the v1.1 family
-does not reinterpret existing v1.0 bytes or consent.
+package JSON files are canonical; v1.1, v1.2 and performance JSON files are generated from their
+package schema factories. Telemetry v1.0 remains code-defined and frozen.
+Successors do not reinterpret earlier bytes or consent.
 
 ## Canonical versus generated
 
 - Change the canonical package/schema/policy source first.
-- Never hand-edit `generated/`, root telemetry mirrors, or generated v1.1 package schemas.
+- Never hand-edit `generated/`, root telemetry mirrors, or generated v1.1/v1.2/performance package schemas.
 - Run the named generator, inspect its diff, then run the check mode.
 - A mirror must remain byte-canonical after normalized JSON formatting; do not
   add explanatory fields to only the mirror.
 - Human explanations belong here or in source policy metadata, not in a second
   manually maintained field dictionary.
+
+The Worker embeds the admin module graph, including the telemetry browser
+mirror. After regenerating that mirror, run
+`node apps/worker/scripts/generate-admin-ui-assets.mjs` from the repository
+root. The Worker check verifies this additional generated copy.
 
 ## Closed privacy contract
 
@@ -98,7 +107,7 @@ allowance. Unknown labels are withheld or fingerprinted at the existing export
 boundary, never copied into admin labels. Legacy telemetry enum positions remain
 stable; newly reviewed values append.
 
-The export registry advances to `telemetry-v0.1-registry-2026-09-03.1` with its
+The export registry advances to `telemetry-v0.1-registry-2026-09-29.1` with its
 closed schema and generated compatibility dictionary. Disabled legacy upload
 contracts remain disabled; this vocabulary change does not enable contribution
 or alter consent. Reparse retained source before claiming to recover a model that
@@ -106,12 +115,45 @@ an older extractor normalized to unknown. Admin model history has an independent
 versioned compact projection; historical absence is not zero observations for a
 newly added model.
 
+### Performance speed vocabulary and retained authorization
+
+The performance dictionary advances to `telemetry-performance-registry-2026-09-29.1`
+for the appended GPT-6.1 Sol identity and separate Ultrafast cohort. Existing
+enum positions stay stable. Worker isolation migration
+`0013_performance_ultrafast.sql` admits the new dictionary without rewriting
+historical migration `0009`. Historical reports and their Sep21 authorizations
+retain their original dictionary; they remain readable and erasable, rather
+than authorizing the expanded contract. New writes require the Sep29
+dictionary and matching current authorization. Local SQL tests cover historical
+preservation, refusal before migration, old-consent refusal, new admission,
+rollback, retry and erasure. Remote application remains a separate gate: the
+existing historical forward operator has closed pins through `0009`, so `0013`
+needs an environment-specific reviewed migration plan and rehearsal.
+The independent performance activation predicate requires the exact `0009` and
+`0013` ledger hashes and both current cohort dictionary triggers. Usage
+activation does not acquire those performance requirements. Migration `0013`
+preserves runtime state while incrementing the existing policy revision; an
+activation request must use the reconciled current revision rather than an
+assumed initial value.
+
 ## Compatibility and versioning
 
 Use a new contract version when a consumer could assign a different meaning to
 the same valid bytes. Additive fields are not automatically compatible when
 objects are closed; producer, consumer, consent, storage, relay, public
 projection, and deletion/export paths must declare the same transition.
+
+Local API valuation methodology is `provider-neutral-api-price-equivalent-v0.3`
+and replay materialization is `local-replay-safe-accounting-v0.18`. Current
+companion readers and writers require `source_native` context behavior: absent
+context remains unavailable rather than becoming observed zero. An inferred
+input total is usable only when its component observations are complete; known
+explicit context, including observed zero, remains authoritative. The memoized
+pricer derives context thresholds from the reviewed public cards and falls back
+to the full ledger for incomplete evidence. Old materialization is withheld for
+rebuild; an explicitly requested `legacy_zero` compatibility adapter retains its
+original meaning rather than becoming the current default. This does not
+rewrite stored source observations or alter retained price-card evidence.
 
 A version change includes:
 
@@ -138,8 +180,10 @@ reset, percentage or window duration. Conflicting evidence remains explicit.
 
 Code availability is not rollout: migration `0044` initializes v1.1 as `staged`
 and v0.2 as `blocked`. Accepted lifecycle, an explicit current v1.1 consent grant,
-and the participant's persisted minimum write rank gate every upload route.
-Device renewal/re-pair cannot lower that floor. `0045` activates only complete
+and a persisted write floor gate every upload route. Forward isolation migration
+`0008` scopes v1/v1.1 floors to the consenting device; a sibling older device
+continues its authorized version. Existing participant-wide v0.2 protections
+remain intact. Device renewal/re-pair cannot lower its existing floor. `0045` activates only complete
 comparison domains after proving predecessor coverage. Partial day arrivals do
 not displace old data. See [architecture](./system-architecture.md) and
 [privacy](./local-data-and-privacy.md) for semantics and lifecycle boundaries.
@@ -153,6 +197,116 @@ is required, not permission to delete it to make an upgrade succeed.
 The v1.1 wire format does not carry a complete quantity-interval proof. Hosted
 allowance remains explicitly conditional even when a record has an account
 pseudonym. This is not a provider-authoritative account billing contract.
+
+The source-verified `promax` identifier is accepted by local v0.1 export and
+staged v1.1/v1.2 schemas. The frozen v0.2
+contribution schema retains its original vocabulary: its local projection
+writes `unknown` for this value, while v1.1/v1.2 can retain the exact identifier.
+The reviewed installed-binary evidence does not yet cover `promax`. Product
+policy names `pro` Pro 10x and `promax` Pro Max 25x, without changing the
+existing `pro` identity or discarding its history. Provider allowance and
+window semantics remain unverified; the release contract check stays blocked.
+
+## Staged continuity successor v1.2
+
+The v1.2 contract adds three required nullable usage fields:
+
+- `boundaryFlags`: integer 0–3; bit 0 records a user-turn boundary and bit 1
+  records compaction. Null means boundary coverage is unreported.
+- `tieOrder`: integer 0–819,199, bounded by the maximum records in a day.
+  It ranks only usage sharing a session and millisecond. A complete group is
+  all null or has exactly the ranks 0 through its size minus one. This rule
+  applies across chunk boundaries.
+- `cacheWriteTtl`: null or the closed object
+  `{ fiveMinuteTokens, oneHourTokens }`. Both counts must be reported and sum
+  to the non-null aggregate cache-write count. They are subdivisions, never
+  additional usage. Codex has no qualified TTL source and supplies null.
+
+Historical restatement keeps its usage rows and reports null continuity before
+the client's persisted activation instant. Local preparation accepts an explicit
+cutoff but does not create or persist policy authority. V1 and v1.1 bytes,
+validators and grants remain separate.
+
+The local attribution reader exposes opt-in `readDayWithV12Evidence(day)` for
+independently authorized successor preparation. It joins emitted usage identities to index boundary rows
+and qualified source coordinates within the same published-generation snapshot.
+Missing lookup coverage, unknown parser provenance and ambiguous ordering stay
+null. Ordinary `readDay(day)` retains its existing query and result shape.
+
+The source provides independent v1.2 capability, social consent and accountless
+policy routes, encrypted local upload, typed storage and complete-domain
+admission. The local review binds the exact inventory, dictionary, privacy
+contract and destination; the upload pins the server-issued activation instant.
+Its progress journal is separate from v1.1. Legacy capability responses remain
+closed and unchanged. These implementations are not hosted activation evidence;
+the migration initializes the successor runtime as staged. Reader and production
+composition qualification is tracked in the
+[v1.2 plan](../plans/2026-09-20-turn-boundary-telemetry-plan.md).
+
+Parser v17 repairs the existing exact totals while preserving parser v16's
+cache-write assumption. Ingestion-isolation migration
+`0007_usage_correction_admission.sql` preserves the predecessor, completeness,
+CAS and non-usage guards. Only an active correction runtime admits null-versus-
+known exact totals, and every other immutable shared typed field must match.
+Different known totals are refused. Raw legacy JSON keeps its exact proof.
+Populated D1 tests cover v1-to-v1.1 repair, v1.1 repair, a late older-client
+upload with unique usage, inactive runtime refusal and unrelated-field changes.
+
+The dormant ingestion-isolation migration `0006_usage_correction_facts.sql`
+introduces a compact archive for typed v1 sources that replacement
+would otherwise delete. It retains original source digests and counters;
+derived facts reference that history without rewriting upload bytes. V1.1 and
+v1.2 archive capture remain refused. The typed v1 writer captures its prior
+usage chunk in the replacement transaction only when the correction runtime
+is active. Database guards protect chunk, record, admission and allocation
+retirement, and protected owner erasure
+removes its history and facts. The runtime remains staged by default. Legacy
+restore initializes that staged runtime. The separate `typed-evidence-restore-v1`
+role preserves a complete typed snapshot, including dictionary identifiers,
+source namespaces, correction history, v1.2 rows, performance histograms, grants
+and revision state. It pins every source table, sequence and schema object,
+verifies bounded copy pages and generated columns, and resumes through a durable
+journal. It does not perform legacy conversion or bootstrap. The old restore
+role still rejects correction sources. Populated local restore and adapter
+checks qualify source behavior; deployment and deletion-ledger reconciliation
+remain separate operator gates. Qualification of every production effective
+reader remains a prerequisite for activation.
+
+`cache-retention-v2` remains request-scoped and ignores continuity; a later
+calculation requires a separate decision after sufficient collected history.
+
+## Staged daily model performance
+
+`model-performance-daily-v1` groups qualified measurements by UTC completion
+day, provider, model, reasoning effort, speed method, speed mode/evidence source
+and API tier. Its independent TPS, TTFT and full-completion histograms retain
+eligible sample counts, conservative integer extrema and speed token/duration
+sums. Completion is positive integer milliseconds; measured zero TTFT is valid. `performance-histogram-v1` fixes the bucket
+edges for every contributor/client and includes explicit tails. Counts and integer units remain bounded by
+JavaScript's safe-integer range. Typed storage retains only populated bucket
+indexes/counts, typed cohort dimensions and the bounded integer summaries.
+
+The helper merges already-qualified distributions and returns approximate
+Type-7 P10/P25/median/P75/P90 estimates with bounds and method metadata. Bands
+are null below five observations; a sparse median remains available. It does
+not deduplicate turns across devices. Compatible reports may be pooled as
+reported samples; copied histories can overlap. No per-turn membership artifact
+is collected. A measurement digest identifies canonical content, not unique
+source membership.
+
+This family is staged independently of usage v1.2. Its source includes separate
+capability and authorization routes, encrypted report delivery, typed cohort and
+bucket storage, idempotent per-device report revisions, and owner-erasure/restore
+coverage. Usage consent cannot authorize performance. Local timing source and
+scheduler integration are qualified separately from hosted chart publication.
+Timing SQLite schemas advance to primary 6 and supplement 7 while parser methods remain 2/3. Source parser version 18 recognizes GPT-6.1 Sol and Ultrafast. Still-present, verified sources replay through bounded staging; completed old rows remain readable through cancellation and restart until the final verified chunk atomically replaces them. Missing or rewritten sources retain their last good rows and prior parser provenance. Older writers refuse the upgraded stores.
+Old rows retain existing TPS/TTFT
+with unavailable new fields. Receipt timing
+wins when qualified; tool-free timing is a single-sample fallback, never a
+second speed sample for the same turn. The field dictionary is `telemetry-performance-registry-2026-09-29.1`.
+The [performance specification](../design/2026-09-20-performance-telemetry-contract.md)
+records the measurement, overlap, policy, delivery, erasure, restore and UI requirements.
+Those gates must not delay continuity collection or alter cache calculations.
 
 ## Retirement
 

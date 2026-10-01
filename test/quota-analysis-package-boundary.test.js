@@ -10,6 +10,10 @@ const TRACK_EXPORTS = Object.freeze([
   "continuityKey",
   "resetKey",
 ]);
+const INCLUDED_ALLOWANCE_SPEED_EXPORTS = Object.freeze([
+  "CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY",
+  "includedAllowanceSpeedWeight",
+]);
 const CALIBRATION_EXPORTS = Object.freeze([
   "QUOTA_CALIBRATION_POLICY",
   "analyzeQuotaCalibration",
@@ -36,6 +40,19 @@ const PLAN_ATTRIBUTION_EXPORTS = Object.freeze([
   "planAttributionContextKey",
   "planAttributionObservationFromSnapshot",
   "planEraForInterval",
+]);
+const RESET_EVENT_EXPORTS = Object.freeze([
+  "classifyQuotaResetTimeline",
+  "createResetEventClassifier",
+  "mergeQuotaResetEvents",
+  "normalizeResetEventContinuity",
+  "normalizeQuotaResetEvent",
+  "RESET_EVENT_CONTINUITY_SCHEMA_VERSION",
+  "QUOTA_RESET_CLASSIFICATION_POLICY",
+  "QUOTA_RESET_EVENT_KINDS",
+  "QUOTA_RESET_EVENT_PRECISIONS",
+  "QUOTA_RESET_EVENT_REASONS",
+  "QUOTA_RESET_EVENT_SCHEMA_VERSION",
 ]);
 const WINDOW_EXPORTS = Object.freeze([
   "classifyQuotaWindowKind",
@@ -64,10 +81,18 @@ const SOURCE_HASHES = Object.freeze({
   "quota-rolling.js":
     "2afca11d40c61c463524cc8f4d267c128dbe427c72fb6c2e3ed68b056ca70977",
   "quota-tracks.js":
-    // Re-pinned for the reviewed 5pp noise tolerance and running-maximum
-    // boundary correction. The executable kernel changed in ea84c35 while
-    // this byte-identity receipt remained on the pre-correction digest.
-    "d15a78931e10c8bccf82ea262f722ea84b5fd02d0cb3c9fd37b18dbd169fa3f0",
+    // Re-pinned 2026-09-18 for the reviewed cycle-restart split and
+    // duplicate-instant collapse. Two refusals became repairs: an instant a
+    // source reported more than once now settles to its highest reading rather
+    // than refusing the cycle, and a fall past the 5pp jitter tolerance now
+    // SPLITS the reset group into the cycles inside it rather than discarding
+    // both. The 5pp tolerance itself is unchanged — measured, it sits in the
+    // valley between jitter and genuine restarts. Both refusal codes remain
+    // emitted as fail-closed guards for a caller that bypasses the repairs.
+    // Both the split and its guard compare WITHIN a slot: `slot` is absent from
+    // the group key, so a cross-slot comparison split healthy groups on the
+    // primary/secondary crossover.
+    "922350e53fd58920fd9f9a9354db1a67b131cb302490b898cb4a5ca8379f9645",
   "quota-windows.js":
     // Re-pinned for the reviewed local-only quota display-name contract:
     // bounded provider copy cannot affect identity, calibration, or export,
@@ -129,11 +154,13 @@ test("quota analysis exposes one exact runtime-neutral package root", async () =
     Object.keys(quotaAnalysis).sort(),
     [
       ...TRACK_EXPORTS,
+      ...INCLUDED_ALLOWANCE_SPEED_EXPORTS,
       ...CALIBRATION_EXPORTS,
       ...ROLLING_EXPORTS,
       ...PACE_EXPORTS,
       ...COMPOSITION_EXPORTS,
       ...PLAN_ATTRIBUTION_EXPORTS,
+      ...RESET_EVENT_EXPORTS,
       ...WINDOW_EXPORTS,
     ].sort(),
   );
@@ -196,6 +223,7 @@ test("root and Worker resolve only the reviewed package root", async () => {
     "buildResetEvidence",
     "analyzeQuotaCalibration",
     "buildRollingQuotaComparisons",
+    "includedAllowanceSpeedWeight",
   ]) {
     assert.match(
       declarationSource,

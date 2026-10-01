@@ -348,7 +348,7 @@ export function validatePr94ProductionResourceEvidence(value) {
     exact(run.metrics, ["wallMs", "userCpuMs", "systemCpuMs", "peakRssBytes"]);
     Object.values(run.metrics).forEach((measurement) => integer(measurement));
     integer(run.metrics.peakRssBytes, 1, value.policy.maximumRssBytes);
-    const envelope = parseSuccessfulAccountingEnvelope(JSON.stringify(run.envelope));
+    const envelope = parseSuccessfulAccountingEnvelope(JSON.stringify(run.envelope), { maximumBytes: TRANSPORT_BYTES });
     exact(run.artifact, ["sha256", "bytes"]); digest(run.artifact.sha256); integer(run.artifact.bytes, 2, CACHE_BYTES);
     if (envelope.resultBytes !== run.artifact.bytes || envelope.resultSha256 !== run.artifact.sha256) fail();
     validateProjection(run.cache);
@@ -395,7 +395,7 @@ function validateHistoricalArtifactRefusal(value) {
     exact(run.metrics, ["wallMs", "userCpuMs", "systemCpuMs", "peakRssBytes"]);
     Object.values(run.metrics).forEach((measurement) => integer(measurement));
     integer(run.metrics.peakRssBytes, 1, value.policy.maximumRssBytes);
-    const envelope = parseSuccessfulAccountingEnvelope(JSON.stringify(run.envelope));
+    const envelope = parseSuccessfulAccountingEnvelope(JSON.stringify(run.envelope), { maximumBytes: TRANSPORT_BYTES });
     exact(run.artifact, ["sha256", "bytes"]); digest(run.artifact.sha256); integer(run.artifact.bytes, 2, CACHE_BYTES);
     if (envelope.resultBytes !== run.artifact.bytes || envelope.resultSha256 !== run.artifact.sha256) fail();
     validateHistoricalCacheAssertion(run.cacheAssertion);
@@ -471,16 +471,18 @@ async function runWorker(options, {
       `--max-old-space-size=${initial.policy.rebuildChildOldSpaceMib}`,
       join(options.root, "src/replay-safe-accounting-rebuild-child.js"), requestFile, resultFile],
     { cwd: directory, env: environment, signal, timeoutMs: timeoutSeconds * 1000 });
-    const envelope = parseSuccessfulAccountingEnvelope(output.stdout);
+    const envelope = parseSuccessfulAccountingEnvelope(output.stdout, { maximumBytes: TRANSPORT_BYTES });
     const metrics = parseMacOsTimeMetrics(output.stderr);
     if (metrics.peakRssBytes > initial.policy.maximumRssBytes) fail("resource_limit_exceeded");
-    const artifact = await verifyAccountingBenchmarkArtifact(resultFile, envelope, { signal });
+    const artifact = await verifyAccountingBenchmarkArtifact(resultFile, envelope, { signal, maximumBytes: CACHE_BYTES });
     const probed = await probe({ ...probeOptions, stage: "artifact", path: resultFile, context });
     const cacheAssertion = historicalCacheAssertion(probed);
     const cache = cacheAssertion === null ? validateProjection(probed) : null;
     if (cacheAssertion !== null && options.expectedRevision !== AFTER_REVISION) fail("artifact_invalid");
     // Bind the exact file validated by the selected revision's public facade.
-    if (!same(artifact, await verifyAccountingBenchmarkArtifact(resultFile, envelope, { signal }))) fail("artifact_changed");
+    if (!same(artifact, await verifyAccountingBenchmarkArtifact(resultFile, envelope, { signal, maximumBytes: CACHE_BYTES }))) {
+      fail("artifact_changed");
+    }
     const priorCache = runs.length && Object.hasOwn(runs[0], "cache") ? runs[0].cache : null;
     const priorAssertion = runs.length && Object.hasOwn(runs[0], "cacheAssertion") ? runs[0].cacheAssertion : null;
     if (runs.length && (!same(runs[0].envelope, envelope) || !same(runs[0].artifact, artifact)

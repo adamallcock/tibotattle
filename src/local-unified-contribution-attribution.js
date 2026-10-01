@@ -11,6 +11,8 @@ import {
   sanitizeTelemetryAttributionBinding,
 } from "./contribution/index.js";
 import { createTelemetryV1IndexReader } from "./contribution/telemetry-v1-chunks.js";
+import { createLocalUnifiedTelemetryV12EvidenceSelector } from
+  "./local-unified-contribution-v12-evidence.js";
 import { exportLimitProvider } from "./export/index.js";
 import { createLocalUnifiedUsageAttributionReader } from "./local-unified-accounting-source.js";
 import {
@@ -30,6 +32,15 @@ export const LOCAL_TELEMETRY_V11_READER_LIMITS = Object.freeze({
   toolClasses: 500_000,
   accountMarkers: 256,
 });
+
+export {
+  createLocalUnifiedTelemetryV12EvidenceSelector,
+} from "./local-unified-contribution-v12-evidence.js";
+export {
+  LOCAL_TELEMETRY_V12_EVIDENCE_LIMITS,
+  createTelemetryV12LocalEvidenceAdapter,
+  isTelemetryV12BoundaryParserVersion,
+} from "./local-unified-contribution-v12-evidence-adapter.js";
 const MAX_MARKER_AGE_MS = 5 * 60_000;
 const DAY_MS = 86_400_000;
 const TOKEN = /^[A-Za-z0-9._:-]{1,64}$/u;
@@ -265,9 +276,47 @@ export function createLocalUnifiedTelemetryV11Reader(database, {
   const allQuota = database.prepare(`${quotaSql}
     ORDER BY q.observed_at_ms, q.source_local, q.source_offset, q.slot_order`);
   const usageRaw = database.prepare(`
-    SELECT event_key, source_local, source_offset, source_ordinal, session_local, observed_at_ms
-    FROM usage_event WHERE observed_at_ms >= ? AND observed_at_ms < ?
+    SELECT event_key, source_local, source_offset, source_ordinal,
+           session_local, observed_at_ms
+    FROM usage_event
+    WHERE observed_at_ms >= ? AND observed_at_ms < ?
     ORDER BY observed_at_ms, event_key LIMIT ?`);
+  const usageEvidenceSql = `
+    SELECT u.event_key, u.source_local, u.source_offset, u.source_ordinal,
+           u.session_local, u.observed_at_ms, parser.parser_version,
+           boundary.current_event_key AS boundary_event_key,
+           boundary.compaction_before, boundary.turn_context_before,
+           boundary.compacted_at_ms,
+           boundary.session_local AS boundary_session_local,
+           boundary_parser.parser_version AS boundary_parser_version,
+           CASE WHEN source.source_local IS NOT NULL
+                     AND cursor.source_local IS NOT NULL
+                THEN u.source_local ELSE NULL END AS evidence_source_local,
+           CASE WHEN source.source_local IS NOT NULL
+                     AND cursor.source_local IS NOT NULL
+                THEN u.source_offset ELSE NULL END AS evidence_source_offset,
+           CASE WHEN source.source_local IS NOT NULL
+                     AND cursor.source_local IS NOT NULL
+                THEN u.source_ordinal ELSE NULL END AS evidence_source_ordinal
+    FROM usage_event u
+    JOIN parser_version parser ON parser.id = u.parser_version_id
+    LEFT JOIN usage_event_boundary boundary
+      ON boundary.current_event_key = u.event_key
+    LEFT JOIN parser_version boundary_parser
+      ON boundary_parser.id = boundary.parser_version_id
+    LEFT JOIN generation_source source
+      ON source.generation_id = ?
+     AND source.source_local = u.source_local
+     AND source.source_ordinal = u.source_ordinal
+     AND u.source_offset IS NOT NULL
+     AND u.source_offset <= source.scanned_bytes
+     AND source.status IN ('skipped', 'touched', 'resumed', 'rescanned', 'complete')
+     AND source.diagnostics_complete = 1
+    LEFT JOIN source_cursor cursor
+      ON cursor.source_local = u.source_local
+     AND cursor.source_ordinal = u.source_ordinal
+    WHERE u.observed_at_ms >= ? AND u.observed_at_ms < ?
+    ORDER BY u.observed_at_ms, u.event_key LIMIT ?`;
   const quotaDays = database.prepare(`SELECT DISTINCT date(q.observed_at_ms / 1000, 'unixepoch') AS day
     FROM quota_occurrence q JOIN generation_source gs ON gs.generation_id = ?
       AND gs.source_local = q.source_local AND gs.source_ordinal = q.source_ordinal
@@ -397,9 +446,19 @@ export function createLocalUnifiedTelemetryV11Reader(database, {
       ])].filter((day) => typeof day === "string" && /^\d{4}-\d{2}-\d{2}$/u.test(day)).sort());
     },
     readDay(day) {
+      return readDayInternal(day, false);
+    },
+    readDayWithV12Evidence(day) {
+      return readDayInternal(day, true);
+    },
+  });
+
+  function readDayInternal(day, includeV12Evidence) {
       const [start, end] = dayBounds(day);
       return snapshot((current, descriptor) => {
-        const rawUsage = usageRaw.all(start, end, bounds.dayRows + 1);
+        const rawUsage = includeV12Evidence
+          ? database.prepare(usageEvidenceSql).all(descriptor.id, start, end, bounds.dayRows + 1)
+          : usageRaw.all(start, end, bounds.dayRows + 1);
         const rawQuota = quotaDay.all(descriptor.id, start, end, bounds.dayRows + 1);
         const canonicalCount = Number(database.prepare(`SELECT COUNT(*) AS count FROM quota_observation
           WHERE observed_at_ms >= ? AND observed_at_ms < ?`).get(start, end).count);
@@ -408,6 +467,31 @@ export function createLocalUnifiedTelemetryV11Reader(database, {
         const usage = base.chunks.filter((chunk) => chunk.stream === "usage").flatMap((chunk) => chunk.records);
         const session = base.chunks.filter((chunk) => chunk.stream === "session").flatMap((chunk) => chunk.records);
         const rawById = new Map(rawUsage.map((row) => [hex(row.event_key), row]));
+        const telemetryV12Evidence = includeV12Evidence
+          ? createLocalUnifiedTelemetryV12EvidenceSelector({
+            records: usage,
+            facts: rawUsage.map((row) => ({
+              eventId: hex(row.event_key),
+              sessionLocal: hex(row.session_local),
+              sourceLocal: hex(row.evidence_source_local),
+              sourceOffset: row.evidence_source_offset === null
+                ? null : Number(row.evidence_source_offset),
+              sourceOrdinal: row.evidence_source_ordinal === null
+                ? null : Number(row.evidence_source_ordinal),
+              parserVersion: row.parser_version,
+              boundary: row.boundary_event_key === null ? null : {
+                parserVersion: row.boundary_parser_version,
+                sessionLocal: hex(row.boundary_session_local),
+                turnContextBefore: Number(row.turn_context_before),
+                compactionBefore: Number(row.compaction_before),
+                compactedAtMs: row.compacted_at_ms === null
+                  ? null : Number(row.compacted_at_ms),
+              },
+            })),
+            boundaryLookupComplete: true,
+            maxRows: bounds.dayRows,
+          })
+          : null;
         const proof = new WeakMap();
         for (const record of usage) {
           const raw = rawById.get(record.eventId);
@@ -443,6 +527,7 @@ export function createLocalUnifiedTelemetryV11Reader(database, {
         }
         return Object.freeze({
           recordsByStream: Object.freeze({ usage: Object.freeze(usage), quota: Object.freeze(quota), session: Object.freeze(session) }),
+          ...(includeV12Evidence ? { telemetryV12Evidence } : {}),
           attributionForRecord(stream, record) {
             if (stream !== "usage" && stream !== "quota") return null;
             const entry = proof.get(record);
@@ -451,6 +536,5 @@ export function createLocalUnifiedTelemetryV11Reader(database, {
           excluded: Object.freeze({ usage: base.excluded.usage, quota: excludedQuota, session: base.excluded.session }),
         });
       });
-    },
-  });
+  }
 }

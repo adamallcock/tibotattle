@@ -39,33 +39,51 @@ export const PRODUCTION_ASSET_DIRECTORY = join(
 );
 
 const RELEASE_MANIFEST_BASENAME = "release-site-manifest.json";
+const FULL_GIT_COMMIT_PATTERN = /^[a-f0-9]{40}$/u;
+const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 const REQUIRED_SEO_ASSET_BASENAMES = Object.freeze([
   "robots.txt",
   "sitemap.xml",
 ]);
 const PUBLIC_RELEASE_ASSET_BASENAMES = Object.freeze([
   "404.html",
+  "allowance-tank-renderer.js",
+  "allowance-tanks.js",
   "apple.svg",
+  "cache-reuse-matrix.css",
+  "cache-reuse-matrix.js",
+  "codex-color.svg",
   "community-data.js",
   "community-refresh.js",
   "community-view.js",
-  "model-visuals.js",
-  "community.js",
   "community.html",
+  "community.js",
+  "dashboard-ui.js",
   "docs.html",
+  "feature-allowance.jpg",
+  "feature-allowance.mp4",
+  "feature-insights.js",
+  "feature-tour.css",
+  "feature-tour.js",
+  "feature-value.png",
+  "feature-week.js",
   "github.svg",
   "i18n.generated.js",
   "index.html",
+  "install-cta.js",
+  "last-known-good.js",
   "localization.js",
   "model-catalog.generated.js",
-  "install-cta.js",
+  "model-performance.css",
+  "model-performance.js",
+  "model-visuals.js",
   "privacy.html",
   "robots.txt",
   "sitemap.xml",
   "social-preview.png",
   "styles.css",
   "tibotattle-icon.png",
-  "tibotattle-weekly-preview.jpg",
+  "trends-horizon.js",
   "ui-format.js",
   "x.svg",
 ]);
@@ -156,6 +174,17 @@ function runGit(repositoryRoot, arguments_) {
   return result.stdout;
 }
 
+function runGitBytes(repositoryRoot, arguments_) {
+  const result = spawnSync("/usr/bin/git", ["-C", repositoryRoot, ...arguments_], {
+    encoding: null,
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  if (result.error || result.status !== 0 || !Buffer.isBuffer(result.stdout)) {
+    throw new Error("Unable to inspect the pinned public release source.");
+  }
+  return result.stdout;
+}
+
 async function requireCleanReleaseTree(repositoryRoot, git) {
   if (git(repositoryRoot, ["status", "--porcelain=v1", "--untracked-files=all"])
       .trim() !== "") {
@@ -219,8 +248,9 @@ async function verifiedGeneratedSite(sourceDirectory) {
     "Generated public release manifest",
   );
   let manifest;
+  const manifestBytes = await readFile(manifestPath);
   try {
-    manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    manifest = JSON.parse(manifestBytes.toString("utf8"));
   } catch {
     throw new Error("Generated public release manifest is not valid JSON.");
   }
@@ -304,7 +334,11 @@ async function verifiedGeneratedSite(sourceDirectory) {
       }
     }
   }
-  return Object.freeze({ files: actualFiles, manifest });
+  return Object.freeze({
+    files: actualFiles,
+    manifest,
+    manifestSha256: createHash("sha256").update(manifestBytes).digest("hex"),
+  });
 }
 
 export async function verifyGeneratedCommunityAssetTree(
@@ -324,6 +358,61 @@ function checkedOutSourceCommit(repositoryRoot, git) {
     throw new Error("Production source revision is unavailable for public asset staging.");
   }
   return value;
+}
+
+function pinnedSourceCommit(repositoryRoot, value, git) {
+  if (typeof value !== "string" || !FULL_GIT_COMMIT_PATTERN.test(value)) {
+    throw new Error(
+      "Pinned public release source commit must be a 40-character lowercase Git commit.",
+    );
+  }
+  let resolved;
+  try {
+    resolved = git(repositoryRoot, ["rev-parse", "--verify", `${value}^{commit}`])
+      .trim();
+  } catch {
+    throw new Error("Pinned public release source commit cannot be resolved.");
+  }
+  if (resolved !== value) {
+    throw new Error("Pinned public release source commit cannot be resolved exactly.");
+  }
+  return value;
+}
+
+function pinnedSourceDigest({ repositoryRoot, sourceCommit, path }) {
+  const sourcePath = `apps/web/public/${path}`;
+  const spec = `${sourceCommit}:${sourcePath}`;
+  let treeEntry;
+  try {
+    treeEntry = runGit(repositoryRoot, [
+      "--literal-pathspecs",
+      "ls-tree",
+      "-z",
+      "--full-tree",
+      sourceCommit,
+      "--",
+      sourcePath,
+    ]);
+  } catch {
+    throw new Error(`Pinned public release source is missing: ${path}`);
+  }
+  const entries = treeEntry.split("\0").filter(Boolean);
+  const [header, selectedPath] = entries.length === 1
+    ? entries[0].split("\t", 2)
+    : [];
+  const [mode, type] = typeof header === "string"
+    ? header.split(/\s+/u, 3)
+    : [];
+  if (!selectedPath || selectedPath !== sourcePath
+      || type !== "blob"
+      || !["100644", "100755"].includes(mode)) {
+    throw new Error(`Pinned public release source is not a regular file: ${path}`);
+  }
+  const bytes = runGitBytes(repositoryRoot, ["show", spec]);
+  return Object.freeze({
+    bytes: bytes.length,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  });
 }
 
 async function replaceGeneratedDirectory(destination, temporaryDirectory) {
@@ -352,18 +441,48 @@ export async function stageProductionAssets({
   sourceDirectory = PRODUCTION_ASSET_SOURCE,
   destinationDirectory = PRODUCTION_ASSET_DIRECTORY,
   expectedSourceCommit = null,
+  retainedPublicSourceCommit = null,
+  expectedLiveManifestSha256 = null,
   git = runGit,
 } = {}) {
   await requireCleanReleaseTree(repositoryRoot, git);
+  const hasRetainedSourceCommit = retainedPublicSourceCommit !== null;
+  const hasExpectedLiveManifest = expectedLiveManifestSha256 !== null;
+  if (hasRetainedSourceCommit !== hasExpectedLiveManifest) {
+    throw new Error(
+      "Pinned public release source commit and expected live manifest SHA-256 must be supplied together.",
+    );
+  }
   const sourceCommit = checkedOutSourceCommit(repositoryRoot, git);
   if (expectedSourceCommit !== null && expectedSourceCommit !== sourceCommit) {
     throw new Error("Production source revision changed before public asset staging.");
   }
+  if (expectedLiveManifestSha256 !== null
+      && (typeof expectedLiveManifestSha256 !== "string"
+        || !SHA256_PATTERN.test(expectedLiveManifestSha256))) {
+    throw new Error("Expected live public release manifest SHA-256 is invalid.");
+  }
   const generated = await verifiedGeneratedSite(sourceDirectory);
+  if (expectedLiveManifestSha256 !== null
+      && generated.manifestSha256 !== expectedLiveManifestSha256) {
+    throw new Error("Generated public release manifest does not match the expected live manifest.");
+  }
+  const publicSourceCommit = retainedPublicSourceCommit === null
+    ? sourceCommit
+    : pinnedSourceCommit(repositoryRoot, retainedPublicSourceCommit, git);
   await verifyPublicReleaseSourceProvenance({
     repositoryRoot,
-    expectedSourceCommit: sourceCommit,
+    expectedSourceCommit: publicSourceCommit,
     provenance: generated.manifest.source,
+    ...(retainedPublicSourceCommit === null
+      ? {}
+      : {
+        sourceReader: ({ path }) => pinnedSourceDigest({
+          repositoryRoot,
+          sourceCommit: publicSourceCommit,
+          path,
+        }),
+      }),
   });
   const sourceFiles = generated.files;
   const destinationParent = dirname(destinationDirectory);
@@ -388,6 +507,9 @@ export async function stageProductionAssets({
   return Object.freeze({
     directory: destinationDirectory,
     files: sourceFiles.length,
+    sourceCommit,
+    publicSourceCommit,
+    manifestSha256: generated.manifestSha256,
   });
 }
 

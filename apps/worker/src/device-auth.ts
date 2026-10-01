@@ -1801,8 +1801,10 @@ export async function disconnectAuthenticatedDevice(
 }
 
 /**
- * Bounded maintenance for expired/idle device state. It only revokes bearer
- * authority and pending upload authorizations; consumed receipts remain for
+ * Bounded maintenance for expired/idle social devices. Accountless leases
+ * expire upload permission, not durable ownership: renewal may restore that
+ * same installation. Explicit disconnect/erasure still revokes its authority.
+ * Expired pending upload authorizations are revoked for both authority kinds; consumed receipts remain for
  * normal replay/audit handling. Callers should schedule this from their
  * existing maintenance path and record the returned counts without including
  * ids, hashes, or request metadata.
@@ -1848,8 +1850,7 @@ export async function purgeStaleDeviceLifecycleRows(
         SELECT id FROM device_credentials
          WHERE state = 'active'
            AND (
-             expires_at <= ?
-             OR last_used_at <= ?
+             (authority_kind = 'social' AND (expires_at <= ? OR last_used_at <= ?))
              OR EXISTS (
                SELECT 1 FROM participants participant
                 WHERE participant.id = device_credentials.participant_id

@@ -12,6 +12,7 @@ import {
   realpath,
   rename,
   rm,
+  stat,
   writeFile,
 } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
@@ -48,7 +49,7 @@ const EXPECTED_SOURCE = Object.freeze({
   path: "codex-rs/protocol/src/auth.rs",
   repository: "openai/codex",
 });
-const ALLOWED_PLAN_LIFECYCLES = new Set(["active", "deprecated"]);
+const ALLOWED_PLAN_LIFECYCLES = new Set(["active", "deprecated", "provisional"]);
 const ALLOWED_SEAT_MAPPING_STATUSES = new Set([
   "rejected",
   "unverified_candidate",
@@ -238,6 +239,11 @@ export function validateCodexContractLedger(value) {
         `ledger.plans[${index}].deprecatedOn`,
         { pattern: ISO_DATE_RE },
       );
+    }
+    if (plan.lifecycle === "provisional") {
+      requireBoundedString(plan.note, `ledger.plans[${index}].note`, {
+        maxLength: 500,
+      });
     }
   }
 
@@ -691,6 +697,12 @@ export function compareUpstreamPlanRegistry(ledger, observedPairs) {
         `Active plan ${expected.rawValue} is no longer present upstream; review before marking it deprecated`,
       ));
     }
+    if (expected.lifecycle === "provisional" && observedByRaw.has(expected.rawValue)) {
+      warnings.push(issue(
+        "provisional_plan_observed",
+        `Provisional plan ${expected.rawValue} is present upstream; resolve remaining release gates before activation`,
+      ));
+    }
   }
   return { issues, ok: issues.length === 0, warnings };
 }
@@ -876,6 +888,7 @@ export async function inspectCodexBinaryContract({
 
 async function executablePath(candidate) {
   try {
+    if (!(await stat(candidate)).isFile()) return null;
     await access(candidate, fsConstants.X_OK);
     return candidate;
   } catch {
@@ -911,17 +924,33 @@ async function resolveCandidate(candidate, environment, platform) {
 export async function discoverInstalledCodexBinaries({
   environment = process.env,
   platform = process.platform,
+  applicationsDir = "/Applications",
 } = {}) {
+  const installations = platform === "darwin"
+    ? [applicationsDir, ...(
+      typeof environment.HOME === "string" && isAbsolute(environment.HOME)
+        ? [join(environment.HOME, "Applications")]
+        : []
+    )]
+    : [];
+  const bundledCandidates = (app) => installations.flatMap((directory) => [
+    join(directory, app, "Contents/Resources/codex-cli/bin/codex"),
+    join(directory, app, "Contents/Resources/codex"),
+  ]);
   const definitions = [
-    ["environment_override", environment.CODEX_BIN ?? null],
-    ["chatgpt_bundled", "/Applications/ChatGPT.app/Contents/Resources/codex"],
-    ["codex_bundled", "/Applications/Codex.app/Contents/Resources/codex"],
-    ["path", "codex"],
+    ["environment_override", [environment.CODEX_BIN ?? null]],
+    ["chatgpt_bundled", bundledCandidates("ChatGPT.app")],
+    ["codex_bundled", bundledCandidates("Codex.app")],
+    ["path", ["codex"]],
   ];
   const binaries = [];
   const missingChannels = [];
-  for (const [channel, candidate] of definitions) {
-    const resolvedPath = await resolveCandidate(candidate, environment, platform);
+  for (const [channel, candidates] of definitions) {
+    let resolvedPath = null;
+    for (const candidate of candidates) {
+      resolvedPath = await resolveCandidate(candidate, environment, platform);
+      if (resolvedPath !== null) break;
+    }
     if (resolvedPath === null) {
       missingChannels.push(channel);
       continue;
@@ -989,6 +1018,18 @@ export async function checkCodexContractDrift({
 
   const productCheck = compareProductPlanRegistry(ledger);
   issues.push(...productCheck.issues);
+  const provisionalPlans = ledger.plans.filter((plan) => plan.lifecycle === "provisional");
+  if (requireBinary && provisionalPlans.length > 0) {
+    issues.push(issue(
+      "provisional_plan_unverified_for_release",
+      `Release check requires resolution of provisional plan(s): ${provisionalPlans.map((plan) => plan.rawValue).join(", ")}`,
+    ));
+  } else if (provisionalPlans.length > 0) {
+    warnings.push(issue(
+      "provisional_plan_assumption",
+      `Product accepts provisional plan(s) pending release review: ${provisionalPlans.map((plan) => plan.rawValue).join(", ")}`,
+    ));
+  }
 
   if (sourceFile !== null) {
     if (sourceRevision !== null && !GIT_REVISION_RE.test(sourceRevision)) {

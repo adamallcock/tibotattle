@@ -109,7 +109,7 @@ const PINNED_RUNTIME_PACKAGES = Object.freeze({
     license: "MIT",
   }),
   "fast-uri": Object.freeze({
-    version: "3.1.5",
+    version: "3.1.8",
     license: "BSD-3-Clause",
   }),
   "json-schema-traverse": Object.freeze({
@@ -132,6 +132,7 @@ export const LOCAL_REVIEW_WORKSPACE_RUNTIME_FILES = Object.freeze({
   "@app-usagemonitor/quota-analysis": Object.freeze([
     "index.js",
     "package.json",
+    "src/included-allowance-speed.js",
     "src/model-composition.js",
     "src/plan-attribution.js",
     "src/quota-calibration.js",
@@ -139,6 +140,7 @@ export const LOCAL_REVIEW_WORKSPACE_RUNTIME_FILES = Object.freeze({
     "src/quota-rolling.js",
     "src/quota-tracks.js",
     "src/quota-windows.js",
+    "src/reset-events.js",
   ]),
   "@app-usagemonitor/telemetry-contract": Object.freeze([
     "index.js",
@@ -147,13 +149,20 @@ export const LOCAL_REVIEW_WORKSPACE_RUNTIME_FILES = Object.freeze({
     "src/constants.js",
     "src/envelope.js",
     "src/errors.js",
+    "src/model-catalog-contract.js",
     "src/model-catalog.js",
+    "src/performance-histogram.js",
     "src/primitives.js",
+    "src/telemetry-performance-v1-schemas.js",
+    "src/telemetry-performance-v1.js",
     "src/telemetry-v0.1.js",
     "src/telemetry-v0.2.js",
     "src/telemetry-v1.1-domain.js",
     "src/telemetry-v1.1-schemas.js",
     "src/telemetry-v1.1.js",
+    "src/telemetry-v1.2-domain.js",
+    "src/telemetry-v1.2-schemas.js",
+    "src/telemetry-v1.2.js",
     "src/upload.js",
   ]),
 });

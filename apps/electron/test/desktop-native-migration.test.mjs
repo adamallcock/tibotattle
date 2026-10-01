@@ -14,6 +14,9 @@ import {
   validateNativeElectronHandoverCandidate,
 } from "../desktop-native-migration.js";
 
+import { createDesktopStartupDiagnostics, DESKTOP_STARTUP_DIAGNOSTIC_FILE }
+  from "../desktop-startup-diagnostics.js";
+
 const MODE_FILE = 0o600;
 const MODE_DIRECTORY = 0o700;
 const ARCHIVE_DIGEST = "a".repeat(64);
@@ -542,4 +545,49 @@ test("unknown startup choice cannot be passed off as disabled or owned", async (
       assert.equal((await readdir(state.backupRoot)).length, 0);
     } finally { await state.dispose(); }
   }
+});
+
+
+test("early default startup diagnostics survive native handover without occupying its targets", async (t) => {
+  const state = await fixture();
+  t.after(() => state.dispose());
+  const calls = [];
+  const diagnostics = createDesktopStartupDiagnostics({
+    app: { getPath: () => state.userDataRoot, getVersion: () => "0.1.24" },
+  });
+  assert.equal(await diagnostics.start(), true);
+  const recordPath = join(state.userDataRoot, "startup-diagnostics", DESKTOP_STARTUP_DIAGNOSTIC_FILE);
+  const before = await readFile(recordPath, "utf8");
+  assert.equal(JSON.parse(before).outcome, "in_progress");
+  const result = await runNativeElectronHandover(migrationOptions(state, calls));
+  assert.equal(result.status, "migrated");
+  assert.deepEqual(calls, ["prepare", "claim:true"]);
+  await assertMigratedState(state);
+  assert.equal(await readFile(recordPath, "utf8"), before);
+  diagnostics.mark("native_handover");
+  assert.equal(await diagnostics.stop("native_handover_blocked"), true);
+  const record = JSON.parse(await readFile(recordPath, "utf8"));
+  assert.equal(record.phase, "native_handover");
+  assert.equal(record.code, "native_handover_blocked");
+});
+
+test("early diagnostics preserve failure evidence when a real migration target is occupied", async (t) => {
+  const state = await fixture();
+  t.after(() => state.dispose());
+  const calls = [];
+  await privateFile(join(state.userDataRoot, "desktop-settings", "unrelated.json"), "retain-me");
+  const diagnostics = createDesktopStartupDiagnostics({
+    app: { getPath: () => state.userDataRoot, getVersion: () => "0.1.24" },
+  });
+  assert.equal(await diagnostics.start(), true);
+  diagnostics.mark("native_handover");
+  await assert.rejects(runNativeElectronHandover(migrationOptions(state, calls)),
+    { code: "native_electron_handover_target_exists" });
+  assert.deepEqual(calls, []);
+  assert.equal(await diagnostics.stop("native_handover_blocked"), true);
+  const record = JSON.parse(await readFile(join(state.userDataRoot,
+    "startup-diagnostics", DESKTOP_STARTUP_DIAGNOSTIC_FILE), "utf8"));
+  assert.equal(record.outcome, "stopped");
+  assert.equal(record.code, "native_handover_blocked");
+  assert.equal(await readFile(join(state.userDataRoot, "desktop-settings", "unrelated.json"), "utf8"), "retain-me");
 });

@@ -335,10 +335,13 @@ test("unsafe or missing index paths fail without creating a database, salt or de
 
 test("ephemeral metadata is projected afresh and malformed names or parents cannot broaden links", async (t) => {
   const f = await fixture(t);
-  const result = await f.run({ readThreadMetadata: async () => new Map([
-    [ROOT, { id: ROOT, name: "<b>Synthetic title</b>", nickname: "invalid\nname", parent: { id: ROOT, name: "self" }, url: "https://invalid.test" }],
-    [WORKER, { id: WORKER, name: "x".repeat(513), nickname: "x".repeat(81), parent: { id: "not-a-uuid", name: "bad" } }],
-  ]) });
+  const result = await f.run({ readThreadMetadata: async (_home, _ids, options) => {
+    assert.deepEqual(options, { forCacheDropLinks: true });
+    return new Map([
+      [ROOT, { id: ROOT, name: "<b>Synthetic title</b>", nickname: "invalid\nname", parent: { id: ROOT, name: "self" }, url: "https://invalid.test" }],
+      [WORKER, { id: WORKER, name: "x".repeat(513), nickname: "x".repeat(81), parent: { id: "not-a-uuid", name: "bad" } }],
+    ]);
+  } });
   assert.deepEqual(result.entries[0].thread, { id: ROOT, name: "<b>Synthetic title</b>", nickname: null, parent: null });
   assert.deepEqual(result.entries[1].thread, { id: WORKER, name: null, nickname: null, parent: null });
   assert.doesNotMatch(JSON.stringify(result), /invalid.test/u);
@@ -347,7 +350,7 @@ test("ephemeral metadata is projected afresh and malformed names or parents cann
 test("only bounded recent references are queried through timestamp and session indexes", async (t) => {
   const f = await fixture(t);
   let cursor = 0;
-  const recent = (template) => Array.from({ length: 20 }, () => ({
+  const recent = (template) => Array.from({ length: 250 }, () => ({
     ...template(), observedAt: new Date(NOW - (++cursor * 1_000)).toISOString(),
   }));
   const impact = (template) => ({
@@ -383,7 +386,7 @@ test("only bounded recent references are queried through timestamp and session i
     };
   };
   assert.equal((await f.run({ overview, openIndex })).status, "available");
-  assert.equal(reads, 160, "unique references stop at the closed 160-row bound");
+  assert.equal(reads, 2_000, "unique references stop at the closed 2,000-row bound");
 });
 
 test("an oversized session cannot cause an unbounded ordering scan or hide other covered sessions", async (t) => {

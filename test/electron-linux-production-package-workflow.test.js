@@ -77,3 +77,38 @@ test('failed packaging always retains bounded metadata without labeling an insta
  const program=capture.run.slice(capture.run.indexOf("<<'NODE'\n")+9,capture.run.lastIndexOf('\nNODE'));
  const checked=spawnSync(process.execPath,['--input-type=module','--check'],{input:program,encoding:'utf8'});assert.equal(checked.status,0,checked.stderr);
 });
+
+test('final AppImage runtime qualification uses the existing offline normal journey before retention',async()=>{
+ const extract=step('Extract only the verified final AppImage for native runtime qualification');
+ const image=step('Prepare the existing isolated native Linux desktop runtime');
+ const runtime=step('Qualify exact final application startup refresh and cold restart offline');
+ const retain=step('Retain final package and exact source evidence');
+ assert.ok(job.steps.indexOf(step('Package exact receipt and bind final AppImage bytes'))<job.steps.indexOf(extract));
+ assert.ok(job.steps.indexOf(extract)<job.steps.indexOf(image));
+ assert.ok(job.steps.indexOf(image)<job.steps.indexOf(runtime));
+ assert.ok(job.steps.indexOf(runtime)<job.steps.indexOf(retain));
+ assert.match(extract.run,/qualify-electron-linux-final-appimage\.mjs --prepare --source-revision "\$SOURCE_REVISION"/);
+ assert.match(image.run,/build-electron-linux-container\.mjs --architecture amd64/);
+ assert.match(image.run,/containers\/electron-linux-production\/Dockerfile/);
+ assert.match(runtime.run,/timeout 600s docker run --rm --init --platform=linux\/amd64 --cap-add=SYS_ADMIN --network none/);
+ for(const root of ['/home/node','/run/user/1000'])assert.ok(runtime.run.includes(`--tmpfs ${root}:rw,noexec,nosuid,size=128m,uid=1000,gid=1000,mode=0700`));
+ assert.match(runtime.run,/TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED=1/);
+ assert.match(runtime.run,/USAGE_MONITOR_LINUX_NETWORK_BOUNDARY=network-none/);
+ assert.match(runtime.run,/smoke-electron-linux-packaged\.mjs/);
+ assert.match(runtime.run,/--app "\$candidate_root\/final-runtime\/extracted\/squashfs-root\/tibotattle"/);
+ assert.match(runtime.run,/--staged-app "\$candidate_root\/app"/);
+ assert.match(runtime.run,/qualify-electron-linux-final-appimage\.mjs --verify-runtime --source-revision "\$SOURCE_REVISION"/);
+ assert.doesNotMatch(runtime.run,/--privileged|--network host|--mount|--volume|--no-sandbox|--disable-setuid-sandbox|electron-builder|updater-rehearsal/);
+ for(const file of ['final-image-preparation.json','normal-packaged-smoke.json','final-image-runtime.json'])assert.ok(retain.with.path.includes(`final-runtime/${file}`));
+ const docker=await readFile(new URL('../containers/electron-linux-production/Dockerfile',import.meta.url),'utf8');
+ const ignore=await readFile(new URL('../containers/electron-linux-production/Dockerfile.dockerignore',import.meta.url),'utf8');
+ assert.match(docker,/FROM tibotattle-electron-linux-amd64:test/);
+ assert.match(docker,/process\.argv\[1\] !== process\.env\.TIBOTATTLE_IMAGE_SOURCE_REVISION/);
+ assert.match(docker,/COPY \.release-build\/electron-production\/linux-x64\/final-runtime\/extracted\/squashfs-root/);
+ assert.match(docker,/USER node\nENTRYPOINT \["xvfb-run"/);
+ assert.match(docker,/chmod 4755 .*\/chrome-sandbox/);
+ assert.doesNotMatch(docker,/electron-dev|electron-candidates|updater-rehearsal|npm install|pnpm|electron-builder/);
+ assert.ok(ignore.startsWith('*\n'));assert.doesNotMatch(ignore,/!\.git|!\.release-build\/\*\*|!node_modules|!.*AppImage|!.*home/);
+ const base=await readFile(new URL('../containers/electron-linux-amd64/Dockerfile',import.meta.url),'utf8');
+ assert.match(base,/FROM node:26\.2\.0-bookworm-slim@sha256:ba2f9edd0785ee291c1a5287764cb41fdb7922336f878993f9d58622613e67a8/);
+});

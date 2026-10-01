@@ -14,6 +14,7 @@ import {
 import {
   cleanupR7OwnedTree,
   inventoryR7OwnedTree,
+  projectR7DeterministicOperation,
   runR7BenchmarkWorker,
 } from "./r7-resource-benchmark.js";
 import { runR7FilesystemHighWaterSampler } from "./r7-filesystem-high-water.js";
@@ -430,20 +431,6 @@ async function inspectExportedLogicalOutcomes(outputDirectory, parameters) {
   };
 }
 
-function deterministicOperationProjection(operation) {
-  const {
-    durableElapsedMs: _durableElapsedMs,
-    durablePeakRssBytes: _durablePeakRssBytes,
-    ...evidence
-  } = operation.evidence;
-  return {
-    operation: operation.operation,
-    status: operation.status,
-    failureCode: operation.failureCode,
-    evidence,
-  };
-}
-
 function aggregateOperation(operation, filesystem) {
   return {
     name: operation.operation,
@@ -639,7 +626,7 @@ async function runPass(root, fixture, fixtureManifest, configuration, timeoutMs)
   };
   const projection = {
     fixtureManifestSha256: fixtureManifest.manifestSha256,
-    operations: operations.map(deterministicOperationProjection),
+    operations: operations.map(projectR7DeterministicOperation),
     semanticOutcomes,
     preservation,
   };
