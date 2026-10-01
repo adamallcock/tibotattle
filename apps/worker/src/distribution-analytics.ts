@@ -880,6 +880,74 @@ function aggregateAnalytics(
 }
 
 /**
+ * One 24-hour window of raw Cloudflare GraphQL rows. It carries source
+ * addresses and user agents, so it is transient input to
+ * cloudflareDistributionFromSegments only: never log, serialize, persist or
+ * forward it.
+ */
+export type CloudflareDistributionSegment = AnalyticsSegment;
+
+/**
+ * Reads the seven raw analytics windows the Cloudflare aggregate needs. It is
+ * exported separately so an edge caller can start the reads early and reduce
+ * them later with cloudflareDistributionFromSegments; readDistributionAnalytics
+ * is exactly that composition.
+ *
+ * Returns null when the zone id or API token is not configured (no request is
+ * made), and an empty list when any window read fails, which the aggregate
+ * reports as unavailable. It rejects only when nowEpoch is not a valid time.
+ */
+export async function readCloudflareDistributionSegments(
+  zoneId: unknown,
+  apiToken: unknown,
+  nowEpoch: number,
+  fetcher: typeof fetch = fetch,
+): Promise<readonly CloudflareDistributionSegment[] | null> {
+  if (!Number.isFinite(nowEpoch)) throw new Error("invalid analytics time");
+  const configuredZoneId = configuredString(zoneId);
+  const configuredApiToken = configuredString(apiToken);
+  if (configuredZoneId === null || configuredApiToken === null) return null;
+  return Promise.all(
+    analyticsSegments(nowEpoch).map(({ startsAt, endsAt }) =>
+      readAnalyticsSegment(
+        configuredZoneId,
+        configuredApiToken,
+        startsAt,
+        endsAt,
+        fetcher,
+      )),
+  ).catch(() => [] as readonly AnalyticsSegment[]);
+}
+
+/**
+ * Reduces raw analytics windows to the aggregate-only Cloudflare evidence of
+ * the owner overview. currentReleaseTag is the GitHub release tag (for
+ * example "v0.1.23") whose version is counted separately, or null.
+ */
+export function cloudflareDistributionFromSegments(
+  segments: readonly CloudflareDistributionSegment[] | null,
+  currentReleaseTag: string | null,
+): CloudflareDistributionAnalytics {
+  if (segments === null) {
+    return sourceUnavailable(
+      "not_configured",
+      "ANALYTICS_NOT_CONFIGURED",
+    );
+  }
+  if (segments.length !== LOOKBACK_DAYS) {
+    return sourceUnavailable("unavailable", "ANALYTICS_UNAVAILABLE");
+  }
+  try {
+    return aggregateAnalytics(
+      segments,
+      currentReleaseTag === null ? null : releaseVersion(currentReleaseTag),
+    );
+  } catch {
+    return sourceUnavailable("unavailable", "ANALYTICS_UNAVAILABLE");
+  }
+}
+
+/**
  * Reads only aggregate distribution evidence for the Access-protected owner
  * console. Cloudflare source addresses exist only in this function's transient
  * memory and are reduced to counts before the response is returned.
@@ -903,43 +971,20 @@ export async function readDistributionAnalytics(
     };
   }
 
-  const zoneId = configuredString(configuration.cloudflareZoneId);
-  const cloudflareApiToken = configuredString(configuration.cloudflareApiToken);
   const githubPromise = configuration.githubSnapshot === undefined
     ? readGithubDistributionInventory(configuration.githubApiToken, fetcher)
     : Promise.resolve(configuration.githubSnapshot);
-
-  const analyticsPromise = zoneId === null || cloudflareApiToken === null
-    ? Promise.resolve<readonly AnalyticsSegment[] | null>(null)
-    : Promise.all(
-      analyticsSegments(nowEpoch).map(({ startsAt, endsAt }) =>
-        readAnalyticsSegment(
-          zoneId,
-          cloudflareApiToken,
-          startsAt,
-          endsAt,
-          fetcher,
-        )),
-    ).catch(() => [] as readonly AnalyticsSegment[]);
+  const analyticsPromise = readCloudflareDistributionSegments(
+    configuration.cloudflareZoneId,
+    configuration.cloudflareApiToken,
+    nowEpoch,
+    fetcher,
+  );
 
   const [segments, github] = await Promise.all([analyticsPromise, githubPromise]);
-  let cloudflare: CloudflareDistributionAnalytics;
-  if (segments === null) {
-    cloudflare = sourceUnavailable(
-      "not_configured",
-      "ANALYTICS_NOT_CONFIGURED",
-    );
-  } else if (segments.length !== LOOKBACK_DAYS) {
-    cloudflare = sourceUnavailable("unavailable", "ANALYTICS_UNAVAILABLE");
-  } else {
-    try {
-      cloudflare = aggregateAnalytics(
-        segments,
-        github.release === null ? null : releaseVersion(github.release.tag),
-      );
-    } catch {
-      cloudflare = sourceUnavailable("unavailable", "ANALYTICS_UNAVAILABLE");
-    }
-  }
+  const cloudflare = cloudflareDistributionFromSegments(
+    segments,
+    github.release === null ? null : github.release.tag,
+  );
   return { methodology, cloudflare, github };
 }
