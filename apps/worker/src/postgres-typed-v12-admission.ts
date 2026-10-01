@@ -21,13 +21,16 @@ import { sha256, sha256Hex } from "./crypto";
 import { TELEMETRY_CONSENT_VERSION } from "./constants";
 import {
   createPostgresSchemaConfig,
-  PostgresStorageError,
   quotePostgresIdentifier,
   withPostgresMutation,
   type PostgresClient,
   type PostgresPool,
   type PostgresSchemaConfig,
 } from "./postgres-client";
+import {
+  classifyPostgresTelemetryV12StorageError,
+  postgresTelemetryV12StorageFailure,
+} from "./postgres-telemetry-v12-storage-refusal";
 import {
   decodeTelemetryV12Record,
   encodeTelemetryV12Record,
@@ -194,16 +197,17 @@ function currentTime(epoch: number): Date {
   return new Date(epoch);
 }
 
+// Classify the raw driver failure inside the transaction helper, before it is
+// normalized: reviewed trigger refusals, telemetry_v12 unique keys and
+// concurrent writers stay 409; any other constraint failure is the paced 503.
 function safeStorageError(error: unknown): Error | null {
-  return error instanceof ApiError ? error : null;
+  return classifyPostgresTelemetryV12StorageError(error);
 }
 
+// Every other failure (commit-uncertain, begin, release, rollback, or a
+// sanitized storage error) is an unpaced 503; nothing here throws a non-ApiError.
 function stagingError(error: unknown): never {
-  if (error instanceof ApiError) throw error;
-  if (error instanceof PostgresStorageError && error.code === "conflict") {
-    throw new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
-  }
-  throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+  throw postgresTelemetryV12StorageFailure(error);
 }
 
 async function runtimeRow(client: PostgresClient, schema: string): Promise<RuntimeRow> {
