@@ -149,4 +149,26 @@ test("Worker migration receipt source is generated exactly from canonical SQL", 
     ),
     true,
   );
+  // Wave-1 promotion (claude/gcp-fastpath-base): primary 0047-0058 and ledger
+  // 0007 moved from staged-migrations/ unchanged, so the runtime receipt
+  // fences the whole promoted chain.
+  for (const migration of [
+    '"0047_host_diagnostic_errors.sql"',
+    '"0048_rate_limit_buckets_unlogged.sql"',
+    '"0049_lifecycle_readiness_state.sql"',
+    '"0050_admin_audit_and_collection_controls.sql"',
+    '"0051_transport_floor_parity.sql"',
+    '"0052_typed_telemetry_live_allocators.sql"',
+    '"0053_community_publication_authority.sql"',
+    '"0054_signin_handoff_claim_shape.sql"',
+    '"0055_v12_owner_bridge.sql"',
+    '"0056_production_transfer_control.sql"',
+    '"0057_upload_path_analytics_retirement.sql"',
+    '"0058_owner_journal_emitter_head_precheck.sql"',
+    '"0007_production_transfer_control.sql"',
+  ]) {
+    assert.equal(renderPostgresRuntimeSchema(manifest).includes(migration), true);
+  }
+  assert.equal(manifest.roles.primary.length, 58);
+  assert.equal(manifest.roles.ledger.length, 7);
 });

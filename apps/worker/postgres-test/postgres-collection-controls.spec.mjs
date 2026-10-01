@@ -6,11 +6,8 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import pg from "pg";
 import { createServer } from "vite";
-import {
-  applyPostgresMigrations,
-  readPostgresMigrations,
-  renderPostgresSearchPath,
-} from "../scripts/postgres-migrations.mjs";
+import { renderPostgresSearchPath } from "../scripts/postgres-migrations.mjs";
+import { applyMigrationsBefore } from "./promoted-migration-prefix.mjs";
 
 const PG_TEST_HOST = process.env.PG_TEST_HOST;
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
@@ -19,11 +16,10 @@ const PG_TEST_USER = process.env.PG_TEST_USER ?? "postgres";
 const PG_TEST_DATABASE = process.env.PG_TEST_DATABASE ?? "postgres";
 const PG_TEST_PASSWORD = process.env.PG_TEST_PASSWORD;
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const STAGED_VERSION = 50;
-const STAGED_PATH = resolve(
-  WORKER_ROOT,
-  "postgres/staged-migrations/primary/0050_admin_audit_and_collection_controls.sql",
-);
+// 0050 is promoted (claude/gcp-fastpath-base): each schema receives the
+// promoted chain below 0050, then the promoted 0050 file itself.
+const STAGED_NAME = "0050_admin_audit_and_collection_controls.sql";
+const STAGED_PATH = resolve(WORKER_ROOT, "postgres/migrations/primary", STAGED_NAME);
 const CONTROL_NAMES = ["enrollment", "uploadRegistration", "processing", "publication"];
 const PG_FLAG_COLUMNS = {
   enrollment: "enrollment_enabled",
@@ -237,16 +233,15 @@ async function connectPool(endpoint) {
 }
 
 /**
- * Apply the stock primary migrations, then the staged 0050 file in one
- * transaction under the runner's search_path guard (the pre-harness recipe).
+ * Apply the promoted primary migrations below 0050, then the promoted 0050
+ * file in one transaction under the runner's search_path guard.
  */
 async function createSchema(pool, schema, created, { beforeStaged, staged = true } = {}) {
   await pool.query(`CREATE SCHEMA "${schema}"`);
   created.push(schema);
-  const stock = await readPostgresMigrations({ role: "primary" });
-  assert.ok(stock.every((migration) => migration.version < STAGED_VERSION),
-    "0050 is promoted: switch this spec to the staged-migration harness");
-  assert.equal((await applyPostgresMigrations({ role: "primary", schema, pool })).applied, stock.length);
+  const before = await applyMigrationsBefore({ role: "primary", schema, pool, name: STAGED_NAME });
+  assert.equal(before.target.version, 50);
+  assert.equal(before.applied, before.prefix.length);
   if (beforeStaged !== undefined) await beforeStaged(schema);
   if (staged) await applyStagedMigration(pool, schema);
 }

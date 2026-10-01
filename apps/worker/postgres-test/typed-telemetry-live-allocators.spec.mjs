@@ -6,11 +6,8 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { createServer } from "vite";
 import pg from "pg";
-import {
-  applyPostgresMigrations,
-  readPostgresMigrations,
-  renderPostgresSearchPath,
-} from "../scripts/postgres-migrations.mjs";
+import { renderPostgresSearchPath } from "../scripts/postgres-migrations.mjs";
+import { applyMigrationsBefore } from "./promoted-migration-prefix.mjs";
 import {
   createSyntheticD1TypedLegacyFixtureSource,
   POSTGRES_TYPED_LEGACY_CONTROL_SCHEMA_PREFIX,
@@ -24,8 +21,10 @@ const PG_TEST_USER = process.env.PG_TEST_USER ?? "postgres";
 const PG_TEST_PASSWORD = process.env.PG_TEST_PASSWORD ?? "synthetic-local-only";
 const PG_TEST_DATABASE = process.env.PG_TEST_DATABASE ?? "postgres";
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const STAGED_MIGRATION = join(WORKER_ROOT, "postgres", "staged-migrations", "primary",
-  "0052_typed_telemetry_live_allocators.sql");
+// 0052 is promoted (claude/gcp-fastpath-base): schemas receive the promoted
+// chain below 0052, then the promoted 0052 file in one bounded transaction.
+const STAGED_MIGRATION_NAME = "0052_typed_telemetry_live_allocators.sql";
+const STAGED_MIGRATION = join(WORKER_ROOT, "postgres", "migrations", "primary", STAGED_MIGRATION_NAME);
 const STAGED_TIMEOUT_MILLISECONDS = 30_000;
 const STAGED_LOCK_TIMEOUT_MILLISECONDS = 5_000;
 const MAX_TYPED_ID = 9_007_199_254_740_991n;
@@ -85,17 +84,16 @@ async function stagedSql() {
 }
 
 /**
- * Stock migrations, then the staged file in one bounded transaction (the CR-1 harness shape).
- * On promotion this spec applies 0052 through applyPostgresMigrations instead, and every
- * primary migration count and tail pin in the Worker moves with it (plan integrationChecklist:
- * "update every tail pin"); grep the current tail filename and count rather than trusting a list.
+ * The promoted migrations below 0052, so the spec can prove the pre-0052 state;
+ * applyStagedMigration then applies the promoted 0052 file in one bounded
+ * transaction (the CR-1 harness shape).
  */
 async function applyStockMigrations(pool, schema) {
-  const stock = await readPostgresMigrations({ role: "primary" });
-  const applied = await applyPostgresMigrations({ role: "primary", schema, pool });
-  assert.equal(applied.applied, stock.length);
-  assert.equal(stock.some((migration) => migration.name.endsWith("_typed_telemetry_live_allocators.sql")), false,
-    "the allocator migration is still staged in this checkout");
+  const before = await applyMigrationsBefore({ role: "primary", schema, pool, name: STAGED_MIGRATION_NAME });
+  assert.equal(before.target.version, 52);
+  assert.equal(before.applied, before.prefix.length);
+  assert.equal(before.prefix.some((migration) => migration.name.endsWith("_typed_telemetry_live_allocators.sql")), false,
+    "the allocator migration is not part of the prefix");
 }
 
 async function applyStagedMigration(pool, schema) {

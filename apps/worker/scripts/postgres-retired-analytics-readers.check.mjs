@@ -58,11 +58,17 @@ export const ALLOWED_MENTIONS = Object.freeze([
   ["scripts/postgres-analytics-applied-main-transfer.mjs", "community_model_composition_days", "inventory", 1],
   ["src/postgres-analytics-owner-retirement.ts", "preview_cache", "reference", 2],
   ["src/postgres-analytics-owner-retirement.ts", "community_model_composition_days", "reference", 2],
+  // PT-1 transfer emptiness list: 0057 keeps these seeded singletons, and a
+  // fresh transfer target counts them as empty only through SEEDED_SINGLETONS.
+  ["scripts/postgres-transfer-target.mjs", "current_queue_state", "inventory", 1],
+  ["scripts/postgres-transfer-target.mjs", "preparation_counters", "inventory", 1],
 ].map(([file, table, kind, max]) => Object.freeze({ file, table, kind, max })));
 
 const IDENTIFIER_LIST_LINE = /^\s*[a-z0-9_]+(?:\s+[a-z0-9_]+)*\s*$/u;
 const COUNT_BOUND_LINE = (table) => new RegExp(`^\\s*${table}:\\s*\\[\\d+,\\s*\\d+\\],?\\s*$`, "u");
 const STRING_ELEMENT_LINE = (table) => new RegExp(`^\\s*["']${table}["'],?\\s*$`, "u");
+const SEEDED_ENTRY_LINE = (table) =>
+  new RegExp(`^\\s*seeded\\(["'](?:primary|ledger)["'],\\s*["']${table}["'](?:,\\s*\\d+)?\\),?\\s*$`, "u");
 const POSTGRES_CONTENT = /\bfrom\s+["']pg["']|\bquotePostgresIdentifier\b|\brenderPostgresSearchPath\b|\bPostgresClient\b/u;
 
 function mentionPattern(table) {
@@ -75,13 +81,15 @@ export function isPostgresModule(file, source) {
 }
 
 /**
- * Classify one line's mention. Only three whole-line shapes are inventory: a
+ * Classify one line's mention. Only four whole-line shapes are inventory: a
  * line of bare table names (the erasers' Set literals), a `name: [min, max]`
- * count bound, and a lone quoted array element. Anything else — SQL text, a
- * table helper call, a template — is a reference.
+ * count bound, a lone quoted array element, and a lone
+ * `seeded("<role>", "<table>"[, rows])` transfer emptiness-list entry. Anything
+ * else — SQL text, a table helper call, a template — is a reference.
  */
 export function classifyMention(line, table) {
-  if (IDENTIFIER_LIST_LINE.test(line) || COUNT_BOUND_LINE(table).test(line) || STRING_ELEMENT_LINE(table).test(line)) {
+  if (IDENTIFIER_LIST_LINE.test(line) || COUNT_BOUND_LINE(table).test(line) || STRING_ELEMENT_LINE(table).test(line)
+      || SEEDED_ENTRY_LINE(table).test(line)) {
     return "inventory";
   }
   return "reference";
@@ -248,6 +256,26 @@ test("the scanner flags doctored sources: a SQL read, an unlisted inventory and 
   // Shrinking one kind never licenses another: a sweep reference is not an inventory entry.
   assert.match(retiredMentionViolations(new Map([["src/postgres-analytics-owner-retirement.ts",
     "const KEEP = new Set([\n  \"preview_cache\",\n]);\n"]]), sweep).join("\n"), /inventory of retired preview_cache is not allowed/u);
+
+  // A lone seeded("<role>", "<table>") transfer emptiness entry is an
+  // inventory; it still needs its own allowlist entry, and any other use of
+  // the seeded helper (or SQL on the same line) stays a reference.
+  const seeded = [{ file: "scripts/postgres-transfer-target.mjs", table: "current_queue_state", kind: "inventory", max: 1 }];
+  assert.equal(classifyMention('  seeded("primary", "current_queue_state"),', "current_queue_state"), "inventory");
+  assert.equal(classifyMention('  seeded("ledger", "preparation_counters", 2),', "preparation_counters"), "inventory");
+  assert.deepEqual(retiredMentionViolations(new Map([["scripts/postgres-transfer-target.mjs",
+    'const S = [\n  seeded("primary", "current_queue_state"),\n];\n']]), seeded), []);
+  assert.match(retiredMentionViolations(new Map([["scripts/postgres-transfer-target.mjs",
+    'const S = [\n  seeded("primary", "current_queue_state"),\n  seeded("primary", "refresh_lanes"),\n];\n']]), seeded)
+    .join("\n"), /inventory of retired refresh_lanes is not allowed/u);
+  for (const line of [
+    '  seeded("primary", "current_queue_state").table + await client.query("SELECT 1"),',
+    '  seeded("public", "current_queue_state"),',
+    '  seeded(role, "current_queue_state"),',
+    '  await client.query(`DELETE FROM current_queue_state`); seeded("primary", "current_queue_state"),',
+  ]) {
+    assert.equal(classifyMention(line, "current_queue_state"), "reference", line);
+  }
 
   // D1 modules share two projection names and are not PostgreSQL modules.
   const d1 = new Map([["src/community-model-history.ts",

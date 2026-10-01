@@ -259,18 +259,24 @@ test("a missing number or a late run start fails MIGRATION_NUMBER_GAP", async ()
 
 test("staged migrations continue the promoted role without reusing its numbers", async () => {
   await withWorkerCopy(["postgres/migrations/primary", "postgres/migrations/ledger"], async (root) => {
+    // Numbers are relative to the promoted primary tail, so promotions never
+    // turn this fixture into a collision with a real promoted file.
+    const promoted = (await sqlFiles(join(root, "postgres", "migrations", "primary")))
+      .map((name) => Number(MIGRATION_FILE_PATTERN.exec(name)?.[1]));
+    const tail = Math.max(...promoted);
+    assert.ok(Number.isSafeInteger(tail) && tail >= 46, "the copy carries the promoted primary chain");
     const staged = join(root, "postgres", "staged-migrations", "primary");
     await mkdir(staged, { recursive: true });
-    await writeFile(join(staged, "0047_synthetic_staged.sql"), "-- synthetic\n");
-    await writeFile(join(staged, "0048_synthetic_staged.sql"), "-- synthetic\n");
+    await writeFile(join(staged, `${pad(tail + 1)}_synthetic_staged.sql`), "-- synthetic\n");
+    await writeFile(join(staged, `${pad(tail + 2)}_synthetic_staged.sql`), "-- synthetic\n");
     assert.deepEqual((await inspectMigrationNumbering(root)).failures, [],
       "a staged run may start after numbers promoted in other worktrees");
 
-    await writeFile(join(staged, "0050_synthetic_staged.sql"), "-- synthetic\n");
+    await writeFile(join(staged, `${pad(tail + 4)}_synthetic_staged.sql`), "-- synthetic\n");
     assert.deepEqual(codes(await inspectMigrationNumbering(root)), ["MIGRATION_NUMBER_GAP"]);
-    await rm(join(staged, "0050_synthetic_staged.sql"));
+    await rm(join(staged, `${pad(tail + 4)}_synthetic_staged.sql`));
 
-    await writeFile(join(staged, "0045_synthetic_reuse.sql"), "-- synthetic\n");
+    await writeFile(join(staged, `${pad(tail - 1)}_synthetic_reuse.sql`), "-- synthetic\n");
     const result = await inspectMigrationNumbering(root);
     assert.ok(codes(result).includes("MIGRATION_NUMBER_DUPLICATE"));
     assert.equal(result.failures.find(({ code }) => code === "MIGRATION_NUMBER_DUPLICATE").promoted,

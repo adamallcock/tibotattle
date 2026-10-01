@@ -65,7 +65,7 @@ test("PostgreSQL ledger tombstones preserve retention and pending erasure author
     await pool.query(`CREATE SCHEMA "${schema}"`);
     schemaCreated = true;
     const migrations = await applyPostgresMigrations({ role: "ledger", schema, pool });
-    assert.equal(migrations.applied, 6);
+    assert.equal(migrations.applied, 7);
 
     vite = await createServer({
       root: new URL("..", import.meta.url).pathname,

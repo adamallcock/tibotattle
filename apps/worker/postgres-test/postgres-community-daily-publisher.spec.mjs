@@ -120,8 +120,11 @@ describe.skipIf(!PG_TEST_SOCKET && !PG_TEST_HOST)("PostgreSQL explicit-day commu
       VALUES ($1,0,0)`, [SOURCE_ID]);
     await pool.query(`UPDATE ${sqlSchema}.publication_state SET publication_state='ready',policy_revision=1
       WHERE singleton=1`);
+    // Primary 0050: 'operational' means all four flags on, and reason_code is
+    // NOT NULL in the D1 vocabulary.
     await pool.query(`UPDATE ${sqlSchema}.collection_controls SET revision=revision+1,
-      control_state='operational', publication_enabled=true, reason_code=NULL,
+      control_state='operational', enrollment_enabled=true, upload_registration_enabled=true,
+      processing_enabled=true, publication_enabled=true, reason_code='maintenance',
       updated_at=clock_timestamp() WHERE singleton=1`);
   }, 120_000);
 

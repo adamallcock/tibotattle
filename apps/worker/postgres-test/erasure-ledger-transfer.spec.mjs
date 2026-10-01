@@ -123,7 +123,7 @@ test("PG17 reconciles a sealed D1 erasure ledger with resumable, fail-closed par
 
     temporaryDirectory = await mkdtemp(join(tmpdir(), "tibotattle-erasure-ledger-migrations-"));
     const migrations = await readPostgresMigrations({ role: "ledger" });
-    assert.equal(migrations.at(-1)?.name, "0006_erasure_ledger_transfer_receipts.sql");
+    assert.equal(migrations.at(-1)?.name, "0007_production_transfer_control.sql");
 
     await pool.query(`CREATE SCHEMA "${invalidSchema}"`);
     schemas.push(invalidSchema);
@@ -149,7 +149,7 @@ test("PG17 reconciles a sealed D1 erasure ledger with resumable, fail-closed par
     await pool.query(`CREATE SCHEMA "${goodSchema}"`);
     schemas.push(goodSchema);
     const applied = await applyPostgresMigrations({ role: "ledger", schema: goodSchema, pool });
-    assert.equal(applied.applied, 6);
+    assert.equal(applied.applied, 7);
     sourceFixture = await makeSealedSource();
     source = await createSealedSqliteErasureLedgerSource(sourceFixture);
 

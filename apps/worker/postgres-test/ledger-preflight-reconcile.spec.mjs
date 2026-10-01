@@ -66,7 +66,7 @@ test("PG17 inspect is read-only and exact candidate reopens 15 jobs for ledger m
     directory = await mkdtemp(join(tmpdir(), "tibotattle-ledger-reconcile-pg17-"));
     const migrations = await readPostgresMigrations({ role: "ledger" });
     const manifest = await buildPostgresMigrationManifest();
-    assert.equal(migrations.length, 6);
+    assert.equal(migrations.length, 7);
     assert.equal((await applyLedgerPrefix(pool, ledgerSchema, directory, migrations)).applied, 5);
 
     const rows = Array.from({ length: 15 }, (_, index) => ({
@@ -142,9 +142,9 @@ test("PG17 inspect is read-only and exact candidate reopens 15 jobs for ledger m
       assert.equal((await pool.query(`SELECT generation::text FROM "${ledgerSchema}".storage_erasure_ledger_generation`)).rows[0]?.generation, "45");
 
       const migrated = await applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool });
-      assert.equal(migrated.applied, 6);
+      assert.equal(migrated.applied, 7);
       const history = await pool.query(`SELECT count(*)::int AS count FROM "${ledgerSchema}"._tibotattle_migration_history`);
-      assert.equal(history.rows[0]?.count, 6);
+      assert.equal(history.rows[0]?.count, 7);
       await assert.rejects(pool.query(`DELETE FROM "${ledgerSchema}".deletion_tombstones
         WHERE participant_digest=$1`, [rows[0].participant]), (error) => error?.code === "P1005");
     } finally {

@@ -14,6 +14,7 @@ export default defineConfig({
       "postgres-test/postgres-ingestion-journal-transfer.spec.mjs",
       "postgres-test/postgres-analytics-applied-transfer.spec.mjs",
       "postgres-test/postgres-analytics-applied-main-transfer.spec.mjs",
+      "postgres-test/d1-analytics-export-oracle.spec.mjs",
     ],
     fileParallelism: false,
   },

@@ -115,8 +115,11 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL private community daily HTTP route"
       VALUES ($1,0,0)`, [SOURCE_ID]);
     await pool.query(`UPDATE ${quotedSchema}.publication_state SET publication_state='ready',policy_revision=1
       WHERE singleton=1`);
+    // Primary 0050: 'operational' means all four flags on, and reason_code is
+    // NOT NULL in the D1 vocabulary.
     await pool.query(`UPDATE ${quotedSchema}.collection_controls SET revision=revision+1,
-      control_state='operational', publication_enabled=true, reason_code=NULL,
+      control_state='operational', enrollment_enabled=true, upload_registration_enabled=true,
+      processing_enabled=true, publication_enabled=true, reason_code='maintenance',
       updated_at=clock_timestamp() WHERE singleton=1`);
   }, 120_000);
 
@@ -157,7 +160,9 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL private community daily HTTP route"
     const ready = await readPostgresCommunityDailyTestPreflight(pool, config);
     expect(ready).toMatchObject({ status: "ready", blockers: [] });
 
+    // Primary 0050: 'contained' means all four flags off.
     await pool.query(`UPDATE ${quotedSchema}.collection_controls SET control_state='contained',
+      enrollment_enabled=false, upload_registration_enabled=false, processing_enabled=false,
       publication_enabled=false WHERE singleton=1`);
     const blockedControls = await readPostgresCommunityDailyTestPreflight(pool, config);
     expect(blockedControls).toMatchObject({

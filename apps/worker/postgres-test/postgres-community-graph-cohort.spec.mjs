@@ -133,7 +133,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph cohort inventory", 
       SET publication_state='ready' WHERE singleton=1`);
     await pool.query(`UPDATE ${sqlSchema}.collection_controls SET revision=revision+1,
       control_state='operational', enrollment_enabled=true, upload_registration_enabled=true,
-      processing_enabled=true, publication_enabled=true, reason_code=NULL,
+      processing_enabled=true, publication_enabled=true, reason_code='maintenance',
       updated_at=clock_timestamp() WHERE singleton=1`);
     await pool.query(`UPDATE ${sqlSchema}.telemetry_v12_runtime SET state='active', changed_at=$1 WHERE id=1`, [now]);
     await pool.query(`UPDATE ${sqlSchema}.telemetry_v12_typed_runtime SET state='active', changed_at=$1 WHERE id=1`, [now]);

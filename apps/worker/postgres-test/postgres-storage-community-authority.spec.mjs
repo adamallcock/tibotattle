@@ -252,7 +252,7 @@ async function setControls(pool, table, state) {
   const on = state === "operational";
   await pool.query(`UPDATE ${table("collection_controls")} SET revision=revision+1,control_state=$1,
       enrollment_enabled=$2,upload_registration_enabled=$2,processing_enabled=$2,publication_enabled=$2,
-      reason_code=NULL,updated_at=clock_timestamp() WHERE singleton=1`, [state, on]);
+      reason_code='maintenance',updated_at=clock_timestamp() WHERE singleton=1`, [state, on]);
 }
 
 async function bootstrapRow(pool, table) {

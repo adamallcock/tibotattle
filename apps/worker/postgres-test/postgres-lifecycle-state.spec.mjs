@@ -6,15 +6,17 @@ import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
 import pg from "pg";
 import { createServer } from "vite";
-import { applyPostgresMigrations, renderPostgresSearchPath } from "../scripts/postgres-migrations.mjs";
+import { renderPostgresSearchPath } from "../scripts/postgres-migrations.mjs";
+import { applyMigrationsBefore } from "./promoted-migration-prefix.mjs";
 
 /*
- * PostgreSQL 17 qualification for the staged lifecycle readiness state
- * (postgres/staged-migrations/primary/0049_lifecycle_readiness_state.sql) and
- * its shared readers (src/postgres-lifecycle-state.ts). Until the
- * staged-migration harness exists, each schema receives the stock primary
- * migrations and then the staged file in one transaction under the migration
- * runner's search path and timeouts. Every row is synthetic and content-free.
+ * PostgreSQL 17 qualification for the lifecycle readiness state
+ * (postgres/migrations/primary/0049_lifecycle_readiness_state.sql, promoted on
+ * claude/gcp-fastpath-base) and its shared readers
+ * (src/postgres-lifecycle-state.ts). Each schema receives the promoted primary
+ * migrations below 0049 and then the 0049 file in one transaction under the
+ * migration runner's search path and timeouts. Every row is synthetic and
+ * content-free.
  */
 
 const PG_TEST_HOST = process.env.PG_TEST_HOST;
@@ -25,7 +27,8 @@ const PG_TEST_PASSWORD = process.env.PG_TEST_PASSWORD || "synthetic-local-only";
 const PG_TEST_DATABASE = process.env.PG_TEST_DATABASE || "postgres";
 const SKIP = !PG_TEST_HOST && !PG_TEST_SOCKET;
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const STAGED_0049 = join(WORKER_ROOT, "postgres", "staged-migrations", "primary", "0049_lifecycle_readiness_state.sql");
+const STAGED_0049_NAME = "0049_lifecycle_readiness_state.sql";
+const STAGED_0049 = join(WORKER_ROOT, "postgres", "migrations", "primary", STAGED_0049_NAME);
 const MODULE = "/src/postgres-lifecycle-state.ts";
 const CLIENT_MODULE = "/src/postgres-client.ts";
 const CANONICAL_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
@@ -145,7 +148,7 @@ async function applyStaged(pool, schema) {
 }
 
 /**
- * Run `body` against a fresh schema at the stock primary head. `beforeStaged`
+ * Run `body` against a fresh schema at the promoted head below 0049. `beforeStaged`
  * shapes the pre-0049 row; 0049 is then applied unless `staged` is false.
  * Only schemas created here are dropped.
  */
@@ -165,9 +168,10 @@ async function withSchema(body, { staged = true, beforeStaged } = {}) {
   };
   await pool.query(`CREATE SCHEMA ${quoted(schema)}`);
   try {
-    await applyPostgresMigrations({ role: "primary", schema, pool });
+    const before = await applyMigrationsBefore({ role: "primary", schema, pool, name: STAGED_0049_NAME });
+    assert.equal(before.target.version, 49);
     const pre = await pool.query("SELECT to_regclass($1) AS relation", [`${quoted(schema)}.quarantine_reconciliation_state`]);
-    assert.equal(pre.rows[0].relation, null, "the stock head has no reconciliation singleton");
+    assert.equal(pre.rows[0].relation, null, "the head below 0049 has no reconciliation singleton");
     if (beforeStaged) await beforeStaged({ pool, schema, table });
     if (staged) await applyStaged(pool, schema);
     await body({ pool, schema, table, scratch });

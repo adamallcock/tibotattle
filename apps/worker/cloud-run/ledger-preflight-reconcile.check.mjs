@@ -58,7 +58,7 @@ function stableOperationId(participantDigest) {
 }
 
 function expectedMigrations() {
-  return Array.from({ length: 6 }, (_, index) => ({
+  return Array.from({ length: 7 }, (_, index) => ({
     role: "ledger",
     version: index + 1,
     name: `${String(index + 1).padStart(4, "0")}_migration_${index + 1}.sql`,
@@ -434,6 +434,6 @@ test("bundled reconciliation manifest uses the pinned runtime migration director
   const bundled = await import(new URL("./dist/ledger-preflight-reconcile.mjs", import.meta.url));
   const workerMigrations = new URL("../postgres/migrations", import.meta.url).pathname;
   const manifest = await bundled.buildLedgerPreflightReconcileManifest({ rootDirectory: workerMigrations });
-  assert.equal(manifest.roles.ledger.length, 6);
+  assert.equal(manifest.roles.ledger.length, 7);
   assert.equal(manifest.roles.ledger[4]?.name, "0005_readiness_generation.sql");
 });
