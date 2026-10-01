@@ -263,7 +263,7 @@ export async function seedSyntheticV12Fixture({
   const pairingId = randomUUIDImpl();
   const deviceId = randomUUIDImpl();
   const ownerDigest = randomBytesImpl(32).toString("hex");
-  const enrollmentNamespace = randomBytesImpl(32).toString("hex");
+  const proposedEnrollmentNamespace = randomBytesImpl(32).toString("hex");
   const deviceSecret = randomBytesImpl(32).toString("base64url");
   const nowIso = now.toISOString();
   const expiresAt = new Date(now.getTime() + 7 * 24 * 60 * 60_000).toISOString();
@@ -279,12 +279,27 @@ export async function seedSyntheticV12Fixture({
        ) VALUES ($1, 'social', 'active', $2, $3, $3)`,
       [participantId, TELEMETRY_CONSENT_VERSION, nowIso],
     );
-    await client.query(
-      `INSERT INTO ${primary("attribution_enrollments")} (
-         participant_id, namespace, created_at
-       ) VALUES ($1, $2, $3)`,
-      [participantId, enrollmentNamespace, nowIso],
+    // From primary 0051 (D1 parity) the social participant insert creates the
+    // attribution enrollment itself; earlier targets need it written here.
+    // Either way the fixture uses the namespace the target holds.
+    const enrollment = await client.query(
+      `WITH inserted AS (
+         INSERT INTO ${primary("attribution_enrollments")} (
+           participant_id, namespace, created_at
+         ) VALUES ($1, $2, $3)
+         ON CONFLICT (participant_id) DO NOTHING
+         RETURNING namespace
+       )
+       SELECT namespace FROM inserted
+       UNION ALL
+       SELECT namespace FROM ${primary("attribution_enrollments")}
+        WHERE participant_id = $1 AND NOT EXISTS (SELECT 1 FROM inserted)`,
+      [participantId, proposedEnrollmentNamespace, nowIso],
     );
+    const enrollmentNamespace = enrollment?.rows?.[0]?.namespace;
+    if (enrollment?.rows?.length !== 1 || !/^[0-9a-f]{64}$/u.test(enrollmentNamespace ?? "")) {
+      fail("SMOKE_FIXTURE_SEED_FAILED");
+    }
     await client.query(
       `INSERT INTO ${primary("web_sessions")} (
          id, participant_id, secret_hash, csrf_hash, issued_at, expires_at, last_used_at

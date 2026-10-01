@@ -635,7 +635,12 @@ test("PG17 capture pins the D1 authority, fails closed and uses the journal maxi
       assert.equal((await capture(client, schema, { retirement: true })).sequence, last);
       await pool.query(`UPDATE ${table("community_public_source_bootstrap")} SET completed=1`);
 
-      // An inconsistent control row is the Worker's controls failure.
+      // An inconsistent control row is the Worker's controls failure. Primary
+      // 0050 refuses to store one, so the reader is proven against a row
+      // written after dropping that check in this disposable schema.
+      await assert.rejects(pool.query(`UPDATE ${table("collection_controls")} SET enrollment_enabled=false WHERE singleton=1`),
+        (error) => error?.code === "23514" && error?.constraint === "collection_controls_state_flags_check");
+      await pool.query(`ALTER TABLE ${table("collection_controls")} DROP CONSTRAINT collection_controls_state_flags_check`);
       await pool.query(`UPDATE ${table("collection_controls")} SET enrollment_enabled=false WHERE singleton=1`);
       await assert.rejects(capture(client, schema), apiError("COLLECTION_CONTROL_UNAVAILABLE"));
       await assert.rejects(capture(client, "Invalid-Schema"), unavailable);

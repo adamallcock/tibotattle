@@ -47,6 +47,23 @@ function randomDigest() {
   return randomBytes(32).toString("hex");
 }
 
+/** One statement with user triggers suspended, for a row stored before primary 0051. */
+async function withTriggersSuspended(pool, statement) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SET LOCAL session_replication_role = replica");
+    const result = await statement(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function seedAccountlessOwner(pool, schema, supplied = {}) {
   const participantId = supplied.participantId ?? `participant:${randomUUID()}`;
   const deviceId = supplied.deviceId ?? randomUUID();
@@ -76,6 +93,17 @@ async function seedAccountlessOwner(pool, schema, supplied = {}) {
        secret_hash,state,issued_at,expires_at,last_used_at,revoked_at,social_verified_at
      ) VALUES ($1,$2,'accountless',NULL,$1,$3,'active',$4,$5,$4,NULL,NULL)`,
     [deviceId, participantId, secretHash, now, later],
+  );
+  // Primary 0051 (D1 parity) admits a v1 chunk by its device floor alone and a
+  // v1.1 consent only for a social participant. This accountless owner carries
+  // the pre-parity v1 and v1.1 history the eraser must still remove, so its
+  // device gets a v1.0 floor (rank 10) and its v1.1 consent row is written
+  // with triggers suspended, as a row stored before 0051 would be.
+  await pool.query(
+    `INSERT INTO ${q(schema, "telemetry_transport_device_floors")} (
+       participant_id,device_id,minimum_rank,revision,changed_at
+     ) VALUES ($1,$2,10,0,$3)`,
+    [participantId, deviceId, now],
   );
   await pool.query(
     `INSERT INTO ${q(schema, "accountless_upload_owners")} (
@@ -110,14 +138,14 @@ async function seedAccountlessOwner(pool, schema, supplied = {}) {
        'ongoing-privacy-safe-telemetry-v1.0',$3)`,
     [participantId, deviceId, now],
   );
-  await pool.query(
+  await withTriggersSuspended(pool, (client) => client.query(
     `INSERT INTO ${q(schema, "telemetry_v11_device_consents")} (
        participant_id,device_id,telemetry_schema_version,field_dictionary_version,
        privacy_contract_version,consented_at
      ) VALUES ($1,$2,'telemetry-contribution-v1.1','telemetry-v1.1-registry-2026-08-31.1',
        'ongoing-privacy-safe-telemetry-v1.1',$3)`,
     [participantId, deviceId, now],
-  );
+  ));
   await pool.query(
     `INSERT INTO ${q(schema, "telemetry_v12_device_capabilities")} (
        participant_id,device_id,telemetry_schema_version,field_dictionary_version,
@@ -449,11 +477,13 @@ async function createSchema(pool, schema, role = "primary") {
 }
 
 async function seedCompletedImportClaim(pool, schema, fixture) {
+  // The 0042 permit needs 'degraded' with enrollment and publication off;
+  // primary 0050 (D1 0009) makes 'degraded' a real mix and closes reason_code.
   await pool.query(
     `UPDATE ${q(schema, "collection_controls")}
         SET revision=revision+1,control_state='degraded',enrollment_enabled=false,
-            upload_registration_enabled=false,processing_enabled=false,publication_enabled=false,
-            reason_code='synthetic-import-test',updated_at=clock_timestamp()
+            upload_registration_enabled=false,processing_enabled=true,publication_enabled=false,
+            reason_code='maintenance',updated_at=clock_timestamp()
       WHERE singleton=1`,
   );
   const migrationReceipt = await pool.query(

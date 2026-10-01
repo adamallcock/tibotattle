@@ -1336,6 +1336,8 @@ test("PG17 storage_journal_transfer_session() admits only a deliberate member th
 
 // ---------------------------------------------------------------------------
 
+// Analytics retirement checks its closed owner_digest inventory, which names
+// AN-1's 0053 relations, so this test runs on the repository chain.
 test("PG17 owner-journal health is content-free and analytics retirement retains an erased head",
   { skip: SKIP, timeout: 180_000 }, async () => withSchema(async ({ pool, schema, quoted, table }) => {
     const { readPostgresOwnerJournalHealth, appendPostgresOwnerJournal, ensurePostgresOwnerLink } =
@@ -1431,4 +1433,4 @@ test("PG17 owner-journal health is content-free and analytics retirement retains
     "the head is a retained tombstone");
     await refuses(pool.query(`SELECT ${quoted}.storage_journal_append('owner-active',$1,$2,$2,$2)`,
       [erasedHead.owner_digest, digest("after-retirement")]), "storage_owner_erased");
-  }));
+  }, { chain: "repository" }));

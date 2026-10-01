@@ -91,7 +91,9 @@ const KEPT_TRIGGERS = Object.freeze([
   ["telemetry_contributions", "telemetry_retained_source_revision"],
   ["telemetry_records", "telemetry_retained_record_source_revision"],
   ["telemetry_v11_domain_heads", "telemetry_v11_domain_head_source_revision"],
-  ["telemetry_v12_domain_heads", "telemetry_v12_domain_head_source_revision"],
+  // OJ-2's primary 0055 replaced the 0014 v1.2 head trigger with the owner
+  // bridge, so the pre-retirement chain carries the bridge on this table.
+  ["telemetry_v12_domain_heads", "storage_v12_head_publication"],
 ]);
 
 const digest = (value) => createHash("sha256").update(String(value)).digest("hex");
@@ -873,6 +875,12 @@ async function guardOutcomes({ pool, t }) {
     VALUES ($1,11,1,clock_timestamp())
     ON CONFLICT (participant_id) DO UPDATE SET minimum_rank=11,revision=telemetry_transport_participant_floors.revision+1`,
   [floorOwner]);
+  // Primary 0051 (D1 isolation 0008) makes the v1 chunk floor device-only, so
+  // the device floor is raised as well, as a v1.1 consent would raise it.
+  const deviceFloor = await pool.query(`UPDATE ${t("telemetry_transport_device_floors")}
+      SET minimum_rank=11,revision=revision+1,changed_at=clock_timestamp()
+    WHERE participant_id=$1 AND device_id=$2`, [floorOwner, floorDevice]);
+  assert.equal(deviceFloor.rowCount, 1);
   const floorAuthorization = await authorization(floorOwner, floorDevice);
   await pool.query(`INSERT INTO ${t("pending_objects")} (contribution_id,object_key,object_kind)
     VALUES ('synthetic-iso1-floor','synthetic/iso1/synthetic-iso1-floor','telemetry_v1')`);

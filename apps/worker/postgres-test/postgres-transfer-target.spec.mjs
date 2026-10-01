@@ -162,13 +162,21 @@ function stageHidingPool(pool, stage) {
 
 // A plain application table (no triggers, no foreign keys) that every
 // wave-1 migration leaves insertable and deletable.
+// A plain, unseeded application table with one instant column probes
+// emptiness, transfer writes and instant round trips. Primary 0057 refuses
+// inserts into the retired 0010 queues, so daily_rebuilds (the probe before
+// promotion) can no longer hold a row.
+const PROBE_RELATION = "sparkle_appcast_guard_nonces";
+const PROBE_INSTANT_COLUMN = "expires_at";
+const probeKey = (day) => `synthetic-pt1-probe-${day}`;
+
 function insertProbeRow(pool, { day = "2026-09-25", requestedAt = "2026-09-25T12:00:00.123Z" } = {}) {
-  return pool.query(`INSERT INTO "${PRIMARY_SCHEMA}".daily_rebuilds(day, requested_epoch, requested_at)
-    VALUES ($1::date, 1, $2)`, [day, requestedAt]);
+  return pool.query(`INSERT INTO "${PRIMARY_SCHEMA}".${PROBE_RELATION}(nonce, ${PROBE_INSTANT_COLUMN})
+    VALUES ($1, $2)`, [probeKey(day), requestedAt]);
 }
 
 function deleteProbeRows(pool) {
-  return pool.query(`DELETE FROM "${PRIMARY_SCHEMA}".daily_rebuilds`);
+  return pool.query(`DELETE FROM "${PRIMARY_SCHEMA}".${PROBE_RELATION}`);
 }
 
 async function seedV12Domain(pool) {
@@ -464,7 +472,7 @@ test("PG17 production transfer target: contract, open, roles, trigger policy, co
 
       await insertProbeRow(ownerPrimary);
       await assert.rejects(openProductionTransferTarget({ ...target, ...openArgs, sealManifestSha256: SEAL_A }),
-        error => isCode("CUTOVER_TARGET_NOT_EMPTY")(error) && error.relation === "daily_rebuilds");
+        error => isCode("CUTOVER_TARGET_NOT_EMPTY")(error) && error.relation === PROBE_RELATION);
       await deleteProbeRows(ownerPrimary);
       await ownerLedger.query(`INSERT INTO "${LEDGER_SCHEMA}".identity_reenrollment_cooldowns(identity_cooldown_digest,
           schema_version, deleted_at, retain_until) VALUES ($1, 'identity-reenrollment-cooldown-v0.1',
@@ -512,7 +520,7 @@ test("PG17 production transfer target: contract, open, roles, trigger policy, co
       const runB = await openProductionTransferTarget({ ...target, ...openArgs, sealManifestSha256: SEAL_B });
       await insertProbeRow(ownerPrimary);
       await assert.rejects(beginRun(runB, { sealedAt: "2026-09-24T12:00:00.000Z" }),
-        error => isCode("CUTOVER_TARGET_NOT_EMPTY")(error) && error.relation === "daily_rebuilds");
+        error => isCode("CUTOVER_TARGET_NOT_EMPTY")(error) && error.relation === PROBE_RELATION);
       await deleteProbeRows(ownerPrimary);
       const { runId: runIdB } = await beginRun(runB, { sealedAt: "2026-09-24T12:00:00.000Z" });
       await advanceRun(runB, "importing");
@@ -966,16 +974,18 @@ test("PG17 production transfer target: contract, open, roles, trigger policy, co
     });
 
     await t.test("instant round trips name only the table and column", async () => {
-      const where = { schema: PRIMARY_SCHEMA, table: "daily_rebuilds", columns: ["requested_at"] };
+      const where = { schema: PRIMARY_SCHEMA, table: PROBE_RELATION, columns: [PROBE_INSTANT_COLUMN] };
       await withTransferTransaction(handle, "primary", client => assertInstantRoundTrip(client, where), { readOnly: true });
       await insertProbeRow(ownerPrimary, { day: "2026-09-26", requestedAt: "2026-09-25T12:00:00.123456Z" });
       await assert.rejects(withTransferTransaction(handle, "primary", client => assertInstantRoundTrip(client, where),
         { readOnly: true }), (error) => {
         assert.equal(error.code, "CUTOVER_INSTANT_FORMAT_INVALID");
-        assert.equal(error.message, "CUTOVER_INSTANT_FORMAT_INVALID [table=daily_rebuilds column=requested_at]");
+        assert.equal(error.message,
+          `CUTOVER_INSTANT_FORMAT_INVALID [table=${PROBE_RELATION} column=${PROBE_INSTANT_COLUMN}]`);
         return true;
       });
-      await ownerPrimary.query(`DELETE FROM "${PRIMARY_SCHEMA}".daily_rebuilds WHERE day = '2026-09-26'`);
+      await ownerPrimary.query(`DELETE FROM "${PRIMARY_SCHEMA}".${PROBE_RELATION} WHERE nonce = $1`,
+        [probeKey("2026-09-26")]);
     });
 
     await t.test("tool relations are owned by the schema owner; objects made without SET ROLE are refused", async () => {

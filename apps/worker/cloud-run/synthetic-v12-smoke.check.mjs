@@ -545,8 +545,16 @@ test("a non-synthetic control reason blocks fixture seeding before the authentic
 
 test("fixture seed writes only uniquely tagged authority rows in one transaction", async () => {
   const statements = [];
+  // The enrollment statement inserts the proposed namespace unless the target
+  // (primary 0051+) already created one, and returns the namespace it holds.
+  const heldNamespace = "e".repeat(64);
   const client = {
-    async query(sql, params) { statements.push({ sql, params }); return { rowCount: 1, rows: [] }; },
+    async query(sql, params) {
+      statements.push({ sql, params });
+      return sql.includes('"attribution_enrollments"')
+        ? { rowCount: 1, rows: [{ namespace: heldNamespace }] }
+        : { rowCount: 1, rows: [] };
+    },
     release() { statements.push({ sql: "RELEASE", params: [] }); },
   };
   const pool = { async connect() { return client; } };
@@ -562,7 +570,10 @@ test("fixture seed writes only uniquely tagged authority rows in one transaction
   assert.equal(fixture.participantId, `${SYNTHETIC_V12_SMOKE_PARTICIPANT_PREFIX}${IDS[0]}`);
   assert.equal(fixture.deviceId, IDS[3]);
   assert.match(fixture.ownerDigest, /^[a-f0-9]{64}$/u);
-  assert.match(fixture.enrollmentNamespace, /^[a-f0-9]{64}$/u);
+  assert.equal(fixture.enrollmentNamespace, heldNamespace, "the fixture uses the namespace the target holds");
+  const enrollments = statements.filter(({ sql }) => sql.includes('"attribution_enrollments"'));
+  assert.equal(enrollments.length, 1);
+  assert.match(enrollments[0].sql, /ON CONFLICT \(participant_id\) DO NOTHING/u);
   assert.deepEqual(statements.map(({ sql }) => sql === "RELEASE" ? sql : sql.match(/(?:INSERT INTO|BEGIN|COMMIT)/u)?.[0]), [
     "BEGIN", "INSERT INTO", "INSERT INTO", "INSERT INTO", "INSERT INTO", "INSERT INTO", "INSERT INTO", "INSERT INTO", "COMMIT", "RELEASE",
   ]);
