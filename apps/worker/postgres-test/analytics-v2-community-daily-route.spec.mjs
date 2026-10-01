@@ -9,35 +9,27 @@
 // production error envelope, the publication control, both Cache-Control
 // branches, the cache-retention withholding gate, and the test-clock refusal.
 //
-// Schema: the stock primary migrations through the production runner, then
-// A-3's 0059_analytics_v2.sql through the staged-migrations harness when that
-// file exists (staged or promoted). Until A-3 lands, an INTERIM DDL with the
-// contract.ts names and A-3's drafted constraints (append-only published
-// heads) stands in for the three tables the route reads; a test diagnostic
-// says which DDL ran. Published rows are therefore seeded once and never
-// updated or deleted; scenarios vary only the preview and cache rows.
+// Schema: the full promoted primary chain through the production runner,
+// which ends at A-3's 0059_analytics_v2.sql (asserted). 0059 keeps published
+// heads append-only, so published rows are seeded once and never updated or
+// deleted; scenarios vary only the preview and cache rows.
 //
 // Run: PG_TEST_SOCKET=/private/tmp/tibotattle-pg-.../socket PG_TEST_PORT=55433 \
 //   node --test postgres-test/analytics-v2-community-daily-route.spec.mjs
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 import pg from "pg";
 import { createServer } from "vite";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
-import { applyStockAndStagedMigrations, postgresTestEndpoint } from "./staged-migrations-harness.mjs";
+import { postgresTestEndpoint } from "./staged-migrations-harness.mjs";
 import { createOriginRouteModuleRegistry, defineOriginRouteModule } from "../cloud-run/origin-route-modules.mjs";
 import { VENDORED_PACKAGE_ENTRIES, usesVendoredPackages } from "../vitest.analytics-v2.config.mjs";
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const A3_MIGRATION = "0059_analytics_v2.sql";
-const A3_MIGRATION_PRESENT = [
-  join(WORKER_ROOT, "postgres/staged-migrations/primary", A3_MIGRATION),
-  join(WORKER_ROOT, "postgres/migrations/primary", A3_MIGRATION),
-].some((path) => existsSync(path));
 
 const NOW_MS = Date.parse("2026-10-01T12:00:00.000Z");
 const GENERATED_AT = "2026-10-01T12:00:00.000Z";
@@ -100,66 +92,6 @@ async function loadModules() {
 // Schema
 // ---------------------------------------------------------------------------
 
-/**
- * INTERIM stand-in for A-3's 0059 (contract.ts table and column names) for
- * the three tables this route reads. Not a migration; never promoted.
- */
-const INTERIM_ANALYTICS_V2_DDL = `
-CREATE TABLE analytics_v2_published_daily (
-  day date PRIMARY KEY,
-  revision integer NOT NULL CHECK (revision >= 1),
-  released_at timestamptz NOT NULL,
-  payload jsonb NOT NULL CHECK (jsonb_typeof(payload) = 'object'),
-  payload_sha256 char(64) NOT NULL CHECK (payload_sha256 ~ '^[0-9a-f]{64}$'),
-  run_id uuid NOT NULL,
-  CHECK (COALESCE(payload ->> 'day' = to_char(day, 'YYYY-MM-DD'), false)),
-  CHECK (COALESCE(payload ->> 'revision' = revision::text, false)),
-  CHECK (COALESCE(payload ->> 'aggregateId'
-    = 'community-daily:' || to_char(day, 'YYYY-MM-DD') || ':r' || revision::text, false))
-);
-CREATE FUNCTION analytics_v2_published_daily_forward_only()
-RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
-BEGIN
-  IF TG_OP = 'DELETE' THEN
-    RAISE EXCEPTION 'analytics_v2_published_daily_no_delete' USING ERRCODE = 'P1005';
-  END IF;
-  IF NEW.day <> OLD.day OR NEW.revision <= OLD.revision OR NEW.payload_sha256 = OLD.payload_sha256 THEN
-    RAISE EXCEPTION 'analytics_v2_published_daily_forward_only' USING ERRCODE = 'P1005';
-  END IF;
-  RETURN NEW;
-END;
-$$;
-CREATE TRIGGER analytics_v2_published_daily_forward_only
-BEFORE UPDATE OR DELETE ON analytics_v2_published_daily
-FOR EACH ROW EXECUTE FUNCTION analytics_v2_published_daily_forward_only();
-CREATE TABLE analytics_v2_preview (
-  id smallint PRIMARY KEY CHECK (id = 1),
-  preview jsonb,
-  computed_at timestamptz NOT NULL,
-  run_id uuid NOT NULL
-);
-CREATE TABLE analytics_v2_cache_bands (
-  owner_digest text NOT NULL CHECK (owner_digest ~ '^[0-9a-f]{64}$'),
-  day date NOT NULL,
-  model text NOT NULL CHECK (length(model) BETWEEN 1 AND 64 AND model ~ '^[A-Za-z0-9._:-]+$'),
-  effort text NOT NULL CHECK (length(effort) BETWEEN 1 AND 64 AND effort ~ '^[A-Za-z0-9._:-]+$'),
-  band text NOT NULL CHECK (band IN ('under_one_minute', 'one_to_two_minutes',
-    'two_to_five_minutes', 'five_to_ten_minutes', 'ten_to_thirty_minutes',
-    'thirty_minutes_to_one_hour', 'one_to_two_hours', 'two_to_six_hours',
-    'six_to_twenty_four_hours', 'over_twenty_four_hours')),
-  adjacencies bigint NOT NULL CHECK (adjacencies >= 0),
-  reused_more_than_half bigint NOT NULL CHECK (reused_more_than_half >= 0),
-  matched_or_exceeded bigint NOT NULL CHECK (matched_or_exceeded >= 0),
-  unordered_ties bigint NOT NULL CHECK (unordered_ties >= 0),
-  excluded_insufficient_evidence bigint NOT NULL CHECK (excluded_insufficient_evidence >= 0),
-  excluded_context_contracted bigint NOT NULL CHECK (excluded_context_contracted >= 0),
-  sessions bigint NOT NULL CHECK (sessions >= 0),
-  run_id uuid NOT NULL,
-  PRIMARY KEY (owner_digest, day, model, effort, band),
-  CHECK (reused_more_than_half <= adjacencies AND matched_or_exceeded <= reused_more_than_half
-    AND unordered_ties <= adjacencies AND sessions <= adjacencies)
-);`;
-
 function q(name) {
   assert.match(name, /^[a-z_][a-z0-9_]{0,62}$/u);
   return `${quotedSchema}."${name}"`;
@@ -169,25 +101,9 @@ async function createSchema() {
   schema = `a4_cdr_${randomBytes(6).toString("hex")}`;
   quotedSchema = `"${schema}"`;
   await pool.query(`CREATE SCHEMA ${quotedSchema}`);
-  if (A3_MIGRATION_PRESENT) {
-    await applyStockAndStagedMigrations({ role: "primary", schema, pool, stagedFiles: [A3_MIGRATION] });
-    ddl = `A-3 ${A3_MIGRATION}`;
-  } else {
-    await applyPostgresMigrations({ role: "primary", schema, pool });
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-      await client.query(`SET LOCAL search_path TO ${quotedSchema}`);
-      await client.query(INTERIM_ANALYTICS_V2_DDL);
-      await client.query("COMMIT");
-    } catch (error) {
-      await client.query("ROLLBACK").catch(() => {});
-      throw error;
-    } finally {
-      client.release();
-    }
-    ddl = "INTERIM contract.ts stand-in (A-3 0059 not present)";
-  }
+  const applied = await applyPostgresMigrations({ role: "primary", schema, pool });
+  assert.equal(applied.migrations.at(-1)?.name, A3_MIGRATION, "the promoted chain ends at A-3's 0059");
+  ddl = `promoted primary chain through ${A3_MIGRATION}`;
 }
 
 /** A run id of the column's type, and a parent run row when the schema has a runs table. */

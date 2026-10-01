@@ -144,6 +144,65 @@ test("PG17 analytics owner retirement is receipt-gated and replay-safe for an ow
   assert.equal(replay.deleted.previewCacheRowsCleared, 0, "replay has no duplicate work");
 }));
 
+test("PG17 analytics owner retirement deletes the owner's analytics_v2 outputs and keeps published community heads", {
+  skip: !PG_TEST_HOST && !PG_TEST_SOCKET,
+  timeout: 180_000,
+}, async () => withHarness(async ({ pool, schema, retirePostgresAnalyticsOwner, hasPostgresAnalyticsOwnerResidue }) => {
+  const runId = randomUUID();
+  const day = "2026-09-20";
+  const options = { primaryPool: pool, ownerDigest: OWNER, schema: { primarySchema: schema } };
+  for (const owner of [OWNER, OTHER_OWNER]) {
+    await pool.query(`INSERT INTO ${q(schema, "analytics_v2_owner_day")} (owner_digest,day,daily,refusal,run_id)
+      VALUES ($1,$2,'{}'::jsonb,NULL,$3), ($1,DATE '2026-09-21',NULL,'source_conflict_or_order',$3)`,
+    [owner, day, runId]);
+    await pool.query(`INSERT INTO ${q(schema, "analytics_v2_cache_bands")}
+      (owner_digest,day,model,effort,band,adjacencies,reused_more_than_half,matched_or_exceeded,
+       unordered_ties,excluded_insufficient_evidence,excluded_context_contracted,sessions,run_id)
+      VALUES ($1,$2,'synthetic-model','medium','under_one_minute',4,2,1,0,1,0,1,$3)`, [owner, day, runId]);
+    await pool.query(`INSERT INTO ${q(schema, "analytics_v2_owner_fits")} (owner_digest,as_of_day,fits,run_id)
+      VALUES ($1,$2,'[]'::jsonb,$3)`, [owner, day, runId]);
+    await pool.query(`INSERT INTO ${q(schema, "analytics_v2_owner_model_dates")} (owner_digest,day,result,run_id)
+      VALUES ($1,$2,'{}'::jsonb,$3)`, [owner, day, runId]);
+  }
+  const payload = JSON.stringify({ aggregateId: `community-daily:${day}:r1`, day, revision: 1,
+    releasedAt: "2026-09-21T00:00:00.000Z" });
+  await pool.query(`INSERT INTO ${q(schema, "analytics_v2_published_daily")}
+    (day,revision,released_at,payload,payload_sha256,run_id) VALUES ($1,1,'2026-09-21T00:00:00Z',$2::jsonb,$3,$4)`,
+  [day, payload, "1".repeat(64), runId]);
+  await pool.query(`INSERT INTO ${q(schema, "analytics_v2_preview")} (id,preview,computed_at,run_id)
+    VALUES (1,'{}'::jsonb,clock_timestamp(),$1)`, [runId]);
+  const published = async () => (await pool.query(
+    `SELECT day::text,revision,payload::text,payload_sha256 FROM ${q(schema, "analytics_v2_published_daily")}
+      UNION ALL SELECT 'preview',id,preview::text,run_id::text FROM ${q(schema, "analytics_v2_preview")}
+      ORDER BY 1`)).rows;
+  const before = await published();
+  assert.equal(before.length, 2);
+
+  await createErasureReceipt(pool, schema);
+  assert.equal(await hasPostgresAnalyticsOwnerResidue(options), true,
+    "analytics_v2 owner rows are residue a re-erasure must retire");
+  const result = await retirePostgresAnalyticsOwner(options);
+  assert.equal(result.status, "complete");
+  assert.equal(result.sourceCount, 0);
+  assert.equal(result.deleted.analyticsV2OwnerDays, 2);
+  assert.equal(result.deleted.analyticsV2CacheBands, 1);
+  assert.equal(result.deleted.analyticsV2OwnerFits, 1);
+  assert.equal(result.deleted.analyticsV2OwnerModelDates, 1);
+  for (const name of ["analytics_v2_owner_day", "analytics_v2_cache_bands", "analytics_v2_owner_fits",
+    "analytics_v2_owner_model_dates"]) {
+    assert.equal(await count(pool, schema, name, "owner_digest=$1", [OWNER]), 0, `${name} keeps no retired-owner row`);
+    assert.ok(await count(pool, schema, name, "owner_digest=$1", [OTHER_OWNER]) > 0, `${name} keeps other owners`);
+  }
+  assert.deepEqual(await published(), before, "published community heads and the preview are never retracted");
+  assert.equal(await hasPostgresAnalyticsOwnerResidue(options), false);
+
+  const replay = await retirePostgresAnalyticsOwner(options);
+  assert.equal(replay.deleted.analyticsV2OwnerDays, 0, "replay has no duplicate work");
+  assert.equal(replay.deleted.analyticsV2CacheBands, 0);
+  assert.equal(replay.deleted.analyticsV2OwnerFits, 0);
+  assert.equal(replay.deleted.analyticsV2OwnerModelDates, 0);
+}));
+
 test("PG17 analytics owner retirement removes mixed v1/v1.1/v1.2-derived state and retains only fenced proof", {
   skip: !PG_TEST_HOST && !PG_TEST_SOCKET,
   timeout: 180_000,

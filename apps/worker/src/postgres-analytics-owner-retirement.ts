@@ -18,7 +18,7 @@ const TIMEOUTS = Object.freeze({
 });
 
 /** Closed inventory of every PostgreSQL primary relation carrying owner_digest
- * at migration 0053. New owner-bearing relations block retirement until they
+ * at migration 0059. New owner-bearing relations block retirement until they
  * receive an explicit deletion or retained-proof decision here.
  */
 const OWNER_DIGEST_TABLES = Object.freeze([
@@ -40,6 +40,12 @@ const OWNER_DIGEST_TABLES = Object.freeze([
   // retirement neither deletes nor counts them as residue.
   "analytics_storage_erasure_fences",
   "analytics_storage_erasure_receipts",
+  // DELETE (0059, GCP fast path): the analytics-refresh Job's per-owner
+  // outputs. See ANALYTICS_V2_OWNER_TABLES.
+  "analytics_v2_cache_bands",
+  "analytics_v2_owner_day",
+  "analytics_v2_owner_fits",
+  "analytics_v2_owner_model_dates",
   "storage_ingestion_changes",
   "storage_owner_erasure_receipts",
   // Retained tombstone: the owner's journal revision head (see
@@ -70,6 +76,21 @@ const SOURCE_OWNER_TABLES = Object.freeze([
   "analytics_scheduler_delivery_cursors",
   "storage_ingestion_changes",
   "storage_owner_revisions",
+] as const);
+
+/**
+ * The analytics-refresh Job's per-owner outputs (primary 0059). They carry no
+ * source_id, so retirement deletes them by owner_digest, which leads every
+ * one of their primary keys. The community outputs built from them
+ * (analytics_v2_published_daily and analytics_v2_preview) carry no owner
+ * digest and are never retracted: published heads are append-only by schema,
+ * and the next full recompute simply no longer includes the retired owner.
+ */
+const ANALYTICS_V2_OWNER_TABLES = Object.freeze([
+  ["analytics_v2_owner_day", "analyticsV2OwnerDays"],
+  ["analytics_v2_cache_bands", "analyticsV2CacheBands"],
+  ["analytics_v2_owner_fits", "analyticsV2OwnerFits"],
+  ["analytics_v2_owner_model_dates", "analyticsV2OwnerModelDates"],
 ] as const);
 
 /** Owner-bearing relations that retirement keeps as proof or marks in place. */
@@ -131,6 +152,10 @@ export interface PostgresAnalyticsOwnerRetirementCounts {
   readonly dailyRevisionsWithdrawn: number;
   readonly modelCompositionDaysCleared: number;
   readonly previewCacheRowsCleared: number;
+  readonly analyticsV2OwnerDays: number;
+  readonly analyticsV2CacheBands: number;
+  readonly analyticsV2OwnerFits: number;
+  readonly analyticsV2OwnerModelDates: number;
 }
 
 export interface PostgresAnalyticsOwnerRetirementEvidence {
@@ -463,7 +488,7 @@ export async function hasPostgresAnalyticsOwnerResidue(
       const rows = parseRows<{ readonly residue: boolean }>(await client.query(
         `SELECT EXISTS (SELECT 1 FROM ${table(schema, "analytics_owner_state")}
                          WHERE owner_digest=$1 AND state <> 'erased')
-                ${residueTables.map((name) =>
+                ${[...residueTables, ...ANALYTICS_V2_OWNER_TABLES.map(([name]) => name)].map((name) =>
                   `OR EXISTS (SELECT 1 FROM ${table(schema, name)} WHERE owner_digest=$1)`).join("\n")}
                 AS residue`,
         [ownerDigest],
@@ -494,8 +519,13 @@ export async function hasPostgresAnalyticsOwnerResidue(
  * are aggregate gauge history without owner digests; like the Worker's D1
  * erasure, retirement keeps them and clears only regenerable caches.
  *
- * Every owner-bearing index leads with source_id, so owner deletes are bounded
- * to the affected sources. The discovery and residual proofs still scan by
+ * The analytics-refresh Job's per-owner outputs (analytics_v2_owner_day,
+ * _cache_bands, _owner_fits and _owner_model_dates) are deleted by owner; its
+ * published community heads and preview carry no owner digest and stay.
+ *
+ * Every legacy owner-bearing index leads with source_id, so those owner
+ * deletes are bounded to the affected sources; the analytics_v2 keys lead
+ * with owner_digest. The discovery and residual proofs still scan by
  * owner_digest alone and must be qualified against real snapshot sizes.
  */
 export async function retirePostgresAnalyticsOwner(
@@ -557,6 +587,8 @@ export async function retirePostgresAnalyticsOwner(
         adminHistoryCache: number; adminAllowanceCache: number;
         adminProgressCache: number; dailyPreviewCache: number; dailyRevisionsWithdrawn: number;
         modelCompositionDaysCleared: number; previewCacheRowsCleared: number;
+        analyticsV2OwnerDays: number; analyticsV2CacheBands: number;
+        analyticsV2OwnerFits: number; analyticsV2OwnerModelDates: number;
       } = {
         analysisWorkParts: 0, analysisWorkHeads: 0,
         preparedOutputs: 0, preparedControls: 0, preparedStreams: 0,
@@ -565,6 +597,8 @@ export async function retirePostgresAnalyticsOwner(
         adminHistoryCache: 0, adminAllowanceCache: 0,
         adminProgressCache: 0, dailyPreviewCache: 0, dailyRevisionsWithdrawn: 0,
         modelCompositionDaysCleared: 0, previewCacheRowsCleared: 0,
+        analyticsV2OwnerDays: 0, analyticsV2CacheBands: 0,
+        analyticsV2OwnerFits: 0, analyticsV2OwnerModelDates: 0,
       };
       const sourceArray = [...sourceIds];
 
@@ -632,6 +666,13 @@ export async function retirePostgresAnalyticsOwner(
         );
       }
 
+      // analytics_v2 per-owner outputs are not source-scoped; delete them by
+      // owner whatever the source set. Published community heads stay.
+      for (const [name, key] of ANALYTICS_V2_OWNER_TABLES) {
+        deleted[key] = await deleteCount(client,
+          `DELETE FROM ${table(schema, name)} WHERE owner_digest=$1`, [ownerDigest]);
+      }
+
       // These two rows are global derived caches in the legacy analytical
       // lane. Any owner retirement invalidates their combined view.
       deleted.previewCacheRowsCleared = await deleteCount(client,
@@ -650,7 +691,9 @@ export async function retirePostgresAnalyticsOwner(
               + (SELECT count(*) FROM ${table(schema, "analytics_prepared_source_rows")} WHERE owner_digest=$1)
               + (SELECT count(*) FROM ${table(schema, "analytics_prepared_source_streams")} WHERE owner_digest=$1)
               + (SELECT count(*) FROM ${table(schema, "analytics_scheduler_delivery_cursors")} WHERE owner_digest=$1)
-              + (SELECT count(*) FROM ${table(schema, "analytics_publication_owner_members")} WHERE owner_digest=$1) AS count`,
+              + (SELECT count(*) FROM ${table(schema, "analytics_publication_owner_members")} WHERE owner_digest=$1)
+              ${ANALYTICS_V2_OWNER_TABLES.map(([name]) =>
+                `+ (SELECT count(*) FROM ${table(schema, name)} WHERE owner_digest=$1)`).join("\n")} AS count`,
         [ownerDigest]);
       if (perOwnerResiduals !== 0) fail("ANALYTICS_OWNER_RETIREMENT_READBACK_FAILED");
 
