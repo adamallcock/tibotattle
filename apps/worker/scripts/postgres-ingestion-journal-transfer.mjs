@@ -4,6 +4,7 @@ import { lstat, open, realpath } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { POSTGRES_MIGRATION_ROOT, readPostgresMigrations } from "./postgres-migrations.mjs";
+import { POSTGRES_FASTPATH_REHEARSAL_TARGET_SCHEMA_PREFIX } from "./postgres-typed-legacy-transfer.mjs";
 
 export const POSTGRES_INGESTION_JOURNAL_TRANSFER_SCHEMA = "sealed-d1-ingestion-journal-to-postgres-v1";
 export const SEALED_SQLITE_INGESTION_JOURNAL_SCHEMA = "sealed-sqlite-d1-ingestion-journal-v1";
@@ -435,10 +436,17 @@ function schemaName(value) {
   return value;
 }
 
+// The disposable targets this importer may write: its own prefix, or the GCP
+// fast-path rehearsal schema that holds every importer's tables at once.
+const TARGET_SCHEMA_PREFIXES = Object.freeze([
+  POSTGRES_INGESTION_JOURNAL_TARGET_SCHEMA_PREFIX,
+  POSTGRES_FASTPATH_REHEARSAL_TARGET_SCHEMA_PREFIX,
+]);
+
 function targetSuffix(value) {
   const schema = schemaName(value);
-  const suffix = schema.startsWith(POSTGRES_INGESTION_JOURNAL_TARGET_SCHEMA_PREFIX)
-    ? schema.slice(POSTGRES_INGESTION_JOURNAL_TARGET_SCHEMA_PREFIX.length) : "";
+  const prefix = TARGET_SCHEMA_PREFIXES.find((candidate) => schema.startsWith(candidate));
+  const suffix = prefix === undefined ? "" : schema.slice(prefix.length);
   if (!TARGET_SUFFIX.test(suffix)) fail("INGESTION_JOURNAL_DISPOSABLE_SCHEMA_REQUIRED");
   return schema;
 }

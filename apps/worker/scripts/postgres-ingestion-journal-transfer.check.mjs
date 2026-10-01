@@ -9,6 +9,7 @@ import {
   createSealedSqliteIngestionJournalSource,
   POSTGRES_INGESTION_JOURNAL_ROW_COLUMNS,
   scanSealedSqliteIngestionJournal,
+  transferPostgresIngestionJournal,
 } from "./postgres-ingestion-journal-transfer.mjs";
 
 const SOURCE_ID = "synthetic-ingestion-journal-source";
@@ -184,5 +185,21 @@ test("sealed D1 storage journal detects source mutation and refuses writable art
       expectedSourceId: SOURCE_ID }), { code: "INGESTION_JOURNAL_SQLITE_UNSAFE" });
   } finally {
     await rm(writable.directory, { recursive: true, force: true });
+  }
+});
+
+test("the journal importer writes only its own or the fast-path rehearsal disposable schema", async () => {
+  const attempt = (targetSchema) => transferPostgresIngestionJournal({
+    source: {}, destinationPool: {}, targetSchema, transferId: "synthetic-ingestion-journal-guard", pageSize: 0,
+  });
+  // Past the schema guard, the invalid page size is the next refusal.
+  for (const targetSchema of ["storage_journal_transfer_target_synthetic",
+    "typed_legacy_transfer_rehearsal_target_fastpath_a1b2c3d4"]) {
+    await assert.rejects(attempt(targetSchema), { code: "INGESTION_JOURNAL_PAGE_SIZE_INVALID" }, targetSchema);
+  }
+  for (const targetSchema of ["typed_legacy_transfer_rehearsal_target_a1b2c3d4",
+    "typed_legacy_transfer_rehearsal_target_fastpath_short", "typed_legacy_transfer_rehearsal_target_fastpath_",
+    "usage_correction_transfer_target_a1b2c3d4", "public", "tibotattle"]) {
+    await assert.rejects(attempt(targetSchema), { code: "INGESTION_JOURNAL_DISPOSABLE_SCHEMA_REQUIRED" }, targetSchema);
   }
 });

@@ -7,6 +7,13 @@ import { DatabaseSync } from "node:sqlite";
 export const POSTGRES_TYPED_LEGACY_TRANSFER_SCHEMA = "typed-legacy-transfer-rehearsal-v1";
 export const POSTGRES_TYPED_LEGACY_CONTROL_SCHEMA_PREFIX = "typed_legacy_transfer_rehearsal_";
 export const POSTGRES_TYPED_LEGACY_TARGET_SCHEMA_PREFIX = "typed_legacy_transfer_rehearsal_target_";
+/**
+ * The GCP fast-path local rehearsal loads every importer into ONE disposable
+ * schema with this prefix (itself a typed-legacy target prefix). The
+ * ingestion-journal and usage-correction importers accept it in addition to
+ * their own disposable prefixes; nothing else widens.
+ */
+export const POSTGRES_FASTPATH_REHEARSAL_TARGET_SCHEMA_PREFIX = `${POSTGRES_TYPED_LEGACY_TARGET_SCHEMA_PREFIX}fastpath_`;
 export const POSTGRES_TYPED_LEGACY_DEFAULT_PAGE_SIZE = 200;
 export const POSTGRES_TYPED_LEGACY_MAX_PAGE_SIZE = 500;
 export const POSTGRES_TYPED_LEGACY_STAGING_FAMILY_EVIDENCE_SCHEMA = "typed-legacy-staging-family-evidence-v1";

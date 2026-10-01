@@ -152,3 +152,19 @@ test("correction importer rejects page sizes above its bounded maximum", async (
     transferId: "synthetic-run", pageSize: 201,
   }), { code: "USAGE_CORRECTION_PAGE_SIZE_INVALID" });
 });
+
+test("correction importer writes only its own or the fast-path rehearsal disposable schema", async () => {
+  const attempt = (targetSchema) => runPostgresUsageCorrectionTransfer({
+    source: {}, destinationPool: {}, targetSchema, transferId: "",
+  });
+  // Past the schema guard, an empty transfer id is the next refusal.
+  for (const targetSchema of ["usage_correction_transfer_target_synthetic",
+    "typed_legacy_transfer_rehearsal_target_fastpath_a1b2c3d4"]) {
+    await assert.rejects(attempt(targetSchema), { code: "USAGE_CORRECTION_TRANSFER_ID_INVALID" }, targetSchema);
+  }
+  for (const targetSchema of ["typed_legacy_transfer_rehearsal_target_a1b2c3d4",
+    "typed_legacy_transfer_rehearsal_target_fastpath_short", "typed_legacy_transfer_rehearsal_target_fastpath_",
+    "storage_journal_transfer_target_a1b2c3d4", "public", "tibotattle"]) {
+    await assert.rejects(attempt(targetSchema), { code: "USAGE_CORRECTION_TARGET_SCHEMA_REQUIRED" }, targetSchema);
+  }
+});

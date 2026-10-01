@@ -3,11 +3,18 @@ import { constants as fsConstants } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { POSTGRES_FASTPATH_REHEARSAL_TARGET_SCHEMA_PREFIX } from "./postgres-typed-legacy-transfer.mjs";
 
 export const POSTGRES_USAGE_CORRECTION_TRANSFER_SCHEMA = "postgres-usage-correction-transfer-v1";
 export const POSTGRES_USAGE_CORRECTION_DEFAULT_PAGE_SIZE = 100;
 export const POSTGRES_USAGE_CORRECTION_MAX_PAGE_SIZE = 200;
 export const POSTGRES_USAGE_CORRECTION_TARGET_SCHEMA_PREFIX = "usage_correction_transfer_target_";
+// The disposable targets this importer may write: its own prefix, or the GCP
+// fast-path rehearsal schema that holds every importer's tables at once.
+const TARGET_SCHEMA_PREFIXES = Object.freeze([
+  POSTGRES_USAGE_CORRECTION_TARGET_SCHEMA_PREFIX,
+  POSTGRES_FASTPATH_REHEARSAL_TARGET_SCHEMA_PREFIX,
+]);
 
 const MAX_SQLITE_BYTES = 100 * 1024 * 1024 * 1024;
 const HASH_BUFFER_BYTES = 1024 * 1024;
@@ -650,8 +657,8 @@ export async function runPostgresUsageCorrectionTransfer({
   pageSize = POSTGRES_USAGE_CORRECTION_DEFAULT_PAGE_SIZE,
 } = {}) {
   const schema = typeof rawTargetSchema === "string" ? rawTargetSchema : "";
-  const suffix = schema.startsWith(POSTGRES_USAGE_CORRECTION_TARGET_SCHEMA_PREFIX)
-    ? schema.slice(POSTGRES_USAGE_CORRECTION_TARGET_SCHEMA_PREFIX.length) : "";
+  const prefix = TARGET_SCHEMA_PREFIXES.find((candidate) => schema.startsWith(candidate));
+  const suffix = prefix === undefined ? "" : schema.slice(prefix.length);
   if (!SCHEMA.test(schema) || !TARGET_SUFFIX.test(suffix)) fail("USAGE_CORRECTION_TARGET_SCHEMA_REQUIRED");
   if (typeof transferId !== "string" || !TRANSFER_ID.test(transferId)) fail("USAGE_CORRECTION_TRANSFER_ID_INVALID");
   const size = validatePageSize(pageSize);

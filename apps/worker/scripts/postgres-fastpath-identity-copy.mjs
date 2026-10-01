@@ -47,15 +47,18 @@
 // eligibility (community_public_source_owners) and owner routing (hasV11)
 // read it; days, manifests and chunks belong to a v1.1 transport importer.
 //
-// No importer in tonight's rehearsal chain (this copy, typed-legacy, T-2,
+// No other importer in the rehearsal chain (typed-legacy, T-2,
 // usage-correction, ingestion-journal) writes the v1/v1.1 transport and
 // admission tables (telemetry_v1_chunks, telemetry_v11_chunks, _domain_days,
 // _day_manifests, typed_v1_/typed_v11_ admission state, proofs, allocations,
-// memberships, typed_v1_event_sources, storage_v11_event_sources). So an owner
-// this copy routes as v1.1 (head present) has no v1/v1.1 occurrences in
-// PostgreSQL until such an importer exists. That importer must own the whole
-// v1.1 chain: run this copy with --omit-family v11-domain-heads and
-// --defer-public-owner-parity before it, then --verify-only after it.
+// memberships, typed_v1_event_sources, storage_v11_event_sources) or the
+// v1.2 event sources. runPostgresFastpathTransportCopy (TRANSPORT_PARTS,
+// rehearsal-only, added by the integration lead) copies exactly those with
+// this module's engine: "legacy-transport" after typed-legacy and before
+// T-2, "v12-event-sources" after T-2. A production v1.1 transport importer
+// is separate work; it must own the whole v1.1 chain: run this copy with
+// --omit-family v11-domain-heads and --defer-public-owner-parity before it,
+// then --verify-only after it.
 //
 // Not copied here, by design:
 //   * storage_owner_revisions and storage_source_state: PostgreSQL 0046
@@ -350,6 +353,129 @@ export const POSTGRES_FASTPATH_IDENTITY_ALLOWLIST = Object.freeze(TABLES.map(spe
 /** sha256 of the canonical allowlist; a reviewed change must update its pin. */
 export function fastpathIdentityAllowlistSha256() {
   return sha256Hex(JSON.stringify([POSTGRES_FASTPATH_IDENTITY_COPY_SCHEMA, POSTGRES_FASTPATH_IDENTITY_ALLOWLIST]));
+}
+
+// ---------------------------------------------------------------------------
+// Rehearsal transport copy (Q-2). No importer in the rehearsal chain writes
+// the v1/v1.1 transport and admission tables the analytics-v2 occurrence
+// adapter joins (see the header), nor the journal's event-source tables
+// readQueuedDays resolves. These two parts copy exactly those relations from
+// the same sealed source, with the same engine and guarantees as the identity
+// copy (one transaction, emptiness, triggers suppressed, foreign keys and
+// digests re-checked). They are rehearsal-only; production transport import
+// is separate work.
+//
+//   "legacy-transport"   after the typed-legacy transfer (its typed records,
+//                        chunks and manifests are foreign-key parents) and
+//                        BEFORE T-2, which then inserts the v1.2 upload
+//                        authorizations next to these;
+//   "v12-event-sources"  after T-2 (telemetry_v12_domains is the parent).
+
+const LEGACY_CHUNK_AUTHORIZATIONS = "id IN (SELECT chunk.device_upload_authorization_id FROM telemetry_v1_chunks chunk UNION SELECT chunk.device_upload_authorization_id FROM telemetry_v11_chunks chunk)";
+
+function allocationColumns() {
+  return [
+    c("chunk_id", "text"), c("namespace_id", "int"), c("chunk_original", "bytes"),
+    c("first_source_row_id", "int"), c("record_count", "int"),
+  ];
+}
+
+function admissionStateColumns() {
+  return [
+    c("id", "int"), c("source_namespace", "text"), c("namespace_id", "int"),
+    c("runtime_contract_version", "int"), c("next_source_row_id", "int"),
+  ];
+}
+
+const TRANSPORT_PARTS = Object.freeze({
+  "legacy-transport": Object.freeze([
+    t("typed_v1_admission_state", "legacy-transport", ["id"], admissionStateColumns()),
+    t("typed_v11_admission_state", "legacy-transport", ["id"], admissionStateColumns()),
+    t("device_upload_authorizations", "legacy-transport", ["id"], [
+      c("id", "text"), c("participant_id", "text"), c("issued_by_device_id", "text"), c("secret_hash", "bytes"),
+      c("envelope_digest", "text"), c("body_bytes", "int"), c("content_type", "text"), c("state", "text"),
+      c("issued_at", "instant"), c("expires_at", "instant"), c("consumed_at", "instant"), c("revoked_at", "instant"),
+      c("consume_lease_expires_at", "instant"), c("consumed_contribution_id", "text"),
+    ], { selection: referenced("referenced-by-v1-and-v1.1-chunks", LEGACY_CHUNK_AUTHORIZATIONS) }),
+    t("telemetry_v1_chunks", "legacy-transport", ["id"], [
+      c("id", "text"), c("participant_id", "text"), c("device_id", "text"), c("stream", "text"), c("chunk_day", "day"),
+      c("chunk_seq", "int"), c("revision", "int"), c("chunk_digest", "text"), c("envelope_digest", "text"),
+      c("parser_version", "text"), c("record_count", "int"), c("accepted_record_count", "int"), c("r2_key", "text"),
+      c("device_upload_authorization_id", "text"), c("superseded_at", "instant"),
+      c("quarantine_deleted_at", "instant"), c("created_at", "instant"),
+    ]),
+    t("typed_v1_chunk_allocations", "legacy-transport", ["chunk_id"], allocationColumns()),
+    t("typed_v1_record_admissions", "legacy-transport", ["typed_record_id"], [
+      c("typed_record_id", "int"), c("chunk_id", "text"),
+    ]),
+    t("typed_v1_event_sources", "legacy-transport", ["event_digest"], [
+      c("event_digest", "text"), c("owner_digest", "text"), c("participant_id", "text"), c("chunk_id", "text"),
+      c("source_namespace", "text"),
+    ]),
+    t("telemetry_v11_day_manifests", "legacy-transport", ["id"], [
+      c("id", "text"), c("participant_id", "text"), c("device_id", "text"), c("chunk_day", "day"),
+      c("manifest_digest", "text"), c("parser_version", "text"), c("manifest_json", "text"),
+      c("expected_chunk_count", "int"), c("state", "text"), c("created_at", "instant"), c("ready_at", "instant"),
+    ]),
+    t("telemetry_v11_chunks", "legacy-transport", ["id"], [
+      c("id", "text"), c("manifest_id", "text"), c("participant_id", "text"), c("device_id", "text"),
+      c("stream", "text"), c("chunk_day", "day"), c("chunk_seq", "int"), c("chunk_id", "text"),
+      c("chunk_digest", "text"), c("envelope_digest", "text"), c("parser_version", "text"), c("record_count", "int"),
+      c("r2_key", "text"), c("device_upload_authorization_id", "text"), c("quarantine_deleted_at", "instant"),
+      c("created_at", "instant"),
+    ]),
+    t("telemetry_v11_domain_days", "legacy-transport", ["generation_id", "observed_day"], [
+      c("generation_id", "text"), c("observed_day", "day"), c("manifest_id", "text"),
+    ]),
+    t("typed_v11_chunk_allocations", "legacy-transport", ["chunk_id"], allocationColumns()),
+    t("typed_v11_manifest_memberships", "legacy-transport", ["manifest_id"], [
+      c("manifest_id", "text"), c("typed_manifest_id", "int"),
+    ]),
+    t("typed_v11_record_proofs", "legacy-transport", ["typed_record_id"], [
+      c("typed_record_id", "int"), c("chunk_key", "int"), c("manifest_key", "int"), c("stream_code", "int"),
+      c("occurrence_blob", "bytes"), c("base_digest", "bytes"), c("legacy_occurrence_blob", "bytes"),
+      c("legacy_digest", "bytes"), c("observed_at_ms", "int"),
+    ], {
+      // D1 derives these VIRTUAL columns from stream_code and the blobs;
+      // PostgreSQL stores only the inputs.
+      omitted: {
+        stream: "d1-generated-from-stream-code",
+        occurrence_id: "d1-generated-from-occurrence-blob",
+        legacy_occurrence_id: "d1-generated-from-legacy-occurrence-blob",
+      },
+    }),
+    t("storage_v11_event_sources", "legacy-transport", ["event_digest"], [
+      c("event_digest", "text"), c("owner_digest", "text"), c("participant_id", "text"), c("device_id", "text"),
+      c("generation_id", "text"), c("manifest_digest", "text"), c("from_day", "day"), c("through_day", "day"),
+      c("head_revision", "int"), c("input_revision", "int"), c("recorded_ms", "int"),
+    ]),
+  ]),
+  "v12-event-sources": Object.freeze([
+    t("storage_v12_event_sources", "v12-event-sources", ["event_digest"], [
+      c("event_digest", "text"), c("owner_digest", "text"), c("participant_id", "text"), c("device_id", "text"),
+      c("generation_id", "text"), c("previous_generation_id", "text"), c("manifest_digest", "text"),
+      c("head_revision", "int"), c("recorded_ms", "int"),
+    ]),
+  ]),
+});
+
+export const POSTGRES_FASTPATH_TRANSPORT_COPY_SCHEMA = "postgres-fastpath-transport-copy-v1";
+export const POSTGRES_FASTPATH_TRANSPORT_PARTS = Object.freeze(Object.keys(TRANSPORT_PARTS));
+
+/** The frozen transport allowlist, in the identity allowlist's shape. */
+export const POSTGRES_FASTPATH_TRANSPORT_ALLOWLIST = Object.freeze(Object.fromEntries(
+  Object.entries(TRANSPORT_PARTS).map(([part, tables]) => [part, Object.freeze(tables.map(spec => Object.freeze({
+    table: spec.name,
+    key: spec.key,
+    selection: spec.selection.id,
+    columns: Object.freeze(spec.columns.map(column => Object.freeze([column.source, column.target, column.type]))),
+    omittedSourceColumns: Object.freeze(Object.keys(spec.omitted).sort()),
+  })))]),
+));
+
+/** sha256 of the canonical transport allowlist; a reviewed change must update its pin. */
+export function fastpathTransportAllowlistSha256() {
+  return sha256Hex(JSON.stringify([POSTGRES_FASTPATH_TRANSPORT_COPY_SCHEMA, POSTGRES_FASTPATH_TRANSPORT_ALLOWLIST]));
 }
 
 // ---------------------------------------------------------------------------
@@ -927,6 +1053,51 @@ export async function runPostgresFastpathIdentityCopy({
   const sourcePublicOwners = readSourcePublicOwners(database);
   await trusted.verifySnapshot();
 
+  const copied = await copyTablesInOneTransaction({
+    trusted, pool, schema, tables, layoutTables: TABLES, sourceTables, migrationsRoot,
+    async beforeCommit(client) {
+      const publicOwners = compareOwnerSets(sourcePublicOwners, await readTargetPublicOwners(client, schema));
+      if (publicSourceOwnerParity === "require" && !publicOwners.equal) {
+        fail("FASTPATH_IDENTITY_PUBLIC_SOURCE_OWNERS_MISMATCH");
+      }
+      return publicOwners;
+    },
+  });
+  return Object.freeze({
+    schema: POSTGRES_FASTPATH_IDENTITY_COPY_SCHEMA,
+    status: "rehearsal_identity_copy_complete",
+    sourceCommit: POSTGRES_FASTPATH_IDENTITY_SOURCE_COMMIT,
+    source: Object.freeze({ kind: trusted.snapshot.kind, artifactSha256: trusted.snapshot.artifactSha256 }),
+    target: Object.freeze({
+      schema, postgresMajor: Math.floor(copied.postgresVersion / 10_000), latestMigration: copied.latestMigration,
+    }),
+    allowlistSha256: fastpathIdentityAllowlistSha256(),
+    tables: copied.tables,
+    omittedFamilies: Object.freeze([...omitFamilies].sort()),
+    excludedTables: POSTGRES_FASTPATH_IDENTITY_EXCLUDED_TABLES,
+    unknownNullableColumnsOmitted: Object.freeze(unknownNullableColumns),
+    foreignKeysChecked: copied.foreignKeysChecked,
+    rowTriggersSuppressed: true,
+    publicSourceOwners: Object.freeze({ mode: publicSourceOwnerParity, ...copied.beforeCommit }),
+    capabilities: Object.freeze({
+      rehearsalOnly: true,
+      ownerRevisionsCopied: false,
+      credentialsBeyondHashesCopied: false,
+      productionCutoverAuthorized: false,
+    }),
+  });
+}
+
+/**
+ * The shared copy transaction: emptiness re-check under table locks, inserts
+ * with row triggers suppressed, an explicit foreign-key re-check with
+ * triggers restored, per-table count and canonical-row digest parity, the
+ * caller's beforeCommit check, then COMMIT. Any failure rolls back
+ * everything.
+ */
+async function copyTablesInOneTransaction({
+  trusted, pool, schema, tables, layoutTables, sourceTables, migrationsRoot, beforeCommit,
+}) {
   let client;
   try {
     client = await pool.connect();
@@ -942,7 +1113,7 @@ export async function runPostgresFastpathIdentityCopy({
     await q(client, `SET LOCAL lock_timeout = '${LOCK_TIMEOUT_MILLISECONDS}ms'`, [], "FASTPATH_IDENTITY_TARGET_QUERY_FAILED");
     const postgresVersion = await assertPostgres17(client);
     const latestMigration = await assertPromotedMigrations(client, schema, migrationsRoot);
-    for (const spec of TABLES) await assertTargetLayout(client, schema, spec);
+    for (const spec of layoutTables) await assertTargetLayout(client, schema, spec);
     await q(client, `LOCK TABLE ${tables.map(spec => relation(schema, spec.name)).join(", ")} IN SHARE ROW EXCLUSIVE MODE`,
       [], "FASTPATH_IDENTITY_TARGET_LOCK_FAILED");
     for (const spec of tables) await assertTargetEmpty(client, schema, spec);
@@ -977,10 +1148,7 @@ export async function runPostgresFastpathIdentityCopy({
         }),
       });
     }
-    const publicOwners = compareOwnerSets(sourcePublicOwners, await readTargetPublicOwners(client, schema));
-    if (publicSourceOwnerParity === "require" && !publicOwners.equal) {
-      fail("FASTPATH_IDENTITY_PUBLIC_SOURCE_OWNERS_MISMATCH");
-    }
+    const beforeCommitResult = await beforeCommit(client);
     await trusted.verifySnapshot();
     open = false;
     try {
@@ -990,25 +1158,11 @@ export async function runPostgresFastpathIdentityCopy({
       fail("FASTPATH_IDENTITY_TARGET_COMMIT_FAILED", { sqlState: sqlStateOf(error) });
     }
     return Object.freeze({
-      schema: POSTGRES_FASTPATH_IDENTITY_COPY_SCHEMA,
-      status: "rehearsal_identity_copy_complete",
-      sourceCommit: POSTGRES_FASTPATH_IDENTITY_SOURCE_COMMIT,
-      source: Object.freeze({ kind: trusted.snapshot.kind, artifactSha256: trusted.snapshot.artifactSha256 }),
-      target: Object.freeze({ schema, postgresMajor: Math.floor(postgresVersion / 10_000), latestMigration }),
-      allowlistSha256: fastpathIdentityAllowlistSha256(),
+      postgresVersion,
+      latestMigration,
       tables: Object.freeze(receiptTables),
-      omittedFamilies: Object.freeze([...omitFamilies].sort()),
-      excludedTables: POSTGRES_FASTPATH_IDENTITY_EXCLUDED_TABLES,
-      unknownNullableColumnsOmitted: Object.freeze(unknownNullableColumns),
       foreignKeysChecked,
-      rowTriggersSuppressed: true,
-      publicSourceOwners: Object.freeze({ mode: publicSourceOwnerParity, ...publicOwners }),
-      capabilities: Object.freeze({
-        rehearsalOnly: true,
-        ownerRevisionsCopied: false,
-        credentialsBeyondHashesCopied: false,
-        productionCutoverAuthorized: false,
-      }),
+      beforeCommit: beforeCommitResult,
     });
   } catch (error) {
     if (open) {
@@ -1027,6 +1181,54 @@ export async function runPostgresFastpathIdentityCopy({
       // The connection is already unusable; the transaction outcome stands.
     }
   }
+}
+
+/**
+ * Copy one rehearsal transport part (see TRANSPORT_PARTS) from the sealed
+ * source into the rehearsal schema, in one transaction with the identity
+ * copy's guarantees. Returns a content-free receipt.
+ */
+export async function runPostgresFastpathTransportCopy({
+  source,
+  pool,
+  targetSchema,
+  part,
+  migrationsRoot = undefined,
+} = {}) {
+  const schema = validateTargetSchema(targetSchema);
+  const trusted = trustedSource(source);
+  if (!pool || typeof pool.connect !== "function") fail("FASTPATH_IDENTITY_TARGET_POOL_REQUIRED");
+  if (typeof part !== "string" || !Object.hasOwn(TRANSPORT_PARTS, part)) fail("FASTPATH_TRANSPORT_PART_INVALID");
+  const tables = TRANSPORT_PARTS[part];
+  await trusted.verifySnapshot();
+  const database = trusted.database();
+  const unknownNullableColumns = {};
+  for (const spec of tables) {
+    const unknown = assertSourceLayout(database, spec);
+    if (unknown.length > 0) unknownNullableColumns[spec.name] = unknown;
+  }
+  const sourceTables = new Map(tables.map(spec => [spec.name, readSourceTable(database, spec)]));
+  await trusted.verifySnapshot();
+  const copied = await copyTablesInOneTransaction({
+    trusted, pool, schema, tables, layoutTables: tables, sourceTables, migrationsRoot,
+    async beforeCommit() { return null; },
+  });
+  return Object.freeze({
+    schema: POSTGRES_FASTPATH_TRANSPORT_COPY_SCHEMA,
+    status: "rehearsal_transport_copy_complete",
+    part,
+    sourceCommit: POSTGRES_FASTPATH_IDENTITY_SOURCE_COMMIT,
+    source: Object.freeze({ kind: trusted.snapshot.kind, artifactSha256: trusted.snapshot.artifactSha256 }),
+    target: Object.freeze({
+      schema, postgresMajor: Math.floor(copied.postgresVersion / 10_000), latestMigration: copied.latestMigration,
+    }),
+    allowlistSha256: fastpathTransportAllowlistSha256(),
+    tables: copied.tables,
+    unknownNullableColumnsOmitted: Object.freeze(unknownNullableColumns),
+    foreignKeysChecked: copied.foreignKeysChecked,
+    rowTriggersSuppressed: true,
+    capabilities: Object.freeze({ rehearsalOnly: true, productionCutoverAuthorized: false }),
+  });
 }
 
 // ---------------------------------------------------------------------------

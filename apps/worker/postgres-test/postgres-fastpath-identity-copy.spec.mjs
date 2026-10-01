@@ -14,11 +14,15 @@ import {
   compareFastpathOwnerRoster,
   compareFastpathPublicSourceOwners,
   fastpathIdentityAllowlistSha256,
+  fastpathTransportAllowlistSha256,
   openSealedFastpathIdentitySource,
   POSTGRES_FASTPATH_IDENTITY_ALLOWLIST,
   POSTGRES_FASTPATH_IDENTITY_SOURCE_COMMIT,
   POSTGRES_FASTPATH_IDENTITY_TARGET_SCHEMA_PREFIX,
+  POSTGRES_FASTPATH_TRANSPORT_ALLOWLIST,
+  POSTGRES_FASTPATH_TRANSPORT_PARTS,
   runPostgresFastpathIdentityCopy,
+  runPostgresFastpathTransportCopy,
 } from "../scripts/postgres-fastpath-identity-copy.mjs";
 
 // PG17 acceptance for the GCP fast-path identity/authority copy (T-1). The
@@ -45,6 +49,7 @@ const WORKER_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 // selection, omissions or source row rules changes this digest and must be
 // re-reviewed here.
 const ALLOWLIST_SHA256 = "303facb9a9decbd6dd50dcf04044bfea21838c22a7a7e910e8bf02238c956d28";
+const TRANSPORT_ALLOWLIST_SHA256 = "a71d5d30f55b3187acd09cc02cc91499d3f2ae68423661bd9d1c3f2759c2326e";
 
 // sha256 of the sqlite_master rows (type, name, tbl_name, sql) of every
 // allowlisted table, storage_owner_revisions, storage_source_state and the
@@ -725,6 +730,52 @@ test("T-1 refuses a non-empty target atomically", { skip: !PG_TEST_SOCKET }, asy
   assert.equal(bootstrap.rows[0].n, 2);
   const seededParticipants = await database.query(`SELECT count(*)::int AS n FROM "${seeded}".participants`);
   assert.equal(seededParticipants.rows[0].n, 0);
+});
+
+test("the rehearsal transport parts copy the checkout's D1 layout, refuse unknown parts and non-empty targets", {
+  skip: !PG_TEST_SOCKET,
+}, async () => {
+  const fixture = await sealedFixture();
+  const database = await pool();
+  assert.deepEqual([...POSTGRES_FASTPATH_TRANSPORT_PARTS], ["legacy-transport", "v12-event-sources"]);
+  assert.equal(fastpathTransportAllowlistSha256(), TRANSPORT_ALLOWLIST_SHA256,
+    "transport allowlist changed: review it and update the pin");
+  const schema = await rehearsalSchema();
+  for (const part of [undefined, "", "identity", "legacy-transport ", "LEGACY-TRANSPORT"]) {
+    await assert.rejects(runPostgresFastpathTransportCopy({ source: fixture.source, pool: database, targetSchema: schema, part }),
+      { code: "FASTPATH_TRANSPORT_PART_INVALID" }, String(part));
+  }
+  await assert.rejects(runPostgresFastpathTransportCopy({ source: fixture.source, pool: database,
+    targetSchema: "tibotattle_fastpath_spec", part: "legacy-transport" }), { code: "FASTPATH_IDENTITY_TARGET_SCHEMA_REFUSED" });
+
+  // The checkout's D1 chain and the promoted PostgreSQL chain agree on every
+  // transport column; the fixture holds no transport rows, so both parts
+  // commit empty after the identity copy (the rehearsal copies the oracle's).
+  await runPostgresFastpathIdentityCopy({ source: fixture.source, pool: database, targetSchema: schema });
+  for (const part of POSTGRES_FASTPATH_TRANSPORT_PARTS) {
+    const receipt = await runPostgresFastpathTransportCopy({ source: fixture.source, pool: database, targetSchema: schema, part });
+    assert.equal(receipt.status, "rehearsal_transport_copy_complete");
+    assert.equal(receipt.part, part);
+    assert.equal(receipt.allowlistSha256, TRANSPORT_ALLOWLIST_SHA256);
+    assert.deepEqual(Object.keys(receipt.tables), POSTGRES_FASTPATH_TRANSPORT_ALLOWLIST[part].map(entry => entry.table));
+    assert.ok(Object.values(receipt.tables).every(table => table.targetRows === table.sourceRows));
+    assert.ok(receipt.foreignKeysChecked > 0);
+    assert.equal(receipt.rowTriggersSuppressed, true);
+  }
+
+  // One pre-existing transport row refuses the part before any write.
+  const client = await database.connect();
+  try {
+    await client.query("SET session_replication_role = replica");
+    await client.query(`INSERT INTO "${schema}".telemetry_v11_domain_days (generation_id, observed_day, manifest_id)
+      VALUES ('synthetic-prior-generation', DATE '2026-09-30', 'synthetic-prior-manifest')`);
+    await assert.rejects(runPostgresFastpathTransportCopy({ source: fixture.source, pool: database, targetSchema: schema,
+      part: "legacy-transport" }), error => error?.code === "FASTPATH_IDENTITY_TARGET_NOT_EMPTY");
+    await client.query(`DELETE FROM "${schema}".telemetry_v11_domain_days`);
+  } finally {
+    await client.query("RESET session_replication_role").catch(() => {});
+    client.release();
+  }
 });
 
 test("T-1 refuses an unknown NOT NULL source or target column", { skip: !PG_TEST_SOCKET }, async () => {
