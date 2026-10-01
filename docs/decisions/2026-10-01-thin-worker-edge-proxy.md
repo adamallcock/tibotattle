@@ -250,7 +250,9 @@ from either host. The order at the edge is:
 
 1. the admin-host Access chokepoint (`verifyAdminAccessAssertion`, then
    `authorizeAdminEmail`);
-2. a declared `content-length` above 8 MiB gets a local `413 BODY_TOO_LARGE`;
+2. a request whose body would be forwarded, with a declared `content-length`
+   above 8 MiB, gets a local `413 BODY_TOO_LARGE`. Any other problem with that
+   header is left to the origin;
 3. edge admission ([section 7](#7-rate-limit-tiering-against-d43c8f92));
 4. the forward.
 
@@ -498,7 +500,7 @@ These are deliberate and accepted with this record:
 1. Fenced 503 responses carry `retry-after: 300`.
 2. The edge's own `503 EDGE_ORIGIN_UNAVAILABLE` and `503 EDGE_NOT_CONFIGURED`
    carry `retry-after: 60`.
-3. A declared body above 8 MiB gets a local `413 BODY_TOO_LARGE` before
+3. A forwarded body declared above 8 MiB gets a local `413 BODY_TOO_LARGE` before
    admission. For `contributions` this equals the Worker, whose preflight 413
    precedes its limiter. For other routes the Worker would charge its limiter
    first and could answer 429; the edge answers 413.
