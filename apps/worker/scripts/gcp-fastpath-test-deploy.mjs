@@ -75,8 +75,12 @@ const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/u;
 const MIGRATION_FILE = /^\d{4}_[a-z][a-z0-9_-]*\.sql$/u;
 const ENV_KEY = /^[A-Z][A-Z0-9_]{0,63}$/u;
 const BUILD_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u;
+const SHA256 = /^[a-f0-9]{64}$/u;
+// Refresh/origin read the pinned primary schema or a rehearsal target seeded
+// into the same fast-path database by scripts/gcp-fastpath-seed.mjs.
+const SCHEMA_OVERRIDE = /^(?:tibotattle_fastpath_20261001|typed_legacy_transfer_rehearsal_target_[a-z][a-z0-9_]{7,23})$/u;
 const STEPS = Object.freeze([
-  "build", "database", "migrate", "verify-database", "refresh", "origin", "verify", "protected", "all",
+  "build", "database", "migrate", "verify-database", "seed", "refresh", "origin", "verify", "protected", "all",
 ]);
 const BUILD_TERMINAL = new Set(["SUCCESS", "FAILURE", "INTERNAL_ERROR", "TIMEOUT", "CANCELLED", "EXPIRED"]);
 
@@ -118,12 +122,17 @@ function labelsFlag() {
   return "--labels=" + Object.entries(FASTPATH_TEST.labels).map(([k, v]) => `${k}=${v}`).join(",");
 }
 
-function databaseEnv() {
+export function primarySchemaOf(schema = FASTPATH_TEST.primarySchema) {
+  if (!SCHEMA_OVERRIDE.test(schema ?? "")) fail("FASTPATH_DEPLOY_SCHEMA_INVALID", String(schema));
+  return schema;
+}
+
+function databaseEnv(schema) {
   return [
     ["GOOGLE_CLOUD_PROJECT", FASTPATH_TEST.project],
     ["PRIMARY_INSTANCE_CONNECTION_NAME", FASTPATH_TEST.instanceConnectionName],
     ["PRIMARY_DATABASE", FASTPATH_TEST.database],
-    ["PRIMARY_SCHEMA", FASTPATH_TEST.primarySchema],
+    ["PRIMARY_SCHEMA", primarySchemaOf(schema)],
     ["LEDGER_INSTANCE_CONNECTION_NAME", FASTPATH_TEST.instanceConnectionName],
     ["LEDGER_DATABASE", FASTPATH_TEST.database],
     ["LEDGER_SCHEMA", FASTPATH_TEST.ledgerSchema],
@@ -151,7 +160,7 @@ export function migrateJobCommand({ image, expectedCounts }) {
     `--service-account=${FASTPATH_TEST.migratorServiceAccount}`,
     "--command=node", "--args=dist/test-migrations.mjs,--profile=fastpath",
     envFlag([
-      ...databaseEnv(),
+      ...databaseEnv(FASTPATH_TEST.primarySchema),
       ["POSTGRES_MIGRATOR_IAM_USER", FASTPATH_TEST.migratorIamUser],
       ["PRIMARY_EXPECTED_MIGRATIONS", String(expectedCounts.primary)],
       ["LEDGER_EXPECTED_MIGRATIONS", String(expectedCounts.ledger)],
@@ -162,11 +171,11 @@ export function migrateJobCommand({ image, expectedCounts }) {
 }
 
 /** gcloud command that creates or updates the analytics-refresh Job. */
-export function refreshJobCommand({ image, now, extraEnv = [], extraArgs = [] }) {
+export function refreshJobCommand({ image, now, schema, extraEnv = [], extraArgs = [] }) {
   if (!IMAGE_REFERENCE.test(image ?? "")) fail("FASTPATH_DEPLOY_IMAGE_DIGEST_REQUIRED");
   if (now !== undefined && !ISO_INSTANT.test(now)) fail("FASTPATH_DEPLOY_NOW_INVALID");
   const args = [
-    "dist/analytics-refresh.mjs", "--mode=full", `--schema=${FASTPATH_TEST.primarySchema}`,
+    "dist/analytics-refresh.mjs", "--mode=full", `--schema=${primarySchemaOf(schema)}`,
     ...(now === undefined ? [] : [`--now=${now}`]),
     ...extraArgs,
   ];
@@ -178,7 +187,7 @@ export function refreshJobCommand({ image, now, extraEnv = [], extraArgs = [] })
     `--service-account=${FASTPATH_TEST.runtimeServiceAccount}`,
     "--command=node", `--args=${args.join(",")}`,
     envFlag(mergeEnv([
-      ...databaseEnv(),
+      ...databaseEnv(schema),
       ["POSTGRES_IAM_USER", FASTPATH_TEST.runtimeIamUser],
       ...(now === undefined ? [] : [["ANALYTICS_V2_TEST_CLOCK", "1"]]),
     ], extraEnv)),
@@ -271,6 +280,7 @@ export function renderOriginService({
   mode = "fastpath-test",
   originEnv = [],
   bucketHistoryProof,
+  schema,
 }) {
   if (!IMAGE_REFERENCE.test(image ?? "")) fail("FASTPATH_DEPLOY_IMAGE_DIGEST_REQUIRED");
   if (!["sidecar", "direct"].includes(variant)) fail("FASTPATH_DEPLOY_ORIGIN_VARIANT_INVALID");
@@ -279,7 +289,7 @@ export function renderOriginService({
   }
   const loopbackOrigin = `http://127.0.0.1:${FASTPATH_TEST.originLoopbackPort}`;
   const env = mergeEnv([
-    ...databaseEnv(),
+    ...databaseEnv(schema),
     ["POSTGRES_IAM_USER", FASTPATH_TEST.runtimeIamUser],
     ["POSTGRES_TEST_HTTP_MODE", mode],
     ["ENVIRONMENT", "synthetic-development"],
@@ -430,6 +440,7 @@ function parseArgs(argv) {
     step, dryRun: false, commit: undefined, image: undefined, now: undefined, out: undefined,
     variant: "sidecar", mode: "fastpath-test", refreshEnv: [], refreshArgs: [], originEnv: [],
     query: "from=2026-04-15&to=2026-10-01", skip: new Set(), noExecute: false,
+    schema: undefined, sqlitePath: undefined, sqliteSha256: undefined, schemaSuffix: undefined,
   };
   for (const argument of rest) {
     if (argument === "--dry-run") { options.dryRun = true; continue; }
@@ -446,6 +457,10 @@ function parseArgs(argv) {
     else if (key === "origin-variant") options.variant = value;
     else if (key === "origin-mode") options.mode = value;
     else if (key === "query") options.query = value;
+    else if (key === "schema") options.schema = primarySchemaOf(value);
+    else if (key === "sqlite") options.sqlitePath = resolve(value);
+    else if (key === "sqlite-sha256") options.sqliteSha256 = value;
+    else if (key === "schema-suffix") options.schemaSuffix = value;
     else if (key === "skip") value.split(",").forEach((item) => options.skip.add(item));
     else if (key === "refresh-arg") options.refreshArgs.push(value);
     else if (["refresh-env", "origin-env"].includes(key)) {
@@ -460,6 +475,10 @@ function parseArgs(argv) {
   }
   if (options.now !== undefined && !ISO_INSTANT.test(options.now)) fail("FASTPATH_DEPLOY_NOW_INVALID");
   if (!/^[A-Za-z0-9=&_.-]{0,256}$/u.test(options.query)) fail("FASTPATH_DEPLOY_QUERY_INVALID");
+  if ((options.sqlitePath === undefined) !== (options.sqliteSha256 === undefined)
+      || (options.sqliteSha256 !== undefined && !SHA256.test(options.sqliteSha256))) {
+    fail("FASTPATH_DEPLOY_SQLITE_ARGUMENTS_INVALID", "--sqlite and --sqlite-sha256 go together");
+  }
   return options;
 }
 
@@ -469,11 +488,14 @@ Steps:
   database         create database ${FASTPATH_TEST.database} on ${FASTPATH_TEST.instance} if absent
   migrate          deploy + execute ${FASTPATH_TEST.migrateJob} (counts read from --commit's tree)
   verify-database  read-only receipt counts via the migrator IAM user (impersonated, Cloud SQL connector)
+  seed             seed a typed_legacy_transfer_rehearsal_target_* schema in ${FASTPATH_TEST.database} from
+                   --sqlite through the importers present at --commit (scripts/gcp-fastpath-seed.mjs);
+                   skips with its reason when a required importer is absent; later steps use that schema
   refresh          deploy + execute ${FASTPATH_TEST.refreshJob} (2 vCPU, 4 GiB, 1 h)
   origin           deploy IAM-private ${FASTPATH_TEST.originService}; journey SA is the only invoker
   verify           GET /api/health and /api/v1/community/daily with a journey-SA ID token; save body
   protected        read the shared test services' revisions (never written)
-  all              build, database, migrate, verify-database, refresh, origin, verify, protected
+  all              build, database, migrate, verify-database, seed, refresh, origin, verify, protected
 Options:
   --commit=<ref>          commit to build (required for build, migrate and all)
   --image=<repo@sha256:>  use an existing image digest instead of building
@@ -485,6 +507,10 @@ Options:
   --refresh-env=K=V       extra/override refresh env (repeatable)
   --refresh-arg=<arg>     extra refresh argument (repeatable)
   --query=<qs>            community/daily query (default from=2026-04-15&to=2026-10-01)
+  --sqlite=<path> --sqlite-sha256=<hex>   sealed SQLite dump to seed from (seed runs only with these)
+  --schema-suffix=<s>     seeded schema suffix (default fp_<commit8>_<dump8>)
+  --schema=<schema>       primary schema for refresh/origin: ${FASTPATH_TEST.primarySchema}
+                          or typed_legacy_transfer_rehearsal_target_* (default: the seeded schema, else pinned)
   --skip=a,b              skip steps inside "all"
   --no-execute            create/update Jobs without executing them
   --dry-run               print every command; run nothing remote and write nothing remote
@@ -763,13 +789,40 @@ async function stepVerifyDatabase(runner) {
   }
 }
 
+async function stepSeed(runner, options) {
+  if (options.sqlitePath === undefined) {
+    const reason = "no --sqlite/--sqlite-sha256 given; refresh and origin read the empty pinned schema";
+    console.error(`# seed skipped: ${reason}`);
+    return { step: "seed", status: "skipped", reason };
+  }
+  const commit = resolveCommit(options.commit);
+  const seedModule = await import("./gcp-fastpath-seed.mjs");
+  const plan = seedModule.planSeed(commit);
+  const suffix = options.schemaSuffix ?? seedModule.defaultSuffix(commit, options.sqliteSha256);
+  const schema = seedModule.seededSchemas(suffix).target;
+  runner.print([process.execPath, join(WORKER_ROOT, "scripts/gcp-fastpath-seed.mjs"), "seed",
+    "--target=gcp-fastpath", `--commit=${commit}`, `--sqlite=${options.sqlitePath}`,
+    `--sqlite-sha256=${options.sqliteSha256}`, `--schema-suffix=${suffix}`],
+  `plan: ${plan.decision}; stages ${plan.stages.map(({ name, status }) => `${name}=${status}`).join(", ")}`);
+  if (runner.dryRun) {
+    if (plan.decision === "run" && options.schema === undefined) options.schema = schema;
+    return { step: "seed", dryRun: true, schema, plan };
+  }
+  const result = await seedModule.runGcpFastpathSeed({ commit, sqlitePath: options.sqlitePath,
+    sqliteSha256: options.sqliteSha256, schemaSuffix: suffix });
+  if (result.status !== "skipped" && options.schema === undefined) options.schema = result.schema;
+  const receipt = { ...result, path: await runner.receipt(`seed-${commit.slice(0, 12)}.json`, result) };
+  return receipt;
+}
+
 async function stepRefresh(runner, options, image) {
   if (options.commit !== undefined && !commitHasRefreshEntry(resolveCommit(options.commit))) {
     fail("FASTPATH_DEPLOY_REFRESH_ENTRY_ABSENT", "cloud-run/build.mjs has no analytics-refresh entry at --commit");
   }
   const result = await deployAndExecuteJob(runner, options, FASTPATH_TEST.refreshJob,
-    refreshJobCommand({ image, now: options.now, extraEnv: options.refreshEnv, extraArgs: options.refreshArgs }));
-  const receipt = { step: "refresh", image, now: options.now ?? null, ...result };
+    refreshJobCommand({ image, now: options.now, schema: options.schema, extraEnv: options.refreshEnv,
+      extraArgs: options.refreshArgs }));
+  const receipt = { step: "refresh", image, schema: primarySchemaOf(options.schema), now: options.now ?? null, ...result };
   if (!runner.dryRun && !options.noExecute) {
     receipt.path = await runner.receipt("refresh.json", receipt);
     if (!result.succeeded) fail("FASTPATH_DEPLOY_REFRESH_FAILED", JSON.stringify(result.results?.at(-1) ?? null));
@@ -805,7 +858,8 @@ async function stepOrigin(runner, options, image) {
     // Name agreed with A-4/IN-1 at integration; override with --origin-env if it differs.
     originEnv.push(["ANALYTICS_V2_TEST_CLOCK", "1"], ["ANALYTICS_V2_TEST_NOW", options.now]);
   }
-  const yaml = renderOriginService({ image, variant: options.variant, mode: options.mode, originEnv, bucketHistoryProof });
+  const yaml = renderOriginService({ image, variant: options.variant, mode: options.mode, originEnv,
+    bucketHistoryProof, schema: options.schema });
   await mkdir(runner.out, { recursive: true, mode: 0o700 });
   const yamlPath = join(runner.out, "origin-service.yaml");
   await writeFile(yamlPath, yaml, { mode: 0o600 });
@@ -820,7 +874,8 @@ async function stepOrigin(runner, options, image) {
   const service = runner.json(gcloudArgs(["run", "services", "describe", FASTPATH_TEST.originService,
     `--project=${FASTPATH_TEST.project}`, `--region=${FASTPATH_TEST.region}`, "--format=json"]),
   { read: true, placeholderJson: {} });
-  const receipt = { step: "origin", image, variant: options.variant, mode: options.mode, yamlPath, ...invokers,
+  const receipt = { step: "origin", image, schema: primarySchemaOf(options.schema), variant: options.variant,
+    mode: options.mode, yamlPath, ...invokers,
     revision: service?.status?.latestReadyRevisionName ?? null, url: service?.status?.url ?? null };
   if (!runner.dryRun) receipt.path = await runner.receipt("origin.json", receipt);
   return receipt;
@@ -895,7 +950,8 @@ export async function main(argv = process.argv.slice(2)) {
   }
   const runner = new Runner({ dryRun: options.dryRun, out });
   const steps = options.step === "all"
-    ? ["protected", "build", "database", "migrate", "verify-database", "refresh", "origin", "verify", "protected"]
+    ? ["protected", "build", "database", "migrate", "verify-database", "seed", "refresh", "origin", "verify",
+      "protected"]
       .filter((step) => !options.skip.has(step))
     : [options.step];
   const report = { project: FASTPATH_TEST.project, dryRun: options.dryRun, out, steps: [] };
@@ -917,6 +973,7 @@ export async function main(argv = process.argv.slice(2)) {
     } else if (step === "database") result = stepDatabase(runner);
     else if (step === "migrate") result = await stepMigrate(runner, options, image);
     else if (step === "verify-database") result = await stepVerifyDatabase(runner);
+    else if (step === "seed") result = await stepSeed(runner, options);
     else if (step === "refresh") {
       if (options.skip.has("refresh")) continue;
       result = await stepRefresh(runner, options, image);

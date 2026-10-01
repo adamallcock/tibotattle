@@ -13,6 +13,7 @@ import {
   GRAPH_BENCHMARK_MIGRATION_PROFILE,
   GRAPH_BENCHMARK_MIGRATIONS_JOB,
   GRAPH_BENCHMARK_MIGRATION_TARGETS,
+  grantAndVerifyTestRuntimePrivileges,
   parseTestMigrationsConfig,
   runTestMigrations,
   TEST_MIGRATIONS_IAM_USER,
@@ -670,4 +671,32 @@ test("fastpath profile applies both roles through one pool and grants only its e
   assert.equal(grantSql.filter((sql) => sql.startsWith("GRANT EXECUTE ON FUNCTION "
     + `"${FASTPATH_MIGRATION_TARGETS.primary.schema}".`)).length, 2,
   "only the primary role schema carries the v1 admission function grant");
+});
+
+test("the exported runtime-grant routine applies the same policy to one named schema", async () => {
+  const harness = makeHarness(manifest);
+  const pool = await harness.dependencies.createPool({
+    connector: { testConnector: true },
+    instanceConnectionName: TEST_MIGRATIONS_TARGETS.primary.instanceConnectionName,
+    database: TEST_MIGRATIONS_TARGETS.primary.database,
+    user: TEST_MIGRATIONS_IAM_USER,
+    max: 1,
+    applicationName: "tibotattle-test-database-migrator",
+  });
+  const schema = "typed_legacy_transfer_rehearsal_target_fastpath_gcp";
+  await grantAndVerifyTestRuntimePrivileges(pool, "primary", schema);
+  const quoted = `"${schema}"`;
+  const grants = harness.events.map(({ sql }) => sql ?? "")
+    .filter((sql) => /^(GRANT|REVOKE|ALTER DEFAULT PRIVILEGES)/u.test(sql));
+  assert.equal(grants.length > 0 && grants.every((sql) => sql.includes(quoted)), true);
+  assert.equal(grants.includes(
+    `GRANT EXECUTE ON FUNCTION ${quoted}."insert_telemetry_v1_contribution"(jsonb) TO "${TEST_MIGRATIONS_RUNTIME_IAM_USER}"`,
+  ), true);
+  assert.equal(harness.events.some(({ sql, params }) =>
+    sql?.includes("has_schema_privilege($1, $2, 'USAGE')") && params?.[1] === schema), true);
+  await assert.rejects(grantAndVerifyTestRuntimePrivileges(pool, "admin", schema),
+    (error) => error?.code === "POSTGRES_TEST_MIGRATIONS_ROLE_INVALID");
+  await assert.rejects(grantAndVerifyTestRuntimePrivileges(pool, "primary", "Bad-Schema"),
+    (error) => error?.code === "POSTGRES_TEST_MIGRATIONS_PRIMARY_RUNTIME_GRANT_FAILED"
+      || error?.code === "POSTGRES_TEST_MIGRATIONS_SCHEMA_INVALID");
 });

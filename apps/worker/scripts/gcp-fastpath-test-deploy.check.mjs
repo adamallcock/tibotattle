@@ -14,6 +14,7 @@ import {
   FASTPATH_TEST,
   migrateJobCommand,
   originInvokerCommand,
+  primarySchemaOf,
   refreshJobCommand,
   renderOriginService,
   validateOriginPolicy,
@@ -174,5 +175,23 @@ test("edge forwards only allowlisted GETs to the loopback origin and strips IAM 
   } finally {
     edge.kill();
     origin.close();
+  }
+});
+
+test("refresh and origin follow an explicit seeded rehearsal schema; migrate stays pinned", () => {
+  const seeded = "typed_legacy_transfer_rehearsal_target_fp_483245ad_98936d54";
+  const refresh = refreshJobCommand({ image: IMAGE, schema: seeded });
+  assert.equal(refresh.some((arg) => arg.includes(`--schema=${seeded}`)), true);
+  assert.equal(refresh.some((arg) => arg.includes(`PRIMARY_SCHEMA=${seeded}`)), true);
+  assert.equal(refresh.some((arg) => arg.includes(`LEDGER_SCHEMA=${FASTPATH_TEST.ledgerSchema}`)), true);
+  const origin = renderOriginService({ image: IMAGE, bucketHistoryProof: PROOF, schema: seeded });
+  assert.match(origin, new RegExp(`name: PRIMARY_SCHEMA\\n {10}value: "${seeded}"`, "u"));
+  const migrate = migrateJobCommand({ image: IMAGE, expectedCounts: { primary: 59, ledger: 7 } });
+  assert.equal(migrate.some((arg) => arg.includes(`PRIMARY_SCHEMA=${FASTPATH_TEST.primarySchema}`)), true);
+  assert.equal(primarySchemaOf(undefined), FASTPATH_TEST.primarySchema);
+  for (const bad of ["tibotattle_v12_a2_20260925", "tibotattle", "typed_legacy_transfer_rehearsal_target_x",
+    "typed_legacy_transfer_rehearsal_fp_483245ad_98936d54", "public"]) {
+    expectCode(() => primarySchemaOf(bad), "FASTPATH_DEPLOY_SCHEMA_INVALID");
+    expectCode(() => refreshJobCommand({ image: IMAGE, schema: bad }), "FASTPATH_DEPLOY_SCHEMA_INVALID");
   }
 });

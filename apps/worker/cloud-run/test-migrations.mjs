@@ -517,6 +517,16 @@ async function readBackReceipts(pool, role, target, expected) {
   }
 }
 
+/**
+ * Apply and read back the runtime role's exact grants on one migrated schema.
+ * The fast-path seed reuses this policy for the rehearsal-target schema it
+ * creates in the disposable fast-path database; it is not a second policy.
+ */
+export async function grantAndVerifyTestRuntimePrivileges(pool, role, schema) {
+  if (role !== "primary" && role !== "ledger") fail("POSTGRES_TEST_MIGRATIONS_ROLE_INVALID");
+  return grantAndVerifyRuntimePrivileges(pool, role, { schema });
+}
+
 /** Fetch the attached service account identity from the Cloud Run metadata server. */
 export async function readAttachedServiceAccountEmail({
   fetchImpl = globalThis.fetch,
