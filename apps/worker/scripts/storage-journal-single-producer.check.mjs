@@ -74,15 +74,24 @@ const IDENTIFIER_RELATION = /^\$\{(?:[^`{}]*[(,]\s*)?([A-Za-z_$][\w$]*)\s*\)?\s*
 
 /**
  * Reviewed files that mention the journal and write through computed targets
- * that cannot name it. The count pins their computed write sites, so a new
- * one needs a fresh review.
+ * that never reach the PostgreSQL journal. The count pins their computed write
+ * sites, so a new one needs a fresh review; a literal journal write in these
+ * files is still refused.
  *   scripts/postgres-analytics-history-transfer.mjs: insertSql writes only the
  *   three SPECS/ANALYTICS_EVENT_SPEC tables (analytics_owner_state,
  *   analytics_source_cursors, analytics_applied_events); the journal is only
  *   read and required empty.
+ *   scripts/gcp-fastpath-rehearsal.mjs: buildJournalSqlite's one prepared
+ *   node:sqlite INSERT copies the oracle dump's storage_source_state and
+ *   storage_ingestion_changes rows into a new journal-only SQLite file in the
+ *   rehearsal's (or the fast-path seed's) mkdtemp work directory, then seals
+ *   it 0444. That file is the source JOURNAL_TRANSFER, the sealed D1 import,
+ *   reads; it never writes PostgreSQL, and the rehearsal's PostgreSQL journal
+ *   rows come only from that transfer.
  */
 const REVIEWED_DYNAMIC_WRITERS = new Map([
   ["scripts/postgres-analytics-history-transfer.mjs", 1],
+  ["scripts/gcp-fastpath-rehearsal.mjs", 1],
 ]);
 
 /** Blank comments and regex-literal bodies (keeping offsets); strings and templates stay. */
