@@ -28,12 +28,12 @@
    "lane": "analytics"
   },
   "publicationPasses": 1,
-  "resumedFrom": null
+  "resumedFrom": "converged run (--resume)"
  },
  "tierF": {
   "scope": "withheld",
   "total": {
-   "ms": 373212,
+   "ms": 394209,
    "statements": 479402
   },
   "owners": {
@@ -51,12 +51,12 @@
      }
     },
     "cost": {
-     "ms": 124569,
+     "ms": 133296,
      "statements": 155804,
      "invocations": 182,
      "maxCheckpointBytes": 689044,
      "fits": {
-      "ms": 7008,
+      "ms": 6956,
       "statements": 8713,
       "invocations": 10,
       "maxCheckpointParts": 7,
@@ -78,12 +78,12 @@
      }
     },
     "cost": {
-     "ms": 104197,
+     "ms": 112488,
      "statements": 130132,
      "invocations": 150,
      "maxCheckpointBytes": 699164,
      "fits": {
-      "ms": 7029,
+      "ms": 8021,
       "statements": 8794,
       "invocations": 10,
       "maxCheckpointParts": 8,
@@ -105,12 +105,12 @@
      }
     },
     "cost": {
-     "ms": 54926,
+     "ms": 55739,
      "statements": 89041,
      "invocations": 110,
      "maxCheckpointBytes": 690937,
      "fits": {
-      "ms": 5650,
+      "ms": 5554,
       "statements": 9026,
       "invocations": 11,
       "maxCheckpointParts": 8,
@@ -132,12 +132,12 @@
      }
     },
     "cost": {
-     "ms": 89104,
+     "ms": 92219,
      "statements": 104425,
      "invocations": 120,
      "maxCheckpointBytes": 721657,
      "fits": {
-      "ms": 6995,
+      "ms": 7718,
       "statements": 8769,
       "invocations": 10,
       "maxCheckpointParts": 8,
