@@ -4,12 +4,17 @@
 // Runs d43c8f92's own Worker code, unmodified, under Node over sealed SQLite
 // files (cloud-run/sealed-sqlite-d1-adapter.mjs) instead of workerd D1:
 //
-//   ~/.nvm/versions/node/v26.2.0/bin/node --max-old-space-size=16384 \
+//   ~/.nvm/versions/node/v26.2.0/bin/node --max-old-space-size=32768 \
 //     apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs \
 //       --work-dir <absolute dir outside the repository> --corpus dense|q1 [--layout compact|spread] [--scale 0.1] \
-//       [--golden-out <dir>] [--verify-against <dir>] [--forced-native withheld|all|none] \
-//       [--max-ticks N] [--resume <converged work dir>] [--keep-scratch] [--forced-jobs N] \
-//       [--publication-passes k] [--analytics-passes k] [--clock-step-ms S] [--stop-when converged|daily-published]
+//       [--golden-out <dir>] [--verify-against <dir>] [--forced-native withheld|all|sample|none] \
+//       [--max-ticks N] [--resume <stopped work dir>] [--keep-scratch] [--forced-jobs N] \
+//       [--publication-passes k] [--analytics-passes k] [--clock-step-ms S] [--stop-when converged|daily-published] \
+//       [--converge-on all|daily] [--direct-native none|all [--direct-jobs N] | --direct-results <direct-results.json>] \
+//       [--settle-cache none|enabled|disabled|both]
+//
+// Defaults reproduce the Q-1 run: --forced-native withheld, --converge-on all,
+// --direct-native none, --settle-cache none, one pass of each lane per minute.
 //
 //  1. build.mjs materializes d43c8f92 (blob-verified) and bundles it for Node;
 //  2. runtime.mjs pins the clock and seeds every random source, so a run is
@@ -36,9 +41,17 @@
 //     graph caches are cleared and whose source is opened read-only. `withheld`
 //     (the default) covers every date without a Tier N result plus a fixed
 //     sample that has one (the Tier N = Tier F check); `all` covers all 70;
-//  7. the source dump (Q-1's usage-monitor-db.json format) and its sealed
+//  7. direct native references (direct-native.mjs): production's effective
+//     analysis called for every owner's fits and model date without the
+//     Worker's budget slicing, computed here (--direct-native all) or imported
+//     from a direct.mjs run over the same source content and re-derived in
+//     part (--direct-results);
+//  8. cache-retention references (--settle-cache): production's lane settled
+//     without the per-pass budget (settled-cache.mjs) and production's
+//     effective day build for every owner-day (cache-days.mjs);
+//  9. the source dump (Q-1's usage-monitor-db.json format) and its sealed
 //     SQLite rebuild through the rehearsal loader (gcp-fastpath-oracle-sqlite.mjs);
-//  8. the golden files.
+// 10. the golden files.
 //
 // Local and synthetic only: no network, no production data, no secrets.
 import { createHash } from "node:crypto";
@@ -53,6 +66,9 @@ import { createDenseOwner, DENSE_CORPUS_DAY_LIST, DENSE_CORPUS_PINNED_NOW, DENSE
   DENSE_DEFAULT_LAYOUT, DENSE_LAYOUTS, denseDayClass } from "./dense-corpus.mjs";
 import { summarizeDenseCorpus } from "./corpus-summary.mjs";
 import { sourceContentDigest as sourceDigestOf, usageRowsByOwnerDay } from "./source-digest.mjs";
+import { runDirectNative, runDirectTasks } from "./direct-native.mjs";
+import { runCacheDays } from "./cache-days.mjs";
+import { runSettledCache } from "./settled-cache.mjs";
 import { runForcedNative } from "./forced-native.mjs";
 import { installDenseOracleRuntime, setPinnedNow } from "./runtime.mjs";
 
@@ -89,7 +105,8 @@ const RUN_SPECIFIC_ANALYTICS_COLUMNS = Object.freeze({
 function parseArgs(argv) {
   const options = { workDir: null, corpus: null, scale: 1, goldenOut: null, verifyAgainst: null,
     forcedNative: "withheld", maxTicks: 200_000, keepScratch: false, resume: null, publicationPasses: 1,
-    layout: DENSE_DEFAULT_LAYOUT, forcedJobs: 6, clockStepMs: 0, analyticsPasses: 1, stopWhen: "converged" };
+    layout: DENSE_DEFAULT_LAYOUT, forcedJobs: 6, clockStepMs: 0, analyticsPasses: 1, stopWhen: "converged",
+    convergeOn: "all", directNative: "none", directJobs: 6, directResults: null, settleCache: "none" };
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index], next = () => argv[++index];
     if (arg === "--work-dir") options.workDir = resolve(next());
@@ -109,6 +126,8 @@ function parseArgs(argv) {
     else if (arg === "--converge-on") options.convergeOn = next();
     else if (arg === "--direct-native") options.directNative = next();
     else if (arg === "--direct-jobs") options.directJobs = Number(next());
+    else if (arg === "--direct-results") options.directResults = resolve(next());
+    else if (arg === "--settle-cache") options.settleCache = next();
     else if (arg === "--stop-when") options.stopWhen = next();
     else throw new Error(`DENSE_ORACLE_ARGUMENT_INVALID:${arg}`);
   }
@@ -121,7 +140,9 @@ function parseArgs(argv) {
   }
   if (!["all", "withheld", "sample", "none"].includes(options.forcedNative)) throw new Error("DENSE_ORACLE_FORCED_NATIVE_INVALID");
   if (!["all", "daily"].includes(options.convergeOn) || !["all", "none"].includes(options.directNative)
-    || !Number.isSafeInteger(options.directJobs) || options.directJobs < 1 || options.directJobs > 32) {
+    || !Number.isSafeInteger(options.directJobs) || options.directJobs < 1 || options.directJobs > 32
+    || (options.directResults !== null && options.directNative !== "none")
+    || !["none", "enabled", "disabled", "both"].includes(options.settleCache)) {
     throw new Error("DENSE_ORACLE_MODE_INVALID");
   }
   if (!Number.isSafeInteger(options.clockStepMs) || options.clockStepMs < 0 || options.clockStepMs > 60_000
@@ -166,8 +187,10 @@ const prior = (() => {
   return events;
 })();
 /** Git blob ids of the oracle files as this process loaded them (SOURCE.json). */
-const ORACLE_FILES = ["oracle.mjs", "build.mjs", "runtime.mjs", "forced-native.mjs", "forced-native-child.mjs", "dense-corpus.mjs",
-  "corpus-summary.mjs", "entry.ts", "shims/cloudflare-workers.mjs", "shims/cloudflare-test.mjs"];
+const ORACLE_FILES = ["oracle.mjs", "build.mjs", "runtime.mjs", "forced-native.mjs", "forced-native-child.mjs",
+  "direct.mjs", "direct-native.mjs", "direct-native-child.mjs", "source-digest.mjs", "settled-cache.mjs", "cache-days.mjs",
+  "cache-days-child.mjs", "dense-corpus.mjs", "corpus-summary.mjs", "entry.ts", "shims/cloudflare-workers.mjs",
+  "shims/cloudflare-test.mjs"];
 const blobOf = (path) => {
   const bytes = readFileSync(path);
   return createHash("sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
@@ -271,7 +294,7 @@ const dense = options.corpus === "dense"
 const corpusOwners = [...q1.owners, ...(dense ? [dense.spec] : [])];
 note("corpus", { owners: corpusOwners.map((owner) => owner.key), dense: dense?.spec ?? null,
   publicationPasses: options.publicationPasses, analyticsPasses: options.analyticsPasses, clockStepMs: options.clockStepMs,
-  stopWhen: options.stopWhen });
+  stopWhen: options.stopWhen, convergeOn: options.convergeOn });
 
 // ---------------------------------------------------------------- seeding --
 // A port of the Q-1 oracle's seeding (gcp-fastpath-oracle.spec.ts), unchanged
@@ -895,8 +918,10 @@ try {
 const directPreview = await P.publishStorageCommunityGraphPreview(bindings());
 
 const nowMs = Date.now();
-const publicEnv = { ...baseEnv(), ENVIRONMENT: "synthetic-development", TELEMETRY_STORAGE_MODE: "typed",
-  TELEMETRY_STORAGE_NAMESPACE: NAMESPACE, ANALYTICS_DB: target() };
+const publicEnvFor = (analyticsDb) => ({ ...baseEnv(), ENVIRONMENT: "synthetic-development", TELEMETRY_STORAGE_MODE: "typed",
+  TELEMETRY_STORAGE_NAMESPACE: NAMESPACE, ANALYTICS_DB: analyticsDb });
+const publicEnv = publicEnvFor(target());
+const publicReadUrl = () => `https://oracle.example.test/api/v1/community/daily?from=${DENSE_CORPUS_DAY_LIST[0]}&to=${DENSE_CORPUS_DAY_LIST.at(-1)}`;
 const fromDay = DENSE_CORPUS_DAY_LIST[0], throughDay = DENSE_CORPUS_DAY_LIST.at(-1);
 const response = await P.handleRequest(new Request(`https://oracle.example.test/api/v1/community/daily?from=${fromDay}&to=${throughDay}`), publicEnv);
 if (response.status !== 200) throw new Error(`DENSE_ORACLE_PUBLIC_READ:${response.status}`);
@@ -976,6 +1001,42 @@ const queuedDailyDays = (await target().prepare(`SELECT day FROM analytics_commu
   .bind(SOURCE_ID).all()).results.map((row) => row.day);
 const finalFingerprint = await targetFingerprint();
 
+// ------------------------------------------------------- routing record --
+/**
+ * Where production's graph lane routes each owner's window. With shared
+ * features enabled, computeEffective first takes the owner's effective
+ * inventory (readEffectiveTelemetryOwnerDays, quota and usage) over the
+ * window and asks readSharedAnalyticsFeatureWindow for those days: `complete`
+ * means the prepared features are passed to advanceStorageEffectiveAnalysis;
+ * `refused` means no prepared input at all (the native path the direct
+ * references compute); `missing` and `deferred` mean the lane would first
+ * prepare a day or wait. This is that same call, on the captured state, with
+ * an unbounded budget; it reads only. Model dates additionally pass through
+ * model blocks in the analytics lane (routingEvidence.modelBlocks).
+ */
+const windowRouting = {};
+{
+  const started = performance.now();
+  for (const owner of roster) {
+    const page = ownerPage.find((value) => value.ownerDigest === owner.ownerDigest);
+    const states = {};
+    for (const day of [...new Set([today, ...modelDates])].sort()) {
+      const window = P.modelHistoryWindow(day);
+      const inventory = { sourceNamespace: NAMESPACE, ownerDigest: page.ownerDigest, ownerRevision: page.ownerRevision,
+        authorityEpoch: page.authorityEpoch, fromDay: window.fromDay, throughDay: window.day };
+      const days = [...new Set([...await P.readEffectiveTelemetryOwnerDays(source(), { ...inventory, stream: "quota" }),
+        ...await P.readEffectiveTelemetryOwnerDays(source(), { ...inventory, stream: "usage" })])].sort();
+      if (days.length === 0) { states[day] = "complete:empty"; continue; }
+      const result = await P.readSharedAnalyticsFeatureWindow({ ...bindings(), owner: page, days,
+        budget: { remainingQueries: () => 1_000_000_000, deadlineMs: Number.MAX_SAFE_INTEGER, now: () => analysisNowMs } });
+      states[day] = result.state === "complete" ? "shared-features" : `${result.state}:${result.reason ?? result.day ?? "unknown"}`;
+    }
+    windowRouting[owner.key] = states;
+  }
+  note("window-routing", { ms: Math.round(performance.now() - started), owners: Object.fromEntries(Object.entries(windowRouting)
+    .map(([key, states]) => [key, Object.values(states).reduce((n, state) => ({ ...n, [state]: (n[state] ?? 0) + 1 }), {})])) });
+}
+
 // ----------------------------------------------------------------- Tier F --
 closeDatabases();
 let forced = {};
@@ -1010,6 +1071,168 @@ if (options.forcedNative !== "none") {
     forced = run.results;
     forcedCost = run.cost;
   } finally { restoreConsole(); }
+}
+
+// ---------------------------------------------------------- direct native --
+// Production's effective analysis called directly for every owner's fits and
+// every model date, with an unbounded budget (direct-native.mjs).
+let direct = {};
+let directCost = null;
+if (options.directNative === "all") {
+  const sourcePath = join(dbDir, DB_FILES.USAGE_MONITOR_DB);
+  const usage = usageRowsByOwnerDay(sourcePath);
+  const weight = (task) => {
+    const window = P.modelHistoryWindow(task.day);
+    let rows = 0;
+    for (const [day, n] of usage.get(task.ownerDigest) ?? []) if (day >= window.fromDay && day <= window.day) rows += n;
+    return rows;
+  };
+  let finished = 0;
+  const run = await runDirectNative({ P, openSealedSqliteD1, sourcePath, sourceNamespace: NAMESPACE, nowMs: analysisNowMs,
+    today, modelDates, ownerKeyOf: ownerKey, weight, jobs: options.directJobs, scratchDir: join(options.workDir, "scratch-direct"),
+    child: { node: process.execPath, execArgv: ["--max-old-space-size=8192"], script: join(HERE, "direct-native-child.mjs"),
+      spec: { bundlePath: build.bundle.path, adapterPath: join(WORKER_ROOT, "cloud-run/sealed-sqlite-d1-adapter.mjs") } },
+    onTask: (task, result) => {
+      finished++;
+      if (finished % 50 === 0 || result.state !== "complete" || result.cost.ms > 60_000) {
+        note("direct-task", { finished, owner: ownerKey(task.ownerDigest), metric: task.metric, day: task.day,
+          state: result.state, code: result.code ?? null, ms: result.cost.ms, steps: result.cost.steps });
+      }
+    } });
+  direct = run.results;
+  directCost = run.cost;
+  note("direct-native", { cost: run.cost, owners: Object.fromEntries(Object.entries(direct).map(([key, value]) => [key,
+    { fits: value.fits.state, model: Object.values(value.model).reduce((n, item) => ({ ...n, [item.state]: (n[item.state] ?? 0) + 1 }), {}) }])) });
+}
+/**
+ * `--direct-results <file>`: the direct references computed by a separate
+ * direct.mjs run (the same direct-native.mjs computation) over a source whose
+ * content digest equals this run's. The file must cover every owner's fits and
+ * every model date. This process then recomputes a sample in place, with the
+ * file's clock, and requires every recomputed payload to equal the file's byte
+ * for byte: every scope of every owner except the dense one, and the dense
+ * owner's lightest model window.
+ */
+let directImport = null;
+if (options.directResults !== null) {
+  const text = readFileSync(options.directResults, "utf8");
+  const file = JSON.parse(text);
+  if (file.schemaVersion !== "gcp-fastpath-dense-direct-v1" || !Number.isSafeInteger(file.nowMs)
+    || !file.results || typeof file.results !== "object") throw new Error("DENSE_ORACLE_DIRECT_RESULTS_INVALID");
+  if (file.sourceDigest !== sourceAfterAnalysis) throw new Error("DENSE_ORACLE_DIRECT_RESULTS_SOURCE_MISMATCH");
+  for (const owner of roster) {
+    const entry = file.results[owner.key];
+    if (!entry?.fits || modelDates.some((day) => !entry.model?.[day])) throw new Error(`DENSE_ORACLE_DIRECT_RESULTS_INCOMPLETE:${owner.key}`);
+  }
+  direct = Object.fromEntries(roster.map((owner) => [owner.key, file.results[owner.key]]));
+  directCost = file.cost ?? null;
+  const usage = usageRowsByOwnerDay(join(dbDir, DB_FILES.USAGE_MONITOR_DB));
+  const windowRows = (ownerDigest, day) => {
+    const window = P.modelHistoryWindow(day);
+    let rows = 0;
+    for (const [usageDay, n] of usage.get(ownerDigest) ?? []) if (usageDay >= window.fromDay && usageDay <= window.day) rows += n;
+    return rows;
+  };
+  const denseKey = dense ? dense.spec.key : null;
+  const sample = roster.flatMap((owner) => {
+    if (owner.key !== denseKey) return [{ ownerDigest: owner.ownerDigest, metric: "fits", day: today },
+      ...modelDates.map((day) => ({ ownerDigest: owner.ownerDigest, metric: "model", day }))];
+    const lightest = [...modelDates].sort((left, right) => windowRows(owner.ownerDigest, left) - windowRows(owner.ownerDigest, right)
+      || (left < right ? -1 : 1))[0];
+    return [{ ownerDigest: owner.ownerDigest, metric: "model", day: lightest }];
+  });
+  setPinnedNow(file.nowMs);
+  let recomputed;
+  try {
+    recomputed = await runDirectTasks({ P, openSealedSqliteD1, sourcePath: join(dbDir, DB_FILES.USAGE_MONITOR_DB),
+      sourceNamespace: NAMESPACE, nowMs: file.nowMs, tasks: sample });
+  } finally { setPinnedNow(analysisNowMs); }
+  const mismatched = recomputed.filter((item) => {
+    const imported = item.metric === "fits" ? direct[ownerKey(item.ownerDigest)].fits : direct[ownerKey(item.ownerDigest)].model[item.day];
+    return imported.state !== item.result.state || (imported.payload ?? null) !== (item.result.payload ?? null);
+  }).map((item) => `${ownerKey(item.ownerDigest)}:${item.metric}:${item.day}`);
+  directImport = { sha256: sha256Text(text), bytes: Buffer.byteLength(text), sourceDigest: file.sourceDigest, nowMs: file.nowMs,
+    producerBundleSha256: file.bundleSha256 ?? null,
+    recomputedInThisProcess: { scopes: recomputed.length, equal: recomputed.length - mismatched.length, mismatched,
+      denseOwnerDates: sample.filter((task) => ownerKey(task.ownerDigest) === denseKey).map((task) => task.day) } };
+  note("direct-import", directImport);
+  if (mismatched.length > 0) throw new Error(`DENSE_ORACLE_DIRECT_RESULTS_NOT_REPRODUCED:${mismatched.slice(0, 5).join(",")}`);
+}
+
+// --------------------------------------------------------- cache reference --
+/**
+ * `--settle-cache enabled|disabled|both`: (1) production's cache-retention
+ * lane driven to idle without the Worker's per-pass budget (settled-cache.mjs),
+ * which is what the lane can ever publish on this state, and (2) the
+ * per-owner-day reference: production's effective day build for every
+ * owner-day with usage (cache-days.mjs). Every day the settled lane built in
+ * the effective layout must equal the reference.
+ */
+let settled = null, settledModes = null, cacheDays = null, settledResponse = null;
+if (options.settleCache !== "none") {
+  const modes = options.settleCache === "both" ? ["enabled", "disabled"] : [options.settleCache];
+  const runs = {};
+  for (const mode of modes) {
+    const events = new Map();
+    console.log = (line) => {
+      if (typeof line !== "string" || !line.startsWith("{")) return;
+      try {
+        const event = JSON.parse(line);
+        if (String(event.event).startsWith("cache_retention_day_")) {
+          const key = `${event.event}:${String(event.reason)}`;
+          events.set(key, (events.get(key) ?? 0) + 1);
+        }
+      } catch { /* not an event */ }
+    };
+    try {
+      runs[mode] = await runSettledCache({ P, openSealedSqliteD1, dbDir, scratchDir: join(options.workDir, `scratch-settled-${mode}`),
+        files: { source: DB_FILES.USAGE_MONITOR_DB, target: DB_FILES.STORAGE_ANALYTICS_DB }, sourceId: SOURCE_ID,
+        sourceNamespace: NAMESPACE, nowMs: analysisNowMs, sharedFeatures: mode === "enabled", ownerKeyOf: ownerKey });
+    } finally { restoreConsole(); }
+    runs[mode].lane.events = Object.fromEntries([...events].sort());
+    note("settled-cache", { mode, lane: runs[mode].lane, marks: runs[mode].marks.length, ownerDays: Object.keys(runs[mode].ownerDays).length });
+  }
+  settled = runs[modes[0]];
+  settledModes = Object.fromEntries(modes.map((mode) => [mode, { lane: runs[mode].lane,
+    ownerDaysSha256: sha256Text(JSON.stringify(runs[mode].ownerDays)), seriesSha256: sha256Text(JSON.stringify(runs[mode].series)) }]));
+  if (modes.length === 2) settledModes.equal = settledModes.enabled.ownerDaysSha256 === settledModes.disabled.ownerDaysSha256
+    && settledModes.enabled.seriesSha256 === settledModes.disabled.seriesSha256;
+  let finished = 0;
+  cacheDays = await runCacheDays({ P, openSealedSqliteD1, dbDir, files: { source: DB_FILES.USAGE_MONITOR_DB, target: DB_FILES.STORAGE_ANALYTICS_DB },
+    scratchDir: join(options.workDir, "scratch-cache-days"), sourceId: SOURCE_ID, sourceNamespace: NAMESPACE, nowMs: analysisNowMs,
+    ownerKeyOf: ownerKey, jobs: options.directJobs,
+    child: { node: process.execPath, execArgv: ["--max-old-space-size=8192"], script: join(HERE, "cache-days-child.mjs"),
+      spec: { bundlePath: build.bundle.path, adapterPath: join(WORKER_ROOT, "cloud-run/sealed-sqlite-d1-adapter.mjs") } },
+    onTask: (task, result) => {
+      finished++;
+      if (finished % 100 === 0 || result.state !== "built" || result.ms > 120_000) {
+        note("cache-day", { finished, owner: ownerKey(task.ownerDigest), day: task.day, state: result.state, reason: result.reason ?? null, ms: result.ms });
+      }
+    } });
+  const settledEffective = new Set(settled.marks.filter((mark) => mark.layout === "effective" && mark.refusal === null)
+    .map((mark) => `${mark.owner}:${mark.day}`));
+  const compared = [...settledEffective].sort().map((key) => [key,
+    JSON.stringify((settled.ownerDays[key] ?? []).filter((row) => row.layout === "effective")) === JSON.stringify(cacheDays.ownerDays[key] ?? [])]);
+  cacheDays.settledAgreement = { compared: compared.length, equal: compared.filter(([, equal]) => equal).length,
+    mismatched: compared.filter(([, equal]) => !equal).map(([key]) => key) };
+  note("cache-days", { cost: cacheDays.cost, states: Object.values(cacheDays.days).reduce((n, day) => ({ ...n,
+    [`${day.state}${day.reason ? `:${day.reason}` : ""}`]: (n[`${day.state}${day.reason ? `:${day.reason}` : ""}`] ?? 0) + 1 }), {}),
+    settledAgreement: cacheDays.settledAgreement });
+
+  // The public read over the settled state: the replay's databases with the
+  // settled cache-retention target in place of the analytics binding.
+  await openDatabases(analysisNowMs);
+  const settledHandle = openSealedSqliteD1(settled.targetPath, { readOnly: true, pinnedNowMs: analysisNowMs });
+  try {
+    const served = await P.handleRequest(new Request(publicReadUrl()), publicEnvFor(settledHandle.database));
+    if (served.status !== 200) throw new Error(`DENSE_ORACLE_SETTLED_PUBLIC_READ:${served.status}`);
+    settledResponse = { status: served.status, cacheControl: served.headers.get("cache-control"), body: await served.json() };
+  } finally { settledHandle.close(); closeDatabases(); }
+  for (const mode of modes) if (!options.keepScratch) rmSync(join(options.workDir, `scratch-settled-${mode}`), { recursive: true, force: true });
+  // Only the cache-retention tables differ, so everything else served must be the replay's.
+  const { cacheRetention: _settledCache, ...settledRest } = settledResponse.body;
+  const { cacheRetention: _replayCache, ...replayRest } = body;
+  if (JSON.stringify(settledRest) !== JSON.stringify(replayRest)) throw new Error("DENSE_ORACLE_SETTLED_RESPONSE_DIVERGED");
 }
 
 // --------------------------------------------------------- source dump --
@@ -1062,7 +1285,12 @@ for (const owner of roster) {
   for (const day of modelDates) {
     const tierN = graph.find((row) => row.metric === "model" && row.day === day) ?? null;
     const f = forcedOwner?.model[day] ?? null;
+    const d = direct[owner.key]?.model[day] ?? null;
     model[day] = {
+      direct: d === null ? null : d.state === "complete" ? { sha256: sha256Text(d.payload), result: JSON.parse(d.payload) }
+        : { state: d.state, reason: d.code ?? null },
+      directEqualsTierN: tierN && d?.state === "complete" ? tierN.payload_json === d.payload : null,
+      directEqualsForced: f?.state === "complete" && d?.state === "complete" ? f.payload === d.payload : null,
       tierN: tierN ? { sourceKind: tierN.source_kind, sha256: sha256Text(tierN.payload_json),
         result: JSON.parse(tierN.payload_json) } : null,
       forced: f === null ? null : f.state === "complete" ? { sourceKind: f.sourceKind, sha256: sha256Text(f.payload),
@@ -1072,9 +1300,16 @@ for (const owner of roster) {
   }
   const daily = Object.fromEntries(dailyOwnerRows.filter((row) => row.owner_digest === owner.ownerDigest)
     .map((row) => [row.day, { sourceFormat: row.source_format, complete: row.complete, values: JSON.parse(row.values_json) }]));
+  const directFits = direct[owner.key]?.fits ?? null;
   ownerResults[owner.key] = {
     ownerDigest: owner.ownerDigest, routing: owner.expectedSourceRouting,
     fits: {
+      direct: directFits === null ? null : directFits.state === "complete"
+        ? { sha256: sha256Text(directFits.payload), fits: JSON.parse(directFits.payload) }
+        : { state: directFits.state, reason: directFits.code ?? null },
+      directEqualsTierN: tierNFits && directFits?.state === "complete" ? tierNFits.payload_json === directFits.payload : null,
+      directEqualsForced: forcedOwner?.fits.state === "complete" && directFits?.state === "complete"
+        ? forcedOwner.fits.payload === directFits.payload : null,
       tierN: tierNFits ? { sourceKind: tierNFits.source_kind, sha256: sha256Text(tierNFits.payload_json),
         fits: JSON.parse(tierNFits.payload_json) } : null,
       forced: forcedOwner === null ? null : forcedOwner.fits.state === "complete" ? { sourceKind: forcedOwner.fits.sourceKind,
@@ -1123,6 +1358,21 @@ const tierNEqualsForced = Object.fromEntries(Object.entries(ownerResults).map(([
   modelEqual: Object.values(value.model).filter((item) => item.equal === true).length,
 }]));
 
+/** Where the direct calls and the lane replay (or the budget-sliced forced
+ * path) both produced a result for an owner and date, they must be equal. */
+const referenceAgreement = Object.fromEntries(Object.entries(ownerResults).map(([key, value]) => {
+  const items = [value.fits, ...Object.values(value.model)];
+  const count = (field, want) => items.filter((item) => item[field] === want).length;
+  return [key, { directEqualsTierN: { compared: count("directEqualsTierN", true) + count("directEqualsTierN", false),
+    equal: count("directEqualsTierN", true) },
+  directEqualsForced: { compared: count("directEqualsForced", true) + count("directEqualsForced", false),
+    equal: count("directEqualsForced", true) } }];
+}));
+const referenceMismatches = Object.entries(ownerResults).flatMap(([key, value]) => [["fits", value.fits],
+  ...Object.entries(value.model)].filter(([, item]) => item.directEqualsTierN === false || item.directEqualsForced === false)
+  .map(([day]) => `${key}:${day}`));
+if (referenceMismatches.length > 0) note("reference-mismatch", { scopes: referenceMismatches });
+
 /**
  * Owner decision 2 (2026-10-01): the fast path publishes every model date with
  * the owners production could not evaluate excluded and counted, instead of
@@ -1150,13 +1400,15 @@ const perDate = (() => {
     let complete = true;
     for (const owner of byDigest) {
       const entry = ownerResults[owner.key].model[day];
-      const result = entry.tierN?.result ?? (entry.forced?.result ?? null);
-      basis[owner.key] = entry.tierN ? "tierN" : entry.forced?.result ? "forced" : entry.forced ? "failed" : "absent";
+      const result = entry.direct?.result ?? entry.tierN?.result ?? entry.forced?.result ?? null;
+      const failed = entry.direct?.state === "failed" || entry.forced?.state === "failed";
+      basis[owner.key] = entry.direct?.result ? "direct" : entry.tierN ? "tierN" : entry.forced?.result ? "forced"
+        : failed ? "failed" : "absent";
       if (result !== null) {
         collection.v1ParticipantCount++;
         if (result.status === "ready") collection.compositions.push({ participantId: owner.ownerDigest, composition: result });
         else collection.refusedParticipantCount++;
-      } else if (entry.forced && entry.forced.state === "failed") {
+      } else if (failed) {
         collection.v1ParticipantCount++; collection.refusedParticipantCount++; refusedOwners.push(owner.key);
       } else complete = false;
     }
@@ -1166,8 +1418,10 @@ const perDate = (() => {
     if (!projected || projected.day !== day) throw new Error("DENSE_ORACLE_PER_DATE_PROJECTION");
     days.push({ day, basis, refusedOwners, payload, projected });
   }
-  const fitsOwners = byDigest.filter((owner) => ownerResults[owner.key].fits.tierN || ownerResults[owner.key].fits.forced?.fits);
-  const fits = fitsOwners.flatMap((owner) => ownerResults[owner.key].fits.tierN?.fits ?? ownerResults[owner.key].fits.forced.fits);
+  const ownerFits = (owner) => ownerResults[owner.key].fits.direct?.fits ?? ownerResults[owner.key].fits.tierN?.fits
+    ?? ownerResults[owner.key].fits.forced?.fits ?? null;
+  const fitsOwners = byDigest.filter((owner) => ownerFits(owner) !== null);
+  const fits = fitsOwners.flatMap(ownerFits);
   const members = ownerPage.filter((owner) => owner.hasV1 || owner.hasV11 || owner.hasV12 || owner.hasEffective || owner.hasLegacy)
     .map((owner) => owner.ownerDigest);
   let preview = null, allowanceBreakdowns = null;
@@ -1190,6 +1444,7 @@ const perDate = (() => {
     nowMs, today, unresolved, days: days.map(({ projected: _projected, ...value }) => value), preview, allowanceBreakdowns };
 })();
 
+const haveDirect = Object.keys(direct).length > 0;
 const cacheByOwnerDay = {};
 for (const row of cacheValueRows) {
   const key = `${ownerKey(row.owner_digest)}:${row.day}`;
@@ -1206,6 +1461,21 @@ const corpusSummary = { schemaVersion: options.corpus === "dense" ? DENSE_CORPUS
     layout: options.layout, spec: dense.spec, classes: Object.fromEntries(["Q", "X", "H", "M", "S", "L"].map((kind) =>
       [kind, DENSE_CORPUS_DAY_LIST.filter((day) => denseDayClass(day, options.layout) === kind).length])) } : null };
 
+const reproduceCommand = [
+  `node --max-old-space-size=${options.corpus === "dense" ? 32768 : 16384} apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs --work-dir <dir>`,
+  `--corpus ${options.corpus}`,
+  options.corpus === "dense" && options.layout !== DENSE_DEFAULT_LAYOUT ? `--layout ${options.layout}` : null,
+  options.scale === 1 ? null : `--scale ${options.scale}`,
+  options.publicationPasses === 1 ? null : `--publication-passes ${options.publicationPasses}`,
+  options.analyticsPasses === 1 ? null : `--analytics-passes ${options.analyticsPasses}`,
+  options.clockStepMs === 0 ? null : `--clock-step-ms ${options.clockStepMs}`,
+  options.stopWhen === "converged" ? null : `--stop-when ${options.stopWhen}`,
+  options.convergeOn === "all" ? null : `--converge-on ${options.convergeOn}`,
+  options.forcedNative === "withheld" ? null : `--forced-native ${options.forcedNative}`,
+  options.directNative === "none" ? null : `--direct-native ${options.directNative} --direct-jobs <n>`,
+  options.directResults === null ? null : "--direct-results <direct.mjs work dir>/direct-results.json",
+  options.settleCache === "none" ? null : `--settle-cache ${options.settleCache}`,
+].filter((part) => part !== null).join(" ");
 const manifest = {
   schemaVersion: "gcp-fastpath-dense-oracle-manifest-v1",
   oracle: "production-code (d43c8f92 Worker modules bundled for Node over the sealed SQLite D1 adapter; D1 seeded through admission helpers; scheduled entry points driven to convergence; forced native references)",
@@ -1239,6 +1509,11 @@ const manifest = {
     (n, state) => ({ ...n, [state]: (n[state] ?? 0) + 1 }), {}) },
   owners: roster,
   routingEvidence: { sharedFeatures: sharedFeatureRouting, sharedFeatureRefusedDays,
+    sharedFeatureWindows: {
+      rule: "storage-community-graph.ts computeEffective with shared features enabled: the owner's effective quota and usage inventory over the window, then readSharedAnalyticsFeatureWindow; 'shared-features' passes prepared features to advanceStorageEffectiveAnalysis, a refusal passes none (the direct native computation); model dates pass through model blocks first",
+      byOwner: Object.fromEntries(Object.entries(windowRouting).map(([key, states]) => [key, {
+        counts: Object.values(states).reduce((n, state) => ({ ...n, [state]: (n[state] ?? 0) + 1 }), {}),
+        notShared: Object.fromEntries(Object.entries(states).filter(([, state]) => state !== "shared-features")) }])) },
     checkpointHeads, checkpointParts, modelBlocks: blocks },
   modelPublications: {
     expectedDates: modelDates.length, published: publishedModelDays.length, missing: missingModelDates,
@@ -1249,7 +1524,35 @@ const manifest = {
   duplicate: q1.duplicate,
   response: { status: response.status, cacheControl: response.headers.get("cache-control"),
     schemaVersion: body.schemaVersion, allowanceState: body.allowanceState, allowanceReadState: body.allowanceReadState,
-    publishedDays: publishedDays.length, modelPublicationDays: publishedModelDays.length, previewRow },
+    publishedDays: publishedDays.length, modelPublicationDays: publishedModelDays.length, previewRow,
+    servedFrom: "the replay's databases (community-daily-response.json)",
+    settled: settledResponse ? { file: "community-daily-response-settled.json", servedFrom: "the replay's databases with the settled cache-retention target (cacheRetention.settledLane)",
+      differsFromReplayOnlyIn: ["cacheRetention"] } : null },
+  outputProvenance: {
+    dailyPayloads: "lane replay (Tier N): production's scheduled analytics, publication and cache lanes; the daily lane had published every non-conflict day",
+    cacheRetention: settled
+      ? "community-daily-response.json and cache-owner-days.json: the lane replay at capture; community-daily-response-settled.json: production's lane settled without the per-pass budget (cacheRetention.settledLane) and read by the public route; cache-reference.json: production's effective day build for every owner-day with usage (cacheRetention.reference)"
+      : "lane replay (Tier N)",
+    ownerFitsAndModelResults: haveDirect
+      ? "direct native calls (advanceStorageEffectiveAnalysis with an unbounded budget, direct-native.mjs); the lane replay's and the budget-sliced forced path's results are cross-checked wherever they exist (directNative.referenceAgreement)"
+      : "lane replay (Tier N), else the budget-sliced forced native path (Tier F)",
+    perDateExpected: "d43c8f92's buildCommunityModelCompositionDay, projectAdminModelHistoryDay, buildAdminCommunityAllowancePreview and projectPublicAllowanceGraph over the owner results above",
+    communityDailyResponse: options.convergeOn === "all" ? "lane replay, converged in every lane"
+      : "lane replay captured when delivery, daily and cache lanes stood still; its allowance fields show the graph lane's progress at capture, and per-date-expected.json is the allowance reference",
+  },
+  directNative: haveDirect ? {
+    computedBy: options.directNative === "all" ? "this process" : "a direct.mjs run imported with --direct-results (directImport)",
+    nowMs: directImport?.nowMs ?? analysisNowMs,
+    configuration: "advanceStorageEffectiveAnalysis over the read-only source with no preparedQuota, preparedUsage or preparedUsageReader (what computeEffective passes when shared features are refused or off, STORAGE_V11_PREPARED_FOLD being false at d43c8f92; also the model-block fallback), budget {remainingQueries: 1e9, deadlineMs: far future}, looping on 'deferred' with the checkpoint in memory; fits validated with validCompleteScalarAnalysis and serialized as canonicalJson(selectCommunityAllowanceAnalysisFits(ownerDigest, [{source:'v1.1', analysis}])), model validated with validCompleteCachedComposition and serialized as canonicalJson(analysis)",
+    owners: Object.fromEntries(Object.entries(direct).map(([key, value]) => [key, {
+      fits: value.fits.state, model: Object.values(value.model).reduce((n, item) => ({ ...n, [item.state]: (n[item.state] ?? 0) + 1 }), {}),
+      failures: Object.fromEntries(Object.entries(value.model).filter(([, item]) => item.state !== "complete").map(([day, item]) => [day, item.code ?? item.state])),
+      work: { steps: Object.values(value.model).reduce((n, item) => n + item.cost.steps, value.fits.cost.steps),
+        statements: Object.values(value.model).reduce((n, item) => n + item.cost.statements, value.fits.cost.statements),
+        fitsSteps: value.fits.cost.steps } }])),
+    referenceAgreement, referenceMismatches,
+  } : null,
+  directImport,
   forcedNative: options.forcedNative !== "none" ? { scope: options.forcedNative, sampleDates: FORCED_SAMPLE, configuration: "computeStorageGraphResult(preparedFold:false, preparedEffectiveUsage:false, persistResult:false, no sharedFeatures), re-invoked at production's 1,000-statement invocation meter until complete, on a scratch copy with every graph cache cleared and a read-only source; production's model-block fallback",
     // Deterministic work counts only; wall-clock costs are in run-cost.json.
     owners: Object.fromEntries(Object.entries(forcedSummary).map(([key, value]) => [key, { ...value,
@@ -1257,13 +1560,30 @@ const manifest = {
         maxCheckpointBytes: value.cost.maxCheckpointBytes } }])), tierNEqualsForced } : null,
   cacheRetention: { marks: cacheMarks,
     windowAdjacencies: Object.fromEntries((cacheRetention?.windows ?? []).map((window) =>
-      [window.window, window.bands.reduce((n, band) => n + band.adjacencies, 0)])) },
+      [window.window, window.bands.reduce((n, band) => n + band.adjacencies, 0)])),
+    settledWindowAdjacencies: settledResponse ? Object.fromEntries((settledResponse.body.cacheRetention?.windows ?? []).map((window) =>
+      [window.window, window.bands.reduce((n, band) => n + band.adjacencies, 0)])) : null,
+    settledLane: settled ? { lane: settled.lane, modes: settledModes,
+      marks: settled.marks.reduce((n, mark) => ({ ...n, [`${mark.owner}:${mark.layout}${mark.refusal ? `:${mark.refusal}` : ""}`]:
+        (n[`${mark.owner}:${mark.layout}${mark.refusal ? `:${mark.refusal}` : ""}`] ?? 0) + 1 }), {}),
+      markedDays: Object.fromEntries(roster.map((owner) => [owner.key, settled.marks.filter((mark) => mark.owner === owner.key)
+        .map((mark) => `${mark.day}:${mark.layout}`)])),
+      unpromotedProgress: settled.progress } : null,
+    reference: cacheDays ? {
+      rule: "cache-days.mjs: createCacheRetentionEffectiveDayBuild for every owner-day with effective usage, the candidate and carry digests being the source dependency digests the lane's source build proves",
+      ownerDays: Object.keys(cacheDays.days).length,
+      outcomes: Object.values(cacheDays.days).reduce((n, day) => ({ ...n, [`${day.state}${day.reason ? `:${day.reason}` : ""}`]:
+        (n[`${day.state}${day.reason ? `:${day.reason}` : ""}`] ?? 0) + 1 }), {}),
+      notBuilt: Object.fromEntries(Object.entries(cacheDays.days).filter(([, day]) => day.state !== "built")
+        .map(([key, day]) => [key, `${day.state}:${day.reason ?? day.code ?? ""}`])),
+      withValues: Object.keys(cacheDays.ownerDays).length, settledAgreement: cacheDays.settledAgreement } : null },
   parityBasis: { runSpecificColumns: RUN_SPECIFIC_ANALYTICS_COLUMNS, publishedRowDigests },
   leaseExpiryProbe: probe,
   sourceDump: { tables: usageDump.tables, rows: usageDump.rows, schemaSha256: usageDump.schemaSha256,
     rowCountsSha256: usageDump.rowCountsSha256, jsonBytes: usageDump.bytes, jsonSha256: usageDump.sha256,
     sealedSqlite: sealed, sourceUnchangedByAnalysis: sourceBeforeAnalysis === null ? null : sourceBeforeAnalysis === sourceAfterAnalysis,
-    reproduce: `node --max-old-space-size=16384 apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs --work-dir <dir> --corpus ${options.corpus}${options.corpus === "dense" && options.layout !== DENSE_DEFAULT_LAYOUT ? ` --layout ${options.layout}` : ""}${options.scale === 1 ? "" : ` --scale ${options.scale}`}${options.publicationPasses === 1 ? "" : ` --publication-passes ${options.publicationPasses}`}${options.analyticsPasses === 1 ? "" : ` --analytics-passes ${options.analyticsPasses}`}${options.clockStepMs === 0 ? "" : ` --clock-step-ms ${options.clockStepMs}`}${options.stopWhen === "converged" ? "" : ` --stop-when ${options.stopWhen}`}` },
+    contentDigest: { sha256: sourceAfterAnalysis, rule: "source-digest.mjs: every table's rows in a total order (independent of page layout)" },
+    reproduce: reproduceCommand },
 };
 const diagnostics = { header: { ...header, seedMs, convergenceMs: convergence.elapsedMs, forcedCost,
   wallMs: Math.round(performance.now() - wallStarted), randomBytesDrawn: runtime.randomBytesDrawn() },
@@ -1284,10 +1604,21 @@ const files = {
     runtime: header.runtime, seedMs, tierN: { ticks: convergence.ticks, elapsedMs: convergence.elapsedMs, laneMs: convergence.laneMs,
       laneStats: convergence.laneStats ?? null, slowestLane: convergence.slowestLane ?? null, publicationPasses: options.publicationPasses,
       resumedFrom: prior === null ? null : "converged run (--resume)" },
+    direct: directCost === null ? null : { total: directCost, owners: Object.fromEntries(Object.entries(direct).map(([key, value]) => [key,
+      { ms: Object.values(value.model).reduce((n, item) => n + item.cost.ms, value.fits.cost.ms), fitsMs: value.fits.cost.ms,
+        maxModelMs: Math.max(0, ...Object.values(value.model).map((item) => item.cost.ms)) }])) },
+    cache: settled ? { settledLaneMs: settled.lane.ms, reference: cacheDays.cost } : null,
+    windowRoutingNote: "window routing time is in oracle.log (window-routing)",
     tierF: { scope: options.forcedNative, total: forcedCost, owners: Object.fromEntries(Object.entries(forcedSummary)
       .map(([key, value]) => [key, { pages: value.pages, cost: value.cost }])) } }),
   "cache-owner-days.json": pretty({ schemaVersion: "gcp-fastpath-dense-cache-owner-days-v1", basis: "Tier N cache-retention values as production's interleaved lanes left them (see manifest.cacheRetention.marks)", ownerDays: cacheByOwnerDay }),
 };
+if (settledResponse) files["community-daily-response-settled.json"] = pretty(settledResponse.body);
+if (cacheDays) {
+  files["cache-reference.json"] = pretty({ schemaVersion: "gcp-fastpath-dense-cache-reference-v1",
+    basis: "production's effective day build (createCacheRetentionEffectiveDayBuild) for every owner-day with effective usage, outside the lane (cache-days.mjs); rows are the day's values and bands as writeCacheRetentionDay stores them",
+    method: "cache-days.mjs", nowMs: analysisNowMs, ownerDays: cacheDays.ownerDays, days: cacheDays.days });
+}
 if (denseSummary) {
   if (denseSummary.failures.length > 0) note("corpus-gate-failures", { failures: denseSummary.failures });
   files["dense-corpus.json"] = pretty(denseSummary);
@@ -1300,7 +1631,11 @@ files["SOURCE.json"] = pretty({
   command: manifest.sourceDump.reproduce + (options.goldenOut ? ` --golden-out ${relative(REPO_ROOT, options.goldenOut)}` : ""),
   oracleFiles: LOADED_BLOBS,
   adapter: { path: "apps/worker/cloud-run/sealed-sqlite-d1-adapter.mjs", blob: ADAPTER_BLOB },
-  resumedFrom: prior === null ? null : "a converged run of the same corpus, scale and cadence (--resume): its seeding, convergence and lease-expiry probe ran in that run's process and their recorded outcomes were carried forward; every file here was computed by this process from that converged state",
+  resumedFrom: prior === null ? null : "a run of the same corpus, scale and cadence that converged or stopped by its stop rule (--resume): its seeding, scheduled lanes and lease-expiry probe ran in that run's process and their recorded outcomes were carried forward; every file here was computed by this process from that state, except the direct references when directResults is set",
+  directResults: directImport === null ? null : { command: "node apps/worker/scripts/gcp-fastpath-dense-oracle/direct.mjs --work-dir <dir> --source <seeded usage-monitor.sqlite> --expect-source-digest <sourceDigest> --jobs 12",
+    sha256: directImport.sha256, sourceDigest: directImport.sourceDigest, nowMs: directImport.nowMs,
+    producerFiles: "apps/worker/scripts/gcp-fastpath-dense-oracle/{direct.mjs,direct-native.mjs,direct-native-child.mjs,source-digest.mjs} at the blobs listed in oracleFiles",
+    recomputedInThisProcess: directImport.recomputedInThisProcess },
   bundleNote: "bundleSha256 identifies this build only: the bundle embeds work-directory paths",
   q1Corpus: { path: "apps/worker/analytics-v2-test/golden/corpus/", sha256: q1.sha256 },
   build: { verifiedFiles: build.verifiedFiles, listingSha256: build.listingSha256, bundleSha256: build.bundle.sha256,
@@ -1313,7 +1648,8 @@ files["SOURCE.json"] = pretty({
 });
 for (const [name, text] of Object.entries(files)) writeFileSync(join(outDir, name), text);
 writeFileSync(join(options.workDir, "diagnostics.json"), pretty(diagnostics));
-const privacy = privacyScan([join(outDir, "community-daily-response.json"), join(outDir, "preview.json")]);
+const privacy = privacyScan([join(outDir, "community-daily-response.json"), join(outDir, "preview.json"),
+  ...(settledResponse ? [join(outDir, "community-daily-response-settled.json")] : [])]);
 note("golden", { outDir, files: Object.fromEntries(Object.entries(files).map(([name, text]) => [name, { bytes: Buffer.byteLength(text), sha256: sha256Text(text) }])),
   privacy: { ok: privacy.ok, findings: privacy.findingCount } });
 

@@ -46,3 +46,14 @@ export { ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG, ADMIN_COMMUNITY_ALLOWANCE_MODEL
 export { projectPublicAllowanceGraph } from "../src/public-allowance-breakdowns";
 export { V11_PLAN_ATTRIBUTION_ADAPTER_VERSION } from "../src/quota-analysis-v11";
 export { readAnalyticsModelBlock } from "../src/analytics-model-block";
+// The settled cache-retention rebuild (settled-cache.mjs) drives production's
+// lane and build directly, the per-owner-day reference (cache-days.mjs) calls
+// the effective day build, and the routing record reads the shared-feature
+// window exactly as computeEffective does.
+export { advanceCacheRetentionDayLane, CACHE_RETENTION_EFFECTIVE_DEVICE_ID, CACHE_RETENTION_EFFECTIVE_MANIFEST_ID,
+  CacheRetentionDeferredError, cacheRetentionLookbackDays, createCacheRetentionDaySourceBuild,
+  createCacheRetentionEffectiveDayBuild, readCacheRetentionCommunitySeries } from "../src/cache-retention-day";
+export { CacheRetentionRefusedError } from "../src/cache-retention-values";
+export { CACHE_RETENTION_WORKER_DAYS, CACHE_RETENTION_WORKER_WRITES } from "../src/cache-retention-day-worker";
+export { readSharedAnalyticsFeatureWindow } from "../src/storage-analytics-shared-features";
+export { readEffectiveTelemetryOwnerDays } from "../src/telemetry-usage-effective-reader";
