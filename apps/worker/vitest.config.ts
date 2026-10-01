@@ -45,6 +45,8 @@ export default defineConfig({
     // APIs; they run under their separate Node or local-PostgreSQL gates.
     // analytics-v2-test/** holds the Node-only analytics-v2 specs (vendored
     // kernel parity, compose proof, refresh job), run by their own config.
-    exclude: [...configDefaults.exclude, "postgres-test/**", "analytics-v2-test/**"],
+    // vendor/** is the d43c8f92 kernel tree; it resolves its own packages
+    // only under vitest.analytics-v2.config.mjs.
+    exclude: [...configDefaults.exclude, "postgres-test/**", "analytics-v2-test/**", "vendor/**"],
   },
 });
