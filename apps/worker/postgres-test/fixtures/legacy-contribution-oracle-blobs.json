@@ -1,0 +1,16 @@
+{
+  "commit": "d43c8f92",
+  "note": "git blob ids of the production files the IN-3 legacy admission oracle runs; postgres-legacy-contribution-admission.spec.mjs refuses any drift.",
+  "blobs": {
+    "src/typed-v1-admission.ts": "db661dd4b7004bfad7bd5b3e78affb1c5ff7fb0a",
+    "src/telemetry-v1-repository.ts": "ce812ccdf34461849ae3a28126b0458a512dce36",
+    "src/typed-telemetry-repository.ts": "2d0ad5621b7b9e982085fdcd309f43f9e93c7d96",
+    "src/telemetry-v1.ts": "62eabd530b9fad9712808d79de90f3ca28b02e17",
+    "src/telemetry-transport-policy.ts": "5bad30d1e1c71233bc5d4c56975b90307ca53141",
+    "typed-v1-admission-migrations/0001_typed_v1_chunk_admission.sql": "3e71132d54d2f3af3a75a2f0fcde729c9ba7f306",
+    "ingestion-isolation-migrations/0003_v1_append_classification.sql": "14902b62b254a8ea8dbbce8ecd00d58eba1bdaf2",
+    "ingestion-isolation-migrations/0004_v1_multidevice_source_update.sql": "9e606cbd6a64f724b4326cb581eb685d5e2f2e9d",
+    "typed-ingestion-migrations/0001_typed_telemetry.sql": "e6c938446cbdf2d6394696a04106d3529a622254",
+    "typed-ingestion-migrations/0002_delivery_journal.sql": "6adfcec59fd285cf270e8c1d607cd8f0ed869f44"
+  }
+}
