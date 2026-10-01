@@ -406,6 +406,7 @@ async function fixture() {
       frontEnd, access, sparkle, assets, clientKeySecret, edge, reference, common,
       allExchanges: [],
       rows: [],
+      transportRetries: [],
     };
   })();
   return fixturePromise;
@@ -587,14 +588,35 @@ function privacyViolations(f, exchange, { ip, hostKind = null }) {
  * comparator applies). Records the exchanges, asserts the row's comparators
  * and S7, and returns the answers.
  */
+/**
+ * A multi-MiB body that the server refuses before reading it is answered
+ * early, and workerd then closes the local client connection while
+ * Miniflare's client (undici) may still be sending; undici can report that as
+ * a "terminated" fetch instead of the answer. That race is in the local
+ * client transport, for the Worker and the edge alike, so such a row is sent
+ * again (at most twice) and the retry is recorded in the report.
+ */
+async function sendRow(f, instance, url, options, row, beforeAttempt = () => {}) {
+  for (let attempt = 0; ; attempt += 1) {
+    beforeAttempt();
+    try {
+      return await instance.fetch(url, options);
+    } catch (error) {
+      const largeBody = (row.bodyBytes ?? 0) >= 1024 * 1024;
+      if (!largeBody || attempt >= 2 || !(error instanceof TypeError)) throw error;
+      f.transportRetries.push({ row: row.id, attempt: attempt + 1, message: String(error.message).slice(0, 40) });
+    }
+  }
+}
+
 async function runRow(f, row, { edge = f.edge, reference = f.reference, ip = nextIp(), extraCheck } = {}) {
   const { url, options } = materialize(row, f);
-  const mark = f.frontEnd.mark();
-  const edgeAnswer = await edge.fetch(url, { ...options, ip });
+  let mark = f.frontEnd.mark();
+  const edgeAnswer = await sendRow(f, edge, url, { ...options, ip }, row, () => { mark = f.frontEnd.mark(); });
   const exchanges = f.frontEnd.since(mark);
   let referenceAnswer = null;
   if (row.comparators.includes("worker")) {
-    referenceAnswer = await reference.fetch(url, { ...options, ip });
+    referenceAnswer = await sendRow(f, reference, url, { ...options, ip }, row);
     assert.deepEqual(workerMismatches(edgeAnswer, referenceAnswer, row), [],
       `${row.id}: edge and Worker differ (edge ${edgeAnswer.status} ${edgeAnswer.text.slice(0, 200)}; `
       + `exchanges ${JSON.stringify(exchanges.map((exchange) => [exchange.outcome, exchange.originStatus,
@@ -2134,6 +2156,7 @@ test("S7 privacy over every exchange of the run; the gcp edge never touched stor
       uniqueRequestIds: ids.size,
       framing,
       tokenExchangesIssued: issued,
+      transportRetries: f.transportRetries,
       rows: f.rows,
     };
     await writeFile(resolve(process.env.EDGE_E2E_REPORT), `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 });
