@@ -36,10 +36,10 @@ import { telemetryV11DayShape, TELEMETRY_V11_SHAPE_TABLES } from "./fixtures/tel
  * (fixtures/telemetry-v11-live-q1-owner-a-2026-09-30.json, extracted from the
  * Q-1 D1 dump by fixtures/extract-telemetry-v11-q1-day.mjs).
  *
- * The route modules and the envelope registration are driven directly: the
- * origin mounts neither yet (the composition's pathname dispatch and the
- * envelope registration are lead hand-offs), and the contributions preamble
- * is IN-1b's. The test plays the preamble's part with the production
+ * The route modules and the envelope registration are driven directly here
+ * (the composed origin, cloud-run/origin-intake-composition.mjs, is driven
+ * end to end by postgres-origin-intake.spec.mjs), and the contributions
+ * preamble is IN-1b's. The test plays the preamble's part with the production
  * PostgreSQL adapters: claim (under the v1.1 accountless gate for the
  * accountless owner), the telemetry-contribution-v1.1 transport gate, then
  * abandon on a failure before persistence. Rate-limit adapters are stubs.
@@ -1834,12 +1834,33 @@ test("v1.1 admission answers the Worker's caps, conflicts, v0.2 refusal and conc
     const challenger = await stageDay(modules, primaryPool, schema, owner, makeV11Day(today, {
       usage: [usageAt(today, "challenger")],
     }, "synthetic-edge"), options);
-    const outcomes = await Promise.all([
-      refusal(domain.activate(owner.principal, domainManifest(loserPredecessor, [first, challenger]))),
-      refusal(domain.activate(owner.principal, domainManifest(loserPredecessor, [first, todayEmpty]))),
+    // Both commit orders are legitimate, as on D1: an unchanged vector neither
+    // consumes the predecessor nor moves the head, so the challenger always
+    // activates, and the unchanged vector is either an unchanged replay (it
+    // ran first) or a manifest conflict (the head had already moved).
+    const challengerManifest = domainManifest(loserPredecessor, [first, challenger]);
+    const unchangedManifest = domainManifest(loserPredecessor, [first, todayEmpty]);
+    const settle = (promise) => promise.then((result) => ({ status: "resolved", result }),
+      (error) => ({ status: error?.status, code: error?.code }));
+    const [challenged, repeated] = await Promise.all([
+      settle(domain.activate(owner.principal, challengerManifest)),
+      settle(domain.activate(owner.principal, unchangedManifest)),
     ]);
-    assert.deepEqual(outcomes.map((outcome) => outcome.status).sort(), [409, "resolved"]);
-    assert.ok(outcomes.some((outcome) => outcome.code === "TELEMETRY_MANIFEST_CONFLICT"));
+    assert.equal(challenged.status, "resolved");
+    assert.equal(challenged.result.replay, false);
+    assert.notEqual(challenged.result.generationId, racing[0].generationId);
+    assert.ok((repeated.status === 409 && repeated.code === "TELEMETRY_MANIFEST_CONFLICT")
+      || (repeated.status === "resolved" && repeated.result.unchanged === true
+        && repeated.result.generationId === racing[0].generationId), JSON.stringify(repeated));
+    const raceHead = await primaryPool.query(
+      `SELECT generation_id FROM ${q(primarySchema, "telemetry_v11_domain_heads")} WHERE participant_id = $1`,
+      [owner.participantId],
+    );
+    assert.equal(raceHead.rows[0]?.generation_id, challenged.result.generationId);
+    // Once the head has moved, the same unchanged vector under the consumed
+    // predecessor is a manifest conflict in either order.
+    assert.deepEqual(await refusal(domain.activate(owner.principal, unchangedManifest)),
+      { status: 409, code: "TELEMETRY_MANIFEST_CONFLICT" });
 
     // 429 for the 8,192nd-plus manifest of one device and UTC day, even
     // under concurrent registration.
