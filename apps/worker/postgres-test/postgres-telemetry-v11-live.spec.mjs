@@ -1183,3 +1183,95 @@ test("an accountless v1.1 owner negotiates successors, matches the Q-1 rows, and
     await close();
   }
 });
+
+test("a v1.1 head accepted before storage_source_state is reported pending and bridged exactly once", {
+  skip: endpoint === null,
+  timeout: 120_000,
+}, async () => {
+  const { primaryPool, schema, close } = await openSchemas("pend", [STAGED]);
+  try {
+    const { live, constants } = await loadModules();
+    const { primarySchema } = schema;
+    await primaryPool.query(
+      `UPDATE ${q(primarySchema, "telemetry_transport_formats")} SET lifecycle = 'accepted'
+        WHERE schema_version = 'telemetry-contribution-v1.1'`,
+    );
+    await live.initializePostgresTypedV11Admission(primaryPool, { schema, sourceNamespace: SOURCE_NAMESPACE });
+    const now = new Date().toISOString();
+    const participantId = `participant:${randomUUID()}`;
+    const deviceId = randomUUID();
+    await primaryPool.query(
+      `INSERT INTO ${q(primarySchema, "participants")} (id, owner_kind, state, consent_version, created_at)
+       VALUES ($1, 'social', 'active', $2, $3)`, [participantId, constants.TELEMETRY_CONSENT_VERSION, now],
+    );
+    const expiry = new Date(Date.now() + 30 * DAY_MS).toISOString();
+    const sessionId = randomUUID();
+    const pairingId = randomUUID();
+    await primaryPool.query(
+      `INSERT INTO ${q(primarySchema, "web_sessions")} (
+         id, participant_id, secret_hash, csrf_hash, issued_at, expires_at, last_used_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $5)`,
+      [sessionId, participantId, randomBytes(32), randomBytes(32), now, expiry],
+    );
+    await primaryPool.query(
+      `INSERT INTO ${q(primarySchema, "device_pairings")} (
+         id, participant_id, issued_by_session_id, secret_hash, consent_version,
+         transport_consent_version, state, issued_at, expires_at, consumed_at, claimed_device_id
+       ) VALUES ($1, $2, $3, $4, $5, 'ongoing-privacy-safe-telemetry-v1.0', 'consumed', $6, $7, $6, $8)`,
+      [pairingId, participantId, sessionId, randomBytes(32), constants.TELEMETRY_CONSENT_VERSION, now, expiry, deviceId],
+    );
+    await primaryPool.query(
+      `INSERT INTO ${q(primarySchema, "device_credentials")} (
+         id, participant_id, authority_kind, paired_via_pairing_id, secret_hash,
+         state, issued_at, expires_at, last_used_at, social_verified_at
+       ) VALUES ($1, $2, 'social', $3, $4, 'active', $5, $6, $5, $5)`,
+      [deviceId, participantId, pairingId, randomBytes(32), now, expiry],
+    );
+    await primaryPool.query(
+      `INSERT INTO ${q(primarySchema, "telemetry_v11_device_consents")} (
+         participant_id, device_id, telemetry_schema_version, field_dictionary_version,
+         privacy_contract_version, consented_at
+       ) VALUES ($1, $2, 'telemetry-contribution-v1.1', 'telemetry-v1.1-registry-2026-08-31.1',
+         'ongoing-privacy-safe-telemetry-v1.1', $3)`, [participantId, deviceId, now],
+    );
+    const principal = { participantId, deviceId };
+    const options = { schema, sourceNamespace: SOURCE_NAMESPACE };
+    const today = new Date().toISOString().slice(0, 10);
+    const empty = await live.registerPostgresTelemetryV11DayManifest(
+      primaryPool, principal, makeV11Day(today, {}, "synthetic-v11-live").manifest, Date.now(), options,
+    );
+    const domain = live.createPostgresTelemetryV11Domain(primaryPool, options);
+    const predecessor = await domain.createPredecessor(principal);
+    const generation = await domain.activate(principal, domainManifest(predecessor, [
+      { day: today, manifestId: empty.manifestId, manifestDigest: empty.manifestDigest },
+    ]));
+    assert.equal(generation.replay, false);
+
+    const count = async () => Number((await primaryPool.query(
+      `SELECT ${q(primarySchema, "storage_v11_bridge_pending_count")}() AS n`,
+    )).rows[0].n);
+    const backfill = async () => Number((await primaryPool.query(
+      `SELECT ${q(primarySchema, "storage_v11_bridge_backfill")}(10) AS n`,
+    )).rows[0].n);
+    assert.equal(await count(), 1, "the head was accepted without a journal source");
+    assert.equal(await backfill(), 0, "without storage_source_state nothing is minted");
+    assert.deepEqual(await bridgeState(primaryPool, primarySchema, participantId), { link: null, receipts: [], journal: [] });
+    await primaryPool.query(
+      `INSERT INTO ${q(primarySchema, "storage_source_state")} (singleton, source_id, authority_epoch)
+       VALUES (1, 'synthetic-v11-live-source', 0)`,
+    );
+    assert.equal(await backfill(), 1);
+    assert.equal(await count(), 0);
+    assert.equal(await backfill(), 0, "a bridged head is never bridged twice");
+    const bridged = await bridgeState(primaryPool, primarySchema, participantId);
+    assert.deepEqual(bridged.receipts.map((row) => [row.generation_id, row.head_revision]), [[generation.generationId, 1]]);
+    assert.deepEqual(bridged.journal.map((row) => [row.kind, row.revision, row.content_digest]),
+      [["owner-active", 1, generation.manifestDigest]]);
+    assert.deepEqual([bridged.link.state, bridged.link.generation_id, bridged.link.head_revision],
+      ["active", generation.generationId, 1]);
+    await assert.rejects(primaryPool.query(`SELECT ${q(primarySchema, "storage_v11_bridge_backfill")}(0)`),
+      { message: "storage_v11_bridge_limit_invalid" });
+  } finally {
+    await close();
+  }
+});

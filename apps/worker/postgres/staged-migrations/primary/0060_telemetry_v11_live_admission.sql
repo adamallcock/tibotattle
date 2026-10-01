@@ -38,9 +38,12 @@
 --   (6) The v1.1 owner bridge (D1 ingestion-bridge 0001): an eligible
 --       accepted head change records a storage_v11_event_sources receipt and
 --       one exact owner-active journal row, as 0055 does for v1.2.
+--   (7) The bridge's pending read (storage_v11_bridge_pending_count) and
+--       bounded maintenance backfill (storage_v11_bridge_backfill), as 0055
+--       has for v1.2, without a one-time backfill (imported heads carry D1's
+--       receipts).
 --
--- Not here (documented gaps, IN-2 continuation): the bridge's pending read
--- and backfill for heads accepted before storage_source_state existed, D1's
+-- Not here (documented gaps, IN-2 continuation): D1's
 -- community_snapshot_mutation_control / community_daily_aggregate_rebuilds
 -- head side effects, and the chunk admission window counter
 -- (telemetry_v1_chunk_admission_windows), which the admission module
@@ -241,8 +244,7 @@ CREATE TRIGGER telemetry_v11_typed_json_refusal
 -- Eligibility is 0055's storage_v12_bridge_eligible (community_public_source_
 -- owners with the head's device), read again under the link lock. Without
 -- storage_source_state, in a transfer session, or for an erased owner the
--- bridge does nothing; a pending read and backfill for such heads are the
--- next IN-2 item, as 0055's are for v1.2.
+-- bridge does nothing; (7) reports and repairs such heads.
 CREATE FUNCTION storage_v11_bridge_head(
   participant_id_value text,
   generation_id_value text,
@@ -351,3 +353,136 @@ $$;
 CREATE TRIGGER storage_v11_head_publication
   AFTER INSERT OR UPDATE ON telemetry_v11_domain_heads
   FOR EACH ROW EXECUTE FUNCTION storage_v11_head_publication();
+
+-- (7) Heads the v1.1 bridge still owes, and their bounded repair: 0055
+-- (5)-(7) for v1.1. A pending head is an eligible current head of an owner
+-- that is not erased with no receipt for its (participant, generation,
+-- revision), for example one accepted before storage_source_state existed.
+-- There is no one-time backfill here: heads present when this migration runs
+-- arrive from the D1 import together with D1's own receipts.
+CREATE FUNCTION storage_v11_bridge_pending_heads()
+RETURNS TABLE (participant_id text, generation_id text, head_revision bigint)
+LANGUAGE sql STABLE SET search_path FROM CURRENT AS $$
+  SELECT head.participant_id, head.generation_id, head.revision::bigint
+    FROM telemetry_v11_domain_heads head
+    JOIN telemetry_v11_domains domain
+      ON domain.id = head.generation_id AND domain.participant_id = head.participant_id
+   WHERE EXISTS (
+           SELECT 1 FROM community_public_source_owners public_owner
+            WHERE public_owner.participant_id = head.participant_id
+              AND (public_owner.device_id IS NULL OR public_owner.device_id = domain.device_id))
+     AND NOT EXISTS (
+           SELECT 1 FROM storage_v11_event_sources receipt
+            WHERE receipt.participant_id = head.participant_id
+              AND receipt.generation_id = head.generation_id
+              AND receipt.head_revision = head.revision)
+     AND NOT EXISTS (
+           SELECT 1 FROM storage_v11_owner_links owner_link
+            WHERE owner_link.participant_id = head.participant_id
+              AND (owner_link.state = 'erased' OR EXISTS (
+                SELECT 1 FROM storage_owner_revisions owner_head
+                 WHERE owner_head.owner_digest = owner_link.owner_digest
+                   AND owner_head.state = 'erased')))
+$$;
+
+-- A content-free health count; it does not require storage_source_state.
+CREATE FUNCTION storage_v11_bridge_pending_count()
+RETURNS bigint
+LANGUAGE sql STABLE SET search_path FROM CURRENT AS $$
+  SELECT count(*)::bigint FROM storage_v11_bridge_pending_heads()
+$$;
+
+-- Take every row the bridge needs for one pending head without waiting on
+-- another transaction's row lock (participant, v1.1 head, the head's device,
+-- the retention marker if any, the owner link), as 0055's
+-- storage_v12_bridge_lock_pending.
+CREATE FUNCTION storage_v11_bridge_lock_pending(participant_id_value text)
+RETURNS boolean
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+DECLARE
+  device_id_value text;
+BEGIN
+  PERFORM 1 FROM participants participant
+   WHERE participant.id = participant_id_value AND participant.state = 'active'
+   FOR SHARE SKIP LOCKED;
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+  SELECT domain.device_id INTO device_id_value
+    FROM telemetry_v11_domain_heads head
+    JOIN telemetry_v11_domains domain
+      ON domain.id = head.generation_id AND domain.participant_id = head.participant_id
+   WHERE head.participant_id = participant_id_value
+   FOR UPDATE OF head SKIP LOCKED;
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+  PERFORM 1 FROM device_credentials device
+   WHERE device.id = device_id_value
+   FOR SHARE SKIP LOCKED;
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+  IF EXISTS (SELECT 1 FROM accountless_public_history_retention marker
+              WHERE marker.participant_id = participant_id_value) THEN
+    PERFORM 1 FROM accountless_public_history_retention marker
+     WHERE marker.participant_id = participant_id_value
+     FOR SHARE SKIP LOCKED;
+    IF NOT FOUND THEN
+      RETURN false;
+    END IF;
+  END IF;
+  IF NOT storage_v12_bridge_eligible(participant_id_value, device_id_value) THEN
+    RETURN false;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM storage_v11_owner_links owner_link
+                  WHERE owner_link.participant_id = participant_id_value) THEN
+    PERFORM storage_owner_link_ensure(participant_id_value, 'withdrawn');
+  END IF;
+  PERFORM 1 FROM storage_v11_owner_links owner_link
+   WHERE owner_link.participant_id = participant_id_value
+   FOR UPDATE SKIP LOCKED;
+  RETURN FOUND;
+END;
+$$;
+
+-- Bounded, idempotent repair: inspects at most limit_value pending heads in
+-- participant_id COLLATE "C" order and bridges at most one, so its caller
+-- commits before the next owner (the append takes storage_source_state).
+CREATE FUNCTION storage_v11_bridge_backfill(limit_value integer)
+RETURNS integer
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+DECLARE
+  candidate record;
+  current_generation text;
+  current_revision bigint;
+BEGIN
+  IF limit_value IS NULL OR limit_value < 1 OR limit_value > 500 THEN
+    RAISE EXCEPTION 'storage_v11_bridge_limit_invalid' USING ERRCODE = 'P1005';
+  END IF;
+  IF storage_journal_transfer_session() THEN
+    RAISE EXCEPTION 'storage_v11_bridge_transfer_session' USING ERRCODE = 'P1005';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM storage_source_state source WHERE source.singleton = 1) THEN
+    RETURN 0;
+  END IF;
+  FOR candidate IN
+    SELECT pending.participant_id
+      FROM storage_v11_bridge_pending_heads() pending
+     ORDER BY pending.participant_id COLLATE "C"
+     LIMIT limit_value
+  LOOP
+    CONTINUE WHEN NOT storage_v11_bridge_lock_pending(candidate.participant_id);
+    SELECT head.generation_id, head.revision::bigint
+      INTO current_generation, current_revision
+      FROM telemetry_v11_domain_heads head
+     WHERE head.participant_id = candidate.participant_id;
+    IF storage_v11_bridge_head(candidate.participant_id, current_generation, current_revision) THEN
+      RETURN 1;
+    END IF;
+  END LOOP;
+  RETURN 0;
+END;
+$$;
+-- A maintenance entrypoint, granted deliberately like storage_journal_append.
+REVOKE ALL ON FUNCTION storage_v11_bridge_backfill(integer) FROM PUBLIC;
