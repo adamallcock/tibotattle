@@ -17,7 +17,8 @@
 //     with the golden's nowMs;
 //  5. composes cloud-run/dist/server.mjs in fastpath-test mode with
 //     ANALYTICS_V2_ENABLED=1, the injected clock and local pools, and serves
-//     it on 127.0.0.1;
+//     it on 127.0.0.1 from a child process under the same Node 22 (the
+//     image runtime);
 //  6. GETs /api/v1/community/daily?from=<golden from>&to=<golden to>;
 //  7. compares the response and the stored preview with the golden
 //     (scripts/analytics-v2-parity-compare.mjs, publication fields only
@@ -34,7 +35,7 @@
 // step completed but a gate failed (the report says which); 2 when the
 // rehearsal could not run.
 
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { chmod, lstat, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
@@ -342,7 +343,68 @@ async function startOrigin({ endpoint, schema, ledgerSchema, nowMs }) {
   return { origin, close, pools, mode: runtime.postgresTestHostMode };
 }
 
+/**
+ * The origin child: compose and serve dist/server.mjs, print one JSON line
+ * with its origin, and run until SIGTERM (serve() closes the listener and
+ * the pools, then exits).
+ */
+async function originChild() {
+  const config = JSON.parse(process.env.GCP_FASTPATH_REHEARSAL_ORIGIN ?? "null");
+  if (config === null || typeof config !== "object") fail("REHEARSAL_ORIGIN_CONFIG_INVALID");
+  delete process.env.GCP_FASTPATH_REHEARSAL_ORIGIN;
+  const started = await startOrigin(config);
+  process.stdout.write(`${JSON.stringify({ origin: started.origin, mode: started.mode, node: process.version })}\n`);
+}
+
+/** Start the origin child under `node`, and resolve once it is listening. */
+async function spawnOrigin({ node, endpoint, schema, ledgerSchema, nowMs }) {
+  const child = spawn(node, [fileURLToPath(import.meta.url), "--origin-child"], {
+    cwd: CLOUD_RUN_ROOT,
+    env: {
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+      ...(process.env.PG_TEST_USER ? { PG_TEST_USER: process.env.PG_TEST_USER } : {}),
+      ...(process.env.PG_TEST_DATABASE ? { PG_TEST_DATABASE: process.env.PG_TEST_DATABASE } : {}),
+      GCP_FASTPATH_REHEARSAL_ORIGIN: JSON.stringify({ endpoint, schema, ledgerSchema, nowMs }),
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr = (stderr + chunk).slice(-4_000); });
+  const exited = new Promise((resolveExit) => child.once("exit", (code, signal) => resolveExit({ code, signal })));
+  const ready = await new Promise((resolveReady, reject) => {
+    let buffer = "";
+    const timer = setTimeout(() => reject(new RehearsalError("REHEARSAL_ORIGIN_START_TIMEOUT")), 60_000);
+    child.stdout.on("data", (chunk) => {
+      buffer += chunk;
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) return;
+      clearTimeout(timer);
+      try { resolveReady(JSON.parse(buffer.slice(0, newline))); } catch { reject(new RehearsalError("REHEARSAL_ORIGIN_START_FAILED")); }
+    });
+    exited.then(() => {
+      clearTimeout(timer);
+      const last = stderr.trim().split("\n").filter(Boolean).at(-1) ?? "";
+      let code = "REHEARSAL_ORIGIN_EXITED";
+      try { code = JSON.parse(last).code ?? code; } catch { /* keep the closed code */ }
+      reject(new RehearsalError("REHEARSAL_ORIGIN_START_FAILED", { childCode: code }));
+    });
+  });
+  return {
+    ...ready,
+    async close() {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+      const result = await exited;
+      return result;
+    },
+  };
+}
+
 async function main() {
+  if (process.argv.includes("--origin-child")) {
+    await originChild();
+    return;
+  }
   const options = parseArguments(process.argv.slice(2));
   const [major, minor] = process.versions.node.split(".").map(Number);
   if (major < 22 || (major === 22 && minor < 13)) fail("REHEARSAL_NODE_UNSUPPORTED");
@@ -530,14 +592,16 @@ async function main() {
     const afterFirst = await publishedSnapshot(pool, schema);
 
     // 5-6. The fastpath-test origin and the public read.
-    origin = await timed(timings, "origin:start", async () => startOrigin({ endpoint, schema, ledgerSchema, nowMs }));
+    origin = await timed(timings, "origin:start", async () => spawnOrigin({
+      node: options.node22, endpoint, schema, ledgerSchema, nowMs,
+    }));
     const url = `${origin.origin}${COMMUNITY_DAILY_PATH}?from=${golden.from}&to=${golden.to}`;
     const response = await timed(timings, "origin:get", async () => {
       const result = await fetch(url);
       return { status: result.status, cacheControl: result.headers.get("cache-control"), text: await result.text() };
     });
     report.steps.read = { status: response.status, cacheControl: response.cacheControl, bytes: response.text.length,
-      hostMode: origin.mode };
+      hostMode: origin.mode, originNode: origin.node };
     if (response.status !== 200) fail("REHEARSAL_READ_FAILED", { status: response.status, body: response.text.slice(0, 300) });
     const actual = JSON.parse(response.text);
     const actualPreview = await storedPreview(pool, schema);
@@ -588,8 +652,7 @@ async function main() {
     };
   } finally {
     if (origin !== null) {
-      await origin.close().catch(() => {});
-      for (const created of origin.pools) await created.end().catch(() => {});
+      report.originExit = await origin.close().catch(() => null);
     }
     for (const source of sources) {
       try { source.close?.(); } catch { /* already closed */ }
@@ -612,7 +675,6 @@ async function main() {
   process.stdout.write(text);
   if (options.out !== null) await writeFile(options.out, text, { flag: "wx" });
   process.exitCode = report.status === "pass" ? 0 : report.status === "gate_failed" ? 1 : 2;
-  // The origin registered SIGTERM/SIGINT handlers and pools may hold timers.
   process.exit(process.exitCode);
 }
 
