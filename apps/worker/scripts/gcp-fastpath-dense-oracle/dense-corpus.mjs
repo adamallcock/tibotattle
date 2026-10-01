@@ -3,29 +3,43 @@
 // Owners a to d stay the Q-1 corpus files byte for byte; this module only adds
 // owner e: one social v1.2 owner whose usage is dense enough that production
 // (d43c8f92) routes it through its native paths, and large enough to cross every
-// bound the GCP fast path refused at 7ef0e144:
+// bound the GCP fast path refused at 7ef0e144. Day classes:
 //
-//   class Q (2026-04-15)     13,500 seven-day quota observations (> 12,800 quota
-//                            rows) over ~4,000 usage events;
-//   class X (4 days)         ~40,000 usage events: > 20,000 occurrences and
-//                            > 32 MiB of record JSON in one day;
-//   class H (4 days)         18,000-23,000 usage events: > 20,000 occurrences
-//                            under 32 MiB;
-//   class M (every 9th day)  6,000-15,000 usage events: production's native
-//                            threshold (6,000 rows) but not the GCP one;
-//   class L (all others)     300-1,200 usage events.
+//   Q   13,500 seven-day quota observations (> 12,800 quota rows) over ~4,000
+//       usage events;
+//   X   ~40,000 usage events: > 20,000 occurrences and > 32 MiB of record JSON;
+//   H   18,000-23,000 usage events: > 20,000 occurrences under 32 MiB;
+//   M   6,000-15,000 usage events: production's native threshold (6,000 rows)
+//       but not the GCP one;
+//   S   2,900-3,200 usage events: under production's shared-feature day bounds
+//       (6,000 rows, 4 MiB), so production prepares them on its shared path;
+//   L   300-1,200 usage events (the only class `scale` multiplies in `compact`).
 //
-// The latest 101-day window then holds ~409,000 usage rows (> 120,000 and
-// > 204,800, the single-call page bound of the shared scalar path) and every
-// window holds at most 1,000,000 (MAX_WINDOWED_USAGE_ROWS).
+// Two layouts place the classes:
+//
+//   compact (default)  Q on 2026-04-15; S on every day from 2026-08-27 to
+//                      2026-09-28 except M 2026-09-10 and 2026-09-18 and H
+//                      2026-09-24; X on 2026-09-29 (inside a weekly reset); L
+//                      elsewhere. The current-fits window (2026-06-23 to
+//                      2026-10-01) holds ~230,000 usage rows (> 120,000 and
+//                      > 204,800, the single-call page bound of the shared scalar
+//                      path), the last model windows too, and earlier windows
+//                      progressively fewer, which bounds production's native
+//                      graph work to what proves the bounds.
+//   spread             the design's original layout: X on four days and H on
+//                      four days across the window, M every ninth day from
+//                      2026-05-01 (all scaled with L), so every model window
+//                      holds 240,000-420,000 rows; production needs days to
+//                      converge on it (measured), so it is kept for reference.
+//
+// Every window holds at most 1,000,000 usage rows (MAX_WINDOWED_USAGE_ROWS).
 //
 // Synthetic and content-free: identifiers are hash-derived, there are no paths,
 // prompts, commands, accounts or emails. The generator is pure: it does no I/O
 // and takes the pricer it needs (production's priceTelemetryUsageEvent) as an
 // argument, so it runs unchanged in Node and in workerd. Every owner-day is
 // regenerated from its own PRNG streams, so days stream one at a time and the
-// whole owner never has to be held in memory. `scale` multiplies only the M and
-// L class targets (a pilot at 0.1 still crosses every bound).
+// whole owner never has to be held in memory.
 
 import { createHash } from "node:crypto";
 
@@ -46,12 +60,34 @@ const EFFORTS = Object.freeze(["low", "medium", "high"]);
 const BASE_CAPACITY = Object.freeze({ "gpt-5.6-sol": 900, "gpt-5.6-terra": 420, "gpt-5.5": 700 });
 const PEAK_PERCENT = 80;
 
-export const DENSE_CLASS_DAYS = Object.freeze({
-  Q: Object.freeze(["2026-04-15"]),
-  X: Object.freeze(["2026-07-02", "2026-08-19", "2026-09-16", "2026-09-29"]),
-  H: Object.freeze(["2026-06-24", "2026-08-05", "2026-09-02", "2026-09-24"]),
+export const DENSE_DEFAULT_LAYOUT = "compact";
+const dayRange = (from, through) => {
+  const out = [];
+  for (let at = Date.parse(`${from}T00:00:00.000Z`); at <= Date.parse(`${through}T00:00:00.000Z`); at += 86_400_000) {
+    out.push(new Date(at).toISOString().slice(0, 10));
+  }
+  return out;
+};
+/** Fixed class days per layout; every other day is L, except `spread`'s M
+ * days (every ninth day from 2026-05-01) and `compact`'s S range. */
+export const DENSE_LAYOUTS = Object.freeze({
+  compact: Object.freeze({
+    Q: Object.freeze(["2026-04-15"]), X: Object.freeze(["2026-09-29"]), H: Object.freeze(["2026-09-24"]),
+    M: Object.freeze(["2026-09-10", "2026-09-18"]),
+    S: Object.freeze(dayRange("2026-08-27", "2026-09-28")
+      .filter((day) => !["2026-09-10", "2026-09-18", "2026-09-24"].includes(day))),
+  }),
+  spread: Object.freeze({
+    Q: Object.freeze(["2026-04-15"]),
+    X: Object.freeze(["2026-07-02", "2026-08-19", "2026-09-16", "2026-09-29"]),
+    H: Object.freeze(["2026-06-24", "2026-08-05", "2026-09-02", "2026-09-24"]),
+  }),
 });
-const M_FROM_DAY = "2026-05-01", M_EVERY_DAYS = 9;
+const SPREAD_M_FROM_DAY = "2026-05-01", SPREAD_M_EVERY_DAYS = 9;
+function validLayout(layout) {
+  if (!Object.hasOwn(DENSE_LAYOUTS, layout)) throw new TypeError("DENSE_CORPUS_LAYOUT_INVALID");
+  return layout;
+}
 const Q_DAY_SEVEN_DAY_OBSERVATIONS = 13_500;
 
 const hex = (...parts) => createHash("sha256").update([DENSE_CORPUS_SEED, ...parts].join("\u0000")).digest("hex");
@@ -112,22 +148,23 @@ function resetWindow(ms) {
 }
 const FIVE_HOURS = 5 * HOUR;
 
-/** The class of one owner-day. X, H and Q take precedence over M; the last day is L. */
-export function denseDayClass(day) {
-  for (const [name, days] of Object.entries(DENSE_CLASS_DAYS)) if (days.includes(day)) return name;
-  if (day === LAST_DAY) return "L";
-  const offset = Math.round((dayStartMs(day) - dayStartMs(M_FROM_DAY)) / DAY_MS);
-  return offset >= 0 && offset % M_EVERY_DAYS === 0 ? "M" : "L";
+/** The class of one owner-day. Fixed class days take precedence; the last day is L. */
+export function denseDayClass(day, layout = DENSE_DEFAULT_LAYOUT) {
+  for (const [name, days] of Object.entries(DENSE_LAYOUTS[validLayout(layout)])) if (days.includes(day)) return name;
+  if (day === LAST_DAY || layout !== "spread") return "L";
+  const offset = Math.round((dayStartMs(day) - dayStartMs(SPREAD_M_FROM_DAY)) / DAY_MS);
+  return offset >= 0 && offset % SPREAD_M_EVERY_DAYS === 0 ? "M" : "L";
 }
 
 /** Usage events planned for one owner-day's own sessions (tails are extra). */
-export function denseDayUsageTarget(day, scale = 1) {
+export function denseDayUsageTarget(day, scale = 1, layout = DENSE_DEFAULT_LAYOUT) {
   const { int } = draws(`${OWNER}:plan:${day}`);
-  const kind = denseDayClass(day);
+  const kind = denseDayClass(day, layout);
   if (kind === "X") return 40_000 + int(0, 999);
   if (kind === "H") return int(18_000, 23_000);
   if (kind === "Q") return 4_000;
-  if (kind === "M") return Math.max(20, Math.round(int(6_000, 15_000) * scale));
+  if (kind === "S") return int(2_900, 3_200);
+  if (kind === "M") return layout === "spread" ? Math.max(20, Math.round(int(6_000, 15_000) * scale)) : int(6_500, 15_000);
   if (day === LAST_DAY) return Math.max(5, Math.round(int(60, 160) * scale));
   return Math.max(20, Math.round(int(300, 1_200) * scale));
 }
@@ -138,6 +175,7 @@ const SESSION_SHAPE = Object.freeze({
   H: { lo: 5, hi: 600, crossing: 8, resumed: 6, shortGapShare: 0.98 },
   Q: { lo: 5, hi: 300, crossing: 2, resumed: 2, shortGapShare: 0.9 },
   M: { lo: 5, hi: 400, crossing: 5, resumed: 3, shortGapShare: 0.9 },
+  S: { lo: 5, hi: 400, crossing: 5, resumed: 3, shortGapShare: 0.9 },
   L: { lo: 5, hi: 120, crossing: 1, resumed: 1, shortGapShare: 0.35 },
 });
 const SHORT_GAPS_SECONDS = Object.freeze([3, 5, 8, 12, 18, 25, 35, 45, 60, 90]);
@@ -151,10 +189,10 @@ function gap(d, shortShare) {
 
 /** The working window of one day's own sessions. The last day closes by 02:30Z
  * (Q-1's rule) so nothing is after the seeding instant. */
-function dayWindow(day) {
+function dayWindow(day, layout) {
   const start = dayStartMs(day);
   if (day === LAST_DAY) return { from: start + 5 * MINUTE, to: start + 150 * MINUTE };
-  const kind = denseDayClass(day);
+  const kind = denseDayClass(day, layout);
   if (kind === "L") return { from: start + 6 * HOUR, to: start + 23 * HOUR };
   return { from: start + 20 * MINUTE, to: start + 23 * HOUR + 40 * MINUTE };
 }
@@ -205,17 +243,17 @@ function sessionEvents(d, { day, label, count, from, limit, shortShare }) {
 }
 
 /** Specs of sessions that cross from `day` into the next day. */
-function crossingSessions(day) {
+function crossingSessions(day, layout) {
   if (day >= LAST_DAY || !DENSE_CORPUS_DAY_LIST.includes(day)) return [];
-  const shape = SESSION_SHAPE[denseDayClass(day)];
+  const shape = SESSION_SHAPE[denseDayClass(day, layout)];
   return Array.from({ length: shape.crossing }, (_, j) => ({ origin: day, j,
     sessionUuid: uuid("session", OWNER, day, "cross", String(j)) }));
 }
 
 /** Specs of sessions that start on `day` and resume 1 to 6 days later. */
-function resumedSessions(day) {
+function resumedSessions(day, layout) {
   if (!DENSE_CORPUS_DAY_LIST.includes(day) || day === LAST_DAY) return [];
-  const shape = SESSION_SHAPE[denseDayClass(day)];
+  const shape = SESSION_SHAPE[denseDayClass(day, layout)];
   const d = draws(`${OWNER}:resume:${day}`);
   const out = [];
   for (let j = 0; j < shape.resumed; j++) {
@@ -232,11 +270,11 @@ function resumedSessions(day) {
  * next day, the tails of sessions crossing in from the previous day, and the
  * origin and resumed portions of resumed sessions.
  */
-function dayUsage(day, scale) {
-  const kind = denseDayClass(day);
+function dayUsage(day, scale, layout) {
+  const kind = denseDayClass(day, layout);
   const shape = SESSION_SHAPE[kind];
   const start = dayStartMs(day), end = start + DAY_MS;
-  const window = dayWindow(day);
+  const window = dayWindow(day, layout);
   const usage = [], sessions = [];
   const addSession = (d, label, sessionUuid, events, { record }) => {
     if (events.length === 0) return;
@@ -248,7 +286,7 @@ function dayUsage(day, scale) {
 
   // Own sessions: allocate the day's target across sessions that fit the window.
   const own = draws(`${OWNER}:day:${day}`);
-  let remaining = denseDayUsageTarget(day, scale);
+  let remaining = denseDayUsageTarget(day, scale, layout);
   for (let s = 0; remaining > 0 && s < 10_000; s++) {
     const want = Math.min(remaining, own.int(shape.lo, shape.hi));
     const span = Math.max(0, window.to - window.from);
@@ -261,7 +299,7 @@ function dayUsage(day, scale) {
   if (remaining > 0) throw new Error("DENSE_CORPUS_DAY_TARGET_UNPLACED");
 
   // Sessions crossing into the next day: their heads end before midnight.
-  for (const spec of crossingSessions(day)) {
+  for (const spec of crossingSessions(day, layout)) {
     const d = draws(`${OWNER}:cross:${day}:${spec.j}:head`);
     const from = start + 23 * HOUR + d.int(0, 45) * MINUTE + d.int(0, 59) * SECOND;
     const events = sessionEvents(d, { day, label: `cross-head:${spec.j}`, count: d.int(3, 40), from,
@@ -271,7 +309,7 @@ function dayUsage(day, scale) {
   // Tails of sessions that crossed in from the previous day (no session record:
   // the session's dimension belongs to its first day).
   const previous = dayOf(start - DAY_MS);
-  for (const spec of crossingSessions(previous)) {
+  for (const spec of crossingSessions(previous, layout)) {
     const d = draws(`${OWNER}:cross:${previous}:${spec.j}:tail`);
     const from = start + 5 * SECOND + d.int(0, 20) * MINUTE;
     const limit = day === LAST_DAY ? window.to : start + 6 * HOUR;
@@ -280,7 +318,7 @@ function dayUsage(day, scale) {
     addSession(d, `cross-tail:${spec.j}`, spec.sessionUuid, events, { record: false });
   }
   // Resumed sessions: an origin portion today, a resumed portion 1-6 days later.
-  for (const spec of resumedSessions(day)) {
+  for (const spec of resumedSessions(day, layout)) {
     const d = draws(`${OWNER}:resume:${day}:${spec.j}:origin`);
     const from = window.from + Math.floor(d.random() * Math.max(1, (window.to - window.from) * 0.8));
     const events = sessionEvents(d, { day, label: `resume-origin:${spec.j}`, count: d.int(5, 60), from,
@@ -289,7 +327,7 @@ function dayUsage(day, scale) {
   }
   for (let back = 1; back <= 6; back++) {
     const origin = dayOf(start - back * DAY_MS);
-    for (const spec of resumedSessions(origin)) {
+    for (const spec of resumedSessions(origin, layout)) {
       if (spec.resumeDay !== day) continue;
       const d = draws(`${OWNER}:resume:${origin}:${spec.j}:tail`);
       const from = start + 6 * HOUR + d.int(0, 14 * 60) * MINUTE;
@@ -331,13 +369,14 @@ function costUsd(pricer, record) {
  * M and L classes only. The first call prices every usage event once to fix the
  * capacity scale; days() then regenerates each owner-day with its quota.
  */
-export function createDenseOwner({ pricer, scale = 1 }) {
+export function createDenseOwner({ pricer, scale = 1, layout = DENSE_DEFAULT_LAYOUT }) {
   if (typeof pricer !== "function") throw new TypeError("DENSE_CORPUS_PRICER_REQUIRED");
+  validLayout(layout);
   if (!(typeof scale === "number" && scale > 0 && scale <= 1)) throw new TypeError("DENSE_CORPUS_SCALE_INVALID");
   // Pass 1: every usage event's instant and capacity-normalized spend.
   const times = [], normalized = [];
   for (const day of DENSE_CORPUS_DAY_LIST) {
-    for (const record of dayUsage(day, scale).usage) {
+    for (const record of dayUsage(day, scale, layout).usage) {
       times.push(Date.parse(record.eventTime));
       normalized.push(costUsd(pricer, record) / BASE_CAPACITY[record.modelId]);
     }
@@ -384,7 +423,7 @@ export function createDenseOwner({ pricer, scale = 1 }) {
   };
 
   const ownerDay = (day) => {
-    const { kind, usage, sessions } = dayUsage(day, scale);
+    const { kind, usage, sessions } = dayUsage(day, scale, layout);
     const start = dayStartMs(day), end = start + DAY_MS;
     const d = draws(`${OWNER}:quota:${day}`);
     const quota = [];
@@ -400,7 +439,7 @@ export function createDenseOwner({ pricer, scale = 1 }) {
     usage.forEach((record, index) => {
       if (d.random() >= 1 / 12) return;
       const observed = Date.parse(record.eventTime) + d.int(1, 20) * SECOND + d.int(0, 999);
-      if (observed >= end || (day === LAST_DAY && observed > dayWindow(day).to)) return;
+      if (observed >= end || (day === LAST_DAY && observed > dayWindow(day, layout).to)) return;
       if (kind !== "Q") quota.push(quotaRecord(d, { label: `${day}:7d:${index}`, observed, slot: "seven_day" }));
       quota.push(quotaRecord(d, { label: `${day}:5h:${index}`, observed, slot: "five_hour" }));
     });
@@ -408,7 +447,7 @@ export function createDenseOwner({ pricer, scale = 1 }) {
     for (const reset of DENSE_RESETS) {
       const observed = reset + MINUTE;
       if (observed < start || observed >= end || day < FIRST_DAY) continue;
-      if (day === LAST_DAY && observed > dayWindow(day).to) continue;
+      if (day === LAST_DAY && observed > dayWindow(day, layout).to) continue;
       quota.push(quotaRecord(d, { label: `${day}:reset`, observed, slot: "seven_day" }));
     }
     quota.sort((left, right) => left.observedTime < right.observedTime ? -1 : left.observedTime > right.observedTime ? 1
@@ -419,7 +458,8 @@ export function createDenseOwner({ pricer, scale = 1 }) {
 
   return Object.freeze({
     spec: Object.freeze({
-      key: OWNER, kind: "social", format: "v12",
+      key: OWNER, kind: "social", format: "v12", layout,
+      classDays: Object.fromEntries(Object.entries(DENSE_LAYOUTS[layout]).map(([name, days]) => [name, [...days]])),
       participantId: `participant:${uuid("participant", OWNER)}`,
       pinnedOwnerDigest: hex("owner-digest", OWNER),
       planType: "pro", accountTrackId: `account-track:v2:${hex("track", OWNER)}`, models: MODELS,

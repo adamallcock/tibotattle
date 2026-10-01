@@ -6,7 +6,7 @@
 //
 //   ~/.nvm/versions/node/v26.2.0/bin/node --max-old-space-size=16384 \
 //     apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs \
-//       --work-dir <absolute dir outside the repository> --corpus dense|q1 [--scale 0.1] \
+//       --work-dir <absolute dir outside the repository> --corpus dense|q1 [--layout compact|spread] [--scale 0.1] \
 //       [--golden-out <dir>] [--verify-against <dir>] [--forced-native withheld|all|none] \
 //       [--max-ticks N] [--resume <converged work dir>] [--keep-scratch]
 //
@@ -16,8 +16,8 @@
 //  3. seeding goes through d43c8f92's admission helpers exactly as the Q-1
 //     oracle (apps/worker/test/gcp-fastpath-oracle.spec.ts on
 //     claude/gcp-fp-q1-oracle) did: owners a-d from the Q-1 corpus files, and
-//     for --corpus dense, owner e from dense-corpus.mjs through Q-1 owner c's
-//     v1.2 path;
+//     for --corpus dense, owner e from dense-corpus.mjs (the `compact` layout
+//     by default) through Q-1 owner c's v1.2 path;
 //  4. Tier N: the three production scheduled entry points (analytics,
 //     publication, cache retention) in Q-1's lane order and cadence until no
 //     work progresses for QUIET_TICKS (a progress digest over every analytics
@@ -49,7 +49,7 @@ import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { buildDenseOracle, DENSE_ORACLE_SOURCE_COMMIT } from "./build.mjs";
 import { createDenseOwner, DENSE_CORPUS_DAY_LIST, DENSE_CORPUS_PINNED_NOW, DENSE_CORPUS_SCHEMA_VERSION,
-  DENSE_CLASS_DAYS, denseDayClass } from "./dense-corpus.mjs";
+  DENSE_DEFAULT_LAYOUT, DENSE_LAYOUTS, denseDayClass } from "./dense-corpus.mjs";
 import { summarizeDenseCorpus } from "./corpus-summary.mjs";
 import { runForcedNative } from "./forced-native.mjs";
 import { installDenseOracleRuntime, setPinnedNow } from "./runtime.mjs";
@@ -86,7 +86,8 @@ const RUN_SPECIFIC_ANALYTICS_COLUMNS = Object.freeze({
 
 function parseArgs(argv) {
   const options = { workDir: null, corpus: null, scale: 1, goldenOut: null, verifyAgainst: null,
-    forcedNative: "withheld", maxTicks: 200_000, keepScratch: false, resume: null, publicationPasses: 1 };
+    forcedNative: "withheld", maxTicks: 200_000, keepScratch: false, resume: null, publicationPasses: 1,
+    layout: DENSE_DEFAULT_LAYOUT };
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index], next = () => argv[++index];
     if (arg === "--work-dir") options.workDir = resolve(next());
@@ -99,6 +100,7 @@ function parseArgs(argv) {
     else if (arg === "--keep-scratch") options.keepScratch = true;
     else if (arg === "--resume") options.resume = resolve(next());
     else if (arg === "--publication-passes") options.publicationPasses = Number(next());
+    else if (arg === "--layout") options.layout = next();
     else throw new Error(`DENSE_ORACLE_ARGUMENT_INVALID:${arg}`);
   }
   if (!options.workDir || !isAbsolute(options.workDir) || !relative(REPO_ROOT, options.workDir).startsWith("..")) {
@@ -109,6 +111,9 @@ function parseArgs(argv) {
     throw new Error("DENSE_ORACLE_SCALE_INVALID");
   }
   if (!["all", "withheld", "none"].includes(options.forcedNative)) throw new Error("DENSE_ORACLE_FORCED_NATIVE_INVALID");
+  if (!Object.hasOwn(DENSE_LAYOUTS, options.layout) || (options.corpus === "q1" && options.layout !== DENSE_DEFAULT_LAYOUT)) {
+    throw new Error("DENSE_ORACLE_LAYOUT_INVALID");
+  }
   if (!Number.isSafeInteger(options.maxTicks) || options.maxTicks < 1) throw new Error("DENSE_ORACLE_MAX_TICKS_INVALID");
   if (!Number.isSafeInteger(options.publicationPasses) || options.publicationPasses < 1 || options.publicationPasses > 16) {
     throw new Error("DENSE_ORACLE_PUBLICATION_PASSES_INVALID");
@@ -240,7 +245,8 @@ function loadQ1Corpus() {
 const q1 = loadQ1Corpus();
 if (q1.schemaVersion !== "gcp-fastpath-oracle-corpus-v1" || q1.sourceCommit !== DENSE_ORACLE_SOURCE_COMMIT
   || q1.pinnedNow !== DENSE_CORPUS_PINNED_NOW) throw new Error("DENSE_ORACLE_Q1_CORPUS_INVALID");
-const dense = options.corpus === "dense" ? createDenseOwner({ pricer: P.priceTelemetryUsageEvent, scale: options.scale }) : null;
+const dense = options.corpus === "dense"
+  ? createDenseOwner({ pricer: P.priceTelemetryUsageEvent, scale: options.scale, layout: options.layout }) : null;
 const corpusOwners = [...q1.owners, ...(dense ? [dense.spec] : [])];
 note("corpus", { owners: corpusOwners.map((owner) => owner.key), dense: dense?.spec ?? null,
   publicationPasses: options.publicationPasses });
@@ -418,7 +424,7 @@ async function seedOwner(owner) {
       let chunks = 0;
       await stageV12Days(device, dense.days(), (day, count) => {
         chunks += count;
-        if (day.endsWith("-01") || DENSE_CLASS_DAYS.X.includes(day)) note("seed-e", { day, chunks });
+        if (day.endsWith("-01") || ["X", "H"].includes(denseDayClass(day, options.layout))) note("seed-e", { day, chunks });
       });
     }
     return participantId;
@@ -1004,7 +1010,7 @@ for (const owner of roster) {
 // Native-path page counts: the effective reader pages each observed day's
 // quota and usage streams at 200 rows, so a window costs the sum of
 // ceil(rows/200) over its days for each stream.
-const denseSummary = dense ? summarizeDenseCorpus({ P, owner: dense, scale: options.scale }) : null;
+const denseSummary = dense ? summarizeDenseCorpus({ P, owner: dense, scale: options.scale, layout: options.layout }) : null;
 const dayCounts = new Map(q1.owners.map((owner) => [owner.key, new Map(owner.days.map((day) => [day.day, {
   usage: day.records.usage.length + (day.v1Extra?.usage.length ?? 0), quota: day.records.quota.length + (day.v1Extra?.quota.length ?? 0) }]))]));
 if (denseSummary) dayCounts.set("e", new Map(denseSummary.days.map((day) => [day.day, { usage: day.usage, quota: day.quota }])));
@@ -1119,8 +1125,8 @@ for (const row of cacheValueRows) {
 const corpusSummary = { schemaVersion: options.corpus === "dense" ? DENSE_CORPUS_SCHEMA_VERSION : q1.schemaVersion,
   q1: { path: "apps/worker/analytics-v2-test/golden/corpus/corpus.json", sha256: q1.sha256, recordCounts: q1.recordCounts },
   dense: dense ? { generator: "apps/worker/scripts/gcp-fastpath-dense-oracle/dense-corpus.mjs", scale: options.scale,
-    spec: dense.spec, classes: Object.fromEntries(["Q", "X", "H", "M", "L"].map((kind) =>
-      [kind, DENSE_CORPUS_DAY_LIST.filter((day) => denseDayClass(day) === kind).length])) } : null };
+    layout: options.layout, spec: dense.spec, classes: Object.fromEntries(["Q", "X", "H", "M", "S", "L"].map((kind) =>
+      [kind, DENSE_CORPUS_DAY_LIST.filter((day) => denseDayClass(day, options.layout) === kind).length])) } : null };
 
 const manifest = {
   schemaVersion: "gcp-fastpath-dense-oracle-manifest-v1",
@@ -1171,7 +1177,7 @@ const manifest = {
   sourceDump: { tables: usageDump.tables, rows: usageDump.rows, schemaSha256: usageDump.schemaSha256,
     rowCountsSha256: usageDump.rowCountsSha256, jsonBytes: usageDump.bytes, jsonSha256: usageDump.sha256,
     sealedSqlite: sealed, sourceUnchangedByAnalysis: sourceBeforeAnalysis === null ? null : sourceBeforeAnalysis === sourceAfterAnalysis,
-    reproduce: `node --max-old-space-size=16384 apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs --work-dir <dir> --corpus ${options.corpus}${options.scale === 1 ? "" : ` --scale ${options.scale}`}${options.publicationPasses === 1 ? "" : ` --publication-passes ${options.publicationPasses}`}` },
+    reproduce: `node --max-old-space-size=16384 apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs --work-dir <dir> --corpus ${options.corpus}${options.corpus === "dense" && options.layout !== DENSE_DEFAULT_LAYOUT ? ` --layout ${options.layout}` : ""}${options.scale === 1 ? "" : ` --scale ${options.scale}`}${options.publicationPasses === 1 ? "" : ` --publication-passes ${options.publicationPasses}`}` },
 };
 const diagnostics = { header: { ...header, seedMs, convergenceMs: convergence.elapsedMs, forcedCost,
   wallMs: Math.round(performance.now() - wallStarted), randomBytesDrawn: runtime.randomBytesDrawn() },
