@@ -13,10 +13,10 @@ status: maintained
 > Cloudflare operation, and its Cloudflare sections stay authoritative after P1
 > wherever this runbook does not replace them. Nothing here authorizes a deploy,
 > a secret change, a writer fence, a GCP write or a cutover; each is a separate
-> owner-authorized operation. Some commands below name interfaces from E10 and
-> E12, which were in progress when this was written. Use such a command only
-> after the change that implements it has merged on the line you run it from,
-> and take its exact flags from that change.
+> owner-authorized operation. The E10 deploy flags and the E12 commands below
+> are those merged on `claude/gcp-fp-edge`. Use a command only on a line that
+> carries the change implementing it, and take its exact flags from that
+> line's code.
 
 It covers the three modes of the production Worker's thin edge (`worker`,
 `fenced` and `gcp`), their typed deploys, the edge secrets, the writer fence,
@@ -79,9 +79,9 @@ these flags to that command:
 
 | Mode | Added flags | Typical use |
 |---|---|---|
-| `worker` | `--edge-mode=worker` | P1, the first edge-entry deploy; any later worker-mode redeploy |
+| `worker` | `--edge-mode=worker`; after a fence, also `--fence-receipt=<verified fence receipt> --fence-receipt-sha256=<its sha256>` | P1, the first edge-entry deploy; any later worker-mode redeploy; the abort |
 | `fenced` | `--edge-mode=fenced` | Starting the fence; the brake from gcp |
-| `gcp` | `--edge-mode=gcp --edge-plan=<private gcp plan> --origin-commit=<origin commit from the verifier pre-check>` | The switch; gcp redeploys, including web-only releases |
+| `gcp` | `--edge-mode=gcp --edge-plan=<private gcp plan> --origin-commit=<origin commit> --origin-verifier-account=<verifier account>` | The switch; gcp redeploys, including web-only releases |
 
 The gcp plan is EP-9's closed plan: the Cloud Run origin URL, the audience, the
 edge-invoker account, an optional headers timeout, and the release-guard D1's id
@@ -91,12 +91,18 @@ repository.
 Before any upload, the deploy refuses:
 
 - `--edge-mode` outside the typed path (`EDGE_MODE_REQUIRES_TYPED`);
-- a transition outside EP-9's matrix (`EDGE_MODE_TRANSITION_FORBIDDEN`). The
-  history condition for fenced to worker is read from deployment history since
-  the fence receipt;
+- a transition outside EP-9's matrix (`EDGE_MODE_TRANSITION_FORBIDDEN`). For
+  fenced to worker, E10 walks the deployment history back to the fenced
+  deployment the verified EP-8 fence receipt names
+  (`EDGE_MODE_FENCE_HISTORY_INCOMPLETE` when it cannot);
+- a source that does not descend from the live commit
+  (`EDGE_MODE_SOURCE_NOT_DESCENDANT`), or a source without the edge entry
+  (`EDGE_MODE_ENTRY_UNAVAILABLE`);
 - for gcp: a missing edge-tier rate-limit binding
   (`EDGE_MODE_ADMISSION_BINDING_MISSING`), a missing edge secret
-  (`EDGE_MODE_SECRET_MISSING`), a pending release-guard migration, a contract
+  (`EDGE_MODE_SECRET_MISSING`), a pending release-guard migration
+  (`EDGE_MODE_RELEASE_GUARD_MIGRATIONS_PENDING`), a pre-gcp verifier answer
+  that names another origin commit (`EDGE_ORIGIN_COMMIT_MISMATCH`), a contract
   blob that differs between the edge commit and the origin commit
   (`EDGE_CONTRACT_DRIFT`), or a candidate site without the privacy marker
   (`EDGE_PRIVACY_PAGE_NOT_CUTOVER`);
@@ -111,8 +117,12 @@ After the deploy, verify the mode:
 | `fenced` | One version at 100% whose `DEPLOYMENT_SOURCE_COMMIT` and `EDGE_UPSTREAM_MODE` bindings match | Public `GET /api/health` is barrier health for the commit. `/api/ready`, API, admin, Sparkle guard and Apple paths answer `503 MUTATION_BARRIER_ACTIVE` with `no-store` and `retry-after: 300`. `www` asset paths redirect, and `/release-site-manifest.json` is 200 |
 | `gcp` | As fenced, from the Cloudflare bindings | Public `/api/health` is status `ok` with the origin commit. A `RETIRED_SECRET_PRESENT` warning is expected until the owner deletes the retired storage secrets |
 
-Reconciliation (`npm run production:reconcile`) must use the same pinned mode
-and plan. E10 refuses `EDGE_MODE_PLAN_REQUIRED` when a pinned mode has no plan.
+Reconciliation (`npm run production:reconcile`, with `--edge-mode` and
+`--edge-plan`) and the typed recovery of an uncertain deploy must use the same
+pinned mode and plan. E10 refuses `EDGE_MODE_PLAN_REQUIRED` when a pinned gcp
+mode has no plan and `EDGE_MODE_PLAN_MISMATCH` when the plan differs. In gcp
+mode no typed role is bound, so the typed schema inspection is skipped
+(`EDGE_MODE_GCP_TYPED_ROLES_UNBOUND`).
 
 ## 3. Edge secrets
 
@@ -194,7 +204,13 @@ both outside the repository.
 
 ### Abort, before any gcp version
 
-1. Release the fence from `apps/worker`:
+1. Run the typed worker-mode deploy with `--fence-receipt` and
+   `--fence-receipt-sha256`, while the fence is still applied. Fenced to worker
+   is allowed only while no gcp-mode version has been deployed since the fence
+   began, and E10 proves that from the verified fence receipt, which its reader
+   refuses once the fence is released. The receipt exists only after EP-8's
+   `verify`; before it, there is no typed path back to worker mode.
+2. Then release the fence from `apps/worker`:
 
    ```bash
    node scripts/cloudflare-writer-fence.mjs release --plan=<private fence plan> --receipts=<private receipts directory> \
@@ -204,8 +220,6 @@ both outside the repository.
    It restores the exact prior schedules and queue delivery from the apply
    journal. It is refused once any gcp-mode version has been deployed since the
    fence.
-2. Then run the typed worker-mode deploy. Fenced to worker is allowed only while
-   no gcp-mode version has been deployed since the fence began.
 
 Writes resume, so any seal or export taken under that fence is no longer
 valid. A later attempt needs a fresh fence.
@@ -231,10 +245,11 @@ verifier is limited at the origin to plain `GET /api/health` and
 - **Owner prerequisites:** the verifier account holds `run.invoker` on the
   production service only (EP-7's optional verifier), and the operator may
   impersonate it.
-- **Token:** obtain an identity token for the verifier with the service's
-  audience, through gcloud impersonation (`gcloud auth print-identity-token`
-  with `--impersonate-service-account`, `--audiences` and `--include-email`).
-  Hand it to E10's pre-gcp verifier through its in-memory input only.
+- **Token:** the gcp deploy mints it itself from `--origin-verifier-account`:
+  it runs `gcloud auth print-identity-token` with
+  `--impersonate-service-account`, `--audiences` (the plan's audience) and
+  `--include-email`, without a shell, and keeps the token in memory. It is
+  never printed, passed as an argument or written.
 - **Pass condition:** both reads return 200 with the origin marker and secure
   JSON headers. The verifier records the origin commit, which becomes the gcp
   deploy's `--origin-commit`.
@@ -286,15 +301,25 @@ Edge logs are content-free JSON lines.
 
 ### Local end-to-end (E12)
 
-From `apps/worker`, after `node cloud-run/build.mjs`, under Node 22.16.0, with
-a local PostgreSQL 17 cluster:
+From `apps/worker`, under Node 22 (the image runtime), with a local
+PostgreSQL 17 cluster:
 
 ```bash
+node cloud-run/build.mjs
 PG_TEST_SOCKET=<local PostgreSQL 17 socket> PG_TEST_PORT=<port> \
   node --test --test-concurrency=1 postgres-test/edge-origin-e2e.spec.mjs
 ```
 
-Set `EDGE_E2E_GOLDEN=analytics-v2-test/golden` to add the golden stage.
+`npm run edge:e2e` runs the same two commands with the `node` on PATH, and
+`npm run edge:e2e:check` runs the offline harness and live-check checks (also
+part of `scripts:check`). Set `EDGE_E2E_GOLDEN=analytics-v2-test/golden` to
+add the golden stage; it seeds through the fast-path rehearsal, whose importers
+need a newer `node:sqlite` than Node 22.16 (`EDGE_E2E_REHEARSAL_NODE`, default
+the `node` on PATH). `EDGE_E2E_EDGE_TREE=<edge-port worktree>/apps/worker`
+builds the edge from that tree and refuses unless its
+`src/edge-origin-contract.ts` is byte-identical. The run takes about four
+minutes (S4 waits for fresh rate-limit windows) and drops every schema it
+creates.
 
 - **It qualifies:**
   - the edge bundle running in workerd, in all three modes and the
@@ -306,6 +331,15 @@ Set `EDGE_E2E_GOLDEN=analytics-v2-test/golden` to add the golden stage.
   - privacy and transparency assertions on every forwarded exchange;
   - parity with the unchanged Worker on comparable rows, including admission
     under the checked-in production limits.
+- **Behaviour it found that operators should know:**
+  - workerd hands the edge's answer to an upload to the client only after the
+    client's body has finished streaming into the forward, so a refused or
+    limited upload is answered after its body is sent, not before (the Worker
+    answers at once);
+  - a client disconnect could not be shown to cancel the forward under
+    Miniflare, so that cancellation is unproven;
+  - the Worker's own upload budget (1200 starts per minute) sheds load before
+    the 3000/60 ingress limits; the fast-path origin has no such budget.
 - **It does not qualify:** Google's front end, Cloudflare's network and real
   client addresses, Workers Rate Limiting across locations, Access, custom
   domains, the production origin composition (CR-6 and CR-7) or production
@@ -327,8 +361,10 @@ authorization in chat for each of these:
    `--authorize=EDGE_LIVE_CHECK_WRITES`.
 
 Both tiers also take the inputs E12 defines: the pinned test origin URL and
-invoker account, the expected body digest from E12's golden stage on the same
-commit and seed, and a private receipt directory.
+invoker account (`--origin-url`, `--invoker`), the expected body digest from
+E12's golden stage on the same commit and seed (`--expected-body-sha`), the
+golden directory (`--golden`) and a private receipt directory (`--out`). Any
+other origin, invoker or authorization token is refused before gcloud runs.
 `node scripts/edge-live-check.mjs plan` prints the steps and runs nothing.
 
 The identity token comes from gcloud impersonation of the test project's

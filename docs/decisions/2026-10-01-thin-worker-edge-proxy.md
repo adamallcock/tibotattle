@@ -45,15 +45,18 @@ status: proposed
     ([`cloudflare-writer-fence.mjs`](../../apps/worker/scripts/cloudflare-writer-fence.mjs));
   - EP-9, the edge-mode overlay
     ([`edge-mode-configuration.mjs`](../../apps/worker/scripts/edge-mode-configuration.mjs)).
-- In progress on separate branches when this record was written:
+- Merged on the GCP line's edge integration branch `claude/gcp-fp-edge`,
+  locally tested and not deployed:
   - E4, the proxy core;
   - E5, the Worker entry and the release-guard database facade;
   - EORIGIN, the edge-test origin and the origin's admission fixes;
   - E10, the typed deploy for the edge modes;
-  - E12, the local end-to-end test.
+  - E12, the local end-to-end test
+    ([receipt](../receipts/2026-10-01-gcp-edge-proxy-local.md)).
 
   Where this record describes them, it states their reviewed design. Their
-  merged code and tests are the implementation evidence.
+  merged code and tests are the implementation evidence. None of them is yet
+  on an edge-port line (OD-E1).
 - Nothing has been deployed. No Cloudflare or GCP resource has been created or
   changed for the edge. The origin's production composition (CR-6 and CR-7)
   does not exist yet, and the origin still refuses to start without a test
@@ -263,8 +266,9 @@ The forward:
 - The body is streamed. It is never buffered and never retried.
 - The request uses `redirect: "manual"` and `cache: "no-store"`. The headers
   timeout is `EDGE_UPSTREAM_HEADERS_TIMEOUT_SECONDS` (default 100, bounds 5 to
-  300) and never cuts a streaming body. A client disconnect cancels the
-  subrequest.
+  300) and never cuts a streaming body. The forward follows the incoming
+  request's abort signal; E12 could not show a client disconnect cancelling it
+  under Miniflare, so that cancellation is unproven.
 - Responses pass through with their status and every header except the
   contract's `DROPPED_RESPONSE_HEADERS` (hop-by-hop headers, `server`, `via`,
   `alt-svc`, trace headers and the origin marker). Each `Set-Cookie` stays
@@ -518,6 +522,12 @@ These are deliberate and accepted with this record:
    limits instead of per-location Workers Rate Limiting.
 8. In gcp mode, public `/api/health` reports the origin's commit. The edge's
    commit is read from the Cloudflare version bindings.
+9. An upload the origin refuses or limits before reading its body is answered
+   once the client has finished sending that body, not before. E12 measured
+   this in workerd: the origin's 429 reached the edge at once, and the edge's
+   answer reached the client only when the held body closed, while the Worker
+   answers at once. The 8 MiB forward cap and the origin's own body deadline
+   bound the cost.
 
 ## 14. Relationship to accepted decisions
 
