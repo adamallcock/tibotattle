@@ -732,6 +732,58 @@ test("T-1 refuses a non-empty target atomically", { skip: !PG_TEST_SOCKET }, asy
   assert.equal(seededParticipants.rows[0].n, 0);
 });
 
+test("T-1 suppresses user triggers as table-owner DDL that every refusal rolls back", { skip: !PG_TEST_SOCKET }, async () => {
+  const fixture = await sealedFixture();
+  const database = await pool();
+  const schema = await rehearsalSchema();
+  const triggerStates = async () => (await database.query(`SELECT rel.relname::text AS table_name,
+      trigger.tgname::text AS name, trigger.tgenabled::text AS enabled
+    FROM pg_catalog.pg_trigger trigger JOIN pg_catalog.pg_class rel ON rel.oid = trigger.tgrelid
+    WHERE rel.relnamespace = $1::regnamespace AND NOT trigger.tgisinternal ORDER BY 1, 2`, [schema])).rows;
+  const migrated = await triggerStates();
+  assert.ok(migrated.some(trigger => COPIED_TABLES.includes(trigger.table_name)), "copied tables carry user triggers");
+  assert.deepEqual(migrated.filter(trigger => trigger.enabled !== "O"), []);
+  const copy = () => runPostgresFastpathIdentityCopy({ source: fixture.source, pool: database, targetSchema: schema });
+
+  // Only triggers in origin mode are suppressed and restored (exactly those
+  // session_replication_role = replica suppressed); any other state refuses
+  // the copy before a write and is left as found.
+  const always = migrated.find(trigger => trigger.table_name === "participants");
+  await database.query(`ALTER TABLE "${schema}".participants ENABLE ALWAYS TRIGGER "${always.name}"`);
+  await assert.rejects(copy(), error => error?.code === "FASTPATH_IDENTITY_TRIGGER_STATE_UNEXPECTED"
+    && error.table === "participants");
+  assert.deepEqual((await triggerStates()).filter(trigger => trigger.enabled !== "O"),
+    [{ ...always, enabled: "A" }]);
+  await assertUntouched(schema);
+  await database.query(`ALTER TABLE "${schema}".participants ENABLE TRIGGER "${always.name}"`);
+
+  // Foreign keys stay enforced while triggers are suppressed: an orphan child
+  // is refused as it is inserted, with the re-check's code and child table.
+  await database.query(`CREATE TABLE "${schema}".synthetic_absent_parent (id text PRIMARY KEY)`);
+  await database.query(`ALTER TABLE "${schema}".device_credentials ADD CONSTRAINT synthetic_orphan_child
+    FOREIGN KEY (id) REFERENCES "${schema}".synthetic_absent_parent (id) NOT VALID`);
+  await assert.rejects(copy(), error => error?.code === "FASTPATH_IDENTITY_FOREIGN_KEY_UNSATISFIED"
+    && error.table === "device_credentials");
+  assert.deepEqual(await triggerStates(), migrated, "the rollback restores every suppressed trigger");
+  await assertUntouched(schema);
+  await database.query(`ALTER TABLE "${schema}".device_credentials DROP CONSTRAINT synthetic_orphan_child`);
+  await database.query(`DROP TABLE "${schema}".synthetic_absent_parent`);
+
+  // A late write refused after earlier tables were written rolls back the
+  // rows, the seeded singleton's replacement and the trigger DDL together.
+  await database.query(`ALTER TABLE "${schema}".collection_controls ADD CONSTRAINT synthetic_refuse_copy
+    CHECK (false) NOT VALID`);
+  await assert.rejects(copy(), error => error?.code === "FASTPATH_IDENTITY_TARGET_WRITE_FAILED"
+    && error.table === "collection_controls" && error.sqlState === "23514");
+  assert.deepEqual(await triggerStates(), migrated);
+  await assertUntouched(schema);
+  await database.query(`ALTER TABLE "${schema}".collection_controls DROP CONSTRAINT synthetic_refuse_copy`);
+
+  const receipt = await copy();
+  assert.equal(receipt.rowTriggersSuppressed, true);
+  assert.deepEqual(await triggerStates(), migrated, "a committed copy leaves every trigger enabled as found");
+});
+
 test("the rehearsal transport parts copy the checkout's D1 layout, refuse unknown parts and non-empty targets", {
   skip: !PG_TEST_SOCKET,
 }, async () => {

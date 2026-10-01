@@ -2,6 +2,7 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { lstat, realpath, stat } from "node:fs/promises";
 import test from "node:test";
 import pg from "pg";
@@ -211,5 +212,129 @@ test("PG17: the seed runs the rehearsal's chain into one schema, is idempotent a
         await pools[0]?.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => {});
       }
       for (const pool of pools) await pool.end().catch(() => {});
+    }
+  });
+
+// Importer run-control rows name the run (transfer ids carry the schema
+// suffix) or the clock (migration history; publication_state's migration
+// seed), so two seeds can only agree on their counts.
+const RUN_STAMPED_TABLES = new Set(["_tibotattle_migration_history", "_storage_ingestion_journal_transfer_runs_v1",
+  "_storage_ingestion_journal_transfer_checkpoints_v1", "postgres_usage_correction_transfer_runs",
+  "postgres_usage_correction_transfer_checkpoints", "postgres_usage_correction_transfer_table_receipts",
+  "publication_state"]);
+
+/** Per-table row counts and content digests of every table in a seeded schema. */
+async function seededFingerprint(pool, schema) {
+  const tables = await pool.query(`SELECT relname::text AS name FROM pg_catalog.pg_class
+    WHERE relnamespace = $1::regnamespace AND relkind IN ('r', 'p') ORDER BY 1`, [schema]);
+  const fingerprint = {};
+  for (const { name } of tables.rows) {
+    const { rows: [row] } = await pool.query(`SELECT count(*)::int AS n,
+        md5(COALESCE(string_agg(t::text, E'\\n' ORDER BY t::text COLLATE "C"), '')) AS digest
+      FROM "${schema}"."${name}" t`);
+    fingerprint[name] = RUN_STAMPED_TABLES.has(name) ? { rows: row.n } : { rows: row.n, md5: row.digest };
+  }
+  return fingerprint;
+}
+
+async function userTriggerStates(pool, schema) {
+  const result = await pool.query(`SELECT rel.relname::text || '.' || trigger.tgname::text AS name,
+      trigger.tgenabled::text AS enabled
+    FROM pg_catalog.pg_trigger trigger JOIN pg_catalog.pg_class rel ON rel.oid = trigger.tgrelid
+    WHERE rel.relnamespace = $1::regnamespace AND NOT trigger.tgisinternal ORDER BY 1`, [schema]);
+  return result.rows;
+}
+
+test("PG17: as a Cloud SQL-like migrator (not a superuser) the seed equals the superuser seed",
+  { skip: LOCAL_SKIP, timeout: 900_000 }, async () => {
+    // Cloud SQL's migrator IAM user is a cloudsqlsuperuser member with
+    // CREATEDB and CREATEROLE, never a superuser, and owns what its
+    // migrations create. The stand-in: a NOLOGIN cloudsqlsuperuser role that
+    // owns a fresh database, and a LOGIN migrator in it. The superuser seed
+    // runs in PG_TEST_DATABASE, as above (primary 0056 binds each database's
+    // transfer control schema to the role that installs it first).
+    const options = await localPoolOptions();
+    const admin = new pg.Pool({ ...options, max: 1 });
+    admin.on("error", () => {});
+    const tag = randomBytes(5).toString("hex");
+    const roles = { group: `fp_seed_cloudsqlsuperuser_${tag}`, migrator: `fp_seed_migrator_${tag}` };
+    const database = `fp_seed_cloudsql_${tag}`;
+    const pools = [];
+    const poolFor = ({ user, database: name, max }) => {
+      const pool = new pg.Pool({ ...options, user, database: name, max });
+      pool.on("error", () => {});
+      pools.push(pool);
+      return pool;
+    };
+    const created = { roles: [], database: false };
+    const seeds = {};
+    try {
+      const facts = await admin.query("SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user");
+      assert.equal(facts.rows[0]?.rolsuper, true, "the check creates roles and a database; PG_TEST_USER must be superuser");
+      await admin.query(`CREATE ROLE "${roles.group}" NOLOGIN NOSUPERUSER CREATEDB CREATEROLE`);
+      created.roles.push(roles.group);
+      await admin.query(`CREATE ROLE "${roles.migrator}" LOGIN NOSUPERUSER CREATEDB CREATEROLE INHERIT
+        IN ROLE "${roles.group}"`);
+      created.roles.push(roles.migrator);
+      await admin.query(`CREATE DATABASE "${database}" OWNER "${roles.group}"`);
+      created.database = true;
+
+      const runs = {
+        superuser: { user: options.user, database: options.database, expectedOwner: null },
+        migrator: { user: roles.migrator, database, expectedOwner: roles.migrator },
+      };
+      for (const [name, run] of Object.entries(runs)) {
+        const pool = poolFor({ user: run.user, database: run.database, max: 4 });
+        const session = await pool.query(`SELECT session_user::text AS login, rolsuper, rolcreaterole
+          FROM pg_catalog.pg_roles WHERE rolname = session_user`);
+        assert.deepEqual(session.rows[0], { login: run.user, rolsuper: name === "superuser", rolcreaterole: true });
+        const schemas = seededSchemas(randomBytes(4).toString("hex"));
+        seeds[name] = { pool, schemas };
+        const receipt = await runGcpFastpathSeed({ commit: "HEAD", schemaSuffix: schemas.suffix, log: () => {},
+          dependencies: {
+            spawn: cleanCheckoutGit,
+            createPool: async () => ({ pool, identity: run.user, close: async () => {} }),
+            expectedOwner: run.expectedOwner,
+            grantRuntime: async () => {},
+            readBack: async (schema) => ({ schema }),
+          } });
+        assert.equal(receipt.status, "seeded", name);
+        for (const [verification, entry] of Object.entries(receipt.steps.importVerification)) {
+          assert.equal(entry.equal, true, `${name} ${verification}`);
+        }
+        seeds[name].receipt = receipt;
+      }
+
+      const { superuser, migrator } = seeds;
+      // Same importer receipts, row counts and verifications.
+      assert.deepEqual(migrator.receipt.steps, superuser.receipt.steps);
+      // Same rows in every table, and nothing a suppressed trigger would mint.
+      assert.deepEqual(await seededFingerprint(migrator.pool, migrator.schemas.target),
+        await seededFingerprint(superuser.pool, superuser.schemas.target));
+      // Every user trigger is enabled again, exactly as in the superuser seed.
+      const triggers = await userTriggerStates(migrator.pool, migrator.schemas.target);
+      assert.ok(triggers.length > 0);
+      assert.deepEqual(triggers.filter((trigger) => trigger.enabled !== "O"), []);
+      assert.deepEqual(triggers, await userTriggerStates(superuser.pool, superuser.schemas.target));
+      // The migrator owns everything it seeded, and neither seed is an
+      // ingestion-journal transfer session (CREATEROLE, like superuser, is
+      // never one), so both take the same importer paths.
+      const foreign = await migrator.pool.query(`SELECT count(*)::int AS n FROM pg_catalog.pg_class
+        WHERE relnamespace = $1::regnamespace AND relowner <> (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = $2)`,
+      [migrator.schemas.target, roles.migrator]);
+      assert.equal(foreign.rows[0].n, 0);
+      for (const { pool, schemas } of [superuser, migrator]) {
+        const transfer = await pool.query(`SELECT "${schemas.target}".storage_journal_transfer_session() AS session`);
+        assert.equal(transfer.rows[0].session, false);
+      }
+    } finally {
+      const superuserSeed = seeds.superuser?.schemas;
+      for (const schema of superuserSeed ? [superuserSeed.target, superuserSeed.control] : []) {
+        await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => {});
+      }
+      for (const pool of pools) await pool.end().catch(() => {});
+      if (created.database) await admin.query(`DROP DATABASE IF EXISTS "${database}" WITH (FORCE)`).catch(() => {});
+      for (const role of created.roles.reverse()) await admin.query(`DROP ROLE IF EXISTS "${role}"`).catch(() => {});
+      await admin.end().catch(() => {});
     }
   });
