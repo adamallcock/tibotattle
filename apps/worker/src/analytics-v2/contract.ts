@@ -25,7 +25,7 @@ import type { PostgresPool } from "../postgres-client";
 import type { WorkerRouteMethod } from "../route-registry";
 
 /** Version of this contract; bump with any name or shape change. */
-export const ANALYTICS_V2_CONTRACT_VERSION = "analytics-v2-contract-v0.2" as const;
+export const ANALYTICS_V2_CONTRACT_VERSION = "analytics-v2-contract-v0.3" as const;
 
 /**
  * The analytics_v2 migration: primary role, runtime schema, number assigned in
@@ -202,6 +202,26 @@ export const ANALYTICS_V2_REFUSAL_REASONS = Object.freeze([
   "session_limit_exceeded",
 ] as const);
 export type AnalyticsV2RefusalReason = (typeof ANALYTICS_V2_REFUSAL_REASONS)[number];
+
+/**
+ * Reasons that belong to the "cache" family only. evaluateSharedCacheDay is
+ * the sole source of CacheRetentionRefusedError, so these never replace an
+ * owner-day's prepared daily values.
+ */
+export const ANALYTICS_V2_CACHE_ONLY_REFUSAL_REASONS = Object.freeze([
+  "group_limit_exceeded",
+  "session_limit_exceeded",
+] as const satisfies readonly AnalyticsV2RefusalReason[]);
+
+/**
+ * The closed reasons analytics_v2_owner_day.refusal may hold: every reason
+ * except the cache-only ones. Primary migration 0059's CHECK lists exactly
+ * these; the store refuses any other owner-day reason before writing.
+ */
+export const ANALYTICS_V2_OWNER_DAY_REFUSAL_REASONS: readonly AnalyticsV2RefusalReason[] = Object.freeze(
+  ANALYTICS_V2_REFUSAL_REASONS.filter((reason) =>
+    !(ANALYTICS_V2_CACHE_ONLY_REFUSAL_REASONS as readonly string[]).includes(reason)),
+);
 
 /** An explicit refusal: never converted to zero or to inferred continuity. */
 export interface AnalyticsV2Refusal {

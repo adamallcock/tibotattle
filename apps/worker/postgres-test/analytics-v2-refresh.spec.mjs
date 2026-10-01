@@ -511,8 +511,18 @@ test("PG17: 0059 constraints refuse malformed digests, bands, counters, reasons 
       await expectRefusal(ownerDay, [OWNER_A, DAY_1, null, null, runId], "23514");
       await expectRefusal(ownerDay, [OWNER_A, DAY_1, "{}", "usage_window_unrepresentable", runId], "23514");
       await expectRefusal(ownerDay, [OWNER_A, DAY_1, null, "free_form_reason", runId], "23514");
-      for (const reason of contract.ANALYTICS_V2_REFUSAL_REASONS) {
+      // The owner-day CHECK accepts exactly the contract's owner-day reasons.
+      // The cache-only reasons never replace prepared daily values, so 0059
+      // refuses them there; together the two loops cover every closed reason.
+      assert.deepEqual(
+        [...contract.ANALYTICS_V2_OWNER_DAY_REFUSAL_REASONS, ...contract.ANALYTICS_V2_CACHE_ONLY_REFUSAL_REASONS].sort(),
+        [...contract.ANALYTICS_V2_REFUSAL_REASONS].sort(),
+      );
+      for (const reason of contract.ANALYTICS_V2_OWNER_DAY_REFUSAL_REASONS) {
         await accept(ownerDay, [OWNER_A, DAY_1, null, reason, runId]);
+      }
+      for (const reason of contract.ANALYTICS_V2_CACHE_ONLY_REFUSAL_REASONS) {
+        await expectRefusal(ownerDay, [OWNER_A, DAY_1, null, reason, runId], "23514");
       }
 
       const band = `INSERT INTO ${quoted(schema, "analytics_v2_cache_bands")}
@@ -890,6 +900,11 @@ test("PG17: the store refuses invalid outputs before writing", {
       await assert.rejects(write(minimalOutputs({
         ownerDays: [{ ownerDigest: OWNER_B, day: DAY_1, daily: {}, refusal: null }],
       })), { code: "ANALYTICS_V2_OUTPUTS_INVALID", field: "ownerDays.ownerDigest" });
+      // A cache-only reason is a closed reason, but never an owner-day refusal:
+      // the store refuses it before 0059's CHECK would.
+      await assert.rejects(write(minimalOutputs({
+        ownerDays: [{ ownerDigest: OWNER_A, day: DAY_1, daily: null, refusal: "group_limit_exceeded" }],
+      })), { code: "ANALYTICS_V2_OUTPUTS_INVALID", field: "ownerDays.refusal" });
       await assert.rejects(write(minimalOutputs({
         ownerFits: [{ ownerDigest: OWNER_A, asOfDay: DAY_1, fits: new Map() }],
       })), { code: "ANALYTICS_V2_OUTPUTS_INVALID", field: "ownerFits.fits" });

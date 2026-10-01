@@ -48,6 +48,7 @@ import {
   ANALYTICS_V2_CACHE_BAND_COUNTERS,
   ANALYTICS_V2_CONTRACT_VERSION,
   ANALYTICS_V2_MODES,
+  ANALYTICS_V2_OWNER_DAY_REFUSAL_REASONS,
   ANALYTICS_V2_OWNER_DIGEST_PATTERN,
   ANALYTICS_V2_OWNER_SOURCES,
   ANALYTICS_V2_PHASES,
@@ -397,7 +398,7 @@ async function prepareOutputs(outputs: AnalyticsV2RunOutputs, horizon: Analytics
     const hasRefusal = row.refusal !== null && row.refusal !== undefined;
     if (hasDaily === hasRefusal) invalid("ownerDays.daily");
     if (hasDaily) assertJsonValue(row.daily, "ownerDays.daily");
-    if (hasRefusal && !(ANALYTICS_V2_REFUSAL_REASONS as readonly string[]).includes(row.refusal as string)) {
+    if (hasRefusal && !(ANALYTICS_V2_OWNER_DAY_REFUSAL_REASONS as readonly string[]).includes(row.refusal as string)) {
       invalid("ownerDays.refusal");
     }
   }
