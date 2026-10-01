@@ -5,8 +5,9 @@
  *
  * Builds one commit through the reviewed Cloud Run source-archive tooling,
  * then creates or updates only `tibotattle-fastpath-test-*` resources in the
- * test project: the migrate Job, the analytics-refresh Job and an IAM-private
- * origin service. Every gcloud call carries --project=tibotattle; the shared
+ * test project: the migrate Job, the analytics-refresh Job, an IAM-private
+ * origin service, its bucket and the runtime account's one conditional
+ * binding on that bucket. Every gcloud call carries --project=tibotattle; the shared
  * test services and schemas used by other lines are read, never written.
  *
  * Credentials: none are read, printed or stored. Database access uses Cloud
@@ -72,6 +73,26 @@ export const FASTPATH_TEST = Object.freeze({
   edgeGetPaths: Object.freeze(["/api/health", "/api/ready", "/api/v1/community/daily"]),
   originLoopbackPort: 8080,
   edgeIngressPort: 8081,
+});
+
+/**
+ * The runtime service account's one binding on the origin bucket: the test
+ * project's cleanup-storage custom role, conditioned to the bucket itself and
+ * its telemetry/ objects. The account's only other storage grant is the same
+ * role conditioned to the A2 bucket, so without this binding every origin
+ * write answers 503 BACKEND_STORAGE_UNAVAILABLE (live edge write tier,
+ * 2026-10-01). The expression holds no comma, so it renders as one
+ * gcloud --condition value.
+ */
+export const ORIGIN_BUCKET_RUNTIME_BINDING = Object.freeze({
+  role: "projects/tibotattle/roles/tibotattleTestCleanupStorage",
+  member: `serviceAccount:${FASTPATH_TEST.runtimeServiceAccount}`,
+  condition: Object.freeze({
+    title: "TiboTattleFastpathTelemetry",
+    expression: `(resource.type == "storage.googleapis.com/Bucket" && resource.name == "projects/_/buckets/${
+      FASTPATH_TEST.originBucket}") || (resource.type == "storage.googleapis.com/Object" && resource.name.startsWith(`
+      + `"projects/_/buckets/${FASTPATH_TEST.originBucket}/objects/telemetry/"))`,
+  }),
 });
 
 const IMAGE_REFERENCE =
@@ -501,6 +522,71 @@ export function validateOriginPolicy(policy) {
   return Object.freeze({ invokers });
 }
 
+/** Read-only gcloud command for the origin bucket's IAM policy. */
+export function originBucketPolicyCommand() {
+  return gcloudArgs([
+    "storage", "buckets", "get-iam-policy", `gs://${assertFastpathName(FASTPATH_TEST.originBucket)}`,
+    `--project=${FASTPATH_TEST.project}`, "--format=json",
+  ]);
+}
+
+/** gcloud command that adds ORIGIN_BUCKET_RUNTIME_BINDING to the origin bucket. */
+export function originBucketBindingCommand() {
+  const { role, member, condition } = ORIGIN_BUCKET_RUNTIME_BINDING;
+  if ([condition.title, condition.expression].some((value) => /[,\n]/u.test(value))) {
+    fail("FASTPATH_DEPLOY_ORIGIN_BUCKET_CONDITION_INVALID");
+  }
+  return gcloudArgs([
+    "storage", "buckets", "add-iam-policy-binding", `gs://${assertFastpathName(FASTPATH_TEST.originBucket)}`,
+    `--project=${FASTPATH_TEST.project}`, `--member=${member}`, `--role=${role}`,
+    `--condition=expression=${condition.expression},title=${condition.title}`, "--format=json",
+  ]);
+}
+
+/**
+ * Check an origin bucket IAM policy: no public member anywhere, and the
+ * runtime service account in at most one binding, which must be exactly
+ * ORIGIN_BUCKET_RUNTIME_BINDING with no other member. Any other binding of
+ * that account (another role, no or another condition, a second binding) is
+ * refused, never repaired. Returns whether the binding is present; with
+ * requirePresent its absence is refused too.
+ */
+export function validateOriginBucketPolicy(policy, { requirePresent = false } = {}) {
+  const bindings = Array.isArray(policy?.bindings) ? policy.bindings : [];
+  for (const binding of bindings) {
+    for (const member of binding?.members ?? []) {
+      if (member === "allUsers" || member === "allAuthenticatedUsers") fail("FASTPATH_DEPLOY_ORIGIN_BUCKET_PUBLIC");
+    }
+  }
+  const { role, member, condition } = ORIGIN_BUCKET_RUNTIME_BINDING;
+  const runtime = bindings.filter((binding) => (binding?.members ?? []).includes(member));
+  const exact = (binding) => binding.role === role
+    && binding.members.length === 1
+    && binding.condition?.title === condition.title
+    && binding.condition?.expression === condition.expression;
+  if (runtime.length > 1 || (runtime.length === 1 && !exact(runtime[0]))) {
+    fail("FASTPATH_DEPLOY_ORIGIN_BUCKET_BINDING_UNEXPECTED");
+  }
+  if (requirePresent && runtime.length === 0) fail("FASTPATH_DEPLOY_ORIGIN_BUCKET_BINDING_MISSING");
+  return runtime.length === 1;
+}
+
+/**
+ * Ensure ORIGIN_BUCKET_RUNTIME_BINDING on the origin bucket: read the policy,
+ * add the binding only when the runtime account holds none, then read the
+ * policy back and require exactly that binding. Dry-run prints all three.
+ */
+export function ensureOriginBucketRuntimeBinding(runner) {
+  const read = originBucketPolicyCommand();
+  const present = validateOriginBucketPolicy(runner.json(read, { read: true, placeholderJson: { bindings: [] } }));
+  if (!present) runner.exec(originBucketBindingCommand());
+  const { role, member, condition } = ORIGIN_BUCKET_RUNTIME_BINDING;
+  validateOriginBucketPolicy(runner.json(read, { read: true,
+    placeholderJson: { bindings: [{ role, members: [member], condition: { ...condition } }] } }),
+  { requirePresent: true });
+  return Object.freeze({ role, member, conditionTitle: condition.title, added: !present && !runner.dryRun });
+}
+
 /** Count promoted migrations per role in one commit's tree. */
 export function countMigrationsAtCommit(commit, spawn = spawnSync) {
   const counts = {};
@@ -579,7 +665,9 @@ Steps:
                    skips with its reason when a chain stage is absent at --commit; refresh and origin then read
                    that schema at the golden's clock unless --schema/--now say otherwise
   refresh          deploy + execute ${FASTPATH_TEST.refreshJob} (2 vCPU, 4 GiB, 1 h)
-  origin           deploy IAM-private ${FASTPATH_TEST.originService}; journey SA is the only invoker; a seeded
+  origin           create/verify gs://${FASTPATH_TEST.originBucket}; ensure the runtime SA's one binding on it
+                   (condition ${ORIGIN_BUCKET_RUNTIME_BINDING.condition.title}, read back; any other runtime binding is
+                   refused); deploy IAM-private ${FASTPATH_TEST.originService}; journey SA is the only invoker; a seeded
                    schema's origin gets the golden's POSTGRES_SOURCE_ID/POSTGRES_SOURCE_NAMESPACE, and
                    --origin-env=EDGE_ORIGIN_MODE=edge-test adds wrangler.jsonc env.production's
                    ${EDGE_TEST_PRODUCTION_SETTINGS.join(", ")}
@@ -941,19 +1029,25 @@ function ensureOriginBucket(runner) {
       "--soft-delete-duration=0", "--default-storage-class=STANDARD"]));
     bucket = runner.json(describe, { read: true, placeholderJson: null });
   }
-  if (runner.dryRun) return JSON.stringify({ bucket: FASTPATH_TEST.originBucket, bucketGeneration: "<generation>",
-    bucketMetageneration: "<metageneration>", softDeleteRetentionDurationSeconds: "0" });
-  const retention = String(bucket?.soft_delete_policy?.retentionDurationSeconds ?? "0");
-  if (bucket?.name !== FASTPATH_TEST.originBucket || retention !== "0"
-      || !/^\d+$/u.test(String(bucket?.generation ?? "")) || !/^\d+$/u.test(String(bucket?.metageneration ?? ""))) {
-    fail("FASTPATH_DEPLOY_ORIGIN_BUCKET_UNEXPECTED");
+  let proof;
+  if (runner.dryRun) {
+    proof = JSON.stringify({ bucket: FASTPATH_TEST.originBucket, bucketGeneration: "<generation>",
+      bucketMetageneration: "<metageneration>", softDeleteRetentionDurationSeconds: "0" });
+  } else {
+    const retention = String(bucket?.soft_delete_policy?.retentionDurationSeconds ?? "0");
+    if (bucket?.name !== FASTPATH_TEST.originBucket || retention !== "0"
+        || !/^\d+$/u.test(String(bucket?.generation ?? "")) || !/^\d+$/u.test(String(bucket?.metageneration ?? ""))) {
+      fail("FASTPATH_DEPLOY_ORIGIN_BUCKET_UNEXPECTED");
+    }
+    proof = JSON.stringify({ bucket: FASTPATH_TEST.originBucket, bucketGeneration: String(bucket.generation),
+      bucketMetageneration: String(bucket.metageneration), softDeleteRetentionDurationSeconds: "0" });
   }
-  return JSON.stringify({ bucket: FASTPATH_TEST.originBucket, bucketGeneration: String(bucket.generation),
-    bucketMetageneration: String(bucket.metageneration), softDeleteRetentionDurationSeconds: "0" });
+  // Before the origin is deployed or used: the runtime account's bucket binding.
+  return { proof, binding: ensureOriginBucketRuntimeBinding(runner) };
 }
 
 async function stepOrigin(runner, options, image) {
-  const bucketHistoryProof = ensureOriginBucket(runner);
+  const { proof: bucketHistoryProof, binding: bucketBinding } = ensureOriginBucket(runner);
   const originEnv = originClockEnv(options.originEnv, options.now);
   let sourceIdentity = options.sourceIdentity ?? null;
   if (sourceIdentity === null && primarySchemaOf(options.schema).startsWith(FASTPATH_TEST_CLOUD_TARGET.seededSchemaPrefix)) {
@@ -978,7 +1072,7 @@ async function stepOrigin(runner, options, image) {
     `--project=${FASTPATH_TEST.project}`, `--region=${FASTPATH_TEST.region}`, "--format=json"]),
   { read: true, placeholderJson: {} });
   const receipt = { step: "origin", image, schema: primarySchemaOf(options.schema), variant: options.variant,
-    mode: options.mode, sourceIdentity, yamlPath, ...invokers,
+    mode: options.mode, sourceIdentity, yamlPath, bucketBinding, ...invokers,
     revision: service?.status?.latestReadyRevisionName ?? null, url: service?.status?.url ?? null };
   if (!runner.dryRun) receipt.path = await runner.receipt("origin.json", receipt);
   return receipt;

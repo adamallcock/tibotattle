@@ -109,6 +109,59 @@ export const FASTPATH_MIGRATION_TARGETS = Object.freeze({
 });
 const EXPECTED_MIGRATION_COUNT_PATTERN = /^[1-9]\d{0,3}$/u;
 
+/**
+ * Primary functions the migrations revoke from PUBLIC that the runtime role
+ * must execute: canonical v1 admission (0004), and the owner journal's append
+ * and owner-link mint (0046). Both are SECURITY INVOKER and run as the
+ * request's role inside the v1.2 owner-bridge trigger (0055, every v1.2
+ * domain activation), v1.1 live admission (0060) and legacy contribution
+ * admission (0061), so without EXECUTE those routes answer 503.
+ */
+export const TEST_RUNTIME_PRIMARY_FUNCTIONS = Object.freeze([
+  Object.freeze({ name: "insert_telemetry_v1_contribution", args: "jsonb" }),
+  Object.freeze({ name: "storage_journal_append", args: "text, text, text, text, text" }),
+  Object.freeze({ name: "storage_owner_link_ensure", args: "text, text" }),
+]);
+/**
+ * Maintenance entrypoints revoked from PUBLIC (0055, 0060, 0052) that only an
+ * operator or schema-owner role runs. The runtime role must never execute
+ * them; the read-back also refuses any other non-PUBLIC function it can run.
+ */
+export const TEST_OPERATOR_ONLY_PRIMARY_FUNCTIONS = Object.freeze([
+  Object.freeze({ name: "storage_v11_bridge_backfill", args: "integer" }),
+  Object.freeze({ name: "storage_v12_bridge_backfill", args: "integer" }),
+  Object.freeze({ name: "typed_telemetry_restart_identities", args: "" }),
+]);
+
+/** `name(args)`, as the read-back renders pg_proc rows (oidvectortypes). */
+export function functionSignature({ name, args }) {
+  return `${name}(${args})`;
+}
+
+/**
+ * True when the non-PUBLIC functions of one role schema are exactly as the
+ * runtime policy requires: the runtime role executes every runtime function
+ * and nothing else among them, and every operator-only entrypoint is present
+ * and closed to it.
+ */
+export function restrictedFunctionsMatchPolicy(role, rows) {
+  if (!Array.isArray(rows)) return false;
+  const runtime = role === "primary" ? TEST_RUNTIME_PRIMARY_FUNCTIONS.map(functionSignature).sort() : [];
+  const operatorOnly = role === "primary" ? TEST_OPERATOR_ONLY_PRIMARY_FUNCTIONS.map(functionSignature) : [];
+  const executable = new Map();
+  for (const row of rows) {
+    if (row === null || typeof row !== "object" || typeof row.signature !== "string"
+        || typeof row.runtime_execute !== "boolean" || executable.has(row.signature)) {
+      return false;
+    }
+    executable.set(row.signature, row.runtime_execute);
+  }
+  const granted = [...executable].filter(([, allowed]) => allowed).map(([signature]) => signature).sort();
+  return granted.length === runtime.length
+    && granted.every((signature, index) => signature === runtime[index])
+    && operatorOnly.every((signature) => executable.get(signature) === false);
+}
+
 const A2_PROFILE = "a2";
 export const GRAPH_BENCHMARK_MIGRATION_PROFILE = "community-graph-benchmark";
 const GRAPH_BENCHMARK_PROFILE = GRAPH_BENCHMARK_MIGRATION_PROFILE;
@@ -309,7 +362,6 @@ async function grantAndVerifyRuntimePrivileges(pool, role, target) {
   const runtimeRole = quoteRole(TEST_MIGRATIONS_RUNTIME_IAM_USER);
   const historyTable = `"${HISTORY_TABLE}"`;
   const tableRelation = `${target.schema}.${HISTORY_TABLE}`;
-  const functionRelation = `${target.schema}.insert_telemetry_v1_contribution(jsonb)`;
   let client;
   let transactionOpen = false;
   let discard = false;
@@ -354,13 +406,14 @@ async function grantAndVerifyRuntimePrivileges(pool, role, target) {
       `ALTER DEFAULT PRIVILEGES IN SCHEMA ${schema}
          GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO ${runtimeRole}`,
     );
+    // Function grants are reset the same way: no direct grant survives on any
+    // routine of the schema, then the primary runtime functions are granted.
+    // PUBLIC's default EXECUTE on the other functions is the migrations' own.
+    await client.query(`REVOKE ALL ON ALL ROUTINES IN SCHEMA ${schema} FROM ${runtimeRole}`);
     if (role === "primary") {
-      await client.query(
-        `REVOKE ALL ON FUNCTION ${schema}."insert_telemetry_v1_contribution"(jsonb) FROM ${runtimeRole}`,
-      );
-      await client.query(
-        `GRANT EXECUTE ON FUNCTION ${schema}."insert_telemetry_v1_contribution"(jsonb) TO ${runtimeRole}`,
-      );
+      for (const { name, args } of TEST_RUNTIME_PRIMARY_FUNCTIONS) {
+        await client.query(`GRANT EXECUTE ON FUNCTION ${schema}."${name}"(${args}) TO ${runtimeRole}`);
+      }
     }
 
     const rows = rowsFrom(await client.query(
@@ -376,7 +429,7 @@ async function grantAndVerifyRuntimePrivileges(pool, role, target) {
             FROM pg_class rel
             JOIN pg_namespace ns ON ns.oid = rel.relnamespace
            WHERE ns.nspname = $2 AND rel.relkind IN ('r', 'p', 'v', 'm', 'f')
-             AND rel.relname <> $6) AS application_tables_dml,
+             AND rel.relname <> $4) AS application_tables_dml,
          (SELECT COALESCE(bool_and(
              has_sequence_privilege($1, rel.oid, 'USAGE')
              AND has_sequence_privilege($1, rel.oid, 'SELECT')
@@ -423,16 +476,17 @@ async function grantAndVerifyRuntimePrivileges(pool, role, target) {
              AND defaults.defaclnamespace = 0
              AND pg_get_userbyid(defaults.defaclrole) = current_user
              AND pg_get_userbyid(acl.grantee) = $1) AS no_global_sequence_defaults,
-         CASE WHEN $4
-           THEN has_function_privilege($1, $5, 'EXECUTE')
-           ELSE true
-         END AS telemetry_function_execute`,
+         (SELECT COALESCE(json_agg(json_build_object(
+             'signature', fn.proname || '(' || pg_catalog.oidvectortypes(fn.proargtypes) || ')',
+             'runtime_execute', has_function_privilege($1, fn.oid, 'EXECUTE')
+           ) ORDER BY fn.proname, fn.oid), '[]'::json)
+            FROM pg_proc fn
+           WHERE fn.pronamespace = to_regnamespace($2)
+             AND NOT has_function_privilege('public', fn.oid, 'EXECUTE')) AS restricted_functions`,
       [
         TEST_MIGRATIONS_RUNTIME_IAM_USER,
         target.schema,
         tableRelation,
-        role === "primary",
-        functionRelation,
         HISTORY_TABLE,
       ],
     ), `POSTGRES_TEST_MIGRATIONS_${role.toUpperCase()}_RUNTIME_PRIVILEGES_READ_FAILED`);
@@ -450,7 +504,7 @@ async function grantAndVerifyRuntimePrivileges(pool, role, target) {
         || actual?.default_sequences_access !== true
         || actual?.no_global_table_defaults !== true
         || actual?.no_global_sequence_defaults !== true
-        || actual?.telemetry_function_execute !== true) {
+        || !restrictedFunctionsMatchPolicy(role, actual?.restricted_functions)) {
       fail(`POSTGRES_TEST_MIGRATIONS_${role.toUpperCase()}_RUNTIME_PRIVILEGES_INVALID`);
     }
     await client.query("COMMIT");

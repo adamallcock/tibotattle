@@ -2,9 +2,10 @@
 
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { readdir, readFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import http from "node:http";
-import { dirname, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { parse as parseJsonc } from "jsonc-parser";
@@ -14,9 +15,14 @@ import {
   EDGE_TEST_PRODUCTION_SETTINGS,
   EDGE_TEST_UNMIRRORED_SETTINGS,
   edgeTestProductionEnv,
+  ensureOriginBucketRuntimeBinding,
   executeJobCommand,
   FASTPATH_TEST,
+  main,
   migrateJobCommand,
+  ORIGIN_BUCKET_RUNTIME_BINDING,
+  originBucketBindingCommand,
+  originBucketPolicyCommand,
   ORIGIN_TEST_CLOCK_ENV,
   originClockEnv,
   originInvokerCommand,
@@ -24,6 +30,7 @@ import {
   primarySchemaOf,
   refreshJobCommand,
   renderOriginService,
+  validateOriginBucketPolicy,
   validateOriginPolicy,
 } from "./gcp-fastpath-test-deploy.mjs";
 import { readSeedGolden } from "./gcp-fastpath-seed.mjs";
@@ -348,4 +355,143 @@ test("an edge-test origin runs the participant routes at wrangler.jsonc env.prod
   expectCode(() => edgeTestProductionEnv('{"env":{"production":{"vars":{"ENROLLMENT_MODE":"open"}}}}'),
     "FASTPATH_DEPLOY_PRODUCTION_CONFIG_INVALID");
   expectCode(() => edgeTestProductionEnv("{"), "FASTPATH_DEPLOY_PRODUCTION_CONFIG_INVALID");
+});
+
+// The live edge write tier (2026-10-01): the runtime service account held the
+// cleanup-storage role only on the A2 bucket, so POST /api/v1/contributions
+// answered 503 BACKEND_STORAGE_UNAVAILABLE until this binding was added by hand.
+const LIVE_BUCKET_CONDITION_EXPRESSION = '(resource.type == "storage.googleapis.com/Bucket" && resource.name == '
+  + '"projects/_/buckets/tibotattle-fastpath-test-20261001") || (resource.type == "storage.googleapis.com/Object" '
+  + '&& resource.name.startsWith("projects/_/buckets/tibotattle-fastpath-test-20261001/objects/telemetry/"))';
+const RUNTIME_MEMBER = "serviceAccount:tibotattle-test-runtime@tibotattle.iam.gserviceaccount.com";
+const CLEANUP_ROLE = "projects/tibotattle/roles/tibotattleTestCleanupStorage";
+// A new uniform-access bucket's project convenience bindings, which the guard leaves alone.
+const CONVENIENCE_BINDINGS = Object.freeze([
+  Object.freeze({ role: "roles/storage.legacyBucketOwner", members: ["projectEditor:tibotattle", "projectOwner:tibotattle"] }),
+  Object.freeze({ role: "roles/storage.legacyBucketReader", members: ["projectViewer:tibotattle"] }),
+]);
+const EXPECTED_BINDING = Object.freeze({ role: CLEANUP_ROLE, members: [RUNTIME_MEMBER],
+  condition: { title: "TiboTattleFastpathTelemetry", expression: LIVE_BUCKET_CONDITION_EXPRESSION } });
+
+/** --name=value of one argv, or undefined. */
+function flagValue(command, name) {
+  const arg = command.find((value) => value.startsWith(`--${name}=`));
+  return arg?.slice(name.length + 3);
+}
+
+/** A runner over one scripted bucket policy; add-iam-policy-binding parses --condition as gcloud's ArgDict does. */
+function bucketRunner(initial, { dropAdd = false } = {}) {
+  const policy = structuredClone(initial);
+  const commands = [];
+  return {
+    dryRun: false,
+    commands,
+    policy,
+    json(command) {
+      commands.push(command);
+      assert.deepEqual(command.slice(0, 4), ["gcloud", "storage", "buckets", "get-iam-policy"]);
+      return structuredClone(policy);
+    },
+    exec(command) {
+      commands.push(command);
+      assert.deepEqual(command.slice(0, 4), ["gcloud", "storage", "buckets", "add-iam-policy-binding"]);
+      // ArgDict: split on ',', then each key=value on its first '='.
+      const condition = Object.fromEntries(flagValue(command, "condition").split(",").map((pair) => {
+        const split = pair.indexOf("=");
+        return [pair.slice(0, split), pair.slice(split + 1)];
+      }));
+      if (!dropAdd) {
+        policy.bindings.push({ role: flagValue(command, "role"), members: [flagValue(command, "member")], condition });
+      }
+      return { status: 0, stdout: "{}", stderr: "" };
+    },
+  };
+}
+
+test("the origin bucket binding renders exactly the live grant, in the test project, as one gcloud call", () => {
+  assert.deepEqual({ ...ORIGIN_BUCKET_RUNTIME_BINDING, condition: { ...ORIGIN_BUCKET_RUNTIME_BINDING.condition } }, {
+    role: CLEANUP_ROLE, member: RUNTIME_MEMBER,
+    condition: { title: "TiboTattleFastpathTelemetry", expression: LIVE_BUCKET_CONDITION_EXPRESSION },
+  });
+  assert.deepEqual(originBucketBindingCommand(), [
+    "gcloud", "storage", "buckets", "add-iam-policy-binding", "gs://tibotattle-fastpath-test-20261001",
+    "--project=tibotattle", `--member=${RUNTIME_MEMBER}`, `--role=${CLEANUP_ROLE}`,
+    `--condition=expression=${LIVE_BUCKET_CONDITION_EXPRESSION},title=TiboTattleFastpathTelemetry`, "--format=json",
+  ]);
+  assert.equal(LIVE_BUCKET_CONDITION_EXPRESSION.includes(","), false, "the expression survives gcloud's ',' split");
+  assert.deepEqual(originBucketPolicyCommand(), ["gcloud", "storage", "buckets", "get-iam-policy",
+    "gs://tibotattle-fastpath-test-20261001", "--project=tibotattle", "--format=json"]);
+});
+
+test("ensuring the bucket binding adds it once, reads it back, and is idempotent", () => {
+  const runner = bucketRunner({ version: 1, bindings: [...CONVENIENCE_BINDINGS] });
+  assert.deepEqual({ ...ensureOriginBucketRuntimeBinding(runner) }, { role: CLEANUP_ROLE, member: RUNTIME_MEMBER,
+    conditionTitle: "TiboTattleFastpathTelemetry", added: true });
+  assert.deepEqual(runner.commands.map((command) => command[3]),
+    ["get-iam-policy", "add-iam-policy-binding", "get-iam-policy"]);
+  assert.deepEqual(runner.policy.bindings.at(-1), EXPECTED_BINDING, "the rendered call yields exactly the live binding");
+  const again = bucketRunner(runner.policy);
+  assert.equal(ensureOriginBucketRuntimeBinding(again).added, false);
+  assert.deepEqual(again.commands.map((command) => command[3]), ["get-iam-policy", "get-iam-policy"],
+    "a present binding is read twice and never written");
+  // An add that does not land is refused at the read-back.
+  assert.throws(() => ensureOriginBucketRuntimeBinding(bucketRunner({ bindings: [] }, { dropAdd: true })),
+    (error) => error?.code === "FASTPATH_DEPLOY_ORIGIN_BUCKET_BINDING_MISSING");
+});
+
+test("any other runtime binding or a public member on the bucket is refused before a write", () => {
+  const variants = {
+    "the role without a condition": { role: CLEANUP_ROLE, members: [RUNTIME_MEMBER] },
+    "another expression": { ...EXPECTED_BINDING,
+      condition: { title: "TiboTattleFastpathTelemetry", expression: 'resource.name.startsWith("projects/_/buckets/")' } },
+    "another title": { ...EXPECTED_BINDING, condition: { ...EXPECTED_BINDING.condition, title: "Other" } },
+    "another role": { ...EXPECTED_BINDING, role: "roles/storage.objectAdmin" },
+    "an extra member in the binding": { ...EXPECTED_BINDING, members: [RUNTIME_MEMBER, "serviceAccount:other@tibotattle.iam.gserviceaccount.com"] },
+  };
+  for (const [label, binding] of Object.entries(variants)) {
+    const runner = bucketRunner({ bindings: [...CONVENIENCE_BINDINGS, binding] });
+    assert.throws(() => ensureOriginBucketRuntimeBinding(runner),
+      (error) => error?.code === "FASTPATH_DEPLOY_ORIGIN_BUCKET_BINDING_UNEXPECTED", label);
+    assert.equal(runner.commands.some((command) => command[3] === "add-iam-policy-binding"), false, label);
+  }
+  const extra = bucketRunner({ bindings: [EXPECTED_BINDING, { role: "roles/storage.objectViewer", members: [RUNTIME_MEMBER] }] });
+  assert.throws(() => ensureOriginBucketRuntimeBinding(extra),
+    (error) => error?.code === "FASTPATH_DEPLOY_ORIGIN_BUCKET_BINDING_UNEXPECTED", "a second runtime binding");
+  for (const member of ["allUsers", "allAuthenticatedUsers"]) {
+    const open = bucketRunner({ bindings: [EXPECTED_BINDING, { role: "roles/storage.objectViewer", members: [member] }] });
+    assert.throws(() => ensureOriginBucketRuntimeBinding(open),
+      (error) => error?.code === "FASTPATH_DEPLOY_ORIGIN_BUCKET_PUBLIC", member);
+  }
+  assert.equal(validateOriginBucketPolicy({ bindings: [...CONVENIENCE_BINDINGS] }), false);
+  assert.equal(validateOriginBucketPolicy({ bindings: [...CONVENIENCE_BINDINGS, EXPECTED_BINDING] },
+    { requirePresent: true }), true);
+  assert.throws(() => validateOriginBucketPolicy({}, { requirePresent: true }),
+    (error) => error?.code === "FASTPATH_DEPLOY_ORIGIN_BUCKET_BINDING_MISSING");
+});
+
+test("a dry-run origin step prints the bucket binding before the origin is deployed and writes nothing remote", async () => {
+  const out = await mkdtemp(join(tmpdir(), "fastpath-deploy-dry-"));
+  const printed = [];
+  const { error: printError, log: printLog } = console;
+  console.error = (line) => printed.push(String(line));
+  console.log = () => {};
+  try {
+    const report = await main(["origin", "--dry-run", `--image=${IMAGE}`, `--schema=${FASTPATH_TEST.primarySchema}`,
+      `--out=${out}`]);
+    assert.deepEqual({ ...report.steps[0].bucketBinding }, { role: CLEANUP_ROLE, member: RUNTIME_MEMBER,
+      conditionTitle: "TiboTattleFastpathTelemetry", added: false });
+  } finally {
+    console.error = printError;
+    console.log = printLog;
+    await rm(out, { recursive: true, force: true });
+  }
+  assert.equal(printed.every((line) => line.startsWith("[dry-run] ")), true);
+  const index = (fragment) => printed.findIndex((line) => line.includes(fragment));
+  const binding = index("gcloud storage buckets add-iam-policy-binding gs://tibotattle-fastpath-test-20261001");
+  assert.ok(binding > index("gcloud storage buckets get-iam-policy"), "read before the binding");
+  assert.ok(printed.findLastIndex((line) => line.includes("gcloud storage buckets get-iam-policy")) > binding,
+    "read back after it");
+  assert.ok(binding < index("gcloud run services replace"), "the binding precedes the origin deploy");
+  assert.equal(printed[binding].includes(`--role=${CLEANUP_ROLE}`) && printed[binding].includes(RUNTIME_MEMBER)
+    && printed[binding].includes(LIVE_BUCKET_CONDITION_EXPRESSION), true);
 });

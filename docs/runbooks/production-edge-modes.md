@@ -374,7 +374,14 @@ authorization in chat for each of these:
    typed route the write tier uses answers `503 BACKEND_STORAGE_UNAVAILABLE`,
    and, in edge-test mode, `wrangler.jsonc` env.production's
    `ENROLLMENT_MODE`, `ACCOUNTLESS_ENROLLMENT_MODE`,
-   `ACCOUNTLESS_OWNERSHIP_MODE` and `SIGN_IN_START_MAX_PER_MINUTE`.
+   `ACCOUNTLESS_OWNERSHIP_MODE` and `SIGN_IN_START_MAX_PER_MINUTE`. Before
+   the origin deploys, the origin step also ensures the runtime account's one
+   conditional binding on the fast-path bucket and reads it back; without it
+   `POST /api/v1/contributions` answers `503 BACKEND_STORAGE_UNAVAILABLE`. The
+   seed and migrate steps grant the runtime role `EXECUTE` on
+   `storage_journal_append` and `storage_owner_link_ensure`; without it the
+   v1.2 domain activation answers 503. In fastpath-test mode `/api/ready`
+   answers `503 POSTGRES_TEST_ROUTE_UNSUPPORTED` by design (F8).
 2. Run the read-only tier:
    `node scripts/edge-live-check.mjs run --authorize=EDGE_LIVE_CHECK_READ_ONLY`.
 3. Separately, run the write tier, which enrolls synthetic accountless devices

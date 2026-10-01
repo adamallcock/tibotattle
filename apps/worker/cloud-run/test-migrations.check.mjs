@@ -24,6 +24,10 @@ import {
   TEST_MIGRATIONS_RUNTIME_IAM_USER,
   TEST_MIGRATIONS_SERVICE_ACCOUNT,
   TEST_MIGRATIONS_TARGETS,
+  TEST_OPERATOR_ONLY_PRIMARY_FUNCTIONS,
+  TEST_RUNTIME_PRIMARY_FUNCTIONS,
+  functionSignature,
+  restrictedFunctionsMatchPolicy,
 } from "./test-migrations.mjs";
 
 const EXECUTION = "tibotattle-test-database-migrate-20260924-abc12";
@@ -85,6 +89,9 @@ function makeHarness(manifest, {
   corruptPrimaryPrivileges = false,
   graphBenchmark = false,
   fastpath = false,
+  // Read-back rows the grants cannot change (e.g. a privilege held through
+  // role membership), appended for every primary role schema.
+  extraPrimaryRestrictedFunctions = [],
 } = {}) {
   const schemaNames = {
     primary: [TEST_MIGRATIONS_TARGETS.primary.schema,
@@ -116,9 +123,14 @@ function makeHarness(manifest, {
       historyWrite: false,
       defaultTablesDml: false,
       defaultSequencesAccess: false,
-      telemetryFunctionExecute: false,
     },
   }]));
+  // Direct EXECUTE grants to the runtime role, per schema, as `name(args)`.
+  const functionGrants = new Map(allSchemas.map((schema) => [schema, new Set()]));
+  const ledgerSchemas = new Set([TEST_MIGRATIONS_TARGETS.ledger.schema, FASTPATH_MIGRATION_TARGETS.ledger.schema]);
+  // The primary migrations' non-PUBLIC functions: the runtime ones and the operator-only ones.
+  const restrictedPrimaryFunctions = [...TEST_RUNTIME_PRIMARY_FUNCTIONS, ...TEST_OPERATOR_ONLY_PRIMARY_FUNCTIONS]
+    .map(functionSignature);
   const events = [];
   const pools = {};
   let connectorCount = 0;
@@ -223,12 +235,20 @@ function makeHarness(manifest, {
                 privileges.defaultSequencesAccess = true;
                 return { rows: [], rowCount: 0 };
               }
-              if (sql.startsWith("REVOKE ALL ON FUNCTION ")) {
-                privileges.telemetryFunctionExecute = false;
+              if (sql.startsWith("REVOKE ALL ON ALL ROUTINES IN SCHEMA ")) {
+                const schema = sql.match(/^REVOKE ALL ON ALL ROUTINES IN SCHEMA "([a-z0-9_]+)" FROM /u)?.[1];
+                if (!functionGrants.has(schema)) functionGrants.set(schema, new Set());
+                functionGrants.get(schema).clear();
                 return { rows: [], rowCount: 0 };
               }
               if (sql.startsWith("GRANT EXECUTE ON FUNCTION ")) {
-                privileges.telemetryFunctionExecute = true;
+                const [, schema, name, args] = sql.match(
+                  /^GRANT EXECUTE ON FUNCTION "([a-z0-9_]+)"\."([a-z0-9_]+)"\(([a-z, ]*)\) TO /u) ?? [];
+                if (ledgerSchemas.has(schema) || !restrictedPrimaryFunctions.includes(`${name}(${args})`)) {
+                  throw new Error("unexpected fake function grant");
+                }
+                if (!functionGrants.has(schema)) functionGrants.set(schema, new Set());
+                functionGrants.get(schema).add(`${name}(${args})`);
                 return { rows: [], rowCount: 0 };
               }
               if (sql.includes("has_schema_privilege($1, $2, 'USAGE')")) {
@@ -248,9 +268,11 @@ function makeHarness(manifest, {
                     default_sequences_access: actual.defaultSequencesAccess,
                     no_global_table_defaults: true,
                     no_global_sequence_defaults: true,
-                    telemetry_function_execute: role === "primary"
-                      ? actual.telemetryFunctionExecute
-                      : true,
+                    restricted_functions: ledgerSchemas.has(params[1]) ? [] : restrictedPrimaryFunctions
+                      .map((signature) => ({
+                        signature,
+                        runtime_execute: functionGrants.get(params[1])?.has(signature) === true,
+                      })).concat(extraPrimaryRestrictedFunctions),
                   }],
                   rowCount: 1,
                 };
@@ -495,9 +517,19 @@ test("primary and ledger migrations are checksum-read back and repeated runs are
       `REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER\n         ON ${schema}."_tibotattle_migration_history"`,
     )), true);
   }
-  assert.equal(privilegeSql.some((sql) => sql.startsWith("GRANT EXECUTE ON FUNCTION ")),
-    true, "primary runtime must execute the intentionally non-public v1 admission function");
-  assert.equal(privilegeSql.filter((sql) => sql.startsWith("GRANT EXECUTE ON FUNCTION ")).length, 2);
+  const primarySchema = `"${TEST_MIGRATIONS_TARGETS.primary.schema}"`;
+  const functionGrantSql = privilegeSql.filter((sql) => sql.startsWith("GRANT EXECUTE ON FUNCTION "));
+  assert.deepEqual(functionGrantSql, [1, 2].flatMap(() => TEST_RUNTIME_PRIMARY_FUNCTIONS.map(({ name, args }) =>
+    `GRANT EXECUTE ON FUNCTION ${primarySchema}."${name}"(${args}) TO "${TEST_MIGRATIONS_RUNTIME_IAM_USER}"`)),
+  "each run grants the primary runtime exactly its non-public request-path functions, and the ledger none");
+  for (const role of ["primary", "ledger"]) {
+    assert.equal(privilegeSql.filter((sql) => sql === `REVOKE ALL ON ALL ROUTINES IN SCHEMA "${
+      TEST_MIGRATIONS_TARGETS[role].schema}" FROM "${TEST_MIGRATIONS_RUNTIME_IAM_USER}"`).length, 2,
+    `${role}: every run resets direct routine grants first`);
+  }
+  for (const { name } of TEST_OPERATOR_ONLY_PRIMARY_FUNCTIONS) {
+    assert.equal(privilegeSql.some((sql) => sql.includes(name)), false, `${name} is never granted`);
+  }
   assert.equal(harness.events.filter(({ sql }) => sql?.includes("has_schema_privilege($1, $2, 'USAGE')")).length, 4);
   assert.equal(privilegeSql.some((sql) => sql.includes('"tibotattle"')),
     false, "only the exact A2 schemas may receive grants");
@@ -724,8 +756,10 @@ test("fastpath profile applies both roles through one pool and grants only its e
   assert.equal(grantSql.every((sql) => sql.includes('"tibotattle_fastpath_')), true,
     "fast-path grants never reach the shared A2 or benchmark schemas");
   assert.equal(grantSql.filter((sql) => sql.startsWith("GRANT EXECUTE ON FUNCTION "
-    + `"${FASTPATH_MIGRATION_TARGETS.primary.schema}".`)).length, 2,
-  "only the primary role schema carries the v1 admission function grant");
+    + `"${FASTPATH_MIGRATION_TARGETS.primary.schema}".`)).length, 2 * TEST_RUNTIME_PRIMARY_FUNCTIONS.length,
+  "only the primary role schema carries the runtime function grants");
+  assert.equal(grantSql.filter((sql) => sql.startsWith("GRANT EXECUTE ON FUNCTION ")).length,
+    2 * TEST_RUNTIME_PRIMARY_FUNCTIONS.length);
 });
 
 test("the exported runtime-grant routine applies the same policy to one named schema", async () => {
@@ -744,9 +778,11 @@ test("the exported runtime-grant routine applies the same policy to one named sc
   const grants = harness.events.map(({ sql }) => sql ?? "")
     .filter((sql) => /^(GRANT|REVOKE|ALTER DEFAULT PRIVILEGES)/u.test(sql));
   assert.equal(grants.length > 0 && grants.every((sql) => sql.includes(quoted)), true);
-  assert.equal(grants.includes(
+  for (const grant of [
     `GRANT EXECUTE ON FUNCTION ${quoted}."insert_telemetry_v1_contribution"(jsonb) TO "${TEST_MIGRATIONS_RUNTIME_IAM_USER}"`,
-  ), true);
+    `GRANT EXECUTE ON FUNCTION ${quoted}."storage_journal_append"(text, text, text, text, text) TO "${TEST_MIGRATIONS_RUNTIME_IAM_USER}"`,
+    `GRANT EXECUTE ON FUNCTION ${quoted}."storage_owner_link_ensure"(text, text) TO "${TEST_MIGRATIONS_RUNTIME_IAM_USER}"`,
+  ]) assert.equal(grants.includes(grant), true, grant);
   assert.equal(harness.events.some(({ sql, params }) =>
     sql?.includes("has_schema_privilege($1, $2, 'USAGE')") && params?.[1] === schema), true);
   await assert.rejects(grantAndVerifyTestRuntimePrivileges(pool, "admin", schema),
@@ -754,4 +790,53 @@ test("the exported runtime-grant routine applies the same policy to one named sc
   await assert.rejects(grantAndVerifyTestRuntimePrivileges(pool, "primary", "Bad-Schema"),
     (error) => error?.code === "POSTGRES_TEST_MIGRATIONS_PRIMARY_RUNTIME_GRANT_FAILED"
       || error?.code === "POSTGRES_TEST_MIGRATIONS_SCHEMA_INVALID");
+});
+
+// The live edge write tier (2026-10-01): the runtime role lacked EXECUTE on
+// storage_journal_append and storage_owner_link_ensure, which 0046 revokes
+// from PUBLIC, so POST /api/v1/me/telemetry-v12/domain-activate answered 503.
+test("runtime function policy: exactly the request-path functions, never an operator entrypoint", () => {
+  const signatures = TEST_RUNTIME_PRIMARY_FUNCTIONS.map(functionSignature);
+  assert.deepEqual(signatures, ["insert_telemetry_v1_contribution(jsonb)",
+    "storage_journal_append(text, text, text, text, text)", "storage_owner_link_ensure(text, text)"]);
+  assert.deepEqual(TEST_OPERATOR_ONLY_PRIMARY_FUNCTIONS.map(functionSignature), ["storage_v11_bridge_backfill(integer)",
+    "storage_v12_bridge_backfill(integer)", "typed_telemetry_restart_identities()"]);
+  const row = (signature, runtimeExecute) => ({ signature, runtime_execute: runtimeExecute });
+  const granted = [...signatures.map((signature) => row(signature, true)),
+    ...TEST_OPERATOR_ONLY_PRIMARY_FUNCTIONS.map((fn) => row(functionSignature(fn), false))];
+  assert.equal(restrictedFunctionsMatchPolicy("primary", granted), true);
+  assert.equal(restrictedFunctionsMatchPolicy("primary", [...granted].reverse()), true, "order-insensitive");
+  assert.equal(restrictedFunctionsMatchPolicy("ledger", []), true);
+  assert.equal(restrictedFunctionsMatchPolicy("ledger", [row("ledger_guard()", false)]), true);
+  const refused = {
+    "the pre-fix grant (v1 admission only)": granted.map((entry) => entry.signature.startsWith("storage_journal_append")
+      || entry.signature.startsWith("storage_owner_link_ensure") ? row(entry.signature, false) : entry),
+    "an operator-only entrypoint executable": granted.map((entry) => entry.signature.startsWith("storage_v12_bridge_backfill")
+      ? row(entry.signature, true) : entry),
+    "an operator-only entrypoint missing or PUBLIC": granted.filter(({ signature }) =>
+      !signature.startsWith("typed_telemetry_restart_identities")),
+    "a runtime function missing or PUBLIC": granted.filter(({ signature }) => !signature.startsWith("storage_owner_link_ensure")),
+    "any other non-public function executable": [...granted, row("synthetic_maintenance_backfill(integer)", true)],
+    "a duplicate row": [...granted, granted[0]],
+    "a malformed row": [...granted, { signature: "x()", runtime_execute: "true" }],
+  };
+  for (const [label, rows] of Object.entries(refused)) {
+    assert.equal(restrictedFunctionsMatchPolicy("primary", rows), false, label);
+  }
+  assert.equal(restrictedFunctionsMatchPolicy("ledger", [row("insert_telemetry_v1_contribution(jsonb)", true)]), false,
+    "the ledger runtime executes no non-public function");
+  assert.equal(restrictedFunctionsMatchPolicy("primary", null), false);
+});
+
+test("a non-public function the runtime can still execute after the reset fails the migrate run closed", async () => {
+  for (const extra of [
+    { signature: "synthetic_maintenance_backfill(integer)", runtime_execute: true },
+    { signature: "storage_v12_bridge_backfill(integer)", runtime_execute: true },
+  ]) {
+    const harness = makeHarness(manifest, { fastpath: true, extraPrimaryRestrictedFunctions: [extra] });
+    await assert.rejects(runTestMigrations({ env: validFastpathEnv(), profile: FASTPATH_MIGRATION_PROFILE,
+      dependencies: harness.dependencies }),
+    (error) => error?.code === "POSTGRES_TEST_MIGRATIONS_PRIMARY_RUNTIME_PRIVILEGES_INVALID", extra.signature);
+    assert.equal(harness.cleanupCalls, 1);
+  }
 });

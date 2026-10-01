@@ -25,6 +25,13 @@ against `4722c4a3`, the fixes in code commit `02841e26`, and the gates re-run
 at that commit. Where it differs from the sections before it, it supersedes
 them.
 
+The last section, [live check](#live-check), records the owner-authorized
+live check (OD-E3) run later the same day against the GCP test project, the
+four defects only it found, and the commit that adds that section, which makes
+the last two fixes permanent. It is the only part of this receipt that
+involves Google or GCP; the statements below that nothing called them hold for
+the sections before it.
+
 Nothing was pushed or deployed. No Cloudflare API, Google endpoint or GCP
 resource was called, and wrangler ran only with `--dry-run` and without any
 Cloudflare credential in its environment. This receipt does not qualify
@@ -341,5 +348,158 @@ then matched the Worker.
 | `npm run deployment:endpoints:check` | Pass |
 | `npm run postgres:domain:check` with the same env | Exit 0: vitest 75 pass and 1 skip; node:test 336 tests, 334 pass, 2 skipped by design |
 | `edge:e2e:check` | 12 of 12; the dry run passes with `contributionRequestPreflight` in each bundle's exports |
+| Repository root `npm run architecture:check` | Passed: 922 production files, 3,937 imports, 0 debt edges |
+| Repository root `npm run test:preflight`, with this section in place | Exit 0: documentation governance valid across 303 Markdown files; 20 of 20 governance and guidance tests |
+
+## Live check
+
+On 2026-10-01, between about 21:16 and 22:38 UTC, the orchestrator ran the
+OD-E3 live check with the owner's authorization for each GCP write. The edge
+ran locally in workerd in gcp mode (`scripts/edge-live-check.mjs`). Its
+forwards and its ID-token exchange went through Google's front end to the
+fast-path test origin, `tibotattle-fastpath-test-origin` in project
+`tibotattle` (us-east1). The origin was the direct edge-test variant over the
+seeded schema `typed_legacy_transfer_rehearsal_target_fastpath_cd40451d`.
+Every device, key and row was synthetic. The live receipts hold statuses,
+header names, digests and timings; this section copies only statuses,
+digests and artifact identities.
+
+This qualifies Google's front end with a local edge: the impersonated ID
+token, the Cloud Run invoker check, the delivered `x-serverless-authorization`
+and Google's own headers. It does not qualify Cloudflare's network, Workers
+Rate Limiting across locations, Access, custom domains, the production origin
+composition (CR-6 and CR-7) or production data. OD-E6 and the probe on
+Cloudflare's network for the address-bearing headers
+([review fixes](#review-fixes), finding 1) remain open.
+
+### Origin revisions
+
+All are in project `tibotattle`. Images are in
+`us-east1-docker.pkg.dev/tibotattle/tibotattle-test/tibotattle-host`.
+
+| Revision | Image | Origin settings | Live result |
+|---|---|---|---|
+| `00005-4sc` | from `4aab26ed`, `sha256:c9cba350…` | edge-test, closed admission defaults | Every forwarded request got the origin boundary's constant `421`, without a logged reason |
+| `00006-j6m` | from `b754017f`, `sha256:84cd4ccc…` | as above | Every request refused with the logged reason `invoker_bearer_prefix_missing` (defect 1) |
+| `00007-brw` | from `417dd594`, `sha256:63324fb8504ce3a0da18a82029ad5069603c814323fa9a6a9ad2d52924392043` | as above | The read-only tier passed (below) |
+| `00008-rcg` | the same image | adds `ENROLLMENT_MODE`, `ACCOUNTLESS_ENROLLMENT_MODE` and `ACCOUNTLESS_OWNERSHIP_MODE` at production's values | Enrollment, ownership and the v1.2 authorization `201`, then `503 BACKEND_STORAGE_UNAVAILABLE` at the v1.2 sync capabilities (defect 2) |
+| `00009-cmx` | the same image | deployed by `a6602516`'s tooling: the golden's `POSTGRES_SOURCE_ID` and `POSTGRES_SOURCE_NAMESPACE`, and all four production settings | The write tier reached the contribution and the domain activation, each `503` until defects 3 and 4 were fixed by hand, then passed (below) |
+
+### The passing tiers
+
+The read-only tier passed at 22:02:58 UTC on `00007-brw` with 11 rows:
+
+| Row | Status | Answered by |
+|---|---|---|
+| `/api/health` | 200 | the origin, through the edge |
+| `/api/ready` | 503 `POSTGRES_TEST_ROUTE_UNSUPPORTED`, by design (F8, below) | the origin, through the edge |
+| `/api/v1/envelope-key` | 200 | the origin, through the edge |
+| `/api/v1/community/daily` | 200, sha256 `a27aee711cabc056eea2ecb5c89b7f4de3ec4a9f85b72455057c1f760ffa680d`, byte-identical to the E12 golden answer (S9) | the origin, through the edge |
+| Device sync with no bearer, and with an unknown bearer | 401 and 401 | the origin, through the edge |
+| `www` redirect, asset, unknown API, admin without Access | 308, 200, 404 and 403 | the local edge, with nothing forwarded |
+| The origin URL requested directly without a token | 403 | Google's front end |
+
+The write tier passed at 22:38:06 UTC on `00009-cmx` with 22 rows: the same
+11, with the same statuses and community digest, then 11 written through the
+edge into the seeded schema:
+
+| Row | Status |
+|---|---|
+| Accountless enrollment | 201 |
+| Accountless ownership | 201 |
+| v1.2 authorization | 201 |
+| Shipped v1.2 sync: capabilities | 200 |
+| Predecessor | 201 |
+| Day manifests | 201 |
+| Envelope key (body equal to the read-only row's) | 200 |
+| Upload authorization | 201 |
+| Contribution | 202 |
+| Capabilities again (body equal to the first read) | 200 |
+| Domain activation | 201 |
+
+### Defects only the live check found
+
+1. **Cloud Run delivers `x-serverless-authorization` without the exact
+   `Bearer ` prefix the contract pinned.** The local front-end emulator sent
+   it as the edge did, so E12 passed. Fixed in code commit `417dd594`: the
+   shared contract (`src/edge-origin-contract.ts`) reads the header as RFC 7235
+   credentials. `b754017f` first made each boundary refusal name its reason.
+2. **The seeded-schema origin had no source identity and ran closed admission
+   defaults.** Every typed route answered `503 BACKEND_STORAGE_UNAVAILABLE`, and
+   the participant write routes ran at the composition's closed defaults. Fixed
+   in code commit `a6602516`: the deploy gives a seeded schema's origin the
+   golden's source pair, and gives an edge-test origin the four admission
+   settings from `wrangler.jsonc` env.production.
+3. **The runtime service account had no access to the fast-path bucket.** Its
+   only storage grant was the project custom role
+   `projects/tibotattle/roles/tibotattleTestCleanupStorage`, conditioned to the
+   A2 bucket, so `POST /api/v1/contributions` answered
+   `503 BACKEND_STORAGE_UNAVAILABLE`. The orchestrator added a bucket-level
+   binding by hand: that role, for the runtime account, with the condition
+   `TiboTattleFastpathTelemetry` (the bucket itself and its `telemetry/`
+   objects). The commit that adds this section makes it permanent:
+   `scripts/gcp-fastpath-test-deploy.mjs`'s origin step ensures exactly that
+   binding before the origin deploys. It reads the policy, adds the binding
+   only when the runtime account holds none, reads it back, and refuses any
+   other binding of that account and any public member. A dry run prints all
+   three calls.
+4. **The runtime database role could not execute the owner-journal
+   functions.** Primary 0046 revokes `storage_journal_append` and
+   `storage_owner_link_ensure` from PUBLIC. Both are SECURITY INVOKER and run
+   as the request's role inside the v1.2 owner bridge (0055), v1.1 live
+   admission (0060) and legacy contribution admission (0061).
+   `grantAndVerifyTestRuntimePrivileges` granted only
+   `insert_telemetry_v1_contribution`, so
+   `POST /api/v1/me/telemetry-v12/domain-activate` answered 503. The
+   orchestrator granted both by hand. The commit that adds this section fixes
+   the routine (`cloud-run/test-migrations.mjs`), which the A2, benchmark and
+   fast-path migrate Jobs and the fast-path seed all run:
+   - it resets every direct routine grant to the runtime role in the schema;
+   - it grants `EXECUTE` on exactly those three functions;
+   - its read-back requires that the runtime role executes exactly those
+     three among the schema's non-PUBLIC functions;
+   - the read-back also requires that `storage_v11_bridge_backfill`,
+     `storage_v12_bridge_backfill` and `typed_telemetry_restart_identities`
+     exist, are non-PUBLIC and are closed to the runtime role.
+
+   The seed applies the fix from the checkout. The migrate Jobs apply it only
+   from an image built at that commit.
+
+### Notes
+
+- `/api/ready` answers `503 POSTGRES_TEST_ROUTE_UNSUPPORTED` in fastpath-test
+  mode. This is the known F8 gap: a Worker-shaped readiness answer belongs to
+  the production origin composition. Not changed here.
+- The fast-path plan's integration checklist names
+  `insert_telemetry_v1_typed_contribution`, which no promoted migration
+  defines. LF-3 landed as TypeScript admission (`0061` and
+  `src/postgres-legacy-contribution-admission.ts`), which calls the two journal
+  functions directly. The runtime set is therefore
+  `insert_telemetry_v1_contribution`, `storage_journal_append` and
+  `storage_owner_link_ensure`.
+- No production grant code exists on this line. OPS-2 is planned, and the
+  EP-7 templates carry only the invoker binding. The plan's OPS-2 row now
+  states both requirements: the runtime function grants with read-back, and
+  the runtime account's production bucket grant.
+- `scripts/gcp-test-database.mjs` has the same function gap. It is the older,
+  generic Cloud SQL IAM qualification job, which the fast path does not use,
+  and it grants only `insert_telemetry_v1_contribution`. It is recorded here,
+  not fixed.
+
+### Gates for the commit that adds this section
+
+Local only, on the same workstation: Node 26.2.0 and the local PostgreSQL 17
+cluster on a private Unix socket. No GCP or Cloudflare call was made, and
+nothing was pushed.
+
+| Gate | Result |
+|---|---|
+| New `postgres-test/postgres-test-runtime-grants.spec.mjs`, registered in `postgres:domain:check` | 1 of 1. A non-superuser, Cloud SQL-like migrator owns a fresh database and migrates both roles. Under the pre-fix grant the runtime role gets `42501` on both journal functions. After the routine it mints an owner link and appends a journal row. The three operator entrypoints stay `42501`, a stray direct grant is reset, and a PUBLIC re-grant fails the read-back. Run against `a6602516`'s routine, the spec fails at `storage_journal_append` |
+| `cloud-run/test-migrations.check.mjs` | 16 of 16, including the policy and fail-closed cases |
+| `npm run gcp:fastpath:scripts-check` with the PostgreSQL env | 29 pass, 1 skipped (the TCP case needs `PG_TEST_TCP_HOST`). Includes the deploy script's 14 checks: the rendered binding, idempotency, refusal of a different or extra binding and of public members, and dry-run order |
+| `gcp-fastpath-test-deploy.mjs all --commit=HEAD --dry-run` | Exit 0. The bucket policy read, binding and read-back print before `run services replace` |
+| `cloud-run`: `npm run check` with the PostgreSQL env | Exit 0: 286 node:test tests, 285 pass and 1 skipped (the opt-in A2 activation case) |
+| `npx tsc --noEmit` (apps/worker) | Exit 0 |
+| `node scripts/ci-postgres-suite.mjs --plan` | The new spec routes and registers cleanly. The two failures it reports exist at `a6602516` too: `edge-origin-e2e.spec.mjs` unregistered and `postgres-ingestion-journal-transfer.spec.mjs` ambiguous |
 | Repository root `npm run architecture:check` | Passed: 922 production files, 3,937 imports, 0 debt edges |
 | Repository root `npm run test:preflight`, with this section in place | Exit 0: documentation governance valid across 303 Markdown files; 20 of 20 governance and guidance tests |
