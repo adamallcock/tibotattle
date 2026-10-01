@@ -74,6 +74,16 @@ const UNSUPPORTED_CONFIG_RESOURCE_KEYS = Object.freeze([
   "workflows",
 ]);
 const UNSUPPORTED_CONFIG_KEYS = Object.freeze(["annotations", "tags", "usage_model"]);
+/**
+ * The only D1 `migrations_dir` a candidate config may carry, by binding. The
+ * directory is config-only (Wrangler reads it for `d1 migrations`; the live
+ * inventory never reports it), so it is not compared. A typed deployment still
+ * never carries the legacy JSON migration directory: any other binding or
+ * directory stays BINDING_INVALID.
+ */
+export const PRODUCTION_LIVE_CONFIG_D1_MIGRATIONS_DIRS = Object.freeze({
+  RELEASE_GUARD_DB: "release-guard-migrations",
+});
 
 function fail(code) {
   throw operationError(`PRODUCTION_LIVE_CONFIG_${code}`);
@@ -521,7 +531,12 @@ function normalizeConfigBindings(config) {
   if (!Array.isArray(config.d1_databases)) fail("CONFIG_D1_INVALID");
   for (const entry of config.d1_databases) {
     requiredObject(entry, "CONFIG_D1_INVALID");
-    const { binding, ...fields } = entry;
+    const { binding, migrations_dir: migrationsDir, ...fields } = entry;
+    if (own(entry, "migrations_dir")
+        && (typeof binding !== "string" || !own(PRODUCTION_LIVE_CONFIG_D1_MIGRATIONS_DIRS, binding)
+          || PRODUCTION_LIVE_CONFIG_D1_MIGRATIONS_DIRS[binding] !== migrationsDir)) {
+      fail("BINDING_INVALID");
+    }
     result.push(normalizeBinding({
       ...fields,
       name: binding,
