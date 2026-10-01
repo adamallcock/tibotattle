@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { chmod, copyFile, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -22,10 +22,17 @@ import {
 } from "../scripts/postgres-fastpath-identity-copy.mjs";
 
 // PG17 acceptance for the GCP fast-path identity/authority copy (T-1). The
-// source is a SQLite file built here by applying the d43c8f92
-// USAGE_MONITOR_DB D1 migrations (read from git) with node:sqlite and
-// inserting synthetic, content-free rows. Every PostgreSQL schema is created
-// by this spec under a random name and dropped at the end.
+// source is a SQLite file built here by applying this checkout's
+// USAGE_MONITOR_DB D1 migrations with node:sqlite and inserting synthetic,
+// content-free rows. A shallow CI checkout (fetch-depth 1) has those files
+// but not d43c8f92, which is not an ancestor of this line. For every object
+// the copy reads they are byte-identical to d43c8f92's: the checkout only adds
+// the accountless-history-transfer objects and one v1.2 trigger, and lacks two
+// typed-ingestion indexes. D43C8F92_COPIED_LAYOUT_SHA256 pins that layout;
+// every fixture build asserts it, and the layout test re-derives it from
+// d43c8f92 itself whenever that commit is in the local object store. Every
+// PostgreSQL schema is created by this spec under a random name and dropped
+// at the end.
 
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
 const PG_TEST_PORT = Number(process.env.PG_TEST_PORT ?? "5432");
@@ -35,12 +42,18 @@ const PG_TEST_DATABASE = process.env.PG_TEST_DATABASE ?? "postgres";
 const WORKER_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 // The reviewed allowlist. A change to the table set, column mapping,
-// selection or omissions changes this digest and must be re-reviewed here.
-const ALLOWLIST_SHA256 = "16a1a7941be5ef34c78942edb0a208af427ffd9732f9bf9c81baf02369376ba4";
+// selection, omissions or source row rules changes this digest and must be
+// re-reviewed here.
+const ALLOWLIST_SHA256 = "303facb9a9decbd6dd50dcf04044bfea21838c22a7a7e910e8bf02238c956d28";
 
-// The d43c8f92 USAGE_MONITOR_DB chain, in the order the d43c8f92 oracle
-// specs apply it to env.USAGE_MONITOR_DB. legacy-migrations is retired
-// staging evidence and is never applied.
+// sha256 of the sqlite_master rows (type, name, tbl_name, sql) of every
+// allowlisted table, storage_owner_revisions, storage_source_state and the
+// community_public_source_owners view, as the d43c8f92 chain creates them.
+const D43C8F92_COPIED_LAYOUT_SHA256 = "0d9f5dee9fda6c40f75ed45579f7cedc65403f7a57f9d0b127d3b8968cecbc9c";
+
+// The USAGE_MONITOR_DB chain, in the order the d43c8f92 oracle specs apply it
+// to env.USAGE_MONITOR_DB. legacy-migrations is retired staging evidence and
+// is never applied.
 const D1_MIGRATION_DIRECTORIES = Object.freeze([
   "migrations",
   "typed-ingestion-migrations",
@@ -68,26 +81,67 @@ function git(...args) {
   });
 }
 
-let d1Migrations;
-function readD1Migrations() {
-  if (d1Migrations) return d1Migrations;
+const D1_MIGRATION_NAME = /^\d{4}_[a-z0-9_]+\.sql$/u;
+
+let checkoutMigrations;
+/** This checkout's D1 chain: present in any checkout, shallow or not. */
+async function readCheckoutD1Migrations() {
+  if (checkoutMigrations) return checkoutMigrations;
+  const migrations = [];
+  for (const directory of D1_MIGRATION_DIRECTORIES) {
+    const names = (await readdir(join(WORKER_ROOT, directory))).filter(name => D1_MIGRATION_NAME.test(name)).sort();
+    assert.ok(names.length > 0, `no D1 migrations in ${directory}`);
+    for (const name of names) {
+      migrations.push({ directory, name, sql: await readFile(join(WORKER_ROOT, directory, name), "utf8") });
+    }
+  }
+  checkoutMigrations = Object.freeze(migrations);
+  return checkoutMigrations;
+}
+
+/** The d43c8f92 chain from git, or null when the commit is not in the object store. */
+function readSourceCommitD1Migrations() {
   try {
     git("cat-file", "-e", `${POSTGRES_FASTPATH_IDENTITY_SOURCE_COMMIT}^{commit}`);
   } catch {
-    throw new Error("the d43c8f92 source commit is not in this repository's object store; fetch main before running this spec");
+    return null;
   }
   const migrations = [];
   for (const directory of D1_MIGRATION_DIRECTORIES) {
     const names = git("ls-tree", "--full-tree", "--name-only", `${POSTGRES_FASTPATH_IDENTITY_SOURCE_COMMIT}:apps/worker/${directory}/`)
-      .split("\n").filter(name => /^\d{4}_[a-z0-9_]+\.sql$/u.test(name)).sort();
-    assert.ok(names.length > 0, `no D1 migrations in ${directory}`);
+      .split("\n").filter(name => D1_MIGRATION_NAME.test(name)).sort();
+    assert.ok(names.length > 0, `no d43c8f92 D1 migrations in ${directory}`);
     for (const name of names) {
       migrations.push({ directory, name,
         sql: git("show", `${POSTGRES_FASTPATH_IDENTITY_SOURCE_COMMIT}:apps/worker/${directory}/${name}`) });
     }
   }
-  d1Migrations = Object.freeze(migrations);
-  return d1Migrations;
+  return Object.freeze(migrations);
+}
+
+/** Apply a D1 chain after the ledger vitest-pool-workers' applyD1Migrations creates (some triggers read it). */
+function applyD1Chain(database, migrations) {
+  database.exec(`CREATE TABLE "d1_migrations" (
+\t\tid         INTEGER PRIMARY KEY AUTOINCREMENT,
+\t\tname       TEXT UNIQUE,
+\t\tapplied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+\t)`);
+  const record = database.prepare("INSERT INTO d1_migrations (name) VALUES (?)");
+  for (const migration of migrations) {
+    database.exec(migration.sql);
+    record.run(migration.name);
+  }
+}
+
+function copiedLayoutDigest(database) {
+  const objects = [...POSTGRES_FASTPATH_IDENTITY_ALLOWLIST.map(entry => entry.table),
+    "storage_owner_revisions", "storage_source_state", "community_public_source_owners"].sort();
+  const rows = objects.map(name => {
+    const row = database.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name = ?").get(name);
+    assert.ok(row, `${name} is missing from the D1 chain`);
+    return [row.type, row.name, row.tbl_name, row.sql];
+  });
+  return createHash("sha256").update(JSON.stringify(rows)).digest("hex");
 }
 
 const at = minutes => new Date(Date.UTC(2026, 8, 1, 12, 0, 0) + minutes * 60_000).toISOString();
@@ -290,8 +344,11 @@ function seedSyntheticRows(database) {
     processing_enabled: 1, publication_enabled: 1, control_state: "operational", revision: 3, reason_code: "initial",
     updated_at: at(30),
   });
+  // A finished d43c8f92 walk: completed = 1 still carries the last page's
+  // cursors (community-daily-aggregates.ts never resets them).
   insert("community_public_source_bootstrap", {
-    singleton: 1, policy_version: "community-public-sources-v1", participant_cursor: "", source_day_cursor: "",
+    singleton: 1, policy_version: "community-public-sources-v1",
+    participant_cursor: [a1.participantId, a2.participantId].sort().at(-1), source_day_cursor: "2026-10-01",
     completed: 1,
   });
   insert("telemetry_usage_correction_runtime", {
@@ -306,31 +363,24 @@ function seedSyntheticRows(database) {
 }
 
 /**
- * Build the sealed fixture: apply every d43c8f92 D1 migration, then insert
- * the synthetic rows with the D1 triggers held aside (as Q-1's dump rebuild
- * does) and restore them, so the sealed schema is exactly the migrated one.
+ * Build the sealed fixture: apply every D1 migration of this checkout (whose
+ * copied layout must be d43c8f92's), then insert the synthetic rows with the
+ * D1 triggers held aside (as Q-1's dump rebuild does) and restore them, so
+ * the sealed schema is exactly the migrated one.
  */
 async function sealedFixture({ mutate = null } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "tibotattle-fastpath-identity-"));
   cleanup.push(() => rm(directory, { recursive: true, force: true }));
   const path = join(directory, "usage-monitor-db.sqlite");
+  const migrations = await readCheckoutD1Migrations();
   const database = new DatabaseSync(path);
   let ids;
   let schemaSha256;
   try {
     database.exec("PRAGMA journal_mode=DELETE");
-    // The D1 migration ledger, as vitest-pool-workers' applyD1Migrations
-    // creates it; some d43c8f92 triggers read it.
-    database.exec(`CREATE TABLE "d1_migrations" (
-\t\tid         INTEGER PRIMARY KEY AUTOINCREMENT,
-\t\tname       TEXT UNIQUE,
-\t\tapplied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
-\t)`);
-    const record = database.prepare("INSERT INTO d1_migrations (name) VALUES (?)");
-    for (const migration of readD1Migrations()) {
-      database.exec(migration.sql);
-      record.run(migration.name);
-    }
+    applyD1Chain(database, migrations);
+    assert.equal(copiedLayoutDigest(database), D43C8F92_COPIED_LAYOUT_SHA256,
+      "the checkout's D1 layout of a copied object differs from d43c8f92's");
     schemaSha256 = schemaDigest(database);
     const triggers = database.prepare("SELECT name, sql FROM sqlite_master WHERE type='trigger' ORDER BY rowid").all();
     database.exec("BEGIN");
@@ -338,7 +388,7 @@ async function sealedFixture({ mutate = null } = {}) {
     ids = seedSyntheticRows(database);
     for (const trigger of triggers) database.exec(trigger.sql);
     database.exec("COMMIT");
-    assert.equal(schemaDigest(database), schemaSha256, "seeding must leave the d43c8f92 schema unchanged");
+    assert.equal(schemaDigest(database), schemaSha256, "seeding must leave the migrated schema unchanged");
     if (mutate) mutate(database);
     assert.equal(database.prepare("PRAGMA foreign_key_check").all().length, 0);
     assert.equal(database.prepare("PRAGMA integrity_check").get().integrity_check, "ok");
@@ -350,7 +400,7 @@ async function sealedFixture({ mutate = null } = {}) {
   const resolved = await realpath(path);
   const source = await openSealedFastpathIdentitySource({ path: resolved, expectedSha256 });
   cleanup.push(async () => source.close());
-  return { source, ids, path: resolved, schemaSha256 };
+  return { source, ids, path: resolved, schemaSha256, expectedSha256 };
 }
 
 function sqliteRows(path, sql) {
@@ -491,6 +541,21 @@ test("T-1 copies the identity allowlist from a d43c8f92 fixture with equal count
   assert.deepEqual(controls.rows, [{ revision: 3, control_state: "operational", publication_enabled: true }]);
   const runtime = await database.query(`SELECT state, source_state FROM "${schema}".telemetry_usage_correction_runtime`);
   assert.deepEqual(runtime.rows, [{ state: "staged", source_state: "active" }]);
+
+  // The finished D1 walk keeps its last cursors; PostgreSQL stores the row
+  // complete with both cursors empty (0053), and only that table is ruled.
+  const [sourceBootstrap] = sqliteRows(fixture.path, `SELECT participant_cursor, source_day_cursor, completed
+    FROM community_public_source_bootstrap`);
+  assert.deepEqual([sourceBootstrap.participant_cursor === "", sourceBootstrap.source_day_cursor, sourceBootstrap.completed],
+    [false, "2026-10-01", 1]);
+  const bootstrap = await database.query(`SELECT participant_cursor, source_day_cursor, completed
+    FROM "${schema}".community_public_source_bootstrap`);
+  assert.deepEqual(bootstrap.rows, [{ participant_cursor: "", source_day_cursor: "", completed: 1 }]);
+  assert.deepEqual(receipt.tables.community_public_source_bootstrap.sourceRowRule,
+    { id: "d1-completed-walk-cursors-cleared", rowsRewritten: 1 });
+  for (const [table, entry] of Object.entries(receipt.tables)) {
+    if (table !== "community_public_source_bootstrap") assert.equal(Object.hasOwn(entry, "sourceRowRule"), false, table);
+  }
 
   // community_public_source_owners: PostgreSQL equals the source view.
   const sourceOwners = ownerSet(sqliteRows(fixture.path,
@@ -747,4 +812,156 @@ test("T-1 refuses a source that is not sealed or changes after opening", { skip:
   await assert.rejects(runPostgresFastpathIdentityCopy({ source: fixture.source, pool: await pool(),
     targetSchema: await rehearsalSchema() }), error => error?.code === "FASTPATH_IDENTITY_SOURCE_UNSAFE"
       || error?.code === "FASTPATH_IDENTITY_SOURCE_CHANGED");
+});
+
+test("the checkout's D1 chain has d43c8f92's layout for every object the copy reads", async t => {
+  const checkout = new DatabaseSync(":memory:");
+  try {
+    applyD1Chain(checkout, await readCheckoutD1Migrations());
+    assert.equal(copiedLayoutDigest(checkout), D43C8F92_COPIED_LAYOUT_SHA256);
+  } finally {
+    checkout.close();
+  }
+  // The pin is re-derived from d43c8f92 itself wherever the commit exists
+  // (any local clone of this repository); a shallow CI checkout holds the pin.
+  const sourceCommit = readSourceCommitD1Migrations();
+  if (sourceCommit === null) {
+    t.diagnostic("d43c8f92 is not in this object store; the checkout chain was checked against the reviewed pin");
+    return;
+  }
+  const pinned = new DatabaseSync(":memory:");
+  try {
+    applyD1Chain(pinned, sourceCommit);
+    assert.equal(copiedLayoutDigest(pinned), D43C8F92_COPIED_LAYOUT_SHA256);
+  } finally {
+    pinned.close();
+  }
+});
+
+test("T-1 refuses a started, unfinished D1 bootstrap walk and copies one not yet started", {
+  skip: !PG_TEST_SOCKET,
+}, async () => {
+  const database = await pool();
+
+  // completed = 0 with a cursor: PostgreSQL has no representation for it.
+  const inProgress = await sealedFixture({ mutate: db => db.exec(
+    "UPDATE community_public_source_bootstrap SET completed = 0") });
+  const refused = await rehearsalSchema();
+  await assert.rejects(runPostgresFastpathIdentityCopy({ source: inProgress.source, pool: database, targetSchema: refused }),
+    error => error?.code === "FASTPATH_IDENTITY_SOURCE_BOOTSTRAP_IN_PROGRESS"
+      && error.table === "community_public_source_bootstrap"
+      && !error.message.includes(inProgress.ids.a1.participantId) && !error.message.includes(inProgress.ids.a2.participantId));
+  await assertUntouched(refused);
+
+  // completed = 0 with empty cursors copies as is; PostgreSQL's own advance
+  // completes it later.
+  const notStarted = await sealedFixture({ mutate: db => db.exec(
+    "UPDATE community_public_source_bootstrap SET completed = 0, participant_cursor = '', source_day_cursor = ''") });
+  const schema = await rehearsalSchema();
+  const receipt = await runPostgresFastpathIdentityCopy({ source: notStarted.source, pool: database, targetSchema: schema });
+  assert.deepEqual(receipt.tables.community_public_source_bootstrap.sourceRowRule,
+    { id: "d1-completed-walk-cursors-cleared", rowsRewritten: 0 });
+  const bootstrap = await database.query(`SELECT participant_cursor, source_day_cursor, completed
+    FROM "${schema}".community_public_source_bootstrap`);
+  assert.deepEqual(bootstrap.rows, [{ participant_cursor: "", source_day_cursor: "", completed: 0 }]);
+});
+
+const COPIER = join(WORKER_ROOT, "scripts/postgres-fastpath-identity-copy.mjs");
+
+async function runCopierCli(args, cwd) {
+  const { host, port } = await localSocket();
+  return new Promise((resolve, reject) => {
+    // Node 22 prints an ExperimentalWarning for node:sqlite on stderr.
+    const child = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", COPIER, ...args], {
+      cwd,
+      env: { PATH: process.env.PATH, PGHOST: host, PGPORT: String(port), PGUSER: PG_TEST_USER,
+        PGPASSWORD: PG_TEST_PASSWORD, PGDATABASE: PG_TEST_DATABASE },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", chunk => { stdout += chunk; });
+    child.stderr.setEncoding("utf8").on("data", chunk => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("close", code => resolve({ code, stdout, stderr }));
+  });
+}
+
+async function exists(path) {
+  return lstat(path).then(() => true, error => {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  });
+}
+
+test("T-1's CLI checks its receipt and roster before the copy and keeps a committed copy's receipt", {
+  skip: !PG_TEST_SOCKET,
+}, async () => {
+  // The source lacks storage_owner_revisions, so --verify-owner-revisions
+  // fails only after the copy has committed.
+  const fixture = await sealedFixture({ mutate: db => db.exec(
+    "ALTER TABLE storage_owner_revisions RENAME TO synthetic_owner_revisions") });
+  const scratch = await realpath(await mkdtemp(join(tmpdir(), "tibotattle-fastpath-identity-cli-")));
+  cleanup.push(() => rm(scratch, { recursive: true, force: true }));
+  const { s1, s2, a1, a2 } = fixture.ids;
+  const roster = join(scratch, "roster.json");
+  await writeFile(roster, JSON.stringify({ owners: [s1, s2, a1, a2].map(owner => ({ participantId: owner.participantId })) }));
+  const emptyRoster = join(scratch, "empty-roster.json");
+  await writeFile(emptyRoster, "[]");
+  const schema = await rehearsalSchema();
+  const base = ["--sqlite", fixture.path, "--sha256", fixture.expectedSha256, "--schema", schema];
+
+  // A relative receipt path is refused before anything is written.
+  const relative = await runCopierCli([...base, "--receipt", "relative-receipt.json"], scratch);
+  assert.deepEqual([relative.code, relative.stdout, relative.stderr], [2, "", "FASTPATH_IDENTITY_CLI_ARGUMENT_INVALID\n"]);
+  assert.equal(await exists(join(scratch, "relative-receipt.json")), false);
+  await assertUntouched(schema);
+
+  // An existing receipt file is refused, and left unchanged.
+  const prior = join(scratch, "prior-receipt.json");
+  await writeFile(prior, "prior\n");
+  const taken = await runCopierCli([...base, "--receipt", prior], scratch);
+  assert.deepEqual([taken.code, taken.stdout, taken.stderr], [2, "", "FASTPATH_IDENTITY_RECEIPT_UNAVAILABLE\n"]);
+  assert.equal(await readFile(prior, "utf8"), "prior\n");
+  await assertUntouched(schema);
+
+  // An invalid roster is refused before the copy.
+  const badRoster = await runCopierCli([...base, "--expect-owner-roster", emptyRoster], scratch);
+  assert.deepEqual([badRoster.code, badRoster.stdout, badRoster.stderr], [2, "", "FASTPATH_IDENTITY_ROSTER_INVALID\n"]);
+  await assertUntouched(schema);
+
+  // A refused copy releases the receipt file it reserved.
+  const refusedReceipt = join(scratch, "refused-receipt.json");
+  const refused = await runCopierCli(["--sqlite", fixture.path, "--sha256", fixture.expectedSha256,
+    "--schema", "public", "--receipt", refusedReceipt], scratch);
+  assert.deepEqual([refused.code, refused.stdout, refused.stderr], [2, "", "FASTPATH_IDENTITY_TARGET_SCHEMA_REFUSED\n"]);
+  assert.equal(await exists(refusedReceipt), false);
+
+  // A failure after COMMIT still emits the receipt (stdout and file), naming
+  // the failure, so a caller can tell a populated target from a refused copy.
+  const receiptPath = join(scratch, "receipt.json");
+  const committed = await runCopierCli([...base, "--receipt", receiptPath, "--expect-owner-roster", roster,
+    "--verify-owner-revisions"], scratch);
+  assert.equal(committed.code, 2);
+  assert.equal(committed.stderr, "FASTPATH_IDENTITY_SOURCE_TABLE_MISSING [table=storage_owner_revisions]\n");
+  const emitted = JSON.parse(committed.stdout);
+  assert.equal(emitted.copy.status, "rehearsal_identity_copy_complete");
+  assert.equal(emitted.ownerRoster.equal, true);
+  assert.equal(emitted.failedAfterCopy, "FASTPATH_IDENTITY_SOURCE_TABLE_MISSING");
+  assert.equal(Object.hasOwn(emitted, "ownerRevisions"), false);
+  assert.equal(await readFile(receiptPath, "utf8"), committed.stdout);
+  assert.equal((await stat(receiptPath)).mode & 0o777, 0o600);
+  assert.equal((await tableCounts(schema, ["participants"])).participants, 7);
+  for (const owner of Object.values(fixture.ids)) {
+    assert.equal(committed.stdout.includes(owner.participantId), false, "the receipt must stay content-free");
+  }
+
+  // The verifications re-run read-only against the populated target.
+  const verifiedPath = join(scratch, "verified-receipt.json");
+  const verified = await runCopierCli([...base, "--verify-only", "--receipt", verifiedPath,
+    "--expect-owner-roster", roster], scratch);
+  assert.deepEqual([verified.code, verified.stderr], [0, ""]);
+  const verifiedReceipt = JSON.parse(verified.stdout);
+  assert.deepEqual([verifiedReceipt.publicSourceOwners.equal, verifiedReceipt.ownerRoster.equal], [true, true]);
+  assert.equal(await readFile(verifiedPath, "utf8"), verified.stdout);
 });

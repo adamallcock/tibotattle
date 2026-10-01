@@ -47,6 +47,16 @@
 // eligibility (community_public_source_owners) and owner routing (hasV11)
 // read it; days, manifests and chunks belong to a v1.1 transport importer.
 //
+// No importer in tonight's rehearsal chain (this copy, typed-legacy, T-2,
+// usage-correction, ingestion-journal) writes the v1/v1.1 transport and
+// admission tables (telemetry_v1_chunks, telemetry_v11_chunks, _domain_days,
+// _day_manifests, typed_v1_/typed_v11_ admission state, proofs, allocations,
+// memberships, typed_v1_event_sources, storage_v11_event_sources). So an owner
+// this copy routes as v1.1 (head present) has no v1/v1.1 occurrences in
+// PostgreSQL until such an importer exists. That importer must own the whole
+// v1.1 chain: run this copy with --omit-family v11-domain-heads and
+// --defer-public-owner-parity before it, then --verify-only after it.
+//
 // Not copied here, by design:
 //   * storage_owner_revisions and storage_source_state: PostgreSQL 0046
 //     derives owner heads from exact journal rows and refuses an unproven
@@ -60,7 +70,7 @@
 
 import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { lstat, open, readFile, realpath, writeFile } from "node:fs/promises";
+import { lstat, open, readFile, realpath, unlink } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
@@ -121,12 +131,15 @@ function t(name, family, key, columns, options = {}) {
   const selection = options.selection ?? Object.freeze({ id: "all", where: null });
   const omitted = Object.freeze({ ...(options.omitted ?? {}) });
   const verifiedConstants = Object.freeze({ ...(options.verifiedConstants ?? {}) });
+  const sourceRowRule = options.sourceRowRule ?? null;
   const targets = columns.map(column => column.target);
   const sources = columns.map(column => column.source);
   if (!IDENTIFIER.test(name) || new Set(targets).size !== targets.length || new Set(sources).size !== sources.length
       || key.some(column => !targets.includes(column))
       || Object.keys(omitted).some(column => sources.includes(column))
-      || Object.keys(verifiedConstants).some(column => !Object.hasOwn(omitted, column))) {
+      || Object.keys(verifiedConstants).some(column => !Object.hasOwn(omitted, column))
+      || (sourceRowRule !== null && (typeof sourceRowRule.id !== "string" || typeof sourceRowRule.apply !== "function"
+        || sourceRowRule.columns.some(column => !sources.includes(column))))) {
     throw new TypeError("fastpath identity table definition invalid");
   }
   return Object.freeze({
@@ -137,9 +150,34 @@ function t(name, family, key, columns, options = {}) {
     selection,
     omitted,
     verifiedConstants,
+    sourceRowRule,
     seeded: options.seeded === true,
   });
 }
+
+// D1's JSON-mode bootstrap walk completes without resetting its cursors
+// (d43c8f92 community-daily-aggregates.ts sets completed = 1 under a fence
+// that matches the last page's cursors), so a finished D1 row keeps the last
+// participant id and source day. PostgreSQL ports no walk and stores only
+// empty cursors (primary 0053 community_public_source_bootstrap_cursors_empty),
+// and 0053 directs an importer to write '' for both cursors of a completed D1
+// row. A row whose walk has started but not finished (completed = 0 with a
+// cursor) has no PostgreSQL representation and is refused before any write;
+// completed = 0 with empty cursors (a walk not yet started) copies as is and
+// PostgreSQL's community_public_source_bootstrap_advance() completes it.
+const COMPLETED_WALK_CURSORS_CLEARED = Object.freeze({
+  id: "d1-completed-walk-cursors-cleared",
+  columns: Object.freeze(["completed", "participant_cursor", "source_day_cursor"]),
+  apply(row, table) {
+    const completed = typeof row.completed === "bigint" ? row.completed : null;
+    const cursorsEmpty = row.participant_cursor === "" && row.source_day_cursor === "";
+    if (completed === 1n) {
+      return cursorsEmpty ? [row, false] : [{ ...row, participant_cursor: "", source_day_cursor: "" }, true];
+    }
+    if (completed === 0n && !cursorsEmpty) fail("FASTPATH_IDENTITY_SOURCE_BOOTSTRAP_IN_PROGRESS", { table });
+    return [row, false];
+  },
+});
 
 function referenced(id, where) {
   return Object.freeze({ id, where });
@@ -222,8 +260,9 @@ const TABLES = Object.freeze([
   // Eligibility evidence for accountless v1.1 owners: community_public_source_owners
   // requires an accepted v1.1 head whose domain names the device. Only the
   // head chain is copied (heads, their domains, those domains' predecessor
-  // tokens); domain days, manifests and chunks stay with the v1.1 transport
-  // importer (IN-2), which does not exist yet.
+  // tokens); domain days, manifests and chunks stay with a v1.1 transport
+  // importer, which does not exist yet (IN-2 is live PostgreSQL intake, not
+  // a D1 import). See the header for the run order once it does.
   t("telemetry_v11_domain_predecessors", "v11-domain-heads", ["token_hash"], [
     c("token_hash", "text"), c("participant_id", "text"), c("device_id", "text"),
     c("previous_generation_id", "text"), c("legacy_fingerprint", "text"), c("input_revision", "int"),
@@ -254,12 +293,13 @@ const TABLES = Object.freeze([
     omitted: { schema_version: "d1-schema-marker-verified-constant" },
     verifiedConstants: { schema_version: "collection-controls-v0.1" },
   }),
-  // PostgreSQL ports no bootstrap walk: 0053's cursors-empty CHECK refuses a
-  // source whose D1 walk is still in progress (copied, not dropped).
+  // PostgreSQL ports no bootstrap walk: a completed D1 row is written with
+  // empty cursors and a started, unfinished walk is refused (see
+  // COMPLETED_WALK_CURSORS_CLEARED).
   t("community_public_source_bootstrap", "controls", ["singleton"], [
     c("singleton", "int"), c("policy_version", "text"), c("participant_cursor", "text"),
     c("source_day_cursor", "text"), c("completed", "int"),
-  ], { seeded: true }),
+  ], { seeded: true, sourceRowRule: COMPLETED_WALK_CURSORS_CLEARED }),
   // Staged exactly as postgres-usage-correction-transfer.mjs stages it:
   // PostgreSQL keeps state 'staged' (its default) and records D1's state.
   t("telemetry_usage_correction_runtime", "usage-correction-runtime", ["id"], [
@@ -304,6 +344,7 @@ export const POSTGRES_FASTPATH_IDENTITY_ALLOWLIST = Object.freeze(TABLES.map(spe
   seeded: spec.seeded,
   columns: Object.freeze(spec.columns.map(column => Object.freeze([column.source, column.target, column.type]))),
   omittedSourceColumns: Object.freeze(Object.keys(spec.omitted).sort()),
+  sourceRowRule: spec.sourceRowRule?.id ?? null,
 })));
 
 /** sha256 of the canonical allowlist; a reviewed change must update its pin. */
@@ -627,7 +668,14 @@ function readSourceTable(database, spec) {
   if (BigInt(raw.length) !== BigInt(selected)) fail("FASTPATH_IDENTITY_SOURCE_READ_FAILED", { table: spec.name });
   const canonical = [];
   const parameters = [];
-  for (const row of raw) {
+  let rowsRewritten = 0;
+  for (const sourceRow of raw) {
+    let row = sourceRow;
+    if (spec.sourceRowRule !== null) {
+      const [ruled, rewritten] = spec.sourceRowRule.apply(sourceRow, spec.name);
+      row = ruled;
+      if (rewritten) rowsRewritten += 1;
+    }
     const values = [];
     const params = [];
     for (const column of spec.columns) {
@@ -642,6 +690,8 @@ function readSourceTable(database, spec) {
     totalRows: Number(total),
     rows: canonical,
     parameters,
+    rowsRewritten,
+    // The digest of the rows as written: after the table's source row rule.
     sha256: sortedDigest(spec, canonical),
   });
 }
@@ -922,6 +972,9 @@ export async function runPostgresFastpathIdentityCopy({
         sourceRows: sourceTable.rows.length,
         targetRows: targetTable.rows,
         sha256: targetTable.sha256,
+        ...(spec.sourceRowRule === null ? {} : {
+          sourceRowRule: Object.freeze({ id: spec.sourceRowRule.id, rowsRewritten: sourceTable.rowsRewritten }),
+        }),
       });
     }
     const publicOwners = compareOwnerSets(sourcePublicOwners, await readTargetPublicOwners(client, schema));
@@ -1017,7 +1070,7 @@ export async function compareFastpathPublicSourceOwners({ source, pool, targetSc
  */
 export async function compareFastpathOwnerRoster({ pool, targetSchema, roster } = {}) {
   const schema = validateTargetSchema(targetSchema);
-  if (!Array.isArray(roster) || roster.length === 0 || roster.length > 10_000) fail("FASTPATH_IDENTITY_ROSTER_INVALID");
+  const entries = normalizeOwnerRoster(roster);
   return readOnly(pool, async client => {
     const eligible = await q(client, `SELECT DISTINCT eligible.participant_id, link.owner_digest, link.state AS link_state
         FROM ${relation(schema, "community_public_source_owners")} eligible
@@ -1029,11 +1082,7 @@ export async function compareFastpathOwnerRoster({ pool, targetSchema, roster } 
     const matched = new Set();
     let unresolved = 0;
     let conflicting = 0;
-    for (const entry of roster) {
-      if (!entry || typeof entry !== "object") fail("FASTPATH_IDENTITY_ROSTER_INVALID");
-      const participantId = typeof entry.participantId === "string" ? entry.participantId : null;
-      const ownerDigest = typeof entry.ownerDigest === "string" && SHA256.test(entry.ownerDigest) ? entry.ownerDigest : null;
-      if (participantId === null && ownerDigest === null) fail("FASTPATH_IDENTITY_ROSTER_INVALID");
+    for (const { participantId, ownerDigest } of entries) {
       const viaParticipant = participantId !== null && byParticipant.has(participantId) ? participantId : null;
       const viaDigest = ownerDigest !== null ? byDigest.get(ownerDigest) ?? null : null;
       const resolved = viaParticipant ?? viaDigest;
@@ -1046,15 +1095,27 @@ export async function compareFastpathOwnerRoster({ pool, targetSchema, roster } 
     }
     const extraInTarget = [...byParticipant.keys()].filter(id => !matched.has(id)).length;
     return Object.freeze({
-      rosterOwners: roster.length,
+      rosterOwners: entries.length,
       eligibleParticipants: byParticipant.size,
       matchedParticipants: matched.size,
       unresolved,
       conflicting,
       extraInTarget,
-      equal: unresolved === 0 && conflicting === 0 && extraInTarget === 0 && matched.size === roster.length,
+      equal: unresolved === 0 && conflicting === 0 && extraInTarget === 0 && matched.size === entries.length,
     });
   });
+}
+
+/** Validate a roster up front: 1 to 10000 entries, each with a participant id or a sha256 owner digest. */
+function normalizeOwnerRoster(roster) {
+  if (!Array.isArray(roster) || roster.length === 0 || roster.length > 10_000) fail("FASTPATH_IDENTITY_ROSTER_INVALID");
+  return Object.freeze(roster.map(entry => {
+    if (!entry || typeof entry !== "object") fail("FASTPATH_IDENTITY_ROSTER_INVALID");
+    const participantId = typeof entry.participantId === "string" ? entry.participantId : null;
+    const ownerDigest = typeof entry.ownerDigest === "string" && SHA256.test(entry.ownerDigest) ? entry.ownerDigest : null;
+    if (participantId === null && ownerDigest === null) fail("FASTPATH_IDENTITY_ROSTER_INVALID");
+    return Object.freeze({ participantId, ownerDigest });
+  }));
 }
 
 /**
@@ -1104,6 +1165,16 @@ export async function compareFastpathOwnerRevisions({ source, pool, targetSchema
 //   [--verify-only] [--verify-owner-revisions]
 // Connection: libpq environment (PGHOST, PGPORT, PGUSER, PGDATABASE). Only a
 // Unix socket or a loopback host is accepted.
+//
+// Every argument is checked, the roster is read and the --receipt file is
+// created exclusively (mode 0600) before the copy starts, so a bad argument
+// can never fail after COMMIT. The receipt is written to stdout first, then to
+// the --receipt file. Exit codes: 0 when everything completed and every
+// requested comparison is equal; 1 when a comparison differs; 2 when the run
+// was refused or failed. If a step after a committed copy fails, the receipt
+// is still emitted, with copy.status complete and failedAfterCopy naming the
+// closed error code: the target is populated, and the verifications can be
+// re-run with --verify-only.
 
 function parseArguments(argv) {
   const options = { omitFamilies: [], deferParity: false, verifyOnly: false, verifyOwnerRevisions: false };
@@ -1126,8 +1197,35 @@ function parseArguments(argv) {
     else if (flag === "--verify-owner-revisions") options.verifyOwnerRevisions = true;
     else fail("FASTPATH_IDENTITY_CLI_ARGUMENT_INVALID");
   }
-  if (!options.sqlite || !options.sha256 || !options.schema) fail("FASTPATH_IDENTITY_CLI_ARGUMENT_INVALID");
+  if (!options.sqlite || !options.sha256 || !options.schema
+      || (options.receipt !== undefined && !isAbsolute(options.receipt))) {
+    fail("FASTPATH_IDENTITY_CLI_ARGUMENT_INVALID");
+  }
   return options;
+}
+
+/** Create the receipt file exclusively before any write to the target. */
+async function reserveReceipt(path) {
+  try {
+    return await open(path, "wx", 0o600);
+  } catch {
+    return fail("FASTPATH_IDENTITY_RECEIPT_UNAVAILABLE");
+  }
+}
+
+/** Remove a reserved receipt only while it is still the empty file this run created. */
+async function releaseUnwrittenReceipt(handle, path) {
+  try {
+    const opened = await handle.stat();
+    await handle.close();
+    const current = await lstat(path);
+    if (opened.size === 0 && current.isFile() && current.size === 0
+        && current.dev === opened.dev && current.ino === opened.ino) {
+      await unlink(path);
+    }
+  } catch {
+    // Leave it in place; the run's own error code already explains the failure.
+  }
 }
 
 function assertLocalConnection() {
@@ -1146,47 +1244,69 @@ async function readRoster(path) {
   }
   const owners = Array.isArray(parsed) ? parsed : parsed?.owners;
   if (!Array.isArray(owners)) fail("FASTPATH_IDENTITY_ROSTER_INVALID");
-  return owners.map(owner => typeof owner === "string" ? { participantId: owner }
-    : { participantId: owner?.participantId, ownerDigest: owner?.ownerDigest ?? owner?.pinnedOwnerDigest });
+  return normalizeOwnerRoster(owners.map(owner => typeof owner === "string" ? { participantId: owner }
+    : { participantId: owner?.participantId, ownerDigest: owner?.ownerDigest ?? owner?.pinnedOwnerDigest }));
 }
 
 async function main(argv) {
   const options = parseArguments(argv);
   assertLocalConnection();
+  const roster = options.roster === undefined ? undefined : await readRoster(options.roster);
   const { default: pg } = await import("pg");
-  const pool = new pg.Pool({ max: 2, connectionTimeoutMillis: 10_000 });
   const source = await openSealedFastpathIdentitySource({ path: options.sqlite, expectedSha256: options.sha256 });
+  let pool;
+  let receiptFile;
+  let receiptWritten = false;
   try {
+    if (options.receipt !== undefined) receiptFile = await reserveReceipt(options.receipt);
+    pool = new pg.Pool({ max: 2, connectionTimeoutMillis: 10_000 });
     const receipt = {};
-    if (!options.verifyOnly) {
-      receipt.copy = await runPostgresFastpathIdentityCopy({
-        source, pool, targetSchema: options.schema, omitFamilies: options.omitFamilies,
-        publicSourceOwnerParity: options.deferParity ? "defer" : "require",
-      });
-    } else {
-      receipt.publicSourceOwners = await compareFastpathPublicSourceOwners({ source, pool, targetSchema: options.schema });
-    }
-    if (options.roster) {
-      receipt.ownerRoster = await compareFastpathOwnerRoster({
-        pool, targetSchema: options.schema, roster: await readRoster(options.roster),
-      });
-    }
-    if (options.verifyOwnerRevisions) {
-      receipt.ownerRevisions = await compareFastpathOwnerRevisions({ source, pool, targetSchema: options.schema });
+    let failure;
+    try {
+      if (!options.verifyOnly) {
+        receipt.copy = await runPostgresFastpathIdentityCopy({
+          source, pool, targetSchema: options.schema, omitFamilies: options.omitFamilies,
+          publicSourceOwnerParity: options.deferParity ? "defer" : "require",
+        });
+      } else {
+        receipt.publicSourceOwners = await compareFastpathPublicSourceOwners({ source, pool, targetSchema: options.schema });
+      }
+      if (roster !== undefined) {
+        receipt.ownerRoster = await compareFastpathOwnerRoster({ pool, targetSchema: options.schema, roster });
+      }
+      if (options.verifyOwnerRevisions) {
+        receipt.ownerRevisions = await compareFastpathOwnerRevisions({ source, pool, targetSchema: options.schema });
+      }
+    } catch (error) {
+      // Before the copy committed nothing was written: refuse as is. After
+      // it, the populated target must stay visible in the receipt.
+      if (receipt.copy === undefined) throw error;
+      failure = error;
+      receipt.failedAfterCopy = error instanceof PostgresFastpathIdentityCopyError ? error.code : "FASTPATH_IDENTITY_FAILED";
     }
     const text = `${JSON.stringify(receipt, null, 2)}\n`;
-    if (options.receipt) {
-      if (!isAbsolute(options.receipt)) fail("FASTPATH_IDENTITY_CLI_ARGUMENT_INVALID");
-      await writeFile(options.receipt, text, { flag: "wx", mode: 0o600 });
-    }
     process.stdout.write(text);
+    if (receiptFile !== undefined) {
+      receiptWritten = true;
+      try {
+        await receiptFile.writeFile(text);
+        await receiptFile.close();
+      } catch {
+        await receiptFile.close().catch(() => {});
+        fail("FASTPATH_IDENTITY_RECEIPT_WRITE_FAILED");
+      }
+    }
+    if (failure !== undefined) throw failure;
     const failed = (receipt.publicSourceOwners && !receipt.publicSourceOwners.equal)
       || (receipt.ownerRoster && !receipt.ownerRoster.equal)
       || (receipt.ownerRevisions && !receipt.ownerRevisions.equal);
     return failed ? 1 : 0;
+  } catch (error) {
+    if (receiptFile !== undefined && !receiptWritten) await releaseUnwrittenReceipt(receiptFile, options.receipt);
+    throw error;
   } finally {
     source.close();
-    await pool.end();
+    await pool?.end();
   }
 }
 
