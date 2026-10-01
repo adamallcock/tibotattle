@@ -1,5 +1,7 @@
 -- PostgreSQL primary migration (staged, PROVISIONAL number 0099; the lead
 -- assigns the real number at landing): legacy contribution admission (IN-3).
+-- Two parts: the v0.1 weekly admission window (below) and, at the end, the
+-- typed-row retention allowance a v1.0 correction needs.
 --
 -- The telemetry-envelope-v0.1 contribution path (handleTelemetryContribution
 -- at d43c8f92) bounds admission by a fixed Monday-anchored UTC week of 100
@@ -93,3 +95,102 @@ $$;
 CREATE TRIGGER telemetry_contributions_record_admission_window
   AFTER INSERT ON telemetry_contributions
   FOR EACH ROW EXECUTE FUNCTION telemetry_contributions_record_admission_window();
+
+-- telemetry-envelope-v1.0 corrections. The Worker's typed v1 admission
+-- (typed-v1-admission.ts at d43c8f92) supersedes the current chunk of a
+-- slot and deletes that chunk's typed rows in the same batch (the old
+-- header, allocation and event receipt stay). 0030's retention guard
+-- refuses every typed-row delete short of a proven owner erasure, so this
+-- replacement adds exactly one allowance and keeps the 0030 body otherwise
+-- verbatim: a format-10 typed chunk, or a format-10 typed record inside a
+-- chunk allocation, whose source telemetry_v1_chunks row in the pinned
+-- typed v1 namespace is already superseded. The chunk delete cascades to
+-- records, children and record admissions; a child row reached through
+-- that cascade finds its record gone and is admitted by the 0030 branch.
+-- Every other delete (a current chunk, format 11, owners, devices, shared
+-- dimensions) still needs the terminal erasure proof.
+CREATE OR REPLACE FUNCTION typed_telemetry_source_owner_retention_guard()
+RETURNS trigger
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+DECLARE
+  namespace_value bigint;
+  owner_value bigint;
+  format_value smallint;
+BEGIN
+  IF TG_TABLE_NAME = 'typed_telemetry_owner_memberships' THEN
+    namespace_value := OLD.namespace_id;
+    owner_value := OLD.owner_id;
+    format_value := OLD.source_format;
+  ELSIF TG_TABLE_NAME = 'typed_telemetry_owners' THEN
+    namespace_value := OLD.namespace_id;
+    owner_value := OLD.id;
+  ELSIF TG_TABLE_NAME IN ('typed_telemetry_devices', 'typed_telemetry_manifests',
+      'typed_telemetry_chunks', 'typed_telemetry_records', 'typed_telemetry_identifiers',
+      'typed_telemetry_attributions', 'typed_telemetry_quota_dimensions') THEN
+    namespace_value := OLD.namespace_id;
+    owner_value := OLD.owner_id;
+    IF TG_TABLE_NAME = 'typed_telemetry_chunks' OR TG_TABLE_NAME = 'typed_telemetry_records' THEN
+      format_value := OLD.format;
+    END IF;
+  ELSE
+    SELECT record.namespace_id, record.owner_id, record.format
+      INTO namespace_value, owner_value, format_value
+      FROM typed_telemetry_records record WHERE record.id = OLD.record_id;
+  END IF;
+
+  IF namespace_value IS NULL OR owner_value IS NULL THEN
+    RETURN OLD;
+  END IF;
+
+  -- The v1.0 correction allowance. Separate statements: OLD.original_id
+  -- and OLD.source_row_id exist only on their own tables.
+  IF format_value = 10 AND TG_TABLE_NAME = 'typed_telemetry_chunks' THEN
+    IF EXISTS (
+      SELECT 1
+        FROM typed_v1_admission_state state
+        JOIN typed_v1_chunk_allocations allocation ON allocation.namespace_id = state.namespace_id
+        JOIN telemetry_v1_chunks source_chunk ON source_chunk.id = allocation.chunk_id
+       WHERE state.id = 1 AND state.runtime_contract_version = 1
+         AND state.namespace_id = namespace_value
+         AND allocation.chunk_original = OLD.original_id
+         AND source_chunk.superseded_at IS NOT NULL
+    ) THEN
+      RETURN OLD;
+    END IF;
+  ELSIF format_value = 10 AND TG_TABLE_NAME = 'typed_telemetry_records' THEN
+    IF EXISTS (
+      SELECT 1
+        FROM typed_v1_admission_state state
+        JOIN typed_v1_chunk_allocations allocation ON allocation.namespace_id = state.namespace_id
+        JOIN telemetry_v1_chunks source_chunk ON source_chunk.id = allocation.chunk_id
+       WHERE state.id = 1 AND state.runtime_contract_version = 1
+         AND state.namespace_id = namespace_value
+         AND OLD.source_row_id >= allocation.first_source_row_id
+         AND OLD.source_row_id < allocation.first_source_row_id + allocation.record_count
+         AND source_chunk.superseded_at IS NOT NULL
+    ) THEN
+      RETURN OLD;
+    END IF;
+  END IF;
+
+  -- Shared source rows can be referenced by v1 and v1.1 memberships at once.
+  -- Require terminal proof for every applicable membership; one linked format
+  -- must not authorize deletion of a linkless or still-live sibling format.
+  IF EXISTS (
+    SELECT 1
+      FROM typed_telemetry_owner_memberships membership
+      LEFT JOIN storage_v11_owner_links owner_link
+        ON owner_link.participant_id = membership.participant_id
+      LEFT JOIN storage_owner_erasure_receipts receipt
+        ON receipt.owner_digest = owner_link.owner_digest
+     WHERE membership.namespace_id = namespace_value
+       AND membership.owner_id = owner_value
+       AND (format_value IS NULL OR membership.source_format = format_value)
+       AND (owner_link.owner_digest IS NULL OR owner_link.state <> 'erased'
+         OR receipt.owner_digest IS NULL)
+  ) THEN
+    RAISE EXCEPTION 'typed_telemetry_source_retained' USING ERRCODE = 'P1005';
+  END IF;
+  RETURN OLD;
+END;
+$$;

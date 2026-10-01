@@ -22,13 +22,14 @@
  *
  * Deliberate v1.0 differences, each a refusal rather than an invented
  * behaviour:
- *   - A correction (chunkRevision > 1 over a current chunk) is refused with
- *     503 BACKEND_STORAGE_UNAVAILABLE. Production deletes the superseded
- *     typed chunk and, for usage, records usage-correction facts; on
- *     PostgreSQL typed_telemetry_chunk_delete_guard (0030) refuses that
- *     delete, the correction-fact writer is not ported, and primary 0034
- *     pins the PostgreSQL usage-correction runtime to staged. Exact replays of
- *     current and already-superseded chunks are answered.
+ *   - A correction (chunkRevision = current + 1) supersedes the current
+ *     chunk and deletes its typed rows exactly as D1 does, through the
+ *     staged legacy_contribution_admission migration's retention
+ *     allowance. A usage correction while the imported usage-correction
+ *     runtime was active (0034 source_state) is refused with 503
+ *     BACKEND_STORAGE_UNAVAILABLE: D1 then also records usage-correction
+ *     facts, whose writer is not ported (0034 keeps the PostgreSQL runtime
+ *     staged).
  *   - D1's database-size admission probe (typed-storage-capacity.ts) has no
  *     PostgreSQL meaning and is not run.
  *   - D1's JSON-era analytics side effects that 0057 retired on PostgreSQL
@@ -328,6 +329,21 @@ async function readAdmissionState(
     namespaceId: String(safeInteger(row.namespace_id, 1)),
     nextSourceRowId: safeInteger(row.next_source_row_id, 1),
   });
+}
+
+/**
+ * True when the imported D1 usage-correction runtime was active
+ * (telemetry_usage_correction_runtime.source_state, primary 0034). D1 then
+ * captures usage-correction facts on a usage correction; with the table
+ * absent or staged it captures none, which is the only case ported.
+ */
+async function usageCorrectionRuntimeActive(client: PostgresClient, schema: string): Promise<boolean> {
+  const result = await client.query<{ source_state: string }>(
+    `SELECT source_state FROM ${table(schema, "telemetry_usage_correction_runtime")} WHERE id = 1`,
+  );
+  const state = result.rows[0]?.source_state;
+  if (state !== undefined && state !== "staged" && state !== "active") throw unavailable();
+  return state === "active";
 }
 
 /** Port of telemetryV1DeviceConsentCurrent. */
@@ -699,7 +715,7 @@ interface PersistInput {
  */
 async function persistTypedChunk(
   client: PostgresClient, schema: string, input: PersistInput,
-): Promise<{ acceptedRecords: number; replay: boolean }> {
+): Promise<{ acceptedRecords: number; replay: boolean; supersededRevision: number | null }> {
   const { principal, chunk } = input;
   const nowIso = new Date(input.nowEpoch).toISOString();
   // D1 typed_v1_header_authority: any failure is 'upload unavailable'.
@@ -744,27 +760,30 @@ async function persistTypedChunk(
       throw unavailable();
     }
     await validateReceipt(client, schema, prior, principal.deviceId, input.sourceNamespace);
-    return { acceptedRecords: chunk.records.length, replay: true };
+    return { acceptedRecords: chunk.records.length, replay: true, supersededRevision: null };
   }
 
   const current = await currentChunk(client, schema, principal, chunk, true);
   if (current) {
     if (current.chunk_digest === chunk.chunkDigest) {
       await validateReceipt(client, schema, current, principal.deviceId, input.sourceNamespace);
-      return { acceptedRecords: chunk.records.length, replay: true };
+      return { acceptedRecords: chunk.records.length, replay: true, supersededRevision: null };
     }
     if (chunk.chunkRevision !== current.revision + 1) throw new ApiError(409, "CHUNK_REVISION_CONFLICT");
-    // Corrections are not ported (see the module comment).
-    throw unavailable();
+    // A usage correction under an active correction runtime also records
+    // usage-correction facts on D1 (prepareTelemetryUsageCorrectionForV1Replacement);
+    // that writer is not ported and 0034 keeps the PostgreSQL runtime staged.
+    if (chunk.stream === "usage" && await usageCorrectionRuntimeActive(client, schema)) throw unavailable();
+  } else {
+    if (chunk.chunkRevision !== 1) throw new ApiError(409, "CHUNK_REVISION_CONFLICT");
+    const slotUsed = await client.query<{ found: boolean }>(
+      `SELECT EXISTS (SELECT 1 FROM ${table(schema, "telemetry_v1_chunks")}
+        WHERE participant_id = $1 AND device_id = $2 AND stream = $3 AND chunk_day = $4::date
+          AND chunk_seq = $5) AS found`,
+      [principal.participantId, principal.deviceId, chunk.stream, chunk.chunkDay, chunk.chunkSeq],
+    );
+    if (slotUsed.rows[0]?.found !== false) throw new ApiError(409, "CHUNK_REVISION_CONFLICT");
   }
-  if (chunk.chunkRevision !== 1) throw new ApiError(409, "CHUNK_REVISION_CONFLICT");
-  const slotUsed = await client.query<{ found: boolean }>(
-    `SELECT EXISTS (SELECT 1 FROM ${table(schema, "telemetry_v1_chunks")}
-      WHERE participant_id = $1 AND device_id = $2 AND stream = $3 AND chunk_day = $4::date
-        AND chunk_seq = $5) AS found`,
-    [principal.participantId, principal.deviceId, chunk.stream, chunk.chunkDay, chunk.chunkSeq],
-  );
-  if (slotUsed.rows[0]?.found !== false) throw new ApiError(409, "CHUNK_REVISION_CONFLICT");
 
   // D1 baseline chunk-admission trigger pair, on the request day.
   const windowDay = input.createdAt.slice(0, 10);
@@ -792,7 +811,7 @@ async function persistTypedChunk(
     uploadAuthorizationId: input.authorizationId,
     envelopeDigest: input.envelopeDigest,
     createdAt: input.createdAt,
-    supersedes: null,
+    supersedes: current ? { id: current.id } : null,
     chunk: {
       stream: chunk.stream, chunkDay: chunk.chunkDay, chunkSeq: chunk.chunkSeq,
       chunkRevision: chunk.chunkRevision, chunkDigest: chunk.chunkDigest,
@@ -800,6 +819,25 @@ async function persistTypedChunk(
     },
   })]);
 
+  if (current) {
+    // D1 order: the prior revision leaves the current view, then its typed
+    // rows go (the staged migration's retention allowance), then the new
+    // revision enters. Header, allocation and event receipt of the prior
+    // revision are retained.
+    const superseded = await client.query(
+      `UPDATE ${table(schema, "telemetry_v1_chunks")} SET superseded_at = $3::timestamptz
+        WHERE id = $1 AND participant_id = $2 AND superseded_at IS NULL`,
+      [current.id, principal.participantId, input.createdAt],
+    );
+    if (superseded.rowCount !== 1) throw new ApiError(409, "CHUNK_REVISION_CONFLICT");
+    await client.query(
+      `DELETE FROM ${table(schema, "typed_telemetry_chunks")}
+        WHERE namespace_id = $1 AND format = ${POSTGRES_TYPED_V1_FORMAT}
+          AND original_id = (SELECT chunk_original FROM ${table(schema, "typed_v1_chunk_allocations")}
+                              WHERE chunk_id = $2)`,
+      [state.namespaceId, current.id],
+    );
+  }
   await client.query(
     `INSERT INTO ${table(schema, "telemetry_v1_chunks")} (
        id, participant_id, device_id, stream, chunk_day, chunk_seq, revision, chunk_digest,
@@ -1048,7 +1086,7 @@ async function persistTypedChunk(
                    last_accepted_at = EXCLUDED.last_accepted_at`,
     [principal.participantId, principal.deviceId, windowDay, input.createdAt],
   );
-  return { acceptedRecords: chunk.records.length, replay: false };
+  return { acceptedRecords: chunk.records.length, replay: false, supersededRevision: current?.revision ?? null };
 }
 
 function validPendingObject(
@@ -1225,8 +1263,12 @@ export async function admitPostgresTelemetryV1Contribution(
   const admission = await withPostgresRead(pool, (client) => chunkAdmission(client, schema, principal, nowEpoch),
     { operation: "telemetry_v1.admission", preserveSafeError });
   if (admission.state === "exhausted") throw telemetryV1ChunkAdmissionError(admission, nowEpoch);
-  // Corrections are not ported (module comment). Refuse before any object write.
-  if (current) throw unavailable();
+  if (current && chunk.stream === "usage" && await withPostgresRead(pool,
+    (client) => usageCorrectionRuntimeActive(client, schema),
+    { operation: "telemetry_v1.correction_runtime", preserveSafeError })) {
+    // Refuse before any object write (module comment).
+    throw unavailable();
+  }
 
   const chunkRowId = `chunk:${crypto.randomUUID()}`;
   const r2Key = `telemetry/v1-${crypto.randomUUID()}`;
@@ -1253,7 +1295,7 @@ export async function admitPostgresTelemetryV1Contribution(
     principal, chunk, chunkRowId, r2Key, envelopeDigest, authorizationEnvelopeDigest,
     authorizationId: input.authorization.authorizationId, createdAt, sourceNamespace, nowEpoch, schemaConfig,
   };
-  let result: { acceptedRecords: number; replay: boolean };
+  let result: { acceptedRecords: number; replay: boolean; supersededRevision: number | null };
   try {
     result = await withPostgresMutation(pool, (client) => persistTypedChunk(client, schema, persistInput), {
       operation: "telemetry_v1.admit",
@@ -1317,7 +1359,7 @@ export async function admitPostgresTelemetryV1Contribution(
     chunkId: chunk.chunkId,
     chunkRevision: chunk.chunkRevision,
     status: "accepted",
-    supersededRevision: null,
+    supersededRevision: result.supersededRevision,
     recordCounts: { declared: chunk.records.length, accepted: result.acceptedRecords },
     acknowledgedThroughDay: throughDay,
     admission: settledAdmission,

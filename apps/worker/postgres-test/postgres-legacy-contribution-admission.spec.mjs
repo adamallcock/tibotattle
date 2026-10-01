@@ -544,7 +544,7 @@ async function origin(pool, schemaOptions, objectStore) {
 }
 
 /** The Worker's typed v1 admission for the same chunk, ids and clock, on D1. */
-async function oracleAdmission(twin, schema, chunkRowId, chunk, raw) {
+async function oracleAdmission(twin, schema, chunkRowId, chunk, raw, supersedesId = null) {
   const { insertTypedTelemetryV1Chunk } = await workerModule("/src/typed-v1-admission.ts");
   const { parseTelemetryV1Chunk } = await workerModule("/src/telemetry-v1.ts");
   const { telemetryEnvelopeDigest } = await workerModule("/src/telemetry-repository.ts");
@@ -570,7 +570,9 @@ async function oracleAdmission(twin, schema, chunkRowId, chunk, raw) {
   const result = await insertTypedTelemetryV1Chunk(d1Database(twin.d1), {
     participantId: row.participant_id, deviceId: row.device_id,
     deviceUploadAuthorizationId: row.device_upload_authorization_id, chunkRowId, r2Key: row.r2_key,
-    envelopeDigest: await telemetryEnvelopeDigest(envelope), chunk: parsed, supersedes: null,
+    envelopeDigest: await telemetryEnvelopeDigest(envelope), chunk: parsed,
+    supersedes: supersedesId === null ? null
+      : fromSqlite(twin.d1.prepare("SELECT * FROM telemetry_v1_chunks WHERE id = ?").get(supersedesId)),
     createdAt: row.created_iso, authorizationEnvelopeDigest: sha256Hex(raw),
   }, NAMESPACE);
   assert.deepEqual(result, { acceptedRecords: chunk.records.length, replay: false });
@@ -590,7 +592,8 @@ async function snapshot(twin, schema, participantId) {
   const chunkHeaders = {
     pg: await pgq(`SELECT id, participant_id, device_id, stream, chunk_day::text AS chunk_day, chunk_seq, revision,
         chunk_digest, envelope_digest, parser_version, record_count, accepted_record_count, r2_key,
-        device_upload_authorization_id, superseded_at,
+        device_upload_authorization_id,
+        to_char(superseded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS superseded_at,
         to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at
         FROM ${s}telemetry_v1_chunks WHERE participant_id = $1 ORDER BY id`, [participantId]),
     d1: d1q(`SELECT id, participant_id, device_id, stream, chunk_day, chunk_seq, revision, chunk_digest,
@@ -1077,6 +1080,73 @@ test("PG17 re-uploading the same chunk is idempotent: same receipt id, no new ro
   assert.deepEqual(counts.rows[0], { chunks: 1, records: 2, journal: 1, pending: 1 });
 }));
 
+test("PG17 a v1.0 correction supersedes the current chunk with the d43c8f92 rows, and replays answer both revisions", {
+  skip: SKIP, timeout: 300_000,
+}, () => withTwin(async ({ twin, pool, schema }) => {
+  const { schemaOptions } = await initializeTypedTargets(twin, schema);
+  const store = memoryObjectStore();
+  const service = await origin(pool, schemaOptions, store);
+  await socialParticipant(twin, "in3-correct");
+  const device = await socialDevice(twin, "in3-correct", randomUUID());
+  const ids = {};
+  for (const [stream, count] of [["usage", 2], ["quota", 1]]) {
+    const chunk = await syntheticChunk({ stream, count, seed: "first" });
+    const result = await service.upload(device, chunk);
+    assert.equal(result.response.status, 202);
+    await oracleAdmission(twin, schema, result.receipt.contributionId, chunk, result.raw);
+    ids[stream] = { first: result, chunk };
+  }
+  for (const [stream, count] of [["usage", 3], ["quota", 1]]) {
+    const chunk = await syntheticChunk({ stream, count, seed: "second", revision: 2 });
+    const result = await service.upload(device, chunk);
+    assert.equal(result.response.status, 202);
+    assert.deepEqual({ ...result.receipt, contributionId: "<id>", admission: "<admission>" }, {
+      schemaVersion: "telemetry-chunk-receipt-v1.0", contributionId: "<id>", chunkId: chunk.chunkId, chunkRevision: 2,
+      status: "accepted", supersededRevision: 1, recordCounts: { declared: count, accepted: count },
+      acknowledgedThroughDay: day(), admission: "<admission>",
+    });
+    await oracleAdmission(twin, schema, result.receipt.contributionId, chunk, result.raw,
+      ids[stream].first.receipt.contributionId);
+    ids[stream].second = { ...result, chunk };
+  }
+  const rows = await snapshot(twin, schema, "in3-correct");
+  for (const key of Object.keys(rows.d1)) {
+    assert.deepEqual(rows.pg[key], rows.d1[key], `${key} matches the d43c8f92 typed-v1 correction`);
+  }
+  assert.equal(rows.pg.typedRecords.length, 4, "only the current revisions keep typed rows");
+  assert.equal(rows.pg.chunkHeaders.filter((row) => row.superseded_at !== null).length, 2);
+  assert.deepEqual(rows.pg.events.map((event) => event.kind),
+    ["owner-active", "source-updated", "owner-active", "owner-active"]);
+
+  // The superseded envelope replays as superseded; the current content as accepted.
+  const old = await service.upload(device, null, { envelope: JSON.parse(ids.usage.first.raw) });
+  assert.equal(old.response.status, 202);
+  assert.deepEqual(old.receipt, {
+    schemaVersion: "telemetry-chunk-receipt-v1.0", contributionId: ids.usage.first.receipt.contributionId,
+    chunkId: ids.usage.chunk.chunkId, chunkRevision: 1, status: "superseded", replayed: true,
+    recordCounts: { declared: 2, accepted: 2 }, acknowledgedThroughDay: day(),
+  });
+  const current = await service.upload(device, ids.usage.second.chunk);
+  assert.equal(current.receipt.contributionId, ids.usage.second.receipt.contributionId);
+  assert.equal(current.receipt.status, "accepted");
+  assert.equal(current.receipt.replayed, true);
+  // A skipped revision still conflicts.
+  await assert.rejects(service.upload(device, await syntheticChunk({ stream: "usage", count: 1, seed: "skip", revision: 4 })),
+    (error) => error.status === 409 && error.code === "CHUNK_REVISION_CONFLICT");
+
+  // The retention allowance is exactly superseded format-10 rows: a current
+  // chunk's typed rows still need the erasure proof.
+  const currentTyped = await pool.query(`SELECT c.id FROM "${schema}".typed_telemetry_chunks c
+    JOIN "${schema}".typed_v1_chunk_allocations a ON a.chunk_original = c.original_id
+    WHERE a.chunk_id = $1`, [ids.quota.second.receipt.contributionId]);
+  assert.equal(currentTyped.rows.length, 1);
+  await assert.rejects(pool.query(`DELETE FROM "${schema}".typed_telemetry_chunks WHERE id = $1`,
+    [currentTyped.rows[0].id]), (error) => error.code === "P1005" && error.message === "typed_telemetry_source_retained");
+  await assert.rejects(pool.query(`DELETE FROM "${schema}".typed_telemetry_records WHERE chunk_id = $1`,
+    [currentTyped.rows[0].id]), (error) => error.code === "P1005" && error.message === "typed_telemetry_source_retained");
+  assert.equal(store.objects.size, 4);
+}));
+
 test("PG17 two concurrent uploads of one v1.0 envelope converge on one chunk and retire the losing object", {
   skip: SKIP, timeout: 300_000,
 }, () => withTwin(async ({ twin, pool, schema }) => {
@@ -1153,9 +1223,13 @@ test("PG17 v1.0 refusals keep the Worker's status, code and order, and write not
     "every refused claim is abandoned and nothing is stored");
   assert.equal(store.objects.size, 0);
 
-  // A correction over a current chunk is the documented gap: refused, no write.
+  // A usage correction while the imported correction runtime was active is
+  // the documented gap: refused before any write (D1 would record facts).
   const first = await service.upload(device, await syntheticChunk({ count: 1, seed: "correct" }));
   assert.equal(first.response.status, 202);
+  await pool.query(`INSERT INTO "${schema}".telemetry_usage_correction_runtime
+      (id, schema_version, method_version, source_state, max_capture_rows, max_history_page)
+    VALUES (1, 'telemetry-usage-correction-v1', 'usage-total-correction-v1', 'active', 200, 200)`);
   const correction = await syntheticChunk({ count: 2, seed: "correct-2", revision: 2 });
   assert.deepEqual(await refused(device, correction), { status: 503, code: "BACKEND_STORAGE_UNAVAILABLE", details: null });
   assert.deepEqual(await counts(), { chunks: 1, records: 1, pending: 1, abandoned: 8, other: 1 });
