@@ -8,7 +8,8 @@
 //     apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs \
 //       --work-dir <absolute dir outside the repository> --corpus dense|q1 [--layout compact|spread] [--scale 0.1] \
 //       [--golden-out <dir>] [--verify-against <dir>] [--forced-native withheld|all|none] \
-//       [--max-ticks N] [--resume <converged work dir>] [--keep-scratch] [--forced-jobs N]
+//       [--max-ticks N] [--resume <converged work dir>] [--keep-scratch] [--forced-jobs N] \
+//       [--publication-passes k] [--analytics-passes k] [--clock-step-ms S]
 //
 //  1. build.mjs materializes d43c8f92 (blob-verified) and bundles it for Node;
 //  2. runtime.mjs pins the clock and seeds every random source, so a run is
@@ -87,7 +88,7 @@ const RUN_SPECIFIC_ANALYTICS_COLUMNS = Object.freeze({
 function parseArgs(argv) {
   const options = { workDir: null, corpus: null, scale: 1, goldenOut: null, verifyAgainst: null,
     forcedNative: "withheld", maxTicks: 200_000, keepScratch: false, resume: null, publicationPasses: 1,
-    layout: DENSE_DEFAULT_LAYOUT, forcedJobs: 6 };
+    layout: DENSE_DEFAULT_LAYOUT, forcedJobs: 6, clockStepMs: 0, analyticsPasses: 1 };
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index], next = () => argv[++index];
     if (arg === "--work-dir") options.workDir = resolve(next());
@@ -102,6 +103,8 @@ function parseArgs(argv) {
     else if (arg === "--publication-passes") options.publicationPasses = Number(next());
     else if (arg === "--layout") options.layout = next();
     else if (arg === "--forced-jobs") options.forcedJobs = Number(next());
+    else if (arg === "--clock-step-ms") options.clockStepMs = Number(next());
+    else if (arg === "--analytics-passes") options.analyticsPasses = Number(next());
     else throw new Error(`DENSE_ORACLE_ARGUMENT_INVALID:${arg}`);
   }
   if (!options.workDir || !isAbsolute(options.workDir) || !relative(REPO_ROOT, options.workDir).startsWith("..")) {
@@ -112,6 +115,10 @@ function parseArgs(argv) {
     throw new Error("DENSE_ORACLE_SCALE_INVALID");
   }
   if (!["all", "withheld", "none"].includes(options.forcedNative)) throw new Error("DENSE_ORACLE_FORCED_NATIVE_INVALID");
+  if (!Number.isSafeInteger(options.clockStepMs) || options.clockStepMs < 0 || options.clockStepMs > 60_000
+    || !Number.isSafeInteger(options.analyticsPasses) || options.analyticsPasses < 1 || options.analyticsPasses > 16) {
+    throw new Error("DENSE_ORACLE_CADENCE_INVALID");
+  }
   if (!Number.isSafeInteger(options.forcedJobs) || options.forcedJobs < 1 || options.forcedJobs > 32) {
     throw new Error("DENSE_ORACLE_FORCED_JOBS_INVALID");
   }
@@ -253,7 +260,7 @@ const dense = options.corpus === "dense"
   ? createDenseOwner({ pricer: P.priceTelemetryUsageEvent, scale: options.scale, layout: options.layout }) : null;
 const corpusOwners = [...q1.owners, ...(dense ? [dense.spec] : [])];
 note("corpus", { owners: corpusOwners.map((owner) => owner.key), dense: dense?.spec ?? null,
-  publicationPasses: options.publicationPasses });
+  publicationPasses: options.publicationPasses, analyticsPasses: options.analyticsPasses, clockStepMs: options.clockStepMs });
 
 // ---------------------------------------------------------------- seeding --
 // A port of the Q-1 oracle's seeding (gcp-fastpath-oracle.spec.ts), unchanged
@@ -534,6 +541,29 @@ async function progressDigest() {
   return hash.digest("hex");
 }
 
+/** The analysis clock. Q-1 froze it at the pinned instant; with
+ * `--clock-step-ms S` > 0 it advances S ms between simulated minutes (never
+ * within one), staying inside the pinned UTC day. Production's claims and
+ * leases (a shared-feature day build holds a 60-second claim, a long graph pass
+ * a 570-second lease) are abandoned when a pass ends on its statement meter;
+ * with a frozen clock they never expire, which strands a dense owner's work
+ * (measured: a model block's input acquisition and two shared-feature day
+ * builds stalled for hundreds of passes). Analytical results are day-based
+ * (fixedNow is the end of each window's day), so only publication timestamps
+ * (releasedAt, generatedAt, computed_ms) carry the clock. */
+let analysisNowMs = PINNED_NOW_MS;
+const ANALYSIS_DAY_END_MS = Date.parse(`${DENSE_CORPUS_PINNED_NOW.slice(0, 10)}T00:00:00.000Z`) + 86_400_000;
+async function advanceAnalysisClock(tick) {
+  if (options.clockStepMs === 0) return;
+  const next = PINNED_NOW_MS + tick * options.clockStepMs;
+  // Leave the lease-expiry probe its two hours inside the same UTC day.
+  if (next + PROBE_STEPS * PROBE_STEP_MS >= ANALYSIS_DAY_END_MS) throw new Error("DENSE_ORACLE_CLOCK_LEAVES_DAY");
+  if (next === analysisNowMs) return;
+  analysisNowMs = next;
+  setPinnedNow(analysisNowMs);
+  await openDatabases(analysisNowMs);
+}
+
 /** Q-1's lane order per simulated minute. `--publication-passes k` (default 1,
  * Q-1's cadence) runs the publication worker k times per minute: production's
  * daily lane folds a dense owner-day 50 records per stream per attempt, at most
@@ -543,7 +573,8 @@ async function progressDigest() {
  * interleaving; cache-retention marks are not (Q-1's parity basis), so a run
  * with k > 1 records its cadence and its cache values are informational. */
 const lanes = () => [
-  ["analytics", (minuteMs) => P.runStorageAnalyticsSchedule(ANALYTICS_ENV(), { nowMs: minuteMs })],
+  ...Array.from({ length: options.analyticsPasses }, () =>
+    ["analytics", (minuteMs) => P.runStorageAnalyticsSchedule(ANALYTICS_ENV(), { nowMs: minuteMs })]),
   ...Array.from({ length: options.publicationPasses }, () =>
     ["publication", (minuteMs) => P.runStoragePublicationSchedule(PUBLICATION_ENV(), { nowMs: minuteMs })]),
   ["cache", (minuteMs) => P.runCacheRetentionDaySchedule(CACHE_ENV(), { nowMs: minuteMs })],
@@ -585,6 +616,7 @@ async function converge() {
   interceptConsole(failures, errors, laneStats);
   try {
     for (; tick < options.maxTicks && quiet < QUIET_TICKS; tick++) {
+      await advanceAnalysisClock(tick);
       const minuteMs = PINNED_NOW_MS + (tick + 1) * 60_000;
       for (const [lane, run] of lanes()) {
         const laneStarted = performance.now();
@@ -632,7 +664,7 @@ async function leaseExpiryProbe() {
   interceptConsole(new Map(), errors, new Map());
   try {
     for (let step = 1; step <= PROBE_STEPS; step++) {
-      const nowMs = PINNED_NOW_MS + step * PROBE_STEP_MS;
+      const nowMs = analysisNowMs + step * PROBE_STEP_MS;
       setPinnedNow(nowMs);
       await openDatabases(nowMs);
       const minuteMs = nowMs + (step % 2 === 1 ? 60_000 : 0);
@@ -646,11 +678,11 @@ async function leaseExpiryProbe() {
     }
   } finally {
     restoreConsole();
-    setPinnedNow(PINNED_NOW_MS);
-    await openDatabases(PINNED_NOW_MS);
+    setPinnedNow(analysisNowMs);
+    await openDatabases(analysisNowMs);
   }
   return { steps: PROBE_STEPS, stepMinutes: PROBE_STEP_MS / 60_000,
-    through: new Date(PINNED_NOW_MS + PROBE_STEPS * PROBE_STEP_MS).toISOString(),
+    through: new Date(analysisNowMs + PROBE_STEPS * PROBE_STEP_MS).toISOString(),
     changedOutputs: [...changed].sort(), errors: errors.length };
 }
 
@@ -770,7 +802,7 @@ if (prior === null) {
   setPinnedNow(PINNED_NOW_MS);
   await openDatabases(PINNED_NOW_MS);
   convergence = await converge();
-  note("converged", { ticks: convergence.ticks, converged: convergence.converged, elapsedMs: convergence.elapsedMs,
+  note("converged", { analysisNowMs, ticks: convergence.ticks, converged: convergence.converged, elapsedMs: convergence.elapsedMs,
     errors: convergence.errors.length, failures: convergence.failures, laneMs: convergence.laneMs,
     laneStats: convergence.laneStats, slowestLane: convergence.slowestLane });
 } else {
@@ -784,9 +816,13 @@ if (prior === null) {
     errors: Array.from({ length: prior.converged.errors }, () => "recorded in the resumed run"),
     failures: prior.converged.failures, laneMs: prior.converged.laneMs, laneStats: prior.converged.laneStats ?? null,
     slowestLane: prior.converged.slowestLane ?? null, progress: [], resumedFrom: options.resume };
-  setPinnedNow(PINNED_NOW_MS);
-  await openDatabases(PINNED_NOW_MS);
-  note("resumed", { from: options.resume, ticks: convergence.ticks });
+  if ((prior.corpus.clockStepMs ?? 0) !== options.clockStepMs || (prior.corpus.analyticsPasses ?? 1) !== options.analyticsPasses) {
+    throw new Error("DENSE_ORACLE_RESUME_CADENCE_MISMATCH");
+  }
+  analysisNowMs = prior.converged.analysisNowMs ?? PINNED_NOW_MS;
+  setPinnedNow(analysisNowMs);
+  await openDatabases(analysisNowMs);
+  note("resumed", { from: options.resume, ticks: convergence.ticks, analysisNowMs });
 }
 const ownerPage = await P.readStorageCommunityOwnerPage(source());
 if (ownerPage.length !== corpusOwners.length) throw new Error("DENSE_ORACLE_OWNER_PAGE");
@@ -924,7 +960,7 @@ if (options.forcedNative !== "none") {
   try {
     const run = await runForcedNative({ P, openSealedSqliteD1, dbDir, scratchDir: join(options.workDir, "scratch-forced"),
       files: { source: DB_FILES.USAGE_MONITOR_DB, target: DB_FILES.STORAGE_ANALYTICS_DB },
-      bindings: { sourceId: SOURCE_ID, sourceNamespace: NAMESPACE }, nowMs: PINNED_NOW_MS, today, modelDates,
+      bindings: { sourceId: SOURCE_ID, sourceNamespace: NAMESPACE }, nowMs: analysisNowMs, today, modelDates,
       ownerKeyOf: ownerKey, datesFor: forcedDatesFor, keepScratch: options.keepScratch, jobs: options.forcedJobs,
       child: { node: process.execPath, execArgv: ["--max-old-space-size=8192"], script: join(HERE, "forced-native-child.mjs"),
         spec: { bundlePath: build.bundle.path, adapterPath: join(WORKER_ROOT, "cloud-run/sealed-sqlite-d1-adapter.mjs") } },
@@ -1149,8 +1185,9 @@ const manifest = {
     publication: { PUBLICATION_LANE: "enabled", STORAGE_ANALYTICS_SHARED_FEATURES: "enabled", STORAGE_ANALYTICS_MODEL_BLOCKS: "disabled" },
     cache: { CACHE_RETENTION_BUILD: "enabled", CACHE_RETENTION_SHARED_FEATURES: "enabled", shards: 1 },
     graphDayProjection: "disabled (deployment default)",
-    cadence: { lanesPerSimulatedMinute: ["analytics", `publication x${options.publicationPasses}`, "cache"],
-      longPassEveryMinutes: 10, q1Cadence: options.publicationPasses === 1 },
+    cadence: { lanesPerSimulatedMinute: [`analytics x${options.analyticsPasses}`, `publication x${options.publicationPasses}`, "cache"],
+      longPassEveryMinutes: 10, clockStepMsPerMinute: options.clockStepMs,
+      q1Cadence: options.publicationPasses === 1 && options.analyticsPasses === 1 && options.clockStepMs === 0 },
     basis: "Q-1's reading of the production-scheduled-analytics-deploy refresh plan at d43c8f92; not verified against live configuration",
   },
   convergence: { converged: convergence.converged, scheduleErrors: convergence.errors.length, quietTicks: QUIET_TICKS,
@@ -1183,7 +1220,7 @@ const manifest = {
   sourceDump: { tables: usageDump.tables, rows: usageDump.rows, schemaSha256: usageDump.schemaSha256,
     rowCountsSha256: usageDump.rowCountsSha256, jsonBytes: usageDump.bytes, jsonSha256: usageDump.sha256,
     sealedSqlite: sealed, sourceUnchangedByAnalysis: sourceBeforeAnalysis === null ? null : sourceBeforeAnalysis === sourceAfterAnalysis,
-    reproduce: `node --max-old-space-size=16384 apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs --work-dir <dir> --corpus ${options.corpus}${options.corpus === "dense" && options.layout !== DENSE_DEFAULT_LAYOUT ? ` --layout ${options.layout}` : ""}${options.scale === 1 ? "" : ` --scale ${options.scale}`}${options.publicationPasses === 1 ? "" : ` --publication-passes ${options.publicationPasses}`}` },
+    reproduce: `node --max-old-space-size=16384 apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs --work-dir <dir> --corpus ${options.corpus}${options.corpus === "dense" && options.layout !== DENSE_DEFAULT_LAYOUT ? ` --layout ${options.layout}` : ""}${options.scale === 1 ? "" : ` --scale ${options.scale}`}${options.publicationPasses === 1 ? "" : ` --publication-passes ${options.publicationPasses}`}${options.analyticsPasses === 1 ? "" : ` --analytics-passes ${options.analyticsPasses}`}${options.clockStepMs === 0 ? "" : ` --clock-step-ms ${options.clockStepMs}`}` },
 };
 const diagnostics = { header: { ...header, seedMs, convergenceMs: convergence.elapsedMs, forcedCost,
   wallMs: Math.round(performance.now() - wallStarted), randomBytesDrawn: runtime.randomBytesDrawn() },

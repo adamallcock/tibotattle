@@ -7,8 +7,10 @@
 //
 //   Q   13,500 seven-day quota observations (> 12,800 quota rows) over ~4,000
 //       usage events;
-//   X   ~40,000 usage events: > 20,000 occurrences and > 32 MiB of record JSON;
-//   H   18,000-23,000 usage events: > 20,000 occurrences under 32 MiB;
+//   X   33,000-33,500 usage events (compact; ~40,000 in spread): > 20,000
+//       occurrences and > 32 MiB of record JSON;
+//   H   18,000-19,000 usage events (compact; up to 23,000 in spread): > 20,000
+//       occurrences under 32 MiB;
 //   M   6,000-15,000 usage events: production's native threshold (6,000 rows)
 //       but not the GCP one;
 //   S   2,900-3,200 usage events: under production's shared-feature day bounds
@@ -21,7 +23,7 @@
 //                      2026-09-28 except M 2026-09-10 and 2026-09-18 and H
 //                      2026-09-24; X on 2026-09-29 (inside a weekly reset); L
 //                      elsewhere. The current-fits window (2026-06-23 to
-//                      2026-10-01) holds ~243,000 usage rows (> 120,000 and
+//                      2026-10-01) holds ~230,000 usage rows (> 120,000 and
 //                      > 204,800, the single-call page bound of the shared scalar
 //                      path), the last model windows too, and earlier windows
 //                      progressively fewer, which bounds production's native
@@ -160,8 +162,11 @@ export function denseDayClass(day, layout = DENSE_DEFAULT_LAYOUT) {
 export function denseDayUsageTarget(day, scale = 1, layout = DENSE_DEFAULT_LAYOUT) {
   const { int } = draws(`${OWNER}:plan:${day}`);
   const kind = denseDayClass(day, layout);
-  if (kind === "X") return 40_000 + int(0, 999);
-  if (kind === "H") return int(18_000, 23_000);
+  // Compact sizes sit just past the bounds they cross (X: 32 MiB of record
+  // JSON; H: 20,000 occurrences), since production folds a dense day's daily
+  // values 50 records per stream per publication attempt.
+  if (kind === "X") return layout === "spread" ? 40_000 + int(0, 999) : int(33_000, 33_500);
+  if (kind === "H") return layout === "spread" ? int(18_000, 23_000) : int(18_000, 19_000);
   if (kind === "Q") return 4_000;
   if (kind === "S") return int(2_900, 3_200);
   if (kind === "M") return layout === "spread" ? Math.max(20, Math.round(int(6_000, 15_000) * scale)) : int(6_500, 15_000);
