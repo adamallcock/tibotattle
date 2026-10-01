@@ -1,5 +1,5 @@
--- PostgreSQL primary migration (staged, PROVISIONAL number 0099; the lead
--- assigns the real number at landing): legacy contribution admission (IN-3).
+-- PostgreSQL primary migration 0061 (staged by IN-3 as provisional 0099,
+-- promoted as 0061 by the intake composition): legacy contribution admission (IN-3).
 -- Two parts: the v0.1 weekly admission window (below) and, at the end, the
 -- typed-row retention allowance a v1.0 correction needs.
 --

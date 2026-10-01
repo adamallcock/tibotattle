@@ -1,5 +1,5 @@
--- PostgreSQL primary migration 0060 (staged, number assigned by the
--- integration lead at landing): live v1.1 admission on the retained typed
+-- PostgreSQL primary migration 0060 (staged by IN-2, promoted as 0060 by
+-- the intake composition): live v1.1 admission on the retained typed
 -- v1/v1.1 family (GCP fast path, IN-2).
 --
 -- Migrations 0005, 0030 and 0033 give PostgreSQL the v1.1 transport headers
