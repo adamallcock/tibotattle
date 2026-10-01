@@ -188,8 +188,9 @@ integration commit that also records that production is typed-rendered.
 ## 5. Client address privacy
 
 **In the topology this record describes, Google receives the raw client
-address on every forwarded request.** The edge's own code sets no value
-derived from the client address, but Cloudflare's network adds one. An earlier
+address on every forwarded request, by Cloudflare's own documentation.** No
+run on Cloudflare's network has observed it yet. The edge's own code sets no
+value derived from the client address, but Cloudflare's network adds one. An earlier
 draft of this section said that no raw client address reaches Google; that is
 withdrawn. OD-E6 ([section 15](#15-open-owner-choices-this-record-does-not-settle))
 decides what replaces it, and the gcp switch waits for that decision.
@@ -627,7 +628,9 @@ These are deliberate and accepted with this record:
 5. Address rate-limit keys are re-derived under `EDGE_CLIENT_KEY_SECRET`, so
    every per-address window resets once, at the gcp switch. Rotating that
    secret resets them again.
-6. Edge-local failures write no diagnostic rows.
+6. Edge-local failures write no diagnostic rows. The edge's pre-admission guard
+   refusals and its 8 MiB `413` also log no line, where `handleRequest` logs a
+   content-free `request_failed` warning for each.
 7. `UPLOAD_AUTHORIZATION` and `UPLOAD_PRINCIPAL` become exact, global PostgreSQL
    limits instead of per-location Workers Rate Limiting.
 8. In gcp mode, public `/api/health` reports the origin's commit. The edge's

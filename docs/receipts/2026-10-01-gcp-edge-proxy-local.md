@@ -20,6 +20,11 @@ repository tooling, and a local PostgreSQL 17 cluster on a private Unix
 socket. Every key, token, account, address and row is synthetic and
 content-free.
 
+A later section, [review fixes](#review-fixes), records three review findings
+against `4722c4a3`, the fixes in code commit `02841e26`, and the gates re-run
+at that commit. Where it differs from the sections before it, it supersedes
+them.
+
 Nothing was pushed or deployed. No Cloudflare API, Google endpoint or GCP
 resource was called, and wrangler ran only with `--dry-run` and without any
 Cloudflare credential in its environment. This receipt does not qualify
@@ -208,6 +213,133 @@ never reaches stdout, stderr, the receipt or an error.
   production composition (CR-6 and CR-7).
 - Client-disconnect cancellation is unproven (finding 5).
 - A gcp deploy stays blocked by design until the production origin serves
-  Worker-shaped `/api/health` and `/api/ready` (F8).
+  Worker-shaped `/api/health` and `/api/ready` (F8), and, separately, until the
+  owner decides OD-E6 and an authorized probe on Cloudflare's network confirms
+  which address-bearing headers reach the origin
+  ([review fixes](#review-fixes), finding 1). E10 has no code check for OD-E6.
+- The edge port must also carry `02841e26`: the edge files it changes, the new
+  `src/edge-google-subrequest.ts`, and the `export` keyword and two comment
+  lines it adds to `contributionRequestPreflight` in `index.ts`. Otherwise
+  `d43c8f92`'s copy of that function, and of `hasSessionCookie` and
+  `assertSameOrigin` in `session.ts`, is identical to this line's.
+- The planning spec `design/specs-v2/edge-thin-proxy.json`, outside this
+  repository, still states the withdrawn privacy claim.
 - The base's `storage-graph-history-integration` failure is unchanged and
   unrelated.
+
+## Review fixes
+
+A review of `4722c4a3` raised three findings. Each was checked against
+`d43c8f92`, the branch code and Cloudflare's documentation before any change.
+Code commit `02841e26` holds the fixes and the corrected decision record,
+runbook and plan. The commit that adds this section adds two clarifications
+to the decision record, on the evidence level of the exposure and on logging,
+and changes documentation only.
+
+1. **Blocker, confirmed: Google receives the client address.** Cloudflare's
+   [HTTP headers reference](https://developers.cloudflare.com/fundamentals/reference/http-headers/),
+   read on 2026-10-01, says that a Worker subrequest to a host outside any
+   Cloudflare zone carries the client's address in `CF-Connecting-IP` and
+   `x-real-ip`, and that a Worker can change only `x-real-ip`. Both edge
+   subrequests to Google are of that kind: the forward to the `*.run.app`
+   origin and the ID-token exchange, which runs inside a client request. The
+   decision record's "no raw client address reaches Google" was therefore
+   false for its own topology, and no Worker code can make it true there.
+   - Fixed in code: the edge sets `x-real-ip` to the constant
+     `2a06:98c0:3600::103` on both subrequests (`src/edge-google-subrequest.ts`),
+     the one header a Worker can set.
+   - Fixed in tests: S7 now requires exactly that value, once, on every
+     exchange, instead of forbidding the header name. S10 shows S7 catching a
+     client-valued, a missing and a repeated `x-real-ip`. The proxy and
+     token-source specs pin it too.
+   - Fixed in documents: section 5 of the decision record withdraws the claim
+     and states the exposure. A new owner choice, OD-E6, is either a
+     Cloudflare-proxied origin hostname (a contract, template and DNS change)
+     or acceptance with disclosure. Section 11 blocks the gcp switch on OD-E6
+     and on a probe on Cloudflare's network. Section 12 ties the privacy-page
+     text to the outcome. The runbook and the plan say the same.
+   - Still open: OD-E6 and the probe. S7's claim boundary is now written down:
+     Miniflare adds none of Cloudflare's subrequest headers, so E12 proves only
+     what the edge's code and workerd send.
+2. **Minor, confirmed: the edge's 8 MiB cap pre-empted the Worker's earlier
+   refusals.** At `4722c4a3` a 9 MiB contribution with `text/plain` or a
+   session cookie got the edge's `413` where `d43c8f92` answers `415` or `401`.
+   - Fixed for every refusal the Worker gives before its limiter from the
+     request alone. `EDGE_PRE_ADMISSION_GUARDS` runs before the cap and before
+     admission: a session cookie on the five accountless routes
+     (`401 AUTH_INVALID`), `assertSameOrigin` on `enroll` and both sign-in
+     starts (`403 CSRF_INVALID`), and the Worker's own
+     `contributionRequestPreflight` on `contributions`. `index.ts` now exports
+     that function and the entry injects it, so the edge-port branch adds one
+     `export` keyword to `d43c8f92`'s `index.ts`.
+   - What remains is deviation 3, now stated route by route. On other body
+     routes the Worker can still refuse first, on stored state, its limiter,
+     authentication or `admin_action`'s CSRF or content type.
+3. **Minor, confirmed: refused requests spent edge budget.** At `4722c4a3`,
+   every request on a policy route charged the per-address and global
+   limiters, including requests `d43c8f92` refuses before its limiter.
+   - Fixed for the request-only refusals by the same guards: they no longer
+     reach admission.
+   - Still deviation 4: the refusals that read configuration or stored state
+     (accountless modes, collection controls, the sign-in start switch,
+     admission bindings) still come after the edge's charge. Deviation 4 now
+     states the cross-request effect: a later request the Worker would admit
+     can get `429` within the same 60-second window. Deviation 10 records that
+     the contribution preflight runs without the Worker's ingress
+     configuration checks.
+
+New proof:
+
+- `test/edge-pre-admission-guards.spec.ts` checks the guard map against
+  `handleRequest`. It runs every EP-1 policy route and registry method with 21
+  request variants (567 comparisons), under a permissive configuration and
+  migrated storage. Wherever the Worker refuses before its limiter, the edge
+  must give the same status, headers and envelope locally, with no limiter call
+  and no forward. Everywhere else it must charge and forward, apart from the
+  8 MiB cap.
+- Two mutation checks were each caught, then reverted: disabling the guards
+  (6 tests failed across the two specs) and removing one map entry
+  (`identity_apple_start`, which the differential spec names).
+- E12 now answers these rows at the edge (`local`), each equal to the Worker:
+  - the five contribution preflight rows;
+  - 9 MiB with `text/plain` (415) and with a session cookie (401);
+  - accountless enrollment and renewal with a session cookie, the enrollment
+    one also at 9 MiB (401);
+  - a foreign-origin `enroll`, an origin-less Google start and a cross-site
+    Apple start (403).
+- New S4 rows show that refused requests spend no budget. From one address,
+  14 refused attempts (session-cookie enrollments and foreign-origin `enroll`)
+  at the production limit of 5, then requests both sides admit with
+  `v1;enrollment;allowed`. Then 102 refused uploads against a 100/60 pair,
+  followed by an upload both sides admit.
+- The S3 sweep now sends a same-origin header, so every forwarded pair still
+  reaches the origin.
+
+E12 at `02841e26` (Node 22.16.0, golden stage on) passed 15 of 15 in 6 minutes
+18 seconds:
+
+- 3,925 forwarded exchanges, with 3,925 distinct request ids;
+- framing: 3,579 with a length, 1 chunked and 345 without a body;
+- 3 ID-token exchanges;
+- S9 byte-equal: 396,337 bytes, sha256
+  `a27aee711cabc056eea2ecb5c89b7f4de3ec4a9f85b72455057c1f760ffa680d`.
+
+Three 9 MiB rows each needed one transport retry. These are the local client
+race that `b03bec59` records: undici reports "fetch failed" when an early
+answer closes the connection while the body is still being sent. Each retry
+then matched the Worker.
+
+### Gates at `02841e26`
+
+| Gate | Result |
+|---|---|
+| E12 spec (Node 22.16.0, `--test-concurrency=1`, golden stage on) | 15 of 15, figures above |
+| Worker vitest, default config (`npx vitest run`) | 177 of 178 files and 2,363 of 2,364 tests pass in 909 s. The one failure is the recorded `storage-graph-history-integration` case, as on the base. The 11 added tests are 9 in the proxy spec and 2 in the guard-map spec |
+| `npx tsc --noEmit` (apps/worker) | Exit 0 |
+| `cloud-run`: `npm run check` with the local PostgreSQL 17 env | Exit 0: 276 node:test tests, 275 pass and 1 skipped (the opt-in A2 activation case), plus the plain checks including `host.check.mjs` |
+| `npm run scripts:check` (apps/worker) | Exit 0: 24 node:test suites, 1,053 pass, 0 fail, including the edge-mode dry run and E10's gate suites |
+| `npm run deployment:endpoints:check` | Pass |
+| `npm run postgres:domain:check` with the same env | Exit 0: vitest 75 pass and 1 skip; node:test 336 tests, 334 pass, 2 skipped by design |
+| `edge:e2e:check` | 12 of 12; the dry run passes with `contributionRequestPreflight` in each bundle's exports |
+| Repository root `npm run architecture:check` | Passed: 922 production files, 3,937 imports, 0 debt edges |
+| Repository root `npm run test:preflight`, with this section in place | Exit 0: documentation governance valid across 303 Markdown files; 20 of 20 governance and guidance tests |
