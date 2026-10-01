@@ -12,6 +12,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createContributionEnvelopeRegistry } from "../contribution-envelope-registry.mjs";
 import { createTelemetryV11ContributionEnvelope, hasExactV11EnvelopeKeyOccurrences } from "../envelopes/v11.mjs";
+import { createTelemetryV11OriginIntake } from "./v11-composition.mjs";
 import { createTelemetryV11ConsentRouteModule } from "./v11-device-telemetry-consents.mjs";
 import { createTelemetryV11DayManifestRouteModules } from "./v11-day-manifests.mjs";
 import { createTelemetryV11DomainActivateRouteModule } from "./v11-domain-activate.mjs";
@@ -68,6 +69,8 @@ test("v1.1 route modules refuse incomplete composition at startup", () => {
   assert.throws(() => createTelemetryV11DayManifestRouteModules(deviceDependencies()),
     { code: "TELEMETRY_V11_ROUTE_CONFIGURATION_INVALID" });
   assert.throws(() => createTelemetryV11ConsentRouteModule({ primaryPool: pool }),
+    { code: "TELEMETRY_V11_ROUTE_CONFIGURATION_INVALID" });
+  assert.throws(() => createTelemetryV11OriginIntake({ adapters: { live: {} } }),
     { code: "TELEMETRY_V11_ROUTE_CONFIGURATION_INVALID" });
   const modules = createTelemetryV11DayManifestRouteModules({
     ...deviceDependencies(),

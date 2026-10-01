@@ -17,7 +17,7 @@ import { applyPostgresMigrations } from "../cloud-run/postgres-migrations.mjs";
 import { createContributionEnvelopeRegistry } from "../cloud-run/contribution-envelope-registry.mjs";
 import { createOriginRouteModuleRegistry } from "../cloud-run/origin-route-modules.mjs";
 import { createTelemetryV11ContributionEnvelope } from "../cloud-run/envelopes/v11.mjs";
-import { createTelemetryV11ConsentRouteModule } from "../cloud-run/routes/v11-device-telemetry-consents.mjs";
+import { createTelemetryV11OriginIntake } from "../cloud-run/routes/v11-composition.mjs";
 import { createTelemetryV11DayManifestRouteModules } from "../cloud-run/routes/v11-day-manifests.mjs";
 import { createTelemetryV11DomainPredecessorRouteModule } from "../cloud-run/routes/v11-domain-predecessor.mjs";
 import { createTelemetryV11DomainActivateRouteModule } from "../cloud-run/routes/v11-domain-activate.mjs";
@@ -308,54 +308,27 @@ test("PostgreSQL 17 runs a full v1.1 upload cycle with Worker-equal rows, replay
       async delete(key) { objects.delete(key); },
     };
 
-    // ------------------------------------------------ composition (IN-1b's) --
-    const deviceRouteDependencies = {
-      primaryPool, ledgerPool, schema,
-      admissionEnv: {},
+    // ------------------------------------- composition (the lead's wiring) --
+    const intake = createTelemetryV11OriginIntake({
+      adapters: { live, bearer, transport, ledgerAuthority, personalDevices, controls, crypto, boundedBody },
+      primaryPool, ledgerPool, schema, admissionEnv: {},
       assertAdmissionBindings() {},
       async assertAttemptAllowed() {},
-      authenticateDevice: (pool, header, routeOptions) => bearer.authenticatePostgresDeviceBearer(pool, header, routeOptions),
-      hasDeletionTombstone: ledgerAuthority.hasPostgresDeletionTombstone,
-      assertCollectionControl: controls.assertPostgresCollectionControlFromPool,
-      readBoundedRequestBody: boundedBody.readBoundedRequestBody,
       maxRequestBytes: constants.MAX_REQUEST_BYTES,
-    };
-    const consentRoute = createTelemetryV11ConsentRouteModule({
-      primaryPool, ledgerPool, schema,
-      authenticatePersonalSession: personalDevices.authenticatePostgresPersonalSession,
-      assertPersonalSessionCsrf: personalDevices.assertPostgresPersonalSessionCsrf,
-      hasDeletionTombstone: ledgerAuthority.hasPostgresDeletionTombstone,
-      assertCollectionControl: controls.assertPostgresCollectionControlFromPool,
-      grantConsent: live.grantPostgresTelemetryV11Consent,
-      readBoundedRequestBody: boundedBody.readBoundedRequestBody,
-      maxRequestBytes: constants.MAX_REQUEST_BYTES,
-      socialConsentVersion: constants.TELEMETRY_CONSENT_VERSION,
-    });
-    const [manifestGet, manifestPost] = createTelemetryV11DayManifestRouteModules({
-      ...deviceRouteDependencies,
-      registerDayManifest: live.registerPostgresTelemetryV11DayManifest,
-      readDayChunkVector: live.readPostgresTelemetryV11DayChunkVector,
-      readDayCandidates: live.readPostgresTelemetryV11DayCandidates,
-    });
-    const domainDependencies = { ...deviceRouteDependencies, createDomain: live.createPostgresTelemetryV11Domain };
-    const predecessorRoute = createTelemetryV11DomainPredecessorRouteModule(domainDependencies);
-    const activateRoute = createTelemetryV11DomainActivateRouteModule(domainDependencies);
-    const envelopes = createContributionEnvelopeRegistry([createTelemetryV11ContributionEnvelope({
-      readStorageReplay: live.readPostgresTelemetryV11StorageReplay,
-      persistStagedChunk: live.persistPostgresTypedV11StagedChunk,
-      readUploadOutcome: live.readPostgresTelemetryV11UploadOutcome,
-      recordUploadReceipt: live.recordPostgresTelemetryV11UploadReceipt,
-      registerPendingObject: live.registerPostgresTelemetryV11PendingObject,
-      retirePendingObject: live.retirePostgresTelemetryV11PendingObject,
-      abandonUploadAuthorization: transport.abandonPostgresDeviceUploadAuthorization,
-      validateStagedChunk: live.validatePostgresTelemetryV11StagedChunk,
-      decryptSyntheticEnvelope: crypto.decryptSyntheticEnvelope,
-      sha256Hex: crypto.sha256Hex,
       socialConsentVersion: constants.TELEMETRY_CONSENT_VERSION,
       sourceNamespace: SOURCE_NAMESPACE,
       envelopePublicJwk: keys.publicJwkRaw,
       envelopePrivateJwk: keys.privateJwkRaw,
-    })]);
+    });
+    const [consentRoute, manifestGet, manifestPost, predecessorRoute, activateRoute] = intake.routeModules;
+    assert.deepEqual(intake.routeModules.map((entry) => `${entry.method} ${entry.pathname}`), [
+      "POST /api/v1/me/device-telemetry-consents",
+      "GET /api/v1/device/telemetry/v1.1/day-manifests",
+      "POST /api/v1/device/telemetry/v1.1/day-manifests",
+      "POST /api/v1/me/telemetry-v11/domain-predecessor",
+      "POST /api/v1/me/telemetry-v11/domain-activate",
+    ]);
+    const envelopes = createContributionEnvelopeRegistry([intake.envelopeRegistration]);
     const v11Handler = envelopes.resolve("telemetry-envelope-v1.1");
     assert.equal(typeof v11Handler, "function");
     assert.deepEqual(envelopes.schemaVersions, ["telemetry-envelope-v1.1"]);
