@@ -19,7 +19,10 @@
 //   - v1.0: runIncrementalContributionSyncOnce
 //     (src/contribution-incremental-sync.js) over a real local unified index,
 //     which reads the sync cursor, authorizes each chunk with the shipped
-//     three-key body and uploads the real encrypted v1.0 envelope.
+//     three-key body and uploads the real encrypted v1.0 envelope;
+//   - v0.1: syncPreparedContributionEntryOnce (src/contribution-device-sync.js),
+//     which encrypts a prepared v0.1 contribution with the shipped envelope
+//     builder, authorizes it with the three-key body and uploads it.
 // Re-runs and re-uploads prove idempotence; unregistered envelope versions
 // keep the origin's pre-change refusal byte for byte.
 //
@@ -48,6 +51,7 @@ import {
   outcomeOrdinal,
   reasoningEffortOrdinal,
   runIncrementalContributionSyncOnce,
+  syncPreparedContributionEntryOnce,
 } from "../test/helpers/contribution-shipped-client.js";
 
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
@@ -599,6 +603,145 @@ test("the shipped v1.0 sync engine authorizes with three keys, uploads through t
   }
 }));
 
+// d43c8f92 handleContribution meters POST /api/v1/contributions with the
+// upload-ingress limiters and the per-device chunk windows only; the
+// device_sync attempt limiter (RECOVERY: 20 per 60 s on one global key)
+// meters the authenticated sync reads. More chunks than two RECOVERY windows
+// hold must therefore all be admitted in one pass of the shipped engine.
+const BACKFILL_DAYS = 45;
+
+test("a shipped v1.0 backfill posts every chunk in one pass: contributions never draw the device-sync attempt limiter", {
+  skip: !PG_TEST_SOCKET, timeout: 300_000,
+}, () => withOrigin(async (origin) => {
+  const { base, t, fetchImpl, exchanges } = origin;
+  const owner = await socialOwner(origin, {
+    participantId: `synthetic-intake-backfill-${randomBytes(4).toString("hex")}`,
+    pairingConsent: { consentVersion: V1_CONSENT.privacyContractVersion,
+      transportConsentVersion: V1_CONSENT.privacyContractVersion },
+  });
+  await base.query(`INSERT INTO ${t("telemetry_v1_device_consents")} (participant_id, device_id,
+      telemetry_schema_version, field_dictionary_version, privacy_contract_version, consented_at)
+    VALUES ($1, $2, $3, $4, $5, $6)`, [owner.participantId, owner.deviceId, V1_CONSENT.telemetrySchemaVersion,
+    V1_CONSENT.fieldDictionaryVersion, V1_CONSENT.privacyContractVersion, new Date().toISOString()]);
+  const directory = await mkdtemp(join(tmpdir(), "intake-v1-backfill-"));
+  try {
+    const indexFile = join(directory, "index.sqlite");
+    const firstDay = Date.parse("2026-08-16T00:00:00.000Z");
+    await writeUnifiedIndex(indexFile, Array.from({ length: BACKFILL_DAYS }, (_, index) => {
+      const eventKey = Buffer.alloc(32, 0);
+      eventKey.writeUInt32BE(index + 1, 28);
+      return { eventKey, observedAtMs: firstDay + index * DAY_MS + 1_000, tokens: 10 + index };
+    }));
+    const result = await runIncrementalContributionSyncOnce({
+      indexFile, origin: ORIGIN, backend: {}, fetchImpl,
+      withDeviceSecret: async ({ expectedOrigin, operation }) =>
+        operation(owner.secret, { origin: expectedOrigin, deviceId: owner.deviceId }),
+    });
+    assert.equal(result.status, "complete", JSON.stringify(result.failure));
+    assert.equal(result.chunksUploaded, BACKFILL_DAYS);
+    assert.equal(result.acknowledgedThroughDay, "2026-09-29");
+    const uploads = exchanges.filter((exchange) => exchange.path === CONTRIBUTIONS_PATH);
+    assert.equal(uploads.length, BACKFILL_DAYS);
+    assert.ok(uploads.every((exchange) => exchange.status === 202), "every contribution was admitted");
+    // The RECOVERY buckets counted the sync reads and nothing else.
+    const syncReads = exchanges.filter((exchange) => exchange.path.startsWith("/api/v1/device/sync/")).length;
+    assert.ok(syncReads >= 1);
+    const recovery = (await base.query(`SELECT COALESCE(sum(used_count), 0)::int AS used
+      FROM ${t("postgres_rate_limit_buckets")} WHERE limiter_name = 'RECOVERY'`)).rows[0].used;
+    assert.ok(recovery <= syncReads, `${recovery} device-sync attempts for ${syncReads} sync reads`);
+    assert.equal((await base.query(`SELECT count(*)::int AS n FROM ${t("telemetry_v1_chunks")}
+      WHERE participant_id = $1`, [owner.participantId])).rows[0].n, BACKFILL_DAYS);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}));
+
+/** A synthetic v0.1 contribution (the IN-3 spec's fixture shape): one usage event, one quota snapshot. */
+function v01Contribution() {
+  const toolClassCounts = {
+    webSearch: 1, fileSearch: 0, codeInterpreter: 0, hostedShell: 0, computerUse: 0, mcp: 0,
+    applyPatch: 1, localShell: 2, subagent: 0, toolGateway: 1, other: 0, unknown: 0,
+  };
+  return {
+    schemaVersion: "telemetry-contribution-v0.1", synthetic: false, createdAt: "2026-07-25T13:00:00.000Z",
+    coveredAt: { startAt: "2026-07-25T12:00:00.000Z", endAt: "2026-07-25T12:30:00.000Z" },
+    clientPlatform: "macos", providerPolicyEpoch: "openai_agentic_pool_2026_07_09",
+    usageEvents: [{
+      schemaVersion: "usage-event-v0.1", eventTime: "2026-07-25T12:05:00.000Z", provider: "openai_codex",
+      modelId: "gpt-5.6-sol", modelRecognition: "recognized", modelFingerprint: null,
+      billingSurface: "chatgpt_subscription", speedMode: "fast", apiServiceTier: "priority", reasoningEffort: "xhigh",
+      components: {
+        inputUncachedTokens: 100, inputCacheReadTokens: 900, inputCacheWriteTokens: 0, inputCacheWrite5mTokens: null,
+        inputCacheWrite1hTokens: null, outputTextTokens: 50, outputReasoningTokens: 25, outputCombinedTokens: null,
+      },
+      totalInputContextTokens: 1000, surface: "local_interactive_unclassified", agentScope: "root",
+      lineageDisposition: "standalone", toolClassCounts, outcome: "completed", eventId: `event:v2:${"a".repeat(64)}`,
+      accounting: { estimatedApiCostUsd: "1.000000", pricingCoveragePercent: 100, unknownBillableUnits: 0,
+        priceBasis: "current_api_prices" },
+    }],
+    quotaSnapshots: [{
+      schemaVersion: "quota-snapshot-v0.1", observedTime: "2026-07-25T12:10:00.000Z",
+      receivedTime: "2026-07-25T12:10:01.000Z", provider: "openai_codex", planType: "pro", planVariant: "pro-20x",
+      limitId: "codex", slot: "seven_day", usedPercent: 31, displayPrecision: 0, windowDurationMinutes: 10080,
+      resetsAt: "2026-07-31T12:00:00.000Z", snapshotSource: "rollout", providerSurface: "account_shared_unallocated",
+      snapshotId: `snapshot:v2:${"a".repeat(64)}`,
+    }],
+    activityMarkers: [],
+    accounting: { estimatedApiCostUsd: "1.000000", pricedEventCoveragePercent: 100, unknownModelEventCount: 0,
+      unknownBillableUnits: 0, priceBasis: "current_api_prices" },
+  };
+}
+
+test("a shipped v0.1 client uploads a prepared contribution through the composed v0.1 envelope, then replays", {
+  skip: !PG_TEST_SOCKET, timeout: 300_000,
+}, () => withOrigin(async (origin) => {
+  const { base, t, fetchImpl, exchanges, store } = origin;
+  // A social participant at the rank-1 transport floor, as the v1.0 case.
+  const owner = await socialOwner(origin, {
+    participantId: `synthetic-intake-v01-${randomBytes(4).toString("hex")}`,
+    pairingConsent: { consentVersion: V1_CONSENT.privacyContractVersion,
+      transportConsentVersion: V1_CONSENT.privacyContractVersion },
+  });
+  const sync = () => syncPreparedContributionEntryOnce({
+    directory: "synthetic-prepared-set", entry: { basename: "synthetic-v01.json" }, origin: ORIGIN, backend: {},
+    fetchImpl, cryptoImpl: webcrypto, loadContribution: async () => v01Contribution(),
+    withDeviceSecret: async ({ expectedOrigin, operation }) =>
+      operation(owner.secret, { origin: expectedOrigin, deviceId: owner.deviceId }),
+  });
+  const first = await sync();
+  assert.equal(first.status, "accepted");
+  assert.match(first.contributionId, /^contribution:[0-9a-f-]{36}$/u);
+  const authorization = exchanges.find((exchange) => exchange.path === UPLOAD_AUTHORIZATIONS_PATH);
+  assert.equal(authorization.status, 201);
+  assert.equal(Object.keys(JSON.parse(authorization.body)).sort().join(), "contentLengthBytes,contentType,envelopeDigest");
+  const upload = exchanges.find((exchange) => exchange.path === CONTRIBUTIONS_PATH);
+  assert.equal(upload.status, 202);
+  assert.equal(JSON.parse(upload.body).schemaVersion, "telemetry-envelope-v0.1");
+
+  // The v0.1 admitter wrote the v0.1 rows; no typed v1.0 chunk exists.
+  const rows = async () => (await base.query(`SELECT
+      (SELECT count(*)::int FROM ${t("telemetry_contributions")} WHERE participant_id = $1) AS contributions,
+      (SELECT count(*)::int FROM ${t("telemetry_records")} WHERE participant_id = $1) AS records,
+      (SELECT COALESCE(sum(accepted_count), 0)::int FROM ${t("telemetry_contribution_admission_windows")}
+        WHERE participant_id = $1) AS admitted,
+      (SELECT count(*)::int FROM ${t("telemetry_v1_chunks")} WHERE participant_id = $1) AS v1Chunks`,
+  [owner.participantId])).rows[0];
+  assert.deepEqual(await rows(), { contributions: 1, records: 2, admitted: 1, v1chunks: 0 });
+  const contribution = (await base.query(`SELECT id, r2_key FROM ${t("telemetry_contributions")}
+    WHERE participant_id = $1`, [owner.participantId])).rows[0];
+  assert.equal(contribution.id, first.contributionId);
+  assert.equal(store.objects.get(contribution.r2_key), upload.body);
+
+  // Re-uploading the exact envelope under a fresh three-key authorization replays it.
+  const replay = await reupload(fetchImpl, owner.deviceAuthorization, upload.body);
+  assert.equal(replay.status, 202);
+  assert.equal(replay.headers.get("idempotency-replayed"), "true");
+  const receipt = await replay.json();
+  assert.deepEqual([receipt.contributionId, receipt.status, receipt.replayed], [first.contributionId, "accepted", true]);
+  assert.deepEqual(await rows(), { contributions: 1, records: 2, admitted: 1, v1chunks: 0 });
+  assert.deepEqual(await grantStates(base, t, owner.participantId), [{ state: "consumed", n: 2 }]);
+}));
+
 async function withPinnedRequestId(work) {
   const webCrypto = globalThis.crypto;
   const original = webCrypto.randomUUID;
@@ -649,9 +792,15 @@ test("unregistered envelope versions keep the pre-change refusal byte for byte; 
     assert.equal(refused.status, 403, telemetrySchemaVersion);
     assert.equal((await refused.json()).error.code, "TELEMETRY_TRANSPORT_BLOCKED");
   }
-  // The v1.1 routes answer a wrong method with the Worker registry's 405.
-  const wrongMethod = await fetchImpl(new URL("/api/v1/me/telemetry-v11/domain-activate", ORIGIN), { method: "GET" });
-  assert.equal(wrongMethod.status, 405);
-  assert.equal(wrongMethod.headers.get("allow"), "POST");
+  // The v1.1 routes, and the shared upload-authorization and contributions
+  // routes, answer a wrong method with the Worker registry's 405 and Allow.
+  for (const path of ["/api/v1/me/telemetry-v11/domain-activate", UPLOAD_AUTHORIZATIONS_PATH, CONTRIBUTIONS_PATH]) {
+    for (const method of ["GET", "PUT", "DELETE", "OPTIONS"]) {
+      const wrongMethod = await fetchImpl(new URL(path, ORIGIN), { method });
+      assert.equal(wrongMethod.status, 405, `${method} ${path}`);
+      assert.equal(wrongMethod.headers.get("allow"), "POST", `${method} ${path}`);
+      assert.equal((await wrongMethod.json()).error.code, "METHOD_NOT_ALLOWED", `${method} ${path}`);
+    }
+  }
   assert.deepEqual(await grantStates(origin.base, origin.t, owner.participantId), []);
 }));

@@ -134,7 +134,7 @@ import {
   dispatchCloudRunHostRequest,
   isPrivatePostgresTestHost,
 } from "./postgres-test-dispatch.mjs";
-import { createOriginIntakeComposition } from "./origin-intake-composition.mjs";
+import { createOriginIntakeComposition, originIntakeServedInMode } from "./origin-intake-composition.mjs";
 import { Connector } from "@google-cloud/cloud-sql-connector";
 import { POSTGRES_RUNTIME_MIGRATIONS } from "../src/postgres-runtime-schema.ts";
 import { WORKER_ROUTE_POLICY } from "../src/route-registry.ts";
@@ -675,7 +675,9 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
       // v1.1, v1.0 and v0.1 envelopes with their upload-authorization
       // formats, the upload-authorization route module and the v1.1 routes,
       // all gated on the same migration receipts as the built-in routes.
-      const intake = createOriginIntakeComposition({
+      // Only the modes whose clients reach those routes compose it
+      // (ORIGIN_INTAKE_HOST_MODES); cloud-run-iam keeps its v1.2-only routes.
+      const intake = originIntakeServedInMode(postgresTestMode) ? createOriginIntakeComposition({
         adapters: {
           live: postgresTelemetryV11Live,
           bearer: postgresDeviceBearerAuth,
@@ -710,13 +712,13 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         sourceNamespace: backend.sourceIdentity.sourceNamespace,
         envelopePublicJwk,
         envelopePrivateJwk,
-      });
-      // Route modules may replace only the overridable built-ins. Every mode
-      // that serves the v1.2 routes mounts the intake's upload-authorization
-      // module; only a fastpath-test origin adds the analytics-v2 module.
+      }) : null;
+      // Route modules may replace only the overridable built-ins. A mode
+      // that composes the intake mounts its upload-authorization module; only
+      // a fastpath-test origin adds the analytics-v2 module.
       const routeModules = createOriginRouteModuleRegistry({
         modules: [
-          ...intake.routeModules,
+          ...(intake?.routeModules ?? []),
           ...(postgresTestMode === FASTPATH_TEST_MODE
             ? fastpathTestRouteModules({
               env: process.env,
@@ -755,9 +757,10 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
             const routeModule = routeModules.resolve(request.method, pathname);
             if (routeModule !== null) return routeModule.handler(request, routeModuleContext);
           }
-          // The v1.1 intake routes answer every method of their own paths on
-          // the private origin (a wrong method gets the Worker's 405).
-          if (origin === hostOrigin && intake.pathnames.includes(pathname)) {
+          // The intake answers every method of the v1.1 routes, and a wrong
+          // method on the shared legacy routes, on the private origin (the
+          // Worker's 405); it answers null for what the routes below serve.
+          if (intake !== null && origin === hostOrigin && intake.pathnames.includes(pathname)) {
             const response = await intake.dispatch(request);
             if (response !== null) return response;
           }
@@ -845,9 +848,9 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
           envelopePrivateJwk,
           readBoundedRequestBody,
           maxRequestBytes: MAX_REQUEST_BYTES,
-          contributionEnvelopes: intake.contributionEnvelopes,
-          uploadAuthorizationFormats: intake.uploadAuthorizationFormats,
-          recordPostgresDeviceUploadReceipt: intake.recordPostgresDeviceUploadReceipt,
+          contributionEnvelopes: intake?.contributionEnvelopes,
+          uploadAuthorizationFormats: intake?.uploadAuthorizationFormats,
+          recordPostgresDeviceUploadReceipt: intake?.recordPostgresDeviceUploadReceipt,
         })),
       };
     }

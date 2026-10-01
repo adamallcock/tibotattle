@@ -2,9 +2,9 @@
  * Legacy intake composition for the PostgreSQL origin (GCP fast path, the
  * IN-2 and IN-3 lead hand-offs).
  *
- * server.mjs builds this once at startup wherever it composes the v1.2
- * routes, and hands the result to createPostgresTestV12DayManifestDispatch
- * and to its route-module registry:
+ * server.mjs builds this once at startup in the host modes whose clients
+ * reach these routes (ORIGIN_INTAKE_HOST_MODES), and hands the result to
+ * createPostgresTestV12DayManifestDispatch and to its route-module registry:
  *
  * - contributionEnvelopes: telemetry-envelope-v1.1 (IN-2,
  *   envelopes/v11.mjs, ownsReceipt: true), telemetry-envelope-v1.0 and
@@ -32,8 +32,12 @@
  *   the route's own 405 with the Worker registry's Allow value; an allowed
  *   method first passes the same schema receipt check as every built-in
  *   route, so a stale or newer schema refuses with 503
- *   BACKEND_STORAGE_UNAVAILABLE before any v1.1 read or write. Any other
- *   path answers null and the caller's next route serves it.
+ *   BACKEND_STORAGE_UNAVAILABLE before any v1.1 read or write. pathnames
+ *   also lists the two shared legacy-intake routes (SHARED_LEGACY_PATHNAMES)
+ *   so that a wrong method on them gets the same registry 405; dispatch
+ *   answers null for their allowed method, which the built-in (or the
+ *   upload-authorization module) serves. Any other path answers null and the
+ *   caller's next route serves it.
  *
  * Every adapter is injected (the TypeScript modules server.mjs imports), so
  * this file opens no pool, reads no environment and picks no runtime
@@ -46,9 +50,37 @@ import { createTelemetryV10ContributionEnvelope } from "./envelopes/v10.mjs";
 import { legacyUploadAuthorizationFormatEntries } from "./upload-authorization-formats.mjs";
 import { createUploadAuthorizationRouteModule } from "./routes/upload-authorizations.mjs";
 import { createTelemetryV11OriginIntake } from "./routes/v11-composition.mjs";
-import { routeErrorResponse } from "./routes/v11-route-support.mjs";
+import { methodNotAllowed, routeErrorResponse } from "./routes/v11-route-support.mjs";
 
 const V12_UPLOAD_AUTHORIZATION_SCHEMA_VERSION = "telemetry-contribution-v1.2";
+
+/**
+ * The private-origin host modes that compose the legacy intake: those whose
+ * clients reach its routes directly (the loopback v1.2 host and the
+ * fast-path test origin). cloud-run-iam is left out: its only public ingress
+ * is cloud-run/oauth-gateway.mjs, whose closed route table carries none of
+ * the v1.1 routes, GET /api/v1/device/sync-capabilities or GET
+ * /api/v1/envelope-key, so no shipped legacy client can complete a pass
+ * there, and composing the intake would only change that service's
+ * reachable v1.2 upload-authorization route.
+ */
+export const ORIGIN_INTAKE_HOST_MODES = Object.freeze(["health-and-v12-day-manifest", "fastpath-test"]);
+
+/** Whether server.mjs composes the legacy intake for a POSTGRES_TEST_HTTP_MODE. */
+export function originIntakeServedInMode(mode) {
+  return ORIGIN_INTAKE_HOST_MODES.includes(mode);
+}
+
+/**
+ * Legacy-intake routes the v1.2 dispatch already serves for their allowed
+ * method. d43c8f92 answers any other method with the registry's 405 and
+ * Allow (assertWorkerRouteMethod); the v1.2 dispatch alone would answer 503
+ * not_ready, which a client reads as retryable.
+ */
+const SHARED_LEGACY_PATHNAMES = Object.freeze([
+  "/api/v1/device/upload-authorizations",
+  "/api/v1/contributions",
+]);
 
 /** The legacy formats this origin authorizes: each pairs with a registered envelope. */
 export const ORIGIN_INTAKE_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS = Object.freeze([
@@ -192,8 +224,10 @@ export function createOriginIntakeComposition(options) {
     createDeviceUploadAuthorization: uploadAuthorization.createPostgresDeviceUploadAuthorization,
   });
 
+  const pathnames = Object.freeze([...v11.pathnames, ...SHARED_LEGACY_PATHNAMES]);
+  const sharedPathnames = new Set(SHARED_LEGACY_PATHNAMES);
   const allowedMethods = new Map();
-  for (const pathname of v11.pathnames) {
+  for (const pathname of pathnames) {
     const policy = options.routePolicy.find((entry) => entry?.pathname === pathname);
     if (!policy || (policy.methods !== "all" && !Array.isArray(policy.methods))) {
       throw compositionError(pathname + " is not a route in the Worker route registry");
@@ -206,9 +240,12 @@ export function createOriginIntakeComposition(options) {
     try { ({ pathname } = new URL(request.url)); } catch { return null; }
     const methods = allowedMethods.get(pathname);
     if (methods === undefined) return null;
+    const allowed = methods === "all" || methods.includes(request.method);
+    // A shared legacy route: the registry's 405 here, the built-in otherwise.
+    if (sharedPathnames.has(pathname)) return allowed ? null : routeErrorResponse(methodNotAllowed(methods));
     // A wrong method keeps the route's own 405; an allowed one is served
     // only against current migration receipts, like every built-in route.
-    if (methods === "all" || methods.includes(request.method)) {
+    if (allowed) {
       try {
         await assertStorageCurrent();
       } catch (error) {
@@ -223,7 +260,7 @@ export function createOriginIntakeComposition(options) {
     uploadAuthorizationFormats: legacyFormats,
     recordPostgresDeviceUploadReceipt: legacyAdmission.recordPostgresDeviceUploadReceipt,
     routeModules: Object.freeze([uploadAuthorizations]),
-    pathnames: v11.pathnames,
+    pathnames,
     dispatch,
   });
 }

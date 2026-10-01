@@ -1738,9 +1738,14 @@ function createPostgresTestV12ContributionHandler({
  * bounded body, fatal UTF-8 JSON; the envelope's registered pre-claim check
  * (an unregistered version gets the v1.2-only origin's refusal, before any
  * claim); then the upload-authorization claim, the claimed principal and
- * participant, the device_sync attempt limit, the processing control, the
- * deletion tombstone and the format's transport floor. Only then does the
- * registered handler run. After it returns, the preamble records the receipt
+ * participant, the processing control, the deletion tombstone and the
+ * format's transport floor. Only then does the registered handler run. As in
+ * d43c8f92 handleContribution, no upload draws the device_sync attempt
+ * limiter (RECOVERY, one global 20-per-minute key shared with every sync
+ * read): production meters this route with the upload-ingress limiters and
+ * the per-device chunk windows, and a shipped client reads 429
+ * ATTEMPT_LIMIT_REACHED here as a service failure that stalls its backfill.
+ * After the handler returns, the preamble records the receipt
  * against the response's contributionId (d43c8f92 handleContribution's
  * recordDeviceUploadReceipt), unless the registration owns its receipt.
  * Until the handler marks its persist started, any failure abandons the
@@ -1753,8 +1758,6 @@ async function handlePostgresTestContribution({
   primaryPool,
   ledgerPool,
   schema,
-  admissionEnv,
-  assertAttemptAllowed,
   hasPostgresDeletionTombstone,
   claimPostgresDeviceUploadAuthorization,
   abandonPostgresDeviceUploadAuthorization,
@@ -1836,13 +1839,6 @@ async function handlePostgresTestContribution({
       primaryPool, schema.primarySchema, claim, envelopeDigest, bodyBytes,
     );
     principal = claimed.principal;
-    await assertAttemptAllowed(
-      admissionEnv.RECOVERY_RATE_LIMIT,
-      admissionEnv.CLIENT_ATTEMPT_RATE_LIMIT,
-      request,
-      admissionEnv,
-      "device_sync",
-    );
     await assertPostgresProcessingEnabled(primaryPool, schema.primarySchema);
     if (await hasPostgresDeletionTombstone(
       ledgerPool, principal.participantId, Date.now(), { schema },
@@ -2536,8 +2532,6 @@ export function createPostgresTestV12DayManifestDispatch({
           primaryPool,
           ledgerPool,
           schema,
-          admissionEnv,
-          assertAttemptAllowed,
           hasPostgresDeletionTombstone,
           claimPostgresDeviceUploadAuthorization,
           abandonPostgresDeviceUploadAuthorization,
