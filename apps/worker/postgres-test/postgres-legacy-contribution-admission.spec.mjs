@@ -2454,6 +2454,7 @@ test("PG17 through the landed origin dispatch: a shipped client authorizes with 
     ENVIRONMENT: "test", ENROLLMENT_RATE_LIMIT: allowAll(), RECOVERY_RATE_LIMIT: allowAll(),
     CLIENT_ATTEMPT_RATE_LIMIT: allowAll(), PUBLIC_READ_RATE_LIMIT: allowAll(),
     UPLOAD_AUTHORIZATION_RATE_LIMIT: allowAll(), UPLOAD_PRINCIPAL_RATE_LIMIT: allowAll(),
+    UPLOAD_INGRESS_REQUEST_RATE_LIMIT: allowAll(), UPLOAD_INGRESS_CLIENT_RATE_LIMIT: allowAll(),
   });
   const mustNotCall = (name) => async () => { throw new Error(`${name} must not be called`); };
   const assertV12UploadAllowed = (formatPool, device, nowEpoch, { schema: formatSchema }) =>
@@ -2473,6 +2474,8 @@ test("PG17 through the landed origin dispatch: a shipped client authorizes with 
     assertAttemptAllowed: workerAdmission.assertAttemptAllowed,
     assertUploadAuthorizationBindings: workerAdmission.assertUploadAuthorizationBindings,
     assertUploadAuthorizationAllowed: workerAdmission.assertUploadAuthorizationAllowed,
+    // d43c8f92 index.ts:3342: the contributions route's ingress limiter.
+    assertUploadIngressRequestAllowed: workerAdmission.assertUploadIngressRequestAllowed,
     authenticatePostgresDevice: transport.authenticatePostgresDevice,
     disconnectPostgresAuthenticatedDevice: mustNotCall("disconnectPostgresAuthenticatedDevice"),
     hasPostgresDeletionTombstone: ledgerAuthority.hasPostgresDeletionTombstone,

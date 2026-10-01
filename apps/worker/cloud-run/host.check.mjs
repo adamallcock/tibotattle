@@ -2432,6 +2432,8 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
       ["PUBLIC_READ_RATE_LIMIT", "PUBLIC_READ", 1_000],
       ["UPLOAD_AUTHORIZATION_RATE_LIMIT", "UPLOAD_AUTHORIZATION", 1_000],
       ["UPLOAD_PRINCIPAL_RATE_LIMIT", "UPLOAD_PRINCIPAL", 1_000],
+      ["UPLOAD_INGRESS_REQUEST_RATE_LIMIT", "UPLOAD_INGRESS_REQUEST", 1_000],
+      ["UPLOAD_INGRESS_CLIENT_RATE_LIMIT", "UPLOAD_INGRESS_CLIENT", 1_000],
     ]) {
       admissionEnv[binding] = rateLimit.createPostgresRateLimiter(primaryPool, {
         primarySchema,
@@ -2500,6 +2502,7 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
       },
       assertUploadAuthorizationBindings: admission.assertUploadAuthorizationBindings,
       assertUploadAuthorizationAllowed: admission.assertUploadAuthorizationAllowed,
+      assertUploadIngressRequestAllowed: admission.assertUploadIngressRequestAllowed,
       authenticatePostgresDevice: transport.authenticatePostgresDevice,
       disconnectPostgresAuthenticatedDevice:
         postgresDeviceDisconnectAdapter.disconnectPostgresAuthenticatedDevice,
@@ -2976,8 +2979,21 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
     await assertApiError(await dispatch(request({ headers: { "content-type": "text/plain" } })), 415, "CONTENT_TYPE_INVALID");
     await assertApiError(await dispatch(request({ body: " ".repeat(constants.MAX_REQUEST_BYTES + 1) })), 413, "BODY_TOO_LARGE");
     const chunkUploadUrl = "http://127.0.0.1:43817/api/v1/contributions";
-    await assertApiError(await dispatch(request({ url: chunkUploadUrl, body: " ".repeat(constants.MAX_REQUEST_BYTES + 1) })), 413, "BODY_TOO_LARGE");
-    await assertApiError(await dispatch(request({ url: chunkUploadUrl, headers: { cookie: "session=not-used" } })), 401, "DEVICE_AUTH_INVALID");
+    // An oversize body behind a well-formed Upload header passes the d43c8f92
+    // preflight (index.ts:621-644, which a Device bearer fails with 401) and
+    // the ingress limiter, then the bounded read refuses it.
+    const wellFormedUpload = `Upload um_device_upload_${randomUUID()}.${"A".repeat(43)}`;
+    await assertApiError(await dispatch(request({
+      url: chunkUploadUrl, headers: { authorization: wellFormedUpload },
+      body: " ".repeat(constants.MAX_REQUEST_BYTES + 1),
+    })), 413, "BODY_TOO_LARGE");
+    // d43c8f92 contributionRequestPreflight (index.ts:621-644): only the
+    // session cookie is refused, and a Device bearer fails the Upload shape.
+    await assertApiError(await dispatch(request({ url: chunkUploadUrl, headers: { cookie: "session=not-used" } })), 401, "UPLOAD_AUTH_INVALID");
+    await assertApiError(await dispatch(request({
+      url: chunkUploadUrl,
+      headers: { cookie: "__Host-usage_monitor_session=not-used", authorization: `Upload um_device_upload_${randomUUID()}.${"A".repeat(43)}` },
+    })), 401, "UPLOAD_AUTH_INVALID");
     await assertApiError(await dispatch(request({ body: "{}" })), 400, "TELEMETRY_MANIFEST_INVALID");
     // The shipped client asks for its predecessor before it registers any
     // day. With nothing ready yet the range is seeded with the current day.
@@ -3705,8 +3721,9 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
       });
 
     await assertApiError(await dispatch(enrollmentHttp(undefined, {}, "GET")), 405, "METHOD_NOT_ALLOWED");
+    // d43c8f92 index.ts:710 refuses the browser session cookie, not any cookie.
     await assertApiError(await dispatch(enrollmentHttp(accountlessEnrollmentJson, {
-      cookie: "session=synthetic",
+      cookie: "other=1; __Host-usage_monitor_session=synthetic",
     })), 401, "AUTH_INVALID");
     await assertApiError(await dispatch(enrollmentHttp(JSON.stringify({
       ...accountlessEnrollmentBody, unexpected: true,
@@ -3970,7 +3987,8 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
 
     await assertApiError(await dispatch(renewalHttp(undefined, {}, "GET")),
       405, "METHOD_NOT_ALLOWED");
-    await assertApiError(await dispatch(renewalHttp(renewalJson, { cookie: "session=synthetic" })),
+    // d43c8f92 index.ts:842 refuses the browser session cookie, not any cookie.
+    await assertApiError(await dispatch(renewalHttp(renewalJson, { cookie: "__Host-usage_monitor_session=synthetic" })),
       401, "AUTH_INVALID");
     await assertApiError(await dispatch(renewalHttp(JSON.stringify({
       ...renewalBody, unexpected: true,

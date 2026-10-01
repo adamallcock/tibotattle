@@ -29,8 +29,10 @@ import { grantPostgresTelemetryV12Consent } from "../src/postgres-telemetry-v12-
 import {
   assertAdmissionBindings,
   assertAttemptAllowed,
+  assertPublicAggregateReadAllowed,
   assertUploadAuthorizationAllowed,
   assertUploadAuthorizationBindings,
+  assertUploadIngressRequestAllowed,
 } from "../src/admission.ts";
 import { MAX_REQUEST_BYTES, TELEMETRY_CONSENT_VERSION } from "../src/constants.ts";
 import { readBoundedRequestBody } from "../src/bounded-body.ts";
@@ -149,6 +151,18 @@ import {
   fastpathTestRouteModules,
 } from "./origin-fastpath-mode.mjs";
 import { createAnalyticsV2CommunityDailyRoute } from "../src/analytics-v2/community-daily-route.ts";
+import { createEdgeAdmissionLimiters } from "./postgres-edge-admission-limiters.mjs";
+import {
+  EDGE_TEST_PUBLIC_ORIGIN,
+  EdgeTestBoundaryRefusal,
+  composeEdgeTestOrigin,
+  edgeTestAdmissionEnv,
+  edgeTestRequestFromNode,
+  isEdgeOriginBoundaryRefusal,
+  isEdgeTestCloudListen,
+  readEdgeTestOriginConfiguration,
+  writeEdgeTestBoundaryRefusal,
+} from "./origin-edge-test-mode.mjs";
 import {
   buildPublicGoogleRequestUrl,
   buildRequestUrl,
@@ -249,7 +263,19 @@ function postgresTestHttpMode() {
   }
   return mode;
 }
-function privatePostgresTestHostConfiguration(mode) {
+function privatePostgresTestHostConfiguration(mode, edgeTestOrigin = null) {
+  if (edgeTestOrigin !== null) {
+    // EDGE_ORIGIN_MODE=edge-test (origin-edge-test-mode.mjs) validated the
+    // listen pair: loopback exactly as below, or the pinned Cloud Run pair.
+    const { host, port, hostOrigin } = edgeTestOrigin.listen;
+    return Object.freeze({
+      listenHost: host,
+      port,
+      hostOrigin,
+      mode,
+      requestOriginAllowlist: createRequestOriginAllowlist({ publicHostOrigin: hostOrigin }),
+    });
+  }
   if (mode === "cloud-run-iam") {
     const listenHost = optional("HOST");
     const configuredPort = optional("PORT");
@@ -437,8 +463,12 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
   if (!databaseOnly && !postgresTestHttpEnabled && !isPostgresWorkerRequestPathSupported()) {
     configurationError("POSTGRES_WORKER_REQUEST_PATH_UNSUPPORTED");
   }
+  // EDGE_ORIGIN_MODE alone never enables a request path: it is read after the
+  // refusal above and is refused outside fastpath-test.
+  const edgeTestOrigin = databaseOnly
+    ? null : readEdgeTestOriginConfiguration(process.env, { postgresTestMode });
   const privateHost = postgresTestHttpEnabled
-    ? privatePostgresTestHostConfiguration(postgresTestMode) : null;
+    ? privatePostgresTestHostConfiguration(postgresTestMode, edgeTestOrigin) : null;
   const hostOrigin = databaseOnly ? null : privateHost?.hostOrigin ?? configuredHostOrigin();
   const publicOrigin = databaseOnly ? undefined : postgresTestHttpEnabled
     ? privateHost?.publicOrigin : configuredPublicOrigin();
@@ -535,7 +565,11 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         undefined,
         cloudRunIamResources?.historyProof ?? gcsHistoryProof(),
       );
-      const admissionEnv = {
+      // In edge-test the six edge-tier bindings replay the edge's outcome
+      // (EP-6) and every privateOrigin is the public origin EP-6 rebuilds on.
+      const edgeAdmission = edgeTestOrigin === null ? null : createEdgeAdmissionLimiters();
+      const dispatchOrigin = edgeTestOrigin === null ? hostOrigin : EDGE_TEST_PUBLIC_ORIGIN;
+      const originAdmissionEnv = {
         ENVIRONMENT: optional("ENVIRONMENT", "synthetic-development"),
         ENROLLMENT_MODE: optional("ENROLLMENT_MODE", "disabled"),
         IDENTITY_LINK_SECRET: optional("IDENTITY_LINK_SECRET"),
@@ -547,16 +581,19 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         ACCOUNTLESS_OWNERSHIP_MODE: optional("ACCOUNTLESS_OWNERSHIP_MODE", "disabled"),
       };
       for (const definition of RATE_LIMIT_BINDINGS) {
-        admissionEnv[definition[0]] = rateLimitBinding(
+        originAdmissionEnv[definition[0]] = rateLimitBinding(
           primaryPool, schemaOptions, rateLimitSecret, definition,
         );
       }
+      const admissionEnv = edgeAdmission === null
+        ? originAdmissionEnv
+        : edgeTestAdmissionEnv(originAdmissionEnv, edgeAdmission);
       const healthDispatch = createPostgresTestHealthDispatch({
         primaryPool,
         ledgerPool,
         schemaOptions,
         expectedMigrations: POSTGRES_RUNTIME_MIGRATIONS,
-        privateOrigin: hostOrigin,
+        privateOrigin: dispatchOrigin,
       });
       const googleOrigin = publicOrigin ?? hostOrigin;
       const googleHealthDispatch = publicOrigin === undefined
@@ -574,7 +611,7 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         sourceIdentity: backend.sourceIdentity,
         readPostgresPublishedCommunityDaily,
         healthDispatch,
-        privateOrigin: hostOrigin,
+        privateOrigin: dispatchOrigin,
       });
       const participantDevicesDispatch = createPostgresTestParticipantDevicesDispatch({
         primaryPool,
@@ -588,7 +625,7 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         maxRequestBytes: MAX_REQUEST_BYTES,
         hasPostgresDeletionTombstone,
         healthDispatch,
-        privateOrigin: hostOrigin,
+        privateOrigin: dispatchOrigin,
       });
       const personalSessionDispatch = createPostgresTestPersonalSessionDispatch({
         primaryPool,
@@ -600,7 +637,7 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         hasPostgresDeletionTombstone,
         healthDispatch,
         clearSessionCookie: clearedSessionCookie(),
-        privateOrigin: hostOrigin,
+        privateOrigin: dispatchOrigin,
       });
       const devicePairingDispatch = createPostgresTestDevicePairingDispatch({
         primaryPool,
@@ -615,7 +652,7 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         readBoundedRequestBody,
         maxRequestBytes: MAX_REQUEST_BYTES,
         admissionEnv,
-        privateOrigin: hostOrigin,
+        privateOrigin: dispatchOrigin,
       });
       const devicePairingClaimDispatch = createPostgresTestDevicePairingClaimDispatch({
         primaryPool,
@@ -625,7 +662,7 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         healthDispatch,
         readBoundedRequestBody,
         maxRequestBytes: MAX_REQUEST_BYTES,
-        privateOrigin: hostOrigin,
+        privateOrigin: dispatchOrigin,
       });
       const telemetryV12ConsentDispatch = createPostgresTestTelemetryV12ConsentDispatch({
         primaryPool,
@@ -638,7 +675,7 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         healthDispatch,
         readBoundedRequestBody,
         maxRequestBytes: MAX_REQUEST_BYTES,
-        privateOrigin: hostOrigin,
+        privateOrigin: dispatchOrigin,
       });
       const googleHandoffDispatch = postgresTestMode === "cloud-run-iam"
         ? createPostgresGoogleHandoffDispatch({
@@ -727,12 +764,22 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
               createAnalyticsV2CommunityDailyRoute:
                 dependencies.createAnalyticsV2CommunityDailyRoute ?? null,
               clock: dependencies.analyticsV2Clock ?? null,
+              // d43c8f92 index.ts:3979 handleCommunityDaily: the public-read
+              // limiter (PostgreSQL, or the edge's replayed outcome).
+              assertPublicReadAllowed: (request) => assertPublicAggregateReadAllowed(
+                admissionEnv.PUBLIC_READ_RATE_LIMIT, request, admissionEnv,
+              ),
             })
             : []),
         ],
         routePolicy: WORKER_ROUTE_POLICY,
       });
-      const routeModuleContext = Object.freeze({ origin: hostOrigin, hostMode: privateHost.mode });
+      const routeModuleContext = Object.freeze({ origin: dispatchOrigin, hostMode: privateHost.mode });
+      const edgeTestDispatch = (inner) => (edgeTestOrigin === null ? inner : composeEdgeTestOrigin({
+        configuration: edgeTestOrigin,
+        admission: edgeAdmission,
+        inner,
+      }));
       return {
         pools,
         connector,
@@ -746,21 +793,25 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         listenHost: privateHost.listenHost,
         listenPort: privateHost.port,
         postgresTestHostMode: privateHost.mode,
-        postgresTestDispatch: ((v12Dispatch) => async (request) => {
+        ...(edgeTestOrigin === null ? {} : {
+          edgeTestOrigin,
+          edgeTestRequestFromNode: (req, res) => edgeTestRequestFromNode(req, res, { hostOrigin }),
+        }),
+        postgresTestDispatch: edgeTestDispatch(((v12Dispatch) => async (request) => {
           let pathname;
           let origin;
           try { ({ pathname, origin } = new URL(request.url)); } catch { /* V12 dispatch returns a safe 503. */ }
           // Non-overridable paths never reach a module. On an overridable
           // path a module registered for the exact method and private origin
           // answers first; otherwise the built-in below serves it unchanged.
-          if (origin === hostOrigin && ORIGIN_OVERRIDABLE_BUILT_INS.includes(pathname)) {
+          if (origin === dispatchOrigin && ORIGIN_OVERRIDABLE_BUILT_INS.includes(pathname)) {
             const routeModule = routeModules.resolve(request.method, pathname);
             if (routeModule !== null) return routeModule.handler(request, routeModuleContext);
           }
           // The intake answers every method of the v1.1 routes, and a wrong
           // method on the shared legacy routes, on the private origin (the
           // Worker's 405); it answers null for what the routes below serve.
-          if (intake !== null && origin === hostOrigin && intake.pathnames.includes(pathname)) {
+          if (intake !== null && origin === dispatchOrigin && intake.pathnames.includes(pathname)) {
             const response = await intake.dispatch(request);
             if (response !== null) return response;
           }
@@ -814,13 +865,14 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
             maxRequestBytes: POSTGRES_DEVICE_CREDENTIAL_RENEWAL_MAX_REQUEST_BYTES,
           }),
           expectedMigrations: POSTGRES_RUNTIME_MIGRATIONS,
-          privateOrigin: hostOrigin,
+          privateOrigin: dispatchOrigin,
           healthDispatch,
           admissionEnv,
           assertAdmissionBindings,
           assertAttemptAllowed,
           assertUploadAuthorizationBindings,
           assertUploadAuthorizationAllowed,
+          assertUploadIngressRequestAllowed,
           assertPostgresV12UploadAllowed,
           createPostgresDeviceUploadAuthorization,
           authenticatePostgresDevice,
@@ -851,7 +903,7 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
           contributionEnvelopes: intake?.contributionEnvelopes,
           uploadAuthorizationFormats: intake?.uploadAuthorizationFormats,
           recordPostgresDeviceUploadReceipt: intake?.recordPostgresDeviceUploadReceipt,
-        })),
+        }))),
       };
     }
     const ingressBudget = createPostgresUploadIngressBudget(primaryPool, schemaOptions);
@@ -1006,15 +1058,34 @@ async function writeResponse(res, response) {
  * runtime with injected local pools; the entry point calls it from main().
  */
 export async function serve(runtime) {
+  const edgeTest = typeof runtime.edgeTestRequestFromNode === "function";
   const server = http.createServer(async (req, res) => {
     try {
-      const request = await requestFromNode(
-        req,
-        runtime.requestOriginAllowlist,
-        res,
-        runtime.publicOrigin,
-      );
+      let request;
+      if (edgeTest) {
+        // edge-test keeps the raw headers for EP-6; a refusal here, and EP-6's
+        // unmarked 421 below, end the socket without reading the body.
+        try {
+          request = runtime.edgeTestRequestFromNode(req, res);
+        } catch (error) {
+          if (!(error instanceof EdgeTestBoundaryRefusal)) throw error;
+          writeEdgeTestBoundaryRefusal(res);
+          return;
+        }
+      } else {
+        request = await requestFromNode(
+          req,
+          runtime.requestOriginAllowlist,
+          res,
+          runtime.publicOrigin,
+        );
+      }
       const response = await dispatchCloudRunHostRequest(request, runtime, handleRequest);
+      if (edgeTest && isEdgeOriginBoundaryRefusal(response)) {
+        await response.body?.cancel().catch(() => undefined);
+        writeEdgeTestBoundaryRefusal(res);
+        return;
+      }
       await writeResponse(res, response);
     } catch (error) {
       if (res.headersSent) {
@@ -1036,7 +1107,8 @@ export async function serve(runtime) {
         || port !== CLOUD_RUN_IAM_TEST_TARGET.port)) {
     configurationError("POSTGRES_TEST_CLOUD_RUN_IAM_CONFIGURATION_INVALID");
   }
-  if (postgresTestDispatch && host !== "127.0.0.1" && !cloudRunIamMode) {
+  if (postgresTestDispatch && host !== "127.0.0.1" && !cloudRunIamMode
+      && !isEdgeTestCloudListen(runtime.edgeTestOrigin, host, port, process.env)) {
     configurationError("POSTGRES_TEST_PRIVATE_HOST_REQUIRED");
   }
   try {

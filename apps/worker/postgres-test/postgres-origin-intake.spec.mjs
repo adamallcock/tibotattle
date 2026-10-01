@@ -89,6 +89,10 @@ const PRE_CHANGE_HEADERS = Object.freeze([
 ]);
 const PRE_CHANGE_ENVELOPE_INVALID_BODY =
   `{"error":{"code":"ENVELOPE_INVALID","requestId":"${PINNED_REQUEST_ID}"}}`;
+// Without an Upload-shaped bearer, d43c8f92 contributionRequestPreflight
+// refuses before the body is read (index.ts:638-641).
+const PREFLIGHT_UPLOAD_AUTH_INVALID_BODY =
+  `{"error":{"code":"UPLOAD_AUTH_INVALID","requestId":"${PINNED_REQUEST_ID}"}}`;
 
 let vite;
 let modules;
@@ -778,9 +782,10 @@ test("unregistered envelope versions keep the pre-change refusal byte for byte; 
           authorization === undefined ? {} : { authorization });
         return { status: response.status, headers: [...response.headers], text: await response.text() };
       });
-      assert.equal(answer.status, status, label);
+      assert.equal(answer.status, authorization === undefined ? 401 : status, label);
       assert.deepEqual(answer.headers, PRE_CHANGE_HEADERS, label);
-      assert.equal(answer.text, PRE_CHANGE_ENVELOPE_INVALID_BODY, label);
+      assert.equal(answer.text, authorization === undefined
+        ? PREFLIGHT_UPLOAD_AUTH_INVALID_BODY : PRE_CHANGE_ENVELOPE_INVALID_BODY, label);
     }
   }
   // d43c8f92 answers an unknown transport, and v0.2's blocked lifecycle, 403

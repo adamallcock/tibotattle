@@ -51,6 +51,11 @@ const PRE_CHANGE_HEADERS = Object.freeze([
 ]);
 const PRE_CHANGE_ENVELOPE_INVALID_BODY =
   `{"error":{"code":"ENVELOPE_INVALID","requestId":"${PINNED_REQUEST_ID}"}}`;
+// Without an Upload-shaped bearer, d43c8f92 contributionRequestPreflight
+// refuses before the body is read (index.ts:638-641); the pre-change body
+// above stays the answer for a well-formed bearer.
+const PREFLIGHT_UPLOAD_AUTH_INVALID_BODY =
+  `{"error":{"code":"UPLOAD_AUTH_INVALID","requestId":"${PINNED_REQUEST_ID}"}}`;
 const UNREGISTERED_ENVELOPES = Object.freeze([
   {
     label: "a v1.1 envelope with the six envelope keys",
@@ -556,7 +561,10 @@ test("(a) in fastpath-test a stub community-daily module overrides the built-in,
     );
     try {
       assert.equal(factoryCalls.length, 1);
-      assert.deepEqual(Object.keys(factoryCalls[0]).sort(), ["clock", "originMode", "pool", "schema"]);
+      assert.deepEqual(Object.keys(factoryCalls[0]).sort(),
+        ["assertPublicReadAllowed", "clock", "originMode", "pool", "schema"]);
+      // d43c8f92 index.ts:3979: the composition hands the route its public-read limiter.
+      assert.equal(typeof factoryCalls[0].assertPublicReadAllowed, "function");
       assert.equal(factoryCalls[0].pool, runtime.primaryPool);
       assert.equal(factoryCalls[0].schema, primarySchema);
       assert.equal(factoryCalls[0].originMode, "fastpath-test");
@@ -672,11 +680,14 @@ function contributionDispatch(m, { base, primarySchema, ledgerSchema }, override
       PUBLIC_READ_RATE_LIMIT: allowAll(),
       UPLOAD_AUTHORIZATION_RATE_LIMIT: allowAll(),
       UPLOAD_PRINCIPAL_RATE_LIMIT: allowAll(),
+      UPLOAD_INGRESS_REQUEST_RATE_LIMIT: allowAll(),
+      UPLOAD_INGRESS_CLIENT_RATE_LIMIT: allowAll(),
     }),
     assertAdmissionBindings: m.workerAdmission.assertAdmissionBindings,
     assertAttemptAllowed: m.workerAdmission.assertAttemptAllowed,
     assertUploadAuthorizationBindings: m.workerAdmission.assertUploadAuthorizationBindings,
     assertUploadAuthorizationAllowed: m.workerAdmission.assertUploadAuthorizationAllowed,
+    assertUploadIngressRequestAllowed: m.workerAdmission.assertUploadIngressRequestAllowed,
     authenticatePostgresDevice: mustNotCall("authenticatePostgresDevice"),
     disconnectPostgresAuthenticatedDevice: mustNotCall("disconnectPostgresAuthenticatedDevice"),
     hasPostgresDeletionTombstone: mustNotCall("hasPostgresDeletionTombstone"),
@@ -742,9 +753,10 @@ test("(c) an unregistered envelope version gets the pre-change status and body b
           ));
           const label = `${registryLabel}: ${envelope.label}`
             + (authorization === undefined ? " without a bearer" : " with a bearer");
-          assert.equal(observed.status, envelope.status, label);
+          assert.equal(observed.status, authorization === undefined ? 401 : envelope.status, label);
           assert.deepEqual(observed.headers, PRE_CHANGE_HEADERS, label);
-          assert.equal(observed.text, PRE_CHANGE_ENVELOPE_INVALID_BODY, label);
+          assert.equal(observed.text, authorization === undefined
+            ? PREFLIGHT_UPLOAD_AUTH_INVALID_BODY : PRE_CHANGE_ENVELOPE_INVALID_BODY, label);
         }
       }
     }

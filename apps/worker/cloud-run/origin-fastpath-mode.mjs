@@ -186,7 +186,9 @@ export function analyticsV2TestClock(env, mode) {
  * (src/analytics-v2/community-daily-route.ts, A-4). The factory is injected
  * by the composition root; when it is missing the origin refuses to start
  * rather than silently serving the built-in. The optional clock is a test
- * seam the factory accepts only in fastpath-test mode.
+ * seam the factory accepts only in fastpath-test mode. The optional
+ * assertPublicReadAllowed(request) is the Worker's public-read limiter, which
+ * the route calls after its publication control (d43c8f92 index.ts:3979).
  *
  * @param {{
  *   env: Readonly<Record<string, string | undefined>>,
@@ -194,6 +196,7 @@ export function analyticsV2TestClock(env, mode) {
  *   primarySchema: string,
  *   createAnalyticsV2CommunityDailyRoute?: ((options: object) => unknown) | null,
  *   clock?: (() => number) | null,
+ *   assertPublicReadAllowed?: ((request: Request) => Promise<void>) | null,
  * }} options
  */
 export function fastpathTestRouteModules({
@@ -202,6 +205,7 @@ export function fastpathTestRouteModules({
   primarySchema,
   createAnalyticsV2CommunityDailyRoute = null,
   clock = null,
+  assertPublicReadAllowed = null,
 }) {
   if (!isAnalyticsV2Enabled(env)) return [];
   if (typeof createAnalyticsV2CommunityDailyRoute !== "function") {
@@ -215,6 +219,7 @@ export function fastpathTestRouteModules({
     schema: primarySchema,
     originMode: FASTPATH_TEST_MODE,
     ...(clock === null ? {} : { clock }),
+    ...(assertPublicReadAllowed === null ? {} : { assertPublicReadAllowed }),
   });
   if (built === null || typeof built !== "object") {
     configurationError("ANALYTICS_V2_COMMUNITY_DAILY_ROUTE_INVALID");

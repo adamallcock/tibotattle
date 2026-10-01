@@ -30,6 +30,18 @@ const ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION = "privacy-safe-telemetry-v0.2";
 const ONGOING_TELEMETRY_CONSENT_VERSION = "ongoing-privacy-safe-telemetry-v0.1";
 const ONGOING_ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION = "ongoing-privacy-safe-telemetry-v0.2";
 const ONGOING_INCREMENTAL_TELEMETRY_CONSENT_VERSION = "ongoing-privacy-safe-telemetry-v1.0";
+// origin-edge-test-mode.mjs EDGE_TEST_PUBLIC_ORIGIN: the public origin the
+// edge-test boundary rebuilds requests on, and so that composition's private
+// origin. Plain JavaScript keeps this file free of the contract import; the
+// edge-test check pins the two equal.
+const EDGE_TEST_PUBLIC_ORIGIN = "https://tibotattle.test";
+// src/constants.ts SESSION_COOKIE_NAME, read by src/session.ts
+// hasSessionCookie (d43c8f92 index.ts:277); the edge-test check pins it.
+const SESSION_COOKIE_NAME = "__Host-usage_monitor_session";
+// d43c8f92 index.ts:613-614 DEVICE_UPLOAD_AUTHORIZATION_HEADER, byte for byte;
+// the edge-test check pins the two literals equal.
+const DEVICE_UPLOAD_AUTHORIZATION_HEADER =
+  /^Upload um_device_upload_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$/u;
 const PAIRING_BODY_READ_POLICY = Object.freeze({
   maximumTotalMilliseconds: 15_000,
   maximumIdleMilliseconds: 5_000,
@@ -142,10 +154,23 @@ function isAllowedPostgresTestOrigin(value) {
     const origin = new URL(value);
     if (origin.origin !== value) return false;
     return (origin.protocol === "http:" && origin.hostname === "127.0.0.1")
-      || (origin.protocol === "https:" && value === CLOUD_RUN_IAM_TEST_TARGET.origin);
+      || (origin.protocol === "https:" && value === CLOUD_RUN_IAM_TEST_TARGET.origin)
+      || value === EDGE_TEST_PUBLIC_ORIGIN;
   } catch {
     return false;
   }
+}
+
+/** src/session.ts hasSessionCookie: only the session cookie counts, not any cookie. */
+function hasSessionCookie(cookieHeader) {
+  if (!cookieHeader) return false;
+  return cookieHeader.split(";").some((part) => (
+    part.slice(0, Math.max(0, part.indexOf("="))).trim() === SESSION_COOKIE_NAME
+  ));
+}
+
+function isRateLimitBinding(limiter) {
+  return limiter !== null && typeof limiter === "object" && typeof limiter.limit === "function";
 }
 
 /** Test-only dispatch bypasses the Worker handler entirely, including D1. */
@@ -1734,8 +1759,13 @@ function createPostgresTestV12ContributionHandler({
  * POST /api/v1/contributions. One route with a shared preamble, then a
  * dispatch on the envelope's schemaVersion through the envelope registry.
  *
- * Preamble, in the v1.2-only origin's order: cookie, content type and length,
- * bounded body, fatal UTF-8 JSON; the envelope's registered pre-claim check
+ * Preamble, in d43c8f92 handleContribution's order (index.ts:3337-3347): the
+ * upload-ingress bindings (503 ADMISSION_CONFIGURATION_INVALID), the
+ * contributionRequestPreflight fence (index.ts:621-644: session cookie,
+ * content type, declared length, missing body, Upload header shape), the
+ * upload-ingress limiter (index.ts:3342, replayed from the edge behind the
+ * edge-test boundary) before a byte of the body is read; then the bounded
+ * body and fatal UTF-8 JSON; the envelope's registered pre-claim check
  * (an unregistered version gets the v1.2-only origin's refusal, before any
  * claim); then the upload-authorization claim, the claimed principal and
  * participant, the processing control, the deletion tombstone and the
@@ -1755,6 +1785,8 @@ function createPostgresTestV12ContributionHandler({
  */
 async function handlePostgresTestContribution({
   request,
+  admissionEnv,
+  assertUploadIngressRequestAllowed,
   primaryPool,
   ledgerPool,
   schema,
@@ -1775,11 +1807,21 @@ async function handlePostgresTestContribution({
   let persistStarted = false;
   let handlerReturned = false;
   try {
-    if (request.headers.has("cookie")) {
+    // d43c8f92 index.ts:3339 assertUploadIngressRateLimitBindings.
+    if (typeof assertUploadIngressRequestAllowed !== "function"
+        || !isRateLimitBinding(admissionEnv?.UPLOAD_INGRESS_REQUEST_RATE_LIMIT)
+        || !isRateLimitBinding(admissionEnv?.UPLOAD_INGRESS_CLIENT_RATE_LIMIT)) {
+      throw Object.assign(new Error("ADMISSION_CONFIGURATION_INVALID"), {
+        code: "ADMISSION_CONFIGURATION_INVALID", status: 503,
+      });
+    }
+    // d43c8f92 index.ts:621-644 contributionRequestPreflight.
+    if (hasSessionCookie(request.headers.get("cookie"))) {
       throw Object.assign(new Error("UPLOAD_AUTH_INVALID"), {
         code: "UPLOAD_AUTH_INVALID", status: 401,
       });
     }
+    const authorization = request.headers.get("authorization");
     const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim();
     if (contentType !== "application/json") {
       throw Object.assign(new Error("CONTENT_TYPE_INVALID"), {
@@ -1796,6 +1838,22 @@ async function handlePostgresTestContribution({
         throw Object.assign(new Error("BODY_TOO_LARGE"), { code: "BODY_TOO_LARGE", status: 413 });
       }
     }
+    if (!request.body) {
+      throw Object.assign(new Error("BODY_INVALID"), { code: "BODY_INVALID", status: 400 });
+    }
+    if (typeof authorization !== "string" || !DEVICE_UPLOAD_AUTHORIZATION_HEADER.test(authorization)) {
+      throw Object.assign(new Error("UPLOAD_AUTH_INVALID"), {
+        code: "UPLOAD_AUTH_INVALID", status: 401,
+      });
+    }
+    // d43c8f92 index.ts:3342: the address-keyed ingress limiter, before the
+    // body. As there, no upload draws the device_sync attempt limiter.
+    await assertUploadIngressRequestAllowed(
+      admissionEnv.UPLOAD_INGRESS_REQUEST_RATE_LIMIT,
+      admissionEnv.UPLOAD_INGRESS_CLIENT_RATE_LIMIT,
+      request,
+      admissionEnv,
+    );
     const bytes = await readBoundedRequestBody(request, maxRequestBytes, {
       maximumTotalMilliseconds: 15_000,
       maximumIdleMilliseconds: 5_000,
@@ -1829,7 +1887,7 @@ async function handlePostgresTestContribution({
     // is not refused 401 UPLOAD_AUTH_INVALID.
     claim = await claimPostgresDeviceUploadAuthorization(
       primaryPool,
-      request.headers.get("authorization"),
+      authorization,
       { envelopeDigest, bodyBytes, contentType },
       registration.schemaVersion === TELEMETRY_V12_ENVELOPE_SCHEMA_VERSION
         ? { schema }
@@ -2025,6 +2083,7 @@ export function createPostgresTestV12DayManifestDispatch({
   assertAttemptAllowed,
   assertUploadAuthorizationBindings,
   assertUploadAuthorizationAllowed,
+  assertUploadIngressRequestAllowed = null,
   authenticatePostgresDevice,
   disconnectPostgresAuthenticatedDevice,
   hasPostgresDeletionTombstone,
@@ -2066,6 +2125,8 @@ export function createPostgresTestV12DayManifestDispatch({
       || typeof assertAttemptAllowed !== "function"
       || typeof assertUploadAuthorizationBindings !== "function"
       || typeof assertUploadAuthorizationAllowed !== "function"
+      || (assertUploadIngressRequestAllowed !== null
+        && typeof assertUploadIngressRequestAllowed !== "function")
       || typeof authenticatePostgresDevice !== "function"
       || typeof disconnectPostgresAuthenticatedDevice !== "function"
       || typeof hasPostgresDeletionTombstone !== "function"
@@ -2283,16 +2344,13 @@ export function createPostgresTestV12DayManifestDispatch({
         code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "POST" },
       }), crypto.randomUUID());
     }
+    // d43c8f92 index.ts:710, 740, 767 and 842: every accountless route
+    // refuses a browser session cookie (not any cookie) with AUTH_INVALID.
     if ((accountlessEnrollmentPath || accountlessOwnershipPath || accountlessV12AuthorizationPath
       || accountlessRenewalPath)
-        && request.headers.has("cookie")) {
-      const code = accountlessEnrollmentPath || accountlessRenewalPath
-        ? "AUTH_INVALID" : "DEVICE_AUTH_INVALID";
-      return routeError(Object.assign(new Error(code), { code, status: 401 }), crypto.randomUUID());
-    }
-    if (deviceCredentialRenewalPath && request.headers.has("cookie")) {
-      return routeError(Object.assign(new Error("DEVICE_AUTH_INVALID"), {
-        code: "DEVICE_AUTH_INVALID", status: 401,
+        && hasSessionCookie(request.headers.get("cookie"))) {
+      return routeError(Object.assign(new Error("AUTH_INVALID"), {
+        code: "AUTH_INVALID", status: 401,
       }), crypto.randomUUID());
     }
     if ((!envelopeKeyRoute && !manifestRoute && !manifestReadRoute
@@ -2405,6 +2463,8 @@ export function createPostgresTestV12DayManifestDispatch({
         ));
       }
       if (deviceCredentialRenewalRoute) {
+        // d43c8f92 index.ts:2224-2236: limiter, upload-registration control,
+        // then any cookie refused.
         await assertAttemptAllowed(
           admissionEnv.RECOVERY_RATE_LIMIT,
           admissionEnv.CLIENT_ATTEMPT_RATE_LIMIT,
@@ -2413,6 +2473,11 @@ export function createPostgresTestV12DayManifestDispatch({
           "device_credential_renew",
         );
         await assertPostgresUploadRegistrationEnabled(primaryPool, schemas.primary);
+        if (request.headers.has("cookie")) {
+          throw Object.assign(new Error("DEVICE_AUTH_INVALID"), {
+            code: "DEVICE_AUTH_INVALID", status: 401,
+          });
+        }
         const body = await readAccountlessJson(
           request,
           deviceCredentialRenewalAuthority.maxRequestBytes,
@@ -2484,6 +2549,30 @@ export function createPostgresTestV12DayManifestDispatch({
         );
         return json(201, body);
       }
+      // d43c8f92 handleContribution answers its own session-cookie refusal
+      // (UPLOAD_AUTH_INVALID), so it precedes the device-bearer cookie
+      // refusal below.
+      if (contributionRoute) {
+        return await handlePostgresTestContribution({
+          request,
+          admissionEnv,
+          assertUploadIngressRequestAllowed,
+          primaryPool,
+          ledgerPool,
+          schema,
+          hasPostgresDeletionTombstone,
+          claimPostgresDeviceUploadAuthorization,
+          abandonPostgresDeviceUploadAuthorization,
+          recordPostgresDeviceUploadReceipt,
+          sha256Hex,
+          readBoundedRequestBody,
+          maxRequestBytes,
+          envelopes,
+          formats,
+          refuseUnregisteredEnvelope,
+          handlerContext: contributionHandlerContext,
+        });
+      }
       if (disconnectRoute) {
         await assertAttemptAllowed(
           admissionEnv.RECOVERY_RATE_LIMIT,
@@ -2493,8 +2582,12 @@ export function createPostgresTestV12DayManifestDispatch({
           "device_disconnect",
         );
       }
+      // d43c8f92 deviceSyncPrincipal (index.ts:3016-3030): every device
+      // bearer read, the v1.2 day-manifest POST and both v1.2 domain routes
+      // charge device_sync before the cookie refusal and authentication.
       if (syncStateRoute || syncManifestRoute || syncCapabilitiesRoute || syncCapabilitiesV12Route
-          || manifestReadRoute || v12EffectivePageRoute) {
+          || manifestReadRoute || manifestRoute || v12DomainPredecessorRoute
+          || v12DomainActivateRoute || v12EffectivePageRoute) {
         await assertAttemptAllowed(
           admissionEnv.RECOVERY_RATE_LIMIT,
           admissionEnv.CLIENT_ATTEMPT_RATE_LIMIT,
@@ -2524,25 +2617,6 @@ export function createPostgresTestV12DayManifestDispatch({
           schemaVersion: "device-disconnect-v0.1",
           disconnected: true,
           deviceId: disconnected.deviceId,
-        });
-      }
-      if (contributionRoute) {
-        return await handlePostgresTestContribution({
-          request,
-          primaryPool,
-          ledgerPool,
-          schema,
-          hasPostgresDeletionTombstone,
-          claimPostgresDeviceUploadAuthorization,
-          abandonPostgresDeviceUploadAuthorization,
-          recordPostgresDeviceUploadReceipt,
-          sha256Hex,
-          readBoundedRequestBody,
-          maxRequestBytes,
-          envelopes,
-          formats,
-          refuseUnregisteredEnvelope,
-          handlerContext: contributionHandlerContext,
         });
       }
       // The v1.2 capability read is how an accountless install learns that
@@ -2681,13 +2755,8 @@ export function createPostgresTestV12DayManifestDispatch({
           admissionEnv,
         );
       } else {
-        await assertAttemptAllowed(
-          admissionEnv.RECOVERY_RATE_LIMIT,
-          admissionEnv.CLIENT_ATTEMPT_RATE_LIMIT,
-          request,
-          admissionEnv,
-          "device_sync",
-        );
+        // device_sync was charged before authentication, as deviceSyncPrincipal
+        // does; the processing control follows it (index.ts:3261, 3280).
         await assertPostgresProcessingEnabled(primaryPool, schemas.primary);
       }
 
