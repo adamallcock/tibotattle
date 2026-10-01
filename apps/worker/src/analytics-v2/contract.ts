@@ -340,10 +340,14 @@ export interface AnalyticsV2ReadContext {
 // may narrow the context and option shapes through the lead; it may not
 // rename them.
 
-/** The built-in origin routes a registered module may override. */
+/**
+ * The built-in origin routes a registered module may override. Each is an
+ * exact WORKER_ROUTE_POLICY path, and the list equals the runtime list in
+ * cloud-run/origin-route-modules.mjs (checked by origin-route-modules.check.mjs).
+ */
 export const ORIGIN_OVERRIDABLE_BUILT_INS = Object.freeze([
   "/api/v1/community/daily",
-  "/api/v1/upload-authorizations",
+  "/api/v1/device/upload-authorizations",
 ] as const);
 export type OriginOverridableBuiltIn = (typeof ORIGIN_OVERRIDABLE_BUILT_INS)[number];
 
@@ -379,8 +383,28 @@ export type ContributionEnvelopeHandler = (
   context: ContributionEnvelopeContext,
 ) => Response | Promise<Response>;
 
-/** One upload-authorization format entry (reserved for IN-1 and IN-3). */
-export type UploadAuthorizationFormat = Readonly<Record<string, unknown>>;
+/**
+ * One upload-authorization format entry (IN-1 and IN-3): it throws the
+ * origin's existing refusal when the authenticated device may not upload
+ * this format.
+ */
+export interface UploadAuthorizationFormat {
+  readonly assertUploadAllowed: (
+    pool: unknown,
+    device: unknown,
+    nowEpoch: number,
+    options: Readonly<{ schema: unknown }>,
+  ) => unknown;
+}
 
-/** createUploadAuthorizationFormats(map): telemetrySchemaVersion to format. */
-export type UploadAuthorizationFormats = ReadonlyMap<string, UploadAuthorizationFormat>;
+/** The table createUploadAuthorizationFormats accepts: telemetrySchemaVersion to format. */
+export type UploadAuthorizationFormatTable =
+  | ReadonlyMap<string, UploadAuthorizationFormat>
+  | Readonly<Record<string, UploadAuthorizationFormat>>;
+
+/** What createUploadAuthorizationFormats(table) returns: a frozen resolver, not a Map. */
+export interface UploadAuthorizationFormats {
+  readonly telemetrySchemaVersions: readonly string[];
+  readonly has: (telemetrySchemaVersion: unknown) => boolean;
+  readonly resolve: (telemetrySchemaVersion: unknown) => UploadAuthorizationFormat | null;
+}

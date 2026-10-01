@@ -38,8 +38,11 @@ const vite = await createServer({
   appType: "custom",
 });
 let WORKER_ROUTE_POLICY;
+let CONTRACT_OVERRIDABLE_BUILT_INS;
 try {
   ({ WORKER_ROUTE_POLICY } = await vite.ssrLoadModule("/src/route-registry.ts"));
+  ({ ORIGIN_OVERRIDABLE_BUILT_INS: CONTRACT_OVERRIDABLE_BUILT_INS } =
+    await vite.ssrLoadModule("/src/analytics-v2/contract.ts"));
 } finally {
   await vite.close();
 }
@@ -69,6 +72,10 @@ test("every overridable built-in is an exact WORKER_ROUTE_POLICY route", () => {
     assert.ok(registryPaths.has(pathname), pathname + " is missing from WORKER_ROUTE_POLICY");
   }
   assert.ok(Object.isFrozen(ORIGIN_OVERRIDABLE_BUILT_INS));
+});
+
+test("the analytics-v2 contract names the same overridable built-ins as the runtime seam", () => {
+  assert.deepEqual([...CONTRACT_OVERRIDABLE_BUILT_INS], [...ORIGIN_OVERRIDABLE_BUILT_INS]);
 });
 
 test("an empty module registry resolves nothing", () => {
