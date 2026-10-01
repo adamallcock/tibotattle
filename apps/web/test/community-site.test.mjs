@@ -1220,7 +1220,7 @@ test("the public guidance pages are useful stubs without app-only controls", asy
   }
 });
 
-test("the dashboard keeps contribution review local while the public site owns delayed evidence", async () => {
+test("the dashboard uses accountless sharing while the public site owns delayed evidence", async () => {
   const siteSource = await readFile(SITE_SOURCE, "utf8");
   const appSource = await readFile(APP_SOURCE, "utf8");
   assert.match(siteSource, /from "\.\/community-view\.js"/u);
@@ -1255,8 +1255,8 @@ test("the dashboard keeps contribution review local while the public site owns d
   // flow, so the dashboard's local destination is now the consent card.
   assert.doesNotMatch(appHtml, /id="prepare-contribution"/u);
   assert.doesNotMatch(appHtml, /id="sync-run-once"/u);
-  assert.match(appHtml, /id="incremental-consent"/u);
-  assert.match(appHtml, /id="incremental-consent-approve"/u);
+  assert.doesNotMatch(appHtml, /id="incremental-consent"/u);
+  assert.match(appHtml, /id="electron-accountless-sharing-enabled"/u);
 });
 
 test("the retained weekly snapshot normalizer still guards the app's closed contract", () => {

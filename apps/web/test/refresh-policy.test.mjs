@@ -71,6 +71,7 @@ function refreshHarness({
     },
   };
   const context = createContext({
+    dashboardCapabilities: () => ({ collection: true }),
     dashboard: priorDashboard,
     localActionBusy: false,
     localRefreshInProgress: false,

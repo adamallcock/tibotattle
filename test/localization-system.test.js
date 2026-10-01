@@ -460,7 +460,6 @@ test("localizer is root-bounded, preserves raw-data boundaries, and never interp
   assert.doesNotMatch(appSource, /\.innerHTML\s*=/u);
   assert.match(appSource, /function setRawText\(/u);
   assert.match(appSource, /function rawNode\(/u);
-  assert.match(appSource, /setRawText\(\$\("#identity-account-provider"\)/u);
   assert.match(
     appSource,
     /node\("span", "metric-name", localizedQuotaWindowLabel\(window\)\)/u,

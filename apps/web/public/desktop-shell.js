@@ -1,3 +1,5 @@
+import { dashboardCapabilities } from "./dashboard-capabilities.js";
+
 /**
  * Small Electron-only bridge for controls that belong to the desktop shell,
  * not to the hosted dashboard. It intentionally has no filesystem or URL
@@ -27,14 +29,10 @@ const DASHBOARD_SECTION_HASHES = Object.freeze({
 });
 const mountedDocuments = new WeakMap();
 
-function electronDashboard(documentRef, windowRef) {
-  // The sandboxed preload exposes this exact, frozen-versioned bridge
-  // synchronously. It is the strongest startup proof: the DOM marker can be
-  // delayed because preload and page DOM events run in isolated worlds.
+function electronDashboard(_documentRef, windowRef) {
+  // The sandboxed preload exposes its versioned bridge synchronously.
   const bridge = windowRef?.tibotattleDesktop;
-  if (bridge?.version === ELECTRON_API_VERSION) return true;
-  return documentRef?.documentElement?.classList?.contains("electron-dashboard") === true
-    || documentRef?.body?.classList?.contains("electron-dashboard") === true;
+  return bridge?.version === ELECTRON_API_VERSION;
 }
 
 function focusSharePanel(documentRef, windowRef) {
@@ -109,6 +107,7 @@ export function navigateToDashboardSection(_documentRef, windowRef, section) {
 }
 
 function openSettings(windowRef) {
+  if (!dashboardCapabilities(windowRef).settings) return false;
   const bridge = windowRef?.tibotattleDesktop;
   if (bridge?.version === ELECTRON_API_VERSION
       && typeof bridge.openSettings === "function") {
@@ -206,10 +205,12 @@ function installCommandBridge(documentRef, windowRef, applyLanguage, applySideba
   const onCommand = (command) => {
     if (!command || typeof command !== "object") return;
     if (command.command === "refresh") {
+      if (!dashboardCapabilities(windowRef).collection) return;
       documentRef.querySelector?.("#refresh-button")?.click?.();
       return;
     }
     if (command.command === "automaticRefresh") {
+      if (!dashboardCapabilities(windowRef).collection) return;
       if (Reflect.ownKeys(command).length !== 2
           || !Object.hasOwn(command, "mode")) return;
       dispatchAutomaticRefresh(windowRef, command.mode);
@@ -219,13 +220,6 @@ function installCommandBridge(documentRef, windowRef, applyLanguage, applySideba
       if (Reflect.ownKeys(command).length !== 2
           || !Object.hasOwn(command, "section")) return;
       navigateToDashboardSection(documentRef, windowRef, command.section);
-      return;
-    }
-    if (command.command === "hostedSignInReturn") {
-      // The desktop host has already validated and reduced the external app
-      // link to this one semantic command.  Do not forward a URL, argv, or
-      // token into the page; wake the existing page-local handoff instead.
-      dispatchFixedDesktopEvent(windowRef, "tibotattle:hosted-sign-in-return");
       return;
     }
     if (command.command === "sidebar") {
@@ -269,6 +263,10 @@ export function mountDesktopShell({
   const shareButton = documentRef.querySelector?.("#electron-share-button");
   const settingsButton = documentRef.querySelector?.("#electron-settings-button");
   if (!settingsButton) return Object.freeze({ teardown() {} });
+  const capabilities = dashboardCapabilities(windowRef);
+  settingsButton.hidden = !capabilities.settings;
+  settingsButton.disabled = !capabilities.settings;
+  if (shareButton) shareButton.hidden = false;
   const onShare = () => {
     // The share card lives on the Allowance page. Navigating to Overview
     // first leaves that page inert, so focus() can succeed in a unit fake yet
@@ -305,7 +303,7 @@ export function mountDesktopShell({
     }
   };
   const onLanguageChange = () => {
-    if (applyingLanguage || bridge?.version !== ELECTRON_API_VERSION) return;
+    if (applyingLanguage || !capabilities.settings || bridge?.version !== ELECTRON_API_VERSION) return;
     const value = DESKTOP_LANGUAGE_BY_PICKER_VALUE[picker?.value];
     if (!LANGUAGE_VALUES.has(value) || typeof bridge.setLanguage !== "function") return;
     try {
@@ -317,7 +315,7 @@ export function mountDesktopShell({
   shareButton?.addEventListener?.("click", onShare);
   settingsButton.addEventListener("click", onSettings);
   picker?.addEventListener?.("change", onLanguageChange);
-  readPersistedSettings(bridge, applyLanguage, applySidebar);
+  if (capabilities.settings) readPersistedSettings(bridge, applyLanguage, applySidebar);
   const unsubscribeCommand = installCommandBridge(
     documentRef,
     windowRef,
@@ -340,26 +338,10 @@ export function mountDesktopShell({
 
 function autoMountDesktopShell() {
   if (typeof document === "undefined") return;
-  const mount = () => {
-    // Electron's preload normally stamps the marker before this module runs.
-    // The DOM-ready retry covers the legitimate startup ordering where the
-    // marker is applied while the document body is still being constructed.
-    mountDesktopShell();
-  };
-  mount();
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", () => {
-      mount();
-      // The preload lives in Electron's isolated world. Its DOMContentLoaded
-      // listener is not ordered relative to this page-world listener, so a
-      // marker can land immediately after the callback above. One macrotask
-      // gives the remaining DOM-ready listeners a chance to stamp it; the
-      // idempotent mount then installs the controls without starting a poll.
-      const schedule = typeof globalThis.window?.setTimeout === "function"
-        ? globalThis.window.setTimeout.bind(globalThis.window)
-        : globalThis.setTimeout;
-      if (typeof schedule === "function") schedule(mount, 0);
-    }, { once: true });
+    document.addEventListener("DOMContentLoaded", () => mountDesktopShell(), { once: true });
+  } else {
+    mountDesktopShell();
   }
 }
 

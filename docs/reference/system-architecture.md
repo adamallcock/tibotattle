@@ -62,6 +62,17 @@ Architecture ownership is mechanically checked by
 `npm run architecture:check`. Cross-surface imports must use reviewed public
 facades; no application may reach through another application's private files.
 
+The shared dashboard defaults to read-only presentation and serves the same
+HTML, modules and styles to standalone clients, including Codex. The Electron
+preload explicitly advertises `dashboardCapabilities` for `collection`,
+`settings` and `accountlessSharing`. Missing, malformed or unadvertised
+capabilities stay off; DOM markers and companion health never enable them.
+Collection retains bounded refresh, cancellation and host-owned cadence;
+Settings and accountless sharing use their existing versioned bridge actions.
+The dashboard contains no social sign-in, legacy consent/pairing or device
+disconnect UI. Legacy backend contracts remain available to their existing
+consumers, independently of this presentation change.
+
 ## Local trust boundary
 
 The installed app creates an owner-only state root at

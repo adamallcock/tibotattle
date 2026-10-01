@@ -274,6 +274,11 @@ function installDesktopBridge() {
   if (typeof contextBridge?.exposeInMainWorld !== "function") return;
   const bridge = Object.freeze({
     version: BRIDGE_VERSION,
+    dashboardCapabilities: Object.freeze({
+      collection: true,
+      settings: true,
+      accountlessSharing: true,
+    }),
     onCommand: (...values) => oneArgument(
       "onCommand",
       values,

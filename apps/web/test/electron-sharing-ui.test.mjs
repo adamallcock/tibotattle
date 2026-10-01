@@ -105,7 +105,7 @@ test("Electron sharing UI uses the accountless bridge and visible receipt gate",
   assert.match(appSource, /setSharingEnabled\(enabled\)/u);
   assert.match(appSource, /sharingNoticePresented\(index\)/u);
   assert.match(appSource, /case "recovery_required":/u);
-  assert.match(appSource, /document\.visibilityState === "visible"/u);
+  assert.match(appSource, /document\.visibilityState !== "visible"/u);
   assert.match(appSource, /getBoundingClientRect\(\)/u);
   assert.match(appSource, /innerWidth/u);
   assert.match(appSource, /listen\(globalThis\.window, "scroll", retry\)/u);
@@ -766,6 +766,7 @@ test("a successful visible notice receipt keeps its current banner actionable", 
     "renderElectronSharingNotice",
   ].map((name) => extractFunction(source, name));
   const factory = new Function("bridge", "initialPreference", "initialVisibility", "initialRect", `
+    const dashboardCapabilities = () => ({ accountlessSharing: true });
     const ELECTRON_SHARING_API_VERSION = "v1";
     const ELECTRON_SHARING_BASES = new Set([
       "default_on", "default_off", "migration_default_on", "user_choice", "legacy_preserved",
@@ -915,6 +916,7 @@ test("offscreen or zero-area notices wait for a visible scroll or resize", async
     "renderElectronSharingNotice",
   ].map((name) => extractFunction(source, name));
   const factory = new Function("bridge", "initialPreference", "initialVisibility", "initialRect", `
+    const dashboardCapabilities = () => ({ accountlessSharing: true });
     const ELECTRON_SHARING_API_VERSION = "v1";
     const ELECTRON_SHARING_BASES = new Set([
       "default_on", "default_off", "migration_default_on", "user_choice", "legacy_preserved",
