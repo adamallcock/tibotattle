@@ -238,8 +238,9 @@ function preserveSafeError(error: unknown): Error | null {
     if (state === "23505" && constraint === "typed_telemetry_v1_occurrence") {
       return new ApiError(409, "RECORD_OWNED_BY_OTHER_CHUNK");
     }
-    // reject_v1_transport_floor (0010) raises P1007 without a message.
-    if (state === "P1007") return new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
+    // Any other trigger abort, including the insert-time transport floor
+    // (reject_v1_transport_floor, P1007), stays a storage failure: D1's
+    // persistTelemetryV1StorageChunk maps an unmapped abort to 503.
   }
   return null;
 }
