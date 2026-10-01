@@ -86,6 +86,11 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/upload-authorization-formats.mjs", destination: "apps/worker/cloud-run/upload-authorization-formats.mjs" }),
   Object.freeze({ source: "cloud-run/envelopes", destination: "apps/worker/cloud-run/envelopes" }),
   Object.freeze({ source: "cloud-run/routes", destination: "apps/worker/cloud-run/routes" }),
+  // The edge-test origin (EORIGIN) and the EP-6 boundary and replay limiters
+  // it composes in front of fastpath-test.
+  Object.freeze({ source: "cloud-run/origin-edge-test-mode.mjs", destination: "apps/worker/cloud-run/origin-edge-test-mode.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-edge-origin-dispatch.mjs", destination: "apps/worker/cloud-run/postgres-edge-origin-dispatch.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-edge-admission-limiters.mjs", destination: "apps/worker/cloud-run/postgres-edge-admission-limiters.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-migrations.mjs", destination: "apps/worker/cloud-run/postgres-migrations.mjs" }),
   Object.freeze({ source: "cloud-run/cloud-sql.mjs", destination: "apps/worker/cloud-run/cloud-sql.mjs" }),
   Object.freeze({ source: "cloud-run/assets.mjs", destination: "apps/worker/cloud-run/assets.mjs" }),

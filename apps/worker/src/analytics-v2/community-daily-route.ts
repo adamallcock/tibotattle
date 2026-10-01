@@ -10,7 +10,9 @@
  *   YYYY-MM-DD, spanning 1..366 days, else 400 BODY_INVALID;
  * - the publication collection control is asserted first through the AA-0
  *   PostgreSQL reader (503 PUBLICATION_DISABLED, or
- *   COLLECTION_CONTROL_UNAVAILABLE when the controls cannot be read);
+ *   COLLECTION_CONTROL_UNAVAILABLE when the controls cannot be read), then
+ *   the optional injected public-read limiter (d43c8f92 index.ts:3979, before
+ *   the parameters are validated);
  * - published days come from analytics_v2_published_daily in one REPEATABLE
  *   READ READ ONLY snapshot; any failure of that read, a payload whose content
  *   digest differs from payload_sha256, or revision fields (aggregateId,
@@ -33,7 +35,9 @@
  *   with `no-store`.
  *
  * Not ported, and why: the PUBLIC_ANALYTICS environment switch (mounting this
- * module is the GCP switch), the public read rate limiter (an edge concern),
+ * module is the GCP switch; the edge answers it), the public read limiter's
+ * binding (injected by the composition root as assertPublicReadAllowed: the
+ * Worker helper over a PostgreSQL limiter, or the edge's replayed outcome),
  * and production's per-row authority and containment fences plus preview
  * freshness columns (analytics-refresh writes every analytics_v2 family in one
  * transaction, and there are no withdrawals under the append-only decision).
@@ -103,7 +107,9 @@ const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const DECIMAL_REVISION = /^[1-9][0-9]{0,15}$/u;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const READ_TIMEOUT_MILLISECONDS = 5_000;
-const OPTION_KEYS: ReadonlySet<string> = new Set(["pool", "schema", "clock", "originMode"]);
+const OPTION_KEYS: ReadonlySet<string> = new Set([
+  "pool", "schema", "clock", "originMode", "assertPublicReadAllowed",
+]);
 
 export interface AnalyticsV2CommunityDailyRouteOptions {
   readonly pool: PostgresPool;
@@ -113,6 +119,13 @@ export interface AnalyticsV2CommunityDailyRouteOptions {
   readonly clock?: () => number;
   /** The origin's POSTGRES_TEST_HTTP_MODE, or null/undefined outside test hosting. */
   readonly originMode?: string | null;
+  /**
+   * The Worker's public-read limiter for this request (admission.ts
+   * assertPublicAggregateReadAllowed over the composition's binding). Its
+   * ApiError (429 or 503 with retry-after) is the route's answer. Absent, the
+   * route reads exactly as before.
+   */
+  readonly assertPublicReadAllowed?: (request: Request) => Promise<void>;
 }
 
 /** The IN-1 route-module shape; the composition root wraps it with defineOriginRouteModule(). */
@@ -386,7 +399,7 @@ export function createAnalyticsV2CommunityDailyRoute(
       || Object.keys(options).some((key) => !OPTION_KEYS.has(key))) {
     configurationError("ANALYTICS_V2_COMMUNITY_DAILY_CONFIGURATION_INVALID");
   }
-  const { pool, schema, clock, originMode } = options;
+  const { pool, schema, clock, originMode, assertPublicReadAllowed } = options;
   if (pool === null || typeof pool !== "object" || typeof pool.connect !== "function") {
     configurationError("ANALYTICS_V2_COMMUNITY_DAILY_CONFIGURATION_INVALID");
   }
@@ -396,6 +409,9 @@ export function createAnalyticsV2CommunityDailyRoute(
     configurationError("ANALYTICS_V2_COMMUNITY_DAILY_CONFIGURATION_INVALID");
   }
   if (originMode !== undefined && originMode !== null && typeof originMode !== "string") {
+    configurationError("ANALYTICS_V2_COMMUNITY_DAILY_CONFIGURATION_INVALID");
+  }
+  if (assertPublicReadAllowed !== undefined && typeof assertPublicReadAllowed !== "function") {
     configurationError("ANALYTICS_V2_COMMUNITY_DAILY_CONFIGURATION_INVALID");
   }
   let now: () => number = Date.now;
@@ -414,6 +430,9 @@ export function createAnalyticsV2CommunityDailyRoute(
       throw new ApiError(405, "METHOD_NOT_ALLOWED", { responseHeaders: { allow: "GET" } });
     }
     await assertPostgresCollectionControlFromPool(pool, schema, "publication");
+    // d43c8f92 index.ts:3979: the public-read limiter runs after the
+    // publication control and before from/to are validated.
+    if (assertPublicReadAllowed !== undefined) await assertPublicReadAllowed(request);
     const parameters = new URL(request.url).searchParams;
     for (const name of parameters.keys()) {
       if (name !== "from" && name !== "to") bodyInvalid();
