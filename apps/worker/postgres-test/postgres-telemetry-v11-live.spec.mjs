@@ -1034,12 +1034,14 @@ test("an accountless v1.1 owner negotiates successors, matches the Q-1 rows, and
       return { claimed: { authorizationId, participantId, authorizationKind: "device" }, envelopeDigest, authorizationId };
     }
     const participantRow = { id: participantId, consentVersion: null, ownerKind: "accountless" };
-    async function contribute(chunk) {
+    async function contribute(chunk, { bareClaim = false } = {}) {
       const raw = JSON.stringify(await encryptV11Envelope(chunk, keys.publicJwk));
       const { claimed, envelopeDigest, authorizationId } = await claimFor(raw);
       let persistStarted = false;
       try {
-        const response = await handler({ raw, value: JSON.parse(raw) }, participantRow, deviceId, claimed, {
+        // The Worker hands its v1.1 handler the bare authorization id.
+        const passed = bareClaim ? claimed.authorizationId : claimed;
+        const response = await handler({ raw, value: JSON.parse(raw) }, participantRow, deviceId, passed, {
           raw, envelopeDigest, primaryPool, schema, objectStore, markPersistStarted() { persistStarted = true; },
         });
         return { response, authorizationId, persistStarted };
@@ -1064,7 +1066,7 @@ test("an accountless v1.1 owner negotiates successors, matches the Q-1 rows, and
     // Uncertain persist, absent: nothing committed. The claim is abandoned,
     // this attempt's object and journal row are retired, the answer is 503.
     persistFault = "before";
-    const absent = await contribute(prepared.chunks[0]);
+    const absent = await contribute(prepared.chunks[0], { bareClaim: true });
     assert.equal(absent.persistStarted, true);
     assert.deepEqual({ status: absent.error?.status, code: absent.error?.code }, { status: 503, code: "BACKEND_STORAGE_UNAVAILABLE" });
     assert.equal((await grant(absent.authorizationId)).state, "revoked");

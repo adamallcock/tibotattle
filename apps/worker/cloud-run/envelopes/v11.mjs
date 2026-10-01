@@ -124,10 +124,20 @@ function participantInput(participant) {
   return { participantId, ownerKind, consentVersion };
 }
 
-function claimInput(claimed) {
+/**
+ * The claimed authorization as the PostgreSQL abandon adapter takes it, from
+ * the claim receipt or (as the Worker passes it to its v1.1 handler) a bare
+ * authorization id.
+ */
+function claimInput(claimed, participantId) {
   const authorizationId = typeof claimed === "string" ? claimed : claimed?.authorizationId;
   if (typeof authorizationId !== "string" || authorizationId.length < 1) throw unavailable();
-  return { authorizationId, raw: claimed };
+  const claimParticipant = typeof claimed === "object" && claimed !== null
+    && typeof claimed.participantId === "string" ? claimed.participantId : participantId;
+  return {
+    authorizationId,
+    claim: Object.freeze({ authorizationKind: "device", authorizationId, participantId: claimParticipant }),
+  };
 }
 
 /**
@@ -160,7 +170,7 @@ export function createTelemetryV11ContributionEnvelope(dependencies) {
       throw failure(400, "TELEMETRY_REQUIRED");
     }
     if (typeof sourceDeviceId !== "string" || sourceDeviceId.length < 1) throw failure(401, "UPLOAD_AUTH_INVALID");
-    const claim = claimInput(claimed);
+    const claim = claimInput(claimed, owner.participantId);
     const pool = context.primaryPool ?? deps.primaryPool;
     const objectStore = context.objectStore ?? deps.objectStore;
     const schema = context.schema ?? deps.schema;
@@ -244,7 +254,7 @@ export function createTelemetryV11ContributionEnvelope(dependencies) {
         return receipt(outcome.row.id, outcome.row.manifestId, chunk, true);
       }
       try {
-        await deps.abandonUploadAuthorization(pool, claim.raw, principal, { schema });
+        await deps.abandonUploadAuthorization(pool, claim.claim, principal, { schema });
       } catch { /* The bounded claim lease expires on its own. */ }
       try {
         await deps.retirePendingObject(pool, objectStore, attempt, options);
