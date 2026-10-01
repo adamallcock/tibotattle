@@ -59,6 +59,16 @@ an informal archive.
 | Windows readiness | [Windows portability environments](./runbooks/2026-08-17-windows-portability-environments.md) | Development/qualification environments only; current release support is defined by the platform authority |
 | R7 evidence | [R7 release-evidence receipt maintenance](./runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md) | Staleness rule and protected dual-runtime regeneration; not a routine documentation check |
 
+## Pending decisions and in-progress plans
+
+These entries are listed for discovery. They are not current authorities until
+their status changes; current Cloudflare behavior follows the authorities above.
+
+| Area | Document | Status | Boundary |
+|---|---|---|---|
+| GCP contributions and erasure | [Append-only contributions on the Google Cloud service](./decisions/2026-09-26-append-only-contributions.md) | Owner sign-off pending | GCP target only, from an authorized cutover: revocation stops uploads without withdrawal, Variant B offline owner erasure, deferred database scaling, Cloudflare edge and release hosting |
+| GCP fast path | [GCP fast path](./plans/2026-10-01-gcp-fastpath.md) | In progress | Analytics-refresh architecture, redesign register mapping, local synthetic parity rehearsal and sized cutover backlog; no production change |
+
 ## Lifecycle evidence
 
 The [API lifecycle review](./reviews/2026-08-26-api-lifecycle-review.md) records
