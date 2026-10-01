@@ -82,8 +82,8 @@ export const POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES = Object.freeze({
   }),
 });
 
-const MIGRATION_COUNT = 46;
-const MIGRATION_TAIL = "0046_owner_journal_authority.sql";
+const MIGRATION_COUNT = 58;
+const MIGRATION_TAIL = "0058_owner_journal_emitter_head_precheck.sql";
 export const POSTGRES_COMMUNITY_GRAPH_BENCHMARK_MIGRATION_ROOT =
   "/app/apps/worker/postgres/migrations";
 const MIGRATION_HISTORY_TABLE = "_tibotattle_migration_history";
@@ -503,7 +503,8 @@ function benchmarkPreflightSql(schema) {
                     UNION ALL SELECT processing_enabled FROM ${quotedSchema}.collection_controls WHERE singleton=1
                     UNION ALL SELECT publication_enabled FROM ${quotedSchema}.collection_controls WHERE singleton=1
                   ) AS flags) AS collection_flags_disabled,
-                 (SELECT reason_code IS NULL FROM ${quotedSchema}.collection_controls WHERE singleton=1)
+                 -- Primary 0050 records the untouched bootstrap row's reason as 'initial'.
+                 (SELECT reason_code = 'initial' FROM ${quotedSchema}.collection_controls WHERE singleton=1)
                    AS collection_reason_empty,
                  (SELECT state FROM ${quotedSchema}.telemetry_v12_runtime WHERE id=1)
                    AS telemetry_v12_state,
@@ -596,10 +597,12 @@ export async function seedPostgresCommunityGraphBenchmark(pool, config) {
     checkedMutation(await client.query(
       `UPDATE ${schema}.publication_state SET publication_state='ready' WHERE singleton=1`,
     ), 1, "POSTGRES_COMMUNITY_GRAPH_BENCHMARK_SEED_FAILED");
+    // Primary 0050 closes reason_code to the D1 vocabulary (NOT NULL), so the
+    // synthetic operational seed records the Worker's manual-change reason.
     checkedMutation(await client.query(
       `UPDATE ${schema}.collection_controls SET revision=revision+1, control_state='operational',
         enrollment_enabled=true, upload_registration_enabled=true, processing_enabled=true,
-        publication_enabled=true, reason_code=NULL, updated_at=clock_timestamp() WHERE singleton=1`,
+        publication_enabled=true, reason_code='maintenance', updated_at=clock_timestamp() WHERE singleton=1`,
     ), 1, "POSTGRES_COMMUNITY_GRAPH_BENCHMARK_SEED_FAILED");
     checkedMutation(await client.query(
       `UPDATE ${schema}.telemetry_v12_runtime SET state='active' WHERE id=1`,

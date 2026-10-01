@@ -43,6 +43,8 @@ export default defineConfig({
     fileParallelism: false,
     // PostgreSQL/Cloud Run qualification tests use Node filesystem and socket
     // APIs; they run under their separate Node or local-PostgreSQL gates.
-    exclude: [...configDefaults.exclude, "postgres-test/**"],
+    // analytics-v2-test/** holds the Node-only analytics-v2 specs (vendored
+    // kernel parity, compose proof, refresh job), run by their own config.
+    exclude: [...configDefaults.exclude, "postgres-test/**", "analytics-v2-test/**"],
   },
 });

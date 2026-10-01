@@ -148,7 +148,8 @@ test("PG17 stages only exact analytics state/cursors behind contained controls",
     });
     fixture = await makeSealedSource();
 
-    await pool.query(`UPDATE ${table("collection_controls")} SET control_state='operational',
+    // Primary 0050: two flags on is 'degraded' (D1 0009), still not contained.
+    await pool.query(`UPDATE ${table("collection_controls")} SET control_state='degraded',
       processing_enabled=true,publication_enabled=true WHERE singleton=1`);
     await assert.rejects(transferPostgresAnalyticsHistoryState({ source: fixture.source,
       destinationPool: pool, targetSchema: schema, pageSize: 1 }),

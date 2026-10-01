@@ -9,7 +9,6 @@ import pg from "pg";
 import {
   applyPostgresMigrations,
   readPostgresMigrations,
-  renderPostgresSearchPath,
 } from "../scripts/postgres-migrations.mjs";
 import {
   abandonRun,
@@ -59,9 +58,11 @@ const PG_TEST_PASSWORD = process.env.PG_TEST_PASSWORD ?? "synthetic-local-only";
 const PG_TEST_DATABASE = process.env.PG_TEST_DATABASE ?? "postgres";
 const WORKER_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const MODULE_PATH = join(WORKER_ROOT, "scripts/postgres-transfer-target.mjs");
-const STAGED = Object.freeze({
-  primary: join(WORKER_ROOT, "postgres/staged-migrations/primary/0056_production_transfer_control.sql"),
-  ledger: join(WORKER_ROOT, "postgres/staged-migrations/ledger/0007_production_transfer_control.sql"),
+// The control migrations are promoted (claude/gcp-fastpath-base), so the
+// production runner installs them as part of each role's chain.
+const CONTROL_MIGRATIONS = Object.freeze({
+  primary: "0056_production_transfer_control.sql",
+  ledger: "0007_production_transfer_control.sql",
 });
 const PRIMARY_SCHEMA = "synthetic_primary";
 const LEDGER_SCHEMA = "synthetic_ledger";
@@ -97,26 +98,15 @@ function isSqlState(sqlState, message = undefined) {
 
 async function applyRole(pool, role, schema) {
   await pool.query(`CREATE SCHEMA "${schema}"`);
-  await applyPostgresMigrations({ role, schema, pool });
-  await applyStaged(pool, role, schema);
+  await applyChain(pool, role, schema);
 }
 
-// Until the staged-migration harness lands, stage the SQL after the stock
-// migrations in one transaction with the migration runner's search path.
-async function applyStaged(pool, role, schema) {
-  const sql = await readFile(STAGED[role], "utf8");
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    await client.query(renderPostgresSearchPath(schema));
-    await client.query(sql);
-    await client.query("COMMIT");
-  } catch (error) {
-    await client.query("ROLLBACK");
-    throw error;
-  } finally {
-    client.release();
-  }
+// Apply the promoted chain through the migration runner and require that it
+// carries the role's control migration.
+async function applyChain(pool, role, schema) {
+  const result = await applyPostgresMigrations({ role, schema, pool });
+  assert.equal(result.migrations.filter(migration => migration.name === CONTROL_MIGRATIONS[role]).length, 1,
+    `the ${role} chain carries ${CONTROL_MIGRATIONS[role]}`);
 }
 
 function stubPool(pool, rewrite) {
@@ -330,8 +320,7 @@ test("PG17 production transfer target: contract, open, roles, trigger policy, co
       const before = await ownerPrimary.query(`SELECT relname FROM pg_class
         WHERE relnamespace = 'tibotattle_transfer'::regnamespace AND relkind = 'r' ORDER BY 1`);
       await ownerPrimary.query(`CREATE SCHEMA "pt1_second_application"`);
-      await applyPostgresMigrations({ role: "primary", schema: "pt1_second_application", pool: ownerPrimary });
-      await applyStaged(ownerPrimary, "primary", "pt1_second_application");
+      await applyChain(ownerPrimary, "primary", "pt1_second_application");
       const after = await ownerPrimary.query(`SELECT relname FROM pg_class
         WHERE relnamespace = 'tibotattle_transfer'::regnamespace AND relkind = 'r' ORDER BY 1`);
       assert.deepEqual(after.rows, before.rows);

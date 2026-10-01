@@ -2341,11 +2341,15 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
        ) VALUES ($1, 'social', 'active', $2, $3)`,
       [participantId, constants.TELEMETRY_CONSENT_VERSION, nowIso],
     );
-    await primaryPool.query(
-      `INSERT INTO ${primaryTable("attribution_enrollments")} (participant_id, namespace, created_at)
-       VALUES ($1, $2, $3)`,
-      [participantId, sha256Hex(`synthetic-enrollment:${suffix}`), nowIso],
+    // Primary 0051 creates a social participant's enrollment namespace with
+    // the participant (D1 0058 parity), so read it back instead of inserting.
+    const enrollment = await primaryPool.query(
+      `SELECT namespace FROM ${primaryTable("attribution_enrollments")} WHERE participant_id=$1`,
+      [participantId],
     );
+    assert.equal(enrollment.rowCount, 1);
+    const enrollmentNamespace = enrollment.rows[0].namespace;
+    assert.match(enrollmentNamespace, /^[0-9a-f]{64}$/u);
     await primaryPool.query(
       `INSERT INTO ${primaryTable("web_sessions")} (
          id, participant_id, secret_hash, csrf_hash, issued_at, expires_at, last_used_at
@@ -2648,7 +2652,7 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
     assert.deepEqual(capabilities, {
       schemaVersion: "device-sync-capabilities-v1.2",
       destinationOrigin: "http://127.0.0.1:43817",
-      enrollmentNamespace: sha256Hex(`synthetic-enrollment:${suffix}`),
+      enrollmentNamespace,
       identityVersion: "account-track-v2",
       authorityKind: "social",
       successor: {
@@ -2664,7 +2668,17 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
 
     // The frozen legacy capability response advertises exactly its four
     // schemas, even though PostgreSQL also contains the separately-negotiated
-    // v1.2 format row. A missing participant floor fails closed.
+    // v1.2 format row. A missing participant floor fails closed. Primary 0051
+    // creates the social participant floor and the device floor on insert
+    // (D1 parity), so remove both to reach that fail-closed path.
+    await primaryPool.query(
+      `DELETE FROM ${primaryTable("telemetry_transport_device_floors")} WHERE participant_id=$1`,
+      [participantId],
+    );
+    await primaryPool.query(
+      `DELETE FROM ${primaryTable("telemetry_transport_participant_floors")} WHERE participant_id=$1`,
+      [participantId],
+    );
     const legacyCapabilitiesRequestCount = deviceSyncRateLimitCalls;
     const missingFloorResponse = await dispatch(request({ url: syncCapabilitiesUrl, method: "GET" }));
     assert.equal(missingFloorResponse.status, 401, JSON.stringify(await missingFloorResponse.clone().json()));
@@ -2693,7 +2707,7 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
     assert.deepEqual(legacyCapabilities, {
       schemaVersion: "device-sync-capabilities-v1.1",
       destinationOrigin: "http://127.0.0.1:43817",
-      enrollmentNamespace: sha256Hex(`synthetic-enrollment:${suffix}`),
+      enrollmentNamespace,
       identityVersion: "account-track-v2",
       minimumWriteRank: 10,
       policyRevision: 7,
@@ -2751,17 +2765,18 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
          'ongoing-privacy-safe-telemetry-v1.1', $3)`,
       [participantId, deviceId, nowIso],
     );
-    await primaryPool.query(
-      `UPDATE ${primaryTable("telemetry_transport_participant_floors")}
-          SET minimum_rank=11, revision=8, changed_at=$2 WHERE participant_id=$1`,
-      [participantId, nowIso],
-    );
-    await primaryPool.query(
-      `UPDATE ${primaryTable("telemetry_transport_device_floors")}
-          SET minimum_rank=11, revision=4, changed_at=$3
-        WHERE participant_id=$1 AND device_id=$2`,
-      [participantId, deviceId, nowIso],
-    );
+    // Primary 0051 (e): the v1.1 consent insert itself raises the device floor
+    // and the participant floor to 11, each with revision + 1 (D1 parity), so
+    // the floors this check used to raise by hand are asserted instead.
+    assert.deepEqual((await primaryPool.query(
+      `SELECT participant.minimum_rank AS participant_rank, participant.revision AS participant_revision,
+              device.minimum_rank AS device_rank, device.revision AS device_revision
+         FROM ${primaryTable("telemetry_transport_participant_floors")} participant
+         JOIN ${primaryTable("telemetry_transport_device_floors")} device
+           ON device.participant_id = participant.participant_id AND device.device_id = $2
+        WHERE participant.participant_id = $1`,
+      [participantId, deviceId],
+    )).rows, [{ participant_rank: 11, participant_revision: 8, device_rank: 11, device_revision: 4 }]);
     const consentedCapabilities = await dispatch(request({
       url: syncCapabilitiesUrl,
       method: "GET",

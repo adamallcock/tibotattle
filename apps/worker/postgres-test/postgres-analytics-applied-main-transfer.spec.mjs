@@ -148,8 +148,8 @@ async function createTarget(pool) {
   const quoted = `"${schema}"`;
   await pool.query(`CREATE SCHEMA ${quoted}`);
   const migration = await applyPostgresMigrations({ role: "primary", schema, pool });
-  expect(migration.applied).toBe(46);
-  expect(migration.migrations.at(-1)?.name).toBe("0046_owner_journal_authority.sql");
+  expect(migration.applied).toBe(58);
+  expect(migration.migrations.at(-1)?.name).toBe("0058_owner_journal_emitter_head_precheck.sql");
   return { schema, quoted, table: name => `${quoted}."${name}"` };
 }
 

@@ -329,7 +329,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
     await pool.query(`UPDATE ${sqlSchema}.publication_state SET publication_state='ready' WHERE singleton=1`);
     await pool.query(`UPDATE ${sqlSchema}.collection_controls SET revision=revision+1, control_state='operational',
       enrollment_enabled=true, upload_registration_enabled=true, processing_enabled=true,
-      publication_enabled=true, reason_code=NULL, updated_at=clock_timestamp() WHERE singleton=1`);
+      publication_enabled=true, reason_code='maintenance', updated_at=clock_timestamp() WHERE singleton=1`);
     await pool.query(`UPDATE ${sqlSchema}.telemetry_v12_runtime SET state='active' WHERE id=1`);
     await pool.query(`UPDATE ${sqlSchema}.telemetry_v12_typed_runtime SET state='active' WHERE id=1`);
     await pool.query(`INSERT INTO ${sqlSchema}.participants(id, owner_kind, state, created_at)
@@ -770,7 +770,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
     await pool.query(`UPDATE ${sqlSchema}.publication_state SET publication_state='ready' WHERE singleton=1`);
     await pool.query(`UPDATE ${sqlSchema}.collection_controls SET revision=revision+1, control_state='operational',
       enrollment_enabled=true, upload_registration_enabled=true, processing_enabled=true,
-      publication_enabled=true, reason_code=NULL, updated_at=clock_timestamp() WHERE singleton=1`);
+      publication_enabled=true, reason_code='maintenance', updated_at=clock_timestamp() WHERE singleton=1`);
     await pool.query(`INSERT INTO ${sqlSchema}.participants(id, owner_kind, state, created_at)
       VALUES ($1, 'social', 'active', clock_timestamp())`, [PARTICIPANT_ID]);
     await pool.query(`INSERT INTO ${sqlSchema}.analytics_owner_state(source_id, owner_digest, revision, authority_epoch, state)

@@ -6,22 +6,17 @@ import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
 import pg from "pg";
 import { createServer, transformWithOxc } from "vite";
-import {
-  applyPostgresMigrations,
-  renderPostgresSearchPath,
-} from "../scripts/postgres-migrations.mjs";
+import { renderPostgresSearchPath } from "../scripts/postgres-migrations.mjs";
+import { applyMigrationsBefore } from "./promoted-migration-prefix.mjs";
 
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
 const PG_TEST_PORT = Number(process.env.PG_TEST_PORT ?? "55432");
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const FIXTURES = join(WORKER_ROOT, "postgres-test", "fixtures");
-const STAGED_MIGRATION = join(
-  WORKER_ROOT,
-  "postgres",
-  "staged-migrations",
-  "primary",
-  "0054_signin_handoff_claim_shape.sql",
-);
+// 0054 is promoted (claude/gcp-fastpath-base): schemas receive the promoted
+// chain below 0054, then the promoted 0054 file itself.
+const STAGED_MIGRATION_NAME = "0054_signin_handoff_claim_shape.sql";
+const STAGED_MIGRATION = join(WORKER_ROOT, "postgres", "migrations", "primary", STAGED_MIGRATION_NAME);
 const SECRET = "synthetic-identity-link-secret-never-real-0001";
 const OTHER_SECRET = "synthetic-identity-link-secret-never-real-0002";
 const SECRET_VERSION = "synthetic-v1";
@@ -462,7 +457,7 @@ async function localPostgresEndpoint() {
 }
 
 /**
- * Apply the stock primary migrations and then the staged 0054 fragment in one
+ * Apply the 0054 fragment (after the promoted chain below 0054) in one
  * transaction with the migration runner's search_path guard and timeouts.
  */
 async function applyStagedClaimShape(pool, schema) {
@@ -556,7 +551,7 @@ test("PostgreSQL sign-in primitives: SELECT-only pin, global start admission, pu
       "sign-in primitive qualification requires a local Unix socket");
     await pool.query(`CREATE SCHEMA ${qschema(schema)}`);
     created.push(schema);
-    await applyPostgresMigrations({ role: "primary", schema, pool });
+    await applyMigrationsBefore({ role: "primary", schema, pool, name: STAGED_MIGRATION_NAME });
     await applyStagedClaimShape(pool, schema);
     await pool.query(
       `UPDATE ${q(schema, "collection_controls")}
@@ -1075,12 +1070,12 @@ test("PostgreSQL sign-in primitives: SELECT-only pin, global start admission, pu
         );
       }
 
-      // Before 0054 a 63-character claim was accepted; the staged migration
+      // Before 0054 a 63-character claim was accepted; the migration
       // validates existing rows and refuses (all-or-nothing) instead of
       // rewriting them.
       await pool.query(`CREATE SCHEMA ${qschema(legacySchema)}`);
       created.push(legacySchema);
-      await applyPostgresMigrations({ role: "primary", schema: legacySchema, pool });
+      await applyMigrationsBefore({ role: "primary", schema: legacySchema, pool, name: STAGED_MIGRATION_NAME });
       await insertAppleHandoff(pool, legacySchema, {
         state: "legacy-apple-valid",
         expiresAt: NOW + 60_000,

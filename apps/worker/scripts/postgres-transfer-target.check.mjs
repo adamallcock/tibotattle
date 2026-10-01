@@ -32,8 +32,8 @@ import {
 } from "./postgres-transfer-target.mjs";
 
 const WORKER_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const PRIMARY_SQL = join(WORKER_ROOT, "postgres/staged-migrations/primary/0056_production_transfer_control.sql");
-const LEDGER_SQL = join(WORKER_ROOT, "postgres/staged-migrations/ledger/0007_production_transfer_control.sql");
+const PRIMARY_SQL = join(WORKER_ROOT, "postgres/migrations/primary/0056_production_transfer_control.sql");
+const LEDGER_SQL = join(WORKER_ROOT, "postgres/migrations/ledger/0007_production_transfer_control.sql");
 const SEAL = "0123456789abcdef".repeat(4);
 
 function rejectsWith(code, fn) {

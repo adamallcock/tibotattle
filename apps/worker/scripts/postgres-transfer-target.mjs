@@ -71,7 +71,7 @@ export const SEEDED_SINGLETONS = Object.freeze([
   // RD-1 lifecycle-state singleton, seeded never_run.
   seeded("primary", "quarantine_reconciliation_state"),
   seeded("primary", "retention_state"),
-  // PF-1 migration 0062 runtime row, seeded 'staged'.
+  // PF-1 migration (number assigned in plan-v5) runtime row, seeded 'staged'.
   seeded("primary", "telemetry_performance_runtime"),
   seeded("primary", "telemetry_transport_formats", 5),
   seeded("primary", "telemetry_v12_runtime"),

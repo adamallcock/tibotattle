@@ -122,8 +122,8 @@ function validEnv(overrides = {}) {
 function fakeManifest() {
   const roles = {};
   for (const [role, expected, tail] of [
-    ["primary", 46, "0046_owner_journal_authority.sql"],
-    ["ledger", 6, "0006_erasure_ledger_transfer_receipts.sql"],
+    ["primary", 58, "0058_owner_journal_emitter_head_precheck.sql"],
+    ["ledger", 7, "0007_production_transfer_control.sql"],
   ]) {
     roles[role] = Array.from({ length: expected }, (_, index) => ({
       role,
@@ -345,12 +345,12 @@ async function seedOwner(pool, schema, { withChunk = false } = {}) {
      ) VALUES ($1, 'social', 'active', 'privacy-safe-telemetry-v0.1', $2, $2)`,
     [participantId, now],
   );
-  await pool.query(
-    `INSERT INTO ${qualified(schema, "attribution_enrollments")} (
-       participant_id, namespace, created_at
-     ) VALUES ($1, $2, $3)`,
-    [participantId, randomBytes(32).toString("hex"), now],
-  );
+  // Primary 0051 creates the social participant's attribution enrollment with
+  // the participant (D1 parity); the fixture only checks that it exists.
+  assert.equal((await pool.query(
+    `SELECT count(*)::integer AS count FROM ${qualified(schema, "attribution_enrollments")} WHERE participant_id=$1`,
+    [participantId],
+  )).rows[0].count, 1);
   await pool.query(
     `INSERT INTO ${qualified(schema, "web_sessions")} (
        id, participant_id, secret_hash, csrf_hash, issued_at, expires_at, last_used_at
