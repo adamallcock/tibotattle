@@ -2400,5 +2400,10 @@
     ]
    }
   ]
+ },
+ "bootstrapPredecessor": {
+  "inputRevision": 0,
+  "winnersJson": "[]",
+  "legacyFingerprint": "d4a9a459bb63a9a04a07ca000e719da616e8a984e02030269afc489f069f8d55"
  }
 }

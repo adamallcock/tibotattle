@@ -46,6 +46,17 @@ const tables = Object.fromEntries(TELEMETRY_V11_SHAPE_TABLES.map((name) => {
 }));
 const ownerOriginalHex = typedIdHex(owner.participantId);
 const expected = telemetryV11DayShape(tables, { participantId: owner.participantId, day, ownerOriginalHex });
+// The owner's bootstrap predecessor (no previous generation): its legacy
+// fingerprint binds only the owner's input revision and legacy evidence, so a
+// fresh PostgreSQL owner with the same evidence must reproduce it exactly.
+const predecessors = d1DumpRows(dump.tables.find((entry) => entry.name === "telemetry_v11_domain_predecessors"))
+  .filter((row) => row.participant_id === owner.participantId && row.previous_generation_id === null);
+if (predecessors.length !== 1) throw new Error("expected one bootstrap predecessor");
+const bootstrapPredecessor = {
+  inputRevision: predecessors[0].input_revision,
+  winnersJson: predecessors[0].winners_json,
+  legacyFingerprint: predecessors[0].legacy_fingerprint,
+};
 
 await writeFile(outputPath, JSON.stringify({
   schemaVersion: "telemetry-v11-live-q1-day-v1",
@@ -63,6 +74,7 @@ await writeFile(outputPath, JSON.stringify({
   parserVersion: PARSER_VERSION,
   records: corpusDay.records,
   expected,
+  bootstrapPredecessor,
 }, null, 1) + "\n", { flag: "wx" });
 console.log(JSON.stringify({ wrote: outputPath, chunks: expected.chunks.length,
   records: expected.chunks.reduce((total, chunk) => total + chunk.records.length, 0) }));

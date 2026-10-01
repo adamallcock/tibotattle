@@ -2304,5 +2304,10 @@
     ]
    }
   ]
+ },
+ "bootstrapPredecessor": {
+  "inputRevision": 0,
+  "winnersJson": "[]",
+  "legacyFingerprint": "dfcb0bc64676c29112e64b47f730dc76cab7428b5c42951ee10061d07e009ec2"
  }
 }

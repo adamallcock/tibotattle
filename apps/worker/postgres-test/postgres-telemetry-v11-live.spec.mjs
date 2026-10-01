@@ -630,6 +630,15 @@ test("PostgreSQL 17 runs a full v1.1 upload cycle with Worker-equal rows, replay
     const predecessor = await predecessorResponse.json();
     assert.equal(predecessor.schemaVersion, "telemetry-domain-predecessor-v1.1");
     assert.equal(predecessor.previousGenerationId, null);
+    // Same owner evidence as the oracle's bootstrap predecessor, same fingerprint.
+    assert.equal(predecessor.legacyFingerprint, fixture.bootstrapPredecessor.legacyFingerprint);
+    const storedPredecessor = (await primaryPool.query(
+      `SELECT input_revision::int AS input_revision, winners_json FROM ${q(primarySchema, "telemetry_v11_domain_predecessors")}
+        WHERE token_hash = $1`, [sha256Hex(predecessor.token)],
+    )).rows[0];
+    assert.deepEqual(storedPredecessor, {
+      input_revision: fixture.bootstrapPredecessor.inputRevision, winners_json: fixture.bootstrapPredecessor.winnersJson,
+    });
     const today = new Date().toISOString().slice(0, 10);
     assert.deepEqual([predecessor.fromDay, predecessor.throughDay], [today, today]);
 
@@ -1121,6 +1130,7 @@ test("an accountless v1.1 owner negotiates successors, matches the Q-1 rows, and
       "/api/v1/me/telemetry-v11/domain-predecessor", {},
     ))).json();
     assert.equal(predecessor.previousGenerationId, null);
+    assert.equal(predecessor.legacyFingerprint, ownerB.bootstrapPredecessor.legacyFingerprint);
     const today = new Date().toISOString().slice(0, 10);
     const days = [{ day: ownerB.day, manifestId: candidate.manifestId, manifestDigest: candidate.manifestDigest }];
     for (const day of utcDays(ownerB.day, today).slice(1)) {
