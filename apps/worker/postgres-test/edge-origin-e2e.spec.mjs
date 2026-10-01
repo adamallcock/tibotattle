@@ -39,6 +39,7 @@ import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { Miniflare } from "miniflare";
 import pg from "pg";
 import { createServer } from "vite";
 import {
@@ -55,6 +56,7 @@ import { buildEdgeBundle, readCompatibility } from "../scripts/edge-e2e/edge-bun
 import {
   EDGE_E2E_ADMIN_ORIGIN,
   EDGE_E2E_AUDIENCE,
+  EDGE_E2E_COMPATIBILITY,
   EDGE_E2E_INVOKER,
   EDGE_E2E_PUBLIC_ORIGIN,
   EDGE_E2E_SOURCE_COMMIT,
@@ -748,6 +750,22 @@ test("S0 modes: fenced, absent and invalid gcp answer at the edge; worker mode e
     assert.equal(mask(a.text), mask(b.text), path);
   }
   assert.equal(today.refusals.length + workerMode.refusals.length, 0, "the Worker made no subrequest");
+
+  // E5 caches one proxy per env object (a WeakMap). workerd hands the same env
+  // object to every request of an isolate, sequential or concurrent, so the
+  // invoker key is imported once per isolate.
+  const probe = new Miniflare({ modules: true, compatibilityDate: EDGE_E2E_COMPATIBILITY.date,
+    compatibilityFlags: [...EDGE_E2E_COMPATIBILITY.flags], bindings: { SETTING: "1" },
+    script: "const seen = new WeakSet(); export default { async fetch(request, env) {"
+      + " const had = seen.has(env); seen.add(env); return new Response(String(had)); } };" });
+  try {
+    const sequential = [];
+    for (let index = 0; index < 3; index += 1) sequential.push(await (await probe.dispatchFetch("http://probe.test/")).text());
+    const concurrent = await Promise.all([1, 2, 3].map(async () => (await probe.dispatchFetch("http://probe.test/")).text()));
+    assert.deepEqual([...sequential, ...concurrent], ["false", "true", "true", "true", "true", "true"]);
+  } finally {
+    await probe.dispose();
+  }
 });
 
 // ---------------------------------------------------------------------------

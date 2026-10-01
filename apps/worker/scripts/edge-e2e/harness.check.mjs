@@ -217,3 +217,20 @@ test("S4's production limits are the checked-in env.production values", async ()
     UPLOAD_INGRESS_REQUEST_RATE_LIMIT: 3000, UPLOAD_INGRESS_CLIENT_RATE_LIMIT: 3000,
   });
 });
+
+test("the edge-mode dry run fails a gcp candidate that keeps storage or a main module with other exports", async () => {
+  const { dryRunViolations } = await import("./edge-mode-dry-run.mjs");
+  const exports = ["UploadIngressBudget", "default", "handleRequest", "isPostgresWorkerRequestPathSupported",
+    "runScheduledMaintenance"];
+  const storage = { d1: ["ANALYTICS_DB", "DELETION_LEDGER", "USAGE_MONITOR_DB"], r2: ["QUARANTINE", "SPARKLE_RELEASES"] };
+  const good = [
+    { mode: "worker", main: "src/edge-entry.ts", modeVar: "worker", exports, ...storage },
+    { mode: "fenced", main: "src/edge-entry.ts", modeVar: "fenced", exports, ...storage },
+    { mode: "gcp", main: "src/edge-entry.ts", modeVar: "gcp", exports, d1: ["RELEASE_GUARD_DB"], r2: ["SPARKLE_RELEASES"] },
+  ];
+  assert.deepEqual(dryRunViolations(good), []);
+  assert.deepEqual(dryRunViolations([good[0], good[1], { ...good[2], d1: ["RELEASE_GUARD_DB", "USAGE_MONITOR_DB"] }]),
+    ["gcp: a data binding survives"]);
+  assert.deepEqual(dryRunViolations([{ ...good[0], exports: [...exports, "EDGE_LOCAL_ENV_KEYS"] }, good[1], good[2]]),
+    [`worker: main-module exports ${[...exports, "EDGE_LOCAL_ENV_KEYS"].join(",")}`]);
+});
