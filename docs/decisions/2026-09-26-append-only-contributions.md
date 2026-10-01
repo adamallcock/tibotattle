@@ -2,16 +2,13 @@
 title: Append-only contributions on the Google Cloud service
 date: 2026-09-26
 type: decision-record
-status: owner-sign-off-pending
+status: accepted
 ---
 
 # Append-only contributions on the Google Cloud service
 
-> **Owner sign-off pending.** This record restates choices the owner made in
-> chat. It is not adopted policy until the owner approves this text in chat.
-> After approval the integration lead sets `status: accepted`, records the
-> approval date in [Sign-off](#sign-off) and moves the index entry into the
-> current authorities. This record changes no current Cloudflare behavior. It
+> **Accepted.** The owner approved this text in chat on 2026-09-30. It restates
+> choices the owner made in chat. This record changes no current Cloudflare behavior. It
 > authorizes no production write, migration, deployment or cutover. It is not
 > legal advice and makes no legal-sufficiency claim. It contains no
 > identifiers, session content or deployment evidence.
@@ -20,7 +17,7 @@ status: owner-sign-off-pending
 |---|---|
 | Decided by the owner | D1 to D4 and D6 in chat on 2026-09-26; D5 is the hosting boundary in force for the 2026-10-01 GCP fast path |
 | Recorded | 2026-10-01, for the GCP fast path (DOC-1L) |
-| Owner sign-off | Pending |
+| Owner sign-off | Approved in chat on 2026-09-30 |
 | Applies to | The proposed PostgreSQL service on Google Cloud, from an owner-authorized cutover |
 | Does not apply to | Current Cloudflare production, local analysis, local erase or Keychain identity reset |
 | Delivery plan | [GCP fast path](../plans/2026-10-01-gcp-fastpath.md) |
@@ -328,18 +325,13 @@ before, so that each stays truthful for the running service.
 
 ## Sign-off
 
-- [ ] The owner approves this text in chat (fast-path OD-6). Approval date:
-  pending.
+- [x] The owner approved this text in chat (fast-path OD-6) on 2026-09-30.
 
-After approval the integration lead:
-
-1. sets `status: accepted` and records the approval date here;
-2. moves this record's `docs/README.md` entry into the current authorities;
-3. schedules the supersession notes and disclosure changes above for the
-   cutover commit.
+Still owed: the supersession notes and disclosure changes above land in the
+cutover commit.
 
 ## Evidence boundary
 
-This record is a decision text awaiting sign-off. It is not a deployment
+This record is an accepted decision text. It is not a deployment
 receipt. Adoption, implementation, tests, privacy-page publication and the
 production cutover are separate gates, and this document proves none of them.
