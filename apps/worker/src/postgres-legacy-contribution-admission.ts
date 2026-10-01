@@ -21,27 +21,34 @@
  * exact journal row (storage_journal_append) publishes the chunk.
  *
  * A correction (chunkRevision = current + 1) supersedes the current chunk
- * and deletes its typed rows exactly as D1 does, through the staged
- * legacy_contribution_admission migration's retention allowance, and is
- * refused (503) exactly where D1's typed_v1_supersession_guard refuses it:
- * for a participant with a v1.1 domain head or an accepted v0.1
- * contribution, which gets no graph-scope marker on D1.
+ * and deletes its typed rows exactly as D1 does, through primary 0061's
+ * retention allowance, and is refused (503) exactly where D1's
+ * typed_v1_supersession_guard refuses it: for a participant with a v1.1
+ * domain head or an accepted v0.1 contribution, which gets no graph-scope
+ * marker on D1.
+ *
+ * A usage correction while the imported usage-correction runtime is active
+ * (telemetry_usage_correction_runtime.source_state = 'active', primary
+ * 0034's carrier of the sealed D1 state) is admitted (202) and archives the
+ * superseded chunk exactly as d43c8f92 does
+ * (prepareTelemetryUsageCorrectionForV1Replacement and
+ * commitCaptureContextWithResults in telemetry-usage-correction-repository.ts,
+ * with ingestion-isolation 0006's history-fact trigger): in the same
+ * transaction, before the supersession, one telemetry_usage_correction_history
+ * row per admitted usage record of the current chunk and one method-1
+ * telemetry_usage_correction_facts row per inserted history row, with D1's
+ * row ids (max + 1, in typed-record order) and D1's owner CAS. A correction
+ * D1's capture refuses (no active owner link or owner head for the chunk's
+ * event, a page over the runtime's max_capture_rows or the record byte
+ * bounds, a source that does not prove itself) is 503 as on D1, which maps
+ * every capture failure to BACKEND_STORAGE_UNAVAILABLE in typed mode. With
+ * the runtime staged or absent nothing is captured, as on D1. (0034's
+ * header predates this port: importing the sealed state still enables
+ * nothing by itself, and this live v1.0 intake is the one writer that acts
+ * on an imported source_state of 'active'.)
  *
  * Deliberate v1.0 differences, each a refusal rather than an invented
  * behaviour:
- *   - OPEN OWNER DECISION (OD-4 question 1). A usage correction while the
- *     imported usage-correction runtime was active (0034 source_state) is
- *     refused with 503 BACKEND_STORAGE_UNAVAILABLE. D1 accepts the same
- *     correction (202) and also records usage-correction facts. That writer
- *     is not ported, and 0034 keeps the PostgreSQL runtime staged with
- *     correction writes disabled. If production's runtime is active at
- *     cutover, shipped clients are affected: the d43c8f92 v1.0 sync engine
- *     retries a 503 as service_unavailable and uploads oldest day first, so
- *     a device whose last usage segment changed stops advancing its v1.0
- *     sync at that correction until this is resolved. The ways out (port
- *     the capture writer, or accept corrections without capture and record
- *     the correction history as incomplete) are owner decisions, not port
- *     choices.
  *   - D1's database-size admission probe (typed-storage-capacity.ts) has no
  *     PostgreSQL meaning and is not run.
  *   - D1's JSON-era analytics side effects that 0057 retired on PostgreSQL
@@ -72,6 +79,7 @@ import {
 } from "./postgres-client";
 import { assertPostgresTelemetryTransportWriteAllowed } from "./postgres-transport-write-authority";
 import { verifyPostgresTypedIdentityHeadroom } from "./postgres-typed-live-allocators";
+import { prepareUsageCorrectionAssertion } from "./telemetry-usage-reconciliation";
 import { priceTelemetryUsageEvent, type ServerPricingResult } from "./server-pricing";
 import {
   telemetryContributionAdmissionWindow,
@@ -344,19 +352,48 @@ async function readAdmissionState(
   });
 }
 
+/** d43c8f92 telemetry-usage-correction-repository.ts bounds. */
+const USAGE_CORRECTION_SCHEMA_VERSION = "telemetry-usage-correction-v1";
+const USAGE_CORRECTION_METHOD_VERSION = "usage-total-correction-v1";
+const MAX_USAGE_CORRECTION_CAPTURE_ROWS = 200;
+const MAX_USAGE_CORRECTION_RECORD_BYTES = 16_384;
+const MAX_USAGE_CORRECTION_PAGE_BYTES = 1_250_000;
+const MAX_USAGE_CORRECTION_OWNER_COUNTER = 0x7fffffff;
+const USAGE_CORRECTION_IDENTIFIER = /^[A-Za-z0-9._:-]{1,256}$/u;
+
+interface UsageCorrectionRuntime {
+  readonly maxCaptureRows: number;
+}
+
 /**
- * True when the imported D1 usage-correction runtime was active
- * (telemetry_usage_correction_runtime.source_state, primary 0034). D1 then
- * captures usage-correction facts on a usage correction; with the table
- * absent or staged it captures none, which is the only case ported.
+ * The imported D1 usage-correction runtime when it is active
+ * (telemetry_usage_correction_runtime.source_state, primary 0034), else
+ * null. D1 captures usage-correction history only when its runtime row is
+ * active; staged (or, on PostgreSQL, never imported) captures nothing. A
+ * row outside D1's runtime contract refuses, as D1's validateRuntime does.
  */
-async function usageCorrectionRuntimeActive(client: PostgresClient, schema: string): Promise<boolean> {
-  const result = await client.query<{ source_state: string }>(
-    `SELECT source_state FROM ${table(schema, "telemetry_usage_correction_runtime")} WHERE id = 1`,
+async function activeUsageCorrectionRuntime(
+  client: PostgresClient, schema: string,
+): Promise<UsageCorrectionRuntime | null> {
+  const result = await client.query<{
+    schema_version: string; method_version: string; source_state: string;
+    max_capture_rows: number; max_history_page: number;
+  }>(
+    `SELECT schema_version, method_version, source_state, max_capture_rows, max_history_page
+       FROM ${table(schema, "telemetry_usage_correction_runtime")} WHERE id = 1`,
   );
-  const state = result.rows[0]?.source_state;
-  if (state !== undefined && state !== "staged" && state !== "active") throw unavailable();
-  return state === "active";
+  const row = result.rows[0];
+  if (row === undefined) return null;
+  if (row.schema_version !== USAGE_CORRECTION_SCHEMA_VERSION
+      || row.method_version !== USAGE_CORRECTION_METHOD_VERSION
+      || (row.source_state !== "staged" && row.source_state !== "active")
+      || !Number.isSafeInteger(row.max_capture_rows) || row.max_capture_rows < 1
+      || row.max_capture_rows > MAX_USAGE_CORRECTION_CAPTURE_ROWS
+      || !Number.isSafeInteger(row.max_history_page) || row.max_history_page < 1
+      || row.max_history_page > MAX_USAGE_CORRECTION_CAPTURE_ROWS) {
+    throw unavailable();
+  }
+  return row.source_state === "active" ? Object.freeze({ maxCaptureRows: row.max_capture_rows }) : null;
 }
 
 /** Port of telemetryV1DeviceConsentCurrent. */
@@ -434,6 +471,7 @@ async function acknowledgedThroughDay(
 }
 
 interface TypedReadbackRow {
+  storage_row_id: string;
   source_row_id: string;
   stream: number;
   occurrence_id: Uint8Array;
@@ -468,6 +506,17 @@ interface TypedReadbackRow {
   canonical_digest: Uint8Array;
 }
 
+/** One admitted record, decoded and proven against its canonical digest. */
+interface AdmittedRecordRow {
+  /** typed_telemetry_records.id (D1's storage row id). */
+  readonly storageRowId: number;
+  readonly sourceRowId: number;
+  /** The canonical record bytes (D1's compatibility record_json). */
+  readonly canonicalRecord: string;
+  readonly canonicalDigest: Uint8Array;
+  readonly record: unknown;
+}
+
 /**
  * Rebuild a chunk's admitted records from the typed family in source-row
  * order and return the canonical records. Port of the D1 compatibility
@@ -476,9 +525,16 @@ interface TypedReadbackRow {
 async function readAdmittedRecords(
   client: PostgresClient, schema: string, chunkRowId: string, deviceId: string,
 ): Promise<unknown[]> {
+  return (await readAdmittedRecordRows(client, schema, chunkRowId, deviceId)).map((row) => row.record);
+}
+
+async function readAdmittedRecordRows(
+  client: PostgresClient, schema: string, chunkRowId: string, deviceId: string,
+): Promise<AdmittedRecordRow[]> {
   const dictionary = table(schema, "typed_telemetry_dictionary");
   const result = await client.query<TypedReadbackRow>(
-    `SELECT record.source_row_id::text AS source_row_id, record.stream, record.occurrence_id,
+    `SELECT record.id::text AS storage_row_id, record.source_row_id::text AS source_row_id,
+            record.stream, record.occurrence_id,
             record.observed_at_ms::text AS observed_at_ms, provider.value AS provider,
             device.original_id AS device_original, chunk.original_id AS chunk_original,
             identifier.value AS session_value, model.value AS model_id, speed.value AS speed_mode,
@@ -525,7 +581,7 @@ async function readAdmittedRecords(
       LIMIT 201`,
     [chunkRowId],
   );
-  const records: unknown[] = [];
+  const records: AdmittedRecordRow[] = [];
   for (const row of result.rows) {
     const stream = STREAMS[safeInteger(row.stream, 1, 3) - 1]!;
     if (decodeTypedTelemetryId(bytes(row.device_original)) !== deviceId
@@ -573,8 +629,15 @@ async function readAdmittedRecords(
       fields.tools = tools;
     }
     const canonical = typedTelemetryCanonicalRecords(fields);
-    if (!sameBytes(await sha256(canonical.canonicalRecord), bytes(row.canonical_digest))) throw unavailable();
-    records.push(JSON.parse(canonical.canonicalRecord));
+    const canonicalDigest = bytes(row.canonical_digest);
+    if (!sameBytes(await sha256(canonical.canonicalRecord), canonicalDigest)) throw unavailable();
+    records.push(Object.freeze({
+      storageRowId: safeInteger(row.storage_row_id, 1),
+      sourceRowId: safeInteger(row.source_row_id, 1),
+      canonicalRecord: canonical.canonicalRecord,
+      canonicalDigest,
+      record: JSON.parse(canonical.canonicalRecord),
+    }));
   }
   return records;
 }
@@ -703,6 +766,204 @@ async function idRow(
   return String(safeInteger(result.rows[0]!.id, 1));
 }
 
+interface UsageCorrectionCapture {
+  readonly ownerDigest: string;
+  readonly ownerRevision: number;
+  readonly authorityEpoch: number;
+}
+
+function hexBytes(value: Uint8Array): string {
+  return Array.from(value, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * Archive the current usage chunk a v1.0 correction supersedes, as d43c8f92
+ * does when its usage-correction runtime is active
+ * (prepareTelemetryUsageCorrectionForV1Replacement, then
+ * commitCaptureContextWithResults: one history row per admitted usage record
+ * through historyInsertPage, the ingestion-isolation 0006 history_fact
+ * trigger's method-1 fact for each inserted row, and verifyCapturedFacts).
+ * It runs inside the persist transaction, after the graph-scope marker and
+ * before the supersession, so the archived rows are the current chunk's
+ * rows; every refusal is D1's unmapped capture failure, which typed mode
+ * answers 503. Lock order: the owner link (after mutation_control, as the
+ * rest of the persist), then the correction history and facts tables for
+ * D1's max + 1 row ids. D1's CAS fence (the owner head is unchanged when the
+ * archive commits) is checked against the journal row this upload appends;
+ * see persistTypedChunk.
+ */
+async function captureUsageCorrection(
+  client: PostgresClient, schema: string,
+  input: {
+    readonly principal: PostgresTelemetryV1Principal;
+    readonly current: TelemetryV1ChunkRow;
+    readonly sourceNamespace: string;
+    readonly runtime: UsageCorrectionRuntime;
+    readonly capturedAtMs: number;
+  },
+): Promise<UsageCorrectionCapture> {
+  const { principal, current, sourceNamespace } = input;
+  // D1 validateSource: identifiers and counters inside the archive contract.
+  for (const value of [principal.participantId, principal.deviceId, sourceNamespace, current.id]) {
+    if (!USAGE_CORRECTION_IDENTIFIER.test(value)) throw unavailable();
+  }
+  if (!Number.isSafeInteger(input.capturedAtMs) || input.capturedAtMs < 0
+      || input.capturedAtMs > 8_640_000_000_000_000) {
+    throw unavailable();
+  }
+  // D1's `current` CTE: the admitted, unsuperseded usage chunk, its event in
+  // this namespace, the active owner link of that event and the active owner
+  // head. The link is locked until commit.
+  const headResult = await client.query<{
+    record_count: number; event_digest: string; owner_digest: string; chunk_digest: string;
+    revision: string; authority_epoch: string;
+  }>(
+    `SELECT chunk.record_count, event.event_digest, event.owner_digest, chunk.chunk_digest,
+            owner.revision::text AS revision, owner.authority_epoch::text AS authority_epoch
+       FROM ${table(schema, "telemetry_v1_chunks")} chunk
+       JOIN ${table(schema, "typed_v1_event_sources")} event ON event.chunk_id = chunk.id
+       JOIN ${table(schema, "storage_v11_owner_links")} link
+         ON link.participant_id = event.participant_id AND link.owner_digest = event.owner_digest
+        AND link.state = 'active'
+       JOIN ${table(schema, "storage_source_state")} source ON source.singleton = 1
+       JOIN ${table(schema, "storage_owner_revisions")} owner
+         ON owner.source_id = source.source_id AND owner.owner_digest = event.owner_digest
+        AND owner.state = 'active'
+      WHERE chunk.id = $1 AND chunk.participant_id = $2 AND chunk.device_id = $3
+        AND chunk.stream = 'usage' AND chunk.superseded_at IS NULL
+        AND chunk.record_count BETWEEN 1 AND 200 AND chunk.accepted_record_count = chunk.record_count
+        AND event.participant_id = chunk.participant_id AND event.source_namespace = $4
+        AND chunk.record_count = (SELECT count(*) FROM ${table(schema, "typed_v1_record_admissions")} admitted
+                                   WHERE admitted.chunk_id = chunk.id)
+      FOR UPDATE OF link`,
+    [current.id, principal.participantId, principal.deviceId, sourceNamespace],
+  );
+  if (headResult.rows.length !== 1) throw unavailable();
+  const head = headResult.rows[0]!;
+  const ownerRevision = safeInteger(head.revision, 1, MAX_USAGE_CORRECTION_OWNER_COUNTER);
+  const authorityEpoch = safeInteger(head.authority_epoch, 1, MAX_USAGE_CORRECTION_OWNER_COUNTER);
+  if (!DIGEST.test(head.owner_digest) || !DIGEST.test(head.event_digest) || !DIGEST.test(head.chunk_digest)) {
+    throw unavailable();
+  }
+  const recordCount = safeInteger(head.record_count, 1, MAX_USAGE_CORRECTION_CAPTURE_ROWS);
+
+  // D1's page: every admitted record of the chunk is a usage record, in
+  // storage-row order, decoded to its canonical bytes (D1 sourceRows and
+  // readTypedTelemetryRowsByStorageIds).
+  const page = (await readAdmittedRecordRows(client, schema, current.id, principal.deviceId))
+    .sort((left, right) => left.storageRowId - right.storageRowId);
+  if (page.length !== recordCount || page.length > MAX_USAGE_CORRECTION_CAPTURE_ROWS) throw unavailable();
+  if (input.runtime.maxCaptureRows < page.length) throw unavailable();
+  let pageBytes = 0;
+  const sources: { readonly row: AdmittedRecordRow; readonly baseDigest: string }[] = [];
+  for (const row of page) {
+    const recordBytes = encoder.encode(row.canonicalRecord).byteLength;
+    pageBytes += recordBytes;
+    if (recordBytes > MAX_USAGE_CORRECTION_RECORD_BYTES || pageBytes > MAX_USAGE_CORRECTION_PAGE_BYTES) {
+      throw unavailable();
+    }
+    let assertion;
+    try {
+      assertion = await prepareUsageCorrectionAssertion({ format: "v1", recordJson: row.canonicalRecord });
+    } catch {
+      throw unavailable();
+    }
+    // D1 validateAssertion against the decoded source row.
+    const record = row.record as {
+      eventId?: unknown; eventTime?: unknown; totalInputContextTokens?: unknown;
+      components?: { outputCombinedTokens?: unknown };
+    };
+    if (assertion.methodVersion !== USAGE_CORRECTION_METHOD_VERSION
+        || assertion.occurrenceId !== record.eventId || assertion.eventTime !== record.eventTime
+        || assertion.recordDigest !== hexBytes(row.canonicalDigest)
+        || !DIGEST.test(assertion.baseDigest)
+        || assertion.totalInputContextTokens !== record.totalInputContextTokens
+        || assertion.outputCombinedTokens !== record.components?.outputCombinedTokens) {
+      throw unavailable();
+    }
+    sources.push(Object.freeze({ row, baseDigest: assertion.baseDigest }));
+  }
+
+  // D1 allocates INTEGER PRIMARY KEY row ids (max + 1). These locks
+  // serialize allocation with every other writer of the two tables until
+  // commit; readers are not blocked.
+  await client.query(
+    `LOCK TABLE ${table(schema, "telemetry_usage_correction_history")},
+                ${table(schema, "telemetry_usage_correction_facts")} IN SHARE ROW EXCLUSIVE MODE`,
+  );
+  const history = table(schema, "telemetry_usage_correction_history");
+  const facts = table(schema, "telemetry_usage_correction_facts");
+  for (const { row, baseDigest } of sources) {
+    // historyInsertPage for one source: the archived values are read from
+    // the admitted typed row itself, which must still carry this digest.
+    const inserted = await client.query<{ id: string; captured_at_ms: string }>(
+      `INSERT INTO ${history} (
+         id, participant_id, owner_digest, owner_revision, authority_epoch, source_format, namespace_id,
+         owner_id, device_id, chunk_id, manifest_id, source_storage_row_id, source_row_id, occurrence_id,
+         event_time_ms, provider_id, session_id, model_id, speed_mode_id, api_service_tier_id, surface_id,
+         billing_surface_id, reasoning_effort_id, agent_scope_id, outcome_id, attribution_id,
+         total_input_context_tokens, input_uncached_tokens, input_cache_read_tokens, input_cache_write_tokens,
+         output_text_tokens, output_reasoning_tokens, output_combined_tokens, source_chunk_digest,
+         source_event_digest, record_digest, base_digest, captured_at_ms
+       )
+       SELECT (SELECT COALESCE(max(existing.id), 0) + 1 FROM ${history} existing),
+              $1, decode($2, 'hex'), $3, $4, ${POSTGRES_TYPED_V1_FORMAT}, raw.namespace_id, raw.owner_id,
+              raw.device_id, raw.chunk_id, raw.manifest_id, raw.id, raw.source_row_id, raw.occurrence_id,
+              raw.observed_at_ms, raw.provider_id, usage.session_id, usage.model_id, usage.speed_mode_id,
+              usage.api_service_tier_id, usage.surface_id, usage.billing_surface_id,
+              usage.reasoning_effort_id, usage.agent_scope_id, usage.outcome_id, usage.attribution_id,
+              usage.total_input_context_tokens, usage.input_uncached_tokens, usage.input_cache_read_tokens,
+              usage.input_cache_write_tokens, usage.output_text_tokens, usage.output_reasoning_tokens,
+              usage.output_combined_tokens, decode($5, 'hex'), decode($6, 'hex'), raw.canonical_digest,
+              decode($7, 'hex'), $8
+         FROM ${table(schema, "typed_telemetry_records")} raw
+         JOIN ${table(schema, "typed_telemetry_usage")} usage ON usage.record_id = raw.id
+         JOIN ${table(schema, "typed_v1_record_admissions")} admitted
+           ON admitted.typed_record_id = raw.id AND admitted.chunk_id = $9
+        WHERE raw.id = $10 AND raw.format = ${POSTGRES_TYPED_V1_FORMAT} AND raw.stream = 1
+          AND raw.manifest_id IS NULL AND raw.source_row_id = $11 AND raw.canonical_digest = decode($12, 'hex')
+       ON CONFLICT DO NOTHING
+       RETURNING id::text AS id, captured_at_ms::text AS captured_at_ms`,
+      [principal.participantId, head.owner_digest, ownerRevision, authorityEpoch, head.chunk_digest,
+        head.event_digest, baseDigest, input.capturedAtMs, current.id, row.storageRowId, row.sourceRowId,
+        hexBytes(row.canonicalDigest)],
+    );
+    if (inserted.rows.length === 1) {
+      // ingestion-isolation 0006 telemetry_usage_correction_history_fact.
+      await client.query(
+        `INSERT INTO ${facts} (id, history_id, method_version, captured_at_ms)
+         SELECT COALESCE(max(existing.id), 0) + 1, $1, 1, $2 FROM ${facts} existing
+         ON CONFLICT (history_id, method_version) DO NOTHING`,
+        [inserted.rows[0]!.id, inserted.rows[0]!.captured_at_ms],
+      );
+    }
+  }
+
+  // verifyCapturedFacts: every source has its history row and method-1 fact
+  // under this owner, whether written now or already archived.
+  const verified = await client.query<{ n: number }>(
+    `SELECT count(DISTINCT history.id)::int AS n
+       FROM jsonb_to_recordset($1::jsonb) AS requested(storage_row_id bigint, base_digest text)
+       JOIN ${table(schema, "typed_telemetry_records")} raw ON raw.id = requested.storage_row_id
+       JOIN ${history} history
+         ON history.participant_id = $2 AND history.owner_digest = decode($3, 'hex')
+        AND history.source_format = ${POSTGRES_TYPED_V1_FORMAT}
+        AND history.namespace_id = raw.namespace_id AND history.owner_id = raw.owner_id
+        AND history.device_id = raw.device_id AND history.chunk_id = raw.chunk_id
+        AND history.manifest_id IS NOT DISTINCT FROM raw.manifest_id
+        AND history.source_row_id = raw.source_row_id
+        AND history.source_chunk_digest = decode($4, 'hex') AND history.source_event_digest = decode($5, 'hex')
+        AND history.record_digest = raw.canonical_digest
+        AND history.base_digest = decode(requested.base_digest, 'hex')
+       JOIN ${facts} fact ON fact.history_id = history.id AND fact.method_version = 1`,
+    [JSON.stringify(sources.map(({ row, baseDigest }) => ({
+      storage_row_id: row.storageRowId, base_digest: baseDigest,
+    }))), principal.participantId, head.owner_digest, head.chunk_digest, head.event_digest],
+  );
+  if (verified.rows[0]?.n !== sources.length) throw unavailable();
+  return Object.freeze({ ownerDigest: head.owner_digest, ownerRevision, authorityEpoch });
+}
+
 interface PersistInput {
   readonly principal: PostgresTelemetryV1Principal;
   readonly chunk: TelemetryV1Chunk;
@@ -730,7 +991,10 @@ interface PersistInput {
  * D1's triggers as explicit steps. Lock order: participant, device, upload
  * grant, v1.0 consent, typed v1 admission state, current slot, admission
  * window, then (through begin_graph_scope, the chunk triggers and
- * storage_journal_append) mutation_control, owner link and storage source.
+ * storage_journal_append) mutation_control, owner link and storage source;
+ * a usage correction under an active correction runtime takes the owner link
+ * and then the correction history and facts tables right after
+ * mutation_control (captureUsageCorrection).
  *
  * Refusal codes follow D1's typed mode (persistTelemetryV1StorageChunk):
  * a header-authority or consume failure is 'upload unavailable', which
@@ -803,10 +1067,6 @@ async function persistTypedChunk(
       return { acceptedRecords: chunk.records.length, replay: true, supersededRevision: null };
     }
     if (chunk.chunkRevision !== current.revision + 1) throw unavailable();
-    // A usage correction under an active correction runtime also records
-    // usage-correction facts on D1 (prepareTelemetryUsageCorrectionForV1Replacement);
-    // that writer is not ported and 0034 keeps the PostgreSQL runtime staged.
-    if (chunk.stream === "usage" && await usageCorrectionRuntimeActive(client, schema)) throw unavailable();
     // D1 writes the supersede graph-scope marker only for a participant with
     // no v1.1 domain head and no accepted v0.1 contribution
     // (prepareTelemetryV1ChunkWrite); without it typed_v1_supersession_guard
@@ -864,11 +1124,22 @@ async function persistTypedChunk(
     },
   })]);
 
+  // A usage correction under an active correction runtime archives the
+  // current chunk first (D1: the capture batch precedes the chunk write).
+  const correctionRuntime = current && chunk.stream === "usage"
+    ? await activeUsageCorrectionRuntime(client, schema) : null;
+  const captured = current && correctionRuntime !== null
+    ? await captureUsageCorrection(client, schema, {
+      principal, current, sourceNamespace: input.sourceNamespace, runtime: correctionRuntime,
+      capturedAtMs: Date.parse(input.checkedAt),
+    })
+    : null;
+
   if (current) {
     // D1 order: the prior revision leaves the current view, then its typed
-    // rows go (the staged migration's retention allowance), then the new
-    // revision enters. Header, allocation and event receipt of the prior
-    // revision are retained.
+    // rows go (primary 0061's retention allowance), then the new revision
+    // enters. Header, allocation and event receipt of the prior revision are
+    // retained.
     const superseded = await client.query(
       `UPDATE ${table(schema, "telemetry_v1_chunks")} SET superseded_at = $3::timestamptz
         WHERE id = $1 AND participant_id = $2 AND superseded_at IS NULL`,
@@ -1126,6 +1397,23 @@ async function persistTypedChunk(
     `SELECT ${schema}.storage_journal_append($1, $2, $3, $3, $4)`,
     [kind, digest, eventDigest, chunk.chunkDigest],
   );
+  if (captured !== null) {
+    // D1's telemetry_usage_correction_cas_guard: the archive's owner head is
+    // exactly the head this upload's journal row extends.
+    const appended = await client.query<{ owner_revision: string; authority_epoch: string }>(
+      `SELECT change.owner_revision::text AS owner_revision, change.authority_epoch::text AS authority_epoch
+         FROM ${table(schema, "storage_ingestion_changes")} change
+         JOIN ${table(schema, "storage_source_state")} source ON source.singleton = 1
+        WHERE change.source_id = source.source_id AND change.event_digest = $1 AND change.owner_digest = $2`,
+      [eventDigest, digest],
+    );
+    const row = appended.rows[0];
+    if (digest !== captured.ownerDigest || appended.rows.length !== 1
+        || Number(row!.owner_revision) !== captured.ownerRevision + 1
+        || Number(row!.authority_epoch) !== captured.authorityEpoch + (kind === "source-updated" ? 0 : 1)) {
+      throw unavailable();
+    }
+  }
   const linked = await client.query(
     `UPDATE ${table(schema, "storage_v11_owner_links")}
         SET state = 'active', object_digest = $2, manifest_digest = $3
@@ -1330,12 +1618,6 @@ export async function admitPostgresTelemetryV1Contribution(
   const admission = await withPostgresRead(pool, (client) => chunkAdmission(client, schema, principal, nowEpoch),
     { operation: "telemetry_v1.admission", preserveSafeError });
   if (admission.state === "exhausted") throw telemetryV1ChunkAdmissionError(admission, nowEpoch);
-  if (current && chunk.stream === "usage" && await withPostgresRead(pool,
-    (client) => usageCorrectionRuntimeActive(client, schema),
-    { operation: "telemetry_v1.correction_runtime", preserveSafeError })) {
-    // Refuse before any object write (module comment).
-    throw unavailable();
-  }
 
   const chunkRowId = `chunk:${crypto.randomUUID()}`;
   const r2Key = `telemetry/v1-${crypto.randomUUID()}`;
@@ -1497,8 +1779,8 @@ export async function recordPostgresDeviceUploadReceipt(
 // telemetry-envelope-v0.1: handleTelemetryContribution (src/index.ts at
 // d43c8f92) with insertTelemetryContribution (telemetry-repository.ts) and the
 // D1 insert triggers on telemetry_contributions as explicit steps. The weekly
-// admission window is enforced by the staged legacy_contribution_admission
-// migration's triggers, exactly as D1 migrations/0014 does.
+// admission window is enforced by primary 0061's (legacy_contribution_admission)
+// triggers, exactly as D1 migrations/0014 does.
 //
 // Deliberate differences, each a refusal:
 //   - The account-scoped (v0.2 consent) branch answers the Worker's deployed

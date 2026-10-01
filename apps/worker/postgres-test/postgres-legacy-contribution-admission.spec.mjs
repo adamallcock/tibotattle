@@ -101,10 +101,15 @@ const ORACLE_REQUIRED = Object.freeze([
   "src/typed-v1-admission.ts", "src/telemetry-v1-repository.ts", "src/typed-telemetry-repository.ts",
   "src/telemetry-v1.ts", "src/telemetry-transport-policy.ts", "src/telemetry-repository.ts",
   "src/telemetry-validation.ts", "src/server-pricing.ts", "src/device-auth.ts", "src/telemetry-storage-mode.ts",
+  // The usage-correction capture a v1.0 correction runs while the runtime is
+  // active (typed-telemetry-compatibility.ts, its source reader, differs from
+  // d43c8f92 only by dropping an Error `cause` option, so it is not pinned).
+  "src/telemetry-usage-correction-repository.ts", "src/telemetry-usage-reconciliation.ts", "src/strict-json.ts",
   "migrations/0014_bounded_contribution_admission.sql",
   "typed-v1-admission-migrations/0001_typed_v1_chunk_admission.sql",
   "ingestion-isolation-migrations/0003_v1_append_classification.sql",
   "ingestion-isolation-migrations/0004_v1_multidevice_source_update.sql",
+  "ingestion-isolation-migrations/0006_usage_correction_facts.sql",
   "typed-ingestion-migrations/0001_typed_telemetry.sql", "typed-ingestion-migrations/0002_delivery_journal.sql",
   "node_modules/@app-usagemonitor/accounting/src/price-registry.js",
   "node_modules/@app-usagemonitor/telemetry-contract/index.js",
@@ -1343,16 +1348,11 @@ test("PG17 v1.0 refusals keep the Worker's status, code and order, and write not
     "every refused claim is abandoned and nothing is stored");
   assert.equal(store.objects.size, 0);
 
-  // A usage correction while the imported correction runtime was active is
-  // the documented gap: refused before any write (D1 would record facts).
+  // A usage correction under the active correction runtime is admitted and
+  // archived; "PG17 a v1.0 usage correction ... correction runtime" covers it.
   const first = await service.upload(device, await syntheticChunk({ count: 1, seed: "correct" }));
   assert.equal(first.response.status, 202);
-  await pool.query(`INSERT INTO "${schema}".telemetry_usage_correction_runtime
-      (id, schema_version, method_version, source_state, max_capture_rows, max_history_page)
-    VALUES (1, 'telemetry-usage-correction-v1', 'usage-total-correction-v1', 'active', 200, 200)`);
-  const correction = await syntheticChunk({ count: 2, seed: "correct-2", revision: 2 });
-  assert.deepEqual(await refused(device, correction), { status: 503, code: "BACKEND_STORAGE_UNAVAILABLE", details: null });
-  assert.deepEqual(await counts(), { chunks: 1, records: 1, pending: 1, abandoned: 8, other: 1 });
+  assert.deepEqual(await counts(), { chunks: 1, records: 1, pending: 1, abandoned: 7, other: 1 });
   assert.equal(store.objects.size, 1);
 
   // An explicit-id import that left a typed identity behind its rows (TL-1)
@@ -1362,7 +1362,7 @@ test("PG17 v1.0 refusals keep the Worker's status, code and order, and write not
     VALUES (5000, $1, $2)`, [nsId, Buffer.from("\u0000synthetic-imported-owner")]);
   const lagging = await syntheticChunk({ stream: "session", seed: "lagging" });
   assert.deepEqual(await refused(device, lagging), { status: 503, code: "BACKEND_STORAGE_UNAVAILABLE", details: null });
-  assert.deepEqual(await counts(), { chunks: 1, records: 1, pending: 1, abandoned: 9, other: 1 });
+  assert.deepEqual(await counts(), { chunks: 1, records: 1, pending: 1, abandoned: 8, other: 1 });
   await pool.query(`SELECT "${schema}".typed_telemetry_restart_identities()`);
   const resumed = await service.upload(device, lagging);
   assert.equal(resumed.response.status, 202);
@@ -1374,6 +1374,228 @@ test("PG17 v1.0 refusals keep the Worker's status, code and order, and write not
     { status: 503, code: "BACKEND_STORAGE_UNAVAILABLE", details: null });
   assert.equal(store.objects.size, 2);
 }));
+
+/** Typed physical ids of the participant's current rows, kept before a supersession deletes them. */
+async function recordTypedIds(twin, schema, maps) {
+  const s = `"${schema}".`;
+  for (const row of (await twin.pool.query(`SELECT c.id::text AS id, a.chunk_id FROM ${s}typed_telemetry_chunks c
+      JOIN ${s}typed_v1_chunk_allocations a ON a.chunk_original = c.original_id AND a.namespace_id = c.namespace_id`)).rows) {
+    maps.pg.chunks.set(row.id, row.chunk_id);
+  }
+  for (const row of (await twin.pool.query(`SELECT id::text AS id, source_row_id::text AS source_row_id
+      FROM ${s}typed_telemetry_records WHERE format = 10`)).rows) {
+    maps.pg.records.set(row.id, row.source_row_id);
+  }
+  for (const row of twin.d1.prepare(`SELECT CAST(c.id AS TEXT) AS id, a.chunk_id FROM typed_telemetry_chunks c
+      JOIN typed_v1_chunk_allocations a ON a.chunk_original = c.original_id AND a.namespace_id = c.namespace_id`).all()) {
+    maps.d1.chunks.set(row.id, row.chunk_id);
+  }
+  for (const row of twin.d1.prepare(`SELECT CAST(id AS TEXT) AS id, CAST(source_row_id AS TEXT) AS source_row_id
+      FROM typed_telemetry_records WHERE format = 10`).all()) {
+    maps.d1.records.set(row.id, row.source_row_id);
+  }
+}
+
+/**
+ * The usage-correction archive of one participant on both stores, as
+ * original identifiers and values: typed ids through the maps above or the
+ * retained typed dimension rows, the owner digest as "is the owner link",
+ * the source event digest as the chunk its event receipt names. Row ids are
+ * kept: both stores allocate D1's INTEGER PRIMARY KEY order.
+ */
+async function correctionArchive(twin, schema, participantId, maps, sinceMs) {
+  const s = `"${schema}".`;
+  const columns = (dialect) => {
+    const text = (expression) => (dialect === "pg" ? `${expression}::text` : `CAST(${expression} AS TEXT)`);
+    const hexOf = (expression) => (dialect === "pg" ? `encode(${expression}, 'hex')` : `lower(hex(${expression}))`);
+    const t = (name) => (dialect === "pg" ? `${s}${name}` : name);
+    return `SELECT ${text("h.id")} AS id, h.participant_id, ${hexOf("h.owner_digest")} AS owner_digest,
+        ${text("h.owner_revision")} AS owner_revision, ${text("h.authority_epoch")} AS authority_epoch,
+        ${text("h.source_format")} AS source_format, ns.original_id AS namespace, o.original_id AS owner,
+        d.original_id AS device, ${text("h.chunk_id")} AS chunk_id, h.manifest_id,
+        ${text("h.source_storage_row_id")} AS storage_row, ${text("h.source_row_id")} AS source_row_id,
+        h.occurrence_id, ${text("h.event_time_ms")} AS event_time_ms, p.value AS provider, iv.value AS session,
+        m.value AS model, sm.value AS speed, st.value AS tier, sf.value AS surface, bs.value AS billing,
+        re.value AS effort, sc.value AS scope, oc.value AS outcome, h.attribution_id,
+        ${text("h.total_input_context_tokens")} AS total, ${text("h.input_uncached_tokens")} AS uncached,
+        ${text("h.input_cache_read_tokens")} AS cache_read, ${text("h.input_cache_write_tokens")} AS cache_write,
+        ${text("h.output_text_tokens")} AS output_text, ${text("h.output_reasoning_tokens")} AS output_reasoning,
+        ${text("h.output_combined_tokens")} AS output_combined,
+        ${hexOf("h.source_chunk_digest")} AS source_chunk_digest,
+        (SELECT e.chunk_id FROM ${t("typed_v1_event_sources")} e
+          WHERE e.event_digest = ${hexOf("h.source_event_digest")}) AS source_event_chunk,
+        ${hexOf("h.record_digest")} AS record_digest, ${hexOf("h.base_digest")} AS base_digest,
+        ${text("h.captured_at_ms")} AS captured_at_ms,
+        (SELECT l.owner_digest FROM ${t("storage_v11_owner_links")} l WHERE l.participant_id = h.participant_id)
+          AS link_digest
+      FROM ${t("telemetry_usage_correction_history")} h
+      JOIN ${t("typed_telemetry_namespaces")} ns ON ns.id = h.namespace_id
+      JOIN ${t("typed_telemetry_owners")} o ON o.id = h.owner_id
+      JOIN ${t("typed_telemetry_devices")} d ON d.id = h.device_id
+      JOIN ${t("typed_telemetry_dictionary")} p ON p.id = h.provider_id
+      JOIN ${t("typed_telemetry_identifiers")} iv ON iv.id = h.session_id
+      JOIN ${t("typed_telemetry_dictionary")} m ON m.id = h.model_id
+      JOIN ${t("typed_telemetry_dictionary")} sm ON sm.id = h.speed_mode_id
+      JOIN ${t("typed_telemetry_dictionary")} st ON st.id = h.api_service_tier_id
+      JOIN ${t("typed_telemetry_dictionary")} sf ON sf.id = h.surface_id
+      JOIN ${t("typed_telemetry_dictionary")} bs ON bs.id = h.billing_surface_id
+      JOIN ${t("typed_telemetry_dictionary")} re ON re.id = h.reasoning_effort_id
+      JOIN ${t("typed_telemetry_dictionary")} sc ON sc.id = h.agent_scope_id
+      JOIN ${t("typed_telemetry_dictionary")} oc ON oc.id = h.outcome_id
+      WHERE h.participant_id = ${dialect === "pg" ? "$1" : "?"} ORDER BY h.id`;
+  };
+  const factColumns = (dialect) => {
+    const text = (expression) => (dialect === "pg" ? `${expression}::text` : `CAST(${expression} AS TEXT)`);
+    const t = (name) => (dialect === "pg" ? `${s}${name}` : name);
+    return `SELECT ${text("f.id")} AS id, ${text("f.history_id")} AS history_id,
+        ${text("f.method_version")} AS method_version, ${text("f.captured_at_ms")} AS captured_at_ms,
+        ${text("h.captured_at_ms")} AS history_captured_at_ms
+      FROM ${t("telemetry_usage_correction_facts")} f
+      JOIN ${t("telemetry_usage_correction_history")} h ON h.id = f.history_id
+      WHERE h.participant_id = ${dialect === "pg" ? "$1" : "?"} ORDER BY f.id`;
+  };
+  const normalize = (rows, map) => rows.map((row) => {
+    const captured = Number(row.captured_at_ms);
+    return {
+      id: row.id, participant_id: row.participant_id, ownerIsLink: row.owner_digest === row.link_digest,
+      owner_revision: row.owner_revision, authority_epoch: row.authority_epoch, source_format: row.source_format,
+      namespace: hex(row.namespace), owner: hex(row.owner), device: hex(row.device),
+      chunk: map.chunks.get(row.chunk_id) ?? `unmapped:${row.chunk_id}`, manifest_id: row.manifest_id,
+      storageRowSourceRow: map.records.get(row.storage_row) ?? `unmapped:${row.storage_row}`,
+      source_row_id: row.source_row_id, occurrence_id: hex(row.occurrence_id), event_time_ms: row.event_time_ms,
+      provider: row.provider, session: hex(row.session), model: row.model, speed: row.speed, tier: row.tier,
+      surface: row.surface, billing: row.billing, effort: row.effort, scope: row.scope, outcome: row.outcome,
+      attribution_id: row.attribution_id, total: row.total, uncached: row.uncached, cache_read: row.cache_read,
+      cache_write: row.cache_write, output_text: row.output_text, output_reasoning: row.output_reasoning,
+      output_combined: row.output_combined, source_chunk_digest: row.source_chunk_digest,
+      source_event_chunk: row.source_event_chunk, record_digest: row.record_digest, base_digest: row.base_digest,
+      capturedInRun: Number.isSafeInteger(captured) && captured >= sinceMs && captured <= Date.now(),
+    };
+  });
+  const normalizeFacts = (rows) => rows.map((row) => ({
+    id: row.id, history_id: row.history_id, method_version: row.method_version,
+    capturedWithHistory: row.captured_at_ms === row.history_captured_at_ms,
+  }));
+  return {
+    pg: {
+      history: normalize((await twin.pool.query(columns("pg"), [participantId])).rows, maps.pg),
+      facts: normalizeFacts((await twin.pool.query(factColumns("pg"), [participantId])).rows),
+    },
+    d1: {
+      history: normalize(twin.d1.prepare(columns("d1")).all(participantId).map((row) => ({ ...row })), maps.d1),
+      facts: normalizeFacts(twin.d1.prepare(factColumns("d1")).all(participantId).map((row) => ({ ...row }))),
+    },
+  };
+}
+
+test("PG17 a v1.0 usage correction is archived exactly as d43c8f92 while the correction runtime is active, and not while staged", {
+  skip: SKIP, timeout: 600_000,
+}, async () => {
+  for (const runtimeState of ["staged", "active"]) {
+    await withTwin(async ({ twin, pool, schema }) => {
+      const sinceMs = Date.now();
+      const { schemaOptions } = await initializeTypedTargets(twin, schema);
+      // D1 seeds its runtime staged (ingestion-isolation 0006) and activates
+      // it in place; PostgreSQL carries the sealed D1 state as source_state
+      // (primary 0034), which the transfer imports.
+      if (runtimeState === "active") {
+        twin.d1Only("UPDATE telemetry_usage_correction_runtime SET state = 'active' WHERE id = 1");
+      }
+      await twin.pgOnly(`INSERT INTO telemetry_usage_correction_runtime
+          (id, schema_version, method_version, source_state, max_capture_rows, max_history_page)
+        VALUES (1, 'telemetry-usage-correction-v1', 'usage-total-correction-v1', ?, 200, 200)`, [runtimeState]);
+      const store = memoryObjectStore();
+      const service = await origin(pool, schemaOptions, store);
+      const participantId = `in3-capture-${runtimeState}`;
+      await socialParticipant(twin, participantId);
+      const device = await socialDevice(twin, participantId, randomUUID());
+      const maps = { pg: { chunks: new Map(), records: new Map() }, d1: { chunks: new Map(), records: new Map() } };
+      const admit = async (chunk, supersedes = null) => {
+        const result = await service.upload(device, chunk);
+        assert.equal(result.response.status, 202, `${runtimeState}: ${chunk.chunkId} r${chunk.chunkRevision}`);
+        assert.equal(result.receipt.status, "accepted");
+        assert.equal(result.receipt.supersededRevision, supersedes === null ? null : chunk.chunkRevision - 1);
+        await oracleAdmission(twin, schema, result.receipt.contributionId, chunk, result.raw,
+          supersedes?.receipt.contributionId ?? null);
+        await recordTypedIds(twin, schema, maps);
+        return { ...result, chunk };
+      };
+      // Revision 1 (two usage records), its correction (three), and a second
+      // correction (one), plus a quota correction, which D1 never archives.
+      const usage1 = await admit(await syntheticChunk({ stream: "usage", count: 2, seed: "capture-1" }));
+      const quota1 = await admit(await syntheticChunk({ stream: "quota", count: 1, seed: "capture-q1" }));
+      const usage2 = await admit(await syntheticChunk({ stream: "usage", count: 3, seed: "capture-2", revision: 2 }),
+        usage1);
+      await admit(await syntheticChunk({ stream: "quota", count: 1, seed: "capture-q2", revision: 2 }), quota1);
+      const usage3 = await admit(await syntheticChunk({ stream: "usage", count: 1, seed: "capture-3", revision: 3 }),
+        usage2);
+
+      const rows = await snapshot(twin, schema, participantId);
+      for (const key of Object.keys(rows.d1)) assert.deepEqual(rows.pg[key], rows.d1[key], `${runtimeState}: ${key}`);
+      let archive = await correctionArchive(twin, schema, participantId, maps, sinceMs);
+      assert.deepEqual(archive.pg, archive.d1, `${runtimeState}: the usage-correction archive matches d43c8f92`);
+      if (runtimeState === "staged") {
+        assert.deepEqual(archive.pg, { history: [], facts: [] }, "a staged runtime archives nothing");
+      } else {
+        // Revision 1's two rows when revision 2 superseded it, then revision
+        // 2's three; never the quota rows, never the current revision.
+        assert.deepEqual(archive.pg.history.map((row) => [row.id, row.chunk, row.source_row_id]), [
+          ["1", usage1.receipt.contributionId, "1"], ["2", usage1.receipt.contributionId, "2"],
+          ["3", usage2.receipt.contributionId, "4"], ["4", usage2.receipt.contributionId, "5"],
+          ["5", usage2.receipt.contributionId, "6"],
+        ]);
+        assert.ok(archive.pg.history.every((row) => row.ownerIsLink && row.capturedInRun
+          && row.storageRowSourceRow === row.source_row_id && row.source_event_chunk === row.chunk
+          && row.source_format === "10" && row.manifest_id === null && row.attribution_id === null));
+        assert.deepEqual(archive.pg.facts, ["1", "2", "3", "4", "5"].map((id) => ({
+          id, history_id: id, method_version: "1", capturedWithHistory: true,
+        })));
+      }
+
+      // Replays answer the retained receipts and archive nothing more.
+      const replayed = await service.upload(device, null, { envelope: JSON.parse(usage2.raw) });
+      assert.equal(replayed.response.status, 202);
+      assert.deepEqual([replayed.receipt.contributionId, replayed.receipt.status, replayed.receipt.replayed],
+        [usage2.receipt.contributionId, "superseded", true]);
+      const current = await service.upload(device, usage3.chunk);
+      assert.deepEqual([current.receipt.contributionId, current.receipt.replayed], [usage3.receipt.contributionId, true]);
+      assert.deepEqual((await correctionArchive(twin, schema, participantId, maps, sinceMs)).pg, archive.pg);
+
+      // A withdrawn owner link: d43c8f92's capture finds no active owner for
+      // the current chunk's event and refuses the correction (typed mode
+      // 503), so PostgreSQL refuses it and writes nothing; with the runtime
+      // staged D1 captures nothing and both stores admit it.
+      const link = (await pool.query(`SELECT owner_digest, object_digest, manifest_digest
+        FROM "${schema}".storage_v11_owner_links WHERE participant_id = $1`, [participantId])).rows[0];
+      twin.d1Only("UPDATE storage_v11_owner_links SET state = 'withdrawn' WHERE participant_id = ?", [participantId]);
+      await pool.query(`UPDATE "${schema}".storage_v11_owner_links SET state = 'withdrawn' WHERE participant_id = $1`,
+        [participantId]);
+      await pool.query(`SELECT "${schema}".storage_journal_append('owner-withdrawn', $1, $2, $3, $4)`,
+        [link.owner_digest, sha256Hex(`synthetic-withdrawal-${runtimeState}`), link.object_digest, link.manifest_digest]);
+      const usage4 = await syntheticChunk({ stream: "usage", count: 2, seed: "capture-4", revision: 4 });
+      if (runtimeState === "active") {
+        const raw = JSON.stringify(await encryptedEnvelope(usage4));
+        assert.deepEqual(await d1Attempt(twin, { participantId, deviceId: device.deviceId, chunk: usage4, raw,
+          supersedesId: usage3.receipt.contributionId }), { status: 503, code: "BACKEND_STORAGE_UNAVAILABLE", details: null });
+        const objectsBefore = store.objects.size;
+        await assert.rejects(service.upload(device, null, { raw }),
+          (error) => error.status === 503 && error.code === "BACKEND_STORAGE_UNAVAILABLE");
+        assert.equal(store.objects.size, objectsBefore, "the refused correction's object is retired");
+        const after = await snapshot(twin, schema, participantId);
+        for (const key of Object.keys(after.d1)) assert.deepEqual(after.pg[key], after.d1[key], `refused: ${key}`);
+        archive = await correctionArchive(twin, schema, participantId, maps, sinceMs);
+        assert.deepEqual(archive.pg, archive.d1);
+        assert.equal(archive.pg.history.length, 5, "a refused correction archives nothing");
+      } else {
+        await admit(usage4, usage3);
+        const after = await snapshot(twin, schema, participantId);
+        for (const key of Object.keys(after.d1)) assert.deepEqual(after.pg[key], after.d1[key], `withdrawn: ${key}`);
+        assert.deepEqual((await correctionArchive(twin, schema, participantId, maps, sinceMs)).pg,
+          { history: [], facts: [] });
+      }
+    }, { ledger: true });
+  }
+});
 
 // ---------------------------------------------------------------------------
 // telemetry-envelope-v0.1 (not retired at d43c8f92; see envelopes/v01.mjs).

@@ -42,6 +42,18 @@
       "production": "apps/worker/src/telemetry-storage-mode.ts",
       "blob": "fe5799b01406bf969460268b26b156e590be9ee2"
     },
+    "src/telemetry-usage-correction-repository.ts": {
+      "production": "apps/worker/src/telemetry-usage-correction-repository.ts",
+      "blob": "d9daf8a0bc6c6b6adda8774d183370cd17f54517"
+    },
+    "src/telemetry-usage-reconciliation.ts": {
+      "production": "apps/worker/src/telemetry-usage-reconciliation.ts",
+      "blob": "bd511909d1fe7122e088f639acee4d8cf2eba723"
+    },
+    "src/strict-json.ts": {
+      "production": "apps/worker/src/strict-json.ts",
+      "blob": "13cfb22c057c07d2394717922d59569ee1d508e1"
+    },
     "migrations/0014_bounded_contribution_admission.sql": {
       "production": "apps/worker/migrations/0014_bounded_contribution_admission.sql",
       "blob": "040e6aef1d44dab8a5f0c8e2ca06a12f5ffb4953"
@@ -57,6 +69,10 @@
     "ingestion-isolation-migrations/0004_v1_multidevice_source_update.sql": {
       "production": "apps/worker/ingestion-isolation-migrations/0004_v1_multidevice_source_update.sql",
       "blob": "9e606cbd6a64f724b4326cb581eb685d5e2f2e9d"
+    },
+    "ingestion-isolation-migrations/0006_usage_correction_facts.sql": {
+      "production": "apps/worker/ingestion-isolation-migrations/0006_usage_correction_facts.sql",
+      "blob": "aa8fa3aa2da5c90106ff448e36ab2cadb859681f"
     },
     "typed-ingestion-migrations/0001_typed_telemetry.sql": {
       "production": "apps/worker/typed-ingestion-migrations/0001_typed_telemetry.sql",
