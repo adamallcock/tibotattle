@@ -766,7 +766,6 @@ test("a successful visible notice receipt keeps its current banner actionable", 
     "renderElectronSharingNotice",
   ].map((name) => extractFunction(source, name));
   const factory = new Function("bridge", "initialPreference", "initialVisibility", "initialRect", `
-    const dashboardCapabilities = () => ({ accountlessSharing: true });
     const ELECTRON_SHARING_API_VERSION = "v1";
     const ELECTRON_SHARING_BASES = new Set([
       "default_on", "default_off", "migration_default_on", "user_choice", "legacy_preserved",
@@ -916,7 +915,6 @@ test("offscreen or zero-area notices wait for a visible scroll or resize", async
     "renderElectronSharingNotice",
   ].map((name) => extractFunction(source, name));
   const factory = new Function("bridge", "initialPreference", "initialVisibility", "initialRect", `
-    const dashboardCapabilities = () => ({ accountlessSharing: true });
     const ELECTRON_SHARING_API_VERSION = "v1";
     const ELECTRON_SHARING_BASES = new Set([
       "default_on", "default_off", "migration_default_on", "user_choice", "legacy_preserved",

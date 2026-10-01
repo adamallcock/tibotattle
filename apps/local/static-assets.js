@@ -1,8 +1,4 @@
 export const LOCAL_COMPANION_STATIC_FILES = Object.freeze({
-  "/dashboard-capabilities.js": Object.freeze({
-    file: "dashboard-capabilities.js",
-    type: "text/javascript; charset=utf-8",
-  }),
   "/": Object.freeze({
     file: "index.html",
     type: "text/html; charset=utf-8",

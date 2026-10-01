@@ -112,11 +112,10 @@ building the app:
 npm run product:local
 ```
 
-then open <http://localhost:8787>. The shared dashboard presents saved results
-read-only by default and can be reused directly by Codex. Electron explicitly
-enables local collection, Settings and accountless sharing through its preload
-bridge. Its first deep pass over a large history remains bounded, cancellable,
-and resumable.
+then open <http://localhost:8787>. Electron is the main app and uses this same
+dashboard for local collection, Settings and accountless community sharing. A
+useful headline usually appears within seconds; the first deep pass over a
+large history is bounded, cancellable, and resumable.
 
 ## Uninstall
 

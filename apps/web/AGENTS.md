@@ -46,8 +46,8 @@ Scope: all files under `apps/web/`. Apply the repository root guidance first.
   them to accounting DTOs, reports, share cards, diagnostics, or contributions.
 - Preserve restrictive network and content-security assumptions. A local preview
   convenience must not weaken the packaged or public surface.
-- The shared dashboard defaults to read-only presentation. Electron explicitly
-  enables collection, settings and accountless sharing through its preload.
+- Electron is the main app and uses the shared dashboard. Preserve its existing
+  collection, Settings and accountless sharing through their current owners.
   Preserve saved sharing opt-outs and owner-only hosted erasure; retired social
   sign-in and disconnect flows belong to legacy backend contracts, not this UI.
 - Run the narrow `apps/web/test/*.test.mjs` files while iterating, then

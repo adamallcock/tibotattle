@@ -33,7 +33,6 @@ function fakeWindow() {
   const windowRef = {
     tibotattleDesktop: {
       version: "v1",
-      dashboardCapabilities: { collection: true, settings: true, accountlessSharing: true },
       onCommand(listener) {
         commandListeners.push(listener);
         return () => {

@@ -325,7 +325,6 @@ export const CLIENT_WEB_FILES = Object.freeze([
   "apps/web/public/community.html",
   "apps/web/public/community.js",
   "apps/web/public/data-client.js",
-  "apps/web/public/dashboard-capabilities.js",
   "apps/web/public/desktop-shell.js",
   "apps/web/public/electron-tray-popup.css",
   "apps/web/public/electron-tray-popup.html",

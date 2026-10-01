@@ -4581,15 +4581,8 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   assert.deepEqual(Object.keys(exposed), ["tibotattleDesktop"]);
   const bridge = exposed.tibotattleDesktop;
   assert.equal(Object.isFrozen(bridge), true);
-  assert.equal(Object.isFrozen(bridge.dashboardCapabilities), true);
-  assert.deepEqual(JSON.parse(JSON.stringify(bridge.dashboardCapabilities)), {
-    collection: true,
-    settings: true,
-    accountlessSharing: true,
-  });
   assert.deepEqual(Object.keys(bridge), [
     "version",
-    "dashboardCapabilities",
     "onCommand",
     "getSettings",
     "getSharingPreference",

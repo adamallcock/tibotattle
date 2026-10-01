@@ -1,5 +1,3 @@
-import { dashboardCapabilities } from "./dashboard-capabilities.js";
-
 /**
  * Small Electron-only bridge for controls that belong to the desktop shell,
  * not to the hosted dashboard. It intentionally has no filesystem or URL
@@ -107,7 +105,6 @@ export function navigateToDashboardSection(_documentRef, windowRef, section) {
 }
 
 function openSettings(windowRef) {
-  if (!dashboardCapabilities(windowRef).settings) return false;
   const bridge = windowRef?.tibotattleDesktop;
   if (bridge?.version === ELECTRON_API_VERSION
       && typeof bridge.openSettings === "function") {
@@ -205,12 +202,10 @@ function installCommandBridge(documentRef, windowRef, applyLanguage, applySideba
   const onCommand = (command) => {
     if (!command || typeof command !== "object") return;
     if (command.command === "refresh") {
-      if (!dashboardCapabilities(windowRef).collection) return;
       documentRef.querySelector?.("#refresh-button")?.click?.();
       return;
     }
     if (command.command === "automaticRefresh") {
-      if (!dashboardCapabilities(windowRef).collection) return;
       if (Reflect.ownKeys(command).length !== 2
           || !Object.hasOwn(command, "mode")) return;
       dispatchAutomaticRefresh(windowRef, command.mode);
@@ -263,9 +258,7 @@ export function mountDesktopShell({
   const shareButton = documentRef.querySelector?.("#electron-share-button");
   const settingsButton = documentRef.querySelector?.("#electron-settings-button");
   if (!settingsButton) return Object.freeze({ teardown() {} });
-  const capabilities = dashboardCapabilities(windowRef);
-  settingsButton.hidden = !capabilities.settings;
-  settingsButton.disabled = !capabilities.settings;
+  settingsButton.hidden = false;
   if (shareButton) shareButton.hidden = false;
   const onShare = () => {
     // The share card lives on the Allowance page. Navigating to Overview
@@ -303,7 +296,7 @@ export function mountDesktopShell({
     }
   };
   const onLanguageChange = () => {
-    if (applyingLanguage || !capabilities.settings || bridge?.version !== ELECTRON_API_VERSION) return;
+    if (applyingLanguage || bridge?.version !== ELECTRON_API_VERSION) return;
     const value = DESKTOP_LANGUAGE_BY_PICKER_VALUE[picker?.value];
     if (!LANGUAGE_VALUES.has(value) || typeof bridge.setLanguage !== "function") return;
     try {
@@ -315,7 +308,7 @@ export function mountDesktopShell({
   shareButton?.addEventListener?.("click", onShare);
   settingsButton.addEventListener("click", onSettings);
   picker?.addEventListener?.("change", onLanguageChange);
-  if (capabilities.settings) readPersistedSettings(bridge, applyLanguage, applySidebar);
+  readPersistedSettings(bridge, applyLanguage, applySidebar);
   const unsubscribeCommand = installCommandBridge(
     documentRef,
     windowRef,

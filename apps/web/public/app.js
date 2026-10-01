@@ -1,4 +1,3 @@
-import { dashboardCapabilities } from "./dashboard-capabilities.js";
 import { modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
 import { mountWorkUsageView } from "./work-usage-view.js";
 import { mountModelPerformance } from "./model-performance.js";
@@ -101,7 +100,7 @@ setMessageLocale(localization.locale());
 const t = localization.t;
 const tPlural = localization.tPlural;
 
-// Accountless sharing requires an explicit host presentation capability. The Electron
+// Accountless sharing uses the existing Electron preload bridge. The Electron
 // main/application controller remains the policy owner; this page receives only
 // its bounded projection through the versioned preload bridge. A missing or malformed
 // projection never becomes an implied permission.
@@ -122,7 +121,6 @@ const ELECTRON_SHARING_STATES = new Set([
 const ELECTRON_SHARING_TRANSPORT_STATUSES = new Set(["unavailable", "off", "uploading", "pending", "up_to_date", "retry_wait", "paused", "recovery_required"]);
 
 function electronSharingBridge(windowRef = globalThis.window) {
-  if (!dashboardCapabilities(windowRef).accountlessSharing) return null;
   const bridge = windowRef?.tibotattleDesktop;
   if (bridge?.version !== ELECTRON_SHARING_API_VERSION
       || typeof bridge.getSharingPreference !== "function"
@@ -499,8 +497,7 @@ function setJourneyState(state) {
 
 function localAnalysisAllowed(value = localOnboarding) {
   return Boolean(
-    dashboardCapabilities().collection
-      && value
+    value
       && value.state === "ready"
       && (value.sessionsReadable || value.archivedSessionsReadable)
       && value.rolloutFilesPresent
@@ -542,7 +539,6 @@ function updateLocalActionButtons() {
   const label = localAnalysisLabel();
   for (const selector of ["#refresh-button", "#setup-refresh"]) {
     const button = $(selector);
-    button.hidden = !dashboardCapabilities().collection;
     button.disabled = localActionBusy || !allowed;
     if (!localActionBusy) {
       button.textContent = label;
@@ -558,7 +554,7 @@ function updateLocalActionButtons() {
   const connectionCheck = $("#connection-check");
   if (connectionCheck) connectionCheck.disabled = localActionBusy;
   const cancel = $("#cancel-refresh");
-  cancel.hidden = !dashboardCapabilities().collection || !localRefreshInProgress;
+  cancel.hidden = !localRefreshInProgress;
   cancel.disabled = localRefreshCancelRequested;
   cancel.textContent = localRefreshCancelRequested ? "Cancelling…" : "Cancel";
 }
@@ -1254,7 +1250,7 @@ function renderLocalOnboarding(value) {
   localOnboarding = value;
   const card = $("#setup-card");
   if (!card) return;
-  if (!dashboardCapabilities().collection || runsInsideNativeDashboard()) {
+  if (runsInsideNativeDashboard()) {
     card.hidden = true;
     card.setAttribute("aria-hidden", "true");
     setJourneyState(
@@ -11085,7 +11081,7 @@ function fastModeInferenceSentence(fastMode) {
 
 
 function scheduleLocalReadinessPoll(isCurrent) {
-  if (!dashboardCapabilities().collection || !isCurrent()
+  if (!isCurrent()
       || (localCompanionHealth !== null && localOnboarding?.state !== "unavailable"
         && localOnboarding !== null)
       || localReadinessPollTimer !== null || localReadinessPollCount >= 450) return;
@@ -11372,7 +11368,7 @@ function signalElectronRefreshLifecycle(action, args = [], options = {}) {
 }
 
 async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
-  if (!dashboardCapabilities().collection || localActionBusy) return;
+  if (localActionBusy) return;
   // Fence continuation against the exact coverage visible before this pass.
   // If the terminal reload presents the same generation/count/byte receipt,
   // scheduleReindexAutoContinuation stops immediately instead of spending the
@@ -11697,7 +11693,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
 }
 
 async function cancelLocalAnalysis() {
-  if (!dashboardCapabilities().collection || !localRefreshInProgress || localRefreshCancelRequested) return;
+  if (!localRefreshInProgress || localRefreshCancelRequested) return;
   localRefreshCancelRequested = true;
   updateLocalActionButtons();
   try {
@@ -11983,17 +11979,16 @@ async function describeFailure({ surface, error, messages = {}, fallback }) {
   // an answer counts as unreachable.
   let localNote = "unreachable";
   try {
-    const recorded = dashboardCapabilities().collection ? await localClient.recordDiagnosticNote({
+    const recorded = await localClient.recordDiagnosticNote({
       reference,
       surface: diagnosticSurface(surface),
       code,
       detail: detailCode,
       requestId
-    }) : null;
+    });
     writtenToLocalLog = recorded?.status === "recorded"
       && recorded.reference === reference;
-    localNote = writtenToLocalLog ? "recorded"
-      : dashboardCapabilities().collection ? "refused" : "unreachable";
+    localNote = writtenToLocalLog ? "recorded" : "refused";
   } catch (noteError) {
     // The reference remains useful even when the local companion cannot write
     // its diagnostics log. Do not claim a write that was not confirmed.

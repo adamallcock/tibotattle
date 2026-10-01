@@ -4802,7 +4802,6 @@ async function createDashboardStartupHarness({
       refreshStatus: async () => ({ refresh: { result: {} } }),
       ...Object.fromEntries(Object.entries(client).filter(([key]) => key !== "load")),
     },
-    dashboardCapabilities: () => ({ collection: false }),
     runsInsideNativeDashboard: () => true,
     // The extracted startup harness exercises the loader without evaluating
     // Electron's launch coordinator. Keep that path explicitly inert so the

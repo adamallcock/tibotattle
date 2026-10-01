@@ -209,7 +209,7 @@ test("agent guidance preserves owner erasure and restore after self-service reti
   assert.match(local, /`device_disconnected` before revocation or\s+credential cleanup/u);
   assert.match(local, /pause across restart/u);
   assert.match(worker, /`--owner-access-file` before enrollment or other writes/u);
-  assert.match(web, /shared dashboard defaults to read-only presentation/u);
+  assert.match(web, /Electron is the main app and uses the shared dashboard/u);
   assert.match(web, /Preserve saved sharing opt-outs and owner-only hosted erasure/u);
   assert.match(docs, /does not retire owner erasure, privacy-request\s+handling, retention disclosures, or deletion-safe restore/u);
 });
