@@ -160,6 +160,7 @@ import {
   edgeTestRequestFromNode,
   isEdgeOriginBoundaryRefusal,
   isEdgeTestCloudListen,
+  lingerAfterEarlyEdgeTestAnswer,
   readEdgeTestOriginConfiguration,
   writeEdgeTestBoundaryRefusal,
 } from "./origin-edge-test-mode.mjs";
@@ -1086,6 +1087,7 @@ export async function serve(runtime) {
         writeEdgeTestBoundaryRefusal(res);
         return;
       }
+      if (edgeTest) lingerAfterEarlyEdgeTestAnswer(req);
       await writeResponse(res, response);
     } catch (error) {
       if (res.headersSent) {

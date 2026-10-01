@@ -31,7 +31,6 @@
  * reads no network and logs nothing.
  */
 
-import { Readable } from "node:stream";
 import {
   EDGE_HEADERS,
   ORIGIN_BOUNDARY_ERROR_BODY,
@@ -343,18 +342,27 @@ function hasRequestBody(req) {
  * The raw body as a web stream that touches the Node request only when it is
  * first read (high-water mark 0), so a refusal or a limited admission never
  * pulls a byte off the socket.
+ *
+ * Cancelling it stops reading without destroying the request: a handler that
+ * stops at its byte limit (413 BODY_TOO_LARGE on a chunked body, which has
+ * no declared length to refuse first) is about to answer, and that answer
+ * must reach the caller. The unread rest of the body is drained and
+ * discarded, so the response is followed by a clean close instead of a reset
+ * that would lose it. (Readable.toWeb's cancel destroys the socket, which
+ * turned that 413 into a connection error the edge reported as 503.)
  */
 function lazyRequestBody(req) {
-  let reader = null;
+  let iterator = null;
   return new ReadableStream({
     async pull(controller) {
-      reader ??= Readable.toWeb(req).getReader();
-      const { value, done } = await reader.read();
+      iterator ??= req.iterator({ destroyOnReturn: false });
+      const { value, done } = await iterator.next();
       if (done) controller.close();
-      else controller.enqueue(value);
+      else controller.enqueue(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
     },
-    async cancel(reason) {
-      if (reader !== null) await reader.cancel(reason);
+    async cancel() {
+      if (iterator !== null) await iterator.return();
+      req.resume();
     },
   }, { highWaterMark: 0 });
 }
@@ -411,6 +419,42 @@ export function edgeTestRequestFromNode(req, res, { hostOrigin } = {}) {
     if (!res.writableEnded) controller.abort();
   });
   return request;
+}
+
+/** How long a connection lingers for the rest of a body after an early answer. */
+export const EDGE_TEST_LINGER_MAX_MILLISECONDS = 15_000;
+
+/**
+ * Lingering close (RFC 9112 section 9.6) under an answer written before the
+ * request body has finished arriving: a 413 at the byte limit of a chunked
+ * body, or a 401, 415 or 429 refusal that never reads the body. Node closes
+ * such a connection as soon as the answer is written, while the caller is
+ * still sending; the close then resets the connection and the caller can lose
+ * the answer, which the edge reports as 503 EDGE_ORIGIN_UNAVAILABLE instead
+ * of the origin's refusal. Here the close waits until the rest of the body has
+ * been received and discarded (the lazy body's cancel, or Node's own dump of
+ * a body nobody read), or EDGE_TEST_LINGER_MAX_MILLISECONDS pass. Only this
+ * request's socket is affected, and only its close is delayed.
+ *
+ * @param {import("node:http").IncomingMessage} req
+ */
+export function lingerAfterEarlyEdgeTestAnswer(req) {
+  const socket = req.socket;
+  if (req.complete || socket === null || typeof socket.destroySoon !== "function") return;
+  const destroySoon = socket.destroySoon;
+  const received = new Promise((resolveReceived) => {
+    const done = () => {
+      clearTimeout(timer);
+      resolveReceived();
+    };
+    const timer = setTimeout(done, EDGE_TEST_LINGER_MAX_MILLISECONDS);
+    req.once("end", done);
+    req.once("close", done);
+    socket.once("close", done);
+  });
+  socket.destroySoon = function lingeringDestroySoon() {
+    void received.then(() => destroySoon.call(socket));
+  };
 }
 
 /** EP-6's constant refusal: a 421 without the origin marker. */

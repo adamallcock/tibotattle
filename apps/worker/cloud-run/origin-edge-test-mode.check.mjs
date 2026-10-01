@@ -713,6 +713,65 @@ test("serve(): inner never sees cf-*, x-forwarded-*, the token or x-tibotattle-*
   assert.equal(headers.get("x-usage-monitor-csrf"), "synthetic-csrf");
 });
 
+test("serve(): an answer to a chunked body inner stops reading reaches the caller; the rest is drained, not reset", async () => {
+  const limit = 2 * 1024 * 1024;
+  let readBytes = 0;
+  await withServedRuntime(() => async (request) => {
+    // As readBoundedRequestBody does: read up to the limit, then cancel and refuse.
+    const reader = request.body.getReader();
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      readBytes += value.byteLength;
+      if (readBytes > limit) {
+        await reader.cancel();
+        return Response.json({ error: { code: "BODY_TOO_LARGE" } }, { status: 413 });
+      }
+    }
+    return Response.json({ read: readBytes }, { status: 200 });
+  }, async ({ port, host }) => {
+    const send = (total) => new Promise((resolveSend, reject) => {
+      const request = http.request({
+        host: "127.0.0.1", port, method: "POST", path: "/api/v1/contributions", agent: false,
+        headers: { host, "content-type": "application/json", "transfer-encoding": "chunked",
+          "x-serverless-authorization": token(), "x-tibotattle-edge-host": "apex",
+          "x-tibotattle-edge-request-id": REQUEST_ID, "x-tibotattle-edge-admission": "v1;upload_ingress;allowed" },
+      });
+      let answer = null;
+      request.on("response", (response) => {
+        const chunks = [];
+        response.on("data", (chunk) => chunks.push(chunk));
+        response.on("end", () => {
+          answer = { status: response.statusCode, text: Buffer.concat(chunks).toString("utf8") };
+          resolveSend(answer);
+        });
+      });
+      request.on("error", (error) => { if (answer === null) reject(error); });
+      const chunk = Buffer.alloc(64 * 1024, 0x78);
+      let sent = 0;
+      const pump = () => {
+        while (sent < total) {
+          sent += chunk.length;
+          if (!request.write(chunk)) { request.once("drain", pump); return; }
+        }
+        request.end();
+      };
+      pump();
+    });
+    // The early answer raced the connection close: repeat it so a reset shows.
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      readBytes = 0;
+      const refused = await send(3 * 1024 * 1024);
+      assert.equal(refused.status, 413, `attempt ${attempt}: the refusal arrives instead of a reset`);
+      assert.equal(JSON.parse(refused.text).error.code, "BODY_TOO_LARGE");
+    }
+    readBytes = 0;
+    const accepted = await send(1024 * 1024);
+    assert.equal(accepted.status, 200, "a body under the limit still streams through whole");
+    assert.equal(JSON.parse(accepted.text).read, 1024 * 1024);
+  });
+});
+
 test("edgeTestRequestFromNode keeps every raw header for EP-6, joined as Headers joins them", async () => {
   const port = await freePort();
   const hostOrigin = `http://127.0.0.1:${port}`;
