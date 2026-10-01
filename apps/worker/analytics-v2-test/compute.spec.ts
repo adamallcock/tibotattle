@@ -291,7 +291,7 @@ describe("computeAnalyticsV2 (A-2)", () => {
     expect(new Set(crowdedBands(atBound, crowdedDay).map((row) => row.model)).size).toBe(512);
   }, 240_000);
 
-  it("takes A-3's call shape and never depends on how widely the occurrences were read", async () => {
+  it("takes A-3's call shape; read width beyond the evidence never moves an output", async () => {
     const corpus = composeProofCorpus();
     const queued = corpus.publishedDays;
     // Exactly the keys A-3 analytics-refresh.mjs passes: no occurrenceRange, a bare queued-day list.
@@ -303,24 +303,68 @@ describe("computeAnalyticsV2 (A-2)", () => {
       occurrenceRange: analyticsV2RequiredOccurrenceRange({ nowMs: NOW_MS, queuedDays: queued }) });
     expect(outputsDigest(a3)).toBe(outputsDigest(declared));
     expect(a3.cacheBands.length).toBe(210);
+    // A read that is merely wider (no evidence in the extra days) changes nothing.
+    const wideEmpty = await computeAnalyticsV2({ ...a3Input,
+      occurrenceRange: { fromDay: addDays(TODAY, -400), throughDay: addDays(TODAY, 2) } });
+    expect(outputsDigest(wideEmpty)).toBe(outputsDigest(declared));
 
-    // A wider read that also returned evidence outside the horizon: an old day
-    // and a day after today, neither queued. Nothing in the outputs moves.
+    // Evidence 200 days back (older than the 170-day analysis horizon, not
+    // queued) is part of the owner's history: production builds a cache day
+    // for every delivered day and its `all` window has no lower bound, so the
+    // day gets its cache bands and owner-day row. A day after today never
+    // enters an output, however the read was declared.
     const first = syntheticOwner(1);
     const tomorrow = addDays(TODAY, 1), old = addDays(TODAY, -200);
-    const extra = new Map(corpus.occurrencesByOwner.get(first.digest)!);
-    extra.set(tomorrow, composeFacts(first, tomorrow).get(tomorrow)!);
-    extra.set(old, composeFacts(first, old).get(old)!);
-    const wider = new Map([...corpus.occurrencesByOwner, [first.digest, extra]]);
+    const withOld = new Map(corpus.occurrencesByOwner.get(first.digest)!);
+    withOld.set(old, composeFacts(first, old).get(old)!);
+    const older = new Map([...corpus.occurrencesByOwner, [first.digest, withOld]]);
+    const history = await computeAnalyticsV2({ ...a3Input, occurrencesByOwner: older });
+    const withTomorrow = new Map(withOld);
+    withTomorrow.set(tomorrow, composeFacts(first, tomorrow).get(tomorrow)!);
+    const wider = new Map([...corpus.occurrencesByOwner, [first.digest, withTomorrow]]);
     const widened = await computeAnalyticsV2({ ...a3Input, occurrencesByOwner: wider,
       occurrenceRange: { fromDay: addDays(TODAY, -220), throughDay: addDays(TODAY, 2) } });
-    expect(outputsDigest(widened)).toBe(outputsDigest(declared));
+    expect(outputsDigest(widened)).toBe(outputsDigest(history));
+    expect(widened.cacheBands.filter((row) => row.day === old).length).toBeGreaterThan(0);
+    expect(widened.cacheBands.filter((row) => row.day !== old)).toEqual(declared.cacheBands);
+    expect(widened.ownerDays.some((row) => row.day === old && row.ownerDigest === first.digest)).toBe(true);
     expect(widened.cacheBands.every((row) => row.day <= TODAY)).toBe(true);
-    expect(widened.ownerDays.every((row) => row.day !== tomorrow && row.day !== old)).toBe(true);
+    expect(widened.ownerDays.every((row) => row.day !== tomorrow)).toBe(true);
+    // The old day is not queued, so no community day changes.
+    expect(widened.dailyCandidates).toEqual(declared.dailyCandidates);
 
-    // Without a declared range, evidence outside the required range is a caller defect.
+    // Without a declared range, evidence after today is a caller defect.
     await expect(computeAnalyticsV2({ ...a3Input, occurrencesByOwner: wider }))
       .rejects.toThrow("ANALYTICS_V2_INPUT_INVALID:occurrencesByOwner.range");
+  }, 240_000);
+
+  it("keeps cache history older than the 170-day analysis horizon (no lower bound, as production)", async () => {
+    const corpus = composeProofCorpus();
+    const queued = corpus.publishedDays;
+    const first = syntheticOwner(1);
+    const history = new Map(corpus.occurrencesByOwner.get(first.digest)!);
+    const ancient = [addDays(TODAY, -400), addDays(TODAY, -171), addDays(TODAY, -165)];
+    for (const day of ancient) history.set(day, composeFacts(first, day).get(day)!);
+    const occurrencesByOwner = new Map([...corpus.occurrencesByOwner, [first.digest, history]]);
+    const input = { owners: corpus.owners, occurrencesByOwner,
+      devicesByDay: oneDevicePerOwner(occurrencesByOwner, queued), queuedDays: queued, nowMs: NOW_MS, revisionSeed: 0 };
+    const outputs = await computeAnalyticsV2(input);
+    // Every evidence day, however old, carries cache bands; the old today-162
+    // default dropped all three of these days.
+    for (const day of ancient) {
+      expect(outputs.cacheBands.some((row) => row.ownerDigest === first.digest && row.day === day), day).toBe(true);
+    }
+    // An explicit horizon at the first evidence day gives the same outputs;
+    // its 7-day lookback is read (and empty).
+    const explicit = await computeAnalyticsV2({ ...input, cacheFromDay: ancient[0],
+      occurrenceRange: analyticsV2RequiredOccurrenceRange({ nowMs: NOW_MS, queuedDays: queued, cacheFromDay: ancient[0] }) });
+    expect(outputsDigest(explicit)).toBe(outputsDigest(outputs));
+    expect(analyticsV2RequiredOccurrenceRange({ nowMs: NOW_MS, queuedDays: queued, cacheFromDay: ancient[0] }))
+      .toEqual({ fromDay: addDays(TODAY, -407), throughDay: TODAY });
+    // An explicit horizon later than old evidence is honoured (A-3 never passes one).
+    const bounded = await computeAnalyticsV2({ ...input, cacheFromDay: addDays(TODAY, -162),
+      occurrenceRange: { fromDay: addDays(TODAY, -400), throughDay: TODAY } });
+    expect(bounded.cacheBands.some((row) => ancient.includes(row.day))).toBe(false);
   }, 240_000);
 
   it("(d) blocks every candidate day of a conflict and withholds that community day", async () => {

@@ -1364,9 +1364,9 @@ const occurrence = (ownerDigest, day) => ({ ownerDigest, day, occurrenceId: `wir
  * around a recording computeAnalyticsV2. Evidence: OWNER_A (effective) on
  * 2026-03-02 and 2026-09-29, OWNER_B (v1.1, typed) on 2026-09-30.
  */
-function wiringModules({ unlinked = [], failOwner = null } = {}) {
-  const calls = { owners: 0, queued: [], occurrences: [], devices: [], compute: null };
-  const evidence = new Map([[OWNER_A, ["2026-03-02", "2026-09-29"]], [OWNER_B, ["2026-09-30"]]]);
+function wiringModules({ unlinked = [], failOwner = null, ownerAEvidence = ["2026-03-02", "2026-09-29"] } = {}) {
+  const calls = { owners: 0, queued: [], occurrences: [], firstEvidence: [], devices: [], compute: null };
+  const evidence = new Map([[OWNER_A, ownerAEvidence], [OWNER_B, ["2026-09-30"]]]);
   const pages = new Map([
     [0, { days: ["2026-09-30"], lastSequence: 5, terminalOwners: [digest("terminal")], events: 5, complete: false }],
     [5, { days: ["2026-03-02", "2026-09-29"], lastSequence: 9, terminalOwners: [], events: 4, complete: true }],
@@ -1391,6 +1391,12 @@ function wiringModules({ unlinked = [], failOwner = null } = {}) {
       },
       occurrences: {
         MAX_ANALYTICS_V2_OCCURRENCE_DAYS: 30,
+        async readOwnerFirstEvidenceDay(context, options) {
+          assert.equal(context.nowMs, WIRING_NOW_MS);
+          calls.firstEvidence.push({ ...options });
+          const days = (evidence.get(options.ownerDigest) ?? []).filter((day) => day <= options.throughDay).sort();
+          return days[0] ?? null;
+        },
         async readOwnerOccurrences(context, options) {
           assert.equal(context.nowMs, WIRING_NOW_MS);
           calls.occurrences.push({ ...options });
@@ -1454,6 +1460,10 @@ test("default wiring: A-1 shapes in, one contiguous A-2 range out, non-effective
   assert.deepEqual(calls.queued, [0, 5]);
   const queued = ["2026-03-02", "2026-04-10", "2026-09-29", "2026-09-30"];
   assert.deepEqual(inputs.queuedDays, queued, "journal days plus the carried blocked day; no published heads");
+  // The first evidence day is read for the effective owner only, over the
+  // whole history through today.
+  assert.deepEqual(calls.firstEvidence, [{ ownerDigest: OWNER_A, throughDay: "2026-10-01" }]);
+  assert.equal(inputs.firstEvidenceDay, "2026-03-02");
   // Cache history reaches the stored floor; the range is A-2's required range.
   assert.equal(inputs.cacheFromDay, "2026-02-20");
   const required = a2.analyticsV2RequiredOccurrenceRange({ nowMs: WIRING_NOW_MS, queuedDays: queued,
@@ -1502,6 +1512,28 @@ test("default wiring: A-1 shapes in, one contiguous A-2 range out, non-effective
   assert.deepEqual(outputs.readSummary, { unlinkedTypedOwners: 0, terminalOwners: 1, nonEffectiveUnread: 0 });
   assert.deepEqual(outputs.dailyCandidates.map((candidate) => candidate.day), ["2026-03-02", "2026-09-29", "2026-09-30"]);
   assert.deepEqual(outputs.blockedDays, ["2026-04-10"]);
+});
+
+test("default wiring: cache history starts at the first evidence day, older than any window, queue or floor", async () => {
+  // OWNER_A's first evidence is 2024-11-03, 697 days before today and never
+  // queued; production builds a cache day for every delivered day.
+  const { calls, modules } = wiringModules({ ownerAEvidence: ["2024-11-03", "2026-09-29"] });
+  const pipeline = job.createAnalyticsV2Pipeline(modules);
+  const inputs = await pipeline.read({ pool: {}, schema: "s", nowMs: WIRING_NOW_MS,
+    state: { cursor: null, carriedBlockedDays: [], cacheFloorDay: null } });
+  assert.equal(inputs.firstEvidenceDay, "2024-11-03");
+  assert.equal(inputs.cacheFromDay, "2024-11-03");
+  assert.deepEqual({ ...inputs.occurrenceRange }, { fromDay: "2024-10-27", throughDay: "2026-10-01" });
+  assert.deepEqual([...inputs.occurrencesByOwner.get(OWNER_A).keys()], ["2024-11-03", "2026-09-29"]);
+  const reads = calls.occurrences.filter((call) => call.ownerDigest === OWNER_A && call.stream === "usage");
+  assert.deepEqual(spannedDays(reads), spannedDays([inputs.occurrenceRange]), "the whole history is read");
+  const outputs = await pipeline.compute(inputs, { nowMs: WIRING_NOW_MS, revisionSeed: 0 });
+  assert.equal(calls.compute.cacheFromDay, "2024-11-03");
+  assert.deepEqual(outputs.horizon, { ownerDayFromDay: "2024-10-27", cacheBandsFromDay: "2024-11-03" });
+  // A pipeline without the first-evidence reader cannot be built.
+  const { occurrences: { readOwnerFirstEvidenceDay: _first, ...withoutFirst }, ...rest } = wiringModules().modules;
+  assert.throws(() => job.createAnalyticsV2Pipeline({ ...rest, occurrences: withoutFirst }),
+    { code: "ANALYTICS_V2_REFRESH_PIPELINE_UNAVAILABLE" });
 });
 
 test("default wiring: an unlinked typed owner blocks every queued day; a non-effective source refusal fails closed", async () => {
@@ -1557,6 +1589,13 @@ test("cache horizon and day spans: history is retained back to the floor; reads 
     queuedDays: ["2026-04-01", "2026-11-01"], cacheFloorDay: "2026-05-01" }), "2026-04-01");
   assert.equal(job.analyticsRefreshCacheFromDay({ today: "2027-06-01", analysisDays: 170, queuedDays: [],
     cacheFloorDay: "2026-07-12" }), "2026-07-12", "a later run never drops stored cache history");
+  // No lower bound: evidence older than the 170-day analysis horizon, never
+  // queued and never stored, still starts the cache horizon.
+  assert.equal(job.analyticsRefreshCacheFromDay({ today: "2026-10-01", analysisDays: 170, queuedDays: [],
+    cacheFloorDay: null, firstEvidenceDay: "2025-01-10" }), "2025-01-10");
+  assert.equal(job.analyticsRefreshCacheFromDay({ today: "2026-10-01", analysisDays: 170,
+    queuedDays: ["2026-04-01"], cacheFloorDay: "2026-05-01", firstEvidenceDay: "2026-09-01" }), "2026-04-01",
+  "a later first evidence day never narrows the horizon");
   assert.deepEqual(job.analyticsRefreshDaySpans(["2026-01-03", "2026-01-01", "2026-01-02", "2026-01-05"], 2), [
     { fromDay: "2026-01-01", throughDay: "2026-01-02" },
     { fromDay: "2026-01-03", throughDay: "2026-01-03" },
@@ -1678,6 +1717,10 @@ test("PG17: real A-2 cache-band history survives later runs unchanged (retention
         : { days: [], lastSequence: afterSequence, terminalOwners: [], events: 0, complete: true }),
     },
     occurrences: {
+      readOwnerFirstEvidenceDay: async (context, { ownerDigest, throughDay }) => [...facts.get(ownerDigest)]
+        .filter(([day, streams]) => day <= throughDay
+          && streams.usage.length + streams.quota.length + streams.session.length > 0)
+        .map(([day]) => day).sort()[0] ?? null,
       readOwnerOccurrences: async (context, { ownerDigest, stream, fromDay, throughDay }) => new Map(
         [...facts.get(ownerDigest)].filter(([day, streams]) => day >= fromDay && day <= throughDay
           && streams[stream].length > 0).map(([day, streams]) => [day, streams[stream]])),

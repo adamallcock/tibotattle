@@ -351,3 +351,30 @@ test("(g) reads are deterministic and run in a read-only snapshot", { skip: SKIP
     client.release();
   }
 });
+
+test("the first evidence day is the earliest candidate day over every stream, with no lower bound",
+  { skip: SKIP, timeout: 120_000 }, async () => {
+    const addDays = (day, delta) => new Date(Date.parse(`${day}T00:00:00.000Z`) + delta * 86_400_000)
+      .toISOString().slice(0, 10);
+    for (const runtime of ["active", "staged"]) {
+      const listing = await modules.owners.listAnalyticsV2Owners(context(runtime));
+      const effective = listing.owners.filter((owner) => owner.source === "effective");
+      assert.ok(effective.length > 0);
+      for (const owner of effective) {
+        // The reference: readOwnerOccurrences over 399 days back from D3, every stream.
+        const days = [];
+        for (const stream of ["usage", "quota", "session"]) {
+          days.push(...(await occurrences(runtime, owner.ownerDigest, stream, addDays(D3, -399), D3)).keys());
+        }
+        const expected = days.sort()[0] ?? null;
+        assert.ok(expected !== null, "every fixture effective owner has evidence");
+        assert.equal(await modules.occurrences.readOwnerFirstEvidenceDay(context(runtime),
+          { ownerDigest: owner.ownerDigest, throughDay: D3 }), expected, `${runtime} ${owner.participantId}`);
+        assert.equal(await modules.occurrences.readOwnerFirstEvidenceDay(context(runtime),
+          { ownerDigest: owner.ownerDigest, throughDay: addDays(expected, -1) }), null,
+        "nothing before the first evidence day");
+      }
+    }
+    await assert.rejects(modules.occurrences.readOwnerFirstEvidenceDay(context("active"),
+      { ownerDigest: "not-a-digest", throughDay: D3 }), (error) => error?.code === "ANALYTICS_V2_SOURCE_INVALID");
+  });

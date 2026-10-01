@@ -34,25 +34,28 @@
  *
  * Input contract (validated, fail closed):
  * - The run uses exactly these days, its horizon: the 170 analysis days
- *   [today-169, today], [cacheFromDay-7, today] for the cache days and their
- *   7-day lookback, and the queued days. Nothing after today enters a window
- *   or a cache band, and evidence outside the horizon is unused, so outputs
- *   depend only on the evidence, nowMs, the queue and cacheFromDay, never on
- *   how widely A-1 read.
+ *   [today-169, today] (production's method constants: 70 model dates, each
+ *   over a 101-day window), [cacheFromDay-7, today] for the cache days and
+ *   their 7-day lookback, and the queued days. Nothing after today enters a
+ *   window or a cache band.
+ * - Cache history has no lower bound, as in production (d43c8f92 builds a
+ *   cache-retention day for every delivered day; CACHE_RETENTION_FROM_DAY is
+ *   unset, and the `all` window is unbounded). An explicit cacheFromDay (A-3
+ *   passes the first evidence day it read from the source, or earlier) needs
+ *   a read from 7 days before it. When cacheFromDay is omitted it is the
+ *   first day with evidence of any effective owner in `occurrencesByOwner`
+ *   (or the analysis start, when that is earlier or there is none), and the
+ *   occurrences must then be every effective owner's full history: the days
+ *   before the first evidence day are known empty, so its 7-day lookback
+ *   needs no read.
  * - The caller must have read every horizon day for EVERY effective owner.
  *   `occurrenceRange`, when given, is the inclusive range it read and must
  *   cover analyticsV2RequiredOccurrenceRange(...); when omitted, the read is
- *   taken to be exactly that required range (A-3 reads the analysis horizon
- *   plus every queued day, which is every horizon day under the default
- *   cacheFromDay). Occurrence days outside the range are rejected. Every
- *   effective owner must have an entry in `occurrencesByOwner` (an empty map
- *   when it has no evidence); a day absent from an owner's map means that
+ *   taken to be that required range, widened to the first evidence day when
+ *   cacheFromDay is omitted. Occurrence days outside the range are rejected.
+ *   Every effective owner must have an entry in `occurrencesByOwner` (an empty
+ *   map when it has no evidence); a day absent from an owner's map means that
  *   owner had no occurrences that day.
- * - Cache bands start at cacheFromDay, by default today-162: the first day
- *   whose 7-day lookback lies inside the analysis horizon. Production's
- *   cacheRetention 'all' window has no lower bound, so reproducing it needs
- *   cacheFromDay at the first evidence day (or production's
- *   CACHE_RETENTION_FROM_DAY) and a read from 7 days before it.
  * - `devicesByDay` holds A-1's contributing-device counts for each queued day
  *   that has a contributing owner. Within a counted day, an owner without a
  *   count takes production's floor of one device (countStorageDaily-
@@ -176,11 +179,11 @@ export interface ComputeAnalyticsV2Input {
   readonly nowMs: number;
   readonly revisionSeed: number;
   /**
-   * First day that gets cache band rows. Defaults to the analysis horizon:
-   * the first analysis day plus the 7-day lookback (today-162). An earlier
-   * day widens the cache history; occurrenceRange must then reach 7 days
-   * before it. Fixed per deployment so the cache output never depends on
-   * which days happen to be queued.
+   * First day that gets cache band rows; occurrenceRange must reach 7 days
+   * before it. Defaults to production's unbounded cache history: the first
+   * evidence day of any effective owner in occurrencesByOwner (or the
+   * analysis start when earlier), with the occurrences taken to be each
+   * owner's full history (see the module comment).
    */
   readonly cacheFromDay?: AnalyticsV2Day;
   /** Wall clock for phase timings only; defaults to performance.now. */
@@ -217,27 +220,49 @@ function queuedDayList(queued: AnalyticsV2QueuedDaysInput): readonly AnalyticsV2
   return (queued as { days: readonly AnalyticsV2Day[] }).days;
 }
 
-function defaultCacheFromDay(today: AnalyticsV2Day): AnalyticsV2Day {
-  return addDays(today, -(ANALYTICS_V2_ANALYSIS_DAYS - 1) + CACHE_LOOKBACK_DAYS);
+/** First analysis day: today-169. */
+function analysisStart(today: AnalyticsV2Day): AnalyticsV2Day {
+  return addDays(today, -(ANALYTICS_V2_ANALYSIS_DAYS - 1));
+}
+
+/** The first day with evidence of any effective owner in the input, or null. */
+function firstEvidenceDay(owners: readonly AnalyticsV2Owner[],
+  occurrencesByOwner: ReadonlyMap<AnalyticsV2OwnerDigest, ReadonlyMap<AnalyticsV2Day, AnalyticsV2DayOccurrences>>,
+  throughDay: AnalyticsV2Day): AnalyticsV2Day | null {
+  let first: AnalyticsV2Day | null = null;
+  for (const owner of owners) {
+    if (owner.source !== "effective") continue;
+    const days = occurrencesByOwner.get(owner.ownerDigest);
+    if (!(days instanceof Map)) continue;
+    for (const [day, value] of days) {
+      dayStart(day, "occurrencesByOwner");
+      if (day <= throughDay && hasEvidence(dayOccurrences(value)) && (first === null || day < first)) first = day;
+    }
+  }
+  return first;
 }
 
 /**
  * The smallest single occurrence range covering one run's horizon: the
- * analysis horizon [today-169, today], the cache lookback before cacheFromDay,
- * and every queued day. The run uses only the horizon days inside it (see the
- * module comment), so a caller may read just those days, as A-3 does with
- * disjoint ranges, and still pass or default to this covering range.
+ * analysis horizon [today-169, today], the cache lookback before an explicit
+ * cacheFromDay, and every queued day. Without cacheFromDay the cache horizon
+ * is the first evidence day (see the module comment), whose lookback is known
+ * empty, so the range adds no lookback. The run uses only the horizon days
+ * inside it, so a caller may read just those days, as A-3 does with disjoint
+ * ranges, and still pass or default to this covering range.
  */
 export function analyticsV2RequiredOccurrenceRange(input: {
   nowMs: number; queuedDays: AnalyticsV2QueuedDaysInput; cacheFromDay?: AnalyticsV2Day;
 }): AnalyticsV2DayRange {
   const today = analyticsV2Today(input.nowMs);
-  const cacheFromDay = input.cacheFromDay ?? defaultCacheFromDay(today);
-  dayStart(cacheFromDay, "cacheFromDay");
-  if (cacheFromDay > today) invalid("cacheFromDay");
-  let fromDay = addDays(today, -(ANALYTICS_V2_ANALYSIS_DAYS - 1)), throughDay = today;
-  const cacheLookback = addDays(cacheFromDay, -CACHE_LOOKBACK_DAYS);
-  if (cacheLookback < fromDay) fromDay = cacheLookback;
+  let fromDay = analysisStart(today), throughDay = today;
+  if (input.cacheFromDay !== undefined) {
+    const cacheFromDay = input.cacheFromDay;
+    dayStart(cacheFromDay, "cacheFromDay");
+    if (cacheFromDay > today) invalid("cacheFromDay");
+    const cacheLookback = addDays(cacheFromDay, -CACHE_LOOKBACK_DAYS);
+    if (cacheLookback < fromDay) fromDay = cacheLookback;
+  }
   for (const day of queuedDayList(input.queuedDays)) {
     dayStart(day, "queuedDays");
     if (day < fromDay) fromDay = day;
@@ -348,13 +373,21 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
   if (lastSequence !== null && (!Number.isSafeInteger(lastSequence) || lastSequence < 0)) invalid("queuedDays.lastSequence");
   for (const day of queuedInput) dayStart(day, "queuedDays");
   const queued = [...new Set(queuedInput)].sort();
-  const cacheFromDay = input.cacheFromDay ?? defaultCacheFromDay(today);
-  const required = analyticsV2RequiredOccurrenceRange({ nowMs, queuedDays: queued, cacheFromDay });
-  const range = input.occurrenceRange === undefined ? required : input.occurrenceRange;
+  if (!(input.occurrencesByOwner instanceof Map) || !(input.devicesByDay instanceof Map)) invalid("maps");
+  // Production has no lower bound on cache history: by default the cache
+  // horizon is the first evidence day (never later than the analysis start).
+  const evidenceFrom = input.cacheFromDay === undefined
+    ? firstEvidenceDay(owners, input.occurrencesByOwner, today) : null;
+  const cacheFromDay = input.cacheFromDay
+    ?? (evidenceFrom !== null && evidenceFrom < analysisStart(today) ? evidenceFrom : analysisStart(today));
+  const required = analyticsV2RequiredOccurrenceRange({ nowMs, queuedDays: queued,
+    ...(input.cacheFromDay === undefined ? {} : { cacheFromDay }) });
+  const range = input.occurrenceRange === undefined
+    ? { fromDay: cacheFromDay < required.fromDay ? cacheFromDay : required.fromDay, throughDay: required.throughDay }
+    : input.occurrenceRange;
   if (!range || typeof range !== "object") invalid("occurrenceRange");
   dayStart(range.fromDay, "occurrenceRange"); dayStart(range.throughDay, "occurrenceRange");
   if (range.fromDay > required.fromDay || range.throughDay < required.throughDay) invalid("occurrenceRange");
-  if (!(input.occurrencesByOwner instanceof Map) || !(input.devicesByDay instanceof Map)) invalid("maps");
   const ownerSet = new Set(owners.map((owner) => owner.ownerDigest));
   for (const [ownerDigest, days] of input.occurrencesByOwner) {
     if (!ownerSet.has(ownerDigest) || !(days instanceof Map)) invalid("occurrencesByOwner");

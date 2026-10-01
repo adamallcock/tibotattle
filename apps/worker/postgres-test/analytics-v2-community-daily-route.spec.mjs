@@ -819,3 +819,23 @@ test("the injected clock moves today, the closed allowance days and the cache wi
   const invalid = createRoute({ clock: () => Number.NaN });
   assertErrorEnvelope(await get(`?from=${FROM}&to=${TO}`, { route: invalid }), 500, "INTERNAL_ERROR");
 });
+
+test("the all window has no lower bound: a band 400 days old counts there and nowhere else", { skip }, async () => {
+  // Production's `all` window is unbounded (d43c8f92 readCacheRetentionCommunityBands
+  // binds no day for it) and the cache lane builds every delivered day, so a
+  // band older than any analysis horizon still counts in `all`.
+  const old = "2025-08-27";
+  const recent = [OWNER_B, "2026-09-28", "gpt-6-sol", "high", "five_to_ten_minutes",
+    { adj: 5, reuse: 2, match: 1, ties: 1, exIns: 0, exCtx: 0, sess: 1 }];
+  const ancient = [OWNER_A, old, "gpt-6-sol", "high", "five_to_ten_minutes",
+    { adj: 4, reuse: 1, match: 1, ties: 0, exIns: 0, exCtx: 0, sess: 2 }];
+  await reseed({ cache: [recent, ancient] });
+  const body = JSON.parse((await get(`?from=${FROM}&to=${TO}`)).text).cacheRetention;
+  const band = (window) => window.bands.find((entry) => entry.band === "five_to_ten_minutes");
+  assert.deepEqual(body.windows.map((window) => [window.window, band(window).adjacencies, band(window).contributors]),
+    [["day", 0, 0], ["week", 5, 1], ["month", 5, 1], ["all", 9, 2]]);
+  const allSql = modules.cacheWindows.analyticsV2CacheBandsSql(schema, { byModel: false, bounded: false });
+  assert.equal(/WHERE/u.test(allSql), false, "the all-window aggregate reads every stored day");
+  assert.equal(modules.cacheWindows.analyticsV2CacheWindowFromDay(NOW_MS, null), null);
+  await reseed();
+});

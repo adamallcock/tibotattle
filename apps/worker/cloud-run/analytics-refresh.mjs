@@ -400,16 +400,24 @@ export function analyticsRefreshPublicationDays(journalDays, state) {
 }
 
 /**
- * First day that gets cache-band rows. Cache history is retained, not a
- * rolling window: the horizon reaches back to the earliest stored cache-band
- * day and the earliest queued day, and never starts later than the analysis
- * horizon [today-(analysisDays-1), today]. Every stored cache day is therefore
- * recomputed exactly (with its 7-day carry) instead of being dropped.
+ * First day that gets cache-band rows. Production builds a cache-retention
+ * day for every delivered day (d43c8f92 cache-retention-day-worker.ts:
+ * CACHE_RETENTION_FROM_DAY is unset in every deployment, which "means every
+ * delivered day"), and its `all` window has no lower bound. So the horizon
+ * has no fixed lower bound either: it reaches back to the first evidence day
+ * of any effective owner (A-1 readOwnerFirstEvidenceDay over the whole day
+ * domain), the earliest stored cache-band day and the earliest queued day,
+ * and never starts later than the analysis horizon
+ * [today-(analysisDays-1), today]. Every stored cache day is recomputed
+ * exactly (with its 7-day carry) instead of being dropped.
  */
-export function analyticsRefreshCacheFromDay({ today, analysisDays, queuedDays, cacheFloorDay }) {
+export function analyticsRefreshCacheFromDay({
+  today, analysisDays, queuedDays, cacheFloorDay, firstEvidenceDay = null,
+}) {
   let fromDay = addDays(today, -(analysisDays - 1));
   for (const day of queuedDays) if (day < fromDay) fromDay = day;
   if (cacheFloorDay !== null && cacheFloorDay < fromDay) fromDay = cacheFloorDay;
+  if (firstEvidenceDay !== null && firstEvidenceDay < fromDay) fromDay = firstEvidenceDay;
   return fromDay;
 }
 
@@ -487,6 +495,8 @@ function compareOwners(left, right) {
  *   until complete;
  * - readOwnerOccurrences(context, {ownerDigest, stream, fromDay, throughDay})
  *   -> Map(day -> occurrences), at most MAX_ANALYTICS_V2_OCCURRENCE_DAYS a call;
+ * - readOwnerFirstEvidenceDay(context, {ownerDigest, throughDay}) -> the
+ *   owner's first evidence day or null (the cache horizon's lower end);
  * - countContributingDevices(context, {days: Map(day -> effective owners)});
  * - computeAnalyticsV2({..., occurrenceRange, cacheFromDay}) over ONE
  *   contiguous range that covers analyticsV2RequiredOccurrenceRange.
@@ -505,6 +515,7 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
   const listOwners = requireFunction(owners, "listAnalyticsV2Owners");
   const readQueued = requireFunction(queuedDays, "readQueuedDays");
   const readOccurrences = requireFunction(occurrences, "readOwnerOccurrences");
+  const readFirstEvidenceDay = requireFunction(occurrences, "readOwnerFirstEvidenceDay");
   const countDevices = requireFunction(devices, "countContributingDevices");
   const computeOutputs = requireFunction(compute, "computeAnalyticsV2");
   const requiredRange = requireFunction(compute, "analyticsV2RequiredOccurrenceRange");
@@ -579,11 +590,24 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
       const journal = await readJournal(context, state.cursor);
       const days = analyticsRefreshPublicationDays(journal.days, state);
       if (days.length > ANALYTICS_REFRESH_MAX_QUEUED_DAYS) fail("ANALYTICS_V2_REFRESH_QUEUE_CAPACITY_EXCEEDED");
+      const today = utcDay(nowMs);
+      const ownerList = [...listing.owners].sort(compareOwners);
+      // Production has no lower bound on cache history: start at the first
+      // evidence day of any effective owner, whatever the queue holds.
+      let firstEvidenceDay = null;
+      for (const owner of ownerList) {
+        if (owner.source !== "effective") continue;
+        const first = await readFirstEvidenceDay(context, { ownerDigest: owner.ownerDigest, throughDay: today });
+        if (first === null) continue;
+        if (!isDay(first) || first > today) fail("ANALYTICS_V2_REFRESH_OCCURRENCES_INVALID");
+        if (firstEvidenceDay === null || first < firstEvidenceDay) firstEvidenceDay = first;
+      }
       const cacheFromDay = analyticsRefreshCacheFromDay({
-        today: utcDay(nowMs),
+        today,
         analysisDays,
         queuedDays: days,
         cacheFloorDay: state.cacheFloorDay ?? null,
+        firstEvidenceDay,
       });
       const range = await requiredRange({ nowMs, queuedDays: days, cacheFromDay });
       if (range === null || typeof range !== "object" || !isDay(range.fromDay) || !isDay(range.throughDay)
@@ -597,7 +621,6 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
       const fullRange = analyticsRefreshRangeChunks(occurrenceRange, chunkDays);
       const queuedSpans = analyticsRefreshDaySpans(days, chunkDays);
 
-      const ownerList = [...listing.owners].sort(compareOwners);
       const occurrencesByOwner = new Map();
       let nonEffectiveUnread = 0;
       for (const owner of ownerList) {
@@ -629,6 +652,7 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
         cacheFromDay,
         devicesByDay,
         queuedDays: days,
+        firstEvidenceDay,
         lastSequence: journal.lastSequence,
         terminalOwners: journal.terminalOwners,
         nonEffectiveUnread,

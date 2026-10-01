@@ -101,6 +101,12 @@ export interface ReadOwnerOccurrencesOptions {
 
 /** Widest day range one call reads (the kernels' 170-day horizon plus slack). */
 export const MAX_ANALYTICS_V2_OCCURRENCE_DAYS = 400;
+/**
+ * The first day readOwnerFirstEvidenceDay considers: the lower end of the
+ * observed-day domain the reader parses (safeInteger(observed_day, -100_000,
+ * ...)), so the first-evidence read has no window, only the representable range.
+ */
+const FIRST_EVIDENCE_FLOOR_DAY_NUMBER = -100_000;
 /** Occurrence ids expanded per source batch (production's page bound). */
 const EXPANSION_BATCH = 200;
 /** Distinct source variants one batch may expand to (production's bound). */
@@ -972,5 +978,60 @@ export async function readOwnerOccurrences(
       output.set(dayFromNumber(day), rows);
     }
     return output;
+  });
+}
+
+/**
+ * The earliest observed day the reader's own candidate selection names on or
+ * before `throughDay`, over every stream, or null when the owner has none.
+ *
+ * Production builds cache-retention days for every delivered day
+ * (d43c8f92 cache-retention-day-worker.ts: CACHE_RETENTION_FROM_DAY unset
+ * "means every delivered day"), so the cache horizon has no lower bound. This
+ * read gives analytics-refresh that first day with exactly the candidate
+ * predicates readOwnerOccurrences uses (v1/v1.1 typed records, v1.2 domain
+ * days, and usage-correction facts when the runtime is active), over the
+ * whole representable day domain, so no evidence older than a fixed window is
+ * ever left out. It reads in the caller's snapshot and expands nothing.
+ */
+export async function readOwnerFirstEvidenceDay(
+  context: AnalyticsV2SnapshotContext,
+  options: { readonly ownerDigest: string; readonly throughDay: AnalyticsV2Day },
+): Promise<AnalyticsV2Day | null> {
+  if (!options || typeof options !== "object" || typeof options.ownerDigest !== "string"
+      || !ANALYTICS_V2_OWNER_DIGEST_PATTERN.test(options.ownerDigest)) {
+    sourceFail("ANALYTICS_V2_SOURCE_INVALID");
+  }
+  const ownerDigest = options.ownerDigest;
+  const throughDay = dayNumber(options.throughDay);
+  const fromDay = FIRST_EVIDENCE_FLOOR_DAY_NUMBER;
+  const s = quotedSchema(context.schema);
+  const now = nowTimestamp(context.nowMs);
+  return onReadSnapshot(context, async (client) => {
+    const scope = await readOwnerScope(client, s, ownerDigest);
+    let first: number | null = null;
+    const take = (rows: readonly Record<string, unknown>[]): void => {
+      const value = rows[0]?.first_day;
+      if (value === null || value === undefined) return;
+      const day = safeInteger(value, fromDay, throughDay);
+      if (first === null || day < first) first = day;
+    };
+    const firstOf = (sql: string): string =>
+      `SELECT min(candidate.observed_day)::integer AS first_day FROM (${sql}) candidate`;
+    for (const stream of ["usage", "quota", "session"] as const) {
+      if (scope.v1Namespace !== null || scope.v11Namespace !== null) {
+        take((await client.query<Record<string, unknown>>(firstOf(legacyCandidatesSql(s)),
+          [ownerDigest, scope.participantId, STREAM_CODES[stream], stream, fromDay, throughDay])).rows);
+      }
+      if (scope.v12HeadActive) {
+        take((await client.query<Record<string, unknown>>(firstOf(v12CandidatesSql(s)),
+          [scope.participantId, stream, now, dayFromNumber(fromDay), dayFromNumber(throughDay)])).rows);
+      }
+      if (stream === "usage" && scope.correctionActive) {
+        take((await client.query<Record<string, unknown>>(firstOf(correctionCandidatesSql(s)),
+          [ownerDigest, fromDay * DAY_MS, (throughDay + 1) * DAY_MS])).rows);
+      }
+    }
+    return first === null ? null : dayFromNumber(first);
   });
 }
