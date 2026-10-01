@@ -1,0 +1,709 @@
+{
+ "schemaVersion": "gcp-fastpath-dense-oracle-manifest-v1",
+ "oracle": "production-code (d43c8f92 Worker modules bundled for Node over the sealed SQLite D1 adapter; D1 seeded through admission helpers; scheduled entry points driven to convergence; forced native references)",
+ "sourceCommit": "d43c8f92a059d9c577776f7eca8a331eb305b8a6",
+ "build": {
+  "verifiedFiles": 392,
+  "listingSha256": "6e8335b8056297b853900673ff3a58b0a20cdd595136905e1dbd6c5a7870f75a",
+  "entrySha256": "81e899035a4a730b9b20c1105728ca9d8e0244d7c17715e7931aa57658c9a146",
+  "esbuildVersion": "0.28.1",
+  "dependencies": {
+   "jsonc-parser": "3.3.1",
+   "oauth4webapi": "3.8.6",
+   "runcost": "0.2.1"
+  }
+ },
+ "corpus": {
+  "schemaVersion": "gcp-fastpath-oracle-corpus-v1",
+  "q1": {
+   "path": "apps/worker/analytics-v2-test/golden/corpus/corpus.json",
+   "sha256": "be042b9a72c00a8bbeef592619d7d7ab00be5b02a557629340d27bbf36b5521e",
+   "recordCounts": {
+    "a": {
+     "quota": 692,
+     "session": 668,
+     "usage": 2324
+    },
+    "b": {
+     "quota": 688,
+     "session": 663,
+     "usage": 2311
+    },
+    "c": {
+     "quota": 690,
+     "session": 666,
+     "usage": 2293
+    },
+    "d": {
+     "quota": 724,
+     "session": 700,
+     "usage": 2411
+    }
+   }
+  },
+  "dense": null
+ },
+ "nowMs": 1790856000000,
+ "now": "2026-10-01T12:00:00.000Z",
+ "pinnedNow": "2026-10-01T12:00:00.000Z",
+ "seedClock": "2026-10-01T07:26:31.714Z",
+ "correctionRuntimeState": "active",
+ "sqliteStatistics": "ANALYZE on the seeded source before analysis (query plans only; sqlite_* tables are not dumped)",
+ "topology": {
+  "analytics": {
+   "STORAGE_ANALYTICS_SHARED_FEATURES": "enabled",
+   "STORAGE_ANALYTICS_MODEL_BLOCKS": "enabled",
+   "PUBLICATION_LANE_EXTERNAL": "enabled"
+  },
+  "publication": {
+   "PUBLICATION_LANE": "enabled",
+   "STORAGE_ANALYTICS_SHARED_FEATURES": "enabled",
+   "STORAGE_ANALYTICS_MODEL_BLOCKS": "disabled"
+  },
+  "cache": {
+   "CACHE_RETENTION_BUILD": "enabled",
+   "CACHE_RETENTION_SHARED_FEATURES": "enabled",
+   "shards": 1
+  },
+  "graphDayProjection": "disabled (deployment default)",
+  "cadence": {
+   "lanesPerSimulatedMinute": [
+    "analytics",
+    "publication x1",
+    "cache"
+   ],
+   "longPassEveryMinutes": 10,
+   "q1Cadence": true
+  },
+  "basis": "Q-1's reading of the production-scheduled-analytics-deploy refresh plan at d43c8f92; not verified against live configuration"
+ },
+ "convergence": {
+  "converged": true,
+  "scheduleErrors": 0,
+  "quietTicks": 21,
+  "rule": "progress digest (counts, integer sums, text lengths, checkpoint/block/feature heads of every analytics table) unchanged for quietTicks consecutive ticks"
+ },
+ "directPublisherCalls": {
+  "preview": "unchanged",
+  "modelDays": {
+   "unchanged": 56
+  }
+ },
+ "owners": [
+  {
+   "key": "a",
+   "kind": "social",
+   "planType": "pro",
+   "storage": {
+    "v11": [
+     "2026-04-15",
+     "2026-10-01"
+    ],
+    "v1ConflictChunk": [
+     "2026-04-17",
+     "2026-04-17"
+    ]
+   },
+   "ownerDigest": "f214e768a577e01681dcb70f03221c39e0715d52ff594724daf0ba76f6c6c54c",
+   "pinnedOwnerDigest": "f214e768a577e01681dcb70f03221c39e0715d52ff594724daf0ba76f6c6c54c",
+   "flags": {
+    "hasV1": true,
+    "hasV11": true,
+    "hasV12": false,
+    "hasLegacy": false,
+    "hasEffective": true
+   },
+   "expectedSourceRouting": "effective",
+   "dailySourceFormats": [
+    {
+     "sourceFormat": "effective",
+     "days": 168
+    }
+   ],
+   "graphSources": [
+    {
+     "metric": "fits",
+     "sourceKind": "effective",
+     "results": 1
+    },
+    {
+     "metric": "model",
+     "sourceKind": "effective",
+     "results": 56
+    }
+   ]
+  },
+  {
+   "key": "b",
+   "kind": "accountless",
+   "planType": "plus",
+   "storage": {
+    "v11": [
+     "2026-04-15",
+     "2026-10-01"
+    ]
+   },
+   "ownerDigest": "b2df2e36a49340774e9550bb63a8ec9a663b5c56b63e86519a987b619c6981be",
+   "pinnedOwnerDigest": "b2df2e36a49340774e9550bb63a8ec9a663b5c56b63e86519a987b619c6981be",
+   "flags": {
+    "hasV1": false,
+    "hasV11": true,
+    "hasV12": false,
+    "hasLegacy": false,
+    "hasEffective": true
+   },
+   "expectedSourceRouting": "effective",
+   "dailySourceFormats": [
+    {
+     "sourceFormat": "effective",
+     "days": 168
+    }
+   ],
+   "graphSources": [
+    {
+     "metric": "fits",
+     "sourceKind": "effective",
+     "results": 1
+    },
+    {
+     "metric": "model",
+     "sourceKind": "effective",
+     "results": 61
+    }
+   ]
+  },
+  {
+   "key": "c",
+   "kind": "social",
+   "planType": "pro",
+   "storage": {
+    "v12": [
+     "2026-04-15",
+     "2026-10-01"
+    ]
+   },
+   "ownerDigest": "77fa209ac4e4d1407b6fbe20381f67bde307e0ffc5ab47b98f3ac48caa9fc04e",
+   "pinnedOwnerDigest": "77fa209ac4e4d1407b6fbe20381f67bde307e0ffc5ab47b98f3ac48caa9fc04e",
+   "flags": {
+    "hasV1": false,
+    "hasV11": false,
+    "hasV12": true,
+    "hasLegacy": false,
+    "hasEffective": true
+   },
+   "expectedSourceRouting": "effective",
+   "dailySourceFormats": [
+    {
+     "sourceFormat": "effective",
+     "days": 168
+    }
+   ],
+   "graphSources": [
+    {
+     "metric": "fits",
+     "sourceKind": "effective",
+     "results": 1
+    },
+    {
+     "metric": "model",
+     "sourceKind": "effective",
+     "results": 66
+    }
+   ]
+  },
+  {
+   "key": "d",
+   "kind": "social",
+   "planType": "prolite",
+   "storage": {
+    "v11": [
+     "2026-04-15",
+     "2026-10-01"
+    ],
+    "v1DuplicateChunk": [
+     "2026-06-30",
+     "2026-06-30"
+    ]
+   },
+   "ownerDigest": "8f6b06d86afa675ccb556989677ad247f687a344926347a68281cebdfe4e4007",
+   "pinnedOwnerDigest": "8f6b06d86afa675ccb556989677ad247f687a344926347a68281cebdfe4e4007",
+   "flags": {
+    "hasV1": true,
+    "hasV11": true,
+    "hasV12": false,
+    "hasLegacy": false,
+    "hasEffective": true
+   },
+   "expectedSourceRouting": "effective",
+   "dailySourceFormats": [
+    {
+     "sourceFormat": "effective",
+     "days": 168
+    }
+   ],
+   "graphSources": [
+    {
+     "metric": "fits",
+     "sourceKind": "effective",
+     "results": 1
+    },
+    {
+     "metric": "model",
+     "sourceKind": "effective",
+     "results": 64
+    }
+   ]
+  }
+ ],
+ "routingEvidence": {
+  "sharedFeatures": [
+   {
+    "owner": "c",
+    "state": "complete",
+    "n": 177,
+    "first": "2026-04-08",
+    "last": "2026-10-01"
+   },
+   {
+    "owner": "d",
+    "state": "complete",
+    "n": 177,
+    "first": "2026-04-08",
+    "last": "2026-10-01"
+   },
+   {
+    "owner": "b",
+    "state": "complete",
+    "n": 177,
+    "first": "2026-04-08",
+    "last": "2026-10-01"
+   },
+   {
+    "owner": "a",
+    "state": "complete",
+    "n": 175,
+    "first": "2026-04-08",
+    "last": "2026-10-01"
+   },
+   {
+    "owner": "a",
+    "state": "refused",
+    "n": 2,
+    "first": "2026-04-17",
+    "last": "2026-04-18"
+   }
+  ],
+  "sharedFeatureRefusedDays": {
+   "a": [
+    "2026-04-17",
+    "2026-04-18"
+   ]
+  },
+  "checkpointHeads": {
+   "heads": 9,
+   "retired": 0
+  },
+  "checkpointParts": {
+   "parts": 54,
+   "bytes": 4595590,
+   "maxPartIndex": 7
+  },
+  "modelBlocks": [
+   {
+    "owner": "c",
+    "state": "complete",
+    "n": 3
+   },
+   {
+    "owner": "d",
+    "state": "complete",
+    "n": 3
+   },
+   {
+    "owner": "b",
+    "state": "complete",
+    "n": 3
+   },
+   {
+    "owner": "a",
+    "state": "complete",
+    "n": 2
+   },
+   {
+    "owner": "a",
+    "state": "pending",
+    "n": 1
+   }
+  ]
+ },
+ "modelPublications": {
+  "expectedDates": 70,
+  "published": 56,
+  "missing": [
+   "2026-07-24",
+   "2026-07-25",
+   "2026-07-26",
+   "2026-07-27",
+   "2026-07-28",
+   "2026-07-29",
+   "2026-07-30",
+   "2026-07-31",
+   "2026-08-01",
+   "2026-08-02",
+   "2026-08-03",
+   "2026-08-04",
+   "2026-08-05",
+   "2026-08-06"
+  ],
+  "ownersWithResultOnMissingDates": {
+   "2026-07-24": [
+    "b",
+    "c",
+    "d"
+   ],
+   "2026-07-25": [
+    "b",
+    "c",
+    "d"
+   ],
+   "2026-07-26": [
+    "b",
+    "c",
+    "d"
+   ],
+   "2026-07-27": [
+    "b",
+    "c",
+    "d"
+   ],
+   "2026-07-28": [
+    "c",
+    "d"
+   ],
+   "2026-07-29": [
+    "c",
+    "d"
+   ],
+   "2026-07-30": [
+    "c",
+    "d"
+   ],
+   "2026-07-31": [
+    "c"
+   ],
+   "2026-08-01": [
+    "c"
+   ],
+   "2026-08-02": [],
+   "2026-08-03": [],
+   "2026-08-04": [],
+   "2026-08-05": [],
+   "2026-08-06": [
+    "b",
+    "c",
+    "d"
+   ]
+  }
+ },
+ "conflict": {
+  "owner": "a",
+  "occurrenceId": "event:v2:d3b6ff85b08a912655697426ded4cba7bee1f0e1cf5574bc717a8c2f14eb5d5e",
+  "days": [
+   "2026-04-17",
+   "2026-04-18"
+  ],
+  "publishedDays": []
+ },
+ "duplicate": {
+  "owner": "d",
+  "occurrenceId": "event:v2:48f6e305db59186ede038b4f089191897d02f1b76941536d25f7a50b26667c5d",
+  "day": "2026-06-30",
+  "formats": [
+   "v1",
+   "v11"
+  ],
+  "v1AdmittedBeforeV11Domain": true
+ },
+ "response": {
+  "status": 200,
+  "cacheControl": "public, max-age=300",
+  "schemaVersion": "community-daily-read-v1.0",
+  "allowanceState": "ready",
+  "allowanceReadState": "confirmed",
+  "publishedDays": 168,
+  "modelPublicationDays": 56,
+  "previewRow": {
+   "revision": 44,
+   "method": "48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9:v1-fit-7:server-api-price-equivalent-v0.5:plan-attribution-v1:legacy-day-or-complete-domain-3:legacy-day-or-complete-domain-3:plan-attribution-v1:v1-era-buckets-2:legacy-day-or-complete-domain-3:plan-attribution-v1:v1-era-buckets-3:v1-quota-acquisition-2:plan-attribution-v1:v11-account-era-buckets-1:v11-complete-domain-1:server-api-price-equivalent-v0.5:community-public-sources-v1:48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9:v1-composition-3:server-api-price-equivalent-v0.5:plan-attribution-v1:legacy-day-or-complete-domain-3:legacy-day-or-complete-domain-3:plan-attribution-v1:v1-era-buckets-2:legacy-day-or-complete-domain-3:plan-attribution-v1:v1-era-buckets-3:v1-quota-acquisition-2:plan-attribution-v1:v11-account-era-buckets-1:v11-complete-domain-1:server-api-price-equivalent-v0.5:community-public-sources-v1:separate-results-1",
+   "generated_at": "2026-10-01T12:00:00.000Z",
+   "inputs_current": 1,
+   "snapshot_source_epoch": 8
+  }
+ },
+ "forcedNative": {
+  "scope": "withheld",
+  "sampleDates": [
+   "2026-07-24",
+   "2026-08-10",
+   "2026-08-27",
+   "2026-09-13",
+   "2026-10-01"
+  ],
+  "configuration": "computeStorageGraphResult(preparedFold:false, preparedEffectiveUsage:false, persistResult:false, no sharedFeatures), re-invoked at production's 1,000-statement invocation meter until complete, on a scratch copy with every graph cache cleared and a read-only source; production's model-block fallback",
+  "owners": {
+   "a": {
+    "pages": {
+     "fits": {
+      "usagePages": 101,
+      "quotaPages": 101,
+      "usageRows": 1395
+     },
+     "modelDates": {
+      "usagePages": 1818,
+      "quotaPages": 1818,
+      "dates": 18
+     }
+    },
+    "fits": "complete",
+    "model": {
+     "failed": 4,
+     "complete": 14
+    },
+    "failures": {
+     "2026-07-24": "STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE",
+     "2026-07-25": "STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE",
+     "2026-07-26": "STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE",
+     "2026-07-27": "STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE"
+    },
+    "cost": {
+     "statements": 155804,
+     "invocations": 182,
+     "maxCheckpointBytes": 689044
+    }
+   },
+   "b": {
+    "pages": {
+     "fits": {
+      "usagePages": 101,
+      "quotaPages": 101,
+      "usageRows": 1417
+     },
+     "modelDates": {
+      "usagePages": 1414,
+      "quotaPages": 1414,
+      "dates": 14
+     }
+    },
+    "fits": "complete",
+    "model": {
+     "complete": 14
+    },
+    "failures": {},
+    "cost": {
+     "statements": 130132,
+     "invocations": 150,
+     "maxCheckpointBytes": 699164
+    }
+   },
+   "c": {
+    "pages": {
+     "fits": {
+      "usagePages": 101,
+      "quotaPages": 101,
+      "usageRows": 1372
+     },
+     "modelDates": {
+      "usagePages": 909,
+      "quotaPages": 909,
+      "dates": 9
+     }
+    },
+    "fits": "complete",
+    "model": {
+     "complete": 9
+    },
+    "failures": {},
+    "cost": {
+     "statements": 89041,
+     "invocations": 110,
+     "maxCheckpointBytes": 690937
+    }
+   },
+   "d": {
+    "pages": {
+     "fits": {
+      "usagePages": 101,
+      "quotaPages": 101,
+      "usageRows": 1425
+     },
+     "modelDates": {
+      "usagePages": 1111,
+      "quotaPages": 1111,
+      "dates": 11
+     }
+    },
+    "fits": "complete",
+    "model": {
+     "complete": 11
+    },
+    "failures": {},
+    "cost": {
+     "statements": 104425,
+     "invocations": 120,
+     "maxCheckpointBytes": 721657
+    }
+   }
+  },
+  "tierNEqualsForced": {
+   "a": {
+    "fits": true,
+    "modelCompared": 4,
+    "modelEqual": 4
+   },
+   "b": {
+    "fits": true,
+    "modelCompared": 5,
+    "modelEqual": 5
+   },
+   "c": {
+    "fits": true,
+    "modelCompared": 5,
+    "modelEqual": 5
+   },
+   "d": {
+    "fits": true,
+    "modelCompared": 5,
+    "modelEqual": 5
+   }
+  }
+ },
+ "cacheRetention": {
+  "marks": [
+   {
+    "owner": "c",
+    "source_layout": "effective",
+    "n": 2,
+    "first": "2026-04-15",
+    "last": "2026-04-16"
+   },
+   {
+    "owner": "d",
+    "source_layout": "effective",
+    "n": 2,
+    "first": "2026-04-15",
+    "last": "2026-04-16"
+   },
+   {
+    "owner": "d",
+    "source_layout": "typed-v11",
+    "n": 32,
+    "first": "2026-04-15",
+    "last": "2026-05-17"
+   },
+   {
+    "owner": "b",
+    "source_layout": "effective",
+    "n": 2,
+    "first": "2026-04-15",
+    "last": "2026-04-16"
+   },
+   {
+    "owner": "b",
+    "source_layout": "typed-v11",
+    "n": 2,
+    "first": "2026-04-17",
+    "last": "2026-04-18"
+   },
+   {
+    "owner": "a",
+    "source_layout": "effective",
+    "n": 2,
+    "first": "2026-04-15",
+    "last": "2026-04-16"
+   },
+   {
+    "owner": "a",
+    "source_layout": "typed-v11",
+    "n": 101,
+    "first": "2026-04-15",
+    "last": "2026-07-24"
+   }
+  ],
+  "windowAdjacencies": {
+   "day": 0,
+   "week": 0,
+   "month": 0,
+   "all": 67
+  }
+ },
+ "parityBasis": {
+  "runSpecificColumns": {
+   "analytics_cache_retention_day_bands": [
+    "value_key"
+   ],
+   "analytics_cache_retention_day_values": [
+    "carry_digest",
+    "mark_key",
+    "value_key"
+   ],
+   "analytics_community_graph_previews": [
+    "cohort_digest"
+   ],
+   "analytics_community_model_publications": [
+    "cohort_digest"
+   ]
+  },
+  "publishedRowDigests": {
+   "analytics_cache_retention_day_bands": {
+    "rows": 1460,
+    "sha256": "73e4dad78b37ef0f06972c7a10a29e041b892108338441adafe0de6e3c22889d"
+   },
+   "analytics_cache_retention_day_values": {
+    "rows": 146,
+    "sha256": "5ed9ed764e8f5aae8d32a4b0c0650efebe5d9fc3f38aa24fe52e88cb495368b5"
+   },
+   "analytics_community_daily_publications": {
+    "rows": 168,
+    "sha256": "7c62ac1eef1a48201c20271ec7d83d1eed2e74155e401cad7759ad750cd75d5c"
+   },
+   "analytics_community_graph_previews": {
+    "rows": 1,
+    "sha256": "1212b46e908b10ff2953df325b6c53f00a14c3609f2e8727b02db467bb723414"
+   },
+   "analytics_community_graph_publication_state": {
+    "rows": 1,
+    "sha256": "9ad78b42a93c9dd9286467f16026ad0e2c055ac3ce5357fd459dcb8349fd11cd"
+   },
+   "analytics_community_model_publications": {
+    "rows": 56,
+    "sha256": "efecfbb2232dfec0b23dc690ef0359478c95cf05e850458de88777c4ec1cb2c8"
+   }
+  }
+ },
+ "leaseExpiryProbe": {
+  "steps": 12,
+  "stepMinutes": 10,
+  "through": "2026-10-01T14:00:00.000Z",
+  "changedOutputs": [],
+  "errors": 0
+ },
+ "sourceDump": {
+  "tables": 85,
+  "rows": 58048,
+  "schemaSha256": "f63ad44aef250a0a54aa6e4eee064a19d20ddb96ff7416535a6fc1a2410901d4",
+  "rowCountsSha256": "a07ba315d18057da0008eb20693537a6b50d9f9bad62525ec949192777fe7775",
+  "jsonBytes": 12535087,
+  "jsonSha256": "c371aab16859bafb724007f542e0ac68598ed8aae6a34b5fa3964e300fa64a40",
+  "sealedSqlite": {
+   "sha256": "b7ff47a9f99b9aac1e321867b79f405d9f9f4a4ea885f8f7f33715d1e4811aa3",
+   "bytes": 19083264,
+   "integrityCheck": "ok",
+   "sealReady": true,
+   "populatedTables": 85,
+   "missingSealedTables": [],
+   "node": "v26.2.0"
+  },
+  "sourceUnchangedByAnalysis": true,
+  "reproduce": "node --max-old-space-size=16384 apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs --work-dir <dir> --corpus q1"
+ }
+}

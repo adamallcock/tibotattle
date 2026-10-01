@@ -1,0 +1,150 @@
+{
+ "schemaVersion": "gcp-fastpath-dense-run-cost-v1",
+ "note": "wall-clock measurements of this run on its host; not reproducible and never compared",
+ "runtime": {
+  "node": "v26.2.0",
+  "sqlite": "3.53.1",
+  "adapter": "cloud-run/sealed-sqlite-d1-adapter.mjs"
+ },
+ "seedMs": 11552,
+ "tierN": {
+  "ticks": 321,
+  "elapsedMs": 636161,
+  "laneMs": {
+   "analytics": 402515,
+   "publication": 122397,
+   "cache": 110005
+  },
+  "laneStats": {
+   "storage_analytics_schedule:progress:step_limit": 199,
+   "storage_analytics_long_schedule:deferred:query_budget": 29,
+   "storage_analytics_schedule:deferred:query_budget": 71,
+   "storage_analytics_long_schedule:deferred:step_limit": 3,
+   "storage_analytics_schedule:idle:complete": 19
+  },
+  "slowestLane": {
+   "ms": 3774,
+   "tick": 209,
+   "lane": "analytics"
+  },
+  "publicationPasses": 1,
+  "resumedFrom": null
+ },
+ "tierF": {
+  "scope": "withheld",
+  "total": {
+   "ms": 373212,
+   "statements": 479402
+  },
+  "owners": {
+   "a": {
+    "pages": {
+     "fits": {
+      "usagePages": 101,
+      "quotaPages": 101,
+      "usageRows": 1395
+     },
+     "modelDates": {
+      "usagePages": 1818,
+      "quotaPages": 1818,
+      "dates": 18
+     }
+    },
+    "cost": {
+     "ms": 124569,
+     "statements": 155804,
+     "invocations": 182,
+     "maxCheckpointBytes": 689044,
+     "fits": {
+      "ms": 7008,
+      "statements": 8713,
+      "invocations": 10,
+      "maxCheckpointParts": 7,
+      "maxCheckpointBytes": 689044
+     }
+    }
+   },
+   "b": {
+    "pages": {
+     "fits": {
+      "usagePages": 101,
+      "quotaPages": 101,
+      "usageRows": 1417
+     },
+     "modelDates": {
+      "usagePages": 1414,
+      "quotaPages": 1414,
+      "dates": 14
+     }
+    },
+    "cost": {
+     "ms": 104197,
+     "statements": 130132,
+     "invocations": 150,
+     "maxCheckpointBytes": 699164,
+     "fits": {
+      "ms": 7029,
+      "statements": 8794,
+      "invocations": 10,
+      "maxCheckpointParts": 8,
+      "maxCheckpointBytes": 699164
+     }
+    }
+   },
+   "c": {
+    "pages": {
+     "fits": {
+      "usagePages": 101,
+      "quotaPages": 101,
+      "usageRows": 1372
+     },
+     "modelDates": {
+      "usagePages": 909,
+      "quotaPages": 909,
+      "dates": 9
+     }
+    },
+    "cost": {
+     "ms": 54926,
+     "statements": 89041,
+     "invocations": 110,
+     "maxCheckpointBytes": 690937,
+     "fits": {
+      "ms": 5650,
+      "statements": 9026,
+      "invocations": 11,
+      "maxCheckpointParts": 8,
+      "maxCheckpointBytes": 690937
+     }
+    }
+   },
+   "d": {
+    "pages": {
+     "fits": {
+      "usagePages": 101,
+      "quotaPages": 101,
+      "usageRows": 1425
+     },
+     "modelDates": {
+      "usagePages": 1111,
+      "quotaPages": 1111,
+      "dates": 11
+     }
+    },
+    "cost": {
+     "ms": 89104,
+     "statements": 104425,
+     "invocations": 120,
+     "maxCheckpointBytes": 721657,
+     "fits": {
+      "ms": 6995,
+      "statements": 8769,
+      "invocations": 10,
+      "maxCheckpointParts": 8,
+      "maxCheckpointBytes": 721657
+     }
+    }
+   }
+  }
+ }
+}
