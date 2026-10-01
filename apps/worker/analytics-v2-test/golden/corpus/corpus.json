@@ -1,0 +1,196 @@
+{
+ "schemaVersion": "gcp-fastpath-oracle-corpus-v1",
+ "sourceCommit": "d43c8f92a059d9c577776f7eca8a331eb305b8a6",
+ "generator": "generate-corpus.mjs",
+ "seed": "gcp-fastpath-oracle-2026-10-01",
+ "synthetic": true,
+ "window": {
+  "fromDay": "2026-04-15",
+  "throughDay": "2026-10-01",
+  "days": 170
+ },
+ "pinnedNow": "2026-10-01T12:00:00.000Z",
+ "correctionRuntimeState": "active",
+ "conflict": {
+  "owner": "a",
+  "occurrenceId": "event:v2:d3b6ff85b08a912655697426ded4cba7bee1f0e1cf5574bc717a8c2f14eb5d5e",
+  "days": [
+   "2026-04-17",
+   "2026-04-18"
+  ],
+  "formats": {
+   "2026-04-17": "v1",
+   "2026-04-18": "v11"
+  },
+  "v1AdmittedAfterV11Domain": true
+ },
+ "duplicate": {
+  "owner": "d",
+  "occurrenceId": "event:v2:48f6e305db59186ede038b4f089191897d02f1b76941536d25f7a50b26667c5d",
+  "day": "2026-06-30",
+  "formats": [
+   "v1",
+   "v11"
+  ],
+  "v1AdmittedBeforeV11Domain": true
+ },
+ "recordCounts": {
+  "a": {
+   "quota": 692,
+   "session": 668,
+   "usage": 2324
+  },
+  "b": {
+   "quota": 688,
+   "session": 663,
+   "usage": 2311
+  },
+  "c": {
+   "quota": 690,
+   "session": 666,
+   "usage": 2293
+  },
+  "d": {
+   "quota": 724,
+   "session": 700,
+   "usage": 2411
+  }
+ },
+ "owners": [
+  {
+   "key": "a",
+   "kind": "social",
+   "participantId": "participant:14c71dae-0182-49fb-89b1-5dc3d6473e71",
+   "pinnedOwnerDigest": "f214e768a577e01681dcb70f03221c39e0715d52ff594724daf0ba76f6c6c54c",
+   "planType": "pro",
+   "accountTrackId": "account-track:v2:85bc874e58219e755b2d253cb0c12e42cdaf9693483ca02f9f54266553868d1d",
+   "models": [
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.5"
+   ],
+   "capacitiesUsdPerWindow": {
+    "gpt-5.6-sol": 229.5,
+    "gpt-5.6-terra": 107.1,
+    "gpt-5.5": 178.5
+   },
+   "resetWeekdayUtc": 1,
+   "storage": {
+    "v11": [
+     "2026-04-15",
+     "2026-10-01"
+    ],
+    "v1ConflictChunk": [
+     "2026-04-17",
+     "2026-04-17"
+    ]
+   },
+   "conflict": {
+    "occurrenceId": "event:v2:d3b6ff85b08a912655697426ded4cba7bee1f0e1cf5574bc717a8c2f14eb5d5e",
+    "days": [
+     "2026-04-17",
+     "2026-04-18"
+    ],
+    "formats": {
+     "2026-04-17": "v1",
+     "2026-04-18": "v11"
+    },
+    "v1AdmittedAfterV11Domain": true
+   },
+   "dayCount": 170
+  },
+  {
+   "key": "b",
+   "kind": "accountless",
+   "participantId": "participant:1a46b631-0678-498b-83c9-af9504eb498c",
+   "pinnedOwnerDigest": "b2df2e36a49340774e9550bb63a8ec9a663b5c56b63e86519a987b619c6981be",
+   "planType": "plus",
+   "accountTrackId": "account-track:v2:31e7d8ede46d6f88c462991c0cf095843bdfafbab70d223cd271683687df3ef0",
+   "models": [
+    "gpt-5.6-terra",
+    "gpt-5.6-sol"
+   ],
+   "capacitiesUsdPerWindow": {
+    "gpt-5.6-terra": 4.25,
+    "gpt-5.6-sol": 9.11
+   },
+   "resetWeekdayUtc": 3,
+   "storage": {
+    "v11": [
+     "2026-04-15",
+     "2026-10-01"
+    ]
+   },
+   "dayCount": 170
+  },
+  {
+   "key": "c",
+   "kind": "social",
+   "participantId": "participant:4ecff397-705c-43db-89d0-df091b4b9a0a",
+   "pinnedOwnerDigest": "77fa209ac4e4d1407b6fbe20381f67bde307e0ffc5ab47b98f3ac48caa9fc04e",
+   "planType": "pro",
+   "accountTrackId": "account-track:v2:31af612fed666f2beba479b917d06413603c5e6a343fb829b0e3b7511726a2b7",
+   "models": [
+    "gpt-5.6-sol",
+    "gpt-5.6-terra"
+   ],
+   "capacitiesUsdPerWindow": {
+    "gpt-5.6-sol": 159.66,
+    "gpt-5.6-terra": 74.51
+   },
+   "resetWeekdayUtc": 5,
+   "storage": {
+    "v12": [
+     "2026-04-15",
+     "2026-10-01"
+    ]
+   },
+   "dayCount": 170
+  },
+  {
+   "key": "d",
+   "kind": "social",
+   "participantId": "participant:69477d65-3ee8-4163-b33d-375e9420a601",
+   "pinnedOwnerDigest": "8f6b06d86afa675ccb556989677ad247f687a344926347a68281cebdfe4e4007",
+   "planType": "prolite",
+   "accountTrackId": "account-track:v2:54f11621070fb851ae7dfd344a957698d0fc3fc2055f229ceb9fa4bd3bc058ba",
+   "models": [
+    "gpt-5.5",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra"
+   ],
+   "capacitiesUsdPerWindow": {
+    "gpt-5.5": 25.81,
+    "gpt-5.6-sol": 33.19,
+    "gpt-5.6-terra": 15.49
+   },
+   "resetWeekdayUtc": 0,
+   "storage": {
+    "v11": [
+     "2026-04-15",
+     "2026-10-01"
+    ],
+    "v1DuplicateChunk": [
+     "2026-06-30",
+     "2026-06-30"
+    ]
+   },
+   "duplicate": {
+    "occurrenceId": "event:v2:48f6e305db59186ede038b4f089191897d02f1b76941536d25f7a50b26667c5d",
+    "day": "2026-06-30",
+    "formats": [
+     "v1",
+     "v11"
+    ],
+    "v1AdmittedBeforeV11Domain": true
+   },
+   "dayCount": 170
+  }
+ ],
+ "shards": {
+  "a": "corpus-owner-a.json",
+  "b": "corpus-owner-b.json",
+  "c": "corpus-owner-c.json",
+  "d": "corpus-owner-d.json"
+ }
+}

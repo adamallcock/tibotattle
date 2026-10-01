@@ -1,0 +1,460 @@
+{
+ "header": {
+  "oracle": "gcp-fastpath-q1",
+  "sourceCommit": "d43c8f92a059d9c577776f7eca8a331eb305b8a6",
+  "nowMs": 1790856000000,
+  "realClockAtSeedMs": 1790839591714,
+  "seedMs": 11076,
+  "convergenceMs": 536237,
+  "synthetic": true
+ },
+ "convergence": {
+  "ticks": 309,
+  "converged": true,
+  "errors": [],
+  "progress": [
+   {
+    "tick": 224,
+    "elapsedMs": 367222
+   },
+   {
+    "tick": 225,
+    "elapsedMs": 368257
+   },
+   {
+    "tick": 226,
+    "elapsedMs": 369341
+   },
+   {
+    "tick": 227,
+    "elapsedMs": 370599
+   },
+   {
+    "tick": 228,
+    "elapsedMs": 371709
+   },
+   {
+    "tick": 229,
+    "elapsedMs": 373366
+   },
+   {
+    "tick": 230,
+    "elapsedMs": 375637
+   },
+   {
+    "tick": 231,
+    "elapsedMs": 376627
+   },
+   {
+    "tick": 233,
+    "elapsedMs": 379654
+   },
+   {
+    "tick": 235,
+    "elapsedMs": 382212
+   },
+   {
+    "tick": 240,
+    "elapsedMs": 394060
+   },
+   {
+    "tick": 250,
+    "elapsedMs": 419558
+   },
+   {
+    "tick": 260,
+    "elapsedMs": 448816
+   },
+   {
+    "tick": 270,
+    "elapsedMs": 476808
+   },
+   {
+    "tick": 280,
+    "elapsedMs": 492815
+   },
+   {
+    "tick": 281,
+    "elapsedMs": 494758
+   },
+   {
+    "tick": 282,
+    "elapsedMs": 496131
+   },
+   {
+    "tick": 283,
+    "elapsedMs": 497125
+   },
+   {
+    "tick": 285,
+    "elapsedMs": 501782
+   },
+   {
+    "tick": 288,
+    "elapsedMs": 507023
+   },
+   {
+    "tick": 289,
+    "elapsedMs": 509216
+   },
+   {
+    "tick": 290,
+    "elapsedMs": 511200
+   },
+   {
+    "tick": 291,
+    "elapsedMs": 512999
+   },
+   {
+    "tick": 292,
+    "elapsedMs": 515024
+   },
+   {
+    "tick": 293,
+    "elapsedMs": 516827
+   },
+   {
+    "tick": 294,
+    "elapsedMs": 518798
+   },
+   {
+    "tick": 295,
+    "elapsedMs": 520642
+   },
+   {
+    "tick": 296,
+    "elapsedMs": 522590
+   },
+   {
+    "tick": 297,
+    "elapsedMs": 524456
+   },
+   {
+    "tick": 298,
+    "elapsedMs": 526549
+   },
+   {
+    "tick": 299,
+    "elapsedMs": 527873
+   },
+   {
+    "tick": 300,
+    "elapsedMs": 528958
+   },
+   {
+    "tick": 301,
+    "elapsedMs": 529795
+   },
+   {
+    "tick": 302,
+    "elapsedMs": 530773
+   },
+   {
+    "tick": 303,
+    "elapsedMs": 531624
+   },
+   {
+    "tick": 304,
+    "elapsedMs": 532515
+   },
+   {
+    "tick": 305,
+    "elapsedMs": 533334
+   },
+   {
+    "tick": 306,
+    "elapsedMs": 534450
+   },
+   {
+    "tick": 307,
+    "elapsedMs": 535234
+   },
+   {
+    "tick": 308,
+    "elapsedMs": 536237
+   }
+  ],
+  "failures": {
+   "cache:idle:complete": 85,
+   "cache:progress:query_budget": 24,
+   "cache:deferred:query_budget": 12,
+   "storage_analytics_lane_failure:daily_publish:daily_publish:application": 22,
+   "graphFailure:daily_publish:application": 22,
+   "cache:progress:day_limit": 188,
+   "storage_analytics_lane_failure:graph_work:graph_model_compute:application": 10,
+   "graphFailure:graph_model_compute:application": 10
+  },
+  "elapsedMs": 536237
+ },
+ "cacheMarks": [
+  {
+   "owner": "c",
+   "source_layout": "effective",
+   "n": 2,
+   "first": "2026-04-15",
+   "last": "2026-04-16"
+  },
+  {
+   "owner": "d",
+   "source_layout": "effective",
+   "n": 2,
+   "first": "2026-04-15",
+   "last": "2026-04-16"
+  },
+  {
+   "owner": "d",
+   "source_layout": "typed-v11",
+   "n": 32,
+   "first": "2026-04-15",
+   "last": "2026-05-17"
+  },
+  {
+   "owner": "b",
+   "source_layout": "effective",
+   "n": 2,
+   "first": "2026-04-15",
+   "last": "2026-04-16"
+  },
+  {
+   "owner": "b",
+   "source_layout": "typed-v11",
+   "n": 2,
+   "first": "2026-04-17",
+   "last": "2026-04-18"
+  },
+  {
+   "owner": "a",
+   "source_layout": "effective",
+   "n": 2,
+   "first": "2026-04-15",
+   "last": "2026-04-16"
+  },
+  {
+   "owner": "a",
+   "source_layout": "typed-v11",
+   "n": 101,
+   "first": "2026-04-15",
+   "last": "2026-07-24"
+  }
+ ],
+ "directPreview": {
+  "state": "unchanged",
+  "memberCount": 4
+ },
+ "directModel": {
+  "2026-08-07": "unchanged",
+  "2026-08-08": "unchanged",
+  "2026-08-09": "unchanged",
+  "2026-08-10": "unchanged",
+  "2026-08-11": "unchanged",
+  "2026-08-12": "unchanged",
+  "2026-08-13": "unchanged",
+  "2026-08-14": "unchanged",
+  "2026-08-15": "unchanged",
+  "2026-08-16": "unchanged",
+  "2026-08-17": "unchanged",
+  "2026-08-18": "unchanged",
+  "2026-08-19": "unchanged",
+  "2026-08-20": "unchanged",
+  "2026-08-21": "unchanged",
+  "2026-08-22": "unchanged",
+  "2026-08-23": "unchanged",
+  "2026-08-24": "unchanged",
+  "2026-08-25": "unchanged",
+  "2026-08-26": "unchanged",
+  "2026-08-27": "unchanged",
+  "2026-08-28": "unchanged",
+  "2026-08-29": "unchanged",
+  "2026-08-30": "unchanged",
+  "2026-08-31": "unchanged",
+  "2026-09-01": "unchanged",
+  "2026-09-02": "unchanged",
+  "2026-09-03": "unchanged",
+  "2026-09-04": "unchanged",
+  "2026-09-05": "unchanged",
+  "2026-09-06": "unchanged",
+  "2026-09-07": "unchanged",
+  "2026-09-08": "unchanged",
+  "2026-09-09": "unchanged",
+  "2026-09-10": "unchanged",
+  "2026-09-11": "unchanged",
+  "2026-09-12": "unchanged",
+  "2026-09-13": "unchanged",
+  "2026-09-14": "unchanged",
+  "2026-09-15": "unchanged",
+  "2026-09-16": "unchanged",
+  "2026-09-17": "unchanged",
+  "2026-09-18": "unchanged",
+  "2026-09-19": "unchanged",
+  "2026-09-20": "unchanged",
+  "2026-09-21": "unchanged",
+  "2026-09-22": "unchanged",
+  "2026-09-23": "unchanged",
+  "2026-09-24": "unchanged",
+  "2026-09-25": "unchanged",
+  "2026-09-26": "unchanged",
+  "2026-09-27": "unchanged",
+  "2026-09-28": "unchanged",
+  "2026-09-29": "unchanged",
+  "2026-09-30": "unchanged",
+  "2026-10-01": "unchanged"
+ },
+ "graphResults": [
+  {
+   "owner": "c",
+   "metric": "fits",
+   "source_kind": "effective",
+   "n": 1,
+   "first": "2026-10-01",
+   "last": "2026-10-01"
+  },
+  {
+   "owner": "c",
+   "metric": "model",
+   "source_kind": "effective",
+   "n": 66,
+   "first": "2026-07-24",
+   "last": "2026-10-01"
+  },
+  {
+   "owner": "d",
+   "metric": "fits",
+   "source_kind": "effective",
+   "n": 1,
+   "first": "2026-10-01",
+   "last": "2026-10-01"
+  },
+  {
+   "owner": "d",
+   "metric": "model",
+   "source_kind": "effective",
+   "n": 64,
+   "first": "2026-07-24",
+   "last": "2026-10-01"
+  },
+  {
+   "owner": "b",
+   "metric": "fits",
+   "source_kind": "effective",
+   "n": 1,
+   "first": "2026-10-01",
+   "last": "2026-10-01"
+  },
+  {
+   "owner": "b",
+   "metric": "model",
+   "source_kind": "effective",
+   "n": 61,
+   "first": "2026-07-24",
+   "last": "2026-10-01"
+  },
+  {
+   "owner": "a",
+   "metric": "fits",
+   "source_kind": "effective",
+   "n": 1,
+   "first": "2026-10-01",
+   "last": "2026-10-01"
+  },
+  {
+   "owner": "a",
+   "metric": "model",
+   "source_kind": "effective",
+   "n": 56,
+   "first": "2026-08-07",
+   "last": "2026-10-01"
+  }
+ ],
+ "modelBlocks": [
+  {
+   "owner": "c",
+   "state": "complete",
+   "n": 3
+  },
+  {
+   "owner": "d",
+   "state": "complete",
+   "n": 3
+  },
+  {
+   "owner": "b",
+   "state": "complete",
+   "n": 3
+  },
+  {
+   "owner": "a",
+   "state": "complete",
+   "n": 2
+  },
+  {
+   "owner": "a",
+   "state": "pending",
+   "n": 1
+  }
+ ],
+ "queuedDailyDays": [
+  "2026-04-17",
+  "2026-04-18"
+ ],
+ "finalFingerprint": {
+  "applied_events": 6,
+  "cache_retention_day_bands": 1460,
+  "cache_retention_day_carry": 1008,
+  "cache_retention_day_marks": 143,
+  "cache_retention_day_progress": 0,
+  "cache_retention_day_values": 146,
+  "cache_retention_owner_cursor": 1,
+  "community_daily_containment": 0,
+  "community_daily_heads": 168,
+  "community_daily_owners": 672,
+  "community_daily_publications": 168,
+  "community_daily_queue": 2,
+  "community_graph_execution": 0,
+  "community_graph_previews": 1,
+  "community_graph_publication_state": 1,
+  "community_graph_results": 251,
+  "community_graph_scan": 1,
+  "community_graph_work_selection": 1,
+  "community_model_publications": 56,
+  "community_terminal_watermarks": 0,
+  "graph_day_pages": 5312,
+  "graph_day_refusals": 0,
+  "graph_day_values": 1328,
+  "graph_erasure_receipts": 0,
+  "history_checkpoint_heads": 9,
+  "history_checkpoint_parts": 54,
+  "history_checkpoint_stages": 9,
+  "legacy_authority_receipts": 0,
+  "model_block_parts": 12,
+  "model_block_policy": 4,
+  "model_block_retirement_cursors": 0,
+  "model_blocks": 12,
+  "owner_state": 4,
+  "runtime_sources": 1,
+  "shared_feature_days": 708,
+  "shared_feature_parts": 708,
+  "shared_feature_sweep_cursor": 1,
+  "source_cursors": 1,
+  "storage_erasure_fences": 0,
+  "storage_erasure_receipts": 0,
+  "v11_day_references": 510,
+  "v11_discard_receipts": 0,
+  "v11_legacy_day_values": 0,
+  "v11_owner_heads": 3,
+  "v11_projection_steps": 510,
+  "v11_projection_work": 3,
+  "v11_retirement_receipts": 0,
+  "v11_reusable_values": 510,
+  "v11_value_pages": 510,
+  "v1_chunk_values": 2,
+  "v1_owner_fences": 0,
+  "v1_projection_receipts": 2,
+  "=dailyRevisions": 168,
+  "=modelRevisions": 56,
+  "=previewRevision": 44,
+  "=cursor": 6,
+  "=blocksComplete": 11,
+  "=scan": 1609
+ },
+ "previewPresent": true
+}

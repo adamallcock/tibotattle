@@ -1,0 +1,74 @@
+{
+  "schemaVersion": "gcp-fastpath-golden-source-v1",
+  "note": "Byte-identical copies of the Q-1 production-code oracle (d43c8f92 Worker code) outputs; regenerate them on the Q-1 branch, never here.",
+  "branch": "claude/gcp-fp-q1-oracle",
+  "commit": "9e26237e3d88ddd3784842a360b74f001ed240f4",
+  "oracleSourceCommit": "d43c8f92a059d9c577776f7eca8a331eb305b8a6",
+  "files": [
+    {
+      "path": "community-daily-response.json",
+      "source": "apps/worker/test/__snapshots__/gcp-fastpath/golden/community-daily-response.json",
+      "blob": "0a95e8ed45135c121c4d90b70d124f9f64539f4c"
+    },
+    {
+      "path": "preview.json",
+      "source": "apps/worker/test/__snapshots__/gcp-fastpath/golden/preview.json",
+      "blob": "4c8f38e8b4b81ed69d167a2fe7aac590ddea8467"
+    },
+    {
+      "path": "manifest.json",
+      "source": "apps/worker/test/__snapshots__/gcp-fastpath/golden/manifest.json",
+      "blob": "73a855c11d1a610ca5618b03a08cfc35b656abaf"
+    },
+    {
+      "path": "dump/usage-monitor-db.json",
+      "source": "apps/worker/test/__snapshots__/gcp-fastpath/dump/usage-monitor-db.json",
+      "blob": "0f753a2acf6827e57118fad46d23565899f91284"
+    },
+    {
+      "path": "dump/storage-analytics-db.json",
+      "source": "apps/worker/test/__snapshots__/gcp-fastpath/dump/storage-analytics-db.json",
+      "blob": "5a920b196ae85e3625de02629cf9d19f77d7d6d3"
+    },
+    {
+      "path": "dump/diagnostics.json",
+      "source": "apps/worker/test/__snapshots__/gcp-fastpath/dump/diagnostics.json",
+      "blob": "f4dda80395791d55a76f577e4ead904cd3dfda21"
+    },
+    {
+      "path": "corpus/corpus.json",
+      "source": "apps/worker/test/fixtures/gcp-fastpath/corpus.json",
+      "blob": "191a2c5ea3d153dd0391dbdd8742c326e2fbfff8"
+    },
+    {
+      "path": "corpus/corpus-owner-a.json",
+      "source": "apps/worker/test/fixtures/gcp-fastpath/corpus-owner-a.json",
+      "blob": "5b3feb22c3dd0734beb3c85dfd25beb04b3be17c"
+    },
+    {
+      "path": "corpus/corpus-owner-b.json",
+      "source": "apps/worker/test/fixtures/gcp-fastpath/corpus-owner-b.json",
+      "blob": "5cd0d6cb2d5ee82aaab5d6ef6588636860e6bdbc"
+    },
+    {
+      "path": "corpus/corpus-owner-c.json",
+      "source": "apps/worker/test/fixtures/gcp-fastpath/corpus-owner-c.json",
+      "blob": "fa401d89a896758161c46a42070f9855a8922924"
+    },
+    {
+      "path": "corpus/corpus-owner-d.json",
+      "source": "apps/worker/test/fixtures/gcp-fastpath/corpus-owner-d.json",
+      "blob": "f06a450f0a3c6c8ed3cfda79f50a465cb1efd0e0"
+    },
+    {
+      "path": "corpus/generate-corpus.mjs",
+      "source": "apps/worker/test/fixtures/gcp-fastpath/generate-corpus.mjs",
+      "blob": "69d09ebfafc00e4a420a80be186cbd8fba5efa6f"
+    },
+    {
+      "path": "../../scripts/gcp-fastpath-oracle-sqlite.mjs",
+      "source": "apps/worker/scripts/gcp-fastpath-oracle-sqlite.mjs",
+      "blob": "0bd534fb1354513cbf3df817e7b5171ef63b8001"
+    }
+  ]
+}
