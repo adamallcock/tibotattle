@@ -600,6 +600,7 @@ function contributionDispatch(m, { base, primarySchema, ledgerSchema }, override
     registerPostgresTypedV12DayManifest: mustNotCall("registerPostgresTypedV12DayManifest"),
     claimPostgresDeviceUploadAuthorization: mustNotCall("claimPostgresDeviceUploadAuthorization"),
     abandonPostgresDeviceUploadAuthorization: mustNotCall("abandonPostgresDeviceUploadAuthorization"),
+    recordPostgresDeviceUploadReceipt: mustNotCall("recordPostgresDeviceUploadReceipt"),
     persistPostgresTypedV12StagedChunk: mustNotCall("persistPostgresTypedV12StagedChunk"),
     decryptSyntheticEnvelope: mustNotCall("decryptSyntheticEnvelope"),
     validateTelemetryV12Envelope,
@@ -693,6 +694,17 @@ test("(d) a registered envelope handler runs only after the shared preamble", {
           code: "BACKEND_STORAGE_UNAVAILABLE", status: 503,
         });
       }
+      if (handlerBehaviour === "no-contribution-id") {
+        return new Response(JSON.stringify({ status: "staged" }), {
+          status: 202, headers: { "content-type": "application/json; charset=utf-8" },
+        });
+      }
+      if (handlerBehaviour === "consume-in-persist") {
+        // A fresh admission consumes the grant in its own persist transaction.
+        context.markPersistStarted();
+        await consume(claimed.authorizationId, "synthetic-v11-receipt");
+      }
+      if (handlerBehaviour === "persist-then-receipt") context.markPersistStarted();
       return new Response(JSON.stringify({ contributionId: "synthetic-v11-receipt" }), {
         status: 202, headers: { "content-type": "application/json; charset=utf-8" },
       });
@@ -700,6 +712,29 @@ test("(d) a registered envelope handler runs only after the shared preamble", {
     const floor = async (poolArgument, principal, nowEpoch, options) => {
       events.push({ step: "floor", poolArgument, principal, nowEpoch, options });
       if (floorRefusal) throw floorRefusal;
+    };
+    // The consume step of d43c8f92 recordDeviceUploadReceipt for a social
+    // grant; the real PostgreSQL recorder is injected by the composition root.
+    const consume = (authorizationId, contributionId) => base.query(
+      `UPDATE "${primarySchema}"."device_upload_authorizations"
+          SET state='consumed', consumed_at=now(), consumed_contribution_id=$2,
+              consume_lease_expires_at=NULL
+        WHERE id=$1 AND state='consuming'`,
+      [authorizationId, contributionId],
+    );
+    let receiptFailure = null;
+    const recordPostgresDeviceUploadReceipt = async (poolArgument, authorizationId, contributionId, options) => {
+      events.push({ step: "receipt", poolArgument, authorizationId, contributionId, options });
+      if (receiptFailure) throw receiptFailure;
+      if ((await consume(authorizationId, contributionId)).rowCount === 1) return;
+      const existing = (await base.query(
+        `SELECT state, consumed_contribution_id FROM "${primarySchema}"."device_upload_authorizations"
+          WHERE id=$1`,
+        [authorizationId],
+      )).rows[0];
+      if (existing?.state !== "consumed" || existing.consumed_contribution_id !== contributionId) {
+        throw Object.assign(new Error("INTERNAL_ERROR"), { code: "INTERNAL_ERROR", status: 500 });
+      }
     };
     const tombstoneChecks = [];
     const dispatch = contributionDispatch(m, schemas, {
@@ -711,13 +746,16 @@ test("(d) a registered envelope handler runs only after the shared preamble", {
         tombstoneChecks.push(args[1]);
         return m.ledgerAuthority.hasPostgresDeletionTombstone(...args);
       },
+      recordPostgresDeviceUploadReceipt,
       contributionEnvelopes: [registerContributionEnvelope(V11_ENVELOPE, handler, { validateEnvelope })],
       uploadAuthorizationFormats: { [V11_TRANSPORT]: { assertUploadAllowed: floor } },
     });
-    const grantState = async (authorizationId) => (await base.query(
-      `SELECT state FROM "${primarySchema}"."device_upload_authorizations" WHERE id=$1`,
+    const grant = async (authorizationId) => (await base.query(
+      `SELECT state, consumed_contribution_id FROM "${primarySchema}"."device_upload_authorizations"
+        WHERE id=$1`,
       [authorizationId],
-    )).rows[0]?.state;
+    )).rows[0];
+    const grantState = async (authorizationId) => (await grant(authorizationId))?.state;
     const issue = async (raw) => {
       const response = await dispatch(new Request(`${DISPATCH_ORIGIN}${UPLOAD_AUTHORIZATIONS_PATH}`, {
         method: "POST",
@@ -811,7 +849,7 @@ test("(d) a registered envelope handler runs only after the shared preamble", {
     const response = await dispatch(contributionRequest(accepted, acceptedGrant.header));
     assert.equal(response.status, 202);
     assert.deepEqual(await response.json(), { contributionId: "synthetic-v11-receipt" });
-    assert.deepEqual(events.map((event) => event.step), ["validate", "floor", "handler"]);
+    assert.deepEqual(events.map((event) => event.step), ["validate", "floor", "handler", "receipt"]);
     assert.deepEqual(tombstoneChecks, [device.participantId]);
     const call = events[2];
     assert.equal(call.grantState, "consuming", "the handler runs on a claimed authorization");
@@ -837,24 +875,82 @@ test("(d) a registered envelope handler runs only after the shared preamble", {
     assert.equal(typeof call.context.markPersistStarted, "function");
     assert.ok(Object.isFrozen(call.context));
     assert.deepEqual(events[1].principal, call.context.principal, "the floor saw the claimed principal");
-    // The preamble does not record the receipt; the handler owns it.
-    assert.equal(await grantState(acceptedGrant.authorizationId), "consuming");
+    // After the handler returns, the preamble records the receipt against
+    // the response's contributionId, as d43c8f92 handleContribution does.
+    assert.deepEqual({ ...events[3] }, {
+      step: "receipt",
+      poolArgument: base,
+      authorizationId: acceptedGrant.authorizationId,
+      contributionId: "synthetic-v11-receipt",
+      options: { schema: { primarySchema, ledgerSchema: schemas.ledgerSchema } },
+    });
+    assert.deepEqual({ ...await grant(acceptedGrant.authorizationId) }, {
+      state: "consumed", consumed_contribution_id: "synthetic-v11-receipt",
+    });
+    events.length = 0;
+
+    // A handler that already consumed the grant against the same id in its
+    // persist transaction gets the same idempotent receipt.
+    handlerBehaviour = "consume-in-persist";
+    const consumedBody = envelopeBody("consumed-in-persist");
+    const consumedGrant = await issue(consumedBody);
+    events.length = 0;
+    const consumedInPersist = await dispatch(contributionRequest(consumedBody, consumedGrant.header));
+    assert.equal(consumedInPersist.status, 202);
+    assert.deepEqual(events.map((event) => event.step), ["validate", "floor", "handler", "receipt"]);
+    assert.deepEqual({ ...await grant(consumedGrant.authorizationId) }, {
+      state: "consumed", consumed_contribution_id: "synthetic-v11-receipt",
+    });
     events.length = 0;
 
     // A handler failure before markPersistStarted() abandons the claim; after
-    // it, the preamble leaves the claim for the handler to resolve.
-    for (const [behaviour, status, code, finalState] of [
-      ["throw-before-persist", 422, "SYNTHETIC_HANDLER_REFUSAL", "revoked"],
-      ["throw-after-persist", 503, "BACKEND_STORAGE_UNAVAILABLE", "consuming"],
+    // it, the preamble leaves the claim for the handler to resolve. Once the
+    // handler has returned, a receipt that cannot be read or recorded
+    // abandons the still-consuming claim, as the Worker does.
+    for (const [behaviour, failure, status, code, steps, finalState] of [
+      ["throw-before-persist", null, 422, "SYNTHETIC_HANDLER_REFUSAL",
+        ["validate", "floor", "handler"], "revoked"],
+      ["throw-after-persist", null, 503, "BACKEND_STORAGE_UNAVAILABLE",
+        ["validate", "floor", "handler"], "consuming"],
+      ["no-contribution-id", null, 500, "INTERNAL_ERROR",
+        ["validate", "floor", "handler"], "revoked"],
+      ["persist-then-receipt", Object.assign(new Error("BACKEND_STORAGE_UNAVAILABLE"), {
+        code: "BACKEND_STORAGE_UNAVAILABLE", status: 503,
+      }), 503, "BACKEND_STORAGE_UNAVAILABLE", ["validate", "floor", "handler", "receipt"], "revoked"],
     ]) {
       handlerBehaviour = behaviour;
+      receiptFailure = failure;
       const body = envelopeBody(behaviour);
-      const grant = await issue(body);
-      const failed = await dispatch(contributionRequest(body, grant.header));
+      const issuedGrant = await issue(body);
+      events.length = 0;
+      const failed = await dispatch(contributionRequest(body, issuedGrant.header));
       assert.equal(failed.status, status, behaviour);
       assert.equal((await failed.json()).error.code, code, behaviour);
-      assert.equal(await grantState(grant.authorizationId), finalState, behaviour);
+      assert.deepEqual(events.map((event) => event.step), steps, behaviour);
+      assert.equal(await grantState(issuedGrant.authorizationId), finalState, behaviour);
     }
+    receiptFailure = null;
+
+    // A registration that owns its receipt resolves the claim itself; the
+    // preamble records nothing after it.
+    handlerBehaviour = "receipt";
+    const ownedDispatch = contributionDispatch(m, schemas, {
+      claimPostgresDeviceUploadAuthorization: m.transport.claimPostgresDeviceUploadAuthorization,
+      abandonPostgresDeviceUploadAuthorization: m.transport.abandonPostgresDeviceUploadAuthorization,
+      hasPostgresDeletionTombstone: m.ledgerAuthority.hasPostgresDeletionTombstone,
+      recordPostgresDeviceUploadReceipt: null,
+      contributionEnvelopes: [registerContributionEnvelope(V11_ENVELOPE, handler, {
+        validateEnvelope, ownsReceipt: true,
+      })],
+      uploadAuthorizationFormats: { [V11_TRANSPORT]: { assertUploadAllowed: floor } },
+    });
+    const ownedBody = envelopeBody("owns-receipt");
+    const ownedGrant = await issue(ownedBody);
+    events.length = 0;
+    const owned = await ownedDispatch(contributionRequest(ownedBody, ownedGrant.header));
+    assert.equal(owned.status, 202);
+    assert.deepEqual(events.map((event) => event.step), ["validate", "floor", "handler"]);
+    assert.equal(await grantState(ownedGrant.authorizationId), "consuming");
   });
 });
 
@@ -880,8 +976,28 @@ test("(c, d) envelope and format registrations must pair exactly and never repla
         /POSTGRES_TEST_CONTRIBUTION_REGISTRY_CONFIGURATION_INVALID/u],
       [{ contributionEnvelopes: [{ schemaVersion: V11_ENVELOPE, handler, validateEnvelope: null }] },
         /only values returned by registerContributionEnvelope/u],
+      // A registration that leaves its receipt to the preamble needs the recorder.
+      [{
+        contributionEnvelopes: [registerContributionEnvelope(V11_ENVELOPE, handler)],
+        uploadAuthorizationFormats: { [V11_TRANSPORT]: floor },
+        recordPostgresDeviceUploadReceipt: null,
+      }, /POSTGRES_TEST_CONTRIBUTION_RECEIPT_CONFIGURATION_INVALID/u],
+      [{ recordPostgresDeviceUploadReceipt: "recordPostgresDeviceUploadReceipt" },
+        /POSTGRES_TEST_CONTRIBUTION_RECEIPT_CONFIGURATION_INVALID/u],
     ]) {
       assert.throws(() => contributionDispatch(m, schemas, overrides), expected);
+    }
+    // v1.2 owns its receipt: the v1.2-only origin, and one whose extra
+    // registrations all own theirs, start without a recorder.
+    for (const overrides of [
+      { recordPostgresDeviceUploadReceipt: null },
+      {
+        contributionEnvelopes: [registerContributionEnvelope(V11_ENVELOPE, handler, { ownsReceipt: true })],
+        uploadAuthorizationFormats: { [V11_TRANSPORT]: floor },
+        recordPostgresDeviceUploadReceipt: null,
+      },
+    ]) {
+      assert.equal(typeof contributionDispatch(m, schemas, overrides), "function");
     }
   });
 });

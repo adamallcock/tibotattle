@@ -262,23 +262,32 @@ test("upload-authorization formats refuse malformed tables", () => {
   }
 });
 
-test("envelope registrations carry an optional pure pre-claim validator", () => {
+test("envelope registrations carry an optional pure pre-claim validator and receipt ownership", () => {
   const validateEnvelope = () => {};
   const registration = registerContributionEnvelope("telemetry-envelope-v1.1", stubHandler, {
     validateEnvelope,
   });
   const bare = registerContributionEnvelope("telemetry-envelope-v1.0", stubHandler);
-  const registry = createContributionEnvelopeRegistry([registration, bare]);
+  const owned = registerContributionEnvelope("telemetry-envelope-v1.2", stubHandler, { ownsReceipt: true });
+  const registry = createContributionEnvelopeRegistry([registration, bare, owned]);
   assert.equal(registry.resolveRegistration("telemetry-envelope-v1.1"), registration);
   assert.equal(registry.resolveRegistration("telemetry-envelope-v1.1").validateEnvelope, validateEnvelope);
   assert.equal(registry.resolveRegistration("telemetry-envelope-v1.0").validateEnvelope, null);
+  // The preamble records the receipt unless a registration owns it.
+  assert.equal(registration.ownsReceipt, false);
+  assert.equal(bare.ownsReceipt, false);
+  assert.equal(owned.ownsReceipt, true);
+  assert.equal(registerContributionEnvelope("telemetry-envelope-v1.1", stubHandler, {
+    ownsReceipt: false,
+  }).ownsReceipt, false);
   assert.equal(registry.resolve("telemetry-envelope-v1.1"), stubHandler);
-  for (const unregistered of ["telemetry-envelope-v1.2", "__proto__", undefined, null, 1]) {
+  for (const unregistered of ["telemetry-envelope-v1.3", "__proto__", undefined, null, 1]) {
     assert.equal(registry.resolveRegistration(unregistered), null);
   }
   assert.ok(Object.isFrozen(registration));
   for (const options of [
     null, [], { validateEnvelope: "validate" }, { validateEnvelope, transport: "v1.1" },
+    { ownsReceipt: "true" }, { ownsReceipt: null }, { ownsReceipt: 1 },
   ]) {
     assert.throws(
       () => registerContributionEnvelope("telemetry-envelope-v1.1", stubHandler, options),

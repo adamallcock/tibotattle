@@ -4,8 +4,9 @@
  *
  * POST /api/v1/contributions stays one route. Its shared preamble (bearer
  * auth, upload-authorization claim, deletion-tombstone check, transport
- * floor, abandon-on-failure) runs first; only then does the origin dispatch
- * on the envelope's body.schemaVersion through a registry built here.
+ * floor, receipt, abandon-on-failure) runs first; only then does the origin
+ * dispatch on the envelope's body.schemaVersion through a registry built
+ * here, and after the handler returns the preamble records the receipt.
  * Envelope versions are registry entries, not routes: postgres-test-dispatch
  * registers v1.2 from its own dependencies, and the v1.1/v1.0/v0.1 ports
  * export registrations that the composition root passes in. An unregistered
@@ -68,12 +69,19 @@
  * - sourceNamespace: the origin's typed-storage source namespace;
  * - markPersistStarted(): call immediately before the first durable write
  *   whose outcome can be uncertain. From then on the preamble no longer
- *   abandons the claim on failure, and the handler resolves the claim itself.
+ *   abandons the claim when the handler throws, and the handler resolves the
+ *   claim itself.
  *
- * The preamble does not record the authorization receipt: a handler consumes
- * the claimed authorization in the same transaction that persists the
- * contribution (as persistPostgresTypedV12StagedChunk does), and abandons it
- * explicitly on a replay.
+ * The receipt: once the handler returns, the preamble reads the response's
+ * JSON contributionId (anything but a string is 500 INTERNAL_ERROR) and
+ * consumes the claimed authorization against it, as d43c8f92
+ * handleContribution does with recordDeviceUploadReceipt after every
+ * envelope handler. For a replay that is the retained contribution's id. The
+ * recorder accepts an authorization the handler already consumed against
+ * the same id in its persist transaction. If the receipt fails, the preamble
+ * abandons the claim (a no-op once it is consumed or a contribution references
+ * it) and the error answers. A registration made with ownsReceipt: true
+ * resolves the claim itself instead, and the preamble records nothing.
  *
  * @typedef {Readonly<Record<string, unknown>>} ContributionEnvelopeContext
  */
@@ -83,7 +91,8 @@
  * the upload authorization, refused tombstoned participants and enforced the
  * transport floor. If it throws before markPersistStarted(), the preamble
  * abandons the claim and the origin maps the error; it must not repeat any
- * preamble step. It returns the client receipt as a Response.
+ * preamble step. It returns the client receipt as a Response whose JSON body
+ * carries the contributionId the preamble records the receipt against.
  *
  * @typedef {(
  *   body: ContributionEnvelopeBody,
@@ -103,10 +112,17 @@
  */
 
 /**
+ * ownsReceipt is false unless the registration asked for it: the preamble
+ * then records the receipt after the handler returns. true means the handler
+ * resolves the claimed authorization on every path itself (the PostgreSQL
+ * v1.2 handler consumes it in its persist transaction and revokes it on a
+ * replay).
+ *
  * @typedef {Readonly<{
  *   schemaVersion: string,
  *   handler: ContributionEnvelopeHandler,
  *   validateEnvelope: ContributionEnvelopeValidator | null,
+ *   ownsReceipt: boolean,
  * }>} ContributionEnvelopeRegistration
  */
 
@@ -146,7 +162,7 @@
 const ENVELOPE_SCHEMA_VERSION = /^telemetry-envelope-v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u;
 const CONTRIBUTION_SCHEMA_VERSION = /^telemetry-contribution-v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u;
 const FORMAT_KEYS = Object.freeze(["assertUploadAllowed"]);
-const REGISTRATION_OPTION_KEYS = Object.freeze(["validateEnvelope"]);
+const REGISTRATION_OPTION_KEYS = Object.freeze(["validateEnvelope", "ownsReceipt"]);
 const DEFINED_REGISTRATIONS = new WeakSet();
 
 // Seam errors carry a stable code so a bad registration stops the origin at
@@ -178,11 +194,13 @@ function isPlainObject(value) {
  *
  * options.validateEnvelope, when given, runs before the claim (see
  * ContributionEnvelopeValidator). Without it the envelope is validated only by
- * the handler, after the preamble.
+ * the handler, after the preamble. options.ownsReceipt: true opts out of the
+ * preamble's receipt (see ContributionEnvelopeRegistration); omit it to have
+ * the preamble record the receipt, as production does for every envelope.
  *
  * @param {string} schemaVersion
  * @param {ContributionEnvelopeHandler} handler
- * @param {{ validateEnvelope?: ContributionEnvelopeValidator }} [options]
+ * @param {{ validateEnvelope?: ContributionEnvelopeValidator, ownsReceipt?: boolean }} [options]
  * @returns {ContributionEnvelopeRegistration}
  */
 export function registerContributionEnvelope(schemaVersion, handler, options = {}) {
@@ -194,13 +212,17 @@ export function registerContributionEnvelope(schemaVersion, handler, options = {
   }
   if (!isPlainObject(options)
       || Object.keys(options).some((key) => !REGISTRATION_OPTION_KEYS.includes(key))) {
-    throw envelopeError("options may contain only validateEnvelope");
+    throw envelopeError("options may contain only validateEnvelope and ownsReceipt");
   }
   const validateEnvelope = options.validateEnvelope ?? null;
   if (validateEnvelope !== null && typeof validateEnvelope !== "function") {
     throw envelopeError("validateEnvelope must be a function");
   }
-  const registration = Object.freeze({ schemaVersion, handler, validateEnvelope });
+  const ownsReceipt = options.ownsReceipt === undefined ? false : options.ownsReceipt;
+  if (typeof ownsReceipt !== "boolean") {
+    throw envelopeError("ownsReceipt must be a boolean");
+  }
+  const registration = Object.freeze({ schemaVersion, handler, validateEnvelope, ownsReceipt });
   DEFINED_REGISTRATIONS.add(registration);
   return registration;
 }

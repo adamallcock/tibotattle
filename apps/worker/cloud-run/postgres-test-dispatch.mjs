@@ -1533,7 +1533,8 @@ function validateV12EnvelopeBeforeClaim(envelope, raw, validateTelemetryV12Envel
  * after the transport floor, unchanged. It decrypts and validates the staged
  * chunk, journals and writes the object, and persists the chunk; the persist
  * transaction consumes the claimed upload authorization (the receipt), and a
- * replay abandons it explicitly.
+ * replay abandons it explicitly. It is therefore registered with
+ * ownsReceipt: true, and the preamble records no receipt after it.
  */
 function createPostgresTestV12ContributionHandler({
   primaryPool,
@@ -1702,8 +1703,13 @@ function createPostgresTestV12ContributionHandler({
  * claim); then the upload-authorization claim, the claimed principal and
  * participant, the device_sync attempt limit, the processing control, the
  * deletion tombstone and the format's transport floor. Only then does the
- * registered handler run. Until the handler marks its persist started, any
- * failure abandons the claim.
+ * registered handler run. After it returns, the preamble records the receipt
+ * against the response's contributionId (d43c8f92 handleContribution's
+ * recordDeviceUploadReceipt), unless the registration owns its receipt.
+ * Until the handler marks its persist started, any failure abandons the
+ * claim; a failure after the handler returned (reading or recording the
+ * receipt) abandons it too, which the abandon makes a no-op once the claim
+ * is consumed or a contribution references it.
  */
 async function handlePostgresTestContribution({
   request,
@@ -1715,6 +1721,7 @@ async function handlePostgresTestContribution({
   hasPostgresDeletionTombstone,
   claimPostgresDeviceUploadAuthorization,
   abandonPostgresDeviceUploadAuthorization,
+  recordPostgresDeviceUploadReceipt,
   sha256Hex,
   readBoundedRequestBody,
   maxRequestBytes,
@@ -1726,6 +1733,7 @@ async function handlePostgresTestContribution({
   let claim = null;
   let principal = null;
   let persistStarted = false;
+  let handlerReturned = false;
   try {
     if (request.headers.has("cookie")) {
       throw Object.assign(new Error("UPLOAD_AUTH_INVALID"), {
@@ -1800,7 +1808,7 @@ async function handlePostgresTestContribution({
     }
     await format.assertUploadAllowed(primaryPool, principal, Date.now(), { schema });
 
-    return await registration.handler(
+    const response = await registration.handler(
       Object.freeze({ bytes, raw, value: envelope }),
       claimed.participant,
       principal.deviceId,
@@ -1816,8 +1824,21 @@ async function handlePostgresTestContribution({
         markPersistStarted() { persistStarted = true; },
       }),
     );
+    if (registration.ownsReceipt) return response;
+    handlerReturned = true;
+    let contributionId;
+    try {
+      contributionId = (await response.clone().json())?.contributionId;
+    } catch { /* A receipt without a JSON body has no contributionId. */ }
+    if (typeof contributionId !== "string") {
+      throw Object.assign(new Error("INTERNAL_ERROR"), { code: "INTERNAL_ERROR", status: 500 });
+    }
+    await recordPostgresDeviceUploadReceipt(
+      primaryPool, claim.authorizationId, contributionId, { schema },
+    );
+    return response;
   } catch (error) {
-    if (claim && principal && !persistStarted) {
+    if (claim && principal && (!persistStarted || handlerReturned)) {
       try {
         await abandonPostgresDeviceUploadAuthorization(primaryPool, claim, principal, { schema });
       } catch { /* A failed revocation leaves the bounded claim lease to expire. */ }
@@ -1992,6 +2013,7 @@ export function createPostgresTestV12DayManifestDispatch({
   maxRequestBytes,
   contributionEnvelopes = [],
   uploadAuthorizationFormats = {},
+  recordPostgresDeviceUploadReceipt = null,
 }) {
   if (primaryPool === null || typeof primaryPool !== "object"
       || typeof primaryPool.connect !== "function"
@@ -2091,6 +2113,7 @@ export function createPostgresTestV12DayManifestDispatch({
       {
         validateEnvelope: (envelope, raw) =>
           validateV12EnvelopeBeforeClaim(envelope, raw, validateTelemetryV12Envelope),
+        ownsReceipt: true,
       },
     ),
     ...contributionEnvelopes,
@@ -2102,6 +2125,18 @@ export function createPostgresTestV12DayManifestDispatch({
       : Object.entries(uploadAuthorizationFormats)),
   ]));
   assertContributionEnvelopeFormats(envelopes, formats);
+  // Every registration that leaves the receipt to the preamble needs the
+  // recorder, recordPostgresDeviceUploadReceipt(pool, authorizationId,
+  // contributionId, { schema }) (d43c8f92 recordDeviceUploadReceipt); v1.2
+  // owns its receipt, so the v1.2-only origin needs none.
+  if ((recordPostgresDeviceUploadReceipt !== null
+        && typeof recordPostgresDeviceUploadReceipt !== "function")
+      || (recordPostgresDeviceUploadReceipt === null
+        && envelopes.schemaVersions.some(
+          (version) => !envelopes.resolveRegistration(version).ownsReceipt,
+        ))) {
+    configurationError("POSTGRES_TEST_CONTRIBUTION_RECEIPT_CONFIGURATION_INVALID");
+  }
   // The v1.2-only origin refused every other envelope inside its pre-claim
   // v1.2 check, before any claim; an unregistered version keeps exactly that
   // refusal (status, code and body).
@@ -2461,6 +2496,7 @@ export function createPostgresTestV12DayManifestDispatch({
           hasPostgresDeletionTombstone,
           claimPostgresDeviceUploadAuthorization,
           abandonPostgresDeviceUploadAuthorization,
+          recordPostgresDeviceUploadReceipt,
           sha256Hex,
           readBoundedRequestBody,
           maxRequestBytes,
