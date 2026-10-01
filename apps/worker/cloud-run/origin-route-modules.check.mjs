@@ -9,10 +9,20 @@ import {
   ORIGIN_OVERRIDABLE_BUILT_INS,
 } from "./origin-route-modules.mjs";
 import {
+  assertContributionEnvelopeFormats,
+  contributionEnvelopeSchemaVersion,
+  contributionTransportSchemaVersion,
   createContributionEnvelopeRegistry,
   createUploadAuthorizationFormats,
   registerContributionEnvelope,
 } from "./contribution-envelope-registry.mjs";
+import {
+  FASTPATH_TEST_SCHEMA_PREFIXES,
+  fastpathTestDatabaseConfig,
+  fastpathTestRouteModules,
+  isAnalyticsV2Enabled,
+  isFastpathTestSchema,
+} from "./origin-fastpath-mode.mjs";
 
 // Loads the Worker route registry the way edge-origin-contract.check.mjs
 // loads Worker source, then checks the origin seams against it. Every handler
@@ -249,5 +259,196 @@ test("upload-authorization formats refuse malformed tables", () => {
       () => createUploadAuthorizationFormats(map),
       /UPLOAD_AUTHORIZATION_FORMAT_INVALID/u,
     );
+  }
+});
+
+test("envelope registrations carry an optional pure pre-claim validator and receipt ownership", () => {
+  const validateEnvelope = () => {};
+  const registration = registerContributionEnvelope("telemetry-envelope-v1.1", stubHandler, {
+    validateEnvelope,
+  });
+  const bare = registerContributionEnvelope("telemetry-envelope-v1.0", stubHandler);
+  const owned = registerContributionEnvelope("telemetry-envelope-v1.2", stubHandler, { ownsReceipt: true });
+  const registry = createContributionEnvelopeRegistry([registration, bare, owned]);
+  assert.equal(registry.resolveRegistration("telemetry-envelope-v1.1"), registration);
+  assert.equal(registry.resolveRegistration("telemetry-envelope-v1.1").validateEnvelope, validateEnvelope);
+  assert.equal(registry.resolveRegistration("telemetry-envelope-v1.0").validateEnvelope, null);
+  // The preamble records the receipt unless a registration owns it.
+  assert.equal(registration.ownsReceipt, false);
+  assert.equal(bare.ownsReceipt, false);
+  assert.equal(owned.ownsReceipt, true);
+  assert.equal(registerContributionEnvelope("telemetry-envelope-v1.1", stubHandler, {
+    ownsReceipt: false,
+  }).ownsReceipt, false);
+  assert.equal(registry.resolve("telemetry-envelope-v1.1"), stubHandler);
+  for (const unregistered of ["telemetry-envelope-v1.3", "__proto__", undefined, null, 1]) {
+    assert.equal(registry.resolveRegistration(unregistered), null);
+  }
+  assert.ok(Object.isFrozen(registration));
+  for (const options of [
+    null, [], { validateEnvelope: "validate" }, { validateEnvelope, transport: "v1.1" },
+    { ownsReceipt: "true" }, { ownsReceipt: null }, { ownsReceipt: 1 },
+  ]) {
+    assert.throws(
+      () => registerContributionEnvelope("telemetry-envelope-v1.1", stubHandler, options),
+      (error) => error?.code === "CONTRIBUTION_ENVELOPE_REGISTRY_INVALID",
+    );
+  }
+  assert.throws(
+    () => registerContributionEnvelope("telemetry-envelope-v1", stubHandler),
+    (error) => error?.code === "CONTRIBUTION_ENVELOPE_REGISTRY_INVALID",
+  );
+  assert.throws(
+    () => createUploadAuthorizationFormats(null),
+    (error) => error?.code === "UPLOAD_AUTHORIZATION_FORMAT_INVALID",
+  );
+  assert.throws(
+    () => registryOf([moduleFor("/api/v1/session")]),
+    (error) => error?.code === "ORIGIN_ROUTE_MODULE_INVALID",
+  );
+});
+
+test("envelope and transport versions map one to one", () => {
+  for (const [envelope, transport] of [
+    ["telemetry-envelope-v0.1", "telemetry-contribution-v0.1"],
+    ["telemetry-envelope-v1.0", "telemetry-contribution-v1.0"],
+    ["telemetry-envelope-v1.1", "telemetry-contribution-v1.1"],
+    ["telemetry-envelope-v1.2", "telemetry-contribution-v1.2"],
+  ]) {
+    assert.equal(contributionTransportSchemaVersion(envelope), transport);
+    assert.equal(contributionEnvelopeSchemaVersion(transport), envelope);
+  }
+  for (const value of [
+    "telemetry-contribution-v1.2", "telemetry-envelope-v1", "telemetry-envelope-v01.2", "", null, 1.2,
+  ]) {
+    assert.equal(contributionTransportSchemaVersion(value), null);
+  }
+  for (const value of ["telemetry-envelope-v1.2", "telemetry-contribution-v1", null]) {
+    assert.equal(contributionEnvelopeSchemaVersion(value), null);
+  }
+});
+
+test("envelope handlers and upload-authorization formats must pair exactly", () => {
+  const assertUploadAllowed = () => {};
+  const envelopes = (...versions) => createContributionEnvelopeRegistry(
+    versions.map((version) => registerContributionEnvelope(version, stubHandler)),
+  );
+  const formats = (...versions) => createUploadAuthorizationFormats(
+    Object.fromEntries(versions.map((version) => [version, { assertUploadAllowed }])),
+  );
+  assertContributionEnvelopeFormats(envelopes(), formats());
+  assertContributionEnvelopeFormats(
+    envelopes("telemetry-envelope-v1.2", "telemetry-envelope-v1.1"),
+    formats("telemetry-contribution-v1.1", "telemetry-contribution-v1.2"),
+  );
+  assert.throws(
+    () => assertContributionEnvelopeFormats(envelopes("telemetry-envelope-v1.1"), formats()),
+    /telemetry-envelope-v1\.1 has no telemetry-contribution-v1\.1 upload-authorization format/u,
+  );
+  assert.throws(
+    () => assertContributionEnvelopeFormats(envelopes(), formats("telemetry-contribution-v0.2")),
+    /telemetry-contribution-v0\.2 has no telemetry-envelope-v0\.2 handler/u,
+  );
+  assert.throws(
+    () => assertContributionEnvelopeFormats({}, formats()),
+    (error) => error?.code === "CONTRIBUTION_ENVELOPE_REGISTRY_INVALID",
+  );
+});
+
+test("fastpath-test accepts only rehearsal schemas and their _ledger pair", () => {
+  assert.deepEqual(FASTPATH_TEST_SCHEMA_PREFIXES, [
+    "typed_legacy_transfer_rehearsal_target_", "tibotattle_fastpath_",
+  ]);
+  for (const schema of [
+    "tibotattle_fastpath_a", "typed_legacy_transfer_rehearsal_target_fastpath_01",
+    "tibotattle_fastpath_" + "x".repeat(36),
+  ]) {
+    assert.equal(isFastpathTestSchema(schema), true, schema);
+  }
+  for (const schema of [
+    "tibotattle", "tibotattle_fastpath_", "typed_legacy_transfer_rehearsal_target_",
+    "tibotattle_v12_a2_20260925", "Tibotattle_fastpath_a", "tibotattle_fastpath_a-b",
+    "tibotattle_fastpath_" + "x".repeat(37), "pg_tibotattle_fastpath_a", undefined, null,
+  ]) {
+    assert.equal(isFastpathTestSchema(schema), false, String(schema));
+  }
+  const env = {
+    PRIMARY_SCHEMA: "tibotattle_fastpath_a",
+    PRIMARY_DATABASE: "tibotattle",
+    PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic:us-east1:primary",
+  };
+  assert.deepEqual(fastpathTestDatabaseConfig(env), {
+    primary: {
+      role: "primary", schema: "tibotattle_fastpath_a", database: "tibotattle",
+      instanceConnectionName: "synthetic:us-east1:primary", max: 3,
+    },
+    ledger: {
+      role: "ledger", schema: "tibotattle_fastpath_a_ledger", database: "tibotattle",
+      instanceConnectionName: "synthetic:us-east1:primary", max: 2,
+    },
+  });
+  assert.deepEqual(fastpathTestDatabaseConfig({
+    ...env,
+    LEDGER_SCHEMA: "tibotattle_fastpath_a_ledger",
+    LEDGER_DATABASE: "tibotattle_ledger",
+    LEDGER_INSTANCE_CONNECTION_NAME: "synthetic:us-east1:ledger",
+  }).ledger, {
+    role: "ledger", schema: "tibotattle_fastpath_a_ledger", database: "tibotattle_ledger",
+    instanceConnectionName: "synthetic:us-east1:ledger", max: 2,
+  });
+  for (const [overrides, code] of [
+    [{ PRIMARY_SCHEMA: "tibotattle" }, "POSTGRES_FASTPATH_TEST_SCHEMA_INVALID"],
+    [{ PRIMARY_SCHEMA: "" }, "POSTGRES_FASTPATH_TEST_SCHEMA_INVALID"],
+    [{ LEDGER_SCHEMA: "tibotattle_ledger" }, "POSTGRES_FASTPATH_TEST_SCHEMA_INVALID"],
+    [{ PRIMARY_DATABASE: undefined }, "PRIMARY_DATABASE_MISSING"],
+    [{ PRIMARY_INSTANCE_CONNECTION_NAME: "" }, "PRIMARY_INSTANCE_CONNECTION_NAME_MISSING"],
+  ]) {
+    assert.throws(() => fastpathTestDatabaseConfig({ ...env, ...overrides }), (error) => error?.code === code);
+  }
+});
+
+test("fastpath-test mounts the analytics-v2 community-daily module only when enabled", () => {
+  assert.equal(isAnalyticsV2Enabled({}), false);
+  assert.equal(isAnalyticsV2Enabled({ ANALYTICS_V2_ENABLED: "" }), false);
+  assert.equal(isAnalyticsV2Enabled({ ANALYTICS_V2_ENABLED: "0" }), false);
+  assert.equal(isAnalyticsV2Enabled({ ANALYTICS_V2_ENABLED: "1" }), true);
+  for (const value of ["true", "yes", "01", " 1"]) {
+    assert.throws(() => isAnalyticsV2Enabled({ ANALYTICS_V2_ENABLED: value }),
+      (error) => error?.code === "ANALYTICS_V2_ENABLED_INVALID");
+  }
+  const pool = { connect() {} };
+  const calls = [];
+  const factory = (options) => {
+    calls.push(options);
+    return { method: "GET", pathname: "/api/v1/community/daily", overridesBuiltIn: true, handler: stubHandler };
+  };
+  assert.deepEqual(fastpathTestRouteModules({
+    env: {}, primaryPool: pool, primarySchema: "tibotattle_fastpath_a", createAnalyticsV2CommunityDailyRoute: factory,
+  }), []);
+  assert.equal(calls.length, 0);
+  const clock = () => 0;
+  const [mounted] = fastpathTestRouteModules({
+    env: { ANALYTICS_V2_ENABLED: "1" },
+    primaryPool: pool,
+    primarySchema: "tibotattle_fastpath_a",
+    createAnalyticsV2CommunityDailyRoute: factory,
+    clock,
+  });
+  assert.deepEqual(calls, [{ pool, schema: "tibotattle_fastpath_a", originMode: "fastpath-test", clock }]);
+  assert.equal(registryOf([mounted]).resolve("GET", "/api/v1/community/daily"), mounted);
+  assert.deepEqual(Object.keys(fastpathTestRouteModules({
+    env: { ANALYTICS_V2_ENABLED: "1" }, primaryPool: pool, primarySchema: "tibotattle_fastpath_a",
+    createAnalyticsV2CommunityDailyRoute: factory,
+  })[0]).sort(), ["handler", "method", "overridesBuiltIn", "pathname"]);
+  assert.equal(Object.hasOwn(calls.at(-1), "clock"), false);
+  for (const [options, code] of [
+    [{ createAnalyticsV2CommunityDailyRoute: null }, "ANALYTICS_V2_COMMUNITY_DAILY_ROUTE_UNAVAILABLE"],
+    [{ createAnalyticsV2CommunityDailyRoute: factory, clock: 0 }, "ANALYTICS_V2_CLOCK_INVALID"],
+    [{ createAnalyticsV2CommunityDailyRoute: () => null }, "ANALYTICS_V2_COMMUNITY_DAILY_ROUTE_INVALID"],
+    [{ createAnalyticsV2CommunityDailyRoute: () => ({ method: "GET" }) }, "ORIGIN_ROUTE_MODULE_INVALID"],
+  ]) {
+    assert.throws(() => fastpathTestRouteModules({
+      env: { ANALYTICS_V2_ENABLED: "1" }, primaryPool: pool, primarySchema: "tibotattle_fastpath_a", ...options,
+    }), (error) => error?.code === code);
   }
 });
