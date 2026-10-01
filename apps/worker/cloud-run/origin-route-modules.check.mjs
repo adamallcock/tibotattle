@@ -17,6 +17,7 @@ import {
   registerContributionEnvelope,
 } from "./contribution-envelope-registry.mjs";
 import {
+  analyticsV2TestClock,
   FASTPATH_TEST_SCHEMA_PREFIXES,
   fastpathTestDatabaseConfig,
   fastpathTestRouteModules,
@@ -457,5 +458,23 @@ test("fastpath-test mounts the analytics-v2 community-daily module only when ena
     assert.throws(() => fastpathTestRouteModules({
       env: { ANALYTICS_V2_ENABLED: "1" }, primaryPool: pool, primarySchema: "tibotattle_fastpath_a", ...options,
     }), (error) => error?.code === code);
+  }
+});
+
+test("ANALYTICS_V2_TEST_NOW_MS pins the route clock in fastpath-test only", () => {
+  assert.equal(analyticsV2TestClock({}, "fastpath-test"), null);
+  assert.equal(analyticsV2TestClock({ ANALYTICS_V2_TEST_NOW_MS: "" }, "cloud-run-iam"), null);
+  const clock = analyticsV2TestClock({ ANALYTICS_V2_TEST_NOW_MS: "1790856000000" }, "fastpath-test");
+  assert.equal(typeof clock, "function");
+  assert.equal(clock(), 1_790_856_000_000);
+  assert.equal(clock(), 1_790_856_000_000, "the pinned clock never advances");
+  for (const mode of [undefined, null, "", "health-only", "health-and-v12-day-manifest", "cloud-run-iam",
+    "FASTPATH-TEST", "production"]) {
+    assert.throws(() => analyticsV2TestClock({ ANALYTICS_V2_TEST_NOW_MS: "1790856000000" }, mode),
+      (error) => error?.code === "ANALYTICS_V2_TEST_CLOCK_REFUSED", String(mode));
+  }
+  for (const value of ["-1", "1.5", "1e12", " 1790856000000", "01790856000000", "99999999999999999", "now"]) {
+    assert.throws(() => analyticsV2TestClock({ ANALYTICS_V2_TEST_NOW_MS: value }, "fastpath-test"),
+      (error) => error?.code === "ANALYTICS_V2_CLOCK_INVALID", value);
   }
 });

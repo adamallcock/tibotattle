@@ -3,7 +3,8 @@
 /**
  * Build the audited Cloud Run host context. The host is a Node composition
  * root around the existing Worker handlers; it must never be built from the
- * dirty repository root. Only the host, Worker source, canonical migrations,
+ * dirty repository root. Only the host, Worker source, the vendored d43c8f92
+ * analytics kernels and the analytics-refresh Job, canonical migrations,
  * migration runner, the private daily publication Job and verifier, their
  * shared receipt contract, test-only activation and independent restore
  * commands, the read-only ledger diagnostic, the guarded test-only ledger
@@ -35,9 +36,9 @@ const SECRET_PATH_PARTS = new Set([
   "credentials.json",
   "service-account.json",
 ]);
-const EXPECTED_PRIMARY_MIGRATION_COUNT = 58;
+const EXPECTED_PRIMARY_MIGRATION_COUNT = 59;
 const EXPECTED_LEDGER_MIGRATION_COUNT = 7;
-const EXPECTED_PRIMARY_MIGRATION_TAIL = "0058_owner_journal_emitter_head_precheck.sql";
+const EXPECTED_PRIMARY_MIGRATION_TAIL = "0059_analytics_v2.sql";
 const REQUIRED_LEDGER_DIAGNOSTIC_PATHS = new Set([
   "apps/worker/cloud-run/ledger-reconciliation-diagnostic.mjs",
   "apps/worker/cloud-run/ledger-reconciliation-diagnostic.check.mjs",
@@ -115,7 +116,11 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/node-crypto-adapter.mjs", destination: "apps/worker/cloud-run/node-crypto-adapter.mjs" }),
   Object.freeze({ source: "cloud-run/owner-bootstrap.mjs", destination: "apps/worker/cloud-run/owner-bootstrap.mjs" }),
   Object.freeze({ source: "cloud-run/request-boundary.mjs", destination: "apps/worker/cloud-run/request-boundary.mjs" }),
+  Object.freeze({ source: "cloud-run/analytics-refresh.mjs", destination: "apps/worker/cloud-run/analytics-refresh.mjs" }),
   Object.freeze({ source: "src", destination: "apps/worker/src" }),
+  // The d43c8f92 analytics kernels and their vendored packages; the
+  // analytics-refresh entry and the community-daily route bundle them.
+  Object.freeze({ source: "vendor", destination: "apps/worker/vendor" }),
   Object.freeze({ source: "postgres/migrations", destination: "apps/worker/postgres/migrations" }),
   Object.freeze({ source: "scripts/postgres-migrations.mjs", destination: "apps/worker/scripts/postgres-migrations.mjs" }),
   Object.freeze({ source: "scripts/cloud-run-build-context.mjs", destination: "apps/worker/scripts/cloud-run-build-context.mjs" }),

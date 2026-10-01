@@ -128,10 +128,12 @@ import {
   ORIGIN_OVERRIDABLE_BUILT_INS,
 } from "./origin-route-modules.mjs";
 import {
+  analyticsV2TestClock,
   FASTPATH_TEST_MODE,
   fastpathTestDatabaseConfig,
   fastpathTestRouteModules,
 } from "./origin-fastpath-mode.mjs";
+import { createAnalyticsV2CommunityDailyRoute } from "../src/analytics-v2/community-daily-route.ts";
 import {
   buildPublicGoogleRequestUrl,
   buildRequestUrl,
@@ -926,7 +928,12 @@ async function writeResponse(res, response) {
   await pipeline(Readable.fromWeb(response.body), res);
 }
 
-async function serve(runtime) {
+/**
+ * Listen for one runtime on HOST:PORT (or the runtime's listen pair) and
+ * return its close function. Exported for local rehearsals that compose a
+ * runtime with injected local pools; the entry point calls it from main().
+ */
+export async function serve(runtime) {
   const server = http.createServer(async (req, res) => {
     try {
       const request = await requestFromNode(
@@ -995,6 +1002,22 @@ async function serve(runtime) {
   return close;
 }
 
+/**
+ * The origin composition root's injected dependencies: the analytics-v2
+ * community-daily route factory, which createRuntime mounts only in
+ * fastpath-test mode with ANALYTICS_V2_ENABLED=1, and its optional test clock
+ * (ANALYTICS_V2_TEST_NOW_MS, fastpath-test only). createRuntime itself keeps
+ * no default factory, so a caller that injects none cannot mount the module.
+ */
+export function originCompositionDependencies(env = process.env) {
+  const mode = env?.POSTGRES_TEST_HTTP_MODE === "" ? undefined : env?.POSTGRES_TEST_HTTP_MODE;
+  const clock = analyticsV2TestClock(env, mode);
+  return Object.freeze({
+    createAnalyticsV2CommunityDailyRoute,
+    ...(clock === null ? {} : { analyticsV2Clock: clock }),
+  });
+}
+
 async function main() {
   const postgresTestMode = postgresTestHttpMode();
   if (postgresTestMode
@@ -1054,7 +1077,7 @@ async function main() {
     }
     return;
   }
-  const runtime = await createRuntime();
+  const runtime = await createRuntime({ dependencies: originCompositionDependencies(process.env) });
   await serve(runtime);
 }
 

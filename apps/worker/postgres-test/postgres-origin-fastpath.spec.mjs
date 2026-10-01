@@ -428,6 +428,43 @@ test("(b) a route module for a non-overridable built-in stops fastpath-test star
   }
 });
 
+test("(f) the origin composition root injects the analytics-v2 route factory and only a fastpath-test clock", async () => {
+  const { server } = await loadModules();
+  const plain = server.originCompositionDependencies({ POSTGRES_TEST_HTTP_MODE: "fastpath-test" });
+  assert.deepEqual(Object.keys(plain), ["createAnalyticsV2CommunityDailyRoute"]);
+  assert.equal(typeof plain.createAnalyticsV2CommunityDailyRoute, "function");
+  const pinned = server.originCompositionDependencies({
+    POSTGRES_TEST_HTTP_MODE: "fastpath-test", ANALYTICS_V2_TEST_NOW_MS: "1790856000000",
+  });
+  assert.equal(pinned.analyticsV2Clock(), 1_790_856_000_000);
+  for (const mode of [undefined, "", "health-only", "health-and-v12-day-manifest", "cloud-run-iam"]) {
+    assert.throws(() => server.originCompositionDependencies({
+      ...(mode === undefined ? {} : { POSTGRES_TEST_HTTP_MODE: mode }), ANALYTICS_V2_TEST_NOW_MS: "1790856000000",
+    }), (error) => error?.code === "ANALYTICS_V2_TEST_CLOCK_REFUSED", String(mode));
+  }
+  // The real factory is the second fence: it refuses a clock outside fastpath-test.
+  assert.throws(() => plain.createAnalyticsV2CommunityDailyRoute({
+    pool: { connect: mustNotCall("pool.connect") }, schema: "tibotattle_fastpath_spec_clock",
+    originMode: "cloud-run-iam", clock: () => 1,
+  }), (error) => error?.message === "ANALYTICS_V2_COMMUNITY_DAILY_TEST_CLOCK_REFUSED");
+
+  // fastpath-test with ANALYTICS_V2_ENABLED=1 mounts the real route from these
+  // dependencies (construction opens no connection) and closes cleanly.
+  const { calls, dependencies } = runtimeDependencies({ extra: pinned });
+  await withEnvironment(
+    fastpathEnvironment("tibotattle_fastpath_spec_compose", { ANALYTICS_V2_ENABLED: "1" }),
+    async () => {
+      const runtime = await server.createRuntime({ dependencies });
+      try {
+        assert.equal(runtime.postgresTestHostMode, "fastpath-test");
+      } finally {
+        await closeRuntime(runtime);
+      }
+    },
+  );
+  assert.ok(calls.includes("pool-end:primary") && calls.includes("pool-end:ledger"));
+});
+
 test("(a) in fastpath-test a stub community-daily module overrides the built-in, and only that route", {
   skip: !PG_TEST_SOCKET,
 }, async () => {

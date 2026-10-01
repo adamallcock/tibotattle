@@ -12,7 +12,9 @@
  *   schema, which may live on the primary instance and database (the ledger
  *   instance, database and schema default to the primary's);
  * - mounts the analytics-v2 GET /api/v1/community/daily route module, which
- *   overrides the built-in, when ANALYTICS_V2_ENABLED=1.
+ *   overrides the built-in, when ANALYTICS_V2_ENABLED=1;
+ * - accepts ANALYTICS_V2_TEST_NOW_MS, the route's injected test clock (a
+ *   rehearsal pins the oracle's nowMs); any other mode refuses it.
  *
  * Nothing here opens a pool or reads the network. server.mjs passes the
  * environment and, for the route module, the factory and optional test clock.
@@ -32,6 +34,7 @@ export const FASTPATH_TEST_SCHEMA_PREFIXES = Object.freeze([
 const LEDGER_SCHEMA_SUFFIX = "_ledger";
 const SCHEMA_IDENTIFIER = /^[a-z_][a-z0-9_]{0,62}$/u;
 const ROUTE_MODULE_FIELDS = Object.freeze(["method", "pathname", "overridesBuiltIn", "handler"]);
+const EPOCH_MILLISECONDS = /^(?:0|[1-9][0-9]{0,15})$/u;
 
 function configurationError(code) {
   throw Object.assign(new Error(code), { code });
@@ -111,6 +114,25 @@ export function isAnalyticsV2Enabled(env) {
   if (value === undefined || value === "0") return false;
   if (value === "1") return true;
   return configurationError("ANALYTICS_V2_ENABLED_INVALID");
+}
+
+/**
+ * ANALYTICS_V2_TEST_NOW_MS: the analytics-v2 route's injected clock, as Unix
+ * epoch milliseconds. Unset gives null (the route uses Date.now). Only a
+ * fastpath-test origin may set it: under any other POSTGRES_TEST_HTTP_MODE,
+ * or none, the origin refuses to start rather than serve a pinned clock.
+ *
+ * @param {Readonly<Record<string, string | undefined>>} env
+ * @param {string | null | undefined} mode the validated POSTGRES_TEST_HTTP_MODE
+ * @returns {(() => number) | null}
+ */
+export function analyticsV2TestClock(env, mode) {
+  const value = envValue(env, "ANALYTICS_V2_TEST_NOW_MS");
+  if (value === undefined) return null;
+  if (mode !== FASTPATH_TEST_MODE) configurationError("ANALYTICS_V2_TEST_CLOCK_REFUSED");
+  const nowMs = EPOCH_MILLISECONDS.test(value) ? Number(value) : Number.NaN;
+  if (!Number.isSafeInteger(nowMs)) configurationError("ANALYTICS_V2_CLOCK_INVALID");
+  return () => nowMs;
 }
 
 /**
