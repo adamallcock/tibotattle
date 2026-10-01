@@ -2188,8 +2188,10 @@ test("PG17 through the landed origin dispatch: a shipped client authorizes with 
     assertTelemetryTransportWriteAllowed: authority.assertPostgresTelemetryTransportWriteAllowed,
     schemaVersions: ["telemetry-contribution-v1.0", "telemetry-contribution-v0.1"],
   });
+  // The dispatch refuses one pool object for both roles; the ledger schema shares the server.
+  const ledgerPool = { connect: () => pool.connect() };
   const dispatch = createPostgresTestV12DayManifestDispatch({
-    primaryPool: pool, ledgerPool: pool, schemaOptions,
+    primaryPool: pool, ledgerPool, schemaOptions,
     expectedMigrations: runtimeSchema.POSTGRES_RUNTIME_MIGRATIONS, privateOrigin: ORIGIN,
     healthDispatch: mustNotCall("healthDispatch"), admissionEnv,
     assertAdmissionBindings: workerAdmission.assertAdmissionBindings,
@@ -2224,7 +2226,7 @@ test("PG17 through the landed origin dispatch: a shipped client authorizes with 
     uploadAuthorizationFormats: legacyFormats,
   });
   const routeModule = createUploadAuthorizationRouteModule({
-    primaryPool: pool, ledgerPool: pool, schema: schemaOptions, maxRequestBytes: MAX_REQUEST_BYTES, admissionEnv,
+    primaryPool: pool, ledgerPool, schema: schemaOptions, maxRequestBytes: MAX_REQUEST_BYTES, admissionEnv,
     formats: createUploadAuthorizationFormats(new Map([
       [V12_UPLOAD_FORMAT, { assertUploadAllowed: assertV12UploadAllowed }], ...Object.entries(legacyFormats),
     ])),
