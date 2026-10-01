@@ -22,7 +22,7 @@
 
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -553,7 +553,9 @@ function commitHasRefreshEntry(commit) {
 async function stepBuild(runner, options) {
   const commit = resolveCommit(options.commit);
   const short = commit.slice(0, 12);
-  const work = await mkdtemp(join(tmpdir(), `tibotattle-fastpath-src-${short}-`));
+  // realpath: the reviewed tools compare import.meta.url with argv[1], and
+  // macOS tmpdir() is a symlink (/var -> /private/var).
+  const work = await realpath(await mkdtemp(join(tmpdir(), `tibotattle-fastpath-src-${short}-`)));
   try {
     const tree = join(work, "tree");
     await mkdir(tree);
@@ -577,7 +579,7 @@ async function stepBuild(runner, options) {
       };
     } else {
       const created = runner.exec([process.execPath, archiveTool, `--output=${archivePath}`], { read: true });
-      archive = JSON.parse(created.stdout);
+      try { archive = JSON.parse(created.stdout); } catch { fail("FASTPATH_DEPLOY_ARCHIVE_RECEIPT_MISSING"); }
       if (archive.status !== "ok") fail("FASTPATH_DEPLOY_ARCHIVE_FAILED");
     }
     const sourceUri = `gs://${FASTPATH_TEST.buildBucket}/${archive.suggestedSourceObject}`;
@@ -838,10 +840,18 @@ async function stepVerify(runner, options) {
   const responses = [];
   try {
     for (const path of targets) {
-      const response = await fetch(FASTPATH_TEST.originUrl + path, {
-        method: "GET", redirect: "error", headers: { authorization: `Bearer ${token}` },
-        signal: AbortSignal.timeout(300_000),
-      });
+      let response;
+      // A fresh invoker binding can take a few minutes to reach the front end;
+      // retry only the front end's 403, bounded, then record what it returned.
+      for (let attempt = 0; attempt < 18; attempt += 1) {
+        response = await fetch(FASTPATH_TEST.originUrl + path, {
+          method: "GET", redirect: "error", headers: { authorization: `Bearer ${token}` },
+          signal: AbortSignal.timeout(300_000),
+        });
+        if (response.status !== 403) break;
+        await response.arrayBuffer();
+        await new Promise((resolveWait) => setTimeout(resolveWait, 10_000));
+      }
       const body = Buffer.from(await response.arrayBuffer());
       const name = path.startsWith("/api/health") ? "health" : "community-daily";
       const bodyPath = join(runner.out, `${name}-response.body`);
