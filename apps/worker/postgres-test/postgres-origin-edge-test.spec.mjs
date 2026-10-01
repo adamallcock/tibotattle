@@ -695,19 +695,28 @@ test("accountless routes refuse only the session cookie, with AUTH_INVALID", {
     const request = (cookie, outcome) => ({
       method: "POST", path, body: "{}",
       headers: { ...edgeHeaders({ admission: `v1;${purpose};${outcome}` }), "content-type": "application/json",
-        authorization: unknownDeviceBearer(), cookie },
+        authorization: unknownDeviceBearer(), ...(cookie === undefined ? {} : { cookie }) },
     });
     for (const cookie of [SESSION_COOKIE, `${UNRELATED_COOKIE}; ${SESSION_COOKIE}`]) {
       assertApiError(await send(port, request(cookie, "allowed")), 401, "AUTH_INVALID", `${path} ${cookie}`);
     }
     // An unrelated cookie is not refused for the cookie: the limiter answers,
-    // and admitted, the route's own body validation does.
+    // and admitted, the route's own next check does. For the v1.2 grant that
+    // is the device credential (d43c8f92 index.ts:780-789 authenticates
+    // before it reads the body), so the unknown bearer is refused whether or
+    // not the unrelated cookie is present; elsewhere it is body validation.
     assertAdmissionAnswer(await send(port, request(UNRELATED_COOKIE, "limited")),
       429, "ATTEMPT_LIMIT_REACHED", `${path} unrelated cookie, limited`);
     const admitted = await send(port, request(UNRELATED_COOKIE, "allowed"));
-    assert.ok(!["AUTH_INVALID", "DEVICE_AUTH_INVALID"].includes(errorCode(admitted)),
-      `${path} unrelated cookie, admitted: ${admitted.text}`);
-    assertApiError(admitted, 400, "BODY_INVALID", `${path} unrelated cookie, admitted`);
+    if (path === "/api/v1/accountless/telemetry-v1.2-authorization") {
+      assertApiError(admitted, 401, "DEVICE_AUTH_INVALID", `${path} unrelated cookie, admitted`);
+      assertApiError(await send(port, request(undefined, "allowed")), 401, "DEVICE_AUTH_INVALID",
+        `${path} no cookie, admitted`);
+    } else {
+      assert.ok(!["AUTH_INVALID", "DEVICE_AUTH_INVALID"].includes(errorCode(admitted)),
+        `${path} unrelated cookie, admitted: ${admitted.text}`);
+      assertApiError(admitted, 400, "BODY_INVALID", `${path} unrelated cookie, admitted`);
+    }
   }
 }));
 

@@ -2517,20 +2517,21 @@ export function createPostgresTestV12DayManifestDispatch({
           admissionEnv,
           "accountless_ownership",
         );
-        const body = await readAccountlessJson(
-          request,
-          accountlessAuthority.maxOwnershipBytes,
-          readBoundedRequestBody,
-          accountlessV12AuthorizationRoute
-            ? accountlessAuthority.parseV12AuthorizationJson
-            : accountlessAuthority.parseOwnershipJson,
-        );
         if (accountlessOwnershipRoute) {
+          const body = await readAccountlessJson(
+            request,
+            accountlessAuthority.maxOwnershipBytes,
+            readBoundedRequestBody,
+            accountlessAuthority.parseOwnershipJson,
+          );
           const result = await accountlessAuthority.createOwner(
             primaryPool, request.headers.get("authorization"), body, { schema },
           );
           return json(result.status, result.response);
         }
+        // d43c8f92 index.ts:780-789: the v1.2 grant authenticates the device
+        // (and its tombstone) before it reads the body, so an unknown
+        // credential is 401 DEVICE_AUTH_INVALID whatever the body holds.
         const principal = await accountlessAuthority.authenticateV12Grant(
           primaryPool, request.headers.get("authorization"), { schema },
         );
@@ -2541,6 +2542,12 @@ export function createPostgresTestV12DayManifestDispatch({
             code: "DEVICE_AUTH_INVALID", status: 401,
           });
         }
+        const body = await readAccountlessJson(
+          request,
+          accountlessAuthority.maxOwnershipBytes,
+          readBoundedRequestBody,
+          accountlessAuthority.parseV12AuthorizationJson,
+        );
         await accountlessAuthority.grantV12(
           primaryPool,
           principal,
