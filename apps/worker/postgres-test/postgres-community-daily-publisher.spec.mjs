@@ -111,9 +111,14 @@ describe.skipIf(!PG_TEST_SOCKET && !PG_TEST_HOST)("PostgreSQL explicit-day commu
     await pool.query(`INSERT INTO ${sqlSchema}.typed_v1_admission_state(
       id,source_namespace,namespace_id,runtime_contract_version,next_source_row_id)
       VALUES (1,$1,1,1,1)`, [SOURCE_NAMESPACE]);
+    // The typed v1.1 runtime is qualified (0 -> 1) by publish(), after a
+    // case's JSON-era v1.1 fixtures: as on D1 and in the transfer, imported
+    // telemetry_v11_records predate qualification, and primary 0060 (D1
+    // typed-v11 0001 typed_v11_legacy_record_refusal) refuses a JSON v1.1
+    // record once the typed runtime is qualified.
     await pool.query(`INSERT INTO ${sqlSchema}.typed_v11_admission_state(
       id,source_namespace,namespace_id,runtime_contract_version,next_source_row_id)
-      VALUES (1,$1,1,1,1)`, [SOURCE_NAMESPACE]);
+      VALUES (1,$1,1,0,1)`, [SOURCE_NAMESPACE]);
     await pool.query(`INSERT INTO ${sqlSchema}.storage_source_state(singleton,source_id,authority_epoch)
       VALUES (1,$1,0)`, [SOURCE_ID]);
     await pool.query(`INSERT INTO ${sqlSchema}.analytics_source_cursors(source_id,sequence,authority_epoch)
@@ -307,6 +312,11 @@ describe.skipIf(!PG_TEST_SOCKET && !PG_TEST_HOST)("PostgreSQL explicit-day commu
       JSON.stringify([{ day: DAY, manifestId: manifest, manifestDigest }]), now]);
     await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v11_domain_days(generation_id,observed_day,manifest_id)
       VALUES ($1,$2::date,$3)`, [generation, DAY, manifest]);
+    // Imported D1 state: the owner link already names the accepted head, so
+    // primary 0060's v1.1 bridge records nothing new for it.
+    await pool.query(`INSERT INTO ${sqlSchema}.storage_v11_owner_links(
+      participant_id,owner_digest,state,generation_id,head_revision)
+      VALUES ($1,$2,'active',$3,1)`, [owner, "4".repeat(64), generation]);
     await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v11_domain_heads(participant_id,generation_id,revision,updated_at)
       VALUES ($1,$2,1,$3::timestamptz)`, [owner, generation, now]);
     await pool.query(`ANALYZE ${sqlSchema}.telemetry_v11_chunks`);
@@ -475,12 +485,14 @@ describe.skipIf(!PG_TEST_SOCKET && !PG_TEST_HOST)("PostgreSQL explicit-day commu
       "8".repeat(64), DAY, JSON.stringify([{ day: DAY, manifestId }]), now]);
     await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v11_domain_days(generation_id,observed_day,manifest_id)
       VALUES ($1,$2::date,$3)`, [generationId, DAY, manifestId]);
-    await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v11_domain_heads(
-      participant_id,generation_id,revision,updated_at)
-      VALUES ($1,$2,1,$3::timestamptz)`, [participantId, generationId, now]);
+    // Imported D1 state: the owner link already names the accepted head, so
+    // primary 0060's v1.1 bridge records nothing new for it.
     await pool.query(`INSERT INTO ${sqlSchema}.storage_v11_owner_links(
       participant_id,owner_digest,state,generation_id,head_revision)
       VALUES ($1,$2,'active',$3,1)`, [participantId, ownerDigest, generationId]);
+    await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v11_domain_heads(
+      participant_id,generation_id,revision,updated_at)
+      VALUES ($1,$2,1,$3::timestamptz)`, [participantId, generationId, now]);
     await pool.query(`INSERT INTO ${sqlSchema}.analytics_owner_state(
       source_id,owner_digest,revision,authority_epoch,state)
       VALUES ($1,$2,1,0,'active')`, [SOURCE_ID, ownerDigest]);
@@ -509,7 +521,13 @@ describe.skipIf(!PG_TEST_SOCKET && !PG_TEST_HOST)("PostgreSQL explicit-day commu
     };
   }
 
+  async function qualifyTypedV11Runtime() {
+    await pool.query(`UPDATE ${sqlSchema}.typed_v11_admission_state SET runtime_contract_version=1
+      WHERE id=1 AND runtime_contract_version=0`);
+  }
+
   async function publish(options = {}, publicationPool = pool) {
+    await qualifyTypedV11Runtime();
     return publishPostgresCommunityDailyDay(publicationPool, {
       sourceId: SOURCE_ID,
       sourceNamespace: SOURCE_NAMESPACE,
@@ -662,18 +680,42 @@ describe.skipIf(!PG_TEST_SOCKET && !PG_TEST_HOST)("PostgreSQL explicit-day commu
       v11SelectedRecordsPresent: true,
     });
 
-    await pool.query(`UPDATE ${sqlSchema}.telemetry_v11_domain_heads
-      SET revision=revision+1 WHERE participant_id=$1`, [fixture.participantId]);
+    // The retained marker needs the exact enrollment secret: a ledger hash
+    // that no longer matches the device excludes the day, and restoring it
+    // includes the day again.
+    await pool.query(`UPDATE ${sqlSchema}.accountless_enrollment_ledger
+      SET device_secret_hash=$2 WHERE device_id=$1`,
+    [fixture.deviceId, Buffer.alloc(32, 0x5e)]);
     expect(await readEligibility()).toEqual({
       v1SelectedRecordsPresent: false,
       v11SelectedRecordsPresent: false,
     });
-    await pool.query(`UPDATE ${sqlSchema}.telemetry_v11_domain_heads
-      SET revision=revision-1 WHERE participant_id=$1`, [fixture.participantId]);
-
     await pool.query(`UPDATE ${sqlSchema}.accountless_enrollment_ledger
-      SET device_secret_hash=$2 WHERE device_id=$1`,
-    [fixture.deviceId, Buffer.alloc(32, 0x5e)]);
+      SET device_secret_hash=$2 WHERE device_id=$1`, [fixture.deviceId, fixture.secretHash]);
+    expect(await readEligibility()).toEqual({
+      v1SelectedRecordsPresent: false,
+      v11SelectedRecordsPresent: true,
+    });
+
+    // The marker pins the exact head too: a successor generation at revision
+    // 2 excludes the retained day. (A head never moves back: primary 0060,
+    // as D1's head classification, refuses a revision-down update.)
+    const successorToken = "a".repeat(64);
+    const successorGeneration = randomUUID();
+    await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v11_domain_predecessors(
+      token_hash,participant_id,device_id,previous_generation_id,legacy_fingerprint,
+      input_revision,from_day,through_day,winners_json,created_at,expires_at,consumed_at)
+      VALUES ($1,$2,$3,$4,$5,0,$6::date,$6::date,'{}',$7::timestamptz,$8::timestamptz,$7::timestamptz)`,
+    [successorToken, fixture.participantId, fixture.deviceId, fixture.generationId, "8".repeat(64), DAY,
+      "2026-09-24T01:00:00.000Z", "2027-09-24T00:00:00.000Z"]);
+    await pool.query(`INSERT INTO ${sqlSchema}.telemetry_v11_domains(
+      id,participant_id,device_id,predecessor_token_hash,previous_generation_id,
+      manifest_digest,legacy_fingerprint,input_revision,from_day,through_day,days_json,created_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,0,$8::date,$8::date,'[]',$9::timestamptz)`,
+    [successorGeneration, fixture.participantId, fixture.deviceId, successorToken, fixture.generationId,
+      "b".repeat(64), "8".repeat(64), DAY, "2026-09-24T01:00:00.000Z"]);
+    await pool.query(`UPDATE ${sqlSchema}.telemetry_v11_domain_heads
+      SET generation_id=$2, revision=2 WHERE participant_id=$1`, [fixture.participantId, successorGeneration]);
     expect(await readEligibility()).toEqual({
       v1SelectedRecordsPresent: false,
       v11SelectedRecordsPresent: false,

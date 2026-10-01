@@ -133,10 +133,12 @@ interface FencedSnapshot {
 }
 
 // This is the complete current owner-scoped table set on migrations through
-// 0042, plus staged 0046's storage_v12_event_sources and the staged
-// legacy_contribution_admission migration's telemetry_contribution_admission_windows
+// 0042, plus staged 0046's storage_v12_event_sources and primary 0061's
+// (legacy_contribution_admission) telemetry_contribution_admission_windows
 // (counters only, no object or authority edge), which cascade with their
-// participant. It is a fail-closed schema fence: adding a participant-owned
+// participant, and primary 0060's storage_v11_append_transitions (immutable
+// v1.1 head classifications, no object or authority edge), which cascades with
+// its telemetry_v11_domains generation. It is a fail-closed schema fence: adding a participant-owned
 // table requires reviewing whether it contains an external object or an
 // accountless authority edge before this eraser can proceed.
 const ACCOUNTLESS_PARTICIPANT_TABLES = new Set(`
@@ -147,8 +149,8 @@ const ACCOUNTLESS_PARTICIPANT_TABLES = new Set(`
   device_pairing_events device_pairings device_upload_authorizations enrollment_grants historical_telemetry_v11_chunk_headers
   historical_telemetry_v11_manifest_headers historical_telemetry_v1_chunk_headers identity_reenrollment_cooldowns
   input_source_digests input_versions participant_community_eligibility prepared_source_days recovery_retry_receipts
-  storage_v11_event_sources storage_v11_owner_links storage_v12_event_sources telemetry_additive_correction_facts
-  telemetry_additive_correction_receipts telemetry_contribution_admission_windows
+  storage_v11_append_transitions storage_v11_event_sources storage_v11_owner_links storage_v12_event_sources
+  telemetry_additive_correction_facts telemetry_additive_correction_receipts telemetry_contribution_admission_windows
   telemetry_contribution_occurrences telemetry_contributions
   telemetry_correction_receipts telemetry_records telemetry_transport_device_floors
   telemetry_transport_floor_rollbacks telemetry_transport_participant_floors telemetry_usage_correction_history

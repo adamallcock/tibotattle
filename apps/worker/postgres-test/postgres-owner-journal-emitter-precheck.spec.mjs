@@ -753,10 +753,19 @@ async function sourceChanges(db, table, participantId, index) {
   assert.ok(Number.isSafeInteger(index) && index >= 1 && index <= 9, "one hex digit keeps the generation id a UUID");
   const firstGeneration = `0d${index}00000-0000-4000-8000-000000000001`;
   const secondGeneration = `0d${index}00000-0000-4000-8000-000000000002`;
+  // An active link that already names each head (imported, already bridged
+  // D1 state) keeps primary 0060's v1.1 bridge from journaling it, so these
+  // head changes reach the 0014 emitter exactly as before the bridge; a
+  // withdrawn or absent link is still bridged, alike in both oracle runs.
+  const nameHead = (generationId, revision) => db.query(`UPDATE ${table("storage_v11_owner_links")}
+    SET generation_id=$2, head_revision=$3 WHERE participant_id=$1 AND state='active'`,
+  [participantId, generationId, revision]);
   await v11Generation(db, table, { participantId, deviceId, generationId: firstGeneration });
+  await nameHead(firstGeneration, 1);
   await db.query(`INSERT INTO ${table("telemetry_v11_domain_heads")} (participant_id,generation_id,revision,updated_at)
     VALUES ($1,$2,1,$3)`, [participantId, firstGeneration, NOW]);
   await v11Generation(db, table, { participantId, deviceId, generationId: secondGeneration, previous: firstGeneration });
+  await nameHead(secondGeneration, 2);
   await db.query(`UPDATE ${table("telemetry_v11_domain_heads")} SET generation_id=$2,revision=2 WHERE participant_id=$1`,
     [participantId, secondGeneration]);
   await db.query(`DELETE FROM ${table("telemetry_records")} WHERE participant_id=$1 AND occurrence_id=$2`,
@@ -810,7 +819,27 @@ async function oracleScenario({ pool, quoted, table }) {
       LEFT JOIN ${table("input_source_digests")} digests ON digests.participant_id=participant.id
       ORDER BY participant.id`);
     const source = await client.query(`SELECT source_id,authority_epoch::int AS epoch FROM ${table("storage_source_state")}`);
-    return { rows: await journal(client, table), heads: await heads(client, table), inputs: inputs.rows, source: source.rows };
+    // Primary 0060's v1.1 bridge journals each eligible head with a random
+    // event digest, and mints a random owner link for an unlinked owner, in
+    // both runs alike. Name those values by their identity, so the oracle
+    // still compares every row, kind, revision and epoch exactly.
+    const named = new Map();
+    for (const row of (await client.query(`SELECT event_digest,participant_id,generation_id,head_revision::int AS revision
+        FROM ${table("storage_v11_event_sources")}`)).rows) {
+      named.set(row.event_digest, `v11-bridge-event:${row.participant_id}:${row.generation_id}:${row.revision}`);
+    }
+    const fixedOwners = new Set(ORACLE_OWNERS.map((owner) => owner.owner));
+    for (const row of (await client.query(`SELECT participant_id,owner_digest FROM ${table("storage_v11_owner_links")}`)).rows) {
+      if (!fixedOwners.has(row.owner_digest)) named.set(row.owner_digest, `minted-owner-link:${row.participant_id}`);
+    }
+    const name = (value) => named.get(value) ?? value;
+    const rows = (await journal(client, table)).map((row) => ({
+      ...row, event_digest: name(row.event_digest), owner_digest: name(row.owner_digest), object_digest: name(row.object_digest),
+    }));
+    const ownerHeads = (await heads(client, table)).map((row) => ({
+      ...row, owner_digest: name(row.owner_digest), object_digest: name(row.object_digest),
+    })).sort((left, right) => left.owner_digest.localeCompare(right.owner_digest));
+    return { rows, heads: ownerHeads, inputs: inputs.rows, source: source.rows };
   } finally {
     await release(client);
   }

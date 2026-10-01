@@ -23,8 +23,7 @@
  * re-reads authority under FOR SHARE (TA-1 assertPostgresTelemetryTransport-
  * WriteAllowed with lock: true) and applies the same checks in the same
  * order, so the status codes and error bodies are the Worker's. Primary
- * migration 0060 (staged) holds the row guards that must hold for every
- * writer.
+ * migration 0060 holds the row guards that must hold for every writer.
  *
  * Typed rows use the retained typed v1/v1.1 family (0030/0033) and the 0052
  * identities (TL-1): ids are allocated by PostgreSQL, while source_row_id
@@ -40,7 +39,7 @@
  *     community_daily_aggregate_rebuilds head side effects are not written;
  *     the analytics_v2 job reads storage_ingestion_changes instead. The
  *     storage_v11 owner bridge (ingestion-bridge 0001, with ingestion-
- *     isolation 0002's append classification) is staged migration 0060's
+ *     isolation 0002's append classification) is primary migration 0060's
  *     head trigger, not this module;
  *   - D1 keeps the usage-correction runtime state in
  *     telemetry_usage_correction_runtime.state; PostgreSQL keeps the

@@ -8,8 +8,8 @@
  * telemetry-contribution-v0.1 'accepted' (migrations/0044), so a social
  * participant whose transport floor is still rank 1 can upload it. The port
  * is admitPostgresTelemetryV01Contribution in
- * src/postgres-legacy-contribution-admission.ts, injected here. It needs the
- * staged legacy_contribution_admission migration (weekly admission window)
+ * src/postgres-legacy-contribution-admission.ts, injected here. It needs
+ * primary 0061, legacy_contribution_admission (weekly admission window),
  * and the retained v0.1 upload-authorization format
  * (upload-authorization-formats.mjs RETAINED_V0_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS);
  * register all three together or none.

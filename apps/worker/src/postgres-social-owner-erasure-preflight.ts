@@ -147,9 +147,11 @@ function safeError(error: unknown): Error | null {
  * not an instruction to cascade through any table the database happens to
  * contain. It currently mirrors the accountless eraser's participant-owned
  * families plus the social grant family; storage_v12_event_sources (staged
- * 0046) and telemetry_contribution_admission_windows (the staged
- * legacy_contribution_admission migration: counters only, no object) cascade
- * with their participant. The two erasers intentionally remain
+ * 0046) and telemetry_contribution_admission_windows (primary 0061,
+ * legacy_contribution_admission: counters only, no object) cascade
+ * with their participant; storage_v11_append_transitions (primary 0060:
+ * immutable v1.1 head classifications, no object) cascades with its
+ * telemetry_v11_domains generation. The two erasers intentionally remain
  * independently fail-closed until a reviewed shared contract replaces them.
  */
 const KNOWN_PARTICIPANT_TABLES = new Set(`
@@ -160,8 +162,8 @@ const KNOWN_PARTICIPANT_TABLES = new Set(`
   device_pairing_events device_pairings device_upload_authorizations enrollment_grants historical_telemetry_v11_chunk_headers
   historical_telemetry_v11_manifest_headers historical_telemetry_v1_chunk_headers identity_reenrollment_cooldowns
   input_source_digests input_versions participant_community_eligibility prepared_source_days recovery_retry_receipts
-  storage_v11_event_sources storage_v11_owner_links storage_v12_event_sources telemetry_additive_correction_facts
-  telemetry_additive_correction_receipts telemetry_contribution_admission_windows
+  storage_v11_append_transitions storage_v11_event_sources storage_v11_owner_links storage_v12_event_sources
+  telemetry_additive_correction_facts telemetry_additive_correction_receipts telemetry_contribution_admission_windows
   telemetry_contribution_occurrences telemetry_contributions
   telemetry_correction_receipts telemetry_records telemetry_transport_device_floors
   telemetry_transport_floor_rollbacks telemetry_transport_participant_floors telemetry_usage_correction_history

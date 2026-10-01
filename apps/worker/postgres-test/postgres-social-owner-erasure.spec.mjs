@@ -588,6 +588,24 @@ test("PG17 participant deletion cascades every participant family except reviewe
         )
       ORDER BY table_name`, [primarySchema],
   );
-  assert.deepEqual(unlinked.rows.map((row) => row.table_name), ["telemetry_contribution_occurrences"],
-    "the only participant column without a direct edge cascades through contributions and records");
+  assert.deepEqual(unlinked.rows.map((row) => row.table_name),
+    ["storage_v11_append_transitions", "telemetry_contribution_occurrences"],
+    "the only participant columns without a direct edge cascade through their parents");
+  // Primary 0060's storage_v11_append_transitions cascades through its v1.1
+  // generation, which cascades from the participant.
+  const generationEdges = await primaryPool.query(
+    `SELECT child.relname::text AS child, parent.relname::text AS parent, constraint_row.confdeltype::text AS rule
+       FROM pg_constraint constraint_row
+       JOIN pg_class child ON child.oid=constraint_row.conrelid
+       JOIN pg_class parent ON parent.oid=constraint_row.confrelid
+       JOIN pg_namespace namespace ON namespace.oid=child.relnamespace
+      WHERE constraint_row.contype='f' AND namespace.nspname=$1
+        AND ((child.relname='storage_v11_append_transitions' AND parent.relname='telemetry_v11_domains')
+          OR (child.relname='telemetry_v11_domains' AND parent.relname='participants'))
+      ORDER BY child`, [primarySchema],
+  );
+  assert.deepEqual(generationEdges.rows, [
+    { child: "storage_v11_append_transitions", parent: "telemetry_v11_domains", rule: "c" },
+    { child: "telemetry_v11_domains", parent: "participants", rule: "c" },
+  ]);
 }));
