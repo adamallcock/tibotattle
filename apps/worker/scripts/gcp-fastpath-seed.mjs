@@ -1,29 +1,40 @@
 #!/usr/bin/env node
 
 /**
- * Seed the disposable fast-path test database (`tibotattle_fastpath`) from a
- * hash-sealed SQLite dump through the rehearsal importers, then give the
- * runtime IAM user exactly the reviewed runtime grants and read back as it.
+ * Seed the disposable fast-path test database (`tibotattle_fastpath`) with
+ * exactly the data the local rehearsal imports, then give the runtime IAM
+ * user exactly the reviewed runtime grants and read back as it.
  *
- * The importers keep their prefix guards: the seeded schema is a
- * `typed_legacy_transfer_rehearsal_target_<suffix>` schema inside the
- * fast-path database, and refresh/origin are pointed at it explicitly.
+ * The seed does not have its own importer logic. It calls the local
+ * rehearsal's own loader (scripts/gcp-fastpath-rehearsal.mjs):
+ * sealFastpathRehearsalSource rebuilds the golden's USAGE_MONITOR_DB dump
+ * into a sealed SQLite, and loadFastpathRehearsalImporters runs the same
+ * importer chain, in the same order, into ONE
+ * typed_legacy_transfer_rehearsal_target_fastpath_<8 hex> schema:
+ * T-1 identity/authority copy, typed-legacy transfer, T-1 legacy-transport
+ * copy, T-2 v1.2 transfer, T-1 v1.2 event-source copy, usage-correction
+ * transfer and the ingestion journal (prefix-guarded fast-path target), then
+ * T-1's roster, public-owner and owner-revision verifications. So
+ * analytics-refresh and the origin read on GCP what they read locally.
  *
  *   node scripts/gcp-fastpath-seed.mjs seed --target=gcp-fastpath --commit=<ref>
- *        --sqlite=<path> --sqlite-sha256=<hex> [--schema-suffix=<suffix>]
- *   node scripts/gcp-fastpath-seed.mjs prove --target=gcp-fastpath
- *   node scripts/gcp-fastpath-seed.mjs plan --commit=<ref>
+ *        [--golden=<dir>] [--schema-suffix=<8 hex>] [--replace]
+ *   node scripts/gcp-fastpath-seed.mjs plan [--commit=<ref>] [--golden=<dir>]
+ *   node scripts/gcp-fastpath-seed.mjs readback --target=gcp-fastpath --schema=<seeded schema>
  *
- * Importers run from this checkout, so the stage files and migrations must
- * equal the deployed commit's; a stage absent from that commit is skipped
- * with its reason. No credential is read, printed or stored.
+ * The importers run from this checkout under Node 26 (node:sqlite), so every
+ * stage file, the migrations and the golden must equal the deployed commit's;
+ * the plan refuses a differing checkout and skips, with its reason, when a
+ * stage is absent at that commit. A schema holding a partial seed is refused
+ * unless --replace drops exactly that target and its control schema. No
+ * credential is read, printed or stored.
  */
 
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { chmod, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createGcpFastpathPool, GCP_FASTPATH_CONNECTION, validateTarget } from "./gcp-fastpath-connection.mjs";
 
@@ -31,46 +42,66 @@ const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const REPOSITORY_ROOT = resolve(WORKER_ROOT, "../..");
 const COMMIT = /^[a-f0-9]{40}$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
-const SUFFIX = /^[a-z][a-z0-9_]{7,23}$/u;
+const SUFFIX = /^[0-9a-f]{8}$/u;
+const SEED_MARKER_VERSION = "gcp-fastpath-seed-v1";
 
 export const GCP_FASTPATH_SEED = Object.freeze({
-  targetPrefix: "typed_legacy_transfer_rehearsal_target_",
-  controlPrefix: "typed_legacy_transfer_rehearsal_",
+  targetPrefix: "typed_legacy_transfer_rehearsal_target_fastpath_",
+  controlPrefix: "typed_legacy_transfer_rehearsal_ctl_",
+  defaultGolden: "apps/worker/analytics-v2-test/golden",
   migrationPaths: Object.freeze([
     "apps/worker/postgres/migrations",
     "apps/worker/cloud-run/postgres-migrations.mjs",
+    "apps/worker/scripts/postgres-migrations.mjs",
   ]),
 });
 
 /**
- * Ordered importer stages. Call contracts for the stages that do not exist
- * yet (T-1, T-2) are the ones this wrapper will invoke; their owners align
- * the export names or the integration lead adjusts this table.
+ * The modules the seed's chain runs, with the exports it relies on. The
+ * first stage is the rehearsal loader the seed calls; the rest are the
+ * importers that loader calls, in its order. Every stage is required: the
+ * GCP seed must be the local rehearsal's chain, not a subset of it.
  */
 export const SEED_STAGES = Object.freeze([
   Object.freeze({
-    name: "identity", label: "T-1 identity/authority copy", required: true,
-    path: "apps/worker/scripts/postgres-fastpath-identity-copy.mjs",
-    exports: Object.freeze(["runPostgresFastpathIdentityCopy"]),
+    name: "rehearsal-loader", label: "rehearsal loader (seal + importer chain)",
+    path: "apps/worker/scripts/gcp-fastpath-rehearsal.mjs",
+    exports: Object.freeze(["fastpathRehearsalSchemas", "sealFastpathRehearsalSource",
+      "loadFastpathRehearsalImporters", "buildJournalSqlite"]),
   }),
   Object.freeze({
-    name: "typed-legacy", label: "typed-legacy v1/v1.1 transfer", required: true,
+    name: "oracle-sqlite", label: "golden dump to sealed SQLite",
+    path: "apps/worker/scripts/gcp-fastpath-oracle-sqlite.mjs",
+    exports: Object.freeze(["rebuildOracleSqlite"]),
+  }),
+  Object.freeze({
+    name: "identity", label: "T-1 identity/authority copy (with legacy-transport and v12-event-sources copies)",
+    path: "apps/worker/scripts/postgres-fastpath-identity-copy.mjs",
+    exports: Object.freeze(["openSealedFastpathIdentitySource", "runPostgresFastpathIdentityCopy",
+      "runPostgresFastpathTransportCopy", "compareFastpathOwnerRoster", "compareFastpathPublicSourceOwners",
+      "compareFastpathOwnerRevisions"]),
+  }),
+  Object.freeze({
+    name: "typed-legacy", label: "typed-legacy v1/v1.1 transfer",
     path: "apps/worker/scripts/postgres-typed-legacy-transfer.mjs",
     exports: Object.freeze(["createSealedSqliteTypedLegacyRehearsalSource", "runPostgresTypedLegacyTransfer"]),
   }),
   Object.freeze({
-    name: "v12", label: "T-2 v1.2 transfer", required: false,
+    name: "v12", label: "T-2 v1.2 transfer",
     path: "apps/worker/scripts/postgres-v12-transfer.mjs",
-    exports: Object.freeze(["createSealedSqliteV12RehearsalSource", "runPostgresV12Transfer"]),
+    exports: Object.freeze(["createSealedSqliteV12RehearsalSource", "loadPostgresV12EffectiveReader",
+      "runPostgresV12Transfer"]),
   }),
-]);
-
-/** Importers whose own prefix guard cannot target the shared seeded schema. */
-export const UNSEEDED_IMPORTERS = Object.freeze([
-  Object.freeze({ label: "usage-correction transfer", path: "apps/worker/scripts/postgres-usage-correction-transfer.mjs",
-    reason: "its target guard requires usage_correction_transfer_target_*" }),
-  Object.freeze({ label: "ingestion-journal transfer", path: "apps/worker/scripts/postgres-ingestion-journal-transfer.mjs",
-    reason: "its target guard requires storage_journal_transfer_target_*" }),
+  Object.freeze({
+    name: "usage-correction", label: "usage-correction transfer",
+    path: "apps/worker/scripts/postgres-usage-correction-transfer.mjs",
+    exports: Object.freeze(["createSealedSqliteUsageCorrectionSource", "runPostgresUsageCorrectionTransfer"]),
+  }),
+  Object.freeze({
+    name: "ingestion-journal", label: "ingestion-journal transfer (fast-path prefix)",
+    path: "apps/worker/scripts/postgres-ingestion-journal-transfer.mjs",
+    exports: Object.freeze(["createSealedSqliteIngestionJournalSource", "transferPostgresIngestionJournal"]),
+  }),
 ]);
 
 function fail(code, detail) {
@@ -88,6 +119,14 @@ export function resolveCommit(ref, spawn = spawnSync) {
   return commit;
 }
 
+/** Repository-relative path of a golden directory inside this checkout. */
+export function goldenPath(golden = GCP_FASTPATH_SEED.defaultGolden) {
+  const absolute = isAbsolute(golden) ? golden : resolve(REPOSITORY_ROOT, golden);
+  const path = relative(REPOSITORY_ROOT, absolute);
+  if (path === "" || path.startsWith("..") || isAbsolute(path)) fail("GCP_FASTPATH_SEED_GOLDEN_INVALID", String(golden));
+  return path;
+}
+
 /** True when this checkout's files at `paths` equal the commit (no diff, no untracked extras). */
 function checkoutMatches(commit, paths, spawn) {
   const diff = git(["diff", "--quiet", commit, "--", ...paths], spawn);
@@ -96,69 +135,64 @@ function checkoutMatches(commit, paths, spawn) {
 }
 
 /** Which stages exist at the commit, and whether this checkout can run them. */
-export function planSeed(commit, spawn = spawnSync) {
+export function planSeed(commit, { spawn = spawnSync, golden = GCP_FASTPATH_SEED.defaultGolden } = {}) {
+  const goldenDirectory = goldenPath(golden);
   const stages = SEED_STAGES.map((stage) => {
     const inCommit = git(["cat-file", "-e", `${commit}:${stage.path}`], spawn).status === 0;
     if (!inCommit) return { ...stage, status: "absent" };
     return { ...stage, status: checkoutMatches(commit, [stage.path], spawn) ? "present" : "checkout-mismatch" };
   });
-  const migrationsMatch = checkoutMatches(commit, GCP_FASTPATH_SEED.migrationPaths, spawn);
-  const missingRequired = stages.filter((stage) => stage.required && stage.status === "absent");
+  const goldenInCommit = git(["cat-file", "-e", `${commit}:${goldenDirectory}/manifest.json`], spawn).status === 0;
+  const dataPaths = [...GCP_FASTPATH_SEED.migrationPaths, goldenDirectory];
+  const dataMatch = checkoutMatches(commit, dataPaths, spawn);
+  const missing = stages.filter((stage) => stage.status === "absent");
   const mismatched = stages.filter((stage) => stage.status === "checkout-mismatch");
   let decision = "run";
   let reason = null;
-  if (missingRequired.length > 0) {
+  if (missing.length > 0 || !goldenInCommit) {
     decision = "skip";
-    reason = `${missingRequired.map((stage) => `${stage.label} (${stage.path})`).join(", ")} absent at `
-      + `${commit.slice(0, 12)}; without destination identity the typed-legacy importer refuses every owner`;
-  } else if (mismatched.length > 0 || !migrationsMatch) {
+    reason = `${[...missing.map((stage) => `${stage.label} (${stage.path})`),
+      ...(goldenInCommit ? [] : [`golden (${goldenDirectory})`])].join(", ")} absent at `
+      + `${commit.slice(0, 12)}; the seed runs the local rehearsal's whole chain or nothing`;
+  } else if (mismatched.length > 0 || !dataMatch) {
     decision = "refuse";
     reason = `this checkout differs from ${commit.slice(0, 12)} in `
-      + `${[...mismatched.map((stage) => stage.path), ...(migrationsMatch ? [] : GCP_FASTPATH_SEED.migrationPaths)].join(", ")}`
+      + `${[...mismatched.map((stage) => stage.path), ...(dataMatch ? [] : dataPaths)].join(", ")}`
       + "; run the seed from a checkout of the deployed commit";
   }
   return Object.freeze({
-    commit, decision, reason,
-    stages: stages.map(({ name, label, path, status, required }) => ({ name, label, path, status, required })),
-    unseeded: UNSEEDED_IMPORTERS.map(({ label, reason: why }) => ({ label, reason: why })),
+    commit, decision, reason, golden: goldenDirectory,
+    stages: stages.map(({ name, label, path, status }) => ({ name, label, path, status })),
   });
 }
 
 export function seededSchemas(suffix) {
   if (!SUFFIX.test(suffix ?? "")) fail("GCP_FASTPATH_SEED_SUFFIX_INVALID", String(suffix));
-  return Object.freeze({
-    target: GCP_FASTPATH_SEED.targetPrefix + suffix,
-    control: GCP_FASTPATH_SEED.controlPrefix + suffix,
-  });
+  const target = GCP_FASTPATH_SEED.targetPrefix + suffix;
+  return Object.freeze({ suffix, target, control: GCP_FASTPATH_SEED.controlPrefix + suffix });
 }
 
-/** Deterministic per (commit, dump): a re-run finds the same schema. */
-export function defaultSuffix(commit, sqliteSha256) {
-  return `fp_${commit.slice(0, 8)}_${sqliteSha256.slice(0, 8)}`;
+/** Deterministic per (commit, golden dump): a re-run finds the same schema. */
+export function defaultSuffix(commit, dumpSha256) {
+  if (!COMMIT.test(commit ?? "") || !SHA256.test(dumpSha256 ?? "")) fail("GCP_FASTPATH_SEED_SUFFIX_INPUT_INVALID");
+  return createHash("sha256").update(`${commit}\n${dumpSha256}`).digest("hex").slice(0, 8);
+}
+
+export function seedMarker(commit, dumpSha256) {
+  return `${SEED_MARKER_VERSION} complete commit=${commit} dump=${dumpSha256}`;
 }
 
 async function sha256File(path) {
   return createHash("sha256").update(await readFile(path)).digest("hex");
 }
 
-async function ensureSchemas(pool, schemas) {
-  for (const schema of [schemas.target, schemas.control]) {
-    await pool.query(`CREATE SCHEMA IF NOT EXISTS "${schema}"`);
-    const owner = await pool.query("SELECT pg_get_userbyid(nspowner) AS owner FROM pg_namespace WHERE nspname=$1",
-      [schema]);
-    if (owner.rows[0]?.owner !== GCP_FASTPATH_CONNECTION.identities.migrator.iamUser) {
-      fail("GCP_FASTPATH_SEED_SCHEMA_OWNER_UNEXPECTED", schema);
-    }
-  }
-}
-
-async function completedTypedLegacyRun(pool, schemas, transferId) {
-  const table = await pool.query("SELECT to_regclass($1) AS relation",
-    [`"${schemas.control}"."_typed_legacy_transfer_rehearsal_runs_v1"`]);
-  if (table.rows[0]?.relation === null) return false;
-  const run = await pool.query(`SELECT status FROM "${schemas.control}"."_typed_legacy_transfer_rehearsal_runs_v1"
-    WHERE transfer_id=$1`, [transferId]);
-  return run.rows[0]?.status === "complete";
+/** The golden's manifest, dump path, dump digest and pinned clock (read-only). */
+export async function readSeedGolden(golden = GCP_FASTPATH_SEED.defaultGolden) {
+  const directory = join(REPOSITORY_ROOT, goldenPath(golden));
+  const manifest = JSON.parse(await readFile(join(directory, "manifest.json"), "utf8"));
+  const dumpPath = join(directory, "dump", "usage-monitor-db.json");
+  if (typeof manifest?.now !== "string" || !Array.isArray(manifest?.owners)) fail("GCP_FASTPATH_SEED_GOLDEN_INVALID");
+  return Object.freeze({ manifest, dumpPath, dumpSha256: await sha256File(dumpPath), nowIso: manifest.now });
 }
 
 async function loadStage(stage) {
@@ -171,17 +205,35 @@ async function loadStage(stage) {
   return module;
 }
 
+/** Load every stage and check its contract; returns the rehearsal loader module. */
+export async function loadSeedStages() {
+  const modules = new Map();
+  for (const stage of SEED_STAGES) modules.set(stage.name, await loadStage(stage));
+  return modules.get("rehearsal-loader");
+}
+
+async function schemaState(pool, schema) {
+  const result = await pool.query(`SELECT pg_get_userbyid(nspowner) AS owner,
+      obj_description(oid, 'pg_namespace') AS marker FROM pg_namespace WHERE nspname = $1`, [schema]);
+  return result.rows[0] ?? null;
+}
+
+async function ensureOwnedSchema(pool, schema, owner) {
+  await pool.query(`CREATE SCHEMA IF NOT EXISTS "${schema}"`);
+  const state = await schemaState(pool, schema);
+  if (owner !== null && state?.owner !== owner) fail("GCP_FASTPATH_SEED_SCHEMA_OWNER_UNEXPECTED", schema);
+}
+
 const READBACK_TABLES = Object.freeze([
-  "participants", "storage_v11_owner_links", "typed_telemetry_dictionary", "typed_telemetry_namespaces",
-  "typed_telemetry_owners", "typed_telemetry_owner_memberships", "typed_telemetry_devices",
-  "typed_telemetry_manifests", "typed_telemetry_chunks", "typed_telemetry_records", "typed_telemetry_usage",
-  "typed_telemetry_quota", "typed_telemetry_session_tools", "telemetry_v12_domains", "telemetry_v12_day_manifests",
-  "telemetry_v12_chunks",
+  "participants", "storage_v11_owner_links", "typed_telemetry_owners", "typed_telemetry_records",
+  "telemetry_v12_records", "telemetry_v12_day_manifests", "telemetry_v11_day_manifests", "telemetry_v1_chunks",
+  "storage_v12_event_sources", "storage_ingestion_changes", "community_public_source_owners",
+  "analytics_v2_published_daily",
 ]);
 
 /** Read-only counts as the runtime IAM user: proves its grants, not the migrator's. */
-export async function readBackAsRuntime(schema) {
-  const runtime = await createGcpFastpathPool({ as: "runtime", max: 1, applicationName: "tibotattle-fastpath-readback" });
+export async function readBackAsRuntime(schema, { createPool = createGcpFastpathPool } = {}) {
+  const runtime = await createPool({ as: "runtime", max: 1, applicationName: "tibotattle-fastpath-readback" });
   const client = await runtime.pool.connect();
   try {
     await client.query("BEGIN READ ONLY");
@@ -218,250 +270,108 @@ async function applyPrimaryMigrations(pool, schema) {
   return { applied: applied.applied, latest: applied.migrations.at(-1)?.name ?? null };
 }
 
+function verificationsEqual(verification) {
+  return verification !== null && typeof verification === "object"
+    && Object.values(verification).every((entry) => entry?.equal === true);
+}
+
 /**
- * Seed one rehearsal-target schema from a sealed SQLite dump. Returns a
- * receipt; `status` is "seeded", "already-seeded" or "skipped".
+ * Seed one fast-path rehearsal target from the golden through the local
+ * rehearsal's loader. Returns a receipt whose `status` is "seeded",
+ * "already-seeded" or "skipped". `dependencies` exists for the local PG17
+ * check: spawn (git), createPool for the migrator, expectedOwner (null skips
+ * the owner check), grantRuntime and readBack.
  */
 export async function runGcpFastpathSeed({
   commit: ref,
-  sqlitePath,
-  sqliteSha256,
+  golden = GCP_FASTPATH_SEED.defaultGolden,
   schemaSuffix,
+  replace = false,
   log = (line) => console.error(line),
+  dependencies = {},
 } = {}) {
-  const commit = resolveCommit(ref);
-  const plan = planSeed(commit);
+  const spawn = dependencies.spawn ?? spawnSync;
+  const commit = resolveCommit(ref, spawn);
+  const plan = planSeed(commit, { spawn, golden });
   if (plan.decision === "skip") {
     log(`# seed skipped: ${plan.reason}`);
     return Object.freeze({ step: "seed", status: "skipped", reason: plan.reason, plan });
   }
   if (plan.decision === "refuse") fail("GCP_FASTPATH_SEED_CHECKOUT_MISMATCH", plan.reason);
-  if (!SHA256.test(sqliteSha256 ?? "")) fail("GCP_FASTPATH_SEED_SQLITE_SHA256_REQUIRED");
-  const sqlite = await realpath(resolve(sqlitePath ?? ""));
-  if (await sha256File(sqlite) !== sqliteSha256) fail("GCP_FASTPATH_SEED_SQLITE_SHA256_MISMATCH");
-  const schemas = seededSchemas(schemaSuffix ?? defaultSuffix(commit, sqliteSha256));
-  const transferId = `gcp-fastpath-${schemas.target.slice(GCP_FASTPATH_SEED.targetPrefix.length)}`;
-  const modules = new Map();
-  for (const stage of SEED_STAGES) {
-    const planned = plan.stages.find(({ name }) => name === stage.name);
-    if (planned.status === "present") modules.set(stage.name, await loadStage(stage));
-    else log(`# seed stage skipped: ${stage.label} (${stage.path}) is absent at ${commit.slice(0, 12)}`);
-  }
-  for (const unseeded of plan.unseeded) log(`# seed stage not run: ${unseeded.label}: ${unseeded.reason}`);
-  const migrator = await createGcpFastpathPool({ as: "migrator", max: 4 });
-  const started = Date.now();
-  const stages = [];
-  let status = "seeded";
-  try {
-    await ensureSchemas(migrator.pool, schemas);
-    const migrations = await applyPrimaryMigrations(migrator.pool, schemas.target);
-    if (await completedTypedLegacyRun(migrator.pool, schemas, transferId)) {
-      status = "already-seeded";
-      log(`# seed: ${schemas.target} already holds a complete transfer ${transferId}; importers not re-run`);
-    } else {
-      const identity = modules.get("identity");
-      const identityReceipt = await identity.runPostgresFastpathIdentityCopy({
-        sqlitePath: sqlite, expectedSha256: sqliteSha256, destinationPool: migrator.pool, targetSchema: schemas.target,
-      });
-      stages.push({ name: "identity", receipt: identityReceipt });
-      const typed = modules.get("typed-legacy");
-      const typedSource = await typed.createSealedSqliteTypedLegacyRehearsalSource({ path: sqlite, expectedSha256: sqliteSha256 });
-      try {
-        const receipt = await typed.runPostgresTypedLegacyTransfer({ source: typedSource, destinationPool: migrator.pool,
-          targetSchema: schemas.target, controlSchema: schemas.control, transferId });
-        stages.push({ name: "typed-legacy", status: receipt.status, destinationManifestSha256: receipt.destination?.manifestSha256 });
-      } finally {
-        typedSource.close?.();
-      }
-      const v12 = modules.get("v12");
-      if (v12 !== undefined) {
-        const v12Source = await v12.createSealedSqliteV12RehearsalSource({ path: sqlite, expectedSha256: sqliteSha256 });
-        try {
-          const receipt = await v12.runPostgresV12Transfer({ source: v12Source, destinationPool: migrator.pool,
-            targetSchema: schemas.target, controlSchema: schemas.control, transferId: `${transferId}-v12` });
-          stages.push({ name: "v12", status: receipt?.status ?? null });
-        } finally {
-          v12Source.close?.();
-        }
-      }
-    }
-    await grantRuntime(migrator.pool, schemas.target);
-    const readback = await readBackAsRuntime(schemas.target);
-    return Object.freeze({ step: "seed", status, commit, schema: schemas.target, controlSchema: schemas.control,
-      transferId, sqliteSha256, migrations, stages, readback, plan, durationSeconds: (Date.now() - started) / 1000 });
-  } finally {
-    await migrator.close();
-  }
-}
-
-/** Synthetic, content-free sealed SQLite in the D1 source layout the typed-legacy importer reads. */
-async function syntheticSealedSqlite() {
-  const { DatabaseSync } = await import("node:sqlite");
-  const directory = await realpath(await mkdtemp(join(tmpdir(), "tibotattle-fastpath-proof-")));
-  const path = join(directory, "source.sqlite");
-  const linked = "synthetic-fastpath-linked-owner";
-  const linkless = "synthetic-fastpath-linkless-owner";
-  const ownerDigest = "c".repeat(64);
-  const day = 20_725;
-  const at = Date.UTC(2026, 8, 29, 12);
-  const byte = (value, size = 24) => Buffer.alloc(size, value);
-  const tables = {
-    typed_telemetry_dictionary: ["openai_codex", "model-x", "standard", "default-tier", "cli", "codex-billing",
-      "medium", "core", "success", "plus", "standard-variant", "five-hour", "primary", "shell"]
-      .map((value, index) => ({ id: index + 1, value })),
-    typed_telemetry_namespaces: [{ id: 100, original_id: byte(1) }],
-    typed_telemetry_owners: [{ id: 200, namespace_id: 100, original_id: byte(2) },
-      { id: 201, namespace_id: 100, original_id: byte(8) }],
-    typed_telemetry_devices: [{ id: 300, namespace_id: 100, owner_id: 200, original_id: byte(3) },
-      { id: 301, namespace_id: 100, owner_id: 200, original_id: byte(4) }],
-    typed_telemetry_manifests: [{ id: 401, namespace_id: 100, owner_id: 200, device_id: 301, original_id: byte(5), chunk_day: day }],
-    typed_telemetry_identifiers: [{ id: 600, namespace_id: 100, owner_id: 200, value: byte(6) },
-      { id: 601, namespace_id: 100, owner_id: 200, value: byte(7) }],
-    typed_telemetry_attributions: [{ id: 611, namespace_id: 100, owner_id: 200, account_basis: 0,
-      account_track: Buffer.alloc(0), plan_basis: 0, plan_type_id: 10, plan_era: Buffer.alloc(0) }],
-    typed_telemetry_quota_dimensions: [
-      { id: 602, namespace_id: 100, owner_id: 200, plan_type_id: 10, plan_variant_id: 11, attribution_id: null },
-      { id: 603, namespace_id: 100, owner_id: 200, plan_type_id: 10, plan_variant_id: 11, attribution_id: 611 }],
-    typed_telemetry_chunks: [
-      ...[101, 102, 103].map((id) => ({ id, namespace_id: 100, format: 10, owner_id: 200, device_id: 300,
-        manifest_id: null, original_id: byte(id), stream: id - 100, chunk_day: day })),
-      ...[[111, 2], [112, 3]].map(([id, stream]) => ({ id, namespace_id: 100, format: 11, owner_id: 200,
-        device_id: 301, manifest_id: 401, original_id: byte(id), stream, chunk_day: day }))],
-    typed_telemetry_records: [],
-    typed_telemetry_usage: [],
-    typed_telemetry_quota: [],
-    typed_telemetry_session_tools: [],
-  };
-  const record = (id, format, stream, chunkId, manifestId = null) => tables.typed_telemetry_records.push({
-    id, namespace_id: 100, format, source_row_id: id, owner_id: 200, device_id: format === 10 ? 300 : 301,
-    chunk_id: chunkId, manifest_id: manifestId, stream, occurrence_id: Buffer.from(`synthetic-occurrence-${id}`),
-    observed_at_ms: at, observed_day: day, provider_id: 1, canonical_digest: byte(id % 255, 32) });
-  for (let id = 1001; id <= 1004; id += 1) record(id, 10, 1, 101);
-  record(1101, 10, 2, 102);
-  record(1201, 10, 3, 103);
-  record(2001, 11, 2, 111, 401);
-  record(2002, 11, 3, 112, 401);
-  for (let id = 1001; id <= 1004; id += 1) {
-    tables.typed_telemetry_usage.push({ record_id: id, stream: 1, session_id: 600, model_id: 2, speed_mode_id: 3,
-      api_service_tier_id: 4, surface_id: 5, billing_surface_id: 6, reasoning_effort_id: 7, agent_scope_id: 8,
-      outcome_id: 9, attribution_id: null, total_input_context_tokens: 1000, input_uncached_tokens: 100,
-      input_cache_read_tokens: 900, input_cache_write_tokens: 0, output_text_tokens: 50,
-      output_reasoning_tokens: 25, output_combined_tokens: 75 });
-  }
-  for (const recordId of [1101, 2001]) {
-    tables.typed_telemetry_quota.push({ record_id: recordId, stream: 2, dimensions_id: recordId === 1101 ? 602 : 603,
-      limit_id: 12, slot_id: 13, used_percent: 75, window_duration_minutes: 300, resets_at_ms: at + 86_400_000 });
-  }
-  for (const recordId of [1201, 2002]) {
-    tables.typed_telemetry_session_tools.push({ record_id: recordId, stream: 3, tool_class_id: 14, count: 2 });
-  }
-  const db = new DatabaseSync(path);
-  const quoted = (name) => `"${name}"`;
-  try {
-    for (const [table, rows] of Object.entries(tables)) {
-      const columns = Object.keys(rows[0]);
-      db.exec(`CREATE TABLE ${quoted(table)} (${columns.map((name) => {
-        const sample = rows.find((row) => row[name] !== null)?.[name];
-        return `${quoted(name)} ${Buffer.isBuffer(sample) ? "BLOB" : typeof sample === "number" ? "INTEGER" : "TEXT"}`;
-      }).join(",")})`);
-      const insert = db.prepare(`INSERT INTO ${quoted(table)} (${columns.map(quoted).join(",")})
-        VALUES (${columns.map(() => "?").join(",")})`);
-      for (const row of rows) insert.run(...columns.map((column) => row[column]));
-    }
-    db.exec(`CREATE TABLE typed_v1_owner_memberships(typed_owner_id INTEGER, participant_id TEXT);
-      CREATE TABLE typed_v11_owner_memberships(typed_owner_id INTEGER, participant_id TEXT);
-      CREATE TABLE typed_v1_admission_state(id INTEGER, namespace_id INTEGER, source_namespace TEXT);
-      CREATE TABLE typed_v11_admission_state(id INTEGER, namespace_id INTEGER, source_namespace TEXT);
-      CREATE TABLE participants(id TEXT, state TEXT);
-      CREATE TABLE storage_v11_owner_links(participant_id TEXT, owner_digest TEXT, state TEXT);`);
-    db.prepare("INSERT INTO typed_v1_admission_state VALUES (1,100,?)").run("synthetic-fastpath-v1-source");
-    db.prepare("INSERT INTO typed_v11_admission_state VALUES (1,100,?)").run("synthetic-fastpath-v11-source");
-    db.prepare("INSERT INTO participants VALUES (?,'active')").run(linked);
-    db.prepare("INSERT INTO participants VALUES (?,'active')").run(linkless);
-    db.prepare("INSERT INTO storage_v11_owner_links VALUES (?,?,'active')").run(linked, ownerDigest);
-    db.prepare("INSERT INTO typed_v1_owner_memberships VALUES (200,?)").run(linked);
-    db.prepare("INSERT INTO typed_v11_owner_memberships VALUES (200,?)").run(linked);
-    db.prepare("INSERT INTO typed_v11_owner_memberships VALUES (201,?)").run(linkless);
-  } finally {
-    db.close();
-  }
-  await chmod(path, 0o400);
-  return { directory, path, sha256: await sha256File(path) };
-}
-
-/**
- * Prove the path end to end with today's code: migrate a rehearsal target in
- * the fast-path database, stand in for T-1 with the fixture's two synthetic
- * participants and one owner link (direct SQL, as the importer's PG spec
- * does), run the existing typed-legacy importer from a sealed SQLite, apply
- * runtime grants and read back as the runtime IAM user.
- */
-export async function proveGcpFastpathSeed({ log = (line) => console.error(line) } = {}) {
-  const fixture = await syntheticSealedSqlite();
-  // Deterministic per fixture: a re-run reuses the schema and skips a completed import.
-  const suffix = `fp_proof_${fixture.sha256.slice(0, 8)}`;
+  const { manifest, dumpPath, dumpSha256 } = await readSeedGolden(plan.golden);
+  const loader = await loadSeedStages();
+  const suffix = schemaSuffix ?? defaultSuffix(commit, dumpSha256);
   const schemas = seededSchemas(suffix);
-  const transferId = `gcp-fastpath-proof-${suffix}`;
-  const typed = await import("./postgres-typed-legacy-transfer.mjs");
-  const migrator = await createGcpFastpathPool({ as: "migrator", max: 4 });
+  const named = loader.fastpathRehearsalSchemas(suffix);
+  if (named.schema !== schemas.target || named.controlSchema !== schemas.control) {
+    fail("GCP_FASTPATH_SEED_STAGE_CONTRACT_MISMATCH", "schema naming differs from the rehearsal's");
+  }
+  const marker = seedMarker(commit, dumpSha256);
+  const createPool = dependencies.createPool ?? createGcpFastpathPool;
+  const migrator = await createPool({ as: "migrator", max: 4 });
+  const owner = dependencies.expectedOwner === undefined
+    ? GCP_FASTPATH_CONNECTION.identities.migrator.iamUser : dependencies.expectedOwner;
   const started = Date.now();
+  const timings = {};
+  let workDirectory = null;
+  let status = "seeded";
+  let steps = null;
   try {
-    await ensureSchemas(migrator.pool, schemas);
-    const migrationsStarted = Date.now();
+    const existing = await schemaState(migrator.pool, schemas.target);
+    if (existing !== null && existing.marker !== marker) {
+      if (!replace) {
+        fail("GCP_FASTPATH_SEED_PARTIAL_SCHEMA",
+          `${schemas.target} exists without this seed's completion marker; pass --replace or another --schema-suffix`);
+      }
+      // Exactly the two prefix-validated schemas this seed names, nothing else.
+      for (const schema of [schemas.target, schemas.control]) {
+        await migrator.pool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+      }
+      log(`# seed: dropped the partial ${schemas.target} and ${schemas.control} (--replace)`);
+    }
+    await ensureOwnedSchema(migrator.pool, schemas.target, owner);
+    await ensureOwnedSchema(migrator.pool, schemas.control, owner);
     const migrations = await applyPrimaryMigrations(migrator.pool, schemas.target);
-    const migrationSeconds = (Date.now() - migrationsStarted) / 1000;
-    log(`# proof: ${schemas.target} migrated (${migrations.applied}, ${migrations.latest}) in ${migrationSeconds}s`);
-    const alreadyComplete = await completedTypedLegacyRun(migrator.pool, schemas, transferId);
-    if (!alreadyComplete) {
-      const now = new Date().toISOString();
-      await migrator.pool.query(`INSERT INTO "${schemas.target}".participants(id, created_at) VALUES ($1,$3),($2,$3)
-        ON CONFLICT (id) DO NOTHING`, ["synthetic-fastpath-linked-owner", "synthetic-fastpath-linkless-owner", now]);
-      await migrator.pool.query(`INSERT INTO "${schemas.target}".storage_v11_owner_links(participant_id, owner_digest, state)
-        VALUES ($1,$2,'active') ON CONFLICT (participant_id) DO NOTHING`, ["synthetic-fastpath-linked-owner", "c".repeat(64)]);
+    if (existing !== null && existing.marker === marker) {
+      status = "already-seeded";
+      log(`# seed: ${schemas.target} already holds this commit's seed of this golden; importers not re-run`);
+    } else {
+      workDirectory = await realpath(await mkdtemp(join(tmpdir(), "gcp-fastpath-seed-")));
+      const sealed = await loader.sealFastpathRehearsalSource({ dumpPath, workDirectory });
+      steps = { sqlite: sealed.report, ...await loader.loadFastpathRehearsalImporters({
+        pool: migrator.pool, schema: schemas.target, controlSchema: schemas.control, suffix,
+        sealedSource: sealed.sealedSource, dumpPath, workDirectory, roster: manifest.owners, timings,
+      }) };
+      if (!verificationsEqual(steps.importVerification)) {
+        fail("GCP_FASTPATH_SEED_VERIFICATION_FAILED", JSON.stringify(steps.importVerification));
+      }
+      // The marker is written last: a schema without it is a partial seed.
+      await migrator.pool.query(`COMMENT ON SCHEMA "${schemas.target}" IS '${marker}'`);
     }
-    // The importer is idempotent per transfer id: a completed run re-verifies parity without rewriting.
-    const source = await typed.createSealedSqliteTypedLegacyRehearsalSource({
-      path: fixture.path, expectedSha256: fixture.sha256 });
-    let receipt;
-    const importStarted = Date.now();
-    try {
-      receipt = await typed.runPostgresTypedLegacyTransfer({ source, destinationPool: migrator.pool,
-        targetSchema: schemas.target, controlSchema: schemas.control, transferId, pageSize: 200 });
-    } finally {
-      source.close?.();
-    }
-    const importSeconds = (Date.now() - importStarted) / 1000;
-    log(`# proof: typed-legacy import ${receipt.status} in ${importSeconds}s (re-run: ${alreadyComplete})`);
-    await grantRuntime(migrator.pool, schemas.target);
-    const readback = await readBackAsRuntime(schemas.target);
-    return Object.freeze({
-      step: "prove", status: receipt.status, reRun: alreadyComplete, schema: schemas.target, controlSchema: schemas.control, transferId,
-      sqliteSha256: fixture.sha256, identity: "proof stand-in: 2 synthetic participants + 1 owner link by direct SQL",
-      migrations, migrationSeconds, importSeconds,
-      sourceRows: Object.fromEntries(Object.entries(receipt.source?.tables ?? {}).map(([name, table]) => [name, table.rows])),
-      sourceManifestSha256: receipt.source?.manifestSha256, destinationManifestSha256: receipt.destination?.manifestSha256,
-      stagingFamilyEvidence: receipt.stagingFamilyEvidence?.rowCount ?? null,
-      readback, durationSeconds: (Date.now() - started) / 1000,
-    });
+    await (dependencies.grantRuntime ?? grantRuntime)(migrator.pool, schemas.target);
+    const readback = await (dependencies.readBack ?? readBackAsRuntime)(schemas.target);
+    return Object.freeze({ step: "seed", status, commit, golden: plan.golden, dumpSha256,
+      schema: schemas.target, controlSchema: schemas.control, nowIso: manifest.now, migrations, steps,
+      timingsMs: timings, readback, plan, durationSeconds: (Date.now() - started) / 1000 });
   } finally {
+    if (workDirectory !== null) await rm(workDirectory, { recursive: true, force: true });
     await migrator.close();
-    await rm(fixture.directory, { recursive: true, force: true });
   }
 }
 
 function parseArgs(argv) {
   const [command, ...rest] = argv;
-  if (!["seed", "prove", "plan", "readback"].includes(command)) fail("GCP_FASTPATH_SEED_COMMAND_INVALID", String(command));
-  const options = { command, target: undefined };
+  if (!["seed", "plan", "readback"].includes(command)) fail("GCP_FASTPATH_SEED_COMMAND_INVALID", String(command));
+  const options = { command, target: undefined, replace: false };
   for (const argument of rest) {
+    if (argument === "--replace") { options.replace = true; continue; }
     const separator = argument.indexOf("=");
     const key = separator > 2 ? argument.slice(2, separator) : "";
     const value = separator > 2 ? argument.slice(separator + 1) : "";
     if (!argument.startsWith("--") || value.length === 0) fail("GCP_FASTPATH_SEED_ARGUMENT_INVALID", argument);
     if (key === "target") options.target = validateTarget(value);
     else if (key === "commit") options.commit = value;
-    else if (key === "sqlite") options.sqlitePath = value;
-    else if (key === "sqlite-sha256") options.sqliteSha256 = value;
+    else if (key === "golden") options.golden = value;
     else if (key === "schema-suffix") options.schemaSuffix = value;
     else if (key === "schema") options.schema = value;
     else fail("GCP_FASTPATH_SEED_ARGUMENT_INVALID", argument);
@@ -474,12 +384,14 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   try {
     const options = parseArgs(process.argv.slice(2));
     let result;
-    if (options.command === "plan") result = planSeed(resolveCommit(options.commit ?? "HEAD"));
-    else if (options.command === "prove") result = await proveGcpFastpathSeed();
-    else if (options.command === "readback") {
+    if (options.command === "plan") {
+      result = planSeed(resolveCommit(options.commit ?? "HEAD"), { golden: options.golden });
+    } else if (options.command === "readback") {
       if (!options.schema?.startsWith(GCP_FASTPATH_SEED.targetPrefix)) fail("GCP_FASTPATH_SEED_SCHEMA_INVALID");
       result = await readBackAsRuntime(seededSchemas(options.schema.slice(GCP_FASTPATH_SEED.targetPrefix.length)).target);
-    } else result = await runGcpFastpathSeed(options);
+    } else {
+      result = await runGcpFastpathSeed(options);
+    }
     console.log(JSON.stringify(result, null, 2));
   } catch (error) {
     console.error(JSON.stringify({ status: "error", code: error?.code ?? "GCP_FASTPATH_SEED_FAILED",

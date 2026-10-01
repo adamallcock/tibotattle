@@ -217,7 +217,7 @@ const JOURNAL_OBJECTS = Object.freeze(["storage_source_state", "storage_ingestio
  * STRICT). Project it from the same oracle dump with the dump's own DDL and
  * rows, seal it 0444 and return its digest.
  */
-async function buildJournalSqlite(dumpPath, outPath) {
+export async function buildJournalSqlite(dumpPath, outPath) {
   const dump = JSON.parse(await readFile(dumpPath, "utf8"));
   const database = new DatabaseSync(outPath);
   try {
@@ -244,6 +244,173 @@ async function buildJournalSqlite(dumpPath, outPath) {
   const sha256 = createHash("sha256").update(await readFile(outPath)).digest("hex");
   return { path: await realpath(outPath), sha256 };
 }
+
+/**
+ * The schema names one rehearsal target uses: the importers' shared
+ * fast-path target (typed_legacy_transfer_rehearsal_target_fastpath_<suffix>),
+ * its "_ledger" pair and the importers' control schema. `suffix` is 8
+ * lower-case hex digits, so "<schema>_ledger" stays a PostgreSQL identifier.
+ */
+export function fastpathRehearsalSchemas(suffix) {
+  if (typeof suffix !== "string" || !/^[0-9a-f]{8}$/u.test(suffix)) fail("REHEARSAL_SUFFIX_INVALID");
+  const schema = `${POSTGRES_FASTPATH_REHEARSAL_TARGET_SCHEMA_PREFIX}${suffix}`;
+  return Object.freeze({
+    suffix,
+    schema,
+    ledgerSchema: `${schema}_ledger`,
+    controlSchema: `${POSTGRES_TYPED_LEGACY_CONTROL_SCHEMA_PREFIX}ctl_${suffix}`,
+  });
+}
+
+/**
+ * Step 2: rebuild the oracle's USAGE_MONITOR_DB dump (`dumpPath`) into a
+ * sealed SQLite inside `workDirectory`. Returns the sealed source the
+ * importers open and the report fields.
+ */
+export async function sealFastpathRehearsalSource({ dumpPath, workDirectory }) {
+  const sealed = await rebuildOracleSqlite(dumpPath, join(workDirectory, "usage-monitor-db.sqlite"));
+  const report = {
+    sha256: sealed.sha256, bytes: sealed.bytes, integrityCheck: sealed.integrityCheck,
+    populatedTables: sealed.populatedTables, sealReady: sealed.sealReady,
+  };
+  if (!sealed.sealReady) fail("REHEARSAL_SQLITE_NOT_SEALED");
+  return { sealedSource: { path: sealed.path, expectedSha256: sealed.sha256 }, report };
+}
+
+/**
+ * Step 3: the importer chain, in the plan's order, into ONE migrated
+ * fast-path rehearsal target schema: T-1 identity/authority copy, the
+ * typed-legacy transfer, T-1's legacy-transport copy, T-2 v1.2, T-1's v1.2
+ * event-source copy, the usage-correction transfer and the ingestion-journal
+ * transfer (from a journal-only SQLite projected from the same dump), then
+ * the read-only T-1 verifications and per-table row counts.
+ *
+ * The local rehearsal and the GCP seed (gcp-fastpath-seed.mjs) both call
+ * this, so refresh and origin read the same imported data in either place.
+ * `pool` is any pg-compatible pool that may write `schema` and
+ * `controlSchema`; `timings` collects per-importer wall times. Every source
+ * it opens is closed before it returns.
+ */
+export async function loadFastpathRehearsalImporters({
+  pool, schema, controlSchema, suffix, sealedSource, dumpPath, workDirectory, roster, timings = {},
+}) {
+  if (typeof schema !== "string" || !schema.startsWith(POSTGRES_FASTPATH_REHEARSAL_TARGET_SCHEMA_PREFIX)) {
+    fail("REHEARSAL_TARGET_SCHEMA_INVALID");
+  }
+  const steps = {};
+  const sources = [];
+  try {
+    const identitySource = await openSealedFastpathIdentitySource(sealedSource);
+    sources.push(identitySource);
+    steps.identityCopy = await timed(timings, "importer:t1-identity", async () => {
+      const receipt = await runPostgresFastpathIdentityCopy({
+        source: identitySource, pool, targetSchema: schema, publicSourceOwnerParity: "defer",
+      });
+      return {
+        status: receipt.status,
+        tables: Object.keys(receipt.tables).length,
+        rows: Object.values(receipt.tables).reduce((sum, table) => sum + table.targetRows, 0),
+        publicSourceOwners: receipt.publicSourceOwners,
+        foreignKeysChecked: receipt.foreignKeysChecked,
+      };
+    });
+
+    const typedLegacySource = await createSealedSqliteTypedLegacyRehearsalSource(sealedSource);
+    sources.push(typedLegacySource);
+    steps.typedLegacy = await timed(timings, "importer:typed-legacy", async () => {
+      const receipt = await runPostgresTypedLegacyTransfer({
+        source: typedLegacySource, destinationPool: pool, targetSchema: schema, controlSchema,
+        transferId: `fastpath-rehearsal-typed-legacy-${suffix}`,
+      });
+      return { status: receipt.status, tables: receipt.tables ? Object.keys(receipt.tables).length : null,
+        rows: receipt.rowCount ?? receipt.rows ?? null };
+    });
+
+    // No importer in the plan's chain writes the v1/v1.1 transport and
+    // admission tables the occurrence adapter joins, so the rehearsal copies
+    // them (and, after T-2, the v1.2 event sources) with T-1's engine.
+    const transportReceipt = (receipt) => ({
+      status: receipt.status,
+      part: receipt.part,
+      rows: Object.fromEntries(Object.entries(receipt.tables).map(([name, table]) => [name, table.targetRows])),
+      foreignKeysChecked: receipt.foreignKeysChecked,
+    });
+    steps.legacyTransport = await timed(timings, "importer:legacy-transport", async () =>
+      transportReceipt(await runPostgresFastpathTransportCopy({
+        source: identitySource, pool, targetSchema: schema, part: "legacy-transport",
+      })));
+
+    const v12Source = await createSealedSqliteV12RehearsalSource(sealedSource);
+    sources.push(v12Source);
+    steps.v12 = await timed(timings, "importer:t2-v12", async () => {
+      const effectiveReader = await loadPostgresV12EffectiveReader({ workerRoot: WORKER_ROOT });
+      try {
+        const receipt = await runPostgresV12Transfer({
+          source: v12Source, destinationPool: pool, targetSchema: schema, controlSchema,
+          transferId: `fastpath-rehearsal-v12-${suffix}`, effectiveReader,
+        });
+        return { status: receipt.status, effective: receipt.effective ?? null,
+          sourceSha256Equal: receipt.source?.sha256 === receipt.target?.sha256 || null };
+      } finally {
+        await effectiveReader.close?.();
+      }
+    });
+
+    steps.v12EventSources = await timed(timings, "importer:v12-event-sources", async () =>
+      transportReceipt(await runPostgresFastpathTransportCopy({
+        source: identitySource, pool, targetSchema: schema, part: "v12-event-sources",
+      })));
+
+    const correctionSource = await createSealedSqliteUsageCorrectionSource(sealedSource);
+    sources.push(correctionSource);
+    steps.usageCorrection = await timed(timings, "importer:usage-correction", async () => {
+      const receipt = await runPostgresUsageCorrectionTransfer({
+        source: correctionSource, destinationPool: pool, targetSchema: schema,
+        transferId: `fastpath-rehearsal-correction-${suffix}`,
+      });
+      return { status: receipt.status, rows: receipt.rows ?? receipt.tables ?? null };
+    });
+
+    const sourceId = identitySource.database()
+      .prepare("SELECT source_id FROM storage_source_state WHERE singleton = 1").get()?.source_id;
+    const journalSealed = await timed(timings, "sqlite:journal", async () =>
+      buildJournalSqlite(dumpPath, join(workDirectory, "storage-ingestion-journal.sqlite")));
+    steps.journalSqlite = { sha256: journalSealed.sha256 };
+    const journalSource = await createSealedSqliteIngestionJournalSource({
+      path: journalSealed.path, expectedSha256: journalSealed.sha256, expectedSourceId: sourceId,
+    });
+    sources.push(journalSource);
+    steps.ingestionJournal = await timed(timings, "importer:ingestion-journal", async () => {
+      const receipt = await transferPostgresIngestionJournal({
+        source: journalSource, destinationPool: pool, targetSchema: schema,
+        transferId: `synthetic-ingestion-journal-fastpath-${suffix}`,
+      });
+      return { status: receipt.status, rows: receipt.rowCount ?? receipt.rows ?? null,
+        lastSequence: receipt.lastSequence ?? null };
+    });
+
+    steps.importVerification = await timed(timings, "importer:verify", async () => ({
+      ownerRoster: await compareFastpathOwnerRoster({ pool, targetSchema: schema, roster }),
+      publicSourceOwners: await compareFastpathPublicSourceOwners({ source: identitySource, pool, targetSchema: schema }),
+      ownerRevisions: await compareFastpathOwnerRevisions({ source: identitySource, pool, targetSchema: schema }),
+    }));
+    steps.importedRows = await tableCounts(pool, schema, FASTPATH_REHEARSAL_COUNTED_TABLES);
+    return steps;
+  } finally {
+    for (const source of sources) {
+      try { source.close?.(); } catch { /* already closed */ }
+    }
+  }
+}
+
+/** The imported tables both the rehearsal and the GCP seed count. */
+export const FASTPATH_REHEARSAL_COUNTED_TABLES = Object.freeze([
+  "participants", "storage_v11_owner_links", "typed_telemetry_records", "telemetry_v12_records",
+  "telemetry_v12_day_manifests", "telemetry_v1_chunks", "telemetry_v11_chunks", "telemetry_v11_day_manifests",
+  "telemetry_v11_domain_days", "typed_v11_record_proofs", "typed_v1_record_admissions",
+  "storage_v11_event_sources", "typed_v1_event_sources", "storage_v12_event_sources", "storage_ingestion_changes",
+  "telemetry_usage_correction_facts",
+]);
 
 async function publishedSnapshot(pool, schema) {
   const result = await pool.query(`SELECT to_char(day,'YYYY-MM-DD') AS day, revision, payload_sha256,
@@ -429,10 +596,7 @@ async function main() {
     ...(process.env.PG_TEST_USER ? { PG_TEST_USER: process.env.PG_TEST_USER } : {}),
     ...(process.env.PG_TEST_DATABASE ? { PG_TEST_DATABASE: process.env.PG_TEST_DATABASE } : {}),
   };
-  const suffix = randomBytes(4).toString("hex");
-  const schema = `${POSTGRES_FASTPATH_REHEARSAL_TARGET_SCHEMA_PREFIX}${suffix}`;
-  const ledgerSchema = `${schema}_ledger`;
-  const controlSchema = `${POSTGRES_TYPED_LEGACY_CONTROL_SCHEMA_PREFIX}ctl_${suffix}`;
+  const { suffix, schema, ledgerSchema, controlSchema } = fastpathRehearsalSchemas(randomBytes(4).toString("hex"));
   const created = [];
   const timings = {};
   const report = {
@@ -449,7 +613,6 @@ async function main() {
   pool.on("error", () => {});
   let origin = null;
   let workDirectory = null;
-  const sources = [];
   try {
     const version = await pool.query("SELECT current_setting('server_version_num')::integer AS version");
     if (Math.floor(version.rows[0].version / 10_000) !== 17) fail("REHEARSAL_POSTGRES_17_REQUIRED");
@@ -472,117 +635,14 @@ async function main() {
 
     // 2. The sealed SQLite rebuild of the oracle's USAGE_MONITOR_DB dump.
     workDirectory = await realpath(await mkdtemp(join(tmpdir(), "gcp-fastpath-rehearsal-")));
-    const sqlitePath = join(workDirectory, "usage-monitor-db.sqlite");
-    const sealed = await timed(timings, "sqlite", async () => rebuildOracleSqlite(dumpPath, sqlitePath));
-    report.steps.sqlite = {
-      sha256: sealed.sha256, bytes: sealed.bytes, integrityCheck: sealed.integrityCheck,
-      populatedTables: sealed.populatedTables, sealReady: sealed.sealReady,
-    };
-    if (!sealed.sealReady) fail("REHEARSAL_SQLITE_NOT_SEALED");
-    const sealedSource = { path: sealed.path, expectedSha256: sealed.sha256 };
+    const sealed = await timed(timings, "sqlite", async () => sealFastpathRehearsalSource({ dumpPath, workDirectory }));
+    report.steps.sqlite = sealed.report;
 
-    // 3. Importers, in the plan's order.
-    const identitySource = await openSealedFastpathIdentitySource(sealedSource);
-    sources.push(identitySource);
-    report.steps.identityCopy = await timed(timings, "importer:t1-identity", async () => {
-      const receipt = await runPostgresFastpathIdentityCopy({
-        source: identitySource, pool, targetSchema: schema, publicSourceOwnerParity: "defer",
-      });
-      return {
-        status: receipt.status,
-        tables: Object.keys(receipt.tables).length,
-        rows: Object.values(receipt.tables).reduce((sum, table) => sum + table.targetRows, 0),
-        publicSourceOwners: receipt.publicSourceOwners,
-        foreignKeysChecked: receipt.foreignKeysChecked,
-      };
-    });
-
-    const typedLegacySource = await createSealedSqliteTypedLegacyRehearsalSource(sealedSource);
-    sources.push(typedLegacySource);
-    report.steps.typedLegacy = await timed(timings, "importer:typed-legacy", async () => {
-      const receipt = await runPostgresTypedLegacyTransfer({
-        source: typedLegacySource, destinationPool: pool, targetSchema: schema, controlSchema,
-        transferId: `fastpath-rehearsal-typed-legacy-${suffix}`,
-      });
-      return { status: receipt.status, tables: receipt.tables ? Object.keys(receipt.tables).length : null,
-        rows: receipt.rowCount ?? receipt.rows ?? null };
-    });
-
-    // No importer in the plan's chain writes the v1/v1.1 transport and
-    // admission tables the occurrence adapter joins, so the rehearsal copies
-    // them (and, after T-2, the v1.2 event sources) with T-1's engine.
-    const transportReceipt = (receipt) => ({
-      status: receipt.status,
-      part: receipt.part,
-      rows: Object.fromEntries(Object.entries(receipt.tables).map(([name, table]) => [name, table.targetRows])),
-      foreignKeysChecked: receipt.foreignKeysChecked,
-    });
-    report.steps.legacyTransport = await timed(timings, "importer:legacy-transport", async () =>
-      transportReceipt(await runPostgresFastpathTransportCopy({
-        source: identitySource, pool, targetSchema: schema, part: "legacy-transport",
-      })));
-
-    const v12Source = await createSealedSqliteV12RehearsalSource(sealedSource);
-    sources.push(v12Source);
-    report.steps.v12 = await timed(timings, "importer:t2-v12", async () => {
-      const effectiveReader = await loadPostgresV12EffectiveReader({ workerRoot: WORKER_ROOT });
-      try {
-        const receipt = await runPostgresV12Transfer({
-          source: v12Source, destinationPool: pool, targetSchema: schema, controlSchema,
-          transferId: `fastpath-rehearsal-v12-${suffix}`, effectiveReader,
-        });
-        return { status: receipt.status, effective: receipt.effective ?? null,
-          sourceSha256Equal: receipt.source?.sha256 === receipt.target?.sha256 || null };
-      } finally {
-        await effectiveReader.close?.();
-      }
-    });
-
-    report.steps.v12EventSources = await timed(timings, "importer:v12-event-sources", async () =>
-      transportReceipt(await runPostgresFastpathTransportCopy({
-        source: identitySource, pool, targetSchema: schema, part: "v12-event-sources",
-      })));
-
-    const correctionSource = await createSealedSqliteUsageCorrectionSource(sealedSource);
-    sources.push(correctionSource);
-    report.steps.usageCorrection = await timed(timings, "importer:usage-correction", async () => {
-      const receipt = await runPostgresUsageCorrectionTransfer({
-        source: correctionSource, destinationPool: pool, targetSchema: schema,
-        transferId: `fastpath-rehearsal-correction-${suffix}`,
-      });
-      return { status: receipt.status, rows: receipt.rows ?? receipt.tables ?? null };
-    });
-
-    const sourceId = identitySource.database()
-      .prepare("SELECT source_id FROM storage_source_state WHERE singleton = 1").get()?.source_id;
-    const journalSealed = await timed(timings, "sqlite:journal", async () =>
-      buildJournalSqlite(dumpPath, join(workDirectory, "storage-ingestion-journal.sqlite")));
-    report.steps.journalSqlite = { sha256: journalSealed.sha256 };
-    const journalSource = await createSealedSqliteIngestionJournalSource({
-      path: journalSealed.path, expectedSha256: journalSealed.sha256, expectedSourceId: sourceId,
-    });
-    sources.push(journalSource);
-    report.steps.ingestionJournal = await timed(timings, "importer:ingestion-journal", async () => {
-      const receipt = await transferPostgresIngestionJournal({
-        source: journalSource, destinationPool: pool, targetSchema: schema,
-        transferId: `synthetic-ingestion-journal-fastpath-${suffix}`,
-      });
-      return { status: receipt.status, rows: receipt.rowCount ?? receipt.rows ?? null,
-        lastSequence: receipt.lastSequence ?? null };
-    });
-
-    report.steps.importVerification = await timed(timings, "importer:verify", async () => ({
-      ownerRoster: await compareFastpathOwnerRoster({ pool, targetSchema: schema, roster: manifest.owners }),
-      publicSourceOwners: await compareFastpathPublicSourceOwners({ source: identitySource, pool, targetSchema: schema }),
-      ownerRevisions: await compareFastpathOwnerRevisions({ source: identitySource, pool, targetSchema: schema }),
+    // 3. Importers, in the plan's order (shared with the GCP seed).
+    Object.assign(report.steps, await loadFastpathRehearsalImporters({
+      pool, schema, controlSchema, suffix, sealedSource: sealed.sealedSource, dumpPath, workDirectory,
+      roster: manifest.owners, timings,
     }));
-    report.steps.importedRows = await tableCounts(pool, schema, [
-      "participants", "storage_v11_owner_links", "typed_telemetry_records", "telemetry_v12_records",
-      "telemetry_v12_day_manifests", "telemetry_v1_chunks", "telemetry_v11_chunks", "telemetry_v11_day_manifests",
-      "telemetry_v11_domain_days", "typed_v11_record_proofs", "typed_v1_record_admissions",
-      "storage_v11_event_sources", "typed_v1_event_sources", "storage_v12_event_sources", "storage_ingestion_changes",
-      "telemetry_usage_correction_facts",
-    ]);
 
     // 4. analytics-refresh (dist, Node 22) at the golden's clock.
     const first = await runRefresh({ node22: options.node22, endpointEnv, schema, nowIso });
@@ -653,9 +713,6 @@ async function main() {
   } finally {
     if (origin !== null) {
       report.originExit = await origin.close().catch(() => null);
-    }
-    for (const source of sources) {
-      try { source.close?.(); } catch { /* already closed */ }
     }
     if (workDirectory !== null) await rm(workDirectory, { recursive: true, force: true });
     if (!options.keepSchema) {
