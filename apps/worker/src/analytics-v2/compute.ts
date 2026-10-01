@@ -18,23 +18,41 @@
  *   occurrences were not supplied, every queued day is blocked. A legacy-only
  *   (v0.2) owner is not a daily cohort member and blocks nothing.
  * - A kernel refusal (SharedAnalyticsUnavailable, including the checkedRows
- *   source_conflict_or_order throw for conflict rows) is recorded per owner,
- *   day and family. There is no dense or native fallback.
+ *   source_conflict_or_order throw for conflict rows, and the cache reducer's
+ *   CacheRetentionRefusedError group/session bounds) is recorded per owner,
+ *   day and family, and the run carries on. There is no dense or native
+ *   fallback. Any other kernel error is a defect and fails the run.
  * - A refused owner-day blocks that queued community day; the day keeps its
  *   prior published revision (A-3). A refused scalar fit removes the owner
- *   from the fit cohort and the preview's participant list; a refused model
- *   date removes the owner from that date's composition. A model date with no
- *   evaluated owner is withheld. Refused evidence is never counted as zero.
+ *   from the fit cohort and the preview's participant list. A refused model
+ *   date keeps the owner out of that date's composition and counts it as a
+ *   refused participant (v1ParticipantCount and refusedParticipantCount), so
+ *   the published day states the cohort it could not evaluate. A model date
+ *   with no evaluated owner is withheld. Refused evidence is never counted as
+ *   zero. (d43c8f92's storage publication instead withholds the model day and
+ *   the preview until every member has a result; that is a known divergence.)
  *
  * Input contract (validated, fail closed):
- * - `occurrenceRange` is the inclusive day range A-1 read for EVERY owner. It
- *   must cover analyticsV2RequiredOccurrenceRange(...). Every effective owner
- *   must have an entry in `occurrencesByOwner` (an empty map when it has no
- *   evidence); a day absent from an owner's map means that owner had no
- *   occurrences that day. Occurrence days outside the range are rejected.
- * - Owner-day rows, windows and cache bands cover the run horizon only: the
- *   170 analysis days, the cache days (from cacheFromDay) with their 7-day
- *   lookback, and the queued days. Evidence elsewhere in the range is unused.
+ * - The run uses exactly these days, its horizon: the 170 analysis days
+ *   [today-169, today], [cacheFromDay-7, today] for the cache days and their
+ *   7-day lookback, and the queued days. Nothing after today enters a window
+ *   or a cache band, and evidence outside the horizon is unused, so outputs
+ *   depend only on the evidence, nowMs, the queue and cacheFromDay, never on
+ *   how widely A-1 read.
+ * - The caller must have read every horizon day for EVERY effective owner.
+ *   `occurrenceRange`, when given, is the inclusive range it read and must
+ *   cover analyticsV2RequiredOccurrenceRange(...); when omitted, the read is
+ *   taken to be exactly that required range (A-3 reads the analysis horizon
+ *   plus every queued day, which is every horizon day under the default
+ *   cacheFromDay). Occurrence days outside the range are rejected. Every
+ *   effective owner must have an entry in `occurrencesByOwner` (an empty map
+ *   when it has no evidence); a day absent from an owner's map means that
+ *   owner had no occurrences that day.
+ * - Cache bands start at cacheFromDay, by default today-162: the first day
+ *   whose 7-day lookback lies inside the analysis horizon. Production's
+ *   cacheRetention 'all' window has no lower bound, so reproducing it needs
+ *   cacheFromDay at the first evidence day (or production's
+ *   CACHE_RETENTION_FROM_DAY) and a read from 7 days before it.
  * - `devicesByDay` holds A-1's contributing-device counts for each queued day
  *   that has a contributing owner. Within a counted day, an owner without a
  *   count takes production's floor of one device (countStorageDaily-
@@ -145,8 +163,13 @@ export type AnalyticsV2QueuedDaysInput =
 export interface ComputeAnalyticsV2Input {
   readonly owners: readonly AnalyticsV2Owner[];
   readonly occurrencesByOwner: ReadonlyMap<AnalyticsV2OwnerDigest, ReadonlyMap<AnalyticsV2Day, AnalyticsV2DayOccurrences>>;
-  /** The inclusive day range the occurrences were read over, for every owner. */
-  readonly occurrenceRange: AnalyticsV2DayRange;
+  /**
+   * The inclusive day range the occurrences were read over, for every owner.
+   * Optional: when omitted it is analyticsV2RequiredOccurrenceRange(...) of
+   * this input, and the caller is responsible for having read every horizon
+   * day (see the module comment).
+   */
+  readonly occurrenceRange?: AnalyticsV2DayRange;
   /** day -> ownerDigest -> contributing devices (A-1 countContributingDevices). */
   readonly devicesByDay: ReadonlyMap<AnalyticsV2Day, ReadonlyMap<AnalyticsV2OwnerDigest, number>>;
   readonly queuedDays: AnalyticsV2QueuedDaysInput;
@@ -199,9 +222,11 @@ function defaultCacheFromDay(today: AnalyticsV2Day): AnalyticsV2Day {
 }
 
 /**
- * The smallest occurrence range one run needs: the analysis horizon
- * [today-169, today], the cache lookback before cacheFromDay, and every queued
- * day. A-3 reads at least this range for every owner.
+ * The smallest single occurrence range covering one run's horizon: the
+ * analysis horizon [today-169, today], the cache lookback before cacheFromDay,
+ * and every queued day. The run uses only the horizon days inside it (see the
+ * module comment), so a caller may read just those days, as A-3 does with
+ * disjoint ranges, and still pass or default to this covering range.
  */
 export function analyticsV2RequiredOccurrenceRange(input: {
   nowMs: number; queuedDays: AnalyticsV2QueuedDaysInput; cacheFromDay?: AnalyticsV2Day;
@@ -325,7 +350,7 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
   const queued = [...new Set(queuedInput)].sort();
   const cacheFromDay = input.cacheFromDay ?? defaultCacheFromDay(today);
   const required = analyticsV2RequiredOccurrenceRange({ nowMs, queuedDays: queued, cacheFromDay });
-  const range = input.occurrenceRange;
+  const range = input.occurrenceRange === undefined ? required : input.occurrenceRange;
   if (!range || typeof range !== "object") invalid("occurrenceRange");
   dayStart(range.fromDay, "occurrenceRange"); dayStart(range.throughDay, "occurrenceRange");
   if (range.fromDay > required.fromDay || range.throughDay < required.throughDay) invalid("occurrenceRange");
@@ -351,7 +376,9 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
 
   const analysisDays = daysBetween(addDays(today, -(ANALYTICS_V2_ANALYSIS_DAYS - 1)), today);
   const modelDates = analysisDays.slice(-ANALYTICS_V2_MODEL_DATES);
-  const cacheDays = daysBetween(cacheFromDay, range.throughDay);
+  // Cache days end today: a day after today is never a cache band, whatever
+  // the read range happened to include.
+  const cacheDays = daysBetween(cacheFromDay, today);
   const queuedSet = new Set(queued);
   const refusals: AnalyticsV2Refusal[] = [];
   const ownerDays: AnalyticsV2OwnerDayRow[] = [];
@@ -365,6 +392,8 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
   const fitsByOwner = new Map<AnalyticsV2OwnerDigest, readonly CommunityAllowanceFit[]>();
   const compositionsByDate = new Map<AnalyticsV2Day, Array<{ ownerDigest: string; result: V1ModelCompositionResult }>>(
     modelDates.map((day) => [day, []]));
+  /** model date -> effective owners whose evaluation the kernels refused. */
+  const modelRefusedByDate = new Map<AnalyticsV2Day, number>(modelDates.map((day) => [day, 0]));
   const effectiveOwners: AnalyticsV2Owner[] = [];
 
   for (const owner of owners) {
@@ -392,7 +421,7 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
     // run's horizon, so the outputs depend only on nowMs, the queue and
     // cacheFromDay, never on how widely A-1 happened to read.
     const needed = new Set<AnalyticsV2Day>([...analysisDays, ...daysBetween(addDays(cacheFromDay, -CACHE_LOOKBACK_DAYS),
-      range.throughDay), ...queued]);
+      today), ...queued]);
     const prepared = new Map<AnalyticsV2Day, SharedAnalyticsDay>();
     const dayDigests = new Map<AnalyticsV2Day, string>();
     await timed("prepare", async () => {
@@ -448,6 +477,7 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
           const reason = kernelRefusalReason(error);
           if (reason === null) throw error;
           refusals.push(analyticsV2Refusal(ownerDigest, day, "model", reason));
+          modelRefusedByDate.set(day, modelRefusedByDate.get(day)! + 1);
         }
       }
     });
@@ -504,8 +534,11 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
     for (const day of modelDates) {
       const evaluated = compositionsByDate.get(day)!;
       if (evaluated.length === 0) continue;
-      const collection: CachedCommunityModelCompositions = { compositions: [], v1ParticipantCount: 0,
-        unsupportedSourceParticipantCount: 0, refusedParticipantCount: 0, storeAvailable: true };
+      // An effective owner the kernels refused for this date is still a
+      // member of its cohort: it is counted as refused, never dropped.
+      const refused = modelRefusedByDate.get(day)!;
+      const collection: CachedCommunityModelCompositions = { compositions: [], v1ParticipantCount: refused,
+        unsupportedSourceParticipantCount: 0, refusedParticipantCount: refused, storeAvailable: true };
       for (const { ownerDigest, result } of evaluated) {
         collection.v1ParticipantCount++;
         if (result.status === "ready") collection.compositions.push({ participantId: ownerDigest, composition: result });

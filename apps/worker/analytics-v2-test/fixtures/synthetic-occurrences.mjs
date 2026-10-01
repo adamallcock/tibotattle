@@ -5,8 +5,9 @@
 // `composeProofCorpus()` reproduces analytics-v2-test/compose-proof.spec.ts
 // byte for byte (3 owners, 7 active days in a 170-day calendar). The other
 // builders add the owners the refusal cases need: a dense owner whose scalar
-// window exceeds the kernels' 120,000 usage-row bound, an owner with a
-// conflicting occurrence on two candidate days, and non-effective owners.
+// window exceeds the kernels' 120,000 usage-row bound, an owner whose day
+// exceeds the cache reducer's 512-group bound, an owner with a conflicting
+// occurrence on two candidate days, and non-effective owners.
 //
 // Records are canonicalized with the d43c8f92 telemetry-contract vendored
 // beside the kernels, so the fixture is plain JavaScript and loads in Node.
@@ -137,6 +138,32 @@ export function denseFacts(owner, { firstDenseBack = 100, denseDays = 7, usagePe
     const q = Array.from({ length: 9 }, (_, i) => quota(owner, ++k, start + i * 3_600_000, 5 + i * 10, start + 8 * DAY_MS));
     byDay.set(label(start), { usage: u, quota: q, session: [session(owner, start + 500)] });
   }
+  return byDay;
+}
+
+/**
+ * The compose pattern plus one day on which the owner's session switches
+ * model `models` times, two requests per model 10 seconds apart, so the day
+ * holds `models` distinct (model, effort) cache groups. The d43c8f92 cache
+ * reducer bounds one owner-day at 512 groups (CACHE_RETENTION_GROUP_LIMIT)
+ * and refuses the day above it. Model ids are synthetic tokens.
+ */
+export function manyModelFacts(owner, day, models) {
+  const byDay = composeFacts(owner);
+  if (byDay.has(day)) throw new Error("many-model day overlaps an active day");
+  const start = dayMs(day) + 3_600_000;
+  const rows = [];
+  let k = 20_000_000;
+  for (let model = 0; model < models; model++) {
+    for (let request = 0; request < 2; request++) {
+      const at = start + (model * 2 + request) * 10_000;
+      const record = usageRecord(label(at), { eventId: id("event", owner.n, ++k), eventTime: stamp(at),
+        sessionUuid: `synthetic-session-${owner.n}`, modelId: `synthetic-model-${model}`,
+        accountPlanAttribution: attribution(owner) });
+      rows.push(occurrence(owner, "usage", at, record.eventId, record));
+    }
+  }
+  byDay.set(day, { usage: rows, quota: [], session: [] });
   return byDay;
 }
 

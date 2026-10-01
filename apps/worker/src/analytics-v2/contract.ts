@@ -25,7 +25,7 @@ import type { PostgresPool } from "../postgres-client";
 import type { WorkerRouteMethod } from "../route-registry";
 
 /** Version of this contract; bump with any name or shape change. */
-export const ANALYTICS_V2_CONTRACT_VERSION = "analytics-v2-contract-v0.1" as const;
+export const ANALYTICS_V2_CONTRACT_VERSION = "analytics-v2-contract-v0.2" as const;
 
 /**
  * The analytics_v2 migration: primary role, runtime schema, number assigned in
@@ -166,9 +166,10 @@ export const ANALYTICS_V2_REFUSAL_FAMILIES = Object.freeze(["owner", "daily", "s
 export type AnalyticsV2RefusalFamily = (typeof ANALYTICS_V2_REFUSAL_FAMILIES)[number];
 
 /**
- * Closed refusal reasons: the fast-path's own reasons plus every
- * SharedAnalyticsUnavailable reason the d43c8f92 kernels raise. A new reason
- * is a contract change through the lead, never a free-form string.
+ * Closed refusal reasons: the fast-path's own reasons, every
+ * SharedAnalyticsUnavailable reason the d43c8f92 kernels raise, and the
+ * CacheRetentionRefusedError reasons evaluateSharedCacheDay can raise. A new
+ * reason is a contract change through the lead, never a free-form string.
  */
 export const ANALYTICS_V2_REFUSAL_REASONS = Object.freeze([
   // Fast-path routing and scope (tonight: no dense or non-effective port).
@@ -193,6 +194,12 @@ export const ANALYTICS_V2_REFUSAL_REASONS = Object.freeze([
   "owner_mismatch",
   "incomplete_cache_day",
   "incomplete_cache_lookback",
+  // d43c8f92 cache-retention-values.ts reduceCacheRetentionDay refusals
+  // (CacheRetentionRefusedError). Production records both per owner-day as
+  // refusal marks (CACHE_RETENTION_RECORDED_REFUSALS) and continues. A-2
+  // emits them in the "cache" family only.
+  "group_limit_exceeded",
+  "session_limit_exceeded",
 ] as const);
 export type AnalyticsV2RefusalReason = (typeof ANALYTICS_V2_REFUSAL_REASONS)[number];
 

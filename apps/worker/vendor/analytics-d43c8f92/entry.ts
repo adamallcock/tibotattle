@@ -84,6 +84,7 @@ export {
   CACHE_RETENTION_PUBLIC_MODEL_LIMIT,
   CACHE_RETENTION_PUBLIC_SCHEMA_VERSION,
   CACHE_RETENTION_WINDOWS,
+  CacheRetentionRefusedError,
   mergeCacheRetentionBands,
   publicCacheRetentionCurve,
   publicCacheRetentionWindow,

@@ -44,6 +44,7 @@ import {
   effectiveV2Owner,
   label,
   legacyOnlyV2Owner,
+  manyModelFacts,
   NOW_MS,
   oneDevicePerOwner,
   stamp,
@@ -218,7 +219,11 @@ describe("computeAnalyticsV2 (A-2)", () => {
     expect(outputs.ownerModelDates.some((row) => row.ownerDigest === dense.digest)).toBe(false);
     const preview = outputs.preview as AdminCommunityAllowancePreview;
     expect(preview.coverage.uploadingParticipantCount).toBe(3);
-    expect(preview.models.days.every((day) => day.v1ParticipantCount === 3)).toBe(true);
+    // Every model day keeps it out of the composition but counts it as refused,
+    // so the published day states the four-owner cohort it could not complete.
+    expect(preview.models.days.length).toBe(ANALYTICS_V2_MODEL_DATES);
+    expect(preview.models.days.every((day) => day.v1ParticipantCount === 4 && day.refusedParticipantCount === 1
+      && day.fittedParticipantCount + day.unstableParticipantCount + day.staleParticipantCount === 3)).toBe(true);
     // Its daily evidence still publishes: four contributing owners today.
     const today = outputs.dailyCandidates.find((candidate) => candidate.day === TODAY)!;
     expect(today.payload.totals.contributingParticipants).toBe(4);
@@ -250,6 +255,73 @@ describe("computeAnalyticsV2 (A-2)", () => {
     expect(fitOwners(outputs)).not.toContain(crowded.digest);
     expect(outputs.dailyCandidates.map((candidate) => candidate.day)).toEqual(corpus.publishedDays);
   }, 120_000);
+
+  it("(c, cache bound) records a day over the cache reducer's group bound as that owner-day's refusal and carries on", async () => {
+    const corpus = composeProofCorpus();
+    const crowded = syntheticOwner(4, "pro");
+    const crowdedDay = addDays(TODAY, -30);
+    const withModels = (models: number) => computeAnalyticsV2(inputFor({
+      owners: [...corpus.owners, effectiveV2Owner(crowded)],
+      occurrencesByOwner: new Map([...corpus.occurrencesByOwner,
+        [crowded.digest, manyModelFacts(crowded, crowdedDay, models)]]),
+    }, corpus.publishedDays));
+    const cacheRefusals = (outputs: AnalyticsV2ComputeOutputs) =>
+      refusalsOf(outputs, crowded.digest).filter((refusal) => refusal.family === "cache");
+    const crowdedBands = (outputs: AnalyticsV2ComputeOutputs, day: string) =>
+      outputs.cacheBands.filter((row) => row.ownerDigest === crowded.digest && row.day === day);
+    const base = await computeAnalyticsV2(inputFor(corpus, corpus.publishedDays));
+
+    // 513 (model, effort) groups in one owner-day: d43c8f92 records group_limit_exceeded for
+    // that day and continues, so one contributor never stops the run for everyone.
+    const over = await withModels(513);
+    expect(cacheRefusals(over)).toEqual([{ ownerDigest: crowded.digest, day: crowdedDay, family: "cache",
+      reason: "group_limit_exceeded" }]);
+    expect(crowdedBands(over, crowdedDay)).toEqual([]);
+    expect(crowdedBands(over, TODAY).length).toBeGreaterThan(0);
+    expect(over.refusals.every((refusal) => refusal.ownerDigest === crowded.digest)).toBe(true);
+    expect(over.blockedDays).toEqual([]);
+    expect(over.dailyCandidates.map((candidate) => candidate.day)).toEqual(corpus.publishedDays);
+    expect(over.preview).not.toBeNull();
+    // Every other owner's cache continuity is exactly what it is without this owner.
+    expect(over.cacheBands.filter((row) => row.ownerDigest !== crowded.digest)).toEqual(base.cacheBands);
+
+    // At the bound itself the day reduces into one group per model.
+    const atBound = await withModels(512);
+    expect(cacheRefusals(atBound)).toEqual([]);
+    expect(new Set(crowdedBands(atBound, crowdedDay).map((row) => row.model)).size).toBe(512);
+  }, 240_000);
+
+  it("takes A-3's call shape and never depends on how widely the occurrences were read", async () => {
+    const corpus = composeProofCorpus();
+    const queued = corpus.publishedDays;
+    // Exactly the keys A-3 analytics-refresh.mjs passes: no occurrenceRange, a bare queued-day list.
+    const a3Input = { owners: corpus.owners, occurrencesByOwner: corpus.occurrencesByOwner,
+      devicesByDay: oneDevicePerOwner(corpus.occurrencesByOwner, queued), queuedDays: queued, nowMs: NOW_MS,
+      revisionSeed: 0 };
+    const a3 = await computeAnalyticsV2(a3Input);
+    const declared = await computeAnalyticsV2({ ...a3Input,
+      occurrenceRange: analyticsV2RequiredOccurrenceRange({ nowMs: NOW_MS, queuedDays: queued }) });
+    expect(outputsDigest(a3)).toBe(outputsDigest(declared));
+    expect(a3.cacheBands.length).toBe(210);
+
+    // A wider read that also returned evidence outside the horizon: an old day
+    // and a day after today, neither queued. Nothing in the outputs moves.
+    const first = syntheticOwner(1);
+    const tomorrow = addDays(TODAY, 1), old = addDays(TODAY, -200);
+    const extra = new Map(corpus.occurrencesByOwner.get(first.digest)!);
+    extra.set(tomorrow, composeFacts(first, tomorrow).get(tomorrow)!);
+    extra.set(old, composeFacts(first, old).get(old)!);
+    const wider = new Map([...corpus.occurrencesByOwner, [first.digest, extra]]);
+    const widened = await computeAnalyticsV2({ ...a3Input, occurrencesByOwner: wider,
+      occurrenceRange: { fromDay: addDays(TODAY, -220), throughDay: addDays(TODAY, 2) } });
+    expect(outputsDigest(widened)).toBe(outputsDigest(declared));
+    expect(widened.cacheBands.every((row) => row.day <= TODAY)).toBe(true);
+    expect(widened.ownerDays.every((row) => row.day !== tomorrow && row.day !== old)).toBe(true);
+
+    // Without a declared range, evidence outside the required range is a caller defect.
+    await expect(computeAnalyticsV2({ ...a3Input, occurrencesByOwner: wider }))
+      .rejects.toThrow("ANALYTICS_V2_INPUT_INVALID:occurrencesByOwner.range");
+  }, 240_000);
 
   it("(d) blocks every candidate day of a conflict and withholds that community day", async () => {
     const corpus = composeProofCorpus();

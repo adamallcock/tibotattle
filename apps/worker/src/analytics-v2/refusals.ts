@@ -9,7 +9,7 @@
  * contract does not list is rethrown rather than renamed, because a new
  * reason is a contract change through the integration lead.
  */
-import { SharedAnalyticsUnavailable } from "../../vendor/analytics-d43c8f92/entry";
+import { CacheRetentionRefusedError, SharedAnalyticsUnavailable } from "../../vendor/analytics-d43c8f92/entry";
 import {
   ANALYTICS_V2_DAY_PATTERN,
   ANALYTICS_V2_OWNER_DIGEST_PATTERN,
@@ -42,12 +42,18 @@ export function analyticsV2Refusal(ownerDigest: AnalyticsV2OwnerDigest, day: Ana
 
 /**
  * The closed reason of a kernel refusal, or null when `error` is not a
- * refusal at all. SharedAnalyticsUnavailable covers every shared-reducer
- * refusal, including the checkedRows conflict/order throw
- * (source_conflict_or_order). Any other error is a defect the caller rethrows.
+ * refusal at all. Two kernel errors are refusals:
+ * - SharedAnalyticsUnavailable: every shared-reducer refusal, including the
+ *   checkedRows conflict/order throw (source_conflict_or_order);
+ * - CacheRetentionRefusedError from reduceCacheRetentionDay (reached through
+ *   evaluateSharedCacheDay): a day over the method's group or session bound.
+ *   d43c8f92 records these per owner-day as refusal marks and carries on
+ *   (cache-retention-day.ts advanceCacheRetentionDayLane), so one owner-day
+ *   never stops the run.
+ * Any other error is a defect the caller rethrows.
  */
 export function kernelRefusalReason(error: unknown): AnalyticsV2RefusalReason | null {
-  if (!(error instanceof SharedAnalyticsUnavailable)) return null;
+  if (!(error instanceof SharedAnalyticsUnavailable) && !(error instanceof CacheRetentionRefusedError)) return null;
   if (!isAnalyticsV2RefusalReason(error.reason)) throw error;
   return error.reason;
 }
