@@ -41,7 +41,7 @@
 //
 // Local and synthetic only: no network, no production data, no secrets.
 import { createHash } from "node:crypto";
-import { chmodSync, closeSync, constants as fsConstants, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync,
+import { closeSync, constants as fsConstants, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync,
   statSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { createRequire } from "node:module";
@@ -1214,7 +1214,8 @@ files["SOURCE.json"] = pretty({
   command: manifest.sourceDump.reproduce + (options.goldenOut ? ` --golden-out ${relative(REPO_ROOT, options.goldenOut)}` : ""),
   oracleFiles: LOADED_BLOBS,
   adapter: { path: "apps/worker/cloud-run/sealed-sqlite-d1-adapter.mjs", blob: ADAPTER_BLOB },
-  resumedFrom: prior === null ? null : "a converged run of the same oracle files, corpus and scale (--resume)",
+  resumedFrom: prior === null ? null : "a converged run of the same corpus, scale and cadence (--resume): its seeding, convergence and lease-expiry probe ran in that run's process and their recorded outcomes were carried forward; every file here was computed by this process from that converged state",
+  bundleNote: "bundleSha256 identifies this build only: the bundle embeds work-directory paths",
   q1Corpus: { path: "apps/worker/analytics-v2-test/golden/corpus/", sha256: q1.sha256 },
   build: { verifiedFiles: build.verifiedFiles, listingSha256: build.listingSha256, bundleSha256: build.bundle.sha256,
     esbuildVersion: build.esbuildVersion, dependencies: build.dependencies },

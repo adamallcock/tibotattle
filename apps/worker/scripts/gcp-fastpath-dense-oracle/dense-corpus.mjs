@@ -21,7 +21,7 @@
 //                      2026-09-28 except M 2026-09-10 and 2026-09-18 and H
 //                      2026-09-24; X on 2026-09-29 (inside a weekly reset); L
 //                      elsewhere. The current-fits window (2026-06-23 to
-//                      2026-10-01) holds ~230,000 usage rows (> 120,000 and
+//                      2026-10-01) holds ~243,000 usage rows (> 120,000 and
 //                      > 204,800, the single-call page bound of the shared scalar
 //                      path), the last model windows too, and earlier windows
 //                      progressively fewer, which bounds production's native
