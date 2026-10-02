@@ -18,16 +18,24 @@
  *   build   --data F --out P [--previous Q]
  *           Validate F (and its continuity from the canonical payload Q),
  *           then write the canonical payload bytes P, the bytes that are signed.
- *   sign    --payload P --channel production|staging --out E [--key-env NAME]
- *           Sign P into the catalog-envelope-v1 envelope E. The private key is
- *           referenced by NAME only: the step that runs this resolves the named
- *           Secret Manager secret (src/catalog-manifest-keys.ts
- *           CATALOG_SIGNING_KEY_REFERENCES) into the named environment variable
- *           for this one process, as base64 PKCS#8 DER or a PKCS#8 PEM block.
- *           The key is never written, printed or passed as an argument. A key
- *           whose public half differs from a pinned key for the same key id is
- *           refused; with no pin yet, the receipt reports the public key for
- *           the owner to pin.
+ *   sign    --payload P --channel production|staging --out E [--slot current|next]
+ *           [--key-env NAME]
+ *           Sign P into the catalog-envelope-v1 envelope E with the pinned key
+ *           of that channel and slot (default current). An OWNER-RUN
+ *           protected operation: it refuses to run when a CI or hosted-runner
+ *           environment is detected (CATALOG_TOOL_SIGNING_REFUSED_IN_CI),
+ *           before it reads any key. The private key is referenced by NAME
+ *           only (src/catalog-manifest-keys.ts): the owner runs
+ *             secret run tibotattle-<keyId> --env TIBOTATTLE_CATALOG_SIGNING_KEY -- \
+ *               node apps/worker/scripts/catalog-manifest.mjs sign ...
+ *           and the `secret` helper sets that variable for this one process
+ *           from the macOS Keychain, as base64 PKCS#8 DER, a PKCS#8 PEM block
+ *           or the base64 raw 32-byte Ed25519 seed. The key is never written,
+ *           printed or passed as an argument, and never comes from CI or
+ *           Secret Manager. A key whose public half is not the pinned key for
+ *           that slot is refused (CATALOG_TOOL_SIGNING_KEY_NOT_PINNED) and
+ *           nothing is written. Runbook:
+ *           docs/runbooks/gcp-catalog-manifest-signing.md.
  *   verify  --envelope E (--channel C | --key-id K --public-key B64)
  *           Verify E exactly as the server loader does (signature, canonical
  *           bytes, closed schema, registry SHA).
@@ -72,7 +80,8 @@ import {
 } from "../src/catalog-manifest.ts";
 import {
   CATALOG_KEY_CHANNELS,
-  CATALOG_SIGNING_KEY_REFERENCES,
+  CATALOG_KEY_SLOTS,
+  catalogSigningKeyReference,
   catalogTrustedKeys,
 } from "../src/catalog-manifest-keys.ts";
 
@@ -175,6 +184,33 @@ function receiptOf(checked, extra = {}) {
   };
 }
 
+/**
+ * Environment variables whose presence (with any value other than empty,
+ * "0" or "false") marks a CI system, a hosted runner or a Google Cloud
+ * build or run environment. Signing is owner-run only (design §2.5), so the
+ * sign mode refuses under any of them before it reads a key.
+ */
+export const CATALOG_SIGNING_CI_MARKERS = Object.freeze([
+  "CI", "CONTINUOUS_INTEGRATION", "GITHUB_ACTIONS", "RUNNER_ENVIRONMENT", "GITLAB_CI",
+  "BUILDKITE", "CIRCLECI", "TRAVIS", "TF_BUILD", "JENKINS_URL", "TEAMCITY_VERSION", "CODEBUILD_BUILD_ID",
+  "BITBUCKET_BUILD_NUMBER", "DRONE", "SEMAPHORE", "APPVEYOR", "BUILDER_OUTPUT", "CLOUD_RUN_JOB", "K_SERVICE",
+]);
+
+/** The first CI marker set in env, or null. */
+export function detectedCiMarker(env) {
+  for (const name of CATALOG_SIGNING_CI_MARKERS) {
+    const value = env?.[name];
+    if (typeof value === "string" && value.trim() !== "" && !["0", "false"].includes(value.trim().toLowerCase())) {
+      return name;
+    }
+  }
+  return null;
+}
+
+/** The fixed PKCS#8 DER prefix of an Ed25519 private key around its 32-byte seed (RFC 8410). */
+const ED25519_PKCS8_PREFIX = Uint8Array.from([0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65,
+  0x70, 0x04, 0x22, 0x04, 0x20]);
+
 /** Parse the private key from the named environment variable's value. */
 function privateKeyFrom(value) {
   if (typeof value !== "string" || value.length === 0 || value.length > 8192) {
@@ -184,6 +220,13 @@ function privateKeyFrom(value) {
   const base64 = (pem === null ? value : pem[1]).replace(/\s+/gu, "");
   const bytes = decodeBase64(base64);
   if (bytes === null) throw new CatalogToolError("CATALOG_TOOL_SIGNING_KEY_UNAVAILABLE", "key");
+  if (pem === null && bytes.byteLength === 32) {
+    const wrapped = new Uint8Array(ED25519_PKCS8_PREFIX.byteLength + 32);
+    wrapped.set(ED25519_PKCS8_PREFIX, 0);
+    wrapped.set(bytes, ED25519_PKCS8_PREFIX.byteLength);
+    bytes.fill(0);
+    return wrapped;
+  }
   return bytes;
 }
 
@@ -203,7 +246,7 @@ function parseArguments(argv) {
     check: ["data"],
     write: [],
     build: ["data", "out", "previous"],
-    sign: ["payload", "channel", "out", "key-env"],
+    sign: ["payload", "channel", "out", "slot", "key-env"],
     verify: ["envelope", "channel", "key-id", "public-key"],
   }[mode];
   for (const name of Object.keys(options)) if (!allowed.includes(name)) usage(name);
@@ -215,7 +258,13 @@ function channelOf(value) {
   return value;
 }
 
-export async function runCatalogManifestTool(argv, { env = process.env, cwd = process.cwd() } = {}) {
+/**
+ * `trustedKeysFor` defaults to the code pins; only the offline checks pass a
+ * synthetic pin set, so they can sign without a real key.
+ */
+export async function runCatalogManifestTool(argv, {
+  env = process.env, cwd = process.cwd(), trustedKeysFor = catalogTrustedKeys,
+} = {}) {
   const { mode, options } = parseArguments(argv);
   const path = (name) => resolve(cwd, options[name]);
   if (mode === "check") {
@@ -247,9 +296,15 @@ export async function runCatalogManifestTool(argv, { env = process.env, cwd = pr
     return { status: "ok", mode, ...receiptOf(checked) };
   }
   if (mode === "sign") {
+    // Owner-run only: refuse under CI before reading any argument file or key.
+    const marker = detectedCiMarker(env);
+    if (marker !== null) throw new CatalogToolError("CATALOG_TOOL_SIGNING_REFUSED_IN_CI", marker, 2);
     if (!options.payload || !options.out) usage("sign");
     const channel = channelOf(options.channel);
-    const reference = CATALOG_SIGNING_KEY_REFERENCES[channel];
+    const slot = options.slot ?? "current";
+    if (!CATALOG_KEY_SLOTS.includes(slot)) usage("slot");
+    const reference = catalogSigningKeyReference(channel, slot);
+    if (reference === null) throw new CatalogToolError("CATALOG_TOOL_SIGNING_KEY_NOT_PINNED", "slot");
     const environmentVariable = options["key-env"] ?? reference.environmentVariable;
     if (!ENVIRONMENT_NAME.test(environmentVariable)) usage("key-env");
     const payloadText = await readRegularFile(path("payload"), "payload");
@@ -259,14 +314,16 @@ export async function runCatalogManifestTool(argv, { env = process.env, cwd = pr
       keyId: reference.keyId,
       privateKeyPkcs8: privateKeyFrom(env[environmentVariable]),
     });
-    const pinned = catalogTrustedKeys(channel).find((entry) => entry.keyId === reference.keyId) ?? null;
-    if (pinned !== null && pinned.publicKey !== signed.publicKey) {
+    const pinned = trustedKeysFor(channel).find((entry) => entry.keyId === reference.keyId) ?? null;
+    if (pinned === null || pinned.publicKey !== signed.publicKey) {
       throw new CatalogToolError("CATALOG_TOOL_SIGNING_KEY_NOT_PINNED", "key");
     }
+    // Verify the envelope exactly as the server loader will before writing it.
+    await verifyCatalogEnvelope(signed.envelopeText, { trustedKeys: trustedKeysFor(channel) });
     await writeFile(path("out"), signed.envelopeText, { mode: 0o644 });
     return {
-      status: "ok", mode, channel, keyId: reference.keyId, secretManagerSecret: reference.secretManagerSecret,
-      publicKey: signed.publicKey, pinned: pinned !== null, ...receiptOf(checked),
+      status: "ok", mode, channel, slot, keyId: reference.keyId, secretHelperName: reference.secretHelperName,
+      publicKey: signed.publicKey, pinned: true, ...receiptOf(checked),
     };
   }
   // verify
@@ -274,7 +331,7 @@ export async function runCatalogManifestTool(argv, { env = process.env, cwd = pr
   let trustedKeys;
   if (options.channel !== undefined) {
     if (options["key-id"] !== undefined || options["public-key"] !== undefined) usage("verify");
-    trustedKeys = catalogTrustedKeys(channelOf(options.channel));
+    trustedKeys = trustedKeysFor(channelOf(options.channel));
   } else {
     if (!KEY_ID.test(options["key-id"] ?? "") || typeof options["public-key"] !== "string") usage("verify");
     trustedKeys = [{ keyId: options["key-id"], publicKey: options["public-key"] }];

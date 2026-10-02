@@ -257,3 +257,30 @@ the package's published `files`.
 - **Re-vendoring at P** must re-project the baseline as a successor version;
   the spec fails if the compiled registry stops projecting to
   `CATALOG_BASELINE_DIGEST`.
+
+## Later update: keys pinned (round 11, 2026-10-02)
+
+This section is added after the snapshot above; the sections above are
+unchanged and describe the branch as it was then. On
+`claude/gcp-fp-int-b` (INT-B receipt, "Round 11"):
+
+- The four round-11 public keys are pinned in
+  `src/catalog-manifest-keys.ts` with their SHA-256 fingerprints:
+  `catalog-prod-2026a` and `catalog-prod-2026b` (production current and
+  next), `catalog-staging-2026a` and `catalog-staging-2026b` (staging current
+  and next). The "Keys" open gate above is closed for pinning; no manifest
+  has been signed with a real key, published or loaded.
+- Custody follows design §2.5: the private keys are in the owner's macOS
+  Keychain only, used through `secret run tibotattle-<keyId> --env
+  TIBOTATTLE_CATALOG_SIGNING_KEY -- …`. The Secret Manager references
+  (`CATALOG_SIGNING_KEY_REFERENCES.secretManagerSecret`) are removed, and the
+  sign receipt carries the `secret` helper name instead.
+- `sign` now refuses under CI (`CATALOG_TOOL_SIGNING_REFUSED_IN_CI`), takes
+  `--slot current|next`, refuses any key that is not the pinned key for that
+  slot (before, an unpinned key was allowed and reported `pinned: false`),
+  and verifies the envelope against the pins before writing it.
+- Pinning loads nothing: the read APIs still serve the compiled baseline
+  until a deliberate load (proved in `catalog-manifest-store.spec.mjs` with
+  the real pins, and by an offline check that no runtime module calls the
+  loader).
+- Runbook: `docs/runbooks/gcp-catalog-manifest-signing.md`.

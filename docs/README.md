@@ -75,6 +75,7 @@ their status changes; current Cloudflare behavior follows the authorities above.
 | GCP origin rollout | [GCP origin rollout](./runbooks/gcp-rollout.md) | Draft | Preflight, build, migrate and roll with the accepted per-migration write outage and an explicit scheduler pause and resume; forward only |
 | GCP scheduler resume | [GCP scheduler resume](./runbooks/gcp-scheduler-resume.md) | Draft | Triggers created paused and resumed only explicitly; state model, pause and resume steps; pause and resume tooling not built |
 | GCP brake and incidents | [GCP brake and incidents](./runbooks/gcp-brake-and-incidents.md) | Draft | Brake to fenced only, then fix forward; incident classes; brake thresholds and escalation not recorded |
+| GCP catalog signing | [GCP catalog manifest signing, key custody and rotation](./runbooks/gcp-catalog-manifest-signing.md) | Draft | Owner-run signing with the Keychain `secret` helper, never in CI or Secret Manager; the four round-11 keys pinned; rotation through the next slot; no manifest published or loaded |
 
 ## Lifecycle evidence
 

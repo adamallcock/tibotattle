@@ -381,6 +381,22 @@ describe("catalog-envelope-v1", () => {
     expect(await codeOf(() => verifyCatalogEnvelope(envelopeText, {
       trustedKeys: catalogTrustedKeys("production"),
     }))).toBe("CATALOG_KEY_UNTRUSTED");
+    // Under a real pinned key id, a synthetic key fails the signature on its
+    // own channel and is untrusted on the other.
+    for (const [channel, other] of [["production", "staging"], ["staging", "production"]] as const) {
+      const pair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]) as CryptoKeyPair;
+      const impostor = await signCatalogPayload({
+        payloadText: canonicalCatalogPayloadText(compiledBaselineCatalogManifest()),
+        keyId: catalogTrustedKeys(channel)[0]!.keyId,
+        privateKeyPkcs8: new Uint8Array(await crypto.subtle.exportKey("pkcs8", pair.privateKey) as ArrayBuffer),
+      });
+      expect(await codeOf(() => verifyCatalogEnvelope(impostor.envelopeText, {
+        trustedKeys: catalogTrustedKeys(channel),
+      }))).toBe("CATALOG_SIGNATURE_INVALID");
+      expect(await codeOf(() => verifyCatalogEnvelope(impostor.envelopeText, {
+        trustedKeys: catalogTrustedKeys(other),
+      }))).toBe("CATALOG_KEY_UNTRUSTED");
+    }
     const other = await syntheticSigner();
     expect(await codeOf(() => verifyCatalogEnvelope(envelopeText, { trustedKeys: other.trustedKeys })))
       .toBe("CATALOG_SIGNATURE_INVALID");

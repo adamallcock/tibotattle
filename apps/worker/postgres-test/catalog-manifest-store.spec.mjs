@@ -252,11 +252,36 @@ test("before any load the read APIs serve the compiled baseline, stamped version
   assert.equal(analytics.boundManifest, null);
   assert.equal(analytics.tableManifestVersion, null);
 
-  // The production pins are empty, so no manifest can load yet: the cutover state.
+  // The real keys are pinned (round 11), and that alone loads nothing: with
+  // the code pins of either channel and an empty store, every read is the
+  // compiled baseline, which is what is served at cutover (round 7). Only a
+  // deliberate load of a signed manifest changes that.
   const { catalogTrustedKeys } = await vite.ssrLoadModule("/src/catalog-manifest-keys.ts");
+  for (const channel of ["production", "staging"]) {
+    const trustedKeys = catalogTrustedKeys(channel);
+    assert.equal(trustedKeys.length, 2, `${channel} has its current and next keys pinned`);
+    const pinnedPricing = await readPricing(schema, NOW_MS, trustedKeys);
+    assert.deepEqual([pinnedPricing.source, pinnedPricing.manifestVersion, pinnedPricing.manifestDigest],
+      ["compiled_baseline", 1, null]);
+    assert.equal(JSON.stringify(pinnedPricing.priceCards), JSON.stringify(APP_OFFICIAL_PRICE_CARDS));
+    const cutover = await readAnalytics(schema, undefined, NOW_MS, trustedKeys);
+    assert.deepEqual([cutover.kernelBinding, cutover.stampManifestVersion, cutover.boundManifest,
+      cutover.tableManifestVersion, cutover.tableFault], ["compiled_registry", 1, null, null, null]);
+    const bound = await readAnalytics(schema, "manifest", NOW_MS, trustedKeys);
+    assert.deepEqual([bound.stampManifestVersion, bound.tableManifestVersion], [1, null]);
+    assert.equal(bound.boundManifestDigest, contract.CATALOG_BASELINE_DIGEST, "the manifest binding binds the baseline");
+  }
+  // A synthetic key cannot load under the real pins: under its own key id it
+  // is untrusted, and under a real key id its signature fails.
   const envelope = await signer.sign(store.compiledBaselineCatalogManifest());
   assert.equal(await refusal(() => load(schema, envelope, catalogTrustedKeys("production"))),
     "CATALOG_KEY_UNTRUSTED");
+  const impersonator = await syntheticSigner(catalogTrustedKeys("production")[0].keyId);
+  const forged = await impersonator.sign(store.compiledBaselineCatalogManifest());
+  assert.equal(await refusal(() => load(schema, forged, catalogTrustedKeys("production"))),
+    "CATALOG_SIGNATURE_INVALID");
+  assert.equal(await refusal(() => load(schema, forged, catalogTrustedKeys("staging"))), "CATALOG_KEY_UNTRUSTED",
+    "a production key id never verifies on the staging pins");
   assert.deepEqual(await counts(schema), { manifests: 0, cards: 0, retractions: 0 });
 
   // Before the migration (no table at all) the read is the same fallback.
