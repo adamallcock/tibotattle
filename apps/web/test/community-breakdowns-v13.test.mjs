@@ -379,3 +379,44 @@ test("without a block, a GPT-6.1 Sol estimate draws at its roster slot, second",
   const models = render(payload, "models");
   assert.deepEqual(cardTitles(models.container), [SIX_LABELS[0], "GPT-6.1 Sol", ...SIX_LABELS.slice(1)]);
 });
+
+// A valid block is the served catalog's public roster. One that does not name
+// GPT-6.1 Sol says the served catalog has not added it (owner rounds 5 and 11),
+// so an estimate for it under that block is a server fault: it is skipped and
+// counted like a newer model's, never drawn, and the gap is stated.
+test("a valid block that does not name GPT-6.1 Sol keeps its estimate off the page, counted and stated", () => {
+  for (const [name, block] of [["the six-entry block", undefined], ["an empty block", []]]) {
+    const payload = withTuples(v13(block), [[SOL_61, 4321, 2]]);
+    const normalized = series(payload);
+    const { breakdowns } = normalized;
+    assert.equal(breakdowns.modelMetadata, "applied", name);
+    assert.equal(breakdowns.unrecognizedModelTuples, 5, `${name}: one tuple on each of five days`);
+    assert.equal(breakdowns.unrecognizedModelCount, 1, name);
+    assert.deepEqual(breakdowns.days, series(v13(block)).breakdowns.days, `${name}: every other value is untouched`);
+    const chart = modelsChart(payload);
+    assert.deepEqual(chart.legendSeries.map(item => item.key),
+      modelsChart(v13(block)).legendSeries.map(item => item.key), name);
+    assert.ok(!chart.cardSeries.some(card => card.key === SOL_61), name);
+    const models = render(payload, "models");
+    assert.equal(models.state, "published", name);
+    assert.deepEqual(cardTitles(models.container), SIX_LABELS, name);
+    assert.doesNotMatch(models.text, /GPT-6\.1 Sol/u, name);
+    assert.ok(everyAttribute(models.container).every(value => !value.includes(SOL_61)), name);
+    assert.ok(models.text.includes(NOTICE), `${name}: the gap is stated, not silent`);
+    // The stored copy drops the tuple, keeps the count, and re-reads the same.
+    const stored = projectCommunityDailyPayloadForCache(payload, { nowMs: NOW });
+    assert.ok(!JSON.stringify(stored.allowanceBreakdowns).includes(SOL_61), name);
+    assert.deepEqual(stored.allowanceBreakdowns.retainedUnrecognizedModels, { tuples: 5, models: 1 }, name);
+    const reread = normalizeCommunityDailySeries(stored, { nowMs: NOW, retained: true });
+    assert.deepEqual(reread, normalized, `${name}: omission counts included`);
+    const cached = render(stored, "models", RETAINED);
+    assert.ok(cached.text.includes(NOTICE), name);
+    assert.doesNotMatch(cached.text, /GPT-6\.1 Sol/u, name);
+  }
+  // A malformed block is ignored whole, so the page reads exactly as it does without one.
+  const rejected = withTuples(v13([{ ...SIX_MODELS[0], tone: "warm" }]), [[SOL_61, 4321, 2]]);
+  assert.equal(series(rejected).breakdowns.modelMetadata, "rejected");
+  assert.equal(series(rejected).breakdowns.unrecognizedModelTuples, 0);
+  assert.deepEqual(cardTitles(render(rejected, "models").container),
+    cardTitles(render(withTuples(v11(), [[SOL_61, 4321, 2]]), "models").container));
+});

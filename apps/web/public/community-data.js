@@ -319,10 +319,12 @@ const PUBLIC_ALLOWANCE_ROSTER = Object.freeze([
 const PUBLIC_ALLOWANCE_ROSTER_IDS = new Set(PUBLIC_ALLOWANCE_ROSTER.map(([modelId]) => modelId));
 // Roster models with no card until a served publication carries an estimate
 // for them (owner rounds 5 and 11). GPT-6.1 Sol is on the OpenAI release-line
-// catalog only: until the served catalog adds it, no server can publish an
-// estimate for it, and the page must not name it. It keeps its roster slot, so
-// once an estimate arrives it draws second, and it stays known, so its tuples
-// are never counted as unrecognized.
+// catalog only, and the page must not name it before the served catalog adds
+// it. A valid `modelConfig` block is the served catalog's public roster: while
+// a block does not name it, its tuples are skipped and counted like a newer
+// model's. A block that names it places it at the block's order.
+// Without a valid block it keeps its roster slot (second) and stays known: a
+// producer publishes tuples only for models in its own reviewed catalog.
 const PUBLIC_ALLOWANCE_ROSTER_UNTIL_PUBLISHED = new Set(["gpt-6.1-sol"]);
 // The owner chose a selected comparison, not the whole historical vocabulary
 // (2d6cfbc8, "six requested public allowance models"): older generations stay
@@ -509,7 +511,9 @@ function retainedUnrecognizedCounts(value) {
  * kept off the primary comparison (a separate allowance track, or another
  * provider) are producer faults that refuse the block, exactly as for a known
  * id. The tuple's numbers must still be valid, the id is never retained or
- * rendered, and every other part of the contract stays closed.
+ * rendered, and every other part of the contract stays closed. A roster model
+ * held back until publication is known under a valid block only if the block
+ * names it; otherwise its tuple is skipped and counted the same way.
  *
  * `retained` is true only for a payload this browser stored itself. Its
  * projection leaves the skipped tuples out and records how many as
@@ -557,6 +561,14 @@ export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs =
   const modelConfig = chartedModelsWith([...(metadata ?? [])].map(
     ([modelId, entry]) => ({ modelId, ...entry })));
   const knownModelIds = new Set([...PUBLIC_ALLOWANCE_MODELS.known, ...modelConfig.map(model => model.modelId)]);
+  // A valid block is the served catalog's public roster. A held-back roster
+  // model it does not name is one the served catalog has not added, so its
+  // tuples are not this page's to draw. A rejected block is no evidence at all.
+  if (metadata !== null) {
+    for (const modelId of PUBLIC_ALLOWANCE_ROSTER_UNTIL_PUBLISHED) {
+      if (!metadata.has(modelId)) knownModelIds.delete(modelId);
+    }
+  }
   let unrecognizedModelTuples = 0;
   const unrecognizedModelIds = new Set();
   for (const row of value.days) {

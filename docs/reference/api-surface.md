@@ -165,6 +165,13 @@ characters; an integer order from 0 to 9999. The block is all-or-nothing, a
 malformed one is ignored whole, and it cannot promote a separate-track or other
 provider's model onto the primary comparison. A model the page's catalog does not
 know is drawn only once the block names it; an id neither names stays unrendered.
+GPT-6.1 Sol (`gpt-6.1-sol`) is on the page's roster but held back until the
+served catalog adds it: it has no card until an estimate for it is published.
+A valid block is read as the served catalog's public roster, so while one is
+present and does not name it, its tuples are skipped and counted like a newer
+model's; a block that names it places it at the block's order. Without a valid
+block it is read from the page's own catalog and draws second. The public page's
+synthetic speed demonstration does not name it either.
 
 The public reader accepts `community-allowance-breakdowns-v1.3` as well as
 v1.0 to v1.2. v1.3 is v1.1's meaning (the Pro 20x basis, `combined`, and the
