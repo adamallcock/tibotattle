@@ -1049,21 +1049,29 @@ test("build writes the audited archive, submits that file and qualifies the buil
       archiveSha256: ARCHIVE_SHA256 }).digest, DIGEST);
   });
 
-test("until the committed desired states are complete every verb fails closed, and error codes stay content-free",
+test("an incomplete committed desired state fails every verb closed, a complete one dry-runs without a call, and error codes stay content-free",
   async () => {
   // The default loader reaches the OPS-2 manifest's rolloutTarget, which reads
-  // only the committed desired state: production waits for OWN-5's
-  // placeholders and staging for the verifier's operator. The rollout reports
-  // either as ROLLOUT_INFRA_MANIFEST_UNAVAILABLE before running anything.
+  // only the committed desired state. Production waits for OWN-5's
+  // placeholders, and the rollout reports that as
+  // ROLLOUT_INFRA_MANIFEST_UNAVAILABLE before running anything.
   await assert.rejects(loadRolloutTargetFromInfraManifest("production"),
     isCode("DESIRED_STATE_PLACEHOLDER_UNFILLED:project"));
-  await assert.rejects(loadRolloutTargetFromInfraManifest("staging"),
-    isCode("ROLLOUT_TARGET_VERIFIER_TOKEN_CREATOR_UNASSIGNED"));
-  for (const environment of ["production", "staging"]) {
-    await assert.rejects(runRollout(["preflight", `--environment=${environment}`, `--commit=${COMMIT}`,
-      "--backup-audit=/synthetic/audit.json"], { run: () => assert.fail("never") }),
-    isCode("ROLLOUT_INFRA_MANIFEST_UNAVAILABLE"), environment);
-  }
+  await assert.rejects(runRollout(["preflight", "--environment=production", `--commit=${COMMIT}`,
+    "--backup-audit=/synthetic/audit.json"], { run: () => assert.fail("never") }),
+  isCode("ROLLOUT_INFRA_MANIFEST_UNAVAILABLE"));
+  // Staging's verifier operator is named (owner decision, 2026-10-02 round
+  // 9), so its committed state now yields a target that OPS-10 validates for
+  // the staging plane. The manifest check holds the unassigned-operator
+  // refusal (rolloutTargetFromDesiredState). A dry run still runs nothing.
+  const staging = await loadRolloutTargetFromInfraManifest("staging");
+  assert.deepEqual(validateRolloutTarget(staging, "staging"), staging);
+  assert.match(staging.verifierServiceAccount, /^tibotattle-staging-verifier@/u);
+  const dryRun = await runRollout(["preflight", "--environment=staging", `--commit=${COMMIT}`,
+    "--backup-audit=/synthetic/audit.json"], { run: () => assert.fail("never"), fetch: () => assert.fail("never") });
+  assert.equal(dryRun.status, "dry-run");
+  assert.equal(dryRun.environment, "staging");
+  assert.equal(dryRun.service, staging.service);
   assert.equal(safeRolloutErrorCode({ code: "EDGE_CONTRACT_DRIFT" }), "EDGE_CONTRACT_DRIFT");
   assert.equal(safeRolloutErrorCode({ code: "PRODUCTION_COORDINATION_BUSY" }), "PRODUCTION_COORDINATION_BUSY");
   assert.equal(safeRolloutErrorCode({ code: "EDGE_ORIGIN_VERIFIER_UNREACHABLE" }), "EDGE_ORIGIN_VERIFIER_UNREACHABLE");
