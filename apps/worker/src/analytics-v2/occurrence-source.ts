@@ -551,29 +551,63 @@ function v12CandidatesSql(s: string): string {
     GROUP BY domain_day.observed_day,r.occurrence_id`;
 }
 
-/** $1 participant, $2 stream, $3 now, $4 occurrence ids (hex text[]), $5 limit. */
+/**
+ * $1 participant, $2 stream, $3 now, $4 occurrence ids (hex text[]), $5 limit.
+ *
+ * The selection is production's: every record of a requested occurrence and
+ * stream in a complete chunk of a ready manifest of the participant's
+ * owner-linked generation on a retained authorization. The statement is
+ * shaped so its cost follows the batch, not the owner. No index leads with
+ * occurrence_id, and the planner's estimate of the chunk-completeness chain
+ * collapses to one row, so an unfenced join walks every record of the owner
+ * for each 200-id batch (about 1.7 s a batch for a 300,000-record owner: a
+ * read quadratic in owner size). Here the participant's ready manifests are
+ * fenced first, each is probed once on its (manifest_id, stream,
+ * occurrence_id) key for the batch's ids, and each matched record is then
+ * checked against the same joins in a fenced LATERAL (OFFSET 0 keeps it per
+ * record). The manifest filter is implied by the joins it precedes
+ * (manifest.participant_id = chunk.participant_id =
+ * generation.participant_id = $1, state ready), so the rows, their
+ * multiplicity and the grouping below are unchanged.
+ */
 function v12OccurrencesSql(s: string): string {
   return `WITH requested AS MATERIALIZED (
       SELECT DISTINCT decode(value,'hex') AS occurrence_id FROM unnest($4::text[]) value
+    ), owner_manifests AS MATERIALIZED (
+      SELECT owned.id FROM ${s}.telemetry_v12_day_manifests owned
+       WHERE owned.participant_id=$1 AND owned.state='ready'
+    ), matched AS MATERIALIZED (
+      SELECT probe.id FROM owner_manifests owned
+        CROSS JOIN LATERAL (
+          SELECT r.id FROM ${s}.telemetry_v12_typed_records r
+           WHERE r.manifest_id=owned.id AND r.stream=$2
+             AND r.occurrence_id=ANY(ARRAY(SELECT wanted.occurrence_id FROM requested wanted))
+          OFFSET 0
+        ) probe
+    ), retained_auth AS MATERIALIZED (
+      ${v12RetainedAuthorizationScopeSql(s, "$3::timestamptz", "reader")}
     ), eligible AS MATERIALIZED (
-      SELECT r.id,r.occurrence_id,r.observed_at_ms,r.canonical_digest,generation.device_id AS source_device_id
-        FROM requested wanted
-        JOIN ${s}.telemetry_v12_typed_records r ON r.occurrence_id=wanted.occurrence_id AND r.stream=$2
-        JOIN ${s}.telemetry_v12_chunks chunk ON chunk.id=r.chunk_id AND chunk.manifest_id=r.manifest_id
-         AND chunk.stream=$2
-         AND chunk.record_count=(SELECT count(*) FROM ${s}.telemetry_v12_typed_records complete
-           WHERE complete.chunk_id=chunk.id)
-        JOIN ${s}.telemetry_v12_day_manifests manifest ON manifest.id=r.manifest_id
-         AND manifest.participant_id=chunk.participant_id AND manifest.device_id=chunk.device_id
-         AND manifest.state='ready'
-        JOIN ${s}.telemetry_v12_domain_days domain_day ON domain_day.manifest_id=manifest.id
-         AND domain_day.manifest_digest=manifest.manifest_digest
-        JOIN ${s}.telemetry_v12_domains generation ON generation.id=domain_day.generation_id
-         AND generation.participant_id=chunk.participant_id AND generation.device_id=chunk.device_id
-        JOIN (${v12RetainedAuthorizationScopeSql(s, "$3::timestamptz", "reader")}) retained_auth
-          ON retained_auth.participant_id=generation.participant_id
-         AND retained_auth.device_id=generation.device_id
-       WHERE generation.participant_id=$1
+      SELECT r.id,r.occurrence_id,r.observed_at_ms,r.canonical_digest,scope.source_device_id
+        FROM matched
+        JOIN ${s}.telemetry_v12_typed_records r ON r.id=matched.id
+        CROSS JOIN LATERAL (
+          SELECT generation.device_id AS source_device_id
+            FROM ${s}.telemetry_v12_chunks chunk
+            JOIN ${s}.telemetry_v12_day_manifests manifest ON manifest.id=r.manifest_id
+             AND manifest.participant_id=chunk.participant_id AND manifest.device_id=chunk.device_id
+             AND manifest.state='ready'
+            JOIN ${s}.telemetry_v12_domain_days domain_day ON domain_day.manifest_id=manifest.id
+             AND domain_day.manifest_digest=manifest.manifest_digest
+            JOIN ${s}.telemetry_v12_domains generation ON generation.id=domain_day.generation_id
+             AND generation.participant_id=chunk.participant_id AND generation.device_id=chunk.device_id
+            JOIN retained_auth ON retained_auth.participant_id=generation.participant_id
+             AND retained_auth.device_id=generation.device_id
+           WHERE chunk.id=r.chunk_id AND chunk.manifest_id=r.manifest_id AND chunk.stream=$2
+             AND chunk.record_count=(SELECT count(*) FROM ${s}.telemetry_v12_typed_records complete
+               WHERE complete.chunk_id=chunk.id)
+             AND generation.participant_id=$1
+          OFFSET 0
+        ) scope
     ), grouped AS MATERIALIZED (
       SELECT min(id) AS id FROM eligible
        GROUP BY source_device_id,occurrence_id,observed_at_ms,canonical_digest
