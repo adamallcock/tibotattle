@@ -111,18 +111,24 @@ test("the probe's one read counts both typed families' tokens for exactly that d
   const client = await pool.connect();
   try {
     await seed(client, schema);
+    // The default report holds the listing: counts only.
     const report = await runUnseenTokenProbe(client, { schema, day: DAY });
-    assert.equal(report.verdict, "unseen");
-    assert.deepEqual(report.dimensions.model.unseen, [{ token: "gpt-6.1-sol", records: 2 }]);
-    assert.deepEqual([report.dimensions.model.records, report.dimensions.model.distinct], [3, 2]);
-    assert.deepEqual(report.dimensions.speed.unseen, [{ token: "ultrafast", records: 1 }]);
-    assert.equal(report.dimensions.speed.sentinels.other, 1);
-    assert.deepEqual(report.dimensions.tier.unseen, []);
+    assert.deepEqual([report.verdict, report.listing], ["unseen", "held"]);
+    assert.deepEqual([report.dimensions.model.records, report.dimensions.model.distinct,
+      report.dimensions.model.unseenDistinct, report.dimensions.model.unseenRecords], [3, 2, 1, 2]);
+    assert.deepEqual([report.dimensions.speed.unseenDistinct, report.dimensions.speed.sentinels.other], [1, 1]);
+    assert.equal(report.dimensions.tier.unseenDistinct, 0);
     // Plans: the two legacy usage records' attribution (pro), the legacy
     // quota's promax, and the v1.2 usage attribution and quota (plus).
-    assert.deepEqual(report.dimensions.plan.unseen, [{ token: "promax", records: 1 }]);
-    assert.equal(report.dimensions.plan.records, 5);
-    assert.doesNotMatch(JSON.stringify(report), /synthetic-other-day-model|synthetic-session|synthetic-occurrence/u);
+    assert.deepEqual([report.dimensions.plan.records, report.dimensions.plan.unseenDistinct], [5, 1]);
+    assert.doesNotMatch(JSON.stringify(report), /gpt-6\.1-sol|ultrafast|promax|synthetic/u);
+    // The same read with listing allowed names exactly that day's unseen tokens.
+    const listed = await runUnseenTokenProbe(client, { schema, day: DAY, listing: "plain" });
+    assert.deepEqual(listed.dimensions.model.unseen, [{ token: "gpt-6.1-sol", records: 2 }]);
+    assert.deepEqual(listed.dimensions.speed.unseen, [{ token: "ultrafast", records: 1 }]);
+    assert.deepEqual(listed.dimensions.tier.unseen, []);
+    assert.deepEqual(listed.dimensions.plan.unseen, [{ token: "promax", records: 1 }]);
+    assert.doesNotMatch(JSON.stringify(listed), /synthetic-other-day-model|synthetic-session|synthetic-occurrence/u);
     const empty = await runUnseenTokenProbe(client, { schema, day: "2026-09-01" });
     assert.deepEqual([empty.verdict, empty.dimensions.model.records], ["clear", 0]);
   } finally {

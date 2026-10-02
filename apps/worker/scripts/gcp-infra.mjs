@@ -42,8 +42,9 @@
  *   resume-all   --environment=<env> (--pause-receipt=<abs path> | --only=<name>[,<name>...])
  *                [--apply --authorize=<planDigest>]
  *     OPS-3. Resumes only managed triggers whose committed state is ENABLED,
- *     live PAUSED, and paused by that pause-all run (its receipt) or named by
- *     the operator with --only, in that order. Dry run by default.
+ *     live PAUSED, and paused by that pause-all run (its receipt, under 24 h
+ *     old, with the trigger unchanged since) or named by the operator with
+ *     --only, in that order. Dry run by default.
  *   bucket-birth --environment=<env> [--apply
  *                --authorize=bucket-birth:<project>:<bucket> --receipt-out=<abs path>]
  *     Dry run by default; with --apply, one bucket insert that refuses an
@@ -303,7 +304,7 @@ export async function main(argv = process.argv.slice(2), {
         only: config.only,
       };
       if (!config.apply) {
-        const plan = planResumeAll(desired, { runner, ...source });
+        const plan = planResumeAll(desired, { runner, ...source, ...(now === undefined ? {} : { now }) });
         print(plan);
         return plan.blockers.length > 0 ? 2 : 0;
       }

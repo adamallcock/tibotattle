@@ -236,7 +236,10 @@ export function readbackMonitoring(desired, { runner = defaultMonitoringRunner }
 
 function compare(kind, rendered, live, view) {
   return rendered.map((entry) => {
-    const deferred = entry.deferred === undefined ? {} : { deferred: entry.deferred };
+    const deferred = {
+      ...(entry.deferred === undefined ? {} : { deferred: entry.deferred }),
+      ...(entry.deferredConditions === undefined ? {} : { deferredConditions: entry.deferredConditions }),
+    };
     if (!Object.hasOwn(live, entry.name)) return { id: `${kind}:create:${entry.id}`, kind, name: entry.name, action: "create", ...deferred };
     const same = canonicalJson(view(entry.body)) === canonicalJson(live[entry.name]);
     return { id: `${kind}:${same ? "unchanged" : "update"}:${entry.id}`, kind, name: entry.name,

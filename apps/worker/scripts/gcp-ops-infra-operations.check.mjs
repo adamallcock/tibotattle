@@ -16,6 +16,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { canonicalJson } from "../src/canonical-json.ts";
 import * as manifest from "./gcp-ops-infra-manifest.mjs";
 import * as operations from "./gcp-ops-infra-operations.mjs";
 import {
@@ -1081,7 +1082,11 @@ test("pause-all applies only under its digest, pauses only, writes the receipt, 
     assert.equal(receipt.pausedAt, "2026-10-02T12:00:00.000Z");
     const written = JSON.parse(readFileSync(receiptPath, "utf8"));
     assert.deepEqual(written, JSON.parse(JSON.stringify(receipt)));
-    assert.deepEqual(operations.verifyPauseAllReceipt(written, desired), written);
+    assert.deepEqual(operations.verifyPauseAllReceipt(written, desired, { nowMs: Date.parse("2026-10-02T12:30:00Z") }),
+      written);
+    // Each plane trigger's read-back evidence is recorded for resume-all.
+    assert.deepEqual(written.triggers.find(({ name }) => name === TRIGGER),
+      { name: TRIGGER, state: "PAUSED", userUpdateTime: "2026-10-02T00:00:00Z", lastAttemptTime: null });
     const { statSync } = await import("node:fs");
     assert.equal(statSync(receiptPath).mode & 0o777, 0o600);
     // OPS-10's clean verdict is unchanged for the managed trigger: paused while
@@ -1125,10 +1130,12 @@ test("resume-all resumes only committed-ENABLED managed triggers that pause-all 
   const desired = desiredState({ synthetic: false, mutate: RESUMED });
   const world = resumedWorld(desired);
   const pausePlan = operations.planPauseAll(desired, { runner: fake(desired, world).runner });
+  const pausedAt = () => Date.parse("2026-10-02T12:00:00Z");
+  const now = () => Date.parse("2026-10-02T13:00:00Z");
   const receipt = await operations.applyPauseAll(desired, { runner: fake(desired, world).runner,
-    authorize: pausePlan.planDigest, receiptPath: join(directory, "pause.json") });
+    authorize: pausePlan.planDigest, receiptPath: join(directory, "pause.json"), now: pausedAt });
   const gcloud = fake(desired, world);
-  const plan = operations.planResumeAll(desired, { runner: gcloud.runner, pauseReceipt: receipt });
+  const plan = operations.planResumeAll(desired, { runner: gcloud.runner, pauseReceipt: receipt, now });
   assert.equal(kinds(gcloud.calls).every((kind) => kind === "read"), true, "the resume plan is a dry run");
   assert.deepEqual(plan.resume, [TRIGGER], "hand-made triggers are never resumed");
   assert.deepEqual(plan.triggers, [{ job: "analytics-refresh", name: TRIGGER, committedState: "ENABLED",
@@ -1137,14 +1144,14 @@ test("resume-all resumes only committed-ENABLED managed triggers that pause-all 
     [{ authorize: undefined }, "RESUME_ALL_AUTHORIZATION_REQUIRED"],
     [{ authorize: "0".repeat(64) }, "RESUME_ALL_PLAN_DIGEST_MISMATCH"],
   ]) {
-    assert.throws(() => operations.applyResumeAll(desired, { runner: gcloud.runner, pauseReceipt: receipt, ...options }),
+    assert.throws(() => operations.applyResumeAll(desired, { runner: gcloud.runner, pauseReceipt: receipt, now, ...options }),
       { code });
   }
   assert.throws(() => operations.applyResumeAll(desiredState({ mutate: RESUMED }), { runner: gcloud.runner,
-    pauseReceipt: receipt, authorize: plan.planDigest }), { code: "RESUME_ALL_SYNTHETIC_TARGET_REFUSED" });
+    pauseReceipt: receipt, authorize: plan.planDigest, now }), { code: "RESUME_ALL_SYNTHETIC_TARGET_REFUSED" });
   const before = gcloud.calls.length;
   const done = operations.applyResumeAll(desired, { runner: gcloud.runner, pauseReceipt: receipt,
-    authorize: plan.planDigest, now: () => Date.parse("2026-10-02T13:00:00Z") });
+    authorize: plan.planDigest, now });
   assert.deepEqual(gcloud.calls.slice(before).filter((argv) => operations.classifyGcloudCommand(argv) !== "read"),
     [["scheduler", "jobs", "resume", TRIGGER, `--project=${APPLY_PROJECT}`, "--location=us-east1"]]);
   assert.deepEqual([done.schema, done.outcomes], [operations.GCP_OPS_RESUME_ALL_RECEIPT_SCHEMA,
@@ -1154,8 +1161,8 @@ test("resume-all resumes only committed-ENABLED managed triggers that pause-all 
     assert.equal(world.schedulerJobs.find((entry) => entry.name.endsWith(`/${name}`)).state, "PAUSED", name);
   }
   // Applied again, there is nothing left to resume.
-  assert.deepEqual(operations.planResumeAll(desired, { runner: fake(desired, world).runner, pauseReceipt: receipt }).resume,
-    []);
+  assert.deepEqual(operations.planResumeAll(desired, { runner: fake(desired, world).runner, pauseReceipt: receipt, now })
+    .resume, []);
 });
 
 test("resume-all never resumes a trigger committed PAUSED, or one paused by someone else, and --only is exact", async (t) => {
@@ -1205,6 +1212,79 @@ test("resume-all never resumes a trigger committed PAUSED, or one paused by some
   assert.ok(operations.planPauseAll(resumed, { runner: fake(resumed, world).runner }).blockers
     .includes(`TRIGGER_STATE_UNRECOGNIZED:${TRIGGER}`));
 });
+
+/** A receipt edited and then re-digested, as a hand-forged or stale file would be. */
+function redigested(receipt, edit) {
+  const copy = structuredClone(receipt);
+  edit(copy);
+  delete copy.digest;
+  return { ...copy, digest: manifest.sha256Hex(canonicalJson(copy)) };
+}
+
+test("resume-all refuses an old receipt and skips a trigger changed after pause-all, even under a valid receipt",
+  async (t) => {
+    const directory = await receiptDirectory(t);
+    const desired = desiredState({ synthetic: false, mutate: RESUMED });
+    const world = resumedWorld(desired);
+    let tick = 0;
+    const clock = () => `2026-10-02T12:${String(tick++).padStart(2, "0")}:00Z`;
+    const pausedAtMs = Date.parse("2026-10-02T12:30:00Z");
+    const pausePlan = operations.planPauseAll(desired, { runner: fake(desired, world, { clock }).runner });
+    const receipt = await operations.applyPauseAll(desired, { runner: fake(desired, world, { clock }).runner,
+      authorize: pausePlan.planDigest, receiptPath: join(directory, "pause.json"), now: () => pausedAtMs });
+    const at = (iso) => () => Date.parse(iso);
+    const planAt = (now, pauseReceipt = receipt) => operations.planResumeAll(desired,
+      { runner: fake(desired, world, { clock }).runner, pauseReceipt, now });
+    assert.deepEqual(planAt(at("2026-10-03T12:30:00Z")).resume, [TRIGGER], "exactly 24 h old is still current");
+    // Age: a receipt older than 24 h, or dated ahead of now, is refused before any read.
+    assert.equal(operations.PAUSE_ALL_RECEIPT_MAX_AGE_HOURS, 24);
+    assert.throws(() => planAt(at("2026-10-03T12:30:01Z")), { code: "PAUSE_ALL_RECEIPT_STALE" });
+    const august = redigested(receipt, (copy) => { copy.pausedAt = "2026-08-01T00:00:00.000Z"; });
+    assert.throws(() => planAt(at("2026-10-02T13:00:00Z"), august), { code: "PAUSE_ALL_RECEIPT_STALE" });
+    assert.throws(() => operations.applyResumeAll(desired, { runner: fake(desired, world, { clock }).runner,
+      pauseReceipt: august, authorize: "0".repeat(64), now: at("2026-10-02T13:00:00Z") }), { code: "PAUSE_ALL_RECEIPT_STALE" });
+    const ahead = redigested(receipt, (copy) => { copy.pausedAt = "2026-10-02T13:06:00.000Z"; });
+    assert.throws(() => planAt(at("2026-10-02T13:00:00Z"), ahead), { code: "PAUSE_ALL_RECEIPT_INVALID" });
+    // The read-back evidence is closed and digested.
+    for (const edit of [
+      (copy) => { copy.triggers[0].extra = true; },
+      (copy) => { copy.triggers[0].userUpdateTime = "yesterday"; },
+      (copy) => { copy.triggers.push(copy.triggers[0]); },
+      (copy) => { copy.triggers = "none"; },
+    ]) {
+      assert.throws(() => planAt(at("2026-10-02T13:00:00Z"), redigested(receipt, edit)),
+        { code: "PAUSE_ALL_RECEIPT_INVALID" });
+    }
+    // No read-back for the trigger (the readback after the pauses failed): not resumed from the receipt.
+    const unread = redigested(receipt, (copy) => { copy.triggers = null; });
+    const missing = planAt(at("2026-10-02T13:00:00Z"), unread);
+    assert.deepEqual([missing.resume, missing.triggers[0].reason], [[], "PAUSE_ALL_READBACK_MISSING"]);
+    // Someone resumed it and paused it again on purpose after pause-all.
+    const now = at("2026-10-02T13:00:00Z");
+    assert.deepEqual(planAt(now).resume, [TRIGGER]);
+    const recorded = receipt.triggers.find(({ name }) => name === TRIGGER);
+    const call = fake(desired, world, { clock }).runner;
+    for (const verb of ["resume", "pause"]) {
+      assert.equal(call(["scheduler", "jobs", verb, TRIGGER, `--project=${desired.project}`, "--location=us-east1"]).status, 0);
+    }
+    assert.equal(trigger(world).state, "PAUSED");
+    assert.notEqual(trigger(world).userUpdateTime, recorded.userUpdateTime);
+    const repaused = planAt(now);
+    assert.deepEqual([repaused.resume, repaused.triggers[0].reason], [[], "CHANGED_AFTER_PAUSE_ALL"]);
+    const none = operations.applyResumeAll(desired, { runner: fake(desired, world, { clock }).runner,
+      pauseReceipt: receipt, authorize: repaused.planDigest, now });
+    assert.deepEqual(none.outcomes, []);
+    assert.equal(trigger(world).state, "PAUSED", "a deliberately re-paused trigger stays paused");
+    // A trigger that ran after pause-all was resumed in between, even if its userUpdateTime did not move.
+    trigger(world).userUpdateTime = recorded.userUpdateTime;
+    trigger(world).lastAttemptTime = "2026-10-02T12:45:00Z";
+    assert.deepEqual(planAt(now).triggers[0].reason, "CHANGED_AFTER_PAUSE_ALL");
+    // --only stays the operator's explicit path for both.
+    assert.deepEqual(operations.planResumeAll(desired, { runner: fake(desired, world).runner, only: [TRIGGER] }).resume,
+      [TRIGGER]);
+    assert.ok(operations.RESUME_SKIP_REASONS.includes("CHANGED_AFTER_PAUSE_ALL")
+      && operations.RESUME_SKIP_REASONS.includes("PAUSE_ALL_READBACK_MISSING"));
+  });
 
 test("in a shared project pause-all touches only the plane, and names a co-tenant trigger that keeps the gate shut",
   async (t) => {

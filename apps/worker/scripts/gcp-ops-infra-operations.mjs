@@ -1653,11 +1653,16 @@ export function probeScheduler(desired, { runner = defaultGcloudRunner, now = ()
 // ROLLOUT_JOBS_NOT_PAUSED gate (every Cloud Scheduler trigger in the region
 // that runs a Cloud Run job is PAUSED, classified by
 // gcp-scheduler-run-target.mjs as the rollout classifies it) can be met, and
-// records which triggers it paused in a receipt. resume-all resumes only a
-// managed trigger whose committed state is ENABLED, that is live PAUSED, and
-// that the pause-all receipt names as paused by that run or the operator
-// names with --only (asserting that they paused it): a trigger someone paused
-// on purpose stays paused, and nothing committed PAUSED is ever resumed.
+// records which triggers it paused in a receipt, with each plane trigger's
+// userUpdateTime and lastAttemptTime read back after the pauses. resume-all
+// resumes only a managed trigger whose committed state is ENABLED, that is
+// live PAUSED, and that either the operator names with --only (asserting
+// that they paused it) or a pause-all receipt names as paused by that run,
+// where the receipt is under PAUSE_ALL_RECEIPT_MAX_AGE_HOURS old and the
+// trigger's live userUpdateTime and lastAttemptTime still equal the ones it
+// recorded. A trigger someone paused on purpose stays paused, including one
+// resumed and paused again (or one that ran) after pause-all
+// (CHANGED_AFTER_PAUSE_ALL), and nothing committed PAUSED is ever resumed.
 //
 // The plane: in a dedicated project every trigger of the region; in a shared
 // project (staging in the GCP test project) only the plane's managed triggers
@@ -1677,12 +1682,20 @@ export const GCP_OPS_RESUME_ALL_RECEIPT_SCHEMA = "tibotattle-gcp-ops-resume-all-
 /** Why resume-all leaves a trigger as it is (closed). */
 export const RESUME_SKIP_REASONS = Object.freeze([
   "STATE_UNRECOGNIZED", "COMMITTED_STATE_PAUSED", "TRIGGER_ABSENT", "ALREADY_ENABLED", "NOT_PAUSED_BY_PAUSE_ALL",
-  "NOT_SELECTED",
+  "PAUSE_ALL_READBACK_MISSING", "CHANGED_AFTER_PAUSE_ALL", "NOT_SELECTED",
 ]);
+/**
+ * A pause-all receipt older than this is refused (PAUSE_ALL_RECEIPT_STALE);
+ * the operator names the triggers with --only instead. A pausedAt more than
+ * PAUSE_ALL_RECEIPT_CLOCK_SKEW_MINUTES ahead of now is invalid.
+ */
+export const PAUSE_ALL_RECEIPT_MAX_AGE_HOURS = 24;
+export const PAUSE_ALL_RECEIPT_CLOCK_SKEW_MINUTES = 5;
 const PAUSE_RECEIPT_KEYS = Object.freeze([
   "schema", "environment", "project", "region", "planDigest", "status", "pausedAt", "paused", "alreadyPaused",
   "failed", "triggers", "rolloutGate", "digest",
 ]);
+const PAUSE_RECEIPT_TRIGGER_KEYS = Object.freeze(["name", "state", "userUpdateTime", "lastAttemptTime"]);
 const PAUSE_RECEIPT_MAX_BYTES = 256 * 1024;
 const TRIGGER_NAME = /^[A-Za-z0-9_-]{1,500}$/u;
 
@@ -1690,7 +1703,16 @@ function sortedNames(names) {
   return [...names].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
 }
 
-/** The region's triggers as content-free views: name, live state and the Cloud Run job each runs. */
+/** An RFC 3339 instant exactly as Cloud Scheduler gave it, or null when absent or malformed. */
+function instantText(value) {
+  return instantMs(value) === null ? null : value;
+}
+
+/**
+ * The region's triggers as content-free views: name, live state, the Cloud
+ * Run job each runs, and its userUpdateTime and lastAttemptTime (the
+ * evidence resume-all compares with a pause-all receipt).
+ */
 function readTriggers(call, desired) {
   const entries = array(call(["scheduler", "jobs", "list", `--project=${desired.project}`,
     `--location=${desired.region}`, "--format=json"]), "scheduler-jobs");
@@ -1701,6 +1723,8 @@ function readTriggers(call, desired) {
       name,
       state: SCHEDULER_LIVE_STATES.includes(entry.state) ? entry.state : "UNRECOGNIZED",
       runJob: scheduledRunJob(entry),
+      userUpdateTime: instantText(entry.userUpdateTime),
+      lastAttemptTime: instantText(entry.lastAttemptTime),
     });
   }).sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
 }
@@ -1855,7 +1879,8 @@ export async function applyPauseAll(desired, {
     paused: sortedNames(paused),
     alreadyPaused: sortedNames(plan.triggers.filter(({ state }) => state === "PAUSED").map(({ name }) => name)),
     failed,
-    triggers: planeAfter === null ? null : planeAfter.map(({ name, state }) => ({ name, state })),
+    triggers: planeAfter === null ? null : planeAfter.map(({ name, state, userUpdateTime, lastAttemptTime }) => ({
+      name, state, userUpdateTime, lastAttemptTime })),
     rolloutGate: after === null ? null : rolloutTriggerGate(after),
   };
   const receipt = deepFreeze({ ...body, digest: digestOf(body) });
@@ -1866,8 +1891,22 @@ export async function applyPauseAll(desired, {
   return receipt;
 }
 
-/** A pause-all receipt for this plane, structurally valid and self-digested. */
-export function verifyPauseAllReceipt(receipt, desired) {
+function receiptTriggerValid(entry) {
+  return isRecord(entry) && Object.keys(entry).length === PAUSE_RECEIPT_TRIGGER_KEYS.length
+    && PAUSE_RECEIPT_TRIGGER_KEYS.every((key) => Object.hasOwn(entry, key))
+    && typeof entry.name === "string" && TRIGGER_NAME.test(entry.name)
+    && (SCHEDULER_LIVE_STATES.includes(entry.state) || entry.state === "UNRECOGNIZED")
+    && [entry.userUpdateTime, entry.lastAttemptTime].every((value) => value === null || instantText(value) === value);
+}
+
+/**
+ * A pause-all receipt for this plane: structurally valid (closed keys, its
+ * read-back triggers included), self-digested, and recent. A receipt whose
+ * pausedAt is more than PAUSE_ALL_RECEIPT_MAX_AGE_HOURS before `nowMs` is
+ * PAUSE_ALL_RECEIPT_STALE; one dated in the future is invalid.
+ */
+export function verifyPauseAllReceipt(receipt, desired, { nowMs = Date.now() } = {}) {
+  if (!Number.isSafeInteger(nowMs) || nowMs < 0) fail("PAUSE_ALL_RECEIPT_CLOCK_INVALID");
   const ok = isRecord(receipt) && Object.keys(receipt).length === PAUSE_RECEIPT_KEYS.length
     && PAUSE_RECEIPT_KEYS.every((key) => Object.hasOwn(receipt, key))
     && receipt.schema === GCP_OPS_PAUSE_ALL_RECEIPT_SCHEMA
@@ -1879,9 +1918,14 @@ export function verifyPauseAllReceipt(receipt, desired) {
       && names.every((name) => typeof name === "string" && TRIGGER_NAME.test(name))
       && new Set(names).size === names.length)
     && (receipt.failed === null || (typeof receipt.failed === "string" && TRIGGER_NAME.test(receipt.failed)))
+    && (receipt.triggers === null || (Array.isArray(receipt.triggers) && receipt.triggers.every(receiptTriggerValid)
+      && new Set(receipt.triggers.map(({ name }) => name)).size === receipt.triggers.length))
     && receipt.digest === digestOf(Object.fromEntries(PAUSE_RECEIPT_KEYS.filter((key) => key !== "digest")
       .map((key) => [key, receipt[key]])));
   if (!ok) fail("PAUSE_ALL_RECEIPT_INVALID");
+  const pausedAtMs = Date.parse(receipt.pausedAt);
+  if (pausedAtMs > nowMs + PAUSE_ALL_RECEIPT_CLOCK_SKEW_MINUTES * 60_000) fail("PAUSE_ALL_RECEIPT_INVALID");
+  if (nowMs - pausedAtMs > PAUSE_ALL_RECEIPT_MAX_AGE_HOURS * 3_600_000) fail("PAUSE_ALL_RECEIPT_STALE");
   return deepFreeze(structuredClone(receipt));
 }
 
@@ -1891,7 +1935,11 @@ export function verifyPauseAllReceipt(receipt, desired) {
  * is required. With `only`, exactly those triggers are resumed, in that
  * order, and each must be eligible (committed ENABLED, live PAUSED or already
  * ENABLED); without it, the receipt's paused triggers that are eligible, in
- * name order.
+ * name order. A receipt-sourced trigger is resumed only while its live
+ * userUpdateTime and lastAttemptTime equal those the receipt read back after
+ * the pauses: a trigger resumed and paused again, updated, or run since then
+ * is CHANGED_AFTER_PAUSE_ALL, and one the receipt has no read-back for is
+ * PAUSE_ALL_READBACK_MISSING (the operator may still name it with --only).
  */
 export function resumeAllPlan(desired, triggers, { pauseReceipt = null, only = null } = {}) {
   if (pauseReceipt === null && only === null) fail("RESUME_ALL_SOURCE_REQUIRED");
@@ -1914,7 +1962,13 @@ export function resumeAllPlan(desired, triggers, { pauseReceipt = null, only = n
     if (live === null) return decide("none", "TRIGGER_ABSENT");
     if (live.state === "ENABLED") return decide("none", "ALREADY_ENABLED");
     if (only !== null) return only.includes(name) ? decide("resume") : decide("none", "NOT_SELECTED");
-    return pausedByPauseAll.has(name) ? decide("resume") : decide("none", "NOT_PAUSED_BY_PAUSE_ALL");
+    if (!pausedByPauseAll.has(name)) return decide("none", "NOT_PAUSED_BY_PAUSE_ALL");
+    const recorded = pauseReceipt.triggers?.find((entry) => entry.name === name) ?? null;
+    if (recorded === null || recorded.state !== "PAUSED") return decide("none", "PAUSE_ALL_READBACK_MISSING");
+    if (recorded.userUpdateTime !== live.userUpdateTime || recorded.lastAttemptTime !== live.lastAttemptTime) {
+      return decide("none", "CHANGED_AFTER_PAUSE_ALL");
+    }
+    return decide("resume");
   });
   if (only !== null) {
     for (const name of only) {
@@ -1940,8 +1994,9 @@ export function resumeAllPlan(desired, triggers, { pauseReceipt = null, only = n
 }
 
 /** Reads the region and plans resume-all; read calls only. */
-export function planResumeAll(desired, { runner = defaultGcloudRunner, pauseReceipt = null, only = null } = {}) {
-  const receipt = pauseReceipt === null ? null : verifyPauseAllReceipt(pauseReceipt, desired);
+export function planResumeAll(desired, { runner = defaultGcloudRunner, pauseReceipt = null, only = null,
+  now = () => Date.now() } = {}) {
+  const receipt = pauseReceipt === null ? null : verifyPauseAllReceipt(pauseReceipt, desired, { nowMs: now() });
   const triggers = readTriggers(guardedGcloud(runner, { mode: "read", project: desired.project }), desired);
   return resumeAllPlan(desired, triggers, { pauseReceipt: receipt, only });
 }
@@ -1960,7 +2015,7 @@ export function applyResumeAll(desired, {
   now = () => Date.now(),
 } = {}) {
   applyPreconditions(desired, authorize, "RESUME_ALL");
-  const plan = planResumeAll(desired, { runner, pauseReceipt, only });
+  const plan = planResumeAll(desired, { runner, pauseReceipt, only, now });
   if (plan.planDigest !== authorize) fail("RESUME_ALL_PLAN_DIGEST_MISMATCH");
   if (plan.blockers.length > 0) fail("RESUME_ALL_BLOCKED");
   const call = guardedGcloud(runner, { mode: "resume", project: desired.project });

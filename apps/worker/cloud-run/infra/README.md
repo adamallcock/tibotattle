@@ -74,18 +74,32 @@ state.
   `scripts/gcp-scheduler-run-target.mjs`. The plan names any co-tenant
   trigger that keeps that gate shut; pause-all never touches it. The receipt
   (`--receipt-out`, written even when a pause fails) records which triggers
-  this run paused and which were already paused.
+  this run paused and which were already paused. It also records each plane
+  trigger's `userUpdateTime` and `lastAttemptTime`, read back after the
+  pauses.
 - **resume-all** resumes a managed trigger only when its committed `state`
-  is `ENABLED`, it is live `PAUSED`, and either the pause-all receipt
-  (`--pause-receipt`) records it as paused by that run or the operator names
-  it with `--only`. A trigger someone paused on purpose stays paused.
+  is `ENABLED`, it is live `PAUSED`, and one of these holds:
+  - the operator names it with `--only`;
+  - the pause-all receipt (`--pause-receipt`) records it as paused by that
+    run, the receipt is at most 24 hours old, and the trigger's live
+    `userUpdateTime` and `lastAttemptTime` still equal the recorded ones.
+
+  An older receipt is refused (`PAUSE_ALL_RECEIPT_STALE`). A trigger resumed
+  and paused again, updated, or run since pause-all is skipped
+  (`CHANGED_AFTER_PAUSE_ALL`), so a trigger someone paused on purpose stays
+  paused. A trigger with no read-back in the receipt is skipped
+  (`PAUSE_ALL_READBACK_MISSING`). In either case the operator may still
+  name it with `--only`.
 
 `node scripts/gcp-infra.mjs scheduler-probe --environment=<env>` is the
 paused-too-long signal. It exits 2 when a trigger whose committed state is
 `ENABLED` has been `PAUSED` for 6 hours or more, with no user change or
 attempt in that time. OPS-5 renders the matching alert (`scheduler-quiet` in
 `monitoring.md`): no Cloud Scheduler attempt within max(6 h, cadence plus
-slack). The alert is not applied yet and waits for the cadence and the
-owner's notification channel (OWN-5c). The probe also assumes that pausing a
-trigger updates its `userUpdateTime`. The first owner-run readback against
-the test project has to confirm that after a pause.
+slack). That is about 25 hours for a daily trigger, so it is a proxy, not
+the 6-hour signal; the trade-off waits for the owner (OWN-5). The alert is
+not applied yet and waits for the cadence and the owner's notification
+channel (OWN-5c). The probe also assumes that pausing a trigger updates its
+`userUpdateTime`. The first owner-run readback against the test project has
+to confirm that after a pause. resume-all does not rely on that assumption
+alone: it also compares `lastAttemptTime`, and the receipt's age is bounded.

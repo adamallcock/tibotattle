@@ -628,7 +628,12 @@ state that only a gcp deploy produces, or that lacks the ingestion database.
   record defines no in-place contract upgrade; one would need its own reviewed
   procedure. Under the blob rule as written, the only path is through the brake
   (gcp to fenced, origin deploy, fenced to gcp), and the forwarded routes are
-  unavailable for that window.
+  unavailable for that window. Since 2026-10-02 (D-BLOB), every origin deploy
+  checks the live edge commit in every edge mode. The brake to fenced must
+  therefore deploy from an edge commit that already carries the new contract
+  blob; the fenced edge does not compare the origin's blob, so it can go
+  first. The maintained steps are in
+  [Production edge modes](../runbooks/production-edge-modes.md#cloud-run-deploys).
 - **Fail-closed today.** The fast-path test origin's health is a test schema and
   it does not serve `/api/ready` (finding F8). A gcp deploy therefore cannot
   pass against any fast-path origin. It can pass only once the production

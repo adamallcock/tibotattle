@@ -196,6 +196,25 @@ test("the scheduler paused-too-long alert waits max(6 h, cadence plus slack) per
   assert.equal(policy(monitoring.renderMonitoring(STAGING), "scheduler-quiet").deferred, "SCHEDULER_CADENCE_UNSET");
 });
 
+test("scheduler-quiet defers per trigger: one deferred trigger never silences another's condition", () => {
+  const live = { job: "analytics-refresh", cadence: { gapMinutes: 1440 } };
+  const paused = { job: "synthetic-probe", cadence: { deferred: "TRIGGER_COMMITTED_PAUSED" } };
+  const unset = { job: "synthetic-maintenance", cadence: { deferred: "SCHEDULER_CADENCE_UNSET" } };
+  assert.deepEqual(monitoring.schedulerQuietConditions([live, paused, unset]), { conditions: [live], deferred: null,
+    deferredConditions: [{ job: "synthetic-probe", deferred: "TRIGGER_COMMITTED_PAUSED" },
+      { job: "synthetic-maintenance", deferred: "SCHEDULER_CADENCE_UNSET" }] });
+  assert.deepEqual(monitoring.schedulerQuietConditions([paused, live]).conditions, [live]);
+  assert.deepEqual(monitoring.schedulerQuietConditions([live]), { conditions: [live], deferred: null, deferredConditions: [] });
+  assert.deepEqual(monitoring.schedulerQuietConditions([unset, paused]), { conditions: [unset, paused],
+    deferred: "SCHEDULER_CADENCE_UNSET", deferredConditions: [] });
+  assert.throws(() => monitoring.schedulerQuietConditions([]), { code: "MONITORING_POLICY_INVALID" });
+  // The committed plane: one trigger, no cadence yet, so the whole policy waits.
+  const rendered = monitoring.renderMonitoring(STAGING);
+  assert.deepEqual([policy(rendered, "scheduler-quiet").deferred, "deferredConditions" in policy(rendered, "scheduler-quiet")],
+    ["SCHEDULER_CADENCE_UNSET", false]);
+  assert.equal(policy(monitoring.renderMonitoring(resumed("15 3 * * *")), "scheduler-quiet").deferredConditions, undefined);
+});
+
 test("cron gaps follow the validator's grammar in UTC", () => {
   for (const [schedule, gap] of [["*/5 * * * *", 5], ["0 * * * *", 60], ["15 3 * * *", 1440], ["0 */6 * * *", 360],
     ["0 0 1 * *", 44640], ["30 2 * * 1-5", 4320], ["0 9,17 * * *", 960], ["5/15 * * * *", 15], ["0 0 29 2 *", null]]) {
@@ -221,15 +240,55 @@ test("Cloud SQL alerts read the plane's instance, and connections follow the com
   assert.equal(policy(rendered, "sql-connections").body.conditions[0].conditionThreshold.thresholdValue, 80);
 });
 
+/**
+ * A log entry against a rendered filter, for the subset this module renders:
+ * `field="value"` and `field=("a" OR "b")` clauses joined by AND.
+ */
+function filterMatches(filter, entry) {
+  return filter.split(" AND ").every((clause) => {
+    const match = /^([A-Za-z_.@"]+)=(?:"([^"]*)"|\(((?:"[^"]*"(?: OR )?)+)\))$/u.exec(clause);
+    assert.ok(match, `unsupported clause ${clause}`);
+    const value = match[1].split(".").reduce((node, key) => node?.[key.replaceAll('"', "")], entry);
+    const allowed = match[2] !== undefined ? [match[2]] : [...match[3].matchAll(/"([^"]*)"/gu)].map(([, text]) => text);
+    return typeof value === "string" && allowed.includes(value);
+  });
+}
+
 test("K-DETECT alerts key on the probe's own schema and verdict, and wait for its job", async () => {
   const probe = await import("../cloud-run/unseen-token-probe.mjs");
   assert.equal(monitoring.UNSEEN_TOKEN_PROBE_SCHEMA, probe.UNSEEN_TOKEN_PROBE_SCHEMA);
+  assert.deepEqual([...monitoring.UNSEEN_TOKEN_PROBE_VERDICTS], [...probe.UNSEEN_TOKEN_PROBE_VERDICTS]);
   const rendered = monitoring.renderMonitoring(STAGING);
   assert.match(rendered.metrics[3].body.filter, /jsonPayload\.schema="tibotattle-unseen-token-probe-v1"/u);
+  assert.match(rendered.metrics[3].body.filter, /jsonPayload\.verdict=\("clear" OR "unseen"\)$/u);
   assert.match(query(rendered, "unseen-tokens"), /verdict="unseen"\}\[1d\]\)\) > 0$/u);
   assert.match(query(rendered, "unseen-tokens-silent"), /\[26h\]\)$/u);
   assert.equal(manifest.JOB_NAMES.includes(monitoring.UNSEEN_TOKEN_PROBE_JOB), false, "D-OPS4 adds the probe job");
   assert.equal(policy(rendered, "unseen-tokens").deferred, "PRODUCER_NOT_IN_MANIFEST:unseen-token-probe");
+});
+
+test("a K-DETECT probe that only fails is silence: its failure line never feeds the metric", async () => {
+  const probe = await import("../cloud-run/unseen-token-probe.mjs");
+  const { spawnSync } = await import("node:child_process");
+  const [, , , metric] = monitoring.renderMonitoring(STAGING).metrics;
+  // Cloud Run parses a JSON line on stdout or stderr into jsonPayload.
+  const asEntry = (line) => ({ resource: { type: "cloud_run_job" }, jsonPayload: JSON.parse(line) });
+  const failed = spawnSync(process.execPath, [join(WORKER_ROOT, "cloud-run/unseen-token-probe.mjs"),
+    "--schema=synthetic_schema"], { encoding: "utf8", env: { PATH: "" }, timeout: 30_000 });
+  assert.equal(failed.status, 1);
+  const failure = asEntry(failed.stderr.trim());
+  assert.deepEqual([failure.jsonPayload.schema, failure.jsonPayload.status], [probe.UNSEEN_TOKEN_PROBE_SCHEMA, "failed"]);
+  assert.equal(filterMatches(metric.body.filter, failure), false, "a failure line is not a report");
+  // Without the verdict clause the same line would have kept the silent alert quiet.
+  assert.equal(filterMatches(metric.body.filter.replace(/ AND jsonPayload\.verdict=\([^)]*\)$/u, ""), failure), true);
+  for (const rows of [[], [{ dimension: "model", token: "synthetic-unseen-model", records: 1 }]]) {
+    const report = asEntry(JSON.stringify(probe.unseenTokenReport(rows, { day: "2026-10-01" })));
+    assert.equal(filterMatches(metric.body.filter, report), true, report.jsonPayload.verdict);
+    assert.equal(filterMatches(metric.body.filter, { ...report, resource: { type: "cloud_run_revision" } }), false);
+  }
+  // The silent condition reads that metric alone, so a failure-only day is absent.
+  const silent = query(monitoring.renderMonitoring(STAGING), "unseen-tokens-silent");
+  assert.equal(silent, `absent_over_time(logging_googleapis_com:user_${metric.name}{monitored_resource="cloud_run_job"}[26h])`);
 });
 
 test("every policy links to its own anchor in the maintained runbook", () => {

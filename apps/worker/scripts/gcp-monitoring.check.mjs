@@ -162,6 +162,13 @@ test("the plan is deterministic, never applies, defers what waits and refuses de
   readbackMonitoring(STAGING, { runner: fakeMonitoring(liveFrom(rendered)).runner }));
   assert.equal(otherChannel.operations.filter(({ action }) => action === "update").length, 11);
   assert.throws(() => planMonitoring(rendered, { schema: "other" }), { code: "MONITORING_PLAN_READBACK_INVALID" });
+  // A policy that dropped a deferred trigger's condition says so in the plan.
+  const dropped = structuredClone(rendered);
+  dropped.policies.find(({ id }) => id === "scheduler-quiet").deferredConditions = [
+    { job: "synthetic-probe", deferred: "TRIGGER_COMMITTED_PAUSED" }];
+  const named = planMonitoring(dropped, readbackMonitoring(STAGING, { runner: fakeMonitoring(liveFrom(rendered)).runner }));
+  assert.deepEqual(named.operations.find(({ id }) => id.endsWith(":scheduler-quiet")).deferredConditions,
+    [{ job: "synthetic-probe", deferred: "TRIGGER_COMMITTED_PAUSED" }]);
 });
 
 test("production waits for its owner placeholders", async () => {

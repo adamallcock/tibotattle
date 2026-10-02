@@ -15,18 +15,28 @@
  * It reads both typed families (the retained v1/v1.1 typed_telemetry_* tables
  * and the v1.2 telemetry_v12_typed_* tables) through typed_telemetry_dictionary,
  * grouped by token: no owner, device, session, account or record identifier
- * is selected, and the output holds counts and tokens only. A token the
- * catalog does not name is "unseen" and is listed in plain text (the owner's
- * 2026-10-02 round-3 decision: model, speed, tier and plan names are not
- * confidential, ARNs included), bounded by UNSEEN_TOKEN_GRAMMAR; a token
- * outside that grammar is counted as unrecognized and never printed. The
- * sentinels ("unknown", "other", "mixed") are catalog members whose shares
- * are reported separately, so a rise in "other" speed (Ultrafast) or
- * "unknown" model shows even when no new token appears.
+ * is selected, and the output holds counts (and, once listing is allowed,
+ * tokens) only. A token the catalog does not name is "unseen" when it fits
+ * UNSEEN_TOKEN_GRAMMAR, the v1.x wire grammar (owner decision, round 7 "Name
+ * guard"), and "unrecognized" otherwise: an ARN with "/", an email address or
+ * anything over 64 characters is counted, never printed. The sentinels
+ * ("unknown", "other", "mixed") are catalog members whose shares are reported
+ * separately, so a rise in "other" speed (Ultrafast) or "unknown" model shows
+ * even when no new token appears.
+ *
+ * Listing is HELD (UNSEEN_TOKEN_LISTING): the owner's round-3 amendment lets
+ * these names pass in plain text, but requires the change that does so to
+ * narrow the root AGENTS.md "raw account IDs" invariant and its tests and
+ * docs. Until that change lands, the probe reports how many distinct unseen
+ * tokens each dimension holds and how many records carry them, and prints no
+ * token. The change that narrows the invariant flips UNSEEN_TOKEN_LISTING to
+ * "plain"; the bounded listing below is already checked.
  *
  * One JSON line on stdout per run (schema tibotattle-unseen-token-probe-v1),
  * which OPS-5's log-based metric keys on (verdict "unseen" or "clear"); one
- * JSON error line with a closed code on stderr otherwise. Exit 0 when the
+ * JSON error line with a closed code and no verdict on stderr otherwise
+ * (OPS-5's metric counts only lines with a verdict, so a probe that fails
+ * every day goes silent and raises unseen-tokens-silent). Exit 0 when the
  * probe ran (whatever it found), 2 for a usage refusal, 1 for any other
  * failure. The CLI connects only to a local endpoint (PG_TEST_SOCKET, a
  * private /private/tmp/tibotattle-pg-* socket directory, or a loopback
@@ -55,12 +65,21 @@ export const UNSEEN_TOKEN_DIMENSIONS = Object.freeze(["model", "speed", "tier", 
 /** Catalog members whose share is reported, not treated as a known identity. */
 export const UNSEEN_TOKEN_SENTINELS = Object.freeze(["unknown", "other", "mixed"]);
 /**
- * The structural guard on a printed token (owner decision, round 3
- * amendment): at most 64 characters (the dictionary's own bound), a safe
- * printable character set, no space or control character. ARNs and
- * account-number-like strings pass; anything else is counted, never printed.
+ * The name guard (owner decision, round 7): exactly the v1.x wire grammar
+ * that telemetry-contract enforces on every token (telemetry-v1.1.js TOKEN,
+ * telemetry-v1.2.js V12_TOKEN; not exported, so restated here and pinned to
+ * both sources by unseen-token-probe.check.mjs). Case is preserved. An ARN
+ * with "/", an email address, or anything over 64 characters is
+ * "unrecognized": counted, never printed.
  */
-export const UNSEEN_TOKEN_GRAMMAR = /^[A-Za-z0-9._:/@+=-]{1,64}$/u;
+export const UNSEEN_TOKEN_GRAMMAR = /^[A-Za-z0-9._:-]{1,64}$/u;
+/**
+ * Whether unseen tokens are printed: "held" (counts only) until the change
+ * that narrows the root AGENTS.md "raw account IDs" invariant for model,
+ * speed, tier and plan names (owner, round-3 amendment) flips it to "plain".
+ */
+export const UNSEEN_TOKEN_LISTINGS = Object.freeze(["held", "plain"]);
+export const UNSEEN_TOKEN_LISTING = "held";
 /** At most this many unseen tokens are listed per dimension; the rest are counted. */
 export const UNSEEN_TOKEN_LIST_LIMIT = 50;
 export const UNSEEN_TOKEN_PROBE_VERDICTS = Object.freeze(["clear", "unseen"]);
@@ -172,16 +191,22 @@ export async function readDayTokenCounts(client, { schema, day }) {
 
 /**
  * The content-free report for one day's (dimension, token, records) rows
- * against a catalog. Pure and deterministic: tokens are sorted, unseen lists
- * are bounded, and nothing but tokens and counts is carried.
+ * against a catalog. Pure and deterministic. Per dimension it counts the
+ * distinct unseen tokens (unseenDistinct) and their records, and the
+ * unrecognized ones; with listing "plain" it also lists the unseen tokens,
+ * sorted and bounded (unseen, unseenListed, unseenOverflow). With listing
+ * "held", the default, no token is carried at all.
  */
-export function unseenTokenReport(rows, { day, catalog = bundledTokenCatalog(), listLimit = UNSEEN_TOKEN_LIST_LIMIT }) {
+export function unseenTokenReport(rows, { day, catalog = bundledTokenCatalog(), listLimit = UNSEEN_TOKEN_LIST_LIMIT,
+  listing = UNSEEN_TOKEN_LISTING }) {
   observedDay(day);
+  if (!UNSEEN_TOKEN_LISTINGS.includes(listing)) fail("UNSEEN_TOKEN_PROBE_LISTING_INVALID");
   if (!Array.isArray(rows)) fail("UNSEEN_TOKEN_PROBE_ROWS_INVALID");
   const dimensions = Object.fromEntries(UNSEEN_TOKEN_DIMENSIONS.map((dimension) => [dimension, {
     records: 0, distinct: 0, sentinels: Object.fromEntries(UNSEEN_TOKEN_SENTINELS.map((token) => [token, 0])),
-    unseen: [], unseenRecords: 0, unseenListed: 0, unseenOverflow: 0, unrecognized: 0, unrecognizedRecords: 0,
+    unseenDistinct: 0, unseenRecords: 0, unrecognized: 0, unrecognizedRecords: 0,
   }]));
+  const unseen = Object.fromEntries(UNSEEN_TOKEN_DIMENSIONS.map((dimension) => [dimension, []]));
   for (const row of rows) {
     if (row === null || typeof row !== "object" || !UNSEEN_TOKEN_DIMENSIONS.includes(row.dimension)
         || typeof row.token !== "string" || !Number.isSafeInteger(row.records) || row.records < 1) {
@@ -198,23 +223,26 @@ export function unseenTokenReport(rows, { day, catalog = bundledTokenCatalog(), 
       entry.unrecognized += 1;
       entry.unrecognizedRecords += row.records;
     } else {
-      entry.unseen.push({ token: row.token, records: row.records });
+      entry.unseenDistinct += 1;
       entry.unseenRecords += row.records;
+      unseen[row.dimension].push({ token: row.token, records: row.records });
     }
   }
   let unseenTotal = 0;
-  for (const entry of Object.values(dimensions)) {
-    entry.unseen.sort((left, right) => right.records - left.records
+  for (const [dimension, entry] of Object.entries(dimensions)) {
+    unseenTotal += entry.unseenDistinct + entry.unrecognized;
+    if (listing !== "plain") continue;
+    const listed = unseen[dimension].sort((left, right) => right.records - left.records
       || (left.token < right.token ? -1 : left.token > right.token ? 1 : 0));
-    entry.unseenOverflow = Math.max(0, entry.unseen.length - listLimit);
-    entry.unseen = entry.unseen.slice(0, listLimit);
+    entry.unseen = listed.slice(0, listLimit);
     entry.unseenListed = entry.unseen.length;
-    unseenTotal += entry.unseenListed + entry.unseenOverflow + entry.unrecognized;
+    entry.unseenOverflow = Math.max(0, listed.length - listLimit);
   }
   return Object.freeze({
     schema: UNSEEN_TOKEN_PROBE_SCHEMA,
     day,
     catalogVersion: catalog.version,
+    listing,
     dimensions,
     unseenTotal,
     verdict: unseenTotal > 0 ? "unseen" : "clear",
@@ -222,8 +250,9 @@ export function unseenTokenReport(rows, { day, catalog = bundledTokenCatalog(), 
 }
 
 /** One probe run over an open client. */
-export async function runUnseenTokenProbe(client, { schema, day, catalog = bundledTokenCatalog() }) {
-  return unseenTokenReport(await readDayTokenCounts(client, { schema, day }), { day, catalog });
+export async function runUnseenTokenProbe(client, { schema, day, catalog = bundledTokenCatalog(),
+  listing = UNSEEN_TOKEN_LISTING }) {
+  return unseenTokenReport(await readDayTokenCounts(client, { schema, day }), { day, catalog, listing });
 }
 
 export function parseUnseenTokenProbeArguments(argv, { nowMs = Date.now() } = {}) {

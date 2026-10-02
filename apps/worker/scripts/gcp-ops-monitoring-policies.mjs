@@ -30,8 +30,15 @@
  *                                  committed ENABLED within max(6 h, cadence
  *                                  + slack): the paused-too-long signal.
  *                                  Cloud Scheduler has no paused-state metric;
- *                                  a PAUSED trigger makes no attempt. The
- *                                  operator's exact check stays
+ *                                  a PAUSED trigger makes no attempt. This is
+ *                                  a log-absence proxy, so the effective delay
+ *                                  is the larger of the two: about 25 h for a
+ *                                  daily trigger, not the owner's "a few
+ *                                  hours" (a trade-off for OWN-5). One
+ *                                  condition per trigger; a trigger that has
+ *                                  no cadence yet or is committed PAUSED drops
+ *                                  only its own condition (deferredConditions).
+ *                                  The operator's exact check stays
  *                                  `gcp-infra.mjs scheduler-probe`.
  *   origin-lock            page    an unauthenticated uptime check of the
  *                                  service's run.app /api/health must get
@@ -44,7 +51,10 @@
  *   unseen-tokens          ticket  K-DETECT: a daily unseen-token probe line
  *                                  (cloud-run/unseen-token-probe.mjs) with
  *                                  verdict "unseen".
- *   unseen-tokens-silent   ticket  no probe line for 26 h.
+ *   unseen-tokens-silent   ticket  no completed probe report for 26 h. The
+ *                                  metric counts only lines with a verdict
+ *                                  (clear or unseen), so a probe that fails
+ *                                  every day is silent, not healthy.
  *
  * A policy whose producer or input does not exist yet is rendered and
  * deferred with a closed reason (SCHEDULER_CADENCE_UNSET,
@@ -92,8 +102,9 @@ export const ORIGIN_REQUEST_LOG_CONTRACT = Object.freeze({
 });
 /** cloud-run/analytics-refresh.mjs ANALYTICS_REFRESH_RECEIPT_VERSION. */
 export const ANALYTICS_REFRESH_RECEIPT_VERSION = "analytics-refresh-receipt-v1";
-/** cloud-run/unseen-token-probe.mjs UNSEEN_TOKEN_PROBE_SCHEMA, and the job D-OPS4 would run it as. */
+/** cloud-run/unseen-token-probe.mjs UNSEEN_TOKEN_PROBE_SCHEMA and its verdicts, and the job D-OPS4 would run it as. */
 export const UNSEEN_TOKEN_PROBE_SCHEMA = "tibotattle-unseen-token-probe-v1";
+export const UNSEEN_TOKEN_PROBE_VERDICTS = Object.freeze(["clear", "unseen"]);
 export const UNSEEN_TOKEN_PROBE_JOB = "unseen-token-probe";
 /** Cloud Scheduler's attempt log entry (to confirm at the first readback). */
 export const SCHEDULER_ATTEMPT_LOG_TYPE = "type.googleapis.com/google.cloud.scheduler.logging.AttemptStarted";
@@ -302,6 +313,25 @@ function triggerCadence(desired, job) {
 }
 
 /**
+ * scheduler-quiet's conditions, one per trigger ([{ job, cadence }]). A
+ * trigger with no usable cadence, or committed PAUSED, drops only its own
+ * condition (listed in deferredConditions), so one deferred trigger never
+ * silences another's. The policy is deferred, with the first trigger's
+ * reason, only when every condition is.
+ */
+export function schedulerQuietConditions(quiet) {
+  if (!Array.isArray(quiet) || quiet.length === 0) fail("MONITORING_POLICY_INVALID");
+  const live = quiet.filter(({ cadence }) => cadence.deferred === undefined);
+  if (live.length === 0) return { conditions: quiet, deferred: quiet[0].cadence.deferred, deferredConditions: [] };
+  return {
+    conditions: live,
+    deferred: null,
+    deferredConditions: quiet.filter(({ cadence }) => cadence.deferred !== undefined)
+      .map(({ job, cadence }) => ({ job, deferred: cadence.deferred })),
+  };
+}
+
+/**
  * The plane's monitoring resources. `notificationChannel` is the owner's
  * projects/<p>/notificationChannels/<n> (OWN-5c) or null. Deterministic.
  */
@@ -338,8 +368,11 @@ export function renderMonitoring(desired, { notificationChannel = null } = {}) {
       labels: [],
     }),
     logMetric(desired, "unseen-token-probe", {
-      description: "K-DETECT unseen-token probe lines (closed field: verdict).",
-      filter: [`resource.type="cloud_run_job"`, `jsonPayload.schema=${quote(UNSEEN_TOKEN_PROBE_SCHEMA)}`].join(" AND "),
+      // Completed reports only: a failure line carries the schema but no
+      // verdict, and must read as silence, not as a run.
+      description: "K-DETECT unseen-token probe reports (closed field: verdict).",
+      filter: [`resource.type="cloud_run_job"`, `jsonPayload.schema=${quote(UNSEEN_TOKEN_PROBE_SCHEMA)}`,
+        `jsonPayload.verdict=(${UNSEEN_TOKEN_PROBE_VERDICTS.map(quote).join(" OR ")})`].join(" AND "),
       labels: [{ key: "verdict", field: "jsonPayload.verdict" }],
     }),
   ];
@@ -367,10 +400,11 @@ export function renderMonitoring(desired, { notificationChannel = null } = {}) {
   };
 
   const policies = [];
-  const add = (id, options, deferred = null) => {
+  const add = (id, options, deferred = null, deferredConditions = []) => {
     const policy = alertPolicy(desired, id, { ...options, notificationChannel });
     const reason = deferred ?? (notificationChannel === null ? "NOTIFICATION_CHANNEL_UNASSIGNED" : null);
-    policies.push(reason === null ? policy : { ...policy, deferred: reason });
+    policies.push({ ...policy, ...(reason === null ? {} : { deferred: reason }),
+      ...(deferredConditions.length === 0 ? {} : { deferredConditions }) });
   };
 
   const notPorted = `${metricName("origin-request-failure")}{monitored_resource="cloud_run_revision",`
@@ -402,17 +436,16 @@ export function renderMonitoring(desired, { notificationChannel = null } = {}) {
       + `job_name=${quote(refreshJob)},state="complete"}[${windowText((refreshCadence.gapMinutes ?? 0)
         + t.cadenceSlackMinutes)}])`)],
   }, refreshCadence.deferred ?? null);
-  const quiet = SCHEDULED_JOB_NAMES.map((job) => ({ job, cadence: triggerCadence(desired, job) }));
-  const quietDeferred = quiet.find(({ cadence }) => cadence.deferred !== undefined)?.cadence.deferred ?? null;
+  const quiet = schedulerQuietConditions(SCHEDULED_JOB_NAMES.map((job) => ({ job, cadence: triggerCadence(desired, job) })));
   add("scheduler-quiet", {
     severity: "ticket",
     summary: `A trigger committed ENABLED made no attempt within max(${t.schedulerQuietMinimumHours} h, cadence `
       + "plus slack): paused too long, or broken. Confirm with `gcp-infra.mjs scheduler-probe`.",
-    conditions: quiet.map(({ job, cadence }) => promCondition(`${job} trigger quiet`,
+    conditions: quiet.conditions.map(({ job, cadence }) => promCondition(`${job} trigger quiet`,
       `absent_over_time(${metricName("scheduler-attempt")}{monitored_resource="cloud_scheduler_job",`
       + `job_id=${quote(desired.scheduler[job].name)}}[${windowText(Math.max(t.schedulerQuietMinimumHours * 60,
         (cadence.gapMinutes ?? 0) + t.cadenceSlackMinutes))}])`)),
-  }, quietDeferred);
+  }, quiet.deferred, quiet.deferredConditions);
   add("origin-lock", {
     severity: "page",
     summary: "The run.app origin answered an unauthenticated request with something other than Google's 403.",
@@ -458,7 +491,8 @@ export function renderMonitoring(desired, { notificationChannel = null } = {}) {
   }, probeProducer);
   add("unseen-tokens-silent", {
     severity: "ticket",
-    summary: `The K-DETECT probe logged nothing for ${t.unseenProbeSilentHours} h.`,
+    summary: `The K-DETECT probe completed no report (verdict clear or unseen) for ${t.unseenProbeSilentHours} h; `
+      + "failed runs do not count.",
     conditions: [promCondition("unseen-token probe silent", `absent_over_time(${metricName("unseen-token-probe")}`
       + `{monitored_resource="cloud_run_job"}[${t.unseenProbeSilentHours}h])`)],
   }, probeProducer);

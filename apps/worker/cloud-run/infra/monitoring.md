@@ -57,6 +57,12 @@ exists:
 | `TRIGGER_COMMITTED_PAUSED` | The trigger is committed `PAUSED`, so no attempts or runs are expected |
 | `PRODUCER_NOT_IN_MANIFEST:<job>` | No manifest job emits the signal yet (D-OPS4 adds the jobs and probes) |
 
+A policy with one condition per trigger (scheduler-quiet) defers per
+trigger instead. A trigger with no usable cadence, or one committed
+`PAUSED`, drops only its own condition, and the policy lists it in
+`deferredConditions` (the plan repeats that list). The policy waits as a
+whole only when every trigger's condition does.
+
 ## origin-5xx-ratio
 
 **Page.** For 10 minutes, Cloud Run's 5xx responses exceed 2 % of all
@@ -97,6 +103,16 @@ attempts. Confirm with
 paused too long). If OPS-3 `pause-all` paused it for a rollout, finish the
 rollout and run `resume-all` with that pause-all receipt.
 
+**Trade-off awaiting the owner (OWN-5).** The owner asked for an alert when
+a trigger stays paused for more than a few hours. This policy is a
+log-absence proxy, so it fires only after the larger of 6 hours and the
+cadence plus 60 minutes: about 25 hours for a daily trigger. The exact
+6-hour signal is the scheduler probe's `SCHEDULER_TRIGGER_PAUSED_TOO_LONG`,
+which no scheduled job runs yet. Closing that gap needs a periodic job that
+runs the probe and logs its verdict, plus a log metric on it. Until the
+owner confirms the proxy or asks for that job, treat this threshold as a
+proposal.
+
 ## origin-lock
 
 **Page.** An unauthenticated GET of the service's `run.app` `/api/health`
@@ -135,11 +151,25 @@ connection budget, which covers service, job and rollout overlap.
 
 **Ticket.** The daily K-DETECT probe (`cloud-run/unseen-token-probe.mjs`)
 found model, speed, tier or plan tokens that the bundled catalog does not
-name. The probe line lists them in plain text, because the owner says these
-names are not confidential. This feeds the add-model scaffold (K-SCAFFOLD)
-and the catalog manifest.
+name. This feeds the add-model scaffold (K-SCAFFOLD) and the catalog
+manifest.
+
+- A token that fits the v1.x wire grammar (`[A-Za-z0-9._:-]`, 1 to 64
+  characters; owner decision, round 7) is **unseen**.
+- Any other token is **unrecognized**: for example an ARN with `/`, an email
+  address, or a name over 64 characters. It is counted and never printed.
+- **The probe prints no token today.** The owner allowed these names in
+  plain text (round-3 amendment). That amendment also requires the change
+  that prints them to narrow the root `AGENTS.md` "raw account IDs"
+  invariant. Until that change lands, `UNSEEN_TOKEN_LISTING` is `held`.
+  The probe line then carries, per dimension, the number of distinct unseen
+  tokens and their records, and the number of unrecognized ones. It does not
+  say which token is new.
 
 ## unseen-tokens-silent
 
-**Ticket.** The K-DETECT probe has logged nothing for 26 hours. Check its
-job and trigger.
+**Ticket.** The K-DETECT probe has completed no report (verdict `clear` or
+`unseen`) for 26 hours. The log metric counts only lines that carry a
+verdict. A failed run writes a line with `status: "failed"` and a closed
+`code`, but no verdict, so a probe that fails every day shows up here as
+silence. Check the job's failure lines (`code`) first, then its trigger.
