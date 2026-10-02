@@ -18,7 +18,7 @@
 
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { appendFileSync, closeSync, openSync, statSync, writeSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -102,6 +102,11 @@ export const DEFAULT_INGESTION_LEDGERS = Object.freeze({
     "typed-v11-admission-migrations", "typed-v1-admission-migrations", "ingestion-isolation-migrations"],
 });
 export const DEFAULT_LEDGER_LEDGERS = Object.freeze({ d1_migrations: ["deletion-ledger-migrations"] });
+/** The restore-era ingestion layout: every ingestion directory under the storage ledger. */
+export const RESTORE_INGESTION_LEDGERS = Object.freeze({
+  d1_storage_migrations: ["migrations", "typed-ingestion-migrations", "ingestion-bridge-migrations",
+    "typed-v11-admission-migrations", "typed-v1-admission-migrations", "ingestion-isolation-migrations"],
+});
 
 const WRANGLER_LEDGER_SQL = `CREATE TABLE d1_migrations(
 \t\tid         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -113,10 +118,13 @@ const STORAGE_LEDGER_SQL = "CREATE TABLE d1_storage_migrations (name TEXT PRIMAR
 /**
  * Replace the source's migration ledgers with the expected ledgers at commit
  * (bare names). `nameStyle: "canonical"` writes directory-prefixed names
- * instead, which the seal must refuse.
+ * instead, which the seal must refuse. `layout` selects the expected-ledger
+ * layout; `storageRows(rows)` may rewrite the storage rows for drift cases.
  */
-export function writeExpectedLedgers(database, { role, ledgers, commit, nameStyle = "bare" }) {
-  const expected = buildExpectedLedger({ source: { role, ledgers }, commit });
+export function writeExpectedLedgers(database, {
+  role, ledgers, commit, nameStyle = "bare", layout = undefined, storageRows = rows => rows,
+}) {
+  const expected = buildExpectedLedger({ source: { role, ledgers, ...(layout === undefined ? {} : { layout }) }, commit });
   const directoryOf = (name, table) => {
     for (const directory of ledgers[table]) {
       if (expected.ledgers[table].some(row => row.name === name)) return directory;
@@ -132,7 +140,7 @@ export function writeExpectedLedgers(database, { role, ledgers, commit, nameStyl
   if (expected.ledgers.d1_storage_migrations) {
     database.exec(STORAGE_LEDGER_SQL);
     const insert = database.prepare("INSERT INTO d1_storage_migrations(name, sha256) VALUES (?, ?)");
-    for (const row of expected.ledgers.d1_storage_migrations) {
+    for (const row of storageRows(expected.ledgers.d1_storage_migrations)) {
       const name = nameStyle === "canonical" ? `${directoryOf(row.name, "d1_storage_migrations")}/${row.name}` : row.name;
       insert.run(name, row.sha256);
     }
@@ -370,6 +378,31 @@ export async function buildSyntheticIngestionD1({
     database.close();
   }
   return { path: work, fixture };
+}
+
+/**
+ * A copy of a synthetic ingestion D1 whose migration ledgers are rewritten to
+ * another layout (and optionally drifted through `storageRows`), for the
+ * ledger-layout refusal cases. Everything else is byte-for-byte the source.
+ */
+export async function copyIngestionWithLedgers({
+  sourcePath, directory, name, commit, ledgers, layout = undefined, storageRows = undefined,
+} = {}) {
+  const path = join(directory, name);
+  await copyFile(sourcePath, path);
+  await chmod(path, 0o600);
+  const database = new DatabaseSync(path);
+  try {
+    database.exec("BEGIN");
+    writeExpectedLedgers(database, { role: "ingestion", ledgers, commit, layout, storageRows });
+    database.exec("COMMIT");
+  } catch (error) {
+    try { database.exec("ROLLBACK"); } catch { /* not open */ }
+    throw error;
+  } finally {
+    database.close();
+  }
+  return path;
 }
 
 /** The synthetic deletion-ledger D1 (deletion-ledger-migrations 0001-0003, synthetic digests). */

@@ -15,6 +15,11 @@
 //                    (never the working tree): d1_migrations rows as Wrangler
 //                    writes them and d1_storage_migrations rows (name, sha256)
 //                    as d1-storage-wrangler.mjs:19-25 and :207-218 write them.
+//                    A source whose inventory entry selects
+//                    "layout": "ingestion-restore-base-v1" expects the
+//                    restore-era ingestion ledger instead: the pinned
+//                    0001_restore_base.sql row plus every file the base did
+//                    not fold (CUTOVER_RESTORE_BASE).
 //   seal             verify the EP-8 fence and the barrier proof
 //                    (cutover-source-fence.mjs), read bookmark B0 (must equal
 //                    the fence receipt bookmark), the remote schema, ledgers,
@@ -75,6 +80,47 @@ export const CUTOVER_SEALABLE_SOURCES = Object.freeze({
 });
 export const CUTOVER_SOURCE_ROLES = Object.freeze(Object.keys(CUTOVER_SEALABLE_SOURCES));
 export const CUTOVER_LEDGER_TABLES = Object.freeze(["d1_migrations", "d1_storage_migrations"]);
+
+// Ledger layouts. "fresh-chain" (the default when a source names no layout)
+// expects every file of the role's directories at the commit, one row each.
+// "ingestion-restore-base-v1" is the restore-era production ingestion ledger:
+// the database was built from the generated restore base that
+// d1-storage-restore.mjs writes (one d1_storage_migrations row, 0001_restore_base.sql)
+// and every later ingestion file was then applied as its own row. Its expected
+// ledger is the base row plus the tail: the six directories' files at the
+// commit minus the role inputs the base folded.
+export const CUTOVER_FRESH_CHAIN_LAYOUT = "fresh-chain";
+export const CUTOVER_RESTORE_BASE_LAYOUT = "ingestion-restore-base-v1";
+export const CUTOVER_LEDGER_LAYOUTS = Object.freeze([CUTOVER_FRESH_CHAIN_LAYOUT, CUTOVER_RESTORE_BASE_LAYOUT]);
+
+/**
+ * The restore base, pinned with provenance. The folded role inputs are
+ * recomputed from git objects at generatorCommit exactly as
+ * d1-storage-role.mjs readIngestionRoleInputs lists them, and must hash to
+ * roleInputsSha256 (the inputSha256 recorded in the qualification's
+ * role-inputs.json). The base digest itself is pinned, not recomputed at seal
+ * time, because recomputing needs the full Miniflare restore rehearsal: the
+ * generator (d1-storage-restore.mjs rehearseStorageRestore, baseSql) run at
+ * generatorCommit reproduces baseSha256 byte for byte, the same digest is in
+ * every .release-build ingestion qualification from 5ff56ab7 to 8da57e76
+ * (qualification.json scope restore-base-schema-only, e.g.
+ * .release-build/d1-upload-first-cutover-20260914/.release-build/upload-first-cutover-qualification/final-8da/ingestion/),
+ * and the generator at d43c8f92 does not reproduce it because it also folds
+ * the later files. Any other base digest refuses (CUTOVER_LEDGER_MISMATCH).
+ * See docs/receipts/2026-10-02-gcp-int-c-seal-restore-base.md.
+ */
+export const CUTOVER_RESTORE_BASE = Object.freeze({
+  layout: CUTOVER_RESTORE_BASE_LAYOUT,
+  role: "ingestion",
+  table: "d1_storage_migrations",
+  name: "0001_restore_base.sql",
+  sha256: "396753809b9631990412a988972e105de6ce944417704f7ef560c76d6cae6c1f",
+  generatorCommit: "8da57e767a3b7b3d38d3bf80546e75afcd59e08d",
+  roleInputsSha256: "9c128c5259a2af4fbd111a742caf9277683a8f122bb95dde527c2f4cda0a60af",
+  roleInputCount: 78,
+});
+const ROLE_INPUT_MAX_BYTES = 240 * 1024;
+const ROLE_INPUT_MAX_FILES = 128;
 const STORAGE_LEDGER_SQL = "CREATE TABLE d1_storage_migrations (name TEXT PRIMARY KEY NOT NULL, sha256 TEXT NOT NULL CHECK(length(sha256)=64)) STRICT";
 
 export const CUTOVER_ERROR_CODES = Object.freeze([
@@ -366,6 +412,21 @@ function validateLedgerLayout(role, ledgers) {
 }
 
 /**
+ * The ledger layout a source selects. Absent means the fresh chain. The
+ * restore-base layout is ingestion-only and its ledgers must name every
+ * ingestion directory, in role order, under d1_storage_migrations alone.
+ */
+function validateSourceLayout(role, layout, ledgers) {
+  if (layout === CUTOVER_FRESH_CHAIN_LAYOUT) return layout;
+  if (layout !== CUTOVER_RESTORE_BASE_LAYOUT || role !== CUTOVER_RESTORE_BASE.role
+      || ledgers.d1_migrations !== undefined
+      || canonicalJson(ledgers[CUTOVER_RESTORE_BASE.table] ?? null) !== canonicalJson(CUTOVER_SEALABLE_SOURCES[role].directories)) {
+    fail("CUTOVER_INVENTORY_INVALID");
+  }
+  return layout;
+}
+
+/**
  * The owner inventory names exactly the ingestion and deletion-ledger D1s.
  * Any other role or a second entry for a role is CUTOVER_SOURCE_NOT_ALLOWED;
  * the analytics D1 is never sealed for import.
@@ -385,20 +446,24 @@ export function validateCutoverInventory(value) {
         || Object.hasOwn(sources, source.role)) {
       fail("CUTOVER_SOURCE_NOT_ALLOWED");
     }
-    exactKeys(source, ["role", "binding", "databaseName", "databaseId", "ledgers"], "CUTOVER_INVENTORY_INVALID");
+    exactKeys(source, ["role", "binding", "databaseName", "databaseId", "ledgers",
+      ...(Object.hasOwn(source, "layout") ? ["layout"] : [])], "CUTOVER_INVENTORY_INVALID");
     if (source.binding !== CUTOVER_SEALABLE_SOURCES[source.role].binding
         || typeof source.databaseName !== "string" || !DATABASE_NAME.test(source.databaseName)
         || typeof source.databaseId !== "string" || !UUID.test(source.databaseId) || ids.has(source.databaseId)) {
       fail("CUTOVER_INVENTORY_INVALID");
     }
     ids.add(source.databaseId);
+    const ledgers = validateLedgerLayout(source.role, source.ledgers);
     sources[source.role] = Object.freeze({
       role: source.role,
       binding: source.binding,
       databaseName: source.databaseName,
       databaseId: source.databaseId,
       databaseIdSha256: idDigest("d1", source.databaseId),
-      ledgers: validateLedgerLayout(source.role, source.ledgers),
+      layout: validateSourceLayout(source.role, Object.hasOwn(source, "layout") ? source.layout : CUTOVER_FRESH_CHAIN_LAYOUT,
+        ledgers),
+      ledgers,
     });
   }
   if (CUTOVER_SOURCE_ROLES.some(role => !Object.hasOwn(sources, role))) fail("CUTOVER_INVENTORY_INVALID");
@@ -440,43 +505,145 @@ function defaultGit(args, { repositoryRoot }) {
   });
 }
 
+function gitRunner(git, repositoryRoot, role) {
+  return (args) => {
+    try {
+      return git(args, { repositoryRoot });
+    } catch {
+      return fail("CUTOVER_EXPECTED_LEDGER_INVALID", { role });
+    }
+  };
+}
+
+function assertCommitObject(run, commit, role) {
+  if (typeof commit !== "string" || !COMMIT.test(commit)
+      || run(["cat-file", "-t", commit]).toString("utf8").trim() !== "commit") {
+    fail("CUTOVER_EXPECTED_LEDGER_INVALID", { role });
+  }
+}
+
+/** The bare .sql names of one migration directory at a commit, sorted. */
+function sqlNamesAt(run, commit, directory, role) {
+  const listing = run(["ls-tree", "--full-tree", "-z", "--name-only", `${commit}:apps/worker/${directory}`]).toString("utf8")
+    .split("\0").filter(Boolean);
+  const sqlFiles = listing.filter(name => name.endsWith(".sql"));
+  if (sqlFiles.length === 0 || sqlFiles.some(name => !BARE_MIGRATION.test(name))) {
+    fail("CUTOVER_EXPECTED_LEDGER_INVALID", { role });
+  }
+  return [...sqlFiles].sort();
+}
+
+/**
+ * The ingestion role inputs at a commit, read from git objects with the
+ * listing, order, entry shape and limits of d1-storage-role.mjs
+ * readIngestionRoleInputs ({directory, name, sha256, bytes} per .sql file,
+ * directories in role order, names sorted; at most 240 KiB and no NUL byte
+ * per file; at most 128 files). Their canonical digest equals that
+ * function's inputSha256.
+ */
+export function cutoverRoleInputsAt({ commit, repositoryRoot = REPOSITORY_ROOT, git = defaultGit } = {}) {
+  const role = CUTOVER_RESTORE_BASE.role;
+  const run = gitRunner(git, repositoryRoot, role);
+  assertCommitObject(run, commit, role);
+  const migrations = [];
+  for (const directory of CUTOVER_SEALABLE_SOURCES[role].directories) {
+    for (const name of sqlNamesAt(run, commit, directory, role)) {
+      const bytes = run(["cat-file", "blob", `${commit}:apps/worker/${directory}/${name}`]);
+      if (bytes.length > ROLE_INPUT_MAX_BYTES || bytes.includes(0)) fail("CUTOVER_EXPECTED_LEDGER_INVALID", { role });
+      migrations.push(Object.freeze({ directory, name, sha256: sha256Hex(bytes), bytes: bytes.length }));
+    }
+  }
+  if (migrations.length > ROLE_INPUT_MAX_FILES) fail("CUTOVER_EXPECTED_LEDGER_INVALID", { role });
+  return Object.freeze({ migrations: Object.freeze(migrations), inputSha256: sha256Hex(canonicalJson(migrations)) });
+}
+
+/**
+ * The restore-era ingestion d1_storage_migrations rows at a commit: the
+ * pinned base row, then every file of the six directories at the commit that
+ * the base did not fold. The folded inputs are recomputed at the generator
+ * commit and must match the pinned digest and count; the generator commit
+ * must be an ancestor of the commit, and every folded file must still exist
+ * at the commit with identical bytes (otherwise the base no longer describes
+ * it and the expected ledger is refused).
+ */
+function restoreBaseLedgerRows({ commit, run, repositoryRoot, git }) {
+  const role = CUTOVER_RESTORE_BASE.role;
+  const spec = CUTOVER_RESTORE_BASE;
+  assertCommitObject(run, spec.generatorCommit, role);
+  run(["merge-base", "--is-ancestor", spec.generatorCommit, commit]);
+  const folded = cutoverRoleInputsAt({ commit: spec.generatorCommit, repositoryRoot, git });
+  if (folded.migrations.length !== spec.roleInputCount || folded.inputSha256 !== spec.roleInputsSha256) {
+    fail("CUTOVER_EXPECTED_LEDGER_INVALID", { role });
+  }
+  const foldedByPath = new Map(folded.migrations.map(input => [`${input.directory}/${input.name}`, input]));
+  const rows = [Object.freeze({ name: spec.name, sha256: spec.sha256 })];
+  let foldedSeen = 0;
+  for (const directory of CUTOVER_SEALABLE_SOURCES[role].directories) {
+    for (const name of sqlNamesAt(run, commit, directory, role)) {
+      const bytes = run(["cat-file", "blob", `${commit}:apps/worker/${directory}/${name}`]);
+      const sha256 = sha256Hex(bytes);
+      const input = foldedByPath.get(`${directory}/${name}`);
+      if (input === undefined) {
+        rows.push(Object.freeze({ name, sha256 }));
+        continue;
+      }
+      if (input.sha256 !== sha256 || input.bytes !== bytes.length) fail("CUTOVER_EXPECTED_LEDGER_INVALID", { role });
+      foldedSeen += 1;
+    }
+  }
+  if (foldedSeen !== folded.migrations.length) fail("CUTOVER_EXPECTED_LEDGER_INVALID", { role });
+  return Object.freeze({
+    rows,
+    restoreBase: Object.freeze({
+      name: spec.name,
+      sha256: spec.sha256,
+      generatorCommit: spec.generatorCommit,
+      roleInputsSha256: folded.inputSha256,
+      folded: folded.migrations.length,
+    }),
+  });
+}
+
 /**
  * Build a source's expected ledgers from git objects at the commit, with BARE
  * migration names in each ledger's directory order: d1_migrations as names,
- * d1_storage_migrations as (name, sha256 of the exact file bytes).
+ * d1_storage_migrations as (name, sha256 of the exact file bytes). Under the
+ * restore-base layout the ingestion d1_storage_migrations ledger is the base
+ * row plus the unfolded tail (restoreBaseLedgerRows).
  */
 export function buildExpectedLedger({ source, commit, repositoryRoot = REPOSITORY_ROOT, git = defaultGit } = {}) {
   if (!record(source) || !Object.hasOwn(CUTOVER_SEALABLE_SOURCES, source.role)
       || typeof commit !== "string" || !COMMIT.test(commit)) {
     fail("CUTOVER_EXPECTED_LEDGER_INVALID");
   }
-  const run = (args) => {
+  const layout = source.layout ?? CUTOVER_FRESH_CHAIN_LAYOUT;
+  if (!CUTOVER_LEDGER_LAYOUTS.includes(layout)) fail("CUTOVER_EXPECTED_LEDGER_INVALID", { role: source.role });
+  if (layout === CUTOVER_RESTORE_BASE_LAYOUT) {
     try {
-      return git(args, { repositoryRoot });
+      validateSourceLayout(source.role, layout, source.ledgers ?? {});
     } catch {
-      return fail("CUTOVER_EXPECTED_LEDGER_INVALID", { role: source.role });
+      fail("CUTOVER_EXPECTED_LEDGER_INVALID", { role: source.role });
     }
-  };
-  const type = run(["cat-file", "-t", commit]).toString("utf8").trim();
-  if (type !== "commit") fail("CUTOVER_EXPECTED_LEDGER_INVALID", { role: source.role });
+  }
+  const run = gitRunner(git, repositoryRoot, source.role);
+  assertCommitObject(run, commit, source.role);
   const ledgers = {};
+  let restoreBase = null;
   for (const table of CUTOVER_LEDGER_TABLES) {
     const directories = source.ledgers[table];
     if (directories === undefined) continue;
-    const rows = [];
-    for (const directory of directories) {
-      const listing = run(["ls-tree", "--full-tree", "-z", "--name-only", `${commit}:apps/worker/${directory}`]).toString("utf8")
-        .split("\0").filter(Boolean);
-      const sqlFiles = listing.filter(name => name.endsWith(".sql"));
-      if (sqlFiles.length === 0 || sqlFiles.some(name => !BARE_MIGRATION.test(name))) {
-        fail("CUTOVER_EXPECTED_LEDGER_INVALID", { role: source.role });
-      }
-      for (const name of [...sqlFiles].sort()) {
-        if (table === "d1_storage_migrations") {
-          const bytes = run(["cat-file", "blob", `${commit}:apps/worker/${directory}/${name}`]);
-          rows.push(Object.freeze({ name, sha256: sha256Hex(bytes) }));
-        } else {
-          rows.push(Object.freeze({ name }));
+    let rows = [];
+    if (layout === CUTOVER_RESTORE_BASE_LAYOUT) {
+      ({ rows, restoreBase } = restoreBaseLedgerRows({ commit, run, repositoryRoot, git }));
+    } else {
+      for (const directory of directories) {
+        for (const name of sqlNamesAt(run, commit, directory, source.role)) {
+          if (table === "d1_storage_migrations") {
+            const bytes = run(["cat-file", "blob", `${commit}:apps/worker/${directory}/${name}`]);
+            rows.push(Object.freeze({ name, sha256: sha256Hex(bytes) }));
+          } else {
+            rows.push(Object.freeze({ name }));
+          }
         }
       }
     }
@@ -484,8 +651,10 @@ export function buildExpectedLedger({ source, commit, repositoryRoot = REPOSITOR
     if (new Set(names).size !== names.length) fail("CUTOVER_EXPECTED_LEDGER_INVALID", { role: source.role });
     ledgers[table] = Object.freeze(rows);
   }
-  const body = { schema: CUTOVER_EXPECTED_LEDGER_SCHEMA, role: source.role, commit, ledgers };
-  return Object.freeze({ ...body, ledgers: Object.freeze(ledgers), sha256: sha256Hex(canonicalJson(body)) });
+  // The fresh-chain body is unchanged, so its digest matches earlier receipts.
+  const body = { schema: CUTOVER_EXPECTED_LEDGER_SCHEMA, role: source.role, commit, ledgers,
+    ...(restoreBase === null ? {} : { layout, restoreBase }) };
+  return Object.freeze({ ...body, layout, ledgers: Object.freeze(ledgers), sha256: sha256Hex(canonicalJson(body)) });
 }
 
 // ---------------------------------------------------------------------------
@@ -1610,7 +1779,7 @@ async function main(argv) {
     const inventory = await readCutoverInventory(resolve(options.inventoryPath));
     const ledgers = CUTOVER_SOURCE_ROLES.map(role => {
       const ledger = buildExpectedLedger({ source: inventory.sources[role], commit: inventory.expectedSourceCommit });
-      return { role, sha256: ledger.sha256, rows: Object.fromEntries(Object.entries(ledger.ledgers)
+      return { role, layout: ledger.layout, sha256: ledger.sha256, rows: Object.fromEntries(Object.entries(ledger.ledgers)
         .map(([table, rows]) => [table, rows.length])) };
     });
     process.stdout.write(`${JSON.stringify({ command: "expected-ledger", ledgers })}\n`);
