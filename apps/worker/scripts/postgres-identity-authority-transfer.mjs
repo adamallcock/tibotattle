@@ -636,9 +636,12 @@ function accountlessChain(database) {
   });
 }
 
+/** A content-free digest of a sealed table this stage cannot import, ordered by every column. */
 function genericTableDigest(database, table) {
   const digest = createRowsDigest();
-  const statement = database.prepare(`SELECT * FROM ${quote(table)} ORDER BY 1`);
+  const columns = sourceColumns(database, table);
+  const statement = database.prepare(`SELECT ${columns.map(quote).join(", ")} FROM ${quote(table)}
+    ORDER BY ${columns.map((_, index) => String(index + 1)).join(", ")}`);
   statement.setReadBigInts(true);
   let rows = 0;
   for (const row of statement.iterate()) {
