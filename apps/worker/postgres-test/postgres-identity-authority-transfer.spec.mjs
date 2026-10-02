@@ -4,7 +4,8 @@ import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { readCutoverSeal } from "../scripts/cutover-source-seal.mjs";
+import { participantDeletionDigest } from "../scripts/cutover-source-projections.mjs";
+import { CutoverSourceError, readCutoverSeal } from "../scripts/cutover-source-seal.mjs";
 import {
   IDENTITY_AUTHORITY_COUNTER_MAPPING,
   IDENTITY_AUTHORITY_EXCLUDED_TABLES,
@@ -49,7 +50,7 @@ const SCHEMAS = Object.freeze({ schema: { primarySchema: PRIMARY_SCHEMA, ledgerS
 const table = name => `"${PRIMARY_SCHEMA}"."${name}"`;
 
 const isCode = code => error => (error instanceof IdentityAuthorityTransferError
-  || error instanceof PostgresTransferTargetError) && error.code === code;
+  || error instanceof PostgresTransferTargetError || error instanceof CutoverSourceError) && error.code === code;
 
 async function count(pool, name, where = "") {
   return Number((await pool.query(`SELECT count(*)::int AS n FROM ${table(name)} ${where}`)).rows[0].n);
@@ -118,7 +119,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PT-3 identity and authority importer on Postgr
     expect([receipts.rows[0].n, sealed.rows[0].n]).toEqual([0, 0]);
   }
 
-  it("refuses before any write: wrong pin, incomplete or foreign bootstrap, broken chain, unmapped counter or column, a participant mid-erasure, contained controls", async () => {
+  it("refuses before any write: wrong pin, incomplete or foreign bootstrap, broken chain, unmapped counter or column, a participant mid-erasure, a restored erased participant, contained controls", async () => {
     const variants = [
       { label: "wrong identity-link secret", sql: "SELECT 1", pin: { keyVersion: PIN.keyVersion,
         secretFingerprint: identityLinkFingerprint("w2-seal-fixture-not-the-configured-secret-0002") },
@@ -142,13 +143,20 @@ describe.skipIf(!PG_TEST_SOCKET)("PT-3 identity and authority importer on Postgr
       { label: "participant mid-erasure", sql: `UPDATE participants SET state = 'deleting',
           deletion_session_id = '${randomUUID()}' WHERE id = '${world.fixture.ids.participant}'`,
       code: "CUTOVER_PARTICIPANT_ERASURE_PENDING" },
+      // Decision D2, enforced by PT-3 itself: the seal's own ledger records
+      // the deletion digest of an 'active' sealed participant.
+      { label: "restored erased participant", role: "deletion-ledger",
+        sql: `INSERT INTO deletion_tombstones(participant_digest, schema_version, deleted_at, retain_until)
+          SELECT '${participantDeletionDigest(world.fixture.ids.participant)}', schema_version, deleted_at, retain_until
+            FROM deletion_tombstones LIMIT 1`,
+        code: "CUTOVER_ERASED_PARTICIPANT_PRESENT" },
       { label: "contained controls", sql: `UPDATE collection_controls SET control_state = 'contained',
           enrollment_enabled = 0, upload_registration_enabled = 0, processing_enabled = 0, publication_enabled = 0`,
       code: "CUTOVER_CONTROLS_DEGRADE_IMPOSSIBLE" },
     ];
     const pristineControls = await controlsRow(target);
     for (const variant of variants) {
-      const forged = await forgeVariantSeal(seal, variant.sql);
+      const forged = await forgeVariantSeal(seal, variant.sql, variant.role);
       const handle = await beginImporting(target, forged.sealId, forged.sealedAt);
       try {
         await expect(runIdentityAuthorityTransfer({ handle, sealManifestPath: forged.manifestPath,
@@ -193,6 +201,12 @@ describe.skipIf(!PG_TEST_SOCKET)("PT-3 identity and authority importer on Postgr
 
     expect(receipt.order).toEqual(IDENTITY_AUTHORITY_FROZEN_ORDER);
     expect(receipt.receiptSha256).toBe(cleanReceipt.receiptSha256);
+    // The do-not-restore rule ran over the seal's own ledger: counts and the
+    // projection sha256 only.
+    expect(receipt.doNotRestore).toEqual({ deletionDigests: world.digests.length,
+      deletionDigestsSha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      participants: Number(sealedDb.prepare("SELECT count(*) AS n FROM participants").get().n), matches: 0 });
+    expect(cleanReceipt.doNotRestore).toEqual(receipt.doNotRestore);
     expect(receipt.tables).toEqual(cleanReceipt.tables);
     for (const name of IDENTITY_AUTHORITY_FROZEN_ORDER) {
       const facts = receipt.tables[name];

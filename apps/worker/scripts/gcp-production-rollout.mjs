@@ -1274,7 +1274,10 @@ async function roll(context, args, target) {
       servedCommit: served,
       // OPS-3 resume-all resumes these after this receipt; the rollout never does.
       pausedTriggers: scheduledJobs.triggers.map(({ name }) => name),
-      // The window in which the previous revision served the migrated schema.
+      // The migrate-to-roll window: the previous revision ran against the
+      // migrated schema. Behind an exact-history receipt fence (the only one
+      // today) its storage-gated routes answered 503 for this long; see the
+      // expand-compatibility note in cloud-run/postgres-production-migrations.mjs.
       secondsSinceMigrate: Math.max(0, Math.round((rolledAt - Date.parse(migrateReceipt.completedAt)) / 1_000)),
       rolledAt: new Date(rolledAt).toISOString(),
     };

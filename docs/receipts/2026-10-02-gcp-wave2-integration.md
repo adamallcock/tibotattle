@@ -10,8 +10,9 @@ status: snapshot
 This is a 2026-10-02 receipt for the wave-2 integration on branch
 `claude/gcp-fp-w2-integration`. It starts from `claude/gcp-fastpath-final` at
 `3fa1ba64` and merges the three reviewed wave-2 packages, settles the seams
-between them, and promotes W2-SEAL's migration as primary 0063. It records
-**local, synthetic** evidence only: one macOS arm64 workstation, Node 26.2.0
+between them, and promotes W2-SEAL's migration as primary 0063. A later
+review-fix commit on the same branch corrects five review findings
+([Review fixes](#review-fixes)). It records **local, synthetic** evidence only: one macOS arm64 workstation, Node 26.2.0
 for repository tooling, Node 22.16.0 (the image runtime) where noted, and the
 local PostgreSQL 17.10 fan-out cluster on a private Unix socket (port 55433,
 which also listens on loopback TCP). Nothing was built in Cloud Build,
@@ -29,8 +30,9 @@ the repository's own.
 | `db12721c` | `--no-ff` merge of W2-INFRA, `claude/gcp-fp-w2-infra` `c99cfb47`: SIMP-0 items 7 to 9 and OPS-2 infrastructure as code, dry run only ([package receipt](./2026-10-02-gcp-w2-infra.md)) |
 | `35aeb93d` | `--no-ff` merge of W2-SEAL, `claude/gcp-fp-w2-seal` `7e3ff2f1`: the PT-2-lite seal and deletion-digest projection, and the PT-3 importer in PT-1 production mode ([package receipt](./2026-10-02-gcp-w2-seal.md)) |
 | `f2063efc` | Primary 0063 promoted, with the count and tail pins moved, OPS-10's contract review of 0063 and the SIMP residue rule |
-| `aa2ae89b` | The cross-package seams, the gate registrations and the journal-guard review |
-| This receipt's commit | This receipt and the fast-path plan's backlog rows |
+| `aa2ae89b` | The cross-package seams, the gate registrations (withdrawn by the review fixes) and the journal-guard review |
+| `5f8e1551` | The first version of this receipt and the fast-path plan's backlog rows |
+| The review-fix commit | The [review fixes](#review-fixes): the four keys leave the Worker gates, PT-3 enforces the do-not-restore rule, and this receipt and the plan rows are corrected |
 
 ### Merge reconciliation
 
@@ -71,17 +73,24 @@ The integration is the numbering authority for this line.
   plus a trigger that refuses a redeemed grant without a redeemer with the
   same SQLSTATE class 23514, except for an INSERT inside an import transfer
   session. The live writers always set the redeemer, and
-  `normalizePostgresError` maps by SQLSTATE class only, so a serving previous
-  revision sees no change.
+  `normalizePostgresError` maps by SQLSTATE class only, so at the SQL level
+  every write a previous revision makes is admitted or refused as before.
+  That review does not cover the previous revision's receipt fence: the only
+  fence that exists requires the migration history to equal the image's
+  manifest exactly, so a revision built before 0063 refuses its
+  storage-gated routes with 503 once 0063 is applied, until the roll (see
+  [Review fixes](#review-fixes)).
 - PT-3's frozen policy digest covers the trigger's reason text, which changed
   from "Staged 0063" to "Primary 0063". The pin in
   `postgres-identity-authority-transfer.check.mjs` moved from `d78633fa…` to
   `779895eb…`; recomputing the digest with the old text reproduces the old pin
   exactly, so nothing else in the policy changed.
-- The SIMP residue is **not** created here (LEAD-SIMP is deferred). Its name
-  must end in `_append_only_residue.sql` and its number must come after 0063
-  (`NNNN_append_only_residue.sql`, NNNN 0064 or later). OPS-10's guard now
-  enforces that: `SIMP_RESIDUE_PREDECESSOR` is
+- The SIMP residue is **not** created here (LEAD-SIMP is deferred). Its
+  number must come after 0063, and its proposed name is
+  `NNNN_append_only_residue.sql` (NNNN 0064 or later). The name awaits the
+  owner's confirmation (wave-3 SIMP design, OD-1); if the owner picks another
+  name, `SIMP_RESIDUE_MIGRATION_SUFFIX` and its checks change in the same
+  change. OPS-10's guard enforces the proposal and fails closed: `SIMP_RESIDUE_PREDECESSOR` is
   `0063_enrollment_grants_erased_redeemer.sql`, and `simpResidueMigration`
   counts only a residue after both 0053 and that predecessor; a manifest
   missing either anchor has none. Checks cover a residue before 0053, one
@@ -121,12 +130,13 @@ The integration is the numbering authority for this line.
   `rolloutTarget` refuses `GCP_INFRA_DESIRED_STATE_UNCONFIGURED`, which the
   rollout reports as `ROLLOUT_INFRA_MANIFEST_UNAVAILABLE`. The rollout's
   header says the same.
-- **Gate registration.** The Worker `check` now runs
-  `postgres:production-migrations:check` and `postgres:cutover-seal:check`,
-  and `scripts:check` runs `gcp:production-rollout:check` and
-  `gcp:ops:infra:check`. The CR-3, EP-7 and OPS-1 checks that
-  `gcp:ops:infra:check` bundles ran in no Worker gate before. Whether hosted
-  CI runs these keys stays the owner's decision; no workflow changed.
+- **Gate registration (withdrawn by the review fixes).** `aa2ae89b` chained
+  `postgres:production-migrations:check` and `postgres:cutover-seal:check`
+  into the Worker `check`, and `gcp:production-rollout:check` and
+  `gcp:ops:infra:check` into `scripts:check`. That was not local only: the
+  hosted Worker gate runs `npm --prefix apps/worker run check`. The review-fix
+  commit takes the four keys out again (see
+  [Review fixes](#review-fixes)).
 - **The journal single-producer guard.** `scripts:check` failed on
   `scripts/cutover-source-projections.mjs` (W2-SEAL had not run it). The
   module writes a local journal-only SQLite for the existing journal importer
@@ -169,6 +179,104 @@ no code). "PG env" is the fan-out cluster's socket and port; "TCP pair" adds
 | `git diff --cached --check` | Clean |
 | Fan-out cluster leftovers | None from this integration. The remaining schemas all have OIDs older than a database created on 2026-10-01, and the newest belongs to the dense workstream's concurrent run |
 
+## Review fixes
+
+A review of `5f8e1551` raised five findings. Each was checked against the code
+before it was fixed; none was rejected.
+
+1. **Hosted CI ran the four new keys.** The first version of this receipt said
+   no hosted gate changed. That was wrong: `aa2ae89b` chained the keys into
+   the Worker `check` and `scripts:check`, and the hosted Worker gate runs
+   `npm --prefix apps/worker run check`. Three of the four could not pass
+   there. That job installs no `apps/worker/cloud-run` dependencies (pinned
+   by `test/hosted-backend-workflow.test.js`), and with the cloud-run
+   `node_modules` moved aside locally, `postgres:production-migrations:check`
+   and `gcp:ops:infra:check` exit 1 with `ERR_MODULE_NOT_FOUND` for
+   `@google-cloud/cloud-sql-connector` (test files fail to load).
+   `gcp:production-rollout:check` exits 1 on one case: the rollout's manifest
+   import fails, so it reports `ROLLOUT_INFRA_MANIFEST_UNAVAILABLE` instead of
+   the expected refusal. Only `postgres:cutover-seal:check` passes there.
+   The owner had not agreed, so the fix takes the four keys out of `check`
+   and `scripts:check`, which are now byte-identical to `3fa1ba64`. A new local-only key,
+   `gcp:production-tooling:local-check`, runs all four. Hosted CI still
+   covers OPS-10's offline checks and its rollout check in the Cloud Run
+   check job, which W2-OPSDB extended, and its PostgreSQL spec in the
+   `postgres-17-suite`. `gcp:ops:infra:check` (which bundles the CR-3, EP-7
+   and OPS-1 checks) and `postgres:cutover-seal:check` run in no hosted
+   gate. Adding them is the owner's decision.
+2. **The previous revision does not keep serving through a migrate.** OPS-10
+   assumes the previous revision serves the migrated schema until the roll.
+   But the only runtime receipt fence (`readSchemaReceipt` in
+   `cloud-run/postgres-test-dispatch.mjs`) admits a history only when it
+   equals the image's manifest exactly, and `assertStorageCurrent` gates every
+   intake write. Behind that fence every migrate, 0063 included, takes the
+   previous revision's storage-gated routes to 503 until the roll. This is
+   latent until CR-7 builds the production host. The fix is to documentation
+   and comments only:
+   - The plan's CR-7 row now requires a fence that admits a reviewed,
+     expand-compatible extension of the image's manifest. Failing that, the
+     OPS-10 runbook must treat migrate-to-roll as a write outage. The OPS-10
+     row says the same.
+   - The OPS-10 module header, the `CONTRACT_MIGRATIONS` note, the 0063
+     review reason and the rollout's `secondsSinceMigrate` comment now limit
+     the review to the SQL a previous revision issues.
+3. **The hosted `postgres-17-suite` would fail, not only report a gap.**
+   `Not covered` and `Open` now say so, with the 11 analytics-v2 pin failures
+   (re-run: 36 tests, 25 pass, 11 fail) and the merge-order constraint. The
+   pre-existing Worker gate failure on `gcp:fastpath:scripts-check` is
+   recorded beside it.
+4. **PT-3 did not enforce the do-not-restore rule.** Called directly, it
+   imported any `active` participant without consulting the sealed deletion
+   digests. It now does so before its first write:
+   - It reads the same seal's deletion-ledger digests in memory through the
+     new `readSealedDeletionDigests`. This is the projection
+     `projectDeletionDigests` writes, with the same sha256, so no caller can
+     pass a stale or empty list.
+   - It calls `assertNoSealedParticipantDeletionMatches`, which refuses
+     `CUTOVER_ERASED_PARTICIPANT_PRESENT` whether or not PT-8-lite composes
+     PT-3.
+   - The quiescence refusal still comes first.
+   - PT-3's returned receipt adds `doNotRestore` (the digest count, the
+     projection sha256, the participant count and `matches: 0`), and the
+     summary its stored `receiptSha256` digests covers the count and the
+     sha256.
+   - The policy digest is unchanged.
+   - New cases: the offline check plants the tombstone of an `active`
+     participant in a forged seal's ledger (`forgeVariantSeal` takes a
+     source role now). PT-3 then refuses before it touches its target, and
+     a mutation that skips the call fails that case with
+     `CUTOVER_TARGET_HANDLE_INVALID`. The PostgreSQL spec proves nothing was
+     written for the same variant. The rehearsal checks that PT-3's
+     `doNotRestore` equals the PT-2-lite projection's count and sha256.
+5. **The SIMP residue name is a proposal.** The plan's SIMP row, the
+   migration numbering above and the OPS-10 module header now mark
+   `NNNN_append_only_residue.sql` as awaiting the owner's confirmation (OD-1).
+   The guard stays, because it fails closed.
+
+### Gates after the review fixes
+
+These ran serially on the review-fix code, with the same environments as
+above.
+
+| Gate | Result |
+|---|---|
+| Worker `npx tsc --noEmit`; `node --check` on every changed module | Exit 0 |
+| Worker `npm run scripts:check` | Exit 0: 1,059 of 1,059 across 24 node:test runs (the 1,257 above less the 19 rollout and 179 infrastructure tests that left it) |
+| `npm run gcp:production-tooling:local-check` (PG env) | Exit 0: production migrations 33 of 33 and 5 of 5 PostgreSQL; rollout 19 of 19; infrastructure 179 of 179; cutover seal 32 of 32 (including the new PT-3 and projection cases) |
+| `cloud-run` `npm run check` (PG env) | Exit 0: 337 pass, 1 skipped (the opt-in A2 case) across 16 runs |
+| `postgres:domain:check` Vitest half (PG env and TCP pair) | 14 files, 84 of 84, including the new PT-3 variant and the rehearsal's `doNotRestore` check |
+| `postgres:migrations:check` | Exit 0: 10 of 10 and 1 of 1 |
+| The hosted workflow's static step, run locally | 60 of 60 |
+| `node scripts/ci-postgres-suite.mjs --plan` | Planned, 80 files (77 SOCKET, 2 HOST, 1 EDGE_E2E), 0 failures |
+| `analytics-v2-refresh` and `analytics-v2-community-daily-route` specs (PG env and TCP pair) | 36 tests: 25 pass, 11 fail, the pins described in Open (re-run for finding 3, unchanged) |
+| Root `architecture:check` | Pass: 924 production files, 3,950 imports, 0 debt edges |
+| Root `test:preflight` (docs staged); `git diff --cached --check` | Exit 0; clean |
+| Fan-out cluster leftovers | None: no database, role or schema created since this session began (`xmin` above 3,000,000) remains in any database |
+
+The `postgres:domain:check` node half, `edge:e2e:check`,
+`gcp:fastpath:scripts-check` and the edge end-to-end run were not re-run: no
+file they load changed.
+
 ## Not covered
 
 - No GCP or Cloudflare resource was created, changed or read, and no image
@@ -181,9 +289,24 @@ no code). "PG env" is the fan-out cluster's socket and port; "TCP pair" adds
   runtime-schema manifest, which only the cloud-run host reads. The known
   `test/storage-graph-history-integration.spec.ts` failure recorded in the
   combined-gates receipt was therefore not re-run.
-- The hosted workflows did not run. They have no Node 22.16.0 or EDGE_E2E
-  golden, so the hosted `postgres-17-suite` job would report the EDGE_E2E
-  environment gap.
+- The hosted workflows did not run. At this head the hosted
+  `postgres-17-suite` job would **fail**, not only report a gap. The planner
+  routes `analytics-v2-refresh.spec.mjs` and
+  `analytics-v2-community-daily-route.spec.mjs` (SOCKET profile), and they
+  fail 11 of 36 tests on their primary-chain pins (Open). Ten of the 11 are
+  one setup assertion cascading, so the route behaviour cases (a) to (f) do
+  not run on this branch. The job would also report the EDGE_E2E environment
+  gap: CI has no Node 22.16.0 or golden.
+- The hosted Worker gate cannot pass either, before or after this
+  integration. Its job installs no `apps/worker/cloud-run` dependencies, and
+  `test/hosted-backend-workflow.test.js` pins that it does not. The Worker
+  `check` already runs `gcp:fastpath:scripts-check` at `3fa1ba64`, and that
+  key imports `cloud-run/analytics-refresh.mjs`, which needs
+  `@google-cloud/cloud-sql-connector`. Run locally with the cloud-run
+  `node_modules` moved aside, it exits 1 with `ERR_MODULE_NOT_FOUND`. The
+  keys before it in `check` that touch PostgreSQL passed that way; the rest,
+  such as `npm test` and `analytics-v2:check`, were not tried that way. That
+  key and its tooling belong to the dense workstream.
 - The analytics-v2 specs and the `gcp-fastpath-*` tooling belong to the dense
   workstream and were not edited (see Open).
 
@@ -199,7 +322,9 @@ no code). "PG env" is the fan-out cluster's socket and port; "TCP pair" adds
   those two literals moved to 63 and `0063_…` passed 36 of 36 on the same
   cluster; the copies were deleted. When the
   dense workstream merges, it must move both pins to 63 and `0063_…`, as the
-  0062 promotion did.
+  0062 promotion did. **Merge order:** this branch must not reach `main`
+  before the dense branch moves both pins, or the two must land together;
+  otherwise `main` turns the PostgreSQL 17 suite red.
 - A2: the cloud-run `check` skips the A2 activation real-PostgreSQL case
   unless `A2_DAILY_ACTIVATION_TEST_HOST` is set. With the TCP pair it fails
   "fresh migrations must match the exact contained baseline" (18 of 19). The
@@ -209,7 +334,15 @@ no code). "PG env" is the fan-out cluster's socket and port; "TCP pair" adds
   [combined-gates receipt](./2026-10-02-gcp-fastpath-combined-gates.md#known-failure-outside-the-fast-path)
   records.
 - The SIMP residue (LEAD-SIMP) is next. Until it lands, OPS-10 refuses every
-  non-scratch target with `PRODUCTION_SIMP_RESIDUE_MISSING`.
+  non-scratch target with `PRODUCTION_SIMP_RESIDUE_MISSING`. Its name awaits
+  the owner's confirmation (OD-1).
+- CR-7's receipt fence: until the production host admits a reviewed
+  expand-compatible extension of its manifest, every migrate is a write
+  outage for the previous revision until the roll (review fix 2).
+- Hosted gates: `gcp:ops:infra:check` and `postgres:cutover-seal:check` run
+  in no hosted gate, and the hosted Worker gate already fails on
+  `gcp:fastpath:scripts-check` without the cloud-run dependencies. Both are
+  for the owner, and the second also for the dense workstream.
 - The promoted 0063 changes the runtime receipt fence: an origin built from
   this line serves only a schema migrated through 0063, so the disposable
   `tibotattle_fastpath` test database (62 primary) needs a migrate before any

@@ -5,7 +5,8 @@ import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { readCutoverSeal } from "./cutover-source-seal.mjs";
+import { participantDeletionDigest } from "./cutover-source-projections.mjs";
+import { CutoverSourceError, readCutoverSeal } from "./cutover-source-seal.mjs";
 import {
   POSTGRES_FASTPATH_IDENTITY_ALLOWLIST,
   POSTGRES_FASTPATH_IDENTITY_CREDENTIAL_OMISSIONS,
@@ -215,4 +216,15 @@ test("every sealed-source refusal fires before the target is touched", async () 
     await assert.rejects(runIdentityAuthorityTransfer({ handle: { sealManifestSha256: forged.sealId },
       sealManifestPath: forged.manifestPath, identityLinkPin: pin }), isCode(code), sql);
   }
+  // The do-not-restore rule (decision D2) is PT-3's own: an 'active'
+  // participant whose deletion digest the same seal's ledger records (an
+  // erased participant whose rows came back) is refused before the target,
+  // without PT-8-lite.
+  assert.ok(world.digests.length > 0, "the clean seal's ledger already records a tombstone");
+  const restored = await forgeVariantSeal(seal, `INSERT INTO deletion_tombstones(participant_digest, schema_version,
+      deleted_at, retain_until) SELECT '${participantDeletionDigest(world.fixture.ids.participant)}', schema_version,
+      deleted_at, retain_until FROM deletion_tombstones LIMIT 1`, "deletion-ledger");
+  await assert.rejects(runIdentityAuthorityTransfer({ handle: { sealManifestSha256: restored.sealId },
+    sealManifestPath: restored.manifestPath, identityLinkPin: PIN }),
+  error => error instanceof CutoverSourceError && error.code === "CUTOVER_ERASED_PARTICIPANT_PRESENT");
 });

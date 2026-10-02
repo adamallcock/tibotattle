@@ -29,7 +29,12 @@
 //     erasure quiescence: every sealed participant 'active' with no
 //     deletion fence (CUTOVER_PARTICIPANT_ERASURE_PENDING; an interrupted
 //     Cloudflare erasure is never completed in PostgreSQL, which has no
-//     online erasure, so the owner finishes it and re-seals), the bootstrap
+//     online erasure, so the owner finishes it and re-seals), the
+//     do-not-restore rule (decision D2): no sealed participant, whatever its
+//     state, hashes to a deletion digest of the same seal's deletion ledger
+//     (CUTOVER_ERASED_PARTICIPANT_PRESENT, through PT-2-lite's
+//     assertNoSealedParticipantDeletionMatches, so the rule holds whether or
+//     not PT-8-lite composes this stage), the bootstrap
 //     (CUTOVER_PUBLIC_SOURCE_BOOTSTRAP_INCOMPLETE), the accountless authority
 //     chain (CUTOVER_ACCOUNTLESS_AUTHORITY_CHAIN_INVALID),
 //     the import transfer session, the reviewed trigger policy coverage and
@@ -46,6 +51,7 @@
 
 import { createHash } from "node:crypto";
 import { readCutoverSeal, openSealedSourceFromSeal, CutoverSourceError } from "./cutover-source-seal.mjs";
+import { assertNoSealedParticipantDeletionMatches, readSealedDeletionDigests } from "./cutover-source-projections.mjs";
 import {
   FASTPATH_IDENTITY_COMPLETED_WALK_RULE,
   POSTGRES_FASTPATH_IDENTITY_TABLE_SPECS,
@@ -591,6 +597,27 @@ function assertParticipantsQuiescent(database) {
   if (row?.n !== 0n) fail("CUTOVER_PARTICIPANT_ERASURE_PENDING", { table: "participants" });
 }
 
+/**
+ * The do-not-restore rule (decision D2), enforced by this stage itself and
+ * not only by PT-8-lite: no sealed participant, whatever its state, may hash
+ * to a deletion digest recorded in the same seal's deletion ledger (for
+ * example an erased participant whose rows came back through a D1 restore).
+ * The digests come from the verified seal, so no caller can supply a stale
+ * or empty list. Refuses CUTOVER_ERASED_PARTICIPANT_PRESENT; only counts and
+ * the projection's sha256 leave here.
+ */
+async function assertNoErasedParticipantRestored(seal, sealedIngestion) {
+  const ledger = await openSealedSourceFromSeal(seal, "deletion-ledger");
+  try {
+    const projection = await readSealedDeletionDigests({ sealedLedger: ledger });
+    const result = await assertNoSealedParticipantDeletionMatches({ sealedIngestion, digests: projection.digests });
+    return Object.freeze({ deletionDigests: projection.count, deletionDigestsSha256: projection.sha256,
+      participants: result.participants, matches: result.matches });
+  } finally {
+    ledger.close();
+  }
+}
+
 function assertCounters(database) {
   const present = sourceAll(database, "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'sqlite_sequence'").length === 1;
   const counters = present ? sourceAll(database, "SELECT name, seq FROM sqlite_sequence ORDER BY name") : [];
@@ -988,6 +1015,7 @@ export async function runIdentityAuthorityTransfer({
       if (!sourceTablePresent(database, table)) fail("CUTOVER_SOURCE_TABLE_MISSING", { table });
     }
     assertParticipantsQuiescent(database);
+    const doNotRestore = await assertNoErasedParticipantRestored(seal, sealed);
     // Every sealed value is canonicalized (and the table digest taken) now,
     // so an invalid value refuses here rather than after earlier pages.
     const sourceFacts = new Map(ENTRIES.map(item => [item.name, sourceTableFacts(database, item.spec, pageRows)]));
@@ -1060,6 +1088,8 @@ export async function runIdentityAuthorityTransfer({
       controls: controlsRecord.sealedRowSha256,
       bootstrap: controlsRecord.bootstrapSha256,
       targetMissing,
+      doNotRestore: { deletionDigests: doNotRestore.deletionDigests,
+        deletionDigestsSha256: doNotRestore.deletionDigestsSha256 },
     };
     const receiptSha256 = HASH(JSON.stringify(summary));
     const rowCount = Object.values(tables).reduce((total, facts) => total + facts.sourceRows, 0) + 2;
@@ -1100,6 +1130,7 @@ export async function runIdentityAuthorityTransfer({
       triggerPolicy: target.coverage,
       foreignKeysChecked: target.foreignKeys,
       targetMissing: Object.freeze(targetMissing),
+      doNotRestore,
       excluded: IDENTITY_AUTHORITY_EXCLUDED_TABLES,
       rowCount,
       byteCount,

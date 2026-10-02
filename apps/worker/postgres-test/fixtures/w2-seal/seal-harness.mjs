@@ -100,16 +100,19 @@ export function outputPathsOf(out) {
 }
 
 /**
- * A variant seal for refusal cases: the sealed ingestion file copied,
- * mutated with SQL, re-sealed 0400 beside a manifest whose sealId covers the
- * new digest (the manifest's aggregates are not recomputed; only
- * verify-unchanged reads them).
+ * A variant seal for refusal cases: one sealed source file (the ingestion
+ * one unless `role` names the deletion ledger) copied, mutated with SQL,
+ * re-sealed 0400 beside the other source unchanged and a manifest whose
+ * sealId covers the new digest (the manifest's aggregates are not
+ * recomputed; only verify-unchanged reads them).
  */
-export async function forgeVariantSeal(seal, mutateSql) {
+export async function forgeVariantSeal(seal, mutateSql, role = "ingestion") {
+  const other = { ingestion: "deletion-ledger", "deletion-ledger": "ingestion" }[role];
+  if (other === undefined) throw new Error("forgeVariantSeal: unknown source role");
   const directory = await privateDirectory("w2-seal-variant-");
   const work = join(directory, "work.sqlite");
-  const sealedPath = join(directory, "ingestion.sealed.sqlite");
-  await copyFile(seal.sources.ingestion.path, work);
+  const sealedPath = join(directory, `${role}.sealed.sqlite`);
+  await copyFile(seal.sources[role].path, work);
   await chmod(work, 0o600);
   const database = new DatabaseSync(work);
   try {
@@ -120,11 +123,11 @@ export async function forgeVariantSeal(seal, mutateSql) {
   }
   await rm(work, { force: true });
   await chmod(sealedPath, 0o400);
-  await copyFile(seal.sources["deletion-ledger"].path, join(directory, "deletion-ledger.sealed.sqlite"));
-  await chmod(join(directory, "deletion-ledger.sealed.sqlite"), 0o400);
+  await copyFile(seal.sources[other].path, join(directory, `${other}.sealed.sqlite`));
+  await chmod(join(directory, `${other}.sealed.sqlite`), 0o400);
   const { sealId: _previous, ...body } = seal.manifest;
   const sealedSha256 = await sha256File(sealedPath);
-  const next = { ...body, sources: body.sources.map(source => (source.role === "ingestion" ? { ...source, sealedSha256 } : source)) };
+  const next = { ...body, sources: body.sources.map(source => (source.role === role ? { ...source, sealedSha256 } : source)) };
   const sealId = sha256Hex(canonicalJson(next));
   const manifestPath = join(directory, "seal-manifest.json");
   await writePrivateFileOnce(manifestPath, `${canonicalJson({ ...next, sealId })}\n`, 0o400);

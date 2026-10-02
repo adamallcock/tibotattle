@@ -14,6 +14,7 @@ import {
   projectDeletionDigests,
   projectIngestionJournal,
   readDeletionDigestProjection,
+  readSealedDeletionDigests,
   readWorkerDeletionDigestDomain,
 } from "./cutover-source-projections.mjs";
 import {
@@ -129,6 +130,11 @@ test("the deletion-digest projection holds exactly the sorted synthetic digests,
     assert.equal(projected.count, world.digests.length);
     const set = await readDeletionDigestProjection({ path: projected.path, expectedSha256: projected.sha256 });
     assert.deepEqual([...set].sort(), [...world.digests].sort());
+    // PT-3's in-memory read of the same ledger is the same projection.
+    const inMemory = await readSealedDeletionDigests({ sealedLedger: ledger });
+    assert.deepEqual([inMemory.schema, inMemory.count, inMemory.sha256],
+      [projected.schema, projected.count, projected.sha256]);
+    assert.deepEqual([...inMemory.digests], [...set]);
     // Only tombstone digests: the cooldown and erasure-job rows of the
     // sealed ledger never reach the projection.
     const cooldown = ledger.database().prepare("SELECT identity_cooldown_digest AS d FROM identity_reenrollment_cooldowns").get().d;
@@ -239,6 +245,9 @@ test("projections refuse a sealed file that changed underneath them", async () =
     await chmod(copy, 0o400);
     await assert.rejects(projectDeletionDigests({ sealedLedger: opened, outputPath: join(directory, "d.txt") }),
       isCode("CUTOVER_SEALED_SOURCE_CHANGED"));
+    await assert.rejects(readSealedDeletionDigests({ sealedLedger: opened }), isCode("CUTOVER_SEALED_SOURCE_CHANGED"));
+    await assert.rejects(readSealedDeletionDigests({ sealedLedger: { database() {}, verify() {} } }),
+      isCode("CUTOVER_ARGUMENT_INVALID"));
   } finally {
     opened.close();
   }

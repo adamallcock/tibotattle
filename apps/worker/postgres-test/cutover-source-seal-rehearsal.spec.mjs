@@ -100,6 +100,7 @@ describe.skipIf(!PG_TEST_SOCKET)("W2-SEAL cutover source rehearsal on PostgreSQL
     let journal;
     let digests;
     let intersection;
+    let projectedDigestsSha256;
     let sourceId;
     try {
       journal = await projectIngestionJournal({ sealedIngestion: ingestion,
@@ -107,6 +108,7 @@ describe.skipIf(!PG_TEST_SOCKET)("W2-SEAL cutover source rehearsal on PostgreSQL
       sourceId = ingestion.database().prepare("SELECT source_id FROM storage_source_state WHERE singleton = 1").get().source_id;
       const projectedDigests = await projectDeletionDigests({ sealedLedger: ledger,
         outputPath: join(projections, "deletion-digests.projection.txt") });
+      projectedDigestsSha256 = projectedDigests.sha256;
       digests = await readDeletionDigestProjection({ path: projectedDigests.path, expectedSha256: projectedDigests.sha256 });
       intersection = await assertNoSealedParticipantDeletionMatches({ sealedIngestion: ingestion, digests });
     } finally {
@@ -148,6 +150,10 @@ describe.skipIf(!PG_TEST_SOCKET)("W2-SEAL cutover source rehearsal on PostgreSQL
     await assertStageComplete(handle, "identity-authority");
     expect(receipt.transferId).toBe(`production-identity-authority-${seal.manifest.sealId.slice(0, 16)}`);
     expect(receipt.sourceSha256).toBe(seal.sources.ingestion.sealedSha256);
+    // PT-3 enforced the do-not-restore rule over the same digests PT-2-lite
+    // projected: the same count, the projection file's sha256, no match.
+    expect(receipt.doNotRestore).toEqual({ deletionDigests: intersection.deletionDigests,
+      deletionDigestsSha256: projectedDigestsSha256, participants: intersection.participants, matches: 0 });
 
     // Unchanged sources: flip evidence; a moved bookmark refuses.
     const flipDirectory = await privateDirectory("w2-seal-flip-");

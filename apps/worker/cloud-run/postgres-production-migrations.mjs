@@ -34,13 +34,24 @@
  * ends in SIMP_RESIDUE_MIGRATION_SUFFIX and its number comes after
  * SIMP_RESIDUE_PREDECESSOR, the last migration numbered before it (the
  * wave-2 integration promoted primary 0063, so the residue is
- * NNNN_append_only_residue.sql with NNNN >= 0064).
+ * NNNN_append_only_residue.sql with NNNN >= 0064). The suffix is a proposal
+ * awaiting the owner's confirmation (wave-3 SIMP OD-1); another name changes
+ * the suffix and its checks in the same change.
  *
  * Expand-compatibility: the migrate step runs while the previous revision
  * still serves, so a migration that drops, renames or tightens (SET NOT NULL,
  * or a NOT NULL column without a default) is a contract change. Each one must
  * be listed, with its sha256, in the reviewed CONTRACT_MIGRATIONS map; the
- * promoted tail 0001-0063 is classified once below.
+ * promoted tail 0001-0063 is classified once below. That review covers the
+ * SQL a previous revision issues, not its storage fence. The only runtime
+ * receipt fence that exists (readSchemaReceipt in postgres-test-dispatch.mjs)
+ * admits a migration history only when it equals the image's manifest
+ * exactly, so behind it a revision built before a migration answers every
+ * storage-gated route 503 BACKEND_STORAGE_UNAVAILABLE from migrate until the
+ * roll. The production host (CR-7) must either admit a history that extends
+ * its manifest only by reviewed expand-compatible migrations, or the rollout
+ * must treat migrate-to-roll as a write outage and keep it short; the
+ * fast-path plan's CR-7 and OPS-10 rows record this.
  *
  * Identity: the attached identity is read through google-auth-library's
  * Application Default Credentials (the metadata server on Cloud Run, which
@@ -132,9 +143,11 @@ export const CONTRACT_OPERATION_KINDS = Object.freeze([
  * them can break a serving previous revision there; each reason records what
  * the operation does, including where it tightens. A migration after the tail
  * runs between migrate and roll while the previous revision still serves, so
- * it must be safe against that revision, and it (the SIMP residue included)
- * must be added here, reviewed, before any image carrying it can migrate a
- * target.
+ * its SQL must be safe against that revision, and it (the SIMP residue
+ * included) must be added here, reviewed, before any image carrying it can
+ * migrate a target. A reason speaks to the SQL only: whether the previous
+ * revision's receipt fence admits the longer history is CR-7's requirement
+ * (module header).
  */
 export const CONTRACT_MIGRATIONS = Object.freeze({
   "0008_pending_object_reconciliation.sql": Object.freeze({
@@ -255,7 +268,7 @@ export const CONTRACT_MIGRATIONS = Object.freeze({
   "0063_enrollment_grants_erased_redeemer.sql": Object.freeze({
     sha256: "0341b5a6b7165b918e7e18c11873243aff4906a81a8376a0ae46ec5f14007ce9",
     operations: Object.freeze(["drop", "add-constraint"]),
-    reason: "replaces 0015's enrollment_grants_check1 (aborting unless its definition is exactly 0015's) with a state-shape check that only stops requiring the redeemer of a redeemed grant, which every existing row satisfies, plus a trigger that refuses a redeemed grant without a redeemer with the same 23514 class except on an INSERT inside an import transfer session; every write a previous revision makes (issue with every field NULL, redeem with a redeemer, a participant delete's SET NULL) is admitted or refused as before",
+    reason: "replaces 0015's enrollment_grants_check1 (aborting unless its definition is exactly 0015's) with a state-shape check that only stops requiring the redeemer of a redeemed grant, which every existing row satisfies, plus a trigger that refuses a redeemed grant without a redeemer with the same 23514 class except on an INSERT inside an import transfer session; at the SQL level every write a previous revision makes (issue with every field NULL, redeem with a redeemer, a participant delete's SET NULL) is admitted or refused as before; a previous revision behind an exact-history receipt fence still refuses the migrated schema until the roll (module header)",
   }),
 });
 

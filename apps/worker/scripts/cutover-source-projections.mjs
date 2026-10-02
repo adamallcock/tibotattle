@@ -21,7 +21,9 @@
 //                       otherwise). No participant id is ever written. A
 //                       'deleting' participant (an interrupted Cloudflare
 //                       erasure) is hashed like any other: its tombstone may
-//                       already be recorded. PT-3 separately refuses any
+//                       already be recorded. PT-3 runs the same gate itself,
+//                       over the same seal's ledger (readSealedDeletionDigests),
+//                       before its first write, and separately refuses any
 //                       participant that is not quiescent.
 
 import { createHash } from "node:crypto";
@@ -127,13 +129,12 @@ export async function projectIngestionJournal({ sealedIngestion, outputPath } = 
 }
 
 /**
- * The do-not-restore seed: sorted participant digests from the sealed
- * deletion ledger's deletion_tombstones (deletion-ledger-migrations/0001),
- * one per line, written once 0400. Every value must be a 64-hex digest.
+ * The sorted participant digests of a sealed deletion ledger's
+ * deletion_tombstones (deletion-ledger-migrations/0001) and the projection
+ * text, one per line. Every value must be a distinct 64-hex digest.
  */
-export async function projectDeletionDigests({ sealedLedger, outputPath } = {}) {
+async function sealedDeletionDigestProjection(sealedLedger) {
   const source = trusted(sealedLedger);
-  if (typeof outputPath !== "string") fail("CUTOVER_ARGUMENT_INVALID");
   await source.verify();
   const database = source.database();
   const table = database.prepare(`SELECT sql FROM sqlite_schema WHERE type='table' AND name='deletion_tombstones'`).all();
@@ -145,13 +146,39 @@ export async function projectDeletionDigests({ sealedLedger, outputPath } = {}) 
     if (digests[index - 1] >= digests[index]) fail("CUTOVER_PROJECTION_INVALID");
   }
   await source.verify();
-  const text = digests.map(digest => `${digest}\n`).join("");
+  return { digests, text: digests.map(digest => `${digest}\n`).join("") };
+}
+
+/**
+ * The do-not-restore seed: sorted participant digests from the sealed
+ * deletion ledger's deletion_tombstones (deletion-ledger-migrations/0001),
+ * one per line, written once 0400. Every value must be a 64-hex digest.
+ */
+export async function projectDeletionDigests({ sealedLedger, outputPath } = {}) {
+  trusted(sealedLedger);
+  if (typeof outputPath !== "string") fail("CUTOVER_ARGUMENT_INVALID");
+  const { digests, text } = await sealedDeletionDigestProjection(sealedLedger);
   const sha256 = await writePrivateFileOnce(outputPath, text, 0o400);
   return Object.freeze({
     schema: CUTOVER_DELETION_DIGEST_PROJECTION_SCHEMA,
     path: outputPath,
     sha256,
     count: digests.length,
+  });
+}
+
+/**
+ * The same projection in memory, for an importer that enforces the
+ * do-not-restore rule itself (PT-3): the digest set, its count and the
+ * sha256 the projection file of this ledger has. Nothing is written.
+ */
+export async function readSealedDeletionDigests({ sealedLedger } = {}) {
+  const { digests, text } = await sealedDeletionDigestProjection(sealedLedger);
+  return Object.freeze({
+    schema: CUTOVER_DELETION_DIGEST_PROJECTION_SCHEMA,
+    digests: Object.freeze(new Set(digests)),
+    count: digests.length,
+    sha256: sha256Hex(text),
   });
 }
 
