@@ -596,6 +596,8 @@ export function validateFrozenCommunityDaily(
     : validateBreakdowns(body.allowanceBreakdowns, facts.capturedAt.slice(0, 10), publishedDays, capturedAtMs);
   // Typed storage: the allowance is ready exactly when a graph was published.
   if ((body.allowanceState === "ready") !== (breakdowns !== null)) inconsistent("allowanceState");
+  // The graph is projected from the allowance cache, so an unreadable cache never carries one.
+  if (breakdowns !== null && body.allowanceReadState !== "confirmed") inconsistent("allowanceReadState");
   if (body.cacheRetention !== undefined) validateCacheRetention(body.cacheRetention);
   return {
     from,

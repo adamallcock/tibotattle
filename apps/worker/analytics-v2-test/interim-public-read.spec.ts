@@ -345,6 +345,20 @@ describe("the closed community-daily-read-v1.0 contract", () => {
     await refuseMutated((body) => { body.allowanceBreakdowns.days = []; }, CONTRACT, "allowanceBreakdowns.days");
   });
 
+  it("holds the read state to the breakdowns: an unreadable allowance cache never carries a graph", async () => {
+    // Production projects the graph from the cache, so temporarily_unavailable always means no breakdowns.
+    await refuseMutated((body) => { body.allowanceReadState = "temporarily_unavailable"; }, EVIDENCE, "allowanceReadState");
+    // The Q1 settled golden carries breakdowns too, and is refused the same way.
+    const settled = oracleGoldenExportBody("golden-q1-node/community-daily-response-settled.json") as Body;
+    expect(settled.allowanceBreakdowns).toBeDefined();
+    settled.allowanceReadState = "temporarily_unavailable";
+    const error = await refusal(prepareInterimPublicRead(exportInput(settled)));
+    expect([error.code, error.detail]).toEqual([EVIDENCE, "allowanceReadState"]);
+    // The legitimate pairing is untouched: unavailable with no graph is the dense golden's shape.
+    const dense = await prepareInterimPublicRead(exportInput(denseGoldenExportBody()));
+    expect([dense.summary.allowanceReadState, dense.summary.breakdownDayCount]).toEqual(["temporarily_unavailable", 0]);
+  });
+
   it("validates the breakdowns by version: their plan set, combined summary, days and models", async () => {
     const at = "allowanceBreakdowns";
     await refuseMutated((body) => { body.allowanceBreakdowns.schemaVersion = "community-allowance-breakdowns-v1.3"; },

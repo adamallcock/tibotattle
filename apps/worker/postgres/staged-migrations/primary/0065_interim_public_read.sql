@@ -37,6 +37,15 @@
 -- Reloading the identical export is a no-op in the loader; a different export
 -- is refused there and by the primary key here.
 --
+-- RETENTION IS NOT SETTLED. The owner's answer sets 90 days, then delete, for
+-- "sealed and frozen copies", and this row is a frozen copy if that answer
+-- covers it; nothing decides that. Until the owner or the integrator does, the
+-- row stays. If it is covered, the retirement is a later migration that drops
+-- the table and its function: the route already answers as "no export" when
+-- the table is absent (to_regclass), and DROP is a contract operation, so that
+-- migration needs its own CONTRACT_MIGRATIONS entry. See the receipt
+-- docs/receipts/2026-10-02-gcp-c-ipr.md, "Retention of the frozen copy".
+--
 -- Grants: none, consistent with every other primary migration. The migrate job
 -- grants the runtime role its table privileges; the trigger below, not the
 -- grant, makes the row immutable.
