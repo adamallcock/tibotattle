@@ -87,12 +87,21 @@
     "analytics-refresh": {
       "name": "synthetic-analytics-refresh",
       "maxConnections": 4
+    },
+    "maintenance": {
+      "name": "synthetic-maintenance",
+      "maxConnections": 2
     }
   },
   "scheduler": {
     "analytics-refresh": {
       "name": "synthetic-analytics-refresh-trigger",
       "schedule": null,
+      "state": "PAUSED"
+    },
+    "maintenance": {
+      "name": "synthetic-maintenance-trigger",
+      "schedule": "* * * * *",
       "state": "PAUSED"
     }
   }
