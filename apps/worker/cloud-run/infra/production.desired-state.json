@@ -92,5 +92,6 @@
       "schedule": null,
       "state": "PAUSED"
     }
-  }
+  },
+  "stagingOrigin": null
 }

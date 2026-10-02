@@ -91,7 +91,9 @@ export function bucketBirthSnapshot(value, desired) {
     projectNumber: value.projectNumber,
     location: value.location,
     storageClass: value.storageClass,
-    timeCreated: value.timeCreated,
+    // Canonical ISO milliseconds: the JSON API says "…18.035Z" while gcloud's
+    // raw listing (the readback) says "…18.035000+00:00" for the same instant.
+    timeCreated: new Date(Date.parse(value.timeCreated)).toISOString(),
     bucketGeneration: decimalGeneration(value.generation),
     bucketMetageneration: decimalGeneration(value.metageneration),
     softDeleteRetentionDurationSeconds: "0",
@@ -106,7 +108,14 @@ export function createBucketBirthReceipt(desired, { createResponse, readbackResp
   const created = bucketBirthSnapshot(createResponse, desired);
   const readback = bucketBirthSnapshot(readbackResponse, desired);
   if (canonicalJson(created) !== canonicalJson(readback) || readback.bucketMetageneration !== "1") {
-    fail("BUCKET_BIRTH_READBACK_MISMATCH");
+    // Content-free diagnostics: snapshot field NAMES only, never values.
+    const differingFields = Object.keys(created)
+      .filter((key) => canonicalJson(created[key]) !== canonicalJson(readback[key])).sort();
+    if (readback.bucketMetageneration !== "1" && !differingFields.includes("bucketMetageneration")) {
+      differingFields.push("readbackMetagenerationNotOne");
+    }
+    throw Object.assign(new GcpOpsInfraError("BUCKET_BIRTH_READBACK_MISMATCH"),
+      { differingFields: Object.freeze(differingFields) });
   }
   const request = bucketBirthRequest(desired);
   return deepFreeze({
@@ -222,6 +231,7 @@ function afterInsert(error, receipt) {
   return Object.assign(new GcpOpsInfraError(code), {
     bucketInserted: true,
     ...(receipt === undefined ? {} : { receipt }),
+    ...(Array.isArray(error?.differingFields) ? { differingFields: error.differingFields } : {}),
   });
 }
 

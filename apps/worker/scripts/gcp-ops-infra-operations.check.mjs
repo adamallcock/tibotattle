@@ -25,6 +25,7 @@ import {
   memoryWriter,
   withSecretValues,
 } from "./fixtures/gcp-ops-infra/fake-gcloud.mjs";
+import { unpinnedStagingText } from "./fixtures/gcp-ops-infra/staging-unpinned.mjs";
 
 process.env.PATH = "/nonexistent-gcloud-guard";
 
@@ -208,9 +209,12 @@ test("the plan for the synthetic fixture holds the whole estate and no bucket ch
   for (const flag of manifest.databaseFlags(desired)) {
     assert.ok(byId.get("cloud-sql:create").argv.at(-1).includes(`${flag.name}=${flag.value}`), flag.name);
   }
+  // PostgreSQL IAM users are the email without ".gserviceaccount.com".
   assert.deepEqual(byId.get("cloud-sql-user:create:runtime").argv, ["sql", "users", "create",
-    desired.serviceAccounts.runtime.email, "--instance=synthetic-primary", "--project=synthetic-ops-project",
+    desired.cloudSql.runtimeIamUser, "--instance=synthetic-primary", "--project=synthetic-ops-project",
     "--type=cloud_iam_service_account"]);
+  assert.equal(byId.get("cloud-sql-user:create:runtime").argv.some((arg) => arg.endsWith(".gserviceaccount.com")), false);
+  assert.equal(byId.get("cloud-sql-user:create:migrator").argv[3], desired.cloudSql.migratorIamUser);
   assert.ok(byId.has("cloud-sql-user:create:migrator"));
   // The conditional custom role, with exactly the parsed permissions.
   assert.ok(byId.get("custom-role:create").argv.includes(`--permissions=${desired.customRole.permissions.join(",")}`));
@@ -852,12 +856,13 @@ test("a shared project's co-tenants and project-wide settings are never read int
   assert.doesNotMatch(JSON.stringify(result.operations), /tibotattle-test/u);
   operations.applyInfrastructure(shared, { runner: gcloud.runner, authorize: result.planDigest, bootstrap: BOOTSTRAP,
     createSpecWriter: () => gcloud.writer.create() });
-  // The plane converged as far as it can (its service waits for a staging
-  // template); its co-tenants and the project-wide settings are exactly as they were.
+  // The plane converged as far as it can (its service waits for its
+  // stagingOrigin settings, STG-PREP); its co-tenants and the project-wide
+  // settings are exactly as they were.
   assert.deepEqual([...operations.infrastructureCleanliness(plan(shared, gcloud.runner)).reasons], [
-    "DEFERRED:run-service:create:STAGING_SERVICE_TEMPLATE_UNAVAILABLE",
-    `DEFERRED:run-service-iam:bind:roles/run.invoker|${shared.serviceAccounts.edgeInvoker.member}|:STAGING_SERVICE_TEMPLATE_UNAVAILABLE`,
-    `DEFERRED:run-service-iam:bind:roles/run.invoker|${shared.serviceAccounts.verifier.member}|:STAGING_SERVICE_TEMPLATE_UNAVAILABLE`,
+    "DEFERRED:run-service:create:STAGING_ORIGIN_UNASSIGNED",
+    `DEFERRED:run-service-iam:bind:roles/run.invoker|${shared.serviceAccounts.edgeInvoker.member}|:STAGING_ORIGIN_UNASSIGNED`,
+    `DEFERRED:run-service-iam:bind:roles/run.invoker|${shared.serviceAccounts.verifier.member}|:STAGING_ORIGIN_UNASSIGNED`,
   ]);
   for (const [key, value] of Object.entries(before)) {
     const now = key === "auditConfigs" ? world.projectPolicy.auditConfigs
@@ -882,7 +887,9 @@ test("a shared project's co-tenants and project-wide settings are never read int
 });
 
 test("the committed staging desired state plans only its own new resources in the shared test project", () => {
-  const desired = manifest.loadCommittedDesiredState("staging");
+  // The committed file as it reads before its pins (STG-PREP): the first plan.
+  manifest.loadCommittedDesiredState("staging");
+  const desired = manifest.assertCommittedDesiredState(manifest.validateDesiredState(JSON.parse(unpinnedStagingText())));
   const world = withCoTenants(emptyWorld(), desired);
   const gcloud = fake(desired, world);
   const result = plan(desired, gcloud.runner, { bootstrap: BOOTSTRAP });
@@ -892,14 +899,15 @@ test("the committed staging desired state plans only its own new resources in th
   assert.deepEqual(result.blockers, ["BUCKET_ABSENT", "BUCKET_PROOF_UNPINNED"]);
   assert.doesNotMatch(JSON.stringify(result.operations), /tibotattle-test|_Default/u);
   // Everything it would create is the staging plane's; the service waits for
-  // its template, the verifier grant for the operator, the trigger for the cadence.
+  // its Access AUD, the verifier grant for the operator, the trigger for the cadence.
   for (const entry of result.operations.filter((operation) => operation.deferred === undefined)) {
     const named = entry.file === undefined ? entry.argv : [...entry.argv, entry.file.content];
     assert.ok(named.some((arg) => /staging/u.test(arg)) || entry.id === "custom-role:create", entry.id);
   }
   const deferrals = new Set(ops(result, (entry) => entry.deferred !== undefined).map((entry) => entry.deferred));
-  assert.deepEqual([...deferrals].sort(), ["SCHEDULER_CADENCE_UNSET", "STAGING_SERVICE_TEMPLATE_UNAVAILABLE",
-    "VERIFIER_TOKEN_CREATOR_UNASSIGNED"]);
+  // The verifier operator was named on 2026-10-02, so its grant is no longer deferred.
+  assert.deepEqual([...deferrals].sort(), ["SCHEDULER_CADENCE_UNSET",
+    "STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud"]);
   assert.ok(ops(result, (entry) => entry.id === "secret:create:IDENTITY_LINK_SECRET")[0].argv
     .includes("tibotattle-staging-identity-link-secret"));
   // Apply refuses it until the bucket is born and its proof is committed.
