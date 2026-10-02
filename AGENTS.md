@@ -50,6 +50,7 @@ and updated authoritative documentation.
   account IDs and session content must not enter derived artifacts, fixtures,
   logs, diagnostics, issues, commits, or PRs. Opt-in Crashpad dumps and explicit
   owner-only raw crash exports are sole local exceptions; never project/upload them (`docs/decisions/2026-09-21-opt-in-crash-doctor.md`).
+  Model, provider, speed, tier and plan names are vocabulary, not account IDs: plain text inside `[A-Za-z0-9._:-]{1,64}`, else `unrecognized` (`docs/decisions/2026-10-02-catalog-vocabulary-plain-text.md`).
 - Hosted contribution is optional, content-free and pseudonymous. Follow the
   accountless Electron defaults and transition in
   `docs/decisions/2026-09-04-accountless-sharing-policy.md`; preserve durable

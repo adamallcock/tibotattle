@@ -213,6 +213,32 @@ test("agent guidance preserves owner erasure and restore after self-service reti
   assert.match(docs, /does not retire owner erasure, privacy-request\s+handling, retention disclosures, or deletion-safe restore/u);
 });
 
+test("agent guidance scopes the raw-identifier invariant for catalog vocabulary to the wire grammar", async () => {
+  const [root, contract, decision, index] = await Promise.all([
+    readRepositoryFile("AGENTS.md"),
+    readRepositoryFile("packages/telemetry-contract/AGENTS.md"),
+    readRepositoryFile("docs/decisions/2026-10-02-catalog-vocabulary-plain-text.md"),
+    readRepositoryFile("docs/README.md"),
+  ]);
+  const grammar = "`[A-Za-z0-9._:-]{1,64}`";
+  const decisionPath = "docs/decisions/2026-10-02-catalog-vocabulary-plain-text.md";
+  // The invariant itself still forbids raw account IDs; only vocabulary is carved out.
+  assert.match(root, /raw\s+account IDs and session content must not enter derived artifacts/u);
+  assert.match(
+    root,
+    /Model, provider, speed, tier and plan names are vocabulary, not account IDs/u,
+  );
+  assert.ok(root.includes(`plain text inside ${grammar}, else \`unrecognized\``));
+  assert.ok(root.includes(decisionPath));
+  assert.match(contract, /Model, provider, speed, tier and plan\s+names are vocabulary, not raw account\/scope identifiers/u);
+  assert.ok(contract.includes(grammar));
+  assert.ok(contract.includes(decisionPath));
+  assert.match(contract, /unknown models follow the current fingerprint\/unknown policy/u);
+  assert.match(decision, /^status: accepted$/mu);
+  assert.match(decision, /ARNs? (?:that contain|containing) `\/`/u);
+  assert.ok(index.includes("(./decisions/2026-10-02-catalog-vocabulary-plain-text.md)"));
+});
+
 test("agent guidance treats unexpected Keychain prompts as a release blocker without weakening security", async () => {
   const [root, native, scripts, runbook] = await Promise.all([
     readRepositoryFile("AGENTS.md"),
