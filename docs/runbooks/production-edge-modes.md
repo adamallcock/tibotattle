@@ -334,7 +334,11 @@ add the golden stage: the community/daily read, then the live check's write
 tier against an origin with the settings the deploy gives it over a seeded
 schema. It seeds through the fast-path rehearsal, whose importers
 need a newer `node:sqlite` than Node 22.16 (`EDGE_E2E_REHEARSAL_NODE`, default
-the `node` on PATH). `EDGE_E2E_EDGE_TREE=<edge-port worktree>/apps/worker`
+the `node` on PATH). The golden's withheld model dates are held to the
+oracle's per-date expectation, as in `npm run gcp:fastpath:rehearsal`:
+`EDGE_E2E_PER_DATE_EXPECTED`, which defaults to
+`analytics-v2-test/golden-q1-node/per-date-expected.json` for the committed
+Q-1 golden. `EDGE_E2E_EDGE_TREE=<edge-port worktree>/apps/worker`
 builds the edge from that tree and refuses unless its
 `src/edge-origin-contract.ts` is byte-identical. The run takes about four
 minutes (S4 waits for fresh rate-limit windows) and drops every schema it

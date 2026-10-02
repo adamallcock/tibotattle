@@ -19,7 +19,10 @@
 // the checked-in production limits, S5 shipped-client flows, S6 upstream
 // failures, S7 privacy on every exchange, S8 the Sparkle guard, S9 the golden
 // community/daily read and the live check's write tier on the golden-seeded
-// schema (EDGE_E2E_GOLDEN), S10 detector controls.
+// schema (EDGE_E2E_GOLDEN), S10 detector controls. S9 holds the golden's
+// withheld model dates to the oracle's per-date expectation (OD-12, decision
+// D7): EDGE_E2E_PER_DATE_EXPECTED, or for the committed Q-1 golden the one
+// `npm run gcp:fastpath:rehearsal` uses.
 //
 // Local only: nothing is deployed, nothing reaches Cloudflare or Google, and
 // every key, token, account, address and row is synthetic and content-free.
@@ -51,7 +54,11 @@ import {
   telemetryV12DayManifestDigestInput,
   telemetryV12RequiredConsent,
 } from "@app-usagemonitor/telemetry-contract";
-import { compareAnalyticsV2Parity } from "../scripts/analytics-v2-parity-compare.mjs";
+import {
+  compareAnalyticsV2Parity,
+  perDateExpectationFor,
+  withheldModelDatesOf,
+} from "../scripts/analytics-v2-parity-compare.mjs";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
 import { buildEdgeBundle, readCompatibility } from "../scripts/edge-e2e/edge-bundle.mjs";
 import {
@@ -2129,6 +2136,18 @@ test("S4 ingress: a pair with 100/60 ingress limits shows the client, coarse, pr
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * The oracle's per-date expectation for the S9 golden (OD-12): the file
+ * EDGE_E2E_PER_DATE_EXPECTED names, else for the committed Q-1 golden the
+ * expectation `npm run gcp:fastpath:rehearsal` passes, else none (the withheld
+ * dates' publications then stay unverified, as in the rehearsal without one).
+ */
+const PER_DATE_EXPECTED = process.env.EDGE_E2E_PER_DATE_EXPECTED
+  ? resolve(process.env.EDGE_E2E_PER_DATE_EXPECTED)
+  : GOLDEN === join(WORKER_ROOT, "analytics-v2-test", "golden")
+    ? join(WORKER_ROOT, "analytics-v2-test", "golden-q1-node", "per-date-expected.json")
+    : null;
+
 function familyTable(report) {
   return Object.fromEntries(report.families.map((entry) => [entry.family,
     { expected: entry.expected, compared: entry.compared, equal: entry.equal, diffCount: entry.diffCount }]));
@@ -2151,7 +2170,8 @@ async function seededRehearsal() {
   const out = join(directory, "report.json");
   try {
     await execFileAsync(node,
-      [join(WORKER_ROOT, "scripts", "gcp-fastpath-rehearsal.mjs"), "--golden", GOLDEN, "--keep-schema", "--out", out], {
+      [join(WORKER_ROOT, "scripts", "gcp-fastpath-rehearsal.mjs"), "--golden", GOLDEN, "--keep-schema", "--out", out,
+        ...(PER_DATE_EXPECTED === null ? [] : ["--per-date-expected", PER_DATE_EXPECTED])], {
         cwd: WORKER_ROOT, maxBuffer: 256 * 1024 * 1024, timeout: 40 * 60_000,
         env: { PATH: process.env.PATH, HOME: process.env.HOME, PG_TEST_SOCKET: process.env.PG_TEST_SOCKET,
           PG_TEST_PORT: String(PG_TEST_PORT), GCP_FASTPATH_NODE22: process.execPath,
@@ -2209,9 +2229,17 @@ test("S9 golden: the community/daily read is byte-equal through the edge and rep
     assert.ok(answer.body.equals(direct.body), "the edge read equals a direct origin read byte for byte");
     const actualPreview = (await f.base.query(`SELECT preview FROM "${schema}".analytics_v2_preview WHERE id = 1`))
       .rows[0]?.preview ?? null;
-    const parity = compareAnalyticsV2Parity({ golden, actual: JSON.parse(answer.text), goldenPreview, actualPreview });
+    // The rehearsal's own compare: the golden's withheld model dates, held to
+    // the per-date expectation when there is one.
+    const perDateExpected = PER_DATE_EXPECTED === null ? null
+      : perDateExpectationFor(JSON.parse(await readFile(PER_DATE_EXPECTED, "utf8")), manifest);
+    const parity = compareAnalyticsV2Parity({ golden, actual: JSON.parse(answer.text), goldenPreview, actualPreview,
+      withheldModelDates: withheldModelDatesOf(manifest), perDateExpected });
     assert.deepEqual(familyTable(parity), familyTable(rehearsal.parity),
       "the edge read reproduces the rehearsal's parity table on this commit");
+    if (perDateExpected !== null) {
+      assert.equal(parity.unexpectedDiffs, 0, "the edge read equals the golden and its per-date expectation");
+    }
     f.rows.push({ stage: "S9", id: "golden", bytes: answer.body.length,
       sha256: createHash("sha256").update(answer.body).digest("hex"), cacheControl: answer.header("cache-control"),
       unexpectedDiffs: parity.unexpectedDiffs, unexpectedFamilies: parity.unexpectedFamilies,
