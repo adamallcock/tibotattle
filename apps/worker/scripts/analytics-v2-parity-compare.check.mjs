@@ -3,12 +3,15 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  ANALYTICS_V2_DECLARED_MODEL_METADATA,
   ANALYTICS_V2_PARITY_FAMILIES,
   compareAnalyticsV2Parity,
+  declaredBreakdownsV13,
   normalizeServedDay,
   perDateExpectationFor,
   withheldModelDatesOf,
 } from "./analytics-v2-parity-compare.mjs";
+import { comparePerDate } from "./gcp-fastpath-dense-oracle/per-date-compare.mjs";
 
 function servedDay(day, revision, overrides = {}) {
   const releasedAt = `2026-10-0${revision}T12:00:00.000Z`;
@@ -264,4 +267,111 @@ test("the withheld dates come from the golden manifest and are validated", () =>
   for (const missing of [["2026-7-24"], ["2026-07-24", "2026-07-24"], "2026-07-24", [null]]) {
     assert.throws(() => withheldModelDatesOf({ modelPublications: { missing } }), /WITHHELD_DATES_INVALID/u);
   }
+});
+
+// Owner decision round 7 (2026-10-02): GCP serves breakdowns v1.3, d43c8f92's
+// v1.1 plus the catalog baseline's model-metadata block, as a declared
+// difference. Every other byte of the block is still held to the oracle.
+function v11Breakdowns() {
+  return {
+    schemaVersion: "community-allowance-breakdowns-v1.1",
+    basis: "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d",
+    referencePlanType: "pro",
+    normalization: "pro_x1_prolite_x4_plus_x20",
+    modelBasis: "seven_day_codex_pro20x_equivalent_per_model_composition",
+    modelGate: "shared_composition_kernel_identification",
+    generatedAt: "2026-10-01T12:00:00.000Z",
+    days: [{ day: "2026-09-30", combined: { centralUsd: 10 }, byPlanType: {}, models: [["gpt-6-sol", 1, 1]] }],
+  };
+}
+
+function v13Fixture() {
+  const golden = response([], { allowanceBreakdowns: v11Breakdowns() });
+  const actual = response([], { allowanceBreakdowns: {
+    ...v11Breakdowns(), schemaVersion: "community-allowance-breakdowns-v1.3",
+    modelConfig: structuredClone(ANALYTICS_V2_DECLARED_MODEL_METADATA),
+  } });
+  return { golden, actual };
+}
+
+test("the declared block is the committed manifest_version 1 public roster", () => {
+  // The six models the d43c8f92 public page charts, in its card order; never
+  // a model the owner's selected comparison keeps off the page, such as GPT-5.5.
+  assert.deepEqual([...ANALYTICS_V2_DECLARED_MODEL_METADATA].sort((left, right) => left.order - right.order)
+    .map(({ id, family, order }) => [id, family, order]), [
+    ["gpt-6-astra", "astra", 0], ["gpt-6-sol", "sol", 1], ["gpt-6-luna", "luna", 2],
+    ["gpt-5.6-terra", "terra", 3], ["gpt-5.6-sol", "sol", 4], ["gpt-5.6-luna", "luna", 5],
+  ]);
+  assert.deepEqual(ANALYTICS_V2_DECLARED_MODEL_METADATA.find((entry) => entry.id === "gpt-6-astra"),
+    { id: "gpt-6-astra", label: "GPT-6 Astra", family: "astra", order: 0 });
+  assert.equal(ANALYTICS_V2_DECLARED_MODEL_METADATA.some((entry) => entry.id === "gpt-5.5"), false);
+});
+
+test("a served v1.3 block is the declared difference and nothing else", () => {
+  const report = compareAnalyticsV2Parity(v13Fixture());
+  assert.equal(report.unexpectedDiffs, 0);
+  assert.deepEqual(report.breakdownsV13, { decision: report.breakdownsV13.decision, served: true, accepted: true,
+    declaredEntries: 6 });
+  const declared = byName(report)["breakdowns-v13-metadata"];
+  assert.equal(declared.expected, true);
+  assert.deepEqual(declared.diffs.map((diff) => diff.path),
+    ["$.allowanceBreakdowns.schemaVersion", "$.allowanceBreakdowns.modelConfig"]);
+  // The plain v1.1 oracle shape served as-is is equal and declares nothing.
+  const plain = compareAnalyticsV2Parity({ golden: v13Fixture().golden, actual: v13Fixture().golden });
+  assert.equal(plain.unexpectedDiffs, 0);
+  assert.deepEqual([plain.breakdownsV13.served, plain.breakdownsV13.accepted], [false, false]);
+});
+
+test("every other byte of a v1.3 block is still held to the oracle", () => {
+  const changedValue = v13Fixture();
+  changedValue.actual.allowanceBreakdowns.days[0].combined.centralUsd = 11;
+  assert.deepEqual(compareAnalyticsV2Parity(changedValue).unexpectedFamilies, ["allowance-breakdowns"]);
+  const changedModel = v13Fixture();
+  changedModel.actual.allowanceBreakdowns.days[0].models[0][1] = 2;
+  assert.deepEqual(compareAnalyticsV2Parity(changedModel).unexpectedFamilies, ["model-days"]);
+  const changedHeader = v13Fixture();
+  changedHeader.actual.allowanceBreakdowns.generatedAt = "2026-10-01T12:00:01.000Z";
+  assert.deepEqual(compareAnalyticsV2Parity(changedHeader).unexpectedFamilies, ["allowance-breakdowns"]);
+});
+
+test("a v1.3 block outside the declared shape or with another block is unexpected", () => {
+  const mutations = [
+    (block) => { block.modelConfig[0].label = "Codex Auto Review"; },
+    (block) => { block.modelConfig.pop(); },
+    (block) => { block.modelConfig.push({ id: "synthetic-unseen", label: "Unseen", family: "generic", order: 99 }); },
+    (block) => { block.modelConfig[0].order = 8; block.modelConfig[1].order = 7; },
+    (block) => { block.modelConfig[0].tone = "x"; },
+    (block) => { delete block.modelConfig; },
+    (block) => { block.catalogManifestVersion = 1; },
+    (block) => { const { modelConfig, ...rest } = structuredClone(block);
+      for (const key of Object.keys(block)) delete block[key];
+      Object.assign(block, { modelConfig, ...rest }); },
+  ];
+  for (const [index, mutate] of mutations.entries()) {
+    const fixture = v13Fixture();
+    mutate(fixture.actual.allowanceBreakdowns);
+    const report = compareAnalyticsV2Parity(fixture);
+    assert.ok(report.unexpectedFamilies.includes("allowance-breakdowns"), `mutation ${index}`);
+    assert.equal(report.breakdownsV13.accepted, false, `mutation ${index}`);
+    assert.equal(byName(report)["breakdowns-v13-metadata"].diffCount, 0, `mutation ${index}`);
+  }
+  // Against a v1.1 oracle, a v1.3 claim is never the v1.1 bytes by itself.
+  const relabelOnly = v13Fixture();
+  relabelOnly.golden.allowanceBreakdowns.schemaVersion = "community-allowance-breakdowns-v1.0";
+  assert.deepEqual(compareAnalyticsV2Parity(relabelOnly).unexpectedFamilies, ["allowance-breakdowns"]);
+});
+
+test("the per-date compare holds the reduced v1.1 block and the declared block", () => {
+  const { actual } = v13Fixture();
+  const expected = { decision: "d", preview: { p: 1 }, allowanceBreakdowns: v11Breakdowns() };
+  const equal = comparePerDate({ expected, response: actual, preview: { p: 1 } });
+  assert.equal(equal.equal, true);
+  assert.deepEqual(equal.breakdownsV13, { served: true, accepted: true });
+  const wrongBlock = structuredClone(actual);
+  wrongBlock.allowanceBreakdowns.modelConfig[3].family = "sol";
+  assert.equal(comparePerDate({ expected, response: wrongBlock, preview: { p: 1 } }).equal, false);
+  const wrongValue = structuredClone(actual);
+  wrongValue.allowanceBreakdowns.days[0].models = [];
+  assert.equal(comparePerDate({ expected, response: wrongValue, preview: { p: 1 } }).equal, false);
+  assert.equal(declaredBreakdownsV13(null).served, false);
 });

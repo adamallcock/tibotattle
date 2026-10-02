@@ -50,6 +50,8 @@ and updated authoritative documentation.
   account IDs and session content must not enter derived artifacts, fixtures,
   logs, diagnostics, issues, commits, or PRs. Opt-in Crashpad dumps and explicit
   owner-only raw crash exports are sole local exceptions; never project/upload them (`docs/decisions/2026-09-21-opt-in-crash-doctor.md`).
+  Model, provider, speed, tier and plan names in the wire grammar are vocabulary,
+  not account IDs (`docs/decisions/2026-10-02-catalog-vocabulary-plain-text.md`).
 - Hosted contribution is optional, content-free and pseudonymous. Follow the
   accountless Electron defaults and transition in
   `docs/decisions/2026-09-04-accountless-sharing-policy.md`; preserve durable
@@ -66,8 +68,7 @@ and updated authoritative documentation.
   version, destructively downgrade state, wipe application data, or let an older
   reader mutate newer state. Diagnose and rehearse recovery against a copy.
 - Local, hosted, browser, native, installed-artifact, CI, signed-release, updater,
-  and public-deployment evidence are separate gates. Passing one never proves
-  another.
+  and public-deployment evidence are separate gates; one never proves another.
 
 ## Truth and evidence
 
@@ -161,8 +162,7 @@ and updated authoritative documentation.
   external resources without explicit authorization for that outcome.
 - Treat production and staging writes, live load tests, real-account experiments,
   R7 regeneration, signing, notarization, updater publication, and website
-  publication as protected operations. A dry run is not authorization for a
-  write.
+  publication as protected operations; a dry run never authorizes a write.
 - Never print, commit, or document secrets. Keep credentials in their designed
   local secret store and preserve redaction in failures and diagnostics.
 - Never use real private session data in tests. Use synthetic, minimal, content-free
