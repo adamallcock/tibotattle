@@ -25,17 +25,21 @@
  * Registration is read from the places the Worker gate runs PostgreSQL specs
  * from: the `postgres:domain:check` script, the include arrays of
  * vitest.postgres.config.ts and vitest.node.config.ts, and the frozen
- * EXTRA_REGISTRATION_SCRIPTS (`edge:e2e`, `postgres:production-migrations:check`).
+ * EXTRA_REGISTRATION_SCRIPTS (`edge:e2e`, `postgres:production-migrations:check`,
+ * `gcp:load-test:local`).
  * UNREGISTERED_ALLOWLIST names the specs registered in none of them; it may
  * only shrink.
  *
  * A spec registered by a script in SCRIPT_PROFILES runs in that explicit
  * profile through the script's own steps instead of a SOCKET or HOST pass.
- * EDGE_E2E (`edge:e2e`, postgres-test/edge-origin-e2e.spec.mjs) needs the
+ * EDGE_E2E (`edge:e2e`, postgres-test/edge-origin-e2e.spec.mjs, and
+ * `gcp:load-test:local`, postgres-test/gcp-load-test.spec.mjs, which drives the
+ * OPS-11 load generator through the same local edge and origin) needs the
  * cloud-run build, workerd and the image runtime (Node 22.16.0, named by
- * EDGE_E2E_NODE), and its S9 stage reads the golden named by EDGE_E2E_GOLDEN.
- * Without them the spec is reported as a named ENVIRONMENT_GAP and the run is
- * "incomplete", never green and never a silent skip.
+ * EDGE_E2E_NODE), and the edge spec's S9 stage reads the golden named by
+ * EDGE_E2E_GOLDEN. Without them each spec is reported as a named
+ * ENVIRONMENT_GAP and the run is "incomplete", never green and never a silent
+ * skip. The shared build prerequisite runs once per suite run.
  *
  * Failure codes (one entry per file and test, never payloads):
  *   FAILED, ENV_PROFILE_CONFLICT, SILENTLY_SKIPPED, EMPTY_SPEC_FILE,
@@ -87,6 +91,7 @@ export const NODE_RUNNER = "node";
 export const EXTRA_REGISTRATION_SCRIPTS = Object.freeze([
   "edge:e2e",
   "postgres:production-migrations:check",
+  "gcp:load-test:local",
 ]);
 
 /**
@@ -95,6 +100,7 @@ export const EXTRA_REGISTRATION_SCRIPTS = Object.freeze([
  */
 export const SCRIPT_PROFILES = Object.freeze({
   "edge:e2e": PROFILE_EDGE_E2E,
+  "gcp:load-test:local": PROFILE_EDGE_E2E,
 });
 
 /** The only steps an extra registration script may run before its specs. */

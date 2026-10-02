@@ -346,6 +346,11 @@ against a copy of the old harness first, and it failed there.
   per-address edge limits then apply to the whole fleet, as run 2 shows.
 - **Hosted CI:** the offline check runs inside `scripts:check`. Registering
   the PostgreSQL spec in the hosted PostgreSQL lane belongs to C-CI.
+  *Integration note (2026-10-02):* C-CI's registration ratchet merged after
+  this branch's base and refuses an unregistered spec, so the merge into
+  `claude/gcp-fastpath-final` registered `gcp:load-test:local` in
+  `scripts/ci-postgres-suite.mjs` as a second EDGE_E2E-profile script. The
+  hosted `postgres-17-suite` job now runs this spec under Node 22.16.0.
 - **Guidance conflict, open for the owner:** `apps/worker/AGENTS.md` asks
   network harnesses to validate a local owner session through
   `--owner-access-file` before enrollment. That rule is written for the
