@@ -512,7 +512,7 @@ function buildCommunityAllowanceSingleChartModel(series, {
  * ones with a published `order`) lead, by that order, and may add models the
  * page has never seen. Every other model follows in the page's own order. The
  * input list is never reordered. Without metadata this is the page's own list.
- * `pinned` marks the page's roster: those models keep a card even with no
+ * `pinned` marks the page's roster models that keep a card even with no
  * estimate, while any other model is charted only when it has one.
  */
 function modelDefinitions(modelConfig) {
@@ -655,7 +655,7 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
   }).filter(definition => definition.dots.length > 0);
   if (visible.length === 0) return null;
   const visibleByKey = new Map(visible.map(definition => [definition.key, definition]));
-  // The page's roster keeps a card (and a legend entry) while it has no
+  // The page's pinned roster keeps a card (and a legend entry) while it has no
   // estimate; every other model, however it became known, is drawn only once it
   // has one. A catalog of dozens of models must not become dozens of empty cards.
   const cardSeries = view === "models"

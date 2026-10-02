@@ -420,8 +420,11 @@ test("a model appended to the catalog after the hide list was frozen is charted 
   const before = publicAllowanceModels();
   const after = publicAllowanceModels([...REVIEWED_MODEL_CATALOG, appended]);
   assert.deepEqual(before.charted.map(model => model.modelId), PUBLIC_ALLOWANCE_MODEL_CONFIG.map(model => model.modelId));
-  assert.ok(before.charted.length >= 7 && before.charted.slice(0, 7).every(model => model.pinned === true),
-    "the roster leads and is pinned");
+  assert.ok(before.charted.length >= 7, "the seven-model roster leads");
+  assert.deepEqual(before.charted.slice(0, 7).map(model => [model.modelId, model.pinned]), [
+    ["gpt-6-astra", true], ["gpt-6.1-sol", false], ["gpt-6-sol", true], ["gpt-6-luna", true],
+    ["gpt-5.6-terra", true], ["gpt-5.6-sol", true], ["gpt-5.6-luna", true],
+  ], "the six are pinned; GPT-6.1 Sol keeps its slot without a card until it has an estimate");
   assert.ok(before.charted.slice(7).every(model => model.pinned === undefined));
   assert.deepEqual(after.charted.slice(0, before.charted.length), before.charted);
   assert.deepEqual(after.charted.slice(before.charted.length), [{ modelId: appended.id, label: appended.label }]);

@@ -426,10 +426,11 @@ test("real public render shows model sample semantics, per-view labels and discl
       assert.match(container.text, /1 source/u);
       const cards = container.descendants().filter(element => element.tag === "article");
       assert.deepEqual(cards.map(card => card.descendants().find(element => element.tag === "h3")?.text),
-        ["GPT-6 Astra", "GPT-6.1 Sol", "GPT-6 Sol", "GPT-6 Luna", "GPT-5.6 Terra", "GPT-5.6 Sol", "GPT-5.6 Luna"]);
+        ["GPT-6 Astra", "GPT-6 Sol", "GPT-6 Luna", "GPT-5.6 Terra", "GPT-5.6 Sol", "GPT-5.6 Luna"]);
       assert.doesNotMatch(container.text, /GPT-5.5/u);
-      assert.match(cards[1].text, /No published estimate yet/u);
-      assert.match(cards[4].text, /No published estimate yet/u);
+      // GPT-6.1 Sol has no estimate here, so the page does not name it at all.
+      assert.doesNotMatch(container.text, /GPT-6\.1 Sol/u);
+      assert.match(cards[3].text, /No published estimate yet/u);
       assert.match(cards[0].text.trim(), /^GPT-6 Astra/u);
       assert.match(cards[0].className, /allowance-model-astra/u);
       assert.ok(cards.every(card => !/\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{1,2}, \d{4}\b/u.test(card.text)),

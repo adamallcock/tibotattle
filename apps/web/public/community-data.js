@@ -305,7 +305,8 @@ export function planWeeklyApiEquivalentUsd(referenceUsd, planType, normalization
 }
 
 // The page's own selected roster, in display order: the models it leads with.
-// Roster models keep a card while they have no estimate.
+// Roster models keep a card while they have no estimate, except the ones in
+// PUBLIC_ALLOWANCE_ROSTER_UNTIL_PUBLISHED below.
 const PUBLIC_ALLOWANCE_ROSTER = Object.freeze([
   ["gpt-6-astra", "GPT-6 Astra"],
   ["gpt-6.1-sol", "GPT-6.1 Sol"],
@@ -316,6 +317,13 @@ const PUBLIC_ALLOWANCE_ROSTER = Object.freeze([
   ["gpt-5.6-luna", "GPT-5.6 Luna"],
 ]);
 const PUBLIC_ALLOWANCE_ROSTER_IDS = new Set(PUBLIC_ALLOWANCE_ROSTER.map(([modelId]) => modelId));
+// Roster models with no card until a served publication carries an estimate
+// for them (owner rounds 5 and 11). GPT-6.1 Sol is on the OpenAI release-line
+// catalog only: until the served catalog adds it, no server can publish an
+// estimate for it, and the page must not name it. It keeps its roster slot, so
+// once an estimate arrives it draws second, and it stays known, so its tuples
+// are never counted as unrecognized.
+const PUBLIC_ALLOWANCE_ROSTER_UNTIL_PUBLISHED = new Set(["gpt-6.1-sol"]);
 // The owner chose a selected comparison, not the whole historical vocabulary
 // (2d6cfbc8, "six requested public allowance models"): older generations stay
 // off the page. That choice is this explicit list, frozen at catalog
@@ -334,8 +342,9 @@ const PUBLIC_ALLOWANCE_HIDDEN_IDS = Object.freeze([
 
 /**
  * The models a build can name for the public comparison, from a reviewed catalog.
- * `charted` is the roster (pinned), then every other primary Codex model that is
- * not on the hide list, in catalog order, with its catalog label. `known` also
+ * `charted` is the roster (pinned, except a model awaiting publication), then
+ * every other primary Codex model that is not on the hide list, in catalog
+ * order, with its catalog label. `known` also
  * holds the hidden ones: their tuples are valid on the wire and kept, only not
  * charted, so a page update cannot make previously published days disappear.
  */
@@ -344,7 +353,8 @@ export function publicAllowanceModels(catalog = REVIEWED_MODEL_CATALOG) {
     && model.allowanceTrack === "primary");
   const hidden = new Set(PUBLIC_ALLOWANCE_HIDDEN_IDS);
   const charted = Object.freeze([
-    ...PUBLIC_ALLOWANCE_ROSTER.map(([modelId, label]) => Object.freeze({ modelId, label, pinned: true })),
+    ...PUBLIC_ALLOWANCE_ROSTER.map(([modelId, label]) => Object.freeze({
+      modelId, label, pinned: !PUBLIC_ALLOWANCE_ROSTER_UNTIL_PUBLISHED.has(modelId) })),
     ...primary.filter(model => !PUBLIC_ALLOWANCE_ROSTER_IDS.has(model.id) && !hidden.has(model.id))
       .map(model => Object.freeze({ modelId: model.id, label: model.label })),
   ]);

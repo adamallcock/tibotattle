@@ -314,3 +314,68 @@ test("a retained v1.3 payload re-reads as the same series, and the cache identit
   assert.equal(open(COMMUNITY_DAILY_CACHE_SCHEMA_IDENTITY).resolve({ payload: null, failure }).state, "unavailable",
     "the previous deploy's copy is not served under this deploy's meanings");
 });
+
+// GPT-6.1 Sol (owner round 11) is the seventh roster model. It is on the OpenAI
+// release-line catalog only, so until a served publication carries an estimate
+// for it the page shows exactly the six-model comparison and never names it.
+const SOL_61 = "gpt-6.1-sol";
+const SIX_LABELS = Object.freeze(["GPT-6 Astra", "GPT-6 Sol", "GPT-6 Luna", "GPT-5.6 Terra", "GPT-5.6 Sol", "GPT-5.6 Luna"]);
+const SEVEN_MODELS = Object.freeze([
+  { id: "gpt-6-astra", label: "GPT-6 Astra", family: "astra", order: 0 },
+  { id: SOL_61, label: "GPT-6.1 Sol", family: "sol", order: 1 },
+  ...SIX_MODELS.slice(1).map(model => ({ ...model, order: model.order + 1 })),
+]);
+const cardTitles = container => container.descendants().filter(element => element.tag === "article")
+  .map(card => card.descendants().find(element => element.tag === "h3")?.text);
+
+test("with no GPT-6.1 Sol estimate, the six-model block renders exactly six cards and never names it", () => {
+  for (const [name, payload] of [["v1.3 six-entry block", v13], ["v1.1 without a block", v11]]) {
+    const normalized = series(payload());
+    assert.ok(normalized.breakdowns.days.every(day => day.models.every(([id]) => id !== SOL_61)), name);
+    const chart = modelsChart(payload());
+    assert.ok(!chart.cardSeries.some(card => card.key === SOL_61), name);
+    assert.ok(!chart.legendSeries.some(item => item.key === SOL_61), name);
+    const models = render(payload(), "models");
+    assert.equal(models.state, "published", name);
+    assert.deepEqual(cardTitles(models.container), SIX_LABELS, name);
+    assert.doesNotMatch(models.text, /GPT-6\.1 Sol/u, name);
+    assert.ok(everyAttribute(models.container).every(value => !value.includes(SOL_61)), name);
+  }
+});
+
+test("a block that names GPT-6.1 Sol but carries no estimate for it still shows no card for it", () => {
+  const models = render(v13(SEVEN_MODELS.map(model => ({ ...model }))), "models");
+  assert.equal(models.state, "published");
+  assert.deepEqual(cardTitles(models.container), SIX_LABELS);
+  assert.doesNotMatch(models.text, /GPT-6\.1 Sol/u);
+});
+
+test("a seven-entry block with a GPT-6.1 Sol estimate draws it second, and the six are unchanged", () => {
+  const without = modelsChart(v13());
+  const payload = withTuples(v13(SEVEN_MODELS.map(model => ({ ...model }))), [[SOL_61, 4321, 2]]);
+  const normalized = series(payload);
+  assert.equal(normalized.breakdowns.modelMetadata, "applied");
+  assert.equal(normalized.breakdowns.unrecognizedModelTuples, 0, "a roster model is never unrecognized");
+  const chart = modelsChart(payload);
+  assert.deepEqual(chart.legendSeries.map(item => item.key),
+    ["gpt-6-astra", SOL_61, "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol"]);
+  const sol61 = chart.legendSeries.find(item => item.key === SOL_61);
+  assert.equal(sol61.label, "GPT-6.1 Sol");
+  for (const item of without.legendSeries) {
+    const same = chart.legendSeries.find(entry => entry.key === item.key);
+    assert.equal(same.label, item.label, item.key);
+    assert.ok(item.dots.length > 0, item.key);
+    assert.deepEqual(same.dots.map(dot => [dot.day, dot.centralUsd]),
+      item.dots.map(dot => [dot.day, dot.centralUsd]), `${item.key} values unchanged`);
+  }
+  const models = render(payload, "models");
+  assert.deepEqual(cardTitles(models.container), [SIX_LABELS[0], "GPT-6.1 Sol", ...SIX_LABELS.slice(1)]);
+  assert.ok(!models.text.includes(NOTICE));
+});
+
+test("without a block, a GPT-6.1 Sol estimate draws at its roster slot, second", () => {
+  const payload = withTuples(v11(), [[SOL_61, 4321, 2]]);
+  assert.equal(series(payload).breakdowns.unrecognizedModelTuples, 0);
+  const models = render(payload, "models");
+  assert.deepEqual(cardTitles(models.container), [SIX_LABELS[0], "GPT-6.1 Sol", ...SIX_LABELS.slice(1)]);
+});
