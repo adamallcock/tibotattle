@@ -300,18 +300,44 @@ export async function runLiveCheck(options, deps = {}) {
   };
 }
 
-const LABORATORY_ORIGIN = "http://127.0.0.1:49111";
+/** The loopback laboratory origin the shipped accountless client is configured with (E12's S5). */
+export const LABORATORY_ORIGIN = "http://127.0.0.1:49111";
 const CAPABILITY_PATHS = new Set(["/api/v1/device/sync-capabilities", "/api/v1/device/sync-capabilities-v1.2"]);
+/** Whether a laboratory-mapped run rewrites this path's answer's destinationOrigin. */
+export function isCapabilityPath(pathname) {
+  return CAPABILITY_PATHS.has(pathname);
+}
+/** The accountless v1.2 policy authorization, exactly as the shipped client presents it. */
+export const ACCOUNTLESS_V12_AUTHORIZATION = Object.freeze({ schemaVersion: "accountless-upload-owner-v1.2",
+  policyVersion: "accountless-telemetry-v1.2-policy-v1", authorizationBasis: "accountless-policy-v1.2",
+  telemetrySchemaVersion: "telemetry-contribution-v1.2" });
+const SYNTHETIC_EVENT_STEP_MS = 10;
 
-/** One deterministic synthetic v1.2 day (E12's makeV12Day), content-free. */
-async function syntheticV12Day(day) {
+/**
+ * One deterministic synthetic v1.2 day (E12's makeV12Day), content-free:
+ * `chunks` usage chunks of `recordsPerChunk` records each. Record i's event id
+ * is derived from `${eventSeed}:${day}` (plus `:${i}` after the first) and its
+ * time is 12:00 UTC plus i * 10 ms; the defaults are the live check's one
+ * record in one chunk.
+ */
+export async function syntheticV12Day(day, {
+  chunks: chunkCount = 1, recordsPerChunk = 1, eventSeed = "edge-live-check",
+  parserVersion = "synthetic-edge-live-check",
+} = {}) {
   const contract = await import("@app-usagemonitor/telemetry-contract");
+  if (!Number.isSafeInteger(chunkCount) || chunkCount < 1 || chunkCount > contract.MAX_TELEMETRY_V12_DAY_CHUNKS
+      || !Number.isSafeInteger(recordsPerChunk) || recordsPerChunk < 1
+      || recordsPerChunk > contract.MAX_TELEMETRY_V12_CHUNK_RECORDS) {
+    throw new RangeError("SYNTHETIC_V12_DAY_SHAPE_INVALID");
+  }
   const sha256Hex = (value) => createHash("sha256").update(value).digest("hex");
   const consent = contract.telemetryV12RequiredConsent();
-  const parserVersion = "synthetic-edge-live-check";
-  const records = [{
-    schemaVersion: "usage-event-v1.2", eventId: `event:v2:${sha256Hex(`edge-live-check:${day}`)}`,
-    eventTime: `${day}T12:00:00.000Z`, sessionUuid: "0a49f9db-8b2d-4c3e-9a6f-2f4f1c7d9e0b", provider: "openai_codex",
+  const noon = Date.parse(`${day}T12:00:00.000Z`);
+  const record = (index) => ({
+    schemaVersion: "usage-event-v1.2",
+    eventId: `event:v2:${sha256Hex(index === 0 ? `${eventSeed}:${day}` : `${eventSeed}:${day}:${index}`)}`,
+    eventTime: new Date(noon + index * SYNTHETIC_EVENT_STEP_MS).toISOString(),
+    sessionUuid: "0a49f9db-8b2d-4c3e-9a6f-2f4f1c7d9e0b", provider: "openai_codex",
     modelId: "gpt-5.6-sol", speedMode: "standard", apiServiceTier: "default", surface: "local_interactive_unclassified",
     billingSurface: "chatgpt_subscription", reasoningEffort: "high", agentScope: "root", outcome: "completed",
     totalInputContextTokens: 1000, components: { inputUncachedTokens: 100, inputCacheReadTokens: 900,
@@ -319,16 +345,49 @@ async function syntheticV12Day(day) {
     accountPlanAttribution: { accountBasis: "unavailable", accountTrackId: null, planBasis: "same_source_occurrence",
       planType: "pro", planEraId: null },
     boundaryFlags: null, tieOrder: null, cacheWriteTtl: null,
-  }];
-  const chunk = { schemaVersion: "telemetry-contribution-v1.2", manifestDigest: "0".repeat(64), chunkId: `usage:${day}:0`,
-    chunkRevision: 1, chunkDigest: sha256Hex(Buffer.from(contract.canonicalTelemetryV12Json(records))), parserVersion,
-    consent, records };
+  });
+  const chunks = Array.from({ length: chunkCount }, (_, sequence) => {
+    const records = Array.from({ length: recordsPerChunk }, (__, offset) => record(sequence * recordsPerChunk + offset));
+    return { schemaVersion: "telemetry-contribution-v1.2", manifestDigest: "0".repeat(64), chunkId: `usage:${day}:${sequence}`,
+      chunkRevision: 1, chunkDigest: sha256Hex(Buffer.from(contract.canonicalTelemetryV12Json(records))), parserVersion,
+      consent, records };
+  });
   const manifest = { schemaVersion: "telemetry-day-manifest-v1.2", day, parserVersion, consent,
-    chunks: [{ chunkId: chunk.chunkId, chunkDigest: chunk.chunkDigest, recordCount: 1 }],
+    chunks: chunks.map((chunk) => ({ chunkId: chunk.chunkId, chunkDigest: chunk.chunkDigest,
+      recordCount: chunk.records.length })),
     excluded: { quota: 0, session: 0, usage: 0 }, manifestDigest: "0".repeat(64) };
   manifest.manifestDigest = sha256Hex(Buffer.from(contract.telemetryV12DayManifestDigestInput(manifest)));
-  chunk.manifestDigest = manifest.manifestDigest;
-  return { manifest, chunks: [chunk] };
+  for (const chunk of chunks) chunk.manifestDigest = manifest.manifestDigest;
+  return { manifest, chunks };
+}
+
+/**
+ * A fresh synthetic accountless device and its three admission requests:
+ * accountless enrollment, the ownership grant and the v1.2 authorization, in
+ * that order, each as { id, path, init } for a `send`. The device secret is
+ * random, held only in the returned Device authorization, and never logged.
+ */
+export function accountlessDeviceRequests() {
+  const deviceId = randomUUID();
+  const secret = randomBytes(32);
+  const secretHash = createHash("sha256").update(`app-usagemonitor/device/v1\0${deviceId}\0`).update(secret).digest("hex");
+  const deviceAuthorization = `Device um_device_${deviceId}.${secret.toString("base64url")}`;
+  const json = (body, headers = {}) => ({ method: "POST", headers: { "content-type": "application/json", ...headers },
+    body: JSON.stringify(body) });
+  return {
+    deviceAuthorization,
+    requests: [
+      { id: "accountless-enrollment", path: "/api/v1/accountless/enrollment", init: json({
+        schemaVersion: "accountless-enrollment-v0.1", deviceId, deviceSecretHash: secretHash,
+        policyVersion: "accountless-opt-out-v1", authorizationBasis: "accountless-policy-v1" }) },
+      { id: "accountless-ownership", path: "/api/v1/accountless/ownership", init: json({
+        schemaVersion: "accountless-upload-owner-v0.1", policyVersion: "accountless-opt-out-v1",
+        authorizationBasis: "accountless-policy-v1", telemetrySchemaVersion: "telemetry-contribution-v1.1" },
+      { authorization: deviceAuthorization }) },
+      { id: "accountless-v12-authorization", path: "/api/v1/accountless/telemetry-v1.2-authorization",
+        init: json({ ...ACCOUNTLESS_V12_AUTHORIZATION }, { authorization: deviceAuthorization }) },
+    ],
+  };
 }
 
 /**
@@ -343,23 +402,9 @@ async function syntheticV12Day(day) {
  * { status, headers (pairs), body }.
  */
 export async function liveWriteRows({ send, publicOrigin }) {
-  const deviceId = randomUUID();
-  const secret = randomBytes(32);
-  const secretHash = createHash("sha256").update(`app-usagemonitor/device/v1\0${deviceId}\0`).update(secret).digest("hex");
-  const deviceAuthorization = `Device um_device_${deviceId}.${secret.toString("base64url")}`;
-  const json = (body, headers = {}) => ({ method: "POST", headers: { "content-type": "application/json", ...headers },
-    body: JSON.stringify(body) });
-  const authorization = { schemaVersion: "accountless-upload-owner-v1.2", policyVersion: "accountless-telemetry-v1.2-policy-v1",
-    authorizationBasis: "accountless-policy-v1.2", telemetrySchemaVersion: "telemetry-contribution-v1.2" };
-  await send("write-accountless-enrollment", "/api/v1/accountless/enrollment", json({
-    schemaVersion: "accountless-enrollment-v0.1", deviceId, deviceSecretHash: secretHash,
-    policyVersion: "accountless-opt-out-v1", authorizationBasis: "accountless-policy-v1" }));
-  await send("write-accountless-ownership", "/api/v1/accountless/ownership", json({
-    schemaVersion: "accountless-upload-owner-v0.1", policyVersion: "accountless-opt-out-v1",
-    authorizationBasis: "accountless-policy-v1", telemetrySchemaVersion: "telemetry-contribution-v1.1" },
-  { authorization: deviceAuthorization }));
-  await send("write-accountless-v12-authorization", "/api/v1/accountless/telemetry-v1.2-authorization",
-    json(authorization, { authorization: deviceAuthorization }));
+  const { deviceAuthorization, requests } = accountlessDeviceRequests();
+  const authorization = { ...ACCOUNTLESS_V12_AUTHORIZATION };
+  for (const request of requests) await send(`write-${request.id}`, request.path, request.init);
   const { runTelemetryV12Sync } = await import("../../../src/contribution/telemetry-v12-sync.js");
   const { createTelemetryV12Envelope } = await import("../../../src/platform/telemetry-v12-envelope.js");
   let syncCalls = 0;
