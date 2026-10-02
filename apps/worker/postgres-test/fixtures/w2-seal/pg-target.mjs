@@ -4,8 +4,9 @@
 // Each target is a dedicated primary database and an interim ledger database
 // (w2_seal_*; decision D4 keeps the ledger role on the same instance until
 // SIMP-4 makes the target primary-only), owned by a schema-owner role, with
-// the promoted chains applied by the production runner, the staged 0063
-// through the staged-migrations harness (outside the receipt history), and
+// the promoted chains (primary 0063, the erased-redeemer migration, promoted
+// at the wave-2 integration; a staged copy would go through the
+// staged-migrations harness instead) applied by the production runner, and
 // the contract registered. The transfer login is a deliberate, non-escalating
 // member of tibotattle_source_transfer, so storage_journal_transfer_session()
 // is true for it; the cluster-global role is created and granted under the

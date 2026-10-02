@@ -245,7 +245,7 @@ const ENTRIES = Object.freeze([
   entry(2, "insert", t("enrollment_grants", "identity", ["id"], [
     text("id"), bytes("secret_hash"), text("state"), instant("issued_at"), instant("expires_at"), instant("redeemed_at"),
     text("redeemed_participant_id"),
-  ]), { fire: { enrollment_grants_redeemer_required: "Staged 0063: admits an erased redeemer only for this transfer session." } }),
+  ]), { fire: { enrollment_grants_redeemer_required: "Primary 0063: admits an erased redeemer only for this transfer session." } }),
   entry(2, "insert", t("participant_community_eligibility", "identity", ["id"], [
     text("id"), text("participant_id"), text("grant_id"), instant("created_at"),
   ]), { fire: { participant_community_eligibility_requires_redeemed_grant: "Guard: the redeemed grant is imported first." } }),

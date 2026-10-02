@@ -8,7 +8,7 @@
 // the attached identity are replaced by local stand-ins. The spec shows:
 //
 //   - on a fresh schema of a '-rehearsal-xxxxxxxx' scratch target the job
-//     applies primary 0001-0062 forward, and the distinct runtime role ends
+//     applies primary 0001-0063 forward, and the distinct runtime role ends
 //     with exactly table DML plus EXECUTE on the three runtime functions: it
 //     cannot CREATE in the schema, cannot write the migration history, and
 //     every operator-only entrypoint is present and closed to it;
@@ -216,13 +216,15 @@ after(async () => {
 });
 
 const primary = await readPostgresMigrations({ role: "primary" });
+/** The next free primary number after the promoted tail, as a 4-digit prefix. */
+const nextNumber = () => String(primary.length + 1).padStart(4, "0");
 let firstReceipt;
 
-test("PG17 a fresh scratch schema is migrated 0001-0062 forward and the runtime role ends with exactly DML plus the three runtime functions", {
+test("PG17 a fresh scratch schema is migrated 0001-0063 forward and the runtime role ends with exactly DML plus the three runtime functions", {
   skip: !PG_TEST_SOCKET,
   timeout: 300_000,
 }, async () => {
-  assert.equal(primary.length, 62, "the promoted primary tail");
+  assert.equal(primary.length, 63, "the promoted primary tail");
   const { calls, dependencies } = jobDependencies();
   const receipt = await runProductionMigrations({ env: jobEnv(), dependencies });
   firstReceipt = receipt;
@@ -234,7 +236,7 @@ test("PG17 a fresh scratch schema is migrated 0001-0062 forward and the runtime 
   assert.deepEqual(receipt.target, {
     kind: "scratch", instanceConnectionName: SCRATCH_INSTANCE, database: DATABASE, schema: SCRATCH_SCHEMA,
   });
-  assert.equal(receipt.migrations.count, 62);
+  assert.equal(receipt.migrations.count, 63);
   assert.equal(receipt.migrations.latest.name, primary.at(-1).name);
   assert.equal(receipt.migrations.simpResidue, null, "no SIMP residue: only scratch targets are accepted");
   assert.equal(receipt.migrations.contractReviewed, Object.keys(CONTRACT_MIGRATIONS).length);
@@ -294,7 +296,7 @@ test("PG17 a fresh scratch schema is migrated 0001-0062 forward and the runtime 
   await assert.rejects(asRuntime(`UPDATE ${q(SCRATCH_SCHEMA)}.${q(HISTORY)} SET name = name`), insufficientPrivilege);
   await assert.rejects(asRuntime(`DELETE FROM ${q(SCRATCH_SCHEMA)}.${q(HISTORY)}`), insufficientPrivilege);
   await assert.rejects(asRuntime(`TRUNCATE ${q(SCRATCH_SCHEMA)}.participants`), insufficientPrivilege);
-  assert.equal((await asRuntime(`SELECT count(*)::integer AS n FROM ${q(SCRATCH_SCHEMA)}.${q(HISTORY)}`)).rows[0].n, 62);
+  assert.equal((await asRuntime(`SELECT count(*)::integer AS n FROM ${q(SCRATCH_SCHEMA)}.${q(HISTORY)}`)).rows[0].n, 63);
   await asRuntime(`UPDATE ${q(SCRATCH_SCHEMA)}.participants SET id = id WHERE false`);
   await asRuntime(`DELETE FROM ${q(SCRATCH_SCHEMA)}.participants WHERE false`);
   for (const sql of [
@@ -338,11 +340,11 @@ test("PG17 an ahead history and a diverged history are each refused with no writ
   const cases = [
     ["MIGRATION_STATE_NEWER_THAN_IMAGE",
       `INSERT INTO ${q(SCRATCH_SCHEMA)}.${q(HISTORY)} (version, name, checksum_sha256)
-         VALUES (63, '0063_w2_opsdb_newer.sql', '${digest("newer")}')`,
-      `DELETE FROM ${q(SCRATCH_SCHEMA)}.${q(HISTORY)} WHERE version = 63`],
+         VALUES (${primary.length + 1}, '${nextNumber()}_w2_opsdb_newer.sql', '${digest("newer")}')`,
+      `DELETE FROM ${q(SCRATCH_SCHEMA)}.${q(HISTORY)} WHERE version = ${primary.length + 1}`],
     ["MIGRATION_HISTORY_DIVERGED",
-      `UPDATE ${q(SCRATCH_SCHEMA)}.${q(HISTORY)} SET checksum_sha256 = '${"f".repeat(64)}' WHERE version = 62`,
-      `UPDATE ${q(SCRATCH_SCHEMA)}.${q(HISTORY)} SET checksum_sha256 = '${primary[61].sha256}' WHERE version = 62`],
+      `UPDATE ${q(SCRATCH_SCHEMA)}.${q(HISTORY)} SET checksum_sha256 = '${"f".repeat(64)}' WHERE version = ${primary.length}`,
+      `UPDATE ${q(SCRATCH_SCHEMA)}.${q(HISTORY)} SET checksum_sha256 = '${primary.at(-1).sha256}' WHERE version = ${primary.length}`],
     ["MIGRATION_HISTORY_DIVERGED",
       `UPDATE ${q(SCRATCH_SCHEMA)}.${q(HISTORY)} SET name = '0010_w2_opsdb_other.sql' WHERE version = 10`,
       `UPDATE ${q(SCRATCH_SCHEMA)}.${q(HISTORY)} SET name = '${primary[9].name}' WHERE version = 10`],
@@ -393,7 +395,7 @@ test("PG17 with the SIMP residue in the image manifest the environment target is
   const root = await mkdtemp(join(tmpdir(), "w2-opsdb-migrations-"));
   try {
     await cp(join(POSTGRES_MIGRATION_ROOT, "primary"), join(root, "primary"), { recursive: true });
-    const residueName = `0063_w2_opsdb_synthetic${SIMP_RESIDUE_MIGRATION_SUFFIX}`;
+    const residueName = `${nextNumber()}_w2_opsdb_synthetic${SIMP_RESIDUE_MIGRATION_SUFFIX}`;
     await writeFile(join(root, "primary", residueName), "-- synthetic stand-in for the SIMP residue\nSELECT 1;\n");
     const { calls, dependencies } = jobDependencies({ rootDirectory: root });
     const receipt = await runProductionMigrations({
@@ -402,12 +404,12 @@ test("PG17 with the SIMP residue in the image manifest the environment target is
     });
     assert.deepEqual(calls.roles, ["primary"]);
     assert.equal(verifyProductionMigrationReceipt(receipt).target.kind, "environment");
-    assert.equal(receipt.migrations.count, 63);
+    assert.equal(receipt.migrations.count, 64);
     assert.equal(receipt.migrations.simpResidue, residueName);
     const history = await state.superuser.query(
       `SELECT count(*)::integer AS n FROM ${q(ENVIRONMENT_SCHEMA)}.${q(HISTORY)}`,
     );
-    assert.equal(history.rows[0].n, 63);
+    assert.equal(history.rows[0].n, 64);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

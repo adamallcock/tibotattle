@@ -94,6 +94,7 @@ export const POSTGRES_RUNTIME_MIGRATIONS: Readonly<{
     ["0060_telemetry_v11_live_admission.sql", "9216078e27d695c3615b888cd1a27df0ff7a5af94583fc97208c6f2ca16e47f0"],
     ["0061_legacy_contribution_admission.sql", "9a22c0f0fa4b1dc1c0694cb2020b89546ede6c8cc6e949b4cb6e87b42465c5c8"],
     ["0062_telemetry_contribution_trigger_search_path.sql", "b9eaaa7c19948a778c0d3e857b872cea6ce5026ab82566438d7f295b0a2ea876"],
+    ["0063_enrollment_grants_erased_redeemer.sql", "0341b5a6b7165b918e7e18c11873243aff4906a81a8376a0ae46ec5f14007ce9"],
   ] as readonly MigrationEntry[]).map((entry, index) => receipt(entry, index + 1))),
   ledger: Object.freeze(([
     ["0001_schema_metadata.sql", "783e0d414ee8c755c8886daa95a1fe998527b44445b08eaa36a595dddabf8f8c"],

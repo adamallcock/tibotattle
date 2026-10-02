@@ -342,7 +342,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PT-3 identity and authority importer on Postgr
     expect(BigInt(inserted.rows[0].id) > BigInt(audit)).toBe(true);
   });
 
-  it("the staged erased-redeemer migration admits the imported grant and refuses the same shape live", async () => {
+  it("the erased-redeemer migration (primary 0063) admits the imported grant and refuses the same shape live", async () => {
     const pool = target.ownerPrimary;
     const imported = await pool.query(`SELECT state, redeemed_participant_id FROM ${table("enrollment_grants")} WHERE id = $1`,
       [world.fixture.ids.erasedRedeemerGrant]);

@@ -18,7 +18,7 @@ const EXECUTION = "tibotattle-public-graph-readback-diagnostic-00001-abc";
 const SOURCE_ID = "synthetic-community-source";
 const DAY = "2026-09-23";
 const GENERATION = "a".repeat(64);
-const MIGRATION_TAIL = "0062_telemetry_contribution_trigger_search_path.sql";
+const MIGRATION_TAIL = "0063_enrollment_grants_erased_redeemer.sql";
 
 function validEnv(overrides = {}) {
   return {
@@ -38,7 +38,7 @@ function validEnv(overrides = {}) {
 }
 
 function fakeMigrations() {
-  return Array.from({ length: 62 }, (_, index) => ({
+  return Array.from({ length: 63 }, (_, index) => ({
     version: index + 1,
     name: `${String(index + 1).padStart(4, "0")}_${index === 38
       ? "analytics_applied_projection_v1" : index === 39
@@ -53,7 +53,8 @@ function fakeMigrations() {
                         ? "analytics_v2" : index === 59
                           ? "telemetry_v11_live_admission" : index === 60
                             ? "legacy_contribution_admission" : index === 61
-                              ? "telemetry_contribution_trigger_search_path" : `test_${index + 1}`}.sql`,
+                              ? "telemetry_contribution_trigger_search_path" : index === 62
+                                ? "enrollment_grants_erased_redeemer" : `test_${index + 1}`}.sql`,
     sha256: (index + 1).toString(16).padStart(64, "0"),
   }));
 }
@@ -236,7 +237,7 @@ test("diagnostic explains the production read query in a bounded read-only plan 
     status: "ok",
     profile: "100k-readindexed",
     memberCount: 100_000,
-    migrationReceipt: { count: 62, tail: MIGRATION_TAIL },
+    migrationReceipt: { count: 63, tail: MIGRATION_TAIL },
     explainElapsedMilliseconds: receipt.explainElapsedMilliseconds,
     statementSha256: createHash("sha256").update(explainSql).digest("hex"),
     planSummary: {

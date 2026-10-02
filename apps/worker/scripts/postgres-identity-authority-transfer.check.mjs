@@ -46,7 +46,9 @@ const PIN = Object.freeze({ keyVersion: SYNTHETIC_IDENTITY_LINK_VERSION,
   secretFingerprint: identityLinkFingerprint(SYNTHETIC_IDENTITY_LINK_SECRET) });
 // A reviewed change to the order, COLUMN_MAP, counters, policy, exclusions
 // or target-missing list must update this pin.
-const POLICY_SHA256 = "d78633fa7af7b34727766497ef2775c19837813706454fdadf033178d8531ca1";
+// Re-pinned at the wave-2 integration: only the erased-redeemer trigger's reason
+// changed, from "Staged 0063" to "Primary 0063", when 0063 was promoted.
+const POLICY_SHA256 = "779895ebc03df1a93a148bd4c46a4d9747a84ef29ee1605e9e22fc0e493a031e";
 let world;
 let seal;
 let manifestPath;

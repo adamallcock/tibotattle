@@ -28,16 +28,19 @@
  *
  * Ordering guard (D6): the promoted primary 0053 carries the analytics
  * erasure fences that the SIMP work removes with a forward migration. Until
- * an image's primary manifest contains that migration (a name ending in
- * SIMP_RESIDUE_MIGRATION_SUFFIX), every target that is not a disposable
- * '-rehearsal-xxxxxxxx' scratch instance is refused with
- * PRODUCTION_SIMP_RESIDUE_MISSING before any connection is opened.
+ * an image's primary manifest contains that migration, every target that is
+ * not a disposable '-rehearsal-xxxxxxxx' scratch instance is refused with
+ * PRODUCTION_SIMP_RESIDUE_MISSING before any connection is opened. Its name
+ * ends in SIMP_RESIDUE_MIGRATION_SUFFIX and its number comes after
+ * SIMP_RESIDUE_PREDECESSOR, the last migration numbered before it (the
+ * wave-2 integration promoted primary 0063, so the residue is
+ * NNNN_append_only_residue.sql with NNNN >= 0064).
  *
  * Expand-compatibility: the migrate step runs while the previous revision
  * still serves, so a migration that drops, renames or tightens (SET NOT NULL,
  * or a NOT NULL column without a default) is a contract change. Each one must
  * be listed, with its sha256, in the reviewed CONTRACT_MIGRATIONS map; the
- * promoted tail 0001-0062 is classified once below.
+ * promoted tail 0001-0063 is classified once below.
  *
  * Identity: the attached identity is read through google-auth-library's
  * Application Default Credentials (the metadata server on Cloud Run, which
@@ -87,6 +90,14 @@ export const PRODUCTION_MIGRATION_JOB = Object.freeze({
   maxRetries: 0,
   taskTimeoutSeconds: 1800,
   pools: Object.freeze({ primary: 1 }),
+  // The operator-set env validateProductionMigrationEnvironment reads, in the
+  // order OPS-2 renders it; Cloud Run supplies CLOUD_RUN_*. No LEDGER_* and no
+  // GOOGLE_APPLICATION_CREDENTIALS (both refused).
+  env: Object.freeze([
+    "MIGRATION_ENVIRONMENT", "GOOGLE_CLOUD_PROJECT", "PRODUCTION_MIGRATOR_SERVICE_ACCOUNT",
+    "POSTGRES_MIGRATOR_IAM_USER", "POSTGRES_RUNTIME_IAM_USER", "ENVIRONMENT_PRIMARY_INSTANCE_CONNECTION_NAME",
+    "PRIMARY_INSTANCE_CONNECTION_NAME", "PRIMARY_DATABASE", "PRIMARY_SCHEMA", "DEPLOYMENT_SOURCE_COMMIT",
+  ]),
 });
 
 /** A disposable rehearsal instance id: never a production or staging target. */
@@ -95,6 +106,11 @@ export const SCRATCH_INSTANCE_PATTERN = /-rehearsal-[a-z0-9]{8}b?$/u;
 export const SIMP_RESIDUE_MIGRATION_SUFFIX = "_append_only_residue.sql";
 /** The promoted migration whose erasure fences the SIMP residue must follow. */
 export const SIMP_FENCED_MIGRATION = "0053_community_publication_authority.sql";
+/**
+ * The last primary migration numbered before the SIMP residue (the wave-2
+ * integration's numbering): the residue's number must come after it.
+ */
+export const SIMP_RESIDUE_PREDECESSOR = "0063_enrollment_grants_erased_redeemer.sql";
 
 /** Contract operation kinds, in report order. */
 export const CONTRACT_OPERATION_KINDS = Object.freeze([
@@ -109,7 +125,7 @@ export const CONTRACT_OPERATION_KINDS = Object.freeze([
 ]);
 
 /**
- * Reviewed contract migrations of the promoted primary tail (0001-0062),
+ * Reviewed contract migrations of the promoted primary tail (0001-0063),
  * classified with classifyContractOperations and pinned by sha256. A
  * production, staging or scratch database receives this tail in its first
  * migrate, onto an empty schema before any revision serves it, so none of
@@ -235,6 +251,11 @@ export const CONTRACT_MIGRATIONS = Object.freeze({
     sha256: "9a22c0f0fa4b1dc1c0694cb2020b89546ede6c8cc6e949b4cb6e87b42465c5c8",
     operations: Object.freeze(["drop"]),
     reason: "replaces the participant-limit trigger with legacy contribution admission in one transaction",
+  }),
+  "0063_enrollment_grants_erased_redeemer.sql": Object.freeze({
+    sha256: "0341b5a6b7165b918e7e18c11873243aff4906a81a8376a0ae46ec5f14007ce9",
+    operations: Object.freeze(["drop", "add-constraint"]),
+    reason: "replaces 0015's enrollment_grants_check1 (aborting unless its definition is exactly 0015's) with a state-shape check that only stops requiring the redeemer of a redeemed grant, which every existing row satisfies, plus a trigger that refuses a redeemed grant without a redeemer with the same 23514 class except on an INSERT inside an import transfer session; every write a previous revision makes (issue with every field NULL, redeem with a redeemer, a participant delete's SET NULL) is admitted or refused as before",
   }),
 });
 
@@ -547,11 +568,19 @@ export function validatePrimaryMigrations(migrations) {
   return migrations;
 }
 
-/** The SIMP append-only residue migration of the manifest, or null. */
+/**
+ * The SIMP append-only residue migration of the manifest, or null: the first
+ * migration named '*_append_only_residue.sql' that comes after both the
+ * fenced 0053 and SIMP_RESIDUE_PREDECESSOR. A manifest missing either anchor
+ * has no residue.
+ */
 export function simpResidueMigration(migrations) {
-  const fenced = migrations.find(({ name }) => name === SIMP_FENCED_MIGRATION);
-  const residue = migrations.filter(({ name }) => name.endsWith(SIMP_RESIDUE_MIGRATION_SUFFIX)
-    && (fenced === undefined || migrations.indexOf(fenced) < migrations.findIndex((entry) => entry.name === name)));
+  const names = migrations.map(({ name }) => name);
+  const fenced = names.indexOf(SIMP_FENCED_MIGRATION);
+  const predecessor = names.indexOf(SIMP_RESIDUE_PREDECESSOR);
+  if (fenced === -1 || predecessor === -1) return null;
+  const floor = Math.max(fenced, predecessor);
+  const residue = migrations.filter(({ name }, index) => index > floor && name.endsWith(SIMP_RESIDUE_MIGRATION_SUFFIX));
   return residue.length === 0 ? null : residue[0];
 }
 

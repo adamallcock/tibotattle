@@ -1,4 +1,4 @@
--- PostgreSQL primary migration 0063 (staged; PT-3, W2-SEAL): an imported
+-- PostgreSQL primary migration 0063 (PT-3, W2-SEAL): an imported
 -- enrollment grant may keep an erased redeemer.
 --
 -- D1 migrations/0003 has no shape CHECK on enrollment_grants, and its
@@ -8,7 +8,8 @@
 -- a redeemer for 'redeemed'), so the identity importer could not carry the
 -- sealed grant, and a grant once redeemed must never become issuable again.
 --
--- This forward migration (the lead assigns the final number at landing):
+-- This forward migration (PT-3's 0075, promoted as primary 0063 at the
+-- wave-2 integration):
 --   * replaces 0015's shape CHECK with one that no longer requires the
 --     redeemer of a redeemed grant (issued grants keep every field NULL);
 --   * adds a BEFORE INSERT OR UPDATE trigger that refuses a redeemed grant
