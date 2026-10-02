@@ -29,11 +29,20 @@
  *
  * Dry run (the default) makes no call and writes nothing. --apply needs the
  * exact bucket-birth authorization. A failure after the insert reports
- * bucketInserted: true; when only the pin failed, rerun with --pin-only,
- * which reads the committed receipt, verifies it and pins (a no-op when the
- * same proof is already pinned). --verify checks the receipt and the pinned
- * proof agree, and changes nothing. Staging only; production keeps the plain
- * OPS-2 bucket-birth command.
+ * bucketInserted: true on stderr, with receiptWritten and receiptPrinted
+ * saying where the proof is:
+ * - receiptWritten: the receipt file exists and only the pin failed; rerun
+ *   with --pin-only, which reads the committed receipt, verifies it and pins
+ *   (a no-op when the same proof is already pinned);
+ * - receiptPrinted: the receipt file could not be written, and stdout carries
+ *   the receipt (status created_receipt_unwritten) to save, then --pin-only;
+ * - neither: the bucket was born but no receipt exists (for example the
+ *   readback missed it, or the create response was unreadable). The proof
+ *   cannot be recovered with this tool: stop and ask the owner; never rerun
+ *   --apply and never adopt the bucket.
+ * --verify checks the receipt and the pinned proof agree, and changes
+ * nothing. Staging only; production keeps the plain OPS-2 bucket-birth
+ * command.
  */
 
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
@@ -258,13 +267,17 @@ export async function main(argv = process.argv.slice(2), {
     return 0;
   } catch (error) {
     const code = error instanceof GcpOpsInfraError ? error.code : "STAGING_BUCKET_BIRTH_FAILED";
-    if (error?.bucketInserted === true && error.receipt !== undefined) {
+    const inserted = error?.bucketInserted === true;
+    const written = inserted && error.receiptWritten === true;
+    const printed = inserted && !written && error.receipt !== undefined;
+    if (printed) {
       // The receipt file failed after the insert: never lose the proof.
       print({ status: "created_receipt_unwritten", receipt: error.receipt });
     }
+    // After an insert, always say where the proof is; both false means it is lost.
     stderr(`${JSON.stringify({ status: "error", code,
-      ...(error?.bucketInserted === true ? { bucketInserted: true } : {}),
-      ...(error?.receiptWritten === true ? { receiptWritten: true, receiptFile: STAGING_BUCKET_BIRTH_RECEIPT_FILE } : {}),
+      ...(inserted ? { bucketInserted: true, receiptWritten: written, receiptPrinted: printed } : {}),
+      ...(written ? { receiptFile: STAGING_BUCKET_BIRTH_RECEIPT_FILE } : {}),
     })}\n`);
     return 1;
   }

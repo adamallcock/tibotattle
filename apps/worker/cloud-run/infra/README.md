@@ -39,18 +39,36 @@ production estate reads unclean until that instance is deleted.
 
 ## Values that wait for the owner
 
-Each of these is `null` until the owner supplies it. Each keeps the estate
-from reading clean, or keeps the dependent resource from being created, until
-then.
+Each of these is `null` until the owner supplies it, except where the next
+section says Claude filled a staging value. While a value is `null`, the
+estate does not read clean, or the resource that depends on it is not
+created.
 
 | Setting | Effect while `null` |
 |---|---|
 | `serviceAccounts.verifier.tokenCreators` | The operator's `roles/iam.serviceAccountTokenCreator` grant on the verifier (OD-CR-7) is deferred, and OPS-10 refuses the rollout target |
 | `secrets.*.version` | The service is not rendered (`SECRET_VERSION_UNPINNED`) |
 | `bucket.proof` | Apply refuses until the bucket-birth receipt's proof is committed; the staging service is not rendered (`SERVICE_RENDER_BUCKET_PROOF_UNPINNED`) |
-| `service.telemetryStorageNamespace` | The service is not rendered; it must equal the namespace the imported data carries (staging, synthetic only, uses its own `tibotattle-staging-synthetic`) |
+| `service.telemetryStorageNamespace` | The service is not rendered; it must equal the namespace the imported data carries. Staging's value was chosen by Claude (see below) |
 | `scheduler.analytics-refresh.schedule` | The trigger is not created (decision D3: no default cadence) |
 | `stagingOrigin.accessAud` (staging only) | The staging service is not rendered (`STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud`) until the owner creates the staging admin Access application |
+
+### Staging values Claude filled, for the owner to confirm
+
+Stream STG-PREP (Claude, not the owner) committed these staging values so
+that the staging service can render once the owner values above arrive. No
+owner decision contradicts them, but the owner has not confirmed them either.
+The owner confirms or replaces each one before the staging service first
+renders. Until D-CRB lands, OPS-2 defers that service in any case.
+
+| Setting | Committed value | Source |
+|---|---|---|
+| `service.telemetryStorageNamespace` | `tibotattle-staging-synthetic` | Claude's choice. Staging imports no data, so the rule that it equals the imported data's namespace holds trivially |
+| `stagingOrigin.publicOrigin` | `https://staging.tibotattle.com` | Staging edge plan proposal D-S1, not yet confirmed by the owner |
+| `stagingOrigin.accessTeamDomain` | `tibotattle.cloudflareaccess.com` | Production's Access team (CR-3's production values); the staging edge plan (D-S3) proposes reusing it |
+| `stagingOrigin.accessAdminEmail` | the owner's admin email | Production's Access admin email (CR-3's production values) |
+| `stagingOrigin.identityLinkSecretVersion` | `staging-gcp-v1` | Claude's label for the staging identity-link secret; CR-3 refuses a production label |
+| `stagingOrigin.admissionMode` | `closed` | CR-3's fail-closed staging mode; the other mode, `synthetic-rehearsal`, opens accountless admission |
 
 ## The staging service
 

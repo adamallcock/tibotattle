@@ -21,10 +21,11 @@ status: draft
 
 This runbook covers, in order: the read-only plan, the synthetic secrets,
 pinning their versions, the bucket birth and its proof, committing the
-pins and the receipt, the first OPS-2 apply, and readback. It then lists
-the gated tail (the bootstrap image, the jobs, the service, migrate and roll)
-with the gate that holds each one. A gated step is not part of the approved
-work until its gate is cleared.
+pins and the receipt, the owner's confirmation of the project-wide custom
+role, the first OPS-2 apply, and readback. It then lists the gated tail (the
+bootstrap image, the jobs, the service, migrate and roll) with the gate that
+holds each one. A gated step is not part of the approved work until its gate
+is cleared.
 
 What the tooling guarantees, from code and offline checks
 (`npm --prefix apps/worker run gcp:ops:infra:check`):
@@ -32,8 +33,13 @@ What the tooling guarantees, from code and offline checks
 - `scripts/gcp-staging-secrets.mjs` refuses every id that is not
   `tibotattle-staging-*`, makes each value in process, passes it to
   `gcloud secrets versions add --data-file=-` on stdin only, and prints
-  secret ids and version numbers only. Google, Apple and GitHub-token
-  secrets are inert synthetic values.
+  secret ids and version numbers only. Every gcloud call it makes carries
+  `--no-log-http`, which outranks `core/log_http` in the gcloud config and
+  `CLOUDSDK_CORE_LOG_HTTP`, so gcloud never writes a request body (the
+  value) to its log files under `~/.config/gcloud/logs`. Google, Apple and
+  GitHub-token secrets are inert synthetic values. The envelope key pair is
+  provisioned as one unit, and a run that fails part-way can be rerun with
+  the same command.
 - `scripts/gcp-staging-bucket-birth.mjs` makes the one OPS-2 bucket insert,
   writes the receipt to `apps/worker/cloud-run/infra/staging.bucket-birth.receipt.json`
   and pins its proof into the staging desired state.
@@ -43,7 +49,8 @@ What the tooling guarantees, from code and offline checks
 What it does not prove: that gcloud's live output parses as the fake does
 (OPS2-READ), that the shared project has no co-tenant using a staging name
 or the project-wide custom role id, or that a staging service starts (it
-cannot until D-CRB).
+cannot until D-CRB). The `--no-log-http` behaviour was read from the local
+Google Cloud SDK 569.0.0 source, not observed in a live run.
 
 ## Before you start
 
@@ -57,10 +64,19 @@ cd "$FINAL_CHECKOUT/apps/worker"
 git status --porcelain                    # expect: nothing
 git log -1 --format=%H                    # record it: this is <commit>
 gcloud config get-value account           # record it: the operator account
+gcloud config get-value core/log_http     # expect: False, or (unset)
 npm run gcp:ops:infra:check               # expect: every test passes, 0 fail
 ```
 
-Stop if the tree is dirty, the gate fails, or gcloud has no active account.
+Stop if the tree is dirty, the gate fails, gcloud has no active account, or
+`core/log_http` prints `True`. In that last case, ask the owner to turn the
+property off (`gcloud config unset core/log_http`). The secrets tool turns
+HTTP logging off for each of its own calls regardless, but other commands
+in this runbook would still log their HTTP traffic.
+
+Step 6 needs the owner's explicit confirmation of the project-wide custom
+role. To avoid stopping mid-run, you may ask for it now, with the step 1
+plan in hand.
 
 ## 1. Plan (read-only)
 
@@ -88,7 +104,8 @@ Stop, and do not continue, if any of these holds:
 - the custom role is planned as anything but `custom-role:create`. Its id
   `tibotattleQuarantineStore` is project-wide and not staging-named: an
   update or destructive entry means a co-tenant already owns that id. Ask
-  the owner before going on;
+  the owner before going on. A plain create is expected here, but it still
+  needs the owner's confirmation before the first apply (step 6);
 - a finding other than the two above (for example `SERVICE_ACCOUNT_DISABLED`,
   `CUSTOM_ROLE_*`, `BUCKET_PROOF_STALE`), or any live staging resource you
   did not create.
@@ -115,21 +132,45 @@ node scripts/gcp-staging-secrets.mjs --environment=staging --apply \
   --write-pins --report-out="$SCRATCH/staging-secrets-report.json"; echo "exit=$?"
 ```
 
-Expected: exit 0, `"status": "provisioned"`, seven entries each with
-`"container": "created"`, `"outcome": "added"`, `"version": "1"`, and
-`pinned.changed: true` with all seven variables at `"1"`.
+Expected: exit 0, `"status": "provisioned"`, `"envelopePairReissued": false`,
+seven entries each with `"container": "created"`, `"outcome": "added"`,
+`"version": "1"`, and `pinned.changed: true` with all seven variables at `"1"`.
 
 Stop conditions:
 
 - Any entry reads `already_provisioned` on this first run: someone else made
   that `tibotattle-staging-*` secret. Do not pin it; ask the owner.
-- `STAGING_ENVELOPE_PAIR_PARTIAL` or `STAGING_SECRET_VERSIONS_UNUSABLE:<VAR>`:
-  stop and ask. Never disable, destroy or delete a version by hand.
-- Exit 1 with `outcomes` in the error: some versions were added. Read the
-  code; when the cause is fixed, rerun the same command. A rerun skips every
-  secret that already has an ENABLED version and pins it.
+- `STAGING_ENVELOPE_PAIR_PARTIAL` (the envelope pair needs reissuing, but a
+  key is already pinned) or `STAGING_SECRET_VERSIONS_UNUSABLE:<VAR>` (every
+  version of a secret is disabled or destroyed): someone changed the state by
+  hand. Stop and ask. Never disable, destroy or delete a version by hand.
+- `STAGING_SECRETS_REPORT_PATH_UNAVAILABLE`: nothing was called. The
+  `--report-out` path already exists (a finished run's report, or the empty
+  reservation of a run that was killed). Rerun with a fresh path.
 - `STAGING_SECRETS_AUTHORIZATION_MISMATCH`: the ids changed; rerun the dry
   run and review why.
+
+Exit 1 with `outcomes` in the error means some containers or versions were
+made. The report file was released, so the rerun can use the same path.
+Pins are written only after all seven secrets are provisioned. Read the code
+and fix the cause, then rerun the same command, with the same
+`--report-out`. The rerun skips every secret that already has an ENABLED
+version, and a pin already in place is left as it is. On the rerun:
+
+- `already_provisioned` is expected for the secrets that the failed run
+  reported as `added`. The failed run may also have reported an add as
+  `pending` when gcloud timed out after Secret Manager kept the version.
+  That entry can also read `already_provisioned`. Any other
+  `already_provisioned` is a stop, as above.
+- The envelope pair is one unit. Suppose the failed run did not add
+  `ENVELOPE_PRIVATE_JWK`, but Secret Manager kept a version of
+  `ENVELOPE_PUBLIC_JWK`: reported as `added`, or as `pending` after a
+  timeout. Then the rerun prints `"envelopePairReissued": true`. It adds a
+  version of a fresh pair to both keys, so `ENVELOPE_PUBLIC_JWK` is pinned
+  at `"2"` (or higher) and `ENVELOPE_PRIVATE_JWK` at `"1"`. The public
+  version from the failed run stays ENABLED but unpinned. Nothing reads it;
+  leave it alone. `envelopePairReissued: true` in any other situation is a
+  stop.
 
 ## 3. Review the version pins
 
@@ -138,7 +179,9 @@ git diff -- cloud-run/infra/staging.desired-state.json
 ```
 
 Expected: exactly seven changed lines, each `"version": null` becoming
-`"version": "1"`. Stop on any other change.
+the version the step 2 report pinned: `"1"` for all seven on a clean run,
+and a higher `ENVELOPE_PUBLIC_JWK` version after a reissue. Stop on any
+other change.
 
 ## 4. Bucket birth and its proof
 
@@ -170,13 +213,30 @@ Stop conditions:
   ask the owner.
 - `BUCKET_BIRTH_RECEIPT_PATH_UNAVAILABLE`: a receipt file is already there;
   nothing was inserted. Find out why before anything else.
-- stderr with `"bucketInserted": true, "receiptWritten": true`: the bucket
-  and receipt exist, only the pin failed. Fix the cause, then run
+
+After the insert, stderr always carries `"bucketInserted": true` with
+`receiptWritten` and `receiptPrinted`, which say where the proof is. Never
+rerun `--apply` in any of these cases:
+
+- `"receiptWritten": true`: the bucket and receipt exist, and only the pin
+  failed. Fix the cause, then run
   `node scripts/gcp-staging-bucket-birth.mjs --environment=staging --pin-only`.
-- stdout `"status": "created_receipt_unwritten"`: the bucket exists and the
-  receipt is only on stdout. Save that `receipt` object, unchanged, as
-  `cloud-run/infra/staging.bucket-birth.receipt.json`, then run `--pin-only`
-  (it verifies the receipt before pinning). Never rerun `--apply`.
+- `"receiptPrinted": true`, with stdout `"status": "created_receipt_unwritten"`:
+  the bucket exists and the receipt is only on stdout. Save that `receipt`
+  object, unchanged, as `cloud-run/infra/staging.bucket-birth.receipt.json`,
+  then run `--pin-only`, which verifies the receipt before pinning.
+- `"receiptWritten": false, "receiptPrinted": false`, and nothing on stdout:
+  the bucket was born, but no receipt exists. Examples are
+  `BUCKET_BIRTH_READBACK_MISSING` and `BUCKET_BIRTH_RESPONSE_INVALID`. The
+  proof cannot be recovered with this tooling: `--pin-only` refuses with
+  `STAGING_BUCKET_BIRTH_RECEIPT_MISSING`. **Stop and ask the owner.** Never
+  write a receipt by hand and never adopt the bucket.
+
+Any other error, without `bucketInserted`, means that no insert is known to
+have succeeded, and the receipt reservation was released. Fix the cause and
+rerun `--apply`. If the insert request timed out (`BUCKET_BIRTH_REQUEST_FAILED`),
+the bucket may still have been made. The rerun's listing then refuses with
+`BUCKET_BIRTH_BUCKET_EXISTS`, which is the first stop above.
 
 ## 5. Commit the pins and the proof
 
@@ -192,13 +252,33 @@ new receipt file; the gate passes (its checks accept both the unpinned and
 the pinned file and hold the proof to the receipt). Do not push; apply reads
 the committed file locally (`GCP_INFRA_COMMITTED_DESIRED_STATE_REQUIRED`).
 
-## 6. Apply, pass 1 (no image)
+## 6. Owner confirmation: the project-wide custom role
+
+**Stop here unless the owner has confirmed this in chat.** The approval
+covers "new staging-named resources only, including their IAM bindings". The
+first apply also creates the custom role `tibotattleQuarantineStore`
+(`custom-role:create`). The role is project-wide in the shared project, and
+C-INFRA pins its id (`QUARANTINE_STORE_ROLE_ID`), so it cannot carry a
+staging name. OPS-2 applies the authorized plan whole, so the role cannot be
+left out of that plan. Ask the owner, naming the role id, its project
+(`tibotattle`) and its five `storage.*` permissions. Continue only on an
+explicit yes. Record the confirmation, with the time, in the session notes.
+
+If the owner declines, or wants a staging-named role instead, the approved
+work ends at step 5. A staging-named role is a C-INFRA change (a
+per-environment role id), not a step of this runbook.
+
+## 7. Apply, pass 1 (no image)
 
 ```bash
 node scripts/gcp-infra.mjs plan --environment=staging > "$SCRATCH/staging-plan-1.json"; echo "exit=$?"
 node -e 'const p=require(process.argv[1]);console.log(p.planDigest, JSON.stringify(p.summary), JSON.stringify(p.findings), JSON.stringify(p.blockers))' "$SCRATCH/staging-plan-1.json"
 node scripts/gcp-infra.mjs apply --environment=staging --authorize=<planDigest> > "$SCRATCH/staging-apply-1.json"; echo "exit=$?"
 ```
+
+Before you authorize: step 6's confirmation is recorded, and the plan's
+only non-staging-named entry is `custom-role:create` for
+`tibotattleQuarantineStore`.
 
 Expected plan: exit 0, no findings or blockers, `summary.refused` 0. With
 the secrets and bucket already made, about 26 executable operations
@@ -218,7 +298,7 @@ stderr lists the operations that ran; re-plan, read the readback, and only
 then decide whether a fresh plan and apply is safe); `APPLY_PLAN_DIGEST_MISMATCH`
 (the estate moved between plan and apply: re-plan, re-read, re-authorize).
 
-## 7. Readback
+## 8. Readback
 
 ```bash
 node scripts/gcp-infra.mjs readback --environment=staging > "$SCRATCH/staging-readback-1.json"; echo "exit=$?"
@@ -226,7 +306,7 @@ node scripts/gcp-infra.mjs readback --environment=staging --require-clean > "$SC
 ```
 
 Expected: the first exits 0 with no finding. The second exits 2 with
-`"clean": false`, and its reasons are only the deferrals listed in step 6.
+`"clean": false`, and its reasons are only the deferrals listed in step 7.
 This is the first owner-run readback of the test project (OPS2-READ): check
 that the service-account policy, the scheduler listing and the custom role
 parsed, and keep the files as evidence (they are content-free).

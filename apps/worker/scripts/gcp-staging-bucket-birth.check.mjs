@@ -52,7 +52,7 @@ function receiptFor(desired) {
 }
 
 /** A recording gcloud runner and fetch: listings before and after the one insert, and a token. */
-function harness(desired, { existing = false } = {}) {
+function harness(desired, { existing = false, readbackMissing = false, createBody } = {}) {
   const calls = [];
   const requests = [];
   let inserted = false;
@@ -60,14 +60,14 @@ function harness(desired, { existing = false } = {}) {
     calls.push([...argv]);
     if (argv[0] === "auth" && argv[1] === "print-access-token") return { status: 0, stdout: `${TOKEN}\n` };
     if (argv.slice(0, 3).join(" ") === "storage buckets list") {
-      return { status: 0, stdout: JSON.stringify(existing || inserted ? [created(desired)] : []) };
+      return { status: 0, stdout: JSON.stringify((existing || inserted) && !readbackMissing ? [created(desired)] : []) };
     }
     return { status: 2, stdout: "" };
   };
   const fetchImpl = async (url, init) => {
     requests.push({ url: String(url), method: init.method });
     inserted = true;
-    return new Response(JSON.stringify(created(desired)), { status: 200 });
+    return new Response(createBody ?? JSON.stringify(created(desired)), { status: 200 });
   };
   return { calls, requests, runner, fetchImpl };
 }
@@ -208,7 +208,7 @@ test("a pin that fails after the insert keeps the receipt and says so; --pin-onl
       stdout: () => {}, stderr: (text) => { err += text; } });
     assert.equal(code, 1);
     assert.deepEqual(JSON.parse(err), { status: "error", code: "STAGING_BUCKET_PROOF_ALREADY_PINNED", bucketInserted: true,
-      receiptWritten: true, receiptFile: "cloud-run/infra/staging.bucket-birth.receipt.json" });
+      receiptWritten: true, receiptPrinted: false, receiptFile: "cloud-run/infra/staging.bucket-birth.receipt.json" });
     assert.equal(store.writes, 0);
     assert.equal(existsSync(receiptPath), true);
     // With the hand edit reverted, --pin-only pins from the receipt, and a second run is a no-op.
@@ -220,6 +220,52 @@ test("a pin that fails after the insert keeps the receipt and says so; --pin-onl
       { mode: "pin-only", receiptPath, pinStore: fresh });
     assert.equal(repeat.status, "already_pinned");
     assert.equal(fresh.writes, 1);
+  });
+});
+
+test("after the insert, stderr always says where the proof is: printed, or lost", async () => {
+  const desired = staging();
+  await withDirectory(async (directory) => {
+    // The receipt file cannot be written: stdout carries the receipt to save, then --pin-only.
+    const unwrittenPath = join(directory, "unwritten.json");
+    const run = harness(desired);
+    let out = "";
+    let err = "";
+    const reserveReceipt = async () => Object.freeze({
+      async write() { throw new manifest.GcpOpsInfraError("BUCKET_BIRTH_RECEIPT_WRITE_FAILED"); },
+      async release() {},
+    });
+    assert.equal(await flow.main(["--environment=staging", "--apply", `--authorize=${AUTHORIZE}`], {
+      loadDesired: () => desired, runner: run.runner, fetchImpl: run.fetchImpl, receiptPath: unwrittenPath, reserveReceipt,
+      pinStore: memoryStore(), stdout: (text) => { out += text; }, stderr: (text) => { err += text; } }), 1);
+    assert.deepEqual(JSON.parse(err), { status: "error", code: "BUCKET_BIRTH_RECEIPT_WRITE_FAILED", bucketInserted: true,
+      receiptWritten: false, receiptPrinted: true });
+    const printed = JSON.parse(out);
+    assert.equal(printed.status, "created_receipt_unwritten");
+    assert.deepEqual(flow.verifyStagingBucketBirthReceipt(printed.receipt, desired),
+      { bucketGeneration: GENERATION, bucketMetageneration: "1" });
+    // The bucket was born but no receipt exists: both false, nothing on stdout, nothing to pin from.
+    for (const [options, code] of [
+      [{ readbackMissing: true }, "BUCKET_BIRTH_READBACK_MISSING"],
+      [{ createBody: "{not json" }, "BUCKET_BIRTH_RESPONSE_INVALID"],
+    ]) {
+      const lostPath = join(directory, `${code}.json`);
+      const lost = harness(desired, options);
+      const store = memoryStore();
+      let lostOut = "";
+      let lostErr = "";
+      assert.equal(await flow.main(["--environment=staging", "--apply", `--authorize=${AUTHORIZE}`], {
+        loadDesired: () => desired, runner: lost.runner, fetchImpl: lost.fetchImpl, receiptPath: lostPath, pinStore: store,
+        stdout: (text) => { lostOut += text; }, stderr: (text) => { lostErr += text; } }), 1, code);
+      assert.equal(lost.requests.length, 1, code);
+      assert.deepEqual(JSON.parse(lostErr), { status: "error", code, bucketInserted: true, receiptWritten: false,
+        receiptPrinted: false }, code);
+      assert.equal(lostOut, "", code);
+      assert.equal(existsSync(lostPath), false, code);
+      assert.equal(store.writes, 0, code);
+      await assert.rejects(flow.runStagingBucketBirth(desired, { mode: "pin-only", receiptPath: lostPath, pinStore: store }),
+        { code: "STAGING_BUCKET_BIRTH_RECEIPT_MISSING" }, code);
+    }
   });
 });
 

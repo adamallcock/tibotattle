@@ -20,8 +20,9 @@
  *   base64url (64 characters; CR-3 needs at least 32).
  * - ENVELOPE_PUBLIC_JWK, ENVELOPE_PRIVATE_JWK: one freshly generated RSA-2048
  *   pair, as JWKs with one key id `key:staging-<uuid>` (CR-3's staging plane
- *   requires the staging token on the key id). Both are added in one run or
- *   neither (STAGING_ENVELOPE_PAIR_PARTIAL).
+ *   requires the staging token on the key id). The pair is one unit: both
+ *   keys get a version from the same pair in the same run, the public key
+ *   first (ENVELOPE_PAIR), and values for half a pair are never made.
  * - GOOGLE_OIDC_CLIENT_SECRET, DISTRIBUTION_GITHUB_API_TOKEN: INERT,
  *   `staging-inert-` plus 32 random bytes. They are no Google client secret
  *   and no GitHub token; Google sign-in on staging cannot complete, and a
@@ -48,14 +49,32 @@
  *   after a partial failure provisions only what is missing) and reports the
  *   version to pin (the pinned one when it is ENABLED, else the highest
  *   ENABLED one);
+ * - adds the envelope pair as one unit: when either key has no ENABLED
+ *   version, a fresh pair and a new version on BOTH keys. When the other key
+ *   already had one, that is a reissue (envelopePairReissued): the forward
+ *   path after a failure between the two adds, which leaves a public version
+ *   with no private partner. That orphan stays ENABLED but unpinned, and only
+ *   pinned versions are read. A reissue that would move a committed pin
+ *   refuses (STAGING_ENVELOPE_PAIR_PARTIAL). Because the private key is only
+ *   ever added right after its public key succeeded in the same run, whenever
+ *   both keys have an ENABLED version the highest of each comes from one
+ *   pair;
  * - refuses a secret whose versions are all disabled or destroyed
  *   (STAGING_SECRET_VERSIONS_UNUSABLE), for a human to decide.
  * It never disables, destroys or deletes anything and never reads a value
  * back (`secrets versions access` is not a shape it can issue).
  *
+ * Every gcloud call carries --no-log-http (the guard refuses one without it,
+ * GCLOUD_LOG_HTTP_REQUIRED_OFF). The flag outranks core/log_http from the
+ * gcloud config and CLOUDSDK_CORE_LOG_HTTP, so gcloud never writes a
+ * `versions add` request body, which carries the value, to its log files.
+ *
  * --write-pins then pins every reported version into the committed staging
- * desired state (gcp-staging-desired-state.mjs). --report-out writes the
- * content-free report, created exclusively and owner-only.
+ * desired state (gcp-staging-desired-state.mjs). --report-out names the
+ * content-free report file. It is reserved (created exclusively, owner-only,
+ * never through a symlink) before the first gcloud call, so an unusable path
+ * refuses with nothing called. It is filled at the end and removed when the
+ * run fails, so the same command can be rerun.
  *
  * Output: one content-free JSON document on stdout; exit 0 on success, 1 on
  * error, with {"status":"error","code":...} on stderr (plus the content-free
@@ -95,6 +114,9 @@ export const STAGING_SECRET_KINDS = Object.freeze({
 export const ENVELOPE_PAIR = Object.freeze(["ENVELOPE_PUBLIC_JWK", "ENVELOPE_PRIVATE_JWK"]);
 export const INERT_VALUE_PREFIX = "staging-inert-";
 
+/** Turns gcloud's HTTP logging off for the call, whatever the config or environment says. */
+export const GCLOUD_NO_LOG_HTTP = "--no-log-http";
+
 /** gcloud command shapes this tool may issue, and nothing else. */
 export const STAGING_SECRETS_COMMANDS = Object.freeze({
   "secrets list": "read",
@@ -111,6 +133,19 @@ const KID = /^key:[A-Za-z0-9._-]{1,64}$/u;
 const PKCS8_PEM = /-----BEGIN PRIVATE KEY-----([\sA-Za-z0-9+/=]+)-----END PRIVATE KEY-----/u;
 const MAX_SECRET_BYTES = 65_536;
 const FORBIDDEN_ID_TOKENS = Object.freeze(["production", "prod", "test", "rehearsal", "synthetic"]);
+
+/** The exact argv of each call, for the dry run and the apply alike. */
+function secretsArgv(desired) {
+  const project = `--project=${desired.project}`;
+  const common = ["--format=json", GCLOUD_NO_LOG_HTTP];
+  return Object.freeze({
+    list: () => ["secrets", "list", project, ...common],
+    versions: (secretId) => ["secrets", "versions", "list", secretId, project, ...common],
+    create: (secretId) => ["secrets", "create", secretId, project, "--replication-policy=user-managed",
+      `--locations=${desired.region}`, ...common],
+    add: (secretId) => ["secrets", "versions", "add", secretId, project, "--data-file=-", ...common],
+  });
+}
 
 function tokens(value) {
   return String(value).toLowerCase().split(/[^a-z0-9]+/u).filter(Boolean);
@@ -271,9 +306,9 @@ function commandShape(argv) {
 
 /**
  * The guarded gcloud call: a closed set of shapes, exactly one --project for
- * the plane's project, JSON output on every call, stdin only for `versions
- * add --data-file=-`, and never a value in argv. Failures name the command
- * shape only.
+ * the plane's project, JSON output and HTTP logging off on every call, stdin
+ * only for `versions add --data-file=-`, and never a value in argv. Failures
+ * name the command shape only.
  */
 export function guardedStagingSecretsGcloud(runner, { project, values = new Map() }) {
   if (typeof runner !== "function") fail("GCLOUD_RUNNER_INVALID");
@@ -285,6 +320,10 @@ export function guardedStagingSecretsGcloud(runner, { project, values = new Map(
       fail("GCLOUD_PROJECT_FLAG_INVALID");
     }
     if (!argv.includes("--format=json")) fail("GCLOUD_READ_FORMAT_REQUIRED");
+    if (argv.filter((arg) => arg === GCLOUD_NO_LOG_HTTP).length !== 1
+        || argv.some((arg) => arg === "--log-http" || arg.startsWith("--log-http="))) {
+      fail("GCLOUD_LOG_HTTP_REQUIRED_OFF");
+    }
     const adding = shape === "secrets versions add";
     if (adding !== argv.includes("--data-file=-") || adding !== (typeof input === "string")) {
       fail("GCLOUD_STDIN_CONTRACT_BROKEN");
@@ -348,7 +387,7 @@ export function stagingSecretsDryRun(desired) {
   const values = generateStagingSecretValues(targets.map((target) => target.variable));
   const checked = values.size;
   values.clear();
-  const project = `--project=${desired.project}`;
+  const argv = secretsArgv(desired);
   return deepFreeze({
     schema: STAGING_SECRETS_REPORT_SCHEMA,
     status: "dry_run",
@@ -356,16 +395,14 @@ export function stagingSecretsDryRun(desired) {
     project: desired.project,
     authorization: stagingSecretsAuthorization(desired),
     generationSelfTest: { valuesGenerated: checked, valuesChecked: checked, valuesKept: values.size },
-    reads: [["secrets", "list", project, "--format=json"],
-      ...targets.map((target) => ["secrets", "versions", "list", target.secretId, project, "--format=json"])],
+    reads: [argv.list(), ...targets.map((target) => argv.versions(target.secretId))],
     secrets: targets.map((target) => ({
       variable: target.variable,
       secretId: target.secretId,
       kind: target.kind,
       pinned: target.pinned,
-      createIfMissing: ["secrets", "create", target.secretId, project, "--replication-policy=user-managed",
-        `--locations=${desired.region}`, "--format=json"],
-      addVersion: ["secrets", "versions", "add", target.secretId, project, "--data-file=-", "--format=json"],
+      createIfMissing: argv.create(target.secretId),
+      addVersion: argv.add(target.secretId),
       stdin: `<${target.kind}, generated in process at apply>`,
     })),
   });
@@ -377,22 +414,23 @@ function stagingSecretsError(code, outcomes) {
 
 /**
  * Applies the plan: reads, then creates missing containers, then adds one
- * version per secret without an ENABLED version. Returns the content-free
- * report. A failure after any change carries the outcomes so far.
+ * version per secret without an ENABLED version, reissuing the envelope pair
+ * as one unit (see the header). Returns the content-free report. A failure
+ * after any change carries the outcomes so far.
  */
 export function provisionStagingSecrets(desired, { authorize, runner = defaultStagingSecretsRunner } = {}) {
   const targets = stagingSecretTargets(desired);
   if (desired.synthetic) fail("STAGING_SECRETS_SYNTHETIC_TARGET_REFUSED");
   if (authorize !== stagingSecretsAuthorization(desired)) fail("STAGING_SECRETS_AUTHORIZATION_MISMATCH");
-  const project = `--project=${desired.project}`;
+  const argv = secretsArgv(desired);
   const read = guardedStagingSecretsGcloud(runner, { project: desired.project });
-  const listed = read(["secrets", "list", project, "--format=json"]);
+  const listed = read(argv.list());
   if (!Array.isArray(listed)) fail("GCLOUD_OUTPUT_INVALID:secrets-list");
   const existing = new Set(listed.map((entry) => tail(entry?.name)).filter((name) => name !== null));
 
   const plan = targets.map((target) => {
     if (!existing.has(target.secretId)) return { ...target, container: "missing", states: new Map() };
-    const states = versionStates(read(["secrets", "versions", "list", target.secretId, project, "--format=json"]));
+    const states = versionStates(read(argv.versions(target.secretId)));
     return { ...target, container: "existing", states };
   });
   for (const entry of plan) {
@@ -402,16 +440,27 @@ export function provisionStagingSecrets(desired, { authorize, runner = defaultSt
       : entry.pinned !== null && enabled.includes(entry.pinned) ? entry.pinned
         : enabled.sort((left, right) => Number(right) - Number(left))[0];
   }
-  const pending = plan.filter((entry) => entry.enabledVersion === null).map((entry) => entry.variable);
-  if (ENVELOPE_PAIR.some((name) => pending.includes(name)) && !ENVELOPE_PAIR.every((name) => pending.includes(name))) {
-    fail("STAGING_ENVELOPE_PAIR_PARTIAL");
+  // The envelope pair is one unit: when either key has no ENABLED version,
+  // both get a version of one fresh pair. An earlier public version without
+  // a private partner stays, ENABLED and unpinned. A pin is never moved.
+  const pair = ENVELOPE_PAIR.map((name) => plan.find((entry) => entry.variable === name));
+  let envelopePairReissued = false;
+  if (pair.some((entry) => entry.enabledVersion === null)) {
+    envelopePairReissued = pair.some((entry) => entry.enabledVersion !== null);
+    if (envelopePairReissued && pair.some((entry) => entry.pinned !== null)) fail("STAGING_ENVELOPE_PAIR_PARTIAL");
+    for (const entry of pair) entry.enabledVersion = null;
   }
+  // The private key is added right after the public key, so it is only ever
+  // added once its public partner succeeded in the same run.
+  const order = plan.filter((entry) => entry !== pair[1]);
+  order.splice(order.indexOf(pair[0]) + 1, 0, pair[1]);
+  const pending = order.filter((entry) => entry.enabledVersion === null).map((entry) => entry.variable);
 
   const values = generateStagingSecretValues(pending);
   const call = guardedStagingSecretsGcloud(runner, { project: desired.project, values });
   const outcomes = [];
   try {
-    for (const entry of plan) {
+    for (const entry of order) {
       const outcome = { variable: entry.variable, secretId: entry.secretId, kind: entry.kind,
         container: entry.container === "missing" ? "pending" : "existing", outcome: "pending", version: null };
       outcomes.push(outcome);
@@ -420,12 +469,10 @@ export function provisionStagingSecrets(desired, { authorize, runner = defaultSt
         continue;
       }
       if (entry.container === "missing") {
-        call(["secrets", "create", entry.secretId, project, "--replication-policy=user-managed",
-          `--locations=${desired.region}`, "--format=json"]);
+        call(argv.create(entry.secretId));
         outcome.container = "created";
       }
-      const output = call(["secrets", "versions", "add", entry.secretId, project, "--data-file=-", "--format=json"],
-        { input: values.get(entry.variable) });
+      const output = call(argv.add(entry.secretId), { input: values.get(entry.variable) });
       values.delete(entry.variable);
       Object.assign(outcome, { outcome: "added", version: addedVersion(output, entry.secretId) });
     }
@@ -442,13 +489,19 @@ export function provisionStagingSecrets(desired, { authorize, runner = defaultSt
     environment: desired.environment,
     project: desired.project,
     authorization: authorize,
+    envelopePairReissued,
     secrets: outcomes,
     pins: Object.fromEntries(outcomes.map((outcome) => [outcome.variable, outcome.version])),
   });
 }
 
-/** Writes the content-free report: created exclusively, owner-only, never through a symlink. */
-export async function writeStagingSecretsReport(path, report) {
+/**
+ * Reserves the report file before anything changes: created exclusively,
+ * owner-only and never through a symlink. Returns { write(report), release() }:
+ * write fills and syncs it once; release removes the still-empty reservation
+ * when the run ends without a report. A failed write removes this run's file.
+ */
+export async function reserveStagingSecretsReport(path) {
   if (typeof path !== "string" || !isAbsolute(path)) fail("STAGING_SECRETS_REPORT_PATH_INVALID");
   let handle;
   try {
@@ -457,15 +510,30 @@ export async function writeStagingSecretsReport(path, report) {
   } catch {
     fail("STAGING_SECRETS_REPORT_PATH_UNAVAILABLE");
   }
-  try {
-    await handle.writeFile(`${JSON.stringify(report, null, 2)}\n`, "utf8");
-    await handle.sync();
-    await handle.close();
-  } catch {
+  let settled = false;
+  const discardFile = async () => {
     try { await handle.close(); } catch { /* keep the original outcome */ }
     try { await unlink(path); } catch { /* only this run's own file */ }
-    fail("STAGING_SECRETS_REPORT_WRITE_FAILED");
-  }
+  };
+  return Object.freeze({
+    async write(report) {
+      if (settled) fail("STAGING_SECRETS_REPORT_WRITE_FAILED");
+      settled = true;
+      try {
+        await handle.writeFile(`${JSON.stringify(report, null, 2)}\n`, "utf8");
+        await handle.sync();
+        await handle.close();
+      } catch {
+        await discardFile();
+        fail("STAGING_SECRETS_REPORT_WRITE_FAILED");
+      }
+    },
+    async release() {
+      if (settled) return;
+      settled = true;
+      await discardFile();
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -511,7 +579,7 @@ export async function main(argv = process.argv.slice(2), {
   runner = defaultStagingSecretsRunner,
   loadDesired = () => loadCommittedDesiredState(STAGING_SECRETS_ENVIRONMENT),
   pinStore,
-  writeReport = writeStagingSecretsReport,
+  reserveReport = reserveStagingSecretsReport,
   stdout = (text) => process.stdout.write(text),
   stderr = (text) => process.stderr.write(text),
 } = {}) {
@@ -523,26 +591,36 @@ export async function main(argv = process.argv.slice(2), {
       print(stagingSecretsDryRun(desired));
       return 0;
     }
-    const report = provisionStagingSecrets(desired, { authorize: config.authorize, runner });
-    let pinned = null;
-    if (config.writePins) {
-      try {
-        pinned = updateStagingDesiredState((text) => pinStagingSecretVersions(text, report.pins), pinStore);
-      } catch (error) {
-        throw stagingSecretsError(error instanceof GcpOpsInfraError ? error.code : "STAGING_SECRETS_PIN_FAILED",
-          report.secrets);
+    // Checked before the report is reserved, so a wrong authorization leaves no file.
+    if (config.authorize !== stagingSecretsAuthorization(desired)) fail("STAGING_SECRETS_AUTHORIZATION_MISMATCH");
+    // Reserved before the first gcloud call; released on any failure, so the
+    // same command can be rerun with the same --report-out.
+    const reservation = config.reportOut === null ? null : await reserveReport(config.reportOut);
+    try {
+      const report = provisionStagingSecrets(desired, { authorize: config.authorize, runner });
+      let pinned = null;
+      if (config.writePins) {
+        try {
+          pinned = updateStagingDesiredState((text) => pinStagingSecretVersions(text, report.pins), pinStore);
+        } catch (error) {
+          throw stagingSecretsError(error instanceof GcpOpsInfraError ? error.code : "STAGING_SECRETS_PIN_FAILED",
+            report.secrets);
+        }
       }
-    }
-    if (config.reportOut !== null) {
-      try {
-        await writeReport(config.reportOut, report);
-      } catch (error) {
-        throw stagingSecretsError(error instanceof GcpOpsInfraError ? error.code : "STAGING_SECRETS_REPORT_WRITE_FAILED",
-          report.secrets);
+      if (reservation !== null) {
+        try {
+          await reservation.write(report);
+        } catch (error) {
+          throw stagingSecretsError(error instanceof GcpOpsInfraError ? error.code : "STAGING_SECRETS_REPORT_WRITE_FAILED",
+            report.secrets);
+        }
       }
+      print({ ...report, pinned });
+      return 0;
+    } catch (error) {
+      await reservation?.release();
+      throw error;
     }
-    print({ ...report, pinned });
-    return 0;
   } catch (error) {
     const code = error instanceof GcpOpsInfraError ? error.code : "STAGING_SECRETS_FAILED";
     stderr(`${JSON.stringify({ status: "error", code, ...(error?.outcomes === undefined ? {} : { outcomes: error.outcomes }) })}\n`);
