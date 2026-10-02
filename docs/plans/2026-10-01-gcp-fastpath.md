@@ -99,9 +99,11 @@ The target keeps every published output contract and every intake contract.
   `workers.dev` Worker, found that no header carrying the visitor's address
   reached a Cloud Run service. The recommendation for OD-E6 is therefore to
   keep the direct `*.run.app` topology with that override, with no
-  proxied-hostname rework. The switch waits for one owner-run rerun of the
-  probe from the `tibotattle.com` zone
-  ([decision record, section 5](../decisions/2026-10-01-thin-worker-edge-proxy.md#od-e6-recommendation-and-gate)).
+  proxied-hostname rework. The owner-run rerun of the probe from the
+  `tibotattle.com` zone passed on 2026-10-02
+  ([decision record, section 5](../decisions/2026-10-01-thin-worker-edge-proxy.md#od-e6-recommendation-and-gate);
+  [receipt](../receipts/2026-10-02-gcp-edge-ip-probe-production-zone.md)),
+  so that gate is met.
 
 ### Origin
 
@@ -496,8 +498,8 @@ gates are in the
   per-date expectation and fails closed without it. The preview is withheld
   while any effective owner lacks a current fit, as production's preview
   publication requires, and a model date on which every member was refused
-  is published with all of them counted (D7 amended; both await the owner's
-  confirmation). The day backstop now applies before the evidence digest. The
+  is published with all of them counted (D7 amended; the owner accepted both
+  on 2026-10-02). The day backstop now applies before the evidence digest. The
   owner-parity compare fails closed on fits references, and a PostgreSQL case
   pins the v1.2 expansion's exclusions. Disclosed, not fixed: the reader
   variant bound divergence in every family, the memory estimate's growth with
@@ -568,7 +570,8 @@ OD-8 for PT-4; production resources.
 8. Start the analytics cold build.
 
 Step 6 also needs a recorded pass of the edge IP probe from the
-`tibotattle.com` zone (OD-E6). It can run at any time before the window.
+`tibotattle.com` zone (OD-E6). The owner recorded that pass on 2026-10-02
+([receipt](../receipts/2026-10-02-gcp-edge-ip-probe-production-zone.md)).
 
 Before the flip, rollback is redeploying the production Worker and running the
 EP-8 release. After the flip, gcp-to-fenced is the brake. Gcp-to-worker is
@@ -961,11 +964,14 @@ is a GCP deploy, a Cloudflare deploy, a production migration or a cutover.
 - Cutover is not tonight. The remaining critical path covers intake, the edge,
   the importers and seal, the dense path and memo, and production resources and
   secrets from the owner's custody.
-- The client-address result (OD-E6) is observed only from a `workers.dev`
-  Worker. If the production-zone rerun of the edge IP probe finds the
-  visitor's address reaching the origin, the fallbacks are a
-  Cloudflare-proxied origin hostname (a contract, EP-7 and EP-9 template and
-  DNS change) or acceptance with a privacy-page disclosure.
+- The client-address result (OD-E6) passed from both a `workers.dev` Worker
+  and the `tibotattle.com` zone on 2026-10-02
+  ([receipt](../receipts/2026-10-02-gcp-edge-ip-probe-production-zone.md)).
+  Neither run observed the token exchange or the case without the edge's
+  override, so the override stays load-bearing. A change to the edge's
+  topology needs its own passing probe, and a failure would reopen the
+  fallbacks: a Cloudflare-proxied origin hostname (a contract, EP-7 and EP-9
+  template and DNS change) or acceptance with a privacy-page disclosure.
 - Dense owners were excluded from the night's parity gate. The cap raise
   proves dense analysis against production's native kernels with a stand-in
   reader on synthetic data; the dense-owner parity run then proves it through

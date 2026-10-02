@@ -48,10 +48,12 @@ The decision it informs is OD-E6 in the
 
 ## Rerun it on the production zone before the first gcp deploy
 
-The 2026-10-02 run used a `workers.dev` Worker. The production edge runs on
-the `tibotattle.com` zone, so the gcp switch waits for one rerun from that
-zone. Every step is owner-run, and the deploys and deletions are separate
-authorizations.
+The first 2026-10-02 run used a `workers.dev` Worker. The production edge
+runs on the `tibotattle.com` zone, so the gcp switch waited for one rerun from
+that zone. The owner ran it later on 2026-10-02 and it passed
+([receipt](../../../../docs/receipts/2026-10-02-gcp-edge-ip-probe-production-zone.md)).
+Run it again if the edge's topology or placement changes. Every step is
+owner-run, and the deploys and deletions are separate authorizations.
 
 1. **Stage the echo outside the repository.** Copy `echo-server.mjs` into an
    empty scratch directory and add this `package.json`:

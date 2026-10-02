@@ -38,9 +38,9 @@ Authority:
 - No load balancer in front of Cloud Run, no Transform Rule, no DNS change and
   no custom-domain removal or move. The three hostnames stay custom domains of
   the same Worker in every mode. Option A of OD-E6 (a Cloudflare-proxied
-  origin hostname) would change this rule. It is a fallback only if the
-  production-zone address probe fails, and needs its own owner decision
-  first.
+  origin hostname) would change this rule. It was a fallback only if the
+  production-zone address probe failed, and that probe passed on 2026-10-02;
+  it would need its own owner decision first.
 - No guard-only Worker. The Sparkle appcast guard stays in the production
   Worker.
 - No deploy from the checked-in `env.production`, and no raw `wrangler deploy`.
@@ -67,20 +67,21 @@ Authority:
   ([section 7](#7-local-proof-and-the-optional-live-check)) must also be green
   for the edge commit against the origin commit. E12's cross-line option builds
   the edge from the edge-port tree and checks that the contract blob matches.
-- No gcp deploy runs until the owner has re-run the edge IP probe from the
-  `tibotattle.com` zone and recorded a pass (OD-E6). On 2026-10-02 the probe,
-  from a `workers.dev` Worker that sends the edge's `x-real-ip` override, found
-  that no header carrying the visitor's address reached a Cloud Run service:
-  no `CF-Connecting-IP` and no `x-real-ip` arrived, and `x-forwarded-for`
-  carried Cloudflare's placeholder. The zone itself is unobserved. The rerun
-  deploys the echo to the test project and the probe Worker with one
-  exact-path route on the zone, calls `/probe` once, and deletes both; every
-  step is owner-run, and the result records header names and booleans, never a
-  value. Follow
+- No gcp deploy runs without a recorded pass of the edge IP probe from the
+  `tibotattle.com` zone (OD-E6). The owner recorded that pass on 2026-10-02
+  ([receipt](../receipts/2026-10-02-gcp-edge-ip-probe-production-zone.md)):
+  from the zone, with the edge's `x-real-ip` override, no header carrying the
+  visitor's address reached a Cloud Run service, no `CF-Connecting-IP` or
+  `x-real-ip` arrived, `x-forwarded-for` carried Cloudflare's placeholder, and
+  the header names matched the earlier `workers.dev` run. The probe did not
+  observe the token exchange or the case without the override, so the
+  override stays load-bearing. A change to the edge's topology or placement
+  needs a new passing run, which follows
   [the probe's README](../../apps/worker/scripts/edge-ip-probe/README.md); the
   recommendation and the fallbacks if it fails are in
   [the decision record, section 5](../decisions/2026-10-01-thin-worker-edge-proxy.md#od-e6-recommendation-and-gate).
-  E10 does not check this, so the operator must confirm it before the switch.
+  E10 does not check this, so the operator confirms the recorded pass before
+  the switch.
 - Before the first production use of each mode, rehearse worker, fenced (with
   an EP-8 drill) and gcp on a staging Worker with its own hostnames, Access
   application and Cloud Run service. EP-9 provides a staging overlay for this.

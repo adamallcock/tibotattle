@@ -9,8 +9,9 @@ status: accepted
 
 > **Accepted.** The owner approved this text in chat on 2026-09-30. It restates
 > choices the owner made in chat. D7 was added on 2026-10-01 from the owner's
-> decision in chat that day (fast-path OD-12); its wording awaits the owner's
-> review. This record changes no current Cloudflare behavior. It
+> decision in chat that day (fast-path OD-12); the owner accepted its wording
+> as written in chat on 2026-10-02. This record changes no current Cloudflare
+> behavior. It
 > authorizes no production write, migration, deployment or cutover. It is not
 > legal advice and makes no legal-sufficiency claim. It contains no
 > identifiers, session content or deployment evidence.
@@ -19,7 +20,7 @@ status: accepted
 |---|---|
 | Decided by the owner | D1 to D4 and D6 in chat on 2026-09-26; D7 in chat on 2026-10-01; D5 is the hosting boundary in force for the 2026-10-01 GCP fast path |
 | Recorded | 2026-10-01, for the GCP fast path (DOC-1L) |
-| Owner sign-off | Approved in chat on 2026-09-30 (D1 to D6); D7's wording awaits review |
+| Owner sign-off | Approved in chat on 2026-09-30 (D1 to D6); D7's wording accepted as written in chat on 2026-10-02 |
 | Applies to | The proposed PostgreSQL service on Google Cloud, from an owner-authorized cutover |
 | Does not apply to | Current Cloudflare production, local analysis, local erase or Keychain identity reset |
 | Delivery plan | [GCP fast path](../plans/2026-10-01-gcp-fastpath.md) |
@@ -232,7 +233,7 @@ withholding. Recorded here on 2026-10-01.
   counts that silently leave that owner out. The allowance is then served as
   temporarily unavailable; production would instead keep serving its last
   completed preview while it stays valid. (Recorded on 2026-10-02 after
-  review; awaits the owner's confirmation with the rest of D7's wording.)
+  review; the owner accepted it with the rest of D7's wording on 2026-10-02.)
 - `d43c8f92`'s storage publication instead withholds a 14-date model block
   until every member owner has a result. That rule is not ported. Where
   production withholds a block because one owner's window cannot be computed,
@@ -380,12 +381,12 @@ before, so that each stays truthful for the running service.
 ## Sign-off
 
 - [x] The owner approved this text in chat (fast-path OD-6) on 2026-09-30.
-- [ ] D7, added on 2026-10-01, restates the owner's decision in chat that day
-  (fast-path OD-12). The owner has not yet reviewed its wording, including
-  the two points added on 2026-10-02 after review: a model date on which
-  every member was refused is published with all of them counted, and the
-  preview (with every model date) is withheld while an effective owner has
-  no current fit.
+- [x] D7, added on 2026-10-01, restates the owner's decision in chat that day
+  (fast-path OD-12). The owner accepted its wording as written in chat on
+  2026-10-02, including the two points added that day after review: a model
+  date on which every member was refused is published with all of them
+  counted, and the preview (with every model date) is withheld while an
+  effective owner has no current fit.
 
 Still owed: the supersession notes and disclosure changes above land in the
 cutover commit.

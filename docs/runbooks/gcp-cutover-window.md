@@ -71,7 +71,7 @@ the step's acceptance criteria are what the finished tool must satisfy.
 
 | Marker | Meaning |
 |---|---|
-| `built` | On the line at `c80f99b9`, tested locally with synthetic data, never run against a live service |
+| `built` | On the line at `c80f99b9` (for C-IPR, C-ADMIN and C-REFRESH, on the line this draft merged into after `95c158ba`), tested locally with synthetic data, never run against a live service |
 | `in build` | Owned by a running wave-4 or wave-5 stream; not on the line yet |
 | `not built` | Listed in the checklist for a later wave, or only designed |
 | `owner` | Done by the owner outside the repository's tools, for example in the Cloudflare dashboard or Google Cloud console |
@@ -352,8 +352,9 @@ Authorization: the D1 seal export, a read-only production operation. `owner`.
    `built`. The identity importer repeats the same gate before its first write.
 5. **Take the frozen public read.** Export the current `community_daily` read
    model from production, read-only, at the seal, in the format the interim
-   read item defines (OWN-4). `owner`; the format and the loader are `in build`
-   (C-IPR).
+   read item defines (OWN-4). `owner`; the format and the loader are `built`
+   (C-IPR). The loader's table is in staged migration `0065`, whose promotion
+   is owed at the C-SIMP merge.
 
 Refusals to plan for: `CUTOVER_SOURCE_BOOKMARK_DRIFT` (a write reached a D1
 after the fence), `CUTOVER_LEDGER_MISMATCH` or `CUTOVER_SCHEMA_MISMATCH`
@@ -424,8 +425,10 @@ list on the deploy line governs.
      and Claude decide whether that is a new database on the instance or a new
      instance.
 4. **Load the frozen public read.** Serve the frozen `community_daily` until the
-   first Google Cloud publication, with the evidence date labelled. `in build`
-   (C-IPR).
+   first Google Cloud publication, with the evidence date labelled. The loader
+   and the route are `built` (C-IPR), once staged migration `0065` is promoted;
+   the production load is a call from the import orchestrator, `not built`
+   (E-PT8).
 5. **Run a maintenance pass and resume the maintenance trigger.** Readiness
    goes stale 2 hours after the last pass, and an empty origin reads not ready
    until the first pass. Run one pass by hand, then resume the maintenance
@@ -474,8 +477,10 @@ Preconditions, all of them:
   pending migration, and all six edge-tier rate-limit bindings are live.
 - The contract blob is identical at the edge commit and the origin commit
   (`EDGE_CONTRACT_DRIFT` otherwise).
-- The production-zone IP probe passed and is recorded (OWN-7). The deploy does
-  not check this.
+- The production-zone IP probe passed and is recorded (OWN-7; passed on
+  2026-10-02,
+  [receipt](../receipts/2026-10-02-gcp-edge-ip-probe-production-zone.md)). The
+  deploy does not check this.
 - A fresh private inventory with a pinned sha256 exists.
 
 ```bash
@@ -528,7 +533,9 @@ Read, do not change:
 - The maintenance trigger running and the lifecycle pass fresh.
 - Database load: CPU, memory, connections and disk.
 - One owner-controlled client completing a sync end to end (proposed).
-- The admin overview, once the admin routes are ported (`in build`, C-ADMIN).
+- The admin overview, once the admin routes are served. C-ADMIN's route
+  modules are `built` but not registered in the host until D-CRB, and the
+  overview answers 503 until its missing sources exist (E-ADMIN).
 
 The duration of the observation and the thresholds that justify the brake are
 owner decisions that are not recorded yet. The brake is gcp to fenced
@@ -543,12 +550,15 @@ resume. `owner`.
    paused, and wait for it. Read its content-free receipt line. `ok` with state
    `LOCK_HELD` means another run held the lock and nothing was written; that is
    not a build. Success needs a completed run. The production contract of the
-   job (bounded history loading, output accounting, a time guard) is `in build`
+   job (bounded history loading, output accounting, a time guard) is `built`
    (C-REFRESH); the measured dense run took 66 minutes on a test seed, and the
    production figure is unmeasured.
 2. Confirm the first Google Cloud publication: `GET /api/v1/community/daily`
    serves origin-computed days.
-3. Retire the frozen interim read. `in build` (C-IPR).
+3. Retire the frozen interim read. `built` (C-IPR): the route stops reading
+   the frozen export as soon as any day is published and cannot return to it.
+   Dropping the stored row is a later migration, `not built`, pending the
+   owner's reading of the 90-day rule for frozen copies.
 4. Resume the analytics-refresh trigger under
    [GCP scheduler resume](./gcp-scheduler-resume.md), at the cadence set from
    the measurements. Then set its committed state to `ENABLED`. Tooling:
@@ -642,7 +652,9 @@ noted.
 
 ## Open gaps in tooling and decisions
 
-Status is as of the line at `c80f99b9` and the checklist on 2026-10-02.
+Status is as of the line at `c80f99b9` and the checklist on 2026-10-02. The
+C-IPR, C-ADMIN and C-REFRESH rows were re-marked when this draft merged into
+the line after `95c158ba`.
 
 | Gap | Affects | State |
 |---|---|---|
@@ -651,9 +663,9 @@ Status is as of the line at `c80f99b9` and the checklist on 2026-10-02.
 | Telemetry importer production modes | H.4 | `not built` (D-PT5A) |
 | Import orchestrator and finalize sequencing | H.4 | `not built` (E-PT8) |
 | Read-only pre-fence quiescence query | H.1 | `not built` (E-QUIESCE) |
-| Frozen public read: export format, loader, retirement | H.3, H.4, H.8 | `in build` (C-IPR) |
-| Admin routes at the origin | H.7 | `in build` (C-ADMIN) |
-| Refresh job production contract | H.8 | `in build` (C-REFRESH) |
+| Frozen public read: export format, loader, retirement | H.3, H.4, H.8 | `built` (C-IPR), with staged migration `0065` promoted at the C-SIMP merge; dropping the stored row is `not built` |
+| Admin routes at the origin | H.7 | Route modules `built` (C-ADMIN); registration in the host `not built` (D-CRB); the overview answers 503 until its sources exist (E-ADMIN) |
+| Refresh job production contract | H.8 | `built` (C-REFRESH) |
 | Maintenance job and trigger in the desired state | H.4 | `not built` (D-OPS4) |
 | Scheduler pause-all and resume-all | H.4, H.8 | `not built` (D-OPS3) |
 | Monitoring and alerting, origin-lock check | H.7 | `not built` (E-OPS5) |

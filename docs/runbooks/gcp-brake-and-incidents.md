@@ -27,8 +27,9 @@ commands, and the edge failure table.
 
 ## Status and claim boundary
 
-- **Basis.** The fast-path line `claude/gcp-fastpath-final` at `c80f99b9`, the
-  accepted [edge decision](../decisions/2026-10-01-thin-worker-edge-proxy.md) and
+- **Basis.** The fast-path line `claude/gcp-fastpath-final` at `c80f99b9`
+  (the C-ADMIN markers re-marked when this draft merged into the line after
+  `95c158ba`), the accepted [edge decision](../decisions/2026-10-01-thin-worker-edge-proxy.md) and
   the owner decisions of 2026-10-02.
 - **Verified from source.** The mode matrix, the typed deploy refusals, the
   fence-history proof for the abort, the privacy-marker rule across the brake,
@@ -84,7 +85,9 @@ Prefer the lesser control when it contains the harm:
 - Collection controls stop enrollment, upload registration and processing. They
   never retract a publication, and turning publication off is a reversible
   serving switch that serves the same revisions when turned back on. The
-  control surface at the origin is the admin routes (`in build`, C-ADMIN). The
+  control surface at the origin is the admin routes: C-ADMIN's modules are
+  `built` but not registered in the host until D-CRB, and the console cannot
+  act while the overview answers 503 (E-ADMIN). The
   Cloudflare collection-control operator reads Cloudflare's D1 and does not apply
   after the switch; a Google Cloud equivalent is `not built`.
 - A trigger pause stops a job
@@ -294,11 +297,11 @@ accepted contributions. See
 | Thresholds that justify the brake, the observation period, escalation and notification | Owner decisions, not recorded |
 | Monitoring, alerting and the origin-lock check | `not built` (E-OPS5) |
 | Restore tooling and its rehearsal | `not built` (OPS-7, E-OPS7) |
-| Operator controls for collection containment at the origin | `in build` (C-ADMIN); a Google Cloud operator wrapper is `not built` |
+| Operator controls for collection containment at the origin | Route modules `built` (C-ADMIN; `set_collection_controls` works over the API), registration in the host `not built` (D-CRB), console blocked while the overview answers 503 (E-ADMIN); a Google Cloud operator wrapper is `not built` |
 | Scheduler pause-all and resume-all | `not built` (D-OPS3) |
 | Custody of the do-not-restore list and the erasure intake channel | Open (OA-9), decided after the cutover |
 | Edge live capture and barrier-proof writers | `not built`; no command writes either file |
-| The edge decision's section 15 and the fast-path plan still list the rollback policy as open | The owner answered it on 2026-10-02 (OWN-10); those records predate the answer and are not rewritten |
+| The fast-path plan's minimum cutover sequence and the append-only decision (D5 and its open choices) still describe the post-flip rollback policy as open | The owner answered it on 2026-10-02 (OWN-10), and the edge decision's section 10 records the answer; the other records predate the answer and are not rewritten |
 
 ## Evidence boundary
 

@@ -61,11 +61,13 @@ status: accepted
   changed for the edge. The origin's production composition (CR-6 and CR-7)
   does not exist yet, and the origin still refuses to start without a test
   mode.
-- One observation on Cloudflare's network exists: the owner-authorized address
-  probe of 2026-10-02, from a throwaway `workers.dev` Worker to a temporary
-  echo service in the GCP test project, since deleted
-  ([section 5](#the-cloudflare-network-probe-2026-10-02)). It deployed no part
-  of the edge and does not cover the `tibotattle.com` zone.
+- Two observations on Cloudflare's network exist, both owner-authorized
+  address probes on 2026-10-02 to a temporary echo service in the GCP test
+  project, since deleted: one from a throwaway `workers.dev` Worker
+  ([section 5](#the-cloudflare-network-probe-2026-10-02)), and a rerun from an
+  exact-path route on the `tibotattle.com` zone
+  ([section 5](#the-production-zone-probe-2026-10-02)). Neither deployed any
+  part of the edge.
 
 ## 1. Topology and modes
 
@@ -202,9 +204,10 @@ documentation says otherwise for `CF-Connecting-IP`, and a previous revision
 of this section, relying on it, said that Google receives the raw client
 address on every forwarded request. The observation replaces that statement for the
 placement it covers. The edge's own code sets no value derived from the client
-address. The `tibotattle.com` zone, where the production edge runs, is not yet
-observed, so the gcp switch waits for the same probe from that zone (OD-E6,
-[section 15](#15-open-owner-choices-this-record-does-not-settle)).
+address. The same probe from the `tibotattle.com` zone, where the production
+edge runs, passed later on 2026-10-02
+([below](#the-production-zone-probe-2026-10-02)), which clears OD-E6's gate on
+the gcp switch ([below](#od-e6-recommendation-and-gate)).
 
 ### What Cloudflare documents for the edge's subrequests
 
@@ -269,7 +272,8 @@ the origin" holds: the `x-forwarded-for` that Google delivers carries
 Cloudflare's placeholder, not the visitor's address. The probe does not prove:
 
 - the same for a Worker on the `tibotattle.com` zone. Expected, because the
-  origin is a non-Cloudflare host either way, but unobserved;
+  origin is a non-Cloudflare host either way, but unobserved by this run (the
+  [production-zone probe](#the-production-zone-probe-2026-10-02) covers it);
 - what the token exchange's endpoint receives. It is the same kind of
   subrequest with the same override, but `oauth2.googleapis.com` cannot be
   observed this way;
@@ -281,6 +285,32 @@ Cloudflare's placeholder, not the visitor's address. The probe does not prove:
 - delivery to an IAM-private service. The echo was public; the invoker check
   is not expected to change header delivery, but the probe did not exercise
   it.
+
+### The production-zone probe (2026-10-02)
+
+At about 16:30 UTC on 2026-10-02 the owner re-ran the same probe, following
+the [probe's README](../../apps/worker/scripts/edge-ip-probe/README.md#rerun-it-on-the-production-zone-before-the-first-gcp-deploy),
+from a throwaway Worker on one exact-path route of the `tibotattle.com` zone
+(`workers_dev` off), against a temporary public echo in the GCP test project.
+The production Worker was not touched. The
+[production-zone receipt](../receipts/2026-10-02-gcp-edge-ip-probe-production-zone.md)
+records the run with header names, booleans and token counts only. Both the
+Worker and the echo were deleted afterwards.
+
+- The Worker had the visitor's address in `CF-Connecting-IP`, so the run is
+  valid.
+- The header names that reached the container were identical to the
+  `workers.dev` run's, with no new name. Neither `cf-connecting-ip`,
+  `x-real-ip` nor `true-client-ip` arrived.
+- `x-forwarded-for` held two tokens, including the constant, and not the
+  visitor's address. `forwarded` held four tokens and not the visitor's
+  address. No header contained the visitor's address.
+
+**Result: pass.** From the production zone, with the override, no header
+carrying the visitor's address reaches the origin. The run leaves the rest of
+the list above unproven: the token exchange, the counterfactual without the
+override, what Google's front end receives and does not deliver, and an
+IAM-private service.
 
 ### What the edge's code controls
 
@@ -352,6 +382,14 @@ fallbacks:
 
 No local gate can replace the probe: Miniflare adds none of Cloudflare's
 headers.
+
+**Gate result: passed on 2026-10-02.** The owner's rerun from the
+`tibotattle.com` zone found no visitor address and no new header name reaching
+the origin ([above](#the-production-zone-probe-2026-10-02);
+[receipt](../receipts/2026-10-02-gcp-edge-ip-probe-production-zone.md)). The
+recommendation stands, neither fallback is needed, and the probe no longer
+blocks a gcp deploy. A change to the edge's topology or placement, such as
+option A, needs its own passing probe before a gcp deploy (section 12).
 
 ## 6. Request handling in gcp mode
 
@@ -639,12 +677,16 @@ new owner decision and a reviewed matrix change.
   it does not serve `/api/ready` (finding F8). A gcp deploy therefore cannot
   pass against any fast-path origin. It can pass only once the production
   origin composition (CR-6 and CR-7) serves Worker-shaped health and readiness.
-- **Gated on the production-zone probe (OD-E6).** Lifting F8 does not clear
-  the switch. Until the owner has re-run the address probe from the
-  `tibotattle.com` zone and recorded a pass
-  ([section 5](#od-e6-recommendation-and-gate)), no gcp deploy may run, and the
-  privacy page cannot carry the gcp text (section 12). A failed probe reopens
-  OD-E6's fallbacks. E10 has no code check for this, so it is an owner gate.
+- **Gated on the production-zone probe (OD-E6): passed on 2026-10-02.**
+  Lifting F8 does not clear the switch by itself. Until the owner had re-run
+  the address probe from the `tibotattle.com` zone and recorded a pass
+  ([section 5](#od-e6-recommendation-and-gate)), no gcp deploy could run and
+  the privacy page could not carry the gcp text (section 12). The owner
+  recorded that pass on 2026-10-02
+  ([receipt](../receipts/2026-10-02-gcp-edge-ip-probe-production-zone.md)).
+  A change to the edge's topology or placement reopens the gate, and a failed
+  probe reopens OD-E6's fallbacks. E10 has no code check for this, so it stays
+  an owner gate: the operator confirms the recorded pass before the switch.
 
 ## 12. Privacy-marker rule
 
@@ -661,7 +703,12 @@ new owner decision and a reviewed matrix change.
     Under option B the page must say that Google's front end receives the
     client's network address in a header Cloudflare adds, and that the origin
     discards it before processing. The page must not claim more than the probe
-    showed.
+    showed. The production-zone probe passed on 2026-10-02
+    ([section 5](#the-production-zone-probe-2026-10-02)). It observed the
+    forward to the origin only, not the token exchange with
+    `oauth2.googleapis.com`, so the page's sentence stays scoped to the
+    Google Cloud service: that service does not receive the visitor's network
+    address.
 - The new text carries `data-hosting-topology="cloudflare-edge-gcp-origin"`.
 - A gcp deploy requires a candidate site, built from its own source, whose
   privacy page carries the marker (`EDGE_PRIVACY_PAGE_NOT_CUTOVER` otherwise).
@@ -764,14 +811,6 @@ These are deliberate and accepted with this record:
 - OD-E5: re-derive EP-1, and `EDGE_PRE_ADMISSION_GUARDS`, if production's
   admission call sites or the request-only guards ahead of them change before
   the switch.
-- OD-E6: the client address Google receives
-  ([section 5](#od-e6-recommendation-and-gate)). Recommended: keep the direct
-  `*.run.app` topology with the `x-real-ip` override; no proxied-hostname
-  rework. The 2026-10-02 probe from `workers.dev` found no visitor address
-  reaching the origin. Before the first gcp deploy, the owner re-runs the probe
-  from the `tibotattle.com` zone and records the result, together with the
-  privacy-page text it supports (section 12). A failure reopens option A (a
-  Cloudflare-proxied hostname) and option B (accept and disclose).
 - The HMAC fallback, only if organization policy forbids service-account keys.
 
 ## 16. Documentation owed at the cutover
