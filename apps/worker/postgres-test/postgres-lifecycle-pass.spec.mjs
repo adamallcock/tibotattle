@@ -660,11 +660,27 @@ test("every pre-write conflict refuses with a closed code and writes nothing", {
   const next = BASE_CYCLE + MINUTE;
 
   // The 0064 pins (restore replay and suppression), refused rather than repaired.
+  // The promoted 0064 makes both pins CHECK constraints, so the database
+  // refuses these states first. To prove the pass's own refusal (defense in
+  // depth), the two constraints are lifted in this disposable schema only,
+  // and restored exactly as 0064 defines them before the test continues.
+  for (const assignment of ["restore_replay_complete = false", "restored_participants_suppressed = 2"]) {
+    await assert.rejects(pool.query(`UPDATE ${retention} SET ${assignment}`),
+      (error) => error?.code === "23514", assignment);
+  }
+  await pool.query(`ALTER TABLE ${retention}
+    DROP CONSTRAINT retention_state_restore_replay_complete_check,
+    DROP CONSTRAINT retention_state_restored_participants_suppressed_check`);
   await pool.query(`UPDATE ${retention} SET restore_replay_complete = false`);
   await refusedWithoutWrite(context, next, "LIFECYCLE_RESTORE_PIN_CONFLICT");
   await pool.query(`UPDATE ${retention} SET restore_replay_complete = true, restored_participants_suppressed = 2`);
   await refusedWithoutWrite(context, next, "LIFECYCLE_RESTORE_PIN_CONFLICT");
   await pool.query(`UPDATE ${retention} SET restored_participants_suppressed = 0`);
+  await pool.query(`ALTER TABLE ${retention}
+    ADD CONSTRAINT retention_state_restored_participants_suppressed_check
+      CHECK (restored_participants_suppressed = 0),
+    ADD CONSTRAINT retention_state_restore_replay_complete_check
+      CHECK (restore_replay_complete)`);
 
   // A lease pair nothing on PostgreSQL writes.
   await pool.query(`UPDATE ${retention} SET lease_id = 'synthetic-foreign-lease', lease_expires_at = $1`,
@@ -948,7 +964,8 @@ test("the maintenance Job entry composes the pass against the image manifest and
     PRIMARY_SCHEMA: schema,
     POSTGRES_IAM_USER: "origin-runtime@synthetic-project.iam",
     GCS_BUCKET_NAME: bucket,
-    GCS_QUARANTINE_BUCKET_HISTORY_PROOF: JSON.stringify({ proof }),
+    // OD-2: the closed proof record itself, as OPS-2 renders it (CR-3 parses it).
+    GCS_QUARANTINE_BUCKET_HISTORY_PROOF: JSON.stringify(proof),
     POSTGRES_SCHEDULED_MAINTENANCE_ENABLED: "enabled",
     IDENTITY_LINK_SECRET: "synthetic-identity-link-secret-value-0000000001",
   };

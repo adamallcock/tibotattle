@@ -158,7 +158,10 @@ test("seeded schemas are the rehearsal's names and pass every importer's prefix 
   assert.equal(schemas.target.startsWith(POSTGRES_TYPED_LEGACY_TARGET_SCHEMA_PREFIX), true);
   assert.equal(schemas.control.startsWith(POSTGRES_TYPED_LEGACY_CONTROL_SCHEMA_PREFIX), true);
   assert.equal(schemas.control.startsWith(POSTGRES_TYPED_LEGACY_TARGET_SCHEMA_PREFIX), false);
-  assert.equal(`${schemas.target}_ledger`.length <= 63, true, "the origin's <schema>_ledger fits an identifier");
+  // The origin serves one schema (no ledger pair): the target itself must be
+  // a PostgreSQL identifier.
+  assert.equal(schemas.target.length <= 63, true, "the seeded schema fits an identifier");
+  assert.deepEqual(Object.keys(rehearsal).sort(), ["controlSchema", "schema", "suffix"], "no ledger schema");
   for (const bad of ["short", "ABCDEF12", "fp_483245ad", "0123456789", "../../x", undefined]) {
     assert.throws(() => seededSchemas(bad), (error) => error?.code === "GCP_FASTPATH_SEED_SUFFIX_INVALID");
   }

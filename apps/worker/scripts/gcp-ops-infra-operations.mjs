@@ -1115,6 +1115,10 @@ function loggingOperations(desired, observed) {
 
 /** Why a service or job cannot be rendered yet, or null. */
 function serviceDeferral(desired, observed) {
+  // OD-2: the service renders the bucket's pinned birth proof
+  // (GCS_QUARANTINE_BUCKET_HISTORY_PROOF), so an unborn or unpinned bucket
+  // defers it; the plan also blocks on BUCKET_PROOF_UNPINNED.
+  if (desired.bucket.proof === null) return "BUCKET_PROOF_UNPINNED";
   for (const [name, secret] of Object.entries(desired.secrets)) {
     if (secret.version === null) {
       if (secret.required) return `SECRET_VERSION_UNPINNED:${name}`;

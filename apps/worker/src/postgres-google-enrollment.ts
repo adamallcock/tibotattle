@@ -57,7 +57,6 @@ export interface PostgresGoogleEnrollmentEnvironment extends Env {}
 
 export interface PostgresGoogleEnrollmentDispatchOptions {
   readonly primaryPool: PostgresPool;
-  readonly ledgerPool: PostgresPool;
   readonly schemaOptions?: PostgresSchemaOptions;
   readonly privateOrigin: string;
   readonly env: PostgresGoogleEnrollmentEnvironment;
@@ -350,28 +349,6 @@ async function consumeGoogleProof(
   return linkKey;
 }
 
-async function readIdentityCooldown(
-  ledgerPool: PostgresPool,
-  ledgerSchema: string,
-  digest: string,
-  nowIso: string,
-): Promise<boolean> {
-  const table = qtable(ledgerSchema, "identity_reenrollment_cooldowns");
-  try {
-    return await withPostgresRead(ledgerPool, async (client) => {
-      const result = await client.query(
-        `SELECT 1 FROM ${table}
-          WHERE identity_cooldown_digest = $1 AND retain_until > $2::timestamptz
-          LIMIT 1`,
-        [digest, nowIso],
-      );
-      return result.rows.length > 0;
-    }, { operation: "google_enrollment.ledger_cooldown", statementTimeoutMilliseconds: 5_000 });
-  } catch {
-    throw apiError(503, "BACKEND_STORAGE_UNAVAILABLE");
-  }
-}
-
 async function cooldownDigestForIdentity(
   env: PostgresGoogleEnrollmentEnvironment,
   linkKey: string,
@@ -522,15 +499,20 @@ function enrollmentPayload(
 /**
  * PostgreSQL implementation of the existing Google proof enrollment sink.
  * The Google proof is deleted in its own committed transaction before account
- * continuity, cooldown, or participant writes, matching the Worker's one-use
- * semantics. Only this private Cloud Run test composition registers the route.
+ * continuity or participant writes, matching the Worker's one-use semantics.
+ * Only this private Cloud Run test composition registers the route.
+ *
+ * There is no re-enrollment cooldown read (the append-only decision record
+ * supersedes it; decisions D2 and D6): an identity whose participant was
+ * deleted enrolls as a new participant. The participant row still carries
+ * identity_cooldown_digest, so its shape matches the D1 row the identity
+ * importer carries.
  */
 export function createPostgresGoogleEnrollmentDispatch(
   options: PostgresGoogleEnrollmentDispatchOptions,
 ): (request: Request) => Promise<Response> {
   const {
     primaryPool,
-    ledgerPool,
     privateOrigin,
     env,
     assertAdmissionBindings,
@@ -539,8 +521,6 @@ export function createPostgresGoogleEnrollmentDispatch(
   } = options;
   if (primaryPool === null || typeof primaryPool !== "object"
       || typeof primaryPool.connect !== "function"
-      || ledgerPool === null || typeof ledgerPool !== "object"
-      || typeof ledgerPool.connect !== "function"
       || !validOrigin(privateOrigin)
       || env === null || typeof env !== "object"
       || typeof assertAdmissionBindings !== "function"
@@ -550,7 +530,6 @@ export function createPostgresGoogleEnrollmentDispatch(
   }
   const schemas = createPostgresSchemaConfig(options.schemaOptions);
   const primarySchema = schemas.primarySchema;
-  const ledgerSchema = schemas.ledgerSchema;
   const now = options.now ?? Date.now;
 
   return async function dispatchPostgresGoogleEnrollment(request: Request): Promise<Response> {
@@ -643,7 +622,6 @@ export function createPostgresGoogleEnrollmentDispatch(
       const nowIso = new Date(nowEpoch).toISOString();
       const participants = qtable(primarySchema, "participants");
       const sessions = qtable(primarySchema, "web_sessions");
-      const cooldowns = qtable(primarySchema, "identity_reenrollment_cooldowns");
       const grants = qtable(primarySchema, "enrollment_grants");
       const eligibility = qtable(primarySchema, "participant_community_eligibility");
 
@@ -667,23 +645,6 @@ export function createPostgresGoogleEnrollmentDispatch(
           if (existing && existing.state !== "active") {
             if (existing.state === "deleting") throw apiError(409, "PARTICIPANT_DELETING");
             throw apiError(503, "BACKEND_STORAGE_UNAVAILABLE");
-          }
-          if (existing === null && identityCooldownDigest !== null) {
-            const primaryCooling = await client.query(
-              `SELECT 1 FROM ${cooldowns}
-                WHERE identity_cooldown_digest = $1 AND expires_at > $2::timestamptz
-                LIMIT 1`,
-              [identityCooldownDigest, nowIso],
-            );
-            const ledgerCooling = await readIdentityCooldown(
-              ledgerPool,
-              ledgerSchema,
-              identityCooldownDigest,
-              nowIso,
-            );
-            if (primaryCooling.rows.length > 0 || ledgerCooling) {
-              throw apiError(409, "IDENTITY_REENROLLMENT_COOLDOWN");
-            }
           }
         }
         if (existing === null && mode === "disabled") throw apiError(503, "ENROLLMENT_DISABLED");

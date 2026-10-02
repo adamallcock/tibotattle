@@ -123,7 +123,8 @@ const RUNTIME_ENVIRONMENT_NAMES = Object.freeze([
   "K_SERVICE", "PRIMARY_DATABASE", "PRIMARY_SCHEMA", "PRIMARY_INSTANCE_CONNECTION_NAME",
   "LEDGER_DATABASE", "LEDGER_SCHEMA", "LEDGER_INSTANCE_CONNECTION_NAME", "POSTGRES_IAM_USER",
   "POSTGRES_SOURCE_ID", "POSTGRES_SOURCE_NAMESPACE", "POSTGRES_RATE_LIMIT_SECRET",
-  "ENVELOPE_PUBLIC_JWK", "ENVELOPE_PRIVATE_JWK", "GCS_BUCKET_NAME", "GCS_ERASURE_BUCKET_HISTORY_PROOF",
+  "ENVELOPE_PUBLIC_JWK", "ENVELOPE_PRIVATE_JWK", "GCS_BUCKET_NAME", "GCS_QUARANTINE_BUCKET_HISTORY_PROOF",
+  "GCS_ERASURE_BUCKET_HISTORY_PROOF",
   "ENVIRONMENT", "ENROLLMENT_MODE", "IDENTITY_LINK_SECRET", "IDENTITY_LINK_SECRET_VERSION",
   "GOOGLE_OIDC_CLIENT_ID", "GOOGLE_OIDC_CLIENT_SECRET", "SIGN_IN_START_MAX_PER_MINUTE",
   "ACCOUNTLESS_ENROLLMENT_MODE", "ACCOUNTLESS_OWNERSHIP_MODE", "SOURCE_CONTENT_DIGEST",
@@ -159,8 +160,8 @@ async function freePort() {
 }
 
 /**
- * A fastpath-test origin over a fresh, fully migrated "<schema>" and
- * "<schema>_ledger" pair with operational collection controls and the typed
+ * A fastpath-test origin over a fresh, fully migrated "<schema>" (no
+ * deletion-ledger schema: D4, SIMP-4) with operational collection controls and the typed
  * v1/v1.1 targets initialized (as the intake spec seeds them). With edge, the
  * runtime is served on 127.0.0.1 behind EDGE_ORIGIN_MODE=edge-test; without,
  * requests go to runtime.postgresTestDispatch on the loopback origin.
@@ -170,7 +171,6 @@ async function withOrigin({ edge, environment = {} }, run) {
   const socket = await localSocket();
   const base = new pg.Pool(localPoolOptions(socket, 4, "pg-origin-edge-test"));
   const primarySchema = `tibotattle_fastpath_edge_${randomBytes(5).toString("hex")}`;
-  const ledgerSchema = `${primarySchema}_ledger`;
   const created = [];
   const pools = [];
   let close = null;
@@ -182,12 +182,11 @@ async function withOrigin({ edge, environment = {} }, run) {
     );
     assert.equal(server.rows[0]?.address, null, "qualification requires the local Unix socket");
     assert.equal(Math.floor(server.rows[0].version / 10_000), 17, "the disposable socket must be PostgreSQL 17");
-    for (const schema of [primarySchema, ledgerSchema]) {
+    for (const schema of [primarySchema]) {
       await base.query(`CREATE SCHEMA "${schema}"`);
       created.push(schema);
     }
     await applyPostgresMigrations({ role: "primary", schema: primarySchema, pool: base });
-    await applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool: base });
     const t = (name) => `"${primarySchema}"."${name}"`;
     await base.query(`UPDATE ${t("collection_controls")}
         SET revision=2, control_state='operational', enrollment_enabled=true, upload_registration_enabled=true,
@@ -225,7 +224,7 @@ async function withOrigin({ edge, environment = {} }, run) {
       ENVELOPE_PUBLIC_JWK: keys.publicText,
       ENVELOPE_PRIVATE_JWK: keys.privateText,
       GCS_BUCKET_NAME: bucket,
-      GCS_ERASURE_BUCKET_HISTORY_PROOF: JSON.stringify({
+      GCS_QUARANTINE_BUCKET_HISTORY_PROOF: JSON.stringify({
         bucket, bucketGeneration: "1", bucketMetageneration: "1", softDeleteRetentionDurationSeconds: "0",
       }),
       ACCOUNTLESS_ENROLLMENT_MODE: "enabled",

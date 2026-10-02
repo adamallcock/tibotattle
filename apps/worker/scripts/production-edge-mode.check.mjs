@@ -240,12 +240,20 @@ function workerHealth(sourceCommit) {
   return { status: "ok", mode: "synthetic-and-private-telemetry", deployment: { sourceCommit } };
 }
 
-/** The GCP fast-path test origin's health shape (cloud-run/postgres-test-dispatch.mjs). */
+/**
+ * The GCP fast-path test origin's health body as createPostgresTestHealthDispatch
+ * (cloud-run/postgres-test-dispatch.mjs) serves it: gcp-postgres-test-health-v2,
+ * the primary receipt only, in every test mode (LEAD-SIMP).
+ */
 const FASTPATH_TEST_HEALTH = Object.freeze({
-  schemaVersion: "gcp-postgres-test-health-v1",
+  schemaVersion: "gcp-postgres-test-health-v2",
   scope: "postgres_schema_and_migrations_only",
   status: "ready",
   workerApplicationReady: false,
+  checks: Object.freeze({
+    postgresMajor: 17,
+    primaryMigrationReceipt: Object.freeze({ status: "current", version: 64 }),
+  }),
 });
 
 function originFetch({ health = workerHealth(ORIGIN_COMMIT), ready = { status: "ready" }, marked = true, seen = [] } = {}) {

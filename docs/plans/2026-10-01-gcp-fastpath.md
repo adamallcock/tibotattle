@@ -116,7 +116,8 @@ The production refusal stays in place until cutover. Two new seams:
    a path outside the route registry, fails at startup.
 2. **Envelope-version handler registry** inside the PostgreSQL contributions
    handler. The shared preamble stays where it is: bearer auth,
-   upload-authorization claim, tombstone check, transport floor and receipt.
+   upload-authorization claim, transport floor and receipt (the tombstone
+   check left with the deletion ledger, LEAD-SIMP).
    v1.2 is registered tonight. The v1.1, v1.0 and v0.1 handlers and the
    upload-authorization formats plug in as registry entries, not as new routes.
 
@@ -124,8 +125,10 @@ The production refusal stays in place until cutover. Two new seams:
 
 - One Cloud SQL PostgreSQL 17 instance (decision D4).
 - The `primary` role holds everything, including the new analytics tables.
-- The frozen `ledger` role is an interim second schema on the same instance
-  until the SIMP-4 code removes it. There is no second instance.
+- There is no `ledger` role: LEAD-SIMP removed it, and the canonical runner
+  refuses it (`POSTGRES_MIGRATION_ROLE_INVALID`). The frozen ledger migration
+  files stay on disk, read by nothing, until owner action OA-4. There is no
+  second instance.
 
 ### Analytics job
 
@@ -536,7 +539,7 @@ still needs its own qualification.
 | Non-effective sources | Depends on OD-4 | v1-only, mixed and v0.2 graph paths, needed only if the production check finds such owners | A parity claim for those owners |
 | Memo mode | M (estimate) | The digest-keyed owner-day memo, the dirty-owner cursor and the nightly full sweep, measured on real data | The cutover cadence (decision D3) |
 | OPS-2 to OPS-5, with OPS-10 | L | Built locally as dry runs on `claude/gcp-fp-w2-integration` ([receipt](../receipts/2026-10-02-gcp-wave2-integration.md)); nothing was built, migrated, rolled or applied in any project. OPS-2 renders, reads back, plans and applies (create and update only, under `--authorize=<planDigest>`) one Cloud SQL PostgreSQL 17 instance with no ledger instance, the service and its IAM, the secrets, the bucket birth with its proof, the runtime's conditional `tibotattleQuarantineStore` bucket grant, the `production-migrate` job and the analytics-refresh job in the production refresh-job contract (dense profile until MEAS-3; C-INFRA, [receipt](../receipts/2026-10-02-gcp-c-infra.md)). The desired state is committed (`apps/worker/cloud-run/infra/`): staging in the shared test project, production with OWN-5 placeholders. Apply creates the trigger and pauses it before granting the scheduler the job, never resumes it, and `gcp-infra.mjs scheduler-probe` signals a resumed trigger paused for 6 h or more. The verifier account carries the operator's token-creator grant once the owner names the operator. OPS-10 is the primary-only production migration job (`dist/production-migrations.mjs`, whose `PRODUCTION_MIGRATION_JOB` OPS-2 imports) and the rollout CLI (preflight, build, migrate, roll), which reads its target from OPS-2's `rolloutTarget(environment)` and its readback from `gcp-infra.mjs readback --require-clean`. Its expand-and-contract review (`CONTRACT_MIGRATIONS`) covers the SQL a serving previous revision issues, not that revision's receipt fence: with today's exact-history fence every migrate, 0063 included, refuses the previous revision's storage-gated routes (503) until the roll, so `secondsSinceMigrate` is a write-outage window until CR-7 provides a fence that admits a reviewed expand-only extension (CR-7 row). One runtime-grant policy (`cloud-run/postgres-runtime-grants.mjs`) serves the test migrations, OPS-10 and `scripts/gcp-test-database.mjs`. OPS-2's readback has never parsed real `gcloud` output. Still to do: OPS-3 pause-all and resume-all, OPS-4 probes after the SIMP residue, OPS-5 monitoring after CR-6 and CR-7 | Production origin deploy and operation |
-| SIMP-0, SIMP-1 and SIMP-4 code | M (estimate) | The 2026-09-26 briefs. SIMP-0 items 7 to 9 (the ledger removed from CR-3, EP-7 and OPS-1) landed with W2-INFRA. The rest is one lead-run change: a forward primary migration numbered after 0063 (the lead assigns the number at landing) and proposed as `NNNN_append_only_residue.sql`, a name that awaits the owner's confirmation (wave-3 SIMP OD-1; OPS-10's guard enforces the proposed suffix and fails closed, so another name changes `SIMP_RESIDUE_MIGRATION_SUFFIX` and its checks in the same change), rather than an edit of promoted 0053 or ledger 0007, which the disposable test database has applied; the five online-erasure modules and their specs, the ledger authority and every `hasPostgresDeletionTombstone` call site, the ledger jobs and transfer, the PT-1 ledger stages, CR-1 FC-11 and the ledger pool. In the same change the migration is reviewed into OPS-10's `CONTRACT_MIGRATIONS` | Every non-scratch production migrate: OPS-10 refuses `PRODUCTION_SIMP_RESIDUE_MISSING` until it lands. CR-6, CR-7, RD-2, RD-3, OPS-4 and PT-8-lite also follow it |
+| SIMP-0, SIMP-1 and SIMP-4 code | M | Landed locally on `claude/gcp-fp-c-simp` (C-SIMP, 2026-10-02; [receipt](../receipts/2026-10-02-gcp-c-simp.md)) and reaches the final line through `claude/gcp-fp-c-simp-recon`, which reconciles it with C-ADMIN, C-MAINT and C-REFRESH (C-SIMP-RECON, [receipt](../receipts/2026-10-02-gcp-c-simp-recon.md)). C-SIMP merges LEAD-SIMP's `claude/gcp-fp-w3-simp` with the owner's answers: the forward primary migration `0064_append_only_residue.sql` (name and number final, OD-1) is reviewed into OPS-10's `CONTRACT_MIGRATIONS`; the five online-erasure modules, the ledger authority and every tombstone call site, the ledger jobs and transfer, the PT-1 ledger stages, CR-1 FC-11 and the ledger pool are gone; the quarantine bucket's birth proof is re-admitted as `GCS_QUARANTINE_BUCKET_HISTORY_PROOF` in CR-3, EP-7 and OPS-2 (OD-2); maintenance reports the erasure items as constant true, marked not applicable, with no ledger key (OD-4); the A2 deployed-test tooling and the root GCP journey are retired, with no cloud resource deleted (OD-6, OA-4 later). The Variant B offline purge (PURGE-1) deletes the participant's objects first, then the participant. The `accountless-retention` stage (OD-3) and the analytics-history transfer scripts (OD-5) stay | OPS-10 no longer refuses `PRODUCTION_SIMP_RESIDUE_MISSING` for an image built from this line. CR-6, CR-7, RD-2, RD-3, OPS-4 and PT-8-lite follow it |
 | R2-to-GCS copy (PT-7, reduced) | M | A post-flip copy from the frozen R2 bucket using the sealed reference set; pending quarantine objects empty or mapped at import | Decommissioning R2, not the flip |
 | Production resources | S to M of owner time | One Cloud SQL PostgreSQL 17 instance (estimate: 2 to 4 vCPU, 8 to 16 GB, 50 GB or more SSD, point-in-time recovery, zonal); a private GCS bucket; runtime, migrator, scheduler, builder, edge-invoker and verifier service accounts; Artifact Registry; Secret Manager populated from the owner's custody. The identity-link secret must match the sealed pin and the envelope keys must be identical. OPS-2 produces the plan and its digest for the owner to apply; a disabled managed account or a custom role not at GA blocks apply. A rollout needs a verifier account the operator can impersonate | Every production step. Owner-run |
 | OPS-9: privacy and disclosure | S | Privacy page, `SECURITY.md`, scoped guidance and the supersession notes on accepted decisions, in the cutover commit only | The flip |
@@ -951,7 +954,7 @@ is a GCP deploy, a Cloudflare deploy, a production migration or a cutover.
 |---|---|
 | The 2026-09-27 SIMP-0, SIMP-1 and SIMP-4 briefs | They keep the erasure, ledger, tombstone, cooldown and restore-replay machinery that the 2026-09-26 decisions remove (OD-2) |
 | Analytics ports AN-2 to AN-8, GB-2 to GB-8, HX-1, HX-2, HX-3, HX-5, HX-6, VR-5, VR-6, OJ-6, AR-2 and probably AA-4 | The single `analytics-refresh` job over vendored kernels replaces them, and history is recomputed |
-| The separate deletion-ledger instance, the ledger 0007 transfer, the ledger and analytics-history transfer scripts, the staged 0053 erasure fences and the online erasure modules | Decisions D1 and D2 remove them. Deferred, not deleted tonight; the ordering constraint in D6 applies |
+| The separate deletion-ledger instance, the ledger 0007 transfer, the ledger and analytics-history transfer scripts, the staged 0053 erasure fences and the online erasure modules | Decisions D1 and D2 remove them. Removed from the code by C-SIMP on 2026-10-02 (0064 drops the fences, with the OPS-10 guard enforcing D6's order), except the analytics-history transfer scripts, which a later cleanup removes (OD-5). The test ledger instance and the frozen ledger migration files wait for OA-4 |
 | Register rows built for D1 rescans and Worker statement meters, analytics D1 migrations 0030 to 0035 and the Codex day catalogs | Cloud Run Jobs over PostgreSQL recompute exactly without them |
 | The memo, the worker pool and task sharding | Measured optimizations. The memo is required before the cutover cadence |
 | The v1-only, mixed and v0.2 graph paths | D1-coupled orchestration rather than pure kernels; ported next via the HX-4 oracle. Recorded refusals tonight. (The dense-owner native path was ported later on 2026-10-01, OD-11) |
@@ -988,8 +991,10 @@ is a GCP deploy, a Cloudflare deploy, a production migration or a cutover.
   production publisher semantics.
 - Vendored kernels are pinned to `d43c8f92` blob digests. Later production
   kernel changes must be re-vendored deliberately before cutover parity.
-- Promoting staged migrations, including 0053 and ledger 0007, is safe only on
-  disposable databases until the SIMP work lands.
+- The SIMP residue (0064) refuses a schema that still holds erasure
+  residue, so a database that applied 0053's fences with real rows needs a
+  reviewed decision before its next migrate (OD-7 recreates the disposable
+  `tibotattle_fastpath`). The A2 test schema stays at 0063 (OD-6).
 - The local runtime differs from the image. The dist bundle and the A-2 and A-3
   specs run under Node 22.16.0; the importers (Node 22.13 or later) and the
   HX-4 adapter (Node 24.10 or later) stay out of the image.

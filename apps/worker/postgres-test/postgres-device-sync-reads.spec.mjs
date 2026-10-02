@@ -66,7 +66,7 @@ function mockPoolFor(rows, queries = []) {
 test("manifest range accepts 31 inclusive days and rejects invalid or wider ranges before connecting", async () => {
   const queries = [];
   const pool = mockPoolFor([], queries);
-  const schema = { primarySchema: "sync_reads_test", ledgerSchema: "sync_reads_ledger" };
+  const schema = { primarySchema: "sync_reads_test" };
   const manifest = await syncReads.readPostgresDeviceSyncManifest(
     pool, "synthetic-owner", "synthetic-device", "2026-01-01", "2026-01-31", { schema },
   );
@@ -111,7 +111,7 @@ test("manifest range accepts 31 inclusive days and rejects invalid or wider rang
 });
 
 test("state and manifest fail closed when their bounded chunk result exceeds the D1 caps", async () => {
-  const schema = { primarySchema: "sync_reads_test", ledgerSchema: "sync_reads_ledger" };
+  const schema = { primarySchema: "sync_reads_test" };
   const manifestRows = Array.from({ length: 10_001 }, () => ({
     chunk_day: "2026-01-01",
     stream: "usage",
@@ -141,7 +141,7 @@ test("state and manifest fail closed when their bounded chunk result exceeds the
   await assert.rejects(
     syncReads.readPostgresDeviceSyncState(
       statePool, "synthetic-owner", "synthetic-device", {
-        schema: { primarySchema: schema.primarySchema, ledgerSchema: schema.ledgerSchema },
+        schema: { primarySchema: schema.primarySchema },
       },
     ),
     (error) => error?.status === 503 && error?.code === "LIFECYCLE_BOUNDS_EXCEEDED",
@@ -246,7 +246,7 @@ test("PostgreSQL 17 state and manifest match the D1 cursor contract and isolate 
     connectionTimeoutMillis: 5_000,
   });
   const schema = `sync_read_${randomBytes(5).toString("hex")}`;
-  const options = { schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` } };
+  const options = { schema: { primarySchema: schema } };
   const nowEpoch = Date.parse("2026-09-25T12:00:00.000Z");
   const now = new Date(nowEpoch).toISOString();
   const owner = "synthetic-sync-owner";
@@ -408,7 +408,7 @@ test("PostgreSQL 17 state and manifest match the D1 cursor contract and isolate 
       await assert.rejects(
         syncReads.readPostgresDeviceSyncManifest(
           pool, owner, device, "2026-09-24", "2026-09-24", {
-            schema: { primarySchema: notReadySchema, ledgerSchema: `${notReadySchema}_ledger` },
+            schema: { primarySchema: notReadySchema },
           },
         ),
         (error) => error?.code === "unavailable"

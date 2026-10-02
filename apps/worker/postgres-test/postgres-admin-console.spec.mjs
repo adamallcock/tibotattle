@@ -2,10 +2,14 @@
 // (GCP, C-ADMIN), with parity against the d43c8f92 Worker's own DTO code.
 //
 // Parity method: the same synthetic, content-free fixture is written to
-// PostgreSQL (the promoted primary and ledger chains) and to SQLite files that
-// carry the Worker's D1 schemas (the production primary directories, the
-// analytics database and the deletion ledger), opened through the reviewed
-// D1 adapter (cloud-run/sealed-sqlite-d1-adapter.mjs). The expected body is
+// PostgreSQL (the promoted primary chain) and to SQLite files that carry the
+// Worker's D1 schemas (the production primary directories, the analytics
+// database and the deletion ledger), opened through the reviewed D1 adapter
+// (cloud-run/sealed-sqlite-d1-adapter.mjs). The PostgreSQL line has no
+// deletion ledger (decisions D2, D4 and D6 of 2026-09-26): the overview's
+// deletionLedger block has no PostgreSQL reader, so the spec injects a
+// synthetic source (the Worker's own block over the D1 fixture) wherever the
+// composed overview must answer 200. The expected body is
 // computed by the Worker's code: the vendored d43c8f92 readAdminOverview and
 // setCollectionControls (vendor/analytics-d43c8f92, byte copies), and this
 // checkout's readGithubDistributionSnapshot, readDistributionAnalytics and
@@ -66,7 +70,6 @@ let vite;
 let m;
 let pool;
 let schema;
-let ledgerSchema;
 let scratch;
 let d1;
 let d1Handles = [];
@@ -368,7 +371,9 @@ const SINGLETONS = Object.freeze({
     singleton: 1, schema_version: "backend-retention-v0.1", state: "completed",
     last_started_at: "2026-10-02T11:00:00.000Z", last_completed_at: "2026-10-02T11:00:05.000Z",
     maintenance_run_at: "2026-10-02T11:00:00.000Z", quarantine_cutoff_at: "2026-10-02T10:00:00.000Z",
-    quarantine_objects_deleted: 2, quarantine_retention_complete: 1, restored_participants_suppressed: 1,
+    // 0064 pins restored_participants_suppressed to 0 (no restore suppression
+    // on the append-only line); both sides carry the same row.
+    quarantine_objects_deleted: 2, quarantine_retention_complete: 1, restored_participants_suppressed: 0,
     restore_replay_complete: 1, failure_code: null,
   },
   quarantine_reconciliation_state: {
@@ -404,7 +409,6 @@ async function seedPostgres() {
       if (table === "deletion_tombstones") continue;
       for (const row of rows) await pgInsert(client, table, row);
     }
-    for (const row of FIXTURE.deletion_tombstones) await pgInsert(client, "deletion_tombstones", row, ledgerSchema);
     // Explicit fixture ids: move the identity sequences past them, as D1's AUTOINCREMENT does.
     for (const table of ["admin_action_audit", "diagnostic_error_events"]) {
       await client.query(`SELECT setval(pg_get_serial_sequence($1, 'id'), (SELECT max(id) FROM ${q(table)}))`,
@@ -494,7 +498,8 @@ function sourcesFrom(expected) {
   return {
     syntheticContributions: async () => expected.counts.contributions.synthetic,
     historicalPublication: async () => expected.historicalPublication,
-    deletionLedger: () => m.overview.readPostgresAdminDeletionLedger(pool, ledgerSchema),
+    // Synthetic injected source: no PostgreSQL ledger exists (OWN-17 question 1).
+    deletionLedger: async () => expected.deletionLedger,
   };
 }
 
@@ -510,11 +515,8 @@ before(async () => {
   assert.match(version.rows[0]?.version ?? "", /^PostgreSQL 17\./u);
   const suffix = randomBytes(5).toString("hex");
   schema = `${STREAM_PREFIX}_p_${suffix}`;
-  ledgerSchema = `${STREAM_PREFIX}_l_${suffix}`;
   await pool.query(`CREATE SCHEMA "${schema}"`);
-  await pool.query(`CREATE SCHEMA "${ledgerSchema}"`);
   await applyPostgresMigrations({ role: "primary", schema, pool });
-  await applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool });
   scratch = await realpath(await mkdtemp(join(tmpdir(), "c-admin-d1-")));
   await seedPostgres();
   d1 = await seedD1();
@@ -525,7 +527,6 @@ after(async () => {
   if (scratch) await rm(scratch, { recursive: true, force: true });
   if (pool) {
     if (schema) await pool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
-    if (ledgerSchema) await pool.query(`DROP SCHEMA IF EXISTS "${ledgerSchema}" CASCADE`);
     await pool.end();
   }
   await vite?.close();
@@ -927,12 +928,9 @@ test("the composed console serves the routes over PostgreSQL with the root's ide
     env: ENV,
     // No analytics pool: the composition binds the analytics role to the
     // primary pool, where 0059 places analytics_v2.
-    pools: { primary: pool, ledger: pool },
-    schemaOptions: { primarySchema: schema, ledgerSchema },
-    overviewSources: {
-      syntheticContributions: async () => expected.counts.contributions.synthetic,
-      historicalPublication: async () => expected.historicalPublication,
-    },
+    pools: { primary: pool },
+    schemaOptions: { primarySchema: schema },
+    overviewSources: sourcesFrom(expected),
   });
   const dispatch = async (routeId, request, identity = OWNER) => store.dispatch(request, {
     requestId: REQUEST_ID, routeId, ...(identity === null ? {} : { adminIdentityKey: identity }),
@@ -951,23 +949,24 @@ test("the composed console serves the routes over PostgreSQL with the root's ide
   const health = await dispatch("admin_database_health", new Request(`${ORIGIN}/api/v1/admin/database-health`));
   const healthBody = await health.json();
   assert.equal(health.status, 200);
+  // There is no ledger pool (LEAD-SIMP retired the ledger), so the closed DTO
+  // reports deletion_ledger not_configured and the status stays degraded;
+  // how a retired role is represented is OWN-17 question 3.
   assert.deepEqual(healthBody.databases.map((row) => [row.role, row.status]),
-    [["primary", "reachable"], ["deletion_ledger", "reachable"], ["analytics", "reachable"]]);
-  assert.equal(healthBody.status, "available");
+    [["primary", "reachable"], ["deletion_ledger", "not_configured"], ["analytics", "reachable"]]);
+  assert.equal(healthBody.status, "degraded");
   // One database holds both roles, so they report the same size.
   assert.equal(healthBody.databases[2].databaseBytes, healthBody.databases[0].databaseBytes);
-  // Without a ledger pool (after LEAD-SIMP retires the ledger) the closed DTO
-  // reports deletion_ledger not_configured, so the status stays degraded;
-  // how a retired role is represented is an open owner question. An explicit
-  // analytics pool that fails is reported as failing, never replaced by primary.
+  // An explicit analytics pool that fails is reported as failing, never
+  // replaced by primary.
   const failing = { connect: async () => { throw new Error("synthetic"); } };
   for (const [pools, statuses] of [
     [{ primary: pool }, ["reachable", "not_configured", "reachable"]],
-    [{ primary: pool, ledger: pool, analytics: failing }, ["reachable", "reachable", "unavailable"]],
+    [{ primary: pool, analytics: failing }, ["reachable", "not_configured", "unavailable"]],
   ]) {
     const body = await m.adminConsole.createAdminConsoleAdapters({
       requestContext: store.accessor, clock: () => NOW_MS, env: ENV, pools,
-      schemaOptions: { primarySchema: schema, ledgerSchema },
+      schemaOptions: { primarySchema: schema },
     }).readDatabaseHealth();
     assert.deepEqual(body.databases.map((row) => row.status), statuses);
     assert.equal(body.status, "degraded");

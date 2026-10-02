@@ -202,8 +202,7 @@ test("postgres-test-dispatch.mjs pins: public origin, session cookie name and Up
   const pool = { connect() { throw new Error("no connection at construction"); } };
   const health = (privateOrigin) => testDispatch.createPostgresTestHealthDispatch({
     primaryPool: pool,
-    ledgerPool: { connect: pool.connect },
-    schemaOptions: { primarySchema: "tibotattle_fastpath_check", ledgerSchema: "tibotattle_fastpath_check_ledger" },
+    schemaOptions: { primarySchema: "tibotattle_fastpath_check" },
     expectedMigrations: runtimeSchema.POSTGRES_RUNTIME_MIGRATIONS,
     privateOrigin,
   });
@@ -380,10 +379,13 @@ test("createRuntime refuses edge-test outside fastpath-test before any pool exis
   try {
     // No test mode: the production request path is still refused first.
     await withEnv(localEnv(43005), "POSTGRES_WORKER_REQUEST_PATH_UNSUPPORTED", "no test mode");
-    for (const testMode of ["health-only", "health-and-v12-day-manifest", "cloud-run-iam"]) {
+    for (const testMode of ["health-only", "health-and-v12-day-manifest"]) {
       await withEnv({ ...localEnv(43005), POSTGRES_TEST_HTTP_MODE: testMode },
         "EDGE_TEST_ORIGIN_MODE_REQUIRES_FASTPATH_TEST", testMode);
     }
+    // The retired cloud-run-iam mode (OD-6) is refused as a mode first.
+    await withEnv({ ...localEnv(43005), POSTGRES_TEST_HTTP_MODE: "cloud-run-iam" },
+      "POSTGRES_TEST_HTTP_MODE_INVALID", "cloud-run-iam");
     await withEnv({ ...localEnv(43005, { EDGE_ORIGIN_MODE: "cloudflare-worker-iam" }),
       POSTGRES_TEST_HTTP_MODE: "fastpath-test" }, "EDGE_TEST_ORIGIN_MODE_INVALID", "production value");
     await withEnv({ ...localEnv(43005, { HOST: "0.0.0.0" }), POSTGRES_TEST_HTTP_MODE: "fastpath-test" },
@@ -1045,8 +1047,17 @@ test("the direct deploy variant renders an env readEdgeTestOriginConfiguration a
     { host: "0.0.0.0", port: 8080, hostOrigin: mode.EDGE_TEST_CLOUD_ORIGIN, cloud: true });
   assert.equal(configuration.audience, mode.EDGE_TEST_CLOUD_ORIGIN);
   assert.equal(configuration.invokerServiceAccount, deploy.FASTPATH_TEST.journeyServiceAccount);
-  // The fast-path cloud pins still apply to the same env.
-  assert.equal(fastpathMode.fastpathTestDatabaseConfig(env).primary.database, deploy.FASTPATH_TEST.database);
+  // The fast-path cloud pins still apply to the same env. The deploy script
+  // (a dense-workstream file) still renders the retired LEDGER_* settings,
+  // which the primary-only origin refuses (LEAD-SIMP); stripping them is a
+  // post-dense follow-up in scripts/gcp-fastpath-test-deploy.mjs.
+  const renderedLedgerSettings = Object.keys(env).filter((name) => name.startsWith("LEDGER_"));
+  if (renderedLedgerSettings.length > 0) {
+    assertRefused(() => fastpathMode.fastpathTestDatabaseConfig(env), "POSTGRES_FASTPATH_TEST_SCHEMA_INVALID",
+      "a rendered LEDGER_ setting");
+  }
+  const primaryOnly = Object.fromEntries(Object.entries(env).filter(([name]) => !name.startsWith("LEDGER_")));
+  assert.equal(fastpathMode.fastpathTestDatabaseConfig(primaryOnly).primary.database, deploy.FASTPATH_TEST.database);
   // The deploy recognises this mode by the same value, and gives it env.production's admission settings.
   assert.equal(deploy.EDGE_TEST_ORIGIN_MODE, mode.EDGE_TEST_ORIGIN_MODE);
   for (const [name, value] of deploy.edgeTestProductionEnv()) assert.equal(env[name], value, name);

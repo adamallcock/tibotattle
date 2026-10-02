@@ -438,7 +438,7 @@ test("readers render ms-Z instants under a hostile session and return null for a
 }, async () => withSchema(async ({ pool, schema, table }) => {
   const lifecycle = await workerModule(MODULE);
   const { withPostgresRead } = await workerModule(CLIENT_MODULE);
-  const options = { primarySchema: schema, ledgerSchema: `${schema}_ledger` };
+  const options = { primarySchema: schema };
   const readBoth = () => inHostileTransaction(pool, async (client) => ({
     retention: await lifecycle.readPostgresRetentionState(client, options),
     reconciliation: await lifecycle.readPostgresQuarantineReconciliationState(client, options),
@@ -572,7 +572,7 @@ test("readers throw StateShapeError for values outside the contract, including o
   skip: SKIP, timeout: 120_000,
 }, async () => withSchema(async ({ pool, schema, table, scratch }) => {
   const lifecycle = await workerModule(MODULE);
-  const live = { primarySchema: schema, ledgerSchema: `${schema}_ledger` };
+  const live = { primarySchema: schema };
   const read = (reader, options) => inHostileTransaction(pool, (client) => lifecycle[reader](client, options));
   const shapeError = (relation, field) => (error) => {
     assert.ok(error instanceof lifecycle.StateShapeError, `expected StateShapeError, got ${error?.name}`);
@@ -611,7 +611,7 @@ test("readers throw StateShapeError for values outside the contract, including o
     [copy],
   );
   assert.equal(unchecked.rows[0].constraints, 0, "the scratch copy has no CHECK or key constraints");
-  const scratchOptions = { primarySchema: copy, ledgerSchema: `${copy}_ledger` };
+  const scratchOptions = { primarySchema: copy };
   const seedRetention = () => pool.query(
     `INSERT INTO ${table("retention_state", copy)} (singleton) VALUES (1)`,
   );

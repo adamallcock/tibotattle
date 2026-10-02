@@ -12,10 +12,11 @@
 //
 // As on Cloud SQL, a migrator that is not a superuser (a LOGIN member of a
 // NOLOGIN cloudsqlsuperuser stand-in with CREATEDB and CREATEROLE) owns a
-// fresh database, migrates a primary and a ledger schema there with the
-// production runner and runs the routine. The spec shows the runtime role
-// refused (42501) under the pre-fix grant, then executes both functions as
-// the runtime role after the routine; it fails without the fix. The
+// fresh database, migrates a primary schema there (there is no deletion
+// ledger role: D4, SIMP-4) with the production runner and runs the routine.
+// The spec shows the runtime role refused (42501) under the pre-fix grant,
+// then executes both functions as the runtime role after the routine; it
+// fails without the fix. The
 // operator-only entrypoints stay refused, a stray direct grant on one is
 // reset, and a privilege the reset cannot remove fails the read-back closed.
 //
@@ -100,7 +101,6 @@ test("PG17 the runtime role executes the owner-journal functions only through th
   const roles = { group: `runtime_grants_cloudsqlsuperuser_${tag}`, migrator: `runtime_grants_migrator_${tag}` };
   const database = `runtime_grants_${tag}`;
   const primary = `runtime_grants_primary_${tag}`;
-  const ledger = `runtime_grants_ledger_${tag}`;
   const admin = connect(endpoint.user, endpoint.database, "pg-test-runtime-grants-admin");
   const created = { roles: [], database: false, runtime: false };
   const lock = await admin.connect();
@@ -131,7 +131,7 @@ test("PG17 the runtime role executes the owner-journal functions only through th
     const session = await migrator.query(`SELECT session_user::text AS login, rolsuper FROM pg_catalog.pg_roles
       WHERE rolname = session_user`);
     assert.deepEqual(session.rows[0], { login: roles.migrator, rolsuper: false });
-    for (const [migrationRole, schema] of [["primary", primary], ["ledger", ledger]]) {
+    for (const [migrationRole, schema] of [["primary", primary]]) {
       await migrator.query(`CREATE SCHEMA "${schema}"`);
       await applyPostgresMigrations({ role: migrationRole, schema, pool: migrator });
     }
@@ -157,7 +157,8 @@ test("PG17 the runtime role executes the owner-journal functions only through th
     // After: the routine, run by the migrator, grants exactly the runtime
     // functions and reads them back.
     await grantAndVerifyTestRuntimePrivileges(migrator, "primary", primary);
-    await grantAndVerifyTestRuntimePrivileges(migrator, "ledger", ledger);
+    await assert.rejects(grantAndVerifyTestRuntimePrivileges(migrator, "ledger", primary),
+      (error) => error?.code === "POSTGRES_TEST_MIGRATIONS_ROLE_INVALID", "the retired ledger role is refused");
     for (const fn of TEST_RUNTIME_PRIMARY_FUNCTIONS) {
       assert.equal(await runtimeCanExecute(migrator, primary, fn), true, fn.name);
     }

@@ -1,13 +1,12 @@
 // W2-SEAL PostgreSQL 17 harness: a registered PT-1 production transfer
 // target on the local cluster. Test-only.
 //
-// Each target is a dedicated primary database and an interim ledger database
-// (w2_seal_*; decision D4 keeps the ledger role on the same instance until
-// SIMP-4 makes the target primary-only), owned by a schema-owner role, with
-// the promoted chains (primary 0063, the erased-redeemer migration, promoted
-// at the wave-2 integration; a staged copy would go through the
-// staged-migrations harness instead) applied by the production runner, and
-// the contract registered. The transfer login is a deliberate, non-escalating
+// Each target is one dedicated primary database (w2_seal_*; decision D4
+// leaves no deletion-ledger database, and SIMP-4 makes the target
+// primary-only), owned by a schema-owner role, with the promoted primary
+// chain (through the append-only residue; the erased-redeemer migration
+// would go through the staged-migrations harness while staged) applied by
+// the production runner, and the contract registered. The transfer login is a deliberate, non-escalating
 // member of tibotattle_source_transfer, so storage_journal_transfer_session()
 // is true for it; the cluster-global role is created and granted under the
 // advisory lock the owner-journal and transport-floor specs share.
@@ -29,7 +28,6 @@ const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..",
 export const TRANSFER_ROLE = "tibotattle_source_transfer";
 export const TRANSFER_ROLE_LOCK = 460_046;
 export const PRIMARY_SCHEMA = "w2_seal_primary";
-export const LEDGER_SCHEMA = "w2_seal_ledger";
 export const ERASED_REDEEMER_SUFFIX = "_enrollment_grants_erased_redeemer.sql";
 
 export async function localSocket(socket, port) {
@@ -111,22 +109,19 @@ export async function createW2SealCluster({ socket, port, user, password, databa
     const erased = await erasedRedeemerMigration();
     const targets = [];
     for (let index = 0; index < count; index += 1) {
-      const databases = { primary: `w2_seal_primary_${suffix}_${index}`, ledger: `w2_seal_ledger_${suffix}_${index}` };
+      const databases = { primary: `w2_seal_primary_${suffix}_${index}` };
       for (const name of Object.values(databases)) {
         await admin.query(`CREATE DATABASE "${name}" OWNER "${roles.owner}"`);
         created.databases.push(name);
       }
       const ownerPrimary = pool(roles.owner, databases.primary);
-      const ownerLedger = pool(roles.owner, databases.ledger);
       await ownerPrimary.query(`CREATE SCHEMA "${PRIMARY_SCHEMA}"`);
-      await ownerLedger.query(`CREATE SCHEMA "${LEDGER_SCHEMA}"`);
       if (erased.staged) {
         await applyStockAndStagedMigrations({ role: "primary", schema: PRIMARY_SCHEMA, pool: ownerPrimary,
           stagedFiles: [erased.name] });
       } else {
         await applyPostgresMigrations({ role: "primary", schema: PRIMARY_SCHEMA, pool: ownerPrimary });
       }
-      await applyPostgresMigrations({ role: "ledger", schema: LEDGER_SCHEMA, pool: ownerLedger });
       const contract = {
         contractId: `w2-seal-target-${index}`,
         mode: "production",
@@ -135,27 +130,21 @@ export async function createW2SealCluster({ socket, port, user, password, databa
         instanceConnectionName: "tibotattle-synthetic:us-east1:w2-seal-primary",
         databaseName: databases.primary,
         schemaName: PRIMARY_SCHEMA,
-        ledgerInstanceConnectionName: "tibotattle-synthetic:us-east1:w2-seal-primary",
-        ledgerDatabaseName: databases.ledger,
-        ledgerSchemaName: LEDGER_SCHEMA,
         iamDatabaseUser: roles.transfer,
         schemaOwnerRole: roles.owner,
         gcsBucket: "tibotattle-synthetic-quarantine",
         gcsBucketGeneration: "1790000000000001",
       };
-      await registerProductionTransferTarget({ primaryPool: ownerPrimary, ledgerPool: ownerLedger, contract });
+      await registerProductionTransferTarget({ primaryPool: ownerPrimary, contract });
       const transferPrimary = pool(roles.transfer, databases.primary);
-      const transferLedger = pool(roles.transfer, databases.ledger);
       targets.push(Object.freeze({
         index,
         databases,
         contract,
         ownerPrimary,
-        ownerLedger,
         adminPrimary: pool(user, databases.primary, 2),
         transferPrimary,
-        transferLedger,
-        open: sealManifestSha256 => openProductionTransferTarget({ primaryPool: transferPrimary, ledgerPool: transferLedger,
+        open: sealManifestSha256 => openProductionTransferTarget({ primaryPool: transferPrimary,
           expectedContractId: contract.contractId, sealManifestSha256 }),
       }));
     }

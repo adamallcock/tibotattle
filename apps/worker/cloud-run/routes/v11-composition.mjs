@@ -56,7 +56,6 @@ const ADAPTER_EXPORTS = Object.freeze({
   ]),
   bearer: Object.freeze(["authenticatePostgresDeviceBearer"]),
   transport: Object.freeze(["abandonPostgresDeviceUploadAuthorization"]),
-  ledgerAuthority: Object.freeze(["hasPostgresDeletionTombstone"]),
   personalDevices: Object.freeze(["authenticatePostgresPersonalSession", "assertPostgresPersonalSessionCsrf"]),
   controls: Object.freeze(["assertPostgresCollectionControlFromPool"]),
   crypto: Object.freeze(["decryptSyntheticEnvelope", "sha256Hex"]),
@@ -66,8 +65,8 @@ const ADAPTER_EXPORTS = Object.freeze({
 /**
  * @param {{
  *   adapters: Record<string, Record<string, unknown>>,
- *   primaryPool: unknown, ledgerPool: unknown,
- *   schema: Readonly<{ primarySchema: string, ledgerSchema: string }>,
+ *   primaryPool: unknown,
+ *   schema: Readonly<{ primarySchema: string }>,
  *   admissionEnv: unknown,
  *   assertAdmissionBindings: (env: unknown) => void,
  *   assertAttemptAllowed: (...args: unknown[]) => Promise<void>,
@@ -92,10 +91,10 @@ export function createTelemetryV11OriginIntake(options) {
       }
     }
   }
-  const { live, bearer, transport, ledgerAuthority, personalDevices, controls, crypto, boundedBody } = options.adapters;
-  const { primaryPool, ledgerPool, schema, maxRequestBytes } = options;
+  const { live, bearer, transport, personalDevices, controls, crypto, boundedBody } = options.adapters;
+  const { primaryPool, schema, maxRequestBytes } = options;
   const device = {
-    primaryPool, ledgerPool, schema, maxRequestBytes,
+    primaryPool, schema, maxRequestBytes,
     admissionEnv: options.admissionEnv,
     assertAdmissionBindings: options.assertAdmissionBindings,
     assertAttemptAllowed: options.assertAttemptAllowed,
@@ -103,15 +102,13 @@ export function createTelemetryV11OriginIntake(options) {
     authenticateDevice: (pool, header, routeOptions) => bearer.authenticatePostgresDeviceBearer(pool, header, {
       ...routeOptions, accountlessAuthorizationVersion: "v1.1",
     }),
-    hasDeletionTombstone: ledgerAuthority.hasPostgresDeletionTombstone,
     assertCollectionControl: controls.assertPostgresCollectionControlFromPool,
     readBoundedRequestBody: boundedBody.readBoundedRequestBody,
   };
   const consent = createTelemetryV11ConsentRouteModule({
-    primaryPool, ledgerPool, schema, maxRequestBytes,
+    primaryPool, schema, maxRequestBytes,
     authenticatePersonalSession: personalDevices.authenticatePostgresPersonalSession,
     assertPersonalSessionCsrf: personalDevices.assertPostgresPersonalSessionCsrf,
-    hasDeletionTombstone: ledgerAuthority.hasPostgresDeletionTombstone,
     assertCollectionControl: controls.assertPostgresCollectionControlFromPool,
     grantConsent: live.grantPostgresTelemetryV11Consent,
     readBoundedRequestBody: boundedBody.readBoundedRequestBody,

@@ -10,9 +10,11 @@ import {
 // Every importer defaults to a disposable prefix schema. Production mode is
 // available only through a handle returned by openProductionTransferTarget:
 // the registered transfer_target_contract names the one application schema,
-// the databases, the IAM login and the schema-owner role. Each transaction
-// re-asserts PostgreSQL 17, the database, session_user and SET LOCAL ROLE to
-// the schema owner, so every object a tool creates is owned by the schema
+// its database, the IAM login and the schema-owner role. There is one target
+// database: the deletion ledger is retired (decisions D2, D4 and D6 of
+// 2026-09-26), so there is no ledger pool, mirror run or 'erasure-ledger'
+// stage. Each transaction re-asserts PostgreSQL 17, the database,
+// session_user and SET LOCAL ROLE to the schema owner, so every object a tool creates is owned by the schema
 // owner and never by the transfer login. Once a run is live (or the handle's
 // run is abandoned) the handle only reads. Errors are closed codes; no value
 // read from a source or target is ever placed in an error, log or receipt.
@@ -36,7 +38,6 @@ export const TRANSFER_STAGES = Object.freeze([
   "pending-registrations",
   "accountless-retention",
   "ingestion-journal",
-  "erasure-ledger",
   "analytics-history",
   "analytics-community-history",
   "owner-lifecycle-verify",
@@ -48,8 +49,8 @@ export const TRANSFER_RUN_STATES = Object.freeze([
   "preflight", "importing", "verifying", "verified", "live", "abandoned",
 ]);
 
-function seeded(role, table, seedRows = 1) {
-  return Object.freeze({ role, table, seedRows });
+function seeded(table, seedRows = 1) {
+  return Object.freeze({ role: "primary", table, seedRows });
 }
 
 /**
@@ -59,30 +60,32 @@ function seeded(role, table, seedRows = 1) {
  * listed before they land.
  */
 export const SEEDED_SINGLETONS = Object.freeze([
-  seeded("primary", "accountless_enrollment_issuance"),
-  seeded("primary", "collection_controls"),
+  seeded("accountless_enrollment_issuance"),
+  seeded("collection_controls"),
   // AN-1 migration 0053; replaced verbatim by the sealed singleton (PT-3).
-  seeded("primary", "community_public_source_bootstrap"),
-  seeded("primary", "current_queue_state"),
-  seeded("primary", "github_distribution_sync_state"),
-  seeded("primary", "mutation_control"),
-  seeded("primary", "preparation_counters"),
-  seeded("primary", "publication_state"),
+  seeded("community_public_source_bootstrap"),
+  seeded("current_queue_state"),
+  seeded("github_distribution_sync_state"),
+  seeded("mutation_control"),
+  seeded("preparation_counters"),
+  seeded("publication_state"),
   // RD-1 lifecycle-state singleton, seeded never_run.
-  seeded("primary", "quarantine_reconciliation_state"),
-  seeded("primary", "retention_state"),
+  seeded("quarantine_reconciliation_state"),
+  seeded("retention_state"),
   // PF-1 migration (number assigned in plan-v5) runtime row, seeded 'staged'.
-  seeded("primary", "telemetry_performance_runtime"),
-  seeded("primary", "telemetry_transport_formats", 5),
-  seeded("primary", "telemetry_v12_runtime"),
-  seeded("primary", "telemetry_v12_typed_runtime"),
-  seeded("primary", "telemetry_v1_quota_fit_backfill"),
-  seeded("ledger", "storage_erasure_ledger_generation"),
+  seeded("telemetry_performance_runtime"),
+  seeded("telemetry_transport_formats", 5),
+  seeded("telemetry_v12_runtime"),
+  seeded("telemetry_v12_typed_runtime"),
+  seeded("telemetry_v1_quota_fit_backfill"),
 ]);
 
-/** The relations the control migrations create (primary 0056 and ledger 0007). */
+/**
+ * The relations the control migration creates (primary 0056). The ledger
+ * mirror table that only the frozen ledger 0007 creates is not among them,
+ * so a database that carries it fails the control-schema allowlist.
+ */
 export const CONTROL_SCHEMA_RELATIONS = Object.freeze([
-  "ledger_transfer_runs",
   "sealed_collection_controls",
   "transfer_checkpoints",
   "transfer_control_installations",
@@ -108,7 +111,6 @@ export const RETAINED_CONTROL_RELATIONS = Object.freeze([
 /** Functions created by the control migrations; never dropped by tools. */
 export const RETAINED_CONTROL_FUNCTIONS = Object.freeze([
   "install_transfer_live_lock",
-  "ledger_transfer_runs_guard",
   "transfer_checkpoints_guard",
   "transfer_control_row_immutable",
   "transfer_insert_only_guard",
@@ -223,9 +225,6 @@ const DISPOSITION = /^(?:(?:imported|mapped|claimed-by):[a-z][a-z0-9]*(?:-[a-z0-
 const SOURCE_ROLES = new Set(["ingestion", "analytics", "deletion-ledger", "r2"]);
 const OBJECT_KINDS_ALLOWED_IN_CONTROL_SCHEMA = new Set(["r", "p", "i", "I"]);
 const RESERVED_SCHEMAS = new Set(["tibotattle_transfer", "information_schema", "public", "pg_catalog"]);
-const RUN_ORDER = new Map([
-  ["preflight", 0], ["importing", 1], ["verifying", 2], ["verified", 3], ["live", 4],
-]);
 const COLLECTION_CONTROL_STATES = new Set(["operational", "degraded", "contained"]);
 const COLLECTION_REASON_CODES = new Set([
   "initial", "drill_containment", "drill_restore", "privacy_incident", "security_incident",
@@ -244,9 +243,6 @@ const CONTRACT_KEYS = Object.freeze([
   ["instanceConnectionName", "instance_connection_name"],
   ["databaseName", "database_name"],
   ["schemaName", "schema_name"],
-  ["ledgerInstanceConnectionName", "ledger_instance_connection_name"],
-  ["ledgerDatabaseName", "ledger_database_name"],
-  ["ledgerSchemaName", "ledger_schema_name"],
   ["iamDatabaseUser", "iam_database_user"],
   ["schemaOwnerRole", "schema_owner_role"],
   ["gcsBucket", "gcs_bucket"],
@@ -260,9 +256,8 @@ const LIVE_LOCK_TRIGGER = "transfer_target_live_lock";
 const HASH = value => createHash("sha256").update(value).digest("hex");
 const HANDLES = new WeakMap();
 const TRANSACTION_CLIENTS = new WeakMap();
-// Module-private option: the run-state transitions (advance, abandon, ledger
-// mirror convergence, mark-live) enforce their own state rules under a FOR
-// UPDATE run lock, so they skip the live/abandoned write gate (and its FOR
+// Module-private option: the run-state transitions (advance, abandon,
+// mark-live) enforce their own state rules under a FOR UPDATE run lock, so they skip the live/abandoned write gate (and its FOR
 // SHARE lock) that every other write transaction meets.
 const RUN_CONTROL = Symbol("tibotattle-transfer-run-control");
 const MAX_WAIVED_ROLE_MEMBERS = 8;
@@ -556,14 +551,13 @@ async function controlSchemaOwner(client) {
   return row.owner;
 }
 
-async function assertComponentInstalled(client, component) {
-  const table = component === "primary" ? "transfer_runs" : "ledger_transfer_runs";
+async function assertPrimaryControlInstalled(client) {
   const [row] = rows(await q(client, `SELECT to_regclass($1) IS NOT NULL AS installations,
       to_regclass($2) IS NOT NULL AS runs`,
-  [`${TRANSFER_CONTROL_SCHEMA}.transfer_control_installations`, `${TRANSFER_CONTROL_SCHEMA}.${table}`]));
+  [`${TRANSFER_CONTROL_SCHEMA}.transfer_control_installations`, `${TRANSFER_CONTROL_SCHEMA}.transfer_runs`]));
   if (row?.installations !== true || row?.runs !== true) fail("CUTOVER_TARGET_CONTROL_SCHEMA_MISSING");
   const installed = rows(await q(client, `SELECT 1 FROM ${control("transfer_control_installations")}
-    WHERE component = $1`, [component]));
+    WHERE component = 'primary'`));
   if (installed.length !== 1) fail("CUTOVER_TARGET_CONTROL_SCHEMA_MISSING");
 }
 
@@ -573,10 +567,10 @@ async function assertApplicationSchema(client, schema, owner) {
   if (row === undefined || row.owner !== owner) fail("CUTOVER_TARGET_SCHEMA_MISMATCH");
 }
 
-async function assertMigrationReceipts(client, role, schema, rootDirectory) {
+async function assertMigrationReceipts(client, schema, rootDirectory) {
   let expected;
   try {
-    expected = await readPostgresMigrations({ role, rootDirectory });
+    expected = await readPostgresMigrations({ role: "primary", rootDirectory });
   } catch {
     fail("CUTOVER_TARGET_MIGRATION_RECEIPTS_MISMATCH");
   }
@@ -596,10 +590,8 @@ async function assertMigrationReceipts(client, role, schema, rootDirectory) {
   }
 }
 
-async function assertApplicationTablesEmpty(client, role, schema) {
-  const seededLimits = new Map(SEEDED_SINGLETONS
-    .filter(entry => entry.role === role)
-    .map(entry => [entry.table, entry.seedRows]));
+async function assertApplicationTablesEmpty(client, schema) {
+  const seededLimits = new Map(SEEDED_SINGLETONS.map(entry => [entry.table, entry.seedRows]));
   const tables = rows(await q(client, `SELECT c.relname::text AS relname
       FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
      WHERE n.nspname = $1 AND c.relkind IN ('r', 'p') AND c.relname <> $2
@@ -668,11 +660,8 @@ function normalizeContract(contract) {
       || !PROJECT_ID.test(row.project_id)
       || !DECIMAL_ID.test(row.project_number)
       || !INSTANCE.test(row.instance_connection_name)
-      || !INSTANCE.test(row.ledger_instance_connection_name)
       || !DATABASE_NAME.test(row.database_name)
-      || !DATABASE_NAME.test(row.ledger_database_name)
       || !schemaOk(row.schema_name)
-      || !schemaOk(row.ledger_schema_name)
       || !ROLE_NAME.test(row.iam_database_user)
       || !ROLE_NAME.test(row.schema_owner_role)
       || row.iam_database_user === row.schema_owner_role
@@ -688,28 +677,31 @@ async function assertRoleExists(client, role) {
   if (found.length !== 1) fail("CUTOVER_TARGET_IAM_USER_MISSING");
 }
 
+/** Refuse any argument key outside the closed set (a retired ledger pool included). */
+function closedArguments(args, allowed) {
+  if (args === null || typeof args !== "object" || Array.isArray(args)
+      || Object.keys(args).some(key => !allowed.includes(key))) {
+    fail("CUTOVER_TARGET_ARGUMENT_INVALID");
+  }
+  return args;
+}
+
 /**
- * Owner-run, idempotent registration of the production target contract.
- * The ledger side is validated first; only the primary control schema holds
- * the contract row, which is immutable once written.
+ * Owner-run, idempotent registration of the production target contract in
+ * the one target database. The contract row is immutable once written. A
+ * database still carrying the dual-role contract shape (before primary 0064)
+ * refuses the insert, as does any argument beyond the primary pool and the
+ * contract.
  */
-export async function registerProductionTransferTarget({ primaryPool, ledgerPool, contract } = {}) {
+export async function registerProductionTransferTarget(args = {}) {
+  const { primaryPool, contract } = closedArguments(args, ["primaryPool", "contract"]);
   const row = normalizeContract(contract);
-  const asOwner = async (client, databaseName) => {
+  return inTransaction(primaryPool, {}, async (client) => {
     const facts = await sessionFacts(client);
-    if (facts.databaseName !== databaseName) fail("CUTOVER_TARGET_DATABASE_MISMATCH");
+    if (facts.databaseName !== row.database_name) fail("CUTOVER_TARGET_DATABASE_MISMATCH");
     if (facts.loginRole !== row.schema_owner_role) await assumeOwnerRole(client, row.schema_owner_role);
     if (await controlSchemaOwner(client) !== row.schema_owner_role) fail("CUTOVER_TARGET_ROLE_INVALID");
-  };
-  await inTransaction(ledgerPool, { readOnly: true }, async (client) => {
-    await asOwner(client, row.ledger_database_name);
-    await assertComponentInstalled(client, "ledger");
-    await assertApplicationSchema(client, row.ledger_schema_name, row.schema_owner_role);
-    await assertRoleExists(client, row.iam_database_user);
-  });
-  return inTransaction(primaryPool, {}, async (client) => {
-    await asOwner(client, row.database_name);
-    await assertComponentInstalled(client, "primary");
+    await assertPrimaryControlInstalled(client);
     await assertApplicationSchema(client, row.schema_name, row.schema_owner_role);
     await assertRoleExists(client, row.iam_database_user);
     const columns = CONTRACT_KEYS.map(([, column]) => column);
@@ -728,12 +720,11 @@ function handleState(handle) {
   return state;
 }
 
+// The one target is the primary; any other role (the retired 'ledger'
+// included) is refused.
 function roleTarget(handle, role) {
   if (role === "primary") {
     return { database: handle.primaryDatabase, schema: handle.primarySchema, component: "primary" };
-  }
-  if (role === "ledger") {
-    return { database: handle.ledgerDatabase, schema: handle.ledgerSchema, component: "ledger" };
   }
   return fail("CUTOVER_TARGET_ARGUMENT_INVALID");
 }
@@ -751,13 +742,9 @@ async function liveRunPresent(client, table) {
 // target then belongs to the runtime) and once the handle's own run is
 // abandoned. The primary run row is share-locked first, so a concurrent
 // markLive either waits for this transaction or is seen by it.
-async function assertWritableTarget(client, role, runId) {
-  const runs = role === "primary" ? "transfer_runs" : "ledger_transfer_runs";
-  const own = runId === null ? undefined
-    : await readRunById(client, runs, runId, role === "primary" ? "FOR SHARE" : "");
-  if (await liveRunPresent(client, "transfer_runs") || await liveRunPresent(client, "ledger_transfer_runs")) {
-    fail("CUTOVER_TARGET_LIVE");
-  }
+async function assertWritableTarget(client, runId) {
+  const own = runId === null ? undefined : await readRunById(client, "transfer_runs", runId, "FOR SHARE");
+  if (await liveRunPresent(client, "transfer_runs")) fail("CUTOVER_TARGET_LIVE");
   if (own?.state === "abandoned") fail("CUTOVER_RUN_STATE_INVALID");
 }
 
@@ -774,7 +761,7 @@ export async function withTransferTransaction(handle, role, fn, options = {}) {
   if (typeof fn !== "function" || options === null || typeof options !== "object") {
     fail("CUTOVER_TARGET_ARGUMENT_INVALID");
   }
-  const pool = role === "primary" ? state.primaryPool : state.ledgerPool;
+  const pool = state.primaryPool;
   const readOnly = options.readOnly === true;
   const runControl = options[RUN_CONTROL] === true;
   return inTransaction(pool, {
@@ -787,7 +774,7 @@ export async function withTransferTransaction(handle, role, fn, options = {}) {
     if (facts.loginRole !== handle.iamDatabaseUser) fail("CUTOVER_TARGET_SESSION_USER_MISMATCH");
     await assumeOwnerRole(client, handle.schemaOwnerRole);
     await q(client, renderPostgresSearchPath(target.schema));
-    if (!readOnly && !runControl) await assertWritableTarget(client, role, state.runId);
+    if (!readOnly && !runControl) await assertWritableTarget(client, state.runId);
     TRANSACTION_CLIENTS.set(client, Object.freeze({ handle, role }));
     try {
       return await fn(client);
@@ -816,78 +803,27 @@ async function inspectPrimary(client, { expectedContractId, sealManifestSha256, 
   if (contract.database_name !== facts.databaseName) fail("CUTOVER_TARGET_DATABASE_MISMATCH");
   if (contract.iam_database_user !== facts.loginRole) fail("CUTOVER_TARGET_SESSION_USER_MISMATCH");
   await assertApplicationSchema(client, contract.schema_name, owner);
-  await assertComponentInstalled(client, "primary");
-  await assertMigrationReceipts(client, "primary", contract.schema_name, rootDirectory);
+  await assertPrimaryControlInstalled(client);
+  await assertMigrationReceipts(client, contract.schema_name, rootDirectory);
   const run = await readOpenRun(client, "transfer_runs");
   if (run !== undefined && run.sealManifestSha256 !== sealManifestSha256) fail("CUTOVER_TARGET_SEAL_MISMATCH");
   if (run !== undefined && run.contractId !== contract.contract_id) fail("CUTOVER_RUN_STATE_DIVERGED");
-  if (run === undefined) await assertApplicationTablesEmpty(client, "primary", contract.schema_name);
+  if (run === undefined) await assertApplicationTablesEmpty(client, contract.schema_name);
   return { contract, run };
-}
-
-async function inspectLedger(client, contract, { sealManifestSha256, rootDirectory, primaryRun }) {
-  const facts = await sessionFacts(client);
-  await assumeOwnerRole(client, contract.schema_owner_role);
-  if (await controlSchemaOwner(client) !== contract.schema_owner_role) fail("CUTOVER_TARGET_ROLE_INVALID");
-  if (contract.ledger_database_name !== facts.databaseName) fail("CUTOVER_TARGET_DATABASE_MISMATCH");
-  if (contract.iam_database_user !== facts.loginRole) fail("CUTOVER_TARGET_SESSION_USER_MISMATCH");
-  await assertApplicationSchema(client, contract.ledger_schema_name, contract.schema_owner_role);
-  await assertComponentInstalled(client, "ledger");
-  await assertMigrationReceipts(client, "ledger", contract.ledger_schema_name, rootDirectory);
-  const mirror = await readOpenRun(client, "ledger_transfer_runs");
-  let strandedMirror;
-  if (mirror !== undefined) {
-    if (primaryRun === undefined || mirror.runId !== primaryRun.runId) {
-      // Either an abandon that committed in the primary but not yet in the
-      // ledger, which the open converges, or a divergent mirror (refused).
-      strandedMirror = mirror;
-    } else if (mirror.sealManifestSha256 !== sealManifestSha256) {
-      fail("CUTOVER_TARGET_SEAL_MISMATCH");
-    } else if (RUN_ORDER.get(mirror.state) > RUN_ORDER.get(primaryRun.state)) {
-      fail("CUTOVER_RUN_STATE_DIVERGED");
-    }
-  }
-  if (primaryRun === undefined) await assertApplicationTablesEmpty(client, "ledger", contract.ledger_schema_name);
-  return { strandedMirror };
-}
-
-async function assumeContractSession(client, contract, component) {
-  const facts = await sessionFacts(client);
-  const database = component === "primary" ? contract.database_name : contract.ledger_database_name;
-  if (facts.databaseName !== database) fail("CUTOVER_TARGET_DATABASE_MISMATCH");
-  if (facts.loginRole !== contract.iam_database_user) fail("CUTOVER_TARGET_SESSION_USER_MISMATCH");
-  await assumeOwnerRole(client, contract.schema_owner_role);
-}
-
-// A ledger mirror left open by a torn abandonRun (primary committed, ledger
-// not) converges to 'abandoned' only when the primary holds the same run,
-// with the same contract, seal and seal time, in state 'abandoned'. Any
-// other open mirror without its primary run is divergent.
-async function convergeStrandedMirror(primaryPool, ledgerPool, contract, stranded) {
-  const primaryRun = await inTransaction(primaryPool, { readOnly: true }, async (client) => {
-    await assumeContractSession(client, contract, "primary");
-    return readRunById(client, "transfer_runs", stranded.runId);
-  });
-  if (primaryRun?.state !== "abandoned") fail("CUTOVER_RUN_STATE_DIVERGED");
-  await inTransaction(ledgerPool, {}, async (client) => {
-    await assumeContractSession(client, contract, "ledger");
-    await advanceMirror(client, primaryRun);
-  });
 }
 
 /**
  * Open the registered production target. A fresh open requires empty
  * application tables (seeded singletons excepted); an open whose seal id
  * equals the existing non-abandoned run resumes it and skips that check.
- * A ledger mirror stranded by a torn abandon is converged first.
  */
-export async function openProductionTransferTarget({
-  primaryPool,
-  ledgerPool,
-  expectedContractId,
-  sealManifestSha256,
-  rootDirectory = POSTGRES_MIGRATION_ROOT,
-} = {}) {
+export async function openProductionTransferTarget(args = {}) {
+  const {
+    primaryPool,
+    expectedContractId,
+    sealManifestSha256,
+    rootDirectory = POSTGRES_MIGRATION_ROOT,
+  } = closedArguments(args, ["primaryPool", "expectedContractId", "sealManifestSha256", "rootDirectory"]);
   if (typeof expectedContractId !== "string" || !CONTRACT_ID.test(expectedContractId)) {
     fail("CUTOVER_TARGET_ARGUMENT_INVALID");
   }
@@ -895,12 +831,6 @@ export async function openProductionTransferTarget({
   const primary = await inTransaction(primaryPool, { readOnly: true }, client => inspectPrimary(client, {
     expectedContractId, sealManifestSha256, rootDirectory,
   }));
-  const ledger = await inTransaction(ledgerPool, { readOnly: true }, client => inspectLedger(client, primary.contract, {
-    sealManifestSha256, rootDirectory, primaryRun: primary.run,
-  }));
-  if (ledger.strandedMirror !== undefined) {
-    await convergeStrandedMirror(primaryPool, ledgerPool, primary.contract, ledger.strandedMirror);
-  }
   const { contract, run } = primary;
   const handle = Object.freeze({
     schemaVersion: POSTGRES_TRANSFER_TARGET_SCHEMA_VERSION,
@@ -909,8 +839,6 @@ export async function openProductionTransferTarget({
     sealManifestSha256,
     primaryDatabase: contract.database_name,
     primarySchema: contract.schema_name,
-    ledgerDatabase: contract.ledger_database_name,
-    ledgerSchema: contract.ledger_schema_name,
     controlSchema: TRANSFER_CONTROL_SCHEMA,
     iamDatabaseUser: contract.iam_database_user,
     schemaOwnerRole: contract.schema_owner_role,
@@ -919,8 +847,7 @@ export async function openProductionTransferTarget({
     resumed: run !== undefined,
     openedRunState: run?.state ?? null,
   });
-  HANDLES.set(handle, { primaryPool, ledgerPool, rootDirectory, runId: run?.runId ?? null, began: run !== undefined });
-  if (run !== undefined) await reconcileLedgerRunMirror(handle);
+  HANDLES.set(handle, { primaryPool, rootDirectory, runId: run?.runId ?? null, began: run !== undefined });
   return handle;
 }
 
@@ -966,74 +893,15 @@ function nextStateToward(from, to) {
   return order[order.indexOf(from) + 1];
 }
 
-// Walk the ledger mirror forward to the primary run's state. Only markLive
-// takes a mirror to 'live' (allowLive), in the transaction that installs that
-// database's live lock; every other caller stops a live run's mirror at
-// 'verified'. A 'live' mirror therefore always carries its lock, and a
-// markLive torn after the primary commit is completed by rerunning markLive.
-async function advanceMirror(client, primaryRun, { allowLive = false } = {}) {
-  let mirror = await readRunById(client, "ledger_transfer_runs", primaryRun.runId, "FOR UPDATE");
-  if (mirror === undefined) {
-    if (primaryRun.state === "abandoned") return undefined;
-    const other = await readOpenRun(client, "ledger_transfer_runs");
-    if (other !== undefined) fail("CUTOVER_RUN_STATE_DIVERGED");
-    await q(client, `INSERT INTO ${control("ledger_transfer_runs")}
-        (run_id, contract_id, seal_manifest_sha256, sealed_at, state)
-      VALUES ($1, $2, $3, $4::timestamptz, 'preflight')`,
-    [primaryRun.runId, primaryRun.contractId, primaryRun.sealManifestSha256, primaryRun.sealedAt]);
-    mirror = await readRunById(client, "ledger_transfer_runs", primaryRun.runId, "FOR UPDATE");
-  }
-  if (mirror.sealManifestSha256 !== primaryRun.sealManifestSha256 || mirror.contractId !== primaryRun.contractId
-      || mirror.sealedAt !== primaryRun.sealedAt) {
-    fail("CUTOVER_RUN_STATE_DIVERGED");
-  }
-  const target = primaryRun.state === "live" && mirror.state !== "live" && !allowLive ? "verified" : primaryRun.state;
-  while (mirror.state !== target) {
-    if (mirror.state === "abandoned" || mirror.state === "live"
-        || (primaryRun.state !== "abandoned"
-          && RUN_ORDER.get(mirror.state) > RUN_ORDER.get(primaryRun.state))) {
-      fail("CUTOVER_RUN_STATE_DIVERGED");
-    }
-    const next = nextStateToward(mirror.state, target);
-    await q(client, `UPDATE ${control("ledger_transfer_runs")} SET state = $2,
-        verified_at = CASE WHEN $2 = 'verified' THEN clock_timestamp() ELSE verified_at END,
-        live_at = CASE WHEN $2 = 'live' THEN clock_timestamp() ELSE live_at END,
-        flip_evidence_sha256 = CASE WHEN $2 = 'live' THEN $3 ELSE flip_evidence_sha256 END,
-        abandoned_at = CASE WHEN $2 = 'abandoned' THEN clock_timestamp() ELSE abandoned_at END
-      WHERE run_id = $1`, [mirror.runId, next, primaryRun.flipEvidenceSha256]);
-    mirror = await readRunById(client, "ledger_transfer_runs", primaryRun.runId, "FOR UPDATE");
-  }
-  return mirror;
-}
-
-/**
- * Converge the ledger mirror forward to the primary run's state. A live
- * run's mirror stops at 'verified' (ledgerState reports it) until markLive
- * takes it live together with the ledger's live lock.
- */
-export async function reconcileLedgerRunMirror(handle) {
-  const state = handleState(handle);
-  if (state.runId === null) fail("CUTOVER_RUN_MISSING");
-  const primaryRun = await withTransferTransaction(handle, "primary", client => currentRun(client, handle),
-    { readOnly: true });
-  const mirror = await withTransferTransaction(handle, "ledger", client => advanceMirror(client, primaryRun),
-    { [RUN_CONTROL]: true });
-  return Object.freeze({ runId: primaryRun.runId, state: primaryRun.state, ledgerState: mirror?.state ?? null });
-}
-
 /** Begin the one run for this handle's seal; the target must still be empty. */
 export async function beginRun(handle, { sealedAt } = {}) {
   const state = handleState(handle);
   if (state.began) fail("CUTOVER_RUN_EXISTS");
   const sealed = toPostgresInstant(sealedAt, { table: "transfer_runs", column: "sealed_at" });
   const runId = randomUUID();
-  await withTransferTransaction(handle, "ledger", async (client) => {
-    if (await readOpenRun(client, "ledger_transfer_runs") !== undefined) fail("CUTOVER_RUN_EXISTS");
-    await assertApplicationTablesEmpty(client, "ledger", handle.ledgerSchema);
-  }, { readOnly: true });
   await withTransferTransaction(handle, "primary", async (client) => {
     if (await readOpenRun(client, "transfer_runs") !== undefined) fail("CUTOVER_RUN_EXISTS");
-    await assertApplicationTablesEmpty(client, "primary", handle.primarySchema);
+    await assertApplicationTablesEmpty(client, handle.primarySchema);
     await q(client, `INSERT INTO ${control("transfer_runs")}
         (run_id, contract_id, seal_manifest_sha256, sealed_at, state)
       VALUES ($1, $2, $3, $4::timestamptz, 'preflight')`,
@@ -1041,7 +909,6 @@ export async function beginRun(handle, { sealedAt } = {}) {
   });
   state.began = true;
   state.runId = runId;
-  await reconcileLedgerRunMirror(handle);
   return Object.freeze({ runId, state: "preflight" });
 }
 
@@ -1074,11 +941,9 @@ async function scrubAbandonedRunCursors(client) {
   return result.rowCount ?? 0;
 }
 
-async function assertVerifiedPreconditions(client, handle, role, run) {
-  if (role === "primary") {
-    await assertAllStagesComplete(client, run);
-    await assertNoCheckpointCursors(client);
-  }
+async function assertVerifiedPreconditions(client, handle, run) {
+  await assertAllStagesComplete(client, run);
+  await assertNoCheckpointCursors(client);
   await assertControlSchemaAllowlist(client);
   await assertNoTransferUserOwnership(client, handle);
 }
@@ -1092,34 +957,28 @@ export async function advanceRun(handle, to) {
   if (!["importing", "verifying", "verified"].includes(to)) fail("CUTOVER_RUN_TRANSITION_REFUSED");
   const state = handleState(handle);
   if (state.runId === null) fail("CUTOVER_RUN_MISSING");
-  if (to === "verified") {
-    await withTransferTransaction(handle, "ledger", async (client) => {
-      await assertVerifiedPreconditions(client, handle, "ledger", undefined);
-    }, { readOnly: true });
-  }
-  await withTransferTransaction(handle, "primary", async (client) => {
+  return withTransferTransaction(handle, "primary", async (client) => {
     const run = await currentRun(client, handle, "FOR UPDATE");
-    if (run.state === to) return;
-    if (nextStateToward(run.state, to) !== to) fail("CUTOVER_RUN_TRANSITION_REFUSED");
-    if (to === "verifying") await assertAllStagesComplete(client, run);
-    if (to === "verified") await assertVerifiedPreconditions(client, handle, "primary", run);
-    await q(client, `UPDATE ${control("transfer_runs")} SET state = $2,
-        verified_at = CASE WHEN $2 = 'verified' THEN clock_timestamp() ELSE verified_at END
-      WHERE run_id = $1`, [run.runId, to]);
+    if (run.state !== to) {
+      if (nextStateToward(run.state, to) !== to) fail("CUTOVER_RUN_TRANSITION_REFUSED");
+      if (to === "verifying") await assertAllStagesComplete(client, run);
+      if (to === "verified") await assertVerifiedPreconditions(client, handle, run);
+      await q(client, `UPDATE ${control("transfer_runs")} SET state = $2,
+          verified_at = CASE WHEN $2 = 'verified' THEN clock_timestamp() ELSE verified_at END
+        WHERE run_id = $1`, [run.runId, to]);
+    }
+    return Object.freeze({ runId: run.runId, state: to });
   }, { [RUN_CONTROL]: true });
-  return reconcileLedgerRunMirror(handle);
 }
 
 /**
- * Abandon the run in both databases. There is no reopen. The run's
- * checkpoint cursors are NULLed in the same primary transaction, so an
- * abandoned run never keeps a cursor. If the ledger step is lost, the next
- * openProductionTransferTarget converges the mirror.
+ * Abandon the run. There is no reopen. The run's checkpoint cursors are
+ * NULLed in the same transaction, so an abandoned run never keeps a cursor.
  */
 export async function abandonRun(handle) {
   const state = handleState(handle);
   if (state.runId === null) fail("CUTOVER_RUN_MISSING");
-  await withTransferTransaction(handle, "primary", async (client) => {
+  return withTransferTransaction(handle, "primary", async (client) => {
     const run = await currentRun(client, handle, "FOR UPDATE");
     if (run.state === "live") fail("CUTOVER_RUN_TRANSITION_REFUSED");
     if (run.state !== "abandoned") {
@@ -1130,8 +989,8 @@ export async function abandonRun(handle) {
     const [left] = rows(await q(client, `SELECT count(*)::text AS n FROM ${control("transfer_checkpoints")}
       WHERE run_id = $1 AND last_key IS NOT NULL`, [run.runId]));
     if (databaseCount(left?.n) !== 0n) fail("CUTOVER_CHECKPOINT_INVALID");
+    return Object.freeze({ runId: run.runId, state: "abandoned" });
   }, { [RUN_CONTROL]: true });
-  return reconcileLedgerRunMirror(handle);
 }
 
 // ---------------------------------------------------------------------------
@@ -1948,7 +1807,7 @@ export async function dropTransferStagingRelations(client, handle, registry = []
  */
 export async function assertNoTransferUserOwnership(client, handle) {
   transactionRole(client, handle);
-  const schemas = [handle.primarySchema, handle.ledgerSchema, TRANSFER_CONTROL_SCHEMA];
+  const schemas = [handle.primarySchema, TRANSFER_CONTROL_SCHEMA];
   const [owned] = rows(await q(client, `WITH login AS (
         SELECT oid FROM pg_catalog.pg_roles WHERE rolname = $2
       ), spaces AS (
@@ -2066,7 +1925,8 @@ function flipOptions(options) {
  * member beyond the transfer login and owner-named administrative members,
  * no privilege on tibotattle_transfer for any other role, every user trigger
  * enabled, nothing owned by the transfer login, and the control schema
- * allowlist, in both databases. The report names the waived members.
+ * allowlist (which a leftover ledger mirror table fails). The report names
+ * the waived members.
  */
 export async function assertFlipReady(client, handle, options = {}) {
   transactionRole(client, handle, "primary");
@@ -2077,13 +1937,6 @@ export async function assertFlipReady(client, handle, options = {}) {
   await assertNoCheckpointCursors(client);
   await assertControlsEqualSealed(client, handle, run.runId);
   await assertDatabaseFlipReady(client, handle, allowedRoleMembers, handle.primarySchema);
-  await withTransferTransaction(handle, "ledger", async (ledgerClient) => {
-    const mirror = await readRunById(ledgerClient, "ledger_transfer_runs", run.runId);
-    if (mirror?.state !== "verified" || mirror.sealManifestSha256 !== run.sealManifestSha256) {
-      fail("CUTOVER_RUN_NOT_VERIFIED");
-    }
-    await assertDatabaseFlipReady(ledgerClient, handle, allowedRoleMembers, handle.ledgerSchema);
-  }, { readOnly: true });
   return Object.freeze({ runId: run.runId, flipEvidenceSha256, ready: true, waivedRoleMembers: allowedRoleMembers });
 }
 
@@ -2119,12 +1972,11 @@ async function readBackLiveLock(client) {
 
 /**
  * Mark the verified run live after assertFlipReady, then install and verify
- * the whole-schema TRANSFER_TARGET_LIVE lock in both databases. Each
- * database goes live in the transaction that locks it, so a run or mirror in
- * state 'live' always carries its lock. Rerunning after a loss between the
- * two commits completes the ledger, re-proving its flip readiness first.
- * Idempotent for the same flip evidence: a repeated call on a live database
- * is a readback that fails closed on any relation added after live.
+ * the whole-schema TRANSFER_TARGET_LIVE lock in the same transaction, so a
+ * run in state 'live' always carries its lock. Idempotent for the same flip
+ * evidence: a repeated call on a live database is a readback that fails
+ * closed on any relation added after live (a leftover ledger mirror table
+ * included).
  */
 export async function markLive(handle, options = {}) {
   const { flipEvidenceSha256, allowedRoleMembers } = flipOptions(options);
@@ -2139,12 +1991,6 @@ export async function markLive(handle, options = {}) {
     await assertFlipReady(client, handle, { flipEvidenceSha256, allowedRoleMembers });
     await q(client, `UPDATE ${control("transfer_runs")} SET state = 'live', live_at = clock_timestamp(),
       flip_evidence_sha256 = $2 WHERE run_id = $1`, [run.runId, flipEvidenceSha256]);
-    const [shared] = rows(await q(client, `SELECT current_database()::text = $1
-        AND to_regclass('tibotattle_transfer.ledger_transfer_runs') IS NOT NULL AS shared`,
-    [handle.ledgerDatabase]));
-    if (shared?.shared === true) {
-      await advanceMirror(client, await currentRun(client, handle), { allowLive: true });
-    }
     await q(client, "SELECT tibotattle_transfer.install_transfer_live_lock()");
     return verifyLiveLock(client);
   }, { [RUN_CONTROL]: true });
@@ -2153,18 +1999,5 @@ export async function markLive(handle, options = {}) {
   if (liveRun.state !== "live" || liveRun.flipEvidenceSha256 !== flipEvidenceSha256) {
     fail("CUTOVER_RUN_STATE_DIVERGED");
   }
-  const ledgerLocked = await withTransferTransaction(handle, "ledger", async (client) => {
-    const mirror = await readRunById(client, "ledger_transfer_runs", liveRun.runId, "FOR UPDATE");
-    if (mirror?.state === "live") {
-      if (mirror.flipEvidenceSha256 !== flipEvidenceSha256) fail("CUTOVER_RUN_STATE_DIVERGED");
-      return readBackLiveLock(client);
-    }
-    await advanceMirror(client, liveRun, { allowLive: true });
-    // A rerun after a torn markLive finds the primary live and skips
-    // assertFlipReady, so the ledger half is proved again where it locks.
-    await assertDatabaseFlipReady(client, handle, allowedRoleMembers, handle.ledgerSchema);
-    await q(client, "SELECT tibotattle_transfer.install_transfer_live_lock()");
-    return verifyLiveLock(client);
-  }, { [RUN_CONTROL]: true });
-  return Object.freeze({ runId: liveRun.runId, state: "live", primaryLocked, ledgerLocked });
+  return Object.freeze({ runId: liveRun.runId, state: "live", primaryLocked });
 }

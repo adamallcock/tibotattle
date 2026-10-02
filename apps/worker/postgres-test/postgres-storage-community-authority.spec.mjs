@@ -19,9 +19,10 @@ import { applyPostgresMigrations, renderPostgresSearchPath } from "../scripts/po
  * staged-migrations/ or, once promoted, from migrations/, so the tests are
  * unchanged by promotion and by later waves. Tests that need data from
  * before 0053 (the bootstrap seed and the head backfill) write it at the
- * baseline. The analytics retirement test runs on the repository's whole
- * primary chain instead, because the retirement inventory is closed over the
- * current chain and later waves add owner-bearing relations above 0053. Every
+ * baseline. 0053's erasure fences, terminal watermarks and the erasure floor
+ * of the daily and preview fences are superseded by the append-only residue
+ * migration (LEAD-SIMP); their source readers and the analytics retirement
+ * are deleted, and append-only-residue.spec.mjs qualifies the residue. Every
  * row is synthetic and content-free.
  *
  * Connection profile: the private Unix socket (PG_TEST_SOCKET) or loopback
@@ -164,9 +165,7 @@ async function applyAuthority(pool, schema) {
 /**
  * Run `body` on a fresh schema at the baseline, `before` data, then 0053. The
  * "repository" chain instead applies the repository's whole primary chain
- * through the runner (plus 0053 while it is still staged): the analytics
- * retirement inventory is closed over the current chain, so a test that
- * retires an owner must see every later owner-bearing relation too.
+ * through the runner (plus 0053 while it is still staged).
  */
 async function withSchema(body, { before, chain = "baseline" } = {}) {
   assert.ok(chain === "baseline" || chain === "repository");
@@ -620,19 +619,21 @@ test("PG17 capture pins the D1 authority, fails closed and uses the journal maxi
       assert.equal(current.policyRevision, 2);
       assert.equal(module.sameStorageCommunityHardAuthority(fresh, current), false);
 
-      // Publication off: build and read capture fail closed; retirement does not.
+      // Publication off: build and read capture fail closed. No retirement
+      // capture bypasses that any more (D2): the retired option is refused.
       await setControls(pool, table, "contained");
       await assert.rejects(capture(client, schema), unavailable);
       await assert.rejects(isPostgresCalculationAuthorityCurrent(client, schema, current), unavailable);
-      const retirement = await capture(client, schema, { retirement: true });
-      assert.equal(retirement.sourceId, SOURCE_ID);
+      await assert.rejects(capture(client, schema, { retirement: true }), unavailable);
       await setControls(pool, table, "operational");
+      await assert.rejects(capture(client, schema, { retirement: true }), unavailable,
+        "the retired option is refused while publication is on, too");
+      await assert.rejects(capture(client, schema, null), unavailable);
 
       // Bootstrap incomplete: the same.
       await pool.query(`UPDATE ${table("community_public_source_bootstrap")} SET completed=0`);
       await assert.rejects(capture(client, schema), unavailable);
       assert.equal(await isPostgresCalculationAuthorityCurrent(client, schema, current), false);
-      assert.equal((await capture(client, schema, { retirement: true })).sequence, last);
       await pool.query(`UPDATE ${table("community_public_source_bootstrap")} SET completed=1`);
 
       // An inconsistent control row is the Worker's controls failure. Primary
@@ -647,125 +648,6 @@ test("PG17 capture pins the D1 authority, fails closed and uses the journal maxi
     } finally {
       client.release();
     }
-  }));
-
-// ---------------------------------------------------------------------------
-
-test("PG17 terminal epochs: exact maximum, legacy floor or 503, and a monotonic delivered watermark",
-  { skip: SKIP, timeout: 180_000 }, async () => withSchema(async ({ pool, schema, quoted, table }) => {
-    const { readPostgresSourceTerminalEpoch: sourceTerminal, readPostgresDeliveredTerminalEpoch: delivered } =
-      await authorityModule();
-    await initializeAuthority(pool, table, { epoch: 10 });
-    const client = await pool.connect();
-    const watermark = async () => (await pool.query(`SELECT terminal_public_authority_epoch::int AS epoch,
-        terminal_sequence::int AS sequence,legacy_terminal_floor_epoch::int AS floor
-      FROM ${table("community_terminal_watermarks")} WHERE source_id=$1`, [SOURCE_ID])).rows[0];
-    try {
-      assert.equal(await sourceTerminal(client, schema, SOURCE_ID), 0);
-      assert.equal(await delivered(client, schema, SOURCE_ID), 0);
-      const ownerA = digest("terminal-owner-a");
-      const ownerB = digest("terminal-owner-b");
-      await append(pool, quoted, "owner-active", ownerA);
-      await append(pool, quoted, "owner-active", ownerB);
-      await append(pool, quoted, "owner-withdrawn", ownerA);
-      const exact = (await pool.query(`SELECT max(public_authority_epoch)::int AS epoch FROM ${table("storage_ingestion_changes")}
-        WHERE kind IN ('owner-withdrawn','owner-erased')`)).rows[0].epoch;
-      assert.equal(exact, 13);
-      await append(pool, quoted, "owner-active", ownerA);
-      assert.equal(await sourceTerminal(client, schema, SOURCE_ID), exact, "the highest exact terminal epoch");
-      assert.equal(await sourceTerminal(client, schema, "synthetic-other-source"), 0, "per source");
-
-      // A legacy version-0 terminal carries no public epoch: without an
-      // explicit floor the read fails closed rather than reading 0.
-      const next = (await pool.query(`SELECT max(sequence)::int + 1 AS next FROM ${table("storage_ingestion_changes")}`)).rows[0].next;
-      await pool.query(`INSERT INTO ${table("storage_ingestion_changes")} (
-          source_id,sequence,event_digest,owner_digest,owner_revision,authority_epoch,kind,recorded_ms
-        ) VALUES ($1,$2,$3,$4,1,1,'owner-erased',1)`, [SOURCE_ID, next, digest("legacy-terminal"), digest("legacy-owner")]);
-      await assert.rejects(sourceTerminal(client, schema, SOURCE_ID), apiError("BACKEND_STORAGE_UNAVAILABLE"));
-      await pool.query(`INSERT INTO ${table("community_terminal_watermarks")}
-          (source_id,terminal_public_authority_epoch,terminal_sequence,legacy_terminal_floor_epoch) VALUES ($1,0,0,9)`,
-      [SOURCE_ID]);
-      assert.equal(await sourceTerminal(client, schema, SOURCE_ID), exact, "a lower floor never lowers the exact maximum");
-      await pool.query(`UPDATE ${table("community_terminal_watermarks")} SET legacy_terminal_floor_epoch=20 WHERE source_id=$1`,
-        [SOURCE_ID]);
-      assert.equal(await sourceTerminal(client, schema, SOURCE_ID), 20, "the legacy floor bounds the legacy terminal");
-      await refuses(pool.query(`UPDATE ${table("community_terminal_watermarks")} SET legacy_terminal_floor_epoch=19
-        WHERE source_id=$1`, [SOURCE_ID]), "community_terminal_watermark_regression");
-      await refuses(pool.query(`UPDATE ${table("community_terminal_watermarks")} SET legacy_terminal_floor_epoch=NULL
-        WHERE source_id=$1`, [SOURCE_ID]), "community_terminal_watermark_regression");
-
-      // Delivered: a fence raises the watermark in its own transaction and
-      // retained exact terminal receipts are read directly; nothing lowers
-      // or deletes either.
-      assert.equal(await delivered(client, schema, SOURCE_ID), 0);
-      await pool.query(`INSERT INTO ${table("analytics_storage_erasure_fences")} (source_id,owner_digest,terminal_event_digest,
-          terminal_sequence,terminal_revision,authority_epoch,public_authority_epoch) VALUES ($1,$2,$3,7,3,2,17)`,
-      [SOURCE_ID, digest("fenced-owner"), digest("fenced-event")]);
-      assert.deepEqual(await watermark(), { epoch: 17, sequence: 7, floor: 20 });
-      assert.equal(await delivered(client, schema, SOURCE_ID), 17);
-      // Owners are fenced out of epoch order: a later, lower fence neither
-      // lowers the watermark nor is refused by its monotonic guard.
-      await pool.query(`INSERT INTO ${table("analytics_storage_erasure_fences")} (source_id,owner_digest,terminal_event_digest,
-          terminal_sequence,terminal_revision,authority_epoch,public_authority_epoch) VALUES ($1,$2,$3,3,2,2,12)`,
-      [SOURCE_ID, digest("fenced-owner-lower"), digest("fenced-event-lower")]);
-      assert.deepEqual(await watermark(), { epoch: 17, sequence: 7, floor: 20 });
-      assert.equal(await delivered(client, schema, SOURCE_ID), 17);
-      const receipt =(sequence, kind, publicEpoch, tupleVersion = 1) => pool.query(`INSERT INTO ${table("analytics_applied_events")} (
-          source_id,sequence,event_digest,owner_digest,authority_epoch,projection_json,event_tuple_version,revision,kind,
-          object_digest,content_digest,public_authority_epoch,recorded_ms
-        ) VALUES ($1,$2,$3,$4,1,'{}',$5,$6,$7,$8,$9,$10,$11)`,
-      [SOURCE_ID, sequence, digest(`applied-${sequence}`), digest("delivered-owner"), tupleVersion,
-        tupleVersion === 1 ? 1 : null, kind, tupleVersion === 1 ? digest("o") : null, tupleVersion === 1 ? digest("c") : null,
-        publicEpoch, tupleVersion === 1 ? 1 : null]);
-      await receipt(20, "owner-erased", 15);
-      assert.equal(await delivered(client, schema, SOURCE_ID), 17, "a lower delivered epoch never lowers it");
-      await receipt(21, "source-updated", 30);
-      assert.equal(await delivered(client, schema, SOURCE_ID), 17, "a non-terminal receipt is not containment");
-      await receipt(22, "owner-withdrawn", 25);
-      assert.equal(await delivered(client, schema, SOURCE_ID), 25);
-      await receipt(23, null, null, 0);
-      assert.equal(await delivered(client, schema, SOURCE_ID), 25, "a version-0 receipt carries no containment");
-      assert.deepEqual(await watermark(), { epoch: 17, sequence: 7, floor: 20 },
-        "applied receipts need no trigger on the transfer-owned applied-event table");
-      const appliedTriggers = await pool.query(`SELECT count(*)::int AS count FROM pg_trigger trigger_row
-          JOIN pg_class relation_row ON relation_row.oid=trigger_row.tgrelid
-          JOIN pg_namespace namespace_row ON namespace_row.oid=relation_row.relnamespace
-         WHERE namespace_row.nspname=$1 AND relation_row.relname='analytics_applied_events' AND NOT trigger_row.tgisinternal`,
-      [schema]);
-      assert.equal(appliedTriggers.rows[0].count, 0);
-      await refuses(pool.query(`UPDATE ${table("community_terminal_watermarks")} SET terminal_public_authority_epoch=16`),
-        "community_terminal_watermark_regression");
-      await refuses(pool.query(`UPDATE ${table("community_terminal_watermarks")} SET terminal_sequence=1`),
-        "community_terminal_watermark_regression");
-      await refuses(pool.query(`DELETE FROM ${table("community_terminal_watermarks")}`), "community_terminal_watermark_retained");
-      await refuses(pool.query(`TRUNCATE ${table("community_terminal_watermarks")}`), "community_publication_proof_retained");
-      assert.equal(await delivered(client, schema, "synthetic-other-source"), 0);
-    } finally {
-      client.release();
-    }
-  }));
-
-test("PG17 the delivered epoch includes exact terminal receipts applied before 0053", { skip: SKIP, timeout: 120_000 },
-  async () => withSchema(async ({ pool, schema, table }) => {
-    const { readPostgresDeliveredTerminalEpoch } = await authorityModule();
-    const client = await pool.connect();
-    try {
-      assert.equal(await readPostgresDeliveredTerminalEpoch(client, schema, SOURCE_ID), 12);
-      assert.equal(await readPostgresDeliveredTerminalEpoch(client, schema, "synthetic-other-source"), 0);
-    } finally {
-      client.release();
-    }
-    assert.equal((await pool.query(`SELECT count(*)::int AS count FROM ${table("community_terminal_watermarks")}`)).rows[0].count, 0);
-  }, {
-    before: async ({ pool, table }) => {
-      for (const [sequence, kind, epoch] of [[2, "owner-withdrawn", 12], [3, "owner-active", 40], [4, "owner-erased", 9]]) {
-        await pool.query(`INSERT INTO ${table("analytics_applied_events")} (
-            source_id,sequence,event_digest,owner_digest,authority_epoch,projection_json,event_tuple_version,revision,kind,
-            object_digest,content_digest,public_authority_epoch,recorded_ms
-          ) VALUES ($1,$2,$3,$4,1,'{}',1,1,$5,$6,$6,$7,1)`,
-        [SOURCE_ID, sequence, digest(`backfill-${sequence}`), digest("backfill-owner"), kind, digest("x"), epoch]);
-      }
-    },
   }));
 
 // ---------------------------------------------------------------------------
@@ -860,7 +742,6 @@ test("PG17 an eligible v1.1 head without its event source seeds the bootstrap in
     const client = await pool.connect();
     try {
       await assert.rejects(capture(client, schema), unavailable, "capture fails closed while the bootstrap is incomplete");
-      assert.equal((await capture(client, schema, { retirement: true })).sourceId, SOURCE_ID);
       assert.deepEqual(await advance(client, schema), { completed: false, pending: 1 });
       assert.deepEqual(await advance(client, schema), { completed: false, pending: 1 }, "advancing is idempotent");
       assert.equal((await bootstrapRow(pool, table))[0].completed, 0);
@@ -1475,32 +1356,3 @@ test("PG17 the write-side fence is linearizable with concurrent erasure fences a
       }
     }
   }));
-
-// ---------------------------------------------------------------------------
-
-test("PG17 analytics owner retirement keeps erasure fences and receipts as retained proof", { skip: SKIP, timeout: 180_000 },
-  async () => withSchema(async ({ pool, schema, table }) => {
-    const { retirePostgresAnalyticsOwner, hasPostgresAnalyticsOwnerResidue } =
-      await workerModule("/src/postgres-analytics-owner-retirement.ts");
-    const owner = digest("retired-owner");
-    const participantId = "synthetic-retired-owner";
-    await pool.query(`INSERT INTO ${table("participants")} (id,owner_kind,state,created_at) VALUES ($1,'accountless','active',$2)`,
-      [participantId, T.issued]);
-    await pool.query(`INSERT INTO ${table("storage_v11_owner_links")} (participant_id,owner_digest,state) VALUES ($1,$2,'active')`,
-      [participantId, owner]);
-    await pool.query(`DELETE FROM ${table("participants")} WHERE id=$1`, [participantId]);
-    await pool.query(`INSERT INTO ${table("analytics_storage_erasure_fences")} (source_id,owner_digest,terminal_event_digest,
-        terminal_sequence,terminal_revision,authority_epoch,public_authority_epoch) VALUES ($1,$2,$3,5,2,2,6)`,
-    [SOURCE_ID, owner, digest("retired-terminal")]);
-    await pool.query(`INSERT INTO ${table("analytics_storage_erasure_receipts")} (source_id,owner_digest,terminal_event_digest,
-        payload_contract) VALUES ($1,$2,$3,1)`, [SOURCE_ID, owner, digest("retired-terminal")]);
-    const options = { primaryPool: pool, ownerDigest: owner, schema: { primarySchema: schema } };
-    assert.equal(await hasPostgresAnalyticsOwnerResidue(options), false, "retained proof is not residue");
-    const result = await retirePostgresAnalyticsOwner(options);
-    assert.equal(result.status, "complete", "the closed owner inventory accepts the 0053 relations");
-    const retained = await pool.query(`SELECT
-        (SELECT count(*)::int FROM ${table("analytics_storage_erasure_fences")} WHERE owner_digest=$1) AS fences,
-        (SELECT count(*)::int FROM ${table("analytics_storage_erasure_receipts")} WHERE owner_digest=$1) AS receipts`, [owner]);
-    assert.deepEqual(retained.rows[0], { fences: 1, receipts: 1 });
-    assert.equal((await retirePostgresAnalyticsOwner(options)).status, "complete", "retirement stays replay-safe");
-  }, { chain: "repository" }));

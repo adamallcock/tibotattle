@@ -38,9 +38,10 @@
  *   PostgreSQL relation (it is untransferred legacy state);
  * - historicalPublication: production's per-day model publications and
  *   graph-preview freshness have no analytics_v2 counterpart;
- * - deletionLedger: the deletion-ledger tombstones. While a ledger database
- *   exists, readPostgresAdminDeletionLedger is a faithful source; the
- *   append-only line removes the ledger.
+ * - deletionLedger: the deletion-ledger tombstones. The PostgreSQL line has
+ *   no deletion ledger (decisions D2, D4 and D6 of 2026-09-26), so there is
+ *   no reader here; what the block reports once the ledger is gone is OWN-17
+ *   question 1, and until it is answered the root injects nothing.
  *
  * All primary reads run in one REPEATABLE READ READ ONLY snapshot. A
  * reviewed ApiError (for example 503 COLLECTION_CONTROL_UNAVAILABLE) keeps its
@@ -501,43 +502,6 @@ function typedOverview(typed: TypedRead) {
 async function required<T>(source: (() => Promise<T>) | undefined): Promise<T> {
   if (typeof source !== "function") unavailable();
   return source();
-}
-
-/**
- * The deletion-ledger block exactly as the Worker reads it: at most
- * 10 000 tombstones ordered by retain_until, the count and the earliest
- * retain_until. Only for a line that still has a ledger database.
- */
-export async function readPostgresAdminDeletionLedger(
-  ledgerPool: PostgresPool,
-  ledgerSchema: string,
-): Promise<PostgresAdminDeletionLedger> {
-  let s: string;
-  try {
-    s = quotePostgresIdentifier(ledgerSchema);
-  } catch {
-    return unavailable();
-  }
-  try {
-    const row = await withPostgresRead(ledgerPool, (client) => one<Row>(client,
-      `SELECT COUNT(*)::text AS total, ${iso("MIN(retain_until)")} AS earliest_retain_until
-         FROM (SELECT retain_until FROM ${s}."deletion_tombstones"
-                ORDER BY retain_until LIMIT $1) bounded_tombstones`,
-      [MAX_ADMIN_AGGREGATE_ROWS]), {
-      operation: "admin_overview.deletion_ledger",
-      statementTimeoutMilliseconds: 5_000,
-      lockTimeoutMilliseconds: 5_000,
-    });
-    if (row === null) unavailable();
-    const total = bounded(count(row.total));
-    return {
-      total: total.total,
-      bounded: total.bounded,
-      earliestRetainUntil: nullableTimestamp(row.earliest_retain_until),
-    };
-  } catch {
-    return unavailable();
-  }
 }
 
 /** The 'admin-overview-v0.5' body, or an ApiError (503 unless a reviewed code). */

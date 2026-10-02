@@ -245,7 +245,8 @@ const RUNTIME_ENVIRONMENT_NAMES = Object.freeze([
   "K_SERVICE", "PRIMARY_DATABASE", "PRIMARY_SCHEMA", "PRIMARY_INSTANCE_CONNECTION_NAME",
   "LEDGER_DATABASE", "LEDGER_SCHEMA", "LEDGER_INSTANCE_CONNECTION_NAME", "POSTGRES_IAM_USER",
   "POSTGRES_SOURCE_ID", "POSTGRES_SOURCE_NAMESPACE", "POSTGRES_RATE_LIMIT_SECRET",
-  "ENVELOPE_PUBLIC_JWK", "ENVELOPE_PRIVATE_JWK", "GCS_BUCKET_NAME", "GCS_ERASURE_BUCKET_HISTORY_PROOF",
+  "ENVELOPE_PUBLIC_JWK", "ENVELOPE_PRIVATE_JWK", "GCS_BUCKET_NAME", "GCS_QUARANTINE_BUCKET_HISTORY_PROOF",
+  "GCS_ERASURE_BUCKET_HISTORY_PROOF",
   "ENVIRONMENT", "ENROLLMENT_MODE", "IDENTITY_LINK_SECRET", "IDENTITY_LINK_SECRET_VERSION",
   "GOOGLE_OIDC_CLIENT_ID", "GOOGLE_OIDC_CLIENT_SECRET", "SIGN_IN_START_MAX_PER_MINUTE",
   "ACCOUNTLESS_ENROLLMENT_MODE", "ACCOUNTLESS_OWNERSHIP_MODE", "SOURCE_CONTENT_DIGEST",
@@ -279,10 +280,9 @@ async function freePort() {
   });
 }
 
-/** A migrated rehearsal schema pair with the state the intake specs seed. */
-async function seedSchema(base, m, schema, ledgerSchema) {
+/** A migrated rehearsal schema with the state the intake specs seed (no deletion ledger: D4, SIMP-4). */
+async function seedSchema(base, m, schema) {
   await applyPostgresMigrations({ role: "primary", schema, pool: base });
-  await applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool: base });
   const t = (name) => `"${schema}"."${name}"`;
   const now = new Date().toISOString();
   await base.query(`UPDATE ${t("collection_controls")}
@@ -311,7 +311,7 @@ let serverModule = null;
  * cloud-run/dist/server.mjs composed and served as the rehearsal's startOrigin does, behind EP-6.
  * `settings` replaces env values (S9: what the deploy gives an origin over a seeded schema).
  */
-async function startOrigin({ socket, schema, ledgerSchema, keys, nowMs = null, objects, settings = {} }) {
+async function startOrigin({ socket, schema, keys, nowMs = null, objects, settings = {} }) {
   serverModule ??= await import(pathToFileURL(DIST_SERVER).href);
   const port = await freePort();
   const hostOrigin = `http://127.0.0.1:${port}`;
@@ -323,7 +323,6 @@ async function startOrigin({ socket, schema, ledgerSchema, keys, nowMs = null, o
     PORT: String(port),
     HOST_ORIGIN: hostOrigin,
     PRIMARY_SCHEMA: schema,
-    LEDGER_SCHEMA: ledgerSchema,
     PRIMARY_DATABASE: process.env.PG_TEST_DATABASE || "postgres",
     PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:synthetic-edge-e2e-primary",
     POSTGRES_IAM_USER: "synthetic-edge-e2e-runtime@synthetic.iam",
@@ -333,7 +332,7 @@ async function startOrigin({ socket, schema, ledgerSchema, keys, nowMs = null, o
     ENVELOPE_PUBLIC_JWK: keys.publicText,
     ENVELOPE_PRIVATE_JWK: keys.privateText,
     GCS_BUCKET_NAME: bucket,
-    GCS_ERASURE_BUCKET_HISTORY_PROOF: JSON.stringify({
+    GCS_QUARANTINE_BUCKET_HISTORY_PROOF: JSON.stringify({
       bucket, bucketGeneration: "1", bucketMetageneration: "1", softDeleteRetentionDurationSeconds: "0",
     }),
     ACCOUNTLESS_ENROLLMENT_MODE: "enabled",
@@ -403,20 +402,19 @@ async function fixture() {
     assert.equal(version.rows[0].address, null, "the local Unix socket only");
     assert.equal(Math.floor(version.rows[0].version / 10_000), 17, "PostgreSQL 17");
     const schema = `tibotattle_fastpath_edge_e2e_${randomBytes(4).toString("hex")}`;
-    const ledgerSchema = `${schema}_ledger`;
     const created = [];
     disposers.push(async () => {
       for (const name of [...created].reverse()) await base.query(`DROP SCHEMA IF EXISTS "${name}" CASCADE`);
       await base.end();
     });
-    for (const name of [schema, ledgerSchema]) {
+    for (const name of [schema]) {
       await base.query(`CREATE SCHEMA "${name}"`);
       created.push(name);
     }
-    const t = await seedSchema(base, m, schema, ledgerSchema);
+    const t = await seedSchema(base, m, schema);
     const keys = await envelopeKeys();
     const objects = new Map();
-    const origin = await startOrigin({ socket, schema, ledgerSchema, keys, objects });
+    const origin = await startOrigin({ socket, schema, keys, objects });
     disposers.push(() => origin.close());
     const invoker = createSyntheticServiceAccountKey(EDGE_E2E_INVOKER);
     const frontEnd = createGoogleFrontEnd({
@@ -434,7 +432,7 @@ async function fixture() {
     const reference = await createReferenceInstance({ ...common, envelope: keys });
     disposers.push(() => reference.dispose());
     return {
-      m, compatibility, bundle, socket, base, schema, ledgerSchema, created, t, keys, objects, origin, invoker,
+      m, compatibility, bundle, socket, base, schema, created, t, keys, objects, origin, invoker,
       frontEnd, access, sparkle, assets, clientKeySecret, edge, reference, common,
       allExchanges: [],
       rows: [],
@@ -2212,15 +2210,19 @@ test("S9 golden: the community/daily read is byte-equal through the edge and rep
     assert.notEqual(rehearsal.status, "error", JSON.stringify(rehearsal.error ?? null));
     assert.equal(rehearsal.steps.read.status, 200);
     assert.ok(rehearsal.parity?.families, "the rehearsal produced a parity table");
-    const [schema, ledgerSchema] = kept;
-    assert.equal(ledgerSchema, `${schema}_ledger`);
+    // The rehearsal keeps its one primary schema and the importers' control
+    // schema; there is no deletion-ledger schema (LEAD-SIMP).
+    const [schema, controlSchema] = kept;
+    assert.equal(kept.length, 2, JSON.stringify(kept));
+    assert.match(controlSchema, /^typed_legacy_transfer_rehearsal_ctl_[0-9a-f]{8}$/u);
+    assert.equal(kept.some((name) => /ledger/u.test(name)), false, "no ledger schema is created");
     // What scripts/gcp-fastpath-test-deploy.mjs gives an edge-test origin over a
     // seeded schema: the golden's source (without it every typed route of the
     // live write tier answered 503 BACKEND_STORAGE_UNAVAILABLE, 2026-10-01) and
     // env.production's enrollment, accountless and sign-in settings.
     const dump = JSON.parse(await readFile(join(GOLDEN, "dump", "usage-monitor-db.json"), "utf8"));
     const settings = Object.fromEntries([...originSourceEnv(goldenSourceIdentity(dump)), ...edgeTestProductionEnv()]);
-    origin = await startOrigin({ socket: f.socket, schema, ledgerSchema, keys: f.keys, nowMs: manifest.nowMs,
+    origin = await startOrigin({ socket: f.socket, schema, keys: f.keys, nowMs: manifest.nowMs,
       objects: new Map(), settings });
     const frontEnd = createGoogleFrontEnd({ invoker: f.invoker, verifiers: [EDGE_E2E_VERIFIER], audience: EDGE_E2E_AUDIENCE,
       upstreamOrigin: EDGE_E2E_UPSTREAM_ORIGIN, origin: loopbackOrigin(origin.port) });

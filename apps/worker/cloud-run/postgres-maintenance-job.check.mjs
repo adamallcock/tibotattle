@@ -27,6 +27,7 @@ const vite = await createServer({
   appType: "custom",
 });
 const job = await vite.ssrLoadModule("/cloud-run/postgres-maintenance-job.mjs");
+const configuration = await vite.ssrLoadModule("/cloud-run/postgres-production-configuration.mjs");
 const pass = await vite.ssrLoadModule("/src/postgres-lifecycle-pass.ts");
 const { CLOUD_RUN_IAM_TEST_TARGET } = await vite.ssrLoadModule("/cloud-run/postgres-test-dispatch.mjs");
 after(async () => { await vite.close(); });
@@ -154,11 +155,7 @@ test("both profiles accept their synthetic environment and keep secrets out of t
   assert.equal(staging.plane, "staging");
   assert.equal(staging.bucket, STAGING_BUCKET);
 
-  // A receipt that carries the proof is accepted as the proof itself.
-  const wrapped = job.readPostgresMaintenanceJobConfiguration(productionJobEnv({
-    GCS_QUARANTINE_BUCKET_HISTORY_PROOF: JSON.stringify({ schemaVersion: "synthetic", proof: proof(BUCKET) }),
-  }), "maintenance-job");
-  assert.deepEqual({ ...wrapped.historyProof }, proof(BUCKET));
+  assert.deepEqual({ ...staging.historyProof }, proof(STAGING_BUCKET));
 });
 
 test("the job's own refusals come first and hold even for empty values", () => {
@@ -206,8 +203,14 @@ test("the shared production configuration's refusals pass through unchanged", ()
     (error) => typeof error?.code === "string" && error.code.endsWith("_MISSING"));
 });
 
-test("the OD-2 quarantine history proof is required, well formed and bound to the bucket", () => {
+test("the OD-2 quarantine history proof is CR-3's one parse: required, closed and bound to the bucket", () => {
   const name = "GCS_QUARANTINE_BUCKET_HISTORY_PROOF";
+  // The job's proof is exactly CR-3's resources.bucketHistoryProof: one parser, one set of codes.
+  const env = productionJobEnv();
+  assert.deepEqual({ ...job.readPostgresMaintenanceJobConfiguration(env, "maintenance-job").historyProof },
+    { ...configuration.readProductionConfiguration(env, "maintenance-job").resources.bucketHistoryProof });
+  assert.equal("POSTGRES_MAINTENANCE_JOB_HISTORY_PROOF_VARIABLE" in job, false);
+  assert.equal("readPostgresMaintenanceJobHistoryProof" in job, false);
   const cases = [
     [without(productionJobEnv(), name), `${name}_MISSING`],
     [productionJobEnv({ [name]: "" }), `${name}_MISSING`],
@@ -218,11 +221,21 @@ test("the OD-2 quarantine history proof is required, well formed and bound to th
       `${name}_INVALID`],
     [productionJobEnv({ [name]: JSON.stringify(proof(BUCKET, { bucketGeneration: "not-a-generation" })) }),
       `${name}_INVALID`],
-    [productionJobEnv({ [name]: JSON.stringify(proof("synthetic-other-bucket")) }), `${name}_BUCKET_MISMATCH`],
+    // A bucket mismatch is CR-3's _INVALID (there is no separate mismatch code).
+    [productionJobEnv({ [name]: JSON.stringify(proof("synthetic-other-bucket")) }), `${name}_INVALID`],
+    // The closed four-key record only, as OPS-2 renders it: a receipt wrapper
+    // or an extra key is refused.
+    [productionJobEnv({ [name]: JSON.stringify({ schemaVersion: "synthetic", proof: proof(BUCKET) }) }),
+      `${name}_INVALID`],
+    [productionJobEnv({ [name]: JSON.stringify(proof(BUCKET, { extra: "1" })) }), `${name}_INVALID`],
+    [productionJobEnv({ [name]: JSON.stringify(proof(BUCKET, { bucketGeneration: "0" })) }), `${name}_INVALID`],
   ];
   for (const [env, expected] of cases) {
     assert.throws(() => job.readPostgresMaintenanceJobConfiguration(env, "maintenance-job"), code(expected));
   }
+  // The staging profile binds the proof to the staging bucket the same way.
+  assert.throws(() => job.readPostgresMaintenanceJobConfiguration(
+    stagingJobEnv({ [name]: JSON.stringify(proof(BUCKET)) }), "staging-maintenance-job"), code(`${name}_INVALID`));
 });
 
 test("the cycle is the start of the UTC minute, and a bad clock is refused", () => {

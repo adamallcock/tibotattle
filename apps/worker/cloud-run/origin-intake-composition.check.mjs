@@ -26,7 +26,6 @@ import { createOriginRouteModuleRegistry } from "./origin-route-modules.mjs";
 const ORIGIN = "http://127.0.0.1:8787";
 const unreachable = (name) => () => { throw new Error(`${name} must not be reached by this check`); };
 const pool = { connect: unreachable("primary pool") };
-const ledgerPool = { connect: unreachable("ledger pool") };
 const ROUTE_POLICY = Object.freeze([
   { pathname: "/api/v1/device/upload-authorizations", methods: ["POST"] },
   { pathname: "/api/v1/community/daily", methods: ["GET"] },
@@ -61,7 +60,6 @@ function options(overrides = {}) {
       ]),
       bearer: stubs(["authenticatePostgresDeviceBearer"]),
       transport: stubs(["abandonPostgresDeviceUploadAuthorization", "authenticatePostgresDevice"]),
-      ledgerAuthority: stubs(["hasPostgresDeletionTombstone"]),
       personalDevices: stubs(["authenticatePostgresPersonalSession", "assertPostgresPersonalSessionCsrf"]),
       controls: stubs(["assertPostgresCollectionControlFromPool"]),
       crypto: stubs(["decryptSyntheticEnvelope", "sha256Hex"]),
@@ -74,8 +72,7 @@ function options(overrides = {}) {
       uploadAuthorization: stubs(["createPostgresDeviceUploadAuthorization"]),
     },
     primaryPool: pool,
-    ledgerPool,
-    schemaOptions: Object.freeze({ primarySchema: "synthetic_primary", ledgerSchema: "synthetic_primary_ledger" }),
+    schemaOptions: Object.freeze({ primarySchema: "synthetic_primary" }),
     admissionEnv: Object.freeze({}),
     assertAdmissionBindings: unreachable("assertAdmissionBindings"),
     assertAttemptAllowed: unreachable("assertAttemptAllowed"),
@@ -162,7 +159,7 @@ test("the v1.0 and v0.1 envelopes each reach their own admitter", async () => {
   ]);
 });
 
-test("only the host modes whose clients reach the intake compose it; cloud-run-iam does not", () => {
+test("only the host modes whose clients reach the intake compose it; the retired cloud-run-iam does not", () => {
   assert.deepEqual([...ORIGIN_INTAKE_HOST_MODES], ["health-and-v12-day-manifest", "fastpath-test"]);
   for (const mode of ORIGIN_INTAKE_HOST_MODES) assert.equal(originIntakeServedInMode(mode), true, mode);
   for (const mode of ["cloud-run-iam", "health-only", undefined, null, ""]) {
@@ -237,6 +234,18 @@ test("the composition refuses missing adapters and a route policy without its pa
   }
   assert.throws(() => createOriginIntakeComposition({ ...base, assertStorageCurrent: undefined }),
     (error) => error.code === "ORIGIN_INTAKE_COMPOSITION_INVALID");
+  // One schema, no deletion-ledger pool or adapter (LEAD-SIMP).
+  for (const schemaOptions of [
+    { primarySchema: "synthetic_primary", ledgerSchema: "synthetic_primary_ledger" },
+    {},
+    null,
+    { primarySchema: 1 },
+  ]) {
+    assert.throws(() => createOriginIntakeComposition({ ...base, schemaOptions }),
+      (error) => error.code === "ORIGIN_INTAKE_COMPOSITION_INVALID", JSON.stringify(schemaOptions));
+  }
+  assert.equal("ledgerAuthority" in base.adapters, false);
+  assert.doesNotThrow(() => createOriginIntakeComposition(base));
   assert.throws(() => createOriginIntakeComposition({
     ...base, routePolicy: ROUTE_POLICY.filter((entry) => !entry.pathname.includes("domain-activate")),
   }), (error) => error.code === "ORIGIN_INTAKE_COMPOSITION_INVALID");

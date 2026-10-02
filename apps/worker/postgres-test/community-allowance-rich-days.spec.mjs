@@ -1,5 +1,5 @@
 import { expect, it } from "vitest";
-import { richV11Day, richV12Day } from "../../../scripts/gcp-cloud-run-journey.mjs";
+import { richV11Day, richV12Day } from "./fixtures/rich-telemetry-days.mjs";
 import {
   finishProviderEffectiveModelComposition,
   finishProviderEffectiveQuotaAnalysis,

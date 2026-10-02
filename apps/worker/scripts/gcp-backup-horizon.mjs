@@ -56,7 +56,7 @@ import {
   onDemandExpiresOn,
   verifyBackupHorizonReceipt,
 } from "../cloud-run/ops-backup-horizon.mjs";
-import { GCP_PRIVATE_TEST_TARGET } from "./gcp-private-test-deploy.mjs";
+import { GCP_PRIVATE_TEST_TARGET } from "./gcp-test-project.mjs";
 
 export const BACKUP_ON_DEMAND_RECEIPT_SCHEMA = "tibotattle-backup-on-demand-v1";
 export const BACKUP_PRUNE_JOURNAL_SCHEMA = "tibotattle-backup-horizon-prune-v1";

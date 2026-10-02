@@ -58,13 +58,10 @@ test("Cloud Run PostgreSQL device pairing issues bounded social pairing codes be
     connectionTimeoutMillis: 5_000,
   };
   const primaryPool = new pg.Pool({ ...poolOptions, application_name: "pg-device-pairing-primary-test" });
-  const ledgerPool = new pg.Pool({ ...poolOptions, application_name: "pg-device-pairing-ledger-test" });
   const suffix = randomBytes(5).toString("hex");
   const primarySchema = `device_pairing_${suffix}`;
-  const ledgerSchema = `device_pairing_l_${suffix}`;
-  const schemaOptions = { primarySchema, ledgerSchema };
+  const schemaOptions = { primarySchema };
   let primaryCreated = false;
-  let ledgerCreated = false;
   try {
     const server = await primaryPool.query(
       "SELECT current_setting('server_version_num')::integer AS version, inet_server_addr() AS address",
@@ -75,10 +72,7 @@ test("Cloud Run PostgreSQL device pairing issues bounded social pairing codes be
 
     await primaryPool.query(`CREATE SCHEMA "${primarySchema}"`);
     primaryCreated = true;
-    await ledgerPool.query(`CREATE SCHEMA "${ledgerSchema}"`);
-    ledgerCreated = true;
     await applyPostgresMigrations({ role: "primary", schema: primarySchema, pool: primaryPool });
-    await applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool: ledgerPool });
     await primaryPool.query(
       `UPDATE ${table(primarySchema, "collection_controls")}
           SET control_state = 'operational', enrollment_enabled = true,
@@ -91,7 +85,6 @@ test("Cloud Run PostgreSQL device pairing issues bounded social pairing codes be
     const devicePairing = await vite.ssrLoadModule("/src/postgres-device-pairing.ts");
     const personalSession = await vite.ssrLoadModule("/src/postgres-personal-session.ts");
     const personalDevices = await vite.ssrLoadModule("/src/postgres-personal-devices.ts");
-    const ledgerAuthority = await vite.ssrLoadModule("/src/postgres-ledger-authority.ts");
     const accountScoped = await vite.ssrLoadModule("/src/account-scoped-ingest.ts");
     const boundedBody = await vite.ssrLoadModule("/src/bounded-body.ts");
     const sessionModule = await vite.ssrLoadModule("/src/session.ts");
@@ -120,13 +113,11 @@ test("Cloud Run PostgreSQL device pairing issues bounded social pairing codes be
     const healthDispatch = async () => new Response(null, { status: 200 });
     const dispatch = createPostgresTestDevicePairingDispatch({
       primaryPool,
-      ledgerPool,
       schemaOptions,
       authenticatePostgresPersonalSession: personalSession.authenticatePostgresPersonalSessionForRead,
       assertPostgresPersonalSessionCsrf: personalDevices.assertPostgresPersonalSessionCsrf,
       assertAccountScopedLocalPreview: accountScoped.assertAccountScopedLocalPreview,
       createPostgresDevicePairing: devicePairing.createPostgresDevicePairing,
-      hasPostgresDeletionTombstone: ledgerAuthority.hasPostgresDeletionTombstone,
       healthDispatch,
       readBoundedRequestBody: boundedBody.readBoundedRequestBody,
       maxRequestBytes: constants.MAX_REQUEST_BYTES,
@@ -335,7 +326,6 @@ test("Cloud Run PostgreSQL device pairing issues bounded social pairing codes be
     })), 503, "UPLOAD_REGISTRATION_DISABLED");
   } finally {
     if (primaryCreated) await primaryPool.query(`DROP SCHEMA IF EXISTS "${primarySchema}" CASCADE`);
-    if (ledgerCreated) await ledgerPool.query(`DROP SCHEMA IF EXISTS "${ledgerSchema}" CASCADE`);
-    await Promise.all([primaryPool.end(), ledgerPool.end()]);
+    await primaryPool.end();
   }
 });

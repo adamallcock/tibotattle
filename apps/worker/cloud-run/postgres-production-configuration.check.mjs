@@ -36,7 +36,7 @@ const vite = await createServer({
 });
 let canonical;
 try {
-  const [storage, crypto, identityLink, postgresClient, apple, rateLimiter, publication] = await Promise.all([
+  const [storage, crypto, identityLink, postgresClient, apple, rateLimiter, publication, quarantineStore] = await Promise.all([
     vite.ssrLoadModule("/src/telemetry-storage-mode.ts"),
     vite.ssrLoadModule("/src/crypto.ts"),
     vite.ssrLoadModule("/src/identity-link-configuration.ts"),
@@ -44,8 +44,9 @@ try {
     vite.ssrLoadModule("/src/identity-apple.ts"),
     vite.ssrLoadModule("/src/postgres-rate-limiter.ts"),
     vite.ssrLoadModule("/src/storage-publication-worker.ts"),
+    vite.ssrLoadModule("/src/gcs-quarantine-object-store.ts"),
   ]);
-  canonical = { storage, crypto, identityLink, postgresClient, apple, rateLimiter, publication };
+  canonical = { storage, crypto, identityLink, postgresClient, apple, rateLimiter, publication, quarantineStore };
 } finally {
   await vite.close();
 }
@@ -71,7 +72,11 @@ function envelopeKeys(kid) {
   };
 }
 
-/** A bucket-birth history proof: retired as a runtime setting, used only to show its refusal. */
+/**
+ * A bucket-birth history proof (the OPS-2 receipt's proof record): required
+ * as GCS_QUARANTINE_BUCKET_HISTORY_PROOF (OD-2), refused under the retired
+ * GCS_ERASURE_BUCKET_HISTORY_PROOF name.
+ */
 function proof(bucket, extra = {}) {
   return JSON.stringify({
     bucket,
@@ -101,6 +106,7 @@ function productionResources() {
     PRIMARY_SCHEMA: "origin_primary",
     POSTGRES_IAM_USER: "origin-runtime@synthetic-project.iam",
     GCS_BUCKET_NAME: "synthetic-origin-quarantine",
+    GCS_QUARANTINE_BUCKET_HISTORY_PROOF: proof("synthetic-origin-quarantine"),
   };
 }
 
@@ -153,6 +159,7 @@ function stagingPlane() {
     TELEMETRY_STORAGE_NAMESPACE: "synthetic-staging-namespace",
     PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:origin-staging-primary",
     GCS_BUCKET_NAME: "synthetic-staging-quarantine",
+    GCS_QUARANTINE_BUCKET_HISTORY_PROOF: proof("synthetic-staging-quarantine"),
     ACCESS_TEAM_DOMAIN: "synthetic.cloudflareaccess.com",
     ACCESS_AUD: "a".repeat(64),
     ACCESS_ADMIN_EMAIL: "owner@synthetic.example",
@@ -512,8 +519,8 @@ test("a valid production environment yields a frozen configuration with opaque s
     sourceCommit: COMMIT,
     workload: { kind: "service", name: "tibotattle-origin" },
   });
-  // One instance and no deletion ledger: no ledger resource and no
-  // bucket-history proof (SIMP-0 item 7).
+  // One instance and no deletion ledger: no ledger resource (SIMP-0 item 7).
+  // The quarantine bucket carries its birth proof (OD-2).
   assert.deepEqual(config.resources, {
     primary: {
       instanceConnectionName: "synthetic-project:us-east1:origin-primary",
@@ -522,8 +529,10 @@ test("a valid production environment yields a frozen configuration with opaque s
     },
     iamUser: "origin-runtime@synthetic-project.iam",
     bucket: "synthetic-origin-quarantine",
+    bucketHistoryProof: JSON.parse(proof("synthetic-origin-quarantine")),
   });
-  assert.deepEqual(Reflect.ownKeys(config.resources), ["primary", "iamUser", "bucket"]);
+  assert.deepEqual(Reflect.ownKeys(config.resources), ["primary", "iamUser", "bucket", "bucketHistoryProof"]);
+  assert.equal(Object.isFrozen(config.resources.bucketHistoryProof), true);
   assert.equal(config.poolSizes, configuration.PRODUCTION_POOL_SIZES);
   assert.equal(config.admissionTimeouts, configuration.PRODUCTION_ADMISSION_TIMEOUTS);
   assert.equal(config.rateLimits.edgeTier, configuration.EDGE_TIER_RATE_LIMIT_NAMES);
@@ -1360,6 +1369,49 @@ test("the staging maintenance job requires the enabled switch too", () => {
   assert.deepEqual(config.deployment.workload, { kind: "job", name: "tibotattle-staging-maintenance" });
 });
 
+test("OD-2: every profile requires the quarantine bucket's birth proof, closed and bound to its bucket", () => {
+  const profiles = [
+    ["production", (overrides) => productionEnv(overrides), "synthetic-origin-quarantine"],
+    ["staging", (overrides) => stagingEnv(overrides), "synthetic-staging-quarantine"],
+    ...JOB_PROFILES.map((job) => [job, (overrides) => jobEnv(job, overrides),
+      job.startsWith("staging-") ? "synthetic-staging-quarantine" : "synthetic-origin-quarantine"]),
+  ];
+  const code = "GCS_QUARANTINE_BUCKET_HISTORY_PROOF_INVALID";
+  for (const [profile, env, bucket] of profiles) {
+    const accepted = readProductionConfiguration(env(), profile);
+    assert.deepEqual(accepted.resources.bucketHistoryProof, JSON.parse(proof(bucket)), profile);
+    expectCode(() => readProductionConfiguration(without(env(), "GCS_QUARANTINE_BUCKET_HISTORY_PROOF"), profile),
+      "GCS_QUARANTINE_BUCKET_HISTORY_PROOF_MISSING");
+    for (const value of [
+      "",
+      proof("another-synthetic-quarantine"),
+      proof(bucket, { extra: "1" }),
+      JSON.stringify({ proof: JSON.parse(proof(bucket)) }),
+      JSON.stringify({ schemaVersion: "tibotattle-gcp-bucket-birth-v1", proof: JSON.parse(proof(bucket)) }),
+      proof(bucket, { softDeleteRetentionDurationSeconds: "604800" }),
+      proof(bucket, { softDeleteRetentionDurationSeconds: 0 }),
+      proof(bucket, { bucketGeneration: "0" }),
+      proof(bucket, { bucketGeneration: "01" }),
+      proof(bucket, { bucketGeneration: 1700000000000001 }),
+      proof(bucket, { bucketMetageneration: "9223372036854775808" }),
+      "[]",
+      "null",
+      "not-json",
+      " ".repeat(2_000),
+    ]) {
+      expectCode(() => readProductionConfiguration(env({ GCS_QUARANTINE_BUCKET_HISTORY_PROOF: value }), profile),
+        value === "" ? "GCS_QUARANTINE_BUCKET_HISTORY_PROOF_MISSING" : code);
+    }
+    // The retired erasure-era name stays refused next to a valid proof.
+    expectCode(() => readProductionConfiguration(env({ GCS_ERASURE_BUCKET_HISTORY_PROOF: proof(bucket) }), profile),
+      "GCS_ERASURE_BUCKET_HISTORY_PROOF_FORBIDDEN");
+  }
+  // A test-target bucket is still refused by its own code, before the proof.
+  expectCode(() => readProductionConfiguration(productionEnv({ GCS_BUCKET_NAME: CLOUD_RUN_IAM_TEST_TARGET.gcsBucket,
+    GCS_QUARANTINE_BUCKET_HISTORY_PROOF: proof(CLOUD_RUN_IAM_TEST_TARGET.gcsBucket) }), "production"),
+  "GCS_BUCKET_NAME_TEST_TARGET_FORBIDDEN");
+});
+
 // ---------------------------------------------------------------------------
 // Mirrors of Worker validators, cross-checked against the canonical source
 
@@ -1381,6 +1433,35 @@ function acceptsCanonical(action) {
     return false;
   }
 }
+
+test("the quarantine bucket-history proof grammar matches parseGcsQuarantineBucketHistoryProof (OD-2)", () => {
+  const bucket = "synthetic-origin-quarantine";
+  for (const value of [
+    proof(bucket),
+    proof(bucket, { bucketGeneration: "9223372036854775807", bucketMetageneration: "2" }),
+    proof(bucket, { bucketGeneration: "9223372036854775808" }),
+    proof(bucket, { bucketGeneration: "0" }),
+    proof(bucket, { bucketGeneration: "1e3" }),
+    proof(bucket, { bucketMetageneration: "" }),
+    proof(bucket, { softDeleteRetentionDurationSeconds: "1" }),
+    proof("another-synthetic-quarantine"),
+    proof(bucket, { extra: true }),
+    JSON.stringify({ proof: JSON.parse(proof(bucket)) }),
+    JSON.stringify({ bucket, bucketGeneration: "1", bucketMetageneration: "1" }),
+    "{}",
+    "[]",
+    "not-json",
+    `${proof(bucket)}${" ".repeat(1_100)}`,
+  ]) {
+    assert.equal(
+      acceptsProduction({ GCS_QUARANTINE_BUCKET_HISTORY_PROOF: value }),
+      acceptsCanonical(() => canonical.quarantineStore.parseGcsQuarantineBucketHistoryProof(value, bucket)),
+      value.slice(0, 120),
+    );
+  }
+  assert.equal(configuration.QUARANTINE_BUCKET_HISTORY_PROOF_SETTING,
+    canonical.quarantineStore.GCS_QUARANTINE_BUCKET_HISTORY_PROOF_SETTING);
+});
 
 test("the namespace grammar matches parseTelemetryStorageMode", () => {
   const values = [
@@ -1436,19 +1517,17 @@ test("the IAM user, schema, Apple key and identity-version mirrors match their s
         .resources.iamUser, normalizeIamUser(value));
     }
   }
-  // The primary schema grammar. Until SIMP-4 removes it, the canonical
-  // runtime validator still takes a second schema; a fixed, distinct probe
-  // name fills it, so only the primary value decides.
-  const SECOND_SCHEMA_PROBE = "synthetic_second_schema_probe";
+  // The primary schema grammar. LEAD-SIMP made the canonical runtime
+  // validator primary-only (it refuses a second schema key), so the primary
+  // value alone decides.
   for (const primary of [
     "origin_primary", "pg_primary", "information_schema", "Origin", "_origin",
     "a".repeat(63), "a".repeat(64), "origin-primary", "origin primary",
   ]) {
-    assert.notEqual(primary, SECOND_SCHEMA_PROBE);
     assert.equal(
       acceptsProduction({ PRIMARY_SCHEMA: primary }),
       acceptsCanonical(() => canonical.postgresClient.createPostgresSchemaConfig({
-        primarySchema: primary, ledgerSchema: SECOND_SCHEMA_PROBE,
+        primarySchema: primary,
       })),
       primary,
     );
@@ -1523,7 +1602,8 @@ test("one Cloud SQL instance and no deletion ledger: retired settings are refuse
     ...JOB_PROFILES.map((job) => [job, jobEnv(job)]),
   ]) {
     const config = expectAccepted(env, profile);
-    assert.deepEqual(Object.keys(config.resources), ["primary", "iamUser", "bucket"], profile);
+    assert.deepEqual(Object.keys(config.resources), ["primary", "iamUser", "bucket", "bucketHistoryProof"], profile);
+    assert.equal(config.resources.bucketHistoryProof.bucket, config.resources.bucket, profile);
     const workerEnv = createProductionWorkerEnv(config, profile.endsWith("-job") ? {} : {
       bindings: serviceBindings(config.rateLimits.originTier),
     });

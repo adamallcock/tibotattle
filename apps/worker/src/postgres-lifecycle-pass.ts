@@ -230,6 +230,13 @@ class LifecyclePassRefusal extends Error {
   }
 }
 
+/**
+ * This pass reads the migration receipt itself, inside its own transaction.
+ * It is the one named, counted exception to the single storage receipt
+ * reader (owner decision OWN-19, round 8: pinned until CR phase B, where
+ * D-CRB consolidates it with the dispatch's reader); scripts/
+ * ledger-absence.check.mjs pins its references, so do not add another.
+ */
 const MIGRATION_HISTORY_TABLE = "_tibotattle_migration_history";
 /** The reconciler's and the lease token's 13-digit epoch bound (year 2286). */
 const MAX_EPOCH = 9_999_999_999_999;

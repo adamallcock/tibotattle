@@ -541,8 +541,12 @@ test("composition refuses malformed dependencies", () => {
   for (const deps of [
     { ...base, pools: {}, schemaOptions: { primarySchema: "s" } },
     { ...base, pools: { primary: { connect() {} } }, schemaOptions: {} },
+    // The PostgreSQL line has no deletion ledger: a stale root's ledger pool
+    // or schema, or any other key, is refused rather than ignored.
     { ...base, pools: { primary: { connect() {} }, ledger: {} }, schemaOptions: { primarySchema: "s" } },
     { ...base, pools: { primary: { connect() {} }, ledger: { connect() {} } }, schemaOptions: { primarySchema: "s" } },
+    { ...base, pools: { primary: { connect() {} }, other: { connect() {} } }, schemaOptions: { primarySchema: "s" } },
+    { ...base, pools: { primary: { connect() {} } }, schemaOptions: { primarySchema: "s", ledger: "s_ledger" } },
     { ...base, env: {}, pools: { primary: { connect() {} } }, schemaOptions: { primarySchema: "s" } },
     { ...base, pools: { primary: { connect() {} } }, schemaOptions: { primarySchema: "s" },
       overviewSources: { other: async () => ({}) } },

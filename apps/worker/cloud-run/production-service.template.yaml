@@ -45,6 +45,8 @@
 #   PRIMARY_DATABASE, PRIMARY_SCHEMA   its database and schema
 #   POSTGRES_IAM_USER                  the runtime's IAM database user
 #   GCS_BUCKET_NAME                    the quarantine object bucket
+#   GCS_BUCKET_GENERATION,             its birth proof's generation and
+#   GCS_BUCKET_METAGENERATION          metageneration (OD-2, below)
 #   SECRET_VERSION_<NAME>              the pinned Secret Manager version of
 #                                      each secret NAME below; for the
 #                                      optional GitHub distribution token,
@@ -58,9 +60,12 @@
 # run.invoker to a public principal.
 #
 # The service uses one Cloud SQL instance and no deletion ledger (decisions
-# D2 and D4): no ledger instance, database or schema and no bucket-history
-# proof is configured here. The bucket-birth proof stays infrastructure
-# evidence, which the service does not read.
+# D2 and D4): no ledger instance, database or schema is configured here, and
+# never the retired erasure-era proof setting. Owner decision OD-2
+# (2026-10-02) re-admits the quarantine bucket's birth proof under its own
+# name: GCS_QUARANTINE_BUCKET_HISTORY_PROOF is the OPS-2 bucket-birth
+# receipt's proof record for GCS_BUCKET_NAME, as the desired state pins it,
+# which the quarantine store needs on a bucket with soft delete disabled.
 #
 # Secrets come only from Secret Manager through secretKeyRef, with pinned
 # versions. The Cloudflare-only edge secrets (the edge client key secret, the
@@ -130,6 +135,8 @@ spec:
               value: '${POSTGRES_IAM_USER}'
             - name: GCS_BUCKET_NAME
               value: '${GCS_BUCKET_NAME}'
+            - name: GCS_QUARANTINE_BUCKET_HISTORY_PROOF
+              value: '{"bucket":"${GCS_BUCKET_NAME}","bucketGeneration":"${GCS_BUCKET_GENERATION}","bucketMetageneration":"${GCS_BUCKET_METAGENERATION}","softDeleteRetentionDurationSeconds":"0"}'
             # IDENTITY_LINK_SECRET also keys the edge admission replay.
             - name: IDENTITY_LINK_SECRET
               valueFrom:

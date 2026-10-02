@@ -36,14 +36,15 @@ import {
 } from "../src/admission.ts";
 import { MAX_REQUEST_BYTES, TELEMETRY_CONSENT_VERSION } from "../src/constants.ts";
 import { readBoundedRequestBody } from "../src/bounded-body.ts";
-import { createGcsQuarantineObjectStore } from "../src/gcs-quarantine-object-store.ts";
-import { createGcsErasureBucketHistoryProof } from "../src/gcs-erasure-object-store.ts";
+import {
+  createGcsQuarantineObjectStore,
+  GCS_QUARANTINE_BUCKET_HISTORY_PROOF_SETTING,
+  parseGcsQuarantineBucketHistoryProof,
+} from "../src/gcs-quarantine-object-store.ts";
 import { createFilesystemAssets } from "./assets.mjs";
 import { assertPostgresScheduledMaintenanceEnabled } from "./postgres-maintenance-gate.mjs";
 import { createPostgresUploadIngressBudget } from "../src/postgres-ingress-budget.ts";
 import { createPostgresRateLimiter } from "../src/postgres-rate-limiter.ts";
-import { createPostgresGoogleHandoffDispatch } from "../src/postgres-google-handoff.ts";
-import { createPostgresGoogleEnrollmentDispatch } from "../src/postgres-google-enrollment.ts";
 import {
   ACCOUNTLESS_ENROLLMENT_MAX_REQUEST_BYTES,
   parseAccountlessEnrollmentJson,
@@ -100,13 +101,11 @@ import { validateTelemetryV12StagedChunk } from "../src/telemetry-v12-repository
 import { validateTelemetryV12Envelope } from "@app-usagemonitor/telemetry-contract";
 import { assertPostgresTelemetryTransportWriteAllowed } from "../src/postgres-telemetry-format-authority.ts";
 import { TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION } from "@app-usagemonitor/telemetry-contract";
-import { hasPostgresDeletionTombstone } from "../src/postgres-ledger-authority.ts";
 // Legacy intake adapters (IN-2 v1.1, IN-3 v1.0/v0.1), composed by
 // ./origin-intake-composition.mjs beside the v1.2 routes.
 import * as postgresTelemetryV11Live from "../src/postgres-telemetry-v11-live-admission.ts";
 import * as postgresDeviceBearerAuth from "../src/postgres-device-bearer-auth.ts";
 import * as postgresTypedV12Transport from "../src/postgres-typed-v12-transport.ts";
-import * as postgresLedgerAuthority from "../src/postgres-ledger-authority.ts";
 import * as postgresPersonalDevices from "../src/postgres-personal-devices.ts";
 import * as postgresCollectionControls from "../src/postgres-collection-controls.ts";
 import * as workerCrypto from "../src/crypto.ts";
@@ -123,7 +122,6 @@ import {
 } from "./owner-bootstrap.mjs";
 import { installNodeTimingSafeEqual } from "./node-crypto-adapter.mjs";
 import {
-  CLOUD_RUN_IAM_TEST_TARGET,
   createPostgresTestCommunityDailyDispatch,
   createPostgresTestDevicePairingDispatch,
   createPostgresTestDevicePairingClaimDispatch,
@@ -212,20 +210,22 @@ function sourceDigest() {
   if (value === undefined || !DIGEST_PATTERN.test(value)) configurationError("SOURCE_CONTENT_DIGEST_INVALID");
   return value;
 }
-function gcsHistoryProof() {
-  const raw = required("GCS_ERASURE_BUCKET_HISTORY_PROOF");
-  let value;
-  try {
-    value = JSON.parse(raw);
-  } catch {
-    configurationError("GCS_ERASURE_BUCKET_HISTORY_PROOF_INVALID");
+/**
+ * Owner decision OD-2 (2026-10-02): the quarantine bucket's birth proof,
+ * GCS_QUARANTINE_BUCKET_HISTORY_PROOF, as the OPS-2 bucket-birth receipt's
+ * proof record for exactly `bucket`. The retired
+ * GCS_ERASURE_BUCKET_HISTORY_PROOF is refused even when empty, so a stale
+ * deployment fails closed instead of starting without the proof it expected.
+ */
+function quarantineBucketHistoryProof(bucket) {
+  if (Object.hasOwn(process.env, "GCS_ERASURE_BUCKET_HISTORY_PROOF")) {
+    configurationError("GCS_ERASURE_BUCKET_HISTORY_PROOF_RETIRED");
   }
-  const proof = value !== null && typeof value === "object" && !Array.isArray(value)
-    && value.proof !== undefined ? value.proof : value;
+  const raw = required(GCS_QUARANTINE_BUCKET_HISTORY_PROOF_SETTING);
   try {
-    return createGcsErasureBucketHistoryProof(proof);
+    return parseGcsQuarantineBucketHistoryProof(raw, bucket);
   } catch {
-    configurationError("GCS_ERASURE_BUCKET_HISTORY_PROOF_INVALID");
+    configurationError("GCS_QUARANTINE_BUCKET_HISTORY_PROOF_INVALID");
   }
 }
 function parseOrigin(value, name) {
@@ -258,8 +258,10 @@ function configuredRequestOrigins(hostOrigin, publicOrigin) {
 function postgresTestHttpMode() {
   const mode = optional("POSTGRES_TEST_HTTP_MODE");
   if (mode === undefined) return null;
+  // The cloud-run-iam mode (the A2 deployed test host) is retired (owner
+  // decision OD-6, 2026-10-02) and is refused like any unknown mode.
   if (!new Set([
-    "health-only", "health-and-v12-day-manifest", "cloud-run-iam", FASTPATH_TEST_MODE,
+    "health-only", "health-and-v12-day-manifest", FASTPATH_TEST_MODE,
   ]).has(mode)) {
     configurationError("POSTGRES_TEST_HTTP_MODE_INVALID");
   }
@@ -274,35 +276,6 @@ function privatePostgresTestHostConfiguration(mode, edgeTestOrigin = null) {
       listenHost: host,
       port,
       hostOrigin,
-      mode,
-      requestOriginAllowlist: createRequestOriginAllowlist({ publicHostOrigin: hostOrigin }),
-    });
-  }
-  if (mode === "cloud-run-iam") {
-    const listenHost = optional("HOST");
-    const configuredPort = optional("PORT");
-    const hostOrigin = optional("HOST_ORIGIN");
-    const publicOrigin = configuredPublicOrigin();
-    const service = optional("K_SERVICE");
-    if (!isPrivatePostgresTestHost({
-      mode,
-      project: CLOUD_RUN_IAM_TEST_TARGET.project,
-      region: CLOUD_RUN_IAM_TEST_TARGET.region,
-      service,
-      listenHost,
-      hostOrigin,
-      port: configuredPort === String(CLOUD_RUN_IAM_TEST_TARGET.port)
-        ? CLOUD_RUN_IAM_TEST_TARGET.port : null,
-    }) || (publicOrigin !== undefined
-        && (new URL(publicOrigin).protocol !== "https:" || publicOrigin === hostOrigin))
-        || optional("ADMIN_HOST_ORIGIN") !== undefined) {
-      configurationError("POSTGRES_TEST_CLOUD_RUN_IAM_CONFIGURATION_INVALID");
-    }
-    return Object.freeze({
-      listenHost,
-      port: CLOUD_RUN_IAM_TEST_TARGET.port,
-      hostOrigin,
-      publicOrigin,
       mode,
       requestOriginAllowlist: createRequestOriginAllowlist({ publicHostOrigin: hostOrigin }),
     });
@@ -337,7 +310,22 @@ export {
   sanitizeHeaders,
 } from "./request-boundary.mjs";
 
+/**
+ * The deletion ledger is retired (decisions D2, D4 and D6 of 2026-09-26):
+ * the test hosts and the scheduled job use one database and refuse any
+ * LEDGER_ setting, so a stale deployment fails closed instead of being
+ * served without the second pool it expected. (The production profiles of
+ * postgres-production-configuration.mjs refuse the same settings with
+ * their own codes.)
+ */
+function assertNoLedgerConfiguration(env = process.env) {
+  if (Object.keys(env).some((name) => name.startsWith("LEDGER_"))) {
+    configurationError("POSTGRES_LEDGER_CONFIGURATION_RETIRED");
+  }
+}
+
 function databaseConfig() {
+  assertNoLedgerConfiguration();
   const primary = {
     role: "primary",
     schema: optional("PRIMARY_SCHEMA", "tibotattle"),
@@ -345,43 +333,12 @@ function databaseConfig() {
     instanceConnectionName: required("PRIMARY_INSTANCE_CONNECTION_NAME"),
     max: 3,
   };
-  const ledger = {
-    role: "ledger",
-    schema: optional("LEDGER_SCHEMA", "tibotattle_ledger"),
-    database: required("LEDGER_DATABASE"),
-    instanceConnectionName: required("LEDGER_INSTANCE_CONNECTION_NAME"),
-    max: 2,
-  };
-  return { primary, ledger };
-}
-
-export function validateCloudRunIamTestResources({ database, iamUser, bucket, historyProof }) {
-  const target = CLOUD_RUN_IAM_TEST_TARGET;
-  const matchesDatabaseTarget = (actual, expected) => actual?.database === expected.database
-    && actual?.schema === expected.schema
-    && actual?.instanceConnectionName === expected.instanceConnectionName;
-  if (!matchesDatabaseTarget(database?.primary, target.postgres.primary)) {
-    configurationError("POSTGRES_TEST_CLOUD_RUN_IAM_PRIMARY_TARGET_INVALID");
-  }
-  if (!matchesDatabaseTarget(database?.ledger, target.postgres.ledger)) {
-    configurationError("POSTGRES_TEST_CLOUD_RUN_IAM_LEDGER_TARGET_INVALID");
-  }
-  if (iamUser !== target.postgres.iamUser) {
-    configurationError("POSTGRES_TEST_CLOUD_RUN_IAM_USER_INVALID");
-  }
-  if (bucket !== target.gcsBucket) {
-    configurationError("POSTGRES_TEST_CLOUD_RUN_IAM_BUCKET_INVALID");
-  }
-  if (historyProof?.bucket !== target.gcsBucket) {
-    configurationError("POSTGRES_TEST_CLOUD_RUN_IAM_BUCKET_HISTORY_PROOF_INVALID");
-  }
-  return Object.freeze({ bucket: target.gcsBucket, historyProof });
+  return { primary };
 }
 
 function rateLimitBinding(pool, schemaOptions, keyHashSecret, [binding, name, defaultLimit, defaultPeriod]) {
   return createPostgresRateLimiter(pool, {
     primarySchema: schemaOptions.primarySchema,
-    ledgerSchema: schemaOptions.ledgerSchema,
     name,
     limit: integer(`HOST_RATE_LIMIT_${binding}_LIMIT`, defaultLimit, 1, 10_000),
     periodSeconds: integer(`HOST_RATE_LIMIT_${binding}_PERIOD_SECONDS`, defaultPeriod, 1, 86_400),
@@ -460,6 +417,7 @@ function configurationEnv({
 }
 
 export async function createRuntime({ databaseOnly = false, dependencies = {} } = {}) {
+  assertNoLedgerConfiguration();
   const postgresTestMode = databaseOnly ? null : postgresTestHttpMode();
   const postgresTestHttpEnabled = postgresTestMode !== null;
   if (!databaseOnly && !postgresTestHttpEnabled && !isPostgresWorkerRequestPathSupported()) {
@@ -478,20 +436,18 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
     ? null
     : privateHost?.requestOriginAllowlist ?? configuredRequestOrigins(hostOrigin, publicOrigin);
   const digest = databaseOnly || postgresTestHttpEnabled ? undefined : sourceDigest();
-  // fastpath-test serves a rehearsal schema pair only; refuse any other
-  // schema before a connector or pool exists.
+  // fastpath-test serves a rehearsal schema only; refuse any other schema
+  // before a connector or pool exists.
   const database = postgresTestMode === FASTPATH_TEST_MODE
     ? fastpathTestDatabaseConfig(process.env)
     : databaseConfig();
   const iamUser = normalizeIamUser(required("POSTGRES_IAM_USER"), "POSTGRES_IAM_USER");
-  const cloudRunIamResources = postgresTestMode === "cloud-run-iam"
-    ? validateCloudRunIamTestResources({
-      database,
-      iamUser,
-      bucket: required("GCS_BUCKET_NAME"),
-      historyProof: gcsHistoryProof(),
-    })
-    : null;
+  // Every composition that builds the quarantine store reads its bucket and
+  // the bucket's birth proof (OD-2) before a connector or pool exists.
+  const quarantineBucket = databaseOnly || postgresTestMode === "health-only"
+    ? null : required("GCS_BUCKET_NAME");
+  const quarantineHistoryProof = quarantineBucket === null
+    ? null : quarantineBucketHistoryProof(quarantineBucket);
   const connector = typeof dependencies.createConnector === "function"
     ? dependencies.createConnector()
     : new Connector();
@@ -500,15 +456,11 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
   try {
     const primaryPool = await createPool({ connector, ...database.primary, user: iamUser });
     pools.push(primaryPool);
-    const ledgerPool = await createPool({ connector, ...database.ledger, user: iamUser });
-    pools.push(ledgerPool);
     const schemaOptions = {
       primarySchema: database.primary.schema,
-      ledgerSchema: database.ledger.schema,
     };
     const backend = createPostgresWorkerBackend({
       primaryPool,
-      ledgerPool,
       schemaOptions,
       sourceId: optional("POSTGRES_SOURCE_ID"),
       sourceNamespace: optional("POSTGRES_SOURCE_NAMESPACE"),
@@ -519,7 +471,6 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         connector,
         backend,
         primaryPool,
-        ledgerPool,
         schemaOptions,
         hostOrigin,
         requestOriginAllowlist,
@@ -531,7 +482,6 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         connector,
         backend,
         primaryPool,
-        ledgerPool,
         schemaOptions,
         hostOrigin,
         requestOriginAllowlist,
@@ -540,7 +490,6 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         postgresTestHostMode: privateHost.mode,
         postgresTestHealthDispatch: createPostgresTestHealthDispatch({
           primaryPool,
-          ledgerPool,
           schemaOptions,
           expectedMigrations: POSTGRES_RUNTIME_MIGRATIONS,
           privateOrigin: hostOrigin,
@@ -548,7 +497,6 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
       };
     }
     if (postgresTestMode === "health-and-v12-day-manifest"
-        || postgresTestMode === "cloud-run-iam"
         || postgresTestMode === FASTPATH_TEST_MODE) {
       const rateLimitSecret = required("POSTGRES_RATE_LIMIT_SECRET");
       if (new TextEncoder().encode(rateLimitSecret).byteLength < 32) {
@@ -556,16 +504,11 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
       }
       const envelopePublicJwk = required("ENVELOPE_PUBLIC_JWK");
       const envelopePrivateJwk = required("ENVELOPE_PRIVATE_JWK");
-      const bucket = cloudRunIamResources?.bucket ?? required("GCS_BUCKET_NAME");
       const accessToken = await (dependencies.createGoogleAccessTokenProvider
         ?? createGoogleAccessTokenProvider)();
       const objectStore = (dependencies.createGcsQuarantineObjectStore
         ?? createGcsQuarantineObjectStore)(
-        bucket,
-        accessToken,
-        undefined,
-        undefined,
-        cloudRunIamResources?.historyProof ?? gcsHistoryProof(),
+        quarantineBucket, accessToken, undefined, undefined, quarantineHistoryProof,
       );
       // In edge-test the six edge-tier bindings replay the edge's outcome
       // (EP-6) and every privateOrigin is the public origin EP-6 rebuilds on.
@@ -592,21 +535,10 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         : edgeTestAdmissionEnv(originAdmissionEnv, edgeAdmission);
       const healthDispatch = createPostgresTestHealthDispatch({
         primaryPool,
-        ledgerPool,
         schemaOptions,
         expectedMigrations: POSTGRES_RUNTIME_MIGRATIONS,
         privateOrigin: dispatchOrigin,
       });
-      const googleOrigin = publicOrigin ?? hostOrigin;
-      const googleHealthDispatch = publicOrigin === undefined
-        ? healthDispatch
-        : (request) => {
-          let requestUrl;
-          try { requestUrl = new URL(request.url); } catch { return new Response(null, { status: 503 }); }
-          if (request.method !== "GET" || requestUrl.origin !== publicOrigin
-              || requestUrl.pathname !== "/api/health") return new Response(null, { status: 503 });
-          return healthDispatch(new Request(`${hostOrigin}/api/health`));
-        };
       const communityDailyDispatch = createPostgresTestCommunityDailyDispatch({
         primaryPool,
         schemaOptions,
@@ -617,7 +549,6 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
       });
       const participantDevicesDispatch = createPostgresTestParticipantDevicesDispatch({
         primaryPool,
-        ledgerPool,
         schemaOptions,
         authenticatePostgresPersonalSession,
         assertPostgresPersonalSessionCsrf,
@@ -625,31 +556,26 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         revokePostgresParticipantDevice,
         readBoundedRequestBody,
         maxRequestBytes: MAX_REQUEST_BYTES,
-        hasPostgresDeletionTombstone,
         healthDispatch,
         privateOrigin: dispatchOrigin,
       });
       const personalSessionDispatch = createPostgresTestPersonalSessionDispatch({
         primaryPool,
-        ledgerPool,
         schemaOptions,
         authenticatePostgresPersonalSession: authenticatePostgresPersonalSessionForRead,
         assertPostgresPersonalSessionCsrf,
         revokePostgresPersonalSession,
-        hasPostgresDeletionTombstone,
         healthDispatch,
         clearSessionCookie: clearedSessionCookie(),
         privateOrigin: dispatchOrigin,
       });
       const devicePairingDispatch = createPostgresTestDevicePairingDispatch({
         primaryPool,
-        ledgerPool,
         schemaOptions,
         authenticatePostgresPersonalSession: authenticatePostgresPersonalSessionForRead,
         assertPostgresPersonalSessionCsrf,
         assertAccountScopedLocalPreview,
         createPostgresDevicePairing,
-        hasPostgresDeletionTombstone,
         healthDispatch,
         readBoundedRequestBody,
         maxRequestBytes: MAX_REQUEST_BYTES,
@@ -658,7 +584,6 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
       });
       const devicePairingClaimDispatch = createPostgresTestDevicePairingClaimDispatch({
         primaryPool,
-        ledgerPool,
         schemaOptions,
         claimPostgresDevicePairing,
         healthDispatch,
@@ -668,40 +593,15 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
       });
       const telemetryV12ConsentDispatch = createPostgresTestTelemetryV12ConsentDispatch({
         primaryPool,
-        ledgerPool,
         schemaOptions,
         authenticatePostgresPersonalSession: authenticatePostgresPersonalSessionForRead,
         assertPostgresPersonalSessionCsrf,
         grantPostgresTelemetryV12Consent,
-        hasPostgresDeletionTombstone,
         healthDispatch,
         readBoundedRequestBody,
         maxRequestBytes: MAX_REQUEST_BYTES,
         privateOrigin: dispatchOrigin,
       });
-      const googleHandoffDispatch = postgresTestMode === "cloud-run-iam"
-        ? createPostgresGoogleHandoffDispatch({
-          primaryPool,
-          schemaOptions,
-          privateOrigin: googleOrigin,
-          env: admissionEnv,
-          assertAdmissionBindings,
-          assertAttemptAllowed,
-          healthDispatch: googleHealthDispatch,
-        })
-        : null;
-      const googleEnrollmentDispatch = postgresTestMode === "cloud-run-iam"
-        ? createPostgresGoogleEnrollmentDispatch({
-          primaryPool,
-          ledgerPool,
-          schemaOptions,
-          privateOrigin: googleOrigin,
-          env: admissionEnv,
-          assertAdmissionBindings,
-          assertAttemptAllowed,
-          healthDispatch: googleHealthDispatch,
-        })
-        : null;
       Object.freeze(admissionEnv);
       const assertPostgresV12UploadAllowed = (pool, device, nowEpoch, { schema }) =>
         assertPostgresTelemetryTransportWriteAllowed(
@@ -715,13 +615,12 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
       // formats, the upload-authorization route module and the v1.1 routes,
       // all gated on the same migration receipts as the built-in routes.
       // Only the modes whose clients reach those routes compose it
-      // (ORIGIN_INTAKE_HOST_MODES); cloud-run-iam keeps its v1.2-only routes.
+      // (ORIGIN_INTAKE_HOST_MODES).
       const intake = originIntakeServedInMode(postgresTestMode) ? createOriginIntakeComposition({
         adapters: {
           live: postgresTelemetryV11Live,
           bearer: postgresDeviceBearerAuth,
           transport: postgresTypedV12Transport,
-          ledgerAuthority: postgresLedgerAuthority,
           personalDevices: postgresPersonalDevices,
           controls: postgresCollectionControls,
           crypto: workerCrypto,
@@ -731,7 +630,6 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
           uploadAuthorization: postgresUploadAuthorization,
         },
         primaryPool,
-        ledgerPool,
         schemaOptions,
         admissionEnv,
         assertAdmissionBindings,
@@ -741,7 +639,6 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         assertV12UploadAllowed: assertPostgresV12UploadAllowed,
         assertStorageCurrent: createPostgresTestStorageReceiptCheck({
           primaryPool,
-          ledgerPool,
           schemaOptions,
           expectedMigrations: POSTGRES_RUNTIME_MIGRATIONS,
         }),
@@ -787,7 +684,6 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         connector,
         backend,
         primaryPool,
-        ledgerPool,
         schemaOptions,
         hostOrigin,
         publicOrigin,
@@ -834,18 +730,9 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
           if (pathname === "/api/v1/me/device-telemetry-v12-consents") {
             return telemetryV12ConsentDispatch(request);
           }
-          if (googleEnrollmentDispatch && pathname === "/api/v1/enroll") {
-            return googleEnrollmentDispatch(request);
-          }
-          if (googleHandoffDispatch && (pathname === "/api/v1/identity/google/start"
-              || pathname === "/api/v1/identity/google/callback"
-              || pathname === "/api/v1/identity/google/result")) {
-            return googleHandoffDispatch(request);
-          }
           return v12Dispatch(request);
         })(createPostgresTestV12DayManifestDispatch({
           primaryPool,
-          ledgerPool,
           schemaOptions,
           accountlessAuthority: Object.freeze({
             authenticateV12Grant: authenticatePostgresAccountlessOwnerForV12Grant,
@@ -879,7 +766,6 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
           createPostgresDeviceUploadAuthorization,
           authenticatePostgresDevice,
           disconnectPostgresAuthenticatedDevice,
-          hasPostgresDeletionTombstone,
           readPostgresDeviceSyncState,
           readPostgresDeviceSyncManifest,
           readPostgresDeviceSyncCapabilities,
@@ -911,16 +797,11 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
     const ingressBudget = createPostgresUploadIngressBudget(primaryPool, schemaOptions);
     const rateLimitSecret = required("POSTGRES_RATE_LIMIT_SECRET");
     if (new TextEncoder().encode(rateLimitSecret).byteLength < 32) configurationError("POSTGRES_RATE_LIMIT_SECRET_INVALID");
-    const bucket = required("GCS_BUCKET_NAME");
     const accessToken = await (dependencies.createGoogleAccessTokenProvider
       ?? createGoogleAccessTokenProvider)();
     const objectStore = (dependencies.createGcsQuarantineObjectStore
       ?? createGcsQuarantineObjectStore)(
-      bucket,
-      accessToken,
-      undefined,
-      undefined,
-      gcsHistoryProof(),
+      quarantineBucket, accessToken, undefined, undefined, quarantineHistoryProof,
     );
     const assets = await createFilesystemAssets(
       optional("ASSET_ROOT", "/app/apps/worker/cloud-run/assets"),
@@ -943,7 +824,6 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
       connector,
       backend,
       primaryPool,
-      ledgerPool,
       schemaOptions,
       objectStore,
       hostOrigin,
@@ -956,15 +836,19 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
   }
 }
 
-/** Compose only the resources required by the fail-closed scheduled job. */
+/**
+ * Compose only the resources required by the fail-closed scheduled job: one
+ * primary pool and the quarantine object store. There is no ledger pool, and
+ * any LEDGER_ setting is refused (databaseConfig). The store reads the
+ * quarantine bucket's birth proof (OD-2), which must name this bucket. The
+ * maintenance report's shape is fixed by owner decision OD-4
+ * (src/postgres-maintenance.ts POSTGRES_MAINTENANCE_NOT_APPLICABLE).
+ */
 export async function createScheduledMaintenanceRuntime({ dependencies = {} } = {}) {
   const database = databaseConfig();
   const iamUser = normalizeIamUser(required("POSTGRES_IAM_USER"), "POSTGRES_IAM_USER");
   const bucket = required("GCS_BUCKET_NAME");
-  const historyProof = gcsHistoryProof();
-  if (historyProof.bucket !== bucket) {
-    configurationError("GCS_ERASURE_BUCKET_HISTORY_PROOF_INVALID");
-  }
+  const historyProof = quarantineBucketHistoryProof(bucket);
   const connector = typeof dependencies.createConnector === "function"
     ? dependencies.createConnector()
     : new Connector();
@@ -973,8 +857,6 @@ export async function createScheduledMaintenanceRuntime({ dependencies = {} } = 
   try {
     const primaryPool = await createPool({ connector, ...database.primary, user: iamUser });
     pools.push(primaryPool);
-    const ledgerPool = await createPool({ connector, ...database.ledger, user: iamUser });
-    pools.push(ledgerPool);
     const accessToken = await (dependencies.createGoogleAccessTokenProvider
       ?? createGoogleAccessTokenProvider)();
     const objectStore = (dependencies.createGcsQuarantineObjectStore
@@ -983,11 +865,9 @@ export async function createScheduledMaintenanceRuntime({ dependencies = {} } = 
       pools,
       connector,
       primaryPool,
-      ledgerPool,
       objectStore,
       schemaOptions: {
         primarySchema: database.primary.schema,
-        ledgerSchema: database.ledger.schema,
       },
     };
   } catch (error) {
@@ -1107,13 +987,7 @@ export async function serve(runtime) {
   const host = runtime.listenHost ?? optional("HOST", "127.0.0.1");
   if (host !== "127.0.0.1" && host !== "0.0.0.0") configurationError("HOST_INVALID");
   const postgresTestDispatch = runtime.postgresTestHealthDispatch || runtime.postgresTestDispatch;
-  const cloudRunIamMode = runtime.postgresTestHostMode === "cloud-run-iam";
-  if (cloudRunIamMode
-      && (host !== CLOUD_RUN_IAM_TEST_TARGET.listenHost
-        || port !== CLOUD_RUN_IAM_TEST_TARGET.port)) {
-    configurationError("POSTGRES_TEST_CLOUD_RUN_IAM_CONFIGURATION_INVALID");
-  }
-  if (postgresTestDispatch && host !== "127.0.0.1" && !cloudRunIamMode
+  if (postgresTestDispatch && host !== "127.0.0.1"
       && !isEdgeTestCloudListen(runtime.edgeTestOrigin, host, port, process.env)) {
     configurationError("POSTGRES_TEST_PRIVATE_HOST_REQUIRED");
   }
@@ -1210,11 +1084,11 @@ async function main() {
   if (process.argv.includes("--scheduled")) {
     try { assertPostgresScheduledMaintenanceEnabled(process.env); }
     catch { configurationError("POSTGRES_SCHEDULED_MAINTENANCE_DISABLED"); }
+    assertNoLedgerConfiguration();
     const runtime = await createScheduledMaintenanceRuntime();
     try {
       const result = await runPostgresScheduledMaintenance({
         primaryPool: runtime.primaryPool,
-        ledgerPool: runtime.ledgerPool,
         objectStore: runtime.objectStore,
         schema: runtime.schemaOptions,
         nowEpoch: Date.now(),

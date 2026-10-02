@@ -27,7 +27,6 @@ const vite = await createServer({
 const consentAdapter = await vite.ssrLoadModule("/src/postgres-telemetry-v12-consent.ts");
 const personalSession = await vite.ssrLoadModule("/src/postgres-personal-session.ts");
 const personalDevices = await vite.ssrLoadModule("/src/postgres-personal-devices.ts");
-const ledgerAuthority = await vite.ssrLoadModule("/src/postgres-ledger-authority.ts");
 const sessionModule = await vite.ssrLoadModule("/src/session.ts");
 const constants = await vite.ssrLoadModule("/src/constants.ts");
 const boundedBody = await vite.ssrLoadModule("/src/bounded-body.ts");
@@ -66,13 +65,10 @@ test("private PostgreSQL v1.2 consent route requires a live social session and p
     connectionTimeoutMillis: 5_000,
   };
   const primaryPool = new pg.Pool({ ...poolOptions, application_name: "pg-v12-consent-primary-test" });
-  const ledgerPool = new pg.Pool({ ...poolOptions, application_name: "pg-v12-consent-ledger-test" });
   const suffix = randomBytes(5).toString("hex");
   const primarySchema = `v12consent_${suffix}`;
-  const ledgerSchema = `v12consent_l_${suffix}`;
-  const schemaOptions = { primarySchema, ledgerSchema };
+  const schemaOptions = { primarySchema };
   let primaryCreated = false;
-  let ledgerCreated = false;
   try {
     const server = await primaryPool.query(
       "SELECT current_setting('server_version_num')::integer AS version, inet_server_addr() AS address",
@@ -83,10 +79,7 @@ test("private PostgreSQL v1.2 consent route requires a live social session and p
 
     await primaryPool.query(`CREATE SCHEMA "${primarySchema}"`);
     primaryCreated = true;
-    await ledgerPool.query(`CREATE SCHEMA "${ledgerSchema}"`);
-    ledgerCreated = true;
     await applyPostgresMigrations({ role: "primary", schema: primarySchema, pool: primaryPool });
-    await applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool: ledgerPool });
     await primaryPool.query(
       `UPDATE ${table(primarySchema, "collection_controls")}
           SET control_state = 'operational', enrollment_enabled = true,
@@ -107,12 +100,10 @@ test("private PostgreSQL v1.2 consent route requires a live social session and p
     const healthDispatch = async () => new Response(null, { status: 200 });
     const dispatch = createPostgresTestTelemetryV12ConsentDispatch({
       primaryPool,
-      ledgerPool,
       schemaOptions,
       authenticatePostgresPersonalSession: personalSession.authenticatePostgresPersonalSessionForRead,
       assertPostgresPersonalSessionCsrf: personalDevices.assertPostgresPersonalSessionCsrf,
       grantPostgresTelemetryV12Consent: consentAdapter.grantPostgresTelemetryV12Consent,
-      hasPostgresDeletionTombstone: ledgerAuthority.hasPostgresDeletionTombstone,
       healthDispatch,
       readBoundedRequestBody: boundedBody.readBoundedRequestBody,
       maxRequestBytes: constants.MAX_REQUEST_BYTES,
@@ -322,13 +313,6 @@ test("private PostgreSQL v1.2 consent route requires a live social session and p
         WHERE singleton = 1`,
     );
 
-    await ledgerAuthority.recordPostgresDeletionTombstone(
-      ledgerPool,
-      owner.participantId,
-      Date.now(),
-      { schema: { ledgerSchema } },
-    );
-    await apiError(await dispatch(request(validBody())), 401, "AUTH_INVALID");
     const finalStored = await primaryPool.query(
       `SELECT count(*)::integer AS count, min(consented_at) AS consented_at
          ${capabilityPath} WHERE participant_id = $1 AND device_id = $2`,
@@ -336,9 +320,20 @@ test("private PostgreSQL v1.2 consent route requires a live social session and p
     );
     assert.equal(finalStored.rows[0].count, 1);
     assert.equal(finalStored.rows[0].consented_at.toISOString(), originalConsentedAt);
+
+    // An owner removed by the offline purge (D2 Variant B) is refused: its
+    // session and device are gone with it, and no deletion ledger is read.
+    assert.equal((await primaryPool.query(
+      `DELETE FROM ${table(primarySchema, "participants")} WHERE id = $1`, [owner.participantId],
+    )).rowCount, 1);
+    await apiError(await dispatch(request(validBody())), 401, "AUTH_INVALID");
+    const purgedStored = await primaryPool.query(
+      `SELECT count(*)::integer AS count ${capabilityPath} WHERE participant_id = $1`,
+      [owner.participantId],
+    );
+    assert.equal(purgedStored.rows[0].count, 0);
   } finally {
     if (primaryCreated) await primaryPool.query(`DROP SCHEMA IF EXISTS "${primarySchema}" CASCADE`);
-    if (ledgerCreated) await ledgerPool.query(`DROP SCHEMA IF EXISTS "${ledgerSchema}" CASCADE`);
-    await Promise.all([primaryPool.end(), ledgerPool.end()]);
+    await primaryPool.end();
   }
 });

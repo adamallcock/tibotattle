@@ -17,6 +17,7 @@ import {
   RUNTIME_PRIMARY_FUNCTIONS,
 } from "../cloud-run/postgres-runtime-grants.mjs";
 import {
+  databaseConfig,
   ensureSchema,
   GCP_TEST_DATABASE_GRANT_CODE_PREFIX,
   grantRuntimePrivileges,
@@ -26,6 +27,7 @@ import {
 const SCRIPTS_ROOT = dirname(fileURLToPath(import.meta.url));
 const RUNTIME = "w2-opsdb-runtime@w2-opsdb-synthetic.iam";
 const PRIMARY = Object.freeze({ role: "primary", schema: "w2_opsdb_qualification_primary" });
+// The retired ledger role, as a stale caller would still pass it.
 const LEDGER = Object.freeze({ role: "ledger", schema: "w2_opsdb_qualification_ledger" });
 const EMPTY = Object.freeze({ rows: [], rowCount: 0 });
 const RUNTIME_SIGNATURES = RUNTIME_PRIMARY_FUNCTIONS.map(functionSignature);
@@ -103,9 +105,10 @@ test("the primary grant set equals the shared three-function policy, with its re
     assert.ok(sql.includes(`"${PRIMARY.schema}"`) && sql.includes(`"${RUNTIME}"`), sql);
   }
 
+  // The retired ledger role is refused before any connection (LEAD-SIMP).
   const ledger = injectedClient({ role: "ledger" });
-  await grantRuntimePrivileges(ledger.pool, LEDGER, RUNTIME);
-  assert.equal(ledger.statements.some(({ sql }) => sql.startsWith("GRANT EXECUTE")), false, "the ledger grants no function");
+  await assert.rejects(grantRuntimePrivileges(ledger.pool, LEDGER, RUNTIME), refusedWith("ROLE_INVALID"));
+  assert.deepEqual(ledger.statements, []);
 });
 
 test("the read-back refuses a schema where the runtime role holds any extra non-PUBLIC function, with this job's codes", async () => {
@@ -135,8 +138,6 @@ test("the read-back refuses a schema where the runtime role holds any extra non-
   };
   await assert.rejects(grantRuntimePrivileges({ async connect() { return client; } }, PRIMARY, RUNTIME),
     refusedWith("PRIMARY_RUNTIME_PRIVILEGES_INVALID"), "a runtime function missing or reopened to PUBLIC");
-  const ledger = injectedClient({ role: "ledger", extra: [{ signature: RUNTIME_SIGNATURES[0], runtime_execute: true }] });
-  await assert.rejects(grantRuntimePrivileges(ledger.pool, LEDGER, RUNTIME), refusedWith("LEDGER_RUNTIME_PRIVILEGES_INVALID"));
 });
 
 test("driver failures and invalid identifiers refuse with closed job codes", async () => {
@@ -174,4 +175,30 @@ test("the job source carries no grant SQL of its own and keeps the reviewed INST
   assert.equal([...source.matchAll(/^const INSTANCE_PATTERN = \/(.+)\/([a-z]*);$/gmu)].length, 1,
     "scripts/gcp-backup-horizon.check.mjs pins this literal");
   assert.match(source, /if \(invokedDirectly\(\)\) \{/u, "the job runs only as the entry point");
+});
+
+test("the job configures one primary database and refuses any retired LEDGER_ setting", () => {
+  const env = {
+    PRIMARY_SCHEMA: "w2_opsdb_qualification_primary",
+    PRIMARY_DATABASE: "w2_opsdb_database",
+    PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:synthetic-primary",
+  };
+  const config = databaseConfig(env);
+  assert.deepEqual(Object.keys(config), ["primary"]);
+  assert.deepEqual({ ...config.primary }, {
+    role: "primary", schema: env.PRIMARY_SCHEMA, database: env.PRIMARY_DATABASE,
+    instanceConnectionName: env.PRIMARY_INSTANCE_CONNECTION_NAME, max: 3,
+  });
+  for (const ledger of [
+    { LEDGER_SCHEMA: "tibotattle_ledger" },
+    { LEDGER_DATABASE: "tibotattle_ledger" },
+    { LEDGER_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:synthetic-ledger" },
+    { LEDGER_INSTANCE: "synthetic-project:us-east1:synthetic-ledger" },
+    { LEDGER_SCHEMA: "" },
+  ]) {
+    assert.throws(() => databaseConfig({ ...env, ...ledger }), refusedWith("LEDGER_CONFIGURATION_RETIRED"),
+      JSON.stringify(ledger));
+  }
+  assert.throws(() => databaseConfig({ ...env, PRIMARY_INSTANCE_CONNECTION_NAME: "" }),
+    refusedWith("PRIMARY_INSTANCE_CONNECTION_NAME_MISSING"));
 });

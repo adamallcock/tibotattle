@@ -117,7 +117,7 @@ async function withSchema(prefix, run) {
     await pool.query(`UPDATE ${table("telemetry_v12_typed_runtime")} SET state='active', changed_at=$1 WHERE id=1`, [now]);
     await pool.query(`INSERT INTO ${table("storage_source_state")}(singleton, source_id, authority_epoch)
       VALUES (1, $1, 0)`, [SOURCE_ID]);
-    const options = { schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` } };
+    const options = { schema: { primarySchema: schema } };
     const context = {
       schema,
       table,

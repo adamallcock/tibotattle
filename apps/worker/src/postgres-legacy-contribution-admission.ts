@@ -9,8 +9,8 @@
  *
  * It runs only after the origin's shared contributions preamble
  * (contribution-envelope-registry.mjs): bearer authentication, the
- * upload-authorization claim, the deletion-tombstone check and the transport
- * floor. Nothing here repeats them. The upload-authorization receipt that the
+ * upload-authorization claim and the transport floor. Nothing here repeats
+ * them. The upload-authorization receipt that the
  * Worker records after every handler is exported as
  * recordPostgresDeviceUploadReceipt for that preamble.
  *

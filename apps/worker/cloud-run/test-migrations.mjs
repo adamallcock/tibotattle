@@ -22,6 +22,12 @@ import {
 
 export { functionSignature, restrictedFunctionsMatchPolicy } from "./postgres-runtime-grants.mjs";
 
+/**
+ * The retired A2 migrate Job's name. Owner decision OD-6 (2026-10-02)
+ * retired the a2 profile; the deployed Job is deleted only by owner action
+ * OA-4, so its name stays a refusal identity for production tooling. No
+ * profile here runs as it.
+ */
 export const TEST_MIGRATIONS_JOB = "tibotattle-test-database-migrate";
 export const GRAPH_BENCHMARK_MIGRATIONS_JOB = "tibotattle-public-graph-benchmark-migrate";
 export const TEST_MIGRATIONS_PROJECT = "tibotattle";
@@ -30,78 +36,71 @@ export const TEST_MIGRATIONS_SERVICE_ACCOUNT =
 export const TEST_MIGRATIONS_IAM_USER = "tibotattle-test-migrator@tibotattle.iam";
 export const TEST_MIGRATIONS_RUNTIME_IAM_USER = "tibotattle-test-runtime@tibotattle.iam";
 export const TEST_MIGRATIONS_ROOT = "/app/apps/worker/postgres/migrations";
-export const TEST_MIGRATIONS_TARGETS = Object.freeze({
-  primary: Object.freeze({
-    instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
-    database: "tibotattle",
-    schema: "tibotattle_v12_a2_20260925",
-    expectedMigrations: 63,
-  }),
-  ledger: Object.freeze({
-    instanceConnectionName: "tibotattle:us-east1:tibotattle-test-ledger-20260922",
-    database: "tibotattle_ledger",
-    schema: "tibotattle_ledger_v12_a2_20260925",
-    expectedMigrations: 7,
-  }),
-});
+// Primary only (LEAD-SIMP; decisions D2, D4 and D6): the canonical runner
+// and manifest have no ledger role. The A2 profile and its target are
+// retired (owner decision OD-6, 2026-10-02): the A2 primary is not migrated
+// past 0063, and its schema, the ledger schema and the Job stay in the test
+// project until owner action OA-4.
+const ROLES = Object.freeze(["primary"]);
 export const GRAPH_BENCHMARK_MIGRATION_TARGETS = Object.freeze([
   Object.freeze({
     name: "10k",
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle",
     schema: "tibotattle_graph_benchmark_10k_20260925",
-    expectedMigrations: 63,
+    expectedMigrations: 64,
   }),
   Object.freeze({
     name: "100k",
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle",
     schema: "tibotattle_graph_benchmark_100k_20260925",
-    expectedMigrations: 63,
+    expectedMigrations: 64,
   }),
   Object.freeze({
     name: "100k-insights",
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle",
     schema: "tibotattle_graph_benchmark_100k_insights_20260925",
-    expectedMigrations: 63,
+    expectedMigrations: 64,
   }),
   Object.freeze({
     name: "100k-paged",
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle",
     schema: "tibotattle_graph_benchmark_100k_paged_20260925",
-    expectedMigrations: 63,
+    expectedMigrations: 64,
   }),
   Object.freeze({
     name: "100k-readpaged",
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle",
     schema: "tibotattle_graph_benchmark_100k_readpaged_20260925",
-    expectedMigrations: 63,
+    expectedMigrations: 64,
   }),
   Object.freeze({
     name: "100k-readindexed",
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle",
     schema: "tibotattle_graph_benchmark_100k_readindexed_20260925",
-    expectedMigrations: 63,
+    expectedMigrations: 64,
   }),
   Object.freeze({
     name: "100k-batched",
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle",
     schema: "tibotattle_graph_benchmark_100k_batched_20260925",
-    expectedMigrations: 63,
+    expectedMigrations: 64,
   }),
 ]);
 
 // The fast-path rehearsal target is a separate, disposable database on the
 // test primary instance, so the database-scoped tibotattle_transfer control
-// schema installed by primary 0056 and ledger 0007 never enters the shared
-// `tibotattle` test database. Both roles are schemas of that one database.
-// Expected counts come from the deploying checkout's migration directory
-// (job environment) and must equal the image manifest; they are not pinned.
+// schema installed by primary 0056 never enters the shared `tibotattle` test
+// database. The orphan ledger schema an earlier migrate created there is no
+// longer a target. The expected count comes from the deploying checkout's
+// migration directory (job environment) and must equal the image manifest;
+// it is not pinned.
 export const FASTPATH_MIGRATIONS_JOB = "tibotattle-fastpath-test-migrate";
 export const FASTPATH_MIGRATION_PROFILE = "fastpath";
 export const FASTPATH_MIGRATION_TARGETS = Object.freeze({
@@ -109,11 +108,6 @@ export const FASTPATH_MIGRATION_TARGETS = Object.freeze({
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle_fastpath",
     schema: "tibotattle_fastpath_20261001",
-  }),
-  ledger: Object.freeze({
-    instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
-    database: "tibotattle_fastpath",
-    schema: "tibotattle_fastpath_ledger_20261001",
   }),
 });
 const EXPECTED_MIGRATION_COUNT_PATTERN = /^[1-9]\d{0,3}$/u;
@@ -126,7 +120,6 @@ const EXPECTED_MIGRATION_COUNT_PATTERN = /^[1-9]\d{0,3}$/u;
 export const TEST_RUNTIME_PRIMARY_FUNCTIONS = RUNTIME_PRIMARY_FUNCTIONS;
 export const TEST_OPERATOR_ONLY_PRIMARY_FUNCTIONS = OPERATOR_ONLY_PRIMARY_FUNCTIONS;
 
-const A2_PROFILE = "a2";
 export const GRAPH_BENCHMARK_MIGRATION_PROFILE = "community-graph-benchmark";
 const GRAPH_BENCHMARK_PROFILE = GRAPH_BENCHMARK_MIGRATION_PROFILE;
 const FASTPATH_PROFILE = FASTPATH_MIGRATION_PROFILE;
@@ -157,7 +150,7 @@ function hash(value) {
 function canonicalManifest(manifest) {
   return JSON.stringify({
     schemaVersion: manifest.schemaVersion,
-    roles: Object.fromEntries(Object.keys(TEST_MIGRATIONS_TARGETS).map((role) => [
+    roles: Object.fromEntries(ROLES.map((role) => [
       role,
       manifest.roles[role].map(({ version, name, bytes, sha256 }) => ({
         version,
@@ -169,27 +162,31 @@ function canonicalManifest(manifest) {
   });
 }
 
-/** The pinned per-role migration counts of the A2 and benchmark profiles. */
-const PINNED_MIGRATION_COUNTS = Object.freeze(Object.fromEntries(
-  Object.entries(TEST_MIGRATIONS_TARGETS).map(([role, target]) => [role, target.expectedMigrations]),
-));
+/** The pinned primary migration count of the benchmark profile. */
+const PINNED_MIGRATION_COUNTS = Object.freeze({
+  primary: GRAPH_BENCHMARK_MIGRATION_TARGETS[0].expectedMigrations,
+});
+if (GRAPH_BENCHMARK_MIGRATION_TARGETS.some(({ expectedMigrations }) =>
+  expectedMigrations !== PINNED_MIGRATION_COUNTS.primary)) {
+  throw new Error("POSTGRES_TEST_MIGRATIONS_BENCHMARK_PIN_INCONSISTENT");
+}
 
 /**
- * Validate the image manifest's structure and digest. The A2 and benchmark
- * profiles pin each role's count (PINNED_MIGRATION_COUNTS); the fastpath
+ * Validate the image manifest's structure and digest. The benchmark profile
+ * pins the primary count (PINNED_MIGRATION_COUNTS); the fastpath
  * profile instead passes the counts the deploying commit's migration
  * directory holds, and a manifest that differs from them is refused with
  * POSTGRES_TEST_MIGRATIONS_FASTPATH_EXPECTED_COUNT_MISMATCH.
  */
 function validateManifest(manifest, { expectedCounts = PINNED_MIGRATION_COUNTS, countMismatchCode } = {}) {
   if (manifest === null || typeof manifest !== "object"
-      || manifest.schemaVersion !== "tibotattle-postgres-migration-manifest-v1"
+      || manifest.schemaVersion !== "tibotattle-postgres-migration-manifest-v2"
       || !SHA256_PATTERN.test(manifest.sha256 ?? "")
       || manifest.roles === null || typeof manifest.roles !== "object"
-      || Object.keys(manifest.roles).sort().join(",") !== "ledger,primary") {
+      || Object.keys(manifest.roles).join(",") !== "primary") {
     fail("POSTGRES_TEST_MIGRATIONS_MANIFEST_INVALID");
   }
-  for (const role of Object.keys(TEST_MIGRATIONS_TARGETS)) {
+  for (const role of ROLES) {
     const migrations = manifest.roles[role];
     if (!Array.isArray(migrations)) fail("POSTGRES_TEST_MIGRATIONS_MANIFEST_INVALID");
     for (let index = 0; index < migrations.length; index += 1) {
@@ -210,7 +207,7 @@ function validateManifest(manifest, { expectedCounts = PINNED_MIGRATION_COUNTS, 
   if (hash(canonicalManifest(manifest)) !== manifest.sha256) {
     fail("POSTGRES_TEST_MIGRATIONS_MANIFEST_INVALID");
   }
-  for (const role of Object.keys(TEST_MIGRATIONS_TARGETS)) {
+  for (const role of ROLES) {
     if (manifest.roles[role].length !== expectedCounts[role]) {
       fail(countMismatchCode ?? "POSTGRES_TEST_MIGRATIONS_MANIFEST_INVALID");
     }
@@ -275,7 +272,7 @@ export async function readBackReceipts(pool, role, target, expected) {
  * creates in the disposable fast-path database; it is not a second policy.
  */
 export async function grantAndVerifyTestRuntimePrivileges(pool, role, schema) {
-  if (role !== "primary" && role !== "ledger") fail("POSTGRES_TEST_MIGRATIONS_ROLE_INVALID");
+  if (role !== "primary") fail("POSTGRES_TEST_MIGRATIONS_ROLE_INVALID");
   return grantAndVerifyRuntimePrivileges(pool, role, { schema });
 }
 
@@ -315,18 +312,12 @@ export async function readAttachedServiceAccountEmail({
 }
 
 function migrationPlans(profile) {
-  if (profile === A2_PROFILE) {
-    return Object.freeze(Object.entries(TEST_MIGRATIONS_TARGETS).map(([role, target]) =>
-      Object.freeze({ name: role, role, poolKey: role, target }),
-    ));
-  }
   if (profile === GRAPH_BENCHMARK_PROFILE) {
     return Object.freeze(GRAPH_BENCHMARK_MIGRATION_TARGETS.map((target) =>
       Object.freeze({ name: target.name, role: "primary", poolKey: "primary", target }),
     ));
   }
   if (profile === FASTPATH_PROFILE) {
-    // Both role schemas live in one database, so they share one pool.
     return Object.freeze(Object.entries(FASTPATH_MIGRATION_TARGETS).map(([role, target]) =>
       Object.freeze({ name: role, role, poolKey: "fastpath", target }),
     ));
@@ -335,7 +326,6 @@ function migrationPlans(profile) {
 }
 
 function expectedJobForProfile(profile) {
-  if (profile === A2_PROFILE) return TEST_MIGRATIONS_JOB;
   if (profile === FASTPATH_PROFILE) return FASTPATH_MIGRATIONS_JOB;
   return GRAPH_BENCHMARK_MIGRATIONS_JOB;
 }
@@ -352,8 +342,12 @@ function fastpathExpectedCounts(env) {
   return Object.freeze(counts);
 }
 
-/** Validate the exact profile target and one-task Cloud Run Job execution contract. */
-function validateJobEnvironment(env, profile = A2_PROFILE) {
+/**
+ * Validate the exact profile target and one-task Cloud Run Job execution
+ * contract. The profile is required: the retired a2 profile, or any other
+ * value, fails CLOUD_RUN_TEST_MIGRATIONS_PROFILE_INVALID.
+ */
+function validateJobEnvironment(env, profile) {
   const plans = migrationPlans(profile);
   const expectedJob = expectedJobForProfile(profile);
   if (env === null || typeof env !== "object"
@@ -369,16 +363,12 @@ function validateJobEnvironment(env, profile = A2_PROFILE) {
   if (env.POSTGRES_MIGRATOR_IAM_USER !== TEST_MIGRATIONS_IAM_USER) {
     fail("POSTGRES_TEST_MIGRATIONS_IAM_USER_INVALID");
   }
-  if (profile === A2_PROFILE) {
-    for (const [role, target] of Object.entries(TEST_MIGRATIONS_TARGETS)) {
-      const prefix = role.toUpperCase();
-      if (env[`${prefix}_DATABASE`] !== target.database
-          || env[`${prefix}_SCHEMA`] !== target.schema
-          || env[`${prefix}_INSTANCE_CONNECTION_NAME`] !== target.instanceConnectionName) {
-        fail(`POSTGRES_TEST_MIGRATIONS_${prefix}_TARGET_INVALID`);
-      }
-    }
-  } else if (profile === FASTPATH_PROFILE) {
+  // No profile has a ledger target any more: a LEDGER_ setting is a stale
+  // deployment and is refused before any target is read.
+  if (Object.keys(env).some((name) => name.startsWith("LEDGER_"))) {
+    fail("POSTGRES_TEST_MIGRATIONS_LEDGER_TARGET_RETIRED");
+  }
+  if (profile === FASTPATH_PROFILE) {
     for (const [role, target] of Object.entries(FASTPATH_MIGRATION_TARGETS)) {
       const prefix = role.toUpperCase();
       if (env[`${prefix}_DATABASE`] !== target.database
@@ -391,10 +381,7 @@ function validateJobEnvironment(env, profile = A2_PROFILE) {
     const target = GRAPH_BENCHMARK_MIGRATION_TARGETS[0];
     if (env.PRIMARY_DATABASE !== target.database
         || env.PRIMARY_INSTANCE_CONNECTION_NAME !== target.instanceConnectionName
-        || env.PRIMARY_SCHEMA !== undefined
-        || env.LEDGER_DATABASE !== undefined
-        || env.LEDGER_SCHEMA !== undefined
-        || env.LEDGER_INSTANCE_CONNECTION_NAME !== undefined) {
+        || env.PRIMARY_SCHEMA !== undefined) {
       fail("POSTGRES_TEST_MIGRATIONS_BENCHMARK_TARGET_INVALID");
     }
   }
@@ -405,7 +392,6 @@ function validateJobEnvironment(env, profile = A2_PROFILE) {
     project: TEST_MIGRATIONS_PROJECT,
     serviceAccount: TEST_MIGRATIONS_SERVICE_ACCOUNT,
     migratorIamUser: TEST_MIGRATIONS_IAM_USER,
-    ...(profile === A2_PROFILE ? { targets: TEST_MIGRATIONS_TARGETS } : {}),
     ...(profile === FASTPATH_PROFILE
       ? { targets: FASTPATH_MIGRATION_TARGETS, expectedCounts: fastpathExpectedCounts(env) }
       : {}),
@@ -413,7 +399,7 @@ function validateJobEnvironment(env, profile = A2_PROFILE) {
   });
 }
 
-export function parseTestMigrationsConfig(env, attachedServiceAccountEmail, profile = A2_PROFILE) {
+export function parseTestMigrationsConfig(env, attachedServiceAccountEmail, profile) {
   const config = validateJobEnvironment(env, profile);
   if (attachedServiceAccountEmail !== TEST_MIGRATIONS_SERVICE_ACCOUNT) {
     fail("CLOUD_RUN_TEST_MIGRATIONS_SERVICE_ACCOUNT_INVALID");
@@ -440,7 +426,7 @@ function migrationSummary(role, manifest) {
 export async function runTestMigrations({
   env = process.env,
   dependencies = {},
-  profile = A2_PROFILE,
+  profile,
 } = {}) {
   // Reject wrong jobs and targets before metadata credentials or SQL clients are touched.
   validateJobEnvironment(env, profile);
@@ -454,7 +440,7 @@ async function runConfiguredTestMigrations({ env, dependencies, profile }) {
     ?? readAttachedServiceAccountEmail)({ fetchImpl: dependencies.fetchImpl });
   const config = parseTestMigrationsConfig(env, attachedServiceAccountEmail, profile);
   const migrationRoot = TEST_MIGRATIONS_ROOT;
-  // A2 and the benchmark keep their pinned target counts; the fastpath profile
+  // The benchmark keeps its pinned target count; the fastpath profile
   // checks the image manifest against the deploying commit's counts instead.
   const countPolicy = profile === FASTPATH_PROFILE
     ? { expectedCounts: config.expectedCounts,
@@ -525,14 +511,11 @@ async function runConfiguredTestMigrations({ env, dependencies, profile }) {
       validateApplyResult(applied, role, target, expected);
       await readBackReceipts(pools[poolKey], role, target, expected);
       await grantAndVerifyRuntimePrivileges(pools[poolKey], role, target);
-      targetSummaries[name] = profile === A2_PROFILE
-        ? migrationSummary(role, manifest)
-        : Object.freeze({ schema: target.schema, ...migrationSummary(role, manifest) });
+      targetSummaries[name] = Object.freeze({ schema: target.schema, ...migrationSummary(role, manifest) });
     }
-    const migrations = profile === A2_PROFILE || profile === FASTPATH_PROFILE
+    const migrations = profile === FASTPATH_PROFILE
       ? Object.freeze({
         primary: targetSummaries.primary,
-        ledger: targetSummaries.ledger,
       })
       : Object.freeze({
         primarySchemas: Object.freeze(config.plans.map(({ name }) => targetSummaries[name])),
@@ -541,7 +524,7 @@ async function runConfiguredTestMigrations({ env, dependencies, profile }) {
       status: "ok",
       mode: "migrate",
       job: config.job,
-      ...(profile === A2_PROFILE ? {} : { profile }),
+      profile,
       execution: config.execution,
       project: config.project,
       migrations,
@@ -569,9 +552,8 @@ function invokedDirectly() {
 
 if (invokedDirectly()) {
   const profileArgument = process.argv.slice(2);
-  const profile = profileArgument.length === 0
-    ? A2_PROFILE
-    : profileArgument.length === 1 && profileArgument[0] === `--profile=${GRAPH_BENCHMARK_PROFILE}`
+  // The profile is explicit: no argument (the retired a2 default) is refused.
+  const profile = profileArgument.length === 1 && profileArgument[0] === `--profile=${GRAPH_BENCHMARK_PROFILE}`
       ? GRAPH_BENCHMARK_PROFILE
       : profileArgument.length === 1 && profileArgument[0] === `--profile=${FASTPATH_PROFILE}`
         ? FASTPATH_PROFILE

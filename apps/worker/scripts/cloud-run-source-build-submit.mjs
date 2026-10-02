@@ -15,7 +15,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   GCP_PRIVATE_TEST_BUILD,
   GCP_PRIVATE_TEST_TARGET,
-} from "./gcp-private-test-deploy.mjs";
+} from "./gcp-test-project.mjs";
 import { createCloudRunBuildArchive } from "./cloud-run-build-archive.mjs";
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
