@@ -15,6 +15,11 @@
  *
  * The frozen ledger migrations under postgres/migrations/ledger are not
  * modules and stay outside the scan until owner action OA-4 retires them.
+ *
+ * It also keeps the one storage receipt reader single (see
+ * STORAGE_RECEIPT_READER): removing the ledger receipt left readSchemaReceipt
+ * as the only fail-closed reader of the primary migration receipt, and no
+ * second copy may grow beside it.
  */
 
 import assert from "node:assert/strict";
@@ -184,7 +189,7 @@ export function violations(scanned, sites = REFUSAL_SITES) {
   return problems;
 }
 
-async function trackedModules(root) {
+async function trackedModules(root, filter = inScope) {
   // Tracked and untracked-but-not-ignored modules, so a new file is scanned
   // before it is committed.
   const output = execFileSync("git", [
@@ -192,12 +197,12 @@ async function trackedModules(root) {
   ], {
     cwd: root, encoding: "utf8", maxBuffer: 64 * 1024 * 1024,
   });
-  return output.split("\0").filter((path) => path.length > 0 && inScope(path));
+  return output.split("\0").filter((path) => path.length > 0 && filter(path));
 }
 
-export async function scanTree(root = WORKER_ROOT, paths = undefined) {
+async function scanModules(root, paths, scan) {
   const scanned = {};
-  for (const path of paths ?? await trackedModules(root)) {
+  for (const path of paths) {
     let text;
     try {
       text = await readFile(join(root, path), "utf8");
@@ -205,10 +210,113 @@ export async function scanTree(root = WORKER_ROOT, paths = undefined) {
       if (error?.code === "ENOENT") continue;
       throw error;
     }
-    const counts = scanText(path, text);
+    const counts = scan(path, text);
     if (Object.keys(counts).length > 0) scanned[path] = counts;
   }
   return scanned;
+}
+
+export async function scanTree(root = WORKER_ROOT, paths = undefined) {
+  return scanModules(root, paths ?? await trackedModules(root), scanText);
+}
+
+/**
+ * One storage receipt reader (wave-3 critic, conflict on
+ * cloud-run/postgres-test-dispatch.mjs). readSchemaReceipt is the only
+ * fail-closed reader of the primary migration receipt that gates the
+ * PostgreSQL routes. The critic assigned its extraction into a src module to
+ * LEAD-SIMP, so that RD-2 (src/postgres-readiness.ts, which cannot import
+ * cloud-run) and CR B2's storage gate share it. W3-SIMP leaves it in place:
+ * src is TypeScript only, and modules that import the dispatch load
+ * unbundled on the image's Node 22.16, which strips no types by default: the
+ * dense analytics-refresh.mjs source entry, whose spec requires it (it
+ * imports CLOUD_RUN_IAM_TEST_TARGET from the dispatch), and, as W3-SIMP runs
+ * them, host.check and the OPS-10 migration spec. An extraction tried here
+ * failed that source-entry test with ERR_UNKNOWN_FILE_EXTENSION and was
+ * reverted. No src module reads the receipt yet. Moving the extraction to CR
+ * phase B needs the lead's or owner's acceptance (see the W3-SIMP receipt).
+ * Until the extraction lands, this guard refuses a second copy:
+ * - no src module names the migration-history table: RD-2 must import the
+ *   one reader once it is moved into src, not re-implement it;
+ * - readSchemaReceipt is declared once, in the dispatch, and the dispatch
+ *   names the history table only in its constant and in that reader's one
+ *   query: CR B2's gate must call the reader;
+ * - outside the dispatch, only the reviewed migrators and Jobs below name the
+ *   history table, each for its own run receipt; a new module that names it
+ *   fails until it is reviewed here.
+ * The extraction updates this guard in the same change.
+ */
+export const STORAGE_RECEIPT_READER = Object.freeze({
+  file: "cloud-run/postgres-test-dispatch.mjs",
+  // MIGRATION_HISTORY_TABLE's declaration (its name and the table literal)
+  // and the one history query in readSchemaReceipt.
+  historyReferences: 3,
+});
+
+/** The cloud-run migrators and Jobs that read or grant the history table for their own receipts. */
+export const MIGRATION_HISTORY_MODULES = Object.freeze([
+  "cloud-run/postgres-community-daily-activation.mjs",
+  "cloud-run/postgres-community-graph-benchmark.mjs",
+  "cloud-run/postgres-community-graph-readback-diagnostic.mjs",
+  "cloud-run/postgres-migrations.mjs",
+  "cloud-run/postgres-production-migrations.mjs",
+  "cloud-run/postgres-runtime-grants.mjs",
+  "cloud-run/synthetic-v12-cleanup.mjs",
+  "cloud-run/synthetic-v12-discovery.mjs",
+  "cloud-run/test-activation.mjs",
+]);
+
+const RECEIPT_SCOPE = /^(?:src\/.+\.ts|cloud-run\/.+\.(?:[cm]?js|ts))$/u;
+const HISTORY_TABLE = /_tibotattle_migration_history|\bMIGRATION_HISTORY_TABLE\b|\bmigrationHistoryTable\b/gu;
+const RECEIPT_READER_DECLARATION = /\bfunction\s*\*?\s*readSchemaReceipt\b|\breadSchemaReceipt\s*=(?!=)/gu;
+
+/** Product modules under src and cloud-run; their checks are tests, outside the guard. */
+export function inReceiptScope(path) {
+  return RECEIPT_SCOPE.test(path) && !/\.check\.[cm]?js$/u.test(path) && !path.startsWith("cloud-run/dist/");
+}
+
+/** History-table references and receipt-reader declarations of one module. */
+export function scanReceiptText(_path, text) {
+  const counts = {};
+  const history = matchCount(text, HISTORY_TABLE);
+  if (history > 0) counts.history = history;
+  const declarations = matchCount(text, RECEIPT_READER_DECLARATION);
+  if (declarations > 0) counts.declarations = declarations;
+  return counts;
+}
+
+/** Every second copy of the storage receipt policy, as content-free messages. */
+export function receiptReaderViolations(scanned, reader = STORAGE_RECEIPT_READER,
+  modules = MIGRATION_HISTORY_MODULES) {
+  const problems = [];
+  for (const [file, counts] of Object.entries(scanned).sort(([left], [right]) => left.localeCompare(right))) {
+    if (file === reader.file) continue;
+    if ((counts.declarations ?? 0) > 0) {
+      problems.push(`${file}: declares readSchemaReceipt; import the one reader`);
+    }
+    if ((counts.history ?? 0) > 0 && file.startsWith("src/")) {
+      problems.push(`${file}: reads the migration history; extract the one reader into src instead`);
+    } else if ((counts.history ?? 0) > 0 && !modules.includes(file)) {
+      problems.push(`${file}: names the migration history outside the reviewed readers`);
+    }
+  }
+  const own = scanned[reader.file] ?? {};
+  if ((own.declarations ?? 0) !== 1) {
+    problems.push(`${reader.file}: ${own.declarations ?? 0} readSchemaReceipt declarations (pinned 1)`);
+  }
+  if ((own.history ?? 0) !== reader.historyReferences) {
+    problems.push(`${reader.file}: ${own.history ?? 0} history references (pinned ${reader.historyReferences})`);
+  }
+  for (const file of modules) {
+    if ((scanned[file]?.history ?? 0) === 0) {
+      problems.push(`${file}: listed as a history reader but names no history table; remove it`);
+    }
+  }
+  return problems;
+}
+
+export async function scanReceiptTree(root = WORKER_ROOT, paths = undefined) {
+  return scanModules(root, paths ?? await trackedModules(root, inReceiptScope), scanReceiptText);
 }
 
 if (process.argv.includes("--print")) {
@@ -333,6 +441,69 @@ if (process.argv.includes("--print")) {
       const scanned = await scanTree(root, ["cloud-run/synthetic.mjs", "cloud-run/absent.mjs"]);
       assert.deepEqual(scanned, { "cloud-run/synthetic.mjs": { ledgerPool: 1 } });
       assert.deepEqual(violations(scanned, {}), ["cloud-run/synthetic.mjs: 1 ledgerPool (pinned 0)"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("the storage receipt policy has one reader until its extraction lands", async () => {
+    assert.deepEqual(receiptReaderViolations(await scanReceiptTree()), []);
+  });
+
+  test("a second storage receipt reader fails the guard", () => {
+    const reader = STORAGE_RECEIPT_READER.file;
+    const current = Object.fromEntries([
+      [reader, { history: STORAGE_RECEIPT_READER.historyReferences, declarations: 1 }],
+      ...MIGRATION_HISTORY_MODULES.map((file) => [file, { history: 1 }]),
+    ]);
+    assert.deepEqual(receiptReaderViolations(current), []);
+    // RD-2 re-implementing the reader in src.
+    const src = "src/postgres-readiness.ts";
+    assert.deepEqual(scanReceiptText(src,
+      'const rows = await client.query(`SELECT version FROM ${schema}."_tibotattle_migration_history"`);'),
+    { history: 1 });
+    assert.deepEqual(receiptReaderViolations({ ...current, [src]: { history: 1 } }),
+      [`${src}: reads the migration history; extract the one reader into src instead`]);
+    // A new cloud-run module (CR's production host) with its own history read.
+    const host = "cloud-run/postgres-production-host.mjs";
+    assert.deepEqual(scanReceiptText(host, "import { MIGRATION_HISTORY_TABLE } from './postgres-runtime-grants.mjs';"),
+      { history: 1 });
+    assert.deepEqual(receiptReaderViolations({ ...current, [host]: { history: 1 } }),
+      [`${host}: names the migration history outside the reviewed readers`]);
+    // A second declaration anywhere, or a copy inside the dispatch.
+    for (const text of ["async function readSchemaReceipt(pool) {}", "const readSchemaReceipt = async () => {};"]) {
+      assert.deepEqual(scanReceiptText(host, text), { declarations: 1 }, text);
+    }
+    assert.deepEqual(scanReceiptText(host, "if (readSchemaReceipt === undefined) await readSchemaReceipt(pool);"), {});
+    assert.deepEqual(receiptReaderViolations({ ...current, [host]: { declarations: 1 } }),
+      [`${host}: declares readSchemaReceipt; import the one reader`]);
+    assert.deepEqual(receiptReaderViolations({ ...current, [reader]: { history: 4, declarations: 1 } }),
+      [`${reader}: 4 history references (pinned ${STORAGE_RECEIPT_READER.historyReferences})`]);
+    assert.deepEqual(receiptReaderViolations({ ...current, [reader]: { history: 3, declarations: 2 } }),
+      [`${reader}: 2 readSchemaReceipt declarations (pinned 1)`]);
+    // A listed reader that stops naming the table must be removed (shrink-only).
+    const [listed] = MIGRATION_HISTORY_MODULES;
+    const { [listed]: _dropped, ...shrunk } = current;
+    assert.deepEqual(receiptReaderViolations(shrunk),
+      [`${listed}: listed as a history reader but names no history table; remove it`]);
+  });
+
+  test("the receipt guard covers product modules under src and cloud-run only", async () => {
+    for (const path of ["src/postgres-readiness.ts", "src/index.ts", "cloud-run/server.mjs",
+      "cloud-run/routes/v11-composition.mjs"]) {
+      assert.equal(inReceiptScope(path), true, path);
+    }
+    for (const path of ["cloud-run/host.check.mjs", "cloud-run/dist/server.mjs", "scripts/gcp-test-database.mjs",
+      "postgres-test/append-only-residue.spec.mjs", "test/postgres-composition.spec.ts"]) {
+      assert.equal(inReceiptScope(path), false, path);
+    }
+    const root = await mkdtemp(join(tmpdir(), "w3-simp-receipt-reader-"));
+    try {
+      await mkdir(join(root, "src"), { recursive: true });
+      await writeFile(join(root, "src", "postgres-readiness.ts"),
+        "export const table = \"_tibotattle_migration_history\";\n");
+      assert.deepEqual(await scanReceiptTree(root, ["src/postgres-readiness.ts"]),
+        { "src/postgres-readiness.ts": { history: 1 } });
     } finally {
       await rm(root, { recursive: true, force: true });
     }

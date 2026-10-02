@@ -445,6 +445,54 @@ test("PG17: the upgrade keeps every published row byte-identical and keeps the a
   });
 });
 
+test("PG17: two application schemas held below the residue in one database each upgrade, one after the other", {
+  skip: !PG_TEST_HOST && !PG_TEST_SOCKET, timeout: 300_000,
+}, async () => {
+  // The shared test-database and fast-path layout: several application
+  // schemas share one database and its database-scoped PT-1 control schema.
+  await withUpgradeDatabase("twoschemas", async (pool) => {
+    await pool.query(`CREATE SCHEMA ${q(SECOND_SCHEMA)}`);
+    const prefix = await applyMigrationsBefore({
+      role: "primary", schema: SECOND_SCHEMA, pool, name: RESIDUE_NAME,
+    });
+    assert.equal(prefix.applied, RESIDUE_VERSION - 1);
+    for (const schema of [SCHEMA, SECOND_SCHEMA]) {
+      await insertDaily(pool, { day: "2026-09-28", revision: 1, epoch: 3, schema });
+      await upsertPreview(pool, { epoch: 3, schema });
+    }
+    const contractBefore = await contractColumns(pool);
+    assert.deepEqual(contractBefore.filter((name) => name.startsWith("ledger_")), LEDGER_CONTRACT_COLUMNS);
+    const contractAfter = contractBefore.filter((name) => !LEDGER_CONTRACT_COLUMNS.includes(name));
+    const firstBefore = await snapshot(pool, SCHEMA);
+    const secondBefore = await snapshot(pool, SECOND_SCHEMA);
+
+    // The first upgrade drops the shared contract's ledger columns, and
+    // leaves the second schema below the residue with every object in place.
+    assert.equal((await applyPostgresMigrations({ role: "primary", schema: SCHEMA, pool })).applied,
+      PRIMARY.length);
+    assert.equal((await history(pool, SCHEMA)).length, RESIDUE_VERSION);
+    await catalogAfterResidue(pool, SCHEMA);
+    assert.deepEqual(await contractColumns(pool), contractAfter);
+    assert.equal((await history(pool, SECOND_SCHEMA)).length, RESIDUE_VERSION - 1);
+    for (const table of DROPPED_TABLES) {
+      assert.equal(await regclass(pool, SECOND_SCHEMA, table), true, `${table} waits for its own upgrade`);
+    }
+    assert.deepEqual(await snapshot(pool, SECOND_SCHEMA), secondBefore);
+
+    // The second upgrade finds the ledger columns gone and changes the
+    // contract shape no further.
+    assert.equal((await applyPostgresMigrations({ role: "primary", schema: SECOND_SCHEMA, pool })).applied,
+      PRIMARY.length);
+    assert.equal((await history(pool, SECOND_SCHEMA)).length, RESIDUE_VERSION);
+    await catalogAfterResidue(pool, SECOND_SCHEMA);
+    assert.deepEqual(await contractColumns(pool), contractAfter);
+    assert.deepEqual(await snapshot(pool, SCHEMA), firstBefore);
+    assert.deepEqual(await snapshot(pool, SECOND_SCHEMA), secondBefore);
+    assert.deepEqual((await history(pool, SCHEMA)).at(-1), { version: RESIDUE_VERSION, name: RESIDUE_NAME });
+    assert.deepEqual((await history(pool, SECOND_SCHEMA)).at(-1), { version: RESIDUE_VERSION, name: RESIDUE_NAME });
+  });
+});
+
 for (const [label, seed, expected] of [
   ["fence", async (pool) => {
     await pool.query(
