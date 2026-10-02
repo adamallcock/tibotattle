@@ -17,9 +17,12 @@
  * What is rendered (docs: cloud-run/infra/monitoring.md, one anchor each):
  *
  *   origin-5xx-ratio       page    Cloud Run 5xx over all requests > 2 % for
- *                                  10 min, less the origin's own 503
- *                                  POSTGRES_ROUTE_NOT_PORTED answers (counted
- *                                  from its request log line, W3-CRA/CR-6).
+ *                                  10 min, in a window that holds at least 50
+ *                                  requests, both net of the deliberate
+ *                                  unported answers: each an exact route path
+ *                                  plus its code (ORIGIN_5XX_EXCLUSIONS),
+ *                                  counted from the origin's request log line
+ *                                  (W3-CRA/CR-6), never a code alone.
  *   refresh-lock-held      ticket  any analytics-refresh receipt with state
  *                                  LOCK_HELD in the last hour.
  *   refresh-not-completed  page    no analytics-refresh receipt with state
@@ -77,6 +80,7 @@
  */
 
 import { canonicalJson } from "../src/canonical-json.ts";
+import { WORKER_ROUTE_POLICY, matchWorkerRoute } from "../src/route-registry.ts";
 import {
   JOB_NAMES,
   SCHEDULED_JOB_NAMES,
@@ -138,9 +142,117 @@ export const GOOGLE_FRONT_END_403_TEXT = "Your client does not have permission";
 /** The only status the origin-lock check accepts. */
 export const ORIGIN_LOCK_ACCEPTED_STATUSES = Object.freeze([403]);
 
+/**
+ * The deliberate unported answers origin-5xx-ratio leaves out, each by an
+ * exact WORKER_ROUTE_POLICY pathname plus its status and code, never by a
+ * code alone. The origin's request log line carries no path: it carries
+ * routeClass, which matchWorkerRoute binds one-to-one to an exact pathname
+ * (routeClass is the route id), so each entry renders as that routeClass
+ * together with its code. Cloud Run's own request log carries the status but
+ * not the body's code, and its URL (httpRequest) is outside the privacy
+ * contract.
+ * - round 12 (2026-10-02): the native social chain (Google, Apple, legacy
+ *   /api/v1/enroll), security reset, and the performance device and consent
+ *   routes are retired;
+ * - OD-CR-2 (round 1): participant export is retired;
+ * - C-ADMIN: an admin task with no PostgreSQL port answers 503
+ *   POSTGRES_ROUTE_NOT_PORTED on the admin action route.
+ * v0.x uploads (round 12) share POST /api/v1/contributions with every live
+ * upload and are refused with a 4xx there, so nothing is excluded for them;
+ * the accountless performance authorization answers a definite 4xx (round
+ * 12), so it is not excluded either: a 5xx from it is a defect.
+ */
+export const ORIGIN_5XX_EXCLUSIONS = Object.freeze([
+  ["/api/v1/enroll", "round-12"],
+  ["/api/v1/identity/google/start", "round-12"],
+  ["/api/v1/identity/google/callback", "round-12"],
+  ["/api/v1/identity/google/result", "round-12"],
+  ["/api/v1/identity/apple/start", "round-12"],
+  ["/api/v1/identity/apple/callback", "round-12"],
+  ["/api/v1/identity/apple/result", "round-12"],
+  ["/api/v1/me/security-reset", "round-12"],
+  ["/api/v1/device/telemetry/performance/capabilities", "round-12"],
+  ["/api/v1/me/device-telemetry-performance-consents", "round-12"],
+  ["/api/v1/device/telemetry/performance/reports", "round-12"],
+  ["/api/v1/me/export", "od-cr-2"],
+  ["/api/v1/admin/action", "c-admin"],
+].map(([path, decision]) => Object.freeze({
+  path,
+  status: ORIGIN_REQUEST_LOG_CONTRACT.notPorted.status,
+  code: ORIGIN_REQUEST_LOG_CONTRACT.notPorted.code,
+  decision,
+})));
+/** The only codes an exclusion may name. */
+export const ORIGIN_5XX_EXCLUDABLE_CODES = Object.freeze([ORIGIN_REQUEST_LOG_CONTRACT.notPorted.code]);
+/**
+ * Codes that are never a deliberate answer and always count: the loopback
+ * test dispatcher's refusal and the edge's own origin-unavailable answer.
+ */
+export const ORIGIN_5XX_NEVER_EXCLUDED_CODES = Object.freeze([
+  "POSTGRES_TEST_ROUTE_UNSUPPORTED",
+  "EDGE_ORIGIN_UNAVAILABLE",
+]);
+/**
+ * Exact paths that are never excluded, whatever the code: the live upload
+ * route v0.x shares, the accountless performance authorization (a definite
+ * 4xx, round 12), and the renew and disconnect routes round 12 keeps.
+ */
+export const ORIGIN_5XX_NEVER_EXCLUDED_PATHS = Object.freeze([
+  "/api/v1/contributions",
+  "/api/v1/device/upload-authorizations",
+  "/api/v1/accountless/telemetry-performance-authorization",
+  "/api/v1/device/credential/renew",
+  "/api/v1/device/disconnect",
+]);
+const ROUTE_CLASS = /^[a-z][a-z0-9_]*$/u;
+const EXCLUSION_KEYS = Object.freeze(["code", "decision", "path", "status"]);
+
+/**
+ * Validate an exclusion table: each entry names an exact WORKER_ROUTE_POLICY
+ * pathname, a 5xx status and an excludable code (with that code's own
+ * status), once. Returns the entries with their routeClass; throws
+ * MONITORING_5XX_EXCLUSION_* otherwise.
+ */
+export function originFiveXxExclusions(entries) {
+  if (!Array.isArray(entries)) fail("MONITORING_5XX_EXCLUSION_INVALID");
+  const seen = new Set();
+  return Object.freeze(entries.map((entry) => {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)
+        || JSON.stringify(Object.keys(entry).sort()) !== JSON.stringify(EXCLUSION_KEYS)
+        || typeof entry.decision !== "string" || entry.decision.length === 0) {
+      fail("MONITORING_5XX_EXCLUSION_INVALID");
+    }
+    const { path, status, code } = entry;
+    if (typeof path !== "string" || path.length === 0) fail("MONITORING_5XX_EXCLUSION_INVALID");
+    if (ORIGIN_5XX_NEVER_EXCLUDED_CODES.includes(code) || !ORIGIN_5XX_EXCLUDABLE_CODES.includes(code)) {
+      fail("MONITORING_5XX_EXCLUSION_CODE_FORBIDDEN");
+    }
+    if (status !== ORIGIN_REQUEST_LOG_CONTRACT.notPorted.status) fail("MONITORING_5XX_EXCLUSION_INVALID");
+    if (ORIGIN_5XX_NEVER_EXCLUDED_PATHS.includes(path)) fail("MONITORING_5XX_EXCLUSION_PATH_FORBIDDEN");
+    const route = matchWorkerRoute(path);
+    if (route.kind !== "exact" || !WORKER_ROUTE_POLICY.some((definition) => definition.pathname === path)
+        || !ROUTE_CLASS.test(route.routeClass)) {
+      fail("MONITORING_5XX_EXCLUSION_PATH_NOT_EXACT");
+    }
+    const key = `${route.routeClass}\u0000${code}`;
+    if (seen.has(key)) fail("MONITORING_5XX_EXCLUSION_DUPLICATE");
+    seen.add(key);
+    return Object.freeze({ path, routeClass: route.routeClass, status, code });
+  }));
+}
+
 export const MONITORING_THRESHOLDS = Object.freeze({
   originFiveXxRatio: 0.02,
   originFiveXxWindowMinutes: 10,
+  /**
+   * A window must hold at least this many requests (net of the exclusions)
+   * before the ratio can page: ceil(1 / originFiveXxRatio), the smallest
+   * count at which one error cannot exceed 2 % (the comparison is strict).
+   * Evidence: production's 30-day volume on the queried routes was 132,945
+   * requests (OWN-2-GQL, 2026-10-02), a mean of about 31 per 10-minute
+   * window, so a higher floor would blind most windows.
+   */
+  originFiveXxMinimumRequests: 50,
   cadenceSlackMinutes: 60,
   schedulerQuietMinimumHours: SCHEDULER_PAUSE_ALERT_THRESHOLD_HOURS,
   sqlCpuUtilization: 0.8,
@@ -467,18 +579,30 @@ export function renderMonitoring(desired, { notificationChannel = null } = {}) {
       ...(deferredConditions.length === 0 ? {} : { deferredConditions }) });
   };
 
-  const notPorted = `${metricName("origin-request-failure")}{monitored_resource="cloud_run_revision",`
-    + `service_name=${quote(service)},status="${origin.notPorted.status}",code=${quote(origin.notPorted.code)}}`;
-  const requests = (extra = "") => `run_googleapis_com:request_count{monitored_resource="cloud_run_revision",`
-    + `service_name=${quote(service)}${extra}}`;
   const window = `${t.originFiveXxWindowMinutes}m`;
+  // One selector per (status, code), each pinned to its exact routeClasses.
+  const exclusionGroups = new Map();
+  for (const { routeClass, status, code } of originFiveXxExclusions(ORIGIN_5XX_EXCLUSIONS)) {
+    const key = `${status} ${code}`;
+    if (!exclusionGroups.has(key)) exclusionGroups.set(key, { status, code, routeClasses: [] });
+    exclusionGroups.get(key).routeClasses.push(routeClass);
+  }
+  const excluded = [...exclusionGroups.values()].map(({ status, code, routeClasses }) =>
+    `(sum(increase(${metricName("origin-request-failure")}{monitored_resource="cloud_run_revision",`
+    + `service_name=${quote(service)},routeClass=~${quote(routeClasses.join("|"))},status="${status}",`
+    + `code=${quote(code)}}[${window}])) or vector(0))`).join(" + ");
+  const requests = (extra = "") => `sum(increase(run_googleapis_com:request_count{monitored_resource=`
+    + `"cloud_run_revision",service_name=${quote(service)}${extra}}[${window}]))`;
+  const counted = `(${requests()} - (${excluded}))`;
   add("origin-5xx-ratio", {
     severity: "page",
-    summary: `Origin 5xx share over ${t.originFiveXxRatio * 100} % for ${t.originFiveXxWindowMinutes} min, `
-      + "excluding 503 POSTGRES_ROUTE_NOT_PORTED.",
+    summary: `Origin 5xx share over ${t.originFiveXxRatio * 100} % for ${t.originFiveXxWindowMinutes} min in a `
+      + `window of at least ${t.originFiveXxMinimumRequests} requests, net of the deliberate unported answers `
+      + "(exact route plus code).",
     conditions: [promCondition("origin 5xx ratio",
-      `(sum(rate(${requests(',response_code_class="5xx"')}[${window}])) - (sum(rate(${notPorted}[${window}])) or vector(0)))`
-      + ` / sum(rate(${requests()}[${window}])) > ${t.originFiveXxRatio}`, { duration: `${t.originFiveXxWindowMinutes * 60}s` })],
+      `((${requests(',response_code_class="5xx"')} - (${excluded})) / ${counted} > ${t.originFiveXxRatio})`
+      + ` and on() (${counted} >= ${t.originFiveXxMinimumRequests})`,
+      { duration: `${t.originFiveXxWindowMinutes * 60}s` })],
   });
   add("refresh-lock-held", {
     severity: "ticket",
@@ -618,10 +742,37 @@ function scanQuery(text, where) {
 }
 
 /**
+ * origin-5xx-ratio's exclusions stay exact: every selector that names a code
+ * also names routeClasses, each the routeClass of one ORIGIN_5XX_EXCLUSIONS
+ * entry with that code; no never-excluded code appears; and the
+ * minimum-request clause is present.
+ */
+function scanFiveXxExclusions(query) {
+  const allowed = new Set(originFiveXxExclusions(ORIGIN_5XX_EXCLUSIONS)
+    .map(({ routeClass, code }) => `${routeClass} ${code}`));
+  for (const code of ORIGIN_5XX_NEVER_EXCLUDED_CODES) {
+    if (query.includes(code)) fail("MONITORING_5XX_EXCLUSION_CODE_FORBIDDEN");
+  }
+  for (const [, selector] of query.matchAll(/\{([^}]*)\}/gu)) {
+    const code = /(?:^|,)\s*code\s*(=~|!~|!=|=)\s*"([^"]*)"/u.exec(selector);
+    if (code === null) continue;
+    const routeClass = /(?:^|,)\s*routeClass\s*(=~|=)\s*"([^"]*)"/u.exec(selector);
+    if (code[1] !== "=" || routeClass === null) fail("MONITORING_5XX_EXCLUSION_CODE_ALONE");
+    for (const name of routeClass[2].split("|")) {
+      if (!allowed.has(`${name} ${code[2]}`)) fail("MONITORING_5XX_EXCLUSION_NOT_LISTED");
+    }
+  }
+  if (!query.endsWith(`>= ${MONITORING_THRESHOLDS.originFiveXxMinimumRequests})`)) {
+    fail("MONITORING_5XX_MINIMUM_REQUESTS_MISSING");
+  }
+}
+
+/**
  * Throws MONITORING_FIELD_FORBIDDEN or MONITORING_*_NOT_ALLOWLISTED unless
  * every log filter, label extractor and value extractor reads only
  * ALLOWED_LOG_FIELDS and
- * every PromQL query matches only ALLOWED_QUERY_LABELS.
+ * every PromQL query matches only ALLOWED_QUERY_LABELS, and (MONITORING_5XX_*)
+ * unless origin-5xx-ratio's exclusions are exact and its floor is present.
  */
 export function scanMonitoringPrivacy(rendered) {
   for (const metric of rendered.metrics) {
@@ -643,6 +794,7 @@ export function scanMonitoringPrivacy(rendered) {
     for (const condition of policy.body.conditions) {
       if (condition.conditionPrometheusQueryLanguage !== undefined) {
         scanQuery(condition.conditionPrometheusQueryLanguage.query, policy.id);
+        if (policy.id === "origin-5xx-ratio") scanFiveXxExclusions(condition.conditionPrometheusQueryLanguage.query);
       } else {
         scanFilter(condition.conditionThreshold.filter, policy.id);
       }

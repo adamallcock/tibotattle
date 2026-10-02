@@ -119,9 +119,50 @@ whole only when every trigger's condition does.
 ## origin-5xx-ratio
 
 **Page.** For 10 minutes, Cloud Run's 5xx responses exceed 2 % of all
-requests. The origin's own `503 POSTGRES_ROUTE_NOT_PORTED` answers are
-subtracted first. Those are counted from its request log line, which is
-contained by design until D-CRB ports the route.
+requests, in a 10-minute window that holds at least 50 requests. Both counts
+are taken net of the origin's deliberate unported answers first.
+
+- **Request floor (50).** This is `ceil(1 / 0.02)`: the smallest window in
+  which one error cannot exceed 2 % (the comparison is strict). So a single
+  error never pages. Production's 30-day volume on the queried routes was
+  132,945 requests (OWN-2-GQL, 2026-10-02). That is a mean of about 31 per
+  10-minute window, so the floor sits just above an average window. A higher
+  floor would silence most windows. The cost: a window under 50 requests
+  never pages, even when every request fails. The Worker's 30-day 5xx
+  baselines were 3.55 % on community/daily, 3.47 % on accountless
+  enrollment and 1.33 % across all routes.
+- **Exclusions (`ORIGIN_5XX_EXCLUSIONS`).** Each one is an exact route path
+  plus its status and code, never a code alone. Today every one is
+  `503 POSTGRES_ROUTE_NOT_PORTED`:
+  - round 12 retirements: the native social chain (Google start, callback
+    and result; Apple start, callback and result; the legacy
+    `/api/v1/enroll`), `/api/v1/me/security-reset`, and the performance
+    device and consent routes:
+    - `/api/v1/device/telemetry/performance/capabilities`;
+    - `/api/v1/device/telemetry/performance/reports`;
+    - `/api/v1/me/device-telemetry-performance-consents`;
+  - OD-CR-2: `/api/v1/me/export` (participant export is retired);
+  - C-ADMIN: `/api/v1/admin/action`, whose unported admin tasks answer this
+    code.
+- **Never excluded.** `POSTGRES_TEST_ROUTE_UNSUPPORTED` and
+  `EDGE_ORIGIN_UNAVAILABLE` always count. So do these paths:
+  `/api/v1/contributions` (v0.x uploads share it with every live upload and
+  are refused there with a 4xx), `/api/v1/device/upload-authorizations`,
+  `/api/v1/accountless/telemetry-performance-authorization` (round 12: a
+  definite 4xx, so a 5xx from it is a defect), and the renew and disconnect
+  routes round 12 keeps. `originFiveXxExclusions` refuses all of these. It
+  also refuses any path that is not an exact `WORKER_ROUTE_POLICY` pathname.
+  The privacy scanner refuses a rendered query that names a code without its
+  route classes, or that drops the floor.
+- **What the origin logs.** Cloud Run's request log carries the status but
+  not the body's code. Its URL (`httpRequest`) is outside the privacy
+  contract. The origin's own request line (CR-6, `postgres-host-dispatch.mjs`)
+  carries `routeClass`, `status` and `code`, but no path. `routeClass` is the
+  route id, which `matchWorkerRoute` binds one-to-one to an exact pathname.
+  So each excluded path renders as its `routeClass` together with its code.
+  Until CR-6's handler is on the deployed line, no such line exists. The
+  exclusion then subtracts zero: those answers count as errors, so the alert
+  over-pages rather than going silent.
 
 1. Read the request log line's `routeClass` and `code` labels to find which
    route class fails.

@@ -3,17 +3,19 @@
  * the rendered set for the committed staging plane and synthetic variants,
  * the privacy scanner (every rendered filter passes, forbidden and unlisted
  * fields fail), the origin-lock check (exactly 403, Google's text, no
- * credentials), the 503 POSTGRES_ROUTE_NOT_PORTED exclusion, cadence-derived
+ * credentials), the 5xx ratio's request floor and its exact route-plus-code
+ * exclusions (never a code alone, never the live or 4xx routes), cadence-derived
  * windows and the closed deferrals and runbook anchors. No call is made.
  */
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import * as manifest from "./gcp-ops-infra-manifest.mjs";
 import * as monitoring from "./gcp-ops-monitoring-policies.mjs";
+import { WORKER_ROUTE_POLICY, matchWorkerRoute } from "../src/route-registry.ts";
 
 const SCRIPTS_ROOT = dirname(fileURLToPath(import.meta.url));
 const WORKER_ROOT = dirname(SCRIPTS_ROOT);
@@ -157,22 +159,122 @@ test("the origin-lock check accepts exactly Google's 403, unauthenticated, on th
   }
 });
 
-test("the 5xx ratio excludes only 503 POSTGRES_ROUTE_NOT_PORTED, over 2 % for 10 minutes", () => {
+test("the 5xx ratio: over 2 % for 10 minutes, at least 50 requests, net of exact route-plus-code exclusions", () => {
   const rendered = monitoring.renderMonitoring(STAGING);
   const promql = query(rendered, "origin-5xx-ratio");
   const service = `service_name="${STAGING.service.name}"`;
-  assert.ok(promql.includes(`run_googleapis_com:request_count{monitored_resource="cloud_run_revision",${service},`
-    + 'response_code_class="5xx"}[10m]'));
-  assert.ok(promql.includes('status="503",code="POSTGRES_ROUTE_NOT_PORTED"}[10m])) or vector(0))'),
-    "exactly the not-ported 503 lines are subtracted, and none subtracts zero");
-  assert.ok(promql.endsWith(`/ sum(rate(run_googleapis_com:request_count{monitored_resource="cloud_run_revision",${service}}[10m])) > 0.02`));
+  const requests = (extra = "") => `sum(increase(run_googleapis_com:request_count{monitored_resource="cloud_run_revision",`
+    + `${service}${extra}}[10m]))`;
+  const routeClasses = monitoring.ORIGIN_5XX_EXCLUSIONS.map(({ path }) => matchWorkerRoute(path).routeClass);
+  const excluded = "(sum(increase(logging_googleapis_com:user_tibotattle_staging_origin_request_failure{"
+    + `monitored_resource="cloud_run_revision",${service},routeClass=~"${routeClasses.join("|")}",status="503",`
+    + 'code="POSTGRES_ROUTE_NOT_PORTED"}[10m])) or vector(0))';
+  const counted = `(${requests()} - (${excluded}))`;
+  assert.equal(promql, `((${requests(',response_code_class="5xx"')} - (${excluded})) / ${counted} > 0.02)`
+    + ` and on() (${counted} >= 50)`);
   assert.equal(policy(rendered, "origin-5xx-ratio").body.conditions[0].conditionPrometheusQueryLanguage.duration, "600s");
   assert.equal(policy(rendered, "origin-5xx-ratio").severity, "page");
   // The origin request metric reads the closed line and its closed events only.
-  const [requests] = rendered.metrics;
-  assert.deepEqual(Object.keys(requests.body.labelExtractors), ["routeClass", "status", "code"]);
-  assert.match(requests.body.filter, /jsonPayload\.event=\("request_failed" OR "request_pending" OR "request_unavailable"\)/u);
+  const [requestLines] = rendered.metrics;
+  assert.deepEqual(Object.keys(requestLines.body.labelExtractors), ["routeClass", "status", "code"]);
+  assert.match(requestLines.body.filter, /jsonPayload\.event=\("request_failed" OR "request_pending" OR "request_unavailable"\)/u);
   assert.deepEqual(monitoring.ORIGIN_REQUEST_LOG_CONTRACT.notPorted, { status: 503, code: "POSTGRES_ROUTE_NOT_PORTED" });
+});
+
+test("the request floor is the smallest count at which one error cannot page, from production's volume", () => {
+  const { originFiveXxRatio: ratio, originFiveXxMinimumRequests: floor } = monitoring.MONITORING_THRESHOLDS;
+  assert.equal(floor, Math.ceil(1 / ratio));
+  // Every eligible window: one error is at most 2 %, and the comparison is strict.
+  for (let requests = floor; requests <= floor * 20; requests += 1) assert.equal(1 / requests > ratio, false, requests);
+  // One error under the floor would have paged without it.
+  assert.equal(1 / (floor - 1) > ratio, true);
+  // OWN-2-GQL (2026-10-02): 132,945 requests in 30 days on the queried routes,
+  // a mean of about 31 per 10-minute window, so the floor sits just above it.
+  const meanPerWindow = 132_945 / (30 * 24 * 6);
+  assert.ok(meanPerWindow > 30 && meanPerWindow < floor, String(meanPerWindow));
+});
+
+test("5xx exclusions name round 12's retired routes and the deliberate unported answers by exact path", () => {
+  const exclusions = monitoring.originFiveXxExclusions(monitoring.ORIGIN_5XX_EXCLUSIONS);
+  assert.deepEqual(exclusions.map(({ routeClass }) => routeClass), [
+    "enroll", "identity_google_start", "identity_google_callback", "identity_google_result",
+    "identity_apple_start", "identity_apple_callback", "identity_apple_result", "security_reset",
+    "telemetry_performance_capabilities", "telemetry_performance_consent", "telemetry_performance_reports",
+    "participant_export", "admin_action",
+  ]);
+  for (const entry of exclusions) {
+    assert.equal(WORKER_ROUTE_POLICY.find(({ pathname }) => pathname === entry.path)?.id, entry.routeClass);
+    assert.deepEqual([entry.status, entry.code], [503, "POSTGRES_ROUTE_NOT_PORTED"]);
+  }
+  const paths = monitoring.ORIGIN_5XX_EXCLUSIONS.map(({ path }) => path);
+  // Kept and live routes are never excluded: v0.x shares the live upload
+  // route, the accountless performance authorization answers a definite 4xx,
+  // and round 12 keeps renew and disconnect.
+  for (const kept of monitoring.ORIGIN_5XX_NEVER_EXCLUDED_PATHS) assert.equal(paths.includes(kept), false, kept);
+  for (const kept of ["/api/v1/contributions", "/api/v1/accountless/telemetry-performance-authorization",
+    "/api/v1/device/credential/renew", "/api/v1/device/disconnect"]) {
+    assert.ok(monitoring.ORIGIN_5XX_NEVER_EXCLUDED_PATHS.includes(kept), kept);
+  }
+  assert.deepEqual([...monitoring.ORIGIN_5XX_NEVER_EXCLUDED_CODES], ["POSTGRES_TEST_ROUTE_UNSUPPORTED",
+    "EDGE_ORIGIN_UNAVAILABLE"]);
+});
+
+test("5xx exclusions refuse a code alone, an inexact path, a kept route and the never-excluded codes", () => {
+  const base = { path: "/api/v1/identity/google/start", status: 503, code: "POSTGRES_ROUTE_NOT_PORTED", decision: "t" };
+  for (const [entries, code] of [
+    [[{ status: 503, code: "POSTGRES_ROUTE_NOT_PORTED", decision: "t" }], "MONITORING_5XX_EXCLUSION_INVALID"],
+    [[{ ...base, path: "" }], "MONITORING_5XX_EXCLUSION_INVALID"],
+    [[{ ...base, path: "/api/v1/identity/google" }], "MONITORING_5XX_EXCLUSION_PATH_NOT_EXACT"],
+    [[{ ...base, path: "/api/v1/identity/google/start/" }], "MONITORING_5XX_EXCLUSION_PATH_NOT_EXACT"],
+    [[{ ...base, path: "/api/v1/identity/google/start?x=1" }], "MONITORING_5XX_EXCLUSION_PATH_NOT_EXACT"],
+    [[{ ...base, path: "/api/v1/identity/*" }], "MONITORING_5XX_EXCLUSION_PATH_NOT_EXACT"],
+    [[{ ...base, path: "/index.html" }], "MONITORING_5XX_EXCLUSION_PATH_NOT_EXACT"],
+    [[{ ...base, path: "/api/v1/contributions" }], "MONITORING_5XX_EXCLUSION_PATH_FORBIDDEN"],
+    [[{ ...base, path: "/api/v1/accountless/telemetry-performance-authorization" }],
+      "MONITORING_5XX_EXCLUSION_PATH_FORBIDDEN"],
+    [[{ ...base, path: "/api/v1/device/credential/renew" }], "MONITORING_5XX_EXCLUSION_PATH_FORBIDDEN"],
+    [[{ ...base, path: "/api/v1/device/disconnect" }], "MONITORING_5XX_EXCLUSION_PATH_FORBIDDEN"],
+    [[{ ...base, code: "POSTGRES_TEST_ROUTE_UNSUPPORTED" }], "MONITORING_5XX_EXCLUSION_CODE_FORBIDDEN"],
+    [[{ ...base, code: "EDGE_ORIGIN_UNAVAILABLE" }], "MONITORING_5XX_EXCLUSION_CODE_FORBIDDEN"],
+    [[{ ...base, code: "INTERNAL_ERROR" }], "MONITORING_5XX_EXCLUSION_CODE_FORBIDDEN"],
+    [[{ ...base, code: undefined }], "MONITORING_5XX_EXCLUSION_CODE_FORBIDDEN"],
+    [[{ ...base, status: 500 }], "MONITORING_5XX_EXCLUSION_INVALID"],
+    [[{ ...base, status: "503" }], "MONITORING_5XX_EXCLUSION_INVALID"],
+    [[{ ...base, routeClass: "identity_google_start" }], "MONITORING_5XX_EXCLUSION_INVALID"],
+    [[{ ...base, decision: "" }], "MONITORING_5XX_EXCLUSION_INVALID"],
+    [[base, { ...base, decision: "again" }], "MONITORING_5XX_EXCLUSION_DUPLICATE"],
+    [[null], "MONITORING_5XX_EXCLUSION_INVALID"],
+    [{}, "MONITORING_5XX_EXCLUSION_INVALID"],
+  ]) {
+    assert.throws(() => monitoring.originFiveXxExclusions(entries), { code }, `${JSON.stringify(entries)} -> ${code}`);
+  }
+});
+
+test("the scanner refuses a rendered 5xx query that drops the floor or excludes by code alone", () => {
+  const rendered = monitoring.renderMonitoring(STAGING);
+  const index = rendered.policies.findIndex(({ id }) => id === "origin-5xx-ratio");
+  const tampered = (edit) => {
+    const copy = structuredClone(rendered);
+    const condition = copy.policies[index].body.conditions[0].conditionPrometheusQueryLanguage;
+    condition.query = edit(condition.query);
+    return () => monitoring.scanMonitoringPrivacy(copy);
+  };
+  for (const [edit, code] of [
+    [(promql) => promql.replaceAll(/routeClass=~"[^"]*",/gu, ""), "MONITORING_5XX_EXCLUSION_CODE_ALONE"],
+    [(promql) => promql.replaceAll('code="POSTGRES_ROUTE_NOT_PORTED"', 'code=~"POSTGRES_ROUTE_NOT_PORTED"'),
+      "MONITORING_5XX_EXCLUSION_CODE_ALONE"],
+    [(promql) => promql.replaceAll('routeClass=~"enroll|', 'routeClass=~"contributions|enroll|'),
+      "MONITORING_5XX_EXCLUSION_NOT_LISTED"],
+    [(promql) => promql.replaceAll('routeClass=~"enroll|', 'routeClass=~".*|'), "MONITORING_5XX_EXCLUSION_NOT_LISTED"],
+    [(promql) => promql.replaceAll("POSTGRES_ROUTE_NOT_PORTED", "POSTGRES_TEST_ROUTE_UNSUPPORTED"),
+      "MONITORING_5XX_EXCLUSION_CODE_FORBIDDEN"],
+    [(promql) => promql.replaceAll("POSTGRES_ROUTE_NOT_PORTED", "EDGE_ORIGIN_UNAVAILABLE"),
+      "MONITORING_5XX_EXCLUSION_CODE_FORBIDDEN"],
+    [(promql) => promql.slice(0, promql.indexOf(" and on() (")), "MONITORING_5XX_MINIMUM_REQUESTS_MISSING"],
+    [(promql) => promql.replace(/>= 50\)$/u, ">= 1)"), "MONITORING_5XX_MINIMUM_REQUESTS_MISSING"],
+  ]) {
+    assert.throws(tampered(edit), { code }, code);
+  }
 });
 
 test("refresh alerts: LOCK_HELD, and no completed run within cadence plus slack (a lost lock exits 0)", async () => {
@@ -372,14 +474,35 @@ test("every policy links to its own anchor in the maintained runbook", () => {
 });
 
 test("the origin request contract mirrors the origin's own log line where that module exists", async (t) => {
-  let host;
-  try {
-    host = await import("../cloud-run/postgres-host-dispatch.mjs");
-  } catch {
+  // Skipped only while the module is absent from this line. It is read as
+  // text: its imports resolve only under the bundler, and a failed import
+  // must not read as a skip.
+  const hostPath = join(WORKER_ROOT, "cloud-run", "postgres-host-dispatch.mjs");
+  if (!existsSync(hostPath)) {
     t.skip("cloud-run/postgres-host-dispatch.mjs (W3-CRA, D-CRB) is not on this line yet");
     return;
   }
-  assert.deepEqual([...host.ORIGIN_REQUEST_LOG_FIELDS], [...monitoring.ORIGIN_REQUEST_LOG_CONTRACT.fields]);
-  assert.deepEqual([...host.ORIGIN_REQUEST_LOG_EVENTS], [...monitoring.ORIGIN_REQUEST_LOG_CONTRACT.events]);
-  assert.deepEqual({ ...host.ORIGIN_ROUTE_NOT_PORTED }, { ...monitoring.ORIGIN_REQUEST_LOG_CONTRACT.notPorted });
+  const source = readFileSync(hostPath, "utf8");
+  const frozenList = (name) => {
+    const match = new RegExp(`export const ${name} = Object\\.freeze\\(\\[([^\\]]*)\\]\\);`, "u").exec(source);
+    assert.ok(match, name);
+    return [...match[1].matchAll(/"([^"]+)"/gu)].map(([, value]) => value);
+  };
+  assert.deepEqual(frozenList("ORIGIN_REQUEST_LOG_FIELDS"), [...monitoring.ORIGIN_REQUEST_LOG_CONTRACT.fields]);
+  assert.deepEqual(frozenList("ORIGIN_REQUEST_LOG_EVENTS"), [...monitoring.ORIGIN_REQUEST_LOG_CONTRACT.events]);
+  const notPorted = /export const ORIGIN_ROUTE_NOT_PORTED = Object\.freeze\(\{\s*status: (\d+),\s*code: "([A-Z_]+)",\s*\}\);/u
+    .exec(source);
+  assert.ok(notPorted, "ORIGIN_ROUTE_NOT_PORTED");
+  assert.deepEqual({ status: Number(notPorted[1]), code: notPorted[2] }, { ...monitoring.ORIGIN_REQUEST_LOG_CONTRACT.notPorted });
+  // Every excluded route is one the origin deliberately leaves unported (or
+  // the admin action route, whose unported tasks answer the same code); the
+  // accountless performance authorization is the one unported route left in.
+  const registry = await import("../cloud-run/postgres-production-registry.mjs");
+  const excluded = monitoring.originFiveXxExclusions(monitoring.ORIGIN_5XX_EXCLUSIONS).map(({ routeClass }) => routeClass);
+  for (const routeClass of excluded) {
+    assert.ok(routeClass === "admin_action" ? registry.ADMIN_HOST_ROUTE_IDS.includes(routeClass)
+      : registry.OD_CR_2_UNPORTED_ROUTE_IDS.includes(routeClass), routeClass);
+  }
+  assert.deepEqual(registry.OD_CR_2_UNPORTED_ROUTE_IDS.filter((id) => !excluded.includes(id)),
+    ["accountless_telemetry_performance_authorization"]);
 });
