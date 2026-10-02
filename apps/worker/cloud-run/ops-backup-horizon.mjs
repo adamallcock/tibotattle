@@ -1,18 +1,20 @@
 /**
- * Backup-horizon policy and audit core for the Google Cloud copies of the
- * hosted PostgreSQL stores (OPS-1).
+ * Backup-horizon policy and audit core for the Google Cloud copy of the
+ * hosted PostgreSQL store (OPS-1).
  *
- * Why this exists: restore replay suppresses an erased participant after a
- * restore only while that participant's deletion tombstone still exists, and
- * tombstones live 400 days (src/retention.ts DELETION_TOMBSTONE_RETENTION_MILLISECONDS
- * for the Worker, src/postgres-ledger-authority.ts TOMBSTONE_RETENTION_MILLISECONDS
- * for the PostgreSQL ledger writer). A backup taken at time T holds only
- * participants erased after T, so every copy that can still be restored must be
- * younger than the tombstone horizon. The operational horizons below keep every
- * Cloud SQL copy under a 365-day ceiling, 35 days inside that horizon, with a
- * 7-day restore slack on top of each operational horizon.
+ * Policy: the service runs on one Cloud SQL PostgreSQL 17 instance with no
+ * deletion ledger (append-only decision record 2026-09-26, D2 and D4), and
+ * its backups follow owner-approved horizons: 30 automated backups (retention
+ * unit COUNT, one a day), 7 days of point-in-time recovery logs, labelled
+ * on-demand copies kept at most 90 days, final backups kept at most 30 days,
+ * and no restorable copy older than the 365-day ceiling. Each operational
+ * horizon plus a 7-day restore slack stays under that ceiling. These are
+ * policy constants in their own right; they are not derived from a deletion
+ * tombstone lifetime, because the Google Cloud service keeps no tombstones and
+ * performs no restore replay. Reapplying the offline do-not-restore list after
+ * a restore (D2 step 4) is a separate owner procedure, not this module.
  *
- * Scope: the Cloud SQL primary and ledger instances only, and within them only
+ * Scope: the one Cloud SQL instance (role 'primary') only, and within it only
  * the per-instance backup runs (`sql backups list --instance`, the Admin API
  * backupRuns collection). Project-level backups that outlive an instance
  * (final backups of deleted instances, backups retained after deletion) are
@@ -46,13 +48,15 @@
 import { createHash } from "node:crypto";
 import { canonicalJson } from "../src/canonical-json.ts";
 
-export const BACKUP_HORIZON_AUDIT_SCHEMA = "tibotattle-backup-horizon-audit-v1";
+/**
+ * v2: one role ('primary'). A v1 receipt (primary and ledger roles) is refused,
+ * as is any receipt or input that names a ledger role.
+ */
+export const BACKUP_HORIZON_AUDIT_SCHEMA = "tibotattle-backup-horizon-audit-v2";
 /** What an audit receipt covers: per-instance backup runs only, never project-level backups. */
 export const BACKUP_HORIZON_COVERAGE = "instance-backup-runs-only";
 
-export const RESTORE_SUPPRESSION_TOMBSTONE_DAYS = 400;
 export const BACKUP_HORIZON_MAX_DAYS = 365;
-export const HORIZON_MARGIN_DAYS = 35;
 export const RESTORE_SLACK_DAYS = 7;
 /** Retention unit COUNT: one automated backup per day, so 30 backups span 30 days. */
 export const AUTOMATED_RETAINED_BACKUPS = 30;
@@ -75,9 +79,7 @@ export const DESCRIPTION_PATTERN = Object.freeze(
 );
 
 export const BACKUP_HORIZON_CONSTANTS = Object.freeze({
-  RESTORE_SUPPRESSION_TOMBSTONE_DAYS,
   BACKUP_HORIZON_MAX_DAYS,
-  HORIZON_MARGIN_DAYS,
   RESTORE_SLACK_DAYS,
   AUTOMATED_RETAINED_BACKUPS,
   PITR_LOG_RETENTION_DAYS,
@@ -88,7 +90,8 @@ export const BACKUP_HORIZON_CONSTANTS = Object.freeze({
 });
 
 export const BACKUP_HORIZON_ENVIRONMENTS = Object.freeze(["production", "staging"]);
-export const BACKUP_HORIZON_ROLES = Object.freeze(["primary", "ledger"]);
+/** One Cloud SQL instance (decision D4): there is no ledger role. */
+export const BACKUP_HORIZON_ROLES = Object.freeze(["primary"]);
 export const BACKUP_HORIZON_VERDICTS = Object.freeze(["ok", "warn", "breach"]);
 export const ON_DEMAND_STATUSES = Object.freeze(["ok", "due", "overdue", "critical", "unlabelled"]);
 /** Receipt statuses a receipt-bound prune may act on. */
@@ -265,9 +268,9 @@ function sha256Hex(text) {
 
 /**
  * Throws BACKUP_HORIZON_INVARIANT_BROKEN unless every operational horizon plus
- * the restore slack fits under the ceiling, the critical threshold sits below
- * the ceiling (and above the overdue threshold), and the ceiling plus margin
- * fits inside the tombstone horizon. The ceiling is not an operational horizon.
+ * the restore slack fits under the ceiling and the critical threshold sits
+ * below the ceiling (and above the overdue threshold). The ceiling is the
+ * owner-approved policy bound itself, not an operational horizon.
  */
 export function assertBackupHorizonInvariant({ constants = BACKUP_HORIZON_CONSTANTS } = {}) {
   if (!isPlainObject(constants)
@@ -283,8 +286,7 @@ export function assertBackupHorizonInvariant({ constants = BACKUP_HORIZON_CONSTA
   ];
   if (operationalHorizonDays.some((days) => days + constants.RESTORE_SLACK_DAYS > ceiling)
       || !(constants.ON_DEMAND_CRITICAL_DAYS < ceiling)
-      || !(constants.ON_DEMAND_MAX_DAYS < constants.ON_DEMAND_CRITICAL_DAYS)
-      || ceiling + constants.HORIZON_MARGIN_DAYS > constants.RESTORE_SUPPRESSION_TOMBSTONE_DAYS) {
+      || !(constants.ON_DEMAND_MAX_DAYS < constants.ON_DEMAND_CRITICAL_DAYS)) {
     fail("BACKUP_HORIZON_INVARIANT_BROKEN");
   }
   return true;
@@ -661,7 +663,6 @@ function validateAssessmentInput({ environment, nowMs, project, region, instance
     }
     byRole.set(entry.role, entry);
   }
-  if (byRole.get("primary").instance === byRole.get("ledger").instance) fail("BACKUP_HORIZON_INPUT_INVALID");
   return byRole;
 }
 
@@ -672,27 +673,28 @@ export function backupHorizonReceiptDigest(body) {
 }
 
 /**
- * Assess both Cloud SQL instances against the backup-horizon policy.
+ * Assess the Cloud SQL instance against the backup-horizon policy.
  *
  * @param {object} input
  * @param {"production"|"staging"} input.environment
  * @param {number} input.nowMs epoch milliseconds
- * @param {string} input.project GCP project id the instances live in
+ * @param {string} input.project GCP project id the instance lives in
  * @param {string|null} [input.region] manifest region; when supplied the
  *   configured backup location and every restorable copy's location must equal it
- * @param {Array<{role:"primary"|"ledger", instance:string, settings:object, backupRuns:unknown}>} input.instances
+ * @param {Array<{role:"primary", instance:string, settings:object, backupRuns:unknown}>} input.instances
+ *   exactly one entry, for the one instance; a ledger role is refused.
  *   `settings` is the `gcloud sql instances describe --format=json` object
  *   (Admin API DatabaseInstance); `backupRuns` the `gcloud sql backups list
  *   --instance=<name> --format=json` array (Admin API BackupRun items).
- * @returns a deep-frozen 'tibotattle-backup-horizon-audit-v1' receipt whose
+ * @returns a deep-frozen 'tibotattle-backup-horizon-audit-v2' receipt whose
  *   `coverage` is BACKUP_HORIZON_COVERAGE: an ok verdict speaks for the
- *   instances' listed backup runs, not for project-level backups.
+ *   instance's listed backup runs, not for project-level backups.
  */
 export function assessBackupRuns({ environment, nowMs, project, region = null, instances } = {}) {
   const byRole = validateAssessmentInput({ environment, nowMs, project, region, instances });
   const roles = {};
   for (const role of BACKUP_HORIZON_ROLES) roles[role] = assessRole(byRole.get(role), { nowMs, region });
-  const codes = sortCodes([...roles.primary.codes, ...roles.ledger.codes]);
+  const codes = sortCodes(BACKUP_HORIZON_ROLES.flatMap((role) => roles[role].codes));
   const body = {
     schema: BACKUP_HORIZON_AUDIT_SCHEMA,
     coverage: BACKUP_HORIZON_COVERAGE,
@@ -819,10 +821,9 @@ export function verifyBackupHorizonReceipt(receipt) {
       || !isCanonicalInstant(receipt.generatedAt)
       || !hasExactKeys(receipt.roles, BACKUP_HORIZON_ROLES)
       || !BACKUP_HORIZON_ROLES.every((role) => validRole(receipt.roles[role]))
-      || receipt.roles.primary.instance === receipt.roles.ledger.instance
       || !validCodeList(receipt.codes)
       || canonicalJson(receipt.codes)
-        !== canonicalJson(sortCodes([...receipt.roles.primary.codes, ...receipt.roles.ledger.codes]))
+        !== canonicalJson(sortCodes(BACKUP_HORIZON_ROLES.flatMap((role) => receipt.roles[role].codes)))
       || receipt.verdict !== verdictFor(receipt.codes)
       || typeof receipt.digest !== "string" || !DIGEST.test(receipt.digest)
       || receipt.digest !== backupHorizonReceiptDigest(receipt)) {

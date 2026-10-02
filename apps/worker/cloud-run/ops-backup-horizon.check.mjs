@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import * as horizonModule from "./ops-backup-horizon.mjs";
 import {
   AUTOMATED_RETAINED_BACKUPS,
   BACKUP_HORIZON_AUDIT_SCHEMA,
@@ -12,16 +13,15 @@ import {
   BACKUP_HORIZON_CONSTANTS,
   BACKUP_HORIZON_COVERAGE,
   BACKUP_HORIZON_MAX_DAYS,
+  BACKUP_HORIZON_ROLES,
   DESCRIPTION_PATTERN,
   FINAL_BACKUP_MAX_DAYS,
-  HORIZON_MARGIN_DAYS,
   LAST_AUTOMATED_SUCCESS_MAX_HOURS,
   ON_DEMAND_CRITICAL_DAYS,
   ON_DEMAND_MAX_DAYS,
   ON_DEMAND_PURPOSES,
   PITR_LOG_RETENTION_DAYS,
   RESTORE_SLACK_DAYS,
-  RESTORE_SUPPRESSION_TOMBSTONE_DAYS,
   assertBackupHorizonInvariant,
   assessBackupRuns,
   classifyBackupRun,
@@ -34,8 +34,30 @@ import {
 
 const CLOUD_RUN_ROOT = dirname(fileURLToPath(import.meta.url));
 const WORKER_ROOT = resolve(CLOUD_RUN_ROOT, "..");
-const RETENTION_SOURCE = join(WORKER_ROOT, "src", "retention.ts");
-const LEDGER_AUTHORITY_SOURCE = join(WORKER_ROOT, "src", "postgres-ledger-authority.ts");
+const MODULE_SOURCE = join(CLOUD_RUN_ROOT, "ops-backup-horizon.mjs");
+/** The OPS-1 files: none may import or name the PostgreSQL ledger writer. */
+const OPS1_SOURCES = Object.freeze([
+  MODULE_SOURCE,
+  join(CLOUD_RUN_ROOT, "ops-backup-horizon.check.mjs"),
+  join(WORKER_ROOT, "scripts", "gcp-backup-horizon.mjs"),
+  join(WORKER_ROOT, "scripts", "gcp-backup-horizon.check.mjs"),
+]);
+/**
+ * The owner-approved horizon constants, as their declaring lines read at the
+ * base commit 45afdf63. SIMP-0 item 9 removed only the tombstone derivation
+ * (RESTORE_SUPPRESSION_TOMBSTONE_DAYS and HORIZON_MARGIN_DAYS); these lines
+ * must stay byte-identical.
+ */
+const BASE_CONSTANT_LINES = Object.freeze([
+  "export const BACKUP_HORIZON_MAX_DAYS = 365;",
+  "export const RESTORE_SLACK_DAYS = 7;",
+  "export const AUTOMATED_RETAINED_BACKUPS = 30;",
+  "export const PITR_LOG_RETENTION_DAYS = 7;",
+  "export const ON_DEMAND_MAX_DAYS = 90;",
+  "export const ON_DEMAND_CRITICAL_DAYS = 300;",
+  "export const FINAL_BACKUP_MAX_DAYS = 30;",
+  "export const LAST_AUTOMATED_SUCCESS_MAX_HOURS = 36;",
+]);
 
 // Synthetic, content-free identifiers; none of them names a real resource.
 const NOW = Date.parse("2026-09-26T12:00:00.000Z");
@@ -44,7 +66,6 @@ const HOUR = 60 * 60 * 1_000;
 const PROJECT = "synthetic-horizon-prod";
 const REGION = "us-east1";
 const PRIMARY = "synthetic-primary-a";
-const LEDGER = "synthetic-ledger-a";
 
 /** Shaped like `gcloud sql instances describe --format=json` for a compliant instance. */
 function describeInstance(name, { config = {}, settings = {} } = {}) {
@@ -110,7 +131,7 @@ function labelFor(ageMs, days, purpose = "pre-migration") {
   return formatOnDemandDescription({ expiresOn: onDemandExpiresOn(NOW - ageMs, days), purpose });
 }
 
-function input({ primary = {}, ledger = {}, region = REGION } = {}) {
+function input({ primary = {}, region = REGION } = {}) {
   return {
     environment: "production",
     nowMs: NOW,
@@ -122,12 +143,6 @@ function input({ primary = {}, ledger = {}, region = REGION } = {}) {
         instance: PRIMARY,
         settings: primary.settings ?? describeInstance(PRIMARY),
         backupRuns: primary.backupRuns ?? automatedSeries(PRIMARY),
-      },
-      {
-        role: "ledger",
-        instance: LEDGER,
-        settings: ledger.settings ?? describeInstance(LEDGER),
-        backupRuns: ledger.backupRuns ?? automatedSeries(LEDGER),
       },
     ],
   };
@@ -155,34 +170,20 @@ function reverseKeys(value) {
   return value;
 }
 
-/**
- * The two 400-day tombstone literals that restore replay depends on. Either
- * drifting away from RESTORE_SUPPRESSION_TOMBSTONE_DAYS breaks the horizon
- * arithmetic, so both are pinned here.
- */
-async function assertTombstoneLiteralsPinned({ retentionPath, ledgerAuthorityPath }) {
-  const retention = await readFile(retentionPath, "utf8");
-  const ledgerAuthority = await readFile(ledgerAuthorityPath, "utf8");
-  const days = String(RESTORE_SUPPRESSION_TOMBSTONE_DAYS);
-  const dayLines = [...retention.matchAll(/^const DAY_MILLISECONDS = 24 \* 60 \* 60 \* 1_000;$/gmu)];
-  const workerLines = [...retention.matchAll(
-    /^export const DELETION_TOMBSTONE_RETENTION_MILLISECONDS = (\d+) \* DAY_MILLISECONDS;$/gmu,
-  )];
-  const ledgerLines = [...ledgerAuthority.matchAll(
-    /^const TOMBSTONE_RETENTION_MILLISECONDS = (\d+) \* 24 \* 60 \* 60 \* 1_000;$/gmu,
-  )];
-  if (dayLines.length !== 1 || workerLines.length !== 1 || workerLines[0][1] !== days) {
-    throw new Error("BACKUP_HORIZON_TOMBSTONE_DRIFT: src/retention.ts");
-  }
-  if (ledgerLines.length !== 1 || ledgerLines[0][1] !== days) {
-    throw new Error("BACKUP_HORIZON_TOMBSTONE_DRIFT: src/postgres-ledger-authority.ts");
+/** Each kept constant's declaring line appears exactly once, byte for byte. */
+function assertHorizonConstantsPinned(source) {
+  const lines = source.split("\n");
+  for (const expected of BASE_CONSTANT_LINES) {
+    const name = /^export const ([A-Z_]+) = /u.exec(expected)[1];
+    const declarations = lines.filter((line) => line.startsWith(`export const ${name} =`));
+    if (declarations.length !== 1 || declarations[0] !== expected) {
+      throw new Error(`BACKUP_HORIZON_CONSTANT_DRIFT: ${name}`);
+    }
   }
 }
 
 test("shipped constants are the approved horizons and are frozen", () => {
-  assert.equal(RESTORE_SUPPRESSION_TOMBSTONE_DAYS, 400);
   assert.equal(BACKUP_HORIZON_MAX_DAYS, 365);
-  assert.equal(HORIZON_MARGIN_DAYS, 35);
   assert.equal(RESTORE_SLACK_DAYS, 7);
   assert.equal(AUTOMATED_RETAINED_BACKUPS, 30);
   assert.equal(PITR_LOG_RETENTION_DAYS, 7);
@@ -196,6 +197,47 @@ test("shipped constants are the approved horizons and are frozen", () => {
   }
   assert.throws(() => { BACKUP_HORIZON_CONSTANTS.ON_DEMAND_MAX_DAYS = 360; }, TypeError);
   assert.equal(BACKUP_HORIZON_CODES.length, 13);
+  // Policy constants only: the tombstone derivation is gone (SIMP-0 item 9).
+  assert.deepEqual(Object.keys(BACKUP_HORIZON_CONSTANTS), [
+    "BACKUP_HORIZON_MAX_DAYS", "RESTORE_SLACK_DAYS", "AUTOMATED_RETAINED_BACKUPS",
+    "PITR_LOG_RETENTION_DAYS", "ON_DEMAND_MAX_DAYS", "ON_DEMAND_CRITICAL_DAYS",
+    "FINAL_BACKUP_MAX_DAYS", "LAST_AUTOMATED_SUCCESS_MAX_HOURS",
+  ]);
+  for (const retired of ["RESTORE_SUPPRESSION_TOMBSTONE_DAYS", "HORIZON_MARGIN_DAYS"]) {
+    assert.equal(Object.hasOwn(horizonModule, retired), false, retired);
+  }
+});
+
+test("one Cloud SQL instance: the only role is primary, and a ledger role is refused", () => {
+  assert.deepEqual([...BACKUP_HORIZON_ROLES], ["primary"]);
+  assert.equal(Object.isFrozen(BACKUP_HORIZON_ROLES), true);
+  assert.equal(BACKUP_HORIZON_AUDIT_SCHEMA, "tibotattle-backup-horizon-audit-v2");
+  const receipt = assessBackupRuns(input());
+  assert.deepEqual(Object.keys(receipt.roles), ["primary"]);
+  // An input naming a ledger role, alone or beside the primary, is refused.
+  const ledger = { role: "ledger", instance: "synthetic-ledger-a",
+    settings: describeInstance("synthetic-ledger-a"), backupRuns: automatedSeries("synthetic-ledger-a") };
+  for (const instances of [[ledger], [input().instances[0], ledger], [ledger, input().instances[0]]]) {
+    assert.throws(() => assessBackupRuns({ ...input(), instances }),
+      (error) => error.code === "BACKUP_HORIZON_INPUT_INVALID");
+  }
+  // A receipt naming a ledger role is refused, under either schema label.
+  const redigest = (value) => {
+    const { digest: _ignored, ...body } = value;
+    return { ...value, digest: createHash("sha256").update(sortedJson(body)).digest("hex") };
+  };
+  const plain = JSON.parse(JSON.stringify(receipt));
+  const withLedger = { ...plain, roles: { ...plain.roles, ledger: { ...plain.roles.primary, instance: "synthetic-ledger-a" } } };
+  for (const doctored of [
+    redigest(withLedger),
+    redigest({ ...withLedger, schema: "tibotattle-backup-horizon-audit-v1" }),
+    redigest({ ...plain, schema: "tibotattle-backup-horizon-audit-v1" }),
+    redigest({ ...plain, roles: { ledger: plain.roles.primary } }),
+  ]) {
+    assert.throws(() => verifyBackupHorizonReceipt(doctored),
+      (error) => error.code === "BACKUP_HORIZON_RECEIPT_INVALID");
+  }
+  assert.deepEqual(verifyBackupHorizonReceipt(structuredClone(plain)).roles.primary.instance, PRIMARY);
 });
 
 test("the invariant passes the shipped constants and fails each doctored horizon", () => {
@@ -203,13 +245,12 @@ test("the invariant passes the shipped constants and fails each doctored horizon
   assert.equal(assertBackupHorizonInvariant({ constants: { ...BACKUP_HORIZON_CONSTANTS } }), true);
   for (const doctored of [
     { ON_DEMAND_MAX_DAYS: 360 },
-    { BACKUP_HORIZON_MAX_DAYS: 366 },
+    // The ceiling bounds every operational horizon, so lowering it fails...
+    { BACKUP_HORIZON_MAX_DAYS: 96 },
     { ON_DEMAND_CRITICAL_DAYS: 365 },
     { AUTOMATED_RETAINED_BACKUPS: 359 },
     { PITR_LOG_RETENTION_DAYS: 359 },
     { FINAL_BACKUP_MAX_DAYS: 359 },
-    { HORIZON_MARGIN_DAYS: 36 },
-    { RESTORE_SUPPRESSION_TOMBSTONE_DAYS: 399 },
     { ON_DEMAND_MAX_DAYS: 300 },
     { RESTORE_SLACK_DAYS: 0 },
     { ON_DEMAND_MAX_DAYS: "90" },
@@ -220,47 +261,38 @@ test("the invariant passes the shipped constants and fails each doctored horizon
       JSON.stringify(doctored),
     );
   }
+  // ...but the 365-day ceiling is now owner-approved policy, not a value
+  // derived from a 400-day tombstone (SIMP-0 item 9), so the invariant alone
+  // no longer refuses a higher one. The byte pin of the declaring lines
+  // (the next test) refuses any change to it, or to any other kept horizon.
+  assert.equal(assertBackupHorizonInvariant({
+    constants: { ...BACKUP_HORIZON_CONSTANTS, BACKUP_HORIZON_MAX_DAYS: 366 },
+  }), true);
 });
 
-test("both 400-day tombstone literals are pinned and a 401 in either copy fails", async () => {
-  await assertTombstoneLiteralsPinned({
-    retentionPath: RETENTION_SOURCE,
-    ledgerAuthorityPath: LEDGER_AUTHORITY_SOURCE,
-  });
-  const directory = await mkdtemp(join(tmpdir(), "ops-backup-horizon-drift-"));
-  try {
-    const retention = await readFile(RETENTION_SOURCE, "utf8");
-    const ledgerAuthority = await readFile(LEDGER_AUTHORITY_SOURCE, "utf8");
-    const retentionCopy = join(directory, "retention.ts");
-    const ledgerCopy = join(directory, "postgres-ledger-authority.ts");
-    const retentionDrift = join(directory, "retention-drift.ts");
-    const ledgerDrift = join(directory, "postgres-ledger-authority-drift.ts");
-    await writeFile(retentionCopy, retention);
-    await writeFile(ledgerCopy, ledgerAuthority);
-    const driftedRetention = retention.replace(
-      "DELETION_TOMBSTONE_RETENTION_MILLISECONDS = 400 * DAY_MILLISECONDS",
-      "DELETION_TOMBSTONE_RETENTION_MILLISECONDS = 401 * DAY_MILLISECONDS",
-    );
-    const driftedLedger = ledgerAuthority.replace(
-      "TOMBSTONE_RETENTION_MILLISECONDS = 400 * 24 * 60 * 60 * 1_000",
-      "TOMBSTONE_RETENTION_MILLISECONDS = 401 * 24 * 60 * 60 * 1_000",
-    );
-    assert.notEqual(driftedRetention, retention);
-    assert.notEqual(driftedLedger, ledgerAuthority);
-    await writeFile(retentionDrift, driftedRetention);
-    await writeFile(ledgerDrift, driftedLedger);
-    await assertTombstoneLiteralsPinned({ retentionPath: retentionCopy, ledgerAuthorityPath: ledgerCopy });
-    await assert.rejects(
-      assertTombstoneLiteralsPinned({ retentionPath: retentionDrift, ledgerAuthorityPath: ledgerCopy }),
-      /BACKUP_HORIZON_TOMBSTONE_DRIFT: src\/retention\.ts/u,
-    );
-    await assert.rejects(
-      assertTombstoneLiteralsPinned({ retentionPath: retentionCopy, ledgerAuthorityPath: ledgerDrift }),
-      /BACKUP_HORIZON_TOMBSTONE_DRIFT: src\/postgres-ledger-authority\.ts/u,
-    );
-  } finally {
-    await rm(directory, { recursive: true, force: true });
+test("the kept horizon constants are byte-identical to the base and a doctored literal fails", async () => {
+  const source = await readFile(MODULE_SOURCE, "utf8");
+  assertHorizonConstantsPinned(source);
+  for (const expected of BASE_CONSTANT_LINES) {
+    const name = /^export const ([A-Z_]+) = /u.exec(expected)[1];
+    const drifted = source.replace(expected, expected.replace(/= (\d+);$/u, (_, value) => `= ${Number(value) + 1};`));
+    assert.notEqual(drifted, source, name);
+    assert.throws(() => assertHorizonConstantsPinned(drifted), new RegExp(`BACKUP_HORIZON_CONSTANT_DRIFT: ${name}$`, "u"));
+    const duplicated = source.replace(expected, `${expected}\n${expected}`);
+    assert.throws(() => assertHorizonConstantsPinned(duplicated), new RegExp(`BACKUP_HORIZON_CONSTANT_DRIFT: ${name}$`, "u"));
   }
+});
+
+test("no OPS-1 module imports or names the PostgreSQL ledger writer, or derives from a tombstone", async () => {
+  for (const path of OPS1_SOURCES) {
+    const source = await readFile(path, "utf8");
+    // Built from parts, so this file does not name the module it forbids.
+    assert.equal(source.includes(["postgres", "ledger", "authority"].join("-")), false, path);
+    assert.doesNotMatch(source, /from\s+["'][^"']*ledger[^"']*["']/iu, path);
+  }
+  const source = await readFile(MODULE_SOURCE, "utf8");
+  assert.doesNotMatch(source, /TOMBSTONE|HORIZON_MARGIN/u);
+  assert.doesNotMatch(source, /\b400\b/u);
 });
 
 test("the core module stays runtime-neutral", async () => {
@@ -369,13 +401,13 @@ test("the verdict matrix is exact", () => {
     },
     {
       name: "PITR log retention 8 days",
-      ledger: { settings: describeInstance(LEDGER, { config: { transactionLogRetentionDays: 8 } }) },
+      primary: { settings: describeInstance(PRIMARY, { config: { transactionLogRetentionDays: 8 } }) },
       verdict: "breach",
       codes: ["PITR_RETENTION_EXCEEDED"],
     },
     {
       name: "PITR disabled",
-      ledger: { settings: describeInstance(LEDGER, { config: {
+      primary: { settings: describeInstance(PRIMARY, { config: {
         pointInTimeRecoveryEnabled: false,
         transactionLogRetentionDays: undefined,
       } }) },
@@ -416,7 +448,7 @@ test("the verdict matrix is exact", () => {
     },
     {
       name: "backups retained after instance deletion",
-      ledger: { settings: describeInstance(LEDGER, { settings: { retainBackupsOnDelete: true } }) },
+      primary: { settings: describeInstance(PRIMARY, { settings: { retainBackupsOnDelete: true } }) },
       verdict: "breach",
       codes: ["FINAL_BACKUP_RETENTION_EXCEEDED"],
     },
@@ -470,33 +502,33 @@ test("the verdict matrix is exact", () => {
     },
     {
       name: "automated backup 366 days old",
-      ledger: { backupRuns: [...automatedSeries(LEDGER), backupRun(LEDGER, { ageMs: 366 * DAY })] },
+      primary: { backupRuns: [...automatedSeries(PRIMARY), backupRun(PRIMARY, { ageMs: 366 * DAY })] },
       verdict: "breach",
       codes: ["BACKUP_OLDER_THAN_HORIZON"],
     },
     {
       name: "a copy whose deletion failed still counts toward the horizon",
-      ledger: { backupRuns: [
-        ...automatedSeries(LEDGER),
-        backupRun(LEDGER, { ageMs: 366 * DAY, status: "DELETION_FAILED" }),
+      primary: { backupRuns: [
+        ...automatedSeries(PRIMARY),
+        backupRun(PRIMARY, { ageMs: 366 * DAY, status: "DELETION_FAILED" }),
       ] },
       verdict: "breach",
       codes: ["BACKUP_OLDER_THAN_HORIZON"],
     },
     {
       name: "a failed backup run is not a restorable copy",
-      ledger: { backupRuns: [
-        ...automatedSeries(LEDGER),
-        backupRun(LEDGER, { ageMs: 366 * DAY, status: "FAILED" }),
+      primary: { backupRuns: [
+        ...automatedSeries(PRIMARY),
+        backupRun(PRIMARY, { ageMs: 366 * DAY, status: "FAILED" }),
       ] },
       verdict: "ok",
       codes: [],
     },
     {
       name: "final backup copy older than 30 days",
-      ledger: { backupRuns: [
-        ...automatedSeries(LEDGER),
-        backupRun(LEDGER, { ageMs: 31 * DAY, type: "FINAL" }),
+      primary: { backupRuns: [
+        ...automatedSeries(PRIMARY),
+        backupRun(PRIMARY, { ageMs: 31 * DAY, type: "FINAL" }),
       ] },
       verdict: "breach",
       codes: ["FINAL_BACKUP_RETENTION_EXCEEDED"],
@@ -598,7 +630,7 @@ test("the verdict matrix is exact", () => {
     {
       // Staleness is an inference from absence, so it is not raised when the list is unreadable.
       name: "backup list is not an array",
-      ledger: { backupRuns: { items: [] } },
+      primary: { backupRuns: { items: [] } },
       verdict: "breach",
       codes: ["BACKUP_SETTINGS_UNRECOGNIZED"],
     },
@@ -742,37 +774,37 @@ test("the verdict matrix is exact", () => {
     },
     {
       name: "an automated copy left in an earlier location",
-      ledger: { backupRuns: [
-        ...automatedSeries(LEDGER),
-        backupRun(LEDGER, { ageMs: 20 * DAY, extra: { location: "asia" } }),
+      primary: { backupRuns: [
+        ...automatedSeries(PRIMARY),
+        backupRun(PRIMARY, { ageMs: 20 * DAY, extra: { location: "asia" } }),
       ] },
       verdict: "breach",
       codes: ["BACKUP_LOCATION_MISMATCH"],
     },
     {
       name: "a copy whose deletion failed still has to be in the region",
-      ledger: { backupRuns: [
-        ...automatedSeries(LEDGER),
-        backupRun(LEDGER, { ageMs: 20 * DAY, status: "DELETION_FAILED", extra: { location: "asia" } }),
+      primary: { backupRuns: [
+        ...automatedSeries(PRIMARY),
+        backupRun(PRIMARY, { ageMs: 20 * DAY, status: "DELETION_FAILED", extra: { location: "asia" } }),
       ] },
       verdict: "breach",
       codes: ["BACKUP_LOCATION_MISMATCH"],
     },
     {
       name: "a failed run elsewhere holds no copy",
-      ledger: { backupRuns: [
-        ...automatedSeries(LEDGER),
-        backupRun(LEDGER, { ageMs: 20 * DAY, status: "FAILED", extra: { location: "asia" } }),
+      primary: { backupRuns: [
+        ...automatedSeries(PRIMARY),
+        backupRun(PRIMARY, { ageMs: 20 * DAY, status: "FAILED", extra: { location: "asia" } }),
       ] },
       verdict: "ok",
       codes: [],
     },
     {
       name: "a restorable copy with no stated location",
-      ledger: { backupRuns: [
-        ...automatedSeries(LEDGER),
+      primary: { backupRuns: [
+        ...automatedSeries(PRIMARY),
         (() => {
-          const run = backupRun(LEDGER, { ageMs: 20 * DAY });
+          const run = backupRun(PRIMARY, { ageMs: 20 * DAY });
           delete run.location;
           return run;
         })(),
@@ -802,7 +834,7 @@ test("the verdict matrix is exact", () => {
     },
   ];
   for (const testCase of cases) {
-    const receipt = assessBackupRuns(input({ primary: testCase.primary, ledger: testCase.ledger }));
+    const receipt = assessBackupRuns(input({ primary: testCase.primary }));
     assert.equal(receipt.verdict, testCase.verdict, testCase.name);
     assert.deepEqual([...receipt.codes], testCase.codes, testCase.name);
   }
@@ -821,7 +853,7 @@ test("unit and status details of the matrix", () => {
   } }) } }));
   assert.equal(unknownUnit.roles.primary.settings.recognized, false);
   assert.equal(unknownUnit.roles.primary.settings.automatedRetentionCompliant, false);
-  assert.deepEqual([...unknownUnit.roles.ledger.codes], []);
+  assert.deepEqual(Object.keys(unknownUnit.roles), ["primary"]);
 
   const stale = assessBackupRuns(input({ primary: { backupRuns: [] } }));
   assert.equal(stale.roles.primary.lastSuccessfulAutomatedAgeHours, null);
@@ -870,12 +902,12 @@ test("unit and status details of the matrix", () => {
   }));
   assertVerdict(elsewhereNoRegion, "ok", []);
 
-  const elsewhere = assessBackupRuns(input({ ledger: { backupRuns: [
-    ...automatedSeries(LEDGER),
-    backupRun(LEDGER, { ageMs: 20 * DAY, extra: { location: "asia" } }),
+  const elsewhere = assessBackupRuns(input({ primary: { backupRuns: [
+    ...automatedSeries(PRIMARY),
+    backupRun(PRIMARY, { ageMs: 20 * DAY, extra: { location: "asia" } }),
   ] } }));
-  assert.equal(elsewhere.roles.ledger.settings.locationCompliant, false);
-  assert.equal(elsewhere.roles.primary.settings.locationCompliant, true);
+  assert.equal(elsewhere.roles.primary.settings.locationCompliant, false);
+  assert.equal(assessBackupRuns(input()).roles.primary.settings.locationCompliant, true);
 });
 
 test("offset timestamps are read as the instant they name", () => {
@@ -900,8 +932,8 @@ test("offset timestamps are read as the instant they name", () => {
 test("unreadable run evidence is reported unavailable, never as zero", () => {
   const unknownField = automatedSeries(PRIMARY).map((run) => ({ ...run, expiryTime: "2027-01-01T00:00:00Z" }));
   const perRun = assessBackupRuns(input({ primary: { backupRuns: unknownField } }));
-  const notArray = assessBackupRuns(input({ ledger: { backupRuns: "nope" } }));
-  for (const [receipt, role] of [[perRun, "primary"], [notArray, "ledger"]]) {
+  const notArray = assessBackupRuns(input({ primary: { backupRuns: "nope" } }));
+  for (const [receipt, role] of [[perRun, "primary"], [notArray, "primary"]]) {
     assertVerdict(receipt, "breach", ["BACKUP_SETTINGS_UNRECOGNIZED"]);
     const assessed = receipt.roles[role];
     assert.equal(assessed.settings.recognized, false, role);
@@ -911,7 +943,7 @@ test("unreadable run evidence is reported unavailable, never as zero", () => {
     assert.equal(assessed.onDemand, null, role);
     assert.deepEqual(verifyBackupHorizonReceipt(JSON.parse(JSON.stringify(receipt))), receipt);
   }
-  assert.equal(perRun.roles.ledger.automatedCount, 30);
+  assert.deepEqual(Object.keys(perRun.roles), ["primary"]);
 
   // Codes proven by the runs that were read still stand beside the unavailable evidence.
   const partial = assessBackupRuns(input({ primary: { backupRuns: [
@@ -1059,7 +1091,9 @@ test("receipt verification is closed and recomputes the digest", () => {
     { ...receipt, digest: "0".repeat(64) },
     redigest({ ...receipt, verdict: "ok" }),
     redigest({ ...receipt, codes: [] }),
-    redigest({ ...receipt, schema: "tibotattle-backup-horizon-audit-v2" }),
+    redigest({ ...receipt, schema: "tibotattle-backup-horizon-audit-v3" }),
+    // The two-role v1 label is retired with the ledger role.
+    redigest({ ...receipt, schema: "tibotattle-backup-horizon-audit-v1" }),
     redigest({ ...receipt, roles: { ...receipt.roles, primary: {
       ...receipt.roles.primary,
       onDemand: [{ ...receipt.roles.primary.onDemand[0], description: "x" }],
@@ -1068,7 +1102,9 @@ test("receipt verification is closed and recomputes the digest", () => {
       ...receipt.roles.primary,
       onDemand: [{ ...receipt.roles.primary.onDemand[0], status: "ok", purpose: null, expiresOn: null }],
     } } }),
-    redigest({ ...receipt, roles: { ...receipt.roles, ledger: { ...receipt.roles.ledger, instance: PRIMARY } } }),
+    // A second role, whatever its name, is outside the closed one-instance shape.
+    redigest({ ...receipt, roles: { ...receipt.roles, ledger: { ...receipt.roles.primary, instance: "synthetic-ledger-a" } } }),
+    redigest({ ...receipt, roles: { ...receipt.roles, secondary: receipt.roles.primary } }),
     // Coverage is fixed: a receipt cannot claim project-wide scope.
     redigest({ ...receipt, coverage: "project-backups" }),
     redigest((({ coverage: _dropped, ...rest }) => rest)(receipt)),
@@ -1083,9 +1119,9 @@ test("receipt verification is closed and recomputes the digest", () => {
     }),
     redigest({ ...receipt, roles: { ...receipt.roles, primary: { ...receipt.roles.primary, onDemand: [] } } }),
     // Unavailable run evidence is all-null, unrecognized and never stale.
-    redigest({ ...receipt, roles: { ...receipt.roles, ledger: { ...receipt.roles.ledger, onDemand: null } } }),
-    redigest({ ...receipt, roles: { ...receipt.roles, ledger: {
-      ...receipt.roles.ledger,
+    redigest({ ...receipt, roles: { ...receipt.roles, primary: { ...receipt.roles.primary, onDemand: null } } }),
+    redigest({ ...receipt, roles: { ...receipt.roles, primary: {
+      ...receipt.roles.primary,
       onDemand: [],
       automatedCount: null,
     } } }),
@@ -1095,20 +1131,20 @@ test("receipt verification is closed and recomputes the digest", () => {
       (error) => error.code === "BACKUP_HORIZON_RECEIPT_INVALID");
   }
 
-  const unavailable = JSON.parse(JSON.stringify(assessBackupRuns(input({ ledger: { backupRuns: "nope" } }))));
+  const unavailable = JSON.parse(JSON.stringify(assessBackupRuns(input({ primary: { backupRuns: "nope" } }))));
   assert.equal(verifyBackupHorizonReceipt(structuredClone(unavailable)).digest, unavailable.digest);
   for (const value of [
-    redigest({ ...unavailable, roles: { ...unavailable.roles, ledger: {
-      ...unavailable.roles.ledger, automatedCount: 0,
+    redigest({ ...unavailable, roles: { ...unavailable.roles, primary: {
+      ...unavailable.roles.primary, automatedCount: 0,
     } } }),
-    redigest({ ...unavailable, roles: { ...unavailable.roles, ledger: {
-      ...unavailable.roles.ledger, settings: { ...unavailable.roles.ledger.settings, recognized: true },
+    redigest({ ...unavailable, roles: { ...unavailable.roles, primary: {
+      ...unavailable.roles.primary, settings: { ...unavailable.roles.primary.settings, recognized: true },
     } } }),
     redigest({
       ...unavailable,
       codes: ["AUTOMATED_BACKUP_STALE", "BACKUP_SETTINGS_UNRECOGNIZED"],
-      roles: { ...unavailable.roles, ledger: {
-        ...unavailable.roles.ledger, codes: ["AUTOMATED_BACKUP_STALE", "BACKUP_SETTINGS_UNRECOGNIZED"],
+      roles: { ...unavailable.roles, primary: {
+        ...unavailable.roles.primary, codes: ["AUTOMATED_BACKUP_STALE", "BACKUP_SETTINGS_UNRECOGNIZED"],
       } },
     }),
   ]) {
@@ -1145,10 +1181,12 @@ test("caller mistakes throw instead of producing a receipt", () => {
     { ...input(), nowMs: -1 },
     { ...input(), project: "Bad Project" },
     { ...input(), region: "us" },
-    { ...input(), instances: input().instances.slice(0, 1) },
+    { ...input(), instances: [] },
+    { ...input(), instances: "primary" },
     { ...input(), instances: [input().instances[0], input().instances[0]] },
-    { ...input(), instances: [input().instances[0], { ...input().instances[1], instance: PRIMARY }] },
-    { ...input(), instances: [input().instances[0], { ...input().instances[1], instance: "p:r:ledger" }] },
+    { ...input(), instances: [{ ...input().instances[0], instance: "p:r:primary" }] },
+    { ...input(), instances: [{ ...input().instances[0], role: "ledger" }] },
+    { ...input(), instances: [{ ...input().instances[0], role: "secondary" }] },
   ]) {
     assert.throws(() => assessBackupRuns(bad), (error) => error.code === "BACKUP_HORIZON_INPUT_INVALID");
   }
@@ -1176,7 +1214,6 @@ test("the desired configuration renders the approved flags and reads back clean"
   });
   assertVerdict(assessBackupRuns(input({
     primary: { settings: readback(PRIMARY) },
-    ledger: { settings: readback(LEDGER) },
   })), "ok", []);
   for (const bad of [{ region: "us", backupStartTime: "07:00" }, { region: REGION, backupStartTime: "7:00" }, {}]) {
     assert.throws(() => desiredBackupConfiguration(bad),
