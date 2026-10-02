@@ -146,7 +146,7 @@ test("date range and absent public breakdowns fail honestly without affecting ag
 
 test("public view controls and method caveats are translated in every shipped language", () => {
   for (const locale of ["en-US", "zh-Hans", "es"]) {
-    for (const suffix of ["viewLabel", "viewAggregate", "viewPlans", "viewModels", "smallSampleDisclosure", "breakdownsUnavailable", "modelsAccumulating", "noModelEstimate", "planMethod", "modelMethod", "planChartLabel", "modelChartLabel", "planChartDescription", "modelChartDescription", "cardsCaption", "legendFocus"]) {
+    for (const suffix of ["viewLabel", "viewAggregate", "viewPlans", "viewModels", "smallSampleDisclosure", "breakdownsUnavailable", "modelsAccumulating", "noModelEstimate", "planMethod", "modelMethod", "planChartLabel", "modelChartLabel", "planChartDescription", "modelChartDescription", "cardsCaption", "legendFocus", "unrecognizedModels"]) {
       const key = `community.allowance.${suffix}`;
       const value = translate(key, {}, locale);
       assert.notEqual(value, key);
@@ -226,9 +226,13 @@ test("optional public breakdown rejects private extras and invalid evidence with
     value => { value.days[0].byPlanType.pro.identity = "PRIVATE_CANARY"; },
     value => { value.days[0].byPlanType.pro.band80Usd.raw = "PRIVATE_CANARY"; },
     value => { value.days[0].byPlanType.team = value.days[0].byPlanType.pro; },
-    value => { value.days[0].models = [["private-model-canary", 1234, 1]]; },
-    value => { value.days[0].models = [["gpt-5.3-codex-spark", 1234, 1]]; },
+    // An UNKNOWN model id no longer invalidates the block: that tuple is
+    // dropped and counted instead (community-model-tolerance.test.mjs).
     value => { value.days[0].models = [["gpt-6-astra", 1234, 1, "PRIVATE_CANARY"]]; },
+    value => { value.days[0].models = [[null, 1234, 1]]; },
+    value => { value.days[0].models = [["gpt-6-astra", 1234, 1], "private-model-canary"]; },
+    value => { value.days[0].models = [["private-model-canary", "1234", 1]]; },
+    value => { value.days[0].models = [["private-model-canary", 1234, 0]]; },
     value => { value.days[0].models = [["gpt-6-astra", 1234, 1], ["gpt-6-astra", 1234, 1]]; },
     value => { value.days[0].models = [["gpt-6-astra", 1234, 0]]; },
     value => { value.days[0].models = [["gpt-6-astra", "1234", 1]]; },
