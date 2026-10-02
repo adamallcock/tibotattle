@@ -17,8 +17,9 @@ The commits are:
   C-CI), with no conflicts, so that the OPS-2 render of the refresh job can
   be pinned to this job's contract;
 - `979775e3`: the review fixes (see "Review findings" below);
-- the commit after it, which carries this revision of the receipt and a
-  figure correction in a refresh-spec comment (no assertion changed).
+- `da80c544` and the commit after it, which carry this revision of the
+  receipt and a figure correction in a refresh-spec comment (no assertion
+  changed).
 
 It records **local, synthetic** evidence only: one macOS arm64 workstation
 shared with other agents, and the local PostgreSQL 17 fan-out cluster
@@ -338,7 +339,7 @@ Local, on `979775e3` unless stated. PostgreSQL 17 fan-out cluster, port
 | `npm run gcp:ops:infra:check` (manifest, operations, bucket birth, gcp-infra) | 195/195 (the manifest check holds the render pin) |
 | `gcp-fastpath-test-deploy`, `gcp-production-rollout` and both parity-compare checks | 59/59 |
 | `npm run gcp:fastpath:scripts-check` (no PostgreSQL environment) | rc 0, 65 pass, 3 skipped |
-| `npm run check` in `cloud-run` (Node 26.2.0, socket) | rc 0; 353 tests: 352 pass, 1 skipped (the opt-in A2 real-PostgreSQL case); all build entries, image build-context check included. Under Node 22.16.0 the check stops at a step that imports TypeScript source, as on the base |
+| `npm run check` in `cloud-run` (Node 26.2.0, socket) | rc 0; 353 tests: 352 pass, 1 skipped (the opt-in A2 real-PostgreSQL case); all build entries, image build-context check included. Under Node 22.16.0 the check stops at `synthetic-v12-smoke.check.mjs`, whose entry imports `../src/constants.ts`; neither file changed since `afd865a0` |
 | Q-1 and dense rehearsals | see Parity |
 | Root `npm run architecture:check` | passed (928 production files, 3,977 imports, 0 debt edges) |
 | Root `npm run test:preflight` | rc 0, 20/20 |
