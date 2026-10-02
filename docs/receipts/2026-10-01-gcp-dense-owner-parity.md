@@ -358,7 +358,9 @@ suite, and anything on GCP or Cloudflare.
    It pages every v1.2 occurrence through its own PostgreSQL reader and took
    3,007 s here (3,379 s in the dense oracle's attempt). It runs in the GCP
    seed and the cutover import, so the real corpus needs the same treatment
-   before the seal.
+   before the seal. (Addressed later, on 2026-10-02, on
+   `claude/gcp-fp-v12-reader`: see the
+   [v1.2 reader batch-cost receipt](./2026-10-02-gcp-v12-reader-batch-cost.md).)
 3. **Legacy expansion unmeasured at volume.** The v1/v1.1 expansion joins
    through indexes that also do not lead with `occurrence_id`.
 4. **A refresh that loses the advisory lock reports success.** A first local
