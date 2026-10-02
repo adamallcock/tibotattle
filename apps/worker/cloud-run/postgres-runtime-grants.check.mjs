@@ -166,10 +166,15 @@ test("grant-and-verify resets, then grants exactly the policy to the given runti
   assert.equal(sql.at(-1), "COMMIT");
   assert.deepEqual(releases, [false]);
 
+  // The retired ledger role is refused before any connection (LEAD-SIMP).
   const ledger = fakePool({ role: "ledger" });
-  await grantAndVerifyRuntimePrivileges(ledger.pool, options({ role: "ledger" }));
-  assert.equal(ledger.statements.some(({ sql: text }) => text.startsWith("GRANT EXECUTE")), false,
-    "a ledger schema grants no function");
+  await rejectsCode(grantAndVerifyRuntimePrivileges(ledger.pool, options({ role: "ledger" })),
+    `${PREFIX}ROLE_INVALID`);
+  assert.deepEqual(ledger.statements, [], "a ledger role opens no connection");
+  await rejectsCode(ensureSchema(ledger.pool, { role: "ledger", schema: SCHEMA, ownerRole: "w2_opsdb_owner",
+    codePrefix: PREFIX }), `${PREFIX}ROLE_INVALID`);
+  assert.deepEqual(ledger.statements, []);
+  assert.deepEqual(RUNTIME_GRANT_ROLES, ["primary"]);
 });
 
 test("the read-back refuses every posture the policy does not allow, and rolls back", async () => {
@@ -190,9 +195,6 @@ test("the read-back refuses every posture the policy does not allow, and rolls b
     const { pool } = fakePool({ extra });
     await rejectsCode(grantAndVerifyRuntimePrivileges(pool, options()), `${PREFIX}PRIMARY_RUNTIME_PRIVILEGES_INVALID`, label);
   }
-  const ledger = fakePool({ role: "ledger", extra: [{ signature: RUNTIME_SIGNATURES[0], runtime_execute: true }] });
-  await rejectsCode(grantAndVerifyRuntimePrivileges(ledger.pool, options({ role: "ledger" })),
-    `${PREFIX}LEDGER_RUNTIME_PRIVILEGES_INVALID`);
 });
 
 test("restrictedFunctionsMatchPolicy accepts exactly the policy and refuses every deviation", () => {
@@ -201,7 +203,6 @@ test("restrictedFunctionsMatchPolicy accepts exactly the policy and refuses ever
     ...OPERATOR_SIGNATURES.map((signature) => row(signature, false))];
   assert.equal(restrictedFunctionsMatchPolicy("primary", exact), true);
   assert.equal(restrictedFunctionsMatchPolicy("primary", [...exact].reverse()), true);
-  assert.equal(restrictedFunctionsMatchPolicy("ledger", []), true);
   for (const rows of [
     exact.filter(({ signature }) => signature !== RUNTIME_SIGNATURES[1]),
     exact.filter(({ signature }) => signature !== OPERATOR_SIGNATURES[2]),
@@ -210,7 +211,11 @@ test("restrictedFunctionsMatchPolicy accepts exactly the policy and refuses ever
     [...exact, row("w2_opsdb_extra()", true)],
     null,
   ]) assert.equal(restrictedFunctionsMatchPolicy("primary", rows), false);
-  assert.equal(restrictedFunctionsMatchPolicy("ledger", [row(RUNTIME_SIGNATURES[0], true)]), false);
+  // Any other role, the retired ledger included, never matches.
+  for (const role of ["ledger", "admin", undefined]) {
+    assert.equal(restrictedFunctionsMatchPolicy(role, []), false);
+    assert.equal(restrictedFunctionsMatchPolicy(role, exact), false);
+  }
 });
 
 test("arguments are closed: role, schema, runtime role and code prefix", async () => {

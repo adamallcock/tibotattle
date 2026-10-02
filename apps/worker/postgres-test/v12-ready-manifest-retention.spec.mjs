@@ -245,7 +245,7 @@ async function admitOneQuotaChunk(pool, schema, identity, modules) {
   manifest.manifestDigest = await modules.sha256Hex(telemetryV12DayManifestDigestInput(manifest));
   chunk.manifestDigest = manifest.manifestDigest;
   const principal = { participantId: identity.participantId, deviceId: identity.deviceId };
-  const options = { schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` } };
+  const options = { schema: { primarySchema: schema } };
   const candidate = await modules.registerPostgresTypedV12DayManifest(
     pool, principal, manifest, nowEpoch, options,
   );
@@ -309,7 +309,7 @@ test("0035 audits existing ready data, preserves exact admission replay, and all
 
     const migrations = await readPostgresMigrations({ role: "primary" });
     const result = await applyPostgresMigrations({ role: "primary", schema, pool });
-    assert.equal(result.applied, 63);
+    assert.equal(result.applied, 64);
     assert.equal(migrations[BASELINE_VERSION]?.name, RETENTION_MIGRATION);
     assert.equal(migrations[BASELINE_VERSION + 1]?.name, "0036_streamed_publication_proofs.sql");
     assert.equal(migrations[BASELINE_VERSION + 2]?.name, "0037_community_daily_publications.sql");

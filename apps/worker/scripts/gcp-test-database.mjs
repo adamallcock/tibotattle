@@ -15,6 +15,10 @@
  * back in one transaction; this job adds no grant of its own. The job runs
  * only when this file is the entry point, so its functions can be imported
  * (gcp-test-database.check.mjs); the Cloud SQL connector is loaded only then.
+ *
+ * Primary only: the deletion ledger is retired (decisions D2, D4 and D6 of
+ * 2026-09-26), so the job migrates and checks one schema and refuses any
+ * LEDGER_ setting with LEDGER_CONFIGURATION_RETIRED.
  */
 
 import { readFile } from "node:fs/promises";
@@ -45,7 +49,6 @@ const HISTORY_TABLE = "_tibotattle_migration_history";
 const DDL_PROBE_TABLE = "_tibotattle_runtime_ddl_probe";
 const DEFAULT_SCHEMA = Object.freeze({
   primary: "tibotattle",
-  ledger: "tibotattle_ledger",
 });
 
 export class JobError extends Error {
@@ -68,8 +71,9 @@ function envValue(name, { required = true, fallback } = {}) {
 }
 
 function envAny(names, options = {}) {
+  const env = options.env ?? process.env;
   for (const name of names) {
-    const value = process.env[name];
+    const value = env[name];
     if (typeof value === "string" && value.length > 0) return value;
   }
   if (options.required === false) return options.fallback;
@@ -128,42 +132,25 @@ function parseCommand() {
   return command;
 }
 
-function databaseConfig() {
+export function databaseConfig(env = process.env) {
+  if (Object.keys(env).some((name) => name.startsWith("LEDGER_"))) fail("LEDGER_CONFIGURATION_RETIRED");
   const primarySchema = validateSchema(
-    process.env.PRIMARY_SCHEMA ?? DEFAULT_SCHEMA.primary,
+    env.PRIMARY_SCHEMA ?? DEFAULT_SCHEMA.primary,
     "PRIMARY_SCHEMA",
   );
-  const ledgerSchema = validateSchema(
-    process.env.LEDGER_SCHEMA ?? DEFAULT_SCHEMA.ledger,
-    "LEDGER_SCHEMA",
-  );
-  if (primarySchema === ledgerSchema) fail("PRIMARY_LEDGER_SCHEMA_COLLISION");
   return Object.freeze({
     primary: Object.freeze({
       role: "primary",
       schema: primarySchema,
       database: validateDatabase(
-        process.env.PRIMARY_DATABASE ?? "tibotattle",
+        env.PRIMARY_DATABASE ?? "tibotattle",
         "PRIMARY_DATABASE",
       ),
       instanceConnectionName: validateInstance(
-        envAny(["PRIMARY_INSTANCE_CONNECTION_NAME", "PRIMARY_INSTANCE"]),
+        envAny(["PRIMARY_INSTANCE_CONNECTION_NAME", "PRIMARY_INSTANCE"], { env }),
         "PRIMARY_INSTANCE_CONNECTION_NAME",
       ),
       max: 3,
-    }),
-    ledger: Object.freeze({
-      role: "ledger",
-      schema: ledgerSchema,
-      database: validateDatabase(
-        process.env.LEDGER_DATABASE ?? "tibotattle_ledger",
-        "LEDGER_DATABASE",
-      ),
-      instanceConnectionName: validateInstance(
-        envAny(["LEDGER_INSTANCE_CONNECTION_NAME", "LEDGER_INSTANCE"]),
-        "LEDGER_INSTANCE_CONNECTION_NAME",
-      ),
-      max: 2,
     }),
   });
 }
@@ -275,9 +262,7 @@ async function readMigrationMetadata(pool, database, manifest) {
 async function readPrivilegeMetadata(pool, database, runtimeRole) {
   const schema = database.schema;
   const historyRelation = `${schema}.${HISTORY_TABLE}`;
-  const dataTable = database.role === "primary"
-    ? "telemetry_v1_chunks"
-    : "storage_erasure_jobs";
+  const dataTable = "telemetry_v1_chunks";
   const dataRelation = `${schema}.${dataTable}`;
   let result;
   try {
@@ -365,12 +350,8 @@ async function proveRuntimeCannotCreateTables(pool, database) {
 
 async function probeRuntimeDml(pool, database) {
   const schema = quoteIdentifier(database.schema);
-  const dataTable = database.role === "primary"
-    ? "telemetry_v1_chunks"
-    : "storage_erasure_jobs";
-  const updateColumn = database.role === "primary"
-    ? "id"
-    : "participant_digest";
+  const dataTable = "telemetry_v1_chunks";
+  const updateColumn = "id";
   const table = `${schema}.${quoteIdentifier(dataTable)}`;
   let client;
   let transactionStarted = false;
@@ -544,30 +525,19 @@ async function run(command) {
       );
       const primaryPool = await createIamPool(connector, databases.primary, runtimeRole, { max: 3 });
       pools.push(primaryPool);
-      const ledgerPool = await createIamPool(connector, databases.ledger, runtimeRole, { max: 2 });
-      pools.push(ledgerPool);
-      const [primary, ledger] = await Promise.all([
-        checkRuntimePool(primaryPool, databases.primary, runtimeRole, manifest),
-        checkRuntimePool(ledgerPool, databases.ledger, runtimeRole, manifest),
-      ]);
+      const primary = await checkRuntimePool(primaryPool, databases.primary, runtimeRole, manifest);
       return Object.freeze({
         status: "ok",
         mode: command,
         sourceContentDigest: digest,
         migrations: Object.freeze({
           primary: primary.migrations,
-          ledger: ledger.migrations,
         }),
         databases: Object.freeze({
           primary: Object.freeze({
             schema: primary.schema,
             database: primary.database,
             privileges: primary.privileges,
-          }),
-          ledger: Object.freeze({
-            schema: ledger.schema,
-            database: ledger.database,
-            privileges: ledger.privileges,
           }),
         }),
       });
@@ -588,45 +558,25 @@ async function run(command) {
       { max: 1 },
     );
     pools.push(primaryMigratorPool);
-    const ledgerMigratorPool = await createIamPool(
-      connector,
-      databases.ledger,
-      migratorRole,
-      { max: 1 },
-    );
-    pools.push(ledgerMigratorPool);
     await ensureSchema(primaryMigratorPool, databases.primary, migratorRole);
-    await ensureSchema(ledgerMigratorPool, databases.ledger, migratorRole);
     const primaryResult = await applyPostgresMigrations({
       role: "primary",
       schema: databases.primary.schema,
       pool: primaryMigratorPool,
       rootDirectory: MIGRATION_ROOT,
     });
-    const ledgerResult = await applyPostgresMigrations({
-      role: "ledger",
-      schema: databases.ledger.schema,
-      pool: ledgerMigratorPool,
-      rootDirectory: MIGRATION_ROOT,
-    });
     await grantRuntimePrivileges(primaryMigratorPool, databases.primary, runtimeRole);
-    await grantRuntimePrivileges(ledgerMigratorPool, databases.ledger, runtimeRole);
 
-    const [primary, ledger] = await Promise.all([
-      inspectRuntimePrivileges(primaryMigratorPool, databases.primary, runtimeRole, manifest),
-      inspectRuntimePrivileges(ledgerMigratorPool, databases.ledger, runtimeRole, manifest),
-    ]);
+    const primary = await inspectRuntimePrivileges(primaryMigratorPool, databases.primary, runtimeRole, manifest);
     return Object.freeze({
       status: "ok",
       mode: command,
       sourceContentDigest: digest,
       migrations: Object.freeze({
         primary: migrationSummary(primaryResult, manifest),
-        ledger: migrationSummary(ledgerResult, manifest),
       }),
       databases: Object.freeze({
         primary: Object.freeze({ schema: primary.schema, database: primary.database, privileges: primary.privileges }),
-        ledger: Object.freeze({ schema: ledger.schema, database: ledger.database, privileges: ledger.privileges }),
       }),
     });
   } finally {

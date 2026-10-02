@@ -528,7 +528,7 @@ test("PG17: 0059 applies within the primary migration chain and creates exactly 
     const stock = await readPostgresMigrations({ role: "primary" });
     const { schema, applied } = await createSchema();
     const stagedCount = applied.staged.length;
-    assert.equal(stock.length + stagedCount, 63, "the 63-migration primary chain, 0059 staged or promoted");
+    assert.equal(stock.length + stagedCount, 64, "the 64-migration primary chain, 0059 staged or promoted");
     const history = await pool.query(`SELECT count(*)::integer AS n FROM ${quoted(schema, "_tibotattle_migration_history")}`);
     assert.equal(history.rows[0].n, stock.length, "staged SQL is not recorded as a migration receipt");
 
@@ -1126,11 +1126,13 @@ test("(f) --now is refused without the test-clock flag, before any database work
   }), { code: "ANALYTICS_V2_TEST_CLOCK_FORBIDDEN", usage: true });
   assert.equal(poolCreated, false);
   for (const refused of [{ ANALYTICS_V2_TEST_CLOCK: "true" }, { ANALYTICS_V2_TEST_CLOCK: "0" },
-    { POSTGRES_TEST_HTTP_MODE: "production" }, { POSTGRES_TEST_HTTP_MODE: "" }]) {
+    { POSTGRES_TEST_HTTP_MODE: "production" }, { POSTGRES_TEST_HTTP_MODE: "" },
+    // The retired cloud-run-iam host mode (OD-6) no longer allows a test clock.
+    { POSTGRES_TEST_HTTP_MODE: "cloud-run-iam" }]) {
     assert.throws(() => job.parseAnalyticsRefreshArguments(["--mode=full", "--schema=s", `--now=${NOW_1}`], refused),
       { code: "ANALYTICS_V2_TEST_CLOCK_FORBIDDEN" });
   }
-  for (const allowed of [{ ANALYTICS_V2_TEST_CLOCK: "1" }, { POSTGRES_TEST_HTTP_MODE: "cloud-run-iam" },
+  for (const allowed of [{ ANALYTICS_V2_TEST_CLOCK: "1" }, { POSTGRES_TEST_HTTP_MODE: "fastpath-test" },
     { POSTGRES_TEST_HTTP_MODE: "health-only" }]) {
     assert.equal(job.parseAnalyticsRefreshArguments(["--mode=full", "--schema=s", `--now=${NOW_1}`], allowed).nowMs,
       Date.parse(NOW_1));

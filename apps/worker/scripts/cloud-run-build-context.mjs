@@ -8,8 +8,9 @@
  * migration runner, the shared runtime-grant policy and the production
  * migration Job, the private daily publication Job and verifier, their
  * shared receipt contract, test-only activation and independent restore
- * commands, the read-only ledger diagnostic, the guarded test-only ledger
- * reconciler, and the reviewed workspace packages enter this context.
+ * commands, and the reviewed workspace packages enter this context. The
+ * migrations are the primary role only: the frozen ledger fragments stay in
+ * the repository (owner action OA-4) and never enter an image.
  */
 
 import { createHash } from "node:crypto";
@@ -37,15 +38,8 @@ const SECRET_PATH_PARTS = new Set([
   "credentials.json",
   "service-account.json",
 ]);
-const EXPECTED_PRIMARY_MIGRATION_COUNT = 63;
-const EXPECTED_LEDGER_MIGRATION_COUNT = 7;
-const EXPECTED_PRIMARY_MIGRATION_TAIL = "0063_enrollment_grants_erased_redeemer.sql";
-const REQUIRED_LEDGER_DIAGNOSTIC_PATHS = new Set([
-  "apps/worker/cloud-run/ledger-reconciliation-diagnostic.mjs",
-  "apps/worker/cloud-run/ledger-reconciliation-diagnostic.check.mjs",
-  "apps/worker/cloud-run/ledger-preflight-reconcile.mjs",
-  "apps/worker/cloud-run/ledger-preflight-reconcile.check.mjs",
-]);
+const EXPECTED_PRIMARY_MIGRATION_COUNT = 64;
+const EXPECTED_PRIMARY_MIGRATION_TAIL = "0064_append_only_residue.sql";
 const REQUIRED_DAILY_ACTIVATION_PATHS = new Set([
   "apps/worker/cloud-run/postgres-community-daily-activation.mjs",
   "apps/worker/cloud-run/postgres-community-daily-activation.check.mjs",
@@ -97,8 +91,6 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/assets.mjs", destination: "apps/worker/cloud-run/assets.mjs" }),
   Object.freeze({ source: "cloud-run/build.mjs", destination: "apps/worker/cloud-run/build.mjs" }),
   Object.freeze({ source: "cloud-run/host.check.mjs", destination: "apps/worker/cloud-run/host.check.mjs" }),
-  Object.freeze({ source: "cloud-run/synthetic-v12-smoke.mjs", destination: "apps/worker/cloud-run/synthetic-v12-smoke.mjs" }),
-  Object.freeze({ source: "cloud-run/synthetic-v12-smoke.check.mjs", destination: "apps/worker/cloud-run/synthetic-v12-smoke.check.mjs" }),
   Object.freeze({ source: "cloud-run/test-migrations.mjs", destination: "apps/worker/cloud-run/test-migrations.mjs" }),
   Object.freeze({ source: "cloud-run/test-migrations.check.mjs", destination: "apps/worker/cloud-run/test-migrations.check.mjs" }),
   // The one runtime-grant policy the test and production migrators share, and
@@ -109,14 +101,6 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/postgres-production-migrations.check.mjs", destination: "apps/worker/cloud-run/postgres-production-migrations.check.mjs" }),
   Object.freeze({ source: "cloud-run/test-activation.mjs", destination: "apps/worker/cloud-run/test-activation.mjs" }),
   Object.freeze({ source: "cloud-run/test-activation.check.mjs", destination: "apps/worker/cloud-run/test-activation.check.mjs" }),
-  Object.freeze({ source: "cloud-run/synthetic-v12-cleanup.mjs", destination: "apps/worker/cloud-run/synthetic-v12-cleanup.mjs" }),
-  Object.freeze({ source: "cloud-run/synthetic-v12-cleanup.check.mjs", destination: "apps/worker/cloud-run/synthetic-v12-cleanup.check.mjs" }),
-  Object.freeze({ source: "cloud-run/synthetic-v12-discovery.mjs", destination: "apps/worker/cloud-run/synthetic-v12-discovery.mjs" }),
-  Object.freeze({ source: "cloud-run/synthetic-v12-discovery.check.mjs", destination: "apps/worker/cloud-run/synthetic-v12-discovery.check.mjs" }),
-  Object.freeze({ source: "cloud-run/ledger-reconciliation-diagnostic.mjs", destination: "apps/worker/cloud-run/ledger-reconciliation-diagnostic.mjs" }),
-  Object.freeze({ source: "cloud-run/ledger-reconciliation-diagnostic.check.mjs", destination: "apps/worker/cloud-run/ledger-reconciliation-diagnostic.check.mjs" }),
-  Object.freeze({ source: "cloud-run/ledger-preflight-reconcile.mjs", destination: "apps/worker/cloud-run/ledger-preflight-reconcile.mjs" }),
-  Object.freeze({ source: "cloud-run/ledger-preflight-reconcile.check.mjs", destination: "apps/worker/cloud-run/ledger-preflight-reconcile.check.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-community-graph-benchmark.mjs", destination: "apps/worker/cloud-run/postgres-community-graph-benchmark.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-community-graph-benchmark.check.mjs", destination: "apps/worker/cloud-run/postgres-community-graph-benchmark.check.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-community-graph-readback-diagnostic.mjs", destination: "apps/worker/cloud-run/postgres-community-graph-readback-diagnostic.mjs" }),
@@ -138,7 +122,7 @@ const BASE_ALLOWLIST = Object.freeze([
   // The d43c8f92 analytics kernels and their vendored packages; the
   // analytics-refresh entry and the community-daily route bundle them.
   Object.freeze({ source: "vendor", destination: "apps/worker/vendor" }),
-  Object.freeze({ source: "postgres/migrations", destination: "apps/worker/postgres/migrations" }),
+  Object.freeze({ source: "postgres/migrations/primary", destination: "apps/worker/postgres/migrations/primary" }),
   Object.freeze({ source: "scripts/postgres-migrations.mjs", destination: "apps/worker/scripts/postgres-migrations.mjs" }),
   Object.freeze({ source: "scripts/cloud-run-build-context.mjs", destination: "apps/worker/scripts/cloud-run-build-context.mjs" }),
   Object.freeze({ source: "../../packages/accounting", destination: "packages/accounting" }),
@@ -282,9 +266,6 @@ async function validateSource(assets) {
   const files = await sourceFiles(assets);
   const includedPaths = new Set(files.map((file) => file.destination));
   await assertImportClosure(files, includedPaths);
-  if ([...REQUIRED_LEDGER_DIAGNOSTIC_PATHS].some((path) => !includedPaths.has(path))) {
-    fail("CLOUD_RUN_CONTEXT_LEDGER_DIAGNOSTIC_PATH_SET_UNEXPECTED");
-  }
   if ([...REQUIRED_DAILY_ACTIVATION_PATHS].some((path) => !includedPaths.has(path))) {
     fail("CLOUD_RUN_CONTEXT_DAILY_ACTIVATION_PATH_SET_UNEXPECTED");
   }
@@ -295,27 +276,25 @@ async function validateSource(assets) {
     role: "primary",
     rootDirectory: join(WORKER_ROOT, "postgres", "migrations"),
   });
-  const ledger = await readPostgresMigrations({
-    role: "ledger",
-    rootDirectory: join(WORKER_ROOT, "postgres", "migrations"),
-  });
-  if (primary.length === 0 || ledger.length === 0) fail("CLOUD_RUN_CONTEXT_MIGRATIONS_EMPTY");
+  if (primary.length === 0) fail("CLOUD_RUN_CONTEXT_MIGRATIONS_EMPTY");
   if (primary.length !== EXPECTED_PRIMARY_MIGRATION_COUNT
-      || ledger.length !== EXPECTED_LEDGER_MIGRATION_COUNT
       || primary.at(-1)?.name !== EXPECTED_PRIMARY_MIGRATION_TAIL) {
     fail("CLOUD_RUN_CONTEXT_MIGRATION_SET_UNEXPECTED");
   }
   const primaryPaths = files.filter((file) =>
     file.destination.startsWith("apps/worker/postgres/migrations/primary/"),
   );
-  const ledgerPaths = files.filter((file) =>
-    file.destination.startsWith("apps/worker/postgres/migrations/ledger/"),
+  // Nothing else under postgres/ (the frozen ledger fragments included)
+  // may enter the image.
+  const otherPostgresPaths = files.filter((file) =>
+    file.destination.startsWith("apps/worker/postgres/")
+      && !file.destination.startsWith("apps/worker/postgres/migrations/primary/"),
   );
-  if (primaryPaths.length !== primary.length || ledgerPaths.length !== ledger.length) {
+  if (primaryPaths.length !== primary.length || otherPostgresPaths.length !== 0) {
     fail("CLOUD_RUN_CONTEXT_MIGRATION_PATH_SET_UNEXPECTED");
   }
   const digest = await digestFiles(files);
-  return Object.freeze({ files, digest, primary, ledger });
+  return Object.freeze({ files, digest, primary });
 }
 
 async function digestCopiedFiles(target, files) {
@@ -386,7 +365,6 @@ try {
       mode: "check",
       fileCount: source.files.length,
       primaryMigrations: source.primary.length,
-      ledgerMigrations: source.ledger.length,
       sourceContentDigest: source.digest,
     }, null, 2));
   } else {
@@ -397,7 +375,6 @@ try {
       output: target,
       fileCount: source.files.length,
       primaryMigrations: source.primary.length,
-      ledgerMigrations: source.ledger.length,
       sourceContentDigest: source.digest,
     }, null, 2));
   }

@@ -15,7 +15,7 @@ export interface PostgresRuntimeMigrationReceipt {
 }
 
 export const POSTGRES_RUNTIME_SCHEMA_VERSION =
-  "tibotattle-postgres-migration-manifest-v1" as const;
+  "tibotattle-postgres-migration-manifest-v2" as const;
 
 type MigrationEntry = readonly [name: string, sha256: string];
 
@@ -29,7 +29,6 @@ function receipt(
 
 export const POSTGRES_RUNTIME_MIGRATIONS: Readonly<{
   readonly primary: readonly PostgresRuntimeMigrationReceipt[];
-  readonly ledger: readonly PostgresRuntimeMigrationReceipt[];
 }> = Object.freeze({
   primary: Object.freeze(([
     ["0001_schema_metadata.sql", "2bcf95c2954d3194696d24574d916391bf09525bf6951d7f6a825f5beb70efb2"],
@@ -95,14 +94,6 @@ export const POSTGRES_RUNTIME_MIGRATIONS: Readonly<{
     ["0061_legacy_contribution_admission.sql", "9a22c0f0fa4b1dc1c0694cb2020b89546ede6c8cc6e949b4cb6e87b42465c5c8"],
     ["0062_telemetry_contribution_trigger_search_path.sql", "b9eaaa7c19948a778c0d3e857b872cea6ce5026ab82566438d7f295b0a2ea876"],
     ["0063_enrollment_grants_erased_redeemer.sql", "0341b5a6b7165b918e7e18c11873243aff4906a81a8376a0ae46ec5f14007ce9"],
-  ] as readonly MigrationEntry[]).map((entry, index) => receipt(entry, index + 1))),
-  ledger: Object.freeze(([
-    ["0001_schema_metadata.sql", "783e0d414ee8c755c8886daa95a1fe998527b44445b08eaa36a595dddabf8f8c"],
-    ["0002_tombstones_cooldowns.sql", "6628c0bcc1f44ee040c137e2e7d0f2163e1dfc147c40a97942ec429c44163d2e"],
-    ["0003_erasure_restore_receipts.sql", "26fe1c48f75816c02415eec5f77fb242894974615f51938d5b75292bb2d71b27"],
-    ["0004_storage_erasure_jobs.sql", "e64d248b31db42dcdcc2aa36e7c623b7f9752143d8108de2d8852702fcbae3d9"],
-    ["0005_readiness_generation.sql", "79b6535a97c8b0ddf39b77e83cbc28842ff864f093ee3c308e52da7e39ec7064"],
-    ["0006_erasure_ledger_transfer_receipts.sql", "1e964efc4a6cdf849e4eb14355956ac3c4e16255d2d3e4ea714a9d098e3f7298"],
-    ["0007_production_transfer_control.sql", "f7784a2b9a8aae3779e67060c2120412b358446322c93a975585e603514bdbbd"],
+    ["0064_append_only_residue.sql", "74fb4aed9c0b1eef7f1433e9e0ea6501bdb8beedffefa17a928ad7774cce37be"],
   ] as readonly MigrationEntry[]).map((entry, index) => receipt(entry, index + 1))),
 });

@@ -128,7 +128,9 @@ test("render makes no call and shows the estate", async () => {
   assert.equal(withImage.jobs["production-migrate"].kind, "Job");
   // Deferred while its entry refuses a production target.
   assert.deepEqual(withImage.jobs["analytics-refresh"], { unavailable: "ANALYTICS_REFRESH_PRODUCTION_TARGET_UNAVAILABLE" });
-  assert.doesNotMatch(JSON.stringify(withImage), /LEDGER|HISTORY_PROOF/u);
+  assert.doesNotMatch(JSON.stringify(withImage), /LEDGER|ERASURE_BUCKET_HISTORY_PROOF/u);
+  // OD-2: the service carries the quarantine bucket's pinned birth proof.
+  assert.match(JSON.stringify(withImage), /GCS_QUARANTINE_BUCKET_HISTORY_PROOF/u);
 });
 
 test("readback and plan issue read shapes only and the plan is a dry run", async () => {

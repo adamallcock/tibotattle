@@ -3,8 +3,8 @@
  * (GCP fast path, IN-3). A registry entry, not a route: the composition root
  * passes the returned registration to createContributionEnvelopeRegistry()
  * next to v1.2, and POST /api/v1/contributions dispatches to it only after
- * the shared preamble (bearer auth, upload-authorization claim, tombstone,
- * transport floor). The work is the d43c8f92 handleTelemetryV1Contribution
+ * the shared preamble (bearer auth, upload-authorization claim, transport
+ * floor). The work is the d43c8f92 handleTelemetryV1Contribution
  * port in src/postgres-legacy-contribution-admission.ts, injected here so
  * this file stays plain JavaScript that node:test can load.
  *
@@ -17,7 +17,7 @@
  *   sourceDeviceId issued_by_device_id of the claimed upload authorization.
  *   claimed        { authorizationId, participantId, authorizationKind }.
  *   context        the preamble context; this handler reads primaryPool,
- *                  schema ({ primarySchema, ledgerSchema }), objectStore,
+ *                  schema ({ primarySchema }), objectStore,
  *                  envelopePublicJwk, envelopePrivateJwk and sourceNamespace,
  *                  plus an optional test clock nowEpoch.
  *

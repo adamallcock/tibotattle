@@ -151,7 +151,10 @@ test("the canonical staged root is apps/worker/postgres/staged-migrations and ab
   assert.equal(STAGED_MIGRATIONS_ROOT, join(WORKER_ROOT, "postgres", "staged-migrations"));
   const root = await temporaryRoot("absent");
   assert.deepEqual(await listStagedMigrations("primary", { rootDirectory: root }), []);
-  assert.deepEqual(await listStagedMigrations("ledger", { rootDirectory: join(root, "missing") }), []);
+  assert.deepEqual(await listStagedMigrations("primary", { rootDirectory: join(root, "missing") }), []);
+  // The deletion-ledger role is retired (D4): it has no staged directory.
+  await assert.rejects(listStagedMigrations("ledger", { rootDirectory: root }),
+    { code: "STAGED_MIGRATION_ROLE_INVALID" });
   await assert.rejects(listStagedMigrations("analytics", { rootDirectory: root }),
     { code: "STAGED_MIGRATION_ROLE_INVALID" });
 });
@@ -542,40 +545,40 @@ test("PG17: staged files apply in version order, fail atomically, and a symlink 
   skip: PG_SKIP,
   timeout: 180_000,
 }, async () => {
-  const stock = await readPostgresMigrations({ role: "ledger" });
+  const stock = await readPostgresMigrations({ role: "primary" });
   const orderedRoot = await temporaryRoot("pg-order");
-  await writeMigration(orderedRoot, "ledger", "0061_staged_first.sql",
+  await writeMigration(orderedRoot, "primary", "0097_staged_first.sql",
     "CREATE TABLE staged_first (id integer PRIMARY KEY);\n");
-  await writeMigration(orderedRoot, "ledger", "0099_staged_second.sql",
+  await writeMigration(orderedRoot, "primary", "0099_staged_second.sql",
     "CREATE TABLE staged_second (id integer REFERENCES staged_first (id));\n"
     + "INSERT INTO staged_second (id) SELECT id FROM staged_first;\n"
-    + "CREATE TABLE staged_tombstone_probe AS SELECT count(*)::integer AS tombstones FROM deletion_tombstones;\n");
+    + "CREATE TABLE staged_participant_probe AS SELECT count(*)::integer AS participants FROM participants;\n");
   const failingRoot = await temporaryRoot("pg-failing");
-  await writeMigration(failingRoot, "ledger", "0099_staged_failing.sql",
+  await writeMigration(failingRoot, "primary", "0099_staged_failing.sql",
     "CREATE TABLE staged_partial (id integer);\nSELECT 1 / 0;\n");
   const outside = await temporaryRoot("pg-outside");
   await writeFile(join(outside, "target.sql"), "CREATE TABLE staged_symlink_target (id integer);\n");
   const symlinkRoot = await temporaryRoot("pg-symlink");
-  await mkdir(join(symlinkRoot, "ledger"));
-  await symlink(join(outside, "target.sql"), join(symlinkRoot, "ledger", "0099_staged_symlink.sql"));
+  await mkdir(join(symlinkRoot, "primary"));
+  await symlink(join(outside, "target.sql"), join(symlinkRoot, "primary", "0099_staged_symlink.sql"));
 
-  await withPostgres("ledger", async ({ pool, createSchema }) => {
+  await withPostgres("order", async ({ pool, createSchema }) => {
     const ordered = await createSchema("staged_order");
     const result = await applyStockAndStagedMigrations({
-      role: "ledger",
+      role: "primary",
       schema: ordered,
       pool,
-      stagedFiles: ["0099_staged_second.sql", "0061_staged_first.sql"],
+      stagedFiles: ["0099_staged_second.sql", "0097_staged_first.sql"],
       stagedRootDirectory: orderedRoot,
     });
     assert.equal(result.stockApplied, stock.length);
-    assert.deepEqual(result.staged.map(({ version }) => version), [61, 99]);
-    const tombstones = await pool.query(`SELECT tombstones FROM "${ordered}".staged_tombstone_probe`);
-    assert.equal(tombstones.rows[0].tombstones, 0);
+    assert.deepEqual(result.staged.map(({ version }) => version), [97, 99]);
+    const participants = await pool.query(`SELECT participants FROM "${ordered}".staged_participant_probe`);
+    assert.equal(participants.rows[0].participants, 0);
 
     const failing = await createSchema("staged_failing");
     await assert.rejects(applyStockAndStagedMigrations({
-      role: "ledger",
+      role: "primary",
       schema: failing,
       pool,
       stagedFiles: ["0099_staged_failing.sql"],
@@ -585,12 +588,12 @@ test("PG17: staged files apply in version order, fail atomically, and a symlink 
       && error.cause?.code === "22012");
     const partial = await pool.query("SELECT to_regclass($1) AS relation", [`"${failing}".staged_partial`]);
     assert.equal(partial.rows[0].relation, null, "the failed staged file left nothing behind");
-    const intact = await applyPostgresMigrations({ role: "ledger", schema: failing, pool });
+    const intact = await applyPostgresMigrations({ role: "primary", schema: failing, pool });
     assert.equal(intact.applied, stock.length);
 
     const refused = await createSchema("staged_symlink");
     await assert.rejects(applyStockAndStagedMigrations({
-      role: "ledger",
+      role: "primary",
       schema: refused,
       pool,
       stagedFiles: ["0099_staged_symlink.sql"],
@@ -609,7 +612,7 @@ test("PG17: the staged phase holds the stock runner's advisory lock and refuses 
   timeout: 180_000,
 }, async () => {
   const stagedRoot = await temporaryRoot("pg-lock");
-  await writeMigration(stagedRoot, "ledger", "0099_staged_lock_probe.sql",
+  await writeMigration(stagedRoot, "primary", "0099_staged_lock_probe.sql",
     "CREATE TABLE staged_lock_probe (id integer);\n");
   await withPostgres("lock", async ({ pool, createSchema }) => {
     const holder = await pool.connect();
@@ -623,9 +626,9 @@ test("PG17: the staged phase holds the stock runner's advisory lock and refuses 
     try {
       // A holder of the runner's key blocks the stock phase first.
       const before = await createSchema("staged_lock_before");
-      await take(`tibotattle:ledger:${before}`);
+      await take(`tibotattle:primary:${before}`);
       await assert.rejects(applyStockAndStagedMigrations({
-        role: "ledger",
+        role: "primary",
         schema: before,
         pool,
         stagedFiles: ["0099_staged_lock_probe.sql"],
@@ -639,12 +642,12 @@ test("PG17: the staged phase holds the stock runner's advisory lock and refuses 
       const contended = {
         async connect() {
           connects += 1;
-          if (connects === 2) await take(`tibotattle:ledger:${between}`);
+          if (connects === 2) await take(`tibotattle:primary:${between}`);
           return pool.connect();
         },
       };
       await assert.rejects(applyStockAndStagedMigrations({
-        role: "ledger",
+        role: "primary",
         schema: between,
         pool: contended,
         stagedFiles: ["0099_staged_lock_probe.sql"],
@@ -653,7 +656,7 @@ test("PG17: the staged phase holds the stock runner's advisory lock and refuses 
       assert.equal(connects, 2, "the stock runner and the staged phase each connected once");
       const probe = await pool.query("SELECT to_regclass($1) AS relation", [`"${between}".staged_lock_probe`]);
       assert.equal(probe.rows[0].relation, null, "no staged DDL ran without the lock");
-      const stock = await readPostgresMigrations({ role: "ledger" });
+      const stock = await readPostgresMigrations({ role: "primary" });
       const receipts = await pool.query(
         `SELECT count(*)::integer AS count FROM "${between}"._tibotattle_migration_history`);
       assert.equal(receipts.rows[0].count, stock.length, "the stock phase completed before the refusal");

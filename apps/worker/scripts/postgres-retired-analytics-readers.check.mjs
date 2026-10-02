@@ -8,14 +8,14 @@ import test from "node:test";
  * The upload-path analytics retirement (ISO-1) stops every PostgreSQL write
  * into the JSON-era queues and caches of primary migration 0010. This check
  * proves no PostgreSQL module reads them either, so no read path can recreate
- * the treadmill. The tables themselves are kept: the erasure fences and
- * cleanup bounds still name them, and the legacy owner-retirement residue
- * sweep still clears two caches. Each remaining mention is listed below with
- * a ceiling. An unlisted mention, a SQL reference where only an inventory
- * entry is allowed, or more mentions than the ceiling fails. The list only
- * shrinks: fewer mentions (a later change retiring the residue sweep or an
- * inventory entry) pass without editing this file and are reported as slack
- * to trim.
+ * the treadmill. The tables themselves are kept: the synthetic discovery's
+ * closed bounds and the transfer inventories still name them. The online
+ * owner erasure and owner-retirement residue sweep that once listed or
+ * cleared them were deleted with online erasure (LEAD-SIMP, decision D2).
+ * Each remaining mention is listed below with a ceiling. An unlisted mention,
+ * a SQL reference where only an inventory entry is allowed, or more mentions
+ * than the ceiling fails. The list only shrinks: fewer mentions pass without
+ * editing this file and are reported as slack to trim.
  */
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -38,26 +38,16 @@ const RETIRED_SEEDED_SINGLETONS = new Set(["current_queue_state", "preparation_c
 
 /**
  * Every remaining mention, with the most allowed. An "inventory" entry names a
- * table in an erasure fence, a cleanup count bound or a transfer emptiness
- * list. The only allowed "reference" is the legacy owner-retirement residue
- * sweep, which deletes and counts the two shared caches; no queue may ever be
- * referenced.
+ * table in a cleanup count bound or a transfer emptiness list. No "reference"
+ * is allowed any more: the owner-retirement residue sweep that deleted and
+ * counted the two shared caches is deleted (LEAD-SIMP), and no queue may ever
+ * be referenced.
  */
 export const ALLOWED_MENTIONS = Object.freeze([
-  ["src/postgres-accountless-owner-erasure.ts", "current_queue", "inventory", 1],
-  ["src/postgres-accountless-owner-erasure.ts", "prepared_source_days", "inventory", 1],
-  ["src/postgres-accountless-owner-erasure.ts", "community_model_history_dependencies", "inventory", 1],
-  ["src/postgres-social-owner-erasure-preflight.ts", "current_queue", "inventory", 1],
-  ["src/postgres-social-owner-erasure-preflight.ts", "prepared_source_days", "inventory", 1],
-  ["src/postgres-social-owner-erasure-preflight.ts", "community_model_history_dependencies", "inventory", 1],
-  ["src/postgres-owner-erasure.ts", "current_queue", "inventory", 1],
-  ["cloud-run/synthetic-v12-discovery.mjs", "current_queue", "inventory", 1],
   ["scripts/postgres-analytics-applied-transfer.mjs", "community_model_history_dependencies", "inventory", 1],
   ["scripts/postgres-analytics-applied-transfer.mjs", "community_model_composition_days", "inventory", 1],
   ["scripts/postgres-analytics-applied-main-transfer.mjs", "community_model_history_dependencies", "inventory", 1],
   ["scripts/postgres-analytics-applied-main-transfer.mjs", "community_model_composition_days", "inventory", 1],
-  ["src/postgres-analytics-owner-retirement.ts", "preview_cache", "reference", 2],
-  ["src/postgres-analytics-owner-retirement.ts", "community_model_composition_days", "reference", 2],
   // PT-1 transfer emptiness list: 0057 keeps these seeded singletons, and a
   // fresh transfer target counts them as empty only through SEEDED_SINGLETONS.
   ["scripts/postgres-transfer-target.mjs", "current_queue_state", "inventory", 1],
@@ -67,8 +57,10 @@ export const ALLOWED_MENTIONS = Object.freeze([
 const IDENTIFIER_LIST_LINE = /^\s*[a-z0-9_]+(?:\s+[a-z0-9_]+)*\s*$/u;
 const COUNT_BOUND_LINE = (table) => new RegExp(`^\\s*${table}:\\s*\\[\\d+,\\s*\\d+\\],?\\s*$`, "u");
 const STRING_ELEMENT_LINE = (table) => new RegExp(`^\\s*["']${table}["'],?\\s*$`, "u");
+// seeded("<table>"[, rows]): primary-only since the deletion ledger was
+// retired (SIMP-4); the former seeded("<role>", "<table>") form is a reference.
 const SEEDED_ENTRY_LINE = (table) =>
-  new RegExp(`^\\s*seeded\\(["'](?:primary|ledger)["'],\\s*["']${table}["'](?:,\\s*\\d+)?\\),?\\s*$`, "u");
+  new RegExp(`^\\s*seeded\\(["']${table}["'](?:,\\s*\\d+)?\\),?\\s*$`, "u");
 const POSTGRES_CONTENT = /\bfrom\s+["']pg["']|\bquotePostgresIdentifier\b|\brenderPostgresSearchPath\b|\bPostgresClient\b/u;
 
 function mentionPattern(table) {
@@ -215,9 +207,9 @@ test("the retired tables are the 0010 tables the retirement migration stops feed
 
 test("the scanner flags doctored sources: a SQL read, an unlisted inventory and a count above its ceiling; shrinkage is only slack", () => {
   const clean = new Map([
-    ["src/postgres-owner-erasure.ts", "const ALLOWED = {\n  current_queue: [0, 1],\n};\n"],
+    ["src/postgres-synthetic-inventory.ts", "const ALLOWED = {\n  current_queue: [0, 1],\n};\n"],
   ]);
-  const allowed = [{ file: "src/postgres-owner-erasure.ts", table: "current_queue", kind: "inventory", max: 1 }];
+  const allowed = [{ file: "src/postgres-synthetic-inventory.ts", table: "current_queue", kind: "inventory", max: 1 }];
   assert.deepEqual(retiredMentionSlack(clean, allowed), []);
   assert.deepEqual(retiredMentionViolations(clean, allowed), []);
 
@@ -230,16 +222,16 @@ test("the scanner flags doctored sources: a SQL read, an unlisted inventory and 
     "await client.query(`UPDATE ${table(schema, \"refresh_lanes\")} SET state='queued'`);\n"]]);
   assert.match(retiredMentionViolations(helper, allowed).join("\n"), /reference of retired refresh_lanes/u);
 
-  const inventoryInSql = new Map([["src/postgres-owner-erasure.ts",
+  const inventoryInSql = new Map([["src/postgres-synthetic-inventory.ts",
     "const ALLOWED = {\n  current_queue: [0, 1],\n};\nconst x = `DELETE FROM current_queue`;\n"]]);
   assert.match(retiredMentionViolations(inventoryInSql, allowed).join("\n"), /reference of retired current_queue/u);
 
-  const extraInventory = new Map([["src/postgres-owner-erasure.ts",
+  const extraInventory = new Map([["src/postgres-synthetic-inventory.ts",
     "const ALLOWED = {\n  current_queue: [0, 1],\n  daily_rebuilds: [0, 1],\n};\n"]]);
   assert.match(retiredMentionViolations(extraInventory, allowed).join("\n"),
     /inventory of retired daily_rebuilds is not allowed/u);
 
-  const doubled = new Map([["src/postgres-owner-erasure.ts",
+  const doubled = new Map([["src/postgres-synthetic-inventory.ts",
     "const A = {\n  current_queue: [0, 1],\n};\nconst B = {\n  current_queue: [0, 1],\n};\n"]]);
   assert.match(retiredMentionViolations(doubled, allowed).join("\n"),
     /has 2 inventory mention\(s\) of current_queue, at most 1 allowed/u);
@@ -247,32 +239,34 @@ test("the scanner flags doctored sources: a SQL read, an unlisted inventory and 
   // A later change that removes the mention (or the whole file) passes and is reported as slack.
   assert.deepEqual(retiredMentionViolations(new Map(), allowed), []);
   assert.deepEqual(retiredMentionSlack(new Map(), allowed),
-    ["src/postgres-owner-erasure.ts now has 0 of 1 allowed inventory mention(s) of current_queue; lower the ceiling"]);
-  const sweep = [{ file: "src/postgres-analytics-owner-retirement.ts", table: "preview_cache", kind: "reference", max: 2 }];
-  const shrunkSweep = new Map([["src/postgres-analytics-owner-retirement.ts",
+    ["src/postgres-synthetic-inventory.ts now has 0 of 1 allowed inventory mention(s) of current_queue; lower the ceiling"]);
+  const sweep = [{ file: "src/postgres-synthetic-sweep.ts", table: "preview_cache", kind: "reference", max: 2 }];
+  const shrunkSweep = new Map([["src/postgres-synthetic-sweep.ts",
     "const residue = await client.query(`SELECT count(*) FROM ${table(schema, \"preview_cache\")}`);\n"]]);
   assert.deepEqual(retiredMentionViolations(shrunkSweep, sweep), []);
   assert.equal(retiredMentionSlack(shrunkSweep, sweep).length, 1);
   // Shrinking one kind never licenses another: a sweep reference is not an inventory entry.
-  assert.match(retiredMentionViolations(new Map([["src/postgres-analytics-owner-retirement.ts",
+  assert.match(retiredMentionViolations(new Map([["src/postgres-synthetic-sweep.ts",
     "const KEEP = new Set([\n  \"preview_cache\",\n]);\n"]]), sweep).join("\n"), /inventory of retired preview_cache is not allowed/u);
 
-  // A lone seeded("<role>", "<table>") transfer emptiness entry is an
-  // inventory; it still needs its own allowlist entry, and any other use of
-  // the seeded helper (or SQL on the same line) stays a reference.
+  // A lone seeded("<table>") transfer emptiness entry is an inventory; it
+  // still needs its own allowlist entry, and any other use of the seeded
+  // helper (or SQL on the same line) stays a reference.
   const seeded = [{ file: "scripts/postgres-transfer-target.mjs", table: "current_queue_state", kind: "inventory", max: 1 }];
-  assert.equal(classifyMention('  seeded("primary", "current_queue_state"),', "current_queue_state"), "inventory");
-  assert.equal(classifyMention('  seeded("ledger", "preparation_counters", 2),', "preparation_counters"), "inventory");
+  assert.equal(classifyMention('  seeded("current_queue_state"),', "current_queue_state"), "inventory");
+  assert.equal(classifyMention('  seeded("preparation_counters", 2),', "preparation_counters"), "inventory");
   assert.deepEqual(retiredMentionViolations(new Map([["scripts/postgres-transfer-target.mjs",
-    'const S = [\n  seeded("primary", "current_queue_state"),\n];\n']]), seeded), []);
+    'const S = [\n  seeded("current_queue_state"),\n];\n']]), seeded), []);
   assert.match(retiredMentionViolations(new Map([["scripts/postgres-transfer-target.mjs",
-    'const S = [\n  seeded("primary", "current_queue_state"),\n  seeded("primary", "refresh_lanes"),\n];\n']]), seeded)
+    'const S = [\n  seeded("current_queue_state"),\n  seeded("refresh_lanes"),\n];\n']]), seeded)
     .join("\n"), /inventory of retired refresh_lanes is not allowed/u);
   for (const line of [
-    '  seeded("primary", "current_queue_state").table + await client.query("SELECT 1"),',
-    '  seeded("public", "current_queue_state"),',
+    '  seeded("current_queue_state").table + await client.query("SELECT 1"),',
+    // The retired dual-role form, with a role first, is no longer an entry.
+    '  seeded("primary", "current_queue_state"),',
+    '  seeded("ledger", "current_queue_state", 2),',
     '  seeded(role, "current_queue_state"),',
-    '  await client.query(`DELETE FROM current_queue_state`); seeded("primary", "current_queue_state"),',
+    '  await client.query(`DELETE FROM current_queue_state`); seeded("current_queue_state"),',
   ]) {
     assert.equal(classifyMention(line, "current_queue_state"), "reference", line);
   }

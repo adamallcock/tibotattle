@@ -7,31 +7,49 @@ import {
   buildPostgresMigrationManifest,
   applyPostgresMigrations,
   migrationHistoryTable,
+  POSTGRES_MIGRATION_ROLES,
   readPostgresMigrations,
   renderPostgresSearchPath,
 } from "./postgres-migrations.mjs";
 
-test("loads contiguous primary and independent ledger migration manifests", async () => {
+test("loads a contiguous primary-only migration manifest", async () => {
   const manifest = await buildPostgresMigrationManifest();
   const expectedPrimary = await readPostgresMigrations({ role: "primary" });
-  const expectedLedger = await readPostgresMigrations({ role: "ledger" });
-  assert.equal(manifest.schemaVersion, "tibotattle-postgres-migration-manifest-v1");
-  assert.deepEqual(Object.keys(manifest.roles).sort(), ["ledger", "primary"]);
+  assert.equal(manifest.schemaVersion, "tibotattle-postgres-migration-manifest-v2");
+  assert.deepEqual(Object.keys(manifest.roles), ["primary"]);
+  assert.deepEqual(POSTGRES_MIGRATION_ROLES, ["primary"]);
   assert.deepEqual(
     manifest.roles.primary.map(({ version, name }) => [version, name]),
     expectedPrimary.map(({ version, name }) => [version, name]),
   );
-  assert.deepEqual(
-    manifest.roles.ledger.map(({ version, name }) => [version, name]),
-    expectedLedger.map(({ version, name }) => [version, name]),
-  );
-  for (const role of ["primary", "ledger"]) {
-    for (const migration of manifest.roles[role]) {
-      assert.match(migration.sha256, /^[0-9a-f]{64}$/u);
-    }
+  assert.equal(manifest.roles.primary.at(-1).name, "0064_append_only_residue.sql");
+  for (const migration of manifest.roles.primary) {
+    assert.match(migration.sha256, /^[0-9a-f]{64}$/u);
   }
   assert.match(manifest.sha256, /^[0-9a-f]{64}$/u);
   assert.equal(migrationHistoryTable(), '"_tibotattle_migration_history"');
+});
+
+test("the retired ledger role is refused before any file or database read", async () => {
+  await assert.rejects(
+    readPostgresMigrations({ role: "ledger" }),
+    error => error.code === "POSTGRES_MIGRATION_ROLE_INVALID",
+  );
+  let connected = false;
+  const pool = { async connect() { connected = true; throw new Error("must not connect"); } };
+  await assert.rejects(
+    applyPostgresMigrations({ role: "ledger", schema: "tibotattle_ledger", pool }),
+    error => error.code === "POSTGRES_MIGRATION_ROLE_INVALID",
+  );
+  assert.equal(connected, false);
+  // A root that still carries a ledger directory builds a primary-only manifest.
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-postgres-migrations-ledger-"));
+  await mkdir(join(root, "primary"));
+  await mkdir(join(root, "ledger"));
+  await writeFile(join(root, "primary", "0001_ok.sql"), "SELECT 1;\n");
+  await writeFile(join(root, "ledger", "0001_ok.sql"), "SELECT 1;\n");
+  const manifest = await buildPostgresMigrationManifest({ rootDirectory: root });
+  assert.deepEqual(Object.keys(manifest.roles), ["primary"]);
 });
 
 test("renders only validated schema identifiers", () => {

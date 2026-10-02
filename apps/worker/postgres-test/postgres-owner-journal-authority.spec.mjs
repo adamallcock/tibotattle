@@ -1336,14 +1336,12 @@ test("PG17 storage_journal_transfer_session() admits only a deliberate member th
 
 // ---------------------------------------------------------------------------
 
-// Analytics retirement checks its closed owner_digest inventory, which names
-// AN-1's 0053 relations, so this test runs on the repository chain.
-test("PG17 owner-journal health is content-free and analytics retirement retains an erased head",
+// There is no online analytics-owner retirement (decision D2, Variant B);
+// this test runs on the repository chain.
+test("PG17 owner-journal health is content-free and participant deletion retains the erased head",
   { skip: SKIP, timeout: 180_000 }, async () => withSchema(async ({ pool, schema, quoted, table }) => {
     const { readPostgresOwnerJournalHealth, appendPostgresOwnerJournal, ensurePostgresOwnerLink } =
       await workerModule("/src/postgres-owner-journal.ts");
-    const { retirePostgresAnalyticsOwner, hasPostgresAnalyticsOwnerResidue } =
-      await workerModule("/src/postgres-analytics-owner-retirement.ts");
     const client = await pool.connect();
     const health = () => readPostgresOwnerJournalHealth(client, schema);
     try {
@@ -1383,54 +1381,14 @@ test("PG17 owner-journal health is content-free and analytics retirement retains
       client.release();
     }
 
-    // Participant erasure after the owner's terminal row, then retirement
-    // once the analytics cursor has applied the whole journal.
+    // Participant deletion after the owner's terminal row: the erased head and
+    // its journal stay (append-only); nothing retires them online.
     await pool.query(`UPDATE ${table("participants")} SET state='deleting' WHERE id='synthetic-health-erased'`);
     await pool.query(`DELETE FROM ${table("participants")} WHERE id='synthetic-health-erased'`);
-    const latest = (await journal(pool, table)).at(-1);
-    const epoch = await sourceEpoch(pool, table);
-    await pool.query(`INSERT INTO ${table("analytics_source_cursors")} (source_id,sequence,authority_epoch) VALUES ($1,$2,$3)`,
-      [SOURCE_ID, latest.sequence, epoch]);
-    await pool.query(`INSERT INTO ${table("analytics_applied_events")} (
-        source_id,sequence,event_digest,owner_digest,authority_epoch,projection_json,event_tuple_version,revision,kind,
-        object_digest,content_digest,public_authority_epoch,recorded_ms
-      ) SELECT source_id,sequence,event_digest,owner_digest,authority_epoch,NULL,1,revision,kind,object_digest,content_digest,
-          public_authority_epoch,recorded_ms
-          FROM ${table("storage_ingestion_changes")} WHERE source_id=$1 AND sequence=$2`, [SOURCE_ID, latest.sequence]);
     const erasedHead = (await heads(pool, table)).find((head) => head.state === "erased" && !head.seeded_partial);
-    const options = { primaryPool: pool, ownerDigest: erasedHead.owner_digest, schema: { primarySchema: schema } };
-    // v1.2 receipts cascade with their participant, so a leftover one (for
-    // example from a restore) is fabricated with triggers and foreign keys
-    // suspended. Retirement must refuse while it remains.
-    const residue = async (sql, values) => {
-      const client = await pool.connect();
-      try {
-        await client.query("BEGIN");
-        await client.query("SET LOCAL session_replication_role = replica");
-        await client.query(sql, values);
-        await client.query("COMMIT");
-      } catch (error) {
-        await client.query("ROLLBACK").catch(() => {});
-        throw error;
-      } finally {
-        client.release();
-      }
-    };
-    await residue(`INSERT INTO ${table("storage_v12_event_sources")} (
-        event_digest,owner_digest,participant_id,device_id,generation_id,previous_generation_id,manifest_digest,head_revision,recorded_ms
-      ) VALUES ($1,$2,'synthetic-health-erased','synthetic-health-device','0f000000-0000-4000-8000-000000000001',NULL,$3,1,1)`,
-    [digest("residual-v12-event"), erasedHead.owner_digest, digest("residual-v12-manifest")]);
-    await assert.rejects(retirePostgresAnalyticsOwner(options), (error) => error?.code === "ANALYTICS_OWNER_RETIREMENT_RESIDUAL_OWNER_ROWS",
-      "a remaining v1.2 publication receipt blocks retirement");
-    await residue(`DELETE FROM ${table("storage_v12_event_sources")} WHERE event_digest=$1`, [digest("residual-v12-event")]);
-    const retired = await retirePostgresAnalyticsOwner(options);
-    assert.equal(retired.status, "complete");
-    assert.equal(retired.sourceCount, 1);
-    assert.equal(retired.retained.sourceJournalRows, 2);
-    assert.equal(await hasPostgresAnalyticsOwnerResidue(options), false, "a retained head is never residue");
     assert.deepEqual((await pool.query(`SELECT state,revision::int AS revision FROM ${table("storage_owner_revisions")}
       WHERE owner_digest=$1`, [erasedHead.owner_digest])).rows, [{ state: "erased", revision: 2 }],
-    "the head is a retained tombstone");
+    "the erased head is retained");
     await refuses(pool.query(`SELECT ${quoted}.storage_journal_append('owner-active',$1,$2,$2,$2)`,
-      [erasedHead.owner_digest, digest("after-retirement")]), "storage_owner_erased");
+      [erasedHead.owner_digest, digest("after-deletion")]), "storage_owner_erased");
   }, { chain: "repository" }));

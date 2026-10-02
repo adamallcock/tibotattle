@@ -238,10 +238,9 @@ async function legacyAdmissionMigration() {
   return names[0];
 }
 
-async function withTwin(operation, { ledger = false } = {}) {
+async function withTwin(operation) {
   const local = await endpoint();
   const schema = `in3_legacy_${randomBytes(6).toString("hex")}`;
-  let ledgerCreated = false;
   const pool = new pg.Pool({
     host: local.host, port: local.port, user: PG_TEST_USER, password: PG_TEST_PASSWORD, database: PG_TEST_DATABASE,
     ssl: false, max: 6, connectionTimeoutMillis: 5_000, application_name: "pg-legacy-contribution-admission-test",
@@ -261,14 +260,8 @@ async function withTwin(operation, { ledger = false } = {}) {
     await applyStockAndStagedMigrations({
       role: "primary", schema, pool, stagedFiles: [await legacyAdmissionMigration()],
     });
-    if (ledger) {
-      await pool.query(`CREATE SCHEMA "${schema}_ledger"`);
-      ledgerCreated = true;
-      await applyPostgresMigrations({ role: "ledger", schema: `${schema}_ledger`, pool });
-    }
     return await operation({ twin: new Twin(d1, pool), pool, schema, d1 });
   } finally {
-    if (ledgerCreated) await pool.query(`DROP SCHEMA IF EXISTS "${schema}_ledger" CASCADE`).catch(() => {});
     if (created) await pool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => {});
     await pool.end();
     d1.close();
@@ -389,7 +382,7 @@ async function initializeTypedTargets(twin, schema, { correctionRuntime = "stage
         (id, schema_version, method_version, source_state, max_capture_rows, max_history_page)
       VALUES (1, 'telemetry-usage-correction-v1', 'usage-total-correction-v1', ?, 200, 200)`, [correctionRuntime]);
   }
-  return { schemaOptions: { primarySchema: schema, ledgerSchema: `${schema}_ledger` } };
+  return { schemaOptions: { primarySchema: schema } };
 }
 
 let keyPair;
@@ -529,7 +522,7 @@ async function refusalOf(response) {
  * receipt the same way (500 INTERNAL_ERROR without a contributionId) and
  * abandons the claim on the same conditions. "PG17 ... through the landed
  * origin dispatch" below drives the real dispatch where it exists. The
- * route module's device-bearer and tombstone steps are stand-ins; its body
+ * route module's device-bearer step is a stand-in; its body
  * rules, format table, controls and authorization writes are real.
  */
 async function origin(pool, schemaOptions, objectStore) {
@@ -564,7 +557,7 @@ async function origin(pool, schemaOptions, objectStore) {
   const devices = new Map();
   const steps = [];
   const uploadAuthorizations = createUploadAuthorizationRouteModule({
-    primaryPool: pool, ledgerPool: pool, schema: schemaOptions, maxRequestBytes: MAX_REQUEST_BYTES,
+    primaryPool: pool, schema: schemaOptions, maxRequestBytes: MAX_REQUEST_BYTES,
     admissionEnv: Object.freeze({ synthetic: true }), formats,
     assertStorageCurrent: async () => { steps.push("storage"); },
     assertAdmissionBindings: () => { steps.push("admission"); },
@@ -580,7 +573,6 @@ async function origin(pool, schemaOptions, objectStore) {
       if (!device) throw Object.assign(new Error("DEVICE_AUTH_INVALID"), { code: "DEVICE_AUTH_INVALID", status: 401 });
       return device;
     },
-    hasDeletionTombstone: async () => { steps.push("tombstone"); return false; },
     readBoundedRequestBody,
     createDeviceUploadAuthorization: uploads.createPostgresDeviceUploadAuthorization,
   });
@@ -627,7 +619,7 @@ async function origin(pool, schemaOptions, objectStore) {
         Object.freeze({ id: participantRow.id, consentVersion: participantRow.consent_version,
           ownerKind: participantRow.owner_kind }),
         deviceId, claim, Object.freeze({
-          primaryPool: pool, ledgerPool: pool, objectStore: store,
+          primaryPool: pool, objectStore: store,
           envelopePublicJwk: keys.publicText, envelopePrivateJwk: keys.privateText, sourceNamespace: NAMESPACE,
           request: new Request(`${ORIGIN}/api/v1/contributions`, { method: "POST" }),
           envelopeDigest, bodyBytes: bytes.byteLength, contentType: "application/json", principal,
@@ -1601,7 +1593,7 @@ test("PG17 a v1.0 usage correction is archived exactly as d43c8f92 while the cor
         assert.deepEqual((await correctionArchive(twin, schema, participantId, maps, sinceMs)).pg,
           { history: [], facts: [] });
       }
-    }, { ledger: true });
+    });
   }
 });
 
@@ -1648,7 +1640,7 @@ test("PG17 without the correction runtime row a v1.0 usage correction is 503, as
       (SELECT count(*)::int FROM "${schema}".telemetry_usage_correction_history) AS history,
       (SELECT count(*)::int FROM "${schema}".telemetry_usage_correction_facts) AS facts`)).rows[0],
   { history: 0, facts: 0 });
-}, { ledger: true }));
+}));
 
 // ---------------------------------------------------------------------------
 // telemetry-envelope-v0.1 (not retired at d43c8f92; see envelopes/v01.mjs).
@@ -1986,7 +1978,7 @@ test("PG17 the staged migration replaces the lifetime cap with D1's weekly windo
 // The upload-authorization route, the receipt, in-batch refusals, supersession
 // scope, withdrawn owners, the erasure inventory and the landed preamble.
 
-const ROUTE_STEPS = Object.freeze(["storage", "admission", "device", "tombstone", "upload-bindings",
+const ROUTE_STEPS = Object.freeze(["storage", "admission", "device", "upload-bindings",
   "upload-registration", "rate-limit"]);
 const sleep = (milliseconds) => new Promise((resolveSleep) => setTimeout(resolveSleep, milliseconds));
 const duplicateIv = (raw) => raw.replace('"iv":', `"iv":"${"A".repeat(16)}","iv":`);
@@ -2057,12 +2049,12 @@ test("PG17 the upload-authorization route module issues for shipped three-key bo
   // A table without v1.2 would stop v1.2 issuance, so the module cannot start with one.
   const noop = () => {};
   assert.throws(() => createUploadAuthorizationRouteModule({
-    primaryPool: pool, ledgerPool: pool, schema: schemaOptions, maxRequestBytes: MAX_REQUEST_BYTES,
+    primaryPool: pool, schema: schemaOptions, maxRequestBytes: MAX_REQUEST_BYTES,
     formats: createUploadAuthorizationFormats(legacyUploadAuthorizationFormatEntries({
       assertTelemetryTransportWriteAllowed: noop })),
     assertStorageCurrent: noop, assertAdmissionBindings: noop, assertUploadAuthorizationBindings: noop,
     assertUploadAuthorizationAllowed: noop, assertUploadRegistrationEnabled: noop, authenticateDevice: noop,
-    hasDeletionTombstone: noop, readBoundedRequestBody: noop, createDeviceUploadAuthorization: noop,
+    readBoundedRequestBody: noop, createDeviceUploadAuthorization: noop,
   }), /UPLOAD_AUTHORIZATION_ROUTE_CONFIGURATION_INVALID/u);
 
   await socialParticipant(twin, "in3-route");
@@ -2413,22 +2405,6 @@ test("PG17 a record another chunk of the device owns is 409 RECORD_OWNED_BY_OTHE
   for (const key of Object.keys(rows.d1)) assert.deepEqual(rows.pg[key], rows.d1[key], key);
 }));
 
-test("PG17 the social owner erasure preflight accepts a schema carrying the v0.1 admission-window table", {
-  skip: SKIP, timeout: 120_000,
-}, () => withTwin(async ({ twin, pool, schema }) => {
-  const { schemaOptions } = await initializeTypedTargets(twin, schema);
-  const preflight = await workerModule("/src/postgres-social-owner-erasure-preflight.ts");
-  const table = await pool.query(`SELECT count(*)::int AS n FROM pg_catalog.pg_tables
-    WHERE schemaname = $1 AND tablename = 'telemetry_contribution_admission_windows'`, [schema]);
-  assert.equal(table.rows[0].n, 1, "the staged migration created the participant-owned window table");
-  const participantId = `participant:${randomUUID()}`;
-  await socialParticipant(twin, participantId);
-  const inventory = await preflight.inspectPostgresSocialOwnerErasureTarget({
-    primaryPool: pool, participantId, schema: schemaOptions,
-  });
-  assert.equal(inventory.status, "inspectable", "the fail-closed participant-table inventory knows the table");
-}));
-
 // The landed IN-1b preamble (claude/gcp-fastpath) exports the pairing check;
 // the IN-1a seam this branch is based on does not, so the case below runs
 // only once IN-3 is composed onto the fast path.
@@ -2440,11 +2416,11 @@ test("PG17 through the landed origin dispatch: a shipped client authorizes with 
 }, () => withTwin(async ({ twin, pool, schema }) => {
   const { schemaOptions } = await initializeTypedTargets(twin, schema);
   await enableCollection(pool, schema);
-  const [authority, admission, transport, uploads, controls, ledgerAuthority, runtimeSchema, workerAdmission,
+  const [authority, admission, transport, uploads, controls, runtimeSchema, workerAdmission,
     workerCrypto, bounded, routes] = await Promise.all([
     "/src/postgres-transport-write-authority.ts", "/src/postgres-legacy-contribution-admission.ts",
     "/src/postgres-typed-v12-transport.ts", "/src/postgres-upload-authorization.ts",
-    "/src/postgres-collection-controls.ts", "/src/postgres-ledger-authority.ts", "/src/postgres-runtime-schema.ts",
+    "/src/postgres-collection-controls.ts", "/src/postgres-runtime-schema.ts",
     "/src/admission.ts", "/src/crypto.ts", "/src/bounded-body.ts", "/src/route-registry.ts",
   ].map((path) => workerModule(path)));
   const keys = await envelopeKeys();
@@ -2464,10 +2440,8 @@ test("PG17 through the landed origin dispatch: a shipped client authorizes with 
     assertTelemetryTransportWriteAllowed: authority.assertPostgresTelemetryTransportWriteAllowed,
     schemaVersions: ["telemetry-contribution-v1.0", "telemetry-contribution-v0.1"],
   });
-  // The dispatch refuses one pool object for both roles; the ledger schema shares the server.
-  const ledgerPool = { connect: () => pool.connect() };
   const dispatch = createPostgresTestV12DayManifestDispatch({
-    primaryPool: pool, ledgerPool, schemaOptions,
+    primaryPool: pool, schemaOptions,
     expectedMigrations: runtimeSchema.POSTGRES_RUNTIME_MIGRATIONS, privateOrigin: ORIGIN,
     healthDispatch: mustNotCall("healthDispatch"), admissionEnv,
     assertAdmissionBindings: workerAdmission.assertAdmissionBindings,
@@ -2478,7 +2452,6 @@ test("PG17 through the landed origin dispatch: a shipped client authorizes with 
     assertUploadIngressRequestAllowed: workerAdmission.assertUploadIngressRequestAllowed,
     authenticatePostgresDevice: transport.authenticatePostgresDevice,
     disconnectPostgresAuthenticatedDevice: mustNotCall("disconnectPostgresAuthenticatedDevice"),
-    hasPostgresDeletionTombstone: ledgerAuthority.hasPostgresDeletionTombstone,
     readPostgresDeviceSyncCapabilities: mustNotCall("readPostgresDeviceSyncCapabilities"),
     readPostgresV12DayCandidates: mustNotCall("readPostgresV12DayCandidates"),
     readPostgresTelemetryV12EffectivePage: mustNotCall("readPostgresTelemetryV12EffectivePage"),
@@ -2504,7 +2477,7 @@ test("PG17 through the landed origin dispatch: a shipped client authorizes with 
     uploadAuthorizationFormats: legacyFormats,
   });
   const routeModule = createUploadAuthorizationRouteModule({
-    primaryPool: pool, ledgerPool, schema: schemaOptions, maxRequestBytes: MAX_REQUEST_BYTES, admissionEnv,
+    primaryPool: pool, schema: schemaOptions, maxRequestBytes: MAX_REQUEST_BYTES, admissionEnv,
     formats: createUploadAuthorizationFormats(new Map([
       [V12_UPLOAD_FORMAT, { assertUploadAllowed: assertV12UploadAllowed }], ...Object.entries(legacyFormats),
     ])),
@@ -2516,7 +2489,6 @@ test("PG17 through the landed origin dispatch: a shipped client authorizes with 
     assertUploadRegistrationEnabled: (controlPool, primarySchema) =>
       controls.assertPostgresCollectionControlFromPool(controlPool, primarySchema, "uploadRegistration"),
     authenticateDevice: transport.authenticatePostgresDevice,
-    hasDeletionTombstone: ledgerAuthority.hasPostgresDeletionTombstone,
     readBoundedRequestBody: bounded.readBoundedRequestBody,
     createDeviceUploadAuthorization: uploads.createPostgresDeviceUploadAuthorization,
   });
@@ -2575,4 +2547,4 @@ test("PG17 through the landed origin dispatch: a shipped client authorizes with 
   const grants = await pool.query(`SELECT state, count(*)::int AS n FROM "${schema}".device_upload_authorizations
     GROUP BY state ORDER BY state`);
   assert.deepEqual(grants.rows, [{ state: "consumed", n: 3 }, { state: "revoked", n: 1 }]);
-}, { ledger: true }));
+}));

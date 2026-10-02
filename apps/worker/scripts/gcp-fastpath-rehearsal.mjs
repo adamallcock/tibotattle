@@ -10,8 +10,8 @@
 // (npm run gcp:fastpath:rehearsal in apps/worker runs exactly this.)
 //
 //  1. creates a fresh typed_legacy_transfer_rehearsal_target_fastpath_<8 hex>
-//     schema (plus its "_ledger" pair and an importer control schema) and
-//     applies every promoted migration with the production runner;
+//     schema (plus an importer control schema) and applies every promoted
+//     primary migration with the production runner (there is no ledger role);
 //  2. rebuilds the Q-1 oracle's USAGE_MONITOR_DB dump into a sealed SQLite;
 //  3. runs the importers in order: T-1 identity/authority copy, the
 //     typed-legacy transfer, T-2 v1.2, usage-correction and ingestion-journal,
@@ -366,9 +366,10 @@ export async function buildJournalSqlite(dumpPath, outPath) {
 
 /**
  * The schema names one rehearsal target uses: the importers' shared
- * fast-path target (typed_legacy_transfer_rehearsal_target_fastpath_<suffix>),
- * its "_ledger" pair and the importers' control schema. `suffix` is 8
- * lower-case hex digits, so "<schema>_ledger" stays a PostgreSQL identifier.
+ * fast-path target (typed_legacy_transfer_rehearsal_target_fastpath_<suffix>)
+ * and the importers' control schema. `suffix` is 8 lower-case hex digits.
+ * There is no ledger schema: the deletion ledger is retired (decisions D2,
+ * D4 and D6 of 2026-09-26) and the runner refuses the ledger role.
  */
 export function fastpathRehearsalSchemas(suffix) {
   if (typeof suffix !== "string" || !/^[0-9a-f]{8}$/u.test(suffix)) fail("REHEARSAL_SUFFIX_INVALID");
@@ -376,7 +377,6 @@ export function fastpathRehearsalSchemas(suffix) {
   return Object.freeze({
     suffix,
     schema,
-    ledgerSchema: `${schema}_ledger`,
     controlSchema: `${POSTGRES_TYPED_LEGACY_CONTROL_SCHEMA_PREFIX}ctl_${suffix}`,
   });
 }
@@ -605,7 +605,7 @@ async function tableCounts(pool, schema, tables) {
   return counts;
 }
 
-async function startOrigin({ endpoint, schema, ledgerSchema, nowMs }) {
+async function startOrigin({ endpoint, schema, nowMs }) {
   const port = await freePort();
   const origin = `http://127.0.0.1:${port}`;
   const bucket = "synthetic-fastpath-rehearsal-bucket";
@@ -615,7 +615,6 @@ async function startOrigin({ endpoint, schema, ledgerSchema, nowMs }) {
     PORT: String(port),
     HOST_ORIGIN: origin,
     PRIMARY_SCHEMA: schema,
-    LEDGER_SCHEMA: ledgerSchema,
     PRIMARY_DATABASE: process.env.PG_TEST_DATABASE || "postgres",
     PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:synthetic-fastpath-rehearsal",
     POSTGRES_IAM_USER: "synthetic-fastpath-rehearsal@synthetic.iam",
@@ -623,7 +622,7 @@ async function startOrigin({ endpoint, schema, ledgerSchema, nowMs }) {
     ENVELOPE_PUBLIC_JWK: '{"synthetic":"unused-public-key"}',
     ENVELOPE_PRIVATE_JWK: "synthetic-unused-private-key",
     GCS_BUCKET_NAME: bucket,
-    GCS_ERASURE_BUCKET_HISTORY_PROOF: JSON.stringify({
+    GCS_QUARANTINE_BUCKET_HISTORY_PROOF: JSON.stringify({
       bucket, bucketGeneration: "1", bucketMetageneration: "1", softDeleteRetentionDurationSeconds: "0",
     }),
     ANALYTICS_V2_ENABLED: "1",
@@ -664,7 +663,7 @@ async function originChild() {
 }
 
 /** Start the origin child under `node`, and resolve once it is listening. */
-async function spawnOrigin({ node, endpoint, schema, ledgerSchema, nowMs }) {
+async function spawnOrigin({ node, endpoint, schema, nowMs }) {
   const child = spawn(node, [fileURLToPath(import.meta.url), "--origin-child"], {
     cwd: CLOUD_RUN_ROOT,
     env: {
@@ -672,7 +671,7 @@ async function spawnOrigin({ node, endpoint, schema, ledgerSchema, nowMs }) {
       HOME: process.env.HOME,
       ...(process.env.PG_TEST_USER ? { PG_TEST_USER: process.env.PG_TEST_USER } : {}),
       ...(process.env.PG_TEST_DATABASE ? { PG_TEST_DATABASE: process.env.PG_TEST_DATABASE } : {}),
-      GCP_FASTPATH_REHEARSAL_ORIGIN: JSON.stringify({ endpoint, schema, ledgerSchema, nowMs }),
+      GCP_FASTPATH_REHEARSAL_ORIGIN: JSON.stringify({ endpoint, schema, nowMs }),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -752,7 +751,7 @@ async function main() {
     ...(process.env.PG_TEST_USER ? { PG_TEST_USER: process.env.PG_TEST_USER } : {}),
     ...(process.env.PG_TEST_DATABASE ? { PG_TEST_DATABASE: process.env.PG_TEST_DATABASE } : {}),
   };
-  const { suffix, schema, ledgerSchema, controlSchema } = fastpathRehearsalSchemas(options.reuseSchema === null
+  const { suffix, schema, controlSchema } = fastpathRehearsalSchemas(options.reuseSchema === null
     ? randomBytes(4).toString("hex")
     : options.reuseSchema.slice(POSTGRES_FASTPATH_REHEARSAL_TARGET_SCHEMA_PREFIX.length));
   const created = [];
@@ -780,21 +779,21 @@ async function main() {
 
     if (options.reuseSchema !== null) {
       const present = await pool.query("SELECT count(*)::integer AS n FROM pg_namespace WHERE nspname = ANY($1)",
-        [[schema, ledgerSchema]]);
-      if (present.rows[0].n !== 2) fail("REHEARSAL_REUSE_SCHEMA_MISSING");
+        [[schema]]);
+      if (present.rows[0].n !== 1) fail("REHEARSAL_REUSE_SCHEMA_MISSING");
     } else {
-      // 1. Fresh schemas, every promoted migration through the production runner.
+      // 1. Fresh schemas, every promoted primary migration through the
+      // production runner.
       await timed(timings, "migrate", async () => {
-        for (const name of [schema, ledgerSchema, controlSchema]) {
+        for (const name of [schema, controlSchema]) {
           await pool.query(`CREATE SCHEMA ${quoteIdentifier(name)}`);
           created.push(name);
         }
         const primary = await applyPostgresMigrations({ role: "primary", schema, pool });
-        const ledger = await applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool });
         const expected = await readPostgresMigrations({ role: "primary" });
         report.steps.migrate = {
           primaryApplied: primary.applied, primaryTail: primary.migrations.at(-1)?.name,
-          ledgerApplied: ledger.applied, expectedPrimary: expected.length,
+          expectedPrimary: expected.length,
         };
         if (primary.applied !== expected.length) fail("REHEARSAL_MIGRATION_INCOMPLETE");
       });
@@ -825,7 +824,7 @@ async function main() {
 
     // 5-6. The fastpath-test origin and the public read.
     origin = await timed(timings, "origin:start", async () => spawnOrigin({
-      node: options.node22, endpoint, schema, ledgerSchema, nowMs,
+      node: options.node22, endpoint, schema, nowMs,
     }));
     const url = `${origin.origin}${COMMUNITY_DAILY_PATH}?from=${golden.from}&to=${golden.to}`;
     const response = await timed(timings, "origin:get", async () => {
@@ -909,7 +908,7 @@ async function main() {
     }
     if (workDirectory !== null) await rm(workDirectory, { recursive: true, force: true });
     if (options.reuseSchema !== null) {
-      report.keptSchemas = [schema, ledgerSchema, controlSchema];
+      report.keptSchemas = [schema, controlSchema];
     } else if (!options.keepSchema) {
       await timed(timings, "cleanup", async () => {
         for (const name of [...created].reverse()) {

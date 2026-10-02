@@ -46,7 +46,6 @@ export const FASTPATH_TEST = Object.freeze({
   instanceConnectionName: FASTPATH_TEST_CLOUD_TARGET.instanceConnectionName,
   database: FASTPATH_TEST_CLOUD_TARGET.database,
   primarySchema: FASTPATH_TEST_CLOUD_TARGET.primarySchema,
-  ledgerSchema: FASTPATH_TEST_CLOUD_TARGET.ledgerSchema,
   imageRepository: "us-east1-docker.pkg.dev/tibotattle/tibotattle-test/tibotattle-host",
   buildBucket: "tibotattle-gcs-test-build-20260922",
   migrateJob: "tibotattle-fastpath-test-migrate",
@@ -125,10 +124,11 @@ export const EDGE_TEST_PRODUCTION_SETTINGS = Object.freeze([
 export const EDGE_TEST_UNMIRRORED_SETTINGS = Object.freeze({
   ENVIRONMENT: "production's value makes every client rate-limit key need IDENTITY_LINK_SECRET, a production "
     + "secret this test origin never holds (src/admission.ts); it keeps its synthetic-development label",
-  IDENTITY_LINK_SECRET: "a production secret, for the Google enrollment routes only cloud-run-iam composes",
-  IDENTITY_LINK_SECRET_VERSION: "names that secret; Google enrollment routes only (cloud-run-iam)",
-  GOOGLE_OIDC_CLIENT_ID: "production's OAuth client, for the Google sign-in routes only cloud-run-iam composes",
-  GOOGLE_OIDC_CLIENT_SECRET: "a production secret; Google sign-in routes only (cloud-run-iam)",
+  IDENTITY_LINK_SECRET: "a production secret, for the Google enrollment routes, which no test host mode composes "
+    + "(the cloud-run-iam mode is retired, OD-6)",
+  IDENTITY_LINK_SECRET_VERSION: "names that secret; Google enrollment routes only, not composed by any test mode",
+  GOOGLE_OIDC_CLIENT_ID: "production's OAuth client, for the Google sign-in routes, which no test host mode composes",
+  GOOGLE_OIDC_CLIENT_SECRET: "a production secret; Google sign-in routes only, not composed by any test mode",
 });
 /** A source id or typed-storage namespace the origin and an env flag both accept. */
 const SOURCE_IDENTITY = /^[A-Za-z0-9._:-]{1,200}$/u;
@@ -186,9 +186,6 @@ function databaseEnv(schema) {
     ["PRIMARY_INSTANCE_CONNECTION_NAME", FASTPATH_TEST.instanceConnectionName],
     ["PRIMARY_DATABASE", FASTPATH_TEST.database],
     ["PRIMARY_SCHEMA", primarySchemaOf(schema)],
-    ["LEDGER_INSTANCE_CONNECTION_NAME", FASTPATH_TEST.instanceConnectionName],
-    ["LEDGER_DATABASE", FASTPATH_TEST.database],
-    ["LEDGER_SCHEMA", FASTPATH_TEST.ledgerSchema],
   ];
 }
 
@@ -227,10 +224,13 @@ export function originSourceEnv(sourceIdentity) {
 /** gcloud command that creates or updates the fast-path migrate Job. */
 export function migrateJobCommand({ image, expectedCounts }) {
   if (!IMAGE_REFERENCE.test(image ?? "")) fail("FASTPATH_DEPLOY_IMAGE_DIGEST_REQUIRED");
-  for (const role of ["primary", "ledger"]) {
-    if (!Number.isSafeInteger(expectedCounts?.[role]) || expectedCounts[role] < 1) {
-      fail("FASTPATH_DEPLOY_EXPECTED_COUNTS_INVALID");
-    }
+  // Primary only: the deletion ledger and its migration role are retired
+  // (decisions D2, D4 and D6), and a counts record naming any other role is
+  // a stale caller.
+  if (expectedCounts === null || typeof expectedCounts !== "object"
+      || Object.keys(expectedCounts).join(",") !== "primary"
+      || !Number.isSafeInteger(expectedCounts.primary) || expectedCounts.primary < 1) {
+    fail("FASTPATH_DEPLOY_EXPECTED_COUNTS_INVALID");
   }
   return gcloudArgs([
     "run", "jobs", "deploy", assertFastpathName(FASTPATH_TEST.migrateJob),
@@ -242,7 +242,6 @@ export function migrateJobCommand({ image, expectedCounts }) {
       ...databaseEnv(FASTPATH_TEST.primarySchema),
       ["POSTGRES_MIGRATOR_IAM_USER", FASTPATH_TEST.migratorIamUser],
       ["PRIMARY_EXPECTED_MIGRATIONS", String(expectedCounts.primary)],
-      ["LEDGER_EXPECTED_MIGRATIONS", String(expectedCounts.ledger)],
     ]),
     "--tasks=1", "--parallelism=1", "--max-retries=0", "--task-timeout=1200s",
     "--cpu=1", "--memory=512Mi", labelsFlag(),
@@ -427,7 +426,8 @@ export function renderOriginService({
     ["ENVIRONMENT", "synthetic-development"],
     ["ANALYTICS_V2_ENABLED", "1"],
     ["GCS_BUCKET_NAME", FASTPATH_TEST.originBucket],
-    ["GCS_ERASURE_BUCKET_HISTORY_PROOF", bucketHistoryProof],
+    // OD-2: the quarantine bucket's birth proof under its own name.
+    ["GCS_QUARANTINE_BUCKET_HISTORY_PROOF", bucketHistoryProof],
     ...(variant === "sidecar"
       ? [["HOST", "127.0.0.1"], ["HOST_ORIGIN", loopbackOrigin]]
       : [["HOST", "0.0.0.0"], ["HOST_ORIGIN", FASTPATH_TEST.originUrl]]),
@@ -627,10 +627,10 @@ export function ensureOriginBucketRuntimeBinding(runner) {
   return Object.freeze({ role, member, conditionTitle: condition.title, added: !present && !runner.dryRun });
 }
 
-/** Count promoted migrations per role in one commit's tree. */
+/** Count promoted primary migrations in one commit's tree (there is no ledger role). */
 export function countMigrationsAtCommit(commit, spawn = spawnSync) {
   const counts = {};
-  for (const role of ["primary", "ledger"]) {
+  for (const role of ["primary"]) {
     const listed = spawn("git", [
       "-C", REPOSITORY_ROOT, "ls-tree", "--name-only", commit, `apps/worker/postgres/migrations/${role}/`,
     ], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
@@ -967,12 +967,12 @@ async function stepMigrate(runner, options, image) {
     migrateJobCommand({ image, expectedCounts }));
   const ok = result.results?.find((line) => line.status === "ok");
   const receipt = { step: "migrate", commit, image, expectedCounts, ...result,
-    applied: ok ? { primary: ok.migrations?.primary?.applied, ledger: ok.migrations?.ledger?.applied } : null };
+    applied: ok ? { primary: ok.migrations?.primary?.applied } : null };
   if (!runner.dryRun && !options.noExecute) {
     receipt.path = await runner.receipt(`migrate-${commit.slice(0, 12)}.json`, receipt);
     if (!result.succeeded || ok === undefined
         || ok.migrations?.primary?.applied !== expectedCounts.primary
-        || ok.migrations?.ledger?.applied !== expectedCounts.ledger) {
+        || Object.keys(ok.migrations ?? {}).join(",") !== "primary") {
       fail("FASTPATH_DEPLOY_MIGRATE_FAILED", JSON.stringify(result.results?.at(-1) ?? null));
     }
   }
@@ -1006,7 +1006,7 @@ async function stepVerifyDatabase(runner) {
       await client.query("BEGIN READ ONLY");
       const row = async (sql, params) => (await client.query(sql, params)).rows;
       const result = { step: "verify-database", database: FASTPATH_TEST.database };
-      for (const [role, schema] of [["primary", FASTPATH_TEST.primarySchema], ["ledger", FASTPATH_TEST.ledgerSchema]]) {
+      for (const [role, schema] of [["primary", FASTPATH_TEST.primarySchema]]) {
         const [history] = await row(`SELECT count(*)::int AS applied, max(version)::int AS latest
           FROM "${schema}"."_tibotattle_migration_history"`);
         const [tables] = await row(`SELECT count(*)::int AS relations FROM pg_class c

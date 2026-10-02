@@ -127,7 +127,26 @@ test("the header block states every family convention later briefs cite as FC", 
   const source = await readFile(CONTRACT_PATH, "utf8");
   const header = source.slice(0, source.indexOf("\nimport "));
   assert.match(header, /FAMILY CONVENTIONS \(FC\)/u);
-  for (let index = 1; index <= 12; index += 1) assert.match(header, new RegExp(`FC-${index} `, "u"));
+  // FC-11 (the online-erasure inventories) is retired with the erasure
+  // modules (decisions D2 and D6); the numbering of the other rules stays.
+  for (let index = 1; index <= 12; index += 1) {
+    if (index === 11) continue;
+    assert.match(header, new RegExp(`FC-${index} `, "u"));
+  }
+  assert.doesNotMatch(header, /FC-11/u, "the retired FC-11 must not return");
+  for (const retired of [
+    /OWNER_DIGEST_TABLES/u,
+    /KNOWN_PARTICIPANT_TABLES/u,
+    /ACCOUNTLESS_PARTICIPANT_TABLES/u,
+    /postgres-analytics-owner-retirement/u,
+    /postgres-social-owner-erasure/u,
+    /postgres-accountless-owner-erasure/u,
+    /postgres-owner-erasure/u,
+    /\bledger[A-Z]\w*/u,
+    /tombstone/iu,
+  ]) {
+    assert.doesNotMatch(source, retired, `the family contract no longer names ${retired.source}`);
+  }
   for (const phrase of [
     /New files only/u,
     /frozen <FAMILY>_PATHNAMES/u,
@@ -144,44 +163,12 @@ test("the header block states every family convention later briefs cite as FC", 
     /No host checks and no retries/u,
     /staged-migrations\/<role>\/<NNNN>_<name>\.sql/u,
     /skip\s+\*\s+cleanly when PG_TEST_SOCKET and PG_TEST_HOST/u,
-    /owner_digest column joins\s+\*\s+OWNER_DIGEST_TABLES/u,
-    /explicit decision in that module: DELETE/u,
-    /SOURCE_OWNER_TABLES or a query in assertNoResidualOwnerFamilyRows/u,
-    /or RETAIN \(RETAINED_OWNER_TABLES, with the retained-proof\s+\*\s+justification\), plus a retirement spec assertion/u,
-    /Membership alone\s+\*\s+only satisfies the fail-closed gate/u,
-    /participant_id column or a participants\s+\*\s+foreign key joins KNOWN_PARTICIPANT_TABLES/u,
-    /ACCOUNTLESS_PARTICIPANT_TABLES in\s+\*\s+src\/postgres-accountless-owner-erasure\.ts/u,
-    /accountless-only\s+\*\s+ACCOUNTLESS_PARTICIPANT_TABLES list when its rows are accountless\s+\*\s+authority/u,
-    /synthetic ALLOWED_PARTICIPANT_TABLES bounds in\s+\*\s+src\/postgres-owner-erasure\.ts and cloud-run\/synthetic-v12-discovery\.mjs/u,
     /no\s+\*\s+upload-authorization format contract/u,
   ]) {
     assert.match(header, phrase);
   }
   assert.doesNotMatch(header, /missing\s+(?:\*\s+)?or different limiter call answers 503/u,
     "a missing limiter call is not detected at the origin, so FC-7 must not promise a 503");
-});
-
-test("FC-11 names inventory constants that exist in the modules it cites", async () => {
-  for (const [path, names] of [
-    ["src/postgres-analytics-owner-retirement.ts", [
-      "const OWNER_DIGEST_TABLES",
-      "const SOURCE_OWNER_TABLES",
-      "const RETAINED_OWNER_TABLES",
-      "async function assertNoResidualOwnerFamilyRows",
-    ]],
-    ["src/postgres-social-owner-erasure-preflight.ts", [
-      "const KNOWN_PARTICIPANT_TABLES",
-      "const ACCOUNTLESS_PARTICIPANT_TABLES",
-    ]],
-    ["src/postgres-accountless-owner-erasure.ts", ["const ACCOUNTLESS_PARTICIPANT_TABLES"]],
-    ["src/postgres-owner-erasure.ts", ["const ALLOWED_PARTICIPANT_TABLES"]],
-    ["cloud-run/synthetic-v12-discovery.mjs", ["const ALLOWED_PARTICIPANT_TABLES"]],
-  ]) {
-    const source = await readFile(resolve(WORKER_ROOT, path), "utf8");
-    for (const name of names) {
-      assert.ok(source.includes(`${name}`), `${path} still declares ${name.split(" ").at(-1)}`);
-    }
-  }
 });
 
 test("the control read policy and readBoundedJson rules match the Worker source (src/index.ts)", async () => {

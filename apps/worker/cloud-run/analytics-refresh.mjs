@@ -89,8 +89,11 @@ export const ANALYTICS_REFRESH_ENTRY = "analytics-refresh";
 export const ANALYTICS_REFRESH_LOCK_KEY = "analytics_v2_refresh";
 export const ANALYTICS_REFRESH_RECEIPT_VERSION = "analytics-refresh-receipt-v1";
 export const ANALYTICS_REFRESH_MODES = Object.freeze(["full"]);
-/** POSTGRES_TEST_HTTP_MODE values the host accepts (server.mjs postgresTestHttpMode). */
-const TEST_HTTP_MODES = new Set(["health-only", "health-and-v12-day-manifest", "cloud-run-iam", "fastpath-test"]);
+/**
+ * POSTGRES_TEST_HTTP_MODE values the host accepts (server.mjs
+ * postgresTestHttpMode); the cloud-run-iam mode is retired (OD-6).
+ */
+const TEST_HTTP_MODES = new Set(["health-only", "health-and-v12-day-manifest", "fastpath-test"]);
 const FLAG = /^--([a-z][a-z-]*)=(.*)$/su;
 const KNOWN_FLAGS = new Set(["mode", "schema", "now", "revision-seed"]);
 const ISO_INSTANT = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?Z$/u;

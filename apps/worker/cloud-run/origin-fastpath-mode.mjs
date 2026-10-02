@@ -8,12 +8,9 @@
  * identity routes, and takes no public or admin origin. On top of that it:
  *
  * - takes a configurable rehearsal schema: PRIMARY_SCHEMA must start with one
- *   of FASTPATH_TEST_SCHEMA_PREFIXES, and the ledger is the "<schema>_ledger"
- *   schema, which may live on the primary instance and database (the ledger
- *   instance, database and schema default to the primary's). The one
- *   explicit alternative is the GCP fast-path database's pinned ledger
- *   schema (FASTPATH_TEST_CLOUD_TARGET.ledgerSchema, created by the fastpath
- *   migrate Job), paired with a primary in the same database;
+ *   of FASTPATH_TEST_SCHEMA_PREFIXES. It is the only schema: there is no
+ *   deletion-ledger schema (decisions D2, D4 and D6 of 2026-09-26), and any
+ *   LEDGER_ setting is refused;
  * - may run as the GCP fast-path test origin (K_SERVICE set): still on
  *   127.0.0.1 behind the test edge sidecar, and only as
  *   FASTPATH_TEST_CLOUD_TARGET's service, instance, database
@@ -41,22 +38,21 @@ export const FASTPATH_TEST_SCHEMA_PREFIXES = Object.freeze([
 /**
  * The GCP fast-path test resources (D-1, scripts/gcp-fastpath-test-deploy.mjs
  * FASTPATH_TEST, which a check pins equal): a disposable database on the test
- * primary instance, its pinned migrate-Job schemas, the runtime IAM user, the
- * origin service and the analytics-refresh Job.
+ * primary instance, its pinned migrate-Job schema, the runtime IAM user, the
+ * origin service and the analytics-refresh Job. The orphan ledger schema the
+ * earlier migrate Job created in that database is no longer a target.
  */
 export const FASTPATH_TEST_CLOUD_TARGET = Object.freeze({
   project: "tibotattle",
   instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
   database: "tibotattle_fastpath",
   primarySchema: "tibotattle_fastpath_20261001",
-  ledgerSchema: "tibotattle_fastpath_ledger_20261001",
   seededSchemaPrefix: "typed_legacy_transfer_rehearsal_target_fastpath_",
   iamUser: "tibotattle-test-runtime@tibotattle.iam",
   originService: "tibotattle-fastpath-test-origin",
   refreshJob: "tibotattle-fastpath-test-analytics-refresh",
 });
 
-const LEDGER_SCHEMA_SUFFIX = "_ledger";
 const SCHEMA_IDENTIFIER = /^[a-z_][a-z0-9_]{0,62}$/u;
 const ROUTE_MODULE_FIELDS = Object.freeze(["method", "pathname", "overridesBuiltIn", "handler"]);
 const EPOCH_MILLISECONDS = /^(?:0|[1-9][0-9]{0,15})$/u;
@@ -79,51 +75,43 @@ function requiredEnv(env, name) {
 /**
  * True when schema is a rehearsal schema a fastpath-test origin may serve:
  * a plain lower-case identifier with an allowed prefix and a non-empty
- * suffix, short enough that "<schema>_ledger" is also an identifier.
+ * suffix.
  *
  * @param {unknown} schema
  */
 export function isFastpathTestSchema(schema) {
   return typeof schema === "string"
     && SCHEMA_IDENTIFIER.test(schema)
-    && SCHEMA_IDENTIFIER.test(schema + LEDGER_SCHEMA_SUFFIX)
     && FASTPATH_TEST_SCHEMA_PREFIXES.some((prefix) =>
       schema.startsWith(prefix) && schema.length > prefix.length);
 }
 
 /**
  * The fastpath-test database configuration, in the shape server.mjs's
- * databaseConfig() returns. Throws POSTGRES_FASTPATH_TEST_SCHEMA_INVALID for
- * a primary schema outside the rehearsal prefixes or a ledger schema other
- * than "<schema>_ledger"; never opens a connection.
+ * databaseConfig() returns: the primary only. Throws
+ * POSTGRES_FASTPATH_TEST_SCHEMA_INVALID for any LEDGER_ setting or a primary
+ * schema outside the rehearsal prefixes; never opens a connection.
  *
  * @param {Readonly<Record<string, string | undefined>>} env
  */
 export function fastpathTestDatabaseConfig(env) {
+  if (env === null || typeof env !== "object"
+      || Object.keys(env).some((name) => name.startsWith("LEDGER_"))) {
+    configurationError("POSTGRES_FASTPATH_TEST_SCHEMA_INVALID");
+  }
   const primarySchema = envValue(env, "PRIMARY_SCHEMA");
   if (!isFastpathTestSchema(primarySchema)) {
     configurationError("POSTGRES_FASTPATH_TEST_SCHEMA_INVALID");
   }
   const primaryDatabase = requiredEnv(env, "PRIMARY_DATABASE");
   const primaryInstance = requiredEnv(env, "PRIMARY_INSTANCE_CONNECTION_NAME");
-  const ledgerDatabase = envValue(env, "LEDGER_DATABASE") ?? primaryDatabase;
-  const ledgerInstance = envValue(env, "LEDGER_INSTANCE_CONNECTION_NAME") ?? primaryInstance;
-  const ledgerSchema = envValue(env, "LEDGER_SCHEMA") ?? primarySchema + LEDGER_SCHEMA_SUFFIX;
-  // The ledger is "<schema>_ledger", or the GCP fast-path database's pinned
-  // ledger schema with both roles in that one database.
   const cloud = FASTPATH_TEST_CLOUD_TARGET;
-  const pinnedCloudLedger = ledgerSchema === cloud.ledgerSchema && ledgerSchema !== primarySchema
-    && primaryDatabase === cloud.database && ledgerDatabase === cloud.database
-    && ledgerInstance === primaryInstance;
-  if (ledgerSchema !== primarySchema + LEDGER_SCHEMA_SUFFIX && !pinnedCloudLedger) {
-    configurationError("POSTGRES_FASTPATH_TEST_SCHEMA_INVALID");
-  }
   if (envValue(env, "K_SERVICE") !== undefined) {
     // On Cloud Run: only the fast-path origin service, its disposable
     // database and runtime user, and a pinned or seeded fast-path schema.
     if (env.K_SERVICE !== cloud.originService
-        || primaryInstance !== cloud.instanceConnectionName || ledgerInstance !== cloud.instanceConnectionName
-        || primaryDatabase !== cloud.database || ledgerDatabase !== cloud.database
+        || primaryInstance !== cloud.instanceConnectionName
+        || primaryDatabase !== cloud.database
         || envValue(env, "POSTGRES_IAM_USER") !== cloud.iamUser
         || !(primarySchema === cloud.primarySchema || primarySchema.startsWith(cloud.seededSchemaPrefix))) {
       configurationError("POSTGRES_FASTPATH_TEST_CLOUD_TARGET_INVALID");
@@ -136,13 +124,6 @@ export function fastpathTestDatabaseConfig(env) {
       database: primaryDatabase,
       instanceConnectionName: primaryInstance,
       max: 3,
-    },
-    ledger: {
-      role: "ledger",
-      schema: ledgerSchema,
-      database: ledgerDatabase,
-      instanceConnectionName: ledgerInstance,
-      max: 2,
     },
   };
 }

@@ -29,28 +29,45 @@ describe("PostgreSQL migration foundation", () => {
     expect(timingSafeEqual(Uint8Array.of(1, 2), Uint8Array.of(1))).toBe(false);
   });
 
-  it("validates two explicit pools without claiming current Worker readiness", () => {
-    const backend = createPostgresWorkerBackend({
-      primaryPool: pool(),
-      ledgerPool: pool(),
-    });
+  it("validates one explicit primary pool without claiming current Worker readiness", () => {
+    const primaryPool = pool();
+    const backend = createPostgresWorkerBackend({ primaryPool });
 
     expect(backend.provider).toBe("postgres");
     expect(backend.applicationReady).toBe(false);
-    expect(backend.schemas).toEqual({
-      primary: "tibotattle",
-      ledger: "tibotattle_ledger",
-    });
+    expect(backend.schemas).toEqual({ primary: "tibotattle" });
+    expect(backend.pools).toEqual({ primary: primaryPool });
+    expect(Object.keys(backend.pools)).toEqual(["primary"]);
     expect(backend.unsupportedContracts).toEqual(POSTGRES_UNSUPPORTED_CURRENT_MAIN_CONTRACTS);
+    expect(createPostgresWorkerBackend({
+      primaryPool: pool(),
+      schemaOptions: { primarySchema: "tibotattle_isolated" },
+    }).schemas).toEqual({ primary: "tibotattle_isolated" });
     expect(() => createPostgresWorkerBackend({
       primaryPool: pool(),
-      ledgerPool: pool(),
       schemaOptions: { primarySchema: "pg_catalog" },
     })).toThrow("invalid PostgreSQL schema configuration");
   });
 
+  it("refuses the retired deletion-ledger pool and schema options", () => {
+    // A stale caller fails closed rather than having either option ignored.
+    expect(() => createPostgresWorkerBackend({
+      primaryPool: pool(),
+      ledgerPool: pool(),
+    } as unknown as Parameters<typeof createPostgresWorkerBackend>[0])).toThrow("POSTGRES_LEDGER_POOL_RETIRED");
+    expect(() => createPostgresWorkerBackend({
+      primaryPool: pool(),
+      ledgerPool: undefined,
+    } as unknown as Parameters<typeof createPostgresWorkerBackend>[0])).toThrow("POSTGRES_LEDGER_POOL_RETIRED");
+    expect(() => createPostgresWorkerBackend({
+      primaryPool: pool(),
+      schemaOptions: { primarySchema: "tibotattle", ledgerSchema: "tibotattle_ledger" } as never,
+    })).toThrow("invalid PostgreSQL schema configuration");
+    expect(() => createPostgresWorkerBackend({ ledgerPool: pool() } as never)).toThrow("POSTGRES_POOL_INVALID");
+  });
+
   it("does not route an injected PostgreSQL foundation through a D1 request handler", async () => {
-    const backend = createPostgresWorkerBackend({ primaryPool: pool(), ledgerPool: pool() });
+    const backend = createPostgresWorkerBackend({ primaryPool: pool() });
     const response = await handleRequest(
       new Request("https://worker.test/api/v1/community/daily"),
       { POSTGRES_WORKER_BACKEND: backend } as unknown as Env,

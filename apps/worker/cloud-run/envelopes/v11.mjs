@@ -3,8 +3,8 @@
  * (GCP fast path, IN-2).
  *
  * A registry entry, not a route: POST /api/v1/contributions keeps one shared
- * preamble (bearer auth, upload-authorization claim, deletion tombstone,
- * transport floor), and dispatches here on body.schemaVersion. The oracle is
+ * preamble (bearer auth, upload-authorization claim, transport floor), and
+ * dispatches here on body.schemaVersion. The oracle is
  * d43c8f92 index.ts handleTelemetryV11Contribution plus the tail of
  * handleContribution it relies on (exact envelope keys, receipt recording,
  * abandon on failure), in typed storage mode, which is how production runs
@@ -45,9 +45,9 @@
  * and assertContributionEnvelopeFormats refuses to start an origin that
  * registers this envelope without that format, so the replay in step 6 never
  * runs for a refused principal. The Worker checks the exact key set (step 1)
- * before its participant, tombstone and transport checks; the preamble runs
- * those first, so a body with a wrong key set from a tombstoned or
- * transport-refused principal is 401/403 here instead of 400. Shipped clients
+ * before its participant and transport checks; the preamble runs those
+ * first, so a body with a wrong key set from a refused or transport-refused
+ * principal is 401/403 here instead of 400. Shipped clients
  * always send the exact key set.
  */
 

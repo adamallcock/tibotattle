@@ -24,8 +24,6 @@ export const POSTGRES_COMMUNITY_GRAPH_BENCHMARK_SERVICE_ACCOUNT =
   "tibotattle-test-runtime@tibotattle.iam.gserviceaccount.com";
 export const POSTGRES_COMMUNITY_GRAPH_BENCHMARK_IAM_USER = "tibotattle-test-runtime@tibotattle.iam";
 export const POSTGRES_COMMUNITY_GRAPH_BENCHMARK_SCHEMA_OWNER = "tibotattle-test-migrator@tibotattle.iam";
-export const POSTGRES_COMMUNITY_GRAPH_BENCHMARK_UNUSED_LEDGER_SCHEMA =
-  "tibotattle_graph_benchmark_ledger_unused";
 export const POSTGRES_COMMUNITY_GRAPH_BENCHMARK_TARGET = Object.freeze({
   instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
   database: "tibotattle",
@@ -82,8 +80,8 @@ export const POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES = Object.freeze({
   }),
 });
 
-const MIGRATION_COUNT = 63;
-const MIGRATION_TAIL = "0063_enrollment_grants_erased_redeemer.sql";
+const MIGRATION_COUNT = 64;
+const MIGRATION_TAIL = "0064_append_only_residue.sql";
 export const POSTGRES_COMMUNITY_GRAPH_BENCHMARK_MIGRATION_ROOT =
   "/app/apps/worker/postgres/migrations";
 const MIGRATION_HISTORY_TABLE = "_tibotattle_migration_history";
@@ -956,7 +954,6 @@ export async function runPostgresCommunityGraphBenchmark({ env = process.env, de
 
     const schema = Object.freeze({
       primarySchema: config.schema,
-      ledgerSchema: POSTGRES_COMMUNITY_GRAPH_BENCHMARK_UNUSED_LEDGER_SCHEMA,
     });
     phase = "publish";
     metrics.setPhase("publish");

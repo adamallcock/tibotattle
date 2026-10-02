@@ -69,9 +69,8 @@ import {
   TEST_MIGRATIONS_PROJECT,
   TEST_MIGRATIONS_RUNTIME_IAM_USER,
   TEST_MIGRATIONS_SERVICE_ACCOUNT,
-  TEST_MIGRATIONS_TARGETS,
 } from "../cloud-run/test-migrations.mjs";
-import { GCP_PRIVATE_TEST_TARGET } from "./gcp-private-test-deploy.mjs";
+import { GCP_PRIVATE_TEST_TARGET } from "./gcp-test-project.mjs";
 import { GCP_TEST_BUCKET_HISTORY_TARGET } from "./gcp-test-bucket-history.mjs";
 import { FASTPATH_TEST } from "./gcp-fastpath-test-deploy.mjs";
 
@@ -338,8 +337,9 @@ function collectStrings(value, into, { skipKeys = [] } = {}) {
 }
 
 /**
- * Every name the test estate uses: the private test deployment, the test,
- * graph-benchmark and fast-path migration targets, the IAM test host, the
+ * Every name the test estate uses: the retired A2 test deployment and its
+ * migrate Job (OD-6; their resources remain until OA-4), the graph-benchmark
+ * and fast-path migration targets, the IAM test host identities, the
  * fast-path deploy and the bucket-history tool. Locations, listen addresses
  * and ports are not identities.
  */
@@ -349,7 +349,6 @@ function testTargetNames() {
     "originLoopbackPort", "edgeIngressPort", "labels", "seededSchemaPrefix", "bucketPrefix"];
   for (const source of [
     GCP_PRIVATE_TEST_TARGET,
-    TEST_MIGRATIONS_TARGETS,
     GRAPH_BENCHMARK_MIGRATION_TARGETS,
     FASTPATH_MIGRATION_TARGETS,
     [TEST_MIGRATIONS_JOB, GRAPH_BENCHMARK_MIGRATIONS_JOB, FASTPATH_MIGRATIONS_JOB, TEST_MIGRATIONS_PROJECT,
@@ -1027,6 +1026,14 @@ function substituteStrings(value, values, used) {
   return value;
 }
 
+function bucketProofValues(bucket) {
+  if (bucket.proof === null) fail("SERVICE_RENDER_BUCKET_PROOF_UNPINNED");
+  return {
+    GCS_BUCKET_GENERATION: bucket.proof.bucketGeneration,
+    GCS_BUCKET_METAGENERATION: bucket.proof.bucketMetageneration,
+  };
+}
+
 /** The placeholder values for a desired state and the image it runs. */
 export function serviceTemplateValues(desired, { imageDigest, sourceCommit }) {
   if (typeof imageDigest !== "string" || !IMAGE_DIGEST.test(imageDigest)) fail("SERVICE_RENDER_IMAGE_INVALID");
@@ -1052,6 +1059,9 @@ export function serviceTemplateValues(desired, { imageDigest, sourceCommit }) {
     PRIMARY_SCHEMA: desired.cloudSql.schema,
     POSTGRES_IAM_USER: desired.cloudSql.runtimeIamUser,
     GCS_BUCKET_NAME: desired.bucket.name,
+    // OD-2: the quarantine bucket's birth proof, as pinned from the OPS-2
+    // bucket-birth receipt. An unborn bucket has no proof to render.
+    ...bucketProofValues(desired.bucket),
   };
   for (const [name, secret] of Object.entries(desired.secrets)) {
     if (secret.version === null && secret.required) fail(`SECRET_VERSION_UNPINNED:${name}`);
@@ -1097,6 +1107,22 @@ export function renderService(desired, image, options = {}) {
   return renderServiceTemplateValues(serviceTemplateValues(desired, image), options);
 }
 
+/**
+ * OD-2: exactly one plain GCS_QUARANTINE_BUCKET_HISTORY_PROOF whose closed
+ * proof record names the rendered GCS_BUCKET_NAME with soft delete "0".
+ */
+function quarantineProofMatchesBucket(env) {
+  const proofs = env.filter((entry) => entry.name === "GCS_QUARANTINE_BUCKET_HISTORY_PROOF");
+  const bucket = env.find((entry) => entry.name === "GCS_BUCKET_NAME")?.value;
+  if (proofs.length !== 1 || typeof proofs[0].value !== "string" || proofs[0].valueFrom !== undefined) return false;
+  let proof;
+  try { proof = JSON.parse(proofs[0].value); } catch { return false; }
+  return isRecord(proof)
+    && Object.keys(proof).join(",") === "bucket,bucketGeneration,bucketMetageneration,softDeleteRetentionDurationSeconds"
+    && proof.bucket === bucket && GENERATION.test(proof.bucketGeneration)
+    && GENERATION.test(proof.bucketMetageneration) && proof.softDeleteRetentionDurationSeconds === "0";
+}
+
 function assertServiceInvariants(service) {
   const annotations = service?.metadata?.annotations ?? {};
   const revision = service?.spec?.template?.spec ?? {};
@@ -1115,6 +1141,7 @@ function assertServiceInvariants(service) {
     (revision.containers ?? []).length !== 1,
     env.some((entry) => /^LEDGER_|^GCS_ERASURE_BUCKET_HISTORY_PROOF$|^EDGE_PROOF_|^SPARKLE_/u.test(entry.name)
       || EDGE_ONLY_SECRET_NAMES.includes(entry.name)),
+    !quarantineProofMatchesBucket(env),
     env.some((entry) => (entry.valueFrom !== undefined) !== secretNames.has(entry.name)),
     env.some((entry) => entry.valueFrom !== undefined
       && (entry.valueFrom.secretKeyRef?.name !== entry.name || !SECRET_VERSION.test(entry.valueFrom.secretKeyRef.key))),

@@ -56,27 +56,6 @@
  *       the plan-assigned number; the integrator promotes it. PG17 specs
  *       apply it through postgres-test/staged-migrations-harness.mjs and skip
  *       cleanly when PG_TEST_SOCKET and PG_TEST_HOST are both unset.
- * FC-11 Erasure inventories, in the same item that adds the relation.
- *       (a) A primary relation with an owner_digest column joins
- *       OWNER_DIGEST_TABLES in src/postgres-analytics-owner-retirement.ts
- *       together with an explicit decision in that module: DELETE (a delete
- *       step in the retirement transaction plus residue readback coverage,
- *       via SOURCE_OWNER_TABLES or a query in assertNoResidualOwnerFamilyRows)
- *       or RETAIN (RETAINED_OWNER_TABLES, with the retained-proof
- *       justification), plus a retirement spec assertion. Membership alone
- *       only satisfies the fail-closed gate and leaves a retired owner's rows
- *       in place.
- *       (b) A relation with a participant_id column or a participants
- *       foreign key joins KNOWN_PARTICIPANT_TABLES in
- *       src/postgres-social-owner-erasure-preflight.ts and
- *       ACCOUNTLESS_PARTICIPANT_TABLES in
- *       src/postgres-accountless-owner-erasure.ts, as cascade-covered or
- *       explicitly erased; the preflight's own accountless-only
- *       ACCOUNTLESS_PARTICIPANT_TABLES list when its rows are accountless
- *       authority; and the synthetic ALLOWED_PARTICIPANT_TABLES bounds in
- *       src/postgres-owner-erasure.ts and cloud-run/synthetic-v12-discovery.mjs
- *       when synthetic fixtures create rows. Both erasers' existing specs
- *       join that item's gate.
  * FC-12 Uploads. Post-claim contribution handlers follow
  *       POST_CLAIM_HANDLER_CONTRACT. There is deliberately no
  *       upload-authorization format contract: the upload pipeline owns every
@@ -97,7 +76,7 @@ import { parseStrictJson } from "../src/strict-json.ts";
  * @typedef {(request: Request) => FamilyRequestContext | undefined} RequestContextAccessor
  * @typedef {Readonly<{
  *   pools: unknown,
- *   schemaOptions: Readonly<{ primarySchema: string, ledgerSchema: string }>,
+ *   schemaOptions: Readonly<{ primarySchema: string }>,
  *   env: Readonly<Record<string, unknown>>,
  *   origins: unknown,
  *   storageGate: unknown,
@@ -166,8 +145,8 @@ export const DISPATCH_CONTRACT = Object.freeze({
 /**
  * Descriptor of a post-claim contribution handler (FC-12). The upload
  * pipeline claims the one-use authorization, holds the ingress lease and
- * heartbeat, checks cookies, participant, tombstone, source device and the
- * transport write authority, then calls handle() for the envelope's version.
+ * heartbeat, checks cookies, participant, source device and the transport
+ * write authority, then calls handle() for the envelope's version.
  * handle() returns the contribution Response whose JSON body carries a string
  * contributionId; it must not claim, abandon, record receipts, check cookies,
  * call ingress limiters or release leases.

@@ -268,7 +268,7 @@ test("PostgreSQL v1.2 authenticates a device and atomically claims a bounded one
     await pool.query(`CREATE SCHEMA "${schema}"`);
     schemaCreated = true;
     await applyPostgresMigrations({ role: "primary", schema, pool });
-    const options = { schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` } };
+    const options = { schema: { primarySchema: schema } };
     vite = await createServer({
       root: WORKER_ROOT,
       configFile: false,

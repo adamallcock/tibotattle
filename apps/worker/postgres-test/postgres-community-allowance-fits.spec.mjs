@@ -38,7 +38,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL persisted allowance-fit boundary", 
   let participantId;
   let generationId;
 
-  const schemaOptions = () => ({ primarySchema: schema, ledgerSchema: `${schema}_ledger` });
+  const schemaOptions = () => ({ primarySchema: schema });
 
   beforeAll(async () => {
     const socket = await localSocket();

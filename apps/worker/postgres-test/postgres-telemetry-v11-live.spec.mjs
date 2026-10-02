@@ -219,30 +219,23 @@ test("PostgreSQL 17 runs a full v1.1 upload cycle with Worker-equal rows, replay
     password: endpoint.password ?? "synthetic-local-only", ssl: false, max: 6, connectionTimeoutMillis: 5_000,
   };
   const primaryPool = new pg.Pool({ ...poolOptions, application_name: "pg-v11-live-primary-test" });
-  const ledgerPool = new pg.Pool({ ...poolOptions, application_name: "pg-v11-live-ledger-test" });
   const suffix = randomBytes(5).toString("hex");
   const primarySchema = `v11live_${suffix}`;
-  const ledgerSchema = `v11live_l_${suffix}`;
-  const schema = Object.freeze({ primarySchema, ledgerSchema });
+  const schema = Object.freeze({ primarySchema });
   let primaryCreated = false;
-  let ledgerCreated = false;
   try {
     const server = await primaryPool.query("SELECT current_setting('server_version_num')::integer AS version");
     assert.equal(Math.floor(server.rows[0].version / 10_000), 17, "v1.1 live admission is qualified on PostgreSQL 17");
     await primaryPool.query(`CREATE SCHEMA "${primarySchema}"`);
     primaryCreated = true;
-    await ledgerPool.query(`CREATE SCHEMA "${ledgerSchema}"`);
-    ledgerCreated = true;
     const applied = await applyStockAndStagedMigrations({
       role: "primary", schema: primarySchema, pool: primaryPool, stagedFiles: [STAGED],
     });
     assert.ok(applied.staged.some((entry) => entry.name === STAGED) || applied.promoted.includes(STAGED));
-    await applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool: ledgerPool });
 
     const live = await load("/src/postgres-telemetry-v11-live-admission.ts");
     const bearer = await load("/src/postgres-device-bearer-auth.ts");
     const transport = await load("/src/postgres-typed-v12-transport.ts");
-    const ledgerAuthority = await load("/src/postgres-ledger-authority.ts");
     const personalDevices = await load("/src/postgres-personal-devices.ts");
     const controls = await load("/src/postgres-collection-controls.ts");
     const crypto = await load("/src/crypto.ts");
@@ -319,8 +312,8 @@ test("PostgreSQL 17 runs a full v1.1 upload cycle with Worker-equal rows, replay
 
     // ------------------------------------- composition (the lead's wiring) --
     const intake = createTelemetryV11OriginIntake({
-      adapters: { live, bearer, transport, ledgerAuthority, personalDevices, controls, crypto, boundedBody },
-      primaryPool, ledgerPool, schema, admissionEnv: {},
+      adapters: { live, bearer, transport, personalDevices, controls, crypto, boundedBody },
+      primaryPool, schema, admissionEnv: {},
       assertAdmissionBindings() {},
       async assertAttemptAllowed() {},
       maxRequestBytes: constants.MAX_REQUEST_BYTES,
@@ -921,9 +914,7 @@ test("PostgreSQL 17 runs a full v1.1 upload cycle with Worker-equal rows, replay
     assert.equal(await sourceEpoch(), 2);
   } finally {
     if (primaryCreated) await primaryPool.query(`DROP SCHEMA "${primarySchema}" CASCADE`);
-    if (ledgerCreated) await ledgerPool.query(`DROP SCHEMA "${ledgerSchema}" CASCADE`);
     await primaryPool.end();
-    await ledgerPool.end();
   }
 });
 
@@ -935,29 +926,24 @@ async function openSchemas(label, stagedFiles) {
     password: endpoint.password ?? "synthetic-local-only", ssl: false, max: 6, connectionTimeoutMillis: 5_000,
   };
   const primaryPool = new pg.Pool({ ...poolOptions, application_name: `pg-v11-${label}-primary-test` });
-  const ledgerPool = new pg.Pool({ ...poolOptions, application_name: `pg-v11-${label}-ledger-test` });
   const suffix = randomBytes(5).toString("hex");
-  const schema = Object.freeze({ primarySchema: `v11${label}_${suffix}`, ledgerSchema: `v11${label}_l_${suffix}` });
+  const schema = Object.freeze({ primarySchema: `v11${label}_${suffix}` });
   const created = [];
   const close = async () => {
     for (const [pool, name] of created.reverse()) await pool.query(`DROP SCHEMA "${name}" CASCADE`);
     await primaryPool.end();
-    await ledgerPool.end();
   };
   try {
     const server = await primaryPool.query("SELECT current_setting('server_version_num')::integer AS version");
     assert.equal(Math.floor(server.rows[0].version / 10_000), 17);
     await primaryPool.query(`CREATE SCHEMA "${schema.primarySchema}"`);
     created.push([primaryPool, schema.primarySchema]);
-    await ledgerPool.query(`CREATE SCHEMA "${schema.ledgerSchema}"`);
-    created.push([ledgerPool, schema.ledgerSchema]);
     await applyStockAndStagedMigrations({ role: "primary", schema: schema.primarySchema, pool: primaryPool, stagedFiles });
-    await applyPostgresMigrations({ role: "ledger", schema: schema.ledgerSchema, pool: ledgerPool });
   } catch (error) {
     await close();
     throw error;
   }
-  return { primaryPool, ledgerPool, schema, close };
+  return { primaryPool, schema, close };
 }
 
 async function loadModules() {
@@ -965,7 +951,6 @@ async function loadModules() {
     live: await load("/src/postgres-telemetry-v11-live-admission.ts"),
     bearer: await load("/src/postgres-device-bearer-auth.ts"),
     transport: await load("/src/postgres-typed-v12-transport.ts"),
-    ledgerAuthority: await load("/src/postgres-ledger-authority.ts"),
     controls: await load("/src/postgres-collection-controls.ts"),
     crypto: await load("/src/crypto.ts"),
     boundedBody: await load("/src/bounded-body.ts"),
@@ -1004,10 +989,10 @@ test("an accountless v1.1 owner negotiates successors, matches the Q-1 rows, and
     resolve(WORKER_ROOT, "postgres-test/fixtures/telemetry-v11-live-q1-owner-b-2026-09-30.json"), "utf8",
   ));
   assert.equal(ownerB.source.ownerKind, "accountless");
-  const { primaryPool, ledgerPool, schema, close } = await openSchemas("acct", [STAGED]);
+  const { primaryPool, schema, close } = await openSchemas("acct", [STAGED]);
   try {
     const modules = await loadModules();
-    const { live, bearer, transport, ledgerAuthority, controls, boundedBody, constants } = modules;
+    const { live, bearer, transport, controls, boundedBody, constants } = modules;
     const { primarySchema } = schema;
     await primaryPool.query(
       `UPDATE ${q(primarySchema, "collection_controls")}
@@ -1085,11 +1070,10 @@ test("an accountless v1.1 owner negotiates successors, matches the Q-1 rows, and
       async delete(key) { objects.delete(key); },
     };
     const deviceRouteDependencies = {
-      primaryPool, ledgerPool, schema, admissionEnv: {},
+      primaryPool, schema, admissionEnv: {},
       assertAdmissionBindings() {},
       async assertAttemptAllowed() {},
       authenticateDevice: (pool, header, routeOptions) => bearer.authenticatePostgresDeviceBearer(pool, header, routeOptions),
-      hasDeletionTombstone: ledgerAuthority.hasPostgresDeletionTombstone,
       assertCollectionControl: controls.assertPostgresCollectionControlFromPool,
       readBoundedRequestBody: boundedBody.readBoundedRequestBody,
       maxRequestBytes: constants.MAX_REQUEST_BYTES,

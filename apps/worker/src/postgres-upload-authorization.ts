@@ -142,9 +142,10 @@ async function assertAccountlessUploadAuthority(
  * Mint a purpose-bound, five-minute upload credential in PostgreSQL.
  *
  * This mirrors the D1 storage operation: callers must already have enforced
- * collection control, request policy, deletion-ledger tombstones, rate and
- * ingress budgets, device authentication, and the requested telemetry-format
- * authorization. The method rechecks current primary-schema device and
+ * collection control, request policy, rate and ingress budgets, device
+ * authentication, and the requested telemetry-format authorization. There is
+ * no deletion-ledger tombstone read: a deleted participant has no device to
+ * authenticate (decisions D2, D4 and D6). The method rechecks current primary-schema device and
  * participant authority transactionally before inserting the one-use grant.
  * Accountless issuance retains the shared v1.1 grant required by the generic
  * Worker transport; a v1.2 caller must also run the separate typed-v1.2

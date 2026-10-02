@@ -14,8 +14,8 @@ import { fileURLToPath } from "node:url";
 import { resolveAnalyticsRefreshDatabase } from "../cloud-run/analytics-refresh.mjs";
 import * as configuration from "../cloud-run/postgres-production-configuration.mjs";
 import * as migrations from "../cloud-run/postgres-production-migrations.mjs";
-import { TEST_MIGRATIONS_TARGETS } from "../cloud-run/test-migrations.mjs";
-import { GCP_PRIVATE_TEST_TARGET } from "./gcp-private-test-deploy.mjs";
+import { CLOUD_RUN_IAM_TEST_TARGET } from "../cloud-run/postgres-test-dispatch.mjs";
+import { GCP_PRIVATE_TEST_TARGET } from "./gcp-test-project.mjs";
 import { FASTPATH_TEST } from "./gcp-fastpath-test-deploy.mjs";
 import * as manifest from "./gcp-ops-infra-manifest.mjs";
 import * as rollout from "./gcp-production-rollout.mjs";
@@ -221,9 +221,9 @@ test("names of the test estate or a rehearsal are refused", () => {
     [(value) => { value.service.name = target.service; }, "DESIRED_STATE_TEST_TARGET_NAME:plane:service.name"],
     [(value) => { value.cloudSql.instance = "tibotattle-test-primary-20260922"; },
       "DESIRED_STATE_TEST_TARGET_NAME:plane:cloudSql.instance"],
-    [(value) => { value.cloudSql.schema = TEST_MIGRATIONS_TARGETS.primary.schema; },
+    [(value) => { value.cloudSql.schema = CLOUD_RUN_IAM_TEST_TARGET.postgres.primary.schema; },
       "DESIRED_STATE_TEST_TARGET_NAME:cloudSql.schema"],
-    [(value) => { value.cloudSql.database = TEST_MIGRATIONS_TARGETS.primary.database; },
+    [(value) => { value.cloudSql.database = CLOUD_RUN_IAM_TEST_TARGET.postgres.primary.database; },
       "DESIRED_STATE_TEST_TARGET_NAME:cloudSql.database"],
     [(value) => { value.jobs["analytics-refresh"].name = FASTPATH_TEST.refreshJob; },
       "DESIRED_STATE_TEST_TARGET_NAME:plane:jobs.analytics-refresh.name"],
@@ -464,7 +464,20 @@ test("the IAM-private service renders from EP-7's template with no deletion-ledg
   assert.equal(env.get("POSTGRES_IAM_USER").value, desired.cloudSql.runtimeIamUser);
   assert.equal(env.get("HOST_ORIGIN").value, "https://synthetic-origin-100000000001.us-east1.run.app");
   assert.equal(service.spec.template.metadata.annotations["autoscaling.knative.dev/maxScale"], "4");
-  assert.equal([...env.keys()].some((name) => /LEDGER|HISTORY_PROOF/u.test(name)), false);
+  assert.equal([...env.keys()].some((name) => /LEDGER|ERASURE_BUCKET_HISTORY_PROOF/u.test(name)), false);
+  // OD-2: the quarantine bucket's birth proof, rendered from the pinned
+  // desired-state proof for exactly this bucket.
+  assert.deepEqual(JSON.parse(env.get("GCS_QUARANTINE_BUCKET_HISTORY_PROOF").value), {
+    bucket: desired.bucket.name,
+    bucketGeneration: desired.bucket.proof.bucketGeneration,
+    bucketMetageneration: desired.bucket.proof.bucketMetageneration,
+    softDeleteRetentionDurationSeconds: "0",
+  });
+  assert.equal(env.get("GCS_QUARANTINE_BUCKET_HISTORY_PROOF").valueFrom, undefined);
+  // An unborn bucket (no pinned proof) cannot render a service.
+  assert.throws(() => manifest.renderService(manifest.validateDesiredState(fixture((value) => {
+    value.bucket.proof = null;
+  })), IMAGE), { code: "SERVICE_RENDER_BUCKET_PROOF_UNPINNED" });
   // The optional token's version is null: its entry is omitted.
   assert.equal(env.has("DISTRIBUTION_GITHUB_API_TOKEN"), false);
   const withToken = manifest.renderService(manifest.validateDesiredState(fixture((value) => {
@@ -504,6 +517,12 @@ test("the rendered service env is a production configuration CR-3 accepts, with 
       schema: desired.cloudSql.schema },
     iamUser: desired.cloudSql.runtimeIamUser,
     bucket: desired.bucket.name,
+    bucketHistoryProof: {
+      bucket: desired.bucket.name,
+      bucketGeneration: desired.bucket.proof.bucketGeneration,
+      bucketMetageneration: desired.bucket.proof.bucketMetageneration,
+      softDeleteRetentionDurationSeconds: "0",
+    },
   });
   assert.equal(config.edge.invokerServiceAccount, desired.serviceAccounts.edgeInvoker.email);
   assert.deepEqual(config.edge.verifierServiceAccounts, [desired.serviceAccounts.verifier.email]);

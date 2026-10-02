@@ -15,15 +15,14 @@ import {
 export interface PostgresWorkerBackendFoundation {
   readonly provider: "postgres";
   readonly applicationReady: false;
-  readonly schemas: Readonly<{ primary: string; ledger: string }>;
+  readonly schemas: Readonly<{ primary: string }>;
   readonly sourceIdentity: Readonly<{ sourceId: string; sourceNamespace: string }>;
-  readonly pools: Readonly<{ primary: PostgresPool; ledger: PostgresPool }>;
+  readonly pools: Readonly<{ primary: PostgresPool }>;
   readonly unsupportedContracts: typeof POSTGRES_UNSUPPORTED_CURRENT_MAIN_CONTRACTS;
 }
 
 export interface PostgresWorkerBackendOptions extends PostgresSourceIdentityOptions {
   readonly primaryPool: PostgresPool;
-  readonly ledgerPool: PostgresPool;
   readonly schemaOptions?: PostgresSchemaOptions;
 }
 
@@ -44,15 +43,17 @@ function assertPool(value: unknown): asserts value is PostgresPool {
 }
 
 /**
- * Validate explicit primary and deletion-ledger pools without connecting.
- * Callers may use this foundation for schema-only rehearsal; `applicationReady`
- * remains false until the current Worker route and storage contracts are ported.
+ * Validate the one explicit primary pool without connecting. There is no
+ * deletion-ledger pool (decisions D2, D4 and D6): a caller that still passes
+ * one fails closed. Callers may use this foundation for schema-only
+ * rehearsal; `applicationReady` remains false until the current Worker route
+ * and storage contracts are ported.
  */
 export function createPostgresWorkerBackend(
   options: PostgresWorkerBackendOptions,
 ): PostgresWorkerBackendFoundation {
   assertPool(options?.primaryPool);
-  assertPool(options?.ledgerPool);
+  if (Object.hasOwn(options, "ledgerPool")) throw new TypeError("POSTGRES_LEDGER_POOL_RETIRED");
   const schema = createPostgresSchemaConfig(options.schemaOptions ?? {});
   const sourceIdentity = createPostgresSourceIdentityConfig({
     sourceId: options.sourceId,
@@ -63,7 +64,6 @@ export function createPostgresWorkerBackend(
     applicationReady: false as const,
     schemas: Object.freeze({
       primary: schema.primarySchema,
-      ledger: schema.ledgerSchema,
     }),
     sourceIdentity: Object.freeze({
       sourceId: sourceIdentity.sourceId,
@@ -71,7 +71,6 @@ export function createPostgresWorkerBackend(
     }),
     pools: Object.freeze({
       primary: options.primaryPool,
-      ledger: options.ledgerPool,
     }),
     unsupportedContracts: POSTGRES_UNSUPPORTED_CURRENT_MAIN_CONTRACTS,
   });

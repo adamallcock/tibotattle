@@ -15,14 +15,17 @@ import { COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION } from "./telemetry-v1-source-se
  * (src/storage-community-authority.ts) over staged primary migration 0053.
  *
  * Every function runs on the caller's client, inside the caller's
- * transaction, and returns the Worker's own types so the publisher, reader,
- * graph and erasure ports compare pins with the Worker's pure predicates,
- * which are re-exported here rather than reimplemented. Failures keep the
- * Worker's contract: an unavailable or fenced authority is the plain
- * `STORAGE_COMMUNITY_AUTHORITY_UNAVAILABLE` error, an invalid collection
- * control row is `COLLECTION_CONTROL_UNAVAILABLE`, and a legacy terminal
- * without its explicit epoch floor is `BACKEND_STORAGE_UNAVAILABLE`. No
- * participant, digest or source identifier appears in an error.
+ * transaction, and returns the Worker's own types so the publisher, reader
+ * and graph ports compare pins with the Worker's pure predicates, which are
+ * re-exported here rather than reimplemented. Failures keep the Worker's
+ * contract: an unavailable authority is the plain
+ * `STORAGE_COMMUNITY_AUTHORITY_UNAVAILABLE` error and an invalid collection
+ * control row is `COLLECTION_CONTROL_UNAVAILABLE`. No participant, digest or
+ * source identifier appears in an error.
+ *
+ * There is no erasure fence, terminal watermark or retirement capture:
+ * decisions D1, D2 and D6 (2026-09-26) remove them, and primary 0064 drops
+ * the 0053 fences and watermarks that the terminal-epoch readers used.
  */
 
 export {
@@ -34,12 +37,6 @@ export {
 export type { StorageCommunityAuthority, StorageCommunityOwner };
 
 export interface CapturePostgresCommunityAuthorityOptions {
-  /**
-   * Retirement capture: cleanup must not depend on publication being enabled
-   * or the public-source bootstrap being complete. Build and read callers
-   * never pass it.
-   */
-  readonly retirement?: boolean;
   readonly sourceId?: string;
   readonly sourceNamespace?: string;
 }
@@ -57,7 +54,6 @@ export interface PostgresPublicSourceBootstrapProgress {
 }
 
 const HEX64 = /^[0-9a-f]{64}$/u;
-const TERMINAL_KINDS = "('owner-withdrawn','owner-erased')";
 
 const unavailable = (): Error => new Error("STORAGE_COMMUNITY_AUTHORITY_UNAVAILABLE");
 
@@ -145,10 +141,10 @@ interface AuthorityRow {
 /**
  * Capture the source-owned privacy and policy stamp (D1
  * captureStorageCommunityAuthority). `sequence` is the journal's MAX
- * sequence for the source, never the analytics delivery cursor. Outside
- * retirement it fails closed while publication is off or the public-source
- * bootstrap is incomplete, and the collection revision must equal the
- * separate controls read.
+ * sequence for the source, never the analytics delivery cursor. It fails
+ * closed while publication is off or the public-source bootstrap is
+ * incomplete, and the collection revision must equal the separate controls
+ * read.
  */
 export async function capturePostgresCommunityAuthority(
   client: PostgresClient,
@@ -156,9 +152,13 @@ export async function capturePostgresCommunityAuthority(
   options: CapturePostgresCommunityAuthorityOptions = {},
 ): Promise<StorageCommunityAuthority> {
   const quoted = schemaName(schema);
-  const retirement = options.retirement === true;
+  // The retirement capture that bypassed publication is retired with online
+  // erasure (decision D2); a caller still asking for it fails closed.
+  if (options === null || typeof options !== "object" || Object.hasOwn(options, "retirement")) {
+    throw unavailable();
+  }
   const controls = await readControls(client, quoted);
-  if (!retirement && !controls.publication) throw unavailable();
+  if (!controls.publication) throw unavailable();
   const selected = rows<AuthorityRow>(await client.query(
     `SELECT s.source_id,a.source_namespace,
             s.authority_epoch::text AS public_authority_epoch,i.policy_revision::text AS policy_revision,
@@ -171,12 +171,12 @@ export async function capturePostgresCommunityAuthority(
        JOIN ${quoted}.typed_v11_admission_state b ON b.id=1 AND b.runtime_contract_version=1
         AND b.source_namespace=a.source_namespace
        JOIN ${quoted}.publication_state i ON i.singleton=1
-       JOIN ${quoted}.collection_controls c ON c.singleton=1 AND ($1::boolean OR c.publication_enabled)
+       JOIN ${quoted}.collection_controls c ON c.singleton=1 AND c.publication_enabled
        JOIN ${quoted}.mutation_control m ON m.singleton_id=1
        JOIN ${quoted}.community_public_source_bootstrap p ON p.singleton=1
-        AND ($1::boolean OR p.completed=1) AND p.policy_version=$2
+        AND p.completed=1 AND p.policy_version=$1
       WHERE s.singleton=1`,
-    [retirement, COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION],
+    [COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION],
   ));
   const row = selected[0];
   if (selected.length !== 1 || row === undefined
@@ -250,62 +250,6 @@ export async function isPostgresCalculationAuthorityCurrent(
 function sourceIdentifier(sourceId: string): string {
   if (typeof sourceId !== "string" || sourceId.length < 1 || sourceId.length > 200) throw unavailable();
   return sourceId;
-}
-
-/**
- * Source-ahead containment (D1 readStorageCommunitySourceTerminalEpoch): the
- * highest public epoch of an owner-withdrawn or owner-erased journal row for
- * the source. A legacy (version-0) terminal carries no epoch; it is bounded
- * by the source's explicit legacy_terminal_floor_epoch and, without one,
- * fails closed with 503. Missing evidence is never read as epoch 0.
- */
-export async function readPostgresSourceTerminalEpoch(
-  client: PostgresClient,
-  schema: string,
-  sourceId: string,
-): Promise<number> {
-  const quoted = schemaName(schema);
-  const selected = rows<{ exact_epoch: unknown; legacy: unknown; floor: unknown }>(await client.query(
-    `SELECT COALESCE((SELECT max(change.public_authority_epoch) FROM ${quoted}.storage_ingestion_changes change
-                       WHERE change.source_id=$1 AND change.kind IN ${TERMINAL_KINDS}),0)::text AS exact_epoch,
-            EXISTS (SELECT 1 FROM ${quoted}.storage_ingestion_changes change
-                     WHERE change.source_id=$1 AND change.kind IN ${TERMINAL_KINDS}
-                       AND change.public_authority_epoch IS NULL) AS legacy,
-            (SELECT watermark.legacy_terminal_floor_epoch FROM ${quoted}.community_terminal_watermarks watermark
-              WHERE watermark.source_id=$1)::text AS floor`,
-    [sourceIdentifier(sourceId)],
-  ));
-  const row = selected[0];
-  if (selected.length !== 1 || row === undefined || typeof row.legacy !== "boolean") throw unavailable();
-  const exact = count(row.exact_epoch);
-  if (!row.legacy) return exact;
-  if (row.floor === null || row.floor === undefined) throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
-  return Math.max(exact, count(row.floor));
-}
-
-/**
- * Highest containment epoch this database has delivered or fenced (D1
- * readStorageCommunityDeliveredTerminalEpoch): the greater of the retained
- * exact terminal receipts in analytics_applied_events and 0053's watermark,
- * which the erasure fence raises in its own transaction and a D1 import
- * carries. Nothing delivered or fenced is 0.
- */
-export async function readPostgresDeliveredTerminalEpoch(
-  client: PostgresClient,
-  schema: string,
-  sourceId: string,
-): Promise<number> {
-  const quoted = schemaName(schema);
-  const selected = rows<{ epoch: unknown }>(await client.query(
-    `SELECT GREATEST(
-       COALESCE((SELECT watermark.terminal_public_authority_epoch FROM ${quoted}.community_terminal_watermarks watermark
-                  WHERE watermark.source_id=$1),0),
-       COALESCE((SELECT max(applied.public_authority_epoch) FROM ${quoted}.analytics_applied_events applied
-                  WHERE applied.source_id=$1 AND applied.kind IN ${TERMINAL_KINDS}),0))::text AS epoch`,
-    [sourceIdentifier(sourceId)],
-  ));
-  if (selected.length !== 1) throw unavailable();
-  return count(selected[0]?.epoch);
 }
 
 interface OwnerRow {

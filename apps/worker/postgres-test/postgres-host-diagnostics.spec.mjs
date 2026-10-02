@@ -114,7 +114,6 @@ async function withDiagnosticsSchema(operation) {
   });
   const suffix = randomBytes(6).toString("hex");
   const primarySchema = `host_diagnostics_primary_${suffix}`;
-  const ledgerSchema = `host_diagnostics_ledger_${suffix}`;
   let created = false;
   try {
     const server = await pool.query(
@@ -131,7 +130,7 @@ async function withDiagnosticsSchema(operation) {
     return await operation({
       pool,
       primarySchema,
-      schema: { primarySchema, ledgerSchema },
+      schema: { primarySchema },
       table: `"${primarySchema}"."diagnostic_error_events"`,
     });
   } finally {

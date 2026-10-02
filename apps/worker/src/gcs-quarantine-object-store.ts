@@ -1,5 +1,6 @@
 import {
   GcsErasureObjectStore,
+  createGcsErasureBucketHistoryProof,
   type GcsErasureAccessTokenProvider,
   type GcsErasureBucketHistoryProof,
   type GcsErasureFetch,
@@ -32,6 +33,27 @@ const encoder = new TextEncoder();
 
 export type GcsQuarantineAccessTokenProvider = GcsErasureAccessTokenProvider;
 export type GcsQuarantineFetch = GcsErasureFetch;
+
+/**
+ * Owner decision OD-2 (2026-10-02): the setting that carries the quarantine
+ * bucket's birth proof. Its value is the `proof` record of the OPS-2
+ * bucket-birth receipt (scripts/gcp-ops-bucket-birth.mjs), as the desired
+ * state pins it: exactly {bucket, bucketGeneration, bucketMetageneration,
+ * softDeleteRetentionDurationSeconds: "0"} as JSON. The store needs it on a
+ * bucket with soft delete disabled, where GCS answers the soft-deleted
+ * listing with HTTP 400: without a matching proof, upload-failure deletes and
+ * the health probe's head of a missing key cannot prove there is no retained
+ * history and fail closed.
+ */
+export const GCS_QUARANTINE_BUCKET_HISTORY_PROOF_SETTING = "GCS_QUARANTINE_BUCKET_HISTORY_PROOF" as const;
+export type GcsQuarantineBucketHistoryProof = GcsErasureBucketHistoryProof;
+const BUCKET_HISTORY_PROOF_KEYS = Object.freeze([
+  "bucket",
+  "bucketGeneration",
+  "bucketMetageneration",
+  "softDeleteRetentionDurationSeconds",
+]);
+const MAX_BUCKET_HISTORY_PROOF_BYTES = 1_024;
 
 function unavailable(): QuarantineObjectStorageUnavailableError {
   return new QuarantineObjectStorageUnavailableError();
@@ -240,9 +262,13 @@ export class GcsQuarantineObjectStore implements QuarantineObjectStore {
     accessToken: GcsQuarantineAccessTokenProvider,
     fetchImpl: GcsQuarantineFetch = (input, init) => fetch(input, init),
     timeoutMilliseconds = DEFAULT_TIMEOUT_MILLISECONDS,
-    historyProof?: GcsErasureBucketHistoryProof,
+    historyProof?: GcsQuarantineBucketHistoryProof,
   ) {
     bucketName(bucket);
+    // OD-2: the quarantine store always reads the bucket's birth proof. A
+    // composition without one is refused here instead of failing later on
+    // the first delete or head of a missing key.
+    if ((historyProof as unknown) === undefined || (historyProof as unknown) === null) throw unavailable();
     if (typeof accessToken !== "function" || typeof fetchImpl !== "function"
         || !Number.isSafeInteger(timeoutMilliseconds)
         || timeoutMilliseconds < 1 || timeoutMilliseconds > MAX_TIMEOUT_MILLISECONDS) {
@@ -254,7 +280,8 @@ export class GcsQuarantineObjectStore implements QuarantineObjectStore {
     this.timeoutMilliseconds = timeoutMilliseconds;
     // The quarantine contract requires retained-data-safe deletion. Reuse the
     // reviewed generation/history erasure path rather than silently issuing a
-    // key-only DELETE against a bucket whose retention policy is unknown.
+    // key-only DELETE against a bucket whose retention policy is unknown; the
+    // erasure store refuses a proof for any other bucket.
     this.erasure = new GcsErasureObjectStore(
       bucket,
       accessToken,
@@ -425,13 +452,41 @@ export class GcsQuarantineObjectStore implements QuarantineObjectStore {
   }
 }
 
+/**
+ * Parse GCS_QUARANTINE_BUCKET_HISTORY_PROOF for `bucket`: a closed JSON record
+ * (exactly the four proof keys, decimal generations, soft delete "0") whose
+ * bucket is `bucket`. Anything else, an older wrapper shape included, throws
+ * QuarantineObjectStorageUnavailableError; the value is never echoed.
+ */
+export function parseGcsQuarantineBucketHistoryProof(
+  raw: unknown,
+  bucket: string,
+): GcsQuarantineBucketHistoryProof {
+  bucketName(bucket);
+  if (typeof raw !== "string" || raw.length === 0 || utf8Length(raw) > MAX_BUCKET_HISTORY_PROOF_BYTES) {
+    throw unavailable();
+  }
+  let value: unknown;
+  try { value = JSON.parse(raw); } catch { throw unavailable(); }
+  if (!isRecord(value)
+      || Object.keys(value).sort().join(",") !== BUCKET_HISTORY_PROOF_KEYS.join(",")) throw unavailable();
+  let proof: GcsQuarantineBucketHistoryProof;
+  try {
+    proof = createGcsErasureBucketHistoryProof(value as unknown as GcsQuarantineBucketHistoryProof);
+  } catch {
+    throw unavailable();
+  }
+  if (proof.bucket !== bucket) throw unavailable();
+  return proof;
+}
+
 /** Factory kept parallel to the R2 adapter for composition roots. */
 export function createGcsQuarantineObjectStore(
   bucket: string,
   accessToken: GcsQuarantineAccessTokenProvider,
   fetchImpl?: GcsQuarantineFetch,
   timeoutMilliseconds?: number,
-  historyProof?: GcsErasureBucketHistoryProof,
+  historyProof?: GcsQuarantineBucketHistoryProof,
 ): QuarantineObjectStore {
   return new GcsQuarantineObjectStore(
     bucket,

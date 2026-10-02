@@ -98,6 +98,10 @@ const EXPECTED_PLAIN_ENV = Object.freeze({
   PRIMARY_SCHEMA: "${PRIMARY_SCHEMA}",
   POSTGRES_IAM_USER: "${POSTGRES_IAM_USER}",
   GCS_BUCKET_NAME: "${GCS_BUCKET_NAME}",
+  // OD-2 (2026-10-02): the quarantine bucket's birth proof, the OPS-2
+  // bucket-birth receipt's proof record for GCS_BUCKET_NAME.
+  GCS_QUARANTINE_BUCKET_HISTORY_PROOF: '{"bucket":"${GCS_BUCKET_NAME}","bucketGeneration":"${GCS_BUCKET_GENERATION}",'
+    + '"bucketMetageneration":"${GCS_BUCKET_METAGENERATION}","softDeleteRetentionDurationSeconds":"0"}',
 });
 
 // Secret version placeholders (SECRET_VERSION_<NAME>) join this set for each
@@ -108,6 +112,7 @@ const SERVICE_PLACEHOLDERS = Object.freeze([
   "EDGE_INVOKER_SA", "VERIFIER_SA", "MAX_INSTANCES",
   "TELEMETRY_STORAGE_NAMESPACE", "PRIMARY_INSTANCE_CONNECTION_NAME",
   "PRIMARY_DATABASE", "PRIMARY_SCHEMA", "POSTGRES_IAM_USER", "GCS_BUCKET_NAME",
+  "GCS_BUCKET_GENERATION", "GCS_BUCKET_METAGENERATION",
 ]);
 const IAM_PLACEHOLDERS = Object.freeze([
   "PROJECT", "REGION", "SERVICE", "EDGE_INVOKER_SA", "VERIFIER_SA",
@@ -699,6 +704,11 @@ const SERVICE_VALUE_GRAMMARS = Object.freeze({
   PRIMARY_SCHEMA: matches(POSTGRES_IDENTIFIER),
   POSTGRES_IAM_USER: (value) => serviceAccountEmail(`${value}${SERVICE_ACCOUNT_DOMAIN_SUFFIX}`),
   GCS_BUCKET_NAME: matches(/^[a-z0-9][a-z0-9_-]{1,61}[a-z0-9]$/u),
+  // A GCS generation: a positive decimal int64, as the bucket-birth receipt
+  // records it (src/gcs-erasure-object-store.ts generation()).
+  GCS_BUCKET_GENERATION: (value) => /^[1-9][0-9]{0,18}$/u.test(value) && BigInt(value) <= 9_223_372_036_854_775_807n,
+  GCS_BUCKET_METAGENERATION: (value) => /^[1-9][0-9]{0,18}$/u.test(value)
+    && BigInt(value) <= 9_223_372_036_854_775_807n,
   ...Object.fromEntries(REQUIRED_SECRET_NAMES.map((name) =>
     [`SECRET_VERSION_${name}`, matches(SECRET_VERSION)])),
   // An empty optional version omits that secret's entry.
@@ -828,6 +838,8 @@ const SYNTHETIC_SERVICE_VALUES = Object.freeze({
   PRIMARY_SCHEMA: "example_primary_schema",
   POSTGRES_IAM_USER: `example-runtime@${SYNTHETIC_PROJECT}.iam`,
   GCS_BUCKET_NAME: "example-origin-bucket",
+  GCS_BUCKET_GENERATION: "1700000000000001",
+  GCS_BUCKET_METAGENERATION: "1",
   ...Object.fromEntries([...REQUIRED_SECRET_NAMES, ...OPTIONAL_SECRET_NAMES].map((name, index) =>
     [`SECRET_VERSION_${name}`, String(index + 1)])),
 });
@@ -1187,16 +1199,18 @@ test("the service template holds placeholders only", () => {
     ["              value: '${SOURCE_COMMIT}'\n", `              value: '${"d".repeat(40)}'\n`,
       ["CONCRETE_IDENTIFIER_PRESENT:source-commit", "ENV_VALUE_INVALID:DEPLOYMENT_SOURCE_COMMIT",
         "PLACEHOLDER_MISSING:SOURCE_COMMIT"]],
+    // GCS_BUCKET_NAME also fills the quarantine birth proof (OD-2), so a
+    // doctored bucket entry leaves the placeholder present there.
     ["              value: '${GCS_BUCKET_NAME}'\n",
       `              value: '${CLOUD_RUN_IAM_TEST_TARGET.gcsBucket}'\n`,
-      ["CONCRETE_IDENTIFIER_PRESENT:test-target", "ENV_VALUE_INVALID:GCS_BUCKET_NAME",
-        "PLACEHOLDER_MISSING:GCS_BUCKET_NAME"]],
+      ["CONCRETE_IDENTIFIER_PRESENT:test-target", "ENV_VALUE_INVALID:GCS_BUCKET_NAME"]],
     ["              value: '${GCS_BUCKET_NAME}'\n", "              value: '${GCS_BUCKET}'\n",
-      ["ENV_VALUE_INVALID:GCS_BUCKET_NAME", "PLACEHOLDER_MISSING:GCS_BUCKET_NAME",
-        "PLACEHOLDER_UNKNOWN:GCS_BUCKET"]],
+      ["ENV_VALUE_INVALID:GCS_BUCKET_NAME", "PLACEHOLDER_UNKNOWN:GCS_BUCKET"]],
     ["              value: '${GCS_BUCKET_NAME}'\n", "              value: '$GCS_BUCKET_NAME'\n",
-      ["ENV_VALUE_INVALID:GCS_BUCKET_NAME", "PLACEHOLDER_MALFORMED",
-        "PLACEHOLDER_MISSING:GCS_BUCKET_NAME"]],
+      ["ENV_VALUE_INVALID:GCS_BUCKET_NAME", "PLACEHOLDER_MALFORMED"]],
+    ['"bucketGeneration":"${GCS_BUCKET_GENERATION}"', '"bucketGeneration":"1700000000000001"',
+      ["CONCRETE_IDENTIFIER_PRESENT:project-number", "ENV_VALUE_INVALID:GCS_QUARANTINE_BUCKET_HISTORY_PROOF",
+        "PLACEHOLDER_MISSING:GCS_BUCKET_GENERATION"]],
   ];
   for (const [search, replacement, expected] of cases) {
     assert.deepEqual(serviceTemplateFindings(doctor(SERVICE_TEXT, search, replacement)), expected,
@@ -1454,7 +1468,23 @@ test("one Cloud SQL instance and no deletion ledger: no LEDGER_ or history-proof
       { code: `RENDER_VALUE_UNUSED:${name}` }, name);
   }
   const rendered = renderServiceTemplate(SERVICE_TEXT, SYNTHETIC_SERVICE_VALUES);
-  assert.doesNotMatch(JSON.stringify(rendered), /LEDGER|HISTORY_PROOF/iu);
+  assert.doesNotMatch(JSON.stringify(rendered), /LEDGER|ERASURE_BUCKET_HISTORY_PROOF/iu);
+  // OD-2: the only history proof is the quarantine bucket's birth proof, a
+  // plain value for exactly the rendered bucket.
+  const renderedEnv = rendered.spec.template.spec.containers[0].env;
+  const proofs = renderedEnv.filter((entry) => /HISTORY_PROOF/u.test(entry.name));
+  assert.deepEqual(proofs.map((entry) => entry.name), ["GCS_QUARANTINE_BUCKET_HISTORY_PROOF"]);
+  assert.deepEqual(JSON.parse(proofs[0].value), {
+    bucket: SYNTHETIC_SERVICE_VALUES.GCS_BUCKET_NAME,
+    bucketGeneration: SYNTHETIC_SERVICE_VALUES.GCS_BUCKET_GENERATION,
+    bucketMetageneration: SYNTHETIC_SERVICE_VALUES.GCS_BUCKET_METAGENERATION,
+    softDeleteRetentionDurationSeconds: "0",
+  });
+  for (const [name, bad] of [["GCS_BUCKET_GENERATION", "0"], ["GCS_BUCKET_GENERATION", "01"],
+    ["GCS_BUCKET_METAGENERATION", "9223372036854775808"], ["GCS_BUCKET_METAGENERATION", "1\""]]) {
+    assert.throws(() => renderServiceTemplate(SERVICE_TEXT, { ...SYNTHETIC_SERVICE_VALUES, [name]: bad }),
+      (error) => /^RENDER_VALUE_(?:INVALID|UNSAFE):/u.test(error.code), `${name}=${bad}`);
+  }
   // The IAM template stays invoker-only for the edge account.
   assert.deepEqual(iamTemplateFindings(IAM_TEXT), []);
   assert.deepEqual(renderEdgeIamPolicy(IAM_TEXT, { ...SYNTHETIC_IAM_VALUES, VERIFIER_SA: "" }), {
