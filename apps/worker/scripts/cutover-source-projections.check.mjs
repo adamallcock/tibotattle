@@ -9,11 +9,13 @@ import {
   CUTOVER_PARTICIPANT_STATES,
   PARTICIPANT_DELETION_DIGEST_DOMAIN,
   assertNoSealedParticipantDeletionMatches,
+  countParticipantDeletionMatches,
   countSealedParticipantDeletionMatches,
   participantDeletionDigest,
   projectDeletionDigests,
   projectIngestionJournal,
   readDeletionDigestProjection,
+  readDeletionDigestsFromDatabase,
   readSealedDeletionDigests,
   readWorkerDeletionDigestDomain,
 } from "./cutover-source-projections.mjs";
@@ -230,6 +232,45 @@ test("a 'deleting' participant (an interrupted erasure) is hashed too: its recor
       digests: new Set(world.digests) }), isCode("CUTOVER_PROJECTION_INVALID"));
   } finally {
     unknownIngestion.close();
+  }
+});
+
+test("the database-level helpers behind the sealed forms are the ones the pre-fence quiescence check reads through", () => {
+  // They take an open database: the sealed forms verify the file around them,
+  // and cutover-quiescence-check.mjs calls them on an exported file.
+  const ledger = new DatabaseSync(":memory:");
+  const ingestion = new DatabaseSync(":memory:");
+  try {
+    assert.throws(() => readDeletionDigestsFromDatabase(ledger), isCode("CUTOVER_PROJECTION_INVALID"), "no tombstone table");
+    ledger.exec(`CREATE TABLE deletion_tombstones (participant_digest TEXT PRIMARY KEY NOT NULL)`);
+    const known = ["participant:00000000-0000-4000-8000-000000000001", "participant:00000000-0000-4000-8000-000000000002"]
+      .map(id => [id, participantDeletionDigest(id)]);
+    for (const [, digest] of known) ledger.prepare("INSERT INTO deletion_tombstones(participant_digest) VALUES (?)").run(digest);
+    assert.deepEqual(readDeletionDigestsFromDatabase(ledger), known.map(([, digest]) => digest).sort());
+    ledger.prepare("INSERT INTO deletion_tombstones(participant_digest) VALUES ('not-a-digest')").run();
+    assert.throws(() => readDeletionDigestsFromDatabase(ledger), isCode("CUTOVER_PROJECTION_INVALID"), "a malformed digest");
+
+    ingestion.exec("CREATE TABLE participants (id TEXT PRIMARY KEY NOT NULL, state TEXT NOT NULL)");
+    const insert = ingestion.prepare("INSERT INTO participants(id, state) VALUES (?, ?)");
+    insert.run(known[0][0], "deleting");
+    insert.run(known[1][0], "active");
+    insert.run("participant:00000000-0000-4000-8000-000000000003", "active");
+    const digests = new Set(known.map(([, digest]) => digest));
+    const matched = [];
+    const result = countParticipantDeletionMatches(ingestion, digests, { onMatch: id => matched.push(id) });
+    assert.deepEqual({ ...result, participantsByState: { ...result.participantsByState } },
+      { participants: 3, participantsByState: { active: 2, deleting: 1 }, deletionDigests: 2, matches: 2 });
+    assert.deepEqual(matched.sort(), known.map(([id]) => id).sort(), "onMatch sees exactly the matching ids");
+    assert.equal(countParticipantDeletionMatches(ingestion, new Set()).matches, 0);
+    for (const bad of [[...digests], new Set(["not-a-digest"]), undefined]) {
+      assert.throws(() => countParticipantDeletionMatches(ingestion, bad), isCode("CUTOVER_ARGUMENT_INVALID"));
+    }
+    assert.throws(() => countParticipantDeletionMatches(ingestion, digests, { onMatch: "x" }), isCode("CUTOVER_ARGUMENT_INVALID"));
+    insert.run("participant:00000000-0000-4000-8000-000000000004", "erased");
+    assert.throws(() => countParticipantDeletionMatches(ingestion, digests), isCode("CUTOVER_PROJECTION_INVALID"));
+  } finally {
+    ledger.close();
+    ingestion.close();
   }
 });
 

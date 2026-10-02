@@ -585,6 +585,18 @@ function assertIdentityLinkPin(database, pin) {
 }
 
 /**
+ * The participants PT-3 refuses, as SQL over the D1 `participants` table, in
+ * two disjuncts and their union. The read-only pre-fence quiescence check
+ * (cutover-quiescence-check.mjs, E-QUIESCE) imports these so that it finds,
+ * before the fence, exactly the rows this stage would refuse after the seal.
+ * Change them only here.
+ */
+export const PARTICIPANT_NOT_ACTIVE_PREDICATE = "state IS NOT 'active'";
+export const PARTICIPANT_DELETION_FENCED_PREDICATE = "deletion_session_id IS NOT NULL";
+export const PARTICIPANT_NOT_QUIESCENT_PREDICATE =
+  `${PARTICIPANT_NOT_ACTIVE_PREDICATE} OR ${PARTICIPANT_DELETION_FENCED_PREDICATE}`;
+
+/**
  * Erasure quiescence (PT-8): no sealed participant may be mid-erasure. A
  * 'deleting' row, or any row still carrying a deletion fence, is an
  * interrupted Cloudflare erasure whose tombstone may already be recorded.
@@ -593,7 +605,7 @@ function assertIdentityLinkPin(database, pin) {
  */
 function assertParticipantsQuiescent(database) {
   const [row] = sourceAll(database, `SELECT count(*) AS n FROM participants
-    WHERE state IS NOT 'active' OR deletion_session_id IS NOT NULL`, [], "participants");
+    WHERE ${PARTICIPANT_NOT_QUIESCENT_PREDICATE}`, [], "participants");
   if (row?.n !== 0n) fail("CUTOVER_PARTICIPANT_ERASURE_PENDING", { table: "participants" });
 }
 
