@@ -860,7 +860,8 @@ GCP work separate from the Cloudflare rollout still stands.
   the change unless P supersedes it.
 - **Export patches and the vendor path.** On `claude/gcp-fastpath-final` the
   generator's five `export` patches name `d43c8f92` line numbers and refuse
-  moved text. K-VENDOR (`claude/gcp-fp-v-tool`, unmerged; receipt
+  moved text. K-VENDOR (`claude/gcp-fp-v-tool`, merged only into the side
+  integration branch `claude/gcp-fp-int-b`; receipt
   [2026-10-02-gcp-k-vendor2](../receipts/2026-10-02-gcp-k-vendor2.md)) locates
   them by symbol, adds the `buildPricingEvent` patch, keeps one stable vendor
   path for every commit and generates the GCP-only vocabularies, so OAI-3
