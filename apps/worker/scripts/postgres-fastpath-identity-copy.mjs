@@ -1443,6 +1443,26 @@ export async function compareFastpathOwnerRevisions({ source, pool, targetSchema
 }
 
 // ---------------------------------------------------------------------------
+// Additive exports for the PT-3 production importer
+// (postgres-identity-authority-transfer.mjs): the reviewed table specs, the
+// column and table definition helpers and the canonical value conversions,
+// exactly as this module uses them. Nothing here reads these exports, so the
+// rehearsal copy, its allowlist pins and its CLI are unchanged.
+
+export const POSTGRES_FASTPATH_IDENTITY_TABLE_SPECS = TABLES;
+export const POSTGRES_FASTPATH_TRANSPORT_TABLE_SPECS = TRANSPORT_PARTS;
+export const POSTGRES_FASTPATH_IDENTITY_TARGET_TYPES = TARGET_TYPES;
+export const POSTGRES_FASTPATH_IDENTITY_CREDENTIAL_OMISSIONS = PARTICIPANT_CREDENTIAL_OMISSIONS;
+export const FASTPATH_IDENTITY_COMPLETED_WALK_RULE = COMPLETED_WALK_CURSORS_CLEARED;
+export {
+  c as fastpathIdentityColumn,
+  fromSource as fastpathIdentitySourceValue,
+  fromTarget as fastpathIdentityTargetValue,
+  t as fastpathIdentityTable,
+  targetExpression as fastpathIdentityTargetExpression,
+};
+
+// ---------------------------------------------------------------------------
 // CLI: node scripts/postgres-fastpath-identity-copy.mjs --sqlite <abs> --sha256 <hex>
 //   --schema <typed_legacy_transfer_rehearsal_target_*> [--omit-family <family>]...
 //   [--defer-public-owner-parity] [--expect-owner-roster <json>] [--receipt <abs json>]
