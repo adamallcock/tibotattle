@@ -495,6 +495,28 @@ edge into the seeded schema:
   and it grants only `insert_telemetry_v1_contribution`. It is recorded here,
   not fixed.
 
+### Redeploy from the fixed tooling (2026-10-02)
+
+Between 02:35 and 02:48 UTC on 2026-10-02 the orchestrator redeployed commit
+`d4ea418d` from a clean worktree with the owner's authorization, every step by
+the tooling and nothing by hand:
+
+| Step | Result |
+|---|---|
+| Build | image `sha256:832796e9dfd47970f6551756e0151b81a9c8365767b075429c6e63d33b02ecd9` |
+| Migrate and verify | execution `tibotattle-fastpath-test-migrate-xdkt9`, 28 s; 62 primary and 7 ledger migrations current in the pinned schemas |
+| Seed | a fresh schema, `typed_legacy_transfer_rehearsal_target_fastpath_7ea408a7`, 448 s; the seed ran the fixed grant routine from the checkout |
+| Refresh | execution `tibotattle-fastpath-test-analytics-refresh-cbrz8`, 102 s, `complete`: 4 owners, 680 owner-days, 2026-04-17 and 2026-04-18 blocked, as in the first deploy |
+| Origin | revision `00010-4rr`, edge-test mode. The bucket binding step found the binding already present (`added: false`), read it back and accepted it |
+| Live read tier | 11 rows passed, community digest `a27aee71…` (396,337 bytes) |
+| Live write tier | 22 rows passed, including the contribution (202) and the domain activation (201) |
+| Protected services | `tibotattle-test-app` and `tibotattle-test-oauth-gateway` unchanged |
+
+The write tier passing on a schema that no one granted by hand shows that
+defect 4's fix works when deployed. Defect 3's step was exercised only on an
+existing binding: it read the binding back and reused it, but did not create
+one.
+
 ### Gates for the commit that adds this section
 
 Local only, on the same workstation: Node 26.2.0 and the local PostgreSQL 17
