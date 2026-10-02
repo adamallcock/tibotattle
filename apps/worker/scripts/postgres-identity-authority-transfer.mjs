@@ -801,7 +801,9 @@ async function targetTableFacts(client, schema, item, keys = null) {
     ...spec.columns.map(column => `${fastpathIdentityTargetExpression(column)} AS ${quote(column.target)}`),
     ...keyColumns.map((column, index) => `${quote(column.target)} AS "__key_${index}"`),
   ].join(", ");
-  const order = keyColumns.map(column => `${quote(column.target)}${collate(column)}`).join(", ");
+  // Qualified by the row alias: an unqualified ORDER BY name would match the
+  // output alias first (a text projection), sorting integer keys as text.
+  const order = keyColumns.map(column => `target_row.${quote(column.target)}${collate(column)}`).join(", ");
   const restrictionValues = keys === null ? [] : [keys];
   const restriction = keys === null ? [] : [`${quote(spec.key[0])} = ANY($1::text[])`];
   const digest = createRowsDigest();
@@ -817,7 +819,7 @@ async function targetTableFacts(client, schema, item, keys = null) {
       values.push(...after);
     }
     const where = conditions.length === 0 ? "" : ` WHERE ${conditions.join(" AND ")}`;
-    const result = await q(client, `SELECT ${list} FROM ${quote(schema)}.${quote(spec.name)}${where}
+    const result = await q(client, `SELECT ${list} FROM ${quote(schema)}.${quote(spec.name)} target_row${where}
       ORDER BY ${order} LIMIT ${TARGET_PAGE_ROWS}`, values, spec.name);
     for (const row of result.rows) {
       digest.update(spec.columns.map(column => fastpathIdentityTargetValue(column.type, row[column.target], spec.name, column.target)));
