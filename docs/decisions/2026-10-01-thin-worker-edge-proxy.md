@@ -2,20 +2,20 @@
 title: Thin Worker edge proxy in front of the Google Cloud origin
 date: 2026-10-01
 type: decision-record
-status: proposed
+status: accepted
 ---
 
 # Thin Worker edge proxy in front of the Google Cloud origin
 
-> **Proposed, owner sign-off pending.** It becomes accepted only when the owner
-> approves this text in chat. It changes no current Cloudflare behavior. It
-> authorizes no deploy, secret change, writer fence, GCP write or cutover, and
-> it makes no production-readiness claim. It contains no identifiers, tokens or
-> session content.
+> **Accepted.** The owner approved this text as written in chat on 2026-10-02.
+> It changes no current Cloudflare behavior. It authorizes no deploy, secret
+> change, writer fence, GCP write or cutover, and it makes no
+> production-readiness claim. It contains no identifiers, tokens or session
+> content.
 
 | Field | Value |
 |---|---|
-| Status | Proposed; owner sign-off pending |
+| Status | Accepted; the owner approved this text as written in chat on 2026-10-02 |
 | Recorded | 2026-10-01, for the GCP fast path (planning item E11, which supersedes the EP-11 brief) |
 | Applies to | The production Worker as a thin edge, and the Google Cloud origin behind it, from an owner-authorized cutover |
 | Does not apply to | Current Cloudflare production before the first edge deploy, local analysis and the desktop clients |
@@ -606,6 +606,12 @@ the matrix on the live state itself. `assertEdgeModeTransition` adds the
 history condition for fenced to worker. Worker mode is also refused on any live
 state that only a gcp deploy produces, or that lacks the ingestion database.
 
+The rollback policy after the switch is settled (checklist OWN-10, 2026-10-02):
+the brake in the table is the only way back, followed by a fix forward. Rolling
+back to the Worker is allowed only before the switch (fenced to worker). There
+is no authority-write-free window and no flag; a rollback window would need a
+new owner decision and a reviewed matrix change.
+
 ## 11. Identity split and the contract-blob rule
 
 - **Edge identity** is always the Cloudflare active deployment: exactly one
@@ -745,7 +751,6 @@ These are deliberate and accepted with this record:
 
 ## 15. Open owner choices this record does not settle
 
-- Approving this text.
 - OD-E1: the production release line that carries the edge port and E10. It
   must contain `d43c8f92`; merging GitHub `main` first brings its typed
   reconciliation.
@@ -767,9 +772,6 @@ These are deliberate and accepted with this record:
   from the `tibotattle.com` zone and records the result, together with the
   privacy-page text it supports (section 12). A failure reopens option A (a
   Cloudflare-proxied hostname) and option B (accept and disclose).
-- The rollback policy after the switch. Gcp to worker is forbidden by the
-  matrix; a rollback window would need its own owner decision and a reviewed
-  matrix change.
 - The HMAC fallback, only if organization policy forbids service-account keys.
 
 ## 16. Documentation owed at the cutover
@@ -787,11 +789,11 @@ These are integration checklist entries, not part of this record:
 
 ## Sign-off
 
-- [ ] The owner approved this text in chat.
+- [x] The owner approved this text in chat, as written, on 2026-10-02.
 
 ## Evidence boundary
 
-This record is a proposed decision text. It is not a deployment receipt.
+This record is an accepted decision text. It is not a deployment receipt.
 Implementation, local tests, the local end-to-end proof, a staging rehearsal,
 the optional live check, the writer fence, the production cutover and public
 deployment are separate gates, and this document proves none of them.
