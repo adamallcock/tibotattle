@@ -20,6 +20,7 @@ import {
   ANALYTICS_V2_HISTORY_SEGMENT_DAYS,
   ANALYTICS_V2_MEMORY_MODEL,
   analyticsV2HistorySegments,
+  analyticsV2OutputBudget,
   analyticsV2OutputRowBytes,
   analyticsV2OwnerMemoryEstimate,
   validAnalyticsV2Resources,
@@ -716,6 +717,8 @@ describe("computeAnalyticsV2 (A-2)", () => {
     }
     expect(outputs.resources!.configuration).toMatchObject({ outputModel: "analytics-v2-output-model-v1",
       outputBudgetBytes: ANALYTICS_V2_DEFAULT_RESOURCES.outputBudgetBytes });
+    // Without reclaim the account is held to the configured output budget.
+    expect(account.outputBudgetBytes).toBe(ANALYTICS_V2_DEFAULT_RESOURCES.outputBudgetBytes);
     expect(account.accountBytes).toBeGreaterThan(1_048_576);
 
     // The budget is an exact bound: at the account it completes, one byte
@@ -724,13 +727,38 @@ describe("computeAnalyticsV2 (A-2)", () => {
       resources: { ...ANALYTICS_V2_DEFAULT_RESOURCES, outputBudgetBytes: account.accountBytes } });
     const withoutBudget = (value: AnalyticsV2ComputeOutputs) => {
       const { timings: _timings, resources, ...rest } = value;
-      return sha(canonicalJson({ ...rest, owners: resources!.owners, account: resources!.account }));
+      const { outputBudgetBytes: _budget, ...charged } = resources!.account;
+      return sha(canonicalJson({ ...rest, owners: resources!.owners, account: charged }));
     };
     expect(withoutBudget(exact)).toBe(withoutBudget(outputs));
+    expect(exact.resources!.account.outputBudgetBytes).toBe(account.accountBytes);
     const refused = computeAnalyticsV2({ ...input,
       resources: { ...ANALYTICS_V2_DEFAULT_RESOURCES, outputBudgetBytes: account.accountBytes - 1 } });
     await expect(refused).rejects.toMatchObject({ code: "ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED",
       accountBytes: account.accountBytes, outputBudgetBytes: account.accountBytes - 1 });
+
+    // Reclaim (the Job's heap partition): the output budget also takes the
+    // part of the per-owner budget the largest admitted estimate leaves, fixed
+    // by the plan. A configured output budget the account outgrows then
+    // completes, with the same outputs and account.
+    const largestAdmitted = Math.max(...outputs.resources!.owners.filter((entry) => entry.admitted)
+      .map((entry) => entry.estimateBytes));
+    const minimal = { ...ANALYTICS_V2_DEFAULT_RESOURCES, outputBudgetBytes: 1_048_576 };
+    await expect(computeAnalyticsV2({ ...input, resources: minimal })).rejects.toMatchObject({
+      code: "ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED", outputBudgetBytes: 1_048_576 });
+    const reclaimed = await computeAnalyticsV2({ ...input, resources: minimal, reclaimUnusedOwnerBudget: true });
+    expect(withoutBudget(reclaimed)).toBe(withoutBudget(outputs));
+    expect(reclaimed.resources!.account.outputBudgetBytes)
+      .toBe(1_048_576 + ANALYTICS_V2_DEFAULT_RESOURCES.memoryBudgetBytes - largestAdmitted);
+    expect(reclaimed.resources!.configuration.outputBudgetBytes).toBe(1_048_576);
+    // An explicit false is the default; anything but a boolean is refused.
+    const unreclaimed = await computeAnalyticsV2({ ...input, reclaimUnusedOwnerBudget: false });
+    expect(unreclaimed.resources!.account).toEqual(account);
+    for (const value of [1, "true", null]) {
+      await expect(computeAnalyticsV2({ ...input,
+        reclaimUnusedOwnerBudget: value as unknown as boolean })).rejects.toThrow(
+        "ANALYTICS_V2_INPUT_INVALID:reclaimUnusedOwnerBudget");
+    }
   }, 240_000);
 
   it("(checkpoints) reports the plan and progress, and a throwing checkpoint ends the run", async () => {
@@ -762,6 +790,15 @@ describe("computeAnalyticsV2 (A-2)", () => {
     expect(analyticsV2HistorySegments(addDays(TODAY, -176), addDays(TODAY, -169)).length).toBe(1);
     expect(events.filter((event) => event.kind === "segment").length).toBe(3 * 2);
     expect(events.filter((event) => event.kind === "model").length).toBe(3 * ANALYTICS_V2_MODEL_DATES);
+    // One scalar checkpoint per computed owner, after its segments and before its first model date.
+    expect(events.filter((event) => event.kind === "scalar").length).toBe(3);
+    const kinds = events.map((event) => event.kind);
+    for (const [index, kind] of kinds.entries()) {
+      if (kind === "scalar") {
+        expect(kinds[index - 1]).toBe("segment");
+        expect(kinds[index + 1]).toBe("model");
+      }
+    }
     expect(events.at(-1)).toEqual({ kind: "community", accountBytes: outputs.resources!.account.accountBytes });
     // accountBytes never decreases.
     const accounts = events.slice(1).map((event) => event.accountBytes as number);
@@ -889,6 +926,21 @@ describe("computeAnalyticsV2 (A-2)", () => {
       { ...ANALYTICS_V2_DEFAULT_RESOURCES, extra: 1 },
     ]) {
       expect(() => validAnalyticsV2Resources(resources)).toThrow("ANALYTICS_V2_INPUT_INVALID:resources");
+    }
+    // The output budget: the configured one, or with reclaim that plus the
+    // per-owner budget the largest admitted estimate leaves (all of it when
+    // none is admitted). The estimate must be an admissible one.
+    const budget = ANALYTICS_V2_DEFAULT_RESOURCES.memoryBudgetBytes;
+    const output = ANALYTICS_V2_DEFAULT_RESOURCES.outputBudgetBytes;
+    expect(analyticsV2OutputBudget(ANALYTICS_V2_DEFAULT_RESOURCES, 600 * 1_048_576, false)).toBe(output);
+    expect(analyticsV2OutputBudget(ANALYTICS_V2_DEFAULT_RESOURCES, 600 * 1_048_576, true))
+      .toBe(output + budget - 600 * 1_048_576);
+    expect(analyticsV2OutputBudget(ANALYTICS_V2_DEFAULT_RESOURCES, 0, true)).toBe(output + budget);
+    expect(analyticsV2OutputBudget(ANALYTICS_V2_DEFAULT_RESOURCES, budget, true)).toBe(output);
+    for (const [estimate, reclaim] of [[budget + 1, true], [-1, true], [1.5, true], [Number.NaN, false],
+      [0, 1]] as const) {
+      expect(() => analyticsV2OutputBudget(ANALYTICS_V2_DEFAULT_RESOURCES, estimate, reclaim as unknown as boolean))
+        .toThrow("ANALYTICS_V2_INPUT_INVALID:outputBudget");
     }
     // The defaults: an 8 GiB task with a 6,144 MiB heap.
     expect(ANALYTICS_V2_DEFAULT_RESOURCES).toEqual({ memoryBudgetBytes: 4_608 * 1_048_576, maxDayOccurrences: 250_000,

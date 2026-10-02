@@ -29,7 +29,9 @@
  *   (ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED) the moment the account exceeds the
  *   budget. The Job derives the budget from its heap limit (the heap left
  *   after the per-owner budget, the read reserve and the runtime reserve), so
- *   no fixed reserve stands in for the outputs.
+ *   no fixed reserve stands in for the outputs, and lets the run reclaim the
+ *   part of the per-owner budget that its largest admitted owner's estimate
+ *   leaves (analyticsV2OutputBudget).
  *
  * Bounded history (memory model v2): the days before the analysis horizon
  * (the cache history, back to the first evidence day) are loaded and reduced
@@ -66,7 +68,11 @@ export interface AnalyticsV2DayLimits {
 export interface AnalyticsV2Resources extends AnalyticsV2DayLimits {
   /** Largest per-owner memory estimate the run computes; larger owners are refused. */
   readonly memoryBudgetBytes: number;
-  /** Largest output account the run holds until its write; beyond it the run is refused. */
+  /**
+   * Largest output account the run holds until its write; beyond it the run
+   * is refused. A run that reclaims the unused per-owner budget
+   * (analyticsV2OutputBudget) adds that part to it.
+   */
   readonly outputBudgetBytes: number;
 }
 
@@ -299,4 +305,30 @@ export function analyticsV2HeldOccurrenceBytes(counts: AnalyticsV2DayEvidence): 
   return validCount(counts.usage) * model.heldBytesPerOccurrence.usage
     + validCount(counts.quota) * model.heldBytesPerOccurrence.quota
     + validCount(counts.session) * model.heldBytesPerOccurrence.session;
+}
+
+/**
+ * The run's output budget (compute.ts), fixed by the plan before any output
+ * is charged. Without reclaim it is resources.outputBudgetBytes. With reclaim
+ * (the Job, whose heap partition reserves resources.memoryBudgetBytes for one
+ * owner at a time beside the output budget) it also takes the part of that
+ * reservation the largest admitted owner's estimate leaves:
+ *
+ *   outputBudgetBytes + memoryBudgetBytes - largest admitted estimate
+ *
+ * (all of memoryBudgetBytes when no owner is admitted). An owner is admitted
+ * only when its estimate is at most memoryBudgetBytes, and only one owner is
+ * held at a time, so the heap bound is unchanged: the largest admitted
+ * estimate plus the output budget is the budget plus the configured output
+ * budget. The reclaim relies on the estimate as each owner's bound, as
+ * admission itself does.
+ */
+export function analyticsV2OutputBudget(resources: AnalyticsV2Resources, largestAdmittedEstimateBytes: number,
+  reclaim: boolean): number {
+  if (!Number.isSafeInteger(largestAdmittedEstimateBytes) || largestAdmittedEstimateBytes < 0
+    || largestAdmittedEstimateBytes > resources.memoryBudgetBytes || typeof reclaim !== "boolean") {
+    throw new TypeError("ANALYTICS_V2_INPUT_INVALID:outputBudget");
+  }
+  return reclaim ? resources.outputBudgetBytes + resources.memoryBudgetBytes - largestAdmittedEstimateBytes
+    : resources.outputBudgetBytes;
 }

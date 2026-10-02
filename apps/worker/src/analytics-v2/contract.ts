@@ -381,11 +381,16 @@ export interface AnalyticsV2OwnerResources {
 /**
  * analytics_v2_runs.timings.account: the run's output account when compute
  * finished. heldInputBytes is the non-effective owners' held queued-day
- * occurrences; accountBytes is everything charged (it includes them).
+ * occurrences; accountBytes is everything charged (it includes them);
+ * outputBudgetBytes is the budget the account was held to: the configured
+ * output budget, or, when the run reclaimed the unused per-owner budget,
+ * that plus the memory budget less the largest admitted estimate
+ * (resources.ts analyticsV2OutputBudget).
  */
 export interface AnalyticsV2OutputAccount {
   readonly heldInputBytes: number;
   readonly accountBytes: number;
+  readonly outputBudgetBytes: number;
 }
 
 export interface AnalyticsV2RunResources {

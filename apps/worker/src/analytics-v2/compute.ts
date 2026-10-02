@@ -103,13 +103,18 @@
  * - Output account: every output row (owner-day, cache band, fits, model
  *   date, refusal) and every held non-effective occurrence is charged to the
  *   run's output account as it is produced (resources.ts
- *   ANALYTICS_V2_OUTPUT_MODEL). The moment the account exceeds
- *   resources.outputBudgetBytes the run fails with
- *   ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED and nothing is written.
+ *   ANALYTICS_V2_OUTPUT_MODEL). The moment the account exceeds the run's
+ *   output budget the run fails with ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED and
+ *   nothing is written. The output budget is resources.outputBudgetBytes;
+ *   with `reclaimUnusedOwnerBudget` (the Job's heap partition) it also takes
+ *   the part of resources.memoryBudgetBytes that the largest admitted owner's
+ *   estimate leaves, which the plan fixes before any output is charged
+ *   (resources.ts analyticsV2OutputBudget).
  * - Checkpoints: `checkpoint`, when given, is called with the run plan before
- *   the first owner, at each effective owner, each segment load and each model
- *   date, and before the community fold. It may throw (the Job's time guard);
- *   the error ends the run and nothing is written.
+ *   the first owner, at each effective owner, each segment load, before the
+ *   owner's scalar fit and at each model date, and before the community fold.
+ *   It may throw (the Job's time guard); the error ends the run and nothing is
+ *   written.
  *
  * Daily candidates are stamped with the revision a first publication gets
  * (revisionSeed + 1) and releasedAt = nowMs. `payloadSha256` identifies the
@@ -177,6 +182,7 @@ import {
   ANALYTICS_V2_OUTPUT_MODEL,
   analyticsV2HeldOccurrenceBytes,
   analyticsV2HistorySegments,
+  analyticsV2OutputBudget,
   analyticsV2OutputRowBytes,
   analyticsV2OwnerMemoryEstimate,
   validAnalyticsV2Resources,
@@ -277,14 +283,23 @@ export interface ComputeAnalyticsV2Input {
   /** Budget and day backstop (resources.ts); defaults to ANALYTICS_V2_DEFAULT_RESOURCES. */
   readonly resources?: AnalyticsV2Resources;
   /**
+   * True when `resources` partition one heap (the Job: the per-owner budget is
+   * reserved for one owner at a time beside the output budget). The run's
+   * output budget then also takes the part of resources.memoryBudgetBytes
+   * that the largest admitted owner's estimate leaves (resources.ts
+   * analyticsV2OutputBudget). Defaults to false: the output budget is
+   * resources.outputBudgetBytes.
+   */
+  readonly reclaimUnusedOwnerBudget?: boolean;
+  /**
    * Heap bytes in use, sampled while an owner is computed and recorded as its
    * heapPeakBytes. Operational metadata only: no decision reads it.
    */
   readonly memoryProbe?: () => number;
   /**
    * Progress hook (the Job's time guard). Called with the plan before the
-   * first owner, then at each effective owner, segment load and model date,
-   * and before the community fold. Anything it throws ends the run.
+   * first owner, then at each effective owner, segment load, scalar fit and
+   * model date, and before the community fold. Anything it throws ends the run.
    */
   readonly checkpoint?: (event: AnalyticsV2Checkpoint) => void;
 }
@@ -304,12 +319,13 @@ export type AnalyticsV2Checkpoint =
   | { readonly kind: "owner"; readonly index: number; readonly ownerDigest: AnalyticsV2OwnerDigest;
     readonly accountBytes: number }
   | { readonly kind: "segment"; readonly index: number; readonly occurrences: number; readonly accountBytes: number }
+  | { readonly kind: "scalar"; readonly accountBytes: number }
   | { readonly kind: "model"; readonly index: number; readonly accountBytes: number }
   | { readonly kind: "community"; readonly accountBytes: number };
 
 /**
- * The run's output account exceeded resources.outputBudgetBytes: a closed run
- * refusal (nothing is written), with content-free byte figures only.
+ * The run's output account exceeded its output budget: a closed run refusal
+ * (nothing is written), with content-free byte figures only.
  */
 export class AnalyticsV2OutputBudgetExceeded extends Error {
   readonly code = "ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED" as const;
@@ -551,6 +567,9 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
   if ((loader === undefined) !== (input.ownerEvidence === undefined)) invalid("ownerEvidence");
   if (input.memoryProbe !== undefined && typeof input.memoryProbe !== "function") invalid("memoryProbe");
   if (input.checkpoint !== undefined && typeof input.checkpoint !== "function") invalid("checkpoint");
+  if (input.reclaimUnusedOwnerBudget !== undefined && typeof input.reclaimUnusedOwnerBudget !== "boolean") {
+    invalid("reclaimUnusedOwnerBudget");
+  }
   const checkpoint = input.checkpoint ?? ((): void => {});
   const ownerSet = new Set(owners.map((owner) => owner.ownerDigest));
   const effectiveDigests = owners.filter((owner) => owner.source === "effective").map((owner) => owner.ownerDigest);
@@ -650,15 +669,33 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
     ...daysBetween(addDays(cacheFromDay, -CACHE_LOOKBACK_DAYS), today), ...queued])].sort();
   const neededSet = new Set(neededDays);
 
+  // ---- The plan: the memory guard is a pure function of the evidence counts
+  // on the days this run uses, so a wider read never moves a decision. (The
+  // Job reads exactly those days, give or take queued days after today.)
+  const plan = new Map<AnalyticsV2OwnerDigest, ReturnType<typeof analyticsV2OwnerMemoryEstimate>>();
+  for (const ownerDigest of effectiveDigests) {
+    plan.set(ownerDigest, analyticsV2OwnerMemoryEstimate(
+      new Map([...evidenceByOwner.get(ownerDigest)!].filter(([day]) => neededSet.has(day))), analysisFrom, today));
+  }
+  const admittedOwner = (estimate: ReturnType<typeof analyticsV2OwnerMemoryEstimate>): boolean =>
+    estimate.estimateBytes <= resources.memoryBudgetBytes
+      && estimate.maxDayOccurrences <= ANALYTICS_V2_MAX_READ_DAY_OCCURRENCES;
+
   // ---- The output account: every held output row, and the non-effective
-  // owners' held occurrences, against the output budget.
+  // owners' held occurrences, against the output budget. The plan fixes the
+  // budget before anything is charged: the largest admitted estimate is the
+  // most of the per-owner reservation any owner of this run can use.
+  const largestAdmittedEstimateBytes = [...plan.values()].filter(admittedOwner)
+    .reduce((largest, estimate) => Math.max(largest, estimate.estimateBytes), 0);
+  const outputBudgetBytes = analyticsV2OutputBudget(resources, largestAdmittedEstimateBytes,
+    input.reclaimUnusedOwnerBudget === true);
   let accountBytes = 0;
   let ownerOutputBytes = 0;
   const charge = (bytes: number): void => {
     accountBytes += bytes;
     ownerOutputBytes += bytes;
-    if (accountBytes > resources.outputBudgetBytes) {
-      throw new AnalyticsV2OutputBudgetExceeded(accountBytes, resources.outputBudgetBytes);
+    if (accountBytes > outputBudgetBytes) {
+      throw new AnalyticsV2OutputBudgetExceeded(accountBytes, outputBudgetBytes);
     }
   };
   const chargeRow = (row: unknown): void => charge(analyticsV2OutputRowBytes(row));
@@ -671,18 +708,6 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
     refusals.push(refusal);
     chargeRow(refusal);
   };
-
-  // ---- The plan: the memory guard is a pure function of the evidence counts
-  // on the days this run uses, so a wider read never moves a decision. (The
-  // Job reads exactly those days, give or take queued days after today.)
-  const plan = new Map<AnalyticsV2OwnerDigest, ReturnType<typeof analyticsV2OwnerMemoryEstimate>>();
-  for (const ownerDigest of effectiveDigests) {
-    plan.set(ownerDigest, analyticsV2OwnerMemoryEstimate(
-      new Map([...evidenceByOwner.get(ownerDigest)!].filter(([day]) => neededSet.has(day))), analysisFrom, today));
-  }
-  const admittedOwner = (estimate: ReturnType<typeof analyticsV2OwnerMemoryEstimate>): boolean =>
-    estimate.estimateBytes <= resources.memoryBudgetBytes
-      && estimate.maxDayOccurrences <= ANALYTICS_V2_MAX_READ_DAY_OCCURRENCES;
   checkpoint(Object.freeze({ kind: "plan", owners: Object.freeze(owners.filter((owner) => owner.source === "effective")
     .map((owner) => {
       const estimate = plan.get(owner.ownerDigest)!;
@@ -855,6 +880,7 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
     const quotaOccurrences = (day: AnalyticsV2Day) => (occurrences.get(day) ?? EMPTY_DAY_OCCURRENCES).quota;
 
     // ---- Current scalar fits: today only.
+    checkpoint(Object.freeze({ kind: "scalar", accountBytes }));
     await timed("scalar", async () => {
       let result: Awaited<ReturnType<typeof evaluateAnalyticsV2ScalarDate>>;
       try {
@@ -983,7 +1009,7 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
       configuration: Object.freeze({ memoryModel: ANALYTICS_V2_MEMORY_MODEL.version,
         outputModel: ANALYTICS_V2_OUTPUT_MODEL.version, ...resources }),
       owners: Object.freeze(ownerResources),
-      account: Object.freeze({ heldInputBytes, accountBytes }),
+      account: Object.freeze({ heldInputBytes, accountBytes, outputBudgetBytes }),
     }),
   };
 }

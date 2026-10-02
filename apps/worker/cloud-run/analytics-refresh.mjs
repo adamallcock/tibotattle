@@ -41,18 +41,27 @@
  * (ANALYTICS_REFRESH_PRODUCTION_ENV): ANALYTICS_REFRESH_TARGET,
  * PRIMARY_INSTANCE_CONNECTION_NAME, PRIMARY_DATABASE, PRIMARY_SCHEMA,
  * POSTGRES_IAM_USER and ANALYTICS_V2_MEMORY_BUDGET_MIB. Any other variable in
- * the job's configuration namespaces (ANALYTICS_, PRIMARY_, POSTGRES_, PG_,
- * LEDGER_), every variable postgres-production-configuration.mjs (CR-3)
- * refuses in production (its test seams, edge secrets, the retired ledger
- * settings), ANALYTICS_V2_TEST_CLOCK and GOOGLE_APPLICATION_CREDENTIALS are
- * refused, as are a test or rehearsal target (the IAM test and fast-path
- * resources, a test or rehearsal schema, database, instance or job) and a
- * resource carrying the other plane's marker (CR-3's convention: a staging
- * resource carries 'staging' and never 'production'; a production one never
- * carries 'staging'). Platform variables Cloud Run sets (CLOUD_RUN_*, K_*,
- * PATH, HOME and so on) are outside these namespaces and are not read, except
- * the Cloud Run job context: CLOUD_RUN_JOB, one task (CLOUD_RUN_TASK_INDEX=0,
- * CLOUD_RUN_TASK_COUNT=1) and no K_SERVICE.
+ * the job's configuration namespaces (ANALYTICS_, PRIMARY_, POSTGRES_, LEDGER_,
+ * and PG, which also covers every libpq-style variable node-pg reads, such as
+ * PGOPTIONS, PGSSLMODE or PGPASSWORD), the Node runtime variables that change
+ * the code loaded, the database driver or TLS trust
+ * (ANALYTICS_REFRESH_RUNTIME_FORBIDDEN: NODE_OPTIONS, NODE_PG_FORCE_NATIVE,
+ * NODE_TLS_REJECT_UNAUTHORIZED, NODE_EXTRA_CA_CERTS), every variable
+ * postgres-production-configuration.mjs (CR-3) refuses in production (its
+ * test seams, edge secrets, the retired ledger settings),
+ * ANALYTICS_V2_TEST_CLOCK and GOOGLE_APPLICATION_CREDENTIALS are refused, as
+ * are a test or rehearsal target (the IAM test and fast-path resources, a test
+ * or rehearsal schema, database, instance or job) and a resource carrying the
+ * other plane's marker (CR-3's convention: a staging resource carries
+ * 'staging' and never 'production'; a production one never carries
+ * 'staging'). The job's own code reads nothing else except the Cloud Run job
+ * context: CLOUD_RUN_JOB, one task (CLOUD_RUN_TASK_INDEX=0,
+ * CLOUD_RUN_TASK_COUNT=1) and no K_SERVICE. Other platform and image
+ * variables (CLOUD_RUN_EXECUTION, K_*, PATH, HOME, NODE_VERSION,
+ * DEPLOYMENT_SOURCE_COMMIT and so on) are tolerated; libraries may read some
+ * of their own (google-auth-library's GCE_METADATA_HOST, proxy variables),
+ * which this contract does not refuse. NODE_OPTIONS is read by Node before
+ * this code runs, so its refusal ends the run but cannot undo a preload.
  *
  * Without ANALYTICS_REFRESH_TARGET the Job keeps its test targets (below).
  *
@@ -94,8 +103,11 @@
  * output budget, which A-2's output account charges every held output row
  * against (resources.ts). The run refuses to start
  * (ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT) unless the output budget is at
- * least 64 MiB, and refuses mid-run (ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED,
- * nothing written) when the account exceeds it.
+ * least 64 MiB. Once the plan has fixed the largest admitted owner's
+ * estimate, the output budget also takes the rest of the per-owner budget
+ * (compute reclaimUnusedOwnerBudget, resources.ts analyticsV2OutputBudget);
+ * the run refuses mid-run (ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED, nothing
+ * written) when the account exceeds that.
  *
  * Database: under a production target, the configured Cloud SQL instance
  * through cloud-sql.mjs createIamPool. Otherwise, in a Cloud Run Job
@@ -149,15 +161,34 @@ export const ANALYTICS_REFRESH_PRODUCTION_ENV = Object.freeze([
   "ANALYTICS_REFRESH_TARGET", "PRIMARY_INSTANCE_CONNECTION_NAME", "PRIMARY_DATABASE", "PRIMARY_SCHEMA",
   "POSTGRES_IAM_USER", "ANALYTICS_V2_MEMORY_BUDGET_MIB",
 ]);
-/** Configuration namespaces a production run closes: any other name in them is refused. */
-export const ANALYTICS_REFRESH_CLOSED_PREFIXES = Object.freeze(["ANALYTICS_", "PRIMARY_", "POSTGRES_", "PG_", "LEDGER_"]);
 /**
- * The production refresh Job as C-INFRA renders it. The task profile is the
- * dense one (4 vCPU, 16 GiB, a 12,288 MiB heap, a 10,752 MiB per-owner
+ * Configuration namespaces a production run closes: any other name in them is
+ * refused. "PG" covers the rehearsal seams (PG_TEST_*) and every libpq-style
+ * variable node-pg reads for a connection it is not given explicitly
+ * (PGOPTIONS, PGSSLMODE, PGPASSWORD, PGCONNECT_TIMEOUT and so on).
+ */
+export const ANALYTICS_REFRESH_CLOSED_PREFIXES = Object.freeze(["ANALYTICS_", "PRIMARY_", "POSTGRES_", "PG", "LEDGER_"]);
+/**
+ * Node runtime variables a production run refuses: they change the code Node
+ * loads (NODE_OPTIONS), the database driver (node-pg's NODE_PG_FORCE_NATIVE)
+ * or TLS trust for every connection (NODE_TLS_REJECT_UNAUTHORIZED,
+ * NODE_EXTRA_CA_CERTS). The NODE_ namespace is not closed: the node image
+ * sets NODE_VERSION.
+ */
+export const ANALYTICS_REFRESH_RUNTIME_FORBIDDEN = Object.freeze(["NODE_OPTIONS", "NODE_PG_FORCE_NATIVE",
+  "NODE_TLS_REJECT_UNAUTHORIZED", "NODE_EXTRA_CA_CERTS"]);
+/**
+ * The production refresh Job as C-INFRA renders it (gcp-ops-infra-manifest.mjs
+ * renderJob; its check pins the render to this object). The task profile is
+ * the dense one (4 vCPU, 16 GiB, a 12,288 MiB heap, a 10,752 MiB per-owner
  * budget, 4 h) until MEAS-3 measures the largest real owner on Cloud Run
- * (dense-owner parity receipt). One task, no retries: a run either writes
- * everything in one transaction or nothing, and the time guard refuses it
- * before taskTimeoutSeconds. `args` follows `node`.
+ * (dense-owner parity receipt). The budget admits that owner at the high end
+ * of its estimate (about 10 GiB when its records fall in the 170 analysis
+ * days, which memory model v2 still charges whole; cap-raise receipt). A run
+ * reclaims the part of it that its largest admitted owner leaves for the
+ * output account (compute reclaimUnusedOwnerBudget). One task, no retries: a
+ * run either writes everything in one transaction or nothing, and the time
+ * guard refuses it before taskTimeoutSeconds. `args` follows `node`.
  */
 export const ANALYTICS_REFRESH_PRODUCTION_JOB = Object.freeze({
   entry: "dist/analytics-refresh.mjs",
@@ -250,7 +281,8 @@ export const ANALYTICS_REFRESH_RESOURCE_ENV = Object.freeze({
  * - the rest of the heap is the output budget, which A-2's output account
  *   charges every held output row and the non-effective owners' held
  *   occurrences against (resources.ts). It must be at least
- *   minimumOutputBudgetBytes.
+ *   minimumOutputBudgetBytes. The run adds to it the part of the per-owner
+ *   budget its largest admitted owner's estimate leaves.
  * The accumulated outputs are accounted, not covered by a fixed reserve: a
  * roster or history whose outputs outgrow the heap refuses the run
  * (ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED) before the heap is exhausted.
@@ -421,10 +453,15 @@ const TEST_TARGET_VALUES = testTargetIdentities();
 /**
  * CR-3's production refusal policy (cloud-run/postgres-production-configuration.mjs):
  * the variables and prefixes it refuses in production, its plane markers and
- * the production resource fingerprint values a staging run must not name.
- * Mirrored, not imported: CR-3 imports Worker TypeScript (so the source entry
- * could not answer --help under plain Node 22) and is not part of the audited
- * image build context. The spec pins every value equal to CR-3's exports.
+ * the production resource fingerprint values (Cloudflare's production names).
+ * CR-3 refuses the fingerprint on the staging plane only; this job refuses it
+ * on both planes, which is stricter and refuses no GCP name the committed
+ * desired states use. Mirrored, not imported: CR-3 imports Worker TypeScript
+ * (so the source entry could not answer --help under plain Node 22) and is not
+ * part of the audited image build context. The spec pins every value equal to
+ * CR-3's exports. Which contract governs the production analytics job (this
+ * one, or CR-3's unused analytics-job profiles) is an open integration
+ * decision; until it is taken the equality pin is the guard against drift.
  */
 export const ANALYTICS_REFRESH_CR3_POLICY = Object.freeze({
   forbiddenVariables: Object.freeze([
@@ -468,8 +505,9 @@ function productionValue(env, name, pattern) {
  * - ANALYTICS_V2_REFRESH_TARGET_INVALID: a target other than production or staging;
  * - ANALYTICS_V2_TEST_CLOCK_FORBIDDEN: ANALYTICS_V2_TEST_CLOCK present (even empty);
  * - ANALYTICS_V2_REFRESH_ENV_FORBIDDEN: any CR-3 production-forbidden variable or
- *   prefix, GOOGLE_APPLICATION_CREDENTIALS, or any other variable in the
- *   closed namespaces (ANALYTICS_REFRESH_CLOSED_PREFIXES);
+ *   prefix, GOOGLE_APPLICATION_CREDENTIALS, a refused Node runtime variable
+ *   (ANALYTICS_REFRESH_RUNTIME_FORBIDDEN), or any other variable in the closed
+ *   namespaces (ANALYTICS_REFRESH_CLOSED_PREFIXES);
  * - ANALYTICS_V2_REFRESH_CONTEXT_INVALID: not one task of a Cloud Run Job;
  * - ANALYTICS_V2_REFRESH_ENV_MISSING / _ENV_INVALID: a contract variable absent or malformed;
  * - ANALYTICS_V2_REFRESH_TEST_TARGET_FORBIDDEN: a test or rehearsal resource;
@@ -492,6 +530,9 @@ export async function readAnalyticsRefreshProductionTarget(env = {}) {
   }
   if (Object.hasOwn(env, "GOOGLE_APPLICATION_CREDENTIALS")) {
     fail("ANALYTICS_V2_REFRESH_ENV_FORBIDDEN", { field: "GOOGLE_APPLICATION_CREDENTIALS" });
+  }
+  for (const name of ANALYTICS_REFRESH_RUNTIME_FORBIDDEN) {
+    if (Object.hasOwn(env, name)) fail("ANALYTICS_V2_REFRESH_ENV_FORBIDDEN", { field: name });
   }
   for (const name of names.sort()) {
     if (ANALYTICS_REFRESH_CLOSED_PREFIXES.some((prefix) => name.startsWith(prefix))
@@ -1228,7 +1269,9 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
         revisionSeed,
         loadOwnerOccurrences: inputs.loadOwnerOccurrences,
         ownerEvidence: inputs.ownerEvidence,
-        ...(inputs.resources === undefined ? {} : { resources: inputs.resources }),
+        // The Job's resources partition one heap (analyticsRefreshResources),
+        // so the run may reclaim the per-owner budget its largest owner leaves.
+        ...(inputs.resources === undefined ? {} : { resources: inputs.resources, reclaimUnusedOwnerBudget: true }),
         memoryProbe,
         ...(checkpoint === undefined ? {} : { checkpoint }),
       });
@@ -1289,8 +1332,9 @@ export async function loadAnalyticsV2Modules() {
  *   owners at an owner checkpoint, cannot finish before it at the measured
  *   rates, and
  * - ANALYTICS_V2_REFRESH_DEADLINE_EXCEEDED when the refusal point has passed,
- *   or a step about to start (a segment load and its days, one model date)
- *   could cross it at stepFactor times the measured rates.
+ *   or a step about to start (a segment load and its days, an owner's scalar
+ *   fit, one model date) could cross it at stepFactor times the measured
+ *   rates.
  * The error carries `deadline`, content-free seconds and owner counts.
  */
 export function createAnalyticsRefreshTimeGuard({ startedAtMs, taskTimeoutMs, wallClock,
@@ -1364,6 +1408,11 @@ export function createAnalyticsRefreshTimeGuard({ startedAtMs, taskTimeoutMs, wa
           if (at + step > refuseAtMs()) refuse("ANALYTICS_V2_REFRESH_DEADLINE_EXCEEDED", at, step);
           break;
         }
+        case "scalar": {
+          const step = model.stepFactor * model.scalarMsPerAnalysisUsage * ownerAnalysisUsage;
+          if (at + step > refuseAtMs()) refuse("ANALYTICS_V2_REFRESH_DEADLINE_EXCEEDED", at, step);
+          break;
+        }
         case "model": {
           const step = model.stepFactor * model.modelMsPerAnalysisUsage * ownerAnalysisUsage / 70;
           if (at + step > refuseAtMs()) refuse("ANALYTICS_V2_REFRESH_DEADLINE_EXCEEDED", at, step);
@@ -1423,6 +1472,8 @@ function memorySummary(resources, recorded, peakRssBytes) {
     peakRssMiB: Number.isSafeInteger(peakRssBytes) && peakRssBytes >= 0 ? toMiB(peakRssBytes) : null,
     outputModel: typeof recorded?.configuration?.outputModel === "string" ? recorded.configuration.outputModel : null,
     outputBudgetMiB: Math.floor(resources.compute.outputBudgetBytes / MIB),
+    effectiveOutputBudgetMiB: Number.isSafeInteger(recorded?.account?.outputBudgetBytes)
+      ? Math.floor(recorded.account.outputBudgetBytes / MIB) : null,
     accountMiB: Number.isSafeInteger(recorded?.account?.accountBytes) ? toMiB(recorded.account.accountBytes) : null,
     heldInputMiB: Number.isSafeInteger(recorded?.account?.heldInputBytes) ? toMiB(recorded.account.heldInputBytes) : null,
     largestOwnerOutputMiB: toMiB(largest(owners.map((owner) => owner.outputBytes ?? 0))),

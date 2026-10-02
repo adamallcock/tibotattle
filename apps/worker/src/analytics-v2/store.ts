@@ -387,17 +387,32 @@ function validResources(value: unknown, effective: ReadonlySet<string>,
   }
   if (owners.length !== effective.size) invalid("resources.owners");
   const account = value.account;
-  if (!plainObject(account) || Object.keys(account).sort().join(",") !== "accountBytes,heldInputBytes") {
+  if (!plainObject(account)
+      || Object.keys(account).sort().join(",") !== "accountBytes,heldInputBytes,outputBudgetBytes") {
     invalid("resources.account");
   }
   const heldInputBytes = assertNonNegativeSafeInteger(account.heldInputBytes, "resources.account.heldInputBytes");
   const accountBytes = assertNonNegativeSafeInteger(account.accountBytes, "resources.account.accountBytes");
+  const outputBudgetBytes = assertNonNegativeSafeInteger(account.outputBudgetBytes,
+    "resources.account.outputBudgetBytes");
   if (heldInputBytes > accountBytes
       || owners.reduce((total, entry) => total + entry.outputBytes, heldInputBytes) > accountBytes) {
     invalid("resources.account");
   }
+  // The budget the account was held to: the configured one, or that plus the
+  // part of the memory budget the largest admitted estimate left
+  // (resources.ts analyticsV2OutputBudget). A completed run stayed within it.
+  const configuredOutput = configuration.outputBudgetBytes as number;
+  const largestAdmitted = owners.filter((entry) => entry.admitted)
+    .reduce((largest, entry) => Math.max(largest, entry.estimateBytes), 0);
+  const memoryBudget = configuration.memoryBudgetBytes as number;
+  if (accountBytes > outputBudgetBytes || largestAdmitted > memoryBudget
+      || (outputBudgetBytes !== configuredOutput
+        && outputBudgetBytes !== configuredOutput + memoryBudget - largestAdmitted)) {
+    invalid("resources.account.outputBudgetBytes");
+  }
   return { configuration: configuration as unknown as AnalyticsV2RunResources["configuration"], owners,
-    account: { heldInputBytes, accountBytes } };
+    account: { heldInputBytes, accountBytes, outputBudgetBytes } };
 }
 
 /**

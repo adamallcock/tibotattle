@@ -493,6 +493,11 @@ test("resources: environment within bounds, and a heap partitioned into budget, 
   assert.ok(denseResources.requiredHeapBytes <= dense.heapMiB * MIB);
   assert.equal(denseResources.compute.outputBudgetBytes,
     (dense.heapMiB + 48 - dense.memoryBudgetMiB - 256) * MIB - 250_000 * 4_096);
+  // A run adds the part of the budget its largest admitted owner leaves (the
+  // plan fixes it before any output is charged): with owner e (1,517 MiB)
+  // largest, about 9.5 GiB of output budget instead of 351 MiB.
+  assert.equal(resources.analyticsV2OutputBudget(denseResources.compute, 1_517 * MIB, true),
+    denseResources.compute.outputBudgetBytes + (dense.memoryBudgetMiB - 1_517) * MIB);
   const tuned = job.analyticsRefreshResources({ ANALYTICS_V2_MEMORY_BUDGET_MIB: "26624",
     ANALYTICS_V2_MAX_DAY_OCCURRENCES: "20000", ANALYTICS_V2_MAX_DAY_RECORD_MIB: "32",
     ANALYTICS_V2_READ_CHUNK_OCCURRENCES: "1000000" }, 32_768 * MIB);
@@ -509,6 +514,50 @@ test("resources: environment within bounds, and a heap partitioned into budget, 
     assert.throws(() => job.analyticsRefreshResources({ [name]: value }, 64 * 1_024 * MIB),
       (error) => error.code === "ANALYTICS_V2_REFRESH_RESOURCES_INVALID" && error.field === name, `${name}=${value}`);
   }
+});
+
+/**
+ * The output projection the production profile must hold (C-REFRESH review,
+ * 2026-10-02). It is a stated planning roster, not a production measurement:
+ * OWN-3's owner counts and MEAS-3 replace it. Rates are what the dense
+ * rehearsal's first run charged to the output account at 32215a26's dist
+ * (b76aa67f..., docs/receipts/2026-10-02-gcp-c-refresh.md): owner e
+ * 13,287,040 bytes and the heaviest light owner 2,888,220 bytes over the 170
+ * analysis days. Each owner's whole output is charged per day of history,
+ * although only its cache bands grow with history, so the rates err high.
+ * The largest owner is taken at the high end of the largest real owner's
+ * estimate (about 10 GiB when its records fall in the analysis days;
+ * docs/receipts/2026-10-01-gcp-fastpath-caps.md), the case where the
+ * profile's per-owner budget leaves the least to reclaim.
+ */
+const ANALYTICS_REFRESH_OUTPUT_PROJECTION = Object.freeze({
+  largestOwnerEstimateMiB: 10_240,
+  denseOwners: 4,
+  denseBytesPerOwnerDay: Math.ceil(13_287_040 / 170),
+  lightOwners: 60,
+  lightBytesPerOwnerDay: Math.ceil(2_888_220 / 170),
+  // The 170 analysis days plus a year of retained cache history.
+  historyDays: 170 + 365,
+});
+
+test("the production profile's output budget holds the stated roster and history projection", () => {
+  const MIB = 1_048_576;
+  const profile = job.ANALYTICS_REFRESH_PRODUCTION_JOB;
+  const projection = ANALYTICS_REFRESH_OUTPUT_PROJECTION;
+  // The old-space size, not V8's slightly larger limit: the pin errs low.
+  const partition = job.analyticsRefreshResources(
+    { ANALYTICS_V2_MEMORY_BUDGET_MIB: String(profile.memoryBudgetMiB) }, profile.heapMiB * MIB).compute;
+  assert.ok(projection.largestOwnerEstimateMiB * MIB <= partition.memoryBudgetBytes, "the largest owner is admitted");
+  const outputBudget = resources.analyticsV2OutputBudget(partition, projection.largestOwnerEstimateMiB * MIB, true);
+  const perDay = projection.denseOwners * projection.denseBytesPerOwnerDay
+    + projection.lightOwners * projection.lightBytesPerOwnerDay;
+  const projected = perDay * projection.historyDays;
+  assert.ok(projected <= outputBudget,
+    `projected ${Math.ceil(projected / MIB)} MiB over an output budget of ${Math.floor(outputBudget / MIB)} MiB`);
+  // The horizon the profile holds for this roster, recorded in the receipt:
+  // 641 days at the high-end estimate, against 238 without the reclaim.
+  assert.equal(Math.floor(outputBudget / perDay), 641);
+  assert.equal(Math.floor(partition.outputBudgetBytes / perDay), 238);
 });
 
 test("read spans: contiguous, at most the day bound, and about the read chunk by the exact counts", () => {
@@ -1051,7 +1100,7 @@ test("the store's resource record is closed and agrees with the owner refusals; 
   const entry = (ownerDigest, admitted) => ({ ownerDigest, usage: 3, quota: 2, session: 1, analysisUsage: 3,
     maxDayOccurrences: 6, estimateBytes: 134_217_728, admitted, heapPeakBytes: admitted ? 1_000 : null,
     outputBytes: 500 });
-  const account = { heldInputBytes: 100, accountBytes: 2_000 };
+  const account = { heldInputBytes: 100, accountBytes: 2_000, outputBudgetBytes: 67_108_864 };
   const ordered = [OWNER_A, OWNER_B].sort();
   const refusedB = [{ ownerDigest: OWNER_B, day: null, family: "owner", reason: "memory_budget" },
     { ownerDigest: OWNER_B, day: DAY_1, family: "daily", reason: "memory_budget" }];
@@ -1096,9 +1145,27 @@ test("the store's resource record is closed and agrees with the owner refusals; 
     [{ configuration, owners: owned }, "resources"],
     [{ configuration, owners: owned, account, extra: 1 }, "resources"],
     [{ configuration, owners: owned, account: { ...account, extra: 1 } }, "resources.account"],
-    [{ configuration, owners: owned, account: { heldInputBytes: 100, accountBytes: 1_099 } }, "resources.account"],
-    [{ configuration, owners: owned, account: { heldInputBytes: 3_000, accountBytes: 2_000 } }, "resources.account"],
-    [{ configuration, owners: owned, account: { heldInputBytes: -1, accountBytes: 2_000 } }, "resources.account.heldInputBytes"],
+    [{ configuration, owners: owned, account: { ...account, heldInputBytes: 100, accountBytes: 1_099 } },
+      "resources.account"],
+    [{ configuration, owners: owned, account: { ...account, heldInputBytes: 3_000, accountBytes: 2_000 } },
+      "resources.account"],
+    [{ configuration, owners: owned, account: { ...account, heldInputBytes: -1, accountBytes: 2_000 } },
+      "resources.account.heldInputBytes"],
+    // The budget the account was held to: present, an integer, never below the
+    // account, and either the configured one or that plus the memory budget
+    // less the largest admitted estimate (A's 128 MiB; B is refused).
+    [{ configuration, owners: owned, account: { heldInputBytes: 100, accountBytes: 2_000 } }, "resources.account"],
+    [{ configuration, owners: owned, account: { ...account, outputBudgetBytes: 1.5 } },
+      "resources.account.outputBudgetBytes"],
+    [{ configuration, owners: owned, account: { ...account, outputBudgetBytes: 1_999 } },
+      "resources.account.outputBudgetBytes"],
+    [{ configuration, owners: owned, account: { ...account, outputBudgetBytes: 67_108_865 } },
+      "resources.account.outputBudgetBytes"],
+    [{ configuration, owners: owned, account: { ...account, outputBudgetBytes: 67_108_864 + 1_073_741_824 } },
+      "resources.account.outputBudgetBytes"],
+    [{ configuration, owners: owned.map((value) => ({ ...value, estimateBytes: 1_073_741_825 })),
+      account: { ...account, outputBudgetBytes: 67_108_864 + 1_073_741_824 - 1_073_741_825 } },
+    "resources.account.outputBudgetBytes"],
     [{ configuration: { ...configuration, outputModel: "x" }, owners: owned, account }, "resources.configuration"],
     [{ configuration: { ...configuration, outputBudgetBytes: 0 }, owners: owned, account },
       "resources.configuration.outputBudgetBytes"],
@@ -1106,7 +1173,11 @@ test("the store's resource record is closed and agrees with the owner refusals; 
   ]) {
     await assert.rejects(check(outputs({ resources: value })), { code: "ANALYTICS_V2_OUTPUTS_INVALID", field }, field);
   }
-  await check(outputs({ resources: { configuration, owners: owned, account: { heldInputBytes: 100, accountBytes: 1_100 } } }));
+  await check(outputs({ resources: { configuration, owners: owned,
+    account: { ...account, heldInputBytes: 100, accountBytes: 1_100 } } }));
+  // A run that reclaimed the unused per-owner budget: configured + budget - largest admitted estimate.
+  await check(outputs({ resources: { configuration, owners: owned,
+    account: { ...account, outputBudgetBytes: 67_108_864 + 1_073_741_824 - 134_217_728 } } }));
 });
 
 test("PG17: bulk owner families are written in bounded chunks with exact row counts", {
@@ -2113,6 +2184,11 @@ test("PG17: an owner beyond the shared reducers' caps is computed and written, n
     // The output budget is what the heap leaves after the budget and the reserves.
     assert.equal(Math.floor(outputBudgetBytes / 1_048_576), run.memory.outputBudgetMiB);
     assert.ok(outputBudgetBytes >= job.ANALYTICS_REFRESH_HEAP_RESERVE.minimumOutputBudgetBytes);
+    // The Job reclaims the part of the per-owner budget the largest admitted owner leaves.
+    const largestAdmitted = Math.max(...row.timings.owners.filter((value) => value.admitted)
+      .map((value) => value.estimateBytes));
+    assert.equal(row.timings.account.outputBudgetBytes, outputBudgetBytes + 1_024 * 1_048_576 - largestAdmitted);
+    assert.equal(run.memory.effectiveOutputBudgetMiB, Math.floor(row.timings.account.outputBudgetBytes / 1_048_576));
     // The account: every owner's outputs, recorded with the run and summarised in the receipt.
     assert.equal(row.timings.account.heldInputBytes, 0);
     assert.equal(row.timings.account.accountBytes, row.timings.owners.reduce((total, value) => total + value.outputBytes, 0));
@@ -2412,9 +2488,25 @@ test("production target: every other variable, test seam, test target and contex
     "LEDGER_ANYTHING", "HOST_RATE_LIMIT_X", "GOOGLE_APPLICATION_CREDENTIALS", "ANALYTICS_V2_MAX_DAY_OCCURRENCES",
     "ANALYTICS_V2_MAX_DAY_RECORD_MIB", "ANALYTICS_V2_READ_CHUNK_OCCURRENCES", "ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS",
     "ANALYTICS_V2_ENABLED", "ANALYTICS_V2_TEST_NOW_MS", "PG_TEST_SOCKET", "PG_TEST_HOST", "PRIMARY_EXTRA",
-    "POSTGRES_MIGRATOR_IAM_USER", "ANALYTICS_REFRESH_SCHEMA"]) {
+    "POSTGRES_MIGRATOR_IAM_USER", "ANALYTICS_REFRESH_SCHEMA",
+    // The libpq-style variables node-pg reads for anything the pool does not
+    // set explicitly (session options, TLS mode, a password, timeouts, a host).
+    "PGOPTIONS", "PGSSLMODE", "PGPASSWORD", "PGCONNECT_TIMEOUT", "PGHOST", "PGUSER", "PGDATABASE", "PGAPPNAME",
+    // Node runtime variables that change the code loaded, the driver or TLS trust.
+    ...job.ANALYTICS_REFRESH_RUNTIME_FORBIDDEN]) {
     await refusedTarget({ ...env, [name]: "" }, "ANALYTICS_V2_REFRESH_ENV_FORBIDDEN", name);
+    await refusedTarget({ ...env, [name]: "-c default_transaction_read_only=on" }, "ANALYTICS_V2_REFRESH_ENV_FORBIDDEN",
+      name);
   }
+  assert.deepEqual([...job.ANALYTICS_REFRESH_RUNTIME_FORBIDDEN], ["NODE_OPTIONS", "NODE_PG_FORCE_NATIVE",
+    "NODE_TLS_REJECT_UNAUTHORIZED", "NODE_EXTRA_CA_CERTS"]);
+  assert.equal(job.ANALYTICS_REFRESH_CLOSED_PREFIXES.includes("PG"), true);
+  // Platform and image variables outside the closed names are tolerated (the
+  // node image sets NODE_VERSION; OPS-10 renders DEPLOYMENT_SOURCE_COMMIT).
+  const tolerated = await job.readAnalyticsRefreshProductionTarget({ ...env, NODE_VERSION: "22.16.0",
+    YARN_VERSION: "1.22.22", DEPLOYMENT_SOURCE_COMMIT: "b".repeat(40), CLOUD_RUN_EXECUTION: "example-execution",
+    CLOUD_RUN_TASK_ATTEMPT: "0", PATH: "/usr/local/bin", HOME: "/root" });
+  assert.equal(tolerated.target, "production");
   // One task of a Cloud Run Job, never a service.
   for (const context of [without(env, "CLOUD_RUN_JOB"), { ...env, CLOUD_RUN_JOB: "" },
     { ...env, CLOUD_RUN_JOB: "Analytics_Refresh" }, { ...env, K_SERVICE: "example-origin" },
@@ -2527,6 +2619,16 @@ test("time guard: refuses a hopeless plan, an owner that cannot finish and a ste
       "projectedSeconds", "refuseAtSeconds", "taskTimeoutSeconds"]);
     assert.equal(error.deadline.ownersStarted, 1);
     assert.equal(error.deadline.ownersPlanned, 2);
+    return true;
+  });
+  // The owner's scalar fit over its analysis rows.
+  const scalarStep = model.stepFactor * model.scalarMsPerAnalysisUsage * 294_000;
+  clock = Math.floor(refuseAt(hour) - scalarStep) - 1;
+  guard.checkpoint({ kind: "scalar", accountBytes: 0 });
+  clock += 2;
+  assert.throws(() => guard.checkpoint({ kind: "scalar", accountBytes: 0 }), (error) => {
+    assert.equal(error.code, "ANALYTICS_V2_REFRESH_DEADLINE_EXCEEDED");
+    assert.equal(error.deadline.projectedSeconds, Math.ceil(scalarStep / 1_000));
     return true;
   });
   // A model date: the owner's analysis rows over the 70 dates.
