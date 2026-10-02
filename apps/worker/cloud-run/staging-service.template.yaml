@@ -1,0 +1,177 @@
+# TiboTattle staging origin: the IAM-private Cloud Run service of the staging
+# plane (Knative serving.knative.dev/v1), in the shared GCP test project.
+#
+# This file is the single source of truth for the staging service spec. It
+# mirrors EP-7's production template (production-service.template.yaml) with
+# the staging composition (HOST_MODE staging, OD-CR-8) and staging-plane
+# limits. The GCP infrastructure tooling (OPS-2, scripts/gcp-ops-infra-
+# manifest.mjs) renders it from the committed staging desired state and
+# applies the result; nothing in the repository applies it on its own.
+# scripts/gcp-ops-infra-staging-service.check.mjs pins its rendering contract.
+#
+# Syntax: the strict subset EP-7's template keeps. Printable ASCII and line
+# feeds only; block mappings and block sequences; plain identifier or integer
+# scalars, true, and single-quoted strings. Every placeholder sits inside a
+# single-quoted scalar. Comments name no concrete identifier.
+#
+# Placeholders, all required. The EP-7 ones keep EP-7's meaning:
+#   PROJECT, REGION, SERVICE, RUNTIME_SA, IMAGE_REPOSITORY, IMAGE_DIGEST,
+#   SOURCE_COMMIT, SERVICE_HOST, AUDIENCE, EDGE_INVOKER_SA, VERIFIER_SA,
+#   MAX_INSTANCES, TELEMETRY_STORAGE_NAMESPACE,
+#   PRIMARY_INSTANCE_CONNECTION_NAME, PRIMARY_DATABASE, PRIMARY_SCHEMA,
+#   POSTGRES_IAM_USER, GCS_BUCKET_NAME, SECRET_VERSION_<NAME>
+# and the staging plane's own, from the desired state's stagingOrigin block:
+#   PUBLIC_ORIGIN                      the staging edge's public https origin
+#   ADMIN_HOST_ORIGIN                  https://admin.<PUBLIC_ORIGIN host>
+#   ACCESS_TEAM_DOMAIN                 the Cloudflare Access team domain
+#   ACCESS_AUD                         the staging admin Access application's
+#                                      AUD tag (never production's)
+#   ACCESS_ADMIN_EMAIL                 the admin email the Access JWT pins
+#   IDENTITY_LINK_SECRET_VERSION       the staging identity-link label
+#   STAGING_ADMISSION_MODE             closed or synthetic-rehearsal (CR-3)
+#   GCS_BUCKET_GENERATION,             the quarantine bucket's birth proof
+#   GCS_BUCKET_METAGENERATION          (OD-2), pinned from the OPS-2
+#                                      bucket-birth receipt
+#
+# Staging-plane limits: the service scales to zero (minScale 0) and to at most
+# MAX_INSTANCES, which the infrastructure validator checks against the staging
+# Cloud SQL connection budget. Request concurrency and timeout equal
+# production's, so the staging load test (OPS-11) measures the production
+# shape. The admission posture (closed enrollment, the upload-ingress
+# budget) and the origin-tier limits (300 and 6 a minute) are not set here:
+# CR-3 (postgres-production-configuration.mjs) pins them by plane.
+#
+# Synthetic only. Production data and production secrets never enter this
+# plane. The Google and Apple identifiers below are inert synthetic values
+# that name no registered client, service or key; the matching Secret
+# Manager secrets hold inert synthetic values from scripts/gcp-staging-
+# secrets.mjs, so Google and Apple sign-in cannot complete on staging.
+#
+# OD-2 (2026-10-02): GCS_QUARANTINE_BUCKET_HISTORY_PROOF is the bucket-birth
+# receipt's proof record for GCS_BUCKET_NAME, as the desired state pins it.
+# CR-3 re-admits and requires it once C-SIMP lands; until then CR-3 ignores
+# it. The retired erasure-era proof and every ledger setting never appear.
+#
+# Secrets come only from Secret Manager through secretKeyRef, with pinned
+# versions; the renderer points each reference at the staging secret id. The
+# Cloudflare-only edge secrets never belong here.
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: '${SERVICE}'
+  namespace: '${PROJECT}'
+  labels:
+    cloud.googleapis.com/location: '${REGION}'
+  annotations:
+    run.googleapis.com/ingress: all
+    run.googleapis.com/invoker-iam-disabled: 'false'
+    run.googleapis.com/custom-audiences: '["${AUDIENCE}"]'
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: '0'
+        autoscaling.knative.dev/maxScale: '${MAX_INSTANCES}'
+    spec:
+      serviceAccountName: '${RUNTIME_SA}'
+      containerConcurrency: 40
+      timeoutSeconds: 300
+      containers:
+        # Keep the default TCP startup probe, as EP-7 does.
+        - image: '${IMAGE_REPOSITORY}@sha256:${IMAGE_DIGEST}'
+          ports:
+            - name: http1
+              containerPort: 8080
+          env:
+            - name: HOST
+              value: '0.0.0.0'
+            - name: HOST_MODE
+              value: staging
+            - name: HOST_ORIGIN
+              value: 'https://${SERVICE_HOST}'
+            - name: PUBLIC_ORIGIN
+              value: '${PUBLIC_ORIGIN}'
+            - name: ADMIN_HOST_ORIGIN
+              value: '${ADMIN_HOST_ORIGIN}'
+            - name: DEPLOYMENT_SOURCE_COMMIT
+              value: '${SOURCE_COMMIT}'
+            - name: EDGE_ORIGIN_MODE
+              value: cloudflare-worker-iam
+            - name: EDGE_ORIGIN_AUDIENCE
+              value: '${AUDIENCE}'
+            - name: EDGE_INVOKER_SERVICE_ACCOUNT
+              value: '${EDGE_INVOKER_SA}'
+            - name: EDGE_ORIGIN_VERIFIER_SERVICE_ACCOUNTS
+              value: '${VERIFIER_SA}'
+            - name: TELEMETRY_STORAGE_NAMESPACE
+              value: '${TELEMETRY_STORAGE_NAMESPACE}'
+            - name: STAGING_ADMISSION_MODE
+              value: '${STAGING_ADMISSION_MODE}'
+            - name: ACCESS_TEAM_DOMAIN
+              value: '${ACCESS_TEAM_DOMAIN}'
+            - name: ACCESS_AUD
+              value: '${ACCESS_AUD}'
+            - name: ACCESS_ADMIN_EMAIL
+              value: '${ACCESS_ADMIN_EMAIL}'
+            - name: IDENTITY_LINK_SECRET_VERSION
+              value: '${IDENTITY_LINK_SECRET_VERSION}'
+            # Inert synthetic identity-provider identifiers (see the header).
+            - name: GOOGLE_OIDC_CLIENT_ID
+              value: '000000000000-tibotattlestaginginert.apps.googleusercontent.com'
+            - name: APPLE_SERVICES_ID
+              value: 'com.tibotattle.staging.inert'
+            - name: APPLE_KEY_ID
+              value: 'STAGINGK01'
+            - name: APPLE_TEAM_ID
+              value: 'STAGINGT01'
+            - name: PRIMARY_INSTANCE_CONNECTION_NAME
+              value: '${PRIMARY_INSTANCE_CONNECTION_NAME}'
+            - name: PRIMARY_DATABASE
+              value: '${PRIMARY_DATABASE}'
+            - name: PRIMARY_SCHEMA
+              value: '${PRIMARY_SCHEMA}'
+            - name: POSTGRES_IAM_USER
+              value: '${POSTGRES_IAM_USER}'
+            - name: GCS_BUCKET_NAME
+              value: '${GCS_BUCKET_NAME}'
+            - name: GCS_QUARANTINE_BUCKET_HISTORY_PROOF
+              value: '{"bucket":"${GCS_BUCKET_NAME}","bucketGeneration":"${GCS_BUCKET_GENERATION}","bucketMetageneration":"${GCS_BUCKET_METAGENERATION}","softDeleteRetentionDurationSeconds":"0"}'
+            - name: IDENTITY_LINK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: IDENTITY_LINK_SECRET
+                  key: '${SECRET_VERSION_IDENTITY_LINK_SECRET}'
+            - name: POSTGRES_RATE_LIMIT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: POSTGRES_RATE_LIMIT_SECRET
+                  key: '${SECRET_VERSION_POSTGRES_RATE_LIMIT_SECRET}'
+            - name: ENVELOPE_PUBLIC_JWK
+              valueFrom:
+                secretKeyRef:
+                  name: ENVELOPE_PUBLIC_JWK
+                  key: '${SECRET_VERSION_ENVELOPE_PUBLIC_JWK}'
+            - name: ENVELOPE_PRIVATE_JWK
+              valueFrom:
+                secretKeyRef:
+                  name: ENVELOPE_PRIVATE_JWK
+                  key: '${SECRET_VERSION_ENVELOPE_PRIVATE_JWK}'
+            - name: GOOGLE_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: GOOGLE_OIDC_CLIENT_SECRET
+                  key: '${SECRET_VERSION_GOOGLE_OIDC_CLIENT_SECRET}'
+            - name: APPLE_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: APPLE_PRIVATE_KEY
+                  key: '${SECRET_VERSION_APPLE_PRIVATE_KEY}'
+            # Optional, as in EP-7: omitted when its version renders empty.
+            - name: DISTRIBUTION_GITHUB_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: DISTRIBUTION_GITHUB_API_TOKEN
+                  key: '${SECRET_VERSION_DISTRIBUTION_GITHUB_API_TOKEN}'
+  traffic:
+    - percent: 100
+      latestRevision: true

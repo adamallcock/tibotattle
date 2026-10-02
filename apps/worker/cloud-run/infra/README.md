@@ -47,13 +47,34 @@ then.
 |---|---|
 | `serviceAccounts.verifier.tokenCreators` | The operator's `roles/iam.serviceAccountTokenCreator` grant on the verifier (OD-CR-7) is deferred, and OPS-10 refuses the rollout target |
 | `secrets.*.version` | The service is not rendered (`SECRET_VERSION_UNPINNED`) |
-| `bucket.proof` | Apply refuses until the bucket-birth receipt's proof is committed |
-| `service.telemetryStorageNamespace` | The service is not rendered; it must equal the namespace the imported data carries |
+| `bucket.proof` | Apply refuses until the bucket-birth receipt's proof is committed; the staging service is not rendered (`SERVICE_RENDER_BUCKET_PROOF_UNPINNED`) |
+| `service.telemetryStorageNamespace` | The service is not rendered; it must equal the namespace the imported data carries (staging, synthetic only, uses its own `tibotattle-staging-synthetic`) |
 | `scheduler.analytics-refresh.schedule` | The trigger is not created (decision D3: no default cadence) |
+| `stagingOrigin.accessAud` (staging only) | The staging service is not rendered (`STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud`) until the owner creates the staging admin Access application |
 
-The staging service also waits for a staging service template
-(`STAGING_SERVICE_TEMPLATE_UNAVAILABLE`): EP-7's template is the production
-profile.
+## The staging service
+
+Staging renders from its own template,
+`../staging-service.template.yaml` (STG-PREP): EP-7's service with
+`HOST_MODE=staging` (OD-CR-8), scale to zero and at most
+`service.maxInstances`, the OD-2 quarantine bucket proof
+(`GCS_QUARANTINE_BUCKET_HISTORY_PROOF`, from the pinned `bucket.proof`) and
+inert synthetic Google and Apple identifiers. Its own non-secret settings
+are the `stagingOrigin` block, which production must hold as `null`: the
+staging edge's public origin (its admin origin is derived), the Access team
+domain, AUD and admin email, the staging identity-link label and the
+staging admission mode (`closed` or `synthetic-rehearsal`, as CR-3 defines
+them).
+
+OPS-2 still defers creating it (`STAGING_HOST_COMPOSITION_PENDING`) until
+D-CRB lands the staging host composition: the server reads no `HOST_MODE`
+yet. The D-CRB merge removes that gate together with its check.
+
+The staging secrets, bucket birth and apply follow
+`docs/runbooks/gcp-staging-apply.md`, with
+`scripts/gcp-staging-secrets.mjs` (synthetic values, piped to Secret Manager
+on stdin) and `scripts/gcp-staging-bucket-birth.mjs` (birth, the committed
+receipt `staging.bucket-birth.receipt.json` and its pinned proof).
 
 ## Scheduler trigger
 

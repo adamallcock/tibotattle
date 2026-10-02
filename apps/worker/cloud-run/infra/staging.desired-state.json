@@ -74,7 +74,7 @@
     "maxInstances": 4,
     "rolloutOverlapInstances": 4,
     "audience": "tibotattle-staging-edge-origin",
-    "telemetryStorageNamespace": null
+    "telemetryStorageNamespace": "tibotattle-staging-synthetic"
   },
   "jobs": {
     "production-migrate": {
@@ -92,5 +92,13 @@
       "schedule": null,
       "state": "PAUSED"
     }
+  },
+  "stagingOrigin": {
+    "publicOrigin": "https://staging.tibotattle.com",
+    "accessTeamDomain": "tibotattle.cloudflareaccess.com",
+    "accessAud": null,
+    "accessAdminEmail": "adamallcock@gmail.com",
+    "identityLinkSecretVersion": "staging-gcp-v1",
+    "admissionMode": "closed"
   }
 }

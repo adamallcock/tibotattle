@@ -890,13 +890,17 @@ test("the committed staging desired state loads: a new plane in the shared GCP t
   assert.equal(desired.serviceAccounts.verifier.tokenCreators, null);
   assert.deepEqual(desired.scheduler["analytics-refresh"], {
     name: "tibotattle-staging-analytics-refresh-trigger", schedule: null, state: "PAUSED" });
-  assert.equal(desired.service.telemetryStorageNamespace, null);
-  assert.equal(desired.bucket.proof, null);
-  assert.ok(Object.values(desired.secrets).every((secret) => secret.version === null));
+  // STG-PREP: staging is synthetic-only, so its namespace is its own synthetic one.
+  assert.equal(desired.service.telemetryStorageNamespace, "tibotattle-staging-synthetic");
+  // The bucket proof and the secret versions are null until the main session
+  // pins them (STG-PREP runbook); once pinned, the receipt check
+  // (gcp-staging-bucket-birth.check.mjs) holds the proof to its receipt.
+  assert.ok(desired.bucket.proof === null || /^[1-9][0-9]*$/u.test(desired.bucket.proof.bucketGeneration));
+  assert.ok(Object.values(desired.secrets).every((secret) => secret.version === null || /^[1-9][0-9]*$/u.test(secret.version)));
   assert.equal(desired.connectionBudget.fits, true);
-  // Its service waits for a staging template; everything else renders.
-  assert.equal(manifest.serviceRenderBlocker(desired), "STAGING_SERVICE_TEMPLATE_UNAVAILABLE");
-  assert.throws(() => manifest.renderService(desired, IMAGE), { code: "STAGING_SERVICE_TEMPLATE_UNAVAILABLE" });
+  // Its service waits for the owner's staging Access AUD (STG-PREP); everything else renders.
+  assert.equal(manifest.serviceRenderBlocker(desired), "STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud");
+  assert.throws(() => manifest.renderService(desired, IMAGE), { code: "STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud" });
   for (const job of manifest.JOB_NAMES) assert.equal(manifest.renderJob(desired, job, IMAGE).kind, "Job");
 });
 
@@ -908,7 +912,7 @@ test("the committed production desired state is refused until OWN-5 fills its pl
   assert.deepEqual(nullPaths(raw).sort(), [
     "bucket.location", "bucket.proof", "project", "projectNumber", "region", "scheduler.analytics-refresh.schedule",
     ...Object.keys(raw.secrets).map((name) => `secrets.${name}.version`),
-    "service.telemetryStorageNamespace", "serviceAccounts.verifier.tokenCreators",
+    "service.telemetryStorageNamespace", "serviceAccounts.verifier.tokenCreators", "stagingOrigin",
   ].sort());
   assert.throws(() => manifest.loadCommittedDesiredState("production"),
     { code: "DESIRED_STATE_PLACEHOLDER_UNFILLED:project" });
@@ -1165,7 +1169,8 @@ test("the service render names each secret by its Secret Manager id and waits fo
     .find((entry) => entry.name === "IDENTITY_LINK_SECRET").valueFrom.secretKeyRef.name, "IDENTITY_LINK_SECRET");
   const noNamespace = manifest.validateDesiredState(unmarked((value) => { value.service.telemetryStorageNamespace = null; }));
   assert.throws(() => manifest.renderService(noNamespace, IMAGE), { code: "TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED" });
+  // STG-PREP: staging has its own template; it waits for its stagingOrigin block.
   const staging = manifest.validateDesiredState(unmarked(stagingNames));
-  assert.throws(() => manifest.renderService(staging, IMAGE), { code: "STAGING_SERVICE_TEMPLATE_UNAVAILABLE" });
-  assert.deepEqual({ ...manifest.SERVICE_TEMPLATE_UNAVAILABLE }, { staging: "STAGING_SERVICE_TEMPLATE_UNAVAILABLE" });
+  assert.throws(() => manifest.renderService(staging, IMAGE), { code: "STAGING_ORIGIN_UNASSIGNED" });
+  assert.deepEqual({ ...manifest.SERVICE_TEMPLATE_UNAVAILABLE }, {});
 });
