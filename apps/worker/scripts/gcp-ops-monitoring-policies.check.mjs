@@ -364,6 +364,11 @@ test("every policy links to its own anchor in the maintained runbook", () => {
     assert.ok(entry.body.documentation.content.endsWith(`Runbook: ${monitoring.MONITORING_RUNBOOK}#${entry.id}`));
   }
   for (const deferral of monitoring.MONITORING_DEFERRALS) assert.ok(runbook.includes(`\`${deferral}`), deferral);
+  // Round 11: the scheduler proxy's delay is decided, not an open trade-off.
+  assert.match(runbook, /\*\*Decided \(owner, round 11, 2026-10-02\): about 25 hours for a daily\s+trigger\.\*\*/u);
+  assert.equal(/Open owner item \(OWN-5\)|The owner has two options/u.test(runbook), false);
+  const source = readFileSync(join(SCRIPTS_ROOT, "gcp-ops-monitoring-policies.mjs"), "utf8");
+  assert.match(source, /DECIDED: the owner accepted\s+\*\s+that delay for a daily trigger/u);
 });
 
 test("the origin request contract mirrors the origin's own log line where that module exists", async (t) => {

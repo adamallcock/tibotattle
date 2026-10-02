@@ -133,29 +133,15 @@ attempts. Confirm with
 paused too long). If OPS-3 `pause-all` paused it for a rollout, finish the
 rollout and run `resume-all` with that pause-all receipt.
 
-**Open owner item (OWN-5): the alert does not enforce 6 hours.** On
-2026-10-02 (round 9, "Alert thresholds") the owner accepted "scheduler
-paused > 6 h" as a starting value. This policy cannot alert at 6 hours for
-a daily trigger:
-
-- It is a log-absence proxy. It fires only after the larger of 6 hours and
-  the cadence plus 60 minutes, which is about 25 hours for a daily trigger.
-  The 6-hour floor binds only for a trigger that fires at least every 5
-  hours.
-- The exact 6-hour signal is the scheduler probe's
-  `SCHEDULER_TRIGGER_PAUSED_TOO_LONG`. Only an operator runs the probe: no
-  scheduled job runs it yet.
-- Round 9 records only the 6-hour value. It does not acknowledge the
-  proxy's delay.
-
-The owner has two options:
-
-- accept the roughly 25-hour proxy explicitly;
-- ask for a periodic job that runs the probe and logs its verdict, with a
-  log metric and an alert on it.
-
-Until the owner chooses, a paused daily trigger alerts after about 25
-hours, not 6. The operator's probe is the only 6-hour check.
+**Decided (owner, round 11, 2026-10-02): about 25 hours for a daily
+trigger.** Round 9 accepted "scheduler paused > 6 h" as a starting value.
+This policy is a log-absence proxy: it fires only after the larger of
+6 hours and the cadence plus 60 minutes, which is about 25 hours for a
+daily trigger. The 6-hour floor binds only for a trigger that fires at
+least every 5 hours. The owner accepted that delay for a daily trigger and
+chose no scheduled probe job. The exact 6-hour check stays the operator's
+`gcp-infra.mjs scheduler-probe` (`SCHEDULER_TRIGGER_PAUSED_TOO_LONG`), run
+by hand, for example after a rollout.
 
 ## origin-lock
 

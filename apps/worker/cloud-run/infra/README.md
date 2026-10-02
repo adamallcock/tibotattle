@@ -136,9 +136,9 @@ paused-too-long signal. It exits 2 when a trigger whose committed state is
 attempt in that time. OPS-5 renders the matching alert (`scheduler-quiet` in
 `monitoring.md`): no Cloud Scheduler attempt within max(6 h, cadence plus
 slack). That is about 25 hours for a daily trigger, so it is a proxy, not
-the 6-hour signal. The owner accepted the 6-hour value in round 9, but has
-not yet accepted the proxy's delay or asked for a scheduled probe (OWN-5,
-open; see `monitoring.md`). The alert is
+the 6-hour signal. The owner accepted the 6-hour value in round 9 and, in
+round 11, the proxy's delay for a daily trigger, with no scheduled probe
+job (see `monitoring.md`). The alert is
 not applied yet and waits for the cadence and the owner's notification
 channel (OWN-5c). The probe also assumes that pausing a trigger updates its
 `userUpdateTime`. The first owner-run readback against the test project has

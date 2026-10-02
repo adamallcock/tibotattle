@@ -40,8 +40,9 @@
  *                                  a PAUSED trigger makes no attempt. This is
  *                                  a log-absence proxy, so the effective delay
  *                                  is the larger of the two: about 25 h for a
- *                                  daily trigger, not the owner's "a few
- *                                  hours" (a trade-off for OWN-5). One
+ *                                  daily trigger. DECIDED: the owner accepted
+ *                                  that delay for a daily trigger, with no
+ *                                  probe job (round 11, 2026-10-02). One
  *                                  condition per trigger; a trigger that has
  *                                  no cadence yet or is committed PAUSED drops
  *                                  only its own condition (deferredConditions).
