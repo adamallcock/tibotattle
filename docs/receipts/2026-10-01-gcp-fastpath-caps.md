@@ -260,5 +260,8 @@ Cloudflare.
 - A dense oracle through the real D1 effective reader (HX-4 sealed-SQLite
   adapter, Node 24.10 or later), if reader parity at volume is required.
 - Owner acceptance of the Worker-only cache divergences above.
+- (Later on 2026-10-01: the dense-owner parity run, the rehearsal's exit 0
+  under OD-12 and the refresh Job profiles are in the
+  [dense-owner parity receipt](./2026-10-01-gcp-dense-owner-parity.md).)
 - Image build, test-project deploy at the new size and a measured cold run;
   none were run for this receipt.

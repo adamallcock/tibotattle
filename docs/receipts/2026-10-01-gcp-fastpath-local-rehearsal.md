@@ -149,7 +149,11 @@ differs by design of the oracle's own parity basis:
   are withheld community-wide. A-2 evaluates per date, counts the refused
   owner on the published point (`refusedParticipantCount`), and publishes.
   Closing this needs an owner decision: port production's block-and-withhold
-  semantics, or accept and disclose per-date publication.
+  semantics, or accept and disclose per-date publication. (Decided later on
+  2026-10-01: per-date publication is accepted, fast-path OD-12, recorded as
+  D7 in the append-only contributions decision. The compare now accepts
+  exactly the withheld dates and the rehearsal exits 0; see the
+  [dense-owner parity receipt](./2026-10-01-gcp-dense-owner-parity.md).)
 - **cache-counts (informational, 395 leaf differences).** Q-1's manifest
   declares cache-retention counts not a parity basis, because production's
   counts depend on lane interleaving; in this oracle the effective cache lane
@@ -223,7 +227,8 @@ image, and anything on GCP or Cloudflare.
 ## Remaining gates and owner decisions
 
 - **Model-day semantics** (above): port production's block-and-withhold rule
-  or accept per-date publication with refused counts.
+  or accept per-date publication with refused counts. (Decided later on
+  2026-10-01: per-date publication, OD-12 and decision D7.)
 - **Cache "all" window lower bound** (above): pass production's
   `CACHE_RETENTION_FROM_DAY` (or the first evidence day) with a matching read,
   or accept a rolling window explicitly.

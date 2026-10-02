@@ -408,4 +408,5 @@ not production observations.
   configuration.
 - Nothing here exercised the GCP fast path's own computation over the dense
   corpus; that comparison (the cap-raise branch against this golden) is the
-  next gate.
+  next gate. (Run later on 2026-10-01: every family equal; see the
+  [dense-owner parity receipt](./2026-10-01-gcp-dense-owner-parity.md).)

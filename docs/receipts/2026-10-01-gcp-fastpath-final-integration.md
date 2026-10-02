@@ -373,7 +373,9 @@ commit's attempt is left in place, and nothing reuses it.
 ## Remaining gates and owner decisions
 
 - Model-day semantics: port production's block-and-withhold rule or accept
-  per-date publication.
+  per-date publication. (Decided later on 2026-10-01: per-date publication,
+  OD-12, recorded as D7 in the append-only contributions decision; the
+  rehearsal now exits 0, see the [dense-owner parity receipt](./2026-10-01-gcp-dense-owner-parity.md).)
 - No D-1 seed has completed on the test project. Seeding needs Node 26 on
   the operator workstation, a checkout equal to the deployed commit, and
   installed `apps/worker` and `apps/worker/cloud-run` dependencies (Vite

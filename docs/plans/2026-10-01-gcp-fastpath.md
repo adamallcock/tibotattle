@@ -74,7 +74,7 @@ Recorded read-only by the fast-path analysis at the start of the night:
 | OD-9 | Nothing touches production; ingestion-side D1 schema on Cloudflare stays frozen until the seal | In force |
 | OD-10 | Optional read-only export of published (day, revision) pairs so GCP revisions continue above them | Open |
 | OD-11 | Raise the GCP caps significantly and prove parity with production's native path for owners beyond them | Owner decision in chat on 2026-10-01; delivered on `claude/gcp-fp-caps` (see [Cap raise](#cap-raise-later-on-2026-10-01)) |
-| OD-12 | Model dates: production withholds a 14-date block until every member has a result, or publish per date with refused owners counted | Owner decision in chat on 2026-10-01: per-date publication is accepted |
+| OD-12 | Model dates: production withholds a 14-date block until every member has a result, or publish per date with refused owners counted | Owner decision in chat on 2026-10-01: per-date publication is accepted. Recorded as D7 in the [decision record](../decisions/2026-09-26-append-only-contributions.md#d7-model-dates-publish-per-date-with-refused-owners-counted); the parity compare accepts exactly the oracle's withheld dates (see [Dense-owner parity](#dense-owner-parity-later-on-2026-10-01)) |
 
 ## GCP-native analytics architecture
 
@@ -394,7 +394,10 @@ or seeded on GCP or Cloudflare, and no production data was read.
   0062, which pins 0011's active-participant trigger to its schema. That
   evidence is local only and is recorded in the final-integration receipt.
 - **The one-command rehearsal** ran as the Gates section expects, with one
-  exception: it exits 1 because model-days differ. Every importer completes
+  exception: it exits 1 because model-days differ. (Later that day the
+  compare accepts exactly the oracle's withheld dates under OD-12 and the
+  rehearsal exits 0; see
+  [Dense-owner parity](#dense-owner-parity-later-on-2026-10-01).) Every importer completes
   (owner roster 4/4, public source owners and owner revisions equal to D1);
   analytics-refresh publishes 168 days with 2026-04-17 and 2026-04-18 blocked
   (owner (a)'s crossed-day conflict) and 15 refusals listed by reason; the
@@ -444,6 +447,31 @@ in the [cap-raise receipt](../receipts/2026-10-01-gcp-fastpath-caps.md).
   over the same occurrences; a dense day's daily values equal production's
   one-record fold. The Q-1 rehearsal's served bytes are unchanged.
 
+### Dense-owner parity, later on 2026-10-01
+
+Local and synthetic only, on `claude/gcp-fastpath-dense` (the cap raise and
+the dense production-code golden merged); the evidence, measurements and
+gates are in the
+[dense-owner parity receipt](../receipts/2026-10-01-gcp-dense-owner-parity.md).
+
+- Per-date model publication (OD-12) is recorded as decision D7. The parity
+  compare accepts exactly the oracle's withheld dates, and only their
+  publication; every shared date stays byte-equal. The Q-1 rehearsal exits 0.
+- The dense golden's corpus went through the importer chain and the raised
+  caps. Every family equals production: the 168 published days, the
+  allowance breakdowns and preview against the per-date expectation, and per
+  owner the fits, all 70 model dates, every owner-day's daily values and
+  cache bands, and the refusals. The dense owner's fits and model results
+  equal production's native path exactly, with no refusal.
+- The read was quadratic in owner size (45 of the dense run's 54 minutes).
+  The v1.2 expansion now probes the owner's manifests per batch, with
+  byte-identical occurrences; the dense refresh takes about 11 minutes, with a
+  peak resident set of at most 2.5 GiB.
+- Sizing: the dense corpus fits the standard Job (2 vCPU, 8 GiB). The
+  largest real owner needs the new `dense` profile (4 vCPU, 16 GiB, heap
+  12,288 MiB, budget 10,752 MiB, 4 h). The seed and test deploy select the
+  dense corpus and profile with `--corpus=dense`; only a dry run was made.
+
 ## Cutover backlog
 
 Sizes are relative effort labels from the 2026-10-01 transfer and cutover
@@ -462,7 +490,7 @@ still needs its own qualification.
 | PT-3 identity and authority importer, with PT-5a's v1.2 mapping | L | Credential and rotation hashes, owner links, the identity-link pin, consents and grants, accountless state and collection controls, with production target modes built on PT-1 | Import, and device authentication after the flip |
 | PT-4: v0.x importer | M | v0.x contributions and admission windows, or an owner decision to retire v0.x backed by traffic evidence | Completeness of raw evidence |
 | PT-8-lite: orchestrator | L | One disposition per sealed table keyed on the live ledger; the deletion-digest exclusion count; the identity-pin fingerprint check; a history-digest and manifest-digest parity sample between D1 and PostgreSQL | The go/no-go, and avoiding a fleet-wide re-upload storm |
-| Dense-owner path | M (remaining, estimate) | Delivered in memory on `claude/gcp-fp-caps` (OD-11). Remaining: a dense oracle through the real D1 effective reader (the HX-4 sealed-SQLite adapter, Node 24.10 or later) rather than a stand-in reader; calibrating the memory model on the Cloud SQL seed; choosing the task size for the largest real owner (about 2.52 million records; its estimate is roughly 4.2 to 10 GiB depending on how many fall in the 170 analysis days, so the 8 GiB default admits it only at the low end) | Cutover: the largest real owner always takes this path |
+| Dense-owner path | M (remaining, estimate) | Delivered in memory on `claude/gcp-fp-caps` (OD-11) and proven equal to production's native path through the importer chain and the real readers on the dense golden (`claude/gcp-fastpath-dense`). Remaining: the cloud measurement with the `dense` refresh profile (4 vCPU, 16 GiB) and a memory-model recalibration on the Cloud SQL seed; the T-2 importer's quadratic reader verification before the seal; the v1/v1.1 expansion at legacy-owner volume | Cutover: the largest real owner always takes this path |
 | Non-effective sources | Depends on OD-4 | v1-only, mixed and v0.2 graph paths, needed only if the production check finds such owners | A parity claim for those owners |
 | Memo mode | M (estimate) | The digest-keyed owner-day memo, the dirty-owner cursor and the nightly full sweep, measured on real data | The cutover cadence (decision D3) |
 | OPS-2 to OPS-5, with OPS-10 | L | Scripted infrastructure with plan, readback and apply; Cloud Run Jobs and Cloud Scheduler as code; probe jobs; monitoring and alerting; the production migration job and rollout | Production origin deploy and operation |
@@ -515,9 +543,12 @@ approves that policy.
   secrets from the owner's custody.
 - Dense owners were excluded from the night's parity gate. The cap raise
   proves dense analysis against production's native kernels with a stand-in
-  reader on synthetic data; the reader at production volumes, production's
-  Worker-only cache refusals (which GCP does not reproduce) and the largest
-  real owner's task size remain open (see the cap-raise receipt).
+  reader on synthetic data; the dense-owner parity run then proves it through
+  the importers and the real readers against the dense production-code
+  golden. Production volumes, production's Worker-only cache refusals (which
+  GCP does not reproduce), the T-2 importer's quadratic reader verification
+  and a measured cloud run of the largest-owner task size remain open (see
+  the cap-raise and dense-owner parity receipts).
 - The oracle may not converge under the Workers test pool. The fallback is a
   kernel-composed golden, which proves glue, I/O and the route but not
   production publisher semantics.
