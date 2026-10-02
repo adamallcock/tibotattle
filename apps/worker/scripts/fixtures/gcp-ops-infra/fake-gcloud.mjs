@@ -51,6 +51,7 @@ export function bornBucket({ name, location, generation = "1700000000000001", me
 export function emptyWorld() {
   return {
     serviceAccounts: [],
+    serviceAccountPolicies: {},
     roles: [],
     projectPolicy: { bindings: [], etag: "BwSynthetic=" },
     repositories: [],
@@ -151,9 +152,11 @@ function applySqlFlags(instance, argv) {
 /**
  * Returns { runner, calls, world }. `files` maps a written spec path to its
  * text (the in-memory writer the check gives apply). `failWhen(argv)` makes a
- * call exit non-zero with a marker on stderr.
+ * call exit non-zero with a marker on stderr. `clock()` stamps a trigger's
+ * userUpdateTime on create, update and pause, as Cloud Scheduler does.
  */
-export function createFakeGcloud(world, { files = new Map(), failWhen = () => false, project, region } = {}) {
+export function createFakeGcloud(world, { files = new Map(), failWhen = () => false, project, region,
+  clock = () => "2026-10-02T00:00:00Z" } = {}) {
   const calls = [];
   const json = (value) => ({ status: 0, stdout: JSON.stringify(value), stderr: "" });
   const done = () => ({ status: 0, stdout: "", stderr: "Updated." });
@@ -167,6 +170,16 @@ export function createFakeGcloud(world, { files = new Map(), failWhen = () => fa
       case path === "iam service-accounts list": return json(world.serviceAccounts);
       case path === "iam service-accounts create":
         world.serviceAccounts.push({ email: `${name(3)}@${project}.iam.gserviceaccount.com`, disabled: false });
+        return done();
+      case path === "iam service-accounts get-iam-policy":
+        if (!world.serviceAccounts.some((account) => account.email === name(3))) {
+          return { status: 1, stdout: "", stderr: "synthetic: no such account" };
+        }
+        return json(world.serviceAccountPolicies[name(3)] ?? { etag: "ACAB" });
+      case path === "iam service-accounts add-iam-policy-binding":
+        world.serviceAccountPolicies[name(3)] ??= {};
+        addBinding(world.serviceAccountPolicies[name(3)], { role: flag(argv, "--role"), member: flag(argv, "--member"),
+          condition: null });
         return done();
       case path === "iam roles list": return json(world.roles.map((role) => ({ name: role.name, deleted: role.deleted })));
       case path === "iam roles describe": return json(world.roles.find((role) => role.name.endsWith(`/${name(3)}`)));
@@ -306,6 +319,8 @@ export function createFakeGcloud(world, { files = new Map(), failWhen = () => fa
           },
           retryConfig: {},
           state: previous?.state ?? "ENABLED",
+          userUpdateTime: clock(),
+          ...(previous?.lastAttemptTime === undefined ? {} : { lastAttemptTime: previous.lastAttemptTime }),
         });
         return done();
       }
@@ -314,6 +329,7 @@ export function createFakeGcloud(world, { files = new Map(), failWhen = () => fa
         const job = world.schedulerJobs.find((entry) => entry.name.endsWith(`/${name(3)}`));
         if (job?.state !== "ENABLED") return { status: 1, stdout: "", stderr: "synthetic: not enabled" };
         job.state = "PAUSED";
+        job.userUpdateTime = clock();
         return done();
       }
       default:

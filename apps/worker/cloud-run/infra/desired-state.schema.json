@@ -1,0 +1,671 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tibotattle:gcp-ops-infra-desired-state:v2",
+  "title": "TiboTattle GCP infrastructure desired state (v2)",
+  "description": "Editor and review aid for the committed desired-state files. scripts/gcp-ops-infra-manifest.mjs validateDesiredState is authoritative and also enforces the name, plane, budget, secret-material and placeholder rules this schema cannot express; its check holds this schema's closed key sets to DESIRED_STATE_SHAPE.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "environment",
+    "projectTenancy",
+    "project",
+    "projectNumber",
+    "region",
+    "artifactRegistry",
+    "serviceAccounts",
+    "customRole",
+    "secrets",
+    "cloudSql",
+    "bucket",
+    "service",
+    "jobs",
+    "scheduler"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "tibotattle-gcp-ops-infra-desired-state-v2"
+    },
+    "environment": {
+      "enum": [
+        "production",
+        "staging"
+      ]
+    },
+    "projectTenancy": {
+      "enum": [
+        "dedicated",
+        "shared"
+      ],
+      "description": "shared: the plane lives in a project it shares with other resources, which are never managed or removed; production is always dedicated"
+    },
+    "project": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]$",
+      "description": "null is an owner placeholder (OWN-5); the validator refuses it"
+    },
+    "projectNumber": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[1-9][0-9]{5,19}$",
+      "description": "null is an owner placeholder (OWN-5)"
+    },
+    "region": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[a-z]+-[a-z]+[0-9]{1,2}$",
+      "description": "null is an owner placeholder (OWN-5)"
+    },
+    "artifactRegistry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "imageName"
+      ],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "pattern": "^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+        },
+        "imageName": {
+          "type": "string",
+          "pattern": "^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$"
+        }
+      }
+    },
+    "serviceAccounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runtime",
+        "migrator",
+        "scheduler",
+        "builder",
+        "edgeInvoker",
+        "verifier"
+      ],
+      "properties": {
+        "runtime": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "accountId",
+            "projectRoles"
+          ],
+          "properties": {
+            "accountId": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+            },
+            "projectRoles": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            }
+          }
+        },
+        "migrator": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "accountId",
+            "projectRoles"
+          ],
+          "properties": {
+            "accountId": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+            },
+            "projectRoles": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            }
+          }
+        },
+        "scheduler": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "accountId",
+            "projectRoles"
+          ],
+          "properties": {
+            "accountId": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+            },
+            "projectRoles": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            }
+          }
+        },
+        "builder": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "accountId",
+            "projectRoles"
+          ],
+          "properties": {
+            "accountId": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+            },
+            "projectRoles": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            }
+          }
+        },
+        "edgeInvoker": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "accountId",
+            "projectRoles"
+          ],
+          "properties": {
+            "accountId": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+            },
+            "projectRoles": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            }
+          }
+        },
+        "verifier": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "accountId",
+                "projectRoles",
+                "tokenCreators"
+              ],
+              "properties": {
+                "accountId": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+                },
+                "projectRoles": {
+                  "type": "array",
+                  "maxItems": 0
+                },
+                "tokenCreators": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "type": "array",
+                      "minItems": 1,
+                      "maxItems": 4,
+                      "uniqueItems": true,
+                      "items": {
+                        "type": "string",
+                        "pattern": "^(?:user|group|serviceAccount):[A-Za-z0-9._%+-]{1,64}@[a-z0-9-]+(?:\\.[a-z0-9-]+)*\\.[a-z]{2,}$"
+                      }
+                    }
+                  ],
+                  "description": "Principals granted roles/iam.serviceAccountTokenCreator on the verifier account only (OD-CR-7); null until the owner names the operator"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "customRole": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "permissions"
+      ],
+      "properties": {
+        "id": {
+          "const": "tibotattleQuarantineStore"
+        },
+        "permissions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-zA-Z0-9]*(?:\\.[a-zA-Z0-9]+){2}$"
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "secrets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "IDENTITY_LINK_SECRET",
+        "POSTGRES_RATE_LIMIT_SECRET",
+        "ENVELOPE_PUBLIC_JWK",
+        "ENVELOPE_PRIVATE_JWK",
+        "GOOGLE_OIDC_CLIENT_SECRET",
+        "APPLE_PRIVATE_KEY",
+        "DISTRIBUTION_GITHUB_API_TOKEN"
+      ],
+      "properties": {
+        "IDENTITY_LINK_SECRET": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "secretName",
+            "version"
+          ],
+          "properties": {
+            "secretName": {
+              "type": "string",
+              "pattern": "^(?:IDENTITY_LINK_SECRET|tibotattle-[a-z0-9]+(?:-[a-z0-9]+)*)$",
+              "maxLength": 255,
+              "description": "The Secret Manager secret id, never a value. Production: the variable name or a tibotattle- id; staging: a tibotattle-staging- id"
+            },
+            "version": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[1-9][0-9]{0,9}$",
+              "description": "The pinned version number; null until populated"
+            }
+          }
+        },
+        "POSTGRES_RATE_LIMIT_SECRET": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "secretName",
+            "version"
+          ],
+          "properties": {
+            "secretName": {
+              "type": "string",
+              "pattern": "^(?:POSTGRES_RATE_LIMIT_SECRET|tibotattle-[a-z0-9]+(?:-[a-z0-9]+)*)$",
+              "maxLength": 255,
+              "description": "The Secret Manager secret id, never a value. Production: the variable name or a tibotattle- id; staging: a tibotattle-staging- id"
+            },
+            "version": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[1-9][0-9]{0,9}$",
+              "description": "The pinned version number; null until populated"
+            }
+          }
+        },
+        "ENVELOPE_PUBLIC_JWK": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "secretName",
+            "version"
+          ],
+          "properties": {
+            "secretName": {
+              "type": "string",
+              "pattern": "^(?:ENVELOPE_PUBLIC_JWK|tibotattle-[a-z0-9]+(?:-[a-z0-9]+)*)$",
+              "maxLength": 255,
+              "description": "The Secret Manager secret id, never a value. Production: the variable name or a tibotattle- id; staging: a tibotattle-staging- id"
+            },
+            "version": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[1-9][0-9]{0,9}$",
+              "description": "The pinned version number; null until populated"
+            }
+          }
+        },
+        "ENVELOPE_PRIVATE_JWK": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "secretName",
+            "version"
+          ],
+          "properties": {
+            "secretName": {
+              "type": "string",
+              "pattern": "^(?:ENVELOPE_PRIVATE_JWK|tibotattle-[a-z0-9]+(?:-[a-z0-9]+)*)$",
+              "maxLength": 255,
+              "description": "The Secret Manager secret id, never a value. Production: the variable name or a tibotattle- id; staging: a tibotattle-staging- id"
+            },
+            "version": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[1-9][0-9]{0,9}$",
+              "description": "The pinned version number; null until populated"
+            }
+          }
+        },
+        "GOOGLE_OIDC_CLIENT_SECRET": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "secretName",
+            "version"
+          ],
+          "properties": {
+            "secretName": {
+              "type": "string",
+              "pattern": "^(?:GOOGLE_OIDC_CLIENT_SECRET|tibotattle-[a-z0-9]+(?:-[a-z0-9]+)*)$",
+              "maxLength": 255,
+              "description": "The Secret Manager secret id, never a value. Production: the variable name or a tibotattle- id; staging: a tibotattle-staging- id"
+            },
+            "version": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[1-9][0-9]{0,9}$",
+              "description": "The pinned version number; null until populated"
+            }
+          }
+        },
+        "APPLE_PRIVATE_KEY": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "secretName",
+            "version"
+          ],
+          "properties": {
+            "secretName": {
+              "type": "string",
+              "pattern": "^(?:APPLE_PRIVATE_KEY|tibotattle-[a-z0-9]+(?:-[a-z0-9]+)*)$",
+              "maxLength": 255,
+              "description": "The Secret Manager secret id, never a value. Production: the variable name or a tibotattle- id; staging: a tibotattle-staging- id"
+            },
+            "version": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[1-9][0-9]{0,9}$",
+              "description": "The pinned version number; null until populated"
+            }
+          }
+        },
+        "DISTRIBUTION_GITHUB_API_TOKEN": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "secretName",
+            "version"
+          ],
+          "properties": {
+            "secretName": {
+              "type": "string",
+              "pattern": "^(?:DISTRIBUTION_GITHUB_API_TOKEN|tibotattle-[a-z0-9]+(?:-[a-z0-9]+)*)$",
+              "maxLength": 255,
+              "description": "The Secret Manager secret id, never a value. Production: the variable name or a tibotattle- id; staging: a tibotattle-staging- id"
+            },
+            "version": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[1-9][0-9]{0,9}$",
+              "description": "The pinned version number; null until populated"
+            }
+          }
+        }
+      }
+    },
+    "cloudSql": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "instance",
+        "tier",
+        "storageSizeGb",
+        "backupStartTime",
+        "maxConnections",
+        "database",
+        "schema"
+      ],
+      "properties": {
+        "instance": {
+          "type": "string",
+          "pattern": "^[a-z](?:[a-z0-9-]{0,96}[a-z0-9])?$"
+        },
+        "tier": {
+          "type": "string",
+          "pattern": "^db-custom-([1-9][0-9]?)-([1-9][0-9]{2,6})$"
+        },
+        "storageSizeGb": {
+          "type": "integer",
+          "minimum": 10,
+          "maximum": 65536
+        },
+        "backupStartTime": {
+          "type": "string",
+          "pattern": "^(?:[01][0-9]|2[0-3]):[0-5][0-9]$"
+        },
+        "maxConnections": {
+          "type": "integer",
+          "minimum": 25,
+          "maximum": 10000
+        },
+        "database": {
+          "type": "string",
+          "pattern": "^[a-z_][a-z0-9_]{0,62}$"
+        },
+        "schema": {
+          "type": "string",
+          "pattern": "^[a-z_][a-z0-9_]{0,62}$"
+        }
+      }
+    },
+    "bucket": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "location",
+        "proof"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{1,61}[a-z0-9]$"
+        },
+        "location": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Z]+-[A-Z]+[0-9]{1,2}$",
+          "description": "The region in upper case; null is an owner placeholder (OWN-5)"
+        },
+        "proof": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "bucketGeneration",
+                "bucketMetageneration"
+              ],
+              "properties": {
+                "bucketGeneration": {
+                  "type": "string",
+                  "pattern": "^[1-9][0-9]{0,18}$"
+                },
+                "bucketMetageneration": {
+                  "type": "string",
+                  "pattern": "^[1-9][0-9]{0,18}$"
+                }
+              }
+            }
+          ],
+          "description": "The bucket-birth receipt's proof; null until the bucket is born"
+        }
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "maxInstances",
+        "rolloutOverlapInstances",
+        "audience",
+        "telemetryStorageNamespace"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z](?:[a-z0-9-]{0,47}[a-z0-9])?$"
+        },
+        "maxInstances": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "rolloutOverlapInstances": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "audience": {
+          "type": "string",
+          "pattern": "^[!-~](?:[ -~]{0,254}[!-~])?$"
+        },
+        "telemetryStorageNamespace": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Za-z0-9._:-]{1,256}$",
+          "description": "The namespace the imported data carries; null until assigned, and the service cannot render without it"
+        }
+      }
+    },
+    "jobs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "production-migrate",
+        "analytics-refresh"
+      ],
+      "properties": {
+        "production-migrate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "maxConnections"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "pattern": "^[a-z](?:[a-z0-9-]{0,47}[a-z0-9])?$"
+            },
+            "maxConnections": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 50
+            }
+          }
+        },
+        "analytics-refresh": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "maxConnections"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "pattern": "^[a-z](?:[a-z0-9-]{0,47}[a-z0-9])?$"
+            },
+            "maxConnections": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 50
+            }
+          }
+        }
+      }
+    },
+    "scheduler": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "analytics-refresh"
+      ],
+      "properties": {
+        "analytics-refresh": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "schedule",
+            "state"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "pattern": "^[a-z](?:[a-z0-9-]{0,47}[a-z0-9])?$"
+            },
+            "schedule": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "Five-field cron in Etc/UTC; null until the owner sets the cadence (D3)"
+            },
+            "state": {
+              "enum": [
+                "PAUSED",
+                "ENABLED"
+              ],
+              "description": "PAUSED until OPS-3 resumes the trigger; apply never resumes"
+            }
+          }
+        }
+      }
+    }
+  }
+}

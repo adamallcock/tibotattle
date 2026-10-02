@@ -11,12 +11,16 @@ import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { resolveAnalyticsRefreshDatabase } from "../cloud-run/analytics-refresh.mjs";
+import {
+  ANALYTICS_REFRESH_RESOURCE_ENV,
+  analyticsRefreshResources,
+  parseAnalyticsRefreshArguments,
+} from "../cloud-run/analytics-refresh.mjs";
 import * as configuration from "../cloud-run/postgres-production-configuration.mjs";
 import * as migrations from "../cloud-run/postgres-production-migrations.mjs";
 import { TEST_MIGRATIONS_TARGETS } from "../cloud-run/test-migrations.mjs";
 import { GCP_PRIVATE_TEST_TARGET } from "./gcp-private-test-deploy.mjs";
-import { FASTPATH_TEST } from "./gcp-fastpath-test-deploy.mjs";
+import { FASTPATH_TEST, REFRESH_JOB_PROFILES } from "./gcp-fastpath-test-deploy.mjs";
 import * as manifest from "./gcp-ops-infra-manifest.mjs";
 import * as rollout from "./gcp-production-rollout.mjs";
 
@@ -58,6 +62,9 @@ function stagingNames(value) {
   value.jobs["production-migrate"].name = "synthetic-staging-migrate";
   value.jobs["analytics-refresh"].name = "synthetic-staging-refresh";
   value.scheduler["analytics-refresh"].name = "synthetic-staging-trigger";
+  for (const [name, secret] of Object.entries(value.secrets)) {
+    secret.secretName = `tibotattle-staging-${name.toLowerCase().replaceAll("_", "-")}`;
+  }
 }
 
 function refused(mutate, code, options) {
@@ -141,22 +148,71 @@ test("the trigger state is closed: PAUSED until OPS-3 resumes it, and never ENAB
     fixture((value) => { value.scheduler["analytics-refresh"].schedule = "15 3 * * *"; }))));
 });
 
-test("the analytics-refresh job stays deferred while its entry refuses every non-test target", async () => {
-  assert.deepEqual({ ...manifest.DEFERRED_JOBS },
-    { "analytics-refresh": "ANALYTICS_REFRESH_PRODUCTION_TARGET_UNAVAILABLE" });
-  assert.deepEqual([...manifest.deployedJobNames()], ["production-migrate"]);
-  // The pin: the env OPS-2 would render for the job, run as that Cloud Run
-  // Job, is refused by cloud-run/analytics-refresh.mjs in both planes. Once
-  // the entry gains a reviewed production target path this fails; remove the
-  // DEFERRED_JOBS entry together with this assertion.
+test("the analytics-refresh job renders the production refresh-job contract in the dense profile", () => {
+  // The deferral is lifted: both jobs deploy, and OPS-10 moves both.
+  assert.deepEqual({ ...manifest.DEFERRED_JOBS }, {});
+  assert.deepEqual([...manifest.deployedJobNames()], ["production-migrate", "analytics-refresh"]);
+  assert.deepEqual({ ...manifest.ANALYTICS_REFRESH_TASK_PROFILE }, { name: "dense", cpu: "4", memory: "16Gi",
+    heapMiB: 12_288, memoryBudgetMiB: 10_752, timeoutSeconds: 14_400 });
+  // It is the dense measurement profile (MEAS-3 runs it), field for field,
+  // including the budget that profile sets, so the two cannot drift.
+  const dense = REFRESH_JOB_PROFILES.dense;
+  assert.deepEqual({ cpu: String(dense.cpu), memory: dense.memory, heapMiB: dense.heapMiB,
+    timeoutSeconds: dense.taskTimeoutSeconds, env: dense.env.map((entry) => [...entry]) }, {
+    cpu: manifest.ANALYTICS_REFRESH_TASK_PROFILE.cpu, memory: manifest.ANALYTICS_REFRESH_TASK_PROFILE.memory,
+    heapMiB: manifest.ANALYTICS_REFRESH_TASK_PROFILE.heapMiB,
+    timeoutSeconds: manifest.ANALYTICS_REFRESH_TASK_PROFILE.timeoutSeconds,
+    env: [["ANALYTICS_V2_MEMORY_BUDGET_MIB", String(manifest.ANALYTICS_REFRESH_TASK_PROFILE.memoryBudgetMiB)]] });
   for (const value of [unmarked(), unmarked(stagingNames)]) {
     const desired = manifest.validateDesiredState(value);
     const job = manifest.renderJob(desired, "analytics-refresh", IMAGE);
-    const container = job.spec.template.spec.template.spec.containers[0];
+    const task = job.spec.template.spec.template.spec;
+    const container = task.containers[0];
+    // node --max-old-space-size=<heap> dist/analytics-refresh.mjs --mode=full, nothing else.
+    assert.deepEqual(container.command, ["node"]);
+    assert.deepEqual(container.args, ["--max-old-space-size=12288", "dist/analytics-refresh.mjs", "--mode=full"]);
+    assert.deepEqual(container.resources, { limits: { cpu: "4", memory: "16Gi" } });
+    assert.equal(task.timeoutSeconds, "14400");
+    assert.equal(task.serviceAccountName, desired.serviceAccounts.runtime.email);
+    // The closed configuration env, plus OPS-10's provenance variable, and nothing a test run uses.
     const env = Object.fromEntries(container.env.map((entry) => [entry.name, entry.value]));
-    await assert.rejects(resolveAnalyticsRefreshDatabase({ ...env, CLOUD_RUN_JOB: job.metadata.name },
-      { schema: env.PRIMARY_SCHEMA }), { code: "ANALYTICS_V2_REFRESH_TARGET_FORBIDDEN" }, desired.environment);
+    assert.deepEqual(env, {
+      ANALYTICS_REFRESH_TARGET: desired.environment,
+      PRIMARY_INSTANCE_CONNECTION_NAME: desired.cloudSql.connectionName,
+      PRIMARY_DATABASE: desired.cloudSql.database,
+      PRIMARY_SCHEMA: desired.cloudSql.schema,
+      POSTGRES_IAM_USER: desired.cloudSql.runtimeIamUser,
+      ANALYTICS_V2_MEMORY_BUDGET_MIB: "10752",
+      DEPLOYMENT_SOURCE_COMMIT: IMAGE.sourceCommit,
+    });
+    for (const refusedName of manifest.ANALYTICS_REFRESH_JOB_CONTRACT.refusedEnv) {
+      assert.equal(Object.hasOwn(env, refusedName), false, refusedName);
+    }
+    for (const flag of manifest.ANALYTICS_REFRESH_JOB_CONTRACT.refusedArguments) {
+      assert.equal(container.args.some((arg) => arg === flag || arg.startsWith(`${flag}=`)), false, flag);
+    }
+    // The entry's own parser accepts the arguments after the script under
+    // this env, reads the schema from PRIMARY_SCHEMA and pins no clock.
+    const parsed = parseAnalyticsRefreshArguments(container.args.slice(2), env);
+    assert.equal(parsed.mode, "full");
+    assert.equal(parsed.schema, desired.cloudSql.schema);
+    assert.equal(parsed.nowMs, null);
+    // Its resource gate admits the rendered budget under the profile's heap,
+    // and refuses it under a heap one MiB short of budget plus reserve.
+    const MIB = 1024 * 1024;
+    const heap = manifest.ANALYTICS_REFRESH_TASK_PROFILE.heapMiB * MIB;
+    const resources = analyticsRefreshResources(env, heap);
+    assert.equal(resources.compute.memoryBudgetBytes, 10_752 * MIB);
+    assert.ok(resources.requiredHeapBytes <= heap);
+    assert.throws(() => analyticsRefreshResources(env, resources.requiredHeapBytes - MIB),
+      { code: "ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT" });
   }
+  assert.equal(ANALYTICS_REFRESH_RESOURCE_ENV.memoryBudgetMiB.name, "ANALYTICS_V2_MEMORY_BUDGET_MIB");
+  // 16 GiB leaves room beyond the heap for native memory.
+  assert.ok(manifest.ANALYTICS_REFRESH_TASK_PROFILE.heapMiB < 16 * 1024);
+  // A render never resolves an env name it does not know.
+  assert.throws(() => manifest.renderJob(manifest.validateDesiredState(fixture()), "analytics-delivery", IMAGE),
+    { code: "JOB_NAME_UNKNOWN" });
 });
 
 test("the connection budget is for one instance with no ledger pool and refuses overflow", () => {
@@ -307,9 +363,22 @@ test("Secret Manager containers are exactly CR-3's secret names, never an edge-o
     refused((value) => { value.secrets.IDENTITY_LINK_SECRET.version = version; },
       "DESIRED_STATE_VALUE_INVALID:secrets.IDENTITY_LINK_SECRET.version");
   }
-  // Containers only: the desired state holds a version number, never a value.
+  // Containers only: the desired state holds a secret id and a version number, never a value.
   refused((value) => { value.secrets.IDENTITY_LINK_SECRET.value = "synthetic"; },
-    "DESIRED_STATE_KEY_UNKNOWN:secrets.IDENTITY_LINK_SECRET.value");
+    "DESIRED_STATE_SECRET_VALUE_FORBIDDEN:desiredState.secrets.IDENTITY_LINK_SECRET.value");
+  refused((value) => { delete value.secrets.IDENTITY_LINK_SECRET.secretName; },
+    "DESIRED_STATE_KEY_MISSING:secrets.IDENTITY_LINK_SECRET.secretName");
+  for (const secretName of ["", "bad name", "a/b", "x".repeat(256), 7]) {
+    refused((value) => { value.secrets.IDENTITY_LINK_SECRET.secretName = secretName; },
+      "DESIRED_STATE_VALUE_INVALID:secrets.IDENTITY_LINK_SECRET.secretName");
+  }
+  refused((value) => {
+    value.secrets.IDENTITY_LINK_SECRET.secretName = "tibotattle-shared-secret";
+    value.secrets.APPLE_PRIVATE_KEY.secretName = "tibotattle-shared-secret";
+  }, "SECRET_NAMES_NOT_DISTINCT");
+  // Secret ids are project-wide: a test-estate secret is never reused.
+  refused((value) => { value.secrets.ENVELOPE_PRIVATE_JWK.secretName = "tibotattle-test-envelope-private-jwk-20260922"; },
+    "DESIRED_STATE_TEST_TARGET_NAME:plane:secrets.ENVELOPE_PRIVATE_JWK.secretName");
 });
 
 test("service accounts hold exactly their reviewed project roles: no primitive role, none for the edge", () => {
@@ -576,7 +645,8 @@ test("the two jobs render with their accounts, entries and bounds, the analytics
     assert.doesNotMatch(JSON.stringify(job), /LEDGER|HISTORY_PROOF/u);
   }
   assert.equal(task(migrate).timeoutSeconds, "1800");
-  assert.deepEqual(task(refresh).containers[0].args, ["dist/analytics-refresh.mjs", "--mode=full"]);
+  assert.deepEqual(task(refresh).containers[0].args, ["--max-old-space-size=12288", "dist/analytics-refresh.mjs",
+    "--mode=full"]);
   // OPS-10's PRODUCTION_MIGRATION_JOB entry (its build output) and exactly
   // the env its validateProductionMigrationEnvironment reads.
   assert.deepEqual(task(migrate).containers[0].args, ["dist/production-migrations.mjs"]);
@@ -604,20 +674,21 @@ test("the two jobs render with their accounts, entries and bounds, the analytics
     "DESIRED_STATE_TEST_TOKEN_NAME:jobs.production-migrate.name");
 });
 
-test("rolloutTarget gives OPS-10 its closed target from the environment's owner-held desired state", () => {
-  const path = "/synthetic-desired/production.json";
-  const stagingPath = "/synthetic-desired/staging.json";
-  const noVerifierPath = "/synthetic-desired/no-verifier.json";
-  const files = { [path]: JSON.stringify(unmarked()), [stagingPath]: JSON.stringify(unmarked(stagingNames)),
-    [noVerifierPath]: JSON.stringify(unmarked((value) => { value.serviceAccounts.verifier = null; })),
-    [FIXTURE_PATH]: JSON.stringify(FIXTURE) };
+test("rolloutTarget gives OPS-10 its closed target from the environment's committed desired state", () => {
+  const files = new Map([
+    [manifest.committedDesiredStatePath("production"), JSON.stringify(unmarked())],
+    [manifest.committedDesiredStatePath("staging"), JSON.stringify(unmarked(stagingNames))],
+  ]);
   const readFile = (target) => {
-    if (!Object.hasOwn(files, target)) throw new Error("synthetic: unexpected read");
-    return files[target];
+    if (!files.has(target)) throw new Error("synthetic: unexpected read");
+    return files.get(target);
   };
-  assert.deepEqual({ ...manifest.DESIRED_STATE_PATH_VARIABLES },
-    { production: "GCP_INFRA_DESIRED_STATE_PRODUCTION", staging: "GCP_INFRA_DESIRED_STATE_STAGING" });
-  const target = manifest.rolloutTarget("production", { env: { GCP_INFRA_DESIRED_STATE_PRODUCTION: path }, readFile });
+  assert.deepEqual({ ...manifest.COMMITTED_DESIRED_STATE_FILES }, {
+    production: "cloud-run/infra/production.desired-state.json",
+    staging: "cloud-run/infra/staging.desired-state.json",
+  });
+  assert.equal(manifest.committedDesiredStatePath("staging"), join(WORKER_ROOT, "cloud-run/infra/staging.desired-state.json"));
+  const target = manifest.rolloutTarget("production", { readFile });
   assert.deepEqual(Object.keys(target), [...manifest.ROLLOUT_TARGET_KEYS]);
   assert.deepEqual({ ...target, jobNames: [...target.jobNames] }, {
     environment: "production",
@@ -625,8 +696,8 @@ test("rolloutTarget gives OPS-10 its closed target from the environment's owner-
     region: "us-east1",
     service: "synthetic-origin",
     migrationJob: "synthetic-production-migrate",
-    // The deferred analytics-refresh job does not exist, so the rollout never moves it.
-    jobNames: ["synthetic-production-migrate"],
+    // Both jobs deploy, so the rollout moves both.
+    jobNames: ["synthetic-production-migrate", "synthetic-analytics-refresh"],
     primaryInstance: "synthetic-primary",
     imageRepository: `us-east1-docker.pkg.dev/${UNMARKED_PROJECT}/synthetic-images/synthetic-host`,
     builderServiceAccount: `synthetic-builder@${UNMARKED_PROJECT}.iam.gserviceaccount.com`,
@@ -635,24 +706,31 @@ test("rolloutTarget gives OPS-10 its closed target from the environment's owner-
     originAudience: "synthetic-edge-origin-audience",
   });
   assert.equal(Object.isFrozen(target.jobNames), true);
-  assert.equal(manifest.rolloutTarget("staging", { env: { GCP_INFRA_DESIRED_STATE_STAGING: stagingPath }, readFile })
-    .service, "synthetic-staging-origin");
-  for (const [environment, env, code] of [
-    ["production", {}, "GCP_INFRA_DESIRED_STATE_UNCONFIGURED"],
-    ["production", { GCP_INFRA_DESIRED_STATE_PRODUCTION: "" }, "GCP_INFRA_DESIRED_STATE_UNCONFIGURED"],
-    ["production", { GCP_INFRA_DESIRED_STATE_STAGING: path }, "GCP_INFRA_DESIRED_STATE_UNCONFIGURED"],
-    ["production", { GCP_INFRA_DESIRED_STATE_PRODUCTION: "relative.json" }, "GCP_INFRA_DESIRED_STATE_PATH_INVALID"],
-    ["test", { GCP_INFRA_DESIRED_STATE_PRODUCTION: path }, "GCP_INFRA_ENVIRONMENT_INVALID"],
-    ["production", { GCP_INFRA_DESIRED_STATE_PRODUCTION: stagingPath }, "GCP_INFRA_ENVIRONMENT_MISMATCH"],
-    ["staging", { GCP_INFRA_DESIRED_STATE_STAGING: path }, "GCP_INFRA_ENVIRONMENT_MISMATCH"],
-    ["production", { GCP_INFRA_DESIRED_STATE_PRODUCTION: "/synthetic-desired/absent.json" }, "DESIRED_STATE_UNREADABLE"],
-    // The shipped synthetic fixture is never a rollout target.
-    ["production", { GCP_INFRA_DESIRED_STATE_PRODUCTION: FIXTURE_PATH }, "ROLLOUT_TARGET_SYNTHETIC_REFUSED"],
-    // The desired state may omit the verifier; a rollout cannot.
-    ["production", { GCP_INFRA_DESIRED_STATE_PRODUCTION: noVerifierPath }, "ROLLOUT_TARGET_VERIFIER_REQUIRED"],
-  ]) {
-    assert.throws(() => manifest.rolloutTarget(environment, { env, readFile }), { code }, `${environment} ${code}`);
-  }
+  assert.equal(manifest.rolloutTarget("staging", { readFile }).service, "synthetic-staging-origin");
+  const refusedWith = (environment, text, code) => {
+    const reader = (path) => (path === manifest.committedDesiredStatePath(environment) ? text : readFile(path));
+    assert.throws(() => manifest.rolloutTarget(environment, { readFile: reader }), { code }, `${environment} ${code}`);
+  };
+  assert.throws(() => manifest.rolloutTarget("test", { readFile }), { code: "GCP_INFRA_ENVIRONMENT_INVALID" });
+  refusedWith("production", JSON.stringify(unmarked(stagingNames)), "GCP_INFRA_ENVIRONMENT_MISMATCH");
+  refusedWith("staging", JSON.stringify(unmarked()), "GCP_INFRA_ENVIRONMENT_MISMATCH");
+  refusedWith("production", "{", "DESIRED_STATE_UNREADABLE");
+  // The shipped synthetic fixture is never a committed desired state, so never a rollout target.
+  refusedWith("production", JSON.stringify(FIXTURE), "COMMITTED_DESIRED_STATE_SYNTHETIC");
+  // A committed desired state names the verifier (OD-CR-7); a rollout also needs its operator.
+  refusedWith("production", JSON.stringify(unmarked((value) => { value.serviceAccounts.verifier = null; })),
+    "COMMITTED_DESIRED_STATE_VERIFIER_REQUIRED");
+  refusedWith("production", JSON.stringify(unmarked((value) => { value.serviceAccounts.verifier.tokenCreators = null; })),
+    "ROLLOUT_TARGET_VERIFIER_TOKEN_CREATOR_UNASSIGNED");
+  assert.throws(() => manifest.rolloutTargetFromDesiredState(manifest.validateDesiredState(fixture())),
+    { code: "ROLLOUT_TARGET_SYNTHETIC_REFUSED" });
+  assert.throws(() => manifest.rolloutTargetFromDesiredState(manifest.validateDesiredState(unmarked((value) => {
+    value.serviceAccounts.verifier = null;
+  }))), { code: "ROLLOUT_TARGET_VERIFIER_REQUIRED" });
+  // With no injected reader, the real committed files answer: staging waits
+  // for its operator, production for OWN-5.
+  assert.throws(() => manifest.rolloutTarget("staging"), { code: "ROLLOUT_TARGET_VERIFIER_TOKEN_CREATOR_UNASSIGNED" });
+  assert.throws(() => manifest.rolloutTarget("production"), { code: "DESIRED_STATE_PLACEHOLDER_UNFILLED:project" });
 });
 
 test("OPS-10 accepts the rendered migration job and the rollout target (integrated; never skipped)", async () => {
@@ -736,14 +814,358 @@ test("the one Cloud SQL instance renders PostgreSQL 17 ENTERPRISE with OPS-1 bac
   assert.equal(manifest.databaseFlagsArgument(desired).split(",").length, 10);
 });
 
-test("the manifest stays pure: no child process or network, and one process.env default", () => {
+test("the manifest stays pure: no child process, network or process environment", () => {
   const source = readFileSync(join(SCRIPTS_ROOT, "gcp-ops-infra-manifest.mjs"), "utf8");
   const code = source.replace(/\/\*[\s\S]*?\*\//gu, "").replace(/^\s*\/\/.*$/gmu, "");
   assert.doesNotMatch(code, /child_process|spawnSync|\bfetch\(|node:net|node:https?/u);
-  // rolloutTarget's default env (OPS-10 passes only the environment) is the
-  // one ambient input, and it only names the desired-state file's path.
-  assert.deepEqual([...code.matchAll(/process\.env/gu)].length, 1);
-  assert.match(code, /export function rolloutTarget\(environment, \{ env = process\.env, readFile, readSource \} = \{\}\) \{/u);
+  // The desired state comes from the committed files only: no variable names a path.
+  assert.equal([...code.matchAll(/process\.env/gu)].length, 0);
+  assert.doesNotMatch(source, /GCP_INFRA_DESIRED_STATE_(?:PRODUCTION|STAGING)/u);
+  assert.match(code, /export function rolloutTarget\(environment, \{ readFile, readSource \} = \{\}\) \{/u);
   assert.doesNotMatch(source, /postgres-ledger-authority/u);
   assert.match(source, /not Terraform/u);
+});
+
+// ---------------------------------------------------------------------------
+// The committed desired states (owner decision 2026-10-02)
+
+const COMMITTED = Object.freeze({
+  production: readFileSync(join(WORKER_ROOT, "cloud-run/infra/production.desired-state.json"), "utf8"),
+  staging: readFileSync(join(WORKER_ROOT, "cloud-run/infra/staging.desired-state.json"), "utf8"),
+});
+const OWN5_FILL = Object.freeze({ project: UNMARKED_PROJECT, projectNumber: "100000000002", region: "us-east1" });
+
+function committed(environment, mutate = () => {}) {
+  const value = JSON.parse(COMMITTED[environment]);
+  mutate(value);
+  return value;
+}
+
+/** The committed production file with OWN-5's placeholders filled by synthetic values. */
+function filledProduction(mutate = () => {}) {
+  return committed("production", (value) => {
+    Object.assign(value, OWN5_FILL);
+    value.bucket.location = "US-EAST1";
+    mutate(value);
+  });
+}
+
+function nullPaths(value, path = "") {
+  if (value === null) return [path];
+  if (Array.isArray(value)) return value.flatMap((entry, index) => nullPaths(entry, `${path}[${index}]`));
+  if (typeof value === "object") {
+    return Object.entries(value).flatMap(([key, entry]) => nullPaths(entry, path === "" ? key : `${path}.${key}`));
+  }
+  return [];
+}
+
+function planeIdentifiers(desired) {
+  return [desired.artifactRegistry.imageRepository, desired.cloudSql.instance, desired.cloudSql.database,
+    desired.cloudSql.schema, desired.bucket.name, desired.service.name, desired.service.audience,
+    ...Object.values(desired.serviceAccounts).filter(Boolean).map((account) => account.accountId),
+    ...Object.values(desired.jobs).map((job) => job.name), ...Object.values(desired.scheduler).map((trigger) => trigger.name),
+    ...Object.values(desired.secrets).map((secret) => secret.secretName)];
+}
+
+test("the committed staging desired state loads: a new plane in the shared GCP test project", () => {
+  const desired = manifest.loadCommittedDesiredState("staging");
+  assert.equal(desired.environment, "staging");
+  assert.equal(desired.projectTenancy, "shared");
+  assert.equal(desired.project, GCP_PRIVATE_TEST_TARGET.project);
+  assert.equal(desired.synthetic, false);
+  assert.deepEqual(manifest.unfilledPlaceholders(JSON.parse(COMMITTED.staging)), []);
+  // New resources only: nothing the test estate (tibotattle-test-app, the
+  // OAuth gateway, the test databases, jobs, secrets and buckets) uses.
+  for (const name of planeIdentifiers(desired)) {
+    assert.equal(manifest.TEST_TARGET_NAMES.includes(name), false, name);
+    assert.equal(manifest.TEST_TARGET_PREFIXES.some((prefix) => name.startsWith(prefix)), false, name);
+    assert.equal(/(?:^|[^a-z0-9])test(?:[^a-z0-9]|$)/iu.test(name), false, name);
+  }
+  for (const name of [desired.cloudSql.instance, desired.bucket.name, desired.service.name, desired.artifactRegistry.repository,
+    ...Object.values(desired.jobs).map((job) => job.name), ...Object.values(desired.secrets).map((secret) => secret.secretName)]) {
+    assert.match(name, /(?:^|-)staging(?:-|$)/u, name);
+  }
+  // The verifier exists; its operator, the namespace, the cadence and the secret versions wait for the owner.
+  assert.equal(desired.serviceAccounts.verifier.accountId, "tibotattle-staging-verifier");
+  assert.equal(desired.serviceAccounts.verifier.tokenCreators, null);
+  assert.deepEqual(desired.scheduler["analytics-refresh"], {
+    name: "tibotattle-staging-analytics-refresh-trigger", schedule: null, state: "PAUSED" });
+  assert.equal(desired.service.telemetryStorageNamespace, null);
+  assert.equal(desired.bucket.proof, null);
+  assert.ok(Object.values(desired.secrets).every((secret) => secret.version === null));
+  assert.equal(desired.connectionBudget.fits, true);
+  // Its service waits for a staging template; everything else renders.
+  assert.equal(manifest.serviceRenderBlocker(desired), "STAGING_SERVICE_TEMPLATE_UNAVAILABLE");
+  assert.throws(() => manifest.renderService(desired, IMAGE), { code: "STAGING_SERVICE_TEMPLATE_UNAVAILABLE" });
+  for (const job of manifest.JOB_NAMES) assert.equal(manifest.renderJob(desired, job, IMAGE).kind, "Job");
+});
+
+test("the committed production desired state is refused until OWN-5 fills its placeholders", () => {
+  const raw = JSON.parse(COMMITTED.production);
+  assert.deepEqual([...manifest.OWNER_PLACEHOLDER_PATHS], ["project", "projectNumber", "region", "bucket.location"]);
+  assert.deepEqual([...manifest.unfilledPlaceholders(raw)], [...manifest.OWNER_PLACEHOLDER_PATHS]);
+  // Every null in the file is a placeholder or a value that waits for the owner.
+  assert.deepEqual(nullPaths(raw).sort(), [
+    "bucket.location", "bucket.proof", "project", "projectNumber", "region", "scheduler.analytics-refresh.schedule",
+    ...Object.keys(raw.secrets).map((name) => `secrets.${name}.version`),
+    "service.telemetryStorageNamespace", "serviceAccounts.verifier.tokenCreators",
+  ].sort());
+  assert.throws(() => manifest.loadCommittedDesiredState("production"),
+    { code: "DESIRED_STATE_PLACEHOLDER_UNFILLED:project" });
+  // Each placeholder refuses on its own, in the validator, whatever reads the file.
+  for (const path of manifest.OWNER_PLACEHOLDER_PATHS) {
+    const value = filledProduction((filled) => {
+      if (path === "bucket.location") filled.bucket.location = null;
+      else filled[path] = null;
+    });
+    assert.throws(() => manifest.validateDesiredState(value), { code: `DESIRED_STATE_PLACEHOLDER_UNFILLED:${path}` }, path);
+  }
+  // A staging file cannot hide behind a placeholder either.
+  assert.throws(() => manifest.validateDesiredState(committed("staging", (value) => { value.region = null; })),
+    { code: "DESIRED_STATE_PLACEHOLDER_UNFILLED:region" });
+  // Filled, it validates under the committed-file policy: dedicated, no test
+  // or staging name, and every name its own.
+  const desired = manifest.assertCommittedDesiredState(manifest.validateDesiredState(filledProduction()));
+  assert.equal(desired.projectTenancy, "dedicated");
+  assert.equal(desired.serviceAccounts.verifier.accountId, "tibotattle-verifier");
+  assert.equal(manifest.serviceRenderBlocker(desired), "TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED");
+  assert.throws(() => manifest.rolloutTargetFromDesiredState(desired), { code: "ROLLOUT_TARGET_VERIFIER_TOKEN_CREATOR_UNASSIGNED" });
+  // Production and staging share no resource name.
+  const staging = new Set(planeIdentifiers(manifest.loadCommittedDesiredState("staging")));
+  for (const name of planeIdentifiers(desired)) {
+    if (/^[A-Z_]+$/u.test(name)) continue; // production secret ids are the variable names; staging's are marked
+    assert.equal(staging.has(name), false, name);
+  }
+});
+
+test("committed files refuse test names, shared tenancy and staging names in production", () => {
+  const cases = [
+    // The GCP test project is a staging host only.
+    [(value) => { value.project = GCP_PRIVATE_TEST_TARGET.project; }, "DESIRED_STATE_TEST_TARGET_NAME:project"],
+    [(value) => { value.projectTenancy = "shared"; }, "PROJECT_TENANCY_SHARED_FORBIDDEN:production"],
+    [(value) => { value.projectTenancy = "pooled"; }, "DESIRED_STATE_VALUE_INVALID:desiredState.projectTenancy"],
+    [(value) => { value.service.name = GCP_PRIVATE_TEST_TARGET.service; }, "DESIRED_STATE_TEST_TARGET_NAME:plane:service.name"],
+    [(value) => { value.cloudSql.instance = "tibotattle-test-primary-20260922"; },
+      "DESIRED_STATE_TEST_TARGET_NAME:plane:cloudSql.instance"],
+    [(value) => { value.cloudSql.database = "tibotattle_fastpath"; }, "DESIRED_STATE_TEST_TARGET_NAME:cloudSql.database"],
+    [(value) => { value.jobs["analytics-refresh"].name = FASTPATH_TEST.refreshJob; },
+      "DESIRED_STATE_TEST_TARGET_NAME:plane:jobs.analytics-refresh.name"],
+    [(value) => { value.serviceAccounts.runtime.accountId = "tibotattle-test-runtime"; },
+      "DESIRED_STATE_TEST_TARGET_NAME:serviceAccounts.runtime.accountId"],
+    [(value) => { value.secrets.ENVELOPE_PUBLIC_JWK.secretName = "tibotattle-test-envelope-public-jwk-20260922"; },
+      "DESIRED_STATE_TEST_TARGET_NAME:plane:secrets.ENVELOPE_PUBLIC_JWK.secretName"],
+    [(value) => { value.bucket.name = "tibotattle-test-quarantine"; }, "DESIRED_STATE_TEST_TARGET_NAME:plane:bucket.name"],
+    [(value) => { value.cloudSql.schema = "tibotattle_rehearsal_primary"; }, "DESIRED_STATE_REHEARSAL_NAME:cloudSql.schema"],
+    [(value) => { value.service.name = "tibotattle-staging-origin"; }, "DESIRED_STATE_STAGING_NAME_FORBIDDEN:service.name"],
+    [(value) => { value.secrets.APPLE_PRIVATE_KEY.secretName = "tibotattle-staging-apple-private-key"; },
+      "DESIRED_STATE_STAGING_NAME_FORBIDDEN:secrets.APPLE_PRIVATE_KEY.secretName"],
+  ];
+  for (const [mutate, code] of cases) {
+    assert.throws(() => manifest.validateDesiredState(filledProduction(mutate)), { code }, code);
+  }
+  // Staging keeps its marker everywhere, never the production token, and never a test name.
+  for (const [mutate, code] of [
+    [(value) => { value.secrets.IDENTITY_LINK_SECRET.secretName = "IDENTITY_LINK_SECRET"; },
+      "SECRET_ID_FORM_INVALID:secrets.IDENTITY_LINK_SECRET.secretName"],
+    [(value) => { value.secrets.IDENTITY_LINK_SECRET.secretName = "synthetic-staging-identity-link"; },
+      "SECRET_ID_FORM_INVALID:secrets.IDENTITY_LINK_SECRET.secretName"],
+    [(value) => { value.cloudSql.instance = "tibotattle-staging-production-primary"; },
+      "DESIRED_STATE_PRODUCTION_NAME_FORBIDDEN:cloudSql.instance"],
+    [(value) => { value.service.name = "tibotattle-test-app"; }, "DESIRED_STATE_TEST_TARGET_NAME:plane:service.name"],
+    // The test estate's image repository, whole or as a test-token repository.
+    [(value) => { value.artifactRegistry.repository = "tibotattle-test"; },
+      "DESIRED_STATE_TEST_TARGET_NAME:artifactRegistry.imageRepository"],
+    [(value) => { value.artifactRegistry.repository = "tibotattle-test"; value.artifactRegistry.imageName = "staging-host"; },
+      "DESIRED_STATE_TEST_TOKEN_NAME:artifactRegistry.imageRepository"],
+    [(value) => { value.serviceAccounts.migrator.accountId = "tibotattle-test-migrator"; },
+      "DESIRED_STATE_TEST_TARGET_NAME:serviceAccounts.migrator.accountId"],
+  ]) {
+    assert.throws(() => manifest.validateDesiredState(committed("staging", mutate)), { code }, code);
+  }
+  // A staging plane may also be dedicated; only production is barred from sharing.
+  assert.equal(manifest.validateDesiredState(unmarked((value) => {
+    stagingNames(value);
+    value.projectTenancy = "dedicated";
+  })).projectTenancy, "dedicated");
+});
+
+test("committed files refuse secret material anywhere, before any shape check", () => {
+  const pem = "-----BEGIN PRIVATE KEY-----\\nc3ludGhldGlj\\n-----END PRIVATE KEY-----";
+  const jwk = JSON.stringify({ kty: "RSA", n: "synthetic", e: "AQAB", d: "synthetic" });
+  for (const [environment, mutate, path] of [
+    ["staging", (value) => { value.secrets.IDENTITY_LINK_SECRET.value = "synthetic-secret"; },
+      "desiredState.secrets.IDENTITY_LINK_SECRET.value"],
+    ["staging", (value) => { value.secrets.ENVELOPE_PRIVATE_JWK.jwk = { kty: "RSA" }; },
+      "desiredState.secrets.ENVELOPE_PRIVATE_JWK.jwk"],
+    ["staging", (value) => { value.secrets.APPLE_PRIVATE_KEY.privateKey = pem; },
+      "desiredState.secrets.APPLE_PRIVATE_KEY.privateKey"],
+    ["staging", (value) => { value.serviceAccounts.edgeInvoker.keyJson = "{}"; },
+      "desiredState.serviceAccounts.edgeInvoker.keyJson"],
+    ["staging", (value) => { value.password = "x"; }, "desiredState.password"],
+    ["staging", (value) => { value.service.audience = pem; }, "desiredState.service.audience"],
+    ["staging", (value) => { value.service.audience = jwk; }, "desiredState.service.audience"],
+    ["staging", (value) => { value.secrets.GOOGLE_OIDC_CLIENT_SECRET.secretName = `AIza${"Sy".repeat(17)}x`; },
+      "desiredState.secrets.GOOGLE_OIDC_CLIENT_SECRET.secretName"],
+    ["staging", (value) => { value.secrets.DISTRIBUTION_GITHUB_API_TOKEN.secretName = `ghp_${"aB3".repeat(12)}`; },
+      "desiredState.secrets.DISTRIBUTION_GITHUB_API_TOKEN.secretName"],
+    ["staging", (value) => { value.secrets.POSTGRES_RATE_LIMIT_SECRET.secretName = "Q2xhdWRlU3ludGhldGljU2VjcmV0VmFsdWUxMjM0"; },
+      "desiredState.secrets.POSTGRES_RATE_LIMIT_SECRET.secretName"],
+    ["staging", (value) => { value.service.telemetryStorageNamespace = "x".repeat(257); },
+      "desiredState.service.telemetryStorageNamespace"],
+    ["production", (value) => { value.secrets.IDENTITY_LINK_SECRET.version = "synthetic-value"; value.token = "t"; },
+      "desiredState.token"],
+  ]) {
+    const value = environment === "production" ? filledProduction(mutate) : committed(environment, mutate);
+    assert.throws(() => manifest.validateDesiredState(value), { code: `DESIRED_STATE_SECRET_VALUE_FORBIDDEN:${path}` }, path);
+  }
+  // Identifiers are not mistaken for secrets.
+  assert.equal(manifest.validateDesiredState(committed("staging", (value) => {
+    value.service.audience = "tibotattle-staging-edge-origin-audience-with-a-long-lowercase-name";
+  })).service.audience.length > 32, true);
+  assert.ok(manifest.SECRET_VALUE_KEYS.includes("value"));
+});
+
+test("committed files close each secret id to its plane's form, so a pasted value is never an id", () => {
+  // Synthetic stand-ins for the shapes the secret-material scan cannot tell
+  // from an identifier: lowercase hex, uppercase hex, lowercase base64url and
+  // a mixed-case token shorter than the scan's 32 characters.
+  const pasted = [
+    "0f1e2d3c4b5a6978".repeat(4),
+    "0F1E2D3C4B5A6978".repeat(4),
+    "c3ludghldglj_c2vjcmv0-dmfsdwu0zm9ylxrlc3q",
+    "Ab3dEf6hIj9lMn2pQr5tUv8xYz1bCd4wX".slice(0, 31),
+  ];
+  const code = "SECRET_ID_FORM_INVALID:secrets.IDENTITY_LINK_SECRET.secretName";
+  for (const value of pasted) {
+    assert.throws(() => manifest.validateDesiredState(filledProduction((desired) => {
+      desired.secrets.IDENTITY_LINK_SECRET.secretName = value;
+    })), { code }, `production ${value}`);
+    assert.throws(() => manifest.validateDesiredState(committed("staging", (desired) => {
+      desired.secrets.IDENTITY_LINK_SECRET.secretName = value;
+    })), { code }, `staging ${value}`);
+  }
+  // Production: the variable name EP-7's template uses, or a tibotattle- id;
+  // never another variable's name, a foreign prefix or upper-case words.
+  for (const value of ["APPLE_PRIVATE_KEY", "IDENTITY_LINK", "identity-link-secret", "Tibotattle-identity-link",
+    "tibotattle_identity_link", "tibotattle-", "tibotattle--identity"]) {
+    assert.throws(() => manifest.validateDesiredState(filledProduction((desired) => {
+      desired.secrets.IDENTITY_LINK_SECRET.secretName = value;
+    })), { code }, `production ${value}`);
+  }
+  assert.equal(manifest.validateDesiredState(filledProduction((desired) => {
+    desired.secrets.IDENTITY_LINK_SECRET.secretName = "tibotattle-identity-link";
+  })).secrets.IDENTITY_LINK_SECRET.secretName, "tibotattle-identity-link");
+  // Staging: only tibotattle-staging- ids.
+  for (const value of ["tibotattle-identity-link", "staging-identity-link", "tibotattle-staging-"]) {
+    assert.throws(() => manifest.validateDesiredState(committed("staging", (desired) => {
+      desired.secrets.IDENTITY_LINK_SECRET.secretName = value;
+    })), { code }, `staging ${value}`);
+  }
+  // The committed ids are in their forms, and the JSON Schema states the
+  // union of both forms per variable and refuses every pasted value.
+  const schema = JSON.parse(readFileSync(join(WORKER_ROOT, manifest.DESIRED_STATE_JSON_SCHEMA_FILE), "utf8"));
+  const production = JSON.parse(COMMITTED.production);
+  const staging = JSON.parse(COMMITTED.staging);
+  assert.equal(manifest.STAGING_SECRET_ID.source.startsWith("^tibotattle-staging-"), true);
+  for (const [name, node] of Object.entries(schema.properties.secrets.properties)) {
+    const secretName = node.properties.secretName;
+    assert.equal(secretName.pattern, `^(?:${name}|${manifest.PLANE_SECRET_ID.source.slice(1, -1)})$`, name);
+    assert.equal(secretName.maxLength, 255, name);
+    const pattern = new RegExp(secretName.pattern, "u");
+    assert.equal(production.secrets[name].secretName, name, name);
+    assert.equal(manifest.STAGING_SECRET_ID.test(staging.secrets[name].secretName), true, name);
+    assert.equal(pattern.test(staging.secrets[name].secretName), true, name);
+    for (const value of pasted) assert.equal(pattern.test(value), false, `${name} ${value}`);
+  }
+});
+
+test("the verifier's token creators are the operator's principals only, closed and normalized", () => {
+  const desired = manifest.validateDesiredState(fixture((value) => {
+    value.serviceAccounts.verifier.tokenCreators = ["user:operator@example.com", "group:ops@example.com"];
+  }));
+  assert.deepEqual(desired.serviceAccounts.verifier.tokenCreators, ["group:ops@example.com", "user:operator@example.com"]);
+  assert.equal(manifest.TOKEN_CREATOR_ROLE, "roles/iam.serviceAccountTokenCreator");
+  for (const tokenCreators of [[], ["allUsers"], ["allAuthenticatedUsers"], ["domain:example.com"],
+    ["user:operator"], ["operator@example.com"], ["user:a@example.com", "user:a@example.com"],
+    ["user:a@example.com", "user:b@example.com", "user:c@example.com", "user:d@example.com", "user:e@example.com"],
+    "user:operator@example.com", [7]]) {
+    refused((value) => { value.serviceAccounts.verifier.tokenCreators = tokenCreators; },
+      "DESIRED_STATE_VALUE_INVALID:serviceAccounts.verifier.tokenCreators");
+  }
+  refused((value) => { delete value.serviceAccounts.verifier.tokenCreators; },
+    "DESIRED_STATE_KEY_MISSING:serviceAccounts.verifier.tokenCreators");
+  // Only the verifier carries the key, and no account of the plane may mint its tokens.
+  refused((value) => { value.serviceAccounts.edgeInvoker.tokenCreators = null; },
+    "DESIRED_STATE_KEY_UNKNOWN:serviceAccounts.edgeInvoker.tokenCreators");
+  refused((value) => {
+    value.serviceAccounts.verifier.tokenCreators = ["serviceAccount:synthetic-runtime@synthetic-ops-project.iam.gserviceaccount.com"];
+  }, "VERIFIER_TOKEN_CREATOR_MANAGED_ACCOUNT_FORBIDDEN");
+});
+
+test("the committed JSON Schema has exactly the validator's closed key sets", () => {
+  const schema = JSON.parse(readFileSync(join(WORKER_ROOT, manifest.DESIRED_STATE_JSON_SCHEMA_FILE), "utf8"));
+  const closed = (node, keys, label) => {
+    assert.equal(node.type, "object", label);
+    assert.equal(node.additionalProperties, false, label);
+    assert.deepEqual(Object.keys(node.properties), [...keys], label);
+    assert.deepEqual(node.required, [...keys], label);
+  };
+  const variant = (node) => node.oneOf?.find((entry) => entry.type === "object") ?? node;
+  const shape = manifest.DESIRED_STATE_SHAPE;
+  closed(schema, shape.desiredState, "desiredState");
+  assert.equal(schema.properties.schemaVersion.const, manifest.GCP_OPS_INFRA_DESIRED_STATE_SCHEMA);
+  assert.deepEqual(schema.properties.environment.enum, [...manifest.GCP_OPS_INFRA_ENVIRONMENTS]);
+  assert.deepEqual(schema.properties.projectTenancy.enum, [...manifest.PROJECT_TENANCIES]);
+  closed(schema.properties.artifactRegistry, shape.artifactRegistry, "artifactRegistry");
+  closed(schema.properties.serviceAccounts, manifest.SERVICE_ACCOUNT_ROLES, "serviceAccounts");
+  for (const role of manifest.SERVICE_ACCOUNT_ROLES) {
+    closed(variant(schema.properties.serviceAccounts.properties[role]),
+      role === "verifier" ? shape.verifier : shape.serviceAccount, role);
+  }
+  closed(schema.properties.customRole, shape.customRole, "customRole");
+  assert.equal(schema.properties.customRole.properties.id.const, manifest.QUARANTINE_STORE_ROLE_ID);
+  closed(schema.properties.secrets, [...configuration.REQUIRED_SECRET_NAMES, ...configuration.OPTIONAL_SECRET_NAMES], "secrets");
+  for (const secret of Object.values(schema.properties.secrets.properties)) closed(secret, shape.secret, "secret");
+  closed(schema.properties.cloudSql, shape.cloudSql, "cloudSql");
+  closed(schema.properties.bucket, shape.bucket, "bucket");
+  closed(variant(schema.properties.bucket.properties.proof), shape.bucketProof, "bucket.proof");
+  closed(schema.properties.service, shape.service, "service");
+  closed(schema.properties.jobs, manifest.JOB_NAMES, "jobs");
+  for (const job of manifest.JOB_NAMES) closed(schema.properties.jobs.properties[job], shape.job, job);
+  closed(schema.properties.scheduler, manifest.SCHEDULED_JOB_NAMES, "scheduler");
+  for (const job of manifest.SCHEDULED_JOB_NAMES) {
+    closed(schema.properties.scheduler.properties[job], shape.trigger, job);
+    assert.deepEqual(schema.properties.scheduler.properties[job].properties.state.enum, [...manifest.SCHEDULER_TRIGGER_STATES]);
+  }
+  // Exactly the owner placeholders, and the values that wait for the owner, admit null.
+  for (const path of manifest.OWNER_PLACEHOLDER_PATHS) {
+    const [head, tail] = path.split(".");
+    const node = tail === undefined ? schema.properties[head] : schema.properties[head].properties[tail];
+    assert.deepEqual(node.type, ["string", "null"], path);
+  }
+  // The committed files and the fixture carry the validator's schema version.
+  for (const text of [COMMITTED.production, COMMITTED.staging, JSON.stringify(FIXTURE)]) {
+    assert.equal(JSON.parse(text).schemaVersion, manifest.GCP_OPS_INFRA_DESIRED_STATE_SCHEMA);
+  }
+});
+
+test("the service render names each secret by its Secret Manager id and waits for its template and namespace", () => {
+  const renamed = manifest.validateDesiredState(unmarked((value) => {
+    value.secrets.IDENTITY_LINK_SECRET.secretName = "tibotattle-identity-link";
+    value.secrets.DISTRIBUTION_GITHUB_API_TOKEN.version = "2";
+  }));
+  const env = manifest.renderService(renamed, IMAGE).spec.template.spec.containers[0].env;
+  const reference = (name) => env.find((entry) => entry.name === name).valueFrom.secretKeyRef;
+  assert.deepEqual(reference("IDENTITY_LINK_SECRET"), { name: "tibotattle-identity-link", key: "1" });
+  assert.deepEqual(reference("APPLE_PRIVATE_KEY"), { name: "APPLE_PRIVATE_KEY", key: "1" });
+  assert.deepEqual(reference("DISTRIBUTION_GITHUB_API_TOKEN"), { name: "DISTRIBUTION_GITHUB_API_TOKEN", key: "2" });
+  // EP-7's own render (the template's variable names) is unchanged.
+  const values = manifest.serviceTemplateValues(renamed, IMAGE);
+  assert.equal(manifest.renderServiceTemplateValues(values).spec.template.spec.containers[0].env
+    .find((entry) => entry.name === "IDENTITY_LINK_SECRET").valueFrom.secretKeyRef.name, "IDENTITY_LINK_SECRET");
+  const noNamespace = manifest.validateDesiredState(unmarked((value) => { value.service.telemetryStorageNamespace = null; }));
+  assert.throws(() => manifest.renderService(noNamespace, IMAGE), { code: "TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED" });
+  const staging = manifest.validateDesiredState(unmarked(stagingNames));
+  assert.throws(() => manifest.renderService(staging, IMAGE), { code: "STAGING_SERVICE_TEMPLATE_UNAVAILABLE" });
+  assert.deepEqual({ ...manifest.SERVICE_TEMPLATE_UNAVAILABLE }, { staging: "STAGING_SERVICE_TEMPLATE_UNAVAILABLE" });
 });
