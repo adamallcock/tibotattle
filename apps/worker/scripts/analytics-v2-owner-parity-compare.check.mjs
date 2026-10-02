@@ -80,7 +80,40 @@ test("stored outputs equal to the references pass every family; only inputFinger
   assert.deepEqual([byName["owner-fits"].equal, byName["owner-model-dates"].equal, byName["owner-days"].equal,
     byName["owner-cache-days"].equal, byName.refusals.equal], [2, 4, 1, 2, 3]);
   assert.deepEqual(report.unreferencedOwnerDays, ["a:2026-09-29", "b:2026-09-29"]);
+  // The conflict owner's conflict day is checked as its refusal; the other
+  // owner's value there has no production reference and is reported uncompared.
+  assert.deepEqual(report.uncomparedOwnerDays, ["b:2026-09-29"]);
   assert.deepEqual(report.normalized, ["owner-model-dates: reference inputFingerprint"]);
+});
+
+test("an uncompared owner-day is listed whatever its value, and a refusal there still fails", () => {
+  const changed = fixture();
+  changed.rows.ownerDays[2] = { ...changed.rows.ownerDays[2],
+    daily: { ...values("2026-09-29"), counts: { usage: 999, quota: 0, session: 0 } } };
+  const report = compareAnalyticsV2OwnerParity(changed);
+  assert.equal(report.unexpectedDiffs, 0);
+  assert.deepEqual(report.uncomparedOwnerDays, ["b:2026-09-29"]);
+  const refused = fixture();
+  refused.rows.ownerDays[2] = { ...refused.rows.ownerDays[2], daily: null, refusal: "day_row_limit" };
+  refused.rows.refusals.push({ ownerDigest: B, day: "2026-09-29", family: "daily", reason: "day_row_limit" });
+  assert.deepEqual(compareAnalyticsV2OwnerParity(refused).unexpectedFamilies, ["refusals"]);
+});
+
+test("only a failed fits reference stands for a production failure; anything else is invalid", () => {
+  const failed = fixture();
+  failed.ownerResults.owners.b.fits.direct = { state: "failed", reason: "STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE" };
+  failed.rows.fits.pop();
+  failed.rows.refusals.push({ ownerDigest: B, day: "2026-10-01", family: "scalar", reason: "incomplete_window" });
+  assert.equal(compareAnalyticsV2OwnerParity(failed).unexpectedDiffs, 0);
+  for (const direct of [null, undefined, { state: "stalled", reason: null },
+    { state: "result_size_limit", reason: null }, { sha256: "z", fits: null }]) {
+    const input = fixture();
+    input.ownerResults.owners.b.fits.direct = direct;
+    input.rows.fits.pop();
+    input.rows.refusals.push({ ownerDigest: B, day: "2026-10-01", family: "scalar", reason: "incomplete_window" });
+    assert.throws(() => compareAnalyticsV2OwnerParity(input), /OWNER_PARITY_INPUT_INVALID:ownerResults.fits.b/u,
+      JSON.stringify(direct));
+  }
 });
 
 test("a changed number anywhere in a fit, a model date, a daily value or a band counter fails", () => {

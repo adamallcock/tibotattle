@@ -215,12 +215,24 @@ withholding. Recorded here on 2026-10-01.
 
 - The analytics-refresh job publishes each of the 70 model-history dates on
   its own.
-- An owner whose model computation for a date is refused, by a kernel refusal
-  or by the job's per-owner memory budget, is left out of that date's
-  composition and counted in both `v1ParticipantCount` and
-  `refusedParticipantCount`. The published date therefore states the cohort
-  it could not evaluate. Refused evidence is never counted as zero. A date
-  with no evaluated owner is not published.
+- An owner whose model computation for a date is refused by the kernels is
+  left out of that date's composition and counted in both
+  `v1ParticipantCount` and `refusedParticipantCount`. The published date therefore states the cohort
+  it could not evaluate, including a date on which every member owner was
+  refused. Refused evidence is never counted as zero. Only a date with no
+  member owner at all is not published. (Amended on 2026-10-02 after review:
+  the first wording withheld a date on which no owner was evaluated, which
+  the parity oracle's per-date expectation does not do.)
+- The preview keeps production's completeness rule. The model dates are
+  served inside the allowance preview, and `d43c8f92` publishes a preview
+  only when every member owner has a current fits result. The Google Cloud
+  job does the same: when an effective owner's current fit is refused, by a
+  kernel refusal or by the job's per-owner memory budget, the run withholds
+  the preview, and with it every model date, rather than publish coverage
+  counts that silently leave that owner out. The allowance is then served as
+  temporarily unavailable; production would instead keep serving its last
+  completed preview while it stays valid. (Recorded on 2026-10-02 after
+  review; awaits the owner's confirmation with the rest of D7's wording.)
 - `d43c8f92`'s storage publication instead withholds a 14-date model block
   until every member owner has a result. That rule is not ported. Where
   production withholds a block because one owner's window cannot be computed,
@@ -237,7 +249,10 @@ withholding. Recorded here on 2026-10-01.
   dates are held exactly to the oracle's per-date expectation, which
   `d43c8f92`'s own publishers compute over its per-owner references
   (`scripts/analytics-v2-parity-compare.mjs`,
-  `scripts/gcp-fastpath-dense-oracle/per-date-compare.mjs`).
+  `scripts/gcp-fastpath-dense-oracle/per-date-compare.mjs`). Without that
+  expectation, an accepted date is an unexpected difference: the compare
+  never accepts one on its presence alone, and the rehearsal command passes
+  the expectation by default.
 - Disclosure. This changes when model-history dates appear, not how a date is
   computed. The cutover disclosure (OPS-9) states that model dates publish per
   date with a refused-participant count.
@@ -366,7 +381,11 @@ before, so that each stays truthful for the running service.
 
 - [x] The owner approved this text in chat (fast-path OD-6) on 2026-09-30.
 - [ ] D7, added on 2026-10-01, restates the owner's decision in chat that day
-  (fast-path OD-12). The owner has not yet reviewed its wording.
+  (fast-path OD-12). The owner has not yet reviewed its wording, including
+  the two points added on 2026-10-02 after review: a model date on which
+  every member was refused is published with all of them counted, and the
+  preview (with every model date) is withheld while an effective owner has
+  no current fit.
 
 Still owed: the supersession notes and disclosure changes above land in the
 cutover commit.

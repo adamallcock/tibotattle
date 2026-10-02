@@ -140,9 +140,13 @@ export const ANALYTICS_REFRESH_RESOURCE_ENV = Object.freeze({
 });
 /**
  * Heap the Job keeps outside the per-owner budget: fixed headroom for the
- * accumulated outputs of earlier owners and the community fold, plus the
- * reader's transient per candidate of one read call (an estimate: decoded
- * sources and reconciliation state of one expansion batch per candidate).
+ * accumulated outputs of earlier owners, the non-effective owners' queued-day
+ * occurrences and the community fold, plus the reader's transient per
+ * candidate of one read call (an estimate: decoded sources and reconciliation
+ * state of one expansion batch per candidate). The fixed part does not scale
+ * with the roster or the cache horizon: every computed owner's rows are held
+ * until the single write, so a large enough roster can outgrow it (the
+ * dense-owner parity receipt states the measured scale).
  */
 export const ANALYTICS_REFRESH_HEAP_RESERVE = Object.freeze({ fixedBytes: 512 * MIB, bytesPerReadCandidate: 4_096 });
 /** Mirrors occurrence-source.ts MAX_ANALYTICS_V2_CANDIDATES (one read call's ceiling); the spec pins it. */
@@ -253,8 +257,10 @@ function resourceValue(env, entry) {
  * The run's resources from the environment, and the heap they need. Refused
  * before any connection: a value outside its bounds
  * (ANALYTICS_V2_REFRESH_RESOURCES_INVALID), or a heap limit below the budget
- * plus the reserve (ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT), so an owner the
- * guard admits cannot exhaust the heap by design.
+ * plus the reserve (ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT). This bounds one
+ * admitted owner's estimate plus a fixed reserve. It is not a bound on the
+ * whole run: the outputs accumulated before the last owner are covered only by
+ * the fixed reserve, which does not grow with the roster or the horizon.
  */
 export function analyticsRefreshResources(env, heapLimitBytes) {
   const spec = ANALYTICS_REFRESH_RESOURCE_ENV;
@@ -1025,7 +1031,10 @@ export async function runAnalyticsRefresh({
       await client.query(`SET LOCAL statement_timeout='${READ_STATEMENT_TIMEOUT_MILLISECONDS}ms'`);
       await client.query(`SET LOCAL lock_timeout='${READ_LOCK_TIMEOUT_MILLISECONDS}ms'`);
       // The exporting transaction idles while owners are computed; the snapshot
-      // must outlive the last owner's read.
+      // must outlive the last owner's read. It therefore holds the primary's
+      // xmin horizon for the whole read and compute (VACUUM cannot remove rows
+      // that die meanwhile) until COMMIT, or until the task ends and its
+      // connection closes. The dense-owner parity receipt records the duration.
       await client.query("SET LOCAL idle_in_transaction_session_timeout=0");
       const snapshot = (await client.query("SELECT pg_export_snapshot() AS snapshot"))?.rows?.[0]?.snapshot;
       const state = await store.readAnalyticsV2RefreshState(client, { schema: parsed.schema });

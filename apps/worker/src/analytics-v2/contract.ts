@@ -331,7 +331,10 @@ export interface AnalyticsV2RunOutputs {
   readonly ownerModelDates: readonly AnalyticsV2OwnerModelDateRow[];
   readonly dailyCandidates: readonly AnalyticsV2DailyCandidate[];
   readonly blockedDays: readonly AnalyticsV2Day[];
-  /** The admin community allowance preview (v0.3), or null when it cannot be built. */
+  /**
+   * The admin community allowance preview (v0.3), or null when it is withheld
+   * (an effective owner without a current fits result) or cannot be built.
+   */
   readonly preview: AnalyticsV2KernelValue | null;
   readonly refusals: readonly AnalyticsV2Refusal[];
   readonly journal: { readonly lastSequence: number | null };

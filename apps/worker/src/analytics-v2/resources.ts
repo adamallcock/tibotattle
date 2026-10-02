@@ -11,14 +11,24 @@
  *   counts (A-1 countOwnerOccurrences, the reader's own candidate selection)
  *   give a memory estimate. An owner whose estimate exceeds the budget is
  *   refused as a whole with `memory_budget`: it is not read, its queued days
- *   with evidence are blocked, it leaves the fit cohort and it is counted as
- *   refused on every model date. The decision is a pure function of the counts
- *   and the configured budget, never of a heap observation;
+ *   with evidence are blocked, and it has no fit, so the run withholds the
+ *   preview and with it every model date. The decision is a pure function of
+ *   the counts and the configured budget, never of a heap observation;
  * - a day backstop (maxDayOccurrences, maxDayRecordBytes). A day over it is
  *   refused with the shared reducers' own reasons (day_row_limit,
- *   day_byte_limit). Its ceiling is fixed by the owner-day evidence digest,
- *   which is one canonical JSON string per day (pin.ts): V8 refuses strings
- *   over 536,870,888 characters, about 470,000 synthetic usage records.
+ *   day_byte_limit) before anything serializes it. Its ceiling is fixed by
+ *   the owner-day evidence digest, which is one canonical JSON string per
+ *   prepared day (pin.ts): V8 refuses strings over 536,870,888 characters,
+ *   about 470,000 synthetic usage records.
+ *
+ * The estimate charges every occurrence the owner holds on the run's days,
+ * and the job holds the whole cache horizon (back to the first evidence day
+ * of any effective owner) at once. It therefore grows with retained history
+ * even when no window or day grows: at the default budget an owner at a
+ * steady 1,100 usage, 4,500 quota and 200 session occurrences a day is
+ * refused after about 500 days of history. Loading the days before the
+ * analysis horizon in bounded segments would remove that growth; it is not
+ * done yet (fast-path plan, dense-owner path).
  *
  * Kernel bounds inside the analysis (1,000,000 windowed usage rows, 100,000
  * sessions, the 8 MiB reduction checkpoint and the quota limits) define

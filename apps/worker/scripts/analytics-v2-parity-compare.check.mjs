@@ -6,6 +6,7 @@ import {
   ANALYTICS_V2_PARITY_FAMILIES,
   compareAnalyticsV2Parity,
   normalizeServedDay,
+  perDateExpectationFor,
   withheldModelDatesOf,
 } from "./analytics-v2-parity-compare.mjs";
 
@@ -112,7 +113,8 @@ test("a changed cache band id is a structure difference, not an expected count d
 
 // Owner decision OD-12 (2026-10-01): the fast path publishes each model date
 // on its own; d43c8f92 withholds a block. Only the golden's withheld dates may
-// differ, and only by being published.
+// differ, only by being published, and only with the values the oracle's
+// per-date expectation holds for them.
 function perDateFixture() {
   const allowanceDay = (day, models) => ({ day, combined: { centralUsd: 10 }, byPlanType: {}, models });
   const golden = response([]);
@@ -123,7 +125,10 @@ function perDateFixture() {
     models: { basis: "b", days: [{ day: "2026-09-30", values: [["m", 1, 1]] }] } };
   const actualPreview = structuredClone(goldenPreview);
   actualPreview.models.days.unshift({ day: "2026-09-29", values: [["m", 2, 1]] });
-  return { golden, actual, goldenPreview, actualPreview };
+  // The oracle's per-date publication: the withheld date's values included.
+  const perDateExpected = { schemaVersion: "gcp-fastpath-dense-per-date-v1", nowMs: 1, unresolved: [],
+    allowanceBreakdowns: structuredClone(actual.allowanceBreakdowns), preview: structuredClone(actualPreview) };
+  return { golden, actual, goldenPreview, actualPreview, perDateExpected };
 }
 const byName = (report) => Object.fromEntries(report.families.map((family) => [family.family, family]));
 
@@ -141,7 +146,62 @@ test("publishing a withheld model date is the accepted per-date difference, and 
   assert.equal(families["model-days"].diffCount, 0);
   assert.ok(families["model-days"].equal >= 3, "the shared date and the day lists are still compared");
   assert.deepEqual(report.perDateModelPublication.publishedWithheldDates, ["2026-09-29"]);
+  assert.deepEqual(report.perDateModelPublication.unverifiedWithheldDates, []);
+  assert.equal(report.perDateModelPublication.valuesHeldTo, "gcp-fastpath-dense-per-date-v1");
   assert.equal(report.perDateModelPublication.withheldDates, 1);
+});
+
+test("an accepted date's value must equal the per-date expectation exactly", () => {
+  // Any other value on a withheld date, in either place, is an unexpected difference.
+  for (const mutate of [
+    (fixture) => { fixture.actual.allowanceBreakdowns.days[0].models = [["m", 999.99, 7]]; },
+    (fixture) => { fixture.actualPreview.models.days[0] = { day: "2026-09-29", values: [["m", 2, 1]],
+      refusedParticipantCount: 0 }; },
+    (fixture) => { fixture.perDateExpected.preview.models.days[0].values = [["m", 2.5, 1]]; },
+  ]) {
+    const fixture = perDateFixture();
+    mutate(fixture);
+    const report = compareAnalyticsV2Parity({ ...fixture, withheldModelDates: ["2026-09-29"] });
+    assert.deepEqual(report.unexpectedFamilies, ["model-days"]);
+    assert.equal(byName(report)["model-days-per-date"].compared, 1);
+  }
+});
+
+test("without a per-date expectation, or one lacking the date, the publication fails closed", () => {
+  const { perDateExpected: _expected, ...fixture } = perDateFixture();
+  const report = compareAnalyticsV2Parity({ ...fixture, withheldModelDates: ["2026-09-29"] });
+  assert.deepEqual(report.unexpectedFamilies, ["model-days"]);
+  assert.equal(report.unexpectedDiffs, 2);
+  assert.deepEqual(byName(report)["model-days"].diffs.map((diff) => [diff.path, diff.golden]), [
+    ["$.allowanceBreakdowns.days[2026-09-29].models", "<withheld; no per-date expectation>"],
+    ["preview.models.days[2026-09-29]", "<withheld; no per-date expectation>"],
+  ]);
+  assert.deepEqual(report.perDateModelPublication.unverifiedWithheldDates, ["2026-09-29"]);
+  assert.deepEqual(report.perDateModelPublication.publishedWithheldDates, []);
+  assert.equal(report.perDateModelPublication.valuesHeldTo, null);
+  const lacking = perDateFixture();
+  lacking.perDateExpected.allowanceBreakdowns.days.shift();
+  lacking.perDateExpected.preview.models.days.shift();
+  const lackingReport = compareAnalyticsV2Parity({ ...lacking, withheldModelDates: ["2026-09-29"] });
+  assert.deepEqual(lackingReport.unexpectedFamilies, ["model-days"]);
+  assert.deepEqual(lackingReport.perDateModelPublication.unverifiedWithheldDates, ["2026-09-29"]);
+});
+
+test("a per-date expectation must be the oracle's, for the golden's clock, with nothing unresolved", () => {
+  const expectation = perDateFixture().perDateExpected;
+  assert.equal(perDateExpectationFor(expectation, { nowMs: 1 }), expectation);
+  for (const [value, manifest] of [
+    [expectation, { nowMs: 2 }],
+    [expectation, null],
+    [{ ...expectation, schemaVersion: "other" }, { nowMs: 1 }],
+    [{ ...expectation, unresolved: ["2026-09-29"] }, { nowMs: 1 }],
+    [{ ...expectation, unresolved: undefined }, { nowMs: 1 }],
+    [null, { nowMs: 1 }],
+  ]) {
+    assert.throws(() => perDateExpectationFor(value, manifest), /ANALYTICS_V2_PARITY_PER_DATE_INVALID/u);
+  }
+  assert.throws(() => compareAnalyticsV2Parity({ ...perDateFixture(), perDateExpected: [] }),
+    /ANALYTICS_V2_PARITY_PER_DATE_INVALID/u);
 });
 
 test("without the golden's withheld dates the same publication is unexpected", () => {

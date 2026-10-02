@@ -80,7 +80,10 @@ characters (about 470,000 synthetic usage records). Kernel bounds that define
 production's result (1,000,000 window rows, 100,000 sessions, the 8 MiB
 reduction checkpoint, the quota and plan limits) and method or contract
 constants (101-day windows, 70 model dates, 366-day reads, lexical top-200
-cells) are unchanged.
+cells) are unchanged. (Corrected on 2026-10-02 after review: at this commit
+the digest was built before the backstop applied, so a day beyond the string
+limit would have failed the run. A day is now digested only after it prepares
+within the backstop.)
 
 ### The memory guard and one owner at a time
 
@@ -96,6 +99,12 @@ cells) are unchanged.
   those days are blocked, it leaves the fit cohort, it counts as refused on
   every model date, and it is never read. It writes no owner-scoped row, so
   its earlier rows are retained. No heap observation feeds the decision.
+  (Changed on 2026-10-02 after review: an owner without a current fit now
+  withholds the preview, and with it every model date, as production's
+  preview publication does; see the
+  [dense-owner parity receipt](./2026-10-01-gcp-dense-owner-parity.md#review-fixes-2026-10-02).
+  The estimate also grows with the owner's retained history, because the
+  whole cache horizon is held at once.)
 - analytics-refresh now reads and computes one effective owner at a time in
   the run's snapshot (the exporting transaction stays open through compute
   with `idle_in_transaction_session_timeout=0`); the owner's occurrences, its
@@ -230,7 +239,13 @@ Cloudflare.
   variants per page. These are D1 and Worker limits; GCP computes those days
   with the same kernel reducer instead of refusing them. This is a divergence
   by design (OD-11), proven only against the kernels, not against a production
-  publication.
+  publication. (Corrected on 2026-10-02 after review: the reader bound is
+  wider than a cache-day divergence. Production's effective reader fails a
+  page over 3,200 legacy or correction variants, or 16,384 v1.2 variants, and
+  the same reader serves its graph and daily lanes, so production also
+  refuses that owner's window and owner-day. With the batch bound at 40,000,
+  GCP publishes daily values, fits and model dates there. See the
+  [dense-owner parity receipt](./2026-10-01-gcp-dense-owner-parity.md#review-fixes-2026-10-02).)
 - **Fold or page.** Like production with prepared or shared features, GCP
   folds a model window when every day is prepared and the window is
   representable; production's original paged job pages it. The kernel itself

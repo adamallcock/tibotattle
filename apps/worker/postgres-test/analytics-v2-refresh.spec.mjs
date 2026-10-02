@@ -2113,6 +2113,8 @@ test("PG17: an owner over the memory budget is refused with memory_budget, never
     const fits = await ownerScopedRows(pool, schema, "analytics_v2_owner_fits");
     const bands = await ownerScopedRows(pool, schema, "analytics_v2_cache_bands");
     const heads = await publishedRows(pool, schema);
+    const previewBefore = (await pool.query(`SELECT preview FROM ${quoted(schema, "analytics_v2_preview")}`))
+      .rows[0].preview;
 
     grown = true;
     reads.length = 0;
@@ -2141,10 +2143,12 @@ test("PG17: an owner over the memory budget is refused with memory_budget, never
     assert.equal(await ownerScopedRows(pool, schema, "analytics_v2_owner_fits"), fits);
     assert.equal(await ownerScopedRows(pool, schema, "analytics_v2_cache_bands"), bands);
     assert.deepEqual(await publishedRows(pool, schema), heads);
-    // The preview's fit cohort leaves it out, and every model date counts it as refused.
+    // It has no current fit, so this run withholds the preview (stored null,
+    // served as temporarily unavailable) rather than publish a cohort that
+    // silently leaves it out; the first run's preview counted all four owners.
+    assert.equal(previewBefore.coverage.uploadingParticipantCount, 4);
     const preview = (await pool.query(`SELECT preview FROM ${quoted(schema, "analytics_v2_preview")}`)).rows[0].preview;
-    assert.equal(preview.coverage.uploadingParticipantCount, 3);
-    assert.ok(preview.models.days.length > 0 && preview.models.days.every((day) => day.refusedParticipantCount >= 1));
+    assert.equal(preview, null);
   });
 });
 

@@ -29,7 +29,8 @@ owner.
 | `c0600bc2` | The v1.2 occurrence expansion's cost follows the batch, not the owner |
 | `77203a3d` | The refresh receipt reports the process's peak resident set (`memory.peakRssMiB`) |
 | `11f1a0b8` | The seed and the test deploy select the dense corpus (`--corpus=dense`, `--dump`) and size the refresh Job (`--refresh-profile`) |
-| this commit | Decision D7, this receipt, the plan and dated notes on the receipts that called OD-12 open |
+| `e8b00f28` | Decision D7, this receipt, the plan and dated notes on the receipts that called OD-12 open |
+| review fixes (2026-10-02) | The verified findings of the branch review; see [Review fixes](#review-fixes-2026-10-02) |
 
 No vendored file changed (`vendor:kernels:check` 10/10). No migration was
 added.
@@ -57,6 +58,14 @@ holds model dates to that decision and to nothing wider:
   publishers compute over its per-owner references.
 - Seven new unit cases in `analytics-v2-parity-compare.check.mjs` pin each
   rule (11/11).
+
+(Corrected on 2026-10-02. At `e8b00f28` the compare accepted any non-empty
+value on an accepted date, and neither the plan's command nor
+`npm run gcp:fastpath:rehearsal` passed `--per-date-expected`, so the 21
+accepted publications in the table below were held to their values only by
+the separate per-date run. The compare now requires those values to equal the
+per-date expectation and fails closed without one; see
+[Review fixes](#review-fixes-2026-10-02).)
 
 The Q-1 rehearsal now exits 0. At `11f1a0b8`, with the plan's command
 (`--golden apps/worker/analytics-v2-test/golden`, database
@@ -155,9 +164,19 @@ probe below and `dense-final` (fresh import at `11f1a0b8`).
 | Refusals | 15 | 15 |
 
 - Owner e: its fits (5 fits, all `pro`) and all 70 model compositions
-  (`ready`) equal production's native results exactly, and it has no
-  refusal in any family. Every e owner-day's daily values and cache bands
-  equal production's.
+  (`ready`) equal production's native computation called directly
+  (`advanceStorageEffectiveAnalysis` without prepared inputs, outside the
+  Worker's budget), and it has no refusal in any family. Every e owner-day's
+  daily values and cache bands equal production's. (Qualified on 2026-10-02:
+  for owner e that direct call is the only reference. The golden holds no
+  scheduled (Tier N) or budget-sliced checkpointed (Tier F) result for e and
+  no published model date (`referenceAgreement.e`: 0 compared each;
+  `forcedNative` null; graph progress for e: no fits, 0 model dates), so the
+  equality does not cover production's checkpoint persistence, its
+  per-invocation meter, or whether its model blocks
+  (`STORAGE_ANALYTICS_MODEL_BLOCKS`) would prepare e's days and give the
+  same compositions. The dense-oracle receipt's claim boundary states the
+  same; prepared-equals-native is established on the small owners only.)
 - Owner a's four conflict-window model dates (2026-07-24 to 07-27), which
   production fails with `STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE`, are
   `model:incomplete_window` refusals here; its conflict days 2026-04-17/18 are
@@ -168,7 +187,11 @@ probe below and `dense-final` (fresh import at `11f1a0b8`).
 - Ten owner-days are unreferenced by construction: every owner's 2026-04-17
   and 04-18, which production's daily lane never completes because owner a's
   crossed-day conflict blocks those community days. The fast path also
-  blocks both days (no publication).
+  blocks both days (no publication). (Clarified on 2026-10-02: owner a's two
+  are checked as its daily refusals; the other eight, owners b to e on those
+  days, have no production value, so their stored daily values are not
+  compared. The owner-parity report now lists them as
+  `uncomparedOwnerDays`.)
 - The published read: 168 days, 2026-04-17/18 blocked, second run 0 new
   revisions. Served `cacheRetention` counts differ from the replay's read
   (543 leaf differences) and from the settled read (536); production's cache
@@ -344,6 +367,47 @@ suite, and anything on GCP or Cloudflare.
    `REHEARSAL_REFRESH_INCOMPLETE`; a deployed Job that loses the lock still
    exits 0 by design (the receipt says `LOCK_HELD`).
 
+## Review fixes, 2026-10-02
+
+A review of this branch at `e8b00f28` raised thirteen findings; two pairs
+describe the same defect. Each was checked against the code before any
+change. Local and synthetic evidence only, on the same workstation and
+PostgreSQL 17 cluster.
+
+| Finding | Verified | Disposition |
+|---|---|---|
+| The default rehearsal accepted any value on a withheld model date (major; reported twice) | Yes. With the committed Q-1 golden and this receipt's own `q1-final-plain` artifacts, changing the 2026-07-24 preview day to 3 participants with 0 refused, and the 2026-07-30 preview and allowance models to one invented model, left 0 unexpected differences | **Fixed.** An accepted date counts only when its value equals the oracle's per-date expectation exactly; without the expectation, or where it differs, the publication is an unexpected `model-days` difference (report `analytics-v2-parity-report-v3`, with `valuesHeldTo` and `unverifiedWithheldDates`). The expectation must be the oracle's schema, at the golden's clock, with nothing unresolved. `npm run gcp:fastpath:rehearsal`, the rehearsal's documented command and the plan's Gates command pass `golden-q1-node/per-date-expected.json`. The same mutation now fails (10 unexpected differences); the committed artifacts pass (14 dates accepted); with no expectation they fail (21 unexpected, 14 dates unverified) |
+| GCP published the preview with refused owners silently left out of its fit cohort (major) | Yes. The cohort was the computed owners with fits; `d43c8f92` `publishStorageCommunityGraphPreview` defers (`cache_pending`) unless every member has a fits result, and the oracle's per-date expectation has no preview unless every owner has fits. The base comment at `7ef0e144` called this a known divergence; this branch's rewrite dropped it from the disclosure | **Fixed.** The preview is withheld (stored null, served as temporarily unavailable) whenever an effective owner has no current fit, from a kernel refusal or the memory budget. Changed expectations, pinned exactly: `compute.spec.ts` memory budget (preview null; it was a 3-owner coverage with every model date counting 4 participants and 1 refused) and `(c, day bound)` at the old bound (null; computed, non-null); the PostgreSQL memory-budget case (4 owners after the first run, null after the second). New case: a refused scalar fit withholds the preview. D7 now states it; it awaits the owner's confirmation. Non-effective owners stay outside the GCP cohort (their paths are not ported, a disclosed plan scope) |
+| The batch variant bounds (40,000) let GCP compute owners production's reader refuses in every family (minor) | Yes. `telemetry-usage-effective-reader.ts` fails a page over 3,200 source variants (lines 52, 615, 951) and `telemetry-v12-effective-reader.ts` over 16,384 (91, 482); the same reader serves the graph, daily and cache lanes | **Disclosed** (below and in the cap-raise receipt). No code change: it is a D1 statement bound raised with OD-11, and it needs the owner's acceptance with the other Worker-only divergences |
+| The memory estimate grows with retained history (minor) | Yes. The arithmetic reproduces: 8.43 MB of held evidence a day, about 606 MB fixed, refused after about 501 days at the default budget (about 1,265 days at the dense profile's 10,752 MiB) | **Not fixed; disclosed** (`resources.ts`, below). Loading the history before the analysis horizon in bounded segments changes the loader contract, the memory model and its pins, so it is not a cheap change; it is a remaining gate |
+| The oracle publishes a model date on which every owner was refused; GCP and D7 withheld it (minor) | Yes (`oracle.mjs` 1410 to 1421 against `compute.ts`) | **Fixed by aligning GCP with the oracle**, whose source both goldens pin and which follows the owner's wording ("publish each model date"). Such a date now publishes with every member counted refused; only a date with no member is withheld. Neither corpus has such a date, so no golden changes. New `compute.spec.ts` case; D7 amended |
+| Owner e's equality rests only on the direct call (minor) | Yes (golden manifest) | **Disclosed**: the owner e bullet above and the claim boundary below |
+| The owner-parity compare was not fail-closed for fits, and left conflict-day values uncompared (minor) | Yes | **Fixed.** Only a `failed` fits reference stands for a production failure; an absent, stalled or size-limited one is invalid input. The eight owner-days with no production value are listed as `uncomparedOwnerDays` (report `analytics-v2-owner-parity-report-v2`). Two new unit cases |
+| The day backstop did not protect the evidence digest (major) | Yes. `analyticsV2DayDigest` ran before `prepareAnalyticsV2Day` and outside its try, so a day over V8's string limit would fail the whole run | **Fixed.** A day is digested only after it prepares within the backstop; a refused day gets a refusal-marker digest, and every window through it is refused (`incomplete_window`), so the marker pins nothing. New case: a refused day whose record throws when read. On `e8b00f28` it fails the run with that error; now it is a `day_row_limit` refusal and every other owner is unchanged. The five new or changed `compute.spec.ts` cases all fail on the `e8b00f28` `compute.ts` |
+| The start-up check's "cannot exhaust the heap by design" is not true (minor) | Yes. The 512 MiB reserve is fixed, while every computed owner's rows are held until the single write (`dense-final` stored about 12.1 MB of row JSON for five owners; owner e's 14,520 cache-band rows are 8.8 MB of it) | **Comment corrected; disclosed.** Per-owner writes or output accounting would change the one-transaction write; remaining gate |
+| The snapshot transaction holds the primary's xmin horizon through compute (minor) | Yes (`analytics-refresh.mjs`) | **Disclosed** in the code and below |
+| The v1.2 expansion rewrite (`c0600bc2`) had no negative test (minor) | Yes | **Fixed.** Opt-in fixture `v12Scope` and a PostgreSQL 17 case: one occurrence id with one eligible record and staged-manifest, incomplete-chunk and foreign-participant variants. Removing the ready-state, chunk-completeness or participant predicate from the expansion each fails the case. Not covered: the retained-authorization join, because every social capability state is retained and an accountless participant has a single v1.2 device, so the schema admits no non-retained variant beside a retained one |
+| The Job has no time guard (minor) | Yes. One transaction at the end, `--max-retries=0`, timeouts 7,200 s and 14,400 s set from an extrapolation | **Disclosed**; remaining gate |
+
+### Gates after the fixes
+
+Local, at the review-fix commit, PostgreSQL 17 on port 55433.
+
+| Gate | Result |
+|---|---|
+| `npx tsc --noEmit` (apps/worker) | rc 0 |
+| `npm run analytics-v2:check` | 12 files, 121/121 under Node 26.2.0 (266 s) and Node 22.16.0 (344 s); 118 before, plus the three new `compute.spec.ts` cases |
+| `npm run vendor:kernels:check` | 10/10 |
+| `npm run gcp:fastpath:scripts-check` (socket and TCP) | rc 0, 58/58 |
+| `npm run scripts:check` | rc 0, 967/967 |
+| `npm run check` in `cloud-run` (socket) | rc 0; 225 tests: 224 pass, 1 skipped |
+| `npm run postgres:domain:check` (socket and TCP) | rc 0. Vitest 12 files 76/76; node:test 337: 335 pass, 0 fail, 2 skipped (the same two). One more case than before: the v1.2 expansion's exclusions |
+| Q-1 rehearsal, `npm run gcp:fastpath:rehearsal` | exit 0, `pass`: `model-days` 120/120, `model-days-per-date` 21 accepted with the values held, 14 dates, none unverified; `perDateEqual` true; second run 0 new revisions; 168 days published, 2026-04-17/18 blocked, 15 refusals. Response file `04f7a277…` and preview `b3722cc9…`, byte-identical to `e8b00f28`'s |
+| The same with `--owner-reference …/golden-q1-node` | exit 0; fits 4/4, model dates 280/280, owner-days 672/672, cache owner-days 680/680, refusals 15/15; 6 uncompared owner-days |
+| The rehearsal without `--per-date-expected` | exit 1, `gate_failed`: 21 unexpected `model-days` differences, 14 dates unverified |
+| Dense rehearsal (fresh import, the Method command) | exit 0, `pass`, every gate true; dump `1d0bef8e…` pinned. Served families equal (model-days 141/141 against the per-date expectation, no accepted date), `perDateEqual` true; fits 5/5, model dates 350/350, owner-days 840/840, cache owner-days 850/850, refusals 15/15; 8 uncompared owner-days (b to e on 2026-04-17/18). Second run 0 new revisions. Response file `36316eca…` and preview `4158041c…`, byte-identical to `dense-final`'s, and every stored owner row equal to `dense-final`'s apart from run ids. T-2 2,895 s; refreshes 680 s and 662 s (read 140 s, prepare 115 s, model 408 s); budget 4,608 MiB, owner e estimate 1,517 MiB, sampled heap peak 1,673 / 2,157 MiB, peak RSS 2,114 / 2,560 MiB |
+| Root `npm run architecture:check`, `test:preflight`, `docs:check` | passed (919 production files, 3,911 imports, 0 debt edges); rc 0, 20/20; valid (303 Markdown files, 1,610 source and config files) |
+
 ## What this does not prove
 
 - Synthetic data on one workstation. Not Cloud SQL, Cloud Run, production
@@ -354,16 +418,46 @@ suite, and anything on GCP or Cloudflare.
   publish these values only after its graph lane finished, which the oracle
   did not wait for, and its cache lane never reaches most owner-days here.
   This proves what production computes, not that it keeps up.
+- For owner e the only reference is that direct call: no scheduled,
+  checkpointed or published production result for e exists in the golden,
+  and whether production's model blocks would prepare e's days with the same
+  compositions is not established.
 - Served cache-retention windows are not a parity basis on this corpus.
 - Per-date model publication is a deliberate divergence from production's
-  block withholding (D7), not parity.
+  block withholding (D7), not parity. When an effective owner has no current
+  fit, GCP withholds the preview where production would keep serving its last
+  completed one.
 - The divergences the cap-raise receipt lists (cache days production's
-  Worker refuses or leaves unbuilt) still stand.
+  Worker refuses or leaves unbuilt) still stand, and are wider than it said:
+  production's reader fails a page over 3,200 legacy or correction variants,
+  or 16,384 v1.2 variants, and that fails the graph window and the daily
+  owner-day too, not only the cache day. GCP's batch bound is 40,000, so for
+  such an owner it publishes daily values, fits and model dates production
+  refuses. No corpus exercises this.
+- Scale limits not yet engineered away, each explicit rather than silent:
+  the memory estimate grows with retained history (the job holds the whole
+  cache horizon of an owner at once); the heap reserve for outputs held until
+  the single write is a fixed 512 MiB; and there is no time guard, so a run
+  that reaches the task timeout writes nothing and repeats.
+- The refresh holds its exported snapshot, and with it the Cloud SQL
+  primary's xmin horizon, for the whole read and compute (657 s and 715 s
+  for `dense-final`'s two runs here; about an hour, unmeasured, for the
+  largest real owner), with the server's idle-in-transaction timeout off for
+  that session. VACUUM cannot remove rows that die during a run, so runs
+  should not be scheduled back to back on the shared primary; the task
+  timeout ends a stalled run's connection.
 
 ## Remaining gates
 
-- Owner review of D7's wording.
+- Owner review of D7's wording, including the preview withholding and the
+  all-refused model dates added on 2026-10-02.
+- Owner acceptance of the Worker-only divergences, including the reader
+  variant bound.
 - The cloud measurement above, on the test project, with the owner's
   authorization; then recalibrate the memory model on the Cloud SQL seed.
+- Before the largest real owner's history outgrows the budget: load the days
+  before the analysis horizon in bounded segments. Before the roster grows:
+  account for the outputs held until the write. Before scheduling: a time
+  bound per owner or run, measured on Cloud Run.
 - Finding 2 before the seal; finding 3 if production holds dense legacy
   owners (OD-4).

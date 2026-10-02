@@ -27,24 +27,39 @@
  * - An effective owner whose deterministic memory estimate (resources.ts,
  *   from its evidence counts) exceeds the run's budget is refused as a whole
  *   before it is read: one owner refusal `memory_budget`, a daily refusal and
- *   a blocked day for every queued day it has evidence on, no fit, and a
- *   refused participant on every model date. Nothing of it is written, so its
- *   stored rows from earlier runs are retained.
+ *   a blocked day for every queued day it has evidence on, and no fit, so
+ *   the preview, and with it every model date, is withheld for the run
+ *   (below). Nothing of it is written, so its stored rows from earlier runs
+ *   are retained.
  * - A kernel refusal (SharedAnalyticsUnavailable, including the checkedRows
  *   source_conflict_or_order throw for conflict rows, and the cache reducer's
  *   CacheRetentionRefusedError group/session bounds) is recorded per owner,
  *   day and family, and the run carries on. Any other kernel error is a defect
- *   and fails the run.
+ *   and fails the run. A day the backstop or the kernels refuse is never
+ *   serialized for its evidence digest: it gets a refusal marker instead, and
+ *   every window containing it is refused (incomplete_window), so the marker
+ *   never pins a result.
  * - A refused owner-day blocks that queued community day; the day keeps its
- *   prior published revision (A-3). A refused scalar fit removes the owner
- *   from the fit cohort and the preview's participant list. A refused model
- *   date keeps the owner out of that date's composition and counts it as a
- *   refused participant (v1ParticipantCount and refusedParticipantCount), so
- *   the published day states the cohort it could not evaluate. A model date
- *   with no evaluated owner is withheld. Refused evidence is never counted as
- *   zero. (d43c8f92's storage publication instead withholds a 14-date model
- *   block until every member has a result; per-date publication with refused
- *   owners counted is the owner's accepted decision of 2026-10-01.)
+ *   prior published revision (A-3).
+ * - The preview follows d43c8f92 publishStorageCommunityGraphPreview: it is
+ *   built only when every effective owner has a current fits result. One
+ *   effective owner without one (a refused scalar fit, or the memory budget)
+ *   withholds it: preview is null and A-4 serves the allowance as
+ *   temporarily unavailable. A partial fit cohort is never published, because
+ *   the preview's coverage counts would silently omit that owner. (Production
+ *   keeps serving its last completed preview while it remains valid; analytics_v2
+ *   stores this run's null.) Non-effective owners are outside the GCP cohort:
+ *   their paths are not ported (non_effective_source_unported), a known
+ *   divergence recorded in the fast-path plan.
+ * - Model dates publish per date (decision D7, the owner's decision of
+ *   2026-10-01, fast-path OD-12). A refused model date keeps the owner out of
+ *   that date's composition and counts it as a refused participant
+ *   (v1ParticipantCount and refusedParticipantCount), so the published day
+ *   states the cohort it could not evaluate, including a date on which every
+ *   effective owner was refused. A date with no effective cohort member at all
+ *   is not published. Refused evidence is never counted as zero. (d43c8f92's
+ *   storage publication instead withholds a 14-date model block until every
+ *   member has a result.)
  *
  * Input contract (validated, fail closed):
  * - The run uses exactly these days, its horizon: the 170 analysis days
@@ -138,7 +153,7 @@ import {
   type AnalyticsV2CacheDay,
   type AnalyticsV2PreparedDay,
 } from "./native-path";
-import { analyticsV2DayDigest, buildAnalyticsV2Pin, EMPTY_DAY_OCCURRENCES,
+import { analyticsV2DayDigest, analyticsV2RefusedDayDigest, buildAnalyticsV2Pin, EMPTY_DAY_OCCURRENCES,
   type AnalyticsV2DayOccurrences } from "./pin";
 import { analyticsV2Refusal, compareAnalyticsV2Refusals, kernelRefusalReason } from "./refusals";
 import {
@@ -555,7 +570,11 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
   const fitsByOwner = new Map<AnalyticsV2OwnerDigest, readonly CommunityAllowanceFit[]>();
   const compositionsByDate = new Map<AnalyticsV2Day, Array<{ ownerDigest: string; result: V1ModelCompositionResult }>>(
     modelDates.map((day) => [day, []]));
-  /** model date -> effective owners whose evaluation was refused (kernels or memory budget). */
+  /**
+   * model date -> effective owners whose evaluation the kernels refused. (A
+   * memory-refused owner has no fit, so the preview that carries the model
+   * dates is withheld for the run; it is never counted here.)
+   */
   const modelRefusedByDate = new Map<AnalyticsV2Day, number>(modelDates.map((day) => [day, 0]));
   /** Effective owners that were computed (admitted by the memory budget). */
   const computedOwners: AnalyticsV2Owner[] = [];
@@ -601,7 +620,6 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
         blocked.add(day);
         refusals.push(analyticsV2Refusal(ownerDigest, day, "daily", "memory_budget"));
       }
-      for (const day of modelDates) modelRefusedByDate.set(day, modelRefusedByDate.get(day)! + 1);
       ownerResources.push(Object.freeze({ ...resource, admitted: false, heapPeakBytes: null }));
       continue;
     }
@@ -636,12 +654,15 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
     for (const day of neededDays) {
       const value = occurrences.get(day) ?? EMPTY_DAY_OCCURRENCES;
       await timed("prepare", async () => {
-        if (day >= analysisFrom && day <= today) dayDigests.set(day, await analyticsV2DayDigest(day, value));
+        const analysisDay = day >= analysisFrom && day <= today;
         let refusal: AnalyticsV2Refusal["reason"] | null = null, daily: V11DailyProjectionValues | null = null;
+        let preparedDay = false;
         try {
+          // The day backstop applies here, before anything serializes the day.
           const shared = await prepareAnalyticsV2Day({ day, ownerDigest, usage: value.usage,
             quota: value.quota, session: value.session }, resources);
-          if (day >= analysisFrom && day <= today) prepared.set(day, shared);
+          preparedDay = true;
+          if (analysisDay) prepared.set(day, shared);
           cacheViews.set(day, analyticsV2CacheView(shared));
           daily = stripFinalized(shared.daily);
           validateV11DailyProjectionValues(daily);
@@ -649,6 +670,12 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
           refusal = kernelRefusalReason(error);
           if (refusal === null) throw error;
           refusals.push(analyticsV2Refusal(ownerDigest, day, "daily", refusal));
+        }
+        // Only a prepared day is digested: its size is within the backstop, so
+        // the one-string digest fits. Every window containing an unprepared
+        // day is refused (incomplete_window), so its marker never pins a result.
+        if (analysisDay) {
+          dayDigests.set(day, preparedDay ? await analyticsV2DayDigest(day, value) : await analyticsV2RefusedDayDigest(day));
         }
         if (queuedSet.has(day)) {
           if (daily === null) blocked.add(day);
@@ -748,15 +775,25 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
         inputs }));
     }
 
-    const fits = computedOwners.flatMap((owner) => fitsByOwner.get(owner.ownerDigest) ?? []);
-    const cohort = computedOwners.filter((owner) => fitsByOwner.has(owner.ownerDigest)).map((owner) => owner.ownerDigest);
+    // d43c8f92 publishStorageCommunityGraphPreview defers (cache_pending)
+    // unless every member has a current fits result. An effective owner
+    // without one, refused by the kernels or by the memory budget, withholds
+    // the preview: a partial cohort would state coverage counts that silently
+    // omit it.
+    if (effectiveDigests.some((ownerDigest) => !fitsByOwner.has(ownerDigest))) {
+      return { dailyCandidates, preview: null };
+    }
+    const fits = computedOwners.flatMap((owner) => fitsByOwner.get(owner.ownerDigest)!);
+    const cohort = computedOwners.map((owner) => owner.ownerDigest);
     const modelDays: AdminCommunityModelCompositionDay[] = [];
     for (const day of modelDates) {
       const evaluated = compositionsByDate.get(day)!;
-      if (evaluated.length === 0) continue;
-      // An effective owner the kernels or the memory budget refused for this
-      // date is still a member of its cohort: it is counted as refused, never dropped.
+      // An effective owner the kernels refused for this date is still a member
+      // of its cohort: it is counted as refused, never dropped, even when no
+      // owner could be evaluated (owner decision 2026-10-01, D7). A date with
+      // no effective member at all is not published.
       const refused = modelRefusedByDate.get(day)!;
+      if (evaluated.length === 0 && refused === 0) continue;
       const collection: CachedCommunityModelCompositions = { compositions: [], v1ParticipantCount: refused,
         unsupportedSourceParticipantCount: 0, refusedParticipantCount: refused, storeAvailable: true };
       for (const { ownerDigest, result } of evaluated) {

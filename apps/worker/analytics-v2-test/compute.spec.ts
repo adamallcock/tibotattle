@@ -290,6 +290,105 @@ describe("computeAnalyticsV2 (A-2)", () => {
       refusal: "day_row_limit" });
     expect(fitOwners(atOldBound)).not.toContain(crowded.digest);
     expect(atOldBound.dailyCandidates.map((candidate) => candidate.day)).toEqual(corpus.publishedDays);
+    // Its refused day makes today's window incomplete, so it has no current
+    // fit and the preview is withheld (d43c8f92 defers a preview until every
+    // member has one); computed, it is published.
+    expect(refusalsOf(atOldBound, crowded.digest)).toContainEqual({ ownerDigest: crowded.digest, day: TODAY,
+      family: "scalar", reason: "incomplete_window" });
+    expect(atOldBound.preview).toBeNull();
+    expect(outputs.preview).not.toBeNull();
+  }, 240_000);
+
+  // Review finding (2026-10-02): the owner-day evidence digest is one string;
+  // a day over the backstop must be refused before anything serializes it,
+  // or a day beyond V8's string limit fails the whole run.
+  it("(c, digest) never serializes a day the backstop refuses", async () => {
+    const corpus = composeProofCorpus();
+    const crowded = syntheticOwner(4, "pro");
+    const crowdedDay = addDays(TODAY, -30);
+    const facts = denseFacts(crowded, { firstDenseBack: 30, denseDays: 1, usagePerDay: 19_995 });
+    const day = facts.get(crowdedDay)!;
+    // Reading this record's evidence throws: the digest of this day must never be built.
+    const poisoned = Object.defineProperty({ ...day.usage[0]! }, "recordJson", { enumerable: true,
+      get() { throw new Error("DIGEST_SERIALIZED_A_REFUSED_DAY"); } });
+    facts.set(crowdedDay, { ...day, usage: [poisoned, ...day.usage.slice(1)] });
+    const input = inputFor({ owners: [...corpus.owners, effectiveV2Owner(crowded)],
+      occurrencesByOwner: new Map([...corpus.occurrencesByOwner, [crowded.digest, facts]]) },
+    [...corpus.publishedDays, crowdedDay].sort(), { resources: { ...ANALYTICS_V2_DEFAULT_RESOURCES,
+      maxDayOccurrences: 20_000 } });
+    const outputs = await computeAnalyticsV2(input);
+    expect(outputs.ownerDays).toContainEqual({ ownerDigest: crowded.digest, day: crowdedDay, daily: null,
+      refusal: "day_row_limit" });
+    expect(outputs.blockedDays).toEqual([crowdedDay]);
+    // Every window containing the refused day (today's fit and the model
+    // dates today-30 to today) is refused, so its marker digest pins nothing;
+    // the earlier model dates are computed.
+    const windowed = refusalsOf(outputs, crowded.digest).filter((refusal) => refusal.family === "scalar"
+      || refusal.family === "model");
+    const containing = Array.from({ length: 31 }, (_, index) => addDays(crowdedDay, index));
+    expect(windowed).toEqual([
+      ...containing.slice(0, -1).map((day) => ({ ownerDigest: crowded.digest, day, family: "model",
+        reason: "incomplete_window" })),
+      { ownerDigest: crowded.digest, day: TODAY, family: "scalar", reason: "incomplete_window" },
+      { ownerDigest: crowded.digest, day: TODAY, family: "model", reason: "incomplete_window" },
+    ]);
+    expect(outputs.ownerModelDates.filter((row) => row.ownerDigest === crowded.digest).map((row) => row.day))
+      .toEqual(Array.from({ length: ANALYTICS_V2_MODEL_DATES - 31 }, (_, index) => addDays(TODAY, -69 + index)));
+    // The other owners are unchanged by it.
+    const without = await computeAnalyticsV2(inputFor(corpus, corpus.publishedDays));
+    expect(outputs.ownerFits.filter((row) => row.ownerDigest !== crowded.digest)).toEqual(without.ownerFits);
+    expect(outputs.ownerModelDates.filter((row) => row.ownerDigest !== crowded.digest))
+      .toEqual(without.ownerModelDates);
+  }, 240_000);
+
+  it("withholds the preview while an effective owner's current fit is refused", async () => {
+    const corpus = composeProofCorpus();
+    const conflictOwner = syntheticOwner(5);
+    const owners = [...corpus.owners, effectiveV2Owner(conflictOwner)];
+    // A conflict yesterday: today's scalar window is incomplete for this owner.
+    const outputs = await computeAnalyticsV2(inputFor({ owners, occurrencesByOwner: new Map([
+      ...corpus.occurrencesByOwner, [conflictOwner.digest, conflictFacts(conflictOwner, addDays(TODAY, -1))]]) },
+    corpus.publishedDays));
+    expect(refusalsOf(outputs, conflictOwner.digest)).toContainEqual({ ownerDigest: conflictOwner.digest, day: TODAY,
+      family: "scalar", reason: "incomplete_window" });
+    expect(fitOwners(outputs)).not.toContain(conflictOwner.digest);
+    expect(outputs.preview).toBeNull();
+    // Everything else is still computed and published.
+    const base = await computeAnalyticsV2(inputFor(corpus, corpus.publishedDays));
+    expect(outputs.ownerFits).toEqual(base.ownerFits);
+    expect(base.preview).not.toBeNull();
+  }, 240_000);
+
+  // Owner decision 2026-10-01 (D7): every model date publishes with refused
+  // owners counted, including a date on which every effective owner was
+  // refused; only a date with no effective member is not published.
+  it("publishes a model date on which every effective owner was refused, with all of them counted", async () => {
+    const conflictOwner = syntheticOwner(5);
+    // A conflict at today-120 and today-119: the windows of model dates
+    // today-69 to today-19 contain it; today's window does not.
+    const outputs = await computeAnalyticsV2(inputFor({ owners: [effectiveV2Owner(conflictOwner)],
+      occurrencesByOwner: new Map([[conflictOwner.digest, conflictFacts(conflictOwner, addDays(TODAY, -120))]]) },
+    [TODAY]));
+    expect(fitOwners(outputs)).toEqual([conflictOwner.digest]);
+    const refusedDates = refusalsOf(outputs, conflictOwner.digest).filter((refusal) => refusal.family === "model")
+      .map((refusal) => refusal.day);
+    expect(refusedDates).toEqual(Array.from({ length: 51 }, (_, index) => addDays(TODAY, -69 + index)));
+    const preview = outputs.preview as AdminCommunityAllowancePreview;
+    expect(preview).not.toBeNull();
+    expect(validCachedAdminCommunityAllowancePreview(preview, preview.generatedAt, NOW_MS)).toBe(true);
+    expect(preview.models.days.length).toBe(ANALYTICS_V2_MODEL_DATES);
+    for (const day of preview.models.days) {
+      const refused = refusedDates.includes(day.day);
+      expect({ day: day.day, v1: day.v1ParticipantCount, refused: day.refusedParticipantCount,
+        values: refused ? day.values : "evaluated" })
+        .toEqual({ day: day.day, v1: 1, refused: refused ? 1 : day.refusedParticipantCount,
+          values: refused ? [] : "evaluated" });
+    }
+    // The public projection takes it: those dates carry no model values.
+    const graph = projectPublicAllowanceGraph({ generated_at: preview.generatedAt, payload_json: JSON.stringify(preview) },
+      { publishedDays: refusedDates, nowMs: NOW_MS });
+    expect(graph!.breakdowns.days.map((day) => [day.day, day.models]))
+      .toEqual(refusedDates.map((day) => [day, []]));
   }, 240_000);
 
   it("(c, cache bound) records a day over the cache reducer's group bound as that owner-day's refusal and carries on", async () => {
@@ -555,14 +654,14 @@ describe("computeAnalyticsV2 (A-2)", () => {
     expect(outputs.blockedDays).toEqual([bigDay]);
     expect(outputs.dailyCandidates.map((candidate) => candidate.day))
       .toEqual(corpus.publishedDays.filter((day) => day !== bigDay));
-    // Nothing of it is written; it leaves the fit cohort and is a refused member of every model date.
+    // Nothing of it is written. It has no current fit, so the preview, and
+    // every model date with it, is withheld for the run (d43c8f92 defers a
+    // preview until every member has a fit; a cohort silently without it is
+    // never published).
     for (const rows of [outputs.ownerDays, outputs.cacheBands, outputs.ownerFits, outputs.ownerModelDates]) {
       expect((rows as ReadonlyArray<{ ownerDigest: string }>).some((row) => row.ownerDigest === big.digest)).toBe(false);
     }
-    const preview = outputs.preview as AdminCommunityAllowancePreview;
-    expect(preview.coverage.uploadingParticipantCount).toBe(3);
-    expect(preview.models.days.length).toBe(ANALYTICS_V2_MODEL_DATES);
-    expect(preview.models.days.every((day) => day.v1ParticipantCount === 4 && day.refusedParticipantCount === 1)).toBe(true);
+    expect(outputs.preview).toBeNull();
     const estimate = analyticsV2OwnerMemoryEstimate(bigEvidence, addDays(TODAY, -169), TODAY);
     expect(outputs.resources!.owners.find((entry) => entry.ownerDigest === big.digest)).toEqual({
       ownerDigest: big.digest, usage: 1_200_000, quota: 90, session: 10, analysisUsage: 1_200_000,

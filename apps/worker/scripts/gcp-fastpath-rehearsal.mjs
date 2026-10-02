@@ -4,7 +4,10 @@
 // One command, against a local PostgreSQL 17 only:
 //
 //   PG_TEST_SOCKET=/private/tmp/tibotattle-pg-.../socket PG_TEST_PORT=55433 \
-//     node apps/worker/scripts/gcp-fastpath-rehearsal.mjs --golden apps/worker/analytics-v2-test/golden
+//     node apps/worker/scripts/gcp-fastpath-rehearsal.mjs --golden apps/worker/analytics-v2-test/golden \
+//     --per-date-expected apps/worker/analytics-v2-test/golden-q1-node/per-date-expected.json
+//
+// (npm run gcp:fastpath:rehearsal in apps/worker runs exactly this.)
 //
 //  1. creates a fresh typed_legacy_transfer_rehearsal_target_fastpath_<8 hex>
 //     schema (plus its "_ledger" pair and an importer control schema) and
@@ -24,8 +27,11 @@
 //     (scripts/analytics-v2-parity-compare.mjs, publication fields only
 //     normalized) and reports every difference per family. The model dates
 //     the golden manifest lists as withheld (modelPublications.missing) may
-//     be published by the fast path, and only those: per-date model
-//     publication is the owner's decision of 2026-10-01 (fast-path plan OD-12);
+//     be published by the fast path, and only those, with exactly the values
+//     the oracle's per-date expectation holds: per-date model publication is
+//     the owner's decision of 2026-10-01 (fast-path plan OD-12, decision D7).
+//     Without --per-date-expected such a publication cannot be verified and
+//     fails the parity gate;
 //  8. runs analytics-refresh again and checks it creates no new revision;
 //  9. drops every schema it created (unless --keep-schema).
 //
@@ -35,9 +41,11 @@
 //                               the golden's source dump when the golden does not
 //                               commit it (golden-dense); its sha256 must equal
 //                               the golden manifest's sourceDump.jsonSha256
-//   --per-date-expected <file>  also hold the stored preview and the served
-//                               allowanceBreakdowns exactly to an oracle's
-//                               per-date expectation (OD-12), for example
+//   --per-date-expected <file>  the oracle's per-date expectation for this golden's
+//                               clock (OD-12): the values on the golden's withheld
+//                               dates are held to it, and the stored preview and the
+//                               served allowanceBreakdowns are also compared with it
+//                               whole (perDateEqual). For the Q-1 golden it is
 //                               analytics-v2-test/golden-q1-node/per-date-expected.json
 //   --owner-reference <dir>     also hold every owner's stored fits, model dates,
 //                               owner-day values, cache bands and refusals to an
@@ -75,7 +83,11 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import pg from "pg";
 
-import { compareAnalyticsV2Parity, withheldModelDatesOf } from "./analytics-v2-parity-compare.mjs";
+import {
+  compareAnalyticsV2Parity,
+  perDateExpectationFor,
+  withheldModelDatesOf,
+} from "./analytics-v2-parity-compare.mjs";
 import {
   compareAnalyticsV2OwnerParity,
   readAnalyticsV2OwnerRows,
@@ -712,8 +724,14 @@ async function main() {
   const goldenPreview = JSON.parse(await readFile(join(options.golden, "preview.json"), "utf8"));
   const manifest = JSON.parse(await readFile(join(options.golden, "manifest.json"), "utf8"));
   const withheldModelDates = withheldModelDatesOf(manifest);
-  const perDateExpected = options.perDateExpected === null ? null
-    : JSON.parse(await readFile(options.perDateExpected, "utf8"));
+  let perDateExpected = null;
+  if (options.perDateExpected !== null) {
+    try {
+      perDateExpected = perDateExpectationFor(JSON.parse(await readFile(options.perDateExpected, "utf8")), manifest);
+    } catch {
+      fail("REHEARSAL_PER_DATE_INVALID");
+    }
+  }
   const ownerReference = options.ownerReference === null ? null : {
     ownerResults: JSON.parse(await readFile(join(options.ownerReference, "owner-results.json"), "utf8")),
     cacheReference: JSON.parse(await readFile(join(options.ownerReference, "cache-reference.json"), "utf8")),
@@ -832,7 +850,7 @@ async function main() {
         golden: { ...golden, ...PUBLISHED_ALLOWANCE_STATE, allowanceBreakdowns: perDateExpected.allowanceBreakdowns },
         actual, goldenPreview: perDateExpected.preview, actualPreview,
       })
-      : compareAnalyticsV2Parity({ golden, actual, goldenPreview, actualPreview, withheldModelDates })));
+      : compareAnalyticsV2Parity({ golden, actual, goldenPreview, actualPreview, withheldModelDates, perDateExpected })));
     if (perDateExpected !== null) {
       report.perDate = comparePerDate({ expected: perDateExpected, response: actual, preview: actualPreview });
     }

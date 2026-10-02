@@ -19,10 +19,13 @@
 //                      epoch) and analytics_v2 never stores it
 //   owner-days         analytics_v2_owner_day.daily against production's daily
 //                      owner values (complete) for every owner-day the
-//                      reference holds. An owner-day the reference lacks is
-//                      compared only by being listed: it must be a day of the
-//                      golden's crossed-day conflict, which production's daily
-//                      lane never completes for any owner
+//                      reference holds. An owner-day the reference lacks must
+//                      be a day of the golden's crossed-day conflict, which
+//                      production's daily lane never completes for any owner.
+//                      There, the conflict owner's row must be its refusal;
+//                      every other owner's stored value has no production
+//                      reference and is NOT compared: the report lists those
+//                      owner-days as uncomparedOwnerDays
 //   owner-cache-days   analytics_v2_cache_bands against production's effective
 //                      cache day build for every owner-day with usage: a built
 //                      day's (model, effort, band) rows and their seven
@@ -32,7 +35,11 @@
 //                      other refusal exists: a failed model date -> family
 //                      model; failed fits -> scalar; a refused cache day ->
 //                      cache; the conflict owner's conflict days -> daily.
-//                      Reasons are closed per family (REFUSAL_REASONS)
+//                      Reasons are closed per family (REFUSAL_REASONS). Only
+//                      a reference recorded as `failed` stands for a
+//                      production failure: an absent, stalled or
+//                      result_size_limit reference is no reference, and the
+//                      input is refused as invalid
 //
 // Nothing is normalized beyond inputFingerprint. A difference in any family is
 // unexpected. Inputs are synthetic and content-free; the report carries owner
@@ -47,7 +54,7 @@ import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const ANALYTICS_V2_OWNER_PARITY_REPORT_VERSION = "analytics-v2-owner-parity-report-v1";
+export const ANALYTICS_V2_OWNER_PARITY_REPORT_VERSION = "analytics-v2-owner-parity-report-v2";
 export const ANALYTICS_V2_OWNER_PARITY_FAMILIES = Object.freeze([
   "owner-fits", "owner-model-dates", "owner-days", "owner-cache-days", "refusals",
 ]);
@@ -238,23 +245,25 @@ export function compareAnalyticsV2OwnerParity({ ownerResults, cacheReference, co
     .map((row) => row.ownerDigest))].filter((digest) => !keyOf.has(digest));
   for (const digest of strangers) note(families["owner-fits"], `owner ${digest.slice(0, 8)}`, "stored rows for an owner the reference does not hold");
   const unreferencedOwnerDays = [];
+  const uncomparedOwnerDays = [];
 
   for (const [key, owner] of Object.entries(ownerResults.owners)) {
     const digest = owner.ownerDigest;
     // ---- Fits for today.
     const storedFits = fitsByOwner.get(digest) ?? [];
     const reference = owner.fits?.direct;
-    if (Array.isArray(reference?.fits)) {
+    if (isObject(reference) && Array.isArray(reference.fits)) {
       if (storedFits.length !== 1) note(families["owner-fits"], `${key}.fits`, `stored ${storedFits.length} fits rows`);
       else {
         record(families["owner-fits"], `${key}.fits`, { asOfDay: ownerResults.today, fits: reference.fits },
           { asOfDay: storedFits[0].asOfDay, fits: storedFits[0].fits });
       }
-    } else {
-      expectRefusal(key, ownerResults.today, "scalar", reference?.reason ?? "failed");
+    } else if (isObject(reference) && reference.state === "failed") {
+      // Production's native computation failed: the fast path must refuse too.
+      expectRefusal(key, ownerResults.today, "scalar", reference.reason ?? "failed");
       if (storedFits.length !== 0) note(families["owner-fits"], `${key}.fits`, "fits stored where production failed");
       else { families["owner-fits"].compared += 1; families["owner-fits"].equal += 1; }
-    }
+    } else invalid(`ownerResults.fits.${key}`);
 
     // ---- Model dates.
     const storedModel = new Map((modelByOwner.get(digest) ?? []).map((row) => [row.day, row.result]));
@@ -291,9 +300,13 @@ export function compareAnalyticsV2OwnerParity({ ownerResults, cacheReference, co
       // Production completes no owner value on a conflict-blocked day; any
       // other unreferenced owner-day is a difference.
       if (!conflictDays.has(day)) note(families["owner-days"], `${key}.daily[${day}]`, "stored owner-day the reference lacks");
-      if (key === conflictOwner && conflictDays.has(day)) {
+      else if (key === conflictOwner) {
         expectRefusal(key, day, "daily", "conflict");
         if (stored.daily !== null) note(families["owner-days"], `${key}.daily[${day}]`, "conflict day computed");
+      } else {
+        // No production value exists for this owner-day: listed, not compared.
+        // An unexpected refusal here still fails the refusals family.
+        uncomparedOwnerDays.push(`${key}:${day}`);
       }
     }
 
@@ -354,6 +367,7 @@ export function compareAnalyticsV2OwnerParity({ ownerResults, cacheReference, co
     runIds: [...new Set([...rows.fits, ...rows.modelDates, ...rows.ownerDays, ...rows.cacheBands]
       .map((row) => row.runId).filter((value) => typeof value === "string"))].length,
     unreferencedOwnerDays: unreferencedOwnerDays.sort(),
+    uncomparedOwnerDays: uncomparedOwnerDays.sort(),
     refusalsByFamilyReason: Object.fromEntries(Object.entries(reasons).sort()),
     unexpectedFamilies: unexpected.map((entry) => entry.family),
     unexpectedDiffs: unexpected.reduce((sum, entry) => sum + entry.diffCount, 0),

@@ -410,3 +410,55 @@ test("counts equal the reader's per-day occurrences for every owner, stream and 
     assert.equal(modules.occurrences.MAX_ANALYTICS_V2_BATCH_SOURCE_ROWS, 40_000);
     assert.equal(modules.occurrences.MAX_ANALYTICS_V2_BATCH_V12_ROWS, 40_000);
   });
+
+// Review of c0600bc2 (the v1.2 expansion rewrite): the expansion probes the
+// participant's ready manifests for a batch's occurrence ids, so it must keep
+// excluding every variant of a requested id that is not in a complete chunk of
+// a ready manifest of this participant's generation. Each excluded variant has
+// its own event time, so any leak changes the occurrence (sourceCount, status
+// and event time), not just a count.
+test("the v1.2 expansion excludes a requested occurrence's staged, incomplete and foreign variants",
+  { skip: SKIP, timeout: 300_000 }, async () => {
+    const schema = `analytics_v2_a1_${randomBytes(6).toString("hex")}`;
+    await pool.query(`CREATE SCHEMA "${schema}"`);
+    schemas.push(schema);
+    await applyPostgresMigrations({ role: "primary", schema, pool });
+    const fixture = await seedAnalyticsV2Fixture({ pool, schema, modules: modules.seed, correctionRuntime: "active",
+      v12Scope: true });
+    const scoped = { pool, schema, nowMs: NOW_MS };
+    const read = (name) => modules.occurrences.readOwnerOccurrences(scoped,
+      { ownerDigest: fixture.owners[name].ownerDigest, stream: "usage", fromDay: D1, throughDay: D3 });
+    // Stored: india's eligible record and its staged and incomplete variants
+    // (one id, three event times), and juliet's record of the same id.
+    const stored = await pool.query(`SELECT manifest.participant_id, manifest.state, chunk.record_count,
+        count(DISTINCT record.occurrence_id)::integer AS ids, count(*)::integer AS records
+      FROM "${schema}".telemetry_v12_typed_records record
+      JOIN "${schema}".telemetry_v12_day_manifests manifest ON manifest.id=record.manifest_id
+      JOIN "${schema}".telemetry_v12_chunks chunk ON chunk.id=record.chunk_id
+     WHERE manifest.participant_id = ANY($1)
+     GROUP BY 1,2,3 ORDER BY 1,2,3`, [[fixture.owners.india.participantId, fixture.owners.juliet.participantId]]);
+    const india0 = fixture.owners.india.participantId, juliet0 = fixture.owners.juliet.participantId;
+    assert.deepEqual(stored.rows.map((row) => [row.participant_id === india0 ? "india" : row.participant_id === juliet0
+      ? "juliet" : "?", row.state, row.record_count, row.ids, row.records]).sort(),
+    [["india", "ready", 1, 1, 1], ["india", "ready", 2, 1, 1], ["india", "staged", 1, 1, 1],
+      ["juliet", "ready", 1, 1, 1]].sort(), "one eligible record and three ineligible variants are stored");
+    const ids = await pool.query(`SELECT count(DISTINCT record.occurrence_id)::integer AS n
+      FROM "${schema}".telemetry_v12_typed_records record
+      JOIN "${schema}".telemetry_v12_day_manifests manifest ON manifest.id=record.manifest_id
+     WHERE manifest.participant_id = ANY($1)`, [[india0, juliet0]]);
+    assert.equal(ids.rows[0].n, 1, "all four share one occurrence id");
+    const india = await read("india");
+    assert.deepEqual([...india.keys()], [D1]);
+    const occurrence = only(india.get(D1), OCCURRENCES.scoped);
+    assert.deepEqual({ status: occurrence.status, sourceFormats: occurrence.sourceFormats,
+      sourceCount: occurrence.sourceCount, eventTime: occurrence.eventTime },
+    { status: "compatible", sourceFormats: ["v12"], sourceCount: 1, eventTime: `${D1}T11:00:00.000Z` });
+    assert.equal(india.get(D1).length, 1);
+    // Another participant's record of the same id is that participant's own occurrence only.
+    const juliet = only((await read("juliet")).get(D1), OCCURRENCES.scoped);
+    assert.deepEqual({ status: juliet.status, sourceCount: juliet.sourceCount, eventTime: juliet.eventTime },
+      { status: "compatible", sourceCount: 1, eventTime: `${D1}T12:30:00.000Z` });
+    // The count the memory guard reads agrees with the expansion.
+    assert.deepEqual([...await modules.occurrences.countOwnerOccurrences(scoped,
+      { ownerDigest: fixture.owners.india.ownerDigest, stream: "usage", fromDay: D1, throughDay: D3 })], [[D1, 1]]);
+  });

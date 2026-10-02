@@ -19,6 +19,8 @@
  *           (production view semantics: included)
  *   delta   accountless, disconnected (security reset): excluded
  *   hotel   social, v1.2 only, seeded only with `dense`  effective / effective
+ *   india   social, v1.2 only, seeded only with `v12Scope`  effective / effective
+ *   juliet  social, v1.2 only, seeded only with `v12Scope`  effective / effective
  *
  * The usage-correction runtime row is immutable once written, so each runtime
  * state gets its own schema: seedAnalyticsV2Fixture({ correctionRuntime }).
@@ -26,6 +28,16 @@
  * `dense: { day, usage }` (GCP cap raise) adds hotel with one v1.2 day of
  * `usage` usage records in 200-record chunks, beyond the d43c8f92 shared
  * reducers' 20,000-occurrence day bound. Nothing else changes.
+ *
+ * `v12Scope: true` (review of the v1.2 expansion rewrite) adds india and
+ * juliet. One occurrence id, OCCURRENCES.scoped, has exactly one eligible v1.2
+ * record (india's first device, D1 11:00) and three ineligible variants with
+ * other event times on D1, each of which the v1.2 reader must exclude:
+ * india's second device in a STAGED (never ready) manifest; india's third
+ * device in a ready manifest whose chunk declares one record more than it
+ * holds (the schema's ready guard forbids this, so the fixture bypasses that
+ * trigger for this one row); and juliet's record, another participant's.
+ * Nothing else changes.
  */
 
 import { createHash } from "node:crypto";
@@ -58,6 +70,8 @@ export const OCCURRENCES = Object.freeze({
   crossed: `event:v2:${digest("occurrence:crossed")}`,
   /** alpha usage present in v1.2 only (D1). */
   v12Only: `event:v2:${digest("occurrence:v12-only")}`,
+  /** india usage with one eligible v1.2 record and three ineligible variants (D1, `v12Scope` only). */
+  scoped: `event:v2:${digest("occurrence:v12-scoped")}`,
   /** alpha usage present in v1.1 only (D2). */
   v11Only: `event:v2:${digest("occurrence:v11-only")}`,
   /** alpha quota present in v1 and v1.1 (D1). */
@@ -146,7 +160,8 @@ const PLAN_BASES = ["unavailable", "same_source_occurrence", "provisional_marker
  * the spec (typed codecs, the correction assertion and sha256Hex), so stored
  * digests are the bytes the production readers verify.
  */
-export async function seedAnalyticsV2Fixture({ pool, schema, modules, correctionRuntime, dense = null }) {
+export async function seedAnalyticsV2Fixture({ pool, schema, modules, correctionRuntime, dense = null,
+  v12Scope = false }) {
   if (correctionRuntime !== "active" && correctionRuntime !== "staged") throw new Error("fixture_runtime_invalid");
   const { codec, v12codec, reconciliation, sha256Hex } = modules;
   const quoted = `"${schema}"`;
@@ -585,13 +600,15 @@ export async function seedAnalyticsV2Fixture({ pool, schema, modules, correction
           records.push(await v12codec.encodeTelemetryV12Record(chunk.stream, record,
             async (canonical) => Buffer.from(await sha256Hex(canonical), "hex")));
         }
+        // `declaredExtra` (v12Scope only) declares records the chunk never receives.
         chunks.push({ stream: chunk.stream, chunkId: `${chunk.stream}:${entry.day}:${index}`,
           rowId: `chunk:${uuid(`v12-chunk:${name}:${entry.day}:${index}`)}`,
-          chunkDigest: digest(`v12-chunk-digest:${name}:${entry.day}:${index}`), records });
+          chunkDigest: digest(`v12-chunk-digest:${name}:${entry.day}:${index}`), records,
+          declaredCount: records.length + (chunk.declaredExtra ?? 0) });
       }
       const manifestJson = JSON.stringify({ schemaVersion: "telemetry-day-manifest-v1.2", day: entry.day,
         chunks: chunks.map((chunk) => ({ chunkId: chunk.chunkId, chunkDigest: chunk.chunkDigest,
-          recordCount: chunk.records.length })) });
+          recordCount: chunk.declaredCount })) });
       await q(`INSERT INTO ${table("telemetry_v12_day_manifests")}(
           id,participant_id,device_id,chunk_day,manifest_digest,parser_version,manifest_json,expected_chunk_count,
           state,created_at,ready_at)
@@ -604,7 +621,7 @@ export async function seedAnalyticsV2Fixture({ pool, schema, modules, correction
             envelope_digest,parser_version,record_count,r2_key,device_upload_authorization_id,created_at)
           VALUES ($1,$2,$3,$4,$5,$6::date,$7,$8,$9,$10,'synthetic-analytics-v2',$11,$12,$13,$14)`,
         [chunk.rowId, manifestId, participantId, deviceId, chunk.stream, entry.day, index, chunk.chunkId,
-          chunk.chunkDigest, upload.envelope, chunk.records.length, upload.objectKey, upload.authorizationId, ISSUED]);
+          chunk.chunkDigest, upload.envelope, chunk.declaredCount, upload.objectKey, upload.authorizationId, ISSUED]);
         for (const [recordIndex, fields] of chunk.records.entries()) {
           const recordId = id();
           await q(`INSERT INTO ${table("telemetry_v12_typed_records")}(
@@ -644,8 +661,31 @@ export async function seedAnalyticsV2Fixture({ pool, schema, modules, correction
           }
         }
       }
-      await q(`UPDATE ${table("telemetry_v12_day_manifests")} SET state='ready',ready_at=$2 WHERE id=$1`,
-        [manifestId, ISSUED]);
+      const incomplete = chunks.some((chunk) => chunk.declaredCount !== chunk.records.length);
+      if (entry.ready === false) {
+        // v12Scope only: the manifest stays staged; nothing may read its records.
+      } else if (incomplete) {
+        // v12Scope only: a ready manifest with an incomplete chunk is a state
+        // the ready-integrity guard (0028) forbids. It is built here with that
+        // one statement's triggers bypassed, so the reader's own chunk
+        // completeness check can be tested.
+        const client = await pool.connect();
+        try {
+          await client.query("BEGIN");
+          await client.query("SET LOCAL session_replication_role = replica");
+          await client.query(`UPDATE ${table("telemetry_v12_day_manifests")} SET state='ready',ready_at=$2 WHERE id=$1`,
+            [manifestId, ISSUED]);
+          await client.query("COMMIT");
+        } catch (error) {
+          await client.query("ROLLBACK").catch(() => {});
+          throw error;
+        } finally {
+          client.release();
+        }
+      } else {
+        await q(`UPDATE ${table("telemetry_v12_day_manifests")} SET state='ready',ready_at=$2 WHERE id=$1`,
+          [manifestId, ISSUED]);
+      }
       domainDays.push({ day: entry.day, manifestId, manifestDigest });
     }
     await q(`INSERT INTO ${table("telemetry_v12_domain_predecessors")}(
@@ -838,6 +878,34 @@ export async function seedAnalyticsV2Fixture({ pool, schema, modules, correction
     hotel = Object.freeze({ participantId: hotelId, ownerDigest: hotelDigest, devices: Object.freeze([hotelDevice]) });
   }
 
+  // india and juliet (opt-in): one occurrence with one eligible v1.2 record
+  // and three variants the v1.2 reader must exclude (see the module comment).
+  let india = null;
+  let juliet = null;
+  if (v12Scope) {
+    const scoped = (time) => usageRecord("v12", OCCURRENCES.scoped, at(D1, time));
+    const indiaId = await participant("india", "social");
+    const indiaEligible = await socialDevice(indiaId, "india-v12", { v12: true });
+    const indiaStaged = await socialDevice(indiaId, "india-v12-staged", { v12: true });
+    const indiaIncomplete = await socialDevice(indiaId, "india-v12-incomplete", { v12: true });
+    const indiaDigest = await linkOwner(indiaId, "india");
+    await v12Generation({ participantId: indiaId, deviceId: indiaEligible, name: "india-v12",
+      days: [{ day: D1, chunks: [{ stream: "usage", records: [scoped("11:00:00")] }] }], head: true });
+    await v12Generation({ participantId: indiaId, deviceId: indiaStaged, name: "india-v12-staged",
+      days: [{ day: D1, ready: false, chunks: [{ stream: "usage", records: [scoped("11:30:00")] }] }], head: false });
+    await v12Generation({ participantId: indiaId, deviceId: indiaIncomplete, name: "india-v12-incomplete",
+      days: [{ day: D1, chunks: [{ stream: "usage", records: [scoped("11:45:00")], declaredExtra: 1 }] }],
+      head: false });
+    india = Object.freeze({ participantId: indiaId, ownerDigest: indiaDigest,
+      devices: Object.freeze([indiaEligible, indiaStaged, indiaIncomplete]) });
+    const julietId = await participant("juliet", "social");
+    const julietDevice = await socialDevice(julietId, "juliet-v12", { v12: true });
+    const julietDigest = await linkOwner(julietId, "juliet");
+    await v12Generation({ participantId: julietId, deviceId: julietDevice, name: "juliet-v12",
+      days: [{ day: D1, chunks: [{ stream: "usage", records: [scoped("12:30:00")] }] }], head: true });
+    juliet = Object.freeze({ participantId: julietId, ownerDigest: julietDigest, devices: Object.freeze([julietDevice]) });
+  }
+
   const lastSequence = Number((await q(`SELECT COALESCE(max(sequence),0)::text AS sequence
     FROM ${table("storage_ingestion_changes")}`)).rows[0].sequence);
   return Object.freeze({
@@ -850,6 +918,7 @@ export async function seedAnalyticsV2Fixture({ pool, schema, modules, correction
       echo: Object.freeze({ participantId: echoId, ownerDigest: echoDigest, devices: Object.freeze([echoDevice]) }),
       delta: Object.freeze({ participantId: deltaId, ownerDigest: deltaDigest, devices: Object.freeze([deltaDevice]) }),
       ...(hotel === null ? {} : { hotel }),
+      ...(india === null ? {} : { india, juliet }),
     }),
     sequences: Object.freeze({
       alphaV1Usage: alphaV1Usage.sequence, alphaV1Quota: alphaV1Quota.sequence,

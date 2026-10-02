@@ -323,8 +323,15 @@ command runs the rehearsal:
 ```sh
 PG_TEST_SOCKET=<local PostgreSQL 17 socket> PG_TEST_PORT=<port> \
   node apps/worker/scripts/gcp-fastpath-rehearsal.mjs \
-  --golden apps/worker/analytics-v2-test/golden
+  --golden apps/worker/analytics-v2-test/golden \
+  --per-date-expected apps/worker/analytics-v2-test/golden-q1-node/per-date-expected.json
 ```
+
+(`npm run gcp:fastpath:rehearsal` in `apps/worker` runs the same. The
+per-date expectation was added on 2026-10-02: under OD-12 the rehearsal
+accepts the fast path's publication of the oracle's withheld model dates
+only with exactly the values the oracle's per-date expectation holds, and
+fails without it.)
 
 The command:
 
@@ -471,6 +478,19 @@ gates are in the
   largest real owner needs the new `dense` profile (4 vCPU, 16 GiB, heap
   12,288 MiB, budget 10,752 MiB, 4 h). The seed and test deploy select the
   dense corpus and profile with `--corpus=dense`; only a dry run was made.
+- Review fixes (2026-10-02; the receipt's
+  [Review fixes](../receipts/2026-10-01-gcp-dense-owner-parity.md#review-fixes-2026-10-02)).
+  The parity compare holds the values on accepted model dates to the
+  per-date expectation and fails closed without it. The preview is withheld
+  while any effective owner lacks a current fit, as production's preview
+  publication requires, and a model date on which every member was refused
+  is published with all of them counted (D7 amended; both await the owner's
+  confirmation). The day backstop now applies before the evidence digest. The
+  owner-parity compare fails closed on fits references, and a PostgreSQL case
+  pins the v1.2 expansion's exclusions. Disclosed, not fixed: the reader
+  variant bound divergence in every family, the memory estimate's growth with
+  retained history, the fixed heap reserve for held outputs, the snapshot's
+  xmin hold and the absence of a time guard.
 
 ## Cutover backlog
 
@@ -490,7 +510,7 @@ still needs its own qualification.
 | PT-3 identity and authority importer, with PT-5a's v1.2 mapping | L | Credential and rotation hashes, owner links, the identity-link pin, consents and grants, accountless state and collection controls, with production target modes built on PT-1 | Import, and device authentication after the flip |
 | PT-4: v0.x importer | M | v0.x contributions and admission windows, or an owner decision to retire v0.x backed by traffic evidence | Completeness of raw evidence |
 | PT-8-lite: orchestrator | L | One disposition per sealed table keyed on the live ledger; the deletion-digest exclusion count; the identity-pin fingerprint check; a history-digest and manifest-digest parity sample between D1 and PostgreSQL | The go/no-go, and avoiding a fleet-wide re-upload storm |
-| Dense-owner path | M (remaining, estimate) | Delivered in memory on `claude/gcp-fp-caps` (OD-11) and proven equal to production's native path through the importer chain and the real readers on the dense golden (`claude/gcp-fastpath-dense`). Remaining: the cloud measurement with the `dense` refresh profile (4 vCPU, 16 GiB) and a memory-model recalibration on the Cloud SQL seed; the T-2 importer's quadratic reader verification before the seal; the v1/v1.1 expansion at legacy-owner volume | Cutover: the largest real owner always takes this path |
+| Dense-owner path | M (remaining, estimate) | Delivered in memory on `claude/gcp-fp-caps` (OD-11) and proven equal to production's native path through the importer chain and the real readers on the dense golden (`claude/gcp-fastpath-dense`). Remaining: the cloud measurement with the `dense` refresh profile (4 vCPU, 16 GiB) and a memory-model recalibration on the Cloud SQL seed; the T-2 importer's quadratic reader verification before the seal; the v1/v1.1 expansion at legacy-owner volume; bounded loading of the history before the analysis horizon (the memory estimate grows with retained history), output accounting beyond the fixed 512 MiB reserve, and a time bound measured on Cloud Run | Cutover: the largest real owner always takes this path |
 | Non-effective sources | Depends on OD-4 | v1-only, mixed and v0.2 graph paths, needed only if the production check finds such owners | A parity claim for those owners |
 | Memo mode | M (estimate) | The digest-keyed owner-day memo, the dirty-owner cursor and the nightly full sweep, measured on real data | The cutover cadence (decision D3) |
 | OPS-2 to OPS-5, with OPS-10 | L | Scripted infrastructure with plan, readback and apply; Cloud Run Jobs and Cloud Scheduler as code; probe jobs; monitoring and alerting; the production migration job and rollout | Production origin deploy and operation |
