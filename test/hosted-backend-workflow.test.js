@@ -1007,7 +1007,78 @@ test("the workflow policy refuses a setup-node step without one exact version or
   const borrowed = inspectWorkflowSource(
     `jobs:\n  job:\n    steps:\n      - uses: ${SETUP_NODE}\n        with:\n          persist-credentials: false\n`
     + `      - uses: ${CHECKOUT}\n        with:\n          node-version: ${TOOLCHAIN_NODE}\n`, { path });
-  assert.equal(borrowed.length, 2);
+  assert.equal(borrowed.length, 3);
   assert.ok(borrowed.some((failure) => failure.includes("must set node-version exactly once")));
   assert.ok(borrowed.some((failure) => failure.includes("persist-credentials explicitly to false")));
+  assert.ok(borrowed.some((failure) => failure.includes("setup-node input persist-credentials is not reviewed")),
+    "persist-credentials is a checkout input, not a setup-node one");
+});
+
+test("the workflow policy closes the setup-node inputs to the reviewed list and its architectures", async () => {
+  const path = WORKFLOW_PATH;
+  const reviewedInputs = "          check-latest: false\n          package-manager-cache: false\n          architecture: x64\n";
+  assert.deepEqual(inspectWorkflowSource(setupNodeStep(TOOLCHAIN_NODE, reviewedInputs), { path }), [],
+    "the inputs the checked-in workflows use");
+  for (const architecture of ["x64", "arm64", "\"x64\"", "'arm64'"]) {
+    assert.deepEqual(inspectWorkflowSource(setupNodeStep(TOOLCHAIN_NODE, `          architecture: ${architecture}\n`), { path }), [], architecture);
+  }
+
+  // Inputs that choose where the toolchain comes from, which credential it
+  // sees or what it caches are not reviewed, in either spelling of the key and
+  // wherever they sit in the mapping.
+  const unreviewed = [
+    ["          mirror: https://mirror.example\n", "mirror"],
+    ["          mirror-token: ${{ github.token }}\n", "mirror-token"],
+    ["          token: ${{ github.token }}\n", "token"],
+    ["          registry-url: https://registry.example\n", "registry-url"],
+    ["          always-auth: true\n", "always-auth"],
+    ["          scope: '@example'\n", "scope"],
+    ["          cache: npm\n", "cache"],
+    ["          cache-dependency-path: package-lock.json\n", "cache-dependency-path"],
+    ["          \"mirror\": https://mirror.example\n", "mirror"],
+    ["          'token': ${{ github.token }}\n", "token"],
+    ["          some-future-input: true\n", "some-future-input"],
+  ];
+  for (const [extra, key] of unreviewed) {
+    for (const [where, source] of [
+      ["after the version", setupNodeStep(TOOLCHAIN_NODE, extra)],
+      ["before the version", `jobs:\n  job:\n    steps:\n      - uses: ${SETUP_NODE}\n        with:\n${extra}          node-version: ${TOOLCHAIN_NODE}\n`],
+    ]) {
+      const failures = inspectWorkflowSource(source, { path });
+      assert.equal(failures.length, 1, `${key} ${where}`);
+      assert.match(failures[0], new RegExp(`actions/setup-node input ${key} is not reviewed`, "u"), `${key} ${where}`);
+      assert.match(failures[0], /only node-version, check-latest, package-manager-cache, architecture are allowed/u, `${key} ${where}`);
+    }
+  }
+
+  // Two unreviewed inputs are two failures; the policy does not stop at the first.
+  assert.equal(inspectWorkflowSource(
+    setupNodeStep(TOOLCHAIN_NODE, "          mirror: https://mirror.example\n          registry-url: https://registry.example\n"), { path }).length, 2);
+
+  // An architecture outside the reviewed pair is refused, however it is written.
+  for (const architecture of ["x86", "arm", "ia32", "\"\"", "${{ matrix.arch }}", "${{ github.event.inputs.arch }}"]) {
+    const failures = inspectWorkflowSource(setupNodeStep(TOOLCHAIN_NODE, `          architecture: ${architecture}\n`), { path });
+    assert.equal(failures.length, 1, architecture);
+    assert.match(failures[0], /actions\/setup-node architecture must be one of x64, arm64/u, architecture);
+  }
+
+  // A flow-style mapping hides its inputs from the line reader, so it fails closed on the missing version.
+  const flow = inspectWorkflowSource(
+    `jobs:\n  job:\n    steps:\n      - uses: ${SETUP_NODE}\n        with: { node-version: ${TOOLCHAIN_NODE}, mirror: "https://mirror.example" }\n`, { path });
+  assert.equal(flow.length, 1);
+  assert.match(flow[0], /must set node-version exactly once/u);
+
+  // The checked-in workflow with an extra input on its image runtime step, and on
+  // its toolchain step, is refused; the policy applies in every workflow.
+  const { text } = await loadWorkflow();
+  const withMirror = inspectWorkflowSource(
+    text.replace(`node-version: ${IMAGE_NODE}`, `node-version: ${IMAGE_NODE}\n          mirror: https://mirror.example`), { path });
+  assert.equal(withMirror.length, 1, "the checked-in workflow with a mirror added to its image runtime step");
+  assert.match(withMirror[0], /input mirror is not reviewed/u);
+  const otherPath = ".github/workflows/linux-portability.yml";
+  assert.equal(inspectWorkflowSource(setupNodeStep(TOOLCHAIN_NODE, "          mirror: https://mirror.example\n"), { path: otherPath }).length, 1);
+
+  // Text that mentions an unreviewed input outside a setup-node step is not a step.
+  assert.deepEqual(inspectWorkflowSource(
+    `jobs:\n  job:\n    steps:\n      - uses: ${CHECKOUT}\n        with:\n          persist-credentials: false\n          mirror: not-a-setup-node-input\n`, { path }), []);
 });

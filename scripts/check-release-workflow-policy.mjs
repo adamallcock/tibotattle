@@ -44,6 +44,13 @@ const WORKFLOW_EXTENSIONS = new Set([".yml", ".yaml"]);
 const REPOSITORY_NODE_VERSION = "26.2.0";
 const CLOUD_RUN_IMAGE_NODE_VERSION = "22.16.0";
 const CLOUD_RUN_IMAGE_NODE_WORKFLOWS = new Set([".github/workflows/hosted-backend.yml"]);
+// The `with:` inputs actions/setup-node may be given, and the only values the
+// reviewed workflows use for `architecture`. Any other input is refused, so a
+// mirror, registry, token or cache input cannot change where the toolchain is
+// downloaded from or what it is allowed to trust without a policy review.
+// `node-version` and `check-latest` carry their own value rules below.
+const SETUP_NODE_INPUTS = new Set(["node-version", "check-latest", "package-manager-cache", "architecture"]);
+const SETUP_NODE_ARCHITECTURES = new Set(["x64", "arm64"]);
 
 function normalizePath(path) {
   return path.split(sep).join("/");
@@ -297,9 +304,18 @@ function setupNodeFailures(entries, { path, lineNumber }) {
   for (const entry of entries) {
     if (entry.key === "node-version-file") {
       failures.push(`${path}:${lineNumber}: actions/setup-node must not read its version from node-version-file`);
+      continue;
+    }
+    if (!SETUP_NODE_INPUTS.has(entry.key)) {
+      failures.push(`${path}:${lineNumber}: actions/setup-node input ${entry.key} is not reviewed`
+        + `; only ${[...SETUP_NODE_INPUTS].join(", ")} are allowed, so a mirror, registry, token or cache input is forbidden`);
+      continue;
     }
     if (entry.key === "check-latest" && unquoteYamlScalar(entry.value).toLowerCase() !== "false") {
       failures.push(`${path}:${lineNumber}: actions/setup-node must not set check-latest to anything but false`);
+    }
+    if (entry.key === "architecture" && !SETUP_NODE_ARCHITECTURES.has(unquoteYamlScalar(entry.value))) {
+      failures.push(`${path}:${lineNumber}: actions/setup-node architecture must be one of ${[...SETUP_NODE_ARCHITECTURES].join(", ")}`);
     }
   }
   return failures;
