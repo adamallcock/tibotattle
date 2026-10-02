@@ -26,6 +26,7 @@ import {
   createFakeCutoverTransport,
   createFakeWranglerSpawn,
   privateDirectory,
+  removePrivateDirectories,
   syntheticTombstoneDigests,
 } from "./synthetic-sources.mjs";
 
@@ -59,6 +60,7 @@ export async function prepareSealWorld({ commit, nowMs = Date.now(), ingestion =
     },
     async dispose() {
       await rm(work, { recursive: true, force: true });
+      await removePrivateDirectories();
     },
   };
 }

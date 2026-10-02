@@ -18,7 +18,7 @@
 
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { appendFileSync, closeSync, openSync, statSync, writeSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, readdir, realpath } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -74,11 +74,22 @@ export function pairingSecretHash(pairingId, secret) {
   return sha256(`app-usagemonitor/device-pairing/v1\0${pairingId}\0${secret}`);
 }
 
+const CREATED_DIRECTORIES = new Set();
+
 /** An owner-only 0700 directory under the OS temp root (outside the repository and any scratchpad). */
 export async function privateDirectory(prefix = "w2-seal-") {
   const directory = await realpath(await mkdtemp(join(tmpdir(), prefix)));
   await chmod(directory, 0o700);
+  CREATED_DIRECTORIES.add(directory);
   return directory;
+}
+
+/** Remove every directory privateDirectory created in this process. */
+export async function removePrivateDirectories() {
+  for (const directory of [...CREATED_DIRECTORIES]) {
+    await rm(directory, { recursive: true, force: true });
+    CREATED_DIRECTORIES.delete(directory);
+  }
 }
 
 // ---------------------------------------------------------------------------
