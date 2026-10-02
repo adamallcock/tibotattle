@@ -365,6 +365,18 @@ test("a readback mismatch names the differing snapshot fields, and only their na
   });
 });
 
+test("the same creation instant in the API and gcloud formats is one snapshot; a different instant is not", () => {
+  const desired = desiredState();
+  const api = createdBucket(desired, { timeCreated: "2026-10-01T04:04:18.035Z" });
+  const gcloudRaw = createdBucket(desired, { timeCreated: "2026-10-01T04:04:18.035000+00:00" });
+  const receipt = birth.createBucketBirthReceipt(desired, { createResponse: api, readbackResponse: gcloudRaw });
+  assert.equal(JSON.stringify(receipt).includes("2026-10-01T04:04:18.035Z"), true);
+  assert.throws(() => birth.createBucketBirthReceipt(desired, { createResponse: api,
+    readbackResponse: createdBucket(desired, { timeCreated: "2026-10-01T04:04:18.036000+00:00" }) }),
+  (error) => error.code === "BUCKET_BIRTH_READBACK_MISMATCH"
+    && JSON.stringify(error.differingFields) === JSON.stringify(["timeCreated"]));
+});
+
 test("the module never updates, deletes or reads the IAM policy of a bucket", () => {
   const source = readFileSync(join(SCRIPTS_ROOT, "gcp-ops-bucket-birth.mjs"), "utf8");
   const code = source.replace(/\/\*[\s\S]*?\*\//gu, "").replace(/^\s*\/\/.*$/gmu, "");

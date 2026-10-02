@@ -91,7 +91,9 @@ export function bucketBirthSnapshot(value, desired) {
     projectNumber: value.projectNumber,
     location: value.location,
     storageClass: value.storageClass,
-    timeCreated: value.timeCreated,
+    // Canonical ISO milliseconds: the JSON API says "…18.035Z" while gcloud's
+    // raw listing (the readback) says "…18.035000+00:00" for the same instant.
+    timeCreated: new Date(Date.parse(value.timeCreated)).toISOString(),
     bucketGeneration: decimalGeneration(value.generation),
     bucketMetageneration: decimalGeneration(value.metageneration),
     softDeleteRetentionDurationSeconds: "0",
