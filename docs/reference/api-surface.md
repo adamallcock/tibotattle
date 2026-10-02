@@ -112,6 +112,19 @@ personal-plan summaries and reviewed model tuples `[modelId, usd, accountCount]`
 Combined and plan summaries contain only median dollars, account/fit counts and an optional
 middle-80%-of-fits band. Model estimates have no band or reset-fit count.
 
+The GCP origin serves `community-allowance-breakdowns-v1.3` instead (owner
+decision 2026-10-02, round 7): the same v1.1 block, with the same values and
+key order, relabelled, and with one trailing `modelConfig` array of
+`{ id, label, family, order }`. The array names only the catalog baseline's
+(manifest version 1) primary Codex models that are not hidden, at most 128.
+Each id and label is the manifest's. Family and order keep the public page's
+existing presentation: the seven pinned models first, with their own
+families, then every other model in catalog order, with family `generic`. A model tuple whose id the manifest does not name gets no
+entry, so a reader leaves it out. The parity check treats the relabel and the
+block as the one declared difference from the d43c8f92 oracle. The frozen
+interim export, served before GCP's first publication, keeps the breakdown
+version Cloudflare published.
+
 All comparisons use the same Pro 20x-equivalent weekly basis: Pro ×1,
 Pro 5x ×4, Plus ×20. Unknown plans and separate-track Spark estimates are
 excluded. Model values require the existing composition identification gate;

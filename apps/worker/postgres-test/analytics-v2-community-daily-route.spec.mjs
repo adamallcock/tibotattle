@@ -19,6 +19,7 @@
 //   node --test postgres-test/analytics-v2-community-daily-route.spec.mjs
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
@@ -81,6 +82,7 @@ async function loadModules() {
   });
   return {
     route: await vite.ssrLoadModule("/src/analytics-v2/community-daily-route.ts"),
+    v13: await vite.ssrLoadModule("/src/analytics-v2/public-allowance-breakdowns-v13.ts"),
     cacheWindows: await vite.ssrLoadModule("/src/analytics-v2/cache-windows-sql.ts"),
     canonical: await vite.ssrLoadModule("/src/canonical-json.ts"),
     routeRegistry: await vite.ssrLoadModule("/src/route-registry.ts"),
@@ -463,9 +465,20 @@ function expectedCacheRetention() {
 
 const EMPTY_SUMMARY = { centralUsd: null, participantCount: 0, fitCount: 0, band80Usd: null };
 
+/**
+ * The declared model-metadata block (KM-7, owner decision round 7): the
+ * committed catalog baseline (manifest_version 1) file's public roster, built
+ * independently of the compiled baseline the route reads.
+ */
+function expectedModelConfig() {
+  return modules.v13.buildPublicModelMetadata(
+    JSON.parse(readFileSync(resolve(WORKER_ROOT, "catalog/manifest-0001.json"), "utf8")));
+}
+
+/** d43c8f92's v1.1 projection relabelled v1.3, with the block appended last. */
 function expectedAllowanceBreakdowns() {
   return {
-    schemaVersion: "community-allowance-breakdowns-v1.1",
+    schemaVersion: "community-allowance-breakdowns-v1.3",
     basis: "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d",
     referencePlanType: "pro",
     normalization: "pro_x1_prolite_x4_plus_x20",
@@ -490,6 +503,7 @@ function expectedAllowanceBreakdowns() {
         },
         models: [["gpt-6-astra", 1_166, 1], ["gpt-6-sol", 1_000, 1]] },
     ],
+    modelConfig: expectedModelConfig(),
   };
 }
 
@@ -613,6 +627,27 @@ test("(a) the response equals the fixture-expected JSON byte for byte at the inj
     "fittedParticipantCount", "uploadingParticipantCount", "synthetic-model-07", "synthetic-model-zero"]) {
     assert.equal(first.text.includes(secret), false, secret);
   }
+});
+
+test("breakdowns v1.3: only the declared relabel and catalog-baseline block differ from the v1.1 projection", { skip }, async () => {
+  await reseed();
+  const { text } = await get(`?from=${FROM}&to=${TO}`);
+  const served = JSON.parse(text).allowanceBreakdowns;
+  // The route's block (compiled baseline) is the committed manifest_version 1 file's.
+  assert.deepEqual(modules.route.analyticsV2PublicModelMetadata(), expectedModelConfig());
+  assert.equal(served.modelConfig.length, 41);
+  const { base, metadata } = modules.v13.reducePublicAllowanceBreakdownsV13(served);
+  assert.deepEqual(metadata, expectedModelConfig());
+  // The parity compare's declared block is the same bytes.
+  assert.equal(JSON.stringify(served.modelConfig), JSON.stringify(JSON.parse(readFileSync(resolve(WORKER_ROOT,
+    "analytics-v2-test/fixtures/breakdowns-v13-declared-model-metadata.json"), "utf8"))));
+  const { modelConfig: _modelConfig, ...v11 } = expectedAllowanceBreakdowns();
+  assert.equal(JSON.stringify(base), JSON.stringify({ ...v11, schemaVersion: "community-allowance-breakdowns-v1.1" }));
+  // Only reviewed public roster names are ever given metadata.
+  const servedIds = new Set(served.days.flatMap((day) => day.models.map(([id]) => id)));
+  const named = new Set(served.modelConfig.map((entry) => entry.id));
+  assert.ok([...servedIds].every((id) => named.has(id)));
+  assert.equal(named.has("gpt-5.3-codex-spark"), false);
 });
 
 test("(b) bad parameters are 400 BODY_INVALID in the production error envelope", { skip }, async () => {

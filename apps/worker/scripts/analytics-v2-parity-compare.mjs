@@ -17,6 +17,8 @@
 //   spend                 payload.apiEquivalentSpend per day
 //   daily-other           every other payload field per day
 //   allowance-breakdowns  allowanceBreakdowns header and per-day combined/byPlanType
+//   breakdowns-v13-metadata  the declared v1.3 relabel and model-metadata block
+//                         (accepted: owner decision round 7, below)
 //   model-days            allowanceBreakdowns days[].models and preview.models, on
 //                         every date the oracle published
 //   model-days-per-date   the fast path publishing a model date the oracle
@@ -26,8 +28,22 @@
 //   cache-counts          cacheRetention counts (informational: the Q-1 manifest's
 //                         parityBasis says counts are not a parity basis)
 //
-// A difference is "expected" only in two families:
+// A difference is "expected" only in three families:
 // - cache-counts, by the oracle's own parityBasis;
+// - breakdowns-v13-metadata, by the owner's decision of 2026-10-02 (round 7,
+//   contract names round 9): GCP serves community-allowance-breakdowns-v1.3 at
+//   cutover, which is d43c8f92's v1.1 plus a closed model-metadata block. A
+//   served v1.3 block is accepted only when it is exactly the v1.1 envelope
+//   relabelled with a trailing `modelConfig`, and that block equals the
+//   declared catalog-baseline block (manifest_version 1): the committed
+//   analytics-v2-test/fixtures/breakdowns-v13-declared-model-metadata.json,
+//   which the analytics-v2 and PostgreSQL specs hold equal to
+//   src/analytics-v2/public-allowance-breakdowns-v13.ts over
+//   catalog/manifest-0001.json. It is then compared as the v1.1 block it
+//   reduces to, so every other byte is still held to the oracle. A malformed
+//   v1.3 block, or any other block, is unexpected. (Plain JavaScript and JSON
+//   here: the rehearsal's origin child and the edge end-to-end suite run this
+//   module under Node 22.16, which does not strip TypeScript.)
 // - model-days-per-date, by the owner's decision of 2026-10-01 (fast-path plan
 //   OD-12): the fast path publishes each model date on its own, with refused
 //   owners excluded and counted, where d43c8f92 withholds a 14-date block until
@@ -53,17 +69,33 @@
 // report; exits 0 when there is no unexpected difference, 1 otherwise, 2 on a
 // usage error. Inputs are synthetic and content-free.
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const ANALYTICS_V2_PARITY_REPORT_VERSION = "analytics-v2-parity-report-v3";
+export const ANALYTICS_V2_PARITY_REPORT_VERSION = "analytics-v2-parity-report-v4";
 export const ANALYTICS_V2_PARITY_FAMILIES = Object.freeze([
   "envelope", "daily-days", "daily-totals", "daily-cells", "spend", "daily-other",
-  "allowance-breakdowns", "model-days", "model-days-per-date", "preview", "cache-structure", "cache-counts",
+  "allowance-breakdowns", "breakdowns-v13-metadata", "model-days", "model-days-per-date", "preview",
+  "cache-structure", "cache-counts",
 ]);
-const EXPECTED_FAMILIES = new Set(["cache-counts", "model-days-per-date"]);
+const EXPECTED_FAMILIES = new Set(["cache-counts", "model-days-per-date", "breakdowns-v13-metadata"]);
+/** The owner decision that makes breakdowns-v13-metadata expected. */
+export const ANALYTICS_V2_BREAKDOWNS_V13_DECISION =
+  "Round 7 and round 9, 2026-10-02: breakdowns v1.3 (d43c8f92 v1.1 plus model metadata) at cutover, a declared difference";
+const WORKER_ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
+const V13_SCHEMA_VERSION = "community-allowance-breakdowns-v1.3";
+const V11_SCHEMA_VERSION = "community-allowance-breakdowns-v1.1";
+/** The v1.1 envelope in the vendored projection's key order; v1.3 appends modelConfig. */
+const V11_KEYS = Object.freeze(["schemaVersion", "basis", "referencePlanType", "normalization", "modelBasis",
+  "modelGate", "generatedAt", "days"]);
+/**
+ * The declared block: the catalog baseline's (manifest_version 1) public
+ * roster as committed, never re-derived from the code under test.
+ */
+export const ANALYTICS_V2_DECLARED_MODEL_METADATA = Object.freeze(JSON.parse(readFileSync(
+  join(WORKER_ROOT, "analytics-v2-test/fixtures/breakdowns-v13-declared-model-metadata.json"), "utf8")));
 /** The owner decision that makes model-days-per-date expected (fast-path plan OD-12). */
 export const ANALYTICS_V2_PER_DATE_MODEL_DECISION =
   "OD-12, 2026-10-01: per-date model publication with refused owners excluded and counted";
@@ -75,6 +107,35 @@ const AGGREGATE_REVISION_SUFFIX = /:r[1-9][0-9]*$/u;
 
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * A served allowanceBreakdowns block with the declared v1.3 difference undone.
+ * `served` says whether the block claims v1.3; `valid` whether it is exactly
+ * the declared shape; `metadataEqual` whether its block is the declared one
+ * (null when it is not v1.3). `base` is what the oracle is compared with: the
+ * reduced v1.1 block when valid, else the block unchanged.
+ */
+export function declaredBreakdownsV13(value, declaredModelMetadata = ANALYTICS_V2_DECLARED_MODEL_METADATA) {
+  if (!isObject(value) || value.schemaVersion !== V13_SCHEMA_VERSION) {
+    return { base: value, served: false, valid: true, metadataEqual: null, metadata: null };
+  }
+  const keys = Object.keys(value);
+  const expectedKeys = [...V11_KEYS, "modelConfig"];
+  if (keys.length !== expectedKeys.length || keys.some((key, index) => key !== expectedKeys[index])
+      || !Array.isArray(value.modelConfig)) {
+    return { base: value, served: true, valid: false, metadataEqual: false, metadata: null };
+  }
+  const { modelConfig, ...rest } = value;
+  // Entry key order is part of the declared bytes, so it is compared too.
+  const entryKeys = (block) => (Array.isArray(block) ? block : []).map((entry) => (isObject(entry) ? Object.keys(entry) : null));
+  const metadataEqual = Array.isArray(declaredModelMetadata)
+    && diffValues(declaredModelMetadata, modelConfig).length === 0
+    && JSON.stringify(entryKeys(declaredModelMetadata)) === JSON.stringify(entryKeys(modelConfig));
+  return {
+    base: { ...rest, schemaVersion: V11_SCHEMA_VERSION }, served: true, valid: true,
+    metadata: modelConfig, metadataEqual,
+  };
 }
 
 /** Drop only the publication-schedule fields from one served day. */
@@ -248,6 +309,7 @@ function acceptPerDate(families, published, unverified, key, day, actual, expect
  */
 export function compareAnalyticsV2Parity({
   golden, actual, goldenPreview = null, actualPreview = null, withheldModelDates = [], perDateExpected = null,
+  declaredModelMetadata = ANALYTICS_V2_DECLARED_MODEL_METADATA,
 }) {
   const withheld = new Set(withheldModelDatesOf({ modelPublications: { missing: withheldModelDates } }));
   if (perDateExpected !== null && !isObject(perDateExpected)) throw new TypeError("ANALYTICS_V2_PARITY_PER_DATE_INVALID");
@@ -278,7 +340,29 @@ export function compareAnalyticsV2Parity({
   }
 
   const gAllowance = golden?.allowanceBreakdowns;
-  const aAllowance = actual?.allowanceBreakdowns;
+  // The declared v1.3 difference is accepted only in its exact shape and with
+  // the declared block; the reduced v1.1 block is then held to the oracle.
+  const declared = declaredBreakdownsV13(actual?.allowanceBreakdowns, declaredModelMetadata);
+  const aAllowance = declared.base;
+  if (declared.served) {
+    const target = families["breakdowns-v13-metadata"];
+    if (!declared.valid) {
+      record(families["allowance-breakdowns"], "$.allowanceBreakdowns", "<declared v1.3 shape>",
+        "<not the v1.1 envelope plus a trailing valid modelConfig>");
+    } else if (!declared.metadataEqual) {
+      record(families["allowance-breakdowns"], "$.allowanceBreakdowns.modelConfig", declaredModelMetadata,
+        declared.metadata);
+    } else {
+      target.compared += 1;
+      target.diffCount += 2;
+      target.diffs.push(
+        { path: "$.allowanceBreakdowns.schemaVersion", golden: brief(gAllowance?.schemaVersion),
+          actual: brief(V13_SCHEMA_VERSION) },
+        { path: "$.allowanceBreakdowns.modelConfig", golden: brief(undefined),
+          actual: `<declared manifest_version 1 block: ${declaredModelMetadata.length} entries>` },
+      );
+    }
+  }
   record(families["allowance-breakdowns"], "$.allowanceBreakdowns", omit(gAllowance, ["days"]),
     omit(aAllowance, ["days"]));
   const gAllowanceDays = byDay(gAllowance?.days);
@@ -340,6 +424,12 @@ export function compareAnalyticsV2Parity({
       valuesHeldTo: perDateExpected === null ? null : (perDateExpected.schemaVersion ?? "per-date expectation"),
       publishedWithheldDates: [...publishedWithheld].sort(),
       unverifiedWithheldDates: [...unverifiedWithheld].sort(),
+    },
+    breakdownsV13: {
+      decision: ANALYTICS_V2_BREAKDOWNS_V13_DECISION,
+      served: declared.served,
+      accepted: declared.served && declared.valid && declared.metadataEqual === true,
+      declaredEntries: declaredModelMetadata.length,
     },
     unexpectedFamilies: unexpected.map((entry) => entry.family),
     unexpectedDiffs: unexpected.reduce((sum, entry) => sum + entry.diffCount, 0),
