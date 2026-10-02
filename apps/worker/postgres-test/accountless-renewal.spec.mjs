@@ -203,7 +203,7 @@ test("PostgreSQL accountless renewal preserves Cloudflare authority, boundary, a
     connectionTimeoutMillis: 5_000,
   });
   const schema = `renewal_${randomBytes(6).toString("hex")}`;
-  const options = { schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` } };
+  const options = { schema: { primarySchema: schema } };
   let createdSchema = false;
   let vite;
   try {

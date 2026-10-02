@@ -1436,19 +1436,17 @@ test("the IAM user, schema, Apple key and identity-version mirrors match their s
         .resources.iamUser, normalizeIamUser(value));
     }
   }
-  // The primary schema grammar. Until SIMP-4 removes it, the canonical
-  // runtime validator still takes a second schema; a fixed, distinct probe
-  // name fills it, so only the primary value decides.
-  const SECOND_SCHEMA_PROBE = "synthetic_second_schema_probe";
+  // The primary schema grammar. LEAD-SIMP made the canonical runtime
+  // validator primary-only (it refuses a second schema key), so the primary
+  // value alone decides.
   for (const primary of [
     "origin_primary", "pg_primary", "information_schema", "Origin", "_origin",
     "a".repeat(63), "a".repeat(64), "origin-primary", "origin primary",
   ]) {
-    assert.notEqual(primary, SECOND_SCHEMA_PROBE);
     assert.equal(
       acceptsProduction({ PRIMARY_SCHEMA: primary }),
       acceptsCanonical(() => canonical.postgresClient.createPostgresSchemaConfig({
-        primarySchema: primary, ledgerSchema: SECOND_SCHEMA_PROBE,
+        primarySchema: primary,
       })),
       primary,
     );

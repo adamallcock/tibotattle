@@ -1,13 +1,12 @@
 import assert from "node:assert/strict";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { lstat, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
-import { createRequire } from "node:module";
-import { dirname, join, resolve } from "node:path";
+import { lstat, mkdtemp, realpath, rm, stat } from "node:fs/promises";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 import { build } from "esbuild";
 import pg from "pg";
-import { applyPostgresMigrations, renderPostgresSearchPath } from "../scripts/postgres-migrations.mjs";
+import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const WORKER_ROOT = resolve(ROOT, "..");
 const PG_TEST_HOST = process.env.PG_TEST_HOST;
@@ -33,9 +32,11 @@ await build({
   logLevel: "silent",
 });
 const {
+  cleanupSyntheticV12Participant,
   parseSyntheticV12CleanupConfig,
   readAttachedSyntheticCleanupServiceAccount,
   runSyntheticV12Cleanup,
+  SYNTHETIC_V12_CLEANUP_RECEIPT_SCHEMA,
   SYNTHETIC_V12_CLEANUP_JOB,
   SYNTHETIC_V12_CLEANUP_SERVICE,
   SYNTHETIC_V12_CLEANUP_SERVICE_ACCOUNT,
@@ -109,9 +110,6 @@ function validEnv(overrides = {}) {
     PRIMARY_INSTANCE_CONNECTION_NAME: SYNTHETIC_V12_CLEANUP_TARGETS.primary.instanceConnectionName,
     PRIMARY_DATABASE: SYNTHETIC_V12_CLEANUP_TARGETS.primary.database,
     PRIMARY_SCHEMA: SYNTHETIC_V12_CLEANUP_TARGETS.primary.schema,
-    LEDGER_INSTANCE_CONNECTION_NAME: SYNTHETIC_V12_CLEANUP_TARGETS.ledger.instanceConnectionName,
-    LEDGER_DATABASE: SYNTHETIC_V12_CLEANUP_TARGETS.ledger.database,
-    LEDGER_SCHEMA: SYNTHETIC_V12_CLEANUP_TARGETS.ledger.schema,
     GCS_BUCKET_NAME: CLEANUP_BUCKET,
     GCS_ERASURE_BUCKET_HISTORY_PROOF: proof(),
     SYNTHETIC_V12_CLEANUP_PARTICIPANT_ID: PARTICIPANT_ID,
@@ -119,54 +117,11 @@ function validEnv(overrides = {}) {
   };
 }
 
-function fakeManifest() {
-  const roles = {};
-  for (const [role, expected, tail] of [
-    ["primary", 63, "0063_enrollment_grants_erased_redeemer.sql"],
-    ["ledger", 7, "0007_production_transfer_control.sql"],
-  ]) {
-    roles[role] = Array.from({ length: expected }, (_, index) => ({
-      role,
-      version: index + 1,
-      name: index + 1 === expected ? tail : `${String(index + 1).padStart(4, "0")}_fixture.sql`,
-      bytes: 1,
-      sql: "x",
-      sha256: "a".repeat(64),
-    }));
-  }
-  return { roles };
-}
-
-function migrationPool(role, migrations) {
-  return {
-    async connect() {
-      return {
-        async query(sql) {
-          if (sql.startsWith("SELECT current_setting('server_version_num')")) {
-            return { rows: [{ server_version_num: 170000 }] };
-          }
-          if (sql.includes("_tibotattle_migration_history")) {
-            return {
-              rows: migrations.map((migration) => ({
-                version: migration.version,
-                name: migration.name,
-                checksum_sha256: migration.sha256,
-              })),
-            };
-          }
-          return { rows: [], rowCount: 0 };
-        },
-        release() {},
-      };
-    },
-  };
-}
-
 test("cleanup config requires a provisioned test bucket receipt and pins the one-task owner target", () => {
   const env = validEnv();
   const parsed = parseSyntheticV12CleanupConfig(env, SYNTHETIC_V12_CLEANUP_SERVICE_ACCOUNT);
   assert.equal(SYNTHETIC_V12_CLEANUP_TARGETS.primary.schema, "tibotattle_v12_a2_20260925");
-  assert.equal(SYNTHETIC_V12_CLEANUP_TARGETS.ledger.schema, "tibotattle_ledger_v12_a2_20260925");
+  assert.equal("ledger" in SYNTHETIC_V12_CLEANUP_TARGETS, false);
   assert.equal(SYNTHETIC_V12_CLEANUP_TARGETS.bucket, CLEANUP_BUCKET);
   assert.equal(parsed.job, SYNTHETIC_V12_CLEANUP_JOB);
   assert.equal(parsed.origin, SYNTHETIC_V12_CLEANUP_TARGETS.origin);
@@ -185,10 +140,11 @@ test("cleanup config requires a provisioned test bucket receipt and pins the one
     { PRIMARY_DATABASE: "another" },
     { PRIMARY_SCHEMA: "another" },
     { PRIMARY_SCHEMA: "tibotattle" },
-    { LEDGER_INSTANCE_CONNECTION_NAME: "another:region:instance" },
-    { LEDGER_DATABASE: "another" },
-    { LEDGER_SCHEMA: "another" },
-    { LEDGER_SCHEMA: "tibotattle_ledger" },
+    // The retired A2 ledger target is refused in any form.
+    { LEDGER_INSTANCE_CONNECTION_NAME: "tibotattle:us-east1:tibotattle-test-ledger-20260922" },
+    { LEDGER_DATABASE: "tibotattle_ledger" },
+    { LEDGER_SCHEMA: "tibotattle_ledger_v12_a2_20260925" },
+    { LEDGER_SCHEMA: "" },
     { GCS_BUCKET_NAME: "another-test-bucket" },
     { GCS_BUCKET_NAME: OLD_APP_BUCKET },
     { GCS_BUCKET_NAME: A1_BUCKET },
@@ -252,55 +208,6 @@ test("wrong job and origin fail before SQL connector or GCS construction", async
     env: validEnv({ HOST_ORIGIN: "https://service.invalid" }), dependencies,
   }), /CLOUD_RUN_SYNTHETIC_CLEANUP_SERVICE_INVALID/u);
   assert.equal(accessCalls, 1);
-});
-
-test("injected cleanup execution verifies both PG receipts and returns a redacted receipt", async () => {
-  const manifest = fakeManifest();
-  const primaryPool = migrationPool("primary", manifest.roles.primary);
-  const ledgerPool = migrationPool("ledger", manifest.roles.ledger);
-  const poolCalls = [];
-  let storeConstructed = false;
-  let closed = false;
-  const participantId = validEnv().SYNTHETIC_V12_CLEANUP_PARTICIPANT_ID;
-  const result = await runSyntheticV12Cleanup({
-    env: validEnv({ SYNTHETIC_V12_CLEANUP_PARTICIPANT_ID: participantId }),
-    dependencies: {
-      async readServiceAccountEmail() { return SYNTHETIC_V12_CLEANUP_SERVICE_ACCOUNT; },
-      buildManifest: async () => manifest,
-      createConnector() { return { marker: "connector" }; },
-      async createPool(options) {
-        poolCalls.push(options);
-        return options.instanceConnectionName === SYNTHETIC_V12_CLEANUP_TARGETS.primary.instanceConnectionName
-          ? primaryPool : ledgerPool;
-      },
-      async createAccessTokenProvider() { return async () => "synthetic-token"; },
-      createObjectStore({ bucket, historyProof }) {
-        storeConstructed = true;
-        assert.equal(bucket, CLEANUP_BUCKET);
-        assert.equal(historyProof.bucket, CLEANUP_BUCKET);
-        return { async deleteBatch() {} };
-      },
-      async eraseOwner(options) {
-        assert.equal(options.participantId, participantId);
-        return { status: "complete", objectsDeleted: 1 };
-      },
-      async closeResources({ pools, connector }) {
-        assert.equal(pools.length, 2);
-        assert.equal(connector.marker, "connector");
-        closed = true;
-      },
-    },
-  });
-  assert.deepEqual(result, { status: "complete", objectsDeleted: 1 });
-  assert.equal(storeConstructed, true);
-  assert.equal(closed, true);
-  assert.deepEqual(poolCalls.map((call) => call.instanceConnectionName), [
-    SYNTHETIC_V12_CLEANUP_TARGETS.primary.instanceConnectionName,
-    SYNTHETIC_V12_CLEANUP_TARGETS.ledger.instanceConnectionName,
-  ]);
-  assert.ok(poolCalls.every((call) => call.user === SYNTHETIC_V12_CLEANUP_TARGETS.iamUser));
-  assert.equal(JSON.stringify(result).includes(participantId), false);
-  assert.equal(JSON.stringify(result).includes("synthetic-token"), false);
 });
 
 async function localPostgresEndpoint() {
@@ -395,11 +302,15 @@ async function seedOwner(pool, schema, { withChunk = false } = {}) {
   );
 
   let objectKey = null;
+  let contributionId = null;
   if (withChunk) {
+    // The discovery rules' shape: one ready manifest declaring one chunk,
+    // its typed key, its registered pending object and one legacy-lane record.
     const manifestId = randomUUID();
     const grantId = randomUUID();
-    const contributionId = `chunk:${randomUUID()}`;
-    objectKey = `telemetry/v12/test/${randomUUID()}`;
+    contributionId = `chunk:${randomUUID()}`;
+    objectKey = `telemetry/v12-${randomUUID()}`;
+    const chunkName = randomUUID();
     const day = "2026-09-24";
     const digest = randomBytes(32).toString("hex");
     await pool.query(
@@ -415,7 +326,7 @@ async function seedOwner(pool, schema, { withChunk = false } = {}) {
          manifest_json, expected_chunk_count, state, created_at
        ) VALUES ($1, $2, $3, $4::date, $5, 'v1.2-test', $6, 1, 'staged', $7)`,
       [manifestId, participantId, deviceId, day, randomBytes(32).toString("hex"),
-        JSON.stringify({ day, chunks: [] }), now],
+        JSON.stringify({ day, chunks: [{ chunkId: chunkName, chunkDigest: digest, recordCount: 1 }] }), now],
     );
     await pool.query(
       `INSERT INTO ${qualified(schema, "pending_objects")} (contribution_id, object_key, object_kind)
@@ -429,11 +340,21 @@ async function seedOwner(pool, schema, { withChunk = false } = {}) {
          r2_key, device_upload_authorization_id, created_at
        ) VALUES ($1, $2, $3, $4, 'usage', $5::date, 0, $6, $7, $8,
          'v1.2-test', 1, $9, $10, $11)`,
-      [contributionId, manifestId, participantId, deviceId, day, randomUUID(), digest,
+      [contributionId, manifestId, participantId, deviceId, day, chunkName, digest,
         digest, objectKey, grantId, now],
     );
+    await pool.query(
+      `INSERT INTO ${qualified(schema, "telemetry_v12_records")} (
+         chunk_id, manifest_id, stream, occurrence_id, observed_at, record_json
+       ) VALUES ($1, $2, 'usage', $3, $4, '{}')`,
+      [contributionId, manifestId, `occurrence-${randomUUID()}`, now],
+    );
+    await pool.query(
+      `UPDATE ${qualified(schema, "telemetry_v12_day_manifests")} SET state = 'ready', ready_at = $2 WHERE id = $1`,
+      [manifestId, now],
+    );
   }
-  return { participantId, deviceId, ownerDigest, objectKey };
+  return { participantId, deviceId, ownerDigest, objectKey, contributionId };
 }
 
 async function seedHistoricalHeader(pool, schema, fixture) {
@@ -519,31 +440,162 @@ async function seedActivatedDomain(pool, schema, participantId) {
   return generationId;
 }
 
-async function importOwnerErasure(temporary) {
+function fakeManifest() {
+  const primary = Array.from({ length: 64 }, (_, index) => ({
+    role: "primary",
+    version: index + 1,
+    name: index + 1 === 64 ? "0064_append_only_residue.sql" : `${String(index + 1).padStart(4, "0")}_fixture.sql`,
+    bytes: 1,
+    sql: "x",
+    sha256: "a".repeat(64),
+  }));
+  return { roles: { primary } };
+}
+
+function migrationPool(migrations) {
+  return {
+    async connect() {
+      return {
+        async query(sql) {
+          if (sql.startsWith("SELECT current_setting('server_version_num')")) {
+            return { rows: [{ server_version_num: 170000 }] };
+          }
+          if (sql.includes("_tibotattle_migration_history")) {
+            return {
+              rows: migrations.map((migration) => ({
+                version: migration.version,
+                name: migration.name,
+                checksum_sha256: migration.sha256,
+              })),
+            };
+          }
+          return { rows: [], rowCount: 0 };
+        },
+        release() {},
+      };
+    },
+  };
+}
+
+function injectedDependencies(overrides = {}) {
+  const manifest = fakeManifest();
+  const calls = { pools: [], cleanups: [], closed: 0, stores: 0 };
+  const dependencies = {
+    async readServiceAccountEmail() { return SYNTHETIC_V12_CLEANUP_SERVICE_ACCOUNT; },
+    buildManifest: async () => manifest,
+    createConnector() { return { marker: "connector" }; },
+    async createPool(options) {
+      calls.pools.push(options);
+      return migrationPool(manifest.roles.primary);
+    },
+    async createAccessTokenProvider() { return async () => "synthetic-token"; },
+    createObjectStore({ bucket, historyProof }) {
+      calls.stores += 1;
+      assert.equal(bucket, CLEANUP_BUCKET);
+      assert.equal(historyProof.bucket, CLEANUP_BUCKET, "OD-2: the history proof still reaches the store");
+      return { async delete() {} };
+    },
+    async cleanupParticipant(options) {
+      calls.cleanups.push(options);
+      return { status: "complete", objectsDeleted: 1, erasureReceipts: 1 };
+    },
+    async closeResources({ pools, connector }) {
+      assert.equal(pools.length, 1, "one primary pool, no ledger pool");
+      assert.equal(connector.marker, "connector");
+      calls.closed += 1;
+    },
+    ...overrides,
+  };
+  return { dependencies, calls, manifest };
+}
+
+test("injected cleanup verifies the primary receipt on one pool and returns a redacted receipt", async () => {
+  const { dependencies, calls } = injectedDependencies();
+  const result = await runSyntheticV12Cleanup({ env: validEnv(), dependencies });
+  assert.deepEqual(result, { status: "complete", objectsDeleted: 1, erasureReceipts: 1 });
+  assert.equal(calls.stores, 1);
+  assert.equal(calls.closed, 1);
+  assert.deepEqual(calls.pools.map((call) => call.instanceConnectionName), [
+    SYNTHETIC_V12_CLEANUP_TARGETS.primary.instanceConnectionName,
+  ]);
+  assert.ok(calls.pools.every((call) => call.user === SYNTHETIC_V12_CLEANUP_TARGETS.iamUser));
+  assert.equal(calls.cleanups.length, 1);
+  assert.equal(calls.cleanups[0].schema, SYNTHETIC_V12_CLEANUP_TARGETS.primary.schema);
+  assert.equal(calls.cleanups[0].participantId, PARTICIPANT_ID);
+  assert.equal(JSON.stringify(result).includes(PARTICIPANT_ID), false);
+  assert.equal(JSON.stringify(result).includes("synthetic-token"), false);
+  assert.equal(SYNTHETIC_V12_CLEANUP_RECEIPT_SCHEMA, "synthetic-v12-owner-cleanup-receipt-v2");
+});
+
+test("a stale manifest or a stale ledger setting stops before any pool or object store", async () => {
+  const base = fakeManifest();
+  for (const [label, env, manifest, code] of [
+    ["v1 dual-role manifest", validEnv(), { roles: { ...base.roles, ledger: [] } },
+      "POSTGRES_SYNTHETIC_CLEANUP_MIGRATION_SOURCE_INVALID"],
+    ["63-migration manifest", validEnv(), { roles: { primary: base.roles.primary.slice(0, 63) } },
+      "POSTGRES_SYNTHETIC_CLEANUP_MIGRATION_SOURCE_INVALID"],
+    ["retired ledger schema", validEnv({ LEDGER_SCHEMA: "tibotattle_ledger_v12_a2_20260925" }), base,
+      "POSTGRES_SYNTHETIC_CLEANUP_TARGET_INVALID"],
+  ]) {
+    const { dependencies, calls } = injectedDependencies({ buildManifest: async () => manifest });
+    await assert.rejects(runSyntheticV12Cleanup({ env, dependencies }), { code }, label);
+    assert.equal(calls.pools.length, 0, label);
+    assert.equal(calls.stores, 0, label);
+    assert.equal(calls.cleanups.length, 0, label);
+  }
+});
+
+test("the cleanup bundle graph carries no ledger, tombstone, cooldown, retirement or eraser module", async () => {
   const result = await build({
-    entryPoints: [resolve(WORKER_ROOT, "src/postgres-owner-erasure.ts")],
+    entryPoints: [resolve(ROOT, "synthetic-v12-cleanup.mjs")],
     bundle: true,
     packages: "external",
     platform: "node",
-    format: "cjs",
-    target: "node22",
+    format: "esm",
     write: false,
+    metafile: true,
     logLevel: "silent",
   });
-  const path = join(temporary, "postgres-owner-erasure.cjs");
-  await writeFile(path, result.outputFiles[0].contents);
-  return createRequire(import.meta.url)(path);
-}
+  const inputs = Object.keys(result.metafile.inputs)
+    .map((path) => relative(WORKER_ROOT, resolve(process.cwd(), path)));
+  assert.ok(inputs.includes("src/gcs-quarantine-object-store.ts"), "the quarantine delete primitive is the object path");
+  assert.ok(inputs.includes("cloud-run/synthetic-v12-discovery.mjs"), "the discovery rules scope the target");
+  for (const input of inputs) {
+    assert.doesNotMatch(input, /ledger|tombstone|cooldown|retirement|owner-erasure|participant-erasure|storage-erasure|(?:^|\/)retention\.ts$/u, input);
+  }
+});
 
-test("PG17 owner-erasure fixture fences one exact owner, retries an object failure and verifies ledger/owner receipts", {
-  skip: !PG_TEST_HOST && !PG_TEST_SOCKET,
-  timeout: 180_000,
-}, async () => {
+test("cleanupSyntheticV12Participant refuses a non-synthetic target or missing store before any query", async () => {
+  let connected = 0;
+  const pool = { async connect() { connected += 1; throw new Error("must not connect"); } };
+  const objectStore = { async delete() { throw new Error("must not delete"); } };
+  for (const [participantId, code] of [
+    ["participant:real-user", "SYNTHETIC_CLEANUP_PARTICIPANT_INVALID"],
+    ["synthetic-v12-smoke-not-a-uuid", "SYNTHETIC_CLEANUP_PARTICIPANT_INVALID"],
+    [`real-${randomUUID()}`, "SYNTHETIC_CLEANUP_PARTICIPANT_INVALID"],
+  ]) {
+    await assert.rejects(cleanupSyntheticV12Participant({ pool, schema: "w3_simp_cleanup", participantId, objectStore }),
+      { code });
+  }
+  await assert.rejects(cleanupSyntheticV12Participant({
+    pool, schema: "w3_simp_cleanup", participantId: PARTICIPANT_ID, objectStore: { deleteBatch() {} },
+  }), { code: "SYNTHETIC_CLEANUP_DEPENDENCIES_INVALID" });
+  await assert.rejects(cleanupSyntheticV12Participant({
+    pool, schema: "pg_catalog", participantId: PARTICIPANT_ID, objectStore,
+  }), { code: "SYNTHETIC_CLEANUP_SCHEMA_INVALID" });
+  assert.equal(connected, 0);
+});
+
+/**
+ * A local PG17 schema migrated to the full primary chain; dropped afterwards.
+ * A historical-header fixture needs primary 0040's typed_legacy_target_
+ * schema family, so that case names its schema there (still tagged w3_simp).
+ */
+async function withMigratedSchema(label, run, { historicalHeaders = false } = {}) {
   const endpoint = await localPostgresEndpoint();
-  const suffix = randomBytes(5).toString("hex");
-  const primarySchema = `typed_legacy_target_${suffix}`;
-  const ledgerSchema = `${primarySchema}_ledger`;
-  const poolOptions = {
+  const schema = `${historicalHeaders ? "typed_legacy_target_" : ""}w3_simp_cleanup_${label}_${
+    randomBytes(4).toString("hex")}`;
+  const pool = new pg.Pool({
     host: endpoint.host,
     port: endpoint.port,
     user: PG_TEST_USER,
@@ -552,403 +604,181 @@ test("PG17 owner-erasure fixture fences one exact owner, retries an object failu
     ssl: false,
     max: 4,
     connectionTimeoutMillis: 3_000,
-  };
-  const primaryPool = new pg.Pool(poolOptions);
-  const ledgerPool = new pg.Pool(poolOptions);
-  const temporary = await mkdtemp(join(ROOT, ".tmp-postgres-owner-erasure-"));
-  const createdSchemas = [];
+  });
   try {
-    const server = await primaryPool.query("SELECT current_setting('server_version_num')::integer AS version");
+    const server = await pool.query("SELECT current_setting('server_version_num')::integer AS version");
     assert.equal(Math.floor(server.rows[0].version / 10_000), 17,
       "the local cleanup integration check requires PostgreSQL 17");
-    await primaryPool.query(`CREATE SCHEMA "${primarySchema}"`);
-    createdSchemas.push(primarySchema);
-    await primaryPool.query(`CREATE SCHEMA "${ledgerSchema}"`);
-    createdSchemas.push(ledgerSchema);
-    await Promise.all([
-      applyPostgresMigrations({ role: "primary", schema: primarySchema, pool: primaryPool }),
-      applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool: ledgerPool }),
-    ]);
-    const { eraseSyntheticPostgresV12Owner } = await importOwnerErasure(temporary);
-
-    const fixture = await seedOwner(primaryPool, primarySchema, { withChunk: true });
-    const rotationBefore = await primaryPool.query(
-      `SELECT count(*)::int AS count FROM ${qualified(primarySchema, "device_credential_rotations")}
-        WHERE participant_id=$1`,
-      [fixture.participantId],
-    );
-    assert.equal(rotationBefore.rows[0]?.count, 1);
-    await primaryPool.query(
-      `INSERT INTO ${qualified(primarySchema, "input_source_digests")}
-        (participant_id,digest) VALUES($1,$2)`,
-      [fixture.participantId, randomBytes(16).toString("hex")],
-    );
-    const generationId = await seedActivatedDomain(
-      primaryPool, primarySchema, fixture.participantId,
-    );
-    const sourceDigestBefore = await primaryPool.query(
-      `SELECT count(*)::int AS count FROM ${qualified(primarySchema, "input_source_digests")}
-        WHERE participant_id=$1`,
-      [fixture.participantId],
-    );
-    assert.equal(sourceDigestBefore.rows[0]?.count, 1);
-    const deletes = [];
-    let shouldFail = true;
-    const objectStore = {
-      async deleteBatch(refs) {
-        deletes.push(refs.map((ref) => ({ ...ref })));
-        assert.equal(refs.length, 1);
-        assert.equal(refs[0].source, "telemetry_v12");
-        assert.equal(refs[0].key, fixture.objectKey);
-        assert.equal(refs[0].version, null,
-          "the GCS adapter must resolve exact generations from this exact stored key");
-        if (shouldFail) {
-          shouldFail = false;
-          throw new Error("provider detail must not escape");
-        }
-      },
-    };
-    const options = {
-      primaryPool,
-      ledgerPool,
-      objectStore,
-      participantId: fixture.participantId,
-      schema: { primarySchema, ledgerSchema },
-    };
-    const first = await eraseSyntheticPostgresV12Owner(options);
-    assert.equal(first.status, "incomplete");
-    assert.equal(first.code, "SYNTHETIC_OWNER_ERASURE_OBJECT_STORE_FAILED");
-    let state = await primaryPool.query(
-      `SELECT state FROM ${qualified(primarySchema, "participants")} WHERE id=$1`,
-      [fixture.participantId],
-    );
-    assert.equal(state.rows[0]?.state, "deleting");
-    const rotationAfterFailedDelete = await primaryPool.query(
-      `SELECT count(*)::int AS count FROM ${qualified(primarySchema, "device_credential_rotations")}
-        WHERE participant_id=$1`,
-      [fixture.participantId],
-    );
-    assert.equal(rotationAfterFailedDelete.rows[0]?.count, 1,
-      "a failed object-delete attempt leaves the exact owner and its rotation receipt retryable");
-    const stillReferenced = await primaryPool.query(
-      `SELECT r2_key FROM ${qualified(primarySchema, "telemetry_v12_chunks")} WHERE participant_id=$1`,
-      [fixture.participantId],
-    );
-    assert.equal(stillReferenced.rows[0]?.r2_key, fixture.objectKey);
-    const tombstone = await ledgerPool.query(
-      `SELECT participant_digest FROM ${qualified(ledgerSchema, "deletion_tombstones")}`,
-    );
-    assert.equal(tombstone.rows.length, 1);
-    const failureReceipt = await ledgerPool.query(
-      `SELECT outcome, details_json FROM ${qualified(ledgerSchema, "participant_erasure_receipts")}`,
-    );
-    assert.equal(failureReceipt.rows[0]?.outcome, "failed");
-    assert.equal(failureReceipt.rows[0]?.details_json.includes(fixture.participantId), false);
-    assert.equal(failureReceipt.rows[0]?.details_json.includes(fixture.objectKey), false);
-
-    const retry = await eraseSyntheticPostgresV12Owner(options);
-    assert.deepEqual(retry, { status: "complete", objectsDeleted: 1 });
-    assert.equal(deletes.length, 2, "the same DB-derived exact object ref is retried idempotently");
-    state = await primaryPool.query(
-      `SELECT id FROM ${qualified(primarySchema, "participants")} WHERE id=$1`,
-      [fixture.participantId],
-    );
-    assert.equal(state.rows.length, 0);
-    const rotationAfterComplete = await primaryPool.query(
-      `SELECT count(*)::int AS count FROM ${qualified(primarySchema, "device_credential_rotations")}
-        WHERE participant_id=$1`,
-      [fixture.participantId],
-    );
-    assert.equal(rotationAfterComplete.rows[0]?.count, 0,
-      "completed exact-owner erasure cascades its credential rotation receipt");
-    const enrollment = await primaryPool.query(
-      `SELECT participant_id FROM ${qualified(primarySchema, "attribution_enrollments")}
-        WHERE participant_id=$1`,
-      [fixture.participantId],
-    );
-    assert.equal(enrollment.rows.length, 0);
-    const sourceDigestAfter = await primaryPool.query(
-      `SELECT count(*)::int AS count FROM ${qualified(primarySchema, "input_source_digests")}
-        WHERE participant_id=$1`,
-      [fixture.participantId],
-    );
-    assert.equal(sourceDigestAfter.rows[0]?.count, 0);
-    for (const name of ["telemetry_v12_domain_predecessors", "telemetry_v12_domains",
-      "telemetry_v12_domain_heads", "telemetry_v12_domain_days"]) {
-      const remaining = await primaryPool.query(
-        `SELECT count(*)::int AS count FROM ${qualified(primarySchema, name)} WHERE ${
-          name === "telemetry_v12_domain_days" ? "generation_id=$1" :
-            name === "telemetry_v12_domains" ? "id=$1" : "participant_id=$1"}`,
-        [name === "telemetry_v12_domain_days" || name === "telemetry_v12_domains"
-          ? generationId : fixture.participantId],
-      );
-      assert.equal(remaining.rows[0]?.count, 0, `${name} must cascade with the owner`);
-    }
-    const ownerProof = await primaryPool.query(
-      `SELECT owner_digest FROM ${qualified(primarySchema, "storage_owner_erasure_receipts")}
-        WHERE owner_digest=$1`,
-      [fixture.ownerDigest],
-    );
-    assert.equal(ownerProof.rows.length, 1);
-    const completed = await ledgerPool.query(
-      `SELECT outcome, details_json FROM ${qualified(ledgerSchema, "participant_erasure_receipts")}`,
-    );
-    assert.equal(completed.rows[0]?.outcome, "completed");
-    assert.equal(completed.rows[0]?.details_json.includes(fixture.participantId), false);
-    assert.equal(completed.rows[0]?.details_json.includes(fixture.objectKey), false);
-    const repeated = await eraseSyntheticPostgresV12Owner(options);
-    assert.deepEqual(repeated, { status: "already_complete", objectsDeleted: 1 });
-    assert.equal(deletes.length, 2);
-
-    const unexpectedFixture = await seedOwner(primaryPool, primarySchema);
-    const nextPriorSecretHash = randomBytes(32);
-    const nextReplacementSecretHash = randomBytes(32);
-    const rotationNow = new Date();
-    const rotationRetireAt = new Date(rotationNow.getTime() + 86_400_000);
-    await primaryPool.query(
-      `UPDATE ${qualified(primarySchema, "device_credentials")}
-          SET credential_generation=3, secret_hash=$2
-        WHERE id=$1`,
-      [unexpectedFixture.deviceId, nextReplacementSecretHash],
-    );
-    await primaryPool.query(
-      `INSERT INTO ${qualified(primarySchema, "device_credential_rotations")} (
-         id, device_id, participant_id, prior_secret_hash, replacement_secret_hash,
-         attempt_id, generation, rotated_at, retire_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, 3, $7, $8)`,
-      [randomUUID(), unexpectedFixture.deviceId, unexpectedFixture.participantId,
-        nextPriorSecretHash, nextReplacementSecretHash, randomUUID(), rotationNow, rotationRetireAt],
-    );
-    await assert.rejects(
-      eraseSyntheticPostgresV12Owner({ ...options, participantId: unexpectedFixture.participantId }),
-      (error) => error?.code === "SYNTHETIC_OWNER_ERASURE_FAMILY_UNSUPPORTED",
-      "cleanup must refuse a synthetic owner with more than its exact expected rotation receipt",
-    );
-    const unexpectedState = await primaryPool.query(
-      `SELECT state FROM ${qualified(primarySchema, "participants")} WHERE id=$1`,
-      [unexpectedFixture.participantId],
-    );
-    assert.equal(unexpectedState.rows[0]?.state, "active",
-      "family refusal occurs before the owner is fenced or mutated");
-    assert.equal(deletes.length, 2, "family refusal must not reach object deletion");
-
-    const archivedFixture = await seedOwner(primaryPool, primarySchema);
-    await seedHistoricalHeader(primaryPool, primarySchema, archivedFixture);
-    await assert.rejects(
-      eraseSyntheticPostgresV12Owner({ ...options, participantId: archivedFixture.participantId }),
-      (error) => error?.code === "SYNTHETIC_OWNER_ERASURE_FAMILY_UNSUPPORTED",
-      "the v1.2-only eraser refuses owners with historical v1 archive references",
-    );
-    const archivedOwnerState = await primaryPool.query(
-      `SELECT state FROM ${qualified(primarySchema, "participants")} WHERE id=$1`,
-      [archivedFixture.participantId],
-    );
-    assert.equal(archivedOwnerState.rows[0]?.state, "active",
-      "archived owner refusal happens before fencing or archive cascade");
-    assert.equal(deletes.length, 2,
-      "historical object keys are not silently omitted from object erasure");
+    await pool.query(`CREATE SCHEMA "${schema}"`);
+    await applyPostgresMigrations({ role: "primary", schema, pool });
+    await run(pool, schema);
   } finally {
-    for (const schema of createdSchemas.reverse()) {
-      try { await primaryPool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`); } catch {}
-    }
-    await rm(temporary, { recursive: true, force: true });
-    await Promise.all([primaryPool.end(), ledgerPool.end()]);
-  }
-});
-
-test("PG17 cleanup refuses an unattributable pending v1.2 object and leaves it untouched", {
-  skip: !PG_TEST_HOST && !PG_TEST_SOCKET,
-  timeout: 180_000,
-}, async () => {
-  const endpoint = await localPostgresEndpoint();
-  const suffix = randomBytes(5).toString("hex");
-  const primarySchema = `owner_orphan_${suffix}`;
-  const ledgerSchema = `${primarySchema}_ledger`;
-  const poolOptions = {
-    host: endpoint.host,
-    port: endpoint.port,
-    user: PG_TEST_USER,
-    ...(PG_TEST_PASSWORD === undefined ? { password: "synthetic-local-only" } : { password: PG_TEST_PASSWORD }),
-    database: PG_TEST_DATABASE,
-    ssl: false,
-    max: 3,
-    connectionTimeoutMillis: 3_000,
-  };
-  const primaryPool = new pg.Pool(poolOptions);
-  const ledgerPool = new pg.Pool(poolOptions);
-  const temporary = await mkdtemp(join(ROOT, ".tmp-postgres-owner-orphan-"));
-  const createdSchemas = [];
-  try {
-    const server = await primaryPool.query("SELECT current_setting('server_version_num')::integer AS version");
-    assert.equal(Math.floor(server.rows[0].version / 10_000), 17);
-    await primaryPool.query(`CREATE SCHEMA "${primarySchema}"`);
-    createdSchemas.push(primarySchema);
-    await primaryPool.query(`CREATE SCHEMA "${ledgerSchema}"`);
-    createdSchemas.push(ledgerSchema);
-    await Promise.all([
-      applyPostgresMigrations({ role: "primary", schema: primarySchema, pool: primaryPool }),
-      applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool: ledgerPool }),
-    ]);
-    const { eraseSyntheticPostgresV12Owner } = await importOwnerErasure(temporary);
-    const fixture = await seedOwner(primaryPool, primarySchema);
-    const orphanId = `chunk:${randomUUID()}`;
-    const orphanKey = `telemetry/v12/test/${randomUUID()}`;
-    await primaryPool.query(
-      `INSERT INTO ${qualified(primarySchema, "pending_objects")} (contribution_id, object_key, object_kind)
-       VALUES ($1, $2, 'telemetry_v12')`,
-      [orphanId, orphanKey],
-    );
-    let deletes = 0;
-    const result = await eraseSyntheticPostgresV12Owner({
-      primaryPool,
-      ledgerPool,
-      participantId: fixture.participantId,
-      schema: { primarySchema, ledgerSchema },
-      objectStore: { async deleteBatch() { deletes += 1; } },
-    });
-    assert.equal(result.status, "incomplete");
-    assert.equal(result.code, "SYNTHETIC_OWNER_ERASURE_PENDING_UNATTRIBUTED");
-    assert.equal(deletes, 0);
-    const stillPending = await primaryPool.query(
-      `SELECT object_key FROM ${qualified(primarySchema, "pending_objects")} WHERE contribution_id=$1`,
-      [orphanId],
-    );
-    assert.equal(stillPending.rows[0]?.object_key, orphanKey);
-    const state = await primaryPool.query(
-      `SELECT state FROM ${qualified(primarySchema, "participants")} WHERE id=$1`,
-      [fixture.participantId],
-    );
-    assert.equal(state.rows[0]?.state, "deleting");
-    const receipt = await ledgerPool.query(
-      `SELECT outcome, details_json FROM ${qualified(ledgerSchema, "participant_erasure_receipts")}`,
-    );
-    assert.equal(receipt.rows[0]?.outcome, "failed");
-    assert.equal(receipt.rows[0]?.details_json.includes(orphanKey), false);
-    assert.equal(receipt.rows[0]?.details_json.includes(fixture.participantId), false);
-  } finally {
-    for (const schema of createdSchemas.reverse()) {
-      try { await primaryPool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`); } catch {}
-    }
-    await rm(temporary, { recursive: true, force: true });
-    await Promise.all([primaryPool.end(), ledgerPool.end()]);
-  }
-});
-
-// The v1.2 owner bridge (primary 0055) journals an eligible v1.2 head on a
-// journal-enabled target. Until the wave integrator promotes it, apply the
-// staged file after the stock chain; once promoted, the stock chain carries it.
-const V12_OWNER_BRIDGE = "0055_v12_owner_bridge.sql";
-
-async function applyV12OwnerBridge(pool, schema) {
-  let sql;
-  try {
-    sql = await readFile(resolve(WORKER_ROOT, "postgres/staged-migrations/primary", V12_OWNER_BRIDGE), "utf8");
-  } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
-  }
-  const promoted = (await readdir(resolve(WORKER_ROOT, "postgres/migrations/primary")))
-    .some((name) => name.endsWith("_v12_owner_bridge.sql"));
-  assert.notEqual(sql !== undefined, promoted, "the v1.2 owner bridge is either staged or promoted, never both or neither");
-  if (sql === undefined) return;
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    await client.query(renderPostgresSearchPath(schema));
-    await client.query(sql);
-    await client.query("COMMIT");
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    throw error;
-  } finally {
-    client.release();
+    try { await pool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`); } catch {}
+    await pool.end();
   }
 }
 
-test("PG17 cleanup erases a bridged smoke owner whose v1.2 receipt reuses the seeded owner link", {
-  skip: !PG_TEST_HOST && !PG_TEST_SOCKET,
+function spyStore({ failFirst = false } = {}) {
+  const deletes = [];
+  let fail = failFirst;
+  return {
+    deletes,
+    store: {
+      async delete(key) {
+        deletes.push(key);
+        if (fail) {
+          fail = false;
+          throw new Error("provider detail must not escape");
+        }
+      },
+    },
+  };
+}
+
+async function count(pool, schema, table, where = "", params = []) {
+  return (await pool.query(
+    `SELECT count(*)::int AS count FROM ${qualified(schema, table)} ${where}`, params,
+  )).rows[0].count;
+}
+
+const PG_ENABLED = Boolean(PG_TEST_HOST || PG_TEST_SOCKET);
+
+test("PG17: a synthetic owner is deleted with its object and exactly one erasure receipt; a rerun is a no-op", {
+  skip: !PG_ENABLED,
   timeout: 180_000,
 }, async () => {
-  const endpoint = await localPostgresEndpoint();
-  const suffix = randomBytes(5).toString("hex");
-  const primarySchema = `owner_bridged_${suffix}`;
-  const ledgerSchema = `${primarySchema}_ledger`;
-  const poolOptions = {
-    host: endpoint.host,
-    port: endpoint.port,
-    user: PG_TEST_USER,
-    ...(PG_TEST_PASSWORD === undefined ? { password: "synthetic-local-only" } : { password: PG_TEST_PASSWORD }),
-    database: PG_TEST_DATABASE,
-    ssl: false,
-    max: 3,
-    connectionTimeoutMillis: 3_000,
-  };
-  const primaryPool = new pg.Pool(poolOptions);
-  const ledgerPool = new pg.Pool(poolOptions);
-  const temporary = await mkdtemp(join(ROOT, ".tmp-postgres-owner-bridged-"));
-  const createdSchemas = [];
-  try {
-    const server = await primaryPool.query("SELECT current_setting('server_version_num')::integer AS version");
-    assert.equal(Math.floor(server.rows[0].version / 10_000), 17);
-    await primaryPool.query(`CREATE SCHEMA "${primarySchema}"`);
-    createdSchemas.push(primarySchema);
-    await primaryPool.query(`CREATE SCHEMA "${ledgerSchema}"`);
-    createdSchemas.push(ledgerSchema);
-    await Promise.all([
-      applyPostgresMigrations({ role: "primary", schema: primarySchema, pool: primaryPool }),
-      applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool: ledgerPool }),
-    ]);
-    await applyV12OwnerBridge(primaryPool, primarySchema);
-    const { eraseSyntheticPostgresV12Owner } = await importOwnerErasure(temporary);
-    // A journal-enabled test target: the smoke owner's head is bridged.
-    await primaryPool.query(
-      `INSERT INTO ${qualified(primarySchema, "storage_source_state")} (singleton, source_id, authority_epoch)
-       VALUES (1, 'synthetic-cleanup-source', 0)`,
+  await withMigratedSchema("owner", async (pool, schema) => {
+    const fixture = await seedOwner(pool, schema, { withChunk: true });
+    await pool.query(
+      `INSERT INTO ${qualified(schema, "input_source_digests")} (participant_id,digest) VALUES($1,$2)`,
+      [fixture.participantId, randomBytes(16).toString("hex")],
     );
-    const fixture = await seedOwner(primaryPool, primarySchema, { withChunk: true });
-    const generationId = await seedActivatedDomain(primaryPool, primarySchema, fixture.participantId);
-    const bridged = await primaryPool.query(
-      `SELECT event_digest, owner_digest, generation_id, head_revision
-         FROM ${qualified(primarySchema, "storage_v12_event_sources")} WHERE participant_id=$1`,
-      [fixture.participantId],
-    );
-    assert.equal(bridged.rows.length, 1, "the smoke owner's head is bridged once");
-    assert.equal(bridged.rows[0].owner_digest, fixture.ownerDigest, "the bridge reuses the smoke's seeded owner link");
-    assert.equal(bridged.rows[0].generation_id, generationId);
-    assert.equal(Number(bridged.rows[0].head_revision), 1);
-    const journalRows = async () => (await primaryPool.query(
-      `SELECT kind, event_tuple_version, owner_digest, object_digest
-         FROM ${qualified(primarySchema, "storage_ingestion_changes")} ORDER BY sequence`,
-    )).rows;
-    assert.deepEqual(await journalRows(), [{
-      kind: "owner-active", event_tuple_version: 1, owner_digest: fixture.ownerDigest,
-      object_digest: bridged.rows[0].event_digest,
-    }]);
-
-    let deletes = 0;
-    const result = await eraseSyntheticPostgresV12Owner({
-      primaryPool,
-      ledgerPool,
-      participantId: fixture.participantId,
-      schema: { primarySchema, ledgerSchema },
-      objectStore: { async deleteBatch() { deletes += 1; } },
+    const generationId = await seedActivatedDomain(pool, schema, fixture.participantId);
+    const receiptsBefore = await count(pool, schema, "storage_owner_erasure_receipts");
+    const { deletes, store } = spyStore();
+    const first = await cleanupSyntheticV12Participant({
+      pool, schema, participantId: fixture.participantId, objectStore: store,
     });
-    assert.deepEqual(result, { status: "complete", objectsDeleted: 1 });
-    assert.equal(deletes, 1);
-    const remaining = await primaryPool.query(
-      `SELECT
-         (SELECT count(*)::int FROM ${qualified(primarySchema, "participants")} WHERE id=$1) AS participants,
-         (SELECT count(*)::int FROM ${qualified(primarySchema, "storage_v12_event_sources")} WHERE participant_id=$1) AS receipts,
-         (SELECT count(*)::int FROM ${qualified(primarySchema, "storage_owner_erasure_receipts")} WHERE owner_digest=$2) AS erasure_receipts`,
-      [fixture.participantId, fixture.ownerDigest],
-    );
-    assert.deepEqual(remaining.rows[0], { participants: 0, receipts: 0, erasure_receipts: 1 },
-      "the bridge receipt cascades with the owner under its erasure receipt");
-    assert.equal((await journalRows()).length, 1, "the exact journal row is retained");
-  } finally {
-    for (const schema of createdSchemas.reverse()) {
-      try { await primaryPool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`); } catch {}
+    assert.deepEqual(first, { status: "complete", objectsDeleted: 1, erasureReceipts: 1 });
+    assert.deepEqual(deletes, [fixture.objectKey], "the one DB-derived key goes through the quarantine delete");
+    assert.equal(await count(pool, schema, "participants", "WHERE id=$1", [fixture.participantId]), 0);
+    assert.equal(await count(pool, schema, "storage_owner_erasure_receipts") - receiptsBefore, 1,
+      "exactly one erasure receipt is written");
+    assert.equal(await count(pool, schema, "storage_owner_erasure_receipts", "WHERE owner_digest=$1",
+      [fixture.ownerDigest]), 1);
+    assert.equal(await count(pool, schema, "storage_v11_owner_links", "WHERE participant_id=$1",
+      [fixture.participantId]), 0);
+    assert.equal(await count(pool, schema, "pending_objects", "WHERE object_key=$1", [fixture.objectKey]), 0,
+      "the deleted object's registration is cleared");
+    for (const table of ["web_sessions", "device_pairings", "device_credentials", "device_credential_rotations",
+      "attribution_enrollments", "telemetry_v12_device_capabilities", "telemetry_v12_day_manifests",
+      "telemetry_v12_chunks", "input_source_digests", "telemetry_v12_domain_predecessors",
+      "telemetry_v12_domain_heads"]) {
+      assert.equal(await count(pool, schema, table, "WHERE participant_id=$1", [fixture.participantId]), 0,
+        `${table} cascades with the participant`);
     }
-    await rm(temporary, { recursive: true, force: true });
-    await Promise.all([primaryPool.end(), ledgerPool.end()]);
-  }
+    assert.equal(await count(pool, schema, "telemetry_v12_domain_days", "WHERE generation_id=$1",
+      [generationId]), 0);
+
+    const rerun = await cleanupSyntheticV12Participant({
+      pool, schema, participantId: fixture.participantId, objectStore: store,
+    });
+    assert.deepEqual(rerun, { status: "absent", objectsDeleted: 0 });
+    assert.equal(deletes.length, 1, "a rerun deletes nothing");
+    assert.equal(await count(pool, schema, "storage_owner_erasure_receipts") - receiptsBefore, 1);
+  });
+});
+
+test("PG17: an object delete failure leaves the participant deleted and the object registered for reconciliation", {
+  skip: !PG_ENABLED,
+  timeout: 180_000,
+}, async () => {
+  await withMigratedSchema("objfail", async (pool, schema) => {
+    const fixture = await seedOwner(pool, schema, { withChunk: true });
+    const { deletes, store } = spyStore({ failFirst: true });
+    const result = await cleanupSyntheticV12Participant({
+      pool, schema, participantId: fixture.participantId, objectStore: store,
+    });
+    assert.deepEqual(result, { status: "incomplete", code: "GCS_SYNTHETIC_CLEANUP_OBJECT_DELETE_DEFERRED" });
+    assert.equal(JSON.stringify(result).includes("provider detail"), false);
+    assert.deepEqual(deletes, [fixture.objectKey]);
+    assert.equal(await count(pool, schema, "participants", "WHERE id=$1", [fixture.participantId]), 0,
+      "plan-v5 order: the participant delete committed before the object step");
+    assert.equal(await count(pool, schema, "storage_owner_erasure_receipts", "WHERE owner_digest=$1",
+      [fixture.ownerDigest]), 1);
+    const pending = await pool.query(
+      `SELECT reconciliation_state FROM ${qualified(schema, "pending_objects")} WHERE object_key=$1`,
+      [fixture.objectKey],
+    );
+    assert.deepEqual(pending.rows, [{ reconciliation_state: "registered" }],
+      "the unreferenced registration stays for the pending-object reconciliation");
+  });
+});
+
+test("PG17: owners outside the discovery rules and grant redeemers are refused before any write", {
+  skip: !PG_ENABLED,
+  timeout: 180_000,
+}, async () => {
+  await withMigratedSchema("refuse", async (pool, schema) => {
+    const { deletes, store } = spyStore();
+    const receiptsBefore = await count(pool, schema, "storage_owner_erasure_receipts");
+
+    // A participant with a non-synthetic tag is refused by the id rule alone.
+    const realId = `real-${randomUUID()}`;
+    await pool.query(
+      `INSERT INTO ${qualified(schema, "participants")} (
+         id, owner_kind, state, consent_version, consented_at, created_at
+       ) VALUES ($1, 'social', 'active', 'privacy-safe-telemetry-v0.1', now(), now())`,
+      [realId],
+    );
+    await assert.rejects(cleanupSyntheticV12Participant({ pool, schema, participantId: realId, objectStore: store }),
+      { code: "SYNTHETIC_CLEANUP_PARTICIPANT_INVALID" });
+    assert.equal(await count(pool, schema, "participants", "WHERE id=$1", [realId]), 1);
+
+    // An extra credential rotation is outside the per-owner family envelope.
+    const extra = await seedOwner(pool, schema);
+    const replacement = randomBytes(32);
+    await pool.query(`UPDATE ${qualified(schema, "device_credentials")} SET credential_generation=3, secret_hash=$2 WHERE id=$1`,
+      [extra.deviceId, replacement]);
+    await pool.query(
+      `INSERT INTO ${qualified(schema, "device_credential_rotations")} (
+         id, device_id, participant_id, prior_secret_hash, replacement_secret_hash,
+         attempt_id, generation, rotated_at, retire_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, 3, now(), now() + interval '1 day')`,
+      [randomUUID(), extra.deviceId, extra.participantId, randomBytes(32), replacement, randomUUID()],
+    );
+    await assert.rejects(cleanupSyntheticV12Participant({
+      pool, schema, participantId: extra.participantId, objectStore: store,
+    }), { code: "POSTGRES_SYNTHETIC_DISCOVERY_FAMILY_INVALID" });
+    assert.equal((await pool.query(`SELECT state FROM ${qualified(schema, "participants")} WHERE id=$1`,
+      [extra.participantId])).rows[0]?.state, "active");
+
+    // A historical v1 archive reference is outside the envelope too.
+    const archived = await seedOwner(pool, schema);
+    await seedHistoricalHeader(pool, schema, archived);
+    await assert.rejects(cleanupSyntheticV12Participant({
+      pool, schema, participantId: archived.participantId, objectStore: store,
+    }), { code: "POSTGRES_SYNTHETIC_DISCOVERY_FAMILY_INVALID" });
+    assert.equal(await count(pool, schema, "participants", "WHERE id=$1", [archived.participantId]), 1);
+
+    // A smoke participant that redeemed an enrollment grant: primary 0063
+    // refuses the redeemer's SET NULL (23514) and the delete rolls back.
+    const redeemer = await seedOwner(pool, schema);
+    await pool.query(
+      `INSERT INTO ${qualified(schema, "enrollment_grants")} (
+         id, secret_hash, state, issued_at, expires_at, redeemed_at, redeemed_participant_id
+       ) VALUES ($1, $2, 'redeemed', now() - interval '1 hour', now() + interval '1 day', now(), $3)`,
+      [`grant:${randomUUID()}`, randomBytes(32), redeemer.participantId],
+    );
+    await assert.rejects(cleanupSyntheticV12Participant({
+      pool, schema, participantId: redeemer.participantId, objectStore: store,
+    }), { code: "SYNTHETIC_CLEANUP_PARTICIPANT_GRANT_REDEEMED" });
+    assert.equal(await count(pool, schema, "participants", "WHERE id=$1", [redeemer.participantId]), 1);
+    assert.equal(await count(pool, schema, "storage_v11_owner_links", "WHERE participant_id=$1 AND state='active'",
+      [redeemer.participantId]), 1, "the rolled-back delete left the owner link active");
+
+    assert.deepEqual(deletes, [], "no refusal reaches the object store");
+    assert.equal(await count(pool, schema, "storage_owner_erasure_receipts"), receiptsBefore,
+      "no refusal writes an erasure receipt");
+  }, { historicalHeaders: true });
 });

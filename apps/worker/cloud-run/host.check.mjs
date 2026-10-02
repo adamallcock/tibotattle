@@ -28,6 +28,7 @@ import {
   createPostgresTestPersonalSessionDispatch,
   createPostgresTestV12DayManifestDispatch,
   createPostgresTestHealthDispatch,
+  createPostgresTestStorageReceiptCheck,
   dispatchCloudRunHostRequest,
   isPrivatePostgresTestHost,
 } from "./postgres-test-dispatch.mjs";
@@ -55,7 +56,6 @@ const WORKER_ROOT = resolve(ROOT, "..");
 
 const ONE_MIGRATION = Object.freeze({
   primary: [{ version: 1, name: "0001_schema_metadata.sql", sha256: "a".repeat(64) }],
-  ledger: [{ version: 1, name: "0001_schema_metadata.sql", sha256: "b".repeat(64) }],
 });
 
 function quotedTable(schema, name) {
@@ -179,10 +179,9 @@ function assertApiError(response, status, code) {
   });
 }
 
-function receiptPool({ major = 17, primaryExists = true, ledgerExists = true,
-  primaryHistory, ledgerHistory, onConnect = () => {} } = {}) {
-  const expectedFor = (role) => role === "primary" ? primaryHistory : ledgerHistory;
-  const existsFor = (role) => role === "primary" ? primaryExists : ledgerExists;
+function receiptPool({ major = 17, primaryExists = true, primaryHistory, onConnect = () => {} } = {}) {
+  const expectedFor = () => primaryHistory;
+  const existsFor = () => primaryExists;
   return function createPool(role) {
     return {
       async connect() {
@@ -363,6 +362,7 @@ test("cloud-run-iam host predicate accepts only the named service tuple and pinn
 
 test("Cloud Run IAM test target is pinned to the isolated A2 schema and bucket profile", () => {
   assert.equal(CLOUD_RUN_IAM_TEST_TARGET.postgres.primary.schema, "tibotattle_v12_a2_20260925");
+  // The retired A2 ledger identity stays only as a frozen refusal identifier.
   assert.equal(CLOUD_RUN_IAM_TEST_TARGET.postgres.ledger.schema, "tibotattle_ledger_v12_a2_20260925");
   assert.equal(CLOUD_RUN_IAM_TEST_TARGET.gcsBucket, "tibotattle-gcs-test-cleanup-20260925-a2");
 });
@@ -395,7 +395,6 @@ test("Cloud Run test origin allowlist rejects alternate authorities and forwarde
   const pools = receiptPool({ onConnect: () => { connections += 1; } });
   const dispatch = createPostgresTestHealthDispatch({
     primaryPool: pools("primary"),
-    ledgerPool: pools("ledger"),
     expectedMigrations: ONE_MIGRATION,
     privateOrigin: CLOUD_RUN_IAM_TEST_TARGET.origin,
   });
@@ -411,7 +410,6 @@ test("Cloud Run test origin allowlist rejects alternate authorities and forwarde
 
   assert.throws(() => createPostgresTestHealthDispatch({
     primaryPool: pools("primary"),
-    ledgerPool: pools("ledger"),
     expectedMigrations: ONE_MIGRATION,
     privateOrigin: "https://other-service-5t5mehqi7a-ue.a.run.app",
   }), /POSTGRES_TEST_PRIVATE_ORIGIN_INVALID/);
@@ -424,8 +422,7 @@ test("partial HTTP dispatch serves only current read-only health and never calls
   const pools = receiptPool({ onConnect: () => { connections += 1; } });
   const healthDispatch = createPostgresTestHealthDispatch({
     primaryPool: pools("primary"),
-    ledgerPool: pools("ledger"),
-    schemaOptions: { primarySchema: "tibotattle_test", ledgerSchema: "tibotattle_ledger_test" },
+    schemaOptions: { primarySchema: "tibotattle_test" },
     expectedMigrations: ONE_MIGRATION,
     privateOrigin: "http://127.0.0.1:8080",
   });
@@ -464,18 +461,17 @@ test("partial HTTP dispatch serves only current read-only health and never calls
   assert.equal(response.status, 200);
   const health = await response.json();
   assert.deepEqual(health, {
-    schemaVersion: "gcp-postgres-test-health-v1",
+    schemaVersion: "gcp-postgres-test-health-v2",
     scope: "postgres_schema_and_migrations_only",
     status: "ready",
     workerApplicationReady: false,
     checks: {
       postgresMajor: 17,
       primaryMigrationReceipt: { status: "current", version: 1 },
-      ledgerMigrationReceipt: { status: "current", version: 1 },
     },
   });
   assert.equal(JSON.stringify(health).includes("tibotattle_test"), false);
-  assert.equal(connections, 2);
+  assert.equal(connections, 1, "one pool: there is no deletion-ledger receipt");
   assert.equal(workerHandlerCalls, 0);
   assert.equal(d1Touched, 0);
 });
@@ -520,7 +516,7 @@ test("private community daily dispatch validates ranges and exposes only the fen
   };
   const dailyDispatch = createPostgresTestCommunityDailyDispatch({
     primaryPool,
-    schemaOptions: { primarySchema: "daily_test", ledgerSchema: "daily_ledger_test" },
+    schemaOptions: { primarySchema: "daily_test" },
     sourceIdentity: { sourceId: "synthetic-source", sourceNamespace: "synthetic-namespace" },
     readPostgresPublishedCommunityDaily: dailyRead,
     healthDispatch,
@@ -584,7 +580,7 @@ test("private community daily dispatch withholds unavailable PostgreSQL data and
   let reads = 0;
   const makeDispatch = (healthStatus, reader) => createPostgresTestCommunityDailyDispatch({
     primaryPool: { async connect() { throw new Error("reader facade owns PG access"); } },
-    schemaOptions: { primarySchema: "daily_test", ledgerSchema: "daily_ledger_test" },
+    schemaOptions: { primarySchema: "daily_test" },
     sourceIdentity: { sourceId: "synthetic-source", sourceNamespace: "synthetic-namespace" },
     readPostgresPublishedCommunityDaily: reader,
     healthDispatch: async () => new Response(null, { status: healthStatus }),
@@ -609,22 +605,19 @@ test("private community daily dispatch withholds unavailable PostgreSQL data and
 test("private participant-device dispatch preserves cookie auth, owner scope, and private readiness", async () => {
   let healthChecks = 0;
   let authCalls = 0;
-  let tombstoneChecks = 0;
   let deviceReads = 0;
   let csrfChecks = 0;
   let deviceRevocations = 0;
   let revocationResult = true;
   let workerCalls = 0;
   const primaryPool = { async connect() { throw new Error("the PostgreSQL facades own reads"); } };
-  const ledgerPool = { async connect() { throw new Error("the tombstone facade owns reads"); } };
   const healthDispatch = async () => {
     healthChecks += 1;
     return new Response(JSON.stringify({ status: "ready" }), { status: 200 });
   };
   const dispatch = createPostgresTestParticipantDevicesDispatch({
     primaryPool,
-    ledgerPool,
-    schemaOptions: { primarySchema: "devices_test", ledgerSchema: "devices_ledger_test" },
+    schemaOptions: { primarySchema: "devices_test" },
     authenticatePostgresPersonalSession: async (pool, cookie, options) => {
       authCalls += 1;
       assert.equal(pool, primaryPool);
@@ -639,13 +632,6 @@ test("private participant-device dispatch preserves cookie auth, owner scope, an
           || request.headers.get("x-usage-monitor-csrf") !== csrfToken) {
         throw Object.assign(new Error("CSRF_INVALID"), { code: "CSRF_INVALID", status: 403 });
       }
-    },
-    hasPostgresDeletionTombstone: async (pool, participantId, _now, options) => {
-      tombstoneChecks += 1;
-      assert.equal(pool, ledgerPool);
-      assert.equal(participantId, "synthetic-owner-a");
-      assert.deepEqual(options, { schema: { ledgerSchema: "devices_ledger_test" } });
-      return false;
     },
     listPostgresParticipantDevices: async (pool, participantId, options) => {
       deviceReads += 1;
@@ -740,7 +726,6 @@ test("private participant-device dispatch preserves cookie auth, owner scope, an
     "query parameters cannot choose or reveal another participant's devices");
   assert.equal(healthChecks, 1);
   assert.equal(authCalls, 1);
-  assert.equal(tombstoneChecks, 1);
   assert.equal(deviceReads, 1);
   assert.equal(workerCalls, 0);
 
@@ -803,15 +788,13 @@ test("private participant-device dispatch preserves cookie auth, owner scope, an
 
   const staleReadiness = createPostgresTestParticipantDevicesDispatch({
     primaryPool,
-    ledgerPool,
-    schemaOptions: { primarySchema: "devices_test", ledgerSchema: "devices_ledger_test" },
+    schemaOptions: { primarySchema: "devices_test" },
     authenticatePostgresPersonalSession: async () => { throw new Error("must not authenticate when stale"); },
     assertPostgresPersonalSessionCsrf: () => { throw new Error("must not check CSRF when stale"); },
     listPostgresParticipantDevices: async () => { throw new Error("must not read when stale"); },
     revokePostgresParticipantDevice: async () => { throw new Error("must not mutate when stale"); },
     readBoundedRequestBody: async () => { throw new Error("must not read body when stale"); },
     maxRequestBytes: 2 * 1024 * 1024,
-    hasPostgresDeletionTombstone: async () => { throw new Error("must not check ledger when stale"); },
     healthDispatch: async () => new Response(null, { status: 503 }),
     privateOrigin: "http://127.0.0.1:8080",
   });
@@ -837,7 +820,6 @@ test("private-host envelope-key is public-only and bypasses PostgreSQL and Worke
   };
   const dispatch = createPostgresTestV12DayManifestDispatch({
     primaryPool: pool,
-    ledgerPool: { async connect() { postgresConnections += 1; throw new Error("must not connect"); } },
     expectedMigrations: ONE_MIGRATION,
     privateOrigin: "http://127.0.0.1:8080",
     healthDispatch: async () => new Response(null, { status: 503 }),
@@ -850,7 +832,6 @@ test("private-host envelope-key is public-only and bypasses PostgreSQL and Worke
     disconnectPostgresAuthenticatedDevice: async () => {
       throw new Error("must not disconnect");
     },
-    hasPostgresDeletionTombstone: async () => { throw new Error("must not read ledger"); },
     readPostgresDeviceSyncState: async () => ({}),
     readPostgresDeviceSyncCapabilities: async () => ({}),
     readPostgresDeviceSyncV12Capabilities: async () => ({}),
@@ -917,14 +898,13 @@ test("private-host envelope-key is public-only and bypasses PostgreSQL and Worke
   assert.equal(workerCalls, 0);
 });
 
-test("partial HTTP health fails closed when either database or receipt is unavailable or stale", async () => {
+test("partial HTTP health fails closed when the database or its receipt is unavailable or stale", async () => {
   const currentHistory = ONE_MIGRATION.primary;
   const staleHistory = [{ ...currentHistory[0], sha256: "c".repeat(64) }];
-  const pools = receiptPool({ primaryHistory: currentHistory, ledgerHistory: staleHistory });
+  const pools = receiptPool({ primaryHistory: staleHistory });
   const dispatch = createPostgresTestHealthDispatch({
     primaryPool: pools("primary"),
-    ledgerPool: pools("ledger"),
-    schemaOptions: { primarySchema: "health_primary", ledgerSchema: "health_ledger" },
+    schemaOptions: { primarySchema: "health_primary" },
     expectedMigrations: ONE_MIGRATION,
     privateOrigin: "http://127.0.0.1:8080",
   });
@@ -932,21 +912,44 @@ test("partial HTTP health fails closed when either database or receipt is unavai
   assert.equal(stale.status, 503);
   assert.deepEqual((await stale.json()).checks, {
     postgresMajor: 17,
-    primaryMigrationReceipt: { status: "current", version: 1 },
-    ledgerMigrationReceipt: { status: "receipt_mismatch", version: 1 },
+    primaryMigrationReceipt: { status: "receipt_mismatch", version: 1 },
   });
 
   const missingPools = receiptPool({ primaryExists: false });
   const missing = createPostgresTestHealthDispatch({
     primaryPool: missingPools("primary"),
-    ledgerPool: missingPools("ledger"),
-    schemaOptions: { primarySchema: "health_primary", ledgerSchema: "health_ledger" },
+    schemaOptions: { primarySchema: "health_primary" },
     expectedMigrations: ONE_MIGRATION,
     privateOrigin: "http://127.0.0.1:8080",
   });
   const missingResponse = await missing(new Request("http://127.0.0.1:8080/api/health"));
   assert.equal(missingResponse.status, 503);
   assert.equal((await missingResponse.json()).checks.primaryMigrationReceipt.status, "schema_missing");
+
+  // The health and storage gate take one pool and the primary manifest only:
+  // a stale composition that passes a second pool, a second schema or a
+  // second manifest role is refused at construction (LEAD-SIMP).
+  const current = receiptPool({ primaryHistory: currentHistory });
+  const base = {
+    primaryPool: current("primary"),
+    schemaOptions: { primarySchema: "health_primary" },
+    expectedMigrations: ONE_MIGRATION,
+    privateOrigin: "http://127.0.0.1:8080",
+  };
+  for (const [label, override, code] of [
+    ["a second pool", { secondaryPool: current("primary") }, "POSTGRES_TEST_POOLS_INVALID"],
+    ["a second schema", { schemaOptions: { primarySchema: "health_primary", secondarySchema: "health_other" } },
+      "POSTGRES_TEST_SCHEMA_CONFIGURATION_INVALID"],
+    ["a second manifest role", { expectedMigrations: { ...ONE_MIGRATION, secondary: ONE_MIGRATION.primary } },
+      "POSTGRES_TEST_PRIMARY_MIGRATION_RECEIPT_INVALID"],
+    ["no primary pool", { primaryPool: undefined }, "POSTGRES_TEST_POOLS_INVALID"],
+  ]) {
+    assert.throws(() => createPostgresTestHealthDispatch({ ...base, ...override }),
+      (error) => error?.code === code, label);
+    const { privateOrigin: _origin, ...gateBase } = base;
+    assert.throws(() => createPostgresTestStorageReceiptCheck({ ...gateBase, ...override }),
+      (error) => error?.code === code, `storage gate: ${label}`);
+  }
 });
 
 test("host startup keeps loopback modes and rejects missing or mismatched Cloud Run identity/config", async () => {
@@ -969,8 +972,8 @@ test("host startup keeps loopback modes and rejects missing or mismatched Cloud 
     const serverModule = await import(`${pathToFileURL(bundlePath).href}?test=${randomUUID()}`);
     const baseEnv = { ...process.env };
     for (const name of ["POSTGRES_TEST_HTTP_MODE", "HOST", "HOST_ORIGIN", "PUBLIC_ORIGIN",
-      "ADMIN_HOST_ORIGIN", "PORT", "K_SERVICE", "PRIMARY_DATABASE", "LEDGER_DATABASE",
-      "PRIMARY_INSTANCE_CONNECTION_NAME", "LEDGER_INSTANCE_CONNECTION_NAME", "POSTGRES_IAM_USER",
+      "ADMIN_HOST_ORIGIN", "PORT", "K_SERVICE", "PRIMARY_DATABASE",
+      "PRIMARY_INSTANCE_CONNECTION_NAME", "POSTGRES_IAM_USER",
       "POSTGRES_SCHEDULED_MAINTENANCE_ENABLED", "ENROLLMENT_MODE", "IDENTITY_LINK_SECRET",
       "IDENTITY_LINK_SECRET_VERSION", "GOOGLE_OIDC_CLIENT_ID", "GOOGLE_OIDC_CLIENT_SECRET",
       "SIGN_IN_START_MAX_PER_MINUTE"]) {
@@ -1000,17 +1003,32 @@ test("host startup keeps loopback modes and rejects missing or mismatched Cloud 
       code: "POSTGRES_SCHEDULED_MAINTENANCE_DISABLED",
     }, "the opt-in gate must stop the scheduled CLI before runtime configuration");
 
-    const scheduledEnabledWithoutDatabase = spawnSync(process.execPath, [bundlePath, "--scheduled"], {
+    // OD-4: with no recorded maintenance report policy the enabled scheduled
+    // CLI refuses before it composes anything; a stale ledger setting is
+    // refused first.
+    const scheduledEnabledWithoutPolicy = spawnSync(process.execPath, [bundlePath, "--scheduled"], {
       cwd: ROOT,
       env: { ...baseEnv, POSTGRES_SCHEDULED_MAINTENANCE_ENABLED: "enabled" },
       encoding: "utf8",
       timeout: 30_000,
     });
-    assert.equal(scheduledEnabledWithoutDatabase.status, 1);
-    assert.deepEqual(JSON.parse(scheduledEnabledWithoutDatabase.stderr.trim()), {
+    assert.equal(scheduledEnabledWithoutPolicy.status, 1);
+    assert.deepEqual(JSON.parse(scheduledEnabledWithoutPolicy.stderr.trim()), {
       status: "error",
-      code: "PRIMARY_DATABASE_MISSING",
-    }, "enabled scheduled startup must enter its database-only composition");
+      code: "POSTGRES_MAINTENANCE_REPORT_POLICY_UNDECIDED",
+    }, "the scheduled CLI refuses until owner decision OD-4 is recorded");
+    assert.equal(serverModule.POSTGRES_MAINTENANCE_REPORT_POLICY, null, "OD-4: no default report policy");
+    const scheduledWithLedger = spawnSync(process.execPath, [bundlePath, "--scheduled"], {
+      cwd: ROOT,
+      env: { ...baseEnv, POSTGRES_SCHEDULED_MAINTENANCE_ENABLED: "enabled", LEDGER_DATABASE: "synthetic_ledger" },
+      encoding: "utf8",
+      timeout: 30_000,
+    });
+    assert.equal(scheduledWithLedger.status, 1);
+    assert.deepEqual(JSON.parse(scheduledWithLedger.stderr.trim()), {
+      status: "error",
+      code: "POSTGRES_LEDGER_CONFIGURATION_RETIRED",
+    });
 
     for (const mode of ["health-only", "health-and-v12-day-manifest"]) {
       const publicBind = spawnSync(process.execPath, [bundlePath], {
@@ -1109,10 +1127,6 @@ test("host startup keeps loopback modes and rejects missing or mismatched Cloud 
       PRIMARY_SCHEMA: CLOUD_RUN_IAM_TEST_TARGET.postgres.primary.schema,
       PRIMARY_INSTANCE_CONNECTION_NAME:
         CLOUD_RUN_IAM_TEST_TARGET.postgres.primary.instanceConnectionName,
-      LEDGER_DATABASE: CLOUD_RUN_IAM_TEST_TARGET.postgres.ledger.database,
-      LEDGER_SCHEMA: CLOUD_RUN_IAM_TEST_TARGET.postgres.ledger.schema,
-      LEDGER_INSTANCE_CONNECTION_NAME:
-        CLOUD_RUN_IAM_TEST_TARGET.postgres.ledger.instanceConnectionName,
       POSTGRES_IAM_USER: CLOUD_RUN_IAM_TEST_TARGET.postgres.iamUser,
       GCS_BUCKET_NAME: CLOUD_RUN_IAM_TEST_TARGET.gcsBucket,
       GCS_ERASURE_BUCKET_HISTORY_PROOF: proof(CLOUD_RUN_IAM_TEST_TARGET.gcsBucket),
@@ -1126,14 +1140,16 @@ test("host startup keeps loopback modes and rejects missing or mismatched Cloud 
         "POSTGRES_TEST_CLOUD_RUN_IAM_PRIMARY_TARGET_INVALID"],
       [{ PRIMARY_SCHEMA: "tibotattle" },
         "POSTGRES_TEST_CLOUD_RUN_IAM_PRIMARY_TARGET_INVALID"],
-      [{ LEDGER_INSTANCE_CONNECTION_NAME: "other-project:us-east1:other-ledger" },
-        "POSTGRES_TEST_CLOUD_RUN_IAM_LEDGER_TARGET_INVALID"],
-      [{ LEDGER_DATABASE: "other_ledger" },
-        "POSTGRES_TEST_CLOUD_RUN_IAM_LEDGER_TARGET_INVALID"],
-      [{ LEDGER_SCHEMA: "other_ledger" },
-        "POSTGRES_TEST_CLOUD_RUN_IAM_LEDGER_TARGET_INVALID"],
+      // The retired A2 ledger target, in any form, is refused before any
+      // connector or pool exists (LEAD-SIMP).
+      [{ LEDGER_INSTANCE_CONNECTION_NAME: CLOUD_RUN_IAM_TEST_TARGET.postgres.ledger.instanceConnectionName },
+        "POSTGRES_LEDGER_CONFIGURATION_RETIRED"],
+      [{ LEDGER_DATABASE: CLOUD_RUN_IAM_TEST_TARGET.postgres.ledger.database },
+        "POSTGRES_LEDGER_CONFIGURATION_RETIRED"],
+      [{ LEDGER_SCHEMA: CLOUD_RUN_IAM_TEST_TARGET.postgres.ledger.schema },
+        "POSTGRES_LEDGER_CONFIGURATION_RETIRED"],
       [{ LEDGER_SCHEMA: "tibotattle_ledger" },
-        "POSTGRES_TEST_CLOUD_RUN_IAM_LEDGER_TARGET_INVALID"],
+        "POSTGRES_LEDGER_CONFIGURATION_RETIRED"],
       [{ POSTGRES_IAM_USER: "other-runtime@tibotattle.iam" },
         "POSTGRES_TEST_CLOUD_RUN_IAM_USER_INVALID"],
       [{ GCS_BUCKET_NAME: "another-test-bucket" },
@@ -1196,15 +1212,13 @@ test("host startup keeps loopback modes and rejects missing or mismatched Cloud 
       PRIMARY_DATABASE: "synthetic_primary",
       PRIMARY_SCHEMA: "scheduled_primary",
       PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:primary",
-      LEDGER_DATABASE: "synthetic_ledger",
-      LEDGER_SCHEMA: "scheduled_ledger",
-      LEDGER_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:ledger",
       POSTGRES_IAM_USER: "scheduled-runtime@tibotattle.iam",
       GCS_BUCKET_NAME: scheduledBucket,
       GCS_ERASURE_BUCKET_HISTORY_PROOF: proof(scheduledBucket),
     };
     const scheduledEnvironmentNames = new Set([
       ...Object.keys(scheduledEnvironment),
+      "LEDGER_DATABASE", "LEDGER_SCHEMA", "LEDGER_INSTANCE_CONNECTION_NAME",
       "POSTGRES_TEST_HTTP_MODE", "HOST", "HOST_ORIGIN", "PUBLIC_ORIGIN",
       "ADMIN_HOST_ORIGIN", "PORT", "K_SERVICE", "SOURCE_CONTENT_DIGEST",
       "POSTGRES_RATE_LIMIT_SECRET", "ENVELOPE_PUBLIC_JWK", "ENVELOPE_PRIVATE_JWK",
@@ -1244,22 +1258,34 @@ test("host startup keeps loopback modes and rejects missing or mismatched Cloud 
           role: "primary", database: "synthetic_primary", schema: "scheduled_primary",
           max: 3, user: "scheduled-runtime@tibotattle.iam",
         },
-        {
-          role: "ledger", database: "synthetic_ledger", schema: "scheduled_ledger",
-          max: 2, user: "scheduled-runtime@tibotattle.iam",
-        },
-      ]);
+      ], "the scheduled job opens one primary pool and no ledger pool");
       assert.equal(runtime.primaryPool, pools[0]);
-      assert.equal(runtime.ledgerPool, pools[1]);
+      assert.deepEqual(runtime.pools, [pools[0]]);
       assert.equal(runtime.connector, connector);
       assert.equal(runtime.objectStore, objectStore);
       assert.deepEqual(runtime.schemaOptions, {
         primarySchema: "scheduled_primary",
-        ledgerSchema: "scheduled_ledger",
       });
       assert.equal(objectStoreInput[0], scheduledBucket);
       assert.equal(objectStoreInput[1], provider);
+      // OD-2: the quarantine store keeps the bucket-history proof unchanged.
       assert.deepEqual(objectStoreInput[4], JSON.parse(proof(scheduledBucket)));
+
+      // Any retired LEDGER_ setting refuses the scheduled composition before
+      // a connector or pool exists.
+      for (const [name, value] of [["LEDGER_DATABASE", "synthetic_ledger"], ["LEDGER_SCHEMA", "scheduled_ledger"],
+        ["LEDGER_INSTANCE_CONNECTION_NAME", "synthetic-project:us-east1:ledger"]]) {
+        process.env[name] = value;
+        const calls = [];
+        await assert.rejects(serverModule.createScheduledMaintenanceRuntime({
+          dependencies: {
+            createConnector() { calls.push("connector"); return connector; },
+            createIamPool() { calls.push("pool"); throw new Error("must not open a pool"); },
+          },
+        }), (error) => error?.code === "POSTGRES_LEDGER_CONFIGURATION_RETIRED", name);
+        assert.deepEqual(calls, [], name);
+        delete process.env[name];
+      }
     } finally {
       for (const [name, value] of previousScheduledEnvironment) {
         if (value === undefined) delete process.env[name];
@@ -1347,7 +1373,7 @@ test("PostgreSQL personal-device adapter validates Worker session bindings and m
         };
       },
     };
-    const schema = { primarySchema: "devices_test", ledgerSchema: "devices_ledger_test" };
+    const schema = { primarySchema: "devices_test" };
     assert.deepEqual(
       await personalDevices.authenticatePostgresPersonalSession(
         pool,
@@ -1439,14 +1465,14 @@ test("PostgreSQL personal-device adapter validates Worker session bindings and m
   }
 });
 
-test("private health dispatch validates current primary and independent ledger PostgreSQL 17 receipts", {
+test("private health dispatch validates the current primary PostgreSQL 17 receipt with one pool", {
   skip: !PG_TEST_HOST && !PG_TEST_SOCKET,
   timeout: 90_000,
 }, async () => {
   const endpoint = await localPostgresEndpoint();
   const suffix = randomBytes(6).toString("hex");
   const primarySchema = `host_health_${suffix}`;
-  const ledgerSchema = `host_health_${suffix}_ledger`;
+  let connections = 0;
   const primaryPool = new pg.Pool({
     host: endpoint.host,
     port: endpoint.port,
@@ -1457,16 +1483,7 @@ test("private health dispatch validates current primary and independent ledger P
     max: 2,
     connectionTimeoutMillis: 3_000,
   });
-  const ledgerPool = new pg.Pool({
-    host: endpoint.host,
-    port: endpoint.port,
-    user: PG_TEST_USER,
-    ...(PG_TEST_PASSWORD === undefined ? { password: "synthetic-local-only" } : { password: PG_TEST_PASSWORD }),
-    database: PG_TEST_DATABASE,
-    ssl: false,
-    max: 2,
-    connectionTimeoutMillis: 3_000,
-  });
+  primaryPool.on("connect", () => { connections += 1; });
   const createdSchemas = [];
   let temporary;
   try {
@@ -1477,12 +1494,7 @@ test("private health dispatch validates current primary and independent ledger P
       "the real integration check requires PostgreSQL 17");
     await primaryPool.query(`CREATE SCHEMA "${primarySchema}"`);
     createdSchemas.push(primarySchema);
-    await primaryPool.query(`CREATE SCHEMA "${ledgerSchema}"`);
-    createdSchemas.push(ledgerSchema);
-    await Promise.all([
-      applyPostgresMigrations({ role: "primary", schema: primarySchema, pool: primaryPool }),
-      applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool: ledgerPool }),
-    ]);
+    await applyPostgresMigrations({ role: "primary", schema: primarySchema, pool: primaryPool });
 
     temporary = await mkdtemp(join(ROOT, ".tmp-postgres-health-manifest-"));
     const manifestBundle = await build({
@@ -1496,12 +1508,14 @@ test("private health dispatch validates current primary and independent ledger P
     });
     const manifestPath = join(temporary, "runtime-schema.mjs");
     await writeFile(manifestPath, manifestBundle.outputFiles[0].contents);
-    const { POSTGRES_RUNTIME_MIGRATIONS } = await import(pathToFileURL(manifestPath).href);
+    const { POSTGRES_RUNTIME_MIGRATIONS, POSTGRES_RUNTIME_SCHEMA_VERSION } =
+      await import(pathToFileURL(manifestPath).href);
+    assert.equal(POSTGRES_RUNTIME_SCHEMA_VERSION, "tibotattle-postgres-migration-manifest-v2");
+    assert.deepEqual(Object.keys(POSTGRES_RUNTIME_MIGRATIONS), ["primary"]);
 
     const dispatch = createPostgresTestHealthDispatch({
       primaryPool,
-      ledgerPool,
-      schemaOptions: { primarySchema, ledgerSchema },
+      schemaOptions: { primarySchema },
       expectedMigrations: POSTGRES_RUNTIME_MIGRATIONS,
       privateOrigin: "http://127.0.0.1:43817",
     });
@@ -1509,7 +1523,7 @@ test("private health dispatch validates current primary and independent ledger P
     assert.equal(response.status, 200);
     const health = await response.json();
     assert.deepEqual(health, {
-      schemaVersion: "gcp-postgres-test-health-v1",
+      schemaVersion: "gcp-postgres-test-health-v2",
       scope: "postgres_schema_and_migrations_only",
       status: "ready",
       workerApplicationReady: false,
@@ -1519,27 +1533,18 @@ test("private health dispatch validates current primary and independent ledger P
           status: "current",
           version: POSTGRES_RUNTIME_MIGRATIONS.primary.length,
         },
-        ledgerMigrationReceipt: {
-          status: "current",
-          version: POSTGRES_RUNTIME_MIGRATIONS.ledger.length,
-        },
       },
     });
-    const [primaryBackend, ledgerBackend] = await Promise.all([
-      primaryPool.query("SELECT pg_backend_pid() AS id"),
-      ledgerPool.query("SELECT pg_backend_pid() AS id"),
-    ]);
-    assert.notEqual(primaryBackend.rows[0].id, ledgerBackend.rows[0].id,
-      "the primary and ledger health checks must use independent pools/connections");
+    assert.equal(POSTGRES_RUNTIME_MIGRATIONS.primary.length, 64);
     assert.equal(JSON.stringify(health).includes(primarySchema), false);
-    assert.equal(JSON.stringify(health).includes(ledgerSchema), false);
     assert.equal(Object.hasOwn(health.checks, "database"), false);
+    assert.ok(connections >= 1);
   } finally {
     for (const schema of createdSchemas.reverse()) {
       try { await primaryPool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`); } catch {}
     }
     if (temporary) await rm(temporary, { recursive: true, force: true });
-    await Promise.all([primaryPool.end(), ledgerPool.end()]);
+    await primaryPool.end();
   }
 });
 
@@ -1550,7 +1555,6 @@ test("private PostgreSQL 17 participant-device routes preserve revocation effect
   const endpoint = await localPostgresEndpoint();
   const suffix = randomBytes(6).toString("hex");
   const primarySchema = `host_devices_${suffix}`;
-  const ledgerSchema = `host_devices_${suffix}_ledger`;
   const primaryPool = new pg.Pool({
     host: endpoint.host,
     port: endpoint.port,
@@ -1559,16 +1563,6 @@ test("private PostgreSQL 17 participant-device routes preserve revocation effect
     database: PG_TEST_DATABASE,
     ssl: false,
     max: 3,
-    connectionTimeoutMillis: 3_000,
-  });
-  const ledgerPool = new pg.Pool({
-    host: endpoint.host,
-    port: endpoint.port,
-    user: PG_TEST_USER,
-    ...(PG_TEST_PASSWORD === undefined ? { password: "synthetic-local-only" } : { password: PG_TEST_PASSWORD }),
-    database: PG_TEST_DATABASE,
-    ssl: false,
-    max: 2,
     connectionTimeoutMillis: 3_000,
   });
   const createdSchemas = [];
@@ -1581,12 +1575,7 @@ test("private PostgreSQL 17 participant-device routes preserve revocation effect
       "the personal-device HTTP integration check requires PostgreSQL 17");
     await primaryPool.query(`CREATE SCHEMA "${primarySchema}"`);
     createdSchemas.push(primarySchema);
-    await primaryPool.query(`CREATE SCHEMA "${ledgerSchema}"`);
-    createdSchemas.push(ledgerSchema);
-    await Promise.all([
-      applyPostgresMigrations({ role: "primary", schema: primarySchema, pool: primaryPool }),
-      applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool: ledgerPool }),
-    ]);
+    await applyPostgresMigrations({ role: "primary", schema: primarySchema, pool: primaryPool });
 
     vite = await createServer({
       root: WORKER_ROOT,
@@ -1594,29 +1583,30 @@ test("private PostgreSQL 17 participant-device routes preserve revocation effect
       server: { middlewareMode: true },
       appType: "custom",
     });
-    const [session, personalDevices, personalSession, ledgerAuthority, deletionDigest, runtimeSchema,
+    const [session, personalDevices, personalSession, runtimeSchema,
       bodyReader, workerConstants]
       = await Promise.all([
         vite.ssrLoadModule("/src/session.ts"),
         vite.ssrLoadModule("/src/postgres-personal-devices.ts"),
         vite.ssrLoadModule("/src/postgres-personal-session.ts"),
-        vite.ssrLoadModule("/src/postgres-ledger-authority.ts"),
-        vite.ssrLoadModule("/src/participant-deletion-digest.ts"),
         vite.ssrLoadModule("/src/postgres-runtime-schema.ts"),
         vite.ssrLoadModule("/src/bounded-body.ts"),
         vite.ssrLoadModule("/src/constants.ts"),
       ]);
     const primaryTable = (name) => quotedTable(primarySchema, name);
-    const ledgerTable = (name) => quotedTable(ledgerSchema, name);
-    const schemas = { primarySchema, ledgerSchema };
+    const schemas = { primarySchema };
     const now = Date.now();
     const participantCreatedAt = new Date(now - 60_000).toISOString();
     const participantA = `synthetic-devices-a-${suffix}`;
     const participantB = `synthetic-devices-b-${suffix}`;
+    // A participant deleted after it signed in (the former tombstone case,
+    // re-expressed without a deletion ledger: its rows are simply gone).
+    const participantDeleted = `synthetic-devices-c-${suffix}`;
     await primaryPool.query(
       `INSERT INTO ${primaryTable("participants")} (id, owner_kind, state, consent_version, created_at)
-       VALUES ($1, 'social', 'active', NULL, $2), ($3, 'social', 'active', $4, $2)`,
-      [participantA, participantCreatedAt, participantB, "telemetry-v3"],
+       VALUES ($1, 'social', 'active', NULL, $2), ($3, 'social', 'active', $4, $2),
+              ($5, 'social', 'active', NULL, $2)`,
+      [participantA, participantCreatedAt, participantB, "telemetry-v3", participantDeleted],
     );
 
     async function insertSession(participantId, {
@@ -1755,24 +1745,17 @@ test("private PostgreSQL 17 participant-device routes preserve revocation effect
       state: "unused",
     });
 
-    const digest = await deletionDigest.participantDeletionDigest(participantB);
-    await ledgerPool.query(
-      `INSERT INTO ${ledgerTable("deletion_tombstones")} (
-         participant_digest, schema_version, deleted_at, retain_until
-       ) VALUES ($1,'participant-deletion-tombstone-v0.1',$2,$3)`,
-      [digest, new Date(now - 1_000).toISOString(), new Date(now + 60 * 60_000).toISOString()],
-    );
+    const sessionDeleted = await insertSession(participantDeleted);
+    await primaryPool.query(`DELETE FROM ${primaryTable("participants")} WHERE id = $1`, [participantDeleted]);
 
     const healthDispatch = createPostgresTestHealthDispatch({
       primaryPool,
-      ledgerPool,
       schemaOptions: schemas,
       expectedMigrations: runtimeSchema.POSTGRES_RUNTIME_MIGRATIONS,
       privateOrigin: "http://127.0.0.1:43818",
     });
     const deviceDispatch = createPostgresTestParticipantDevicesDispatch({
       primaryPool,
-      ledgerPool,
       schemaOptions: schemas,
       authenticatePostgresPersonalSession: personalDevices.authenticatePostgresPersonalSession,
       assertPostgresPersonalSessionCsrf: personalDevices.assertPostgresPersonalSessionCsrf,
@@ -1780,18 +1763,15 @@ test("private PostgreSQL 17 participant-device routes preserve revocation effect
       revokePostgresParticipantDevice: personalDevices.revokePostgresParticipantDevice,
       readBoundedRequestBody: bodyReader.readBoundedRequestBody,
       maxRequestBytes: workerConstants.MAX_REQUEST_BYTES,
-      hasPostgresDeletionTombstone: ledgerAuthority.hasPostgresDeletionTombstone,
       healthDispatch,
       privateOrigin: "http://127.0.0.1:43818",
     });
     const personalSessionDispatch = createPostgresTestPersonalSessionDispatch({
       primaryPool,
-      ledgerPool,
       schemaOptions: schemas,
       authenticatePostgresPersonalSession: personalSession.authenticatePostgresPersonalSessionForRead,
       assertPostgresPersonalSessionCsrf: personalDevices.assertPostgresPersonalSessionCsrf,
       revokePostgresPersonalSession: personalSession.revokePostgresPersonalSession,
-      hasPostgresDeletionTombstone: ledgerAuthority.hasPostgresDeletionTombstone,
       healthDispatch,
       clearSessionCookie: session.clearedSessionCookie(),
       privateOrigin: "http://127.0.0.1:43818",
@@ -2084,13 +2064,13 @@ test("private PostgreSQL 17 participant-device routes preserve revocation effect
     assert.equal(staleLogout.status, 200);
     assert.deepEqual(await staleLogout.json(), { loggedOut: true });
     assert.equal(staleLogout.headers.get("set-cookie"), session.clearedSessionCookie());
-    const tombstonedLogout = await dispatchCloudRunHostRequest(
-      logoutRequest(sessionB), runtime, workerHandler,
+    const deletedLogout = await dispatchCloudRunHostRequest(
+      logoutRequest(sessionDeleted), runtime, workerHandler,
     );
-    assert.equal(tombstonedLogout.status, 200,
-      "a deleted participant can still clear its browser cookie without revealing tombstone state");
-    assert.deepEqual(await tombstonedLogout.json(), { loggedOut: true });
-    assert.equal(tombstonedLogout.headers.get("set-cookie"), session.clearedSessionCookie());
+    assert.equal(deletedLogout.status, 200,
+      "a deleted participant can still clear its browser cookie without revealing that it was deleted");
+    assert.deepEqual(await deletedLogout.json(), { loggedOut: true });
+    assert.equal(deletedLogout.headers.get("set-cookie"), session.clearedSessionCookie());
 
     const logout = await dispatchCloudRunHostRequest(
       logoutRequest(sessionA, { "x-usage-monitor-csrf": sessionA.csrfToken }),
@@ -2153,8 +2133,15 @@ test("private PostgreSQL 17 participant-device routes preserve revocation effect
         code,
       );
     }
+    // A deleted participant's former cookie fails ordinary authentication on
+    // the device list and the session read.
     await assertApiError(
-      await dispatchCloudRunHostRequest(request(sessionB), runtime, workerHandler),
+      await dispatchCloudRunHostRequest(request(sessionDeleted), runtime, workerHandler),
+      401,
+      "AUTH_INVALID",
+    );
+    await assertApiError(
+      await dispatchCloudRunHostRequest(sessionRequest(sessionDeleted), runtime, workerHandler),
       401,
       "AUTH_INVALID",
     );
@@ -2167,7 +2154,7 @@ test("private PostgreSQL 17 participant-device routes preserve revocation effect
     for (const schema of createdSchemas.reverse()) {
       try { await primaryPool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`); } catch {}
     }
-    await Promise.all([primaryPool.end(), ledgerPool.end()]);
+    await primaryPool.end();
   }
 });
 
@@ -2178,7 +2165,6 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
   const endpoint = await localPostgresEndpoint();
   const suffix = randomBytes(6).toString("hex");
   const primarySchema = `host_v12_${suffix}`;
-  const ledgerSchema = `host_v12_${suffix}_ledger`;
   const primaryPool = new pg.Pool({
     host: endpoint.host,
     port: endpoint.port,
@@ -2187,16 +2173,6 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
     database: PG_TEST_DATABASE,
     ssl: false,
     max: 3,
-    connectionTimeoutMillis: 3_000,
-  });
-  const ledgerPool = new pg.Pool({
-    host: endpoint.host,
-    port: endpoint.port,
-    user: PG_TEST_USER,
-    ...(PG_TEST_PASSWORD === undefined ? { password: "synthetic-local-only" } : { password: PG_TEST_PASSWORD }),
-    database: PG_TEST_DATABASE,
-    ssl: false,
-    max: 2,
     connectionTimeoutMillis: 3_000,
   });
   const createdSchemas = [];
@@ -2210,12 +2186,7 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
       "the real dispatch check requires PostgreSQL 17");
     await primaryPool.query(`CREATE SCHEMA "${primarySchema}"`);
     createdSchemas.push(primarySchema);
-    await primaryPool.query(`CREATE SCHEMA "${ledgerSchema}"`);
-    createdSchemas.push(ledgerSchema);
-    await Promise.all([
-      applyPostgresMigrations({ role: "primary", schema: primarySchema, pool: primaryPool }),
-      applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool: ledgerPool }),
-    ]);
+    await applyPostgresMigrations({ role: "primary", schema: primarySchema, pool: primaryPool });
 
     temporary = await mkdtemp(join(ROOT, ".tmp-postgres-v12-host-"));
     const runtimeBundle = await build({
@@ -2237,7 +2208,7 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
       server: { middlewareMode: true },
       appType: "custom",
     });
-    const [transport, v12Admission, ledgerAuthority, admission, rateLimit, bodyReader, constants,
+    const [transport, v12Admission, admission, rateLimit, bodyReader, constants,
       cryptoModule, telemetryV12Repository, deviceSync, typedCodec, typedV12EffectiveReader,
       accountlessAdapter, accountlessRenewalAdapter, accountlessEnrollment, accountlessOwnership,
       accountlessRenewal, transportPolicy, postgresCredentialRenewalAdapter,
@@ -2245,7 +2216,6 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
       = await Promise.all([
         vite.ssrLoadModule("/src/postgres-typed-v12-transport.ts"),
         vite.ssrLoadModule("/src/postgres-typed-v12-admission.ts"),
-        vite.ssrLoadModule("/src/postgres-ledger-authority.ts"),
         vite.ssrLoadModule("/src/admission.ts"),
         vite.ssrLoadModule("/src/postgres-rate-limiter.ts"),
         vite.ssrLoadModule("/src/bounded-body.ts"),
@@ -2328,7 +2298,7 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
     const sessionId = randomUUID();
     const deviceSecret = randomBytes(32).toString("base64url");
     const primaryTable = (name) => quotedTable(primarySchema, name);
-    const schemaOptions = { primarySchema, ledgerSchema };
+    const schemaOptions = { primarySchema };
     const unknownEffectivePageSchema = `host_missing_v12_${suffix}`;
     let useUnknownEffectivePageSchema = false;
     const sourceNamespace = `synthetic-host-source-${suffix}`;
@@ -2437,7 +2407,6 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
     ]) {
       admissionEnv[binding] = rateLimit.createPostgresRateLimiter(primaryPool, {
         primarySchema,
-        ledgerSchema,
         name,
         limit,
         periodSeconds: 60,
@@ -2446,7 +2415,6 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
     }
     const recoveryBoundary = rateLimit.createPostgresRateLimiter(primaryPool, {
       primarySchema,
-      ledgerSchema,
       name: "HOST_RECOVERY_BOUNDARY",
       limit: 20,
       periodSeconds: 60,
@@ -2459,7 +2427,6 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
     assert.deepEqual(await recoveryBoundary.limit({ key: "synthetic-other-device" }), { success: true });
     const healthDispatch = createPostgresTestHealthDispatch({
       primaryPool,
-      ledgerPool,
       schemaOptions,
       expectedMigrations: POSTGRES_RUNTIME_MIGRATIONS,
       privateOrigin: "http://127.0.0.1:43817",
@@ -2468,7 +2435,6 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
     let deviceDisconnectRateLimitCalls = 0;
     const manifestDispatchOptions = {
       primaryPool,
-      ledgerPool,
       schemaOptions,
       expectedMigrations: POSTGRES_RUNTIME_MIGRATIONS,
       privateOrigin: "http://127.0.0.1:43817",
@@ -2506,7 +2472,6 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
       authenticatePostgresDevice: transport.authenticatePostgresDevice,
       disconnectPostgresAuthenticatedDevice:
         postgresDeviceDisconnectAdapter.disconnectPostgresAuthenticatedDevice,
-      hasPostgresDeletionTombstone: ledgerAuthority.hasPostgresDeletionTombstone,
       readPostgresDeviceSyncState: deviceSyncReads.readPostgresDeviceSyncState,
       readPostgresDeviceSyncManifest: deviceSyncReads.readPostgresDeviceSyncManifest,
       readPostgresDeviceSyncCapabilities: deviceSync.readPostgresDeviceSyncCapabilities,
@@ -2581,7 +2546,7 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
     const health = await dispatch(request({ url: "http://127.0.0.1:43817/api/health", method: "GET" }));
     if (health.status !== 200) {
       const status = await health.clone().json();
-      throw new Error(`POSTGRES_TEST_HEALTH_NOT_READY:${status?.checks?.primaryMigrationReceipt?.status ?? "unknown"}:${status?.checks?.ledgerMigrationReceipt?.status ?? "unknown"}`);
+      throw new Error(`POSTGRES_TEST_HEALTH_NOT_READY:${status?.checks?.primaryMigrationReceipt?.status ?? "unknown"}`);
     }
     assert.equal((await health.json()).workerApplicationReady, false);
 
@@ -3570,9 +3535,12 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
     assert.equal(consumedPredecessor.rows[0].token_hash, sha256Hex(predecessor.token));
     assert.ok(consumedPredecessor.rows[0].consumed_at);
 
-    await ledgerAuthority.recordPostgresDeletionTombstone(
-      ledgerPool, participantId, Date.now(), { schema: schemaOptions },
+    // A participant removed by the offline purge (D2 Variant B) has no rows,
+    // so every device route refuses it; there is no separate deletion ledger.
+    const purgedParticipant = await primaryPool.query(
+      `DELETE FROM ${primaryTable("participants")} WHERE id=$1`, [participantId],
     );
+    assert.equal(purgedParticipant.rowCount, 1);
     await assertApiError(await dispatch(request({ body: JSON.stringify(manifest) })), 401, "DEVICE_AUTH_INVALID");
     await assertApiError(await dispatch(request({
       url: domainPredecessorUrl, body: "{}",
@@ -3954,18 +3922,19 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
     await primaryPool.query(
       "UPDATE " + primaryTable("telemetry_v12_runtime") + " SET state='active' WHERE id=1",
     );
-    const concurrentV12Grants = await Promise.all([
-      dispatch(authorizationHttp(JSON.stringify(accountlessV12Body))),
-      dispatch(authorizationHttp(JSON.stringify(accountlessV12Body))),
-    ]);
-    assert.deepEqual(concurrentV12Grants.map((response) => response.status), [201, 201],
+    // Four concurrent first grants: ON CONFLICT arbitrates only the device
+    // key, so without the per-owner grant lock some raced the participant
+    // key and answered 503.
+    const concurrentV12Grants = await Promise.all(Array.from({ length: 4 }, () =>
+      dispatch(authorizationHttp(JSON.stringify(accountlessV12Body)))));
+    assert.deepEqual(concurrentV12Grants.map((response) => response.status), [201, 201, 201, 201],
       `concurrent v1.2 grants must replay one stable active grant; received ${JSON.stringify(
         await Promise.all(concurrentV12Grants.map(async (response) => ({
           status: response.status, body: await response.clone().json(),
         }))),
       )}`);
     const grantReceipts = await Promise.all(concurrentV12Grants.map((response) => response.json()));
-    assert.deepEqual(grantReceipts, [accountlessV12Body, accountlessV12Body],
+    assert.deepEqual(grantReceipts, Array.from({ length: 4 }, () => accountlessV12Body),
       "the receipt includes only the closed v1.2 authorization tuple");
     const accountlessGrant = await primaryPool.query(
       "SELECT state, schema_version, policy_version, authorization_basis, "
@@ -4010,37 +3979,40 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
       telemetrySchemaVersion: "telemetry-contribution-v1.1",
     });
 
-    const tombstonedDeviceId = randomUUID();
-    const tombstonedSecret = randomBytes(32).toString("base64url");
-    const tombstonedAuth = `Device um_device_${tombstonedDeviceId}.${tombstonedSecret}`;
-    const tombstonedEnrollmentBody = {
+    // An accountless owner removed by the offline purge (D2 Variant B) cannot
+    // acquire a v1.2 grant: its rows are gone and no deletion ledger exists.
+    const purgedDeviceId = randomUUID();
+    const purgedSecret = randomBytes(32).toString("base64url");
+    const purgedAuth = `Device um_device_${purgedDeviceId}.${purgedSecret}`;
+    const purgedEnrollmentBody = {
       ...accountlessEnrollmentBody,
-      deviceId: tombstonedDeviceId,
-      deviceSecretHash: deviceSecretHash(tombstonedDeviceId, tombstonedSecret).toString("hex"),
+      deviceId: purgedDeviceId,
+      deviceSecretHash: deviceSecretHash(purgedDeviceId, purgedSecret).toString("hex"),
     };
-    assert.equal((await dispatch(enrollmentHttp(JSON.stringify(tombstonedEnrollmentBody)))).status, 201);
+    assert.equal((await dispatch(enrollmentHttp(JSON.stringify(purgedEnrollmentBody)))).status, 201);
     assert.equal((await dispatch(ownershipHttp(JSON.stringify(ownershipBody), {
-      authorization: tombstonedAuth,
+      authorization: purgedAuth,
     }))).status, 201);
-    const tombstonedOwner = await primaryPool.query(
+    const purgedOwner = await primaryPool.query(
       "SELECT participant_id FROM " + primaryTable("accountless_upload_owners")
         + " WHERE enrollment_device_id=$1",
-      [tombstonedDeviceId],
+      [purgedDeviceId],
     );
-    assert.equal(tombstonedOwner.rowCount, 1);
-    await ledgerAuthority.recordPostgresDeletionTombstone(
-      ledgerPool, tombstonedOwner.rows[0].participant_id, Date.now(), { schema: schemaOptions },
+    assert.equal(purgedOwner.rowCount, 1);
+    const purgedOwnerParticipant = await primaryPool.query(
+      `DELETE FROM ${primaryTable("participants")} WHERE id=$1`, [purgedOwner.rows[0].participant_id],
     );
+    assert.equal(purgedOwnerParticipant.rowCount, 1);
     await assertApiError(await dispatch(authorizationHttp(
-      JSON.stringify(accountlessV12Body), {}, tombstonedAuth,
+      JSON.stringify(accountlessV12Body), {}, purgedAuth,
     )), 401, "DEVICE_AUTH_INVALID");
-    const tombstonedGrant = await primaryPool.query(
+    const purgedGrant = await primaryPool.query(
       "SELECT count(*)::integer AS count FROM "
         + primaryTable("accountless_v12_device_authorizations") + " WHERE enrollment_device_id=$1",
-      [tombstonedDeviceId],
+      [purgedDeviceId],
     );
-    assert.equal(tombstonedGrant.rows[0].count, 0,
-      "a separately tombstoned owner cannot acquire a v1.2 grant");
+    assert.equal(purgedGrant.rows[0].count, 0,
+      "a purged owner cannot acquire a v1.2 grant");
 
     const uploadAuthorizationReceipt = await dispatch(request({
       url: uploadAuthorizationUrl,
@@ -4731,7 +4703,6 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
       try { await primaryPool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`); } catch {}
     }
     await primaryPool.end();
-    await ledgerPool.end();
     if (temporary) await rm(temporary, { recursive: true, force: true });
   }
 });

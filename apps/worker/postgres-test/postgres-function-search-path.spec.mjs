@@ -13,7 +13,9 @@
 // stops the chain before 0062 and shows the failure, then lets the production
 // runner apply 0062 on top and writes through the same trigger: it passes only
 // with 0062. The second asserts the catalog invariant 0062 completes: every
-// function in a migrated primary and ledger schema pins its search_path.
+// function in a migrated primary schema pins its search_path, including the
+// two authority fences the append-only residue migration replaces. There is
+// no deletion-ledger role to migrate (D4, SIMP-4).
 
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
@@ -169,13 +171,13 @@ test("PG17 0011's active-participant trigger resolves its table without a sessio
   }
 });
 
-test("PG17 every function in the migrated primary and ledger schemas pins its search_path", {
+test("PG17 every function in the migrated primary schema pins its search_path", {
   skip: endpoint === null,
   timeout: 180_000,
 }, async () => {
   const pool = poolFor(endpoint, "pg-function-search-path-catalog-test");
   const suffix = randomBytes(6).toString("hex");
-  const schemas = { primary: `fn_search_path_p_${suffix}`, ledger: `fn_search_path_l_${suffix}` };
+  const schemas = { primary: `fn_search_path_p_${suffix}` };
   const created = [];
   try {
     for (const [role, schema] of Object.entries(schemas)) {
@@ -188,7 +190,19 @@ test("PG17 every function in the migrated primary and ledger schemas pins its se
          WHERE n.nspname = $1`, [schema]);
       assert.ok(functions.rows[0].n > 0, `${role} creates functions`);
       assert.deepEqual(await unpinnedFunctions(pool, schema), [], `every ${role} function pins its search_path`);
+      const fences = await pool.query(`SELECT p.proname, p.proconfig
+          FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+         WHERE n.nspname = $1 AND p.proname IN ('community_daily_authority_fence', 'community_graph_preview_authority_fence')
+         ORDER BY p.proname`, [schema]);
+      assert.deepEqual(fences.rows.map((row) => row.proname),
+        ["community_daily_authority_fence", "community_graph_preview_authority_fence"]);
+      for (const row of fences.rows) {
+        assert.equal(row.proconfig?.length, 1, row.proname);
+        assert.match(row.proconfig[0], new RegExp(`^search_path="?${schema}"?, pg_catalog$`, "u"), row.proname);
+      }
     }
+    await assert.rejects(applyPostgresMigrations({ role: "ledger", schema: schemas.primary, pool }),
+      { code: "POSTGRES_MIGRATION_ROLE_INVALID" });
   } finally {
     for (const schema of created.reverse()) {
       await pool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => {});

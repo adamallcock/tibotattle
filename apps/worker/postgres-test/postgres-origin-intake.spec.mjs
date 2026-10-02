@@ -198,7 +198,6 @@ async function withOrigin(run) {
   const socket = await localSocket();
   const base = new pg.Pool(localPoolOptions(socket, 4, "pg-origin-intake-test"));
   const primarySchema = `tibotattle_fastpath_intake_${randomBytes(5).toString("hex")}`;
-  const ledgerSchema = `${primarySchema}_ledger`;
   const created = [];
   const pools = [];
   let runtime;
@@ -208,13 +207,12 @@ async function withOrigin(run) {
     );
     assert.equal(server.rows[0]?.address, null, "qualification requires the local Unix socket");
     assert.equal(Math.floor(server.rows[0].version / 10_000), 17, "the disposable socket must be PostgreSQL 17");
-    for (const schema of [primarySchema, ledgerSchema]) {
+    for (const schema of [primarySchema]) {
       await base.query(`CREATE SCHEMA "${schema}"`);
       created.push(schema);
     }
     const primary = await applyPostgresMigrations({ role: "primary", schema: primarySchema, pool: base });
-    assert.equal(primary.migrations.at(-1)?.name, "0063_enrollment_grants_erased_redeemer.sql");
-    await applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool: base });
+    assert.equal(primary.migrations.at(-1)?.name, "0064_append_only_residue.sql");
     const t = (name) => `"${primarySchema}"."${name}"`;
     await base.query(`UPDATE ${t("collection_controls")}
         SET revision=2, control_state='operational', enrollment_enabled=true, upload_registration_enabled=true,

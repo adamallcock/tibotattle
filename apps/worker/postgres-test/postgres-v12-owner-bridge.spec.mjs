@@ -80,10 +80,6 @@ function baselineMigrationsRoot() {
       .sort();
     assert.ok(names.includes(AUTHORITY_MIGRATION), "the bridge applies on top of the owner-journal authority");
     for (const name of names) await copyFile(join(MIGRATIONS_ROOT, "primary", name), join(directory, "primary", name));
-    await mkdir(join(directory, "ledger"), { mode: 0o700 });
-    for (const name of (await readdir(join(MIGRATIONS_ROOT, "ledger"))).filter((entry) => entry.endsWith(".sql"))) {
-      await copyFile(join(MIGRATIONS_ROOT, "ledger", name), join(directory, "ledger", name));
-    }
     return directory;
   })();
   return baselineRoot;
@@ -171,26 +167,22 @@ function tableIn(schema) {
 
 /**
  * Run `body` against a fresh schema at the pre-bridge baseline, plus 0055
- * unless `bridged` is false. `ledger` also creates a migrated ledger schema.
+ * unless `bridged` is false.
  */
-async function withSchema(body, { bridged = true, ledger = false } = {}) {
+async function withSchema(body, { bridged = true } = {}) {
   const pool = await connection();
   const schema = `v12_bridge_${randomBytes(6).toString("hex")}`;
-  const ledgerSchema = `${schema}_ledger`;
   const quoted = `"${schema}"`;
   const table = tableIn(schema);
   await pool.query(`CREATE SCHEMA ${quoted}`);
-  if (ledger) await pool.query(`CREATE SCHEMA "${ledgerSchema}"`);
   try {
     const rootDirectory = await baselineMigrationsRoot();
     const applied = await applyPostgresMigrations({ role: "primary", schema, pool, rootDirectory });
     assert.ok(applied.migrations.at(-1).version < BRIDGE_VERSION);
-    if (ledger) await applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool, rootDirectory });
     if (bridged) await applyBridge(pool, schema);
-    await body({ pool, schema, ledgerSchema, quoted, table });
+    await body({ pool, schema, quoted, table });
   } finally {
     await pool.query(`DROP SCHEMA IF EXISTS ${quoted} CASCADE`);
-    if (ledger) await pool.query(`DROP SCHEMA IF EXISTS "${ledgerSchema}" CASCADE`);
   }
 }
 
@@ -317,7 +309,7 @@ async function readyDay(pool, table, { participantId, deviceId }, day) {
 async function prepareActivation(schema, principal, days) {
   const { createPostgresTypedV12Domain } = await workerModule("/src/postgres-typed-v12-domain.ts");
   const domainOn = (pool) => createPostgresTypedV12Domain(pool, {
-    schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
+    schema: { primarySchema: schema },
   });
   const domain = domainOn(await connection());
   const predecessor = await domain.createPredecessor(principal);
@@ -838,7 +830,7 @@ test("PG17 without storage_source_state nothing is minted; the pending read and 
   { skip: SKIP, timeout: 180_000 }, async () => withSchema(async ({ pool, schema, quoted, table }) => {
     const { readPostgresV12OwnerBridgePending, runPostgresV12OwnerBridgeBackfill, PostgresV12OwnerBridgeError } =
       await workerModule("/src/postgres-v12-owner-bridge.ts");
-    const options = { pool, schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` } };
+    const options = { pool, schema: { primarySchema: schema } };
     await activateRuntime(pool, table);
     const owner = await seedAccountless(pool, table);
     const activation = await activateDomain(schema, owner, [await readyDay(pool, table, owner, DAY_1)]);
@@ -960,7 +952,7 @@ test("PG17 a transfer-role session mints nothing and cannot run the backfill",
         "the head's input_versions effect still applies in a transfer session");
         await refuses(memberPool.query(`SELECT ${quoted}.storage_v12_bridge_backfill(10)`), "storage_v12_bridge_transfer_session");
         await assert.rejects(runPostgresV12OwnerBridgeBackfill({
-          pool: memberPool, schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` }, deadlineMs: Date.now() + 60_000,
+          pool: memberPool, schema: { primarySchema: schema }, deadlineMs: Date.now() + 60_000,
         }), (error) => error instanceof PostgresV12OwnerBridgeError && error.code === "V12_OWNER_BRIDGE_TRANSFER_SESSION");
       } finally {
         await memberPool.end();
@@ -1028,72 +1020,10 @@ function instrumentedPool(pool, pauseAt) {
   };
 }
 
-test("PG17 concurrent v1.2 activation and accountless erasure serialize without deadlock or unique violation",
-  { skip: SKIP, timeout: 240_000 }, async () => withSchema(async ({ pool, schema, ledgerSchema, table }) => {
-    const { erasePostgresAccountlessOwner } = await workerModule("/src/postgres-accountless-owner-erasure.ts");
-    await initializeSource(pool, table, 5);
-    await activateRuntime(pool, table);
-    const objectStore = { async deleteBatch() {} };
-    for (const order of ["activation-first", "erasure-first"]) {
-      const owner = await seedAccountless(pool, table);
-      const day1 = await readyDay(pool, table, owner, DAY_1);
-      await activateDomain(schema, owner, [day1]);
-      const ownerDigest = (await link(pool, table, owner.participantId)).owner_digest;
-      const day2 = await readyDay(pool, table, owner, DAY_2);
-
-      const prepared = await prepareActivation(schema, owner, [day1, day2]);
-      const activationPool = instrumentedPool(pool, order === "activation-first"
-        ? (text) => /^\s*INSERT INTO\s+"[^"]+"\."telemetry_v12_domain_heads"/u.test(text) : undefined);
-      const erasurePool = instrumentedPool(pool, order === "erasure-first"
-        ? (text) => text.includes("SET state='deleting', deletion_session_id=$2") : undefined);
-      const activate = () => prepared.activate(activationPool)
-        .then((value) => ({ ok: true, value }), (error) => ({ ok: false, error }));
-      const erase = () => erasePostgresAccountlessOwner({
-        primaryPool: erasurePool, ledgerPool: pool, objectStore, participantId: owner.participantId,
-        schema: { primarySchema: schema, ledgerSchema },
-      }).then((value) => ({ ok: true, value }), (error) => ({ ok: false, error }));
-
-      let activation;
-      let erasure;
-      if (order === "activation-first") {
-        const pending = activate();
-        await activationPool.reached;
-        [erasure, activation] = await Promise.all([erase(), pending]);
-        assert.equal(activation.ok, true, "the activation that held the participant first commits");
-        assert.equal((await receipts(pool, table, owner.participantId)).length, 0,
-          "the erasure that followed removed the owner's receipts with the owner");
-      } else {
-        const pending = erase();
-        await erasurePool.reached;
-        [activation, erasure] = await Promise.all([activate(), pending]);
-        assert.equal(activation.ok, false, "an activation behind the erasure fence is refused");
-        assert.equal(activation.error?.status, 401);
-        assert.equal(activation.error?.code, "DEVICE_AUTH_INVALID");
-      }
-      assert.equal((order === "activation-first" ? activationPool : erasurePool).state.contended, true,
-        `the second operation waited on the first one's locks (${order})`);
-      assert.equal(erasure.ok, true, `erasure completed or reported a resumable state (${order})`);
-      assert.ok(erasure.value.status === "complete"
-        || (erasure.value.status === "incomplete" && erasure.value.code === "ACCOUNTLESS_OWNER_ERASURE_ANALYTICS_RETIREMENT_FAILED"),
-      `erasure outcome ${JSON.stringify(erasure.value)}`);
-      assert.equal((await pool.query(`SELECT count(*)::int AS count FROM ${table("participants")} WHERE id=$1`,
-        [owner.participantId])).rows[0].count, 0, "the owner is erased");
-      assert.equal((await pool.query(`SELECT count(*)::int AS count FROM ${table("storage_owner_erasure_receipts")}
-        WHERE owner_digest=$1`, [ownerDigest])).rows[0].count, 1);
-      const driverErrors = [...activationPool.errors, ...erasurePool.errors];
-      assert.equal(driverErrors.includes("40P01"), false, `no deadlock (${order})`);
-      assert.equal(driverErrors.includes("23505"), false, `no unique violation reaches the driver (${order})`);
-      const ownerRows = (await journal(pool, table)).filter((row) => row.owner_digest === ownerDigest);
-      assert.deepEqual(ownerRows.map(({ kind, revision }) => [kind, revision]),
-        order === "activation-first" ? [["owner-active", 1], ["owner-active", 2]] : [["owner-active", 1]],
-        "the journal keeps exactly one owner-active per bridged head");
-    }
-  }, { ledger: true }));
-
 test("PG17 the backfill bridges one head per transaction and never waits on another owner while the source is held",
   { skip: SKIP, timeout: 240_000 }, async () => withSchema(async ({ pool, schema, quoted, table }) => {
     const { runPostgresV12OwnerBridgeBackfill } = await workerModule("/src/postgres-v12-owner-bridge.ts");
-    const options = { pool, schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` } };
+    const options = { pool, schema: { primarySchema: schema } };
     await activateRuntime(pool, table);
     // Heads accepted before storage_source_state existed, as at cutover, for
     // owners a < b < c in "C" order. c's head came through the real path so
@@ -1259,8 +1189,7 @@ test("PG17 a retained v1.2 owner is bridged once, and a marker retirement under 
       await retirement.rollback();
     }
     assert.equal((await directBridge).rows[0].bridged, false, "the retired owner is not bridged after the wait");
-    assert.deepEqual(await runPostgresV12OwnerBridgeBackfill({ pool, schema: { primarySchema: schema,
-      ledgerSchema: `${schema}_ledger` }, deadlineMs: Date.now() + 60_000 }),
+    assert.deepEqual(await runPostgresV12OwnerBridgeBackfill({ pool, schema: { primarySchema: schema }, deadlineMs: Date.now() + 60_000 }),
     { status: "complete", bridged: 0, batches: 0, pending: 0 });
 
     const keptState = await assertOneRowPerReceipt(pool, table, kept.participantId);
@@ -1332,7 +1261,7 @@ test("PG17 a bridge never outlives a revocation under way: the backfill skips it
 test("PG17 the backfill inspects at most its limit and a run that makes no progress stops",
   { skip: SKIP, timeout: 180_000 }, async () => withSchema(async ({ pool, schema, quoted, table }) => {
     const { runPostgresV12OwnerBridgeBackfill } = await workerModule("/src/postgres-v12-owner-bridge.ts");
-    const options = { pool, schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` } };
+    const options = { pool, schema: { primarySchema: schema } };
     const run = randomUUID();
     const owners = [];
     for (const name of ["p1", "p2", "p3"]) {

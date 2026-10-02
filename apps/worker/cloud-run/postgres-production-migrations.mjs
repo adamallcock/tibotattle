@@ -23,8 +23,8 @@
  *
  * Primary role only. Decisions D2, D4 and D6 (2026-09-26) remove the separate
  * deletion ledger: there is no ledger instance or schema in production, so
- * this job never reads, creates or migrates one, refuses any LEDGER_* setting,
- * and ignores the ledger migration directory the image still carries.
+ * this job never reads, creates or migrates one and refuses any LEDGER_*
+ * setting. The canonical runner and the image are primary-only (LEAD-SIMP).
  *
  * Ordering guard (D6): the promoted primary 0053 carries the analytics
  * erasure fences that the SIMP work removes with a forward migration. Until
@@ -34,15 +34,16 @@
  * ends in SIMP_RESIDUE_MIGRATION_SUFFIX and its number comes after
  * SIMP_RESIDUE_PREDECESSOR, the last migration numbered before it (the
  * wave-2 integration promoted primary 0063, so the residue is
- * NNNN_append_only_residue.sql with NNNN >= 0064). The suffix is a proposal
- * awaiting the owner's confirmation (wave-3 SIMP OD-1); another name changes
- * the suffix and its checks in the same change.
+ * NNNN_append_only_residue.sql with NNNN >= 0064). LEAD-SIMP lands it as
+ * 0064_append_only_residue.sql. The name is provisional, awaiting the owner's
+ * confirmation (wave-3 SIMP OD-1); another name changes the file, its
+ * CONTRACT_MIGRATIONS key, the suffix and its checks in the same change.
  *
  * Expand-compatibility: the migrate step runs while the previous revision
  * still serves, so a migration that drops, renames or tightens (SET NOT NULL,
  * or a NOT NULL column without a default) is a contract change. Each one must
  * be listed, with its sha256, in the reviewed CONTRACT_MIGRATIONS map; the
- * promoted tail 0001-0063 is classified once below. That review covers the
+ * promoted tail 0001-0064 is classified once below. That review covers the
  * SQL a previous revision issues, not its storage fence. The only runtime
  * receipt fence that exists (readSchemaReceipt in postgres-test-dispatch.mjs)
  * admits a migration history only when it equals the image's manifest
@@ -136,7 +137,7 @@ export const CONTRACT_OPERATION_KINDS = Object.freeze([
 ]);
 
 /**
- * Reviewed contract migrations of the promoted primary tail (0001-0063),
+ * Reviewed contract migrations of the promoted primary tail (0001-0064),
  * classified with classifyContractOperations and pinned by sha256. A
  * production, staging or scratch database receives this tail in its first
  * migrate, onto an empty schema before any revision serves it, so none of
@@ -269,6 +270,13 @@ export const CONTRACT_MIGRATIONS = Object.freeze({
     sha256: "0341b5a6b7165b918e7e18c11873243aff4906a81a8376a0ae46ec5f14007ce9",
     operations: Object.freeze(["drop", "add-constraint"]),
     reason: "replaces 0015's enrollment_grants_check1 (aborting unless its definition is exactly 0015's) with a state-shape check that only stops requiring the redeemer of a redeemed grant, which every existing row satisfies, plus a trigger that refuses a redeemed grant without a redeemer with the same 23514 class except on an INSERT inside an import transfer session; at the SQL level every write a previous revision makes (issue with every field NULL, redeem with a redeemer, a participant delete's SET NULL) is admitted or refused as before; a previous revision behind an exact-history receipt fence still refuses the migrated schema until the roll (module header)",
+  }),
+  // LEAD-SIMP append-only residue. PROVISIONAL name (owner decision OD-1):
+  // a rename changes this key, the file and its sha256 together.
+  "0064_append_only_residue.sql": Object.freeze({
+    sha256: "e2bec25e14f54678c9a91a6607ac99af019426b2bcd8826a8c41986abfc54f76",
+    operations: Object.freeze(["drop", "add-constraint"]),
+    reason: "drops the 0053 erasure fences, receipts, terminal watermarks and floor (the daily and preview fence functions are replaced without the floor in the same transaction), the participant-erasure lease index, the re-enrollment cooldowns, the readiness sweeps and the PT-1 contract's ledger columns, and pins retention_state to restore_replay_complete and zero suppressed participants; a residue row, a non-zero watermark, a retention row outside the pins or a contract registered with ledger columns aborts it with nothing changed. On production, staging and scratch targets the whole tail including this migration lands in the first migrate onto an empty schema, so only test targets ever apply it under a serving revision, and there the exact-history receipt fence already makes that revision refuse every storage-gated route until the roll (module header); the only reader of a dropped object in a previous revision is the cloud-run-iam Google enrollment's cooldown read, mounted only when the cloud-run-iam dependency is present, which no fast-path, edge-test or production composition mounts; the pinned retention values are the 0049 seed and no PostgreSQL writer changes them",
   }),
 });
 
@@ -1024,6 +1032,12 @@ export function verifyProductionMigrationReceipt(receipt) {
     && (receipt.target.kind === "environment" || receipt.target.kind === "scratch")
     && typeof receipt.target.instanceConnectionName === "string"
     && instanceParts(receipt.target.instanceConnectionName) !== null
+    // A scratch target is exactly a '-rehearsal-xxxxxxxx' instance and an
+    // environment target never is (validateProductionMigrationEnvironment),
+    // so the kind cannot be relabelled now that every manifest carries the
+    // SIMP residue.
+    && (receipt.target.kind === "scratch")
+      === SCRATCH_INSTANCE_PATTERN.test(instanceParts(receipt.target.instanceConnectionName).instance)
     && typeof receipt.target.database === "string" && DATABASE_PATTERN.test(receipt.target.database)
     && typeof receipt.target.schema === "string" && SCHEMA_PATTERN.test(receipt.target.schema)
     && hasExactKeys(receipt.migrations, MIGRATIONS_KEYS)
@@ -1106,9 +1120,12 @@ export async function runProductionMigrations({ env = process.env, dependencies 
     if (OWN_ERRORS.has(error)) throw error;
     fail("POSTGRES_PRODUCTION_MIGRATIONS_MANIFEST_INVALID");
   }
-  const contractReviewed = assertExpandCompatible(migrations, dependencies.contractMigrations ?? CONTRACT_MIGRATIONS);
+  // The residue gate first: an image without it is reported as such, even
+  // though CONTRACT_MIGRATIONS (which reviews the residue) would also call
+  // its manifest stale.
   const residue = simpResidueMigration(migrations);
   if (config.target.kind !== "scratch" && residue === null) fail("PRODUCTION_SIMP_RESIDUE_MISSING");
+  const contractReviewed = assertExpandCompatible(migrations, dependencies.contractMigrations ?? CONTRACT_MIGRATIONS);
 
   const createConnector = dependencies.createConnector ?? defaultCreateConnector;
   const createPool = dependencies.createPool ?? defaultCreatePool;

@@ -246,8 +246,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph cohort inventory", 
     await pool.query(`UPDATE ${sqlSchema}.telemetry_v12_day_manifests
       SET state='ready', ready_at=$2 WHERE id=$1`, [manifestId, now]);
 
-    const domain = createPostgresTypedV12Domain(pool, { schema: { primarySchema: schema,
-      ledgerSchema: `${schema}_ledger` } });
+    const domain = createPostgresTypedV12Domain(pool, { schema: { primarySchema: schema } });
     const principal = { participantId, deviceId };
     const predecessor = await domain.createPredecessor(principal);
     const domainManifest = {
@@ -344,7 +343,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph cohort inventory", 
 
     const first = await listPostgresCommunityGraphCohortPage(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE,
-      limit: 2, schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
+      limit: 2, schema: { primarySchema: schema },
     });
     expect(first).toMatchObject({
       available: true,
@@ -378,7 +377,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph cohort inventory", 
 
     const second = await listPostgresCommunityGraphCohortPage(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE,
-      after: first.next, limit: 2, schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
+      after: first.next, limit: 2, schema: { primarySchema: schema },
     });
     expect(second).toMatchObject({ scannedOwnerCount: 1, owners: [{ ownerDigest: "3".repeat(64) }], next: null });
     assert.equal(first.owners.length + second.owners.length, 3,
@@ -400,16 +399,16 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph cohort inventory", 
     expect(await publishPostgresCommunityModelDay(pool, {
       sourcePin: first.sourcePin,
       members: publicationMembers(initialOwners), day: DAY,
-      schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
+      schema: { primarySchema: schema },
     })).toMatchObject({ state: "deferred", reason: "source_changed", memberCount: 3 });
 
     const currentFirst = await listPostgresCommunityGraphCohortPage(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE,
-      limit: 2, schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
+      limit: 2, schema: { primarySchema: schema },
     });
     const currentSecond = await listPostgresCommunityGraphCohortPage(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE,
-      after: currentFirst.next, limit: 2, schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
+      after: currentFirst.next, limit: 2, schema: { primarySchema: schema },
     });
     const currentOwners = [...currentFirst.owners, ...currentSecond.owners];
     expect(currentFirst.sourcePin.collectionRevision).toBe(first.sourcePin.collectionRevision + 1);
@@ -430,7 +429,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph cohort inventory", 
         sourceNamespace: SOURCE_NAMESPACE,
         limit: 2,
         day: DAY,
-        schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
+        schema: { primarySchema: schema },
       });
       concurrentPublications = await Promise.all([publish(), publish()]);
     } finally {
@@ -456,7 +455,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph cohort inventory", 
       sourceId: SOURCE_ID,
       sourceNamespace: SOURCE_NAMESPACE,
       day: DAY,
-      schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
+      schema: { primarySchema: schema },
     })).toMatchObject({ day: DAY, fittedParticipantCount: 3, values: [["gpt-6-astra", 1000, 3]] });
     const memberReadbackPages = readQueries.filter((sql) =>
       sql.includes("FROM ") && sql.includes(".analytics_publication_owner_members member")
@@ -470,21 +469,21 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph cohort inventory", 
 
     const restart = await listPostgresCommunityGraphCohortPage(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE,
-      limit: 1, schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
+      limit: 1, schema: { primarySchema: schema },
     });
     assert.ok(restart.next);
     await pool.query(`UPDATE ${sqlSchema}.collection_controls
       SET revision=revision+1, updated_at=clock_timestamp() WHERE singleton=1`);
     await expect(listPostgresCommunityGraphCohortPage(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE,
-      after: restart.next, limit: 1, schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
+      after: restart.next, limit: 1, schema: { primarySchema: schema },
     })).rejects.toMatchObject({
       code: "POSTGRES_COMMUNITY_GRAPH_COHORT_SOURCE_CHANGED",
     });
 
     await expect(listPostgresCommunityGraphCohortPage(pool, {
       sourceId: SOURCE_ID, sourceNamespace: `${SOURCE_NAMESPACE}-missing-receipts`,
-      schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
+      schema: { primarySchema: schema },
     })).rejects.toMatchObject({ code: "POSTGRES_COMMUNITY_GRAPH_COHORT_UNAVAILABLE" });
 
     // A journal row that moves only the sequence, not the source authority
@@ -507,7 +506,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph cohort inventory", 
     const scanEpoch = await catchUpCursor(scanStart.rows[0].sequence);
     const newAuthorityScan = await listPostgresCommunityGraphCohortPage(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE,
-      limit: 1, schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
+      limit: 1, schema: { primarySchema: schema },
     });
     assert.ok(newAuthorityScan.next);
     await pool.query(`SELECT ${sqlSchema}.storage_journal_append('source-updated',$1,$2,$2,$2)`,
@@ -520,7 +519,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph cohort inventory", 
     assert.equal(Number(epochAfter.rows[0].epoch), scanEpoch, "the new row moves the sequence only");
     await expect(listPostgresCommunityGraphCohortPage(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE,
-      after: newAuthorityScan.next, limit: 1, schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
+      after: newAuthorityScan.next, limit: 1, schema: { primarySchema: schema },
     })).rejects.toMatchObject({ code: "POSTGRES_COMMUNITY_GRAPH_COHORT_SOURCE_CHANGED" });
   }, 120_000);
 
@@ -531,14 +530,14 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph cohort inventory", 
     await catchUpCursor(latest.rows[0].sequence);
     const first = await listPostgresCommunityGraphCohortPage(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE,
-      limit: 1, schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
+      limit: 1, schema: { primarySchema: schema },
     });
     assert.ok(first.next);
     await pool.query(`UPDATE ${sqlSchema}.telemetry_v12_runtime SET state='staged' WHERE id=1`);
     await pool.query(`UPDATE ${sqlSchema}.telemetry_v12_typed_runtime SET state='staged' WHERE id=1`);
     await expect(listPostgresCommunityGraphCohortPage(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE,
-      after: first.next, limit: 1, schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
+      after: first.next, limit: 1, schema: { primarySchema: schema },
     })).rejects.toMatchObject({ code: "POSTGRES_COMMUNITY_GRAPH_COHORT_SOURCE_CHANGED" });
   }, 120_000);
 
@@ -551,14 +550,14 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph cohort inventory", 
 
     const first = await listPostgresCommunityGraphCohortPage(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE,
-      limit: 1, schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
+      limit: 1, schema: { primarySchema: schema },
     });
     expect(first.sourcePin).toMatchObject({ accountlessAuthorizationCount: 1 });
     assert.ok(first.sourcePin.nextAccountlessAuthorizationExpiry);
     assert.ok(first.next);
     const second = await listPostgresCommunityGraphCohortPage(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE,
-      after: first.next, limit: 1, schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
+      after: first.next, limit: 1, schema: { primarySchema: schema },
     });
     const allOwners = [...first.owners, ...second.owners];
     for (const owner of allOwners) await writeModelResult(owner, first.sourcePin.sequence);
@@ -577,11 +576,11 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph cohort inventory", 
       SET expires_at=$2 WHERE enrollment_device_id=$1`, [auth.deviceId, expired]);
     await expect(listPostgresCommunityGraphCohortPage(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE,
-      after: first.next, limit: 1, schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
+      after: first.next, limit: 1, schema: { primarySchema: schema },
     })).rejects.toMatchObject({ code: "POSTGRES_COMMUNITY_GRAPH_COHORT_SOURCE_CHANGED" });
     expect(await publishPostgresCommunityModelDay(pool, {
       sourcePin: first.sourcePin, members: publisherMembers, day: DAY,
-      schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
+      schema: { primarySchema: schema },
     })).toMatchObject({ state: "deferred", reason: "source_changed", memberCount: 2 });
   }, 120_000);
 });

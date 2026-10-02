@@ -46,6 +46,11 @@ const PAIRING_BODY_READ_POLICY = Object.freeze({
   maximumTotalMilliseconds: 15_000,
   maximumIdleMilliseconds: 5_000,
 });
+// The named A2 test deployment. Its `postgres.ledger` entry is a frozen
+// identity of the test estate's ledger instance (retired with the deletion
+// ledger, decisions D2, D4 and D6; owner action OA-4): no runtime path reads
+// it, and the production refusal lists keep naming it so no primary setting
+// can reuse it.
 export const CLOUD_RUN_IAM_TEST_TARGET = Object.freeze({
   project: "tibotattle",
   region: "us-east1",
@@ -95,17 +100,28 @@ function validateExpectedMigrations(migrations, role) {
   return Object.freeze(expected);
 }
 
+/**
+ * The one application schema. Any other key (a stale caller's retired
+ * second schema included) is refused instead of being ignored.
+ */
 function validatedSchemas(schemaOptions = {}) {
+  if (schemaOptions === null || typeof schemaOptions !== "object"
+      || Object.keys(schemaOptions).some((key) => key !== "primarySchema")) {
+    configurationError("POSTGRES_TEST_SCHEMA_CONFIGURATION_INVALID");
+  }
   const primary = schemaOptions.primarySchema ?? "tibotattle";
-  const ledger = schemaOptions.ledgerSchema ?? "tibotattle_ledger";
   const invalid = (value) => typeof value !== "string"
     || !SCHEMA_IDENTIFIER.test(value)
     || value.startsWith("pg_")
     || value === "information_schema";
-  if (invalid(primary) || invalid(ledger) || primary === ledger) {
+  if (invalid(primary)) {
     configurationError("POSTGRES_TEST_SCHEMA_CONFIGURATION_INVALID");
   }
-  return Object.freeze({ primary, ledger });
+  return Object.freeze({ primary });
+}
+
+function validPool(pool) {
+  return pool !== null && typeof pool === "object" && typeof pool.connect === "function";
 }
 
 function schemaTable(schema) {
@@ -249,66 +265,65 @@ async function readSchemaReceipt(pool, schema, expected) {
 }
 
 /**
+ * The one migration manifest the test routes admit: the primary receipts of
+ * the image (manifest v2). A manifest that still carries a second role is
+ * refused, so a stale composition cannot pass a ledger expectation through.
+ */
+function validatedExpectedManifest(expectedMigrations) {
+  if (expectedMigrations === null || typeof expectedMigrations !== "object"
+      || Object.keys(expectedMigrations).join(",") !== "primary") {
+    configurationError("POSTGRES_TEST_PRIMARY_MIGRATION_RECEIPT_INVALID");
+  }
+  return validateExpectedMigrations(expectedMigrations.primary, "primary");
+}
+
+/**
  * The storage gate every PostgreSQL test route runs before it touches a
- * pool: both the primary and the ledger migration receipts must equal the
- * expected manifests, read in a bounded read-only transaction. The returned
- * assertStorageCurrent() resolves when both are current and otherwise
- * throws 503 BACKEND_STORAGE_UNAVAILABLE, the refusal the v1.2 dispatch
- * gives. Route modules composed beside the dispatch (the upload-authorization
- * route module, the v1.1 intake routes) bind this check so a stale or newer
- * schema refuses them exactly as it refuses the built-in routes.
+ * pool: the primary migration receipt must equal the expected manifest,
+ * read in a bounded read-only transaction. There is no ledger receipt
+ * (decisions D2, D4 and D6). The returned assertStorageCurrent() resolves
+ * when it is current and otherwise throws 503 BACKEND_STORAGE_UNAVAILABLE,
+ * the refusal the v1.2 dispatch gives. Route modules composed beside the
+ * dispatch (the upload-authorization route module, the v1.1 intake routes)
+ * bind this check so a stale or newer schema refuses them exactly as it
+ * refuses the built-in routes.
  */
 export function createPostgresTestStorageReceiptCheck({
   primaryPool,
-  ledgerPool,
   schemaOptions,
   expectedMigrations,
+  ...retired
 }) {
-  if (primaryPool === null || typeof primaryPool !== "object"
-      || typeof primaryPool.connect !== "function"
-      || ledgerPool === null || typeof ledgerPool !== "object"
-      || typeof ledgerPool.connect !== "function"
-      || primaryPool === ledgerPool) {
+  if (!validPool(primaryPool) || Object.keys(retired).length !== 0) {
     configurationError("POSTGRES_TEST_POOLS_INVALID");
   }
   const schemas = validatedSchemas(schemaOptions);
-  const expected = Object.freeze({
-    primary: validateExpectedMigrations(expectedMigrations?.primary, "primary"),
-    ledger: validateExpectedMigrations(expectedMigrations?.ledger, "ledger"),
-  });
+  const expected = validatedExpectedManifest(expectedMigrations);
   return async function assertStorageCurrent() {
-    const [primaryReceipt, ledgerReceipt] = await Promise.all([
-      readSchemaReceipt(primaryPool, schemas.primary, expected.primary),
-      readSchemaReceipt(ledgerPool, schemas.ledger, expected.ledger),
-    ]);
-    if (primaryReceipt !== "current" || ledgerReceipt !== "current") throw storageUnavailable();
+    const primaryReceipt = await readSchemaReceipt(primaryPool, schemas.primary, expected);
+    if (primaryReceipt !== "current") throw storageUnavailable();
   };
 }
 
 /**
  * Construct a read-only health dispatcher for a private local GCP test host.
- * It deliberately receives pools only: unsupported requests cannot reach the
- * Worker handler or any D1 binding.
+ * It deliberately receives one pool only: unsupported requests cannot reach
+ * the Worker handler or any D1 binding. Body schema
+ * gcp-postgres-test-health-v2: the primary receipt only (v1 also carried the
+ * retired ledger receipt).
  */
 export function createPostgresTestHealthDispatch({
   primaryPool,
-  ledgerPool,
   schemaOptions,
   expectedMigrations,
   privateOrigin,
+  ...retired
 }) {
-  if (primaryPool === null || typeof primaryPool !== "object"
-      || typeof primaryPool.connect !== "function"
-      || ledgerPool === null || typeof ledgerPool !== "object"
-      || typeof ledgerPool.connect !== "function"
-      || primaryPool === ledgerPool) {
+  if (!validPool(primaryPool) || Object.keys(retired).length !== 0) {
     configurationError("POSTGRES_TEST_POOLS_INVALID");
   }
   const schemas = validatedSchemas(schemaOptions);
-  const expected = Object.freeze({
-    primary: validateExpectedMigrations(expectedMigrations?.primary, "primary"),
-    ledger: validateExpectedMigrations(expectedMigrations?.ledger, "ledger"),
-  });
+  const expected = validatedExpectedManifest(expectedMigrations);
   if (!isAllowedPostgresTestOrigin(privateOrigin)) {
     configurationError("POSTGRES_TEST_PRIVATE_ORIGIN_INVALID");
   }
@@ -323,13 +338,10 @@ export function createPostgresTestHealthDispatch({
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
     }
 
-    const [primary, ledger] = await Promise.all([
-      readSchemaReceipt(primaryPool, schemas.primary, expected.primary),
-      readSchemaReceipt(ledgerPool, schemas.ledger, expected.ledger),
-    ]);
-    const ready = primary === "current" && ledger === "current";
+    const primary = await readSchemaReceipt(primaryPool, schemas.primary, expected);
+    const ready = primary === "current";
     return json(ready ? 200 : 503, {
-      schemaVersion: "gcp-postgres-test-health-v1",
+      schemaVersion: "gcp-postgres-test-health-v2",
       scope: "postgres_schema_and_migrations_only",
       status: ready ? "ready" : "not_ready",
       workerApplicationReady: false,
@@ -337,11 +349,7 @@ export function createPostgresTestHealthDispatch({
         postgresMajor: POSTGRES_MAJOR_REQUIRED,
         primaryMigrationReceipt: {
           status: primary,
-          version: expected.primary.length,
-        },
-        ledgerMigrationReceipt: {
-          status: ledger,
-          version: expected.ledger.length,
+          version: expected.length,
         },
       },
     });
@@ -526,7 +534,6 @@ async function readPersonalDeviceRevocationId(request, readBoundedRequestBody, m
 /** Private Cloud Run test routes for Worker-compatible personal device reads and revocation. */
 export function createPostgresTestParticipantDevicesDispatch({
   primaryPool,
-  ledgerPool,
   schemaOptions,
   authenticatePostgresPersonalSession,
   assertPostgresPersonalSessionCsrf,
@@ -534,22 +541,17 @@ export function createPostgresTestParticipantDevicesDispatch({
   revokePostgresParticipantDevice,
   readBoundedRequestBody,
   maxRequestBytes,
-  hasPostgresDeletionTombstone,
   healthDispatch,
   privateOrigin,
 }) {
   if (primaryPool === null || typeof primaryPool !== "object"
       || typeof primaryPool.connect !== "function"
-      || ledgerPool === null || typeof ledgerPool !== "object"
-      || typeof ledgerPool.connect !== "function"
-      || primaryPool === ledgerPool
       || typeof authenticatePostgresPersonalSession !== "function"
       || typeof assertPostgresPersonalSessionCsrf !== "function"
       || typeof listPostgresParticipantDevices !== "function"
       || typeof revokePostgresParticipantDevice !== "function"
       || typeof readBoundedRequestBody !== "function"
       || !Number.isSafeInteger(maxRequestBytes) || maxRequestBytes < 1
-      || typeof hasPostgresDeletionTombstone !== "function"
       || typeof healthDispatch !== "function") {
     configurationError("POSTGRES_TEST_PARTICIPANT_DEVICES_DISPATCH_CONFIGURATION_INVALID");
   }
@@ -595,14 +597,6 @@ export function createPostgresTestParticipantDevicesDispatch({
           || typeof principal.participantId !== "string" || principal.participantId.length === 0) {
         throw storageUnavailable();
       }
-      if (await hasPostgresDeletionTombstone(
-        ledgerPool,
-        principal.participantId,
-        Date.now(),
-        { schema: { ledgerSchema: schemas.ledger } },
-      )) {
-        throw Object.assign(new Error("AUTH_INVALID"), { code: "AUTH_INVALID", status: 401 });
-      }
       const schema = { primarySchema: schemas.primary };
       if (isDeviceList) {
         const devices = await listPostgresParticipantDevices(
@@ -645,25 +639,19 @@ export function createPostgresTestParticipantDevicesDispatch({
 /** Private Cloud Run test routes for Worker-compatible social session read and logout. */
 export function createPostgresTestPersonalSessionDispatch({
   primaryPool,
-  ledgerPool,
   schemaOptions,
   authenticatePostgresPersonalSession,
   assertPostgresPersonalSessionCsrf,
   revokePostgresPersonalSession,
-  hasPostgresDeletionTombstone,
   healthDispatch,
   clearSessionCookie,
   privateOrigin,
 }) {
   if (primaryPool === null || typeof primaryPool !== "object"
       || typeof primaryPool.connect !== "function"
-      || ledgerPool === null || typeof ledgerPool !== "object"
-      || typeof ledgerPool.connect !== "function"
-      || primaryPool === ledgerPool
       || typeof authenticatePostgresPersonalSession !== "function"
       || typeof assertPostgresPersonalSessionCsrf !== "function"
       || typeof revokePostgresPersonalSession !== "function"
-      || typeof hasPostgresDeletionTombstone !== "function"
       || typeof healthDispatch !== "function"
       || typeof clearSessionCookie !== "string"
       || clearSessionCookie.length === 0) {
@@ -714,14 +702,6 @@ export function createPostgresTestPersonalSessionDispatch({
             || typeof principal.csrfToken !== "string" || principal.csrfToken.length === 0) {
           throw storageUnavailable();
         }
-        if (await hasPostgresDeletionTombstone(
-          ledgerPool,
-          principal.participantId,
-          Date.now(),
-          { schema: { ledgerSchema: schemas.ledger } },
-        )) {
-          throw personalDevicesRequestError(401, "AUTH_INVALID");
-        }
         return principal;
       };
 
@@ -771,13 +751,11 @@ export function createPostgresTestPersonalSessionDispatch({
 /** Private Cloud Run test route for issuing a session-bound device pairing. */
 export function createPostgresTestDevicePairingDispatch({
   primaryPool,
-  ledgerPool,
   schemaOptions,
   authenticatePostgresPersonalSession,
   assertPostgresPersonalSessionCsrf,
   assertAccountScopedLocalPreview,
   createPostgresDevicePairing,
-  hasPostgresDeletionTombstone,
   healthDispatch,
   readBoundedRequestBody,
   maxRequestBytes,
@@ -786,14 +764,10 @@ export function createPostgresTestDevicePairingDispatch({
 }) {
   if (primaryPool === null || typeof primaryPool !== "object"
       || typeof primaryPool.connect !== "function"
-      || ledgerPool === null || typeof ledgerPool !== "object"
-      || typeof ledgerPool.connect !== "function"
-      || primaryPool === ledgerPool
       || typeof authenticatePostgresPersonalSession !== "function"
       || typeof assertPostgresPersonalSessionCsrf !== "function"
       || typeof assertAccountScopedLocalPreview !== "function"
       || typeof createPostgresDevicePairing !== "function"
-      || typeof hasPostgresDeletionTombstone !== "function"
       || typeof healthDispatch !== "function"
       || typeof readBoundedRequestBody !== "function"
       || !Number.isSafeInteger(maxRequestBytes) || maxRequestBytes < 1) {
@@ -837,14 +811,6 @@ export function createPostgresTestDevicePairingDispatch({
           || typeof principal.csrfToken !== "string" || principal.csrfToken.length === 0
           || (principal.consentVersion !== null && typeof principal.consentVersion !== "string")) {
         throw storageUnavailable();
-      }
-      if (await hasPostgresDeletionTombstone(
-        ledgerPool,
-        principal.participantId,
-        Date.now(),
-        { schema: { ledgerSchema: schemas.ledger } },
-      )) {
-        throw personalDevicesRequestError(401, "AUTH_INVALID");
       }
       assertPostgresPersonalSessionCsrf(request, principal.csrfToken);
 
@@ -920,12 +886,10 @@ export function createPostgresTestDevicePairingDispatch({
 /** Private Cloud Run test route for granting social-device v1.2 consent. */
 export function createPostgresTestTelemetryV12ConsentDispatch({
   primaryPool,
-  ledgerPool,
   schemaOptions,
   authenticatePostgresPersonalSession,
   assertPostgresPersonalSessionCsrf,
   grantPostgresTelemetryV12Consent,
-  hasPostgresDeletionTombstone,
   healthDispatch,
   readBoundedRequestBody,
   maxRequestBytes,
@@ -933,13 +897,9 @@ export function createPostgresTestTelemetryV12ConsentDispatch({
 }) {
   if (primaryPool === null || typeof primaryPool !== "object"
       || typeof primaryPool.connect !== "function"
-      || ledgerPool === null || typeof ledgerPool !== "object"
-      || typeof ledgerPool.connect !== "function"
-      || primaryPool === ledgerPool
       || typeof authenticatePostgresPersonalSession !== "function"
       || typeof assertPostgresPersonalSessionCsrf !== "function"
       || typeof grantPostgresTelemetryV12Consent !== "function"
-      || typeof hasPostgresDeletionTombstone !== "function"
       || typeof healthDispatch !== "function"
       || typeof readBoundedRequestBody !== "function"
       || !Number.isSafeInteger(maxRequestBytes) || maxRequestBytes < 1) {
@@ -985,14 +945,6 @@ export function createPostgresTestTelemetryV12ConsentDispatch({
           || typeof principal.csrfToken !== "string" || principal.csrfToken.length === 0
           || (principal.consentVersion !== null && typeof principal.consentVersion !== "string")) {
         throw storageUnavailable();
-      }
-      if (await hasPostgresDeletionTombstone(
-        ledgerPool,
-        principal.participantId,
-        Date.now(),
-        { schema: { ledgerSchema: schemas.ledger } },
-      )) {
-        throw personalDevicesRequestError(401, "AUTH_INVALID");
       }
       assertPostgresPersonalSessionCsrf(request, principal.csrfToken);
       await assertPostgresUploadRegistrationEnabled(primaryPool, schemas.primary);
@@ -1061,7 +1013,6 @@ export function createPostgresTestTelemetryV12ConsentDispatch({
 /** Private Cloud Run test route for claiming a social device pairing. */
 export function createPostgresTestDevicePairingClaimDispatch({
   primaryPool,
-  ledgerPool,
   schemaOptions,
   claimPostgresDevicePairing,
   healthDispatch,
@@ -1071,9 +1022,6 @@ export function createPostgresTestDevicePairingClaimDispatch({
 }) {
   if (primaryPool === null || typeof primaryPool !== "object"
       || typeof primaryPool.connect !== "function"
-      || ledgerPool === null || typeof ledgerPool !== "object"
-      || typeof ledgerPool.connect !== "function"
-      || primaryPool === ledgerPool
       || typeof claimPostgresDevicePairing !== "function"
       || typeof healthDispatch !== "function"
       || typeof readBoundedRequestBody !== "function"
@@ -1136,12 +1084,11 @@ export function createPostgresTestDevicePairingClaimDispatch({
       }
       const result = await claimPostgresDevicePairing(
         primaryPool,
-        ledgerPool,
         request.headers.get("authorization"),
         body.deviceId,
         body.deviceSecretHash,
         request.headers.get("x-previous-device-authorization"),
-        { schema: { primarySchema: schemas.primary, ledgerSchema: schemas.ledger } },
+        { schema: { primarySchema: schemas.primary } },
       );
       if (result === null || typeof result !== "object"
           || typeof result.deviceId !== "string"
@@ -1768,8 +1715,9 @@ function createPostgresTestV12ContributionHandler({
  * body and fatal UTF-8 JSON; the envelope's registered pre-claim check
  * (an unregistered version gets the v1.2-only origin's refusal, before any
  * claim); then the upload-authorization claim, the claimed principal and
- * participant, the processing control, the deletion tombstone and the
- * format's transport floor. Only then does the registered handler run. As in
+ * participant, the processing control and the format's transport floor
+ * (there is no deletion-ledger tombstone read: a deleted participant has no
+ * claimable authorization). Only then does the registered handler run. As in
  * d43c8f92 handleContribution, no upload draws the device_sync attempt
  * limiter (RECOVERY, one global 20-per-minute key shared with every sync
  * read): production meters this route with the upload-ingress limiters and
@@ -1788,9 +1736,7 @@ async function handlePostgresTestContribution({
   admissionEnv,
   assertUploadIngressRequestAllowed,
   primaryPool,
-  ledgerPool,
   schema,
-  hasPostgresDeletionTombstone,
   claimPostgresDeviceUploadAuthorization,
   abandonPostgresDeviceUploadAuthorization,
   recordPostgresDeviceUploadReceipt,
@@ -1898,13 +1844,6 @@ async function handlePostgresTestContribution({
     );
     principal = claimed.principal;
     await assertPostgresProcessingEnabled(primaryPool, schema.primarySchema);
-    if (await hasPostgresDeletionTombstone(
-      ledgerPool, principal.participantId, Date.now(), { schema },
-    )) {
-      throw Object.assign(new Error("UPLOAD_AUTH_INVALID"), {
-        code: "UPLOAD_AUTH_INVALID", status: 401,
-      });
-    }
     await format.assertUploadAllowed(primaryPool, principal, Date.now(), { schema });
 
     const response = await registration.handler(
@@ -2071,7 +2010,6 @@ async function readV12StagedChunkVector(pool, schema, principal, manifestId) {
  */
 export function createPostgresTestV12DayManifestDispatch({
   primaryPool,
-  ledgerPool,
   schemaOptions,
   expectedMigrations,
   privateOrigin,
@@ -2086,7 +2024,6 @@ export function createPostgresTestV12DayManifestDispatch({
   assertUploadIngressRequestAllowed = null,
   authenticatePostgresDevice,
   disconnectPostgresAuthenticatedDevice,
-  hasPostgresDeletionTombstone,
   readPostgresDeviceSyncState,
   readPostgresDeviceSyncManifest,
   readPostgresDeviceSyncCapabilities,
@@ -2117,9 +2054,6 @@ export function createPostgresTestV12DayManifestDispatch({
 }) {
   if (primaryPool === null || typeof primaryPool !== "object"
       || typeof primaryPool.connect !== "function"
-      || ledgerPool === null || typeof ledgerPool !== "object"
-      || typeof ledgerPool.connect !== "function"
-      || primaryPool === ledgerPool
       || typeof healthDispatch !== "function"
       || typeof assertAdmissionBindings !== "function"
       || typeof assertAttemptAllowed !== "function"
@@ -2129,7 +2063,6 @@ export function createPostgresTestV12DayManifestDispatch({
         && typeof assertUploadIngressRequestAllowed !== "function")
       || typeof authenticatePostgresDevice !== "function"
       || typeof disconnectPostgresAuthenticatedDevice !== "function"
-      || typeof hasPostgresDeletionTombstone !== "function"
       || typeof readPostgresDeviceSyncCapabilities !== "function"
       || typeof assertPostgresV12UploadAllowed !== "function"
       || typeof createPostgresDeviceUploadAuthorization !== "function"
@@ -2155,10 +2088,7 @@ export function createPostgresTestV12DayManifestDispatch({
     configurationError("POSTGRES_TEST_V12_DISPATCH_CONFIGURATION_INVALID");
   }
   const schemas = validatedSchemas(schemaOptions);
-  const expected = Object.freeze({
-    primary: validateExpectedMigrations(expectedMigrations?.primary, "primary"),
-    ledger: validateExpectedMigrations(expectedMigrations?.ledger, "ledger"),
-  });
+  const expected = validatedExpectedManifest(expectedMigrations);
   if (!isAllowedPostgresTestOrigin(privateOrigin)) {
     configurationError("POSTGRES_TEST_PRIVATE_ORIGIN_INVALID");
   }
@@ -2246,7 +2176,6 @@ export function createPostgresTestV12DayManifestDispatch({
     validateV12EnvelopeBeforeClaim(envelope, raw, validateTelemetryV12Envelope);
   const contributionHandlerContext = Object.freeze({
     primaryPool,
-    ledgerPool,
     objectStore,
     envelopePublicJwk,
     envelopePrivateJwk,
@@ -2378,21 +2307,17 @@ export function createPostgresTestV12DayManifestDispatch({
     const requestId = crypto.randomUUID();
     try {
       // Like the Worker route, envelope-key is public configuration projection
-      // and must remain available without opening either database pool.
+      // and must remain available without opening the database pool.
       if (envelopeKeyRoute) return json(200, publicEnvelopeKey(envelopePublicJwk));
 
-      const [primaryReceipt, ledgerReceipt] = await Promise.all([
-        readSchemaReceipt(primaryPool, schemas.primary, expected.primary),
-        readSchemaReceipt(ledgerPool, schemas.ledger, expected.ledger),
-      ]);
-      if (primaryReceipt !== "current" || ledgerReceipt !== "current") {
+      const primaryReceipt = await readSchemaReceipt(primaryPool, schemas.primary, expected);
+      if (primaryReceipt !== "current") {
         throw storageUnavailable();
       }
 
       assertAdmissionBindings(admissionEnv);
       const schema = Object.freeze({
         primarySchema: schemas.primary,
-        ledgerSchema: schemas.ledger,
       });
       if (accountlessEnrollmentRoute) {
         const mode = admissionEnv.ACCOUNTLESS_ENROLLMENT_MODE;
@@ -2530,18 +2455,12 @@ export function createPostgresTestV12DayManifestDispatch({
           return json(result.status, result.response);
         }
         // d43c8f92 index.ts:780-789: the v1.2 grant authenticates the device
-        // (and its tombstone) before it reads the body, so an unknown
-        // credential is 401 DEVICE_AUTH_INVALID whatever the body holds.
+        // before it reads the body, so an unknown credential, including a
+        // deleted owner's (there is no deletion-ledger tombstone read), is
+        // 401 DEVICE_AUTH_INVALID whatever the body holds.
         const principal = await accountlessAuthority.authenticateV12Grant(
           primaryPool, request.headers.get("authorization"), { schema },
         );
-        if (await hasPostgresDeletionTombstone(
-          ledgerPool, principal.participantId, Date.now(), { schema },
-        )) {
-          throw Object.assign(new Error("DEVICE_AUTH_INVALID"), {
-            code: "DEVICE_AUTH_INVALID", status: 401,
-          });
-        }
         const body = await readAccountlessJson(
           request,
           accountlessAuthority.maxOwnershipBytes,
@@ -2565,9 +2484,7 @@ export function createPostgresTestV12DayManifestDispatch({
           admissionEnv,
           assertUploadIngressRequestAllowed,
           primaryPool,
-          ledgerPool,
           schema,
-          hasPostgresDeletionTombstone,
           claimPostgresDeviceUploadAuthorization,
           abandonPostgresDeviceUploadAuthorization,
           recordPostgresDeviceUploadReceipt,
@@ -2640,11 +2557,6 @@ export function createPostgresTestV12DayManifestDispatch({
             ? { accountlessAuthorizationVersion: "v1.1" } : {}),
         },
       );
-      if (await hasPostgresDeletionTombstone(ledgerPool, device.participantId, Date.now(), { schema })) {
-        throw Object.assign(new Error("DEVICE_AUTH_INVALID"), {
-          code: "DEVICE_AUTH_INVALID", status: 401,
-        });
-      }
 
       if (syncStateRoute) {
         if (device.authorityKind !== "social") {

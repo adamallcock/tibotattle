@@ -114,7 +114,6 @@ export async function readPostgresV12DayCandidates(
     encodedNamespace = encodeTypedTelemetryId(options.sourceNamespace);
     schema = createPostgresSchemaConfig({
       primarySchema: options.schema?.primarySchema,
-      ledgerSchema: options.schema?.ledgerSchema,
     }).primarySchema;
   } catch {
     throw storageUnavailable();

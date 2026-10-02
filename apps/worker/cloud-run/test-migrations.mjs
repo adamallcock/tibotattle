@@ -30,18 +30,17 @@ export const TEST_MIGRATIONS_SERVICE_ACCOUNT =
 export const TEST_MIGRATIONS_IAM_USER = "tibotattle-test-migrator@tibotattle.iam";
 export const TEST_MIGRATIONS_RUNTIME_IAM_USER = "tibotattle-test-runtime@tibotattle.iam";
 export const TEST_MIGRATIONS_ROOT = "/app/apps/worker/postgres/migrations";
+// Primary only (LEAD-SIMP; decisions D2, D4 and D6): the canonical runner
+// and manifest have no ledger role. The A2 ledger schema on the retired test
+// ledger instance is no longer a target (owner action OA-4); whether the A2
+// primary is migrated past 0063 is owner decision OD-6, and 0064 refuses a
+// schema that still holds erasure residue.
 export const TEST_MIGRATIONS_TARGETS = Object.freeze({
   primary: Object.freeze({
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle",
     schema: "tibotattle_v12_a2_20260925",
-    expectedMigrations: 63,
-  }),
-  ledger: Object.freeze({
-    instanceConnectionName: "tibotattle:us-east1:tibotattle-test-ledger-20260922",
-    database: "tibotattle_ledger",
-    schema: "tibotattle_ledger_v12_a2_20260925",
-    expectedMigrations: 7,
+    expectedMigrations: 64,
   }),
 });
 export const GRAPH_BENCHMARK_MIGRATION_TARGETS = Object.freeze([
@@ -50,58 +49,59 @@ export const GRAPH_BENCHMARK_MIGRATION_TARGETS = Object.freeze([
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle",
     schema: "tibotattle_graph_benchmark_10k_20260925",
-    expectedMigrations: 63,
+    expectedMigrations: 64,
   }),
   Object.freeze({
     name: "100k",
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle",
     schema: "tibotattle_graph_benchmark_100k_20260925",
-    expectedMigrations: 63,
+    expectedMigrations: 64,
   }),
   Object.freeze({
     name: "100k-insights",
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle",
     schema: "tibotattle_graph_benchmark_100k_insights_20260925",
-    expectedMigrations: 63,
+    expectedMigrations: 64,
   }),
   Object.freeze({
     name: "100k-paged",
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle",
     schema: "tibotattle_graph_benchmark_100k_paged_20260925",
-    expectedMigrations: 63,
+    expectedMigrations: 64,
   }),
   Object.freeze({
     name: "100k-readpaged",
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle",
     schema: "tibotattle_graph_benchmark_100k_readpaged_20260925",
-    expectedMigrations: 63,
+    expectedMigrations: 64,
   }),
   Object.freeze({
     name: "100k-readindexed",
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle",
     schema: "tibotattle_graph_benchmark_100k_readindexed_20260925",
-    expectedMigrations: 63,
+    expectedMigrations: 64,
   }),
   Object.freeze({
     name: "100k-batched",
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle",
     schema: "tibotattle_graph_benchmark_100k_batched_20260925",
-    expectedMigrations: 63,
+    expectedMigrations: 64,
   }),
 ]);
 
 // The fast-path rehearsal target is a separate, disposable database on the
 // test primary instance, so the database-scoped tibotattle_transfer control
-// schema installed by primary 0056 and ledger 0007 never enters the shared
-// `tibotattle` test database. Both roles are schemas of that one database.
-// Expected counts come from the deploying checkout's migration directory
-// (job environment) and must equal the image manifest; they are not pinned.
+// schema installed by primary 0056 never enters the shared `tibotattle` test
+// database. The orphan ledger schema an earlier migrate created there is no
+// longer a target. The expected count comes from the deploying checkout's
+// migration directory (job environment) and must equal the image manifest;
+// it is not pinned.
 export const FASTPATH_MIGRATIONS_JOB = "tibotattle-fastpath-test-migrate";
 export const FASTPATH_MIGRATION_PROFILE = "fastpath";
 export const FASTPATH_MIGRATION_TARGETS = Object.freeze({
@@ -109,11 +109,6 @@ export const FASTPATH_MIGRATION_TARGETS = Object.freeze({
     instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
     database: "tibotattle_fastpath",
     schema: "tibotattle_fastpath_20261001",
-  }),
-  ledger: Object.freeze({
-    instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
-    database: "tibotattle_fastpath",
-    schema: "tibotattle_fastpath_ledger_20261001",
   }),
 });
 const EXPECTED_MIGRATION_COUNT_PATTERN = /^[1-9]\d{0,3}$/u;
@@ -169,7 +164,7 @@ function canonicalManifest(manifest) {
   });
 }
 
-/** The pinned per-role migration counts of the A2 and benchmark profiles. */
+/** The pinned primary migration count of the A2 and benchmark profiles. */
 const PINNED_MIGRATION_COUNTS = Object.freeze(Object.fromEntries(
   Object.entries(TEST_MIGRATIONS_TARGETS).map(([role, target]) => [role, target.expectedMigrations]),
 ));
@@ -183,10 +178,10 @@ const PINNED_MIGRATION_COUNTS = Object.freeze(Object.fromEntries(
  */
 function validateManifest(manifest, { expectedCounts = PINNED_MIGRATION_COUNTS, countMismatchCode } = {}) {
   if (manifest === null || typeof manifest !== "object"
-      || manifest.schemaVersion !== "tibotattle-postgres-migration-manifest-v1"
+      || manifest.schemaVersion !== "tibotattle-postgres-migration-manifest-v2"
       || !SHA256_PATTERN.test(manifest.sha256 ?? "")
       || manifest.roles === null || typeof manifest.roles !== "object"
-      || Object.keys(manifest.roles).sort().join(",") !== "ledger,primary") {
+      || Object.keys(manifest.roles).join(",") !== "primary") {
     fail("POSTGRES_TEST_MIGRATIONS_MANIFEST_INVALID");
   }
   for (const role of Object.keys(TEST_MIGRATIONS_TARGETS)) {
@@ -275,7 +270,7 @@ export async function readBackReceipts(pool, role, target, expected) {
  * creates in the disposable fast-path database; it is not a second policy.
  */
 export async function grantAndVerifyTestRuntimePrivileges(pool, role, schema) {
-  if (role !== "primary" && role !== "ledger") fail("POSTGRES_TEST_MIGRATIONS_ROLE_INVALID");
+  if (role !== "primary") fail("POSTGRES_TEST_MIGRATIONS_ROLE_INVALID");
   return grantAndVerifyRuntimePrivileges(pool, role, { schema });
 }
 
@@ -326,7 +321,6 @@ function migrationPlans(profile) {
     ));
   }
   if (profile === FASTPATH_PROFILE) {
-    // Both role schemas live in one database, so they share one pool.
     return Object.freeze(Object.entries(FASTPATH_MIGRATION_TARGETS).map(([role, target]) =>
       Object.freeze({ name: role, role, poolKey: "fastpath", target }),
     ));
@@ -369,6 +363,11 @@ function validateJobEnvironment(env, profile = A2_PROFILE) {
   if (env.POSTGRES_MIGRATOR_IAM_USER !== TEST_MIGRATIONS_IAM_USER) {
     fail("POSTGRES_TEST_MIGRATIONS_IAM_USER_INVALID");
   }
+  // No profile has a ledger target any more: a LEDGER_ setting is a stale
+  // deployment and is refused before any target is read.
+  if (Object.keys(env).some((name) => name.startsWith("LEDGER_"))) {
+    fail("POSTGRES_TEST_MIGRATIONS_LEDGER_TARGET_RETIRED");
+  }
   if (profile === A2_PROFILE) {
     for (const [role, target] of Object.entries(TEST_MIGRATIONS_TARGETS)) {
       const prefix = role.toUpperCase();
@@ -391,10 +390,7 @@ function validateJobEnvironment(env, profile = A2_PROFILE) {
     const target = GRAPH_BENCHMARK_MIGRATION_TARGETS[0];
     if (env.PRIMARY_DATABASE !== target.database
         || env.PRIMARY_INSTANCE_CONNECTION_NAME !== target.instanceConnectionName
-        || env.PRIMARY_SCHEMA !== undefined
-        || env.LEDGER_DATABASE !== undefined
-        || env.LEDGER_SCHEMA !== undefined
-        || env.LEDGER_INSTANCE_CONNECTION_NAME !== undefined) {
+        || env.PRIMARY_SCHEMA !== undefined) {
       fail("POSTGRES_TEST_MIGRATIONS_BENCHMARK_TARGET_INVALID");
     }
   }
@@ -532,7 +528,6 @@ async function runConfiguredTestMigrations({ env, dependencies, profile }) {
     const migrations = profile === A2_PROFILE || profile === FASTPATH_PROFILE
       ? Object.freeze({
         primary: targetSummaries.primary,
-        ledger: targetSummaries.ledger,
       })
       : Object.freeze({
         primarySchemas: Object.freeze(config.plans.map(({ name }) => targetSummaries[name])),

@@ -8,8 +8,8 @@
 // reaches Google. The preamble cases drive the real
 // createPostgresTestV12DayManifestDispatch against disposable PostgreSQL 17
 // schemas on the local socket. Every fixture is synthetic and content-free;
-// each case creates its own primary and "<schema>_ledger" schemas and drops
-// only those.
+// each case creates its own primary schema and drops only that. There is no
+// deletion-ledger schema or pool (decisions D2, D4, D6 of 2026-09-26).
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -111,20 +111,19 @@ async function loadModules() {
     logLevel: "silent",
   });
   const load = (path) => vite.ssrLoadModule(path);
-  const [server, runtimeSchema, transport, uploadAuthorization, ledgerAuthority, workerAdmission,
+  const [server, runtimeSchema, transport, uploadAuthorization, workerAdmission,
     bodyReader, constants, workerCrypto] = await Promise.all([
     load("/cloud-run/server.mjs"),
     load("/src/postgres-runtime-schema.ts"),
     load("/src/postgres-typed-v12-transport.ts"),
     load("/src/postgres-upload-authorization.ts"),
-    load("/src/postgres-ledger-authority.ts"),
     load("/src/admission.ts"),
     load("/src/bounded-body.ts"),
     load("/src/constants.ts"),
     load("/src/crypto.ts"),
   ]);
   modules = {
-    server, runtimeSchema, transport, uploadAuthorization, ledgerAuthority, workerAdmission,
+    server, runtimeSchema, transport, uploadAuthorization, workerAdmission,
     bodyReader, constants, workerCrypto,
   };
   return modules;
@@ -168,26 +167,24 @@ async function setupPool() {
   return pool;
 }
 
-/** A disposable, fully migrated rehearsal schema and its "<schema>_ledger". */
+/** A disposable, fully migrated rehearsal schema. */
 async function withSchemas(prefix, run) {
   const base = await setupPool();
   const primarySchema = `${prefix}${randomBytes(6).toString("hex")}`;
-  const ledgerSchema = `${primarySchema}_ledger`;
   const created = [];
   try {
-    for (const schema of [primarySchema, ledgerSchema]) {
+    for (const schema of [primarySchema]) {
       await base.query(`CREATE SCHEMA "${schema}"`);
       created.push(schema);
     }
     await applyPostgresMigrations({ role: "primary", schema: primarySchema, pool: base });
-    await applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool: base });
     const nowIso = new Date().toISOString();
     await base.query(`UPDATE "${primarySchema}"."collection_controls"
         SET revision=2, control_state='operational', enrollment_enabled=true,
             upload_registration_enabled=true, processing_enabled=true,
             publication_enabled=true, updated_at=$1
       WHERE singleton=1`, [nowIso]);
-    return await run({ base, primarySchema, ledgerSchema });
+    return await run({ base, primarySchema });
   } finally {
     for (const schema of created.reverse()) await base.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
   }
@@ -237,9 +234,6 @@ const CLOUD_FASTPATH = Object.freeze({
   K_SERVICE: "tibotattle-fastpath-test-origin",
   PRIMARY_DATABASE: "tibotattle_fastpath",
   PRIMARY_INSTANCE_CONNECTION_NAME: "tibotattle:us-east1:tibotattle-test-primary-20260922",
-  LEDGER_DATABASE: "tibotattle_fastpath",
-  LEDGER_INSTANCE_CONNECTION_NAME: "tibotattle:us-east1:tibotattle-test-primary-20260922",
-  LEDGER_SCHEMA: "tibotattle_fastpath_ledger_20261001",
   POSTGRES_IAM_USER: "tibotattle-test-runtime@tibotattle.iam",
 });
 
@@ -286,8 +280,8 @@ async function withEnvironment(environment, work) {
 
 /**
  * Runtime dependencies that record construction. With a socket, the IAM pool
- * factory returns a real local pool (primary and ledger on the same instance,
- * as fastpath-test allows); without one it returns an inert pool.
+ * factory returns a real local pool (the one primary pool); without one it
+ * returns an inert pool.
  */
 function runtimeDependencies({ socket = null, extra = {} } = {}) {
   const calls = [];
@@ -345,18 +339,19 @@ test("(e) fastpath-test refuses a non-loopback host or origin and a non-rehearsa
     [{ PRIMARY_SCHEMA: "tibotattle_fastpath_" }, "POSTGRES_FASTPATH_TEST_SCHEMA_INVALID"],
     [{ PRIMARY_SCHEMA: "typed_legacy_transfer_rehearsal_target_" }, "POSTGRES_FASTPATH_TEST_SCHEMA_INVALID"],
     [{ PRIMARY_SCHEMA: "Tibotattle_fastpath_upper" }, "POSTGRES_FASTPATH_TEST_SCHEMA_INVALID"],
-    [{ PRIMARY_SCHEMA: `tibotattle_fastpath_${"x".repeat(40)}` }, "POSTGRES_FASTPATH_TEST_SCHEMA_INVALID"],
-    [{ LEDGER_SCHEMA: "tibotattle_ledger" }, "POSTGRES_FASTPATH_TEST_SCHEMA_INVALID"],
-    [{ LEDGER_SCHEMA: "tibotattle_fastpath_other_ledger" }, "POSTGRES_FASTPATH_TEST_SCHEMA_INVALID"],
-    // The pinned GCP ledger pairs only with a primary in the fast-path database.
-    [{ LEDGER_SCHEMA: "tibotattle_fastpath_ledger_20261001" }, "POSTGRES_FASTPATH_TEST_SCHEMA_INVALID"],
+    // Over PostgreSQL's 63-byte identifier limit. (Before SIMP-4 the bound was
+    // the derived "<schema>_ledger", 7 bytes shorter; there is no ledger now.)
+    [{ PRIMARY_SCHEMA: `tibotattle_fastpath_${"x".repeat(44)}` }, "POSTGRES_FASTPATH_TEST_SCHEMA_INVALID"],
+    // Any retired deletion-ledger setting stops startup before any construction.
+    [{ LEDGER_SCHEMA: "tibotattle_ledger" }, "POSTGRES_LEDGER_CONFIGURATION_RETIRED"],
+    [{ LEDGER_SCHEMA: "tibotattle_fastpath_ledger_20261001" }, "POSTGRES_LEDGER_CONFIGURATION_RETIRED"],
+    [{ LEDGER_DATABASE: "tibotattle_fastpath" }, "POSTGRES_LEDGER_CONFIGURATION_RETIRED"],
+    [{ LEDGER_INSTANCE_CONNECTION_NAME: "tibotattle:us-east1:tibotattle-test-primary-20260922" },
+      "POSTGRES_LEDGER_CONFIGURATION_RETIRED"],
     // On Cloud Run: only the fast-path origin, database and runtime user.
     [{ K_SERVICE: "tibotattle-test-app" }, "POSTGRES_FASTPATH_TEST_CLOUD_TARGET_INVALID"],
     [{ K_SERVICE: "tibotattle-fastpath-test-origin" }, "POSTGRES_FASTPATH_TEST_CLOUD_TARGET_INVALID"],
-    [{ ...CLOUD_FASTPATH, PRIMARY_DATABASE: "tibotattle", LEDGER_DATABASE: "tibotattle" },
-      "POSTGRES_FASTPATH_TEST_SCHEMA_INVALID"],
-    [{ ...CLOUD_FASTPATH, PRIMARY_DATABASE: "tibotattle", LEDGER_DATABASE: "tibotattle", LEDGER_SCHEMA: undefined },
-      "POSTGRES_FASTPATH_TEST_CLOUD_TARGET_INVALID"],
+    [{ ...CLOUD_FASTPATH, PRIMARY_DATABASE: "tibotattle" }, "POSTGRES_FASTPATH_TEST_CLOUD_TARGET_INVALID"],
     [{ ...CLOUD_FASTPATH, POSTGRES_IAM_USER: "synthetic-fastpath-runtime@synthetic.iam" },
       "POSTGRES_FASTPATH_TEST_CLOUD_TARGET_INVALID"],
     [{ ...CLOUD_FASTPATH, HOST: "0.0.0.0" }, "POSTGRES_TEST_PRIVATE_HOST_CONFIGURATION_INVALID"],
@@ -373,11 +368,11 @@ test("(e) fastpath-test refuses a non-loopback host or origin and a non-rehearsa
     assert.deepEqual(calls, [], `${expectedCode} must fail before any connector, pool or GCS construction`);
   }
 
-  // The accepted shapes reach construction: both rehearsal prefixes, and a
-  // ledger that defaults to "<schema>_ledger" on the primary instance.
+  // The accepted shapes reach construction: both rehearsal prefixes, each
+  // with the one primary pool.
   for (const [schema, overrides] of [
     [goodSchema, {}],
-    ["typed_legacy_transfer_rehearsal_target_spec", { LEDGER_SCHEMA: "typed_legacy_transfer_rehearsal_target_spec_ledger" }],
+    ["typed_legacy_transfer_rehearsal_target_spec", {}],
   ]) {
     const { calls, pools, dependencies } = runtimeDependencies();
     const runtime = await withEnvironment(fastpathEnvironment(schema, overrides),
@@ -389,7 +384,7 @@ test("(e) fastpath-test refuses a non-loopback host or origin and a non-rehearsa
       assert.equal(runtime.hostOrigin, FASTPATH_ORIGIN);
       assert.equal(runtime.publicOrigin, undefined);
       assert.equal(typeof runtime.postgresTestDispatch, "function");
-      assert.deepEqual(runtime.schemaOptions, { primarySchema: schema, ledgerSchema: `${schema}_ledger` });
+      assert.deepEqual(runtime.schemaOptions, { primarySchema: schema });
       assert.deepEqual(pools.map(({ options }) => ({
         role: options.role,
         schema: options.schema,
@@ -401,19 +396,16 @@ test("(e) fastpath-test refuses a non-loopback host or origin and a non-rehearsa
           role: "primary", schema, database: "postgres",
           instanceConnectionName: "synthetic-project:us-east1:synthetic-fastpath-primary", max: 3,
         },
-        {
-          role: "ledger", schema: `${schema}_ledger`, database: "postgres",
-          instanceConnectionName: "synthetic-project:us-east1:synthetic-fastpath-primary", max: 2,
-        },
       ]);
-      assert.deepEqual(calls.slice(0, 3), ["connector", "pool:primary", "pool:ledger"]);
+      assert.deepEqual(calls.slice(0, 2), ["connector", "pool:primary"]);
+      assert.equal(calls.some((call) => call.startsWith("pool:") && call !== "pool:primary"), false);
     } finally {
       await closeRuntime(runtime);
     }
   }
 });
 
-test("fastpath-test runs as the GCP fast-path origin: K_SERVICE, HOST 127.0.0.1, tibotattle_fastpath and an explicit ledger", async () => {
+test("fastpath-test runs as the GCP fast-path origin: K_SERVICE, HOST 127.0.0.1, tibotattle_fastpath and one primary pool", async () => {
   const { server } = await loadModules();
   for (const schema of ["typed_legacy_transfer_rehearsal_target_fastpath_0a1b2c3d", "tibotattle_fastpath_20261001"]) {
     const { calls, pools, dependencies } = runtimeDependencies();
@@ -423,14 +415,12 @@ test("fastpath-test runs as the GCP fast-path origin: K_SERVICE, HOST 127.0.0.1,
       assert.equal(runtime.postgresTestHostMode, "fastpath-test");
       assert.equal(runtime.listenHost, "127.0.0.1");
       assert.equal(runtime.hostOrigin, FASTPATH_ORIGIN);
-      assert.deepEqual(runtime.schemaOptions, { primarySchema: schema, ledgerSchema: "tibotattle_fastpath_ledger_20261001" });
+      assert.deepEqual(runtime.schemaOptions, { primarySchema: schema });
       assert.deepEqual(pools.map(({ options }) => [options.role, options.schema, options.database,
         options.instanceConnectionName]), [
         ["primary", schema, "tibotattle_fastpath", "tibotattle:us-east1:tibotattle-test-primary-20260922"],
-        ["ledger", "tibotattle_fastpath_ledger_20261001", "tibotattle_fastpath",
-          "tibotattle:us-east1:tibotattle-test-primary-20260922"],
       ]);
-      assert.deepEqual(calls.slice(0, 3), ["connector", "pool:primary", "pool:ledger"]);
+      assert.deepEqual(calls.slice(0, 2), ["connector", "pool:primary"]);
     } finally {
       await closeRuntime(runtime);
     }
@@ -468,7 +458,7 @@ test("(b) a route module for a non-overridable built-in stops fastpath-test star
       },
     );
     assert.deepEqual(calls.filter((call) => call.startsWith("pool-end:")).sort(),
-      ["pool-end:ledger", "pool-end:primary"], "a refused registration closes both pools");
+      ["pool-end:primary"], "a refused registration closes its pool");
     assert.ok(calls.includes("connector-closed"));
   }
 
@@ -483,7 +473,7 @@ test("(b) a route module for a non-overridable built-in stops fastpath-test star
     await withEnvironment(fastpathEnvironment("tibotattle_fastpath_spec_session", environment), async () => {
       await assert.rejects(server.createRuntime({ dependencies }), (error) => error?.code === expectedCode);
     });
-    assert.ok(calls.includes("pool-end:primary") && calls.includes("pool-end:ledger"));
+    assert.ok(calls.includes("pool-end:primary"));
   }
 });
 
@@ -521,7 +511,7 @@ test("(f) the origin composition root injects the analytics-v2 route factory and
       }
     },
   );
-  assert.ok(calls.includes("pool-end:primary") && calls.includes("pool-end:ledger"));
+  assert.ok(calls.includes("pool-end:primary"));
 });
 
 test("(a) in fastpath-test a stub community-daily module overrides the built-in, and only that route", {
@@ -529,7 +519,7 @@ test("(a) in fastpath-test a stub community-daily module overrides the built-in,
 }, async () => {
   const { server } = await loadModules();
   const socket = await localSocket();
-  await withSchemas("tibotattle_fastpath_spec_", async ({ primarySchema, ledgerSchema }) => {
+  await withSchemas("tibotattle_fastpath_spec_", async ({ primarySchema }) => {
     const factoryCalls = [];
     const handled = [];
     const clock = () => Date.parse("2026-10-01T06:00:00.000Z");
@@ -569,7 +559,7 @@ test("(a) in fastpath-test a stub community-daily module overrides the built-in,
       assert.equal(factoryCalls[0].schema, primarySchema);
       assert.equal(factoryCalls[0].originMode, "fastpath-test");
       assert.equal(factoryCalls[0].clock, clock);
-      assert.deepEqual(runtime.schemaOptions, { primarySchema, ledgerSchema });
+      assert.deepEqual(runtime.schemaOptions, { primarySchema });
 
       const overridden = await runtime.postgresTestDispatch(new Request(daily));
       assert.equal(overridden.status, 200);
@@ -664,11 +654,10 @@ async function insertSocialDevice(base, primarySchema, consentVersion) {
   return { participantId, deviceId, deviceAuthorization: `Device um_device_${deviceId}.${deviceSecret}` };
 }
 
-function contributionDispatch(m, { base, primarySchema, ledgerSchema }, overrides = {}) {
+function contributionDispatch(m, { base, primarySchema }, overrides = {}) {
   return createPostgresTestV12DayManifestDispatch({
     primaryPool: base,
-    ledgerPool: { connect: () => base.connect() },
-    schemaOptions: { primarySchema, ledgerSchema },
+    schemaOptions: { primarySchema },
     expectedMigrations: m.runtimeSchema.POSTGRES_RUNTIME_MIGRATIONS,
     privateOrigin: DISPATCH_ORIGIN,
     healthDispatch: mustNotCall("healthDispatch"),
@@ -690,7 +679,6 @@ function contributionDispatch(m, { base, primarySchema, ledgerSchema }, override
     assertUploadIngressRequestAllowed: m.workerAdmission.assertUploadIngressRequestAllowed,
     authenticatePostgresDevice: mustNotCall("authenticatePostgresDevice"),
     disconnectPostgresAuthenticatedDevice: mustNotCall("disconnectPostgresAuthenticatedDevice"),
-    hasPostgresDeletionTombstone: mustNotCall("hasPostgresDeletionTombstone"),
     readPostgresDeviceSyncCapabilities: mustNotCall("readPostgresDeviceSyncCapabilities"),
     readPostgresV12DayCandidates: mustNotCall("readPostgresV12DayCandidates"),
     readPostgresTelemetryV12EffectivePage: mustNotCall("readPostgresTelemetryV12EffectivePage"),
@@ -839,16 +827,11 @@ test("(d) a registered envelope handler runs only after the shared preamble", {
         throw Object.assign(new Error("INTERNAL_ERROR"), { code: "INTERNAL_ERROR", status: 500 });
       }
     };
-    const tombstoneChecks = [];
     const dispatch = contributionDispatch(m, schemas, {
       authenticatePostgresDevice: m.transport.authenticatePostgresDevice,
       createPostgresDeviceUploadAuthorization: m.uploadAuthorization.createPostgresDeviceUploadAuthorization,
       claimPostgresDeviceUploadAuthorization: m.transport.claimPostgresDeviceUploadAuthorization,
       abandonPostgresDeviceUploadAuthorization: m.transport.abandonPostgresDeviceUploadAuthorization,
-      hasPostgresDeletionTombstone: async (...args) => {
-        tombstoneChecks.push(args[1]);
-        return m.ledgerAuthority.hasPostgresDeletionTombstone(...args);
-      },
       recordPostgresDeviceUploadReceipt,
       contributionEnvelopes: [registerContributionEnvelope(V11_ENVELOPE, handler, { validateEnvelope })],
       uploadAuthorizationFormats: { [V11_TRANSPORT]: { assertUploadAllowed: floor } },
@@ -885,10 +868,8 @@ test("(d) a registered envelope handler runs only after the shared preamble", {
     assert.equal(events[0].poolArgument, base);
     assert.equal(events[0].principal.participantId, device.participantId);
     assert.equal(events[0].principal.deviceId, device.deviceId);
-    assert.deepEqual(events[0].options, { schema: { primarySchema, ledgerSchema: schemas.ledgerSchema } });
-    // Every device route checks the tombstone; only contribution checks count below.
+    assert.deepEqual(events[0].options, { schema: { primarySchema } });
     events.length = 0;
-    tombstoneChecks.length = 0;
 
     // Unauthenticated, wrong-bearer and wrong-body requests never reach the
     // floor or the handler, and leave the issued grant unused.
@@ -906,7 +887,6 @@ test("(d) a registered envelope handler runs only after the shared preamble", {
     assert.deepEqual([...new Set(events.map((event) => event.step))], ["validate"],
       "only the pure pre-claim validator ran");
     assert.equal(handlerCalls(), 0);
-    assert.deepEqual(tombstoneChecks, []);
     assert.equal(await grantState(issued.authorizationId), "unused");
     events.length = 0;
 
@@ -917,43 +897,22 @@ test("(d) a registered envelope handler runs only after the shared preamble", {
     const blocked = await dispatch(contributionRequest(first, issued.header));
     assert.equal(blocked.status, 403);
     assert.equal((await blocked.json()).error.code, "TELEMETRY_TRANSPORT_BLOCKED");
+    // The claim goes straight to the floor: there is no deletion-ledger
+    // tombstone read in between (D2, D4).
     assert.deepEqual(events.map((event) => event.step), ["validate", "floor"]);
-    assert.deepEqual(tombstoneChecks, [device.participantId], "the tombstone check precedes the floor");
     assert.equal(handlerCalls(), 0);
     assert.equal(await grantState(issued.authorizationId), "revoked");
     floorRefusal = null;
-    events.length = 0;
-    tombstoneChecks.length = 0;
-
-    // A tombstoned participant is refused after the claim and before the floor.
-    const tombstoneBody = envelopeBody("tombstoned");
-    const tombstoneGrant = await issue(tombstoneBody);
-    events.length = 0;
-    tombstoneChecks.length = 0;
-    const tombstoneDispatch = contributionDispatch(m, schemas, {
-      claimPostgresDeviceUploadAuthorization: m.transport.claimPostgresDeviceUploadAuthorization,
-      abandonPostgresDeviceUploadAuthorization: m.transport.abandonPostgresDeviceUploadAuthorization,
-      hasPostgresDeletionTombstone: async () => true,
-      contributionEnvelopes: [registerContributionEnvelope(V11_ENVELOPE, handler, { validateEnvelope })],
-      uploadAuthorizationFormats: { [V11_TRANSPORT]: { assertUploadAllowed: floor } },
-    });
-    const tombstoned = await tombstoneDispatch(contributionRequest(tombstoneBody, tombstoneGrant.header));
-    assert.equal(tombstoned.status, 401);
-    assert.equal((await tombstoned.json()).error.code, "UPLOAD_AUTH_INVALID");
-    assert.deepEqual(events.map((event) => event.step), ["validate"]);
-    assert.equal(await grantState(tombstoneGrant.authorizationId), "revoked");
     events.length = 0;
 
     // After the whole preamble the handler runs with the claimed context.
     const accepted = envelopeBody("accepted");
     const acceptedGrant = await issue(accepted);
     events.length = 0;
-    tombstoneChecks.length = 0;
     const response = await dispatch(contributionRequest(accepted, acceptedGrant.header));
     assert.equal(response.status, 202);
     assert.deepEqual(await response.json(), { contributionId: "synthetic-v11-receipt" });
     assert.deepEqual(events.map((event) => event.step), ["validate", "floor", "handler", "receipt"]);
-    assert.deepEqual(tombstoneChecks, [device.participantId]);
     const call = events[2];
     assert.equal(call.grantState, "consuming", "the handler runs on a claimed authorization");
     assert.equal(call.body.raw, accepted);
@@ -985,7 +944,7 @@ test("(d) a registered envelope handler runs only after the shared preamble", {
       poolArgument: base,
       authorizationId: acceptedGrant.authorizationId,
       contributionId: "synthetic-v11-receipt",
-      options: { schema: { primarySchema, ledgerSchema: schemas.ledgerSchema } },
+      options: { schema: { primarySchema } },
     });
     assert.deepEqual({ ...await grant(acceptedGrant.authorizationId) }, {
       state: "consumed", consumed_contribution_id: "synthetic-v11-receipt",
@@ -1040,7 +999,6 @@ test("(d) a registered envelope handler runs only after the shared preamble", {
     const ownedDispatch = contributionDispatch(m, schemas, {
       claimPostgresDeviceUploadAuthorization: m.transport.claimPostgresDeviceUploadAuthorization,
       abandonPostgresDeviceUploadAuthorization: m.transport.abandonPostgresDeviceUploadAuthorization,
-      hasPostgresDeletionTombstone: m.ledgerAuthority.hasPostgresDeletionTombstone,
       recordPostgresDeviceUploadReceipt: null,
       contributionEnvelopes: [registerContributionEnvelope(V11_ENVELOPE, handler, {
         validateEnvelope, ownsReceipt: true,

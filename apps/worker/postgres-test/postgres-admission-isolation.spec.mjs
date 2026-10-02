@@ -128,7 +128,6 @@ async function withLimiterSchema(operation, { staged = true } = {}) {
   const admissionPool = createPool(endpoint, 4);
   const suffix = randomBytes(6).toString("hex");
   const primarySchema = `admission_isolation_primary_${suffix}`;
-  const ledgerSchema = `admission_isolation_ledger_${suffix}`;
   let created = false;
   try {
     const server = await pool.query(
@@ -148,7 +147,7 @@ async function withLimiterSchema(operation, { staged = true } = {}) {
       pool,
       admissionPool,
       primarySchema,
-      schema: { primarySchema, ledgerSchema },
+      schema: { primarySchema },
       table: `"${primarySchema}"."postgres_rate_limit_buckets"`,
       applyStaged,
       unloggedIsStaged: pendingStaged.includes("0048_rate_limit_buckets_unlogged.sql"),
@@ -283,7 +282,7 @@ function recordingPool({ missingLocks = 0 } = {}) {
 }
 
 test("limiter transaction bounds default to the shared helper and pass through when configured", async () => {
-  const schema = { primarySchema: "synthetic_primary", ledgerSchema: "synthetic_ledger" };
+  const schema = { primarySchema: "synthetic_primary" };
   const secret = randomBytes(32);
   const options = { ...schema, name: "UPLOAD_AUTHORIZATION", limit: 3, periodSeconds: 60, keyHashSecret: secret };
 
@@ -371,7 +370,7 @@ test("limiter transaction bounds default to the shared helper and pass through w
 });
 
 test("a bucket deleted between the limiter's insert and its lock is created once more, then fails closed", async () => {
-  const schema = { primarySchema: "synthetic_primary", ledgerSchema: "synthetic_ledger" };
+  const schema = { primarySchema: "synthetic_primary" };
   const options = {
     ...schema, name: "UPLOAD_PRINCIPAL", limit: 3, periodSeconds: 60, keyHashSecret: randomBytes(32),
   };
@@ -415,7 +414,7 @@ test("a bucket deleted between the limiter's insert and its lock is created once
 
 test("bucket purge validates its bounds before any database work and binds only closed values", async () => {
   const pool = recordingPool();
-  const schema = { primarySchema: "synthetic_primary", ledgerSchema: "synthetic_ledger" };
+  const schema = { primarySchema: "synthetic_primary" };
   const limiter = (name, periodSeconds, limiterSchema = schema) => rateLimit.createPostgresRateLimiter(
     recordingPool(),
     { ...limiterSchema, name, limit: 3_000, periodSeconds, keyHashSecret: randomBytes(32) },
@@ -437,7 +436,7 @@ test("bucket purge validates its bounds before any database work and binds only 
     { limiters: [{ name: "UPLOAD_PRINCIPAL", periodSeconds: 60 }] },
     { limiters: [...limiters, lookAlike] },
     { limiters: [...limiters, "UPLOAD_PRINCIPAL"] },
-    { limiters: [limiter("UPLOAD_PRINCIPAL", 60, { primarySchema: "other_primary", ledgerSchema: "other_ledger" })] },
+    { limiters: [limiter("UPLOAD_PRINCIPAL", 60, { primarySchema: "other_primary" })] },
     { limiters: Array.from({ length: 65 }, () => limiters[0]) },
     { limiters, maxRows: 0 },
     { limiters, maxRows: 10_001 },

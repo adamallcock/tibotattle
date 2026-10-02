@@ -66,13 +66,10 @@ test("Cloud Run PostgreSQL pairing claim preserves one-use, consent, replay, con
     connectionTimeoutMillis: 5_000,
   };
   const primaryPool = new pg.Pool({ ...poolOptions, application_name: "pg-pair-claim-primary-test" });
-  const ledgerPool = new pg.Pool({ ...poolOptions, application_name: "pg-pair-claim-ledger-test" });
   const suffix = randomBytes(5).toString("hex");
   const primarySchema = `pair_claim_${suffix}`;
-  const ledgerSchema = `pair_claim_l_${suffix}`;
-  const schemaOptions = { primarySchema, ledgerSchema };
+  const schemaOptions = { primarySchema };
   let primaryCreated = false;
-  let ledgerCreated = false;
   try {
     const server = await primaryPool.query(
       "SELECT current_setting('server_version_num')::integer AS version, inet_server_addr() AS address",
@@ -83,10 +80,7 @@ test("Cloud Run PostgreSQL pairing claim preserves one-use, consent, replay, con
       "pairing claim qualification requires the private local Unix socket");
     await primaryPool.query(`CREATE SCHEMA "${primarySchema}"`);
     primaryCreated = true;
-    await ledgerPool.query(`CREATE SCHEMA "${ledgerSchema}"`);
-    ledgerCreated = true;
     await applyPostgresMigrations({ role: "primary", schema: primarySchema, pool: primaryPool });
-    await applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool: ledgerPool });
     await primaryPool.query(
       `UPDATE ${table(primarySchema, "collection_controls")}
           SET control_state = 'operational', enrollment_enabled = true,
@@ -103,7 +97,6 @@ test("Cloud Run PostgreSQL pairing claim preserves one-use, consent, replay, con
     const cryptoModule = await vite.ssrLoadModule("/src/crypto.ts");
     const constants = await vite.ssrLoadModule("/src/constants.ts");
     const boundedBody = await vite.ssrLoadModule("/src/bounded-body.ts");
-    const ledgerAuthority = await vite.ssrLoadModule("/src/postgres-ledger-authority.ts");
     const newOwner = async (label, nowEpoch = Date.now()) => {
       const participantId = `${label}-${suffix}`;
       const now = new Date(nowEpoch).toISOString();
@@ -130,7 +123,6 @@ test("Cloud Run PostgreSQL pairing claim preserves one-use, consent, replay, con
     const createDispatch = (claimPostgresDevicePairing = claimModule.claimPostgresDevicePairing) => (
       createPostgresTestDevicePairingClaimDispatch({
         primaryPool,
-        ledgerPool,
         schemaOptions,
         claimPostgresDevicePairing,
         healthDispatch: controls,
@@ -366,9 +358,11 @@ test("Cloud Run PostgreSQL pairing claim preserves one-use, consent, replay, con
 
     const erasedOwner = await newOwner("claim-erased-owner");
     const erasedPairing = await issue(erasedOwner.participantId, erasedOwner.session, erasedOwner.nowEpoch);
-    await ledgerAuthority.recordPostgresDeletionTombstone(
-      ledgerPool, erasedOwner.participantId, Date.now(), { schema: { primarySchema, ledgerSchema } },
-    );
+    // An owner removed by the offline purge (D2 Variant B) leaves no row for a
+    // claim to find; there is no deletion-ledger tombstone to consult.
+    assert.equal((await primaryPool.query(
+      `DELETE FROM ${table(primarySchema, "participants")} WHERE id = $1`, [erasedOwner.participantId],
+    )).rowCount, 1);
     const erasedDeviceId = randomUUID();
     const erasedSecret = await freshSecret(erasedDeviceId);
     await expectApiError(await dispatch(claimRequest({
@@ -428,9 +422,9 @@ test("Cloud Run PostgreSQL pairing claim preserves one-use, consent, replay, con
       issue(rateOwner.participantId, rateOwner.session, rateOwner.nowEpoch),
     ]);
     const limitedDispatch = createDispatch((...args) => {
-      const options = args[6] ?? {};
+      const options = args[5] ?? {};
       return claimModule.claimPostgresDevicePairing(
-        ...args.slice(0, 6),
+        ...args.slice(0, 5),
         { ...options, policy: { pairingClaimLimit: 1 } },
       );
     });
@@ -456,7 +450,6 @@ test("Cloud Run PostgreSQL pairing claim preserves one-use, consent, replay, con
     assert.equal(rateOwnerDevices.rows[0].count, 1);
   } finally {
     if (primaryCreated) await primaryPool.query(`DROP SCHEMA IF EXISTS "${primarySchema}" CASCADE`);
-    if (ledgerCreated) await ledgerPool.query(`DROP SCHEMA IF EXISTS "${ledgerSchema}" CASCADE`);
-    await Promise.all([primaryPool.end(), ledgerPool.end()]);
+    await primaryPool.end();
   }
 });

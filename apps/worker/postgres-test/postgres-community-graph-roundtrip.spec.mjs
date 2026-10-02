@@ -485,25 +485,25 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
     await pool.query(`INSERT INTO ${sqlSchema}.storage_ingestion_changes(
       source_id, sequence, event_digest, owner_digest, owner_revision, authority_epoch, kind, recorded_ms
     ) VALUES ($1,1,$2,$3,1,0,'source-updated',$4)`, [SOURCE_ID, "c".repeat(64), OWNER_DIGEST, NOW]);
-    expect(await publishPostgresCommunityModelDay(pool, { sourcePin: pin, members: [member()], day: DAY, nowMs: NOW, schema: { primarySchema: schema, ledgerSchema: "tibotattle_ledger" } }))
+    expect(await publishPostgresCommunityModelDay(pool, { sourcePin: pin, members: [member()], day: DAY, nowMs: NOW, schema: { primarySchema: schema } }))
       .toMatchObject({ state: "deferred", reason: "source_changed", memberCount: 1 });
     await pool.query(`DELETE FROM ${sqlSchema}.storage_ingestion_changes WHERE source_id=$1`, [SOURCE_ID]);
 
     const first = await publishPostgresCommunityModelDay(pool, {
       sourcePin: pin, members: [member()], day: DAY, nowMs: NOW,
-      schema: { primarySchema: schema, ledgerSchema: "tibotattle_ledger" },
+      schema: { primarySchema: schema },
     });
 
     expect(first).toMatchObject({ state: "published", memberCount: 1 });
     const firstGeneration = first.generation;
     expect(await readPostgresCommunityModelDay(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE, day: DAY,
-      schema: { primarySchema: schema, ledgerSchema: "tibotattle_ledger" },
+      schema: { primarySchema: schema },
     })).toMatchObject({ day: DAY, fittedParticipantCount: 1, values: [["gpt-6-astra", 1000, 1]] });
 
     expect(await publishPostgresCommunityModelDay(pool, {
       sourcePin: pin, members: [member()], day: DAY, nowMs: NOW + 1,
-      schema: { primarySchema: schema, ledgerSchema: "tibotattle_ledger" },
+      schema: { primarySchema: schema },
     })).toMatchObject({ state: "unchanged", generation: firstGeneration });
 
     await pool.query(`UPDATE ${sqlSchema}.input_versions SET revision=1 WHERE participant_id=$1`, [PARTICIPANT_ID]);
@@ -518,11 +518,11 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
     expect(link.rows[0]?.state).toBe("active");
     expect(await readPostgresCommunityModelDay(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE, day: DAY,
-      schema: { primarySchema: schema, ledgerSchema: "tibotattle_ledger" },
+      schema: { primarySchema: schema },
     })).toMatchObject({ day: DAY, fittedParticipantCount: 1, values: [["gpt-6-astra", 1000, 1]] });
     expect(await publishPostgresCommunityModelDay(pool, {
       sourcePin: pin, members: [member()], day: DAY, nowMs: NOW + 2,
-      schema: { primarySchema: schema, ledgerSchema: "tibotattle_ledger" },
+      schema: { primarySchema: schema },
     })).toMatchObject({ state: "deferred", reason: "source_changed" });
 
     await pool.query(`UPDATE ${sqlSchema}.analytics_source_cursors SET sequence=1 WHERE source_id=$1`, [SOURCE_ID]);
@@ -532,19 +532,19 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
     await writeResult(nextFingerprint, 1, 2, 1);
     const second = await publishPostgresCommunityModelDay(pool, {
       sourcePin: { ...pin, sequence: 1 }, members: [member("effective", nextFingerprint, 1, 2)], day: DAY, nowMs: NOW + 3,
-      schema: { primarySchema: schema, ledgerSchema: "tibotattle_ledger" },
+      schema: { primarySchema: schema },
     });
     expect(second).toMatchObject({ state: "published", memberCount: 1 });
     expect(second.generation).not.toBe(firstGeneration);
     expect(await readPostgresCommunityModelDay(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE, day: DAY,
-      schema: { primarySchema: schema, ledgerSchema: "tibotattle_ledger" },
+      schema: { primarySchema: schema },
     })).toMatchObject({ day: DAY, fittedParticipantCount: 1 });
   }, 120_000);
 
   it("continues to read persisted version-1 capture receipts after the streamed proof migration", async () => {
     await seedOwner();
-    const schemaOptions = { primarySchema: schema, ledgerSchema: "tibotattle_ledger" };
+    const schemaOptions = { primarySchema: schema };
     const published = await publishPostgresCommunityModelDay(pool, {
       sourcePin, members: [member()], day: DAY, nowMs: NOW, schema: schemaOptions,
     });
@@ -603,7 +603,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
 
   it("checks each paged member owner, link, and participant authority row", async () => {
     await seedOwner();
-    const schemaOptions = { primarySchema: schema, ledgerSchema: "tibotattle_ledger" };
+    const schemaOptions = { primarySchema: schema };
     const published = await publishPostgresCommunityModelDay(pool, {
       sourcePin, members: [member()], day: DAY, nowMs: NOW, schema: schemaOptions,
     });
@@ -685,7 +685,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
     await seedOwner();
     await seedOtherOwner();
     await writeResult(FINGERPRINT, 0, 1, 0, OTHER_OWNER_DIGEST);
-    const schemaOptions = { primarySchema: schema, ledgerSchema: "tibotattle_ledger" };
+    const schemaOptions = { primarySchema: schema };
     const published = await publishPostgresCommunityModelDay(pool, {
       sourcePin,
       members: [
@@ -724,7 +724,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
 
   it("rolls back a failed member-page read and releases its PostgreSQL client", async () => {
     await seedOwner();
-    const schemaOptions = { primarySchema: schema, ledgerSchema: "tibotattle_ledger" };
+    const schemaOptions = { primarySchema: schema };
     const published = await publishPostgresCommunityModelDay(pool, {
       sourcePin, members: [member()], day: DAY, nowMs: NOW, schema: schemaOptions,
     });
@@ -786,7 +786,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
       .toMatchObject({ rows: [] });
     expect(await readPostgresCommunityModelDay(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE, day: DAY,
-      schema: { primarySchema: schema, ledgerSchema: "tibotattle_ledger" },
+      schema: { primarySchema: schema },
     })).toBeNull();
   }, 120_000);
 
@@ -795,14 +795,14 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
     await seedOtherOwner();
     const affected = await publishPostgresCommunityModelDay(pool, {
       sourcePin, members: [member()], day: DAY, nowMs: NOW,
-      schema: { primarySchema: schema, ledgerSchema: "tibotattle_ledger" },
+      schema: { primarySchema: schema },
     });
     expect(affected.state).toBe("published");
     const unrelatedDay = "2026-09-22";
     const unrelated = await publishPostgresCommunityModelDay(pool, {
       sourcePin, members: [member("mixed", null, 0, 1, OTHER_OWNER_DIGEST, OTHER_PARTICIPANT_ID)],
       day: unrelatedDay, nowMs: NOW,
-      schema: { primarySchema: schema, ledgerSchema: "tibotattle_ledger" },
+      schema: { primarySchema: schema },
     });
     expect(unrelated.state).toBe("published");
 
@@ -819,7 +819,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
 
       const staleCandidate = publishPostgresCommunityModelDay(pool, {
         sourcePin, members: [member()], day: DAY, nowMs: NOW + 2,
-        schema: { primarySchema: schema, ledgerSchema: "tibotattle_ledger" },
+        schema: { primarySchema: schema },
       });
       // pg_stat_activity truncates long SQL statements before the FROM clause;
       // match the publisher's uniquely identifying authority-pin query prefix.
@@ -835,18 +835,18 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
 
     expect(await readPostgresCommunityModelDay(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE, day: DAY,
-      schema: { primarySchema: schema, ledgerSchema: "tibotattle_ledger" },
+      schema: { primarySchema: schema },
     })).toBeNull();
     // Source-ahead terminal evidence temporarily withholds all older days.
     expect(await readPostgresCommunityModelDay(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE, day: unrelatedDay,
-      schema: { primarySchema: schema, ledgerSchema: "tibotattle_ledger" },
+      schema: { primarySchema: schema },
     })).toBeNull();
 
     await pool.query(`UPDATE ${sqlSchema}.analytics_source_cursors SET sequence=1, authority_epoch=1 WHERE source_id=$1`, [SOURCE_ID]);
     expect(await readPostgresCommunityModelDay(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE, day: unrelatedDay,
-      schema: { primarySchema: schema, ledgerSchema: "tibotattle_ledger" },
+      schema: { primarySchema: schema },
     })).toMatchObject({ day: unrelatedDay, v1ParticipantCount: 0, unsupportedSourceParticipantCount: 1 });
     const invalidation = await pool.query(`SELECT reason FROM ${sqlSchema}.analytics_publication_invalidations
       WHERE source_id=$1 AND day=$2::date AND metric='model' AND generation=$3 AND owner_digest=$4`,
@@ -858,7 +858,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
     await seedOwner();
     const initial = await publishPostgresCommunityModelDay(pool, {
       sourcePin, members: [member()], day: DAY, nowMs: NOW,
-      schema: { primarySchema: schema, ledgerSchema: "tibotattle_ledger" },
+      schema: { primarySchema: schema },
     });
     expect(initial.state).toBe("published");
 
@@ -874,7 +874,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
     await writeResult(nextFingerprint, 1, 2, 1);
     expect(await readPostgresCommunityModelDay(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE, day: DAY,
-      schema: { primarySchema: schema, ledgerSchema: "tibotattle_ledger" },
+      schema: { primarySchema: schema },
     })).toMatchObject({ day: DAY, fittedParticipantCount: 1 });
 
     const headLockClient = await pool.connect();
@@ -885,7 +885,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
     const candidate = publishPostgresCommunityModelDay(pool, {
       sourcePin: { ...sourcePin, sequence: 1 },
       members: [member("effective", nextFingerprint, 1, 2)], day: DAY, nowMs: NOW + 2,
-      schema: { primarySchema: schema, ledgerSchema: "tibotattle_ledger" },
+      schema: { primarySchema: schema },
     });
     await waitForLockedQuery("analytics_publications");
 
@@ -910,7 +910,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
 
     expect(await readPostgresCommunityModelDay(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE, day: DAY,
-      schema: { primarySchema: schema, ledgerSchema: "tibotattle_ledger" },
+      schema: { primarySchema: schema },
     })).toBeNull();
     const erasureInvalidation = await pool.query(`SELECT reason FROM ${sqlSchema}.analytics_publication_invalidations
       WHERE source_id=$1 AND day=$2::date AND metric='model' AND generation=$3 AND owner_digest=$4`,
@@ -922,12 +922,12 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
     await seedOwner();
     await publishPostgresCommunityModelDay(pool, {
       sourcePin, members: [member()], day: DAY, nowMs: NOW,
-      schema: { primarySchema: schema, ledgerSchema: "tibotattle_ledger" },
+      schema: { primarySchema: schema },
     });
     await pool.query(`UPDATE ${sqlSchema}.collection_controls SET revision=revision+1 WHERE singleton=1`);
     expect(await readPostgresCommunityModelDay(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE, day: DAY,
-      schema: { primarySchema: schema, ledgerSchema: "tibotattle_ledger" },
+      schema: { primarySchema: schema },
     })).toBeNull();
   }, 120_000);
 
@@ -936,12 +936,12 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
     const unsupportedDay = "2026-09-22";
     const published = await publishPostgresCommunityModelDay(pool, {
       sourcePin: sourcePin, members: [member("mixed", null)], day: unsupportedDay, nowMs: NOW,
-      schema: { primarySchema: schema, ledgerSchema: "tibotattle_ledger" },
+      schema: { primarySchema: schema },
     });
     expect(published).toMatchObject({ state: "published", memberCount: 1 });
     const result = await readPostgresCommunityModelDay(pool, {
       sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE, day: unsupportedDay,
-      schema: { primarySchema: schema, ledgerSchema: "tibotattle_ledger" },
+      schema: { primarySchema: schema },
     });
     expect(result).toMatchObject({ day: unsupportedDay, v1ParticipantCount: 0, unsupportedSourceParticipantCount: 1 });
   }, 120_000);
@@ -987,7 +987,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community graph publication fences"
       yield* stream(700);
       throw new Error("synthetic stream interruption");
     }
-    const schemaOptions = { primarySchema: schema, ledgerSchema: "tibotattle_ledger" };
+    const schemaOptions = { primarySchema: schema };
     await expect(publishPostgresCommunityModelDayStream(pool, {
       sourcePin, members: interrupted(), day: DAY, nowMs: STRESS_NOW_MS, schema: schemaOptions,
     })).rejects.toMatchObject({ code: "unavailable", operation: "postgres.community_graph.publish_model_day" });

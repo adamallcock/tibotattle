@@ -1,9 +1,17 @@
 /**
- * Bounded Cloud Run maintenance operations backed by the operational
- * PostgreSQL schemas. This currently covers expiring identity handoffs and
- * the two-pass orphan-object journal. Owner restore replay and age-based
- * telemetry retention remain explicit incomplete gates; this module must not
- * report a full lifecycle pass while either is absent.
+ * Bounded Cloud Run maintenance operations backed by the one operational
+ * PostgreSQL schema. This currently covers expiring identity handoffs and
+ * sign-in admission windows, stale device lifecycle rows and the two-pass
+ * orphan-object journal. Age-based telemetry retention and analytics
+ * maintenance remain explicit incomplete gates; this module must not report
+ * a full lifecycle pass while either is absent.
+ *
+ * There is no deletion ledger, tombstone or re-enrollment cooldown to purge
+ * (decisions D2, D4 and D6 of 2026-09-26). How the report represents the
+ * retired ledger purge and the restore-replay, tombstone-retention and
+ * owner-erasure flags is open owner decision OD-4: the caller injects the
+ * owner's answer as PostgresMaintenanceReportPolicy, no default is taken, and
+ * a missing or malformed policy is refused before any connection.
  */
 import {
   createPostgresSchemaConfig,
@@ -44,18 +52,43 @@ type PurgeSpec = Readonly<{
 const IDENTITY_PURGES: readonly PurgeSpec[] = Object.freeze([
   { table: "apple_signin_handoffs", column: "expires_at", key: "state", comparison: "<=", batchSize: 100, operation: "maintenance.purge.apple_handoffs" },
   { table: "google_signin_handoffs", column: "expires_at", key: "state", comparison: "<=", batchSize: 100, operation: "maintenance.purge.google_handoffs" },
-  { table: "identity_reenrollment_cooldowns", column: "expires_at", key: "identity_cooldown_digest", comparison: "<=", batchSize: 100, operation: "maintenance.purge.primary_cooldowns" },
   { table: "sign_in_start_admission_windows", column: "window_started_at", key: "window_started_at", comparison: "<", batchSize: 1_000, operation: "maintenance.purge.signin_admission_windows" },
 ]);
 
-const LEDGER_PURGES: readonly PurgeSpec[] = Object.freeze([
-  { table: "identity_reenrollment_cooldowns", column: "retain_until", key: "identity_cooldown_digest", comparison: "<=", batchSize: 100, operation: "maintenance.purge.ledger_cooldowns" },
+/**
+ * OD-4 (open owner decision; no default): the report shape after the
+ * deletion ledger's removal.
+ *   identityPurgeLedger  OD-4(iv): "omitted" drops identityPurge.ledger;
+ *                        "constant" keeps it as {purged: 0, complete: true}
+ *                        (a count for a store that no longer exists, which
+ *                        the review flagged against the missing-evidence
+ *                        invariant).
+ *   restoreReplayComplete, deletionTombstoneRetentionComplete
+ *                        OD-4(ii): whether the log reports them true.
+ *   ownerErasureJobsComplete
+ *                        OD-4(iii).
+ * The previous report's values were all false with a real ledger purge
+ * receipt; no value here is the default.
+ */
+export interface PostgresMaintenanceReportPolicy {
+  readonly identityPurgeLedger: "omitted" | "constant";
+  readonly restoreReplayComplete: boolean;
+  readonly deletionTombstoneRetentionComplete: boolean;
+  readonly ownerErasureJobsComplete: boolean;
+}
+
+const REPORT_POLICY_KEYS = Object.freeze([
+  "deletionTombstoneRetentionComplete",
+  "identityPurgeLedger",
+  "ownerErasureJobsComplete",
+  "restoreReplayComplete",
 ]);
 
 export interface PostgresScheduledMaintenanceOptions {
   readonly primaryPool: PostgresPool;
-  readonly ledgerPool: PostgresPool;
   readonly objectStore: Pick<QuarantineObjectStore, "head" | "delete">;
+  /** OD-4: required, closed, never defaulted. */
+  readonly reportPolicy: PostgresMaintenanceReportPolicy;
   readonly schema?: PostgresSchemaOptions;
   readonly nowEpoch?: number;
 }
@@ -72,17 +105,18 @@ export interface PostgresScheduledMaintenanceResult {
   readonly leaseAcquired: boolean;
   readonly identityPurge: Readonly<{
     readonly primary: PostgresIdentityPurgeReceipt;
-    readonly ledger: PostgresIdentityPurgeReceipt;
+    /** Present only under OD-4 identityPurgeLedger "constant". */
+    readonly ledger?: PostgresIdentityPurgeReceipt;
     readonly complete: boolean;
   }>;
   readonly objectReconciliation: PostgresPendingObjectReconciliationResult | null;
   readonly objectReconciliationComplete: boolean;
   readonly deviceLifecycle: PostgresDeviceLifecycleReceipt;
   readonly deviceLifecycleComplete: boolean;
-  readonly ownerErasureJobsComplete: false;
-  readonly restoreReplayComplete: false;
+  readonly ownerErasureJobsComplete: boolean;
+  readonly restoreReplayComplete: boolean;
   readonly telemetryRetentionComplete: false;
-  readonly deletionTombstoneRetentionComplete: false;
+  readonly deletionTombstoneRetentionComplete: boolean;
   readonly analyticsMaintenanceComplete: false;
 }
 
@@ -97,12 +131,27 @@ function invalidOptions(): never {
 
 function safeSchema(options: PostgresSchemaOptions | undefined): {
   readonly primary: string;
-  readonly ledger: string;
 } {
   const configured = createPostgresSchemaConfig(options ?? {});
   return Object.freeze({
     primary: quotePostgresIdentifier(configured.primarySchema),
-    ledger: quotePostgresIdentifier(configured.ledgerSchema),
+  });
+}
+
+/** Validate the injected OD-4 policy as a closed record; never default it. */
+function reportPolicy(value: unknown): PostgresMaintenanceReportPolicy {
+  if (value === null || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).sort().join(",") !== REPORT_POLICY_KEYS.join(",")) return invalidOptions();
+  const policy = value as Record<string, unknown>;
+  if ((policy.identityPurgeLedger !== "omitted" && policy.identityPurgeLedger !== "constant")
+      || typeof policy.restoreReplayComplete !== "boolean"
+      || typeof policy.deletionTombstoneRetentionComplete !== "boolean"
+      || typeof policy.ownerErasureJobsComplete !== "boolean") return invalidOptions();
+  return Object.freeze({
+    identityPurgeLedger: policy.identityPurgeLedger,
+    restoreReplayComplete: policy.restoreReplayComplete,
+    deletionTombstoneRetentionComplete: policy.deletionTombstoneRetentionComplete,
+    ownerErasureJobsComplete: policy.ownerErasureJobsComplete,
   });
 }
 
@@ -244,12 +293,23 @@ async function withSessionLock<T>(
   }
 }
 
+function identityPurgeReport(
+  policy: PostgresMaintenanceReportPolicy,
+  primary: PostgresIdentityPurgeReceipt,
+): PostgresScheduledMaintenanceResult["identityPurge"] {
+  // OD-4(iv). Either way the retired ledger contributes nothing owed, so the
+  // identity purge is complete exactly when the primary purge is.
+  return policy.identityPurgeLedger === "constant"
+    ? Object.freeze({ primary, ledger: Object.freeze({ purged: 0, complete: true }), complete: primary.complete })
+    : Object.freeze({ primary, complete: primary.complete });
+}
+
 function baseResult(
+  policy: PostgresMaintenanceReportPolicy,
   outcome: PostgresScheduledMaintenanceResult["outcome"],
   code: string,
   leaseAcquired: boolean,
   primary: PostgresIdentityPurgeReceipt = Object.freeze({ purged: 0, complete: false }),
-  ledger: PostgresIdentityPurgeReceipt = Object.freeze({ purged: 0, complete: false }),
   objectReconciliation: PostgresPendingObjectReconciliationResult | null = null,
   objectReconciliationComplete = false,
   deviceLifecycle: PostgresDeviceLifecycleReceipt = Object.freeze({
@@ -266,15 +326,15 @@ function baseResult(
     code,
     complete: false,
     leaseAcquired,
-    identityPurge: Object.freeze({ primary, ledger, complete: primary.complete && ledger.complete }),
+    identityPurge: identityPurgeReport(policy, primary),
     objectReconciliation,
     objectReconciliationComplete,
     deviceLifecycle,
     deviceLifecycleComplete: deviceLifecycle.complete,
-    ownerErasureJobsComplete: false,
-    restoreReplayComplete: false,
+    ownerErasureJobsComplete: policy.ownerErasureJobsComplete,
+    restoreReplayComplete: policy.restoreReplayComplete,
     telemetryRetentionComplete: false,
-    deletionTombstoneRetentionComplete: false,
+    deletionTombstoneRetentionComplete: policy.deletionTombstoneRetentionComplete,
     analyticsMaintenanceComplete: false,
   });
 }
@@ -289,15 +349,16 @@ export async function runPostgresScheduledMaintenance(
 ): Promise<PostgresScheduledMaintenanceResult> {
   if (!options || typeof options !== "object"
       || !options.primaryPool || typeof options.primaryPool.connect !== "function"
-      || !options.ledgerPool || typeof options.ledgerPool.connect !== "function"
       || !options.objectStore || typeof options.objectStore.head !== "function"
-      || typeof options.objectStore.delete !== "function") return invalidOptions();
+      || typeof options.objectStore.delete !== "function"
+      // A caller still composing the retired deletion-ledger pool is stale.
+      || Object.hasOwn(options, "ledgerPool")) return invalidOptions();
+  const policy = reportPolicy(options.reportPolicy);
   const schema = safeSchema(options.schema);
   const nowEpoch = validateNow(options.nowEpoch ?? Date.now());
   const cutoff = new Date(nowEpoch).toISOString();
   let leaseAcquired = false;
   let primary: PostgresIdentityPurgeReceipt = Object.freeze({ purged: 0, complete: false });
-  let ledger: PostgresIdentityPurgeReceipt = Object.freeze({ purged: 0, complete: false });
   let objectReconciliation: PostgresPendingObjectReconciliationResult | null = null;
   let deviceLifecycle: PostgresDeviceLifecycleReceipt = Object.freeze({
     pairingsRevoked: 0,
@@ -313,20 +374,19 @@ export async function runPostgresScheduledMaintenance(
       const primaryHandoffs = await purgeSpecs(
         options.primaryPool,
         schema.primary,
-        IDENTITY_PURGES.slice(0, 3),
+        IDENTITY_PURGES.slice(0, 2),
         cutoff,
       );
       const admission = await purgePage(
         options.primaryPool,
         schema.primary,
-        IDENTITY_PURGES[3]!,
+        IDENTITY_PURGES[2]!,
         new Date(nowEpoch - POSTGRES_SIGNIN_ADMISSION_RETENTION_MILLISECONDS).toISOString(),
       );
       primary = Object.freeze({
         purged: primaryHandoffs.purged + admission.purged,
         complete: primaryHandoffs.complete && admission.complete,
       });
-      ledger = await purgeSpecs(options.ledgerPool, schema.ledger, LEDGER_PURGES, cutoff);
       deviceLifecycle = await purgePostgresStaleDeviceLifecycleRows(options.primaryPool, {
         schema: options.schema,
         nowEpoch,
@@ -341,24 +401,22 @@ export async function runPostgresScheduledMaintenance(
           maximumRegistrations: POSTGRES_MAINTENANCE_OBJECT_PAGE_SIZE,
         },
       );
-      return Object.freeze({ primary, ledger, deviceLifecycle, objectReconciliation });
+      return Object.freeze({ primary, deviceLifecycle, objectReconciliation });
     });
     if (!locked.acquired) {
-      return baseResult("skipped", "MAINTENANCE_IN_PROGRESS", false);
+      return baseResult(policy, "skipped", "MAINTENANCE_IN_PROGRESS", false);
     }
     const {
       primary: completedPrimary,
-      ledger: completedLedger,
       deviceLifecycle: completedDeviceLifecycle,
       objectReconciliation: completedObjects,
     } = locked.value;
     const reconciliationComplete = !completedObjects.hasMore
       && completedObjects.candidatesDeferred === 0;
-    const identityComplete = completedPrimary.complete && completedLedger.complete;
-    const code = !identityComplete || !reconciliationComplete || !completedDeviceLifecycle.complete
+    const code = !completedPrimary.complete || !reconciliationComplete || !completedDeviceLifecycle.complete
       ? "POSTGRES_MAINTENANCE_BACKLOG"
       : "POSTGRES_MAINTENANCE_INCOMPLETE_UNSUPPORTED_PHASES";
-    return baseResult("partial", code, true, completedPrimary, completedLedger,
+    return baseResult(policy, "partial", code, true, completedPrimary,
       completedObjects, reconciliationComplete, completedDeviceLifecycle);
   } catch (error) {
     const code = error instanceof PostgresStorageError
@@ -366,7 +424,7 @@ export async function runPostgresScheduledMaintenance(
       : error instanceof Error && error.name === "QuarantineObjectStorageUnavailableError"
         ? "QUARANTINE_OBJECT_STORAGE_UNAVAILABLE"
         : "POSTGRES_MAINTENANCE_UNAVAILABLE";
-    return baseResult("failure", code, leaseAcquired, primary, ledger, objectReconciliation, false,
+    return baseResult(policy, "failure", code, leaseAcquired, primary, objectReconciliation, false,
       deviceLifecycle);
   }
 }

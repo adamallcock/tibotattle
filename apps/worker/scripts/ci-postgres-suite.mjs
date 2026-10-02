@@ -138,7 +138,8 @@ export const UNREGISTERED_ALLOWLIST = Object.freeze([
  * SOCKET.
  */
 export const EXPECTED_HOST_PROFILE_FILES = Object.freeze([
-  "postgres-test/ledger-authority.spec.mjs",
+  // ledger-authority.spec.mjs, the other HOST file, was deleted with the
+  // deletion ledger (LEAD-SIMP, SIMP-4).
   "postgres-test/typed-v12-normalized.spec.mjs",
 ]);
 

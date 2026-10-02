@@ -99,7 +99,6 @@ const ADAPTER_EXPORTS = Object.freeze({
   transport: Object.freeze(["authenticatePostgresDevice"]),
   uploadAuthorization: Object.freeze(["createPostgresDeviceUploadAuthorization"]),
   controls: Object.freeze(["assertPostgresCollectionControlFromPool"]),
-  ledgerAuthority: Object.freeze(["hasPostgresDeletionTombstone"]),
   boundedBody: Object.freeze(["readBoundedRequestBody"]),
 });
 
@@ -113,8 +112,7 @@ function compositionError(message) {
  * @param {{
  *   adapters: Record<string, Record<string, unknown>>,
  *   primaryPool: unknown,
- *   ledgerPool: unknown,
- *   schemaOptions: Readonly<{ primarySchema: string, ledgerSchema: string }>,
+ *   schemaOptions: Readonly<{ primarySchema: string }>,
  *   admissionEnv: Readonly<Record<string, unknown>>,
  *   assertAdmissionBindings: (env: unknown) => void,
  *   assertAttemptAllowed: (...args: unknown[]) => Promise<void>,
@@ -150,12 +148,18 @@ export function createOriginIntakeComposition(options) {
   if (!Array.isArray(options.routePolicy)) {
     throw compositionError("routePolicy must be the Worker route policy");
   }
+  // One application schema: a stale second schema key is refused here
+  // rather than reaching a storage adapter at request time.
+  if (options.schemaOptions === null || typeof options.schemaOptions !== "object"
+      || Object.keys(options.schemaOptions).join(",") !== "primarySchema"
+      || typeof options.schemaOptions.primarySchema !== "string") {
+    throw compositionError("schemaOptions must carry exactly primarySchema");
+  }
   const {
-    primaryPool, ledgerPool, schemaOptions, admissionEnv, maxRequestBytes, assertStorageCurrent,
+    primaryPool, schemaOptions, admissionEnv, maxRequestBytes, assertStorageCurrent,
   } = options;
   const {
-    legacyAdmission, transportWriteAuthority, transport, uploadAuthorization, controls, ledgerAuthority,
-    boundedBody,
+    legacyAdmission, transportWriteAuthority, transport, uploadAuthorization, controls, boundedBody,
   } = adapters;
 
   const v11 = createTelemetryV11OriginIntake({
@@ -163,14 +167,12 @@ export function createOriginIntakeComposition(options) {
       live: adapters.live,
       bearer: adapters.bearer,
       transport: adapters.transport,
-      ledgerAuthority: adapters.ledgerAuthority,
       personalDevices: adapters.personalDevices,
       controls: adapters.controls,
       crypto: adapters.crypto,
       boundedBody: adapters.boundedBody,
     },
     primaryPool,
-    ledgerPool,
     schema: schemaOptions,
     admissionEnv,
     assertAdmissionBindings: options.assertAdmissionBindings,
@@ -198,7 +200,6 @@ export function createOriginIntakeComposition(options) {
 
   const uploadAuthorizations = createUploadAuthorizationRouteModule({
     primaryPool,
-    ledgerPool,
     schema: schemaOptions,
     maxRequestBytes,
     admissionEnv,
@@ -219,7 +220,6 @@ export function createOriginIntakeComposition(options) {
     authenticateDevice: (pool, header, routeOptions) => transport.authenticatePostgresDevice(pool, header, {
       ...routeOptions, accountlessAuthorizationVersion: "v1.1",
     }),
-    hasDeletionTombstone: ledgerAuthority.hasPostgresDeletionTombstone,
     readBoundedRequestBody: boundedBody.readBoundedRequestBody,
     createDeviceUploadAuthorization: uploadAuthorization.createPostgresDeviceUploadAuthorization,
   });

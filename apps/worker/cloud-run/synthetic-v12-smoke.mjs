@@ -35,9 +35,6 @@ export const SYNTHETIC_V12_SMOKE_DATABASE_TARGET = Object.freeze({
   primaryDatabase: CLOUD_RUN_IAM_TEST_TARGET.postgres.primary.database,
   primarySchema: CLOUD_RUN_IAM_TEST_TARGET.postgres.primary.schema,
   primaryInstance: CLOUD_RUN_IAM_TEST_TARGET.postgres.primary.instanceConnectionName,
-  ledgerDatabase: CLOUD_RUN_IAM_TEST_TARGET.postgres.ledger.database,
-  ledgerSchema: CLOUD_RUN_IAM_TEST_TARGET.postgres.ledger.schema,
-  ledgerInstance: CLOUD_RUN_IAM_TEST_TARGET.postgres.ledger.instanceConnectionName,
   postgresIamUser: CLOUD_RUN_IAM_TEST_TARGET.postgres.iamUser,
 });
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
@@ -124,30 +121,25 @@ export function parseSyntheticV12SmokeConfig(env) {
     fail("PUBLIC_V12_GATEWAY_ORIGIN_INVALID");
   }
 
+  // One database: the deletion ledger is retired (decisions D2, D4 and D6),
+  // so a LEDGER_ setting is a stale deployment and is refused.
+  if (Object.keys(env).some((name) => name.startsWith("LEDGER_"))) {
+    fail("POSTGRES_TEST_TARGET_CONFIGURATION_INVALID");
+  }
   const primarySchema = required(env.PRIMARY_SCHEMA, "PRIMARY_SCHEMA", SCHEMA_PATTERN);
-  const ledgerSchema = required(env.LEDGER_SCHEMA, "LEDGER_SCHEMA", SCHEMA_PATTERN);
   if (!SCHEMA_PATTERN.test(primarySchema) || primarySchema.startsWith("pg_")
-      || primarySchema === "information_schema"
-      || !SCHEMA_PATTERN.test(ledgerSchema) || ledgerSchema.startsWith("pg_")
-      || ledgerSchema === "information_schema" || primarySchema === ledgerSchema) {
+      || primarySchema === "information_schema") {
     fail("POSTGRES_SCHEMA_CONFIGURATION_INVALID");
   }
 
   const primaryDatabase = required(env.PRIMARY_DATABASE, "PRIMARY_DATABASE", DATABASE_PATTERN);
-  const ledgerDatabase = required(env.LEDGER_DATABASE, "LEDGER_DATABASE", DATABASE_PATTERN);
   const primaryInstance = required(
     env.PRIMARY_INSTANCE_CONNECTION_NAME, "PRIMARY_INSTANCE_CONNECTION_NAME", INSTANCE_PATTERN,
-  );
-  const ledgerInstance = required(
-    env.LEDGER_INSTANCE_CONNECTION_NAME, "LEDGER_INSTANCE_CONNECTION_NAME", INSTANCE_PATTERN,
   );
   const postgresIamUser = normalizeIamUser(required(env.POSTGRES_IAM_USER, "POSTGRES_IAM_USER", /.+/u));
   if (primaryDatabase !== SYNTHETIC_V12_SMOKE_DATABASE_TARGET.primaryDatabase
       || primarySchema !== SYNTHETIC_V12_SMOKE_DATABASE_TARGET.primarySchema
       || primaryInstance !== SYNTHETIC_V12_SMOKE_DATABASE_TARGET.primaryInstance
-      || ledgerDatabase !== SYNTHETIC_V12_SMOKE_DATABASE_TARGET.ledgerDatabase
-      || ledgerSchema !== SYNTHETIC_V12_SMOKE_DATABASE_TARGET.ledgerSchema
-      || ledgerInstance !== SYNTHETIC_V12_SMOKE_DATABASE_TARGET.ledgerInstance
       || postgresIamUser !== SYNTHETIC_V12_SMOKE_DATABASE_TARGET.postgresIamUser) {
     fail("POSTGRES_TEST_TARGET_CONFIGURATION_INVALID");
   }
@@ -160,11 +152,8 @@ export function parseSyntheticV12SmokeConfig(env) {
     origin: SMOKE_ORIGIN,
     publicV12GatewayOrigin,
     primarySchema,
-    ledgerSchema,
     primaryDatabase,
-    ledgerDatabase,
     primaryInstance,
-    ledgerInstance,
     postgresIamUser,
     bucket: SYNTHETIC_V12_SMOKE_BUCKET,
     envelopePublicJwk,
@@ -836,15 +825,15 @@ export async function runSyntheticV12Smoke({ config, dependencies }) {
     });
     expectStatus(healthResponse, health, 200, "SMOKE_HEALTH_FAILED");
     const primaryReceipt = health.checks?.primaryMigrationReceipt;
-    const ledgerReceipt = health.checks?.ledgerMigrationReceipt;
-    if (health.schemaVersion !== "gcp-postgres-test-health-v1"
+    // gcp-postgres-test-health-v2: the primary receipt only.
+    if (health.schemaVersion !== "gcp-postgres-test-health-v2"
         || health.scope !== "postgres_schema_and_migrations_only"
         || health.status !== "ready" || health.workerApplicationReady !== false
-        || health.checks?.postgresMajor !== 17
+        || !safeObject(health.checks)
+        || Object.keys(health.checks).sort().join(",") !== "postgresMajor,primaryMigrationReceipt"
+        || health.checks.postgresMajor !== 17
         || primaryReceipt?.status !== "current"
-        || !Number.isSafeInteger(primaryReceipt.version) || primaryReceipt.version < 39
-        || ledgerReceipt?.status !== "current"
-        || !Number.isSafeInteger(ledgerReceipt.version) || ledgerReceipt.version < 6) {
+        || !Number.isSafeInteger(primaryReceipt.version) || primaryReceipt.version < 39) {
       fail("SMOKE_HEALTH_CONTRACT_INVALID");
     }
 
@@ -1311,15 +1300,6 @@ async function createNativeDependencies(config) {
       applicationName: "tibotattle-synthetic-v12-smoke",
     });
     pools.push(primaryPool);
-    const ledgerPool = await createIamPool({
-      connector,
-      instanceConnectionName: config.ledgerInstance,
-      database: config.ledgerDatabase,
-      user: config.postgresIamUser,
-      max: 2,
-      applicationName: "tibotattle-synthetic-v12-smoke",
-    });
-    pools.push(ledgerPool);
     const accessToken = await createGoogleAccessTokenProvider();
     const auth = new GoogleAuth();
     let idTokenClient;
@@ -1348,7 +1328,6 @@ async function createNativeDependencies(config) {
         return await readPage(primaryPool, options, {
           schema: {
             primarySchema: config.primarySchema,
-            ledgerSchema: config.ledgerSchema,
           },
         });
       } catch {

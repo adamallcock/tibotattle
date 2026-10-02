@@ -69,9 +69,6 @@ function validEnv(overrides = {}) {
     PRIMARY_INSTANCE_CONNECTION_NAME: SYNTHETIC_V12_DISCOVERY_TARGETS.primary.instanceConnectionName,
     PRIMARY_DATABASE: SYNTHETIC_V12_DISCOVERY_TARGETS.primary.database,
     PRIMARY_SCHEMA: SYNTHETIC_V12_DISCOVERY_TARGETS.primary.schema,
-    LEDGER_INSTANCE_CONNECTION_NAME: SYNTHETIC_V12_DISCOVERY_TARGETS.ledger.instanceConnectionName,
-    LEDGER_DATABASE: SYNTHETIC_V12_DISCOVERY_TARGETS.ledger.database,
-    LEDGER_SCHEMA: SYNTHETIC_V12_DISCOVERY_TARGETS.ledger.schema,
     GCS_BUCKET_NAME: SYNTHETIC_V12_DISCOVERY_TARGETS.bucket,
     SYNTHETIC_V12_DISCOVERY_PARTICIPANT_ID: PARTICIPANT_ID,
     ...overrides,
@@ -87,7 +84,7 @@ function fakeManifest() {
     sql: "x",
     sha256: "a".repeat(64),
   }];
-  return { roles: { primary: migrations("primary"), ledger: migrations("ledger") } };
+  return { roles: { primary: migrations("primary") } };
 }
 
 function participantFixture(participantId = `synthetic-v12-smoke-${randomUUID()}`) {
@@ -211,11 +208,11 @@ function fakePrimaryPool({
 test("discovery config pins the single IAM-private Job and exact test Cloud SQL/GCS targets", () => {
   const parsed = parseSyntheticV12DiscoveryConfig(validEnv());
   assert.equal(SYNTHETIC_V12_DISCOVERY_TARGETS.primary.schema, "tibotattle_v12_a2_20260925");
-  assert.equal(SYNTHETIC_V12_DISCOVERY_TARGETS.ledger.schema, "tibotattle_ledger_v12_a2_20260925");
+  assert.deepEqual(Object.keys(SYNTHETIC_V12_DISCOVERY_TARGETS).includes("ledger"), false);
   assert.equal(SYNTHETIC_V12_DISCOVERY_TARGETS.bucket, "tibotattle-gcs-test-cleanup-20260925-a2");
   assert.equal(parsed.job, SYNTHETIC_V12_DISCOVERY_JOB);
   assert.equal(parsed.primary.instanceConnectionName, SYNTHETIC_V12_DISCOVERY_TARGETS.primary.instanceConnectionName);
-  assert.equal(parsed.ledger.instanceConnectionName, SYNTHETIC_V12_DISCOVERY_TARGETS.ledger.instanceConnectionName);
+  assert.equal("ledger" in parsed, false);
   assert.equal(parsed.bucket, SYNTHETIC_V12_DISCOVERY_TARGETS.bucket);
   assert.equal(parsed.participantId, PARTICIPANT_ID);
   for (const overrides of [
@@ -230,12 +227,13 @@ test("discovery config pins the single IAM-private Job and exact test Cloud SQL/
     { PRIMARY_INSTANCE_CONNECTION_NAME: "another:region:instance" },
     { PRIMARY_DATABASE: "another" },
     { PRIMARY_SCHEMA: "another" },
-    { LEDGER_INSTANCE_CONNECTION_NAME: "another:region:instance" },
-    { LEDGER_DATABASE: "another" },
-    { LEDGER_SCHEMA: "another" },
+    // The retired A2 ledger target is refused in any form.
+    { LEDGER_INSTANCE_CONNECTION_NAME: "tibotattle:us-east1:tibotattle-test-ledger-20260922" },
+    { LEDGER_DATABASE: "tibotattle_ledger" },
+    { LEDGER_SCHEMA: "tibotattle_ledger_v12_a2_20260925" },
+    { LEDGER_SCHEMA: "" },
     { GCS_BUCKET_NAME: "another-test-bucket" },
     { PRIMARY_SCHEMA: "tibotattle" },
-    { LEDGER_SCHEMA: "tibotattle_ledger" },
     { SYNTHETIC_V12_DISCOVERY_PARTICIPANT_ID: undefined },
     { SYNTHETIC_V12_DISCOVERY_PARTICIPANT_ID: "synthetic-v12-smoke-not-a-uuid" },
     { K_SERVICE: "accidental-service-context" },
@@ -362,13 +360,12 @@ test("tagged malformed ids, shared object keys, pending mismatches and unattribu
   }
 });
 
-test("job execution uses only pinned IAM database pools and keeps database snapshots distinct", async () => {
+test("job execution uses only the pinned IAM primary pool and one snapshot", async () => {
   const manifest = fakeManifest();
   const poolCalls = [];
   let closed = false;
   const owners = [participantFixture(PARTICIPANT_ID)];
   const primaryPool = {};
-  const ledgerPool = {};
   const result = await runSyntheticV12Discovery({
     env: validEnv(),
     dependencies: {
@@ -377,7 +374,7 @@ test("job execution uses only pinned IAM database pools and keeps database snaps
       createConnector: async () => ({ connector: true }),
       async createPool(options) {
         poolCalls.push(options);
-        return poolCalls.length === 1 ? primaryPool : ledgerPool;
+        return primaryPool;
       },
       async readPrimarySnapshot(pool) {
         assert.equal(pool, primaryPool);
@@ -393,23 +390,21 @@ test("job execution uses only pinned IAM database pools and keeps database snaps
           unattributablePendingReferenceCount: 0,
         };
       },
-      async readLedgerSnapshot(pool) {
-        assert.equal(pool, ledgerPool);
-        return { observedAt: "2026-09-25T00:00:01.000Z", migrationReceiptMatched: true };
-      },
       async closeResources({ pools }) {
-        assert.deepEqual(pools, [primaryPool, ledgerPool]);
+        assert.deepEqual(pools, [primaryPool]);
         closed = true;
       },
     },
   });
-  assert.equal(poolCalls.length, 2);
-  assert.deepEqual(poolCalls.map(({ max, applicationName }) => ({ max, applicationName })), [
-    { max: 1, applicationName: "tibotattle-synthetic-v12-discovery" },
-    { max: 1, applicationName: "tibotattle-synthetic-v12-discovery" },
+  assert.equal(poolCalls.length, 1);
+  assert.deepEqual(poolCalls.map(({ max, applicationName, instanceConnectionName }) =>
+    ({ max, applicationName, instanceConnectionName })), [
+    { max: 1, applicationName: "tibotattle-synthetic-v12-discovery",
+      instanceConnectionName: SYNTHETIC_V12_DISCOVERY_TARGETS.primary.instanceConnectionName },
   ]);
   assert.equal(closed, true);
-  assert.notEqual(result.primarySnapshotObservedAt, result.ledgerMigrationSnapshotObservedAt);
+  assert.equal(result.schemaVersion, "synthetic-v12-owner-discovery-v2");
+  assert.equal("ledgerMigrationSnapshotObservedAt" in result, false);
   assert.equal(result.targetParticipantId, PARTICIPANT_ID);
   assert.equal(result.owners[0].participantId, owners[0].participant.id);
   assert.equal(result.referencedGcsObjectCount, 1);
@@ -468,13 +463,24 @@ test("discovery refuses an ambiguous cohort or a target without one uploaded ref
           createConnector: async () => ({ connector: true }),
           async createPool() { return {}; },
           async readPrimarySnapshot() { return inventory; },
-          async readLedgerSnapshot() {
-            return { observedAt: "2026-09-25T00:00:01.000Z", migrationReceiptMatched: true };
-          },
           async closeResources() { closed = true; },
         },
       }), { code: "SYNTHETIC_DISCOVERY_TARGET_OWNER_INVENTORY_MISMATCH" });
       assert.equal(closed, true);
     });
   }
+});
+
+test("a manifest that still carries a second role is refused before any database access", async () => {
+  let connected = false;
+  const base = fakeManifest();
+  await assert.rejects(runSyntheticV12Discovery({
+    env: validEnv(),
+    dependencies: {
+      async readServiceAccountEmail() { return SYNTHETIC_V12_DISCOVERY_SERVICE_ACCOUNT; },
+      buildManifest: async () => ({ roles: { ...base.roles, ledger: base.roles.primary } }),
+      createConnector: async () => { connected = true; return {}; },
+    },
+  }), { code: "POSTGRES_SYNTHETIC_DISCOVERY_MIGRATION_SOURCE_INVALID" });
+  assert.equal(connected, false);
 });

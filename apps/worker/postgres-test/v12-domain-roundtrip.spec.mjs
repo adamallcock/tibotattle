@@ -121,7 +121,7 @@ it("current v1.2 domain activates and replays on real local PostgreSQL", async (
     ]);
 
     const domain = createPostgresTypedV12Domain(pool, {
-      schema: { primarySchema: schema, ledgerSchema: "tibotattle_ledger" },
+      schema: { primarySchema: schema },
     });
     const principal = { participantId, deviceId };
     const predecessor = await domain.createPredecessor(principal);

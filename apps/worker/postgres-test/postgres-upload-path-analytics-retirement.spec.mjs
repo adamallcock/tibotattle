@@ -377,7 +377,7 @@ async function v12Activation(pool, schema, t, modules, participantId, deviceId) 
   [manifestId, participantId, deviceId, DAY, manifestDigest,
     JSON.stringify({ schemaVersion: "telemetry-day-manifest-v1.2", day: DAY, chunks: [] }), now]);
   const domain = modules.createPostgresTypedV12Domain(pool, {
-    schema: { primarySchema: schema, ledgerSchema: "tibotattle_ledger" },
+    schema: { primarySchema: schema },
   });
   const principal = { participantId, deviceId };
   const predecessor = await domain.createPredecessor(principal);

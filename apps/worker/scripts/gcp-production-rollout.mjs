@@ -433,8 +433,11 @@ async function readBoundedJson(path, code, maxBytes = MAX_INPUT_BYTES) {
 /** The checkout's primary manifest: expand-compatible, and carrying the SIMP residue. */
 async function checkMigrations(context) {
   const migrations = await (context.readPrimaryMigrations ?? (() => readPostgresMigrations({ role: "primary" })))();
-  assertExpandCompatible(migrations);
+  // The residue gate first (as the migration Job orders it): an image
+  // without it is reported as such, although CONTRACT_MIGRATIONS, which
+  // reviews the residue, would also call its manifest stale.
   if (simpResidueMigration(migrations) === null) fail("PRODUCTION_SIMP_RESIDUE_MISSING");
+  assertExpandCompatible(migrations);
   return Object.freeze({ count: migrations.length, manifestSha256: primaryManifestSha256(migrations) });
 }
 

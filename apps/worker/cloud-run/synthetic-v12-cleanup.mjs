@@ -1,12 +1,43 @@
 #!/usr/bin/env node
 
-import { resolve } from "node:path";
+/**
+ * Synthetic v1.2 smoke-owner cleanup Job for the named A2 test deployment.
+ *
+ * It removes exactly one synthetic smoke participant (SIMP-1, plan-v5): there
+ * is no online erasure machinery, ledger, tombstone, cooldown, analytics
+ * retirement or erasure receipt of its own. The order is the plan-v5 SIMP-1
+ * brief's:
+ *
+ *   1. one bounded write transaction: lock the participant FOR UPDATE, apply
+ *      the discovery rules to it (synthetic-v12-discovery.mjs
+ *      readSyntheticV12CleanupTarget: exact synthetic tag, active social owner,
+ *      the per-owner family envelope, no upload in progress), read its object
+ *      keys and their pending registrations, then a plain
+ *      DELETE FROM participants for that one id. The primary's 0029 BEFORE
+ *      DELETE trigger marks the owner link erased and writes exactly one
+ *      storage_owner_erasure_receipts row, which the same transaction reads
+ *      back;
+ *   2. after commit, delete each object through the quarantine store's delete
+ *      primitive (a missing object counts as done);
+ *   3. clear the matching pending_objects registrations.
+ *
+ * A run that stops between 1 and 2 leaves the objects registered and
+ * unreferenced, which the scheduled pending-object reconciliation deletes
+ * after its safety window; a rerun finds the participant absent and changes
+ * nothing. A participant outside the synthetic rules is refused before any
+ * write. A participant that redeemed an enrollment grant is refused by
+ * primary 0063 (23514) and left untouched.
+ *
+ * The bucket-history proof requirement is unchanged pending owner decision
+ * OD-2. Whether the A2 deployment runs this Job again is owner decision OD-6.
+ */
+
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { Connector } from "@google-cloud/cloud-sql-connector";
-import { GcsErasureObjectStore, createGcsErasureBucketHistoryProof } from "../src/gcs-erasure-object-store.ts";
-import { eraseSyntheticPostgresV12Owner } from "../src/postgres-owner-erasure.ts";
-import { withPostgresRead } from "../src/postgres-client.ts";
+import { createGcsErasureBucketHistoryProof } from "../src/gcs-erasure-object-store.ts";
+import { createGcsQuarantineObjectStore } from "../src/gcs-quarantine-object-store.ts";
+import { withPostgresMutation, withPostgresRead } from "../src/postgres-client.ts";
 import {
   closeCloudSqlResources,
   createIamPool as createCloudSqlIamPool,
@@ -15,6 +46,7 @@ import {
 } from "./cloud-sql.mjs";
 import { buildPostgresMigrationManifest } from "./postgres-migrations.mjs";
 import { CLOUD_RUN_IAM_TEST_TARGET } from "./postgres-test-dispatch.mjs";
+import { readSyntheticV12CleanupTarget } from "./synthetic-v12-discovery.mjs";
 
 export const SYNTHETIC_V12_CLEANUP_JOB = "tibotattle-v12-synthetic-cleanup";
 export const SYNTHETIC_V12_CLEANUP_SERVICE_ACCOUNT =
@@ -22,9 +54,9 @@ export const SYNTHETIC_V12_CLEANUP_SERVICE_ACCOUNT =
 export const SYNTHETIC_V12_CLEANUP_MIGRATION_ROOT = "/app/apps/worker/postgres/migrations";
 export const SYNTHETIC_V12_CLEANUP_PARTICIPANT_PREFIX = "synthetic-v12-smoke-";
 export const SYNTHETIC_V12_CLEANUP_SERVICE = CLOUD_RUN_IAM_TEST_TARGET.service;
+export const SYNTHETIC_V12_CLEANUP_RECEIPT_SCHEMA = "synthetic-v12-owner-cleanup-receipt-v2";
 export const SYNTHETIC_V12_CLEANUP_TARGETS = Object.freeze({
   primary: CLOUD_RUN_IAM_TEST_TARGET.postgres.primary,
-  ledger: CLOUD_RUN_IAM_TEST_TARGET.postgres.ledger,
   iamUser: CLOUD_RUN_IAM_TEST_TARGET.postgres.iamUser,
   project: CLOUD_RUN_IAM_TEST_TARGET.project,
   origin: CLOUD_RUN_IAM_TEST_TARGET.origin,
@@ -40,10 +72,15 @@ const SCHEMA_PATTERN = /^[a-z_][a-z0-9_]{0,62}$/u;
 const INSTANCE_PATTERN = /^[A-Za-z0-9_.:-]{1,200}$/u;
 const DATABASE_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/u;
 const EXPECTED_MIGRATION_SHAPES = Object.freeze({
-  primary: Object.freeze({ count: 63, tail: "0063_enrollment_grants_erased_redeemer.sql" }),
-  ledger: Object.freeze({ count: 7, tail: "0007_production_transfer_control.sql" }),
+  primary: Object.freeze({ count: 64, tail: "0064_append_only_residue.sql" }),
 });
 const APPLICATION_NAME = "tibotattle-synthetic-v12-cleanup";
+const OBJECT_KEY_LIMIT = 1;
+const PENDING_TOKEN_PATTERN = /^[0-9a-f]{32}$/u;
+const TRANSACTION_LIMITS = Object.freeze({
+  statementTimeoutMilliseconds: 10_000,
+  lockTimeoutMilliseconds: 5_000,
+});
 
 function fail(code) {
   throw Object.assign(new Error(code), { code });
@@ -162,17 +199,12 @@ export function parseSyntheticV12CleanupConfig(env, attachedServiceAccountEmail)
   }
 
   const primary = SYNTHETIC_V12_CLEANUP_TARGETS.primary;
-  const ledger = SYNTHETIC_V12_CLEANUP_TARGETS.ledger;
   if (env.PRIMARY_INSTANCE_CONNECTION_NAME !== primary.instanceConnectionName
       || env.PRIMARY_DATABASE !== primary.database || env.PRIMARY_SCHEMA !== primary.schema
-      || env.LEDGER_INSTANCE_CONNECTION_NAME !== ledger.instanceConnectionName
-      || env.LEDGER_DATABASE !== ledger.database || env.LEDGER_SCHEMA !== ledger.schema
       || !SCHEMA_PATTERN.test(env.PRIMARY_SCHEMA ?? "")
-      || !SCHEMA_PATTERN.test(env.LEDGER_SCHEMA ?? "")
       || !INSTANCE_PATTERN.test(env.PRIMARY_INSTANCE_CONNECTION_NAME ?? "")
-      || !INSTANCE_PATTERN.test(env.LEDGER_INSTANCE_CONNECTION_NAME ?? "")
       || !DATABASE_PATTERN.test(env.PRIMARY_DATABASE ?? "")
-      || !DATABASE_PATTERN.test(env.LEDGER_DATABASE ?? "")) {
+      || Object.keys(env).some((name) => name.startsWith("LEDGER_"))) {
     fail("POSTGRES_SYNTHETIC_CLEANUP_TARGET_INVALID");
   }
   if (env.GCS_BUCKET_NAME !== SYNTHETIC_V12_CLEANUP_TARGETS.bucket) {
@@ -187,7 +219,6 @@ export function parseSyntheticV12CleanupConfig(env, attachedServiceAccountEmail)
     service: SYNTHETIC_V12_CLEANUP_SERVICE,
     origin: SYNTHETIC_V12_CLEANUP_TARGETS.origin,
     primary,
-    ledger,
     iamUser: SYNTHETIC_V12_CLEANUP_TARGETS.iamUser,
     bucket: env.GCS_BUCKET_NAME,
     historyProof,
@@ -230,6 +261,11 @@ export async function readAttachedSyntheticCleanupServiceAccount({
 }
 
 function validateMigrations(manifest) {
+  if (manifest === null || typeof manifest !== "object"
+      || manifest.roles === null || typeof manifest.roles !== "object"
+      || Object.keys(manifest.roles).join(",") !== Object.keys(EXPECTED_MIGRATION_SHAPES).join(",")) {
+    fail("POSTGRES_SYNTHETIC_CLEANUP_MIGRATION_SOURCE_INVALID");
+  }
   for (const [role, shape] of Object.entries(EXPECTED_MIGRATION_SHAPES)) {
     const entries = manifest?.roles?.[role];
     if (!Array.isArray(entries) || entries.length !== shape.count
@@ -289,6 +325,168 @@ async function verifyPostgres17MigrationReceipt(pool, target, role, migrations) 
   }
 }
 
+/** Keep this Job's own closed codes and the discovery rule codes it reuses. */
+function preserveCleanupError(error) {
+  return error instanceof Error
+      && error.message === error.code
+      && typeof error.code === "string"
+      && /^(?:POSTGRES_)?SYNTHETIC_(?:CLEANUP|DISCOVERY)_[A-Z0-9_]+$/u.test(error.code)
+    ? error
+    : null;
+}
+
+function rowsOf(result, code) {
+  if (result === null || typeof result !== "object" || !Array.isArray(result.rows)) fail(code);
+  return result.rows;
+}
+
+/**
+ * Step 1: one bounded write transaction that locks, re-checks, reads the
+ * object references and deletes the one participant. Returns null when the
+ * participant is already absent (an idempotent rerun).
+ */
+async function deleteSyntheticParticipant(pool, schema, participantId) {
+  const quoted = quoteSchema(schema);
+  return withPostgresMutation(pool, async (client) => {
+    const participants = rowsOf(await client.query(
+      `SELECT id, state, owner_kind, identity_link_key
+         FROM ${quoted}."participants" WHERE id = $1 FOR UPDATE`,
+      [participantId],
+    ), "POSTGRES_SYNTHETIC_CLEANUP_READBACK_INVALID");
+    if (participants.length === 0) return null;
+    if (participants.length !== 1) fail("POSTGRES_SYNTHETIC_CLEANUP_READBACK_INVALID");
+    // The discovery rules, under this transaction's participant lock.
+    const objectKeys = await readSyntheticV12CleanupTarget(client, schema, participants[0]);
+    if (!Array.isArray(objectKeys) || objectKeys.length > OBJECT_KEY_LIMIT) {
+      fail("SYNTHETIC_CLEANUP_OBJECT_REFERENCES_UNSUPPORTED");
+    }
+    const owners = rowsOf(await client.query(
+      `SELECT owner_digest FROM ${quoted}."storage_v11_owner_links"
+        WHERE participant_id = $1 AND state = 'active' FOR UPDATE`,
+      [participantId],
+    ), "POSTGRES_SYNTHETIC_CLEANUP_READBACK_INVALID");
+    const ownerDigest = owners[0]?.owner_digest;
+    if (owners.length !== 1 || !SHA256_PATTERN.test(ownerDigest ?? "")) {
+      fail("SYNTHETIC_CLEANUP_OWNER_LINK_INVALID");
+    }
+    const registrations = objectKeys.length === 0 ? [] : rowsOf(await client.query(
+      `SELECT contribution_id, object_key, registration_token
+         FROM ${quoted}."pending_objects"
+        WHERE object_key = $1 AND object_kind = 'telemetry_v12'
+          AND reconciliation_state = 'registered'
+        FOR UPDATE`,
+      [objectKeys[0]],
+    ), "POSTGRES_SYNTHETIC_CLEANUP_READBACK_INVALID");
+    if (registrations.length !== objectKeys.length
+        || registrations.some((row) => row?.object_key !== objectKeys[0]
+          || typeof row?.contribution_id !== "string"
+          || !PENDING_TOKEN_PATTERN.test(row?.registration_token ?? ""))) {
+      fail("SYNTHETIC_CLEANUP_PENDING_REFERENCE_INVALID");
+    }
+    let deleted;
+    try {
+      deleted = await client.query(
+        `DELETE FROM ${quoted}."participants" WHERE id = $1 AND state = 'active'`,
+        [participantId],
+      );
+    } catch (error) {
+      // Primary 0063 refuses the redeemed grant's SET NULL with 23514: the
+      // participant redeemed an enrollment grant and is left untouched.
+      if (error?.code === "23514") fail("SYNTHETIC_CLEANUP_PARTICIPANT_GRANT_REDEEMED");
+      throw error;
+    }
+    if (deleted?.rowCount !== 1) fail("POSTGRES_SYNTHETIC_CLEANUP_DELETE_UNEXPECTED");
+    // The 0029 trigger's receipt, written in this transaction.
+    const receipts = rowsOf(await client.query(
+      `SELECT count(*)::integer AS receipts
+         FROM ${quoted}."storage_owner_erasure_receipts" WHERE owner_digest = $1`,
+      [ownerDigest],
+    ), "POSTGRES_SYNTHETIC_CLEANUP_READBACK_INVALID");
+    if (receipts.length !== 1 || receipts[0]?.receipts !== 1) {
+      fail("POSTGRES_SYNTHETIC_CLEANUP_ERASURE_RECEIPT_MISSING");
+    }
+    return Object.freeze({
+      registrations: Object.freeze(registrations.map((row) => Object.freeze({
+        contributionId: row.contribution_id,
+        objectKey: row.object_key,
+        registrationToken: row.registration_token,
+      }))),
+    });
+  }, {
+    ...TRANSACTION_LIMITS,
+    operation: "postgres.synthetic_cleanup.delete_participant",
+    preserveSafeError: preserveCleanupError,
+  });
+}
+
+/** Step 3: clear the deleted objects' registrations; another reconciler may already have. */
+async function clearRegistrations(pool, schema, registrations) {
+  if (registrations.length === 0) return;
+  const quoted = quoteSchema(schema);
+  await withPostgresMutation(pool, async (client) => {
+    for (const registration of registrations) {
+      const cleared = await client.query(
+        `DELETE FROM ${quoted}."pending_objects"
+          WHERE contribution_id = $1 AND object_key = $2 AND registration_token = $3
+            AND object_kind = 'telemetry_v12' AND reconciliation_state = 'registered'`,
+        [registration.contributionId, registration.objectKey, registration.registrationToken],
+      );
+      if (cleared?.rowCount !== 0 && cleared?.rowCount !== 1) {
+        fail("POSTGRES_SYNTHETIC_CLEANUP_PENDING_CLEAR_UNEXPECTED");
+      }
+    }
+  }, {
+    ...TRANSACTION_LIMITS,
+    operation: "postgres.synthetic_cleanup.clear_registrations",
+    preserveSafeError: preserveCleanupError,
+  });
+}
+
+/**
+ * Steps 1 to 3 for one participant on one primary pool and schema, with the
+ * quarantine store's delete primitive. Returns {status: "complete",
+ * objectsDeleted, erasureReceipts: 1}, {status: "absent", objectsDeleted: 0}
+ * for an already removed participant, or {status: "incomplete", code} when
+ * the participant is gone but an object or registration is left for the
+ * pending-object reconciliation. Refusals throw a closed code before any
+ * write.
+ */
+export async function cleanupSyntheticV12Participant({ pool, schema, participantId, objectStore } = {}) {
+  validateParticipantId(participantId);
+  quoteSchema(schema);
+  if (pool === null || typeof pool !== "object" || typeof pool.connect !== "function"
+      || objectStore === null || typeof objectStore !== "object"
+      || typeof objectStore.delete !== "function") {
+    fail("SYNTHETIC_CLEANUP_DEPENDENCIES_INVALID");
+  }
+  let deleted;
+  try {
+    deleted = await deleteSyntheticParticipant(pool, schema, participantId);
+  } catch (error) {
+    const safe = preserveCleanupError(error);
+    if (safe !== null) throw safe;
+    fail("POSTGRES_SYNTHETIC_CLEANUP_DELETE_FAILED");
+  }
+  if (deleted === null) return Object.freeze({ status: "absent", objectsDeleted: 0 });
+  let objectsDeleted = 0;
+  for (const registration of deleted.registrations) {
+    try {
+      await objectStore.delete(registration.objectKey);
+    } catch {
+      // The participant is gone; its registered, unreferenced objects stay
+      // for the pending-object reconciliation.
+      return Object.freeze({ status: "incomplete", code: "GCS_SYNTHETIC_CLEANUP_OBJECT_DELETE_DEFERRED" });
+    }
+    objectsDeleted += 1;
+  }
+  try {
+    await clearRegistrations(pool, schema, deleted.registrations);
+  } catch {
+    return Object.freeze({ status: "incomplete", code: "POSTGRES_SYNTHETIC_CLEANUP_PENDING_CLEAR_DEFERRED" });
+  }
+  return Object.freeze({ status: "complete", objectsDeleted, erasureReceipts: 1 });
+}
+
 /** Execute a fixed one-owner test cleanup with injectable cloud/SQL adapters. */
 export async function runSyntheticV12Cleanup({ env = process.env, dependencies = {} } = {}) {
   if (env === null || typeof env !== "object"
@@ -330,32 +528,21 @@ export async function runSyntheticV12Cleanup({ env = process.env, dependencies =
       applicationName: APPLICATION_NAME,
     });
     pools.push(primaryPool);
-    const ledgerPool = await createPool({
-      connector,
-      instanceConnectionName: config.ledger.instanceConnectionName,
-      database: config.ledger.database,
-      user: config.iamUser,
-      max: 2,
-      applicationName: APPLICATION_NAME,
-    });
-    pools.push(ledgerPool);
-    await Promise.all([
-      verifyPostgres17MigrationReceipt(primaryPool, config.primary, "primary", manifest.roles.primary),
-      verifyPostgres17MigrationReceipt(ledgerPool, config.ledger, "ledger", manifest.roles.ledger),
-    ]);
+    await verifyPostgres17MigrationReceipt(primaryPool, config.primary, "primary", manifest.roles.primary);
     const accessToken = await (dependencies.createAccessTokenProvider ?? createGoogleAccessTokenProvider)();
+    // OD-2: the quarantine store keeps the bucket-history proof it needs to
+    // prove a missing object absent on a soft-delete-disabled bucket.
     const objectStore = await (dependencies.createObjectStore ?? (({ bucket, tokenProvider, historyProof }) =>
-      new GcsErasureObjectStore(bucket, tokenProvider, globalThis.fetch, 30_000, historyProof)))({
+      createGcsQuarantineObjectStore(bucket, tokenProvider, globalThis.fetch, 30_000, historyProof)))({
       bucket: config.bucket,
       tokenProvider: accessToken,
       historyProof: config.historyProof,
     });
-    result = await (dependencies.eraseOwner ?? eraseSyntheticPostgresV12Owner)({
-      primaryPool,
-      ledgerPool,
-      objectStore,
+    result = await (dependencies.cleanupParticipant ?? cleanupSyntheticV12Participant)({
+      pool: primaryPool,
+      schema: config.primary.schema,
       participantId: config.participantId,
-      schema: { primarySchema: config.primary.schema, ledgerSchema: config.ledger.schema },
+      objectStore,
     });
   } catch (error) {
     operationError = error;
@@ -384,14 +571,14 @@ async function main() {
   try {
     const receipt = await runSyntheticV12Cleanup();
     console.log(JSON.stringify({
-      schemaVersion: "synthetic-v12-owner-cleanup-receipt-v1",
+      schemaVersion: SYNTHETIC_V12_CLEANUP_RECEIPT_SCHEMA,
       status: receipt.status,
       ...(receipt.status === "incomplete" ? { code: receipt.code } : { objectsDeleted: receipt.objectsDeleted }),
     }));
     if (receipt.status === "incomplete") process.exitCode = 2;
   } catch (error) {
     console.error(JSON.stringify({
-      schemaVersion: "synthetic-v12-owner-cleanup-receipt-v1",
+      schemaVersion: SYNTHETIC_V12_CLEANUP_RECEIPT_SCHEMA,
       status: "error",
       code: safeCode(error),
     }));

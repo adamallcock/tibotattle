@@ -32,9 +32,10 @@ const SECRET_PATH_PARTS = new Set([
   "credentials.json",
   "service-account.json",
 ]);
-const EXPECTED_PRIMARY_MIGRATION_COUNT = 63;
-const EXPECTED_LEDGER_MIGRATION_COUNT = 7;
-const EXPECTED_PRIMARY_MIGRATION_TAIL = "0063_enrollment_grants_erased_redeemer.sql";
+// Primary only: the frozen ledger fragments stay in the repository (owner
+// action OA-4) and never enter the qualification image.
+const EXPECTED_PRIMARY_MIGRATION_COUNT = 64;
+const EXPECTED_PRIMARY_MIGRATION_TAIL = "0064_append_only_residue.sql";
 
 const ALLOWLIST = Object.freeze([
   Object.freeze({ source: "gcp-test/package.json", destination: "apps/worker/gcp-test/package.json" }),
@@ -47,7 +48,7 @@ const ALLOWLIST = Object.freeze([
   // scripts/ path re-exports, and the shared runtime-grant policy.
   Object.freeze({ source: "cloud-run/postgres-migrations.mjs", destination: "apps/worker/cloud-run/postgres-migrations.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-runtime-grants.mjs", destination: "apps/worker/cloud-run/postgres-runtime-grants.mjs" }),
-  Object.freeze({ source: "postgres/migrations", destination: "apps/worker/postgres/migrations" }),
+  Object.freeze({ source: "postgres/migrations/primary", destination: "apps/worker/postgres/migrations/primary" }),
   Object.freeze({ source: "cloud-run/postgres-community-graph-benchmark.mjs", destination: "apps/worker/cloud-run/postgres-community-graph-benchmark.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-community-graph-benchmark.check.mjs", destination: "apps/worker/cloud-run/postgres-community-graph-benchmark.check.mjs" }),
 ]);
@@ -148,27 +149,23 @@ async function validateSource() {
     role: "primary",
     rootDirectory: join(WORKER_ROOT, "postgres", "migrations"),
   });
-  const ledger = await readPostgresMigrations({
-    role: "ledger",
-    rootDirectory: join(WORKER_ROOT, "postgres", "migrations"),
-  });
-  if (primary.length === 0 || ledger.length === 0) fail("GCP_TEST_CONTEXT_MIGRATIONS_EMPTY");
+  if (primary.length === 0) fail("GCP_TEST_CONTEXT_MIGRATIONS_EMPTY");
   if (primary.length !== EXPECTED_PRIMARY_MIGRATION_COUNT
-      || ledger.length !== EXPECTED_LEDGER_MIGRATION_COUNT
       || primary.at(-1)?.name !== EXPECTED_PRIMARY_MIGRATION_TAIL) {
     fail("GCP_TEST_CONTEXT_MIGRATION_SET_UNEXPECTED");
   }
   const primaryPaths = files.filter((file) =>
     file.destination.startsWith("apps/worker/postgres/migrations/primary/"),
   );
-  const ledgerPaths = files.filter((file) =>
-    file.destination.startsWith("apps/worker/postgres/migrations/ledger/"),
+  const otherPostgresPaths = files.filter((file) =>
+    file.destination.startsWith("apps/worker/postgres/")
+      && !file.destination.startsWith("apps/worker/postgres/migrations/primary/"),
   );
-  if (primaryPaths.length !== primary.length || ledgerPaths.length !== ledger.length) {
+  if (primaryPaths.length !== primary.length || otherPostgresPaths.length !== 0) {
     fail("GCP_TEST_CONTEXT_MIGRATION_PATH_SET_UNEXPECTED");
   }
   const digest = await digestFiles(files);
-  return Object.freeze({ files, digest, primary, ledger });
+  return Object.freeze({ files, digest, primary });
 }
 
 async function digestCopiedFiles(target, files) {
@@ -239,7 +236,6 @@ try {
       mode: "check",
       fileCount: source.files.length,
       primaryMigrations: source.primary.length,
-      ledgerMigrations: source.ledger.length,
       sourceContentDigest: source.digest,
     }, null, 2));
   } else {
@@ -250,7 +246,6 @@ try {
       output: target,
       fileCount: source.files.length,
       primaryMigrations: source.primary.length,
-      ledgerMigrations: source.ledger.length,
       sourceContentDigest: source.digest,
     }, null, 2));
   }

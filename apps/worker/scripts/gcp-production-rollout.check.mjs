@@ -82,16 +82,11 @@ const IMAGE = `${TARGET.imageRepository}@${DIGEST}`;
 const CONTRACT_PATH = "apps/worker/src/edge-origin-contract.ts";
 const TOKEN = "eyJhbGciOiJSUzI1NiJ9.eyJzeW50aGV0aWMiOnRydWV9.c3ludGhldGlj";
 
-const base = await readPostgresMigrations({ role: "primary" });
-const RESIDUE_SQL = "SELECT 1;\n";
-const MIGRATIONS = Object.freeze([...base, Object.freeze({
-  role: "primary",
-  version: base.length + 1,
-  name: `${String(base.length + 1).padStart(4, "0")}_simp_append_only_residue.sql`,
-  bytes: Buffer.byteLength(RESIDUE_SQL),
-  sha256: createHash("sha256").update(RESIDUE_SQL).digest("hex"),
-  sql: RESIDUE_SQL,
-})]);
+// The checkout's real manifest, which ends with LEAD-SIMP's residue
+// (0064_append_only_residue.sql, provisional name OD-1). The "missing
+// residue" case slices it off rather than naming a file at a fixed number.
+const MIGRATIONS = Object.freeze(await readPostgresMigrations({ role: "primary" }));
+const residueFree = Object.freeze(MIGRATIONS.slice(0, -1));
 
 const isCode = (code) => (error) => error?.code === code;
 
@@ -593,7 +588,7 @@ test("migrate: preflight, quiescent jobs, two labelled pre-migration backups, th
 test("migrate refuses before any backup or lock when the checkout lacks the SIMP residue or is not the commit", async (t) => {
   const paths = await workspace(t);
   for (const [setup, code] of [
-    [{ readPrimaryMigrations: async () => base }, "PRODUCTION_SIMP_RESIDUE_MISSING"],
+    [{ readPrimaryMigrations: async () => residueFree }, "PRODUCTION_SIMP_RESIDUE_MISSING"],
     [{ readPrimaryMigrations: async () => [...MIGRATIONS.slice(0, -1), { ...MIGRATIONS.at(-1), sql: "DROP TABLE participants;\n",
       sha256: createHash("sha256").update("DROP TABLE participants;\n").digest("hex") }] },
     "PRODUCTION_MIGRATION_CONTRACT_UNREVIEWED"],

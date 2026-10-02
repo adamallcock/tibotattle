@@ -1305,7 +1305,7 @@ function validReader(reader) {
 }
 
 async function verifyEffectiveReader({ source, pool, targetSchema, reader }) {
-  const options = { schema: { primarySchema: targetSchema, ledgerSchema: `${targetSchema.slice(0, 55)}_ledger` } };
+  const options = { schema: { primarySchema: targetSchema } };
   const participants = source.all("SELECT DISTINCT participant_id FROM telemetry_v12_domains ORDER BY 1")
     .map(row => row.participant_id);
   const headSql = expectedSql(true);

@@ -98,7 +98,6 @@ test("routing over the real postgres-test directory derives exactly the frozen H
   assert.deepEqual(plan.failures, []);
   assert.deepEqual(plan.hostProfileFiles, [...EXPECTED_HOST_PROFILE_FILES].sort());
   assert.deepEqual([...EXPECTED_HOST_PROFILE_FILES].sort(), [
-    "postgres-test/ledger-authority.spec.mjs",
     "postgres-test/typed-v12-normalized.spec.mjs",
   ]);
   const onDisk = await listPostgresTestFiles(WORKER_ROOT);
@@ -244,9 +243,9 @@ test("a spec whose derived route changes fails PROFILE_ROUTING_DRIFT or PROFILE_
     assert.equal(plan.failures[0].file, "postgres-test/postgres-maintenance.spec.mjs");
   });
   await withWorkerCopy(async (root) => {
-    const ledger = join(root, "postgres-test/ledger-authority.spec.mjs");
-    const source = await readFile(ledger, "utf8");
-    await writeFile(ledger, source.replace(
+    const hostOnly = join(root, "postgres-test/typed-v12-normalized.spec.mjs");
+    const source = await readFile(hostOnly, "utf8");
+    await writeFile(hostOnly, source.replace(
       "skip: !PG_TEST_HOST,",
       "skip: !PG_TEST_HOST && !process.env.PG_TEST_SOCKET,",
     ));
@@ -279,7 +278,10 @@ test("the real registration leaves exactly the ten allowlisted specs unregistere
   const journey = "postgres-test/gcp-cloud-run-journey-fixture.spec.mjs";
   assert.ok(!UNREGISTERED_ALLOWLIST.includes(journey));
   assert.deepEqual(registered.get(journey), ["vitest.node.config.ts"]);
-  assert.deepEqual(registered.get("postgres-test/ledger-authority.spec.mjs"), ["postgres:domain:check"]);
+  assert.deepEqual(registered.get("postgres-test/postgres-maintenance.spec.mjs"), ["postgres:domain:check"]);
+  for (const added of ["postgres-test/append-only-residue.spec.mjs", "postgres-test/online-erasure-absence.spec.mjs"]) {
+    assert.deepEqual(registered.get(added), ["postgres:domain:check"], added);
+  }
 });
 
 test("a new unregistered spec fails UNREGISTERED_POSTGRES_SPEC", async () => {
@@ -888,7 +890,7 @@ test("the runner sends each file to its routed profile and never sets PG_TEST_PA
 
 test("a skip inside the routed pass fails the whole run", async () => {
   const plan = await planPostgresSuite({ workerRoot: WORKER_ROOT });
-  const { run } = fakeSuiteRunner({ plan, skipFile: "postgres-test/ledger-authority.spec.mjs" });
+  const { run } = fakeSuiteRunner({ plan, skipFile: "postgres-test/typed-v12-normalized.spec.mjs" });
   const summary = await runPostgresSuite({
     workerRoot: WORKER_ROOT,
     environment: { PG_TEST_SOCKET: SOCKET, PG_TEST_PORT: "5432" },
@@ -898,7 +900,7 @@ test("a skip inside the routed pass fails the whole run", async () => {
   });
   assert.equal(summary.status, "failed");
   assert.deepEqual(summary.skipped, [{
-    file: "postgres-test/ledger-authority.spec.mjs",
+    file: "postgres-test/typed-v12-normalized.spec.mjs",
     test: "gated",
     pass: "HOST",
   }]);

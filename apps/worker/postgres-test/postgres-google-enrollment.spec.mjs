@@ -123,13 +123,10 @@ test("PostgreSQL Google proof enrollment issues one bound social owner and Worke
     connectionTimeoutMillis: 5_000,
   };
   const primaryPool = new pg.Pool({ ...poolOptions, application_name: "pg-google-enrollment-primary-test" });
-  const ledgerPool = new pg.Pool({ ...poolOptions, application_name: "pg-google-enrollment-ledger-test" });
   const schemaSuffix = randomBytes(5).toString("hex");
   const primarySchema = `google_enroll_p_${schemaSuffix}`;
-  const ledgerSchema = `google_enroll_l_${schemaSuffix}`;
-  const schemaOptions = { primarySchema, ledgerSchema };
+  const schemaOptions = { primarySchema };
   let primaryCreated = false;
-  let ledgerCreated = false;
   try {
     const locality = await primaryPool.query(
       "SELECT current_setting('server_version_num')::integer AS version, inet_server_addr() AS address",
@@ -139,10 +136,7 @@ test("PostgreSQL Google proof enrollment issues one bound social owner and Worke
     assert.equal(locality.rows[0].address, null, "qualification requires a local Unix socket");
     await primaryPool.query(`CREATE SCHEMA "${primarySchema}"`);
     primaryCreated = true;
-    await ledgerPool.query(`CREATE SCHEMA "${ledgerSchema}"`);
-    ledgerCreated = true;
     await applyPostgresMigrations({ role: "primary", schema: primarySchema, pool: primaryPool });
-    await applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool: ledgerPool });
     await setControls(primaryPool, primarySchema);
 
     const env = {
@@ -185,7 +179,6 @@ test("PostgreSQL Google proof enrollment issues one bound social owner and Worke
     });
     const enrollmentDispatch = googleEnrollment.createPostgresGoogleEnrollmentDispatch({
       primaryPool,
-      ledgerPool,
       schemaOptions,
       privateOrigin: PRIVATE_ORIGIN,
       env,
@@ -525,31 +518,31 @@ test("PostgreSQL Google proof enrollment issues one bound social owner and Worke
     )), null);
     env.ENROLLMENT_MODE = "open";
 
-    // Both independent cooldown stores block a fresh identity. The digest is
-    // purpose-separated and never remains on the new participant row.
-    const cooldownFlow = await finishHandoff("cooldown-owner");
-    const cooldownDigest = await retention.identityReenrollmentCooldownDigest(
-      IDENTITY_LINK_SECRET,
-      cooldownFlow.linkKeyHex,
-    );
-    const nowIso = new Date().toISOString();
-    const untilIso = new Date(Date.now() + 24 * 60 * 60_000).toISOString();
-    await ledgerPool.query(
-      `INSERT INTO ${q(ledgerSchema, "identity_reenrollment_cooldowns")}
-       (identity_cooldown_digest, schema_version, deleted_at, retain_until)
-       VALUES ($1, 'identity-reenrollment-cooldown-v0.1', $2::timestamptz, $3::timestamptz)`,
-      [cooldownDigest, nowIso, untilIso],
-    );
-    const cooldownRefused = await enrollmentDispatch(enrollmentRequest(cooldownFlow.identity));
-    assert.equal(cooldownRefused.status, 409);
-    assert.equal((await cooldownRefused.json()).error.code, "IDENTITY_REENROLLMENT_COOLDOWN");
+    // There is no re-enrollment cooldown (decisions D2 and D6): an identity
+    // whose participant the offline purge removed enrolls again as a new
+    // participant, and the purpose-separated digest never remains on the row.
+    assert.equal((await poolRow(primaryPool, "SELECT to_regclass($1) IS NULL AS absent",
+      [q(primarySchema, "identity_reenrollment_cooldowns")]))?.absent, true);
+    const purgedFlow = await finishHandoff("purged-owner");
+    const purgedEnrollment = await enrollmentDispatch(enrollmentRequest(purgedFlow.identity));
+    assert.equal(purgedEnrollment.status, 201);
+    const purgedParticipantId = (await purgedEnrollment.json()).participantId;
+    assert.equal((await primaryPool.query(
+      `DELETE FROM ${q(primarySchema, "participants")} WHERE id = $1`, [purgedParticipantId],
+    )).rowCount, 1);
+    const returningFlow = await finishHandoff("purged-owner");
+    assert.equal(returningFlow.linkKeyHex, purgedFlow.linkKeyHex, "the same identity returns");
+    const returning = await enrollmentDispatch(enrollmentRequest(returningFlow.identity));
+    assert.equal(returning.status, 201, "no cooldown refuses a purged identity");
+    const returningParticipantId = (await returning.json()).participantId;
+    assert.notEqual(returningParticipantId, purgedParticipantId);
     assert.equal((await poolRow(
       primaryPool,
-      `SELECT 1 FROM ${q(primarySchema, "participants")} WHERE identity_link_key = $1`,
-      [cooldownFlow.linkKeyHex],
-    )), null);
-    const cooldownReplay = await enrollmentDispatch(enrollmentRequest(cooldownFlow.identity));
-    assert.equal(cooldownReplay.status, 401, "a cooldown refusal still consumes the one-use proof");
+      `SELECT identity_cooldown_digest FROM ${q(primarySchema, "participants")} WHERE id = $1`,
+      [returningParticipantId],
+    ))?.identity_cooldown_digest, null);
+    const returningReplay = await enrollmentDispatch(enrollmentRequest(returningFlow.identity));
+    assert.equal(returningReplay.status, 401, "the one-use proof is consumed");
 
     // The secret fingerprint established by OAuth is checked again at the
     // enrollment authority sink; a mismatched key version cannot consume the
@@ -558,7 +551,6 @@ test("PostgreSQL Google proof enrollment issues one bound social owner and Worke
     const mismatchedEnv = { ...env, IDENTITY_LINK_SECRET_VERSION: "rotated-without-migration" };
     const mismatchedDispatch = googleEnrollment.createPostgresGoogleEnrollmentDispatch({
       primaryPool,
-      ledgerPool,
       schemaOptions,
       privateOrigin: PRIVATE_ORIGIN,
       env: mismatchedEnv,
@@ -602,8 +594,7 @@ test("PostgreSQL Google proof enrollment issues one bound social owner and Worke
         + 1 /* Alice reattach */ + 1 /* race reattach */ + 1 /* disabled reattach */);
   } finally {
     if (primaryCreated) await primaryPool.query(`DROP SCHEMA IF EXISTS "${primarySchema}" CASCADE`);
-    if (ledgerCreated) await ledgerPool.query(`DROP SCHEMA IF EXISTS "${ledgerSchema}" CASCADE`);
-    await Promise.all([primaryPool.end(), ledgerPool.end()]);
+    await primaryPool.end();
   }
 });
 

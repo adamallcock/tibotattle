@@ -3,7 +3,8 @@
 /**
  * Generate the Worker-safe PostgreSQL migration receipt manifest from the
  * canonical SQL fragments. The Worker cannot inspect its filesystem at
- * runtime, so the TypeScript manifest is a checked source artifact.
+ * runtime, so the TypeScript manifest is a checked source artifact. It is
+ * primary-only (manifest v2): there is no deletion-ledger schema.
  */
 
 import { readFile, writeFile } from "node:fs/promises";
@@ -22,10 +23,10 @@ function renderRole(migrations) {
 
 export function renderPostgresRuntimeSchema(manifest) {
   if (manifest === null || typeof manifest !== "object"
-      || manifest.schemaVersion !== "tibotattle-postgres-migration-manifest-v1"
+      || manifest.schemaVersion !== "tibotattle-postgres-migration-manifest-v2"
       || manifest.roles === null || typeof manifest.roles !== "object"
-      || !Array.isArray(manifest.roles.primary)
-      || !Array.isArray(manifest.roles.ledger)) {
+      || Object.keys(manifest.roles).join(",") !== "primary"
+      || !Array.isArray(manifest.roles.primary)) {
     throw new TypeError("invalid PostgreSQL migration manifest");
   }
   const lines = [
@@ -60,13 +61,9 @@ export function renderPostgresRuntimeSchema(manifest) {
     "",
     "export const POSTGRES_RUNTIME_MIGRATIONS: Readonly<{",
     "  readonly primary: readonly PostgresRuntimeMigrationReceipt[];",
-    "  readonly ledger: readonly PostgresRuntimeMigrationReceipt[];",
     "}> = Object.freeze({",
     "  primary: Object.freeze(([",
     ...renderRole(manifest.roles.primary),
-    "  ] as readonly MigrationEntry[]).map((entry, index) => receipt(entry, index + 1))),",
-    "  ledger: Object.freeze(([",
-    ...renderRole(manifest.roles.ledger),
     "  ] as readonly MigrationEntry[]).map((entry, index) => receipt(entry, index + 1))),",
     "});",
   ];

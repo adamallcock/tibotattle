@@ -159,8 +159,8 @@ async function freePort() {
 }
 
 /**
- * A fastpath-test origin over a fresh, fully migrated "<schema>" and
- * "<schema>_ledger" pair with operational collection controls and the typed
+ * A fastpath-test origin over a fresh, fully migrated "<schema>" (no
+ * deletion-ledger schema: D4, SIMP-4) with operational collection controls and the typed
  * v1/v1.1 targets initialized (as the intake spec seeds them). With edge, the
  * runtime is served on 127.0.0.1 behind EDGE_ORIGIN_MODE=edge-test; without,
  * requests go to runtime.postgresTestDispatch on the loopback origin.
@@ -170,7 +170,6 @@ async function withOrigin({ edge, environment = {} }, run) {
   const socket = await localSocket();
   const base = new pg.Pool(localPoolOptions(socket, 4, "pg-origin-edge-test"));
   const primarySchema = `tibotattle_fastpath_edge_${randomBytes(5).toString("hex")}`;
-  const ledgerSchema = `${primarySchema}_ledger`;
   const created = [];
   const pools = [];
   let close = null;
@@ -182,12 +181,11 @@ async function withOrigin({ edge, environment = {} }, run) {
     );
     assert.equal(server.rows[0]?.address, null, "qualification requires the local Unix socket");
     assert.equal(Math.floor(server.rows[0].version / 10_000), 17, "the disposable socket must be PostgreSQL 17");
-    for (const schema of [primarySchema, ledgerSchema]) {
+    for (const schema of [primarySchema]) {
       await base.query(`CREATE SCHEMA "${schema}"`);
       created.push(schema);
     }
     await applyPostgresMigrations({ role: "primary", schema: primarySchema, pool: base });
-    await applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool: base });
     const t = (name) => `"${primarySchema}"."${name}"`;
     await base.query(`UPDATE ${t("collection_controls")}
         SET revision=2, control_state='operational', enrollment_enabled=true, upload_registration_enabled=true,

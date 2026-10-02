@@ -16,9 +16,10 @@ export const SYNTHETIC_V12_DISCOVERY_SERVICE_ACCOUNT =
   "tibotattle-test-runtime@tibotattle.iam.gserviceaccount.com";
 export const SYNTHETIC_V12_DISCOVERY_MIGRATION_ROOT = "/app/apps/worker/postgres/migrations";
 export const SYNTHETIC_V12_DISCOVERY_PARTICIPANT_PREFIX = "synthetic-v12-smoke-";
+// Primary only: the A2 ledger schema is retired with the deletion ledger
+// (decisions D2, D4 and D6; owner action OA-4).
 export const SYNTHETIC_V12_DISCOVERY_TARGETS = Object.freeze({
   primary: CLOUD_RUN_IAM_TEST_TARGET.postgres.primary,
-  ledger: CLOUD_RUN_IAM_TEST_TARGET.postgres.ledger,
   iamUser: CLOUD_RUN_IAM_TEST_TARGET.postgres.iamUser,
   project: CLOUD_RUN_IAM_TEST_TARGET.project,
   origin: CLOUD_RUN_IAM_TEST_TARGET.origin,
@@ -44,8 +45,10 @@ const MAX_SYNTHETIC_PARTICIPANTS = 128;
 const MAX_PARTICIPANT_TABLES = 256;
 const APPLICATION_NAME = "tibotattle-synthetic-v12-discovery";
 
-// Match cleanup's per-owner family envelope. Any new participant-scoped row
-// type must be reviewed before discovery reports an owner as a cleanup target.
+// The one per-owner family envelope: discovery reports an owner as a cleanup
+// target only inside it, and synthetic-v12-cleanup.mjs re-checks the same
+// rules (readSyntheticV12CleanupTarget) under its delete transaction's row
+// lock. Any new participant-scoped row type must be reviewed here.
 const ALLOWED_PARTICIPANT_TABLES = Object.freeze({
   attribution_enrollments: [0, 1],
   web_sessions: [1, 1],
@@ -114,7 +117,12 @@ function validateParticipantId(value) {
 }
 
 function validateMigrationManifest(manifest) {
-  for (const role of ["primary", "ledger"]) {
+  if (manifest === null || typeof manifest !== "object"
+      || manifest.roles === null || typeof manifest.roles !== "object"
+      || Object.keys(manifest.roles).join(",") !== "primary") {
+    fail("POSTGRES_SYNTHETIC_DISCOVERY_MIGRATION_SOURCE_INVALID");
+  }
+  for (const role of ["primary"]) {
     const migrations = manifest?.roles?.[role];
     if (!Array.isArray(migrations) || migrations.length === 0 || migrations.length > 256) {
       fail("POSTGRES_SYNTHETIC_DISCOVERY_MIGRATION_SOURCE_INVALID");
@@ -155,17 +163,12 @@ export function parseSyntheticV12DiscoveryConfig(env) {
   }
 
   const primary = SYNTHETIC_V12_DISCOVERY_TARGETS.primary;
-  const ledger = SYNTHETIC_V12_DISCOVERY_TARGETS.ledger;
   if (env.PRIMARY_INSTANCE_CONNECTION_NAME !== primary.instanceConnectionName
       || env.PRIMARY_DATABASE !== primary.database || env.PRIMARY_SCHEMA !== primary.schema
-      || env.LEDGER_INSTANCE_CONNECTION_NAME !== ledger.instanceConnectionName
-      || env.LEDGER_DATABASE !== ledger.database || env.LEDGER_SCHEMA !== ledger.schema
       || !SCHEMA_PATTERN.test(env.PRIMARY_SCHEMA ?? "")
-      || !SCHEMA_PATTERN.test(env.LEDGER_SCHEMA ?? "")
       || !INSTANCE_PATTERN.test(env.PRIMARY_INSTANCE_CONNECTION_NAME ?? "")
-      || !INSTANCE_PATTERN.test(env.LEDGER_INSTANCE_CONNECTION_NAME ?? "")
       || !DATABASE_PATTERN.test(env.PRIMARY_DATABASE ?? "")
-      || !DATABASE_PATTERN.test(env.LEDGER_DATABASE ?? "")) {
+      || Object.keys(env).some((name) => name.startsWith("LEDGER_"))) {
     fail("POSTGRES_SYNTHETIC_DISCOVERY_TARGET_INVALID");
   }
   if (env.GCS_BUCKET_NAME !== SYNTHETIC_V12_DISCOVERY_TARGETS.bucket) {
@@ -179,7 +182,6 @@ export function parseSyntheticV12DiscoveryConfig(env) {
     service: SYNTHETIC_V12_DISCOVERY_TARGETS.service,
     origin: SYNTHETIC_V12_DISCOVERY_TARGETS.origin,
     primary,
-    ledger,
     iamUser: SYNTHETIC_V12_DISCOVERY_TARGETS.iamUser,
     bucket: SYNTHETIC_V12_DISCOVERY_TARGETS.bucket,
     participantId,
@@ -403,6 +405,21 @@ async function readOwnerReferences(client, schema, participant) {
   });
 }
 
+/**
+ * The discovery rules for one synthetic owner, for a caller that already
+ * holds the participant row (synthetic-v12-cleanup.mjs, under its delete
+ * transaction's FOR UPDATE lock): the exact synthetic participant tag, an
+ * active social owner without an identity link, the per-owner family
+ * envelope, one active owner link, no upload in progress and at most one
+ * ready v1.2 manifest with its chunk and registered pending reference.
+ * Returns the owner's opaque object keys, which never leave memory.
+ */
+export async function readSyntheticV12CleanupTarget(client, schema, participant) {
+  quoteSchema(schema);
+  const inventory = await readOwnerReferences(client, schema, participant);
+  return inventory.objectKeys;
+}
+
 /** Inventory only the synthetic v1.2 participant family inside one read-only snapshot. */
 export async function readSyntheticV12PrimarySnapshot(pool, schema, migrations) {
   const quotedSchema = quoteSchema(schema);
@@ -477,28 +494,7 @@ export async function readSyntheticV12PrimarySnapshot(pool, schema, migrations) 
   return snapshot;
 }
 
-/** Validate one separate read-only ledger migration snapshot. */
-export async function readSyntheticV12LedgerSnapshot(pool, schema, migrations) {
-  quoteSchema(schema);
-  try {
-    return await withPostgresRead(pool, async (client) => {
-      const start = await readSnapshotStart(client);
-      await readMigrationReceipt(client, schema, migrations);
-      return Object.freeze({ observedAt: start.observedAt, migrationReceiptMatched: true });
-    }, {
-      operation: "postgres.synthetic_v12_discovery.ledger_snapshot",
-      statementTimeoutMilliseconds: 10_000,
-      lockTimeoutMilliseconds: 5_000,
-      preserveSafeError: preserveDiscoveryError,
-    });
-  } catch (error) {
-    if (typeof error?.code === "string" && error.code.startsWith("SYNTHETIC_DISCOVERY_")) throw error;
-    if (typeof error?.code === "string" && error.code.startsWith("POSTGRES_SYNTHETIC_DISCOVERY_")) throw error;
-    fail("POSTGRES_SYNTHETIC_DISCOVERY_LEDGER_READ_FAILED");
-  }
-}
-
-/** Read both database snapshots with the pinned IAM identity; this function has no object-store adapter. */
+/** Read the primary snapshot with the pinned IAM identity; this function has no object-store adapter. */
 export async function runSyntheticV12Discovery({ env = process.env, dependencies = {} } = {}) {
   if (env === null || typeof env !== "object"
       || env.CLOUD_RUN_JOB !== SYNTHETIC_V12_DISCOVERY_JOB
@@ -542,20 +538,8 @@ export async function runSyntheticV12Discovery({ env = process.env, dependencies
       applicationName: APPLICATION_NAME,
     });
     pools.push(primaryPool);
-    const ledgerPool = await createPool({
-      connector,
-      instanceConnectionName: config.ledger.instanceConnectionName,
-      database: config.ledger.database,
-      user: config.iamUser,
-      max: 1,
-      applicationName: APPLICATION_NAME,
-    });
-    pools.push(ledgerPool);
     const primary = await (dependencies.readPrimarySnapshot ?? readSyntheticV12PrimarySnapshot)(
       primaryPool, config.primary.schema, manifest.roles.primary,
-    );
-    const ledger = await (dependencies.readLedgerSnapshot ?? readSyntheticV12LedgerSnapshot)(
-      ledgerPool, config.ledger.schema, manifest.roles.ledger,
     );
     if (primary.owners.length !== 1
         || primary.owners[0]?.participantId !== config.participantId
@@ -567,11 +551,10 @@ export async function runSyntheticV12Discovery({ env = process.env, dependencies
       fail("SYNTHETIC_DISCOVERY_TARGET_OWNER_INVENTORY_MISMATCH");
     }
     result = Object.freeze({
-      schemaVersion: "synthetic-v12-owner-discovery-v1",
+      schemaVersion: "synthetic-v12-owner-discovery-v2",
       status: "ready",
       targetParticipantId: config.participantId,
       primarySnapshotObservedAt: primary.observedAt,
-      ledgerMigrationSnapshotObservedAt: ledger.observedAt,
       ownerCount: primary.owners.length,
       owners: primary.owners,
       referencedGcsObjectCount: primary.referencedGcsObjectCount,
@@ -607,7 +590,7 @@ async function main() {
     console.log(JSON.stringify(inventory));
   } catch (error) {
     console.error(JSON.stringify({
-      schemaVersion: "synthetic-v12-owner-discovery-v1",
+      schemaVersion: "synthetic-v12-owner-discovery-v2",
       status: "error",
       code: safeCode(error),
       ...(error?.code === "POSTGRES_SYNTHETIC_DISCOVERY_FAMILY_INVALID"

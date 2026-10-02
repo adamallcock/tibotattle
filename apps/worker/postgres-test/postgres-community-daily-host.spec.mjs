@@ -147,7 +147,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL private community daily HTTP route"
     const healthDispatch = async () => new Response(JSON.stringify({ status: "ready" }), { status: 200 });
     return createPostgresTestCommunityDailyDispatch({
       primaryPool: pool,
-      schemaOptions: { primarySchema: schema, ledgerSchema: "daily_ledger_test" },
+      schemaOptions: { primarySchema: schema },
       sourceIdentity: { sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE },
       readPostgresPublishedCommunityDaily,
       healthDispatch,

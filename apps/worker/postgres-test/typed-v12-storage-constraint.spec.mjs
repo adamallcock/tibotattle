@@ -67,7 +67,7 @@ async function loadModules() {
     logLevel: "silent",
   });
   const load = (path) => vite.ssrLoadModule(path);
-  const [refusal, errors, client, runtimeSchema, transport, admission, domain, ledgerAuthority,
+  const [refusal, errors, client, runtimeSchema, transport, admission, domain,
     workerAdmission, bodyReader, constants, workerCrypto] = await Promise.all([
     load("/src/postgres-telemetry-v12-storage-refusal.ts"),
     load("/src/errors.ts"),
@@ -76,14 +76,13 @@ async function loadModules() {
     load("/src/postgres-typed-v12-transport.ts"),
     load("/src/postgres-typed-v12-admission.ts"),
     load("/src/postgres-typed-v12-domain.ts"),
-    load("/src/postgres-ledger-authority.ts"),
     load("/src/admission.ts"),
     load("/src/bounded-body.ts"),
     load("/src/constants.ts"),
     load("/src/crypto.ts"),
   ]);
   modules = {
-    refusal, errors, client, runtimeSchema, transport, admission, domain, ledgerAuthority,
+    refusal, errors, client, runtimeSchema, transport, admission, domain,
     workerAdmission, bodyReader, constants, workerCrypto,
   };
   return modules;
@@ -368,15 +367,13 @@ async function withHarness(prefix, run) {
   const m = await loadModules();
   const suffix = randomBytes(6).toString("hex");
   const primarySchema = `${prefix}_${suffix}`;
-  const ledgerSchema = `${prefix}_${suffix}_ledger`;
   const created = [];
   try {
-    for (const schema of [primarySchema, ledgerSchema]) {
+    for (const schema of [primarySchema]) {
       await base.query(`CREATE SCHEMA "${schema}"`);
       created.push(schema);
     }
     await applyPostgresMigrations({ role: "primary", schema: primarySchema, pool: base });
-    await applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool: base });
     const table = (name) => `"${primarySchema}"."${name}"`;
     const nowIso = new Date().toISOString();
     const expiry = new Date(Date.now() + 30 * 24 * HOUR_MS).toISOString();
@@ -426,7 +423,7 @@ async function withHarness(prefix, run) {
       'ongoing-privacy-safe-telemetry-v1.2','accepted',$3)`, [participantId, deviceId, nowIso]);
 
     const failures = [];
-    const schemaOptions = { primarySchema, ledgerSchema };
+    const schemaOptions = { primarySchema };
     const admissionEnv = Object.freeze({
       ENVIRONMENT: "test",
       ENROLLMENT_RATE_LIMIT: allowAll(),
@@ -438,7 +435,6 @@ async function withHarness(prefix, run) {
     });
     const dispatch = createPostgresTestV12DayManifestDispatch({
       primaryPool: observedPool(base, failures),
-      ledgerPool: { connect: () => base.connect() },
       schemaOptions,
       expectedMigrations: m.runtimeSchema.POSTGRES_RUNTIME_MIGRATIONS,
       privateOrigin: ORIGIN,
@@ -450,7 +446,6 @@ async function withHarness(prefix, run) {
       assertUploadAuthorizationAllowed: m.workerAdmission.assertUploadAuthorizationAllowed,
       authenticatePostgresDevice: m.transport.authenticatePostgresDevice,
       disconnectPostgresAuthenticatedDevice: mustNotCall("disconnectPostgresAuthenticatedDevice"),
-      hasPostgresDeletionTombstone: m.ledgerAuthority.hasPostgresDeletionTombstone,
       readPostgresDeviceSyncCapabilities: mustNotCall("readPostgresDeviceSyncCapabilities"),
       readPostgresV12DayCandidates: mustNotCall("readPostgresV12DayCandidates"),
       readPostgresTelemetryV12EffectivePage: mustNotCall("readPostgresTelemetryV12EffectivePage"),

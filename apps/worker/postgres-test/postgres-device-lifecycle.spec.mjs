@@ -128,10 +128,8 @@ test("PostgreSQL device lifecycle maintenance mirrors D1, drains bounded pages, 
   });
   const suffix = randomBytes(6).toString("hex");
   const primarySchema = `device_lifecycle_${suffix}`;
-  const ledgerSchema = `${primarySchema}_ledger`;
-  const schema = { primarySchema, ledgerSchema };
+  const schema = { primarySchema };
   let primaryCreated = false;
-  let ledgerCreated = false;
   let vite;
   let lockHolder;
   try {
@@ -145,10 +143,7 @@ test("PostgreSQL device lifecycle maintenance mirrors D1, drains bounded pages, 
 
     await pool.query(`CREATE SCHEMA "${primarySchema}"`);
     primaryCreated = true;
-    await pool.query(`CREATE SCHEMA "${ledgerSchema}"`);
-    ledgerCreated = true;
     await applyPostgresMigrations({ role: "primary", schema: primarySchema, pool });
-    await applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool });
 
     vite = await createServer({
       root: WORKER_ROOT,
@@ -468,9 +463,15 @@ test("PostgreSQL device lifecycle maintenance mirrors D1, drains bounded pages, 
 
     const scheduled = await maintenance.runPostgresScheduledMaintenance({
       primaryPool: pool,
-      ledgerPool: pool,
       objectStore: { async head() { return null; }, async delete() {} },
       schema,
+      // OD-4 is open: the report policy is injected, never defaulted.
+      reportPolicy: {
+        identityPurgeLedger: "omitted",
+        restoreReplayComplete: false,
+        deletionTombstoneRetentionComplete: false,
+        ownerErasureJobsComplete: false,
+      },
       nowEpoch,
     });
     assert.equal(scheduled.outcome, "partial");
@@ -496,7 +497,6 @@ test("PostgreSQL device lifecycle maintenance mirrors D1, drains bounded pages, 
       lockHolder.release(true);
     }
     await vite?.close();
-    if (ledgerCreated) await pool.query(`DROP SCHEMA IF EXISTS "${ledgerSchema}" CASCADE`);
     if (primaryCreated) await pool.query(`DROP SCHEMA IF EXISTS "${primarySchema}" CASCADE`);
     await pool.end();
   }

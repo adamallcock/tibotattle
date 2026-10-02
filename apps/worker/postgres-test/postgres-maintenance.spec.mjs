@@ -79,10 +79,22 @@ test("PostgreSQL scheduled slice purges expired identity state, fences orphan cl
   });
   const suffix = randomBytes(6).toString("hex");
   const primarySchema = `maintenance_primary_${suffix}`;
-  const ledgerSchema = `maintenance_ledger_${suffix}`;
-  const options = { schema: { primarySchema, ledgerSchema } };
+  const options = { schema: { primarySchema } };
+  // OD-4 is open: the report policy is injected, never defaulted. Both
+  // candidate shapes are exercised; neither is the owner's decision.
+  const omitted = Object.freeze({
+    identityPurgeLedger: "omitted",
+    restoreReplayComplete: false,
+    deletionTombstoneRetentionComplete: false,
+    ownerErasureJobsComplete: false,
+  });
+  const constant = Object.freeze({
+    identityPurgeLedger: "constant",
+    restoreReplayComplete: true,
+    deletionTombstoneRetentionComplete: true,
+    ownerErasureJobsComplete: true,
+  });
   let primaryCreated = false;
-  let ledgerCreated = false;
   let vite;
   try {
     const server = await pool.query(
@@ -95,10 +107,7 @@ test("PostgreSQL scheduled slice purges expired identity state, fences orphan cl
 
     await pool.query(`CREATE SCHEMA "${primarySchema}"`);
     primaryCreated = true;
-    await pool.query(`CREATE SCHEMA "${ledgerSchema}"`);
-    ledgerCreated = true;
-    assert.equal((await applyPostgresMigrations({ role: "primary", schema: primarySchema, pool })).applied, 63);
-    assert.equal((await applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool })).applied, 7);
+    assert.equal((await applyPostgresMigrations({ role: "primary", schema: primarySchema, pool })).applied, 64);
 
     vite = await createServer({
       root: WORKER_ROOT,
@@ -126,38 +135,36 @@ test("PostgreSQL scheduled slice purges expired identity state, fences orphan cl
       [`expired-google-${suffix}`, expired, expired, `live-google-${suffix}`, future],
     );
     await pool.query(
-      `INSERT INTO ${q(primarySchema, "identity_reenrollment_cooldowns")}
-       (identity_cooldown_digest,created_at,expires_at) VALUES ($1,$2,$3)`,
-      ["1".repeat(64), expired, expired],
-    );
-    await pool.query(
       `INSERT INTO ${q(primarySchema, "sign_in_start_admission_windows")}
        (window_started_at,accepted_count,last_accepted_at) VALUES ($1,1,$1),($2,1,$2)`,
       [new Date(nowEpoch - 48 * 60 * 60_000).toISOString(),
         new Date(nowEpoch - 23 * 60 * 60_000).toISOString()],
     );
-    await pool.query(
-      `INSERT INTO ${q(ledgerSchema, "identity_reenrollment_cooldowns")}
-       (identity_cooldown_digest,schema_version,deleted_at,retain_until)
-       VALUES ($1,'identity-reenrollment-cooldown-v0.1',$2,$3)`,
-      ["2".repeat(64), new Date(nowEpoch - 31 * 24 * 60 * 60_000).toISOString(), expired],
-    );
-    const tombstoneDigest = "d".repeat(64);
-    const ownerDigest = "e".repeat(64);
-    const tombstoneDeleted = new Date(nowEpoch - 600 * 24 * 60 * 60_000).toISOString();
-    const tombstoneRetain = new Date(nowEpoch - 100 * 24 * 60 * 60_000).toISOString();
-    await pool.query(
-      `INSERT INTO ${q(ledgerSchema, "deletion_tombstones")}
-       (participant_digest,schema_version,deleted_at,retain_until)
-       VALUES ($1,'participant-deletion-tombstone-v0.1',$2,$3)`,
-      [tombstoneDigest, tombstoneDeleted, tombstoneRetain],
-    );
-    await pool.query(
-      `INSERT INTO ${q(ledgerSchema, "storage_erasure_jobs")}
-       (participant_digest,source_id,owner_digest,source_namespace,state,terminal_json,attempted_ms,completed_at)
-       VALUES ($1,'synthetic:maintenance',$2,'synthetic-maintenance','complete','{}',0,$3)`,
-      [tombstoneDigest, ownerDigest, expired],
-    );
+    // There is no deletion ledger, tombstone or re-enrollment cooldown to
+    // purge (D2, D4, D6); the residue migration dropped the cooldown table.
+    assert.equal((await pool.query("SELECT to_regclass($1) IS NULL AS absent",
+      [q(primarySchema, "identity_reenrollment_cooldowns")])).rows[0].absent, true);
+
+    // The OD-4 policy and the retired ledger pool are refused before any
+    // connection is taken.
+    let connects = 0;
+    const countingPool = { connect: async () => { connects += 1; return pool.connect(); } };
+    for (const reportPolicy of [undefined, null, {}, [], { ...omitted, extra: true },
+      { ...omitted, identityPurgeLedger: "default" }, { ...omitted, restoreReplayComplete: "false" },
+      { ...omitted, ownerErasureJobsComplete: undefined }]) {
+      await assert.rejects(maintenance.runPostgresScheduledMaintenance({
+        primaryPool: countingPool, objectStore: store, ...options, nowEpoch, reportPolicy,
+      }), { name: "PostgresStorageError", code: "invalid" }, JSON.stringify(reportPolicy));
+    }
+    await assert.rejects(maintenance.runPostgresScheduledMaintenance({
+      primaryPool: countingPool, ledgerPool: countingPool, objectStore: store, ...options, nowEpoch,
+      reportPolicy: omitted,
+    }), { name: "PostgresStorageError", code: "invalid" });
+    await assert.rejects(maintenance.runPostgresScheduledMaintenance({
+      primaryPool: countingPool, objectStore: store, schema: { primarySchema, ledgerSchema: "stale" },
+      nowEpoch, reportPolicy: omitted,
+    }));
+    assert.equal(connects, 0, "a refused option takes no connection");
 
     const orphanId = `synthetic-maintenance-${randomUUID()}`;
     const orphanKey = `synthetic/maintenance/${randomUUID()}`;
@@ -180,9 +187,9 @@ test("PostgreSQL scheduled slice purges expired identity state, fences orphan cl
       assert.equal(lock.rows[0]?.acquired, true);
       const skipped = await maintenance.runPostgresScheduledMaintenance({
         primaryPool: pool,
-        ledgerPool: pool,
         objectStore: store,
         ...options,
+        reportPolicy: omitted,
         nowEpoch,
       });
       assert.equal(skipped.outcome, "skipped");
@@ -201,17 +208,17 @@ test("PostgreSQL scheduled slice purges expired identity state, fences orphan cl
 
     const first = await maintenance.runPostgresScheduledMaintenance({
       primaryPool: pool,
-      ledgerPool: pool,
       objectStore: store,
       ...options,
+      reportPolicy: omitted,
       nowEpoch,
     });
     assert.equal(first.outcome, "partial");
     assert.equal(first.code, "POSTGRES_MAINTENANCE_INCOMPLETE_UNSUPPORTED_PHASES");
     assert.equal(first.complete, false);
     assert.equal(first.leaseAcquired, true);
-    assert.equal(first.identityPurge.primary.purged, 4);
-    assert.equal(first.identityPurge.ledger.purged, 1);
+    assert.equal(first.identityPurge.primary.purged, 3);
+    assert.equal(Object.hasOwn(first.identityPurge, "ledger"), false, "OD-4 'omitted' drops the ledger receipt");
     assert.equal(first.identityPurge.complete, true);
     assert.equal(first.objectReconciliation?.deletionGraceStarted, 1);
     assert.equal(first.objectReconciliationComplete, true);
@@ -241,20 +248,26 @@ test("PostgreSQL scheduled slice purges expired identity state, fences orphan cl
     assert.equal((await pool.query(
       `SELECT count(*)::int AS count FROM ${q(primarySchema, "sign_in_start_admission_windows")}`,
     )).rows[0]?.count, 1, "the 23-hour admission window remains inside the 24-hour retention period");
-    assert.equal((await pool.query(
-      `SELECT 1 FROM ${q(ledgerSchema, "deletion_tombstones")} WHERE participant_digest=$1`,
-      [tombstoneDigest],
-    )).rows.length, 1, "expired tombstone stays until restore replay can be implemented and verified");
     assert.equal(JSON.stringify(first).includes(orphanKey), false, "maintenance receipts must not expose object keys");
 
     const second = await maintenance.runPostgresScheduledMaintenance({
       primaryPool: pool,
-      ledgerPool: pool,
       objectStore: store,
       ...options,
+      reportPolicy: constant,
       nowEpoch: nowEpoch + SAFETY_WINDOW + 1,
     });
     assert.equal(second.outcome, "partial");
+    // OD-4 'constant' keeps a constant ledger receipt; the flags follow the
+    // injected policy and nothing else.
+    assert.deepEqual(second.identityPurge.ledger, { purged: 0, complete: true });
+    assert.equal(second.identityPurge.complete, second.identityPurge.primary.complete);
+    assert.equal(second.ownerErasureJobsComplete, true);
+    assert.equal(second.restoreReplayComplete, true);
+    assert.equal(second.deletionTombstoneRetentionComplete, true);
+    assert.equal(second.telemetryRetentionComplete, false);
+    assert.equal(second.analyticsMaintenanceComplete, false);
+    assert.equal(second.complete, false);
     assert.equal(second.code, "POSTGRES_MAINTENANCE_INCOMPLETE_UNSUPPORTED_PHASES");
     assert.equal(store.calls.delete, 1);
     assert.equal(store.objects.has(orphanKey), false);
@@ -279,9 +292,9 @@ test("PostgreSQL scheduled slice purges expired identity state, fences orphan cl
     );
     const failed = await maintenance.runPostgresScheduledMaintenance({
       primaryPool: pool,
-      ledgerPool: pool,
       objectStore: store,
       ...options,
+      reportPolicy: omitted,
       nowEpoch,
     });
     assert.equal(failed.outcome, "failure");
@@ -296,9 +309,9 @@ test("PostgreSQL scheduled slice purges expired identity state, fences orphan cl
     assert.notEqual(retry.rows[0]?.reconciliation_lease_id, null);
     const retried = await maintenance.runPostgresScheduledMaintenance({
       primaryPool: pool,
-      ledgerPool: pool,
       objectStore: store,
       ...options,
+      reportPolicy: omitted,
       nowEpoch: nowEpoch + 2 * SAFETY_WINDOW + 2,
     });
     assert.equal(retried.outcome, "partial", "the failed job released its session lock for a later retry");
@@ -310,7 +323,6 @@ test("PostgreSQL scheduled slice purges expired identity state, fences orphan cl
     )).rows.length, 0);
   } finally {
     await vite?.close();
-    if (ledgerCreated) await pool.query(`DROP SCHEMA IF EXISTS "${ledgerSchema}" CASCADE`);
     if (primaryCreated) await pool.query(`DROP SCHEMA IF EXISTS "${primarySchema}" CASCADE`);
     await pool.end();
   }

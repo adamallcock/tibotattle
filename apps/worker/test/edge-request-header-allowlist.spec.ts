@@ -81,8 +81,6 @@ const RESPONSE_HEADER_READS: Readonly<Record<string, readonly string[]>> = Objec
   // The GCP metadata server's identity on its token and project responses
   // (Cloud Run jobs only; never a request the edge forwards).
   "metadata-flavor": [
-    "../cloud-run/ledger-preflight-reconcile.mjs",
-    "../cloud-run/ledger-reconciliation-diagnostic.mjs",
     "../cloud-run/postgres-community-daily-activation.mjs",
     "../cloud-run/postgres-community-daily-publish-test.mjs",
     "../cloud-run/postgres-community-graph-benchmark.mjs",

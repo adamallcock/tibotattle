@@ -63,9 +63,6 @@ function env(overrides = {}) {
     PRIMARY_DATABASE: SYNTHETIC_V12_SMOKE_DATABASE_TARGET.primaryDatabase,
     PRIMARY_SCHEMA: SYNTHETIC_V12_SMOKE_DATABASE_TARGET.primarySchema,
     PRIMARY_INSTANCE_CONNECTION_NAME: SYNTHETIC_V12_SMOKE_DATABASE_TARGET.primaryInstance,
-    LEDGER_DATABASE: SYNTHETIC_V12_SMOKE_DATABASE_TARGET.ledgerDatabase,
-    LEDGER_SCHEMA: SYNTHETIC_V12_SMOKE_DATABASE_TARGET.ledgerSchema,
-    LEDGER_INSTANCE_CONNECTION_NAME: SYNTHETIC_V12_SMOKE_DATABASE_TARGET.ledgerInstance,
     POSTGRES_IAM_USER: SYNTHETIC_V12_SMOKE_DATABASE_TARGET.postgresIamUser,
     ENVELOPE_PUBLIC_JWK: JSON.stringify({ kty: "RSA", n: "synthetic-modulus", e: "AQAB", kid: "key:test" }),
     SYNTHETIC_V12_SMOKE_DAY: "2026-09-24",
@@ -192,7 +189,7 @@ function mockReadback(input, envelopeBytes, getFailureStage = () => "", onGcsRea
 }
 
 function fakeDependencies({ failManifest = false, anonymousStatus = 403, effectiveMismatch = false,
-  oversizedHealth = false, healthPrimaryVersion = 39, healthLedgerVersion = 6,
+  oversizedHealth = false, healthPrimaryVersion = 39, healthBody = null,
   gatewayResponseUrl, gatewayRedirectStatus, gatewaySetCookie = false } = {}) {
   const calls = [];
   let seedCount = 0;
@@ -257,15 +254,14 @@ function fakeDependencies({ failManifest = false, anonymousStatus = 403, effecti
         }
         if (url.pathname === "/api/health") {
           if (oversizedHealth) return new Response("x".repeat(64 * 1024 + 1), { status: 200 });
-          return respond(200, {
-            schemaVersion: "gcp-postgres-test-health-v1",
+          return respond(200, healthBody ?? {
+            schemaVersion: "gcp-postgres-test-health-v2",
             scope: "postgres_schema_and_migrations_only",
             status: "ready",
             workerApplicationReady: false,
             checks: {
               postgresMajor: 17,
               primaryMigrationReceipt: { status: "current", version: healthPrimaryVersion },
-              ledgerMigrationReceipt: { status: "current", version: healthLedgerVersion },
             },
           });
         }
@@ -405,12 +401,11 @@ function fakeDependencies({ failManifest = false, anonymousStatus = 403, effecti
 test("job config pins the single Cloud Run job, app origin, project, bucket, and fixed day", () => {
   const config = parseSyntheticV12SmokeConfig(env());
   assert.equal(CLOUD_RUN_IAM_TEST_TARGET.postgres.primary.schema, "tibotattle_v12_a2_20260925");
-  assert.equal(CLOUD_RUN_IAM_TEST_TARGET.postgres.ledger.schema, "tibotattle_ledger_v12_a2_20260925");
   assert.equal(CLOUD_RUN_IAM_TEST_TARGET.gcsBucket, "tibotattle-gcs-test-cleanup-20260925-a2");
   assert.equal(config.origin, CLOUD_RUN_IAM_TEST_TARGET.origin);
   assert.equal(config.bucket, SYNTHETIC_V12_SMOKE_BUCKET);
   assert.equal(config.primarySchema, "tibotattle_v12_a2_20260925");
-  assert.equal(config.ledgerSchema, "tibotattle_ledger_v12_a2_20260925");
+  assert.deepEqual(Object.keys(config).filter((key) => /ledger/iu.test(key)), [], "no ledger target is configured");
   assert.equal(config.day, "2026-09-24");
   assert.equal(config.envelopePublicJwk.kid, "key:test");
   assert.equal(config.publicV12GatewayOrigin, null);
@@ -450,8 +445,10 @@ test("job config rejects local execution, spoofable origins, wrong bucket, inval
     { PRIMARY_DATABASE: "production" },
     { PRIMARY_SCHEMA: "tibotattle" },
     { PRIMARY_SCHEMA: undefined },
-    { LEDGER_SCHEMA: "tibotattle_ledger" },
-    { LEDGER_SCHEMA: undefined },
+    // The retired A2 ledger target is refused in any form.
+    { LEDGER_SCHEMA: "tibotattle_ledger_v12_a2_20260925" },
+    { LEDGER_DATABASE: "tibotattle_ledger" },
+    { LEDGER_INSTANCE_CONNECTION_NAME: "tibotattle:us-east1:tibotattle-test-ledger-20260922" },
     { POSTGRES_IAM_USER: "other-runtime@other-project.iam" },
     { SYNTHETIC_V12_SMOKE_DAY: "2026-02-30" },
     { ENVELOPE_PUBLIC_JWK: JSON.stringify({ kty: "RSA", n: "n", e: "AQAB", kid: "x", d: "private" }) },
@@ -929,6 +926,31 @@ test("health rejects pre-v1.2 migrations before seeding and accepts a newer curr
     config: parseSyntheticV12SmokeConfig(env()), dependencies: newer.dependencies,
   });
   assert.equal(receipt.status, "ok");
+});
+
+test("health refuses the retired v1 body and any second receipt before seeding", async () => {
+  const v2 = (checks, schemaVersion = "gcp-postgres-test-health-v2") => ({
+    schemaVersion,
+    scope: "postgres_schema_and_migrations_only",
+    status: "ready",
+    workerApplicationReady: false,
+    checks,
+  });
+  const primary = { status: "current", version: 64 };
+  for (const [label, body] of [
+    ["the v1 body with its ledger receipt", v2({ postgresMajor: 17, primaryMigrationReceipt: primary,
+      ledgerMigrationReceipt: { status: "current", version: 7 } }, "gcp-postgres-test-health-v1")],
+    ["a v2 body that still carries a ledger receipt", v2({ postgresMajor: 17, primaryMigrationReceipt: primary,
+      ledgerMigrationReceipt: { status: "current", version: 7 } })],
+    ["a v2 body with an unknown check", v2({ postgresMajor: 17, primaryMigrationReceipt: primary, extra: true })],
+  ]) {
+    const fake = fakeDependencies({ healthBody: body });
+    await assert.rejects(
+      runSyntheticV12Smoke({ config: parseSyntheticV12SmokeConfig(env()), dependencies: fake.dependencies }),
+      { code: "SMOKE_HEALTH_CONTRACT_INVALID" }, label,
+    );
+    assert.equal(fake.seedCount, 0, label);
+  }
 });
 
 test("effective readback mismatch fails closed after domain activation", async () => {
