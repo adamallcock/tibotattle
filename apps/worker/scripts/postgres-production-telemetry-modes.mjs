@@ -239,7 +239,7 @@ const TELEMETRY_V1_CHUNKS = defineTable({
 });
 
 const TELEMETRY_V1_RECORDS = defineTable({
-  name: "telemetry_v1_records", key: ["id"], token: V1_V11_TOKEN,
+  name: "telemetry_v1_records", large: true, key: ["id"], token: V1_V11_TOKEN,
   columns: [
     i64("id"), text("chunk_row_id"), text("participant_id"), text("device_id"), text("stream"), text("occurrence_id"),
     instant("observed_at"), day("observed_day"), text("provider"), text("model_id"), text("session_uuid"),
@@ -255,7 +255,7 @@ const TELEMETRY_V1_RECORDS = defineTable({
 });
 
 const TELEMETRY_V11_DAY_MANIFESTS = defineTable({
-  name: "telemetry_v11_day_manifests", key: ["id"], token: V1_V11_TOKEN,
+  name: "telemetry_v11_day_manifests", large: true, key: ["id"], token: V1_V11_TOKEN,
   columns: [
     text("id"), text("participant_id"), text("device_id"), day("chunk_day"), text("manifest_digest"), text("parser_version"),
     text("manifest_json"), i32("expected_chunk_count"), text("state"), instant("created_at"), instant("ready_at"),
@@ -282,7 +282,7 @@ const TELEMETRY_V11_CHUNKS = defineTable({
 });
 
 const TELEMETRY_V11_RECORDS = defineTable({
-  name: "telemetry_v11_records", key: ["chunk_id", "occurrence_id"], token: V1_V11_TOKEN,
+  name: "telemetry_v11_records", large: true, key: ["chunk_id", "occurrence_id"], token: V1_V11_TOKEN,
   columns: [
     text("chunk_id"), text("manifest_id"), text("stream"), text("occurrence_id"), instant("observed_at"),
     text("record_json"), text("legacy_occurrence_id"), text("legacy_record_json"),
@@ -294,7 +294,7 @@ const TELEMETRY_V11_RECORDS = defineTable({
 });
 
 const TELEMETRY_V11_DOMAIN_PREDECESSORS = defineTable({
-  name: "telemetry_v11_domain_predecessors", key: ["token_hash"], token: V1_V11_TOKEN,
+  name: "telemetry_v11_domain_predecessors", large: true, key: ["token_hash"], token: V1_V11_TOKEN,
   columns: [
     text("token_hash"), text("participant_id"), text("device_id"), text("previous_generation_id"),
     text("legacy_fingerprint"), i32("input_revision"), day("from_day"), day("through_day"), text("winners_json"),
@@ -303,7 +303,7 @@ const TELEMETRY_V11_DOMAIN_PREDECESSORS = defineTable({
 });
 
 const TELEMETRY_V11_DOMAINS = defineTable({
-  name: "telemetry_v11_domains", key: ["id"], token: V1_V11_TOKEN,
+  name: "telemetry_v11_domains", large: true, key: ["id"], token: V1_V11_TOKEN,
   columns: [
     text("id"), text("participant_id"), text("device_id"), text("predecessor_token_hash"), text("previous_generation_id"),
     text("manifest_digest"), text("legacy_fingerprint"), i32("input_revision"), day("from_day"), day("through_day"),
@@ -825,7 +825,7 @@ const V12_RUNTIME_TRANSPORT = defineTable({
 });
 
 const V12_DAY_MANIFESTS = defineTable({
-  name: "telemetry_v12_day_manifests", key: ["id"], token: V12_TOKEN,
+  name: "telemetry_v12_day_manifests", large: true, key: ["id"], token: V12_TOKEN,
   columns: [text("id"), text("participant_id"), text("device_id"), day("chunk_day"), text("manifest_digest"),
     text("parser_version"), text("manifest_json"), i32("expected_chunk_count"),
     col("state", "text", { override: () => "staged" }), instant("created_at"),
@@ -912,14 +912,14 @@ const V12_SESSION_TOOLS = defineTable({
 });
 
 const V12_DOMAIN_PREDECESSORS = defineTable({
-  name: "telemetry_v12_domain_predecessors", key: ["token_hash"], token: V12_TOKEN,
+  name: "telemetry_v12_domain_predecessors", large: true, key: ["token_hash"], token: V12_TOKEN,
   columns: [text("token_hash"), text("participant_id"), text("device_id"), text("previous_generation_id"),
     text("legacy_fingerprint"), i32("input_revision"), day("from_day"), day("through_day"), text("days_json"),
     instant("created_at"), instant("expires_at"), instant("consumed_at")],
 });
 
 const V12_DOMAINS = defineTable({
-  name: "telemetry_v12_domains", key: ["id"], token: V12_TOKEN,
+  name: "telemetry_v12_domains", large: true, key: ["id"], token: V12_TOKEN,
   columns: [text("id"), text("participant_id"), text("device_id"), text("predecessor_token_hash"), text("previous_generation_id"),
     text("manifest_digest"), text("legacy_fingerprint"), i32("input_revision"), day("from_day"), day("through_day"),
     text("days_json"), instant("created_at")],
@@ -1361,6 +1361,9 @@ export const TELEMETRY_PRODUCTION_DISPOSITIONS = Object.freeze([
 export const TELEMETRY_PRODUCTION_TRIGGER_POLICY = Object.freeze(Object.fromEntries(
   TELEMETRY_PRODUCTION_STAGES.flatMap(stage => TELEMETRY_PRODUCTION_DEFINITIONS[stage].items
     .filter(item => item.kind === "table").map(item => [item.spec.target, specTriggerPolicy(item.spec)]))));
+
+/** The name PT-8's runner contract uses for the same merged policy. */
+export const TRIGGER_POLICY = TELEMETRY_PRODUCTION_TRIGGER_POLICY;
 
 /**
  * No stage creates a staging or mirror relation in tibotattle_transfer, and no

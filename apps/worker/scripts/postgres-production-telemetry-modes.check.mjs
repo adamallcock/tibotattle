@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { chmod, readFile, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -472,6 +472,18 @@ test("every sealed-source refusal fires before the target is touched", async () 
       assert.equal(error.code, code, `${stage}: ${sql.slice(0, 80)} -> ${error.code}`);
       return true;
     }, `${stage} ${code}`);
+  }
+});
+
+test("a sealed file changed after the seal refuses before the target is touched, in every stage", async () => {
+  const forged = await forgeVariantSeal(seal, "SELECT 1");
+  const path = join(forged.directory, "ingestion.sealed.sqlite");
+  await chmod(path, 0o600);
+  await writeFile(path, Buffer.from("tampered"), { flag: "a" });
+  await chmod(path, 0o400);
+  for (const stage of TELEMETRY_PRODUCTION_STAGES) {
+    await assert.rejects(TELEMETRY_PRODUCTION_RUNNERS[stage]({ handle: { sealManifestSha256: forged.sealId },
+      sealManifestPath: forged.manifestPath }), isCode("CUTOVER_SEALED_SOURCE_CHANGED"), stage);
   }
 });
 

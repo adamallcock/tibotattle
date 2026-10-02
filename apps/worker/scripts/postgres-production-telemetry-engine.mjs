@@ -65,6 +65,9 @@ import {
 export const TELEMETRY_PRODUCTION_MAX_PAGE_ROWS = 256;
 export const TELEMETRY_PRODUCTION_MAX_PAGE_BYTES = 4 * 1024 * 1024;
 export const TELEMETRY_PRODUCTION_TARGET_PAGE_ROWS = 2000;
+// Tables whose rows can carry a megabyte of text (manifests, domains, JSON records) read in smaller pages.
+export const TELEMETRY_PRODUCTION_LARGE_TARGET_PAGE_ROWS = 100;
+export const TELEMETRY_PRODUCTION_LARGE_SOURCE_PAGE_ROWS = 8;
 
 export const TELEMETRY_PRODUCTION_ERROR_CODES = Object.freeze([
   "CUTOVER_ADMISSION_PENDING_REQUESTS",
@@ -281,7 +284,7 @@ export function defineTable(options) {
   const {
     name, sealedTable = name, target = name, key, columns, from = null, where = null, closure = null,
     omitted = {}, mode = "insert", token, suppress = {}, fire = {}, beforeInsert = null, matchColumns = null,
-    receipt = true, targetRestrict = null,
+    receipt = true, targetRestrict = null, large = false,
   } = options;
   if (!IDENTIFIER.test(name) || !IDENTIFIER.test(sealedTable) || !IDENTIFIER.test(target)
       || !Array.isArray(key) || key.length === 0 || !Array.isArray(columns) || columns.length === 0
@@ -307,6 +310,7 @@ export function defineTable(options) {
       table: entry.table, columns: Object.freeze([...entry.columns]), omitted: Object.freeze({ ...(entry.omitted ?? {}) }),
     }))), omitted: Object.freeze({ ...omitted }), mode, token: token ?? null, receipt,
     suppress: Object.freeze({ ...suppress }), fire: Object.freeze({ ...fire }), beforeInsert, matchColumns,
+    large: large === true,
     targetRestrict: targetRestrict === null ? null : Object.freeze({ sql: targetRestrict.sql, values: Object.freeze([...(targetRestrict.values ?? [])]) }),
   });
 }
@@ -402,8 +406,12 @@ export function canonicalRow(spec, row) {
   return { values, parameters, size };
 }
 
+function sourcePageRows(spec, maxRows) {
+  return spec.large ? Math.min(maxRows, TELEMETRY_PRODUCTION_LARGE_SOURCE_PAGE_ROWS) : maxRows;
+}
+
 function pageOf(database, spec, after, maxRows, maxBytes) {
-  const candidates = readSourcePage(database, spec, after, maxRows);
+  const candidates = readSourcePage(database, spec, after, sourcePageRows(spec, maxRows));
   const page = [];
   let bytesTotal = 0;
   for (const candidate of candidates) {
@@ -418,13 +426,14 @@ function pageOf(database, spec, after, maxRows, maxBytes) {
 
 /** Stream the whole sealed spec once: count, bytes, digest and final prefix chain. */
 export function sourceTableFacts(database, spec, maxRows) {
+  const pageRows = sourcePageRows(spec, maxRows);
   const digest = createRowsDigest();
   let chain = EMPTY_PREFIX_CHAIN;
   let after = null;
   let rows = 0;
   let bytesTotal = 0;
   for (;;) {
-    const page = readSourcePage(database, spec, after, maxRows);
+    const page = readSourcePage(database, spec, after, pageRows);
     for (const { row, key } of page) {
       const canonical = canonicalRow(spec, row);
       digest.update(canonical.values);
@@ -433,7 +442,7 @@ export function sourceTableFacts(database, spec, maxRows) {
       bytesTotal += canonical.size;
       after = key;
     }
-    if (page.length < maxRows) break;
+    if (page.length < pageRows) break;
   }
   return { rows, bytes: bytesTotal, sha256: digest.digest(), chain };
 }
@@ -444,7 +453,7 @@ function sourcePrefix(database, spec, count, maxRows) {
   let after = null;
   let seen = 0;
   while (seen < count) {
-    const page = readSourcePage(database, spec, after, Math.min(maxRows, count - seen));
+    const page = readSourcePage(database, spec, after, Math.min(sourcePageRows(spec, maxRows), count - seen));
     if (page.length === 0) fail("CUTOVER_CHECKPOINT_DIVERGED", { table: spec.sealedTable });
     for (const { row, key } of page) {
       chain = advancePrefixChain(chain, canonicalRow(spec, row).values);
@@ -520,6 +529,7 @@ async function targetCount(client, schema, table, restrict = null) {
  * `restrict` limits the scan to the sealed keys of a merged seed.
  */
 export async function targetTableFacts(client, schema, spec, { restrict = null } = {}) {
+  const pageRows = spec.large ? TELEMETRY_PRODUCTION_LARGE_TARGET_PAGE_ROWS : TELEMETRY_PRODUCTION_TARGET_PAGE_ROWS;
   const keys = keyColumns(spec);
   if (keys.some(column => !Object.hasOwn(TARGET_KEY_CASTS, column.type))) fail("CUTOVER_TELEMETRY_ARGUMENT_INVALID");
   const collate = column => (column.type === "text" ? ` COLLATE "C"` : "");
@@ -547,12 +557,12 @@ export async function targetTableFacts(client, schema, spec, { restrict = null }
     }
     const where = conditions.length === 0 ? "" : ` WHERE ${conditions.join(" AND ")}`;
     const result = await q(client, `SELECT ${list} FROM ${quote(schema)}.${quote(spec.target)} target_row${where}
-      ORDER BY ${order} LIMIT ${TELEMETRY_PRODUCTION_TARGET_PAGE_ROWS}`, values, spec.target);
+      ORDER BY ${order} LIMIT ${pageRows}`, values, spec.target);
     for (const row of result.rows) {
       digest.update(spec.columns.map(column => canonicalTargetValue(column, row[column.name], spec.target)));
       rows += 1;
     }
-    if (result.rows.length < TELEMETRY_PRODUCTION_TARGET_PAGE_ROWS) break;
+    if (result.rows.length < pageRows) break;
     const last = result.rows.at(-1);
     after = keys.map((_, index) => last[`__key_${index}`]);
   }
