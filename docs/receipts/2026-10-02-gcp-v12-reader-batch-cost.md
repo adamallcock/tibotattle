@@ -7,9 +7,12 @@ status: snapshot
 
 # GCP PostgreSQL v1.2 effective reader, cost per page and batch
 
-This is a 2026-10-02 receipt (runs from 02:50 to 04:20 EDT) for branch
-`claude/gcp-fp-v12-reader`, built on `6e78d64f` (the dense-owner parity
-line). It records **local, synthetic** evidence only: one macOS arm64
+This is a 2026-10-02 receipt for branch `claude/gcp-fp-v12-reader`, built on
+`6e78d64f` (the dense-owner parity line). The rewrite (`f5c806b2`) was
+measured from 02:50 to 04:20 EDT. A review of it was verified and its
+findings fixed from 04:50 to 06:15 EDT; [Review follow-up](#review-follow-up)
+records that round, and the sections it changed say so. It records
+**local, synthetic** evidence only: one macOS arm64
 workstation (Apple M5 Max, 18 cores, 128 GiB), the local fan-out cluster
 (`PostgreSQL 17.10 on x86_64-apple-darwin24.6.0`) on its private Unix socket,
 and the importers and harnesses under Node.js 26.2.0. Every corpus is the
@@ -30,9 +33,11 @@ effective-reader verification was quadratic in owner size.
 
 `apps/worker/src/postgres-typed-v12-effective-reader.ts` is the GCP-only
 PostgreSQL v1.2 effective reader (blob `ec58bebf` before this change). Its
-API, its JavaScript validation and refusals, and the rows, order,
-multiplicity and grouping of all four reads stay the same. Only its four SQL
-statements change. The reader serves:
+API is unchanged. For every state that admission and the codec can write,
+the rows, order, multiplicity and grouping of all four reads stay the same.
+Its four SQL statements change. So do its refusals for stored ids the codec
+never writes, which only corrupt storage can hold (see
+[Refusals](#refusals)). The reader serves:
 
 - `cloud-run/server.mjs` (the runtime record page);
 - `src/postgres-typed-legacy-effective-reader.ts`;
@@ -130,24 +135,61 @@ Every statement already deduplicated what it selected (`DISTINCT`,
 `GROUP BY` or the `min(id)` group), so the multiplicity of the old joins never
 reached a result.
 
-The candidate page used to group by occurrence text; the new statement groups
-by stored id. The two agree because the text is the codec's canonical
-decoding of the stored id: `decodeTypedTelemetryId` refuses alternate byte
-spellings, so distinct stored ids have distinct texts. A state holding two
-stored spellings of one id lies outside the codec and would page differently.
-The record page and the expansion refuse such a row either way.
+The statements keep the 10 s statement timeout. The old shape grew with the
+day, so a day far denser than any measured here could reach that timeout and
+be refused as unavailable. The rewrite's cost does not grow with the day.
+That is a change in cost, not in what is selected.
 
-The JavaScript side, including every refusal, is unchanged. The statements
-keep the 10 s statement timeout. The old shape grew with the day, so a day far
-denser than any measured here could reach that timeout and be refused as
-unavailable. The rewrite's cost does not grow with the day. That is a change
-in cost, not in what is selected.
+### Refusals
+
+*Corrected in the review follow-up.* This section first said the candidate
+page's grouping and every refusal were unchanged. That held only for ids the
+codec writes.
+
+The candidate page used to group by occurrence text. The rewrite's
+earliest-record probe compares stored ids, and so does its `DISTINCT`. For
+admitted data the two agree: the codec admits one stored spelling per id, and
+`decodeTypedTelemetryId` refuses any other spelling. Two kinds of stored id
+lie outside the codec, and only corrupt storage can hold them:
+
+- a noncanonical spelling, which is a compressed id stored raw (tag 0);
+- an id the codec cannot decode: an unknown tag, a wrong length, or bytes that
+  are not UTF-8 under the raw tag.
+
+Admission writes encoder output. T-2's `daySets` already fails closed on
+noncanonical head-scoped source ids (`V12_TRANSFER_SOURCE_OCCURRENCE_INVALID`).
+
+| Stored id | Committed reader (`ec58bebf`) | First rewrite (`f5c806b2`) | Now |
+|---|---|---|---|
+| Raw spelling of an id that also has its compressed spelling, on the candidate page | Merged with its twin by text, so no refusal. The candidate time could come from the raw record, which the expansion never matches | Returned as a second candidate for the same text, within a page or on a later one. The legacy reader would fold that occurrence twice | Refused by the page that reaches it |
+| The same, on a record page or in the expansion | Record page: refused when reached. Expansion: never matched, because it probes encoder output | Same | Same |
+| A raw twin at its twin's instant, falling just after a record page's last row | Skipped: the cursor names the instant and the text, and the next page starts after both | Skipped | Refused: a page whose next row shares the cursor's instant and id refuses |
+| An id with no codec text, at the cursor's instant | Skipped: the SQL text is NULL, and NULL is never greater than the cursor's id | Skipped | Sorted last at its instant and kept by the cursor, so it is reached and refused |
+| Bytes that are not UTF-8 under the raw tag | Refused by every candidate page of the day, and by every record page up to the record, because each page decoded the whole day, or everything after the cursor | Refused by the page whose window reaches it | Same as the first rewrite |
+
+Refusals are now **positional**. A page or batch validates the rows it returns
+and refuses when one cannot be read. So a page that ends before such a record
+succeeds, and the page that reaches it refuses. This was already how every
+other record defect behaved in both readers: digest mismatches, malformed
+records and malformed tool counts.
+
+Pages cover a day contiguously, and the guards above leave no record between
+two pages. So **a complete walk of a day refuses whenever any record in
+scope is unreadable**. T-2's verification and the runtime both walk complete
+days.
+
+Restoring day-level refusal would need one of two things. Each page could
+read the whole day, which is the quadratic cost removed here. Or storage
+could hold a validity mark, which is a schema decision. Positional refusal is
+the contract this branch proposes; see [Findings and limits](#findings-and-limits).
 
 ## Equality
 
 ### A/B of the committed and rewritten readers
 
-A harness loaded both readers (`ec58bebf` and the rewrite) through Vite and
+This is the first round, against `f5c806b2`. The second round, against the
+fixed reader, is under [Review follow-up](#review-follow-up). A harness
+loaded both readers (`ec58bebf` and the rewrite) through Vite and
 called them side by side, read-only. It compared every result or refusal
 with `isDeepStrictEqual`: the records (including `recordJson`,
 `sourceRecordJson` and `sourceRecordKey`), the cursors and `available`.
@@ -194,9 +236,19 @@ passes with the rewrite.
 
 ## Regression case
 
-`typed-v12-effective-reader-scope.spec.mjs` (5 tests) seeds one migrated
-schema through the live guards of the primary chain. For each of the five
-filters, the fixture stores records that only that filter excludes:
+*Extended in the review follow-up.* `f5c806b2`'s spec had 5 tests and held
+only the five filters below. The review showed that twelve other predicates
+could each be removed while that spec still passed 5/5. This section
+describes the current spec.
+
+`typed-v12-effective-reader-scope.spec.mjs` (7 tests) seeds one migrated
+schema through the live guards of the primary chain. Anomalies are then
+written by direct updates with the triggers, foreign keys included, bypassed.
+The expectations are derived from the fixture's definitions, never from a
+read.
+
+**The five filters.** For each one, the fixture stores records that only that
+filter excludes:
 
 | Filter | Excluded variant |
 |---|---|
@@ -206,8 +258,7 @@ filters, the fixture stores records that only that filter excludes:
 | Retained authorization | romeo, whose owner link is withdrawn |
 | Head generation | papa's earlier generation: `OLD_ONLY`, an earlier variant of `SHARED`, and day D4 |
 
-The expectations are derived from the fixture's definitions, not from a
-read. They cover:
+These cases cover:
 
 - days;
 - candidate pages, including a same-instant tie split across pages, and two
@@ -216,19 +267,61 @@ read. They cover:
 - the expansion: a two-day occurrence's two variants, with foreign and
   ineligible variants excluded.
 
-The mutation check ran the spec once per mutant:
+**Every other predicate.** Participant tango has one record on its own head
+day for each predicate, excluded by that predicate alone; only `CONTROL` is
+selected. Participant sierra's head is on a device without retained
+authorization, while its other device is retained. Participant uniform has
+no generation. The test compares all four reads for tango, sierra and uniform
+over every stream and day, and its one assertion lists each read that
+differs.
 
-- Both readers unchanged, the committed one and the rewrite: 5 of 5 pass.
-- Any one filter removed from either reader: 4 of the 5 tests fail, one for
-  each of the four reads (10 mutants).
-- Any one filter removed from one statement of the committed reader, where
-  each statement has its own copy: exactly that statement's test fails
-  (20 mutants). In the rewrite the filters are shared by all four statements.
+| Predicate | Record that only it excludes |
+|---|---|
+| Domain day's manifest digest | `DIGEST`: the domain day carries another digest |
+| Manifest's day equals the domain day | `DAY_SHIFT`: the domain day is moved, the manifest is not |
+| Manifest's participant, and its device, are the generation's | `MANIFEST_PARTICIPANT` and `MANIFEST_DEVICE`: the manifest and its chunk are another participant's, or another device's |
+| Retained authorization's device | sierra's `SIERRA_ONLY` |
+| Chunk's participant, and its device | `CHUNK_PARTICIPANT` and `CHUNK_DEVICE`: the chunk alone differs |
+| Chunk's day | `CHUNK_DAY` |
+| Chunk's stream; record's stream in pages, in the expansion and in days | `USAGE_IN_QUOTA_CHUNK` and `QUOTA_IN_USAGE_CHUNK`, which hold each mismatch both ways |
+| Chunk's manifest | `FOREIGN_CHUNK`: the record's chunk names tango's loose staged manifest |
+| Record's manifest (days) | `FOREIGN_RECORD`: the record names that manifest |
+| Head row's participant; domain day's generation | `HEADED_ELSEWHERE`: tango's earlier generation on the same device, named by uniform's head row |
+
+**Refusals.** Participant victor stores the four kinds of id in the
+[Refusals](#refusals) table, one kind per day, beside canonical records. The
+test fixes the following:
+
+- each page before such a record succeeds;
+- the page that reaches it refuses;
+- no page skips one;
+- the expansion returns only the canonical records.
+
+For bytes that are not UTF-8, which page first decodes them depends on the
+plan, so the test fixes only that the walk refuses.
+
+**Mutation check** (follow-up; a scratch copy of the spec loads each mutant
+through a Vite load hook, so no tracked file changed):
+
+| Reader | Result |
+|---|---|
+| The fixed reader | 7/7 |
+| `ec58bebf` and `f5c806b2` | 6/7 each: both fail only the refusal test |
+| Each of the five filters removed (5 mutants) | 4 or 5 tests fail |
+| Each other predicate removed (16 mutants) | The predicate test fails, each at its own record's day and only in the reads that use that predicate. Chunk manifest and record manifest show the split: chunk manifest fails pages, candidates and expansion but not days, which reaches chunks through the manifest; record manifest fails days only, since the other reads reach records through their manifest |
+| Each refusal guard disabled (4 mutants: the candidate canonical check, the candidate's byte order, the record page's tie check, the cursor's NULL clause) | The refusal test fails |
+
+The first round's per-statement results (20 mutants of the committed reader,
+each failing exactly its statement's test) were measured against the 5-test
+spec.
 
 `npm run postgres:domain:check` runs the case in its node:test list.
 `ci-postgres-suite --plan` routes it to the SOCKET profile.
 
 ## Measurement (Node.js 26.2.0)
+
+These are the first round's figures, for `f5c806b2`. The fixed reader's
+paired run and plans are under [Review follow-up](#review-follow-up).
 
 ### T-2's reader verification
 
@@ -283,7 +376,10 @@ median of 7 runs.
 The dense owner has 128 times the small owner's records but costs 1.7 times
 as much: the expansion now follows the batch and the number of head days.
 
-## Gates
+## Gates, first round
+
+These ran against `f5c806b2`. The follow-up's gates, for the head of the
+branch, are under [Review follow-up](#review-follow-up).
 
 | Gate | Result |
 |---|---|
@@ -301,6 +397,92 @@ as much: the expansion now follows the batch and the number of head days.
 Not run: Docker, root `npm test` and `npm run check`, the Worker's full
 `check` and default Vitest suite, the cloud-run `npm run check` build, and
 anything on GCP or Cloudflare.
+
+## Review follow-up
+
+An independent review of `f5c806b2` raised three low-severity findings and
+one informational note. Each was verified against the code and reproduced
+before any change. None was rejected. The fixes are in the commit that
+follows `f5c806b2` on this branch. The reviewer's harness was reused for the
+reproductions; every database it touched was a scratch `v12r_*` database.
+
+| Finding | Verification | Fix |
+|---|---|---|
+| 1. The candidate page grouped by stored id, so a noncanonical spelling made one id a candidate twice, and the reader comment claimed the two groupings were the same | Reproduced. Raw spellings of `C` and `E` were added to papa's head day. The committed reader returned 7 candidates and `f5c806b2` returned 9, with `E` and `C` each twice; at limit 2, `E` appeared on pages 1 and 4 | Each candidate now carries its stored id. The page refuses one that is not the codec's spelling of its text. The stored id is part of the `DISTINCT` and the last ordering key, so a raw twin is returned no later than its compressed twin. The comment is corrected |
+| 2. The refusal set changed for ids the codec cannot decode | Reproduced. For bytes that are not UTF-8, the committed reader refused page 1 at limits 200 and 2, while `f5c806b2` returned pages 1 and 2 at limit 2 and refused page 3. For unknown tags with the cursor at 14:00 and `zzzzzzzz`, the committed reader returned an empty page and `f5c806b2` refused. Verification also found two silent skips that **both** readers share: an id with no codec text at the cursor's instant, and a raw twin at its twin's instant just past a record page's last row. A complete walk of the day missed each record without refusing | The contract is positional refusal with complete walks; see [Refusals](#refusals). The cursor keeps textless ids, and a record page refuses when its next row shares the cursor's instant and id. The contract is stated in the reader and here, and is open for the owner below |
+| 3. The spec caught only the five filters | Reproduced. Each of the reviewer's 13 mutants passed `f5c806b2`'s spec 5/5, while the ready-filter mutant failed 4 | The fixture and spec now hold every predicate, and the receipt's mutation claim is corrected; see [Regression case](#regression-case) |
+| 4. (Info) No equality defect, and the speed-up reproduces | Agreed. The second round below confirms both | None. The caveat on 7x owner volume and Cloud SQL stays |
+
+### Second-round equality
+
+Each harness compared every result or refusal side by side, as in the first
+round. The fixture and randomized schemas were built in the scratch database
+`v12r_fix`; the kept dense schema was read through read-only sessions.
+
+| Schema | Baseline | Comparisons | Mismatches |
+|---|---|---:|---:|
+| The extended fixture (all participants, own days, every stream, walks at limits 1, 2, 3 and 200, sampled cursors at every stored instant ±1 ms, single and full expansions, day windows) | `ec58bebf` | 6,254 | 105, all on victor's four days. In 92 the fixed reader refuses where the baseline returned. In 7 both return the same records, but the fixed reader's cursor continues to the defective record, which the next page refuses. In 6 the fixed reader returns a page before the non-UTF-8 id, which the baseline refused |
+| The same | `f5c806b2` | 6,255 | 95, all on victor's first three days: 93 refusals and 2 continued cursors |
+| Five randomized schemas (seeds 1, 7, 39, 52 and 65, from the reviewer's generator: ties, shared manifests, staged and incomplete chunks, cross-participant ids) | each | 29,362 each | 0 |
+| Q-1, imported afresh into `v12r_q1` with the fixed reader inside T-2 | `ec58bebf` | 2,242 | 0 |
+| Dense, the kept schema: every candidate and record page of every owner, stream and day (2,623 of each, all 364,111 records), all 2,605 expansion batches (364,111 rows), plus the first round's limit, cursor, mixed, cross-owner and refused cases | `f5c806b2` | 9,213 | 0 |
+| Dense, the same pages, with 372 of the batches (24,281 rows) | `ec58bebf` | 6,980 | 0 |
+
+Outside victor's days, which hold ids the codec never writes, no comparison
+differs.
+
+### T-2 and plans, fixed reader
+
+- **Q-1 import.** T-2 verified 3,649 records with digest `a9256d48…`, the same
+  as the first round. The T-2 phase took 7.5 s.
+- **Dense import.** The whole importer chain ran into a fresh `v12r_dense`
+  from the dense oracle's pinned dump (`1d0bef8e…`, sealed `cb04f411…`). T-2
+  verified 364,111 records with digest `759b9ea3…`. The T-2 phase took
+  121.4 s, against 144.0 s in the first round and 2,904 to 3,007 s before it.
+- **Kept dense schema.** `verifyEffectiveReader` ran back to back with each
+  reader, at a load average of about 4.5. Both returned `759b9ea3…`.
+
+  | | Fixed reader | `f5c806b2` |
+  |---|---:|---:|
+  | Wall | 74.3 s | 71.9 s |
+  | Candidate pages (2,605 calls) | 16.4 s, max 11.3 ms | 14.4 s, max 13.1 ms |
+  | Expansion batches (2,605 calls) | 52.8 s, max 34 ms | 52.5 s, max 46 ms |
+
+  The candidate pages cost about 14% more, from the stored id each row now
+  carries and the codec check of each candidate.
+- **Plans (`EXPLAIN (ANALYZE, BUFFERS)`, dense owner, busiest day).** The
+  shapes and buffers match `f5c806b2`. The candidate page still reads each
+  manifest's index with an incremental sort presorted on `observed_at_ms`.
+
+  | Statement | Execution | Buffers |
+  |---|---:|---:|
+  | Candidate page 1 | 1.0 ms | 882 |
+  | Candidate page 82 | 2.9 ms | 2,877 |
+  | Record page 1 | 1.4 ms | 2,110 |
+  | Record page at cursor 82 | 3.6 ms | 4,511 |
+  | Expansion, 200 ids | 25.3 ms | 22,149 |
+  | Days, 101-day window | 5.4 ms | 2,532 |
+
+### Gates, head of the branch
+
+| Gate | Result |
+|---|---|
+| `tsc --noEmit` (apps/worker) | exit 0 |
+| The spec alone (`PG_TEST_SOCKET`) | 7/7 |
+| `postgres:domain:check`, vitest half (`PG_TEST_SOCKET`, `PG_TEST_TCP_HOST`) | 12 files, 76/76 |
+| `postgres:domain:check`, node:test half | 344 tests: 342 pass, 0 fail, 2 skipped. These are the same two skips as the first round; the T-2 Q-1 case was then run on its own |
+| T-2's opt-in Q-1 dump case (`POSTGRES_V12_TRANSFER_Q1_DUMP`) | 1/1 |
+| `cloud-run/host.check.mjs` (`PG_TEST_SOCKET`) | 22/22 in both of two runs. The concurrent-grant flake did not occur |
+| `npm run scripts:check` | exit 0, 967/967 |
+| `ci-postgres-suite --plan` | exit 1, the same single `PROFILE_ROUTING_AMBIGUOUS` failure as at the base. The spec is routed SOCKET |
+| `npm run architecture:check` (root) | passed (919 production files, 3,911 imports) |
+| `npm run test:preflight` (root) | passed |
+
+`typed-v12-normalized.spec.mjs` was not rerun. Its two failures predate this
+branch, and both precede or follow its reader assertions. Not run: Docker,
+root `npm test` and `npm run check`, the Worker's full `check` and default
+Vitest suite, the cloud-run `npm run check` build, and anything on GCP or
+Cloudflare.
 
 ## Findings and limits
 
@@ -325,9 +507,19 @@ anything on GCP or Cloudflare.
    - production's D1 reader (the Worker), which has the same shape;
    - the legacy v1/v1.1 expansion (finding 3 of the dense-owner parity
      receipt).
-5. **Gate failures that predate this branch** are listed under Gates: the
-   suite plan's routing ambiguity, the stale normalized spec, and the host
-   check's flaky concurrent grant. None was changed here.
+5. **Gate failures that predate this branch** are listed under the gates:
+   the suite plan's routing ambiguity, the stale normalized spec, and the
+   host check's flaky concurrent grant. None was changed here.
+6. **Refusals for stored ids the codec never writes are positional (owner
+   decision).** Only corrupt storage can hold such ids. A page refuses when
+   it reaches one, and a complete walk always refuses. A page that ends
+   before the defect still succeeds, as it already did for every other
+   record defect. The committed reader also refused earlier pages for
+   non-UTF-8 ids, but only as a side effect of decoding the whole day on
+   every page. Day-level refusal would need either that quadratic read or a
+   stored validity mark, which is a schema change. If the owner wants
+   day-level refusal, it is a separate decision.
 
-Scratch databases `v12r_q1` and `v12r_dense` and their work files were
-removed after the runs.
+Scratch databases from both rounds were removed after the runs, with their
+work files: `v12r_q1` and `v12r_dense` in the first round; `v12r_fix`,
+`v12r_q1` and `v12r_dense` in the follow-up.

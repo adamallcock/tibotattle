@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { lstat, realpath, stat } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,8 +15,11 @@ import {
   D3,
   D4,
   D5,
+  ANOMALIES,
+  E,
   IDS,
   TIMES,
+  V,
   seedTypedV12EffectiveScope,
 } from "./fixtures/typed-v12-effective-scope.mjs";
 
@@ -26,9 +30,14 @@ import {
  * record page) select exactly the records of the requested stream in a
  * complete chunk of a ready manifest of the participant's current-head
  * generation on a retained authorization. The fixture holds each of those
- * five filters to a record only that filter excludes, so removing any one of
- * them from any read fails a case below. Each expectation is derived from the
- * fixture's own definitions, never from a read.
+ * five filters, and every other predicate of the selection (the domain day's
+ * manifest, the manifest's and chunk's participant, device, day and stream,
+ * the record's own manifest and stream, the head row's participant and the
+ * retained device), to a record that only it excludes, so removing any one
+ * of them fails a case below. It also stores ids the codec never writes, to
+ * fix the refusals: each page refuses when it reaches one and no page skips
+ * one, so a complete walk of the day refuses. Each expectation is derived
+ * from the fixture's own definitions, never from a read.
  *
  * One random schema with the whole primary chain applied by the production
  * migration runner; nothing outside it is written or dropped.
@@ -164,18 +173,27 @@ test("the fixture stores every excluded variant the reads must not select", { sk
     JOIN "${schema}".telemetry_v12_day_manifests manifest ON manifest.id=record.manifest_id
    GROUP BY 1,2,3`);
   const name = Object.fromEntries(Object.entries(fixture.participants).map(([key, value]) => [value, key]));
+  // MANIFEST_PARTICIPANT's manifest is uniform's, QUOTA_IN_USAGE_CHUNK is a
+  // quota record and FOREIGN_RECORD names tango's loose staged manifest.
   assert.deepEqual(stored.rows.map((row) => `${name[row.participant_id]}:${row.state}:${row.stream}:${row.records}`).sort(),
     ["papa:ready:quota:3", "papa:ready:session:1", "papa:ready:usage:13", "papa:staged:usage:1",
-      "quebec:ready:usage:3", "romeo:ready:usage:1"].sort());
+      "quebec:ready:usage:3", "romeo:ready:usage:1", "sierra:ready:usage:1", "tango:ready:quota:1",
+      "tango:ready:usage:10", "tango:staged:usage:1", "uniform:ready:usage:1", "victor:ready:usage:9"].sort());
   const incomplete = await pool.query(`SELECT count(*)::integer AS n FROM "${schema}".telemetry_v12_chunks chunk
     WHERE chunk.record_count <> (SELECT count(*) FROM "${schema}".telemetry_v12_typed_records r WHERE r.chunk_id=chunk.id)`);
   assert.equal(incomplete.rows[0].n, 2, "two stored chunks are incomplete");
   const retained = await pool.query(`SELECT participant_id FROM "${schema}".telemetry_v12_typed_retained_authorizations`);
-  assert.deepEqual(retained.rows.map((row) => name[row.participant_id]).sort(), ["papa", "papa", "quebec"]);
+  assert.deepEqual(retained.rows.map((row) => name[row.participant_id]).sort(),
+    ["papa", "papa", "quebec", "sierra", "tango", "tango", "victor"]);
   const heads = await pool.query(`SELECT count(*)::integer AS n FROM "${schema}".telemetry_v12_domains generation
-    LEFT JOIN "${schema}".telemetry_v12_domain_heads head ON head.generation_id=generation.id
+    LEFT JOIN "${schema}".telemetry_v12_domain_heads head
+      ON head.generation_id=generation.id AND head.participant_id=generation.participant_id
    WHERE head.generation_id IS NULL`);
-  assert.equal(heads.rows[0].n, 1, "papa's earlier generation is not a head");
+  assert.equal(heads.rows[0].n, 2, "papa's and tango's earlier generations are not their participants' heads");
+  const ids = await pool.query(`SELECT count(*)::integer AS n FROM "${schema}".telemetry_v12_typed_records record
+    JOIN "${schema}".telemetry_v12_day_manifests manifest ON manifest.id=record.manifest_id
+   WHERE manifest.participant_id=$1 AND get_byte(record.occurrence_id, 0)<>7`, [fixture.participants.victor]);
+  assert.equal(ids.rows[0].n, 4, "victor stores four ids the codec never writes");
 });
 
 test("nonempty days are the head's ready days with a complete chunk of the stream, for a retained owner",
@@ -272,4 +290,102 @@ test("the occurrence expansion returns only the selected variants of the request
     assert.deepEqual(await expand(papa, "usage", []), { available: false, records: [] });
     await assert.rejects(expand(papa, "usage", Array.from({ length: 201 }, (_, index) =>
       `event:v2:${index.toString(16).padStart(64, "0")}`)), /TELEMETRY_V12_EFFECTIVE_UNAVAILABLE/u);
+  });
+
+test("every other predicate of the selection excludes the record held to it", { skip: SKIP }, async () => {
+  const { tango, sierra, uniform } = fixture.participants;
+  // Every read is compared; the one assertion lists each read that differs,
+  // so a failure names the reads that lost the predicate.
+  const differing = [];
+  async function compare(label, read, want) {
+    let got;
+    try { got = await read(); } catch (error) { got = { refused: error.message }; }
+    if (!isDeepStrictEqual(got, want)) differing.push(label);
+  }
+  const shape = (pages) => pages.flatMap((page) => page.records.map((item) =>
+    [item.sourceRecordKey, item.occurrenceId, item.observedAt]));
+  const candidates = async (participantId, day, stream) => (await allCandidates(participantId, day, stream, 200))
+    .flatMap((page) => page.records);
+  const control = (stream, day) => (stream === "usage" && day === E[0] ? [["CONTROL", IDS.CONTROL, TIMES.CONTROL]] : []);
+  const requested = ANOMALIES.map((role) => IDS[role]);
+  for (const [name, participantId] of Object.entries({ tango, sierra, uniform })) {
+    for (const stream of STREAMS) {
+      const selected = (day) => (name === "tango" ? control(stream, day) : []);
+      await compare(`days ${name} ${stream}`, () => reader.readPostgresTelemetryV12EffectiveDays(pool,
+        { participantId, fromDay: E[0], throughDay: E.at(-1), stream }, options),
+      name === "tango" && stream === "usage" ? [E[0]] : []);
+      for (const day of E) {
+        await compare(`candidates ${name} ${stream} ${day}`, () => candidates(participantId, day, stream),
+          selected(day).map(([, id, time]) => ({ occurrenceId: id, observedAtMs: ms(time) })));
+        await compare(`records ${name} ${stream} ${day}`, async () => shape(await allRecords(participantId, day, stream, 200)),
+          selected(day).map(([role, id, time]) => [`v12:record:${fixture.rows[role]}`, id, time]));
+      }
+      await compare(`expansion ${name} ${stream}`, async () => shape([await reader.readPostgresTelemetryV12EffectiveOccurrences(
+        pool, { participantId, stream, occurrenceIds: requested }, options)]),
+      selected(E[0]).map(([role, id, time]) => [`v12:record:${fixture.rows[role]}`, id, time]));
+    }
+  }
+  assert.deepEqual(differing, []);
+});
+
+/** Walk a day's pages until the end or a refusal; returns each page's records. */
+async function walk(read, participantId, day, limit) {
+  const pages = [];
+  let afterCursor;
+  for (let index = 0; index < 64; index += 1) {
+    let page;
+    try {
+      page = await read(pool, { participantId, day, stream: "usage",
+        ...(afterCursor ? { after: afterCursor } : {}), limit }, options);
+    } catch (error) {
+      assert.match(error.message, /^TELEMETRY_V12_EFFECTIVE_UNAVAILABLE$/u);
+      return { pages, refused: true };
+    }
+    assert.equal(page.available, true);
+    pages.push(page.records.map((item) => [item.occurrenceId, item.observedAtMs]));
+    if (page.next === null) return { pages, refused: false };
+    afterCursor = page.next;
+  }
+  throw new Error("paging did not end");
+}
+
+test("a stored id the codec never writes refuses the page that reaches it, and no page skips one",
+  { skip: SKIP }, async () => {
+    const { victor } = fixture.participants;
+    const candidates = (day, limit) => walk(reader.readPostgresTelemetryV12EffectiveCandidatePage, victor, day, limit);
+    const records = (day, limit) => walk(reader.readPostgresTelemetryV12EffectivePage, victor, day, limit);
+    const entry = (role) => [IDS[role], ms(TIMES[role])];
+    assert.deepEqual(await reader.readPostgresTelemetryV12EffectiveDays(pool,
+      { participantId: victor, fromDay: V[0], throughDay: V.at(-1), stream: "usage" }, options), [...V]);
+    // A raw spelling of NC_ID, later than NC_ID: the page before it succeeds
+    // and the candidate page refuses it rather than return NC_ID twice.
+    for (const read of [candidates, records]) {
+      assert.deepEqual(await read(V[0], 1), { pages: [[entry("NC_ID")]], refused: true });
+      assert.deepEqual(await read(V[0], 200), { pages: [], refused: true });
+    }
+    // A raw spelling of TIE_ID at TIE_ID's instant. A candidate page orders
+    // the raw spelling first and refuses it; a record page that ends at
+    // TIE_ID refuses rather than hand back a cursor that would skip it.
+    assert.deepEqual(await candidates(V[1], 1), { pages: [[entry("TIE_FIRST")]], refused: true });
+    assert.deepEqual(await records(V[1], 1), { pages: [[entry("TIE_FIRST")]], refused: true });
+    assert.deepEqual(await records(V[1], 2), { pages: [], refused: true });
+    // An id with no codec text at NO_TEXT_ID's instant sorts after it and
+    // is not excluded by a cursor at NO_TEXT_ID.
+    for (const read of [candidates, records]) {
+      assert.deepEqual(await read(V[2], 1), { pages: [[entry("NO_TEXT_ID")]], refused: true });
+      assert.deepEqual(await read(V[2], 200), { pages: [], refused: true });
+    }
+    // An id that is not UTF-8 fails in SQL; which page first decodes it
+    // depends on the plan, so only the walk's refusal is fixed.
+    for (const read of [candidates, records]) {
+      for (const limit of [1, 200]) assert.equal((await read(V[3], limit)).refused, true);
+    }
+    // The expansion matches only codec spellings, so it returns the canonical
+    // records of the requested ids.
+    const wanted = ["NC_ID", "TIE_FIRST", "TIE_ID", "NO_TEXT_ID", "UTF8_ID"];
+    const expanded = await reader.readPostgresTelemetryV12EffectiveOccurrences(pool,
+      { participantId: victor, stream: "usage", occurrenceIds: wanted.map((role) => IDS[role]) }, options);
+    assert.deepEqual(expanded.records.map((item) => [item.sourceRecordKey, item.occurrenceId, item.observedAt]),
+      wanted.map((role) => [`v12:record:${fixture.rows[role]}`, IDS[role], TIMES[role]])
+        .sort((left, right) => byKey(left[1], right[1])));
   });

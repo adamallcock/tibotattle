@@ -300,6 +300,15 @@ function BufferHex(value: unknown): string {
   return [...bytes(value)].map((item) => item.toString(16).padStart(2, "0")).join("");
 }
 
+/** The codec's text of a stored id; refuses an undecodable id or an alternate byte spelling. */
+function canonicalOccurrence(value: unknown): string {
+  try {
+    return decodeTypedTelemetryId(bytes(value));
+  } catch {
+    throw unavailable();
+  }
+}
+
 async function assertAvailable(client: PostgresClient, schema: string): Promise<boolean> {
   const result = await client.query<{ name: string }>(
     `SELECT relation.relname AS name
@@ -439,9 +448,20 @@ function recordJoins(schema: string): string {
  * chunk) for each page or batch: a read quadratic in owner size.
  *
  * Every statement deduplicates what it selects (DISTINCT, GROUP BY or a
- * min(id) group), so the rows, their order, their grouping and the
- * reader's refusals are unchanged; the multiplicity of the old joins never
- * reached a result.
+ * min(id) group), so the multiplicity of the joins never reaches a result.
+ *
+ * Refusals are positional. A page or batch validates the rows it returns and
+ * refuses when one cannot be read (an id with no codec text or a
+ * noncanonical spelling, a digest mismatch, a malformed record), so a page
+ * that ends before such a record succeeds and the page that reaches it
+ * refuses. Pages cover a day contiguously and no record can fall between
+ * them: an id with no codec text sorts last at its instant and the cursor
+ * never excludes it, a candidate page orders an id's raw spelling before its
+ * compressed one, and a record page refuses when its next record shares the
+ * cursor's instant and id. A complete walk of a day therefore refuses
+ * whenever any record in scope is unreadable. (Statements that regrouped or
+ * sorted the whole day on every page also refused earlier pages, as a side
+ * effect of the cost this shape removes.)
  */
 
 /** The current-head manifests in scope, one row per manifest. */
@@ -511,7 +531,7 @@ function pageSql(schema: string): string {
     `        FROM ${table(schema, "telemetry_v12_typed_records")} r`,
     `        ${completeChunkJoinSql(schema, "r", "scope", "$2", "chunk")}`,
     "       WHERE r.manifest_id=scope.manifest_id AND r.stream=$2 AND r.observed_at_ms>=$4",
-    `         AND (r.observed_at_ms>$4 OR (r.observed_at_ms=$4 AND (${occurrence} COLLATE "C")>($5::text COLLATE "C")))`,
+    `         AND (r.observed_at_ms>$4 OR (r.observed_at_ms=$4 AND ((${occurrence}) IS NULL OR (${occurrence} COLLATE "C")>($5::text COLLATE "C"))))`,
     "       ORDER BY r.observed_at_ms,occurrence_key,manifest_key,r.record_index LIMIT $6",
     "    ) page",
     "   ORDER BY page.observed_at_ms,page.occurrence_key,page.manifest_key,page.record_index LIMIT $6",
@@ -533,8 +553,15 @@ function pageSql(schema: string): string {
  * records after the cursor, in (observed_at_ms, occurrence) order, are the
  * candidates in page order. An occurrence id is unique within a manifest's
  * stream, so each scoped manifest's first $6 such records are distinct
- * candidates and the union holds the overall first $6. Occurrence text is
- * the codec's decoding of the stored id, so grouping by either is the same.
+ * candidates and the union holds the overall first $6.
+ *
+ * The probe compares stored ids, not texts. The codec admits one stored
+ * spelling per id, so for admitted data that is grouping by text. A second
+ * spelling of one text (only in corrupt storage: a compressed id stored raw)
+ * would be a second candidate, so each candidate carries its stored id and
+ * the page refuses one that is not the codec's spelling of its text. The
+ * stored id is the last ordering key, so at one instant a raw spelling
+ * (tag 0) precedes the compressed one and is returned no later than its twin.
  */
 function candidateSql(schema: string): string {
   const occurrence = typedIdTextSql("r.occurrence_id");
@@ -542,23 +569,23 @@ function candidateSql(schema: string): string {
     "WITH scope AS MATERIALIZED (",
     headManifestsSql(schema, "$3", " AND domain_day.observed_day=$1::date"),
     "), picked AS MATERIALIZED (",
-    "  SELECT DISTINCT candidate.occurrence_key AS occurrence_id,candidate.observed_at_ms",
+    "  SELECT DISTINCT candidate.occurrence_key AS occurrence_id,candidate.observed_at_ms,candidate.occurrence_bytes",
     "    FROM scope CROSS JOIN LATERAL (",
-    `      SELECT (${occurrence}) COLLATE "C" AS occurrence_key,r.observed_at_ms`,
+    `      SELECT (${occurrence}) COLLATE "C" AS occurrence_key,r.observed_at_ms,r.occurrence_id AS occurrence_bytes`,
     `        FROM ${table(schema, "telemetry_v12_typed_records")} r`,
     `        ${completeChunkJoinSql(schema, "r", "scope", "$2", "chunk")}`,
     "       WHERE r.manifest_id=scope.manifest_id AND r.stream=$2 AND r.observed_at_ms>=$4::bigint",
-    `         AND (r.observed_at_ms>$4::bigint OR (r.observed_at_ms=$4::bigint AND (${occurrence}) COLLATE "C">($5::text COLLATE "C")))`,
+    `         AND (r.observed_at_ms>$4::bigint OR (r.observed_at_ms=$4::bigint AND ((${occurrence}) IS NULL OR (${occurrence}) COLLATE "C">($5::text COLLATE "C"))))`,
     "         AND NOT EXISTS (",
     `           SELECT 1 FROM scope earlier_scope JOIN ${table(schema, "telemetry_v12_typed_records")} earlier`,
     "             ON earlier.manifest_id=earlier_scope.manifest_id AND earlier.stream=$2",
     "            AND earlier.occurrence_id=r.occurrence_id AND earlier.observed_at_ms<r.observed_at_ms",
     `          WHERE ${completeChunkSql(schema, "earlier", "earlier_scope", "$2", "earlier_chunk")})`,
-    "       ORDER BY r.observed_at_ms,occurrence_key LIMIT $6",
+    "       ORDER BY r.observed_at_ms,occurrence_key,r.occurrence_id LIMIT $6",
     "    ) candidate",
     ")",
-    "SELECT occurrence_id,observed_at_ms FROM picked",
-    " ORDER BY observed_at_ms,occurrence_id COLLATE \"C\" LIMIT $6",
+    "SELECT occurrence_id,observed_at_ms,occurrence_bytes FROM picked",
+    " ORDER BY observed_at_ms,occurrence_id COLLATE \"C\",occurrence_bytes LIMIT $6",
   ].join("\n");
 }
 
@@ -657,6 +684,12 @@ export async function readPostgresTelemetryV12EffectivePage(
       );
       const parsed = await Promise.all(query.rows.slice(0, pageLimit).map((row) => decodedRow(streamName, row)));
       if (parsed.some((record) => record.observedAt.slice(0, 10) !== requestedDay)) throw unavailable();
+      // The cursor names an instant and an id. A next record with both of the
+      // last record's could not be addressed, so refuse rather than skip it.
+      const following = query.rows[pageLimit];
+      if (following !== undefined && parsed.length > 0
+          && integer(following.observed_at_ms, MIN_MS, MAX_MS) === parsed.at(-1)!.observedAtMs
+          && following.occurrence_key === parsed.at(-1)!.occurrenceId) throw unavailable();
       const next = query.rows.length > pageLimit && parsed.length > 0
         ? Object.freeze({
           observedAtMs: parsed.at(-1)!.observedAtMs,
@@ -688,13 +721,18 @@ export async function readPostgresTelemetryV12EffectiveCandidatePage(
       if (!await assertAvailable(client, schema)) {
         return Object.freeze({ available: false, records: Object.freeze([]), next: null });
       }
-      const query = await client.query<{ occurrence_id: string; observed_at_ms: number | string }>(
+      const query = await client.query<{
+        occurrence_id: string | null;
+        observed_at_ms: number | string;
+        occurrence_bytes: unknown;
+      }>(
         candidateSql(schema),
         [requestedDay, streamName, participantId, cursor.observedAtMs,
           cursor.occurrenceId, pageLimit + 1],
       );
       const records = query.rows.slice(0, pageLimit).map((row) => {
-        if (typeof row.occurrence_id !== "string" || !OCCURRENCE.test(row.occurrence_id)) throw unavailable();
+        if (typeof row.occurrence_id !== "string" || !OCCURRENCE.test(row.occurrence_id)
+            || canonicalOccurrence(row.occurrence_bytes) !== row.occurrence_id) throw unavailable();
         return Object.freeze({
           occurrenceId: row.occurrence_id,
           observedAtMs: integer(row.observed_at_ms, MIN_MS, MAX_MS),

@@ -24,9 +24,42 @@
  * romeo (social, head, owner link withdrawn, so no retained authorization):
  *   D1 ready, ROMEO_ONLY.
  *
+ * tango (social, retained) holds one record for each remaining predicate of
+ * the selection, each on its own ready day of the head generation (device
+ * tango-head) and excluded by that predicate alone. Only CONTROL (E[0]) is
+ * selected:
+ *   E[1] DIGEST: the domain day's manifest digest differs from the manifest's;
+ *   E[2] DAY_SHIFT: the domain day is moved to E[14], its manifest stays on E[2];
+ *   E[3] MANIFEST_DEVICE: the manifest, and its chunk, are device tango-other's;
+ *   E[4] MANIFEST_PARTICIPANT: the manifest, and its chunk, are uniform's;
+ *   E[5] CHUNK_PARTICIPANT: the chunk alone is uniform's;
+ *   E[6] CHUNK_DEVICE: the chunk alone is tango-other's;
+ *   E[7] CHUNK_DAY: the chunk alone is dated E[15];
+ *   E[8] USAGE_IN_QUOTA_CHUNK: a usage record in a chunk marked quota;
+ *   E[9] QUOTA_IN_USAGE_CHUNK: a quota record in a chunk marked usage;
+ *   E[10] FOREIGN_CHUNK: the record's chunk names tango's loose staged manifest;
+ *   E[11] FOREIGN_RECORD: the record names that manifest, its chunk does not;
+ *   E[12] HEADED_ELSEWHERE: tango's earlier generation on the same device,
+ *     which participant uniform's head row names.
+ * sierra (social, retained): the head generation is on device sierra-head,
+ *   which has no retained authorization while sierra-other has one:
+ *   E[13] SIERRA_ONLY.
+ * uniform (social, active owner link) has no device or generation of its own.
+ *
+ * victor (social, retained, head) holds stored ids the codec never writes,
+ * one kind per day, each beside canonical records:
+ *   V[0] the raw spelling (tag 0) of NC_ID, later than NC_ID;
+ *   V[1] the raw spelling of TIE_ID at TIE_ID's instant, after it in record
+ *     order (TIE_FIRST precedes both);
+ *   V[2] an id with an unknown tag (no codec text) at NO_TEXT_ID's instant;
+ *   V[3] an id that is not UTF-8 under the raw tag, after UTF8_ID.
+ *
  * The ready-integrity guard (0028) forbids a ready manifest with an
  * incomplete chunk, so that one manifest is made ready with the statement's
  * triggers bypassed; the reader's own completeness check is what is tested.
+ * Every tango, sierra and victor anomaly is likewise written after its
+ * generation is built through the live guards, by direct writes with the
+ * triggers (foreign keys included) bypassed.
  */
 import { createHash } from "node:crypto";
 
@@ -36,6 +69,11 @@ export const D2 = "2026-09-29";
 export const D3 = "2026-09-30";
 export const D4 = "2026-10-01";
 export const D5 = "2026-10-02";
+/** tango's and sierra's days: E[0] to E[13] hold records; E[14] and E[15] are anomaly targets. */
+export const E = Object.freeze(Array.from({ length: 16 }, (_, index) =>
+  new Date(Date.parse("2026-10-05T00:00:00.000Z") + index * 86_400_000).toISOString().slice(0, 10)));
+/** victor's days, one stored-id defect each. */
+export const V = Object.freeze(["2026-10-25", "2026-10-26", "2026-10-27", "2026-10-28"]);
 const ISSUED = "2026-09-01T00:00:00.000Z";
 const EXPIRES = "2099-01-01T00:00:00.000Z";
 const PROVIDER = "openai_codex";
@@ -73,7 +111,36 @@ export const IDS = Object.freeze({
   QUOTA_TEXT: "quota:v12:effective-scope-1",
   QUOTA_INCOMPLETE: `quota-occurrence:v1:${digest("occurrence:quota-incomplete")}`,
   SESSION: uuid("session:papa"),
+  CONTROL: event("control"),
+  DIGEST: event("digest"),
+  DAY_SHIFT: event("day-shift"),
+  MANIFEST_DEVICE: event("manifest-device"),
+  MANIFEST_PARTICIPANT: event("manifest-participant"),
+  CHUNK_PARTICIPANT: event("chunk-participant"),
+  CHUNK_DEVICE: event("chunk-device"),
+  CHUNK_DAY: event("chunk-day"),
+  USAGE_IN_QUOTA_CHUNK: event("usage-in-quota-chunk"),
+  QUOTA_IN_USAGE_CHUNK: `quota-occurrence:v1:${digest("occurrence:quota-in-usage-chunk")}`,
+  FOREIGN_CHUNK: event("foreign-chunk"),
+  FOREIGN_RECORD: event("foreign-record"),
+  HEADED_ELSEWHERE: event("headed-elsewhere"),
+  SIERRA_ONLY: event("sierra-only"),
+  NC_ID: event("nc"),
+  TIE_FIRST: event("tie-first"),
+  TIE_ID: event("tie"),
+  NO_TEXT_ID: event("no-text"),
+  UTF8_ID: event("utf8"),
+  // Admitted ids of the victor records whose stored ids are then rewritten.
+  NC_SOURCE: event("nc-source"),
+  TIE_SOURCE: event("tie-source"),
+  NO_TEXT_SOURCE: event("no-text-source"),
+  UTF8_SOURCE: event("utf8-source"),
 });
+
+/** The tango and sierra roles, in day order (E[0] to E[13]). */
+export const ANOMALIES = Object.freeze(["CONTROL", "DIGEST", "DAY_SHIFT", "MANIFEST_DEVICE",
+  "MANIFEST_PARTICIPANT", "CHUNK_PARTICIPANT", "CHUNK_DEVICE", "CHUNK_DAY", "USAGE_IN_QUOTA_CHUNK",
+  "QUOTA_IN_USAGE_CHUNK", "FOREIGN_CHUNK", "FOREIGN_RECORD", "HEADED_ELSEWHERE", "SIERRA_ONLY"]);
 
 /** Event times (UTC) by role; A and B share an instant, as do both quota ids. */
 export const TIMES = Object.freeze({
@@ -98,6 +165,16 @@ export const TIMES = Object.freeze({
   QUEBEC_D0: at(D0, "10:00:00.000"),
   QUOTA_INCOMPLETE: at(D3, "07:00:00.000"),
   ROMEO_ONLY: at(D1, "10:45:00.000"),
+  ...Object.fromEntries(ANOMALIES.map((role, index) => [role, at(E[index], "10:00:00.000")])),
+  NC_ID: at(V[0], "09:00:00.000"),
+  NC_SOURCE: at(V[0], "11:00:00.000"),
+  TIE_FIRST: at(V[1], "08:00:00.000"),
+  TIE_ID: at(V[1], "12:00:00.000"),
+  TIE_SOURCE: at(V[1], "12:00:00.000"),
+  NO_TEXT_ID: at(V[2], "10:00:00.000"),
+  NO_TEXT_SOURCE: at(V[2], "10:00:00.000"),
+  UTF8_ID: at(V[3], "09:00:00.000"),
+  UTF8_SOURCE: at(V[3], "11:00:00.000"),
 });
 
 function usageRecord(eventId, eventTime) {
@@ -134,7 +211,7 @@ function usageRecord(eventId, eventTime) {
   };
 }
 
-function quotaRecord(observationId, observedTime) {
+function quotaRecord(observationId, observedTime, resetsAt = at(D3, "13:05:00.000")) {
   return {
     schemaVersion: "quota-observation-v1.2",
     observationId,
@@ -146,7 +223,7 @@ function quotaRecord(observationId, observedTime) {
     slot: "primary",
     usedPercent: 20,
     windowDurationMinutes: 10_080,
-    resetsAt: at(D3, "13:05:00.000"),
+    resetsAt,
     accountPlanAttribution: {
       accountBasis: "unavailable", accountTrackId: null,
       planBasis: "same_source_occurrence", planType: "pro", planEraId: null,
@@ -265,13 +342,15 @@ export async function seedTypedV12EffectiveScope({ pool, schema, modules }) {
    * One generation of `days` ({ day, ready, chunks: [{ stream, records:
    * [[role, value]], declaredExtra }] }); `head` makes it the participant's
    * head. Records are admitted while each manifest is staged, as the
-   * admission path does, then the manifest is made ready.
+   * admission path does, then the manifest is made ready. Returns the
+   * generation id and, per day, the manifest id and chunk row ids.
    */
   async function generation({ participantId, deviceId, name, days, head }) {
     const generationId = uuid(`generation:${name}`);
     const fingerprint = digest(`fingerprint:${name}`);
     const token = digest(`token:${name}`);
     const domainDays = [];
+    const manifests = {};
     for (const entry of days) {
       const manifestId = uuid(`manifest:${name}:${entry.day}`);
       const manifestDigest = digest(`manifest-digest:${name}:${entry.day}`);
@@ -361,6 +440,7 @@ export async function seedTypedV12EffectiveScope({ pool, schema, modules }) {
           [manifestId, ISSUED]);
       }
       domainDays.push({ day: entry.day, manifestId, manifestDigest });
+      manifests[entry.day] = Object.freeze({ manifestId, chunks: Object.freeze(chunks.map((chunk) => chunk.rowId)) });
     }
     const fromDay = days[0].day;
     const throughDay = days.at(-1).day;
@@ -383,7 +463,23 @@ export async function seedTypedV12EffectiveScope({ pool, schema, modules }) {
       await q(`INSERT INTO ${table("telemetry_v12_domain_heads")}(participant_id,generation_id,revision,updated_at)
         VALUES ($1,$2,1,$3)`, [participantId, generationId, ISSUED]);
     }
-    return generationId;
+    return Object.freeze({ generationId, manifests: Object.freeze(manifests) });
+  }
+
+  /** Direct writes with every trigger, foreign keys included, bypassed. */
+  async function bypassingGuards(write) {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SET LOCAL session_replication_role = replica");
+      await write((text, values = []) => client.query(text, values));
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   const usage = (role, id, time) => [role, usageRecord(id, time)];
@@ -427,9 +523,86 @@ export async function seedTypedV12EffectiveScope({ pool, schema, modules }) {
   // romeo's owner withdrew: no branch of the retained-authorization view holds.
   await q(`UPDATE ${table("storage_v11_owner_links")} SET state='withdrawn' WHERE participant_id=$1`, [romeo]);
 
+  // One record per remaining predicate (see the header), built valid, then
+  // broken in exactly one place.
+  const uniform = await participant("uniform");
+  const tango = await participant("tango");
+  const tangoHead = await device(tango, "tango-head");
+  const tangoOther = await device(tango, "tango-other");
+  const anomalyDay = (role) => {
+    const day = E[ANOMALIES.indexOf(role)];
+    const value = role === "QUOTA_IN_USAGE_CHUNK"
+      ? quotaRecord(IDS[role], TIMES[role], at(E[15], "13:05:00.000"))
+      : usageRecord(IDS[role], TIMES[role]);
+    return { day, chunks: [{ stream: role === "QUOTA_IN_USAGE_CHUNK" ? "quota" : "usage", records: [[role, value]] }] };
+  };
+  const tangoCurrent = await generation({ participantId: tango, deviceId: tangoHead, name: "tango-head", head: true,
+    days: ANOMALIES.slice(0, 12).map(anomalyDay) });
+  const tangoEarlier = await generation({ participantId: tango, deviceId: tangoHead, name: "tango-earlier", head: false,
+    days: [anomalyDay("HEADED_ELSEWHERE")] });
+  const looseManifest = uuid("manifest:tango-loose");
+  await q(`INSERT INTO ${table("telemetry_v12_day_manifests")}(
+      id,participant_id,device_id,chunk_day,manifest_digest,parser_version,manifest_json,expected_chunk_count,
+      state,created_at,ready_at)
+    VALUES ($1,$2,$3,$4::date,$5,'synthetic-effective-scope','{}',0,'staged',$6,NULL)`,
+  [looseManifest, tango, tangoHead, E[10], digest("manifest-digest:tango-loose"), ISSUED]);
+  const sierra = await participant("sierra");
+  const sierraHead = await device(sierra, "sierra-head");
+  const sierraOther = await device(sierra, "sierra-other");
+  await generation({ participantId: sierra, deviceId: sierraHead, name: "sierra-head", head: true,
+    days: [anomalyDay("SIERRA_ONLY")] });
+
+  // victor: canonical records beside the ones whose stored ids are rewritten.
+  const victor = await participant("victor");
+  const victorDevice = await device(victor, "victor");
+  const victorDay = (day, roles) => ({ day, chunks: [{ stream: "usage",
+    records: roles.map((role) => usage(role, IDS[role], TIMES[role])) }] });
+  await generation({ participantId: victor, deviceId: victorDevice, name: "victor", head: true, days: [
+    victorDay(V[0], ["NC_ID", "NC_SOURCE"]),
+    victorDay(V[1], ["TIE_FIRST", "TIE_ID", "TIE_SOURCE"]),
+    victorDay(V[2], ["NO_TEXT_ID", "NO_TEXT_SOURCE"]),
+    victorDay(V[3], ["UTF8_ID", "UTF8_SOURCE"]),
+  ] });
+
+  const chunkOf = (role) => tangoCurrent.manifests[E[ANOMALIES.indexOf(role)]].chunks[0];
+  const manifestOf = (role) => tangoCurrent.manifests[E[ANOMALIES.indexOf(role)]].manifestId;
+  const raw = (text) => Buffer.concat([Buffer.from([0]), Buffer.from(text, "utf8")]);
+  await bypassingGuards(async (write) => {
+    const domainDays = table("telemetry_v12_domain_days");
+    const manifests = table("telemetry_v12_day_manifests");
+    const chunks = table("telemetry_v12_chunks");
+    const records = table("telemetry_v12_typed_records");
+    await write(`UPDATE ${domainDays} SET manifest_digest=$3 WHERE generation_id=$1 AND observed_day=$2::date`,
+      [tangoCurrent.generationId, E[1], digest("manifest-digest:not-the-manifest")]);
+    await write(`UPDATE ${domainDays} SET observed_day=$3::date WHERE generation_id=$1 AND observed_day=$2::date`,
+      [tangoCurrent.generationId, E[2], E[14]]);
+    await write(`UPDATE ${manifests} SET device_id=$2 WHERE id=$1`, [manifestOf("MANIFEST_DEVICE"), tangoOther]);
+    await write(`UPDATE ${chunks} SET device_id=$2 WHERE id=$1`, [chunkOf("MANIFEST_DEVICE"), tangoOther]);
+    await write(`UPDATE ${manifests} SET participant_id=$2 WHERE id=$1`, [manifestOf("MANIFEST_PARTICIPANT"), uniform]);
+    await write(`UPDATE ${chunks} SET participant_id=$2 WHERE id=$1`, [chunkOf("MANIFEST_PARTICIPANT"), uniform]);
+    await write(`UPDATE ${chunks} SET participant_id=$2 WHERE id=$1`, [chunkOf("CHUNK_PARTICIPANT"), uniform]);
+    await write(`UPDATE ${chunks} SET device_id=$2 WHERE id=$1`, [chunkOf("CHUNK_DEVICE"), tangoOther]);
+    await write(`UPDATE ${chunks} SET chunk_day=$2::date WHERE id=$1`, [chunkOf("CHUNK_DAY"), E[15]]);
+    await write(`UPDATE ${chunks} SET stream='quota' WHERE id=$1`, [chunkOf("USAGE_IN_QUOTA_CHUNK")]);
+    await write(`UPDATE ${chunks} SET stream='usage' WHERE id=$1`, [chunkOf("QUOTA_IN_USAGE_CHUNK")]);
+    await write(`UPDATE ${chunks} SET manifest_id=$2 WHERE id=$1`, [chunkOf("FOREIGN_CHUNK"), looseManifest]);
+    await write(`UPDATE ${records} SET manifest_id=$2 WHERE id=$1`, [rows.FOREIGN_RECORD, looseManifest]);
+    await write(`INSERT INTO ${table("telemetry_v12_domain_heads")}(participant_id,generation_id,revision,updated_at)
+      VALUES ($1,$2,1,$3)`, [uniform, tangoEarlier.generationId, ISSUED]);
+    await write(`DELETE FROM ${table("telemetry_v12_device_capabilities")} WHERE participant_id=$1 AND device_id=$2`,
+      [sierra, sierraHead]);
+    await write(`UPDATE ${records} SET occurrence_id=$2 WHERE id=$1`, [rows.NC_SOURCE, raw(IDS.NC_ID)]);
+    await write(`UPDATE ${records} SET occurrence_id=$2 WHERE id=$1`, [rows.TIE_SOURCE, raw(IDS.TIE_ID)]);
+    await write(`UPDATE ${records} SET occurrence_id=$2 WHERE id=$1`,
+      [rows.NO_TEXT_SOURCE, Buffer.concat([Buffer.from([12]), blob("no-text").subarray(0, 16)])]);
+    await write(`UPDATE ${records} SET occurrence_id=$2 WHERE id=$1`,
+      [rows.UTF8_SOURCE, Buffer.from([0x00, 0xff, 0xfe, 0x41])]);
+  });
+
   return Object.freeze({
-    participants: Object.freeze({ papa, quebec, romeo }),
-    devices: Object.freeze({ papaHead, papaOld, quebec: quebecDevice, romeo: romeoDevice }),
+    participants: Object.freeze({ papa, quebec, romeo, tango, uniform, sierra, victor }),
+    devices: Object.freeze({ papaHead, papaOld, quebec: quebecDevice, romeo: romeoDevice, tangoHead, tangoOther,
+      sierraHead, sierraOther, victor: victorDevice }),
     rows: Object.freeze(rows),
   });
 }
