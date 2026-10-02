@@ -136,7 +136,20 @@ export async function projectIngestionJournal({ sealedIngestion, outputPath } = 
 async function sealedDeletionDigestProjection(sealedLedger) {
   const source = trusted(sealedLedger);
   await source.verify();
-  const database = source.database();
+  const digests = readDeletionDigestsFromDatabase(source.database());
+  await source.verify();
+  return { digests, text: digests.map(digest => `${digest}\n`).join("") };
+}
+
+/**
+ * The sorted participant digests of a deletion ledger's deletion_tombstones
+ * read from an open database. Every value must be a distinct 64-hex digest
+ * (CUTOVER_PROJECTION_INVALID otherwise). The sealed projection and the
+ * pre-fence quiescence check (cutover-quiescence-check.mjs) both read the
+ * ledger through this one function; the caller owns any integrity
+ * verification of the database.
+ */
+export function readDeletionDigestsFromDatabase(database) {
   const table = database.prepare(`SELECT sql FROM sqlite_schema WHERE type='table' AND name='deletion_tombstones'`).all();
   if (table.length !== 1) fail("CUTOVER_PROJECTION_INVALID");
   const digests = database.prepare("SELECT participant_digest AS digest FROM deletion_tombstones ORDER BY participant_digest")
@@ -145,8 +158,7 @@ async function sealedDeletionDigestProjection(sealedLedger) {
   for (let index = 1; index < digests.length; index += 1) {
     if (digests[index - 1] >= digests[index]) fail("CUTOVER_PROJECTION_INVALID");
   }
-  await source.verify();
-  return { digests, text: digests.map(digest => `${digest}\n`).join("") };
+  return digests;
 }
 
 /**
@@ -210,9 +222,30 @@ export const CUTOVER_PARTICIPANT_STATES = Object.freeze(["active", "deleting"]);
  */
 export async function countSealedParticipantDeletionMatches({ sealedIngestion, digests } = {}) {
   const source = trusted(sealedIngestion);
-  if (!(digests instanceof Set) || [...digests].some(digest => !DIGEST.test(digest))) fail("CUTOVER_ARGUMENT_INVALID");
+  assertDigestSet(digests);
   await source.verify();
-  const statement = source.database().prepare("SELECT id, state FROM participants WHERE id > ? ORDER BY id LIMIT 1000");
+  const result = countParticipantDeletionMatches(source.database(), digests);
+  await source.verify();
+  return result;
+}
+
+function assertDigestSet(digests) {
+  if (!(digests instanceof Set) || [...digests].some(digest => !DIGEST.test(digest))) fail("CUTOVER_ARGUMENT_INVALID");
+}
+
+/**
+ * The intersection over an open ingestion database: every participant,
+ * whatever its state, hashed in memory and counted against the digest set.
+ * onMatch, when given, is called with each matching participant id so a
+ * caller can derive an opaque reference; nothing else leaves this function.
+ * The sealed form above and the pre-fence quiescence check
+ * (cutover-quiescence-check.mjs) share this loop; the caller owns any
+ * integrity verification of the database.
+ */
+export function countParticipantDeletionMatches(database, digests, { onMatch = null } = {}) {
+  assertDigestSet(digests);
+  if (onMatch !== null && typeof onMatch !== "function") fail("CUTOVER_ARGUMENT_INVALID");
+  const statement = database.prepare("SELECT id, state FROM participants WHERE id > ? ORDER BY id LIMIT 1000");
   const byState = Object.fromEntries(CUTOVER_PARTICIPANT_STATES.map(state => [state, 0]));
   let after = "";
   let participants = 0;
@@ -223,12 +256,14 @@ export async function countSealedParticipantDeletionMatches({ sealedIngestion, d
       if (typeof row.state !== "string" || !Object.hasOwn(byState, row.state)) fail("CUTOVER_PROJECTION_INVALID");
       participants += 1;
       byState[row.state] += 1;
-      if (digests.has(participantDeletionDigest(row.id))) matches += 1;
+      if (digests.has(participantDeletionDigest(row.id))) {
+        matches += 1;
+        onMatch?.(row.id);
+      }
     }
     if (page.length < 1000) break;
     after = page.at(-1).id;
   }
-  await source.verify();
   return Object.freeze({ participants, participantsByState: Object.freeze(byState), deletionDigests: digests.size,
     matches });
 }
