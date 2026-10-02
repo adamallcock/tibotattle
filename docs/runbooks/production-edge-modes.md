@@ -348,7 +348,11 @@ oracle's per-date expectation, as in `npm run gcp:fastpath:rehearsal`:
 `analytics-v2-test/golden-q1-node/per-date-expected.json` for the committed
 Q-1 golden. `EDGE_E2E_EDGE_TREE=<edge-port worktree>/apps/worker`
 builds the edge from that tree and refuses unless its
-`src/edge-origin-contract.ts` is byte-identical. The run takes about four
+`src/edge-origin-contract.ts` is byte-identical. With it, S0 holds worker
+mode to that tree's own `wrangler.jsonc` main and compatibility settings,
+built from that tree, and expects the `isPostgresWorkerRequestPathSupported`
+export only when that tree's `src/index.ts` re-exports it (the production
+line's does not). The run takes about four
 minutes (S4 waits for fresh rate-limit windows) and drops every schema it
 creates.
 
