@@ -11,7 +11,7 @@
 //                     with retry-after 300). Both are files; nothing is fetched.
 //   verify-unchanged  re-read every sealed source's bookmark and aggregates
 //                     through the injected read-only transport and re-hash the
-//                     sealed files; emit flip-evidence-<instant>.json (0400)
+//                     sealed files; emit flip-evidence.json (0400)
 //                     with its sha256 only when everything equals the seal,
 //                     else CUTOVER_SOURCE_CHANGED_AFTER_SEAL.
 //
@@ -205,10 +205,6 @@ export async function verifyCutoverFence({
   });
 }
 
-function compactInstant(iso) {
-  return iso.replaceAll("-", "").replaceAll(":", "").replace(".", "");
-}
-
 /**
  * verify-unchanged --seal: every bookmark, schema digest and aggregate digest
  * read now through the read-only transport must equal the seal, and every
@@ -278,7 +274,9 @@ export async function verifyCutoverUnchanged({
   };
   const text = `${canonicalJson(evidence)}\n`;
   if (containsSignedUrl(text)) fail("CUTOVER_SECRET_IN_OUTPUT");
-  const path = join(directory, `flip-evidence-${compactInstant(verifiedAt)}.json`);
+  // One verification per owner directory: an existing flip-evidence.json
+  // is CUTOVER_OUTPUT_EXISTS, never overwritten.
+  const path = join(directory, "flip-evidence.json");
   const flipEvidenceSha256 = await writePrivateFileOnce(path, text, 0o400);
   return Object.freeze({ mode: "verified", path, flipEvidenceSha256, evidence: Object.freeze(evidence) });
 }

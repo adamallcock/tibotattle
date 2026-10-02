@@ -443,7 +443,9 @@ export function writeD1Export(sourcePath, outputPath, { extra = [] } = {}) {
     const sequence = database.prepare("SELECT 1 FROM sqlite_schema WHERE name = 'sqlite_sequence'").all();
     if (sequence.length === 1) {
       write("DELETE FROM sqlite_sequence;\n");
-      for (const row of database.prepare("SELECT name, seq FROM sqlite_sequence ORDER BY name").all()) {
+      const sequenceRows = database.prepare("SELECT name, seq FROM sqlite_sequence ORDER BY name");
+      sequenceRows.setReadBigInts(true);
+      for (const row of sequenceRows.all()) {
         write(`INSERT INTO "sqlite_sequence" VALUES(${literal(row.name)},${literal(row.seq)});\n`);
       }
     }

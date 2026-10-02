@@ -3,9 +3,16 @@
 // injected fake transport and fake Wrangler export. Test-only.
 
 import { execFileSync } from "node:child_process";
-import { rm } from "node:fs/promises";
+import { chmod, copyFile, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { runCutoverSeal } from "../../../scripts/cutover-source-seal.mjs";
+import { DatabaseSync } from "node:sqlite";
+import {
+  canonicalJson,
+  runCutoverSeal,
+  sha256File,
+  sha256Hex,
+  writePrivateFileOnce,
+} from "../../../scripts/cutover-source-seal.mjs";
 import {
   SYNTHETIC_BOOKMARKS,
   SYNTHETIC_DATABASE_NAMES,
@@ -85,4 +92,36 @@ export function outputPathsOf(out) {
     ingestion: join(out, "ingestion.sealed.sqlite"),
     ledger: join(out, "deletion-ledger.sealed.sqlite"),
   };
+}
+
+/**
+ * A variant seal for refusal cases: the sealed ingestion file copied,
+ * mutated with SQL, re-sealed 0400 beside a manifest whose sealId covers the
+ * new digest (the manifest's aggregates are not recomputed; only
+ * verify-unchanged reads them).
+ */
+export async function forgeVariantSeal(seal, mutateSql) {
+  const directory = await privateDirectory("w2-seal-variant-");
+  const work = join(directory, "work.sqlite");
+  const sealedPath = join(directory, "ingestion.sealed.sqlite");
+  await copyFile(seal.sources.ingestion.path, work);
+  await chmod(work, 0o600);
+  const database = new DatabaseSync(work);
+  try {
+    database.exec(mutateSql);
+    database.exec(`VACUUM INTO '${sealedPath}'`);
+  } finally {
+    database.close();
+  }
+  await rm(work, { force: true });
+  await chmod(sealedPath, 0o400);
+  await copyFile(seal.sources["deletion-ledger"].path, join(directory, "deletion-ledger.sealed.sqlite"));
+  await chmod(join(directory, "deletion-ledger.sealed.sqlite"), 0o400);
+  const { sealId: _previous, ...body } = seal.manifest;
+  const sealedSha256 = await sha256File(sealedPath);
+  const next = { ...body, sources: body.sources.map(source => (source.role === "ingestion" ? { ...source, sealedSha256 } : source)) };
+  const sealId = sha256Hex(canonicalJson(next));
+  const manifestPath = join(directory, "seal-manifest.json");
+  await writePrivateFileOnce(manifestPath, `${canonicalJson({ ...next, sealId })}\n`, 0o400);
+  return { directory, manifestPath, sealId, sealedAt: seal.manifest.createdAt };
 }

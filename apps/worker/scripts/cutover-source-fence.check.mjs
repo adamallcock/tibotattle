@@ -153,7 +153,7 @@ test("verify-unchanged emits 0400 flip evidence only when every bookmark and agg
   assert.equal(result.mode, "verified");
   const files = await readdir(out);
   assert.equal(files.length, 1);
-  assert.match(files[0], /^flip-evidence-\d{8}T\d{9}Z\.json$/u);
+  assert.equal(files[0], "flip-evidence.json");
   const path = join(out, files[0]);
   assert.equal((await lstat(path)).mode & 0o777, 0o400);
   const bytes = await readFile(path);
@@ -173,6 +173,8 @@ test("verify-unchanged emits 0400 flip evidence only when every bookmark and agg
   assert.deepEqual(await readdir(dry), []);
   await assert.rejects(verifyCutoverUnchanged(unchangedArgs({ ownerDirectory: dry, remote: false, transport })),
     isCode("CUTOVER_REMOTE_NOT_AUTHORIZED"));
+  await assert.rejects(verifyCutoverUnchanged(unchangedArgs({ ownerDirectory: out, transport })),
+    isCode("CUTOVER_OUTPUT_EXISTS"), "a second verification never overwrites the evidence");
 });
 
 test("verify-unchanged refuses a moved bookmark, a changed aggregate, a changed schema or a changed sealed file", async () => {
