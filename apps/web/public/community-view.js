@@ -490,6 +490,23 @@ function buildCommunityAllowanceSingleChartModel(series, {
   };
 }
 
+/**
+ * Model series in display order. A model the server published an order for
+ * leads, by that order; every other drawable model follows in this page's own
+ * preferred order, then catalog order. The input list is never reordered.
+ * Without published metadata this is exactly the page's own order.
+ */
+function modelDefinitions(modelConfig) {
+  return modelConfig.map(({ modelId, label, family, order }, index) => {
+    const published = Number.isSafeInteger(order);
+    const presentation = allowanceModelPresentation(modelId, index, family);
+    return { tier: published ? 0 : 1, definition: {
+      key: modelId, label, view: "models", ...presentation, ...(published ? { order } : {}),
+    } };
+  }).sort((left, right) => left.tier - right.tier || left.definition.order - right.definition.order)
+    .map(({ definition }) => definition);
+}
+
 /** Presentation only: validated public series in, shared dollar axes and gap-aware
  * geometry out. No owner data access, pricing, fitting, or inferred history. */
 export function buildCommunityAllowanceChartModel(series, options = {}) {
@@ -513,9 +530,7 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
     ...[ ["pro", "Pro 20×"], ["prolite", "Pro 5×"], ["plus", "Plus"] ].map(([key, label], index) => ({
       key, label, view: "plans", className: `allowance-series-${index}`,
     })),
-    ...series.breakdowns.modelConfig.map(({ modelId, label }, index) => ({
-      key: modelId, label, view: "models", ...allowanceModelPresentation(modelId, index),
-    })).sort((left, right) => left.order - right.order),
+    ...modelDefinitions(series.breakdowns.modelConfig),
   ];
   const summaryFor = (day, definition) => {
     const breakdown = breakdownDays.get(day.day);
@@ -1562,6 +1577,12 @@ export function renderCommunityAllowanceSection({
     return "breakdowns_unavailable";
   }
 
+  // Estimates the server published for a model this page cannot name are left
+  // out of the model view. Say so there, so the gap is stated and not silent.
+  // Plan and aggregate figures never depended on them.
+  const unrecognizedModelNotice = () => view === "models"
+    && (series.breakdowns?.unrecognizedModelTuples ?? 0) > 0
+    ? [node("p", "snapshot-disclosure", t("community.allowance.unrecognizedModels"))] : [];
   const model = buildCommunityAllowanceChartModel(series, { rangeDays, view });
   if (model === null) {
     const anyEstimate = buildCommunityAllowanceChartModel(series, { view }) !== null;
@@ -1573,7 +1594,7 @@ export function renderCommunityAllowanceSection({
         ? "community.allowance.noneInRange"
         : view === "models" ? "community.allowance.modelsAccumulating"
         : "community.allowance.stillAccumulating"),
-    ));
+    ), ...unrecognizedModelNotice());
     return anyEstimate ? "no_estimates_in_range" : "estimates_accumulating";
   }
 
@@ -1627,7 +1648,8 @@ export function renderCommunityAllowanceSection({
       appendCommunityAllowanceChart({ documentRef, container, model, t, inspection });
     }
     container.append(node("p", "snapshot-disclosure", t(view === "models"
-      ? "community.allowance.modelMethod" : "community.allowance.planMethod")));
+      ? "community.allowance.modelMethod" : "community.allowance.planMethod")),
+    ...unrecognizedModelNotice());
     return "published";
   }
   const headline = node("div", "allowance-headline");
