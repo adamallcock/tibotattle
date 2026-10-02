@@ -338,15 +338,99 @@ function legacyDirectSql(s: string, filter: string): string {
        AND chunk.record_count=${v11ProofCount} AND ${filter}`;
 }
 
+/**
+ * $1 owner, $2 participant, $3 stream code, $4 stream name, $5/$6 first/last
+ * observed day (day numbers).
+ *
+ * The selection is production's CANDIDATE_SQL (legacyDirectSql over the
+ * observed-day range), shaped so its cost follows the range, not the owner.
+ * Unfenced, the planner walked every v1 chunk and admission of the
+ * participant, and joined every v1.1 domain day of the owner against the
+ * range's records, for each call: a cost in the owner's whole history, paid
+ * once per read span (C-REFRESH, measured on a synthetic dense legacy owner).
+ * Here the owner's typed records of the stream in the range are fenced first
+ * through typed_telemetry_owner_time (owner_id, stream, observed_at_ms), and
+ * each is then checked against the unchanged joins in a fenced LATERAL
+ * (OFFSET 0 keeps it per record). The fence is implied by the joins it
+ * precedes: a selected record's (namespace, owner, format) is its source
+ * format's membership of participant $2 (one per format), its stream is $3,
+ * and observed_day BETWEEN $5 AND $6 holds exactly when observed_at_ms lies
+ * in [$5, $6 + 1) days (0030's CHECK ties the two). So the rows, their
+ * multiplicity and the grouping are unchanged.
+ */
 function legacyCandidatesSql(s: string): string {
-  return `WITH direct AS (${legacyDirectSql(s, "record.observed_day BETWEEN $5 AND $6")})
+  return `WITH owned AS MATERIALIZED (
+      SELECT owned_record.id FROM ${s}.typed_telemetry_owner_memberships owned_membership
+        JOIN ${s}.typed_telemetry_records owned_record ON owned_record.namespace_id=owned_membership.namespace_id
+         AND owned_record.owner_id=owned_membership.owner_id AND owned_record.format=owned_membership.source_format
+         AND owned_record.stream=$3
+         AND owned_record.observed_at_ms>=$5::integer::bigint*${DAY_MS}
+         AND owned_record.observed_at_ms<($6::integer::bigint+1)*${DAY_MS}
+       WHERE owned_membership.participant_id=$2 AND owned_membership.source_format IN (10,11)
+    ), direct AS (
+      SELECT eligible.* FROM owned CROSS JOIN LATERAL (
+        ${legacyDirectSql(s, "record.id=owned.id AND record.observed_day BETWEEN $5::integer AND $6::integer")}
+        OFFSET 0) eligible
+    )
     SELECT observed_day,occurrence_id,min(observed_at_ms)::text AS observed_at_ms
       FROM direct GROUP BY observed_day,occurrence_id`;
 }
 
+/**
+ * $1 owner, $2 participant, $3 stream code, $4 stream name, $5 occurrence ids
+ * (hex text[]).
+ *
+ * The selection is production's DIRECT_SOURCE_SQL: every typed legacy row of
+ * a requested occurrence and stream that legacyDirectSql admits. It is shaped
+ * as c0600bc2 shaped the v1.2 expansion, so its cost follows the batch, not
+ * the owner. No index leads with occurrence_id, so an unfenced filter walked
+ * every v1 chunk, admission and record and every v1.1 record and proof of the
+ * owner for each 200-id batch (C-REFRESH measured about 32 ms a batch for a
+ * 12,000-record owner and 200 ms for a 72,000-record one, the same batch: a
+ * read quadratic in owner size). Here the owner's typed devices (v1) and
+ * typed manifests (v1.1) are fenced first, each is probed once on its unique
+ * (device_id or manifest_id, stream, occurrence_id) key for the batch's ids,
+ * and each matched record is then checked against the unchanged joins in a
+ * fenced LATERAL (OFFSET 0 keeps it per record). The fence is implied by the
+ * joins it precedes: a selected v1 record's device and a selected v1.1
+ * record's manifest belong to the record's (namespace, owner) (0030's foreign
+ * keys), which is its format's membership of participant $2. So the rows,
+ * their multiplicity and the grouping below are unchanged.
+ */
 function legacySourcesSql(s: string): string {
-  const filter = "record.occurrence_id IN (SELECT decode(value,'hex') FROM unnest($5::text[]) value)";
-  return `WITH direct AS MATERIALIZED (${legacyDirectSql(s, filter)}),
+  const requested = "ARRAY(SELECT wanted.occurrence_id FROM requested wanted)";
+  return `WITH requested AS MATERIALIZED (
+      SELECT DISTINCT decode(value,'hex') AS occurrence_id FROM unnest($5::text[]) value
+    ), owner_parents AS MATERIALIZED (
+      SELECT 10 AS format,parent_device.id AS parent_id
+        FROM ${s}.typed_telemetry_owner_memberships parent_membership
+        JOIN ${s}.typed_telemetry_devices parent_device ON parent_device.namespace_id=parent_membership.namespace_id
+         AND parent_device.owner_id=parent_membership.owner_id
+       WHERE parent_membership.participant_id=$2 AND parent_membership.source_format=10
+      UNION ALL
+      SELECT 11 AS format,parent_manifest.id AS parent_id
+        FROM ${s}.typed_telemetry_owner_memberships parent_membership
+        JOIN ${s}.typed_telemetry_manifests parent_manifest
+          ON parent_manifest.namespace_id=parent_membership.namespace_id
+         AND parent_manifest.owner_id=parent_membership.owner_id
+       WHERE parent_membership.participant_id=$2 AND parent_membership.source_format=11
+    ), matched AS MATERIALIZED (
+      SELECT probe.id FROM owner_parents parent
+        CROSS JOIN LATERAL (
+          SELECT probed.id FROM ${s}.typed_telemetry_records probed
+           WHERE parent.format=10 AND probed.format=10 AND probed.device_id=parent.parent_id AND probed.stream=$3
+             AND probed.occurrence_id=ANY(${requested})
+          UNION ALL
+          SELECT probed.id FROM ${s}.typed_telemetry_records probed
+           WHERE parent.format=11 AND probed.format=11 AND probed.manifest_id=parent.parent_id AND probed.stream=$3
+             AND probed.occurrence_id=ANY(${requested})
+          OFFSET 0
+        ) probe
+    ), direct AS MATERIALIZED (
+      SELECT eligible.* FROM matched CROSS JOIN LATERAL (
+        ${legacyDirectSql(s, "record.id=matched.id")}
+        OFFSET 0) eligible
+    ),
     grouped AS MATERIALIZED (
       SELECT min(storage_row_id) AS storage_row_id FROM direct
        GROUP BY device_blob,occurrence_id,observed_at_ms,canonical_digest,format

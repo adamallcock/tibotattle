@@ -268,10 +268,14 @@ export const LOGGING_POSTURE = Object.freeze({
  * per-owner memory budget, a 4 h task timeout) until the largest real owner
  * is measured on Cloud Run (MEAS-3). That budget is the one the memory model
  * says admits the largest real owner even when every record falls in the
- * analysis days, and it leaves analytics-refresh.mjs's heap reserve (512 MiB
- * plus 4 KiB per default read-chunk occurrence) inside the heap. The manifest
- * check holds this profile equal to the measurement profile and proves the
- * budget against that module's exported bounds.
+ * analysis days, and the heap holds it beside analytics-refresh.mjs's
+ * reserves (256 MiB, 4 KiB per default read-chunk occurrence) and its
+ * minimum output budget; a run reclaims for its output account the part of
+ * the budget its largest admitted owner leaves. The manifest check holds this
+ * profile equal to the measurement profile and the render equal to
+ * analytics-refresh.mjs ANALYTICS_REFRESH_PRODUCTION_JOB (args, CPU, memory,
+ * heap, task timeout, retries, tasks and env), and proves the budget against
+ * that module's exported bounds.
  */
 export const ANALYTICS_REFRESH_TASK_PROFILE = Object.freeze({
   name: "dense",

@@ -38,6 +38,8 @@ import {
 } from "./staged-migrations-harness.mjs";
 import { readPostgresMigrations } from "../cloud-run/postgres-migrations.mjs";
 import * as job from "../cloud-run/analytics-refresh.mjs";
+import { FASTPATH_TEST_CLOUD_TARGET } from "../cloud-run/origin-fastpath-mode.mjs";
+import { CLOUD_RUN_IAM_TEST_TARGET } from "../cloud-run/postgres-test-dispatch.mjs";
 import analyticsV2Config from "../vitest.analytics-v2.config.mjs";
 import * as seedFixture from "./fixtures/analytics-v2/direct-seed.mjs";
 import * as synthetic from "../analytics-v2-test/fixtures/synthetic-occurrences.mjs";
@@ -399,7 +401,8 @@ function createSpecPipeline(hooks = {}) {
 /**
  * In-process runs use Node's default heap (about 4 GiB), so the per-owner
  * budget is set to its minimum (1,024 MiB): the heap check then needs about
- * 2.5 GiB. The default budget (4,608 MiB) needs --max-old-space-size=6144,
+ * 2.3 GiB (budget, 256 MiB runtime, the read reserve and a 64 MiB output
+ * budget). The default budget (4,608 MiB) needs --max-old-space-size=6144,
  * as the Job is deployed.
  */
 function jobEnvironment(extra = {}) {
@@ -456,27 +459,50 @@ test("resource constants: the Job's environment mirrors resources.ts; every rost
   assert.deepEqual(pick(env.memoryBudgetMiB), inMiB(bounds.memoryBudgetBytes));
   assert.deepEqual(pick(env.maxDayOccurrences), pick(bounds.maxDayOccurrences));
   assert.deepEqual(pick(env.maxDayRecordMiB), inMiB(bounds.maxDayRecordBytes));
+  // The output budget the Job derives stays inside A-2's bounds.
+  assert.equal(job.ANALYTICS_REFRESH_HEAP_RESERVE.minimumOutputBudgetBytes >= bounds.outputBudgetBytes.minimum, true);
+  assert.equal(job.analyticsRefreshResources({}, 64 * 1_024 * MIB).compute.outputBudgetBytes,
+    bounds.outputBudgetBytes.maximum);
   assert.equal(job.ANALYTICS_REFRESH_MAX_READ_CANDIDATES, a1.occurrences.MAX_ANALYTICS_V2_CANDIDATES);
   assert.equal(job.ANALYTICS_REFRESH_MAX_READ_CANDIDATES, resources.ANALYTICS_V2_MAX_READ_DAY_OCCURRENCES);
   assert.ok(env.readChunkOccurrences.maximum <= job.ANALYTICS_REFRESH_MAX_READ_CANDIDATES);
   assert.equal(store.ANALYTICS_V2_OUTPUT_LIMITS.owners, a1.owners.MAX_ANALYTICS_V2_OWNERS);
 });
 
-test("resources: environment within bounds, and a heap that covers the budget plus the reserve", () => {
+test("resources: environment within bounds, and a heap partitioned into budget, reserves and the output budget", () => {
   const MIB = 1_048_576;
   const heap = 6_192 * MIB;
   const defaults = job.analyticsRefreshResources({}, heap);
-  assert.deepEqual(defaults.compute, resources.ANALYTICS_V2_DEFAULT_RESOURCES);
+  const reserved = 4_608 * MIB + 256 * MIB + 250_000 * 4_096;
+  // The rest of the heap is the output budget; no fixed reserve stands in for the outputs.
+  assert.deepEqual(defaults.compute, { ...resources.ANALYTICS_V2_DEFAULT_RESOURCES, outputBudgetBytes: heap - reserved });
   assert.equal(defaults.readChunkOccurrences, 250_000);
-  // 4,608 MiB + 512 MiB + 250,000 x 4 KiB: --max-old-space-size=6144 (heap limit 6,192 MiB) is enough.
-  assert.equal(defaults.requiredHeapBytes, 5_120 * MIB + 250_000 * 4_096);
+  // 4,608 MiB + 256 MiB + 250,000 x 4 KiB + a 64 MiB output budget:
+  // --max-old-space-size=6144 (heap limit 6,192 MiB) is enough.
+  assert.equal(defaults.requiredHeapBytes, reserved + 64 * MIB);
   assert.ok(defaults.requiredHeapBytes <= heap);
+  assert.equal(job.analyticsRefreshResources({}, defaults.requiredHeapBytes).compute.outputBudgetBytes, 64 * MIB);
+  assert.throws(() => job.analyticsRefreshResources({}, defaults.requiredHeapBytes - 1),
+    { code: "ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT" });
   assert.throws(() => job.analyticsRefreshResources({}, 4_144 * MIB), { code: "ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT" });
+  // The production (dense) profile: a 12,288 MiB old space (heap limit about
+  // 12,336 MiB) with the 10,752 MiB budget leaves about 350 MiB of output budget.
+  const dense = job.ANALYTICS_REFRESH_PRODUCTION_JOB;
+  const denseResources = job.analyticsRefreshResources(
+    { ANALYTICS_V2_MEMORY_BUDGET_MIB: String(dense.memoryBudgetMiB) }, (dense.heapMiB + 48) * MIB);
+  assert.ok(denseResources.requiredHeapBytes <= dense.heapMiB * MIB);
+  assert.equal(denseResources.compute.outputBudgetBytes,
+    (dense.heapMiB + 48 - dense.memoryBudgetMiB - 256) * MIB - 250_000 * 4_096);
+  // A run adds the part of the budget its largest admitted owner leaves (the
+  // plan fixes it before any output is charged): with owner e (1,517 MiB)
+  // largest, about 9.4 GiB of output budget instead of 351 MiB.
+  assert.equal(resources.analyticsV2OutputBudget(denseResources.compute, 1_517 * MIB, true),
+    denseResources.compute.outputBudgetBytes + (dense.memoryBudgetMiB - 1_517) * MIB);
   const tuned = job.analyticsRefreshResources({ ANALYTICS_V2_MEMORY_BUDGET_MIB: "26624",
     ANALYTICS_V2_MAX_DAY_OCCURRENCES: "20000", ANALYTICS_V2_MAX_DAY_RECORD_MIB: "32",
     ANALYTICS_V2_READ_CHUNK_OCCURRENCES: "1000000" }, 32_768 * MIB);
   assert.deepEqual(tuned.compute, { memoryBudgetBytes: 26_624 * MIB, maxDayOccurrences: 20_000,
-    maxDayRecordBytes: 32 * MIB });
+    maxDayRecordBytes: 32 * MIB, outputBudgetBytes: (32_768 - 26_624 - 256) * MIB - 1_000_000 * 4_096 });
   for (const [name, value] of [
     ["ANALYTICS_V2_MEMORY_BUDGET_MIB", "1023"], ["ANALYTICS_V2_MEMORY_BUDGET_MIB", "30721"],
     ["ANALYTICS_V2_MEMORY_BUDGET_MIB", "4608.5"], ["ANALYTICS_V2_MEMORY_BUDGET_MIB", "0x1200"],
@@ -488,6 +514,50 @@ test("resources: environment within bounds, and a heap that covers the budget pl
     assert.throws(() => job.analyticsRefreshResources({ [name]: value }, 64 * 1_024 * MIB),
       (error) => error.code === "ANALYTICS_V2_REFRESH_RESOURCES_INVALID" && error.field === name, `${name}=${value}`);
   }
+});
+
+/**
+ * The output projection the production profile must hold (C-REFRESH review,
+ * 2026-10-02). It is a stated planning roster, not a production measurement:
+ * OWN-3's owner counts and MEAS-3 replace it. Rates are what the dense
+ * rehearsal's first run charged to the output account at 32215a26's dist
+ * (b76aa67f..., docs/receipts/2026-10-02-gcp-c-refresh.md): owner e
+ * 13,287,040 bytes and the heaviest light owner 2,888,220 bytes over the 170
+ * analysis days. Each owner's whole output is charged per day of history,
+ * although only its cache bands grow with history, so the rates err high.
+ * The largest owner is taken at the high end of the largest real owner's
+ * estimate (about 10 GiB when its records fall in the analysis days;
+ * docs/receipts/2026-10-01-gcp-fastpath-caps.md), the case where the
+ * profile's per-owner budget leaves the least to reclaim.
+ */
+const ANALYTICS_REFRESH_OUTPUT_PROJECTION = Object.freeze({
+  largestOwnerEstimateMiB: 10_240,
+  denseOwners: 4,
+  denseBytesPerOwnerDay: Math.ceil(13_287_040 / 170),
+  lightOwners: 60,
+  lightBytesPerOwnerDay: Math.ceil(2_888_220 / 170),
+  // The 170 analysis days plus a year of retained cache history.
+  historyDays: 170 + 365,
+});
+
+test("the production profile's output budget holds the stated roster and history projection", () => {
+  const MIB = 1_048_576;
+  const profile = job.ANALYTICS_REFRESH_PRODUCTION_JOB;
+  const projection = ANALYTICS_REFRESH_OUTPUT_PROJECTION;
+  // The old-space size, not V8's slightly larger limit: the pin errs low.
+  const partition = job.analyticsRefreshResources(
+    { ANALYTICS_V2_MEMORY_BUDGET_MIB: String(profile.memoryBudgetMiB) }, profile.heapMiB * MIB).compute;
+  assert.ok(projection.largestOwnerEstimateMiB * MIB <= partition.memoryBudgetBytes, "the largest owner is admitted");
+  const outputBudget = resources.analyticsV2OutputBudget(partition, projection.largestOwnerEstimateMiB * MIB, true);
+  const perDay = projection.denseOwners * projection.denseBytesPerOwnerDay
+    + projection.lightOwners * projection.lightBytesPerOwnerDay;
+  const projected = perDay * projection.historyDays;
+  assert.ok(projected <= outputBudget,
+    `projected ${Math.ceil(projected / MIB)} MiB over an output budget of ${Math.floor(outputBudget / MIB)} MiB`);
+  // The horizon the profile holds for this roster, recorded in the receipt:
+  // 641 days at the high-end estimate, against 238 without the reclaim.
+  assert.equal(Math.floor(outputBudget / perDay), 641);
+  assert.equal(Math.floor(partition.outputBudgetBytes / perDay), 238);
 });
 
 test("read spans: contiguous, at most the day bound, and about the read chunk by the exact counts", () => {
@@ -1024,15 +1094,18 @@ test("PG17: the store refuses invalid outputs before writing", {
 test("the store's resource record is closed and agrees with the owner refusals; a refused owner writes nothing", async () => {
   // Validation only (assertAnalyticsV2RunOutputs runs before any database work).
   const owners = [contractOwner(OWNER_A, "effective"), contractOwner(OWNER_B, "effective")];
-  const configuration = { memoryModel: "analytics-v2-memory-model-v1", memoryBudgetBytes: 1_073_741_824,
-    maxDayOccurrences: 250_000, maxDayRecordBytes: 268_435_456 };
+  const configuration = { memoryModel: "analytics-v2-memory-model-v2", outputModel: "analytics-v2-output-model-v1",
+    memoryBudgetBytes: 1_073_741_824, maxDayOccurrences: 250_000, maxDayRecordBytes: 268_435_456,
+    outputBudgetBytes: 67_108_864 };
   const entry = (ownerDigest, admitted) => ({ ownerDigest, usage: 3, quota: 2, session: 1, analysisUsage: 3,
-    maxDayOccurrences: 6, estimateBytes: 134_217_728, admitted, heapPeakBytes: admitted ? 1_000 : null });
+    maxDayOccurrences: 6, estimateBytes: 134_217_728, admitted, heapPeakBytes: admitted ? 1_000 : null,
+    outputBytes: 500 });
+  const account = { heldInputBytes: 100, accountBytes: 2_000, outputBudgetBytes: 67_108_864 };
   const ordered = [OWNER_A, OWNER_B].sort();
   const refusedB = [{ ownerDigest: OWNER_B, day: null, family: "owner", reason: "memory_budget" },
     { ownerDigest: OWNER_B, day: DAY_1, family: "daily", reason: "memory_budget" }];
   const outputs = (overrides = {}) => minimalOutputs({ owners, refusals: refusedB, blockedDays: [DAY_1],
-    resources: { configuration, owners: ordered.map((digest) => entry(digest, digest !== OWNER_B)) }, ...overrides });
+    resources: { configuration, account, owners: ordered.map((digest) => entry(digest, digest !== OWNER_B)) }, ...overrides });
   const check = (value) => store.assertAnalyticsV2RunOutputs(value, STAND_IN_HORIZON);
   await check(outputs());
   await check(outputs({ resources: undefined }));
@@ -1045,27 +1118,66 @@ test("the store's resource record is closed and agrees with the owner refusals; 
   await assert.rejects(check(outputs({ ownerDays: [{ ownerDigest: OWNER_A, day: DAY_1, daily: null,
     refusal: "memory_budget" }] })), { code: "ANALYTICS_V2_OUTPUTS_INVALID", field: "ownerDays.refusal" });
   // `admitted` must be false exactly for the owners refused as a whole.
-  await assert.rejects(check(outputs({ resources: { configuration,
+  await assert.rejects(check(outputs({ resources: { configuration, account,
     owners: ordered.map((digest) => entry(digest, true)) } })),
   { code: "ANALYTICS_V2_OUTPUTS_INVALID", field: "resources.owners.admitted" });
   await assert.rejects(check(outputs({ refusals: [] })),
     { code: "ANALYTICS_V2_OUTPUTS_INVALID", field: "resources.owners.admitted" });
   // Closed shapes: no extra key, one entry per effective owner in digest order, no heap for a refused owner.
-  await assert.rejects(check(outputs({ resources: { configuration: { ...configuration, extra: 1 },
+  await assert.rejects(check(outputs({ resources: { configuration: { ...configuration, extra: 1 }, account,
     owners: ordered.map((digest) => entry(digest, digest !== OWNER_B)) } })),
   { code: "ANALYTICS_V2_OUTPUTS_INVALID", field: "resources.configuration" });
-  await assert.rejects(check(outputs({ resources: { configuration,
+  await assert.rejects(check(outputs({ resources: { configuration, account,
     owners: [...ordered].reverse().map((digest) => entry(digest, digest !== OWNER_B)) } })),
   { code: "ANALYTICS_V2_OUTPUTS_INVALID", field: "resources.owners.ownerDigest" });
-  await assert.rejects(check(outputs({ resources: { configuration,
+  await assert.rejects(check(outputs({ resources: { configuration, account,
     owners: ordered.filter((digest) => digest === OWNER_A).map((digest) => entry(digest, true)) } })),
   { code: "ANALYTICS_V2_OUTPUTS_INVALID", field: "resources.owners" });
-  await assert.rejects(check(outputs({ resources: { configuration, owners: ordered.map((digest) =>
+  await assert.rejects(check(outputs({ resources: { configuration, account, owners: ordered.map((digest) =>
     ({ ...entry(digest, digest !== OWNER_B), heapPeakBytes: 5 })) } })),
   { code: "ANALYTICS_V2_OUTPUTS_INVALID", field: "resources.owners.heapPeakBytes" });
-  await assert.rejects(check(outputs({ resources: { configuration, owners: ordered.map((digest) =>
+  await assert.rejects(check(outputs({ resources: { configuration, account, owners: ordered.map((digest) =>
     ({ ...entry(digest, digest !== OWNER_B), contentHint: "x" })) } })),
   { code: "ANALYTICS_V2_OUTPUTS_INVALID", field: "resources.owners" });
+  // The output account: closed, and never smaller than the owners' outputs plus the held inputs.
+  const owned = ordered.map((digest) => entry(digest, digest !== OWNER_B));
+  for (const [value, field] of [
+    [{ configuration, owners: owned }, "resources"],
+    [{ configuration, owners: owned, account, extra: 1 }, "resources"],
+    [{ configuration, owners: owned, account: { ...account, extra: 1 } }, "resources.account"],
+    [{ configuration, owners: owned, account: { ...account, heldInputBytes: 100, accountBytes: 1_099 } },
+      "resources.account"],
+    [{ configuration, owners: owned, account: { ...account, heldInputBytes: 3_000, accountBytes: 2_000 } },
+      "resources.account"],
+    [{ configuration, owners: owned, account: { ...account, heldInputBytes: -1, accountBytes: 2_000 } },
+      "resources.account.heldInputBytes"],
+    // The budget the account was held to: present, an integer, never below the
+    // account, and either the configured one or that plus the memory budget
+    // less the largest admitted estimate (A's 128 MiB; B is refused).
+    [{ configuration, owners: owned, account: { heldInputBytes: 100, accountBytes: 2_000 } }, "resources.account"],
+    [{ configuration, owners: owned, account: { ...account, outputBudgetBytes: 1.5 } },
+      "resources.account.outputBudgetBytes"],
+    [{ configuration, owners: owned, account: { ...account, outputBudgetBytes: 1_999 } },
+      "resources.account.outputBudgetBytes"],
+    [{ configuration, owners: owned, account: { ...account, outputBudgetBytes: 67_108_865 } },
+      "resources.account.outputBudgetBytes"],
+    [{ configuration, owners: owned, account: { ...account, outputBudgetBytes: 67_108_864 + 1_073_741_824 } },
+      "resources.account.outputBudgetBytes"],
+    [{ configuration, owners: owned.map((value) => ({ ...value, estimateBytes: 1_073_741_825 })),
+      account: { ...account, outputBudgetBytes: 67_108_864 + 1_073_741_824 - 1_073_741_825 } },
+    "resources.account.outputBudgetBytes"],
+    [{ configuration: { ...configuration, outputModel: "x" }, owners: owned, account }, "resources.configuration"],
+    [{ configuration: { ...configuration, outputBudgetBytes: 0 }, owners: owned, account },
+      "resources.configuration.outputBudgetBytes"],
+    [{ configuration, owners: owned.map((value) => ({ ...value, outputBytes: -1 })), account }, "resources.owners.outputBytes"],
+  ]) {
+    await assert.rejects(check(outputs({ resources: value })), { code: "ANALYTICS_V2_OUTPUTS_INVALID", field }, field);
+  }
+  await check(outputs({ resources: { configuration, owners: owned,
+    account: { ...account, heldInputBytes: 100, accountBytes: 1_100 } } }));
+  // A run that reclaimed the unused per-owner budget: configured + budget - largest admitted estimate.
+  await check(outputs({ resources: { configuration, owners: owned,
+    account: { ...account, outputBudgetBytes: 67_108_864 + 1_073_741_824 - 134_217_728 } } }));
 });
 
 test("PG17: bulk owner families are written in bounded chunks with exact row counts", {
@@ -2065,8 +2177,23 @@ test("PG17: an owner beyond the shared reducers' caps is computed and written, n
 
     // The run row records the bounds applied and each owner's evidence and memory figures.
     const [row] = await runRows(pool, schema);
-    assert.deepEqual(row.timings.resources, { memoryModel: "analytics-v2-memory-model-v1",
-      memoryBudgetBytes: 1_024 * 1_048_576, maxDayOccurrences: 250_000, maxDayRecordBytes: 256 * 1_048_576 });
+    const { outputBudgetBytes, ...bounds } = row.timings.resources;
+    assert.deepEqual(bounds, { memoryModel: "analytics-v2-memory-model-v2",
+      outputModel: "analytics-v2-output-model-v1", memoryBudgetBytes: 1_024 * 1_048_576, maxDayOccurrences: 250_000,
+      maxDayRecordBytes: 256 * 1_048_576 });
+    // The output budget is what the heap leaves after the budget and the reserves.
+    assert.equal(Math.floor(outputBudgetBytes / 1_048_576), run.memory.outputBudgetMiB);
+    assert.ok(outputBudgetBytes >= job.ANALYTICS_REFRESH_HEAP_RESERVE.minimumOutputBudgetBytes);
+    // The Job reclaims the part of the per-owner budget the largest admitted owner leaves.
+    const largestAdmitted = Math.max(...row.timings.owners.filter((value) => value.admitted)
+      .map((value) => value.estimateBytes));
+    assert.equal(row.timings.account.outputBudgetBytes, outputBudgetBytes + 1_024 * 1_048_576 - largestAdmitted);
+    assert.equal(run.memory.effectiveOutputBudgetMiB, Math.floor(row.timings.account.outputBudgetBytes / 1_048_576));
+    // The account: every owner's outputs, recorded with the run and summarised in the receipt.
+    assert.equal(row.timings.account.heldInputBytes, 0);
+    assert.equal(row.timings.account.accountBytes, row.timings.owners.reduce((total, value) => total + value.outputBytes, 0));
+    assert.equal(run.memory.accountMiB, Math.ceil(row.timings.account.accountBytes / 1_048_576));
+    assert.ok(run.memory.accountMiB <= run.memory.outputBudgetMiB);
     assert.deepEqual(row.timings.owners.map((entry) => entry.ownerDigest), owners.map((owner) => owner.ownerDigest).sort());
     const entry = row.timings.owners.find((value) => value.ownerDigest === dense.digest);
     const total = (stream) => [...denseFacts.values()].reduce((sum, streams) => sum + streams[stream].length, 0);
@@ -2194,4 +2321,498 @@ test("PG17 integration (dense): the real readers count and stream a 25,000-occur
     // D2 stays blocked by alpha's crossed-midnight conflict, as without hotel.
     assert.ok(run.blocked.includes(seedFixture.D2));
   });
+});
+
+// ---------------------------------------------------------------------------
+// C-REFRESH: the production target path, segment loads and the time guard
+// ---------------------------------------------------------------------------
+
+/** A synthetic, content-free production (or staging) environment as Cloud Run renders the Job. */
+function productionEnvironment(target = "production", extra = {}) {
+  const staging = target === "staging";
+  return {
+    ANALYTICS_REFRESH_TARGET: target,
+    PRIMARY_INSTANCE_CONNECTION_NAME: staging ? "example-ops-prod1:us-east1:example-staging-primary"
+      : "example-ops-prod1:us-east1:example-primary",
+    PRIMARY_DATABASE: "tibotattle",
+    PRIMARY_SCHEMA: "tibotattle_runtime",
+    POSTGRES_IAM_USER: "example-runtime@example-ops-prod1.iam.gserviceaccount.com",
+    ANALYTICS_V2_MEMORY_BUDGET_MIB: "10752",
+    CLOUD_RUN_JOB: staging ? "example-staging-refresh" : "example-analytics-refresh",
+    CLOUD_RUN_EXECUTION: "example-analytics-refresh-abcde",
+    CLOUD_RUN_TASK_INDEX: "0",
+    CLOUD_RUN_TASK_ATTEMPT: "0",
+    CLOUD_RUN_TASK_COUNT: "1",
+    // Platform and deployment variables outside the closed namespaces are not read.
+    DEPLOYMENT_SOURCE_COMMIT: "b".repeat(40),
+    PATH: "/usr/local/bin:/usr/bin",
+    HOME: "/home/node",
+    NODE_VERSION: "22.16.0",
+    ...extra,
+  };
+}
+
+function without(env, name) {
+  const copy = { ...env };
+  delete copy[name];
+  return copy;
+}
+
+async function refusedTarget(env, code, field) {
+  await assert.rejects(job.readAnalyticsRefreshProductionTarget(env), (error) => {
+    assert.equal(error.code, code, JSON.stringify({ code: error.code, field: error.field }));
+    if (field !== undefined) assert.equal(error.field, field);
+    // A refusal names a setting, never a value.
+    assert.equal(JSON.stringify({ message: error.message, field: error.field }).includes("example-"), false);
+    return true;
+  }, `${code}:${field}`);
+}
+
+test("production target: the closed contract reads the six variables and the dense profile", async () => {
+  assert.equal(await job.readAnalyticsRefreshProductionTarget({ PG_TEST_SOCKET: "/x" }), null);
+  for (const target of ["production", "staging"]) {
+    const env = productionEnvironment(target);
+    const read = await job.readAnalyticsRefreshProductionTarget(env);
+    assert.deepEqual({ ...read }, {
+      target,
+      job: env.CLOUD_RUN_JOB,
+      instanceConnectionName: env.PRIMARY_INSTANCE_CONNECTION_NAME,
+      database: "tibotattle",
+      schema: "tibotattle_runtime",
+      iamUser: "example-runtime@example-ops-prod1.iam",
+      taskTimeoutSeconds: 14_400,
+    });
+    assert.deepEqual({ ...await job.resolveAnalyticsRefreshDatabase(env, { schema: "tibotattle_runtime" }) }, {
+      kind: "cloud-sql", target, instanceConnectionName: env.PRIMARY_INSTANCE_CONNECTION_NAME,
+      database: "tibotattle", iamUser: "example-runtime@example-ops-prod1.iam" });
+    // The schema is PRIMARY_SCHEMA and nothing else.
+    await assert.rejects(job.resolveAnalyticsRefreshDatabase(env, { schema: "tibotattle_other" }),
+      { code: "ANALYTICS_V2_REFRESH_TARGET_FORBIDDEN" });
+    assert.equal(job.analyticsRefreshTaskTimeoutMs(env, read), 14_400_000);
+  }
+  // The contract C-INFRA renders.
+  assert.deepEqual([...job.ANALYTICS_REFRESH_PRODUCTION_ENV], ["ANALYTICS_REFRESH_TARGET",
+    "PRIMARY_INSTANCE_CONNECTION_NAME", "PRIMARY_DATABASE", "PRIMARY_SCHEMA", "POSTGRES_IAM_USER",
+    "ANALYTICS_V2_MEMORY_BUDGET_MIB"]);
+  const profile = job.ANALYTICS_REFRESH_PRODUCTION_JOB;
+  assert.deepEqual({ cpu: profile.cpu, memory: profile.memory, heapMiB: profile.heapMiB,
+    memoryBudgetMiB: profile.memoryBudgetMiB, taskTimeoutSeconds: profile.taskTimeoutSeconds, tasks: profile.tasks,
+    maxRetries: profile.maxRetries }, { cpu: "4", memory: "16Gi", heapMiB: 12_288, memoryBudgetMiB: 10_752,
+    taskTimeoutSeconds: 14_400, tasks: 1, maxRetries: 0 });
+  assert.deepEqual([...profile.args], ["--max-old-space-size=12288", "dist/analytics-refresh.mjs", "--mode=full"]);
+  // The rendered invocation parses to the real clock and PRIMARY_SCHEMA.
+  const parsed = job.parseAnalyticsRefreshArguments(profile.args.slice(2), productionEnvironment());
+  assert.deepEqual({ ...parsed }, { help: false, mode: "full", schema: "tibotattle_runtime", nowMs: null,
+    revisionSeed: 0 });
+  // The profile's heap holds its budget, the reserves and the minimum output budget.
+  const MIB = 1_048_576;
+  assert.ok(job.analyticsRefreshResources(productionEnvironment(), profile.heapMiB * MIB).requiredHeapBytes
+    <= profile.heapMiB * MIB);
+});
+
+test("production target: the plane, the shared values and the patterns agree with CR-3's reader", async () => {
+  const configuration = await import("../cloud-run/postgres-production-configuration.mjs");
+  // The Job mirrors CR-3's refusal policy exactly (it cannot import CR-3: see the entry).
+  const policy = job.ANALYTICS_REFRESH_CR3_POLICY;
+  assert.deepEqual([...policy.forbiddenVariables].sort(), Object.keys(configuration.PRODUCTION_FORBIDDEN_VARIABLES).sort());
+  assert.deepEqual([...policy.forbiddenPrefixes].sort(),
+    Object.keys(configuration.PRODUCTION_FORBIDDEN_VARIABLE_PREFIXES).sort());
+  assert.equal(policy.stagingMarker, configuration.STAGING_RESOURCE_MARKER);
+  assert.equal(policy.productionMarker, configuration.PRODUCTION_RESOURCE_MARKER);
+  assert.deepEqual([...policy.fingerprint].sort(), [...new Set(Object.values(configuration.PRODUCTION_RESOURCE_FINGERPRINT)
+    .flatMap((value) => (Array.isArray(value) ? value : [value])))].sort());
+  // Everything CR-3's analytics-job profiles need beyond the refresh contract (synthetic values).
+  const cr3 = (env, plane) => ({ ...env, TELEMETRY_STORAGE_NAMESPACE: "example-namespace",
+    GCS_BUCKET_NAME: plane === "staging" ? "example-staging-quarantine" : "example-quarantine",
+    ...(plane === "staging" ? { PUBLIC_ORIGIN: "https://example-staging.example.org",
+      ADMIN_HOST_ORIGIN: "https://admin.example-staging.example.org", ACCESS_TEAM_DOMAIN: "example.cloudflareaccess.com",
+      ACCESS_AUD: "a".repeat(64), ACCESS_ADMIN_EMAIL: "owner@example.org", IDENTITY_LINK_SECRET_VERSION: "staging-v1",
+      GOOGLE_OIDC_CLIENT_ID: "1-example.apps.googleusercontent.com", APPLE_SERVICES_ID: "org.example.staging",
+      APPLE_KEY_ID: "ABCDEFGHIJ", APPLE_TEAM_ID: "ABCDEFGHIJ" } : {}) });
+  const strip = (env) => Object.fromEntries(Object.entries(env).filter(([name]) => !name.startsWith("ANALYTICS_")));
+  for (const target of ["production", "staging"]) {
+    const env = productionEnvironment(target);
+    const accepted = configuration.readProductionConfiguration(cr3(strip(env), target),
+      target === "staging" ? "staging-analytics-job" : "analytics-job");
+    const read = await job.readAnalyticsRefreshProductionTarget(env);
+    assert.deepEqual({ ...accepted.resources.primary }, { instanceConnectionName: read.instanceConnectionName,
+      database: read.database, schema: read.schema });
+    assert.equal(accepted.resources.iamUser, read.iamUser);
+  }
+  // Values CR-3 refuses, the refresh contract refuses too.
+  for (const [name, value] of [
+    ["PRIMARY_INSTANCE_CONNECTION_NAME", "ex:us-east1:primary"],
+    ["PRIMARY_INSTANCE_CONNECTION_NAME", "example-ops-prod1:useast1:example-primary"],
+    ["PRIMARY_DATABASE", "tibotattle-db"],
+    ["PRIMARY_SCHEMA", "pg_catalog"],
+    ["PRIMARY_SCHEMA", "Runtime"],
+    ["POSTGRES_IAM_USER", "bad user"],
+    ["PRIMARY_INSTANCE_CONNECTION_NAME", job.ANALYTICS_REFRESH_PRODUCTION_ENV.length === 6
+      ? "tibotattle:us-east1:tibotattle-test-primary-20260922" : ""],
+  ]) {
+    const env = productionEnvironment("production", { [name]: value });
+    assert.throws(() => configuration.readProductionConfiguration(cr3(strip(env), "production"), "analytics-job"),
+      undefined, `${name} (CR-3)`);
+    await assert.rejects(job.readAnalyticsRefreshProductionTarget(env), (error) =>
+      ["ANALYTICS_V2_REFRESH_ENV_INVALID", "ANALYTICS_V2_REFRESH_TEST_TARGET_FORBIDDEN"].includes(error.code)
+        && error.field === name, `${name} (refresh)`);
+  }
+  // A staging run never names a production resource of the fingerprint.
+  await refusedTarget(productionEnvironment("staging", { CLOUD_RUN_JOB: "app-usagemonitor-production" }),
+    "ANALYTICS_V2_REFRESH_TEST_TARGET_FORBIDDEN", "CLOUD_RUN_JOB");
+  // Plane markers (CR-3's convention).
+  await refusedTarget(productionEnvironment("production", {
+    PRIMARY_INSTANCE_CONNECTION_NAME: "example-ops-prod1:us-east1:example-staging-primary" }),
+  "ANALYTICS_V2_REFRESH_PLANE_MISMATCH", "PRIMARY_INSTANCE_CONNECTION_NAME");
+  await refusedTarget(productionEnvironment("production", { CLOUD_RUN_JOB: "example-staging-refresh" }),
+    "ANALYTICS_V2_REFRESH_PLANE_MISMATCH", "CLOUD_RUN_JOB");
+  await refusedTarget(productionEnvironment("staging", { CLOUD_RUN_JOB: "example-analytics-refresh" }),
+    "ANALYTICS_V2_REFRESH_PLANE_MISMATCH", "CLOUD_RUN_JOB");
+  await refusedTarget(productionEnvironment("staging", {
+    PRIMARY_INSTANCE_CONNECTION_NAME: "example-ops-prod1:us-east1:example-staging-production" }),
+  "ANALYTICS_V2_REFRESH_PLANE_MISMATCH", "PRIMARY_INSTANCE_CONNECTION_NAME");
+});
+
+test("production target: every other variable, test seam, test target and context is refused", async () => {
+  const env = productionEnvironment();
+  for (const value of ["", "prod", "Production", "test", "local", "production "]) {
+    await refusedTarget({ ...env, ANALYTICS_REFRESH_TARGET: value }, "ANALYTICS_V2_REFRESH_TARGET_INVALID");
+  }
+  // The test clock, even empty.
+  await refusedTarget({ ...env, ANALYTICS_V2_TEST_CLOCK: "1" }, "ANALYTICS_V2_TEST_CLOCK_FORBIDDEN");
+  await refusedTarget({ ...env, ANALYTICS_V2_TEST_CLOCK: "" }, "ANALYTICS_V2_TEST_CLOCK_FORBIDDEN");
+  // CR-3's production-forbidden variables and prefixes, key credentials, and
+  // anything else in the closed namespaces (the other resource knobs, the
+  // rehearsal's seams, a ledger, a second schema).
+  for (const name of ["POSTGRES_TEST_HTTP_MODE", "ACCESS_TEST_JWKS_JSON", "EDGE_PROOF_SECRET", "LEDGER_SCHEMA",
+    "LEDGER_ANYTHING", "HOST_RATE_LIMIT_X", "GOOGLE_APPLICATION_CREDENTIALS", "ANALYTICS_V2_MAX_DAY_OCCURRENCES",
+    "ANALYTICS_V2_MAX_DAY_RECORD_MIB", "ANALYTICS_V2_READ_CHUNK_OCCURRENCES", "ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS",
+    "ANALYTICS_V2_ENABLED", "ANALYTICS_V2_TEST_NOW_MS", "PG_TEST_SOCKET", "PG_TEST_HOST", "PRIMARY_EXTRA",
+    "POSTGRES_MIGRATOR_IAM_USER", "ANALYTICS_REFRESH_SCHEMA",
+    // The libpq-style variables node-pg reads for anything the pool does not
+    // set explicitly (session options, TLS mode, a password, timeouts, a host).
+    "PGOPTIONS", "PGSSLMODE", "PGPASSWORD", "PGCONNECT_TIMEOUT", "PGHOST", "PGUSER", "PGDATABASE", "PGAPPNAME",
+    // Node runtime variables that change the code loaded, the driver or TLS trust.
+    ...job.ANALYTICS_REFRESH_RUNTIME_FORBIDDEN]) {
+    await refusedTarget({ ...env, [name]: "" }, "ANALYTICS_V2_REFRESH_ENV_FORBIDDEN", name);
+    await refusedTarget({ ...env, [name]: "-c default_transaction_read_only=on" }, "ANALYTICS_V2_REFRESH_ENV_FORBIDDEN",
+      name);
+  }
+  assert.deepEqual([...job.ANALYTICS_REFRESH_RUNTIME_FORBIDDEN], ["NODE_OPTIONS", "NODE_PG_FORCE_NATIVE",
+    "NODE_TLS_REJECT_UNAUTHORIZED", "NODE_EXTRA_CA_CERTS"]);
+  assert.equal(job.ANALYTICS_REFRESH_CLOSED_PREFIXES.includes("PG"), true);
+  // Platform and image variables outside the closed names are tolerated (the
+  // node image sets NODE_VERSION; OPS-10 renders DEPLOYMENT_SOURCE_COMMIT).
+  const tolerated = await job.readAnalyticsRefreshProductionTarget({ ...env, NODE_VERSION: "22.16.0",
+    YARN_VERSION: "1.22.22", DEPLOYMENT_SOURCE_COMMIT: "b".repeat(40), CLOUD_RUN_EXECUTION: "example-execution",
+    CLOUD_RUN_TASK_ATTEMPT: "0", PATH: "/usr/local/bin", HOME: "/root" });
+  assert.equal(tolerated.target, "production");
+  // One task of a Cloud Run Job, never a service.
+  for (const context of [without(env, "CLOUD_RUN_JOB"), { ...env, CLOUD_RUN_JOB: "" },
+    { ...env, CLOUD_RUN_JOB: "Analytics_Refresh" }, { ...env, K_SERVICE: "example-origin" },
+    { ...env, CLOUD_RUN_TASK_INDEX: "1" }, { ...env, CLOUD_RUN_TASK_COUNT: "2" }, without(env, "CLOUD_RUN_TASK_INDEX"),
+    without(env, "CLOUD_RUN_TASK_COUNT")]) {
+    await refusedTarget(context, "ANALYTICS_V2_REFRESH_CONTEXT_INVALID");
+  }
+  // Every contract variable is required and well formed.
+  for (const name of job.ANALYTICS_REFRESH_PRODUCTION_ENV.slice(1)) {
+    await refusedTarget(without(env, name), "ANALYTICS_V2_REFRESH_ENV_MISSING", name);
+    await refusedTarget({ ...env, [name]: "" }, "ANALYTICS_V2_REFRESH_ENV_MISSING", name);
+  }
+  await refusedTarget({ ...env, ANALYTICS_V2_MEMORY_BUDGET_MIB: "10752.0" }, "ANALYTICS_V2_REFRESH_ENV_INVALID",
+    "ANALYTICS_V2_MEMORY_BUDGET_MIB");
+  await refusedTarget({ ...env, PRIMARY_SCHEMA: "pg_toast" }, "ANALYTICS_V2_REFRESH_ENV_INVALID", "PRIMARY_SCHEMA");
+  // Test and rehearsal targets: the IAM test and fast-path resources by
+  // identity, and test or rehearsal names, prefixes and scratch instances.
+  const iam = CLOUD_RUN_IAM_TEST_TARGET;
+  const fastpath = FASTPATH_TEST_CLOUD_TARGET;
+  for (const [name, value] of [
+    ["PRIMARY_INSTANCE_CONNECTION_NAME", iam.postgres.primary.instanceConnectionName],
+    ["PRIMARY_INSTANCE_CONNECTION_NAME", fastpath.instanceConnectionName],
+    ["PRIMARY_INSTANCE_CONNECTION_NAME", "example-ops-prod1:us-east1:example-primary-rehearsal-0123abcd"],
+    ["PRIMARY_INSTANCE_CONNECTION_NAME", "example-ops-prod1:us-east1:example-test-primary"],
+    ["PRIMARY_DATABASE", fastpath.database],
+    ["PRIMARY_DATABASE", "tibotattle_test"],
+    ["PRIMARY_SCHEMA", iam.postgres.primary.schema],
+    ["PRIMARY_SCHEMA", fastpath.primarySchema],
+    ["PRIMARY_SCHEMA", "typed_legacy_transfer_rehearsal_target_fastpath_0123abcd"],
+    ["PRIMARY_SCHEMA", "tibotattle_fastpath_20261002"],
+    ["PRIMARY_SCHEMA", "tibotattle_test_runtime"],
+    ["PRIMARY_SCHEMA", "runtime_rehearsal"],
+    ["POSTGRES_IAM_USER", iam.postgres.iamUser],
+    ["POSTGRES_IAM_USER", `${fastpath.iamUser}.gserviceaccount.com`],
+    ["CLOUD_RUN_JOB", fastpath.refreshJob],
+    ["CLOUD_RUN_JOB", "example-analytics-refresh-test"],
+    ["CLOUD_RUN_JOB", "app-usagemonitor-production"],
+  ]) {
+    await refusedTarget({ ...env, [name]: value }, "ANALYTICS_V2_REFRESH_TEST_TARGET_FORBIDDEN", name);
+  }
+});
+
+test("production target: --schema, --now and --revision-seed are refused before any connection", async () => {
+  for (const flag of ["--schema=tibotattle_runtime", "--now=2026-10-01T12:00:00.000Z", "--revision-seed=7"]) {
+    assert.throws(() => job.parseAnalyticsRefreshArguments(["--mode=full", flag], productionEnvironment()),
+      (error) => error.code === "ANALYTICS_V2_REFRESH_ARGUMENT_FORBIDDEN" && error.usage === true
+        && error.field === flag.slice(2, flag.indexOf("=")), flag);
+    // An invalid target is refused the same way: the flags never reach it.
+    assert.throws(() => job.parseAnalyticsRefreshArguments(["--mode=full", flag], { ANALYTICS_REFRESH_TARGET: "x" }),
+      { code: "ANALYTICS_V2_REFRESH_ARGUMENT_FORBIDDEN" }, flag);
+  }
+  // Configuration refusals end the run before any pool, connector or module.
+  let created = 0;
+  for (const [env, code] of [
+    [{ ...productionEnvironment(), ANALYTICS_V2_TEST_CLOCK: "1" }, "ANALYTICS_V2_TEST_CLOCK_FORBIDDEN"],
+    [{ ...productionEnvironment(), ANALYTICS_V2_READ_CHUNK_OCCURRENCES: "10000" }, "ANALYTICS_V2_REFRESH_ENV_FORBIDDEN"],
+    [productionEnvironment("production", { PRIMARY_SCHEMA: "tibotattle_fastpath_20261001" }),
+      "ANALYTICS_V2_REFRESH_TEST_TARGET_FORBIDDEN"],
+  ]) {
+    await assert.rejects(job.runAnalyticsRefresh({ argv: ["--mode=full"], env, dependencies: {
+      createPool: () => { created += 1; return {}; }, createConnector: () => { created += 1; return {}; },
+      modules: { get store() { created += 1; return {}; }, pipeline: {} } } }),
+    (error) => error.code === code && error.phase === "configuration", code);
+  }
+  assert.equal(created, 0);
+  // Under a production target the task timeout is the profile's; elsewhere it is opt-in and bounded.
+  assert.equal(job.analyticsRefreshTaskTimeoutMs({}, null), null);
+  assert.equal(job.analyticsRefreshTaskTimeoutMs({ ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS: "3600" }, null), 3_600_000);
+  for (const value of ["59", "604801", "1e3", "-1", " 60"]) {
+    assert.throws(() => job.analyticsRefreshTaskTimeoutMs({ ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS: value }, null),
+      (error) => error.code === "ANALYTICS_V2_REFRESH_RESOURCES_INVALID"
+        && error.field === "ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS", value);
+  }
+});
+
+test("time guard: refuses a hopeless plan, an owner that cannot finish and a step that could cross the deadline", () => {
+  const model = job.ANALYTICS_REFRESH_TIME_MODEL;
+  let clock = 1_000_000;
+  const guardAt = (taskTimeoutMs) => job.createAnalyticsRefreshTimeGuard({ startedAtMs: 1_000_000, taskTimeoutMs,
+    wallClock: () => clock });
+  // Inert without a task timeout.
+  const inert = guardAt(null);
+  assert.equal(inert.active, false);
+  inert.checkpoint({ kind: "plan", owners: [{ admitted: true, occurrences: 1e12, analysisUsage: 1e12 }] });
+  assert.equal(inert.summary(), null);
+
+  const hour = 3_600_000;
+  const owners = [
+    { ownerDigest: OWNER_A, admitted: true, occurrences: 360_000, analysisUsage: 294_000 },
+    { ownerDigest: OWNER_B, admitted: false, occurrences: 1e9, analysisUsage: 1e9 },
+  ];
+  const ownerMs = (model.readMsPerOccurrence + model.prepareMsPerOccurrence) * 360_000
+    + (model.scalarMsPerAnalysisUsage + model.modelMsPerAnalysisUsage) * 294_000;
+  const refuseAt = (timeout, accountBytes = 0) => 1_000_000 + timeout - model.exitMarginMs - model.writeFixedMs
+    - model.writeMsPerAccountMiB * accountBytes / 1_048_576;
+  // A plan that fits; a refused owner costs nothing.
+  const guard = guardAt(hour);
+  guard.checkpoint({ kind: "read" });
+  guard.checkpoint({ kind: "plan", owners });
+  assert.deepEqual({ ...guard.summary() }, { taskTimeoutSeconds: 3_600, plannedSeconds: Math.ceil(ownerMs / 1_000) });
+  guard.checkpoint({ kind: "owner", index: 0, ownerDigest: OWNER_A, accountBytes: 0 });
+  // A step is projected at stepFactor times the measured rate.
+  const segmentStep = model.stepFactor * (model.readMsPerOccurrence + model.prepareMsPerOccurrence) * 100_000;
+  clock = Math.floor(refuseAt(hour) - segmentStep) - 1;
+  guard.checkpoint({ kind: "segment", index: 0, occurrences: 100_000, accountBytes: 0 });
+  clock += 2;
+  assert.throws(() => guard.checkpoint({ kind: "segment", index: 1, occurrences: 100_000, accountBytes: 0 }), (error) => {
+    assert.equal(error.code, "ANALYTICS_V2_REFRESH_DEADLINE_EXCEEDED");
+    assert.deepEqual(Object.keys(error.deadline).sort(), ["elapsedSeconds", "ownersPlanned", "ownersStarted",
+      "projectedSeconds", "refuseAtSeconds", "taskTimeoutSeconds"]);
+    assert.equal(error.deadline.ownersStarted, 1);
+    assert.equal(error.deadline.ownersPlanned, 2);
+    return true;
+  });
+  // The owner's scalar fit over its analysis rows.
+  const scalarStep = model.stepFactor * model.scalarMsPerAnalysisUsage * 294_000;
+  clock = Math.floor(refuseAt(hour) - scalarStep) - 1;
+  guard.checkpoint({ kind: "scalar", accountBytes: 0 });
+  clock += 2;
+  assert.throws(() => guard.checkpoint({ kind: "scalar", accountBytes: 0 }), (error) => {
+    assert.equal(error.code, "ANALYTICS_V2_REFRESH_DEADLINE_EXCEEDED");
+    assert.equal(error.deadline.projectedSeconds, Math.ceil(scalarStep / 1_000));
+    return true;
+  });
+  // A model date: the owner's analysis rows over the 70 dates.
+  const modelStep = model.stepFactor * model.modelMsPerAnalysisUsage * 294_000 / 70;
+  clock = Math.floor(refuseAt(hour) - modelStep) + 1;
+  assert.throws(() => guard.checkpoint({ kind: "model", index: 0, accountBytes: 0 }),
+    { code: "ANALYTICS_V2_REFRESH_DEADLINE_EXCEEDED" });
+  // The write projection grows with the output account.
+  clock = Math.floor(refuseAt(hour, 512 * 1_048_576)) + 1;
+  guard.checkpoint({ kind: "community", accountBytes: 0 });
+  assert.throws(() => guard.beforeWrite(512 * 1_048_576), { code: "ANALYTICS_V2_REFRESH_DEADLINE_EXCEEDED" });
+  // Past the refusal point every checkpoint refuses.
+  clock = refuseAt(hour) + 1;
+  assert.throws(() => guard.checkpoint({ kind: "read" }), { code: "ANALYTICS_V2_REFRESH_DEADLINE_EXCEEDED" });
+
+  // A plan that cannot finish even at the measured rates is refused at once.
+  clock = 1_000_000;
+  const short = guardAt(Math.floor(ownerMs) + model.exitMarginMs + model.writeFixedMs - 1);
+  assert.throws(() => short.checkpoint({ kind: "plan", owners }), (error) => {
+    assert.equal(error.code, "ANALYTICS_V2_REFRESH_DEADLINE_PROJECTED");
+    assert.equal(error.deadline.projectedSeconds, Math.ceil(ownerMs / 1_000));
+    assert.equal(error.deadline.ownersStarted, 0);
+    return true;
+  });
+  // So is an owner whose remaining owners cannot finish, after time has passed.
+  const later = guardAt(Math.ceil(ownerMs) + model.exitMarginMs + model.writeFixedMs + 10_000);
+  later.checkpoint({ kind: "plan", owners });
+  clock += 20_000;
+  assert.throws(() => later.checkpoint({ kind: "owner", index: 0, ownerDigest: OWNER_A, accountBytes: 0 }),
+    { code: "ANALYTICS_V2_REFRESH_DEADLINE_PROJECTED" });
+  // Closed inputs.
+  for (const options of [{ startedAtMs: 1.5, taskTimeoutMs: hour, wallClock: () => 0 },
+    { startedAtMs: 0, taskTimeoutMs: 0, wallClock: () => 0 }, { startedAtMs: 0, taskTimeoutMs: hour }]) {
+    assert.throws(() => job.createAnalyticsRefreshTimeGuard(options), { code: "ANALYTICS_V2_REFRESH_DEADLINE_INVALID" });
+  }
+  const unplanned = guardAt(hour);
+  clock = 1_000_000;
+  assert.throws(() => unplanned.checkpoint({ kind: "owner", index: 0, accountBytes: 0 }),
+    { code: "ANALYTICS_V2_REFRESH_DEADLINE_INVALID" });
+});
+
+test("default wiring: A-2 segment loads read only their days, in spans of the read chunk, and stay inside the range", async () => {
+  const { calls, modules } = wiringModules({ ownerAEvidence: ["2024-11-03", "2026-09-29"] });
+  const pipeline = job.createAnalyticsV2Pipeline(modules);
+  const inputs = await pipeline.read({ pool: {}, schema: "s", nowMs: WIRING_NOW_MS,
+    state: { cursor: null, carriedBlockedDays: [], cacheFloorDay: null } });
+  const range = inputs.occurrenceRange;
+  const segment = { fromDay: "2024-11-01", throughDay: "2024-12-30" };
+  calls.occurrences.length = 0;
+  const loaded = await inputs.loadOwnerOccurrences(OWNER_A, segment);
+  assert.deepEqual([...loaded.keys()], ["2024-11-03"]);
+  for (const stream of ["usage", "quota", "session"]) {
+    const reads = calls.occurrences.filter((call) => call.stream === stream);
+    assert.deepEqual(spannedDays(reads), spannedDays([segment]), stream);
+  }
+  for (const bad of [{ fromDay: range.fromDay, throughDay: "2026-10-02" },
+    { fromDay: "2024-10-01", throughDay: "2024-10-02" }, { fromDay: "2024-12-30", throughDay: "2024-11-01" },
+    { fromDay: "2024-11-1", throughDay: "2024-12-30" }, null]) {
+    if (bad !== null && bad.fromDay >= range.fromDay && bad.throughDay <= range.throughDay && bad.fromDay <= bad.throughDay
+        && /^\d{4}-\d{2}-\d{2}$/u.test(bad.fromDay)) continue;
+    await assert.rejects(inputs.loadOwnerOccurrences(OWNER_A, bad), { code: "ANALYTICS_V2_REFRESH_RANGE_INVALID" },
+      JSON.stringify(bad));
+  }
+});
+
+test("PG17: the production target path runs a full refresh on the real clock and reports its target", {
+  skip: PG_SKIP,
+  timeout: 300_000,
+}, async () => {
+  await withDatabase("production-path", async ({ pool, createSchema }) => {
+    const { schema } = await createSchema();
+    await seedBaseCorpus(pool, schema);
+    const databases = [];
+    const env = productionEnvironment("production", { PRIMARY_SCHEMA: schema, ANALYTICS_V2_MEMORY_BUDGET_MIB: "1024" });
+    const before = Date.now();
+    const run = await job.runAnalyticsRefresh({
+      argv: ["--mode=full"],
+      env,
+      dependencies: {
+        modules: { store, pipeline: createSpecPipeline() },
+        createConnector: () => ({ close() {} }),
+        // The Cloud SQL target resolved from the contract, served by the local cluster.
+        createPool: async (database) => {
+          databases.push(database);
+          return jobPool(await job.resolveAnalyticsRefreshDatabase(jobEnvironment()));
+        },
+        closeResources: async ({ pools }) => { for (const value of pools) await value.end(); },
+      },
+    });
+    assert.equal(run.state, "complete");
+    assert.equal(run.target, "production");
+    assert.equal(run.schema, schema);
+    assert.equal(run.clock, "wall");
+    assert.equal(run.revisionSeed, 0);
+    assert.ok(Date.parse(run.now) >= before && Date.parse(run.now) <= Date.now(), "the real clock");
+    assert.deepEqual(databases.map(({ kind, target, database, iamUser }) => ({ kind, target, database, iamUser })),
+      [{ kind: "cloud-sql", target: "production", database: "tibotattle", iamUser: "example-runtime@example-ops-prod1.iam" }]);
+    // The profile's task timeout arms the time guard.
+    assert.deepEqual(run.timeGuard, { taskTimeoutSeconds: 14_400, plannedSeconds: null });
+    assert.equal((await runRows(pool, schema)).length, 1);
+  });
+});
+
+test("PG17: the time guard refuses with a receipt before the deadline and writes nothing", {
+  skip: PG_SKIP,
+  timeout: 600_000,
+}, async () => {
+  const corpus = synthetic.composeProofCorpus();
+  const facts = new Map(synthetic.COMPOSE_OWNERS.map((owner) => [owner.digest, synthetic.composeFacts(owner)]));
+  const pipeline = syntheticPipeline({ owners: corpus.owners, facts, journal: journalOf(corpus.publishedDays) });
+  await withDatabase("time-guard", async ({ pool, createSchema }) => {
+    const { schema } = await createSchema();
+    const now = new Date(synthetic.NOW_MS).toISOString();
+    const before = await analyticsSnapshot(pool, schema);
+    // The clock jumps an hour after the plan: the next checkpoint is past the
+    // refusal point of a one-hour task.
+    let calls = 0;
+    let base = null;
+    const wallClock = () => {
+      base ??= Date.now();
+      calls += 1;
+      return base + (calls > 3 ? 3_600_000 : 0);
+    };
+    await assert.rejects(job.runAnalyticsRefresh({
+      argv: ["--mode=full", `--schema=${schema}`, `--now=${now}`],
+      env: jobEnvironment({ ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS: "3600" }),
+      dependencies: { modules: { store, pipeline }, createPool: jobPool, wallClock },
+    }), (error) => {
+      assert.equal(error.code, "ANALYTICS_V2_REFRESH_DEADLINE_EXCEEDED");
+      assert.ok(["read", "compute"].includes(error.phase), error.phase);
+      assert.equal(error.deadline.taskTimeoutSeconds, 3_600);
+      assert.ok(error.deadline.elapsedSeconds >= 3_600);
+      assert.ok(error.deadline.refuseAtSeconds < 3_600);
+      return true;
+    });
+    assert.deepEqual(await analyticsSnapshot(pool, schema), before, "nothing is written");
+    // The lock was released: a run with time completes.
+    const run = await runJob({ schema, now, pipeline, env: jobEnvironment({ ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS: "3600" }) });
+    assert.equal(run.state, "complete");
+    assert.equal(run.timeGuard.taskTimeoutSeconds, 3_600);
+    assert.ok(Number.isSafeInteger(run.timeGuard.plannedSeconds));
+
+    // An output account over the output budget is refused the same way.
+    // (A-2's exact account and refusal are pinned in compute.spec.ts.)
+    const MIB = 1_048_576;
+    const afterRun = await analyticsSnapshot(pool, schema);
+    const refused = await job.runAnalyticsRefresh({
+      argv: ["--mode=full", `--schema=${schema}`, `--now=${now}`],
+      env: jobEnvironment(),
+      dependencies: { modules: { store, pipeline: {
+        read: pipeline.read,
+        compute: async () => {
+          throw Object.assign(new Error("ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED"), {
+            code: "ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED", accountBytes: 70 * MIB + 1, outputBudgetBytes: 70 * MIB });
+        },
+      } }, createPool: jobPool },
+    }).then(() => null, (error) => error);
+    assert.equal(refused?.code, "ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED");
+    assert.equal(refused.phase, "compute");
+    assert.deepEqual({ ...refused.outputAccount }, { accountMiB: 71, outputBudgetMiB: 70 });
+    assert.deepEqual(await analyticsSnapshot(pool, schema), afterRun, "nothing is written");
+  });
+});
+
+test("the source entry prints a deadline refusal's figures and exits 1, before any connection", { timeout: 120_000 }, async () => {
+  // A one-minute task leaves no time after the exit margin and the write: it
+  // is refused at the start, before modules, pools or the lock.
+  const node22 = join(homedir(), ".nvm/versions/node/v22.16.0/bin/node");
+  const available = await access(node22).then(() => true, () => false);
+  assert.ok(available, "Node v22.16.0 is required for the image runtime check");
+  const result = await execFileAsync(node22,
+    ["--max-old-space-size=6144", JOB_PATH, "--mode=full", "--schema=analytics_v2_deadline_cli", `--now=${NOW_1}`], {
+      env: { ANALYTICS_V2_TEST_CLOCK: "1", PG_TEST_SOCKET: "/private/tmp/tibotattle-pg-unused/socket",
+        ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS: "60", PATH: process.env.PATH },
+      cwd: WORKER_ROOT,
+    }).then(() => null, (error) => error);
+  assert.equal(result?.code, 1);
+  assert.equal(result.stdout, "");
+  const line = JSON.parse(result.stderr.trim());
+  assert.equal(line.code, "ANALYTICS_V2_REFRESH_DEADLINE_EXCEEDED");
+  assert.equal(line.phase, "configuration");
+  assert.deepEqual(Object.keys(line).sort(), ["code", "deadline", "phase", "schemaVersion", "status"]);
+  assert.deepEqual(Object.keys(line.deadline).sort(), ["elapsedSeconds", "ownersPlanned", "ownersStarted",
+    "refuseAtSeconds", "taskTimeoutSeconds"]);
+  assert.equal(line.deadline.taskTimeoutSeconds, 60);
+  assert.equal(line.deadline.ownersPlanned, null);
 });

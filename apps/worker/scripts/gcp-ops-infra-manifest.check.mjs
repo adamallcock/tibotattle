@@ -12,9 +12,13 @@ import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  ANALYTICS_REFRESH_PRODUCTION_ENV,
+  ANALYTICS_REFRESH_PRODUCTION_JOB,
   ANALYTICS_REFRESH_RESOURCE_ENV,
   analyticsRefreshResources,
+  analyticsRefreshTaskTimeoutMs,
   parseAnalyticsRefreshArguments,
+  readAnalyticsRefreshProductionTarget,
 } from "../cloud-run/analytics-refresh.mjs";
 import * as configuration from "../cloud-run/postgres-production-configuration.mjs";
 import * as migrations from "../cloud-run/postgres-production-migrations.mjs";
@@ -74,6 +78,40 @@ function refused(mutate, code, options) {
 
 function readSourceWith(overrides) {
   return (path) => (Object.hasOwn(overrides, path) ? overrides[path] : readFileSync(join(WORKER_ROOT, path), "utf8"));
+}
+
+/**
+ * The C-REFRESH binding: a rendered analytics-refresh job is the entry's own
+ * ANALYTICS_REFRESH_PRODUCTION_JOB, every field it states, so a render cannot
+ * drift from the time guard's deadline, the heap the budget was sized in, or
+ * the closed env. The entry's production reader must accept the rendered env
+ * as one task of this job, and its time guard must enforce the rendered
+ * timeout.
+ */
+async function assertRefreshRenderIsProductionJob(job, desired) {
+  const profile = ANALYTICS_REFRESH_PRODUCTION_JOB;
+  const task = job.spec.template.spec.template.spec;
+  const container = task.containers[0];
+  const env = Object.fromEntries(container.env.map((entry) => [entry.name, entry.value]));
+  assert.deepEqual(container.command, ["node"]);
+  assert.deepEqual(container.args, [...profile.args]);
+  assert.equal(container.args[0], `--max-old-space-size=${profile.heapMiB}`);
+  assert.equal(container.args[1], profile.entry);
+  assert.deepEqual(container.resources, { limits: { cpu: profile.cpu, memory: profile.memory } });
+  assert.equal(task.timeoutSeconds, String(profile.taskTimeoutSeconds));
+  assert.equal(task.maxRetries, profile.maxRetries);
+  assert.equal(job.spec.template.spec.taskCount, profile.tasks);
+  assert.equal(job.spec.template.spec.parallelism, profile.parallelism);
+  assert.deepEqual([...profile.env], [...ANALYTICS_REFRESH_PRODUCTION_ENV]);
+  assert.deepEqual(container.env.map((entry) => entry.name),
+    [...profile.env, ...manifest.ANALYTICS_REFRESH_JOB_CONTRACT.provenanceEnv]);
+  assert.equal(env.ANALYTICS_V2_MEMORY_BUDGET_MIB, String(profile.memoryBudgetMiB));
+  const target = await readAnalyticsRefreshProductionTarget({ ...env, CLOUD_RUN_JOB: job.metadata.name,
+    CLOUD_RUN_TASK_INDEX: "0", CLOUD_RUN_TASK_COUNT: "1", CLOUD_RUN_EXECUTION: `${job.metadata.name}-x1`,
+    NODE_VERSION: "22.16.0" });
+  assert.equal(target.target, desired.environment);
+  assert.equal(target.schema, desired.cloudSql.schema);
+  assert.equal(analyticsRefreshTaskTimeoutMs(env, target), Number(task.timeoutSeconds) * 1_000);
 }
 
 test("the synthetic fixture validates closed, frozen and marked synthetic", () => {
@@ -148,7 +186,7 @@ test("the trigger state is closed: PAUSED until OPS-3 resumes it, and never ENAB
     fixture((value) => { value.scheduler["analytics-refresh"].schedule = "15 3 * * *"; }))));
 });
 
-test("the analytics-refresh job renders the production refresh-job contract in the dense profile", () => {
+test("the analytics-refresh job renders the production refresh-job contract in the dense profile", async () => {
   // The deferral is lifted: both jobs deploy, and OPS-10 moves both.
   assert.deepEqual({ ...manifest.DEFERRED_JOBS }, {});
   assert.deepEqual([...manifest.deployedJobNames()], ["production-migrate", "analytics-refresh"]);
@@ -206,6 +244,34 @@ test("the analytics-refresh job renders the production refresh-job contract in t
     assert.ok(resources.requiredHeapBytes <= heap);
     assert.throws(() => analyticsRefreshResources(env, resources.requiredHeapBytes - MIB),
       { code: "ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT" });
+
+    // The render IS the entry's production job (C-REFRESH), field for field.
+    await assertRefreshRenderIsProductionJob(job, desired);
+  }
+  // The binding refuses a render that drifts from the production job in any field it states.
+  {
+    const desired = manifest.validateDesiredState(unmarked());
+    const rendered = manifest.renderJob(desired, "analytics-refresh", IMAGE);
+    const containerOf = (value) => value.spec.template.spec.template.spec.containers[0];
+    for (const [label, mutate] of [
+      ["timeout 3600", (value) => { value.spec.template.spec.template.spec.timeoutSeconds = "3600"; }],
+      ["8Gi", (value) => { containerOf(value).resources.limits.memory = "8Gi"; }],
+      ["2 vCPU", (value) => { containerOf(value).resources.limits.cpu = "2"; }],
+      ["heap 6144", (value) => { containerOf(value).args[0] = "--max-old-space-size=6144"; }],
+      ["retries", (value) => { value.spec.template.spec.template.spec.maxRetries = 3; }],
+      ["two tasks", (value) => { value.spec.template.spec.taskCount = 2; }],
+      ["budget", (value) => { containerOf(value).env.find((entry) => entry.name === "ANALYTICS_V2_MEMORY_BUDGET_MIB")
+        .value = "4608"; }],
+      ["extra env", (value) => { containerOf(value).env.push({ name: "PGOPTIONS", value: "-c x=y" }); }],
+      ["missing env", (value) => { containerOf(value).env = containerOf(value).env
+        .filter((entry) => entry.name !== "PRIMARY_SCHEMA"); }],
+      ["schema flag", (value) => { containerOf(value).args.push("--schema=synthetic_primary"); }],
+    ]) {
+      const doctored = structuredClone(rendered);
+      mutate(doctored);
+      await assert.rejects(assertRefreshRenderIsProductionJob(doctored, desired), undefined, label);
+    }
+    await assertRefreshRenderIsProductionJob(structuredClone(rendered), desired);
   }
   assert.equal(ANALYTICS_REFRESH_RESOURCE_ENV.memoryBudgetMiB.name, "ANALYTICS_V2_MEMORY_BUDGET_MIB");
   // 16 GiB leaves room beyond the heap for native memory.
@@ -867,7 +933,7 @@ function planeIdentifiers(desired) {
     ...Object.values(desired.secrets).map((secret) => secret.secretName)];
 }
 
-test("the committed staging desired state loads: a new plane in the shared GCP test project", () => {
+test("the committed staging desired state loads: a new plane in the shared GCP test project", async () => {
   const desired = manifest.loadCommittedDesiredState("staging");
   assert.equal(desired.environment, "staging");
   assert.equal(desired.projectTenancy, "shared");
@@ -898,9 +964,11 @@ test("the committed staging desired state loads: a new plane in the shared GCP t
   assert.equal(manifest.serviceRenderBlocker(desired), "STAGING_SERVICE_TEMPLATE_UNAVAILABLE");
   assert.throws(() => manifest.renderService(desired, IMAGE), { code: "STAGING_SERVICE_TEMPLATE_UNAVAILABLE" });
   for (const job of manifest.JOB_NAMES) assert.equal(manifest.renderJob(desired, job, IMAGE).kind, "Job");
+  // Its refresh job is the entry's production job, and the entry accepts its staging names.
+  await assertRefreshRenderIsProductionJob(manifest.renderJob(desired, "analytics-refresh", IMAGE), desired);
 });
 
-test("the committed production desired state is refused until OWN-5 fills its placeholders", () => {
+test("the committed production desired state is refused until OWN-5 fills its placeholders", async () => {
   const raw = JSON.parse(COMMITTED.production);
   assert.deepEqual([...manifest.OWNER_PLACEHOLDER_PATHS], ["project", "projectNumber", "region", "bucket.location"]);
   assert.deepEqual([...manifest.unfilledPlaceholders(raw)], [...manifest.OWNER_PLACEHOLDER_PATHS]);
@@ -930,6 +998,8 @@ test("the committed production desired state is refused until OWN-5 fills its pl
   assert.equal(desired.serviceAccounts.verifier.accountId, "tibotattle-verifier");
   assert.equal(manifest.serviceRenderBlocker(desired), "TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED");
   assert.throws(() => manifest.rolloutTargetFromDesiredState(desired), { code: "ROLLOUT_TARGET_VERIFIER_TOKEN_CREATOR_UNASSIGNED" });
+  // Its refresh job is the entry's production job, and the entry accepts its production names.
+  await assertRefreshRenderIsProductionJob(manifest.renderJob(desired, "analytics-refresh", IMAGE), desired);
   // Production and staging share no resource name.
   const staging = new Set(planeIdentifiers(manifest.loadCommittedDesiredState("staging")));
   for (const name of planeIdentifiers(desired)) {

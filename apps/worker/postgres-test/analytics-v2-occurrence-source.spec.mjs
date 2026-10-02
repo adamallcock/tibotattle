@@ -462,3 +462,50 @@ test("the v1.2 expansion excludes a requested occurrence's staged, incomplete an
     assert.deepEqual([...await modules.occurrences.countOwnerOccurrences(scoped,
       { ownerDigest: fixture.owners.india.ownerDigest, stream: "usage", fromDay: D1, throughDay: D3 })], [[D1, 1]]);
   });
+
+test("the legacy expansion and candidates exclude superseded, incomplete and foreign variants and keep the day edges",
+  { skip: SKIP, timeout: 300_000 }, async () => {
+    // C-REFRESH rewrote both legacy statements to fence the owner's devices,
+    // manifests and day range first; the full admission joins still decide.
+    const schema = `analytics_v2_a1_${randomBytes(6).toString("hex")}`;
+    await pool.query(`CREATE SCHEMA "${schema}"`);
+    schemas.push(schema);
+    await applyPostgresMigrations({ role: "primary", schema, pool });
+    const fixture = await seedAnalyticsV2Fixture({ pool, schema, modules: modules.seed, correctionRuntime: "active",
+      legacyScope: true });
+    const scoped = { pool, schema, nowMs: NOW_MS };
+    const read = (name, fromDay = D1, throughDay = D3) => modules.occurrences.readOwnerOccurrences(scoped,
+      { ownerDigest: fixture.owners[name].ownerDigest, stream: "usage", fromDay, throughDay });
+    const count = (name, fromDay = D1, throughDay = D3) => modules.occurrences.countOwnerOccurrences(scoped,
+      { ownerDigest: fixture.owners[name].ownerDigest, stream: "usage", fromDay, throughDay });
+    // Stored: four records of one id (three of lima's v1 devices, one of mike's v1.1).
+    const stored = await pool.query(`SELECT count(*)::integer AS records, count(DISTINCT owner_id)::integer AS owners
+      FROM "${schema}".typed_telemetry_records WHERE occurrence_id=$1`,
+    [Buffer.from(modules.seed.codec.encodeTypedTelemetryId(OCCURRENCES.legacyScoped))]);
+    assert.deepEqual(stored.rows[0], { records: 4, owners: 2 }, "one eligible record and three ineligible variants");
+    const lima = await read("lima");
+    assert.deepEqual([...lima.keys()], [D1, D3]);
+    const occurrence = only(lima.get(D1), OCCURRENCES.legacyScoped);
+    assert.deepEqual({ status: occurrence.status, sourceFormats: occurrence.sourceFormats,
+      sourceCount: occurrence.sourceCount, eventTime: occurrence.eventTime },
+    { status: "compatible", sourceFormats: ["v1"], sourceCount: 1, eventTime: `${D1}T10:00:00.000Z` });
+    // The incomplete chunk's peer is excluded with it; the day edges are kept.
+    assert.deepEqual(lima.get(D1).map((row) => row.occurrenceId).sort(),
+      [OCCURRENCES.legacyFirst, OCCURRENCES.legacyScoped].sort());
+    assert.deepEqual(lima.get(D3).map((row) => row.occurrenceId), [OCCURRENCES.legacyLast]);
+    assert.deepEqual([...await count("lima")], [[D1, 2], [D3, 1]]);
+    // A range starting after D1 or ending before D3 drops exactly that edge.
+    assert.deepEqual([...(await read("lima", D2, D3))].map(([day, rows]) => [day, rows.map((row) => row.occurrenceId)]),
+      [[D3, [OCCURRENCES.legacyLast]]]);
+    assert.deepEqual([...(await read("lima", D1, D2))].map(([day, rows]) => [day, rows.map((row) => row.occurrenceId).sort()]),
+      [[D1, [OCCURRENCES.legacyFirst, OCCURRENCES.legacyScoped].sort()]]);
+    assert.deepEqual([...await count("lima", D2, D3)], [[D3, 1]]);
+    assert.deepEqual([...await count("lima", D1, D2)], [[D1, 2]]);
+    assert.equal(await modules.occurrences.readOwnerFirstEvidenceDay(scoped,
+      { ownerDigest: fixture.owners.lima.ownerDigest, throughDay: D3 }), D1);
+    // Another participant's record of the same id is that participant's own occurrence only.
+    const mike = only((await read("mike")).get(D1), OCCURRENCES.legacyScoped);
+    assert.deepEqual({ status: mike.status, sourceFormats: mike.sourceFormats, sourceCount: mike.sourceCount,
+      eventTime: mike.eventTime }, { status: "compatible", sourceFormats: ["v11"], sourceCount: 1,
+      eventTime: `${D1}T11:00:00.000Z` });
+  });

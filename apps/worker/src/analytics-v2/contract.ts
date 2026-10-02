@@ -350,17 +350,20 @@ export interface AnalyticsV2RunOutputs {
 /** analytics_v2_runs.timings.resources: the bounds one run applied. */
 export interface AnalyticsV2ResourceConfiguration {
   readonly memoryModel: string;
+  readonly outputModel: string;
   readonly memoryBudgetBytes: number;
   readonly maxDayOccurrences: number;
   readonly maxDayRecordBytes: number;
+  readonly outputBudgetBytes: number;
 }
 
 /**
  * analytics_v2_runs.timings.owners[]: one effective owner's evidence size and
- * memory figures. Counts and the estimate are deterministic; heapPeakBytes is
- * the largest heap-in-use sample taken while computing the owner (null when
- * no probe was supplied or the owner was refused) and is operational
- * metadata only, never an input to a decision.
+ * memory figures. Counts, the estimate and outputBytes (what the owner's rows
+ * and refusals charged to the output account) are deterministic;
+ * heapPeakBytes is the largest heap-in-use sample taken while computing the
+ * owner (null when no probe was supplied or the owner was refused) and is
+ * operational metadata only, never an input to a decision.
  */
 export interface AnalyticsV2OwnerResources {
   readonly ownerDigest: AnalyticsV2OwnerDigest;
@@ -372,11 +375,28 @@ export interface AnalyticsV2OwnerResources {
   readonly estimateBytes: number;
   readonly admitted: boolean;
   readonly heapPeakBytes: number | null;
+  readonly outputBytes: number;
+}
+
+/**
+ * analytics_v2_runs.timings.account: the run's output account when compute
+ * finished. heldInputBytes is the non-effective owners' held queued-day
+ * occurrences; accountBytes is everything charged (it includes them);
+ * outputBudgetBytes is the budget the account was held to: the configured
+ * output budget, or, when the run reclaimed the unused per-owner budget,
+ * that plus the memory budget less the largest admitted estimate
+ * (resources.ts analyticsV2OutputBudget).
+ */
+export interface AnalyticsV2OutputAccount {
+  readonly heldInputBytes: number;
+  readonly accountBytes: number;
+  readonly outputBudgetBytes: number;
 }
 
 export interface AnalyticsV2RunResources {
   readonly configuration: AnalyticsV2ResourceConfiguration;
   readonly owners: readonly AnalyticsV2OwnerResources[];
+  readonly account: AnalyticsV2OutputAccount;
 }
 
 /** The read context every A-1 reader takes; reads run in BEGIN READ ONLY. */
