@@ -1490,3 +1490,50 @@ test("version totals validate OS coverage, counts and unavailable states without
     assert.throws(() => projectAdminOverview(invalid), /ADMIN_OVERVIEW_INVALID/u);
   }
 });
+
+
+test("maintained pipeline jobs are closed aggregates and older Workers remain compatible", async () => {
+  const graph = await fixture("admin-reconstruction-graph-valid.json");
+  const maintained = { featureDays: { building: 2, complete: 7, refused: 1,
+    updatedLastHour: 3, latestUpdatedAt: graph.generatedAt }, modelDateBatches: null };
+  const project = (value) => projectAdminReconstructionProgress({ ...graph,
+    pipeline: pipelineBlock({ maintained: value }) }).pipeline.maintained;
+  assert.deepEqual(JSON.parse(JSON.stringify(project(maintained))), maintained);
+  assert.deepEqual(JSON.parse(JSON.stringify(project({ featureDays: null, modelDateBatches: null }))),
+    { featureDays: null, modelDateBatches: null });
+  for (const featureDays of [
+    { ...maintained.featureDays, ownerDigest: "a".repeat(64) },
+    { ...maintained.featureDays, building: -1 },
+    { ...maintained.featureDays, updatedLastHour: 11 },
+    { ...maintained.featureDays, latestUpdatedAt: null },
+    { ...maintained.featureDays, complete: 10_001 },
+  ]) assert.throws(() => project({ ...maintained, featureDays }), /ADMIN_RECONSTRUCTION_PROGRESS_INVALID/u);
+  assert.throws(() => project({ ...maintained, queue: 1 }), /ADMIN_RECONSTRUCTION_PROGRESS_INVALID/u);
+});
+
+
+test("maintained pipeline metadata is closed, nullable and does not turn retained heads into current evidence", async () => {
+  const graph = await fixture("admin-reconstruction-graph-valid.json");
+  const value = await fixture("admin-maintained-pipeline-valid.json");
+  const project = canonical => projectAdminReconstructionProgress({ ...graph, pipeline: pipelineBlock({ canonical }) }).pipeline.canonical;
+  assert.deepEqual(JSON.parse(JSON.stringify(project(value))), value);
+  const missing = { schemaVersion: 1, queues: null, stores: { features: null, rolling: null, activity: null, cache: null },
+    publications: { daily: null, model: null, cache: null }, runtime: null };
+  assert.deepEqual(JSON.parse(JSON.stringify(project(missing))), missing);
+  for (const mutate of [
+    p => { p.sourceId = "private"; },
+    p => { p.queues.cache.detail.reasons[0].code = "raw_error"; },
+    p => { p.queues.cache.detail.reasons[0].jobs++; },
+    p => { p.queues.cache.detail.expiredLeases = 1; },
+    p => { p.queues.cache.detail.completedLastHour = 4; },
+    p => { p.stores.activity.headMatched = 13; },
+    p => { p.stores.cache.retained = 10001; },
+    p => { p.publications.cache.freshness = "current"; },
+    p => { p.publications.cache.retained = 2; },
+    p => { p.runtime[0].maxQueries = 951; },
+    p => { p.runtime[0].degree = 3; },
+    p => { p.runtime[0].canonicalEnabled = 1; },
+    p => { p.runtime.push(p.runtime[0]); },
+  ]) { const broken = structuredClone(value); mutate(broken);
+    assert.throws(() => project(broken), /ADMIN_RECONSTRUCTION_PROGRESS_INVALID/u); }
+});

@@ -135,15 +135,15 @@ async function eraseParticipantData(
           AND NOT EXISTS (
             SELECT 1 FROM admin_action_audit
              WHERE operation_id = ? AND outcome = 'started' AND created_at > ?
-          )`,
+          ) RETURNING 1 AS written`,
     ).bind(
       operationId,
       participantId,
       deletionFence,
       deletionFence,
       new Date(Date.now() - ERASURE_ATTEMPT_LEASE_MILLISECONDS).toISOString(),
-    ).run();
-    if (claimed.meta.changes !== 1) throw new ApiError(409, "PARTICIPANT_DELETING");
+    ).first<number>('written');
+    if (claimed !== 1) throw new ApiError(409, "PARTICIPANT_DELETING");
     deletionFence = operationId;
   }
   if (typeof deletionFence !== "string" || !UUID_PATTERN.test(deletionFence)) {

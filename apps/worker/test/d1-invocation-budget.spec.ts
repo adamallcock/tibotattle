@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { reset } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import { createD1InvocationBudget, D1InvocationBudgetExceededError } from "../src/d1-invocation-budget";
+import { createD1InvocationBudget, reserveD1FinalQuery, D1InvocationBudgetExceededError, D1_BUDGET_ATTACHMENT, type D1BudgetAttachment } from "../src/d1-invocation-budget";
 
 beforeEach(async () => { await reset(); });
 
@@ -66,9 +66,88 @@ describe("whole-invocation D1 statement budget", () => {
     expect(meter.queriesUsed).toBe(1);
   });
 
+  it("charges a carried target binding to every enclosing phase and invocation meter", async () => {
+    interface Attachment extends D1BudgetAttachment { readonly target: D1Database; }
+    const attach = (target: D1Database): Attachment => ({ target,
+      withBudget(wrap) { return attach(wrap(target)); } });
+    const carried = attach(env.DELETION_LEDGER);
+    const source = new Proxy(env.USAGE_MONITOR_DB, { get(database, property) {
+      if (property === D1_BUDGET_ATTACHMENT) return carried;
+      const value: unknown = Reflect.get(database, property);
+      return typeof value === 'function' ? value.bind(database) : value;
+    } });
+    const invocation = createD1InvocationBudget(5), phase = createD1InvocationBudget(2);
+    const scoped = phase.wrap(invocation.wrap(source));
+    const attachment = Reflect.get(scoped, D1_BUDGET_ATTACHMENT) as Attachment;
+    expect(attachment.target).not.toBe(env.DELETION_LEDGER);
+    await attachment.target.prepare('SELECT 1').first();
+    await scoped.prepare('SELECT 2').first();
+    expect(invocation.queriesUsed).toBe(2);
+    expect(phase.queriesUsed).toBe(2);
+    expect(() => attachment.target.prepare('SELECT 3').first()).toThrow(D1InvocationBudgetExceededError);
+    expect(invocation.queriesUsed).toBe(2);
+    expect(Reflect.get(scoped, D1_BUDGET_ATTACHMENT)).toBe(attachment);
+  });
+
   it("validates hard limits and reserves", () => {
     for (const value of [0,-1,1.5,1_001,NaN,Infinity]) expect(() => createD1InvocationBudget(value)).toThrow(TypeError);
     const meter = createD1InvocationBudget(3);
     for (const value of [-1,4,NaN,Infinity,1.5]) expect(() => { meter.reserveQueries=value; }).toThrow(TypeError);
+  });
+});
+
+describe('binding-lineage final-query reservations',()=>{
+  it('protects one actual final statement through nested meters and captured binding facades',async()=>{
+    const invocation=createD1InvocationBudget(5),phase=createD1InvocationBudget(4);
+    const source=phase.wrap(invocation.wrap(env.USAGE_MONITOR_DB));
+    const target=phase.wrap(invocation.wrap(env.DELETION_LEDGER));
+    const observed=new Proxy(target,{get(db,key){const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;}});
+    invocation.reserveQueries=1;phase.reserveQueries=1;
+    const reservation=reserveD1FinalQuery([source,observed,source]);
+    expect(reservation).toBeDefined();
+    expect([invocation.reserveQueries,phase.reserveQueries]).toEqual([1,1]);
+    expect([invocation.remainingQueries,phase.remainingQueries]).toEqual([3,2]);
+    // A producer may reset its ordinary phase save reserve. The independent
+    // branded reservation still protects cleanup on its original captured DB.
+    invocation.reserveQueries=0;phase.reserveQueries=0;
+    const captured=()=>source.prepare('SELECT 1').first();
+    for(let i=0;i<3;i++)await captured();
+    expect(()=>captured()).toThrow(D1InvocationBudgetExceededError);
+    expect([invocation.queriesUsed,phase.queriesUsed]).toEqual([3,3]);
+    expect([invocation.remainingQueries,phase.remainingQueries]).toEqual([1,0]);
+    reservation!.unreserve();reservation!.unreserve();
+    await observed.prepare('SELECT 1').run();
+    expect([invocation.queriesUsed,phase.queriesUsed]).toEqual([4,4]);
+    expect([invocation.remainingQueries,phase.remainingQueries]).toEqual([1,0]);
+    expect([invocation.reserveQueries,phase.reserveQueries]).toEqual([0,0]);
+  });
+  it('refuses unknown or forged lineages before holding any verified meter',()=>{
+    const meter=createD1InvocationBudget(3),db=meter.wrap(env.USAGE_MONITOR_DB);
+    expect(reserveD1FinalQuery([db,env.DELETION_LEDGER])).toBeUndefined();
+    const forged=new Proxy(env.DELETION_LEDGER,{get(target,key){
+      if(typeof key==='symbol')return [{remaining:3,hold(){throw new Error('unverified holder');}}];
+      return Reflect.get(target,key);
+    }});
+    expect(reserveD1FinalQuery([db,forged])).toBeUndefined();
+    expect(meter.remainingQueries).toBe(3);
+  });
+  it('checks every enclosing cap before acquiring any final-query credit',async()=>{
+    const invocation=createD1InvocationBudget(2),phase=createD1InvocationBudget(1);
+    const db=phase.wrap(invocation.wrap(env.USAGE_MONITOR_DB));
+    await db.prepare('SELECT 1').first();
+    expect(()=>reserveD1FinalQuery([db])).toThrow(D1InvocationBudgetExceededError);
+    expect([invocation.remainingQueries,phase.remainingQueries]).toEqual([1,0]);
+    expect([invocation.queriesUsed,phase.queriesUsed]).toEqual([1,1]);
+  });
+  it('releases only its own held credit when reservations overlap',async()=>{
+    const meter=createD1InvocationBudget(3),db=meter.wrap(env.USAGE_MONITOR_DB);
+    const first=reserveD1FinalQuery([db])!,second=reserveD1FinalQuery([db])!;
+    expect(meter.remainingQueries).toBe(1);
+    first.unreserve();first.unreserve();
+    expect(meter.remainingQueries).toBe(2);
+    await db.prepare('SELECT 1').first();await db.prepare('SELECT 1').first();
+    expect(()=>db.prepare('SELECT 1').first()).toThrow(D1InvocationBudgetExceededError);
+    second.unreserve();await db.prepare('SELECT 1').first();
+    expect(meter.queriesUsed).toBe(3);
   });
 });

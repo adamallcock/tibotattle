@@ -5,7 +5,7 @@ import { env, reset, applyD1Migrations, type D1Migration } from 'cloudflare:test
 import { beforeEach, describe, expect, it } from 'vitest';
 import { authoritySchemaInventory, authoritySchemaDigest, authorityMigrationLedgerDigest, authorityRestoreContractDigest,
  copyAuthorityTypedPage, verifyAuthorityTypedPage, freezeAuthorityRestoreSource, beginAuthorityRestore, copyAuthorityPage, sealAuthorityRestore,
- completeAuthorityVerification, finalizeAuthorityRestore, promoteAuthorityRestore, type AuthorityRestoreContract } from '../src/authority-restore';
+ completeAuthorityVerification, finalizeAuthorityRestore, promoteAuthorityRestore, authorityRestoreServingReady, requireAuthorityRestoreServingReady, type AuthorityRestoreContract } from '../src/authority-restore';
 const source=()=>env.USAGE_MONITOR_DB;
 const target=()=>(env as Env & {STORAGE_INGESTION_A:D1Database}).STORAGE_INGESTION_A;
 beforeEach(async()=>reset());
@@ -214,4 +214,19 @@ describe('isolated authority restore protocol',()=>{
   await expect(beginAuthorityRestore(source(),target(),f.contract,f.pin)).rejects.toThrow('AUTHORITY_RESTORE_TARGET_NOT_EMPTY');
  });
 
+});
+
+it('requires explicit replay capability only for restored sources',async()=>{
+ expect(await authorityRestoreServingReady(source())).toBe(true);
+ await source().prepare('CREATE TABLE _authority_restore_run(id INTEGER PRIMARY KEY,phase TEXT)').run();
+ await source().prepare("INSERT INTO _authority_restore_run VALUES(1,'ready')").run();
+ expect(await authorityRestoreServingReady(source())).toBe(false);
+ await expect(requireAuthorityRestoreServingReady(source())).rejects.toThrow('AUTHORITY_RESTORE_REPLAY_REQUIRED');
+ await source().prepare('CREATE TABLE retention_state(singleton INTEGER,state TEXT,restore_replay_complete INTEGER)').run();
+ await source().prepare("INSERT INTO retention_state VALUES(1,'running',1)").run();
+ expect(await authorityRestoreServingReady(source())).toBe(false);
+ await source().prepare("UPDATE retention_state SET state='completed'").run();
+ expect(await authorityRestoreServingReady(source())).toBe(true);
+ await source().prepare("UPDATE _authority_restore_run SET phase='installed'").run();
+ expect(await authorityRestoreServingReady(source())).toBe(false);
 });

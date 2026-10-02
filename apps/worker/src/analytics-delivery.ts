@@ -5,6 +5,8 @@
  */
 /** Explicit source/derived-store binding; no runtime or scheduler dependency. */
 export interface StorageAnalyticsBindings {
+ /** Public reads adopt prepared cache snapshots only under the maintained switch. */
+ canonicalPublications?:boolean;
  source:D1Database; target:D1Database; sourceId:string; sourceNamespace:string;
 }
 export const STORAGE_OPERATING_BUDGET_BYTES = 9_000_000_000;

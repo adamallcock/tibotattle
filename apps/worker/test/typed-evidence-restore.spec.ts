@@ -14,12 +14,13 @@ import { captureTelemetryUsageCorrectionBeforeDelete, readTelemetryUsageCorrecti
 import { authoritySchemaInventory, authoritySchemaDigest, authorityRestoreContractDigest,
   typedEvidenceRestoreFinalSchema, freezeAuthorityRestoreSource, beginAuthorityRestore, copyAuthorityPage,
   sealAuthorityRestore, completeAuthorityVerification, promoteAuthorityRestore, finalizeAuthorityRestore,
-  type AuthorityRestoreContract } from "../src/authority-restore";
+  authorityRestoreServingReady, requireAuthorityRestoreServingReady, type AuthorityRestoreContract } from "../src/authority-restore";
 import { grantTelemetryV12Consent } from "../src/telemetry-transport-policy";
 import { registerTelemetryV12DayManifest, persistTelemetryV12StagedChunk } from "../src/telemetry-v12-repository";
 import { admitTelemetryPerformanceReport, readTelemetryPerformanceReports } from "../src/telemetry-performance-repository";
 import { initializeStorageAnalyticsRuntime } from "../src/storage-analytics-runtime";
-import { eraseParticipantAsOwner } from "../src/participant-erasure";
+import { createD1InvocationBudget } from "../src/d1-invocation-budget";
+import { recordDeletionTombstone, runBackendLifecycle } from "../src/retention";
 interface Bindings extends Env {
   STORAGE_ANALYTICS_DB: D1Database;
   TEST_ANALYTICS_MIGRATIONS: D1Migration[];
@@ -51,6 +52,9 @@ async function prepare() {
   await source().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
   await captureTelemetryUsageCorrectionBeforeDelete(source(), fact);
   const successor = await seedSuccessorStreams();
+  // The snapshot claims a prior successful replay. It cannot authorize serving
+  // against the newer independent deletion ledger after this restore.
+  await source().prepare("UPDATE retention_state SET state='completed',restore_replay_complete=1 WHERE singleton=1").run();
   const sourceSchema = await authoritySchemaInventory(source());
   const finalSchema = typedEvidenceRestoreFinalSchema(sourceSchema);
   const authoritySequences = [];
@@ -217,17 +221,40 @@ it("typed snapshot preserves dictionary ids, active correction facts and source 
   const before = await readTelemetryUsageCorrectionEffectiveFacts(source(), options);
   const performanceBefore = await readTelemetryPerformanceReports(source(), successor.fixture.participantId);
   expect(before.rows.length).toBe(1);
-  await freezeAuthorityRestoreSource(source(), contract, pin);
-  await beginAuthorityRestore(source(), target(), contract, pin);
-  await copyAuthorityPage(source(), target(), contract, pin);
-  await beginAuthorityRestore(source(), target(), contract, pin);
-  await drain(() => copyAuthorityPage(source(), target(), contract, pin));
-  await sealAuthorityRestore(source(), target(), contract, pin);
-  await drain(() => copyAuthorityPage(source(), target(), contract, pin, "verify"));
-  await completeAuthorityVerification(source(), target(), contract, pin);
-  await promoteAuthorityRestore(source(), target(), contract, pin);
-  await finalizeAuthorityRestore(source(), target(), contract, pin);
-  await finalizeAuthorityRestore(source(), target(), contract, pin);
+  expect(await authorityRestoreServingReady(source())).toBe(true);
+  const expectedOwners=(await source().prepare('SELECT owner_digest FROM storage_v11_owner_links WHERE participant_id IN(?,?) ORDER BY owner_digest')
+    .bind(fact.participantId,successor.fixture.participantId).all<{owner_digest:string}>()).results;
+  // The successor fixture is only staged; it has no analytics owner mapping.
+  expect(expectedOwners).toEqual([{owner_digest:fact.ownerDigest}]);
+  const counts:number[]=[];
+  const bounded=async<T>(fn:(s:D1Database,t:D1Database)=>Promise<T>):Promise<T>=>{
+    const meter=createD1InvocationBudget(950);try{return await fn(meter.wrap(source()),meter.wrap(target()));}
+    finally{counts.push(meter.queriesUsed);expect(meter.queriesUsed).toBeLessThanOrEqual(950);}
+  };
+  await bounded((s)=>freezeAuthorityRestoreSource(s,contract,pin));
+  await bounded((s,t)=>beginAuthorityRestore(s,t,contract,pin));
+  expect(await authorityRestoreServingReady(target())).toBe(false);
+  await bounded((s,t)=>copyAuthorityPage(s,t,contract,pin));
+  await bounded((s,t)=>beginAuthorityRestore(s,t,contract,pin));
+  await drain(() => bounded((s,t)=>copyAuthorityPage(s,t,contract,pin)));
+  await bounded((s,t)=>sealAuthorityRestore(s,t,contract,pin));
+  await drain(() => bounded((s,t)=>copyAuthorityPage(s,t,contract,pin,"verify")));
+  await bounded((s,t)=>completeAuthorityVerification(s,t,contract,pin));
+  let promotionResponseLost=false;
+  await expect(bounded((s,t)=>promoteAuthorityRestore(s,new Proxy(t,{get(db,key){
+    if(key==='batch')return async(statements:D1PreparedStatement[])=>{const result=await db.batch(statements);
+      if(!promotionResponseLost){promotionResponseLost=true;throw Error('synthetic lost installation acknowledgement');}return result;};
+    const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;
+  }}),contract,pin))).rejects.toThrow('AUTHORITY_RESTORE_PROMOTION_UNACKNOWLEDGED');
+  expect(promotionResponseLost).toBe(true);
+  expect(await target().prepare('SELECT phase FROM _authority_restore_run WHERE id=1').first('phase')).toBe('installing');
+  expect(await authorityRestoreServingReady(target())).toBe(false);
+  await expect(target().prepare("UPDATE retention_state SET restore_replay_complete=1").run()).rejects.toThrow('AUTHORITY_SNAPSHOT_FROZEN');
+  await drain(()=>bounded((s,t)=>promoteAuthorityRestore(s,t,contract,pin)));
+  await bounded((s,t)=>finalizeAuthorityRestore(s,t,contract,pin));
+  await bounded((s,t)=>finalizeAuthorityRestore(s,t,contract,pin));
+  expect(await target().prepare('SELECT restore_replay_complete FROM retention_state WHERE singleton=1').first('restore_replay_complete')).toBe(0);
+  await expect(requireAuthorityRestoreServingReady(target())).rejects.toThrow('AUTHORITY_RESTORE_REPLAY_REQUIRED');
   expect(await readTelemetryUsageCorrectionEffectiveFacts(target(), options)).toEqual(before);
   expect(await readTelemetryPerformanceReports(target(), successor.fixture.participantId)).toEqual(performanceBefore);
   expect(await target().prepare("SELECT boundary_flags,tie_order FROM telemetry_v12_usage").first()).toEqual({ boundary_flags: 1, tie_order: 0 });
@@ -240,20 +267,39 @@ it("typed snapshot preserves dictionary ids, active correction facts and source 
   await applyD1Migrations(bindings.STORAGE_ANALYTICS_DB, bindings.TEST_ANALYTICS_MIGRATIONS);
   await applyD1Migrations(bindings.DELETION_LEDGER, bindings.TEST_DELETION_LEDGER_MIGRATIONS);
   await initializeStorageAnalyticsRuntime({ source: target(), target: bindings.STORAGE_ANALYTICS_DB, sourceId, sourceNamespace });
-  const runtime = { ...bindings, USAGE_MONITOR_DB: target(), ENVIRONMENT: "synthetic-development" } as Env;
-  Reflect.set(runtime, "TELEMETRY_STORAGE_MODE", "typed");
-  Reflect.set(runtime, "TELEMETRY_STORAGE_NAMESPACE", sourceNamespace);
-  Reflect.set(runtime, "ANALYTICS_DB", bindings.STORAGE_ANALYTICS_DB);
+  const storage = { source:target(),target:bindings.STORAGE_ANALYTICS_DB,ledger:bindings.DELETION_LEDGER,sourceId,sourceNamespace };
   await bindings.QUARANTINE.put("synthetic/typed-restore-v12", "synthetic ciphertext");
-  for (const participantId of [fact.participantId, successor.fixture.participantId]) {
-    expect(await eraseParticipantAsOwner(runtime, "synthetic-admin", participantId)).toMatchObject({ deleted: true });
-  }
+  for (const participantId of [fact.participantId, successor.fixture.participantId])
+    await recordDeletionTombstone(bindings.DELETION_LEDGER,participantId);
+  const replay = () => runBackendLifecycle(target(),bindings.DELETION_LEDGER,bindings.QUARANTINE,Date.now(),undefined,undefined,true,storage);
+  // A restored database with a missing maintained erasure migration must stay
+  // unservable, even though verification and promotion have both completed.
+  const trigger='analytics_canonical_erasure_replay';
+  const triggerSql=await bindings.STORAGE_ANALYTICS_DB.prepare('SELECT sql FROM sqlite_schema WHERE name=?').bind(trigger).first<string>('sql');
+  await bindings.STORAGE_ANALYTICS_DB.prepare('DROP TRIGGER '+trigger).run();
+  await expect(replay()).rejects.toMatchObject({code:'BACKEND_STORAGE_UNAVAILABLE'});
+  expect(await authorityRestoreServingReady(target())).toBe(false);
+  expect(await bindings.STORAGE_ANALYTICS_DB.prepare('SELECT count(*) n FROM analytics_storage_erasure_receipts').first('n')).toBe(0);
+  await bindings.STORAGE_ANALYTICS_DB.prepare(triggerSql!).run();
+  let replayed=false;for(let n=0;n<20;n++)if((await replay()).restoreReplayComplete){replayed=true;break;}
+  expect(replayed).toBe(true);
+  expect(await authorityRestoreServingReady(target())).toBe(true);
+  expect(await bindings.DELETION_LEDGER.prepare("SELECT count(*) n FROM storage_erasure_jobs WHERE state='pending'").first('n')).toBe(0);
+  const receipts=(await bindings.STORAGE_ANALYTICS_DB.prepare('SELECT * FROM analytics_storage_erasure_receipts ORDER BY owner_digest').all()).results;
+  expect(receipts.map(row=>({owner_digest:row.owner_digest}))).toEqual(expectedOwners);
+  expect(await target().prepare('SELECT count(*) n FROM participants WHERE id IN(?,?)').bind(fact.participantId,successor.fixture.participantId).first('n')).toBe(0);
+  expect(await replay()).toMatchObject({restoreReplayComplete:true,restoredParticipantsSuppressed:0});
+  expect((await bindings.STORAGE_ANALYTICS_DB.prepare('SELECT * FROM analytics_storage_erasure_receipts ORDER BY owner_digest').all()).results).toEqual(receipts);
+  expect(await bindings.DELETION_LEDGER.prepare('SELECT count(*) n FROM deletion_tombstones').first('n')).toBe(2);
+  await bounded((s,t)=>finalizeAuthorityRestore(s,t,contract,pin));
+  expect(await authorityRestoreServingReady(target())).toBe(true);
   expect(await target().prepare("SELECT count(*) n FROM telemetry_usage_correction_history").first("n")).toBe(0);
   expect(await target().prepare("SELECT count(*) n FROM telemetry_v12_records").first("n")).toBe(0);
   expect(await target().prepare("SELECT count(*) n FROM telemetry_performance_reports").first("n")).toBe(0);
   expect(await bindings.QUARANTINE.head("synthetic/typed-restore-v12")).toBeNull();
   await expect(registerTelemetryV12DayManifest(target(), successor.fixture, successor.manifest)).rejects.toThrow();
   await expect(admitTelemetryPerformanceReport(target(), successor.fixture, successor.report, successor.authorization, "d".repeat(64))).rejects.toThrow();
+  expect(Math.max(...counts)).toBeLessThanOrEqual(950);
 }, 120_000);
 
 it("typed snapshot cannot omit a stream table, change namespace layout or use legacy conversion", async () => {

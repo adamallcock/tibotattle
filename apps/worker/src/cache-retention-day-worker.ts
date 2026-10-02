@@ -1,3 +1,7 @@
+import {recordAnalyticsPipelineRuntime} from './storage-analytics-runtime-controls';
+import {runCanonicalAnalyticsWorkPass} from './storage-analytics-canonical-runtime';
+import { analyticsFeatureControls, type AnalyticsFeatureControlEnv } from './analytics-feature-controls';
+import { withMaintainedEffectiveDependencies } from './storage-effective-dependency-summaries';
 import { advanceCacheRetentionDayLane, createCacheRetentionDaySourceBuild,
  CACHE_RETENTION_MAX_SHARDS, CACHE_RETENTION_MAX_WRITES } from './cache-retention-day';
 import { createD1InvocationBudget, D1InvocationBudgetExceededError } from './d1-invocation-budget';
@@ -17,7 +21,7 @@ import { createD1InvocationBudget, D1InvocationBudgetExceededError } from './d1-
  * second instance is another cron with another `CACHE_RETENTION_SHARD` and two
  * instances can never select the same day.
  */
-export interface CacheRetentionDayWorkerEnv {
+export interface CacheRetentionDayWorkerEnv extends AnalyticsFeatureControlEnv {
  CACHE_RETENTION_BUILD?:'disabled'|'enabled';
  /** Durable shared owner-day feature read is independent of lane admission. */
  CACHE_RETENTION_SHARED_FEATURES?:'disabled'|'enabled';
@@ -56,7 +60,7 @@ export function cacheRetentionBuildEnabled(env:unknown):boolean{
  * own plus the seven-day lookback a cross-midnight pair needs. A v1.1 day costs
  * one page statement per 5,000 usage rows plus one generation fence each, so a
  * typical owner-day is about 16 statements and the densest measured one about
- * 32, and the 350-statement source half affords between 10 and 21 days.
+ * 32, and the 300-statement source half affords between 9 and 18 days.
  *
  * A v1 day costs roughly twice that: its reader splits each page into an
  * equal-instant leg and an after-instant leg, and its liveness fence reloads a
@@ -72,7 +76,7 @@ export function cacheRetentionBuildEnabled(env:unknown):boolean{
  * the statement meter, not the clock, is the binding constraint on an ordinary
  * pass; the lane reports which one stopped it either way.
  */
-export const CACHE_RETENTION_WORKER_QUERIES=1_000;
+export const CACHE_RETENTION_WORKER_QUERIES=950;
 export const CACHE_RETENTION_WORKER_WINDOW_MS=4*60_000;
 export const CACHE_RETENTION_WORKER_DAYS=12;
 export const CACHE_RETENTION_WORKER_TARGET_QUERIES=650;
@@ -104,6 +108,7 @@ export async function runCacheRetentionDaySchedule(env:CacheRetentionDayWorkerEn
   ||(env.CACHE_RETENTION_FROM_DAY!==undefined&&!DAY.test(env.CACHE_RETENTION_FROM_DAY))
   ||(options?.nowMs!==undefined&&(!Number.isSafeInteger(options.nowMs)||options.nowMs<0)))throw invalid();
  if(CACHE_RETENTION_WORKER_WRITES>CACHE_RETENTION_MAX_WRITES)throw invalid();
+ const features=analyticsFeatureControls(env);
  const {index,count}=shard(env);
  const started=options?.nowMs??Date.now();
  const event='cache_retention_day_schedule';
@@ -113,7 +118,19 @@ export async function runCacheRetentionDaySchedule(env:CacheRetentionDayWorkerEn
   // reads through the unwrapped binding.
   const meter=createD1InvocationBudget(CACHE_RETENTION_WORKER_QUERIES);
   const target=meter.wrap(env.STORAGE_ANALYTICS_DB);
-  const source=meter.wrap(env.STORAGE_INGESTION_DB);
+  if(env.STORAGE_ANALYTICS_CANONICAL_PIPELINE!==undefined)await recordAnalyticsPipelineRuntime(meter.wrap(env.STORAGE_ANALYTICS_DB),env.STORAGE_SOURCE_ID,{
+   role:'cache',method:'maintained-analytics-v1',canonicalPipeline:features.canonicalPipeline,
+   sharedFeatures:features.sharedFeatures||features.canonicalPipeline,modelBlocks:features.modelBlocks,
+   degree:1,queryLimit:950,observedMs:Date.now()});
+  const source=meter.wrap(features.canonicalPipeline?withMaintainedEffectiveDependencies(env.STORAGE_INGESTION_DB,
+   env.STORAGE_ANALYTICS_DB,env.STORAGE_SOURCE_ID,env.TELEMETRY_STORAGE_NAMESPACE):env.STORAGE_INGESTION_DB);
+  if(features.canonicalPipeline){
+   const canonicalWork=await runCanonicalAnalyticsWorkPass({source,target,sourceId:env.STORAGE_SOURCE_ID,
+    sourceNamespace:env.TELEMETRY_STORAGE_NAMESPACE,invocation:meter,now:Date.now,modelBlocks:features.modelBlocks,
+    deadlineMs:started+CACHE_RETENTION_WORKER_WINDOW_MS,stages:['cache'],bridge:false,maxWaves:4});
+   console.log(JSON.stringify({event,...canonicalWork,shard:index,shards:count,durationMs:Math.max(0,Date.now()-started)}));
+   return;
+  }
   const lane=await advanceCacheRetentionDayLane({target,sourceId:env.STORAGE_SOURCE_ID,
    build:createCacheRetentionDaySourceBuild({source,target,sourceNamespace:env.TELEMETRY_STORAGE_NAMESPACE,
     sharedFeatures:env.CACHE_RETENTION_SHARED_FEATURES==='enabled'}),

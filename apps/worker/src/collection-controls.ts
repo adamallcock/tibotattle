@@ -1,4 +1,5 @@
 import { ApiError } from "./errors";
+import { D1InvocationBudgetExceededError } from "./d1-invocation-budget";
 import type { ErrorCode } from "./errors";
 
 export const COLLECTION_CONTROLS_SCHEMA_VERSION =
@@ -55,7 +56,10 @@ export async function readCollectionControls(
         FROM collection_controls
        WHERE singleton = 1
     `).first<CollectionControlRow>();
-  } catch {
+  } catch (error) {
+    // Scheduled statement exhaustion is a resumable deferral, not evidence
+    // that collection controls are unavailable.
+    if (error instanceof D1InvocationBudgetExceededError) throw error;
     fail();
   }
   if (!row

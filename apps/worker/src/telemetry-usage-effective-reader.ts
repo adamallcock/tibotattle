@@ -1,7 +1,10 @@
+import { D1InvocationBudgetExceededError } from "./d1-invocation-budget";
 import {
   canonicalTelemetryV11Json,
   parseTelemetryV11Attribution,
   parseTelemetryV11Record,
+  parseTelemetryV12Record,
+  type TelemetryV12UsageEvent,
   type TelemetryV11Attribution,
 } from "@app-usagemonitor/telemetry-contract";
 import {
@@ -108,6 +111,54 @@ export interface EffectiveTelemetryReaderOptions extends EffectiveUsageReaderOpt
   readonly stream: EffectiveTelemetryStream;
 }
 
+/** Closed extra evidence for canonical materialization; this does not alter the
+ * frozen accounting projection or elect a source by schema rank. */
+export interface EffectiveCanonicalEvidence {
+  readonly accountScopeConflict?: boolean;
+  readonly linkedDays: readonly string[];
+  readonly variants: readonly {
+    readonly coordinate: string;
+    readonly format: "v1" | "v11" | "v12";
+    readonly observedAtMs: number;
+  }[];
+  readonly boundaryFlags: EffectiveOptionalNumber;
+  readonly tieOrder: EffectiveOptionalNumber;
+  readonly cacheWriteFiveMinuteTokens: EffectiveOptionalNumber;
+  readonly cacheWriteOneHourTokens: EffectiveOptionalNumber;
+}
+export interface EffectiveOptionalNumber {
+  readonly presence: "unknown" | "reported" | "conflict";
+  readonly value: number | null;
+}
+function optionalNumber(values: readonly (number | null)[]): EffectiveOptionalNumber {
+  const known = [...new Set(values.filter((value): value is number => value !== null))];
+  return Object.freeze({ presence: known.length > 1 ? "conflict" : known.length ? "reported" : "unknown",
+    value: known.length === 1 ? known[0]! : null });
+}
+function accountScopeConflict(records: readonly Record<string, unknown>[]): boolean {
+  const tracks = records.flatMap(record => {
+    const a = record.accountPlanAttribution;
+    if (!a || typeof a !== 'object' || !('accountBasis' in a) || a.accountBasis === 'unavailable'
+      || !('accountTrackId' in a) || typeof a.accountTrackId !== 'string') return [];
+    return [a.accountTrackId];
+  });
+  return new Set(tracks).size > 1;
+}
+function canonicalEvidence(entries: readonly { coordinate: string; format: "v1" | "v11" | "v12";
+  observedAt: string; sourceRecordJson?: string }[], accountConflict = false): EffectiveCanonicalEvidence {
+  const extended = entries.filter(entry => entry.format === "v12" && entry.sourceRecordJson !== undefined)
+    .map(entry => parseTelemetryV12Record("usage", JSON.parse(entry.sourceRecordJson!)) as TelemetryV12UsageEvent);
+  const variants = entries.map(entry => Object.freeze({ coordinate: entry.coordinate, format: entry.format,
+    observedAtMs: Date.parse(entry.observedAt) })).sort((a, b) => a.coordinate.localeCompare(b.coordinate));
+  return Object.freeze({ accountScopeConflict: accountConflict, variants: Object.freeze(variants),
+    linkedDays: Object.freeze([...new Set(entries.map(entry => entry.observedAt.slice(0, 10)))].sort()),
+    boundaryFlags: optionalNumber(extended.map(row => row.boundaryFlags)),
+    tieOrder: optionalNumber(extended.map(row => row.tieOrder)),
+    cacheWriteFiveMinuteTokens: optionalNumber(extended.map(row => row.cacheWriteTtl?.fiveMinuteTokens ?? null)),
+    cacheWriteOneHourTokens: optionalNumber(extended.map(row => row.cacheWriteTtl?.oneHourTokens ?? null)),
+  });
+}
+
 export interface EffectiveTelemetryOccurrence {
   readonly methodVersion: "effective-telemetry-owner-day-v1";
   readonly stream: EffectiveTelemetryStream;
@@ -121,6 +172,7 @@ export interface EffectiveTelemetryOccurrence {
   readonly sourceFormats: readonly ("v1" | "v11" | "v12")[];
   readonly sourceRowIds: readonly number[];
   readonly sourceRecordKeys: readonly string[];
+  readonly canonicalEvidence?: EffectiveCanonicalEvidence;
   readonly recordJson: string | null;
 }
 
@@ -149,6 +201,7 @@ export interface EffectiveUsageOccurrence {
   /** v1.2 has no typed compatibility row id; these are its immutable
    * manifest/record coordinates, retained for audit without exposing content. */
   readonly sourceRecordKeys: readonly string[];
+  readonly canonicalEvidence?: EffectiveCanonicalEvidence;
   readonly correctionHistoryIds: readonly number[];
   /** Same effective accounting with independently reconciled attribution. */
   readonly analyticalRecordJson: string | null;
@@ -236,7 +289,8 @@ export async function effectiveTelemetryReaderAvailable(db: D1Database): Promise
     return runtime?.state === "active"
       && runtime.schema_version === "telemetry-usage-correction-v1"
       && runtime.method_version === "usage-total-correction-v1";
-  } catch {
+  } catch (error) {
+    if (error instanceof D1InvocationBudgetExceededError) throw error;
     return false;
   }
 }
@@ -276,6 +330,7 @@ async function readV12Availability(db: D1Database): Promise<boolean> {
     if (rows.length !== V12_READER_TABLES.length) fail("EFFECTIVE_USAGE_UNAVAILABLE");
     return true;
   } catch (error) {
+    if (error instanceof D1InvocationBudgetExceededError) throw error;
     if (error instanceof EffectiveUsageReaderError) throw error;
     throw new EffectiveUsageReaderError("EFFECTIVE_USAGE_UNAVAILABLE", { cause: error });
   }
@@ -359,6 +414,7 @@ async function readOwnerScope(
     }
     return row;
   } catch (error) {
+    if (error instanceof D1InvocationBudgetExceededError) throw error;
     if (error instanceof EffectiveUsageReaderError) throw error;
     throw new EffectiveUsageReaderError("EFFECTIVE_USAGE_UNAVAILABLE", { cause: error });
   }
@@ -398,18 +454,39 @@ async function assertOwnerScopeCurrent(
  * any totals are folded. Expansion later deliberately removes the day filter
  * so a conflicting/misaligned timestamp for the same occurrence cannot become
  * an independently priced row on another day. */
-// Completeness is an immutable chunk property. Materialize it once per owner,
-// before occurrence expansion, so a page never recounts a chunk for every row.
-const COMPLETE_CHUNKS_SQL = `owner_scope(participant_id) AS (SELECT ?),
-  complete_v1_chunks AS MATERIALIZED (
-    SELECT chunk.id FROM owner_scope owner
-      JOIN telemetry_v1_chunks chunk ON chunk.participant_id=owner.participant_id
-     WHERE chunk.superseded_at IS NULL AND chunk.accepted_record_count=chunk.record_count
+// Completeness is an immutable chunk property. Prove each reached chunk once,
+// before either page folds records; owner-wide history must not be recounted
+// for a fixed selected day or requested occurrence batch.
+const COMPLETE_CHUNKS_SQL = `complete_v1_chunks AS MATERIALIZED (
+    SELECT chunk.id FROM reached_v1_chunks reached
+      CROSS JOIN telemetry_v1_chunks chunk ON chunk.id=reached.chunk_id
+     WHERE chunk.participant_id=(SELECT participant_id FROM owner_scope)
+       AND chunk.superseded_at IS NULL AND chunk.accepted_record_count=chunk.record_count
        AND chunk.record_count=(SELECT count(*) FROM typed_v1_record_admissions p WHERE p.chunk_id=chunk.id)
   ), complete_v11_chunks AS MATERIALIZED (
-    SELECT chunk.id FROM owner_scope owner
-      JOIN telemetry_v11_chunks chunk ON chunk.participant_id=owner.participant_id
-     WHERE chunk.record_count=${TYPED_V11_CHUNK_PROOF_COUNT_SQL}
+    SELECT chunk.id FROM reached_v11_chunks reached
+      CROSS JOIN telemetry_v11_chunks chunk ON chunk.id=reached.chunk_id
+     WHERE chunk.participant_id=(SELECT participant_id FROM owner_scope)
+       AND chunk.record_count=${TYPED_V11_CHUNK_PROOF_COUNT_SQL}
+  )`;
+const CANDIDATE_REACHED_CHUNKS_SQL = `reached_v1_chunks AS MATERIALIZED (
+    SELECT DISTINCT admission.chunk_id FROM owner_scope owner
+      JOIN typed_v1_owner_memberships membership ON membership.participant_id=owner.participant_id
+      CROSS JOIN selected_window window
+      CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_time
+       ON scoped_record.owner_id=membership.typed_owner_id AND scoped_record.format=10
+        AND scoped_record.stream=window.stream_code
+        AND scoped_record.observed_at_ms>=window.from_ms AND scoped_record.observed_at_ms<window.through_ms
+      JOIN typed_v1_record_admissions admission ON admission.typed_record_id=scoped_record.id
+  ), reached_v11_chunks AS MATERIALIZED (
+    SELECT DISTINCT admission.chunk_id FROM owner_scope owner
+      JOIN typed_v11_owner_memberships membership ON membership.participant_id=owner.participant_id
+      CROSS JOIN selected_window window
+      CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_owner_time
+       ON scoped_record.owner_id=membership.typed_owner_id AND scoped_record.format=11
+        AND scoped_record.stream=window.stream_code
+        AND scoped_record.observed_at_ms>=window.from_ms AND scoped_record.observed_at_ms<window.through_ms
+      JOIN typed_v11_record_admissions admission ON admission.typed_record_id=scoped_record.id
   )`;
 
 // Keep the owner lookup outside compatibility decoding. Namespace/format scans
@@ -418,7 +495,9 @@ const COMPLETE_CHUNKS_SQL = `owner_scope(participant_id) AS (SELECT ?),
 // Constrain the physical owner/stream/time index before compatibility decoding;
 // the decoded day/stream predicates remain as source-validation fences.
 const CANDIDATE_SQL = `
-  WITH ${COMPLETE_CHUNKS_SQL}, selected_window(stream_code,from_ms,through_ms) AS (SELECT ?,?,?), direct AS (
+  WITH owner_scope(participant_id) AS (SELECT ?),
+    selected_window(stream_code,from_ms,through_ms) AS (SELECT ?,?,?),
+    ${CANDIDATE_REACHED_CHUNKS_SQL}, ${COMPLETE_CHUNKS_SQL}, direct AS (
     SELECT r.occurrence_id,r.observed_at_ms
       FROM typed_v1_owner_memberships owner_membership
       CROSS JOIN selected_window window
@@ -498,6 +577,7 @@ async function readDirectCandidates(db: D1Database, scope: OwnerScope, options: 
     ).all<CandidateRow>()).results;
     return rows.map((row) => ({ occurrence_id: identifier(row.occurrence_id, OCCURRENCE_ID), observed_at_ms: integer(row.observed_at_ms, -8_640_000_000_000_000, 8_640_000_000_000_000) }));
   } catch (error) {
+    if (error instanceof D1InvocationBudgetExceededError) throw error;
     if (error instanceof EffectiveUsageReaderError) throw error;
     throw new EffectiveUsageReaderError("EFFECTIVE_USAGE_UNAVAILABLE", { cause: error });
   }
@@ -506,9 +586,36 @@ async function readDirectCandidates(db: D1Database, scope: OwnerScope, options: 
 // The requested values are complete canonical BLOB identities, not TEXT from
 // json_each. The page is split into bounded batches before binding these VALUES.
 const REQUESTED_BLOB_VALUES = "__REQUESTED_BLOB_VALUES__";
+const SOURCE_REACHED_CHUNKS_SQL = `reached_v1_chunks AS MATERIALIZED (
+    SELECT DISTINCT admission.chunk_id FROM owner_scope owner
+      JOIN typed_v1_owner_memberships membership ON membership.participant_id=owner.participant_id
+      CROSS JOIN requested wanted
+      CROSS JOIN typed_telemetry_devices scoped_device INDEXED BY typed_telemetry_device_owner
+       ON scoped_device.owner_id=membership.typed_owner_id
+      CROSS JOIN selected_stream stream
+      CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_v1_occurrence
+       ON scoped_record.device_id=scoped_device.id AND scoped_record.owner_id=membership.typed_owner_id
+        AND scoped_record.format=10 AND scoped_record.stream=stream.stream_code
+        AND scoped_record.occurrence_id=wanted.occurrence_id
+      JOIN typed_v1_record_admissions admission ON admission.typed_record_id=scoped_record.id
+  ), reached_v11_chunks AS MATERIALIZED (
+    SELECT DISTINCT admission.chunk_id FROM owner_scope owner
+      JOIN typed_v11_owner_memberships membership ON membership.participant_id=owner.participant_id
+      CROSS JOIN requested wanted
+      CROSS JOIN typed_telemetry_manifests scoped_manifest INDEXED BY typed_telemetry_manifest_owner
+       ON scoped_manifest.owner_id=membership.typed_owner_id
+      CROSS JOIN selected_stream stream
+      CROSS JOIN typed_telemetry_records scoped_record INDEXED BY typed_telemetry_v11_occurrence
+       ON scoped_record.manifest_id=scoped_manifest.id AND scoped_record.owner_id=membership.typed_owner_id
+        AND scoped_record.format=11 AND scoped_record.stream=stream.stream_code
+        AND scoped_record.occurrence_id=wanted.occurrence_id
+      JOIN typed_v11_record_admissions admission ON admission.typed_record_id=scoped_record.id
+  )`;
 const DIRECT_SOURCE_SQL = `
-  WITH ${COMPLETE_CHUNKS_SQL}, requested(occurrence_id) AS MATERIALIZED (VALUES ${REQUESTED_BLOB_VALUES}),
+  WITH owner_scope(participant_id) AS (SELECT ?),
+  requested(occurrence_id) AS MATERIALIZED (VALUES ${REQUESTED_BLOB_VALUES}),
   selected_stream(stream_code) AS (SELECT ?),
+  ${SOURCE_REACHED_CHUNKS_SQL}, ${COMPLETE_CHUNKS_SQL},
   direct AS (
     SELECT r.storage_row_id,r.source_namespace,r.participant_id,r.device_id,r.occurrence_id,
            r.observed_at_ms,r.canonical_sha256,r.format_code
@@ -636,6 +743,7 @@ async function readDirectSourceRows(db: D1Database, scope: OwnerScope, options: 
       occurrence_id: identifier(row.occurrence_id, OCCURRENCE_ID),
     }));
   } catch (error) {
+    if (error instanceof D1InvocationBudgetExceededError) throw error;
     if (error instanceof EffectiveUsageReaderError) throw error;
     throw new EffectiveUsageReaderError("EFFECTIVE_USAGE_UNAVAILABLE", { cause: error });
   }
@@ -772,6 +880,11 @@ async function reconcileGroups(
       status: result.status, sourceCount: result.sourceCount, sourceFormats: Object.freeze(formats),
       sourceRowIds: Object.freeze(sourceRowIds), sourceRecordKeys: Object.freeze(sourceRecordKeys),
       correctionHistoryIds: Object.freeze(correctionHistoryIds),
+      canonicalEvidence: canonicalEvidence(all.map(entry => {
+        const source = JSON.parse(entry.source.recordJson) as { eventTime: string };
+        return { coordinate: entry.sourceKey, format: entry.format, observedAt: source.eventTime,
+          ...(entry.format === "v12" ? { sourceRecordJson: entry.source.recordJson } : {}) };
+      }), accountScopeConflict(all.map(entry => JSON.parse(entry.source.recordJson)))),
       recordJson: result.effectiveLegacyRecord,
       analyticalRecordJson: result.effectiveLegacyRecord === null ? null : canonicalTelemetryV11Json(
         parseTelemetryV11Record("usage", { ...JSON.parse(result.effectiveLegacyRecord), schemaVersion: "usage-event-v1.1",
@@ -878,6 +991,7 @@ async function readGenericDirectCandidates(
     return rows.map((row) => ({ occurrence_id: identifier(row.occurrence_id, OCCURRENCE_ID),
       observed_at_ms: integer(row.observed_at_ms, -8_640_000_000_000_000, 8_640_000_000_000_000) }));
   } catch (error) {
+    if (error instanceof D1InvocationBudgetExceededError) throw error;
     if (error instanceof EffectiveUsageReaderError) throw error;
     throw new EffectiveUsageReaderError("EFFECTIVE_USAGE_UNAVAILABLE", { cause: error });
   }
@@ -900,6 +1014,7 @@ async function readGenericSourceRows(
       source_namespace: identifier(row.source_namespace), participant_id: identifier(row.participant_id),
       occurrence_id: identifier(row.occurrence_id, OCCURRENCE_ID) }));
   } catch (error) {
+    if (error instanceof D1InvocationBudgetExceededError) throw error;
     if (error instanceof EffectiveUsageReaderError) throw error;
     throw new EffectiveUsageReaderError("EFFECTIVE_USAGE_UNAVAILABLE", { cause: error });
   }
@@ -996,7 +1111,7 @@ interface GenericSourceEntry {
 /** Canonicalize retained v1 records into the v1.1 analytical shape used by
  * the generic stream reader. This is a projection for overlap comparison and
  * folding only; source format and source keys remain in the result. */
-function genericRecordJson(row: TypedTelemetryCompatibilityRecord): string {
+export function selectedTypedTelemetryAnalyticalJson(row: TypedTelemetryCompatibilityRecord): string {
   if (row.format === "v11") return row.record_json;
   let value: Record<string, unknown>;
   try {
@@ -1029,7 +1144,7 @@ function genericOccurrence(
   const entries: GenericSourceEntry[] = [
     ...direct.filter((row) => row.occurrence_id === candidate.occurrence_id).map((row) => ({
       format: row.format, sourceRowId: row.source_row_id, sourceKey: `${row.format}:${row.source_row_id}`,
-      observedAt: row.observed_at, recordJson: genericRecordJson(row),
+      observedAt: row.observed_at, recordJson: selectedTypedTelemetryAnalyticalJson(row),
     })),
     ...v12.filter((row) => row.occurrenceId === candidate.occurrence_id).map((row) => ({
       format: "v12" as const, sourceRowId: null, sourceKey: row.sourceRecordKey,
@@ -1060,6 +1175,8 @@ function genericOccurrence(
     sourceFormats: Object.freeze([...new Set(entries.map((entry) => entry.format))].sort() as ("v1" | "v11" | "v12")[]),
     sourceRowIds: Object.freeze([...new Set(entries.flatMap((entry) => entry.sourceRowId === null ? [] : [entry.sourceRowId]))].sort((a, b) => a - b)),
     sourceRecordKeys: Object.freeze([...new Set(entries.map((entry) => entry.sourceKey))].sort()),
+    canonicalEvidence: canonicalEvidence(entries.map(entry => ({ coordinate: entry.sourceKey,
+      format: entry.format, observedAt: entry.observedAt })), accountScopeConflict(parsed)),
     recordJson: conflict ? null : effective,
   });
 }
@@ -1081,7 +1198,7 @@ export async function readEffectiveTelemetryOwnerDayPage(
         occurrenceId: row.occurrenceId, eventTime: row.eventTime, eventTimeConflict: row.eventTimeConflict,
         status: row.status === "compatible" ? "compatible" as const : "conflict" as const,
         sourceCount: row.sourceCount, sourceFormats: row.sourceFormats, sourceRowIds: row.sourceRowIds,
-        sourceRecordKeys: row.sourceRecordKeys, recordJson: row.analyticalRecordJson }))), next: page.next });
+        sourceRecordKeys: row.sourceRecordKeys, canonicalEvidence: row.canonicalEvidence, recordJson: row.analyticalRecordJson }))), next: page.next });
   }
   const scope = await readOwnerScope(db, options, await readV12Availability(db));
   const directCandidates = await readGenericDirectCandidates(db, scope, options);

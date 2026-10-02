@@ -1200,7 +1200,8 @@ describe('the cache-retention lane',()=>{
  });
  it('refuses source work before the additive owner cursor migration',async()=>{
   const before=b.TEST_ANALYTICS_MIGRATIONS.filter(m=>m.name<'0033_');
-  expect(before.length).toBe(b.TEST_ANALYTICS_MIGRATIONS.length-1);
+  expect(before.at(-1)?.name).toMatch(/^0032_/u);
+  expect(b.TEST_ANALYTICS_MIGRATIONS.some(m=>m.name.startsWith('0033_'))).toBe(true);
   await reset();
   await applyD1Migrations(target(),before);
   await target().prepare('INSERT INTO analytics_runtime_sources(source_id,source_namespace,contract_version) VALUES(?,?,1)')

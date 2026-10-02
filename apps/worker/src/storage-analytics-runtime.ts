@@ -1,3 +1,6 @@
+import {createCanonicalSharedFeaturePreparation} from './storage-analytics-canonical-day';
+import {readAnalyticsWorkTargetSettled} from './storage-analytics-closure-fence';
+import { withMaintainedEffectiveDependencies } from './storage-effective-dependency-summaries';
 import { decodeStorageChangeRow, readIngestionChanges, STORAGE_OPERATING_BUDGET_BYTES, type StorageChange } from './analytics-delivery';
 import { createD1InvocationBudget, D1InvocationBudgetExceededError } from './d1-invocation-budget';
 import { lookupV11StorageSource } from './v11-storage-journal';
@@ -313,7 +316,7 @@ export function storageDailyAdmissionForSlot(slot:number):{
 /** Runs in an independent scheduled invocation. The actual query meter is
  * shared by BOTH databases; a batch counts all statements. A failed calculation
  * cannot participate in, roll back or delay an upload transaction. */
-export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
+type StorageAnalyticsPassOptions=StorageAnalyticsBindings&{
  maxSteps?:number;deadlineMs?:number;maxQueries?:number;signal?:AbortSignal;
  publishCommunity?:boolean;publicOnly?:boolean;
  /** Run the publication lanes and never the graph lane. The publication worker
@@ -338,6 +341,8 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
  modelBlocks?:boolean;
  /** Reuse durable shared features across daily and graph consumers. */
  sharedFeatures?:boolean;
+ /** Adopt common canonical preparation with independently qualified stores. */
+ canonicalPipeline?:boolean;
  /** Optional content-free timing for the first four daily attempts in this
   * pass. The scheduled publication worker owns the aggregate and its log. */
  publicationTimingObserver?:StoragePublicationTimingObserver;
@@ -365,7 +370,15 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
   * incomplete. Its own switch, revertible independently of the builder and the
   * fold, and self-limiting: an empty selection costs one statement. */
  graphDayProjectionLongPass?:boolean;
-}):Promise<StorageAnalyticsPass> {
+};
+type StoragePublicationAnalyticsPass=Omit<StorageAnalyticsPass,'reason'>&{
+ reason:StorageAnalyticsPass['reason']|'source_prefix_pending';
+};
+// Pending publication is exclusive to the publication-only composition.
+// Delivery/catch-up callers retain their existing durable result contract.
+export function runStorageAnalyticsPass(options:StorageAnalyticsPassOptions&{publicationOnly?:false}):Promise<StorageAnalyticsPass>;
+export function runStorageAnalyticsPass(options:StorageAnalyticsPassOptions):Promise<StoragePublicationAnalyticsPass>;
+export async function runStorageAnalyticsPass(options:StorageAnalyticsPassOptions):Promise<StoragePublicationAnalyticsPass> {
  const maxSteps=options.maxSteps??8,deadlineMs=options.deadlineMs??Date.now()+20_000;
  if(!Number.isSafeInteger(maxSteps)||maxSteps<1||maxSteps>32||!Number.isFinite(deadlineMs)
    ||(options.publicOnly!==undefined&&typeof options.publicOnly!=='boolean')
@@ -374,6 +387,7 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
    ||(options.graphOnly!==undefined&&typeof options.graphOnly!=='boolean')
    ||(options.modelBlocks!==undefined&&typeof options.modelBlocks!=='boolean')
    ||(options.sharedFeatures!==undefined&&typeof options.sharedFeatures!=='boolean')
+   ||(options.canonicalPipeline!==undefined&&typeof options.canonicalPipeline!=='boolean')
    ||(options.graphSelectionNowMs!==undefined&&(!Number.isSafeInteger(options.graphSelectionNowMs)
      ||options.graphSelectionNowMs<0))
    // A graph-only pass publishes community results and opens no ordered
@@ -407,7 +421,9 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
   ??Math.floor(Date.now()/60_000)%GRAPH_DAY_PROJECTION_OPEN_EVERY===GRAPH_DAY_PROJECTION_OPEN_MINUTE;
  const graphAdmission=options.graphOnly?GRAPH_ONLY_ADMISSION_QUERIES:GRAPH_LANE_ADMISSION_QUERIES;
  const meter=createD1InvocationBudget(options.maxQueries??900);
- const scoped={...options,source:meter.wrap(options.source),target:meter.wrap(options.target)};
+ const sourceForPass=options.canonicalPipeline===true?withMaintainedEffectiveDependencies(
+  options.source,options.target,options.sourceId,options.sourceNamespace):options.source;
+ const scoped={...options,source:meter.wrap(sourceForPass),target:meter.wrap(options.target)};
  let steps=0,recordsRead=0,dailyPublications=0,graphCalculations=0,modelBlockAdoptedDates=0,
   graphFailure:StorageGraphFailureFields|undefined;
  let dailyAdmissionAttempt=0;
@@ -425,7 +441,7 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
   emptyRetirement.add(lane);return idlePage;
  };
  const retireSharedFeatures=async()=>{
-  if(options.sharedFeatures!==true||meter.remainingQueries<60||Date.now()>=deadlineMs)return;
+  if((options.sharedFeatures!==true&&options.canonicalPipeline!==true)||meter.remainingQueries<60||Date.now()>=deadlineMs)return;
   const before=meter.queriesUsed;
   const cleaned=await retireSharedAnalyticsFeaturePage({target:scoped.target,sourceId:options.sourceId,
    budget:{remainingQueries:()=>meter.remainingQueries,deadlineMs,now:Date.now}});
@@ -433,7 +449,7 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
   sweep.iterations++;
   if(cleaned.state==='complete'&&(cleaned.headsRemoved>0||cleaned.partsRemoved>0))sweep.graphWorked++;
  };
- const result=(state:StorageAnalyticsPass['state'],reason:StorageAnalyticsPass['reason']):StorageAnalyticsPass=>
+ const result=(state:StorageAnalyticsPass['state'],reason:StoragePublicationAnalyticsPass['reason']):StoragePublicationAnalyticsPass=>
   ({state,reason,steps,recordsRead,queriesUsed:meter.queriesUsed,dailyPublications,graphCalculations,
    ...(options.modelBlocks===true?{modelBlockAdoptedDates}:{}),
    sweepQueries:sweep.queries,sweepIterations:sweep.iterations,
@@ -521,6 +537,15 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
     reason:fields.reason,detail:storageGraphFailureDetail(error)??null}));
    if(stage==='graph_work')graphExhausted=true;
   };
+  // A negative target hint can only postpone this publication-only pass.
+  // The pass prepares no canonical/features inputs, so retry on the next cron
+  // instead of selecting blocked days repeatedly. Every positive publication
+  // keeps its complete source/authority/clock/lease/closure proofs. Leave two
+  // queries above the ordinary loop floor for this fresh target-only hint.
+  const canonicalPublicationPending=options.canonicalPipeline===true
+   &&options.publicOnly===true&&options.publicationOnly===true
+   &&meter.remainingQueries>=102&&Date.now()<deadlineMs
+   &&!await readAnalyticsWorkTargetSettled(scoped);
   // A graph-only pass skips this opportunistic publication: its cost scales
   // with the cohort and could spend the graph lane's admission floor before any
   // calculation starts. The minute pass still runs it every minute, and the
@@ -528,14 +553,14 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
   // The standing preview refresh is publication work, so it travels with the
   // publication lane. A graph completion still publishes its own result inside
   // `runGraphLane`, which is the graph's own output rather than this sweep.
-  if(options.publishCommunity&&!options.graphOnly&&!options.skipPublication
+  if(!canonicalPublicationPending&&options.publishCommunity&&!options.graphOnly&&!options.skipPublication
     &&meter.remainingQueries>=253&&deadlineMs-Date.now()>=5_000
     &&(await readCollectionControls(scoped.source)).publication) {
    options.signal?.throwIfAborted();
    try{
     const ready=await storageCommunityGraphPreviewReadyHint(scoped);
     options.signal?.throwIfAborted();
-    if(ready&&meter.remainingQueries>=250&&Date.now()<deadlineMs)await publishStorageCommunityGraphPreview(scoped);
+    if(ready&&meter.remainingQueries>=250&&Date.now()<deadlineMs)await publishStorageCommunityGraphPreview(scoped,{...(options.canonicalPipeline?{canonicalClosure:true}:{})});
    }catch(error){laneFailure('graph_work',error);}
   }
   for(;steps<maxSteps;) {
@@ -683,7 +708,7 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
    if(longPassBuild)await runProjectionLane('long');
    else if(projectionLaneFirst)await runProjectionLane('opening');
 
-   if(options.publishCommunity && meter.remainingQueries>=100 && Date.now()<deadlineMs
+   if(!canonicalPublicationPending&&options.publishCommunity && meter.remainingQueries>=100 && Date.now()<deadlineMs
      && (await readCollectionControls(scoped.source)).publication) {
     // Recover several already prepared days without consuming the graph's
     // 550-statement admission floor while the graph lane is still to run.
@@ -702,7 +727,7 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
      // 90-query publication slice cannot admit that operation, and exposing
      // only the outer meter would let preparation hit the nested cap before
      // saving its progress. Keep the graph reserve and expose BOTH meters.
-     const dailyCap=options.sharedFeatures===true?750:90;
+     const dailyCap=(options.sharedFeatures===true||options.canonicalPipeline===true)?750:90;
      const dailyAllowance=options.publicationOnly
       ?Math.min(dailyCap,Math.max(0,meter.remainingQueries-100))
       :Math.min(dailyCap,Math.max(0,meter.remainingQueries-(graphRan?100:560)));
@@ -725,7 +750,8 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
         const statementsUsed=()=>meter.queriesUsed;
         const daily=await withStoragePublicationTiming('daily_attempt',observer,statementsUsed,
          ()=>advanceNextStorageCommunityDaily({...dailyScoped,...storageDailyAdmissionForSlot(slot),skipDays,
-          ...(options.sharedFeatures===true?{sharedFeatures:true,sharedFeatureBudget:{
+          ...((options.sharedFeatures===true||options.canonicalPipeline===true)?{sharedFeatures:true,
+           ...(options.canonicalPipeline?{canonicalPreparation:createCanonicalSharedFeaturePreparation}:{}),sharedFeatureBudget:{
            remainingQueries:()=>Math.min(meter.remainingQueries,dailyMeter.remainingQueries),
            deadlineMs,now:Date.now,
            ...(observer?{observePhase:observer,statementCount:statementsUsed}:{})}}:{})}));
@@ -765,7 +791,8 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
        admissionQueries:graphAdmission,...(options.graphLeaseMs===undefined?{}:{leaseMs:options.graphLeaseMs}),
        ...(options.foldGraphDayProjections===undefined?{}:{preparedFold:options.foldGraphDayProjections}),
        ...(options.modelBlocks===true?{modelBlocks:true}:{}),
-       ...(options.sharedFeatures===true?{sharedFeatures:true}:{}),
+       ...((options.sharedFeatures===true||options.canonicalPipeline===true)?{sharedFeatures:true}:{}),
+       ...(options.canonicalPipeline?{canonicalPipeline:true}:{}),
        ...(options.graphSelectionNowMs===undefined?{}:{nowMs:options.graphSelectionNowMs})});
       if(graph.failure)graphFailure??=graph.failure;
       modelBlockAdoptedDates+=graph.modelBlockAdoptedDates??0;
@@ -779,8 +806,8 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
       }
       if((graph.state==='complete'||graph.state==='reused')&&meter.remainingQueries>=250&&Date.now()<deadlineMs) {
        emptyRetirement.delete('publication');
-       if(graph.metric==='model'&&graph.day)await publishStorageCommunityModelDay(scoped,{day:graph.day});
-       if(meter.remainingQueries>=250&&Date.now()<deadlineMs)await publishStorageCommunityGraphPreview(scoped);
+       if(graph.metric==='model'&&graph.day)await publishStorageCommunityModelDay(scoped,{day:graph.day,...(options.canonicalPipeline?{canonicalClosure:true}:{})});
+       if(meter.remainingQueries>=250&&Date.now()<deadlineMs)await publishStorageCommunityGraphPreview(scoped,{...(options.canonicalPipeline?{canonicalClosure:true}:{})});
       }
       if(meter.remainingQueries>=30)await retire('publication',async()=>(await retireStorageCommunityGraphPublications(scoped))>0);
      }catch(error){laneFailure('graph_work',error);}
@@ -805,6 +832,25 @@ export async function runStorageAnalyticsPass(options:StorageAnalyticsBindings&{
    // reserves the graph lane's own admission floor whenever that lane has not
    // already run in this iteration.
    await runProjectionLane('trailing');
+   if(canonicalPublicationPending){
+    options.signal?.throwIfAborted();
+    if(Date.now()>=deadlineMs)return result('deferred','deadline');
+    // The skipped daily lane normally owns its retirement page, and the
+    // publication-only graph lane returns before publication retirement.
+    // Keep both bounded pages alongside the ordinary sweeps, even with
+    // publication paused. Pending input must never be reported as idle.
+    try{await retire('daily',async()=>(await retireStorageCommunityDailyPage(scoped))>0);}
+    catch(error){laneFailure('daily_publish',error);}
+    options.signal?.throwIfAborted();
+    if(Date.now()>=deadlineMs)return result('deferred','deadline');
+    if(meter.remainingQueries>=30){
+     try{await retire('publication',async()=>(await retireStorageCommunityGraphPublications(scoped))>0);}
+     catch(error){laneFailure('graph_work',error);}
+    }
+    options.signal?.throwIfAborted();
+    if(Date.now()>=deadlineMs)return result('deferred','deadline');
+    return result('deferred','source_prefix_pending');
+   }
    if(step.state==='idle'&&v11.state==='idle'&&v1.state==='idle'&&retiredGraph.state==='idle'
      &&retiredProjection.state==='idle'&&publicIdle&&projectionIdle)
     return graphOnlyStalled()?result('deferred','step_limit'):result('idle','complete');

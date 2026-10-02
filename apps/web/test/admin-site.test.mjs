@@ -2070,16 +2070,19 @@ test("the processing pipeline shows every stage, observed movement and a publica
   }, async documentRef => {
     const stages = documentRef.byId.get("pipeline-stages");
     const badge = documentRef.byId.get("pipeline-badge");
-    await waitFor(() => stages.children.length === 4);
+    await waitFor(() => stages.children.length === 7);
     const texts = () => stages.children.map((card) => allText(card));
     assert.equal(badge.textContent, "Delivering · 14 changes behind");
-    const [ingestion, delivery, daily, allowance] = texts();
-    assert.match(ingestion, /Ingestion journal .*27,650 changes recorded Latest .*\(5 min ago\)/u);
-    assert.match(delivery, /Delivery into analytics .*14 changes behind · 13 device activations Current device: 13 of 94 days folded \(May 27 – Aug 28\)$/u);
-    assert.match(daily, /229 days queued · May 4 – Sep 16 Last published .*\(5 h ago\) · 0 in the last hour Waiting for delivery/u);
+    const [ingestion, delivery, preparation, daily, allowance, cache, publication] = texts();
+    assert.match(ingestion, /Accepted changes .*27,650 changes recorded in the ingestion journal Produces ordered changes for delivery. Latest .*\(5 min ago\)/u);
+    assert.match(delivery, /Delivery into analytics .*14 changes behind · 13 device activations Current device: 13 of 94 days folded \(May 27, 2026 – Aug 28, 2026\) Produces delivered owner\/day projections/u);
+    assert.match(daily, /229 days queued · May 4, 2026 – Sep 16, 2026 Last published .*\(5 h ago\) · 0 in the last hour Reuses daily features to publish account, token and priced API-value aggregates. Waiting for delivery/u);
     assert.match(allowance, /1,042 results remaining · 23 in the last hour · 208 in 6 h/u);
+    assert.match(preparation, /Shared preparation .*Not counted .*Retained feature job counts are unavailable/u);
+    assert.match(cache, /Cache continuity .*Not counted .*carrying continuity across days/u);
+    assert.match(publication, /Complete publication .*Update awaiting graph .*Last complete graph/u);
     assert.deepEqual(stages.children.map((card) => card.className.split(" ").at(-1)),
-      ["admin-pipeline-clear", "admin-pipeline-busy", "admin-pipeline-waiting", "admin-pipeline-busy"]);
+      ["admin-pipeline-clear", "admin-pipeline-busy", "admin-pipeline-unknown", "admin-pipeline-waiting", "admin-pipeline-busy", "admin-pipeline-unknown", "admin-pipeline-waiting"]);
 
     await documentRef.byId.get("refresh").listeners.get("click")();
     await waitFor(() => texts()[1].includes("Since the read"));
@@ -2088,7 +2091,7 @@ test("the processing pipeline shows every stage, observed movement and a publica
     failProgress = true;
     await documentRef.byId.get("refresh").listeners.get("click")();
     await waitFor(() => badge.textContent === "Stale · the latest refresh failed");
-    assert.equal(stages.children.length, 4);
+    assert.equal(stages.children.length, 7);
     assert.equal(texts()[1].includes("Since the read"), false);
   });
 });
@@ -2293,5 +2296,75 @@ test("distribution quality summary labels retained evidence after a failed refre
     failed = false;
     await documentRef.byId.get("refresh").listeners.get("click")();
     await waitFor(() => !documentRef.byId.get("distribution-source-summary").textContent.startsWith("Refresh failed"));
+  });
+});
+
+
+test("maintained stage metadata shows retained counts without claiming an unmeasured queue or current reuse", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const graph = await fixture("admin-reconstruction-graph-valid.json");
+  graph.pipeline = {
+    ingestion: { journalHead: 10, latestRecordedAt: graph.generatedAt },
+    delivery: { appliedSequence: 10, pendingChanges: 0, pendingActivations: 0, current: null },
+    daily: { queuedDays: 0, oldestQueuedDay: null, newestQueuedDay: null, lastReleasedAt: null, releasedLastHour: 0 },
+    maintained: {
+      featureDays: { building: 2, complete: 7, refused: 1, updatedLastHour: 3, latestUpdatedAt: graph.generatedAt },
+      modelDateBatches: { pending: 1, complete: 2, updatedLastHour: 1, latestUpdatedAt: graph.generatedAt },
+    },
+  };
+  await withAdminPage(async (path, init) => path === ADMIN_READ_PATHS[3] && init?.method !== "POST"
+    ? response(graph) : healthyAdminRead(path, overview), async documentRef => {
+    const stages = documentRef.byId.get("pipeline-stages");
+    await waitFor(() => stages.children.length === 7);
+    assert.match(allText(stages.children[2]), /2 building .*7 complete retained days · 1 refused day .*3 retained jobs updated/u);
+    assert.match(allText(stages.children[2]), /checked against dependencies before reuse. Preparation queue not counted/u);
+    assert.match(allText(stages.children[4]), /1 pending retained batch · 2 complete retained batches/u);
+    assert.equal(documentRef.byId.get("pipeline-badge").textContent, "Awaiting complete graph");
+  });
+});
+
+
+test("maintained pipeline renders independent family queues, explicit gaps, refusal and stored public freshness", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const graph = await fixture("admin-reconstruction-graph-valid.json");
+  graph.generatedAt = "2026-10-01T12:00:00.000Z";
+  graph.pipeline = { ingestion: { journalHead: 12, latestRecordedAt: graph.generatedAt },
+    delivery: { appliedSequence: 12, pendingChanges: 0, pendingActivations: 0, current: null },
+    daily: { queuedDays: 0, oldestQueuedDay: null, newestQueuedDay: null, lastReleasedAt: null, releasedLastHour: 0 },
+    canonical: await fixture("admin-maintained-pipeline-valid.json") };
+  let missing = false, failed = false;
+  await withAdminPage(async (path, init) => {
+    if (path !== ADMIN_READ_PATHS[3] || init?.method === "POST") return healthyAdminRead(path, overview);
+    if (failed) return unavailableResponse();
+    const value = structuredClone(graph);
+    if (missing) { value.pipeline.canonical.queues = null; value.pipeline.canonical.runtime = null;
+      value.pipeline.canonical.stores.cache = null; value.pipeline.canonical.publications.cache = null; }
+    return response(value);
+  }, async documentRef => {
+    const stages = documentRef.byId.get("pipeline-stages");
+    await waitFor(() => stages.children.length === 7);
+    assert.equal(documentRef.byId.get("pipeline-badge").textContent, "Refused work needs attention");
+    assert.match(allText(stages.children[2]), /Query budget reached: 2 jobs/u);
+    assert.match(allText(stages.children[2]), /Dec 30, 2025 – Oct 1, 2026/u);
+    assert.match(allText(stages.children[4]), /Evidence refused: 1 job/u);
+    assert.match(allText(stages.children[5]), /426 selected input events · 422 consecutive-event pairs/u);
+    assert.match(allText(stages.children[6]), /publish independently/u);
+    assert.match(allText(stages.children[6]), /Live serving eligibility is not checked/u);
+    assert.match(allText(documentRef.byId.get("pipeline-runtime")), /do not verify the currently deployed configuration/u);
+    assert.match(allText(documentRef.byId.get("pipeline-runtime")), /publication: controls not reported/u);
+    const preparationDetail = stages.children[2].querySelector("details");
+    preparationDetail.open = true;
+    preparationDetail.querySelector("summary").focus();
+    failed = true;
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await waitFor(() => documentRef.byId.get("pipeline-badge").textContent.startsWith("Stale"));
+    assert.equal(stages.children[2].querySelector("details").open, true);
+    assert.equal(documentRef.activeElement, stages.children[2].querySelector("summary"));
+    assert.match(allText(stages.children[5]), /Public cache output: 1 stored snapshot/u);
+    failed = false; missing = true;
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await waitFor(() => documentRef.byId.get("pipeline-badge").textContent === "Queue metadata unavailable");
+    assert.match(allText(stages.children[5]), /Queue not reported.*inventory unavailable.*public metadata not reported/u);
+    assert.doesNotMatch(allText(stages.children[5]), /0 queued|Caught up|Up to date/u);
   });
 });

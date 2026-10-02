@@ -7,6 +7,7 @@ import { ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS } from './admin-community-allowa
 import { COMMUNITY_MODEL_REFUSAL_REASONS } from './community-allowance';
 import type { StorageAnalyticsBindings } from './analytics-delivery';
 import { ApiError } from './errors';
+import { readAdminMaintainedPipeline, type AdminMaintainedPipeline } from './storage-analytics-admin-progress';
 import { validStorageModelPublication, type StorageModelPublicationValue } from './storage-community-publication-value';
 import { STORAGE_DAILY_PENDING_DAYS_SQL } from './storage-community-daily-pending';
 
@@ -63,7 +64,17 @@ export interface StorageCommunityProgressGraph {
 }
 /** Where analytics processing stands between an upload and a publication.
  * Counts, UTC days and instants only: no digest, owner or content crosses. */
+export interface StoragePipelineMaintainedJobs {
+ featureDays: { building: number; complete: number; refused: number;
+  updatedLastHour: number; latestUpdatedAt: string | null } | null;
+ modelDateBatches: { pending: number; complete: number;
+  updatedLastHour: number; latestUpdatedAt: string | null } | null;
+}
 export interface StoragePipelineProgress {
+ canonical?: AdminMaintainedPipeline;
+ /** Retained job metadata, not a current dependency census or reuse forecast.
+  * A missing migration or unreadable lane stays null independently. */
+ maintained?: StoragePipelineMaintainedJobs;
  /** The ingestion journal every accepted change is written to. */
  ingestion: { journalHead: number; latestRecordedAt: string | null };
  /** Ordered delivery of journal changes into analytics. A device activation
@@ -122,6 +133,35 @@ function bounded(total: number): number {
 const inclusiveDays = (from: string, through: string): number =>
  Math.round((Date.parse(`${through}T00:00:00.000Z`) - Date.parse(`${from}T00:00:00.000Z`)) / DAY_MS) + 1;
 
+/** Head metadata only; no payload, identity, dependency or source row leaves
+ * these aggregates. Capped totals remain unknown rather than lower counts. */
+async function readMaintainedJobs(bindings: StorageAnalyticsBindings, nowMs: number): Promise<StoragePipelineMaintainedJobs> {
+ async function lane(table: 'analytics_shared_feature_days' | 'analytics_model_blocks', states: readonly string[]) {
+  try {
+   const row = await bindings.target.prepare(`SELECT COUNT(*) AS total,
+    ${states.map(state => `COALESCE(SUM(CASE WHEN state='${state}' THEN 1 ELSE 0 END),0) AS ${state}`).join(',')},
+    COALESCE(SUM(CASE WHEN updated_ms>=? THEN 1 ELSE 0 END),0) AS recent,
+    MAX(updated_ms) AS latest FROM (SELECT state,updated_ms FROM ${table}
+     WHERE source_id=? AND source_namespace=? LIMIT ?)`)
+    .bind(nowMs - HOUR_MS, bindings.sourceId, bindings.sourceNamespace, MAX_ADMIN_AGGREGATE_ROWS + 1)
+    .first<Record<string, unknown>>();
+   if (!row || count(row.total) > MAX_ADMIN_AGGREGATE_ROWS) return null;
+   const values = Object.fromEntries(states.map(state => [state, count(row[state])]));
+   if (Object.values(values).reduce((a,b) => a+b,0) !== count(row.total)
+     || count(row.recent) > count(row.total)
+     || (count(row.total) === 0) !== (row.latest === null)) return null;
+   return { ...values, updatedLastHour: count(row.recent),
+    latestUpdatedAt: row.latest === null ? null : instant(row.latest) };
+  } catch { return null; }
+ }
+ const [featureDays, modelDateBatches] = await Promise.all([
+  lane('analytics_shared_feature_days', ['building','complete','refused']),
+  lane('analytics_model_blocks', ['pending','complete']),
+ ]);
+ return { featureDays: featureDays as StoragePipelineMaintainedJobs['featureDays'],
+  modelDateBatches: modelDateBatches as StoragePipelineMaintainedJobs['modelDateBatches'] };
+}
+
 /** Read separately from the graph census and never allowed to take it down:
  * a failure here reports the pipeline as unavailable, not the whole panel. */
 export async function readStoragePipelineProgress(bindings: StorageAnalyticsBindings,
@@ -168,6 +208,8 @@ export async function readStoragePipelineProgress(bindings: StorageAnalyticsBind
   const publishedRow = published!.results[0] as { last: string | null; last_hour: number } | undefined;
   const queuedDays = count(queueRow?.days ?? 0);
   return {
+   maintained: await readMaintainedJobs(bindings, nowMs),
+   canonical: await readAdminMaintainedPipeline(bindings, nowMs),
    ingestion: { journalHead, latestRecordedAt: headRow ? instant(headRow.recorded_ms) : null },
    delivery: { appliedSequence, pendingChanges, pendingActivations, current },
    daily: {

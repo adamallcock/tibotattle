@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { cpSync, mkdirSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { mkdtemp, readFile } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { TYPED_SCHEMA_INPUT_DIRECTORIES, WRANGLER_MIGRATION_LEDGER_SCHEMA } from './production-typed-schema.mjs';
@@ -22,6 +22,24 @@ import { DIRECT_OCCURRENCE_FORWARD_SCHEMA, DIRECT_OCCURRENCE_FORWARD_PREVIOUS, D
   verifyExistingRoleForwardReceipt } from './existing-role-forward-migration.mjs';
 
 const sourceWorker=resolve(dirname(fileURLToPath(import.meta.url)),'..');
+// These operator tests qualify their historical predecessor. The independent
+// maintained candidate has eighteen forward inputs outside both old profiles.
+const maintainedSuffixInputs=new Set([
+  ...['0014_effective_dependency_mutations.sql','0015_effective_selective_dependencies.sql',
+    '0016_terminal_replay_coverage.sql'].map(name=>join('ingestion-isolation-migrations',name)),
+  ...['0034_shared_preparation_work.sql','0035_effective_dependency_summaries.sql',
+    '0036_canonical_analytics_facts.sql','0037_canonical_feature_contributions.sql',
+    '0038_analytics_partition_work.sql','0039_canonical_rolling_inputs.sql',
+    '0040_canonical_cache_pairs.sql','0041_canonical_publication_closure.sql',
+    '0042_terminal_replay_coverage.sql','0043_analytics_work_capacity.sql',
+    '0044_canonical_quota_identity.sql','0045_maintained_output_work.sql',
+    '0046_source_empty_outcomes.sql','0047_analytics_cleanup_cadence.sql','0048_canonical_cache_prepared_receipts.sql']
+    .map(name=>join('analytics-migrations',name)),
+]);
+function copyPredecessorFolder(folder,worker){
+  cpSync(join(sourceWorker,folder),join(worker,folder),{recursive:true,
+    filter:path=>!maintainedSuffixInputs.has(relative(sourceWorker,path))});
+}
 const sha='a'.repeat(64),account='a'.repeat(32);
 const ids=['11111111-1111-4111-8111-111111111111','22222222-2222-4222-8222-222222222222'];
 const controls={collection:{schema_version:'collection-controls-v0.1',control_state:'operational',revision:9,
@@ -37,7 +55,7 @@ async function fixture(){
     for(const folder of ['src','scripts','migrations','typed-ingestion-migrations','ingestion-bridge-migrations',
       'typed-v11-admission-migrations','typed-v1-admission-migrations','ingestion-isolation-migrations',
       'analytics-migrations','deletion-ledger-migrations'])
-      cpSync(join(sourceWorker,folder),join(worker,folder),{recursive:true});
+      copyPredecessorFolder(folder,worker);
     cpSync(join(sourceWorker,'package.json'),join(worker,'package.json'));
     symlinkSync(join(sourceWorker,'node_modules'),join(worker,'node_modules'));
     writeFileSync(join(root,'.gitignore'),'apps/worker/node_modules\n');
@@ -52,6 +70,17 @@ async function fixture(){
   })();
   return fixturePromise;
 }
+test('historical fixtures exclude exactly the maintained suffix and retain the old schema pins',async()=>{
+  const f=await fixture();
+  assert.equal(maintainedSuffixInputs.size,18);
+  for(const path of maintainedSuffixInputs)assert.equal(existsSync(join(f.worker,path)),false);
+  assert.deepEqual(f.expected.migrationCounts,{primary:92,analytics:32,ledger:3});
+  const direct=await directFixture();
+  assert.deepEqual(direct.expected.migrationCounts,{primary:91,analytics:32,ledger:3});
+  assert.equal(direct.expected.expectedSchemas.primary.schemaSha256,
+    '51d131e2215bcd99db0a79698c4195d06be40a3c091199674f45ed74f4e3c039');
+});
+
 function scheduledRaw(name,version){return {accountId:account,workerName:name,version:{id:version,
   resources:{script_runtime:{compatibility_date:'2026-09-29'},bindings:[
     {type:'plain_text',name:'DEPLOYMENT_SOURCE_COMMIT',text:EXISTING_ROLE_FORWARD_PREVIOUS_SCHEDULED},
@@ -195,7 +224,7 @@ test('closed file pin rejects missing, extra, changed-column and wrong-table SQL
   const worker=join(root,'apps','worker');mkdirSync(worker,{recursive:true});
   try{
     for(const folder of ['typed-ingestion-migrations','analytics-migrations'])
-      cpSync(join(sourceWorker,folder),join(worker,folder),{recursive:true});
+      copyPredecessorFolder(folder,worker);
     cpSync(join(sourceWorker,'package.json'),join(worker,'package.json'));
     symlinkSync(join(sourceWorker,'node_modules'),join(worker,'node_modules'));
     const path=join(worker,'typed-ingestion-migrations','0005_owner_occurrence_lookup.sql');

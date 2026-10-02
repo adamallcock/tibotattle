@@ -1524,7 +1524,7 @@ describe.each([false, true])("bounded shared effective day dependencies (direct=
       b.TEST_INGESTION_BRIDGE_MIGRATIONS, b.TEST_TYPED_V1_ADMISSION_MIGRATIONS,
       b.TEST_TYPED_V11_ADMISSION_MIGRATIONS]) await applyD1Migrations(db(), migrations);
     await applyD1Migrations(db(), b.TEST_INGESTION_ISOLATION_MIGRATIONS
-      .filter(migration => !/^(0008|0010|0011|0012|0013)_/u.test(migration.name)));
+      .filter(migration => !/^(0008|0010|0011|0012|0013|0014|0015)_/u.test(migration.name)));
     const selectedDay = day();
     const observed = observeDependencyQueries(db());
     const reader = await createEffectiveHistoryDayDependencyReader(observed.database, emptyDependencyOwner,
@@ -2178,3 +2178,125 @@ describe.each([false, true])("effective quota preparation source fences (direct=
       expect(measured.meter.remainingQueries).toBeGreaterThanOrEqual(120);
     }, 60_000);
 });
+
+import {type TelemetryV11Record,type TelemetryV11Stream} from '@app-usagemonitor/telemetry-contract';
+
+function inventoryStreamRecords(selectedDay:string,tag:string):Record<TelemetryV11Stream,TelemetryV11Record[]>{
+  return {
+    usage:[v11UsageRecord(selectedDay,'a',{eventId:`synthetic:inventory-family:${tag}:usage`})],
+    quota:[{schemaVersion:'quota-observation-v1.1',observationId:`synthetic:inventory-family:${tag}:quota`,
+      observedTime:`${selectedDay}T12:00:00.000Z`,provider:'openai_codex',planType:'pro',planVariant:'unknown',
+      limitId:'codex',slot:'seven_day',usedPercent:20,windowDurationMinutes:10080,resetsAt:`${selectedDay}T23:00:00.000Z`,
+      accountPlanAttribution:{accountBasis:'unavailable',accountTrackId:null,planBasis:'same_source_occurrence',
+        planType:'pro',planEraId:null}}],
+    session:[{schemaVersion:'session-dimension-v1.1',sessionUuid:`synthetic:inventory-family:${tag}:session`,
+      firstEventTime:`${selectedDay}T12:00:00.000Z`,provider:'openai_codex',toolClassCounts:{shell:1}}],
+  };
+}
+
+async function insertInventoryV1Stream(fixture:Fixture,selectedDay:string,stream:TelemetryV11Stream,records:TelemetryV11Record[]){
+  const projected=records.map(record=>{
+    const projection=telemetryV11LegacyProjection(stream,record);
+    if(!projection)throw new Error('synthetic inventory v1 projection missing');
+    return JSON.parse(projection.canonicalRecord);
+  });
+  const envelopeDigest=await sha256Hex(`synthetic-inventory-family:${crypto.randomUUID()}`);
+  const principal=await authenticateDevice(db(),fixture.authorization);
+  const upload=await createDeviceUploadAuthorization(db(),principal,envelopeDigest,1000);
+  const claimed=await claimDeviceUploadAuthorization(db(),`Upload ${upload.uploadAuthorization}`,
+    {envelopeDigest,bodyBytes:1000,contentType:'application/json'});
+  const chunk=parseTelemetryV1Chunk({schemaVersion:'telemetry-contribution-v1.0',
+    chunkId:`${stream}:${selectedDay}:0`,chunkRevision:1,chunkDigest:await sha256Hex(canonicalJson(projected)),
+    parserVersion:'synthetic-inventory-family',consent:{telemetrySchemaVersion:'telemetry-contribution-v1.0',
+      fieldDictionaryVersion:'telemetry-v1.0-registry-2026-08-07.1',privacyContractVersion:'ongoing-privacy-safe-telemetry-v1.0'},
+    records:projected});
+  await insertTypedTelemetryV1Chunk(db(),{chunkRowId:`chunk:${crypto.randomUUID()}`,participantId:fixture.participantId,
+    deviceId:fixture.deviceId,chunk,envelopeDigest,r2Key:`synthetic/inventory-family/${crypto.randomUUID()}`,
+    deviceUploadAuthorizationId:claimed.authorizationId,createdAt:new Date().toISOString(),supersedes:null},namespace);
+}
+
+for(const family of ['v1','v11','v12'] as const){
+  it(`keeps exact native inventory for every stream across ${family} versions, foreign owners and retained sources`,async()=>{
+    const first=day(),gap=dayAfter(first),last=dayAfter(gap),outside=dayAfter(last);
+    const selected=await createV11DeviceFixture(db(),{grant:family==='v11'});
+    const foreign=await createV11DeviceFixture(db(),{grant:family==='v11'});
+    const chosenDays=[first,last],stagedV11:Staged[]=[],stagedV12:V12Uploaded[]=[];
+    if(family==='v12'){
+      // Establish both owners through genuine accepted legacy admission. The
+      // bootstrap rows are outside the tested interval; no owner rows are seeded.
+      await insertV1HistoryDay(selected,outside,1,null,'synthetic:inventory-v12-owner');
+      await insertV1HistoryDay(foreign,outside,1,null,'synthetic:inventory-v12-foreign-owner');
+      await db().prepare("UPDATE telemetry_v12_runtime SET state='active' WHERE id=1").run();
+      for(const fixture of [selected,foreign])await grantTelemetryV12Consent(db(),fixture,telemetryV12RequiredConsent());
+    }
+    const asV12=(selectedDay:string,tag:string):TelemetryV12Record[]=>{
+      const records=inventoryStreamRecords(selectedDay,tag);
+      const quota=records.quota[0]!,session=records.session[0]!;
+      if(quota.schemaVersion!=='quota-observation-v1.1'||session.schemaVersion!=='session-dimension-v1.1')
+        throw new Error('synthetic inventory stream mismatch');
+      return [v12UsageRecord(selectedDay,`synthetic:inventory-family:${tag}:usage`),
+        {...quota,schemaVersion:'quota-observation-v1.2'},
+        {...session,schemaVersion:'session-dimension-v1.2'}];
+    };
+    for(const selectedDay of chosenDays){
+      const records=inventoryStreamRecords(selectedDay,`${family}:${selectedDay}`);
+      if(family==='v1')for(const stream of ['usage','quota','session'] as const)
+        await insertInventoryV1Stream(selected,selectedDay,stream,records[stream]);
+      if(family==='v11')stagedV11.push(await stage(selected,await makeV11Day(selectedDay,records)));
+      if(family==='v12')stagedV12.push(await stageV12Day(selected,selectedDay,asV12(selectedDay,`${family}:${selectedDay}`)));
+    }
+    // Native domains are complete calendars, including genuinely empty days.
+    // An accepted empty manifest must still not become positive row inventory.
+    if(family==='v11')stagedV11.push(await stage(selected,await makeV11Day(gap,{})));
+    if(family==='v12')stagedV12.push(await stageV12Day(selected,gap,[]));
+    if(family==='v11')await activate(selected,stagedV11);
+    if(family==='v12')await activateV12(selected,stagedV12);
+    const foreignRecords=inventoryStreamRecords(gap,`${family}:foreign`);
+    if(family==='v1')for(const stream of ['usage','quota','session'] as const)
+      await insertInventoryV1Stream(foreign,gap,stream,foreignRecords[stream]);
+    if(family==='v11')await activate(foreign,[
+      // A fresh native predecessor includes today's day even with no source
+      // rows. Preserve that required extent with a genuinely empty manifest.
+      await stage(foreign,await makeV11Day(first,{})),
+      await stage(foreign,await makeV11Day(gap,foreignRecords)),
+    ]);
+    if(family==='v12')await activateV12(foreign,[await stageV12Day(foreign,gap,asV12(gap,`${family}:foreign`))]);
+    const check=async()=>{
+      const owner=(await readStorageCommunityOwnerPage(db())).find(value=>value.participantId===selected.participantId)!;
+      expect(owner.ownerDigest).toBeTruthy();
+      for(const stream of ['usage','quota','session'] as const){
+        const scope={sourceNamespace:namespace,ownerDigest:owner.ownerDigest!,ownerRevision:owner.ownerRevision,
+          authorityEpoch:owner.authorityEpoch,stream,fromDay:first,throughDay:last};
+        expect(await readEffectiveTelemetryOwnerDays(db(),scope)).toEqual(chosenDays);
+        expect(await readEffectiveTelemetryOwnerDays(db(),{...scope,fromDay:gap,throughDay:gap})).toEqual([]);
+      }
+    };
+    await check();
+    if(family==='v1'){
+      await db().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+      const previous=await currentTelemetryV1Chunk(db(),selected.participantId,selected.deviceId,'usage',first,0);
+      expect(previous).not.toBeNull();
+      await insertV1HistoryDay(selected,first,2,previous,'synthetic:inventory-family:retained-replacement');
+      expect(await db().prepare('SELECT count(*) n FROM telemetry_usage_correction_history').first<number>('n')).toBe(1);
+      await check();
+    }
+    if(family==='v11'){
+      const records=inventoryStreamRecords(first,`${family}:${first}`);
+      records.usage.push(v11UsageRecord(first,'b',{eventId:'synthetic:inventory-family:retained-extra'}));
+      const replacement=await stage(selected,await makeV11Day(first,records));
+      await activate(selected,[replacement,stagedV11[1]!,stagedV11[2]!]);
+      expect(await db().prepare('SELECT count(*) n FROM storage_v11_event_sources WHERE participant_id=?')
+        .bind(selected.participantId).first<number>('n')).toBe(2);
+      await check();
+    }
+    if(family==='v12'){
+      const records=asV12(first,`${family}:${first}`);
+      records.push(v12UsageRecord(first,'synthetic:inventory-family:retained-extra'));
+      const replacement=await stageV12Day(selected,first,records);
+      await activateV12(selected,[replacement,stagedV12[1]!,stagedV12[2]!]);
+      expect(await db().prepare('SELECT count(*) n FROM storage_v12_event_sources WHERE participant_id=?')
+        .bind(selected.participantId).first<number>('n')).toBe(2);
+      await check();
+    }
+  },90_000);
+}

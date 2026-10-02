@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readFile } from 'node:fs/promises';
 import { storageSchemaDigest } from './d1-storage-plan.mjs';
 import {
   TYPED_PRODUCTION_QUERIES,
@@ -259,12 +260,15 @@ test('canonical expected schemas are generated from local migration inputs only'
   for (const role of ['primary', 'analytics', 'ledger']) {
     assert.ok(/^[a-f0-9]{64}$/.test(generated.expectedSchemas[role].schemaSha256));
     assert.ok(generated.expectedSchemas[role].requiredObjects.length > 0);
-    assert.equal(generated.migrationCounts[role], TYPED_SCHEMA_INPUT_DIRECTORIES[role].reduce((count, directory) => count + (directory === 'migrations' ? 62 : directory === 'typed-ingestion-migrations' ? 6 : directory === 'ingestion-bridge-migrations' ? 2 : directory === 'typed-v11-admission-migrations' ? 6 : directory === 'typed-v1-admission-migrations' ? 3 : directory === 'ingestion-isolation-migrations' ? 13 : directory === 'analytics-migrations' ? 32 : 3), 0));
+    assert.equal(generated.migrationCounts[role], TYPED_SCHEMA_INPUT_DIRECTORIES[role].reduce((count, directory) => count + (directory === 'migrations' ? 62 : directory === 'typed-ingestion-migrations' ? 6 : directory === 'ingestion-bridge-migrations' ? 2 : directory === 'typed-v11-admission-migrations' ? 6 : directory === 'typed-v1-admission-migrations' ? 3 : directory === 'ingestion-isolation-migrations' ? 16 : directory === 'analytics-migrations' ? 47 : 3), 0));
   }
   for (const name of ['typed_telemetry_device_owner', 'typed_telemetry_manifest_owner']) {
     assert.ok(generated.expectedSchemas.primary.requiredObjects.some(object => object.type === 'index' && object.name === name));
   }
   assert.ok(generated.expectedSchemas.primary.requiredObjects.some(object => object.type === 'index' && object.name === 'typed_telemetry_owner_occurrence'));
+  assert.ok(generated.expectedSchemas.primary.requiredObjects.some(object =>
+    object.type === 'index' && object.name === 'storage_ingestion_terminal_epoch'
+    && object.tbl_name === 'storage_ingestion_changes'));
   for (const name of ['storage_effective_source_days', 'storage_effective_source_days_runtime']) {
     assert.ok(generated.expectedSchemas.primary.requiredObjects.some(object => object.type === 'table' && object.name === name));
   }
@@ -272,6 +276,29 @@ test('canonical expected schemas are generated from local migration inputs only'
     object.type === 'trigger' && object.name.startsWith('storage_effective_days_')).length, 12);
 
   assert.ok(generated.expectedSchemas.analytics.requiredObjects.some(object => object.type === 'table' && object.name === 'analytics_cache_retention_owner_cursor'));
+  assert.ok(generated.expectedSchemas.analytics.requiredObjects.some(object =>
+    object.type === 'table' && object.name === 'analytics_cache_retention_date_cursor'));
+  for (const [name, table] of [
+    ['insert', 'analytics_cache_retention_date_cursor'],
+    ['update', 'analytics_cache_retention_date_cursor'],
+    ['owner_terminal', 'analytics_owner_state'],
+    ['erasure', 'analytics_storage_erasure_fences'],
+    ['erasure_replay', 'analytics_storage_erasure_fences'],
+    ['owner_delete', 'analytics_owner_state'],
+  ]) assert.ok(generated.expectedSchemas.analytics.requiredObjects.some(object =>
+    object.type === 'trigger' && object.name === 'analytics_cache_retention_date_cursor_' + name
+    && object.tbl_name === table));
+  assert.ok(generated.expectedSchemas.analytics.requiredObjects.some(object =>
+    object.type === 'table' && object.name === 'analytics_community_daily_owner_cursor'));
+  const preparationMigration = await readFile(join(workerDirectory, 'analytics-migrations/0034_shared_preparation_work.sql'), 'utf8');
+  assert.match(preparationMigration, /CREATE TABLE analytics_community_daily_owner_cursor \(\s*cursor_id INTEGER PRIMARY KEY AUTOINCREMENT,/u);
+  assert.match(preparationMigration, /CREATE TABLE analytics_cache_retention_date_cursor \(\s*cursor_id INTEGER PRIMARY KEY AUTOINCREMENT,/u);
+  assert.ok(generated.expectedSchemas.analytics.requiredObjects.some(object =>
+    object.type === 'trigger' && object.name === 'analytics_community_daily_owner_cursor_update'
+    && object.tbl_name === 'analytics_community_daily_owner_cursor'));
+  assert.ok(generated.expectedSchemas.analytics.requiredObjects.some(object =>
+    object.type === 'trigger' && object.name === 'analytics_shared_feature_release_v1'
+    && object.tbl_name === 'analytics_shared_feature_days'));
   assert.equal(generated.expectedSchemas.primary.optionalObjects.length, 17);
   assert.equal(generated.expectedSchemas.primary.restoredSchemaSha256.length, 3);
   assert.deepEqual(validateTypedProductionConfiguration({ roles, expectedSchemas: generated.expectedSchemas, config }), { ok: true, code: null });

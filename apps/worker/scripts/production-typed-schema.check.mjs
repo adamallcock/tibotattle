@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { copyFile, link, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { copyFile, cp, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -171,9 +171,36 @@ test('restore transformation changes are bound into the operation source identit
 });
 
 
-test('index-only rollout omits exactly the reviewed day catalog and preserves all three role contracts',async()=>{
-  const generated=await buildTypedProductionExpectedSchemas({workerDirectory:actualWorker,rolloutProfile:'direct-occurrence-index-only-v1'});
-  const canonical=await buildTypedProductionExpectedSchemas({workerDirectory:actualWorker});
+async function predecessorWorker(t) {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'typed-schema-predecessor-')));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await copyFile(join(actualWorker, 'package.json'), join(root, 'package.json'));
+  await symlink(await realpath(join(actualWorker, 'node_modules')), join(root, 'node_modules'), 'dir');
+  await cp(join(actualWorker, 'src'), join(root, 'src'), { recursive: true });
+  await mkdir(join(root, 'scripts'));
+  await copyFile(join(actualWorker, 'scripts', 'd1-storage-migration-worker.mjs'), join(root, 'scripts', 'd1-storage-migration-worker.mjs'));
+  for (const directory of new Set(Object.values(TYPED_SCHEMA_INPUT_DIRECTORIES).flat())) {
+    await mkdir(join(root, directory));
+    for (const name of (await readdir(join(actualWorker, directory))).filter(name => name.endsWith('.sql'))) {
+      // Qualify the actual predecessor, before the independent maintained suffix.
+      if ((directory === 'ingestion-isolation-migrations' && Number.parseInt(name, 10) > 13)
+          || (directory === 'analytics-migrations' && Number.parseInt(name, 10) > 33)) continue;
+      await copyFile(join(actualWorker, directory, name), join(root, directory, name));
+    }
+  }
+  return root;
+}
+
+test('latest canonical schema includes all maintained migrations through the exact source exception', async () => {
+  const generated = await buildTypedProductionExpectedSchemas({ workerDirectory: actualWorker });
+  assert.deepEqual(generated.migrationCounts, { primary: 95, analytics: 46, ledger: 3 });
+  assert.ok(generated.expectedSchemas.primary.requiredObjects.some(row => row.type === 'table' && row.name === 'storage_effective_selective_runtime'));
+});
+
+test('index-only rollout omits exactly the reviewed day catalog and preserves all three role contracts',async t=>{
+  const workerDirectory=await predecessorWorker(t);
+  const generated=await buildTypedProductionExpectedSchemas({workerDirectory,rolloutProfile:'direct-occurrence-index-only-v1'});
+  const canonical=await buildTypedProductionExpectedSchemas({workerDirectory});
   assert.equal(generated.migrationCounts.primary,91);assert.equal(canonical.migrationCounts.primary,92);
   assert.equal(generated.expectedSchemas.primary.schemaSha256,'51d131e2215bcd99db0a79698c4195d06be40a3c091199674f45ed74f4e3c039');
   assert.equal(generated.expectedSchemas.primary.restoredSchemaSha256.length,3);

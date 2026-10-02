@@ -1,6 +1,8 @@
-import { captureSelectedStorageGraphScope,captureStorageGraphScope,computeStorageGraphResult,
+import {createCanonicalSharedFeaturePreparation} from './storage-analytics-canonical-day';
+import { captureSelectedStorageGraphScope,captureStorageGraphScope,computeStorageGraphResult,reuseStorageGraphResult,
  STORAGE_GRAPH_METHOD,storageGraphV11CheckpointMethod,
  type StorageGraphScope } from './storage-community-graph';
+import {readEffectiveDependencySourceFence} from './storage-effective-selective-dependencies';
 import { STORAGE_V11_PREPARED_FOLD } from './storage-v11-history';
 /** The same rule the write site uses, so the durable envelope names the key
  * work is actually staged under rather than the namespace they were split
@@ -11,7 +13,7 @@ import { STORAGE_V11_PREPARED_FOLD } from './storage-v11-history';
  * in, not a module default the deployment has overridden. */
 const v11CheckpointMethod=(metric:'fits'|'model',preparedFold?:boolean):string=>
  storageGraphV11CheckpointMethod(metric,preparedFold??STORAGE_V11_PREPARED_FOLD);
-import { readStorageCommunityOwnerPage, captureStorageCommunityAuthority, readStorageCommunityCorrectionState,
+import { readStorageCommunityOwner,readStorageCommunityOwnerPage, captureStorageCommunityAuthority, readStorageCommunityCorrectionState,
  readStorageCommunityDeliveredTerminalEpoch, readStorageCommunitySourceTerminalEpoch,
  type StorageCommunityOwner } from './storage-community-authority';
 import { ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS } from './admin-community-allowance';
@@ -31,6 +33,7 @@ import {claimStorageGraphWorkSelection,completeStorageGraphWorkSelection,discard
  from './storage-community-graph-selection';
 
 const fail=()=>new Error('STORAGE_GRAPH_WORK_UNAVAILABLE');
+class FastReuseChanged extends Error {}
 const CURRENT_FIT_CACHE_PAGE=64;
 const SCOPE_RETRY_HEADROOM_MS=4_000;
 // Covers a claim, bounded scope recapture and release; after recapture the
@@ -168,7 +171,11 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
   /** Local qualification seam for complete historical model blocks. The
    * ordinary scheduler leaves this off until the integrated path is measured. */
   modelBlocks?:boolean;
-  sharedFeatures?:boolean;
+  sharedFeatures?:boolean;canonicalPipeline?:boolean;
+  /** Durable P8 scope/date request; the native claim and computation remain authoritative. */
+  request?:{readonly ownerDigest:string;readonly day:string;readonly metric:'fits'|'model'};
+  /** Queue demand proof, checked again by each result commit. */
+  assertCurrent?:()=>Promise<void>;
 }):Promise<StorageGraphWorkProgress> {
  const nowMs=options.nowMs??Date.now();
  if(!Number.isFinite(nowMs))throw fail();
@@ -179,6 +186,18 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
  if((options.remainingQueries??900)<admissionQueries || Date.now()>=(options.deadlineMs??Date.now()+20_000)) {
   return {state:'deferred',reason:'budget'};
  }
+ await options.assertCurrent?.();
+ const today=new Date(nowMs).toISOString().slice(0,10);
+ let owner:StorageCommunityOwner,metric:'fits'|'model',day:string|null;
+ if(options.request){
+  const request=options.request;
+  if(!/^[a-f0-9]{64}$/u.test(request.ownerDigest)||!/^\d{4}-\d{2}-\d{2}$/u.test(request.day)
+   ||new Date(request.day+'T00:00:00.000Z').toISOString().slice(0,10)!==request.day
+   ||!['fits','model'].includes(request.metric)||request.metric==='fits'&&request.day!==today)throw fail();
+  const fresh=await readStorageCommunityOwner(options.source,{ownerDigest:request.ownerDigest});
+  if(!fresh)return {state:'deferred',reason:'owner_unavailable',metric:request.metric,day:request.day};
+  owner=fresh;metric=request.metric;day=request.day;
+ }else{
  const owners:StorageCommunityOwner[]=[];let after='',bytes=0;
  for(let page=0;;page++) {
   if(page>=COMMUNITY_MODEL_CACHE_MAX_PAGES)return {state:'deferred',reason:'cohort_capacity'};
@@ -204,9 +223,8 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
  let current=scan.tick===0;
  let position=current?scan.current_position%(owners.length*2)
   :scan.history_position%owners.length;
- const today=new Date(nowMs).toISOString().slice(0,10);
  if(current&&position%2===0)position=await nextMissingCurrentFitPosition(options.target,options.sourceId,owners,position,today,correctionState);
- let day:string|null=today;
+ day=today;
  if(!current) {
   const authority=await captureStorageCommunityAuthority(options.source,options);
   if(authority.usageCorrectionState!==correctionState)return {state:'deferred',reason:'source_changed'};
@@ -230,13 +248,14 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
   }
  }
  if(!current&&day!==null)position=await nextMissingHistoricalModelPosition(options.target,options.sourceId,owners,position,day,correctionState);
- const owner=owners[current?Math.floor(position/2):position%owners.length]!;
- const metric=current&&position%2===0?'fits':'model';
+ owner=owners[current?Math.floor(position/2):position%owners.length]!;
+ metric=current&&position%2===0?'fits':'model';
  const claimed=await options.target.prepare(`UPDATE analytics_community_graph_scan SET revision=revision+1,
   tick=(tick+1)%3,current_position=?,history_position=?,updated_ms=? WHERE source_id=? AND revision=?`)
   .bind(current?position+1:scan.current_position,current?scan.history_position:position+1,nowMs,options.sourceId,scan.revision).run();
  if(claimed.meta.changes!==1)return {state:'deferred',reason:'claim_changed'};
  if(day===null)return {state:'idle'};
+ }
  if(!owner.ownerDigest)return {state:'deferred',metric,day,reason:'source_bootstrap_pending'};
  const capture=()=>withStorageGraphFailureStage('graph_scope',()=>captureStorageGraphScope(options.source,{owner,day,metric,
   sourceId:options.sourceId,sourceNamespace:options.sourceNamespace,
@@ -296,6 +315,56 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
      fixedNow:scope.fixedNow,dependencyDigest:scope.dependencyDigest,
      checkpointDependencyDigest:scope.checkpointDependencyDigest,checkpointMethod:checkpointKey.method,
      checkpointKeyDigest:await storageHistoryKeyDigest(checkpointKey),targetAuthorityEpoch:authorityEpoch,snapshot};
+   }
+   // A complete native head can be reused without opening another durable
+   // selection. This indexed existence read is only a hint: the reviewed
+   // cache reader below still verifies its payload, exact dependency and live
+   // source pin. Pending/claimed selections retain their original lifecycle.
+   const head=await options.target.prepare(`SELECT 1 AS ready FROM analytics_community_graph_results
+    WHERE source_id=? AND owner_digest=? AND metric=? AND day=? AND method=? AND dependency_digest=?`)
+    .bind(options.sourceId,owner.ownerDigest,metric,latest.day,STORAGE_GRAPH_METHOD,latest.dependencyDigest)
+    .first<number>('ready');
+   if(head===1){
+    if((options.remainingQueries??900)<SELECTION_QUERY_RESERVE
+      ||Date.now()>=(options.deadlineMs??Date.now()+20_000))return {state:'deferred',metric,day,reason:'budget'};
+    const fastScope=scope??{...latest,ownerAuthorityEpoch:authorityEpoch};
+    const blockReuse=options.modelBlocks===true&&metric==='model'&&day<today&&latest.source==='effective'
+      &&planHistoricalModelBlockRanges(today).some(range=>range.outputFromDay<=day&&day<=range.outputThroughDay);
+    const targetCurrent=async()=>await options.target.prepare(`SELECT 1 AS ready FROM analytics_owner_state o
+      JOIN analytics_runtime_sources r ON r.source_id=o.source_id AND r.source_namespace=? AND r.contract_version=1
+      WHERE o.source_id=? AND o.owner_digest=? AND o.state='active' AND o.authority_epoch=?
+      AND (?=0 OR o.revision=?)
+      AND NOT EXISTS(SELECT 1 FROM analytics_storage_erasure_fences f
+        WHERE f.source_id=o.source_id AND f.owner_digest=o.owner_digest)`)
+      .bind(options.sourceNamespace,options.sourceId,owner.ownerDigest,authorityEpoch,
+        blockReuse?1:0,owner.ownerRevision).first<number>('ready')===1;
+    // A forced capability refusal cannot fall through to a different writer.
+    const canonicalFence=options.canonicalPipeline===true
+      ?await readEffectiveDependencySourceFence(options.source):undefined;
+    if(options.canonicalPipeline===true&&!canonicalFence)
+      return {state:'deferred',metric,day,reason:'migration_required'};
+    if(!await targetCurrent())return {state:'deferred',metric,day,reason:'source_changed'};
+    const assertFastCurrent=async()=>{
+      await options.assertCurrent?.();
+      if(!await targetCurrent())throw new FastReuseChanged();
+      if(canonicalFence){
+       const fresh=await readEffectiveDependencySourceFence(options.source);
+       if(!fresh||fresh.generation!==canonicalFence.generation
+        ||fresh.capabilityVersion!==canonicalFence.capabilityVersion)throw new FastReuseChanged();
+      }
+    };
+    try {
+     const cached=await reuseStorageGraphResult(options,fastScope,{
+       remainingQueries:()=>options.remainingQueries??900,deadlineMs:options.deadlineMs??Date.now()+20_000,
+       now:Date.now,assertCurrent:assertFastCurrent,
+       preparedFold:options.preparedFold??STORAGE_V11_PREPARED_FOLD,
+       effectiveFormat:options.sharedFeatures===true?6:metric==='model'?5:4});
+     if(cached){
+      await assertFastCurrent();
+      return {state:'reused',metric,day};
+     }
+    }catch(error){if(error instanceof FastReuseChanged)return {state:'deferred',metric,day,reason:'source_changed'};
+     throw error;}
    }
    const ensured=await withStorageGraphFailureStage('graph_scope',()=>ensureStorageGraphWorkSelection({
     source:options.source,target:options.target,envelope,...(existing?{expectedRevision:existing.revision}:{}),nowMs}));
@@ -374,8 +443,11 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
     ()=>advanceStorageModelBlockGraphWork({source:options.source,target:options.target,
      sourceId:options.sourceId,sourceNamespace:options.sourceNamespace,
      scope:selectedScope,nowMs,maxQueries,deadlineMs:options.deadlineMs,
-     ...(options.sharedFeatures===true?{sharedFeatures:true}:{})}));
+     ...(options.sharedFeatures===true?{sharedFeatures:true}:{}),
+     ...(options.assertCurrent?{assertCurrent:options.assertCurrent}:{}),
+     ...(options.canonicalPipeline===true?{canonicalPreparation:createCanonicalSharedFeaturePreparation}:{})}));
    if(block.state!=='unsupported'){
+    if(block.state==='complete')await options.assertCurrent?.();
     if(block.state==='complete'&&selection&&claimToken){
      const finished=await completeStorageGraphWorkSelection({target:options.target,selection,claimToken});
      if(finished.status!=='completed')return {state:'deferred',metric,day,reason:'selection_changed',
@@ -397,6 +469,8 @@ export async function advanceStorageCommunityGraphWork(options:StorageAnalyticsB
    ()=>computeStorageGraphResult(options,selectedScope,{maxQueries:nativeQueries,
     deadlineMs:options.deadlineMs,
     ...(options.sharedFeatures===true?{sharedFeatures:true}:{}),
+    ...(options.assertCurrent?{assertCurrent:options.assertCurrent}:{}),
+    ...(options.canonicalPipeline===true?{canonicalPipeline:true}:{}),
     ...(options.preparedFold!==undefined?{preparedFold:options.preparedFold}:{})}));
   if(result.state==='complete'&&selection&&claimToken){
    const finished=await completeStorageGraphWorkSelection({target:options.target,selection,claimToken});

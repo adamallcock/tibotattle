@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { lstat, readFile, realpath, readdir } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { identityDigest, operationError } from '../../../scripts/lib/release-operation.mjs';
+import { assertMigrationInputPolicy,migrationInputMaximumBytes } from './migration-input-policy.mjs';
 
 export const D1_STORAGE_OPERATING_CAP = 9_000_000_000;
 export const D1_STORAGE_CONFIRMATION = 'EXECUTE_REVIEWED_D1_STORAGE_PLAN';
@@ -184,8 +185,10 @@ export async function loadStorageQualification({ workerRoot, plan, target }) {
       const pinned=inputs.migrations.filter(m=>m.directory===directoryName);
       const actual=(await readdir(join(workerRoot,directoryName))).filter(name=>name.endsWith('.sql')).sort();
       if(JSON.stringify(actual)!==JSON.stringify(pinned.map(m=>m.name)))throw storageError('ROLE_INPUT_CHANGED');
-      for(const input of pinned){if(!/^\d{4}_[a-z0-9_-]+\.sql$/.test(input.name)
-        ||storageSha256(await boundedFile(join(workerRoot,directoryName,input.name),240*1024))!==input.sha256)throw storageError('ROLE_INPUT_CHANGED');}
+      for(const input of pinned){if(!/^\d{4}_[a-z0-9_-]+\.sql$/.test(input.name))throw storageError('ROLE_INPUT_CHANGED');
+        const bytes=await boundedFile(join(workerRoot,directoryName,input.name),migrationInputMaximumBytes(directoryName,input.name));
+        try{assertMigrationInputPolicy({workerDirectory:resolve(workerRoot),directory:directoryName,name:input.name,bytes});}catch{throw storageError('ROLE_INPUT_CHANGED');}
+        if(storageSha256(bytes)!==input.sha256)throw storageError('ROLE_INPUT_CHANGED');}
     }
     const correctionMigrationPinned=inputs.migrations.some(input=>input.directory==='ingestion-isolation-migrations'
       &&input.name==='0006_usage_correction_facts.sql');

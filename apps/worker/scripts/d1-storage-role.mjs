@@ -3,6 +3,7 @@ import { readFile,readdir,lstat,realpath } from 'node:fs/promises';
 import { join,resolve } from 'node:path';
 import { storageError,storageSha256 } from './d1-storage-plan.mjs';
 import { identityDigest } from '../../../scripts/lib/release-operation.mjs';
+import { assertMigrationInputPolicy,migrationInputMaximumBytes } from './migration-input-policy.mjs';
 
 export const INGESTION_ROLE_INPUT_DIRECTORIES=Object.freeze(['migrations','typed-ingestion-migrations',
  'ingestion-bridge-migrations','typed-v11-admission-migrations','typed-v1-admission-migrations','ingestion-isolation-migrations']);
@@ -20,8 +21,9 @@ export async function readIngestionRoleInputs(workerRoot,{allowUnfrozen=false}={
   const names=(await readdir(path)).filter(n=>n.endsWith('.sql')).sort();
   if(!names.length||names.some(n=>!/^\d{4}_[a-z0-9_-]+\.sql$/.test(n)))throw storageError('ROLE_INPUT_UNSAFE');
   for(const name of names){const file=join(path,name),stat=await lstat(file);
-   if(!stat.isFile()||stat.nlink!==1||stat.size>240*1024||await realpath(file)!==file)throw storageError('ROLE_INPUT_UNSAFE');
+   if(!stat.isFile()||stat.nlink!==1||stat.size>migrationInputMaximumBytes(directory,name)||await realpath(file)!==file)throw storageError('ROLE_INPUT_UNSAFE');
    const bytes=await readFile(file);if(bytes.length!==stat.size||bytes.includes(0))throw storageError('ROLE_INPUT_UNSAFE');
+   try{assertMigrationInputPolicy({workerDirectory:workerRoot,directory,name,bytes});}catch{throw storageError('ROLE_INPUT_UNSAFE');}
    migrations.push({directory,name,sha256:storageSha256(bytes),bytes:bytes.length});
   }
  }

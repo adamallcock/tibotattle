@@ -1,3 +1,6 @@
+import type {EffectiveHistoryDependency} from './effective-history-dependency';
+export type {EffectiveHistoryDependency} from './effective-history-dependency';
+import { maintainedEffectiveHistoryDependency,createMaintainedEffectiveHistoryRangeReader, maintainedEffectiveHistoryDayReader } from './storage-effective-dependency-summaries';
 import { canonicalJson } from './canonical-json';
 import { EFFECTIVE_DAY_CATALOG_TABLES, EFFECTIVE_DAY_CATALOG_TRIGGERS, effectiveDayCatalogAvailable,
   effectiveOutsideDayPredicate, EFFECTIVE_DAY_CATALOG_RUNTIME_FENCE } from './storage-effective-dependency-days';
@@ -25,6 +28,12 @@ const MAX_EFFECTIVE_DEPENDENCY_ROWS = 30_000;
 const MAX_EFFECTIVE_DEPENDENCY_BYTES = 4 * 1024 * 1024;
 const EFFECTIVE_DEPENDENCY_BATCH_DAYS = 16;
 const EFFECTIVE_OWNER_OCCURRENCE_INDEX = 'typed_telemetry_owner_occurrence';
+// 0008_telemetry_v12.sql: UNIQUE(chunk_id,occurrence_id). Keep the selected
+// and outside-day record seeks anchored to each proven chunk even when D1 has
+// no sqlite_stat1; the manifest/order index can rescan an entire day per chunk.
+const V12_CHUNK_OCCURRENCE_INDEX = 'sqlite_autoindex_telemetry_v12_records_2';
+// 0008_telemetry_v12.sql: UNIQUE(manifest_id,stream,occurrence_id).
+const V12_MANIFEST_OCCURRENCE_INDEX = 'sqlite_autoindex_telemetry_v12_records_3';
 const V12_DEPENDENCY_TABLES = [
   'telemetry_v12_runtime', 'telemetry_v12_device_capabilities',
   'accountless_v12_device_authorizations', 'telemetry_v12_day_manifests',
@@ -123,22 +132,6 @@ export function validEffectiveUsagePreparation(value:unknown,checkpoint:Pick<Sto
     &&Number.isSafeInteger(after.observedAtMs)&&after.observedAtMs===preparation.day.lastObservedAtMs
     &&typeof after.occurrenceId==='string'&&/^[A-Za-z0-9._:-]{8,128}$/u.test(after.occurrenceId)
     &&preparation.rowsRead>=preparation.day.projection.usage.rowsRead;
-}
-export interface EffectiveHistoryDependency {
-  version: 'effective-history-dependency-v3'; participantId: string; fromDay: string; throughDay: string;
-  /** The correction-aware reader changes source selection at activation even
-   * when no owner revision or historical header changes. */
-  correctionRuntime: 'staged'|'active';
-  /** The retained source streams represented by this identity. Session rows
-   * are opt-in because usage/quota callers must keep their existing key. */
-  streams: readonly ('quota'|'session'|'usage')[];
-  v1: readonly Record<string, unknown>[]; v11: readonly Record<string, unknown>[];
-  v12: readonly Record<string, unknown>[]; corrections: readonly Record<string, unknown>[];
-  /** Immutable header coordinates for selected occurrences whose retained
-   * variant lies outside the requested window. In-window rows are covered by
-   * the family metadata vectors above. Correction rows use a per-day
-   * count/frontier summary rather than one history/fact row per occurrence. */
-  occurrenceLinks: readonly Record<string, unknown>[];
 }
 
 function validDependencyDay(value:string):void {
@@ -250,12 +243,16 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
           AND chunk.chunk_day=manifest.chunk_day AND chunk.stream IN ${sourceStreams}
        WHERE chunk.record_count=(SELECT count(*) FROM telemetry_v12_records complete
           WHERE complete.chunk_id=chunk.id)
-    ),`:' ';
+    ), ${batched?`retained_v12_manifest_streams AS MATERIALIZED (
+      SELECT DISTINCT manifest_id,stream,source_day,manifest_digest
+        FROM retained_v12_chunks
+    ),`:''}`:' ';
   const selectedV12=includeV12?`      UNION
       SELECT ${target('s')}v12_record.occurrence_id
         FROM retained_v12_chunks chunk
         JOIN ${selectionScope} s ON chunk.source_day>=s.from_day AND chunk.source_day<=s.through_day
-        CROSS JOIN telemetry_v12_records v12_record ON v12_record.chunk_id=chunk.id
+        CROSS JOIN telemetry_v12_records v12_record INDEXED BY ${V12_CHUNK_OCCURRENCE_INDEX}
+          ON v12_record.chunk_id=chunk.id
           AND v12_record.manifest_id=chunk.manifest_id AND v12_record.stream=chunk.stream
 ` : '';
   const rows=(await source.prepare(`${batched?'/* batched occurrence links */ ':''}WITH ${useDayCatalog?'requested_scope':'scope'}(owner_digest,participant_id,source_namespace,from_day,through_day,from_ms,through_ms,owner_digest_blob) AS (
@@ -478,20 +475,26 @@ ${selectedV12}    ), /* Count completeness only for selected-day chunks and dist
         FROM linked_v11_headers header JOIN complete_v11_chunks complete_chunk ON complete_chunk.id=header.chunk_id
 ${includeV12?batched?`      UNION
       SELECT DISTINCT wanted.target_day,'v12',chunk.source_day,chunk.id,chunk.manifest_digest
-        FROM retained_v12_chunks chunk
-        JOIN telemetry_v12_records r ON r.chunk_id=chunk.id
-          AND r.manifest_id=chunk.manifest_id AND r.stream=chunk.stream
-        JOIN selected wanted ON wanted.occurrence_id=r.occurrence_id
-       WHERE chunk.source_day<>wanted.target_day
+        FROM selected wanted
+        CROSS JOIN retained_v12_manifest_streams candidate
+        CROSS JOIN telemetry_v12_records r INDEXED BY ${V12_MANIFEST_OCCURRENCE_INDEX}
+          ON r.manifest_id=candidate.manifest_id AND r.stream=candidate.stream
+          AND r.occurrence_id=wanted.occurrence_id
+        CROSS JOIN retained_v12_chunks chunk
+          ON chunk.id=r.chunk_id AND chunk.manifest_id=candidate.manifest_id
+          AND chunk.stream=candidate.stream AND chunk.source_day=candidate.source_day
+          AND chunk.manifest_digest=candidate.manifest_digest
+       WHERE candidate.source_day<>wanted.target_day
 `:`      UNION
       SELECT 'v12',chunk.source_day,chunk.id,chunk.manifest_digest
         FROM retained_v12_chunks chunk
         JOIN scope s
        WHERE (chunk.source_day<s.from_day OR chunk.source_day>s.through_day)
          AND EXISTS (
-           SELECT 1 FROM telemetry_v12_records r
-           JOIN selected wanted ON wanted.occurrence_id=r.occurrence_id
-           WHERE r.chunk_id=chunk.id AND r.manifest_id=chunk.manifest_id AND r.stream=chunk.stream)
+           SELECT 1 FROM selected wanted
+           CROSS JOIN telemetry_v12_records r INDEXED BY ${V12_CHUNK_OCCURRENCE_INDEX}
+             ON r.chunk_id=chunk.id AND r.occurrence_id=wanted.occurrence_id
+             AND r.manifest_id=chunk.manifest_id AND r.stream=chunk.stream)
 `:''}    ), correction_frontiers AS (
       /* Active correction history/facts are append-only. The owner-erasure
        * triggers are the only delete path and the caller's owner CAS fences
@@ -725,12 +728,31 @@ export async function effectiveHistoryDependency(source:D1Database,owner:Storage
   if(!options||typeof options!=='object'||Array.isArray(options))throw fail();
   const includeSessions=options.includeSessions===true;
   if(Object.keys(options).some(key=>key!=='includeSessions'))throw fail();
+  return maintainedEffectiveHistoryDependency(source,owner,sourceNamespace,fromDay,throughDay,includeSessions,
+    ()=>nativeEffectiveHistoryDependency(source,owner,sourceNamespace,fromDay,throughDay,includeSessions));
+}
+async function nativeEffectiveHistoryDependency(source:D1Database,owner:StorageCommunityOwner,
+  sourceNamespace:string,fromDay:string,throughDay:string,includeSessions:boolean):Promise<EffectiveHistoryDependency>{
   const headers=await readEffectiveHistoryHeaders(source,owner,sourceNamespace,fromDay,throughDay,includeSessions);
   if(!headers)throw fail();
-  const occurrenceLinks=await effectiveHistoryOccurrenceLinks(source,owner,sourceNamespace,fromDay,throughDay,headers.v12Available,includeSessions,undefined,headers.dayCatalogAvailable,headers.directOccurrenceAvailable);
-  if(!occurrenceLinks)throw fail();
-  if(occurrenceLinks.correctionRuntime!==headers.correctionRuntime)throw fail();
+  const occurrenceLinks=await effectiveHistoryOccurrenceLinks(source,owner,sourceNamespace,fromDay,throughDay,
+    headers.v12Available,includeSessions,undefined,headers.dayCatalogAvailable,headers.directOccurrenceAvailable);
+  if(!occurrenceLinks||occurrenceLinks.correctionRuntime!==headers.correctionRuntime)throw fail();
   return assembleEffectiveHistoryDependency(owner,fromDay,throughDay,includeSessions,headers,occurrenceLinks.rows);
+}
+export async function createEffectiveHistoryRangeDependencyReader(source:D1Database,target:D1Database,
+  owner:StorageCommunityOwner,sourceNamespace:string,
+  ranges:readonly {fromDay:string;throughDay:string;includeSessions:boolean}[],proofDays:readonly string[],
+  options:{deadlineMs:number;now:()=>number}){
+  if(!Array.isArray(ranges)||ranges.length<1||ranges.length>16||!Array.isArray(proofDays))throw fail();
+  for(const range of ranges){
+    validateDependencyScope(owner,sourceNamespace,range.fromDay,range.throughDay);
+    if(typeof range.includeSessions!=='boolean'||Date.parse(range.throughDay)-Date.parse(range.fromDay)>100*DAY_MS)throw fail();
+  }
+  for(const day of proofDays)validDependencyDay(day);
+  return createMaintainedEffectiveHistoryRangeReader(source,target,owner,sourceNamespace,ranges,proofDays,
+    index=>{const range=ranges[index]!;return nativeEffectiveHistoryDependency(source,owner,sourceNamespace,
+      range.fromDay,range.throughDay,range.includeSessions);},options);
 }
 
 /** Share bounded immutable headers across selected days while preserving each
@@ -741,6 +763,7 @@ export async function createEffectiveHistoryDayDependencyReader(source:D1Databas
   sourceNamespace:string,days:readonly string[],
   options:{includeSessions?:boolean;canContinue?:()=>boolean;occurrenceLinks?:'per-day'|'batched'}={}):Promise<{
     readDigest(day:string):Promise<string|undefined>;
+    readDigests?():Promise<readonly string[]|undefined>;
   }|undefined>{
   if(!Array.isArray(days)||days.length>101||!options||typeof options!=='object'||Array.isArray(options)
     ||Object.keys(options).some(key=>key!=='includeSessions'&&key!=='canContinue'&&key!=='occurrenceLinks')
@@ -753,6 +776,18 @@ export async function createEffectiveHistoryDayDependencyReader(source:D1Databas
   if(Date.parse(throughDay)-Date.parse(fromDay)>100*DAY_MS)throw fail();
   if(options.canContinue?.()===false)return undefined;
   if(days.length===0)return {readDigest:async()=>{throw fail();}};
+  const includeSessions=options.includeSessions===true;
+  const native=()=>createNativeEffectiveHistoryDayDependencyReader(source,owner,sourceNamespace,days,options);
+  const retained=await maintainedEffectiveHistoryDayReader(source,owner,sourceNamespace,days,includeSessions,native,options.canContinue);
+  return retained??native();
+}
+
+async function createNativeEffectiveHistoryDayDependencyReader(source:D1Database,owner:StorageCommunityOwner,
+  sourceNamespace:string,days:readonly string[],
+  options:{includeSessions?:boolean;canContinue?:()=>boolean;occurrenceLinks?:'per-day'|'batched'}={}):Promise<{
+    readDigest(day:string):Promise<string|undefined>;
+  }|undefined>{
+  const fromDay=days[0]!,throughDay=days.at(-1)!;
   const includeSessions=options.includeSessions===true;
   const selected=new Map(days.map(day=>[day,{v1:[],v11:[],v12:[],corrections:[]} as {
     v1:Record<string,unknown>[];v11:Record<string,unknown>[];v12:Record<string,unknown>[];corrections:Record<string,unknown>[];

@@ -12,6 +12,11 @@ import { advanceNextStorageCommunityDaily } from "../src/storage-community-daily
 import { drainCommunityPublicSourceBootstrap } from "../src/community-daily-aggregates";
 import { readStorageCommunityProgress, readStoragePipelineProgress } from "../src/storage-community-progress";
 import { adoptV11UploadedEvidence } from "../src/v11-evidence-adoption";
+import { advanceSharedAnalyticsFeatureDay } from '../src/storage-analytics-shared-features';
+import { seedSharedAnalyticsCorpus } from './fixtures/shared-analytics-corpus';
+import { createD1InvocationBudget } from '../src/d1-invocation-budget';
+import { createModelBlockCheckpoint, modelBlockInputDays, MODEL_BLOCK_METHOD, type ModelBlockIdentity } from '../src/analytics-model-block-contract';
+import { ensureModelBlockJob } from '../src/storage-analytics-model-block';
 import { makeV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
 
 interface Bindings extends Env { STORAGE_ANALYTICS_DB: D1Database; TEST_MIGRATIONS: D1Migration[];
@@ -148,4 +153,49 @@ describe("analytics processing pipeline progress", () => {
     expect(progress.pipeline).not.toBeNull();
     expect(progress.graph.owners.active).toBeGreaterThanOrEqual(0);
   });
+});
+
+
+it("reports retained real producer heads as aggregates and isolates a missing migration", async () => {
+  const now = Date.now();
+  const empty = (await readStoragePipelineProgress(bindings(), now))!.maintained!;
+  expect(empty).toEqual({ featureDays: { building: 0, complete: 0, refused: 0,
+    updatedLastHour: 0, latestUpdatedAt: null }, modelDateBatches: { pending: 0, complete: 0,
+    updatedLastHour: 0, latestUpdatedAt: null } });
+  await source().prepare("UPDATE telemetry_v12_runtime SET state='active' WHERE id=1").run();
+  await source().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+  const corpus = await seedSharedAnalyticsCorpus({ ...bindings(), anchorDay: day(1), calendarDays: 14, graphDays: 2 });
+  for (let attempt = 0; attempt < 24; attempt++) {
+    const meter = createD1InvocationBudget(950);
+    const result = await advanceSharedAnalyticsFeatureDay({ ...bindings(), source: meter.wrap(source()), target: meter.wrap(target()),
+      owner: corpus.owner, day: corpus.graphDates[0]!, budget: { remainingQueries: () => meter.remainingQueries,
+        now: Date.now, deadlineMs: Date.now() + 60_000 } });
+    if (result.state === 'complete') break;
+    expect(result.state).toBe('deferred');
+  }
+  const owner = (await target().prepare("SELECT owner_digest,revision,authority_epoch FROM analytics_owner_state WHERE source_id=? AND owner_digest=?")
+    .bind(sourceId, corpus.owner.ownerDigest).first<{ owner_digest: string; revision: number; authority_epoch: number }>())!;
+  const identity: ModelBlockIdentity = { version: 1, method: MODEL_BLOCK_METHOD, sourceId, sourceNamespace: namespace,
+    ownerDigest: owner.owner_digest, ownerRevision: owner.revision, authorityEpoch: owner.authority_epoch,
+    inputRevision: 1, authorityDigest: 'b'.repeat(64), outputFromDay: day(3), outputThroughDay: day(2) };
+  expect(await ensureModelBlockJob({ target: target(), identity, now: Date.now(),
+    initial: createModelBlockCheckpoint(identity, modelBlockInputDays(identity).map(day =>
+      ({ day, digest: 'c'.repeat(64), hasQuota: false, hasUsage: false }))) })).toBe(true);
+  const populated = (await readStoragePipelineProgress(bindings(), Date.now()))!.maintained!;
+  expect(populated.featureDays).toMatchObject({ building: 0, complete: 1, refused: 0, updatedLastHour: 1 });
+  expect(populated.modelDateBatches).toMatchObject({ pending: 1, complete: 0, updatedLastHour: 1 });
+  expect(populated.featureDays!.latestUpdatedAt).not.toBeNull();
+  expect(JSON.stringify(populated)).not.toContain(owner.owner_digest);
+  expect((await readStoragePipelineProgress(bindings(), Date.now() + 2 * 3_600_000))!.maintained!.featureDays!.updatedLastHour).toBe(0);
+  const previousSchema = new Proxy(target(), { get(db, key) {
+    if (key === 'prepare') return (sql: string) => {
+      if (sql.includes('FROM analytics_shared_feature_days')) throw new Error('synthetic missing table');
+      return db.prepare(sql);
+    };
+    const value = Reflect.get(db, key); return typeof value === 'function' ? value.bind(db) : value;
+  } });
+  const old = (await readStoragePipelineProgress({ ...bindings(), target: previousSchema }, Date.now()))!;
+  expect(old.maintained!.featureDays).toBeNull();
+  expect(old.maintained!.modelDateBatches).toMatchObject({ pending: 1, complete: 0 });
+  expect(old.delivery.pendingChanges).toBeGreaterThanOrEqual(0);
 });

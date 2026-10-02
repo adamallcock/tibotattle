@@ -1,3 +1,4 @@
+import {requireAuthorityRestoreServingReady} from './authority-restore';
 import { readCollectionControls } from './collection-controls';
 import { COMMUNITY_PUBLIC_SOURCE_POLICY_VERSION } from './telemetry-v1-source-selection';
 
@@ -24,6 +25,7 @@ export async function readStorageCommunityCorrectionState(source:D1Database):Pro
  * No participant identities, credentials or derived payloads are copied here. */
 export async function captureStorageCommunityAuthority(source: D1Database,
   expected: { sourceId?: string; sourceNamespace?: string } = {}): Promise<StorageCommunityAuthority> {
+  await requireAuthorityRestoreServingReady(source);
   return captureAuthority(source,expected,false);
 }
 
@@ -258,9 +260,26 @@ export async function storageCommunityOwnersWithCorrectionFacts(
  * disappearing because they do not yet have a typed ingestion journal link. */
 export async function readStorageCommunityOwnerPage(source: D1Database, options: {
   afterParticipantId?: string; limit?: number;
+  /** Preparation requires a stable digest cursor; legacy ownerless rows keep
+   * their ordinary consumer path and cannot occupy that cursor. */
+  requireLinkedOwner?:boolean;
 } = {}): Promise<StorageCommunityOwner[]> {
+  return readOwnerPage(source,options);
+}
+
+/** Exact digest lookup uses the same admitted-format and eligibility contract as
+ * the bounded owner page; the digest is metadata, never a participant identifier. */
+export async function readStorageCommunityOwner(source:D1Database, options:{ownerDigest:string}):
+Promise<StorageCommunityOwner|null> {
+  if(!/^[0-9a-f]{64}$/u.test(options.ownerDigest))throw unavailable();
+  return (await readOwnerPage(source,{limit:1},options.ownerDigest))[0]??null;
+}
+
+async function readOwnerPage(source:D1Database,options:{afterParticipantId?:string;limit?:number;requireLinkedOwner?:boolean},
+  ownerDigest?:string):Promise<StorageCommunityOwner[]> {
   const limit = options.limit ?? 64, after = options.afterParticipantId ?? '';
-  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 64 || typeof after !== 'string' || after.length > 256) throw unavailable();
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 64 || typeof after !== 'string' || after.length > 256
+    ||options.requireLinkedOwner!==undefined&&typeof options.requireLinkedOwner!=='boolean') throw unavailable();
   // Keep the common post-v1.2 path to one bounded owner query. A separate
   // sqlite_master probe is observable in publication statement budgets and is
   // repeated when callers wrap the same D1 handle. The query itself is the
@@ -296,7 +315,8 @@ export async function readStorageCommunityOwnerPage(source: D1Database, options:
     LEFT JOIN storage_v11_owner_links l ON l.participant_id=p.id AND l.state='active'
     LEFT JOIN storage_owner_revisions o ON o.owner_digest=l.owner_digest AND o.state='active'
     LEFT JOIN community_analytical_input_versions v ON v.participant_id=p.id
-    WHERE p.state='active' AND p.id>? AND EXISTS(
+    WHERE p.state='active' AND ${ownerDigest===undefined?'p.id>?':'l.owner_digest=?'}
+      ${options.requireLinkedOwner===true?"AND l.owner_digest IS NOT NULL AND o.revision>0 AND o.authority_epoch>0":''} AND EXISTS(
       SELECT 1 FROM community_public_source_owners eligible WHERE eligible.participant_id=p.id)
     ORDER BY p.id LIMIT ?`;
   type OwnerDbRow = Omit<StorageCommunityOwner,'hasV1'|'hasV11'|'hasV12'|'hasLegacy'|'hasEffective'> & {
@@ -305,7 +325,7 @@ export async function readStorageCommunityOwnerPage(source: D1Database, options:
   let rows: OwnerDbRow[];
   try {
     const hasEffective = `(${v12Expression} OR ((${v1Expression} OR ${v11Expression}) AND ${correctionRuntimeExpression}))`;
-    rows = (await source.prepare(ownerQuery(v12Expression,hasEffective)).bind(after,limit).all<OwnerDbRow>()).results;
+    rows = (await source.prepare(ownerQuery(v12Expression,hasEffective)).bind(ownerDigest??after,limit).all<OwnerDbRow>()).results;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (!/no such table|no such view|no such column/iu.test(message)) throw error;
@@ -313,7 +333,7 @@ export async function readStorageCommunityOwnerPage(source: D1Database, options:
     // complete allowlist before taking the compatibility path so a migration
     // failure cannot silently hide v1.2 evidence.
     if (await v12OwnerSchema(source)) throw unavailable();
-    rows = (await source.prepare(ownerQuery('0','0')).bind(after,limit).all<OwnerDbRow>()).results;
+    rows = (await source.prepare(ownerQuery('0','0')).bind(ownerDigest??after,limit).all<OwnerDbRow>()).results;
   }
   return rows.map(row => {
     if (typeof row.participantId !== 'string' || !count(row.inputRevision) || !count(row.ownerRevision)

@@ -1,3 +1,4 @@
+import {D1InvocationBudgetExceededError} from './d1-invocation-budget';
 import {
   canonicalTelemetryV11Json,
 } from "@app-usagemonitor/telemetry-contract";
@@ -411,6 +412,7 @@ async function runtime(db: D1Database, active = false): Promise<RuntimeRow> {
          FROM ${TELEMETRY_USAGE_CORRECTION_RUNTIME_TABLE} WHERE id=1`,
     ).first<RuntimeRow>(), active);
   } catch (error) {
+    if (error instanceof D1InvocationBudgetExceededError) throw error;
     if (error instanceof TelemetryUsageCorrectionRepositoryError) throw error;
     fail("TELEMETRY_USAGE_CORRECTION_UNAVAILABLE");
   }
@@ -435,6 +437,7 @@ async function owner(db: D1Database, source: TelemetryUsageCorrectionSource): Pr
     }
     return row;
   } catch (error) {
+    if (error instanceof D1InvocationBudgetExceededError) throw error;
     if (error instanceof TelemetryUsageCorrectionRepositoryError) throw error;
     fail("TELEMETRY_USAGE_CORRECTION_OWNER_CONFLICT");
   }
@@ -545,6 +548,7 @@ async function sourceRows(db: D1Database, sources: readonly TelemetryUsageCorrec
       return row;
     });
   } catch (error) {
+    if (error instanceof D1InvocationBudgetExceededError) throw error;
     if (error instanceof TelemetryUsageCorrectionRepositoryError) throw error;
     fail("TELEMETRY_USAGE_CORRECTION_SOURCE_UNAVAILABLE");
   }
@@ -807,6 +811,7 @@ async function commitCaptureContextWithResults(db: D1Database, context: Prepared
       fail("TELEMETRY_USAGE_CORRECTION_CAS_MISMATCH");
     }
   } catch (error) {
+    if (error instanceof D1InvocationBudgetExceededError) throw error;
     if (preserveCallerErrors && !(error instanceof TelemetryUsageCorrectionRepositoryError)
         && !String(error).includes("telemetry_usage_correction_")) throw error;
     mapCaptureError(error);
@@ -906,6 +911,7 @@ export async function prepareTelemetryUsageCorrectionForV1Replacement(
     `).bind(scope.chunkRowId, scope.participantId, scope.deviceId, scope.sourceNamespace)
       .all<V1ReplacementSourceRow>()).results;
   } catch (error) {
+    if (error instanceof D1InvocationBudgetExceededError) throw error;
     if (error instanceof TelemetryUsageCorrectionRepositoryError) throw error;
     fail("TELEMETRY_USAGE_CORRECTION_SOURCE_UNAVAILABLE");
   }

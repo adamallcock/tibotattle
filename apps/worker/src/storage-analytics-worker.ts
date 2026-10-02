@@ -1,3 +1,7 @@
+import {recordAnalyticsPipelineRuntime} from './storage-analytics-runtime-controls';
+import {runCanonicalAnalyticsWorkPass,type CanonicalAnalyticsWorkPassProgress} from './storage-analytics-canonical-runtime';
+import { withMaintainedEffectiveDependencies } from './storage-effective-dependency-summaries';
+import { advanceStorageAnalyticsPreparation, type StorageAnalyticsPreparationResult } from './storage-analytics-preparation';
 import { graphDayProjectionBuildEnabled, runStorageAnalyticsPass } from './storage-analytics-runtime';
 import { storageV11PreparedFoldEnabled } from './storage-v11-history';
 import { createGraphDayProjectionSourceBuild } from './graph-day-projection';
@@ -118,8 +122,14 @@ export async function runStorageAnalyticsSchedule(env:StorageAnalyticsWorkerEnv,
  try {
   // Leave 50 of the paid D1 invocation's 1,000-query ceiling unused.
   const meter=createD1InvocationBudget(950);
-  const bindings={source:meter.wrap(env.STORAGE_INGESTION_DB),target:meter.wrap(env.STORAGE_ANALYTICS_DB),
+  const bindings={source:meter.wrap(features.canonicalPipeline?withMaintainedEffectiveDependencies(env.STORAGE_INGESTION_DB,
+    env.STORAGE_ANALYTICS_DB,env.STORAGE_SOURCE_ID,env.TELEMETRY_STORAGE_NAMESPACE):env.STORAGE_INGESTION_DB),
+   target:meter.wrap(env.STORAGE_ANALYTICS_DB),
    sourceId:env.STORAGE_SOURCE_ID,sourceNamespace:env.TELEMETRY_STORAGE_NAMESPACE,ledger:meter.wrap(env.DELETION_LEDGER)};
+  if(env.STORAGE_ANALYTICS_CANONICAL_PIPELINE!==undefined)await recordAnalyticsPipelineRuntime(meter.wrap(env.STORAGE_ANALYTICS_DB),env.STORAGE_SOURCE_ID,{
+   role:'analytics',method:'maintained-analytics-v1',canonicalPipeline:features.canonicalPipeline,
+   sharedFeatures:features.sharedFeatures||features.canonicalPipeline,modelBlocks:features.modelBlocks,
+   degree:1,queryLimit:950,observedMs:Date.now()});
   // Give ordered delivery its own bounded opportunity before expensive graph
   // work, on every invocation including the long one, so ingestion delivery
   // never skips a minute. Both sequential phases share one actual-statement
@@ -159,6 +169,34 @@ export async function runStorageAnalyticsSchedule(env:StorageAnalyticsWorkerEnv,
     deliveryQueriesUsed:delivery?.queriesUsed??0,publicIterations:0,publicRecordsRead:0,publicQueriesUsed:0,
     queriesUsed:meter.queriesUsed}));return;
   }
+  // Independent day preparation receives a bounded opening slice on the
+  // existing trigger. It shares the actual invocation meter and leaves the
+  // graph lane's ordinary 550-statement admission plus a small margin intact.
+  // Consumers retain their own schedules, source proofs and refusal fallback.
+  let canonicalWork:CanonicalAnalyticsWorkPassProgress|undefined;
+  if(features.canonicalPipeline&&publishCommunity&&meter.remainingQueries>=180){
+   canonicalWork=await runCanonicalAnalyticsWorkPass({...bindings,invocation:meter,now:Date.now,modelBlocks:features.modelBlocks,
+    deadlineMs:Math.min(deadlineMs,Date.now()+(longPass?90_000:20_000)),maxWaves:longPass?8:4,
+    ...(skipPublication?{stages:['canonical','features','activity','fits','cache'] as const}:{})});
+  }
+  const preparationStarted=meter.queriesUsed;
+  const preparationReserve=publishCommunity?560:100;
+  const preparationCap=longPass?250:180;
+  let preparation:StorageAnalyticsPreparationResult|undefined;
+  if(features.sharedFeatures&&!features.canonicalPipeline&&meter.remainingQueries>=preparationReserve+130) {
+   try {
+    preparation=await advanceStorageAnalyticsPreparation({...bindings,sharedFeatures:true,maxAttempts:4,
+     budget:{remainingQueries:()=>Math.max(0,Math.min(meter.remainingQueries-preparationReserve,
+       preparationCap-(meter.queriesUsed-preparationStarted))),
+       deadlineMs:Math.min(deadlineMs,Date.now()+(longPass?30_000:5_000)),now:Date.now}});
+   } catch {
+    // A maintenance failure cannot close the existing consumer lanes. No SQL,
+    // identity or source payload enters this closed diagnostic.
+    preparation={state:'deferred',reason:'lane_failure',attempts:0,prepared:0,reused:0,refused:0,deferred:0,
+     resumeAttempts:0,recentAttempts:0,dirtyAttempts:0,historyAttempts:0};
+   }
+  }
+  const preparationQueries=meter.queriesUsed-preparationStarted;
   // The builder lane opens only on this second pass: delivery normally has
   // 175 statements, or at most 850 on an admitted ordinary-minute authority
   // recovery; the long pass remains graph-only. Both switches must be open,
@@ -174,6 +212,7 @@ export async function runStorageAnalyticsSchedule(env:StorageAnalyticsWorkerEnv,
    ...(buildProjections&&env.GRAPH_DAY_PROJECTION_LONG_PASS==='enabled'
     ?{graphDayProjectionLongPass:true}:{})};
   const result=await runStorageAnalyticsPass({...bindings,...projectionOptions,publishCommunity,
+   ...(features.canonicalPipeline?{canonicalPipeline:true}:{}),
    ...(features.modelBlocks?{modelBlocks:true}:{}),
    ...(features.sharedFeatures?{sharedFeatures:true}:{}),
    ...(skipPublication?{skipPublication:true}:{}),
@@ -189,6 +228,8 @@ export async function runStorageAnalyticsSchedule(env:StorageAnalyticsWorkerEnv,
   const projection=result.graphDayProjection;
   console.log(JSON.stringify({event,...result,
    recoveryAdmitted,deliveryElapsedMs,
+   ...(preparation?{preparation,preparationQueries}:{}),
+   ...(canonicalWork?{canonicalWork}:{}),
    ...(projection?{projectionOpened:projection.opened,projectionBuilt:projection.built,
     projectionRefused:projection.refused,projectionSkipped:projection.skipped,
     projectionCandidates:projection.candidates,projectionSourceQueries:projection.sourceQueriesUsed,

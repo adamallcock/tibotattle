@@ -1,3 +1,12 @@
+import {dailyOwnerCursorMode,readDailyOwnerCursor,advanceDailyOwnerCursor,retireDailyOwnerCursorPage,
+ DAILY_OWNER_CURSOR_CAPABILITY_SQL,type DailyOwnerCursor} from './storage-community-daily-cursor';
+import type {StorageDailyCanonicalPreparation} from './storage-analytics-work-contract';
+import type {AnalyticsWorkLease} from './analytics-partition-work';
+import {readAnalyticsPartitionWork} from './storage-analytics-partition-work';
+import {readMaintainedPublicationCohort} from './storage-community-publication-cohort';
+import {readAnalyticsWorkClosureFence} from './storage-analytics-closure-fence';
+import {beginCanonicalPublicationClosure,sealCanonicalPublicationExpected,commitCanonicalPublicationClosure}
+ from './storage-canonical-publication';
 import { canonicalJson } from './canonical-json';
 import { sha256Hex } from './crypto';
 import { buildCommunityDailyPayload, type DailyTotalsRow, type DailyCellRow,
@@ -10,23 +19,29 @@ import { createV11DailyProjectionValues, foldV11DailyProjectionValues,
 import { readV11ProjectedOwnerDays, repriceV11ProjectedOwnerDayPage } from './v11-daily-projection';
 import { readV1ProjectedChunkPage } from './v1-daily-projection';
 import { readPublishedStorageCommunityGraph } from './storage-community-graph-publication';
+import {readPublishedCanonicalCache} from './storage-community-cache-publication';
 import { readCacheRetentionCommunitySeries } from './cache-retention-day';
 
 import { captureStorageCommunityAuthority, captureStorageCommunityRetirementAuthority, readStorageCommunityOwnerPage,
-  readStorageCommunitySourceTerminalEpoch, sameStorageCommunityHardAuthority, sameStorageCommunityCalculationAuthority, storageCommunityCalculationAuthorityIsCurrent,
+  readStorageCommunitySourceTerminalEpoch, sameStorageCommunityAuthority, sameStorageCommunityHardAuthority, sameStorageCommunityCalculationAuthority, storageCommunityCalculationAuthorityIsCurrent,
   storageCommunityPublicationVisible, type StorageCommunityAuthority, type StorageCommunityOwner } from './storage-community-authority';
 import { readEffectiveTelemetryOwnerDayPage, type EffectiveTelemetryStream } from './telemetry-usage-effective-reader';
-import { countStorageDailyContributingDevices, STORAGE_DAILY_DEVICE_METHOD } from './storage-community-daily-devices';
+import { countStorageDailyContributingDevices, readCanonicalDailyDeviceCounts, STORAGE_DAILY_DEVICE_METHOD } from './storage-community-daily-devices';
 import type { EffectiveUsageReaderCursor } from './telemetry-usage-effective-reader';
 import { effectiveHistoryDependency } from './storage-effective-history';
-import { advanceSharedAnalyticsFeatureDay, type SharedAnalyticsFeatureBudget } from './storage-analytics-shared-features';
+import { advanceSharedAnalyticsFeatureDay, type SharedAnalyticsFeatureBudget, type SharedAnalyticsFeatureInput } from './storage-analytics-shared-features';
 import { rethrowStorageGraphFailure, withStorageGraphFailureStage,
   withStoragePublicationTiming } from './storage-analytics-failure';
 import { STORAGE_DAILY_PENDING_DAYS_SQL } from './storage-community-daily-pending';
 export { STORAGE_DAILY_PENDING_DAYS_SQL } from './storage-community-daily-pending';
 
+export type {StorageDailyCanonicalPreparation} from './storage-analytics-work-contract';
 export interface StorageCommunityDailyBindings {
   source: D1Database; target: D1Database; sourceId: string; sourceNamespace: string;
+  canonicalPreparation?:StorageDailyCanonicalPreparation;
+  publicationClosureKey?:string;
+  canonicalPublications?:boolean;
+  publicationLease?:AnalyticsWorkLease;
 }
 const METHOD = `${V11_DAILY_VALUES_SCHEMA}:${COMMUNITY_DAILY_SPEND_PRICING_METHOD}:${COMMUNITY_DAILY_SPEND_REGISTRY_SHA256}`;
 // A metadata/value payload limit, not a participant admission policy. Larger
@@ -183,11 +198,13 @@ async function ownerPage(options: StorageCommunityDailyBindings, observedDay: st
       let statementsUsed:SharedAnalyticsFeatureBudget['statementCount'];
       try{observer=sharedFeatureBudget.observePhase;statementsUsed=sharedFeatureBudget.statementCount;}
       catch{/* diagnosis is optional */}
+      const featureInput:SharedAnalyticsFeatureInput={source,target,sourceId,sourceNamespace,
+        owner:{...owner,ownerDigest},day:observedDay,budget:sharedFeatureBudget};
+      if(options.canonicalPreparation)featureInput.canonicalPreparation=options.canonicalPreparation(featureInput);
       const feature = await withStoragePublicationTiming('daily_shared_feature',
         observer,statementsUsed,
-        ()=>advanceSharedAnalyticsFeatureDay({source,target,sourceId,sourceNamespace,
-          owner:{...owner,ownerDigest},day:observedDay,budget:sharedFeatureBudget}));
-      if (feature.state === 'deferred') return 'deferred';
+        ()=>advanceSharedAnalyticsFeatureDay(featureInput));
+      if (feature.state === 'deferred'||feature.state==='refused'&&options.canonicalPreparation) return 'deferred';
       if (feature.state === 'complete') {
         validateV11DailyProjectionValues(feature.value.daily);
         sharedValues = feature.value.daily;
@@ -198,6 +215,7 @@ async function ownerPage(options: StorageCommunityDailyBindings, observedDay: st
       // existing effective reader. Other failures remain visible to the pass.
       if (!(error instanceof Error) || !/no such table|no such column/i.test(error.message))
         rethrowStorageGraphFailure('daily_shared_feature',error);
+      if(options.canonicalPreparation)return 'deferred';
     }
   }
   dependencyDigest ??= effective ? await sha256Hex(canonicalJson(await withStorageGraphFailureStage(
@@ -336,7 +354,7 @@ function publicInputs(values: V11DailyProjectionValues[], devices: readonly numb
 
 export interface StorageCommunityDailyProgress {
   state:'published'|'unchanged'|'progress'|'deferred'; ownersAdvanced:number;
-  reason?:'projection_pending'|'source_changed'|'capacity';
+  reason?:'projection_pending'|'source_changed'|'capacity'|'cursor_unavailable'|'cursor_changed';
 }
 
 /** The per-day containment epoch: the highest terminal epoch of any owner whose
@@ -402,7 +420,33 @@ export async function advanceStorageCommunityDaily(options: StorageCommunityDail
   if (options.sharedFeatures === true && !options.sharedFeatureBudget) throw unavailable();
   const maxOwners=options.maxOwners??4;
   if(!Number.isSafeInteger(maxOwners)||maxOwners<1||maxOwners>16)throw unavailable();
-  const initialOwners=await cohort(source,false);
+  const cursorMode=await dailyOwnerCursorMode(target);
+  if(cursorMode==='unavailable'||cursorMode==='predecessor'&&options.canonicalPreparation)
+    return {state:'deferred',ownersAdvanced:0,reason:'cursor_unavailable'};
+  const maintained=options.canonicalPreparation?await readMaintainedPublicationCohort(options):null;
+  if(options.canonicalPreparation&&!maintained)return {state:'deferred',ownersAdvanced:0,reason:'projection_pending'};
+  let canonicalClosureKey=options.canonicalPreparation?(options.publicationClosureKey??await target.prepare(
+    `SELECT closure_key FROM analytics_canonical_publication_closures WHERE source_id=? AND day=? AND family='activity'
+     AND authority_digest=? AND state='complete' ORDER BY watermark DESC LIMIT 1`)
+    .bind(sourceId,options.day,maintained!.fence.proofDigest).first<string>('closure_key')):null;
+  if(options.canonicalPreparation&&!canonicalClosureKey) {
+    // A fully reconciled empty carry day has no fact partition to emit an
+    // activity job. Capture its explicit zero-part expectation under the same
+    // complete source/work fence; pending or nonempty days still wait for P7.
+    const nonempty=await target.prepare(`SELECT 1 present FROM analytics_canonical_heads h
+      JOIN analytics_canonical_facts f ON f.revision=h.revision WHERE f.source_id=? AND f.observed_day=? LIMIT 1`)
+      .bind(sourceId,options.day).first<number>('present');
+    if(nonempty===null) {
+      const fresh=await readAnalyticsWorkClosureFence(options);
+      if(fresh&&fresh.proofDigest===maintained!.fence.proofDigest) {
+        const empty=await beginCanonicalPublicationClosure(target,{sourceId,day:options.day,family:'activity',
+          watermark:fresh.acceptedSequence,authorityDigest:fresh.proofDigest,expectedCount:0,nowMs:options.nowMs??Date.now()});
+        if(await sealCanonicalPublicationExpected(target,empty)&&await commitCanonicalPublicationClosure(target,empty))canonicalClosureKey=empty;
+      }
+    }
+  }
+  if(options.canonicalPreparation&&!canonicalClosureKey)return {state:'deferred',ownersAdvanced:0,reason:'projection_pending'};
+  const initialOwners=maintained?maintained.members.filter(owner=>owner.hasV1||owner.hasV11||owner.hasV12):await cohort(source,false);
   const mayNeedEffective=initialOwners?.some(owner=>owner.hasEffective===true
     ||owner.hasV12||owner.hasV1||owner.hasV11)??false;
   // The authority owner query already evaluated the exact correction runtime
@@ -422,13 +466,31 @@ export async function advanceStorageCommunityDaily(options: StorageCommunityDail
     progress_revision,next_index,fingerprint,complete,'' AS values_json FROM analytics_community_daily_owners
     WHERE source_id=? AND day=? AND owner_digest IN(SELECT json_extract(value,'$.ownerDigest') FROM json_each(?))`)
     .bind(sourceId,options.day,requestJson).all<OwnerCache>()).results;
-  const cache=new Map(rowset.map(row=>[row.owner_digest,row]));let ownersAdvanced=0;
-  for(const owner of owners) {
+  const cache=new Map(rowset.map(row=>[row.owner_digest,row]));let ownersAdvanced=0,ownersAttempted=0;
+  const needsOwnerWork=owners.some(owner=>{const row=cache.get(owner.ownerDigest!);
+    return !current(row,owner,effectiveEnabled,method)||row.complete!==1;});
+  let ownerCursor:DailyOwnerCursor|null=null;
+  if(cursorMode==='installed'&&needsOwnerWork){
+    ownerCursor=await readDailyOwnerCursor(target,sourceId,options.day);
+    if(!ownerCursor)return deferred('cursor_unavailable');
+  }
+  const first=ownerCursor&&owners.length?ownerCursor.next_owner_offset%owners.length:0;
+  // Rotate only scheduling order; the complete cohort's original order remains
+  // unchanged for its identity and every final source/publication check.
+  for(let offset=0;offset<owners.length&&ownersAttempted<maxOwners;offset++) {
+    const index=(first+offset)%owners.length,owner=owners[index]!;
     const row=cache.get(owner.ownerDigest!);
     if(current(row,owner,effectiveEnabled,method)&&row.complete===1)continue;
-    if(ownersAdvanced>=maxOwners)return {state:'progress',ownersAdvanced};
+    if(ownerCursor){
+      const next=await advanceDailyOwnerCursor(target,sourceId,options.day,ownerCursor,(index+1)%owners.length);
+      if(!next)return deferred('cursor_changed',ownersAdvanced);
+      ownerCursor=next;
+    }
+    // Reserve just this attempt before native work. A deferred/throwing owner
+    // cannot retain the next turn, and no reserved block hides other owners.
+    ownersAttempted++;
     if(await ownerPage(options,options.day,owner,effectiveEnabled,row,
-      options.sharedFeatures,options.sharedFeatureBudget,method)==='deferred')return deferred('projection_pending',ownersAdvanced);
+      options.sharedFeatures,options.sharedFeatureBudget,method)==='deferred')continue;
     ownersAdvanced++;
   }
   // Read all selected values and the queue revision in one target snapshot.
@@ -467,7 +529,10 @@ export async function advanceStorageCommunityDaily(options: StorageCommunityDail
   // same member input revisions the commit below re-proves.
   const contributing=folded.flatMap((value,index)=>value.counts.usage+value.counts.quota+value.counts.session>0
     ?[{owner:byOwner.get(rows[index]!.owner_digest)!,effective:usesEffectiveReader(byOwner.get(rows[index]!.owner_digest)!,effectiveEnabled)}]:[]);
-  const deviceCounts=await countStorageDailyContributingDevices(source,options.day,contributing);
+  const deviceCounts=options.canonicalPreparation
+    ?await readCanonicalDailyDeviceCounts(target,sourceId,options.day,contributing)
+    :await countStorageDailyContributingDevices(source,options.day,contributing);
+  if(deviceCounts===null)return deferred('projection_pending',ownersAdvanced);
   const payload=buildCommunityDailyPayload({day:options.day,revision,releasedAt,
     ...publicInputs(folded,rows.map(row=>deviceCounts.get(row.owner_digest)??0))});
   const payloadJson=canonicalJson(payload),payloadHash=await sha256Hex(payloadJson);
@@ -476,7 +541,9 @@ export async function advanceStorageCommunityDaily(options: StorageCommunityDail
   // member's exact input revision is enforced again inside the commit, so an
   // unrelated concurrent upload defers nothing; the fresh stamp pins the epoch
   // this exact member set was verified against.
-  const finalInitialOwners=await cohort(source,false);
+  const finalCohortFence=maintained?await readAnalyticsWorkClosureFence(options):null;
+  if(maintained&&finalCohortFence?.proofDigest!==maintained.fence.proofDigest)return deferred('source_changed',ownersAdvanced);
+  const finalInitialOwners=maintained?initialOwners:await cohort(source,false);
   const finalMayNeedEffective=finalInitialOwners?.some(owner=>owner.hasEffective===true
     ||owner.hasV12||owner.hasV1||owner.hasV11)??false;
   const finalEffectiveAvailable=finalMayNeedEffective
@@ -487,6 +554,10 @@ export async function advanceStorageCommunityDaily(options: StorageCommunityDail
   const finalOwners=finalInitialOwners;
   let pinned:StorageCommunityAuthority;
   try{pinned=await captureStorageCommunityAuthority(source,options);}catch{return deferred('source_changed',ownersAdvanced);}
+  // A maintained cohort belongs to its complete source/work fence. A later
+  // terminal or append must not stamp those older folds with newer authority.
+  if(maintained&&!sameStorageCommunityAuthority(pinned,maintained.fence.authority,true))
+    return deferred('source_changed',ownersAdvanced);
   if(!finalOwners || canonicalJson(finalOwners.map(owner=>member(owner,finalEffectiveEnabled)))!==requestJson
     || !sameStorageCommunityCalculationAuthority(pinned,authority))return deferred('source_changed',ownersAdvanced);
   // A head published under another device-count method is never "unchanged",
@@ -494,19 +565,29 @@ export async function advanceStorageCommunityDaily(options: StorageCommunityDail
   const unchanged=previous?.cohort_digest===cohortDigest&&previous.device_method===STORAGE_DAILY_DEVICE_METHOD
     &&typeof previous.payload_json==='string'
     &&await sha256Hex(previous.payload_json)===previous.payload_sha256;
+  if(await dailyOwnerCursorMode(target)!==cursorMode)return deferred('cursor_unavailable',ownersAdvanced);
+  const lease=options.publicationLease;
+  if(lease&&!await readAnalyticsPartitionWork(target,lease))return deferred('source_changed',ownersAdvanced);
   const commit=target.prepare(`INSERT INTO analytics_community_daily_publications
     (source_id,day,revision,cohort_digest,authority_json,payload_json,payload_sha256,released_at)
     SELECT ?,?,?,?,?,?,?,? WHERE ?=0 AND NOT EXISTS(SELECT 1 FROM analytics_community_daily_publications
-      WHERE source_id=? AND day=? AND revision>=?) AND NOT EXISTS(
+      WHERE source_id=? AND day=? AND revision>=?) ${cursorMode==='installed'?`AND ${DAILY_OWNER_CURSOR_CAPABILITY_SQL}`:''} AND NOT EXISTS(
       SELECT 1 FROM json_each(?) m LEFT JOIN analytics_community_daily_owners c
       ON c.source_id=? AND c.day=? AND c.owner_digest=json_extract(m.value,'$.ownerDigest')
       WHERE c.owner_digest IS NULL OR c.input_revision!=json_extract(m.value,'$.inputRevision')
-       OR c.owner_revision!=json_extract(m.value,'$.ownerRevision') OR c.complete!=1 OR c.method!=?)`)
+       OR c.owner_revision!=json_extract(m.value,'$.ownerRevision') OR c.complete!=1 OR c.method!=?)
+       ${canonicalClosureKey?`AND EXISTS(SELECT 1 FROM analytics_canonical_publication_closures WHERE closure_key=?
+         AND source_id=? AND day=? AND family='activity' AND authority_digest=? AND state='complete')`:''}
+       ${lease?`AND EXISTS(SELECT 1 FROM analytics_partition_work WHERE work_key=? AND revision=? AND claim_token=?
+        AND state='leased' AND claim_expires_ms>?)`:''}`)
     .bind(sourceId,options.day,revision,cohortDigest,canonicalJson({...pinned,dailyDeviceMethod:STORAGE_DAILY_DEVICE_METHOD}),
       payloadJson,payloadHash,releasedAt,unchanged?1:0,
-      sourceId,options.day,revision,requestJson,sourceId,options.day,method);
+      sourceId,options.day,revision,requestJson,sourceId,options.day,method,
+      ...(canonicalClosureKey?[canonicalClosureKey,sourceId,options.day,maintained!.fence.proofDigest]:[]),
+      ...(lease?[lease.workKey,lease.revision,lease.claimToken,Date.now()]:[]));
   try {await target.batch([commit,target.prepare(`DELETE FROM analytics_community_daily_queue
-    WHERE source_id=? AND day=? AND revision=? AND EXISTS(SELECT 1 FROM analytics_community_daily_publications
+    WHERE source_id=? AND day=? AND revision=? ${cursorMode==='installed'?`AND ${DAILY_OWNER_CURSOR_CAPABILITY_SQL}`:''}
+      AND EXISTS(SELECT 1 FROM analytics_community_daily_publications
       WHERE source_id=? AND day=? AND cohort_digest=?)`).bind(sourceId,options.day,queueRevision,sourceId,options.day,cohortDigest)]);}catch{
     // A receipt, not an exception class, decides whether a lost response committed.
   }
@@ -563,8 +644,9 @@ export async function readPublishedStorageCommunityDaily(options:StorageCommunit
     // Every window and every model in one bounded read. Absence is reported
     // as absence: a lane that has published nothing returns null rather than
     // four windows of ten zeroes, which would be a different claim.
-    cacheRetention=await readCacheRetentionCommunitySeries({target:options.target,
-      sourceId:options.sourceId,nowMs:Date.now()});
+    cacheRetention=options.canonicalPublications||options.canonicalPreparation
+      ?await readPublishedCanonicalCache({target:options.target,sourceId:options.sourceId,nowMs:Date.now(),authority,terminalEpoch:sourceTerminal})
+      :await readCacheRetentionCommunitySeries({target:options.target,sourceId:options.sourceId,nowMs:Date.now()});
   }catch{
     cacheRetention=null;
   }
@@ -583,6 +665,7 @@ export async function readPublishedStorageCommunityDaily(options:StorageCommunit
  * captured as containment, without delaying the source upload/erasure transaction. */
 export async function retireStorageCommunityDailyPage(options:StorageCommunityDailyBindings):Promise<number> {
   const authority=await captureStorageCommunityRetirementAuthority(options.source,options);
+  const cursorsRetired=await retireDailyOwnerCursorPage(options.target,options.sourceId);
   const result=await options.target.batch([
     options.target.prepare(`DELETE FROM analytics_community_daily_owners WHERE (source_id,day,owner_digest) IN(
       SELECT c.source_id,c.day,c.owner_digest FROM analytics_community_daily_owners c LEFT JOIN analytics_owner_state o
@@ -598,5 +681,5 @@ export async function retireStorageCommunityDailyPage(options:StorageCommunityDa
       ORDER BY p.day,p.revision LIMIT 4)`).bind(options.sourceId,authority.sourceNamespace,authority.policyRevision,
         authority.collectionRevision),
   ]);
-  return result.reduce((n,row)=>n+row.meta.changes,0);
+  return cursorsRetired+result.reduce((n,row)=>n+row.meta.changes,0);
 }

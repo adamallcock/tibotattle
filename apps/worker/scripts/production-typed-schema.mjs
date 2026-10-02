@@ -7,6 +7,7 @@ import { identityDigest, operationError } from '../../../scripts/lib/release-ope
 import providerSchemas from '../src/d1-provider-schema.json' with { type: 'json' };
 import { storageSchemaDigest, storageSha256 } from './d1-storage-plan.mjs';
 import { TYPED_PRODUCTION_QUERIES } from './production-typed-preflight.mjs';
+import { assertMigrationInputPolicy, migrationInputMaximumBytes } from './migration-input-policy.mjs';
 
 const MAX_MIGRATION_BYTES = 240 * 1024;
 const MIGRATION_NAME = /^\d{4}_[a-z0-9][a-z0-9_-]*\.sql$/u;
@@ -117,12 +118,14 @@ async function readDirectoryInputs(workerRoot, directory) {
   for (const name of names) {
     const file = join(path, name);
     const info = await lstat(file).catch(() => null);
-    if (!info?.isFile() || info.nlink !== 1 || info.size < 1 || info.size > MAX_MIGRATION_BYTES
+    if (!info?.isFile() || info.nlink !== 1 || info.size < 1 || info.size > migrationInputMaximumBytes(directory, name)
         || await realpath(file).catch(() => null) !== file) fail('INPUT_FILE_UNSAFE');
     const bytes = await readFile(file);
     if (bytes.length !== info.size || bytes.includes(0)) fail('INPUT_FILE_CHANGED');
     const sql = bytes.toString('utf8');
     if (!Buffer.from(sql).equals(bytes)) fail('INPUT_ENCODING_INVALID');
+    try { assertMigrationInputPolicy({ workerDirectory: workerRoot, directory, name, bytes }); }
+    catch { fail('INPUT_FILE_CHANGED'); }
     inputs.push({ directory, name, bytes: bytes.length, sha256: storageSha256(bytes), sql });
   }
   return inputs;

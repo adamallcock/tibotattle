@@ -266,12 +266,13 @@ export async function grantTelemetryV12Consent(
         state='accepted', revoked_at=NULL
       WHERE telemetry_v12_device_capabilities.telemetry_schema_version = excluded.telemetry_schema_version
         AND telemetry_v12_device_capabilities.field_dictionary_version = excluded.field_dictionary_version
-        AND telemetry_v12_device_capabilities.privacy_contract_version = excluded.privacy_contract_version`)
+        AND telemetry_v12_device_capabilities.privacy_contract_version = excluded.privacy_contract_version
+      RETURNING 1 AS written`)
       .bind(principal.participantId, principal.deviceId,
         consent.telemetrySchemaVersion, consent.fieldDictionaryVersion,
         consent.privacyContractVersion, now)
-      .run();
-    if (result.meta.changes !== 1) throw new Error("v12 capability not admitted");
+      .first<number>('written');
+    if (result !== 1) throw new Error("v12 capability not admitted");
   } catch {
     throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
   }

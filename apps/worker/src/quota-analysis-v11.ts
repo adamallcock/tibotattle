@@ -29,6 +29,7 @@ import {
   MAX_WINDOWED_USAGE_ROWS,
   V1_ANALYSIS_WINDOW_DAYS,
   priceChunkUsageRecord,
+  priceChunkUsageRecordValue,
 } from "./quota-analysis-v1";
 import type { V1ModelCompositionResult } from "./quota-analysis-v1";
 import {
@@ -1076,29 +1077,80 @@ async function usageDays(db: D1Database, context: Context): Promise<string[] | R
  * admits sessions against its own window-wide map while a prepared day admits
  * them against its own day-local one; it returns a refusal to reject the row
  * at exactly this point, and nothing otherwise. */
+interface V11UsageStaticEvidence {
+  readonly attribution: TelemetryV11Attribution;
+  readonly scope: string | null;
+  readonly end: number;
+  readonly sessionKey: string | null;
+}
+/** Page-local row evidence only. Price is lazy so the native session refusal
+ * still happens before pricing; model and scalar reuse its compatible result.
+ * These inputs must never be serialized into a durable feature. */
+export interface V11UsageRowInputs {
+  readonly evidence: V11UsageStaticEvidence | Refusal | null;
+  readonly price: () => ReturnType<typeof priceChunkUsageRecord>;
+}
+export function prepareV11UsageRowInputs(row: UsageRow,
+  decoded?: Record<string, unknown> | null): V11UsageRowInputs {
+  let evidence: V11UsageRowInputs['evidence'] = null;
+  let record: Record<string, unknown> | null = null;
+  if (TOKEN.test(row.provider)) {
+    record = decoded === undefined ? parseStoredRecordJson(row.record_json) : decoded;
+    if (!record) evidence = refused('invalid_attribution_record');
+    else {
+      let attribution: TelemetryV11Attribution | undefined;
+      try { attribution = parseTelemetryV11Attribution(record.accountPlanAttribution); }
+      catch { evidence = refused('invalid_attribution_record'); }
+      if (attribution !== undefined) {
+        const end = Date.parse(row.observed_at);
+        evidence = Number.isSafeInteger(end) ? { attribution, end,
+          scope: attribution.accountBasis === 'same_source' ? attribution.accountTrackId : null,
+          sessionKey: row.session_uuid === null ? null : JSON.stringify([row.provider, row.session_uuid]),
+        } : refused('invalid_attribution_record');
+      }
+    }
+  }
+  let priced: ReturnType<typeof priceChunkUsageRecord> | undefined;
+  return { evidence, price: () => {
+    if (priced === undefined) priced = priceChunkUsageRecordValue(record, row.observed_at);
+    return priced;
+  } };
+}
 async function usageRowEvidence(row: UsageRow,
   session: (sessionKey: string | null, observedAtMs: number, scope: string | null) => Promise<Refusal | null>,
+  preparedInputs?: V11UsageRowInputs,
 ): Promise<{ attribution: TelemetryV11Attribution; scope: string | null; end: number;
   priced: NonNullable<ReturnType<typeof priceChunkUsageRecord>> } | Refusal | null> {
-  if (!TOKEN.test(row.provider)) return null;
-  const record = parseStoredRecordJson(row.record_json);
-  if (!record) return refused("invalid_attribution_record");
-  let attribution: TelemetryV11Attribution;
-  try { attribution = parseTelemetryV11Attribution(record.accountPlanAttribution); }
-  catch { return refused("invalid_attribution_record"); }
-  const scope = attribution.accountBasis === "same_source" ? attribution.accountTrackId : null;
-  const end = Date.parse(row.observed_at);
-  if (!Number.isSafeInteger(end)) return refused("invalid_attribution_record");
-  const sessionKey = row.session_uuid === null ? null : JSON.stringify([row.provider, row.session_uuid]);
-  const rejected = await session(sessionKey, end, scope);
+  const inputs = preparedInputs ?? prepareV11UsageRowInputs(row);
+  const evidence = inputs.evidence;
+  if (evidence === null || 'status' in evidence) return evidence;
+  const rejected = await session(evidence.sessionKey, evidence.end, evidence.scope);
   if (rejected) return rejected;
-  const priced = priceChunkUsageRecord(row.record_json, row.observed_at);
+  const priced = inputs.price();
   if (priced === null) return null;
-  return { attribution, scope, end, priced };
+  return { attribution: evidence.attribution, scope: evidence.scope, end: evidence.end, priced };
 }
 
-export async function prepareV11UsageFeature(row: UsageRow, ownerDigest: string): Promise<V11PreparedUsageFeature> {
+/** Exact native scalar session identity; accepts a transient source UUID only. */
+export async function v11PreparedUsageSessionDigest(input: {ownerDigest:string;provider:string;sessionUuid:string}):Promise<string> {
+  if (!/^[a-f0-9]{64}$/u.test(input.ownerDigest) || typeof input.provider !== 'string'
+    || typeof input.sessionUuid !== 'string' || input.sessionUuid.length === 0) throw new Error('V11_USAGE_FEATURE_INVALID');
+  return sha256Hex(JSON.stringify([V11_PREPARED_USAGE_FEATURE_METHOD,input.ownerDigest,input.provider,input.sessionUuid]));
+}
+
+export async function prepareV11UsageFeature(row: UsageRow, ownerDigest: string,
+  preparedInputs?: V11UsageRowInputs): Promise<V11PreparedUsageFeature> {
   if (!/^[a-f0-9]{64}$/u.test(ownerDigest)) throw new Error('V11_USAGE_FEATURE_INVALID');
+  return prepareV11UsageFeatureWithSession(row, (provider, sessionUuid) =>
+    v11PreparedUsageSessionDigest({ownerDigest,provider,sessionUuid}), preparedInputs);
+}
+
+/** Canonical preparation supplies the already derived native scalar identity.
+ * Shared reduction semantics remain here: skipped rows still advance session
+ * tails, while invalid attribution refuses before session admission or price. */
+export async function prepareV11UsageFeatureWithSession(row: UsageRow,
+  sessionDigest: (provider: string, sessionKey: string) => Promise<string>,
+  preparedInputs?: V11UsageRowInputs): Promise<V11PreparedUsageFeature> {
   const feature: V11PreparedUsageFeature = {
     occurrenceId: row.occurrence_id, observedAtMs: Date.parse(row.observed_at),
     provider: TOKEN.test(row.provider) ? row.provider : 'unknown', sessionDigest: null,
@@ -1108,11 +1160,9 @@ export async function prepareV11UsageFeature(row: UsageRow, ownerDigest: string)
   const evidence = await usageRowEvidence(row, async (session, observedAtMs, scope) => {
     feature.observedAtMs = observedAtMs;
     feature.accountScopeId = scope;
-    if (session !== null) feature.sessionDigest = await sha256Hex(JSON.stringify([
-      V11_PREPARED_USAGE_FEATURE_METHOD, ownerDigest, row.provider, row.session_uuid,
-    ]));
+    if (session !== null) feature.sessionDigest = await sessionDigest(row.provider,row.session_uuid!);
     return null;
-  });
+  }, preparedInputs);
   if (evidence !== null) {
     if ('status' in evidence) {
       feature.outcome = 'refused'; feature.refusalReason = evidence.reason;
@@ -1200,6 +1250,7 @@ export type V11PreparedUsageDayResult =
 export async function v11PreparedUsageDayRow(row: UsageRow,
   sessionDigest: (provider: string, sessionUuid: string) => Promise<string>,
   sessions: Set<string> = new Set(), maxSessions = MAX_SESSIONS,
+  preparedInputs?: V11UsageRowInputs,
 ): Promise<V11PreparedUsageDayResult> {
   let digest: string | null = null, touched: V11PreparedUsageDaySession | null = null;
   const evidence = await usageRowEvidence(row, async (sessionKey, observedAtMs, accountScopeId) => {
@@ -1211,7 +1262,7 @@ export async function v11PreparedUsageDayRow(row: UsageRow,
     sessions.add(digest);
     touched = { sessionDigest: digest, observedAtMs, accountScopeId };
     return null;
-  });
+  }, preparedInputs);
   if (evidence === null) return { status: "skipped", session: touched };
   if ("status" in evidence) return { status: "refused", reason: evidence.reason };
   const fully = evidence.priced.pricingStatus === "fully_priced";

@@ -10,6 +10,7 @@
   "vars": {
     "STORAGE_ANALYTICS_MODE": "disabled",
     "PUBLIC_ANALYTICS_MODE": "disabled",
+    "STORAGE_ANALYTICS_CANONICAL_PIPELINE": "disabled",
     "STORAGE_SOURCE_ID": "unbound-example",
     "TELEMETRY_STORAGE_NAMESPACE": "unbound-example"
   },

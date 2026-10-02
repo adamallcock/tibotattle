@@ -2,19 +2,588 @@
 title: A shared incremental analytics architecture
 date: 2026-09-28
 type: plan
-status: production-enabled
+status: in-progress
 ---
 
 # A shared incremental analytics architecture
 
-## Running checklist: complete local implementation before migration
+## Owner direction — October1
+
+The owner has instructed P0 to complete the remaining P1–P11 work end to end
+and to defer the10× performance target for now. Complete functional integration,
+correctness, bounded execution, erasure/recovery and honest measurement remain
+required. A tenfold saving is no longer a local-completion or migration gate.
+Historical performance experiments below retain their original claim boundaries.
+
+## Implementation status and completion rule — October 1
+
+**The complete architecture is not yet qualified.** The maintained candidate now
+contains local implementations for canonical facts, selective mutation/reverse
+metadata, shared quantities and prices, rolling inputs, reversible cache pairs,
+partition work, publication closure, physical erasure/restore and the descriptive
+admin flow. Actual Worker role composition and durable graph-date admissions are
+integrated locally. Focused native-oracle tests qualify named boundaries; they do
+not establish complete all-output parity or a tenfold whole-workload saving.
+
+The [integration work ledger](./2026-09-30-maintained-analytics-framework.md)
+records P0–P11 ownership, schemas, focused evidence and remaining gates. The
+candidate is branch `codex/maintained-analytics-framework`, baseline `f056940f`
+plus uncommitted changes in its dedicated worktree. This plan's original checkout
+and its unrelated changes remain preserved. The candidate is not frozen or
+reviewed as a combined release, and it has not been deployed by this work.
+
+**The implementation register below defines the full scope.** Existing L0–L9 and
+rollout checklists describe dated increments; their checked boxes do not complete
+the full design. The small integrated comparison is a diagnostic. H04's equal
+completed-output and incremental-work requirements remain open; the tenfold
+performance target is deferred by the owner;
+H05–H07 remain separate gates. Recorded deployments are dated evidence, and
+production was not inspected for this checkpoint. The
+[production runbook](../runbooks/production-operations.md) remains the operational
+authority.
+
+### How to read the register
+
+- **Complete foundation:** the named existing building block has source and
+  recorded qualification evidence. This does not qualify its integration with
+  newly added metadata, queues or schemas.
+- **Partial:** a useful part exists, but the full requirement is unmet.
+- **Local implementation:** working source exists; integration and qualification
+  for the whole requirement remain open. Local tests are not deployment evidence.
+- **In progress:** implementation is being assembled; no completion claim.
+- **Not implemented:** no implementation of the stated target was established.
+- **Pending gate:** the new combined candidate has not passed that gate.
+- **Conditional:** an explicit experiment or architecture decision determines
+  adoption. Its obligations become required if adopted; a condition cannot be
+  used to reclassify an unfinished core requirement.
+
+Only **Complete foundation** IDs appear in the checked aggregate foundation item.
+Every other core row stays open until its stated acceptance boundary is met.
+Full local readiness requires all core implementation rows plus local
+qualification; online qualification, deployment and production observation have
+their own completion boundaries. An adopted conditional item needs its own
+implementation and qualification.
+
+When a row advances, record the integrated source revision, exact schema/method
+contract, focused/owning test or receipt, and its separate online/deployment/live
+result. A green test for another revision or a deployment of a related component
+cannot advance that row. Do not replace a missing core requirement with a narrower
+completed experiment without an explicit scope decision.
+
+Evidence entrypoints:
+
+- [Initial durable shared-feature qualification](../receipts/2026-09-28-durable-shared-analytics-local.md)
+  and [initial online rollout](../receipts/2026-09-29-shared-analytics-online-rollout.md).
+- [Durable model-block experiment](../receipts/2026-09-28-durable-model-blocks.md)
+  and [native publication/adoption](../receipts/2026-09-28-model-block-publication.md).
+- [Shared feature store](../../apps/worker/src/storage-analytics-shared-features.ts),
+  [native dependency reconstruction](../../apps/worker/src/storage-effective-history.ts)
+  and [cache calculation](../../apps/worker/src/cache-retention-day.ts).
+
+These links support the named foundations and explain the remaining paths. The
+uncommitted increment does not yet have a combined qualification/release receipt.
+
+## Implementation register
+
+### A — Admission, reconciliation and canonical inputs
+
+| ID | Required implementation and granularity | Local state and evidence | Recorded online / production status | Remaining acceptance |
+|---|---|---|---|---|
+| A01 | Closed v1/v1.1/v1.2 admission, authorization and complete-source activation; accepted change set | **Complete foundation.** Existing admission adapters and effective reader; recorded all-format activation and erasure qualification below. | Recorded all-format activation and isolated parity/erasure; new composition pending. | Preserve these contracts in the new composition; never invent fields absent from older formats. |
+| A02 | Stable logical occurrence identity, retained variant reconciliation and correction effects; occurrence × effective revision | **Local implementation.** Migration 0036 persists scoped logical identities, retained provenance and replay-safe old/new effects. Native mixed-format/correction tests passed; combined acceptance pending. | Native reconciliation recorded; maintained provenance/effects pending. | Persist reusable reconciliation/provenance; emit replay-safe insert, replace, withdraw or no-op effects once, including old/new locations and externally linked variants. |
+| A03 | Closed private canonical facts and revisioned partition manifests; stream × logical partition × content revision | **Local implementation.** Closed canonical facts, bounded ordered input pages, revisioned partition manifests and source/target guards are in 0036/0044; physical inventory is registered. | No target materialization deployed or qualified online. | Define the allowlisted fact/manifest contract, ordering, presence/conflict fields, content hashes, provenance and erasure coverage; materialize and replay it without copying arbitrary source JSON or raw session IDs. Storage choice is separate, X01. |
+| A04 | Computation units independent of upload protocol and owner/device hierarchy; bounded logical partitions/date ranges | **Partial; feature/activity composition and fair claims checked locally.** Original-leaf groups retain individual receipts; same-caller-stage previews, guarded ordinary-prefix claims and singleton retries have focused parity/race evidence. Eight one-fact/one-scope activity leaves fit the950 cap; mixed groups regress and stay excluded. Shared cache staging/drain has exact history-fixture parity; an accepted eight-leaf computation completes in610 queries with exact native cache-day/series outputs and focused source/lease/erasure/retry controls. Sparse eight-leaf runtime completes all original leaves in685 statements; genuine mixed/dense singleton fallback and both interrupted-write cases passed focused native recovery/public parity checks. Wider bounds and skewed whole-workload qualification remain open. | Existing owner-scoped paths recorded; target partition scheduling pending. | Split large partitions and group small ones by bounded work; retain identity only for deduplication, quota/session continuity, membership and authority/erasure. Prove no cross-subject deduplication or pooling of unknown quota scopes. |
+| A05 | Exact contributor/device membership and identity-role metadata; membership key × contribution | **Local implementation.** Migration 0041 maintains exact credential membership, contributions and native cohorts; focused count/weight/publication parity passed. | Existing counts/weighting retained; maintained membership redesign pending. | Maintain membership/reference counts and erasure provenance separately from job identity; preserve the current credential-based metric and sample weighting without repeated source enumeration. |
+
+### B — Shared feature preparation and early aggregation
+
+| ID | Required implementation and granularity | Local state and evidence | Recorded online / production status | Remaining acceptance |
+|---|---|---|---|---|
+| B01 | One normalized analytical input per changed occurrence and shared compatible pricing/classification | **Local implementation.** Shared canonical page preparation reuses quantities and compatible prices. Dense B02/native-bundle parity passed; all-consumer cold/warm measurement is open. | Local increment only; combined online/production qualification pending. | Qualify the combined path across all consumers and measure decode/price calls including cold preparation. Daily and fit pricing methods remain separate where their contracts differ. Codec validation copies are not a second analytical reduction. |
+| B02 | Durable shared day features; source scope × UTC day × content/method dependency | **Complete foundation.** Migration 0032 and `storage-analytics-shared-features.ts` provide bounded parts, resumable building, validated immutable values and atomic head promotion; L2–L5 receipts cover consumers. | Initial store 0032 enabled in recorded rollout; new dependency composition pending. | Preserve the store's refusal, capacity, lease and authority behavior when replacing its expensive dependency proofs, C01–C07. |
+| B03 | Independent fair preparation of recent, changed and all retained historical days; bounded day/range jobs | **Local implementation.** Migrations 0034/0038 and Worker roles compose fair changed/recovery/history preparation; focused scheduling passed. Whole retained-history convergence is being measured. | Local lane only; migration/activation and online qualification pending. | Integrate and qualify resume/recent/dirty/history fairness, large and legacy sources, delivery lag, interruption and resource reserves. Historical traversal must not stop permanently at the recent 101-day window. |
+| B04 | Price-independent quantities plus versioned priced usage/coverage; occurrence or exactly equivalent price cell | **Local implementation.** Migration 0037 separates immutable quantity, daily-price and fit-price contributions; selective repricing and sparse coverage passed focused tests. | Existing priced path recorded; selective repricing target pending. | Reprice only affected cost products when possible; preserve integer rounding, context thresholds, unknown coverage and method differences. A price change must not rebuild unrelated token or cache evidence. |
+| B05 | Exact early activity/API contributions and non-additive side state; partition × day × provider/model | **Local implementation.** Partition activity/API replacement and exact maximum/membership state feed existing publication; focused native daily parity passed. | Native daily/API path recorded; maintained partition contributions pending. | Maintain partition contributions, maximum-time candidates and exact membership state without rereading unaffected sources; prove null/unknown and overlap handling. Do not average daily medians or percentages. |
+
+### C — Maintained dependencies, freshness and precise invalidation
+
+| ID | Required implementation and granularity | Local state and evidence | Recorded online / production status | Remaining acceptance |
+|---|---|---|---|---|
+| C01 | Source-owned mutation metadata updated atomically with every relevant accepted change | **Local implementation.** Source 0014/0015 atomically maintain mutation and selective change metadata. Seventeen native D1 tests passed; measured 200-record admission added 11 bookkeeping writes. | New mutation schema/reader not qualified online or deployed. | Prove complete mutation coverage, monotonicity, namespace/runtime sealing and partial-schema refusal. Include correction facts at unchanged owner revision, proof completion, retained-domain changes and permitted deletion. Measure admission write overhead. |
+| C02 | Durable exact day and range dependency summaries; source scope × bounds × stream set × dependency method | **Local implementation.** Analytics 0035 reuses native exact day/range identities with bounded payloads and fenced promotion; seven focused native tests passed. | New summary schema/adapter not qualified online or deployed. | Preserve native v3 identity bytes, distinguish session-inclusive scopes, fence before/after reads and writes, and bound storage/cleanup. A range identity cannot be replaced by concatenated singleton-day hashes. |
+| C03 | Selective invalidation of affected days, partitions and intersecting result ranges | **Local implementation.** Selective covered scope tokens and changed-range work preserve unaffected dependencies; source-backed no-op/outside-append tests passed. Whole-consumer proof is open. | No qualified selective-invalidation rollout. | Maintain the narrow change state needed to reuse unaffected work after unrelated uploads. Broad participant invalidation does not complete this row; no-op and unrelated-append tests must prove the absence of repeated raw-history scans. |
+| C04 | Maintained reverse links from source variants/corrections to partitions, session boundaries and output windows | **Local implementation.** Source 0015 maintains variant/day reverse incidence and bounded drain coverage; unseeded or pending scopes refuse negative reuse. | No qualified maintained reverse-link rollout. | Discover both existing and newly introduced cross-day variants, replace old/new effects, bound fanout and use an explicit safe fallback until coverage is complete. No unseeded catalog may assert that no dependency exists. |
+| C05 | Empty-range, correction-runtime, selection-policy and clock/authorization dependencies | **Local implementation.** Empty/terminal outcomes (0046), source/runtime/selection stamps and output clock jobs (0045) are composed; combined mutation/clock acceptance remains open. | Native checks recorded; new metadata/clock-boundary composition pending. | Invalidate on arrivals into empty days, runtime activation, policy changes and relevant authorization-time boundaries without requiring a payload change or owner revision. Preserve opt-out versus historical withdrawal semantics. |
+| C06 | All consumers use maintained validation rather than repeated source-history reconstruction | **Partial; local composition.** Maintained adapters are wired into daily/API, graph, block, cache and publication paths. Legacy-selected complete-output parity and warmed whole-workload scan proof remain open. | New all-consumer summary integration/rollout pending. | Integrate daily/API, scalar/model scope capture, date-block preparation/adoption, cache lookback and publication. Count initial scope capture and final checks. Warm reuse may read bounded metadata, not rescan unchanged raw history. |
+| C07 | Safe capability fallback, metadata retirement and erasure; bounded schema/owner/scope units | **Local implementation.** Capability inventories, native fallback/refusal and bounded retirement are composed. Focused capability loss and physical erasure/restore tests passed; final combined gates pending. | New metadata fallback/cleanup/erasure qualification pending. | Prove missing/partial migrations retain exact native proofs or explicit refusal; source changes cannot bypass guards. Add metadata to physical erasure/recovery proofs and validate every target binding through nested statement meters. |
+
+### D — Quota/usage features, scalar fits and model-date calculations
+
+| ID | Required implementation and granularity | Local state and evidence | Recorded online / production status | Remaining acceptance |
+|---|---|---|---|---|
+| D01 | Durable ordered quota and priced usage features; measurement scope × ordered segment | **Complete foundation.** Shared quota/model/scalar features and their current consumers are implemented and covered by L4 parity evidence. | Shared consumers enabled in recorded rollout; new input/metadata composition pending. | Preserve event timing, attribution hazards, unknown scope, reset/plan evidence and native pricing methods in the new input representation. |
+| D02 | Resumable adjacent model-date batches that reuse overlapping history; scope × bounded output-date block | **Complete foundation.** Migrations 0030/0031, bounded model-block jobs and clipped date planning are implemented; local/online adoption evidence is linked below. | Jobs and isolated adoption recorded; production observations are dated. | Keep the existing memory/checkpoint/fallback limits and native dependency identities; C06 must remove repeated validation cost around the batch. |
+| D03 | Exact rolling-window feature reuse and narrow corrections; measurement scope × window boundary | **Local implementation.** Migration 0039 persists exact rolling segments/windows and native readers, including open-ended scalar evidence. Focused parity/resume/correction passed; whole-date scaling is unproved. | Existing batch reuse recorded; new maintained rolling-window state pending. | Maintain exact affected interval/window state across corrections and resumed work. Prove expiration, reset-cluster splits, session boundaries and cutoff eligibility. Compact feature folds are allowed; raw-history reconstruction is not the warm path. |
+| D04 | Existing whole-cohort eligibility and date-specific statistical finishers | **Complete foundation.** Native scalar/model kernels remain the reference and parity tests cover the implemented shared path. | Native methods retained by recorded releases; new composition pending. | Preserve whole-window refusals, joint model solving, medians/percentiles and chronology. Do not infer constant-time fits, independent per-model solves or a new historical scalar output. Further solver reuse is X05. |
+| D05 | Adoption into native graph storage and the existing publisher; result date × method/dependency | **Complete foundation.** The native adoption adapter preserves result/publication identities, CAS and refusal results. | Native publication parity and deployment recorded; new proof integration pending. | Requalify adoption with maintained dependencies and new partition work; stored job completion alone is not a published result. |
+
+### E — Cache continuity and reversible pair updates
+
+| ID | Required implementation and granularity | Local state and evidence | Recorded online / production status | Remaining acceptance |
+|---|---|---|---|---|
+| E01 | Shared cache event preparation and exact existing seven-day carry | **Complete foundation.** Shared digest-only cache items feed the native reducer; L5 and N1 have parity/replay/correction/erasure evidence. | Isolated nonempty parity and shared-cache activation recorded; new pair path pending. | Preserve the current carry reach, ordering ambiguity, exclusions and explicit empty-input behavior through the new path. |
+| E02 | Persistent ordered session-neighbor index and boundary state; session × event order | **Local implementation.** Migration 0040 maintains ordered private session neighbors and boundary proofs; focused move/tie/carry tests passed. | No maintained neighbor-index rollout. | Add bounded predecessor/successor discovery, configuration/unreadable breaks, ties and cross-midnight/session-move handling without rereading seven whole source days. |
+| E03 | Reversible pair contributions and exact multiplicities; consecutive pair × later-endpoint day × model/effort/band | **Local implementation.** Reversible pair contributions, provenance and membership multiplicities support bounded old/new neighborhood repair; focused insertion/deletion/replay tests passed. | No maintained reversible-pair rollout. | Replace P→N with P→X and X→N on insertion; reverse on deletion and repair both neighborhoods on moves. Preserve session-count/concentration membership semantics and replay safety. |
+| E04 | Prepared community cache counters and bounded public calendar windows; day × model × gap band | **Local implementation.** Maintained day/week/month counters and 0041 cache snapshots preserve tagged empty/refusal outcomes and UTC refresh; whole-output population parity pending. | Existing cache windows recorded; new pooled contribution path pending. | Pool replacement pair contributions once; maintain exact contributor/session multiplicities. Compose small daily counters or explicitly trigger UTC rollover. Preserve current session-count meaning, model selection and omitted/null series. |
+
+### F — Contribution replacement, publication and consumer outputs
+
+| ID | Required implementation and granularity | Local state and evidence | Recorded online / production status | Remaining acceptance |
+|---|---|---|---|---|
+| F01 | Idempotent replacement of affected output contributions; partition/scope × output date × revision | **Local implementation.** Guarded partition/day contributions and recoverable successors use immutable input/policy identities; focused lost-response and duplicate tests passed. | Existing guarded writers recorded; new partition effects pending. | Generalize to the new partition effects and exact side state. Apply `oldTotal - oldContribution + replacement` atomically; retries or partial writes must not double count. |
+| F02 | Maintained expected membership/dependency completion at an accepted watermark | **Local implementation.** Migration 0041 persists expected partition closure and bounded native cohorts at accepted watermarks, including empty/unchanged outcomes. | Native publisher recorded; maintained expected-partition closure pending. | Replace repeated broad enumeration with maintained expected-partition completion, including empty partitions and explicit unchanged reuse. Preserve sample weighting and non-additive final estimators. |
+| F03 | Separate content/method reuse from permission to publish or serve | **Local implementation.** Content reuse has separate source authority, target epoch/erasure, clock and final live lease/CAS fences. Whole cross-store race qualification remains open. | Existing authority/continuity gates recorded; new contribution composition pending. | Reuse unaffected arithmetic across unrelated source/authority bookkeeping while immediately enforcing withdrawal/erasure. Prove cross-store publication races are fenced; a before/after read is not an atomic cross-store commit. |
+| F04 | Complete prepared outputs with last-good continuity and atomic replacement | **Complete foundation.** Existing daily/API, scalar/model and cache publications preserve accepted output contracts. | Existing outputs/continuity recorded; full target cutover pending. | Retain daily tables/charts, headline totals/API value, overall/plan/model allowance views and cache continuity. Expose each family's evidence date; a new count must not imply a newly calculated graph. Qualify new heads through H04–H07. |
+
+### G — Durable work, budgets, parallelism and recovery
+
+| ID | Required implementation and granularity | Local state and evidence | Recorded online / production status | Remaining acceptance |
+|---|---|---|---|---|
+| G01 | Durable idempotent work keys, leases/fencing and interrupted-transition recovery; logical job × input/policy revision | **Local implementation.** Migration 0038 persists immutable jobs, claims, fencing and successor lineage; actual D1 replay/lease tests passed. | Existing durable jobs recorded; full partition/pair scheduler pending. | Extend and qualify it for canonical partition changes, maintained metadata, pair repair and downstream effects. Duplicate delivery and lost write responses must converge. |
+| G02 | Durable dirty-work/outbox index with repair of lost notifications and bounded recovery sweeps | **Local implementation.** Canonical effects, dirty partitions and 0045 sealed-input/graph-result outboxes feed bounded role work; focused lost-notification/replay tests passed. | Source delivery outbox recorded; new partition-work index pending. | Maintain discoverable changed partitions/ranges and downstream work atomically; recover missing notifications. Recovery sweeps must not become recurring full-history reconstruction. |
+| G03 | Fair short-update and historical lanes, adaptive bounded units and capacity reserves | **Partial; local implementation.** Fair lane/subject claims, split partitions and 0043 pending capacity/reserves are composed. Skewed final workload and retirement qualification are open. | Existing schedules recorded; new partition fairness/capacity qualification pending. | Prove skewed-source fairness, separation of new work/backfill and prompt withdrawals/erasure. Split oversized partitions or group small ones without fixed uploader/version job boundaries. |
+| G04 | Controlled parallel execution of independent partitions/date blocks | **Partial; measured component decision.** Actual 1/2/4/8 canonical/features component preserves semantic and lease parity. Degrees4/8 add work; retain degree1 pending grouped/skewed whole qualification. | No qualified parallel partition-pool rollout. | Benchmark concurrency 1/2/4/8, serialize competing output heads and keep authority fresh. Adopt only beneficial bounded concurrency, or record evidence supporting a single executor; replica/shard/container choices are X01–X04. |
+| G05 | Actual statement metering, cooperative deadlines and bounded CPU/memory/checkpoint behavior | **Complete foundation.** Existing invocation/phase meters and deadline/refusal gates bound scheduled work. | Existing metered roles recorded; new attached bindings/adapters pending. | Meter every new binding and nested adapter, including metadata reads/writes, save/release work and failed statements. Batching or worker chaining must not evade a limit; requalify the changed composition, H05. |
+| G06 | Bounded retirement, compaction/capacity and orphan cleanup for every new artifact | **Partial; local implementation.** Bounded canonical, rolling, cache, publication/cohort, queue, feature/model retirement is composed and lease-protected; 0047 paces empty cleanup sweeps. Complete lifecycle qualification remains open. | Existing retirement recorded; complete new-artifact cleanup pending. | Include facts, manifests, summaries, reverse links, queues, pair contributions and any adopted objects; protect active leases and physical erasure. A capacity refusal keeps the native/reference result or explicit unknown. |
+
+### H — Privacy, admin visibility, qualification and migration
+
+| ID | Required implementation and granularity | Local state and evidence | Recorded online / production status | Remaining acceptance |
+|---|---|---|---|---|
+| H01 | Complete physical erasure and deletion-safe restore across all new stores/indexes | **Local implementation.** Analytics 0042/source 0016 cover terminal UPDATE replay; 0046 outcomes and 0045 graph roots are in the physical inventory. Populated interrupted erasure and resumable frozen restore passed focused checks. | Prior isolated physical erasure/restore passed; new artifact coverage pending. | Fence immediately, enumerate all newly retained provenance/metadata, physically remove owned artifacts and prove tombstone/ledger replay and surviving contributions. No completion from public withdrawal alone. |
+| H02 | Descriptive admin flow, real units/coverage, controls, waiting reasons and public freshness | **Local implementation.** Seven-stage view uses compact real populations, closed reasons, explicit unchecked freshness and last-observed role controls. Focused web/D1 checks and desktop/narrow rendering passed; live rendering is unqualified. | Local view only; new deployed availability/live rendering not established. | Finish the acceptance checklist below. Retained complete heads are not proof of current dependencies. Unmeasured preparation/cache queues stay unavailable; qualify runtime controls/reasons, rendered states and deployed/live visibility separately. |
+| H03 | Whole-workload instrumentation and a fixed comparison basis | **Partial.** Pinned native and integrated candidate instrumentation includes delivery, proofs, queues, cleanup and publication with actual 950 metering and input hashes. Complete equal-output receipt and CPU/memory/bytes/cost evidence pending. | No comparable full-target production saving established. | Capture scope validation, preparation, checkpoint/retry/cleanup, adoption, publication, bytes/writes, CPU/peak memory and total cost. Compare equal completed outputs; do not combine incompatible samples or exclude expensive proofs. |
+| H04 | All-format, all-output correctness and incremental-work qualification, E1/E2 | **Partial; sixteenth optimized small pair completed.** Complete cold/warm/unchanged public outputs match exactly and all six observer/histogram records reconcile. Four genuine native writer/delivery cases passed separately, including typed append and metadata change. A later cold pair also matched all eight public families and populations, then refused base capture on a private preview CAS counter difference (48/1) before any mutation. A separate unchanged-SQL native counter lineage observer passed six focused actual-D1 cases; its whole-run seam, persistent all-output repair, full corpus/mutations and C06/resource proof remain open. The owner deferred the tenfold target; the exact comparison is in the [local receipt](../receipts/2026-10-01-maintained-analytics-comparison16.md). | Initial-increment isolated parity passed; full new-target qualification pending. | Qualify the full new composition through cold/warm/no-op, unrelated append, corrections, clock changes, repricing, interruption, refusal and erasure. Prove no unchanged raw-history scan on the warmed no-op path and report whole-workload measurements. The tenfold performance target is deferred by the owner. |
+| H05 | One frozen combined candidate, independent review and owning local gates | **Pending gate.** Prior green releases do not qualify newly added modules/migrations. | Combined local gate pending; no newly qualified release from this work. | Integrate the exact candidate, run focused checks while iterating, then the complete owning Worker gate once on frozen source; run architecture/docs and relevant UI/render gates. Preserve failed results and distinguish environment gaps. |
+| H06 | Populated migration/rollback rehearsal and isolated online qualification of the exact new candidate | **Pending gate.** Previous operators/rehearsals provide reusable procedures. | Exact new-candidate online migration/parity gate pending. | Verify source/target ledgers, partial-migration refusal, ordered code/schema/activation, privacy and forward-safe rollback. Compare the same outputs online before an explicitly authorized production change. |
+| H07 | Production cutover, measured output convergence and controlled legacy retirement | **Pending gate.** Initial increments have dated deployments; this complete target has none. | Complete-target production qualification not established. | Pin exact deployed versions/controls/schemas, observe nonempty work through publication, reconcile throughput/cost and rollback. Retire redundant paths/data only after parity, erasure and recovery are proven and the exact operation is authorized. |
+
+
+### Conditional storage/runtime choices and later experiments
+
+These are not excuses to omit A–H. Choose the physical implementation from the
+same contracts and whole-workload measurements. A backend decision must record
+what was adopted, deferred or rejected and why; unselected options do not block
+completion of an equivalent, qualified implementation on current storage.
+
+| ID | Option and present status | Condition and required acceptance if adopted |
+|---|---|---|
+| X01 | Private R2 or columnar fact/feature objects plus a compact catalog; **not implemented** | Adopt if measured acquisition/checkpoint cost warrants it. Qualify immutable digest/length checks, manifest/head atomicity or recoverable commit, private serving, orphan/compaction cleanup and exact packed-subject erasure. |
+| X02 | Ordinary CPU/container workers; **not implemented** | Adopt if bounded Worker execution remains the measured constraint. Use the same kernels and durable references/revisions; qualify memory/CPU limits, cancellation, retries, authority and publication recovery. |
+| X03 | Replica acquisition; **experimental code only, not adopted for production consumers** | Require demonstrated routing and equivalent fresh acquisition with primary authority/commit fences. Bookmarks are not cross-database snapshots; no saving follows merely from an enabled setting. |
+| X04 | Physical source sharding or source-store rebuild; **synthetic experiments only** | Require measured useful scaling beyond aggregate count scans, stable placement, cross-format/session/quota locality, correction reconciliation, migration/restore and erasure. A failed populated index build is not a completed migration. |
+| X05 | Completed-reset candidates, exact prefix/interval indexes or statistical solver optimization; **planned** | Profile after acquisition/metadata savings. Preserve cutoff cohort, pairwise/median behavior, joint solves and refusals; any eligibility/capacity/method change requires its own explicit decision and parity basis. |
+
+### Checklists to local readiness, online qualification and production
+
+The detailed acceptance cells above are the task list. These aggregate gates
+remain open even where reusable building blocks are complete:
+
+- [x] Existing closed admission, durable shared-feature/model job foundations,
+  native reducers/adoption and published continuity identified: A01, B02, D01,
+  D02, D04, D05, E01, F04 and G05. Existing evidence is revision-scoped.
+- [ ] Finish reusable canonical inputs and identity/membership roles: A02–A05.
+- [ ] Finish fused preparation, independent scheduling and affected contributions:
+  B01, B03–B05.
+- [ ] Finish maintained exact dependencies, narrow invalidation and all-consumer
+  integration: C01–C07. Conservative broad stamps alone do not close this gate.
+- [ ] Finish exact rolling-window reuse and reversible cache work: D03, E02–E04.
+- [ ] Finish partition replacement, expected membership and authority integration:
+  F01–F03.
+- [ ] Finish discoverable durable work, fairness, concurrency decision and complete
+  cleanup/erasure: G01–G04, G06 and H01.
+- [ ] Finish admin coverage and whole-workload measurement: H02–H04.
+- [ ] Select and record the physical backend/runtime/concurrency decisions;
+  qualify each adopted X item.
+- [ ] **Ready to begin online qualification:** close the preceding local gates
+  and H05; prepare and rehearse the exact migration/rollback portion of H06.
+- [ ] **Ready for production cutover:** pass the isolated online portion of H06
+  and receive authorization for the exact candidate/environment/operation.
+- [ ] **Production-qualified target:** close H07 with observed output completion,
+  measured costs and recovery evidence. A deployed flag is insufficient.
+
+### Required evidence for closing the incremental-work claims
+
+Use one pinned reference and identical accepted evidence/output populations.
+Cover daily counts/table/chart/totals and API value, current scalar/plan views,
+historical model results and native publication, and cache continuity/windows.
+Keep the current meaning of turns, contributor/device counts, coverage and cache
+sessions. Include explicit unknowns and refusal results in comparisons.
+
+Test mixed versions and overlapping occurrences, sparse older fields, a warmed
+no-op, an unrelated later append, new evidence in an empty day, same-owner-revision
+correction, cross-day variant introduction and timestamp/session movement,
+quota/plan/price/method/runtime changes, expiry/UTC rollover, ambiguous ties,
+partial schema/authority lag, lease loss, duplicate work, interrupted writes,
+withdrawal, physical erasure and deletion-safe restore. Prove metadata coverage
+before using a negative catalog lookup to skip native work.
+
+Measure cold history, warm refresh, small updates and corrections, including
+initial scope capture, final validation, all feature/metadata writes, retries,
+cleanup, adoption and complete publication. Report raw resource units separately
+and use one cost basis. Whole-workload 10× is still unproved; a 10×–100× selected
+query/phase saving or additional parallelism does not close H04/H07.
+
+## Agent implementation work packages
+
+This partitions the **34 open core requirements** into 11 specialist packages
+and one integration/qualification owner. The nine complete foundations remain
+the reference and must be preserved. These are proposed work boundaries, not
+new completion claims or a transfer of ownership of ongoing work.
+
+Before starting a package, reconcile its exact checkout, existing changes and
+current file owner. Reuse the in-progress metadata, preparation and admin work
+rather than starting competing implementations. Every agent must know it is not
+alone in the codebase, preserve other agents' changes and report interface changes
+to the integration owner. One primary owner closes each requirement; contributors
+may provide tests or adapters without silently taking over another package.
+
+### Package overview and requirement ownership
+
+| Package | Responsibility | Primary open requirements | Depends on |
+|---|---|---|---|
+| P0 | Contracts, runtime integration, concurrency and final qualification | A04, C06, G04, H05, H06, H07 | Establish interfaces first; integrate P1–P11 as they become ready |
+| P1 | Canonical facts, occurrence reconciliation and provenance | A02, A03 | P0 interfaces; existing effective reader as oracle |
+| P2 | Source change tracking, selective invalidation and reverse links | C01, C03, C04, C05 | P0 identity/change contract; P1 occurrence/provenance contract |
+| P3 | Exact dependency summaries, capability guards and bounded retirement | C02, C07 | P2 mutation/coverage contract; native v3 dependency oracle |
+| P4 | Shared normalization, pricing and activity contributions | B01, B04, B05 | P1 facts; P2 invalidation; P3 exact validation |
+| P5 | Exact rolling quota/usage reuse and date-block calculations | D03 | P4 feature contract; P2/P3 invalidation and validation |
+| P6 | Session-neighbor index, reversible cache pairs and window counters | E02, E03, E04 | P1 order/provenance; P4 cache feature contract; P2 invalidation |
+| P7 | Membership, contribution replacement and publication closure | A05, F01, F02, F03 | P1 provenance; P4–P6 contribution contracts; P2/P3 validation |
+| P8 | Durable changed-work index, preparation scheduling and cleanup | B03, G01, G02, G03, G06 | P0 job/resource contract; P1/P2 change effects; artifact contracts from P3–P7 |
+| P9 | Physical erasure, restore and recovery coverage | H01 | Define erasure contract early; final proof needs artifacts from P1–P8 |
+| P10 | Admin pipeline flow and authoritative progress reporting | H02 | P0 aggregate contract; real job/result metadata from P3–P8 |
+| P11 | Whole-workload instrumentation, reference parity and performance proof | H03, H04 | Harness can start immediately; final comparisons need the integrated P1–P10 candidate |
+
+Dependencies refer to stable interfaces or qualified artifacts, not necessarily
+the completion of an entire upstream package. A consumer may develop against a
+synthetic contract fixture, but cannot close its requirement on a stub.
+
+### P0 — Contracts, integration and qualification
+
+**Deliverable:** one coherent locally qualified candidate, followed by separately
+qualified online migration and production cutover. Primary ownership is A04,
+C06, G04 and H05–H07.
+
+- Own shared composition files: `storage-analytics-runtime.ts`,
+  `storage-analytics-worker.ts`, `storage-publication-worker.ts`,
+  `cache-retention-day-worker.ts`, `analytics-delivery.ts`,
+  `storage-community-authority.ts`, `storage-community-graph.ts`,
+  `storage-effective-history.ts`, `d1-invocation-budget.ts` and
+  `analytics-feature-controls.ts` under `apps/worker/src/`.
+- Own integration configuration/package scripts, migration-number allocation,
+  the implementation register and the final release/migration receipts.
+  Preserve existing allocated migrations and verify the actual ledger before
+  assigning additional numbers. Specialists write only their allocated SQL.
+- Agree the versioned fact/change, mutation/coverage, feature/contribution,
+  job/fencing, erasure and admin contracts. Implement admission-to-work and
+  consumer wiring through existing public entrypoints; keep dependencies static.
+- Define bounded partition splitting/grouping and a concurrency dispatcher;
+  qualify concurrency with P8/P11. Preserve one final writer for a given output
+  head and the actual invocation meter across every binding/adapter.
+- **Acceptance:** all specialist outputs compose without duplicate policy or
+  source scans on the warmed path. Freeze one revision, run the owning gates,
+  rehearse migration/rollback, then pass isolated online parity. Production
+  operation and observation close H07 only after exact authorization.
+
+### P1 — Canonical inputs and provenance
+
+**Deliverable:** reusable immutable canonical input revisions and partition
+manifests, with replay-safe reconciliation effects. Primary ownership is A02/A03.
+
+- Own new canonical fact/reconciliation/manifest modules and focused tests under
+  the Worker app, plus the relevant selection implementation in
+  `telemetry-usage-effective-reader.ts` and `typed-telemetry-compatibility.ts`.
+  P0 owns admission/composition call-site wiring; P2 owns mutation hooks.
+- Start from the existing reader's exact selection rules. Preserve scoped
+  logical keys across timestamp moves and retain only closed, opaque analytical
+  provenance. Define explicit missing/conflict evidence rather than defaults.
+- Hand P2 the stable occurrence, source-variant, location and erasure references;
+  hand P4–P6 ordered facts and presence fields. Supply insert/replace/withdraw/
+  no-op effects and an immutable revision/digest contract.
+- **Acceptance:** mixed-version overlap, cross-subject duplicate IDs, late
+  corrections, moved events and identical replay match the native oracle.
+  Bounded materialization is resumable and privacy-safe; source retention and
+  physical erasure remain exact. No repeated normalization for an unchanged
+  canonical revision.
+
+### P2 — Maintained source changes and reverse dependencies
+
+**Deliverable:** atomic source metadata that identifies affected partitions and
+result ranges without rereading unchanged history. Primary ownership is
+C01/C03/C04/C05.
+
+- Own `storage-effective-dependency-mutations.ts`,
+  `storage-effective-dependency-days.ts`, new selective-change/reverse-link
+  modules, their tests and centrally allocated ingestion-isolation SQL.
+  Necessary admission-writer changes require a named file handoff through P0.
+- Reuse the in-progress conservative mutation token as a safe intermediate.
+  Add narrow day/range state and complete occurrence/provenance coverage,
+  including variants introduced after a summary was built. Until coverage is
+  sealed, expose the need for a native proof; absence is not negative evidence.
+- Cover same-owner-revision corrections, proof completion, all retained domains,
+  empty manifests, runtime/policy changes, allowed deletion, authorization-time
+  boundaries and erasure. Bound any initial catalog build and change fanout.
+- Hand P3 sealed tokens/coverage and P8 idempotent affected-work effects; hand
+  P6 old/new order neighborhoods and P7 affected memberships/output ranges.
+- **Acceptance:** unrelated uploads preserve unaffected dependencies; no-op
+  validation does not scan raw history. Every genuinely relevant change
+  invalidates, including cross-day links and clock-only transitions. Prove
+  atomicity, monotonicity, partial-schema refusal and admission write overhead.
+  Broad participant/global epochs alone do not complete this package.
+
+### P3 — Exact dependency summary store
+
+**Deliverable:** reusable bounded day/range proofs compatible with native v3
+identities. Primary ownership is C02/C07.
+
+- Own `storage-effective-dependency-summaries.ts`, its tests and centrally
+  allocated analytics-summary SQL. P0 owns integration into the native history
+  facade and nested D1 meter; P2 owns source tokens.
+- Reuse the working exact-summary adapter. Separate range and singleton proofs,
+  stream sets and method versions; preserve byte-identical native dependencies.
+  Never substitute concatenated day digests for a native range identity.
+- Implement source/target/current-authority fences, capability inventory,
+  missing/partial-schema fallback, bounded payload/record counts and retirement.
+  Give P9 an explicit artifact/erasure inventory.
+- **Acceptance:** cold native proofs and stored proofs have exact parity; warm
+  reuse performs bounded metadata reads. Dirty/stale/expired tokens cannot
+  return stale work. Unknown response, capacity refusal, missing triggers and
+  erasure remain recoverable and within all enclosing budgets.
+
+### P4 — Shared features, pricing and activity
+
+**Deliverable:** one prepared analytical pass over each changed canonical
+partition, with reusable exact activity and priced contributions. Primary
+ownership is B01/B04/B05.
+
+- Own `analytics-shared-input.ts`, `analytics-shared-reducers.ts`,
+  `analytics-shared-features.ts`, `storage-analytics-shared-features.ts`,
+  `v11-daily-projection-values.ts`, new activity/price contribution modules and
+  their focused tests. P5 owns quota/usage mapper internals; P6 owns cache mapper
+  internals. Coordinate their public input contracts instead of editing them.
+- Reuse the implemented page normalization and compatible pricing work. Retain
+  distinct daily/fit pricing methods where required and separate price-independent
+  quantities from cost products. Persist bounded feature heads/parts using the
+  existing B02 store rather than creating another competing feature cache.
+- Hand P5 ordered quota/usage features, P6 cache/order features and P7 exact
+  activity/API cells, maximum-time candidates and membership references.
+- **Acceptance:** every family matches the existing reference, including unknown
+  price/field coverage and rounding. Replays reuse; corrections replace only
+  affected contributions; selective repricing preserves unrelated counts/cache
+  state. Count cold and warm decode/price calls and all preparation I/O.
+
+### P5 — Rolling fit inputs and model dates
+
+**Deliverable:** exact reuse of quota/usage window state across dates, corrections
+and resumed jobs. Primary ownership is D03; preserve D01/D02/D04/D05.
+
+- Own `effective-quota-day.ts`, `effective-usage-day.ts`,
+  `storage-effective-quota-days.ts`, `storage-effective-usage-days.ts`,
+  `quota-analysis-v1.ts`, `quota-analysis-v11.ts`, `analytics-model-block.ts`,
+  `analytics-model-block-contract.ts`, `storage-analytics-model-block.ts`,
+  `storage-community-graph-model-block.ts` and their focused tests.
+- Extend current durable features/date-block jobs instead of replacing their
+  native finishers. Maintain bounded ordered/interval state and exact changed
+  window membership; keep whole-cohort refusals and reset/plan hazards.
+- Hand P7 validated date-result contributions with native method/dependency
+  identities. P0 owns graph facade/runtime wiring; P7 owns publication closure.
+- **Acceptance:** adjacent dates, resumed isolates, expired bridging reset
+  instants, open-ended legacy scalar evidence, changed plan/price and cross-day
+  corrections match native results/refusals without repeated raw acquisition.
+  No new historical scalar output or statistical method is implied. X05 is a
+  separate optional follow-up if final solving remains expensive.
+
+### P6 — Incremental cache pairs
+
+**Deliverable:** maintained session neighbors, reversible pair contributions and
+prepared cache-window counters. Primary ownership is E02/E03/E04; preserve E01.
+
+- Own `cache-retention-events.ts`, `cache-retention-values.ts`,
+  `cache-retention-day.ts`, new neighbor/pair/counter store modules and focused
+  tests. P0 owns the Worker entrypoint; P7 owns shared publication closure.
+- Persist ordered session boundary state and pair provenance. Repair both old
+  and new neighborhoods on a move; maintain exact membership multiplicities
+  when a pair is added, replaced or removed. Use P1/P4 facts and P2 changes.
+- Publish bounded contribution/counter contracts to P7; expose genuine progress
+  and reasons to P10. Compose small daily windows or explicitly handle UTC rollover.
+- **Acceptance:** insertion/deletion inverses, midnight/session moves, unreadable
+  breaks, configuration changes, unknown order/ties, seven-day reach, concentration
+  and current session-count semantics match the native reducer. Warm updates
+  repair affected neighborhoods rather than rereading seven whole source days.
+
+### P7 — Membership and publication closure
+
+**Deliverable:** exact contribution replacement and maintained expected-cohort
+completion, with authority-safe public heads. Primary ownership is
+A05/F01/F02/F03; preserve F04.
+
+- Own `storage-community-daily.ts`, `storage-community-daily-devices.ts`,
+  `storage-community-daily-pending.ts`, `storage-community-graph-publication.ts`,
+  `storage-community-publication-value.ts`, new membership/closure modules and
+  their focused tests. P0 owns shared authority and HTTP/runtime composition.
+- Maintain exact contributor/device sets, weights, maximum candidates and fit
+  sample states. Use explicit old/new contribution revisions and transactional
+  or recoverably journaled downstream effects; do not subtract or average medians.
+- Track expected changed partitions at a source watermark, including empty and
+  explicitly unchanged ones. Do not rescan the whole cohort to rediscover that
+  already-complete state on every phase or public read.
+- **Acceptance:** duplicate/lost-write recovery never overcounts; complete
+  public payloads match all reference outputs and refusals. New counters do not
+  misrepresent graph freshness. Unrelated bookkeeping reuses arithmetic, while
+  withdrawal/erasure races immediately fence visibility and last-good continuity
+  remains consistent with the accepted policy.
+
+### P8 — Durable work scheduling and lifecycle
+
+**Deliverable:** discoverable bounded changed-work jobs and fair recovery without
+recurring broad history sweeps. Primary ownership is B03/G01/G02/G03/G06.
+
+- Own `storage-analytics-preparation.ts`, `storage-community-graph-work.ts`,
+  `storage-graph-retirement.ts`, new work-index/outbox/reconciliation/cleanup
+  modules, their tests and centrally allocated scheduling SQL. P0 owns scheduler
+  entrypoints, shared resource controls and the concurrency dispatcher.
+- Reuse the existing local resume/recent/dirty/history preparation lane. Connect
+  idempotent P1/P2 change effects to durable queues/work indexes and guarded
+  downstream completion. Lost notification, expired lease and partial save must
+  remain discoverable; source authority is not a scheduling hint.
+- Reserve capacity for new evidence and withdrawals while progressing all
+  retained historical ranges. Split/group bounded jobs and reconcile orphan
+  artifacts through each store's public lifecycle API.
+- **Acceptance:** skewed owners/partitions cannot starve, history is not limited
+  permanently to the recent horizon, duplicate work converges and interrupted
+  jobs resume. Cleanup is bounded and protects live leases. Metadata and memory
+  costs remain inside the same actual invocation/phase budgets.
+
+### P9 — Erasure, restore and recovery
+
+**Deliverable:** exact physical artifact removal and deletion-safe replay for the
+whole adopted system. Primary ownership is H01.
+
+- Own `storage-erasure.ts`, the relevant `authority-restore*.ts` modules,
+  erasure/restore tests and the consolidated artifact inventory. Artifact owners
+  implement their allocated schema/lifecycle hooks against this contract.
+- Review provenance/FK/terminal-fence design before stores are finalized. Track
+  facts, manifests, mutation/reverse-link metadata, summaries, work indexes,
+  pair/membership contributions, public heads and any adopted packed objects.
+- **Acceptance:** withdrawn work cannot republish; physical removal is ledger-
+  proven and interruption-safe; surviving contributions remain exact. Restore
+  replays tombstones/deletion receipts before serving and a repeated replay is
+  a no-op. Test every newly retained artifact, not only the existing B02 store.
+
+### P10 — Admin flow and progress
+
+**Deliverable:** a descriptive rendered pipeline view backed by closed aggregate
+contracts. Primary ownership is H02.
+
+- Own canonical admin assets/tests under `apps/web`, plus
+  `storage-community-progress.ts`, `storage-admin-overview.ts` and focused admin/
+  pipeline contract tests. Regenerate `admin-ui.generated.ts` through its generator;
+  do not hand-edit it.
+- Reuse the local seven-stage view. Consume actual contracts from P3–P8 for job
+  units, coverage, current/deferred/refused state, controls, methods and public
+  freshness; P0 approves shared operational fields.
+- **Acceptance:** incomplete/missing telemetry is explicit, retained complete
+  heads are distinguished from currently valid/published results, and admin
+  reads do not reconstruct source history. Closed negative tests and real
+  desktop/narrow rendering pass; deployed availability/live progress stay separate.
+
+### P11 — Whole-workload correctness and performance
+
+**Deliverable:** a reproducible comparison of identical complete outputs and
+resource use, including invalidation and publication. Primary ownership is
+H03/H04; support P0's G04 and H05–H07 gates.
+
+- Own new all-output benchmark/instrumentation scripts and tests, existing
+  benchmark tool extensions, and shared synthetic corpus/profile helpers under
+  `apps/worker/test/`. Do not change production kernels to obtain parity.
+  Other agents own their focused product tests; coordinate edits to shared fixtures.
+- Start a baseline/oracle harness against existing paths while implementation
+  proceeds. Include scope capture, source/target metadata, preparation, all
+  writes/checkpoints, cleanup/retries, adoption and complete publication.
+- **Acceptance:** close E1/E2 on mixed/sparse/skewed data and every mutation case
+  listed above, including warmed no-op and unrelated append. Count raw scans,
+  decoding/pricing, bytes, database work, CPU/memory and fixed-basis cost. Compare
+  concurrency 1/2/4/8 with P0/P8 if adopted. A selected query gain, unequal output
+  set or interrupted cost sample cannot establish a whole-workload saving. The tenfold target is deferred; complete functional qualification remains required.
+
+### Contracts and ownership that must be settled before parallel edits
+
+1. **P1 ↔ P2:** scoped immutable occurrence/provenance keys, old/new locations,
+   coverage/backfill proof, selection method and authority/erasure references.
+2. **P2 ↔ P3/P8:** sealed mutation stamps, narrow affected ranges, clock-boundary
+   validity, safe fallback and replay-safe changed-work delivery.
+3. **P4 ↔ P5/P6/P7:** closed feature/contribution schemas, ordering, price/method
+   versions, null/unknown/refusal representation and non-additive membership state.
+4. **P7 ↔ P8:** accepted watermark, expected-partition closure, transactional
+   replacement and durable downstream work effect. Neither side independently
+   invents a second completion/queue policy.
+5. **P0/P9 ↔ every store:** actual budget/fencing adapters, migration allocation,
+   terminal erasure, artifact inventories and bounded retirement interfaces.
+6. **P0/P10/P11 ↔ producers:** safe aggregate counters, exact measurement units,
+   instrumentation seams and reference workload/output populations.
+
+P0 is the sole editor of the shared composition files listed in P0. Specialists
+request small integration changes through their public interfaces or an explicit
+sequential file handoff. Migration directories are shared, but SQL file numbers
+and ownership are allocated centrally. Do not run complete owning suites against
+a candidate still being edited by multiple packages.
+
+### Suggested execution waves
+
+Keep **one integrator and at most three active specialists** at a time. A package
+is a responsibility, not a requirement to create a permanent chat or keep the same
+agent occupied through every later gate. Reuse available agents for later packages.
+
+| Wave | Main packages | Required result before dependent integration |
+|---|---|---|
+| 0 | P0 contracts; P1/P2 interface design; P11 baseline harness | Pin existing work, agree shared keys/change contracts and capture an equal-output baseline. P9's erasure design is part of contract review. |
+| 1 | P1 canonical inputs, P2 selective metadata, P11 reference/cost harness | Stable fact/change/coverage contracts and native-oracle tests. P2 can use current source seals while P1 materialization is assembled. |
+| 2 | P3 summaries, P4 shared features, P8 durable work | Qualified exact validation, common feature/contribution contracts and the generic resumable work/preparation lane. P8's fit/cache/publication adapters and cleanup close after P5–P7 artifacts stabilize. |
+| 3 | P5 rolling fits, P6 cache pairs, P7 publication/membership | Independent output-family work composes through exact contribution and closure contracts. |
+| 4 | P9 complete erasure/restore, P10 admin completion, P11 integrated comparisons | Full artifact deletion proof, descriptive real progress and whole-workload parity/cost evidence. |
+| 5 | P0 combined qualification with focused reviewer/benchmark help | One frozen owning gate, populated rehearsal and exact candidate/package for isolated online qualification. |
+| 6 | P0 authorized online/production operation and observed convergence | Close H06/H07 against exact deployed identities and complete public outputs; retain rollback and erasure safety. |
+
+Independent contracts, focused tests and synthetic adapters may start earlier
+than their final wave. P9 reviews every store early; P10 can extend the existing
+view while producers mature. A wave is an integration barrier, not a reason to
+wait for unrelated work. Resume P8 in a freed specialist slot to finish its
+artifact adapters and cleanup before the final P9/P11 proofs. Each handoff records
+the exact source revision, owned files/migrations, public contracts, focused test
+results, measured costs and remaining gates. Run focused tests while iterating, then one complete
+owning Worker gate on frozen source plus relevant UI/architecture/docs gates.
+
+### Conditional experiment ownership
+
+P1 leads X01 object/columnar materialization if measurements justify it; P0/P8
+own its runtime and work integration and P9 proves object erasure. P0 leads X02
+container execution, X03 replica adoption and X04 physical placement/migration,
+with P11 providing comparative evidence. P5 leads X05 solver/reset reuse.
+An adopted option needs allocated files and explicit qualification; experiments
+do not bypass open core requirements or independently authorize remote changes.
+
+## Recorded Phase 1 checklist: reusable features and model jobs
 
 The owner requested completion of both durable model-date batches and durable
 shared features/incremental updates across every output family before online
 qualification. This supersedes the earlier sequence that would canary model
-batching before implementing the other families. Completion here means a locally
-qualified, clean release candidate and migration/activation plan; online testing
-and production writes are subsequent, separately recorded operations.
+batching before implementing the other families. The checklist below records the
+implemented initial increment, qualified on the named September 29 candidates.
+It did not include the full maintained-input, invalidation and pair-update
+architecture in A–H. Its correction/replay tests proved correctness and reuse,
+not absence of recurring history scans. Online testing and production writes
+are subsequent, separately recorded operations.
 
 - [x] **L0 — Baseline and acceptance:** preserve the existing working tree;
   identify production source/schema and independent reference kernels.
@@ -38,7 +607,8 @@ and production writes are subsequent, separately recorded operations.
   handle cross-midnight changes, ties, corrections and erasure. Exact reference
   parity passed; a cold dense scheduled case completed in 10 invocations,
   at most 352 statements each, with 427 events and 426 adjacencies.
-- [x] **L6 — Incremental lifecycle:** unchanged replay, outside-window uploads,
+- [x] **L6 — Initial reuse/correction lifecycle:** unchanged replay,
+  outside-window uploads,
   cross-day correction, empty-day changes, repricing, method changes, erasure,
   lease expiry, interruption and stale-source/target fences across all families.
   Lost write responses, prior pricing-method artifacts and correction at the
@@ -61,11 +631,11 @@ and production writes are subsequent, separately recorded operations.
   are verified. Online qualification and fresh live reconciliation remain open;
   the owner subsequently authorized the end-to-end staged rollout below.
 
-The readout will retain these identifiers and distinguish implemented, focused
-tests passed, full local qualification, and ready for online migration. A passing
-partial experiment does not mark its whole checklist item complete.
+These identifiers retain the initial increment's evidence. Full target readiness
+is governed by A–H above, including the cost of its freshness checks. A passing
+partial experiment does not mark a full architecture requirement complete.
 
-## Running checklist: online qualification and production rollout
+## Recorded Phase 1 online qualification and production rollout
 
 The owner authorized proceeding end to end after reviewing the local candidate
 and staged migration proposal. Online testing started with candidate `4ac0b999`;
@@ -157,26 +727,620 @@ recovery, 103 queued days, 67 complete shared feature days and 14 complete
 effective cache marks. The previously qualified `e0bd9b9f` package and deployed
 version receipt remain immutable. The next candidate is still local.
 
+At 16:15 UTC, the clean increment is frozen at `2ad641d3`. Focused cache,
+dependency, daily, graph, progress, admin and activation checks passed. The full
+Worker gate is running. A fresh isolated four-database qualification has the
+verified 89 source and 31 analytics migration imports; its authenticated Worker
+has no production bindings or schedules. Equal completed-output comparison and
+an additional active-correction deletion-safe restore rehearsal remain in
+progress. No production change from this increment has occurred yet.
+
+Qualification caught a bundled initialization defect in `2ad641d3`: the new
+pending-day status query imported the daily publisher through a cycle, leaving
+the historical model-window constant undefined for some entrypoints. A
+dependency-free SQL module fixes the cycle; bundled and ESM entrypoints are
+being rechecked before freezing a successor. Exact query accounting and one
+fixture's source-schema prerequisites also need updates. The isolated test
+stopped before seeding, so it has produced no performance result. The local
+active v1/v1.1 correction restore rehearsal passed, including deletion replay
+and a no-op second replay; it will be repeated against the successor revision.
+
+At 16:47 UTC, successor `3216e225` is frozen and its full Worker gate is
+running. Focused regression checks pass, including both bundle entrypoints,
+query-budget boundaries and aggregate model-adoption telemetry. The exact
+successor's active-correction restore and deletion replay also pass. The first
+online corpus setup failed because its analytics seed required an active runtime
+while the admission rehearsal required a staged one. These now use separate
+synthetic sources; the full initialization and seed sequence passes locally.
+The fresh R2 Worker is deployed with four isolated databases, no production
+bindings or schedules, and its comparable run has started. The separate R1
+admission rehearsal stopped before activation and is being diagnosed. There
+is still no performance claim or production deployment from this increment.
+
+At 16:50 UTC, `3216e225` passed the full owning gate: 191 files and 2,393
+tests, generated contract/type checks, operator checks and deployment dry runs.
+The 31-migration native schema qualification matches the observed live schema;
+all three scheduled artifacts and the retained release package are built.
+Existing website assets are staged by their exact 38-file manifest. R2 has
+completed seeding and reached model publication in both comparison lanes.
+These are local and isolated-online results; production still runs `e0bd9b9f`.
+
+At 17:10 UTC, the complete local comparison passes cold, warm, correction and
+erasure against the frozen Worker bundle. It closes all 69 historical model
+dates and the 70-day publication window before the warm comparison, checks
+today's two-owner model results separately, and proves daily, scalar, preview
+and nonempty cache parity. Erasure removes the owned derived artifacts and
+invalidates the public read. The two failed online setup/comparison attempts
+remain separate evidence and are excluded from performance measurements.
+The isolated owner-kernel activation rehearsal also passes, including the
+expected staged refusal, CAS, audit, replay, V1 archive and V1.1 successor
+readback. Its first two attempts exposed a REST test-adapter error translation
+defect; the corrected attempt records the exact expected refusal. This does not
+claim to exercise production Access/CSRF. Fresh R3 databases are initialized;
+the complete online comparison is the remaining pre-deployment gate.
+
 The owner requested completion of all recommended items after the first
 production rollout. This includes the cache follow-up identified in the receipt.
 Keep the prior deployment evidence intact while qualifying this next increment.
 
+**19:06 UTC update:** `3216e225` is deployed to all three scheduled roles with
+all shared controls enabled. Online cold/warm, correction, accepted-update and
+erasure qualification passed. Integrated public source `c7dcdc6f` passed its
+complete 2,395-test owning gate and deployed at 19:02 UTC. The all-format runtime
+activated at 19:05 UTC with an independently reconciled revision 0→1; all 52
+eligible owners now select the effective path. Production output observation
+is ongoing. These are prior point-in-time observations from the original plan,
+not qualification of the maintained candidate. The candidate ledger records
+its separate local and release gates.
+
 - [x] **N0 — Refresh and pin:** capture current live progress and preserve the
   qualified `e0bd9b9f` fallback, public writer identity and existing dirty work.
-- [ ] **N1 — Cache efficiency:** avoid repeated eight-day validation and
+- [x] **N1 — Cache efficiency:** avoid repeated eight-day validation and
   unnecessary reconstruction for exact-current empty inputs; prove nonempty,
   empty, late correction and erasure parity under actual scheduler budgets.
-- [ ] **N2 — All-format transition:** implement a guarded, resumable operator
+- [x] **N2 — All-format transition:** implement a guarded, resumable operator
   and qualify the deployed writer, effective reader, rollback target,
   correction retention, predecessor closure, erasure and restore together.
-- [ ] **N3 — Comparable online measurement:** compare identical completed
+- [x] **N3 — Comparable online measurement:** compare identical completed
   outputs and input ranges through cold, warm and correction work; retain
   statements, rows, elapsed time and complete publication/adoption evidence.
-- [ ] **N4 — Qualify the release:** integrate the scoped changes into a clean
+  Cold/warm and a fresh accepted additive update have complete cost comparisons.
+  The interrupted replacement correction has separately recovered functional
+  parity; its incomplete cost sample is excluded. Online erasure passed at
+  18:43 UTC. These are isolated synthetic results, not production speedups.
+- [x] **N4 — Qualify the release:** integrate the scoped changes into a clean
   candidate, run the full owning gate and rehearse the exact online operation.
 - [ ] **N5 — Production completion:** deploy the qualified increment, perform
   the qualified all-format transition, and verify nonempty cache/shared graph
   and model-batch work through the existing publisher.
+  - [x] Implement the selected-occurrence lookup and additive index; 39 focused
+    tests prove parity, indexed work and refusal before migration.
+  - [x] Implement durable cache-owner rotation; 70 focused tests cover skipped
+    candidates, real deadlines, owner churn, races and migration refusal.
+  - [x] Qualify the guarded migration and enabled deployment operators locally:
+    8 and 37 tests pass, respectively; successor frozen at `21e694cc`.
+  - [x] Pass the complete successor Worker gate and package its exact artifacts:
+    2,403 tests in 191 files passed at 20:26 UTC; all 32 analytics migrations
+    qualified locally and the three scheduled bundles are retained.
+  - [x] Receive approval and temporarily pause all three telemetry schedules;
+    live cron arrays were verified empty at 21:31 UTC.
+  - [x] Replace the source-index migration that failed with `SQLITE_NOMEM`;
+    read-only reconciliation proved it did not apply. The analytics cursor
+    migration was not attempted. Qualify existing-index lookup alternatives
+    against the measured 9.8-million-record retained table. Successor
+    `198be972` reuses existing occurrence indexes and adds only two metadata
+    indexes; 41 lookup tests and 10/37 operator tests pass. The sparse
+    166-manifest case shows fanout overhead, so no blanket speedup is claimed.
+  - [x] Retire the proven-not-applied operation with exact journal/lock guards;
+    original evidence is preserved and its matching lock released at 21:49 UTC.
+  - [x] Pass `198be972`'s complete owning gate and apply its two required
+    additive migrations. The gate passed all 2,405 tests and dry builds at
+    23:02 UTC. Both migrations completed with verified full schemas and ledgers.
+  - [x] Deploy the successor public and three scheduled Workers. The public
+    backend completed and verified `198be972` at 23:10 UTC; all three scheduled
+    roles completed and verified at 23:42 UTC. The reviewed rollout tool
+    corrections and recovered journal are retained with the deployment proof.
+  - [x] Restore the recorded schedules against verified successor versions.
+    Restoration completed with live readback at 23:45:39 UTC: analytics and
+    publication every minute, cache every five minutes.
+  - [x] Resolve missing scheduled execution after restoration. At September 30
+    00:16 UTC, dedicated cron history and retained log counts showed no new
+    scheduled runs; a connection probe confirmed all three live tails opened.
+    Exact handlers, versions, environments and schedule arrays remain verified.
+    The exact arrays were reasserted once with a new guarded operation at
+    00:28:35 UTC; provider modification times confirm the writes and the lock
+    is released. Fresh provider cron history and retained logs at 00:46 UTC
+    now prove all three scheduled roles execute. Strict live tails remain empty;
+    this diagnostic alone must not be treated as an absence of execution.
+  - [ ] Resolve the remaining expensive reader/query path: retained summaries
+    show repeated publisher deadline deferrals after approximately 100 queries
+    and graph `d1_cpu_limit` failures. Verify planner and bounded acquisition
+    behavior before selecting the next production increment.
+    - [x] Freeze reader increment `d05135a3`: both source-expansion paths
+      seek requested canonical occurrence IDs through the existing format
+      indexes. Seven reader tests and typechecking pass. Synthetic row cost
+      is 249 versus 445 for one fixture; this is not an overall speedup.
+    - [x] Verify the candidate's plan against production with synthetic-only
+      `EXPLAIN`: both paths use owner dictionary and format occurrence indexes;
+      zero rows are acquired or written. Whole-owner completeness proof cost
+      remains, and the exact statement responsible for live CPU failures is
+      not yet identified.
+    - [x] Qualify successor `c3a5c3b8` incrementally, following the owner's
+      request to avoid repeating large suites for each small change. The first
+      `d05135a3` broad gate passed 2,406 tests and failed one mixed-format fixture;
+      the same failure reproduces on unchanged deployed baseline `198be972`.
+      The fixture drain now follows manifest days and asserts idle and owner
+      authority. Runtime code is unchanged from the broad-tested `d05135a3`.
+      The repeated broad successor run was stopped; its interrupted evidence
+      remains separate. All 49 tests in both affected files, type/contract
+      checks and both dry builds passed at 01:52 UTC on September 30. The exact
+      incremental receipt, old failed gate, baseline reproduction and unchanged
+      migration bytes are bound into the deployment package. This is an
+      incremental qualification, not a green complete successor suite.
+    - [x] Deploy the code-only increment with original schedules and flags.
+      All three scheduled roles verified `c3a5c3b8` at 02:09 UTC on September 30.
+      The public backend is also on that source; current typed schema/config,
+      public health/surface and retained manifest checks passed, and its matching
+      coordination lock was released at 02:20 UTC. There were no migrations.
+    - [ ] Qualify the remaining outputs and failures. By 02:37 UTC, 32 shared
+      feature heads and five model blocks had completed after the scheduled
+      refresh. All 66 active model rows are `not_testable` with
+      `supported_quota_track_unavailable`; these are completed refusal results,
+      not fitted estimates. No active-authority daily publication or effective
+      cache mark appears in July 22–September 29. A separate target aggregate
+      finds zero complete effective daily rows in that window, so the cache
+      builder has no effective daily candidate there. Its `built` log count
+      includes idempotent stored results and is not a new-mark delta. Trace the
+      upstream daily prerequisite and quota eligibility before claiming recovery.
+    - [x] Evaluate and withdraw the source-only chunk-proof experiment. Sparse
+      parity passed, but a dense 200-ID chunk required 17,842 versus 2,048 rows
+      read; both distinct-chunk alternatives also exceeded the original sparse
+      and dense costs. Preserve the unqualified patch and failed assertion.
+      No reader change from this experiment is included in the next release.
+    - [x] Trace actual daily admission: all 294 unqueued stale heads and both
+      selected endpoints precede July 22. All 66 retained in-window stale heads
+      are queued and excluded from stale-head admission. The queue contains 11
+      older days ahead of 69 in-window days. A one-owner source probe also found
+      no typed quota rows across its model window; this does not establish
+      eligibility for the other owners.
+    - [x] Qualify daily admission candidate `47aee7e7`, based on `c3a5c3b8`.
+      Queue-first opportunities alternate oldest/newest selection, while stale
+      priority, bounded skipping and full publication gates remain. All 104
+      tests in four complete affected/consumer files passed, along with types,
+      contract checks, documentation checks and both dry builds. The CI reporter
+      omitted filenames; a reviewed parser correction verifies the closed
+      four-file command and exact 104-test log without rerunning product tests.
+      This is scoped qualification, not a complete new Worker suite.
+    - [x] Deploy the three scheduled roles on daily admission `47aee7e7`.
+      The operation completed at September 30 04:21:30 UTC and released its
+      matching lock. Schemas, controls and schedules were preserved.
+    - [x] Complete public backend reconciliation for `47aee7e7`. Its upload
+      succeeded, but the immediate health read was unreachable; its operation
+      initially remained `deployed_unverified` with coordination held. Full
+      typed/configuration/health/surface/manifest/version checks passed, and
+      its matching lock was released at 05:03:20 UTC. A later failed attempt
+      identifies a primary probe read failure; bounded exact metadata/probe
+      retries preserve the original guards. No deployment was replayed.
+      Retained frontend bytes are unchanged.
+    - [x] Verify recent daily checkpoint progress. At 04:39 UTC, September 28
+      has seven retained complete effective owner rows with the active correction
+      method. This does not prove complete current cohort membership or release.
+      The first observer compared the base method and misclassified active
+      correction rows; its zero-current count is inconclusive and superseded
+      by a distinct bounded observer, preserving both receipts.
+    - [x] Qualify content-free phase timings on frozen `9a59dd27`.
+      All 115 tests in six complete affected/consumer files passed. The new
+      checkout initially lacked generated site assets; a preserved build
+      continuation passed both dry builds without repeating the tests. The
+      composite proof binds both attempts, the parent proof and local assets.
+    - [x] Deploy `9a59dd27` to the three scheduled roles and measure a normal
+      scheduled run. All versions verified and the lock released at 05:50 UTC.
+      One daily attempt spent 48.5 of its 50.6 shared-feature seconds validating
+      dependencies, before page reading or saving. Preserve runtime/authority
+      fences while identifying and reducing that query work.
+    - [x] Diagnose the public `9a59dd27` preflight refusal. The upload never
+      started and no lock was acquired. A distinct read-only check passed all
+      ten typed queries at 06:14 UTC with one bounded metadata retry; it proves
+      no schema mismatch. Public remains verified on `47aee7e7`; include the
+      measured performance fix in the next guarded backend deployment.
+    - [x] Profile exact dependency statements on one bounded, nonempty source
+      scope. Tiny source/header reads took roughly 19–23 seconds wall time
+      despite sub-millisecond D1 execution metadata; the selected scope is not
+      a controlled benchmark of the current heavy publication owner.
+    - [x] Qualify indexed correction expansion in `1ffae989`: all 46 tests in
+      the two complete dependency files passed, with types, guards and dry
+      builds. Dense correction singleton reads fell 13.9–34.8%; batch reads
+      fell 4.4–6.1% while preserving exact dependency bytes. This is local query
+      evidence, not measured publication throughput.
+    - [x] Test temporary scheduler isolation. Analytics/cache were paused at
+      06:43 UTC while publication continued. Publication still spent about
+      44–45 seconds in duplicate dependency proofs and reached its deadline
+      before saving. Original schedules were restored and verified at 07:10
+      UTC; the matching coordination lock is released.
+    - [x] Freeze a bounded save-progress repair in `f54709d3`: reuse the initial
+      private dependency snapshot, reserve observed proof/page latency before
+      acquiring another page, and retain fresh final proofs and clock/lease
+      checks. The first focused run exposed two new test expectation errors;
+      its receipt is preserved. The next regression attempt incorrectly reset
+      its synthetic clock across resumptions; the database correctly refused
+      the backwards timestamp. Follow-up `90c38f6e` fixes only that test clock.
+    - [x] Qualify `90c38f6e` using all 74 tests in the three complete
+      affected/consumer files, TypeScript, contract checks, preflight and both
+      dry builds, reusing the exact qualified parent proof. All three scheduled
+      bundles and 17 deployment-protocol checks also pass. No new large suite
+      was repeated. Retained 9985 frontend bytes are staged separately from
+      archived local qualification assets.
+    - [x] Deploy `90c38f6e` through both guarded backend paths. All three
+      scheduled roles completed at 07:39 UTC; the public backend verified at
+      07:44 UTC. Both coordination locks are released. Original controls,
+      schedules, resources and all 39 retained 9985 frontend files are preserved.
+    - [x] Compare durable progress after rollout. At 07:53 UTC, nine shared
+      feature days and one model block completed after scheduled rollout;
+      one pass adopted two model-date results and completed a graph calculation.
+      At 09:04 UTC this reaches 65 feature days and two model blocks, while
+      fresh daily/model/nonempty effective-cache publication remains unconfirmed.
+    - [x] Refresh the existing Chrome public page. Activity and aggregate
+      allowance now reach September 28; cache continuity increased by 3,685
+      checked follow-ups. These are visible outputs, not proof that each uses
+      the new effective method or that the latest increment alone caused them.
+    - [x] Verify a fresh daily release after the latest increment. The pinned
+      09:49 UTC observation confirms a new active daily head released at
+      09:42:45 UTC and a queue of 78 days. The settled existing Chrome page
+      confirms 362 shared days and $247,909.60 API-equivalent value.
+    - [ ] Verify public model publication and nonempty effective cache output.
+      At 10:18 UTC there are zero active-method model publication days and zero
+      nonempty effective cache marks. Retained public continuity does not
+      substitute for completion of the new paths.
+    - [ ] Resolve the next measured bottleneck. Some heavy feature scopes
+      spend about 44–45 seconds in two dependency proofs; graph scope/model
+      queries still report D1 CPU-limit failures. Profile the exact SQL before
+      changing the schedule, work window or publication guards.
+      - [x] Isolate the busy dependency query with read-only source/target/version
+        fences. Its 150,987 selected occurrences require 2.8 million selection
+        reads and 4.3 million reads including outside matching.
+      - [x] Implement and qualify sealed V1 chunk-header proof reuse on
+        `4b101167`: all 69 tests in four complete affected files, type/contract
+        checks and both dry builds pass; the exact parent proof is retained.
+      - [x] Compare production-identical `c320c534` with deployed `90c38f6e`:
+        exact result parity, 47% fewer rows and SQL execution 3.55 to 1.10 seconds
+        on the busy scope. Earlier sparse-only gains did not improve that scope
+        and were not sufficient for deployment.
+      - [x] Finish the guarded `4b101167` rollout through both backend paths.
+        Scheduled roles verified at 09:24 UTC; public backend verified at
+        09:44 UTC after a pre-write health refusal and a separately journaled
+        retry. The approved analytics/cache pause lasted 09:41–09:45 UTC;
+        all original schedules are restored. Schema proof, role settings and
+        all 39 retained 9985 website files remain unchanged.
+      - [x] Capture source/version-pinned results at 09:38 UTC: 370 complete
+        shared features, 24 complete model blocks and 14 ready model results.
+        Three features completed after this scheduled rollout. No fresh daily,
+        public model or nonempty effective-cache output is confirmed yet;
+        remaining deadline and D1 CPU failures are preserved in the receipt.
+      - [x] Refresh source/version-pinned progress at 10:18 UTC: 395 complete
+        shared features, 25 complete model blocks and 14 ready model rows.
+        After the scheduled rollout, 28 features and one model block completed;
+        the graph queue has 182 pending and three claimed selections.
+      - [x] Measure paged source expansion and owner discovery without changing
+        production code. Usage/quota source expansion completed below 40 ms
+        SQL time in the sampled scope; an owner-discovery rewrite halved reads
+        but did not improve execution time, so it is not selected for rollout.
+      - [x] Locate a larger v1.1 dependency scope using retained chunk metadata.
+        Header/runtime queries complete below 2 ms SQL time, while its exact
+        101-day occurrence-links query reaches the 35-second read deadline.
+        This refused profile does not prove a complete stable dependency.
+      - [x] Isolate v1.1 selection cost: the fenced 101-day phase profile
+        selects 1,746,651 occurrences with 57,334,488 reads and 32.2 seconds SQL
+        time. Completeness is a separate 4.27-million-read / 986-ms phase.
+      - [x] Complete the approved analytics-only contention experiment:
+        paused at 10:55 UTC and restored at 11:03 UTC; publication/cache continue.
+        No fresh daily release is observed. All original schedules are restored.
+      - [x] Qualify sealed v1.1 chunk metadata reuse in `d43c8f92`: all 70
+        tests in four complete files, type/configuration/preflight checks, both
+        dry builds and 17 deployment-recovery checks pass. Exact deployed SQL
+        parity holds and dense selection reads decrease by more than 3x.
+      - [x] Preserve the 11:32 UTC pre-rollout baseline: 437 complete features,
+        25 complete model blocks, 14 ready rows, zero active-method public model
+        days and zero nonempty effective cache marks; latest daily release
+        remains 09:42:45 UTC. Candidate live profiles are refused before the
+        changed query, with explicit D1 CPU-reset evidence.
+      - [x] Complete the guarded `d43c8f92` rollout of all three scheduled roles
+        at 11:41 UTC, with its deployment journal completed and lock released.
+        At 12:16 UTC nine feature heads have completed since rollout; model
+        blocks remain at 25 and ready model rows at 14. Public publication is
+        still a separate open gate.
+      - [x] Complete the public backend's guarded `d43c8f92` rollout.
+        The fifth attempt uploads once; exact typed reconciliation at 13:03 UTC
+        verifies the same journal, retains the 9985 frontend and releases the
+        lock without replaying deployment. The prior four refused attempts are
+        preserved separately.
+      - [x] Complete the approved processing pause and restore all three original
+        schedules. Restoration is verified at 13:08 UTC; a fresh provider API
+        read at 13:39 UTC confirms the exact versions, configuration and crons.
+        A subsequent short diagnostic pause also ends with all original crons
+        verified restored at 14:48:29 UTC, with the coordination lock released.
+      - [x] Qualify local successor `cdcff55e`: 72 tests in four complete files,
+        types/contracts and both dry builds pass by reusing the qualified parent.
+        A fenced same-scope production read matches the `d43c8f92` dependency
+        query exactly and reads 19% fewer rows; its 752 ms SQL time is slower than
+        the reference's 640 ms in that run. It is not deployed and no latency gain
+        is claimed. The code-only package and 17 operator recovery tests pass.
+      - [ ] Evaluate read replication before the next infrastructure change.
+        The September 30, 14:47 UTC provider read verifies replication disabled
+        on ingestion and analytics. Heavy native reads currently use the primary;
+        the budget wrapper supports Sessions, but consumers do not request them.
+        Test a Worker-based session anchored at the primary, preserve fresh
+        primary erasure/authority/publication checks, and measure routing, SQL
+        time, end-to-end time, parity and concurrency 1/2/4. REST cannot test
+        Sessions. The owner's September 30 instruction to proceed authorizes
+        the bounded ingestion-replica trial below; a full publisher cutover
+        remains dependent on its measured result.
+        - [x] **R0:** Create an isolated trial from deployed `d43c8f92`; preserve
+          the separately qualified manifest successor.
+        - [x] **R1:** Implement read-only native Session measurements in isolated
+          `e8bf9ab8`, with primary anchoring and fresh primary dependency and
+          authority checks. The private preview returns aggregate timings only.
+        - [x] **R2:** Qualify correction, erasure, routing and budget behaviour:
+          all 60 tests in three affected files, original Worker types, preview
+          types and dry build pass. The September 30, 15:28 UTC native primary
+          baseline completes with exact parity and a 584 ms measured phase.
+        - [x] **R3:** Verify exact live versions/configuration and enable only
+          ingestion read replication. The operation is verified complete at
+          15:28:53 UTC, with analytics replication still disabled and the
+          coordination lock released. Existing production readers still use
+          primary bindings; replica code is confined to the private preview.
+        - [x] **R4:** Compare primary/session reads at concurrency 1/2/4; record
+          actual routing, failures, SQL time, elapsed time and exact parity.
+          Two initial attempts are refused before the replica phase. The second
+          records a primary lookup CPU/reset refusal after 27.3 seconds, at
+          query 2. All three processing schedules are temporarily paused at
+          15:34:41 UTC under the owner's existing discretionary approval. Allow
+          propagation/draining before interpreting the comparison. Complete
+          preview and private deployed-Worker sweeps pass within-job parity,
+          but every measured query remains on the primary. Native Session
+          bookmarks work; actual replica throughput remains unqualified.
+          Wrangler disables placement in development. A separately deployed,
+          private Worker requests Europe placement and repeats the sweep;
+          all 49 measured Session queries still report primary/ENAM. Each phase
+          scans 1,153,425 rows. No replica saving is claimed.
+        - [x] **R5:** Retain the experimental code locally without publisher
+          adoption. Delete the exact temporary Worker at 16:06:11 UTC and verify
+          all three original processing schedules restored at 16:08:41 UTC;
+          both journals complete with coordination locks released. Ingestion
+          replication remains at its last verified `auto` setting, while
+          production consumers retain their primary bindings. Later database
+          metadata inspection is refused with provider CPU/reset code 7429.
+        - [ ] **R6 — next experiment:** Replace repeated full history dependency
+          scans with maintained day/range summaries. First prove exact v1,
+          v1.1, v1.2, late-correction, cross-day-link, consent and erasure parity
+          locally. Measure read rows and total phase time before deployment.
+          Resolve actual replica routing independently before any Session
+          adoption or claim of parallel scaling.
+          - [x] **S0:** Trace invalidation and preserve the exact v3 identity,
+            correction activation, fresh authority fences and all input versions.
+          - [x] **S1:** Implement an isolated source-day catalog on deployed
+            `d43c8f92`, at `analytics-dependency-summaries`. Granularity is one
+            participant/stream/day, shared across v1, v1.1 and v1.2. Chunk and
+            correction admission maintain presence; retirement retains it and
+            participant erasure removes it. The existing link statement uses
+            the catalog to skip occurrence acquisition only when there is no
+            possible outside day. Positive lookups and batched targets retain
+            the exact scan. Statement count stays unchanged.
+          - [x] **S2:** Qualify populated migration, exact bytes, late arrivals,
+            cross-day links, sessions, runtime activation, guard failures and
+            erasure. Measure read rows and elapsed time with real Miniflare D1.
+            September 30 local evidence: all 53 dependency tests and all 67
+            tests in nine integration files pass. The owner explicitly approved
+            a 10-times minimum for this first slice. Automatic review accepted
+            the exact edit after provenance checks proved the prior 100-times
+            assertion was new uncommitted experiment code. The 2,000-record
+            v1.1 phase reads 917 rows instead of 25,254 (27.5 times fewer).
+            Exact bytes and seven statements are retained. The earlier local
+            wall observation was 14 versus 12 ms; no equivalent throughput
+            saving is claimed. The final owning gate remains S3.
+          - [ ] **S3:** Freeze the candidate and qualify the affected consumers,
+            types, forward-migration tooling and dry deployment. Reuse the
+            owning baseline evidence where valid; run one final owning gate.
+            TypeScript, generated bindings, production dry build and 18 schema/
+            existing-operator tests pass. The derived primary schema adds only
+            two tables and 12 triggers; analytics/ledger schemas are unchanged.
+            The current operator does not yet admit the new primary-only file.
+            Runtime source is now frozen at `3686c56a`; its schema test requires 91
+            primary inputs, both catalog tables and all 12 guards, with 11
+            focused checks passing. The final owning gate resumed at its
+            repaired script step; earlier unchanged passing steps are retained.
+            The broad run covered 191 files / 2,440 tests: 2,431 passed, with
+            nine setup failures in two historical-schema fixtures. Both files
+            now retain their intended prerequisites and all assertions; all 26
+            focused tests pass. Final default/staging dry builds pass. This is
+            combined evidence, not a fresh single all-green full-suite run.
+            - [x] Qualify the local reader, schema, affected consumers and dry
+              builds on frozen runtime bytes, reusing unchanged passing gates.
+            - [ ] Admit this exact file in a guarded migration operator and
+              qualify its drift, interruption and rollback boundaries.
+          - [ ] **S4:** Prepare the exact production migration/deployment plan,
+            reviewed resource scope, pause/restore journal and rollback path.
+            No remote summary migration or candidate deployment has occurred.
+            A non-executable local review package pins 19 migration statements
+            plus the ledger insert in one atomic 20-result request. Its schema
+            comparison adds exactly 14 primary objects and removes none. The
+            guarded execution operator, fresh live fences and post-migration
+            rollback-target qualification remain outstanding. Check whether
+            representative live scopes can use the negative shortcut before
+            expecting a production gain from this first slice.
+            **September 30 live decision:** one version/binding-fenced 101-day
+            sample from the eligible source with the largest retained header
+            volume has outside-day v1.1 and v1.2 candidates. The shortcut is
+            ineligible for that sample. No fraction of other work is inferred.
+            Keep this component local and investigate S6 before rollout.
+          - [ ] **S5:** After the approved online trial, measure freshly completed
+            daily/model/cache outputs and remaining positive-range scan costs.
+            Extend maintained summaries to positive ranges only if warranted.
+          - [x] **S6 — positive-range performance experiment:** avoid the manifest/device
+            fanout for positive ranges by comparing direct record seeks for
+            exact encoded occurrence IDs. Preserve namespace, admission,
+            correction, retained-variant and outside-header proofs. Measure
+            complete dependency rows/time and any new index/storage cost before
+            choosing a durable positive-range summary or production migration.
+            **Completed locally at `45820c6c`:** an optional non-unique owner/
+            encoded-occurrence/format/stream/day index removes the metadata
+            fanout. The existing schema statement discovers it; absence keeps
+            the original exact query. The populated 101-day/166-manifest
+            fixture reads 86,471 rows instead of 1,123,971 (13.0 times fewer),
+            with unchanged seven statements and exact v3 bytes. Local elapsed
+            time is 38 versus 91 ms; no equal wall-clock or production saving
+            is claimed. Sessions-enabled reads fall 16.6 times; a 16-target
+            batch falls 12.4 times, retaining all 22 statements/runtime checks.
+            All 104 dependency tests, 195 tests in ten affected consumer files,
+            21 schema/operator tests, TypeScript, default/staging dry builds
+            and documentation/preflight checks pass. Admission, correction,
+            incomplete proofs, cross-day links, namespace, consent and erasure
+            remain fenced. The 4,164-record index adds 212,992 allocated bytes
+            locally and one index entry per typed record. The complete owning
+            suite is deferred to the final deployment candidate under the
+            owner's requested focused iteration strategy. No remote index or
+            candidate deployment has occurred.
+          - [ ] **S7 — qualify the production index operation:** admit the exact
+            `0006_direct_owner_occurrence.sql` hash in a guarded forward
+            operator; qualify drift, interruption, reconciliation and rollback.
+            The non-executable review package for `45820c6c` proves an index-only
+            schema delta: one index added, no other objects changed, and one
+            migration statement plus the custom-ledger entry in one atomic
+            request. The source-day catalog can remain deferred. Qualify the
+            corresponding canonical/restored schema variants, fresh live
+            version/binding/ledger/capacity/backup fences and final owning gate
+            before the separately authorized production trial. Measure actual
+            completed daily/model/cache/public outputs after that trial.
+            **Rollout preparation at `2fc43efc` (September 30):**
+            - [x] Separate closed one-index profile; old two-role journals and
+              recovery contracts remain valid. Lost-response reconciliation,
+              atomic index/ledger rollback, source/control drift and deployment
+              receipt adoption pass focused checks.
+            - [x] Exact index-only canonical/restored schema expectations hold
+              the hash-pinned catalog; all other role schemas remain required.
+            - [x] Fresh read-only inventory confirms four predecessor Workers
+              at `d43c8f92`, operational collection revision 9, the exact source
+              schema and 13-entry custom ledger, and a Time Travel bookmark.
+            - [x] Primary capacity observed at 6.76 GB with 9.81 million typed
+              records. A separate 100,000-record native D1 experiment uses the
+              observed maximum 42-byte occurrence key and widest integers:
+              78.89 allocated bytes per record. Twice that measured page growth
+              plus 64 MiB reserves 1.62 GB, below the 9 GB operating cap.
+              This is a planning estimate; recheck capacity before the write.
+            - [x] Three scheduled bundles dry-built from retained production
+              configurations, with only source/bundle changes.
+            - [x] Single complete owning Worker gate passed on the frozen
+              `2fc43efc` candidate at September 30, 20:39 UTC: 191 Vitest files,
+              2,491 tests, script/type checks and both dry deployments. The
+              three scheduled bundles form a local-qualified retained package;
+              this does not establish production deployment or performance.
+            - [x] Attempted the approved atomic index operation. The fresh
+              capacity check passed, but D1 refused the index build with
+              `out of memory: SQLITE_NOMEM`, provider code 7500. Exact read-only
+              reconciliation verifies the original schema and 13-entry ledger:
+              the index and migration entry were not applied. The attempt is
+              journaled as aborted-not-applied and its coordination lock is
+              released. No SQL was replayed, no Worker deployed, and no schedule
+              changed. Production remains on `d43c8f92`.
+            - [ ] Reassess the storage/build strategy before another migration;
+              then qualify the successor and measure complete dependency phases
+              and freshly completed outputs. Disk-capacity qualification alone
+              does not establish index-build memory feasibility.
+          - [ ] **S8 — assess physical sharding before retrying:** the owner
+            proposed three or four D1 databases partitioned by device. Separate
+            databases provide independent SQL execution queues and storage
+            capacity; parallelism requires independent jobs and a reducer that
+            can combine their exact results. A source split alone leaves the
+            analytics target and final publisher as possible serial bottlenecks.
+            - [x] At September 30, 21:03 UTC, a read-only compact-metadata
+              aggregate matches 9,811,828 allocated v1/v1.1 typed records across
+              57 physical devices and 54 physical typed owners. The largest
+              device holds 2,521,345 records (25.7 percent). Three physical owners
+              have multiple devices. This is retained allocation evidence, not
+              a deduplicated active-output census; v1.2 and correction archives
+              are outside this count. No participant/device identifiers were
+              returned. The query read 418,386 metadata/index rows in 417 ms SQL
+              time, without scanning the 9.81-million-row record table.
+            - [x] Simulated internal-device-ID modulo placement: three buckets
+              span 3,036,932–3,572,218 allocated records; four span
+              938,121–4,173,671. These are placement proxies, not a production
+              pseudonym-hash simulation or throughput benchmark. Four database
+              names alone do not guarantee balanced work. Equal four-way packing
+              would average 2,452,957 records; the largest indivisible device
+              already exceeds that average.
+            - [x] Source review confirms effective usage reconciles complete
+              occurrence groups across v1/v1.1/v1.2 and correction history in a
+              common identity scope. Device-only storage can scatter one group
+              across databases. Preserve version-neutral deduplication,
+              corrections, quota/session continuity, authority and erasure;
+              identities may determine placement metadata without becoming
+              mandatory computation stages.
+            - [x] Continuity-mapping coverage check: 9,811,828 retained allocated
+              records include 51,562 without a current mapping in the checked
+              metadata. All mapped groups have exactly one continuity key.
+              Preserve the unmapped evidence; do not infer identity, eligibility
+              or erasure from this absence. Resolve its authority before a real
+              source migration. No raw keys or records were returned or saved.
+              A 22:13 UTC aggregate identifies four v1.1 physical groups with
+              memberships and active participants, but no public-source entry
+              or current v1.1 head. This explains the narrower current mapping;
+              preserve their retained evidence and later admission semantics.
+            - [x] Local synthetic physical experiment: create indexes before
+              loading one baseline and four independent native D1 databases;
+              seed 9,811,828 records in each layout through atomic 10,000-row
+              pages with durable checkpoints. Focused rollback, lost-response,
+              identity, interruption and query-parity checks pass (23 tests).
+              Concurrency-four warm occurrence/range queries measured about
+              2.21/2.39 times faster locally, with identical rows read and exact
+              query-result parity. This is physical query evidence, not parity
+              of analytical outputs or a production throughput claim.
+            - [x] Complete the authorized Cloudflare physical experiment:
+              five private synthetic databases, full observed cardinality,
+              native index-before-load, API batch rollback qualification,
+              exact query parity and concurrency 1/2/4 measurements. The
+              [shard experiment plan](2026-09-30-analytics-shard-experiment.md)
+              tracks this bounded storage experiment and remaining cutover gates.
+              Both online layouts sealed 9,811,828 synthetic headers at
+              September 30, 22:53 UTC. Exact count/checksum parity holds at
+              concurrency 1/2/4. At concurrency four, a full indexed count/checksum
+              scan measured 1.276 seconds in one database versus 0.822 seconds across
+              four (1.55 times faster); short indexed queries were slightly
+              slower with four databases. Only aggregate rows were returned;
+              header transfer and analytical computation were not measured.
+              All indexes were created before rows,
+              avoiding a populated-index build. Baseline seed cost/time remains
+              incomplete after interruption; native checkpoint recovery retained
+              the committed prefix. Production versions remained unchanged at
+              the 22:55 UTC read-only check.
+            - [ ] **Next local slice:** qualify one complete source-store rebuild
+              with required indexes created before loading, preserving every
+              format, dictionary, admission/correction state, staged record and
+              erasure fence. Resume dependency summaries and shared date/feature
+              reuse after that qualification; measure end-to-end gains before
+              expanding production source storage to four databases.
+            - [ ] Compare a bounded one-database rebuild with three/four shadow
+              databases. Create reviewed indexes while targets are empty, then
+              seed through resumable bounded batches; merely dividing the table
+              into four does not prove a populated-index build fits D1 memory.
+              Prefer stable logical buckets with explicit placement and balance
+              measurements. Keep duplicate/correction variants together or prove
+              complete cross-shard reconciliation before publication.
+            - [ ] Measure exact counts/API value, scalar/model fits and cache
+              output parity; correction, replay, interruption and erasure; build
+              memory/storage, per-phase rows/time and complete output throughput
+              at concurrency 1/2/4. Include analytics-target/publication limits.
+              Preserve the original production stores until a separately
+              qualified shadow cutover and rollback are concrete. No shard was
+              provisioned or production input moved by this assessment.
+      - [ ] Measure durable saves, new daily/model publication and nonempty
+        effective-cache output after the rollout; retain failures and latency
+        observations separately from the single-query comparison.
+  - [ ] Observe newly completed nonempty cache, model-block adoption and public
+    publication; measure their actual throughput and remaining failures.
+- [ ] **N5a — Explain the new flow in the admin pipeline:** replace the four
+  broad counters with the stage and output-family view specified below. Expose
+  prepared, calculated, adopted and published work separately, with units,
+  freshness and blockers. Qualify the bounded admin read, canonical web assets
+  and rendered target before including this view in a production release.
 - [ ] **N6 — Final readout:** reconcile all remaining checks with observed
   results, record measured gains and unresolved limitations, and retain the
   exact forward-safe recovery artifacts.
@@ -185,13 +1349,86 @@ The separate website deployment released the production coordination lock.
 Its availability is rechecked before each operation. Progress and evidence are
 recorded in the [online rollout receipt](../receipts/2026-09-29-shared-analytics-online-rollout.md).
 
-**Remaining all-format cutover boundary:** the shared reader supports v1, v1.1
-and v1.2, but current production owner selection routes v1/v1.1-only owners to
-their existing paths while the correction runtime is inactive. Activating that
+**All-format cutover:** the shared reader supports v1, v1.1 and v1.2.
+Production activated the common effective path at 19:05 UTC on September 29.
+Before activation, v1/v1.1-only owners used their existing paths. Activating that
 runtime changes upload admission, retained correction facts and predecessor
 closure, and cannot be reversed to staged state. It therefore needs separate
 writer, rollback-target, erasure/restore and occurrence-reader qualification.
 Completing M5 does not by itself establish an all-format ingestion cutover.
+
+## Admin pipeline visibility acceptance
+
+Added at the owner's request on September 30; tracked as **H02**. The working
+candidate now includes a seven-stage view and bounded, nullable feature/model
+head counts. This checkout's earlier four-card view and that separate working
+implementation must not be confused with deployed availability. Preparation and
+cache queues remain uncounted; full runtime-control, waiting-reason and live
+publication visibility are still open. The acceptance checklist below therefore
+remains open for the complete requirement.
+
+The overview should follow the actual processing flow:
+
+```mermaid
+flowchart LR
+    I["Accepted changes / journal"] --> D["Delivery / reconcile inputs"]
+    D --> F["Prepare reusable day features"]
+    F --> A["Daily counts and API value"]
+    F --> G["Scalar and model fits / date batches"]
+    F --> C["Session adjacency and cache bands"]
+    A --> V["Each lane: validate current inputs and eligibility"]
+    G --> V
+    C --> V
+    V --> P["Each lane: publish complete outputs"]
+```
+
+Stages may share code or run concurrently. The view must not imply that all
+output families wait for one another. Show reuse and dependency validation as
+part of preparation rather than inventing a separate catalog work queue.
+Owner/device keys belong in bounded deduplication and authority diagnostics;
+they should not define the main processing story.
+
+| Area | Granularity and progress to expose | Completion boundary |
+|---|---|---|
+| Accepted input and delivery | Journal changes recorded/applied, remaining changes, current input date coverage | Delivered into the analytical input store |
+| Shared preparation | Source-day feature bundles: ready, building, stale, refused; covered dates and actual durable movement | Complete bundle with current dependencies and method |
+| Daily counts and API value | Analytical days calculated/queued; date coverage; current-method coverage | Complete day contribution ready for the existing publisher |
+| Scalar/model fits | Result dates and plan/model results, separately from date-block jobs; pending/running/complete blocks and resumable cursor | Calculated results adopted into native graph storage |
+| Cache continuity | Source event/day coverage and consecutive-event pairs; pending/complete cache dates | Completed adjacency and cache-band output, including explicit empty inputs |
+| Validation and publication | Ready versus deferred output days/results; published current-method coverage, latest successful replacement per family | Authoritative complete output visible to consumers |
+
+For each area, show its actual work unit, date coverage, latest successful
+completion, observed movement in the last hour/six hours where available, and
+why work is waiting. Distinguish waiting for delivery, stale dependencies,
+refused evidence, query budget, deadline, capacity, retry and caught-up states.
+Use validated reason codes and safe explanations; retain the last failure time
+and retry state without exposing private identifiers or raw errors.
+
+Keep these acceptance checks in the rollout checklist:
+
+- [ ] Define the aggregate progress contract and name every counter's unit and
+  population. Separate queued jobs, stale output dates and retained results;
+  explain why a count can exceed the dates in the displayed recent range.
+  Include years when a displayed range crosses calendar years.
+- [ ] Expose enabled controls and deployed processing method from authoritative
+  runtime state. Missing telemetry is “not reported”; it is never zero, idle or
+  proof that a planned stage runs in production.
+- [ ] Use compact persisted metadata or bounded existing summaries. Admin
+  refresh must not rebuild outputs or scan source history for an estimate.
+- [ ] Label completed stored artifacts separately from artifacts validated
+  against current inputs. If freshness has not been checked, say so rather
+  than calling the artifacts ready for publication.
+- [ ] Render a readable flow and output-family progress, with expandable
+  technical detail for granularity, budgets and cursor progress. A successful
+  invocation or checkpoint advance must not count as completed publication.
+- [ ] Preserve last completed public output while replacement work proceeds;
+  show public freshness separately from calculation freshness. Do not infer a
+  percentage or forecast from unrelated counters.
+- [ ] Add focused contract/render checks for partial, missing, stale, refused,
+  deferred and failed states; inspect the actual admin target at desktop and
+  narrow widths. Regenerate Worker admin assets from canonical web sources.
+- [ ] Record local implementation, deployed availability and observed live
+  output progress separately before marking N5a complete.
 
 ## Purpose and decision boundary
 
@@ -201,19 +1438,24 @@ work per accepted change and faster completion of historical calculations.
 **Tenfold improvement is an experiment target; 100-fold improvement is a stretch
 hypothesis for workloads dominated by repeated acquisition. Neither is proven.**
 The target design and local delivery record are separate from deployment
-authorization. The checklists above distinguish local qualification, deployed
-controls and remaining production measurement.
+authorization. The implementation register above distinguishes the complete
+target from qualified initial building blocks and dated rollout records.
 
 The [artifact catalog](../research/2026-09-28-analytics-artifact-catalog.md)
 describes the existing system. Source findings here use analytics candidate
 `23575017c61d7b83093227d71e09096e50cf7bd1`. Its
 [production receipt](../receipts/2026-09-28-effective-usage-throughput.md)
-is a dated deployment observation, not a fresh production audit. The latest
-deployment is recorded in the September 29 rollout checklist and receipt above.
+is a dated deployment observation, not a fresh production audit. Subsequent
+deployment/progress observations are dated in the rollout records above; none
+is a fresh live audit supplied by this document correction.
 The [production runbook](../runbooks/production-operations.md) remains the
 operational authority.
 
-## Implementation and rollout checkpoint
+## Recorded implementation and rollout checkpoint — September 29
+
+This table is the initial rollout snapshot. Use the September 30 implementation
+register for remaining target requirements; this snapshot does not claim cheap
+maintained validation, canonical fact partitions or incremental cache-pair repair.
 
 Production readback at **2026-09-29 15:30 UTC** verified all three scheduled
 roles on `e0bd9b9f`, with shared features enabled and model blocks enabled on
@@ -230,14 +1472,15 @@ results and unexercised boundaries are in the
 | Clean release candidate and all-family qualification | `e0bd9b9f` passed the owning gate, 2,375 tests, dry builds and native schema/package qualification | Online parity passed on parent `9a590a4a`; the two-file scheduling follow-up deployed and completed production delivery recovery |
 | Object-backed features, containers and concurrency 1/2/4/8 | Planned experiments | No redesign implementation or qualification |
 
-The requested local milestones L0–L9 are complete as of **2026-09-29 01:51 UTC**.
+The initial increment's local milestones L0–L9 were complete as of
+**2026-09-29 01:51 UTC**. This does not complete the full target architecture.
 Candidate `4ac0b999` is committed locally on `codex/analytics-shared-qualified-local`;
 it has not been pushed or merged into the main branch. The detailed local
 receipt is [durable shared analytics qualification](../receipts/2026-09-28-durable-shared-analytics-local.md).
 Earlier experiment receipts below remain point-in-time measurements of their
 named workloads; the table above records the September 29 deployed state.
 
-### Completed rollout sequence and next measurements
+### Recorded initial rollout sequence and next measurements
 
 The owner changed the sequence to finish both durable blocks and shared
 features locally first. The model-only canary recommendation is superseded.
@@ -272,6 +1515,8 @@ optimizations, not claims made by the current candidate.
 
 ## Recommendation
 
+**Full target; partially implemented.** Requirements A–H above define completion.
+
 Build one version-independent, incrementally maintained analytical input layer.
 From each changed input partition, produce a shared set of exact features for
 activity, pricing, allowance and cache continuity. Calculate adjacent graph dates
@@ -294,6 +1539,10 @@ installation is unnecessary to prove the reduction in work.
 | Separate computation from publication | Many workers can compute immutable results; small guarded commits decide what readers may see. |
 
 ## 1. Sanity check: version labels and identity
+
+Implementation mapping: **A01–A05**, with shared preparation in **B01–B03**.
+Existing source observations below are the September 28 design baseline; the
+implementation register separates later shared-path work from unfinished targets.
 
 ### The v1.1 labels are real, but not every v1.1 name is a restriction
 
@@ -358,6 +1607,10 @@ separate, as required by the [accepted opt-out contract](../decisions/2026-09-15
 
 ## 2. Contracts from inputs to outputs
 
+Each artifact below is a target contract. Its implementation is tracked by the
+named register IDs; the presence of a consumer output does not prove that its
+proposed intermediate artifact has been implemented.
+
 The input streams remain usage occurrences, quota observations, session/tool facts,
 attribution/corrections, reference policies and eligibility. The required outputs
 remain activity, API-equivalent value, allowance views and cache continuity.
@@ -367,17 +1620,17 @@ Today's scheduler calculates scalar `fits` for the current date and historical
 current scalar results reuse the same acquisition features. Adding a new historical
 scalar series would be a separate output enhancement, not required for this plan.
 
-| Reusable artifact | Logical grain | Stored contents | Consumers |
-| --- | --- | --- | --- |
-| Canonical facts | Stream × logical occurrence × effective revision | Allowlisted normalized columns, time/order, explicit field presence and conflict state; private provenance references | All reducers; replay and new method versions |
-| Partition manifest | Logical partition × content revision | Ordered object references, schema, min/max time, row counts, content hash, exact dependencies, authority revision | Scheduling, reuse, reconciliation, erasure |
-| Activity contribution | Partition × UTC day × provider/model cell | Integer token components, usage/quota counts, session/tool facts where used, maximum activity time, membership state | Daily table/chart, headline totals |
-| Priced usage features | Occurrence/time segment × pricing-rule key × pricing version | Integer cost, coverage/unknown flags, price dimensions and ordered interval indexes | API value, scalar allowance, model allowance |
-| Quota timeline | Measurement scope × limit × ordered segment | Percent observations, reset/plan anchors, boundaries/ties, eligibility and uncertainty | Scalar and model feature assembly |
-| Fit features | Measurement scope × reset/observation interval × method/dependency | Exact boundary costs, hazard/coverage state, model cost vectors, source ordinals/counts and window membership | Date-specific scalar and joint model solves |
-| Cache adjacency | Session × consecutive-event pair × method/dependency | Endpoint references, gap, comparator configuration, reuse and exclusion contributions | Reversible day/model/gap-band reduction |
-| Output contribution | Partition or fit scope × output date × method/dependency | Additive day/band counters, exact memberships, fit samples or model-result contribution | Community publication |
-| Published output | Output family × date/window × revision | Complete payload, dependency root, eligibility epoch and method versions | Public API and browser |
+| Reusable artifact | Logical grain | Stored contents | Consumers | Register |
+| --- | --- | --- | --- | --- |
+| Canonical facts | Stream × logical occurrence × effective revision | Allowlisted normalized columns, time/order, explicit field presence and conflict state; private provenance references | All reducers; replay and new method versions | A02/A03 |
+| Partition manifest | Logical partition × content revision | Ordered object references, schema, min/max time, row counts, content hash, exact dependencies, authority revision | Scheduling, reuse, reconciliation, erasure | A03/C02/G01; X01 if object-backed |
+| Activity contribution | Partition × UTC day × provider/model cell | Integer token components, usage/quota counts, session/tool facts where used, maximum activity time, membership state | Daily table/chart, headline totals | B05/F01/F02 |
+| Priced usage features | Occurrence/time segment × pricing-rule key × pricing version | Integer cost, coverage/unknown flags, price dimensions and ordered interval indexes | API value, scalar allowance, model allowance | B01/B04/D01 |
+| Quota timeline | Measurement scope × limit × ordered segment | Percent observations, reset/plan anchors, boundaries/ties, eligibility and uncertainty | Scalar and model feature assembly | D01/D03 |
+| Fit features | Measurement scope × reset/observation interval × method/dependency | Exact boundary costs, hazard/coverage state, model cost vectors, source ordinals/counts and window membership | Date-specific scalar and joint model solves | D01/D03/D04 |
+| Cache adjacency | Session × consecutive-event pair × method/dependency | Endpoint references, gap, comparator configuration, reuse and exclusion contributions | Reversible day/model/gap-band reduction | E02/E03 |
+| Output contribution | Partition or fit scope × output date × method/dependency | Additive day/band counters, exact memberships, fit samples or model-result contribution | Community publication | B05/E04/F01/F02 |
+| Published output | Output family × date/window × revision | Complete payload, dependency root, eligibility epoch and method versions | Public API and browser | D05/F03/F04/H07 |
 
 These are logical contracts, not a prescription for nine services or nine SQL
 tables. A partition builder should emit several features in one streamed pass;
@@ -392,6 +1645,11 @@ schema. Source facts remain replayable under the existing retention contract;
 this proposal does not authorize discarding evidence or retaining new fields.
 
 ## 3. Complete target flow and granularity
+
+**Target diagram, not a deployed-system diagram.** Canonical facts/manifests,
+maintained change queues, session-neighbor repair and parallel partition builders
+include unfinished A–H requirements. Shared day features/date batches currently
+provide only part of this flow. No box is implemented merely because it is drawn.
 
 ```mermaid
 flowchart TB
@@ -452,6 +1710,8 @@ not make a slow graph complete.
 
 ### 4.1 Canonicalize each changed occurrence once
 
+Required implementations: **A02–A05, B01 and C03/C04**; these remain incomplete.
+
 After a complete source activation, reconcile source variants and corrections
 against the previous accepted revision. Emit insert, replace, withdraw or no-op
 effects. A repeated upload or unchanged manifest must produce no analytical work.
@@ -467,6 +1727,9 @@ session neighbors, quota scope and erasure subject. The scheduler splits large
 partitions or groups small ones. It does not recreate the owner/device hierarchy.
 
 ### 4.2 Fuse compatible reductions
+
+Required implementations: **B01/B04/B05**. Working shared preparation is a local
+increment; exact compatible reuse and selective repricing must both be qualified.
 
 A streamed usage pass can decode and price an occurrence once, then feed activity
 counters, scalar/model features and cache adjacency. Quota and session streams
@@ -488,6 +1751,10 @@ logic may require replay of affected canonical occurrences. Repricing should not
 invalidate unrelated token counts or cache evidence.
 
 ### 4.3 Reuse ordered features across many calculation dates
+
+Required implementations: **D01–D05**. Durable features/date batches and native
+adoption are implemented foundations; maintained validation and exact narrow
+rolling-window updates, **C06/D03**, remain open.
 
 Load one date block plus its required history once. For the existing model/effective
 history window, calculation date D uses D minus 100 through the end of D. Advancing to D+1 admits
@@ -553,6 +1820,9 @@ from statistical parity.
 
 ### 4.4 Maintain cache pairs instead of rereading seven days
 
+Required implementations: **E01–E04**. Existing shared events/carry satisfy E01;
+persistent neighbor and reversible pair state, E02/E03, are not implemented.
+
 Use a persistent ordered session index. An inserted event X between P and N
 replaces P→N with P→X and X→N. Attribute each contribution to the later endpoint's
 day. Re-evaluate the exact comparator, gap, exclusion and unknown rules. Deletion
@@ -595,6 +1865,10 @@ the omitted/null series when no evidence exists in any window.
 
 ### 4.5 Replace contributions and publish dependency-complete outputs
 
+Required implementations: **B05, C01–C07 and F01–F04**. Existing guarded writers
+and public continuity do not supply maintained partition membership or cheap
+incremental dependency validation.
+
 For additive fields use `new total = old total - old contribution + replacement`,
 with an idempotent transactional revision swap. For non-additive quantities retain
 exact membership/reference counts, ordered candidate values or fit samples; merge
@@ -619,6 +1893,10 @@ not invalidate an unchanged day's features. An authority change can withhold
 publication immediately without forcing unrelated arithmetic to be rebuilt.
 
 ## 5. Scheduling, storage and meaningful parallelism
+
+Required implementations: **G01–G06**. Backend/runtime choices **X01–X04** remain
+conditional experiments; existing role schedules are not a qualified parallel
+partition pool.
 
 ### Proposed service responsibilities
 
@@ -713,6 +1991,11 @@ revoke the old one. [R2 consistency and caching](https://developers.cloudflare.c
 
 ## 6. Precise invalidation instead of global rebuilds
 
+Required implementations: **C01–C07, B04, D03 and E02/E03**. The table describes
+the target invalidation behavior, not behavior already delivered for every row.
+Conservative participant-wide stamps can safely bridge to it, but do not meet
+the narrow invalidation/no-history-rescan acceptance by themselves.
+
 | Change | Necessary work | Work usually reusable |
 | --- | --- | --- |
 | Identical reupload / unchanged day manifest | Receipt/authority bookkeeping only | All measurement features and results |
@@ -744,6 +2027,9 @@ complete from a publication change alone; the durable deletion ledger must also
 prevent restored backups from reintroducing the evidence.
 
 ## 7. Where tenfold or hundredfold gains could come from
+
+Qualification requirements: **H03/H04/H07**. Component savings and hypothetical
+multipliers do not complete the whole-workload or production gates.
 
 ### Separate work, throughput and latency
 
@@ -795,6 +2081,10 @@ fractions first. No current profile establishes those assumed percentages.
 
 ## 8. Experiments and acceptance gates
 
+Required qualification: **H03–H06**, plus **G04** if parallel execution is adopted.
+Historical experiment completions below apply only to their named increments.
+They do not close the full E1/E2/E3 acceptance criteria against newly added code.
+
 ### Local implementation checkpoint — September 28
 
 The [batched dependency follow-up](../receipts/2026-09-28-batched-analytics-dependencies.md)
@@ -832,9 +2122,10 @@ persist raw records or session identifiers.
 The [local experiment receipt](../receipts/2026-09-28-shared-analytics-benchmark.md)
 records exact analytical parity, query/row reductions, the sparse-fixture and
 persistence limits, and the remaining dependency-query bottleneck. This completes
-the first local slice, not E2/E3 or the whole-work promotion gate. Its dependency
-bottleneck is addressed by the paired follow-up above. Durable model-date
-execution is measured below; public publication remains a separate gate.
+the first local slice, not E2/E3 or the whole-work promotion gate. The paired
+follow-up batches dependency acquisition; it does not eliminate repeated native
+history validation. That unfinished work is C01–C07. Durable model-date execution
+is measured below; public publication remains a separate gate.
 
 ### Durable model-date blocks: local implementation
 
@@ -926,6 +2217,10 @@ publication; scalar and cache-continuity representations, production routing and
 parallel admission remain independent work.
 
 ### Current local slice: native graph adoption
+
+**September 28 experiment record.** The heading is retained for existing receipt
+links; it does not identify the current implementation stage. See D05 and H05/H06
+for foundation versus new-candidate qualification.
 
 **Implemented and qualified locally September 28; production remains off.** The
 owner approved proceeding step by step. The acceptance boundary is identical
@@ -1113,7 +2408,7 @@ must eventually resolve without duplicate analytical effects or stale visibility
   weighting, reset votes or model selection caused by physical partitioning.
 - Feature creation, metadata, retries, compaction and erasure are counted in cost;
   a warm result alone cannot justify a whole-system multiplier.
-- First promotion target: at least 10× lower total measured work/cost on the
+- Deferred performance target: at least10× lower total measured work/cost on the
   repeated-history workload, with small-update and cold-path regressions explicitly
   reviewed. If this is not met, profile the remaining dominant stage before scaling.
 
@@ -1123,6 +2418,10 @@ added as if they were the same unit. Compare equal complete output sets, includi
 refusals and coverage; producing fewer eligible results is not an optimization.
 
 ## 9. Migration sequence and stop points
+
+Required gates: **H05–H07**. The earlier Phase 1 rollout does not qualify migrations
+or cutover for the unfinished target. Migration/code/activation and live output
+verification must identify the exact new candidate and adopted storage choices.
 
 1. **Freeze semantics and measure.** Capture input/output contracts and reference
    results; finish E1/E2 locally. Decide the physical store from results.
@@ -1203,28 +2502,24 @@ and container target is a candidate to earn its place through that experiment.
 
 ## Validation of this plan
 
-Source-sensitive claims were checked against the pinned code and two focused
+**September 30 status correction:** the full implementation register separates
+43 core requirements from five conditional experiments and preserves the dated
+initial-increment evidence. Source presence and remaining dependency scans were
+checked locally; no production query or code/deployment change formed part of
+this correction. Documentation/link governance, root hygiene/whitespace and all
+20 documentation/guidance preflight tests passed. These validate the document,
+not completion or performance of the new architecture.
+
+**Agent work-package coverage:** the 34 open core IDs are assigned once across
+P0–P11, with explicit file ownership, interface dependencies, acceptance criteria
+and execution waves. The nine completed foundations remain outside that open
+assignment; conditional experiments have separate proposed owners. This grouping
+defines work boundaries and does not start agents or advance implementation status.
+
+**Original September 28 design validation:** source-sensitive claims were checked
+against the pinned code and two focused
 read-only reviews. Official Cloudflare/DuckDB documentation was checked on
 September 28 for the platform claims linked above. The system diagram was
 rendered and visually inspected in Chrome. Documentation/link governance and
 the preflight documentation/guidance suite passed; these checks validate the
 document, not the proposed architecture's performance or deployment readiness.
-
-## September 30 physical sharding experiment
-
-After the qualified direct-index build was refused with `SQLITE_NOMEM`, the
-owner approved one-versus-four private shadow databases. The isolated source
-candidate remains recoverable at `2fc43efc`; it was not deployed after that
-refusal. Production remains at `d43c8f92` as last reconciled.
-
-See the [physical shard experiment](2026-09-30-analytics-shard-experiment.md)
-for the running checklist. Local synthetic native D1 seeding and query parity
-are complete at the full 9,811,828-record cardinality. The online experiment
-sealed both layouts at 9,811,828 synthetic headers. At concurrency four, an
-indexed count/checksum scan over the complete dataset measured 1.55 times
-faster across four databases; short indexed reads were slightly slower. Only
-aggregate rows were returned; header transfer and analytical computation were
-not measured. Required indexes were created before loading. The next local
-slice qualifies one complete rebuilt source store and then resumes shared
-preparation and dependency summaries. Real-source migration, all-output parity,
-publication throughput and a production cutover remain separate gates.

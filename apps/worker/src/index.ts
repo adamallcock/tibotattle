@@ -3668,7 +3668,8 @@ async function optionalStorageAnalyticsBindings(env:Env,
   sourceId=row.source_id;
  }else sourceId=(await captureStorageCommunityAuthority(env.USAGE_MONITOR_DB,
   {sourceNamespace:mode.sourceNamespace})).sourceId;
- return {source:env.USAGE_MONITOR_DB,target:target as D1Database,sourceId,sourceNamespace:mode.sourceNamespace};
+ return {source:env.USAGE_MONITOR_DB,target:target as D1Database,sourceId,sourceNamespace:mode.sourceNamespace,
+  ...(Reflect.get(env,'STORAGE_ANALYTICS_CANONICAL_PIPELINE')==='enabled'?{canonicalPublications:true}:{})};
 }
 
 async function handleAdminOverview(
@@ -4007,7 +4008,8 @@ async function handleCommunityDaily(
         const authority = await captureStorageCommunityAuthority(env.USAGE_MONITOR_DB,
           {sourceNamespace:storageMode.sourceNamespace});
         return await readPublishedStorageCommunityDaily({source:env.USAGE_MONITOR_DB,target:target as D1Database,
-          sourceId:authority.sourceId,sourceNamespace:storageMode.sourceNamespace,fromDay:from,throughDay:to});
+          sourceId:authority.sourceId,sourceNamespace:storageMode.sourceNamespace,fromDay:from,throughDay:to,
+          ...(Reflect.get(env,'STORAGE_ANALYTICS_CANONICAL_PIPELINE')==='enabled'?{canonicalPublications:true}:{})});
       } catch { throw new ApiError(503,"BACKEND_STORAGE_UNAVAILABLE"); }
     })();
   const today = new Date(nowMs).toISOString().slice(0, 10);

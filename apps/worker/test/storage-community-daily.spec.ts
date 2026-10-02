@@ -17,6 +17,8 @@ import { CACHE_RETENTION_BAND_IDS, CACHE_RETENTION_METHOD,
   CACHE_RETENTION_PUBLIC_SCHEMA_VERSION } from "../src/cache-retention-values";
 import { reduceCacheRetentionDay } from "../src/cache-retention-values";
 import { cacheRetentionLookbackDays, writeCacheRetentionDay } from "../src/cache-retention-day";
+import { beginCanonicalPublicationClosure, commitCanonicalPublicationClosure,
+  sealCanonicalPublicationExpected } from '../src/storage-canonical-publication';
 import { handleRequest } from "../src/index";
 import { initializeStorageSource, prepareIngestionChange, readIngestionChanges } from "../src/analytics-delivery";
 import { initializeTypedV11Admission, persistTypedV11StagedChunk } from "../src/typed-v11-admission";
@@ -297,6 +299,39 @@ describe('independent public daily publication',()=>{
     expect((await advanceStorageCommunityDaily({...options(),target:db})).state).toBe('published');expect(lost).toBe(true);
     expect((await publish()).state).toBe('unchanged');
     expect(await target().prepare('SELECT count(*) n FROM analytics_community_daily_publications').first('n')).toBe(1);
+  });
+  it('retains the queued revision when the daily cursor guard disappears at the final publication batch',async()=>{
+    await fixture();await ready();expect((await publish()).state).toBe('published');
+    const immutable=(await target().prepare("SELECT sql FROM sqlite_schema WHERE name='analytics_community_daily_revision_immutable'")
+      .first<string>('sql'))!;
+    // Model a genuinely computed older device-method publication. Its complete
+    // payload/cohort stay intact; only this synthetic historical authority marker
+    // changes. No owner fold or completion is manufactured.
+    await target().prepare('DROP TRIGGER analytics_community_daily_revision_immutable').run();
+    await target().prepare("UPDATE analytics_community_daily_publications SET authority_json=json_set(authority_json,'$.dailyDeviceMethod','synthetic-previous-device-method')").run();
+    await target().prepare(immutable).run();
+    await target().prepare('INSERT INTO analytics_community_daily_queue VALUES(?,?,1)').bind(sourceId,today()).run();
+    const before=(await target().prepare('SELECT * FROM analytics_community_daily_publications').all()).results;
+    const queued=(await target().prepare('SELECT * FROM analytics_community_daily_queue').all()).results;
+    const guard=(await target().prepare("SELECT sql FROM sqlite_schema WHERE name='analytics_community_daily_owner_cursor_update'")
+      .first<string>('sql'))!;
+    const meter=createD1InvocationBudget(950),metered=meter.wrap(target());let lost=false;
+    const interrupted=new Proxy(metered,{get(db,key){
+      if(key==='batch')return async<T>(statements:D1PreparedStatement[])=>{
+        if(statements.length===2&&!lost){lost=true;await metered.prepare('DROP TRIGGER analytics_community_daily_owner_cursor_update').run();}
+        return db.batch<T>(statements);
+      };
+      const member=Reflect.get(db,key);return typeof member==='function'?member.bind(db):member;
+    }});
+    expect(await advanceStorageCommunityDaily({...options(),source:meter.wrap(source()),target:interrupted}))
+      .toEqual({state:'deferred',reason:'source_changed',ownersAdvanced:0});
+    expect(lost).toBe(true);expect(meter.queriesUsed).toBeLessThanOrEqual(950);
+    expect((await target().prepare('SELECT * FROM analytics_community_daily_publications').all()).results).toEqual(before);
+    expect((await target().prepare('SELECT * FROM analytics_community_daily_queue').all()).results).toEqual(queued);
+    await target().prepare(guard).run();
+    expect(await publish()).toEqual({state:'published',ownersAdvanced:0});
+    expect((await publicRead()).rows[0]!.revision).toBe(2);
+    expect(await target().prepare('SELECT count(*) n FROM analytics_community_daily_queue').first('n')).toBe(0);
   });
   it('recreates a removed payload and refuses a failed repair of a corrupt same-cohort payload',async()=>{
     await fixture();await ready();await publish();
@@ -1224,6 +1259,57 @@ describe('independent public daily publication',()=>{
     // version nothing wrote returns no rows at all.
     await expect(target().prepare('UPDATE analytics_cache_retention_day_bands SET method_version=?')
       .bind('cache-retention-v3').run()).rejects.toThrow('analytics_cache_retention_day_band_retained');
+  });
+
+  it('selects the stored canonical cache snapshot only when enabled and never calculates on a public read',async()=>{
+    await fixture();await ready();await publish();
+    const day=today(),dayMs=Date.parse(`${day}T00:00:00.000Z`);
+    const write=async(ownerDigest:string,secondRead:number)=>writeCacheRetentionDay({target:target(),
+      key:{sourceId,sourceLayout:'typed-v11',sourceNamespace:namespace,ownerDigest,
+        deviceId:'device-1',manifestId:'manifest-1',manifestDigest:'c'.repeat(64),day},
+      carry:cacheRetentionLookbackDays(day).map(back=>({day:back,manifestDigest:''})),
+      aggregate:reduceCacheRetentionDay({day,events:[0,15*60_000].map((offset,index)=>({
+        sessionDigest:ownerDigest,observedAtMs:dayMs+offset,orderKey:`route-${ownerDigest.slice(0,4)}-${index}`,
+        model:'gpt-5.6-sol',effort:'high',speedMode:'standard',surface:'local_interactive_unclassified',
+        cacheReadTokens:index===0?1_000:secondRead,uncachedTokens:index===0?100:1_000,cacheWriteTokens:0})),
+        carry:[],eventsRead:2})});
+    await write('a'.repeat(64),1_000);
+    const saved=(await publicRead()).cacheRetention;expect(saved).not.toBeNull();
+    const nowMs=Date.now(),closure=await beginCanonicalPublicationClosure(target(),{sourceId,day,
+      family:'cache',watermark:0,authorityDigest:'d'.repeat(64),expectedCount:0,nowMs});
+    expect(await sealCanonicalPublicationExpected(target(),closure)).toBe(true);
+    expect(await commitCanonicalPublicationClosure(target(),closure)).toBe(true);
+    const cohort='e'.repeat(64);
+    await target().prepare(`INSERT INTO analytics_canonical_publication_cohorts
+      (cohort_key,source_id,proof_digest,member_count,state,valid_until_ms,created_ms)
+      VALUES(?,?,?,0,'complete',?,?)`).bind(cohort,sourceId,cohort,nowMs+86_400_000,nowMs).run();
+    const payload=JSON.stringify(saved),authority=JSON.stringify(await captureStorageCommunityAuthority(source(),
+      {sourceId,sourceNamespace:namespace}));
+    await target().prepare(`INSERT INTO analytics_canonical_cache_publications
+      (source_id,revision,closure_key,cohort_key,cache_revision,anchor_day,authority_json,payload_json,payload_sha256,computed_ms)
+      SELECT ?,1,?,?,revision,?,?,?,?,? FROM analytics_canonical_cache_clock WHERE id=1`)
+      .bind(sourceId,closure,cohort,day,authority,payload,await sha256Hex(payload),nowMs).run();
+    // The legacy writer advances independently; the saved canonical DTO must
+    // remain the exact earlier snapshot selected by the route flag.
+    await write('b'.repeat(64),100);
+    const legacy=(await publicRead()).cacheRetention;expect(legacy).not.toEqual(saved);
+    const observed:string[]=[];
+    const observedTarget=new Proxy(target(),{get(database,key){if(key==='prepare')return(sql:string)=>{
+      observed.push(sql);return database.prepare(sql);};
+      const value=Reflect.get(database,key);return typeof value==='function'?value.bind(database):value;}});
+    const enabled=publicEnv(observedTarget);Reflect.set(enabled,'STORAGE_ANALYTICS_CANONICAL_PIPELINE','enabled');
+    const disabled=publicEnv(observedTarget);Reflect.set(disabled,'STORAGE_ANALYTICS_CANONICAL_PIPELINE','disabled');
+    const canonicalResponse=await api(enabled);expect(canonicalResponse.status).toBe(200);
+    expect((await canonicalResponse.json<{cacheRetention:unknown}>()).cacheRetention).toEqual(saved);
+    expect((await (await api(disabled)).json<{cacheRetention:unknown}>()).cacheRetention).toEqual(legacy);
+    expect(observed.join('\n')).toContain('analytics_canonical_cache_publications');
+    expect(observed.join('\n')).not.toMatch(/\b(?:INSERT|UPDATE|DELETE)\b|typed_telemetry_records|materializeCanonical/i);
+    // A missing canonical publication relation is an explicit optional-cache
+    // absence, never permission to serve the independently stored legacy curve.
+    await target().prepare('DROP TABLE analytics_canonical_cache_publications').run();
+    const partial=await api(enabled);expect(partial.status).toBe(200);
+    expect(await partial.json<Record<string,unknown>>()).not.toHaveProperty('cacheRetention');
+    expect((await (await api(disabled)).json<{cacheRetention:unknown}>()).cacheRetention).toEqual(legacy);
   });
 
   it('uses indexed owner/day and latest-revision reads with no raw telemetry read on the public route',async()=>{

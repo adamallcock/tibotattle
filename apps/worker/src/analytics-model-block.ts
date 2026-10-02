@@ -24,7 +24,7 @@ import { GRAPH_DAY_EFFECTIVE_DEVICE_ID, GRAPH_DAY_EFFECTIVE_MANIFEST_ID,
   type GraphDayProjectionWriteCursor, type GraphDayEffectiveQuotaHead } from './graph-day-projection';
 import { modelHistoryWindow } from './model-history-window';
 import { assertEffectiveHistoryOwner, createEffectiveHistoryDayDependencyReader } from './storage-effective-history';
-import { advanceSharedAnalyticsFeatureDay } from './storage-analytics-shared-features';
+import { advanceSharedAnalyticsFeatureDay, type SharedAnalyticsFeatureInput } from './storage-analytics-shared-features';
 import { captureStorageCommunityAuthority, type StorageCommunityOwner } from './storage-community-authority';
 import { captureStorageGraphScope, computeStorageGraphResult } from './storage-community-graph';
 import { readEffectiveTelemetryOwnerDayPage, readEffectiveTelemetryOwnerDays,
@@ -57,6 +57,7 @@ export interface AnalyticsModelBlockInput {
   /** Whole historical block admission used by the opt-in scheduler. */
   historicalAdmission?: { todayDay: string; token: ModelBlockAdmission };
   sharedFeatures?: boolean;
+  canonicalPreparation?: (input: SharedAnalyticsFeatureInput) => SharedAnalyticsFeatureInput['canonicalPreparation'];
   /** Committed older-revision checkpoint; every selected input is re-proved before use. */
   resumeCandidate?: ModelBlockCheckpoint;
   /** Retire stale jobs only after a captured candidate has been source-proved. */
@@ -248,18 +249,31 @@ async function storePreparedDay(target: D1Database, identity: ModelBlockIdentity
 
 export async function appendModelBlockDependencies(source: D1Database, identity: ModelBlockIdentity,
   owner: Owner, prefix: readonly ModelBlockDependency[], check: (queries: number) => void,
-  selected: (dependency: ModelBlockDependency) => void, stopAfter?: number): Promise<void> {
+  selected: (dependency: ModelBlockDependency) => void, stopAfter?: number,
+  remainingSelections?: () => number): Promise<void> {
   const allDays = modelBlockInputDays(identity);
   if (stopAfter !== undefined && (!Number.isSafeInteger(stopAfter) || stopAfter < prefix.length
     || stopAfter > allDays.length)) throw new TypeError('MODEL_BLOCK_INVALID_DEPENDENCIES');
   const days = stopAfter === undefined ? allDays : allDays.slice(0, stopAfter);
-  for (let offset = prefix.length; offset < days.length; offset += 101) {
-    const block = days.slice(offset, offset + 101);
+  for (let offset = prefix.length; offset < days.length;) {
     check(40);
-    const reader = await createEffectiveHistoryDayDependencyReader(source, owner,
-      identity.sourceNamespace, block, { includeSessions: true, occurrenceLinks: 'batched',
+    // Keep a complete-list proof small enough for a partial select checkpoint.
+    // Earlier selected days are excluded when a later invocation resumes.
+    const remaining = remainingSelections?.() ?? 101;
+    if (!Number.isSafeInteger(remaining) || remaining < 1) throw new YieldJob('step_limit');
+    let block = days.slice(offset, offset + Math.min(16, remaining));
+    const readerFor=(selectedDays:readonly string[])=>createEffectiveHistoryDayDependencyReader(source, owner,
+      identity.sourceNamespace, selectedDays, { includeSessions: true, occurrenceLinks: 'batched',
         canContinue: () => { check(2); return true; } });
+    let reader = await readerFor(block);
     if (!reader) throw new YieldJob('dependency_budget');
+    // The native fallback has no complete-list API. Retain its original
+    // ≤101-day shared-header acquisition instead of repeating it per 16 days.
+    if(!reader.readDigests&&block.length<Math.min(101,remaining,days.length-offset)) {
+      block=days.slice(offset,offset+Math.min(101,remaining));
+      reader=await readerFor(block);
+      if(!reader)throw new YieldJob('dependency_budget');
+    }
     const inventory = new Map<EffectiveTelemetryStream, ReadonlySet<string>>();
     for (const stream of ['quota', 'usage'] as const) {
       check(20);
@@ -269,13 +283,34 @@ export async function appendModelBlockDependencies(source: D1Database, identity:
         stream, fromDay: block[0]!, throughDay: block.at(-1)!,
       })));
     }
-    for (const day of block) {
+    // A durable select first records one individually fenced day. Dense cold
+    // acquisition can then exhaust the budget without stranding this prefix.
+    // Read-only verification has no checkpoint and can use the full batch.
+    let firstDigest:string|undefined;
+    const firstSelected=remainingSelections!==undefined&&block.length>1;
+    if (firstSelected) {
       check(2);
-      const digest = await reader.readDigest(day);
+      firstDigest=await reader.readDigest(block[0]!);
+      if(firstDigest===undefined)throw new YieldJob('dependency_budget');
+      selected({day:block[0]!,digest:firstDigest,hasQuota:inventory.get('quota')!.has(block[0]!),
+        hasUsage:inventory.get('usage')!.has(block[0]!)});
+    }
+    // The maintained reader returns no partial batch and takes a final full
+    // source capability fence. An unavailable bulk proof may mean source
+    // change, so only a reader with no bulk API uses the per-day fallback.
+    const digests=block.length>1?await reader.readDigests?.():undefined;
+    if(block.length>1&&reader.readDigests&&digests===undefined)throw new YieldJob('dependency_budget');
+    if (digests && digests.length !== block.length) throw new Error('MODEL_BLOCK_INVALID_DEPENDENCIES');
+    if(digests&&firstSelected&&digests[0]!==firstDigest)throw new ModelBlockSourceChanged();
+    for (let index = firstSelected?1:0; index < block.length; index++) {
+      check(2);
+      const day = block[index]!;
+      const digest = digests?.[index] ?? await reader.readDigest(day);
       if (digest === undefined) throw new YieldJob('dependency_budget');
       selected({ day, digest, hasQuota: inventory.get('quota')!.has(day),
         hasUsage: inventory.get('usage')!.has(day) });
     }
+    offset += block.length;
   }
 }
 
@@ -427,7 +462,7 @@ export async function advanceAnalyticsModelBlock(input: AnalyticsModelBlockInput
             dependency => {
               checkpoint = { ...checkpoint!, dependencies: [...checkpoint!.dependencies, dependency] };
               steps++;
-            });
+            }, undefined, () => maxSteps - steps);
           checkpoint = { ...checkpoint, phase: 'acquire' };
           continue;
         }
@@ -449,10 +484,12 @@ export async function advanceAnalyticsModelBlock(input: AnalyticsModelBlockInput
             }
             if (input.sharedFeatures && (dependency.hasQuota || dependency.hasUsage)) {
               check(110);
-              const feature = await advanceSharedAnalyticsFeatureDay({ source, target,
+              const featureInput: SharedAnalyticsFeatureInput = { source, target,
                 sourceId: identity.sourceId, sourceNamespace: identity.sourceNamespace,
                 owner, day: dependency.day,
-                budget: { remainingQueries: () => meter.remainingQueries, deadlineMs: deadline, now } });
+                budget: { remainingQueries: () => meter.remainingQueries, deadlineMs: deadline, now } };
+              const feature = await advanceSharedAnalyticsFeatureDay({ ...featureInput,
+                canonicalPreparation: input.canonicalPreparation?.(featureInput) });
               if (feature.state === 'deferred') {
                 if (feature.reason === 'source_changed') throw new ModelBlockSourceChanged();
                 throw new YieldJob('shared_feature_pending');

@@ -30,7 +30,7 @@ export async function runStorageRestoreStep({api,source,target,contract,contract
  case 'verify-v1':case 'verify-v11':
   result=await call('verifyAuthorityTypedPage',source,target,contract,contractDigest,stage.slice(7));complete=result.reachedEnd===true;break;
  case 'verify-complete':result=await call('completeAuthorityVerification',source,target,contract,contractDigest);break;
- case 'install-role':result=await call('promoteAuthorityRestore',source,target,contract,contractDigest);break;
+ case 'install-role':result=await call('promoteAuthorityRestore',source,target,contract,contractDigest);complete=result?.state!=='progress';break;
  case 'finalize-role':case 'verify-ready':result=await call('finalizeAuthorityRestore',source,target,contract,contractDigest);break;
  case 'initialize-bootstrap':result=await call('initializeAuthorityRestoreBootstrap',target,contractDigest);break;
  case 'bootstrap':result=await call('bootstrapAuthorityRestorePage',target,contractDigest);complete=result.completed===true;break;

@@ -1,3 +1,4 @@
+import { D1InvocationBudgetExceededError } from "./d1-invocation-budget";
 import type { TelemetryV11Attribution } from "@app-usagemonitor/telemetry-contract";
 import { sha256Hex } from "./crypto";
 import {
@@ -195,6 +196,7 @@ export async function readTypedTelemetryCompatibilityPage(db: D1Database, option
       observedAtMs: last.observed_at_ms, format: last.format, sourceRowId: last.source_row_id,
     } : null };
   } catch (error) {
+    if (error instanceof D1InvocationBudgetExceededError) throw error;
     if (error instanceof TypedTelemetryError) throw error;
     throw new TypedTelemetryError("TYPED_TELEMETRY_UNAVAILABLE", { cause: error });
   }
@@ -324,6 +326,7 @@ export async function readTypedTelemetryRowsByStorageIds(db: D1Database, options
     if (found.size !== ids.length) throw new TypedTelemetryError("TYPED_TELEMETRY_UNAVAILABLE");
     return await decodeRows(db, ids.map(id => found.get(id)!), { sourceNamespace, participantId });
   } catch (error) {
+    if (error instanceof D1InvocationBudgetExceededError) throw error;
     if (error instanceof TypedTelemetryError) throw error;
     throw new TypedTelemetryError("TYPED_TELEMETRY_UNAVAILABLE", { cause: error });
   }
@@ -364,7 +367,7 @@ export async function readTypedTelemetryRowsByStorageIdPages(db:D1Database,
    if(rows.some((row:Row|undefined)=>!row))throw new TypedTelemetryError("TYPED_TELEMETRY_UNAVAILABLE");return rows as Row[];});
   const tools=await readSessionTools(db,ordered.flat());
   return Promise.all(ordered.map((rows,index)=>decodeRows(db,rows,normalized[index]!,tools)));
- }catch(error){if(error instanceof TypedTelemetryError)throw error;throw new TypedTelemetryError("TYPED_TELEMETRY_UNAVAILABLE",{cause:error});}
+ }catch(error){if(error instanceof D1InvocationBudgetExceededError)throw error;if(error instanceof TypedTelemetryError)throw error;throw new TypedTelemetryError("TYPED_TELEMETRY_UNAVAILABLE",{cause:error});}
 }
 
 /** Internal usage-only analytical page. SQL has already bounded and pinned its

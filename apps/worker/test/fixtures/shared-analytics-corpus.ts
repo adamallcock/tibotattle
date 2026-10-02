@@ -10,11 +10,14 @@ import {
   type TelemetryV12DayManifest,
   type TelemetryV12Record,
   type TelemetryV12UsageEvent,
+  type TelemetryV12QuotaObservation,
 } from "@app-usagemonitor/telemetry-contract";
 import { initializeStorageSource } from "../../src/analytics-delivery";
 import { drainCommunityPublicSourceBootstrap } from "../../src/community-daily-aggregates";
 import { canonicalJson } from "../../src/canonical-json";
-import { sha256Hex } from "../../src/crypto";
+import { encodeBase64Url, sha256Hex } from "../../src/crypto";
+import { enrollAccountlessDevice, parseAccountlessEnrollmentRequest } from "../../src/accountless-enrollment";
+import { createAccountlessUploadOwner, parseAccountlessOwnershipRequest } from "../../src/accountless-ownership";
 import { authenticateDevice, claimDeviceUploadAuthorization, createDeviceUploadAuthorization } from "../../src/device-auth";
 import { initializeStorageAnalyticsRuntime } from "../../src/storage-analytics-runtime";
 import { readStorageCommunityOwnerPage, type StorageCommunityOwner } from "../../src/storage-community-authority";
@@ -25,7 +28,7 @@ import { telemetryV11LegacyProjection } from "../../src/telemetry-v11-compatibil
 import { activateTelemetryV12Domain, createTelemetryV12DomainPredecessor } from "../../src/telemetry-v12-domain";
 import { persistTelemetryV12StagedChunk, registerTelemetryV12DayManifest } from "../../src/telemetry-v12-repository";
 import { parseTelemetryV1Chunk, type TelemetryV1UsageEvent } from "../../src/telemetry-v1";
-import { grantTelemetryV12Consent } from "../../src/telemetry-transport-policy";
+import { grantTelemetryV12Consent, grantTelemetryV12AccountlessAuthorization } from "../../src/telemetry-transport-policy";
 import { initializeTypedV1Admission, insertTypedTelemetryV1Chunk } from "../../src/typed-v1-admission";
 import { initializeTypedV11Admission, persistTypedV11StagedChunk } from "../../src/typed-v11-admission";
 import { createV11DeviceFixture, makeV11Day, v11UsageRecord } from "../helpers/telemetry-v11";
@@ -47,6 +50,10 @@ export interface SharedAnalyticsCorpusOptions {
   target: D1Database;
   sourceId: string;
   sourceNamespace: string;
+  /** Integrated harnesses derive target authority from real delivery receipts. */
+  targetAuthority?: "fixture-direct" | "ordered-delivery";
+  /** Local lifecycle qualification only; the ordinary social corpus is unchanged. */
+  secondaryOwnerKind?: "social" | "accountless";
   /** Default 130: the last 30 dates each have a complete 101-date predecessor window. */
   calendarDays?: number;
   graphDays?: number;
@@ -64,6 +71,8 @@ export interface SharedAnalyticsCorpusOptions {
 export interface SharedAnalyticsCorpus {
   owner: StorageCommunityOwner & { ownerDigest: string };
   readonly participantId: string;
+  /** Private laboratory coordinates, never included in aggregate receipts. */
+  readonly secondaryAccountless?: { participantId: string; enrollmentDeviceId: string };
   readonly historyDates: readonly string[];
   readonly graphDates: readonly string[];
   readonly firstGraphLookbackDates: readonly string[];
@@ -79,6 +88,8 @@ export interface SharedAnalyticsCorpus {
   readonly v11DomainThroughDay: string;
   readonly duplicateAcrossOwnersOccurrenceId: string;
   readonly modelFitDates: readonly string[];
+  /** Private coordinates of records actually staged above; no extra admission. */
+  readonly functionalInputs: {usage:{day:string;occurrenceId:string};quota?:{day:string;occurrenceId:string};emptyDay?:string;crossDayDestination:string};
   /** Activates a replacement v1.2 domain day, then returns the current owner CAS pin. */
   mutateCorrection(): Promise<StorageCommunityOwner & { ownerDigest: string }>;
   /** Accepts a new v1.1 event on the current fixture day, outside historical model windows. */
@@ -87,7 +98,7 @@ export interface SharedAnalyticsCorpus {
   appendV11Day(day: string): Promise<StorageCommunityOwner & { ownerDigest: string }>;
 }
 
-type Device = Awaited<ReturnType<typeof createV11DeviceFixture>>;
+type Device = Pick<Awaited<ReturnType<typeof createV11DeviceFixture>>, "participantId" | "deviceId" | "authorization">;
 type V11Ready = Awaited<ReturnType<typeof registerTelemetryV11DayManifest>>;
 type V12Ready = Awaited<ReturnType<typeof registerTelemetryV12DayManifest>>;
 const DAY_MS = 86_400_000;
@@ -127,6 +138,36 @@ export async function initializeSharedAnalyticsCorpusDatabases(
   await initializeStorageAnalyticsRuntime({ source, target, sourceId, sourceNamespace });
   await source.prepare("UPDATE telemetry_v12_runtime SET state='active' WHERE id=1").run();
   await source.prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+}
+
+/** One genuine native enrollment/ownership/grant episode before source cloning.
+ * Credential material stays in fixture memory and is never emitted. */
+async function createAccountlessSecondary(source: D1Database): Promise<Device> {
+  const nowEpoch = Date.now(), deviceId = crypto.randomUUID();
+  const secret = crypto.getRandomValues(new Uint8Array(32));
+  const prefix = new TextEncoder().encode(`app-usagemonitor/device/v1\0${deviceId}\0`);
+  const bytes = new Uint8Array(prefix.length + secret.length);
+  bytes.set(prefix); bytes.set(secret, prefix.length);
+  const deviceSecretHash = await sha256Hex(bytes);
+  const authorization = `Device um_device_${deviceId}.${encodeBase64Url(secret)}`;
+  bytes.fill(0); secret.fill(0);
+  await enrollAccountlessDevice(source, parseAccountlessEnrollmentRequest({
+    schemaVersion: "accountless-enrollment-v0.1", deviceId, deviceSecretHash,
+    policyVersion: "accountless-opt-out-v1", authorizationBasis: "accountless-policy-v1",
+  }), nowEpoch);
+  await createAccountlessUploadOwner(source, authorization, parseAccountlessOwnershipRequest({
+    schemaVersion: "accountless-upload-owner-v0.1", policyVersion: "accountless-opt-out-v1",
+    authorizationBasis: "accountless-policy-v1", telemetrySchemaVersion: "telemetry-contribution-v1.1",
+  }), nowEpoch);
+  const participantId = await source.prepare("SELECT participant_id FROM accountless_upload_owners WHERE enrollment_device_id=?")
+    .bind(deviceId).first<string>("participant_id");
+  if (!participantId) throw new Error("synthetic accountless owner unavailable");
+  const device = { participantId, deviceId, authorization };
+  await grantTelemetryV12AccountlessAuthorization(source, device, {
+    schemaVersion: "accountless-upload-owner-v1.2", policyVersion: "accountless-telemetry-v1.2-policy-v1",
+    authorizationBasis: "accountless-policy-v1.2", telemetrySchemaVersion: "telemetry-contribution-v1.2",
+  }, nowEpoch);
+  return device;
 }
 
 async function grantUpload(source: D1Database, device: Device, label: string) {
@@ -261,6 +302,8 @@ async function ownerFor(source: D1Database, participantId: string) {
  */
 export async function seedSharedAnalyticsCorpus(options: SharedAnalyticsCorpusOptions): Promise<SharedAnalyticsCorpus> {
   const { source, target, sourceId, sourceNamespace } = options;
+  if (options.secondaryOwnerKind !== undefined && !["social", "accountless"].includes(options.secondaryOwnerKind))
+    throw new Error("invalid synthetic secondary owner kind");
   const calendarDays = options.calendarDays ?? 130, graphDays = options.graphDays ?? 30;
   const denseUsageRows = options.denseUsageRows ?? 0;
   const anchorDay = options.anchorDay ?? "2026-09-20";
@@ -407,17 +450,29 @@ export async function seedSharedAnalyticsCorpus(options: SharedAnalyticsCorpusOp
 
   // This is a different owner with the same occurrence ID. The effective
   // reader must never merge it with the primary owner's evidence.
-  const other = await createV11DeviceFixture(source, { participantId: "synthetic-shared-corpus-other" });
-  await insertV1Usage(source, sourceNamespace, other, equivalentDay,
-    duplicateAcrossOwnersOccurrenceId, 1, true);
-  if (crossDayLinkDay) {
-    const otherLinkedDevice = await createV11DeviceFixture(source, { participantId: other.participantId });
-    await insertV1Usage(source, sourceNamespace, otherLinkedDevice, crossDayLinkDay,
+  let secondaryAccountless: SharedAnalyticsCorpus["secondaryAccountless"];
+  if (options.secondaryOwnerKind === "accountless") {
+    const other = await createAccountlessSecondary(source), secondaryReady: V12Ready[] = [];
+    for (const day of historyDates) secondaryReady.push(await stageV12(source, other, day,
+      day === equivalentDay || day === crossDayLinkDay
+        ? [v12Usage(day, duplicateAcrossOwnersOccurrenceId, true)] : []));
+    await activateV12(source, other, secondaryReady);
+    const secondary = await ownerFor(source, other.participantId);
+    if (!secondary.hasV12) throw new Error("synthetic accountless accepted source unavailable");
+    secondaryAccountless = { participantId: other.participantId, enrollmentDeviceId: other.deviceId };
+  } else {
+    const other = await createV11DeviceFixture(source, { participantId: "synthetic-shared-corpus-other" });
+    await insertV1Usage(source, sourceNamespace, other, equivalentDay,
       duplicateAcrossOwnersOccurrenceId, 1, true);
+    if (crossDayLinkDay) {
+      const otherLinkedDevice = await createV11DeviceFixture(source, { participantId: other.participantId });
+      await insertV1Usage(source, sourceNamespace, otherLinkedDevice, crossDayLinkDay,
+        duplicateAcrossOwnersOccurrenceId, 1, true);
+    }
   }
   const owner = await ownerFor(source, v1.participantId);
   if (!owner.hasV1 || !owner.hasV11 || !owner.hasV12) throw new Error("synthetic mixed owner incomplete");
-  await target.prepare(`INSERT INTO analytics_owner_state
+  if (options.targetAuthority !== "ordered-delivery") await target.prepare(`INSERT INTO analytics_owner_state
     (source_id,owner_digest,revision,authority_epoch,state) VALUES(?,?,?,?,?)`)
     .bind(sourceId, owner.ownerDigest, owner.ownerRevision, owner.authorityEpoch, "active").run();
   let corrected = false, outsideAppends = 0;
@@ -431,16 +486,21 @@ export async function seedSharedAnalyticsCorpus(options: SharedAnalyticsCorpusOp
     appendedV11.set(day, occurrences);
     await activateV11(source, v11, v11Ready);
     const current = await ownerFor(source, v1.participantId);
-    await target.prepare(`UPDATE analytics_owner_state SET revision=?,authority_epoch=?
+    if (options.targetAuthority !== "ordered-delivery") await target.prepare(`UPDATE analytics_owner_state SET revision=?,authority_epoch=?
       WHERE source_id=? AND owner_digest=? AND state='active'`)
       .bind(current.ownerRevision, current.authorityEpoch, sourceId, current.ownerDigest).run();
     return current;
   };
-  return { owner, participantId: v1.participantId, historyDates, graphDates: selectedDates,
+  return { owner, participantId: v1.participantId, ...(secondaryAccountless ? { secondaryAccountless } : {}), historyDates, graphDates: selectedDates,
     firstGraphLookbackDates: historyDates.slice(0, Math.min(101, calendarDays - graphDays + 1)),
     populatedDates: [...grouped.keys()].sort(), equivalentOccurrenceId, equivalentDay,
     correctionOccurrenceId, correctionDay, crossDayLinkDay, sessionDay, v11DomainThroughDay: date(v11LastMs),
     duplicateAcrossOwnersOccurrenceId, modelFitDates: [...modelFitDates].sort(),
+    functionalInputs: {usage:{day:correctionDay,occurrenceId:correctionOccurrenceId},
+      quota: [...grouped.entries()].flatMap(([day,records])=>records.filter(record=>
+        record.schemaVersion==='quota-observation-v1.2'&&record.usedPercent!==null&&record.usedPercent<=95&&record.planType==='pro')
+        .map(record=>({day,occurrenceId:(record as TelemetryV12QuotaObservation).observationId})))[0],
+      emptyDay:historyDates.find(day=>(grouped.get(day)?.length??0)===0),crossDayDestination:equivalentDay},
     appendOutsideV11: () => appendV11Day(date(v11LastMs)), appendV11Day,
     async mutateCorrection() {
       if (corrected) throw new Error("synthetic correction already applied");
@@ -468,7 +528,7 @@ export async function seedSharedAnalyticsCorpus(options: SharedAnalyticsCorpusOp
       await activateV12(source, v12, staged);
       corrected = true;
       const current = await ownerFor(source, v1.participantId);
-      await target.prepare(`UPDATE analytics_owner_state SET revision=?,authority_epoch=?
+      if (options.targetAuthority !== "ordered-delivery") await target.prepare(`UPDATE analytics_owner_state SET revision=?,authority_epoch=?
         WHERE source_id=? AND owner_digest=? AND state='active'`)
         .bind(current.ownerRevision, current.authorityEpoch, sourceId, current.ownerDigest).run();
       return current;

@@ -626,7 +626,7 @@ export async function recoverAccess(
                   ELSE deletion_session_id
                 END
           WHERE id = ? AND recovery_token_id = ?
-            AND state IN ('active', 'deleting')`,
+            AND state IN ('active', 'deleting') RETURNING id`,
       ).bind(replacement.id, replacementHash, session.id, row.id, parsed.id),
       db.prepare(
         `UPDATE web_sessions SET state = 'revoked', revoked_at = ?
@@ -720,7 +720,7 @@ export async function recoverAccess(
     if (retried) return retried;
     throw error;
   }
-  if (results[0]?.meta.changes !== 1
+  if (!returnedTargetId(results[0], row.id)
       || results[3]?.meta.changes !== 1
       || results[4]?.meta.changes !== 1) {
     const retried = await retryRecoveredAccess(db, parsed, attemptHash);
@@ -782,7 +782,7 @@ export async function securityReset(
     db.prepare(
       `UPDATE participants
           SET recovery_token_id = ?, recovery_token_hash = ?
-        WHERE id = ? AND recovery_token_id = ? AND state = 'active'`,
+        WHERE id = ? AND recovery_token_id = ? AND state = 'active' RETURNING id`,
     ).bind(replacement.id, replacementHash, participantId, row.recovery_token_id),
     db.prepare(
       `UPDATE web_sessions SET state = 'revoked', revoked_at = ?
@@ -825,7 +825,7 @@ export async function securityReset(
           )`,
     ).bind(now, participantId, participantId, replacement.id),
   ]);
-  if (results[0]?.meta.changes !== 1) throw new ApiError(409, "AUTH_INVALID");
+  if (!returnedTargetId(results[0], participantId)) throw new ApiError(409, "AUTH_INVALID");
   return { recoveryCode: replacement.encoded };
 }
 

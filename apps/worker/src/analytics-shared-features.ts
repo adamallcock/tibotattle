@@ -1,22 +1,23 @@
 /** Durable, day-local effective evidence shared by the daily, scalar, model,
  * and cache lanes. No source record JSON or raw session identifier is retained. */
+import type { TelemetryV11Record } from '@app-usagemonitor/telemetry-contract';
 import { canonicalJson } from './canonical-json';
-import { cacheRetentionEventFromRecord, cacheRetentionSessionDigest } from './cache-retention-events';
+import { cacheRetentionEventFromRecordValue, cacheRetentionSessionDigest } from './cache-retention-events';
 import { CACHE_RETENTION_METHOD, validCacheRetentionEvent, validCacheRetentionSessionBreak,
   type CacheRetentionItem } from './cache-retention-values';
 import { COMMUNITY_DAILY_SPEND_PRICING_METHOD, COMMUNITY_DAILY_SPEND_REGISTRY_SHA256 } from './community-daily-spend';
 import { COMPOSITION_CACHE_KEY_SUFFIX } from './community-allowance';
-import { appendEffectiveQuotaDay, finishEffectiveQuotaDay, mapEffectiveQuotaPageRow,
+import { appendEffectiveQuotaDay, finishEffectiveQuotaDay, mapEffectiveQuotaRecord,
   validEffectiveQuotaDay, validEffectiveQuotaDayPending, type EffectiveQuotaDay,
   type EffectiveQuotaDayPending } from './effective-quota-day';
-import { appendEffectiveUsageDay, mapEffectiveUsagePageRow, validEffectiveUsageDay,
+import { appendEffectiveUsageDay, mapEffectiveUsageRecord, validEffectiveUsageDay,
   validEffectiveUsageDayPending, type EffectiveUsageDay, type EffectiveUsageDayPending } from './effective-usage-day';
 import { GRAPH_DAY_PROJECTION_VERSION } from './graph-day-projection-values';
-import { prepareV11UsageFeature, validV11UsageFeature, V11_PREPARED_USAGE_FEATURE_METHOD,
+import { prepareV11UsageFeature, prepareV11UsageRowInputs, validV11UsageFeature, V11_PREPARED_USAGE_FEATURE_METHOD,
   type V11PreparedUsageFeature } from './quota-analysis-v11';
 import { type EffectiveTelemetryOccurrence, type EffectiveTelemetryStream,
   EFFECTIVE_USAGE_READER_METHOD, type EffectiveUsageReaderCursor } from './telemetry-usage-effective-reader';
-import { createV11DailyProjectionValues, foldV11DailyProjectionValues, validateV11DailyProjectionValues,
+import { createV11DailyProjectionValues, foldPreparedV11DailyProjectionValues, prepareV11DailyProjectionRecord, validateV11DailyProjectionValues,
   V11_DAILY_VALUES_SCHEMA, type V11DailyProjectionValues } from './v11-daily-projection-values';
 
 export const SHARED_ANALYTICS_FEATURE_SCHEMA = 'shared-analytics-feature-day-v1';
@@ -154,6 +155,7 @@ export async function appendSharedAnalyticsFeaturePage(pending: SharedAnalyticsF
   const start = dayStart(pending.day);
   let previousTime = pending.after?.observedAtMs ?? -1, previousId = pending.after?.occurrenceId ?? '';
   let daily = pending.daily;
+  const records: TelemetryV11Record[] = [];
   for (const row of rows) {
     const time = row.eventTime === null ? NaN : Date.parse(row.eventTime);
     if (row.ownerDigest !== pending.ownerDigest || row.stream !== stream
@@ -162,7 +164,10 @@ export async function appendSharedAnalyticsFeaturePage(pending: SharedAnalyticsF
       || time < previousTime || time === previousTime && row.occurrenceId <= previousId) {
       throw new SharedFeatureRefused('source_conflict_or_order');
     }
-    daily = foldV11DailyProjectionValues(daily, [JSON.parse(row.recordJson)]);
+    const prepared = prepareV11DailyProjectionRecord('v11', JSON.parse(row.recordJson));
+    // One-record folds preserve the native lexical top-K/refusal behavior.
+    daily = foldPreparedV11DailyProjectionValues(daily, [prepared]);
+    records.push(prepared.record as TelemetryV11Record);
     previousTime = time; previousId = row.occurrenceId;
   }
   const sourceRowsRead = pending.sourceRowsRead + rows.length;
@@ -173,27 +178,29 @@ export async function appendSharedAnalyticsFeaturePage(pending: SharedAnalyticsF
   if (stream === 'quota') {
     const offset = quotaPending?.quotaRowsRead ?? 0;
     quotaPending = appendEffectiveQuotaDay(quotaPending, pending.day,
-      rows.map((row, index) => mapEffectiveQuotaPageRow(row, pending.day, offset + index + 1)),
+      rows.map((row, index) => mapEffectiveQuotaRecord(row, pending.day, offset + index + 1, records[index]!)),
       QUOTA_WINDOW_MINUTES);
     if (quotaPending === null) throw new SharedFeatureRefused('quota_day_limit');
   } else if (stream === 'usage') {
-    const usageRows = rows.map(mapEffectiveUsagePageRow);
-    usagePending = await appendEffectiveUsageDay(usagePending, pending.day, usageRows, pending.ownerDigest);
+    const usageRows = rows.map((row,index) => mapEffectiveUsageRecord(row,records[index]!));
+    const usageInputs = usageRows.map((row,index) => prepareV11UsageRowInputs(row,
+      records[index] as unknown as Record<string,unknown>));
+    usagePending = await appendEffectiveUsageDay(usagePending, pending.day, usageRows, pending.ownerDigest,usageInputs);
     if (usagePending === null) throw new SharedFeatureRefused('usage_day_limit');
     for (const [index, row] of rows.entries()) {
       const usage = usageRows[index]!;
       // The source ID is needed only until this page has been ordered. A
       // fixed-width day ordinal preserves equal-time order for both consumers.
       const orderKey = `ord:${String(cacheEventsRead+index+1).padStart(6,'0')}`;
-      scalarUsage.push({...await prepareV11UsageFeature(usage, pending.ownerDigest),
+      scalarUsage.push({...await prepareV11UsageFeature(usage, pending.ownerDigest,usageInputs[index]),
         occurrenceId:orderKey});
-      const record = JSON.parse(row.recordJson!) as Record<string, unknown>;
+      const record = records[index] as unknown as Record<string,unknown>;
       if (typeof record.provider !== 'string' || typeof record.sessionUuid !== 'string'
         || record.sessionUuid.length === 0) throw new SharedFeatureRefused('cache_row_unavailable');
       const sessionDigest = await cacheRetentionSessionDigest({ownerDigest: pending.ownerDigest,
         provider: record.provider, sessionUuid: record.sessionUuid});
-      const item = cacheRetentionEventFromRecord({sessionDigest, observedAtMs: Date.parse(row.eventTime!),
-        orderKey, recordJson: row.recordJson!});
+      const item = cacheRetentionEventFromRecordValue({sessionDigest, observedAtMs: Date.parse(row.eventTime!),
+        orderKey},record);
       if (item !== null) cacheItems.push(item);
     }
     cacheEventsRead += rows.length;

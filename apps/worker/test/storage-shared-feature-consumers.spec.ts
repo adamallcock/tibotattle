@@ -146,6 +146,7 @@ it('reuses durable effective days for exact daily spend and seven-day cache publ
   const native=await createCacheRetentionDaySourceBuild({source:source(),target:reference(),sourceNamespace})(
     referenceKey.key,referenceKey.carry,{remainingQueries:10_000,deadlineMs:Date.now()+120_000});
   const sharedFeatureReads=vi.spyOn(sharedStore,'advanceSharedAnalyticsFeatureDay');
+  const sharedWindowReads=vi.spyOn(sharedStore,'readSharedAnalyticsFeatureWindow');
   let shared:typeof native|undefined;
   let warmQueries=0;
   for(let attempt=0;attempt<40&&!shared;attempt++) {
@@ -159,11 +160,18 @@ it('reuses durable effective days for exact daily spend and seven-day cache publ
     expect(meter.queriesUsed).toBeLessThanOrEqual(950);
   }
   expect(shared).toEqual(native);
-  expect(sharedFeatureReads).toHaveBeenCalledTimes(8);
-  expect(sharedFeatureReads.mock.calls.map(([input])=>input.day)).toEqual([destination,...lookback]);
+  expect(sharedFeatureReads).toHaveBeenCalledTimes(1);
+  expect(sharedFeatureReads.mock.calls.map(([input])=>input.day)).toEqual([destination]);
+  expect(sharedWindowReads).toHaveBeenCalledTimes(1);
+  expect(sharedWindowReads.mock.calls[0]![0].days).toEqual([...lookback,destination]);
+  const warmWindow:Awaited<ReturnType<typeof sharedStore.readSharedAnalyticsFeatureWindow>>=
+    await sharedWindowReads.mock.results[0]!.value;
+  expect(warmWindow.state).toBe('complete');
+  if(warmWindow.state==='complete')expect(warmWindow.values.map(value=>value.day)).toEqual([...lookback,destination]);
   expect((await Promise.all(sharedFeatureReads.mock.results.map(result=>result.value)))
     .every(result=>result.state==='complete'&&result.reused)).toBe(true);
   sharedFeatureReads.mockRestore();
+  sharedWindowReads.mockRestore();
   expect(warmQueries).toBeGreaterThan(0);
   const refusedFeature=vi.spyOn(sharedStore,'advanceSharedAnalyticsFeatureDay')
     .mockResolvedValue({state:'refused',reason:'day_feature_limit'});
@@ -240,7 +248,7 @@ it('reuses durable effective days for exact daily spend and seven-day cache publ
     .first<number>('n')).toBe(0);
 },30_000);
 
-it('finishes a dense shared cache day through the scheduled 1000-statement cap across invocations',async()=>{
+it('finishes a dense shared cache day through the scheduled 950-statement cap across invocations',async()=>{
   await reset();
   await initializeSharedAnalyticsCorpusDatabases(source(),candidate(),b,sourceId,sourceNamespace);
   const corpus=await seedSharedAnalyticsCorpus({source:source(),target:candidate(),sourceId,
@@ -277,7 +285,7 @@ it('finishes a dense shared cache day through the scheduled 1000-statement cap a
       row.event==='cache_retention_day_schedule');
   log.mockRestore();
   expect(schedules).toHaveLength(progress.length);
-  expect(schedules.every(row=>row.queriesUsed<=950&&row.sourceQueriesUsed<=350)).toBe(true);
+  expect(schedules.every(row=>row.queriesUsed<=950&&row.sourceQueriesUsed<=300)).toBe(true);
   expect(schedules.some(row=>row.state==='deferred')).toBe(true);
   expect(progress.length).toBeGreaterThan(1);
   expect(progress.at(-1)).toBeGreaterThanOrEqual(8);
@@ -297,7 +305,7 @@ it('finishes a dense shared cache day through the scheduled 1000-statement cap a
   }
 },30_000);
 
-it('publishes a dense effective day from cold shared features through the scheduled 900-statement cap',async()=>{
+it('publishes a dense effective day from cold shared features through the scheduled 950-statement cap',async()=>{
   await reset();
   await initializeSharedAnalyticsCorpusDatabases(source(),candidate(),b,sourceId,sourceNamespace);
   await applyD1Migrations(b.DELETION_LEDGER,b.TEST_DELETION_LEDGER_MIGRATIONS);
@@ -341,7 +349,7 @@ it('publishes a dense effective day from cold shared features through the schedu
         totalStatements:number;maxStatements:number}>}).filter(row=>
         row.event==='storage_publication_schedule');
     expect(schedules).toHaveLength(progress.length);
-    expect(schedules.every(row=>row.queriesUsed<=900)).toBe(true);
+    expect(schedules.every(row=>row.queriesUsed<=950)).toBe(true);
     for(const schedule of schedules){
       expect(Object.keys(schedule.phaseTiming)).toEqual([...STORAGE_PUBLICATION_TIMING_PHASES]);
       expect(schedule.phaseTiming.daily_attempt?.count).toBeLessThanOrEqual(4);

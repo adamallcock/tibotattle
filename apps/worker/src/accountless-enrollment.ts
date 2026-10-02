@@ -1,3 +1,4 @@
+import { returnedD1Target } from './d1-direct-write';
 import { timingSafeEqual } from "./crypto";
 import { ApiError } from "./errors";
 import { parseStrictJson } from "./strict-json";
@@ -315,6 +316,7 @@ export async function enrollAccountlessDevice(
      WHERE (SELECT last_issue_token
               FROM accountless_enrollment_issuance
              WHERE singleton = 1) = ?
+    RETURNING device_id
   `).bind(
     request.deviceId,
     request.deviceSecretHash,
@@ -334,7 +336,7 @@ export async function enrollAccountlessDevice(
     ]);
     if (!budgetResult || !insertResult
         || budgetResult.meta.changes !== 1
-        || insertResult.meta.changes !== 1) {
+        || !returnedD1Target(insertResult, 'device_id', request.deviceId)) {
       // A concurrent identical request can observe the final budget slot as
       // unavailable after the winner commits. Resolve that one replay before
       // returning the limit response so idempotency does not depend on which

@@ -143,6 +143,74 @@ const quotaPage=(sql:string,bound:unknown[])=>sql.includes('SELECT occurrence_id
   &&sql.includes('chunk.stream=?')&&bound.includes('quota');
 
 describe('effective graph work selection',()=>{
+  it('reuses an exact completed head before opening another selection, but retains pending selection recovery',async()=>{
+    const owner=await fixture(),request={ownerDigest:owner.ownerDigest!,day:today(),metric:'fits' as const};
+    const first=await advanceStorageCommunityGraphWork({...bindings(),request,deadlineMs:Date.now()+60_000});
+    expect(first).toMatchObject({state:'complete',metric:'fits',day:today()});
+    const envelope=await effectiveEnvelope();
+    expect(await readStorageGraphWorkSelection(target(),key(envelope))).toBeNull();
+    const retained=await target().prepare(`SELECT dependency_digest,payload_json,payload_sha256,computed_ms
+      FROM analytics_community_graph_results WHERE source_id=? AND owner_digest=? AND metric='fits' AND day=?`)
+      .bind(namespace,owner.ownerDigest,today()).first();
+    expect(retained).not.toBeNull();
+    let selectionWrites=0;
+    const observedTarget=observe(target(),(sql,_bound,when)=>{
+      if(when==='after'&&/\b(?:INSERT|UPDATE|DELETE)\b/iu.test(sql)
+        &&sql.includes('analytics_community_graph_work_selection'))selectionWrites++;
+    });
+    expect(await advanceStorageCommunityGraphWork({...bindings(),target:observedTarget,request,
+      deadlineMs:Date.now()+60_000})).toMatchObject({state:'reused',metric:'fits',day:today()});
+    expect(selectionWrites).toBe(0);
+    expect(await readStorageGraphWorkSelection(target(),key(envelope))).toBeNull();
+    expect(await target().prepare(`SELECT dependency_digest,payload_json,payload_sha256,computed_ms
+      FROM analytics_community_graph_results WHERE source_id=? AND owner_digest=? AND metric='fits' AND day=?`)
+      .bind(namespace,owner.ownerDigest,today()).first()).toEqual(retained);
+
+    let demandChecks=0;
+    await expect(advanceStorageCommunityGraphWork({...bindings(),target:observedTarget,request,
+      deadlineMs:Date.now()+60_000,assertCurrent:async()=>{
+        if(++demandChecks===2)throw new Error('synthetic graph demand changed');
+      }})).rejects.toThrow('synthetic graph demand changed');
+    expect(demandChecks).toBe(2);
+    expect(selectionWrites).toBe(0);
+    expect(await readStorageGraphWorkSelection(target(),key(envelope))).toBeNull();
+
+    await ensure(envelope);selectionWrites=0;
+    expect(await advanceStorageCommunityGraphWork({...bindings(),target:observedTarget,request,
+      deadlineMs:Date.now()+60_000})).toMatchObject({state:'reused',metric:'fits',day:today()});
+    expect(selectionWrites).toBeGreaterThan(0);
+    expect(await readStorageGraphWorkSelection(target(),key(envelope))).toBeNull();
+  });
+
+  it('does not fall through to selection or computation on a forced canonical capability refusal',async()=>{
+    const owner=await fixture(),request={ownerDigest:owner.ownerDigest!,day:today(),metric:'fits' as const};
+    expect(await advanceStorageCommunityGraphWork({...bindings(),request,deadlineMs:Date.now()+60_000}))
+      .toMatchObject({state:'complete'});
+    const envelope=await effectiveEnvelope();
+    await source().prepare('DROP TRIGGER storage_effective_selective_runtime_retained').run();
+    let writes=0;
+    const observedTarget=observe(target(),(sql,_bound,when)=>{
+      if(when==='after'&&/\b(?:INSERT|UPDATE|DELETE)\b/iu.test(sql)
+        &&(sql.includes('analytics_community_graph_work_selection')
+          ||sql.includes('analytics_community_graph_results')))writes++;
+    });
+    expect(await advanceStorageCommunityGraphWork({...bindings(),target:observedTarget,request,canonicalPipeline:true,
+      deadlineMs:Date.now()+60_000})).toMatchObject({state:'deferred',reason:'migration_required'});
+    expect(writes).toBe(0);
+    expect(await readStorageGraphWorkSelection(target(),key(envelope))).toBeNull();
+  });
+
+  it('does not reuse a completed head after target erasure',async()=>{
+    const owner=await fixture(),request={ownerDigest:owner.ownerDigest!,day:today(),metric:'fits' as const};
+    expect(await advanceStorageCommunityGraphWork({...bindings(),request,deadlineMs:Date.now()+60_000}))
+      .toMatchObject({state:'complete'});
+    const envelope=await effectiveEnvelope();
+    await fence(envelope);
+    expect(await advanceStorageCommunityGraphWork({...bindings(),request,deadlineMs:Date.now()+60_000}))
+      .not.toMatchObject({state:'reused'});
+    expect(await readStorageGraphWorkSelection(target(),key(envelope))).toBeNull();
+  });
+
   it('admits one overlapping scheduler and keeps the busy contender out of effective quota pages',async()=>{
     await fixture();const envelope=await effectiveEnvelope();await currentFit();
     const winnerMeter=createD1InvocationBudget(950),contenderMeter=createD1InvocationBudget(950);
@@ -208,9 +276,9 @@ describe('effective graph work selection',()=>{
     });
     const result=await advanceStorageCommunityGraphWork({...bindings(),source:meter.wrap(observedSource),target:meter.wrap(observedTarget),
       get remainingQueries(){return meter.remainingQueries;},deadlineMs:Date.now()+60_000,leaseMs:570_000,preparedFold:false});
-    // One scheduler method probe and both effective dependency captures now
-    // include the staged/active correction runtime in their source authority.
-    expect(preludeQueries).toBe(41);expect(pages).toBeGreaterThan(0);
+    // The exact-head miss adds one indexed read. Both scope captures also
+    // check the authority-restore marker before their source authority read.
+    expect(preludeQueries).toBe(44);expect(pages).toBeGreaterThan(0);
     expect(result.failure).toBeUndefined();
     if(cap===560)expect(result.state).toBe('deferred');else expect(['complete','deferred']).toContain(result.state);
     expect(meter.remainingQueries).toBeGreaterThanOrEqual(38);

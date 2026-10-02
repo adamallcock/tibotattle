@@ -1,6 +1,10 @@
 import { env, reset, type D1Migration } from 'cloudflare:test';
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
+import * as dependencySummaries from '../src/storage-effective-dependency-summaries';
+import { withMaintainedEffectiveDependencies } from '../src/storage-effective-dependency-summaries';
+import { advanceEffectiveDependencyCoverage } from '../src/storage-effective-selective-dependencies';
 import { createD1InvocationBudget } from '../src/d1-invocation-budget';
+import { createAnalyticsProfile, profileAnalyticsDatabase, summarizeAnalyticsProfile } from './helpers/analytics-profile';
 import { prepareSharedAnalyticsDay } from '../src/analytics-shared-reducers';
 import { appendSharedAnalyticsFeaturePage, createSharedAnalyticsFeaturePending,
   SHARED_ANALYTICS_FEATURE_METHOD, SharedFeatureRefused } from '../src/analytics-shared-features';
@@ -457,3 +461,292 @@ it.each(['deadline','lease'] as const)('does not promote after final validation 
     WHERE source_id=? AND owner_digest=?`)
     .bind(sourceId,corpus.owner.ownerDigest).first<number>('n')).toBe(0);
 },180_000);
+
+it('uses two sealed digest batches to read an exact maintained shared window within950 statements',async()=>{
+  const corpus=await setup(),days=corpus.historyDates.slice(0,12),expected=[];
+  for(const day of days)expected.push((await finish(corpus.owner,day)).result.value);
+  for(let turn=0;turn<48;turn++){
+    const progress=await advanceEffectiveDependencyCoverage(source(),{sourceId,sourceNamespace,
+      participantId:corpus.owner.participantId,maxSteps:64,maxRows:128});
+    if(progress.status==='complete')break;
+    expect(progress.status).not.toBe('unavailable');
+  }
+  const original=dependencySummaries.maintainedEffectiveHistoryDayReader;
+  let batches=0,individual=0,acquisitions=0,reacquireOnVerification=false;
+  const readerSpy=vi.spyOn(dependencySummaries,'maintainedEffectiveHistoryDayReader').mockImplementation(async(...args)=>{
+    acquisitions++;
+    const reader=await original(...args);if(!reader)return;
+    expect(reader.readDigests).toBeTypeOf('function');
+    let reads=0;
+    return {readDigest:async day=>{individual++;return reader.readDigest(day);},
+      readDigests:async()=>{
+        batches++;
+        // Retain the prior production acquisition path for a same-state cost
+        // comparison. Both branches still execute actual sealed batch reads.
+        if(reacquireOnVerification&&++reads===2){acquisitions++;return (await original(...args))?.readDigests?.();}
+        return reader.readDigests!();
+      }};
+  });
+  try{
+    for(const warm of [false,true]){
+      const {value,meter}=input(corpus.owner,days[0]!);
+      const window=await readSharedAnalyticsFeatureWindow({...value,
+        source:meter.wrap(withMaintainedEffectiveDependencies(source(),target(),sourceId,sourceNamespace)),days});
+      expect(window).toMatchObject({state:'complete',values:expected});
+      expect(meter.queriesUsed).toBeLessThanOrEqual(950);
+      if(warm)expect(meter.queriesUsed).toBeLessThan(80);
+    }
+    expect(batches).toBe(4);expect(individual).toBe(0);expect(acquisitions).toBe(2);
+    const measurements=[];
+    for(const freshVerification of [true,false]){
+      reacquireOnVerification=freshVerification;
+      const profile=createAnalyticsProfile(),meter=createD1InvocationBudget(950);
+      const profiledSource=profileAnalyticsDatabase(source(),'source',profile,()=> 'shared_window');
+      const profiledTarget=profileAnalyticsDatabase(target(),'target',profile,()=> 'shared_window');
+      const window=await readSharedAnalyticsFeatureWindow({source:meter.wrap(withMaintainedEffectiveDependencies(
+        profiledSource,profiledTarget,sourceId,sourceNamespace)),target:meter.wrap(profiledTarget),
+        sourceId,sourceNamespace,owner:corpus.owner,days,budget:{remainingQueries:()=>meter.remainingQueries,
+          deadlineMs:Date.now()+60_000,now:Date.now}});
+      expect(window).toMatchObject({state:'complete',values:expected});
+      const summary=summarizeAnalyticsProfile(profile);
+      expect(summary.statements).toBe(meter.queriesUsed);expect(summary.statements).toBeLessThanOrEqual(950);
+      expect(summary.rowsWritten).toBe(0);
+      measurements.push({statements:summary.statements,rowsRead:summary.rowsRead,rowsWritten:summary.rowsWritten});
+    }
+    expect(measurements[1]!.statements).toBeLessThan(measurements[0]!.statements);
+    expect(measurements[1]!.rowsRead).toBeLessThan(measurements[0]!.rowsRead);
+    console.log('P11_SHARED_WINDOW_PROOF_REUSE',JSON.stringify({days:days.length,before:measurements[0],after:measurements[1]}));
+  }finally{readerSpy.mockRestore();}
+},120_000);
+
+
+it('releases an unsaved feature-day claim before its lease expires',async()=>{
+  const corpus=await setup(),day=corpus.graphDates[0]!;
+  const first=input(corpus.owner,day);
+  const profile=createAnalyticsProfile();
+  const value={...first.value,target:first.meter.wrap(profileAnalyticsDatabase(target(),'target',profile,()=> 'claim_release'))};
+  let producerCalls=0;
+  const result=await advanceSharedAnalyticsFeatureDay({...value,canonicalPreparation:async()=>{
+    producerCalls++;
+    // This producer spends real statements on the same invocation meter.
+    // Forty remain: enough to release a claim, too few for the fresh save proof.
+    const statements=first.meter.remainingQueries-40;
+    expect(statements).toBeGreaterThan(0);
+    await value.target.batch(Array.from({length:statements},()=>value.target.prepare('SELECT 1')));
+    return {state:'deferred' as const,reason:'query_budget'};
+  }});
+  expect(producerCalls).toBe(1);
+  expect(result).toEqual({state:'deferred',reason:'source_changed_or_budget'});
+  expect(first.meter.queriesUsed).toBeLessThanOrEqual(950);
+  const before=await target().prepare(`SELECT head_revision,state,claim_token,claim_expires_ms
+    FROM analytics_shared_feature_days WHERE source_id=? AND owner_digest=? AND day=?`)
+    .bind(sourceId,corpus.owner.ownerDigest,day).first();
+  expect(before).toEqual({head_revision:0,state:'building',claim_token:null,claim_expires_ms:null});
+  const second=input(corpus.owner,day);
+  const resumed=await advanceSharedAnalyticsFeatureDay({...second.value,canonicalPreparation:async()=>{
+    producerCalls++;return {state:'deferred' as const,reason:'query_budget'};
+  }});
+  expect(producerCalls).toBe(2);
+  expect(resumed).toEqual({state:'deferred',reason:'query_budget'});
+  expect(second.meter.queriesUsed).toBeLessThanOrEqual(950);
+  expect(await target().prepare(`SELECT head_revision,state,claim_token,claim_expires_ms
+    FROM analytics_shared_feature_days WHERE source_id=? AND owner_digest=? AND day=?`)
+    .bind(sourceId,corpus.owner.ownerDigest,day).first())
+    .toEqual({head_revision:1,state:'building',claim_token:null,claim_expires_ms:null});
+  expect((await target().prepare(`SELECT count(*) n FROM analytics_community_daily_publications WHERE source_id=?`)
+    .bind(sourceId).first<number>('n'))).toBe(0);
+},60_000);
+
+function observeSharedFeatureClaim(database:D1Database,after:()=>Promise<void>):D1Database {
+  const wrap=(statement:D1PreparedStatement):D1PreparedStatement=>new Proxy(statement,{get(value,key){
+    if(key==='bind')return (...args:unknown[])=>wrap(value.bind(...args));
+    if(key==='run')return async()=>{const result=await value.run();if(result.meta.changes===1)await after();return result;};
+    const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;
+  }});
+  return new Proxy(database,{get(value,key){
+    if(key==='prepare')return (sql:string)=>/^UPDATE analytics_shared_feature_days SET\s+claim_token=\?/u.test(sql)
+      ?wrap(value.prepare(sql)):value.prepare(sql);
+    const member=Reflect.get(value,key);return typeof member==='function'?member.bind(value):member;
+  }});
+}
+async function currentSharedFeatureHead(owner:Awaited<ReturnType<typeof setup>>['owner'],day:string) {
+  return target().prepare(`SELECT * FROM analytics_shared_feature_days
+    WHERE source_id=? AND owner_digest=? AND day=?`)
+    .bind(sourceId,owner.ownerDigest,day).first<Record<string,unknown>>();
+}
+
+it.each(['canonical','ordinary'] as const)('releases exact feature leases after a %s producer error',async path=>{
+  const corpus=await setup(path==='ordinary'),day=corpus.graphDates[0]!;
+  const seed=input(corpus.owner,day);
+  const checkpoint=await advanceSharedAnalyticsFeatureDay({...seed.value,
+    ...(path==='canonical'?{canonicalPreparation:async()=>({state:'deferred' as const,reason:'query_budget'})}:{})});
+  expect(checkpoint.state).toBe('deferred');expect(seed.meter.queriesUsed).toBeLessThanOrEqual(950);
+  expect((await currentSharedFeatureHead(corpus.owner,day))?.head_revision).toBe(1);
+  const savedParts=(await target().prepare('SELECT * FROM analytics_shared_feature_parts ORDER BY job_key,revision,part_index').all()).results;
+  const {value,meter}=input(corpus.owner,day);
+  let claimed=false,readFailed=false;
+  const claimedHead:{value:Record<string,unknown>|null}={value:null};
+  const observed=observeSharedFeatureClaim(value.target,async()=>{
+    claimed=true;claimedHead.value=await currentSharedFeatureHead(corpus.owner,day);
+  });
+  const wrapRead=(statement:D1PreparedStatement):D1PreparedStatement=>new Proxy(statement,{get(db,key){
+    if(key==='bind')return (...args:unknown[])=>wrapRead(db.bind(...args));
+    if(key==='first')return async(...args:unknown[])=>{
+      const result=await Reflect.apply(db.first,db,args);
+      if(claimed&&!readFailed){readFailed=true;throw new Error('synthetic source read response failed');}
+      return result;
+    };
+    const member=Reflect.get(db,key);return typeof member==='function'?member.bind(db):member;
+  }});
+  const sourceObserved=new Proxy(value.source,{get(db,key){
+    if(key==='prepare')return (sql:string)=>sql.startsWith('SELECT v.revision AS input_revision,o.revision AS owner_revision')
+      ?wrapRead(db.prepare(sql)):db.prepare(sql);
+    const member=Reflect.get(db,key);return typeof member==='function'?member.bind(db):member;
+  }});
+  await expect(advanceSharedAnalyticsFeatureDay({...value,target:observed,
+    ...(path==='canonical'?{canonicalPreparation:async()=>{throw new Error('synthetic canonical producer failed');}}
+      :{source:sourceObserved})})).rejects.toThrow(path==='canonical'?'synthetic canonical producer failed':'synthetic source read response failed');
+  expect(claimed).toBe(true);expect(path==='ordinary'?readFailed:true).toBe(true);
+  expect(claimedHead.value?.claim_token).not.toBeNull();
+  expect(await currentSharedFeatureHead(corpus.owner,day)).toEqual({...claimedHead.value,claim_token:null,claim_expires_ms:null});
+  expect(meter.queriesUsed).toBeLessThanOrEqual(950);
+  expect((await target().prepare('SELECT * FROM analytics_shared_feature_parts ORDER BY job_key,revision,part_index').all()).results).toEqual(savedParts);
+},60_000);
+
+it.each(['deferred','error'] as const)('holds a real final query across captured handles and nested meters after %s',async boundary=>{
+  const corpus=await setup(),day=corpus.graphDates[0]!,outer=input(corpus.owner,day);
+  const phase=createD1InvocationBudget(950);
+  const captured={...outer.value,source:phase.wrap(outer.value.source),target:phase.wrap(outer.value.target)};
+  const claimedHead:{value:Record<string,unknown>|null}={value:null};
+  const operation=advanceSharedAnalyticsFeatureDay({...captured,canonicalPreparation:async()=>{
+    claimedHead.value=await currentSharedFeatureHead(corpus.owner,day);
+    // Execute native metadata reads through the callback's original captured
+    // target. Neither a replacement local handle nor a synthetic counter can
+    // protect this path. Every actual statement is charged to both meters.
+    const count=outer.meter.remainingQueries;
+    expect(count).toBe(phase.remainingQueries);expect(count).toBeGreaterThan(0);
+    await captured.target.batch(Array.from({length:count},()=>captured.target.prepare(
+      'SELECT head_revision FROM analytics_shared_feature_days WHERE source_id=? AND owner_digest=? AND day=?')
+      .bind(sourceId,corpus.owner.ownerDigest,day)));
+    expect(outer.meter.remainingQueries).toBe(0);expect(phase.remainingQueries).toBe(0);
+    if(boundary==='error')await captured.target.prepare('SELECT 1').first();
+    return {state:'deferred' as const,reason:'query_budget'};
+  }});
+  if(boundary==='error')await expect(operation).rejects.toThrow('invocation budget');
+  else expect(await operation).toEqual({state:'deferred',reason:'source_changed_or_budget'});
+  expect([outer.meter.queriesUsed,phase.queriesUsed]).toEqual([950,950]);
+  expect([outer.meter.remainingQueries,phase.remainingQueries]).toEqual([0,0]);
+  expect(await currentSharedFeatureHead(corpus.owner,day)).toEqual({...claimedHead.value,claim_token:null,claim_expires_ms:null});
+},60_000);
+
+it('releases an exact committed claim when its response is lost',async()=>{
+  const corpus=await setup(),day=corpus.graphDates[0]!,{value,meter}=input(corpus.owner,day);
+  let lost=false;
+  const claimedHead:{value:Record<string,unknown>|null}={value:null};
+  const observed=observeSharedFeatureClaim(value.target,async()=>{
+    if(lost)return;lost=true;claimedHead.value=await currentSharedFeatureHead(corpus.owner,day);
+    throw new Error('synthetic committed claim response lost');
+  });
+  expect(await advanceSharedAnalyticsFeatureDay({...value,target:observed,
+    canonicalPreparation:async()=>({state:'deferred' as const,reason:'query_budget'})}))
+    .toEqual({state:'deferred',reason:'source_changed'});
+  expect(lost).toBe(true);expect(meter.queriesUsed).toBeLessThanOrEqual(950);
+  expect(await currentSharedFeatureHead(corpus.owner,day)).toEqual({...claimedHead.value,claim_token:null,claim_expires_ms:null});
+  const retry=input(corpus.owner,day);
+  expect(await advanceSharedAnalyticsFeatureDay({...retry.value,
+    canonicalPreparation:async()=>({state:'deferred' as const,reason:'query_budget'})}))
+    .toEqual({state:'deferred',reason:'query_budget'});
+  expect((await currentSharedFeatureHead(corpus.owner,day))?.head_revision).toBe(1);
+  expect(retry.meter.queriesUsed).toBeLessThanOrEqual(950);
+},60_000);
+
+it('preserves the replacement public claimant when old feature cleanup is delayed',async()=>{
+  const corpus=await setup(),day=corpus.graphDates[0]!,first=input(corpus.owner,day),second=input(corpus.owner,day);
+  let entered!:()=>void,finishReplacement!:()=>void;
+  const replacementEntered=new Promise<void>(resolve=>{entered=resolve;});
+  const replacementFinish=new Promise<void>(resolve=>{finishReplacement=resolve;});
+  let replacement:Promise<Awaited<ReturnType<typeof advanceSharedAnalyticsFeatureDay>>>|undefined;
+  let replacementHead:Record<string,unknown>|null=null;
+  let firstResult:Awaited<ReturnType<typeof advanceSharedAnalyticsFeatureDay>>;
+  try {
+  firstResult=await advanceSharedAnalyticsFeatureDay({...first.value,canonicalPreparation:async()=>{
+    const old=await currentSharedFeatureHead(corpus.owner,day);
+    expect(old?.claim_token).not.toBeNull();
+    // Native exact release enables the genuine public next claimant. No
+    // fabricated token/head or expiry/clock override is used.
+    await first.value.target.prepare(`UPDATE analytics_shared_feature_days SET claim_token=NULL,claim_expires_ms=NULL
+      WHERE job_key=? AND head_revision=? AND claim_token=?`)
+      .bind(old!.job_key,old!.head_revision,old!.claim_token).run();
+    replacement=advanceSharedAnalyticsFeatureDay({...second.value,canonicalPreparation:async()=>{
+      replacementHead=await currentSharedFeatureHead(corpus.owner,day);entered();await replacementFinish;
+      return {state:'deferred' as const,reason:'query_budget'};
+    }});
+    await Promise.race([replacementEntered,replacement.then(()=>{throw new Error('replacement returned before barrier');})]);
+    expect(replacementHead?.claim_token).not.toBe(old?.claim_token);
+    return {state:'deferred' as const,reason:'query_budget'};
+  }});
+    expect(firstResult).toEqual({state:'deferred',reason:'source_changed_or_budget'});
+    expect(await currentSharedFeatureHead(corpus.owner,day)).toEqual(replacementHead);
+  }finally{finishReplacement();}
+  expect(await replacement).toEqual({state:'deferred',reason:'query_budget'});
+  const final=await currentSharedFeatureHead(corpus.owner,day);
+  expect(final).toMatchObject({head_revision:1,state:'building',claim_token:null,claim_expires_ms:null});
+  expect([first.meter.queriesUsed,second.meter.queriesUsed].every(count=>count<=950)).toBe(true);
+},60_000);
+
+it.each(['analytics_shared_feature_release_v1','analytics_shared_feature_day_update'] as const)(
+ 'refuses new claims without %s while preserving legacy completed reads',async name=>{
+  const corpus=await setup(),completeDay=corpus.graphDates[0]!,newDay=corpus.graphDates[1]!;
+  const completed=(await finish(corpus.owner,completeDay)).result;
+  const ddl=await target().prepare('SELECT sql FROM sqlite_schema WHERE type=\'trigger\' AND name=?').bind(name).first<string>('sql');
+  expect(ddl).toBeTruthy();
+  await target().exec(`DROP TRIGGER ${name}`);
+  try {
+    const fresh=input(corpus.owner,newDay);
+    expect(await advanceSharedAnalyticsFeatureDay(fresh.value)).toEqual({state:'refused',reason:'migration_required'});
+    expect(fresh.meter.queriesUsed).toBeLessThanOrEqual(950);
+    expect((await currentSharedFeatureHead(corpus.owner,newDay))?.claim_token).toBeNull();
+    const read=input(corpus.owner,completeDay);
+    expect(await advanceSharedAnalyticsFeatureDay(read.value)).toMatchObject({state:'complete',reused:true,value:completed.value});
+    expect(read.meter.queriesUsed).toBeLessThanOrEqual(950);
+  }finally{await target().prepare(ddl!).run();}
+  const restored=await finish(corpus.owner,newDay);
+  expect(restored.result.state).toBe('complete');
+},180_000);
+
+it.each(['analytics_shared_feature_release_v1','analytics_shared_feature_day_update'] as const)(
+ 'refuses a feature claim when %s disappears after its fresh release proof',async name=>{
+  const corpus=await setup(),day=corpus.graphDates[0]!,{value,meter}=input(corpus.owner,day);
+  // Exact native DDL removal/restore is separate lab setup; no producer query
+  // or budget/clock is substituted by this administrative race injection.
+  const ddl=await target().prepare('SELECT sql FROM sqlite_schema WHERE type=\'trigger\' AND name=?').bind(name).first<string>('sql');
+  expect(ddl).toBeTruthy();
+  let dropped=false,producerCalls=0;
+  const before:{head:Record<string,unknown>|null}={head:null};
+  const wrap=(statement:D1PreparedStatement):D1PreparedStatement=>new Proxy(statement,{get(db,key){
+    if(key==='bind')return (...args:unknown[])=>wrap(db.bind(...args));
+    if(key==='first')return async(...args:unknown[])=>{
+      const result=await Reflect.apply(db.first,db,args);
+      if(result===2&&!dropped){before.head=await currentSharedFeatureHead(corpus.owner,day);
+        await target().exec(`DROP TRIGGER ${name}`);dropped=true;}
+      return result;
+    };
+    const member=Reflect.get(db,key);return typeof member==='function'?member.bind(db):member;
+  }});
+  const racing=new Proxy(value.target,{get(db,key){
+    if(key==='prepare')return (sql:string)=>sql.startsWith("SELECT count(*) n FROM sqlite_schema WHERE type='trigger'\n    AND tbl_name='analytics_shared_feature_days'")
+      ?wrap(db.prepare(sql)):db.prepare(sql);
+    const member=Reflect.get(db,key);return typeof member==='function'?member.bind(db):member;
+  }});
+  try {
+    expect(await advanceSharedAnalyticsFeatureDay({...value,target:racing,canonicalPreparation:async()=>{
+      producerCalls++;return {state:'deferred' as const,reason:'query_budget'};
+    }})).toEqual({state:'deferred',reason:'claim_busy'});
+    expect(dropped).toBe(true);expect(producerCalls).toBe(0);
+    expect(before.head?.claim_token).toBeNull();expect(before.head?.head_revision).toBe(0);
+    expect(await currentSharedFeatureHead(corpus.owner,day)).toEqual(before.head);
+    expect(await target().prepare('SELECT count(*) n FROM analytics_shared_feature_parts').first<number>('n')).toBe(0);
+    expect(await target().prepare('SELECT count(*) n FROM analytics_community_daily_publications').first<number>('n')).toBe(0);
+    expect(meter.queriesUsed).toBeLessThanOrEqual(950);
+  }finally{if(dropped)await target().prepare(ddl!).run();}
+},60_000);

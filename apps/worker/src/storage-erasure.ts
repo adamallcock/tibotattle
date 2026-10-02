@@ -1,4 +1,5 @@
 import {ApiError} from './errors';
+import {readMaintainedAnalyticsErasureInventory,requireMaintainedSourceErasureProof,type MaintainedErasureInventory} from './storage-erasure-artifacts';
 import {canonicalJson} from './canonical-json';
 import {participantDeletionDigest} from './participant-deletion-digest';
 import {parseTelemetryStorageMode} from './telemetry-storage-mode';
@@ -37,7 +38,8 @@ async function scope(b:StorageErasureBindings):Promise<void>{
  * last participant->opaque-owner mapping. Existing completed jobs reopen on
  * restore replay, retaining their irreversible original terminal evidence. */
 export async function prepareStorageParticipantErasure(b:StorageErasureBindings,participantId:string):Promise<void>{
- await scope(b);const participantDigest=await participantDeletionDigest(participantId);
+ await scope(b);await requireMaintainedSourceErasureProof(b.source);
+ const participantDigest=await participantDeletionDigest(participantId);
  const link=await b.source.prepare('SELECT owner_digest FROM storage_v11_owner_links WHERE participant_id=?')
   .bind(participantId).first<{owner_digest:string}>();
  if(!link)return;
@@ -86,7 +88,7 @@ async function sharedFeatureErasureTables(target:D1Database):Promise<readonly st
    ||SHARED_FEATURE_ERASURE_TABLES.some(name=>!result.results.some(row=>row.name===name)))throw unavailable();
  return SHARED_FEATURE_ERASURE_TABLES;
 }
-const payloadAbsence=(cacheTables:readonly string[]=[]):string=>`
+const payloadAbsence=(cacheTables:readonly string[]=[],inventory:MaintainedErasureInventory={ownerTables:[],predicates:[]}):string=>`
  NOT EXISTS(SELECT 1 FROM analytics_v1_chunk_values WHERE source_id=?1 AND owner_digest=?2)
  AND NOT EXISTS(SELECT 1 FROM analytics_v11_projection_work WHERE source_id=?1 AND owner_digest=?2)
  AND NOT EXISTS(SELECT 1 FROM analytics_v11_reusable_values WHERE source_id=?1 AND owner_digest=?2)
@@ -105,19 +107,22 @@ const payloadAbsence=(cacheTables:readonly string[]=[]):string=>`
    AND COALESCE(json_extract(authority_json,'$.publicAuthorityEpoch'),-1)<?4)
  AND NOT EXISTS(SELECT 1 FROM analytics_community_graph_previews WHERE source_id=?1
    AND COALESCE(json_extract(authority_json,'$.publicAuthorityEpoch'),-1)<?4)
- ${cacheTables.map(table=>` AND NOT EXISTS(SELECT 1 FROM ${table} WHERE source_id=?1 AND owner_digest=?2)`).join('\n')}`;
+ ${[...cacheTables,...inventory.ownerTables].map(table=>` AND NOT EXISTS(SELECT 1 FROM ${table} WHERE source_id=?1 AND owner_digest=?2)`).join('\n')}
+ ${inventory.predicates.map(predicate=>' AND '+predicate).join('\n')}`;
 async function readCompletion(b:StorageErasureBindings,job:Job,change:StorageChange,
- cacheTables?:readonly string[]):Promise<boolean>{
+ cacheTables?:readonly string[],knownInventory?:MaintainedErasureInventory):Promise<boolean>{
  // Completed-job retries must also prove absence of payload families added
  // after the receipt was first written. Targets predating these optional
  // payload families remain supported; partially migrated families fail closed.
+ await requireMaintainedSourceErasureProof(b.source,true);
+ const inventory=knownInventory??await readMaintainedAnalyticsErasureInventory(b.target);
  const payloadTables=cacheTables??[...await cacheRetentionErasureTables(b.target),
   ...await modelBlockErasureTables(b.target),...await sharedFeatureErasureTables(b.target)];
  return !!await b.target.prepare(`SELECT 1 AS complete FROM analytics_storage_erasure_receipts r
  JOIN analytics_storage_erasure_fences f ON f.source_id=r.source_id AND f.owner_digest=r.owner_digest
   AND f.terminal_event_digest=r.terminal_event_digest
  WHERE r.source_id=?1 AND r.owner_digest=?2 AND r.terminal_event_digest=?3 AND r.payload_contract=1
-  AND f.public_authority_epoch=?4 AND ${payloadAbsence(payloadTables)}`)
+  AND f.public_authority_epoch=?4 AND ${payloadAbsence(payloadTables,inventory)}`)
   .bind(b.sourceId,job.owner_digest,change.eventDigest,change.publicAuthorityEpoch).first();
 }
 function terminal(value:unknown,job:Job):StorageChange{
@@ -135,6 +140,8 @@ async function advanceJob(b:StorageErasureBindings,job:Job):Promise<boolean>{
  const ready=await b.target.prepare('SELECT source_namespace,contract_version FROM analytics_runtime_sources WHERE source_id=?')
   .bind(b.sourceId).first<{source_namespace:string;contract_version:number}>();
  if(!ready||ready.source_namespace!==b.sourceNamespace||ready.contract_version!==1)throw unavailable();
+ await requireMaintainedSourceErasureProof(b.source,true);
+ const inventory=await readMaintainedAnalyticsErasureInventory(b.target);
  const cacheTables=await cacheRetentionErasureTables(b.target);
  const payloadTables=[...cacheTables,...await modelBlockErasureTables(b.target),
   ...await sharedFeatureErasureTables(b.target)];
@@ -184,9 +191,9 @@ async function advanceJob(b:StorageErasureBindings,job:Job):Promise<boolean>{
  if(cacheTables.length>0) await retireCacheRetentionDayPage(b.target,b.sourceId);
  await b.target.prepare(`INSERT INTO analytics_storage_erasure_receipts(source_id,owner_digest,terminal_event_digest,payload_contract)
  SELECT ?1,?2,?3,1 WHERE EXISTS(SELECT 1 FROM analytics_storage_erasure_fences
- WHERE source_id=?1 AND owner_digest=?2 AND terminal_event_digest=?3 AND public_authority_epoch=?4) AND ${payloadAbsence(payloadTables)}
+ WHERE source_id=?1 AND owner_digest=?2 AND terminal_event_digest=?3 AND public_authority_epoch=?4) AND ${payloadAbsence(payloadTables,inventory)}
  ON CONFLICT(source_id,owner_digest) DO NOTHING`).bind(b.sourceId,job.owner_digest,change.eventDigest,change.publicAuthorityEpoch).run();
- const complete=await readCompletion(b,job,change,payloadTables);
+ const complete=await readCompletion(b,job,change,payloadTables,inventory);
  if(!complete)return false;
  await b.ledger.prepare(`UPDATE storage_erasure_jobs SET state='complete',completed_at=?
  WHERE participant_digest=? AND source_id=? AND owner_digest=? AND terminal_json=?`).bind(new Date().toISOString(),job.participant_digest,b.sourceId,job.owner_digest,json).run();
@@ -236,4 +243,16 @@ export async function requireStorageParticipantErasureComplete(ledger:D1Database
    }
   }
  }
+}
+
+/** Fresh physical proof for a delivered native terminal event. This does not
+ * create an erasure authorization or acknowledge source work. The caller must
+ * separately pin the exact source event and its target delivery receipt. */
+export async function storageTerminalPayloadAbsent(b:StorageAnalyticsBindings,ownerDigest:string,publicAuthorityEpoch:number):Promise<boolean>{
+ if(!/^[a-f0-9]{64}$/u.test(ownerDigest)||!Number.isSafeInteger(publicAuthorityEpoch)||publicAuthorityEpoch<1)throw unavailable();
+ await requireMaintainedSourceErasureProof(b.source,true);
+ const inventory=await readMaintainedAnalyticsErasureInventory(b.target);
+ const tables=[...await cacheRetentionErasureTables(b.target),...await modelBlockErasureTables(b.target),...await sharedFeatureErasureTables(b.target)];
+ return !!await b.target.prepare(`SELECT 1 WHERE ${payloadAbsence(tables,inventory)}`)
+  .bind(b.sourceId,ownerDigest,null,publicAuthorityEpoch).first();
 }

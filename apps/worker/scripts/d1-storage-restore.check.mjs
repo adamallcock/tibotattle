@@ -136,4 +136,31 @@ test('ingestion qualification binds tested restore base and complete ordered rol
  proof.frozenSource=false;await assert.rejects(loadStorageQualification(await save()),/ROLE_QUALIFICATION_INVALID/);proof.frozenSource=true;
  manifest.runtimeReady=true;await assert.rejects(loadStorageQualification(await save()),/ROLE_QUALIFICATION_INVALID/);manifest.runtimeReady=false;
  await writeFile(join(root,'ingestion-isolation-migrations','0006_usage_correction_facts.sql'),'changed');await assert.rejects(loadStorageQualification(await save()),/ROLE_INPUT_CHANGED/);
+ // The qualification verifier must apply the same exact source exception as
+ // the role reader, even when all supplied receipt digests are self-consistent.
+ await writeFile(join(root,'ingestion-isolation-migrations','0006_usage_correction_facts.sql'),'CREATE TABLE synthetic(id INTEGER PRIMARY KEY);');
+ const selectiveName='0015_effective_selective_dependencies.sql',selectivePath=join(root,'ingestion-isolation-migrations',selectiveName);
+ const selectiveBytes=await readFile(join(workerRoot,'ingestion-isolation-migrations',selectiveName));
+ await writeFile(selectivePath,selectiveBytes);
+ const selectiveInput={directory:'ingestion-isolation-migrations',name:selectiveName,sha256:storageSha256(selectiveBytes),bytes:selectiveBytes.length};
+ migrations.push(selectiveInput);
+ await writeFile(join(root,'package.json'),'{}');
+ const {symlink}=await import('node:fs/promises');
+ await symlink(await realpath(join(workerRoot,'node_modules')),join(root,'node_modules'));
+ const saveInputs=async()=>{inputs.inputSha256=identityDigest(migrations);proof.inputSha256=inputs.inputSha256;
+  const updated=JSON.stringify(inputs);await writeFile(join(directory,'role-inputs.json'),updated);
+  proof.roleInputsSha256=storageSha256(updated);manifest.roleInputsSha256=proof.roleInputsSha256;return save();};
+ assert.equal((await loadStorageQualification(await saveInputs())).migrations.length,1);
+ const changedSelective=Buffer.from(selectiveBytes);changedSelective[0]^=1;await writeFile(selectivePath,changedSelective);
+ selectiveInput.sha256=storageSha256(changedSelective);
+ await assert.rejects(loadStorageQualification(await saveInputs()),/ROLE_INPUT_CHANGED/);
+});
+
+test('bounded role installation retains the frozen install stage until its final page',async()=>{
+ const api={...apiBase,promoteAuthorityRestore:async()=>({state:'progress'})};
+ assert.deepEqual(await runStorageRestoreStep({api,source,target,contract,contractDigest,stage:'install-role'}),
+  {stage:'install-role',complete:false,counters:{},nextStage:'install-role'});
+ api.promoteAuthorityRestore=async()=>({state:'complete'});
+ assert.deepEqual(await runStorageRestoreStep({api,source,target,contract,contractDigest,stage:'install-role'}),
+  {stage:'install-role',complete:true,counters:{},nextStage:'finalize-role'});
 });

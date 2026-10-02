@@ -1,7 +1,7 @@
 import { D1_PROVIDER_SCHEMA_PREDICATE } from './d1-provider-schema';
 /** Private restore protocol metadata, never a runtime authorization source. */
 export const AUTHORITY_RESTORE_SCHEMA = [
-`CREATE TABLE _authority_restore_run(id INTEGER PRIMARY KEY CHECK(id=1),run_id TEXT NOT NULL,contract_digest TEXT NOT NULL,limit_bytes INTEGER NOT NULL CHECK(limit_bytes BETWEEN 33554432 AND 9000000000),phase TEXT NOT NULL CHECK(phase IN ('copying','sealed','verified','installed','ready'))) STRICT`,
+`CREATE TABLE _authority_restore_run(id INTEGER PRIMARY KEY CHECK(id=1),run_id TEXT NOT NULL,contract_digest TEXT NOT NULL,limit_bytes INTEGER NOT NULL CHECK(limit_bytes BETWEEN 33554432 AND 9000000000),phase TEXT NOT NULL CHECK(phase IN ('copying','sealed','verified','installing','installed','ready'))) STRICT`,
 `CREATE TABLE _authority_restore_tables(name TEXT PRIMARY KEY,ordinal INTEGER NOT NULL UNIQUE,descriptor TEXT NOT NULL,copy_cursor TEXT NOT NULL DEFAULT '[]',verify_cursor TEXT NOT NULL DEFAULT '[]',copied INTEGER NOT NULL DEFAULT 0,verified INTEGER NOT NULL DEFAULT 0,copy_done INTEGER NOT NULL DEFAULT 0,verify_done INTEGER NOT NULL DEFAULT 0) STRICT`,
 `CREATE TRIGGER _authority_restore_descriptor_guard BEFORE UPDATE OF name,ordinal,descriptor ON _authority_restore_tables BEGIN SELECT RAISE(ABORT,'authority_restore_descriptor_immutable'); END`,
 `CREATE TABLE _authority_restore_pages(name TEXT NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('copy','verify')),after_cursor TEXT NOT NULL,through_cursor TEXT NOT NULL,digest TEXT NOT NULL,row_count INTEGER NOT NULL,done INTEGER NOT NULL,PRIMARY KEY(name,kind,after_cursor)) STRICT, WITHOUT ROWID`,
@@ -29,7 +29,7 @@ END`,
 END`,
 `CREATE TRIGGER _authority_restore_run_guard BEFORE UPDATE ON _authority_restore_run BEGIN
  SELECT CASE WHEN NEW.run_id IS NOT OLD.run_id OR NEW.contract_digest IS NOT OLD.contract_digest OR NEW.limit_bytes IS NOT OLD.limit_bytes
- OR NOT ((OLD.phase='copying' AND NEW.phase='sealed') OR (OLD.phase='sealed' AND NEW.phase='verified') OR (OLD.phase='verified' AND NEW.phase='installed') OR (OLD.phase='installed' AND NEW.phase='ready'))
+ OR NOT ((OLD.phase='copying' AND NEW.phase='sealed') OR (OLD.phase='sealed' AND NEW.phase='verified') OR (OLD.phase='verified' AND NEW.phase IN ('installing','installed')) OR (OLD.phase='installing' AND NEW.phase='installed') OR (OLD.phase='installed' AND NEW.phase='ready'))
  THEN RAISE(ABORT,'authority_restore_state_conflict') END;
  SELECT CASE WHEN EXISTS(SELECT 1 FROM _authority_restore_tables WHERE copy_done!=1 OR (NEW.phase!='sealed' AND (verify_done!=1 OR copied!=verified)))
  OR (NEW.phase!='sealed' AND EXISTS(SELECT 1 FROM _authority_restore_typed WHERE done!=1))

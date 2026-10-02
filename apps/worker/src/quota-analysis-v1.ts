@@ -401,6 +401,11 @@ export type V1UsageReductionStep =
 
 export const V1_USAGE_REDUCTION_COMPONENTS = ["usage-sessions", "usage-scopes", "usage-buckets"] as const;
 export const MAX_V1_USAGE_REDUCTION_CHECKPOINT_BYTES = 8 * 1024 * 1024;
+/** Scoped canonical identities can consume more storage than the original
+ * identifiers. A representation limit must not become an analytical refusal. */
+export class V1PreparedUsageRepresentationUnavailable extends Error {
+  constructor() { super('V1_PREPARED_USAGE_REPRESENTATION_UNAVAILABLE'); }
+}
 const MAX_V1_USAGE_REDUCTION_BUCKETS = 120_000;
 
 function validV1UsageIdentity(value: unknown): value is V1QuotaAcquisitionIdentity {
@@ -812,7 +817,15 @@ export function priceChunkUsageRecord(
   recordJson: string,
   observedAt: string,
 ): { costNanousd: number; pricingStatus: PricingStatus; modelId: string | null } | null {
-  const rec = parseStoredRecordJson(recordJson);
+  return priceChunkUsageRecordValue(parseStoredRecordJson(recordJson), observedAt);
+}
+
+/** Same native pricer for an already decoded, transient stored record. The
+ * caller owns validation and source selection; no record is retained here. */
+export function priceChunkUsageRecordValue(
+  rec: Record<string, unknown> | null,
+  observedAt: string,
+): ReturnType<typeof priceChunkUsageRecord> {
   if (rec === null) return null;
   const pricingEvent = buildPricingEvent(rec, observedAt);
   if (pricingEvent === null) return null;
@@ -1690,7 +1703,7 @@ async function prepareV1UsageReductionContext(
       for (const [provider, grid] of built) gridByProvider.set(provider, grid);
     }
   }
-  const selectedLayout = refusal === null ? await loadTypedV1AnalysisScope(db, participantId) : null;
+  const selectedLayout = refusal === null && !options.preparedEvidence ? await loadTypedV1AnalysisScope(db, participantId) : null;
   return { db, participantId, sourcePin, observedAtCutoff, resetsAtCutoff, attributionIndex, rows, datasetId,
     accountTrackByProvider, gridByProvider, selectedLayout, refusal };
 }
@@ -1761,13 +1774,18 @@ export async function advanceV1UsageReduction(
   const maxWindowedUsageRows = options.maxWindowedUsageRows ?? MAX_WINDOWED_USAGE_ROWS;
   if (!Number.isSafeInteger(maxWindowedUsageRows) || maxWindowedUsageRows < 1
       || maxWindowedUsageRows > MAX_WINDOWED_USAGE_ROWS) throw new Error("v1 usage reduction row bound invalid");
-  if (options.preparedEvidence) throw new Error("v1 usage reduction does not accept prepared evidence");
-  const state = prior ? structuredClone(prior) : createV1UsageReductionCheckpoint(evidence.identity);
-  if (!validateV1UsageReductionCheckpoint(state) || !sameV1UsageIdentity(state.identity, evidence.identity)) {
+  if (options.preparedEvidence && options.preparedEvidence.sourceFingerprint !== options.sourcePin.fingerprint)
+    throw new Error("v1 prepared evidence source mismatch");
+  // The canonical reader has scoped session and occurrence identities. Its
+  // checkpoint must never resume a raw-session frame even under one source pin.
+  const reductionIdentity = options.preparedEvidence ? {...evidence.identity,
+    sourceMethodVersion: evidence.identity.sourceMethodVersion + ':prepared-priced-usage-1'} : evidence.identity;
+  const state = prior ? structuredClone(prior) : createV1UsageReductionCheckpoint(reductionIdentity);
+  if (!validateV1UsageReductionCheckpoint(state) || !sameV1UsageIdentity(state.identity, reductionIdentity)) {
     throw new Error("v1 usage reduction checkpoint invalid");
   }
   const now = budget.now ?? Date.now;
-  const PREPARE_QUERIES = 7, PAGE_QUERIES = 2, FINAL_QUERIES = 2;
+  const PREPARE_QUERIES = 7, PAGE_QUERIES = options.preparedEvidence ? 1 : 2, FINAL_QUERIES = 2;
   if (budget.remainingQueries < PREPARE_QUERIES || now() >= budget.deadlineMs) {
     return { status: "deferred", checkpoint: state };
   }
@@ -1831,8 +1849,10 @@ export async function advanceV1UsageReduction(
   pages: for (let page = 0; page < maxPages && !state.complete; page += 1) {
     if (budget.remainingQueries < PAGE_QUERIES || now() >= budget.deadlineMs) break;
     budget.remainingQueries -= PAGE_QUERIES;
-    const rows = await readV1UsagePage(db, context.sourcePin.winnersJson, participantId,
-      state.cursorObservedAt, state.cursorId, USAGE_PAGE_SIZE, undefined, context.selectedLayout);
+    const rows = options.preparedEvidence
+      ? await options.preparedEvidence.usageReader.readPage(state.cursorObservedAt,state.cursorId,USAGE_PAGE_SIZE)
+      : await readV1UsagePage(db, context.sourcePin.winnersJson, participantId,
+        state.cursorObservedAt, state.cursorId, USAGE_PAGE_SIZE, undefined, context.selectedLayout);
     if (rows.length > USAGE_PAGE_SIZE) throw new Error("v1 usage reduction page overflow");
     state.rowsRead += rows.length;
     if (state.rowsRead > maxWindowedUsageRows) {
@@ -1861,7 +1881,8 @@ export async function advanceV1UsageReduction(
       const grid = context.gridByProvider.get(row.provider);
       const scalarPriceNeeded = state.commonRefusal !== "session_interval_scope_limit_exceeded"
         && grid !== undefined && grid.sortedMs.length > 0 && observedAtMs <= grid.sortedMs[grid.sortedMs.length - 1]!;
-      const priced = scalarPriceNeeded ? reducedUsagePrice(priceChunkUsageRecord(row.record_json, row.observed_at)) : null;
+      const priced = scalarPriceNeeded ? reducedUsagePrice(Object.hasOwn(row,"preparedPrice")
+        ? row.preparedPrice! : priceChunkUsageRecord(row.record_json, row.observed_at)) : null;
       if (session) {
         const intervalStartMs = session.time === null ? undefined : session.time;
         session.time = observedAtMs;
@@ -1900,6 +1921,7 @@ export async function advanceV1UsageReduction(
   }
   state.sessions = [...sessions.values()]; state.scopes = [...scopes.values()]; state.buckets = [...buckets.values()];
   if (v1UsageReductionPayloadBytes(state) > MAX_V1_USAGE_REDUCTION_CHECKPOINT_BYTES) {
+    if (options.preparedEvidence) throw new V1PreparedUsageRepresentationUnavailable();
     state.commonRefusal = "reduced_usage_limit_exceeded"; state.complete = true; clearReducer();
   }
   if (!validateV1UsageReductionCheckpoint(state)) throw new Error("v1 usage reduction successor invalid");

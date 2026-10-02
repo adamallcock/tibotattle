@@ -1,0 +1,256 @@
+{
+  "schemaVersion": 1,
+  "queues": {
+    "canonical": {
+      "ready": 0,
+      "leased": 0,
+      "complete": 3,
+      "refused": 0,
+      "detail": {
+        "fromDay": "2025-12-30",
+        "throughDay": "2026-10-01",
+        "latestCompletedAt": "2026-10-01T12:00:00.000Z",
+        "completedLastHour": 1,
+        "completedLast6Hours": 2,
+        "latestUpdatedAt": "2026-10-01T12:00:00.000Z",
+        "lastFailureAt": null,
+        "delayed": 0,
+        "retrying": 0,
+        "expiredLeases": 0,
+        "reasons": []
+      }
+    },
+    "features": {
+      "ready": 2,
+      "leased": 0,
+      "complete": 3,
+      "refused": 0,
+      "detail": {
+        "fromDay": "2025-12-30",
+        "throughDay": "2026-10-01",
+        "latestCompletedAt": "2026-10-01T12:00:00.000Z",
+        "completedLastHour": 1,
+        "completedLast6Hours": 2,
+        "latestUpdatedAt": "2026-10-01T12:00:00.000Z",
+        "lastFailureAt": null,
+        "delayed": 1,
+        "retrying": 1,
+        "expiredLeases": 0,
+        "reasons": [
+          {
+            "code": "query_budget",
+            "jobs": 2
+          }
+        ]
+      }
+    },
+    "activity": {
+      "ready": 0,
+      "leased": 0,
+      "complete": 3,
+      "refused": 0,
+      "detail": {
+        "fromDay": "2025-12-30",
+        "throughDay": "2026-10-01",
+        "latestCompletedAt": "2026-10-01T12:00:00.000Z",
+        "completedLastHour": 1,
+        "completedLast6Hours": 2,
+        "latestUpdatedAt": "2026-10-01T12:00:00.000Z",
+        "lastFailureAt": null,
+        "delayed": 0,
+        "retrying": 0,
+        "expiredLeases": 0,
+        "reasons": []
+      }
+    },
+    "fits": {
+      "ready": 0,
+      "leased": 0,
+      "complete": 3,
+      "refused": 1,
+      "detail": {
+        "fromDay": "2025-12-30",
+        "throughDay": "2026-10-01",
+        "latestCompletedAt": "2026-10-01T12:00:00.000Z",
+        "completedLastHour": 1,
+        "completedLast6Hours": 2,
+        "latestUpdatedAt": "2026-10-01T12:00:00.000Z",
+        "lastFailureAt": "2026-10-01T12:00:00.000Z",
+        "delayed": 0,
+        "retrying": 0,
+        "expiredLeases": 0,
+        "reasons": [
+          {
+            "code": "evidence",
+            "jobs": 1
+          }
+        ]
+      }
+    },
+    "cache": {
+      "ready": 2,
+      "leased": 0,
+      "complete": 3,
+      "refused": 0,
+      "detail": {
+        "fromDay": "2025-12-30",
+        "throughDay": "2026-10-01",
+        "latestCompletedAt": "2026-10-01T12:00:00.000Z",
+        "completedLastHour": 1,
+        "completedLast6Hours": 2,
+        "latestUpdatedAt": "2026-10-01T12:00:00.000Z",
+        "lastFailureAt": null,
+        "delayed": 1,
+        "retrying": 1,
+        "expiredLeases": 0,
+        "reasons": [
+          {
+            "code": "query_budget",
+            "jobs": 2
+          }
+        ]
+      }
+    },
+    "publication": {
+      "ready": 2,
+      "leased": 0,
+      "complete": 3,
+      "refused": 0,
+      "detail": {
+        "fromDay": "2025-12-30",
+        "throughDay": "2026-10-01",
+        "latestCompletedAt": "2026-10-01T12:00:00.000Z",
+        "completedLastHour": 1,
+        "completedLast6Hours": 2,
+        "latestUpdatedAt": "2026-10-01T12:00:00.000Z",
+        "lastFailureAt": null,
+        "delayed": 1,
+        "retrying": 1,
+        "expiredLeases": 0,
+        "reasons": [
+          {
+            "code": "query_budget",
+            "jobs": 2
+          }
+        ]
+      }
+    },
+    "cleanup": {
+      "ready": 0,
+      "leased": 0,
+      "complete": 3,
+      "refused": 0,
+      "detail": {
+        "fromDay": "2025-12-30",
+        "throughDay": "2026-10-01",
+        "latestCompletedAt": "2026-10-01T12:00:00.000Z",
+        "completedLastHour": 1,
+        "completedLast6Hours": 2,
+        "latestUpdatedAt": "2026-10-01T12:00:00.000Z",
+        "lastFailureAt": null,
+        "delayed": 0,
+        "retrying": 0,
+        "expiredLeases": 0,
+        "reasons": []
+      }
+    }
+  },
+  "stores": {
+    "features": {
+      "unit": "feature_days",
+      "retained": 12,
+      "complete": 10,
+      "headMatched": null,
+      "fromDay": "2025-12-30",
+      "throughDay": "2026-10-01",
+      "latestUpdatedAt": "2026-10-01T12:00:00.000Z",
+      "updatedLastHour": 1,
+      "updatedLast6Hours": 4,
+      "inputEvents": null,
+      "adjacencyPairs": null
+    },
+    "rolling": {
+      "unit": "rolling_segments",
+      "retained": 12,
+      "complete": 10,
+      "headMatched": null,
+      "fromDay": "2025-12-30",
+      "throughDay": "2026-10-01",
+      "latestUpdatedAt": null,
+      "updatedLastHour": null,
+      "updatedLast6Hours": null,
+      "inputEvents": null,
+      "adjacencyPairs": null
+    },
+    "activity": {
+      "unit": "activity_parts",
+      "retained": 12,
+      "complete": 10,
+      "headMatched": 8,
+      "fromDay": "2025-12-30",
+      "throughDay": "2026-10-01",
+      "latestUpdatedAt": "2026-10-01T12:00:00.000Z",
+      "updatedLastHour": 1,
+      "updatedLast6Hours": 4,
+      "inputEvents": null,
+      "adjacencyPairs": null
+    },
+    "cache": {
+      "unit": "cache_days",
+      "retained": 12,
+      "complete": null,
+      "headMatched": null,
+      "fromDay": "2025-12-30",
+      "throughDay": "2026-10-01",
+      "latestUpdatedAt": null,
+      "updatedLastHour": null,
+      "updatedLast6Hours": null,
+      "inputEvents": 426,
+      "adjacencyPairs": 422
+    }
+  },
+  "publications": {
+    "daily": {
+      "unit": "days",
+      "retained": 9,
+      "fromDay": "2025-12-30",
+      "throughDay": "2026-10-01",
+      "latestPublishedAt": "2026-10-01T09:00:00.000Z",
+      "publishedLastHour": 0,
+      "publishedLast6Hours": 1,
+      "freshness": "not_checked"
+    },
+    "model": {
+      "unit": "days",
+      "retained": 9,
+      "fromDay": "2025-12-30",
+      "throughDay": "2026-10-01",
+      "latestPublishedAt": "2026-10-01T09:00:00.000Z",
+      "publishedLastHour": 0,
+      "publishedLast6Hours": 1,
+      "freshness": "not_checked"
+    },
+    "cache": {
+      "unit": "snapshot",
+      "retained": 1,
+      "fromDay": "2026-10-01",
+      "throughDay": "2026-10-01",
+      "latestPublishedAt": "2026-10-01T09:00:00.000Z",
+      "publishedLastHour": 0,
+      "publishedLast6Hours": 1,
+      "freshness": "not_checked"
+    }
+  },
+  "runtime": [
+    {
+      "role": "analytics",
+      "method": "maintained-analytics-v1",
+      "canonicalEnabled": true,
+      "sharedFeaturesEnabled": true,
+      "modelBlocksEnabled": false,
+      "degree": 4,
+      "maxQueries": 950,
+      "observedAt": "2026-10-01T12:00:00.000Z"
+    }
+  ]
+}

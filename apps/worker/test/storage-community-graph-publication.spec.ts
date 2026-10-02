@@ -1291,3 +1291,36 @@ it('admits a real graph calculation with pending delivery after the scheduler re
  expect(await b.STORAGE_ANALYTICS_DB.prepare(
   "SELECT COUNT(*) AS n FROM analytics_community_graph_results WHERE metric='fits'").first<number>('n')).toBe(1);
 });
+
+it('retains complete native graph output while reusing a maintained opaque cohort and exact sample closure',async()=>{
+ await modelFixture();await compute('fits');await compute('model');
+ expect((await publishStorageCommunityModelDay(bindings(),{day:day()})).state).toBe('published');
+ expect((await publishStorageCommunityGraphPreview(bindings())).state).toBe('published');
+ const before=await b.STORAGE_ANALYTICS_DB.prepare('SELECT payload_json FROM analytics_community_graph_previews WHERE source_id=?')
+ .bind(namespace).first<string>('payload_json');
+ const selective=await import('../src/storage-effective-selective-dependencies');
+ for(let n=0;n<48;n++){const progress=await selective.advanceEffectiveDependencyCoverage(typed(),{sourceId:namespace,sourceNamespace:namespace,maxSteps:64,maxRows:128});
+ if(progress.status==='complete')break;}
+ // These native output products are already complete; acknowledge the exact
+ // source metadata ranges in this bounded cohort-layer fixture.
+ await selective.acknowledgeEffectiveDependencyAffectedRanges(typed(),await selective.readEffectiveDependencyAffectedRanges(typed(),128));
+ const global=await selective.readEffectiveDependencyGlobalChange(typed());if(global)await selective.acknowledgeEffectiveDependencyGlobalChange(typed(),global);
+ await b.STORAGE_ANALYTICS_DB.prepare(`INSERT INTO analytics_partition_reconciliation(source_id,complete) VALUES(?,1)
+ ON CONFLICT(source_id) DO UPDATE SET complete=1`).bind(namespace).run();
+ const {readAnalyticsWorkClosureFence}=await import('../src/storage-analytics-closure-fence');
+ expect(await readAnalyticsWorkClosureFence(bindings())).not.toBeNull();
+ expect(await publishStorageCommunityModelDay(bindings(),{day:day(),canonicalClosure:true})).toMatchObject({state:'unchanged'});
+ expect(await publishStorageCommunityGraphPreview(bindings(),{canonicalClosure:true})).toMatchObject({state:'unchanged'});
+ expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT payload_json FROM analytics_community_graph_previews WHERE source_id=?')
+ .bind(namespace).first<string>('payload_json')).toBe(before);
+ const descriptors=(await b.STORAGE_ANALYTICS_DB.prepare('SELECT descriptor FROM analytics_canonical_publication_cohort_members').all()).results;
+ expect(descriptors.length).toBeGreaterThan(0);expect(JSON.stringify(descriptors)).not.toContain(participantId);
+ expect(await b.STORAGE_ANALYTICS_DB.prepare("SELECT count(*) n FROM analytics_canonical_publication_closures WHERE state='complete' AND family IN('fits','model')")
+ .first<number>('n')).toBe(2);
+ let ownerCensuses=0;
+ const observedSource=new Proxy(typed(),{get(db,property){if(property==='prepare')return(sql:string)=>{
+ if(sql.includes('AS hasV1')&&sql.includes('ORDER BY p.id LIMIT'))ownerCensuses++;return db.prepare(sql);};
+ const value=Reflect.get(db,property);return typeof value==='function'?value.bind(db):value;}});
+ expect(await publishStorageCommunityGraphPreview({...bindings(),source:observedSource},{canonicalClosure:true})).toMatchObject({state:'unchanged'});
+ expect(ownerCensuses).toBe(0);
+},120000);

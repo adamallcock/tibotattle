@@ -1,4 +1,4 @@
-import { parseTelemetryV11Record } from '@app-usagemonitor/telemetry-contract';
+import { parseTelemetryV11Record, type TelemetryV11Record } from '@app-usagemonitor/telemetry-contract';
 import {
   GraphDayProjectionRefusedError, reduceGraphDayProjection, type GraphDayQuotaInput,
 } from './graph-day-projection';
@@ -109,7 +109,16 @@ export function mapEffectiveQuotaPageRow(row: EffectiveTelemetryOccurrence,
   if (row.stream !== 'quota' || row.status !== 'compatible' || row.recordJson === null
     || row.eventTime === null || !validGraphDayLabel(day)
     || !Number.isSafeInteger(ordinal) || ordinal <= 0) throw fail();
-  const value = parseTelemetryV11Record('quota', JSON.parse(row.recordJson));
+  return mapEffectiveQuotaRecord(row, day, ordinal,
+    parseTelemetryV11Record('quota', JSON.parse(row.recordJson)));
+}
+
+/** Use the shared page's validated record with the native effective mapping. */
+export function mapEffectiveQuotaRecord(row: EffectiveTelemetryOccurrence,
+  day: string, ordinal: number, value: TelemetryV11Record): V11QuotaPageRow {
+  if (row.stream !== 'quota' || row.status !== 'compatible' || row.recordJson === null
+    || row.eventTime === null || !validGraphDayLabel(day)
+    || !Number.isSafeInteger(ordinal) || ordinal <= 0) throw fail();
   if (value.schemaVersion !== 'quota-observation-v1.1') throw fail();
   const at = Date.parse(row.eventTime), attribution = value.accountPlanAttribution;
   if (!inDay(at, day)) throw fail();

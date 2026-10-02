@@ -45,11 +45,11 @@ async function migrate(includeCorrection = true): Promise<void> {
   await applyD1Migrations(db(), bindings.TEST_INGESTION_BRIDGE_MIGRATIONS);
   await applyD1Migrations(db(), bindings.TEST_TYPED_V11_ADMISSION_MIGRATIONS);
   await applyD1Migrations(db(), bindings.TEST_TYPED_V1_ADMISSION_MIGRATIONS);
-  // The optional catalog depends on correction history; keep this fixture at
-  // its intended pre-correction schema when testing refusal before 0006.
+  // Refusal before 0006 uses its actual predecessor frontier. Later source
+  // catalogs depend on correction history/runtime and do not belong here.
   await applyD1Migrations(db(), includeCorrection
     ? bindings.TEST_INGESTION_ISOLATION_MIGRATIONS
-    : bindings.TEST_INGESTION_ISOLATION_MIGRATIONS.filter((migration) => !/^(0006|0013)_/u.test(migration.name)));
+    : bindings.TEST_INGESTION_ISOLATION_MIGRATIONS.filter((migration) => migration.name < '0006_'));
   await initializeStorageSource(db(), sourceId);
   await initializeTypedV1Admission(db(), sourceNamespace);
 }

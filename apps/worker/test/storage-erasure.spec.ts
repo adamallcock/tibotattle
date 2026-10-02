@@ -424,3 +424,157 @@ describe('cross-store physical erasure completion',()=>{
   expect(await count('analytics_v11_value_pages')).toBe(0);
  });
 });
+
+
+it('physically removes maintained mixed artifacts after lost fence acknowledgement and preserves exact survivor values',async()=>{
+ const {seedMaintainedErasureFacts,prepareMaintainedErasurePartitions,seedMaintainedErasureOwnerMetadata}=await import('./helpers/maintained-erasure');
+ const {readMaintainedAnalyticsErasureInventory}=await import('../src/storage-erasure-artifacts');
+ const {materializeCanonicalPartition,readCanonicalFacts}=await import('../src/storage-canonical-analytics-facts');
+ const {readCanonicalCacheDay}=await import('../src/storage-canonical-cache-pairs');
+ const {advanceEffectiveDependencyCoverage}=await import('../src/storage-effective-selective-dependencies');
+ const first=await fixture(),second=await fixture();await deliver();
+ const scope=(ownerDigest:string)=>({sourceId,sourceNamespace,ownerDigest,day:today()});
+ const erased=await seedMaintainedErasureFacts(target(),scope(first.event.ownerDigest));
+ const surviving=await seedMaintainedErasureFacts(target(),scope(second.event.ownerDigest),erased[0]!.occurrenceKey.slice(0,2));
+ const features=await prepareMaintainedErasurePartitions(target(),sourceId,[...erased,...surviving]);
+ const mixed=features.find(f=>f.facts.some(v=>v.revision===erased[0]!.revision))!;
+ expect(mixed.facts.some(f=>f.revision===surviving[0]!.revision)).toBe(true);
+ await seedMaintainedErasureOwnerMetadata(target(),scope(first.event.ownerDigest),erased);
+ const survivor=await seedMaintainedErasureOwnerMetadata(target(),scope(second.event.ownerDigest),surviving);
+ const o=first.event.ownerDigest,d='d'.repeat(64),work='a'.repeat(64),global='b'.repeat(64),cohort='c'.repeat(64);
+ await target().prepare(`INSERT INTO analytics_shared_preparation_cursor(source_id,after_recent_owner,after_dirty_owner,after_history_owner)
+  VALUES(?,?,?,?)`).bind(sourceId,o,o,o).run();
+ await target().prepare(`INSERT INTO analytics_partition_global_changes(source_id,source_stamp,after_owner_digest,updated_ms)
+  VALUES(?,1,?,0)`).bind(sourceId,o).run();
+ await target().prepare(`INSERT INTO analytics_partition_work(work_key,head_key,source_id,owner_digest,partition_key,input_revision,policy_revision,
+  stage,lane,resident_bytes,admission_queries,ready_ms,created_ms,updated_ms) VALUES(?,?,?,NULL,?,?,?,'activity','new',1024,200,0,0,0)`)
+  .bind(work,global,sourceId,mixed.manifest.partitionKey,mixed.manifest.contentRevision,d).run();
+ await target().prepare(`UPDATE analytics_partition_work SET state='leased',revision=1,claim_token=?,claim_expires_ms=? WHERE work_key=?`)
+  .bind(crypto.randomUUID(),Date.now()+60000,work).run();
+ expect(await target().prepare('SELECT count(*) n FROM analytics_partition_work_subjects WHERE work_key=?').bind(work).first<number>('n')).toBe(2);
+ const publicationWork=await sha256Hex('synthetic-independent-publication-leaf');
+ await target().prepare(`INSERT INTO analytics_partition_work(work_key,head_key,source_id,owner_digest,partition_key,input_revision,policy_revision,
+  stage,lane,resident_bytes,admission_queries,ready_ms,created_ms,updated_ms) VALUES(?,?,?,NULL,?,?,?,'publication','new',1024,200,0,0,0)`)
+  .bind(publicationWork,publicationWork,sourceId,mixed.manifest.partitionKey,mixed.manifest.contentRevision,d).run();
+ expect(await target().prepare('SELECT count(*) n FROM analytics_partition_work_subjects WHERE work_key=?').bind(publicationWork).first('n')).toBe(2);
+ await target().prepare('INSERT INTO analytics_partition_work_links VALUES(?,?)').bind(work,publicationWork).run();
+ await target().prepare(`INSERT INTO analytics_partition_effect_refs(work_key,effect_key)
+  SELECT ?,effect_key FROM analytics_canonical_effects`).bind(work).run();
+ await target().prepare(`INSERT INTO analytics_partition_reconciliation(source_id,after_effect_key,complete)
+  SELECT ?,e.effect_key,1 FROM analytics_canonical_effects e JOIN analytics_canonical_pages p USING(change_key)
+  WHERE p.owner_digest=? LIMIT 1`).bind(sourceId,o).run();
+ await target().prepare(`INSERT INTO analytics_canonical_publication_cohorts(cohort_key,source_id,proof_digest,member_count,cursor_count,state,valid_until_ms,created_ms)
+  VALUES(?,?,?,2,2,'complete',?,0)`).bind(cohort,sourceId,d,Date.now()+60000).run();
+ for(const [n,ownerDigest]of [o,second.event.ownerDigest].entries())await target().prepare(`INSERT INTO analytics_canonical_publication_cohort_members
+  (cohort_key,source_id,owner_digest,ordinal,descriptor) VALUES(?,?,?,?,?)`).bind(cohort,sourceId,ownerDigest,n,JSON.stringify({ownerDigest})).run();
+ // These closed metadata fixtures exercise physical parent/child cleanup;
+ // native calculation and publication payload parity are separate tests.
+ await target().prepare(`INSERT INTO analytics_canonical_cache_session_proofs
+  SELECT source_id,owner_digest,selection_method,day,revision,1 FROM analytics_canonical_cache_days`).run();
+ const {beginCanonicalPublicationClosure,sealCanonicalPublicationExpected,commitCanonicalPublicationClosure,pinCanonicalGraphPublication}=await import('../src/storage-canonical-publication');
+ const cacheClosure=await beginCanonicalPublicationClosure(target(),{sourceId,day:today(),family:'cache',watermark:50,authorityDigest:d,expectedCount:0,nowMs:0});
+ for(const ownerDigest of [o,second.event.ownerDigest])await target().prepare('INSERT INTO analytics_canonical_publication_subjects VALUES(?,?,?)').bind(cacheClosure,sourceId,ownerDigest).run();
+ expect(await sealCanonicalPublicationExpected(target(),cacheClosure)).toBe(true);
+ expect(await commitCanonicalPublicationClosure(target(),cacheClosure)).toBe(true);
+ await target().prepare(`INSERT INTO analytics_canonical_cache_publications
+  SELECT ?,1,?,?,revision,?,'{}','null',?,0 FROM analytics_canonical_cache_clock WHERE id=1`)
+  .bind(sourceId,cacheClosure,cohort,today(),await sha256Hex('null')).run();
+ const authority=JSON.stringify(await captureStorageCommunityAuthority(source()));
+ await target().prepare('INSERT INTO analytics_community_graph_results VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)')
+  .bind(sourceId,o,'fits',today(),'synthetic',d,1,d,'{}',d,authority,Date.now(),'v1.1').run();
+ const graphClosure=await pinCanonicalGraphPublication(target(),{sourceId,day:today(),metric:'fits',watermark:51,authorityDigest:d,nowMs:0,
+  refs:[{ownerDigest:o,day:today(),metric:'fits',method:'synthetic',dependencyDigest:d,payloadSha256:d,empty:true}]});
+ expect(graphClosure).not.toBeNull();
+ // Interrupted census headers have no admitted subjects yet. Terminal replay
+ // must remove these drafts rather than retaining an incomplete owner census.
+ const draft=await beginCanonicalPublicationClosure(target(),{sourceId,day:today(),family:'cache',watermark:52,authorityDigest:d,expectedCount:1,nowMs:0});
+ await target().prepare(`INSERT INTO analytics_canonical_publication_cohorts(cohort_key,source_id,proof_digest,member_count,valid_until_ms,created_ms)
+  VALUES(?,?,?,2,?,0)`).bind(await sha256Hex('synthetic-capturing-cohort'),sourceId,d,Date.now()+60000).run();
+ await target().prepare(`INSERT INTO analytics_canonical_cache_pair_work(node_key,source_id,owner_digest,day,selection_method)
+  SELECT node_key,source_id,owner_digest,day,selection_method FROM analytics_canonical_cache_nodes WHERE owner_digest=? ON CONFLICT DO NOTHING`).bind(o).run();
+ await target().prepare(`INSERT INTO analytics_canonical_cache_logical_work(logical_key,source_id,owner_digest,day,selection_method)
+  SELECT logical_key,source_id,owner_digest,day,selection_method FROM analytics_canonical_cache_slots WHERE owner_digest=? ON CONFLICT DO NOTHING`).bind(o).run();
+ // Populate source reverse/dependency state through its actual catalog builder.
+ await advanceEffectiveDependencyCoverage(source(),{sourceId,sourceNamespace,participantId:first.participantId,maxSteps:64,maxRows:128});
+ await source().prepare('UPDATE storage_effective_selective_bootstrap SET owner_cursor=?,complete=0').bind(first.event.ownerDigest).run();
+ const inventory=await readMaintainedAnalyticsErasureInventory(target());
+ for(const table of ['analytics_canonical_tools','analytics_canonical_feature_quantities','analytics_canonical_feature_prices',
+  'analytics_canonical_feature_membership','analytics_canonical_activity_heads','analytics_canonical_input_pending','analytics_canonical_rolling_rows',
+  'analytics_canonical_rolling_members','analytics_canonical_cache_pairs','analytics_canonical_cache_windows','analytics_canonical_publication_part_subjects',
+  'analytics_canonical_publication_expected','analytics_partition_effect_refs','analytics_canonical_cache_session_proofs',
+  'analytics_canonical_cache_publications','analytics_canonical_publication_graph_refs','analytics_partition_work_links',
+  'analytics_canonical_cache_pair_work','analytics_canonical_cache_logical_work'])expect(await count(table),table).toBeGreaterThan(0);
+ let sawFence=false,lost=false;
+ const interrupted=new Proxy(target(),{get(db,key){
+  if(key==='prepare')return(sql:string)=>{if(sql.includes('INSERT INTO analytics_storage_erasure_fences'))sawFence=true;return db.prepare(sql);};
+  if(key==='batch')return async(statements:D1PreparedStatement[])=>{const result=await db.batch(statements);
+   if(sawFence&&!lost){lost=true;throw Error('synthetic lost terminal acknowledgement');}return result;};
+  const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;
+ }});
+ await expect(eraseParticipantAsOwner(runtime(interrupted),'synthetic-admin',first.participantId)).rejects.toThrow();expect(lost).toBe(true);
+ expect(await count('analytics_storage_erasure_receipts')).toBe(0);
+ expect(await target().prepare('SELECT 1 FROM analytics_partition_work WHERE work_key IN(?,?)').bind(work,publicationWork).first()).toBeNull();
+ await drain();await requireStorageParticipantErasureComplete(b.DELETION_LEDGER,first.participantId,bindings());
+ expect(await count('analytics_storage_erasure_receipts')).toBe(1);
+ for(const table of inventory.ownerTables)expect(await target().prepare('SELECT count(*) n FROM '+table+' WHERE source_id=? AND owner_digest=?')
+  .bind(sourceId,o).first<number>('n'),table).toBe(0);
+ expect(await target().prepare('SELECT 1 FROM analytics_canonical_manifests WHERE content_revision=?').bind(mixed.manifest.contentRevision).first()).toBeNull();
+ expect(await count('analytics_canonical_publication_cohorts')).toBe(0);
+ expect(await count('analytics_canonical_cache_publications')).toBe(0);
+ expect(await target().prepare('SELECT 1 FROM analytics_canonical_publication_closures WHERE closure_key IN(?,?,?)').bind(cacheClosure,graphClosure,draft).first()).toBeNull();
+ expect(await target().prepare('SELECT after_effect_key FROM analytics_partition_reconciliation WHERE source_id=?').bind(sourceId).first('after_effect_key')).toBe('');
+ expect(await target().prepare('SELECT sum(jobs) n FROM analytics_partition_work_counts WHERE source_id=?').bind(sourceId).first('n')).toBe(await count('analytics_partition_work'));
+ expect(await readCanonicalFacts(target(),surviving.map(f=>f.revision))).toEqual(surviving);
+ const rebuilt=await materializeCanonicalPartition(target(),surviving[0]!.location.partitionKey);
+ expect(rebuilt).toMatchObject({state:'complete',manifest:{rowCount:1}});
+ expect(await readCanonicalCacheDay({target:target(),scope:{sourceId,ownerDigest:second.event.ownerDigest,selectionMethod:'effective-union-v1'},
+  day:today(),stillCurrent:async()=>true})).toEqual(survivor.cache);
+ expect(await source().prepare('SELECT owner_cursor FROM storage_effective_selective_bootstrap').first<string>('owner_cursor')).toBe('');
+ for(const table of ['storage_effective_dependency_owner_mutations','storage_effective_selective_owners','storage_effective_selective_work',
+  'storage_effective_selective_variants','storage_effective_selective_reverse_work','storage_effective_selective_days','storage_effective_selective_ranges','storage_effective_selective_effects'])
+  expect(await source().prepare('SELECT count(*) n FROM '+table+' WHERE participant_id=?').bind(first.participantId).first<number>('n'),table).toBe(0);
+ const dirty=await target().prepare('SELECT generation FROM analytics_canonical_dirty_partitions WHERE partition_key=?').bind(erased[0]!.location.partitionKey).first<number>('generation');
+ expect(dirty).toBeGreaterThan(0);
+ const before=JSON.stringify((await target().prepare('SELECT * FROM analytics_storage_erasure_receipts').all()).results);
+ expect(await advanceStorageErasureJobs(bindings())).toEqual({completed:0,pending:false});
+ await requireStorageParticipantErasureComplete(b.DELETION_LEDGER,first.participantId,bindings());
+ expect(JSON.stringify((await target().prepare('SELECT * FROM analytics_storage_erasure_receipts').all()).results)).toBe(before);
+ expect((await target().prepare('PRAGMA foreign_key_check').all()).results).toEqual([]);
+},120_000);
+
+it('replays an existing terminal fence against a populated restored derived snapshot',async()=>{
+ const {seedMaintainedErasureFacts,prepareMaintainedErasurePartitions,seedMaintainedErasureOwnerMetadata}=await import('./helpers/maintained-erasure');
+ const {readMaintainedAnalyticsErasureInventory}=await import('../src/storage-erasure-artifacts');
+ const f=await fixture();await deliver();const o=f.event.ownerDigest,scope={sourceId,sourceNamespace,ownerDigest:o,day:today()};
+ const facts=await seedMaintainedErasureFacts(target(),scope);
+ await prepareMaintainedErasurePartitions(target(),sourceId,facts);
+ await seedMaintainedErasureOwnerMetadata(target(),scope,facts);
+ // Model an old derived snapshot coexisting with an independently retained
+ // terminal fence. Disable only INSERT cleanup inside this synthetic setup
+ // transaction, restore every hook, then test the actual UPDATE replay path.
+ const hooks=(await target().prepare("SELECT name,sql FROM sqlite_schema WHERE type='trigger' AND tbl_name='analytics_storage_erasure_fences'")
+  .all<{name:string;sql:string}>()).results.filter(row=>/AFTER INSERT/iu.test(row.sql));
+ await target().batch([
+  ...hooks.map(row=>target().prepare('DROP TRIGGER '+row.name)),
+  target().prepare(`INSERT INTO analytics_storage_erasure_fences(source_id,owner_digest,terminal_event_digest,terminal_sequence,
+   terminal_revision,authority_epoch,public_authority_epoch) VALUES(?,?,?,1,2,2,2)`).bind(sourceId,o,'e'.repeat(64)),
+  ...hooks.map(row=>target().prepare(row.sql)),
+ ]);
+ expect(await count('analytics_canonical_facts')).toBe(3);
+ expect(await count('analytics_canonical_rolling_rows')).toBeGreaterThan(0);
+ expect(await count('analytics_canonical_cache_pairs')).toBeGreaterThan(0);
+ const inventory=await readMaintainedAnalyticsErasureInventory(target());
+ await target().prepare('UPDATE analytics_storage_erasure_fences SET terminal_revision=terminal_revision WHERE source_id=? AND owner_digest=?').bind(sourceId,o).run();
+ for(const table of inventory.ownerTables)expect(await target().prepare('SELECT count(*) n FROM '+table+' WHERE source_id=? AND owner_digest=?')
+  .bind(sourceId,o).first('n'),table).toBe(0);
+ for(const table of ['analytics_canonical_variants','analytics_canonical_days','analytics_canonical_tools','analytics_canonical_heads',
+  'analytics_canonical_effects','analytics_canonical_manifest_rows','analytics_canonical_manifests','analytics_canonical_partition_heads',
+  'analytics_canonical_input_seen','analytics_canonical_input_pending','analytics_canonical_feature_quantities','analytics_canonical_feature_prices',
+  'analytics_canonical_feature_membership','analytics_canonical_activity_heads','analytics_canonical_rolling_rows','analytics_canonical_rolling_members',
+  'analytics_canonical_cache_partitions','analytics_canonical_publication_parts','analytics_canonical_publication_part_facts',
+  'analytics_canonical_publication_part_heads','analytics_canonical_publication_replacements','analytics_canonical_publication_expected'])
+  expect(await count(table),table).toBe(0);
+ expect(await count('analytics_canonical_dirty_partitions')).toBeGreaterThan(0);
+ expect(await count('analytics_storage_erasure_fences')).toBe(1);
+ expect((await target().prepare('PRAGMA foreign_key_check').all()).results).toEqual([]);
+});

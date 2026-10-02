@@ -56,9 +56,9 @@ async function compute(target: D1Database, owner: Owner, day: string, metric: 'f
     const scope = await captureStorageGraphScope(scoped.source,
       { owner, day, metric, sourceId, sourceNamespace, preparedFold: true });
     expect(scope.source).toBe(owner.hasEffective ? 'effective' : scope.source);
-    // Scope capture is the common exact dependency proof, independent of the
-    // graph finisher. Count source payload reads only inside the finisher.
-    rawThisCall = 0; inventoryThisCall = 0; partsThisCall = 0;
+    // Keep the full invocation in the counters, including exact scope capture.
+    // The finisher delta remains a separate assertion about fallback behavior.
+    const scopeRawReads = rawThisCall;
     const result = await computeStorageGraphResult(scoped, scope, { maxQueries: meter.remainingQueries,
       deadlineMs: Date.now() + 55_000, preparedFold: true, preparedEffectiveUsage: false,
       ...(sharedFeatures ? { sharedFeatures: true } : {}) });
@@ -72,7 +72,7 @@ async function compute(target: D1Database, owner: Owner, day: string, metric: 'f
       if (sharedFeatures && !result.reused) {
         // A completed feature-backed window must reach the prepared graph
         // kernel. A hidden native fallback rereads the source candidate SQL.
-        expect(rawThisCall).toBe(0);
+        expect(rawThisCall - scopeRawReads).toBe(0);
         expect(partsThisCall).toBeGreaterThan(0);
       }
       return { result, scope, invocations: invocations + 1, rawUsageReads, inventoryReads,

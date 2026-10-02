@@ -1,3 +1,4 @@
+import {D1InvocationBudgetExceededError} from './d1-invocation-budget';
 import {
   canonicalTelemetryV11Json,
   parseTelemetryV11Record,
@@ -10,7 +11,7 @@ import {
   decodeTelemetryV12Record,
   type TelemetryV12TypedRecordRow,
 } from "./telemetry-v12-repository";
-import { typedTelemetryIdSql } from "./typed-telemetry-codec";
+import { encodeTypedTelemetryId, typedTelemetryIdSql } from "./typed-telemetry-codec";
 
 /**
  * Typed v1.2 analytical source boundary. A domain head is a write cursor,
@@ -89,6 +90,9 @@ const MAX_DAYS = 101;
  * extension remains a separate variant and is never silently discarded.
  */
 export const MAX_EFFECTIVE_V12_VARIANT_ROWS = 16_384;
+// D1 allows at most 100 bound parameters per statement. One batch also binds
+// participant, two stream guards and the global variant-refusal limit.
+const MAX_EFFECTIVE_V12_OCCURRENCE_BATCH = 80;
 const unavailable = () => new Error("TELEMETRY_V12_EFFECTIVE_UNAVAILABLE");
 
 function integer(value: unknown, minimum = 0, maximum = Number.MAX_SAFE_INTEGER): number {
@@ -232,6 +236,7 @@ async function available(db: D1Database): Promise<boolean> {
     if (rows.length !== TABLES.length + 1) throw unavailable();
     return true;
   } catch (error) {
+    if (error instanceof D1InvocationBudgetExceededError) throw error;
     if (error instanceof Error && error.message === "TELEMETRY_V12_EFFECTIVE_UNAVAILABLE") throw error;
     throw unavailable();
   }
@@ -326,28 +331,59 @@ function pageSql(): string {
   ].join("\n");
 }
 
-function occurrenceSql(): string {
+function occurrenceSql(requestedCount: number): string {
+  if (!Number.isSafeInteger(requestedCount) || requestedCount < 1
+      || requestedCount > MAX_EFFECTIVE_V12_OCCURRENCE_BATCH) throw unavailable();
   return [
-    "WITH requested(occurrence_id) AS MATERIALIZED (SELECT value FROM json_each(?)),",
-    "eligible AS MATERIALIZED (",
+    "WITH requested(occurrence_id) AS MATERIALIZED (VALUES " +
+      Array.from({ length: requestedCount }, () => "(?)").join(",") + "),",
+    "eligible_manifests AS MATERIALIZED (",
+    "  SELECT DISTINCT manifest.id AS manifest_id,generation.device_id AS source_device_id,",
+    "         generation.participant_id AS source_participant_id",
+    "    FROM telemetry_v12_domains generation",
+    "    JOIN telemetry_v12_domain_days domain_day ON domain_day.generation_id=generation.id",
+    "    JOIN telemetry_v12_day_manifests manifest ON manifest.id=domain_day.manifest_id",
+    "      AND manifest.participant_id=generation.participant_id",
+    "      AND manifest.device_id=generation.device_id",
+    "      AND manifest.manifest_digest=domain_day.manifest_digest AND manifest.state='ready'",
+    "    " + BASE_JOIN,
+    "   WHERE generation.participant_id=?",
+    "),",
+    "candidate_records AS MATERIALIZED (",
     "  SELECT r.id,r.manifest_id,r.record_index,r.stream,r.occurrence_id,",
-    "         r.observed_at_ms,r.observed_day,r.canonical_digest,",
-    "         generation.device_id AS source_device_id,",
-    "         " + typedTelemetryIdSql("r.occurrence_id") + " AS occurrence_text",
-      "    FROM requested wanted",
-      "    JOIN telemetry_v12_records r ON " + typedTelemetryIdSql("r.occurrence_id") +
-      "=wanted.occurrence_id AND r.stream=?",
-    "    JOIN telemetry_v12_chunks chunk ON chunk.id=r.chunk_id AND chunk.manifest_id=r.manifest_id",
-    "      AND chunk.stream=?",
-    "      AND chunk.record_count=(SELECT count(*) FROM telemetry_v12_records complete WHERE complete.chunk_id=chunk.id)",
-    "    JOIN telemetry_v12_day_manifests manifest ON manifest.id=r.manifest_id",
-    "      AND manifest.participant_id=chunk.participant_id AND manifest.device_id=chunk.device_id AND manifest.state='ready'",
-    "    JOIN telemetry_v12_domain_days domain_day ON domain_day.manifest_id=manifest.id",
-    "      AND domain_day.manifest_digest=manifest.manifest_digest",
-      "    JOIN telemetry_v12_domains generation ON generation.id=domain_day.generation_id",
-      "      AND generation.participant_id=chunk.participant_id AND generation.device_id=chunk.device_id",
-      "    " + BASE_JOIN,
-      "   WHERE generation.participant_id=?",
+    "         r.chunk_id,r.observed_at_ms,r.observed_day,r.canonical_digest,",
+    "         scope.source_device_id,scope.source_participant_id",
+    "    FROM eligible_manifests scope",
+    "    CROSS JOIN requested wanted",
+    "    CROSS JOIN telemetry_v12_records r",
+    "    CROSS JOIN telemetry_v12_chunks chunk",
+    "   WHERE r.manifest_id=scope.manifest_id AND r.stream=?",
+    "     AND r.occurrence_id=wanted.occurrence_id",
+    "     AND chunk.id=r.chunk_id AND chunk.manifest_id=r.manifest_id",
+    "     AND chunk.stream=?",
+    "     AND chunk.participant_id=scope.source_participant_id",
+    "     AND chunk.device_id=scope.source_device_id",
+    "), reached_chunks AS MATERIALIZED (",
+    "  SELECT DISTINCT candidate.chunk_id AS chunk_id",
+    "    FROM candidate_records candidate",
+    "), complete_chunks AS MATERIALIZED (",
+    "  SELECT chunk.id AS chunk_id",
+    "    FROM reached_chunks reached",
+    "    CROSS JOIN telemetry_v12_chunks chunk",
+    "   WHERE chunk.id=reached.chunk_id",
+    "     AND chunk.record_count=(SELECT count(*) FROM telemetry_v12_records complete WHERE complete.chunk_id=chunk.id)",
+    "), eligible AS MATERIALIZED (",
+    "  SELECT candidate.id,candidate.manifest_id,candidate.record_index,candidate.stream,",
+    "         candidate.occurrence_id,candidate.observed_at_ms,candidate.observed_day,",
+    "         candidate.canonical_digest,candidate.source_device_id,",
+    "         " + typedTelemetryIdSql("candidate.occurrence_id") + " AS occurrence_text",
+    "    FROM candidate_records candidate",
+    "    CROSS JOIN telemetry_v12_chunks chunk",
+    "    JOIN complete_chunks complete_chunk ON complete_chunk.chunk_id=candidate.chunk_id",
+    "   WHERE chunk.id=candidate.chunk_id",
+    "     AND chunk.manifest_id=candidate.manifest_id AND chunk.stream=candidate.stream",
+    "     AND chunk.participant_id=candidate.source_participant_id",
+    "     AND chunk.device_id=candidate.source_device_id",
     "), grouped AS MATERIALIZED (",
     "  SELECT MIN(id) AS id,source_device_id,occurrence_text,observed_at_ms,canonical_digest",
     "    FROM eligible",
@@ -434,6 +470,7 @@ export async function readTelemetryV12EffectiveCandidatePage(db: D1Database, opt
       : null;
     return Object.freeze({ available: true, records: Object.freeze(records), next });
   } catch (error) {
+    if (error instanceof D1InvocationBudgetExceededError) throw error;
     if (error instanceof Error && error.message === "TELEMETRY_V12_EFFECTIVE_UNAVAILABLE") throw error;
     throw unavailable();
   }
@@ -461,6 +498,7 @@ export async function readTelemetryV12EffectivePage(db: D1Database, options: {
       : null;
     return Object.freeze({ available: true, records: Object.freeze(parsed), next });
   } catch (error) {
+    if (error instanceof D1InvocationBudgetExceededError) throw error;
     if (error instanceof Error && error.message === "TELEMETRY_V12_EFFECTIVE_UNAVAILABLE") throw error;
     throw unavailable();
   }
@@ -475,16 +513,34 @@ export async function readTelemetryV12EffectiveOccurrences(db: D1Database, optio
       || options.occurrenceIds.some((value) => !OCCURRENCE.test(value))) throw unavailable();
   if (!options.occurrenceIds.length || !await available(db)) return { available: false, records: Object.freeze([]) };
   try {
-    const rows = (await db.prepare(occurrenceSql()).bind(
-      JSON.stringify(options.occurrenceIds), streamName, streamName, participantId,
-      MAX_EFFECTIVE_V12_VARIANT_ROWS + 1,
-    ).all<TypedStorageRow>()).results;
-    if (rows.length > MAX_EFFECTIVE_V12_VARIANT_ROWS) throw unavailable();
+    const rows: TypedStorageRow[] = [];
+    const unique = [...new Set(options.occurrenceIds)];
+    for (let offset = 0; offset < unique.length; offset += MAX_EFFECTIVE_V12_OCCURRENCE_BATCH) {
+      const batch = unique.slice(offset, offset + MAX_EFFECTIVE_V12_OCCURRENCE_BATCH);
+      const requested = batch.map(id => Uint8Array.from(encodeTypedTelemetryId(id)).buffer);
+      const part = (await db.prepare(occurrenceSql(batch.length)).bind(
+        ...requested, participantId, streamName, streamName,
+        MAX_EFFECTIVE_V12_VARIANT_ROWS + 1,
+      ).all<TypedStorageRow>()).results;
+      rows.push(...part);
+      if (rows.length > MAX_EFFECTIVE_V12_VARIANT_ROWS) throw unavailable();
+    }
+    rows.sort((left, right) => {
+      const a = bytes(left.occurrence_id), b = bytes(right.occurrence_id);
+      for (let index = 0; index < Math.min(a.length, b.length); index += 1) {
+        if (a[index] !== b[index]) return a[index]! - b[index]!;
+      }
+      if (a.length !== b.length) return a.length - b.length;
+      if (left.observed_at_ms !== right.observed_at_ms) return left.observed_at_ms - right.observed_at_ms;
+      if (left.manifest_id !== right.manifest_id) return left.manifest_id < right.manifest_id ? -1 : 1;
+      return left.record_index - right.record_index;
+    });
     return {
       available: true,
       records: Object.freeze(await Promise.all(rows.map((row) => decodedRow(streamName, row)))),
     };
   } catch (error) {
+    if (error instanceof D1InvocationBudgetExceededError) throw error;
     if (error instanceof Error && error.message === "TELEMETRY_V12_EFFECTIVE_UNAVAILABLE") throw error;
     throw unavailable();
   }
@@ -524,6 +580,7 @@ export async function readTelemetryV12EffectiveDays(db: D1Database, options: {
     if (rows.length > MAX_DAYS) throw unavailable();
     return Object.freeze(rows.map((row) => day(row.observed_day)));
   } catch (error) {
+    if (error instanceof D1InvocationBudgetExceededError) throw error;
     if (error instanceof Error && error.message === "TELEMETRY_V12_EFFECTIVE_UNAVAILABLE") throw error;
     throw unavailable();
   }

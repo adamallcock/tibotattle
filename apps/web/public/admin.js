@@ -96,10 +96,10 @@ const isAdminPage = document.body?.classList?.contains(ADMIN_PAGE_CLASS) === tru
 let infoHintSequence = 0;
 
 const INFO_HINTS = Object.freeze({
-  "Ingestion journal": "Every accepted change (an upload that changes a contributor's evidence, an activation, an opt-out or an erasure) is recorded here in order. The value is the latest change's position in that order.",
-  "Delivery into analytics": "The analytics Worker applies journal changes in order, one bounded step a minute. A device activation is folded in day by day, so a large backlog of activations takes hours. The movement line is what this page saw between two refreshes.",
-  "Daily publication": "Days waiting to have their public daily figures rebuilt. A day republishes only after every public owner's latest change has been delivered, so a delivery backlog holds the whole queue.",
-  "Allowance graph": "The allowance and model graph is rebuilt separately from daily figures. Its full breakdown is under Allowance diagnostics.",
+  "1 · Accepted changes": "Every accepted change (an upload that changes a contributor's evidence, an activation, an opt-out or an erasure) is recorded here in order. The value is the latest change's position in that order.",
+  "2 · Delivery into analytics": "The analytics Worker applies journal changes in order, one bounded step a minute. A device activation is folded in day by day, so a large backlog of activations takes hours. The movement line is what this page saw between two refreshes.",
+  "4a · Daily counts & API value": "Days waiting to have their public daily figures rebuilt. A day republishes only after every public owner's latest change has been delivered, so a delivery backlog holds the whole queue.",
+  "4b · Fits & model dates": "The allowance and model graph is rebuilt separately from daily figures. Its full breakdown is under Allowance diagnostics.",
   "Active contributor identities": "Active pseudonymous contributor identities, including accountless installations. These are not verified people or a device census and may include identities without accepted data.",
   "Identities with accepted data": "Distinct contributor identities with retained accepted uploads in the active storage mode. The exact value as of the displayed snapshot and recent history come from the scheduled aggregate cache, independently of the overview's bounded newest-row sample.",
   "Identities added last 24h": "Contributor identities created during the trailing 24 hours. The caption gives the corresponding trailing seven-day count.",
@@ -3624,7 +3624,7 @@ function renderGraphRebuild(progress, panel, badge, details) {
 
 // Two progress reads closer together than this say too little to show as movement.
 const PIPELINE_OBSERVATION_MIN_MILLISECONDS = 20_000;
-const PIPELINE_DAY = new Intl.DateTimeFormat(undefined, { timeZone: "UTC", month: "short", day: "numeric" });
+const PIPELINE_DAY = new Intl.DateTimeFormat(undefined, { timeZone: "UTC", year: "numeric", month: "short", day: "numeric" });
 
 function pipelineDay(day) {
   return PIPELINE_DAY.format(new Date(`${day}T00:00:00.000Z`));
@@ -3651,7 +3651,7 @@ function pipelineCard(label, value, lines, tone) {
   return card;
 }
 
-/** Four stages from one progress read. Movement is only what this page saw
+/** Stage evidence from one progress read. Movement is only what this page saw
  * between two reads of the same service, measured on the service's clock. */
 function renderPipeline(progress, { stale = false } = {}) {
   if (!isAdminPage) return;
@@ -3659,6 +3659,10 @@ function renderPipeline(progress, { stale = false } = {}) {
   const badge = $("#pipeline-badge");
   if (!stages || !badge) return;
   const pipeline = progress?.schemaVersion === 3 ? progress.pipeline : undefined;
+  if (!pipeline?.canonical) {
+    const runtime = $("#pipeline-runtime");
+    if (runtime) runtime.textContent = "Runtime controls not reported by this service.";
+  }
   if (!pipeline) {
     stages.replaceChildren();
     state.pipelineObservation = null;
@@ -3666,7 +3670,16 @@ function renderPipeline(progress, { stale = false } = {}) {
       : progress ? "Not reported by this service" : "Unavailable";
     return;
   }
-  const { ingestion, delivery, daily } = pipeline;
+  if (pipeline.canonical) {
+    renderMaintainedPipeline(progress, stale);
+    return;
+  }
+  const { ingestion, delivery, daily, maintained } = pipeline;
+  const features = maintained?.featureDays;
+  const batches = maintained?.modelDateBatches;
+  const jobRecent = (jobs) => jobs?.latestUpdatedAt
+    ? `${countWith(jobs.updatedLastHour, "retained job")} updated in the last hour · latest ${pipelineAge(jobs.latestUpdatedAt, nowMs)}`
+    : "No retained job update recorded";
   const nowMs = Date.parse(progress.generatedAt);
   const current = delivery.current;
   const currentKey = current ? `${current.fromDay}/${current.throughDay}` : null;
@@ -3681,22 +3694,32 @@ function renderPipeline(progress, { stale = false } = {}) {
   }
   const waiting = daily.queuedDays > 0 && delivery.pendingChanges > 0 && daily.releasedLastHour === 0;
   const cards = [
-    pipelineCard("Ingestion journal", formatNumber(ingestion.journalHead), [
-      "changes recorded",
+    pipelineCard("1 · Accepted changes", formatNumber(ingestion.journalHead), [
+      "changes recorded in the ingestion journal",
+      "Produces ordered changes for delivery.",
       ingestion.latestRecordedAt
         ? `Latest ${formatReportingTime(ingestion.latestRecordedAt)} (${pipelineAge(ingestion.latestRecordedAt, nowMs)})`
         : "No change recorded yet",
     ], "clear"),
-    pipelineCard("Delivery into analytics",
+    pipelineCard("2 · Delivery into analytics",
       delivery.pendingChanges === 0 ? "Caught up" : formatNumber(delivery.pendingChanges), [
         delivery.pendingChanges === 0 ? `Applied through change ${formatNumber(delivery.appliedSequence)}`
           : `${delivery.pendingChanges === 1 ? "change" : "changes"} behind · `
             + `${countWith(delivery.pendingActivations, "device activation")}`,
         current ? `Current device: ${formatNumber(current.daysDone)} of ${countWith(current.daysTotal, "day")} folded`
           + ` (${pipelineDay(current.fromDay)} – ${pipelineDay(current.throughDay)})` : null,
+        "Produces delivered owner/day projections; activation history folds day by day.",
         movement,
       ], delivery.pendingChanges === 0 ? "clear" : "busy"),
-    pipelineCard("Daily publication",
+    pipelineCard("3 · Shared preparation", features ? `${formatNumber(features.building)} building` : "Not counted", [
+      "Reconciles admitted v1, v1.1 and v1.2 evidence into reusable daily, quota, usage and cache features.",
+      features ? `${countWith(features.complete, "complete retained day")} · ${countWith(features.refused, "refused day")}`
+        : "Retained feature job counts are unavailable from this service.",
+      features ? jobRecent(features) : null,
+      "Retained days are checked against dependencies before reuse. Preparation queue not counted.",
+      delivery.pendingChanges > 0 ? "New changes still await delivery; existing admitted days can be prepared." : null,
+    ], !features ? "unknown" : features.refused > 0 ? "waiting" : features.building > 0 ? "busy" : "clear"),
+    pipelineCard("4a · Daily counts & API value",
       daily.queuedDays === 0 ? "Up to date" : formatNumber(daily.queuedDays), [
         daily.queuedDays > 0 ? `${daily.queuedDays === 1 ? "day" : "days"} queued · `
           + `${pipelineDay(daily.oldestQueuedDay)} – ${pipelineDay(daily.newestQueuedDay)}` : null,
@@ -3704,27 +3727,148 @@ function renderPipeline(progress, { stale = false } = {}) {
           ? `Last published ${formatReportingTime(daily.lastReleasedAt)} (${pipelineAge(daily.lastReleasedAt, nowMs)})`
             + ` · ${formatNumber(daily.releasedLastHour)} in the last hour`
           : "Nothing published yet",
+        "Reuses daily features to publish account, token and priced API-value aggregates.",
         waiting ? "Waiting for delivery: each day waits until every public owner's latest change is delivered." : null,
       ], waiting ? "waiting" : daily.queuedDays === 0 ? "clear" : "busy"),
   ];
   const throughput = progress.graph?.throughput;
   if (throughput) {
     const count = (value) => value === null ? "not counted" : formatNumber(value);
-    cards.push(pipelineCard("Allowance graph",
+    cards.push(pipelineCard("4b · Fits & model dates",
       throughput.remainingResults === 0 ? "Up to date" : formatNumber(throughput.remainingResults), [
         `${throughput.remainingResults === 1 ? "result" : "results"} remaining · `
           + `${count(throughput.resultsLastHour)} in the last hour · ${count(throughput.resultsLast6Hours)} in 6 h`,
+        "Fits use prepared quota and usage. Model batches reuse shared days across their date windows.",
+        batches ? `${countWith(batches.pending, "pending retained batch", "pending retained batches")} · ${countWith(batches.complete, "complete retained batch", "complete retained batches")}`
+          : "Retained model batch counts are unavailable from this service.",
+        batches ? jobRecent(batches) : null,
+        progress.graph.work.state === "building" ? "Building allowance results; complete publication waits for the whole graph window." : null,
         "Full breakdown under Allowance diagnostics",
       ], throughput.remainingResults === 0 ? "clear" : "busy"));
   }
+  cards.push(pipelineCard("4c · Cache continuity", "Not counted", [
+    "Reuses prepared cache events and session breaks in chronological order, carrying continuity across days.",
+    "A separate cache queue and completion census are not reported here.",
+  ], "unknown"));
+  const publication = progress.publication;
+  cards.push(pipelineCard("5 · Complete publication",
+    progress.graph?.throughput.remainingResults > 0 ? "Update awaiting graph"
+      : publication.state === "ready" ? "Graph published" : publication.state === "empty" ? "Not published" : "Awaiting graph", [
+      "Daily figures publish independently. The allowance graph waits for complete, validated current fits and model dates.",
+      publication.publishedAt ? `Last complete graph ${formatReportingTime(publication.publishedAt)}` : "No complete graph publication recorded",
+      daily.queuedDays > 0 ? `${countWith(daily.queuedDays, "daily update")} still queued` : "No daily update queued",
+      "Preparation checkpoints alone do not prove a published result.",
+    ], publication.state === "ready" && progress.graph?.throughput.remainingResults === 0 ? "clear" : "waiting"));
   stages.replaceChildren(...cards);
   badge.textContent = stale ? "Stale · the latest refresh failed"
     : delivery.pendingChanges > 0 ? `Delivering · ${countWith(delivery.pendingChanges, "change")} behind`
-      : daily.queuedDays > 0 ? `Publishing · ${countWith(daily.queuedDays, "day")} queued` : "Caught up";
+      : daily.queuedDays > 0 ? `Publishing · ${countWith(daily.queuedDays, "day")} queued` : progress.publication.state !== "ready" || progress.graph?.throughput.remainingResults > 0 ? "Awaiting complete graph" : "Published · no daily updates queued";
   if (!stale) {
     state.pipelineObservation = { atMs: nowMs, appliedSequence: delivery.appliedSequence, currentKey,
       daysDone: current ? current.daysDone : 0 };
   }
+}
+
+const PIPELINE_REASON_LABELS = Object.freeze({ delivery: "Waiting for delivery", dependencies: "Dependencies need preparation or validation",
+  evidence: "Evidence refused", query_budget: "Query budget reached", deadline: "Invocation deadline reached",
+  capacity: "Capacity limit reached", retry: "Retry or lease recovery", scheduled: "Awaiting dispatch", other: "Other reported reason" });
+function renderMaintainedPipeline(progress, stale) {
+  const { canonical: metadata, ingestion, delivery } = progress.pipeline;
+  const nowMs = Date.parse(progress.generatedAt);
+  const priorDetails = [...$("#pipeline-stages").querySelectorAll("details")];
+  const expanded = new Set(priorDetails.filter(node => node.open).map(node => node.dataset.stage));
+  const focusedStage = document.activeElement?.closest?.("details")?.dataset.stage;
+  const queue = stage => metadata.queues?.[stage];
+  const queueValue = stage => { const q = queue(stage); return q ? `${formatNumber(q.ready)} queued · ${formatNumber(q.leased)} running` : "Queue not reported"; };
+  const queueTone = stage => { const q = queue(stage); return !q ? "unknown" : q.refused ? "waiting" : q.ready || q.leased ? "busy" : "clear"; };
+  const dateRange = row => row?.fromDay ? `${pipelineDay(row.fromDay)} – ${pipelineDay(row.throughDay)}` : "No dated evidence reported";
+  const stores = metadata.stores;
+  const storeLine = (row, unit) => row ? `${countWith(row.retained, unit)} retained`
+    + (row.complete !== null ? ` · ${formatNumber(row.complete)} stored complete` : "") : "Store inventory unavailable or exceeds the bounded census";
+  const detail = (card, stage, extra = []) => {
+    const disclosure = document.createElement("details");
+    disclosure.className = "admin-pipeline-detail";
+    disclosure.dataset.stage = stage;
+    disclosure.open = expanded.has(stage);
+    const heading = document.createElement("summary"); heading.textContent = "Work units, dates & waiting reasons";
+    const q = queue(stage), d = q?.detail;
+    const lines = q ? [
+      `${formatNumber(q.complete)} completed and ${formatNumber(q.refused)} refused retained jobs. These are jobs, not distinct dates or published results.`,
+      d ? `Job date coverage: ${dateRange(d)}.` : "Detailed queue metadata is unavailable or above the 10,000-row census limit.",
+      d ? `${formatNumber(d.completedLastHour)} completed jobs in the last hour · ${formatNumber(d.completedLast6Hours)} in 6 hours. Latest completion: ${d.latestCompletedAt ? formatReportingTime(d.latestCompletedAt) : "none recorded"}.` : null,
+      d ? `${formatNumber(d.delayed)} delayed for retry · ${formatNumber(d.retrying)} previously attempted · ${formatNumber(d.expiredLeases)} expired leases.` : null,
+      d?.lastFailureAt ? `Last refusal or retry: ${formatReportingTime(d.lastFailureAt)}.` : null,
+      ...(d?.reasons.map(reason => `${PIPELINE_REASON_LABELS[reason.code]}: ${countWith(reason.jobs, "job")}.`) ?? []),
+      d && d.reasons.length === 0 ? "No pending or refused jobs recorded. This does not establish publication freshness." : null,
+    ] : ["Queue telemetry unavailable. An empty queue is not inferred."];
+    disclosure.append(heading, ...[...lines, ...extra].filter(Boolean).map(line => {
+      const p = document.createElement("p"); p.textContent = line; return p;
+    }));
+    card.append(disclosure);
+    return card;
+  };
+  const publicLine = (key, label) => { const row = metadata.publications[key];
+    return row ? `${label}: ${formatNumber(row.retained)} stored ${row.unit === "snapshot" ? "snapshot" : "days"}; last replacement ${row.latestPublishedAt ? formatReportingTime(row.latestPublishedAt) : "not recorded"}.`
+      : `${label}: public metadata not reported.`; };
+  const cards = [
+    pipelineCard("1 · Accepted changes", formatNumber(ingestion.journalHead), ["changes recorded in the ingestion journal",
+      ingestion.latestRecordedAt ? `Latest accepted change ${formatReportingTime(ingestion.latestRecordedAt)}` : "No accepted change recorded"], "clear"),
+    detail(pipelineCard("2 · Delivery into analytics", delivery.pendingChanges ? `${countWith(delivery.pendingChanges, "change")} pending` : "Delivery caught up", [
+      `Applied through change ${formatNumber(delivery.appliedSequence)}.`,
+      delivery.current ? `Current delivery range: ${formatNumber(delivery.current.daysDone)} of ${countWith(delivery.current.daysTotal, "day")} folded.` : null,
+      `Canonical input preparation: ${queueValue("canonical")}.`,
+    ], delivery.pendingChanges ? "busy" : queueTone("canonical")), "canonical"),
+    detail(pipelineCard("3 · Shared preparation", queueValue("features"), [
+      "Reusable quantities, versioned prices and consumer inputs.", storeLine(stores.features, "source-day feature bundle"),
+      "Stored completion is revalidated against dependencies before use.",
+    ], queueTone("features")), "features", [stores.features ? `Retained feature coverage: ${dateRange(stores.features)}.` : null]),
+    detail(pipelineCard("4a · Daily counts & API value", queueValue("activity"), [
+      storeLine(stores.activity, "activity partition"),
+      stores.activity?.headMatched !== null && stores.activity ? `${formatNumber(stores.activity.headMatched)} match the selected partition heads; source authority has not been checked here.` : null,
+      publicLine("daily", "Public daily output"),
+    ], queueTone("activity")), "activity", [stores.activity ? `Retained activity coverage: ${dateRange(stores.activity)}.` : null]),
+    detail(pipelineCard("4b · Fits & model dates", queueValue("fits"), [
+      storeLine(stores.rolling, "prepared input segment"),
+      progress.graph ? `${countWith(progress.graph.throughput.remainingResults, "native result")} remaining in the displayed graph window.` : "Native result coverage not reported.",
+      publicLine("model", "Public model dates"),
+    ], queueTone("fits")), "fits", ["Prepared input segments, queued jobs and calculated model results are different populations.",
+      stores.rolling ? `Retained input coverage: ${dateRange(stores.rolling)}.` : null,
+      progress.graph?.work.activeDay ? `Current native calculation date: ${pipelineDay(progress.graph.work.activeDay)} (${progress.graph.work.activeMetric ?? "metric not reported"}).` : null,
+      progress.graph?.work.checkpoints ? `Resumable native checkpoints: ${progress.graph.work.checkpoints.phases.map(row => `${row.phase}: ${row.stages} stages, ${row.parts} parts`).join("; ") || "none retained"}.` : "Native checkpoint position not reported.",
+      progress.pipeline.maintained?.modelDateBatches ? `${formatNumber(progress.pipeline.maintained.modelDateBatches.pending)} pending and ${formatNumber(progress.pipeline.maintained.modelDateBatches.complete)} complete retained date batches.` : "Date-batch inventory not reported."]),
+    detail(pipelineCard("4c · Cache continuity", queueValue("cache"), [
+      storeLine(stores.cache, "cache source-day"),
+      stores.cache ? `${stores.cache.inputEvents === null ? "Not counted" : formatNumber(stores.cache.inputEvents)} selected input events · ${stores.cache.adjacencyPairs === null ? "not counted" : formatNumber(stores.cache.adjacencyPairs)} consecutive-event pairs.` : null,
+      publicLine("cache", "Public cache output"),
+    ], queueTone("cache")), "cache", [stores.cache ? `Retained cache coverage: ${dateRange(stores.cache)}.` : null,
+      "Empty inputs can complete a cache job. Retained day counters alone do not establish a complete or current output."]),
+    detail(pipelineCard("5 · Validate & publish each family", queueValue("publication"), [
+      "Daily, allowance and cache outputs validate and publish independently.",
+      "Stored public outputs remain separate from replacement calculations. Live serving eligibility is not checked by this metadata read.",
+      `Allowance graph: ${progress.publication.state === "ready" ? "last complete snapshot retained" : progress.publication.state === "empty" ? "no snapshot recorded" : "replacement needs validation"}.`,
+    ], queueTone("publication")), "publication", [
+      ...Object.entries(metadata.publications).map(([family, row]) => row ? `${family}: ${dateRange(row)}; ${row.publishedLastHour} latest heads replaced in the last hour, ${row.publishedLast6Hours} in 6 hours.` : `${family}: publication metadata unavailable.`),
+      "Replacement totals count the latest retained head per date, not every historical replacement or an estimated completion percentage."]),
+  ];
+  $("#pipeline-stages").replaceChildren(...cards);
+  if (focusedStage) [...$("#pipeline-stages").querySelectorAll("details")]
+    .find(node => node.dataset.stage === focusedStage)?.querySelector("summary")?.focus();
+  const runtime = $("#pipeline-runtime");
+  if (runtime) {
+    const entries = metadata.runtime;
+    const lines = ["Last observed Worker controls. These observations do not verify the currently deployed configuration.",
+      ...["analytics", "publication", "cache"].map(role => {
+        const row = entries?.find(entry => entry.role === role);
+        return row ? `${role}: ${row.method}; canonical pipeline ${row.canonicalEnabled ? "enabled" : "disabled"}, shared features ${row.sharedFeaturesEnabled ? "enabled" : "disabled"}, model batches ${row.modelBlocksEnabled ? "enabled" : "disabled"}; degree ${row.degree}, ${row.maxQueries} query limit. Observed ${formatReportingTime(row.observedAt)} (${pipelineAge(row.observedAt, nowMs)}).`
+          : `${role}: controls not reported${entries === null ? " (metadata unavailable)" : ""}.`;
+      }), "Inventories cover retained history and may exceed the dates in the recent graph. Counts above the bounded census are unavailable; missing data is never zero."];
+    runtime.replaceChildren(...lines.map(line => { const p = document.createElement("p"); p.textContent = line; return p; }));
+  }
+  $("#pipeline-badge").textContent = stale ? "Stale · latest refresh failed" : !metadata.queues ? "Queue metadata unavailable"
+    : Object.values(metadata.queues).some(row => row.refused) ? "Refused work needs attention"
+      : Object.values(metadata.queues).some(row => row.ready || row.leased) ? "Processing · independent output families"
+        : "No pending jobs · publication freshness separate";
+  state.pipelineObservation = null;
 }
 
 function renderCurrentReconstructionProgress() {

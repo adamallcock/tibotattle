@@ -1,7 +1,14 @@
+import { createD1InvocationBudget, D1_BUDGET_ATTACHMENT } from '../src/d1-invocation-budget';
 import { beforeEach,afterEach,describe,expect,it,vi } from 'vitest';
+import {runCanonicalAnalyticsWorkPass} from '../src/storage-analytics-canonical-runtime';
+import {recordAnalyticsPipelineRuntime} from '../src/storage-analytics-runtime-controls';
+import { advanceStorageAnalyticsPreparation } from '../src/storage-analytics-preparation';
 import { runStorageAnalyticsPass } from '../src/storage-analytics-runtime';
 import { runStorageAnalyticsSchedule,STORAGE_ANALYTICS_LONG_PASS_MINUTES,STORAGE_ANALYTICS_MINUTE_CRON,
  type StorageAnalyticsWorkerEnv } from '../src/storage-analytics-worker';
+vi.mock('../src/storage-analytics-canonical-runtime',()=>({runCanonicalAnalyticsWorkPass:vi.fn()}));
+vi.mock('../src/storage-analytics-runtime-controls',()=>({recordAnalyticsPipelineRuntime:vi.fn(async()=>true)}));
+vi.mock('../src/storage-analytics-preparation',()=>({advanceStorageAnalyticsPreparation:vi.fn()}));
 vi.mock('../src/storage-v11-history',()=>({
  storageV11PreparedFoldEnabled:(env:unknown)=>!!env&&typeof env==='object'
   &&Reflect.get(env,'GRAPH_DAY_PROJECTION_FOLD')==='enabled'}));
@@ -10,7 +17,9 @@ vi.mock('../src/storage-analytics-runtime',()=>({runStorageAnalyticsPass:vi.fn()
  // mock keeps the real predicate so these passes stay builder-free by default.
  graphDayProjectionBuildEnabled:(env:unknown)=>!!env&&typeof env==='object'
   &&Reflect.get(env,'GRAPH_DAY_PROJECTION_BUILD')==='enabled'}));
-const pass=vi.mocked(runStorageAnalyticsPass);
+const pass=vi.mocked(runStorageAnalyticsPass),preparation=vi.mocked(advanceStorageAnalyticsPreparation);
+const prepared={state:'progress' as const,reason:'complete',attempts:1,prepared:1,reused:0,refused:0,deferred:0,
+ resumeAttempts:0,recentAttempts:1,dirtyAttempts:0,historyAttempts:0};
 const log=vi.fn(),errorLog=vi.fn();
 const result={state:'progress' as const,reason:'step_limit' as const,steps:1,recordsRead:0,queriesUsed:0,dailyPublications:0,graphCalculations:0};
 const sourceProbe={sourceId:'synthetic-source',v1Namespace:'synthetic-namespace',
@@ -36,7 +45,7 @@ function environment(probe:Probe={}):StorageAnalyticsWorkerEnv{return {STORAGE_A
 /** A fixed synthetic instant. Its UTC minute is not a multiple of ten, so an
  * invocation that names no minute runs the ordinary two-phase pass. */
 const at=(minute:number)=>Date.UTC(2026,8,17,1,minute,0),NOW=at(7);
-beforeEach(()=>{vi.useFakeTimers();vi.setSystemTime(NOW);pass.mockReset();log.mockReset();errorLog.mockReset();
+beforeEach(()=>{vi.useFakeTimers();vi.setSystemTime(NOW);pass.mockReset();preparation.mockReset();preparation.mockResolvedValue(prepared);log.mockReset();errorLog.mockReset();
  vi.spyOn(console,'log').mockImplementation(log);vi.spyOn(console,'error').mockImplementation(errorLog);});
 afterEach(()=>{vi.restoreAllMocks();vi.useRealTimers();});
 describe('ordered ingestion before public analytics',()=>{
@@ -225,6 +234,29 @@ describe('ordered ingestion before public analytics',()=>{
    STORAGE_ANALYTICS_MODEL_BLOCKS:'enabled'},{nowMs:at(10)});
   expect(pass.mock.calls[1]![0]).toMatchObject({sharedFeatures:true,modelBlocks:true,graphOnly:true});
  });
+ it('prepares days before consumers using the same meter and preserves consumer admission',async()=>{
+  pass.mockResolvedValue(result);
+  preparation.mockImplementationOnce(async options=>{
+   expect(options).toMatchObject({sharedFeatures:true,maxAttempts:4});
+   expect(options.budget.deadlineMs).toBe(NOW+5_000);
+   expect(options.budget.remainingQueries()).toBe(180);
+   for(let n=0;n<100;n++)await options.source.prepare('SELECT 1').run();
+   expect(options.budget.remainingQueries()).toBe(80);
+   return prepared;
+  });
+  await runStorageAnalyticsSchedule({...environment(),STORAGE_ANALYTICS_SHARED_FEATURES:'enabled'});
+  expect(pass.mock.calls[1]![0].maxQueries).toBe(848);
+  expect(pass.mock.invocationCallOrder[0]!).toBeLessThan(preparation.mock.invocationCallOrder[0]!);
+  expect(preparation.mock.invocationCallOrder[0]!).toBeLessThan(pass.mock.invocationCallOrder[1]!);
+  expect(JSON.parse(log.mock.calls[0]![0] as string)).toMatchObject({preparation:prepared,preparationQueries:100,queriesUsed:102});
+ });
+ it('continues consumer work after an independent preparation failure',async()=>{
+  pass.mockResolvedValue(result);preparation.mockRejectedValueOnce(new Error('private source SQL'));
+  await runStorageAnalyticsSchedule({...environment(),STORAGE_ANALYTICS_SHARED_FEATURES:'enabled'});
+  expect(pass).toHaveBeenCalledTimes(2);
+  expect(JSON.parse(log.mock.calls[0]![0] as string)).toMatchObject({preparation:{state:'deferred',reason:'lane_failure'}});
+  expect(log.mock.calls[0]![0]).not.toContain('private source SQL');
+ });
  it('logs only the closed model-block adoption count from the public pass',async()=>{
   pass.mockResolvedValueOnce(result).mockResolvedValueOnce({...result,modelBlockAdoptedDates:2});
   await runStorageAnalyticsSchedule({...environment(),STORAGE_ANALYTICS_MODEL_BLOCKS:'enabled'});
@@ -235,8 +267,26 @@ describe('ordered ingestion before public analytics',()=>{
   await runStorageAnalyticsSchedule(environment());
   expect(JSON.parse(log.mock.calls[0]![0] as string)).not.toHaveProperty('modelBlockAdoptedDates');
  });
+ it('activates the canonical pipeline independently and meters its summary target through nested phases',async()=>{
+  pass.mockResolvedValueOnce(result).mockImplementationOnce(async options=>{
+   expect(options.canonicalPipeline).toBe(true);
+   expect(options).not.toHaveProperty('sharedFeatures');
+   const inner=createD1InvocationBudget(3);
+   const nested=inner.wrap(options.source);
+   const carried=Reflect.get(nested,D1_BUDGET_ATTACHMENT) as {target:D1Database};
+   await nested.prepare('SELECT 1').run();
+   await carried.target.prepare('SELECT 1').run();
+   await inner.wrap(options.ledger!).prepare('SELECT 1').run();
+   expect(inner.queriesUsed).toBe(3);
+   expect(()=>carried.target.prepare('SELECT 1').run()).toThrow('scheduled database work deferred');
+   return {...result,queriesUsed:3};
+  });
+  await runStorageAnalyticsSchedule({...environment(),STORAGE_ANALYTICS_CANONICAL_PIPELINE:'enabled'});
+  expect(pass.mock.calls[0]![0]).not.toHaveProperty('canonicalPipeline');
+  expect(JSON.parse(log.mock.calls[0]![0] as string).queriesUsed).toBe(5);
+ });
  it('rejects malformed durable feature activation before any database work',async()=>{
-  for(const field of ['STORAGE_ANALYTICS_SHARED_FEATURES','STORAGE_ANALYTICS_MODEL_BLOCKS'] as const) {
+  for(const field of ['STORAGE_ANALYTICS_SHARED_FEATURES','STORAGE_ANALYTICS_MODEL_BLOCKS','STORAGE_ANALYTICS_CANONICAL_PIPELINE'] as const) {
    await expect(runStorageAnalyticsSchedule({...environment(),[field]:'yes' as 'enabled'}))
     .rejects.toThrow('STORAGE_ANALYTICS_FEATURE_CONFIGURATION_INVALID');
   }

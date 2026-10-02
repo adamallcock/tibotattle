@@ -2,7 +2,7 @@ import { env, reset, applyD1Migrations, type D1Migration } from "cloudflare:test
 import { beforeEach, describe, expect, it } from "vitest";
 import { advanceStorageV1CurrentFitAnalysis, type StorageV1HistoryCheckpoint } from "../src/storage-v1-history";
 import { accountScopedQuotaAnalysisV1, advanceV1UsageReduction, createV1UsageReductionCheckpoint,
-  MAX_V1_USAGE_REDUCTION_CHECKPOINT_BYTES, MAX_WINDOWED_USAGE_ROWS,
+  MAX_V1_USAGE_REDUCTION_CHECKPOINT_BYTES, MAX_WINDOWED_USAGE_ROWS, V1PreparedUsageRepresentationUnavailable,
   V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION } from "../src/quota-analysis-v1";
 import { loadV1SourcePin } from "../src/telemetry-v1-source-selection";
 import { modelHistoryWindow } from "../src/model-history-window";
@@ -190,6 +190,15 @@ describe("resumable current-fit v1 usage reduction", () => {
     if (payloadResult.status !== 'deferred') throw new Error('expected bounded payload refusal');
     expect(payloadResult.checkpoint).toMatchObject({ complete: true, commonRefusal: 'reduced_usage_limit_exceeded',
       sessions: [], scopes: [], buckets: [] });
+    const preparedBound=structuredClone(payloadBound);
+    preparedBound.identity.sourceMethodVersion+=':prepared-priced-usage-1';
+    await expect(advanceV1UsageReduction(db(),input.fixture.participantId,
+      {identity:finishCheckpoint.identity,acquisition:finishCheckpoint.acquisition},
+      {remainingQueries:7,deadlineMs:Date.now()+60_000},
+      {nowMs:Date.parse(input.window.fixedNow),sourcePin:input.sourcePin,preparedEvidence:{
+        sourceFingerprint:input.sourcePin.fingerprint,usageReader:{readPage:async()=>[]},
+        usageBins:{totalRowCount:0,fragmentCount:0,readPage:async()=>[]}}},preparedBound,1))
+      .rejects.toBeInstanceOf(V1PreparedUsageRepresentationUnavailable);
   }, 60_000);
 
   it("preserves occurrence-first equal-time interval semantics across a resumed page seam", async () => {

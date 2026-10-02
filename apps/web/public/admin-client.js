@@ -344,7 +344,26 @@ export function projectAdminReconstructionProgress(value) {
  * clamp: the view then reports the pipeline as unreadable. */
 function projectPipeline(value, code, closed, nullableTime) {
   if (value === null) return null;
-  const pipeline = closed(value, ["ingestion", "delivery", "daily"]);
+  const hasMaintained = Object.hasOwn(record(value, code), "maintained");
+  const hasCanonical = Object.hasOwn(value, "canonical");
+  const pipeline = closed(value, ["ingestion", "delivery", "daily", ...(hasMaintained ? ["maintained"] : []), ...(hasCanonical ? ["canonical"] : [])]);
+  let maintained;
+  if (hasMaintained) {
+    const source = closed(pipeline.maintained, ["featureDays", "modelDateBatches"]);
+    const jobs = (value, states) => {
+      if (value === null) return null;
+      const source = closed(value, [...states, "updatedLastHour", "latestUpdatedAt"]);
+      const counters = Object.fromEntries(states.map(state => [state, count(source[state], code)]));
+      const total = Object.values(counters).reduce((a,b) => a+b,0);
+      if (!Number.isSafeInteger(total) || total > 10_000
+          || count(source.updatedLastHour, code) > total
+          || (total === 0) !== (source.latestUpdatedAt === null)) invalid(code);
+      return Object.freeze({ ...counters, updatedLastHour: count(source.updatedLastHour, code),
+        latestUpdatedAt: nullableTime(source.latestUpdatedAt) });
+    };
+    maintained = Object.freeze({ featureDays: jobs(source.featureDays, ["building", "complete", "refused"]),
+      modelDateBatches: jobs(source.modelDateBatches, ["pending", "complete"]) });
+  }
   const ingestion = closed(pipeline.ingestion, ["journalHead", "latestRecordedAt"]);
   const delivery = closed(pipeline.delivery, ["appliedSequence", "pendingChanges", "pendingActivations", "current"]);
   const daily = closed(pipeline.daily, [
@@ -364,6 +383,8 @@ function projectPipeline(value, code, closed, nullableTime) {
     if (current.fromDay > current.throughDay || current.daysDone > current.daysTotal) invalid(code);
   }
   const projected = Object.freeze({
+    ...(hasMaintained ? { maintained } : {}),
+    ...(hasCanonical ? { canonical: projectMaintainedPipeline(pipeline.canonical, code, closed, nullableTime) } : {}),
     ingestion: Object.freeze({
       journalHead: count(ingestion.journalHead, code),
       latestRecordedAt: nullableTime(ingestion.latestRecordedAt),
@@ -388,6 +409,90 @@ function projectPipeline(value, code, closed, nullableTime) {
       || (queue.oldestQueuedDay === null) !== (queue.newestQueuedDay === null)
       || (queue.oldestQueuedDay !== null && queue.oldestQueuedDay > queue.newestQueuedDay)) invalid(code);
   return projected;
+}
+
+const MAINTAINED_STAGES = ["canonical", "features", "activity", "fits", "cache", "publication", "cleanup"];
+const MAINTAINED_REASONS = new Set(["delivery", "dependencies", "evidence", "query_budget", "deadline", "capacity", "retry", "scheduled", "other"]);
+function projectMaintainedPipeline(value, code, closed, nullableTime) {
+  const source = closed(value, ["schemaVersion", "queues", "stores", "publications", "runtime"]);
+  if (source.schemaVersion !== 1) invalid(code);
+  const nullableCount = value => value === null ? null : count(value, code);
+  const dates = row => {
+    const fromDay = row.fromDay === null ? null : calendarDay(row.fromDay, code);
+    const throughDay = row.throughDay === null ? null : calendarDay(row.throughDay, code);
+    if ((fromDay === null) !== (throughDay === null) || (fromDay !== null && fromDay > throughDay)) invalid(code);
+    return { fromDay, throughDay };
+  };
+  let queues = null;
+  if (source.queues !== null) {
+    const rows = closed(source.queues, MAINTAINED_STAGES);
+    queues = Object.freeze(Object.fromEntries(MAINTAINED_STAGES.map(stage => {
+      const row = closed(rows[stage], ["ready", "leased", "complete", "refused", "detail"]);
+      const counts = Object.fromEntries(["ready", "leased", "complete", "refused"].map(key => [key, count(row[key], code)]));
+      if (!Number.isSafeInteger(Object.values(counts).reduce((a, b) => a + b, 0))) invalid(code);
+      let detail = null;
+      if (row.detail !== null) {
+        const d = closed(row.detail, ["fromDay", "throughDay", "latestCompletedAt", "completedLastHour", "completedLast6Hours",
+          "latestUpdatedAt", "lastFailureAt", "delayed", "retrying", "expiredLeases", "reasons"]);
+        if (!Array.isArray(d.reasons) || d.reasons.length > MAINTAINED_REASONS.size) invalid(code);
+        const reasons = d.reasons.map(value => { const r = closed(value, ["code", "jobs"]);
+          return Object.freeze({ code: enumValue(r.code, MAINTAINED_REASONS, code), jobs: positiveInteger(r.jobs, code) }); });
+        if (new Set(reasons.map(row => row.code)).size !== reasons.length
+          || reasons.reduce((sum, row) => sum + row.jobs, 0) !== counts.ready + counts.leased + counts.refused) invalid(code);
+        detail = Object.freeze({ ...dates(d), latestCompletedAt: nullableTime(d.latestCompletedAt),
+          completedLastHour: count(d.completedLastHour, code), completedLast6Hours: count(d.completedLast6Hours, code),
+          latestUpdatedAt: nullableTime(d.latestUpdatedAt), lastFailureAt: nullableTime(d.lastFailureAt),
+          delayed: count(d.delayed, code), retrying: count(d.retrying, code), expiredLeases: count(d.expiredLeases, code), reasons: Object.freeze(reasons) });
+        if (detail.completedLastHour > detail.completedLast6Hours || detail.completedLast6Hours > counts.complete
+          || detail.delayed > counts.ready || detail.retrying > counts.ready || detail.expiredLeases > counts.leased
+          || (counts.complete === 0) !== (detail.latestCompletedAt === null)
+          || (Object.values(counts).reduce((a, b) => a + b, 0) === 0) !== (detail.latestUpdatedAt === null)) invalid(code);
+      }
+      return [stage, Object.freeze({ ...counts, detail })];
+    })));
+  }
+  const storeSource = closed(source.stores, ["features", "rolling", "activity", "cache"]);
+  const units = { features: "feature_days", rolling: "rolling_segments", activity: "activity_parts", cache: "cache_days" };
+  const stores = Object.freeze(Object.fromEntries(Object.keys(units).map(key => {
+    if (storeSource[key] === null) return [key, null];
+    const row = closed(storeSource[key], ["unit", "retained", "complete", "headMatched", "fromDay", "throughDay", "latestUpdatedAt",
+      "updatedLastHour", "updatedLast6Hours", "inputEvents", "adjacencyPairs"]);
+    const result = { unit: row.unit, retained: count(row.retained, code), complete: nullableCount(row.complete),
+      headMatched: nullableCount(row.headMatched), ...dates(row), latestUpdatedAt: nullableTime(row.latestUpdatedAt),
+      updatedLastHour: nullableCount(row.updatedLastHour), updatedLast6Hours: nullableCount(row.updatedLast6Hours),
+      inputEvents: nullableCount(row.inputEvents), adjacencyPairs: nullableCount(row.adjacencyPairs) };
+    if (row.unit !== units[key] || result.retained > 10_000
+      || [result.complete, result.headMatched, result.updatedLastHour, result.updatedLast6Hours].some(value => value !== null && value > result.retained)
+      || (result.updatedLastHour === null) !== (result.updatedLast6Hours === null)
+      || (result.updatedLastHour !== null && result.updatedLastHour > result.updatedLast6Hours)
+      || (key !== "cache" && (result.inputEvents !== null || result.adjacencyPairs !== null))) invalid(code);
+    return [key, Object.freeze(result)];
+  })));
+  const publicationsSource = closed(source.publications, ["daily", "model", "cache"]);
+  const publications = Object.freeze(Object.fromEntries(Object.keys(publicationsSource).map(key => {
+    if (publicationsSource[key] === null) return [key, null];
+    const row = closed(publicationsSource[key], ["unit", "retained", "fromDay", "throughDay", "latestPublishedAt", "publishedLastHour", "publishedLast6Hours", "freshness"]);
+    const result = { unit: row.unit, retained: count(row.retained, code), ...dates(row), latestPublishedAt: nullableTime(row.latestPublishedAt),
+      publishedLastHour: count(row.publishedLastHour, code), publishedLast6Hours: count(row.publishedLast6Hours, code), freshness: row.freshness };
+    if (result.unit !== (key === "cache" ? "snapshot" : "days") || result.freshness !== "not_checked" || result.retained > (key === "cache" ? 1 : 10_000)
+      || result.publishedLastHour > result.publishedLast6Hours || result.publishedLast6Hours > result.retained
+      || (result.retained === 0) !== (result.latestPublishedAt === null) || (result.retained === 0) !== (result.fromDay === null)) invalid(code);
+    return [key, Object.freeze(result)];
+  })));
+  let runtime = null;
+  if (source.runtime !== null) {
+    if (!Array.isArray(source.runtime) || source.runtime.length > 3) invalid(code);
+    runtime = source.runtime.map(value => {
+      const row = closed(value, ["role", "method", "canonicalEnabled", "sharedFeaturesEnabled", "modelBlocksEnabled", "degree", "maxQueries", "observedAt"]);
+      if (row.method !== "maintained-analytics-v1" || ![1, 2, 4, 8].includes(row.degree) || positiveInteger(row.maxQueries, code) > 950) invalid(code);
+      return Object.freeze({ role: enumValue(row.role, new Set(["analytics", "publication", "cache"]), code), method: row.method,
+        canonicalEnabled: boolean(row.canonicalEnabled, code), sharedFeaturesEnabled: boolean(row.sharedFeaturesEnabled, code),
+        modelBlocksEnabled: boolean(row.modelBlocksEnabled, code), degree: row.degree, maxQueries: row.maxQueries, observedAt: isoTimestamp(row.observedAt, code) });
+    });
+    if (new Set(runtime.map(row => row.role)).size !== runtime.length) invalid(code);
+    Object.freeze(runtime);
+  }
+  return Object.freeze({ schemaVersion: 1, queues, stores, publications, runtime });
 }
 
 /** The typed-storage rebuild view: a closed, aggregate-only description of the

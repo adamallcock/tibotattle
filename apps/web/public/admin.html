@@ -122,12 +122,15 @@
           <span class="admin-source-badge" id="pipeline-badge">Checking progress…</span>
         </div>
         <p class="admin-copy">
-          Every accepted change is written to the ingestion journal, then delivered into analytics in order.
-          A device activation is folded in day by day. A day's public figures republish only after every public
-          owner's latest change has been delivered. The allowance graph is rebuilt separately. Counts only; the
-          movement since the last refresh is what this page observed, not a forecast.
+          Accepted changes are delivered in order. Shared preparation reconciles admitted evidence into reusable
+          inputs for daily counts and API value, allowance fits and model dates, and cache continuity.
+          Each consumer validates its dependencies before reuse. Daily figures and the complete allowance graph
+          publish through separate gates, alongside cache output. Counts are aggregate evidence; observed movement is not a forecast.
         </p>
         <div class="admin-card-grid admin-pipeline-grid" id="pipeline-stages" aria-live="polite"></div>
+        <details class="admin-pipeline-controls"><summary>Observed runtime controls & count definitions</summary>
+          <div id="pipeline-runtime"><p>Runtime controls not reported by this service.</p></div>
+        </details>
       </section>
 
       <section class="admin-section" aria-labelledby="counts-title">

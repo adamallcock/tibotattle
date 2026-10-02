@@ -1,3 +1,4 @@
+import { returnedD1Target } from './d1-direct-write';
 import {
   ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION,
   DEVICE_CREDENTIAL_TTL_MILLISECONDS,
@@ -557,7 +558,7 @@ async function revokeSupersededDeviceCredential(
                AND participant_id = ?
                AND scope = 'personal'
                AND state = 'active'
-          )`,
+          ) RETURNING id`,
     ).bind(now, target.device_id, participantId, sessionId, participantId),
     db.prepare(
       `UPDATE device_upload_authorizations
@@ -572,7 +573,7 @@ async function revokeSupersededDeviceCredential(
           )`,
     ).bind(now, target.device_id, participantId, target.device_id, participantId),
   ]);
-  return results[0]?.meta.changes === 1;
+  return returnedD1Target(results[0], 'id', target.device_id);
 }
 
 export async function createDevicePairing(
@@ -937,7 +938,7 @@ export async function claimDevicePairing(
                 AND current_device.state = 'active'
                 AND current_device.expires_at > ?
                 AND current_device.last_used_at > ?
-           ) < ?`,
+           ) < ? RETURNING id`,
       ).bind(
         deviceId,
         deviceSecretHash,
@@ -1017,7 +1018,7 @@ export async function claimDevicePairing(
     if (replay) return replay;
     throw error;
   }
-  if (results[0]?.meta.changes !== 1 || results[1]?.meta.changes !== 1) {
+  if (!returnedD1Target(results[0], 'id', deviceId) || results[1]?.meta.changes !== 1) {
     const replay = await pairedDeviceForRetry(
       db,
       parsed.id,
@@ -1380,7 +1381,7 @@ export async function rotateDeviceCredential(
             SET secret_hash = ?, expires_at = ?, last_used_at = ?,
                 credential_generation = ?
           WHERE id = ? AND state = 'active'
-            AND secret_hash = ? AND credential_generation = ?`,
+            AND secret_hash = ? AND credential_generation = ? RETURNING id`,
       ).bind(
         replacementHash,
         expiresAt,
@@ -1420,7 +1421,7 @@ export async function rotateDeviceCredential(
     }
     throw error;
   }
-  if (results[0]?.meta.changes !== 1 || results[1]?.meta.changes !== 1) {
+  if (results[0]?.meta.changes !== 1 || !returnedD1Target(results[1], 'id', row.id)) {
     const retry = await db.prepare(
       `SELECT rotation.*, device.secret_hash, device.state
          FROM device_credential_rotations rotation

@@ -88,7 +88,7 @@ export interface AuthorityRestoreContract {
   authoritySequences: {name:string;sequence:number}[];
   operatingLimitBytes: number;
 }
-interface Column { name: string; type: string; pk: number; hidden: number; }
+interface Column { cid: number; name: string; type: string; pk: number; hidden: number; }
 interface Descriptor { name: string; columns: string[]; generatedColumns?: string[]; keys: string[]; rowid: boolean; sql: string; }
 type Cell = ['null'] | ['text',string] | ['number',number] | ['blob',number[]];
 type Cursor = Cell[];
@@ -236,9 +236,19 @@ async function assertFrozen(source: D1Database, contract: AuthorityRestoreContra
 async function descriptors(source: D1Database, contract: AuthorityRestoreContract): Promise<Descriptor[]> {
   const names = new Set(contract.tables.filter(x=>x.disposition==='authority').map(x=>x.name));
   const result: Descriptor[]=[]; const pending = new Map<string,{desc:Descriptor;parents:string[]}>();
+  // Read the pinned schema metadata in two bounded statements. Per-table PRAGMA
+  // calls plus atomic staging DDL otherwise exceed one invocation on the full
+  // maintained source schema. These are read-only table functions, not triggers.
+  const encodedNames=JSON.stringify([...names]);
+  const columnsByTable=(await source.prepare(`SELECT s.name AS table_name,c.* FROM sqlite_schema s
+    JOIN pragma_table_xinfo(s.name) c WHERE s.type='table' AND s.name IN(SELECT value FROM json_each(?))`)
+    .bind(encodedNames).all<Column&{table_name:string}>()).results;
+  const parentsByTable=(await source.prepare(`SELECT s.name AS table_name,p."table" AS parent_name FROM sqlite_schema s
+    JOIN pragma_foreign_key_list(s.name) p WHERE s.type='table' AND s.name IN(SELECT value FROM json_each(?))`)
+    .bind(encodedNames).all<{table_name:string;parent_name:string}>()).results;
   for (const name of names) {
     const object=contract.sourceSchema.find(x=>x.type==='table'&&x.name===name)!;
-    const allColumns=(await source.prepare(`PRAGMA table_xinfo(${q(name)})`).all<Column>()).results;
+    const allColumns=columnsByTable.filter(column=>column.table_name===name).sort((a,b)=>a.cid-b.cid);
     const typedSnapshot = contract.version === 'typed-evidence-restore-v1';
     if (!allColumns.length || allColumns.length>99 || allColumns.some(x=>
       (typedSnapshot ? ![0,2,3].includes(x.hidden) : x.hidden!==0)
@@ -249,7 +259,7 @@ async function descriptors(source: D1Database, contract: AuthorityRestoreContrac
     const rowid=!/\bWITHOUT\s+ROWID\b/i.test(object.sql);
     const keys=rowid?['_authority_original_rowid']:columns.filter(x=>x.pk>0).sort((a,b)=>a.pk-b.pk).map(x=>x.name);
     if (!keys.length) fail();
-    const parents=[...new Set((await source.prepare(`PRAGMA foreign_key_list(${q(name)})`).all<{table:string}>()).results.map(x=>x.table).filter(x=>x!==name))];
+    const parents=[...new Set(parentsByTable.filter(row=>row.table_name===name).map(row=>row.parent_name).filter(parent=>parent!==name))];
     if (parents.some(x=>!names.has(x))) throw new Error('AUTHORITY_RESTORE_ROLE_DEPENDENCY_UNCOVERED');
     pending.set(name,{desc:{name,columns:columns.map(x=>x.name),...(generatedColumns.length ? {generatedColumns} : {}),keys,rowid,sql:object.sql},parents});
   }
@@ -296,13 +306,14 @@ export async function beginAuthorityRestore(source:D1Database,target:D1Database,
   const statements=AUTHORITY_RESTORE_SCHEMA.map(sql=>target.prepare(sql));
   statements.push(target.prepare("INSERT INTO _authority_restore_run VALUES(1,?,?,?,'copying')").bind(contract.runId,pin,contract.operatingLimitBytes));
   for(const d of desc) {
-    statements.push(target.prepare(stageSql(d,names)),target.prepare('INSERT INTO _authority_restore_tables(name,ordinal,descriptor) VALUES(?,?,?)').bind(d.name,desc.indexOf(d),canonicalJson(d)));
+    statements.push(target.prepare(stageSql(d,names)));
     for(const verb of ['UPDATE','DELETE']) statements.push(target.prepare(frozenTrigger(verb,PREFIX+d.name,'_authority_stage_guard_').sql));
     statements.push(target.prepare(`CREATE TRIGGER ${q('_authority_stage_insert_'+d.name)} BEFORE INSERT ON ${q(PREFIX+d.name)}
       WHEN NOT EXISTS(SELECT 1 FROM _authority_restore_permission p JOIN _authority_restore_tables t ON t.name=p.name
       JOIN _authority_restore_run r ON r.id=1 WHERE p.name='${d.name}' AND t.copy_done=0 AND r.phase='copying')
       BEGIN SELECT RAISE(ABORT,'AUTHORITY_RESTORE_WRITE_DENIED'); END`));
   }
+  for(let offset=0;offset<desc.length;offset+=20){const page=desc.slice(offset,offset+20);statements.push(target.prepare(`INSERT INTO _authority_restore_tables(name,ordinal,descriptor) VALUES ${page.map(()=>'(?,?,?)').join(',')}`).bind(...page.flatMap((d,index)=>[d.name,offset+index,canonicalJson(d)])));}
   for(let offset=0;offset<contract.finalSchema.length;offset+=20){const page=contract.finalSchema.slice(offset,offset+20);statements.push(target.prepare(`INSERT INTO _authority_restore_expected VALUES ${page.map(()=>'(?,?,?,?)').join(',')}`).bind(...page.flatMap(object=>[object.name,object.type,object.tbl_name,object.sql])));}
   for(const copy of contract.typedCopies){statements.push(target.prepare('INSERT INTO _authority_restore_typed(format,run_id) VALUES(?,?)').bind(copy.format,copy.runId));if(contract.admissionContract)statements.push(target.prepare('INSERT INTO _authority_restore_adoption(format,high_water) VALUES(?,?)').bind(copy.format,copy.format==='v1'?(contract.authoritySequences.find(x=>x.name==='telemetry_v1_records')?.sequence??0):0));}
   await checkCapacity(target,contract);
@@ -406,36 +417,60 @@ export async function completeAuthorityVerification(source:D1Database,target:D1D
   await validate(contract,pin);await assertFrozen(source,contract,pin);const state=await runState(target,contract,pin);if(state.phase==='verified')return;if(state.phase!=='sealed')fail();
   await target.prepare("UPDATE _authority_restore_run SET phase='verified' WHERE id=1").run();
 }
-/** Final role SQL is independently reviewed and hash-pinned, not a callback or
- * ready=true assertion. SQL inventory and all FKs are compared INSIDE the same
- * batch exposing original names under a temporary write freeze. D1 FK/provider
- * size checks run while frozen, then a final batch removes only that freeze and
- * marks ready. Any installation mismatch rolls back; verification failure stays
- * installed but unbound and write-frozen.
+/** Role SQL is independently reviewed and hash-pinned. Small roles install
+ * atomically; larger roles resume in bounded pages with every table frozen.
+ * Exact role equality is asserted in the final installation transaction. Fresh
+ * FK/capacity checks precede unfreeze. A failed page rolls back while prior pages
+ * remain unbound and write-frozen; installation alone never permits serving.
  */
-export async function promoteAuthorityRestore(source:D1Database,target:D1Database,contract:AuthorityRestoreContract,pin:string) {
-  await validate(contract,pin);await assertFrozen(source,contract,pin);const state=await runState(target,contract,pin);if(state.phase==='ready'){await checkFinal(target,contract);return;}if(!['verified','installed'].includes(state.phase))fail();
-  if(state.phase==='installed')return;
+export async function promoteAuthorityRestore(source:D1Database,target:D1Database,contract:AuthorityRestoreContract,pin:string):Promise<{state:'progress'|'complete'}> {
+  await validate(contract,pin);await assertFrozen(source,contract,pin);const state=await runState(target,contract,pin);
+  if(state.phase==='ready'){await checkFinal(target,contract);return {state:'complete'};}
+  if(state.phase==='installed')return {state:'complete'};
+  if(!['verified','installing'].includes(state.phase))fail();
   const desc=await descriptors(source,contract);
-  const controlTriggers=(await target.prepare("SELECT name,sql,tbl_name FROM sqlite_master WHERE type='trigger' AND (name GLOB '_authority_stage_*' OR name GLOB '_authority_seal_*') ORDER BY name LIMIT 800").all<{name:string;sql:string;tbl_name:string}>()).results;
   const statements:D1PreparedStatement[]=[],guardProofs:{name:string;sql:string;tbl_name:string}[]=[];
-  // Keep existing temporary guards attached while SQLite renames their tables.
-  // Replacing all of them would needlessly double the atomic DDL batch.
-  for(const guard of controlTriggers){let sql=guard.sql;for(const d of desc)sql=sql.split(q(PREFIX+d.name)).join(q(d.name));
-    guardProofs.push({name:guard.name,sql,tbl_name:guard.tbl_name.startsWith(PREFIX)?guard.tbl_name.slice(PREFIX.length):guard.tbl_name});}
-  for(const d of desc)statements.push(target.prepare(`ALTER TABLE ${q(PREFIX+d.name)} RENAME TO ${q(d.name)}`));
-  const existing=new Set([...contract.targetBaseSchema.map(x=>x.name),...desc.map(x=>x.name)]);
-  for(const type of ['table','index','view','trigger'])for(const object of contract.finalSchema)if(object.type===type&&!existing.has(object.name))statements.push(target.prepare(object.sql));
-  if(contract.version==='authority-restore-v1'&&contract.finalSchema.some(object=>object.type==='table'&&object.name==='telemetry_usage_correction_runtime'))statements.push(target.prepare(`INSERT INTO telemetry_usage_correction_runtime
+  if(state.phase==='verified'){
+    const controls=(await target.prepare("SELECT name,sql,tbl_name FROM sqlite_master WHERE type='trigger' AND (name GLOB '_authority_stage_*' OR name GLOB '_authority_seal_*') ORDER BY name LIMIT 801").all<{name:string;sql:string;tbl_name:string}>()).results;
+    if(controls.length>800)fail();
+    // Rename together while the original temporary write freezes stay attached.
+    for(const guard of controls){let sql=guard.sql;for(const d of desc)sql=sql.split(q(PREFIX+d.name)).join(q(d.name));
+      guardProofs.push({name:guard.name,sql,tbl_name:guard.tbl_name.startsWith(PREFIX)?guard.tbl_name.slice(PREFIX.length):guard.tbl_name});}
+    for(const d of desc)statements.push(target.prepare(`ALTER TABLE ${q(PREFIX+d.name)} RENAME TO ${q(d.name)}`));
+  }else await verifyInstalledGuards(target);
+  const existing=new Set((await authoritySchemaInventory(target)).map(object=>object.name));
+  // Original table names are pending in this same atomic first page.
+  for(const d of desc)existing.add(d.name);
+  const missing=contract.finalSchema.filter(object=>!existing.has(object.name))
+    .sort((a,b)=>['table','index','view','trigger'].indexOf(a.type)-['table','index','view','trigger'].indexOf(b.type));
+  let installed=0;
+  for(const object of missing){
+    const size=object.type==='table'?4:1;
+    // Reserve room for guard proofs, the phase transition, and all fresh checks.
+    if(statements.length+size>800)break;
+    statements.push(target.prepare(object.sql));installed++;
+    if(object.type==='table')for(const verb of ['INSERT','UPDATE','DELETE']){
+      const guard=frozenTrigger(verb,object.name,'_authority_final_guard_');
+      statements.push(target.prepare(guard.sql));guardProofs.push({...guard,tbl_name:object.name});
+    }
+  }
+  const complete=installed===missing.length;
+  if(complete&&contract.version==='authority-restore-v1'&&contract.finalSchema.some(object=>object.type==='table'&&object.name==='telemetry_usage_correction_runtime'))statements.push(target.prepare(`INSERT INTO telemetry_usage_correction_runtime
     (id,schema_version,method_version,state,max_capture_rows,max_history_page)
     SELECT 1,'telemetry-usage-correction-v1','usage-total-correction-v1','staged',200,200
      WHERE NOT EXISTS(SELECT 1 FROM telemetry_usage_correction_runtime WHERE id=1)`));
-  for(const object of contract.finalSchema.filter(x=>x.type==='table'&&!existing.has(x.name)))for(const verb of ['INSERT','UPDATE','DELETE']){const guard=frozenTrigger(verb,object.name,'_authority_final_guard_');statements.push(target.prepare(guard.sql));guardProofs.push({...guard,tbl_name:object.name});}
   for(let offset=0;offset<guardProofs.length;offset+=30){const page=guardProofs.slice(offset,offset+30);statements.push(target.prepare(`INSERT INTO _authority_restore_installed_guards VALUES ${page.map(()=>'(?,?,?)').join(',')}`).bind(...page.flatMap(x=>[x.name,x.sql,x.tbl_name])));}
-  statements.push(target.prepare("UPDATE _authority_restore_run SET phase='installed' WHERE id=1"));
-  if(statements.length>900)fail();
-  try{await target.batch(statements);}catch{if((await runState(target,contract,pin)).phase!=='installed')throw new Error('AUTHORITY_RESTORE_PROMOTION_UNACKNOWLEDGED');}
-  // Run finalizeAuthorityRestore in the next bounded operator invocation.
+  if(complete)statements.push(target.prepare("UPDATE _authority_restore_run SET phase='installed' WHERE id=1"));
+  else if(state.phase==='verified')statements.push(target.prepare("UPDATE _authority_restore_run SET phase='installing' WHERE id=1"));
+  if(statements.length>900||!statements.length)fail();
+  try{await target.batch(statements);}catch{
+    if((await runState(target,contract,pin)).phase==='installed')return {state:'complete'};
+    throw new Error('AUTHORITY_RESTORE_PROMOTION_UNACKNOWLEDGED');
+  }
+  // No application write or serving is admitted during installation. The final
+  // role equality assertion runs in the last transaction; FK/capacity checks
+  // and unfreeze remain a separate bounded finalize invocation.
+  return {state:complete?'complete':'progress'};
 }
 
 export async function finalizeAuthorityRestore(source:D1Database,target:D1Database,contract:AuthorityRestoreContract,pin:string){
@@ -471,13 +506,22 @@ async function ensureDormantCorrectionRuntime(target:D1Database,contract:Authori
    ||(contract.version==='typed-evidence-restore-v1' ? !['staged','active'].includes(row.state) : row.state!=='staged')
    ||row.max_capture_rows!==200||row.max_history_page!==200)fail();
 }
-async function finishPromotion(db:D1Database,contract:AuthorityRestoreContract,pin:string){
- await checkFinal(db,contract);
+async function verifyInstalledGuards(db:D1Database){
  const expected=(await db.prepare('SELECT name,sql,tbl_name FROM _authority_restore_installed_guards ORDER BY name LIMIT 801').all<{name:string;sql:string;tbl_name:string}>()).results;
  const actual=(await db.prepare("SELECT name,sql,tbl_name FROM sqlite_master WHERE type='trigger' AND (name GLOB '_authority_stage_*' OR name GLOB '_authority_seal_*' OR name GLOB '_authority_final_guard_*') ORDER BY name LIMIT 801").all<{name:string;sql:string;tbl_name:string}>()).results;
  if(expected.length>800||canonicalJson(actual)!==canonicalJson(expected))fail();
+ return expected;
+}
+async function finishPromotion(db:D1Database,contract:AuthorityRestoreContract,pin:string){
+ await checkFinal(db,contract);
+ const expected=await verifyInstalledGuards(db);
  const names=expected.map(x=>x.name);
  const statements=names.map(name=>db.prepare(`DROP TRIGGER ${q(name)}`));
+ // A copied readiness bit predates the independent deletion ledger. Clear it
+ // atomically with first unfreeze; repeated finalization of ready state is a
+ // no-op and must not invalidate a completed real lifecycle replay.
+ if(contract.finalSchema.some(object=>object.type==='table'&&object.name==='retention_state'))
+  statements.push(db.prepare('UPDATE retention_state SET restore_replay_complete=0 WHERE singleton=1'));
  statements.push(db.prepare("UPDATE _authority_restore_run SET phase='ready' WHERE id=1"));
  try{await db.batch(statements);}catch{if((await runState(db,contract,pin)).phase!=='ready')throw new Error('AUTHORITY_RESTORE_READY_UNACKNOWLEDGED');}
 }
@@ -489,4 +533,20 @@ export async function adoptAuthorityTypedPage(source:D1Database,target:D1Databas
  // including all reads, proof writes, checkpoint/CAS and uncertain readback.
  const result=await restoreTypedAdmissionPage(target,{format,sourceNamespace:contract.sourceNamespace,contractDigest:pin,verify,limit:200,maxStatements:900-64-2*contract.authoritySequences.length});
  await assertFrozen(source,contract,pin);await checkCapacity(target,contract);return result;
+}
+
+/** Fresh role/data verification never substitutes for current-ledger replay.
+ * Composition calls this before serving from an explicitly restored source. */
+export async function authorityRestoreServingReady(source:D1Database):Promise<boolean> {
+ // Fresh named table metadata avoids a catalog row scan on every nested read.
+ // Views remain excluded; restore phase and replay completion are always live.
+ if(!await source.prepare("SELECT 1 FROM pragma_table_list('_authority_restore_run') WHERE schema='main' AND name='_authority_restore_run' AND type IN('table','virtual','shadow') LIMIT 1").first())return true;
+ const run=await source.prepare('SELECT phase FROM _authority_restore_run WHERE id=1').first<{phase:string}>();
+ if(run?.phase!=='ready')return false;
+ if(!await source.prepare("SELECT 1 FROM pragma_table_list('retention_state') WHERE schema='main' AND name='retention_state' AND type IN('table','virtual','shadow') LIMIT 1").first())return false;
+ return !!await source.prepare("SELECT 1 FROM retention_state WHERE singleton=1 AND state='completed' AND restore_replay_complete=1").first();
+}
+
+export async function requireAuthorityRestoreServingReady(source:D1Database):Promise<void> {
+ if(!await authorityRestoreServingReady(source))throw new Error('AUTHORITY_RESTORE_REPLAY_REQUIRED');
 }

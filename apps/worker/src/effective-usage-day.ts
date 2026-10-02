@@ -1,10 +1,10 @@
-import {canonicalTelemetryV11Json,parseTelemetryV11Record} from '@app-usagemonitor/telemetry-contract';
+import {canonicalTelemetryV11Json,parseTelemetryV11Record,type TelemetryV11Record} from '@app-usagemonitor/telemetry-contract';
 import {GraphDayProjectionRefusedError,graphDayUsageSessionDigest,reduceGraphDayProjection,
   type GraphDayUsageInput} from './graph-day-projection';
 import {graphDayUsageCellOrder,validGraphDayProjection,GRAPH_DAY_USAGE_CELL_LIMIT,
   GRAPH_DAY_USAGE_COST_CEILING,GRAPH_DAY_USAGE_SESSION_LIMIT,
   type GraphDayProjection,type GraphDayUsageCell} from './graph-day-projection-values';
-import {v11PreparedUsageDayRow,type UsageRow} from './quota-analysis-v11';
+import {v11PreparedUsageDayRow,type UsageRow,type V11UsageRowInputs} from './quota-analysis-v11';
 import {MAX_WINDOWED_USAGE_ROWS} from './quota-analysis-v1';
 import type {EffectiveTelemetryOccurrence} from './telemetry-usage-effective-reader';
 
@@ -51,7 +51,12 @@ export function validEffectiveUsageDayPending(value:unknown):value is EffectiveU
 /** Keep the effective pager's existing analytical v1.1 mapping unchanged. */
 export function mapEffectiveUsagePageRow(row:EffectiveTelemetryOccurrence):UsageRow {
   if(row.stream!=='usage'||row.status!=='compatible'||row.recordJson===null||row.eventTime===null)throw fail();
-  const value=parseTelemetryV11Record('usage',JSON.parse(row.recordJson));
+  return mapEffectiveUsageRecord(row,parseTelemetryV11Record('usage',JSON.parse(row.recordJson)));
+}
+
+/** The shared page normalizer has already validated this analytical record. */
+export function mapEffectiveUsageRecord(row:EffectiveTelemetryOccurrence,value:TelemetryV11Record):UsageRow {
+  if(row.stream!=='usage'||row.status!=='compatible'||row.recordJson===null||row.eventTime===null)throw fail();
   if(value.schemaVersion!=='usage-event-v1.1')throw fail();
   return {occurrence_id:value.eventId,observed_at:row.eventTime,provider:value.provider,
     session_uuid:value.sessionUuid,record_json:canonicalTelemetryV11Json(value)};
@@ -62,19 +67,24 @@ export function mapEffectiveUsagePageRow(row:EffectiveTelemetryOccurrence):Usage
  * Reducing each page independently without this edge would invent an opener
  * on every page and lose account changes at the page boundary. */
 export async function appendEffectiveUsageDay(pending:EffectiveUsageDayPending|null,day:string,
-  rows:readonly UsageRow[],ownerDigest:string):Promise<EffectiveUsageDayPending|null> {
+  rows:readonly UsageRow[],ownerDigest:string,
+  preparedInputs?:readonly V11UsageRowInputs[],preparedSessionDigests?:readonly string[]):Promise<EffectiveUsageDayPending|null> {
+  if(preparedInputs!==undefined&&preparedInputs.length!==rows.length)throw fail();
+  if(preparedSessionDigests!==undefined&&(preparedSessionDigests.length!==rows.length
+    ||preparedSessionDigests.some(value=>!/^[a-f0-9]{64}$/u.test(value))))throw fail();
   if(pending!==null&&(!validEffectiveUsageDayPending(pending)||pending.projection.day!==day))throw fail();
   const prior=pending?.projection??reduceGraphDayProjection(day,[]);
   if(prior.usage.rowsRead+rows.length>MAX_WINDOWED_USAGE_ROWS)return null;
   const sessions=new Set(prior.usage.sessions.map(session=>session.sessionDigest));
   const events:GraphDayUsageInput[]=[];
   let last=pending?.lastObservedAtMs??null;
-  for(const row of rows){
+  for(const [index,row] of rows.entries()){
     const at=Date.parse(row.observed_at),start=Date.parse(`${day}T00:00:00.000Z`);
     if(!Number.isSafeInteger(at)||at<start||at>=start+86_400_000||last!==null&&at<last)throw fail();
     last=at;
     const mapped=await v11PreparedUsageDayRow(row,(provider,sessionUuid)=>
-      graphDayUsageSessionDigest({ownerDigest,provider,sessionUuid}),sessions,GRAPH_DAY_USAGE_SESSION_LIMIT);
+      preparedSessionDigests===undefined?graphDayUsageSessionDigest({ownerDigest,provider,sessionUuid}):Promise.resolve(preparedSessionDigests[index]!),sessions,GRAPH_DAY_USAGE_SESSION_LIMIT,
+      preparedInputs?.[index]);
     if(mapped.status==='refused')return null;
     if(mapped.status==='row')events.push({...mapped.row,kind:mapped.row.model===null?'unpriced':'priced'});
     else if(mapped.session!==null)events.push({sessionDigest:mapped.session.sessionDigest,

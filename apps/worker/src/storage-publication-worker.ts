@@ -1,3 +1,6 @@
+import {recordAnalyticsPipelineRuntime} from './storage-analytics-runtime-controls';
+import {runCanonicalAnalyticsWorkPass} from './storage-analytics-canonical-runtime';
+import { withMaintainedEffectiveDependencies } from './storage-effective-dependency-summaries';
 import { createD1InvocationBudget } from './d1-invocation-budget';
 import { publicAnalyticsEnabled } from './public-analytics-gate';
 import { runStorageAnalyticsPass } from './storage-analytics-runtime';
@@ -66,15 +69,26 @@ export async function runStoragePublicationSchedule(
   const features=analyticsFeatureControls(env);
   const phaseTiming=createStoragePublicationTiming();
   try {
-    const meter = createD1InvocationBudget(900);
+    const meter = createD1InvocationBudget(950);
     const started = Date.now();
+    if(env.STORAGE_ANALYTICS_CANONICAL_PIPELINE!==undefined)await recordAnalyticsPipelineRuntime(meter.wrap(env.STORAGE_ANALYTICS_DB),env.STORAGE_SOURCE_ID,{
+   role:'publication',method:'maintained-analytics-v1',canonicalPipeline:features.canonicalPipeline,
+   sharedFeatures:features.sharedFeatures||features.canonicalPipeline,modelBlocks:features.modelBlocks,
+   degree:1,queryLimit:950,observedMs:Date.now()});
+    const bindings={source:meter.wrap(features.canonicalPipeline?withMaintainedEffectiveDependencies(env.STORAGE_INGESTION_DB,
+      env.STORAGE_ANALYTICS_DB,env.STORAGE_SOURCE_ID,env.TELEMETRY_STORAGE_NAMESPACE):env.STORAGE_INGESTION_DB),
+      target:meter.wrap(env.STORAGE_ANALYTICS_DB)};
+  const canonicalWork=features.canonicalPipeline?await runCanonicalAnalyticsWorkPass({
+      ...bindings,sourceId:env.STORAGE_SOURCE_ID,
+      sourceNamespace:env.TELEMETRY_STORAGE_NAMESPACE,invocation:meter,now:Date.now,modelBlocks:features.modelBlocks,deadlineMs:started+PUBLICATION_WINDOW_MS,
+      bridge:false,stages:['publication'],maxWaves:4}):undefined;
     const result = await runStorageAnalyticsPass({
-      source: meter.wrap(env.STORAGE_INGESTION_DB),
-      target: meter.wrap(env.STORAGE_ANALYTICS_DB),
+      ...bindings,
       ledger: meter.wrap(env.DELETION_LEDGER),
       sourceId: env.STORAGE_SOURCE_ID,
       sourceNamespace: env.TELEMETRY_STORAGE_NAMESPACE,
       publishCommunity: true, publicOnly: true, publicationOnly: true,
+      ...(features.canonicalPipeline?{canonicalPipeline:true}:{}),
       ...(features.sharedFeatures?{sharedFeatures:true}:{}),
       publicationTimingObserver:phaseTiming.observe,
       maxSteps: 32, maxQueries: meter.remainingQueries,
@@ -82,6 +96,7 @@ export async function runStoragePublicationSchedule(
     });
     console.log(JSON.stringify({ event, ...result,
       elapsedMs: Date.now() - started, queriesUsed: meter.queriesUsed,
+      ...(canonicalWork?{canonicalWork}:{}),
       phaseTiming:phaseTiming.snapshot() }));
   } catch (error) {
     console.error(JSON.stringify({ event, state: 'unavailable',

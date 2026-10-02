@@ -1,6 +1,9 @@
 import { env, reset, type D1Migration } from 'cloudflare:test';
 import { expect, it } from 'vitest';
-import { advanceAnalyticsModelBlock, readAnalyticsModelBlock } from '../src/analytics-model-block';
+import { advanceAnalyticsModelBlock, appendModelBlockDependencies, readAnalyticsModelBlock } from '../src/analytics-model-block';
+import { createD1InvocationBudget } from '../src/d1-invocation-budget';
+import { modelBlockInputDays } from '../src/analytics-model-block-contract';
+import { withMaintainedEffectiveDependencies } from '../src/storage-effective-dependency-summaries';
 import { createSharedAnalyticsInputCache } from '../src/analytics-shared-input';
 import { evaluateSharedModelDate } from '../src/analytics-shared-reducers';
 import { modelHistoryWindow } from '../src/model-history-window';
@@ -94,6 +97,79 @@ it('carries a partial model selection across accepted same-owner v1.1 outside-wi
   const fresh = (await readModelBlockJob({ target: target(), identity: corrected.identity! }))!.checkpoint;
   expect(fresh.phase).toBe('select');
   expect(fresh.dependencies).toHaveLength(1);
+});
+
+it('selects a bounded cold maintained prefix and resumes in exact order with bulk day proofs', async () => {
+  await reset();
+  await initializeSharedAnalyticsCorpusDatabases(source(), target(), bindings, sourceId, sourceNamespace);
+  const corpus = await seedSharedAnalyticsCorpus({ source: source(), target: target(),
+    sourceId, sourceNamespace, calendarDays: 14, graphDays: 1 });
+  const first = await advanceMeasured(corpus.owner, corpus.graphDates[0]!, true);
+  const identity = first.identity!;
+  const allDays = modelBlockInputDays(identity);
+  const run = async (prefix: readonly {day:string;digest:string;hasQuota:boolean;hasUsage:boolean}[],
+    stopAfter:number,individual=false,durable=false) => {
+    const budget=createD1InvocationBudget(950);
+    const profile=createAnalyticsProfile();
+    const measuredSource=profileAnalyticsDatabase(source(),'source',profile,()=> 'selection');
+    const measuredTarget=profileAnalyticsDatabase(target(),'target',profile,()=> 'selection');
+    const attached=budget.wrap(withMaintainedEffectiveDependencies(measuredSource,measuredTarget,sourceId,sourceNamespace));
+    const chosen:typeof prefix[number][]=[];
+    await appendModelBlockDependencies(attached,identity,corpus.owner,prefix,
+      queries=>{if(budget.remainingQueries<queries)throw new Error('MODEL_BLOCK_TEST_QUERY_BUDGET');},
+      dependency=>chosen.push(dependency),stopAfter,
+      individual?()=>1:durable?()=>stopAfter-prefix.length-chosen.length:undefined);
+    const measured=summarizeAnalyticsProfile(profile);
+    expect(measured.statements).toBe(budget.queriesUsed);
+    expect(budget.queriesUsed).toBeLessThanOrEqual(950);
+    return {chosen,queries:budget.queriesUsed,rowsRead:measured.rowsRead};
+  };
+  const initial=await run([],4,false,true);
+  expect(initial.chosen.map(value=>value.day)).toEqual(allDays.slice(0,4));
+  const resumed=await run(initial.chosen,16,false,true);
+  expect(resumed.chosen.map(value=>value.day)).toEqual(allDays.slice(4,16));
+  const complete=[...initial.chosen,...resumed.chosen];
+  const warmed=await run([],16);
+  const individual=await run([],16,true);
+  expect(warmed.chosen).toEqual(complete);
+  expect(individual.chosen).toEqual(complete);
+  expect(warmed.queries).toBeLessThan(resumed.queries+initial.queries);
+  expect(warmed.queries).toBeLessThan(individual.queries);
+  expect(warmed.rowsRead).toBeLessThan(individual.rowsRead);
+  console.log(JSON.stringify({schema:'model-block-bulk-day-local-profile-v1',
+    coldPrefix:{queries:initial.queries,rowsRead:initial.rowsRead},
+    coldResume:{queries:resumed.queries,rowsRead:resumed.rowsRead},
+    warmBatch:{queries:warmed.queries,rowsRead:warmed.rowsRead},
+    warmIndividual:{queries:individual.queries,rowsRead:individual.rowsRead}}));
+  // readVerified uses this no-selection-limit path. A plain source lacks the
+  // maintained bulk API, so its native headers must cover the full >16-day
+  // request after the bounded capability probe.
+  const nativeRanges:Array<readonly [unknown,unknown]>=[];
+  const observedSource=new Proxy(source(),{get(db,key){
+    if(key==='prepare')return(sql:string)=>{
+      const statement=db.prepare(sql);
+      if(!sql.includes('FROM telemetry_v1_chunks c')||!sql.includes('JOIN typed_v1_event_sources event'))
+        return statement;
+      return new Proxy(statement,{get(prepared,method){
+        if(method==='bind')return(...values:unknown[])=>{
+          nativeRanges.push([values[3],values[4]]);
+          return Reflect.apply(prepared.bind,prepared,values) as D1PreparedStatement;
+        };
+        const value:unknown=Reflect.get(prepared,method);
+        return typeof value==='function'?value.bind(prepared):value;
+      }});
+    };
+    const value:unknown=Reflect.get(db,key);
+    return typeof value==='function'?value.bind(db):value;
+  }});
+  const nativeBudget=createD1InvocationBudget(950),native:typeof complete=[];
+  await appendModelBlockDependencies(nativeBudget.wrap(observedSource),identity,corpus.owner,[],
+    queries=>{if(nativeBudget.remainingQueries<queries)throw new Error('MODEL_BLOCK_TEST_QUERY_BUDGET');},
+    dependency=>native.push(dependency),20);
+  expect(native.slice(0,16)).toEqual(complete);
+  expect(native.map(value=>value.day)).toEqual(allDays.slice(0,20));
+  expect(nativeRanges.some(([from,through])=>from===allDays[0]&&through===allDays[19])).toBe(true);
+  expect(nativeBudget.queriesUsed).toBeLessThanOrEqual(950);
 });
 
 it('uses durable shared feature days to prepare model inputs across bounded invocations', async () => {

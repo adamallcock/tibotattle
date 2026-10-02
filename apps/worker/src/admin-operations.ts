@@ -1,3 +1,4 @@
+import { returnedD1Target } from './d1-direct-write';
 import { readCollectionControls, type CollectionControls } from "./collection-controls";
 import { QUARANTINE_RECONCILIATION_GRACE_MILLISECONDS } from "./constants";
 import { sha256Hex } from "./crypto";
@@ -385,7 +386,7 @@ export async function setCollectionControls(
             revision = revision + 1,
             reason_code = ?,
             updated_at = ?
-      WHERE singleton = 1 AND revision = ?`,
+      WHERE singleton = 1 AND revision = ? RETURNING revision`,
     ).bind(
       Number(flags.enrollment),
     Number(flags.uploadRegistration),
@@ -430,13 +431,13 @@ export async function setCollectionControls(
         WHERE operation_id = ? AND outcome = 'started'`,
     ).bind(failureDetails, operationId),
   ]);
-  if (results[1]?.meta.changes === 0
+  if (results[1]?.results.length === 0
       && results[2]?.meta.changes === 0
       && results[3]?.meta.changes === 1) {
     throw new ApiError(409, "ADMIN_ACTION_CONFLICT");
   }
   if (results[0]?.meta.changes !== 1
-      || results[1]?.meta.changes !== 1
+      || !returnedD1Target(results[1], 'revision', nextRevision)
       || results[2]?.meta.changes !== 1
       || results[3]?.meta.changes !== 0) {
     throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");

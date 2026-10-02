@@ -1,3 +1,4 @@
+import { normalizeNativeEffectiveOccurrence } from '../src/canonical-analytics-facts';
 import { applyD1Migrations, env, reset, type D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
@@ -392,4 +393,24 @@ describe("typed v1.2 effective reader", () => {
       sourceCount: 2, sourceFormats: ["v12"], status: "compatible",
     });
   }, 120_000);
+});
+
+it('retains separately qualified v12 order, boundary and cache TTL evidence in canonical facts',async()=>{
+  await db().prepare("UPDATE telemetry_v12_runtime SET state='active',changed_at=? WHERE id=1")
+    .bind(new Date(nowEpoch).toISOString()).run();
+  const fixture=await createV11DeviceFixture(db());
+  await grantTelemetryV12Consent(db(),fixture,telemetryV12RequiredConsent(),nowEpoch);
+  const owner=await prepareOwner(fixture.participantId);
+  const record={...usageRecord('event:v2:'+'d'.repeat(64),'extension'),boundaryFlags:1 as const,tieOrder:0,
+    cacheWriteTtl:{fiveMinuteTokens:0,oneHourTokens:0}};
+  await activate(fixture,await uploadDay(fixture,[record]));
+  const page=await readEffectiveUsageOwnerDayPage(db(),{sourceNamespace:'synthetic-v12-reader-source',
+    ...await currentPin(owner.ownerDigest),day,limit:16});
+  const canonical=await normalizeNativeEffectiveOccurrence({sourceNamespace:'synthetic-v12-reader-source',ownerDigest:owner.ownerDigest,
+    selectionMethod:'effective-union-v1'},page.rows[0]!,0);
+  expect(canonical.boundaryFlags).toEqual({presence:'reported',value:1});
+  expect(canonical.tieOrder).toEqual({presence:'reported',value:0});
+  expect(canonical.cacheWriteFiveMinuteTokens).toEqual({presence:'reported',value:0});
+  expect(canonical.cacheWriteOneHourTokens).toEqual({presence:'reported',value:0});
+  expect(JSON.parse(page.rows[0]!.recordJson!)).not.toHaveProperty('tieOrder');
 });

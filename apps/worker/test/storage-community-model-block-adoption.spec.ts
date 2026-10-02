@@ -1,5 +1,5 @@
 import { env, reset, type D1Migration } from 'cloudflare:test';
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
 import { telemetryV11DomainManifestDigestInput, type TelemetryV11DomainManifest } from '@app-usagemonitor/telemetry-contract';
 import { advanceAnalyticsModelBlock, appendModelBlockDependencies, ModelBlockSourceChanged,
   readVerifiedAnalyticsModelBlock } from '../src/analytics-model-block';
@@ -10,6 +10,9 @@ import { sha256Hex } from '../src/crypto';
 import { authenticateDevice, claimDeviceUploadAuthorization, createDeviceUploadAuthorization } from '../src/device-auth';
 import { ensureModelBlockJob, modelBlockJobKey, prepareModelBlockAdmission, readModelBlockJob } from '../src/storage-analytics-model-block';
 import { captureStorageGraphScope, computeStorageGraphResult, readStorageGraphResult } from '../src/storage-community-graph';
+import * as graphFacade from '../src/storage-community-graph';
+import { withMaintainedEffectiveDependencies } from '../src/storage-effective-dependency-summaries';
+import { advanceEffectiveDependencyCoverage } from '../src/storage-effective-selective-dependencies';
 import { advanceStorageModelBlockGraphWork } from '../src/storage-community-graph-model-block';
 import { captureStorageCommunityAuthority, readStorageCommunityOwnerPage } from '../src/storage-community-authority';
 import { publishStorageCommunityModelDay } from '../src/storage-community-graph-publication';
@@ -371,3 +374,54 @@ it('keeps runtime, owner, erasure and the per-date input-revision CAS authoritat
   expect(await graphRows()).toBe(0);
   expect(await target().prepare('SELECT COUNT(*) n FROM analytics_model_block_parts').first('n')).toBe(0);
 }, 180_000);
+
+
+it('lazily adopts the selected cold date through real bounded maintained scope batches',async()=>{
+  const context=await setup(),{corpus,scope,nowMs}=context;
+  const {checkpoint}=await completed(context);
+  let covered=false;
+  for(let pass=0;pass<48;pass++){
+    const progress=await advanceEffectiveDependencyCoverage(source(),{sourceId,sourceNamespace,
+      participantId:corpus.owner.participantId,maxSteps:64,maxRows:128});
+    if(progress.status==='complete'){covered=true;break;}
+    expect(progress.status).not.toBe('unavailable');
+  }
+  expect(covered).toBe(true);
+  expect(await target().prepare('SELECT count(*) n FROM analytics_effective_dependency_summaries')
+    .first<number>('n')).toBe(0);
+  const original=graphFacade.createStorageGraphScopeBatch,reads:string[]=[],sizes:number[]=[];
+  let captured=0,closed=0;
+  const spy=vi.spyOn(graphFacade,'createStorageGraphScopeBatch').mockImplementation(async(...args)=>{
+    const batch=await original(...args);if(!batch)return;
+    captured++;sizes.push(args[1].days.length);
+    return {readScope:async day=>{reads.push(day);return batch.readScope(day);},
+      assertCurrent:()=>batch.assertCurrent(),close:()=>{closed++;batch.close();}};
+  });
+  const profiles:{statements:number;rowsRead:number;rowsWritten:number;adoptedDates:number}[]=[];
+  let complete=false;
+  try{
+    for(let pass=0;pass<20;pass++){
+      const profile=createAnalyticsProfile();
+      const profiledSource=profileAnalyticsDatabase(source(),'source',profile,()=> 'adoption');
+      const profiledTarget=profileAnalyticsDatabase(target(),'target',profile,()=> 'adoption');
+      const result=await advanceStorageModelBlockGraphWork({...bindings(),source:withMaintainedEffectiveDependencies(
+        profiledSource,profiledTarget,sourceId,sourceNamespace),target:profiledTarget,scope,nowMs,
+        maxQueries:950,deadlineMs:Date.now()+60_000});
+      const costs=summarizeAnalyticsProfile(profile);
+      expect(costs.statements).toBe(result.queriesUsed);expect(result.queriesUsed).toBeLessThanOrEqual(950);
+      profiles.push({statements:costs.statements,rowsRead:costs.rowsRead,rowsWritten:costs.rowsWritten,
+        adoptedDates:result.adoptedDates});
+      expect(closed).toBe(captured);
+      if(result.state==='complete'){complete=true;break;}
+      expect(result.state).toBe('deferred');
+    }
+    expect(complete).toBe(true);expect(captured).toBeGreaterThan(0);
+    expect(reads[0]).toBe(scope.day);expect(sizes.every(size=>size<=16)).toBe(true);
+    const expected=checkpoint.outputs.find(output=>output.day===scope.day)!;
+    const native=await readStorageGraphResult(bindings(),scope);
+    expect(native?.composition).toEqual(expected.value.status==='ready'
+      ?{...expected.value,inputFingerprint:scope.pin.fingerprint}:expected.value);
+    console.log('P11_MODEL_BLOCK_LAZY_ADOPTION',JSON.stringify({passes:profiles.length,batches:captured,
+      closed,rangeReads:reads.length,batchSizes:sizes,profiles}));
+  }finally{spy.mockRestore();}
+},180_000);

@@ -1,3 +1,4 @@
+import type { SharedAnalyticsFeatureInput } from './storage-analytics-shared-features';
 import { canonicalJson } from './canonical-json';
 import { validCompleteCachedComposition } from './community-allowance';
 import { createD1InvocationBudget, D1InvocationBudgetExceededError } from './d1-invocation-budget';
@@ -8,9 +9,10 @@ import { advanceAnalyticsModelBlock, assertModelBlockSourceCurrent, assertModelB
   readVerifiedAnalyticsModelBlock } from './analytics-model-block';
 import { modelBlockStoreSupported, prepareModelBlockAdmission, readRebasableModelBlockCheckpoint,
   retireModelBlockJobs } from './storage-analytics-model-block';
-import { captureStorageGraphScope, readStorageGraphResult, reuseStorageGraphResult, saveStorageGraphResult,
+import { captureStorageGraphScope, createStorageGraphScopeBatch, readStorageGraphResult, reuseStorageGraphResult, saveStorageGraphResult,
   STORAGE_GRAPH_METHOD, type StorageGraphScope } from './storage-community-graph';
 import { V11_PLAN_ATTRIBUTION_ADAPTER_VERSION } from './quota-analysis-v11';
+import { modelBlockAdoptionBatches } from './storage-model-block-adoption-batches';
 
 /** These paths use the same effective reader and model kernel. Changes to any
  * member require native/adopted numerical and publication parity qualification. */
@@ -35,6 +37,8 @@ export async function advanceStorageModelBlockGraphWork(input: {
   source: D1Database; target: D1Database; sourceId: string; sourceNamespace: string;
   scope: StorageGraphScope; nowMs: number; maxQueries: number; deadlineMs?: number; now?: () => number;
   sharedFeatures?: boolean;
+  assertCurrent?: () => Promise<void>;
+  canonicalPreparation?: (input: SharedAnalyticsFeatureInput) => SharedAnalyticsFeatureInput['canonicalPreparation'];
 }): Promise<StorageModelBlockGraphProgress> {
   const now = input.now ?? Date.now, deadline = input.deadlineMs ?? now() + 20_000;
   if (input.source === input.target || !Number.isSafeInteger(input.nowMs)
@@ -87,6 +91,7 @@ export async function advanceStorageModelBlockGraphWork(input: {
       authorityEpoch: owner.authorityEpoch, inputRevision: owner.inputRevision,
       authorityDigest: await captureModelBlockAuthorityDigest(source, input), ...range };
     const fence = async () => {
+      await input.assertCurrent?.();
       await assertModelBlockSourceCurrent(source, owner, identity);
       await assertModelBlockTargetCurrent(target, identity);
     };
@@ -104,7 +109,7 @@ export async function advanceStorageModelBlockGraphWork(input: {
     check(600);
     const advanced = await advanceAnalyticsModelBlock({ ...bindings, owner, ...range,
       maxQueries: meter.remainingQueries, deadlineMs: deadline, now,
-      sharedFeatures: input.sharedFeatures,
+      sharedFeatures: input.sharedFeatures, canonicalPreparation: input.canonicalPreparation,
       ...(resumeCandidate ? { resumeCandidate, retireBeforeEnsure: true } : {}),
       historicalAdmission: { todayDay, token: admission } });
     if (advanced.status === 'unsupported') return result('unsupported', advanced.reason);
@@ -117,40 +122,58 @@ export async function advanceStorageModelBlockGraphWork(input: {
 
     // Serve the selected date first, then spend available capacity adopting
     // other dates. A retry discovers complete native rows without a new cursor.
-    const outputs = [...block.outputs].sort((a, b) =>
-      a.day === selectedScope.day ? -1 : b.day === selectedScope.day ? 1 : a.day.localeCompare(b.day));
-    for (const output of outputs) {
+    for (const outputs of modelBlockAdoptionBatches(block.outputs, selectedScope.day)) {
       check(60);
-      const scope = { ...await captureStorageGraphScope(source, {
-        owner, day: output.day, metric: 'model', sourceId: input.sourceId,
-        sourceNamespace: input.sourceNamespace, preparedFold: true,
-      }), ownerAuthorityEpoch: identity.authorityEpoch };
-      if (scope.source !== 'effective') throw new ModelBlockSourceChanged();
-      const blockPin = await modelBlockSourcePinForDay(identity, owner, block.dependencies, output.day);
-      // Native fallback outputs already carry the native window fingerprint;
-      // prepared outputs must carry the exact block window fingerprint.
-      if (output.fingerprint !== blockPin.fingerprint && output.fingerprint !== scope.pin.fingerprint
-        || !validCompleteCachedComposition(output.value, output.fingerprint,
-          MODEL_BLOCK_GRAPH_COMPATIBILITY.attribution)) throw new Error('MODEL_BLOCK_ADOPTION_PROOF_INVALID');
-      const existing = await readStorageGraphResult(bindings, scope);
-      if (existing) {
-        await fence();
-        if (output.day === selectedScope.day) { selectedComplete = true; selectedReused = true; }
-        continue;
-      }
-      // Only the envelope identity changes. Counts, coefficients, refusals,
-      // coverage and membership pass through byte-for-byte.
-      const value = output.value.status === 'ready'
-        ? { ...output.value, inputFingerprint: scope.pin.fingerprint } : output.value;
-      if (!validCompleteCachedComposition(value, scope.pin.fingerprint,
-        MODEL_BLOCK_GRAPH_COMPATIBILITY.attribution)) throw new Error('MODEL_BLOCK_ADOPTION_PROOF_INVALID');
-      check(35);
-      const saved = await saveStorageGraphResult(bindings, scope, {
-        payload: canonicalJson(value), payloadFingerprint: scope.pin.fingerprint, assertCurrent: fence,
+      // Construct only after the final meter wraps both exact handles. Native
+      // misses remain lazy so a cold sibling cannot starve the selected date.
+      if (meter.remainingQueries >= 120) check(80);
+      const batch = meter.remainingQueries < 120 ? undefined : await createStorageGraphScopeBatch(source, {
+        target, owner, days: outputs.map(output => output.day), metric: 'model',
+        sourceId: input.sourceId, sourceNamespace: input.sourceNamespace,
+        preparedFold: true, deadlineMs: deadline, now, remainingQueries: () => meter.remainingQueries,
       });
-      if (saved.state !== 'complete') return result('deferred', saved.reason);
-      adoptedDates++;
-      if (output.day === selectedScope.day) selectedComplete = true;
+      const adoptionFence = async () => {
+        await fence();
+        await batch?.assertCurrent();
+      };
+      try {
+        for (const output of outputs) {
+          check(60);
+          const captured = batch ? await batch.readScope(output.day)
+            : await captureStorageGraphScope(source, {
+              owner, day: output.day, metric: 'model', sourceId: input.sourceId,
+              sourceNamespace: input.sourceNamespace, preparedFold: true,
+            });
+          const scope = { ...captured, ownerAuthorityEpoch: identity.authorityEpoch };
+          if (scope.source !== 'effective') throw new ModelBlockSourceChanged();
+          const blockPin = await modelBlockSourcePinForDay(identity, owner, block.dependencies, output.day);
+          // Native fallback outputs already carry the native window fingerprint;
+          // prepared outputs must carry the exact block window fingerprint.
+          if (output.fingerprint !== blockPin.fingerprint && output.fingerprint !== scope.pin.fingerprint
+            || !validCompleteCachedComposition(output.value, output.fingerprint,
+              MODEL_BLOCK_GRAPH_COMPATIBILITY.attribution)) throw new Error('MODEL_BLOCK_ADOPTION_PROOF_INVALID');
+          await batch?.assertCurrent();
+          const existing = await readStorageGraphResult(bindings, scope);
+          if (existing) {
+            await adoptionFence();
+            if (output.day === selectedScope.day) { selectedComplete = true; selectedReused = true; }
+            continue;
+          }
+          // Only the envelope identity changes. Counts, coefficients, refusals,
+          // coverage and membership pass through byte-for-byte.
+          const value = output.value.status === 'ready'
+            ? { ...output.value, inputFingerprint: scope.pin.fingerprint } : output.value;
+          if (!validCompleteCachedComposition(value, scope.pin.fingerprint,
+            MODEL_BLOCK_GRAPH_COMPATIBILITY.attribution)) throw new Error('MODEL_BLOCK_ADOPTION_PROOF_INVALID');
+          check(35);
+          const saved = await saveStorageGraphResult(bindings, scope, {
+            payload: canonicalJson(value), payloadFingerprint: scope.pin.fingerprint, assertCurrent: adoptionFence,
+          });
+          if (saved.state !== 'complete') return result('deferred', saved.reason);
+          adoptedDates++;
+          if (output.day === selectedScope.day) selectedComplete = true;
+        }
+      } finally { batch?.close(); }
     }
     return result(selectedComplete ? 'complete' : 'deferred', selectedComplete ? undefined : 'model_block_incomplete');
   } catch (error) {

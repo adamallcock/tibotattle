@@ -1,6 +1,6 @@
 import { canonicalTelemetryV11Json } from '@app-usagemonitor/telemetry-contract';
-import { encodeTypedTelemetryRecord, typedTelemetryCanonicalRecords } from './typed-telemetry-codec';
-import { priceChunkUsageRecord } from './quota-analysis-v1';
+import { encodeTypedTelemetryRecord, typedTelemetryCanonicalRecords, type TypedTelemetryFields, type TypedTelemetryRecord } from './typed-telemetry-codec';
+import { priceChunkUsageRecordValue } from './quota-analysis-v1';
 import { COMMUNITY_DAILY_SPEND_PRICING_METHOD, COMMUNITY_DAILY_SPEND_REGISTRY_SHA256 } from './community-daily-spend';
 
 export const V11_DAILY_VALUES_SCHEMA = 'v11-daily-projection-values-v2';
@@ -16,8 +16,10 @@ type TokenKey = typeof TOKEN_KEYS[number];
  * outputCombinedTokens is the raw component; effectiveOutput alone applies
  * combined-or-split fallback. Only nonOverlappingTotal sums input plus output. */
 export interface ExactTokenSum { knownSum: string; unavailable: number }
-type Tokens = Record<TokenKey, ExactTokenSum>;
-interface Pricing { knownNanousd: string; fullyPriced: number; partiallyPriced: number; unpriced: number }
+export type V11DailyTokens = Record<TokenKey, ExactTokenSum>;
+type Tokens = V11DailyTokens;
+export interface V11DailyPricing { knownNanousd: string; fullyPriced: number; partiallyPriced: number; unpriced: number }
+type Pricing = V11DailyPricing;
 export interface V11DailyModelCell { provider: string; modelId: string; usageEvents: number; tokens: Tokens; pricing: Pricing }
 export interface V11DailyProjectionValues {
   schemaVersion: typeof V11_DAILY_VALUES_SCHEMA; day: string;
@@ -147,35 +149,36 @@ export function mergeV11DailyProjectionValues(a: V11DailyProjectionValues,b: V11
 function sumKnown(values: readonly (number|null)[]): ExactTokenSum {
   return {knownSum:values.reduce<bigint>((sum,value)=>sum+BigInt(value??0),0n).toString(),unavailable:values.some(v=>v===null)?1:0};
 }
+/** Transient validated typed inputs. These contain source identifiers and are
+ * never a persisted feature/checkpoint contract. Keep daily canonicalization
+ * separate from scalar/model accounting even when their current prices agree. */
+export interface V11DailyProjectionRecord {
+  readonly fields: TypedTelemetryFields;
+  readonly record: TypedTelemetryRecord;
+}
+export function prepareV11DailyProjectionRecord(format:'v1'|'v11', value:unknown):V11DailyProjectionRecord {
+  const fields=encodeTypedTelemetryRecord(format,value);
+  return {fields,record:typedTelemetryCanonicalRecords(fields).record};
+}
 /** All three streams are validated; only usage contributes tokens and spend.
  * No DB/network writes, raw persistence, quota fit or source selection occurs. */
-function foldDailyProjectionValues(format:'v1'|'v11',state: V11DailyProjectionValues, records: readonly unknown[]): V11DailyProjectionValues {
+function foldDailyRecords<T>(state: V11DailyProjectionValues, records: readonly T[],
+  prepare:(value:T)=>V11DailyProjectionRecord): V11DailyProjectionValues {
   state=normalizeV11DailyProjectionValues(state);
   if(!Array.isArray(records)||records.length>MAX_V11_DAILY_FOLD_RECORDS)fail();
   const page=createV11DailyProjectionValues(state.day), cells=new Map<string,V11DailyModelCell>();const identities=new Set<string>();
-  for(const value of records) {
-    const fields=encodeTypedTelemetryRecord(format,value),canonical=typedTelemetryCanonicalRecords(fields);
+  for(const value of records as readonly T[]) {
+    const {fields,record}=prepare(value);
     if(new Date(fields.observedAtMs).toISOString().slice(0,10)!==state.day)fail();
     const identity=`${fields.stream}:${Array.from(fields.occurrenceId).join(',')}`;
     if(identities.has(identity))fail();identities.add(identity);
     if(fields.stream!=='usage'){page.counts[fields.stream]++;continue;}
-    const u=fields.usage!; const tokens=zeroTokens();
-    for(const key of COMPONENTS)tokens[key]=sumKnown([u.components[key]]);
-    const output=u.components.outputCombinedTokens===null
-      ?[u.components.outputTextTokens,u.components.outputReasoningTokens]:[u.components.outputCombinedTokens];
-    tokens.effectiveOutput=sumKnown(output);
-    tokens.nonOverlappingTotal=sumKnown([u.components.inputUncachedTokens,u.components.inputCacheReadTokens,u.components.inputCacheWriteTokens,...output]);
-    const priced=priceChunkUsageRecord(canonical.canonicalRecord,new Date(fields.observedAtMs).toISOString());
-    const pricing=zeroPricing();
-    if(priced===null||priced.pricingStatus==='unpriced')pricing.unpriced=1;
-    else {
-      if(!Number.isSafeInteger(priced.costNanousd)||priced.costNanousd<0)fail();
-      pricing.knownNanousd=String(priced.costNanousd);
-      if(priced.pricingStatus==='fully_priced')pricing.fullyPriced=1;else if(priced.pricingStatus==='partially_priced')pricing.partiallyPriced=1;else fail();
-    }
+    const tokens=v11DailyTokenQuantities(fields.usage!.components);
+    const pricing=v11DailyPricingContribution(priceChunkUsageRecordValue(
+      record as unknown as Record<string,unknown>,new Date(fields.observedAtMs).toISOString()));
     page.counts.usage++;page.tokens=addTokens(page.tokens,tokens);page.pricing=addPricing(page.pricing,pricing);
-    const key=keyOf({provider:fields.provider,modelId:u.modelId}),old=cells.get(key);
-    cells.set(key,{provider:fields.provider,modelId:u.modelId,usageEvents:(old?.usageEvents??0)+1,
+    const key=keyOf({provider:fields.provider,modelId:fields.usage!.modelId}),old=cells.get(key);
+    cells.set(key,{provider:fields.provider,modelId:fields.usage!.modelId,usageEvents:(old?.usageEvents??0)+1,
       tokens:old?addTokens(old.tokens,tokens):tokens,pricing:old?addPricing(old.pricing,pricing):pricing});
     if(cells.size>MAX_V11_DAILY_MODEL_CELLS)fail();
   }
@@ -193,10 +196,63 @@ export function finalizeV11DailyProjectionValues(state: V11DailyProjectionValues
     knownCostNanousd:state.counts.usage===0||priced>0?state.pricing.knownNanousd:null};
 }
 
+export function foldPreparedV11DailyProjectionValues(state:V11DailyProjectionValues,
+  records:readonly V11DailyProjectionRecord[]):V11DailyProjectionValues {
+  return foldDailyRecords(state,records,value=>value);
+}
+function foldDailyProjectionValues(format:'v1'|'v11',state:V11DailyProjectionValues,records:readonly unknown[]):V11DailyProjectionValues {
+  return foldDailyRecords(state,records,value=>prepareV11DailyProjectionRecord(format,value));
+}
 /** Format-specific validation shares exact arithmetic without translating wire records. */
 export function foldV11DailyProjectionValues(state:V11DailyProjectionValues,records:readonly unknown[]):V11DailyProjectionValues {
  return foldDailyProjectionValues('v11',state,records);
 }
 export function foldV1DailyProjectionValues(state:V11DailyProjectionValues,records:readonly unknown[]):V11DailyProjectionValues {
  return foldDailyProjectionValues('v1',state,records);
+}
+
+/** Price-independent exact arithmetic shared by native records and canonical
+ * facts. Null counts as unavailable even when its known subtotal is zero. */
+export function v11DailyTokenQuantities(components:Readonly<Record<typeof COMPONENTS[number],number|null>>):V11DailyTokens {
+  const tokens=zeroTokens();
+  for(const key of COMPONENTS) {
+    const value=components[key];
+    if(value!==null&&(!Number.isSafeInteger(value)||value<0))fail();
+    tokens[key]=sumKnown([value]);
+  }
+  const output=components.outputCombinedTokens===null
+    ?[components.outputTextTokens,components.outputReasoningTokens]:[components.outputCombinedTokens];
+  tokens.effectiveOutput=sumKnown(output);
+  tokens.nonOverlappingTotal=sumKnown([components.inputUncachedTokens,components.inputCacheReadTokens,
+    components.inputCacheWriteTokens,...output]);
+  return tokens;
+}
+export function v11DailyPricingContribution(priced:ReturnType<typeof priceChunkUsageRecordValue>):V11DailyPricing {
+  const pricing=zeroPricing();
+  if(priced===null||priced.pricingStatus==='unpriced')pricing.unpriced=1;
+  else {
+    if(!Number.isSafeInteger(priced.costNanousd)||priced.costNanousd<0)fail();
+    pricing.knownNanousd=String(priced.costNanousd);
+    if(priced.pricingStatus==='fully_priced')pricing.fullyPriced=1;
+    else if(priced.pricingStatus==='partially_priced')pricing.partiallyPriced=1;
+    else fail();
+  }
+  return pricing;
+}
+/** One already validated canonical occurrence. Keep single-record merging so
+ * lexical top-K behavior exactly matches the native day fold. */
+export function foldV11DailyContribution(state:V11DailyProjectionValues,input:{
+  stream:'usage'|'quota'|'session';provider:string;modelId:string|null;
+  tokens:V11DailyTokens|null;pricing:V11DailyPricing|null;
+}):V11DailyProjectionValues {
+  const page=createV11DailyProjectionValues(state.day);
+  page.counts[input.stream]=1;
+  if(input.stream==='usage') {
+    token(input.provider);token(input.modelId);
+    if(input.tokens===null||input.pricing===null)fail();
+    validateTokens(input.tokens,1);validatePricing(input.pricing,1);
+    page.tokens=input.tokens;page.pricing=input.pricing;
+    page.cells=[{provider:input.provider,modelId:input.modelId,usageEvents:1,tokens:input.tokens,pricing:input.pricing}];
+  } else if(input.tokens!==null||input.pricing!==null)fail();
+  return mergeV11DailyProjectionValues(state,page);
 }
