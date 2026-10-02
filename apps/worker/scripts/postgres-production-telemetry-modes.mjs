@@ -945,6 +945,14 @@ const V12_DOMAIN_HEADS = defineTable({
 const PROMOTE_READY_MANIFESTS = "promote-ready-manifests";
 const V12_CHUNK_TABLES = Object.freeze([["telemetry_v12_chunks", REGISTRATION_KINDS.telemetry_v12]]);
 
+/**
+ * Every chunk family whose registrations a telemetry stage maps, as
+ * [sealed chunk table, PostgreSQL pending_objects kind]. The
+ * 'pending-registrations' stage (D-PT4X) applies the same mapping to every
+ * sealed registration, so the rows these stages wrote verify field by field.
+ */
+export const CHUNK_REGISTRATION_FAMILIES = Object.freeze([...V1_V11_CHUNK_TABLES, ...V12_CHUNK_TABLES]);
+
 function promoteReadyManifestsStep(stage) {
   return Object.freeze({
     kind: "step",

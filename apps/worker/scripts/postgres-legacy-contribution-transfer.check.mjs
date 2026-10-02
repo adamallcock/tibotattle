@@ -32,6 +32,7 @@ import {
   runOperationalHistoryProduction,
   runPendingRegistrationsProduction,
 } from "./postgres-legacy-contribution-transfer.mjs";
+import { CHUNK_REGISTRATION_FAMILIES, TELEMETRY_PRODUCTION_DISPOSITIONS } from "./postgres-production-telemetry-modes.mjs";
 import { PostgresTransferTargetError, TRANSFER_STAGES } from "./postgres-transfer-target.mjs";
 import { forgeVariantSeal, headCommit, outputPathsOf, prepareSealWorld, sealWorld } from "../postgres-test/fixtures/w2-seal/seal-harness.mjs";
 import { Q1_INGESTION_DUMP } from "../postgres-test/fixtures/w2-seal/synthetic-sources.mjs";
@@ -47,8 +48,9 @@ import { Q1_INGESTION_DUMP } from "../postgres-test/fixtures/w2-seal/synthetic-s
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // A reviewed change to the order, column maps, trigger policy, dispositions,
-// prerequisites or the exclusion filter must update this pin.
-const POLICY_SHA256 = "5f8200b0f281791d0737267a1ff960048d9c2a42f724c78f24b40c88fe12e2f3";
+// prerequisites, the exclusion filter or the chunk-registration families
+// (shared with D-PT5A) must update this pin.
+const POLICY_SHA256 = "97613b7e03ce61bfb51eb61c387217dec171d394fa6dd74ec67ab707158919ef";
 const DISPOSITION = /^(?:(?:imported|mapped|claimed-by):[a-z][a-z0-9]*(?:-[a-z0-9]+)*|verified-equal|must-be-empty|schema-marker|source-machinery|runtime-reset|edge-retained|not-transferred-expiring|target-missing)$/u;
 let world;
 let seal;
@@ -90,6 +92,14 @@ test("the stages, order, dispositions and trigger policy are frozen and pinned",
     assert.ok(Object.hasOwn(LEGACY_TRANSFER_COLUMN_MAP, table), table);
   }
   assert.equal(LEGACY_TRANSFER_DISPOSITIONS.pending_quarantine_objects.token, "mapped:pending-registrations");
+  // A chunk-owned registration takes its family's kind here exactly as in D-PT5A's chunk stages, and each
+  // family's chunk table belongs to a prerequisite stage, so those rows exist before this stage verifies them.
+  assert.deepEqual(CHUNK_REGISTRATION_FAMILIES, [["telemetry_v1_chunks", "telemetry_v1"],
+    ["telemetry_v11_chunks", "telemetry_v11"], ["telemetry_v12_chunks", "telemetry_v12"]]);
+  for (const [chunkTable] of CHUNK_REGISTRATION_FAMILIES) {
+    const owner = TELEMETRY_PRODUCTION_DISPOSITIONS.find(entry => entry.table === chunkTable);
+    assert.ok(owner !== undefined && PENDING_REGISTRATIONS_PREREQUISITE_STAGES.includes(owner.stage), chunkTable);
+  }
   assert.equal(LEGACY_TRANSFER_DISPOSITIONS.community_aggregate_exclusions.token, "imported:community-aggregate-exclusions");
   for (const [tableName, triggers] of Object.entries(LEGACY_TRIGGER_POLICY)) {
     for (const [trigger, entry] of Object.entries(triggers)) {
@@ -207,6 +217,10 @@ test("every sealed-source refusal fires before the target is touched", async () 
     [runPendingRegistrationsProduction, `PRAGMA ignore_check_constraints = ON;
       INSERT INTO pending_quarantine_objects (r2_key, contribution_id, object_kind, registered_at, reconciliation_state)
       VALUES ('telemetry/${randomUUID()}', '${randomUUID()}', 'telemetry', '${instant}', 'deleting')`, "CUTOVER_SOURCE_VALUE_INVALID"],
+    // A chunk-owned registration (contribution id = a sealed chunk's id) under another object key.
+    [runPendingRegistrationsProduction, `INSERT INTO pending_quarantine_objects (r2_key, contribution_id, object_kind, registered_at)
+      SELECT 'telemetry/v11-${randomUUID()}', id, 'telemetry', '${instant}' FROM telemetry_v11_chunks ORDER BY id LIMIT 1`,
+    "CUTOVER_SOURCE_VALUE_INVALID"],
     [runPendingRegistrationsProduction, "ALTER TABLE pending_quarantine_objects ADD COLUMN synthetic_extra TEXT",
       "CUTOVER_COLUMN_UNMAPPED"],
     [runOperationalHistoryProduction, `INSERT INTO admin_metric_snapshots (captured_at, metrics_json)

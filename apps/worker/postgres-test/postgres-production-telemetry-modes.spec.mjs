@@ -17,6 +17,10 @@ import {
 } from "../scripts/postgres-production-telemetry-modes.mjs";
 import { TelemetryProductionError } from "../scripts/postgres-production-telemetry-engine.mjs";
 import {
+  runLegacyContributionsProduction,
+  runPendingRegistrationsProduction,
+} from "../scripts/postgres-legacy-contribution-transfer.mjs";
+import {
   PostgresTransferTargetError,
   TRANSFER_STAGES,
   abandonRun,
@@ -622,11 +626,18 @@ function augmentationSql(database) {
     WHERE link.state = 'active' AND membership.participant_id <> ? ORDER BY membership.participant_id LIMIT 1`.replace("?", `'${withdrawn.participant_id}'`));
   const hex = Buffer.from(correction.digest, "hex");
   const zero = "zeroblob(32)";
+  // The registered chunks take D1-shaped object keys (telemetry/v1-, v11- and v12-), so each registration
+  // also satisfies D1's own CHECK, which the pending-registrations stage (D-PT4X) re-asserts.
+  const keys = { v1: "telemetry/v1-00000000-0000-4000-8000-000000000001", v11: "telemetry/v11-00000000-0000-4000-8000-000000000002",
+    v12: "telemetry/v12-00000000-0000-4000-8000-000000000003" };
   return `PRAGMA foreign_keys = OFF; PRAGMA ignore_check_constraints = ON;
+    UPDATE telemetry_v1_chunks SET r2_key = '${keys.v1}' WHERE id = '${v1Chunk.id}';
+    UPDATE telemetry_v11_chunks SET r2_key = '${keys.v11}' WHERE id = '${v11Chunk.id}';
+    UPDATE telemetry_v12_chunks SET r2_key = '${keys.v12}' WHERE id = '${v12Chunk.id}';
     INSERT INTO pending_quarantine_objects(r2_key, contribution_id, object_kind, registered_at, reconciliation_state, reconciliation_lease_id)
-      VALUES ('${v1Chunk.r2_key}', '${v1Chunk.id}', 'telemetry', '2026-10-01T10:00:00.000Z', 'registered', NULL),
-             ('${v11Chunk.r2_key}', '${v11Chunk.id}', 'telemetry', '2026-10-01T11:00:00.123Z', 'registered', NULL),
-             ('${v12Chunk.r2_key}', '${v12Chunk.id}', 'telemetry', '2026-10-01T12:00:00.000Z', 'deleting', 'lease-synthetic-0001');
+      VALUES ('${keys.v1}', '${v1Chunk.id}', 'telemetry', '2026-10-01T10:00:00.000Z', 'registered', NULL),
+             ('${keys.v11}', '${v11Chunk.id}', 'telemetry', '2026-10-01T11:00:00.123Z', 'registered', NULL),
+             ('${keys.v12}', '${v12Chunk.id}', 'telemetry', '2026-10-01T12:00:00.000Z', 'deleting', 'lease-synthetic-0001');
     INSERT INTO telemetry_v1_records(chunk_row_id, participant_id, device_id, stream, occurrence_id, observed_at, observed_day,
         provider, model_id, session_uuid, plan_type, plan_variant, limit_id, slot, used_percent, window_duration_minutes, resets_at,
         input_uncached_tokens, input_cache_read_tokens, input_cache_write_tokens, output_text_tokens, output_reasoning_tokens,
@@ -662,7 +673,7 @@ describe.skipIf(!PG_TEST_SOCKET)("D-PT5A telemetry production stages over an aug
   function dropAllTriggers(path) {
     const database = new DatabaseSync(path, { readOnly: true });
     try {
-      return database.prepare("SELECT name FROM sqlite_schema WHERE type = 'trigger' AND tbl_name IN ('pending_quarantine_objects', 'telemetry_v1_records', 'storage_v11_append_transitions', 'storage_v11_owner_links', 'telemetry_usage_correction_history', 'telemetry_usage_correction_facts', 'telemetry_usage_correction_runtime')")
+      return database.prepare("SELECT name FROM sqlite_schema WHERE type = 'trigger' AND tbl_name IN ('pending_quarantine_objects', 'telemetry_v1_chunks', 'telemetry_v11_chunks', 'telemetry_v12_chunks', 'telemetry_v1_records', 'storage_v11_append_transitions', 'storage_v11_owner_links', 'telemetry_usage_correction_history', 'telemetry_usage_correction_facts', 'telemetry_usage_correction_runtime')")
         .all().map(row => `DROP TRIGGER IF EXISTS "${row.name}";`).join("\n");
     } finally {
       database.close();
@@ -781,6 +792,34 @@ describe.skipIf(!PG_TEST_SOCKET)("D-PT5A telemetry production stages over an aug
     }
     // Restored, both stages replay to the receipts of the first run.
     for (const stage of ["telemetry-v1-v11", "telemetry-v12"]) expect((await replay(stage)).receiptSha256, stage).toBe(results[stage].receiptSha256);
+  }, 600_000);
+
+  // Integration with D-PT4X: 'pending-registrations' owns every sealed
+  // registration and must accept the chunk-owned rows these stages already
+  // mapped (family kind) without rewriting them, then hold every object.
+  it("hands the chunk-owned registrations to the pending-registrations stage, which accepts the family kind and holds every object", async () => {
+    const pool = target.ownerPrimary;
+    const snapshot = async () => (await pool.query(`SELECT to_jsonb(registration) AS row FROM ${table("pending_objects")} registration
+      ORDER BY contribution_id COLLATE "C"`)).rows.map(row => row.row);
+    const before = await snapshot();
+    const sealed = Number(forgedDb.prepare("SELECT count(*) AS n FROM pending_quarantine_objects").get().n);
+    expect(before).toHaveLength(3);
+    expect(sealed).toBe(3);
+    await runLegacyContributionsProduction({ handle, sealManifestPath: forged.manifestPath });
+    const pending = await runPendingRegistrationsProduction({ handle, sealManifestPath: forged.manifestPath });
+    expect(pending.registrations.rows).toBe(sealed);
+    expect([pending.premapped, pending.inserted]).toEqual([3, 0]);
+    // The rows these stages wrote are untouched: family kind, registration token and all.
+    expect(await snapshot()).toEqual(before);
+    expect(await count(pool, "pending_object_transfer_holds")).toBe(sealed);
+    // The telemetry stages still re-prove their registrations, and a replay of the pending stage writes nothing.
+    for (const stage of ["telemetry-v1-v11", "telemetry-v12"]) {
+      const replayed = await TELEMETRY_PRODUCTION_RUNNERS[stage]({ handle, sealManifestPath: forged.manifestPath });
+      expect(replayed.receiptSha256, stage).toBe(results[stage].receiptSha256);
+    }
+    const again = await runPendingRegistrationsProduction({ handle, sealManifestPath: forged.manifestPath });
+    expect(again.receiptSha256).toBe(pending.receiptSha256);
+    expect([again.premapped, again.inserted]).toEqual([0, 0]);
   }, 600_000);
 });
 
