@@ -300,7 +300,8 @@ test("a receipt write that fails after the insert still yields the receipt, and 
   const cliRun = harness(desired);
   const out = [];
   const err = [];
-  const code = await main(["bucket-birth", "--desired-state=/synthetic-desired/unborn.json", "--apply",
+  // An applying bucket birth reads only the committed desired state (here, its synthetic stand-in).
+  const code = await main(["bucket-birth", "--environment=production", "--apply",
     `--authorize=${authorize}`, "--receipt-out=/synthetic/receipt.json"], {
     runner: cliRun.runner,
     fetchImpl: cliRun.fetchImpl,

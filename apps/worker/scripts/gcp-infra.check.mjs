@@ -3,7 +3,8 @@
  * arguments, a dry run by default, render with no call, plan and readback
  * through read shapes only, apply only under --authorize and never for the
  * synthetic fixture, OPS-10's `readback --require-clean --environment=<env>`
- * form, and named error codes that never echo gcloud output. The runner is
+ * form over the committed desired state, the scheduler probe, and named error
+ * codes that never echo gcloud output. The runner is
  * the synthetic in-memory gcloud; PATH is blanked for this process and for
  * the spawned CLI, so no real gcloud can run.
  */
@@ -16,6 +17,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { committedDesiredStatePath } from "./gcp-ops-infra-manifest.mjs";
 import { classifyGcloudCommand } from "./gcp-ops-infra-operations.mjs";
 import { main, parseGcpInfraArgs } from "./gcp-infra.mjs";
 import { INFRA_READBACK_ARGV, ROLLOUT_ARGV } from "./gcp-production-rollout.mjs";
@@ -36,11 +38,17 @@ const FIXTURE_TEXT = readFileSync(FIXTURE_PATH, "utf8");
 const UNMARKED_PATH = "/synthetic-desired/example-ops-prod1.json";
 const UNMARKED_TEXT = FIXTURE_TEXT.replaceAll("synthetic-ops-project", "example-ops-prod1");
 const IMAGE = ["--bootstrap-image-digest=" + "c".repeat(64), "--bootstrap-source-commit=" + "d".repeat(40)];
+const COMMITTED_PRODUCTION = committedDesiredStatePath("production");
+const COMMITTED_STAGING = committedDesiredStatePath("staging");
 
-function readFile(path) {
-  if (path === FIXTURE_PATH) return FIXTURE_TEXT;
-  if (path === UNMARKED_PATH) return UNMARKED_TEXT;
-  throw new Error("synthetic: unexpected read");
+/** Reads synthetic files; the committed production path is a synthetic stand-in unless `committed` says otherwise. */
+function reader(committed = UNMARKED_TEXT) {
+  return (path) => {
+    if (path === FIXTURE_PATH) return FIXTURE_TEXT;
+    if (path === UNMARKED_PATH) return UNMARKED_TEXT;
+    if (path === COMMITTED_PRODUCTION) return committed;
+    throw new Error("synthetic: unexpected read");
+  };
 }
 
 function world(project) {
@@ -51,15 +59,16 @@ function world(project) {
   return value;
 }
 
-async function run(argv, { project = "synthetic-ops-project", gcloud, writer = memoryWriter(), env = {} } = {}) {
+async function run(argv, { project = "synthetic-ops-project", gcloud, writer = memoryWriter(), readFile = reader(),
+  now } = {}) {
   const fake = gcloud ?? createFakeGcloud(world(project), { files: writer.files, project, region: "us-east1" });
   const out = [];
   const err = [];
   const code = await main(argv, {
     runner: fake.runner,
     fetchImpl: async () => { throw new Error("synthetic: no network in this check"); },
-    readFile,
-    env,
+    ...(readFile === null ? {} : { readFile }),
+    ...(now === undefined ? {} : { now }),
     createSpecWriter: () => writer.create(),
     stdout: (text) => out.push(text),
     stderr: (text) => err.push(text),
@@ -72,7 +81,7 @@ test("arguments are closed and dangerous combinations are refused", () => {
     command: "plan", desiredStatePath: FIXTURE_PATH, environment: null, bootstrap: null, authorize: null, apply: false,
     requireClean: false, receiptPath: null,
   });
-  // OPS-10's preflight argv (ROLLOUT_ARGV.infraReadback): no path, the environment's variable names it.
+  // OPS-10's preflight argv (ROLLOUT_ARGV.infraReadback): no path, the environment's committed file.
   assert.deepEqual(parseGcpInfraArgs(["readback", "--require-clean", "--environment=production"]), {
     command: "readback", desiredStatePath: null, environment: "production", bootstrap: null, authorize: null,
     apply: false, requireClean: true, receiptPath: null,
@@ -106,6 +115,16 @@ test("arguments are closed and dangerous combinations are refused", () => {
     [["plan", "--environment=production", "--require-clean"], "GCP_INFRA_ARGUMENT_INVALID"],
     [["apply", "--environment=production", "--require-clean", "--authorize=" + "a".repeat(64)],
       "GCP_INFRA_ARGUMENT_INVALID"],
+    // A real change is made only from the committed desired state.
+    [["apply", `--desired-state=${FIXTURE_PATH}`, "--authorize=" + "a".repeat(64)],
+      "GCP_INFRA_COMMITTED_DESIRED_STATE_REQUIRED"],
+    [["apply", "--environment=production", `--desired-state=${UNMARKED_PATH}`, "--authorize=" + "a".repeat(64)],
+      "GCP_INFRA_COMMITTED_DESIRED_STATE_REQUIRED"],
+    [["bucket-birth", `--desired-state=${FIXTURE_PATH}`, "--apply", "--authorize=bucket-birth:x:y"],
+      "GCP_INFRA_COMMITTED_DESIRED_STATE_REQUIRED"],
+    [["scheduler-probe"], "GCP_INFRA_ARGUMENT_MISSING"],
+    [["scheduler-probe", "--environment=staging", "--require-clean"], "GCP_INFRA_ARGUMENT_INVALID"],
+    [["scheduler-probe", "--environment=staging", "--now=2026-10-02T00:00:00Z"], "GCP_INFRA_ARGUMENT_INVALID"],
   ];
   for (const [argv, code] of cases) {
     assert.throws(() => parseGcpInfraArgs(argv), { code }, argv.join(" "));
@@ -123,11 +142,14 @@ test("render makes no call and shows the estate", async () => {
   assert.deepEqual(rendered.service, { unavailable: "BOOTSTRAP_IMAGE_REQUIRED" });
   assert.deepEqual(rendered.scheduler, { "analytics-refresh": { unavailable: "SCHEDULER_CADENCE_UNSET" } });
   assert.deepEqual(Object.keys(rendered.jobs), ["production-migrate", "analytics-refresh"]);
+  assert.deepEqual(rendered.verifierIam, { account: "synthetic-verifier@synthetic-ops-project.iam.gserviceaccount.com",
+    role: "roles/iam.serviceAccountTokenCreator", members: ["group:synthetic-operators@example.com"] });
   const withImage = JSON.parse((await run(["render", `--desired-state=${FIXTURE_PATH}`, ...IMAGE])).out);
   assert.equal(withImage.service.kind, "Service");
   assert.equal(withImage.jobs["production-migrate"].kind, "Job");
-  // Deferred while its entry refuses a production target.
-  assert.deepEqual(withImage.jobs["analytics-refresh"], { unavailable: "ANALYTICS_REFRESH_PRODUCTION_TARGET_UNAVAILABLE" });
+  // The analytics-refresh job renders the production refresh-job contract.
+  assert.deepEqual(withImage.jobs["analytics-refresh"].spec.template.spec.template.spec.containers[0].args,
+    ["--max-old-space-size=12288", "dist/analytics-refresh.mjs", "--mode=full"]);
   assert.doesNotMatch(JSON.stringify(withImage), /LEDGER|HISTORY_PROOF/u);
 });
 
@@ -152,9 +174,11 @@ test("readback and plan issue read shapes only and the plan is a dry run", async
 
 test("apply refuses the synthetic fixture before any call, and runs an authorized plan otherwise", async () => {
   const plan = JSON.parse((await run(["plan", `--desired-state=${FIXTURE_PATH}`, ...IMAGE])).out);
-  const refused = await run(["apply", `--desired-state=${FIXTURE_PATH}`, `--authorize=${plan.planDigest}`, ...IMAGE]);
+  // Apply reads only the committed desired state, and a synthetic one is never committed.
+  const refused = await run(["apply", "--environment=production", `--authorize=${plan.planDigest}`, ...IMAGE],
+    { readFile: reader(FIXTURE_TEXT) });
   assert.equal(refused.code, 1);
-  assert.deepEqual(JSON.parse(refused.err), { status: "error", code: "APPLY_SYNTHETIC_TARGET_REFUSED" });
+  assert.deepEqual(JSON.parse(refused.err), { status: "error", code: "COMMITTED_DESIRED_STATE_SYNTHETIC" });
   assert.equal(refused.calls.length, 0);
   assert.equal(refused.out, "");
 
@@ -163,12 +187,12 @@ test("apply refuses the synthetic fixture before any call, and runs an authorize
   const gcloud = createFakeGcloud(world(project), { files: writer.files, project, region: "us-east1" });
   const unmarked = JSON.parse((await run(["plan", `--desired-state=${UNMARKED_PATH}`, ...IMAGE], { gcloud })).out);
   gcloud.calls.length = 0;
-  const stale = await run(["apply", `--desired-state=${UNMARKED_PATH}`, `--authorize=${"0".repeat(64)}`, ...IMAGE],
+  const stale = await run(["apply", "--environment=production", `--authorize=${"0".repeat(64)}`, ...IMAGE],
     { gcloud });
   assert.deepEqual(JSON.parse(stale.err), { status: "error", code: "APPLY_PLAN_DIGEST_MISMATCH" });
   assert.ok(gcloud.calls.every((argv) => classifyGcloudCommand(argv) === "read"));
   gcloud.calls.length = 0;
-  const applied = await run(["apply", `--desired-state=${UNMARKED_PATH}`, `--authorize=${unmarked.planDigest}`, ...IMAGE],
+  const applied = await run(["apply", "--environment=production", `--authorize=${unmarked.planDigest}`, ...IMAGE],
     { gcloud, writer });
   assert.equal(applied.code, 0, applied.err);
   const receipt = JSON.parse(applied.out);
@@ -180,7 +204,7 @@ test("apply refuses the synthetic fixture before any call, and runs an authorize
     failWhen: (argv) => argv[0] === "iam" && argv[2] === "create" });
   const failingPlan = JSON.parse((await run(["plan", `--desired-state=${UNMARKED_PATH}`, ...IMAGE],
     { gcloud: failing })).out);
-  const broken = await run(["apply", `--desired-state=${UNMARKED_PATH}`, `--authorize=${failingPlan.planDigest}`, ...IMAGE],
+  const broken = await run(["apply", "--environment=production", `--authorize=${failingPlan.planDigest}`, ...IMAGE],
     { gcloud: failing });
   assert.equal(broken.code, 1);
   const error = JSON.parse(broken.err);
@@ -192,7 +216,6 @@ test("apply refuses the synthetic fixture before any call, and runs an authorize
 
 test("readback --require-clean --environment is OPS-10's preflight: exit 0 only when clean", async () => {
   const project = "example-ops-prod1";
-  const env = { GCP_INFRA_DESIRED_STATE_PRODUCTION: UNMARKED_PATH };
   // Exactly the argv OPS-10's rollout runs (from apps/worker), less `node <script>`.
   const rolloutArgv = ROLLOUT_ARGV.infraReadback("production");
   assert.deepEqual(rolloutArgv.slice(0, 2), ["node", "scripts/gcp-infra.mjs"]);
@@ -202,7 +225,7 @@ test("readback --require-clean --environment is OPS-10's preflight: exit 0 only 
   const writer = memoryWriter();
   const gcloud = createFakeGcloud(world(project), { files: writer.files, project, region: "us-east1" });
   // An estate apply has not built yet is not clean.
-  const empty = await run(preflight, { gcloud, env });
+  const empty = await run(preflight, { gcloud });
   assert.equal(empty.code, 2, empty.err);
   const dirty = JSON.parse(empty.out);
   assert.equal(dirty.schema, "tibotattle-gcp-ops-infra-clean-v1");
@@ -210,32 +233,33 @@ test("readback --require-clean --environment is OPS-10's preflight: exit 0 only 
   assert.ok(dirty.reasons.includes("EXECUTABLE:cloud-sql:create"));
   assert.ok(gcloud.calls.every((argv) => classifyGcloudCommand(argv) === "read"));
   // Converge it, then the preflight passes; the readback is carried for OPS-10's digest.
-  const plan = JSON.parse((await run(["plan", "--environment=production", ...IMAGE], { gcloud, env })).out);
+  const plan = JSON.parse((await run(["plan", "--environment=production", ...IMAGE], { gcloud })).out);
   assert.equal((await run(["apply", "--environment=production", `--authorize=${plan.planDigest}`, ...IMAGE],
-    { gcloud, writer, env })).code, 0);
+    { gcloud, writer })).code, 0);
   gcloud.calls.length = 0;
-  const clean = await run(preflight, { gcloud, env });
+  const clean = await run(preflight, { gcloud });
   assert.equal(clean.code, 0, clean.out);
   const verdict = JSON.parse(clean.out);
   assert.deepEqual([verdict.clean, verdict.reasons, verdict.environment, verdict.project],
     [true, [], "production", project]);
-  assert.deepEqual(verdict.summary, { executable: 0, deferred: 3, refused: 0 });
+  assert.deepEqual(verdict.summary, { executable: 0, deferred: 1, refused: 0 });
   assert.equal(verdict.readback.schema, "tibotattle-gcp-ops-infra-readback-v1");
   assert.ok(gcloud.calls.every((argv) => classifyGcloudCommand(argv) === "read"));
   // A running trigger, a stale proof or any drift fails it.
   gcloud.world.buckets[0].metageneration = "2";
-  const stale = await run(preflight, { gcloud, env });
+  const stale = await run(preflight, { gcloud });
   assert.equal(stale.code, 2);
   assert.deepEqual(JSON.parse(stale.out).reasons, ["FINDING:BUCKET_PROOF_STALE"]);
-  // The path comes only from the environment's own variable, and the file must describe it.
-  for (const [argv, environment, code] of [
-    [preflight, {}, "GCP_INFRA_DESIRED_STATE_UNCONFIGURED"],
-    [preflight, { GCP_INFRA_DESIRED_STATE_PRODUCTION: "relative.json" }, "GCP_INFRA_DESIRED_STATE_PATH_INVALID"],
-    [["readback", "--require-clean", "--environment=staging"], { GCP_INFRA_DESIRED_STATE_STAGING: UNMARKED_PATH },
-      "GCP_INFRA_ENVIRONMENT_MISMATCH"],
-    [["readback", "--environment=staging", `--desired-state=${UNMARKED_PATH}`], {}, "GCP_INFRA_ENVIRONMENT_MISMATCH"],
+  // The desired state comes only from the environment's committed file, which must describe it.
+  const staging = (path) => (path === COMMITTED_STAGING ? UNMARKED_TEXT : reader()(path));
+  for (const [argv, readFile, code] of [
+    // The real committed production file waits for OWN-5.
+    [preflight, null, "DESIRED_STATE_PLACEHOLDER_UNFILLED:project"],
+    [preflight, reader("{"), "DESIRED_STATE_UNREADABLE"],
+    [["readback", "--require-clean", "--environment=staging"], staging, "GCP_INFRA_ENVIRONMENT_MISMATCH"],
+    [["readback", "--environment=staging", `--desired-state=${UNMARKED_PATH}`], reader(), "GCP_INFRA_ENVIRONMENT_MISMATCH"],
   ]) {
-    const refused = await run(argv, { gcloud, env: environment });
+    const refused = await run(argv, { gcloud, readFile });
     assert.equal(refused.code, 1, code);
     assert.deepEqual(JSON.parse(refused.err), { status: "error", code }, code);
     assert.equal(refused.out, "", code);
@@ -247,10 +271,54 @@ test("bucket birth is a dry run by default and refuses the synthetic fixture", a
   assert.equal(dry.code, 0);
   assert.equal(JSON.parse(dry.out).status, "dry_run");
   assert.equal(dry.calls.length, 0);
-  const refused = await run(["bucket-birth", `--desired-state=${FIXTURE_PATH}`, "--apply",
-    "--authorize=bucket-birth:synthetic-ops-project:synthetic-ops-quarantine"]);
-  assert.deepEqual(JSON.parse(refused.err), { status: "error", code: "BUCKET_BIRTH_SYNTHETIC_TARGET_REFUSED" });
+  const refused = await run(["bucket-birth", "--environment=production", "--apply",
+    "--authorize=bucket-birth:synthetic-ops-project:synthetic-ops-quarantine"], { readFile: reader(FIXTURE_TEXT) });
+  assert.deepEqual(JSON.parse(refused.err), { status: "error", code: "COMMITTED_DESIRED_STATE_SYNTHETIC" });
   assert.equal(refused.calls.length, 0);
+});
+
+test("the committed desired states render offline: staging's waits are named, production waits for OWN-5", async () => {
+  const staging = await run(["render", "--environment=staging", ...IMAGE], { readFile: null, project: "tibotattle" });
+  assert.equal(staging.code, 0, staging.err);
+  assert.equal(staging.calls.length, 0);
+  const rendered = JSON.parse(staging.out);
+  assert.deepEqual([rendered.environment, rendered.project, rendered.synthetic], ["staging", "tibotattle", false]);
+  assert.deepEqual(rendered.service, { unavailable: "STAGING_SERVICE_TEMPLATE_UNAVAILABLE" });
+  assert.deepEqual(rendered.verifierIam, { unavailable: "VERIFIER_TOKEN_CREATOR_UNASSIGNED" });
+  assert.equal(rendered.jobs["analytics-refresh"].metadata.name, "tibotattle-staging-analytics-refresh");
+  assert.equal(rendered.jobs["analytics-refresh"].spec.template.spec.template.spec.containers[0].env
+    .find((entry) => entry.name === "ANALYTICS_REFRESH_TARGET").value, "staging");
+  assert.doesNotMatch(staging.out, /tibotattle-test|BEGIN PRIVATE KEY/u);
+  for (const command of ["render", "plan", "readback", "scheduler-probe"]) {
+    const production = await run([command, "--environment=production"], { readFile: null });
+    assert.equal(production.code, 1, command);
+    assert.deepEqual(JSON.parse(production.err), { status: "error", code: "DESIRED_STATE_PLACEHOLDER_UNFILLED:project" });
+    assert.equal(production.calls.length, 0, command);
+  }
+});
+
+test("scheduler-probe reads the triggers once and exits 2 on the paused-too-long signal", async () => {
+  const project = "example-ops-prod1";
+  const resumed = UNMARKED_TEXT.replace('"schedule": null', '"schedule": "15 3 * * *"')
+    .replace('"state": "PAUSED"', '"state": "ENABLED"');
+  assert.notEqual(resumed, UNMARKED_TEXT);
+  const gcloud = createFakeGcloud(world(project), { project, region: "us-east1" });
+  gcloud.world.schedulerJobs.push({ name: `projects/${project}/locations/us-east1/jobs/synthetic-analytics-refresh-trigger`,
+    state: "PAUSED", userUpdateTime: "2026-10-02T00:00:00Z" });
+  const now = () => Date.parse("2026-10-02T06:30:00Z");
+  const alerting = await run(["scheduler-probe", "--environment=production"], { gcloud, readFile: reader(resumed), now });
+  assert.equal(alerting.code, 2, alerting.err);
+  const probe = JSON.parse(alerting.out);
+  assert.equal(probe.signal, "SCHEDULER_TRIGGER_PAUSED_TOO_LONG");
+  assert.deepEqual(probe.triggers.map((entry) => [entry.verdict, entry.quietMinutes]), [["paused_too_long", 390]]);
+  assert.deepEqual(gcloud.calls.map((argv) => classifyGcloudCommand(argv)), ["read"]);
+  const early = await run(["scheduler-probe", "--environment=production"], { gcloud, readFile: reader(resumed),
+    now: () => Date.parse("2026-10-02T05:00:00Z") });
+  assert.equal(early.code, 0, early.err);
+  // Before OPS-3 resumes it (desired PAUSED), a paused trigger raises nothing.
+  const prelaunch = await run(["scheduler-probe", `--desired-state=${UNMARKED_PATH}`], { gcloud, now });
+  assert.equal(prelaunch.code, 0, prelaunch.err);
+  assert.equal(JSON.parse(prelaunch.out).triggers[0].verdict, "paused_as_desired");
 });
 
 test("a bad desired state is a named error", async () => {

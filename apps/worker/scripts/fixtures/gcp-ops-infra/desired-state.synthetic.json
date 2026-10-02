@@ -1,6 +1,7 @@
 {
-  "schemaVersion": "tibotattle-gcp-ops-infra-desired-state-v1",
+  "schemaVersion": "tibotattle-gcp-ops-infra-desired-state-v2",
   "environment": "production",
+  "projectTenancy": "dedicated",
   "project": "synthetic-ops-project",
   "projectNumber": "100000000001",
   "region": "us-east1",
@@ -31,7 +32,8 @@
     },
     "verifier": {
       "accountId": "synthetic-verifier",
-      "projectRoles": []
+      "projectRoles": [],
+      "tokenCreators": ["group:synthetic-operators@example.com"]
     }
   },
   "customRole": {
@@ -45,13 +47,13 @@
     ]
   },
   "secrets": {
-    "IDENTITY_LINK_SECRET": { "version": "1" },
-    "POSTGRES_RATE_LIMIT_SECRET": { "version": "1" },
-    "ENVELOPE_PUBLIC_JWK": { "version": "1" },
-    "ENVELOPE_PRIVATE_JWK": { "version": "1" },
-    "GOOGLE_OIDC_CLIENT_SECRET": { "version": "1" },
-    "APPLE_PRIVATE_KEY": { "version": "1" },
-    "DISTRIBUTION_GITHUB_API_TOKEN": { "version": null }
+    "IDENTITY_LINK_SECRET": { "secretName": "IDENTITY_LINK_SECRET", "version": "1" },
+    "POSTGRES_RATE_LIMIT_SECRET": { "secretName": "POSTGRES_RATE_LIMIT_SECRET", "version": "1" },
+    "ENVELOPE_PUBLIC_JWK": { "secretName": "ENVELOPE_PUBLIC_JWK", "version": "1" },
+    "ENVELOPE_PRIVATE_JWK": { "secretName": "ENVELOPE_PRIVATE_JWK", "version": "1" },
+    "GOOGLE_OIDC_CLIENT_SECRET": { "secretName": "GOOGLE_OIDC_CLIENT_SECRET", "version": "1" },
+    "APPLE_PRIVATE_KEY": { "secretName": "APPLE_PRIVATE_KEY", "version": "1" },
+    "DISTRIBUTION_GITHUB_API_TOKEN": { "secretName": "DISTRIBUTION_GITHUB_API_TOKEN", "version": null }
   },
   "cloudSql": {
     "instance": "synthetic-primary",

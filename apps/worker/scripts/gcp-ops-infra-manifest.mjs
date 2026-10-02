@@ -1,5 +1,5 @@
 /**
- * Production infrastructure desired state for the Google Cloud service (OPS-2,
+ * Infrastructure desired state for the Google Cloud service (OPS-2,
  * re-scoped for the fast path).
  *
  * Decision: scripted gcloud over a checked-in desired state, not Terraform.
@@ -14,29 +14,41 @@
  * apply runs only that list under --authorize=<planDigest>. Nothing in this
  * tooling deletes, replaces a policy or edits bucket metadata or bucket IAM.
  *
+ * The desired state is COMMITTED to the repository (owner decision
+ * 2026-10-02): one file per environment under cloud-run/infra/
+ * (COMMITTED_DESIRED_STATE_FILES), with a JSON Schema beside them for
+ * editors and review. The files hold non-secret identifiers only; a secret
+ * is named by its Secret Manager secret and a pinned version number, never
+ * a value, and the validator refuses anything that looks like secret
+ * material. The staging file describes a plane inside the shared GCP test
+ * project (projectTenancy 'shared': co-tenant resources are neither managed
+ * nor removed, and project-wide logging settings are left alone). The
+ * production file keeps its project, project number, region and bucket
+ * location as explicit null placeholders, which the validator refuses
+ * (DESIRED_STATE_PLACEHOLDER_UNFILLED) until the owner fills them (OWN-5).
+ *
  * Topology: one Cloud SQL PostgreSQL 17 ENTERPRISE instance, zonal, with no
  * replica, no high availability and no deletion-ledger instance (append-only
  * decision record 2026-09-26, D2 and D4). Hostnames stay at the Cloudflare
  * edge (D5): the origin is the IAM-private Cloud Run service rendered from
- * EP-7's template, invoked only by the edge-invoker account (and an optional
- * verifier). The fast path renders exactly two Cloud Run Jobs (JOB_NAMES):
- * the OPS-10 production migration and the analytics-refresh job, whose
- * Cloud Scheduler cadence the owner supplies (decision D3; there is no
- * default) and whose trigger state is closed: PAUSED until OPS-3 resumes it.
- * The analytics-refresh job and trigger are deferred (DEFERRED_JOBS) while
- * cloud-run/analytics-refresh.mjs refuses every non-test target. Probe,
- * restore-verify, ledger and Worker-era analytics jobs are not rendered.
+ * EP-7's template, invoked only by the edge-invoker account and the
+ * read-only verifier (OD-CR-7), whose ID tokens the operator mints through a
+ * roles/iam.serviceAccountTokenCreator grant on the verifier alone. The fast
+ * path renders exactly two Cloud Run Jobs (JOB_NAMES): the OPS-10 production
+ * migration and the analytics-refresh job, in the production refresh-job
+ * contract (ANALYTICS_REFRESH_JOB_CONTRACT, the dense task profile until
+ * MEAS-3), whose Cloud Scheduler cadence the owner supplies (decision D3;
+ * there is no default) and whose trigger state is closed: created and paused
+ * in one apply, and resumed only explicitly (OPS-3). Probe, restore-verify,
+ * ledger and Worker-era analytics jobs are not rendered.
  *
  * This module is pure: it validates a desired-state object and renders the
- * resource specifications from it. It reads only repository files (the EP-7
- * templates and the GCS store sources it parses for the custom role), never a
- * live resource, and never a secret value. The one exception is
- * rolloutTarget(environment), OPS-10's entry point, which reads the path of
- * the environment's owner-held desired-state file from one named variable
- * (DESIRED_STATE_PATH_VARIABLES). The real production identifiers are
- * owner-held; the repository ships only a synthetic fixture
- * (fixtures/gcp-ops-infra/), whose project marker apply and rolloutTarget
- * refuse.
+ * resource specifications from it. It reads only repository files (the
+ * committed desired states, the EP-7 templates, analytics-refresh.mjs and the
+ * GCS store sources it parses for the custom role), never a live resource,
+ * never the process environment and never a secret value. The repository
+ * also ships a synthetic fixture (fixtures/gcp-ops-infra/), whose project
+ * marker apply and rolloutTarget refuse.
  *
  * Every refusal throws an Error whose message and `code` are the same named
  * constant (a code may carry a ':<path>' suffix naming the setting).
@@ -44,7 +56,7 @@
 
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { canonicalJson } from "../src/canonical-json.ts";
 import { CLOUD_RUN_IAM_TEST_TARGET } from "../cloud-run/postgres-test-dispatch.mjs";
@@ -77,41 +89,81 @@ import { FASTPATH_TEST } from "./gcp-fastpath-test-deploy.mjs";
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
-export const GCP_OPS_INFRA_DESIRED_STATE_SCHEMA = "tibotattle-gcp-ops-infra-desired-state-v1";
+export const GCP_OPS_INFRA_DESIRED_STATE_SCHEMA = "tibotattle-gcp-ops-infra-desired-state-v2";
 export const GCP_OPS_INFRA_ENVIRONMENTS = Object.freeze(["production", "staging"]);
+
+/**
+ * The committed desired state of each environment, relative to apps/worker.
+ * These files are the only desired states an apply, a bucket birth or an
+ * OPS-10 rollout target reads (owner decision 2026-10-02: commit it to the
+ * repository; non-secret identifiers only).
+ */
+export const COMMITTED_DESIRED_STATE_FILES = Object.freeze({
+  production: "cloud-run/infra/production.desired-state.json",
+  staging: "cloud-run/infra/staging.desired-state.json",
+});
+/** The JSON Schema of the committed files (editor and review aid; this validator is authoritative). */
+export const DESIRED_STATE_JSON_SCHEMA_FILE = "cloud-run/infra/desired-state.schema.json";
+
+/**
+ * Settings a committed file may leave as explicit null placeholders until the
+ * owner assigns them (OWN-5 for production). The validator refuses any of
+ * them while null (DESIRED_STATE_PLACEHOLDER_UNFILLED:<path>), so a file with
+ * a placeholder can be reviewed but never planned, applied or rolled out.
+ */
+export const OWNER_PLACEHOLDER_PATHS = Object.freeze(["project", "projectNumber", "region", "bucket.location"]);
+
+/**
+ * How the plane shares its GCP project. 'dedicated': the project holds this
+ * plane only, so any other Cloud SQL instance, Cloud Run service or job, or
+ * scheduler trigger is drift (a delete apply refuses), and the project-wide
+ * logging posture is managed. 'shared' (staging in the GCP test project):
+ * co-tenant resources are not read into the plan and never removed, and
+ * project-wide settings (the _Default log sink and bucket, Data Access audit
+ * logs) are left alone. Production is always dedicated.
+ */
+export const PROJECT_TENANCIES = Object.freeze(["dedicated", "shared"]);
 
 /** The fast-path Cloud Run Jobs, and nothing else (OPS-3-lite). */
 export const JOB_NAMES = Object.freeze(["production-migrate", "analytics-refresh"]);
 /** Jobs a Cloud Scheduler trigger runs. production-migrate is manual (OPS-10). */
 export const SCHEDULED_JOB_NAMES = Object.freeze(["analytics-refresh"]);
 /**
- * The trigger states a desired state may name. PAUSED until OPS-3 resumes the
+ * The trigger states a desired state may name. Apply creates a trigger and
+ * pauses it in the same apply, whatever its desired state, and binds the
+ * scheduler account's run.jobsExecutor only after that pause, so a trigger
+ * whose pause failed cannot start the job. PAUSED until OPS-3 resumes the
  * trigger; ENABLED records that it has. Apply never resumes: it pauses a live
  * trigger that runs while PAUSED is desired, and leaves a resume to OPS-3.
  */
 export const SCHEDULER_TRIGGER_STATES = Object.freeze(["PAUSED", "ENABLED"]);
 
 /**
- * Jobs whose create, and whose trigger's create, OPS-2 defers, with the
- * reason. cloud-run/analytics-refresh.mjs resolves its database only to the
- * private test targets inside a Cloud Run Job and refuses everything else
- * with ANALYTICS_V2_REFRESH_TARGET_FORBIDDEN, so a production or staging
- * analytics-refresh Job could never run. The manifest check pins that
- * refusal: once the entry gains a reviewed production target path, that
- * check fails, and this entry is removed with it.
+ * The paused-too-long signal (owner decision 2026-10-02: alert when the
+ * trigger stays paused for more than a few hours; proposed 6 h). The
+ * scheduler probe (gcp-infra.mjs scheduler-probe) reports
+ * SCHEDULER_TRIGGER_PAUSED_TOO_LONG when a trigger whose desired state is
+ * ENABLED is live PAUSED and neither a user change nor an attempt is newer
+ * than this threshold.
  */
-export const DEFERRED_JOBS = Object.freeze({
-  "analytics-refresh": "ANALYTICS_REFRESH_PRODUCTION_TARGET_UNAVAILABLE",
-});
+export const SCHEDULER_PAUSE_ALERT_THRESHOLD_HOURS = 6;
 
 /**
- * The variable naming each environment's owner-held desired-state file (an
- * absolute path outside the repository), read only by rolloutTarget and by
- * the CLI's --environment form.
+ * Jobs whose create, and whose trigger's create, OPS-2 defers, with the
+ * reason. None today: the analytics-refresh deferral was lifted when the
+ * production refresh-job contract (ANALYTICS_REFRESH_JOB_CONTRACT) was
+ * defined. The mechanism stays for a job whose entry cannot yet run.
  */
-export const DESIRED_STATE_PATH_VARIABLES = Object.freeze({
-  production: "GCP_INFRA_DESIRED_STATE_PRODUCTION",
-  staging: "GCP_INFRA_DESIRED_STATE_STAGING",
+export const DEFERRED_JOBS = Object.freeze({});
+
+/**
+ * Services OPS-2 cannot render yet, by environment, with the reason. EP-7's
+ * template is the production profile (HOST_MODE production, the production
+ * public origin), and CR-3 refuses it under staging-marked names, so a
+ * staging service waits for a staging service template (D-CRB, OD-CR-8).
+ */
+export const SERVICE_TEMPLATE_UNAVAILABLE = Object.freeze({
+  staging: "STAGING_SERVICE_TEMPLATE_UNAVAILABLE",
 });
 
 export const SERVICE_ACCOUNT_ROLES = Object.freeze([
@@ -150,6 +202,8 @@ export const SECRET_ACCESSOR_ROLE = "roles/secretmanager.secretAccessor";
 export const ARTIFACT_WRITER_ROLE = "roles/artifactregistry.writer";
 export const RUN_INVOKER_ROLE = "roles/run.invoker";
 export const JOBS_EXECUTOR_ROLE = "roles/run.jobsExecutor";
+/** The operator's grant on the verifier account alone (OD-CR-7): mint its ID tokens. */
+export const TOKEN_CREATOR_ROLE = "roles/iam.serviceAccountTokenCreator";
 
 /** Fixed Cloud SQL posture (decision D4); the desired state cannot override it. */
 export const CLOUD_SQL_POSTURE = Object.freeze({
@@ -206,6 +260,47 @@ export const LOGGING_POSTURE = Object.freeze({
   dataAccessAuditOffServices: Object.freeze(["cloudsql.googleapis.com", "storage.googleapis.com"]),
 });
 
+/**
+ * The analytics-refresh task profile. The default production profile is the
+ * dense one (4 vCPU, 16 GiB, a 12288 MiB heap, a 4 h task timeout) until the
+ * largest real owner is measured on Cloud Run (MEAS-3). The per-owner memory
+ * budget keeps analytics-refresh.mjs's own default ratio (4608 of a 6144 MiB
+ * heap) and leaves its heap reserve (512 MiB plus 4 KiB per default
+ * read-chunk occurrence) inside the heap; the manifest check proves both
+ * against that module's exported bounds.
+ */
+export const ANALYTICS_REFRESH_TASK_PROFILE = Object.freeze({
+  name: "dense",
+  cpu: "4",
+  memory: "16Gi",
+  heapMiB: 12_288,
+  memoryBudgetMiB: 9_216,
+  timeoutSeconds: 14_400,
+});
+
+/**
+ * The production refresh-job contract (C-REFRESH implements it; OPS-2
+ * renders it). Invocation: node --max-old-space-size=<heap>
+ * dist/analytics-refresh.mjs --mode=full, with no --schema and no --now; the
+ * real clock is used. Configuration comes from exactly the closed env below.
+ * DEPLOYMENT_SOURCE_COMMIT is deployment provenance, not configuration: OPS-2
+ * renders it and OPS-10's roll moves it on every job. ANALYTICS_V2_TEST_CLOCK
+ * and every test or rehearsal setting are refused under production or
+ * staging, so a render never carries one.
+ */
+export const ANALYTICS_REFRESH_JOB_CONTRACT = Object.freeze({
+  entry: "dist/analytics-refresh.mjs",
+  mode: "--mode=full",
+  configurationEnv: Object.freeze([
+    "ANALYTICS_REFRESH_TARGET", "PRIMARY_INSTANCE_CONNECTION_NAME", "PRIMARY_DATABASE", "PRIMARY_SCHEMA",
+    "POSTGRES_IAM_USER", "ANALYTICS_V2_MEMORY_BUDGET_MIB",
+  ]),
+  provenanceEnv: Object.freeze(["DEPLOYMENT_SOURCE_COMMIT"]),
+  refusedArguments: Object.freeze(["--schema", "--now"]),
+  refusedEnv: Object.freeze(["ANALYTICS_V2_TEST_CLOCK", "POSTGRES_TEST_HTTP_MODE", "PG_TEST_SOCKET", "PG_TEST_HOST",
+    "PG_TEST_PORT", "PG_TEST_USER", "PG_TEST_DATABASE", "PG_TEST_PASSWORD"]),
+});
+
 /** Cloud Run Job definitions for the fast path (rendered only; OPS-3-lite). */
 export const JOB_DEFINITIONS = Object.freeze({
   // OPS-10's PRODUCTION_MIGRATION_JOB (cloud-run/postgres-production-
@@ -222,17 +317,17 @@ export const JOB_DEFINITIONS = Object.freeze({
     memory: "512Mi",
     env: PRODUCTION_MIGRATION_JOB.env,
   }),
-  // cloud-run/analytics-refresh.mjs: one full recompute (the only mode).
+  // cloud-run/analytics-refresh.mjs: one full recompute (the only mode), in
+  // the production refresh-job contract and the dense task profile.
   "analytics-refresh": Object.freeze({
     account: "runtime",
-    args: Object.freeze(["dist/analytics-refresh.mjs", "--mode=full"]),
-    timeoutSeconds: 3_600,
-    cpu: "2",
-    memory: "4Gi",
-    env: Object.freeze([
-      "PRIMARY_INSTANCE_CONNECTION_NAME", "PRIMARY_DATABASE", "PRIMARY_SCHEMA",
-      "POSTGRES_IAM_USER", "DEPLOYMENT_SOURCE_COMMIT",
-    ]),
+    args: Object.freeze([`--max-old-space-size=${ANALYTICS_REFRESH_TASK_PROFILE.heapMiB}`,
+      ANALYTICS_REFRESH_JOB_CONTRACT.entry, ANALYTICS_REFRESH_JOB_CONTRACT.mode]),
+    timeoutSeconds: ANALYTICS_REFRESH_TASK_PROFILE.timeoutSeconds,
+    cpu: ANALYTICS_REFRESH_TASK_PROFILE.cpu,
+    memory: ANALYTICS_REFRESH_TASK_PROFILE.memory,
+    env: Object.freeze([...ANALYTICS_REFRESH_JOB_CONTRACT.configurationEnv,
+      ...ANALYTICS_REFRESH_JOB_CONTRACT.provenanceEnv]),
   }),
 });
 
@@ -271,6 +366,11 @@ const NAMESPACE = /^[A-Za-z0-9._:-]{1,256}$/u;
 const IMAGE_DIGEST = /^[a-f0-9]{64}$/u;
 const SOURCE_COMMIT = /^[a-f0-9]{40}$/u;
 const PERMISSION = /^[a-z][a-zA-Z0-9]*(?:\.[a-zA-Z0-9]+){2}$/u;
+/** A Secret Manager secret id. */
+const SECRET_ID = /^[A-Za-z0-9_-]{1,255}$/u;
+/** An IAM principal that may mint the verifier's tokens: a user, a group or a service account. */
+const TOKEN_CREATOR_MEMBER = /^(?:user|group|serviceAccount):[A-Za-z0-9._%+-]{1,64}@[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}$/u;
+const MAX_TOKEN_CREATORS = 4;
 const MAX_GENERATION = 9_223_372_036_854_775_807n;
 
 export class GcpOpsInfraError extends Error {
@@ -516,10 +616,32 @@ export function analyticsRefreshPoolMax({ readSource = defaultReadSource } = {})
 // ---------------------------------------------------------------------------
 // Desired-state validation
 
-const DESIRED_KEYS = Object.freeze([
-  "schemaVersion", "environment", "project", "projectNumber", "region", "artifactRegistry",
-  "serviceAccounts", "customRole", "secrets", "cloudSql", "bucket", "service", "jobs", "scheduler",
-]);
+/**
+ * The closed key set of every object in a desired state, by kind. The
+ * validator enforces exactly these sets, and the manifest check holds the
+ * committed JSON Schema to them, so the two cannot drift. The keyed maps
+ * (serviceAccounts, secrets, jobs, scheduler) are closed over
+ * SERVICE_ACCOUNT_ROLES, CR-3's secret names, JOB_NAMES and
+ * SCHEDULED_JOB_NAMES.
+ */
+export const DESIRED_STATE_SHAPE = Object.freeze({
+  desiredState: Object.freeze([
+    "schemaVersion", "environment", "projectTenancy", "project", "projectNumber", "region", "artifactRegistry",
+    "serviceAccounts", "customRole", "secrets", "cloudSql", "bucket", "service", "jobs", "scheduler",
+  ]),
+  artifactRegistry: Object.freeze(["repository", "imageName"]),
+  serviceAccount: Object.freeze(["accountId", "projectRoles"]),
+  verifier: Object.freeze(["accountId", "projectRoles", "tokenCreators"]),
+  customRole: Object.freeze(["id", "permissions"]),
+  secret: Object.freeze(["secretName", "version"]),
+  cloudSql: Object.freeze(["instance", "tier", "storageSizeGb", "backupStartTime", "maxConnections", "database",
+    "schema"]),
+  bucket: Object.freeze(["name", "location", "proof"]),
+  bucketProof: Object.freeze(["bucketGeneration", "bucketMetageneration"]),
+  service: Object.freeze(["name", "maxInstances", "rolloutOverlapInstances", "audience", "telemetryStorageNamespace"]),
+  job: Object.freeze(["name", "maxConnections"]),
+  trigger: Object.freeze(["name", "schedule", "state"]),
+});
 
 function closedKeys(value, keys, path) {
   if (!isRecord(value)) fail(`DESIRED_STATE_SHAPE_INVALID:${path}`);
@@ -569,8 +691,73 @@ function refuseLedger(value, path = "desiredState") {
   }
 }
 
+/**
+ * Keys that would hold a secret value, a key or a credential. The desired
+ * state names Secret Manager secrets and pinned version numbers only, so
+ * none of these may appear at any depth.
+ */
+export const SECRET_VALUE_KEYS = Object.freeze([
+  "value", "secretValue", "data", "payload", "plaintext", "password", "passphrase", "privateKey", "private_key",
+  "clientSecret", "client_secret", "token", "accessToken", "refreshToken", "apiKey", "key", "keyJson",
+  "credentials", "jwk", "d",
+]);
+
+/** Strings that look like secret material rather than an identifier. */
+function looksLikeSecret(value) {
+  if (value.length > 256) return true;
+  if (/-----BEGIN [A-Z ]+-----|"(?:kty|private_key|client_secret|refresh_token)"/u.test(value)) return true;
+  if (/AIza[0-9A-Za-z_-]{35}|ya29\.|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_|xox[abpr]-|sk-[A-Za-z0-9]{16,}/u.test(value)) {
+    return true;
+  }
+  // A long token of mixed case and digits is a credential, not a resource name.
+  return /^[A-Za-z0-9+/_=-]{32,}$/u.test(value) && /[A-Z]/u.test(value) && /[a-z]/u.test(value)
+    && /[0-9]/u.test(value);
+}
+
+/**
+ * Refuses secret material anywhere in a desired state, before any shape
+ * check: a secret-valued key, or a string that looks like a key, a token or
+ * a JWK. Committed files hold non-secret identifiers only.
+ */
+function refuseSecretMaterial(value, path = "desiredState") {
+  if (typeof value === "string") {
+    if (looksLikeSecret(value)) fail(`DESIRED_STATE_SECRET_VALUE_FORBIDDEN:${path}`);
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) => refuseSecretMaterial(entry, `${path}[${index}]`));
+    return;
+  }
+  if (value !== null && typeof value === "object") {
+    for (const [key, entry] of Object.entries(value)) {
+      if (SECRET_VALUE_KEYS.includes(key)) fail(`DESIRED_STATE_SECRET_VALUE_FORBIDDEN:${path}.${key}`);
+      refuseSecretMaterial(entry, `${path}.${key}`);
+    }
+  }
+}
+
+/** The owner-assigned placeholders still null, in OWNER_PLACEHOLDER_PATHS order. */
+export function unfilledPlaceholders(input) {
+  if (!isRecord(input)) return Object.freeze([]);
+  return Object.freeze(OWNER_PLACEHOLDER_PATHS.filter((path) => {
+    const [head, tail] = path.split(".");
+    const holder = tail === undefined ? input : input[head];
+    return isRecord(holder) && Object.hasOwn(holder, tail ?? head) && holder[tail ?? head] === null;
+  }));
+}
+
+function tokenCreators(value, path) {
+  if (value === null) return null;
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_TOKEN_CREATORS
+      || value.some((member) => typeof member !== "string" || !TOKEN_CREATOR_MEMBER.test(member))
+      || new Set(value).size !== value.length) {
+    fail(`DESIRED_STATE_VALUE_INVALID:${path}`);
+  }
+  return Object.freeze([...value].sort());
+}
+
 function serviceAccount(value, role, path) {
-  closedKeys(value, ["accountId", "projectRoles"], path);
+  closedKeys(value, role === "verifier" ? DESIRED_STATE_SHAPE.verifier : DESIRED_STATE_SHAPE.serviceAccount, path);
   const accountId = text(value.accountId, ACCOUNT_ID, `${path}.accountId`);
   if (!Array.isArray(value.projectRoles) || value.projectRoles.some((roleName) => typeof roleName !== "string")) {
     fail(`DESIRED_STATE_VALUE_INVALID:${path}.projectRoles`);
@@ -584,7 +771,9 @@ function serviceAccount(value, role, path) {
       || [...roles].sort().join() !== [...PROJECT_ROLE_POLICY[role]].sort().join()) {
     fail(`IAM_PROJECT_ROLES_MISMATCH:${role}`);
   }
-  return { accountId, projectRoles: Object.freeze([...PROJECT_ROLE_POLICY[role]]) };
+  const account = { accountId, projectRoles: Object.freeze([...PROJECT_ROLE_POLICY[role]]) };
+  if (role === "verifier") account.tokenCreators = tokenCreators(value.tokenCreators, `${path}.tokenCreators`);
+  return account;
 }
 
 /** Five-field cron, minutes to day of week, with lists, ranges and steps. */
@@ -670,6 +859,7 @@ export function connectionBudget({ service, jobs, cloudSql }) {
 export function validateDesiredState(input, { readSource = defaultReadSource } = {}) {
   if (!isRecord(input)) fail("DESIRED_STATE_SHAPE_INVALID:desiredState");
   refuseLedger(input);
+  refuseSecretMaterial(input);
   // Specific refusals before the generic closed-key rule.
   if (Array.isArray(input.cloudSql)) {
     fail(input.cloudSql.length > 1 ? "CLOUD_SQL_SECOND_INSTANCE_FORBIDDEN" : "DESIRED_STATE_SHAPE_INVALID:cloudSql");
@@ -692,17 +882,23 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
       }
     }
   }
-  closedKeys(input, DESIRED_KEYS, "desiredState");
+  closedKeys(input, DESIRED_STATE_SHAPE.desiredState, "desiredState");
   if (input.schemaVersion !== GCP_OPS_INFRA_DESIRED_STATE_SCHEMA) fail("DESIRED_STATE_SCHEMA_INVALID");
   if (!GCP_OPS_INFRA_ENVIRONMENTS.includes(input.environment)) {
     fail("DESIRED_STATE_VALUE_INVALID:desiredState.environment");
   }
   const environment = input.environment;
+  // An owner placeholder is reviewable but never usable (OWN-5).
+  const unfilled = unfilledPlaceholders(input);
+  if (unfilled.length > 0) fail(`DESIRED_STATE_PLACEHOLDER_UNFILLED:${unfilled[0]}`);
+  if (!PROJECT_TENANCIES.includes(input.projectTenancy)) fail("DESIRED_STATE_VALUE_INVALID:desiredState.projectTenancy");
+  const projectTenancy = input.projectTenancy;
+  if (environment === "production" && projectTenancy !== "dedicated") fail("PROJECT_TENANCY_SHARED_FORBIDDEN:production");
   const project = text(input.project, PROJECT_ID, "desiredState.project");
   const projectNumber = text(input.projectNumber, PROJECT_NUMBER, "desiredState.projectNumber");
   const region = text(input.region, REGION, "desiredState.region");
 
-  closedKeys(input.artifactRegistry, ["repository", "imageName"], "artifactRegistry");
+  closedKeys(input.artifactRegistry, DESIRED_STATE_SHAPE.artifactRegistry, "artifactRegistry");
   const artifactRegistry = {
     repository: text(input.artifactRegistry.repository, REPOSITORY_NAME, "artifactRegistry.repository"),
     imageName: text(input.artifactRegistry.imageName, IMAGE_NAME, "artifactRegistry.imageName"),
@@ -724,8 +920,13 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
   }
   const accountIds = Object.values(serviceAccounts).filter(Boolean).map((account) => account.accountId);
   if (new Set(accountIds).size !== accountIds.length) fail("SERVICE_ACCOUNTS_NOT_DISTINCT");
+  // The operator mints the verifier's tokens; no account of the plane may.
+  const managedMembers = Object.values(serviceAccounts).filter(Boolean).map((account) => account.member);
+  if ((serviceAccounts.verifier?.tokenCreators ?? []).some((member) => managedMembers.includes(member))) {
+    fail("VERIFIER_TOKEN_CREATOR_MANAGED_ACCOUNT_FORBIDDEN");
+  }
 
-  closedKeys(input.customRole, ["id", "permissions"], "customRole");
+  closedKeys(input.customRole, DESIRED_STATE_SHAPE.customRole, "customRole");
   if (input.customRole.id !== QUARANTINE_STORE_ROLE_ID) fail("CUSTOM_ROLE_ID_INVALID");
   if (!Array.isArray(input.customRole.permissions)
       || input.customRole.permissions.some((permission) => typeof permission !== "string"
@@ -743,7 +944,8 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
     permissions: parsedPermissions,
   };
 
-  // Secret Manager containers: exactly CR-3's required and optional names.
+  // Secret Manager secrets: exactly CR-3's required and optional names, each
+  // named by its Secret Manager secret id and a pinned version number.
   if (!isRecord(input.secrets)) fail("DESIRED_STATE_SHAPE_INVALID:secrets");
   const secretNames = [...REQUIRED_SECRET_NAMES, ...OPTIONAL_SECRET_NAMES];
   for (const name of Object.keys(input.secrets)) {
@@ -752,14 +954,16 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
   const secrets = {};
   for (const name of secretNames) {
     if (!Object.hasOwn(input.secrets, name)) fail(`SECRET_CONTAINER_MISSING:${name}`);
-    closedKeys(input.secrets[name], ["version"], `secrets.${name}`);
+    closedKeys(input.secrets[name], DESIRED_STATE_SHAPE.secret, `secrets.${name}`);
+    const secretName = text(input.secrets[name].secretName, SECRET_ID, `secrets.${name}.secretName`);
     const version = input.secrets[name].version;
     if (version !== null) text(version, SECRET_VERSION, `secrets.${name}.version`);
-    secrets[name] = { version, required: REQUIRED_SECRET_NAMES.includes(name) };
+    secrets[name] = { secretName, version, required: REQUIRED_SECRET_NAMES.includes(name) };
   }
+  const secretIds = Object.values(secrets).map((secret) => secret.secretName);
+  if (new Set(secretIds).size !== secretIds.length) fail("SECRET_NAMES_NOT_DISTINCT");
 
-  closedKeys(input.cloudSql, ["instance", "tier", "storageSizeGb", "backupStartTime", "maxConnections",
-    "database", "schema"], "cloudSql");
+  closedKeys(input.cloudSql, DESIRED_STATE_SHAPE.cloudSql, "cloudSql");
   const cloudSql = {
     instance: text(input.cloudSql.instance, CLOUD_SQL_INSTANCE_ID, "cloudSql.instance"),
     tier: text(input.cloudSql.tier, CUSTOM_TIER, "cloudSql.tier"),
@@ -774,7 +978,7 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
   }
   cloudSql.connectionName = `${project}:${region}:${cloudSql.instance}`;
 
-  closedKeys(input.bucket, ["name", "location", "proof"], "bucket");
+  closedKeys(input.bucket, DESIRED_STATE_SHAPE.bucket, "bucket");
   const bucket = {
     name: text(input.bucket.name, BUCKET_NAME, "bucket.name"),
     location: text(input.bucket.location, /^[A-Z]+-[A-Z]+[0-9]{1,2}$/u, "bucket.location"),
@@ -782,22 +986,23 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
   };
   if (bucket.location !== region.toUpperCase()) fail("BUCKET_LOCATION_NOT_REGION");
   if (input.bucket.proof !== null) {
-    closedKeys(input.bucket.proof, ["bucketGeneration", "bucketMetageneration"], "bucket.proof");
+    closedKeys(input.bucket.proof, DESIRED_STATE_SHAPE.bucketProof, "bucket.proof");
     bucket.proof = {
       bucketGeneration: generation(input.bucket.proof.bucketGeneration, "bucket.proof.bucketGeneration"),
       bucketMetageneration: generation(input.bucket.proof.bucketMetageneration, "bucket.proof.bucketMetageneration"),
     };
   }
 
-  closedKeys(input.service, ["name", "maxInstances", "rolloutOverlapInstances", "audience",
-    "telemetryStorageNamespace"], "service");
+  closedKeys(input.service, DESIRED_STATE_SHAPE.service, "service");
   const service = {
     name: text(input.service.name, RESOURCE_NAME, "service.name"),
     maxInstances: integer(input.service.maxInstances, 1, 100, "service.maxInstances"),
     rolloutOverlapInstances: integer(input.service.rolloutOverlapInstances, 1, 100, "service.rolloutOverlapInstances"),
     audience: text(input.service.audience, AUDIENCE, "service.audience"),
-    telemetryStorageNamespace: text(input.service.telemetryStorageNamespace, NAMESPACE,
-      "service.telemetryStorageNamespace"),
+    // null until assigned: it must equal the namespace the imported data
+    // carries, so the service cannot render without it.
+    telemetryStorageNamespace: input.service.telemetryStorageNamespace === null ? null
+      : text(input.service.telemetryStorageNamespace, NAMESPACE, "service.telemetryStorageNamespace"),
   };
   if (/["'\\$]/u.test(service.audience)) fail("DESIRED_STATE_VALUE_INVALID:service.audience");
   if (service.rolloutOverlapInstances > service.maxInstances) {
@@ -810,7 +1015,7 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
   }
   const jobs = {};
   for (const job of JOB_NAMES) {
-    closedKeys(input.jobs[job], ["name", "maxConnections"], `jobs.${job}`);
+    closedKeys(input.jobs[job], DESIRED_STATE_SHAPE.job, `jobs.${job}`);
     jobs[job] = {
       name: text(input.jobs[job].name, RESOURCE_NAME, `jobs.${job}.name`),
       maxConnections: integer(input.jobs[job].maxConnections, 1, 50, `jobs.${job}.maxConnections`),
@@ -829,7 +1034,7 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
   }
   const scheduler = {};
   for (const job of SCHEDULED_JOB_NAMES) {
-    closedKeys(input.scheduler[job], ["name", "schedule", "state"], `scheduler.${job}`);
+    closedKeys(input.scheduler[job], DESIRED_STATE_SHAPE.trigger, `scheduler.${job}`);
     const schedule = input.scheduler[job].schedule;
     // No default cadence: null means not yet decided (D3), and nothing is created.
     if (schedule !== null && !validCron(schedule)) fail(`SCHEDULER_CADENCE_INVALID:${job}`);
@@ -849,13 +1054,16 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
   const migratorIamUser = serviceAccounts.migrator.email.slice(0, -".gserviceaccount.com".length);
 
   const names = [
-    ["project", project],
+    // A shared plane lives in a test-estate project by design; every
+    // resource it names must still be its own.
+    ...(projectTenancy === "shared" ? [] : [["project", project]]),
     ["artifactRegistry.repository", artifactRegistry.repository],
     ["artifactRegistry.imageRepository", artifactRegistry.imageRepository],
     ["cloudSql.database", cloudSql.database],
     ["cloudSql.schema", cloudSql.schema],
     ["service.audience", service.audience],
-    ["service.telemetryStorageNamespace", service.telemetryStorageNamespace],
+    ...(service.telemetryStorageNamespace === null ? []
+      : [["service.telemetryStorageNamespace", service.telemetryStorageNamespace]]),
     ...Object.entries(serviceAccounts).filter(([, account]) => account !== null)
       .flatMap(([role, account]) => [[`serviceAccounts.${role}.accountId`, account.accountId],
         [`serviceAccounts.${role}.email`, account.email]]),
@@ -872,6 +1080,8 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
     ["plane:service.name", service.name],
     ...JOB_NAMES.map((job) => [`plane:jobs.${job}.name`, jobs[job].name]),
     ...SCHEDULED_JOB_NAMES.map((job) => [`plane:scheduler.${job}.name`, scheduler[job].name]),
+    // Secret Manager ids are project-wide: each one is the plane's own.
+    ...secretNames.map((name) => [`plane:secrets.${name}.secretName`, secrets[name].secretName]),
     ["cloudSql.connectionName", cloudSql.connectionName],
   ];
   nameChecks(names, environment);
@@ -887,6 +1097,7 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
   const desired = {
     schemaVersion: GCP_OPS_INFRA_DESIRED_STATE_SCHEMA,
     environment,
+    projectTenancy,
     project,
     projectNumber,
     region,
@@ -1092,9 +1303,50 @@ export function renderServiceTemplateValues(values, { templateText } = {}) {
   return deepFreeze(service);
 }
 
+/**
+ * Why the desired service cannot be rendered for any image, or null: the
+ * environment has no service template yet (SERVICE_TEMPLATE_UNAVAILABLE), or
+ * the telemetry storage namespace is unassigned.
+ */
+export function serviceRenderBlocker(desired) {
+  if (Object.hasOwn(SERVICE_TEMPLATE_UNAVAILABLE, desired.environment)) {
+    return SERVICE_TEMPLATE_UNAVAILABLE[desired.environment];
+  }
+  if (desired.service.telemetryStorageNamespace === null) return "TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED";
+  return null;
+}
+
+/**
+ * Points each secretKeyRef of a rendered service at the desired state's
+ * Secret Manager secret for that variable (EP-7's template names the
+ * variable; the secret id is the desired state's), and checks the result:
+ * every reference is the mapped secret at a pinned version.
+ */
+function withSecretNames(service, secrets) {
+  const container = service.spec.template.spec.containers[0];
+  const env = container.env.map((entry) => {
+    if (entry.valueFrom?.secretKeyRef === undefined) return entry;
+    const secret = secrets[entry.name];
+    if (secret === undefined) fail("SERVICE_RENDER_INVARIANT_BROKEN");
+    return { ...entry, valueFrom: { secretKeyRef: { ...entry.valueFrom.secretKeyRef, name: secret.secretName } } };
+  });
+  const renamed = structuredClone(service);
+  renamed.spec.template.spec.containers[0].env = env;
+  for (const entry of env) {
+    const reference = entry.valueFrom?.secretKeyRef;
+    if (reference !== undefined && (reference.name !== secrets[entry.name].secretName
+        || reference.key !== secrets[entry.name].version)) {
+      fail("SERVICE_RENDER_INVARIANT_BROKEN");
+    }
+  }
+  return deepFreeze(renamed);
+}
+
 /** Renders the desired service for an image (live or bootstrap). */
 export function renderService(desired, image, options = {}) {
-  return renderServiceTemplateValues(serviceTemplateValues(desired, image), options);
+  const blocker = serviceRenderBlocker(desired);
+  if (blocker !== null) fail(blocker);
+  return withSecretNames(renderServiceTemplateValues(serviceTemplateValues(desired, image), options), desired.secrets);
 }
 
 function assertServiceInvariants(service) {
@@ -1156,6 +1408,8 @@ export function renderEdgeIamPolicy(desired, { templateText } = {}) {
 /** One job's env as name/value pairs, in definition order. */
 function jobEnv(desired, job, sourceCommit) {
   const values = {
+    ANALYTICS_REFRESH_TARGET: desired.environment,
+    ANALYTICS_V2_MEMORY_BUDGET_MIB: String(ANALYTICS_REFRESH_TASK_PROFILE.memoryBudgetMiB),
     MIGRATION_ENVIRONMENT: desired.environment,
     GOOGLE_CLOUD_PROJECT: desired.project,
     PRODUCTION_MIGRATOR_SERVICE_ACCOUNT: desired.serviceAccounts.migrator.email,
@@ -1170,7 +1424,10 @@ function jobEnv(desired, job, sourceCommit) {
     POSTGRES_RUNTIME_IAM_USER: desired.cloudSql.runtimeIamUser,
     DEPLOYMENT_SOURCE_COMMIT: sourceCommit,
   };
-  return JOB_DEFINITIONS[job].env.map((name) => ({ name, value: values[name] }));
+  return JOB_DEFINITIONS[job].env.map((name) => {
+    if (!Object.hasOwn(values, name)) fail(`JOB_RENDER_ENV_UNRESOLVED:${name}`);
+    return { name, value: values[name] };
+  });
 }
 
 /** A Cloud Run Job (run.googleapis.com/v1) for `gcloud run jobs replace`. */
@@ -1331,16 +1588,34 @@ export function readDesiredStateFile(path, { readFile = (target) => readFileSync
   return validateDesiredState(parsed, readSource === undefined ? {} : { readSource });
 }
 
-/**
- * The absolute path of an environment's owner-held desired-state file, from
- * its DESIRED_STATE_PATH_VARIABLES entry in `env`.
- */
-export function desiredStatePathFor(environment, env) {
+/** The absolute path of an environment's committed desired-state file. */
+export function committedDesiredStatePath(environment) {
   if (!GCP_OPS_INFRA_ENVIRONMENTS.includes(environment)) fail("GCP_INFRA_ENVIRONMENT_INVALID");
-  const path = env !== null && typeof env === "object" ? env[DESIRED_STATE_PATH_VARIABLES[environment]] : undefined;
-  if (typeof path !== "string" || path.length === 0) fail("GCP_INFRA_DESIRED_STATE_UNCONFIGURED");
-  if (!isAbsolute(path)) fail("GCP_INFRA_DESIRED_STATE_PATH_INVALID");
-  return path;
+  return resolve(WORKER_ROOT, COMMITTED_DESIRED_STATE_FILES[environment]);
+}
+
+/**
+ * The committed-file policy on top of the validator: a committed desired
+ * state is never synthetic and always names the verifier (OD-CR-7), so OPS-10
+ * and the read-only verifier smoke have an account to read through.
+ */
+export function assertCommittedDesiredState(desired) {
+  if (desired.synthetic) fail("COMMITTED_DESIRED_STATE_SYNTHETIC");
+  if (desired.serviceAccounts.verifier === null) fail("COMMITTED_DESIRED_STATE_VERIFIER_REQUIRED");
+  return desired;
+}
+
+/**
+ * An environment's committed desired state, validated, describing that
+ * environment and meeting the committed-file policy. The production file
+ * refuses DESIRED_STATE_PLACEHOLDER_UNFILLED until OWN-5 fills it.
+ */
+export function loadCommittedDesiredState(environment, { readFile, readSource } = {}) {
+  const desired = readDesiredStateFile(committedDesiredStatePath(environment), {
+    ...(readFile === undefined ? {} : { readFile }),
+    ...(readSource === undefined ? {} : { readSource }),
+  });
+  return assertCommittedDesiredState(requireEnvironment(desired, environment));
 }
 
 /** A validated desired state that must describe `environment`. */
@@ -1366,13 +1641,15 @@ export const ROLLOUT_TARGET_KEYS = Object.freeze([
  * deployed jobs (a deferred job does not exist, so the rollout never moves
  * it), the one primary instance, the image repository, the builder, and the
  * EP-6 verifier path roll reads /api/health through while the edge is not in
- * gcp mode: the verifier account and the origin's ID-token audience. The
- * verifier is optional in the desired state, but a rollout needs it, so a
- * desired state without one is refused ROLLOUT_TARGET_VERIFIER_REQUIRED.
+ * gcp mode: the verifier account and the origin's ID-token audience. A
+ * rollout needs the verifier and the operator's token-creator grant on it, so
+ * a desired state without either is refused (ROLLOUT_TARGET_VERIFIER_REQUIRED,
+ * ROLLOUT_TARGET_VERIFIER_TOKEN_CREATOR_UNASSIGNED).
  */
 export function rolloutTargetFromDesiredState(desired) {
   if (desired.synthetic) fail("ROLLOUT_TARGET_SYNTHETIC_REFUSED");
   if (desired.serviceAccounts.verifier === null) fail("ROLLOUT_TARGET_VERIFIER_REQUIRED");
+  if (desired.serviceAccounts.verifier.tokenCreators === null) fail("ROLLOUT_TARGET_VERIFIER_TOKEN_CREATOR_UNASSIGNED");
   return deepFreeze({
     environment: desired.environment,
     project: desired.project,
@@ -1389,15 +1666,9 @@ export function rolloutTargetFromDesiredState(desired) {
 }
 
 /**
- * OPS-10's entry point: the environment's RolloutTarget, from the owner-held
- * desired-state file its DESIRED_STATE_PATH_VARIABLES entry names. The file
- * must validate, describe that environment and not be synthetic.
+ * OPS-10's entry point: the environment's RolloutTarget, from its committed
+ * desired state (loadCommittedDesiredState). There is no other source.
  */
-export function rolloutTarget(environment, { env = process.env, readFile, readSource } = {}) {
-  const path = desiredStatePathFor(environment, env);
-  const desired = readDesiredStateFile(path, {
-    ...(readFile === undefined ? {} : { readFile }),
-    ...(readSource === undefined ? {} : { readSource }),
-  });
-  return rolloutTargetFromDesiredState(requireEnvironment(desired, environment));
+export function rolloutTarget(environment, { readFile, readSource } = {}) {
+  return rolloutTargetFromDesiredState(loadCommittedDesiredState(environment, { readFile, readSource }));
 }
