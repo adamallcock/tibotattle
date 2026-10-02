@@ -131,11 +131,20 @@ cache or an unavailable optional cache schema omits the breakdown, preserving
 the independent daily activity response. No public request invokes analysis,
 writes state, accepts cohort filters or exposes the private admin response.
 
-Model identity is tolerant on the public reader, not closed. A model tuple whose
-id is outside the page's reviewed catalog is skipped and counted: its dollars and
-account count must still be valid, and nothing of it is retained, stored or
-rendered, but it no longer invalidates every breakdown. The model view states
-that estimates for newer models are left out. `allowanceBreakdowns` may also
+Model identity is tolerant on the public reader in one way: a model tuple whose
+id the page has never heard of is skipped and counted. Its dollars and account
+count must still be valid, its id must be shaped like a model id (at most 128
+characters from `A-Za-z0-9._:/+-`, starting with a letter or digit), and an id
+appears at most once per day, known or not; nothing of it is retained, stored or
+rendered, but it no longer invalidates every breakdown. An id the catalog
+reviewed and kept off the primary comparison (a separate allowance track or
+another provider's model) is not newer than the page: it is a producer fault and
+refuses the block, as does any id that fails the grammar or repeats. The model
+view states that estimates for newer models are left out, and the browser's
+retained copy of the answer keeps that statement as two content-free integers
+(`retainedUnrecognizedModels: { tuples, models }`, accepted only from the
+browser's own store, never from the wire), so a cached render says what the live
+one said. `allowanceBreakdowns` may also
 carry an optional `modelConfig` array of `{ id, label, family, order }` that
 names and orders models the page's catalog does not know: at most 128 entries;
 an id of at most 128 characters from `A-Za-z0-9._:/+-`; a label of at most 80

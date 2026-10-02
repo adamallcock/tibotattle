@@ -1543,7 +1543,9 @@ export function renderCommunityAllowanceSection({
   const inspection = previousInspection?.view === view ? previousInspection : null;
   allowanceInspectionByContainer.delete(container);
   clear(container);
-  const series = normalizeCommunityDailySeries(payload);
+  // A payload handed over with retained provenance came out of this browser's
+  // own store, and only such a payload may carry the stored-copy counters.
+  const series = normalizeCommunityDailySeries(payload, { retained: cache !== null && cache !== undefined });
   const retained = cachedEvidence(cache);
   const setChip = (labelKey, published) => {
     if (!stateNode) return;
