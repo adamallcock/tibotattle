@@ -173,6 +173,9 @@ export function metricView(metric) {
     labelExtractors: isRecord(metric?.labelExtractors) ? metric.labelExtractors : {},
     labels: (Array.isArray(metric?.metricDescriptor?.labels) ? metric.metricDescriptor.labels : [])
       .map((label) => label?.key ?? null).sort(),
+    valueType: metric?.metricDescriptor?.valueType ?? null,
+    valueExtractor: typeof metric?.valueExtractor === "string" ? metric.valueExtractor : null,
+    bucketOptions: isRecord(metric?.bucketOptions) ? metric.bucketOptions : null,
   };
 }
 

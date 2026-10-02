@@ -30,12 +30,14 @@ node scripts/gcp-monitoring.mjs origin-lock-probe --environment=staging
 
 ## Privacy contract
 
-Log-based metric filters and label extractors may read only the closed
-fields in `ALLOWED_LOG_FIELDS`:
+Log-based metric filters, label extractors and value extractors may read
+only the closed fields in `ALLOWED_LOG_FIELDS`:
 
 - the resource type, service name, job name and scheduler job id;
 - the origin request line's `event`, `routeClass`, `status` and `code`;
-- the analytics-refresh receipt's `schemaVersion`, `state` and `code`;
+- the analytics-refresh receipt's `schemaVersion`, `state`, `status` and
+  `code`, and two numbers from a completed receipt: `memory.accountMiB` and
+  `memory.effectiveOutputBudgetMiB` (value extractors only, never labels);
 - the K-DETECT probe's `schema` and `verdict`;
 - Cloud Scheduler's entry type.
 
@@ -91,6 +93,34 @@ the trigger's longest cadence gap plus 60 minutes. A run that lost the lock
 also exits 0, so a succeeded execution does not count as a run. Check the
 trigger first (scheduler-quiet), then the job's failure line (`code`), then
 `LOCK_HELD`.
+
+## refresh-output-headroom
+
+**Ticket.** One policy, two conditions, read from what the refresh already
+logs (C-REFRESH, `cloud-run/analytics-refresh.mjs`):
+
+- **Near budget.** Over the trigger's longest cadence gap plus 60 minutes,
+  the completed receipts' output account (`memory.accountMiB`) exceeds 80 %
+  of their effective output budget (`memory.effectiveOutputBudgetMiB`, the
+  budget after the per-owner reclaim). Two distribution log metrics carry
+  the two numbers from receipts with `status: "ok"`; the condition divides
+  their sums. With one run per window this is that run's share. 80 % is a
+  starting value, like round 9's resource alerts; tune it after a week of
+  real runs.
+- **Exceeded.** A failure line with `code: ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED`
+  in the last hour. That run refused mid-run and wrote nothing, so
+  refresh-not-completed also pages once its window passes. The failure line
+  carries `outputAccount` (`accountMiB`, `outputBudgetMiB`).
+
+The policy waits with the refresh trigger: it is deferred whenever
+refresh-not-completed is (no cadence, or committed `PAUSED`).
+
+What to do: read the receipt's `memory` block (`accountMiB`,
+`effectiveOutputBudgetMiB`, `largestOwnerOutputMiB`, `heldInputMiB`) and
+`ownersComputed`. Growth with history or roster is expected: the C-REFRESH
+receipt projects the dense profile's budget to hold its planning roster for
+about 641 days. The remedies are incremental refresh (decision D3, revised)
+or a larger task memory profile (OWN-5), not a smaller history.
 
 ## scheduler-quiet
 

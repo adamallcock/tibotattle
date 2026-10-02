@@ -48,12 +48,14 @@ test("the committed staging plane renders the closed set, every policy deferred 
   assert.deepEqual(rendered.policies.map(({ id }) => id), [...monitoring.MONITORING_POLICY_IDS]);
   assert.deepEqual(rendered.metrics.map(({ name }) => name), ["tibotattle_staging_origin_request_failure",
     "tibotattle_staging_analytics_refresh_outcome", "tibotattle_staging_scheduler_attempt",
-    "tibotattle_staging_unseen_token_probe"]);
+    "tibotattle_staging_unseen_token_probe", "tibotattle_staging_analytics_refresh_output_account",
+    "tibotattle_staging_analytics_refresh_output_budget"]);
   assert.equal(rendered.notificationChannel, "unassigned");
   assert.deepEqual(Object.fromEntries(rendered.policies.map(({ id, deferred }) => [id, deferred])), {
     "origin-5xx-ratio": "NOTIFICATION_CHANNEL_UNASSIGNED",
     "refresh-lock-held": "NOTIFICATION_CHANNEL_UNASSIGNED",
     "refresh-not-completed": "SCHEDULER_CADENCE_UNSET",
+    "refresh-output-headroom": "SCHEDULER_CADENCE_UNSET",
     "scheduler-quiet": "SCHEDULER_CADENCE_UNSET",
     "origin-lock": "NOTIFICATION_CHANNEL_UNASSIGNED",
     "sql-cpu": "NOTIFICATION_CHANNEL_UNASSIGNED",
@@ -73,7 +75,7 @@ test("the committed staging plane renders the closed set, every policy deferred 
   const assigned = monitoring.renderMonitoring(STAGING, { notificationChannel: CHANNEL });
   assert.equal(assigned.notificationChannel, "assigned");
   assert.deepEqual(assigned.policies.filter(({ deferred }) => deferred !== undefined).map(({ id }) => id),
-    ["refresh-not-completed", "scheduler-quiet", "unseen-tokens", "unseen-tokens-silent"]);
+    ["refresh-not-completed", "refresh-output-headroom", "scheduler-quiet", "unseen-tokens", "unseen-tokens-silent"]);
   assert.deepEqual(policy(assigned, "sql-cpu").body.notificationChannels, [CHANNEL]);
   // Deterministic.
   assert.deepEqual(monitoring.renderMonitoring(STAGING, { notificationChannel: CHANNEL }), assigned);
@@ -114,6 +116,11 @@ test("every rendered filter, extractor and query passes the privacy scanner, and
     [(copy) => { copy.metrics[3].body.labelExtractors.v = "jsonPayload.verdict"; }, /^MONITORING_EXTRACTOR_INVALID:/u],
     [(copy) => { copy.metrics[3].body.labelExtractors.v = "EXTRACT(jsonPayload.dimensions)"; },
       /^MONITORING_FIELD_NOT_ALLOWLISTED:/u],
+    [(copy) => { copy.metrics[4].body.valueExtractor = "EXTRACT(jsonPayload.requestId)"; }, /^MONITORING_FIELD_FORBIDDEN:/u],
+    [(copy) => { copy.metrics[4].body.valueExtractor = "EXTRACT(jsonPayload.memory.peakRssMiB)"; },
+      /^MONITORING_FIELD_NOT_ALLOWLISTED:/u],
+    [(copy) => { copy.metrics[5].body.valueExtractor = "jsonPayload.memory.accountMiB"; }, /^MONITORING_EXTRACTOR_INVALID:/u],
+    [(copy) => { copy.metrics[5].body.valueExtractor = "EXTRACT(httpRequest.latency)"; }, /^MONITORING_FIELD_FORBIDDEN:/u],
     [(copy) => { copy.policies[0].body.conditions[0].conditionPrometheusQueryLanguage.query += ' and on() x{requestId="1"}'; },
       /^MONITORING_(?:FIELD_FORBIDDEN|QUERY_LABEL_NOT_ALLOWLISTED):/u],
     [(copy) => { copy.policies[1].body.conditions[0].conditionPrometheusQueryLanguage.query += ' and on() x{owner="1"}'; },
@@ -180,6 +187,63 @@ test("refresh alerts: LOCK_HELD, and no completed run within cadence plus slack 
   // The receipt schema is the refresh job's own.
   const refresh = await import("../cloud-run/analytics-refresh.mjs");
   assert.equal(monitoring.ANALYTICS_REFRESH_RECEIPT_VERSION, refresh.ANALYTICS_REFRESH_RECEIPT_VERSION);
+});
+
+test("refresh-output-headroom: the receipt's account against its effective budget, and any budget refusal", async () => {
+  const contract = monitoring.REFRESH_OUTPUT_HEADROOM_CONTRACT;
+  const daily = monitoring.renderMonitoring(resumed("15 3 * * *"), { notificationChannel: CHANNEL });
+  const headroom = policy(daily, "refresh-output-headroom");
+  assert.equal(headroom.severity, "ticket");
+  assert.equal(headroom.deferred, undefined);
+  assert.equal(headroom.body.conditions.length, 2);
+  const job = 'job_name="tibotattle-staging-analytics-refresh"';
+  const metric = (part) => `logging_googleapis_com:user_tibotattle_staging_analytics_refresh_output_${part}_sum`
+    + `{monitored_resource="cloud_run_job",${job}}`;
+  assert.equal(query(daily, "refresh-output-headroom", 0),
+    `sum(increase(${metric("account")}[25h])) / sum(increase(${metric("budget")}[25h])) > 0.8`);
+  assert.equal(query(daily, "refresh-output-headroom", 1), "sum(increase(logging_googleapis_com:user_"
+    + `tibotattle_staging_analytics_refresh_outcome{monitored_resource="cloud_run_job",${job},`
+    + 'code="ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED"}[1h])) > 0');
+  assert.match(query(monitoring.renderMonitoring(resumed("*/30 * * * *")), "refresh-output-headroom", 0), /\[90m\]\)\) > 0\.8$/u);
+  // It waits with the refresh trigger, like refresh-not-completed.
+  assert.equal(policy(monitoring.renderMonitoring(STAGING), "refresh-output-headroom").deferred, "SCHEDULER_CADENCE_UNSET");
+  const paused = staging((value) => { value.scheduler["analytics-refresh"].schedule = "15 3 * * *"; });
+  assert.equal(policy(monitoring.renderMonitoring(paused), "refresh-output-headroom").deferred, "TRIGGER_COMMITTED_PAUSED");
+
+  // The two distribution metrics read only completed receipts, one numeric field each.
+  const [account, budget] = daily.metrics.slice(4);
+  assert.deepEqual([account.body.valueExtractor, budget.body.valueExtractor],
+    ["EXTRACT(jsonPayload.memory.accountMiB)", "EXTRACT(jsonPayload.memory.effectiveOutputBudgetMiB)"]);
+  for (const entry of [account, budget]) {
+    assert.deepEqual(entry.body.metricDescriptor, { metricKind: "DELTA", valueType: "DISTRIBUTION", unit: "MiBy", labels: [] });
+    assert.deepEqual(entry.body.labelExtractors, {});
+  }
+  const receipt = { resource: { type: "cloud_run_job", labels: { job_name: "tibotattle-staging-analytics-refresh" } },
+    jsonPayload: { schemaVersion: "analytics-refresh-receipt-v1", status: "ok", state: "complete",
+      memory: { outputBudgetMiB: 10752, effectiveOutputBudgetMiB: 11000, accountMiB: 24 } } };
+  const refused = { ...receipt, jsonPayload: { schemaVersion: "analytics-refresh-receipt-v1", status: "failed",
+    code: contract.exceededCode, phase: "compute", outputAccount: { accountMiB: 71, outputBudgetMiB: 70 } } };
+  assert.equal(filterMatches(account.body.filter, receipt), true);
+  assert.equal(filterMatches(budget.body.filter, receipt), true);
+  assert.equal(filterMatches(account.body.filter, refused), false, "a failure line feeds no headroom sample");
+  assert.equal(filterMatches(account.body.filter, { ...receipt,
+    resource: { type: "cloud_run_job", labels: { job_name: "other-job" } } }), false);
+  // The refusal is counted by the refresh outcome metric's code label.
+  const [, outcome] = daily.metrics;
+  assert.equal(filterMatches(outcome.body.filter, refused), true);
+  assert.equal(outcome.body.labelExtractors.code, "EXTRACT(jsonPayload.code)");
+
+  // The names are the refresh's own (C-REFRESH): pinned to its source.
+  const refreshSource = readFileSync(join(WORKER_ROOT, "cloud-run/analytics-refresh.mjs"), "utf8");
+  for (const fragment of ["effectiveOutputBudgetMiB: Number.isSafeInteger(recorded?.account?.outputBudgetBytes)",
+    "accountMiB: Number.isSafeInteger(recorded?.account?.accountBytes)",
+    "memory: memorySummary(resources, outputs.resources", 'status: "ok",',
+    `if (error?.code === "${contract.exceededCode}"`, 'status: "failed",',
+    "code: safeCode(error, \"ANALYTICS_V2_REFRESH_FAILED\"),"]) {
+    assert.ok(refreshSource.includes(fragment), fragment);
+  }
+  const compute = readFileSync(join(WORKER_ROOT, "src/analytics-v2/compute.ts"), "utf8");
+  assert.ok(compute.includes(`readonly code = "${contract.exceededCode}" as const;`));
 });
 
 test("the scheduler paused-too-long alert waits max(6 h, cadence plus slack) per committed-ENABLED trigger", () => {

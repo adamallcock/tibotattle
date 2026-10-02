@@ -26,6 +26,13 @@
  *                                  complete within cadence + slack: a lost
  *                                  lock exits 0, so a succeeded execution is
  *                                  not evidence of a run.
+ *   refresh-output-headroom ticket a completed analytics-refresh receipt
+ *                                  whose memory.accountMiB exceeds 80 % of
+ *                                  its memory.effectiveOutputBudgetMiB within
+ *                                  cadence + slack, or any failure line with
+ *                                  code ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED in
+ *                                  the last hour (that run published nothing;
+ *                                  refresh-not-completed pages for it).
  *   scheduler-quiet        ticket  no Cloud Scheduler attempt of a trigger
  *                                  committed ENABLED within max(6 h, cadence
  *                                  + slack): the paused-too-long signal.
@@ -86,7 +93,8 @@ const API_SEVERITY = Object.freeze({ page: "CRITICAL", ticket: "ERROR", info: "W
 /** The maintained document every policy links to, one anchor per policy. */
 export const MONITORING_RUNBOOK = "apps/worker/cloud-run/infra/monitoring.md";
 export const MONITORING_POLICY_IDS = Object.freeze([
-  "origin-5xx-ratio", "refresh-lock-held", "refresh-not-completed", "scheduler-quiet", "origin-lock",
+  "origin-5xx-ratio", "refresh-lock-held", "refresh-not-completed", "refresh-output-headroom", "scheduler-quiet",
+  "origin-lock",
   "sql-cpu", "sql-memory", "sql-disk", "sql-connections", "unseen-tokens", "unseen-tokens-silent",
 ]);
 export const MONITORING_DEFERRALS = Object.freeze([
@@ -102,6 +110,22 @@ export const ORIGIN_REQUEST_LOG_CONTRACT = Object.freeze({
 });
 /** cloud-run/analytics-refresh.mjs ANALYTICS_REFRESH_RECEIPT_VERSION. */
 export const ANALYTICS_REFRESH_RECEIPT_VERSION = "analytics-refresh-receipt-v1";
+/**
+ * The refresh's output-headroom figures (C-REFRESH). A completed run's stdout
+ * receipt (status "ok") carries memory.accountMiB (the output account, MiB
+ * rounded up) and memory.effectiveOutputBudgetMiB (the budget after the
+ * per-owner reclaim, MiB rounded down); either is null when the run held no
+ * account. A refused run's stderr line carries code
+ * ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED (src/analytics-v2/compute.ts) and
+ * outputAccount {accountMiB, outputBudgetMiB}. The check pins these names to
+ * cloud-run/analytics-refresh.mjs.
+ */
+export const REFRESH_OUTPUT_HEADROOM_CONTRACT = Object.freeze({
+  okStatus: "ok",
+  accountField: "jsonPayload.memory.accountMiB",
+  budgetField: "jsonPayload.memory.effectiveOutputBudgetMiB",
+  exceededCode: "ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED",
+});
 /** cloud-run/unseen-token-probe.mjs UNSEEN_TOKEN_PROBE_SCHEMA and its verdicts, and the job D-OPS4 would run it as. */
 export const UNSEEN_TOKEN_PROBE_SCHEMA = "tibotattle-unseen-token-probe-v1";
 export const UNSEEN_TOKEN_PROBE_VERDICTS = Object.freeze(["clear", "unseen"]);
@@ -123,6 +147,9 @@ export const MONITORING_THRESHOLDS = Object.freeze({
   sqlDiskUtilization: 0.8,
   sqlConnectionShare: 0.8,
   sqlWindowMinutes: 10,
+  /** Starting value, like round 9's 80 % resource alerts; tune after a week of real runs. */
+  refreshOutputHeadroomShare: 0.8,
+  refreshOutputExceededWindowMinutes: 60,
   unseenProbeSilentHours: 26,
   uptimePeriodSeconds: 300,
 });
@@ -143,6 +170,8 @@ export const ALLOWED_LOG_FIELDS = Object.freeze([
   "jsonPayload.code",
   "jsonPayload.schemaVersion",
   "jsonPayload.state",
+  "jsonPayload.memory.accountMiB",
+  "jsonPayload.memory.effectiveOutputBudgetMiB",
   "jsonPayload.schema",
   "jsonPayload.verdict",
   'jsonPayload."@type"',
@@ -254,6 +283,27 @@ function logMetric(desired, id, { description, filter, labels }) {
         labels: labels.map(({ key }) => ({ key, valueType: "STRING" })),
       },
       labelExtractors: Object.fromEntries(labels.map(({ key, field }) => [key, `EXTRACT(${field})`])),
+    },
+  };
+}
+
+/**
+ * A DELTA distribution of one numeric, content-free receipt field. Exponential
+ * buckets (scale 1 MiB, growth 1.25, 48 finite) cover 1 MiB to about 45 GiB.
+ */
+function distributionMetric(desired, id, { description, filter, valueField }) {
+  return {
+    kind: "log-metric",
+    id,
+    name: monitoringName(desired, id),
+    body: {
+      name: monitoringName(desired, id),
+      description,
+      filter,
+      metricDescriptor: { metricKind: "DELTA", valueType: "DISTRIBUTION", unit: "MiBy", labels: [] },
+      labelExtractors: {},
+      valueExtractor: `EXTRACT(${valueField})`,
+      bucketOptions: { exponentialBuckets: { numFiniteBuckets: 48, growthFactor: 1.25, scale: 1 } },
     },
   };
 }
@@ -375,6 +425,15 @@ export function renderMonitoring(desired, { notificationChannel = null } = {}) {
         `jsonPayload.verdict=(${UNSEEN_TOKEN_PROBE_VERDICTS.map(quote).join(" OR ")})`].join(" AND "),
       labels: [{ key: "verdict", field: "jsonPayload.verdict" }],
     }),
+    ...["account", "budget"].map((part) => distributionMetric(desired, `analytics-refresh-output-${part}`, {
+      description: part === "account"
+        ? "Completed analytics-refresh receipts: the output account in MiB (memory.accountMiB)."
+        : "Completed analytics-refresh receipts: the effective output budget in MiB (memory.effectiveOutputBudgetMiB).",
+      filter: [`resource.type="cloud_run_job"`, `resource.labels.job_name=${quote(refreshJob)}`,
+        `jsonPayload.schemaVersion=${quote(ANALYTICS_REFRESH_RECEIPT_VERSION)}`,
+        `jsonPayload.status=${quote(REFRESH_OUTPUT_HEADROOM_CONTRACT.okStatus)}`].join(" AND "),
+      valueField: REFRESH_OUTPUT_HEADROOM_CONTRACT[`${part}Field`],
+    })),
   ];
   const metricName = (id) => promName(monitoringName(desired, id));
 
@@ -435,6 +494,23 @@ export function renderMonitoring(desired, { notificationChannel = null } = {}) {
       `absent_over_time(${metricName("analytics-refresh-outcome")}{monitored_resource="cloud_run_job",`
       + `job_name=${quote(refreshJob)},state="complete"}[${windowText((refreshCadence.gapMinutes ?? 0)
         + t.cadenceSlackMinutes)}])`)],
+  }, refreshCadence.deferred ?? null);
+  const refreshWindow = windowText((refreshCadence.gapMinutes ?? 0) + t.cadenceSlackMinutes);
+  const refreshSum = (part) => `${metricName(`analytics-refresh-output-${part}`)}_sum{monitored_resource=`
+    + `"cloud_run_job",job_name=${quote(refreshJob)}}`;
+  add("refresh-output-headroom", {
+    severity: "ticket",
+    summary: `An analytics-refresh run used over ${t.refreshOutputHeadroomShare * 100} % of its effective output `
+      + "budget, or refused with ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED and published nothing.",
+    conditions: [
+      promCondition("refresh output account near budget",
+        `sum(increase(${refreshSum("account")}[${refreshWindow}])) / sum(increase(${refreshSum("budget")}`
+        + `[${refreshWindow}])) > ${t.refreshOutputHeadroomShare}`),
+      promCondition("refresh output budget exceeded",
+        `sum(increase(${metricName("analytics-refresh-outcome")}{monitored_resource="cloud_run_job",`
+        + `job_name=${quote(refreshJob)},code=${quote(REFRESH_OUTPUT_HEADROOM_CONTRACT.exceededCode)}}`
+        + `[${windowText(t.refreshOutputExceededWindowMinutes)}])) > 0`),
+    ],
   }, refreshCadence.deferred ?? null);
   const quiet = schedulerQuietConditions(SCHEDULED_JOB_NAMES.map((job) => ({ job, cadence: triggerCadence(desired, job) })));
   add("scheduler-quiet", {
@@ -542,7 +618,8 @@ function scanQuery(text, where) {
 
 /**
  * Throws MONITORING_FIELD_FORBIDDEN or MONITORING_*_NOT_ALLOWLISTED unless
- * every log filter and label extractor reads only ALLOWED_LOG_FIELDS and
+ * every log filter, label extractor and value extractor reads only
+ * ALLOWED_LOG_FIELDS and
  * every PromQL query matches only ALLOWED_QUERY_LABELS.
  */
 export function scanMonitoringPrivacy(rendered) {
@@ -552,6 +629,12 @@ export function scanMonitoringPrivacy(rendered) {
       const match = /^EXTRACT\((.+)\)$/u.exec(extractor);
       if (match === null) fail(`MONITORING_EXTRACTOR_INVALID:${metric.id}:${key}`);
       scanFilter(match[1], `${metric.id}:${key}`);
+      if (!ALLOWED_LOG_FIELDS.includes(match[1])) fail(`MONITORING_FIELD_NOT_ALLOWLISTED:${metric.id}:${match[1]}`);
+    }
+    if (metric.body.valueExtractor !== undefined) {
+      const match = /^EXTRACT\((.+)\)$/u.exec(metric.body.valueExtractor);
+      if (match === null) fail(`MONITORING_EXTRACTOR_INVALID:${metric.id}:value`);
+      scanFilter(match[1], `${metric.id}:value`);
       if (!ALLOWED_LOG_FIELDS.includes(match[1])) fail(`MONITORING_FIELD_NOT_ALLOWLISTED:${metric.id}:${match[1]}`);
     }
   }

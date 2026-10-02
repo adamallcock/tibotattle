@@ -134,7 +134,7 @@ test("readback issues three guarded list calls and keeps only the plane's own re
 test("the plan is deterministic, never applies, defers what waits and refuses deletes", async () => {
   // An empty project: everything is a create; the policies wait for the channel or their signal.
   const empty = JSON.parse((await run(["plan", "--environment=staging"])).out);
-  assert.deepEqual(empty.summary, { create: 5, update: 0, unchanged: 0, deferred: 11, refused: 0 });
+  assert.deepEqual(empty.summary, { create: 7, update: 0, unchanged: 0, deferred: 12, refused: 0 });
   assert.match(empty.apply, /^not available/u);
   assert.equal(empty.notificationChannel, "unassigned");
   const again = JSON.parse((await run(["plan", "--environment=staging"])).out);
@@ -143,15 +143,22 @@ test("the plan is deterministic, never applies, defers what waits and refuses de
   const rendered = renderMonitoring(STAGING, { notificationChannel: CHANNEL });
   const live = liveFrom(rendered);
   const converged = planMonitoring(rendered, readbackMonitoring(STAGING, { runner: fakeMonitoring(live).runner }));
-  assert.equal(converged.summary.unchanged, 16);
+  assert.equal(converged.summary.unchanged, 19);
   assert.deepEqual([converged.summary.create, converged.summary.update, converged.summary.refused], [0, 0, 0]);
   live.metrics[0].filter += ' AND jsonPayload.code="X"';
+  // A distribution metric that extracts another field, or buckets differently, is drift too.
+  const account = live.metrics.find(({ name }) => name.endsWith("_analytics_refresh_output_account"));
+  account.valueExtractor = "EXTRACT(jsonPayload.memory.effectiveOutputBudgetMiB)";
+  const budget = live.metrics.find(({ name }) => name.endsWith("_analytics_refresh_output_budget"));
+  budget.bucketOptions = { exponentialBuckets: { numFiniteBuckets: 10, growthFactor: 2, scale: 1 } };
   live.policies.push({ name: `projects/${PROJECT}/alertPolicies/77`, displayName: "tibotattle-staging-stray", conditions: [] });
   const fake = fakeMonitoring(live);
   const drifted = await run(["plan", "--environment=staging", `--notification-channel=${CHANNEL}`], { runner: fake.runner });
   assert.equal(drifted.code, 2, "a refused delete exits 2");
   const plan = JSON.parse(drifted.out);
   assert.ok(plan.operations.some(({ id }) => id === "log-metric:update:origin-request-failure"));
+  assert.ok(plan.operations.some(({ id }) => id === "log-metric:update:analytics-refresh-output-account"));
+  assert.ok(plan.operations.some(({ id }) => id === "log-metric:update:analytics-refresh-output-budget"));
   assert.deepEqual(plan.operations.filter(({ action }) => action === "delete"), [{ id: "alert-policy:delete:tibotattle-staging-stray",
     kind: "alert-policy", name: "tibotattle-staging-stray", action: "delete", refused: "MONITORING_DELETE_REFUSED" }]);
   assert.equal(drifted.out.includes("1234567890"), false, "the channel value never reaches the plan");
@@ -160,7 +167,7 @@ test("the plan is deterministic, never applies, defers what waits and refuses de
   const otherChannel = planMonitoring(renderMonitoring(STAGING, {
     notificationChannel: `projects/${PROJECT}/notificationChannels/42` }),
   readbackMonitoring(STAGING, { runner: fakeMonitoring(liveFrom(rendered)).runner }));
-  assert.equal(otherChannel.operations.filter(({ action }) => action === "update").length, 11);
+  assert.equal(otherChannel.operations.filter(({ action }) => action === "update").length, 12);
   assert.throws(() => planMonitoring(rendered, { schema: "other" }), { code: "MONITORING_PLAN_READBACK_INVALID" });
   // A policy that dropped a deferred trigger's condition says so in the plan.
   const dropped = structuredClone(rendered);
