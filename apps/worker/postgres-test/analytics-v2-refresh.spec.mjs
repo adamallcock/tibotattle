@@ -2075,6 +2075,8 @@ test("PG17: an owner beyond the shared reducers' caps is computed and written, n
     { usage: total("usage"), quota: total("quota"), session: total("session"), admitted: true, maxDayOccurrences: 25_010 });
     assert.ok(Number.isSafeInteger(entry.heapPeakBytes) && entry.heapPeakBytes > 0, "the heap was sampled");
     assert.ok(entry.estimateBytes < 1_024 * 1_048_576);
+    // The receipt reports the process's peak resident set, for sizing the Job.
+    assert.ok(Number.isSafeInteger(run.memory.peakRssMiB) && run.memory.peakRssMiB > 0, "peak resident set reported");
     // The receipt carries only content-free aggregates.
     assert.deepEqual({ budgetMiB: run.memory.budgetMiB, ownersComputed: run.memory.ownersComputed,
       ownersRefused: run.memory.ownersRefused }, { budgetMiB: 1_024, ownersComputed: 4, ownersRefused: 0 });

@@ -921,11 +921,21 @@ function safeCode(error, fallback) {
 }
 
 /**
- * The receipt's content-free memory summary: the bounds applied and the
- * counts of computed and refused owners, the largest estimate and the largest
- * sampled heap. Per-owner figures go to analytics_v2_runs.timings only.
+ * The process's peak resident set in bytes (getrusage ru_maxrss, which Node
+ * reports in KiB on every platform). Operational metadata only: it sizes the
+ * Job's task memory and no decision reads it.
  */
-function memorySummary(resources, recorded) {
+function defaultPeakRssBytes() {
+  return process.resourceUsage().maxRSS * 1024;
+}
+
+/**
+ * The receipt's content-free memory summary: the bounds applied and the
+ * counts of computed and refused owners, the largest estimate, the largest
+ * sampled heap and the process's peak resident set at the end of compute.
+ * Per-owner figures go to analytics_v2_runs.timings only.
+ */
+function memorySummary(resources, recorded, peakRssBytes) {
   const owners = Array.isArray(recorded?.owners) ? recorded.owners : [];
   const toMiB = (bytes) => Math.ceil(bytes / MIB);
   const largest = (values) => values.reduce((maximum, value) => Math.max(maximum, value), 0);
@@ -941,6 +951,7 @@ function memorySummary(resources, recorded) {
     ownersRefused: owners.filter((owner) => owner.admitted === false).length,
     largestEstimateMiB: toMiB(largest(owners.map((owner) => owner.estimateBytes ?? 0))),
     largestHeapPeakMiB: toMiB(largest(owners.map((owner) => owner.heapPeakBytes ?? 0))),
+    peakRssMiB: Number.isSafeInteger(peakRssBytes) && peakRssBytes >= 0 ? toMiB(peakRssBytes) : null,
   });
 }
 
@@ -953,7 +964,7 @@ function countBy(values, key) {
 /**
  * Run one refresh. dependencies (tests and the composition root only):
  * createPool(database, {connector}), createConnector(), closeResources(),
- * modules ({store, pipeline}), wallClock(), randomUUID(), heapLimitBytes.
+ * modules ({store, pipeline}), wallClock(), randomUUID(), heapLimitBytes, peakRssBytes().
  * Returns the receipt; throws an error carrying a closed code and phase.
  */
 export async function runAnalyticsRefresh({
@@ -1082,7 +1093,7 @@ export async function runAnalyticsRefresh({
         blocked: written.publication.blocked,
         cursor: written.cursor,
         timings: written.timings,
-        memory: memorySummary(resources, outputs.resources),
+        memory: memorySummary(resources, outputs.resources, (dependencies.peakRssBytes ?? defaultPeakRssBytes)()),
       });
     }
   } catch (error) {
