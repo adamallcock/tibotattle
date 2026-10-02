@@ -38,7 +38,8 @@ Authority:
 - No load balancer in front of Cloud Run, no Transform Rule, no DNS change and
   no custom-domain removal or move. The three hostnames stay custom domains of
   the same Worker in every mode. Option A of OD-E6 (a Cloudflare-proxied
-  origin hostname) would change this rule; it needs its own owner decision
+  origin hostname) would change this rule. It is a fallback only if the
+  production-zone address probe fails, and needs its own owner decision
   first.
 - No guard-only Worker. The Sparkle appcast guard stays in the production
   Worker.
@@ -66,14 +67,19 @@ Authority:
   ([section 7](#7-local-proof-and-the-optional-live-check)) must also be green
   for the edge commit against the origin commit. E12's cross-line option builds
   the edge from the edge-port tree and checks that the contract blob matches.
-- No gcp deploy runs until the owner has decided OD-E6. Cloudflare adds the
-  client address, in `CF-Connecting-IP`, to every subrequest the edge sends to a
-  `*.run.app` origin and to Google's token endpoint, and a Worker cannot remove
-  it. An owner-authorized staging edge on Cloudflare's network must also have
-  shown which address-bearing headers reach the origin for the chosen option,
-  recording header names and whether each value is the edge's constant, never
-  the values. See
-  [the decision record, section 5](../decisions/2026-10-01-thin-worker-edge-proxy.md#5-client-address-privacy).
+- No gcp deploy runs until the owner has re-run the edge IP probe from the
+  `tibotattle.com` zone and recorded a pass (OD-E6). On 2026-10-02 the probe,
+  from a `workers.dev` Worker that sends the edge's `x-real-ip` override, found
+  that no header carrying the visitor's address reached a Cloud Run service:
+  no `CF-Connecting-IP` and no `x-real-ip` arrived, and `x-forwarded-for`
+  carried Cloudflare's placeholder. The zone itself is unobserved. The rerun
+  deploys the echo to the test project and the probe Worker with one
+  exact-path route on the zone, calls `/probe` once, and deletes both; every
+  step is owner-run, and the result records header names and booleans, never a
+  value. Follow
+  [the probe's README](../../apps/worker/scripts/edge-ip-probe/README.md); the
+  recommendation and the fallbacks if it fails are in
+  [the decision record, section 5](../decisions/2026-10-01-thin-worker-edge-proxy.md#od-e6-recommendation-and-gate).
   E10 does not check this, so the operator must confirm it before the switch.
 - Before the first production use of each mode, rehearse worker, fenced (with
   an EP-8 drill) and gcp on a staging Worker with its own hostnames, Access
@@ -355,10 +361,11 @@ creates.
   - the Worker's own upload budget (1200 starts per minute) sheds load before
     the 3000/60 ingress limits; the fast-path origin has no such budget.
 - **It does not qualify:** Google's front end, Cloudflare's network and real
-  client addresses (in particular the `CF-Connecting-IP` Cloudflare adds to a
-  subrequest for a non-Cloudflare host, which Miniflare does not add), Workers Rate Limiting across locations, Access, custom
-  domains, the production origin composition (CR-6 and CR-7) or production
-  data.
+  client addresses (the headers Cloudflare adds to a subrequest for a
+  non-Cloudflare host, which Miniflare does not add; the
+  [edge IP probe](../../apps/worker/scripts/edge-ip-probe/README.md) observes
+  those), Workers Rate Limiting across locations, Access, custom domains, the
+  production origin composition (CR-6 and CR-7) or production data.
 
 ### Optional live check (OD-E3)
 

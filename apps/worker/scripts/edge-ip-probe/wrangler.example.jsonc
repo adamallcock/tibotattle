@@ -1,0 +1,15 @@
+// Example configuration for the throwaway edge IP probe Worker (README.md).
+// Copy it, with probe-worker.mjs, into a scratch directory outside the
+// repository as wrangler.jsonc, set ECHO_URL to the temporary echo service's
+// URL, and deploy from there. Never deploy it with apps/worker/wrangler.jsonc
+// or under the production Worker's name.
+{
+  "name": "tibotattle-edge-ip-probe",
+  "main": "probe-worker.mjs",
+  "compatibility_date": "2026-09-01",
+  "workers_dev": true,
+  "vars": { "ECHO_URL": "https://<echo-service-url>/" }
+  // On the production zone instead of workers.dev: set "workers_dev" to false
+  // and add one exact-path route (no wildcard), for example
+  //   "routes": [{ "pattern": "tibotattle.com/probe", "zone_name": "tibotattle.com" }]
+}

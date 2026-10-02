@@ -88,12 +88,14 @@ The target keeps every published output contract and every intake contract.
   and Cloud Run's front end verifies it. The EP-6 origin boundary accepts only
   the EP-0 `x-tibotattle-*` contract. Verifier service accounts may only
   `GET /api/health` and `/api/ready`.
-- Cloudflare adds the client address, in `CF-Connecting-IP`, to every edge
-  subrequest to the `*.run.app` origin or Google's token endpoint, and no
-  Worker code can remove it. Google therefore receives it unless the origin
-  moves behind a Cloudflare-proxied hostname. The switch waits for that owner
-  choice, OD-E6
-  ([decision record, section 5](../decisions/2026-10-01-thin-worker-edge-proxy.md#5-client-address-privacy)).
+- The edge sets `x-real-ip` to Cloudflare's Worker placeholder on its
+  subrequests to Google. An owner-authorized probe on 2026-10-02, from a
+  `workers.dev` Worker, found that no header carrying the visitor's address
+  reached a Cloud Run service. The recommendation for OD-E6 is therefore to
+  keep the direct `*.run.app` topology with that override, with no
+  proxied-hostname rework. The switch waits for one owner-run rerun of the
+  probe from the `tibotattle.com` zone
+  ([decision record, section 5](../decisions/2026-10-01-thin-worker-edge-proxy.md#od-e6-recommendation-and-gate)).
 
 ### Origin
 
@@ -467,6 +469,9 @@ resources.
 7. Observe.
 8. Start the analytics cold build.
 
+Step 6 also needs a recorded pass of the edge IP probe from the
+`tibotattle.com` zone (OD-E6). It can run at any time before the window.
+
 Before the flip, rollback is redeploying the production Worker and running the
 EP-8 release. After the flip, gcp-to-fenced is the brake. Gcp-to-worker is
 allowed only inside an authority-write-free window, and only if the owner
@@ -491,9 +496,11 @@ approves that policy.
 - Cutover is not tonight. The remaining critical path covers intake, the edge,
   the importers and seal, the dense path and memo, and production resources and
   secrets from the owner's custody.
-- The edge cannot keep the client address from Google on a `*.run.app` origin
-  (OD-E6). Choosing a Cloudflare-proxied origin hostname changes the contract,
-  the EP-7 and EP-9 templates and DNS. Accepting it changes the privacy page.
+- The client-address result (OD-E6) is observed only from a `workers.dev`
+  Worker. If the production-zone rerun of the edge IP probe finds the
+  visitor's address reaching the origin, the fallbacks are a
+  Cloudflare-proxied origin hostname (a contract, EP-7 and EP-9 template and
+  DNS change) or acceptance with a privacy-page disclosure.
 - Dense owners are excluded from tonight's parity gate, so tonight's parity
   covers effective, non-dense owners on synthetic data only.
 - The oracle may not converge under the Workers test pool. The fallback is a

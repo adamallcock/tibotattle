@@ -14,8 +14,12 @@
  * x-real-ip into CF-Connecting-IP, so the constant also covers that topology.
  *
  * It does not change CF-Connecting-IP on a subrequest to a non-Cloudflare
- * host: no Worker code can. That exposure and the owner choice it needs are
- * in docs/decisions/2026-10-01-thin-worker-edge-proxy.md, section 5 (OD-E6).
+ * host: no Worker code can. On 2026-10-02 an owner-authorized probe from a
+ * workers.dev Worker (scripts/edge-ip-probe) saw neither header reach a Cloud
+ * Run service and this constant arrive in x-forwarded-for. The case without
+ * the override was not tested, so it stays load-bearing. The production-zone
+ * re-run and OD-E6 are in docs/decisions/2026-10-01-thin-worker-edge-proxy.md,
+ * section 5.
  */
 export const EDGE_SUBREQUEST_REAL_IP_HEADER = "x-real-ip";
 export const EDGE_SUBREQUEST_REAL_IP = "2a06:98c0:3600::103";

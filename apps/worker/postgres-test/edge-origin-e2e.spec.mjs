@@ -136,7 +136,8 @@ const RATE_LIMIT_PURPOSES = Object.freeze([
  * does not add the headers Cloudflare's network adds to a production
  * subrequest; Cloudflare documents that a subrequest for a non-Cloudflare host
  * carries the client address in CF-Connecting-IP, which no Worker can change.
- * S7 cannot observe that (decision record, section 5, OD-E6).
+ * S7 cannot observe that. The owner-run probe in scripts/edge-ip-probe does
+ * (decision record, section 5, OD-E6).
  */
 const PLATFORM_REQUEST_HEADERS = Object.freeze({
   "cf-worker": /^[a-z0-9.-]+$/u,

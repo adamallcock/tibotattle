@@ -61,6 +61,11 @@ status: proposed
   changed for the edge. The origin's production composition (CR-6 and CR-7)
   does not exist yet, and the origin still refuses to start without a test
   mode.
+- One observation on Cloudflare's network exists: the owner-authorized address
+  probe of 2026-10-02, from a throwaway `workers.dev` Worker to a temporary
+  echo service in the GCP test project, since deleted
+  ([section 5](#the-cloudflare-network-probe-2026-10-02)). It deployed no part
+  of the edge and does not cover the `tibotattle.com` zone.
 
 ## 1. Topology and modes
 
@@ -187,15 +192,21 @@ integration commit that also records that production is typed-rendered.
 
 ## 5. Client address privacy
 
-**In the topology this record describes, Google receives the raw client
-address on every forwarded request, by Cloudflare's own documentation.** No
-run on Cloudflare's network has observed it yet. The edge's own code sets no
-value derived from the client address, but Cloudflare's network adds one. An earlier
-draft of this section said that no raw client address reaches Google; that is
-withdrawn. OD-E6 ([section 15](#15-open-owner-choices-this-record-does-not-settle))
-decides what replaces it, and the gcp switch waits for that decision.
+**On Cloudflare's network, no header carrying the visitor's address reached
+a Cloud Run service that a Worker called the way the edge does.** An
+owner-authorized probe observed this on 2026-10-02 from a `workers.dev` Worker
+([below](#the-cloudflare-network-probe-2026-10-02)). With the edge's
+`x-real-ip` override, the `x-forwarded-for` that Google delivered carried
+Cloudflare's placeholder, not the visitor's address. Cloudflare's
+documentation says otherwise for `CF-Connecting-IP`, and a previous revision
+of this section, relying on it, said that Google receives the raw client
+address on every forwarded request. The observation replaces that statement for the
+placement it covers. The edge's own code sets no value derived from the client
+address. The `tibotattle.com` zone, where the production edge runs, is not yet
+observed, so the gcp switch waits for the same probe from that zone (OD-E6,
+[section 15](#15-open-owner-choices-this-record-does-not-settle)).
 
-### What Cloudflare adds to the edge's subrequests
+### What Cloudflare documents for the edge's subrequests
 
 Cloudflare's [HTTP headers reference](https://developers.cloudflare.com/fundamentals/reference/http-headers/)
 says that a Worker subrequest to a host outside any Cloudflare zone carries the
@@ -211,16 +222,65 @@ that kind:
 
 The edge therefore sets `x-real-ip` to the constant `2a06:98c0:3600::103` on
 both (`src/edge-google-subrequest.ts`), the address Cloudflare itself
-substitutes for a cross-zone Worker subrequest. It cannot change
-`CF-Connecting-IP`. Google's front end and the Cloud Run container receive that
-header. EP-6 copies only the allowlisted headers to the application, so no
-handler, PostgreSQL row, origin log or response sees it. What Google's own
-platform does with it is outside this record's evidence.
+substitutes for a cross-zone Worker subrequest. No Worker code can change
+`CF-Connecting-IP`. By the documentation, Google's front end and the Cloud Run
+container would receive that header; in the 2026-10-02 probe it did not reach
+the container. EP-6 copies only the allowlisted headers to the application, so
+even a delivered `CF-Connecting-IP` would reach no handler, PostgreSQL row,
+origin log or response. What Google's own platform does with the headers it
+receives is outside this record's evidence.
 
 Cloudflare does not document every header it adds to such a subrequest, and
 Miniflare adds none of them. E12's S7 proves what the edge's code and workerd
 send, not what Cloudflare's network adds. Only an observation on Cloudflare's
 network can establish that.
+
+### The Cloudflare-network probe (2026-10-02)
+
+At about 02:10 UTC on 2026-10-02, with the owner's authorization, a throwaway
+Worker (`tibotattle-edge-ip-probe`, on the owner's `workers.dev` subdomain, not
+the `tibotattle.com` zone, deployed by the owner) fetched a temporary public
+Cloud Run echo service (`tibotattle-ip-probe-echo` in the GCP test project,
+us-east1) as the edge does: `x-real-ip` set to the constant, plus a
+per-request salt and a salted SHA-256 of the inbound `CF-Connecting-IP`. The
+echo returned only header names and, for address-like names, booleans and
+token counts: whether the value equals or contains the constant, and whether
+it contains a token whose salted hash equals the visitor's. No value was
+returned, logged or stored. The echo was deleted afterwards; deleting the
+throwaway Worker is the owner's step. The tooling is in
+[`apps/worker/scripts/edge-ip-probe/`](../../apps/worker/scripts/edge-ip-probe/README.md),
+and the [edge receipt](../receipts/2026-10-01-gcp-edge-proxy-local.md#cloudflare-network-address-probe)
+records the run.
+
+- The Worker had the visitor's address in `CF-Connecting-IP`.
+- The header names that reached the container were `accept-encoding`,
+  `cdn-loop`, `cf-ew-via`, `cf-ray`, `cf-visitor`, `cf-worker`, `forwarded`,
+  `host`, `traceparent`, `x-cloud-trace-context`, `x-forwarded-for` and
+  `x-forwarded-proto`, plus the two probe headers. Neither `cf-connecting-ip`
+  nor `x-real-ip` arrived, and no `cf-ip*` header derived from the address
+  did.
+- `x-forwarded-for` held two tokens, including the constant, and not the
+  visitor's address. `forwarded`, which Google's front end adds, held four
+  tokens and not the visitor's address. No header contained the visitor's
+  address.
+
+For a `workers.dev` Worker with the override, then, "no client address reaches
+the origin" holds: the `x-forwarded-for` that Google delivers carries
+Cloudflare's placeholder, not the visitor's address. The probe does not prove:
+
+- the same for a Worker on the `tibotattle.com` zone. Expected, because the
+  origin is a non-Cloudflare host either way, but unobserved;
+- what the token exchange's endpoint receives. It is the same kind of
+  subrequest with the same override, but `oauth2.googleapis.com` cannot be
+  observed this way;
+- what would arrive without the override. That was not tested, so the
+  override stays load-bearing, and so does E12's S7 assertion of it;
+- anything Google's front end receives and does not deliver: the container
+  is the observation point. Nor does it show the values of headers whose
+  names are not address-like, which it did not examine;
+- delivery to an IAM-private service. The echo was public; the invoker check
+  is not expected to change header delivery, but the probe did not exercise
+  it.
 
 ### What the edge's code controls
 
@@ -254,32 +314,44 @@ network can establish that.
 - **Unchanged exposure.** Workers observability already records request URLs at
   the edge. That is existing Cloudflare exposure, not a new flow to Google.
 
-### OD-E6: the two ways forward
+### OD-E6: recommendation and gate
+
+**Recommended: keep the current topology, in which the edge forwards directly
+to the `*.run.app` origin, with the `x-real-ip` override. No proxied-hostname
+rework is needed.** The 2026-10-02 probe found no visitor address reaching the
+origin from a `workers.dev` Worker, so neither fallback below is needed unless
+the production-zone probe disagrees.
+
+**Gate: re-run the probe from the production zone before the first gcp
+deploy.** The owner deploys the echo to the test project and the probe Worker
+with an exact-path route on the `tibotattle.com` zone, calls `/probe` once,
+deletes both and records the result, as the
+[probe's README](../../apps/worker/scripts/edge-ip-probe/README.md) describes.
+It records header names and booleans, never a value. A pass keeps this
+recommendation. If any header carries the visitor's address, or a name derived
+from it arrives, the switch stays blocked and the owner chooses between the
+fallbacks:
 
 - **A. A Cloudflare-proxied origin hostname.** The edge forwards to a hostname
-  in a Cloudflare zone that fronts the Cloud Run service. Cloudflare then
-  substitutes the Worker address `2a06:98c0:3600::103` in `CF-Connecting-IP`
-  for a subrequest to another zone, and copies `x-real-ip` (the constant) into
-  it for the same zone. This needs a contract change (`canonicalRunAppOrigin`
-  accepts only `*.run.app`), new EP-7 and EP-9 templates, a DNS record and a
-  way for that hostname to reach an IAM-private service (for example a Google
-  load balancer with a serverless network endpoint group, or a Cloudflare host
-  override). It conflicts with the runbook's "no load balancer, no DNS change"
-  rule, so it needs its own owner decision. It does not cover the token
-  exchange, which still goes to Google directly; that needs the exchange moved
-  out of client requests or the exposure accepted for it.
+  in a Cloudflare zone that fronts the Cloud Run service. By Cloudflare's
+  documentation, Cloudflare then substitutes the Worker address
+  `2a06:98c0:3600::103` in `CF-Connecting-IP` for a subrequest to another
+  zone, and copies `x-real-ip` (the constant) into it for the same zone. This
+  needs a contract change (`canonicalRunAppOrigin` accepts only `*.run.app`),
+  new EP-7 and EP-9 templates, a DNS record and a way for that hostname to
+  reach an IAM-private service (for example a Google load balancer with a
+  serverless network endpoint group, or a Cloudflare host override). It
+  conflicts with the runbook's "no load balancer, no DNS change" rule, so it
+  needs its own owner decision. It does not cover the token exchange, which
+  still goes to Google directly; that needs the exchange moved out of client
+  requests or the exposure accepted for it.
 - **B. Accept and disclose.** Keep `*.run.app` and state that Google's front
   end receives the client's network address in a header Cloudflare adds, which
   the origin discards before any handler runs. Section 12's privacy-page text
   changes to say so.
 
-Either way, before the switch an owner-authorized staging edge on Cloudflare's
-network must forward to an origin that records the names of the request
-headers it receives and, for each address-bearing header (`cf-connecting-ip`,
-`x-real-ip`, `x-forwarded-for`, `forwarded`, `true-client-ip`), only whether
-its value is the constant. A header derived from the address, such as
-`cf-ipcountry`, counts as address-bearing. No value is recorded. The result
-must match the chosen option, and no local gate can replace it.
+No local gate can replace the probe: Miniflare adds none of Cloudflare's
+headers.
 
 ## 6. Request handling in gcp mode
 
@@ -561,11 +633,12 @@ state that only a gcp deploy produces, or that lacks the ingestion database.
   it does not serve `/api/ready` (finding F8). A gcp deploy therefore cannot
   pass against any fast-path origin. It can pass only once the production
   origin composition (CR-6 and CR-7) serves Worker-shaped health and readiness.
-- **Blocked on OD-E6.** Lifting F8 does not clear the switch. Until the owner
-  decides OD-E6 and the Cloudflare-network probe confirms the result
-  ([section 5](#5-client-address-privacy)), no gcp deploy may run, and the
-  privacy page cannot carry the gcp text (section 12). E10 has no code check
-  for this, so it is an owner gate.
+- **Gated on the production-zone probe (OD-E6).** Lifting F8 does not clear
+  the switch. Until the owner has re-run the address probe from the
+  `tibotattle.com` zone and recorded a pass
+  ([section 5](#od-e6-recommendation-and-gate)), no gcp deploy may run, and the
+  privacy page cannot carry the gcp text (section 12). A failed probe reopens
+  OD-E6's fallbacks. E10 has no code check for this, so it is an owner gate.
 
 ## 12. Privacy-marker rule
 
@@ -575,12 +648,14 @@ state that only a gcp deploy produces, or that lacks the ingestion database.
     analytics and release hosting;
   - Google Cloud (Cloud SQL and Cloud Storage) holds hosted data;
   - what Google receives of the client's network address, as OD-E6 settles it
-    ([section 5](#5-client-address-privacy)). Under option A, once the
-    Cloudflare-network probe shows no client value reaching the origin, the
-    page may say that Google receives no client address. Under option B it must
-    say that Google's front end receives the client's network address in a
-    header Cloudflare adds, and that the origin discards it before processing.
-    The page must not claim more than the probe showed.
+    ([section 5](#5-client-address-privacy)). With the recommended topology,
+    once the production-zone probe passes, the page may say that the edge
+    passes Google no client network address. If the probe fails and the owner
+    takes option A, the same wording needs a passing probe of that topology.
+    Under option B the page must say that Google's front end receives the
+    client's network address in a header Cloudflare adds, and that the origin
+    discards it before processing. The page must not claim more than the probe
+    showed.
 - The new text carries `data-hosting-topology="cloudflare-edge-gcp-origin"`.
 - A gcp deploy requires a candidate site, built from its own source, whose
   privacy page carries the marker (`EDGE_PRIVACY_PAGE_NOT_CUTOVER` otherwise).
@@ -685,11 +760,13 @@ These are deliberate and accepted with this record:
   admission call sites or the request-only guards ahead of them change before
   the switch.
 - OD-E6: the client address Google receives
-  ([section 5](#5-client-address-privacy)). Option A routes the origin through
-  a Cloudflare-proxied hostname, and option B accepts and discloses the
-  `CF-Connecting-IP` that Cloudflare adds. The choice, and an owner-authorized
-  probe on Cloudflare's network that confirms it, must come before any gcp
-  switch, together with the privacy-page text it implies (section 12).
+  ([section 5](#od-e6-recommendation-and-gate)). Recommended: keep the direct
+  `*.run.app` topology with the `x-real-ip` override; no proxied-hostname
+  rework. The 2026-10-02 probe from `workers.dev` found no visitor address
+  reaching the origin. Before the first gcp deploy, the owner re-runs the probe
+  from the `tibotattle.com` zone and records the result, together with the
+  privacy-page text it supports (section 12). A failure reopens option A (a
+  Cloudflare-proxied hostname) and option B (accept and disclose).
 - The rollback policy after the switch. Gcp to worker is forbidden by the
   matrix; a rollback window would need its own owner decision and a reviewed
   matrix change.

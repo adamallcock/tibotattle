@@ -25,12 +25,17 @@ against `4722c4a3`, the fixes in code commit `02841e26`, and the gates re-run
 at that commit. Where it differs from the sections before it, it supersedes
 them.
 
-The last section, [live check](#live-check), records the owner-authorized
-live check (OD-E3) run later the same day against the GCP test project, the
-four defects only it found, and the commit that adds that section, which makes
-the last two fixes permanent. It is the only part of this receipt that
-involves Google or GCP; the statements below that nothing called them hold for
-the sections before it.
+The [live check](#live-check) section records the owner-authorized live
+check (OD-E3) run later the same day against the GCP test project, the four
+defects only it found, and the commit that adds that section, which makes the
+last two fixes permanent. The last section,
+[Cloudflare-network address probe](#cloudflare-network-address-probe),
+records an owner-authorized observation made on 2026-10-02 (UTC), after this
+receipt's date, with a throwaway Worker on Cloudflare's network and a
+temporary echo service in the GCP test project. Those two sections are the
+only parts of this receipt that involve Google, GCP or Cloudflare's network;
+the statements below that nothing called them hold for the sections before
+them.
 
 Nothing was pushed or deployed. No Cloudflare API, Google endpoint or GCP
 resource was called, and wrangler ran only with `--dry-run` and without any
@@ -221,9 +226,11 @@ never reaches stdout, stderr, the receipt or an error.
 - Client-disconnect cancellation is unproven (finding 5).
 - A gcp deploy stays blocked by design until the production origin serves
   Worker-shaped `/api/health` and `/api/ready` (F8), and, separately, until the
-  owner decides OD-E6 and an authorized probe on Cloudflare's network confirms
-  which address-bearing headers reach the origin
-  ([review fixes](#review-fixes), finding 1). E10 has no code check for OD-E6.
+  owner re-runs the address probe from the `tibotattle.com` zone and records a
+  pass (OD-E6). The 2026-10-02 run from `workers.dev` found no visitor address
+  reaching the origin
+  ([Cloudflare-network address probe](#cloudflare-network-address-probe)).
+  E10 has no code check for OD-E6.
 - The edge port must also carry `02841e26`: the edge files it changes, the new
   `src/edge-google-subrequest.ts`, and the `export` keyword and two comment
   lines it adds to `contributionRequestPreflight` in `index.ts`. Otherwise
@@ -370,7 +377,9 @@ and Google's own headers. It does not qualify Cloudflare's network, Workers
 Rate Limiting across locations, Access, custom domains, the production origin
 composition (CR-6 and CR-7) or production data. OD-E6 and the probe on
 Cloudflare's network for the address-bearing headers
-([review fixes](#review-fixes), finding 1) remain open.
+([review fixes](#review-fixes), finding 1) remained open at the time; the
+probe ran on 2026-10-02
+([Cloudflare-network address probe](#cloudflare-network-address-probe)).
 
 ### Origin revisions
 
@@ -503,3 +512,94 @@ nothing was pushed.
 | `node scripts/ci-postgres-suite.mjs --plan` | The new spec routes and registers cleanly. The two failures it reports exist at `a6602516` too: `edge-origin-e2e.spec.mjs` unregistered and `postgres-ingestion-journal-transfer.spec.mjs` ambiguous |
 | Repository root `npm run architecture:check` | Passed: 922 production files, 3,937 imports, 0 debt edges |
 | Repository root `npm run test:preflight`, with this section in place | Exit 0: documentation governance valid across 303 Markdown files; 20 of 20 governance and guidance tests |
+
+## Cloudflare-network address probe
+
+At about 02:10 UTC on 2026-10-02, with the owner's authorization, a throwaway
+Worker on Cloudflare's network called a temporary Cloud Run service the way
+the edge calls Google, to observe which headers carrying the client's address
+reach the origin (OD-E6, [review fixes](#review-fixes) finding 1). This
+section copies only header names, booleans and token counts. No address, salt,
+hash or header value was returned, logged or stored.
+
+- **The Worker:** `tibotattle-edge-ip-probe`, on the owner's `workers.dev`
+  subdomain, not the `tibotattle.com` zone, and deployed by the owner. For
+  `GET /probe` it read the inbound `CF-Connecting-IP` and fetched the echo with
+  `x-real-ip` set to `2a06:98c0:3600::103` (the edge's
+  `EDGE_SUBREQUEST_REAL_IP`), a fresh random salt in `x-probe-salt`, and the
+  SHA-256 of salt plus address in `x-probe-visitor-hash`.
+- **The echo:** `tibotattle-ip-probe-echo`, a public Cloud Run service in
+  project `tibotattle` (us-east1). It answered with the sorted request header
+  names and, for each address-like name, `equalsPlaceholder`,
+  `containsPlaceholder`, `containsVisitor` (a token whose salted hash equals
+  the visitor hash) and `tokenCount`.
+- **Afterwards:** the echo service was deleted. Deleting the throwaway Worker
+  is the owner's step; this receipt does not record it.
+- **The code:** the probe that ran is now in
+  [`apps/worker/scripts/edge-ip-probe/`](../../apps/worker/scripts/edge-ip-probe/README.md),
+  renamed (`echo-server.mjs`, `probe-worker.mjs`, `wrangler.example.jsonc`).
+  The echo's classification is unchanged but now sits in an exported
+  `describeHeaders`, and the server starts only when the file is the entry
+  module, so the offline check can import it. The example configuration
+  replaces the run's `ECHO_URL` with a placeholder.
+
+### Result
+
+| Observation | Result |
+|---|---|
+| `visitorSeenByWorker` | `true`: the Worker had the visitor's `CF-Connecting-IP` |
+| Header names that reached Cloud Run | `accept-encoding`, `cdn-loop`, `cf-ew-via`, `cf-ray`, `cf-visitor`, `cf-worker`, `forwarded`, `host`, `traceparent`, `x-cloud-trace-context`, `x-forwarded-for`, `x-forwarded-proto`, and the two probe headers |
+| `cf-connecting-ip` | Absent |
+| `x-real-ip` | Absent |
+| `x-forwarded-for` | 2 tokens; contains the placeholder; does not contain the visitor |
+| `forwarded` (added by Google's front end) | 4 tokens; does not contain the visitor |
+| Any header containing the visitor's address | None |
+
+With the edge's `x-real-ip` override, the `x-forwarded-for` that Google
+delivered carried Cloudflare's placeholder, not the visitor's address, and no
+header carrying the visitor's address reached the origin. For a `workers.dev`
+Worker, "no client address reaches the origin" holds.
+
+Not covered:
+
+- a Worker on the `tibotattle.com` zone, as the production edge runs.
+  Expected to behave the same for a non-Cloudflare host, but unobserved;
+- the counterfactual without the override, which was not tested. The
+  override and E12's S7 assertion of it stay load-bearing;
+- the token exchange's endpoint, `oauth2.googleapis.com`, which gets the same
+  kind of subrequest and the same override but cannot be observed this way;
+- headers that Google's front end might receive and not deliver (the
+  container is the observation point), the values of headers whose names are
+  not address-like, and an IAM-private service (the echo was public).
+
+### What the commit that adds this section changes
+
+- The [decision record](../decisions/2026-10-01-thin-worker-edge-proxy.md)
+  records the probe in section 5 and its boundary. OD-E6 now recommends
+  keeping the direct `*.run.app` topology with the `x-real-ip` override, with
+  no proxied-hostname rework. Sections 11, 12 and 15 turn the gcp-switch gate
+  into an owner-run rerun of the probe from the production zone before the
+  first gcp deploy, and keep options A and B as the fallbacks if it fails.
+- The [edge-modes runbook](../runbooks/production-edge-modes.md) and the
+  [fast-path plan](../plans/2026-10-01-gcp-fastpath.md) say the same.
+- The probe is reusable tooling with a README covering its privacy design, the
+  production-zone rerun and how to read the result. The new offline check
+  `scripts/edge-ip-probe/echo-server.check.mjs` is registered in
+  `edge:e2e:check`, beside the harness and live-check checks.
+- The comments in `src/edge-google-subrequest.ts` and the E12 spec point to
+  the probe. No code path changes.
+
+### Gates for the commit that adds this section
+
+Local only, on the same workstation, under Node 26.2.0. No GCP or Cloudflare
+call was made, and nothing was pushed. The E12 spec was not re-run: its change
+is a comment.
+
+| Gate | Result |
+|---|---|
+| New `scripts/edge-ip-probe/echo-server.check.mjs` | 6 of 6. With the visitor match disabled in the echo, 1 of 6 fails |
+| `npm run edge:e2e:check` (apps/worker) | Exit 0: 18 of 18 (harness, live-check and probe checks), and the edge-mode dry run passes |
+| Vitest: `edge-request-header-allowlist`, `edge-google-id-token` and `edge-origin-proxy` specs, which load the edited source | 225 of 225 |
+| `npx tsc --noEmit` (apps/worker) | Exit 0 |
+| Repository root `npm run architecture:check` | Passed: 922 production files, 3,937 imports, 0 debt edges |
+| Repository root `npm run test:preflight`, with this section in place | Exit 0: root workspace hygiene clean; documentation governance valid across 304 Markdown files; 20 of 20 governance and guidance tests |
