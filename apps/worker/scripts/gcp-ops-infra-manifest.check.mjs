@@ -7,16 +7,18 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { resolveAnalyticsRefreshDatabase } from "../cloud-run/analytics-refresh.mjs";
 import * as configuration from "../cloud-run/postgres-production-configuration.mjs";
+import * as migrations from "../cloud-run/postgres-production-migrations.mjs";
 import { TEST_MIGRATIONS_TARGETS } from "../cloud-run/test-migrations.mjs";
 import { GCP_PRIVATE_TEST_TARGET } from "./gcp-private-test-deploy.mjs";
 import { FASTPATH_TEST } from "./gcp-fastpath-test-deploy.mjs";
 import * as manifest from "./gcp-ops-infra-manifest.mjs";
+import * as rollout from "./gcp-production-rollout.mjs";
 
 process.env.PATH = "/nonexistent-gcloud-guard";
 
@@ -27,9 +29,6 @@ const FIXTURE = JSON.parse(readFileSync(FIXTURE_PATH, "utf8"));
 const SERVICE_TEMPLATE = readFileSync(join(WORKER_ROOT, "cloud-run/production-service.template.yaml"), "utf8");
 const IMAGE = Object.freeze({ imageDigest: "a".repeat(64), sourceCommit: "b".repeat(40) });
 const UNMARKED_PROJECT = "example-ops-prod1";
-// OPS-10's modules (claude/gcp-fp-w2-opsdb), present only once integrated.
-const OPS10_MIGRATIONS_MODULE = join(WORKER_ROOT, "cloud-run/postgres-production-migrations.mjs");
-const OPS10_ROLLOUT_MODULE = join(SCRIPTS_ROOT, "gcp-production-rollout.mjs");
 const PARSED_PERMISSIONS = Object.freeze([
   "storage.buckets.get", "storage.objects.create", "storage.objects.delete",
   "storage.objects.get", "storage.objects.list",
@@ -52,6 +51,7 @@ function stagingNames(value) {
   value.environment = "staging";
   value.artifactRegistry.repository = "synthetic-staging-images";
   value.serviceAccounts.builder.accountId = "synthetic-staging-builder";
+  value.serviceAccounts.verifier.accountId = "synthetic-staging-verifier";
   value.cloudSql.instance = "synthetic-staging-primary";
   value.bucket.name = "synthetic-staging-quarantine";
   value.service.name = "synthetic-staging-origin";
@@ -262,15 +262,22 @@ test("the production and staging planes keep their markers apart", () => {
   assert.throws(() => manifest.validateDesiredState(staging((value) => {
     value.jobs["production-migrate"].name = "synthetic-staging-production-migrate";
   })), { code: "DESIRED_STATE_PRODUCTION_NAME_FORBIDDEN:jobs.production-migrate.name" });
-  // OPS-10 reads the image repository and the builder account as plane resources too.
+  // OPS-10 reads the image repository and the builder and verifier accounts as plane resources too.
   assert.throws(() => manifest.validateDesiredState(staging((value) => {
     value.serviceAccounts.builder.accountId = "synthetic-builder";
   })), { code: "DESIRED_STATE_STAGING_MARKER_MISSING:serviceAccounts.builder.accountId" });
+  assert.throws(() => manifest.validateDesiredState(staging((value) => {
+    value.serviceAccounts.verifier.accountId = "synthetic-verifier";
+  })), { code: "DESIRED_STATE_STAGING_MARKER_MISSING:serviceAccounts.verifier.accountId" });
+  assert.equal(manifest.validateDesiredState(staging((value) => { value.serviceAccounts.verifier = null; }))
+    .serviceAccounts.verifier, null, "a staging plane without a verifier still validates");
   assert.throws(() => manifest.validateDesiredState(staging((value) => {
     value.artifactRegistry.repository = "synthetic-images";
   })), { code: "DESIRED_STATE_STAGING_MARKER_MISSING:artifactRegistry.imageRepository" });
   refused((value) => { value.serviceAccounts.builder.accountId = "synthetic-staging-builder"; },
     "DESIRED_STATE_STAGING_NAME_FORBIDDEN:serviceAccounts.builder.accountId");
+  refused((value) => { value.serviceAccounts.verifier.accountId = "synthetic-staging-verifier"; },
+    "DESIRED_STATE_STAGING_NAME_FORBIDDEN:serviceAccounts.verifier.accountId");
   refused((value) => { value.artifactRegistry.imageName = "staging-host"; },
     "DESIRED_STATE_STAGING_NAME_FORBIDDEN:artifactRegistry.imageRepository");
   // No plane resource carries a 'test' or 'rehearsal' token (OPS-10 refuses either).
@@ -600,7 +607,9 @@ test("the two jobs render with their accounts, entries and bounds, the analytics
 test("rolloutTarget gives OPS-10 its closed target from the environment's owner-held desired state", () => {
   const path = "/synthetic-desired/production.json";
   const stagingPath = "/synthetic-desired/staging.json";
+  const noVerifierPath = "/synthetic-desired/no-verifier.json";
   const files = { [path]: JSON.stringify(unmarked()), [stagingPath]: JSON.stringify(unmarked(stagingNames)),
+    [noVerifierPath]: JSON.stringify(unmarked((value) => { value.serviceAccounts.verifier = null; })),
     [FIXTURE_PATH]: JSON.stringify(FIXTURE) };
   const readFile = (target) => {
     if (!Object.hasOwn(files, target)) throw new Error("synthetic: unexpected read");
@@ -621,6 +630,9 @@ test("rolloutTarget gives OPS-10 its closed target from the environment's owner-
     primaryInstance: "synthetic-primary",
     imageRepository: `us-east1-docker.pkg.dev/${UNMARKED_PROJECT}/synthetic-images/synthetic-host`,
     builderServiceAccount: `synthetic-builder@${UNMARKED_PROJECT}.iam.gserviceaccount.com`,
+    // The EP-6 verifier path roll reads /api/health through outside gcp mode.
+    verifierServiceAccount: `synthetic-verifier@${UNMARKED_PROJECT}.iam.gserviceaccount.com`,
+    originAudience: "synthetic-edge-origin-audience",
   });
   assert.equal(Object.isFrozen(target.jobNames), true);
   assert.equal(manifest.rolloutTarget("staging", { env: { GCP_INFRA_DESIRED_STATE_STAGING: stagingPath }, readFile })
@@ -636,21 +648,22 @@ test("rolloutTarget gives OPS-10 its closed target from the environment's owner-
     ["production", { GCP_INFRA_DESIRED_STATE_PRODUCTION: "/synthetic-desired/absent.json" }, "DESIRED_STATE_UNREADABLE"],
     // The shipped synthetic fixture is never a rollout target.
     ["production", { GCP_INFRA_DESIRED_STATE_PRODUCTION: FIXTURE_PATH }, "ROLLOUT_TARGET_SYNTHETIC_REFUSED"],
+    // The desired state may omit the verifier; a rollout cannot.
+    ["production", { GCP_INFRA_DESIRED_STATE_PRODUCTION: noVerifierPath }, "ROLLOUT_TARGET_VERIFIER_REQUIRED"],
   ]) {
     assert.throws(() => manifest.rolloutTarget(environment, { env, readFile }), { code }, `${environment} ${code}`);
   }
 });
 
-test("OPS-10 accepts the rendered migration job and the rollout target (runs once its modules are integrated)", {
-  skip: existsSync(OPS10_MIGRATIONS_MODULE) && existsSync(OPS10_ROLLOUT_MODULE)
-    ? false : "OPS-10 (claude/gcp-fp-w2-opsdb) is not on this branch",
-}, async () => {
-  const migrations = await import(pathToFileURL(OPS10_MIGRATIONS_MODULE).href);
-  const rollout = await import(pathToFileURL(OPS10_ROLLOUT_MODULE).href);
+test("OPS-10 accepts the rendered migration job and the rollout target (integrated; never skipped)", async () => {
   const job = migrations.PRODUCTION_MIGRATION_JOB;
+  // Single-sourced: the manifest imports OPS-10's job, it does not mirror it.
   assert.deepEqual([...manifest.JOB_DEFINITIONS["production-migrate"].args], [job.entry]);
   assert.equal(manifest.JOB_DEFINITIONS["production-migrate"].account, job.serviceAccount);
   assert.equal(manifest.JOB_DEFINITIONS["production-migrate"].timeoutSeconds, job.taskTimeoutSeconds);
+  assert.equal(manifest.JOB_DEFINITIONS["production-migrate"].env, job.env);
+  assert.doesNotMatch(readFileSync(join(SCRIPTS_ROOT, "gcp-ops-infra-manifest.mjs"), "utf8"),
+    /"PRODUCTION_MIGRATOR_SERVICE_ACCOUNT"/u, "the migrate env list is not restated in the manifest");
   assert.deepEqual([...rollout.ROLLOUT_TARGET_KEYS], [...manifest.ROLLOUT_TARGET_KEYS]);
   for (const value of [unmarked(), unmarked(stagingNames)]) {
     const desired = manifest.validateDesiredState(value);
@@ -658,6 +671,7 @@ test("OPS-10 accepts the rendered migration job and the rollout target (runs onc
     const task = rendered.spec.template.spec.template.spec;
     assert.equal(task.maxRetries, job.maxRetries);
     assert.equal(rendered.spec.template.spec.taskCount, job.tasks);
+    assert.equal(rendered.spec.template.spec.parallelism, job.parallelism);
     const env = Object.fromEntries(task.containers[0].env.map((entry) => [entry.name, entry.value]));
     const config = migrations.validateProductionMigrationEnvironment({ ...env, CLOUD_RUN_JOB: rendered.metadata.name,
       CLOUD_RUN_EXECUTION: `${rendered.metadata.name}-abcde`, CLOUD_RUN_TASK_INDEX: "0", CLOUD_RUN_TASK_COUNT: "1",

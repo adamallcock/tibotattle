@@ -58,6 +58,7 @@ import {
   STAGING_RESOURCE_MARKER,
 } from "../cloud-run/postgres-production-configuration.mjs";
 import { desiredBackupConfiguration } from "../cloud-run/ops-backup-horizon.mjs";
+import { PRODUCTION_MIGRATION_JOB } from "../cloud-run/postgres-production-migrations.mjs";
 import {
   FASTPATH_MIGRATIONS_JOB,
   FASTPATH_MIGRATION_TARGETS,
@@ -208,24 +209,18 @@ export const LOGGING_POSTURE = Object.freeze({
 /** Cloud Run Job definitions for the fast path (rendered only; OPS-3-lite). */
 export const JOB_DEFINITIONS = Object.freeze({
   // OPS-10's PRODUCTION_MIGRATION_JOB (cloud-run/postgres-production-
-  // migrations.mjs on claude/gcp-fp-w2-opsdb e46ceb56, not on this base):
-  // manual, migrator account, one task, no retries, 1,800 s, one primary pool
-  // of one connection. The entry is its build output, and the env keys are
-  // exactly the ones its validateProductionMigrationEnvironment reads (Cloud
-  // Run supplies CLOUD_RUN_*). Mirrored until integration single-sources
-  // them; the manifest check runs that validator on this render once the
-  // module is present.
+  // migrations.mjs) is the single source: its build-output entry, migrator
+  // account, task timeout and the env keys its
+  // validateProductionMigrationEnvironment reads (Cloud Run supplies
+  // CLOUD_RUN_*). renderJob's one task, one attempt and no retries match it;
+  // the manifest check runs that validator on this render.
   "production-migrate": Object.freeze({
-    account: "migrator",
-    args: Object.freeze(["dist/production-migrations.mjs"]),
-    timeoutSeconds: 1_800,
+    account: PRODUCTION_MIGRATION_JOB.serviceAccount,
+    args: Object.freeze([PRODUCTION_MIGRATION_JOB.entry]),
+    timeoutSeconds: PRODUCTION_MIGRATION_JOB.taskTimeoutSeconds,
     cpu: "1",
     memory: "512Mi",
-    env: Object.freeze([
-      "MIGRATION_ENVIRONMENT", "GOOGLE_CLOUD_PROJECT", "PRODUCTION_MIGRATOR_SERVICE_ACCOUNT",
-      "POSTGRES_MIGRATOR_IAM_USER", "POSTGRES_RUNTIME_IAM_USER", "ENVIRONMENT_PRIMARY_INSTANCE_CONNECTION_NAME",
-      "PRIMARY_INSTANCE_CONNECTION_NAME", "PRIMARY_DATABASE", "PRIMARY_SCHEMA", "DEPLOYMENT_SOURCE_COMMIT",
-    ]),
+    env: PRODUCTION_MIGRATION_JOB.env,
   }),
   // cloud-run/analytics-refresh.mjs: one full recompute (the only mode).
   "analytics-refresh": Object.freeze({
@@ -824,6 +819,9 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
   if (jobs["analytics-refresh"].maxConnections < analyticsRefreshPoolMax({ readSource })) {
     fail("JOB_POOL_MAX_UNDERDECLARED:analytics-refresh");
   }
+  if (jobs["production-migrate"].maxConnections < PRODUCTION_MIGRATION_JOB.pools.primary) {
+    fail("JOB_POOL_MAX_UNDERDECLARED:production-migrate");
+  }
 
   if (!isRecord(input.scheduler)
       || Object.keys(input.scheduler).sort().join() !== [...SCHEDULED_JOB_NAMES].sort().join()) {
@@ -866,9 +864,11 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
     ["plane:cloudSql.instance", cloudSql.instance],
     ["plane:bucket.name", bucket.name],
     // OPS-10 also requires the plane marker on the image repository and the
-    // builder account it reads from rolloutTarget.
+    // builder and verifier accounts it reads from rolloutTarget.
     ["plane:artifactRegistry.imageRepository", artifactRegistry.imageRepository],
     ["plane:serviceAccounts.builder.accountId", serviceAccounts.builder.accountId],
+    ...(serviceAccounts.verifier === null ? []
+      : [["plane:serviceAccounts.verifier.accountId", serviceAccounts.verifier.accountId]]),
     ["plane:service.name", service.name],
     ...JOB_NAMES.map((job) => [`plane:jobs.${job}.name`, jobs[job].name]),
     ...SCHEDULED_JOB_NAMES.map((job) => [`plane:scheduler.${job}.name`, scheduler[job].name]),
@@ -1358,16 +1358,21 @@ export function deployedJobNames() {
 /** The keys of OPS-10's closed RolloutTarget (scripts/gcp-production-rollout.mjs). */
 export const ROLLOUT_TARGET_KEYS = Object.freeze([
   "environment", "project", "region", "service", "migrationJob", "jobNames", "primaryInstance",
-  "imageRepository", "builderServiceAccount",
+  "imageRepository", "builderServiceAccount", "verifierServiceAccount", "originAudience",
 ]);
 
 /**
  * OPS-10's RolloutTarget for a validated desired state: the service, the
  * deployed jobs (a deferred job does not exist, so the rollout never moves
- * it), the one primary instance, the image repository and the builder.
+ * it), the one primary instance, the image repository, the builder, and the
+ * EP-6 verifier path roll reads /api/health through while the edge is not in
+ * gcp mode: the verifier account and the origin's ID-token audience. The
+ * verifier is optional in the desired state, but a rollout needs it, so a
+ * desired state without one is refused ROLLOUT_TARGET_VERIFIER_REQUIRED.
  */
 export function rolloutTargetFromDesiredState(desired) {
   if (desired.synthetic) fail("ROLLOUT_TARGET_SYNTHETIC_REFUSED");
+  if (desired.serviceAccounts.verifier === null) fail("ROLLOUT_TARGET_VERIFIER_REQUIRED");
   return deepFreeze({
     environment: desired.environment,
     project: desired.project,
@@ -1378,6 +1383,8 @@ export function rolloutTargetFromDesiredState(desired) {
     primaryInstance: desired.cloudSql.instance,
     imageRepository: desired.artifactRegistry.imageRepository,
     builderServiceAccount: desired.serviceAccounts.builder.email,
+    verifierServiceAccount: desired.serviceAccounts.verifier.email,
+    originAudience: desired.service.audience,
   });
 }
 

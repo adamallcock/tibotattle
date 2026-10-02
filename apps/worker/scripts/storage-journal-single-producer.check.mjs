@@ -88,10 +88,17 @@ const IDENTIFIER_RELATION = /^\$\{(?:[^`{}]*[(,]\s*)?([A-Za-z_$][\w$]*)\s*\)?\s*
  *   it 0444. That file is the source JOURNAL_TRANSFER, the sealed D1 import,
  *   reads; it never writes PostgreSQL, and the rehearsal's PostgreSQL journal
  *   rows come only from that transfer.
+ *   scripts/cutover-source-projections.mjs (PT-2-lite, W2-SEAL):
+ *   projectIngestionJournal's one prepared node:sqlite INSERT copies the
+ *   sealed D1 storage_source_state and storage_ingestion_changes rows into a
+ *   new journal-only SQLite file in the owner directory, in
+ *   buildJournalSqlite's layout, written 0400. JOURNAL_TRANSFER reads that
+ *   file; this module never opens PostgreSQL.
  */
 const REVIEWED_DYNAMIC_WRITERS = new Map([
   ["scripts/postgres-analytics-history-transfer.mjs", 1],
   ["scripts/gcp-fastpath-rehearsal.mjs", 1],
+  ["scripts/cutover-source-projections.mjs", 1],
 ]);
 
 /** Blank comments and regex-literal bodies (keeping offsets); strings and templates stay. */

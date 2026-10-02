@@ -47,7 +47,9 @@
  * The environment's resources come from the infrastructure manifest
  * (scripts/gcp-ops-infra-manifest.mjs, OPS-2): its rolloutTarget(environment)
  * returns the closed RolloutTarget below, whose jobNames are the manifest's
- * JOB_NAMES for that environment. Until that module exists every verb refuses
+ * JOB_NAMES for that environment, less the jobs it defers. A missing module,
+ * or a manifest refusal (an unconfigured, unreadable, synthetic or
+ * verifier-less desired state), refuses every verb with
  * ROLLOUT_INFRA_MANIFEST_UNAVAILABLE.
  *
  * Output and errors are content-free: names, digests, commits and closed codes.

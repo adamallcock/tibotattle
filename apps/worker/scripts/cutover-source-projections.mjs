@@ -93,7 +93,7 @@ export async function projectIngestionJournal({ sealedIngestion, outputPath } = 
     output.exec("PRAGMA journal_mode=DELETE");
     output.exec("BEGIN");
     for (const entry of ddl) output.exec(entry.sql);
-    const copy = (table, columns, keyColumn) => {
+    const copyRows = (table, columns, keyColumn) => {
       const list = columns.map(column => `"${column}"`).join(",");
       const read = sealed.prepare(`SELECT ${list} FROM "${table}" WHERE "${keyColumn}" > ? ORDER BY "${keyColumn}" LIMIT ?`);
       read.setReadBigInts(true);
@@ -109,8 +109,8 @@ export async function projectIngestionJournal({ sealedIngestion, outputPath } = 
         after = page.at(-1)[keyColumn];
       }
     };
-    copy("storage_source_state", ["singleton", "source_id", "authority_epoch"], "singleton");
-    copy("storage_ingestion_changes", ["sequence", "event_digest", "owner_digest", "revision", "kind", "object_digest",
+    copyRows("storage_source_state", ["singleton", "source_id", "authority_epoch"], "singleton");
+    copyRows("storage_ingestion_changes", ["sequence", "event_digest", "owner_digest", "revision", "kind", "object_digest",
       "content_digest", "authority_epoch", "public_authority_epoch", "recorded_ms"], "sequence");
     output.exec("COMMIT");
   } catch (error) {

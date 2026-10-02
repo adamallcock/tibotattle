@@ -18,6 +18,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { classifyGcloudCommand } from "./gcp-ops-infra-operations.mjs";
 import { main, parseGcpInfraArgs } from "./gcp-infra.mjs";
+import { INFRA_READBACK_ARGV, ROLLOUT_ARGV } from "./gcp-production-rollout.mjs";
 import {
   bornBucket,
   createFakeGcloud,
@@ -192,7 +193,12 @@ test("apply refuses the synthetic fixture before any call, and runs an authorize
 test("readback --require-clean --environment is OPS-10's preflight: exit 0 only when clean", async () => {
   const project = "example-ops-prod1";
   const env = { GCP_INFRA_DESIRED_STATE_PRODUCTION: UNMARKED_PATH };
-  const preflight = ["readback", "--require-clean", "--environment=production"];
+  // Exactly the argv OPS-10's rollout runs (from apps/worker), less `node <script>`.
+  const rolloutArgv = ROLLOUT_ARGV.infraReadback("production");
+  assert.deepEqual(rolloutArgv.slice(0, 2), ["node", "scripts/gcp-infra.mjs"]);
+  assert.deepEqual(rolloutArgv.slice(0, INFRA_READBACK_ARGV.length), [...INFRA_READBACK_ARGV]);
+  const preflight = rolloutArgv.slice(2);
+  assert.deepEqual(preflight, ["readback", "--require-clean", "--environment=production"]);
   const writer = memoryWriter();
   const gcloud = createFakeGcloud(world(project), { files: writer.files, project, region: "us-east1" });
   // An estate apply has not built yet is not clean.

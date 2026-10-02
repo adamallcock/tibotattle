@@ -30,6 +30,7 @@ import {
   assessProductionBuild,
   EDGE_CAPTURE_MAX_AGE_MS,
   imageReference,
+  loadRolloutTargetFromInfraManifest,
   parseRolloutArguments,
   PRE_MIGRATION_BACKUPS,
   ROLLOUT_ARGV,
@@ -1016,9 +1017,19 @@ test("build writes the audited archive, submits that file and qualifies the buil
       archiveSha256: ARCHIVE_SHA256 }).digest, DIGEST);
   });
 
-test("without the infrastructure manifest every verb fails closed, and error codes stay content-free", async () => {
-  await assert.rejects(runRollout(["preflight", "--environment=production", `--commit=${COMMIT}`,
-    "--backup-audit=/synthetic/audit.json"], { run: () => assert.fail("never") }), isCode("ROLLOUT_INFRA_MANIFEST_UNAVAILABLE"));
+test("without an owner-held desired state every verb fails closed, and error codes stay content-free", async () => {
+  // The OPS-2 manifest is integrated: the default loader reaches its
+  // rolloutTarget, which refuses an unconfigured desired-state path, and the
+  // rollout reports that as ROLLOUT_INFRA_MANIFEST_UNAVAILABLE before running anything.
+  const saved = process.env.GCP_INFRA_DESIRED_STATE_PRODUCTION;
+  delete process.env.GCP_INFRA_DESIRED_STATE_PRODUCTION;
+  try {
+    await assert.rejects(loadRolloutTargetFromInfraManifest("production"), isCode("GCP_INFRA_DESIRED_STATE_UNCONFIGURED"));
+    await assert.rejects(runRollout(["preflight", "--environment=production", `--commit=${COMMIT}`,
+      "--backup-audit=/synthetic/audit.json"], { run: () => assert.fail("never") }), isCode("ROLLOUT_INFRA_MANIFEST_UNAVAILABLE"));
+  } finally {
+    if (saved !== undefined) process.env.GCP_INFRA_DESIRED_STATE_PRODUCTION = saved;
+  }
   assert.equal(safeRolloutErrorCode({ code: "EDGE_CONTRACT_DRIFT" }), "EDGE_CONTRACT_DRIFT");
   assert.equal(safeRolloutErrorCode({ code: "PRODUCTION_COORDINATION_BUSY" }), "PRODUCTION_COORDINATION_BUSY");
   assert.equal(safeRolloutErrorCode({ code: "EDGE_ORIGIN_VERIFIER_UNREACHABLE" }), "EDGE_ORIGIN_VERIFIER_UNREACHABLE");
