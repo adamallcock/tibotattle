@@ -46,6 +46,13 @@ function legacyFixture(version, block = SIX_MODELS.map(model => ({ ...model })))
   return payload;
 }
 const v13 = block => legacyFixture(V13, block);
+// The v1.0 row shape: the same publication with `combined` removed from every
+// breakdown day. A newer version that happens to carry this shape is the one
+// payload the row check cannot refuse, so only the accepted-version list can.
+function withoutCombined(payload) {
+  for (const day of payload.allowanceBreakdowns.days) delete day.combined;
+  return payload;
+}
 // The same publication, as v1.1 served it before the block was added.
 const v11 = () => legacyFixture("community-allowance-breakdowns-v1.1", null);
 
@@ -209,6 +216,11 @@ test("a newer breakdown version is refused whole, v1.4 included, and activity is
     ["v1.4 on the v1.3 legacy basis", () => legacyFixture("community-allowance-breakdowns-v1.4")],
     ["v1.4 on the current basis", () => { const p = current(); p.allowanceBreakdowns.schemaVersion = "community-allowance-breakdowns-v1.4"; return p; }],
     ["v1.5", () => legacyFixture("community-allowance-breakdowns-v1.5")],
+    // These carry the v1.0 row shape, so the row check would accept them. Only
+    // the accepted-version list refuses them, which is what they pin.
+    ["v1.4 in the v1.0 row shape, without combined", () => withoutCombined(legacyFixture("community-allowance-breakdowns-v1.4"))],
+    ["v1.4 in the v1.0 row shape, without combined or block", () => withoutCombined(legacyFixture("community-allowance-breakdowns-v1.4", null))],
+    ["v1.5 in the v1.0 row shape, without combined", () => withoutCombined(legacyFixture("community-allowance-breakdowns-v1.5"))],
     ["v1.13, which is not v1.1 or v1.3", () => legacyFixture("community-allowance-breakdowns-v1.13")],
     ["v2.0", () => legacyFixture("community-allowance-breakdowns-v2.0")],
     ["v1.3.1", () => legacyFixture(`${V13}.1`)],
@@ -225,6 +237,24 @@ test("a newer breakdown version is refused whole, v1.4 included, and activity is
     assert.equal(render(build(), "models").state, "breakdowns_unavailable", name);
     assert.ok(render(build(), "models").text.includes(UNAVAILABLE), name);
   }
+});
+
+test("the accepted-version list is exactly v1.0 to v1.3, and the v1.0 row shape is accepted only as v1.0", () => {
+  // Pinned at the list itself, so adding a version without reading it cannot
+  // pass on the side effect of a row shape.
+  assert.deepEqual([...COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS], [
+    "community-allowance-breakdowns-v1.0",
+    "community-allowance-breakdowns-v1.1",
+    "community-allowance-breakdowns-v1.2",
+    "community-allowance-breakdowns-v1.3",
+  ]);
+  assert.ok(Object.isFrozen(COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS));
+  // Control: the shape the refused cases use is a readable v1.0 payload, so those
+  // cases are refused for their version and for nothing else.
+  const v10 = series(withoutCombined(legacyFixture("community-allowance-breakdowns-v1.0", null)));
+  assert.notEqual(v10.breakdowns, null);
+  assert.equal(v10.breakdowns.hasCombined, false);
+  assert.equal(v10.breakdowns.modelMetadata, "absent");
 });
 
 test("v1.3 is still checked on v1.1's basis, so a v1.3 that claims the current basis or plans is refused", () => {
