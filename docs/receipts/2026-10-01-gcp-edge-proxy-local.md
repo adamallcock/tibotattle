@@ -533,8 +533,11 @@ hash or header value was returned, logged or stored.
   names and, for each address-like name, `equalsPlaceholder`,
   `containsPlaceholder`, `containsVisitor` (a token whose salted hash equals
   the visitor hash) and `tokenCount`.
-- **Afterwards:** the echo service was deleted. Deleting the throwaway Worker
-  is the owner's step; this receipt does not record it.
+- **Afterwards:** the echo service was deleted. The owner then deleted the
+  throwaway Worker on 2026-10-02 (`wrangler delete` reported it deleted). A
+  re-check confirmed both were gone: `GET /probe` on the Worker's
+  `workers.dev` address returns 404, and project `tibotattle` lists no
+  `ip-probe` Cloud Run service.
 - **The code:** the probe that ran is now in
   [`apps/worker/scripts/edge-ip-probe/`](../../apps/worker/scripts/edge-ip-probe/README.md),
   renamed (`echo-server.mjs`, `probe-worker.mjs`, `wrangler.example.jsonc`).

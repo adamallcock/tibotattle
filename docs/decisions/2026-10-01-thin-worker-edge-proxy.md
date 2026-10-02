@@ -246,8 +246,8 @@ per-request salt and a salted SHA-256 of the inbound `CF-Connecting-IP`. The
 echo returned only header names and, for address-like names, booleans and
 token counts: whether the value equals or contains the constant, and whether
 it contains a token whose salted hash equals the visitor's. No value was
-returned, logged or stored. The echo was deleted afterwards; deleting the
-throwaway Worker is the owner's step. The tooling is in
+returned, logged or stored. Both the echo and the throwaway Worker were
+deleted afterwards (the Worker by the owner). The tooling is in
 [`apps/worker/scripts/edge-ip-probe/`](../../apps/worker/scripts/edge-ip-probe/README.md),
 and the [edge receipt](../receipts/2026-10-01-gcp-edge-proxy-local.md#cloudflare-network-address-probe)
 records the run.
