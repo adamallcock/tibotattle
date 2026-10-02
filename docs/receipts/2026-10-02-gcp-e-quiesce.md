@@ -9,8 +9,10 @@ status: snapshot
 
 This is a 2026-10-02 receipt for stream E-QUIESCE on branch
 `claude/gcp-fp-e-quiesce`, built on `c80f99b9` (`claude/gcp-fastpath-final`
-at the C-MAINT merge). The code is one commit, `698d04c8`; the commit that adds
-this receipt also corrects one sentence of the fast-path plan. It records
+at the C-MAINT merge). The code is `698d04c8`; `35b630eb` added the first
+receipt and corrected one sentence of the fast-path plan; the commit at the
+branch head is the review fix (phases, the analytics drain's queue and terminal
+epoch; see [Review](#review-of-the-first-build)). It records
 **local, synthetic** evidence only: one macOS arm64 workstation, Node 26.2.0.
 No Cloudflare or Google Cloud resource was read or written, no `wrangler` or
 `gcloud` command ran, nothing was pushed or merged, and no PostgreSQL object was
@@ -28,24 +30,65 @@ the seal (PT-2-lite) or the identity importer (PT-3) refuse inside the outage
 window, where each miss costs another fence, release and re-seal cycle.
 
 `apps/worker/scripts/cutover-quiescence-check.mjs` runs seven checks. Each one
-reports counts, and a verdict of `clear`, `blocked` or `not-evaluated`; each one
+reports counts, and a status of `clear`, `blocked` or `not-evaluated`; each one
 names the refusal it stands for and whether that refusal exists in code at this
-commit (`refusals[].implemented`).
+commit (`refusals[].implemented`), and carries the gate it has in the run's
+phase.
 
-| Check | Reads | Refusal it stands for | In code |
-|---|---|---|---|
-| `participants-quiescent` | ingestion | PT-3 `CUTOVER_PARTICIPANT_ERASURE_PENDING`: a participant that is not `active`, or still has a `deletion_session_id` | yes |
-| `deletion-digest-intersection` | ingestion, ledger | PT-2-lite and PT-3 `CUTOVER_ERASED_PARTICIPANT_PRESENT`: a participant whose deletion digest is a recorded tombstone | yes |
-| `owner-links-erased` | ingestion | PT-8 erasure quiescence: a v1.1 owner link already `erased` | no |
-| `pending-quarantine-registrations` | ingestion | PT-4 and PT-8: any `pending_quarantine_objects` row, split `registered` and `deleting` | no |
-| `correction-runtime` | ingestion | PT-8 `CUTOVER_CORRECTION_RUNTIME_ACTIVE`: the runtime row must be the one `staged` row, with no correction facts or history | no |
-| `pending-erasure-jobs` | ledger | PT-8 pending jobs and HX-6 `pendingErasureJobs`: `storage_erasure_jobs` in `pending` | no |
-| `analytics-delivery` | ingestion, analytics | HX-6 `cursorEqualsJournalMax` and the operator's `--analytics-drain-complete` attestation to EP-8 | no |
+| Check | Reads | Refusal it stands for | In code | Gates before the fence |
+|---|---|---|---|---|
+| `participants-quiescent` | ingestion | PT-3 `CUTOVER_PARTICIPANT_ERASURE_PENDING`: a participant that is not `active`, or still has a `deletion_session_id` | yes | yes |
+| `deletion-digest-intersection` | ingestion, ledger | PT-2-lite and PT-3 `CUTOVER_ERASED_PARTICIPANT_PRESENT`: a participant whose deletion digest is a recorded tombstone | yes | yes |
+| `pending-erasure-jobs` | ledger | PT-8 pending jobs and HX-6 `pendingErasureJobs`: `storage_erasure_jobs` in `pending` | no | yes |
+| `owner-links-erased` | ingestion | PT-8 erasure quiescence: a v1.1 owner link already `erased` | no | advisory |
+| `pending-quarantine-registrations` | ingestion | PT-4 and PT-8: any `pending_quarantine_objects` row, split `registered` and `deleting` | no | advisory |
+| `correction-runtime` | ingestion | PT-8 `CUTOVER_CORRECTION_RUNTIME_ACTIVE`: the runtime row must be the one `staged` row, with no correction facts or history | no | advisory until PT-8 lands |
+| `analytics-delivery` | ingestion, analytics | the D1 analytics export oracle's drain proof (`proveQuiescence`: `cursor_not_at_journal_max`, `queue_rows`, `terminal_undelivered`), HX-6's `cursorEqualsJournalMax`, `queueRows` and `deliveredGteSource`, and the operator's `--analytics-drain-complete` attestation to EP-8 | the oracle's yes, HX-6's no | advisory |
 
 A check whose input is absent is `not-evaluated`, never `clear`: a missing
-input is not zero. The verdict is `blocked` if any check blocks, else
-`incomplete` if any check was not evaluated, else `quiescent`. Exit status is 0,
-2 and 3 for those, and 1 for an error.
+input is not zero.
+
+### Phases: what gates the verdict and the exit status
+
+Every run names its phase with `--phase pre-fence` or `--phase post-fence`.
+There is no default, so a run cannot silently use the weaker gate, and a sealed
+source (`--seal`) is post-fence by construction: `--seal` with `pre-fence` is
+refused. The phase decides which checks gate; every check is still evaluated and
+reported with its own `gate` of `gating` or `informational`.
+
+- **`pre-fence`** gates only on the unfinished erasure state the owner must
+  finish on Cloudflare before applying the EP-8 fence (owner decision: no
+  override, finish the erasure, then re-seal): `participants-quiescent`,
+  `deletion-digest-intersection` and `pending-erasure-jobs`. Quarantine
+  registrations and analytics lag are normal on a healthy live source, and
+  `owner-links-erased` and `correction-runtime` are PT-8 refusals that are not
+  in code, so they are advisory. `correction-runtime` joins this gate when
+  PT-8's refusal lands.
+- **`post-fence`** (a fenced and drained export, or the sealed files) gates on
+  all seven.
+
+The verdict and the exit status follow the gating checks of the phase only:
+
+| Exit | Verdict | Act on |
+|---|---|---|
+| 0 | `quiescent` | every gating check is clear. Pre-fence this is the go for the fence, not a claim that the source is drained |
+| 2 | `blocked` | `report.blocked`, the gating checks that block |
+| 3 | `incomplete` | nothing gating blocks but a gating check was not evaluated: `report.notEvaluated` |
+| 1 | error | a refused argument, input or result |
+
+Informational findings are listed in `report.advisory.blocked` and
+`report.advisory.notEvaluated` and never change the verdict. In the owner-run
+Wrangler `evaluate` mode the deletion-digest intersection is always
+`not-evaluated` (it needs local hashing), so the best that mode can give is exit
+3 with `blocked` empty and `notEvaluated` equal to
+`["deletion-digest-intersection"]`: every gating check D1 can answer is clear,
+and `check` on an export answers the intersection.
+
+`pending-erasure-jobs` gates before the fence because an unfinished job
+normally accompanies a mid-erasure participant and costs a fence cycle. The
+HX-6 brief has the analytics Workers keep running after the main Worker is
+fenced and finish pending jobs while they drain, so a job that is still pending
+after the fence can clear without a re-fence; after the fence it gates the seal.
 
 ### The predicates are imported, not copied
 
@@ -64,9 +107,27 @@ input is not zero. The verdict is `blocked` if any check blocks, else
   once, and that the checker source holds none of them and no digest-domain
   code.
 
-The other five checks implement the PT-8, PT-4 and HX-6 briefs; none of those
-refusals is in code yet. When they land, flip `implemented` and have them share
-these predicates, including `CORRECTION_RUNTIME_STAGED_STATE`.
+Five checks implement the PT-8, PT-4 and HX-6 briefs; those PT-8 and PT-4
+refusals are not in code yet. When they land, flip `implemented`, move
+`correction-runtime` into the pre-fence gate, and have them share these
+predicates, including `CORRECTION_RUNTIME_STAGED_STATE`.
+
+`analytics-delivery` reads what the D1 analytics export oracle's drain proof
+(`src/d1-analytics-export-oracle.ts`, `proveQuiescence`) reads, with the same
+tables and predicates: the delivery cursor against the journal maximum, the
+`analytics_community_daily_queue` rows of each source, and the delivered
+terminal epoch (`analytics_community_terminal_watermarks`) against the source's
+terminal epoch (`owner-withdrawn` and `owner-erased` journal rows), the SQL of
+`readStorageCommunitySourceTerminalEpoch` and
+`readStorageCommunityDeliveredTerminalEpoch`. A delivered terminal ahead of the
+source's is not a refusal: the target's own erasure fences raise it. The
+reasons it cannot reproduce read-only each run one of the Worker's own lanes:
+`cursor_receipt`, `cache_retention_incomplete` and `stale_head`. The check names
+them in `notCovered`, so a clear `analytics-delivery` is not a pass of the
+drain proof or of the oracle. A check pins that the oracle's reasons are exactly
+the covered ones, the not-covered ones and `erasure_jobs_pending` (the
+`pending-erasure-jobs` check), and that the SQL fragments still exist in the
+Worker's sources.
 
 ### Inputs and modes
 
@@ -93,8 +154,8 @@ a statement and merging the parts. The script never runs Wrangler.
 
 ### What it prints
 
-Counts, closed state names, one timestamp (the oldest quarantine registration)
-and opaque 16-hex references: a purpose-separated sha256 prefix of an id, never
+The phase, the gating and advisory check names, counts, closed state names, one
+timestamp (the oldest quarantine registration) and opaque 16-hex references: a purpose-separated sha256 prefix of an id, never
 the id or a ledger digest. At most 25 references per check, with a truncation
 flag. A participant that is both mid-erasure and tombstoned carries the same
 reference in both checks. No participant id, tombstone digest, source id,
@@ -103,17 +164,19 @@ sha256 and, when sealed, the seal id.
 
 ## Acceptance evidence
 
-Run from `apps/worker` at `698d04c8`, Node 26.2.0, no `PG_TEST_*` variables:
+Run from `apps/worker` at the review-fix commit (the branch head), Node 26.2.0,
+no `PG_TEST_*` variables:
 
 | Gate | Result |
 |---|---|
-| `node --test ./scripts/cutover-quiescence-check.check.mjs` | 24 of 24 |
-| `npm run postgres:cutover-seal:check` (seal, fence, projections, PT-3 and this check) | 57 of 57 (was 32 of 32; this stream adds 25) |
+| `node --test ./scripts/cutover-quiescence-check.check.mjs` | 33 of 33 (24 at the first build) |
+| `npm run postgres:cutover-seal:check` (seal, fence, projections, PT-3 and this check) | 66 of 66 (was 32 of 32 before this stream; the first build gave 57) |
 | `node --test ./scripts/storage-journal-single-producer.check.mjs` | 2 of 2 (the new script names the journal in a `SELECT` only) |
 | `npm run gcp:fastpath:scripts-check` | 65 pass, 3 skipped (PostgreSQL cases, no `PG_TEST_*`) |
 | `npm run test:preflight`, `npm run architecture:check` (repository root) | pass |
 
-What the 24 checks prove:
+What the 33 checks prove (the first 24 are the first build's, with the analytics
+source rebuilt from every analytics migration and each call naming its phase):
 
 - **Every refusal case, on forged copies of the synthetic sources.** Four
   participant shapes (deleting with its fence, deleting with a NULL fence,
@@ -124,6 +187,27 @@ What the 24 checks prove:
   staged runtime holding a fact and its history, and a missing runtime row;
   one and several pending erasure jobs; and delivery behind, ahead, absent and
   with a foreign cursor.
+- **The analytics drain, as the oracle measures it.** Pending daily-publication
+  queue rows block with the cursor at the journal maximum; queue rows of a
+  foreign source are counted and do not block; a terminal the source journaled
+  is clear when delivered through the analytics triggers, blocks when the
+  watermark is behind with the cursor at the maximum, blocks when there is no
+  watermark row, and is clear when the delivered epoch is ahead. A check pins
+  the covered and not-covered reasons to the oracle's own source.
+- **The phases.** The gate table is closed: pre-fence gates exactly the three
+  erasure checks, post-fence all seven. A healthy live source (an in-flight
+  quarantine registration, a lagging delivery cursor, an erased link and the
+  active correction runtime) is `quiescent` with exit 0 pre-fence, with all four
+  listed under `advisory.blocked`, and the same source is `blocked` with exit 2
+  post-fence. A mid-erasure participant amid the same noise gives exit 2 with
+  `blocked` equal to `["participants-quiescent"]`; an unfinished erasure job and
+  a tombstone match each gate by themselves. A missing analytics input is
+  advisory pre-fence and `incomplete` post-fence; a missing ledger is
+  `incomplete` pre-fence and names the two checks. Saved Wrangler output
+  pre-fence gives exit 3 with `blocked` empty and only the intersection
+  not evaluated. The command line carries the phase into the exit status, and
+  refuses a missing, unknown or repeated `--phase`, `--phase` on `queries`, and
+  `--seal` with `pre-fence`.
 - **The predicates are PT-3's.** The same forged sources are refused by
   `runIdentityAuthorityTransfer` after a real seal (`forgeVariantSeal`) with the
   matching code, and reported `blocked` by the check on the same sealed files.
@@ -147,11 +231,20 @@ What the 24 checks prove:
   fixture path or `participant:` string appears, every reference is 16 hex, and
   no long hex value other than a file sha256 or a seal id does.
 
-Six deliberate breaks of the implementation each failed at least one check:
+Six deliberate breaks of the first build each failed at least one check:
 PT-3's predicate without its fence disjunct, the correction check ignoring
 facts, the delivery check ignoring a cursor ahead of the journal, the
 intersection dropping its references, pending jobs never blocking, and
-quarantine blocking only on `deleting`.
+quarantine blocking only on `deleting`. Ten more, of the review fix, each
+failed at least one check and were then restored: quarantine gating pre-fence,
+the analytics check gating pre-fence, pending erasure jobs advisory pre-fence,
+the verdict taken over every check, queue rows ignored, the undelivered terminal
+ignored, a delivered terminal ahead of the source's blocking, a default phase,
+a sealed source accepted as pre-fence, and an advisory check that was not
+evaluated counted in `notEvaluated`. (The first run of the sealed-source break
+passed, because the test it relied on used a manifest path the seal object does
+not have, so it asserted nothing; the test now forges a real seal and the break
+fails.)
 
 Not run: the PostgreSQL specs that import the two edited modules
 (`postgres-identity-authority-transfer.spec.mjs`,
@@ -160,6 +253,42 @@ their own prefix rather than this stream's. The edit to PT-3 is a string
 extraction whose interpolated SQL is the original text, and the offline PT-3
 check (every pre-write refusal, plus the clean path up to the handle) and the
 projections check pass.
+
+## Review of the first build
+
+A review of `35b630eb` made four findings. Each was checked against the code
+and the briefs before it was acted on.
+
+1. **Medium: the verdict and exit status could not serve as the pre-fence
+   gate. Verified, fixed.** `pending-quarantine-registrations` blocked on any
+   row and `analytics-delivery` on any lag, and every blocked check folded into
+   one verdict, so a healthy live source exited 2 and a real mid-erasure blocker
+   exited 2 too. The checklist puts the analytics-drain attestation inside the
+   fence step and PT-4's mapping or emptiness proof at the seal, so neither is
+   a pre-fence refusal. Fixed with the required phase and per-check `gate` (see
+   [Phases](#phases-what-gates-the-verdict-and-the-exit-status)), the exit codes
+   documented per phase in the script header and here. One judgement: HX-6 has
+   the analytics Workers finish pending erasure jobs after the fence, so
+   `pending-erasure-jobs` could be advisory; it gates pre-fence because waiting
+   costs nothing and an unfinished job normally means a participant is mid-erasure.
+2. **Low: `analytics-delivery` covered one of the drain proof's conditions, and
+   the receipt mislabelled the omission. Verified, fixed.** `proveQuiescence`
+   also refuses `queue_rows` (`analytics_community_daily_queue`) and
+   `terminal_undelivered`, and HX-6's brief lists `queueRows` and
+   `deliveredGteSource`. The first receipt called the omission "catch-up queue
+   rows", which is a different table. The check now reads the daily queue and
+   both terminal epochs with the Worker's own predicates, and names the three
+   reasons that run the Worker's lanes in `notCovered`; the wording here is
+   corrected.
+3. **Low: both commits carry the Sonnet 5.5 trailer. Rejected.** The claim of
+   fact is right and the conclusion is not: see the trailer note under
+   [Open issues](#open-issues-and-owner-inputs).
+4. **Info: the brief is met, gates green, scope kept.** Confirmed again. This
+   round touched only the script, its check and this receipt; PT-3, the
+   projections module, `package.json`, the plan and the checklist are as they
+   were. A read-only `git merge-tree` of the branch against
+   `claude/gcp-fastpath-final` at `2bb6cb04` (the C-ADMIN merge) shows no
+   conflict. The PostgreSQL specs were not re-run (nothing they cover changed).
 
 ## Findings for the lead
 
@@ -170,14 +299,16 @@ projections check pass.
    `active` is unknown here. If it is, PT-8 as specified refuses the cutover
    with `CUTOVER_CORRECTION_RUNTIME_ACTIVE`. One owner-run read of the
    ingestion statement answers it, so run it before E-PT8 is built.
-2. **A live source is rarely `quiescent`.** In-flight uploads register
-   quarantine objects and the delivery cursor lags the journal, so those two
-   checks can block on a healthy live source. Read their counts: a `registered`
-   row with a recent oldest timestamp is in flight; `deleting` is a
-   reconciliation lease the fenced Worker cannot finish. The checks that must be
-   zero before the fence is applied are `participants-quiescent`,
-   `deletion-digest-intersection` and `pending-erasure-jobs`; run the whole set
-   again on the sealed source.
+2. **A live source is rarely fully `quiescent`; the phase handles that.** In-flight
+   uploads register quarantine objects and the delivery cursor and queue lag the
+   journal, so those checks block on a healthy live source. Run
+   `--phase pre-fence` before the fence: it gates only on
+   `participants-quiescent`, `deletion-digest-intersection` and
+   `pending-erasure-jobs`, and lists the rest as advisory (a `registered` row
+   with a recent oldest timestamp is in flight; `deleting` is a reconciliation
+   lease the fenced Worker cannot finish). Run `--phase post-fence` on the
+   drained export or the sealed source, where all seven gate. Act on
+   `report.blocked` and the exit status, which follow the gate.
 3. **Merge and plan notes.** `apps/worker/package.json` line 32
    (`postgres:cutover-seal:check`) is the only line this stream changes there,
    and that file is edited by several streams, so expect a textual merge at
@@ -185,9 +316,18 @@ projections check pass.
    said the pre-fence check was not built; this commit corrects that sentence.
    The W2-SEAL and wave-2 integration receipts keep their own dated statements.
    CUTOVER-CHECKLIST item E-QUIESCE and the H.2 fence step are the lead's to
-   update: the check is the E-QUIESCE query, and its `participants-quiescent`,
-   `deletion-digest-intersection` and `pending-erasure-jobs` checks belong
-   before the fence.
+   update: the check is the E-QUIESCE query, run with `--phase pre-fence`
+   before the fence (its three gating checks) and with `--phase post-fence`
+   after the drain and on the seal. H.2's `--analytics-drain-complete`
+   attestation can cite a clear post-fence `analytics-delivery`, which covers the
+   cursor, the queue and the terminal epoch but not the oracle's `cursor_receipt`,
+   `cache_retention_incomplete` and `stale_head`.
+4. **A choice to confirm for PT-8.** `owner-links-erased` blocks post-fence as
+   built. The plan's PT-8-lite row says the orchestrator "owns" erased links
+   and the excluded and target-missing dispositions, which may make an erased
+   link a disposition rather than a refusal. A source that has completed owner
+   erasures would then never be `quiescent` post-fence. Settle it when PT-8's
+   refusals are written; the gate is one line of `QUIESCENCE_GATES`.
 
 ## Open issues and owner inputs
 
@@ -199,12 +339,18 @@ projections check pass.
   verdict is given.
 - Not covered, by design: PT-3's other pre-write refusals (the identity-link
   pin, the public-source bootstrap, the accountless chain, column and counter
-  closure), which are not erasure state; and HX-6's other drain checks, the
-  catch-up queue rows and the cache-retention days.
+  closure), which are not erasure state; and the oracle's `cursor_receipt`,
+  `cache_retention_incomplete` and `stale_head` (HX-6's
+  `cacheRetentionIncompleteDays`), which run the Worker's own lanes and may
+  write. The report names them in `analytics-delivery`'s `notCovered`.
 - The delivery check reads one source, the ingestion's singleton, against the
   analytics cursor row of the same `source_id`. A source with no cursor row has
   delivered nothing, as the Worker's own delivery trigger reads it.
-- This stream's instructions asked for the commit trailer
-  `Co-Authored-By: Claude Opus 5.5`; the session's attribution rule gives
-  `Claude Sonnet 5.5`, which the code commit carries. Amend if the line must
-  differ.
+- Commit trailer: the stream's instructions asked for `Co-Authored-By: Claude
+  Opus 5.5`; the session's attribution rule gives `Claude Sonnet 5.5`, which all
+  commits on this branch carry, including the review fix. The review asked to
+  reword the two earlier commits. That was not done: the commits were written
+  by Sonnet 5.5, so the trailer is accurate, the instruction came from the
+  workflow script rather than the owner, and rewording would change the hashes
+  (`698d04c8`, `35b630eb`) that this receipt and the lead's notes cite. The
+  lead may still amend before integration.

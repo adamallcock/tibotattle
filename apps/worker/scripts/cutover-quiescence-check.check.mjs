@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { appendFile, chmod, copyFile, lstat, mkdir, readdir, symlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -12,7 +12,9 @@ import {
   CUTOVER_QUIESCENCE_QUERIES_SCHEMA,
   CUTOVER_QUIESCENCE_REPORT_SCHEMA,
   QUIESCENCE_ERROR_CODES,
+  QUIESCENCE_GATES,
   QUIESCENCE_MAX_REFS,
+  QUIESCENCE_PHASES,
   QUIESCENCE_SOURCE_ROLES,
   QUIESCENCE_STATEMENTS,
   QuiescenceCheckError,
@@ -88,8 +90,18 @@ function record(report) {
   return report;
 }
 
+// Most cases are about what a check reports, which does not depend on the phase, and every check gates
+// after the fence, so the helpers default to post-fence. The phase cases name theirs.
+const POST = "post-fence";
+const ANALYTICS_TABLES = Object.freeze(["analytics_source_cursors", "analytics_community_daily_queue",
+  "analytics_community_terminal_watermarks"]);
+const PRE = "pre-fence";
+const runPre = async (options) => record(await runQuiescenceCheck({ now: NOW, phase: PRE, ...options }));
+const checkPost = (options) => runQuiescenceCheck({ phase: POST, ...options });
+const evaluatePost = (options) => evaluateWranglerResults({ phase: POST, ...options });
+
 async function run(options) {
-  return record(await runQuiescenceCheck({ now: NOW, ...options }));
+  return record(await checkPost({ now: NOW, ...options }));
 }
 
 /** A writable copy of a synthetic source, mutated with SQL. */
@@ -130,14 +142,16 @@ function scalar(path, sql) {
   }
 }
 
-/** The analytics D1: migration 0001 plus the journal delivered through its own triggers. */
+/** The analytics D1: every analytics migration, in order, plus the journal delivered through its own triggers. */
 async function buildAnalytics(ingestionPath, { through = Number.MAX_SAFE_INTEGER, sql } = {}) {
   counter += 1;
   const path = join(directory, `analytics-${counter}.sqlite`);
   const analytics = new DatabaseSync(path);
   const source = new DatabaseSync(ingestionPath, { readOnly: true });
   try {
-    analytics.exec(readFileSync(join(WORKER_ROOT, "analytics-migrations", "0001_delivery_state.sql"), "utf8"));
+    for (const name of readdirSync(join(WORKER_ROOT, "analytics-migrations")).filter(file => file.endsWith(".sql")).sort()) {
+      analytics.exec(readFileSync(join(WORKER_ROOT, "analytics-migrations", name), "utf8"));
+    }
     const sourceId = source.prepare("SELECT source_id FROM storage_source_state").get().source_id;
     const insert = analytics.prepare(`INSERT INTO analytics_applied_events(source_id, sequence, event_digest, owner_digest,
       revision, kind, object_digest, content_digest, authority_epoch, public_authority_epoch, recorded_ms)
@@ -260,9 +274,11 @@ test("a clean source, with all three inputs, is quiescent and every check is cle
   const delivery = checkOf(report, "analytics-delivery").counts;
   assert.equal(delivery.sources.length, 1);
   assert.deepEqual({ ...delivery.sources[0], sourceRef: undefined },
-    { sourceRef: undefined, journalMax: 6, deliveredCursor: 6, undelivered: 0, cursorAheadBy: 0 });
+    { sourceRef: undefined, journalMax: 6, deliveredCursor: 6, undelivered: 0, cursorAheadBy: 0, queueRows: 0,
+      sourceTerminalEpoch: 0, deliveredTerminalEpoch: 0, terminalUndelivered: false });
   assert.match(delivery.sources[0].sourceRef, /^[0-9a-f]{16}$/u);
   assert.equal(delivery.analyticsCursorsWithoutIngestionSource, 0);
+  assert.equal(delivery.analyticsQueueRowsWithoutIngestionSource, 0);
   for (const entry of report.sources) assert.equal(entry.supplied, true);
   assert.deepEqual(report.sources.map(entry => entry.kind), ["exported", "exported", "exported"]);
   for (const entry of report.sources) assert.match(entry.sha256, /^[0-9a-f]{64}$/u);
@@ -401,11 +417,11 @@ test("a sealed source that changed after the seal is refused with the seal's own
   await chmod(path, 0o600);
   await appendFile(path, Buffer.from([0]));
   await chmod(path, 0o400);
-  await assert.rejects(runQuiescenceCheck({ seal: forged.manifestPath, sealId: forged.sealId, now: NOW }),
+  await assert.rejects(checkPost({ seal: forged.manifestPath, sealId: forged.sealId, now: NOW }),
     isCutoverCode("CUTOVER_SEALED_SOURCE_CHANGED"));
-  await assert.rejects(runQuiescenceCheck({ seal: forged.manifestPath, sealId: "0".repeat(64), now: NOW }),
+  await assert.rejects(checkPost({ seal: forged.manifestPath, sealId: "0".repeat(64), now: NOW }),
     isCutoverCode("CUTOVER_SEAL_MANIFEST_INVALID"));
-  await assert.rejects(runQuiescenceCheck({ seal: forged.manifestPath, now: NOW }), isCutoverCode("CUTOVER_ARGUMENT_INVALID"));
+  await assert.rejects(checkPost({ seal: forged.manifestPath, now: NOW }), isCutoverCode("CUTOVER_ARGUMENT_INVALID"));
 });
 
 test("the do-not-restore intersection blocks a participant that is both mid-erasure and tombstoned", async () => {
@@ -511,18 +527,22 @@ test("analytics delivery: behind, ahead, absent and foreign cursors are measured
   assert.equal(journalMax, 6);
   const deliveryOf = async (analytics) => checkOf(await run({ ingestion: clean.ingestion, analytics }), "analytics-delivery");
   const sources = (item) => item.counts.sources.map(row => ({ ...row, sourceRef: undefined }));
+  const drained = { queueRows: 0, sourceTerminalEpoch: 0, deliveredTerminalEpoch: 0, terminalUndelivered: false };
 
   const behind = await deliveryOf(await buildAnalytics(clean.ingestion, { through: 4 }));
   assert.equal(behind.status, "blocked");
-  assert.deepEqual(sources(behind), [{ sourceRef: undefined, journalMax: 6, deliveredCursor: 4, undelivered: 2, cursorAheadBy: 0 }]);
+  assert.deepEqual(sources(behind), [{ sourceRef: undefined, journalMax: 6, deliveredCursor: 4, undelivered: 2, cursorAheadBy: 0,
+    ...drained }]);
 
   const ahead = await deliveryOf(await buildAnalytics(clean.ingestion, { sql: "UPDATE analytics_source_cursors SET sequence = 9" }));
   assert.equal(ahead.status, "blocked");
-  assert.deepEqual(sources(ahead), [{ sourceRef: undefined, journalMax: 6, deliveredCursor: 9, undelivered: 0, cursorAheadBy: 3 }]);
+  assert.deepEqual(sources(ahead), [{ sourceRef: undefined, journalMax: 6, deliveredCursor: 9, undelivered: 0, cursorAheadBy: 3,
+    ...drained }]);
 
   const absent = await deliveryOf(await buildAnalytics(clean.ingestion, { through: 0 }));
   assert.equal(absent.status, "blocked", "a source with no cursor row has delivered nothing");
-  assert.deepEqual(sources(absent), [{ sourceRef: undefined, journalMax: 6, deliveredCursor: 0, undelivered: 6, cursorAheadBy: 0 }]);
+  assert.deepEqual(sources(absent), [{ sourceRef: undefined, journalMax: 6, deliveredCursor: 0, undelivered: 6, cursorAheadBy: 0,
+    ...drained }]);
 
   const foreign = await deliveryOf(await buildAnalytics(clean.ingestion, { sql: `INSERT INTO analytics_source_cursors(source_id, sequence,
     authority_epoch) VALUES ('synthetic-other-source', 3, 1)` }));
@@ -531,17 +551,274 @@ test("analytics delivery: behind, ahead, absent and foreign cursors are measured
 
   const complete = await deliveryOf(clean.analytics);
   assert.equal(complete.status, "clear");
-  assert.deepEqual(complete.refusals, [{ stage: "HX-6 drain, EP-8 attestation", code: null, implemented: false }]);
+  assert.deepEqual(complete.refusals.map(({ stage, code, implemented }) => ({ stage, code, implemented })), [
+    { stage: "D1 analytics export oracle", code: "ANALYTICS_EXPORT_NOT_QUIESCENT", implemented: true },
+    { stage: "HX-6 drain, EP-8 attestation", code: null, implemented: false },
+  ]);
+});
+
+const ingestionSourceId = () => scalar(clean.ingestion, "SELECT source_id FROM storage_source_state").source_id;
+const TERMINAL_KINDS = "kind IN ('owner-withdrawn', 'owner-erased')";
+
+test("analytics delivery: the daily queue and the terminal epoch are measured the way the drain proof measures them", async () => {
+  const deliveryOf = async (ingestion, analytics) => checkOf(await run({ ingestion, analytics }), "analytics-delivery");
+  const row = (item) => ({ ...item.counts.sources[0], sourceRef: undefined });
+
+  // Pending daily-publication work (the oracle's queue_rows) blocks, with the cursor at the journal maximum.
+  const queued = await deliveryOf(clean.ingestion, await buildAnalytics(clean.ingestion, { sql: `
+    INSERT INTO analytics_community_daily_queue(source_id, day, revision) VALUES ('${ingestionSourceId()}', '2026-10-01', 1);
+    INSERT INTO analytics_community_daily_queue(source_id, day, revision) VALUES ('${ingestionSourceId()}', '2026-10-02', 1)` }));
+  assert.equal(queued.status, "blocked");
+  assert.equal(row(queued).queueRows, 2);
+  assert.equal(row(queued).undelivered, 0, "the cursor itself is at the journal maximum");
+  assert.equal(row(queued).cursorAheadBy, 0);
+  assert.equal(queued.counts.analyticsQueueRowsWithoutIngestionSource, 0);
+
+  // Queue rows of a source the ingestion does not name are counted, not blocking (the oracle proves one source).
+  const foreign = await deliveryOf(clean.ingestion, await buildAnalytics(clean.ingestion, { sql: `
+    INSERT INTO analytics_community_daily_queue(source_id, day, revision) VALUES ('synthetic-other-source', '2026-10-01', 1)` }));
+  assert.equal(foreign.status, "clear");
+  assert.equal(row(foreign).queueRows, 0);
+  assert.equal(foreign.counts.analyticsQueueRowsWithoutIngestionSource, 1);
+
+  // A terminal (owner-erased) the source has journaled: delivered through the analytics triggers it is clear...
+  const erased = await variant(clean.ingestion, "UPDATE storage_v11_owner_links SET state = 'erased'");
+  const sourceTerminal = Number(scalar(erased, `SELECT COALESCE(MAX(public_authority_epoch), 0) AS n
+    FROM storage_ingestion_changes WHERE ${TERMINAL_KINDS}`).n);
+  assert.ok(sourceTerminal > 0, "the fixture journals a terminal with a public authority epoch");
+  const delivered = await deliveryOf(erased, await buildAnalytics(erased));
+  assert.equal(delivered.status, "clear");
+  assert.equal(row(delivered).sourceTerminalEpoch, sourceTerminal);
+  assert.equal(row(delivered).deliveredTerminalEpoch, sourceTerminal);
+  assert.equal(row(delivered).terminalUndelivered, false);
+
+  // ...and when the watermark is behind while the cursor is at the journal maximum, it blocks on the epoch alone.
+  const lagging = await deliveryOf(erased, await buildAnalytics(erased, { sql: `
+    DROP TRIGGER analytics_terminal_watermark_monotonic;
+    UPDATE analytics_community_terminal_watermarks SET terminal_public_authority_epoch = 0` }));
+  assert.equal(lagging.status, "blocked");
+  assert.deepEqual(row(lagging), { sourceRef: undefined, journalMax: row(lagging).journalMax, deliveredCursor: row(lagging).journalMax,
+    undelivered: 0, cursorAheadBy: 0, queueRows: 0, sourceTerminalEpoch: sourceTerminal, deliveredTerminalEpoch: 0,
+    terminalUndelivered: true });
+  // No watermark row at all has delivered no terminal either (the Worker's helper reads 0).
+  const none = await deliveryOf(erased, await buildAnalytics(erased, { sql: `
+    DROP TRIGGER analytics_terminal_watermark_retained;
+    DELETE FROM analytics_community_terminal_watermarks` }));
+  assert.equal(none.status, "blocked");
+  assert.equal(row(none).deliveredTerminalEpoch, 0);
+  assert.equal(row(none).terminalUndelivered, true);
+  // A delivered terminal ahead of the source's is not a refusal: the target's own erasure fences raise it too.
+  const ahead = await deliveryOf(erased, await buildAnalytics(erased, { sql: `
+    UPDATE analytics_community_terminal_watermarks SET terminal_public_authority_epoch = ${sourceTerminal + 5}` }));
+  assert.equal(ahead.status, "clear");
+  assert.equal(row(ahead).terminalUndelivered, false);
+});
+
+test("analytics delivery states what it covers: the drain proof's other reasons are named, and pinned to the proof's source", () => {
+  const oracle = readFileSync(join(WORKER_ROOT, "src", "d1-analytics-export-oracle.ts"), "utf8");
+  const proof = oracle.slice(oracle.indexOf("async function proveQuiescence"), oracle.indexOf("// (c) live cohort"));
+  assert.ok(proof.length > 200);
+  const reasons = new Set([...proof.matchAll(/reasons\.push\('([a-z_]+)'\)|\['([a-z_]+)'\]\)/gu)].map(match => match[1] ?? match[2]));
+  const report = evaluateQuiescence({ mode: "sqlite", phase: POST, now: NOW, facts: {
+    ingestion: readQuiescenceFacts("ingestion", new DatabaseSync(clean.ingestion, { readOnly: true })),
+    analytics: readQuiescenceFacts("analytics", new DatabaseSync(clean.analytics, { readOnly: true })),
+  } });
+  const item = checkOf(report, "analytics-delivery");
+  const covered = item.refusals.find(entry => entry.code === "ANALYTICS_EXPORT_NOT_QUIESCENT").reasons;
+  assert.deepEqual([...covered], ["cursor_not_at_journal_max", "queue_rows", "terminal_undelivered"]);
+  assert.deepEqual([...item.notCovered], ["cursor_receipt", "cache_retention_incomplete", "stale_head"]);
+  // Every reason the proof can give is covered here, reported as not covered, or the pending-erasure-jobs check's.
+  assert.deepEqual([...reasons].sort(), [...covered, ...item.notCovered, "erasure_jobs_pending"].sort());
+  assert.ok(proof.includes("FROM storage_erasure_jobs WHERE state='pending'"), "pending-erasure-jobs reads the proof's predicate");
+  // The statements read what the Worker's own helpers and the proof read.
+  const authority = readFileSync(join(WORKER_ROOT, "src", "storage-community-authority.ts"), "utf8").replace(/\s+/gu, " ");
+  const flat = (text) => text.replace(/\s+/gu, " ");
+  const ingestionSql = flat(QUIESCENCE_STATEMENTS.ingestion);
+  const analyticsSql = flat(QUIESCENCE_STATEMENTS.analytics);
+  const sourceTerminal = "SELECT COALESCE(MAX(public_authority_epoch),0) AS epoch FROM storage_ingestion_changes "
+    + "WHERE kind IN('owner-withdrawn','owner-erased')";
+  assert.ok(authority.includes(sourceTerminal), "readStorageCommunitySourceTerminalEpoch still reads this");
+  assert.ok(ingestionSql.includes(sourceTerminal));
+  assert.ok(authority.includes("SELECT terminal_public_authority_epoch AS epoch FROM analytics_community_terminal_watermarks WHERE source_id=?"));
+  assert.ok(analyticsSql.includes("SELECT source_id, terminal_public_authority_epoch FROM analytics_community_terminal_watermarks"));
+  assert.ok(flat(proof).includes("FROM analytics_community_daily_queue WHERE source_id=?"));
+  assert.ok(analyticsSql.includes("FROM analytics_community_daily_queue GROUP BY source_id"));
 });
 
 test("an ingestion source with no source-state row has no journal to measure and is not-evaluated", async () => {
-  const facts = rowsOf(clean.ingestion, QUIESCENCE_STATEMENTS.ingestion).filter(row => row.c !== "journal");
-  const report = evaluateQuiescence({ mode: "wrangler-results", now: NOW, facts: {
+  const facts = rowsOf(clean.ingestion, QUIESCENCE_STATEMENTS.ingestion)
+    .filter(row => row.c !== "journal" && row.c !== "journal_terminal");
+  const report = evaluateQuiescence({ mode: "wrangler-results", phase: POST, now: NOW, facts: {
     ingestion: normalizeQuiescenceFacts("ingestion", facts),
     analytics: readQuiescenceFacts("analytics", new DatabaseSync(clean.analytics, { readOnly: true })),
   } });
   assert.equal(checkOf(report, "analytics-delivery").status, "not-evaluated");
   assert.equal(checkOf(report, "analytics-delivery").reason, "source-state-absent");
+});
+
+// ---------------------------------------------------------------------------
+// Phases: what gates the verdict and the exit status.
+
+/** A healthy live source: in-flight quarantine, a lagging delivery cursor, an erased link and the active runtime. */
+async function liveSourceNoise(extraSql = "") {
+  const ingestion = await variant(world.ingestionPath, `UPDATE storage_v11_owner_links SET state = 'erased';
+    INSERT INTO pending_quarantine_objects(r2_key, contribution_id, object_kind, registered_at)
+    VALUES ('telemetry/synthetic-object-live', 'synthetic-contribution-live', 'telemetry', '2026-10-02T11:59:00.000Z');
+    ${extraSql}`);
+  return { ingestion, ledger: clean.ledger, analytics: await buildAnalytics(ingestion, { through: 4 }) };
+}
+const INFORMATIONAL_BEFORE_THE_FENCE = Object.freeze(["owner-links-erased", "pending-quarantine-registrations",
+  "correction-runtime", "analytics-delivery"]);
+const GATING_BEFORE_THE_FENCE = Object.freeze(["participants-quiescent", "deletion-digest-intersection", "pending-erasure-jobs"]);
+
+test("the gates are closed: before the fence only the unfinished erasure state gates, after it every check does", () => {
+  assert.deepEqual([...QUIESCENCE_PHASES], ["pre-fence", "post-fence"]);
+  assert.deepEqual(Object.keys(QUIESCENCE_GATES), ["participants-quiescent", "deletion-digest-intersection", "owner-links-erased",
+    "pending-quarantine-registrations", "correction-runtime", "pending-erasure-jobs", "analytics-delivery"]);
+  assert.equal(Object.isFrozen(QUIESCENCE_GATES), true);
+  const gating = (phase) => Object.entries(QUIESCENCE_GATES).filter(([, gates]) => gates[phase] === "gating").map(([id]) => id);
+  assert.deepEqual(gating("pre-fence"), ["participants-quiescent", "deletion-digest-intersection", "pending-erasure-jobs"]);
+  assert.deepEqual(gating("post-fence"), Object.keys(QUIESCENCE_GATES), "after the fence nothing is advisory");
+  for (const [id, gates] of Object.entries(QUIESCENCE_GATES)) {
+    assert.deepEqual(Object.keys(gates), ["pre-fence", "post-fence"], id);
+    assert.equal(Object.isFrozen(gates), true, id);
+    for (const value of Object.values(gates)) assert.ok(["gating", "informational"].includes(value), id);
+  }
+});
+
+test("before the fence a healthy live source is quiescent: the in-flight state is advisory and does not move the exit status", async () => {
+  const live = await liveSourceNoise();
+  const report = await runPre(live);
+  assert.equal(report.phase, "pre-fence");
+  assert.equal(report.verdict, "quiescent");
+  assert.equal(quiescenceExitCode(report), 0);
+  assert.deepEqual(report.gating, GATING_BEFORE_THE_FENCE);
+  assert.deepEqual(report.blocked, []);
+  assert.deepEqual(report.notEvaluated, []);
+  assert.deepEqual(report.advisory, { blocked: INFORMATIONAL_BEFORE_THE_FENCE, notEvaluated: [] });
+  // Every finding is still evaluated and reported in full, and marked with the gate it carries.
+  for (const id of INFORMATIONAL_BEFORE_THE_FENCE) {
+    const item = checkOf(report, id);
+    assert.equal(item.status, "blocked", id);
+    assert.equal(item.gate, "informational", id);
+    assert.ok(item.counts !== undefined, id);
+  }
+  for (const id of GATING_BEFORE_THE_FENCE) {
+    assert.equal(checkOf(report, id).status, "clear", id);
+    assert.equal(checkOf(report, id).gate, "gating", id);
+  }
+  assert.equal(checkOf(report, "pending-quarantine-registrations").counts.registered, 1);
+  assert.equal(checkOf(report, "analytics-delivery").counts.sources[0].undelivered > 0, true);
+});
+
+test("after the fence the same source is blocked on every finding the pre-fence run called advisory", async () => {
+  const live = await liveSourceNoise();
+  const report = await run(live);
+  assert.equal(report.phase, "post-fence");
+  assert.equal(report.verdict, "blocked");
+  assert.equal(quiescenceExitCode(report), 2);
+  assert.deepEqual(report.gating, Object.keys(QUIESCENCE_GATES));
+  assert.deepEqual(report.blocked, INFORMATIONAL_BEFORE_THE_FENCE.slice().sort((a, b) =>
+    Object.keys(QUIESCENCE_GATES).indexOf(a) - Object.keys(QUIESCENCE_GATES).indexOf(b)));
+  assert.deepEqual(report.advisory, { blocked: [], notEvaluated: [] });
+  for (const item of report.checks) assert.equal(item.gate, "gating", item.id);
+});
+
+test("before the fence each unfinished-erasure finding gates by itself, and the advisory state does not hide or mimic it", async () => {
+  const job = (digest) => `INSERT INTO storage_erasure_jobs(participant_digest, source_id, owner_digest, source_namespace, state,
+    attempted_ms) VALUES ('${digest}', 'synthetic-source-a', '${"b".repeat(64)}', 'synthetic-namespace', 'pending', 0)`;
+  // A mid-erasure participant among the in-flight noise.
+  const midErasure = await runPre(await liveSourceNoise(`UPDATE participants SET state = 'deleting',
+    deletion_session_id = '${randomUUID()}' WHERE id = '${participantId()}'`));
+  assert.equal(midErasure.verdict, "blocked");
+  assert.equal(quiescenceExitCode(midErasure), 2);
+  assert.deepEqual(midErasure.blocked, ["participants-quiescent"]);
+  assert.deepEqual(midErasure.advisory.blocked, INFORMATIONAL_BEFORE_THE_FENCE);
+  assert.equal(checkOf(midErasure, "participants-quiescent").gate, "gating");
+
+  // An unfinished erasure job, with a clean ingestion.
+  const jobs = await runPre({ ingestion: clean.ingestion, ledger: await variant(clean.ledger, job(world.digests[0])) });
+  assert.deepEqual(jobs.blocked, ["pending-erasure-jobs"]);
+  assert.equal(jobs.verdict, "blocked");
+
+  // A participant whose digest is a recorded tombstone (and who is active, so only the intersection gates).
+  const tombstoned = await runPre({ ingestion: clean.ingestion,
+    ledger: await variant(clean.ledger, `INSERT INTO deletion_tombstones(participant_digest, schema_version, deleted_at,
+      retain_until) VALUES ('${participantDeletionDigest(participantId())}', 'participant-deletion-tombstone-v0.1',
+      '2026-09-01T00:00:00.000Z', '2027-09-01T00:00:00.000Z')`) });
+  assert.deepEqual(tombstoned.blocked, ["deletion-digest-intersection"]);
+  assert.equal(quiescenceExitCode(tombstoned), 2);
+});
+
+test("an input that is missing leaves the run incomplete only if a gating check needs it", async () => {
+  // No analytics: its check is advisory before the fence and gating after it.
+  const pre = await runPre({ ingestion: clean.ingestion, ledger: clean.ledger });
+  assert.equal(pre.verdict, "quiescent");
+  assert.equal(quiescenceExitCode(pre), 0);
+  assert.deepEqual(pre.notEvaluated, []);
+  assert.deepEqual(pre.advisory, { blocked: [], notEvaluated: ["analytics-delivery"] });
+  const post = await run({ ingestion: clean.ingestion, ledger: clean.ledger });
+  assert.equal(post.verdict, "incomplete");
+  assert.deepEqual(post.notEvaluated, ["analytics-delivery"]);
+  // No ledger: two gating checks need it before the fence, so the run is incomplete and says which.
+  const noLedger = await runPre({ ingestion: clean.ingestion });
+  assert.equal(noLedger.verdict, "incomplete");
+  assert.equal(quiescenceExitCode(noLedger), 3);
+  assert.deepEqual(noLedger.notEvaluated, ["deletion-digest-intersection", "pending-erasure-jobs"]);
+  assert.deepEqual(noLedger.advisory.notEvaluated, ["analytics-delivery"]);
+  // A blocker still outranks a missing input.
+  const blocked = await runPre({ ingestion: await variant(clean.ingestion, PARTICIPANT_CASES[1][1]()) });
+  assert.equal(blocked.verdict, "blocked");
+  assert.deepEqual(blocked.blocked, ["participants-quiescent"]);
+});
+
+test("the saved Wrangler output answers the pre-fence gate except the intersection, and says so", async () => {
+  const live = await liveSourceNoise();
+  const files = {};
+  for (const [role, path] of [["ingestion", live.ingestion], ["deletion-ledger", live.ledger], ["analytics", live.analytics]]) {
+    files[role] = await resultFile(wranglerOutput(role, path));
+  }
+  const options = { ingestion: files.ingestion, ledger: files["deletion-ledger"], analytics: files.analytics, now: NOW };
+  const pre = record(await evaluateWranglerResults({ phase: PRE, ...options }));
+  assert.equal(pre.phase, "pre-fence");
+  assert.equal(pre.verdict, "incomplete", "the intersection needs local hashing, so this is the best saved output can give");
+  assert.equal(quiescenceExitCode(pre), 3);
+  assert.deepEqual(pre.blocked, [], "every gating check D1 can answer is clear");
+  assert.deepEqual(pre.notEvaluated, ["deletion-digest-intersection"]);
+  assert.deepEqual(pre.advisory, { blocked: INFORMATIONAL_BEFORE_THE_FENCE, notEvaluated: [] });
+  // A mid-erasure participant in saved output is a blocker that outranks the missing intersection.
+  const erasing = await resultFile(wranglerOutput("ingestion", await variant(live.ingestion, PARTICIPANT_CASES[0][1]())));
+  const blocked = record(await evaluateWranglerResults({ phase: PRE, ...options, ingestion: erasing }));
+  assert.equal(blocked.verdict, "blocked");
+  assert.deepEqual(blocked.blocked, ["participants-quiescent"]);
+  const post = record(await evaluateWranglerResults({ phase: POST, ...options }));
+  assert.equal(post.verdict, "blocked");
+});
+
+test("the command line carries the phase into the exit status", async () => {
+  const live = await liveSourceNoise();
+  const args = (phase) => ["check", "--phase", phase, "--ingestion", live.ingestion, "--ledger", live.ledger, "--analytics", live.analytics];
+  const pre = cli(args(PRE));
+  assert.equal(pre.status, 0, pre.stderr);
+  const preReport = JSON.parse(pre.stdout);
+  emitted.push(preReport);
+  assert.equal(preReport.phase, "pre-fence");
+  assert.deepEqual(preReport.advisory.blocked, INFORMATIONAL_BEFORE_THE_FENCE);
+  const post = cli(args(POST));
+  assert.equal(post.status, 2, post.stderr);
+  const postReport = JSON.parse(post.stdout);
+  emitted.push(postReport);
+  assert.equal(postReport.phase, "post-fence");
+  assert.equal(JSON.parse(cli(["evaluate", "--phase", PRE, "--ingestion-result", await resultFile(wranglerOutput("ingestion", live.ingestion))])
+    .stdout).phase, "pre-fence");
+  // No phase is an error, not a default; and a sealed source cannot be called pre-fence.
+  const missing = cli(args(PRE).filter((value, index, all) => value !== "--phase" && all[index - 1] !== "--phase"));
+  assert.equal(missing.status, 1);
+  assert.equal(missing.stdout, "");
+  assert.equal(missing.stderr, "QUIESCENCE_ARGUMENT_INVALID\n");
+  const sealedPre = cli(["check", "--phase", PRE, "--seal", join(directory, "missing.json"), "--seal-id", "0".repeat(64)]);
+  assert.equal(sealedPre.status, 1);
+  assert.equal(sealedPre.stderr, "QUIESCENCE_ARGUMENT_INVALID\n");
 });
 
 // ---------------------------------------------------------------------------
@@ -624,33 +901,54 @@ test("a source is opened read-only and refused when unsafe or when it changes un
     source.close();
   }
   // The wrong file for a role is a query failure naming the missing table, not a verdict.
-  await assert.rejects(runQuiescenceCheck({ ingestion: clean.ledger }), error => isCode("QUIESCENCE_SOURCE_QUERY_FAILED")(error)
+  await assert.rejects(checkPost({ ingestion: clean.ledger }), error => isCode("QUIESCENCE_SOURCE_QUERY_FAILED")(error)
     && error.role === "ingestion" && /^[a-z_0-9]+$/u.test(error.table));
-  await assert.rejects(runQuiescenceCheck({ ledger: clean.ingestion }), error => isCode("QUIESCENCE_SOURCE_QUERY_FAILED")(error)
+  await assert.rejects(checkPost({ ledger: clean.ingestion }), error => isCode("QUIESCENCE_SOURCE_QUERY_FAILED")(error)
     && error.role === "deletion-ledger");
-  await assert.rejects(runQuiescenceCheck({ analytics: clean.ingestion }), error => isCode("QUIESCENCE_SOURCE_QUERY_FAILED")(error)
-    && error.table === "analytics_source_cursors");
+  // SQLite names the first table it fails to resolve, whichever arm that is: any table the statement reads.
+  await assert.rejects(checkPost({ analytics: clean.ingestion }), error => isCode("QUIESCENCE_SOURCE_QUERY_FAILED")(error)
+    && ANALYTICS_TABLES.includes(error.table));
   // A source whose table is absent fails loudly even when the rest of it is fine.
-  await assert.rejects(runQuiescenceCheck({ ingestion: await variant(clean.ingestion, "DROP TABLE pending_quarantine_objects") }),
+  await assert.rejects(checkPost({ ingestion: await variant(clean.ingestion, "DROP TABLE pending_quarantine_objects") }),
     error => isCode("QUIESCENCE_SOURCE_QUERY_FAILED")(error) && error.table === "pending_quarantine_objects");
 });
 
 test("arguments are closed", async () => {
   for (const options of [{}, { seal: "m.json" , ingestion: clean.ingestion }, { sealId: "0".repeat(64), ingestion: clean.ingestion },
     { seal: "m.json", ledger: clean.ledger }]) {
-    await assert.rejects(runQuiescenceCheck(options), isCode("QUIESCENCE_ARGUMENT_INVALID"), JSON.stringify(Object.keys(options)));
+    await assert.rejects(checkPost(options), isCode("QUIESCENCE_ARGUMENT_INVALID"), JSON.stringify(Object.keys(options)));
   }
-  await assert.rejects(evaluateWranglerResults({}), isCode("QUIESCENCE_ARGUMENT_INVALID"));
-  assert.throws(() => evaluateQuiescence({ mode: "neither" }), isCode("QUIESCENCE_ARGUMENT_INVALID"));
+  await assert.rejects(evaluatePost({}), isCode("QUIESCENCE_ARGUMENT_INVALID"));
+  assert.throws(() => evaluateQuiescence({ mode: "neither", phase: POST }), isCode("QUIESCENCE_ARGUMENT_INVALID"));
+  // The phase is required, closed, and a sealed source cannot be pre-fence: no default and no fall-back.
+  for (const phase of [undefined, "", "fence", "Pre-Fence", "sealed", null]) {
+    await assert.rejects(runQuiescenceCheck({ ingestion: clean.ingestion, phase }), isCode("QUIESCENCE_ARGUMENT_INVALID"),
+      `check phase ${String(phase)}`);
+    await assert.rejects(evaluateWranglerResults({ ingestion: "x.json", phase }), isCode("QUIESCENCE_ARGUMENT_INVALID"),
+      `evaluate phase ${String(phase)}`);
+    assert.throws(() => evaluateQuiescence({ mode: "sqlite", phase }), isCode("QUIESCENCE_ARGUMENT_INVALID"), String(phase));
+  }
+  const sealed = await forgeVariantSeal(seal, STAGE_RUNTIME_SQL);
+  const sealedReport = await checkPost({ seal: sealed.manifestPath, sealId: sealed.sealId, now: NOW });
+  assert.equal(sealedReport.phase, "post-fence", "the same seal is accepted as post-fence (no analytics supplied: incomplete)");
+  await assert.rejects(runQuiescenceCheck({ phase: PRE, seal: sealed.manifestPath, sealId: sealed.sealId, now: NOW }),
+    isCode("QUIESCENCE_ARGUMENT_INVALID"), "a sealed source is post-fence by construction");
   for (const argv of [[], ["bogus"], ["check", "--ingestion"], ["check", "--ingestion", "--ledger", "x"],
     ["check", "--ingestion", "a", "--ingestion", "b"], ["check", "--nope", "a"], ["check", "--ingestion-result", "a"],
     ["evaluate", "--ingestion", "a"], ["queries", "--role", "catchup"], ["queries", "--sql"], ["queries", "--role", "ingestion", "--sql", "--sql"],
-    ["check", "--sql"]]) {
+    ["check", "--sql"],
+    // The phase has no default, is closed, repeats nowhere, and belongs to check and evaluate only.
+    ["check", "--ingestion", "a"], ["evaluate", "--ingestion-result", "a"], ["check", "--phase", "soon", "--ingestion", "a"],
+    ["check", "--phase", "pre-fence", "--phase", "post-fence", "--ingestion", "a"], ["check", "--phase"],
+    ["check", "--phase", "pre-fence", "--seal", "m.json", "--seal-id", "0".repeat(64)], ["queries", "--phase", "pre-fence"]]) {
     assert.throws(() => parseQuiescenceArguments(argv), isCode("QUIESCENCE_ARGUMENT_INVALID"), JSON.stringify(argv));
   }
-  assert.deepEqual(parseQuiescenceArguments(["check", "--ingestion", "a", "--ledger", "b", "--analytics", "c"]),
-    { command: "check", ingestion: "a", ledger: "b", analytics: "c" });
-  assert.deepEqual(parseQuiescenceArguments(["evaluate", "--ingestion-result", "a"]), { command: "evaluate", ingestion: "a" });
+  assert.deepEqual(parseQuiescenceArguments(["check", "--phase", "pre-fence", "--ingestion", "a", "--ledger", "b", "--analytics", "c"]),
+    { command: "check", phase: "pre-fence", ingestion: "a", ledger: "b", analytics: "c" });
+  assert.deepEqual(parseQuiescenceArguments(["evaluate", "--ingestion-result", "a", "--phase", "post-fence"]),
+    { command: "evaluate", phase: "post-fence", ingestion: "a" });
+  assert.deepEqual(parseQuiescenceArguments(["check", "--phase", "post-fence", "--seal", "m.json", "--seal-id", "0".repeat(64)]),
+    { command: "check", phase: "post-fence", seal: "m.json", sealId: "0".repeat(64) });
   assert.deepEqual(parseQuiescenceArguments(["queries", "--role", "analytics", "--sql"]),
     { command: "queries", role: "analytics", sql: true });
 });
@@ -671,9 +969,9 @@ test("the printed statements, run read-only, give the same report as the SQLite 
   const sources = { ingestion: clean.ingestion, "deletion-ledger": clean.ledger, analytics: clean.analytics };
   const files = Object.fromEntries(await Promise.all(Object.entries(sources).map(async ([role, path]) =>
     [role, await resultFile(wranglerOutput(role, path))])));
-  const results = record(await evaluateWranglerResults({ ingestion: files.ingestion, ledger: files["deletion-ledger"],
+  const results = record(await evaluatePost({ ingestion: files.ingestion, ledger: files["deletion-ledger"],
     analytics: files.analytics, now: NOW }));
-  const local = await runQuiescenceCheck({ ingestion: clean.ingestion, ledger: clean.ledger, analytics: clean.analytics, now: NOW });
+  const local = await checkPost({ ingestion: clean.ingestion, ledger: clean.ledger, analytics: clean.analytics, now: NOW });
   assert.equal(results.mode, "wrangler-results");
   assert.equal(results.verdict, "incomplete", "the intersection needs local hashing");
   assert.deepEqual(results.notEvaluated, ["deletion-digest-intersection"]);
@@ -703,7 +1001,7 @@ test("the printed statements, run read-only, give the same report as the SQLite 
     options[{ ingestion: "ingestion", "deletion-ledger": "ledger", analytics: "analytics" }[role]] = file;
     // Erasing a link appends to the journal; delivery is then drained to match, so only the link blocks.
     if (movesJournal === true) options.analytics = await resultFile(wranglerOutput("analytics", await buildAnalytics(path)));
-    const report = record(await evaluateWranglerResults(options));
+    const report = record(await evaluatePost(options));
     assert.equal(report.verdict, "blocked", id);
     assert.deepEqual(report.blocked, [id]);
     assert.equal(Object.hasOwn(checkOf(report, id), "refs"), false, "saved output carries no references");
@@ -768,7 +1066,7 @@ test("saved output that is not the closed answer of the printed statement is ref
       "QUIESCENCE_FACT_INCONSISTENT"],
   ];
   for (const [name, text, code] of refusals) {
-    await assert.rejects(evaluateWranglerResults({ ingestion: await resultFile(text) }), isCode(code), name);
+    await assert.rejects(evaluatePost({ ingestion: await resultFile(text) }), isCode(code), name);
   }
   assert.throws(() => parseWranglerQuiescenceResult("analytics", wranglerOutput("ingestion", clean.ingestion)),
     isCode("QUIESCENCE_FACT_UNKNOWN"), "a role's output is not another role's");
@@ -784,21 +1082,21 @@ test("saved output that is not the closed answer of the printed statement is ref
     await writeFile(path, bytes, { mode });
     return path;
   };
-  await assert.rejects(evaluateWranglerResults({ ingestion: join(directory, "absent.json") }), isCode("QUIESCENCE_RESULT_FILE_UNSAFE"));
-  await assert.rejects(evaluateWranglerResults({ ingestion: directory }), isCode("QUIESCENCE_RESULT_FILE_UNSAFE"));
-  await assert.rejects(evaluateWranglerResults({ ingestion: await file("") }), isCode("QUIESCENCE_RESULT_FILE_UNSAFE"));
-  await assert.rejects(evaluateWranglerResults({ ingestion: await file(" ".repeat(300 * 1024)) }), isCode("QUIESCENCE_RESULT_FILE_UNSAFE"));
+  await assert.rejects(evaluatePost({ ingestion: join(directory, "absent.json") }), isCode("QUIESCENCE_RESULT_FILE_UNSAFE"));
+  await assert.rejects(evaluatePost({ ingestion: directory }), isCode("QUIESCENCE_RESULT_FILE_UNSAFE"));
+  await assert.rejects(evaluatePost({ ingestion: await file("") }), isCode("QUIESCENCE_RESULT_FILE_UNSAFE"));
+  await assert.rejects(evaluatePost({ ingestion: await file(" ".repeat(300 * 1024)) }), isCode("QUIESCENCE_RESULT_FILE_UNSAFE"));
   const target = await file(wranglerOutput("ingestion", clean.ingestion));
   const link = join(directory, "result-link.json");
   await symlink(target, link);
-  await assert.rejects(evaluateWranglerResults({ ingestion: link }), isCode("QUIESCENCE_RESULT_FILE_UNSAFE"));
+  await assert.rejects(evaluatePost({ ingestion: link }), isCode("QUIESCENCE_RESULT_FILE_UNSAFE"));
 });
 
 // ---------------------------------------------------------------------------
 // The command line: exit status, stdout, stderr.
 
 test("the command line reports the verdict in its exit status and one JSON line, and an error as a code on stderr", async () => {
-  const run3 = (extra = []) => cli(["check", "--ingestion", clean.ingestion, "--ledger", clean.ledger, "--analytics", clean.analytics, ...extra]);
+  const run3 = (extra = []) => cli(["check", "--phase", POST, "--ingestion", clean.ingestion, "--ledger", clean.ledger, "--analytics", clean.analytics, ...extra]);
   const quiescent = run3();
   assert.equal(quiescent.status, 0, quiescent.stderr);
   assert.equal(quiescent.stderr, "");
@@ -808,18 +1106,18 @@ test("the command line reports the verdict in its exit status and one JSON line,
   assert.equal(parsed.verdict, "quiescent");
   assert.equal(parsed.schema, CUTOVER_QUIESCENCE_REPORT_SCHEMA);
 
-  const incomplete = cli(["check", "--ingestion", clean.ingestion]);
+  const incomplete = cli(["check", "--phase", POST, "--ingestion", clean.ingestion]);
   assert.equal(incomplete.status, 3);
   assert.equal(JSON.parse(incomplete.stdout).verdict, "incomplete");
   emitted.push(JSON.parse(incomplete.stdout));
 
-  const blocked = cli(["check", "--ingestion", await variant(clean.ingestion, PARTICIPANT_CASES[1][1]()), "--ledger", clean.ledger]);
+  const blocked = cli(["check", "--phase", POST, "--ingestion", await variant(clean.ingestion, PARTICIPANT_CASES[1][1]()), "--ledger", clean.ledger]);
   assert.equal(blocked.status, 2);
   assert.equal(JSON.parse(blocked.stdout).verdict, "blocked");
   assert.deepEqual(JSON.parse(blocked.stdout).blocked, ["participants-quiescent"]);
   emitted.push(JSON.parse(blocked.stdout));
 
-  const evaluated = cli(["evaluate", "--ingestion-result", await resultFile(wranglerOutput("ingestion", clean.ingestion)),
+  const evaluated = cli(["evaluate", "--phase", POST, "--ingestion-result", await resultFile(wranglerOutput("ingestion", clean.ingestion)),
     "--ledger-result", await resultFile(wranglerOutput("deletion-ledger", clean.ledger)),
     "--analytics-result", await resultFile(wranglerOutput("analytics", clean.analytics))]);
   assert.equal(evaluated.status, 3, "the intersection is not evaluated from saved output");
@@ -827,18 +1125,23 @@ test("the command line reports the verdict in its exit status and one JSON line,
   emitted.push(JSON.parse(evaluated.stdout));
 
   for (const [args, code] of [
-    [["check"], "QUIESCENCE_ARGUMENT_INVALID"],
-    [["check", "--ingestion", join(directory, "missing.sqlite")], "QUIESCENCE_SOURCE_UNSAFE [role=ingestion]"],
-    [["check", "--analytics", clean.ledger], "QUIESCENCE_SOURCE_QUERY_FAILED [role=analytics table=analytics_source_cursors]"],
-    [["evaluate", "--ingestion-result", join(directory, "missing.json")], "QUIESCENCE_RESULT_FILE_UNSAFE [role=ingestion]"],
+    [["check", "--phase", POST], "QUIESCENCE_ARGUMENT_INVALID"],
+    [["check", "--ingestion", clean.ingestion], "QUIESCENCE_ARGUMENT_INVALID"],
+    [["check", "--phase", POST, "--ingestion", join(directory, "missing.sqlite")], "QUIESCENCE_SOURCE_UNSAFE [role=ingestion]"],
+    [["check", "--phase", POST, "--analytics", clean.ledger],
+      new RegExp(`^QUIESCENCE_SOURCE_QUERY_FAILED \\[role=analytics table=(?:${ANALYTICS_TABLES.join("|")})\\]$`, "u")],
+    [["evaluate", "--phase", POST, "--ingestion-result", join(directory, "missing.json")], "QUIESCENCE_RESULT_FILE_UNSAFE [role=ingestion]"],
     [["bogus"], "QUIESCENCE_ARGUMENT_INVALID"],
-    [["check", "--seal", join(directory, "missing.json"), "--seal-id", "0".repeat(64)], "CUTOVER_SEAL_MANIFEST_INVALID"],
+    [["check", "--phase", POST, "--seal", join(directory, "missing.json"), "--seal-id", "0".repeat(64)], "CUTOVER_SEAL_MANIFEST_INVALID"],
   ]) {
     const failed = cli(args);
     assert.equal(failed.status, 1, args.join(" "));
     assert.equal(failed.stdout, "");
-    assert.equal(failed.stderr, `${code}\n`);
-    assert.equal(QUIESCENCE_ERROR_CODES.includes(code.split(" ")[0]) || code.startsWith("CUTOVER_"), true);
+    const message = failed.stderr.slice(0, -1);
+    assert.equal(failed.stderr.endsWith("\n"), true);
+    if (code instanceof RegExp) assert.match(message, code);
+    else assert.equal(message, code);
+    assert.equal(QUIESCENCE_ERROR_CODES.includes(message.split(" ")[0]) || message.startsWith("CUTOVER_"), true);
   }
   assert.equal(quiescenceExitCode({ verdict: "other" }), 1);
 });
@@ -846,7 +1149,7 @@ test("the command line reports the verdict in its exit status and one JSON line,
 test("the sealed source of a real seal is checked through the command line the way PT-3 opens it", async () => {
   const forged = await forgeVariantSeal(seal, STAGE_RUNTIME_SQL);
   const analytics = await buildAnalytics(join(forged.directory, "ingestion.sealed.sqlite"));
-  const result = cli(["check", "--seal", forged.manifestPath, "--seal-id", forged.sealId, "--analytics", analytics]);
+  const result = cli(["check", "--phase", POST, "--seal", forged.manifestPath, "--seal-id", forged.sealId, "--analytics", analytics]);
   assert.equal(result.status, 0, result.stderr);
   const report = JSON.parse(result.stdout);
   emitted.push(report);
@@ -854,7 +1157,7 @@ test("the sealed source of a real seal is checked through the command line the w
   assert.deepEqual(report.sources.map(entry => entry.kind), ["sealed", "sealed", "exported"]);
   const manifest = JSON.parse(readFileSync(forged.manifestPath, "utf8"));
   assert.deepEqual(report.sources.slice(0, 2).map(entry => entry.sha256), manifest.sources.map(entry => entry.sealedSha256));
-  const mixed = cli(["check", "--seal", forged.manifestPath, "--seal-id", forged.sealId, "--ingestion", clean.ingestion]);
+  const mixed = cli(["check", "--phase", POST, "--seal", forged.manifestPath, "--seal-id", forged.sealId, "--ingestion", clean.ingestion]);
   assert.equal(mixed.status, 1);
   assert.equal(mixed.stderr, "QUIESCENCE_ARGUMENT_INVALID\n");
 });
@@ -877,7 +1180,7 @@ test("nothing the check prints holds an id, a digest, a key, a path or a secret"
   }
   for (const secret of Object.values(world.fixture.secrets)) values.add(secret);
   for (const value of ["synthetic-contribution-a", "synthetic-contribution-b", "synthetic-contribution-c", "synthetic-object-a",
-    "synthetic-lease", "synthetic-bulk-0", "synthetic-source-a", "synthetic-other-source", directory, world.work, "participant:"]) {
+    "synthetic-lease", "synthetic-bulk-0", "synthetic-contribution-live", "synthetic-object-live", "synthetic-source-a", "synthetic-other-source", directory, world.work, "participant:"]) {
     values.add(value);
   }
   for (const value of values) {

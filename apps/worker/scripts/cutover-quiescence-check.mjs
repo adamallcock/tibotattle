@@ -27,11 +27,22 @@
 //                                    deletion ledger: PT-8's pending jobs and
 //                                    HX-6's pendingErasureJobs drain check
 //                                    (specified, not yet built).
-//   analytics-delivery               the analytics delivery cursor against the
-//                                    ingestion journal maximum: HX-6's
-//                                    cursorEqualsJournalMax drain check and
-//                                    the operator's --analytics-drain-complete
-//                                    attestation to EP-8.
+//   analytics-delivery               the analytics drain: the delivery cursor
+//                                    against the ingestion journal maximum, the
+//                                    daily publication queue, and the delivered
+//                                    terminal epoch against the source's. These
+//                                    are the D1 analytics export oracle's
+//                                    cursor_not_at_journal_max, queue_rows and
+//                                    terminal_undelivered refusals
+//                                    (proveQuiescence), HX-6's drain checks
+//                                    cursorEqualsJournalMax, queueRows and
+//                                    deliveredGteSource, and what an owner
+//                                    attests to EP-8 with
+//                                    --analytics-drain-complete. Not covered:
+//                                    the oracle's cursor_receipt,
+//                                    cache_retention_incomplete and stale_head,
+//                                    which run the Worker's own lanes (see
+//                                    notCovered on the check).
 //
 // The first two use the code the seal and PT-3 use, not a copy of it: the
 // participant predicate is imported from PT-3 (PARTICIPANT_*_PREDICATE) and the
@@ -41,8 +52,39 @@
 // refusal exists in code yet (refusals[].implemented). A check whose input is
 // absent is 'not-evaluated', never clear: missing evidence is not zero.
 //
+// Phases. Every run names its phase (--phase pre-fence | post-fence, with no
+// default, so a run cannot silently use the weaker one). The phase decides which
+// checks gate the verdict and the exit status; every check is still evaluated
+// and reported, and each carries gate: 'gating' | 'informational'.
+//
+//   pre-fence   gates only on the unfinished erasure state the owner must finish
+//               on Cloudflare before applying the EP-8 fence (decision: no
+//               override, finish the erasure, then re-seal): participants-
+//               quiescent, deletion-digest-intersection, pending-erasure-jobs.
+//               The rest are informational: in-flight uploads register
+//               quarantine objects and the delivery cursor and queue lag the
+//               journal on any healthy live source, and the others are PT-8
+//               refusals that are not in code yet. correction-runtime joins this
+//               gate when PT-8's CUTOVER_CORRECTION_RUNTIME_ACTIVE lands.
+//   post-fence  all seven checks gate: a fenced and drained export, or the
+//               sealed files (--seal is always post-fence).
+//
+// The exit status follows the gating checks of the phase only. Informational
+// findings are listed under `advisory` and never change the verdict:
+//
+//   0  quiescent   every gating check is clear. Pre-fence this is the go for the
+//                  fence, not a claim that the source is drained.
+//   2  blocked     a gating check is blocked: act on report.blocked.
+//   3  incomplete  nothing gating is blocked but a gating check was not
+//                  evaluated (an input was not supplied, or, in evaluate mode,
+//                  the intersection, which needs local hashing). From
+//                  `evaluate` with notEvaluated = ['deletion-digest-intersection']
+//                  alone, every gating check D1 can answer is clear: run `check`
+//                  on an export for the intersection.
+//   1  error       a refused argument, input or result.
+//
 // Modes (nothing here writes any database, contacts a provider or spawns
-// Wrangler):
+// Wrangler). `check` and `evaluate` both require --phase:
 //
 //   check     reads local SQLite files with node:sqlite, read-only:
 //               --seal <manifest> --seal-id <sha256>   the sealed ingestion and
@@ -80,19 +122,20 @@
 // and v columns), run the parts, and merge their outputs into one JSON array
 // (jq -s add part-1.json part-2.json) before `evaluate`. Then:
 //
-//   node scripts/cutover-quiescence-check.mjs evaluate --ingestion-result ingestion-result.json \
+//   node scripts/cutover-quiescence-check.mjs evaluate --phase pre-fence \
+//     --ingestion-result ingestion-result.json \
 //     --ledger-result ledger-result.json --analytics-result analytics-result.json
 //
 // Output is content free: counts, closed state names, one timestamp, and
 // opaque 16-hex references (a purpose-separated sha256 prefix of an id, never
 // the id or a ledger digest). No participant id, tombstone digest, source id,
-// object key, path or secret is printed. Exit status: 0 quiescent, 2 blocked,
-// 3 incomplete (nothing blocks, something was not evaluated), 1 an error.
+// object key, path or secret is printed.
 //
-// A live source is rarely quiescent: in-flight uploads register quarantine
-// objects and the delivery cursor lags the journal. Run it before the fence to
-// find mid-erasure participants and unfinished erasure jobs (the items an
-// owner must finish on Cloudflare), and again on the sealed source.
+// A live source is rarely fully quiescent, which is why the phases differ: run
+// `--phase pre-fence` before the fence to find mid-erasure participants and
+// unfinished erasure jobs (the items an owner must finish on Cloudflare), and
+// `--phase post-fence` on the drained export or the sealed source, where the
+// quarantine registrations and the analytics drain gate too.
 
 import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
@@ -122,6 +165,8 @@ import {
 export const CUTOVER_QUIESCENCE_REPORT_SCHEMA = "tibotattle-cutover-quiescence-report-v1";
 export const CUTOVER_QUIESCENCE_QUERIES_SCHEMA = "tibotattle-cutover-quiescence-queries-v1";
 export const QUIESCENCE_SOURCE_ROLES = Object.freeze(["ingestion", "deletion-ledger", "analytics"]);
+/** The phase of the cutover a run belongs to; it decides which checks gate (see GATES). */
+export const QUIESCENCE_PHASES = Object.freeze(["pre-fence", "post-fence"]);
 /** PT-8: the correction runtime must be staged (and hold no facts) for the transfer. */
 export const CORRECTION_RUNTIME_STAGED_STATE = "staged";
 /** At most this many opaque references are listed per check. */
@@ -224,6 +269,12 @@ const INGESTION_DYNAMIC = Object.freeze([
   // The journal head of the (singleton) ingestion source: k is its opaque source id.
   ["journal", "source_id",
     "COALESCE((SELECT max(sequence) FROM storage_ingestion_changes), 0)", "FROM storage_source_state"],
+  // The highest terminal (owner-withdrawn, owner-erased) containment epoch the source has journaled: the
+  // statement of readStorageCommunitySourceTerminalEpoch (src/storage-community-authority.ts), which
+  // the D1 analytics export oracle compares with the delivered one.
+  ["journal_terminal", "source_id",
+    "(SELECT COALESCE(MAX(public_authority_epoch),0) AS epoch FROM storage_ingestion_changes "
+      + "WHERE kind IN('owner-withdrawn','owner-erased'))", "FROM storage_source_state"],
 ]);
 const LEDGER_FACTS = Object.freeze([
   ["erasure_jobs", "total", "count", "count(*)", "FROM storage_erasure_jobs"],
@@ -235,10 +286,21 @@ const LEDGER_FACTS = Object.freeze([
 ]);
 const ANALYTICS_FACTS = Object.freeze([
   ["delivery", "cursor_rows", "count", "count(*)", "FROM analytics_source_cursors"],
+  ["delivery", "queue_rows", "count", "count(*)", "FROM analytics_community_daily_queue"],
+  ["delivery", "terminal_rows", "count", "count(*)", "FROM analytics_community_terminal_watermarks"],
 ]);
 const ANALYTICS_DYNAMIC = Object.freeze([
   ["delivery_cursor", "source_id", "sequence",
     `FROM (SELECT source_id, sequence FROM analytics_source_cursors ORDER BY source_id LIMIT ${MAX_CURSOR_ROWS + 1})`],
+  // Pending daily-publication work per source: the oracle's queue_rows (analytics_community_daily_queue).
+  ["delivery_queue", "source_id", "n",
+    "FROM (SELECT source_id, count(*) AS n FROM analytics_community_daily_queue GROUP BY source_id "
+      + `ORDER BY source_id LIMIT ${MAX_CURSOR_ROWS + 1})`],
+  // The highest terminal epoch the target has delivered or fenced: readStorageCommunityDeliveredTerminalEpoch
+  // (a source with no row has delivered none, which that helper reads as 0).
+  ["delivery_terminal", "source_id", "terminal_public_authority_epoch",
+    "FROM (SELECT source_id, terminal_public_authority_epoch FROM analytics_community_terminal_watermarks "
+      + `ORDER BY source_id LIMIT ${MAX_CURSOR_ROWS + 1})`],
 ]);
 
 const ROLE_DEFINITIONS = Object.freeze({
@@ -337,6 +399,10 @@ function assertFactsConsistent(facts) {
     need(get("owner_links", "total") >= get("owner_links", "erased") + get("owner_links", "withdrawn"));
     need(get("quarantine", "total") === get("quarantine", "registered") + get("quarantine", "deleting"));
     need((get("quarantine", "total") === 0) === (get("quarantine", "oldest_registered_at") === null));
+    // Both journal facts are read once per source_state row, so they name the same sources.
+    const journal = facts.family("journal");
+    const terminal = facts.family("journal_terminal");
+    need(journal.size === terminal.size && [...journal.keys()].every(source => terminal.has(source)));
     const rows = get("correction", "runtime_rows");
     need(rows <= 1 && (rows === 1) === (get("correction", "runtime_state") !== null));
   } else if (facts.role === "deletion-ledger") {
@@ -345,6 +411,8 @@ function assertFactsConsistent(facts) {
       && (get("erasure_jobs", "pending") === 0) === (get("erasure_jobs", "pending_participants") === 0));
   } else {
     need(get("delivery", "cursor_rows") === facts.family("delivery_cursor").size);
+    need(get("delivery", "terminal_rows") === facts.family("delivery_terminal").size);
+    need(get("delivery", "queue_rows") === [...facts.family("delivery_queue").values()].reduce((sum, n) => sum + n, 0));
   }
 }
 
@@ -568,16 +636,25 @@ function readIntersection(ingestionDatabase, ledgerDatabase) {
 
 // implemented: whether the refusal exists in code at this commit. A code of null
 // is a refusal the PT-8, PT-4 or HX-6 brief specifies without naming a code.
-const refusal = (stage, code, implemented) => Object.freeze([Object.freeze({ stage, code, implemented })]);
+const refusal = (stage, code, implemented, extra = {}) => Object.freeze({ stage, code, implemented, ...extra });
 const REFUSALS = Object.freeze({
-  "participants-quiescent": refusal("PT-3", "CUTOVER_PARTICIPANT_ERASURE_PENDING", true),
-  "deletion-digest-intersection": refusal("PT-2-lite, PT-3", "CUTOVER_ERASED_PARTICIPANT_PRESENT", true),
-  "owner-links-erased": refusal("PT-8", null, false),
-  "pending-quarantine-registrations": refusal("PT-4, PT-8", null, false),
-  "correction-runtime": refusal("PT-8", "CUTOVER_CORRECTION_RUNTIME_ACTIVE", false),
-  "pending-erasure-jobs": refusal("PT-8, HX-6 drain", null, false),
-  "analytics-delivery": refusal("HX-6 drain, EP-8 attestation", null, false),
+  "participants-quiescent": Object.freeze([refusal("PT-3", "CUTOVER_PARTICIPANT_ERASURE_PENDING", true)]),
+  "deletion-digest-intersection": Object.freeze([refusal("PT-2-lite, PT-3", "CUTOVER_ERASED_PARTICIPANT_PRESENT", true)]),
+  "owner-links-erased": Object.freeze([refusal("PT-8", null, false)]),
+  "pending-quarantine-registrations": Object.freeze([refusal("PT-4, PT-8", null, false)]),
+  "correction-runtime": Object.freeze([refusal("PT-8", "CUTOVER_CORRECTION_RUNTIME_ACTIVE", false)]),
+  "pending-erasure-jobs": Object.freeze([refusal("PT-8, HX-6 drain", null, false)]),
+  "analytics-delivery": Object.freeze([
+    // The drain proof the analytics export oracle runs (src/d1-analytics-export-oracle.ts proveQuiescence).
+    refusal("D1 analytics export oracle", "ANALYTICS_EXPORT_NOT_QUIESCENT", true,
+      { reasons: Object.freeze(["cursor_not_at_journal_max", "queue_rows", "terminal_undelivered"]) }),
+    refusal("HX-6 drain, EP-8 attestation", null, false),
+  ]),
 });
+// The drain proof's reasons this check cannot reproduce read-only: each runs one of the Worker's own
+// lanes (the cursor receipt re-proof, the cache-retention pass, the stale-head selector). A clear
+// analytics-delivery is therefore not a pass of the drain proof.
+const ANALYTICS_DELIVERY_NOT_COVERED = Object.freeze(["cursor_receipt", "cache_retention_incomplete", "stale_head"]);
 const REQUIRES = Object.freeze({
   "participants-quiescent": ["ingestion"],
   "deletion-digest-intersection": ["ingestion", "deletion-ledger"],
@@ -587,19 +664,45 @@ const REQUIRES = Object.freeze({
   "pending-erasure-jobs": ["deletion-ledger"],
   "analytics-delivery": ["ingestion", "analytics"],
 });
+
+const GATING = "gating";
+const INFORMATIONAL = "informational";
+/**
+ * Which checks gate the verdict and the exit status in each phase. Before the
+ * fence only the unfinished erasure state gates: that is what the owner must
+ * finish on Cloudflare (decision: no override, finish the erasure, re-seal) and
+ * what a seal or PT-3 cannot take. In-flight quarantine registrations and
+ * analytics lag are normal on a live source, and owner-links-erased and
+ * correction-runtime are PT-8 refusals that are not in code. After the fence
+ * (the drained export, the sealed files) every check gates.
+ * correction-runtime joins the pre-fence gate when PT-8's
+ * CUTOVER_CORRECTION_RUNTIME_ACTIVE lands.
+ */
+export const QUIESCENCE_GATES = Object.freeze(Object.fromEntries(Object.entries({
+  "participants-quiescent": [GATING, GATING],
+  "deletion-digest-intersection": [GATING, GATING],
+  "owner-links-erased": [INFORMATIONAL, GATING],
+  "pending-quarantine-registrations": [INFORMATIONAL, GATING],
+  "correction-runtime": [INFORMATIONAL, GATING],
+  "pending-erasure-jobs": [GATING, GATING],
+  "analytics-delivery": [INFORMATIONAL, GATING],
+}).map(([id, [preFence, postFence]]) => [id, Object.freeze({ "pre-fence": preFence, "post-fence": postFence })])));
+
 const NOTES = Object.freeze({
   "participants-quiescent": "Finish each erasure on Cloudflare before the fence. After a seal, that costs a fence release, "
     + "the erasure and a re-seal. There is no override.",
   "deletion-digest-intersection": "A participant that matches a recorded tombstone must not be imported (decision D2).",
-  "pending-quarantine-registrations": "In-flight uploads register objects on a live source; the fence freezes the set. "
-    + "'deleting' is a reconciliation lease the fenced Worker cannot finish.",
+  "pending-quarantine-registrations": "In-flight uploads register objects on a live source; the fence freezes the set, "
+    + "and PT-4 then maps it or proves it empty. 'deleting' is a reconciliation lease the fenced Worker cannot finish.",
   "correction-runtime": "PT-8 requires the runtime staged with no correction facts.",
-  "pending-erasure-jobs": "The analytics Workers finish erasure jobs while they still run; wait for them to clear before the seal.",
-  "analytics-delivery": "Meaningful after the main Worker is fenced and its drain is complete; some lag is normal on a live source.",
+  "pending-erasure-jobs": "The analytics Workers finish erasure jobs while they still run: wait for them to clear before the "
+    + "fence, and after it they must have drained before the seal.",
+  "analytics-delivery": "Some lag is normal on a live source. After the fence the analytics Workers keep running, and "
+    + "the cursor, the queue and the terminal epoch must have drained before the seal and the attestation.",
 });
 
-function checkBody(id, status, extra = {}) {
-  return Object.freeze({ id, status, requires: REQUIRES[id], refusals: REFUSALS[id], ...extra,
+function checkBody(id, status, phase, extra = {}) {
+  return Object.freeze({ id, status, gate: QUIESCENCE_GATES[id][phase], requires: REQUIRES[id], refusals: REFUSALS[id], ...extra,
     ...(status === "blocked" && NOTES[id] !== undefined ? { note: NOTES[id] } : {}) });
 }
 
@@ -609,13 +712,15 @@ const statusOf = (blocked) => (blocked ? "blocked" : "clear");
  * Evaluate the facts into a report. `facts` holds a normalised fact set per
  * supplied role; `local` carries SQLite-mode detail (refs, the intersection).
  */
-export function evaluateQuiescence({ facts = {}, local = {}, mode, sources = [], now = () => new Date() } = {}) {
+export function evaluateQuiescence({ facts = {}, local = {}, mode, phase, sources = [], now = () => new Date() } = {}) {
   if (mode !== "sqlite" && mode !== "wrangler-results") fail("QUIESCENCE_ARGUMENT_INVALID");
+  if (!QUIESCENCE_PHASES.includes(phase)) fail("QUIESCENCE_ARGUMENT_INVALID");
+  const body = (id, status, extra) => checkBody(id, status, phase, extra);
   const ingestion = facts.ingestion;
   const ledger = facts["deletion-ledger"];
   const analytics = facts.analytics;
   const checks = [];
-  const absent = (id, reason) => checkBody(id, "not-evaluated", { reason });
+  const absent = (id, reason) => body(id, "not-evaluated", { reason });
   const refsOfCheck = (detail) => (detail === undefined ? {} : { refs: detail.refs, refsTruncated: detail.truncated });
 
   if (ingestion === undefined) {
@@ -629,7 +734,7 @@ export function evaluateQuiescence({ facts = {}, local = {}, mode, sources = [],
       deletionFenced: get("participants", "deletion_fenced"),
       stateUnrecognized: get("participants", "state_unrecognized"),
     };
-    checks.push(checkBody("participants-quiescent", statusOf(counts.notQuiescent > 0),
+    checks.push(body("participants-quiescent", statusOf(counts.notQuiescent > 0),
       { counts, ...refsOfCheck(local.ingestion?.participants) }));
   }
 
@@ -639,10 +744,10 @@ export function evaluateQuiescence({ facts = {}, local = {}, mode, sources = [],
   } else if (local.intersection === undefined) {
     checks.push(absent("deletion-digest-intersection", "requires-local-hashing"));
   } else if (local.intersection.refused !== undefined) {
-    checks.push(checkBody("deletion-digest-intersection", "blocked", { counts: null, refused: local.intersection.refused }));
+    checks.push(body("deletion-digest-intersection", "blocked", { counts: null, refused: local.intersection.refused }));
   } else {
     const { participants, deletionDigests, matches, refs, truncated } = local.intersection;
-    checks.push(checkBody("deletion-digest-intersection", statusOf(matches > 0),
+    checks.push(body("deletion-digest-intersection", statusOf(matches > 0),
       { counts: { participants, deletionDigests, matches }, refs, refsTruncated: truncated }));
   }
 
@@ -654,17 +759,17 @@ export function evaluateQuiescence({ facts = {}, local = {}, mode, sources = [],
     const get = ingestion.get;
     const links = { ownerLinks: get("owner_links", "total"), erased: get("owner_links", "erased"),
       withdrawn: get("owner_links", "withdrawn") };
-    checks.push(checkBody("owner-links-erased", statusOf(links.erased > 0),
+    checks.push(body("owner-links-erased", statusOf(links.erased > 0),
       { counts: links, ...refsOfCheck(local.ingestion?.erasedLinks) }));
     const quarantine = { registrations: get("quarantine", "total"), registered: get("quarantine", "registered"),
       deleting: get("quarantine", "deleting"), oldestRegisteredAt: get("quarantine", "oldest_registered_at") };
-    checks.push(checkBody("pending-quarantine-registrations", statusOf(quarantine.registrations > 0),
+    checks.push(body("pending-quarantine-registrations", statusOf(quarantine.registrations > 0),
       { counts: quarantine, ...refsOfCheck(local.ingestion?.quarantine) }));
     const correction = { runtimeRows: get("correction", "runtime_rows"), runtimeState: get("correction", "runtime_state"),
       facts: get("correction", "facts"), history: get("correction", "history") };
     const runtimeBlocked = correction.runtimeRows !== 1 || correction.runtimeState !== CORRECTION_RUNTIME_STAGED_STATE
       || correction.facts > 0 || correction.history > 0;
-    checks.push(checkBody("correction-runtime", statusOf(runtimeBlocked), { counts: correction }));
+    checks.push(body("correction-runtime", statusOf(runtimeBlocked), { counts: correction }));
   }
 
   if (ledger === undefined) {
@@ -674,7 +779,7 @@ export function evaluateQuiescence({ facts = {}, local = {}, mode, sources = [],
     const jobs = { jobs: get("erasure_jobs", "total"), pending: get("erasure_jobs", "pending"),
       complete: get("erasure_jobs", "complete"), pendingParticipants: get("erasure_jobs", "pending_participants"),
       tombstones: get("tombstones", "total") };
-    checks.push(checkBody("pending-erasure-jobs", statusOf(jobs.pending > 0),
+    checks.push(body("pending-erasure-jobs", statusOf(jobs.pending > 0),
       { counts: jobs, ...refsOfCheck(local.ledger?.erasureJobs) }));
   }
 
@@ -682,36 +787,58 @@ export function evaluateQuiescence({ facts = {}, local = {}, mode, sources = [],
     checks.push(absent("analytics-delivery", ingestion === undefined ? "ingestion-not-supplied" : "analytics-not-supplied"));
   } else {
     const journal = [...ingestion.family("journal")];
+    const sourceTerminals = ingestion.family("journal_terminal");
     const cursors = analytics.family("delivery_cursor");
+    const queues = analytics.family("delivery_queue");
+    const delivered = analytics.family("delivery_terminal");
     if (journal.length === 0) {
       checks.push(absent("analytics-delivery", "source-state-absent"));
     } else {
       // A source with no cursor row has delivered nothing (the Worker's own
-      // delivery trigger reads a missing cursor as 0), but only because the
-      // analytics statement succeeded and listed every cursor row.
+      // delivery trigger reads a missing cursor as 0), and one with no terminal
+      // watermark has delivered no terminal (readStorageCommunityDeliveredTerminalEpoch
+      // reads 0), but only because the analytics statement succeeded and listed
+      // every row. A delivered terminal ahead of the source's is not a refusal:
+      // the target's watermark is also raised by its own erasure fences.
       const rows = journal.map(([source, journalMax]) => {
-        const delivered = cursors.get(source) ?? 0;
-        return { sourceRef: opaqueRef("source", source), journalMax, deliveredCursor: delivered,
-          undelivered: Math.max(0, journalMax - delivered), cursorAheadBy: Math.max(0, delivered - journalMax) };
+        const cursor = cursors.get(source) ?? 0;
+        const sourceTerminalEpoch = sourceTerminals.get(source);
+        const deliveredTerminalEpoch = delivered.get(source) ?? 0;
+        return { sourceRef: opaqueRef("source", source), journalMax, deliveredCursor: cursor,
+          undelivered: Math.max(0, journalMax - cursor), cursorAheadBy: Math.max(0, cursor - journalMax),
+          queueRows: queues.get(source) ?? 0, sourceTerminalEpoch, deliveredTerminalEpoch,
+          terminalUndelivered: deliveredTerminalEpoch < sourceTerminalEpoch };
       });
       const known = new Set(journal.map(([source]) => source));
       const counts = { sources: rows,
-        analyticsCursorsWithoutIngestionSource: [...cursors.keys()].filter(source => !known.has(source)).length };
-      checks.push(checkBody("analytics-delivery", statusOf(rows.some(row => row.undelivered > 0 || row.cursorAheadBy > 0)),
-        { counts }));
+        analyticsCursorsWithoutIngestionSource: [...cursors.keys()].filter(source => !known.has(source)).length,
+        analyticsQueueRowsWithoutIngestionSource: [...queues].filter(([source]) => !known.has(source))
+          .reduce((sum, [, n]) => sum + n, 0) };
+      // Cursors and queue rows of a source the ingestion does not name are counted, and do not block, as the
+      // oracle only proves the one source it exports.
+      const blocked = rows.some(row => row.undelivered > 0 || row.cursorAheadBy > 0 || row.queueRows > 0 || row.terminalUndelivered);
+      checks.push(body("analytics-delivery", statusOf(blocked), { counts, notCovered: ANALYTICS_DELIVERY_NOT_COVERED }));
     }
   }
 
-  const blocked = checks.filter(item => item.status === "blocked").map(item => item.id);
-  const notEvaluated = checks.filter(item => item.status === "not-evaluated").map(item => item.id);
+  // The verdict follows the gating checks of the phase. An informational check that is blocked or
+  // not evaluated is listed under advisory and never changes the verdict or the exit status.
+  const gating = checks.filter(item => item.gate === GATING);
+  const informational = checks.filter(item => item.gate === INFORMATIONAL);
+  const idsWith = (items, status) => items.filter(item => item.status === status).map(item => item.id);
+  const blocked = idsWith(gating, "blocked");
+  const notEvaluated = idsWith(gating, "not-evaluated");
   const verdict = blocked.length > 0 ? "blocked" : notEvaluated.length > 0 ? "incomplete" : "quiescent";
   return Object.freeze({
     schema: CUTOVER_QUIESCENCE_REPORT_SCHEMA,
     mode,
+    phase,
     checkedAt: now().toISOString(),
     verdict,
+    gating: gating.map(item => item.id),
     blocked,
     notEvaluated,
+    advisory: Object.freeze({ blocked: idsWith(informational, "blocked"), notEvaluated: idsWith(informational, "not-evaluated") }),
     sources: Object.freeze(sources),
     checks: Object.freeze(checks),
   });
@@ -731,9 +858,13 @@ function sourceEntry(role, source) {
  * `sealId`, which supplies the sealed ingestion and deletion-ledger files, or
  * `ingestion` and `ledger` paths of exported D1 files; `analytics` is always a
  * plain exported file. At least one source is required; an absent one is
- * not-evaluated, never clear.
+ * not-evaluated, never clear. `phase` ('pre-fence' | 'post-fence') is required
+ * and decides which checks gate the verdict; a sealed source is post-fence by
+ * construction, so `seal` with 'pre-fence' is refused.
  */
-export async function runQuiescenceCheck({ seal, sealId, ingestion, ledger, analytics, now = () => new Date() } = {}) {
+export async function runQuiescenceCheck({ seal, sealId, phase, ingestion, ledger, analytics, now = () => new Date() } = {}) {
+  if (!QUIESCENCE_PHASES.includes(phase)) fail("QUIESCENCE_ARGUMENT_INVALID");
+  if (seal !== undefined && phase !== "post-fence") fail("QUIESCENCE_ARGUMENT_INVALID");
   if (seal !== undefined && (ingestion !== undefined || ledger !== undefined)) fail("QUIESCENCE_ARGUMENT_INVALID");
   if (seal === undefined && sealId !== undefined) fail("QUIESCENCE_ARGUMENT_INVALID");
   if (seal === undefined && ingestion === undefined && ledger === undefined && analytics === undefined) {
@@ -764,7 +895,7 @@ export async function runQuiescenceCheck({ seal, sealId, ingestion, ledger, anal
     }
     for (const source of Object.values(opened)) await source.verify();
     return evaluateQuiescence({
-      facts, local, mode: "sqlite", now,
+      facts, local, mode: "sqlite", phase, now,
       sources: QUIESCENCE_SOURCE_ROLES.map(role => sourceEntry(role, opened[role])),
     });
   } finally {
@@ -772,8 +903,9 @@ export async function runQuiescenceCheck({ seal, sealId, ingestion, ledger, anal
   }
 }
 
-/** Evaluate saved owner-run Wrangler output (documented mode); each argument is a file path. */
-export async function evaluateWranglerResults({ ingestion, ledger, analytics, now = () => new Date() } = {}) {
+/** Evaluate saved owner-run Wrangler output (documented mode); each source argument is a file path. */
+export async function evaluateWranglerResults({ phase, ingestion, ledger, analytics, now = () => new Date() } = {}) {
+  if (!QUIESCENCE_PHASES.includes(phase)) fail("QUIESCENCE_ARGUMENT_INVALID");
   const inputs = { ingestion, "deletion-ledger": ledger, analytics };
   if (Object.values(inputs).every(value => value === undefined)) fail("QUIESCENCE_ARGUMENT_INVALID");
   const facts = {};
@@ -787,7 +919,7 @@ export async function evaluateWranglerResults({ ingestion, ledger, analytics, no
     facts[role] = parseWranglerQuiescenceResult(role, file.text);
     sources.push(sourceEntry(role, { kind: "wrangler-result", sha256: file.sha256 }));
   }
-  return evaluateQuiescence({ facts, mode: "wrangler-results", now, sources });
+  return evaluateQuiescence({ facts, mode: "wrangler-results", phase, now, sources });
 }
 
 export function quiescenceExitCode(report) {
@@ -798,9 +930,10 @@ export function quiescenceExitCode(report) {
 // CLI.
 
 const COMMAND_FLAGS = Object.freeze({
-  check: Object.freeze({ "--seal": "seal", "--seal-id": "sealId", "--ingestion": "ingestion", "--ledger": "ledger",
-    "--analytics": "analytics" }),
-  evaluate: Object.freeze({ "--ingestion-result": "ingestion", "--ledger-result": "ledger", "--analytics-result": "analytics" }),
+  check: Object.freeze({ "--phase": "phase", "--seal": "seal", "--seal-id": "sealId", "--ingestion": "ingestion",
+    "--ledger": "ledger", "--analytics": "analytics" }),
+  evaluate: Object.freeze({ "--phase": "phase", "--ingestion-result": "ingestion", "--ledger-result": "ledger",
+    "--analytics-result": "analytics" }),
   queries: Object.freeze({ "--role": "role" }),
 });
 
@@ -824,6 +957,11 @@ export function parseQuiescenceArguments(argv) {
     }
     options[key] = value;
     index += 1;
+  }
+  if (command !== "queries") {
+    // The phase is required and has no default: a run cannot silently use the weaker gate.
+    if (!QUIESCENCE_PHASES.includes(options.phase)) fail("QUIESCENCE_ARGUMENT_INVALID");
+    if (options.seal !== undefined && options.phase !== "post-fence") fail("QUIESCENCE_ARGUMENT_INVALID");
   }
   if (command === "queries") {
     if (options.role !== undefined && !QUIESCENCE_SOURCE_ROLES.includes(options.role)) fail("QUIESCENCE_ARGUMENT_INVALID");
