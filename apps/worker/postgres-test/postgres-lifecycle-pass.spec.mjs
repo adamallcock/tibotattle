@@ -1,0 +1,779 @@
+import assert from "node:assert/strict";
+import { randomBytes, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { lstat, readdir, realpath, stat } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { after, test } from "node:test";
+import pg from "pg";
+import { createServer } from "vite";
+import { applyPostgresMigrations, renderPostgresSearchPath } from "../scripts/postgres-migrations.mjs";
+
+/*
+ * PostgreSQL 17 qualification for the MP-2-lite lifecycle and
+ * quarantine-reconciliation pass (src/postgres-lifecycle-pass.ts, OD-CR-4).
+ *
+ * Readiness is judged by WORKER_READINESS below: a verbatim port of the
+ * d43c8f92 Worker handleReady computation for typed storage (src/index.ts
+ * lifecycleReadiness and handleReady; BACKEND_LIFECYCLE_STALE_MILLISECONDS
+ * from src/constants.ts) over the shared PostgreSQL readers. When the RD-2
+ * builder (src/postgres-readiness.ts) is present in the checkout, every body
+ * is also compared with buildPostgresReadinessBody, so the two can never
+ * drift silently once they meet.
+ *
+ * Each test creates its own schema, prefixed c_maint_, applies the promoted
+ * primary chain through the production runner and drops the schema
+ * afterwards. Every row, key and object is synthetic and content-free.
+ */
+
+const PG_TEST_HOST = process.env.PG_TEST_HOST;
+const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
+const PG_TEST_PORT = Number(process.env.PG_TEST_PORT ?? "55432");
+const PG_TEST_USER = process.env.PG_TEST_USER || "postgres";
+const PG_TEST_PASSWORD = process.env.PG_TEST_PASSWORD || "synthetic-local-only";
+const PG_TEST_DATABASE = process.env.PG_TEST_DATABASE || "postgres";
+const SKIP = !PG_TEST_HOST && !PG_TEST_SOCKET;
+const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const PRIMARY_MIGRATIONS = join(WORKER_ROOT, "postgres", "migrations", "primary");
+const READINESS_BUILDER = join(WORKER_ROOT, "src", "postgres-readiness.ts");
+const SOCKET_DIRECTORY = /^\/private\/tmp\/tibotattle-pg-[^/]+\/socket$/u;
+const STALE_AFTER = 2 * 60 * 60 * 1_000;
+const SAFETY_WINDOW = 24 * 60 * 60 * 1_000;
+const PAGE = 50;
+const MINUTE = 60_000;
+const BASE_CYCLE = Date.parse("2026-10-02T12:00:00.000Z");
+
+/** The 0064 section (4) pins, verbatim from claude/gcp-fp-w3-simp 3a93c7d1 (OD-1). */
+const RESIDUE_0064_RETENTION_PINS = `ALTER TABLE retention_state
+  DROP CONSTRAINT retention_state_restored_participants_suppressed_check,
+  ADD CONSTRAINT retention_state_restored_participants_suppressed_check
+    CHECK (restored_participants_suppressed = 0),
+  ADD CONSTRAINT retention_state_restore_replay_complete_check
+    CHECK (restore_replay_complete);`;
+
+async function endpoint() {
+  const socket = PG_TEST_SOCKET || (PG_TEST_HOST?.startsWith("/") ? PG_TEST_HOST : undefined);
+  assert.ok(socket || ["localhost", "127.0.0.1", "::1"].includes(PG_TEST_HOST),
+    "lifecycle pass tests require loopback or a private Unix socket");
+  assert.ok(Number.isSafeInteger(PG_TEST_PORT) && PG_TEST_PORT > 0 && PG_TEST_PORT <= 65_535);
+  if (socket) {
+    assert.match(socket, SOCKET_DIRECTORY);
+    const link = await lstat(socket);
+    const host = await realpath(socket);
+    const metadata = await stat(host);
+    assert.equal(link.isSymbolicLink(), false);
+    assert.ok(host.startsWith("/private/tmp/tibotattle-pg-"));
+    assert.equal(metadata.isDirectory(), true);
+    assert.equal(metadata.mode & 0o077, 0);
+    assert.equal(metadata.uid, process.getuid());
+    return { host, port: PG_TEST_PORT, socket: true };
+  }
+  return { host: PG_TEST_HOST, port: PG_TEST_PORT, socket: false };
+}
+
+let sharedPool;
+let sharedVite;
+const loaded = new Map();
+
+async function connection() {
+  if (!sharedPool) {
+    const { host, port, socket } = await endpoint();
+    const pool = new pg.Pool({
+      host, port, user: PG_TEST_USER, password: PG_TEST_PASSWORD, database: PG_TEST_DATABASE,
+      ssl: false, max: 6, connectionTimeoutMillis: 5_000, application_name: "c-maint-lifecycle-pass-test",
+    });
+    pool.on("error", () => {});
+    try {
+      const server = await pool.query(
+        "SELECT current_setting('server_version_num')::integer AS version, host(inet_server_addr()) AS address",
+      );
+      assert.equal(Math.floor(server.rows[0].version / 10_000), 17, "the pass is qualified on PostgreSQL 17");
+      if (socket) assert.equal(server.rows[0].address, null);
+      else assert.ok(["127.0.0.1", "::1"].includes(server.rows[0].address), "the server answers on loopback");
+    } catch (error) {
+      await pool.end();
+      throw error;
+    }
+    sharedPool = pool;
+  }
+  return sharedPool;
+}
+
+async function workerModule(path) {
+  if (!sharedVite) {
+    sharedVite = await createServer({
+      root: WORKER_ROOT, configFile: false, server: { middlewareMode: true }, appType: "custom", logLevel: "silent",
+    });
+  }
+  if (!loaded.has(path)) loaded.set(path, await sharedVite.ssrLoadModule(path));
+  return loaded.get(path);
+}
+
+after(async () => {
+  if (sharedVite) await sharedVite.close();
+  if (sharedPool) await sharedPool.end();
+});
+
+function quoted(schema) {
+  assert.match(schema, /^c_maint_[a-z0-9_]{1,54}$/u);
+  return `"${schema}"`;
+}
+
+/**
+ * A pool whose clients run in a far-from-UTC session time zone, so every
+ * instant the pass writes must carry its own offset. DateStyle stays ISO: the
+ * pg driver (and so the reused reconciler's registered_at check) parses only
+ * the ISO text form.
+ */
+function hostile(pool) {
+  return {
+    async connect() {
+      const client = await pool.connect();
+      await client.query("SET TimeZone='Pacific/Kiritimati'");
+      return {
+        query: (text, values) => client.query(text, values),
+        async release(discard) {
+          if (!discard) {
+            try { await client.query("RESET ALL"); } catch { discard = true; }
+          }
+          client.release(discard);
+        },
+      };
+    },
+  };
+}
+
+/** Apply the 0064 retention pins unless the promoted chain already carries 0064. */
+async function applyResiduePins(pool, schema) {
+  const promoted = (await readdir(PRIMARY_MIGRATIONS)).some((name) => name.endsWith("_append_only_residue.sql"));
+  if (promoted) return "promoted";
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(renderPostgresSearchPath(schema));
+    await client.query(RESIDUE_0064_RETENTION_PINS);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+  return "inline";
+}
+
+/**
+ * Run `body` against a fresh schema migrated by the production runner to the
+ * promoted head, which must equal the image manifest the pass checks.
+ */
+async function withSchema(body, { pins = false } = {}) {
+  const pool = await connection();
+  const { POSTGRES_RUNTIME_MIGRATIONS } = await workerModule("/src/postgres-runtime-schema.ts");
+  const schema = `c_maint_lp_${randomBytes(6).toString("hex")}`;
+  await pool.query(`CREATE SCHEMA ${quoted(schema)}`);
+  try {
+    const applied = await applyPostgresMigrations({ role: "primary", schema, pool });
+    assert.equal(applied.applied, POSTGRES_RUNTIME_MIGRATIONS.primary.length,
+      "the promoted chain is the image manifest the pass expects");
+    const pinned = pins ? await applyResiduePins(pool, schema) : null;
+    const table = (name) => {
+      assert.match(name, /^[a-z_][a-z0-9_]{0,62}$/u);
+      return `${quoted(schema)}."${name}"`;
+    };
+    await body({ pool, schema, table, pinned, expected: POSTGRES_RUNTIME_MIGRATIONS.primary });
+  } finally {
+    await pool.query(`DROP SCHEMA IF EXISTS ${quoted(schema)} CASCADE`);
+  }
+}
+
+function syntheticStore() {
+  const objects = new Set();
+  const calls = { head: 0, delete: 0 };
+  let failDelete = false;
+  return {
+    objects,
+    calls,
+    failNextDelete() { failDelete = true; },
+    async head(key) {
+      calls.head += 1;
+      return objects.has(key) ? { version: "synthetic-generation-1", size: 1 } : null;
+    },
+    async delete(key) {
+      calls.delete += 1;
+      if (failDelete) {
+        failDelete = false;
+        throw new Error("synthetic provider failure");
+      }
+      objects.delete(key);
+    },
+  };
+}
+
+/** The d43c8f92 Worker handleReady body for typed storage, from the PostgreSQL readers. */
+function WORKER_READINESS(retention, reconciliation, nowEpoch) {
+  let lifecycle;
+  if (retention.state !== "completed") {
+    lifecycle = { fresh: false, state: retention.state };
+  } else {
+    const completedEpoch = retention.lastCompletedAtMs === null ? Number.NaN : retention.lastCompletedAtMs;
+    const fresh = Number.isFinite(completedEpoch)
+      && completedEpoch <= nowEpoch
+      && nowEpoch - completedEpoch <= STALE_AFTER;
+    if (!fresh) lifecycle = { fresh: false, state: "stale" };
+    else if (!retention.quarantineRetentionComplete || !retention.restoreReplayComplete) {
+      lifecycle = { fresh: true, state: "incomplete" };
+    } else lifecycle = { fresh: true, state: "ready" };
+  }
+  const maintenanceCycleMatched = retention.maintenanceRunAtIso !== null
+    && reconciliation.maintenanceRunAtIso === retention.maintenanceRunAtIso;
+  const reconciliationComplete = reconciliation.state === "completed"
+    && reconciliation.reconciliationComplete
+    && maintenanceCycleMatched;
+  const ready = lifecycle.state === "ready" && reconciliationComplete;
+  return {
+    httpStatus: ready ? 200 : 503,
+    body: {
+      status: ready ? "ready" : "not_ready",
+      checks: {
+        lifecycle: lifecycle.state,
+        lifecycleFresh: lifecycle.fresh,
+        quarantineRetentionComplete: retention.quarantineRetentionComplete,
+        restoreReplayComplete: retention.restoreReplayComplete,
+        aggregateRebuildComplete: false,
+        aggregateRebuildDelegated: true,
+        maintenanceCycleMatched,
+        quarantineReconciliation: reconciliation.state,
+        quarantineReconciliationComplete: reconciliationComplete,
+      },
+      policy: { lifecycleStaleAfterMilliseconds: STALE_AFTER },
+    },
+  };
+}
+
+/** Read both rows in one read-only snapshot and judge them as the Worker would. */
+async function readiness(pool, schema, nowEpoch) {
+  const state = await workerModule("/src/postgres-lifecycle-state.ts");
+  const client = await pool.connect();
+  let retention;
+  let reconciliation;
+  try {
+    await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    retention = await state.readPostgresRetentionState(client, { primarySchema: schema });
+    reconciliation = await state.readPostgresQuarantineReconciliationState(client, { primarySchema: schema });
+    await client.query("COMMIT");
+  } finally {
+    client.release();
+  }
+  assert.ok(retention && reconciliation, "a migrated origin has both singleton rows");
+  const expected = WORKER_READINESS(retention, reconciliation, nowEpoch);
+  if (existsSync(READINESS_BUILDER)) {
+    const builder = await workerModule("/src/postgres-readiness.ts");
+    const actual = builder.buildPostgresReadinessBody({ retention, reconciliation }, nowEpoch,
+      { semantics: "worker-exact" });
+    assert.deepEqual(JSON.parse(JSON.stringify(actual)), expected, "RD-2 builder matches the Worker port");
+  }
+  return expected;
+}
+
+/** Both singleton rows with their row versions: equal snapshots mean no write. */
+async function snapshot(pool, table) {
+  const rows = await pool.query(
+    `SELECT 'retention' AS relation, xmin::text AS version, to_jsonb(r) AS row FROM ${table("retention_state")} r
+     UNION ALL
+     SELECT 'reconciliation', xmin::text, to_jsonb(q) FROM ${table("quarantine_reconciliation_state")} q
+     ORDER BY 1`,
+  );
+  return rows.rows;
+}
+
+async function pendingCount(pool, table) {
+  return (await pool.query(`SELECT count(*)::int AS count FROM ${table("pending_objects")}`)).rows[0].count;
+}
+
+async function seedPending(pool, table, store, count, registeredEpoch) {
+  const keys = [];
+  for (let index = 0; index < count; index += 1) {
+    const key = `synthetic/c-maint/${randomUUID()}`;
+    keys.push(key);
+    store.objects.add(key);
+    await pool.query(
+      `INSERT INTO ${table("pending_objects")}
+         (contribution_id, object_key, object_kind, registered_at, reconciliation_state)
+       VALUES ($1, $2, 'synthetic', $3, 'registered')`,
+      [`synthetic-c-maint-${randomUUID()}`, key, new Date(registeredEpoch).toISOString()],
+    );
+  }
+  return keys;
+}
+
+async function reconciliationRow(pool, table) {
+  return (await pool.query(
+    `SELECT state, lease_id, failure_code, reconciliation_complete,
+            registrations_examined::int AS examined, orphan_objects_deleted::int AS orphans,
+            referenced_objects_preserved::int AS preserved,
+            to_char(maintenance_run_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS run_at,
+            to_char(cutoff_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS cutoff_at
+       FROM ${table("quarantine_reconciliation_state")}`,
+  )).rows[0];
+}
+
+const RESULT_KEYS = Object.freeze([
+  "schemaVersion", "outcome", "code", "changed", "cycle", "lockAcquired", "lifecycleComplete",
+  "lifecycleWritten", "quarantineRetentionComplete", "quarantineObjectsDeleted", "reconciliation",
+  "quarantineReconciliationComplete", "appendOnlyNotApplicable",
+]);
+const NOT_APPLICABLE = Object.freeze({
+  restoreReplayComplete: true, deletionTombstoneRetentionComplete: true, ownerErasureJobsComplete: true,
+});
+
+function iso(epoch) { return new Date(epoch).toISOString(); }
+
+async function runPass({ pool, schema, expected }, cycleEpoch, overrides = {}) {
+  const { runPostgresLifecyclePass } = await workerModule("/src/postgres-lifecycle-pass.ts");
+  const result = await runPostgresLifecyclePass({
+    pool: hostile(pool),
+    objectStore: overrides.objectStore ?? syntheticStore(),
+    schema: { primarySchema: schema },
+    cycleEpoch,
+    expectedPrimaryMigrations: overrides.expected ?? expected,
+    clock: overrides.clock ?? (() => cycleEpoch + 1_500),
+  });
+  assert.deepEqual(Object.keys(result), RESULT_KEYS);
+  assert.equal(result.schemaVersion, "postgres-lifecycle-pass-v1");
+  assert.equal(result.cycle, iso(cycleEpoch));
+  assert.equal(result.quarantineObjectsDeleted, 0);
+  assert.deepEqual({ ...result.appendOnlyNotApplicable }, NOT_APPLICABLE, "OD-4 constants");
+  assert.doesNotMatch(JSON.stringify(result), /synthetic\/c-maint|synthetic-c-maint/u, "content-free result");
+  return result;
+}
+
+test("an empty origin reads not_ready until the first pass, then ready; a repeated pass changes nothing", {
+  skip: SKIP, timeout: 180_000,
+}, async () => withSchema(async (context) => {
+  const { pool, schema, table } = context;
+  const fresh = await readiness(pool, schema, BASE_CYCLE);
+  assert.equal(fresh.httpStatus, 503);
+  assert.deepEqual(fresh.body, {
+    status: "not_ready",
+    checks: {
+      lifecycle: "never_run", lifecycleFresh: false, quarantineRetentionComplete: true,
+      restoreReplayComplete: true, aggregateRebuildComplete: false, aggregateRebuildDelegated: true,
+      maintenanceCycleMatched: false, quarantineReconciliation: "never_run",
+      quarantineReconciliationComplete: false,
+    },
+    policy: { lifecycleStaleAfterMilliseconds: STALE_AFTER },
+  });
+
+  const first = await runPass(context, BASE_CYCLE);
+  assert.equal(first.outcome, "complete");
+  assert.equal(first.code, "LIFECYCLE_PASS_COMPLETE");
+  assert.equal(first.changed, true);
+  assert.equal(first.lockAcquired, true);
+  assert.equal(first.lifecycleWritten, true);
+  assert.equal(first.lifecycleComplete, true);
+  assert.equal(first.quarantineRetentionComplete, true);
+  assert.equal(first.quarantineReconciliationComplete, true);
+  assert.deepEqual({ ...first.reconciliation }, {
+    registrationsExamined: 0, deletionGraceStarted: 0, legacyLeasesAdopted: 0, orphanObjectsDeleted: 0,
+    orphanObjectsAlreadyAbsent: 0, referencedObjectsPreserved: 0, candidatesDeferred: 0, hasMore: false,
+  });
+
+  const ready = await readiness(pool, schema, BASE_CYCLE + 2_000);
+  assert.equal(ready.httpStatus, 200);
+  assert.deepEqual(ready.body.checks, {
+    lifecycle: "ready", lifecycleFresh: true, quarantineRetentionComplete: true, restoreReplayComplete: true,
+    aggregateRebuildComplete: false, aggregateRebuildDelegated: true, maintenanceCycleMatched: true,
+    quarantineReconciliation: "completed", quarantineReconciliationComplete: true,
+  });
+  assert.equal(ready.body.status, "ready");
+
+  const retention = (await pool.query(
+    `SELECT state, schema_version, restore_replay_complete, restored_participants_suppressed::int AS suppressed,
+            quarantine_retention_complete, quarantine_objects_deleted::int AS deleted,
+            quarantine_cutoff_at IS NULL AS cutoff_null, lease_id, lease_expires_at, failure_code,
+            to_char(last_started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS started,
+            to_char(last_completed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS completed,
+            to_char(maintenance_run_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS run_at
+       FROM ${table("retention_state")}`,
+  )).rows[0];
+  assert.deepEqual(retention, {
+    state: "completed", schema_version: "backend-retention-v0.1", restore_replay_complete: true, suppressed: 0,
+    quarantine_retention_complete: true, deleted: 0, cutoff_null: true, lease_id: null, lease_expires_at: null,
+    failure_code: null, started: iso(BASE_CYCLE), completed: iso(BASE_CYCLE + 1_500), run_at: iso(BASE_CYCLE),
+  });
+  assert.deepEqual(await reconciliationRow(pool, table), {
+    state: "completed", lease_id: null, failure_code: null, reconciliation_complete: true,
+    examined: 0, orphans: 0, preserved: 0, run_at: iso(BASE_CYCLE), cutoff_at: iso(BASE_CYCLE - SAFETY_WINDOW),
+  });
+
+  // A retry of the same cycle (a Cloud Run task retry inside one minute)
+  // commits nothing: both rows keep their row versions.
+  const before = await snapshot(pool, table);
+  const repeat = await runPass(context, BASE_CYCLE, { clock: () => BASE_CYCLE + 9_000 });
+  assert.equal(repeat.outcome, "complete");
+  assert.equal(repeat.code, "LIFECYCLE_CYCLE_ALREADY_COMPLETE");
+  assert.equal(repeat.changed, false);
+  assert.equal(repeat.lifecycleWritten, false);
+  assert.equal(repeat.reconciliation, null);
+  assert.deepEqual(await snapshot(pool, table), before);
+
+  // The next cycle moves both markers together and stays ready.
+  const next = await runPass(context, BASE_CYCLE + MINUTE);
+  assert.equal(next.code, "LIFECYCLE_PASS_COMPLETE");
+  assert.equal(next.changed, true);
+  const nextReady = await readiness(pool, schema, BASE_CYCLE + MINUTE + 2_000);
+  assert.equal(nextReady.body.status, "ready");
+  assert.equal((await reconciliationRow(pool, table)).run_at, iso(BASE_CYCLE + MINUTE));
+
+  // Worker parity beyond the pass: two hours without one reads stale.
+  const stale = await readiness(pool, schema, BASE_CYCLE + MINUTE + 1_500 + STALE_AFTER + 1);
+  assert.equal(stale.httpStatus, 503);
+  assert.equal(stale.body.checks.lifecycle, "stale");
+  assert.equal(stale.body.checks.lifecycleFresh, false);
+}));
+
+test("a reconciliation backlog is bounded per pass, resumes its counters and reads not_ready until drained", {
+  skip: SKIP, timeout: 240_000,
+}, async () => withSchema(async (context) => {
+  const { pool, schema, table } = context;
+  const store = syntheticStore();
+  const total = PAGE + 3;
+  await seedPending(pool, table, store, total, BASE_CYCLE - 2 * SAFETY_WINDOW);
+
+  // Pass 1: one page starts the deletion grace of 50 registrations.
+  const first = await runPass(context, BASE_CYCLE, { objectStore: store });
+  assert.equal(first.outcome, "partial");
+  assert.equal(first.code, "QUARANTINE_RECONCILIATION_BACKLOG");
+  assert.equal(first.reconciliation.registrationsExamined, PAGE);
+  assert.equal(first.reconciliation.deletionGraceStarted, PAGE);
+  assert.equal(first.reconciliation.hasMore, true);
+  assert.equal(first.quarantineReconciliationComplete, false);
+  assert.equal(store.calls.head + store.calls.delete, 0, "the first pass makes no object call");
+  const backlog = await readiness(pool, schema, BASE_CYCLE + 2_000);
+  assert.equal(backlog.httpStatus, 503);
+  assert.equal(backlog.body.checks.lifecycle, "ready");
+  assert.equal(backlog.body.checks.maintenanceCycleMatched, true);
+  assert.equal(backlog.body.checks.quarantineReconciliation, "completed");
+  assert.equal(backlog.body.checks.quarantineReconciliationComplete, false);
+  assert.equal((await reconciliationRow(pool, table)).examined, PAGE);
+
+  // A retry of an incomplete cycle continues the work instead of replaying it.
+  const retry = await runPass(context, BASE_CYCLE, { objectStore: store });
+  assert.equal(retry.outcome, "complete");
+  assert.equal(retry.lifecycleWritten, false, "the lifecycle row already holds this cycle");
+  assert.equal(retry.reconciliation.registrationsExamined, total - PAGE);
+  const resumed = await reconciliationRow(pool, table);
+  assert.equal(resumed.examined, total, "a resumed backlog keeps its cumulative counters");
+  assert.equal(resumed.reconciliation_complete, true);
+  assert.equal((await readiness(pool, schema, BASE_CYCLE + 3_000)).body.status, "ready");
+
+  // After a full safety window the deleting claims are due: two bounded
+  // passes delete every object, and the fresh run starts its counters at 0.
+  const later = BASE_CYCLE + 2 * SAFETY_WINDOW;
+  const third = await runPass(context, later, { objectStore: store });
+  assert.equal(third.outcome, "partial");
+  assert.equal(third.reconciliation.orphanObjectsDeleted, PAGE);
+  assert.equal((await reconciliationRow(pool, table)).examined, PAGE, "a new backlog starts from zero");
+  const fourth = await runPass(context, later + MINUTE, { objectStore: store });
+  assert.equal(fourth.outcome, "complete");
+  assert.equal(fourth.reconciliation.orphanObjectsDeleted, total - PAGE);
+  const drained = await reconciliationRow(pool, table);
+  assert.equal(drained.orphans, total);
+  assert.equal(drained.examined, total);
+  assert.equal(store.objects.size, 0);
+  assert.equal(await pendingCount(pool, table), 0);
+  assert.equal((await readiness(pool, schema, later + MINUTE + 2_000)).body.status, "ready");
+}));
+
+test("a killed pass's running row is taken over, and a storage failure is recorded then recovered", {
+  skip: SKIP, timeout: 180_000,
+}, async () => withSchema(async (context) => {
+  const { pool, schema, table } = context;
+  assert.equal((await runPass(context, BASE_CYCLE)).outcome, "complete");
+
+  // A pass killed after taking the reconciliation row mid-backlog.
+  await pool.query(
+    `UPDATE ${table("quarantine_reconciliation_state")}
+        SET state = 'running', lease_id = $1, maintenance_run_at = $2, last_started_at = $2,
+            reconciliation_complete = false, registrations_examined = 7
+      WHERE singleton = 1`,
+    [`pglp1:${String(BASE_CYCLE + MINUTE).padStart(13, "0")}:${"0".repeat(32)}`, iso(BASE_CYCLE + MINUTE)],
+  );
+  const killed = await readiness(pool, schema, BASE_CYCLE + MINUTE + 1_000);
+  assert.equal(killed.body.checks.quarantineReconciliation, "running");
+  assert.equal(killed.body.status, "not_ready");
+  const takeover = await runPass(context, BASE_CYCLE + 2 * MINUTE);
+  assert.equal(takeover.outcome, "complete");
+  const taken = await reconciliationRow(pool, table);
+  assert.equal(taken.state, "completed");
+  assert.equal(taken.lease_id, null);
+  assert.equal(taken.examined, 7, "the interrupted backlog resumes its counters");
+  assert.equal((await readiness(pool, schema, BASE_CYCLE + 2 * MINUTE + 2_000)).body.status, "ready");
+
+  // A provider failure keeps the exact deleting claim and records the failure.
+  const store = syntheticStore();
+  const key = `synthetic/c-maint/${randomUUID()}`;
+  store.objects.add(key);
+  const staleEpoch = BASE_CYCLE - 3 * SAFETY_WINDOW;
+  await pool.query(
+    `INSERT INTO ${table("pending_objects")}
+       (contribution_id, object_key, object_kind, registered_at, reconciliation_state, reconciliation_lease_id)
+     VALUES ($1, $2, 'synthetic', $3, 'deleting', $4)`,
+    [`synthetic-c-maint-${randomUUID()}`, key, iso(staleEpoch),
+      `pgq1:${String(staleEpoch).padStart(13, "0")}:${randomUUID().replaceAll("-", "")}`],
+  );
+  store.failNextDelete();
+  const failed = await runPass(context, BASE_CYCLE + 3 * MINUTE, { objectStore: store });
+  assert.equal(failed.outcome, "failure");
+  assert.equal(failed.code, "QUARANTINE_OBJECT_STORAGE_UNAVAILABLE");
+  assert.equal(failed.lifecycleComplete, true);
+  assert.equal(failed.changed, true);
+  const recorded = await reconciliationRow(pool, table);
+  assert.equal(recorded.state, "failed");
+  assert.equal(recorded.failure_code, "QUARANTINE_RECONCILIATION_FAILED");
+  assert.equal(recorded.lease_id, null);
+  assert.equal(recorded.run_at, iso(BASE_CYCLE + 3 * MINUTE));
+  const notReady = await readiness(pool, schema, BASE_CYCLE + 3 * MINUTE + 2_000);
+  assert.equal(notReady.body.status, "not_ready");
+  assert.equal(notReady.body.checks.quarantineReconciliation, "failed");
+  assert.equal(await pendingCount(pool, table), 1, "the claim survives the failure");
+
+  // The deleting claim was re-leased by the failed pass; once its safety
+  // window passes, the next pass deletes the object and reads ready.
+  const recoveredCycle = BASE_CYCLE + 3 * MINUTE + SAFETY_WINDOW + MINUTE;
+  const recovered = await runPass(context, recoveredCycle, { objectStore: store });
+  assert.equal(recovered.outcome, "complete");
+  assert.equal(recovered.reconciliation.orphanObjectsDeleted, 1);
+  assert.equal(store.objects.has(key), false);
+  assert.equal(await pendingCount(pool, table), 0);
+  assert.equal((await readiness(pool, schema, recoveredCycle + 2_000)).body.status, "ready");
+}));
+
+async function refusedWithoutWrite(context, cycleEpoch, code, overrides = {}) {
+  const before = await snapshot(context.pool, context.table);
+  const pendingBefore = await pendingCount(context.pool, context.table);
+  const store = syntheticStore();
+  const result = await runPass(context, cycleEpoch, { objectStore: store, ...overrides });
+  assert.equal(result.outcome, "refused", code);
+  assert.equal(result.code, code);
+  assert.equal(result.changed, false);
+  assert.equal(result.lifecycleWritten, false);
+  assert.equal(result.reconciliation, null);
+  assert.deepEqual(await snapshot(context.pool, context.table), before, `${code} leaves both rows unchanged`);
+  assert.equal(await pendingCount(context.pool, context.table), pendingBefore);
+  assert.equal(store.calls.head + store.calls.delete, 0);
+  return result;
+}
+
+test("every pre-write conflict refuses with a closed code and writes nothing", {
+  skip: SKIP, timeout: 240_000,
+}, async () => withSchema(async (context) => {
+  const { pool, table, schema, expected } = context;
+  assert.equal((await runPass(context, BASE_CYCLE)).outcome, "complete");
+  const retention = table("retention_state");
+  const next = BASE_CYCLE + MINUTE;
+
+  // The 0064 pins (restore replay and suppression), refused rather than repaired.
+  await pool.query(`UPDATE ${retention} SET restore_replay_complete = false`);
+  await refusedWithoutWrite(context, next, "LIFECYCLE_RESTORE_PIN_CONFLICT");
+  await pool.query(`UPDATE ${retention} SET restore_replay_complete = true, restored_participants_suppressed = 2`);
+  await refusedWithoutWrite(context, next, "LIFECYCLE_RESTORE_PIN_CONFLICT");
+  await pool.query(`UPDATE ${retention} SET restored_participants_suppressed = 0`);
+
+  // A lease pair nothing on PostgreSQL writes.
+  await pool.query(`UPDATE ${retention} SET lease_id = 'synthetic-foreign-lease', lease_expires_at = $1`,
+    [iso(next + MINUTE)]);
+  await refusedWithoutWrite(context, next, "LIFECYCLE_LEASE_CONFLICT");
+  await pool.query(`UPDATE ${retention} SET lease_id = NULL, lease_expires_at = NULL`);
+
+  // A cycle older than a stored marker.
+  await refusedWithoutWrite(context, BASE_CYCLE - MINUTE, "LIFECYCLE_CYCLE_REGRESSED");
+
+  // A value outside the closed reader contract.
+  await pool.query(`UPDATE ${retention} SET last_started_at = 'infinity'`);
+  await refusedWithoutWrite(context, next, "LIFECYCLE_STATE_SHAPE_INVALID");
+  await pool.query(`UPDATE ${retention} SET last_started_at = $1`, [iso(BASE_CYCLE)]);
+
+  // Receipt drift: an older schema, a newer schema and a different image.
+  const history = table("_tibotattle_migration_history");
+  const last = (await pool.query(`SELECT * FROM ${history} ORDER BY version DESC LIMIT 1`)).rows[0];
+  await pool.query(`DELETE FROM ${history} WHERE version = $1`, [last.version]);
+  await refusedWithoutWrite(context, next, "POSTGRES_SCHEMA_RECEIPT_MISMATCH");
+  const columns = Object.keys(last);
+  await pool.query(
+    `INSERT INTO ${history} (${columns.map((name) => `"${name}"`).join(", ")})
+     VALUES (${columns.map((_, index) => `$${index + 1}`).join(", ")})`,
+    columns.map((name) => last[name]),
+  );
+  await refusedWithoutWrite(context, next, "POSTGRES_SCHEMA_RECEIPT_MISMATCH",
+    { expected: expected.slice(0, -1) });
+  await refusedWithoutWrite(context, next, "POSTGRES_SCHEMA_RECEIPT_MISMATCH",
+    { expected: expected.map((entry, index) => (index === expected.length - 1
+      ? { ...entry, sha256: "0".repeat(64) } : entry)) });
+
+  // A missing singleton.
+  const saved = (await pool.query(`SELECT * FROM ${table("quarantine_reconciliation_state")}`)).rows[0];
+  await pool.query(`DELETE FROM ${table("quarantine_reconciliation_state")}`);
+  await refusedWithoutWrite(context, next, "LIFECYCLE_STATE_MISSING");
+  const savedColumns = Object.keys(saved);
+  await pool.query(
+    `INSERT INTO ${table("quarantine_reconciliation_state")} (${savedColumns.map((name) => `"${name}"`).join(", ")})
+     VALUES (${savedColumns.map((_, index) => `$${index + 1}`).join(", ")})`,
+    savedColumns.map((name) => saved[name]),
+  );
+
+  // Another maintenance run holds the shared lock: skipped, nothing written.
+  const { POSTGRES_LIFECYCLE_PASS_LOCK_DOMAIN } = await workerModule("/src/postgres-lifecycle-pass.ts");
+  const holder = await pool.connect();
+  try {
+    assert.equal((await holder.query("SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS acquired",
+      [POSTGRES_LIFECYCLE_PASS_LOCK_DOMAIN])).rows[0].acquired, true);
+    const before = await snapshot(pool, table);
+    const skipped = await runPass(context, next);
+    assert.equal(skipped.outcome, "skipped");
+    assert.equal(skipped.code, "MAINTENANCE_IN_PROGRESS");
+    assert.equal(skipped.lockAcquired, false);
+    assert.equal(skipped.changed, false);
+    assert.deepEqual(await snapshot(pool, table), before);
+  } finally {
+    await holder.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [POSTGRES_LIFECYCLE_PASS_LOCK_DOMAIN]);
+    holder.release();
+  }
+
+  // With every conflict removed the same cycle completes.
+  const healed = await runPass(context, next);
+  assert.equal(healed.code, "LIFECYCLE_PASS_COMPLETE");
+  assert.equal((await readiness(pool, schema, next + 2_000)).body.status, "ready");
+}));
+
+test("a CHECK violation refuses: before the lease nothing changes, after it the failure is recorded and recoverable", {
+  skip: SKIP, timeout: 180_000,
+}, async () => withSchema(async (context) => {
+  const { pool, table, schema } = context;
+  assert.equal((await runPass(context, BASE_CYCLE)).outcome, "complete");
+
+  // A constraint the lifecycle write violates (NOT VALID: the stored row stays legal).
+  await pool.query(`ALTER TABLE ${table("retention_state")}
+    ADD CONSTRAINT c_maint_synthetic_retention_conflict CHECK (maintenance_run_at <= $$${iso(BASE_CYCLE)}$$::timestamptz) NOT VALID`);
+  await refusedWithoutWrite(context, BASE_CYCLE + MINUTE, "LIFECYCLE_STATE_CHECK_CONFLICT");
+  await pool.query(`ALTER TABLE ${table("retention_state")} DROP CONSTRAINT c_maint_synthetic_retention_conflict`);
+
+  // A constraint only the reconciliation completion violates.
+  await pool.query(`ALTER TABLE ${table("quarantine_reconciliation_state")}
+    ADD CONSTRAINT c_maint_synthetic_reconciliation_conflict
+      CHECK (state <> 'completed' OR maintenance_run_at <= $$${iso(BASE_CYCLE)}$$::timestamptz) NOT VALID`);
+  const refused = await runPass(context, BASE_CYCLE + MINUTE);
+  assert.equal(refused.outcome, "refused");
+  assert.equal(refused.code, "LIFECYCLE_STATE_CHECK_CONFLICT");
+  assert.equal(refused.lifecycleWritten, true);
+  assert.equal(refused.changed, true);
+  const recorded = await reconciliationRow(pool, table);
+  assert.equal(recorded.state, "failed");
+  assert.equal(recorded.failure_code, "QUARANTINE_RECONCILIATION_FAILED");
+  assert.equal(recorded.lease_id, null);
+  assert.equal((await readiness(pool, schema, BASE_CYCLE + MINUTE + 2_000)).body.status, "not_ready");
+  await pool.query(`ALTER TABLE ${table("quarantine_reconciliation_state")}
+    DROP CONSTRAINT c_maint_synthetic_reconciliation_conflict`);
+
+  // Replay-safe: the same cycle, retried, finishes the reconciliation only.
+  const retried = await runPass(context, BASE_CYCLE + MINUTE);
+  assert.equal(retried.outcome, "complete");
+  assert.equal(retried.lifecycleWritten, false);
+  assert.equal((await readiness(pool, schema, BASE_CYCLE + MINUTE + 3_000)).body.status, "ready");
+}));
+
+test("on a schema carrying the 0064 pins the pass keeps restore replay true and suppression 0", {
+  skip: SKIP, timeout: 180_000,
+}, async () => withSchema(async (context) => {
+  const { pool, table, schema, pinned } = context;
+  assert.ok(pinned === "inline" || pinned === "promoted");
+  const constraints = (await pool.query(
+    `SELECT conname, pg_get_constraintdef(oid) AS definition
+       FROM pg_constraint
+      WHERE conrelid = $1::regclass
+        AND conname IN ('retention_state_restore_replay_complete_check',
+                        'retention_state_restored_participants_suppressed_check')
+      ORDER BY conname`,
+    [`${`"${schema}"`}.retention_state`],
+  )).rows;
+  assert.deepEqual(constraints, [
+    { conname: "retention_state_restore_replay_complete_check", definition: "CHECK (restore_replay_complete)" },
+    { conname: "retention_state_restored_participants_suppressed_check",
+      definition: "CHECK ((restored_participants_suppressed = 0))" },
+  ]);
+  const first = await runPass(context, BASE_CYCLE);
+  assert.equal(first.code, "LIFECYCLE_PASS_COMPLETE");
+  assert.equal((await readiness(pool, schema, BASE_CYCLE + 2_000)).body.status, "ready");
+  const row = (await pool.query(
+    `SELECT restore_replay_complete, restored_participants_suppressed::int AS suppressed FROM ${table("retention_state")}`,
+  )).rows[0];
+  assert.deepEqual(row, { restore_replay_complete: true, suppressed: 0 });
+  for (const assignment of ["restore_replay_complete = false", "restored_participants_suppressed = 1"]) {
+    await assert.rejects(pool.query(`UPDATE ${table("retention_state")} SET ${assignment}`),
+      (error) => error?.code === "23514");
+  }
+  const repeat = await runPass(context, BASE_CYCLE);
+  assert.equal(repeat.code, "LIFECYCLE_CYCLE_ALREADY_COMPLETE");
+  assert.equal(repeat.changed, false);
+}, { pins: true }));
+
+test("the maintenance Job entry composes the pass against the image manifest and turns an empty origin ready", {
+  skip: SKIP, timeout: 180_000,
+}, async () => withSchema(async ({ pool, schema }) => {
+  const job = await workerModule("/cloud-run/postgres-maintenance-job.mjs");
+  const { host, port } = await endpoint();
+  const bucket = "synthetic-c-maint-quarantine";
+  const proof = {
+    bucket, bucketGeneration: "1700000000000001", bucketMetageneration: "1", softDeleteRetentionDurationSeconds: "0",
+  };
+  const env = {
+    CLOUD_RUN_JOB: "tibotattle-maintenance",
+    DEPLOYMENT_SOURCE_COMMIT: "0123456789abcdef0123456789abcdef01234567",
+    TELEMETRY_STORAGE_NAMESPACE: "synthetic-namespace",
+    PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:origin-primary",
+    PRIMARY_DATABASE: "origin_primary",
+    PRIMARY_SCHEMA: schema,
+    POSTGRES_IAM_USER: "origin-runtime@synthetic-project.iam",
+    GCS_BUCKET_NAME: bucket,
+    GCS_QUARANTINE_BUCKET_HISTORY_PROOF: JSON.stringify({ proof }),
+    POSTGRES_SCHEDULED_MAINTENANCE_ENABLED: "enabled",
+    IDENTITY_LINK_SECRET: "synthetic-identity-link-secret-value-0000000001",
+  };
+  const minute = BASE_CYCLE + 7 * MINUTE;
+  const events = [];
+  let jobPool;
+  const result = await job.runPostgresMaintenanceJob({
+    argv: ["--profile=maintenance-job"],
+    env,
+    now: () => minute + 4_321,
+    dependencies: {
+      createConnector() { return { async close() { events.push("connector.close"); } }; },
+      async createIamPool(options) {
+        assert.equal(options.max, 2);
+        assert.equal(options.database, "origin_primary");
+        jobPool = new pg.Pool({
+          host, port, user: PG_TEST_USER, password: PG_TEST_PASSWORD, database: PG_TEST_DATABASE,
+          ssl: false, max: options.max, application_name: options.applicationName,
+        });
+        const end = jobPool.end.bind(jobPool);
+        jobPool.end = async () => { events.push("pool.end"); await end(); };
+        return jobPool;
+      },
+      async createAccessTokenProvider() { return async () => "synthetic-access-token"; },
+      createObjectStore(storeBucket, _token, storeProof) {
+        assert.equal(storeBucket, bucket);
+        assert.deepEqual({ ...storeProof }, proof);
+        return syntheticStore();
+      },
+    },
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.receipt.status, "complete");
+  assert.equal(result.receipt.pass.code, "LIFECYCLE_PASS_COMPLETE");
+  assert.equal(result.receipt.pass.cycle, iso(minute));
+  assert.deepEqual(events, ["pool.end", "connector.close"]);
+  assert.doesNotMatch(JSON.stringify(result.receipt), /synthetic-identity-link-secret|synthetic-access-token/u);
+  const ready = await readiness(pool, schema, minute + 5_000);
+  assert.equal(ready.httpStatus, 200);
+  assert.equal(ready.body.status, "ready");
+}));
