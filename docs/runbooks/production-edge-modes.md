@@ -25,11 +25,11 @@ and the local proof.
 
 Authority:
 
-- The contract is the proposed
+- The contract is the accepted
   [thin Worker edge proxy decision](../decisions/2026-10-01-thin-worker-edge-proxy.md),
-  pending owner sign-off.
-- Cutover ordering belongs to PT-9's cutover runbook, which is planned and not
-  yet written. Until it exists, the
+  approved by the owner on 2026-10-02.
+- Cutover ordering belongs to the cutover runbook, which exists only as a draft:
+  [GCP cutover window](./gcp-cutover-window.md). The
   [GCP fast path plan](../plans/2026-10-01-gcp-fastpath.md#minimum-cutover-sequence)
   records the intended sequence. This runbook never decides order on its own.
 
@@ -249,8 +249,9 @@ Gcp to fenced is the brake: a typed fenced deploy with no plan.
   `retry-after: 300`, and the edge stops forwarding.
 - The Cloudflare writers stay fenced.
 - Leave the brake only by fenced to gcp, which runs every gcp check again.
-- Gcp to worker is forbidden. The rollback policy after the switch is an open
-  owner decision.
+- Gcp to worker is forbidden. The owner decided on 2026-10-02 that the brake is
+  the only way back after the switch, followed by a fix forward; the draft
+  [GCP brake and incidents](./gcp-brake-and-incidents.md) sequences it.
 
 ## 5. Pre-gcp verifier
 

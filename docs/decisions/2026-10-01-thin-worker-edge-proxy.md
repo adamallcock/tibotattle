@@ -2,20 +2,20 @@
 title: Thin Worker edge proxy in front of the Google Cloud origin
 date: 2026-10-01
 type: decision-record
-status: proposed
+status: accepted
 ---
 
 # Thin Worker edge proxy in front of the Google Cloud origin
 
-> **Proposed, owner sign-off pending.** It becomes accepted only when the owner
-> approves this text in chat. It changes no current Cloudflare behavior. It
-> authorizes no deploy, secret change, writer fence, GCP write or cutover, and
-> it makes no production-readiness claim. It contains no identifiers, tokens or
-> session content.
+> **Accepted.** The owner approved this text as written in chat on 2026-10-02.
+> It changes no current Cloudflare behavior. It authorizes no deploy, secret
+> change, writer fence, GCP write or cutover, and it makes no
+> production-readiness claim. It contains no identifiers, tokens or session
+> content.
 
 | Field | Value |
 |---|---|
-| Status | Proposed; owner sign-off pending |
+| Status | Accepted; the owner approved this text as written in chat on 2026-10-02 |
 | Recorded | 2026-10-01, for the GCP fast path (planning item E11, which supersedes the EP-11 brief) |
 | Applies to | The production Worker as a thin edge, and the Google Cloud origin behind it, from an owner-authorized cutover |
 | Does not apply to | Current Cloudflare production before the first edge deploy, local analysis and the desktop clients |
@@ -787,11 +787,11 @@ These are integration checklist entries, not part of this record:
 
 ## Sign-off
 
-- [ ] The owner approved this text in chat.
+- [x] The owner approved this text in chat, as written, on 2026-10-02.
 
 ## Evidence boundary
 
-This record is a proposed decision text. It is not a deployment receipt.
+This record is an accepted decision text. It is not a deployment receipt.
 Implementation, local tests, the local end-to-end proof, a staging rehearsal,
 the optional live check, the writer fence, the production cutover and public
 deployment are separate gates, and this document proves none of them.

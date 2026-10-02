@@ -41,7 +41,7 @@ an informal archive.
 | Sidebar recovery | [Collapsed dashboard sidebar rescue](./runbooks/sidebar-stranded-collapsed-rescue.md) | Current 0.1.16 recovery for persisted collapsed navigation; removes only exact window-geometry defaults |
 | Platform support | [Platform support and qualification](./reference/platform-support.md) | Released Electron 0.1.24 across four targets, exact artifact assurances and owner-accepted unperformed qualification |
 | Production | [Production service operations](./runbooks/production-operations.md) | Read-only observation, deploy/migration gates, private owner erasure, containment, rollback, and recovery boundaries |
-| Production edge modes | [Production edge modes](./runbooks/production-edge-modes.md) | Maintained; not yet operational until P1, the first typed worker-mode edge deploy. Until then Production service operations governs Cloudflare. Follows the proposed edge-proxy decision; grants no deploy, fence or cutover authority |
+| Production edge modes | [Production edge modes](./runbooks/production-edge-modes.md) | Maintained; not yet operational until P1, the first typed worker-mode edge deploy. Until then Production service operations governs Cloudflare. Follows the accepted edge-proxy decision; grants no deploy, fence or cutover authority |
 | Telemetry activation | [Protected telemetry runtime activation](./runbooks/2026-09-22-telemetry-runtime-activation.md) | Migration, reconciliation, deploy, post-deploy verification, and owner-only independent usage/performance activation |
 | Community diagnostics | [Community allowance-band diagnosis](./runbooks/2026-08-13-community-allowance-band-diagnosis.md) | Current fit-cache and aggregate diagnosis; production writes remain owner-run |
 | Contribution diagnosis | [Contribution completion funnel](./runbooks/2026-09-22-contribution-completion-funnel.md) | Aggregate-only receipt, activation, projection and publication queries; schema-qualified, read-only plans |
@@ -69,7 +69,11 @@ their status changes; current Cloudflare behavior follows the authorities above.
 | Area | Document | Status | Boundary |
 |---|---|---|---|
 | GCP fast path | [GCP fast path](./plans/2026-10-01-gcp-fastpath.md) | In progress | Analytics-refresh architecture, redesign register mapping, local synthetic parity rehearsal, sized cutover backlog and alignment with the OpenAI September 29 release; no production change |
-| GCP edge proxy | [Thin Worker edge proxy](./decisions/2026-10-01-thin-worker-edge-proxy.md) | Proposed; owner sign-off pending | Production Worker as a thin edge (worker, fenced, gcp) in front of an IAM-private Cloud Run origin, from an owner-authorized cutover; current Cloudflare behavior unchanged; no readiness claim |
+| GCP edge proxy | [Thin Worker edge proxy](./decisions/2026-10-01-thin-worker-edge-proxy.md) | Accepted 2026-10-02; implementation and cutover pending | Production Worker as a thin edge (worker, fenced, gcp) in front of an IAM-private Cloud Run origin, from an owner-authorized cutover; current Cloudflare behavior unchanged; no readiness claim |
+| GCP cutover window | [GCP cutover window](./runbooks/gcp-cutover-window.md) | Draft | Steps H.1 to H.8 with preconditions, attestations, abort path and tooling status; not operational and authorizes nothing |
+| GCP origin rollout | [GCP origin rollout](./runbooks/gcp-rollout.md) | Draft | Preflight, build, migrate and roll with the accepted per-migration write outage and an explicit scheduler pause and resume; forward only |
+| GCP scheduler resume | [GCP scheduler resume](./runbooks/gcp-scheduler-resume.md) | Draft | Triggers created paused and resumed only explicitly; state model, pause and resume steps; pause and resume tooling not built |
+| GCP brake and incidents | [GCP brake and incidents](./runbooks/gcp-brake-and-incidents.md) | Draft | Brake to fenced only, then fix forward; incident classes; brake thresholds and escalation not recorded |
 
 ## Lifecycle evidence
 
