@@ -39,7 +39,8 @@ const READINESS_BUILDER = join(WORKER_ROOT, "src", "postgres-readiness.ts");
 const SOCKET_DIRECTORY = /^\/private\/tmp\/tibotattle-pg-[^/]+\/socket$/u;
 const STALE_AFTER = 2 * 60 * 60 * 1_000;
 const SAFETY_WINDOW = 24 * 60 * 60 * 1_000;
-const PAGE = 50;
+/** The d43c8f92 Worker's QUARANTINE_RECONCILIATION_BATCH_SIZE: one batch per one-minute cron. */
+const PAGE = 100;
 const MINUTE = 60_000;
 const BASE_CYCLE = Date.parse("2026-10-02T12:00:00.000Z");
 
@@ -291,19 +292,57 @@ async function pendingCount(pool, table) {
 }
 
 async function seedPending(pool, table, store, count, registeredEpoch) {
+  const ids = [];
   const keys = [];
   for (let index = 0; index < count; index += 1) {
     const key = `synthetic/c-maint/${randomUUID()}`;
     keys.push(key);
+    ids.push(`synthetic-c-maint-${randomUUID()}`);
     store.objects.add(key);
-    await pool.query(
-      `INSERT INTO ${table("pending_objects")}
-         (contribution_id, object_key, object_kind, registered_at, reconciliation_state)
-       VALUES ($1, $2, 'synthetic', $3, 'registered')`,
-      [`synthetic-c-maint-${randomUUID()}`, key, new Date(registeredEpoch).toISOString()],
-    );
   }
+  await pool.query(
+    `INSERT INTO ${table("pending_objects")}
+       (contribution_id, object_key, object_kind, registered_at, reconciliation_state)
+     SELECT seed.id, seed.key, 'synthetic', $3::timestamptz, 'registered'
+       FROM unnest($1::text[], $2::text[]) AS seed(id, key)`,
+    [ids, keys, new Date(registeredEpoch).toISOString()],
+  );
   return keys;
+}
+
+/** One aged 'deleting' claim whose lease is stale: the next pass deletes its object. */
+async function seedStaleClaim(pool, table, store, staleEpoch) {
+  const key = `synthetic/c-maint/${randomUUID()}`;
+  store.objects.add(key);
+  await pool.query(
+    `INSERT INTO ${table("pending_objects")}
+       (contribution_id, object_key, object_kind, registered_at, reconciliation_state, reconciliation_lease_id)
+     VALUES ($1, $2, 'synthetic', $3, 'deleting', $4)`,
+    [`synthetic-c-maint-${randomUUID()}`, key, iso(staleEpoch),
+      `pgq1:${String(staleEpoch).padStart(13, "0")}:${randomUUID().replaceAll("-", "")}`],
+  );
+  return key;
+}
+
+/** A synthetic store whose head() first runs `hook`: a point inside the reconciliation page. */
+function storeWithHeadHook(hook) {
+  const base = syntheticStore();
+  return {
+    objects: base.objects,
+    calls: base.calls,
+    async head(key) {
+      await hook();
+      return base.head(key);
+    },
+    delete: (key) => base.delete(key),
+  };
+}
+
+async function lifecycleRunAt(pool, table) {
+  return (await pool.query(
+    `SELECT to_char(maintenance_run_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS run_at
+       FROM ${table("retention_state")}`,
+  )).rows[0].run_at;
 }
 
 async function reconciliationRow(pool, table) {
@@ -432,7 +471,52 @@ test("an empty origin reads not_ready until the first pass, then ready; a repeat
   assert.equal(stale.body.checks.lifecycleFresh, false);
 }));
 
-test("a reconciliation backlog is bounded per pass, resumes its counters and reads not_ready until drained", {
+test("a backlog of up to the Worker's batch of 100 completes in one pass, as one Worker cron does", {
+  skip: SKIP, timeout: 240_000,
+}, async () => withSchema(async (context) => {
+  const { pool, schema, table } = context;
+  const { POSTGRES_LIFECYCLE_PASS_RECONCILIATION_PAGE_SIZE } = await workerModule("/src/postgres-lifecycle-pass.ts");
+  assert.equal(POSTGRES_LIFECYCLE_PASS_RECONCILIATION_PAGE_SIZE, PAGE);
+  const store = syntheticStore();
+
+  // 53 due registrations: the Worker completes them in one cron; so does the pass.
+  await seedPending(pool, table, store, 53, BASE_CYCLE - 2 * SAFETY_WINDOW);
+  const first = await runPass(context, BASE_CYCLE, { objectStore: store });
+  assert.equal(first.outcome, "complete");
+  assert.equal(first.code, "LIFECYCLE_PASS_COMPLETE");
+  assert.equal(first.reconciliation.registrationsExamined, 53);
+  assert.equal(first.reconciliation.deletionGraceStarted, 53);
+  assert.equal(first.reconciliation.hasMore, false);
+  assert.equal(first.quarantineReconciliationComplete, true);
+  assert.equal(store.calls.head + store.calls.delete, 0, "the first pass makes no object call");
+  const ready = await readiness(pool, schema, BASE_CYCLE + 2_000);
+  assert.equal(ready.httpStatus, 200);
+  assert.equal(ready.body.status, "ready");
+
+  // Exactly the batch, 100 newly due registrations, also completes in one pass.
+  const second = BASE_CYCLE + MINUTE;
+  await seedPending(pool, table, store, PAGE, second - 2 * SAFETY_WINDOW);
+  const full = await runPass(context, second, { objectStore: store });
+  assert.equal(full.outcome, "complete");
+  assert.equal(full.reconciliation.registrationsExamined, PAGE);
+  assert.equal(full.reconciliation.deletionGraceStarted, PAGE);
+  assert.equal(full.reconciliation.hasMore, false);
+  assert.equal((await reconciliationRow(pool, table)).examined, PAGE, "a completed run starts its counters at 0");
+  assert.equal((await readiness(pool, schema, second + 2_000)).body.status, "ready");
+
+  // A safety window after each grace started, each set of claims is deleted in one pass.
+  const firstDeletion = await runPass(context, BASE_CYCLE + SAFETY_WINDOW, { objectStore: store });
+  assert.equal(firstDeletion.outcome, "complete");
+  assert.equal(firstDeletion.reconciliation.orphanObjectsDeleted, 53);
+  const secondDeletion = await runPass(context, second + SAFETY_WINDOW, { objectStore: store });
+  assert.equal(secondDeletion.outcome, "complete");
+  assert.equal(secondDeletion.reconciliation.orphanObjectsDeleted, PAGE);
+  assert.equal(store.objects.size, 0);
+  assert.equal(await pendingCount(pool, table), 0);
+  assert.equal((await readiness(pool, schema, second + SAFETY_WINDOW + 2_000)).body.status, "ready");
+}));
+
+test("a backlog above the batch reads not_ready, resumes its counters and drains in later passes", {
   skip: SKIP, timeout: 240_000,
 }, async () => withSchema(async (context) => {
   const { pool, schema, table } = context;
@@ -440,7 +524,7 @@ test("a reconciliation backlog is bounded per pass, resumes its counters and rea
   const total = PAGE + 3;
   await seedPending(pool, table, store, total, BASE_CYCLE - 2 * SAFETY_WINDOW);
 
-  // Pass 1: one page starts the deletion grace of 50 registrations.
+  // Pass 1: one batch starts the deletion grace of 100 registrations; 3 remain due.
   const first = await runPass(context, BASE_CYCLE, { objectStore: store });
   assert.equal(first.outcome, "partial");
   assert.equal(first.code, "QUARANTINE_RECONCILIATION_BACKLOG");
@@ -467,13 +551,15 @@ test("a reconciliation backlog is bounded per pass, resumes its counters and rea
   assert.equal(resumed.reconciliation_complete, true);
   assert.equal((await readiness(pool, schema, BASE_CYCLE + 3_000)).body.status, "ready");
 
-  // After a full safety window the deleting claims are due: two bounded
-  // passes delete every object, and the fresh run starts its counters at 0.
+  // After a full safety window the deleting claims are due: the first pass
+  // deletes one batch and reads not_ready, the next minute's pass drains the
+  // rest, and the fresh run starts its counters at 0.
   const later = BASE_CYCLE + 2 * SAFETY_WINDOW;
   const third = await runPass(context, later, { objectStore: store });
   assert.equal(third.outcome, "partial");
   assert.equal(third.reconciliation.orphanObjectsDeleted, PAGE);
   assert.equal((await reconciliationRow(pool, table)).examined, PAGE, "a new backlog starts from zero");
+  assert.equal((await readiness(pool, schema, later + 2_000)).body.status, "not_ready");
   const fourth = await runPass(context, later + MINUTE, { objectStore: store });
   assert.equal(fourth.outcome, "complete");
   assert.equal(fourth.reconciliation.orphanObjectsDeleted, total - PAGE);
@@ -646,23 +732,62 @@ test("every pre-write conflict refuses with a closed code and writes nothing", {
   assert.equal((await readiness(pool, schema, next + 2_000)).body.status, "ready");
 }));
 
-test("a CHECK violation refuses: before the lease nothing changes, after it the failure is recorded and recoverable", {
+test("a CHECK violation refuses: in the lifecycle write nothing changes, while the lease is taken the lifecycle keeps the new cycle, after it the failure is recorded", {
   skip: SKIP, timeout: 180_000,
 }, async () => withSchema(async (context) => {
   const { pool, table, schema } = context;
   assert.equal((await runPass(context, BASE_CYCLE)).outcome, "complete");
+  const first = BASE_CYCLE + MINUTE;
+  const second = BASE_CYCLE + 2 * MINUTE;
 
   // A constraint the lifecycle write violates (NOT VALID: the stored row stays legal).
   await pool.query(`ALTER TABLE ${table("retention_state")}
     ADD CONSTRAINT c_maint_synthetic_retention_conflict CHECK (maintenance_run_at <= $$${iso(BASE_CYCLE)}$$::timestamptz) NOT VALID`);
-  await refusedWithoutWrite(context, BASE_CYCLE + MINUTE, "LIFECYCLE_STATE_CHECK_CONFLICT");
+  await refusedWithoutWrite(context, first, "LIFECYCLE_STATE_CHECK_CONFLICT");
   await pool.query(`ALTER TABLE ${table("retention_state")} DROP CONSTRAINT c_maint_synthetic_retention_conflict`);
+
+  // A constraint only the reconciliation lease violates. The lease is taken in
+  // its own transaction after the lifecycle transaction committed, so the
+  // lifecycle row keeps the new cycle and the reconciliation row is unchanged.
+  await pool.query(`ALTER TABLE ${table("quarantine_reconciliation_state")}
+    ADD CONSTRAINT c_maint_synthetic_lease_conflict CHECK (state <> 'running') NOT VALID`);
+  const before = await snapshot(pool, table);
+  const pendingBefore = await pendingCount(pool, table);
+  const store = syntheticStore();
+  const leaseRefused = await runPass(context, first, { objectStore: store });
+  assert.equal(leaseRefused.outcome, "refused");
+  assert.equal(leaseRefused.code, "LIFECYCLE_STATE_CHECK_CONFLICT");
+  assert.equal(leaseRefused.changed, true, "the lifecycle row was written before the lease");
+  assert.equal(leaseRefused.lifecycleWritten, true);
+  assert.equal(leaseRefused.lifecycleComplete, true);
+  assert.equal(leaseRefused.reconciliation, null);
+  assert.equal(leaseRefused.quarantineReconciliationComplete, false);
+  const after = await snapshot(pool, table);
+  const relation = (rows, name) => rows.find((row) => row.relation === name);
+  assert.deepEqual(relation(after, "reconciliation"), relation(before, "reconciliation"),
+    "the reconciliation row keeps its row version");
+  assert.notEqual(relation(after, "retention").version, relation(before, "retention").version);
+  assert.equal(await lifecycleRunAt(pool, table), iso(first));
+  assert.equal(await pendingCount(pool, table), pendingBefore);
+  assert.equal(store.calls.head + store.calls.delete, 0);
+  const unmatched = await readiness(pool, schema, first + 2_000);
+  assert.equal(unmatched.httpStatus, 503);
+  assert.equal(unmatched.body.checks.lifecycle, "ready");
+  assert.equal(unmatched.body.checks.maintenanceCycleMatched, false, "the Worker reads the same unmatched cycle");
+  assert.equal(unmatched.body.checks.quarantineReconciliation, "completed");
+  assert.equal(unmatched.body.checks.quarantineReconciliationComplete, false);
+  await pool.query(`ALTER TABLE ${table("quarantine_reconciliation_state")}
+    DROP CONSTRAINT c_maint_synthetic_lease_conflict`);
+  const leaseRetried = await runPass(context, first);
+  assert.equal(leaseRetried.outcome, "complete");
+  assert.equal(leaseRetried.lifecycleWritten, false, "a retry takes the lease only");
+  assert.equal((await readiness(pool, schema, first + 3_000)).body.status, "ready");
 
   // A constraint only the reconciliation completion violates.
   await pool.query(`ALTER TABLE ${table("quarantine_reconciliation_state")}
     ADD CONSTRAINT c_maint_synthetic_reconciliation_conflict
-      CHECK (state <> 'completed' OR maintenance_run_at <= $$${iso(BASE_CYCLE)}$$::timestamptz) NOT VALID`);
-  const refused = await runPass(context, BASE_CYCLE + MINUTE);
+      CHECK (state <> 'completed' OR maintenance_run_at <= $$${iso(first)}$$::timestamptz) NOT VALID`);
+  const refused = await runPass(context, second);
   assert.equal(refused.outcome, "refused");
   assert.equal(refused.code, "LIFECYCLE_STATE_CHECK_CONFLICT");
   assert.equal(refused.lifecycleWritten, true);
@@ -671,15 +796,103 @@ test("a CHECK violation refuses: before the lease nothing changes, after it the 
   assert.equal(recorded.state, "failed");
   assert.equal(recorded.failure_code, "QUARANTINE_RECONCILIATION_FAILED");
   assert.equal(recorded.lease_id, null);
-  assert.equal((await readiness(pool, schema, BASE_CYCLE + MINUTE + 2_000)).body.status, "not_ready");
+  assert.equal((await readiness(pool, schema, second + 2_000)).body.status, "not_ready");
   await pool.query(`ALTER TABLE ${table("quarantine_reconciliation_state")}
     DROP CONSTRAINT c_maint_synthetic_reconciliation_conflict`);
 
   // Replay-safe: the same cycle, retried, finishes the reconciliation only.
-  const retried = await runPass(context, BASE_CYCLE + MINUTE);
+  const retried = await runPass(context, second);
   assert.equal(retried.outcome, "complete");
   assert.equal(retried.lifecycleWritten, false);
-  assert.equal((await readiness(pool, schema, BASE_CYCLE + MINUTE + 3_000)).body.status, "ready");
+  assert.equal((await readiness(pool, schema, second + 3_000)).body.status, "ready");
+}));
+
+test("the pass holds the migration runner's lock shared: a running migration skips it, a migration mid-pass is refused, and drift outside the runner leaves the row running", {
+  skip: SKIP, timeout: 240_000,
+}, async () => withSchema(async (context) => {
+  const { pool, table, schema, expected } = context;
+  assert.equal((await runPass(context, BASE_CYCLE)).outcome, "complete");
+  const { POSTGRES_LIFECYCLE_PASS_MIGRATION_LOCK_PREFIX } = await workerModule("/src/postgres-lifecycle-pass.ts");
+  const migrationKey = `${POSTGRES_LIFECYCLE_PASS_MIGRATION_LOCK_PREFIX}${schema}`;
+  const history = table("_tibotattle_migration_history");
+  const historyCount = async () => (await pool.query(`SELECT count(*)::int AS count FROM ${history}`)).rows[0].count;
+
+  // (1) A migration run holds the runner's lock (the runner's own statement and
+  // key): the pass is skipped and writes nothing.
+  const runner = await pool.connect();
+  try {
+    assert.equal((await runner.query("SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS acquired",
+      [migrationKey])).rows[0].acquired, true);
+    const before = await snapshot(pool, table);
+    const skipped = await runPass(context, BASE_CYCLE + MINUTE);
+    assert.equal(skipped.outcome, "skipped");
+    assert.equal(skipped.code, "MIGRATION_IN_PROGRESS");
+    assert.equal(skipped.lockAcquired, false);
+    assert.equal(skipped.changed, false);
+    assert.deepEqual(await snapshot(pool, table), before);
+  } finally {
+    await runner.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [migrationKey]);
+    runner.release();
+  }
+
+  // (2) The real runner, started while the pass is inside its reconciliation
+  // page, refuses POSTGRES_MIGRATION_CONFLICT. The pass completes, and both
+  // locks are released afterwards: the next pass and the runner both proceed.
+  let attempted = null;
+  const fenced = storeWithHeadHook(async () => {
+    attempted = await applyPostgresMigrations({ role: "primary", schema, pool })
+      .then(() => "applied", (error) => error?.code ?? "unknown");
+  });
+  const fencedKey = await seedStaleClaim(pool, table, fenced, BASE_CYCLE - 3 * SAFETY_WINDOW);
+  const during = await runPass(context, BASE_CYCLE + 2 * MINUTE, { objectStore: fenced });
+  assert.equal(attempted, "POSTGRES_MIGRATION_CONFLICT");
+  assert.equal(during.outcome, "complete");
+  assert.equal(during.lockAcquired, true);
+  assert.equal(during.reconciliation.orphanObjectsDeleted, 1);
+  assert.equal(fenced.objects.has(fencedKey), false);
+  assert.equal(await historyCount(), expected.length);
+  assert.equal((await readiness(pool, schema, BASE_CYCLE + 2 * MINUTE + 2_000)).body.status, "ready");
+  const free = await applyPostgresMigrations({ role: "primary", schema, pool });
+  assert.equal(free.applied, expected.length, "the runner takes its lock once the pass is done");
+
+  // (3) A history edit outside the runner (out of contract) inside the page:
+  // the page in flight finishes its object work, then the completion refuses
+  // POSTGRES_SCHEMA_RECEIPT_MISMATCH and the failure record, which also proves
+  // the receipt, writes nothing. The row stays running and reads not_ready.
+  const last = (await pool.query(`SELECT * FROM ${history} ORDER BY version DESC LIMIT 1`)).rows[0];
+  const drifting = storeWithHeadHook(async () => {
+    await pool.query(`DELETE FROM ${history} WHERE version = $1`, [last.version]);
+  });
+  const driftKey = await seedStaleClaim(pool, table, drifting, BASE_CYCLE - 3 * SAFETY_WINDOW);
+  const driftCycle = BASE_CYCLE + 3 * MINUTE;
+  const drifted = await runPass(context, driftCycle, { objectStore: drifting });
+  assert.equal(drifted.outcome, "refused");
+  assert.equal(drifted.code, "POSTGRES_SCHEMA_RECEIPT_MISMATCH");
+  assert.equal(drifted.changed, true);
+  assert.equal(drifted.lifecycleWritten, true);
+  assert.equal(drifting.objects.has(driftKey), false, "the page in flight completed its delete");
+  const running = await reconciliationRow(pool, table);
+  assert.equal(running.state, "running", "no failure was written against the drifted schema");
+  assert.equal(running.failure_code, null);
+  assert.match(running.lease_id, /^pglp1:[0-9]{13}:[0-9a-f]{32}$/u);
+  assert.equal(running.run_at, iso(driftCycle));
+  const notReady = await readiness(pool, schema, driftCycle + 2_000);
+  assert.equal(notReady.body.status, "not_ready");
+  assert.equal(notReady.body.checks.quarantineReconciliation, "running");
+
+  // Restored, the next pass takes the running row over and reads ready.
+  const columns = Object.keys(last);
+  await pool.query(
+    `INSERT INTO ${history} (${columns.map((name) => `"${name}"`).join(", ")})
+     VALUES (${columns.map((_, index) => `$${index + 1}`).join(", ")})`,
+    columns.map((name) => last[name]),
+  );
+  const recovered = await runPass(context, driftCycle + MINUTE);
+  assert.equal(recovered.outcome, "complete");
+  const taken = await reconciliationRow(pool, table);
+  assert.equal(taken.state, "completed");
+  assert.equal(taken.lease_id, null);
+  assert.equal((await readiness(pool, schema, driftCycle + MINUTE + 2_000)).body.status, "ready");
 }));
 
 test("on a schema carrying the 0064 pins the pass keeps restore replay true and suppression 0", {

@@ -6,10 +6,21 @@
  *
  * One execution runs one runPostgresLifecyclePass
  * (src/postgres-lifecycle-pass.ts) for the current one-minute cycle: the
- * lifecycle row, then one bounded page of quarantine reconciliation, under the
- * shared maintenance advisory lock. That pass is what lets GET /api/ready on
- * the origin read 'ready' (owner decision OD-CR-4). It is a separate workload
- * from the request-serving origin: it has no HOST_MODE and serves nothing.
+ * lifecycle row, then one page of up to 100 quarantine registrations (the
+ * Worker's batch), under the shared maintenance advisory lock and the primary
+ * migration fence. That pass is what lets GET /api/ready on the origin read
+ * 'ready' (owner decision OD-CR-4). It is a separate workload from the
+ * request-serving origin: it has no HOST_MODE and serves nothing.
+ *
+ * Schedule (the D-OPS4 trigger contract): every minute,
+ * POSTGRES_MAINTENANCE_JOB_SCHEDULE ('* * * * *'), the d43c8f92 Worker cron.
+ * Throughput is then the Worker's: 100 due registrations per execution. Every
+ * v1.0 and v1.1 upload leaves a registered pending object that only this pass
+ * clears a safety window (24 h) later, so a slower trigger, or a sustained due
+ * rate above 100 a minute, leaves /api/ready not_ready and lets the journal
+ * grow. While a migration runs the pass is skipped; while a pass runs the
+ * migration runner refuses POSTGRES_MIGRATION_CONFLICT (fail-closed,
+ * retryable).
  *
  * Arguments (closed): --profile=maintenance-job | --profile=staging-maintenance-job
  * (required, no default), or --help. Anything else is a usage refusal.
@@ -40,9 +51,9 @@
  *
  * Output: one content-free JSON receipt line on stdout, or one JSON error
  * line with a closed code on stderr. Exit 0 for complete, partial (a
- * reconciliation backlog, drained by later executions) and skipped (another
- * maintenance run holds the lock); 1 for refused, failure or configuration;
- * 2 for a usage refusal.
+ * reconciliation backlog above 100, drained by later executions) and skipped
+ * (another maintenance run holds the lock, or a migration holds the fence);
+ * 1 for refused, failure or configuration; 2 for a usage refusal.
  */
 
 import { resolve } from "node:path";
@@ -67,6 +78,8 @@ export const POSTGRES_MAINTENANCE_JOB_POOL_MAX = 2;
 /** Cycles are whole UTC minutes, the Worker cron's scheduledTime granularity. */
 export const POSTGRES_MAINTENANCE_JOB_CYCLE_MILLISECONDS = 60_000;
 export const POSTGRES_MAINTENANCE_JOB_APPLICATION_NAME = "tibotattle-maintenance-job";
+/** The trigger schedule the D-OPS4 Scheduler must use: every minute, as the Worker cron. */
+export const POSTGRES_MAINTENANCE_JOB_SCHEDULE = "* * * * *";
 export const POSTGRES_MAINTENANCE_JOB_HISTORY_PROOF_VARIABLE = "GCS_QUARANTINE_BUCKET_HISTORY_PROOF";
 /** Variables the job refuses even when empty, and the code each gives. */
 export const POSTGRES_MAINTENANCE_JOB_FORBIDDEN_VARIABLES = Object.freeze({
@@ -81,8 +94,9 @@ export const POSTGRES_MAINTENANCE_JOB_FORBIDDEN_PREFIXES = Object.freeze({
 export const POSTGRES_MAINTENANCE_JOB_USAGE = `Usage: node postgres-maintenance-job.mjs --profile=<maintenance-job|staging-maintenance-job>
 
 Run one MP-2-lite lifecycle and quarantine-reconciliation pass for the current
-one-minute cycle. Cloud Run Jobs only. Exits 0 (complete, partial or skipped),
-1 (refused, failure or configuration) or 2 (usage refusal).
+one-minute cycle (up to 100 registrations). Cloud Run Jobs only, triggered
+every minute (* * * * *). Exits 0 (complete, partial or skipped), 1 (refused,
+failure or configuration) or 2 (usage refusal).
 
   --profile=<name>  maintenance-job or staging-maintenance-job (required)
   --help            print this text

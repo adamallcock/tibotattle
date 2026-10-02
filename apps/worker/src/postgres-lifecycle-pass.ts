@@ -21,26 +21,49 @@
  *     this pass never writes them: it requires true and 0 and refuses
  *     otherwise. OD-4 reports the erasure items as constant true, marked not
  *     applicable (POSTGRES_APPEND_ONLY_NOT_APPLICABLE);
- *   - reconciliation: one bounded page of the existing two-pass PostgreSQL
- *     reconciler (src/postgres-quarantine-reconciliation.ts) under a
- *     running/lease row, then completed with cumulative counters while a
- *     backlog is resumed, exactly as the Worker resumes its cursor. The page is
- *     complete when nothing due remains beyond it and no candidate was
- *     deferred.
+ *   - reconciliation: one page of the existing two-pass PostgreSQL reconciler
+ *     (src/postgres-quarantine-reconciliation.ts) under a running/lease row,
+ *     then completed with cumulative counters while a backlog is resumed,
+ *     exactly as the Worker resumes its cursor. The page is the Worker's
+ *     batch, 100 registrations (QUARANTINE_RECONCILIATION_BATCH_SIZE, one
+ *     batch per one-minute cron), so a backlog of up to 100 due registrations
+ *     completes in one pass, as it does on the Worker. The page is complete
+ *     when nothing due remains beyond it and no candidate was deferred.
+ *     Throughput parity needs the trigger to run every minute, like the
+ *     Worker cron.
  *
  * Safety:
  *   - one session-level advisory lock, shared with the scheduled maintenance
  *     slice (POSTGRES_SCHEDULED_MAINTENANCE_LOCK_DOMAIN); a held lock skips the
  *     pass with no write. Holding it is what makes taking over a 'running'
  *     reconciliation row left by a killed pass safe;
- *   - every mutation transaction first proves the primary migration receipt
- *     equals the caller's expected manifest, so an older image never mutates
- *     newer state;
+ *   - a migration fence: on the same session the pass holds, in shared mode,
+ *     the lock the primary migration runner takes exclusively for a whole
+ *     migration run (cloud-run/postgres-migrations.mjs,
+ *     'tibotattle:primary:<schema>'). While a migration runs the pass is
+ *     skipped with no write; while a pass runs the runner refuses
+ *     POSTGRES_MIGRATION_CONFLICT. So the reviewed runner never commits a
+ *     migration in the middle of a pass, including the reconciler's own
+ *     per-object transactions and object-store calls;
+ *   - every transaction this module opens (the lifecycle write, the lease,
+ *     the completion and the failure record) first proves the primary
+ *     migration receipt equals the caller's expected manifest. The
+ *     reconciler's per-object transactions do not re-check it; the fence
+ *     covers them. A schema change made outside the runner is caught at the
+ *     pass's next own transaction, after the page in flight;
  *   - idempotent per cycle: a pass whose cycle is already complete in both
  *     rows writes nothing. A cycle older than either stored marker is refused;
- *   - any CHECK violation (SQLSTATE 23514) refuses with a closed code. Before
- *     the reconciliation lease is taken it rolls back and leaves both rows
- *     unchanged.
+ *   - refusals: one raised inside the lifecycle transaction (receipt, pins,
+ *     lease pair, regression, shape, or a CHECK violation, SQLSTATE 23514, on
+ *     the lifecycle write) rolls back and leaves both rows unchanged. One
+ *     raised while the reconciliation lease is taken, a separate transaction,
+ *     leaves the lifecycle row on the new cycle (already committed) and the
+ *     reconciliation row unchanged, so readiness reads not_ready on the
+ *     unmatched cycle, as the Worker does when its reconciliation cannot
+ *     start after runBackendLifecycle committed. A retry of the same cycle
+ *     takes the lease only. After the lease is taken a failure is recorded
+ *     as failed, unless the receipt no longer matches, in which case the row
+ *     stays running and the next pass takes it over.
  *
  * Every result, error and code is content-free: counts, booleans, instants
  * and closed codes only.
@@ -65,6 +88,7 @@ import {
 import { POSTGRES_SCHEDULED_MAINTENANCE_LOCK_DOMAIN } from "./postgres-maintenance";
 import {
   DEFAULT_POSTGRES_PENDING_OBJECT_SAFETY_WINDOW_MILLISECONDS,
+  POSTGRES_PENDING_OBJECT_RECONCILIATION_BATCH_LIMIT,
   reconcilePostgresPendingObjects,
   type PostgresPendingObjectReconciliationResult,
 } from "./postgres-quarantine-reconciliation";
@@ -72,12 +96,22 @@ import type { PostgresRuntimeMigrationReceipt } from "./postgres-runtime-schema"
 import type { QuarantineObjectStore } from "./quarantine-object-store";
 
 export const POSTGRES_LIFECYCLE_PASS_RECEIPT_VERSION = "postgres-lifecycle-pass-v1" as const;
-/** Registrations one pass reconciles (the reconciler's own default page). */
-export const POSTGRES_LIFECYCLE_PASS_RECONCILIATION_PAGE_SIZE = 50;
+/**
+ * Registrations one pass reconciles: the d43c8f92 Worker's
+ * QUARANTINE_RECONCILIATION_BATCH_SIZE (100, one batch per one-minute cron),
+ * which is also the PostgreSQL reconciler's own upper bound.
+ */
+export const POSTGRES_LIFECYCLE_PASS_RECONCILIATION_PAGE_SIZE = POSTGRES_PENDING_OBJECT_RECONCILIATION_BATCH_LIMIT;
 /** The reconciler's two-pass safety window; the recorded cutoff is cycle minus this. */
 export const POSTGRES_LIFECYCLE_PASS_SAFETY_WINDOW_MILLISECONDS =
   DEFAULT_POSTGRES_PENDING_OBJECT_SAFETY_WINDOW_MILLISECONDS;
 export const POSTGRES_LIFECYCLE_PASS_LOCK_DOMAIN = POSTGRES_SCHEDULED_MAINTENANCE_LOCK_DOMAIN;
+/**
+ * The primary migration runner's lock key prefix (cloud-run/postgres-migrations.mjs
+ * takes `tibotattle:${role}:${schema}` exclusively for a whole run). The pass
+ * holds `${prefix}${primarySchema}` in shared mode as its migration fence.
+ */
+export const POSTGRES_LIFECYCLE_PASS_MIGRATION_LOCK_PREFIX = "tibotattle:primary:";
 export const POSTGRES_LIFECYCLE_PASS_POSTGRES_MAJOR = 17;
 
 /**
@@ -104,7 +138,7 @@ export const POSTGRES_LIFECYCLE_PASS_OUTCOMES = Object.freeze([
 export const POSTGRES_LIFECYCLE_PASS_CODES = Object.freeze({
   complete: Object.freeze(["LIFECYCLE_PASS_COMPLETE", "LIFECYCLE_CYCLE_ALREADY_COMPLETE"] as const),
   partial: Object.freeze(["QUARANTINE_RECONCILIATION_BACKLOG"] as const),
-  skipped: Object.freeze(["MAINTENANCE_IN_PROGRESS"] as const),
+  skipped: Object.freeze(["MAINTENANCE_IN_PROGRESS", "MIGRATION_IN_PROGRESS"] as const),
   refused: Object.freeze([
     "POSTGRES_VERSION_UNSUPPORTED",
     "POSTGRES_SCHEMA_RECEIPT_MISMATCH",
@@ -125,6 +159,7 @@ export const POSTGRES_LIFECYCLE_PASS_CODES = Object.freeze({
 export type PostgresLifecyclePassOutcome = (typeof POSTGRES_LIFECYCLE_PASS_OUTCOMES)[number];
 type RefusalCode = (typeof POSTGRES_LIFECYCLE_PASS_CODES.refused)[number];
 type FailureCode = (typeof POSTGRES_LIFECYCLE_PASS_CODES.failure)[number];
+type SkippedCode = (typeof POSTGRES_LIFECYCLE_PASS_CODES.skipped)[number];
 export type PostgresLifecyclePassCode =
   (typeof POSTGRES_LIFECYCLE_PASS_CODES)[keyof typeof POSTGRES_LIFECYCLE_PASS_CODES][number];
 
@@ -162,6 +197,7 @@ export interface PostgresLifecyclePassResult {
   /** True when this pass committed a write to either singleton row. */
   readonly changed: boolean;
   readonly cycle: string;
+  /** Both the maintenance lock and the shared migration fence were held. */
   readonly lockAcquired: boolean;
   /** retention_state records this cycle as completed (written now or before). */
   readonly lifecycleComplete: boolean;
@@ -228,6 +264,7 @@ interface ValidatedOptions {
   readonly schemaOptions: PostgresSchemaOptions;
   readonly primarySchema: string;
   readonly quotedSchema: string;
+  readonly migrationLockKey: string;
   readonly cycleEpoch: number;
   readonly cycle: string;
   readonly expected: readonly PostgresRuntimeMigrationReceipt[];
@@ -260,6 +297,7 @@ function validateOptions(options: PostgresLifecyclePassOptions): ValidatedOption
     schemaOptions: Object.freeze({ primarySchema }),
     primarySchema,
     quotedSchema: quotePostgresIdentifier(primarySchema),
+    migrationLockKey: `${POSTGRES_LIFECYCLE_PASS_MIGRATION_LOCK_PREFIX}${primarySchema}`,
     cycleEpoch: options.cycleEpoch,
     cycle: canonical(options.cycleEpoch),
     expected: Object.freeze([...options.expectedPrimaryMigrations]),
@@ -499,10 +537,15 @@ async function completeReconciliation(
   }, { operation: "lifecycle_pass.reconciliation_complete", preserveSafeError: safeRefusal });
 }
 
-/** Best effort, as the Worker's recordReconciliationFailure: a lost write is taken over next pass. */
+/**
+ * Best effort, as the Worker's recordReconciliationFailure: a lost write is
+ * taken over next pass. It proves the receipt like every other transaction of
+ * the pass, so a schema that no longer matches is left running, not written.
+ */
 async function recordReconciliationFailure(config: ValidatedOptions, lease: string): Promise<void> {
   try {
     await withPostgresMutation(config.pool, async (client) => {
+      await assertReceipt(client, config);
       await client.query(
         `UPDATE ${table(config, "quarantine_reconciliation_state")}
             SET state = 'failed',
@@ -523,29 +566,39 @@ async function recordReconciliationFailure(config: ValidatedOptions, lease: stri
 interface LockRow { readonly acquired: unknown }
 interface UnlockRow { readonly released: unknown }
 
-type Locked<T> = { readonly acquired: false } | { readonly acquired: true; readonly value: T };
+type Locked<T> =
+  | { readonly acquired: false; readonly code: SkippedCode }
+  | { readonly acquired: true; readonly value: T };
+
+const MAINTENANCE_LOCK_SQL = "SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS acquired";
+const MAINTENANCE_UNLOCK_SQL = "SELECT pg_advisory_unlock(hashtextextended($1, 0)) AS released";
+const MIGRATION_FENCE_SQL = "SELECT pg_try_advisory_lock_shared(hashtextextended($1, 0)) AS acquired";
+const MIGRATION_FENCE_RELEASE_SQL = "SELECT pg_advisory_unlock_shared(hashtextextended($1, 0)) AS released";
 
 /**
- * Run `operation` under the session-level maintenance lock on a dedicated
- * connection. A connection whose unlock is not acknowledged is discarded,
- * which releases the lock with the session.
+ * Run `operation` on a dedicated session holding the maintenance lock
+ * (exclusive) and then the primary migration fence (shared). Either one held
+ * elsewhere skips with its code and runs nothing. A connection whose unlock is
+ * not acknowledged is discarded, which releases its locks with the session.
  */
-async function withMaintenanceLock<T>(pool: PostgresPool, operation: () => Promise<T>): Promise<Locked<T>> {
+async function withMaintenanceLocks<T>(
+  pool: PostgresPool,
+  migrationLockKey: string,
+  operation: () => Promise<T>,
+): Promise<Locked<T>> {
   let client: PostgresClient;
   try {
     client = await pool.connect();
   } catch {
     throw new PostgresStorageError("unavailable", "lifecycle_pass.lock.connect");
   }
-  let acquired = false;
+  let maintenanceHeld = false;
+  let migrationFenceHeld = false;
   let discard = false;
-  try {
+  const tryLock = async (text: string, key: string): Promise<boolean> => {
     let result;
     try {
-      result = await client.query<LockRow>(
-        "SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS acquired",
-        [POSTGRES_LIFECYCLE_PASS_LOCK_DOMAIN],
-      );
+      result = await client.query<LockRow>(text, [key]);
     } catch {
       discard = true;
       throw new PostgresStorageError("unavailable", "lifecycle_pass.lock.acquire");
@@ -555,21 +608,26 @@ async function withMaintenanceLock<T>(pool: PostgresPool, operation: () => Promi
       discard = true;
       throw new PostgresStorageError("unavailable", "lifecycle_pass.lock.acquire");
     }
-    if (!value) return Object.freeze({ acquired: false });
-    acquired = true;
-    return Object.freeze({ acquired: true, value: await operation() });
-  } finally {
-    if (acquired) {
-      try {
-        const released = await client.query<UnlockRow>(
-          "SELECT pg_advisory_unlock(hashtextextended($1, 0)) AS released",
-          [POSTGRES_LIFECYCLE_PASS_LOCK_DOMAIN],
-        );
-        if (released.rows[0]?.released !== true) discard = true;
-      } catch {
-        discard = true;
-      }
+    return value;
+  };
+  const unlock = async (text: string, key: string): Promise<void> => {
+    try {
+      const released = await client.query<UnlockRow>(text, [key]);
+      if (released.rows[0]?.released !== true) discard = true;
+    } catch {
+      discard = true;
     }
+  };
+  try {
+    maintenanceHeld = await tryLock(MAINTENANCE_LOCK_SQL, POSTGRES_LIFECYCLE_PASS_LOCK_DOMAIN);
+    if (!maintenanceHeld) return Object.freeze({ acquired: false, code: "MAINTENANCE_IN_PROGRESS" } as const);
+    migrationFenceHeld = await tryLock(MIGRATION_FENCE_SQL, migrationLockKey);
+    if (!migrationFenceHeld) return Object.freeze({ acquired: false, code: "MIGRATION_IN_PROGRESS" } as const);
+    const value = await operation();
+    return Object.freeze({ acquired: true, value } as const);
+  } finally {
+    if (migrationFenceHeld) await unlock(MIGRATION_FENCE_RELEASE_SQL, migrationLockKey);
+    if (maintenanceHeld) await unlock(MAINTENANCE_UNLOCK_SQL, POSTGRES_LIFECYCLE_PASS_LOCK_DOMAIN);
     try {
       await client.release(discard);
     } catch {
@@ -722,10 +780,10 @@ export async function runPostgresLifecyclePass(
   }
   let locked: Locked<PassBody>;
   try {
-    locked = await withMaintenanceLock(config.pool, () => passUnderLock(config));
+    locked = await withMaintenanceLocks(config.pool, config.migrationLockKey, () => passUnderLock(config));
   } catch (error) {
     return result(config, false, idle("failure", failureCode(error)));
   }
-  if (!locked.acquired) return result(config, false, idle("skipped", "MAINTENANCE_IN_PROGRESS"));
+  if (!locked.acquired) return result(config, false, idle("skipped", locked.code));
   return result(config, true, locked.value);
 }

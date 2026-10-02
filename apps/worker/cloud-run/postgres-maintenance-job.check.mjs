@@ -369,13 +369,69 @@ test("the pass rejects malformed options before any connection", async () => {
   assert.equal(connects, 1);
 });
 
+test("a migration holding the fence skips the pass after the maintenance lock, which is released", async () => {
+  const statements = [];
+  const releases = [];
+  const pool = {
+    async connect() {
+      return {
+        async query(text, values) {
+          statements.push([text, ...values]);
+          if (/pg_try_advisory_lock_shared/u.test(text)) return { rows: [{ acquired: false }], rowCount: 1 };
+          if (/pg_try_advisory_lock\(/u.test(text)) return { rows: [{ acquired: true }], rowCount: 1 };
+          if (/pg_advisory_unlock\(/u.test(text)) return { rows: [{ released: true }], rowCount: 1 };
+          throw new Error(`unexpected statement: ${text}`);
+        },
+        release(discard) { releases.push(discard); },
+      };
+    },
+  };
+  const result = await pass.runPostgresLifecyclePass({
+    pool,
+    objectStore: { async head() { throw new Error("unused"); }, async delete() { throw new Error("unused"); } },
+    schema: { primarySchema: "origin_primary" },
+    cycleEpoch: Date.parse("2026-10-02T12:34:00.000Z"),
+    expectedPrimaryMigrations: [{ version: 1, name: "0001_schema_metadata.sql", sha256: "a".repeat(64) }],
+  });
+  assert.equal(result.outcome, "skipped");
+  assert.equal(result.code, "MIGRATION_IN_PROGRESS");
+  assert.equal(result.lockAcquired, false);
+  assert.equal(result.changed, false);
+  assert.deepEqual(statements, [
+    ["SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS acquired", "tibotattle/postgres-scheduled-maintenance/v1"],
+    ["SELECT pg_try_advisory_lock_shared(hashtextextended($1, 0)) AS acquired", "tibotattle:primary:origin_primary"],
+    ["SELECT pg_advisory_unlock(hashtextextended($1, 0)) AS released", "tibotattle/postgres-scheduled-maintenance/v1"],
+  ]);
+  assert.deepEqual(releases, [false]);
+});
+
 test("the pass result and code vocabularies are closed", () => {
   assert.deepEqual([...pass.POSTGRES_LIFECYCLE_PASS_OUTCOMES], ["complete", "partial", "skipped", "refused", "failure"]);
   assert.deepEqual(Object.keys(pass.POSTGRES_LIFECYCLE_PASS_CODES), [...pass.POSTGRES_LIFECYCLE_PASS_OUTCOMES]);
-  assert.equal(pass.POSTGRES_LIFECYCLE_PASS_RECONCILIATION_PAGE_SIZE, 50);
+  assert.deepEqual([...pass.POSTGRES_LIFECYCLE_PASS_CODES.skipped], ["MAINTENANCE_IN_PROGRESS", "MIGRATION_IN_PROGRESS"]);
   assert.equal(pass.POSTGRES_LIFECYCLE_PASS_SAFETY_WINDOW_MILLISECONDS, 24 * 60 * 60 * 1_000);
   assert.equal(pass.POSTGRES_LIFECYCLE_PASS_LOCK_DOMAIN, "tibotattle/postgres-scheduled-maintenance/v1");
+  assert.equal(pass.POSTGRES_LIFECYCLE_PASS_MIGRATION_LOCK_PREFIX, "tibotattle:primary:");
   assert.ok(Object.isFrozen(pass.POSTGRES_APPEND_ONLY_NOT_APPLICABLE));
+});
+
+test("throughput and schedule match the Worker: 100 registrations per execution, every minute", async () => {
+  // The d43c8f92 Worker reconciles one batch of QUARANTINE_RECONCILIATION_BATCH_SIZE
+  // per scheduled run, and every Worker environment's cron runs every minute.
+  const worker = await readFile(join(WORKER_ROOT, "src", "quarantine-reconciliation.ts"), "utf8");
+  const batch = /^const QUARANTINE_RECONCILIATION_BATCH_SIZE = (\d+);$/mu.exec(worker);
+  assert.ok(batch, "the Worker's batch constant is present");
+  assert.equal(pass.POSTGRES_LIFECYCLE_PASS_RECONCILIATION_PAGE_SIZE, Number(batch[1]));
+  assert.equal(pass.POSTGRES_LIFECYCLE_PASS_RECONCILIATION_PAGE_SIZE, 100);
+  const reconciler = await vite.ssrLoadModule("/src/postgres-quarantine-reconciliation.ts");
+  assert.equal(pass.POSTGRES_LIFECYCLE_PASS_RECONCILIATION_PAGE_SIZE,
+    reconciler.POSTGRES_PENDING_OBJECT_RECONCILIATION_BATCH_LIMIT, "the reconciler accepts the full batch");
+  const wrangler = await readFile(join(WORKER_ROOT, "wrangler.jsonc"), "utf8");
+  const crons = [...wrangler.matchAll(/"crons":\s*\[([^\]]*)\]/gu)].map((match) => match[1].trim());
+  assert.ok(crons.length >= 3, "development, staging and production crons");
+  assert.deepEqual(new Set(crons), new Set([JSON.stringify(job.POSTGRES_MAINTENANCE_JOB_SCHEDULE)]));
+  assert.equal(job.POSTGRES_MAINTENANCE_JOB_SCHEDULE, "* * * * *");
+  assert.match(job.POSTGRES_MAINTENANCE_JOB_USAGE, /every minute \(\* \* \* \* \*\)/u);
 });
 
 test("the image builds dist/postgres-maintenance-job.mjs and the bundle answers its contract", async () => {
