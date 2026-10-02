@@ -14,6 +14,7 @@ import {
   EMPTY_PREFIX_CHAIN,
   instantFromPostgres,
   markLive,
+  openProductionTransferTarget,
   POSTGRES_TRANSFER_TARGET_ERROR_CODES,
   PostgresTransferTargetError,
   productionTransferId,
@@ -33,7 +34,9 @@ import {
 
 const WORKER_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const PRIMARY_SQL = join(WORKER_ROOT, "postgres/migrations/primary/0056_production_transfer_control.sql");
-const LEDGER_SQL = join(WORKER_ROOT, "postgres/migrations/ledger/0007_production_transfer_control.sql");
+// The frozen ledger 0007 (owner action OA-4): read only to prove that the
+// relation and guard it adds are outside the primary-only allowlists.
+const FROZEN_LEDGER_SQL = join(WORKER_ROOT, "postgres/migrations/ledger/0007_production_transfer_control.sql");
 const SEAL = "0123456789abcdef".repeat(4);
 
 function rejectsWith(code, fn) {
@@ -50,10 +53,14 @@ test("TRANSFER_STAGES is the frozen, ordered production stage list", () => {
     "analytics-expectation", "identity-authority", "legacy-contributions", "telemetry-v1-v11",
     "typed-legacy", "legacy-admission", "header-promotion", "telemetry-v12", "v12-event-sources",
     "usage-correction", "performance", "pending-registrations", "accountless-retention",
-    "ingestion-journal", "erasure-ledger", "analytics-history", "analytics-community-history",
+    "ingestion-journal", "analytics-history", "analytics-community-history",
     "owner-lifecycle-verify", "objects", "post-import",
   ]);
   assert.equal(new Set(TRANSFER_STAGES).size, TRANSFER_STAGES.length);
+  // No deletion-ledger stage (LEAD-SIMP); 'accountless-retention' is kept by
+  // owner decision OD-3 (2026-10-02).
+  assert.equal(TRANSFER_STAGES.some((stage) => /ledger/u.test(stage)), false);
+  assert.ok(TRANSFER_STAGES.includes("accountless-retention"));
   for (const stage of TRANSFER_STAGES) assert.match(stage, /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/u);
 });
 
@@ -172,21 +179,21 @@ test("seeded singletons and retained control relations are frozen allowlists", (
   assert.equal(Object.isFrozen(RETAINED_CONTROL_RELATIONS), true);
   for (const entry of SEEDED_SINGLETONS) {
     assert.equal(Object.isFrozen(entry), true);
-    assert.ok(["primary", "ledger"].includes(entry.role));
+    assert.equal(entry.role, "primary", "every seeded singleton lives in the one target database");
     assert.ok(Number.isSafeInteger(entry.seedRows) && entry.seedRows >= 1);
   }
   const names = SEEDED_SINGLETONS.map(entry => `${entry.role}:${entry.table}`);
   assert.equal(new Set(names).size, names.length);
   assert.ok(names.includes("primary:community_public_source_bootstrap"));
   assert.ok(names.includes("primary:collection_controls"));
-  assert.ok(names.includes("ledger:storage_erasure_ledger_generation"));
+  assert.equal(names.some((name) => /ledger/u.test(name)), false);
   for (const relation of RETAINED_CONTROL_RELATIONS) {
     assert.equal(/participant|device|object_key|r2_key|manifest/u.test(relation), false, relation);
   }
 });
 
 async function migrationSql() {
-  return { primary: await readFile(PRIMARY_SQL, "utf8"), ledger: await readFile(LEDGER_SQL, "utf8") };
+  return { primary: await readFile(PRIMARY_SQL, "utf8") };
 }
 
 function createdNames(sql, kind) {
@@ -230,44 +237,44 @@ test("control migrations qualify every object, raise constant coded errors and g
   }
 });
 
-test("the shared control block is byte-identical in primary 0056 and ledger 0007", async () => {
-  const sql = await migrationSql();
-  const shared = text => {
-    const start = text.indexOf("  -- Shared control objects (identical in primary 0056 and ledger 0007).\n");
-    const end = text.indexOf("\n  -- ", text.indexOf("    $fn$;\n  END IF;\n\n", text.indexOf("install_transfer_live_lock()")));
-    assert.ok(start > 0 && end > start);
-    return text.slice(start, end);
-  };
-  assert.equal(shared(sql.primary), shared(sql.ledger));
-  assert.match(sql.primary, /WHERE installation\.component = 'primary'\) THEN\n {4}RETURN;/u);
-  assert.match(sql.ledger, /WHERE installation\.component = 'ledger'\) THEN\n {4}RETURN;/u);
+test("the frozen ledger 0007 adds exactly one relation and its guard, both outside the allowlists", async () => {
+  const primary = (await migrationSql()).primary;
+  const frozen = await readFile(FROZEN_LEDGER_SQL, "utf8");
+  const primaryTables = new Set(createdNames(primary, "TABLE").map(created => created.name));
+  const frozenOnlyTables = createdNames(frozen, "TABLE").map(created => created.name)
+    .filter(name => !primaryTables.has(name));
+  assert.equal(frozenOnlyTables.length, 1, "the ledger mirror run table");
+  for (const name of frozenOnlyTables) {
+    assert.equal(CONTROL_SCHEMA_RELATIONS.includes(name), false, name);
+    assert.equal(RETAINED_CONTROL_RELATIONS.includes(name), false, name);
+  }
+  const primaryFunctions = new Set(createdNames(primary, "FUNCTION").map(created => created.name));
+  const frozenOnlyFunctions = createdNames(frozen, "FUNCTION").map(created => created.name)
+    .filter(name => !primaryFunctions.has(name));
+  assert.equal(frozenOnlyFunctions.length, 1, "the mirror table's guard");
+  for (const name of frozenOnlyFunctions) assert.equal(RETAINED_CONTROL_FUNCTIONS.includes(name), false, name);
 });
 
-test("CONTROL_SCHEMA_RELATIONS and RETAINED_CONTROL_FUNCTIONS equal what the control migrations create", async () => {
+test("CONTROL_SCHEMA_RELATIONS and RETAINED_CONTROL_FUNCTIONS equal what primary 0056 creates", async () => {
   const sql = await migrationSql();
-  const tables = new Set([...createdNames(sql.primary, "TABLE"), ...createdNames(sql.ledger, "TABLE")]
-    .map(created => created.name));
+  const tables = new Set(createdNames(sql.primary, "TABLE").map(created => created.name));
   assert.equal(Object.isFrozen(CONTROL_SCHEMA_RELATIONS), true);
   assert.deepEqual([...tables].sort(), [...CONTROL_SCHEMA_RELATIONS].sort());
   // The retained allowlist always covers the control relations; reviewed
   // tool receipt relations may be appended after them.
   assert.deepEqual(RETAINED_CONTROL_RELATIONS.slice(0, CONTROL_SCHEMA_RELATIONS.length), [...CONTROL_SCHEMA_RELATIONS]);
-  const functions = new Set([...createdNames(sql.primary, "FUNCTION"), ...createdNames(sql.ledger, "FUNCTION")]
-    .map(created => created.name));
+  const functions = new Set(createdNames(sql.primary, "FUNCTION").map(created => created.name));
   assert.deepEqual([...functions].sort(), [...RETAINED_CONTROL_FUNCTIONS].sort());
   for (const forbidden of ["participant_id", "device_id", "r2_key", "object_key", "manifest_json", "record_json"]) {
-    assert.equal(sql.primary.includes(forbidden) || sql.ledger.includes(forbidden), false, forbidden);
+    assert.equal(sql.primary.includes(forbidden), false, forbidden);
   }
   assert.match(sql.primary, /CHECK \(state <> 'complete' OR last_key IS NULL\)/u);
   // An abandoned run's checkpoint admits only NULLing its cursor.
   assert.match(sql.primary, /OLD\.last_key IS NOT NULL AND NEW\.last_key IS NULL[\s\S]{0,400}run\.state = 'abandoned'/u);
   // Installing the live lock revokes CREATE on the control schema and verifies it.
-  for (const text of [sql.primary, sql.ledger]) {
-    assert.match(text, /EXECUTE format\('REVOKE CREATE ON SCHEMA tibotattle_transfer FROM %I'/u);
-    assert.match(text, /acl\.privilege_type = 'CREATE'/u);
-  }
+  assert.match(sql.primary, /EXECUTE format\('REVOKE CREATE ON SCHEMA tibotattle_transfer FROM %I'/u);
+  assert.match(sql.primary, /acl\.privilege_type = 'CREATE'/u);
   assert.match(sql.primary, /CREATE UNIQUE INDEX transfer_runs_one_open\s+ON tibotattle_transfer\.transfer_runs \(\(true\)\) WHERE state <> 'abandoned';/u);
-  assert.match(sql.ledger, /CREATE UNIQUE INDEX ledger_transfer_runs_one_open\s+ON tibotattle_transfer\.ledger_transfer_runs \(\(true\)\) WHERE state <> 'abandoned';/u);
 });
 
 function fakeClient(responder) {
@@ -470,19 +477,32 @@ test("contract registration input is closed before any connection is made", asyn
     contractId: "tibotattle-production-v1", mode: "production", projectId: "tibotattle",
     projectNumber: "806510610397", instanceConnectionName: "tibotattle:us-east1:tibotattle-primary",
     databaseName: "tibotattle", schemaName: "tibotattle_primary",
-    ledgerInstanceConnectionName: "tibotattle:us-east1:tibotattle-ledger", ledgerDatabaseName: "tibotattle_ledger",
-    ledgerSchemaName: "tibotattle_ledger", iamDatabaseUser: "tibotattle-transfer@tibotattle.iam",
+    iamDatabaseUser: "tibotattle-transfer@tibotattle.iam",
     schemaOwnerRole: "tibotattle-migrator@tibotattle.iam", gcsBucket: "tibotattle-quarantine",
     gcsBucketGeneration: "1790000000000000",
   };
   for (const change of [
     { mode: "gcp_named_test" }, { schemaName: "tibotattle_transfer" }, { schemaName: "public" },
-    { ledgerSchemaName: "pg_catalog" }, { iamDatabaseUser: contract.schemaOwnerRole }, { projectNumber: "0" },
+    { schemaName: "pg_catalog" }, { iamDatabaseUser: contract.schemaOwnerRole }, { projectNumber: "0" },
     { gcsBucket: "Bad_Bucket" }, { contractId: "x" }, { databaseName: "bad-name" }, { extra: "value" },
     { instanceConnectionName: "tibotattle:us-east1" },
+    // The retired dual-role contract keys are unknown keys now.
+    { ledgerInstanceConnectionName: "tibotattle:us-east1:tibotattle-ledger" },
+    { ledgerDatabaseName: "tibotattle_ledger" },
+    { ledgerSchemaName: "tibotattle_ledger" },
   ]) {
     await rejectsWith("CUTOVER_TARGET_CONTRACT_INVALID", () => registerProductionTransferTarget({
-      primaryPool: pool, ledgerPool: pool, contract: { ...contract, ...change },
+      primaryPool: pool, contract: { ...contract, ...change },
+    }));
+  }
+  // Register and open take the one primary pool: any other argument (a
+  // retired second pool included) is refused before any connection.
+  for (const extra of [{ secondPool: pool }, { ledgerPool: pool }]) {
+    await rejectsWith("CUTOVER_TARGET_ARGUMENT_INVALID", () => registerProductionTransferTarget({
+      primaryPool: pool, contract, ...extra,
+    }));
+    await rejectsWith("CUTOVER_TARGET_ARGUMENT_INVALID", () => openProductionTransferTarget({
+      primaryPool: pool, expectedContractId: contract.contractId, sealManifestSha256: SEAL, ...extra,
     }));
   }
 });

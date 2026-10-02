@@ -209,7 +209,7 @@ test("PostgreSQL pending-object reconciliation fences late uploads and retries i
     });
     const module = await vite.ssrLoadModule("/src/postgres-quarantine-reconciliation.ts");
     const options = {
-      schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` },
+      schema: { primarySchema: schema },
       nowEpoch: FIXED_NOW,
       safetyWindowMilliseconds: SAFETY_WINDOW,
       maximumRegistrations: 10,

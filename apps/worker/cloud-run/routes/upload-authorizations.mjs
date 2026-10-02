@@ -14,7 +14,7 @@
  * can never obtain an authorization.
  *
  * Behaviour: the built-in route step for step (query string, storage
- * receipts, admission bindings, cookie, device bearer, deletion tombstone,
+ * receipt, admission bindings, cookie, device bearer,
  * upload-authorization bindings, upload-registration control, rate limits,
  * content type, declared length, bounded fatal-UTF-8 JSON, the format's
  * write authority, 201 with the created authorization, and the built-in's
@@ -28,17 +28,19 @@
  * Every storage and admission step is injected and bound once at startup
  * (origin-route-modules.mjs: modules take no per-request storage). The
  * composition root passes the same adapters the built-in uses:
- *   assertStorageCurrent()          the built-in's primary and ledger
+ *   assertStorageCurrent()          the built-in's primary
  *                                   schema-receipt check; throws 503
- *                                   BACKEND_STORAGE_UNAVAILABLE unless both
- *                                   are current
+ *                                   BACKEND_STORAGE_UNAVAILABLE unless it
+ *                                   is current
  *   assertAdmissionBindings(env), assertUploadAuthorizationBindings(env),
  *   assertUploadAuthorizationAllowed(limit, principalLimit, participantId, env)
  *                                   the Worker's admission functions
  *   assertUploadRegistrationEnabled(pool, primarySchema)
  *                                   the uploadRegistration collection control
  *   authenticateDevice(pool, header, { schema })   authenticatePostgresDevice
- *   hasDeletionTombstone(ledgerPool, participantId, nowEpoch, { schema })
+ *                                   (a deleted participant's bearer fails
+ *                                   it; there is no deletion-ledger
+ *                                   tombstone read)
  *   readBoundedRequestBody(request, maxBytes, timing)
  *   createDeviceUploadAuthorization(pool, device, { envelopeDigest, bodyBytes }, { schema })
  *   formats                         createUploadAuthorizationFormats() output
@@ -63,7 +65,6 @@ const REQUIRED_FUNCTIONS = Object.freeze([
   "assertUploadAuthorizationAllowed",
   "assertUploadRegistrationEnabled",
   "authenticateDevice",
-  "hasDeletionTombstone",
   "readBoundedRequestBody",
   "createDeviceUploadAuthorization",
 ]);
@@ -127,13 +128,12 @@ export function createUploadAuthorizationRouteModule(dependencies) {
   for (const name of REQUIRED_FUNCTIONS) {
     if (typeof dependencies[name] !== "function") throw configurationError(name + " must be a function");
   }
-  const { primaryPool, ledgerPool, schema, maxRequestBytes, formats } = dependencies;
+  const { primaryPool, schema, maxRequestBytes, formats } = dependencies;
   if (!primaryPool || typeof primaryPool.connect !== "function"
-      || !ledgerPool || typeof ledgerPool.connect !== "function"
       || schema === null || typeof schema !== "object"
-      || typeof schema.primarySchema !== "string" || typeof schema.ledgerSchema !== "string"
+      || typeof schema.primarySchema !== "string"
       || !Number.isSafeInteger(maxRequestBytes) || maxRequestBytes < 1) {
-    throw configurationError("pools, schema and maxRequestBytes are required");
+    throw configurationError("pool, schema and maxRequestBytes are required");
   }
   if (formats === null || typeof formats !== "object" || typeof formats.resolve !== "function"
       || typeof formats.has !== "function"
@@ -160,9 +160,6 @@ export function createUploadAuthorizationRouteModule(dependencies) {
       );
       if (device === null || typeof device !== "object" || typeof device.participantId !== "string") {
         throw refusal(503, "BACKEND_STORAGE_UNAVAILABLE");
-      }
-      if (await deps.hasDeletionTombstone(deps.ledgerPool, device.participantId, Date.now(), { schema: deps.schema })) {
-        throw refusal(401, "DEVICE_AUTH_INVALID");
       }
       deps.assertUploadAuthorizationBindings(admissionEnv);
       await deps.assertUploadRegistrationEnabled(deps.primaryPool, deps.schema.primarySchema);

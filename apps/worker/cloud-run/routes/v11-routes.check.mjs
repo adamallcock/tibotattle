@@ -1,8 +1,8 @@
 /**
  * Storage-free checks of the v1.1 origin route modules and the
  * telemetry-envelope-v1.1 registration (GCP fast path, IN-2): configuration
- * refusals, the Worker's request preamble answers (method, cookie, tombstone,
- * collection control, content type, size, JSON), error-body masking, and the
+ * refusals, the Worker's request preamble answers (method, cookie, device
+ * authentication, collection control, content type, size, JSON), error-body masking, and the
  * envelope's closed key set and pre-storage refusals. Storage adapters are
  * synthetic stubs; postgres-test/postgres-telemetry-v11-live.spec.mjs runs
  * the same modules against PostgreSQL 17.
@@ -20,16 +20,15 @@ import { createTelemetryV11DomainPredecessorRouteModule } from "./v11-domain-pre
 
 const ORIGIN = "http://127.0.0.1:8787";
 const pool = { connect() { throw new Error("storage is not used by this check"); } };
-const schema = Object.freeze({ primarySchema: "synthetic_primary", ledgerSchema: "synthetic_ledger" });
+const schema = Object.freeze({ primarySchema: "synthetic_primary" });
 const readBoundedRequestBody = async (request) => new Uint8Array(await request.arrayBuffer());
 
 function deviceDependencies(overrides = {}) {
   return {
-    primaryPool: pool, ledgerPool: { connect: pool.connect }, schema, admissionEnv: {},
+    primaryPool: pool, schema, admissionEnv: {},
     assertAdmissionBindings() {},
     async assertAttemptAllowed() {},
     async authenticateDevice() { return { participantId: "participant:synthetic", deviceId: "device-synthetic" }; },
-    async hasDeletionTombstone() { return false; },
     async assertCollectionControl() {},
     readBoundedRequestBody,
     maxRequestBytes: 64,
@@ -91,10 +90,17 @@ test("v1.1 device routes answer the Worker's preamble codes before storage", asy
   assert.equal(notAllowed.headers.get("allow"), "POST");
   await expectError(await route.handler(request(path, { headers: { cookie: "session=x" }, body: "{}" })),
     401, "DEVICE_AUTH_INVALID");
-  const tombstoned = createTelemetryV11DomainPredecessorRouteModule(deviceDependencies({
-    async hasDeletionTombstone() { return true; },
+  // A deleted participant's bearer fails ordinary device authentication;
+  // there is no separate deletion-ledger read (LEAD-SIMP).
+  let collectionControlReached = false;
+  const deletedOwner = createTelemetryV11DomainPredecessorRouteModule(deviceDependencies({
+    async authenticateDevice() {
+      throw Object.assign(new Error("DEVICE_AUTH_INVALID"), { status: 401, code: "DEVICE_AUTH_INVALID" });
+    },
+    async assertCollectionControl() { collectionControlReached = true; },
   }));
-  await expectError(await tombstoned.handler(request(path, { body: "{}" })), 401, "DEVICE_AUTH_INVALID");
+  await expectError(await deletedOwner.handler(request(path, { body: "{}" })), 401, "DEVICE_AUTH_INVALID");
+  assert.equal(collectionControlReached, false, "authentication refuses before any later preamble step");
   const contained = createTelemetryV11DomainPredecessorRouteModule(deviceDependencies({
     async assertCollectionControl() {
       throw Object.assign(new Error("PROCESSING_DISABLED"), { status: 503, code: "PROCESSING_DISABLED" });
@@ -147,13 +153,12 @@ test("the composition's pathname dispatch answers the Worker's 405 and Allow for
       ]),
       bearer: adapter(["authenticatePostgresDeviceBearer"]),
       transport: adapter(["abandonPostgresDeviceUploadAuthorization"]),
-      ledgerAuthority: adapter(["hasPostgresDeletionTombstone"]),
       personalDevices: adapter(["authenticatePostgresPersonalSession", "assertPostgresPersonalSessionCsrf"]),
       controls: adapter(["assertPostgresCollectionControlFromPool"]),
       crypto: adapter(["decryptSyntheticEnvelope", "sha256Hex"]),
       boundedBody: adapter(["readBoundedRequestBody"]),
     },
-    primaryPool: pool, ledgerPool: { connect: pool.connect }, schema, admissionEnv: {},
+    primaryPool: pool, schema, admissionEnv: {},
     assertAdmissionBindings() { throw new Error("a 405 precedes admission"); },
     async assertAttemptAllowed() { throw new Error("a 405 precedes the attempt limit"); },
     maxRequestBytes: 64,
@@ -198,12 +203,11 @@ test("a failure that is not a closed error is the Worker's 500 without its text"
 test("the consent route needs a session without a bearer and the Worker's three body keys", async () => {
   const granted = [];
   const route = createTelemetryV11ConsentRouteModule({
-    primaryPool: pool, ledgerPool: { connect: pool.connect }, schema,
+    primaryPool: pool, schema,
     async authenticatePersonalSession() {
       return { participantId: "participant:synthetic", sessionId: "session-synthetic", csrfToken: "csrf", consentVersion: "privacy-safe-telemetry-v0.1" };
     },
     assertPersonalSessionCsrf() {},
-    async hasDeletionTombstone() { return false; },
     async assertCollectionControl() {},
     async grantConsent(...args) { granted.push(args); return { consent: {}, minimumWriteRank: 11 }; },
     readBoundedRequestBody,

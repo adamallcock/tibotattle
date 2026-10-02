@@ -5,7 +5,12 @@ import { fileURLToPath } from "node:url";
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DEFAULT_ROOT = join(WORKER_ROOT, "postgres", "migrations");
-const ROLES = Object.freeze(["primary", "ledger"]);
+// Primary only (decisions D2, D4 and D6 of 2026-09-26). The frozen ledger
+// fragments under postgres/migrations/ledger stay on disk, covered by the
+// numbering check, until owner action OA-4 retires them; no runner, manifest,
+// build context or image reads them, and role 'ledger' is
+// POSTGRES_MIGRATION_ROLE_INVALID.
+const ROLES = Object.freeze(["primary"]);
 const FILE_NAME = /^(\d{4})_([a-z][a-z0-9_-]*)\.sql$/u;
 const SCHEMA_NAME = /^[a-z_][a-z0-9_]{0,62}$/u;
 const SHA256 = /^[0-9a-f]{64}$/u;
@@ -106,7 +111,7 @@ export async function readPostgresMigrations({
   return Object.freeze(migrations);
 }
 
-/** Build a checksum-bound source manifest for both independent schemas. */
+/** Build a checksum-bound source manifest of the primary schema. */
 export async function buildPostgresMigrationManifest({
   rootDirectory = DEFAULT_ROOT,
 } = {}) {
@@ -114,7 +119,7 @@ export async function buildPostgresMigrationManifest({
     ROLES.map(async role => [role, await readPostgresMigrations({ role, rootDirectory })]),
   ));
   const manifest = {
-    schemaVersion: "tibotattle-postgres-migration-manifest-v1",
+    schemaVersion: "tibotattle-postgres-migration-manifest-v2",
     roles,
   };
   return Object.freeze({

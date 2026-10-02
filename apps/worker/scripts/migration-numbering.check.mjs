@@ -14,8 +14,8 @@
  * Covered directories: migrations, every top-level *-migrations,
  * postgres/migrations/<role> and postgres/staged-migrations/<role>. Any other
  * directory holding .sql files fails MIGRATION_DIRECTORY_UNCOVERED, except
- * postgres/proposals, which holds unreferenced drafts (for example
- * 0007_named_gcp_test_erasure_transfer.sql; ledger 0007 is assigned to PT-1).
+ * postgres/proposals, which may hold unreferenced drafts (none is tracked:
+ * LEAD-SIMP deleted the erasure-transfer draft with online erasure).
  *
  * Run: node --test ./scripts/migration-numbering.check.mjs
  */
@@ -302,9 +302,12 @@ test("a staged role with no promoted directory must start its run at 0001", asyn
 });
 
 test("unreferenced proposals are excluded, but any other SQL directory must be covered", async () => {
-  await withWorkerCopy(["postgres/migrations/ledger", "postgres/proposals"], async (root) => {
+  await withWorkerCopy(["postgres/migrations/ledger"], async (root) => {
+    // A synthetic draft numbered like a promoted ledger file.
+    await mkdir(join(root, "postgres", "proposals"), { recursive: true });
+    await writeFile(join(root, "postgres", "proposals", "0007_synthetic_draft.sql"), "-- synthetic\n");
     assert.deepEqual((await inspectMigrationNumbering(root)).failures, [],
-      "proposal 0007 does not collide with the ledger role");
+      "a proposal 0007 does not collide with the ledger role");
     await mkdir(join(root, "postgres", "drafts"), { recursive: true });
     await writeFile(join(root, "postgres", "drafts", "0001_unowned.sql"), "-- synthetic\n");
     assert.deepEqual(codes(await inspectMigrationNumbering(root)), ["MIGRATION_DIRECTORY_UNCOVERED"]);

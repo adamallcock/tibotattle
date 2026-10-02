@@ -3,8 +3,9 @@
  * on the PostgreSQL origin (GCP fast path, IN-2).
  *
  * Oracle: d43c8f92 index.ts handleTelemetryV11Consent. Order and answers:
- * 405 for another method; the personal session (cookie, no bearer) and its
- * deletion tombstone; CSRF; the uploadRegistration collection control; the
+ * 405 for another method; the personal session (cookie, no bearer; a
+ * deleted participant's session fails it, there is no deletion-ledger
+ * tombstone read); CSRF; the uploadRegistration collection control; the
  * social consent version (400 TELEMETRY_REQUIRED); the Worker's bounded JSON
  * body with exactly deviceId, consent and ongoingUpload: true (400
  * BODY_INVALID otherwise); then grantPostgresTelemetryV11Consent, answered
@@ -34,17 +35,16 @@ export function createTelemetryV11ConsentRouteModule(dependencies) {
   if (dependencies === null || typeof dependencies !== "object") {
     throw routeConfigurationError(route, "dependencies must be an object");
   }
-  for (const name of ["authenticatePersonalSession", "assertPersonalSessionCsrf", "hasDeletionTombstone",
+  for (const name of ["authenticatePersonalSession", "assertPersonalSessionCsrf",
     "assertCollectionControl", "grantConsent", "readBoundedRequestBody"]) {
     if (typeof dependencies[name] !== "function") throw routeConfigurationError(route, name + " must be a function");
   }
-  const { primaryPool, ledgerPool, schema, maxRequestBytes, socialConsentVersion } = dependencies;
+  const { primaryPool, schema, maxRequestBytes, socialConsentVersion } = dependencies;
   if (!primaryPool || typeof primaryPool.connect !== "function"
-      || !ledgerPool || typeof ledgerPool.connect !== "function"
       || schema === null || typeof schema !== "object" || typeof schema.primarySchema !== "string"
       || !Number.isSafeInteger(maxRequestBytes) || maxRequestBytes < 1
       || typeof socialConsentVersion !== "string" || socialConsentVersion.length < 1) {
-    throw routeConfigurationError(route, "pools, schema, maxRequestBytes and socialConsentVersion are required");
+    throw routeConfigurationError(route, "pool, schema, maxRequestBytes and socialConsentVersion are required");
   }
   const deps = Object.freeze({ ...dependencies });
 
@@ -60,9 +60,6 @@ export function createTelemetryV11ConsentRouteModule(dependencies) {
           || typeof session.csrfToken !== "string"
           || (session.consentVersion !== null && typeof session.consentVersion !== "string")) {
         throw storageUnavailable();
-      }
-      if (await deps.hasDeletionTombstone(deps.ledgerPool, session.participantId, Date.now(), { schema: deps.schema })) {
-        throw routeFailure(401, "AUTH_INVALID");
       }
       deps.assertPersonalSessionCsrf(request, session.csrfToken);
       await deps.assertCollectionControl(deps.primaryPool, deps.schema.primarySchema, "uploadRegistration");

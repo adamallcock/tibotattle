@@ -134,7 +134,7 @@ test("PostgreSQL device credential renewal fences replay, reuse, and social expi
     connectionTimeoutMillis: 5_000,
   });
   const schema = `credential_renew_${randomBytes(6).toString("hex")}`;
-  const options = { schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` } };
+  const options = { schema: { primarySchema: schema } };
   let createdSchema = false;
   let vite;
   let restoreTimingSafeEqual;

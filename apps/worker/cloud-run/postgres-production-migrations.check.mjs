@@ -30,6 +30,7 @@ import {
   runProductionMigrations,
   safeProductionMigrationErrorCode,
   SCRATCH_INSTANCE_PATTERN,
+  SIMP_RESIDUE_MIGRATION_SUFFIX,
   SIMP_RESIDUE_PREDECESSOR,
   simpResidueMigration,
   validateProductionMigrationEnvironment,
@@ -47,7 +48,6 @@ import {
   TEST_MIGRATIONS_IAM_USER,
   TEST_MIGRATIONS_RUNTIME_IAM_USER,
   TEST_MIGRATIONS_SERVICE_ACCOUNT,
-  TEST_MIGRATIONS_TARGETS,
 } from "./test-migrations.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -60,6 +60,13 @@ const SCRATCH_INSTANCE = `${PROJECT}:us-east1:w2-opsdb-primary-rehearsal-0a1b2c3
 const SCHEMA = "w2_opsdb_primary";
 const EMPTY = Object.freeze({ rows: [], rowCount: 0 });
 const primary = await readPostgresMigrations({ role: "primary" });
+// The real manifest ends with LEAD-SIMP's residue (its final name, OD-1).
+// The "missing residue" cases slice it off, with its contract entry, instead
+// of naming a synthetic file at a hard-coded number.
+const REAL_RESIDUE = "0064_append_only_residue.sql";
+const residueFree = Object.freeze(primary.slice(0, -1));
+const residueFreeContracts = Object.freeze(Object.fromEntries(Object.entries(CONTRACT_MIGRATIONS)
+  .filter(([name]) => name !== REAL_RESIDUE)));
 
 function validEnv(overrides = {}) {
   const env = {
@@ -104,7 +111,9 @@ function withExtraMigration(base, name, sql) {
  * the runner fake writes the full history. The read-back reports function
  * grants as they were issued.
  */
-function harness({ migrations = primary, history = null, owner = null, posture = {}, attached = MIGRATOR_SA } = {}) {
+function harness({
+  migrations = primary, history = null, owner = null, posture = {}, attached = MIGRATOR_SA, contractMigrations,
+} = {}) {
   const events = [];
   const granted = new Set();
   const state = {
@@ -193,6 +202,7 @@ function harness({ migrations = primary, history = null, owner = null, posture =
       assert.deepEqual(pools, counts.pools > 0 ? [pool] : []);
       assert.equal(connector?.fake, true);
     },
+    ...(contractMigrations === undefined ? {} : { contractMigrations }),
   };
   return { dependencies, events, counts, state };
 }
@@ -304,12 +314,12 @@ test("every test deployment identity is refused, whichever setting carries it", 
   const instances = [
     CLOUD_RUN_IAM_TEST_TARGET.postgres.primary.instanceConnectionName,
     CLOUD_RUN_IAM_TEST_TARGET.postgres.ledger.instanceConnectionName,
-    ...Object.values(TEST_MIGRATIONS_TARGETS).map(({ instanceConnectionName }) => instanceConnectionName),
+    // The retired A2 target (OD-6) is the IAM test target's primary.
     ...Object.values(FASTPATH_MIGRATION_TARGETS).map(({ instanceConnectionName }) => instanceConnectionName),
   ];
   for (const instance of instances) assert.equal(isTestTargetValue("instance", instance), true, instance);
   const schemas = [
-    ...Object.values(TEST_MIGRATIONS_TARGETS).map(({ schema }) => schema),
+    CLOUD_RUN_IAM_TEST_TARGET.postgres.primary.schema,
     ...Object.values(FASTPATH_MIGRATION_TARGETS).map(({ schema }) => schema),
     ...GRAPH_BENCHMARK_MIGRATION_TARGETS.map(({ schema }) => schema),
     "typed_legacy_transfer_rehearsal_target_fastpath_7ea408a7",
@@ -321,11 +331,12 @@ test("every test deployment identity is refused, whichever setting carries it", 
     assert.equal(isTestTargetValue("iam", identity), true, identity);
   }
   for (const [overrides, label] of [
-    [{ PRIMARY_INSTANCE_CONNECTION_NAME: TEST_MIGRATIONS_TARGETS.primary.instanceConnectionName,
-      ENVIRONMENT_PRIMARY_INSTANCE_CONNECTION_NAME: TEST_MIGRATIONS_TARGETS.primary.instanceConnectionName }, "test instance"],
+    [{ PRIMARY_INSTANCE_CONNECTION_NAME: CLOUD_RUN_IAM_TEST_TARGET.postgres.primary.instanceConnectionName,
+      ENVIRONMENT_PRIMARY_INSTANCE_CONNECTION_NAME: CLOUD_RUN_IAM_TEST_TARGET.postgres.primary.instanceConnectionName },
+    "test instance"],
     [{ ENVIRONMENT_PRIMARY_INSTANCE_CONNECTION_NAME: `${PROJECT}:us-east1:tibotattle-test-primary-20261002` }, "test-token instance"],
     [{ PRIMARY_SCHEMA: FASTPATH_MIGRATION_TARGETS.primary.schema }, "fast-path schema"],
-    [{ PRIMARY_SCHEMA: TEST_MIGRATIONS_TARGETS.primary.schema }, "A2 schema"],
+    [{ PRIMARY_SCHEMA: CLOUD_RUN_IAM_TEST_TARGET.postgres.primary.schema }, "A2 schema"],
     [{ PRIMARY_DATABASE: FASTPATH_MIGRATION_TARGETS.primary.database }, "fast-path database"],
     [{ POSTGRES_RUNTIME_IAM_USER: TEST_MIGRATIONS_RUNTIME_IAM_USER }, "test runtime identity"],
     [{ PRODUCTION_MIGRATOR_SERVICE_ACCOUNT: `tibotattle-test-migrator@${PROJECT}.iam.gserviceaccount.com`,
@@ -420,7 +431,7 @@ test("contract classification finds drops, renames, tightenings and dynamic SQL,
   ]) assert.deepEqual(kinds(sql), [], sql);
 });
 
-test("the promoted primary tail 0001-0063 is classified once and pinned in CONTRACT_MIGRATIONS", () => {
+test("the promoted primary tail 0001-0064 is classified once and pinned in CONTRACT_MIGRATIONS", () => {
   const classified = Object.fromEntries(primary.map((migration) => [migration.name, classifyContractOperations(migration.sql)])
     .filter(([, operations]) => operations.length > 0));
   assert.deepEqual(Object.keys(CONTRACT_MIGRATIONS).sort(), Object.keys(classified).sort());
@@ -430,8 +441,20 @@ test("the promoted primary tail 0001-0063 is classified once and pinned in CONTR
     assert.deepEqual([...entry.operations], [...classified[name]], name);
     assert.ok(entry.reason.length > 20, name);
   }
-  assert.equal(Object.keys(CONTRACT_MIGRATIONS).length, 24);
-  assert.equal(assertExpandCompatible(primary), 24);
+  assert.equal(Object.keys(CONTRACT_MIGRATIONS).length, 25);
+  assert.equal(assertExpandCompatible(primary), 25);
+  // LEAD-SIMP's residue: reviewed with exactly the operations it performs.
+  const residue = primary.at(-1);
+  assert.equal(residue.name, REAL_RESIDUE);
+  assert.deepEqual([...CONTRACT_MIGRATIONS[REAL_RESIDUE].operations], ["drop", "add-constraint"]);
+  assert.deepEqual([...classifyContractOperations(residue.sql)], ["drop", "add-constraint"]);
+  assert.doesNotMatch(residue.sql, /EXECUTE/iu, "the residue carries no dynamic SQL, comments included");
+  // Without its entry the residue is an unreviewed contract migration; the
+  // entry without the residue is stale.
+  assert.throws(() => assertExpandCompatible(primary, residueFreeContracts),
+    isCode("PRODUCTION_MIGRATION_CONTRACT_UNREVIEWED"));
+  assert.throws(() => assertExpandCompatible(residueFree), isCode("PRODUCTION_MIGRATION_CONTRACT_MAP_STALE"));
+  assert.equal(assertExpandCompatible(residueFree, residueFreeContracts), 24);
 });
 
 test("an unreviewed, changed or stale contract migration refuses the image", () => {
@@ -441,7 +464,7 @@ test("an unreviewed, changed or stale contract migration refuses the image", () 
   assert.throws(() => assertExpandCompatible(renaming), isCode("PRODUCTION_MIGRATION_CONTRACT_UNREVIEWED"));
   const reviewed = { ...CONTRACT_MIGRATIONS, [dropping.at(-1).name]: { sha256: dropping.at(-1).sha256, operations: ["drop"],
     reason: "synthetic reviewed contract migration" } };
-  assert.equal(assertExpandCompatible(dropping, reviewed), 25);
+  assert.equal(assertExpandCompatible(dropping, reviewed), 26);
   for (const [name, sql] of [
     ["w2_opsdb_retype.sql", "ALTER TABLE participants ALTER COLUMN created_at TYPE text;"],
     ["w2_opsdb_check.sql", "ALTER TABLE participants ADD CONSTRAINT w2_opsdb_check CHECK (id <> '');"],
@@ -463,25 +486,30 @@ test("an unreviewed, changed or stale contract migration refuses the image", () 
 
 test("the SIMP residue guard: only an '_append_only_residue.sql' migration after 0053 and 0063 counts", () => {
   assert.equal(SIMP_RESIDUE_PREDECESSOR, "0063_enrollment_grants_erased_redeemer.sql");
-  assert.equal(primary.at(-1).name, SIMP_RESIDUE_PREDECESSOR, "the predecessor is the promoted tail at this numbering");
-  assert.equal(simpResidueMigration(primary), null);
-  const residue = withExtraMigration(primary, "simp_append_only_residue.sql", "SELECT 1;\n");
-  assert.equal(simpResidueMigration(residue).name, "0064_simp_append_only_residue.sql");
-  const renamed = (index, name) => primary.map((migration, at) => at === index ? { ...migration, name } : migration);
+  assert.equal(SIMP_RESIDUE_MIGRATION_SUFFIX, "_append_only_residue.sql");
+  // The real manifest carries LEAD-SIMP's residue right after the predecessor.
+  assert.equal(simpResidueMigration(primary).name, REAL_RESIDUE);
+  assert.equal(residueFree.at(-1).name, SIMP_RESIDUE_PREDECESSOR, "the predecessor precedes the residue");
+  assert.equal(simpResidueMigration(residueFree), null, "the real residue sliced off is a missing residue");
+  const synthetic = withExtraMigration(residueFree, "simp_append_only_residue.sql", "SELECT 1;\n");
+  assert.equal(simpResidueMigration(synthetic).name, `${String(residueFree.length + 1).padStart(4, "0")}_simp_append_only_residue.sql`);
+  const renamed = (index, name) => residueFree.map((migration, at) => at === index ? { ...migration, name } : migration);
   assert.equal(simpResidueMigration(renamed(10, "0011_early_append_only_residue.sql")), null,
     "a residue before 0053 does not follow the fences");
   assert.equal(simpResidueMigration(renamed(59, "0060_early_append_only_residue.sql")), null,
     "a residue numbered before 0063 does not follow the numbering");
-  assert.equal(simpResidueMigration(withExtraMigration(primary.slice(0, -1), "simp_append_only_residue.sql", "SELECT 1;\n")),
+  assert.equal(simpResidueMigration(withExtraMigration(residueFree.slice(0, -1), "simp_append_only_residue.sql", "SELECT 1;\n")),
     null, "a manifest without the predecessor has no residue");
-  assert.equal(simpResidueMigration(withExtraMigration(primary, "append_only_residue_notes.sql", "SELECT 1;")), null);
+  assert.equal(simpResidueMigration(withExtraMigration(residueFree, "append_only_residue_notes.sql", "SELECT 1;")), null);
 });
 
 test("history versus manifest: behind and current proceed; ahead and non-prefix histories refuse", () => {
   const rows = (list) => list.map(({ version, name, sha256 }) => ({ version, name, checksum_sha256: sha256 }));
-  assert.deepEqual({ ...compareHistoryToManifest([], primary) }, { applied: 0, pending: 63 });
-  assert.deepEqual({ ...compareHistoryToManifest(rows(primary.slice(0, 40)), primary) }, { applied: 40, pending: 23 });
-  assert.deepEqual({ ...compareHistoryToManifest(rows(primary), primary) }, { applied: 63, pending: 0 });
+  assert.deepEqual({ ...compareHistoryToManifest([], primary) }, { applied: 0, pending: primary.length });
+  assert.deepEqual({ ...compareHistoryToManifest(rows(primary.slice(0, 40)), primary) },
+    { applied: 40, pending: primary.length - 40 });
+  assert.deepEqual({ ...compareHistoryToManifest(rows(primary), primary) }, { applied: primary.length, pending: 0 });
+  assert.equal(primary.length, 64);
   const newer = rows(withExtraMigration(primary, "w2_opsdb_newer.sql", "SELECT 1;"));
   assert.throws(() => compareHistoryToManifest(newer, primary), isCode("MIGRATION_STATE_NEWER_THAN_IMAGE"));
   const diverged = [
@@ -513,10 +541,10 @@ test("a fresh scratch target: read-only history first, then schema, forward runn
   assert.equal(verifyProductionMigrationReceipt(receipt).digest, receipt.digest);
   assert.equal(receipt.schema, PRODUCTION_MIGRATION_RECEIPT_SCHEMA);
   assert.equal(receipt.target.kind, "scratch");
-  assert.equal(receipt.migrations.count, 63);
+  assert.equal(receipt.migrations.count, 64);
   assert.equal(receipt.migrations.manifestSha256, primaryManifestSha256(primary));
-  assert.equal(receipt.migrations.contractReviewed, 24);
-  assert.equal(receipt.migrations.simpResidue, null);
+  assert.equal(receipt.migrations.contractReviewed, 25);
+  assert.equal(receipt.migrations.simpResidue, REAL_RESIDUE);
   assert.equal(receipt.ledger, "not-migrated");
   assert.equal(receipt.sourceCommit, "c".repeat(40));
   const rerun = await runProductionMigrations({ env: validEnv(), dependencies: run.dependencies });
@@ -541,17 +569,24 @@ test("ahead and diverged histories refuse with no write, and the pool is still c
 
 test("a non-scratch target needs the SIMP residue in the image manifest; refused before any connection otherwise", async () => {
   const env = validEnv({ PRIMARY_INSTANCE_CONNECTION_NAME: ENVIRONMENT_INSTANCE });
-  const refused = harness();
+  // The real manifest with its residue sliced off (and its contract entry).
+  const refused = harness({ migrations: residueFree, contractMigrations: residueFreeContracts });
   await assert.rejects(runProductionMigrations({ env, dependencies: refused.dependencies }),
     isCode("PRODUCTION_SIMP_RESIDUE_MISSING"));
   assert.deepEqual(refused.counts, { identity: 1, manifest: 1, pools: 0, apply: 0, closes: 0 });
   assert.deepEqual(refused.events, []);
-  const withResidue = withExtraMigration(primary, "simp_append_only_residue.sql", "SELECT 1;\n");
-  const accepted = harness({ migrations: withResidue });
+  // The real 64-migration manifest is accepted for a non-scratch target.
+  const accepted = harness();
   const receipt = await runProductionMigrations({ env, dependencies: accepted.dependencies });
   assert.equal(receipt.target.kind, "environment");
-  assert.equal(receipt.migrations.simpResidue, "0064_simp_append_only_residue.sql");
+  assert.equal(receipt.migrations.simpResidue, REAL_RESIDUE);
   assert.equal(verifyProductionMigrationReceipt(receipt).migrations.count, 64);
+  // A synthetic residue named from the manifest length also satisfies the guard.
+  const synthetic = withExtraMigration(residueFree, "simp_append_only_residue.sql", "SELECT 1;\n");
+  const syntheticRun = harness({ migrations: synthetic, contractMigrations: residueFreeContracts });
+  const syntheticReceipt = await runProductionMigrations({ env, dependencies: syntheticRun.dependencies });
+  assert.equal(syntheticReceipt.migrations.simpResidue,
+    `${String(synthetic.length).padStart(4, "0")}_simp_append_only_residue.sql`);
   const unreviewed = harness({ migrations: withExtraMigration(primary, "w2_opsdb_drop.sql", "DROP TABLE participants;") });
   await assert.rejects(runProductionMigrations({ env: validEnv(), dependencies: unreviewed.dependencies }),
     isCode("PRODUCTION_MIGRATION_CONTRACT_UNREVIEWED"));
@@ -580,6 +615,8 @@ test("the receipt is closed, content-free and digest-bound", async () => {
     { ...receipt, ledger: "migrated" },
     { ...receipt, extra: true },
     { ...receipt, target: { ...receipt.target, kind: "environment" } },
+    { ...receipt, target: { ...receipt.target, instanceConnectionName: ENVIRONMENT_INSTANCE } },
+    { ...receipt, migrations: { ...receipt.migrations, simpResidue: "0064_other.sql" } },
     { ...receipt, migrations: { ...receipt.migrations, count: 61 } },
     { ...receipt, roles: { migrator: RUNTIME, runtime: RUNTIME } },
     { ...receipt, runtimeGrants: { ...receipt.runtimeGrants, executableFunctions: ["insert_telemetry_v1_contribution(jsonb)"] } },

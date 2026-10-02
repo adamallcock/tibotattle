@@ -2,7 +2,7 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
-    include: ["postgres-test/gcp-cloud-run-journey-fixture.spec.mjs"],
+    include: ["postgres-test/community-allowance-rich-days.spec.mjs"],
     fileParallelism: false,
   },
 });

@@ -556,6 +556,15 @@ test("the retired ledger and history-proof settings are never origin configurati
     }), [`VAR_UNCLASSIFIED:${name}`], name);
   }
   assert.equal(configuration.PRODUCTION_FORBIDDEN_VARIABLE_PREFIXES.LEDGER_, "LEDGER_CONFIGURATION_FORBIDDEN");
+  // OD-2 re-admits the quarantine bucket's birth proof under its own name as
+  // a resource setting (like GCS_BUCKET_NAME): never a Worker var, a secret
+  // or a forbidden variable.
+  const quarantineProof = configuration.QUARANTINE_BUCKET_HISTORY_PROOF_SETTING;
+  assert.equal(quarantineProof, "GCS_QUARANTINE_BUCKET_HISTORY_PROOF");
+  assert.equal(Object.hasOwn(configuration.PRODUCTION_VARS, quarantineProof), false);
+  assert.equal(configuration.DEPLOYMENT_PROVIDED_VAR_NAMES.includes(quarantineProof), false);
+  assert.equal(secrets.includes(quarantineProof), false);
+  assert.equal(Object.hasOwn(configuration.PRODUCTION_FORBIDDEN_VARIABLES, quarantineProof), false);
   // The Worker's deletion-ledger D1 stays fingerprinted (staging may never
   // name it) and its binding never reaches the origin env.
   assert.ok(configuration.PRODUCTION_RESOURCE_FINGERPRINT.cloudflareResourceNames

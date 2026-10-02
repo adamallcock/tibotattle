@@ -17,7 +17,6 @@ import {
 } from "./constants";
 import { sha256, timingSafeEqual } from "./crypto";
 import { ApiError } from "./errors";
-import { hasPostgresDeletionTombstone } from "./postgres-ledger-authority";
 import {
   createPostgresSchemaConfig,
   quotePostgresIdentifier,
@@ -564,18 +563,26 @@ export interface PostgresDevicePairingClaimOptions {
   readonly policy?: Partial<DeviceLifecyclePolicy>;
 }
 
-/** Claim a one-use social pairing under the Worker-compatible credential contract. */
+/**
+ * Claim a one-use social pairing under the Worker-compatible credential
+ * contract. A deleted participant's pairing rows are gone with it, so the
+ * claim of a former owner is refused by ordinary authentication; there is no
+ * deletion-ledger tombstone read (decisions D2, D4 and D6).
+ */
 export async function claimPostgresDevicePairing(
   primaryPool: PostgresPool,
-  ledgerPool: PostgresPool,
   authorizationHeader: string | null,
   deviceId: string,
   deviceSecretHashHex: string,
   previousDeviceAuthorization: string | null = null,
   options: PostgresDevicePairingClaimOptions = {},
 ): Promise<PairingClaimResult> {
+  // The retired second (deletion-ledger pool) argument shifted every later
+  // one; a caller still passing a pool there is refused, not parsed.
+  if (authorizationHeader !== null && typeof authorizationHeader !== "string") {
+    throw new TypeError("POSTGRES_DEVICE_PAIRING_CLAIM_ARGUMENTS_INVALID");
+  }
   if (!UUID_V4.test(deviceId)) throw new ApiError(400, "BODY_INVALID");
-  if (primaryPool === ledgerPool) throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
   const { id: pairingId, secret: pairingSecret } = parsePairingAuthorization(authorizationHeader);
   const replacementSecretHash = bytesFromHex(deviceSecretHashHex);
   const nowEpoch = options.nowEpoch ?? Date.now();
@@ -591,9 +598,6 @@ export async function claimPostgresDevicePairing(
   try {
     const preflight = await readPairing(primaryPool, primary, pairingId);
     verifyPairing(preflight, pairingId, presentedPairingHash, nowEpoch);
-    if (await hasPostgresDeletionTombstone(
-      ledgerPool, preflight.participant_id, nowEpoch, { schema: schemas },
-    )) throw pairingUnauthorized();
 
     try {
       return await withPostgresMutation(primaryPool, async (client) => {

@@ -150,7 +150,9 @@ test("render makes no call and shows the estate", async () => {
   // The analytics-refresh job renders the production refresh-job contract.
   assert.deepEqual(withImage.jobs["analytics-refresh"].spec.template.spec.template.spec.containers[0].args,
     ["--max-old-space-size=12288", "dist/analytics-refresh.mjs", "--mode=full"]);
-  assert.doesNotMatch(JSON.stringify(withImage), /LEDGER|HISTORY_PROOF/u);
+  assert.doesNotMatch(JSON.stringify(withImage), /LEDGER|ERASURE_BUCKET_HISTORY_PROOF/u);
+  // OD-2: the service carries the quarantine bucket's pinned birth proof.
+  assert.match(JSON.stringify(withImage), /GCS_QUARANTINE_BUCKET_HISTORY_PROOF/u);
 });
 
 test("readback and plan issue read shapes only and the plan is a dry run", async () => {

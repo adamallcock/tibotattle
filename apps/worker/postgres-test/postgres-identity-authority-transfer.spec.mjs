@@ -24,7 +24,7 @@ import {
 import { authenticatePostgresDeviceBearer } from "../src/postgres-device-bearer-auth.ts";
 import { claimPostgresDevicePairing } from "../src/postgres-device-pairing-claim.ts";
 import { authenticatePostgresPersonalSessionForRead } from "../src/postgres-personal-session.ts";
-import { createW2SealCluster, LEDGER_SCHEMA, PRIMARY_SCHEMA } from "./fixtures/w2-seal/pg-target.mjs";
+import { createW2SealCluster, PRIMARY_SCHEMA } from "./fixtures/w2-seal/pg-target.mjs";
 import { forgeVariantSeal, headCommit, outputPathsOf, prepareSealWorld, sealWorld } from "./fixtures/w2-seal/seal-harness.mjs";
 import {
   SYNTHETIC_IDENTITY_LINK_SECRET,
@@ -46,7 +46,7 @@ const PG_TEST_DATABASE = process.env.PG_TEST_DATABASE || "postgres";
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const PIN = Object.freeze({ keyVersion: SYNTHETIC_IDENTITY_LINK_VERSION,
   secretFingerprint: identityLinkFingerprint(SYNTHETIC_IDENTITY_LINK_SECRET) });
-const SCHEMAS = Object.freeze({ schema: { primarySchema: PRIMARY_SCHEMA, ledgerSchema: LEDGER_SCHEMA } });
+const SCHEMAS = Object.freeze({ schema: { primarySchema: PRIMARY_SCHEMA } });
 const table = name => `"${PRIMARY_SCHEMA}"."${name}"`;
 
 const isCode = code => error => (error instanceof IdentityAuthorityTransferError
@@ -303,7 +303,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PT-3 identity and authority importer on Postgr
     expect(receipt.triggerPolicy.suppressed).toBe(suppressed);
   });
 
-  it("imports audit rows before rollbacks, carries revoked authority verbatim and excludes cooldowns, ledger and retention markers", async () => {
+  it("imports audit rows before rollbacks, carries revoked authority verbatim and excludes retention markers; the target has no cooldown table or ledger", async () => {
     const pool = target.ownerPrimary;
     const order = receipt.order;
     expect(order.indexOf("admin_action_audit")).toBeLessThan(order.indexOf("telemetry_transport_floor_rollbacks"));
@@ -319,18 +319,14 @@ describe.skipIf(!PG_TEST_SOCKET)("PT-3 identity and authority importer on Postgr
     expect(revoked.rows).toEqual([{ ledger: "revoked", owner: "revoked", v11: "revoked", v12: "revoked", device: "revoked" }]);
     expect(receipt.accountlessChain.revokedOwners).toBe(1);
 
-    expect(await count(pool, "identity_reenrollment_cooldowns")).toBe(0);
+    // The append-only residue dropped the re-enrollment cooldowns (D2, D6).
+    expect((await pool.query("SELECT to_regclass($1) AS relation", [table("identity_reenrollment_cooldowns")]))
+      .rows[0].relation).toBeNull();
     for (const name of ["accountless_public_history_retention", "accountless_public_history_import_runs",
       "accountless_public_history_import_pages", "accountless_public_history_import_claims"]) {
       expect(await count(pool, name), name).toBe(0);
     }
-    const ledgerTables = await target.ownerLedger.query(`SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-      WHERE n.nspname = $1 AND c.relkind = 'r' AND c.relname <> '_tibotattle_migration_history'`, [LEDGER_SCHEMA]);
-    for (const { relname } of ledgerTables.rows) {
-      const rows = await target.ownerLedger.query(`SELECT count(*)::int AS n FROM "${LEDGER_SCHEMA}"."${relname}"`);
-      const seeded = relname === "storage_erasure_ledger_generation" ? 1 : 0;
-      expect(rows.rows[0].n, `ledger ${relname}`).toBe(seeded);
-    }
+    expect(Object.keys(target.databases)).toEqual(["primary"]);
     expect(Object.keys(receipt.excluded).sort()).toEqual(Object.keys(IDENTITY_AUTHORITY_EXCLUDED_TABLES).sort());
     expect(Object.keys(receipt.targetMissing).sort()).toEqual(["accountless_telemetry_performance_authorizations",
       "telemetry_performance_device_capabilities"]);
@@ -390,7 +386,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PT-3 identity and authority importer on Postgr
       credentialGeneration: 2 });
 
     const newDevice = randomUUID();
-    const claimed = await claimPostgresDevicePairing(target.ownerPrimary, target.ownerLedger,
+    const claimed = await claimPostgresDevicePairing(target.ownerPrimary,
       `Pairing um_pair_${ids.openPairing}.${secrets.openPairing}`, newDevice,
       deviceSecretHash(newDevice, fixtureSecret("claimed-device")).toString("hex"), null, { ...SCHEMAS, nowEpoch });
     expect(claimed).toMatchObject({ deviceId: newDevice, state: "active" });

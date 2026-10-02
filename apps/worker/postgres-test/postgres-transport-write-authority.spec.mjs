@@ -501,7 +501,7 @@ test("argument refusals and storage failures resolve before or without any autho
   }
   await assert.rejects(assertAllowed({}, principal, "telemetry-contribution-v1.0"), { name: "TypeError" });
   await assert.rejects(assertAllowed(refusingClient, principal, "telemetry-contribution-v1.0",
-    { schema: { primarySchema: "pg_catalog", ledgerSchema: "ledger" } }), { name: "TypeError" });
+    { schema: { primarySchema: "pg_catalog" } }), { name: "TypeError" });
 
   // A storage failure is 503, never a refusal the client could act on.
   const failingPool = { async connect() { throw new Error("connection refused"); } };
@@ -520,7 +520,7 @@ test("PG17 the write-authority matrix reproduces every Worker code for social an
   const authority = await workerModule("/src/postgres-transport-write-authority.ts");
   const context = {
     twin, pool, worker, authority,
-    schemaOptions: { schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` } },
+    schemaOptions: { schema: { primarySchema: schema } },
   };
   const principal = (participantId, deviceId) => Object.freeze({ participantId, deviceId });
 
@@ -746,7 +746,7 @@ test("PG17 a locking client holds FOR SHARE on every row it decided on until its
 }, () => withTwin(async ({ twin, pool, schema }) => {
   const { assertPostgresTelemetryTransportWriteAllowed: assertAllowed } =
     await workerModule("/src/postgres-transport-write-authority.ts");
-  const options = { schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` } };
+  const options = { schema: { primarySchema: schema } };
   await twin.pgOnly("UPDATE telemetry_transport_formats SET lifecycle = 'accepted' WHERE schema_version = 'telemetry-contribution-v1.1'");
   await socialParticipant(twin, "lock-social");
   await socialDevice(twin, "lock-social", "lock-social-device");

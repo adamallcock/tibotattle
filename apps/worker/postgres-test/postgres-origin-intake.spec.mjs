@@ -166,7 +166,8 @@ const RUNTIME_ENVIRONMENT_NAMES = Object.freeze([
   "K_SERVICE", "PRIMARY_DATABASE", "PRIMARY_SCHEMA", "PRIMARY_INSTANCE_CONNECTION_NAME",
   "LEDGER_DATABASE", "LEDGER_SCHEMA", "LEDGER_INSTANCE_CONNECTION_NAME", "POSTGRES_IAM_USER",
   "POSTGRES_SOURCE_ID", "POSTGRES_SOURCE_NAMESPACE", "POSTGRES_RATE_LIMIT_SECRET",
-  "ENVELOPE_PUBLIC_JWK", "ENVELOPE_PRIVATE_JWK", "GCS_BUCKET_NAME", "GCS_ERASURE_BUCKET_HISTORY_PROOF",
+  "ENVELOPE_PUBLIC_JWK", "ENVELOPE_PRIVATE_JWK", "GCS_BUCKET_NAME", "GCS_QUARANTINE_BUCKET_HISTORY_PROOF",
+  "GCS_ERASURE_BUCKET_HISTORY_PROOF",
   "ENVIRONMENT", "ENROLLMENT_MODE", "IDENTITY_LINK_SECRET", "IDENTITY_LINK_SECRET_VERSION",
   "GOOGLE_OIDC_CLIENT_ID", "GOOGLE_OIDC_CLIENT_SECRET", "SIGN_IN_START_MAX_PER_MINUTE",
   "ACCOUNTLESS_ENROLLMENT_MODE", "ACCOUNTLESS_OWNERSHIP_MODE", "SOURCE_CONTENT_DIGEST",
@@ -198,7 +199,6 @@ async function withOrigin(run) {
   const socket = await localSocket();
   const base = new pg.Pool(localPoolOptions(socket, 4, "pg-origin-intake-test"));
   const primarySchema = `tibotattle_fastpath_intake_${randomBytes(5).toString("hex")}`;
-  const ledgerSchema = `${primarySchema}_ledger`;
   const created = [];
   const pools = [];
   let runtime;
@@ -208,13 +208,12 @@ async function withOrigin(run) {
     );
     assert.equal(server.rows[0]?.address, null, "qualification requires the local Unix socket");
     assert.equal(Math.floor(server.rows[0].version / 10_000), 17, "the disposable socket must be PostgreSQL 17");
-    for (const schema of [primarySchema, ledgerSchema]) {
+    for (const schema of [primarySchema]) {
       await base.query(`CREATE SCHEMA "${schema}"`);
       created.push(schema);
     }
     const primary = await applyPostgresMigrations({ role: "primary", schema: primarySchema, pool: base });
-    assert.equal(primary.migrations.at(-1)?.name, "0063_enrollment_grants_erased_redeemer.sql");
-    await applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool: base });
+    assert.equal(primary.migrations.at(-1)?.name, "0064_append_only_residue.sql");
     const t = (name) => `"${primarySchema}"."${name}"`;
     await base.query(`UPDATE ${t("collection_controls")}
         SET revision=2, control_state='operational', enrollment_enabled=true, upload_registration_enabled=true,
@@ -256,7 +255,7 @@ async function withOrigin(run) {
       ENVELOPE_PUBLIC_JWK: keys.publicText,
       ENVELOPE_PRIVATE_JWK: keys.privateText,
       GCS_BUCKET_NAME: bucket,
-      GCS_ERASURE_BUCKET_HISTORY_PROOF: JSON.stringify({
+      GCS_QUARANTINE_BUCKET_HISTORY_PROOF: JSON.stringify({
         bucket, bucketGeneration: "1", bucketMetageneration: "1", softDeleteRetentionDurationSeconds: "0",
       }),
       ACCOUNTLESS_ENROLLMENT_MODE: "enabled",

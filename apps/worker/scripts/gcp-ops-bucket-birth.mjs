@@ -7,8 +7,10 @@
  * STANDARD storage, in the desired region. The receipt records the created
  * bucket's generation and metageneration; the owner pins that proof in the
  * desired state, and OPS-2 readback reports BUCKET_PROOF_STALE once the live
- * bucket moves from it. The proof is infrastructure evidence only: the
- * runtime no longer consumes a bucket-history proof (SIMP-0).
+ * bucket moves from it. Owner decision OD-2 (2026-10-02): the service
+ * reads that pinned proof as GCS_QUARANTINE_BUCKET_HISTORY_PROOF (rendered
+ * from the desired state into EP-7's template), because the quarantine store
+ * needs it on a bucket with soft delete disabled.
  *
  * Default is a dry run that makes no call. With apply and
  * --authorize=bucket-birth:<project>:<bucket>, it lists the project's buckets

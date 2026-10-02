@@ -101,7 +101,9 @@ before(async () => {
   assert.equal(applied.migrations.length, (await readPostgresMigrations({ role: "primary" })).length,
     "the production runner applies the whole primary chain");
   fixture = await seedTypedV12EffectiveScope({ pool, schema, modules });
-  options = Object.freeze({ schema: Object.freeze({ primarySchema: schema, ledgerSchema: `${schema}_ledger` }) });
+  // One schema: the deletion ledger is retired (LEAD-SIMP), and the schema
+  // configuration refuses a ledger key.
+  options = Object.freeze({ schema: Object.freeze({ primarySchema: schema }) });
 });
 
 after(async () => {

@@ -57,12 +57,9 @@ const V12_UPLOAD_AUTHORIZATION_SCHEMA_VERSION = "telemetry-contribution-v1.2";
 /**
  * The private-origin host modes that compose the legacy intake: those whose
  * clients reach its routes directly (the loopback v1.2 host and the
- * fast-path test origin). cloud-run-iam is left out: its only public ingress
- * is cloud-run/oauth-gateway.mjs, whose closed route table carries none of
- * the v1.1 routes, GET /api/v1/device/sync-capabilities or GET
- * /api/v1/envelope-key, so no shipped legacy client can complete a pass
- * there, and composing the intake would only change that service's
- * reachable v1.2 upload-authorization route.
+ * fast-path test origin). The cloud-run-iam mode never composed it and is
+ * retired (owner decision OD-6, 2026-10-02); server.mjs refuses that mode
+ * outright, and this predicate keeps answering false for it.
  */
 export const ORIGIN_INTAKE_HOST_MODES = Object.freeze(["health-and-v12-day-manifest", "fastpath-test"]);
 
@@ -99,7 +96,6 @@ const ADAPTER_EXPORTS = Object.freeze({
   transport: Object.freeze(["authenticatePostgresDevice"]),
   uploadAuthorization: Object.freeze(["createPostgresDeviceUploadAuthorization"]),
   controls: Object.freeze(["assertPostgresCollectionControlFromPool"]),
-  ledgerAuthority: Object.freeze(["hasPostgresDeletionTombstone"]),
   boundedBody: Object.freeze(["readBoundedRequestBody"]),
 });
 
@@ -113,8 +109,7 @@ function compositionError(message) {
  * @param {{
  *   adapters: Record<string, Record<string, unknown>>,
  *   primaryPool: unknown,
- *   ledgerPool: unknown,
- *   schemaOptions: Readonly<{ primarySchema: string, ledgerSchema: string }>,
+ *   schemaOptions: Readonly<{ primarySchema: string }>,
  *   admissionEnv: Readonly<Record<string, unknown>>,
  *   assertAdmissionBindings: (env: unknown) => void,
  *   assertAttemptAllowed: (...args: unknown[]) => Promise<void>,
@@ -150,12 +145,18 @@ export function createOriginIntakeComposition(options) {
   if (!Array.isArray(options.routePolicy)) {
     throw compositionError("routePolicy must be the Worker route policy");
   }
+  // One application schema: a stale second schema key is refused here
+  // rather than reaching a storage adapter at request time.
+  if (options.schemaOptions === null || typeof options.schemaOptions !== "object"
+      || Object.keys(options.schemaOptions).join(",") !== "primarySchema"
+      || typeof options.schemaOptions.primarySchema !== "string") {
+    throw compositionError("schemaOptions must carry exactly primarySchema");
+  }
   const {
-    primaryPool, ledgerPool, schemaOptions, admissionEnv, maxRequestBytes, assertStorageCurrent,
+    primaryPool, schemaOptions, admissionEnv, maxRequestBytes, assertStorageCurrent,
   } = options;
   const {
-    legacyAdmission, transportWriteAuthority, transport, uploadAuthorization, controls, ledgerAuthority,
-    boundedBody,
+    legacyAdmission, transportWriteAuthority, transport, uploadAuthorization, controls, boundedBody,
   } = adapters;
 
   const v11 = createTelemetryV11OriginIntake({
@@ -163,14 +164,12 @@ export function createOriginIntakeComposition(options) {
       live: adapters.live,
       bearer: adapters.bearer,
       transport: adapters.transport,
-      ledgerAuthority: adapters.ledgerAuthority,
       personalDevices: adapters.personalDevices,
       controls: adapters.controls,
       crypto: adapters.crypto,
       boundedBody: adapters.boundedBody,
     },
     primaryPool,
-    ledgerPool,
     schema: schemaOptions,
     admissionEnv,
     assertAdmissionBindings: options.assertAdmissionBindings,
@@ -198,7 +197,6 @@ export function createOriginIntakeComposition(options) {
 
   const uploadAuthorizations = createUploadAuthorizationRouteModule({
     primaryPool,
-    ledgerPool,
     schema: schemaOptions,
     maxRequestBytes,
     admissionEnv,
@@ -219,7 +217,6 @@ export function createOriginIntakeComposition(options) {
     authenticateDevice: (pool, header, routeOptions) => transport.authenticatePostgresDevice(pool, header, {
       ...routeOptions, accountlessAuthorizationVersion: "v1.1",
     }),
-    hasDeletionTombstone: ledgerAuthority.hasPostgresDeletionTombstone,
     readBoundedRequestBody: boundedBody.readBoundedRequestBody,
     createDeviceUploadAuthorization: uploadAuthorization.createPostgresDeviceUploadAuthorization,
   });

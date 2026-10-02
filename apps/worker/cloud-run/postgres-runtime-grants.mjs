@@ -16,8 +16,8 @@
  * DML (SELECT, INSERT, UPDATE, DELETE) on every relation, USAGE, SELECT and
  * UPDATE on every sequence, the same through the migrator's default
  * privileges, SELECT only on the migration history, and EXECUTE on exactly
- * RUNTIME_PRIMARY_FUNCTIONS among the schema's non-PUBLIC routines (none in a
- * ledger schema). Every direct grant to the runtime role on the schema's
+ * RUNTIME_PRIMARY_FUNCTIONS among the schema's non-PUBLIC routines. Every
+ * direct grant to the runtime role on the schema's
  * tables, sequences and routines is reset first, so a re-run converges.
  *
  * The read-back is part of the policy, not an option: after granting, one
@@ -36,7 +36,12 @@
 import { createHash } from "node:crypto";
 
 export const MIGRATION_HISTORY_TABLE = "_tibotattle_migration_history";
-export const RUNTIME_GRANT_ROLES = Object.freeze(["primary", "ledger"]);
+/**
+ * Primary only: the deletion ledger is retired (decisions D2, D4 and D6 of
+ * 2026-09-26), so a 'ledger' role is <prefix>ROLE_INVALID before any
+ * connection.
+ */
+export const RUNTIME_GRANT_ROLES = Object.freeze(["primary"]);
 
 /**
  * Primary functions the migrations revoke from PUBLIC that the runtime role
@@ -81,9 +86,9 @@ export function functionSignature({ name, args }) {
  * and closed to it.
  */
 export function restrictedFunctionsMatchPolicy(role, rows) {
-  if (!Array.isArray(rows)) return false;
-  const runtime = role === "primary" ? RUNTIME_PRIMARY_FUNCTIONS.map(functionSignature).sort() : [];
-  const operatorOnly = role === "primary" ? OPERATOR_ONLY_PRIMARY_FUNCTIONS.map(functionSignature) : [];
+  if (role !== "primary" || !Array.isArray(rows)) return false;
+  const runtime = RUNTIME_PRIMARY_FUNCTIONS.map(functionSignature).sort();
+  const operatorOnly = OPERATOR_ONLY_PRIMARY_FUNCTIONS.map(functionSignature);
   const executable = new Map();
   for (const row of rows) {
     if (row === null || typeof row !== "object" || typeof row.signature !== "string"

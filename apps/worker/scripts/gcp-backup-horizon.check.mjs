@@ -24,7 +24,7 @@ import {
   parseBackupHorizonArgs,
   readBackupHorizonReceiptFile,
 } from "./gcp-backup-horizon.mjs";
-import { GCP_PRIVATE_TEST_TARGET } from "./gcp-private-test-deploy.mjs";
+import { GCP_PRIVATE_TEST_TARGET } from "./gcp-test-project.mjs";
 
 const SCRIPTS_ROOT = dirname(fileURLToPath(import.meta.url));
 
@@ -38,7 +38,7 @@ const PRIMARY = "synthetic-primary-a";
 // A second instance name, only to show that a ledger instance or role is refused.
 const LEDGER = "synthetic-ledger-a";
 const TEST_PRIMARY = GCP_PRIVATE_TEST_TARGET.primaryInstanceConnectionName.split(":").at(-1);
-const TEST_LEDGER = GCP_PRIVATE_TEST_TARGET.ledgerInstanceConnectionName.split(":").at(-1);
+const TEST_LEDGER = GCP_PRIVATE_TEST_TARGET.retiredLedgerInstanceConnectionName.split(":").at(-1);
 
 function describeInstance(name, config = {}) {
   return {

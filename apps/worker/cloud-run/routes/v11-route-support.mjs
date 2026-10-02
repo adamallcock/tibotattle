@@ -86,7 +86,7 @@ export function methodNotAllowed(methods) {
 
 const DEVICE_DEPENDENCIES = Object.freeze([
   "assertAdmissionBindings", "assertAttemptAllowed", "authenticateDevice",
-  "hasDeletionTombstone", "assertCollectionControl", "readBoundedRequestBody",
+  "assertCollectionControl", "readBoundedRequestBody",
 ]);
 
 /** Validate the bound dependencies every device-authenticated v1.1 route shares. */
@@ -97,21 +97,21 @@ export function validateDeviceRouteDependencies(route, dependencies) {
   for (const name of DEVICE_DEPENDENCIES) {
     if (typeof dependencies[name] !== "function") throw routeConfigurationError(route, name + " must be a function");
   }
-  const { primaryPool, ledgerPool, schema, maxRequestBytes } = dependencies;
+  const { primaryPool, schema, maxRequestBytes } = dependencies;
   if (!primaryPool || typeof primaryPool.connect !== "function"
-      || !ledgerPool || typeof ledgerPool.connect !== "function"
       || schema === null || typeof schema !== "object"
-      || typeof schema.primarySchema !== "string" || typeof schema.ledgerSchema !== "string"
+      || typeof schema.primarySchema !== "string"
       || !Number.isSafeInteger(maxRequestBytes) || maxRequestBytes < 1) {
-    throw routeConfigurationError(route, "pools, schema and maxRequestBytes are required");
+    throw routeConfigurationError(route, "pool, schema and maxRequestBytes are required");
   }
   return Object.freeze({ ...dependencies });
 }
 
 /**
  * The Worker's deviceSyncPrincipal: method, admission bindings, the
- * device_sync attempt limit, no cookie, device bearer (the generic v1.1
- * accountless gate), and the deletion tombstone.
+ * device_sync attempt limit, no cookie and the device bearer (the generic
+ * v1.1 accountless gate). There is no deletion-ledger tombstone read: a
+ * deleted participant's bearer fails ordinary authentication.
  */
 export async function deviceSyncPrincipal(request, deps, method) {
   if (request.method !== method) throw methodNotAllowed([method]);
@@ -130,9 +130,6 @@ export async function deviceSyncPrincipal(request, deps, method) {
   if (device === null || typeof device !== "object"
       || typeof device.participantId !== "string" || typeof device.deviceId !== "string") {
     throw storageUnavailable();
-  }
-  if (await deps.hasDeletionTombstone(deps.ledgerPool, device.participantId, Date.now(), { schema: deps.schema })) {
-    throw routeFailure(401, "DEVICE_AUTH_INVALID");
   }
   return device;
 }

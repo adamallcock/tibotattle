@@ -29,7 +29,7 @@ const PG_TEST_PASSWORD = process.env.PG_TEST_PASSWORD;
 const BASELINE_PRIMARY_VERSION = 24;
 const schema = `typed_v12_test_${randomBytes(8).toString("hex")}`;
 const options = Object.freeze({
-  schema: Object.freeze({ primarySchema: schema, ledgerSchema: `${schema}_ledger` }),
+  schema: Object.freeze({ primarySchema: schema }),
 });
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const FIXTURE_DAY = "2026-09-20";

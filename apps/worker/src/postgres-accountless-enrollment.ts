@@ -725,6 +725,13 @@ export async function grantPostgresTelemetryV12AccountlessAuthorization(
   const schema = schemaName(options);
   try {
     await withPostgresMutation(pool, async (client) => {
+      // ON CONFLICT arbitrates only enrollment_device_id, so two first grants
+      // for one owner raced the participant_id unique key and one answered
+      // 503. Serialise grants per owner for this transaction; the second then
+      // sees the first's committed row and replays it. Only grants take this
+      // lock, so no other owner reader waits on it.
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        [`accountless-v12-grant:${schema}:${principal.participantId}`]);
       const authority = await client.query<V12OwnerRow>(
         `SELECT owner.enrollment_device_id, owner.participant_id,
                 owner.device_credential_id, owner.expires_at AS owner_expires_at

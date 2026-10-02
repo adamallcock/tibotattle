@@ -566,7 +566,9 @@ test("OPS-10's clean verdict needs no finding, blocker, executable, refused or u
   assert.equal(operations.infrastructureCleanliness(plan(desired, fake(desired, bornWorld(desired)).runner)).clean, false);
   const unpinned = desiredState({ synthetic: false, mutate: (value) => { value.bucket.proof = null; } });
   assert.deepEqual([...operations.infrastructureCleanliness(plan(unpinned, fake(unpinned, world).runner)).reasons],
-    ["FINDING:BUCKET_PROOF_UNPINNED", "BLOCKER:BUCKET_PROOF_UNPINNED"]);
+    ["FINDING:BUCKET_PROOF_UNPINNED", "BLOCKER:BUCKET_PROOF_UNPINNED",
+      // OD-2: the service renders the pinned proof, so it defers without one.
+      "DEFERRED:run-service:update:BUCKET_PROOF_UNPINNED"]);
 });
 
 test("apply never changes a live image or source commit, and refuses an unneeded bootstrap image", () => {

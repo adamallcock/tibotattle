@@ -32,11 +32,20 @@
  * One Cloud SQL PostgreSQL 17 instance, no deletion ledger (append-only
  * decision record 2026-09-26, D2 and D4; SIMP-0 item 7): every service pool
  * opens the primary instance, and the configuration names only that
- * instance, its database and schema. The retired ledger and bucket-history
- * settings (LEDGER_INSTANCE_CONNECTION_NAME, LEDGER_DATABASE, LEDGER_SCHEMA,
- * any other LEDGER_ name and GCS_ERASURE_BUCKET_HISTORY_PROOF) are refused
- * when present, even empty, so a deployment rendered from a stale template
- * fails closed instead of being silently ignored. The Cloudflare
+ * instance, its database and schema. The retired ledger and erasure-era
+ * bucket-history settings (LEDGER_INSTANCE_CONNECTION_NAME, LEDGER_DATABASE,
+ * LEDGER_SCHEMA, any other LEDGER_ name and GCS_ERASURE_BUCKET_HISTORY_PROOF)
+ * are refused when present, even empty, so a deployment rendered from a
+ * stale template fails closed instead of being silently ignored.
+ *
+ * Owner decision OD-2 (2026-10-02) re-admits the quarantine bucket's birth
+ * proof under its own name, GCS_QUARANTINE_BUCKET_HISTORY_PROOF: every profile
+ * that names GCS_BUCKET_NAME requires it, as the OPS-2 bucket-birth receipt's
+ * proof record for exactly that bucket (closed keys, decimal generations,
+ * soft delete "0"), and returns it as resources.bucketHistoryProof. The
+ * quarantine store needs it on a bucket with soft delete disabled; the
+ * validator mirrors parseGcsQuarantineBucketHistoryProof in
+ * src/gcs-quarantine-object-store.ts. The Cloudflare
  * DELETION_LEDGER binding and the production deletion-ledger D1 name stay in
  * the absent-key and fingerprint lists: that is cutover hygiene, not a GCP
  * resource.
@@ -520,6 +529,15 @@ const IAM_ROLE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9@_.-]{0,62}$/u;
 // Mirrors bucketName in src/gcs-erasure-object-store.ts, without dots (a
 // dotted name is a domain-verified bucket, which this service never uses).
 const BUCKET_PATTERN = /^[a-z0-9](?:[a-z0-9_-]{1,61}[a-z0-9])$/u;
+// OD-2: mirrors parseGcsQuarantineBucketHistoryProof
+// (src/gcs-quarantine-object-store.ts) and createGcsErasureBucketHistoryProof.
+export const QUARANTINE_BUCKET_HISTORY_PROOF_SETTING = "GCS_QUARANTINE_BUCKET_HISTORY_PROOF";
+const BUCKET_HISTORY_PROOF_KEYS = Object.freeze([
+  "bucket", "bucketGeneration", "bucketMetageneration", "softDeleteRetentionDurationSeconds",
+]);
+const BUCKET_HISTORY_PROOF_MAX_BYTES = 1_024;
+const BUCKET_GENERATION_PATTERN = /^(?:0|[1-9][0-9]{0,18})$/u;
+const MAX_BUCKET_GENERATION = 9_223_372_036_854_775_807n;
 // Mirrors src/crypto.ts parseJwk.
 const ENVELOPE_KEY_ID_PATTERN = /^key:[A-Za-z0-9._-]{1,64}$/u;
 // Mirrors src/identity-link-configuration.ts.
@@ -584,6 +602,37 @@ function assertNoForbiddenVariables(environment) {
   for (const [prefix, code] of Object.entries(PRODUCTION_FORBIDDEN_VARIABLE_PREFIXES)) {
     if (names.some((name) => name.startsWith(prefix))) configurationError(code);
   }
+}
+
+/**
+ * OD-2: the quarantine bucket's birth proof for exactly `bucket`, frozen.
+ * The value never reaches an error.
+ */
+function quarantineBucketHistoryProof(environment, bucket) {
+  const code = `${QUARANTINE_BUCKET_HISTORY_PROOF_SETTING}_INVALID`;
+  const raw = environment.required(QUARANTINE_BUCKET_HISTORY_PROOF_SETTING);
+  if (new TextEncoder().encode(raw).byteLength > BUCKET_HISTORY_PROOF_MAX_BYTES) configurationError(code);
+  let value;
+  try { value = JSON.parse(raw); } catch { configurationError(code); }
+  if (value === null || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).sort().join(",") !== BUCKET_HISTORY_PROOF_KEYS.join(",")
+      || value.bucket !== bucket
+      || value.softDeleteRetentionDurationSeconds !== "0") {
+    configurationError(code);
+  }
+  for (const name of ["bucketGeneration", "bucketMetageneration"]) {
+    const generation = value[name];
+    if (typeof generation !== "string" || !BUCKET_GENERATION_PATTERN.test(generation)
+        || BigInt(generation) < 1n || BigInt(generation) > MAX_BUCKET_GENERATION) {
+      configurationError(code);
+    }
+  }
+  return Object.freeze({
+    bucket,
+    bucketGeneration: value.bucketGeneration,
+    bucketMetageneration: value.bucketMetageneration,
+    softDeleteRetentionDurationSeconds: "0",
+  });
 }
 
 function matching(environment, name, pattern) {
@@ -1028,6 +1077,9 @@ export function readProductionConfiguration(processEnv, profile) {
     ...envelopeKeyId,
   ];
   assertPlaneSeparation(shape.plane, planeNames, stagingValues);
+  // Read after the bucket passed the test-target and plane checks, so a
+  // refused bucket reports its own code rather than a proof mismatch.
+  const bucketHistoryProof = quarantineBucketHistoryProof(environment, bucket);
 
   const jobSwitches = readJobSwitches(environment, shape.job);
   const vars = Object.freeze({
@@ -1057,6 +1109,7 @@ export function readProductionConfiguration(processEnv, profile) {
       primary,
       iamUser,
       bucket,
+      bucketHistoryProof,
     }),
     poolSizes: PRODUCTION_POOL_SIZES,
     admissionTimeouts: PRODUCTION_ADMISSION_TIMEOUTS,

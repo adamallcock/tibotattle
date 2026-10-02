@@ -64,7 +64,7 @@ function expectCode(fn, code) {
 
 test("every write command targets only fast-path resources in the tibotattle project", () => {
   const commands = [
-    migrateJobCommand({ image: IMAGE, expectedCounts: { primary: 62, ledger: 7 } }),
+    migrateJobCommand({ image: IMAGE, expectedCounts: { primary: 64 } }),
     refreshJobCommand({ image: IMAGE }),
     refreshJobCommand({ image: IMAGE, now: "2026-10-01T00:00:00Z" }),
     executeJobCommand(FASTPATH_TEST.migrateJob),
@@ -83,20 +83,26 @@ test("every write command targets only fast-path resources in the tibotattle pro
   expectCode(() => executeJobCommand("tibotattle-test-database-migrate"),
     "FASTPATH_DEPLOY_TARGET_NOT_FASTPATH");
   expectCode(() => migrateJobCommand({ image: "us-east1-docker.pkg.dev/tibotattle/tibotattle-test/tibotattle-host:latest",
-    expectedCounts: { primary: 62, ledger: 7 } }), "FASTPATH_DEPLOY_IMAGE_DIGEST_REQUIRED");
-  expectCode(() => migrateJobCommand({ image: IMAGE, expectedCounts: { primary: 62 } }),
-    "FASTPATH_DEPLOY_EXPECTED_COUNTS_INVALID");
+    expectedCounts: { primary: 64 } }), "FASTPATH_DEPLOY_IMAGE_DIGEST_REQUIRED");
+  // Primary only: a counts record that still names the retired ledger role,
+  // or lacks a positive primary count, is a stale caller.
+  for (const expectedCounts of [{ primary: 64, ledger: 7 }, { ledger: 7 }, {}, { primary: 0 }, { primary: "64" },
+    null, undefined]) {
+    expectCode(() => migrateJobCommand({ image: IMAGE, expectedCounts }), "FASTPATH_DEPLOY_EXPECTED_COUNTS_INVALID");
+  }
 });
 
 test("migrate and refresh Jobs carry the exact database targets, identities and sizes", () => {
-  const migrate = migrateJobCommand({ image: IMAGE, expectedCounts: { primary: 62, ledger: 7 } });
+  const migrate = migrateJobCommand({ image: IMAGE, expectedCounts: { primary: 64 } });
   const env = migrate.find((arg) => arg.startsWith("--set-env-vars="));
   for (const pair of [
-    "PRIMARY_DATABASE=tibotattle_fastpath", "LEDGER_DATABASE=tibotattle_fastpath",
-    "PRIMARY_SCHEMA=tibotattle_fastpath_20261001", "LEDGER_SCHEMA=tibotattle_fastpath_ledger_20261001",
-    "PRIMARY_EXPECTED_MIGRATIONS=62", "LEDGER_EXPECTED_MIGRATIONS=7",
+    "PRIMARY_DATABASE=tibotattle_fastpath",
+    "PRIMARY_SCHEMA=tibotattle_fastpath_20261001",
+    "PRIMARY_EXPECTED_MIGRATIONS=64",
     "POSTGRES_MIGRATOR_IAM_USER=tibotattle-test-migrator@tibotattle.iam",
   ]) assert.equal(env.includes(pair), true, pair);
+  // No ledger setting reaches a fast-path Job (decisions D2, D4 and D6).
+  assert.doesNotMatch(env, /(?:^|[=,])LEDGER_/u);
   assert.equal(migrate.includes(`--service-account=${FASTPATH_TEST.migratorServiceAccount}`), true);
   assert.equal(migrate.includes("--args=dist/test-migrations.mjs,--profile=fastpath"), true);
 
@@ -201,13 +207,12 @@ test("expected migration counts are read from the commit tree, not pinned", asyn
   const dirty = spawnSync("git", ["-C", WORKER_ROOT, "status", "--porcelain", "--", "postgres/migrations"],
     { encoding: "utf8" }).stdout.trim();
   if (dirty === "") {
-    for (const role of ["primary", "ledger"]) {
-      const files = (await readdir(resolve(WORKER_ROOT, "postgres/migrations", role)))
-        .filter((name) => /^\d{4}_[a-z][a-z0-9_-]*\.sql$/u.test(name));
-      assert.equal(counts[role], files.length);
-    }
+    const files = (await readdir(resolve(WORKER_ROOT, "postgres/migrations", "primary")))
+      .filter((name) => /^\d{4}_[a-z][a-z0-9_-]*\.sql$/u.test(name));
+    assert.equal(counts.primary, files.length);
   }
-  assert.equal(counts.primary > 0 && counts.ledger > 0, true);
+  assert.deepEqual(Object.keys(counts), ["primary"], "no ledger role is counted");
+  assert.equal(counts.primary > 0, true);
 });
 
 test("edge forwards only allowlisted GETs to the loopback origin and strips IAM headers", async () => {
@@ -258,10 +263,10 @@ test("refresh and origin follow an explicit seeded rehearsal schema; migrate sta
   const refresh = refreshJobCommand({ image: IMAGE, schema: seeded });
   assert.equal(refresh.some((arg) => arg.includes(`--schema=${seeded}`)), true);
   assert.equal(refresh.some((arg) => arg.includes(`PRIMARY_SCHEMA=${seeded}`)), true);
-  assert.equal(refresh.some((arg) => arg.includes(`LEDGER_SCHEMA=${FASTPATH_TEST.ledgerSchema}`)), true);
+  assert.equal(refresh.some((arg) => /LEDGER_/u.test(arg)), false, "no ledger setting reaches the refresh Job");
   const origin = renderOriginService({ image: IMAGE, bucketHistoryProof: PROOF, schema: seeded, sourceIdentity: SOURCE });
   assert.match(origin, new RegExp(`name: PRIMARY_SCHEMA\\n {10}value: "${seeded}"`, "u"));
-  const migrate = migrateJobCommand({ image: IMAGE, expectedCounts: { primary: 62, ledger: 7 } });
+  const migrate = migrateJobCommand({ image: IMAGE, expectedCounts: { primary: 64 } });
   assert.equal(migrate.some((arg) => arg.includes(`PRIMARY_SCHEMA=${FASTPATH_TEST.primarySchema}`)), true);
   assert.equal(primarySchemaOf(undefined), FASTPATH_TEST.primarySchema);
   for (const bad of ["tibotattle_v12_a2_20260925", "tibotattle", "typed_legacy_transfer_rehearsal_target_x",
@@ -289,7 +294,7 @@ function originContainerEnv(yaml) {
 }
 
 test("the deploy script and the composition roots agree on the clock, database, schemas and Cloud Run target", async () => {
-  for (const key of ["project", "instanceConnectionName", "database", "primarySchema", "ledgerSchema"]) {
+  for (const key of ["project", "instanceConnectionName", "database", "primarySchema"]) {
     assert.equal(FASTPATH_TEST[key], FASTPATH_TEST_CLOUD_TARGET[key], key);
   }
   assert.equal(FASTPATH_TEST.refreshJob, FASTPATH_TEST_CLOUD_TARGET.refreshJob);
@@ -308,8 +313,11 @@ test("the deploy script and the composition roots agree on the clock, database, 
   assert.equal(analyticsV2TestClock(env, env.POSTGRES_TEST_HTTP_MODE)(), Date.parse(now));
   assert.equal("ANALYTICS_V2_TEST_NOW" in env || "ANALYTICS_V2_TEST_CLOCK" in env, false);
   const database = fastpathTestDatabaseConfig(env);
-  assert.deepEqual([database.primary.database, database.primary.schema, database.ledger.database,
-    database.ledger.schema], ["tibotattle_fastpath", seeded, "tibotattle_fastpath", FASTPATH_TEST.ledgerSchema]);
+  assert.deepEqual(Object.keys(database), ["primary"]);
+  assert.deepEqual([database.primary.database, database.primary.schema], ["tibotattle_fastpath", seeded]);
+  // OD-2: the origin takes the quarantine bucket's proof under its own name.
+  assert.equal(env.GCS_QUARANTINE_BUCKET_HISTORY_PROOF, PROOF);
+  assert.equal(Object.hasOwn(env, "GCS_ERASURE_BUCKET_HISTORY_PROOF"), false);
   assert.equal(originClockEnv([[ORIGIN_TEST_CLOCK_ENV, "1"]], now).length, 1, "an explicit value wins");
   expectCode(() => originClockEnv([], "yesterday"), "FASTPATH_DEPLOY_NOW_INVALID");
 

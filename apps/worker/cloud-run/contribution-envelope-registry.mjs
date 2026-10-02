@@ -3,8 +3,8 @@
  * path, IN-1).
  *
  * POST /api/v1/contributions stays one route. Its shared preamble (bearer
- * auth, upload-authorization claim, deletion-tombstone check, transport
- * floor, receipt, abandon-on-failure) runs first; only then does the origin
+ * auth, upload-authorization claim, transport floor, receipt,
+ * abandon-on-failure) runs first; only then does the origin
  * dispatch on the envelope's body.schemaVersion through a registry built
  * here, and after the handler returns the preamble records the receipt.
  * Envelope versions are registry entries, not routes: postgres-test-dispatch
@@ -63,8 +63,8 @@
  * - envelopeDigest, bodyBytes, contentType: the values the claim was bound to;
  * - principal: Readonly<{ participantId, deviceId }>, the device principal the
  *   PostgreSQL write authorities take;
- * - schema: Readonly<{ primarySchema, ledgerSchema }>;
- * - primaryPool, ledgerPool, objectStore: the origin's storage handles;
+ * - schema: Readonly<{ primarySchema }>;
+ * - primaryPool, objectStore: the origin's storage handles;
  * - envelopePublicJwk, envelopePrivateJwk: the origin's envelope key pair;
  * - sourceNamespace: the origin's typed-storage source namespace;
  * - markPersistStarted(): call immediately before the first durable write
@@ -88,10 +88,9 @@
 
 /**
  * Runs only after the shared preamble has authenticated the bearer, claimed
- * the upload authorization, refused tombstoned participants and enforced the
- * transport floor. If it throws before markPersistStarted(), the preamble
- * abandons the claim and the origin maps the error; it must not repeat any
- * preamble step. It returns the client receipt as a Response whose JSON body
+ * the upload authorization and enforced the transport floor. If it throws
+ * before markPersistStarted(), the preamble abandons the claim and the
+ * origin maps the error; it must not repeat any preamble step. It returns the client receipt as a Response whose JSON body
  * carries the contributionId the preamble records the receipt against.
  *
  * @typedef {(

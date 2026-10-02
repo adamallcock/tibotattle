@@ -548,7 +548,7 @@ async function v12RowTotal(targetSchema) {
 
 /** The reader's per-stream/day occurrence-id sets for one participant, read independently of the importer. */
 async function readerSets(targetSchema, participantId, firstDay, lastDay) {
-  const options = { schema: { primarySchema: targetSchema, ledgerSchema: `${targetSchema.slice(0, 50)}_ledger` } };
+  const options = { schema: { primarySchema: targetSchema } };
   const result = new Map();
   for (const stream of STREAMS) {
     for (let from = firstDay; from <= lastDay; from = addDays(from, 101)) {

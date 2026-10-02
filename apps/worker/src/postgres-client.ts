@@ -26,14 +26,17 @@ export interface PostgresPool {
   connect(): Promise<PostgresClient>;
 }
 
+/**
+ * The one application schema. There is no deletion-ledger schema: decisions
+ * D2, D4 and D6 (2026-09-26) remove the independent ledger from the
+ * PostgreSQL line.
+ */
 export interface PostgresSchemaConfig {
   readonly primarySchema: string;
-  readonly ledgerSchema: string;
 }
 
 export interface PostgresSchemaOptions {
   readonly primarySchema?: unknown;
-  readonly ledgerSchema?: unknown;
 }
 
 /**
@@ -54,7 +57,6 @@ export interface PostgresSourceIdentityConfig {
 
 export const DEFAULT_POSTGRES_SCHEMA_CONFIG: PostgresSchemaConfig = Object.freeze({
   primarySchema: "tibotattle",
-  ledgerSchema: "tibotattle_ledger",
 });
 
 const SCHEMA_IDENTIFIER = /^[a-z_][a-z0-9_]{0,62}$/u;
@@ -76,25 +78,25 @@ function validSourceIdentity(value: unknown): value is string {
 }
 
 /**
- * Validate runtime-configured schema names before they reach an identifier
- * position. Test harnesses may provide isolated names; production defaults
- * remain the canonical primary and independent ledger schemas.
+ * Validate the runtime-configured schema name before it reaches an identifier
+ * position. Test harnesses may provide an isolated name; production defaults
+ * to the canonical primary schema. A caller that still passes the retired
+ * ledger schema key fails closed instead of having it silently ignored.
  */
 export function createPostgresSchemaConfig(
   options: PostgresSchemaOptions = {},
 ): PostgresSchemaConfig {
+  if (options === null || typeof options !== "object"
+      || Object.hasOwn(options, "ledgerSchema")) {
+    throw new TypeError("invalid PostgreSQL schema configuration");
+  }
   const primarySchema = options.primarySchema === undefined
     ? DEFAULT_POSTGRES_SCHEMA_CONFIG.primarySchema
     : options.primarySchema;
-  const ledgerSchema = options.ledgerSchema === undefined
-    ? DEFAULT_POSTGRES_SCHEMA_CONFIG.ledgerSchema
-    : options.ledgerSchema;
-  if (!validSchemaIdentifier(primarySchema) || !validSchemaIdentifier(ledgerSchema)
-      || reservedSchemaIdentifier(primarySchema) || reservedSchemaIdentifier(ledgerSchema)
-      || primarySchema === ledgerSchema) {
+  if (!validSchemaIdentifier(primarySchema) || reservedSchemaIdentifier(primarySchema)) {
     throw new TypeError("invalid PostgreSQL schema configuration");
   }
-  return Object.freeze({ primarySchema, ledgerSchema });
+  return Object.freeze({ primarySchema });
 }
 
 /** Alias emphasizing that this is the validated runtime boundary. */

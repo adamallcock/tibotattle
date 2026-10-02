@@ -130,7 +130,7 @@ test("PostgreSQL device-bearer authentication matches the Worker and commits reu
     await pool.query(`CREATE SCHEMA "${schema}"`);
     schemaCreated = true;
     await applyPostgresMigrations({ role: "primary", schema, pool });
-    const options = { schema: { primarySchema: schema, ledgerSchema: `${schema}_ledger` } };
+    const options = { schema: { primarySchema: schema } };
 
     vite = await createServer({
       root: WORKER_ROOT,

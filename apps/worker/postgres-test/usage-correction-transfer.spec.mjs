@@ -155,7 +155,7 @@ test("PG17 correction transfer stages active source state, seals parity receipts
     assert.equal(applied.applied, applied.migrations.length);
     assert.ok(applied.migrations.some((migration) =>
       migration.name === "0034_usage_correction_history.sql"));
-    assert.equal(applied.migrations.at(-1)?.name, "0063_enrollment_grants_erased_redeemer.sql");
+    assert.equal(applied.migrations.at(-1)?.name, "0064_append_only_residue.sql");
     const table = name => `"${schema}"."${name}"`;
     const createdAt = new Date().toISOString();
     await pool.query(`INSERT INTO ${table("participants")} (id,created_at) VALUES($1,$2)`, [participantId, createdAt]);
