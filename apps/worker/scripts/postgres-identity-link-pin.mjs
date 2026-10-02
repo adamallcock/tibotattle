@@ -128,3 +128,25 @@ export function assertPinMatchesSealed(pin, sealedRows, { expectedKeyVersion }) 
   }
   return Object.freeze({ keyVersion: valid.keyVersion, secretFingerprint: valid.secretFingerprint });
 }
+
+/**
+ * Preflight P8 against the deployment: the pin must name the Secret Manager
+ * secret and the numeric version the production service template mounts
+ * (the IDENTITY_LINK_SECRET entry of the committed production desired state).
+ * A mount that is not pinned to a numeric version (null, 'latest' or any
+ * other form) refuses CUTOVER_IDENTITY_LINK_MOUNT_UNPINNED, and a pin taken
+ * from another secret or version refuses CUTOVER_IDENTITY_LINK_MOUNT_MISMATCH,
+ * so the import cannot carry a fingerprint the service will not load.
+ */
+export function assertPinMatchesMount(pin, mount) {
+  const valid = validateIdentityLinkPin(pin);
+  if (mount === null || typeof mount !== "object" || Array.isArray(mount)
+      || typeof mount.secretName !== "string" || !SECRET_NAME.test(mount.secretName)
+      || typeof mount.version !== "string" || !SECRET_VERSION.test(mount.version)) {
+    fail("CUTOVER_IDENTITY_LINK_MOUNT_UNPINNED");
+  }
+  if (valid.secretName !== mount.secretName || valid.secretVersion !== mount.version) {
+    fail("CUTOVER_IDENTITY_LINK_MOUNT_MISMATCH");
+  }
+  return Object.freeze({ secretName: valid.secretName, secretVersion: valid.secretVersion });
+}

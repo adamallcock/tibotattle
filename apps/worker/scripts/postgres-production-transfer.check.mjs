@@ -10,7 +10,7 @@
 
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
@@ -35,6 +35,7 @@ import {
 } from "./postgres-transfer-coverage.mjs";
 import {
   IDENTITY_LINK_FINGERPRINT_DOMAIN,
+  assertPinMatchesMount,
   assertPinMatchesSealed,
   buildIdentityLinkPin,
   identityLinkSecretFingerprint,
@@ -43,18 +44,24 @@ import {
 } from "./postgres-identity-link-pin.mjs";
 import { PARITY_CLASSES, selectParitySample } from "./postgres-transfer-parity-sample.mjs";
 import {
+  DESIRED_STATE_SCHEMA,
   FINALIZE_ORDER,
   MIGRATION_FENCE_LOCK_PREFIX,
   PRODUCTION_TRANSFER_ERROR_CODES,
   PRODUCTION_TRANSFER_INPUTS_SCHEMA,
+  PRODUCTION_DESIRED_STATE_FILE,
   PROTECTED_STEPS,
   ProductionTransferError,
+  SCHEDULED_TRIGGER_JOBS,
+  SCHEDULER_EVIDENCE_MAXIMUM_AGE_MILLISECONDS,
   SCHEDULER_PROBE_SCHEMA,
   assertStepOrder,
   authorizationToken,
   cliErrorLine,
   connectionOptions,
   parseTransferArguments,
+  readProductionDeployment,
+  validateSchedulerEvidence,
   validateTransferInputs,
 } from "./postgres-production-transfer.mjs";
 import { TRANSFER_STAGES } from "./postgres-transfer-target.mjs";
@@ -240,6 +247,87 @@ test("the pin equals the Worker's fingerprint, refuses short secrets and 'latest
     { code: "CUTOVER_IDENTITY_LINK_SECRET_MISMATCH" });
 });
 
+test("P8 binds the pin to the secret and numeric version the production service mounts", () => {
+  const pin = buildIdentityLinkPin({ secret: SECRET, keyVersion: "prod-v1", secretName: "IDENTITY_LINK_SECRET",
+    secretVersion: "3", computedAt: "2026-10-02T00:00:00.000Z" });
+  assert.deepEqual(assertPinMatchesMount(pin, { secretName: "IDENTITY_LINK_SECRET", version: "3" }),
+    { secretName: "IDENTITY_LINK_SECRET", secretVersion: "3" });
+  for (const version of [null, "latest", "0", "03", 3, ""]) {
+    assert.throws(() => assertPinMatchesMount(pin, { secretName: "IDENTITY_LINK_SECRET", version }),
+      { code: "CUTOVER_IDENTITY_LINK_MOUNT_UNPINNED" }, String(version));
+  }
+  assert.throws(() => assertPinMatchesMount(pin, null), { code: "CUTOVER_IDENTITY_LINK_MOUNT_UNPINNED" });
+  assert.throws(() => assertPinMatchesMount(pin, { secretName: "IDENTITY_LINK_SECRET", version: "4" }),
+    { code: "CUTOVER_IDENTITY_LINK_MOUNT_MISMATCH" }, "another version than the template mounts");
+  assert.throws(() => assertPinMatchesMount(pin, { secretName: "tibotattle-identity-link", version: "3" }),
+    { code: "CUTOVER_IDENTITY_LINK_MOUNT_MISMATCH" }, "another secret than the template mounts");
+});
+
+test("the committed production desired state is read as data: schema, environment, project and the closed mount", async () => {
+  const committed = JSON.parse(await readFile(new URL(`../${PRODUCTION_DESIRED_STATE_FILE}`, import.meta.url), "utf8"));
+  assert.equal(committed.schemaVersion, DESIRED_STATE_SCHEMA);
+  assert.equal(committed.environment, "production");
+  assert.deepEqual(Object.keys(committed.secrets.IDENTITY_LINK_SECRET).sort(), ["secretName", "version"]);
+  const write = async (name, value) => {
+    const path = join(scratch, name);
+    await writeFile(path, JSON.stringify(value), { mode: 0o600 });
+    return path;
+  };
+  const filled = { ...committed, project: "tibotattle-synthetic-prod",
+    secrets: { ...committed.secrets, IDENTITY_LINK_SECRET: { secretName: "IDENTITY_LINK_SECRET", version: "7" } } };
+  assert.deepEqual(await readProductionDeployment(await write("filled.json", filled)),
+    { project: "tibotattle-synthetic-prod", identityLinkMount: { secretName: "IDENTITY_LINK_SECRET", version: "7" } });
+  // An unpinned mount reads, and P8 refuses it (above); an unfilled project refuses here.
+  const unpinned = { ...filled, secrets: { ...filled.secrets, IDENTITY_LINK_SECRET: { secretName: "IDENTITY_LINK_SECRET",
+    version: null } } };
+  assert.equal((await readProductionDeployment(await write("unpinned.json", unpinned))).identityLinkMount.version, null);
+  for (const [name, bad] of [["placeholder", { ...filled, project: null }], ["staging", { ...filled, environment: "staging" }],
+    ["schema", { ...filled, schemaVersion: "tibotattle-gcp-ops-infra-desired-state-v1" }],
+    ["mount-keys", { ...filled, secrets: { ...filled.secrets, IDENTITY_LINK_SECRET: { secretName: "IDENTITY_LINK_SECRET",
+      version: "7", value: "x" } } }],
+    ["no-mount", { ...filled, secrets: {} }]]) {
+    await assert.rejects(readProductionDeployment(await write(`${name}.json`, bad)), { code: "CUTOVER_DESIRED_STATE_INVALID" }, name);
+  }
+  await assert.rejects(readProductionDeployment(join(scratch, "absent.json")), { code: "CUTOVER_DESIRED_STATE_INVALID" });
+});
+
+test("P11 accepts only the producer's shape: the managed trigger set, paused, no alert, this project, fresh and strict", () => {
+  const appliedMs = Date.parse("2026-10-02T00:00:00.000Z");
+  const nowMs = Date.parse("2026-10-02T02:00:00.000Z");
+  // probeScheduler's output (gcp-ops-infra-operations.mjs) for the paused production plane.
+  const probe = (overrides = {}) => ({
+    schema: SCHEDULER_PROBE_SCHEMA, environment: "production", project: "tibotattle-synthetic-prod",
+    checkedAt: "2026-10-02T00:30:00.000Z", thresholdHours: 6,
+    triggers: SCHEDULED_TRIGGER_JOBS.map(job => ({ job, name: `tibotattle-${job}-trigger`, desiredState: "PAUSED",
+      liveState: "PAUSED", quietMinutes: null, verdict: "paused_as_desired", alert: false })),
+    alert: false, signal: null, ...overrides,
+  });
+  const bind = { project: "tibotattle-synthetic-prod", appliedMs, nowMs };
+  assert.equal(validateSchedulerEvidence(probe(), bind), SCHEDULED_TRIGGER_JOBS.length);
+  const paused = probe().triggers[0];
+  const refusals = {
+    "an unmanaged extra trigger": probe({ triggers: [...probe().triggers, { ...paused, job: "maintenance" }] }),
+    "a duplicated trigger": probe({ triggers: [paused, paused] }),
+    "another trigger in its place": probe({ triggers: [{ ...paused, job: "maintenance" }] }),
+    "a missing trigger": probe({ triggers: [] }),
+    "a running trigger": probe({ triggers: [{ ...paused, liveState: "ENABLED", verdict: "running" }] }),
+    "an absent trigger": probe({ triggers: [{ ...paused, liveState: null, verdict: "absent_not_created" }] }),
+    "an alert": probe({ alert: true, signal: "SCHEDULER_TRIGGER_PAUSED_TOO_LONG" }),
+    "another project": probe({ project: "tibotattle-other" }),
+    "another environment": probe({ environment: "staging" }),
+    "another schema": probe({ schema: "tibotattle-gcp-ops-infra-scheduler-probe-v0" }),
+    "a lenient instant": probe({ checkedAt: "2026-10-02T00:30:00Z" }),
+    "an instant before the fence": probe({ checkedAt: "2026-10-01T23:59:59.999Z" }),
+    "an instant in the future": probe({ checkedAt: "2026-10-02T02:00:00.001Z" }),
+  };
+  for (const [label, value] of Object.entries(refusals)) {
+    assert.throws(() => validateSchedulerEvidence(value, bind), { code: "CUTOVER_SCHEDULER_NOT_PAUSED" }, label);
+  }
+  assert.throws(() => validateSchedulerEvidence(probe(), { ...bind, nowMs: Date.parse("2026-10-02T00:30:00.000Z")
+    + SCHEDULER_EVIDENCE_MAXIMUM_AGE_MILLISECONDS + 1 }), { code: "CUTOVER_SCHEDULER_NOT_PAUSED" }, "older than 6 h");
+  assert.throws(() => validateSchedulerEvidence(probe(), { ...bind, project: undefined }), { code: "CUTOVER_SCHEDULER_NOT_PAUSED" });
+});
+
 // ---------------------------------------------------------------------------
 // Parity sample (PT8-E): the selection.
 
@@ -382,9 +470,19 @@ test("errors are closed and content-free on the CLI", () => {
   assert.equal(new ProductionTransferError("NOT_A_CODE").code, "CUTOVER_ARGUMENT_INVALID");
 });
 
-test("pinned literals equal their owners: the scheduler probe schema and C-MAINT's migration fence prefix", async () => {
+test("pinned literals equal their owners: the scheduler probe, the desired state and C-MAINT's migration fence prefix", async () => {
   const probe = await readFile(new URL("./gcp-ops-infra-operations.mjs", import.meta.url), "utf8");
   assert.ok(probe.includes(`GCP_OPS_INFRA_SCHEDULER_PROBE_SCHEMA = "${SCHEDULER_PROBE_SCHEMA}"`));
+  // The producer emits one entry per managed trigger, with the plane's project and an alert flag.
+  for (const fragment of ["const results = SCHEDULED_JOB_NAMES.map((job) => {", "project: desired.project,",
+    "checkedAt: new Date(nowMs).toISOString(),", "alert: results.some((entry) => entry.alert),"]) {
+    assert.ok(probe.includes(fragment), fragment);
+  }
+  const manifest = await readFile(new URL("./gcp-ops-infra-manifest.mjs", import.meta.url), "utf8");
+  assert.ok(manifest.includes(`SCHEDULED_JOB_NAMES = Object.freeze(${JSON.stringify(SCHEDULED_TRIGGER_JOBS)
+    .replaceAll(",", ", ")});`));
+  assert.ok(manifest.includes(`GCP_OPS_INFRA_DESIRED_STATE_SCHEMA = "${DESIRED_STATE_SCHEMA}"`));
+  assert.ok(manifest.includes(`production: "${PRODUCTION_DESIRED_STATE_FILE}"`));
   const lifecycle = await readFile(new URL("../src/postgres-lifecycle-pass.ts", import.meta.url), "utf8");
   assert.ok(lifecycle.includes(`POSTGRES_LIFECYCLE_PASS_MIGRATION_LOCK_PREFIX = "${MIGRATION_FENCE_LOCK_PREFIX}"`));
 });

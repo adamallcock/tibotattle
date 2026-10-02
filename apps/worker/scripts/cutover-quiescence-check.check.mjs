@@ -464,6 +464,9 @@ test("pending quarantine registrations block, split by state, with the oldest ti
   const item = checkOf(report, "pending-quarantine-registrations");
   assert.equal(item.status, "blocked");
   assert.deepEqual(item.counts, { registrations: 2, registered: 1, deleting: 1, oldestRegisteredAt: "2026-10-02T10:00:00.000Z" });
+  // PT-4 maps the sealed registrations and E-PT8's post-import refuses a mapping mismatch.
+  assert.deepEqual(item.refusals, [{ stage: "PT-4 pending-registrations, E-PT8 post-import",
+    code: "CUTOVER_PENDING_OBJECT_CONFLICT", implemented: true }]);
   assert.deepEqual(item.refs, [opaqueRef("quarantine-registration", "synthetic-contribution-a"),
     opaqueRef("quarantine-registration", "synthetic-contribution-b")]);
   assert.equal(report.verdict, "blocked");

@@ -14,19 +14,24 @@
 //                                    recorded tombstone: PT-2-lite's and PT-3's
 //                                    CUTOVER_ERASED_PARTICIPANT_PRESENT.
 //   owner-links-erased               v1.1 owner links already marked erased:
-//                                    PT-8's erasure quiescence (specified,
-//                                    not yet built).
-//   pending-quarantine-registrations pending_quarantine_objects rows: the PT-4
-//                                    / PT-8 mapping or emptiness proof
-//                                    (specified, not yet built).
+//                                    E-PT8 preflight P5's
+//                                    CUTOVER_OWNER_LINK_ERASED.
+//   pending-quarantine-registrations pending_quarantine_objects rows: PT-4
+//                                    (D-PT4X pending-registrations) maps
+//                                    them, and E-PT8's post-import proves
+//                                    the mapping
+//                                    (CUTOVER_PENDING_OBJECT_CONFLICT on a
+//                                    mismatch). Their presence alone is not
+//                                    refused downstream.
 //   correction-runtime               the telemetry_usage_correction_runtime
-//                                    row and the correction facts: PT-8's
-//                                    CUTOVER_CORRECTION_RUNTIME_ACTIVE
-//                                    (specified, not yet built).
+//                                    row and the correction facts: E-PT8
+//                                    preflight P4's
+//                                    CUTOVER_CORRECTION_RUNTIME_ACTIVE.
 //   pending-erasure-jobs             unfinished storage_erasure_jobs in the
-//                                    deletion ledger: PT-8's pending jobs and
-//                                    HX-6's pendingErasureJobs drain check
-//                                    (specified, not yet built).
+//                                    deletion ledger: E-PT8 preflight P3 and
+//                                    P5's CUTOVER_PARTICIPANT_ERASURE_PENDING
+//                                    (HX-6's pendingErasureJobs drain check
+//                                    is not built).
 //   analytics-delivery               the analytics drain: the delivery cursor
 //                                    against the ingestion journal maximum, the
 //                                    daily publication queue, and the delivered
@@ -48,7 +53,7 @@
 // participant predicate is imported from PT-3 (PARTICIPANT_*_PREDICATE) and the
 // tombstone read and the intersection loop from the projections module
 // (readDeletionDigestsFromDatabase, countParticipantDeletionMatches). The
-// others implement the PT-8, PT-4 and HX-6 briefs; each check says whether its
+// others report what E-PT8, PT-4 and HX-6 refuse; each check says whether its
 // refusal exists in code yet (refusals[].implemented). A check whose input is
 // absent is 'not-evaluated', never clear: missing evidence is not zero.
 //
@@ -640,7 +645,8 @@ const REFUSALS = Object.freeze({
   "participants-quiescent": Object.freeze([refusal("PT-3", "CUTOVER_PARTICIPANT_ERASURE_PENDING", true)]),
   "deletion-digest-intersection": Object.freeze([refusal("PT-2-lite, PT-3", "CUTOVER_ERASED_PARTICIPANT_PRESENT", true)]),
   "owner-links-erased": Object.freeze([refusal("PT-8 preflight P5", "CUTOVER_OWNER_LINK_ERASED", true)]),
-  "pending-quarantine-registrations": Object.freeze([refusal("PT-4, PT-8", null, false)]),
+  "pending-quarantine-registrations": Object.freeze([
+    refusal("PT-4 pending-registrations, E-PT8 post-import", "CUTOVER_PENDING_OBJECT_CONFLICT", true)]),
   "correction-runtime": Object.freeze([refusal("PT-8 preflight P4", "CUTOVER_CORRECTION_RUNTIME_ACTIVE", true)]),
   "pending-erasure-jobs": Object.freeze([refusal("PT-8 preflight P3 and P5", "CUTOVER_PARTICIPANT_ERASURE_PENDING", true)]),
   "analytics-delivery": Object.freeze([

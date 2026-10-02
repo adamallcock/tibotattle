@@ -409,7 +409,10 @@ tokens and every refusal, is [the orchestrator section](#h4-reference-the-pt-8-l
    correction runtime staged with no facts (P4,
    `CUTOVER_CORRECTION_RUNTIME_ACTIVE`), erasure quiescence (P5), the
    deletion-digest exclusion count (P6), the public-source bootstrap at
-   `completed=1` (P7) and the identity-pin fingerprint (P8).
+   `completed=1` (P7), the identity pin (P8: the sealed fingerprint, and the
+   secret and numeric version that the committed production desired state
+   mounts) and the scheduler probe (P11: the desired state's project, exactly
+   the managed triggers, all paused, no alert, under 6 hours old).
 2. **Import (protected).** `node $S run --owner-dir <dir> <connection>` is a dry
    run that prints the plan and the token; add `--execute --confirm <token>`.
    It runs the stages in dependency order: PT-3 `identity-authority`, D-PT4X
@@ -423,6 +426,10 @@ tokens and every refusal, is [the orchestrator section](#h4-reference-the-pt-8-l
    finalizes coverage, runs the parity sample, **loads the frozen public read**
    (C-IPR) and **drops the staging relations**. Then the run moves to
    `verifying` and `verified`. A killed `run` is rerun with the same token.
+   Before any write, every `run --execute` that has not reached `verified`
+   proves P11 and P10's memberships again. If a resumed run starts more than
+   6 hours after the probe, replace the probe receipt at the same path with a
+   fresh one first.
 3. **Finalize to live, in this order.** PT-1 admits the staging drop only
    before `verified`, and refuses every write once a run is live, so the drop
    and the frozen-read load happen inside step 2; the flip gate reads both
@@ -439,9 +446,13 @@ tokens and every refusal, is [the orchestrator section](#h4-reference-the-pt-8-l
      `CUTOVER_SOURCE_CHANGED_AFTER_SEAL` (a fence breach: abort).
    - `node $S release-controls --flip-evidence <flip-1>/flip-evidence.json`
      (protected) restores the sealed collection controls exactly. Without
-     it, enrollment and publication stay disabled after the switch.
-   - Owner: `verify-unchanged` again, into `flip-2` (fresh evidence taken after
-     the release).
+     it, enrollment and publication stay disabled after the switch. It then
+     reads the database clock once, after the restore commits, and records it
+     as `releasedAt` in `release-controls.json`. A rerun keeps that instant.
+   - Owner: `verify-unchanged` again, into `flip-2`, started only after
+     `release-controls` has printed `executed`. Its `verifiedAt` must be later
+     than `releasedAt`. Evidence taken between flip-1 and the release is
+     refused (`CUTOVER_FLIP_EVIDENCE_STALE`).
    - `node $S flip-gate --flip-evidence <flip-2>/flip-evidence.json`
      (read-only) reads back the staging drop and the loaded frozen read, runs
      `assertFlipReady` and checks that no sealed Sparkle nonce is unexpired. It
@@ -502,8 +513,11 @@ orchestrator writes `identity-pin.json`, `preflight.json`, `post-import.json`,
 `release-controls.json`, `flip-gate.json`, `mark-live.json`,
 `pt8-report.json` and the advisory `pt8-journal.ndjson` (`0600`). A receipt
 is written once; a rerun that computes identical bytes reuses it and any other
-result refuses `CUTOVER_RECEIPT_CONFLICT`. Every receipt is content-free:
-names, counts, states and sha256 digests.
+result refuses `CUTOVER_RECEIPT_CONFLICT`. `post-import.json` is written before
+the post-import stage commits. A rerun that finds the stage complete requires
+the file and its digest (`CUTOVER_RECEIPT_CONFLICT` otherwise). A rerun of
+`release-controls` must name the same flip-1 evidence. Every receipt is
+content-free: names, counts, states and sha256 digests.
 
 **Identity pin (owner only).** The deployed `IDENTITY_LINK_SECRET` is read from
 standard input only, never from an argument or the environment:
@@ -513,8 +527,16 @@ gcloud secrets versions access <N> --secret=<identity-link secret id> | \
   node $S identity-pin --owner-dir <dir> --key-version <label> --secret-name <id> --secret-version <N>
 ```
 
-A secret shorter than 32 characters and a version of `latest` are refused. The
-pin is a keyed digest: keep it in the owner directory only.
+A secret shorter than 32 characters and a version of `latest` are refused.
+`--secret-name` and `--secret-version` must equal the `IDENTITY_LINK_SECRET`
+entry of the committed production desired state
+(`apps/worker/cloud-run/infra/production.desired-state.json`), which is the
+secret the service template mounts. Preflight P8 refuses while that entry has
+no numeric version (`CUTOVER_IDENTITY_LINK_MOUNT_UNPINNED`). Pin the version
+in the desired state (owner) before the pin is taken. P8 also refuses a pin of
+another secret or version (`CUTOVER_IDENTITY_LINK_MOUNT_MISMATCH`). The key
+version label (`expectedIdentityKeyVersion`) still comes from `pt8-inputs.json`.
+The pin is a keyed digest: keep it in the owner directory only.
 
 **Connection.** Every database subcommand takes `--pg-socket <dir> --pg-port
 <n> --pg-user <transfer IAM user> --pg-database <db>`: a Unix socket directory
@@ -539,7 +561,7 @@ authorizes one step of one cutover.
 |---|---|
 | `run` | `preflight.json` is GO for these inputs, and the run is absent, `preflight`, `importing`, `verifying` or `verified` (a no-op) |
 | `release-controls` | The run is `verified`; the flip-1 evidence was taken after `verified_at` |
-| `flip-gate` | The run is `verified`, `release-controls.json` exists, and the flip-2 evidence differs from flip-1 and was taken after the release |
+| `flip-gate` | The run is `verified`, `release-controls.json` exists, and the flip-2 evidence differs from flip-1 and its `verifiedAt` is later than the recorded `releasedAt` |
 | `mark-live` | The flip gate passed for exactly this flip-2 sha256, or the run is already live with it (a readback) |
 | `post-live-check`, `report` | The run is `live` |
 | `abandon` | A run exists and is not `live` |
@@ -575,9 +597,11 @@ the target is final for this seal.
 | `CUTOVER_ERASED_PARTICIPANT_PRESENT`, `CUTOVER_PROJECTION_SEAL_MISMATCH` | P6 | A sealed participant matches a tombstone, or the projection is not this seal's |
 | `CUTOVER_PUBLIC_SOURCE_BOOTSTRAP_INCOMPLETE` | P7 | The sealed bootstrap is not complete |
 | `CUTOVER_IDENTITY_LINK_SECRET_MISMATCH`, `CUTOVER_IDENTITY_LINK_VERSION_MISMATCH` | P8 | The pin differs from the sealed row or the deployed label. Never rotate the secret to pass |
+| `CUTOVER_IDENTITY_LINK_MOUNT_UNPINNED`, `CUTOVER_IDENTITY_LINK_MOUNT_MISMATCH` | P8 | The committed production desired state mounts no numeric version, or the pin names another secret or version than the mount |
+| `CUTOVER_DESIRED_STATE_INVALID` | P8, P11 | The committed production desired state is unreadable or still has a placeholder project |
 | `CUTOVER_CONTROLS_DEGRADE_IMPOSSIBLE` | P9 | The sealed controls admit no degraded form. Re-seal |
-| `CUTOVER_TARGET_NOT_EMPTY`, `CUTOVER_TRANSFER_LOGIN_MEMBERSHIP_INVALID`, `CUTOVER_TARGET_FROZEN_READ_TABLE_MISSING` | P10 | The target is not the pre-staged empty database, or the login's membership inherits |
-| `CUTOVER_SCHEDULER_NOT_PAUSED` | P11 | A trigger runs, or the probe predates the fence or is over 6 h old |
+| `CUTOVER_TARGET_NOT_EMPTY`, `CUTOVER_TRANSFER_LOGIN_MEMBERSHIP_INVALID` (again at `run`), `CUTOVER_TARGET_FROZEN_READ_TABLE_MISSING` | P10 | The target is not the pre-staged empty database, the login's membership inherits, or the frozen-read table is absent or a published day exists |
+| `CUTOVER_SCHEDULER_NOT_PAUSED` | P11 (again at `run`) | The probe does not name exactly the managed triggers, all paused, for the desired state's project with no alert; or it predates the fence, is over 6 h old or has a non-strict instant |
 | `CUTOVER_INTERIM_READ_FACTS_INVALID` and the C-IPR `INTERIM_PUBLIC_READ_*` codes | P12 | The OWN-4 export or its facts do not hold (captured after the fence, another commit, another day) |
 | `CUTOVER_PENDING_OBJECT_GUARD_MISSING` | P13 | The transfer-hold guard is absent and no owner flag accepts that |
 

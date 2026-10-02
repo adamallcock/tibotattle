@@ -1,4 +1,4 @@
-import { readFile, readdir, writeFile, chmod, mkdir } from "node:fs/promises";
+import { readFile, readdir, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 import { DatabaseSync } from "node:sqlite";
@@ -18,7 +18,9 @@ import {
   ORCHESTRATOR_LOCK_KEY,
   MIGRATION_FENCE_LOCK_PREFIX,
   OWNER_FILES,
+  PRODUCTION_DESIRED_STATE_FILE,
   PRODUCTION_TRANSFER_INPUTS_SCHEMA,
+  SCHEDULED_TRIGGER_JOBS,
   SCHEDULER_PROBE_SCHEMA,
   abandon,
   createTransferContext,
@@ -59,6 +61,9 @@ const FENCE_APPLIED_MS = Date.parse("2026-10-02T00:00:00.000Z");
 const SEAL_NOW = new Date("2026-10-02T01:00:00.000Z");
 const CONTEXT_NOW = () => new Date("2026-10-02T02:00:00.000Z");
 const table = name => `"${PRIMARY_SCHEMA}"."${name}"`;
+/** The synthetic production plane: its project, and the identity-link mount the pin must name. */
+const DESIRED_PROJECT = "tibotattle-synthetic";
+const IDENTITY_MOUNT = Object.freeze({ secretName: "IDENTITY_LINK_SECRET", version: "3" });
 
 async function codeOf(promise) {
   try {
@@ -82,8 +87,8 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
     pinSecret = SYNTHETIC_IDENTITY_LINK_SECRET, ledgerSeal = null, scheduler = {} } = {}) {
     const directory = await privateDirectory("ept8-owner-");
     await writeIdentityPin({ ownerDirectory: directory, stream: Readable.from([`${pinSecret}\n`]),
-      keyVersion: SYNTHETIC_IDENTITY_LINK_VERSION, secretName: "tibotattle-identity-link", secretVersion: "3",
-      now: CONTEXT_NOW });
+      keyVersion: SYNTHETIC_IDENTITY_LINK_VERSION, secretName: IDENTITY_MOUNT.secretName,
+      secretVersion: IDENTITY_MOUNT.version, now: CONTEXT_NOW });
     const projectionSeal = ledgerSeal ?? await readCutoverSeal({ manifestPath: manifest, expectedSealId: sealId });
     const ledger = await openSealedSourceFromSeal(projectionSeal, "deletion-ledger");
     let projection;
@@ -94,11 +99,10 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
     }
     const bytes = exportBytes(goldenExportBody());
     await writePrivateFileOnce(join(directory, "own4-export.json"), bytes, 0o400);
+    // The C-INFRA probe's own shape (probeScheduler): one entry per managed trigger.
     await writePrivateFileOnce(join(directory, "scheduler-probe.json"), `${JSON.stringify({
-      schema: SCHEDULER_PROBE_SCHEMA, environment: "production", project: "tibotattle-synthetic",
-      checkedAt: "2026-10-02T00:30:00.000Z", thresholdHours: 25,
-      triggers: [{ job: "maintenance", liveState: "PAUSED", verdict: "paused_as_desired" },
-        { job: "analytics-refresh", liveState: "PAUSED", verdict: "paused_as_desired" }],
+      schema: SCHEDULER_PROBE_SCHEMA, environment: "production", project: DESIRED_PROJECT,
+      checkedAt: "2026-10-02T00:30:00.000Z", thresholdHours: 6, triggers: pausedTriggers(),
       alert: false, signal: null, ...scheduler })}\n`, 0o400);
     const value = {
       schema: PRODUCTION_TRANSFER_INPUTS_SCHEMA,
@@ -120,16 +124,82 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
     return directory;
   }
 
-  function context(target, directory, options = {}) {
-    return createTransferContext({ ownerDirectory: directory, pool: target.transferPrimary, now: CONTEXT_NOW, ...options });
+  function pausedTriggers() {
+    return SCHEDULED_TRIGGER_JOBS.map(job => ({ job, name: `tibotattle-${job}-trigger`, desiredState: "PAUSED",
+      liveState: "PAUSED", quietMinutes: null, verdict: "paused_as_desired", alert: false }));
   }
 
-  async function flipEvidence(directoryName) {
+  /** A synthetic production desired state: the committed file with its placeholders filled. */
+  async function desiredStateFile(overrides = {}) {
+    const committed = JSON.parse(await readFile(join(WORKER_ROOT, PRODUCTION_DESIRED_STATE_FILE), "utf8"));
+    const directory = await privateDirectory("ept8-desired-");
+    const path = join(directory, "production.desired-state.json");
+    await writePrivateFileOnce(path, `${JSON.stringify({ ...committed, project: DESIRED_PROJECT,
+      secrets: { ...committed.secrets, IDENTITY_LINK_SECRET: { ...IDENTITY_MOUNT } }, ...overrides })}\n`, 0o400);
+    return path;
+  }
+
+  function context(target, directory, options = {}) {
+    return createTransferContext({ ownerDirectory: directory, pool: target.transferPrimary, now: CONTEXT_NOW,
+      desiredStatePath: world.desiredStatePath, ...options });
+  }
+
+  async function flipEvidence(directoryName, { manifest = manifestPath, sealId = seal.manifest.sealId } = {}) {
     const out = await privateDirectory(`ept8-${directoryName}-`);
-    const result = await verifyCutoverUnchanged({ inventoryPath: world.inventory.path, manifestPath, sealId: seal.manifest.sealId,
+    const result = await verifyCutoverUnchanged({ inventoryPath: world.inventory.path, manifestPath: manifest, sealId,
       ownerDirectory: out, execute: true, remote: true, ownerReadOnly: true,
       transport: createFakeCutoverTransport({ sources: world.remotePaths, bookmarks: SYNTHETIC_BOOKMARKS }) });
     return { path: result.path, sha256: result.flipEvidenceSha256 };
+  }
+
+  /** A superuser statement with user triggers off (synthetic tampering only). */
+  async function tamper(target, sql, values = []) {
+    const client = await target.adminPrimary.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SET LOCAL session_replication_role = replica");
+      const result = await client.query(sql, values);
+      await client.query("COMMIT");
+      return result.rows;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /** Remove the loaded frozen read and return a restorer for the identical row. */
+  async function removeFrozenRead(target) {
+    const [row] = await tamper(target, `DELETE FROM ${table("community_daily_frozen_export")} WHERE id = 1
+      RETURNING payload_text, payload_sha256, captured_at::text AS captured_at, source_commit,
+        evidence_date::text AS evidence_date, loaded_at::text AS loaded_at`);
+    expect(row).toBeDefined();
+    return () => tamper(target, `INSERT INTO ${table("community_daily_frozen_export")}
+        (id, payload_text, payload_sha256, captured_at, source_commit, evidence_date, loaded_at)
+      VALUES (1, $1, $2, $3::timestamptz, $4, $5::date, $6::timestamptz)`,
+    [row.payload_text, row.payload_sha256, row.captured_at, row.source_commit, row.evidence_date, row.loaded_at]);
+  }
+
+  /**
+   * tibotattle_source_transfer is cluster-global: a member left behind (or
+   * added concurrently) by another suite makes PT-1's flip gate refuse,
+   * correctly. Fail loudly instead; run this spec alone on a clean cluster.
+   */
+  async function assertNoForeignTransferMembers() {
+    const { rows: members } = await admin.query(`SELECT count(*)::int AS n FROM pg_auth_members am
+      JOIN pg_roles role ON role.oid = am.roleid JOIN pg_roles member ON member.oid = am.member
+     WHERE role.rolname = $1 AND member.rolname <> $2`, [TRANSFER_ROLE, cluster.roles.transfer]);
+    if (members[0].n !== 0) {
+      throw new Error(`ENVIRONMENT: ${members[0].n} foreign member(s) of ${TRANSFER_ROLE} on this cluster; use a clean cluster`);
+    }
+  }
+
+  /** A run killed right after the named committed step. */
+  function killAfter(name) {
+    return { onStep: (fired) => {
+      if (fired === name) throw new Error("synthetic kill");
+    } };
   }
 
   async function runToVerified(target, directory, contextOptions = {}) {
@@ -174,12 +244,13 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
     const fenceDirectory = await privateDirectory("ept8-fence-");
     world.fence = await writeFenceReceiptFixture({ directory: fenceDirectory, appliedAtMs: FENCE_APPLIED_MS });
     world.proof = await writeBarrierProofFixture({ directory: fenceDirectory, observedAtMs: FENCE_APPLIED_MS + 20 * 60_000 });
+    world.desiredStatePath = await desiredStateFile();
     const run = await sealWorld(world, { overrides: { now: () => SEAL_NOW } });
     const sealed = await run.run();
     manifestPath = outputPathsOf(run.out).manifest;
     seal = await readCutoverSeal({ manifestPath, expectedSealId: sealed.sealId });
     cluster = await createW2SealCluster({ socket: PG_TEST_SOCKET, port: PG_TEST_PORT, user: PG_TEST_USER,
-      password: PG_TEST_PASSWORD, database: PG_TEST_DATABASE, count: 4, label: "ept8" });
+      password: PG_TEST_PASSWORD, database: PG_TEST_DATABASE, count: 5, label: "ept8" });
     const endpoint = await localSocket(PG_TEST_SOCKET, PG_TEST_PORT);
     admin = new pg.Client({ ...endpoint, user: PG_TEST_USER, password: PG_TEST_PASSWORD, database: PG_TEST_DATABASE, ssl: false });
     await admin.connect();
@@ -194,22 +265,28 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
     await world?.dispose();
   });
 
-  it("target-check passes on an empty registered target and reports content-free facts", async () => {
+  it("target-check passes on an empty registered target and refuses one without the frozen-read table", async () => {
     const target = cluster.targets[3];
     const report = await targetCheck({ pool: target.transferPrimary, contractId: target.contract.contractId });
     expect(report.verdict).toBe("GO");
     expect(report.target.triggerTables).toBeGreaterThan(50);
+    // The C-IPR table moved out of the application schema (a superuser session on the target database).
+    const moved = new pg.Client({ ...await localSocket(PG_TEST_SOCKET, PG_TEST_PORT), user: PG_TEST_USER,
+      password: PG_TEST_PASSWORD, database: target.databases.primary, ssl: false });
+    await moved.connect();
+    try {
+      await moved.query(`ALTER TABLE ${table("community_daily_frozen_export")} SET SCHEMA public`);
+      expect(await codeOf(targetCheck({ pool: target.transferPrimary, contractId: target.contract.contractId })))
+        .toBe("CUTOVER_TARGET_FROZEN_READ_TABLE_MISSING");
+    } finally {
+      await moved.query(`ALTER TABLE public.community_daily_frozen_export SET SCHEMA "${PRIMARY_SCHEMA}"`).catch(() => {});
+      await moved.end();
+    }
+    expect((await targetCheck({ pool: target.transferPrimary, contractId: target.contract.contractId })).verdict).toBe("GO");
   }, 120_000);
 
   it("drives a seal from preflight to live, resuming identically after a kill at every committed step", async () => {
-    // tibotattle_source_transfer is cluster-global: a member left behind by
-    // another suite makes PT-1's flip gate refuse, correctly. Fail loudly.
-    const { rows: members } = await admin.query(`SELECT count(*)::int AS n FROM pg_auth_members am
-      JOIN pg_roles role ON role.oid = am.roleid JOIN pg_roles member ON member.oid = am.member
-     WHERE role.rolname = $1 AND member.rolname <> $2`, [TRANSFER_ROLE, cluster.roles.transfer]);
-    if (members[0].n !== 0) {
-      throw new Error(`ENVIRONMENT: ${members[0].n} foreign member(s) of ${TRANSFER_ROLE} on this cluster; use a clean cluster`);
-    }
+    await assertNoForeignTransferMembers();
     const [target, clean] = cluster.targets;
     // A clean run on its own target: the reference.
     const cleanDirectory = await ownerDirectory(clean);
@@ -239,7 +316,7 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
     expect(killed).toEqual(expect.arrayContaining(["begin", "importing", ...STAGE_PLAN.filter(entry => entry.stage !== "post-import")
       .map(entry => `stage:${entry.stage}`), "post-import:started", "post-import:tl1", "post-import:operational-history",
       "post-import:invariants", "post-import:coverage", "post-import:parity", "post-import:interim-read",
-      "post-import:cleanup", "post-import", "verifying", "verified"]));
+      "post-import:cleanup", "post-import:receipt", "post-import", "verifying", "verified"]));
     // Identical to the clean run, receipt by receipt (post-import binds its own preflight).
     const resumed = await receipts(target);
     const reference = await receipts(clean);
@@ -366,9 +443,9 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
   it("refuses every preflight check, the authorization token and the locks before any target write", async () => {
     const target = cluster.targets[2];
     expect((await targetCheck({ pool: target.transferPrimary, contractId: target.contract.contractId })).verdict).toBe("GO");
-    const refuse = async (options, expected, label) => {
+    const refuse = async (options, expected, label, contextOptions = {}) => {
       const directory = await ownerDirectory(target, options);
-      expect(await codeOf(runPreflight(await context(target, directory))), label).toBe(expected);
+      expect(await codeOf(runPreflight(await context(target, directory, contextOptions))), label).toBe(expected);
       expect(await readdir(directory), label).not.toContain(OWNER_FILES.preflight);
     };
     const variant = async (sql, role = "ingestion") => {
@@ -394,9 +471,21 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
     await refuse(await variant(`${guards.map(guard => `DROP TRIGGER "${guard.name}";`).join("\n")}
       UPDATE telemetry_usage_correction_runtime SET state = 'active';
       ${guards.map(guard => `${guard.sql};`).join("\n")}`), "CUTOVER_CORRECTION_RUNTIME_ACTIVE", "P4");
-    // P5: an owner link marked erased (an erasure still in flight).
+    // P5: an owner link marked erased, a participant not active, a pending
+    // erasure job (P3's ledger rule meets it first, with the same code).
     await refuse(await variant(`UPDATE storage_v11_owner_links SET state = 'erased'
       WHERE participant_id = (SELECT min(participant_id) FROM storage_v11_owner_links)`), "CUTOVER_OWNER_LINK_ERASED", "P5");
+    const participantGuards = new DatabaseSync(seal.sources.ingestion.path, { readOnly: true });
+    const lifecycle = participantGuards.prepare(`SELECT name, sql FROM sqlite_schema WHERE type = 'trigger'
+      AND tbl_name = 'participants'`).all();
+    participantGuards.close();
+    await refuse(await variant(`${lifecycle.map(guard => `DROP TRIGGER "${guard.name}";`).join("\n")}
+      UPDATE participants SET state = 'deleting' WHERE id = (SELECT min(id) FROM participants);
+      ${lifecycle.map(guard => `${guard.sql};`).join("\n")}`), "CUTOVER_PARTICIPANT_ERASURE_PENDING", "P5 deleting");
+    await refuse(await variant(`INSERT INTO storage_erasure_jobs(participant_digest, source_id, owner_digest, source_namespace,
+        state) SELECT participant_digest, 'ept8-source', '${"e".repeat(64)}', 'ept8-namespace', 'pending'
+      FROM deletion_tombstones ORDER BY participant_digest LIMIT 1`, "deletion-ledger"),
+    "CUTOVER_PARTICIPANT_ERASURE_PENDING", "P5 pending job");
     // P6: a tombstone of a sealed participant (the projection read from the same variant ledger) ...
     const tombstoned = await variant(`INSERT INTO deletion_tombstones(participant_digest, schema_version, deleted_at, retain_until)
       VALUES ('${participantDeletionDigest(participantIds[0])}', 'participant-deletion-tombstone-v0.1',
@@ -410,6 +499,14 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
       "CUTOVER_PUBLIC_SOURCE_BOOTSTRAP_INCOMPLETE", "P7");
     await refuse({ pinSecret: "ept8-some-other-identity-link-secret-0000000" }, "CUTOVER_IDENTITY_LINK_SECRET_MISMATCH", "P8 pin");
     await refuse({ inputs: { expectedIdentityKeyVersion: "other-v1" } }, "CUTOVER_IDENTITY_LINK_VERSION_MISMATCH", "P8 version");
+    // P8 against the committed production desired state: the mount the service template uses.
+    const { secrets } = JSON.parse(await readFile(join(WORKER_ROOT, PRODUCTION_DESIRED_STATE_FILE), "utf8"));
+    const mounting = async version => ({ desiredStatePath: await desiredStateFile({
+      secrets: { ...secrets, IDENTITY_LINK_SECRET: { ...IDENTITY_MOUNT, version } } }) });
+    await refuse({}, "CUTOVER_IDENTITY_LINK_MOUNT_MISMATCH", "P8 another mounted version", await mounting("4"));
+    await refuse({}, "CUTOVER_IDENTITY_LINK_MOUNT_UNPINNED", "P8 unpinned mount", await mounting(null));
+    await refuse({}, "CUTOVER_DESIRED_STATE_INVALID", "desired-state placeholder",
+      { desiredStatePath: await desiredStateFile({ project: null }) });
     await refuse(await variant(`UPDATE collection_controls SET control_state = 'contained', enrollment_enabled = 0,
       upload_registration_enabled = 0, processing_enabled = 0, publication_enabled = 0`),
     "CUTOVER_CONTROLS_DEGRADE_IMPOSSIBLE", "P9");
@@ -424,10 +521,13 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
     } finally {
       await admin.query(`GRANT "${cluster.roles.owner}" TO "${cluster.roles.transfer}" WITH INHERIT FALSE`);
     }
-    // P11 scheduler, P12 the OWN-4 facts.
-    await refuse({ scheduler: { triggers: [{ job: "maintenance", liveState: "ENABLED", verdict: "running" }] } },
+    // P11 scheduler (the producer's shape; DB-free cases are in the check), P12 the OWN-4 facts.
+    await refuse({ scheduler: { triggers: pausedTriggers().map(trigger => ({ ...trigger, liveState: "ENABLED", verdict: "running" })) } },
       "CUTOVER_SCHEDULER_NOT_PAUSED", "P11 running");
     await refuse({ scheduler: { checkedAt: "2026-10-01T23:00:00.000Z" } }, "CUTOVER_SCHEDULER_NOT_PAUSED", "P11 before fence");
+    await refuse({ scheduler: { project: "tibotattle-another" } }, "CUTOVER_SCHEDULER_NOT_PAUSED", "P11 another project");
+    await refuse({ scheduler: { triggers: [...pausedTriggers(), { ...pausedTriggers()[0], job: "maintenance" }] } },
+      "CUTOVER_SCHEDULER_NOT_PAUSED", "P11 an unmanaged trigger");
     const own4 = async (overrides) => {
       const directory = await ownerDirectory(target);
       const inputs = JSON.parse(await readFile(join(directory, OWNER_FILES.inputs), "utf8"));
@@ -467,11 +567,31 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
       await holder.end();
     }
     expect(await targetRows(target)).toBe(0);
+    // run --execute proves P11 and P10 again before any write: a GO preflight
+    // does not outlive the scheduler evidence or the login's memberships.
+    const authorization = { execute: true, confirm: preflight.runAuthorizationToken };
+    expect(await codeOf(runImport(await context(target, directory, { now: () => new Date("2026-10-02T06:30:00.001Z") }),
+      authorization))).toBe("CUTOVER_SCHEDULER_NOT_PAUSED");
+    await admin.query(`GRANT "${cluster.roles.owner}" TO "${cluster.roles.transfer}" WITH INHERIT TRUE`);
+    try {
+      expect(await codeOf(runImport(await context(target, directory), authorization)))
+        .toBe("CUTOVER_TRANSFER_LOGIN_MEMBERSHIP_INVALID");
+    } finally {
+      await admin.query(`GRANT "${cluster.roles.owner}" TO "${cluster.roles.transfer}" WITH INHERIT FALSE`);
+    }
+    expect(await targetRows(target)).toBe(0);
 
     // Ordering inside a run: killed after PT-3, nothing past 'run' is admitted.
-    expect(await codeOf(runImport(await context(target, directory, { onStep: (name) => {
-      if (name === "stage:identity-authority") throw new Error("synthetic kill");
-    } }), { execute: true, confirm: preflight.runAuthorizationToken }))).toBe("synthetic kill");
+    expect(await codeOf(runImport(await context(target, directory, killAfter("stage:identity-authority")), authorization)))
+      .toBe("synthetic kill");
+    // A published day (only a refresh writes one) ends the frozen read: a resumed preflight refuses.
+    await tamper(target, `INSERT INTO ${table("analytics_v2_published_daily")}(day, revision, released_at, payload,
+        payload_sha256, run_id)
+      VALUES ('2026-10-01', 1, clock_timestamp(),
+        '{"day":"2026-10-01","revision":1,"aggregateId":"community-daily:2026-10-01:r1"}'::jsonb, repeat('0', 64),
+        '00000000-0000-4000-8000-000000000001')`);
+    await refuse({}, "CUTOVER_TARGET_FROZEN_READ_TABLE_MISSING", "P10 published day");
+    await tamper(target, `DELETE FROM ${table("analytics_v2_published_daily")} WHERE day = '2026-10-01'`);
     const early = await flipEvidence("before-verified");
     expect(await codeOf(releaseControls(await context(target, directory), { flipEvidencePath: early.path })))
       .toBe("CUTOVER_STEP_ORDER_VIOLATION");
@@ -479,16 +599,69 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
       .toBe("CUTOVER_STEP_ORDER_VIOLATION");
     expect(await codeOf(markLiveStep(await context(target, directory), { flipEvidenceSha256: early.sha256 })))
       .toBe("CUTOVER_STEP_ORDER_VIOLATION");
-    // A pending object that is not a sealed registration refuses post-import.
-    expect(await codeOf(runImport(await context(target, directory, { onStep: (name) => {
-      if (name === "stage:pending-registrations") throw new Error("synthetic kill");
-    } }), { execute: true, confirm: preflight.runAuthorizationToken }))).toBe("synthetic kill");
+    expect(await codeOf(runImport(await context(target, directory, killAfter("stage:pending-registrations")), authorization)))
+      .toBe("synthetic kill");
+    // owner-lifecycle-verify: a target owner revision that differs from the seal.
+    expect(await codeOf(runImport(await context(target, directory, killAfter("stage:ingestion-journal")), authorization)))
+      .toBe("synthetic kill");
+    const [revision] = await tamper(target, `UPDATE ${table("storage_owner_revisions")} SET authority_epoch = authority_epoch + 1
+      WHERE (source_id, owner_digest) = (SELECT source_id, owner_digest FROM ${table("storage_owner_revisions")}
+        ORDER BY owner_digest LIMIT 1) RETURNING source_id, owner_digest`);
+    expect(await codeOf(runImport(await context(target, directory), authorization))).toBe("CUTOVER_OWNER_REVISIONS_DIVERGED");
+    await tamper(target, `UPDATE ${table("storage_owner_revisions")} SET authority_epoch = authority_epoch - 1
+      WHERE source_id = $1 AND owner_digest = $2`, [revision.source_id, revision.owner_digest]);
+    // Post-import: a pending object that is not a sealed registration.
     await target.adminPrimary.query(`INSERT INTO ${table("pending_objects")}(contribution_id, object_key)
       VALUES ('ept8-tamper', 'telemetry/ept8-tamper')`);
-    expect(await codeOf(runImport(await context(target, directory), { execute: true, confirm: preflight.runAuthorizationToken })))
-      .toBe("CUTOVER_PENDING_OBJECT_CONFLICT");
+    expect(await codeOf(runImport(await context(target, directory), authorization))).toBe("CUTOVER_PENDING_OBJECT_CONFLICT");
     await target.adminPrimary.query(`DELETE FROM ${table("pending_objects")} WHERE contribution_id = 'ept8-tamper'`);
-    const finished = await runImport(await context(target, directory), { execute: true, confirm: preflight.runAuthorizationToken });
+    // Post-import, Variant B step 4: a target participant on the do-not-restore list (the fixture's erased participant).
+    const plant = id => tamper(target, `INSERT INTO ${table("participants")}(id, owner_kind, state, created_at)
+      VALUES ($1, 'social', 'active', clock_timestamp())`, [id]);
+    const unplant = id => tamper(target, `DELETE FROM ${table("participants")} WHERE id = $1`, [id]);
+    expect(participantIds).not.toContain(world.fixture.ids.erasedParticipant);
+    await plant(world.fixture.ids.erasedParticipant);
+    expect(await codeOf(runImport(await context(target, directory), authorization))).toBe("CUTOVER_ERASED_PARTICIPANT_PRESENT");
+    await unplant(world.fixture.ids.erasedParticipant);
+    // Post-import: public-source owners that differ from the sealed view (an extra eligible social participant).
+    await plant("participant:ept8-planted-social-owner");
+    expect(await codeOf(runImport(await context(target, directory), authorization))).toBe("CUTOVER_PUBLIC_SOURCE_OWNERS_DIVERGED");
+    await unplant("participant:ept8-planted-social-owner");
+    // Post-import: the parity sample over independent engine SQL (a chunk's record count edited on the target).
+    const [chunk] = await tamper(target, `UPDATE ${table("telemetry_v11_chunks")} SET record_count = record_count + 1
+      WHERE id = (SELECT id FROM ${table("telemetry_v11_chunks")} WHERE record_count < 200 ORDER BY id LIMIT 1) RETURNING id`);
+    expect(await codeOf(runImport(await context(target, directory), authorization))).toBe("CUTOVER_PARITY_SAMPLE_MISMATCH");
+    await tamper(target, `UPDATE ${table("telemetry_v11_chunks")} SET record_count = record_count - 1 WHERE id = $1`, [chunk.id]);
+    // Post-import: the bootstrap singleton and a runtime-reset table must be at their seed.
+    await tamper(target, `UPDATE ${table("community_public_source_bootstrap")} SET completed = 0`);
+    expect(await codeOf(runImport(await context(target, directory), authorization))).toBe("CUTOVER_BOOTSTRAP_TARGET_INVALID");
+    await tamper(target, `UPDATE ${table("community_public_source_bootstrap")} SET completed = 1`);
+    await tamper(target, `INSERT INTO ${table("community_model_composition_days")}(day, payload_json, computed_at)
+      VALUES ('2026-10-01', '{}', clock_timestamp())`);
+    expect(await codeOf(runImport(await context(target, directory), authorization))).toBe("CUTOVER_RUNTIME_RESET_NOT_AT_SEED");
+    await tamper(target, `DELETE FROM ${table("community_model_composition_days")} WHERE day = '2026-10-01'`);
+    // Coverage finalize: a table receipt with another token, one naming an unknown table, and one missing.
+    const receiptRow = "source_role = 'ingestion' AND source_table = 'participants'";
+    const receiptTable = "tibotattle_transfer.transfer_table_receipts";
+    await tamper(target, `UPDATE ${receiptTable} SET disposition = 'imported:legacy-contributions' WHERE ${receiptRow}`);
+    expect(await codeOf(runImport(await context(target, directory), authorization))).toBe("CUTOVER_COVERAGE_RECEIPT_MISMATCH");
+    await tamper(target, `UPDATE ${receiptTable} SET disposition = 'imported:identity-authority' WHERE ${receiptRow}`);
+    await tamper(target, `UPDATE ${receiptTable} SET source_table = 'zz_ept8_unknown' WHERE ${receiptRow}`);
+    expect(await codeOf(runImport(await context(target, directory), authorization))).toBe("CUTOVER_COVERAGE_RECEIPT_UNEXPECTED");
+    await tamper(target, `UPDATE ${receiptTable} SET source_table = 'participants'
+      WHERE source_role = 'ingestion' AND source_table = 'zz_ept8_unknown'`);
+    const [removed] = await tamper(target, `DELETE FROM ${receiptTable} receipt WHERE ${receiptRow} RETURNING to_jsonb(receipt) AS row`);
+    expect(await codeOf(runImport(await context(target, directory), authorization))).toBe("CUTOVER_COVERAGE_RECEIPT_MISSING");
+    await tamper(target, `INSERT INTO ${receiptTable} SELECT * FROM jsonb_populate_record(NULL::${receiptTable}, $1::jsonb)`,
+      [JSON.stringify(removed.row)]);
+    // A complete post-import stage needs its owner receipt: without it a rerun refuses, and with it resumes.
+    expect(await codeOf(runImport(await context(target, directory, killAfter("post-import")), authorization)))
+      .toBe("synthetic kill");
+    const receiptPath = join(directory, OWNER_FILES.postImport);
+    await rename(receiptPath, `${receiptPath}.moved`);
+    expect(await codeOf(runImport(await context(target, directory), authorization))).toBe("CUTOVER_RECEIPT_CONFLICT");
+    await rename(`${receiptPath}.moved`, receiptPath);
+    const finished = await runImport(await context(target, directory), authorization);
     expect(finished.runState).toBe("verified");
     // Flip evidence taken before 'verified' is stale; tampered evidence is invalid.
     expect(await codeOf(releaseControls(await context(target, directory), { flipEvidencePath: early.path })))
@@ -509,5 +682,52 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
       .toBe("abandoned");
     expect(await codeOf(runImport(await context(target, directory), { execute: true, confirm: preflight.runAuthorizationToken })))
       .toBe("CUTOVER_TARGET_NOT_EMPTY");
+  }, 900_000);
+
+  it("refuses each finalize condition: flip-2 before the release, a second flip-1, nonces and the frozen read", async () => {
+    const target = cluster.targets[4];
+    // A seal whose one Sparkle nonce expires an hour after CONTEXT_NOW.
+    const forged = await forgeVariantSeal(seal, `INSERT INTO sparkle_appcast_guard_nonces(nonce, expires_at)
+      VALUES ('ept8-synthetic-nonce', ${Date.parse("2026-10-02T03:00:00.000Z") / 1000})`);
+    const variantSeal = { manifest: forged.manifestPath, sealId: forged.sealId };
+    const directory = await ownerDirectory(target, variantSeal);
+    const { preflight } = await runToVerified(target, directory);
+    expect(preflight.checks.P14.unexpiredAtSeal).toBe(1);
+    const at = now => context(target, directory, { now: () => new Date(now) });
+    const later = "2026-10-02T04:00:00.000Z";
+
+    // F1, then a second verify-unchanged BEFORE the release, then F2 with the first.
+    const flip1 = await flipEvidence("final-flip1", variantSeal);
+    const between = await flipEvidence("final-between", variantSeal);
+    const dry = await releaseControls(await context(target, directory), { flipEvidencePath: flip1.path });
+    const released = await releaseControls(await context(target, directory), { flipEvidencePath: flip1.path, execute: true,
+      confirm: dry.authorizationToken });
+    const receipt = JSON.parse(await readFile(join(directory, OWNER_FILES.release), "utf8"));
+    expect(receipt.releasedAt).toBe(released.releasedAt);
+    expect(Date.parse(receipt.releasedAt)).toBeGreaterThan(Date.parse(JSON.parse(await readFile(between.path, "utf8")).verifiedAt));
+    // A rerun keeps the first release instant; another flip-1 for the same release conflicts before any write.
+    expect((await releaseControls(await context(target, directory), { flipEvidencePath: flip1.path, execute: true,
+      confirm: dry.authorizationToken })).releaseSha256).toBe(released.releaseSha256);
+    expect(await codeOf(releaseControls(await context(target, directory), { flipEvidencePath: between.path })))
+      .toBe("CUTOVER_RECEIPT_CONFLICT");
+    // F4: evidence taken after E1 but before the release is not flip-2.
+    expect(await codeOf(flipGate(await at(later), { flipEvidencePath: between.path }))).toBe("CUTOVER_FLIP_EVIDENCE_STALE");
+    const flip2 = await flipEvidence("final-flip2", variantSeal);
+    await assertNoForeignTransferMembers();
+    // F4: a sealed Sparkle nonce still unexpired at the gate.
+    expect(await codeOf(flipGate(await context(target, directory), { flipEvidencePath: flip2.path })))
+      .toBe("CUTOVER_SPARKLE_NONCES_UNEXPIRED");
+    // F4: the frozen read is gone.
+    let restore = await removeFrozenRead(target);
+    expect(await codeOf(flipGate(await at(later), { flipEvidencePath: flip2.path }))).toBe("CUTOVER_INTERIM_READ_NOT_LOADED");
+    await restore();
+    const gate = await flipGate(await at(later), { flipEvidencePath: flip2.path });
+    expect(gate.ready).toBe(true);
+    // F5 re-proves the frozen read immediately before live.
+    const authorization = { flipEvidenceSha256: flip2.sha256, execute: true, confirm: gate.markLiveAuthorizationToken };
+    restore = await removeFrozenRead(target);
+    expect(await codeOf(markLiveStep(await context(target, directory), authorization))).toBe("CUTOVER_INTERIM_READ_NOT_LOADED");
+    await restore();
+    expect((await markLiveStep(await context(target, directory), authorization)).state).toBe("live");
   }, 900_000);
 });

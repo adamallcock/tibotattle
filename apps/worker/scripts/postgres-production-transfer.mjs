@@ -17,18 +17,23 @@
 //                     trigger-policy coverage, the frozen-read table.
 //   preflight         Read-only: P1-P14 (seal, fence binding, coverage,
 //                     correction runtime, erasure quiescence, the deletion-
-//                     digest exclusion count, bootstrap, identity pin,
-//                     controls, target, scheduler pause, the OWN-4 export, the
-//                     pending-object guard, Sparkle nonces). GO writes
-//                     preflight.json (0400); NO-GO writes nothing.
-//   run               PROTECTED. R1 open/begin, R2 every stage of the plan
-//                     (runners, PT-8's own stages, waivers), R3 post-import,
-//                     R4 'verifying' then 'verified'.
+//                     digest exclusion count, bootstrap, identity pin bound
+//                     to the sealed row and to the committed production
+//                     desired state's mount, controls, target, scheduler
+//                     pause, the OWN-4 export, the pending-object guard,
+//                     Sparkle nonces). GO writes preflight.json (0400);
+//                     NO-GO writes nothing.
+//   run               PROTECTED. Re-proves P10's memberships and P11's
+//                     scheduler pause, then R1 open/begin, R2 every stage of
+//                     the plan (runners, PT-8's own stages, waivers), R3
+//                     post-import, R4 'verifying' then 'verified'.
 //   release-controls  PROTECTED. Validates flip-1 evidence (PT-2
 //                     verify-unchanged, taken after 'verified'), then
-//                     restoreSealedCollectionControls. Writes
+//                     restoreSealedCollectionControls, then reads the
+//                     database clock once (the release instant). Writes
 //                     release-controls.json (0400).
-//   flip-gate         Read-only: flip-2 evidence taken after the release,
+//   flip-gate         Read-only: flip-2 evidence taken after the recorded
+//                     release instant,
 //                     the staging-drop readback, the frozen read loaded,
 //                     assertFlipReady, zero unexpired sealed Sparkle nonces.
 //                     Writes flip-gate.json (0400).
@@ -70,9 +75,9 @@
 // No row value, id, secret or URL is ever printed or written.
 
 import { createHash } from "node:crypto";
-import { appendFile, lstat, realpath, stat } from "node:fs/promises";
+import { appendFile, lstat, readFile, realpath, stat } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   CUTOVER_SOURCE_ROLES,
   CutoverSourceError,
@@ -104,6 +109,7 @@ import {
 } from "./postgres-identity-authority-transfer.mjs";
 import {
   IDENTITY_LINK_PIN_SCHEMA,
+  assertPinMatchesMount,
   assertPinMatchesSealed,
   buildIdentityLinkPin,
   readSecretFromStream,
@@ -180,6 +186,23 @@ const INTERIM_PUBLIC_READ_TABLE = "community_daily_frozen_export";
  * check pins the two literals equal).
  */
 export const SCHEDULER_PROBE_SCHEMA = "tibotattle-gcp-ops-infra-scheduler-probe-v1";
+/**
+ * The managed scheduler triggers, one probe entry each: C-INFRA's
+ * SCHEDULED_JOB_NAMES (gcp-ops-infra-manifest.mjs, whose imports pull the
+ * Cloud SQL connector; the check pins the literal equal). P11 requires the
+ * probe to report exactly this set.
+ */
+export const SCHEDULED_TRIGGER_JOBS = Object.freeze(["analytics-refresh"]);
+/**
+ * The committed production desired state, relative to apps/worker (C-INFRA's
+ * COMMITTED_DESIRED_STATE_FILES.production), and its schema literal
+ * (GCP_OPS_INFRA_DESIRED_STATE_SCHEMA); the check pins both. P8 binds the pin
+ * to its IDENTITY_LINK_SECRET mount and P11 binds the probe to its project.
+ */
+export const PRODUCTION_DESIRED_STATE_FILE = "cloud-run/infra/production.desired-state.json";
+export const DESIRED_STATE_SCHEMA = "tibotattle-gcp-ops-infra-desired-state-v2";
+const WORKER_ROOT = fileURLToPath(new URL("..", import.meta.url));
+const GCP_PROJECT = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/u;
 const PUBLISHED_DAILY_TABLE = "analytics_v2_published_daily";
 
 /** The owner-directory files. */
@@ -208,6 +231,7 @@ export const PRODUCTION_TRANSFER_ERROR_CODES = Object.freeze([
   "CUTOVER_BOOTSTRAP_TARGET_INVALID",
   "CUTOVER_CONNECTION_INVALID",
   "CUTOVER_CORRECTION_RUNTIME_ACTIVE",
+  "CUTOVER_DESIRED_STATE_INVALID",
   "CUTOVER_COVERAGE_RECEIPT_MISMATCH",
   "CUTOVER_COVERAGE_RECEIPT_MISSING",
   "CUTOVER_COVERAGE_RECEIPT_UNEXPECTED",
@@ -473,12 +497,16 @@ async function journal(context, step, event, details = {}) {
 /**
  * The context every subcommand shares: the validated owner directory and
  * inputs, the target pool (an injected pg.Pool connected as the transfer IAM
- * login), a clock and the test hooks.
+ * login), a clock, the committed production desired state and the test
+ * hooks. The CLI always uses the committed desired-state file; only the
+ * library API (the synthetic spec) passes another path.
  */
 export async function createTransferContext({ ownerDirectory, pool, now = () => new Date(), onStep = null,
-  runnerOptions = {}, forbiddenRoots = undefined, rootDirectory = undefined } = {}) {
+  runnerOptions = {}, forbiddenRoots = undefined, rootDirectory = undefined,
+  desiredStatePath = join(WORKER_ROOT, PRODUCTION_DESIRED_STATE_FILE) } = {}) {
   const directory = await assertOwnerDirectory(ownerDirectory, forbiddenRoots === undefined ? {} : { forbiddenRoots });
   if (onStep !== null && typeof onStep !== "function") fail("CUTOVER_ARGUMENT_INVALID");
+  absolutePath(desiredStatePath, "CUTOVER_ARGUMENT_INVALID");
   if (!record(runnerOptions) || Object.keys(runnerOptions).some(key => !["pageRows", "pageBytes", "onPage"].includes(key))) {
     fail("CUTOVER_ARGUMENT_INVALID");
   }
@@ -493,6 +521,7 @@ export async function createTransferContext({ ownerDirectory, pool, now = () => 
     onStep,
     runnerOptions: Object.freeze({ ...runnerOptions }),
     rootDirectory,
+    desiredStatePath,
     path: name => join(directory, OWNER_FILES[name]),
   });
 }
@@ -720,18 +749,60 @@ function controlsCheck(database) {
   return Object.freeze({ degradable: true });
 }
 
-async function schedulerCheck(context, seal) {
-  const { value, sha256 } = await readOwnerJson(context.inputs.schedulerEvidencePath, "CUTOVER_SCHEDULER_NOT_PAUSED");
-  const checkedMs = Date.parse(value?.checkedAt ?? "");
-  const appliedMs = Date.parse(seal.manifest.fence?.window?.appliedAt ?? "");
+/**
+ * The committed production desired state, read as data (not through C-INFRA's
+ * validator module, whose imports need the Cloud SQL connector): the project
+ * the scheduler probe must name (P11) and the IDENTITY_LINK_SECRET mount the
+ * identity pin must name (P8). An unfilled project placeholder refuses here; an
+ * unpinned mount version refuses at P8 (CUTOVER_IDENTITY_LINK_MOUNT_UNPINNED).
+ */
+export async function readProductionDeployment(path) {
+  let value;
+  try {
+    const metadata = await lstat(path);
+    if (!metadata.isFile() || metadata.size > MAX_JSON_BYTES) throw new Error("not a desired-state file");
+    value = JSON.parse(await readFile(path, "utf8"));
+  } catch {
+    fail("CUTOVER_DESIRED_STATE_INVALID", { check: "desired-state" });
+  }
+  const mount = value?.secrets?.IDENTITY_LINK_SECRET;
+  if (!record(value) || value.schemaVersion !== DESIRED_STATE_SCHEMA || value.environment !== "production"
+      || typeof value.project !== "string" || !GCP_PROJECT.test(value.project)
+      || !record(mount) || Object.keys(mount).sort().join(",") !== "secretName,version") {
+    fail("CUTOVER_DESIRED_STATE_INVALID", { check: "desired-state" });
+  }
+  return Object.freeze({ project: value.project,
+    identityLinkMount: Object.freeze({ secretName: mount.secretName, version: mount.version }) });
+}
+
+/**
+ * P11 over a parsed C-INFRA scheduler probe receipt (probeScheduler in
+ * gcp-ops-infra-operations.mjs): the production environment and project, no
+ * alert, exactly one entry per managed trigger (SCHEDULED_TRIGGER_JOBS), every
+ * one live PAUSED, and a strict checkedAt no earlier than the fence apply
+ * instant, not in the future and at most 6 h old at `nowMs`.
+ */
+export function validateSchedulerEvidence(value, { project, appliedMs, nowMs }) {
+  const checkedMs = instantMs(value?.checkedAt);
+  const triggers = Array.isArray(value?.triggers) ? value.triggers : null;
+  const jobs = triggers === null ? [] : triggers.map(trigger => (record(trigger) ? trigger.job : null));
   if (!record(value) || value.schema !== SCHEDULER_PROBE_SCHEMA || value.environment !== "production"
-      || !Array.isArray(value.triggers) || value.triggers.length === 0
-      || value.triggers.some(trigger => !record(trigger) || trigger.liveState !== "PAUSED")
-      || !Number.isFinite(checkedMs) || !Number.isFinite(appliedMs) || checkedMs < appliedMs
-      || checkedMs > context.now().getTime() || context.now().getTime() - checkedMs > SCHEDULER_EVIDENCE_MAXIMUM_AGE_MILLISECONDS) {
+      || typeof project !== "string" || value.project !== project || value.alert !== false
+      || triggers === null || triggers.length !== SCHEDULED_TRIGGER_JOBS.length
+      || [...jobs].sort().join("\n") !== [...SCHEDULED_TRIGGER_JOBS].sort().join("\n")
+      || triggers.some(trigger => !record(trigger) || trigger.liveState !== "PAUSED")
+      || checkedMs === null || !Number.isFinite(appliedMs) || !Number.isFinite(nowMs) || checkedMs < appliedMs
+      || checkedMs > nowMs || nowMs - checkedMs > SCHEDULER_EVIDENCE_MAXIMUM_AGE_MILLISECONDS) {
     fail("CUTOVER_SCHEDULER_NOT_PAUSED", { check: "P11" });
   }
-  return Object.freeze({ evidenceSha256: sha256, triggersPaused: value.triggers.length });
+  return triggers.length;
+}
+
+async function schedulerCheck(context, seal, deployment) {
+  const { value, sha256 } = await readOwnerJson(context.inputs.schedulerEvidencePath, "CUTOVER_SCHEDULER_NOT_PAUSED");
+  const triggersPaused = validateSchedulerEvidence(value, { project: deployment.project,
+    appliedMs: Date.parse(seal.manifest.fence?.window?.appliedAt ?? ""), nowMs: context.now().getTime() });
+  return Object.freeze({ evidenceSha256: sha256, triggersPaused });
 }
 
 function utcDay(ms) {
@@ -771,30 +842,38 @@ async function targetFacts(handle, { requireEmptyFrozenRead = true } = {}) {
       [`${quote(handle.primarySchema)}.${INTERIM_PUBLIC_READ_TABLE}`, `${quote(handle.primarySchema)}.${PUBLISHED_DAILY_TABLE}`]);
     if (tables[0]?.frozen !== true || tables[0]?.published !== true) fail("CUTOVER_TARGET_FROZEN_READ_TABLE_MISSING");
     if (requireEmptyFrozenRead) {
+      // A published day ends the frozen read; only a refresh writes one.
       const { rows } = await client.query(`SELECT (SELECT count(*) FROM ${quote(handle.primarySchema)}.${PUBLISHED_DAILY_TABLE})::int AS published`);
       if (rows[0].published !== 0) fail("CUTOVER_TARGET_FROZEN_READ_TABLE_MISSING");
     }
-    // The production contract: the transfer login reaches the schema owner
-    // and tibotattle_source_transfer by SET only, never by inheritance.
-    const { rows: memberships } = await client.query(`SELECT role.rolname::text AS role, am.set_option, am.inherit_option
-        FROM pg_catalog.pg_auth_members am
-        JOIN pg_catalog.pg_roles role ON role.oid = am.roleid
-        JOIN pg_catalog.pg_roles member ON member.oid = am.member
-       WHERE member.rolname = $1 AND role.rolname = ANY($2::text[])`,
-    [handle.iamDatabaseUser, [handle.schemaOwnerRole, "tibotattle_source_transfer"]]);
-    for (const role of [handle.schemaOwnerRole, "tibotattle_source_transfer"]) {
-      const grants = memberships.filter(row => row.role === role);
-      if (grants.length === 0 || grants.some(row => row.set_option !== true || row.inherit_option !== false)) {
-        fail("CUTOVER_TRANSFER_LOGIN_MEMBERSHIP_INVALID", { check: "P10" });
-      }
-    }
-    const { rows: privileges } = await client.query(`SELECT count(*)::int AS n FROM pg_catalog.pg_namespace n
-        CROSS JOIN LATERAL aclexplode(COALESCE(n.nspacl, acldefault('n', n.nspowner))) acl
-        JOIN pg_catalog.pg_roles grantee ON grantee.oid = acl.grantee
-       WHERE n.nspname = $1 AND grantee.oid <> n.nspowner`, [TRANSFER_CONTROL_SCHEMA]);
-    if (privileges[0].n !== 0) fail("CUTOVER_TRANSFER_LOGIN_MEMBERSHIP_INVALID", { check: "P10" });
+    await transferLoginCheck(client, handle);
     return Object.freeze({ triggerTables: coverage.tables, triggers: coverage.triggers, suppressed: coverage.suppressed });
   }, { readOnly: true });
+}
+
+/**
+ * P10's identity half: the transfer login reaches the schema owner and
+ * tibotattle_source_transfer by SET only, never by inheritance, and no role
+ * but the owner holds a privilege on the transfer control schema.
+ */
+async function transferLoginCheck(client, handle) {
+  const { rows: memberships } = await client.query(`SELECT role.rolname::text AS role, am.set_option, am.inherit_option
+      FROM pg_catalog.pg_auth_members am
+      JOIN pg_catalog.pg_roles role ON role.oid = am.roleid
+      JOIN pg_catalog.pg_roles member ON member.oid = am.member
+     WHERE member.rolname = $1 AND role.rolname = ANY($2::text[])`,
+  [handle.iamDatabaseUser, [handle.schemaOwnerRole, "tibotattle_source_transfer"]]);
+  for (const role of [handle.schemaOwnerRole, "tibotattle_source_transfer"]) {
+    const grants = memberships.filter(row => row.role === role);
+    if (grants.length === 0 || grants.some(row => row.set_option !== true || row.inherit_option !== false)) {
+      fail("CUTOVER_TRANSFER_LOGIN_MEMBERSHIP_INVALID", { check: "P10" });
+    }
+  }
+  const { rows: privileges } = await client.query(`SELECT count(*)::int AS n FROM pg_catalog.pg_namespace n
+      CROSS JOIN LATERAL aclexplode(COALESCE(n.nspacl, acldefault('n', n.nspowner))) acl
+      JOIN pg_catalog.pg_roles grantee ON grantee.oid = acl.grantee
+     WHERE n.nspname = $1 AND grantee.oid <> n.nspowner`, [TRANSFER_CONTROL_SCHEMA]);
+  if (privileges[0].n !== 0) fail("CUTOVER_TRANSFER_LOGIN_MEMBERSHIP_INVALID", { check: "P10" });
 }
 
 /** Read-only, before the fence: the target accepts a fresh import (no seal needed). */
@@ -848,19 +927,23 @@ export async function runPreflight(context) {
     checks.P5 = erasureQuiescenceCheck(ingestion, ledger);
     // P6 the deletion-digest exclusion count.
     checks.P6 = (await deletionDigestCheck(context, sealed)).report;
-    // P7 bootstrap, P8 identity pin, P9 controls.
+    // P7 bootstrap, P8 identity pin (the sealed row, then the mount the
+    // committed production desired state names), P9 controls.
     checks.P7 = bootstrapCheck(ingestion);
     const { pin, sha256: pinSha256 } = await readPin(context);
     const pinned = assertPinMatchesSealed(pin, sealedRows(ingestion,
       "SELECT key_version, secret_fingerprint FROM identity_link_secret_configuration"),
     { expectedKeyVersion: context.inputs.expectedIdentityKeyVersion });
-    checks.P8 = Object.freeze({ pinSha256, keyVersion: pinned.keyVersion, secretVersion: pin.secretVersion });
+    const deployment = await readProductionDeployment(context.desiredStatePath);
+    const mounted = assertPinMatchesMount(pin, deployment.identityLinkMount);
+    checks.P8 = Object.freeze({ pinSha256, keyVersion: pinned.keyVersion, secretVersion: mounted.secretVersion,
+      mountBound: true });
     checks.P9 = controlsCheck(ingestion);
     // P10 target (open refuses a non-empty target unless this seal resumes).
     const handle = await openHandle(context);
     checks.P10 = Object.freeze({ contractId: handle.contractId, mode: handle.mode, ...await targetFacts(handle) });
     // P11 scheduler, P12 the OWN-4 export, P13 the pending-object guard, P14 nonces.
-    checks.P11 = await schedulerCheck(context, seal);
+    checks.P11 = await schedulerCheck(context, seal, deployment);
     checks.P12 = (await interimReadCheck(context, seal)).receipt;
     const guard = await checkPendingObjectTransferGuard(handle, { ownerFlags: context.inputs.ownerFlags
       .filter(flag => flag === OWNER_FLAG_ACCEPT_ORPHAN_REGISTRATION_CLEARING) });
@@ -1178,13 +1261,50 @@ async function runPostImport(context, handle, sealed, preflightSha256) {
     cleanup,
   };
   const receiptSha256 = HASH(canonicalJson(body));
+  // The owner receipt is written BEFORE the stage commits: a crash between
+  // the two reruns post-import, which recomputes the same body and finds the
+  // file equal. Written after, a crash would leave a complete stage with no
+  // post-import.json, and `report` would refuse for good.
+  const postImportSha256 = await writeReceiptOnce(context.path("postImport"), { ...body, receiptSha256 });
+  await step(context, "post-import:receipt", { postImportSha256 });
   await withTransferTransaction(handle, "primary", async client => {
     await requireImportingRun(client, handle);
     await stageReceipt(client, handle, { stage, state: "complete", rowCount: coverage.tables, byteCount: 0, receiptSha256 });
   });
-  const postImportSha256 = await writeReceiptOnce(context.path("postImport"), { ...body, receiptSha256 });
   await step(context, "post-import", { postImportSha256 });
   return Object.freeze({ receiptSha256, postImportSha256, interimRead: frozen.state, parity: parity.mismatches });
+}
+
+/**
+ * A complete post-import stage is skipped on a rerun; its owner receipt must
+ * then exist and carry the receipt digest the stage committed.
+ */
+async function assertPostImportReceiptBound(context, handle) {
+  const committed = await withTransferTransaction(handle, "primary", async client => {
+    const { rows } = await client.query(`SELECT receipt.receipt_sha256 FROM ${TRANSFER_CONTROL_SCHEMA}.transfer_stage_receipts receipt
+        JOIN ${TRANSFER_CONTROL_SCHEMA}.transfer_runs run ON run.run_id = receipt.run_id
+       WHERE run.seal_manifest_sha256 = $1 AND run.contract_id = $2 AND run.state <> 'abandoned'
+         AND receipt.stage = 'post-import' AND receipt.state = 'complete'`, [handle.sealManifestSha256, handle.contractId]);
+    return rows.length === 1 ? rows[0].receipt_sha256 : null;
+  }, { readOnly: true });
+  if (!await fileExists(context.path("postImport"))) fail("CUTOVER_RECEIPT_CONFLICT", { step: "post-import" });
+  const { value } = await readOwnerJson(context.path("postImport"), "CUTOVER_RECEIPT_CONFLICT");
+  if (committed === null || !record(value) || value.receiptSha256 !== committed || value.sealId !== context.inputs.sealId) {
+    fail("CUTOVER_RECEIPT_CONFLICT", { step: "post-import" });
+  }
+}
+
+/**
+ * At import start, the preflight facts that can go stale are proven again:
+ * preflight.json carries no clock, so a GO taken hours earlier must not
+ * authorize an import after a trigger resumed or a membership changed.
+ * P11 (the scheduler probe at the inputs' path, under 6 h old now) and P10's
+ * transfer-login memberships, with preflight's codes.
+ */
+async function recheckImportPreconditions(context, handle, seal) {
+  const deployment = await readProductionDeployment(context.desiredStatePath);
+  await schedulerCheck(context, seal, deployment);
+  await withTransferTransaction(handle, "primary", client => transferLoginCheck(client, handle), { readOnly: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -1203,6 +1323,7 @@ export async function runImport(context, { execute = false, confirm = undefined 
   return withOrchestratorLocks(context, preview.primarySchema, () => withSeal(context, async (sealed) => {
     let handle = await openHandle(context);
     assertStepOrder("run", { runState: handle.openedRunState, preflight: true });
+    if (handle.openedRunState !== "verified") await recheckImportPreconditions(context, handle, sealed.seal);
     if (!handle.resumed) {
       await beginRun(handle, { sealedAt: sealed.seal.manifest.createdAt });
       await step(context, "begin");
@@ -1226,6 +1347,7 @@ export async function runImport(context, { execute = false, confirm = undefined 
         complete = await completeStages(handle);
       }
       if (!complete.has("post-import")) await runPostImport(context, handle, sealed, preflightSha256);
+      else await assertPostImportReceiptBound(context, handle);
       await advanceRun(handle, "verifying");
       state = "verifying";
       await step(context, "verifying");
@@ -1287,11 +1409,29 @@ async function finalizeFacts(context) {
   };
 }
 
+/**
+ * The release instant: the database clock read in its own transaction after
+ * the restore committed, rounded UP to the millisecond, so any evidence whose
+ * verifiedAt is later was taken after the sealed controls were released.
+ */
+async function databaseInstantAfterCommit(handle) {
+  return withTransferTransaction(handle, "primary", async client => {
+    const { rows } = await client.query(`SELECT to_char(date_trunc('milliseconds', clock_timestamp() + interval '999 microseconds')
+      AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS at`);
+    if (instantMs(rows[0]?.at) === null) fail("CUTOVER_STEP_ORDER_VIOLATION", { step: "release-controls" });
+    return rows[0].at;
+  }, { readOnly: true });
+}
+
 export async function releaseControls(context, { flipEvidencePath, execute = false, confirm = undefined } = {}) {
   const seal = await readCutoverSeal({ manifestPath: context.inputs.sealManifestPath, expectedSealId: context.inputs.sealId });
   const { handle, run, released, flipGate } = await finalizeFacts(context);
   assertStepOrder("release-controls", { runState: run?.state ?? null, released, flipGate });
   const evidence = await validateFlipEvidence(flipEvidencePath, seal, { afterMs: Date.parse(run.verifiedAt) });
+  // A rerun must name the same flip-1 evidence; it then restores the same
+  // values again and keeps the first release instant, so the receipt is equal.
+  const prior = released ? (await readRelease(context, run)).release : null;
+  if (prior !== null && prior.flipEvidenceSha256 !== evidence.sha256) fail("CUTOVER_RECEIPT_CONFLICT", { step: "release-controls" });
   const token = authorizationToken("release-controls", { sealId: context.inputs.sealId, contractId: context.inputs.contractId,
     inputsSha256: context.inputsSha256, runId: run.runId, flipEvidenceSha256: evidence.sha256 });
   if (!authorize("release-controls", token, { execute, confirm })) {
@@ -1299,18 +1439,22 @@ export async function releaseControls(context, { flipEvidencePath, execute = fal
   }
   return withOrchestratorLocks(context, handle.primarySchema, async () => {
     const restored = await withTransferTransaction(handle, "primary", client => restoreSealedCollectionControls(client, handle));
+    const releasedAt = prior?.releasedAt ?? await databaseInstantAfterCommit(handle);
     const body = { schema: `${PRODUCTION_TRANSFER_SCHEMA}-release-controls`, sealId: context.inputs.sealId, runId: run.runId,
-      flipEvidenceSha256: evidence.sha256, flipEvidenceVerifiedAt: evidence.verifiedAt,
+      flipEvidenceSha256: evidence.sha256, flipEvidenceVerifiedAt: evidence.verifiedAt, releasedAt,
       sealedRowSha256: restored.sealedRowSha256, revision: restored.revision };
     const releaseSha256 = await writeReceiptOnce(context.path("release"), body);
     await step(context, "release-controls", { releaseSha256 });
-    return Object.freeze({ mode: "executed", step: "release-controls", releaseSha256, sealedRowSha256: restored.sealedRowSha256 });
+    return Object.freeze({ mode: "executed", step: "release-controls", releaseSha256, sealedRowSha256: restored.sealedRowSha256,
+      releasedAt });
   });
 }
 
 async function readRelease(context, run) {
   const { value, sha256 } = await readOwnerJson(context.path("release"), "CUTOVER_STEP_ORDER_VIOLATION");
-  if (!record(value) || value.sealId !== context.inputs.sealId || value.runId !== run.runId) {
+  if (!record(value) || value.sealId !== context.inputs.sealId || value.runId !== run.runId
+      || instantMs(value.releasedAt) === null || instantMs(value.flipEvidenceVerifiedAt) === null
+      || typeof value.flipEvidenceSha256 !== "string" || !SHA256.test(value.flipEvidenceSha256)) {
     fail("CUTOVER_STEP_ORDER_VIOLATION", { step: "release-controls" });
   }
   return { release: value, releaseSha256: sha256 };
@@ -1319,9 +1463,10 @@ async function readRelease(context, run) {
 async function flipGateBody(context, handle, run, flipEvidencePath) {
   const seal = await readCutoverSeal({ manifestPath: context.inputs.sealManifestPath, expectedSealId: context.inputs.sealId });
   const { release, releaseSha256 } = await readRelease(context, run);
-  // E2 must be fresh evidence taken after the release (F2), never E1 again.
+  // E2 must be fresh evidence taken after the release (F2): later than the
+  // recorded release instant (and so than E1), and never E1 again.
   const evidence = await validateFlipEvidence(flipEvidencePath, seal,
-    { afterMs: Date.parse(release.flipEvidenceVerifiedAt) });
+    { afterMs: Math.max(instantMs(release.releasedAt), instantMs(release.flipEvidenceVerifiedAt)) });
   if (evidence.sha256 === release.flipEvidenceSha256) fail("CUTOVER_FLIP_EVIDENCE_STALE");
   const facts = await withTransferTransaction(handle, "primary", async client => {
     // The staging-drop readback: PT-1's dropped-relation receipts cover the
