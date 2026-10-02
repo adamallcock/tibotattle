@@ -6,7 +6,8 @@
 //     -> scripts/edge-e2e/google-front-end.mjs (token issuer and Cloud Run IAM)
 //     -> cloud-run/dist/server.mjs in fastpath-test mode behind EP-6
 //        (EDGE_ORIGIN_MODE=edge-test) on 127.0.0.1
-//     -> PostgreSQL 17 (a fresh tibotattle_fastpath_l_loadtest_* schema pair, dropped after)
+//     -> PostgreSQL 17 (a fresh tibotattle_fastpath_l_loadtest_* schema, dropped after; no deletion
+//        ledger: D4, SIMP-4)
 //
 // Run 1, at a low rate with per-device client addresses and generous edge
 // limits, drives enrollment, v1.2 authorization, day manifests, uploads and
@@ -81,7 +82,8 @@ const RUNTIME_ENVIRONMENT_NAMES = Object.freeze([
   "K_SERVICE", "PRIMARY_DATABASE", "PRIMARY_SCHEMA", "PRIMARY_INSTANCE_CONNECTION_NAME",
   "LEDGER_DATABASE", "LEDGER_SCHEMA", "LEDGER_INSTANCE_CONNECTION_NAME", "POSTGRES_IAM_USER",
   "POSTGRES_SOURCE_ID", "POSTGRES_SOURCE_NAMESPACE", "POSTGRES_RATE_LIMIT_SECRET",
-  "ENVELOPE_PUBLIC_JWK", "ENVELOPE_PRIVATE_JWK", "GCS_BUCKET_NAME", "GCS_ERASURE_BUCKET_HISTORY_PROOF",
+  "ENVELOPE_PUBLIC_JWK", "ENVELOPE_PRIVATE_JWK", "GCS_BUCKET_NAME", "GCS_QUARANTINE_BUCKET_HISTORY_PROOF",
+  "GCS_ERASURE_BUCKET_HISTORY_PROOF",
   "ENVIRONMENT", "ENROLLMENT_MODE", "IDENTITY_LINK_SECRET", "IDENTITY_LINK_SECRET_VERSION",
   "GOOGLE_OIDC_CLIENT_ID", "GOOGLE_OIDC_CLIENT_SECRET", "SIGN_IN_START_MAX_PER_MINUTE",
   "ACCOUNTLESS_ENROLLMENT_MODE", "ACCOUNTLESS_OWNERSHIP_MODE", "SOURCE_CONTENT_DIGEST",
@@ -161,10 +163,9 @@ async function freePort() {
   });
 }
 
-/** A migrated rehearsal schema pair with the state E12's seedSchema gives. */
-async function seedSchema(base, codec, schema, ledgerSchema) {
+/** A migrated rehearsal schema with the state E12's seedSchema gives (no deletion ledger: D4, SIMP-4). */
+async function seedSchema(base, codec, schema) {
   await applyPostgresMigrations({ role: "primary", schema, pool: base });
-  await applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool: base });
   const t = (name) => `"${schema}"."${name}"`;
   const now = new Date().toISOString();
   await base.query(`UPDATE ${t("collection_controls")}
@@ -190,7 +191,7 @@ async function seedSchema(base, codec, schema, ledgerSchema) {
 let serverModule = null;
 
 /** One origin revision: cloud-run/dist/server.mjs as E12's startOrigin composes it, behind EP-6. */
-async function startOrigin({ socket, schema, ledgerSchema, keys, rateLimitSecret }) {
+async function startOrigin({ socket, schema, keys, rateLimitSecret }) {
   serverModule ??= await import(pathToFileURL(DIST_SERVER).href);
   const port = await freePort();
   const hostOrigin = `http://127.0.0.1:${port}`;
@@ -202,7 +203,6 @@ async function startOrigin({ socket, schema, ledgerSchema, keys, rateLimitSecret
     PORT: String(port),
     HOST_ORIGIN: hostOrigin,
     PRIMARY_SCHEMA: schema,
-    LEDGER_SCHEMA: ledgerSchema,
     PRIMARY_DATABASE: process.env.PG_TEST_DATABASE || "postgres",
     PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:synthetic-l-loadtest-primary",
     POSTGRES_IAM_USER: "synthetic-l-loadtest-runtime@synthetic.iam",
@@ -212,7 +212,7 @@ async function startOrigin({ socket, schema, ledgerSchema, keys, rateLimitSecret
     ENVELOPE_PUBLIC_JWK: keys.publicText,
     ENVELOPE_PRIVATE_JWK: keys.privateText,
     GCS_BUCKET_NAME: bucket,
-    GCS_ERASURE_BUCKET_HISTORY_PROOF: JSON.stringify({
+    GCS_QUARANTINE_BUCKET_HISTORY_PROOF: JSON.stringify({
       bucket, bucketGeneration: "1", bucketMetageneration: "1", softDeleteRetentionDurationSeconds: "0",
     }),
     ACCOUNTLESS_ENROLLMENT_MODE: "enabled",
@@ -274,20 +274,19 @@ async function fixture() {
     assert.equal(version.rows[0].address, null, "the local Unix socket only");
     assert.equal(Math.floor(version.rows[0].version / 10_000), 17, "PostgreSQL 17");
     const schema = `${SCHEMA_PREFIX}${randomBytes(4).toString("hex")}`;
-    const ledgerSchema = `${schema}_ledger`;
     const created = [];
     disposers.push(async () => {
       for (const name of [...created].reverse()) await base.query(`DROP SCHEMA IF EXISTS "${name}" CASCADE`);
       await base.end();
     });
-    for (const name of [schema, ledgerSchema]) {
+    for (const name of [schema]) {
       await base.query(`CREATE SCHEMA "${name}"`);
       created.push(name);
     }
-    const t = await seedSchema(base, codec, schema, ledgerSchema);
+    const t = await seedSchema(base, codec, schema);
     const keys = await envelopeKeys();
     const rateLimitSecret = randomBytes(32).toString("hex");
-    const originSettings = { socket, schema, ledgerSchema, keys, rateLimitSecret };
+    const originSettings = { socket, schema, keys, rateLimitSecret };
     const state = { origin: await startOrigin(originSettings) };
     disposers.push(() => state.origin.close());
     const invoker = createSyntheticServiceAccountKey(EDGE_E2E_INVOKER);
