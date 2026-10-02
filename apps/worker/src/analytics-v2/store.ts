@@ -60,10 +60,12 @@ import {
   ANALYTICS_V2_TABLES,
   type AnalyticsV2Day,
   type AnalyticsV2Mode,
+  type AnalyticsV2OwnerResources,
   type AnalyticsV2Phase,
   type AnalyticsV2PublicationSummary,
   type AnalyticsV2Refusal,
   type AnalyticsV2RunOutputs,
+  type AnalyticsV2RunResources,
 } from "./contract";
 
 /** The ten closed cache-continuity bands (d43c8f92 CACHE_RETENTION_BAND_IDS). */
@@ -96,9 +98,13 @@ export const ANALYTICS_V2_MAX_DAILY_PAYLOAD_BYTES = 262_144;
 /** Highest revisionSeed accepted; revision is a PostgreSQL integer. */
 export const ANALYTICS_V2_MAX_REVISION_SEED = 2_000_000_000;
 
-/** Bounded outputs: a run beyond these is refused before any write. */
+/**
+ * Bounded outputs: a run beyond these is refused before any write. `owners`
+ * equals A-1's roster bound (owners.ts MAX_ANALYTICS_V2_OWNERS), so every
+ * roster A-1 can list can be written.
+ */
 export const ANALYTICS_V2_OUTPUT_LIMITS = Object.freeze({
-  owners: 10_000,
+  owners: 100_000,
   ownerDays: 4_000_000,
   cacheBands: 8_000_000,
   ownerModelDates: 2_000_000,
@@ -313,6 +319,7 @@ interface PreparedOutputs {
   readonly refusals: readonly AnalyticsV2Refusal[];
   readonly lastSequence: number | null;
   readonly timings: Readonly<Partial<Record<AnalyticsV2Phase, number>>>;
+  readonly resources: AnalyticsV2RunResources | null;
 }
 
 function refusalKey(refusal: AnalyticsV2Refusal): string {
@@ -329,6 +336,52 @@ function validTimings(value: unknown, field: string): Partial<Record<AnalyticsV2
     timings[key as AnalyticsV2Phase] = entry;
   }
   return timings;
+}
+
+const RESOURCE_CONFIGURATION_KEYS = "maxDayOccurrences,maxDayRecordBytes,memoryBudgetBytes,memoryModel";
+const OWNER_RESOURCE_KEYS = "admitted,analysisUsage,estimateBytes,heapPeakBytes,maxDayOccurrences,ownerDigest,quota,session,usage";
+const MEMORY_MODEL = /^analytics-v2-memory-model-v[0-9]+$/u;
+
+/**
+ * The run's resource record (contract AnalyticsV2RunResources): closed keys,
+ * one entry per effective owner in digest order, and `admitted` false exactly
+ * for the owners refused as a whole (an owner-family refusal).
+ */
+function validResources(value: unknown, effective: ReadonlySet<string>,
+  refusedOwners: ReadonlySet<string>): AnalyticsV2RunResources | null {
+  if (value === undefined) return null;
+  if (!plainObject(value) || Object.keys(value).sort().join(",") !== "configuration,owners") invalid("resources");
+  const configuration = value.configuration;
+  if (!plainObject(configuration) || Object.keys(configuration).sort().join(",") !== RESOURCE_CONFIGURATION_KEYS
+      || typeof configuration.memoryModel !== "string" || !MEMORY_MODEL.test(configuration.memoryModel)) {
+    invalid("resources.configuration");
+  }
+  for (const name of ["memoryBudgetBytes", "maxDayOccurrences", "maxDayRecordBytes"]) {
+    if (assertNonNegativeSafeInteger(configuration[name], `resources.configuration.${name}`) < 1) {
+      invalid(`resources.configuration.${name}`);
+    }
+  }
+  assertArray(value.owners, "resources.owners");
+  assertCapacity(value.owners.length, ANALYTICS_V2_OUTPUT_LIMITS.owners, "resources.owners");
+  const owners: AnalyticsV2OwnerResources[] = [];
+  let previous = "";
+  for (const entry of value.owners) {
+    if (!plainObject(entry) || Object.keys(entry).sort().join(",") !== OWNER_RESOURCE_KEYS) invalid("resources.owners");
+    assertOwnerDigest(entry.ownerDigest, effective, "resources.owners.ownerDigest");
+    if ((entry.ownerDigest as string) <= previous) invalid("resources.owners.ownerDigest");
+    previous = entry.ownerDigest as string;
+    for (const name of ["usage", "quota", "session", "analysisUsage", "maxDayOccurrences", "estimateBytes"]) {
+      assertNonNegativeSafeInteger(entry[name], `resources.owners.${name}`);
+    }
+    if (typeof entry.admitted !== "boolean" || entry.admitted === refusedOwners.has(entry.ownerDigest as string)) {
+      invalid("resources.owners.admitted");
+    }
+    if (entry.heapPeakBytes !== null) assertNonNegativeSafeInteger(entry.heapPeakBytes, "resources.owners.heapPeakBytes");
+    if (!entry.admitted && entry.heapPeakBytes !== null) invalid("resources.owners.heapPeakBytes");
+    owners.push(entry as unknown as AnalyticsV2OwnerResources);
+  }
+  if (owners.length !== effective.size) invalid("resources.owners");
+  return { configuration: configuration as unknown as AnalyticsV2RunResources["configuration"], owners };
 }
 
 /**
@@ -386,6 +439,19 @@ async function prepareOutputs(outputs: AnalyticsV2RunOutputs, horizon: Analytics
     }
     owners.add(owner.ownerDigest);
     if (owner.source === "effective") computed.add(owner.ownerDigest);
+  }
+  // An effective owner refused as a whole (an owner-family refusal, such as
+  // memory_budget) was not computed: it writes no owner-scoped row and its
+  // stored rows are retained like any other uncomputed owner's.
+  const effective = new Set(computed);
+  assertArray(outputs.refusals, "refusals");
+  const refusedOwners = new Set<string>();
+  for (const refusal of outputs.refusals) {
+    if (plainObject(refusal) && refusal.family === "owner" && typeof refusal.ownerDigest === "string"
+        && effective.has(refusal.ownerDigest)) {
+      refusedOwners.add(refusal.ownerDigest);
+      computed.delete(refusal.ownerDigest);
+    }
   }
 
   assertArray(outputs.ownerDays, "ownerDays");
@@ -519,6 +585,7 @@ async function prepareOutputs(outputs: AnalyticsV2RunOutputs, horizon: Analytics
     refusals,
     lastSequence,
     timings: validTimings(outputs.timings, "timings"),
+    resources: validResources(outputs.resources, effective, refusedOwners),
   };
 }
 
@@ -882,6 +949,10 @@ export async function writeRunOutputs(
       ...callerTimings,
       write: Math.max(0, clockMs - writeStartedMs),
     };
+    // The run row's timings also carry the resource record (bounds applied,
+    // and each effective owner's evidence size, estimate and sampled heap).
+    const recorded = prepared.resources === null ? timings
+      : { ...timings, resources: prepared.resources.configuration, owners: prepared.resources.owners };
     await client.query(
       `INSERT INTO ${relation(schema, tables.runs)}
          (run_id, started_at, finished_at, mode, state, owners, owner_days, refusals, publication, timings)
@@ -896,7 +967,7 @@ export async function writeRunOutputs(
         outputs.ownerDays.length,
         JSON.stringify(prepared.refusals),
         JSON.stringify(publication),
-        JSON.stringify(timings),
+        JSON.stringify(recorded),
       ],
     );
     await client.query("COMMIT");

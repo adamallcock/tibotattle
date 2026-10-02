@@ -25,7 +25,7 @@ import type { PostgresPool } from "../postgres-client";
 import type { WorkerRouteMethod } from "../route-registry";
 
 /** Version of this contract; bump with any name or shape change. */
-export const ANALYTICS_V2_CONTRACT_VERSION = "analytics-v2-contract-v0.3" as const;
+export const ANALYTICS_V2_CONTRACT_VERSION = "analytics-v2-contract-v0.4" as const;
 
 /**
  * The analytics_v2 migration: primary role, runtime schema, number assigned in
@@ -172,11 +172,14 @@ export type AnalyticsV2RefusalFamily = (typeof ANALYTICS_V2_REFUSAL_FAMILIES)[nu
  * reason is a contract change through the lead, never a free-form string.
  */
 export const ANALYTICS_V2_REFUSAL_REASONS = Object.freeze([
-  // Fast-path routing and scope (tonight: no dense or non-effective port).
+  // Fast-path routing and scope.
   "non_effective_source_unported",
   "usage_window_unrepresentable",
   "day_occurrences_exceeded",
   "source_conflict_or_order",
+  // GCP resource guard (resources.ts): an effective owner whose deterministic
+  // memory estimate exceeds the run's budget. Owner and daily families only.
+  "memory_budget",
   // d43c8f92 analytics-shared-reducers.ts SharedAnalyticsUnavailable reasons.
   "invalid_day",
   "invalid_owner",
@@ -214,13 +217,25 @@ export const ANALYTICS_V2_CACHE_ONLY_REFUSAL_REASONS = Object.freeze([
 ] as const satisfies readonly AnalyticsV2RefusalReason[]);
 
 /**
+ * Reasons that refuse a whole effective owner before it is read
+ * (resources.ts). Such an owner is not computed: it writes no owner-scoped
+ * row, so these never reach analytics_v2_owner_day either, and its stored
+ * rows from earlier runs are retained.
+ */
+export const ANALYTICS_V2_OWNER_ONLY_REFUSAL_REASONS = Object.freeze([
+  "memory_budget",
+] as const satisfies readonly AnalyticsV2RefusalReason[]);
+
+/**
  * The closed reasons analytics_v2_owner_day.refusal may hold: every reason
- * except the cache-only ones. Primary migration 0059's CHECK lists exactly
- * these; the store refuses any other owner-day reason before writing.
+ * except the cache-only and owner-only ones. Primary migration 0059's CHECK
+ * lists exactly these; the store refuses any other owner-day reason before
+ * writing.
  */
 export const ANALYTICS_V2_OWNER_DAY_REFUSAL_REASONS: readonly AnalyticsV2RefusalReason[] = Object.freeze(
   ANALYTICS_V2_REFUSAL_REASONS.filter((reason) =>
-    !(ANALYTICS_V2_CACHE_ONLY_REFUSAL_REASONS as readonly string[]).includes(reason)),
+    !(ANALYTICS_V2_CACHE_ONLY_REFUSAL_REASONS as readonly string[]).includes(reason)
+    && !(ANALYTICS_V2_OWNER_ONLY_REFUSAL_REASONS as readonly string[]).includes(reason)),
 );
 
 /** An explicit refusal: never converted to zero or to inferred continuity. */
@@ -316,11 +331,52 @@ export interface AnalyticsV2RunOutputs {
   readonly ownerModelDates: readonly AnalyticsV2OwnerModelDateRow[];
   readonly dailyCandidates: readonly AnalyticsV2DailyCandidate[];
   readonly blockedDays: readonly AnalyticsV2Day[];
-  /** The admin community allowance preview (v0.3), or null when it cannot be built. */
+  /**
+   * The admin community allowance preview (v0.3), or null when it is withheld
+   * (an effective owner without a current fits result) or cannot be built.
+   */
   readonly preview: AnalyticsV2KernelValue | null;
   readonly refusals: readonly AnalyticsV2Refusal[];
   readonly journal: { readonly lastSequence: number | null };
   readonly timings: Readonly<Partial<Record<AnalyticsV2Phase, number>>>;
+  /**
+   * The run's resource configuration and one entry per effective owner, in
+   * owner-digest order. Recorded in analytics_v2_runs.timings (keys
+   * `resources` and `owners`). Optional for callers that compute no owner.
+   */
+  readonly resources?: AnalyticsV2RunResources;
+}
+
+/** analytics_v2_runs.timings.resources: the bounds one run applied. */
+export interface AnalyticsV2ResourceConfiguration {
+  readonly memoryModel: string;
+  readonly memoryBudgetBytes: number;
+  readonly maxDayOccurrences: number;
+  readonly maxDayRecordBytes: number;
+}
+
+/**
+ * analytics_v2_runs.timings.owners[]: one effective owner's evidence size and
+ * memory figures. Counts and the estimate are deterministic; heapPeakBytes is
+ * the largest heap-in-use sample taken while computing the owner (null when
+ * no probe was supplied or the owner was refused) and is operational
+ * metadata only, never an input to a decision.
+ */
+export interface AnalyticsV2OwnerResources {
+  readonly ownerDigest: AnalyticsV2OwnerDigest;
+  readonly usage: number;
+  readonly quota: number;
+  readonly session: number;
+  readonly analysisUsage: number;
+  readonly maxDayOccurrences: number;
+  readonly estimateBytes: number;
+  readonly admitted: boolean;
+  readonly heapPeakBytes: number | null;
+}
+
+export interface AnalyticsV2RunResources {
+  readonly configuration: AnalyticsV2ResourceConfiguration;
+  readonly owners: readonly AnalyticsV2OwnerResources[];
 }
 
 /** The read context every A-1 reader takes; reads run in BEGIN READ ONLY. */

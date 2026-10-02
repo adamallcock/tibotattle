@@ -1,0 +1,1061 @@
+{
+ "schemaVersion": "gcp-fastpath-dense-oracle-manifest-v1",
+ "oracle": "production-code (d43c8f92 Worker modules bundled for Node over the sealed SQLite D1 adapter; D1 seeded through admission helpers; scheduled entry points driven to convergence; forced native references)",
+ "sourceCommit": "d43c8f92a059d9c577776f7eca8a331eb305b8a6",
+ "build": {
+  "verifiedFiles": 392,
+  "listingSha256": "6e8335b8056297b853900673ff3a58b0a20cdd595136905e1dbd6c5a7870f75a",
+  "entrySha256": "77207ea50bdb0d9d451b4b7325e5bae3ab0ebadf0a666850e59e099a9ebd208c",
+  "esbuildVersion": "0.28.1",
+  "dependencies": {
+   "jsonc-parser": "3.3.1",
+   "oauth4webapi": "3.8.6",
+   "runcost": "0.2.1"
+  }
+ },
+ "corpus": {
+  "schemaVersion": "gcp-fastpath-oracle-corpus-v1",
+  "q1": {
+   "path": "apps/worker/analytics-v2-test/golden/corpus/corpus.json",
+   "sha256": "be042b9a72c00a8bbeef592619d7d7ab00be5b02a557629340d27bbf36b5521e",
+   "recordCounts": {
+    "a": {
+     "quota": 692,
+     "session": 668,
+     "usage": 2324
+    },
+    "b": {
+     "quota": 688,
+     "session": 663,
+     "usage": 2311
+    },
+    "c": {
+     "quota": 690,
+     "session": 666,
+     "usage": 2293
+    },
+    "d": {
+     "quota": 724,
+     "session": 700,
+     "usage": 2411
+    }
+   }
+  },
+  "dense": null
+ },
+ "nowMs": 1790856000000,
+ "now": "2026-10-01T12:00:00.000Z",
+ "pinnedNow": "2026-10-01T12:00:00.000Z",
+ "seedClock": "2026-10-01T07:26:31.714Z",
+ "correctionRuntimeState": "active",
+ "sqliteStatistics": "ANALYZE on the seeded source before analysis (query plans only; sqlite_* tables are not dumped)",
+ "topology": {
+  "analytics": {
+   "STORAGE_ANALYTICS_SHARED_FEATURES": "enabled",
+   "STORAGE_ANALYTICS_MODEL_BLOCKS": "enabled",
+   "PUBLICATION_LANE_EXTERNAL": "enabled"
+  },
+  "publication": {
+   "PUBLICATION_LANE": "enabled",
+   "STORAGE_ANALYTICS_SHARED_FEATURES": "enabled",
+   "STORAGE_ANALYTICS_MODEL_BLOCKS": "disabled"
+  },
+  "cache": {
+   "CACHE_RETENTION_BUILD": "enabled",
+   "CACHE_RETENTION_SHARED_FEATURES": "enabled",
+   "shards": 1
+  },
+  "graphDayProjection": "disabled (deployment default)",
+  "cadence": {
+   "lanesPerSimulatedMinute": [
+    "analytics x1",
+    "publication x1",
+    "cache"
+   ],
+   "longPassEveryMinutes": 10,
+   "clockStepMsPerMinute": 0,
+   "q1Cadence": true
+  },
+  "basis": "Q-1's reading of the production-scheduled-analytics-deploy refresh plan at d43c8f92; not verified against live configuration"
+ },
+ "convergence": {
+  "converged": true,
+  "stoppedBy": null,
+  "scheduleErrors": 0,
+  "quietTicks": 21,
+  "rule": "progress digest (counts, integer sums, text lengths, checkpoint/block/feature heads of every analytics table) unchanged for quietTicks consecutive ticks",
+  "graphProgress": {
+   "results": 251,
+   "byOwner": {
+    "a": {
+     "fits": true,
+     "modelDates": 56
+    },
+    "b": {
+     "fits": true,
+     "modelDates": 61
+    },
+    "c": {
+     "fits": true,
+     "modelDates": 66
+    },
+    "d": {
+     "fits": true,
+     "modelDates": 64
+    }
+   },
+   "publishedModelDays": 56,
+   "previewRevision": 44
+  }
+ },
+ "directPublisherCalls": {
+  "preview": "unchanged",
+  "modelDays": {
+   "unchanged": 56
+  }
+ },
+ "owners": [
+  {
+   "key": "a",
+   "kind": "social",
+   "planType": "pro",
+   "storage": {
+    "v11": [
+     "2026-04-15",
+     "2026-10-01"
+    ],
+    "v1ConflictChunk": [
+     "2026-04-17",
+     "2026-04-17"
+    ]
+   },
+   "ownerDigest": "f214e768a577e01681dcb70f03221c39e0715d52ff594724daf0ba76f6c6c54c",
+   "pinnedOwnerDigest": "f214e768a577e01681dcb70f03221c39e0715d52ff594724daf0ba76f6c6c54c",
+   "flags": {
+    "hasV1": true,
+    "hasV11": true,
+    "hasV12": false,
+    "hasLegacy": false,
+    "hasEffective": true
+   },
+   "expectedSourceRouting": "effective",
+   "dailySourceFormats": [
+    {
+     "sourceFormat": "effective",
+     "days": 168
+    }
+   ],
+   "graphSources": [
+    {
+     "metric": "fits",
+     "sourceKind": "effective",
+     "results": 1
+    },
+    {
+     "metric": "model",
+     "sourceKind": "effective",
+     "results": 56
+    }
+   ]
+  },
+  {
+   "key": "b",
+   "kind": "accountless",
+   "planType": "plus",
+   "storage": {
+    "v11": [
+     "2026-04-15",
+     "2026-10-01"
+    ]
+   },
+   "ownerDigest": "b2df2e36a49340774e9550bb63a8ec9a663b5c56b63e86519a987b619c6981be",
+   "pinnedOwnerDigest": "b2df2e36a49340774e9550bb63a8ec9a663b5c56b63e86519a987b619c6981be",
+   "flags": {
+    "hasV1": false,
+    "hasV11": true,
+    "hasV12": false,
+    "hasLegacy": false,
+    "hasEffective": true
+   },
+   "expectedSourceRouting": "effective",
+   "dailySourceFormats": [
+    {
+     "sourceFormat": "effective",
+     "days": 168
+    }
+   ],
+   "graphSources": [
+    {
+     "metric": "fits",
+     "sourceKind": "effective",
+     "results": 1
+    },
+    {
+     "metric": "model",
+     "sourceKind": "effective",
+     "results": 61
+    }
+   ]
+  },
+  {
+   "key": "c",
+   "kind": "social",
+   "planType": "pro",
+   "storage": {
+    "v12": [
+     "2026-04-15",
+     "2026-10-01"
+    ]
+   },
+   "ownerDigest": "77fa209ac4e4d1407b6fbe20381f67bde307e0ffc5ab47b98f3ac48caa9fc04e",
+   "pinnedOwnerDigest": "77fa209ac4e4d1407b6fbe20381f67bde307e0ffc5ab47b98f3ac48caa9fc04e",
+   "flags": {
+    "hasV1": false,
+    "hasV11": false,
+    "hasV12": true,
+    "hasLegacy": false,
+    "hasEffective": true
+   },
+   "expectedSourceRouting": "effective",
+   "dailySourceFormats": [
+    {
+     "sourceFormat": "effective",
+     "days": 168
+    }
+   ],
+   "graphSources": [
+    {
+     "metric": "fits",
+     "sourceKind": "effective",
+     "results": 1
+    },
+    {
+     "metric": "model",
+     "sourceKind": "effective",
+     "results": 66
+    }
+   ]
+  },
+  {
+   "key": "d",
+   "kind": "social",
+   "planType": "prolite",
+   "storage": {
+    "v11": [
+     "2026-04-15",
+     "2026-10-01"
+    ],
+    "v1DuplicateChunk": [
+     "2026-06-30",
+     "2026-06-30"
+    ]
+   },
+   "ownerDigest": "8f6b06d86afa675ccb556989677ad247f687a344926347a68281cebdfe4e4007",
+   "pinnedOwnerDigest": "8f6b06d86afa675ccb556989677ad247f687a344926347a68281cebdfe4e4007",
+   "flags": {
+    "hasV1": true,
+    "hasV11": true,
+    "hasV12": false,
+    "hasLegacy": false,
+    "hasEffective": true
+   },
+   "expectedSourceRouting": "effective",
+   "dailySourceFormats": [
+    {
+     "sourceFormat": "effective",
+     "days": 168
+    }
+   ],
+   "graphSources": [
+    {
+     "metric": "fits",
+     "sourceKind": "effective",
+     "results": 1
+    },
+    {
+     "metric": "model",
+     "sourceKind": "effective",
+     "results": 64
+    }
+   ]
+  }
+ ],
+ "routingEvidence": {
+  "sharedFeatures": [
+   {
+    "owner": "c",
+    "state": "complete",
+    "n": 177,
+    "first": "2026-04-08",
+    "last": "2026-10-01"
+   },
+   {
+    "owner": "d",
+    "state": "complete",
+    "n": 177,
+    "first": "2026-04-08",
+    "last": "2026-10-01"
+   },
+   {
+    "owner": "b",
+    "state": "complete",
+    "n": 177,
+    "first": "2026-04-08",
+    "last": "2026-10-01"
+   },
+   {
+    "owner": "a",
+    "state": "complete",
+    "n": 175,
+    "first": "2026-04-08",
+    "last": "2026-10-01"
+   },
+   {
+    "owner": "a",
+    "state": "refused",
+    "n": 2,
+    "first": "2026-04-17",
+    "last": "2026-04-18"
+   }
+  ],
+  "sharedFeatureRefusedDays": {
+   "a": [
+    "2026-04-17",
+    "2026-04-18"
+   ]
+  },
+  "sharedFeatureWindows": {
+   "rule": "storage-community-graph.ts computeEffective with shared features enabled: the owner's effective quota and usage inventory over the window, then readSharedAnalyticsFeatureWindow; 'shared-features' passes prepared features to advanceStorageEffectiveAnalysis, a refusal passes none (the direct native computation); model dates pass through model blocks first",
+   "byOwner": {
+    "a": {
+     "counts": {
+      "refused:prepared_day_refused": 4,
+      "shared-features": 66
+     },
+     "notShared": {
+      "2026-07-24": "refused:prepared_day_refused",
+      "2026-07-25": "refused:prepared_day_refused",
+      "2026-07-26": "refused:prepared_day_refused",
+      "2026-07-27": "refused:prepared_day_refused"
+     }
+    },
+    "b": {
+     "counts": {
+      "shared-features": 70
+     },
+     "notShared": {}
+    },
+    "c": {
+     "counts": {
+      "shared-features": 70
+     },
+     "notShared": {}
+    },
+    "d": {
+     "counts": {
+      "shared-features": 70
+     },
+     "notShared": {}
+    }
+   }
+  },
+  "checkpointHeads": {
+   "heads": 9,
+   "retired": 0
+  },
+  "checkpointParts": {
+   "parts": 54,
+   "bytes": 4595590,
+   "maxPartIndex": 7
+  },
+  "modelBlocks": [
+   {
+    "owner": "c",
+    "state": "complete",
+    "n": 3
+   },
+   {
+    "owner": "d",
+    "state": "complete",
+    "n": 3
+   },
+   {
+    "owner": "b",
+    "state": "complete",
+    "n": 3
+   },
+   {
+    "owner": "a",
+    "state": "complete",
+    "n": 2
+   },
+   {
+    "owner": "a",
+    "state": "pending",
+    "n": 1
+   }
+  ]
+ },
+ "modelPublications": {
+  "expectedDates": 70,
+  "published": 56,
+  "missing": [
+   "2026-07-24",
+   "2026-07-25",
+   "2026-07-26",
+   "2026-07-27",
+   "2026-07-28",
+   "2026-07-29",
+   "2026-07-30",
+   "2026-07-31",
+   "2026-08-01",
+   "2026-08-02",
+   "2026-08-03",
+   "2026-08-04",
+   "2026-08-05",
+   "2026-08-06"
+  ],
+  "ownersWithResultOnMissingDates": {
+   "2026-07-24": [
+    "b",
+    "c",
+    "d"
+   ],
+   "2026-07-25": [
+    "b",
+    "c",
+    "d"
+   ],
+   "2026-07-26": [
+    "b",
+    "c",
+    "d"
+   ],
+   "2026-07-27": [
+    "b",
+    "c",
+    "d"
+   ],
+   "2026-07-28": [
+    "c",
+    "d"
+   ],
+   "2026-07-29": [
+    "c",
+    "d"
+   ],
+   "2026-07-30": [
+    "c",
+    "d"
+   ],
+   "2026-07-31": [
+    "c"
+   ],
+   "2026-08-01": [
+    "c"
+   ],
+   "2026-08-02": [],
+   "2026-08-03": [],
+   "2026-08-04": [],
+   "2026-08-05": [],
+   "2026-08-06": [
+    "b",
+    "c",
+    "d"
+   ]
+  }
+ },
+ "conflict": {
+  "owner": "a",
+  "occurrenceId": "event:v2:d3b6ff85b08a912655697426ded4cba7bee1f0e1cf5574bc717a8c2f14eb5d5e",
+  "days": [
+   "2026-04-17",
+   "2026-04-18"
+  ],
+  "publishedDays": []
+ },
+ "duplicate": {
+  "owner": "d",
+  "occurrenceId": "event:v2:48f6e305db59186ede038b4f089191897d02f1b76941536d25f7a50b26667c5d",
+  "day": "2026-06-30",
+  "formats": [
+   "v1",
+   "v11"
+  ],
+  "v1AdmittedBeforeV11Domain": true
+ },
+ "response": {
+  "status": 200,
+  "cacheControl": "public, max-age=300",
+  "schemaVersion": "community-daily-read-v1.0",
+  "allowanceState": "ready",
+  "allowanceReadState": "confirmed",
+  "publishedDays": 168,
+  "modelPublicationDays": 56,
+  "previewRow": {
+   "revision": 44,
+   "method": "48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9:v1-fit-7:server-api-price-equivalent-v0.5:plan-attribution-v1:legacy-day-or-complete-domain-3:legacy-day-or-complete-domain-3:plan-attribution-v1:v1-era-buckets-2:legacy-day-or-complete-domain-3:plan-attribution-v1:v1-era-buckets-3:v1-quota-acquisition-2:plan-attribution-v1:v11-account-era-buckets-1:v11-complete-domain-1:server-api-price-equivalent-v0.5:community-public-sources-v1:48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9:v1-composition-3:server-api-price-equivalent-v0.5:plan-attribution-v1:legacy-day-or-complete-domain-3:legacy-day-or-complete-domain-3:plan-attribution-v1:v1-era-buckets-2:legacy-day-or-complete-domain-3:plan-attribution-v1:v1-era-buckets-3:v1-quota-acquisition-2:plan-attribution-v1:v11-account-era-buckets-1:v11-complete-domain-1:server-api-price-equivalent-v0.5:community-public-sources-v1:separate-results-1",
+   "generated_at": "2026-10-01T12:00:00.000Z",
+   "inputs_current": 1,
+   "snapshot_source_epoch": 8
+  },
+  "servedFrom": "the replay's databases (community-daily-response.json)",
+  "settled": {
+   "file": "community-daily-response-settled.json",
+   "servedFrom": "the replay's databases with the settled cache-retention target (cacheRetention.settledLane)",
+   "differsFromReplayOnlyIn": [
+    "cacheRetention"
+   ]
+  }
+ },
+ "outputProvenance": {
+  "dailyPayloads": "lane replay (Tier N): production's scheduled analytics, publication and cache lanes; the daily lane had published every non-conflict day",
+  "cacheRetention": "community-daily-response.json and cache-owner-days.json: the lane replay at capture; community-daily-response-settled.json: production's lane settled without the per-pass budget (cacheRetention.settledLane) and read by the public route; cache-reference.json: production's effective day build for every owner-day with usage (cacheRetention.reference)",
+  "ownerFitsAndModelResults": "direct native calls (advanceStorageEffectiveAnalysis with an unbounded budget, direct-native.mjs); the lane replay's and the budget-sliced forced path's results are cross-checked wherever they exist (directNative.referenceAgreement)",
+  "perDateExpected": "d43c8f92's buildCommunityModelCompositionDay, projectAdminModelHistoryDay, buildAdminCommunityAllowancePreview and projectPublicAllowanceGraph over the owner results above",
+  "communityDailyResponse": "lane replay, converged in every lane"
+ },
+ "directNative": {
+  "computedBy": "this process",
+  "nowMs": 1790856000000,
+  "configuration": "advanceStorageEffectiveAnalysis over the read-only source with no preparedQuota, preparedUsage or preparedUsageReader (what computeEffective passes when shared features are refused or off, STORAGE_V11_PREPARED_FOLD being false at d43c8f92; also the model-block fallback), budget {remainingQueries: 1e9, deadlineMs: far future}, looping on 'deferred' with the checkpoint in memory; fits validated with validCompleteScalarAnalysis and serialized as canonicalJson(selectCommunityAllowanceAnalysisFits(ownerDigest, [{source:'v1.1', analysis}])), model validated with validCompleteCachedComposition and serialized as canonicalJson(analysis)",
+  "owners": {
+   "a": {
+    "fits": "complete",
+    "model": {
+     "failed": 4,
+     "complete": 66
+    },
+    "failures": {
+     "2026-07-24": "STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE",
+     "2026-07-25": "STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE",
+     "2026-07-26": "STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE",
+     "2026-07-27": "STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE"
+    },
+    "work": {
+     "steps": 35525,
+     "statements": 432232,
+     "fitsSteps": 506
+    }
+   },
+   "b": {
+    "fits": "complete",
+    "model": {
+     "complete": 70
+    },
+    "failures": {},
+    "work": {
+     "steps": 35926,
+     "statements": 438993,
+     "fitsSteps": 506
+    }
+   },
+   "c": {
+    "fits": "complete",
+    "model": {
+     "complete": 70
+    },
+    "failures": {},
+    "work": {
+     "steps": 35926,
+     "statements": 453335,
+     "fitsSteps": 506
+    }
+   },
+   "d": {
+    "fits": "complete",
+    "model": {
+     "complete": 70
+    },
+    "failures": {},
+    "work": {
+     "steps": 35926,
+     "statements": 438993,
+     "fitsSteps": 506
+    }
+   }
+  },
+  "referenceAgreement": {
+   "a": {
+    "directEqualsTierN": {
+     "compared": 57,
+     "equal": 57
+    },
+    "directEqualsForced": {
+     "compared": 67,
+     "equal": 67
+    }
+   },
+   "b": {
+    "directEqualsTierN": {
+     "compared": 62,
+     "equal": 62
+    },
+    "directEqualsForced": {
+     "compared": 71,
+     "equal": 71
+    }
+   },
+   "c": {
+    "directEqualsTierN": {
+     "compared": 67,
+     "equal": 67
+    },
+    "directEqualsForced": {
+     "compared": 71,
+     "equal": 71
+    }
+   },
+   "d": {
+    "directEqualsTierN": {
+     "compared": 65,
+     "equal": 65
+    },
+    "directEqualsForced": {
+     "compared": 71,
+     "equal": 71
+    }
+   }
+  },
+  "referenceMismatches": []
+ },
+ "directImport": null,
+ "forcedNative": {
+  "scope": "all",
+  "sampleDates": [
+   "2026-07-24",
+   "2026-08-10",
+   "2026-08-27",
+   "2026-09-13",
+   "2026-10-01"
+  ],
+  "configuration": "computeStorageGraphResult(preparedFold:false, preparedEffectiveUsage:false, persistResult:false, no sharedFeatures), re-invoked at production's 1,000-statement invocation meter until complete, on a scratch copy with every graph cache cleared and a read-only source; production's model-block fallback",
+  "owners": {
+   "a": {
+    "pages": {
+     "fits": {
+      "usagePages": 101,
+      "quotaPages": 101,
+      "usageRows": 1395
+     },
+     "modelDates": {
+      "usagePages": 7070,
+      "quotaPages": 7070,
+      "dates": 70
+     }
+    },
+    "fits": "complete",
+    "model": {
+     "failed": 4,
+     "complete": 66
+    },
+    "failures": {
+     "2026-07-24": "STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE",
+     "2026-07-25": "STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE",
+     "2026-07-26": "STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE",
+     "2026-07-27": "STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE"
+    },
+    "cost": {
+     "statements": 607274,
+     "invocations": 702,
+     "maxCheckpointBytes": 689044
+    }
+   },
+   "b": {
+    "pages": {
+     "fits": {
+      "usagePages": 101,
+      "quotaPages": 101,
+      "usageRows": 1417
+     },
+     "modelDates": {
+      "usagePages": 7070,
+      "quotaPages": 7070,
+      "dates": 70
+     }
+    },
+    "fits": "complete",
+    "model": {
+     "complete": 70
+    },
+    "failures": {},
+    "cost": {
+     "statements": 615453,
+     "invocations": 710,
+     "maxCheckpointBytes": 699164
+    }
+   },
+   "c": {
+    "pages": {
+     "fits": {
+      "usagePages": 101,
+      "quotaPages": 101,
+      "usageRows": 1372
+     },
+     "modelDates": {
+      "usagePages": 7070,
+      "quotaPages": 7070,
+      "dates": 70
+     }
+    },
+    "fits": "complete",
+    "model": {
+     "complete": 70
+    },
+    "failures": {},
+    "cost": {
+     "statements": 632048,
+     "invocations": 781,
+     "maxCheckpointBytes": 690937
+    }
+   },
+   "d": {
+    "pages": {
+     "fits": {
+      "usagePages": 101,
+      "quotaPages": 101,
+      "usageRows": 1425
+     },
+     "modelDates": {
+      "usagePages": 7070,
+      "quotaPages": 7070,
+      "dates": 70
+     }
+    },
+    "fits": "complete",
+    "model": {
+     "complete": 70
+    },
+    "failures": {},
+    "cost": {
+     "statements": 617451,
+     "invocations": 710,
+     "maxCheckpointBytes": 721657
+    }
+   }
+  },
+  "tierNEqualsForced": {
+   "a": {
+    "fits": true,
+    "modelCompared": 56,
+    "modelEqual": 56
+   },
+   "b": {
+    "fits": true,
+    "modelCompared": 61,
+    "modelEqual": 61
+   },
+   "c": {
+    "fits": true,
+    "modelCompared": 66,
+    "modelEqual": 66
+   },
+   "d": {
+    "fits": true,
+    "modelCompared": 64,
+    "modelEqual": 64
+   }
+  }
+ },
+ "cacheRetention": {
+  "marks": [
+   {
+    "owner": "c",
+    "source_layout": "effective",
+    "n": 2,
+    "first": "2026-04-15",
+    "last": "2026-04-16"
+   },
+   {
+    "owner": "d",
+    "source_layout": "effective",
+    "n": 2,
+    "first": "2026-04-15",
+    "last": "2026-04-16"
+   },
+   {
+    "owner": "d",
+    "source_layout": "typed-v11",
+    "n": 32,
+    "first": "2026-04-15",
+    "last": "2026-05-17"
+   },
+   {
+    "owner": "b",
+    "source_layout": "effective",
+    "n": 2,
+    "first": "2026-04-15",
+    "last": "2026-04-16"
+   },
+   {
+    "owner": "b",
+    "source_layout": "typed-v11",
+    "n": 2,
+    "first": "2026-04-17",
+    "last": "2026-04-18"
+   },
+   {
+    "owner": "a",
+    "source_layout": "effective",
+    "n": 2,
+    "first": "2026-04-15",
+    "last": "2026-04-16"
+   },
+   {
+    "owner": "a",
+    "source_layout": "typed-v11",
+    "n": 101,
+    "first": "2026-04-15",
+    "last": "2026-07-24"
+   }
+  ],
+  "windowAdjacencies": {
+   "day": 0,
+   "week": 0,
+   "month": 0,
+   "all": 67
+  },
+  "settledWindowAdjacencies": {
+   "day": 0,
+   "week": 0,
+   "month": 0,
+   "all": 8
+  },
+  "settledLane": {
+   "lane": {
+    "calls": 66,
+    "built": 14,
+    "staged": 0,
+    "refused": 0,
+    "skipped": 262,
+    "outcome": "stalled",
+    "stalledAt": {
+     "state": "progress",
+     "reason": "day_limit"
+    },
+    "configuration": {
+     "sharedFeatures": true,
+     "maxDays": 12,
+     "maxWrites": 48,
+     "shards": 1,
+     "budget": "target, source and shared statement allowances and the deadline unbounded"
+    },
+    "cleared": {
+     "analytics_cache_retention_day_marks": 143,
+     "analytics_cache_retention_day_values": 146,
+     "analytics_cache_retention_day_bands": 1460,
+     "analytics_cache_retention_day_carry": 1008,
+     "analytics_cache_retention_day_progress": 0,
+     "analytics_cache_retention_owner_cursor": 1
+    },
+    "events": {
+     "cache_retention_day_skipped:owner_source_unavailable": 262
+    }
+   },
+   "modes": {
+    "enabled": {
+     "lane": {
+      "calls": 66,
+      "built": 14,
+      "staged": 0,
+      "refused": 0,
+      "skipped": 262,
+      "outcome": "stalled",
+      "stalledAt": {
+       "state": "progress",
+       "reason": "day_limit"
+      },
+      "configuration": {
+       "sharedFeatures": true,
+       "maxDays": 12,
+       "maxWrites": 48,
+       "shards": 1,
+       "budget": "target, source and shared statement allowances and the deadline unbounded"
+      },
+      "cleared": {
+       "analytics_cache_retention_day_marks": 143,
+       "analytics_cache_retention_day_values": 146,
+       "analytics_cache_retention_day_bands": 1460,
+       "analytics_cache_retention_day_carry": 1008,
+       "analytics_cache_retention_day_progress": 0,
+       "analytics_cache_retention_owner_cursor": 1
+      },
+      "events": {
+       "cache_retention_day_skipped:owner_source_unavailable": 262
+      }
+     },
+     "ownerDaysSha256": "adb750fad05aaa84e81887252b80e5e0bfde67fe27daadea4d8f5847ab9f0ffa",
+     "seriesSha256": "b902c9e1bbcd95a42af95766d7caa41e1a621a42264d9d5d36ebd66cbefaf6bf"
+    },
+    "disabled": {
+     "lane": {
+      "calls": 66,
+      "built": 14,
+      "staged": 0,
+      "refused": 0,
+      "skipped": 262,
+      "outcome": "stalled",
+      "stalledAt": {
+       "state": "progress",
+       "reason": "day_limit"
+      },
+      "configuration": {
+       "sharedFeatures": false,
+       "maxDays": 12,
+       "maxWrites": 48,
+       "shards": 1,
+       "budget": "target, source and shared statement allowances and the deadline unbounded"
+      },
+      "cleared": {
+       "analytics_cache_retention_day_marks": 143,
+       "analytics_cache_retention_day_values": 146,
+       "analytics_cache_retention_day_bands": 1460,
+       "analytics_cache_retention_day_carry": 1008,
+       "analytics_cache_retention_day_progress": 0,
+       "analytics_cache_retention_owner_cursor": 1
+      },
+      "events": {
+       "cache_retention_day_skipped:owner_source_unavailable": 262
+      }
+     },
+     "ownerDaysSha256": "adb750fad05aaa84e81887252b80e5e0bfde67fe27daadea4d8f5847ab9f0ffa",
+     "seriesSha256": "b902c9e1bbcd95a42af95766d7caa41e1a621a42264d9d5d36ebd66cbefaf6bf"
+    },
+    "equal": true
+   },
+   "marks": {
+    "c:effective": 2,
+    "d:effective": 2,
+    "d:typed-v11": 2,
+    "b:effective": 2,
+    "b:typed-v11": 2,
+    "a:effective": 2,
+    "a:typed-v11": 2
+   },
+   "markedDays": {
+    "a": [
+     "2026-04-15:effective",
+     "2026-04-16:effective",
+     "2026-04-17:typed-v11",
+     "2026-04-18:typed-v11"
+    ],
+    "b": [
+     "2026-04-15:effective",
+     "2026-04-16:effective",
+     "2026-04-17:typed-v11",
+     "2026-04-18:typed-v11"
+    ],
+    "c": [
+     "2026-04-15:effective",
+     "2026-04-16:effective"
+    ],
+    "d": [
+     "2026-04-15:effective",
+     "2026-04-16:effective",
+     "2026-04-17:typed-v11",
+     "2026-04-18:typed-v11"
+    ]
+   },
+   "unpromotedProgress": []
+  },
+  "reference": {
+   "rule": "cache-days.mjs: createCacheRetentionEffectiveDayBuild for every owner-day with effective usage, the candidate and carry digests being the source dependency digests the lane's source build proves",
+   "ownerDays": 680,
+   "outcomes": {
+    "built": 671,
+    "refused:usage_row_refused": 9
+   },
+   "notBuilt": {
+    "a:2026-04-17": "refused:usage_row_refused",
+    "a:2026-04-18": "refused:usage_row_refused",
+    "a:2026-04-19": "refused:usage_row_refused",
+    "a:2026-04-20": "refused:usage_row_refused",
+    "a:2026-04-21": "refused:usage_row_refused",
+    "a:2026-04-22": "refused:usage_row_refused",
+    "a:2026-04-23": "refused:usage_row_refused",
+    "a:2026-04-24": "refused:usage_row_refused",
+    "a:2026-04-25": "refused:usage_row_refused"
+   },
+   "withValues": 480,
+   "settledAgreement": {
+    "compared": 8,
+    "equal": 8,
+    "mismatched": []
+   }
+  }
+ },
+ "parityBasis": {
+  "runSpecificColumns": {
+   "analytics_cache_retention_day_bands": [
+    "value_key"
+   ],
+   "analytics_cache_retention_day_values": [
+    "carry_digest",
+    "mark_key",
+    "value_key"
+   ],
+   "analytics_community_graph_previews": [
+    "cohort_digest"
+   ],
+   "analytics_community_model_publications": [
+    "cohort_digest"
+   ]
+  },
+  "publishedRowDigests": {
+   "analytics_cache_retention_day_bands": {
+    "rows": 1460,
+    "sha256": "73e4dad78b37ef0f06972c7a10a29e041b892108338441adafe0de6e3c22889d"
+   },
+   "analytics_cache_retention_day_values": {
+    "rows": 146,
+    "sha256": "5ed9ed764e8f5aae8d32a4b0c0650efebe5d9fc3f38aa24fe52e88cb495368b5"
+   },
+   "analytics_community_daily_publications": {
+    "rows": 168,
+    "sha256": "7c62ac1eef1a48201c20271ec7d83d1eed2e74155e401cad7759ad750cd75d5c"
+   },
+   "analytics_community_graph_previews": {
+    "rows": 1,
+    "sha256": "1212b46e908b10ff2953df325b6c53f00a14c3609f2e8727b02db467bb723414"
+   },
+   "analytics_community_graph_publication_state": {
+    "rows": 1,
+    "sha256": "9ad78b42a93c9dd9286467f16026ad0e2c055ac3ce5357fd459dcb8349fd11cd"
+   },
+   "analytics_community_model_publications": {
+    "rows": 56,
+    "sha256": "efecfbb2232dfec0b23dc690ef0359478c95cf05e850458de88777c4ec1cb2c8"
+   }
+  }
+ },
+ "leaseExpiryProbe": {
+  "steps": 12,
+  "stepMinutes": 10,
+  "through": "2026-10-01T14:00:00.000Z",
+  "changedOutputs": [],
+  "errors": 0
+ },
+ "sourceDump": {
+  "tables": 85,
+  "rows": 58048,
+  "schemaSha256": "f63ad44aef250a0a54aa6e4eee064a19d20ddb96ff7416535a6fc1a2410901d4",
+  "rowCountsSha256": "a07ba315d18057da0008eb20693537a6b50d9f9bad62525ec949192777fe7775",
+  "jsonBytes": 12535087,
+  "jsonSha256": "c371aab16859bafb724007f542e0ac68598ed8aae6a34b5fa3964e300fa64a40",
+  "sealedSqlite": {
+   "sha256": "b7ff47a9f99b9aac1e321867b79f405d9f9f4a4ea885f8f7f33715d1e4811aa3",
+   "bytes": 19083264,
+   "integrityCheck": "ok",
+   "sealReady": true,
+   "populatedTables": 85,
+   "missingSealedTables": [],
+   "node": "v26.2.0"
+  },
+  "sourceUnchangedByAnalysis": true,
+  "contentDigest": {
+   "sha256": "3239f1ca6b95778f2575aa7bfaf373e8906755f219d864b99597f6715e15757c",
+   "rule": "source-digest.mjs: every table's rows in a total order (independent of page layout)"
+  },
+  "reproduce": "node --max-old-space-size=16384 apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs --work-dir <dir> --corpus q1 --forced-native all --direct-native all --direct-jobs <n> --settle-cache both"
+ }
+}

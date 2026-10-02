@@ -8,16 +8,18 @@ status: accepted
 # Append-only contributions on the Google Cloud service
 
 > **Accepted.** The owner approved this text in chat on 2026-09-30. It restates
-> choices the owner made in chat. This record changes no current Cloudflare behavior. It
+> choices the owner made in chat. D7 was added on 2026-10-01 from the owner's
+> decision in chat that day (fast-path OD-12); its wording awaits the owner's
+> review. This record changes no current Cloudflare behavior. It
 > authorizes no production write, migration, deployment or cutover. It is not
 > legal advice and makes no legal-sufficiency claim. It contains no
 > identifiers, session content or deployment evidence.
 
 | Field | Value |
 |---|---|
-| Decided by the owner | D1 to D4 and D6 in chat on 2026-09-26; D5 is the hosting boundary in force for the 2026-10-01 GCP fast path |
+| Decided by the owner | D1 to D4 and D6 in chat on 2026-09-26; D7 in chat on 2026-10-01; D5 is the hosting boundary in force for the 2026-10-01 GCP fast path |
 | Recorded | 2026-10-01, for the GCP fast path (DOC-1L) |
-| Owner sign-off | Approved in chat on 2026-09-30 |
+| Owner sign-off | Approved in chat on 2026-09-30 (D1 to D6); D7's wording awaits review |
 | Applies to | The proposed PostgreSQL service on Google Cloud, from an owner-authorized cutover |
 | Does not apply to | Current Cloudflare production, local analysis, local erase or Keychain identity reset |
 | Delivery plan | [GCP fast path](../plans/2026-10-01-gcp-fastpath.md) |
@@ -28,7 +30,7 @@ status: accepted
   writer fence and cutover. The accepted decisions listed under
   [Relationship to accepted decisions](#relationship-to-accepted-decisions)
   remain authoritative for it.
-- D1 to D6 describe the Google Cloud target only. They take effect when the
+- D1 to D7 describe the Google Cloud target only. They take effect when the
   owner authorizes the cutover.
 - Local analysis, local erase and Keychain identity reset are unchanged.
 
@@ -205,6 +207,58 @@ land before any non-disposable database applies the staged primary migration
 `0053` (analytics erasure fences) or the staged ledger migration `0007`. Both
 are forward-only once applied.
 
+## D7. Model dates publish per date, with refused owners counted
+
+The owner decided in chat on 2026-10-01 (fast-path OD-12) to accept per-date
+model publication on Google Cloud instead of porting production's block
+withholding. Recorded here on 2026-10-01.
+
+- The analytics-refresh job publishes each of the 70 model-history dates on
+  its own.
+- An owner whose model computation for a date is refused by the kernels is
+  left out of that date's composition and counted in both
+  `v1ParticipantCount` and `refusedParticipantCount`. The published date therefore states the cohort
+  it could not evaluate, including a date on which every member owner was
+  refused. Refused evidence is never counted as zero. Only a date with no
+  member owner at all is not published. (Amended on 2026-10-02 after review:
+  the first wording withheld a date on which no owner was evaluated, which
+  the parity oracle's per-date expectation does not do.)
+- The preview keeps production's completeness rule. The model dates are
+  served inside the allowance preview, and `d43c8f92` publishes a preview
+  only when every member owner has a current fits result. The Google Cloud
+  job does the same: when an effective owner's current fit is refused, by a
+  kernel refusal or by the job's per-owner memory budget, the run withholds
+  the preview, and with it every model date, rather than publish coverage
+  counts that silently leave that owner out. The allowance is then served as
+  temporarily unavailable; production would instead keep serving its last
+  completed preview while it stays valid. (Recorded on 2026-10-02 after
+  review; awaits the owner's confirmation with the rest of D7's wording.)
+- `d43c8f92`'s storage publication instead withholds a 14-date model block
+  until every member owner has a result. That rule is not ported. Where
+  production withholds a block because one owner's window cannot be computed,
+  the Google Cloud service publishes those dates with that owner counted as
+  refused. On the synthetic Q-1 corpus, owner (a)'s crossed-day conflict
+  makes production withhold 2026-07-24 to 2026-08-06; the fast path publishes
+  all 14.
+- Parity contract. A compare against a production-code golden accepts exactly
+  the dates that golden withholds (its manifest's
+  `modelPublications.missing`), and only their publication: model values in
+  `allowanceBreakdowns.days[].models` on those dates and those dates in the
+  stored preview's `models.days`. Every date both sides publish stays
+  byte-equal, and every other field is unchanged. The values on the accepted
+  dates are held exactly to the oracle's per-date expectation, which
+  `d43c8f92`'s own publishers compute over its per-owner references
+  (`scripts/analytics-v2-parity-compare.mjs`,
+  `scripts/gcp-fastpath-dense-oracle/per-date-compare.mjs`). Without that
+  expectation, an accepted date is an unexpected difference: the compare
+  never accepts one on its presence alone, and the rehearsal command passes
+  the expectation by default.
+- Disclosure. This changes when model-history dates appear, not how a date is
+  computed. The cutover disclosure (OPS-9) states that model dates publish per
+  date with a refused-participant count.
+- The current Cloudflare service keeps its block withholding until the
+  cutover.
+
 ## Superseded planning contracts
 
 The following are GCP planning work items (plan-v4, 2026-09-27) and the
@@ -326,6 +380,12 @@ before, so that each stays truthful for the running service.
 ## Sign-off
 
 - [x] The owner approved this text in chat (fast-path OD-6) on 2026-09-30.
+- [ ] D7, added on 2026-10-01, restates the owner's decision in chat that day
+  (fast-path OD-12). The owner has not yet reviewed its wording, including
+  the two points added on 2026-10-02 after review: a model date on which
+  every member was refused is published with all of them counted, and the
+  preview (with every model date) is withheld while an effective owner has
+  no current fit.
 
 Still owed: the supersession notes and disclosure changes above land in the
 cutover commit.

@@ -378,3 +378,87 @@ test("the first evidence day is the earliest candidate day over every stream, wi
     await assert.rejects(modules.occurrences.readOwnerFirstEvidenceDay(context("active"),
       { ownerDigest: "not-a-digest", throughDay: D3 }), (error) => error?.code === "ANALYTICS_V2_SOURCE_INVALID");
   });
+
+test("counts equal the reader's per-day occurrences for every owner, stream and runtime (the Job's memory guard input)",
+  { skip: SKIP, timeout: 180_000 }, async () => {
+    const addDays = (day, delta) => new Date(Date.parse(`${day}T00:00:00.000Z`) + delta * 86_400_000)
+      .toISOString().slice(0, 10);
+    let compared = 0;
+    for (const runtime of ["active", "staged"]) {
+      const listing = await modules.owners.listAnalyticsV2Owners(context(runtime));
+      for (const owner of listing.owners) {
+        for (const stream of ["usage", "quota", "session"]) {
+          const options = { ownerDigest: owner.ownerDigest, stream, fromDay: addDays(D3, -399), throughDay: D3 };
+          const read = await modules.occurrences.readOwnerOccurrences(context(runtime), options);
+          const counts = await modules.occurrences.countOwnerOccurrences(context(runtime), options);
+          assert.deepEqual([...counts], [...read].map(([day, rows]) => [day, rows.length]),
+            `${runtime} ${owner.participantId} ${stream}`);
+          compared += counts.size;
+        }
+      }
+    }
+    // The fixture's union cases are all counted once: the v1/v1.1/v1.2 shared
+    // occurrence, the crossed-midnight conflict on both days and the corrected one.
+    const alpha = fixtures.active.owners.alpha.ownerDigest;
+    assert.deepEqual([...await modules.occurrences.countOwnerOccurrences(context("active"),
+      { ownerDigest: alpha, stream: "usage", fromDay: D1, throughDay: D3 })], [[D1, 3], [D2, 2]]);
+    assert.ok(compared >= 8, "the comparison covered every evidence day of the fixture");
+    await assert.rejects(modules.occurrences.countOwnerOccurrences(context("active"),
+      { ownerDigest: alpha, stream: "usage", fromDay: D1, throughDay: addDays(D1, 400) }),
+    (error) => error?.code === "ANALYTICS_V2_SOURCE_INVALID", "a count spans at most 400 days, as a read");
+    assert.equal(modules.occurrences.MAX_ANALYTICS_V2_CANDIDATES, 2_000_000);
+    assert.equal(modules.occurrences.MAX_ANALYTICS_V2_BATCH_SOURCE_ROWS, 40_000);
+    assert.equal(modules.occurrences.MAX_ANALYTICS_V2_BATCH_V12_ROWS, 40_000);
+  });
+
+// Review of c0600bc2 (the v1.2 expansion rewrite): the expansion probes the
+// participant's ready manifests for a batch's occurrence ids, so it must keep
+// excluding every variant of a requested id that is not in a complete chunk of
+// a ready manifest of this participant's generation. Each excluded variant has
+// its own event time, so any leak changes the occurrence (sourceCount, status
+// and event time), not just a count.
+test("the v1.2 expansion excludes a requested occurrence's staged, incomplete and foreign variants",
+  { skip: SKIP, timeout: 300_000 }, async () => {
+    const schema = `analytics_v2_a1_${randomBytes(6).toString("hex")}`;
+    await pool.query(`CREATE SCHEMA "${schema}"`);
+    schemas.push(schema);
+    await applyPostgresMigrations({ role: "primary", schema, pool });
+    const fixture = await seedAnalyticsV2Fixture({ pool, schema, modules: modules.seed, correctionRuntime: "active",
+      v12Scope: true });
+    const scoped = { pool, schema, nowMs: NOW_MS };
+    const read = (name) => modules.occurrences.readOwnerOccurrences(scoped,
+      { ownerDigest: fixture.owners[name].ownerDigest, stream: "usage", fromDay: D1, throughDay: D3 });
+    // Stored: india's eligible record and its staged and incomplete variants
+    // (one id, three event times), and juliet's record of the same id.
+    const stored = await pool.query(`SELECT manifest.participant_id, manifest.state, chunk.record_count,
+        count(DISTINCT record.occurrence_id)::integer AS ids, count(*)::integer AS records
+      FROM "${schema}".telemetry_v12_typed_records record
+      JOIN "${schema}".telemetry_v12_day_manifests manifest ON manifest.id=record.manifest_id
+      JOIN "${schema}".telemetry_v12_chunks chunk ON chunk.id=record.chunk_id
+     WHERE manifest.participant_id = ANY($1)
+     GROUP BY 1,2,3 ORDER BY 1,2,3`, [[fixture.owners.india.participantId, fixture.owners.juliet.participantId]]);
+    const india0 = fixture.owners.india.participantId, juliet0 = fixture.owners.juliet.participantId;
+    assert.deepEqual(stored.rows.map((row) => [row.participant_id === india0 ? "india" : row.participant_id === juliet0
+      ? "juliet" : "?", row.state, row.record_count, row.ids, row.records]).sort(),
+    [["india", "ready", 1, 1, 1], ["india", "ready", 2, 1, 1], ["india", "staged", 1, 1, 1],
+      ["juliet", "ready", 1, 1, 1]].sort(), "one eligible record and three ineligible variants are stored");
+    const ids = await pool.query(`SELECT count(DISTINCT record.occurrence_id)::integer AS n
+      FROM "${schema}".telemetry_v12_typed_records record
+      JOIN "${schema}".telemetry_v12_day_manifests manifest ON manifest.id=record.manifest_id
+     WHERE manifest.participant_id = ANY($1)`, [[india0, juliet0]]);
+    assert.equal(ids.rows[0].n, 1, "all four share one occurrence id");
+    const india = await read("india");
+    assert.deepEqual([...india.keys()], [D1]);
+    const occurrence = only(india.get(D1), OCCURRENCES.scoped);
+    assert.deepEqual({ status: occurrence.status, sourceFormats: occurrence.sourceFormats,
+      sourceCount: occurrence.sourceCount, eventTime: occurrence.eventTime },
+    { status: "compatible", sourceFormats: ["v12"], sourceCount: 1, eventTime: `${D1}T11:00:00.000Z` });
+    assert.equal(india.get(D1).length, 1);
+    // Another participant's record of the same id is that participant's own occurrence only.
+    const juliet = only((await read("juliet")).get(D1), OCCURRENCES.scoped);
+    assert.deepEqual({ status: juliet.status, sourceCount: juliet.sourceCount, eventTime: juliet.eventTime },
+      { status: "compatible", sourceCount: 1, eventTime: `${D1}T12:30:00.000Z` });
+    // The count the memory guard reads agrees with the expansion.
+    assert.deepEqual([...await modules.occurrences.countOwnerOccurrences(scoped,
+      { ownerDigest: fixture.owners.india.ownerDigest, stream: "usage", fromDay: D1, throughDay: D3 })], [[D1, 1]]);
+  });

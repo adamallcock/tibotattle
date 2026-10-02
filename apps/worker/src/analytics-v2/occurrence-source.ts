@@ -109,11 +109,25 @@ export const MAX_ANALYTICS_V2_OCCURRENCE_DAYS = 400;
 const FIRST_EVIDENCE_FLOOR_DAY_NUMBER = -100_000;
 /** Occurrence ids expanded per source batch (production's page bound). */
 const EXPANSION_BATCH = 200;
-/** Distinct source variants one batch may expand to (production's bound). */
-const MAX_BATCH_SOURCE_ROWS = 3_200;
-/** Distinct v1.2 variants one batch may expand to (production's bound). */
-const MAX_BATCH_V12_ROWS = 16_384;
-/** Candidate coordinates one call may select before failing closed. */
+/**
+ * Distinct legacy or correction source variants one 200-id batch may expand
+ * to: 200 variants per occurrence. d43c8f92's Worker reader stops at 3,200
+ * (telemetry-usage-effective-reader.ts), a D1 statement bound; the GCP job
+ * holds one batch in memory (about 2 KB per variant), so it reconciles every
+ * variant production's reconcileGroups would see up to this bound.
+ */
+export const MAX_ANALYTICS_V2_BATCH_SOURCE_ROWS = 40_000;
+/** Distinct v1.2 variants one 200-id batch may expand to (production's Worker bound is 16,384). */
+export const MAX_ANALYTICS_V2_BATCH_V12_ROWS = 40_000;
+const MAX_BATCH_SOURCE_ROWS = MAX_ANALYTICS_V2_BATCH_SOURCE_ROWS;
+const MAX_BATCH_V12_ROWS = MAX_ANALYTICS_V2_BATCH_V12_ROWS;
+/**
+ * Candidate coordinates one call may select before failing closed. The Job
+ * splits its reads by the exact counts of countOwnerOccurrences so that a
+ * call stays near its configured read chunk; this is the hard ceiling, and a
+ * day larger than it refuses its owner before any read (resources.ts
+ * ANALYTICS_V2_MAX_READ_DAY_OCCURRENCES).
+ */
 export const MAX_ANALYTICS_V2_CANDIDATES = 2_000_000;
 
 const OCCURRENCE_ID = /^[A-Za-z0-9._:-]{8,128}$/u;
@@ -537,29 +551,63 @@ function v12CandidatesSql(s: string): string {
     GROUP BY domain_day.observed_day,r.occurrence_id`;
 }
 
-/** $1 participant, $2 stream, $3 now, $4 occurrence ids (hex text[]), $5 limit. */
+/**
+ * $1 participant, $2 stream, $3 now, $4 occurrence ids (hex text[]), $5 limit.
+ *
+ * The selection is production's: every record of a requested occurrence and
+ * stream in a complete chunk of a ready manifest of the participant's
+ * owner-linked generation on a retained authorization. The statement is
+ * shaped so its cost follows the batch, not the owner. No index leads with
+ * occurrence_id, and the planner's estimate of the chunk-completeness chain
+ * collapses to one row, so an unfenced join walks every record of the owner
+ * for each 200-id batch (about 1.7 s a batch for a 300,000-record owner: a
+ * read quadratic in owner size). Here the participant's ready manifests are
+ * fenced first, each is probed once on its (manifest_id, stream,
+ * occurrence_id) key for the batch's ids, and each matched record is then
+ * checked against the same joins in a fenced LATERAL (OFFSET 0 keeps it per
+ * record). The manifest filter is implied by the joins it precedes
+ * (manifest.participant_id = chunk.participant_id =
+ * generation.participant_id = $1, state ready), so the rows, their
+ * multiplicity and the grouping below are unchanged.
+ */
 function v12OccurrencesSql(s: string): string {
   return `WITH requested AS MATERIALIZED (
       SELECT DISTINCT decode(value,'hex') AS occurrence_id FROM unnest($4::text[]) value
+    ), owner_manifests AS MATERIALIZED (
+      SELECT owned.id FROM ${s}.telemetry_v12_day_manifests owned
+       WHERE owned.participant_id=$1 AND owned.state='ready'
+    ), matched AS MATERIALIZED (
+      SELECT probe.id FROM owner_manifests owned
+        CROSS JOIN LATERAL (
+          SELECT r.id FROM ${s}.telemetry_v12_typed_records r
+           WHERE r.manifest_id=owned.id AND r.stream=$2
+             AND r.occurrence_id=ANY(ARRAY(SELECT wanted.occurrence_id FROM requested wanted))
+          OFFSET 0
+        ) probe
+    ), retained_auth AS MATERIALIZED (
+      ${v12RetainedAuthorizationScopeSql(s, "$3::timestamptz", "reader")}
     ), eligible AS MATERIALIZED (
-      SELECT r.id,r.occurrence_id,r.observed_at_ms,r.canonical_digest,generation.device_id AS source_device_id
-        FROM requested wanted
-        JOIN ${s}.telemetry_v12_typed_records r ON r.occurrence_id=wanted.occurrence_id AND r.stream=$2
-        JOIN ${s}.telemetry_v12_chunks chunk ON chunk.id=r.chunk_id AND chunk.manifest_id=r.manifest_id
-         AND chunk.stream=$2
-         AND chunk.record_count=(SELECT count(*) FROM ${s}.telemetry_v12_typed_records complete
-           WHERE complete.chunk_id=chunk.id)
-        JOIN ${s}.telemetry_v12_day_manifests manifest ON manifest.id=r.manifest_id
-         AND manifest.participant_id=chunk.participant_id AND manifest.device_id=chunk.device_id
-         AND manifest.state='ready'
-        JOIN ${s}.telemetry_v12_domain_days domain_day ON domain_day.manifest_id=manifest.id
-         AND domain_day.manifest_digest=manifest.manifest_digest
-        JOIN ${s}.telemetry_v12_domains generation ON generation.id=domain_day.generation_id
-         AND generation.participant_id=chunk.participant_id AND generation.device_id=chunk.device_id
-        JOIN (${v12RetainedAuthorizationScopeSql(s, "$3::timestamptz", "reader")}) retained_auth
-          ON retained_auth.participant_id=generation.participant_id
-         AND retained_auth.device_id=generation.device_id
-       WHERE generation.participant_id=$1
+      SELECT r.id,r.occurrence_id,r.observed_at_ms,r.canonical_digest,scope.source_device_id
+        FROM matched
+        JOIN ${s}.telemetry_v12_typed_records r ON r.id=matched.id
+        CROSS JOIN LATERAL (
+          SELECT generation.device_id AS source_device_id
+            FROM ${s}.telemetry_v12_chunks chunk
+            JOIN ${s}.telemetry_v12_day_manifests manifest ON manifest.id=r.manifest_id
+             AND manifest.participant_id=chunk.participant_id AND manifest.device_id=chunk.device_id
+             AND manifest.state='ready'
+            JOIN ${s}.telemetry_v12_domain_days domain_day ON domain_day.manifest_id=manifest.id
+             AND domain_day.manifest_digest=manifest.manifest_digest
+            JOIN ${s}.telemetry_v12_domains generation ON generation.id=domain_day.generation_id
+             AND generation.participant_id=chunk.participant_id AND generation.device_id=chunk.device_id
+            JOIN retained_auth ON retained_auth.participant_id=generation.participant_id
+             AND retained_auth.device_id=generation.device_id
+           WHERE chunk.id=r.chunk_id AND chunk.manifest_id=r.manifest_id AND chunk.stream=$2
+             AND chunk.record_count=(SELECT count(*) FROM ${s}.telemetry_v12_typed_records complete
+               WHERE complete.chunk_id=chunk.id)
+             AND generation.participant_id=$1
+          OFFSET 0
+        ) scope
     ), grouped AS MATERIALIZED (
       SELECT min(id) AS id FROM eligible
        GROUP BY source_device_id,occurrence_id,observed_at_ms,canonical_digest
@@ -978,6 +1026,63 @@ export async function readOwnerOccurrences(
       output.set(dayFromNumber(day), rows);
     }
     return output;
+  });
+}
+
+/** Renumber a statement's $n parameters by `offset` so several statements share one parameter list. */
+function shiftParameters(sql: string, offset: number): string {
+  return sql.replace(/\$(\d+)/gu, (_match, index: string) => `$${Number(index) + offset}`);
+}
+
+/**
+ * The exact number of occurrences readOwnerOccurrences returns for each
+ * observed day of [fromDay, throughDay], without expanding or decoding any
+ * source: the distinct (observed day, occurrence) candidates of the same
+ * selection (v1/v1.1 typed records, v1.2 domain days, and usage-correction
+ * facts when the runtime is active), counted in SQL. The reader emits one
+ * occurrence per candidate and day, so the analytics-refresh Job uses these
+ * counts for its memory guard and read spans before reading anything, and
+ * A-2 refuses a load whose counts differ. Days without candidates are absent.
+ */
+export async function countOwnerOccurrences(
+  context: AnalyticsV2SnapshotContext,
+  options: Omit<ReadOwnerOccurrencesOptions, "maxCandidates">,
+): Promise<Map<AnalyticsV2Day, number>> {
+  const s = quotedSchema(context.schema);
+  const now = nowTimestamp(context.nowMs);
+  const { ownerDigest, stream, fromDay, throughDay } = normalizeOptions({
+    ownerDigest: options?.ownerDigest, stream: options?.stream, fromDay: options?.fromDay,
+    throughDay: options?.throughDay,
+  } as ReadOwnerOccurrencesOptions);
+  return onReadSnapshot(context, async (client) => {
+    const scope = await readOwnerScope(client, s, ownerDigest);
+    const participantId = scope.participantId;
+    const sources: string[] = [];
+    const values: unknown[] = [];
+    const add = (sql: string, binds: readonly unknown[]): void => {
+      sources.push(`SELECT observed_day,occurrence_id FROM (${shiftParameters(sql, values.length)}) source`);
+      values.push(...binds);
+    };
+    if (scope.v1Namespace !== null || scope.v11Namespace !== null) {
+      add(legacyCandidatesSql(s), [ownerDigest, participantId, STREAM_CODES[stream], stream, fromDay, throughDay]);
+    }
+    if (scope.v12HeadActive) {
+      add(v12CandidatesSql(s), [participantId, stream, now, dayFromNumber(fromDay), dayFromNumber(throughDay)]);
+    }
+    if (stream === "usage" && scope.correctionActive) {
+      add(correctionCandidatesSql(s), [ownerDigest, fromDay * DAY_MS, (throughDay + 1) * DAY_MS]);
+    }
+    const counts = new Map<AnalyticsV2Day, number>();
+    if (sources.length === 0) return counts;
+    const result = await client.query<Record<string, unknown>>(
+      `SELECT observed_day,count(*)::text AS occurrences FROM (${sources.join("\nUNION\n")}) candidate
+        GROUP BY observed_day ORDER BY observed_day`, values);
+    for (const row of result.rows) {
+      const day = safeInteger(row.observed_day, -100_000, 100_000);
+      if (day < fromDay || day > throughDay) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+      counts.set(dayFromNumber(day), safeInteger(row.occurrences, 1));
+    }
+    return counts;
   });
 }
 

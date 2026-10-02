@@ -71,6 +71,18 @@ export async function analyticsV2DayDigest(day: AnalyticsV2Day,
 }
 
 /**
+ * The digest that stands for an owner-day the backstop or the kernels refused
+ * to prepare. Such a day is never serialized (its evidence may be larger than
+ * one string can hold), and every window containing it is refused
+ * (incomplete_window) before its pin is used, so this marker never identifies
+ * a result. Its preimage cannot equal analyticsV2DayDigest's: the third
+ * element is a string here and an object there.
+ */
+export async function analyticsV2RefusedDayDigest(day: AnalyticsV2Day): Promise<string> {
+  return sha256Hex(canonicalJson([ANALYTICS_V2_PIN_METHOD, day, "refused"]));
+}
+
+/**
  * The pin for evaluating `day` (the scalar fit for today, or one model date)
  * over modelHistoryWindow(day). `dayDigests` must hold the digest of every
  * day of that window; a missing day is a caller defect and throws.

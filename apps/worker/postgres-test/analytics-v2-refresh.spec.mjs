@@ -67,6 +67,8 @@ const STAND_IN_HORIZON = Object.freeze({ ownerDayFromDay: "2026-01-01", cacheBan
 let vite;
 let contract;
 let store;
+/** resources.ts: the GCP bounds the Job's environment mirrors. */
+let resources;
 /** The real A-1 readers and A-2 compute core, as the Job bundles them. */
 let a1;
 let a2;
@@ -88,6 +90,7 @@ before(async () => {
   const load = (path) => vite.ssrLoadModule(path);
   contract = await load("/src/analytics-v2/contract.ts");
   store = await load("/src/analytics-v2/store.ts");
+  resources = await load("/src/analytics-v2/resources.ts");
   a1 = {
     owners: await load("/src/analytics-v2/owners.ts"),
     occurrences: await load("/src/analytics-v2/occurrence-source.ts"),
@@ -393,8 +396,14 @@ function createSpecPipeline(hooks = {}) {
   };
 }
 
+/**
+ * In-process runs use Node's default heap (about 4 GiB), so the per-owner
+ * budget is set to its minimum (1,024 MiB): the heap check then needs about
+ * 2.5 GiB. The default budget (4,608 MiB) needs --max-old-space-size=6144,
+ * as the Job is deployed.
+ */
 function jobEnvironment(extra = {}) {
-  const env = { ANALYTICS_V2_TEST_CLOCK: "1", ...extra };
+  const env = { ANALYTICS_V2_TEST_CLOCK: "1", ANALYTICS_V2_MEMORY_BUDGET_MIB: "1024", ...extra };
   for (const name of ["PG_TEST_SOCKET", "PG_TEST_HOST", "PG_TEST_PORT", "PG_TEST_USER",
     "PG_TEST_DATABASE", "PG_TEST_PASSWORD"]) {
     if (process.env[name]) env[name] ??= process.env[name];
@@ -436,6 +445,79 @@ test("contract constants: the Job mirrors the lock key and the build entry", () 
   assert.equal(job.ANALYTICS_REFRESH_ENTRY, contract.ANALYTICS_V2_REFRESH_ENTRY);
   assert.deepEqual([...job.ANALYTICS_REFRESH_MODES], [...contract.ANALYTICS_V2_MODES]);
   assert.equal(contract.ANALYTICS_V2_MIGRATION.name, STAGED_FILE);
+});
+
+test("resource constants: the Job's environment mirrors resources.ts; every roster A-1 lists can be written", () => {
+  const MIB = 1_048_576;
+  const bounds = resources.ANALYTICS_V2_RESOURCE_BOUNDS;
+  const env = job.ANALYTICS_REFRESH_RESOURCE_ENV;
+  const inMiB = (bound) => ({ minimum: bound.minimum / MIB, maximum: bound.maximum / MIB, default: bound.default / MIB });
+  const pick = ({ minimum, maximum, default: value }) => ({ minimum, maximum, default: value });
+  assert.deepEqual(pick(env.memoryBudgetMiB), inMiB(bounds.memoryBudgetBytes));
+  assert.deepEqual(pick(env.maxDayOccurrences), pick(bounds.maxDayOccurrences));
+  assert.deepEqual(pick(env.maxDayRecordMiB), inMiB(bounds.maxDayRecordBytes));
+  assert.equal(job.ANALYTICS_REFRESH_MAX_READ_CANDIDATES, a1.occurrences.MAX_ANALYTICS_V2_CANDIDATES);
+  assert.equal(job.ANALYTICS_REFRESH_MAX_READ_CANDIDATES, resources.ANALYTICS_V2_MAX_READ_DAY_OCCURRENCES);
+  assert.ok(env.readChunkOccurrences.maximum <= job.ANALYTICS_REFRESH_MAX_READ_CANDIDATES);
+  assert.equal(store.ANALYTICS_V2_OUTPUT_LIMITS.owners, a1.owners.MAX_ANALYTICS_V2_OWNERS);
+});
+
+test("resources: environment within bounds, and a heap that covers the budget plus the reserve", () => {
+  const MIB = 1_048_576;
+  const heap = 6_192 * MIB;
+  const defaults = job.analyticsRefreshResources({}, heap);
+  assert.deepEqual(defaults.compute, resources.ANALYTICS_V2_DEFAULT_RESOURCES);
+  assert.equal(defaults.readChunkOccurrences, 250_000);
+  // 4,608 MiB + 512 MiB + 250,000 x 4 KiB: --max-old-space-size=6144 (heap limit 6,192 MiB) is enough.
+  assert.equal(defaults.requiredHeapBytes, 5_120 * MIB + 250_000 * 4_096);
+  assert.ok(defaults.requiredHeapBytes <= heap);
+  assert.throws(() => job.analyticsRefreshResources({}, 4_144 * MIB), { code: "ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT" });
+  const tuned = job.analyticsRefreshResources({ ANALYTICS_V2_MEMORY_BUDGET_MIB: "26624",
+    ANALYTICS_V2_MAX_DAY_OCCURRENCES: "20000", ANALYTICS_V2_MAX_DAY_RECORD_MIB: "32",
+    ANALYTICS_V2_READ_CHUNK_OCCURRENCES: "1000000" }, 32_768 * MIB);
+  assert.deepEqual(tuned.compute, { memoryBudgetBytes: 26_624 * MIB, maxDayOccurrences: 20_000,
+    maxDayRecordBytes: 32 * MIB });
+  for (const [name, value] of [
+    ["ANALYTICS_V2_MEMORY_BUDGET_MIB", "1023"], ["ANALYTICS_V2_MEMORY_BUDGET_MIB", "30721"],
+    ["ANALYTICS_V2_MEMORY_BUDGET_MIB", "4608.5"], ["ANALYTICS_V2_MEMORY_BUDGET_MIB", "0x1200"],
+    ["ANALYTICS_V2_MAX_DAY_OCCURRENCES", "19999"], ["ANALYTICS_V2_MAX_DAY_OCCURRENCES", "250001"],
+    ["ANALYTICS_V2_MAX_DAY_RECORD_MIB", "31"], ["ANALYTICS_V2_MAX_DAY_RECORD_MIB", "257"],
+    ["ANALYTICS_V2_READ_CHUNK_OCCURRENCES", "9999"], ["ANALYTICS_V2_READ_CHUNK_OCCURRENCES", "2000001"],
+    ["ANALYTICS_V2_READ_CHUNK_OCCURRENCES", " 250000"],
+  ]) {
+    assert.throws(() => job.analyticsRefreshResources({ [name]: value }, 64 * 1_024 * MIB),
+      (error) => error.code === "ANALYTICS_V2_REFRESH_RESOURCES_INVALID" && error.field === name, `${name}=${value}`);
+  }
+});
+
+test("read spans: contiguous, at most the day bound, and about the read chunk by the exact counts", () => {
+  const range = { fromDay: "2026-01-01", throughDay: "2026-01-10" };
+  const counts = new Map([["2026-01-02", 6], ["2026-01-03", 5], ["2026-01-05", 20], ["2026-01-09", 1]]);
+  assert.deepEqual(job.analyticsRefreshReadSpans(range, 4, counts, 10), [
+    { fromDay: "2026-01-01", throughDay: "2026-01-02", occurrences: 6 },
+    { fromDay: "2026-01-03", throughDay: "2026-01-04", occurrences: 5 },
+    // A day over the chunk is a span of its own; A-1 never splits a day.
+    { fromDay: "2026-01-05", throughDay: "2026-01-05", occurrences: 20 },
+    { fromDay: "2026-01-06", throughDay: "2026-01-09", occurrences: 1 },
+    { fromDay: "2026-01-10", throughDay: "2026-01-10", occurrences: 0 },
+  ]);
+  // Without counts the spans are the plain day chunks.
+  assert.deepEqual(job.analyticsRefreshReadSpans(range, 4, new Map(), 10)
+    .map(({ fromDay, throughDay }) => ({ fromDay, throughDay })), job.analyticsRefreshRangeChunks(range, 4));
+});
+
+test("(f, heap) a heap below the budget plus the reserve is refused before any database work", async () => {
+  let pools = 0;
+  await assert.rejects(job.runAnalyticsRefresh({
+    argv: ["--mode=full", "--schema=analytics_v2_heap_refusal"],
+    env: { PG_TEST_SOCKET: "/private/tmp/tibotattle-pg-unused/socket" },
+    dependencies: { heapLimitBytes: 2_048 * 1_048_576, createPool: () => { pools += 1; return {}; } },
+  }), (error) => {
+    assert.equal(error.code, "ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT");
+    assert.equal(error.phase, "configuration");
+    return true;
+  });
+  assert.equal(pools, 0);
 });
 
 test("PG17: 0059 applies within the primary migration chain and creates exactly the contract tables", {
@@ -512,16 +594,21 @@ test("PG17: 0059 constraints refuse malformed digests, bands, counters, reasons 
       await expectRefusal(ownerDay, [OWNER_A, DAY_1, "{}", "usage_window_unrepresentable", runId], "23514");
       await expectRefusal(ownerDay, [OWNER_A, DAY_1, null, "free_form_reason", runId], "23514");
       // The owner-day CHECK accepts exactly the contract's owner-day reasons.
-      // The cache-only reasons never replace prepared daily values, so 0059
-      // refuses them there; together the two loops cover every closed reason.
+      // The cache-only reasons never replace prepared daily values, and the
+      // owner-only reasons (memory_budget) refuse an owner that writes no
+      // owner-scoped row, so 0059 refuses both there; together the three
+      // loops cover every closed reason.
       assert.deepEqual(
-        [...contract.ANALYTICS_V2_OWNER_DAY_REFUSAL_REASONS, ...contract.ANALYTICS_V2_CACHE_ONLY_REFUSAL_REASONS].sort(),
+        [...contract.ANALYTICS_V2_OWNER_DAY_REFUSAL_REASONS, ...contract.ANALYTICS_V2_CACHE_ONLY_REFUSAL_REASONS,
+          ...contract.ANALYTICS_V2_OWNER_ONLY_REFUSAL_REASONS].sort(),
         [...contract.ANALYTICS_V2_REFUSAL_REASONS].sort(),
       );
+      assert.deepEqual([...contract.ANALYTICS_V2_OWNER_ONLY_REFUSAL_REASONS], ["memory_budget"]);
       for (const reason of contract.ANALYTICS_V2_OWNER_DAY_REFUSAL_REASONS) {
         await accept(ownerDay, [OWNER_A, DAY_1, null, reason, runId]);
       }
-      for (const reason of contract.ANALYTICS_V2_CACHE_ONLY_REFUSAL_REASONS) {
+      for (const reason of [...contract.ANALYTICS_V2_CACHE_ONLY_REFUSAL_REASONS,
+        ...contract.ANALYTICS_V2_OWNER_ONLY_REFUSAL_REASONS]) {
         await expectRefusal(ownerDay, [OWNER_A, DAY_1, null, reason, runId], "23514");
       }
 
@@ -932,6 +1019,53 @@ test("PG17: the store refuses invalid outputs before writing", {
       client.release();
     }
   });
+});
+
+test("the store's resource record is closed and agrees with the owner refusals; a refused owner writes nothing", async () => {
+  // Validation only (assertAnalyticsV2RunOutputs runs before any database work).
+  const owners = [contractOwner(OWNER_A, "effective"), contractOwner(OWNER_B, "effective")];
+  const configuration = { memoryModel: "analytics-v2-memory-model-v1", memoryBudgetBytes: 1_073_741_824,
+    maxDayOccurrences: 250_000, maxDayRecordBytes: 268_435_456 };
+  const entry = (ownerDigest, admitted) => ({ ownerDigest, usage: 3, quota: 2, session: 1, analysisUsage: 3,
+    maxDayOccurrences: 6, estimateBytes: 134_217_728, admitted, heapPeakBytes: admitted ? 1_000 : null });
+  const ordered = [OWNER_A, OWNER_B].sort();
+  const refusedB = [{ ownerDigest: OWNER_B, day: null, family: "owner", reason: "memory_budget" },
+    { ownerDigest: OWNER_B, day: DAY_1, family: "daily", reason: "memory_budget" }];
+  const outputs = (overrides = {}) => minimalOutputs({ owners, refusals: refusedB, blockedDays: [DAY_1],
+    resources: { configuration, owners: ordered.map((digest) => entry(digest, digest !== OWNER_B)) }, ...overrides });
+  const check = (value) => store.assertAnalyticsV2RunOutputs(value, STAND_IN_HORIZON);
+  await check(outputs());
+  await check(outputs({ resources: undefined }));
+  // The refused owner is not computed: no owner-scoped row may name it.
+  await assert.rejects(check(outputs({ ownerDays: [{ ownerDigest: OWNER_B, day: DAY_1, daily: {}, refusal: null }] })),
+    { code: "ANALYTICS_V2_OUTPUTS_INVALID", field: "ownerDays.ownerDigest" });
+  await assert.rejects(check(outputs({ ownerFits: [{ ownerDigest: OWNER_B, asOfDay: DAY_1, fits: [] }] })),
+    { code: "ANALYTICS_V2_OUTPUTS_INVALID", field: "ownerFits.ownerDigest" });
+  // memory_budget is owner-only: never an owner-day refusal.
+  await assert.rejects(check(outputs({ ownerDays: [{ ownerDigest: OWNER_A, day: DAY_1, daily: null,
+    refusal: "memory_budget" }] })), { code: "ANALYTICS_V2_OUTPUTS_INVALID", field: "ownerDays.refusal" });
+  // `admitted` must be false exactly for the owners refused as a whole.
+  await assert.rejects(check(outputs({ resources: { configuration,
+    owners: ordered.map((digest) => entry(digest, true)) } })),
+  { code: "ANALYTICS_V2_OUTPUTS_INVALID", field: "resources.owners.admitted" });
+  await assert.rejects(check(outputs({ refusals: [] })),
+    { code: "ANALYTICS_V2_OUTPUTS_INVALID", field: "resources.owners.admitted" });
+  // Closed shapes: no extra key, one entry per effective owner in digest order, no heap for a refused owner.
+  await assert.rejects(check(outputs({ resources: { configuration: { ...configuration, extra: 1 },
+    owners: ordered.map((digest) => entry(digest, digest !== OWNER_B)) } })),
+  { code: "ANALYTICS_V2_OUTPUTS_INVALID", field: "resources.configuration" });
+  await assert.rejects(check(outputs({ resources: { configuration,
+    owners: [...ordered].reverse().map((digest) => entry(digest, digest !== OWNER_B)) } })),
+  { code: "ANALYTICS_V2_OUTPUTS_INVALID", field: "resources.owners.ownerDigest" });
+  await assert.rejects(check(outputs({ resources: { configuration,
+    owners: ordered.filter((digest) => digest === OWNER_A).map((digest) => entry(digest, true)) } })),
+  { code: "ANALYTICS_V2_OUTPUTS_INVALID", field: "resources.owners" });
+  await assert.rejects(check(outputs({ resources: { configuration, owners: ordered.map((digest) =>
+    ({ ...entry(digest, digest !== OWNER_B), heapPeakBytes: 5 })) } })),
+  { code: "ANALYTICS_V2_OUTPUTS_INVALID", field: "resources.owners.heapPeakBytes" });
+  await assert.rejects(check(outputs({ resources: { configuration, owners: ordered.map((digest) =>
+    ({ ...entry(digest, digest !== OWNER_B), contentHint: "x" })) } })),
+  { code: "ANALYTICS_V2_OUTPUTS_INVALID", field: "resources.owners" });
 });
 
 test("PG17: bulk owner families are written in bounded chunks with exact row counts", {
@@ -1388,7 +1522,8 @@ const occurrence = (ownerDigest, day) => ({ ownerDigest, day, occurrenceId: `wir
  * 2026-03-02 and 2026-09-29, OWNER_B (v1.1, typed) on 2026-09-30.
  */
 function wiringModules({ unlinked = [], failOwner = null, ownerAEvidence = ["2026-03-02", "2026-09-29"] } = {}) {
-  const calls = { owners: 0, queued: [], occurrences: [], firstEvidence: [], devices: [], compute: null };
+  const calls = { owners: 0, queued: [], occurrences: [], counts: [], firstEvidence: [], devices: [], compute: null,
+    loaded: new Map() };
   const evidence = new Map([[OWNER_A, ownerAEvidence], [OWNER_B, ["2026-09-30"]]]);
   const pages = new Map([
     [0, { days: ["2026-09-30"], lastSequence: 5, terminalOwners: [digest("terminal")], events: 5, complete: false }],
@@ -1420,6 +1555,19 @@ function wiringModules({ unlinked = [], failOwner = null, ownerAEvidence = ["202
           const days = (evidence.get(options.ownerDigest) ?? []).filter((day) => day <= options.throughDay).sort();
           return days[0] ?? null;
         },
+        async countOwnerOccurrences(context, options) {
+          assert.equal(context.nowMs, WIRING_NOW_MS);
+          calls.counts.push({ ...options });
+          if (options.ownerDigest === failOwner) {
+            throw Object.assign(new Error("ANALYTICS_V2_SOURCE_CONFLICT"), { code: "ANALYTICS_V2_SOURCE_CONFLICT" });
+          }
+          const result = new Map();
+          if (options.stream !== "usage") return result;
+          for (const day of evidence.get(options.ownerDigest) ?? []) {
+            if (day >= options.fromDay && day <= options.throughDay) result.set(day, 1);
+          }
+          return result;
+        },
         async readOwnerOccurrences(context, options) {
           assert.equal(context.nowMs, WIRING_NOW_MS);
           calls.occurrences.push({ ...options });
@@ -1448,6 +1596,12 @@ function wiringModules({ unlinked = [], failOwner = null, ownerAEvidence = ["202
         analyticsV2RequiredOccurrenceRange: a2.analyticsV2RequiredOccurrenceRange,
         async computeAnalyticsV2(input) {
           calls.compute = input;
+          // As A-2 does: each effective owner is loaded once, in digest order.
+          for (const owner of [...input.owners].sort((left, right) => (left.ownerDigest < right.ownerDigest ? -1 : 1))) {
+            if (owner.source === "effective") {
+              calls.loaded.set(owner.ownerDigest, await input.loadOwnerOccurrences(owner.ownerDigest));
+            }
+          }
           return {
             contractVersion: contract.ANALYTICS_V2_CONTRACT_VERSION, mode: "full", nowMs: input.nowMs,
             today: utcDay(input.nowMs), revisionSeed: input.revisionSeed, owners: input.owners, ownerDays: [],
@@ -1494,13 +1648,20 @@ test("default wiring: A-1 shapes in, one contiguous A-2 range out, non-effective
   assert.deepEqual({ ...inputs.occurrenceRange }, required);
   assert.deepEqual(required, { fromDay: "2026-02-13", throughDay: "2026-10-01" });
 
-  // The effective owner: every stream over the whole range, in contiguous chunks of at most 30 days.
+  // The effective owner is counted, not read, during read: every stream over
+  // the whole range, in contiguous chunks of at most 30 days.
   const rangeDays = spannedDays([required]);
   for (const stream of ["usage", "quota", "session"]) {
-    const reads = calls.occurrences.filter((call) => call.ownerDigest === OWNER_A && call.stream === stream);
-    assert.ok(reads.every((call) => spannedDays([call]).length <= 30));
-    assert.deepEqual(spannedDays(reads), rangeDays, stream);
+    const counts = calls.counts.filter((call) => call.ownerDigest === OWNER_A && call.stream === stream);
+    assert.ok(counts.every((call) => spannedDays([call]).length <= 30));
+    assert.deepEqual(spannedDays(counts), rangeDays, stream);
   }
+  assert.equal(calls.occurrences.some((call) => call.ownerDigest === OWNER_A), false, "read only while computing");
+  assert.equal(calls.counts.some((call) => call.ownerDigest !== OWNER_A), false, "only effective owners are counted");
+  assert.deepEqual([...inputs.ownerEvidence.keys()], [OWNER_A]);
+  assert.deepEqual([...inputs.ownerEvidence.get(OWNER_A)], [
+    ["2026-03-02", { usage: 1, quota: 0, session: 0 }], ["2026-09-29", { usage: 1, quota: 0, session: 0 }],
+  ]);
   // The non-effective typed owner: the queued days only. The v0.2 owner: never read.
   const ownerBReads = calls.occurrences.filter((call) => call.ownerDigest === OWNER_B);
   assert.deepEqual(ownerBReads.filter((call) => call.stream === "usage").map(({ fromDay, throughDay }) =>
@@ -1511,10 +1672,8 @@ test("default wiring: A-1 shapes in, one contiguous A-2 range out, non-effective
   ]);
   assert.equal(ownerBReads.length, 9);
   assert.equal(calls.occurrences.some((call) => call.ownerDigest === OWNER_LEGACY), false);
-  assert.deepEqual([...inputs.occurrencesByOwner.keys()], [OWNER_B, OWNER_A].sort());
+  assert.deepEqual([...inputs.occurrencesByOwner.keys()], [OWNER_B]);
   assert.deepEqual([...inputs.occurrencesByOwner.get(OWNER_B).keys()], ["2026-09-30"]);
-  assert.deepEqual(inputs.occurrencesByOwner.get(OWNER_A).get("2026-09-29"),
-    { usage: [occurrence(OWNER_A, "2026-09-29")], quota: [], session: [] });
 
   // Devices: every queued day, with the effective owners that have evidence on it.
   assert.equal(calls.devices.length, 1);
@@ -1525,6 +1684,21 @@ test("default wiring: A-1 shapes in, one contiguous A-2 range out, non-effective
   ]);
 
   const outputs = await pipeline.compute(inputs, { nowMs: WIRING_NOW_MS, revisionSeed: 3 });
+  // While computing, the effective owner is read once over the whole range:
+  // every stream in contiguous chunks of at most 30 days, each bounded by the read chunk.
+  for (const stream of ["usage", "quota", "session"]) {
+    const reads = calls.occurrences.filter((call) => call.ownerDigest === OWNER_A && call.stream === stream);
+    assert.ok(reads.every((call) => spannedDays([call]).length <= 30));
+    assert.deepEqual(spannedDays(reads), rangeDays, stream);
+    assert.ok(reads.every((call) => call.maxCandidates === job.ANALYTICS_REFRESH_RESOURCE_ENV.readChunkOccurrences.default));
+  }
+  assert.deepEqual([...calls.loaded.keys()], [OWNER_A]);
+  assert.deepEqual([...calls.loaded.get(OWNER_A).keys()], ["2026-03-02", "2026-09-29"]);
+  assert.deepEqual(calls.loaded.get(OWNER_A).get("2026-09-29"),
+    { usage: [occurrence(OWNER_A, "2026-09-29")], quota: [], session: [] });
+  assert.equal(calls.compute.ownerEvidence, inputs.ownerEvidence);
+  assert.equal(calls.compute.occurrencesByOwner, inputs.occurrencesByOwner);
+  assert.equal(typeof calls.compute.memoryProbe, "function");
   assert.equal(calls.compute.occurrenceRange, inputs.occurrenceRange);
   assert.equal(calls.compute.cacheFromDay, "2026-02-20");
   assert.deepEqual(calls.compute.queuedDays, queued);
@@ -1547,10 +1721,13 @@ test("default wiring: cache history starts at the first evidence day, older than
   assert.equal(inputs.firstEvidenceDay, "2024-11-03");
   assert.equal(inputs.cacheFromDay, "2024-11-03");
   assert.deepEqual({ ...inputs.occurrenceRange }, { fromDay: "2024-10-27", throughDay: "2026-10-01" });
-  assert.deepEqual([...inputs.occurrencesByOwner.get(OWNER_A).keys()], ["2024-11-03", "2026-09-29"]);
+  assert.deepEqual([...inputs.ownerEvidence.get(OWNER_A).keys()], ["2024-11-03", "2026-09-29"]);
+  const counts = calls.counts.filter((call) => call.ownerDigest === OWNER_A && call.stream === "usage");
+  assert.deepEqual(spannedDays(counts), spannedDays([inputs.occurrenceRange]), "the whole history is counted");
+  const outputs = await pipeline.compute(inputs, { nowMs: WIRING_NOW_MS, revisionSeed: 0 });
+  assert.deepEqual([...calls.loaded.get(OWNER_A).keys()], ["2024-11-03", "2026-09-29"]);
   const reads = calls.occurrences.filter((call) => call.ownerDigest === OWNER_A && call.stream === "usage");
   assert.deepEqual(spannedDays(reads), spannedDays([inputs.occurrenceRange]), "the whole history is read");
-  const outputs = await pipeline.compute(inputs, { nowMs: WIRING_NOW_MS, revisionSeed: 0 });
   assert.equal(calls.compute.cacheFromDay, "2024-11-03");
   assert.deepEqual(outputs.horizon, { ownerDayFromDay: "2024-10-27", cacheBandsFromDay: "2024-11-03" });
   // A pipeline without the first-evidence reader cannot be built.
@@ -1579,16 +1756,31 @@ test("default wiring: an unlinked typed owner blocks every queued day; a non-eff
   const inputs = await pipeline.read({ pool: {}, schema: "s", nowMs: WIRING_NOW_MS, state: WIRING_STATE });
   // OWNER_B's closed source refusal leaves it unread: A-2 then blocks every queued day for it.
   assert.equal(inputs.occurrencesByOwner.has(OWNER_B), false);
-  assert.equal(inputs.occurrencesByOwner.has(OWNER_A), true);
+  assert.equal(inputs.ownerEvidence.has(OWNER_A), true);
   const outputs = await pipeline.compute(inputs, { nowMs: WIRING_NOW_MS, revisionSeed: 0 });
   assert.deepEqual(outputs.dailyCandidates, []);
   assert.deepEqual(outputs.blockedDays, ["2026-03-02", "2026-04-10", "2026-09-29", "2026-09-30"]);
   assert.deepEqual(outputs.readSummary, { unlinkedTypedOwners: 1, terminalOwners: 1, nonEffectiveUnread: 1 });
 
-  // The same refusal for an effective owner fails the run.
+  // The same refusal for an effective owner fails the run: at its count
+  // (read) and, should only its read refuse, at its load (compute).
   const failing = wiringModules({ failOwner: OWNER_A });
   await assert.rejects(job.createAnalyticsV2Pipeline(failing.modules)
     .read({ pool: {}, schema: "s", nowMs: WIRING_NOW_MS, state: WIRING_STATE }), { code: "ANALYTICS_V2_SOURCE_CONFLICT" });
+  const failingRead = wiringModules();
+  const readOnly = failingRead.modules.occurrences.readOwnerOccurrences;
+  failingRead.modules.occurrences.readOwnerOccurrences = async (context, options) => {
+    if (options.ownerDigest === OWNER_A) {
+      throw Object.assign(new Error("ANALYTICS_V2_SOURCE_LIMIT"), { code: "ANALYTICS_V2_SOURCE_LIMIT" });
+    }
+    return readOnly(context, options);
+  };
+  const failingPipeline = job.createAnalyticsV2Pipeline(failingRead.modules);
+  await assert.rejects(failingPipeline.compute(await failingPipeline.read({ pool: {}, schema: "s", nowMs: WIRING_NOW_MS,
+    state: WIRING_STATE }), { nowMs: WIRING_NOW_MS, revisionSeed: 0 }), { code: "ANALYTICS_V2_SOURCE_LIMIT" });
+  const { occurrences: { countOwnerOccurrences: _count, ...withoutCount }, ...others } = wiringModules().modules;
+  assert.throws(() => job.createAnalyticsV2Pipeline({ ...others, occurrences: withoutCount }),
+    { code: "ANALYTICS_V2_REFRESH_PIPELINE_UNAVAILABLE" });
 
   // Shapes other than the landed ones are refused, never coerced.
   const arrayOwners = wiringModules();
@@ -1747,6 +1939,9 @@ test("PG17: real A-2 cache-band history survives later runs unchanged (retention
       readOwnerOccurrences: async (context, { ownerDigest, stream, fromDay, throughDay }) => new Map(
         [...facts.get(ownerDigest)].filter(([day, streams]) => day >= fromDay && day <= throughDay
           && streams[stream].length > 0).map(([day, streams]) => [day, streams[stream]])),
+      countOwnerOccurrences: async (context, { ownerDigest, stream, fromDay, throughDay }) => new Map(
+        [...facts.get(ownerDigest)].filter(([day, streams]) => day >= fromDay && day <= throughDay
+          && streams[stream].length > 0).map(([day, streams]) => [day, streams[stream].length])),
     },
     devices: {
       countContributingDevices: async (context, { days }) => new Map([...days].map(([day, owners]) =>
@@ -1777,5 +1972,226 @@ test("PG17: real A-2 cache-band history survives later runs unchanged (retention
       assert.equal(await ownerScopedRows(pool, schema, "analytics_v2_owner_day"), ownerDays, `${daysLater} days later`);
       assert.deepEqual(await publishedRows(pool, schema), heads);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GCP cap raise: owners beyond the shared reducers' bounds, and the memory guard
+// ---------------------------------------------------------------------------
+
+/**
+ * Stub A-1 readers with the landed shapes over synthetic facts
+ * (ownerDigest -> day -> streams), a journal of explicit events, and the real
+ * A-2 compute. `countOf(ownerDigest, stream, day, actual)` may override a
+ * count A-1 reports; `reads` records the owner of every occurrence read.
+ */
+function syntheticPipeline({ owners, facts, journal, countOf = (_owner, _stream, _day, actual) => actual, reads = [] }) {
+  const daysOf = (ownerDigest, stream, fromDay, throughDay) => [...(facts.get(ownerDigest) ?? new Map())]
+    .filter(([day, streams]) => day >= fromDay && day <= throughDay && streams[stream].length > 0);
+  return job.createAnalyticsV2Pipeline({
+    owners: { listAnalyticsV2Owners: async () => ({ owners, unlinked: [], correctionRuntimeActive: true }) },
+    queuedDays: {
+      readQueuedDays: async (context, { afterSequence }) => {
+        const events = journal.filter((event) => event.sequence > afterSequence);
+        return { days: [...new Set(events.map((event) => event.day))].sort(),
+          lastSequence: events.at(-1)?.sequence ?? afterSequence, terminalOwners: [], events: events.length, complete: true };
+      },
+    },
+    occurrences: {
+      readOwnerFirstEvidenceDay: async (context, { ownerDigest, throughDay }) => [...(facts.get(ownerDigest) ?? new Map())]
+        .filter(([day, streams]) => day <= throughDay && streams.usage.length + streams.quota.length + streams.session.length > 0)
+        .map(([day]) => day).sort()[0] ?? null,
+      readOwnerOccurrences: async (context, { ownerDigest, stream, fromDay, throughDay }) => {
+        reads.push(ownerDigest);
+        return new Map(daysOf(ownerDigest, stream, fromDay, throughDay).map(([day, streams]) => [day, streams[stream]]));
+      },
+      countOwnerOccurrences: async (context, { ownerDigest, stream, fromDay, throughDay }) => new Map(
+        daysOf(ownerDigest, stream, fromDay, throughDay)
+          .map(([day, streams]) => [day, countOf(ownerDigest, stream, day, streams[stream].length)])),
+    },
+    devices: {
+      countContributingDevices: async (context, { days }) => new Map([...days].map(([day, contributors]) =>
+        [day, new Map(contributors.map((owner) => [owner.ownerDigest, 1]))])),
+    },
+    compute: a2,
+  });
+}
+
+const journalOf = (days) => days.map((day, index) => ({ sequence: index + 1, day }));
+
+test("PG17: an owner beyond the shared reducers' caps is computed and written, not refused", {
+  skip: PG_SKIP,
+  timeout: 900_000,
+}, async () => {
+  // Owner decision 2026-10-01: the d43c8f92 shared reducers refused a day
+  // over 20,000 occurrences (day_row_limit) and a day whose quota preparation
+  // reached its bound (quota_day_unrepresentable); the fast path recorded
+  // those refusals and blocked the days. Both are now computed.
+  const corpus = synthetic.composeProofCorpus();
+  const dense = synthetic.syntheticOwner(4, "pro");
+  const crowdedDay = synthetic.addDays(synthetic.TODAY, -30);
+  const quotaDay = synthetic.addDays(synthetic.TODAY, -21);
+  const denseFacts = synthetic.capFacts(dense, { firstDenseBack: 30, denseDays: 1, usagePerDay: 25_000 });
+  denseFacts.set(quotaDay, synthetic.capFacts(dense, { firstDenseBack: 21, denseDays: 1, usagePerDay: 200,
+    quotaPerDay: 6_000, idBase: 40_000_000 }).get(quotaDay));
+  const facts = new Map([...synthetic.COMPOSE_OWNERS.map((owner) => [owner.digest, synthetic.composeFacts(owner)]),
+    [dense.digest, denseFacts]]);
+  const owners = [...corpus.owners, synthetic.effectiveV2Owner(dense)];
+  const queued = [...corpus.publishedDays, crowdedDay, quotaDay].sort();
+  const pipeline = syntheticPipeline({ owners, facts, journal: journalOf(queued) });
+  await withDatabase("cap-raise", async ({ pool, createSchema }) => {
+    const { schema } = await createSchema();
+    const run = await runJob({ schema, now: new Date(synthetic.NOW_MS).toISOString(), pipeline });
+    assert.equal(run.state, "complete");
+    assert.equal(run.refusals, 0, "no owner, day or window is refused");
+    assert.deepEqual(run.published, queued);
+    assert.deepEqual(run.blocked, []);
+    const heads = await publishedRows(pool, schema);
+    assert.equal(heads.get(crowdedDay).payload.totals.usageEvents, 25_000);
+    assert.equal(heads.get(quotaDay).payload.totals.quotaObservations, 6_000);
+    const ownerDay = await pool.query(`SELECT to_char(day, 'YYYY-MM-DD') AS day, daily, refusal
+        FROM ${quoted(schema, "analytics_v2_owner_day")} WHERE owner_digest = $1 AND day IN ($2::date, $3::date) ORDER BY day`,
+    [dense.digest, crowdedDay, quotaDay]);
+    assert.deepEqual(ownerDay.rows.map((row) => [row.day, row.refusal, row.daily.counts]), [
+      [crowdedDay, null, { usage: 25_000, quota: 9, session: 1 }],
+      [quotaDay, null, { usage: 200, quota: 6_000, session: 1 }],
+    ]);
+    const modelDates = await pool.query(`SELECT count(*)::integer AS n FROM ${quoted(schema, "analytics_v2_owner_model_dates")}
+      WHERE owner_digest = $1`, [dense.digest]);
+    assert.equal(modelDates.rows[0].n, 70);
+    const fits = await pool.query(`SELECT fits FROM ${quoted(schema, "analytics_v2_owner_fits")} WHERE owner_digest = $1`,
+      [dense.digest]);
+    assert.ok(fits.rows[0].fits.length > 0, "the dense owner holds fits");
+
+    // The run row records the bounds applied and each owner's evidence and memory figures.
+    const [row] = await runRows(pool, schema);
+    assert.deepEqual(row.timings.resources, { memoryModel: "analytics-v2-memory-model-v1",
+      memoryBudgetBytes: 1_024 * 1_048_576, maxDayOccurrences: 250_000, maxDayRecordBytes: 256 * 1_048_576 });
+    assert.deepEqual(row.timings.owners.map((entry) => entry.ownerDigest), owners.map((owner) => owner.ownerDigest).sort());
+    const entry = row.timings.owners.find((value) => value.ownerDigest === dense.digest);
+    const total = (stream) => [...denseFacts.values()].reduce((sum, streams) => sum + streams[stream].length, 0);
+    assert.deepEqual({ usage: entry.usage, quota: entry.quota, session: entry.session, admitted: entry.admitted,
+      maxDayOccurrences: entry.maxDayOccurrences },
+    { usage: total("usage"), quota: total("quota"), session: total("session"), admitted: true, maxDayOccurrences: 25_010 });
+    assert.ok(Number.isSafeInteger(entry.heapPeakBytes) && entry.heapPeakBytes > 0, "the heap was sampled");
+    assert.ok(entry.estimateBytes < 1_024 * 1_048_576);
+    // The receipt reports the process's peak resident set, for sizing the Job.
+    assert.ok(Number.isSafeInteger(run.memory.peakRssMiB) && run.memory.peakRssMiB > 0, "peak resident set reported");
+    // The receipt carries only content-free aggregates.
+    assert.deepEqual({ budgetMiB: run.memory.budgetMiB, ownersComputed: run.memory.ownersComputed,
+      ownersRefused: run.memory.ownersRefused }, { budgetMiB: 1_024, ownersComputed: 4, ownersRefused: 0 });
+    assert.equal(JSON.stringify(run).includes(dense.digest), false);
+    assert.equal(Object.keys(run.timings).some((key) => key === "owners" || key === "resources"), false);
+  });
+});
+
+test("PG17: an owner over the memory budget is refused with memory_budget, never read, and its rows are retained", {
+  skip: PG_SKIP,
+  timeout: 600_000,
+}, async () => {
+  const corpus = synthetic.composeProofCorpus();
+  const big = synthetic.syntheticOwner(5, "plus");
+  const facts = new Map([...synthetic.COMPOSE_OWNERS.map((owner) => [owner.digest, synthetic.composeFacts(owner)]),
+    [big.digest, synthetic.composeFacts(big)]]);
+  const owners = [...corpus.owners, synthetic.effectiveV2Owner(big)];
+  const journal = journalOf(corpus.publishedDays);
+  const reads = [];
+  let grown = false;
+  // After the first run the owner's evidence grows past the 1,024 MiB budget:
+  // A-1 counts 200,000 usage occurrences on today (an estimate of about 1.6 GB).
+  const countOf = (ownerDigest, stream, day, actual) =>
+    (grown && ownerDigest === big.digest && stream === "usage" && day === synthetic.TODAY ? 200_000 : actual);
+  const pipeline = syntheticPipeline({ owners, facts, journal, countOf, reads });
+  await withDatabase("memory-budget", async ({ pool, createSchema }) => {
+    const { schema } = await createSchema();
+    const now = new Date(synthetic.NOW_MS).toISOString();
+    const first = await runJob({ schema, now, pipeline });
+    assert.equal(first.state, "complete");
+    assert.equal(first.memory.ownersRefused, 0);
+    assert.ok(reads.includes(big.digest));
+    const ownerDays = await ownerScopedRows(pool, schema, "analytics_v2_owner_day");
+    const fits = await ownerScopedRows(pool, schema, "analytics_v2_owner_fits");
+    const bands = await ownerScopedRows(pool, schema, "analytics_v2_cache_bands");
+    const heads = await publishedRows(pool, schema);
+    const previewBefore = (await pool.query(`SELECT preview FROM ${quoted(schema, "analytics_v2_preview")}`))
+      .rows[0].preview;
+
+    grown = true;
+    reads.length = 0;
+    journal.push({ sequence: journal.length + 1, day: synthetic.TODAY });
+    const second = await runJob({ schema, now, pipeline });
+    assert.equal(second.state, "complete");
+    assert.equal(reads.includes(big.digest), false, "a refused owner is never read");
+    assert.deepEqual(second.refusalsByReason, { memory_budget: 2 });
+    assert.deepEqual(second.blocked, [synthetic.TODAY]);
+    assert.deepEqual(second.published, []);
+    assert.deepEqual({ ownersComputed: second.memory.ownersComputed, ownersRefused: second.memory.ownersRefused },
+      { ownersComputed: 3, ownersRefused: 1 });
+    const runs = await runRows(pool, schema);
+    assert.deepEqual(runs[1].refusals, [
+      { ownerDigest: big.digest, day: null, family: "owner", reason: "memory_budget" },
+      { ownerDigest: big.digest, day: synthetic.TODAY, family: "daily", reason: "memory_budget" },
+    ]);
+    const entry = runs[1].timings.owners.find((value) => value.ownerDigest === big.digest);
+    assert.equal(entry.admitted, false);
+    assert.equal(entry.heapPeakBytes, null);
+    assert.equal(entry.usage, 200_000 + 54);
+    assert.ok(entry.estimateBytes > 1_024 * 1_048_576);
+    // Nothing of the refused owner changed: its rows are retained, the blocked
+    // day keeps its prior head, and every other owner is recomputed unchanged.
+    assert.equal(await ownerScopedRows(pool, schema, "analytics_v2_owner_day"), ownerDays);
+    assert.equal(await ownerScopedRows(pool, schema, "analytics_v2_owner_fits"), fits);
+    assert.equal(await ownerScopedRows(pool, schema, "analytics_v2_cache_bands"), bands);
+    assert.deepEqual(await publishedRows(pool, schema), heads);
+    // It has no current fit, so this run withholds the preview (stored null,
+    // served as temporarily unavailable) rather than publish a cohort that
+    // silently leaves it out; the first run's preview counted all four owners.
+    assert.equal(previewBefore.coverage.uploadingParticipantCount, 4);
+    const preview = (await pool.query(`SELECT preview FROM ${quoted(schema, "analytics_v2_preview")}`)).rows[0].preview;
+    assert.equal(preview, null);
+  });
+});
+
+test("PG17 integration (dense): the real readers count and stream a 25,000-occurrence v1.2 day, and A-2 computes it", {
+  skip: PG_SKIP,
+  timeout: 900_000,
+}, async () => {
+  await withDatabase("integration-dense", async ({ pool, createSchema }) => {
+    const { schema } = await createSchema();
+    const fixture = await seedFixture.seedAnalyticsV2Fixture({ pool, schema, modules: seedModules, correctionRuntime: "active",
+      dense: { day: seedFixture.D2, usage: 25_000 } });
+    const hotel = fixture.owners.hotel.ownerDigest;
+    const context = { pool, schema, nowMs: seedFixture.NOW_MS };
+    const options = { ownerDigest: hotel, stream: "usage", fromDay: seedFixture.D1, throughDay: seedFixture.D3 };
+    // A-1's exact count is the reader's own row count, before anything is read.
+    const counts = await a1.occurrences.countOwnerOccurrences(context, options);
+    assert.deepEqual([...counts], [[seedFixture.D2, 25_000]]);
+    const read = await a1.occurrences.readOwnerOccurrences(context, options);
+    assert.equal(read.get(seedFixture.D2).length, 25_000);
+    // The shared reducers refuse this day; the fast path used to refuse it too.
+    const kernels = await vite.ssrLoadModule("/vendor/analytics-d43c8f92/entry.ts");
+    await assert.rejects(kernels.prepareSharedAnalyticsDay({ day: seedFixture.D2, ownerDigest: hotel,
+      usage: read.get(seedFixture.D2), quota: [], session: [] }), (error) => error.reason === "day_row_limit");
+
+    const run = await runJob({ schema, now: new Date(seedFixture.NOW_MS).toISOString(), pipeline: realPipeline(),
+      env: jobEnvironment({ ANALYTICS_V2_READ_CHUNK_OCCURRENCES: "10000" }) });
+    assert.equal(run.state, "complete");
+    assert.equal(run.memory.ownersRefused, 0);
+    assert.equal(run.memory.readChunkOccurrences, 10_000);
+    const runs = await runRows(pool, schema);
+    assert.equal(runs[0].refusals.some((refusal) => refusal.ownerDigest === hotel), false, "hotel is not refused");
+    const entry = runs[0].timings.owners.find((value) => value.ownerDigest === hotel);
+    assert.deepEqual({ usage: entry.usage, quota: entry.quota, session: entry.session, admitted: entry.admitted,
+      maxDayOccurrences: entry.maxDayOccurrences }, { usage: 25_000, quota: 0, session: 0, admitted: true,
+      maxDayOccurrences: 25_000 });
+    const ownerDay = await pool.query(`SELECT daily, refusal FROM ${quoted(schema, "analytics_v2_owner_day")}
+      WHERE owner_digest = $1 AND day = $2::date`, [hotel, seedFixture.D2]);
+    assert.equal(ownerDay.rows[0].refusal, null);
+    assert.deepEqual(ownerDay.rows[0].daily.counts, { usage: 25_000, quota: 0, session: 0 });
+    const modelDates = await pool.query(`SELECT count(*)::integer AS n FROM ${quoted(schema, "analytics_v2_owner_model_dates")}
+      WHERE owner_digest = $1`, [hotel]);
+    assert.equal(modelDates.rows[0].n, 70);
+    // D2 stays blocked by alpha's crossed-midnight conflict, as without hotel.
+    assert.ok(run.blocked.includes(seedFixture.D2));
   });
 });

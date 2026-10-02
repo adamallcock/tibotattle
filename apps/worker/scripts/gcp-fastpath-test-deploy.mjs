@@ -249,11 +249,50 @@ export function migrateJobCommand({ image, expectedCounts }) {
   ]);
 }
 
+/**
+ * The analytics-refresh Job's task sizes (--refresh-profile).
+ *
+ * standard: the job's default per-owner memory budget (4,608 MiB,
+ * cloud-run/analytics-refresh.mjs) plus its reserve needs a 6,144 MiB Node
+ * heap, which an 8 GiB task holds with room for the runtime and native
+ * buffers; Cloud Run allows 8 GiB with 2 vCPU (more memory needs 4 vCPU). One
+ * owner's cold recompute is single-threaded and can take tens of minutes, so
+ * the task timeout is two hours.
+ *
+ * dense: the dense-owner measurement profile (receipt
+ * docs/receipts/2026-10-01-gcp-dense-owner-parity.md). A 16 GiB task (Cloud
+ * Run needs 4 vCPU for it) with a 12,288 MiB heap and a 10,752 MiB budget,
+ * which the memory model says admits the largest real owner (about 2.52
+ * million records) even when every record falls in the 170 analysis days.
+ * Compute stays single-threaded; the extra vCPUs are Cloud Run's minimum for
+ * the memory and serve the garbage collector and the database driver. Four
+ * hours of task time cover the local dense run several times over.
+ */
+export const REFRESH_JOB_PROFILES = Object.freeze({
+  standard: Object.freeze({ cpu: 2, memory: "8Gi", heapMiB: 6_144, taskTimeoutSeconds: 7_200, env: Object.freeze([]) }),
+  dense: Object.freeze({ cpu: 4, memory: "16Gi", heapMiB: 12_288, taskTimeoutSeconds: 14_400,
+    env: Object.freeze([Object.freeze(["ANALYTICS_V2_MEMORY_BUDGET_MIB", "10752"])]) }),
+});
+/** The default (standard) profile; the local rehearsal runs its heap. */
+export const REFRESH_JOB_RESOURCES = REFRESH_JOB_PROFILES.standard;
+/** --corpus: the committed golden and the refresh profile each corpus seeds and sizes by default. */
+export const FASTPATH_CORPORA = Object.freeze({
+  q1: Object.freeze({ golden: "apps/worker/analytics-v2-test/golden", refreshProfile: "standard" }),
+  dense: Object.freeze({ golden: "apps/worker/analytics-v2-test/golden-dense", refreshProfile: "dense" }),
+});
+
+function refreshProfile(name) {
+  if (!Object.hasOwn(REFRESH_JOB_PROFILES, name ?? "")) fail("FASTPATH_DEPLOY_REFRESH_PROFILE_INVALID", String(name));
+  return REFRESH_JOB_PROFILES[name];
+}
+
 /** gcloud command that creates or updates the analytics-refresh Job. */
-export function refreshJobCommand({ image, now, schema, extraEnv = [], extraArgs = [] }) {
+export function refreshJobCommand({ image, now, schema, extraEnv = [], extraArgs = [], profile = "standard" }) {
   if (!IMAGE_REFERENCE.test(image ?? "")) fail("FASTPATH_DEPLOY_IMAGE_DIGEST_REQUIRED");
   if (now !== undefined && !ISO_INSTANT.test(now)) fail("FASTPATH_DEPLOY_NOW_INVALID");
+  const resources = refreshProfile(profile);
   const args = [
+    `--max-old-space-size=${resources.heapMiB}`,
     "dist/analytics-refresh.mjs", "--mode=full", `--schema=${primarySchemaOf(schema)}`,
     ...(now === undefined ? [] : [`--now=${now}`]),
     ...extraArgs,
@@ -269,9 +308,10 @@ export function refreshJobCommand({ image, now, schema, extraEnv = [], extraArgs
       ...databaseEnv(schema),
       ["POSTGRES_IAM_USER", FASTPATH_TEST.runtimeIamUser],
       ...(now === undefined ? [] : [["ANALYTICS_V2_TEST_CLOCK", "1"]]),
+      ...resources.env,
     ], extraEnv)),
-    "--tasks=1", "--parallelism=1", "--max-retries=0", "--task-timeout=3600s",
-    "--cpu=2", "--memory=4Gi", labelsFlag(),
+    "--tasks=1", "--parallelism=1", "--max-retries=0", `--task-timeout=${resources.taskTimeoutSeconds}s`,
+    `--cpu=${resources.cpu}`, `--memory=${resources.memory}`, labelsFlag(),
   ]);
 }
 
@@ -614,6 +654,7 @@ function parseArgs(argv) {
     variant: "sidecar", mode: "fastpath-test", refreshEnv: [], refreshArgs: [], originEnv: [],
     query: "from=2026-04-15&to=2026-10-01", skip: new Set(), noExecute: false,
     schema: undefined, golden: undefined, schemaSuffix: undefined, replaceSeed: false, sourceIdentity: undefined,
+    corpus: undefined, dump: undefined, refreshProfile: undefined,
   };
   for (const argument of rest) {
     if (argument === "--dry-run") { options.dryRun = true; continue; }
@@ -633,6 +674,9 @@ function parseArgs(argv) {
     else if (key === "query") options.query = value;
     else if (key === "schema") options.schema = primarySchemaOf(value);
     else if (key === "golden") options.golden = value;
+    else if (key === "corpus") options.corpus = value;
+    else if (key === "dump") options.dump = resolve(value);
+    else if (key === "refresh-profile") options.refreshProfile = value;
     else if (key === "schema-suffix") options.schemaSuffix = value;
     else if (key === "skip") value.split(",").forEach((item) => options.skip.add(item));
     else if (key === "refresh-arg") options.refreshArgs.push(value);
@@ -651,6 +695,14 @@ function parseArgs(argv) {
   if (options.schemaSuffix !== undefined && !/^[0-9a-f]{8}$/u.test(options.schemaSuffix)) {
     fail("FASTPATH_DEPLOY_ARGUMENT_INVALID", "--schema-suffix is 8 lower-case hex digits");
   }
+  if (options.corpus !== undefined) {
+    if (!Object.hasOwn(FASTPATH_CORPORA, options.corpus)) fail("FASTPATH_DEPLOY_CORPUS_INVALID", options.corpus);
+    if (options.golden !== undefined) fail("FASTPATH_DEPLOY_ARGUMENT_INVALID", "--corpus and --golden are exclusive");
+    options.golden = FASTPATH_CORPORA[options.corpus].golden;
+    options.refreshProfile ??= FASTPATH_CORPORA[options.corpus].refreshProfile;
+  }
+  options.refreshProfile ??= "standard";
+  refreshProfile(options.refreshProfile);
   return options;
 }
 
@@ -664,7 +716,8 @@ Steps:
                    from the golden through the local rehearsal's own importer chain (scripts/gcp-fastpath-seed.mjs);
                    skips with its reason when a chain stage is absent at --commit; refresh and origin then read
                    that schema at the golden's clock unless --schema/--now say otherwise
-  refresh          deploy + execute ${FASTPATH_TEST.refreshJob} (2 vCPU, 4 GiB, 1 h)
+  refresh          deploy + execute ${FASTPATH_TEST.refreshJob} (--refresh-profile: standard 2 vCPU, 8 GiB,
+                   heap 6,144 MiB, 2 h; dense 4 vCPU, 16 GiB, heap 12,288 MiB, budget 10,752 MiB, 4 h)
   origin           create/verify gs://${FASTPATH_TEST.originBucket}; ensure the runtime SA's one binding on it
                    (condition ${ORIGIN_BUCKET_RUNTIME_BINDING.condition.title}, read back; any other runtime binding is
                    refused); deploy IAM-private ${FASTPATH_TEST.originService}; journey SA is the only invoker; a seeded
@@ -686,6 +739,11 @@ Options:
   --refresh-arg=<arg>     extra refresh argument (repeatable)
   --query=<qs>            community/daily query (default from=2026-04-15&to=2026-10-01)
   --golden=<dir>          golden to seed from (default apps/worker/analytics-v2-test/golden)
+  --corpus=q1|dense       seed a committed golden by name instead of --golden: q1 (the default) or dense
+                          (golden-dense, which needs --dump); also picks the refresh profile unless given
+  --dump=<path>           the golden's source dump when the golden commits only its digest (golden-dense);
+                          refused unless its sha256 equals the golden manifest's sourceDump.jsonSha256
+  --refresh-profile=standard|dense   the refresh Job's task size (default: the corpus's, else standard)
   --schema-suffix=<hex8>  seeded schema suffix (default: from the commit and the golden dump digest)
   --replace-seed          drop and re-seed a seeded schema that lacks its completion marker
   --schema=<schema>       primary schema for refresh/origin: ${FASTPATH_TEST.primarySchema}
@@ -974,23 +1032,25 @@ async function stepSeed(runner, options) {
   const plan = seedModule.planSeed(commit, { golden: options.golden });
   runner.print([process.execPath, join(WORKER_ROOT, "scripts/gcp-fastpath-seed.mjs"), "seed",
     "--target=gcp-fastpath", `--commit=${commit}`, `--golden=${plan.golden}`,
+    ...(options.dump === undefined ? [] : [`--dump=${options.dump}`]),
     ...(options.schemaSuffix === undefined ? [] : [`--schema-suffix=${options.schemaSuffix}`]),
     ...(options.replaceSeed ? ["--replace"] : [])],
   `plan: ${plan.decision}; stages ${plan.stages.map(({ name, status }) => `${name}=${status}`).join(", ")}`);
   if (runner.dryRun) {
     // Read-only: name the schema and clock the seed would hand to refresh and origin.
     if (plan.decision === "run") {
-      const golden = await seedModule.readSeedGolden(plan.golden);
+      const golden = await seedModule.readSeedGolden(plan.golden, { dump: options.dump });
       const schema = seedModule.seededSchemas(options.schemaSuffix
         ?? seedModule.defaultSuffix(commit, golden.dumpSha256)).target;
       if (options.schema === undefined) options.schema = schema;
       if (options.now === undefined) options.now = golden.nowIso;
       if (options.schema === schema) options.sourceIdentity ??= golden.sourceIdentity;
-      return { step: "seed", dryRun: true, schema, nowIso: golden.nowIso, sourceIdentity: golden.sourceIdentity, plan };
+      return { step: "seed", dryRun: true, schema, nowIso: golden.nowIso, dumpSha256: golden.dumpSha256,
+        sourceIdentity: golden.sourceIdentity, plan };
     }
     return { step: "seed", dryRun: true, plan };
   }
-  const result = await seedModule.runGcpFastpathSeed({ commit, golden: options.golden,
+  const result = await seedModule.runGcpFastpathSeed({ commit, golden: options.golden, dump: options.dump,
     schemaSuffix: options.schemaSuffix, replace: options.replaceSeed });
   if (result.status !== "skipped") {
     // Refresh and origin read the seeded schema at the golden's clock unless
@@ -1010,8 +1070,9 @@ async function stepRefresh(runner, options, image) {
   }
   const result = await deployAndExecuteJob(runner, options, FASTPATH_TEST.refreshJob,
     refreshJobCommand({ image, now: options.now, schema: options.schema, extraEnv: options.refreshEnv,
-      extraArgs: options.refreshArgs }));
-  const receipt = { step: "refresh", image, schema: primarySchemaOf(options.schema), now: options.now ?? null, ...result };
+      extraArgs: options.refreshArgs, profile: options.refreshProfile }));
+  const receipt = { step: "refresh", image, schema: primarySchemaOf(options.schema), now: options.now ?? null,
+    profile: options.refreshProfile, resources: REFRESH_JOB_PROFILES[options.refreshProfile], ...result };
   if (!runner.dryRun && !options.noExecute) {
     receipt.path = await runner.receipt("refresh.json", receipt);
     if (!result.succeeded) fail("FASTPATH_DEPLOY_REFRESH_FAILED", JSON.stringify(result.results?.at(-1) ?? null));
@@ -1051,9 +1112,10 @@ async function stepOrigin(runner, options, image) {
   const originEnv = originClockEnv(options.originEnv, options.now);
   let sourceIdentity = options.sourceIdentity ?? null;
   if (sourceIdentity === null && primarySchemaOf(options.schema).startsWith(FASTPATH_TEST_CLOUD_TARGET.seededSchemaPrefix)) {
-    // Without the seed step in this run: a seeded schema holds the golden's source.
+    // Without the seed step in this run: a seeded schema holds the golden's source
+    // (a golden that commits only its dump digest needs the same --dump the seed used).
     const seedModule = await import("./gcp-fastpath-seed.mjs");
-    sourceIdentity = (await seedModule.readSeedGolden(options.golden)).sourceIdentity;
+    sourceIdentity = (await seedModule.readSeedGolden(options.golden, { dump: options.dump })).sourceIdentity;
   }
   const yaml = renderOriginService({ image, variant: options.variant, mode: options.mode, originEnv,
     bucketHistoryProof, schema: options.schema, sourceIdentity });

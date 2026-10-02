@@ -17,32 +17,59 @@
 //   spend                 payload.apiEquivalentSpend per day
 //   daily-other           every other payload field per day
 //   allowance-breakdowns  allowanceBreakdowns header and per-day combined/byPlanType
-//   model-days            allowanceBreakdowns days[].models and preview.models
+//   model-days            allowanceBreakdowns days[].models and preview.models, on
+//                         every date the oracle published
+//   model-days-per-date   the fast path publishing a model date the oracle
+//                         withheld (accepted: owner decision OD-12, below)
 //   preview               the stored admin preview except preview.models
 //   cache-structure       cacheRetention schema, method, measures, gap basis, window and band ids
 //   cache-counts          cacheRetention counts (informational: the Q-1 manifest's
 //                         parityBasis says counts are not a parity basis)
 //
-// A difference is "expected" only for cache-counts, by the oracle's own
-// parityBasis. Every other difference is reported as unexpected; the caller
-// decides how to label it (for example as an out-of-scope owner effect) and
-// must say so in its receipt.
+// A difference is "expected" only in two families:
+// - cache-counts, by the oracle's own parityBasis;
+// - model-days-per-date, by the owner's decision of 2026-10-01 (fast-path plan
+//   OD-12): the fast path publishes each model date on its own, with refused
+//   owners excluded and counted, where d43c8f92 withholds a 14-date block until
+//   every member has a result. Only the dates the golden manifest lists as
+//   withheld (modelPublications.missing) qualify, and only as publication:
+//   the oracle side must be unpublished (allowanceBreakdowns days[].models
+//   empty, the date absent from preview.models.days) and the fast path may
+//   fill exactly those two places. Every other model date stays in model-days
+//   and must be byte-equal; a published date outside the withheld set, a
+//   missing published date, or any other field difference is unexpected.
+//   The VALUE published on an accepted date must equal the oracle's per-date
+//   expectation (per-date-expected.json: d43c8f92's own publishers over its
+//   per-owner references) exactly. Without that expectation, or where it
+//   differs, the publication is an unexpected model-days difference: an
+//   accepted date is never taken on its presence alone.
+// Every other difference is reported as unexpected; the caller decides how to
+// label it and must say so in its receipt.
 //
 // CLI: node scripts/analytics-v2-parity-compare.mjs --golden <dir> --actual <response.json>
-//        [--actual-preview <preview.json>]
-// Prints one JSON report; exits 0 when there is no unexpected difference, 1
-// otherwise, 2 on a usage error. Inputs are synthetic and content-free.
+//        [--actual-preview <preview.json>] [--per-date-expected <per-date-expected.json>]
+// The withheld dates are read from <dir>/manifest.json when it exists. The
+// per-date expectation must be for the golden's clock (nowMs). Prints one JSON
+// report; exits 0 when there is no unexpected difference, 1 otherwise, 2 on a
+// usage error. Inputs are synthetic and content-free.
 
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const ANALYTICS_V2_PARITY_REPORT_VERSION = "analytics-v2-parity-report-v1";
+export const ANALYTICS_V2_PARITY_REPORT_VERSION = "analytics-v2-parity-report-v3";
 export const ANALYTICS_V2_PARITY_FAMILIES = Object.freeze([
   "envelope", "daily-days", "daily-totals", "daily-cells", "spend", "daily-other",
-  "allowance-breakdowns", "model-days", "preview", "cache-structure", "cache-counts",
+  "allowance-breakdowns", "model-days", "model-days-per-date", "preview", "cache-structure", "cache-counts",
 ]);
-const EXPECTED_FAMILIES = new Set(["cache-counts"]);
+const EXPECTED_FAMILIES = new Set(["cache-counts", "model-days-per-date"]);
+/** The owner decision that makes model-days-per-date expected (fast-path plan OD-12). */
+export const ANALYTICS_V2_PER_DATE_MODEL_DECISION =
+  "OD-12, 2026-10-01: per-date model publication with refused owners excluded and counted";
+const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
+/** The oracle's per-date expectation (scripts/gcp-fastpath-dense-oracle/oracle.mjs). */
+const PER_DATE_SCHEMA_VERSION = "gcp-fastpath-dense-per-date-v1";
 const MAX_LISTED_DIFFS = 40;
 const AGGREGATE_REVISION_SUFFIX = /:r[1-9][0-9]*$/u;
 
@@ -146,12 +173,86 @@ function cacheStructure(cache) {
   };
 }
 
+/** The golden manifest's withheld model dates, validated: sorted, unique YYYY-MM-DD strings. */
+export function withheldModelDatesOf(manifest) {
+  const missing = manifest?.modelPublications?.missing;
+  if (missing === undefined) return [];
+  if (!Array.isArray(missing) || missing.some((day) => typeof day !== "string" || !DAY_PATTERN.test(day))
+      || new Set(missing).size !== missing.length) {
+    throw new TypeError("ANALYTICS_V2_PARITY_WITHHELD_DATES_INVALID");
+  }
+  return [...missing].sort();
+}
+
+/**
+ * A per-date expectation checked against the golden it stands beside: the
+ * oracle's per-date schema, the golden's clock, and no unresolved date.
+ * Throws ANALYTICS_V2_PARITY_PER_DATE_INVALID otherwise.
+ */
+export function perDateExpectationFor(expectation, manifest) {
+  if (!isObject(expectation) || expectation.schemaVersion !== PER_DATE_SCHEMA_VERSION
+      || !Number.isSafeInteger(expectation.nowMs) || expectation.nowMs !== manifest?.nowMs
+      || !Array.isArray(expectation.unresolved) || expectation.unresolved.length !== 0) {
+    throw new TypeError("ANALYTICS_V2_PARITY_PER_DATE_INVALID");
+  }
+  return expectation;
+}
+
+const UNVERIFIED = "<withheld; no per-date expectation>";
+
+/**
+ * The per-date expectation's value at one place, or undefined when the
+ * expectation does not hold that date (absent, or no expectation at all).
+ */
+function expectedOn(entries, day, field) {
+  if (!Array.isArray(entries)) return undefined;
+  const entry = entries.find((value) => isObject(value) && value.day === day);
+  if (entry === undefined) return undefined;
+  return field === null ? entry : entry[field];
+}
+
+/**
+ * One fast-path publication of a withheld model date. It is the accepted
+ * per-date difference (model-days-per-date) only when its value equals the
+ * per-date expectation exactly; otherwise it is an unexpected model-days
+ * difference.
+ */
+function acceptPerDate(families, published, unverified, key, day, actual, expected) {
+  if (expected === undefined) {
+    const target = families["model-days"];
+    target.compared += 1;
+    target.diffCount += 1;
+    unverified.add(day);
+    if (target.diffs.length < MAX_LISTED_DIFFS) target.diffs.push({ path: key, golden: UNVERIFIED, actual: brief(actual) });
+    return;
+  }
+  if (diffValues(expected, actual, key).length > 0) {
+    record(families["model-days"], key, expected, actual);
+    return;
+  }
+  const target = families["model-days-per-date"];
+  target.compared += 1;
+  target.diffCount += 1;
+  published.add(day);
+  if (target.diffs.length < MAX_LISTED_DIFFS) target.diffs.push({ path: key, golden: "<withheld>", actual: brief(actual) });
+}
+
 /**
  * Compare one served response (and optionally the stored preview) with the
  * golden. Returns a content-free report: counts, field paths and the leaf
- * values of synthetic aggregates only.
+ * values of synthetic aggregates only. `withheldModelDates` are the model
+ * dates the golden withheld (manifest modelPublications.missing); only those
+ * may be published by the fast path, and only with the value
+ * `perDateExpected` (the oracle's per-date-expected.json) holds for them (see
+ * the header).
  */
-export function compareAnalyticsV2Parity({ golden, actual, goldenPreview = null, actualPreview = null }) {
+export function compareAnalyticsV2Parity({
+  golden, actual, goldenPreview = null, actualPreview = null, withheldModelDates = [], perDateExpected = null,
+}) {
+  const withheld = new Set(withheldModelDatesOf({ modelPublications: { missing: withheldModelDates } }));
+  if (perDateExpected !== null && !isObject(perDateExpected)) throw new TypeError("ANALYTICS_V2_PARITY_PER_DATE_INVALID");
+  const publishedWithheld = new Set();
+  const unverifiedWithheld = new Set();
   const families = Object.fromEntries(ANALYTICS_V2_PARITY_FAMILIES.map((name) => [name, family(name)]));
   const envelopeKeys = ["schemaVersion", "from", "to", "allowanceState", "allowanceReadState"];
   record(families.envelope, "$", pick(golden, envelopeKeys), pick(actual, envelopeKeys));
@@ -187,8 +288,17 @@ export function compareAnalyticsV2Parity({ golden, actual, goldenPreview = null,
   for (const day of [...gAllowanceDays.keys()].filter((value) => aAllowanceDays.has(value)).sort()) {
     record(families["allowance-breakdowns"], `$.allowanceBreakdowns.days[${day}]`,
       omit(gAllowanceDays.get(day), ["models"]), omit(aAllowanceDays.get(day), ["models"]));
-    record(families["model-days"], `$.allowanceBreakdowns.days[${day}].models`,
-      gAllowanceDays.get(day)?.models, aAllowanceDays.get(day)?.models);
+    const key = `$.allowanceBreakdowns.days[${day}].models`;
+    const gModels = gAllowanceDays.get(day)?.models;
+    const aModels = aAllowanceDays.get(day)?.models;
+    // A withheld date: the oracle serves no model values; the fast path may.
+    if (withheld.has(day) && Array.isArray(gModels) && gModels.length === 0
+        && Array.isArray(aModels) && aModels.length > 0) {
+      acceptPerDate(families, publishedWithheld, unverifiedWithheld, key, day, aModels,
+        expectedOn(perDateExpected?.allowanceBreakdowns?.days, day, "models"));
+    } else {
+      record(families["model-days"], key, gModels, aModels);
+    }
   }
 
   if (goldenPreview !== null || actualPreview !== null) {
@@ -198,10 +308,17 @@ export function compareAnalyticsV2Parity({ golden, actual, goldenPreview = null,
     record(families["model-days"], "preview.models", omit(gModels, ["days"]), omit(aModels, ["days"]));
     const gModelDays = byDay(gModels?.days);
     const aModelDays = byDay(aModels?.days);
+    // A withheld date the oracle's preview omits may be present in the fast
+    // path's; every other date must appear in both or neither.
+    const accepted = [...aModelDays.keys()].filter((day) => withheld.has(day) && !gModelDays.has(day)).sort();
     record(families["model-days"], "preview.models.days[*].day",
-      [...gModelDays.keys()].sort(), [...aModelDays.keys()].sort());
+      [...gModelDays.keys()].sort(), [...aModelDays.keys()].filter((day) => !accepted.includes(day)).sort());
     for (const day of [...gModelDays.keys()].filter((value) => aModelDays.has(value)).sort()) {
       record(families["model-days"], `preview.models.days[${day}]`, gModelDays.get(day), aModelDays.get(day));
+    }
+    for (const day of accepted) {
+      acceptPerDate(families, publishedWithheld, unverifiedWithheld, `preview.models.days[${day}]`, day,
+        aModelDays.get(day), expectedOn(perDateExpected?.preview?.models?.days, day, null));
     }
   }
 
@@ -217,6 +334,13 @@ export function compareAnalyticsV2Parity({ golden, actual, goldenPreview = null,
     normalized: ["days[].revision", "days[].releasedAt", "payload.revision", "payload.releasedAt",
       "payload.aggregateId :r<revision> suffix"],
     days: { golden: goldenDays.size, actual: actualDays.size, missingInActual: missing, extraInActual: extra },
+    perDateModelPublication: {
+      decision: ANALYTICS_V2_PER_DATE_MODEL_DECISION,
+      withheldDates: withheld.size,
+      valuesHeldTo: perDateExpected === null ? null : (perDateExpected.schemaVersion ?? "per-date expectation"),
+      publishedWithheldDates: [...publishedWithheld].sort(),
+      unverifiedWithheldDates: [...unverifiedWithheld].sort(),
+    },
     unexpectedFamilies: unexpected.map((entry) => entry.family),
     unexpectedDiffs: unexpected.reduce((sum, entry) => sum + entry.diffCount, 0),
     families: list,
@@ -238,11 +362,22 @@ async function main(argv) {
   if (!goldenDirectory || !actualPath) usageFail("--golden <dir> and --actual <response.json> are required");
   const read = async (path) => JSON.parse(await readFile(resolve(path), "utf8"));
   const actualPreviewPath = value("--actual-preview");
+  const perDatePath = value("--per-date-expected");
+  const manifestPath = join(goldenDirectory, "manifest.json");
+  const manifest = existsSync(resolve(manifestPath)) ? await read(manifestPath) : null;
+  let perDateExpected = null;
+  if (perDatePath) {
+    try { perDateExpected = perDateExpectationFor(await read(perDatePath), manifest); } catch (error) {
+      usageFail(String(error?.message ?? error));
+    }
+  }
   const report = compareAnalyticsV2Parity({
     golden: await read(join(goldenDirectory, "community-daily-response.json")),
     actual: await read(actualPath),
     goldenPreview: await read(join(goldenDirectory, "preview.json")),
     actualPreview: actualPreviewPath ? await read(actualPreviewPath) : null,
+    withheldModelDates: manifest === null ? [] : withheldModelDatesOf(manifest),
+    perDateExpected,
   });
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   process.exitCode = report.unexpectedDiffs === 0 ? 0 : 1;

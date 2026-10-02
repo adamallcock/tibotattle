@@ -21,6 +21,17 @@ export const ACTIVE_DAYS_BACK = Object.freeze([0, 1, 2, 9, 20, 45, 80]);
 /** compose-proof.spec.ts pins these for JSON.stringify of its envelope and preview. */
 export const COMPOSED_RESPONSE_SHA256 = "2737d60661d0392b19ccc368b62bdb7ba3c8f14ead2241a28d30d6914ee84390";
 export const COMPOSED_PREVIEW_SHA256 = "f04259f71d4e2a34bddaa92f306687d051fd8c3ac082f012dcec80e8fd7af6d2";
+/**
+ * denseFacts(syntheticOwner(4, "pro")) computed by A-2 on production's native
+ * path (GCP cap raise): its 14 scalar fits and its 70 model-date rows
+ * ({ownerDigest, day, result} with the private fingerprint stripped), as
+ * sha256 of canonical JSON. compute.spec.ts pins A-2's outputs to these and
+ * native-parity.spec.ts proves the same values against d43c8f92's
+ * advanceStorageEffectiveAnalysis.
+ */
+export const DENSE_OWNER_PINS = Object.freeze({ fits: 14,
+  fitsSha256: "e02fd4995c742704947eb206483705f6b49b98779f1e808daa3f7e2dffcf63f9", ready: 70,
+  modelsSha256: "c1ef753db9cbe81745997be297546a5d6a7848cfddbb7b4fbe508b7433c17a0d" });
 
 export const stamp = (at) => new Date(at).toISOString();
 export const label = (at) => stamp(at).slice(0, 10);
@@ -194,4 +205,48 @@ export function legacyOnlyV2Owner(owner) {
 export function v1OnlyV2Owner(owner) {
   return Object.freeze({ participantId: owner.participant, ownerDigest: owner.digest, hasV1: true, hasV11: false,
     hasV12: false, hasLegacy: false, hasEffective: false, source: "v1" });
+}
+
+/** One usage occurrence in session `sessionIndex` of the owner (synthetic session tokens only). */
+export function sessionUsage(owner, index, at, sessionIndex) {
+  const record = usageRecord(label(at), { eventId: id("event", owner.n, index), eventTime: stamp(at),
+    sessionUuid: `synthetic-session-${owner.n}-${sessionIndex}`, accountPlanAttribution: attribution(owner) });
+  return occurrence(owner, "usage", at, record.eventId, record);
+}
+
+const byReaderOrder = (left, right) => (left.eventTime < right.eventTime ? -1 : left.eventTime > right.eventTime ? 1
+  : left.occurrenceId < right.occurrenceId ? -1 : 1);
+
+/**
+ * The cap-raise owners (GCP cap raise, native-path.ts): the compose pattern
+ * plus `denseDays` consecutive days starting `firstDenseBack` days before
+ * today, each holding `usagePerDay` usage rows spread round-robin over
+ * `sessionsPerDay` sessions and `quotaPerDay` quota rows. With
+ * `distinctResets`, every dense quota row restates its reset one second
+ * later than the previous one: one reset pool (well inside the 3-hour pool
+ * tolerance) but one fit fragment per row. With `distinctSessionsPerDay`,
+ * each dense day uses its own sessions (otherwise every day reuses the same
+ * `sessionsPerDay` sessions). Ids start at `idBase`.
+ */
+export function capFacts(owner, { firstDenseBack, denseDays, usagePerDay = 0, sessionsPerDay = 1, quotaPerDay = 9,
+  distinctResets = false, distinctSessionsPerDay = false, idBase = 30_000_000 }) {
+  const byDay = composeFacts(owner);
+  let k = idBase, resetIndex = 0;
+  const resetBase = dayMs(TODAY) - (firstDenseBack - denseDays - 2) * DAY_MS;
+  for (let d = 0; d < denseDays; d++) {
+    const start = dayMs(TODAY) - (firstDenseBack - d) * DAY_MS;
+    if (byDay.has(label(start))) throw new Error("dense day overlaps an active day");
+    const usageSpacing = usagePerDay === 0 ? 0 : Math.floor(86_000_000 / usagePerDay);
+    const u = Array.from({ length: usagePerDay }, (_, i) =>
+      sessionUsage(owner, ++k, start + 1_000 + i * usageSpacing,
+        (distinctSessionsPerDay ? d * sessionsPerDay : 0) + (i % sessionsPerDay)));
+    u.sort(byReaderOrder);
+    const quotaSpacing = Math.floor(86_000_000 / quotaPerDay);
+    const q = Array.from({ length: quotaPerDay }, (_, i) => quota(owner, ++k, start + 500 + i * quotaSpacing,
+      Math.min(100, 5 + Math.floor((i * 90) / quotaPerDay)),
+      distinctResets ? resetBase + (resetIndex++) * 1_000 : start + 8 * DAY_MS));
+    q.sort(byReaderOrder);
+    byDay.set(label(start), { usage: u, quota: q, session: [session(owner, start + 250)] });
+  }
+  return byDay;
 }
