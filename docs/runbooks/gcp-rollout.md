@@ -258,6 +258,28 @@ that window; see [GCP brake and incidents](./gcp-brake-and-incidents.md#fix-forw
 Before the switch, the same comparison is made by hand against the edge-port
 commit.
 
+## Staging proof
+
+Before the first production rollout, the owner runs this sequence once on the
+staging plane with synthetic data: a full `migrate` and `roll` of a new
+digest. The staging load test (OPS-11) was removed by the owner on
+2026-10-02 (round 11); the live checks it carried that do not need load are
+part of this proof. Each is an owner-authorized staging operation, and each
+is `owner`:
+
+1. **Maintenance pass.** Run one maintenance pass live and confirm it
+   completes and `/api/ready` reads `ready` afterwards (C-MAINT).
+2. **Advisory-lock fence.** Confirm the maintenance pass and the migration
+   job take the Cloud SQL advisory lock through the IAM connector, not only
+   on a local socket.
+3. **A migration meeting a running pass.** Start `migrate` while a pass is
+   running. The migration job must refuse `POSTGRES_MIGRATION_CONFLICT`
+   (read from the job's log, because `migrate` reports any failed job as
+   `ROLLOUT_MIGRATION_FAILED`), then rerun cleanly once the pass has ended.
+
+No load is generated, and no capacity or latency figure comes out of this
+proof. The quiescence and fresh-pass preconditions above apply unchanged.
+
 ## First rollout
 
 The first production rollout pre-stages the origin (checklist PROD-3):
@@ -291,7 +313,7 @@ The first production rollout pre-stages the origin (checklist PROD-3):
 | Contract-blob check on every origin deploy | The roll checks it only while the edge is in gcp mode. The all-modes check is `not built` (D-BLOB) |
 | Maintenance job in the rollout target | `not built` (D-OPS4). The manifest's jobs are the migration job and the refresh job |
 | First live readback of the OPS-2 estate | Open (OPS2-READ) |
-| Staging load test with a migrate and roll under load | Open (OPS-11) |
+| Staging migrate-and-roll proof, with its live sub-checks | Open (see [staging proof](#staging-proof)) |
 
 ## Evidence boundary
 
