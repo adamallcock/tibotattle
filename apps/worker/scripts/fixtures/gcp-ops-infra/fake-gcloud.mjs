@@ -332,6 +332,14 @@ export function createFakeGcloud(world, { files = new Map(), failWhen = () => fa
         job.userUpdateTime = clock();
         return done();
       }
+      case path === "scheduler jobs resume": {
+        // Cloud Scheduler resumes only a PAUSED job (FAILED_PRECONDITION otherwise).
+        const job = world.schedulerJobs.find((entry) => entry.name.endsWith(`/${name(3)}`));
+        if (job?.state !== "PAUSED") return { status: 1, stdout: "", stderr: "synthetic: not paused" };
+        job.state = "ENABLED";
+        job.userUpdateTime = clock();
+        return done();
+      }
       default:
         return { status: 2, stdout: "", stderr: "synthetic: unexpected command" };
     }

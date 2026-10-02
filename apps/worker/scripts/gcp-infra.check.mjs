@@ -79,12 +79,12 @@ async function run(argv, { project = "synthetic-ops-project", gcloud, writer = m
 test("arguments are closed and dangerous combinations are refused", () => {
   assert.deepEqual(parseGcpInfraArgs(["plan", `--desired-state=${FIXTURE_PATH}`]), {
     command: "plan", desiredStatePath: FIXTURE_PATH, environment: null, bootstrap: null, authorize: null, apply: false,
-    requireClean: false, receiptPath: null,
+    requireClean: false, receiptPath: null, pauseReceiptPath: null, only: null,
   });
   // OPS-10's preflight argv (ROLLOUT_ARGV.infraReadback): no path, the environment's committed file.
   assert.deepEqual(parseGcpInfraArgs(["readback", "--require-clean", "--environment=production"]), {
     command: "readback", desiredStatePath: null, environment: "production", bootstrap: null, authorize: null,
-    apply: false, requireClean: true, receiptPath: null,
+    apply: false, requireClean: true, receiptPath: null, pauseReceiptPath: null, only: null,
   });
   const cases = [
     [[], "GCP_INFRA_COMMAND_INVALID"],
@@ -125,6 +125,25 @@ test("arguments are closed and dangerous combinations are refused", () => {
     [["scheduler-probe"], "GCP_INFRA_ARGUMENT_MISSING"],
     [["scheduler-probe", "--environment=staging", "--require-clean"], "GCP_INFRA_ARGUMENT_INVALID"],
     [["scheduler-probe", "--environment=staging", "--now=2026-10-02T00:00:00Z"], "GCP_INFRA_ARGUMENT_INVALID"],
+    // OPS-3: dry runs by default; an applied run needs its digest, a receipt path and the committed state.
+    [["pause-all", "--environment=production", "--apply"], "OPS3_AUTHORIZATION_MISMATCH"],
+    [["pause-all", "--environment=production", "--authorize=" + "a".repeat(64)], "OPS3_AUTHORIZATION_MISMATCH"],
+    [["pause-all", "--environment=production", "--apply", "--authorize=" + "a".repeat(64)],
+      "PAUSE_ALL_RECEIPT_PATH_REQUIRED"],
+    [["pause-all", "--environment=production", "--receipt-out=/synthetic/pause.json"], "PAUSE_ALL_RECEIPT_PATH_REQUIRED"],
+    [["pause-all", "--environment=production", "--apply", "--authorize=" + "a".repeat(64), "--receipt-out=pause.json"],
+      "OPS_RECEIPT_PATH_INVALID"],
+    [["pause-all", `--desired-state=${UNMARKED_PATH}`, "--apply", "--authorize=" + "a".repeat(64),
+      "--receipt-out=/synthetic/pause.json"], "GCP_INFRA_COMMITTED_DESIRED_STATE_REQUIRED"],
+    [["pause-all", "--environment=production", "--only=x"], "GCP_INFRA_ARGUMENT_INVALID"],
+    [["resume-all", "--environment=production"], "RESUME_ALL_SOURCE_REQUIRED"],
+    [["resume-all", "--environment=production", "--only=a,,b"], "RESUME_ALL_ONLY_INVALID"],
+    [["resume-all", "--environment=production", "--only=a b"], "RESUME_ALL_ONLY_INVALID"],
+    [["resume-all", "--environment=production", "--pause-receipt=pause.json"], "PAUSE_ALL_RECEIPT_PATH_INVALID"],
+    [["resume-all", "--environment=production", "--only=a", "--apply"], "OPS3_AUTHORIZATION_MISMATCH"],
+    [["resume-all", "--environment=production", "--only=a", "--receipt-out=/synthetic/r.json"], "GCP_INFRA_ARGUMENT_INVALID"],
+    [["resume-all", `--desired-state=${UNMARKED_PATH}`, "--only=a", "--apply", "--authorize=" + "a".repeat(64)],
+      "GCP_INFRA_COMMITTED_DESIRED_STATE_REQUIRED"],
   ];
   for (const [argv, code] of cases) {
     assert.throws(() => parseGcpInfraArgs(argv), { code }, argv.join(" "));
@@ -324,6 +343,56 @@ test("scheduler-probe reads the triggers once and exits 2 on the paused-too-long
   assert.equal(JSON.parse(prelaunch.out).triggers[0].verdict, "paused_as_desired");
 });
 
+test("pause-all and resume-all: dry runs by default, applied only under their digest from the committed state",
+  async (t) => {
+    const project = "example-ops-prod1";
+    const resumed = UNMARKED_TEXT.replace('"schedule": null', '"schedule": "15 3 * * *"')
+      .replace('"state": "PAUSED"', '"state": "ENABLED"');
+    const gcloud = createFakeGcloud(world(project), { project, region: "us-east1" });
+    const runUri = `https://run.googleapis.com/v2/projects/${project}/locations/us-east1/jobs/synthetic-analytics-refresh:run`;
+    gcloud.world.schedulerJobs.push({ name: `projects/${project}/locations/us-east1/jobs/synthetic-analytics-refresh-trigger`,
+      state: "ENABLED", httpTarget: { uri: runUri } });
+    const readFile = reader(resumed);
+    const dry = await run(["pause-all", "--environment=production"], { gcloud, readFile });
+    assert.equal(dry.code, 0, dry.err);
+    const plan = JSON.parse(dry.out);
+    assert.deepEqual(plan.triggers.map(({ name, action }) => [name, action]),
+      [["synthetic-analytics-refresh-trigger", "pause"]]);
+    assert.ok(gcloud.calls.every((argv) => classifyGcloudCommand(argv) === "read"), "the dry run only reads");
+    const directory = await mkdtemp(join(tmpdir(), "gcp-infra-ops3-"));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const receiptPath = join(directory, "pause.json");
+    const stale = await run(["pause-all", "--environment=production", "--apply", `--authorize=${"0".repeat(64)}`,
+      `--receipt-out=${receiptPath}`], { gcloud, readFile });
+    assert.deepEqual([stale.code, JSON.parse(stale.err)], [1, { status: "error", code: "PAUSE_ALL_PLAN_DIGEST_MISMATCH" }]);
+    const paused = await run(["pause-all", "--environment=production", "--apply", `--authorize=${plan.planDigest}`,
+      `--receipt-out=${receiptPath}`], { gcloud, readFile });
+    assert.equal(paused.code, 0, paused.err);
+    assert.deepEqual(JSON.parse(paused.out).paused, ["synthetic-analytics-refresh-trigger"]);
+    assert.equal(gcloud.world.schedulerJobs[0].state, "PAUSED");
+    const resumePlan = await run(["resume-all", "--environment=production", `--pause-receipt=${receiptPath}`],
+      { gcloud, readFile });
+    assert.equal(resumePlan.code, 0, resumePlan.err);
+    const { planDigest, resume } = JSON.parse(resumePlan.out);
+    assert.deepEqual(resume, ["synthetic-analytics-refresh-trigger"]);
+    assert.equal(gcloud.world.schedulerJobs[0].state, "PAUSED", "the resume plan is a dry run");
+    const resumedRun = await run(["resume-all", "--environment=production", `--pause-receipt=${receiptPath}`, "--apply",
+      `--authorize=${planDigest}`], { gcloud, readFile });
+    assert.equal(resumedRun.code, 0, resumedRun.err);
+    assert.equal(gcloud.world.schedulerJobs[0].state, "ENABLED");
+    // A missing or tampered receipt is a named refusal.
+    const missing = await run(["resume-all", "--environment=production", `--pause-receipt=${join(directory, "none.json")}`],
+      { gcloud, readFile });
+    assert.deepEqual(JSON.parse(missing.err), { status: "error", code: "PAUSE_ALL_RECEIPT_REQUIRED" });
+    await writeFile(join(directory, "tampered.json"), JSON.stringify({ ...JSON.parse(paused.out), paused: [] }));
+    const tampered = await run(["resume-all", "--environment=production",
+      `--pause-receipt=${join(directory, "tampered.json")}`], { gcloud, readFile });
+    assert.deepEqual(JSON.parse(tampered.err), { status: "error", code: "PAUSE_ALL_RECEIPT_INVALID" });
+    // A co-tenant-free dedicated estate with a blocking trigger state exits 2 from the dry run.
+    gcloud.world.schedulerJobs[0].state = "UPDATE_FAILED";
+    assert.equal((await run(["pause-all", "--environment=production"], { gcloud, readFile })).code, 2);
+  });
+
 test("a bad desired state is a named error", async () => {
   const result = await run(["plan", "--desired-state=/synthetic-desired/absent.json"]);
   assert.deepEqual(JSON.parse(result.err), { status: "error", code: "DESIRED_STATE_UNREADABLE" });
@@ -365,7 +434,8 @@ test("the CLI runs through a symlinked path, fails closed and finds no gcloud", 
 
 test("no OPS-2 module uses a shell, and the package runs exactly these checks", () => {
   for (const name of ["gcp-infra.mjs", "gcp-ops-infra-manifest.mjs", "gcp-ops-infra-operations.mjs",
-    "gcp-ops-bucket-birth.mjs", "gcp-staging-desired-state.mjs", "gcp-staging-secrets.mjs", "gcp-staging-bucket-birth.mjs"]) {
+    "gcp-ops-bucket-birth.mjs", "gcp-staging-desired-state.mjs", "gcp-staging-secrets.mjs", "gcp-staging-bucket-birth.mjs",
+    "gcp-scheduler-run-target.mjs", "gcp-ops-monitoring-policies.mjs", "gcp-monitoring.mjs"]) {
     const source = readFileSync(join(SCRIPTS_ROOT, name), "utf8");
     // A regular expression's .exec() is not a process call.
     assert.doesNotMatch(source, /\bexecSync\b|(?<![.\w])exec\(|\bexecFile|shell:\s*true|["'`](?:sh|bash|zsh)["'`]/u, name);
@@ -375,7 +445,8 @@ test("no OPS-2 module uses a shell, and the package runs exactly these checks", 
   const gate = scripts["gcp:ops:infra:check"];
   for (const check of ["gcp-ops-infra-manifest.check.mjs", "gcp-ops-infra-operations.check.mjs",
     "gcp-ops-bucket-birth.check.mjs", "gcp-infra.check.mjs", "gcp-ops-infra-staging-service.check.mjs",
-    "gcp-staging-secrets.check.mjs", "gcp-staging-bucket-birth.check.mjs"]) {
+    "gcp-staging-secrets.check.mjs", "gcp-staging-bucket-birth.check.mjs", "gcp-ops-monitoring-policies.check.mjs",
+    "gcp-monitoring.check.mjs"]) {
     assert.ok(gate.includes(`./scripts/${check}`), check);
   }
   assert.doesNotMatch(gate, /gcloud|wrangler|--apply|apply /u);

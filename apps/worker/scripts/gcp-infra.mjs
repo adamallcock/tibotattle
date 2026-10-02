@@ -32,6 +32,19 @@
  *     operations of a plan whose digest equals --authorize. It never deletes,
  *     never changes a running image or source commit, never edits bucket
  *     metadata or bucket IAM, and refuses the synthetic fixture.
+ *   pause-all    --environment=<env> [--apply --authorize=<planDigest> --receipt-out=<abs path>]
+ *     OPS-3. Dry run by default: one read of the region's scheduler jobs and
+ *     the plan (every plane trigger, its action, co-tenant triggers that keep
+ *     OPS-10's ROLLOUT_JOBS_NOT_PAUSED gate shut, and that gate after the
+ *     pauses). With --apply: re-plan, refuse a different digest or a blocker,
+ *     reserve the receipt file, pause each ENABLED plane trigger, read back,
+ *     and write the receipt resume-all reads.
+ *   resume-all   --environment=<env> (--pause-receipt=<abs path> | --only=<name>[,<name>...])
+ *                [--apply --authorize=<planDigest>]
+ *     OPS-3. Resumes only managed triggers whose committed state is ENABLED,
+ *     live PAUSED, and paused by that pause-all run (its receipt, under 24 h
+ *     old, with the trigger unchanged since) or named by the operator with
+ *     --only, in that order. Dry run by default.
  *   bucket-birth --environment=<env> [--apply
  *                --authorize=bucket-birth:<project>:<bucket> --receipt-out=<abs path>]
  *     Dry run by default; with --apply, one bucket insert that refuses an
@@ -48,7 +61,7 @@
  * argv array through the guarded runner; no shell is used.
  */
 
-import { realpathSync } from "node:fs";
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -74,10 +87,14 @@ import {
 } from "./gcp-ops-infra-manifest.mjs";
 import {
   applyInfrastructure,
+  applyPauseAll,
+  applyResumeAll,
   defaultGcloudRunner,
   infrastructureCleanliness,
   normalizeBootstrap,
   planInfrastructure,
+  planPauseAll,
+  planResumeAll,
   probeScheduler,
   readbackInfrastructure,
 } from "./gcp-ops-infra-operations.mjs";
@@ -94,7 +111,12 @@ const COMMANDS = Object.freeze({
   apply: Object.freeze([...SOURCE, "--authorize", "--bootstrap-image-digest", "--bootstrap-source-commit"]),
   "bucket-birth": Object.freeze([...SOURCE, "--authorize", "--receipt-out", "--apply"]),
   "scheduler-probe": Object.freeze([...SOURCE]),
+  "pause-all": Object.freeze([...SOURCE, "--authorize", "--receipt-out", "--apply"]),
+  "resume-all": Object.freeze([...SOURCE, "--authorize", "--pause-receipt", "--only", "--apply"]),
 });
+const OPS3_COMMANDS = Object.freeze(["pause-all", "resume-all"]);
+const PAUSE_RECEIPT_MAX_BYTES = 256 * 1024;
+const TRIGGER_LIST = /^[A-Za-z0-9_-]{1,500}(?:,[A-Za-z0-9_-]{1,500})*$/u;
 const BOOLEAN_FLAGS = Object.freeze(["--apply", "--require-clean"]);
 
 function fail(code) {
@@ -137,9 +159,22 @@ export function parseGcpInfraArgs(argv) {
   if (command === "bucket-birth" && apply !== values.has("--authorize")) fail("BUCKET_BIRTH_AUTHORIZATION_MISMATCH");
   if (command === "bucket-birth" && !apply && values.has("--receipt-out")) fail("GCP_INFRA_ARGUMENT_INVALID");
   const receiptPath = values.get("--receipt-out") ?? null;
-  if (receiptPath !== null && !isAbsolute(receiptPath)) fail("BUCKET_BIRTH_RECEIPT_PATH_INVALID");
+  if (receiptPath !== null && !isAbsolute(receiptPath)) {
+    fail(command === "bucket-birth" ? "BUCKET_BIRTH_RECEIPT_PATH_INVALID" : "OPS_RECEIPT_PATH_INVALID");
+  }
+  if (OPS3_COMMANDS.includes(command)) {
+    if (apply !== values.has("--authorize")) fail("OPS3_AUTHORIZATION_MISMATCH");
+    if (command === "pause-all" && apply !== (receiptPath !== null)) fail("PAUSE_ALL_RECEIPT_PATH_REQUIRED");
+    if (command === "resume-all" && !values.has("--pause-receipt") && !values.has("--only")) {
+      fail("RESUME_ALL_SOURCE_REQUIRED");
+    }
+  }
+  const pauseReceiptPath = values.get("--pause-receipt") ?? null;
+  if (pauseReceiptPath !== null && !isAbsolute(pauseReceiptPath)) fail("PAUSE_ALL_RECEIPT_PATH_INVALID");
+  const onlyValue = values.get("--only") ?? null;
+  if (onlyValue !== null && !TRIGGER_LIST.test(onlyValue)) fail("RESUME_ALL_ONLY_INVALID");
   // A real change is made only from the committed desired state.
-  if ((command === "apply" || (command === "bucket-birth" && apply))
+  if ((command === "apply" || ((command === "bucket-birth" || OPS3_COMMANDS.includes(command)) && apply))
       && (desiredStatePath !== undefined || environment === null)) {
     fail("GCP_INFRA_COMMITTED_DESIRED_STATE_REQUIRED");
   }
@@ -152,7 +187,25 @@ export function parseGcpInfraArgs(argv) {
     apply,
     requireClean: values.get("--require-clean") === true,
     receiptPath: receiptPath === null ? null : resolve(receiptPath),
+    pauseReceiptPath: pauseReceiptPath === null ? null : resolve(pauseReceiptPath),
+    only: onlyValue === null ? null : Object.freeze(onlyValue.split(",")),
   });
+}
+
+/** A pause-all receipt file: a regular, single-link file of bounded JSON (verified by resume-all). */
+export function readPauseReceiptFile(path) {
+  let stat;
+  try {
+    stat = lstatSync(path);
+  } catch {
+    return fail("PAUSE_ALL_RECEIPT_REQUIRED");
+  }
+  if (!stat.isFile() || stat.nlink !== 1 || stat.size > PAUSE_RECEIPT_MAX_BYTES) fail("PAUSE_ALL_RECEIPT_INVALID");
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return fail("PAUSE_ALL_RECEIPT_INVALID");
+  }
 }
 
 function attempt(render) {
@@ -230,6 +283,35 @@ export async function main(argv = process.argv.slice(2), {
       print(probe);
       return probe.alert ? 2 : 0;
     }
+    if (config.command === "pause-all") {
+      if (!config.apply) {
+        const plan = planPauseAll(desired, { runner });
+        print(plan);
+        return plan.blockers.length > 0 || !plan.rolloutGateAfter.satisfied ? 2 : 0;
+      }
+      print(await applyPauseAll(desired, {
+        runner,
+        authorize: config.authorize,
+        receiptPath: config.receiptPath,
+        ...(now === undefined ? {} : { now }),
+        ...(reserveReceipt === undefined ? {} : { reserveReceipt }),
+      }));
+      return 0;
+    }
+    if (config.command === "resume-all") {
+      const source = {
+        pauseReceipt: config.pauseReceiptPath === null ? null : readPauseReceiptFile(config.pauseReceiptPath),
+        only: config.only,
+      };
+      if (!config.apply) {
+        const plan = planResumeAll(desired, { runner, ...source, ...(now === undefined ? {} : { now }) });
+        print(plan);
+        return plan.blockers.length > 0 ? 2 : 0;
+      }
+      print(applyResumeAll(desired, { runner, authorize: config.authorize, ...source,
+        ...(now === undefined ? {} : { now }) }));
+      return 0;
+    }
     if (config.command === "render") {
       print(renderInfrastructure(desired, { bootstrap: config.bootstrap }));
       return 0;
@@ -286,6 +368,18 @@ export async function main(argv = process.argv.slice(2), {
         print({ status: "created_receipt_unwritten", receipt: error.receipt });
       }
       stderr(`${JSON.stringify({ status: "error", code: error.code, bucketInserted: true })}\n`);
+      return 1;
+    }
+    if (error?.code === "PAUSE_ALL_INCOMPLETE" && error.receipt !== undefined) {
+      // The receipt was written; it is printed too, content-free, so the
+      // operator sees what was paused.
+      print({ status: "incomplete", receipt: error.receipt });
+      stderr(`${JSON.stringify({ status: "error", code: error.code })}\n`);
+      return 1;
+    }
+    if (error?.code === "RESUME_ALL_OPERATION_FAILED" && Array.isArray(error.outcomes)) {
+      stderr(`${JSON.stringify({ status: "error", code: error.code, operation: error.operation,
+        outcomes: error.outcomes })}\n`);
       return 1;
     }
     if (error?.code === "APPLY_OPERATION_FAILED" && Array.isArray(error.outcomes)) {

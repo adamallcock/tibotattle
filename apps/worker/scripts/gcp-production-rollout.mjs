@@ -17,8 +17,9 @@
  *              against the archive's own sha256 (sourceProvenance.fileHashes),
  *              its identity, step, step image and image digest.
  *   migrate    --authorize=migrate:<env>:<digest>. Preflight; the jobs must be
- *              quiescent (OPS-3 pause-all done, nothing running); two labelled
- *              pre-migration on-demand backups of the primary instance, then
+ *              quiescent (OPS-3 pause-all done, nothing running); one labelled
+ *              pre-migration on-demand backup of the primary instance (with
+ *              point-in-time recovery, the owner's 2026-10-02 decision), then
  *              the production migration Job moved to the digest and commit and
  *              executed, and its 'tibotattle-gcp-migration-v1' receipt read
  *              back from the execution's log and verified. Writes the migrate
@@ -26,11 +27,13 @@
  *   roll       --authorize=roll:<env>:<digest>. Requires the matching migrate
  *              receipt and a fresh, verified capture of the live edge for this
  *              environment (its own mode, Worker, domains, single deployment
- *              and source commit). When the live edge runs in gcp mode (EP-9),
- *              refuses EDGE_CONTRACT_DRIFT unless src/edge-origin-contract.ts
- *              has the same blob at --commit and at the live edge's commit, and
- *              requires the edge to point at this service. With the jobs
- *              quiescent, the service and every Job of the infrastructure
+ *              and source commit). In every edge mode (D-BLOB) it refuses
+ *              EDGE_CONTRACT_DRIFT unless src/edge-origin-contract.ts has the
+ *              same blob at --commit and at the live edge's commit, so a
+ *              pre-edge Worker, which has no contract file, refuses the roll;
+ *              in gcp mode (EP-9) it also requires the edge to point at this
+ *              service. With the jobs quiescent, the service and every Job of
+ *              the infrastructure
  *              manifest move to one digest and commit and are read back; then
  *              the public /api/health (gcp mode) or the EP-6 verifier path
  *              (every other mode) must report --commit. The rollout never
@@ -87,6 +90,7 @@ import {
   verifyEdgeModeLiveSnapshot,
 } from "./edge-mode-configuration.mjs";
 import { createOnDemandBackup } from "./gcp-backup-horizon.mjs";
+import { scheduledRunJob } from "./gcp-scheduler-run-target.mjs";
 import { GCP_PRIVATE_TEST_TARGET } from "./gcp-private-test-deploy.mjs";
 import {
   createGcloudIdentityTokenSource,
@@ -116,8 +120,12 @@ export const ROLLOUT_ROLL_RECEIPT_SCHEMA = "tibotattle-gcp-rollout-roll-v1";
 export const ROLLOUT_EDGE_LIVE_SCHEMA = "tibotattle-edge-live-capture-v1";
 export const ROLLOUT_EDGE_LIVE_KEYS = Object.freeze(["schema", "capturedAt", "snapshot", "deployment"]);
 export const EDGE_CAPTURE_MAX_AGE_MS = 15 * 60 * 1_000;
-/** Two labelled pre-migration on-demand backups of the primary instance (OPS-10). */
-export const PRE_MIGRATION_BACKUPS = 2;
+/**
+ * Labelled pre-migration on-demand backups of the primary instance (OPS-10):
+ * one, alongside the instance's point-in-time recovery (owner decision
+ * 2026-10-02, "Pre-migration backups").
+ */
+export const PRE_MIGRATION_BACKUPS = 1;
 export const PRE_MIGRATION_BACKUP_EXPIRES_IN_DAYS = 30;
 export const BACKUP_AUDIT_MAX_AGE_MS = 6 * 60 * 60 * 1_000;
 export const MIGRATE_RECEIPT_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
@@ -470,23 +478,6 @@ function checkInfraReadback(context, environment) {
 }
 
 const SCHEDULER_NAME = /^[A-Za-z0-9_-]{1,500}$/u;
-// A trigger whose URI names run.googleapis.com in any other shape is kept as
-// job "unparsed", so it must be paused too.
-const RUN_JOB_URIS = Object.freeze([
-  /^https:\/\/run\.googleapis\.com\/v2\/projects\/[a-z0-9-]+\/locations\/([a-z0-9-]+)\/jobs\/([a-z0-9-]+):run$/u,
-  /^https:\/\/([a-z0-9-]+)-run\.googleapis\.com\/apis\/run\.googleapis\.com\/v1\/namespaces\/[a-z0-9-]+\/jobs\/([a-z0-9-]+):run$/u,
-]);
-
-/** The Cloud Run job a scheduler's HTTP target runs, or null for any other target. */
-function triggeredJob(entry) {
-  const uri = entry?.httpTarget?.uri;
-  if (typeof uri !== "string") return null;
-  for (const pattern of RUN_JOB_URIS) {
-    const match = pattern.exec(uri);
-    if (match !== null) return match[2];
-  }
-  return /run\.googleapis\.com/u.test(uri) ? "unparsed" : null;
-}
 
 /**
  * The scheduled-jobs readback (read-only): every Cloud Scheduler trigger in
@@ -502,7 +493,7 @@ function readScheduledJobs(context, target) {
   if (!Array.isArray(schedulers)) fail("ROLLOUT_SCHEDULED_JOBS_READBACK_FAILED");
   const triggers = [];
   for (const entry of schedulers) {
-    const job = triggeredJob(entry);
+    const job = scheduledRunJob(entry);
     if (job === null) continue;
     const name = typeof entry?.name === "string" ? entry.name.split("/").at(-1) : "";
     if (!SCHEDULER_NAME.test(name)) fail("ROLLOUT_SCHEDULED_JOBS_READBACK_FAILED");
@@ -527,9 +518,10 @@ function readScheduledJobs(context, target) {
 
 /**
  * Refuse unless a scheduled-jobs readback is quiescent (the 2026-09-26 OPS-10
- * separation patch): until OPS-3's pause-all exists here, migrate and roll
- * execute only after the operator has paused every trigger and the running
- * executions have finished.
+ * separation patch): migrate and roll execute only after every trigger is
+ * paused (`gcp-infra.mjs pause-all`, OPS-3, which classifies triggers with
+ * the same gcp-scheduler-run-target.mjs) and the running executions have
+ * finished. The rollout never pauses or resumes a trigger itself.
  */
 function assertQuiescent(readback) {
   if (readback.triggers.some(({ state }) => state !== "PAUSED")) fail("ROLLOUT_JOBS_NOT_PAUSED");
@@ -748,39 +740,41 @@ function verifyPreEdgeCapture({ snapshot, deployment, sourceCommit, expectedDoma
   return JSON.stringify(domains) === JSON.stringify(expectedDomains);
 }
 
-function assertEdgeCaptureFresh(context, capturedAt) {
-  const now = context.now();
-  if (capturedAt > now + FUTURE_TOLERANCE_MS || now - capturedAt > EDGE_CAPTURE_MAX_AGE_MS) {
+/** The owner-supplied live edge capture file: a regular, single-link file of at most 4 MiB of JSON. */
+export function readEdgeLiveCaptureFile(path) {
+  return readBoundedJson(path, "ROLLOUT_EDGE_LIVE_INVALID", 4 * MAX_INPUT_BYTES);
+}
+
+/** A capture time is fresh when it is at most EDGE_CAPTURE_MAX_AGE_MS old and not in the future. */
+export function assertEdgeCaptureFresh(nowMs, capturedAt) {
+  if (capturedAt > nowMs + FUTURE_TOLERANCE_MS || nowMs - capturedAt > EDGE_CAPTURE_MAX_AGE_MS) {
     fail("ROLLOUT_EDGE_LIVE_STALE");
   }
 }
 
 /**
- * EP-9: read and verify the live edge capture for this environment. The
- * capture must be fresh, of the environment's Worker, and verify for its own
- * mode (verifyEdgeModeLiveSnapshot for worker, fenced and gcp with the
+ * EP-9: verify a parsed live edge capture for an environment. The capture
+ * must be fresh at `nowMs`, of the environment's Worker, and verify for its
+ * own mode (verifyEdgeModeLiveSnapshot for worker, fenced and gcp with the
  * environment's domains; verifyPreEdgeCapture for a pre-edge Worker), with a
  * single active deployment and the snapshot's source commit, and serve the
- * environment's PUBLIC_ORIGIN. In gcp mode the edge/origin contract blob at
- * --commit must equal the one at the live edge's commit; the edge's upstream
- * origin and audience are returned for the service check.
+ * environment's PUBLIC_ORIGIN. Returns the live mode ("unset" for a pre-edge
+ * Worker), the edge's DEPLOYMENT_SOURCE_COMMIT and the capture time.
  */
-async function checkEdgeContract(context, args) {
-  const capture = await readBoundedJson(args.edgeLive, "ROLLOUT_EDGE_LIVE_INVALID", 4 * MAX_INPUT_BYTES);
+export async function verifyEdgeLiveCapture(capture, { environment, nowMs, readTrackedConfig }) {
   if (!hasExactKeys(capture, ROLLOUT_EDGE_LIVE_KEYS) || capture.schema !== ROLLOUT_EDGE_LIVE_SCHEMA
       || typeof capture.capturedAt !== "string" || !ISO_INSTANT.test(capture.capturedAt)
       || !Number.isFinite(Date.parse(capture.capturedAt)) || !isRecord(capture.snapshot)) {
     fail("ROLLOUT_EDGE_LIVE_INVALID");
   }
-  const capturedAt = Date.parse(capture.capturedAt);
-  assertEdgeCaptureFresh(context, capturedAt);
+  assertEdgeCaptureFresh(nowMs, Date.parse(capture.capturedAt));
   let mode;
   try {
     mode = liveEdgeMode(capture.snapshot);
   } catch {
     fail("ROLLOUT_EDGE_LIVE_INVALID");
   }
-  const identity = await trackedEdgeIdentity(args.environment, context.readTrackedConfig);
+  const identity = await trackedEdgeIdentity(environment, readTrackedConfig);
   if (capture.snapshot.workerName !== identity.workerName) fail("ROLLOUT_EDGE_LIVE_TARGET_MISMATCH");
   const edgeCommit = bindingText(capture.snapshot, "DEPLOYMENT_SOURCE_COMMIT");
   if (edgeCommit === null || !COMMIT.test(edgeCommit)) fail("ROLLOUT_EDGE_LIVE_INVALID");
@@ -797,19 +791,52 @@ async function checkEdgeContract(context, args) {
   if (bindingText(capture.snapshot, "PUBLIC_ORIGIN") !== identity.publicOrigin) {
     fail("ROLLOUT_EDGE_LIVE_TARGET_MISMATCH");
   }
-  const base = { mode: mode ?? "unset", edgeCommit, capturedAt: capture.capturedAt, publicOrigin: identity.publicOrigin };
-  if (mode !== "gcp") {
-    return Object.freeze({ ...base, contractBlob: null, upstreamOrigin: null, originAudience: null });
-  }
-  const candidate = gitBlob(context, args.commit, EDGE_ORIGIN_CONTRACT_PATH);
-  const live = gitBlob(context, edgeCommit, EDGE_ORIGIN_CONTRACT_PATH);
-  if (candidate === null || live === null || candidate !== live) fail("EDGE_CONTRACT_DRIFT");
   return Object.freeze({
-    ...base,
-    contractBlob: candidate,
-    upstreamOrigin: bindingText(capture.snapshot, EDGE_MODE_GCP_VARS.upstreamOrigin),
-    originAudience: bindingText(capture.snapshot, EDGE_MODE_GCP_VARS.originAudience),
+    mode: mode ?? "unset",
+    edgeCommit,
+    capturedAt: capture.capturedAt,
+    publicOrigin: identity.publicOrigin,
+    upstreamOrigin: mode === "gcp" ? bindingText(capture.snapshot, EDGE_MODE_GCP_VARS.upstreamOrigin) : null,
+    originAudience: mode === "gcp" ? bindingText(capture.snapshot, EDGE_MODE_GCP_VARS.originAudience) : null,
   });
+}
+
+/**
+ * D-BLOB (docs/runbooks/production-edge-modes.md, "Cloud Run deploys"): an
+ * origin deploy refuses EDGE_CONTRACT_DRIFT unless
+ * src/edge-origin-contract.ts has one and the same git blob at the deployed
+ * origin commit and at the live edge's DEPLOYMENT_SOURCE_COMMIT, in every
+ * edge mode. A pre-edge Worker carries no contract file, so an origin deploy
+ * against it refuses: the edge port goes live (worker mode) first.
+ * `readBlob(commit, path)` returns the 40-hex blob id or null; local git only.
+ */
+export function assertOriginContractBlob({ originCommit, edgeCommit, readBlob }) {
+  if (typeof readBlob !== "function" || !COMMIT.test(originCommit ?? "") || !COMMIT.test(edgeCommit ?? "")) {
+    fail("EDGE_CONTRACT_DRIFT");
+  }
+  const candidate = readBlob(originCommit, EDGE_ORIGIN_CONTRACT_PATH);
+  const live = readBlob(edgeCommit, EDGE_ORIGIN_CONTRACT_PATH);
+  if (typeof candidate !== "string" || !COMMIT.test(candidate) || candidate !== live) fail("EDGE_CONTRACT_DRIFT");
+  return candidate;
+}
+
+/**
+ * Read and verify the live edge capture for this roll (verifyEdgeLiveCapture),
+ * then the contract blob at --commit against the live edge's commit
+ * (assertOriginContractBlob) in every mode. In gcp mode the edge's upstream
+ * origin and audience are returned for the service check.
+ */
+async function checkEdgeContract(context, args) {
+  const capture = await readEdgeLiveCaptureFile(args.edgeLive);
+  const edge = await verifyEdgeLiveCapture(capture, {
+    environment: args.environment, nowMs: context.now(), readTrackedConfig: context.readTrackedConfig,
+  });
+  const contractBlob = assertOriginContractBlob({
+    originCommit: args.commit,
+    edgeCommit: edge.edgeCommit,
+    readBlob: (commit, path) => gitBlob(context, commit, path),
+  });
+  return Object.freeze({ ...edge, contractBlob });
 }
 
 /** In gcp mode the live edge must forward to this service, with the target's audience. */
@@ -1246,7 +1273,7 @@ async function roll(context, args, target) {
   return underLock(context, { sourceCommit: args.commit, previousSourceCommit: live.commit }, async (assertOwned) => {
     const { scheduledJobs } = await preflight(context, args, target);
     assertQuiescent(scheduledJobs);
-    assertEdgeCaptureFresh(context, Date.parse(edge.capturedAt));
+    assertEdgeCaptureFresh(context.now(), Date.parse(edge.capturedAt));
     assertOwned();
     runChecked(context, ROLLOUT_ARGV.serviceUpdate(target, image, args.commit), "ROLLOUT_SERVICE_UPDATE_FAILED");
     for (const job of target.jobNames) {

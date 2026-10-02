@@ -16,6 +16,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { canonicalJson } from "../src/canonical-json.ts";
 import * as manifest from "./gcp-ops-infra-manifest.mjs";
 import * as operations from "./gcp-ops-infra-operations.mjs";
 import {
@@ -997,4 +998,350 @@ test("the scheduler probe raises the paused-too-long signal only for a resumed t
   const prelaunch = desiredState({ synthetic: false, mutate: CADENCE });
   trigger(world).state = "PAUSED";
   assert.equal(operations.probeScheduler(prelaunch, { runner: fake(prelaunch, world).runner, now: () => nowMs }).alert, false);
+});
+
+// ---------------------------------------------------------------------------
+// OPS-3 pause-all and resume-all (D-OPS3)
+
+const RESUMED = (value) => { CADENCE(value); value.scheduler["analytics-refresh"].state = "ENABLED"; };
+
+/** A converged dedicated project whose managed trigger OPS-3 resumed, plus hand-made triggers. */
+function resumedWorld(desired) {
+  const world = convergedWorld(desired);
+  trigger(world).state = "ENABLED";
+  const runUri = (job) => `https://run.googleapis.com/v2/projects/${desired.project}/locations/${desired.region}/jobs/${job}:run`;
+  world.schedulerJobs.push(
+    { name: `projects/${desired.project}/locations/${desired.region}/jobs/synthetic-hand-made-trigger`, state: "ENABLED",
+      schedule: "0 * * * *", httpTarget: { uri: runUri("synthetic-production-migrate") } },
+    { name: `projects/${desired.project}/locations/${desired.region}/jobs/synthetic-webhook-trigger`, state: "ENABLED",
+      schedule: "0 * * * *", httpTarget: { uri: "https://hooks.example.invalid/synthetic" } },
+    { name: `projects/${desired.project}/locations/${desired.region}/jobs/synthetic-deliberately-paused`, state: "PAUSED",
+      schedule: "0 * * * *", httpTarget: { uri: runUri("synthetic-analytics-refresh") } },
+  );
+  return world;
+}
+
+async function receiptDirectory(t) {
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const directory = await mkdtemp(join(tmpdir(), "ops3-receipt-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  return directory;
+}
+
+/** OPS-10's ROLLOUT_JOBS_NOT_PAUSED rule over a world, with the rollout's own classifier. */
+async function rolloutGateHolds(world) {
+  const { scheduledRunJob } = await import("./gcp-scheduler-run-target.mjs");
+  return world.schedulerJobs.filter((entry) => scheduledRunJob(entry) !== null).every(({ state }) => state === "PAUSED");
+}
+
+test("pause-all is a read-only dry run whose plan pauses every plane trigger and opens OPS-10's gate", async () => {
+  const desired = desiredState({ synthetic: false, mutate: RESUMED });
+  const world = resumedWorld(desired);
+  const gcloud = fake(desired, world);
+  const first = operations.planPauseAll(desired, { runner: gcloud.runner });
+  assert.deepEqual(gcloud.calls, [["scheduler", "jobs", "list", `--project=${APPLY_PROJECT}`, "--location=us-east1",
+    "--format=json"]]);
+  assert.equal(first.schema, operations.GCP_OPS_PAUSE_ALL_PLAN_SCHEMA);
+  assert.deepEqual(first.triggers.map(({ name, action, runJob }) => [name, action, runJob]), [
+    [TRIGGER, "pause", "synthetic-analytics-refresh"],
+    ["synthetic-deliberately-paused", "none", "synthetic-analytics-refresh"],
+    ["synthetic-hand-made-trigger", "pause", "synthetic-production-migrate"],
+    ["synthetic-webhook-trigger", "pause", null],
+  ]);
+  assert.deepEqual([first.blockers, first.foreignBlocking, first.rolloutGateAfter.satisfied], [[], [], true]);
+  assert.equal(await rolloutGateHolds(world), false, "the gate is shut before pause-all");
+  // Deterministic: the same estate in another order gives the same digest.
+  world.schedulerJobs.reverse();
+  assert.equal(operations.planPauseAll(desired, { runner: fake(desired, world).runner }).planDigest, first.planDigest);
+});
+
+test("pause-all applies only under its digest, pauses only, writes the receipt, and the rollout gate then holds",
+  async (t) => {
+    const directory = await receiptDirectory(t);
+    const desired = desiredState({ synthetic: false, mutate: RESUMED });
+    const world = resumedWorld(desired);
+    const gcloud = fake(desired, world);
+    const plan = operations.planPauseAll(desired, { runner: gcloud.runner });
+    const receiptPath = join(directory, "pause-all.json");
+    // Refusals before any mutation.
+    for (const [options, code] of [
+      [{ authorize: undefined }, "PAUSE_ALL_AUTHORIZATION_REQUIRED"],
+      [{ authorize: "not-a-digest" }, "PAUSE_ALL_AUTHORIZATION_INVALID"],
+      [{ authorize: "0".repeat(64) }, "PAUSE_ALL_PLAN_DIGEST_MISMATCH"],
+      [{ authorize: plan.planDigest, receiptPath: "relative.json" }, "PAUSE_ALL_RECEIPT_PATH_REQUIRED"],
+    ]) {
+      await assert.rejects(operations.applyPauseAll(desired, { runner: gcloud.runner, receiptPath, ...options }), { code });
+    }
+    await assert.rejects(operations.applyPauseAll(desiredState({ mutate: RESUMED }), { runner: gcloud.runner,
+      authorize: plan.planDigest, receiptPath }), { code: "PAUSE_ALL_SYNTHETIC_TARGET_REFUSED" });
+    assert.equal(kinds(gcloud.calls).every((kind) => kind === "read"), true, "nothing mutated by a refusal");
+    const callsBefore = gcloud.calls.length;
+    const receipt = await operations.applyPauseAll(desired, { runner: gcloud.runner, authorize: plan.planDigest,
+      receiptPath, now: () => Date.parse("2026-10-02T12:00:00Z") });
+    const mutations = gcloud.calls.slice(callsBefore).filter((argv) => operations.classifyGcloudCommand(argv) !== "read");
+    assert.deepEqual(mutations.map((argv) => argv.slice(0, 4).join(" ")), [`scheduler jobs pause ${TRIGGER}`,
+      "scheduler jobs pause synthetic-hand-made-trigger", "scheduler jobs pause synthetic-webhook-trigger"]);
+    assert.equal(world.schedulerJobs.every(({ state }) => state === "PAUSED"), true);
+    assert.equal(await rolloutGateHolds(world), true, "ROLLOUT_JOBS_NOT_PAUSED is now satisfiable");
+    assert.deepEqual([receipt.status, receipt.paused, receipt.alreadyPaused, receipt.failed, receipt.rolloutGate.satisfied],
+      ["complete", [TRIGGER, "synthetic-hand-made-trigger", "synthetic-webhook-trigger"],
+        ["synthetic-deliberately-paused"], null, true]);
+    assert.equal(receipt.pausedAt, "2026-10-02T12:00:00.000Z");
+    const written = JSON.parse(readFileSync(receiptPath, "utf8"));
+    assert.deepEqual(written, JSON.parse(JSON.stringify(receipt)));
+    assert.deepEqual(operations.verifyPauseAllReceipt(written, desired, { nowMs: Date.parse("2026-10-02T12:30:00Z") }),
+      written);
+    // Each plane trigger's read-back evidence is recorded for resume-all.
+    assert.deepEqual(written.triggers.find(({ name }) => name === TRIGGER),
+      { name: TRIGGER, state: "PAUSED", userUpdateTime: "2026-10-02T00:00:00Z", lastAttemptTime: null });
+    const { statSync } = await import("node:fs");
+    assert.equal(statSync(receiptPath).mode & 0o777, 0o600);
+    // OPS-10's clean verdict is unchanged for the managed trigger: paused while
+    // committed ENABLED is OPS-3's deferred resume. (The hand-made triggers are
+    // drift in a dedicated project either way.)
+    assert.deepEqual([...operations.infrastructureCleanliness(plan2(desired, world)).reasons], [
+      "REFUSED:scheduler:delete:synthetic-deliberately-paused", "REFUSED:scheduler:delete:synthetic-hand-made-trigger",
+      "REFUSED:scheduler:delete:synthetic-webhook-trigger"]);
+    // A receipt is never overwritten.
+    const again = operations.planPauseAll(desired, { runner: fake(desired, world).runner });
+    await assert.rejects(operations.applyPauseAll(desired, { runner: fake(desired, world).runner,
+      authorize: again.planDigest, receiptPath }), { code: "OPS_RECEIPT_PATH_UNAVAILABLE" });
+  });
+
+function plan2(desired, world) {
+  return plan(desired, fake(desired, world).runner);
+}
+
+test("a failed pause leaves an incomplete receipt naming what was paused, and resume-all resumes only that", async (t) => {
+  const directory = await receiptDirectory(t);
+  const desired = desiredState({ synthetic: false, mutate: RESUMED });
+  const world = resumedWorld(desired);
+  const failing = fake(desired, world, { failWhen: (argv) => argv.slice(0, 4).join(" ")
+    === "scheduler jobs pause synthetic-hand-made-trigger" });
+  const plan = operations.planPauseAll(desired, { runner: failing.runner });
+  const receiptPath = join(directory, "pause-all.json");
+  const error = await operations.applyPauseAll(desired, { runner: failing.runner, authorize: plan.planDigest, receiptPath })
+    .then(() => null, (caught) => caught);
+  assert.equal(error?.code, "PAUSE_ALL_INCOMPLETE");
+  const written = JSON.parse(readFileSync(receiptPath, "utf8"));
+  assert.deepEqual([written.status, written.paused, written.failed, written.rolloutGate.satisfied],
+    ["incomplete", [TRIGGER], "synthetic-hand-made-trigger", false]);
+  assert.doesNotMatch(JSON.stringify(written), /MARKER/u);
+  // The managed trigger paused by this run is resumed; nothing else is.
+  const resume = operations.planResumeAll(desired, { runner: fake(desired, world).runner, pauseReceipt: written });
+  assert.deepEqual(resume.resume, [TRIGGER]);
+});
+
+test("resume-all resumes only committed-ENABLED managed triggers that pause-all or the operator paused", async (t) => {
+  const directory = await receiptDirectory(t);
+  const desired = desiredState({ synthetic: false, mutate: RESUMED });
+  const world = resumedWorld(desired);
+  const pausePlan = operations.planPauseAll(desired, { runner: fake(desired, world).runner });
+  const pausedAt = () => Date.parse("2026-10-02T12:00:00Z");
+  const now = () => Date.parse("2026-10-02T13:00:00Z");
+  const receipt = await operations.applyPauseAll(desired, { runner: fake(desired, world).runner,
+    authorize: pausePlan.planDigest, receiptPath: join(directory, "pause.json"), now: pausedAt });
+  const gcloud = fake(desired, world);
+  const plan = operations.planResumeAll(desired, { runner: gcloud.runner, pauseReceipt: receipt, now });
+  assert.equal(kinds(gcloud.calls).every((kind) => kind === "read"), true, "the resume plan is a dry run");
+  assert.deepEqual(plan.resume, [TRIGGER], "hand-made triggers are never resumed");
+  assert.deepEqual(plan.triggers, [{ job: "analytics-refresh", name: TRIGGER, committedState: "ENABLED",
+    liveState: "PAUSED", action: "resume" }]);
+  for (const [options, code] of [
+    [{ authorize: undefined }, "RESUME_ALL_AUTHORIZATION_REQUIRED"],
+    [{ authorize: "0".repeat(64) }, "RESUME_ALL_PLAN_DIGEST_MISMATCH"],
+  ]) {
+    assert.throws(() => operations.applyResumeAll(desired, { runner: gcloud.runner, pauseReceipt: receipt, now, ...options }),
+      { code });
+  }
+  assert.throws(() => operations.applyResumeAll(desiredState({ mutate: RESUMED }), { runner: gcloud.runner,
+    pauseReceipt: receipt, authorize: plan.planDigest, now }), { code: "RESUME_ALL_SYNTHETIC_TARGET_REFUSED" });
+  const before = gcloud.calls.length;
+  const done = operations.applyResumeAll(desired, { runner: gcloud.runner, pauseReceipt: receipt,
+    authorize: plan.planDigest, now });
+  assert.deepEqual(gcloud.calls.slice(before).filter((argv) => operations.classifyGcloudCommand(argv) !== "read"),
+    [["scheduler", "jobs", "resume", TRIGGER, `--project=${APPLY_PROJECT}`, "--location=us-east1"]]);
+  assert.deepEqual([done.schema, done.outcomes], [operations.GCP_OPS_RESUME_ALL_RECEIPT_SCHEMA,
+    [{ name: TRIGGER, outcome: "resumed" }]]);
+  assert.equal(trigger(world).state, "ENABLED");
+  for (const name of ["synthetic-hand-made-trigger", "synthetic-webhook-trigger", "synthetic-deliberately-paused"]) {
+    assert.equal(world.schedulerJobs.find((entry) => entry.name.endsWith(`/${name}`)).state, "PAUSED", name);
+  }
+  // Applied again, there is nothing left to resume.
+  assert.deepEqual(operations.planResumeAll(desired, { runner: fake(desired, world).runner, pauseReceipt: receipt, now })
+    .resume, []);
+});
+
+test("resume-all never resumes a trigger committed PAUSED, or one paused by someone else, and --only is exact", async (t) => {
+  const directory = await receiptDirectory(t);
+  // Committed PAUSED (before OPS-3's first resume): pause-all still pauses, resume-all never resumes.
+  const prelaunch = desiredState({ synthetic: false, mutate: CADENCE });
+  const world = convergedWorld(prelaunch);
+  trigger(world).state = "ENABLED"; // someone resumed it by hand
+  const pausePlan = operations.planPauseAll(prelaunch, { runner: fake(prelaunch, world).runner });
+  const receipt = await operations.applyPauseAll(prelaunch, { runner: fake(prelaunch, world).runner,
+    authorize: pausePlan.planDigest, receiptPath: join(directory, "pause.json") });
+  assert.deepEqual(receipt.paused, [TRIGGER]);
+  const committedPaused = operations.planResumeAll(prelaunch, { runner: fake(prelaunch, world).runner, pauseReceipt: receipt });
+  assert.deepEqual([committedPaused.resume, committedPaused.triggers[0].reason], [[], "COMMITTED_STATE_PAUSED"]);
+  assert.throws(() => operations.planResumeAll(prelaunch, { runner: fake(prelaunch, world).runner, only: [TRIGGER] }),
+    { code: "RESUME_ALL_ONLY_INELIGIBLE" });
+  // Committed ENABLED but paused before pause-all ran: not this receipt's to resume.
+  const resumed = desiredState({ synthetic: false, mutate: RESUMED });
+  const quiet = fake(resumed, world).runner;
+  const emptyReceipt = await (async () => {
+    const plan = operations.planPauseAll(resumed, { runner: quiet });
+    return operations.applyPauseAll(resumed, { runner: quiet, authorize: plan.planDigest,
+      receiptPath: join(directory, "pause-again.json") });
+  })();
+  assert.deepEqual([emptyReceipt.paused, emptyReceipt.alreadyPaused], [[], [TRIGGER]]);
+  const deliberate = operations.planResumeAll(resumed, { runner: quiet, pauseReceipt: emptyReceipt });
+  assert.deepEqual([deliberate.resume, deliberate.triggers[0].reason], [[], "NOT_PAUSED_BY_PAUSE_ALL"]);
+  // The operator may name it: --only asserts they paused it.
+  assert.deepEqual(operations.planResumeAll(resumed, { runner: quiet, only: [TRIGGER] }).resume, [TRIGGER]);
+  for (const [source, code] of [
+    [{}, "RESUME_ALL_SOURCE_REQUIRED"],
+    [{ only: [] }, "RESUME_ALL_ONLY_INVALID"],
+    [{ only: ["synthetic-hand-made-trigger"] }, "RESUME_ALL_ONLY_INVALID"],
+    [{ only: [TRIGGER, TRIGGER] }, "RESUME_ALL_ONLY_INVALID"],
+    [{ pauseReceipt: { ...emptyReceipt, paused: [TRIGGER] } }, "PAUSE_ALL_RECEIPT_INVALID"],
+    [{ pauseReceipt: { ...emptyReceipt, project: "example-ops-other" } }, "PAUSE_ALL_RECEIPT_INVALID"],
+    [{ pauseReceipt: { ...emptyReceipt, extra: true } }, "PAUSE_ALL_RECEIPT_INVALID"],
+  ]) {
+    assert.throws(() => operations.planResumeAll(resumed, { runner: quiet, ...source }), { code }, code);
+  }
+  // A live state the plan does not recognize blocks resume-all.
+  trigger(world).state = "UPDATE_FAILED";
+  const blocked = operations.planResumeAll(resumed, { runner: fake(resumed, world).runner, pauseReceipt: emptyReceipt });
+  assert.deepEqual(blocked.blockers, [`TRIGGER_STATE_UNRECOGNIZED:${TRIGGER}`]);
+  assert.throws(() => operations.applyResumeAll(resumed, { runner: fake(resumed, world).runner, pauseReceipt: emptyReceipt,
+    authorize: blocked.planDigest }), { code: "RESUME_ALL_BLOCKED" });
+  assert.ok(operations.planPauseAll(resumed, { runner: fake(resumed, world).runner }).blockers
+    .includes(`TRIGGER_STATE_UNRECOGNIZED:${TRIGGER}`));
+});
+
+/** A receipt edited and then re-digested, as a hand-forged or stale file would be. */
+function redigested(receipt, edit) {
+  const copy = structuredClone(receipt);
+  edit(copy);
+  delete copy.digest;
+  return { ...copy, digest: manifest.sha256Hex(canonicalJson(copy)) };
+}
+
+test("resume-all refuses an old receipt and skips a trigger changed after pause-all, even under a valid receipt",
+  async (t) => {
+    const directory = await receiptDirectory(t);
+    const desired = desiredState({ synthetic: false, mutate: RESUMED });
+    const world = resumedWorld(desired);
+    let tick = 0;
+    const clock = () => `2026-10-02T12:${String(tick++).padStart(2, "0")}:00Z`;
+    const pausedAtMs = Date.parse("2026-10-02T12:30:00Z");
+    const pausePlan = operations.planPauseAll(desired, { runner: fake(desired, world, { clock }).runner });
+    const receipt = await operations.applyPauseAll(desired, { runner: fake(desired, world, { clock }).runner,
+      authorize: pausePlan.planDigest, receiptPath: join(directory, "pause.json"), now: () => pausedAtMs });
+    const at = (iso) => () => Date.parse(iso);
+    const planAt = (now, pauseReceipt = receipt) => operations.planResumeAll(desired,
+      { runner: fake(desired, world, { clock }).runner, pauseReceipt, now });
+    assert.deepEqual(planAt(at("2026-10-03T12:30:00Z")).resume, [TRIGGER], "exactly 24 h old is still current");
+    // Age: a receipt older than 24 h, or dated ahead of now, is refused before any read.
+    assert.equal(operations.PAUSE_ALL_RECEIPT_MAX_AGE_HOURS, 24);
+    assert.throws(() => planAt(at("2026-10-03T12:30:01Z")), { code: "PAUSE_ALL_RECEIPT_STALE" });
+    const august = redigested(receipt, (copy) => { copy.pausedAt = "2026-08-01T00:00:00.000Z"; });
+    assert.throws(() => planAt(at("2026-10-02T13:00:00Z"), august), { code: "PAUSE_ALL_RECEIPT_STALE" });
+    assert.throws(() => operations.applyResumeAll(desired, { runner: fake(desired, world, { clock }).runner,
+      pauseReceipt: august, authorize: "0".repeat(64), now: at("2026-10-02T13:00:00Z") }), { code: "PAUSE_ALL_RECEIPT_STALE" });
+    const ahead = redigested(receipt, (copy) => { copy.pausedAt = "2026-10-02T13:06:00.000Z"; });
+    assert.throws(() => planAt(at("2026-10-02T13:00:00Z"), ahead), { code: "PAUSE_ALL_RECEIPT_INVALID" });
+    // The read-back evidence is closed and digested.
+    for (const edit of [
+      (copy) => { copy.triggers[0].extra = true; },
+      (copy) => { copy.triggers[0].userUpdateTime = "yesterday"; },
+      (copy) => { copy.triggers.push(copy.triggers[0]); },
+      (copy) => { copy.triggers = "none"; },
+    ]) {
+      assert.throws(() => planAt(at("2026-10-02T13:00:00Z"), redigested(receipt, edit)),
+        { code: "PAUSE_ALL_RECEIPT_INVALID" });
+    }
+    // No read-back for the trigger (the readback after the pauses failed): not resumed from the receipt.
+    const unread = redigested(receipt, (copy) => { copy.triggers = null; });
+    const missing = planAt(at("2026-10-02T13:00:00Z"), unread);
+    assert.deepEqual([missing.resume, missing.triggers[0].reason], [[], "PAUSE_ALL_READBACK_MISSING"]);
+    // Someone resumed it and paused it again on purpose after pause-all.
+    const now = at("2026-10-02T13:00:00Z");
+    assert.deepEqual(planAt(now).resume, [TRIGGER]);
+    const recorded = receipt.triggers.find(({ name }) => name === TRIGGER);
+    const call = fake(desired, world, { clock }).runner;
+    for (const verb of ["resume", "pause"]) {
+      assert.equal(call(["scheduler", "jobs", verb, TRIGGER, `--project=${desired.project}`, "--location=us-east1"]).status, 0);
+    }
+    assert.equal(trigger(world).state, "PAUSED");
+    assert.notEqual(trigger(world).userUpdateTime, recorded.userUpdateTime);
+    const repaused = planAt(now);
+    assert.deepEqual([repaused.resume, repaused.triggers[0].reason], [[], "CHANGED_AFTER_PAUSE_ALL"]);
+    const none = operations.applyResumeAll(desired, { runner: fake(desired, world, { clock }).runner,
+      pauseReceipt: receipt, authorize: repaused.planDigest, now });
+    assert.deepEqual(none.outcomes, []);
+    assert.equal(trigger(world).state, "PAUSED", "a deliberately re-paused trigger stays paused");
+    // A trigger that ran after pause-all was resumed in between, even if its userUpdateTime did not move.
+    trigger(world).userUpdateTime = recorded.userUpdateTime;
+    trigger(world).lastAttemptTime = "2026-10-02T12:45:00Z";
+    assert.deepEqual(planAt(now).triggers[0].reason, "CHANGED_AFTER_PAUSE_ALL");
+    // --only stays the operator's explicit path for both.
+    assert.deepEqual(operations.planResumeAll(desired, { runner: fake(desired, world).runner, only: [TRIGGER] }).resume,
+      [TRIGGER]);
+    assert.ok(operations.RESUME_SKIP_REASONS.includes("CHANGED_AFTER_PAUSE_ALL")
+      && operations.RESUME_SKIP_REASONS.includes("PAUSE_ALL_READBACK_MISSING"));
+  });
+
+test("in a shared project pause-all touches only the plane, and names a co-tenant trigger that keeps the gate shut",
+  async (t) => {
+    const directory = await receiptDirectory(t);
+    const shared = desiredState({ synthetic: false, mutate: (value) => { sharedStaging(value); CADENCE(value); } });
+    const world = withCoTenants(bornWorld(shared), shared);
+    const runUri = (job) => `https://run.googleapis.com/v2/projects/${shared.project}/locations/${shared.region}/jobs/${job}:run`;
+    world.schedulerJobs.push(
+      { name: `projects/${shared.project}/locations/${shared.region}/jobs/synthetic-staging-trigger`, state: "ENABLED",
+        httpTarget: { uri: runUri("synthetic-staging-refresh") } },
+      { name: `projects/${shared.project}/locations/${shared.region}/jobs/synthetic-staging-hand-made`, state: "ENABLED",
+        httpTarget: { uri: runUri("synthetic-staging-migrate") } },
+    );
+    const plan = operations.planPauseAll(shared, { runner: fake(shared, world).runner });
+    assert.deepEqual(plan.triggers.map(({ name }) => name), ["synthetic-staging-hand-made", "synthetic-staging-trigger"]);
+    assert.deepEqual(plan.foreignBlocking, [{ name: "tibotattle-test-nightly", state: "ENABLED" }]);
+    assert.deepEqual([plan.rolloutGateAfter.satisfied, plan.rolloutGateAfter.reasons],
+      [false, ["TRIGGER_NOT_PAUSED:tibotattle-test-nightly"]]);
+    const gcloud = fake(shared, world);
+    const receipt = await operations.applyPauseAll(shared, { runner: gcloud.runner, authorize: plan.planDigest,
+      receiptPath: join(directory, "pause.json") });
+    assert.deepEqual(receipt.paused, ["synthetic-staging-hand-made", "synthetic-staging-trigger"]);
+    assert.equal(gcloud.calls.some((argv) => argv.includes("tibotattle-test-nightly")), false, "a co-tenant is never touched");
+    assert.equal(world.schedulerJobs.find((entry) => entry.name.endsWith("/tibotattle-test-nightly")).state, "ENABLED");
+    assert.equal(receipt.rolloutGate.satisfied, false);
+  });
+
+test("the pause and resume guards issue only their own shape, and apply and read never know resume", () => {
+  const calls = [];
+  const runner = (argv) => { calls.push(argv); return { status: 0, stdout: "[]" }; };
+  const project = "--project=example-ops-prod1";
+  const pause = operations.guardedGcloud(runner, { mode: "pause", project: "example-ops-prod1" });
+  const resume = operations.guardedGcloud(runner, { mode: "resume", project: "example-ops-prod1" });
+  const apply = operations.guardedGcloud(runner, { mode: "apply", project: "example-ops-prod1" });
+  const read = operations.guardedGcloud(runner, { mode: "read", project: "example-ops-prod1" });
+  assert.throws(() => pause(["sql", "instances", "create", "x", project]), { code: "GCLOUD_MUTATION_UNAUTHORIZED" });
+  assert.throws(() => pause(["scheduler", "jobs", "update", "http", "x", project]), { code: "GCLOUD_MUTATION_UNAUTHORIZED" });
+  assert.throws(() => pause(["scheduler", "jobs", "resume", "x", project]), { code: "GCLOUD_COMMAND_FORBIDDEN" });
+  assert.throws(() => resume(["scheduler", "jobs", "pause", "x", project]), { code: "GCLOUD_MUTATION_UNAUTHORIZED" });
+  assert.throws(() => resume(["run", "jobs", "replace", "x", project]), { code: "GCLOUD_MUTATION_UNAUTHORIZED" });
+  for (const call of [apply, read]) {
+    assert.throws(() => call(["scheduler", "jobs", "resume", "x", project]), { code: "GCLOUD_COMMAND_FORBIDDEN" });
+  }
+  assert.throws(() => operations.guardedGcloud(runner, { mode: "admin", project: "example-ops-prod1" }),
+    { code: "GCLOUD_GUARD_MODE_INVALID" });
+  assert.equal(calls.length, 0);
+  assert.equal(pause(["scheduler", "jobs", "pause", "x", project, "--location=us-east1"]), null);
+  assert.equal(resume(["scheduler", "jobs", "resume", "x", project, "--location=us-east1"]), null);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(operations.RESUME_COMMANDS, ["scheduler jobs resume"]);
+  assert.equal(operations.MUTATING_COMMANDS.includes(operations.PAUSE_COMMAND), true);
 });

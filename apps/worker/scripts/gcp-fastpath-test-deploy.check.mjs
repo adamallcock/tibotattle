@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -10,6 +10,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { parse as parseJsonc } from "jsonc-parser";
 import {
+  checkOriginEdgeContract,
   countMigrationsAtCommit,
   EDGE_PROXY_SOURCE,
   EDGE_TEST_PRODUCTION_SETTINGS,
@@ -52,11 +53,63 @@ import {
   resolveAnalyticsRefreshDatabase,
 } from "../cloud-run/analytics-refresh.mjs";
 
+import { applyEdgeModeSnapshotDelta } from "./edge-mode-configuration.mjs";
+import { createProductionLiveConfigSnapshot } from "./production-live-config.mjs";
+import { EDGE_CAPTURE_MAX_AGE_MS, ROLLOUT_EDGE_LIVE_SCHEMA } from "./gcp-production-rollout.mjs";
+
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const IMAGE = `${FASTPATH_TEST.imageRepository}@sha256:${"a".repeat(64)}`;
 const PROOF = JSON.stringify({ bucket: FASTPATH_TEST.originBucket, bucketGeneration: "1",
   bucketMetageneration: "1", softDeleteRetentionDurationSeconds: "0" });
 const SOURCE = Object.freeze({ sourceId: "synthetic-source", sourceNamespace: "synthetic-namespace" });
+
+// ---------------------------------------------------------------------------
+// D-BLOB: a synthetic EP-9 capture of the tracked production Worker in worker
+// mode, whose DEPLOYMENT_SOURCE_COMMIT is this checkout's HEAD, so the
+// contract blob at --commit=HEAD equals the live edge's.
+
+const HEAD_COMMIT = spawnSync("git", ["-C", WORKER_ROOT, "rev-parse", "--verify", "HEAD"], { encoding: "utf8" })
+  .stdout.trim();
+const EDGE_FIXTURE = JSON.parse(await readFile(new URL("./fixtures/edge-mode-live-snapshot.synthetic.json",
+  import.meta.url), "utf8"));
+const TRACKED_WRANGLER = parseJsonc(await readFile(join(WORKER_ROOT, "wrangler.jsonc"), "utf8"));
+
+function liveSnapshot(snapshot, overrides) {
+  const value = { ...snapshot, ...overrides };
+  const bindings = value.bindings.map((binding) => (binding.type === "d1" ? { ...binding, id: binding.database_id } : binding));
+  return createProductionLiveConfigSnapshot({
+    accountId: value.accountId,
+    workerName: value.workerName,
+    version: { id: value.versionId, resources: { script_runtime: value.runtime, bindings } },
+    settings: { ...value.settings, compatibility_date: value.runtime.compatibility_date,
+      compatibility_flags: value.runtime.compatibility_flags, usage_model: value.runtime.usage_model,
+      limits: value.runtime.limits, cache_options: value.runtime.cache_options, bindings },
+    schedules: { schedules: value.crons.map((cron) => ({ cron })) },
+    subdomain: value.subdomain,
+    routes: value.routes,
+    domains: value.domains,
+    namespaces: value.namespaces,
+  });
+}
+
+/** The capture text: worker mode, one deployment at 100%, edge commit `edgeCommit`. */
+function edgeCapture({ edgeCommit = HEAD_COMMIT, capturedAt = new Date().toISOString() } = {}) {
+  const worker = applyEdgeModeSnapshotDelta({ snapshot: EDGE_FIXTURE, mode: "worker", trackedConfig: TRACKED_WRANGLER });
+  const withCommit = liveSnapshot(worker, { bindings: worker.bindings.map((binding) =>
+    (binding.name === "DEPLOYMENT_SOURCE_COMMIT" ? { ...binding, text: edgeCommit } : binding)) });
+  const snapshot = liveSnapshot(withCommit, { versionId: "0e000000-0000-4000-8000-000000000201" });
+  return JSON.stringify({ schema: ROLLOUT_EDGE_LIVE_SCHEMA, capturedAt, snapshot,
+    deployment: { versions: [{ version_id: snapshot.versionId, percentage: 100 }] } });
+}
+
+/** A temporary capture file and the D-BLOB arguments that name it. */
+async function edgeArguments(t, options) {
+  const directory = await mkdtemp(join(tmpdir(), "fastpath-deploy-edge-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, "edge-live.json");
+  await writeFile(path, edgeCapture(options), { mode: 0o600 });
+  return ["--commit=HEAD", `--edge-live=${path}`, "--edge-environment=production"];
+}
 
 function expectCode(fn, code) {
   assert.throws(fn, (error) => error?.code === code);
@@ -522,7 +575,8 @@ test("any other runtime binding or a public member on the bucket is refused befo
     (error) => error?.code === "FASTPATH_DEPLOY_ORIGIN_BUCKET_BINDING_MISSING");
 });
 
-test("a dry-run origin step prints the bucket binding before the origin is deployed and writes nothing remote", async () => {
+test("a dry-run origin step prints the bucket binding before the origin is deployed and writes nothing remote", async (t) => {
+  const edge = await edgeArguments(t);
   const out = await mkdtemp(join(tmpdir(), "fastpath-deploy-dry-"));
   const printed = [];
   const { error: printError, log: printLog } = console;
@@ -530,9 +584,13 @@ test("a dry-run origin step prints the bucket binding before the origin is deplo
   console.log = () => {};
   try {
     const report = await main(["origin", "--dry-run", `--image=${IMAGE}`, `--schema=${FASTPATH_TEST.primarySchema}`,
-      `--out=${out}`]);
+      `--out=${out}`, ...edge]);
     assert.deepEqual({ ...report.steps[0].bucketBinding }, { role: CLEANUP_ROLE, member: RUNTIME_MEMBER,
       conditionTitle: "TiboTattleFastpathTelemetry", added: false });
+    assert.deepEqual({ ...report.steps[0].edgeContract }, { environment: "production", mode: "worker",
+      edgeCommit: HEAD_COMMIT, capturedAt: report.steps[0].edgeContract.capturedAt, originCommit: HEAD_COMMIT,
+      contractBlob: spawnSync("git", ["-C", WORKER_ROOT, "rev-parse", "HEAD:apps/worker/src/edge-origin-contract.ts"],
+        { encoding: "utf8" }).stdout.trim() });
   } finally {
     console.error = printError;
     console.log = printLog;
@@ -593,7 +651,8 @@ test("a digest-only golden without --dump is refused before any remote command; 
   }
 });
 
-test("an origin-only run over a seeded schema renders the source of the --dump a digest-only golden pins", async () => {
+test("an origin-only run over a seeded schema renders the source of the --dump a digest-only golden pins", async (t) => {
+  const edge = await edgeArguments(t);
   await withDigestOnlyGolden(async ({ golden, dump }) => {
     const out = await mkdtemp(join(tmpdir(), "fastpath-deploy-dump-"));
     try {
@@ -602,7 +661,7 @@ test("an origin-only run over a seeded schema renders the source of the --dump a
       const refused = await capturedMain(argv);
       assert.equal(refused.error?.code, "GCP_FASTPATH_SEED_DUMP_REQUIRED");
       assert.deepEqual(refused.printed, []);
-      const { report, error } = await capturedMain([...argv, `--dump=${dump}`]);
+      const { report, error } = await capturedMain([...argv, `--dump=${dump}`, ...edge]);
       assert.equal(error, undefined);
       const [origin] = report.steps;
       assert.deepEqual({ ...origin.sourceIdentity }, { ...DIGEST_ONLY_GOLDEN_SOURCE });
@@ -614,3 +673,49 @@ test("an origin-only run over a seeded schema renders the source of the --dump a
     }
   });
 });
+
+test("D-BLOB: the origin step refuses before any remote command without a fresh, verified, matching edge capture",
+  async (t) => {
+    const out = await mkdtemp(join(tmpdir(), "fastpath-deploy-blob-"));
+    t.after(() => rm(out, { recursive: true, force: true }));
+    const base = ["origin", "--dry-run", `--image=${IMAGE}`, `--schema=${FASTPATH_TEST.primarySchema}`, `--out=${out}`];
+    const edge = await edgeArguments(t);
+    const refusals = [
+      [base, "FASTPATH_DEPLOY_EDGE_LIVE_REQUIRED"],
+      [[...base, edge[1], edge[2]], "FASTPATH_DEPLOY_ORIGIN_COMMIT_REQUIRED"],
+      [[...base, edge[0], edge[1]], "FASTPATH_DEPLOY_EDGE_LIVE_REQUIRED"],
+      [[...base, ...edge.slice(0, 2), "--edge-environment=staging"], "ROLLOUT_EDGE_LIVE_TARGET_MISMATCH"],
+      [[...base, ...await edgeArguments(t, { capturedAt: new Date(Date.now() - EDGE_CAPTURE_MAX_AGE_MS - 60_000)
+        .toISOString() })], "ROLLOUT_EDGE_LIVE_STALE"],
+      [[...base, edge[0], `--edge-live=${join(out, "absent.json")}`, edge[2]], "ROLLOUT_EDGE_LIVE_REQUIRED"],
+      [["all", "--dry-run", `--image=${IMAGE}`, `--schema=${FASTPATH_TEST.primarySchema}`, `--out=${out}`, "--commit=HEAD"],
+        "FASTPATH_DEPLOY_EDGE_LIVE_REQUIRED"],
+    ];
+    for (const [argv, code] of refusals) {
+      const { printed, error } = await capturedMain(argv);
+      assert.equal(error?.code, code, argv.join(" "));
+      assert.deepEqual(printed, [], `${code}: no command precedes the refusal`);
+    }
+    for (const argument of ["--edge-live=relative.json", "--edge-environment=test"]) {
+      const { error } = await capturedMain([...base, argument]);
+      assert.equal(error?.code, "FASTPATH_DEPLOY_ARGUMENT_INVALID", argument);
+    }
+    // The blob comparison itself, against a synthetic edge commit: another
+    // blob there, or none (a pre-edge Worker), refuses; the same blob passes.
+    const record = await checkOriginEdgeContract({ edgeLive: edge[1].slice("--edge-live=".length),
+      edgeEnvironment: "production", commit: "HEAD" });
+    assert.equal(record.originCommit, HEAD_COMMIT);
+    const EDGE_COMMIT = "3".repeat(40);
+    const synthetic = await edgeArguments(t, { edgeCommit: EDGE_COMMIT });
+    const options = { edgeLive: synthetic[1].slice("--edge-live=".length), edgeEnvironment: "production", commit: "HEAD" };
+    for (const edgeBlob of ["b".repeat(40), null]) {
+      await assert.rejects(checkOriginEdgeContract(options, {
+        readBlob: (commit) => (commit === HEAD_COMMIT ? record.contractBlob : edgeBlob),
+      }), (error) => error?.code === "EDGE_CONTRACT_DRIFT", String(edgeBlob));
+    }
+    assert.equal((await checkOriginEdgeContract(options, {
+      readBlob: (commit) => (commit === HEAD_COMMIT || commit === EDGE_COMMIT ? record.contractBlob : null),
+    })).edgeCommit, EDGE_COMMIT);
+    const { error } = await capturedMain([...base, ...synthetic]);
+    assert.equal(error?.code, "EDGE_CONTRACT_DRIFT", "an edge commit this checkout lacks never matches");
+  });

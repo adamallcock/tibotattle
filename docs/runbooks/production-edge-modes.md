@@ -303,11 +303,46 @@ web-only releases pause.
 Every origin deploy must check that
 `git rev-parse <origin commit>:apps/worker/src/edge-origin-contract.ts` equals
 the same blob at the live edge commit, read from the Cloudflare
-`DEPLOYMENT_SOURCE_COMMIT` binding. Refuse the deploy otherwise. The origin
-deploy tooling does not implement this check yet.
+`DEPLOYMENT_SOURCE_COMMIT` binding. Refuse the deploy otherwise.
 
-A contract change has no in-place path: brake to fenced, deploy the origin,
-then run the gcp deploy from an edge commit with the same blob.
+Both origin deploy tools apply this check (D-BLOB) in every edge mode, before
+any remote command. They read the live edge commit from the owner's fresh
+EP-9 capture (`{schema, capturedAt, snapshot, deployment}`, at most 15
+minutes old):
+
+- OPS-10's `gcp-production-rollout.mjs roll` (`--edge-live`);
+- the fast-path test deploy's `origin` step (`--edge-live` and
+  `--edge-environment`).
+
+Each refuses `EDGE_CONTRACT_DRIFT` when the two blobs differ, or when either
+commit has no contract file. A pre-edge Worker, such as the production
+commit `d43c8f92`, has no contract file. An origin roll therefore refuses
+until the edge port is live in worker mode (PROD-5).
+
+**One exception: OPS-2's first create of the service.** `gcp-infra.mjs apply`
+with `--bootstrap-image-digest` and `--bootstrap-source-commit` creates the
+Cloud Run service from a bootstrap image when the service does not exist yet.
+That create runs no contract-blob check. It is safe only because no edge can
+be forwarding to a service that does not exist:
+
+- a gcp-mode edge is deployed only against a verified, running origin whose
+  blob matched;
+- OPS-2 never deletes the service.
+
+If the service is ever deleted out of band while the edge is in gcp mode,
+brake to fenced before recreating it. Then roll the intended commit with
+OPS-10, which checks the blob, before any gcp deploy.
+
+A contract change has no in-place path. Run these steps in order:
+
+1. **Brake to fenced, from an edge commit that already carries the new
+   contract blob.** A fenced deploy does not compare the origin's blob, so
+   it can go first. Braking from the old edge commit does not work: the
+   origin deploy in step 2 would then refuse `EDGE_CONTRACT_DRIFT` against
+   the live fenced edge.
+2. Deploy the origin at a commit with the new blob. Its D-BLOB check now
+   matches the live fenced edge.
+3. Run the gcp deploy from an edge commit with the same blob.
 
 ### Reading edge failures
 
