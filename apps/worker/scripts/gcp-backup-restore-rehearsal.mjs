@@ -77,8 +77,8 @@
  * Safety:
  * - Dry run is the default and makes no call: it prints the exact plan and the
  *   exact `--authorize` value (`restore-rehearsal:<env>:<scratch>:<plan digest>`).
- * - Only staging is rehearsed. Production needs its committed desired state
- *   filled (the loader refuses DESIRED_STATE_PLACEHOLDER_UNFILLED until OWN-5)
+ * - Only staging is rehearsed. Production needs a filled committed desired
+ *   state (the loader refuses DESIRED_STATE_PLACEHOLDER_UNFILLED otherwise)
  *   AND `--production`; even then it only prints the plan (`plan_only`) and
  *   refuses `--apply` and `cleanup`. Every other environment is refused.
  * - The source is only read. Every gcloud call passes a closed guard: a fixed

@@ -269,13 +269,12 @@
     "secrets": {
       "type": "object",
       "additionalProperties": false,
+      "description": "CR-3's secret names. Production may leave out GOOGLE_OIDC_CLIENT_SECRET and APPLE_PRIVATE_KEY (round 12 retired Google and Apple sign-in; RETIRED_PRODUCTION_SECRET_NAMES), and the committed production file does; staging must name all seven until ROUTES-R12 narrows CR-3.",
       "required": [
         "IDENTITY_LINK_SECRET",
         "POSTGRES_RATE_LIMIT_SECRET",
         "ENVELOPE_PUBLIC_JWK",
         "ENVELOPE_PRIVATE_JWK",
-        "GOOGLE_OIDC_CLIENT_SECRET",
-        "APPLE_PRIVATE_KEY",
         "DISTRIBUTION_GITHUB_API_TOKEN"
       ],
       "properties": {

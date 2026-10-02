@@ -2,9 +2,9 @@
   "schemaVersion": "tibotattle-gcp-ops-infra-desired-state-v2",
   "environment": "production",
   "projectTenancy": "dedicated",
-  "project": null,
-  "projectNumber": null,
-  "region": null,
+  "project": "tibotattle-prod",
+  "projectNumber": "874229235044",
+  "region": "us-east1",
   "artifactRegistry": {
     "repository": "tibotattle-images",
     "imageName": "tibotattle-host"
@@ -33,7 +33,7 @@
     "verifier": {
       "accountId": "tibotattle-verifier",
       "projectRoles": [],
-      "tokenCreators": null
+      "tokenCreators": ["user:adamallcock@gmail.com"]
     }
   },
   "customRole": {
@@ -51,8 +51,6 @@
     "POSTGRES_RATE_LIMIT_SECRET": { "secretName": "POSTGRES_RATE_LIMIT_SECRET", "version": null },
     "ENVELOPE_PUBLIC_JWK": { "secretName": "ENVELOPE_PUBLIC_JWK", "version": null },
     "ENVELOPE_PRIVATE_JWK": { "secretName": "ENVELOPE_PRIVATE_JWK", "version": null },
-    "GOOGLE_OIDC_CLIENT_SECRET": { "secretName": "GOOGLE_OIDC_CLIENT_SECRET", "version": null },
-    "APPLE_PRIVATE_KEY": { "secretName": "APPLE_PRIVATE_KEY", "version": null },
     "DISTRIBUTION_GITHUB_API_TOKEN": { "secretName": "DISTRIBUTION_GITHUB_API_TOKEN", "version": null }
   },
   "cloudSql": {
@@ -66,7 +64,7 @@
   },
   "bucket": {
     "name": "tibotattle-quarantine",
-    "location": null,
+    "location": "US-EAST1",
     "proof": null
   },
   "service": {
@@ -89,7 +87,7 @@
   "scheduler": {
     "analytics-refresh": {
       "name": "tibotattle-analytics-refresh-trigger",
-      "schedule": null,
+      "schedule": "15 2 * * *",
       "state": "PAUSED"
     }
   },

@@ -8,7 +8,7 @@
  */
 
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -31,6 +31,7 @@ import {
   readbackMonitoring,
 } from "./gcp-monitoring.mjs";
 import { renderMonitoring } from "./gcp-ops-monitoring-policies.mjs";
+import { unfilledProductionText } from "./fixtures/gcp-ops-infra/production-unfilled.mjs";
 
 process.env.PATH = "/nonexistent-gcloud-guard";
 
@@ -70,10 +71,11 @@ function liveFrom(rendered) {
   };
 }
 
-async function run(argv, { runner = fakeMonitoring().runner, fetchImpl } = {}) {
+async function run(argv, { runner = fakeMonitoring().runner, fetchImpl, readFile } = {}) {
   const out = [];
   const err = [];
   const code = await main(argv, { runner, ...(fetchImpl === undefined ? {} : { fetchImpl }),
+    ...(readFile === undefined ? {} : { readFile }),
     now: () => Date.parse("2026-10-02T12:00:00Z"), stdout: (text) => out.push(text), stderr: (text) => err.push(text) });
   return { code, out: out.join(""), err: err.join("") };
 }
@@ -203,11 +205,20 @@ test("the plan is deterministic, never applies, defers what waits and refuses de
     [{ job: "synthetic-probe", deferred: "TRIGGER_COMMITTED_PAUSED" }]);
 });
 
-test("production waits for its owner placeholders", async () => {
+test("production renders from its committed file (PROD-PREP) and refuses one with an unfilled placeholder", async () => {
   assert.match(committedDesiredStatePath("production"), /production\.desired-state\.json$/u);
   const result = await run(["render", "--environment=production"]);
-  assert.equal(result.code, 1);
-  assert.match(JSON.parse(result.err).code, /^DESIRED_STATE_PLACEHOLDER_UNFILLED/u);
+  assert.equal(result.code, 0, result.err);
+  const rendered = JSON.parse(result.out);
+  assert.deepEqual([rendered.environment, rendered.project, rendered.notificationChannel],
+    ["production", "tibotattle-prod", "unassigned"]);
+  // The trigger is committed PAUSED, so its policies wait for OPS-3.
+  assert.deepEqual(rendered.policies.find(({ id }) => id === "scheduler-quiet").deferred, "TRIGGER_COMMITTED_PAUSED");
+  const unfilledText = unfilledProductionText();
+  const unfilled = await run(["render", "--environment=production"], {
+    readFile: (path) => (path === committedDesiredStatePath("production") ? unfilledText : readFileSync(path, "utf8")) });
+  assert.equal(unfilled.code, 1);
+  assert.match(JSON.parse(unfilled.err).code, /^DESIRED_STATE_PLACEHOLDER_UNFILLED/u);
 });
 
 test("the origin-lock probe accepts exactly Google's front-end 403 and never prints the body", async () => {

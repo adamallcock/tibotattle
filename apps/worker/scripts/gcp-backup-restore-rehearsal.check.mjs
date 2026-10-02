@@ -30,6 +30,7 @@ import {
   scratchInstanceName,
 } from "./gcp-backup-restore-rehearsal.mjs";
 import { TEST_TARGET_NAMES, loadCommittedDesiredState } from "./gcp-ops-infra-manifest.mjs";
+import { unfilledProductionText } from "./fixtures/gcp-ops-infra/production-unfilled.mjs";
 
 // The committed staging desired state is read as is; every database row,
 // backup, instance and operation below is a synthetic fake. Nothing calls gcloud.
@@ -411,13 +412,8 @@ function withDesired(mutate) {
 }
 
 function productionFilledText() {
-  return readFile(new URL("../cloud-run/infra/production.desired-state.json", import.meta.url), "utf8")
-    .then((text) => {
-      const value = JSON.parse(text);
-      Object.assign(value, { project: "tibotattle-prod", projectNumber: "874229235044", region: "us-east1" });
-      value.bucket.location = "US-EAST1";
-      return JSON.stringify(value);
-    });
+  // PROD-PREP filled OWN-5's placeholders in the committed file.
+  return readFile(new URL("../cloud-run/infra/production.desired-state.json", import.meta.url), "utf8");
 }
 
 async function expectCode(promiseOrFn, code) {
@@ -863,11 +859,13 @@ test("every environment other than staging and plan-only production is refused",
 test("production needs --production, then a filled desired state, and then only plans", async () => {
   const productionArgs = ["rehearse", "--environment=production", "--path=pitr", `--point-in-time=${POINT_IN_TIME}`];
   assert.equal((await cli(productionArgs, { runner: NO_GCLOUD })).err.code, "RESTORE_REHEARSAL_PRODUCTION_FLAG_REQUIRED");
-  // The committed production file is still unfilled (OWN-5).
-  const unfilled = await cli([...productionArgs, "--production"], { runner: NO_GCLOUD });
+  // A production file whose OWN-5 placeholders are unfilled is refused.
+  const unfilledText = unfilledProductionText(await productionFilledText());
+  const unfilled = await cli([...productionArgs, "--production"], { runner: NO_GCLOUD,
+    loadDesired: (environment) => loadCommittedDesiredState(environment, { readFile: () => unfilledText }) });
   assert.equal(unfilled.code, 1);
   assert.match(unfilled.err.code, /^DESIRED_STATE_PLACEHOLDER_UNFILLED:/u);
-  // Filled in memory: a plan, never an authorization.
+  // The committed, filled file: a plan, never an authorization.
   const filledText = await productionFilledText();
   const loadDesired = (environment) => loadCommittedDesiredState(environment, { readFile: () => filledText });
   const planned = await cli([...productionArgs, "--production", `--rehearsal-id=${ID}`], { runner: NO_GCLOUD, loadDesired });

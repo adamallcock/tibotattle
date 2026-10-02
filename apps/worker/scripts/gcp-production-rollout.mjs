@@ -1385,11 +1385,15 @@ export async function runRollout(argv, dependencies = {}) {
   return roll(context, args, validated);
 }
 
+// No top-level await: the default target loader imports the OPS-2 manifest,
+// whose import graph (gcp-fastpath-test-deploy.mjs) imports this module back.
+// Awaiting here would leave this module evaluating while that import waits for
+// it, and Node would exit 13 ("unsettled top-level await") before any verb ran.
 if (process.argv[1] !== undefined && resolve(process.argv[1]) === SCRIPT_FILE) {
-  try {
-    console.log(JSON.stringify(await runRollout(process.argv.slice(2)), null, 2));
-  } catch (error) {
+  runRollout(process.argv.slice(2)).then((result) => {
+    console.log(JSON.stringify(result, null, 2));
+  }, (error) => {
     console.error(JSON.stringify({ status: "error", code: safeRolloutErrorCode(error) }));
     process.exitCode = 1;
-  }
+  });
 }

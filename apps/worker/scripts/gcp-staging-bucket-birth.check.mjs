@@ -21,6 +21,7 @@ import * as flow from "./gcp-staging-bucket-birth.mjs";
 import * as pins from "./gcp-staging-desired-state.mjs";
 import { bornBucket } from "./fixtures/gcp-ops-infra/fake-gcloud.mjs";
 import { unpinnedStagingText } from "./fixtures/gcp-ops-infra/staging-unpinned.mjs";
+import { unfilledProductionText } from "./fixtures/gcp-ops-infra/production-unfilled.mjs";
 
 process.env.PATH = "/nonexistent-gcloud-guard";
 
@@ -387,7 +388,9 @@ test("pins are exact, validated, one line each, and never move an existing pin",
   assert.throws(() => pins.pinStagingSecretVersions(reformatted, { APPLE_PRIVATE_KEY: "1" }),
     { code: "STAGING_DESIRED_STATE_LAYOUT_UNEXPECTED:secrets.APPLE_PRIVATE_KEY" });
   // Only the committed staging file: never production, never the synthetic fixture.
-  assert.throws(() => pins.pinStagingSecretVersions(PRODUCTION_TEXT, { APPLE_PRIVATE_KEY: "1" }),
+  assert.throws(() => pins.pinStagingSecretVersions(PRODUCTION_TEXT, { ENVELOPE_PRIVATE_JWK: "1" }),
+    { code: "GCP_INFRA_ENVIRONMENT_MISMATCH" });
+  assert.throws(() => pins.pinStagingSecretVersions(unfilledProductionText(PRODUCTION_TEXT), { ENVELOPE_PRIVATE_JWK: "1" }),
     { code: "DESIRED_STATE_PLACEHOLDER_UNFILLED:project" });
   const fixture = readFileSync(join(SCRIPTS_ROOT, "fixtures/gcp-ops-infra/desired-state.synthetic.json"), "utf8");
   assert.throws(() => pins.pinStagingBucketProof(fixture, { bucketGeneration: GENERATION, bucketMetageneration: "1" }),

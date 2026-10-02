@@ -9,7 +9,7 @@ a rollout reads.
 | File | Plane |
 |---|---|
 | `staging.desired-state.json` | Staging, in the shared GCP test project `tibotattle` (`projectTenancy: "shared"`), with new, staging-marked resources only. It is the synthetic plane for the staging load test (OPS-11), the staging edge's origin (OWN-7b) and migrate and roll drills. Production data and production secrets never enter it. |
-| `production.desired-state.json` | Production, in a dedicated project. Its project, project number, region and bucket location are `null` placeholders until the owner assigns them (OWN-5). |
+| `production.desired-state.json` | Production, in the dedicated project `tibotattle-prod` (number 874229235044, `us-east1`), filled by PROD-PREP under owner decisions round 13. The apply steps and their per-operation approvals are in `docs/runbooks/gcp-production-apply.md`. |
 | `desired-state.schema.json` | JSON Schema for editors and review. `scripts/gcp-ops-infra-manifest.mjs` `validateDesiredState` is authoritative. |
 | `monitoring.md` | The runbook that the OPS-5 alert policies link to, one anchor per policy. The policies are derived from these desired states by `scripts/gcp-ops-monitoring-policies.mjs`. |
 
@@ -32,6 +32,13 @@ production estate reads unclean until that instance is deleted.
   words. In staging it is a `tibotattle-staging-` id of lowercase words.
 - An owner placeholder (`null` at `project`, `projectNumber`, `region` or
   `bucket.location`) is refused with `DESIRED_STATE_PLACEHOLDER_UNFILLED`.
+- Production may leave out the secrets round 12 retired with Google and Apple
+  sign-in (`RETIRED_PRODUCTION_SECRET_NAMES`: `GOOGLE_OIDC_CLIENT_SECRET`,
+  `APPLE_PRIVATE_KEY`), and the committed file does, so no production
+  container is made for them. Staging names all seven until ROUTES-R12
+  narrows CR-3. While CR-3 still requires a secret the file leaves out, the
+  service is deferred (`SERVICE_RETIRED_SECRET_STILL_REQUIRED:<name>`); that
+  clears itself when ROUTES-R12 drops the name.
 - Production never shares its project and never names a test-estate or
   staging resource. Staging names every plane resource with the `staging`
   token and never reuses a test-estate name.
@@ -41,7 +48,7 @@ production estate reads unclean until that instance is deleted.
 ## Values that wait for the owner
 
 Each of these is `null` until the owner supplies it, except where the next
-section says Claude filled a staging value. While a value is `null`, the
+sections say Claude filled a production or staging value. While a value is `null`, the
 estate does not read clean, or the resource that depends on it is not
 created.
 
@@ -51,8 +58,25 @@ created.
 | `secrets.*.version` | The service is not rendered (`SECRET_VERSION_UNPINNED`) |
 | `bucket.proof` | Apply refuses until the bucket-birth receipt's proof is committed; the staging service is not rendered (`SERVICE_RENDER_BUCKET_PROOF_UNPINNED`) |
 | `service.telemetryStorageNamespace` | The service is not rendered; it must equal the namespace the imported data carries. Staging's value was chosen by Claude (see below) |
-| `scheduler.analytics-refresh.schedule` | The trigger is not created (decision D3: no default cadence) |
+| `scheduler.analytics-refresh.schedule` | The trigger is not created (decision D3: no default cadence). Production carries PROD-PREP's proposal, below |
 | `stagingOrigin.accessAud` (staging only) | The staging service is not rendered (`STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud`) until the owner creates the staging admin Access application |
+
+### Production values PROD-PREP filled (owner decisions round 13)
+
+| Setting | Committed value | Source |
+|---|---|---|
+| `project`, `projectNumber`, `region`, `bucket.location` | `tibotattle-prod`, `874229235044`, `us-east1`, `US-EAST1` | OWN-5 and round 13; the project number was read back by the main session |
+| `serviceAccounts.verifier.tokenCreators` | the owner's Google account | As staging (round 9); round 12 says the address is fine in tracked files |
+| `secrets` | the five CR-3 secrets the switch keeps, named by their variable names | Round 12 retired Google and Apple sign-in, so their two secrets are left out. `IDENTITY_LINK_SECRET` stays: the edge-admission replay keys its subjects with it, and the session ports, credential renew and the maintenance profile check the imported identity-link pin |
+| `scheduler.analytics-refresh.schedule` | `15 2 * * *` (UTC), state `PAUSED` | Claude's proposal for the full-recompute engine (about 50 min per dense run, 14,400 s timeout): one run a day, after the UTC day closes, done before the 07:00 backup; the advisory lock refuses an overlapping run. Open for the owner to confirm; the trigger stays paused until OPS-3 resumes it |
+
+`service.telemetryStorageNamespace` stays `null`. Continuity requires the
+production Worker's own `TELEMETRY_STORAGE_NAMESPACE` (legacy and v1.1
+admission refuse a namespace that differs from the imported pinned state),
+and that value is a live plain var no tracked file records. The main session
+reads it back from the live Worker and pins it (the runbook's namespace step).
+The secret versions and the bucket proof are pinned after the apply, as for
+staging.
 
 ### Staging values Claude filled, confirmed by the owner
 

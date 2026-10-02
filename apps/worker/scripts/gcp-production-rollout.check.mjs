@@ -6,6 +6,7 @@
 // is synthetic.
 
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
@@ -13,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { parse } from "jsonc-parser";
+import { unfilledProductionText } from "./fixtures/gcp-ops-infra/production-unfilled.mjs";
 import { readPostgresMigrations } from "../cloud-run/postgres-migrations.mjs";
 import {
   primaryManifestSha256,
@@ -1066,14 +1068,26 @@ test("build writes the audited archive, submits that file and qualifies the buil
 test("an incomplete committed desired state fails every verb closed, a complete one dry-runs without a call, and error codes stay content-free",
   async () => {
   // The default loader reaches the OPS-2 manifest's rolloutTarget, which reads
-  // only the committed desired state. Production waits for OWN-5's
-  // placeholders, and the rollout reports that as
-  // ROLLOUT_INFRA_MANIFEST_UNAVAILABLE before running anything.
-  await assert.rejects(loadRolloutTargetFromInfraManifest("production"),
-    isCode("DESIRED_STATE_PLACEHOLDER_UNFILLED:project"));
+  // only the committed desired state. A manifest refusal (here OWN-5's
+  // placeholders, unfilled) is reported as ROLLOUT_INFRA_MANIFEST_UNAVAILABLE
+  // before anything runs.
+  const unfilledText = unfilledProductionText();
+  const unfilledLoader = async (environment) => (await import("./gcp-ops-infra-manifest.mjs"))
+    .rolloutTarget(environment, { readFile: () => unfilledText });
+  await assert.rejects(unfilledLoader("production"), isCode("DESIRED_STATE_PLACEHOLDER_UNFILLED:project"));
   await assert.rejects(runRollout(["preflight", "--environment=production", `--commit=${COMMIT}`,
-    "--backup-audit=/synthetic/audit.json"], { run: () => assert.fail("never") }),
+    "--backup-audit=/synthetic/audit.json"], { run: () => assert.fail("never"), loadTarget: unfilledLoader }),
   isCode("ROLLOUT_INFRA_MANIFEST_UNAVAILABLE"));
+  // PROD-PREP filled production (round 13): its committed target validates,
+  // a dry run calls nothing, and a mutating verb names the production lock.
+  const production = await loadRolloutTargetFromInfraManifest("production");
+  assert.deepEqual(validateRolloutTarget(production, "production"), production);
+  assert.deepEqual([production.project, production.region, production.service],
+    ["tibotattle-prod", "us-east1", "tibotattle-origin"]);
+  const productionBuild = await runRollout(["build", "--environment=production", `--commit=${COMMIT}`],
+    { run: () => assert.fail("never"), fetch: () => assert.fail("never") });
+  assert.deepEqual([productionBuild.status, productionBuild.environment, productionBuild.lockRef],
+    ["dry-run", "production", "refs/heads/codex/production-deployment-lock"]);
   // Staging's verifier operator is named (owner decision, 2026-10-02 round
   // 9), so its committed state now yields a target that OPS-10 validates for
   // the staging plane. The manifest check holds the unassigned-operator
@@ -1240,4 +1254,19 @@ test("STG-LOCK: a lock reporting another environment's ref is refused before any
   assert.equal(safeRolloutErrorCode({ code: "STAGING_COORDINATION_BUSY" }), "STAGING_COORDINATION_BUSY");
   // An unknown environment never reaches a lock: the argument parser refuses it first.
   assert.throws(() => parseRolloutArguments(["build", "--environment=test", `--commit=${COMMIT}`]), isCode("ROLLOUT_ENVIRONMENT_INVALID"));
+});
+
+test("the CLI entry finishes: no top-level await deadlocks the manifest's import cycle back to this module", () => {
+  // gcp-ops-infra-manifest.mjs -> gcp-fastpath-test-deploy.mjs -> this module.
+  // With a top-level await at the entry, Node exited 13 before any verb ran.
+  for (const environment of ["staging", "production"]) {
+    const result = spawnSync(process.execPath, [join(import.meta.dirname, "gcp-production-rollout.mjs"), "build",
+      `--environment=${environment}`, `--commit=${COMMIT}`],
+    { encoding: "utf8", env: { PATH: "/nonexistent-gcloud-guard" }, timeout: 60_000 });
+    assert.equal(result.status, 0, `${environment}: ${result.stderr}`);
+    assert.doesNotMatch(result.stderr, /unsettled top-level await/u);
+    const output = JSON.parse(result.stdout);
+    assert.deepEqual([output.status, output.verb, output.environment, output.lockRef],
+      ["dry-run", "build", environment, `refs/heads/codex/${environment}-deployment-lock`]);
+  }
 });

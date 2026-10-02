@@ -23,9 +23,10 @@
  * material. The staging file describes a plane inside the shared GCP test
  * project (projectTenancy 'shared': co-tenant resources are neither managed
  * nor removed, and project-wide logging settings are left alone). The
- * production file keeps its project, project number, region and bucket
- * location as explicit null placeholders, which the validator refuses
- * (DESIRED_STATE_PLACEHOLDER_UNFILLED) until the owner fills them (OWN-5).
+ * production file names the dedicated project tibotattle-prod (OWN-5, filled
+ * by PROD-PREP under owner decisions round 13); the validator still refuses
+ * any file whose project, project number, region or bucket location is an
+ * explicit null placeholder (DESIRED_STATE_PLACEHOLDER_UNFILLED).
  *
  * Topology: one Cloud SQL PostgreSQL 17 ENTERPRISE instance, zonal, with no
  * replica, no high availability and no deletion-ledger instance (append-only
@@ -167,6 +168,20 @@ export const DEFERRED_JOBS = Object.freeze({});
  * for an environment whose template is withdrawn.
  */
 export const SERVICE_TEMPLATE_UNAVAILABLE = Object.freeze({});
+
+/**
+ * CR-3 secrets a production desired state may leave out (owner decision
+ * 2026-10-02, round 12: Google and Apple sign-in are retired at the switch,
+ * with no port). The committed production file leaves both out, so OPS-2
+ * never makes a production container for them; its check pins that. Staging
+ * keeps its inert synthetic copies, and the synthetic fixture keeps both so
+ * the service render stays covered, until ROUTES-R12 narrows CR-3. While CR-3
+ * still requires a secret the desired state leaves out, the service cannot
+ * boot, so OPS-2 defers it (SERVICE_RETIRED_SECRET_STILL_REQUIRED:<name>).
+ * Once ROUTES-R12 drops the names from CR-3, that deferral clears itself and
+ * any file still naming them is refused as SECRET_UNKNOWN.
+ */
+export const RETIRED_PRODUCTION_SECRET_NAMES = Object.freeze(["GOOGLE_OIDC_CLIENT_SECRET", "APPLE_PRIVATE_KEY"]);
 
 export const SERVICE_ACCOUNT_ROLES = Object.freeze([
   "runtime", "migrator", "scheduler", "builder", "edgeInvoker", "verifier",
@@ -971,16 +986,19 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
     permissions: parsedPermissions,
   };
 
-  // Secret Manager secrets: exactly CR-3's required and optional names, each
-  // named by its Secret Manager secret id, in its plane's form, and a pinned
-  // version number.
+  // Secret Manager secrets: exactly CR-3's required and optional names (less,
+  // in production, the retired ones), each named by its Secret Manager secret
+  // id, in its plane's form, and a pinned version number.
   if (!isRecord(input.secrets)) fail("DESIRED_STATE_SHAPE_INVALID:secrets");
   const secretNames = [...REQUIRED_SECRET_NAMES, ...OPTIONAL_SECRET_NAMES];
   for (const name of Object.keys(input.secrets)) {
     if (!secretNames.includes(name)) fail(`SECRET_UNKNOWN:${name}`);
   }
+  // Production may leave out a retired secret (round 12); every other name is required.
+  const retiredSecretNames = environment === "production" ? RETIRED_PRODUCTION_SECRET_NAMES : [];
   const secrets = {};
   for (const name of secretNames) {
+    if (!Object.hasOwn(input.secrets, name) && retiredSecretNames.includes(name)) continue;
     if (!Object.hasOwn(input.secrets, name)) fail(`SECRET_CONTAINER_MISSING:${name}`);
     closedKeys(input.secrets[name], DESIRED_STATE_SHAPE.secret, `secrets.${name}`);
     const secretName = text(input.secrets[name].secretName, SECRET_ID, `secrets.${name}.secretName`);
@@ -1113,7 +1131,7 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
     ...JOB_NAMES.map((job) => [`plane:jobs.${job}.name`, jobs[job].name]),
     ...SCHEDULED_JOB_NAMES.map((job) => [`plane:scheduler.${job}.name`, scheduler[job].name]),
     // Secret Manager ids are project-wide: each one is the plane's own.
-    ...secretNames.map((name) => [`plane:secrets.${name}.secretName`, secrets[name].secretName]),
+    ...Object.keys(secrets).map((name) => [`plane:secrets.${name}.secretName`, secrets[name].secretName]),
     ["cloudSql.connectionName", cloudSql.connectionName],
   ];
   nameChecks(names, environment);
@@ -1349,8 +1367,10 @@ export function renderServiceTemplateValues(values, { templateText, environment 
 /**
  * Why the desired service's template cannot be rendered for any image, or
  * null: the environment has no service template (SERVICE_TEMPLATE_UNAVAILABLE),
- * the telemetry storage namespace is unassigned, or a staging setting the
- * staging template needs is not yet there (stagingServiceBlocker).
+ * the telemetry storage namespace is unassigned, a staging setting the
+ * staging template needs is not yet there (stagingServiceBlocker), or the
+ * desired state leaves out a retired secret that CR-3 still requires
+ * (RETIRED_PRODUCTION_SECRET_NAMES).
  */
 export function serviceTemplateBlocker(desired) {
   if (Object.hasOwn(SERVICE_TEMPLATE_UNAVAILABLE, desired.environment)) {
@@ -1358,6 +1378,9 @@ export function serviceTemplateBlocker(desired) {
   }
   if (desired.service.telemetryStorageNamespace === null) return "TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED";
   if (desired.environment === "staging") return stagingServiceBlocker(desired);
+  // A secret the plane retired but CR-3 still requires: the service would not boot.
+  const retired = REQUIRED_SECRET_NAMES.find((name) => !Object.hasOwn(desired.secrets, name));
+  if (retired !== undefined) return `SERVICE_RETIRED_SECRET_STILL_REQUIRED:${retired}`;
   return null;
 }
 
@@ -1662,8 +1685,8 @@ export function assertCommittedDesiredState(desired) {
 
 /**
  * An environment's committed desired state, validated, describing that
- * environment and meeting the committed-file policy. The production file
- * refuses DESIRED_STATE_PLACEHOLDER_UNFILLED until OWN-5 fills it.
+ * environment and meeting the committed-file policy. A file with an unfilled
+ * owner placeholder refuses DESIRED_STATE_PLACEHOLDER_UNFILLED.
  */
 export function loadCommittedDesiredState(environment, { readFile, readSource } = {}) {
   const desired = readDesiredStateFile(committedDesiredStatePath(environment), {

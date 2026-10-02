@@ -28,6 +28,7 @@ import {
   memoryWriter,
   withSecretValues,
 } from "./fixtures/gcp-ops-infra/fake-gcloud.mjs";
+import { unfilledProductionText, unpinnedProductionText } from "./fixtures/gcp-ops-infra/production-unfilled.mjs";
 
 process.env.PATH = "/nonexistent-gcloud-guard";
 
@@ -272,8 +273,8 @@ test("readback --require-clean --environment is OPS-10's preflight: exit 0 only 
   // The desired state comes only from the environment's committed file, which must describe it.
   const staging = (path) => (path === COMMITTED_STAGING ? UNMARKED_TEXT : reader()(path));
   for (const [argv, readFile, code] of [
-    // The real committed production file waits for OWN-5.
-    [preflight, null, "DESIRED_STATE_PLACEHOLDER_UNFILLED:project"],
+    // A production file whose OWN-5 placeholders are unfilled.
+    [preflight, reader(unfilledProductionText()), "DESIRED_STATE_PLACEHOLDER_UNFILLED:project"],
     [preflight, reader("{"), "DESIRED_STATE_UNREADABLE"],
     [["readback", "--require-clean", "--environment=staging"], staging, "GCP_INFRA_ENVIRONMENT_MISMATCH"],
     [["readback", "--environment=staging", `--desired-state=${UNMARKED_PATH}`], reader(), "GCP_INFRA_ENVIRONMENT_MISMATCH"],
@@ -296,7 +297,7 @@ test("bucket birth is a dry run by default and refuses the synthetic fixture", a
   assert.equal(refused.calls.length, 0);
 });
 
-test("the committed desired states render offline: staging's waits are named, production waits for OWN-5", async () => {
+test("the committed desired states render offline: staging's and production's waits are named", async () => {
   const staging = await run(["render", "--environment=staging", ...IMAGE], { readFile: null, project: "tibotattle" });
   assert.equal(staging.code, 0, staging.err);
   assert.equal(staging.calls.length, 0);
@@ -311,11 +312,32 @@ test("the committed desired states render offline: staging's waits are named, pr
   assert.equal(rendered.jobs["analytics-refresh"].spec.template.spec.template.spec.containers[0].env
     .find((entry) => entry.name === "ANALYTICS_REFRESH_TARGET").value, "staging");
   assert.doesNotMatch(staging.out, /tibotattle-test|BEGIN PRIVATE KEY/u);
+  // PROD-PREP filled production (round 13). Rendered as it reads before the
+  // main session pins its versions, proof and namespace, so this holds after them.
+  const unpinned = reader(unpinnedProductionText());
+  const production = await run(["render", "--environment=production", ...IMAGE], { readFile: unpinned });
+  assert.equal(production.code, 0, production.err);
+  assert.equal(production.calls.length, 0);
+  const prod = JSON.parse(production.out);
+  assert.deepEqual([prod.environment, prod.project, prod.region, prod.synthetic], ["production", "tibotattle-prod", "us-east1", false]);
+  assert.deepEqual(prod.verifierIam, { account: "tibotattle-verifier@tibotattle-prod.iam.gserviceaccount.com",
+    role: "roles/iam.serviceAccountTokenCreator", members: ["user:adamallcock@gmail.com"] });
+  assert.deepEqual(prod.service, { unavailable: "TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED" });
+  assert.equal(prod.bucket.location, "US-EAST1");
+  assert.equal(prod.jobs["analytics-refresh"].metadata.name, "tibotattle-analytics-refresh");
+  assert.ok(prod.scheduler["analytics-refresh"].includes("--schedule=15 2 * * *"));
+  // Round 12 retired Google and Apple sign-in: no production secret, container or reference names them.
+  assert.doesNotMatch(production.out, /GOOGLE_OIDC_CLIENT_SECRET|APPLE_PRIVATE_KEY|tibotattle-test|staging|BEGIN PRIVATE KEY/u);
+  // With the namespace pinned, the service still waits for ROUTES-R12 to narrow CR-3.
+  const named = unpinnedProductionText().replace('"telemetryStorageNamespace": null', '"telemetryStorageNamespace": "synthetic-namespace"');
+  const waiting = JSON.parse((await run(["render", "--environment=production", ...IMAGE], { readFile: reader(named) })).out);
+  assert.deepEqual(waiting.service, { unavailable: "SERVICE_RETIRED_SECRET_STILL_REQUIRED:GOOGLE_OIDC_CLIENT_SECRET" });
+  // A production file whose OWN-5 placeholders are unfilled is refused before any call.
   for (const command of ["render", "plan", "readback", "scheduler-probe"]) {
-    const production = await run([command, "--environment=production"], { readFile: null });
-    assert.equal(production.code, 1, command);
-    assert.deepEqual(JSON.parse(production.err), { status: "error", code: "DESIRED_STATE_PLACEHOLDER_UNFILLED:project" });
-    assert.equal(production.calls.length, 0, command);
+    const unfilled = await run([command, "--environment=production"], { readFile: reader(unfilledProductionText()) });
+    assert.equal(unfilled.code, 1, command);
+    assert.deepEqual(JSON.parse(unfilled.err), { status: "error", code: "DESIRED_STATE_PLACEHOLDER_UNFILLED:project" });
+    assert.equal(unfilled.calls.length, 0, command);
   }
 });
 
@@ -445,7 +467,7 @@ test("no OPS-2 module uses a shell, and the package runs exactly these checks", 
   const gate = scripts["gcp:ops:infra:check"];
   for (const check of ["gcp-ops-infra-manifest.check.mjs", "gcp-ops-infra-operations.check.mjs",
     "gcp-ops-bucket-birth.check.mjs", "gcp-infra.check.mjs", "gcp-ops-infra-staging-service.check.mjs",
-    "gcp-staging-secrets.check.mjs", "gcp-staging-bucket-birth.check.mjs", "gcp-ops-monitoring-policies.check.mjs",
+    "gcp-ops-infra-production.check.mjs", "gcp-staging-secrets.check.mjs", "gcp-staging-bucket-birth.check.mjs", "gcp-ops-monitoring-policies.check.mjs",
     "gcp-monitoring.check.mjs"]) {
     assert.ok(gate.includes(`./scripts/${check}`), check);
   }

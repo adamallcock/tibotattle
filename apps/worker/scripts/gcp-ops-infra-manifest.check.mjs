@@ -26,6 +26,7 @@ import { TEST_MIGRATIONS_TARGETS } from "../cloud-run/test-migrations.mjs";
 import { GCP_PRIVATE_TEST_TARGET } from "./gcp-private-test-deploy.mjs";
 import { FASTPATH_TEST, REFRESH_JOB_PROFILES } from "./gcp-fastpath-test-deploy.mjs";
 import * as manifest from "./gcp-ops-infra-manifest.mjs";
+import { unfilledProductionText, unpinnedProductionText } from "./fixtures/gcp-ops-infra/production-unfilled.mjs";
 import * as rollout from "./gcp-production-rollout.mjs";
 
 process.env.PATH = "/nonexistent-gcloud-guard";
@@ -415,9 +416,29 @@ test("Secret Manager containers are exactly CR-3's secret names, never an edge-o
     [...configuration.REQUIRED_SECRET_NAMES, ...configuration.OPTIONAL_SECRET_NAMES]);
   for (const name of configuration.REQUIRED_SECRET_NAMES) {
     assert.equal(desired.secrets[name].required, true, name);
+    if (manifest.RETIRED_PRODUCTION_SECRET_NAMES.includes(name)) continue;
     // Removing a required container fails the CR-3 cross-check.
     refused((value) => { delete value.secrets[name]; }, `SECRET_CONTAINER_MISSING:${name}`);
   }
+  // Round 12: production may leave out the retired Google and Apple secrets,
+  // and its service then waits until CR-3 stops requiring them; staging may not.
+  assert.deepEqual([...manifest.RETIRED_PRODUCTION_SECRET_NAMES], ["GOOGLE_OIDC_CLIENT_SECRET", "APPLE_PRIVATE_KEY"]);
+  for (const name of manifest.RETIRED_PRODUCTION_SECRET_NAMES) {
+    assert.equal(configuration.REQUIRED_SECRET_NAMES.includes(name), true, `${name} is still CR-3's until ROUTES-R12`);
+    const omitted = manifest.validateDesiredState(fixture((value) => { delete value.secrets[name]; }));
+    assert.equal(Object.hasOwn(omitted.secrets, name), false, name);
+    assert.equal(manifest.serviceRenderBlocker(omitted), `SERVICE_RETIRED_SECRET_STILL_REQUIRED:${name}`, name);
+    assert.throws(() => manifest.renderService(omitted, { imageDigest: "c".repeat(64), sourceCommit: "d".repeat(40) }),
+      { code: `SERVICE_RETIRED_SECRET_STILL_REQUIRED:${name}` }, name);
+    assert.throws(() => manifest.validateDesiredState(committed("staging", (value) => { delete value.secrets[name]; })),
+      { code: `SECRET_CONTAINER_MISSING:${name}` }, name);
+  }
+  // Only those two: no other CR-3 secret is optional in production.
+  for (const name of ["IDENTITY_LINK_SECRET", "POSTGRES_RATE_LIMIT_SECRET", "ENVELOPE_PUBLIC_JWK", "ENVELOPE_PRIVATE_JWK",
+    "DISTRIBUTION_GITHUB_API_TOKEN"]) {
+    assert.equal(manifest.RETIRED_PRODUCTION_SECRET_NAMES.includes(name), false, name);
+  }
+  assert.equal(manifest.serviceRenderBlocker(desired), null);
   refused((value) => { delete value.secrets.DISTRIBUTION_GITHUB_API_TOKEN; },
     "SECRET_CONTAINER_MISSING:DISTRIBUTION_GITHUB_API_TOKEN");
   for (const name of [...configuration.EDGE_ONLY_SECRET_NAMES, "EDGE_PROOF_SECRET", "EDGE_PROOF_SHA256",
@@ -793,11 +814,16 @@ test("rolloutTarget gives OPS-10 its closed target from the environment's commit
   assert.throws(() => manifest.rolloutTargetFromDesiredState(manifest.validateDesiredState(unmarked((value) => {
     value.serviceAccounts.verifier = null;
   }))), { code: "ROLLOUT_TARGET_VERIFIER_REQUIRED" });
-  // With no injected reader, the real committed files answer: staging has its
-  // operator (owner, 2026-10-02) and resolves; production waits for OWN-5. The
-  // unassigned refusal stays proven above with tokenCreators null.
+  // With no injected reader, the real committed files answer: both have the
+  // verifier operator the owner named (2026-10-02) and resolve. The unassigned
+  // refusal stays proven above with tokenCreators null, and the unfilled one
+  // in the committed-production test below.
   assert.doesNotThrow(() => manifest.rolloutTarget("staging"));
-  assert.throws(() => manifest.rolloutTarget("production"), { code: "DESIRED_STATE_PLACEHOLDER_UNFILLED:project" });
+  const production = manifest.rolloutTarget("production");
+  assert.deepEqual([production.project, production.service, production.primaryInstance, production.imageRepository,
+    production.verifierServiceAccount], ["tibotattle-prod", "tibotattle-origin", "tibotattle-primary",
+    "us-east1-docker.pkg.dev/tibotattle-prod/tibotattle-images/tibotattle-host",
+    "tibotattle-verifier@tibotattle-prod.iam.gserviceaccount.com"]);
 });
 
 test("OPS-10 accepts the rendered migration job and the rollout target (integrated; never skipped)", async () => {
@@ -973,17 +999,33 @@ test("the committed staging desired state loads: a new plane in the shared GCP t
   await assertRefreshRenderIsProductionJob(manifest.renderJob(desired, "analytics-refresh", IMAGE), desired);
 });
 
-test("the committed production desired state is refused until OWN-5 fills its placeholders", async () => {
+test("the committed production desired state: OWN-5 filled by PROD-PREP, and refused while a placeholder is unfilled", async () => {
   const raw = JSON.parse(COMMITTED.production);
   assert.deepEqual([...manifest.OWNER_PLACEHOLDER_PATHS], ["project", "projectNumber", "region", "bucket.location"]);
-  assert.deepEqual([...manifest.unfilledPlaceholders(raw)], [...manifest.OWNER_PLACEHOLDER_PATHS]);
-  // Every null in the file is a placeholder or a value that waits for the owner.
-  assert.deepEqual(nullPaths(raw).sort(), [
-    "bucket.location", "bucket.proof", "project", "projectNumber", "region", "scheduler.analytics-refresh.schedule",
-    ...Object.keys(raw.secrets).map((name) => `secrets.${name}.version`),
-    "service.telemetryStorageNamespace", "serviceAccounts.verifier.tokenCreators", "stagingOrigin",
-  ].sort());
-  assert.throws(() => manifest.loadCommittedDesiredState("production"),
+  // PROD-PREP (owner decisions round 13): the production project, its number,
+  // region and bucket location; the verifier operator is the owner's account.
+  assert.deepEqual([...manifest.unfilledPlaceholders(raw)], []);
+  assert.deepEqual([raw.project, raw.projectNumber, raw.region, raw.bucket.location],
+    ["tibotattle-prod", "874229235044", "us-east1", "US-EAST1"]);
+  assert.deepEqual(raw.serviceAccounts.verifier.tokenCreators, ["user:adamallcock@gmail.com"]);
+  // Round 12 retired Google and Apple sign-in: production never names their secrets.
+  assert.deepEqual(Object.keys(raw.secrets), ["IDENTITY_LINK_SECRET", "POSTGRES_RATE_LIMIT_SECRET",
+    "ENVELOPE_PUBLIC_JWK", "ENVELOPE_PRIVATE_JWK", "DISTRIBUTION_GITHUB_API_TOKEN"]);
+  for (const name of Object.keys(raw.secrets)) assert.equal(raw.secrets[name].secretName, name, name);
+  // The proposed full-recompute cadence: daily, created and kept PAUSED until OPS-3.
+  assert.deepEqual(raw.scheduler["analytics-refresh"], {
+    name: "tibotattle-analytics-refresh-trigger", schedule: "15 2 * * *", state: "PAUSED" });
+  // Before the main session pins them, the only nulls are the values it pins
+  // after the apply; a pinned file keeps a subset of them.
+  const pinnable = [
+    "bucket.proof", ...Object.keys(raw.secrets).map((name) => `secrets.${name}.version`),
+    "service.telemetryStorageNamespace", "stagingOrigin",
+  ].sort();
+  assert.deepEqual(nullPaths(JSON.parse(unpinnedProductionText(COMMITTED.production))).sort(), pinnable);
+  assert.ok(nullPaths(raw).every((path) => pinnable.includes(path)), nullPaths(raw).join());
+  assert.equal(manifest.loadCommittedDesiredState("production").project, "tibotattle-prod");
+  // A file whose placeholders are unfilled is refused, the first one named.
+  assert.throws(() => manifest.validateDesiredState(JSON.parse(unfilledProductionText(COMMITTED.production))),
     { code: "DESIRED_STATE_PLACEHOLDER_UNFILLED:project" });
   // Each placeholder refuses on its own, in the validator, whatever reads the file.
   for (const path of manifest.OWNER_PLACEHOLDER_PATHS) {
@@ -998,11 +1040,17 @@ test("the committed production desired state is refused until OWN-5 fills its pl
     { code: "DESIRED_STATE_PLACEHOLDER_UNFILLED:region" });
   // Filled, it validates under the committed-file policy: dedicated, no test
   // or staging name, and every name its own.
-  const desired = manifest.assertCommittedDesiredState(manifest.validateDesiredState(filledProduction()));
+  const desired = manifest.assertCommittedDesiredState(manifest.validateDesiredState(
+    JSON.parse(unpinnedProductionText(COMMITTED.production))));
   assert.equal(desired.projectTenancy, "dedicated");
   assert.equal(desired.serviceAccounts.verifier.accountId, "tibotattle-verifier");
+  assert.equal(desired.connectionBudget.fits, true);
+  // The service waits for the namespace, then for ROUTES-R12 to narrow CR-3.
   assert.equal(manifest.serviceRenderBlocker(desired), "TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED");
-  assert.throws(() => manifest.rolloutTargetFromDesiredState(desired), { code: "ROLLOUT_TARGET_VERIFIER_TOKEN_CREATOR_UNASSIGNED" });
+  const named = manifest.validateDesiredState(JSON.parse(unpinnedProductionText(COMMITTED.production)
+    .replace('"telemetryStorageNamespace": null', '"telemetryStorageNamespace": "synthetic-namespace"')));
+  assert.equal(manifest.serviceRenderBlocker(named), "SERVICE_RETIRED_SECRET_STILL_REQUIRED:GOOGLE_OIDC_CLIENT_SECRET");
+  assert.equal(manifest.rolloutTargetFromDesiredState(desired).project, "tibotattle-prod");
   // Its refresh job is the entry's production job, and the entry accepts its production names.
   await assertRefreshRenderIsProductionJob(manifest.renderJob(desired, "analytics-refresh", IMAGE), desired);
   // Production and staging share no resource name.
@@ -1032,8 +1080,8 @@ test("committed files refuse test names, shared tenancy and staging names in pro
     [(value) => { value.bucket.name = "tibotattle-test-quarantine"; }, "DESIRED_STATE_TEST_TARGET_NAME:plane:bucket.name"],
     [(value) => { value.cloudSql.schema = "tibotattle_rehearsal_primary"; }, "DESIRED_STATE_REHEARSAL_NAME:cloudSql.schema"],
     [(value) => { value.service.name = "tibotattle-staging-origin"; }, "DESIRED_STATE_STAGING_NAME_FORBIDDEN:service.name"],
-    [(value) => { value.secrets.APPLE_PRIVATE_KEY.secretName = "tibotattle-staging-apple-private-key"; },
-      "DESIRED_STATE_STAGING_NAME_FORBIDDEN:secrets.APPLE_PRIVATE_KEY.secretName"],
+    [(value) => { value.secrets.ENVELOPE_PRIVATE_JWK.secretName = "tibotattle-staging-envelope-private-jwk"; },
+      "DESIRED_STATE_STAGING_NAME_FORBIDDEN:secrets.ENVELOPE_PRIVATE_JWK.secretName"],
   ];
   for (const [mutate, code] of cases) {
     assert.throws(() => manifest.validateDesiredState(filledProduction(mutate)), { code }, code);
@@ -1147,7 +1195,9 @@ test("committed files close each secret id to its plane's form, so a pasted valu
     assert.equal(secretName.pattern, `^(?:${name}|${manifest.PLANE_SECRET_ID.source.slice(1, -1)})$`, name);
     assert.equal(secretName.maxLength, 255, name);
     const pattern = new RegExp(secretName.pattern, "u");
-    assert.equal(production.secrets[name].secretName, name, name);
+    // Production leaves out the secrets round 12 retired.
+    if (manifest.RETIRED_PRODUCTION_SECRET_NAMES.includes(name)) assert.equal(Object.hasOwn(production.secrets, name), false, name);
+    else assert.equal(production.secrets[name].secretName, name, name);
     assert.equal(manifest.STAGING_SECRET_ID.test(staging.secrets[name].secretName), true, name);
     assert.equal(pattern.test(staging.secrets[name].secretName), true, name);
     for (const value of pasted) assert.equal(pattern.test(value), false, `${name} ${value}`);
@@ -1199,7 +1249,14 @@ test("the committed JSON Schema has exactly the validator's closed key sets", ()
   }
   closed(schema.properties.customRole, shape.customRole, "customRole");
   assert.equal(schema.properties.customRole.properties.id.const, manifest.QUARANTINE_STORE_ROLE_ID);
-  closed(schema.properties.secrets, [...configuration.REQUIRED_SECRET_NAMES, ...configuration.OPTIONAL_SECRET_NAMES], "secrets");
+  // Every CR-3 name is a property; production may leave out the retired ones,
+  // so only the others are required (the validator holds staging to all).
+  const secretNames = [...configuration.REQUIRED_SECRET_NAMES, ...configuration.OPTIONAL_SECRET_NAMES];
+  assert.equal(schema.properties.secrets.type, "object");
+  assert.equal(schema.properties.secrets.additionalProperties, false);
+  assert.deepEqual(Object.keys(schema.properties.secrets.properties), secretNames);
+  assert.deepEqual(schema.properties.secrets.required,
+    secretNames.filter((name) => !manifest.RETIRED_PRODUCTION_SECRET_NAMES.includes(name)));
   for (const secret of Object.values(schema.properties.secrets.properties)) closed(secret, shape.secret, "secret");
   closed(schema.properties.cloudSql, shape.cloudSql, "cloudSql");
   closed(schema.properties.bucket, shape.bucket, "bucket");
