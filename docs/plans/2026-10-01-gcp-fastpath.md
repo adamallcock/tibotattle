@@ -965,7 +965,10 @@ is a GCP deploy, a Cloudflare deploy, a production migration or a cutover.
   golden. Production volumes, production's Worker-only cache refusals (which
   GCP does not reproduce), the T-2 importer's quadratic reader verification
   and a measured cloud run of the largest-owner task size remain open (see
-  the cap-raise and dense-owner parity receipts).
+  the cap-raise and dense-owner parity receipts). (2026-10-02: the reader
+  verification's cost now follows the page and batch, on
+  `claude/gcp-fp-v12-reader`; see the
+  [v1.2 reader batch-cost receipt](../receipts/2026-10-02-gcp-v12-reader-batch-cost.md).)
 - The oracle may not converge under the Workers test pool. The fallback is a
   kernel-composed golden, which proves glue, I/O and the route but not
   production publisher semantics.

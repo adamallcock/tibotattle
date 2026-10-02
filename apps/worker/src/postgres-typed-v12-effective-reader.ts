@@ -300,6 +300,15 @@ function BufferHex(value: unknown): string {
   return [...bytes(value)].map((item) => item.toString(16).padStart(2, "0")).join("");
 }
 
+/** The codec's text of a stored id; refuses an undecodable id or an alternate byte spelling. */
+function canonicalOccurrence(value: unknown): string {
+  try {
+    return decodeTypedTelemetryId(bytes(value));
+  } catch {
+    throw unavailable();
+  }
+}
+
 async function assertAvailable(client: PostgresClient, schema: string): Promise<boolean> {
   const result = await client.query<{ name: string }>(
     `SELECT relation.relname AS name
@@ -418,31 +427,114 @@ function recordJoins(schema: string): string {
   ].join("\n       ");
 }
 
+/*
+ * Statement shape. Every read below selects the same records: a record of
+ * the requested stream in a complete chunk (its record_count equals its
+ * stored rows) of a ready manifest of the participant's current-head
+ * generation, on a retained authorization. Each statement is shaped so its
+ * cost follows the page, the batch or the day window, not the owner.
+ *
+ * The predicates that do not involve the chunk or the record (generation,
+ * head, domain day, manifest, retained authorization) are fenced first as
+ * the head manifests in scope: one row per manifest, carrying the
+ * participant, device and day every chunk predicate compares with (the
+ * manifest join makes them the generation's). A record is selected exactly
+ * when its manifest is in scope and its own chunk satisfies the chunk
+ * predicates against that manifest, so each read probes the scope's
+ * manifests on their (manifest_id, stream, ...) keys and checks chunk
+ * completeness only for the chunks it reaches. Without the fence the
+ * planner's one-row estimate of the completeness chain led it to join every
+ * record of the owner (or of the day, ANDed with a whole-day index scan per
+ * chunk) for each page or batch: a read quadratic in owner size.
+ *
+ * Every statement deduplicates what it selects (DISTINCT, GROUP BY or a
+ * min(id) group), so the multiplicity of the joins never reaches a result.
+ *
+ * Refusals are positional. A page or batch validates the rows it returns and
+ * refuses when one cannot be read (an id with no codec text or a
+ * noncanonical spelling, a digest mismatch, a malformed record), so a page
+ * that ends before such a record succeeds and the page that reaches it
+ * refuses. Pages cover a day contiguously and no record can fall between
+ * them: an id with no codec text sorts last at its instant and the cursor
+ * never excludes it, a candidate page orders an id's raw spelling before its
+ * compressed one, and a record page refuses when its next record shares the
+ * cursor's instant and id. A complete walk of a day therefore refuses
+ * whenever any record in scope is unreadable. (Statements that regrouped or
+ * sorted the whole day on every page also refused earlier pages, as a side
+ * effect of the cost this shape removes.)
+ */
+
+/** The current-head manifests in scope, one row per manifest. */
+function headManifestsSql(schema: string, participantParameter: string, dayFilter: string): string {
+  return [
+    "SELECT DISTINCT manifest.id AS manifest_id,manifest.participant_id,manifest.device_id,manifest.chunk_day",
+    `  FROM ${table(schema, "telemetry_v12_domains")} generation`,
+    `  JOIN ${table(schema, "telemetry_v12_domain_heads")} active_head`,
+    "    ON active_head.participant_id=generation.participant_id AND active_head.generation_id=generation.id",
+    `  JOIN ${table(schema, "telemetry_v12_domain_days")} domain_day ON domain_day.generation_id=generation.id${dayFilter}`,
+    `  JOIN ${table(schema, "telemetry_v12_day_manifests")} manifest ON manifest.id=domain_day.manifest_id`,
+    "    AND manifest.participant_id=generation.participant_id AND manifest.device_id=generation.device_id",
+    "    AND manifest.chunk_day=domain_day.observed_day AND manifest.manifest_digest=domain_day.manifest_digest",
+    "    AND manifest.state='ready'",
+    `  JOIN ${table(schema, "telemetry_v12_typed_retained_authorizations")} retained_auth`,
+    "    ON retained_auth.participant_id=generation.participant_id AND retained_auth.device_id=generation.device_id",
+    ` WHERE generation.participant_id=${participantParameter}`,
+  ].join("\n");
+}
+
+/** The chunk predicates of the reads for one record against its scoped manifest. */
+function chunkPredicatesSql(schema: string, chunk: string, scope: string, streamParameter: string): string {
+  return [
+    `${chunk}.manifest_id=${scope}.manifest_id`,
+    `${chunk}.participant_id=${scope}.participant_id AND ${chunk}.device_id=${scope}.device_id`,
+    `${chunk}.chunk_day=${scope}.chunk_day AND ${chunk}.stream=${streamParameter}`,
+    `${chunk}.record_count=(SELECT count(*) FROM ${table(schema, "telemetry_v12_typed_records")} complete WHERE complete.chunk_id=${chunk}.id)`,
+  ].join(" AND ");
+}
+
+/** True when `record` lies in a complete chunk of the stream in its scoped manifest. */
+function completeChunkSql(schema: string, record: string, scope: string, streamParameter: string, chunk: string): string {
+  return `EXISTS (SELECT 1 FROM ${table(schema, "telemetry_v12_chunks")} ${chunk}`
+    + ` WHERE ${chunk}.id=${record}.chunk_id AND ${chunkPredicatesSql(schema, chunk, scope, streamParameter)})`;
+}
+
+/**
+ * The same check as a per-record join: `record`'s own chunk (the primary
+ * key, so at most one row), fenced by OFFSET 0 so the planner keeps the
+ * record scan as the driver and checks only the records it reaches.
+ */
+function completeChunkJoinSql(schema: string, record: string, scope: string, streamParameter: string, chunk: string): string {
+  return `CROSS JOIN LATERAL (SELECT ${chunk}.id FROM ${table(schema, "telemetry_v12_chunks")} ${chunk}`
+    + ` WHERE ${chunk}.id=${record}.chunk_id AND ${chunkPredicatesSql(schema, chunk, scope, streamParameter)}`
+    + ` OFFSET 0) ${chunk}_complete`;
+}
+
+/**
+ * $1 day, $2 stream, $3 participant, $4/$5 cursor, $6 limit. The page is the
+ * first $6 selected records after the cursor in (observed_at_ms,
+ * occurrence, manifest, record_index) order. Each scoped manifest (the day
+ * has one per head generation) contributes its own first $6 in that order
+ * from its (manifest_id, stream, observed_at_ms) index, so the union holds
+ * the overall first $6.
+ */
 function pageSql(schema: string): string {
   const occurrence = typedIdTextSql("r.occurrence_id");
   return [
-    "WITH selected AS (",
-    "  SELECT DISTINCT r.id,r.manifest_id COLLATE \"C\" AS manifest_key,r.manifest_id,r.record_index,r.stream,r.occurrence_id,",
-    `         (${occurrence}) COLLATE "C" AS occurrence_key,r.observed_at_ms,r.observed_day,r.canonical_digest`,
-    `    FROM ${table(schema, "telemetry_v12_domains")} generation`,
-    `    JOIN ${table(schema, "telemetry_v12_domain_heads")} active_head`,
-    "      ON active_head.participant_id=generation.participant_id AND active_head.generation_id=generation.id",
-    `    JOIN ${table(schema, "telemetry_v12_domain_days")} domain_day ON domain_day.generation_id=generation.id`,
-    "      AND domain_day.observed_day=$1::date",
-    `    JOIN ${table(schema, "telemetry_v12_day_manifests")} manifest ON manifest.id=domain_day.manifest_id`,
-    "      AND manifest.participant_id=generation.participant_id AND manifest.device_id=generation.device_id",
-    "      AND manifest.chunk_day=domain_day.observed_day AND manifest.manifest_digest=domain_day.manifest_digest",
-    "      AND manifest.state='ready'",
-    `    JOIN ${table(schema, "telemetry_v12_chunks")} chunk ON chunk.manifest_id=manifest.id`,
-    "      AND chunk.participant_id=generation.participant_id AND chunk.device_id=generation.device_id",
-    "      AND chunk.chunk_day=manifest.chunk_day AND chunk.stream=$2 AND chunk.record_count=(",
-    `        SELECT count(*) FROM ${table(schema, "telemetry_v12_typed_records")} complete WHERE complete.chunk_id=chunk.id)`,
-    `    JOIN ${table(schema, "telemetry_v12_typed_records")} r ON r.chunk_id=chunk.id AND r.manifest_id=manifest.id AND r.stream=$2`,
-    `    JOIN ${table(schema, "telemetry_v12_typed_retained_authorizations")} retained_auth`,
-    "      ON retained_auth.participant_id=generation.participant_id AND retained_auth.device_id=generation.device_id",
-    "   WHERE generation.participant_id=$3",
-    `     AND (r.observed_at_ms>$4 OR (r.observed_at_ms=$4 AND (${occurrence} COLLATE "C")>($5::text COLLATE "C")))`,
-    `   ORDER BY r.observed_at_ms,occurrence_key,manifest_key,r.record_index LIMIT $6`,
+    "WITH scope AS MATERIALIZED (",
+    headManifestsSql(schema, "$3", " AND domain_day.observed_day=$1::date"),
+    "), selected AS (",
+    "  SELECT DISTINCT page.id,page.manifest_key,page.manifest_id,page.record_index,page.stream,page.occurrence_id,",
+    "         page.occurrence_key,page.observed_at_ms,page.observed_day,page.canonical_digest",
+    "    FROM scope CROSS JOIN LATERAL (",
+    "      SELECT r.id,r.manifest_id COLLATE \"C\" AS manifest_key,r.manifest_id,r.record_index,r.stream,r.occurrence_id,",
+    `             (${occurrence}) COLLATE "C" AS occurrence_key,r.observed_at_ms,r.observed_day,r.canonical_digest`,
+    `        FROM ${table(schema, "telemetry_v12_typed_records")} r`,
+    `        ${completeChunkJoinSql(schema, "r", "scope", "$2", "chunk")}`,
+    "       WHERE r.manifest_id=scope.manifest_id AND r.stream=$2 AND r.observed_at_ms>=$4",
+    `         AND (r.observed_at_ms>$4 OR (r.observed_at_ms=$4 AND ((${occurrence}) IS NULL OR (${occurrence} COLLATE "C")>($5::text COLLATE "C"))))`,
+    "       ORDER BY r.observed_at_ms,occurrence_key,manifest_key,r.record_index LIMIT $6",
+    "    ) page",
+    "   ORDER BY page.observed_at_ms,page.occurrence_key,page.manifest_key,page.record_index LIMIT $6",
     ")",
     "SELECT selected.id::text AS storage_row_id,selected.occurrence_key,selected.manifest_id,selected.record_index,",
     `       ${recordColumns(schema)}`,
@@ -452,65 +544,76 @@ function pageSql(schema: string): string {
   ].join("\n");
 }
 
+/**
+ * $1 day, $2 stream, $3 participant, $4/$5 cursor, $6 limit. An occurrence's
+ * candidate time is the earliest observed_at_ms among its selected records
+ * of the day. A selected record is its occurrence's earliest exactly when
+ * no selected record of the same occurrence id is earlier (one probe of the
+ * scope on the (manifest_id, stream, occurrence_id) key), and those earliest
+ * records after the cursor, in (observed_at_ms, occurrence) order, are the
+ * candidates in page order. An occurrence id is unique within a manifest's
+ * stream, so each scoped manifest's first $6 such records are distinct
+ * candidates and the union holds the overall first $6.
+ *
+ * The probe compares stored ids, not texts. The codec admits one stored
+ * spelling per id, so for admitted data that is grouping by text. A second
+ * spelling of one text (only in corrupt storage: a compressed id stored raw)
+ * would be a second candidate, so each candidate carries its stored id and
+ * the page refuses one that is not the codec's spelling of its text. The
+ * stored id is the last ordering key, so at one instant a raw spelling
+ * (tag 0) precedes the compressed one and is returned no later than its twin.
+ */
 function candidateSql(schema: string): string {
   const occurrence = typedIdTextSql("r.occurrence_id");
   return [
-    "WITH grouped AS MATERIALIZED (",
-    `  SELECT (${occurrence}) COLLATE "C" AS occurrence_id, min(r.observed_at_ms) AS observed_at_ms`,
-    `    FROM ${table(schema, "telemetry_v12_domains")} generation`,
-    `    JOIN ${table(schema, "telemetry_v12_domain_heads")} active_head`,
-    "      ON active_head.participant_id=generation.participant_id AND active_head.generation_id=generation.id",
-    `    JOIN ${table(schema, "telemetry_v12_domain_days")} domain_day ON domain_day.generation_id=generation.id`,
-    "      AND domain_day.observed_day=$1::date",
-    `    JOIN ${table(schema, "telemetry_v12_day_manifests")} manifest ON manifest.id=domain_day.manifest_id`,
-    "      AND manifest.participant_id=generation.participant_id AND manifest.device_id=generation.device_id",
-    "      AND manifest.chunk_day=domain_day.observed_day AND manifest.manifest_digest=domain_day.manifest_digest",
-    "      AND manifest.state='ready'",
-    `    JOIN ${table(schema, "telemetry_v12_chunks")} chunk ON chunk.manifest_id=manifest.id`,
-    "      AND chunk.participant_id=generation.participant_id AND chunk.device_id=generation.device_id",
-    "      AND chunk.chunk_day=manifest.chunk_day AND chunk.stream=$2",
-    `      AND chunk.record_count=(SELECT count(*) FROM ${table(schema, "telemetry_v12_typed_records")} complete WHERE complete.chunk_id=chunk.id)`,
-    `    JOIN ${table(schema, "telemetry_v12_typed_records")} r ON r.chunk_id=chunk.id AND r.manifest_id=manifest.id AND r.stream=$2`,
-    `    JOIN ${table(schema, "telemetry_v12_typed_retained_authorizations")} retained_auth`,
-    "      ON retained_auth.participant_id=generation.participant_id AND retained_auth.device_id=generation.device_id",
-    "   WHERE generation.participant_id=$3",
-    `   GROUP BY (${occurrence}) COLLATE "C"`,
-    "), selected AS (",
-    "  SELECT occurrence_id,observed_at_ms FROM grouped",
-    "   WHERE observed_at_ms>$4::bigint OR (observed_at_ms=$4::bigint AND occurrence_id>($5::text COLLATE \"C\"))",
-    "   ORDER BY observed_at_ms,occurrence_id COLLATE \"C\" LIMIT $6",
+    "WITH scope AS MATERIALIZED (",
+    headManifestsSql(schema, "$3", " AND domain_day.observed_day=$1::date"),
+    "), picked AS MATERIALIZED (",
+    "  SELECT DISTINCT candidate.occurrence_key AS occurrence_id,candidate.observed_at_ms,candidate.occurrence_bytes",
+    "    FROM scope CROSS JOIN LATERAL (",
+    `      SELECT (${occurrence}) COLLATE "C" AS occurrence_key,r.observed_at_ms,r.occurrence_id AS occurrence_bytes`,
+    `        FROM ${table(schema, "telemetry_v12_typed_records")} r`,
+    `        ${completeChunkJoinSql(schema, "r", "scope", "$2", "chunk")}`,
+    "       WHERE r.manifest_id=scope.manifest_id AND r.stream=$2 AND r.observed_at_ms>=$4::bigint",
+    `         AND (r.observed_at_ms>$4::bigint OR (r.observed_at_ms=$4::bigint AND ((${occurrence}) IS NULL OR (${occurrence}) COLLATE "C">($5::text COLLATE "C"))))`,
+    "         AND NOT EXISTS (",
+    `           SELECT 1 FROM scope earlier_scope JOIN ${table(schema, "telemetry_v12_typed_records")} earlier`,
+    "             ON earlier.manifest_id=earlier_scope.manifest_id AND earlier.stream=$2",
+    "            AND earlier.occurrence_id=r.occurrence_id AND earlier.observed_at_ms<r.observed_at_ms",
+    `          WHERE ${completeChunkSql(schema, "earlier", "earlier_scope", "$2", "earlier_chunk")})`,
+    "       ORDER BY r.observed_at_ms,occurrence_key,r.occurrence_id LIMIT $6",
+    "    ) candidate",
     ")",
-    "SELECT occurrence_id,observed_at_ms FROM selected",
+    "SELECT occurrence_id,observed_at_ms,occurrence_bytes FROM picked",
+    " ORDER BY observed_at_ms,occurrence_id COLLATE \"C\",occurrence_bytes LIMIT $6",
   ].join("\n");
 }
 
+/**
+ * $1 requested ids (hex JSON array), $2 stream, $3 participant, $4 limit.
+ * Each scoped manifest (one per head day) is probed once on its
+ * (manifest_id, stream, occurrence_id) key for the batch's ids; OFFSET 0
+ * keeps the probe per manifest.
+ */
 function occurrenceSql(schema: string): string {
   const occurrence = typedIdTextSql("r.occurrence_id");
   return [
     "WITH requested AS MATERIALIZED (",
     "  SELECT DISTINCT decode(value, 'hex') AS occurrence_id",
     "    FROM jsonb_array_elements_text($1::jsonb) AS requested(value)",
+    "), scope AS MATERIALIZED (",
+    headManifestsSql(schema, "$3", ""),
     "), eligible AS MATERIALIZED (",
     "  SELECT r.id,r.occurrence_id,",
     `         (${occurrence}) COLLATE "C" AS occurrence_key,r.observed_at_ms,r.canonical_digest,`,
-    "         generation.device_id AS source_device_id",
-    `    FROM ${table(schema, "telemetry_v12_domains")} generation`,
-    `    JOIN ${table(schema, "telemetry_v12_domain_heads")} active_head`,
-    "      ON active_head.participant_id=generation.participant_id AND active_head.generation_id=generation.id",
-    `    JOIN ${table(schema, "telemetry_v12_domain_days")} domain_day ON domain_day.generation_id=generation.id`,
-    `    JOIN ${table(schema, "telemetry_v12_day_manifests")} manifest ON manifest.id=domain_day.manifest_id`,
-    "      AND manifest.participant_id=generation.participant_id AND manifest.device_id=generation.device_id",
-    "      AND manifest.chunk_day=domain_day.observed_day AND manifest.manifest_digest=domain_day.manifest_digest",
-    "      AND manifest.state='ready'",
-    `    JOIN ${table(schema, "telemetry_v12_chunks")} chunk ON chunk.manifest_id=manifest.id`,
-    "      AND chunk.participant_id=generation.participant_id AND chunk.device_id=generation.device_id",
-    "      AND chunk.chunk_day=manifest.chunk_day AND chunk.stream=$2",
-    `      AND chunk.record_count=(SELECT count(*) FROM ${table(schema, "telemetry_v12_typed_records")} complete WHERE complete.chunk_id=chunk.id)`,
-    `    JOIN ${table(schema, "telemetry_v12_typed_records")} r ON r.chunk_id=chunk.id AND r.manifest_id=manifest.id AND r.stream=$2`,
-    "      AND r.occurrence_id=ANY(SELECT occurrence_id FROM requested)",
-    `    JOIN ${table(schema, "telemetry_v12_typed_retained_authorizations")} retained_auth`,
-    "      ON retained_auth.participant_id=generation.participant_id AND retained_auth.device_id=generation.device_id",
-    "   WHERE generation.participant_id=$3",
+    "         scope.device_id AS source_device_id",
+    "    FROM scope CROSS JOIN LATERAL (",
+    `      SELECT probe.* FROM ${table(schema, "telemetry_v12_typed_records")} probe`,
+    "       WHERE probe.manifest_id=scope.manifest_id AND probe.stream=$2",
+    "         AND probe.occurrence_id=ANY(ARRAY(SELECT wanted.occurrence_id FROM requested wanted))",
+    "      OFFSET 0",
+    "    ) r",
+    `   WHERE ${completeChunkSql(schema, "r", "scope", "$2", "chunk")}`,
     "), grouped AS MATERIALIZED (",
     "  SELECT min(id) AS id,source_device_id,occurrence_id,occurrence_key,observed_at_ms,canonical_digest",
     "    FROM eligible",
@@ -528,25 +631,31 @@ function occurrenceSql(schema: string): string {
   ].join("\n");
 }
 
+/**
+ * $1 stream, $2 participant, $3/$4 day window, $5 limit. A scoped day is
+ * nonempty when one complete chunk of the stream in its manifest holds a
+ * record of the stream. The manifest's chunks are reached on manifest_id
+ * alone and each chunk's records on chunk_id alone, each fenced by OFFSET 0
+ * so no other predicate is pushed into the scan: unfenced, the planner ANDed
+ * the probes with index scans of every chunk of the owner and every record
+ * of the day. The probe stops at the first such chunk.
+ */
 function daysSql(schema: string): string {
   return [
-    "SELECT DISTINCT to_char(domain_day.observed_day, 'YYYY-MM-DD') AS observed_day",
-    `  FROM ${table(schema, "telemetry_v12_domains")} generation`,
-    `  JOIN ${table(schema, "telemetry_v12_domain_heads")} active_head`,
-    "    ON active_head.participant_id=generation.participant_id AND active_head.generation_id=generation.id",
-    `  JOIN ${table(schema, "telemetry_v12_domain_days")} domain_day ON domain_day.generation_id=generation.id`,
-    `  JOIN ${table(schema, "telemetry_v12_day_manifests")} manifest ON manifest.id=domain_day.manifest_id`,
-    "    AND manifest.participant_id=generation.participant_id AND manifest.device_id=generation.device_id",
-    "    AND manifest.chunk_day=domain_day.observed_day AND manifest.manifest_digest=domain_day.manifest_digest",
-    "    AND manifest.state='ready'",
-    `  JOIN ${table(schema, "telemetry_v12_chunks")} chunk ON chunk.manifest_id=manifest.id`,
-    "    AND chunk.participant_id=generation.participant_id AND chunk.device_id=generation.device_id",
-    "    AND chunk.chunk_day=manifest.chunk_day AND chunk.stream=$1",
-    `    AND chunk.record_count=(SELECT count(*) FROM ${table(schema, "telemetry_v12_typed_records")} complete WHERE complete.chunk_id=chunk.id)`,
-    `  JOIN ${table(schema, "telemetry_v12_typed_records")} r ON r.chunk_id=chunk.id AND r.manifest_id=manifest.id AND r.stream=$1`,
-    `  JOIN ${table(schema, "telemetry_v12_typed_retained_authorizations")} retained_auth`,
-    "    ON retained_auth.participant_id=generation.participant_id AND retained_auth.device_id=generation.device_id",
-    " WHERE generation.participant_id=$2 AND domain_day.observed_day >= $3::date AND domain_day.observed_day <= $4::date",
+    "WITH scope AS MATERIALIZED (",
+    headManifestsSql(schema, "$2",
+      " AND domain_day.observed_day >= $3::date AND domain_day.observed_day <= $4::date"),
+    ")",
+    "SELECT DISTINCT to_char(scope.chunk_day, 'YYYY-MM-DD') AS observed_day",
+    "  FROM scope",
+    " WHERE EXISTS (",
+    `   SELECT 1 FROM (SELECT manifest_chunk.* FROM ${table(schema, "telemetry_v12_chunks")} manifest_chunk`,
+    "                   WHERE manifest_chunk.manifest_id=scope.manifest_id OFFSET 0) chunk",
+    `    WHERE ${chunkPredicatesSql(schema, "chunk", "scope", "$1")}`,
+    "      AND EXISTS (",
+    `        SELECT 1 FROM (SELECT chunk_record.manifest_id,chunk_record.stream FROM ${table(schema, "telemetry_v12_typed_records")} chunk_record`,
+    "                        WHERE chunk_record.chunk_id=chunk.id OFFSET 0) r",
+    "         WHERE r.manifest_id=scope.manifest_id AND r.stream=$1))",
     " ORDER BY observed_day LIMIT $5",
   ].join("\n");
 }
@@ -575,6 +684,12 @@ export async function readPostgresTelemetryV12EffectivePage(
       );
       const parsed = await Promise.all(query.rows.slice(0, pageLimit).map((row) => decodedRow(streamName, row)));
       if (parsed.some((record) => record.observedAt.slice(0, 10) !== requestedDay)) throw unavailable();
+      // The cursor names an instant and an id. A next record with both of the
+      // last record's could not be addressed, so refuse rather than skip it.
+      const following = query.rows[pageLimit];
+      if (following !== undefined && parsed.length > 0
+          && integer(following.observed_at_ms, MIN_MS, MAX_MS) === parsed.at(-1)!.observedAtMs
+          && following.occurrence_key === parsed.at(-1)!.occurrenceId) throw unavailable();
       const next = query.rows.length > pageLimit && parsed.length > 0
         ? Object.freeze({
           observedAtMs: parsed.at(-1)!.observedAtMs,
@@ -606,13 +721,18 @@ export async function readPostgresTelemetryV12EffectiveCandidatePage(
       if (!await assertAvailable(client, schema)) {
         return Object.freeze({ available: false, records: Object.freeze([]), next: null });
       }
-      const query = await client.query<{ occurrence_id: string; observed_at_ms: number | string }>(
+      const query = await client.query<{
+        occurrence_id: string | null;
+        observed_at_ms: number | string;
+        occurrence_bytes: unknown;
+      }>(
         candidateSql(schema),
         [requestedDay, streamName, participantId, cursor.observedAtMs,
           cursor.occurrenceId, pageLimit + 1],
       );
       const records = query.rows.slice(0, pageLimit).map((row) => {
-        if (typeof row.occurrence_id !== "string" || !OCCURRENCE.test(row.occurrence_id)) throw unavailable();
+        if (typeof row.occurrence_id !== "string" || !OCCURRENCE.test(row.occurrence_id)
+            || canonicalOccurrence(row.occurrence_bytes) !== row.occurrence_id) throw unavailable();
         return Object.freeze({
           occurrenceId: row.occurrence_id,
           observedAtMs: integer(row.observed_at_ms, MIN_MS, MAX_MS),
