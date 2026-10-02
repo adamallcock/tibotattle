@@ -4,25 +4,34 @@
  * Backup-restore rehearsal for the Cloud SQL primary (E-OPS7).
  *
  *   node scripts/gcp-backup-restore-rehearsal.mjs rehearse --environment=staging
- *        --path=pitr --point-in-time=<RFC 3339 UTC> [--rehearsal-id=<8 [a-z0-9]>]
- *        [--sample-rows=<1..1000>] [--dry-run]
+ *        --path=pitr --point-in-time=<RFC 3339 UTC>|after-preflight
+ *        [--rehearsal-id=<8 [a-z0-9]>] [--sample-rows=<1..1000>] [--dry-run]
  *   node scripts/gcp-backup-restore-rehearsal.mjs rehearse --environment=staging
  *        --path=backup --backup-id=<backup run id> --rehearsal-id=<id> ...
  *   ... rehearse ... --apply --authorize=<the dry run's authorization>
  *        [--receipt-out=<absolute path>]
  *   node scripts/gcp-backup-restore-rehearsal.mjs cleanup --environment=staging
- *        --path=pitr|backup --rehearsal-id=<id> [--apply --authorize=...]
+ *        --path=pitr|backup --rehearsal-id=<id> [--adopt-unlabelled]
+ *        [--apply --authorize=...]
  *
  * It restores the environment's primary (the committed desired state's
  * `cloudSql.instance`) into ONE new scratch instance, verifies the copy against
  * the source, and deletes the scratch instance:
  *
  * - Path `pitr`: `gcloud sql instances clone <source> <scratch>
- *   --point-in-time=<t>`, then labels the clone.
+ *   --point-in-time=<t>`, then labels the clone. `after-preflight` makes the
+ *   tool choose <t> a minute after its first read of the source and wait until
+ *   <t> is a minute in the past, so its own source reads cover the recovery
+ *   point (see the verdict below).
  * - Path `backup`: `gcloud sql instances create <scratch>` (the plane's fixed
  *   posture, no deletion protection, no automated backups, labelled), then
  *   `gcloud sql backups restore <id> --restore-instance=<scratch>
  *   --backup-instance=<source>`.
+ * - Every mutation is submitted with `--async`, and this tool polls
+ *   `gcloud sql operations describe` up to an explicit bound per step
+ *   (OPERATION_WAIT_BOUNDS_MS). gcloud's own blocking wait stops after 600 s
+ *   for clone, restore, patch and delete while the operation carries on, so it
+ *   is never relied on.
  * - The scratch id is `<source>-rehearsal-<id>` (path `backup` appends `b`),
  *   the SCRATCH_INSTANCE_PATTERN that OPS-10's migration job accepts as a
  *   scratch target.
@@ -34,11 +43,22 @@
  *   equal; and for every table, a keyed digest of the first and last N rows by
  *   primary key (by the row's text for a table without one) is equal. The digest key is random per run and held in
  *   memory only, so no row digest is ever printed: the receipt says `equal` or
- *   `differs`. The source is read before the restore and again after the scratch
- *   verification; a source that moved in between makes the comparison
- *   `inconclusive`, never `passed`.
- * - Timing: each mutation's wall time, and time to ready (from the first
- *   mutation until the scratch is RUNNABLE and a database session opens).
+ *   `differs`.
+ * - Verdict. The source is read before the restore and again after the
+ *   scratch verification, each time with a write watermark (the schema's
+ *   cumulative insert, update and delete counters, the statistics reset time
+ *   and the server start time). A source that moved in between, by data or by
+ *   watermark, makes the comparison `inconclusive`. A scratch that differs from
+ *   the source is `failed` only when the source is shown unchanged since the
+ *   recovery point: the point in time is after the first source read
+ *   (`after-preflight`) and the source did not move. Otherwise a difference
+ *   may be a write after the recovery point, so it is `inconclusive` with
+ *   RESTORE_SOURCE_UNCHANGED_SINCE_RECOVERY_POINT_UNPROVEN. The backup path
+ *   can never show that (its backup predates the run), so a difference there
+ *   is always `inconclusive`. Equality is `passed` on either path.
+ * - Timing: each mutation's wall time to its operation's end, and time to
+ *   ready (from the first mutation until the scratch is RUNNABLE and a
+ *   database session opens).
  * - The do-not-restore reapply step is an INJECTED interface
  *   (`doNotRestore.reapply(target)`), with no default list: custody of the list
  *   is open (OA-9, decided after cutover). The CLI injects none, so its receipt
@@ -46,11 +66,13 @@
  *   `DO_NOT_RESTORE_STEP_NOT_PROVIDED`. `uploadsMayReopen` is true only when the
  *   verification passed, the migration history equals the image tail, and the
  *   step returned a well-formed `done` result.
- * - Teardown, always attempted once the scratch may exist: patch the scratch
+ * - Teardown, armed only by this run's own create or clone (see Ownership): wait
+ *   (bounded, SCRATCH_SETTLE_BOUND_MS) until the scratch is out of
+ *   PENDING_CREATE or maintenance and no operation on it is running, patch it
  *   (no deletion protection, no final backup, no retain-on-delete), read it back,
  *   refuse to delete if any of those is still on (a final backup would keep a
  *   restorable copy), delete it, and read back that it and any final backup of
- *   it are gone.
+ *   it are gone. A scratch still busy at the bound is left for `cleanup`.
  *
  * Safety:
  * - Dry run is the default and makes no call: it prints the exact plan and the
@@ -60,13 +82,21 @@
  *   AND `--production`; even then it only prints the plan (`plan_only`) and
  *   refuses `--apply` and `cleanup`. Every other environment is refused.
  * - The source is only read. Every gcloud call passes a closed guard: a fixed
- *   set of command shapes, exactly one `--project`, no `--async`, and every
- *   mutation names the scratch instance as its target (the source appears only
- *   as a clone or backup source). The scratch instance is the only thing this
- *   tool creates or deletes; it never deletes a backup.
- * - The scratch must not exist before the run (an existing name is refused), so
- *   whatever carries that name afterwards is this run's. `cleanup` deletes only
- *   a scratch carrying this tool's labels for the same rehearsal id.
+ *   set of command shapes, exactly one `--project`, `--async` on every mutation
+ *   and on no read, operations described only when a mutation of this run
+ *   returned them, and every mutation names the scratch instance as its target
+ *   (the source appears only as a clone or backup source). The scratch instance
+ *   is the only thing this tool creates or deletes; it never deletes a backup.
+ * - Ownership. The scratch must not exist at preflight. Cloud SQL refuses a
+ *   create or clone whose name exists, so an ACCEPTED create or clone, with an
+ *   operation that did not fail, proves the scratch is this run's, and only
+ *   then is teardown armed. A refused or failed submission (another run took
+ *   the name, or gcloud failed after sending), a failed operation, or an
+ *   unreadable operation never deletes anything: the receipt reports whether
+ *   an instance carries the name, and `cleanup` decides. `cleanup` deletes
+ *   only a scratch carrying this tool's labels for the same rehearsal id, or,
+ *   for the PITR path only, with `--adopt-unlabelled` and its own
+ *   authorization, an unlabelled one (a clone whose label step never ran).
  * - Output is content-free: names, counts, timings, booleans and codes. gcloud's
  *   stderr is discarded; errors are named codes.
  *
@@ -129,6 +159,8 @@ export const RESTORE_REHEARSAL_COMMANDS = Object.freeze({
   "sql instances list": "read",
   "sql backups describe": "read",
   "sql backups list": "read",
+  "sql operations describe": "read",
+  "sql operations list": "read",
   "sql instances clone": "mutate",
   "sql instances create": "mutate",
   "sql backups restore": "mutate",
@@ -136,8 +168,32 @@ export const RESTORE_REHEARSAL_COMMANDS = Object.freeze({
   "sql instances delete": "mutate",
 });
 
+/** `--point-in-time` value that makes the tool choose a point after its first source read. */
+export const POINT_IN_TIME_AFTER_PREFLIGHT = "after-preflight";
+
+const MINUTE_MS = 60_000;
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
+
+/**
+ * How long this tool waits for each step's operation. gcloud never waits
+ * (`--async`): its own wait stops at 600 s for clone, restore, patch and delete
+ * while the operation carries on server side.
+ */
+export const OPERATION_WAIT_BOUNDS_MS = Object.freeze({
+  clone: 6 * HOUR_MS,
+  label: 30 * MINUTE_MS,
+  create: HOUR_MS,
+  restore: 6 * HOUR_MS,
+  disarm: 30 * MINUTE_MS,
+  delete: HOUR_MS,
+});
+/** How long teardown and cleanup wait for a busy scratch to settle before patching it. */
+export const SCRATCH_SETTLE_BOUND_MS = HOUR_MS;
+
 const PITR_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/u;
 const BACKUP_ID = /^[1-9][0-9]{0,24}$/u;
+const OPERATION_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u;
 const SAMPLE_ROWS = /^[1-9][0-9]{0,3}$/u;
 const IDENTIFIER = /^[a-z_][a-z0-9_]{0,62}$/u;
 const SHA256_HEX = /^[a-f0-9]{64}$/u;
@@ -145,14 +201,27 @@ const ROW_COUNT = /^(?:0|[1-9][0-9]{0,18})$/u;
 const DIGEST_SHORT = 16;
 const MAX_SCRATCH_NAME = 84;
 const GCLOUD_MAX_BUFFER_BYTES = 8 * 1024 * 1024;
-const GCLOUD_READ_TIMEOUT_MS = 120_000;
-const GCLOUD_MUTATION_TIMEOUT_MS = 3 * 60 * 60 * 1_000;
+const GCLOUD_READ_TIMEOUT_MS = 2 * MINUTE_MS;
+/** Kill timer for submitting one `--async` mutation; the operation itself is polled. */
+const GCLOUD_SUBMIT_TIMEOUT_MS = 10 * MINUTE_MS;
+const OPERATION_POLL_INITIAL_MS = 5_000;
+const OPERATION_POLL_CEILING_MS = MINUTE_MS;
+/** Instance states in which a patch or delete is not refused for a running operation. */
+const SETTLED_STATES = Object.freeze(["RUNNABLE", "FAILED", "SUSPENDED"]);
 const READY_POLL_ATTEMPTS = 90;
 const READY_POLL_INTERVAL_MS = 10_000;
-const PITR_MIN_AGE_MS = 60_000;
-const PITR_RETENTION_MARGIN_MS = 15 * 60_000;
-const DAY_MS = 24 * 60 * 60 * 1_000;
-const TOKEN_LIFETIME_MS = 45 * 60_000;
+const PITR_MIN_AGE_MS = MINUTE_MS;
+const PITR_RETENTION_MARGIN_MS = 15 * MINUTE_MS;
+/** `after-preflight` puts the point in time this long after the first source read (clock skew). */
+const AFTER_PREFLIGHT_MARGIN_MS = MINUTE_MS;
+/**
+ * PostgreSQL publishes a backend's cumulative statistics within
+ * PGSTAT_MAX_INTERVAL (60 s); the closing source read waits this long after
+ * the point in time so a write before it shows in the watermark.
+ */
+const STATS_FLUSH_MARGIN_MS = 2 * MINUTE_MS;
+const SLEEP_UNTIL_ATTEMPTS = 100;
+const TOKEN_LIFETIME_MS = 45 * MINUTE_MS;
 
 /** Tokens of a resource name, for the plane-marker rules. */
 function tokens(value) {
@@ -251,7 +320,10 @@ function labelsArgument(rehearsalId) {
   return `${REHEARSAL_LABELS.purpose}=${REHEARSAL_LABEL_PURPOSE},${REHEARSAL_LABELS.id}=${rehearsalId}`;
 }
 
-/** The exact argv of every call, for the dry run and the apply alike. */
+/**
+ * The exact argv of every call, for the dry run and the apply alike. Every
+ * mutation is `--async`: it returns the operation, which is then polled.
+ */
 export function rehearsalArgv(target) {
   const project = `--project=${target.project}`;
   return Object.freeze({
@@ -261,10 +333,13 @@ export function rehearsalArgv(target) {
       "--format=json"],
     listScratchBackups: () => ["sql", "backups", "list", project, `--filter=instance=${target.scratch}`,
       "--format=json"],
+    describeOperation: (operation) => ["sql", "operations", "describe", operation, project, "--format=json"],
+    listScratchOperations: () => ["sql", "operations", "list", `--instance=${target.scratch}`, project,
+      "--format=json"],
     clone: (pointInTime) => ["sql", "instances", "clone", target.source, target.scratch, project,
-      `--point-in-time=${pointInTime}`, "--quiet", "--format=json"],
+      `--point-in-time=${pointInTime}`, "--async", "--quiet", "--format=json"],
     label: (rehearsalId) => ["sql", "instances", "patch", target.scratch, project,
-      `--update-labels=${labelsArgument(rehearsalId)}`, "--quiet", "--format=json"],
+      `--update-labels=${labelsArgument(rehearsalId)}`, "--async", "--quiet", "--format=json"],
     create: (desired, rehearsalId) => ["sql", "instances", "create", target.scratch, project,
       `--region=${target.region}`,
       `--database-version=${CLOUD_SQL_POSTURE.databaseVersion}`,
@@ -279,16 +354,17 @@ export function rehearsalArgv(target) {
       "--no-backup",
       databaseFlagsArgument(desired),
       `--labels=${labelsArgument(rehearsalId)}`,
-      "--quiet", "--format=json"],
+      "--async", "--quiet", "--format=json"],
     restore: (backupId) => ["sql", "backups", "restore", backupId, `--restore-instance=${target.scratch}`,
-      `--backup-instance=${target.source}`, project, "--quiet", "--format=json"],
+      `--backup-instance=${target.source}`, project, "--async", "--quiet", "--format=json"],
     disarm: () => ["sql", "instances", "patch", target.scratch, project, "--no-deletion-protection",
-      "--no-final-backup", "--no-retain-backups-on-delete", "--quiet", "--format=json"],
-    delete: () => ["sql", "instances", "delete", target.scratch, project, "--quiet", "--format=json"],
+      "--no-final-backup", "--no-retain-backups-on-delete", "--async", "--quiet", "--format=json"],
+    delete: () => ["sql", "instances", "delete", target.scratch, project, "--async", "--quiet", "--format=json"],
   });
 }
 
 function validatePointInTime(value, nowMs) {
+  if (value === POINT_IN_TIME_AFTER_PREFLIGHT) return value;
   if (typeof value !== "string" || !PITR_TIME.test(value) || !Number.isFinite(Date.parse(value))) {
     fail("RESTORE_REHEARSAL_POINT_IN_TIME_INVALID");
   }
@@ -355,9 +431,13 @@ export function planRestoreRehearsal(desired, requestInput, { nowMs } = {}) {
       argv.listScratch(),
       ...(request.path === "backup" ? [argv.describeBackup(request.backupId)] : []),
       argv.describe(target.scratch),
+      argv.describeOperation("{operation returned by each mutation}"),
+      argv.listScratchOperations(),
       argv.listScratchBackups(),
     ],
     mutations: [...restore, { step: "disarm", argv: argv.disarm() }, { step: "delete", argv: argv.delete() }],
+    operationWaitBoundsMs: OPERATION_WAIT_BOUNDS_MS,
+    scratchSettleBoundMs: SCRATCH_SETTLE_BOUND_MS,
   };
   const planDigest = digest(body);
   return deepFreeze({
@@ -372,6 +452,11 @@ export function planRestoreRehearsal(desired, requestInput, { nowMs } = {}) {
 /** The exact cleanup authorization for one scratch instance. */
 export function cleanupAuthorization(target) {
   return `restore-rehearsal-cleanup:${target.environment}:${target.scratch}`;
+}
+
+/** The exact authorization to adopt and delete an UNLABELLED PITR scratch (a clone whose label step never ran). */
+export function adoptCleanupAuthorization(target) {
+  return `restore-rehearsal-cleanup-adopt-unlabelled:${target.environment}:${target.scratch}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -406,11 +491,18 @@ function flagValue(argv, name) {
 /**
  * The guarded gcloud call. Reads may name the source or the scratch; every
  * mutation targets the scratch alone, and the source appears only as the
- * clone source or the backup's instance. Failures name the shape only.
+ * clone source or the backup's instance. Every mutation is `--async` and no
+ * read is; an operation may be described only when a mutation through this
+ * guard returned it. Failures name the shape only.
+ *
+ * A mutation returns `{ accepted: true, operation }`: exit status 0 means the
+ * API accepted the request (`operation` is null when its name was unreadable).
+ * A refused or failed submission throws GCLOUD_CALL_FAILED.
  */
 export function guardedRehearsalGcloud(runner, target) {
   if (typeof runner !== "function") fail("GCLOUD_RUNNER_INVALID");
   const { project, source, scratch } = target;
+  const knownOperations = new Set();
   return function call(argv) {
     if (!Array.isArray(argv) || argv.some((arg) => typeof arg !== "string")) fail("GCLOUD_COMMAND_FORBIDDEN");
     const shape = commandShape(argv);
@@ -420,11 +512,14 @@ export function guardedRehearsalGcloud(runner, target) {
       fail("GCLOUD_PROJECT_FLAG_INVALID");
     }
     if (!argv.includes("--format=json")) fail("GCLOUD_FORMAT_REQUIRED");
-    if (argv.some((arg) => arg === "--async" || arg.startsWith("--async=") || arg === "--enable-final-backup"
+    if (argv.some((arg) => arg.startsWith("--async=") || arg === "--enable-final-backup"
         || arg.startsWith("--impersonate-service-account") || arg.startsWith("--account")
         || arg === "--log-http")) {
       fail("GCLOUD_FLAG_FORBIDDEN");
     }
+    const asyncFlags = argv.filter((arg) => arg === "--async").length;
+    if (kind === "read" && asyncFlags !== 0) fail("GCLOUD_FLAG_FORBIDDEN");
+    if (kind === "mutate" && asyncFlags !== 1) fail("GCLOUD_ASYNC_REQUIRED");
     const names = positionals(argv);
     const code = shape.replaceAll(" ", "-");
     if (shape === "sql instances describe") {
@@ -440,8 +535,20 @@ export function guardedRehearsalGcloud(runner, target) {
           || argv.some((arg) => arg.startsWith("--instance"))) {
         fail("GCLOUD_TARGET_FORBIDDEN");
       }
+    } else if (shape === "sql operations describe") {
+      if (names.length !== 1 || !OPERATION_NAME.test(names[0]) || !knownOperations.has(names[0])) {
+        fail("GCLOUD_TARGET_FORBIDDEN");
+      }
+    } else if (shape === "sql operations list") {
+      if (names.length !== 0 || flagValue(argv, "--instance") !== scratch
+          || argv.some((arg) => arg.startsWith("--filter"))) {
+        fail("GCLOUD_TARGET_FORBIDDEN");
+      }
     } else if (shape === "sql instances clone") {
-      if (names.length !== 2 || names[0] !== source || names[1] !== scratch) fail("GCLOUD_TARGET_FORBIDDEN");
+      if (names.length !== 2 || names[0] !== source || names[1] !== scratch
+          || !PITR_TIME.test(flagValue(argv, "--point-in-time") ?? "")) {
+        fail("GCLOUD_TARGET_FORBIDDEN");
+      }
     } else if (shape === "sql backups restore") {
       if (names.length !== 1 || !BACKUP_ID.test(names[0]) || flagValue(argv, "--restore-instance") !== scratch
           || flagValue(argv, "--backup-instance") !== source) {
@@ -456,7 +563,7 @@ export function guardedRehearsalGcloud(runner, target) {
     }
     let result;
     try {
-      result = runner([...argv], { timeoutMs: kind === "mutate" ? GCLOUD_MUTATION_TIMEOUT_MS : GCLOUD_READ_TIMEOUT_MS });
+      result = runner([...argv], { timeoutMs: kind === "mutate" ? GCLOUD_SUBMIT_TIMEOUT_MS : GCLOUD_READ_TIMEOUT_MS });
     } catch {
       fail(`GCLOUD_CALL_FAILED:${code}`);
     }
@@ -464,7 +571,21 @@ export function guardedRehearsalGcloud(runner, target) {
         || (result.error !== undefined && result.error !== null)) {
       fail(`GCLOUD_CALL_FAILED:${code}`);
     }
-    if (kind === "mutate") return true;
+    if (kind === "mutate") {
+      // Accepted. Never throw from here on: the caller must learn that the
+      // request went through even when the operation name is unreadable.
+      let operation = null;
+      try {
+        const parsed = JSON.parse(typeof result.stdout === "string" ? result.stdout : "");
+        if (isRecord(parsed) && typeof parsed.name === "string" && OPERATION_NAME.test(parsed.name)) {
+          operation = parsed.name;
+        }
+      } catch {
+        operation = null;
+      }
+      if (operation !== null) knownOperations.add(operation);
+      return Object.freeze({ accepted: true, operation });
+    }
     if (typeof result.stdout !== "string") fail(`GCLOUD_OUTPUT_INVALID:${code}`);
     try {
       return JSON.parse(result.stdout.trim() === "" ? (shape.endsWith("list") ? "[]" : "null") : result.stdout);
@@ -553,6 +674,18 @@ export const FINGERPRINT_QUERIES = Object.freeze({
   identity: "/* rehearsal:identity */ SELECT current_database() AS database, "
     + "current_setting('transaction_read_only') AS read_only, "
     + "current_setting('server_version_num') AS server_version_num",
+  /**
+   * A write watermark: the schema's cumulative per-table insert, update and
+   * delete counters (with each table's oid), the database's statistics reset
+   * time and the server's start time, as one digest. Reads do not move it; any
+   * row write, statistics reset or restart does.
+   */
+  watermark: "/* rehearsal:watermark */ SELECT count(*)::int AS tables, encode(sha256(convert_to("
+    + "coalesce(string_agg(s.relid::text || ':' || s.n_tup_ins::text || ':' || s.n_tup_upd::text || ':' "
+    + "|| s.n_tup_del::text, E'\\n' ORDER BY s.relid), '') || '|' || coalesce((SELECT d.stats_reset::text "
+    + "FROM pg_stat_database AS d WHERE d.datname = current_database()), '') || '|' "
+    + "|| pg_postmaster_start_time()::text, 'UTF8')), 'hex') AS digest "
+    + "FROM pg_stat_user_tables AS s WHERE s.schemaname = $1",
   presence: "/* rehearsal:presence */ SELECT to_regnamespace($1) IS NOT NULL AS schema_present, "
     + "to_regclass($2) IS NOT NULL AS history_present",
   history: (schema) => `/* rehearsal:history */ SELECT version, name, checksum_sha256 FROM ${quote(schema)}.`
@@ -613,6 +746,11 @@ export async function fingerprintDatabase(pool, { database, schema, sampleRows, 
     const identity = oneRow(await client.query(FINGERPRINT_QUERIES.identity), code);
     if (identity.database !== database) fail("RESTORE_REHEARSAL_DATABASE_MISMATCH");
     if (identity.read_only !== "on") fail("RESTORE_REHEARSAL_SESSION_NOT_READ_ONLY");
+    const watermark = oneRow(await client.query(FINGERPRINT_QUERIES.watermark, [schema]), code);
+    if (!Number.isSafeInteger(watermark.tables) || typeof watermark.digest !== "string"
+        || !SHA256_HEX.test(watermark.digest)) {
+      fail(code);
+    }
     const presence = oneRow(await client.query(FINGERPRINT_QUERIES.presence,
       [schema, `${quote(schema)}.${quote(HISTORY_TABLE)}`]), code);
     if (presence.schema_present !== true) fail("RESTORE_REHEARSAL_SCHEMA_ABSENT");
@@ -654,7 +792,8 @@ export async function fingerprintDatabase(pool, { database, schema, sampleRows, 
     }
     await client.query(FINGERPRINT_QUERIES.end);
     open = false;
-    return deepFreeze({ serverVersionNum: String(identity.server_version_num), history, shape, tables });
+    return deepFreeze({ serverVersionNum: String(identity.server_version_num),
+      writeWatermark: { tables: watermark.tables, digest: watermark.digest }, history, shape, tables });
   } catch (error) {
     discard = true;
     if (open) {
@@ -675,11 +814,16 @@ function sameValue(left, right) {
 
 /**
  * Source versus scratch. `sourceStable` is whether the source read the same
- * before and after; without it nothing passes. The result is content-free: no
- * row digest leaves this function.
+ * before and after, data and write watermark; without it nothing passes.
+ * `recoveryPointCovered` is whether the recovery point is after the first
+ * source read began. Only with both is the source shown unchanged since the
+ * recovery point, and only then is a difference the restore's (`failed`);
+ * otherwise it may be a write after the recovery point (`inconclusive`). The
+ * result is content-free: no row digest leaves this function.
  */
-export function compareFingerprints({ sourceBefore, sourceAfter, scratch }) {
+export function compareFingerprints({ sourceBefore, sourceAfter, scratch, recoveryPointCovered = false }) {
   const sourceStable = sameValue(sourceBefore, sourceAfter);
+  const sourceUnchangedSinceRecoveryPoint = recoveryPointCovered === true && sourceStable;
   const source = sourceAfter;
   const historyEqual = source.history !== null && sameValue(source.history, scratch.history);
   const shape = Object.fromEntries(Object.keys(SHAPE_QUERIES).map((category) => [category, {
@@ -729,11 +873,29 @@ export function compareFingerprints({ sourceBefore, sourceAfter, scratch }) {
       failed = true;
     }
   }
-  // A difference cannot be attributed while the source itself moved.
-  const verdict = !sourceStable ? "inconclusive" : failed ? "failed" : incomplete ? "inconclusive" : "passed";
+  // A difference is the restore's only while the source is shown unchanged
+  // from the recovery point to the closing read.
+  let verdict = "passed";
+  let code = null;
+  if (!sourceStable) {
+    verdict = "inconclusive";
+    code = "RESTORE_SOURCE_MOVED_DURING_RUN";
+  } else if (failed && !sourceUnchangedSinceRecoveryPoint) {
+    verdict = "inconclusive";
+    code = "RESTORE_SOURCE_UNCHANGED_SINCE_RECOVERY_POINT_UNPROVEN";
+  } else if (failed) {
+    verdict = "failed";
+    code = "RESTORE_SCRATCH_DIFFERS_FROM_SOURCE";
+  } else if (incomplete) {
+    verdict = "inconclusive";
+    code = "RESTORE_VERIFICATION_INCOMPLETE";
+  }
   return deepFreeze({
     verdict,
+    code,
+    differs: failed,
     sourceStable,
+    sourceUnchangedSinceRecoveryPoint,
     migrationHistory: {
       equal: historyEqual,
       source: source.history === null ? null : source.history.length,
@@ -857,27 +1019,135 @@ async function withPool(connect, spec, use) {
   }
 }
 
+/** RFC 3339 UTC at a whole second, rounded up. */
+function wholeSecondTime(ms) {
+  return new Date(Math.ceil(ms / 1_000) * 1_000).toISOString().replace(/\.\d{3}Z$/u, "Z");
+}
+
+/** Sleeps until `targetMs` by the injected clock; a clock that never gets there is refused. */
+async function sleepUntil(targetMs, { now, sleep }) {
+  for (let attempt = 0; attempt < SLEEP_UNTIL_ATTEMPTS; attempt += 1) {
+    const remaining = targetMs - now();
+    if (remaining <= 0) return;
+    await sleep(remaining);
+  }
+  if (now() < targetMs) fail("RESTORE_REHEARSAL_CLOCK_STALLED");
+}
+
+/** One operation's state: done (with or without an error) or not yet. */
+function operationState(call, argv, operation) {
+  const described = call(argv.describeOperation(operation));
+  if (!isRecord(described) || described.name !== operation) fail("GCLOUD_OUTPUT_INVALID:sql-operations-describe");
+  return {
+    done: described.status === "DONE",
+    errored: isRecord(described.error) && Array.isArray(described.error.errors) && described.error.errors.length > 0,
+  };
+}
+
 /**
- * Patches the scratch so that deleting it keeps nothing, reads it back, deletes
- * it and reads back that it and any final backup of it are gone. `requireLabels`
- * (cleanup) refuses a scratch without this rehearsal's labels.
+ * Polls one submitted operation until it is DONE, within the step's bound
+ * (OPERATION_WAIT_BOUNDS_MS). `pending` holds every operation of this run not
+ * yet seen DONE, so teardown can wait for it before patching.
  */
-async function teardownScratch(call, target, argv, { rehearsalId, requireLabels, now, steps }) {
+async function waitForOperation(call, argv, submitted, { step, pending, now, sleep }) {
+  if (submitted.operation === null) fail(`RESTORE_REHEARSAL_OPERATION_UNKNOWN:${step}`);
+  pending.add(submitted.operation);
   const started = now();
-  const listed = call(argv.listScratch());
-  if (!scratchListed(listed, target.scratch)) {
-    steps.push({ step: "teardown", outcome: "already-absent" });
-    return { scratchDeleted: true, alreadyAbsent: true, finalBackups: "not-checked", ms: now() - started };
-  }
-  if (requireLabels) {
-    const facts = instanceFacts(call(argv.describe(target.scratch)), { name: target.scratch, project: target.project,
-      region: target.region }, "RESTORE_REHEARSAL_SCRATCH_DESCRIBE_INVALID");
-    if (facts.labels[REHEARSAL_LABELS.purpose] !== REHEARSAL_LABEL_PURPOSE || facts.labels[REHEARSAL_LABELS.id] !== rehearsalId) {
-      fail("RESTORE_REHEARSAL_SCRATCH_NOT_OWNED");
+  let interval = OPERATION_POLL_INITIAL_MS;
+  for (;;) {
+    const { done, errored } = operationState(call, argv, submitted.operation);
+    if (done) {
+      pending.delete(submitted.operation);
+      if (errored) fail(`RESTORE_REHEARSAL_OPERATION_FAILED:${step}`);
+      return;
     }
+    if (now() - started >= OPERATION_WAIT_BOUNDS_MS[step]) fail(`RESTORE_REHEARSAL_OPERATION_TIMEOUT:${step}`);
+    await sleep(interval);
+    interval = Math.min(interval * 2, OPERATION_POLL_CEILING_MS);
   }
+}
+
+/** Whose a scratch is, by its labels: this rehearsal's, unlabelled, or foreign. */
+function scratchOwnership(described, rehearsalId) {
+  const labels = isRecord(described?.settings?.userLabels) ? described.settings.userLabels : {};
+  const purpose = labels[REHEARSAL_LABELS.purpose];
+  const id = labels[REHEARSAL_LABELS.id];
+  if (purpose === REHEARSAL_LABEL_PURPOSE && id === rehearsalId) return "labelled";
+  if (purpose === undefined && id === undefined) return "unlabelled";
+  return "foreign";
+}
+
+/**
+ * What each teardown mode deletes. `run`: this run's accepted create or clone
+ * proved the scratch is its own (a PITR clone is unlabelled until its label
+ * step). `labelled`: cleanup. `adopt-unlabelled`: cleanup of a PITR clone whose
+ * label step never ran, with its own authorization.
+ */
+const TEARDOWN_OWNERSHIP = Object.freeze({
+  run: Object.freeze(["labelled", "unlabelled"]),
+  labelled: Object.freeze(["labelled"]),
+  "adopt-unlabelled": Object.freeze(["labelled", "unlabelled"]),
+});
+
+function checkOwnership(described, target, rehearsalId, mode) {
+  if (!isRecord(described) || described.name !== target.scratch) fail("RESTORE_REHEARSAL_SCRATCH_DESCRIBE_INVALID");
+  const ownership = scratchOwnership(described, rehearsalId);
+  if (!TEARDOWN_OWNERSHIP[mode].includes(ownership)) fail("RESTORE_REHEARSAL_SCRATCH_NOT_OWNED");
+  return ownership;
+}
+
+/**
+ * Waits, within SCRATCH_SETTLE_BOUND_MS, until the scratch can be patched: gone
+ * (returns null), or in a settled state with no operation of this run still
+ * pending and none listed on it as unfinished. Cloud SQL refuses a patch while
+ * another operation runs, so teardown never tries one earlier.
+ */
+async function settleScratch(call, target, argv, { pending, now, sleep }) {
+  const started = now();
+  let interval = OPERATION_POLL_INITIAL_MS;
+  for (;;) {
+    if (!scratchListed(call(argv.listScratch()), target.scratch)) return null;
+    const described = call(argv.describe(target.scratch));
+    if (!isRecord(described) || described.name !== target.scratch) fail("RESTORE_REHEARSAL_SCRATCH_DESCRIBE_INVALID");
+    let busy = !SETTLED_STATES.includes(described.state);
+    for (const operation of [...pending]) {
+      if (operationState(call, argv, operation).done) pending.delete(operation);
+      else busy = true;
+    }
+    const operations = call(argv.listScratchOperations());
+    if (!Array.isArray(operations)) fail("GCLOUD_OUTPUT_INVALID:sql-operations-list");
+    if (operations.some((entry) => !isRecord(entry) || entry.status !== "DONE")) busy = true;
+    if (!busy) return described;
+    if (now() - started >= SCRATCH_SETTLE_BOUND_MS) fail("RESTORE_REHEARSAL_SCRATCH_BUSY");
+    await sleep(interval);
+    interval = Math.min(interval * 2, OPERATION_POLL_CEILING_MS);
+  }
+}
+
+/**
+ * Checks ownership, waits for the scratch to settle, patches it so that
+ * deleting it keeps nothing, reads that back, deletes it, and reads back that
+ * it and any final backup of it are gone. `ownership` is a TEARDOWN_OWNERSHIP
+ * mode; a scratch that mode does not cover is refused before any wait or
+ * mutation.
+ */
+async function teardownScratch(call, target, argv, { rehearsalId, ownership: mode, pending = new Set(), now, sleep,
+  steps }) {
+  const started = now();
+  const absent = () => {
+    steps.push({ step: "teardown", outcome: "already-absent" });
+    return { scratchDeleted: true, alreadyAbsent: true, ownership: null, finalBackups: "not-checked",
+      ms: now() - started };
+  };
+  if (!scratchListed(call(argv.listScratch()), target.scratch)) return absent();
+  checkOwnership(call(argv.describe(target.scratch)), target, rehearsalId, mode);
+  const settleStarted = now();
+  const settled = await settleScratch(call, target, argv, { pending, now, sleep });
+  if (settled === null) return absent();
+  const ownership = checkOwnership(settled, target, rehearsalId, mode);
+  steps.push({ step: "settle", outcome: "done", ms: now() - settleStarted });
   const disarmStarted = now();
-  call(argv.disarm());
+  await waitForOperation(call, argv, call(argv.disarm()), { step: "disarm", pending, now, sleep });
   steps.push({ step: "disarm", outcome: "done", ms: now() - disarmStarted });
   const facts = instanceFacts(call(argv.describe(target.scratch)), { name: target.scratch, project: target.project,
     region: target.region }, "RESTORE_REHEARSAL_SCRATCH_DESCRIBE_INVALID");
@@ -885,7 +1155,7 @@ async function teardownScratch(call, target, argv, { rehearsalId, requireLabels,
     fail("RESTORE_REHEARSAL_TEARDOWN_SETTINGS_UNSAFE");
   }
   const deleteStarted = now();
-  call(argv.delete());
+  await waitForOperation(call, argv, call(argv.delete()), { step: "delete", pending, now, sleep });
   steps.push({ step: "delete", outcome: "done", ms: now() - deleteStarted });
   if (scratchListed(call(argv.listScratch()), target.scratch)) fail("RESTORE_REHEARSAL_SCRATCH_STILL_PRESENT");
   let finalBackups = "unavailable";
@@ -898,14 +1168,16 @@ async function teardownScratch(call, target, argv, { rehearsalId, requireLabels,
     finalBackups = "unavailable";
   }
   if (finalBackups === "found") fail("RESTORE_REHEARSAL_SCRATCH_BACKUP_REMAINS");
-  return { scratchDeleted: true, alreadyAbsent: false, finalBackups, ms: now() - started };
+  return { scratchDeleted: true, alreadyAbsent: false, ownership, finalBackups, ms: now() - started };
 }
+
+const STEP_TIMINGS = Object.freeze({ clone: "cloneMs", label: "labelMs", create: "createMs", restore: "restoreBackupMs" });
 
 /**
  * Runs an authorized staging rehearsal. Reads first (refusing before any
  * mutation), then restores, verifies, runs the injected do-not-restore step,
- * and always tears the scratch down once it may exist. Returns the
- * content-free receipt; a failure carries the receipt so far.
+ * and tears the scratch down once this run's create or clone was accepted.
+ * Returns the content-free receipt; a failure carries the receipt so far.
  */
 export async function runRestoreRehearsal(desired, requestInput, {
   authorize,
@@ -932,6 +1204,7 @@ export async function runRestoreRehearsal(desired, requestInput, {
   const scratchSpec = { ...sourceSpec, role: "scratch", connectionName: target.scratchConnectionName };
   const fingerprint = (spec, onSession) => withPool(connect, spec, (pool) => fingerprintDatabase(pool, {
     database: target.database, schema: target.schema, sampleRows: request.sampleRows, key, onSession }));
+  const afterPreflight = request.pointInTime === POINT_IN_TIME_AFTER_PREFLIGHT;
 
   // 1. Preflight: reads only. Nothing exists to clean up if any of this fails.
   const source = instanceFacts(call(argv.describe(target.source)), { name: target.source, project: target.project,
@@ -939,14 +1212,15 @@ export async function runRestoreRehearsal(desired, requestInput, {
   if (source.state !== "RUNNABLE") fail("RESTORE_REHEARSAL_SOURCE_NOT_RUNNABLE");
   if (source.databaseVersion !== CLOUD_SQL_POSTURE.databaseVersion) fail("RESTORE_REHEARSAL_SOURCE_VERSION_UNEXPECTED");
   if (scratchListed(call(argv.listScratch()), target.scratch)) fail("RESTORE_REHEARSAL_SCRATCH_EXISTS");
-  let recoveryPoint;
+  let backupPoint = null;
   if (request.path === "pitr") {
     if (!source.pointInTimeRecoveryEnabled || source.transactionLogRetentionDays === null) {
       fail("RESTORE_REHEARSAL_SOURCE_PITR_DISABLED");
     }
     const earliest = startedAt - source.transactionLogRetentionDays * DAY_MS + PITR_RETENTION_MARGIN_MS;
-    if (Date.parse(request.pointInTime) < earliest) fail("RESTORE_REHEARSAL_POINT_IN_TIME_OUTSIDE_RETENTION");
-    recoveryPoint = { kind: "point-in-time", at: request.pointInTime };
+    if (!afterPreflight && Date.parse(request.pointInTime) < earliest) {
+      fail("RESTORE_REHEARSAL_POINT_IN_TIME_OUTSIDE_RETENTION");
+    }
   } else {
     const backup = call(argv.describeBackup(request.backupId));
     if (!isRecord(backup) || String(backup.id) !== request.backupId || backup.instance !== target.source) {
@@ -956,20 +1230,37 @@ export async function runRestoreRehearsal(desired, requestInput, {
     if (source.dataDiskSizeGb !== null && source.dataDiskSizeGb > desired.cloudSql.storageSizeGb) {
       fail("RESTORE_REHEARSAL_SOURCE_DISK_EXCEEDS_PLAN");
     }
-    recoveryPoint = {
-      kind: "backup",
+    backupPoint = {
       backupType: typeof backup.type === "string" ? backup.type : null,
       windowStartTime: typeof backup.windowStartTime === "string" ? backup.windowStartTime : null,
       endTime: typeof backup.endTime === "string" ? backup.endTime : null,
     };
   }
   const sourceBefore = await fingerprint(sourceSpec);
+  const sourceBeforeEnd = now();
   if (sourceBefore.history === null) fail("RESTORE_REHEARSAL_SOURCE_HISTORY_ABSENT");
+  // The recovery point is covered by this run's source reads only when it is
+  // after the first one (with a clock-skew margin): then a source unchanged
+  // from that read to the closing read was unchanged since the recovery point.
+  // A backup always predates the run.
+  let pointInTime = null;
+  let recoveryPoint;
+  if (request.path === "pitr") {
+    pointInTime = afterPreflight ? wholeSecondTime(sourceBeforeEnd + AFTER_PREFLIGHT_MARGIN_MS) : request.pointInTime;
+    recoveryPoint = {
+      kind: "point-in-time",
+      mode: afterPreflight ? POINT_IN_TIME_AFTER_PREFLIGHT : "explicit",
+      at: pointInTime,
+      coveredBySourceReads: Date.parse(pointInTime) >= sourceBeforeEnd + AFTER_PREFLIGHT_MARGIN_MS,
+    };
+  } else {
+    recoveryPoint = { kind: "backup", ...backupPoint, coveredBySourceReads: false };
+  }
 
   // 2. Restore into the scratch, verify, run the do-not-restore step.
   const steps = [];
-  const timings = { restoreMs: null, cloneMs: null, createMs: null, restoreBackupMs: null, readyMs: null,
-    verifyMs: null, teardownMs: null, totalMs: null };
+  const timings = { pointInTimeWaitMs: null, restoreMs: null, cloneMs: null, labelMs: null, createMs: null,
+    restoreBackupMs: null, readyMs: null, verifyMs: null, teardownMs: null, totalMs: null };
   const receipt = {
     schema: RESTORE_REHEARSAL_RECEIPT_SCHEMA,
     status: "running",
@@ -995,19 +1286,55 @@ export async function runRestoreRehearsal(desired, requestInput, {
     uploadsBlockedBy: [],
     teardown: null,
   };
-  let scratchMayExist = false;
+  const pending = new Set();
+  // Armed only by an accepted create or clone whose operation did not fail:
+  // Cloud SQL refuses a name that exists, so that scratch is this run's.
+  let teardownArmed = false;
+  // A create or clone that was refused, failed, or returned no operation:
+  // whatever carries the name is not provably this run's.
+  let creationUnproven = false;
   let failure = null;
   try {
+    if (pointInTime !== null) {
+      // Cloud SQL clones only to a point at least a minute in the past.
+      const waitStarted = now();
+      await sleepUntil(Date.parse(pointInTime) + PITR_MIN_AGE_MS, { now, sleep });
+      timings.pointInTimeWaitMs = now() - waitStarted;
+    }
+    const restoreSteps = request.path === "pitr"
+      ? [{ step: "clone", argv: argv.clone(pointInTime), creates: true },
+        { step: "label", argv: argv.label(request.rehearsalId), creates: false }]
+      : [{ step: "create", argv: argv.create(desired, request.rehearsalId), creates: true },
+        { step: "restore", argv: argv.restore(request.backupId), creates: false }];
     const mutationStarted = now();
-    scratchMayExist = true;
-    for (const { step, argv: stepArgv } of plan.mutations.slice(0, 2)) {
+    for (const { step, argv: stepArgv, creates } of restoreSteps) {
       const stepStarted = now();
-      call(stepArgv);
+      let submitted;
+      try {
+        submitted = call(stepArgv);
+      } catch (error) {
+        if (creates) creationUnproven = true;
+        throw error;
+      }
+      if (creates) {
+        if (submitted.operation === null) {
+          creationUnproven = true;
+          fail(`RESTORE_REHEARSAL_OPERATION_UNKNOWN:${step}`);
+        }
+        teardownArmed = true;
+      }
+      try {
+        await waitForOperation(call, argv, submitted, { step, pending, now, sleep });
+      } catch (error) {
+        if (creates && error?.code === `RESTORE_REHEARSAL_OPERATION_FAILED:${step}`) {
+          teardownArmed = false;
+          creationUnproven = true;
+        }
+        throw error;
+      }
       const ms = now() - stepStarted;
       steps.push({ step, outcome: "done", ms });
-      if (step === "clone") timings.cloneMs = ms;
-      if (step === "create") timings.createMs = ms;
-      if (step === "restore") timings.restoreBackupMs = ms;
+      timings[STEP_TIMINGS[step]] = ms;
     }
     timings.restoreMs = now() - mutationStarted;
     let facts = null;
@@ -1024,9 +1351,12 @@ export async function runRestoreRehearsal(desired, requestInput, {
     const verifyStarted = now();
     // Ready: the scratch is RUNNABLE and a database session opened on it.
     const scratch = await fingerprint(scratchSpec, () => { timings.readyMs = now() - mutationStarted; });
+    // A write committed before the point in time has reached the statistics.
+    if (pointInTime !== null) await sleepUntil(Date.parse(pointInTime) + STATS_FLUSH_MARGIN_MS, { now, sleep });
     const sourceAfter = await fingerprint(sourceSpec);
     timings.verifyMs = now() - verifyStarted;
-    receipt.verification = compareFingerprints({ sourceBefore, sourceAfter, scratch });
+    receipt.verification = compareFingerprints({ sourceBefore, sourceAfter, scratch,
+      recoveryPointCovered: recoveryPoint.coveredBySourceReads });
     receipt.manifest = manifestRelation(scratch.history, migrations);
     if (receipt.verification.verdict !== "passed") {
       receipt.doNotRestore = { status: "skipped", code: "RESTORE_VERIFICATION_NOT_PASSED" };
@@ -1051,17 +1381,31 @@ export async function runRestoreRehearsal(desired, requestInput, {
     failure = error instanceof GcpOpsInfraError ? error.code : "RESTORE_REHEARSAL_FAILED";
   }
 
-  // 3. Teardown, whenever the scratch may exist. The scratch was absent at
-  // preflight, so anything with its name now is this run's.
-  if (scratchMayExist) {
+  // 3. Teardown, only of a scratch this run provably made.
+  if (teardownArmed) {
     try {
-      receipt.teardown = await teardownScratch(call, target, argv, { rehearsalId: request.rehearsalId,
-        requireLabels: false, now, steps });
+      receipt.teardown = { armed: true, ...await teardownScratch(call, target, argv, {
+        rehearsalId: request.rehearsalId, ownership: "run", pending, now, sleep, steps }) };
       timings.teardownMs = receipt.teardown.ms;
     } catch (error) {
-      receipt.teardown = { scratchDeleted: false, code: error instanceof GcpOpsInfraError ? error.code
-        : "RESTORE_REHEARSAL_TEARDOWN_FAILED" };
-      failure ??= receipt.teardown.code;
+      const code = error instanceof GcpOpsInfraError ? error.code : "RESTORE_REHEARSAL_TEARDOWN_FAILED";
+      // A remaining backup is found only after the delete succeeded.
+      receipt.teardown = { armed: true, scratchDeleted: code === "RESTORE_REHEARSAL_SCRATCH_BACKUP_REMAINS", code };
+      failure ??= code;
+    }
+  } else if (creationUnproven) {
+    // Another run may hold the name, or gcloud failed after sending: report
+    // whether an instance carries the name, and never touch it.
+    let scratchPresent = null;
+    try {
+      scratchPresent = scratchListed(call(argv.listScratch()), target.scratch);
+    } catch {
+      scratchPresent = null;
+    }
+    receipt.teardown = { armed: false, scratchPresent };
+    if (scratchPresent !== false) {
+      receipt.teardown.code = scratchPresent === true ? "RESTORE_REHEARSAL_SCRATCH_OWNERSHIP_UNPROVEN"
+        : "RESTORE_REHEARSAL_SCRATCH_PRESENCE_UNKNOWN";
     }
   }
   timings.totalMs = now() - startedAt;
@@ -1093,17 +1437,27 @@ export function rehearsalExitCode(receipt) {
   return receipt.uploadsMayReopen === true ? EXIT_CODES.uploadsMayReopen : EXIT_CODES.uploadsBlocked;
 }
 
-/** Deletes one labelled scratch left by an interrupted run. */
+/**
+ * Deletes one scratch left by an interrupted run: one carrying this
+ * rehearsal's labels, or with `adoptUnlabelled` (PITR path only, its own
+ * authorization) one with no rehearsal labels at all, a clone whose label step
+ * never ran. Waits for it to settle first, within SCRATCH_SETTLE_BOUND_MS.
+ */
 export async function cleanupRehearsalScratch(desired, { environment, path, rehearsalId, authorize,
-  runner = defaultRehearsalRunner, now = Date.now } = {}) {
+  adoptUnlabelled = false, runner = defaultRehearsalRunner, now = Date.now,
+  sleep = (ms) => new Promise((wake) => setTimeout(wake, ms)) } = {}) {
   if (environment !== "staging") fail("RESTORE_REHEARSAL_PRODUCTION_PLAN_ONLY");
+  if (typeof adoptUnlabelled !== "boolean") fail("RESTORE_REHEARSAL_ARGUMENT_INVALID");
   const target = rehearsalTarget(desired, { environment, rehearsalId, path });
-  if (authorize !== cleanupAuthorization(target)) fail("RESTORE_REHEARSAL_AUTHORIZATION_MISMATCH");
+  if (adoptUnlabelled && path !== "pitr") fail("RESTORE_REHEARSAL_ADOPT_PATH_REFUSED");
+  const expected = adoptUnlabelled ? adoptCleanupAuthorization(target) : cleanupAuthorization(target);
+  if (authorize !== expected) fail("RESTORE_REHEARSAL_AUTHORIZATION_MISMATCH");
+  const mode = adoptUnlabelled ? "adopt-unlabelled" : "labelled";
   const steps = [];
   const teardown = await teardownScratch(guardedRehearsalGcloud(runner, target), target, rehearsalArgv(target),
-    { rehearsalId, requireLabels: true, now, steps });
+    { rehearsalId, ownership: mode, now, sleep, steps });
   return deepFreeze({ schema: RESTORE_REHEARSAL_RECEIPT_SCHEMA, status: "cleaned", environment, scratch: target.scratch,
-    steps, teardown });
+    mode, steps, teardown });
 }
 
 // ---------------------------------------------------------------------------
@@ -1152,7 +1506,7 @@ const COMMANDS = Object.freeze({
   }),
   cleanup: Object.freeze({
     flags: ["--environment", "--path", "--rehearsal-id", "--authorize"],
-    booleans: ["--apply", "--dry-run", "--production"],
+    booleans: ["--apply", "--dry-run", "--production", "--adopt-unlabelled"],
   }),
 });
 
@@ -1192,7 +1546,10 @@ export function parseRehearsalArgs(argv) {
   if (rehearsalId !== null && !REHEARSAL_ID_PATTERN.test(rehearsalId)) fail("RESTORE_REHEARSAL_ID_INVALID");
   if ((apply || command === "cleanup") && rehearsalId === null) fail("RESTORE_REHEARSAL_ID_INVALID");
   if (command === "cleanup") {
-    return deepFreeze({ command, environment, path, rehearsalId, apply, authorize: values.get("--authorize") ?? null });
+    const adoptUnlabelled = values.get("--adopt-unlabelled") === true;
+    if (adoptUnlabelled && path !== "pitr") fail("RESTORE_REHEARSAL_ADOPT_PATH_REFUSED");
+    return deepFreeze({ command, environment, path, rehearsalId, apply, adoptUnlabelled,
+      authorize: values.get("--authorize") ?? null });
   }
   const pointInTime = values.get("--point-in-time") ?? null;
   const backupId = values.get("--backup-id") ?? null;
@@ -1229,6 +1586,8 @@ function dryRunDocument(plan, { generatedId }) {
     status: plan.environment === "staging" ? "dry_run" : "plan_only",
     authorization: plan.environment === "staging" ? plan.authorization : null,
     rehearsalIdGenerated: generatedId,
+    // Only then can a scratch that differs be `failed` rather than `inconclusive`.
+    recoveryPointCoveredBySourceReads: plan.path === "pitr" && plan.pointInTime === POINT_IN_TIME_AFTER_PREFLIGHT,
     doNotRestore: { status: "not-provided", code: "DO_NOT_RESTORE_STEP_NOT_PROVIDED",
       note: "No default list: custody of the do-not-restore list is decided after cutover (OA-9)." },
     uploadsMayReopen: false,
@@ -1256,12 +1615,21 @@ export async function main(argv = process.argv.slice(2), {
       if (!config.apply) {
         const argvFor = rehearsalArgv(target);
         print({ schema: RESTORE_REHEARSAL_RECEIPT_SCHEMA, status: "dry_run", command: "cleanup",
-          environment: target.environment, scratch: target.scratch, authorization: cleanupAuthorization(target),
-          calls: [argvFor.listScratch(), argvFor.describe(target.scratch), argvFor.disarm(), argvFor.describe(target.scratch),
-            argvFor.delete(), argvFor.listScratch(), argvFor.listScratchBackups()] });
+          environment: target.environment, scratch: target.scratch,
+          mode: config.adoptUnlabelled ? "adopt-unlabelled" : "labelled",
+          deletes: config.adoptUnlabelled
+            ? "the scratch if it carries no rehearsal labels or this rehearsal's labels"
+            : "the scratch only if it carries this rehearsal's labels",
+          authorization: config.adoptUnlabelled ? adoptCleanupAuthorization(target) : cleanupAuthorization(target),
+          settleBoundMs: SCRATCH_SETTLE_BOUND_MS,
+          calls: [argvFor.listScratch(), argvFor.describe(target.scratch), argvFor.listScratchOperations(),
+            argvFor.disarm(), argvFor.describeOperation("{operation}"), argvFor.describe(target.scratch),
+            argvFor.delete(), argvFor.describeOperation("{operation}"), argvFor.listScratch(),
+            argvFor.listScratchBackups()] });
         return 0;
       }
-      print(await cleanupRehearsalScratch(desired, { ...config, runner, now }));
+      print(await cleanupRehearsalScratch(desired, { ...config, runner, now,
+        ...(sleep === undefined ? {} : { sleep }) }));
       return 0;
     }
     if (!config.apply) {

@@ -370,11 +370,20 @@ instance, naming the path and the recovery point.
 
 - `--path=pitr`: `gcloud sql instances clone` at `--point-in-time`, then a
   label patch (`tibotattle-purpose=restore-rehearsal`,
-  `tibotattle-rehearsal=<id>`).
+  `tibotattle-rehearsal=<id>`). `--point-in-time=after-preflight` makes the
+  tool choose the point itself, a minute after its first read of the source,
+  and wait until that point is a minute old before cloning.
 - `--path=backup`: `gcloud sql instances create` (the plane's posture, no
   deletion protection, no automated backups, labelled), then
   `gcloud sql backups restore <id> --restore-instance=<scratch>
   --backup-instance=tibotattle-staging-primary`.
+
+Every mutation is submitted with `--async`, and the tool polls
+`gcloud sql operations describe` until the operation is `DONE`, up to an
+explicit bound per step: clone and restore 6 hours, create and delete 1 hour,
+each patch 30 minutes. It never relies on gcloud's own wait. In SDK 569.0.0
+that wait gives up after 600 seconds for clone, restore, patch and delete,
+while the operation carries on.
 
 It then waits for `RUNNABLE` and opens read-only sessions on the scratch and
 the source (`BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`, in sessions that
@@ -387,18 +396,52 @@ default to read-only). It compares:
   or by row text when a table has none.
 
 The digest key is random per run and never printed, so the receipt says only
-`equal` or `differs`. The source is read before and after; if it moved, the
-verdict is `inconclusive`.
+`equal` or `differs`.
 
-Teardown always runs once the scratch may exist. It patches the scratch to no
-deletion protection, no final backup and no retain-on-delete, and reads that
-back. If any of the three is still on, it refuses to delete, because a final
-backup would keep a restorable copy. Otherwise it deletes the scratch and
-checks that no instance or backup of it is left.
+**The verdict.** The source is read before the restore and again after the
+scratch is verified. Each read includes a write watermark: the schema's
+cumulative insert, update and delete counters, the statistics reset time and
+the server start time. Reads do not move it; any row write does.
+
+| Verdict | When | `verification.code` |
+|---|---|---|
+| `passed` | Scratch equals source, source unchanged during the run | `null` |
+| `inconclusive` | The source moved during the run, by data or by watermark | `RESTORE_SOURCE_MOVED_DURING_RUN` |
+| `inconclusive` | Scratch differs, but the source is not shown unchanged since the recovery point, so the difference may be a write after it | `RESTORE_SOURCE_UNCHANGED_SINCE_RECOVERY_POINT_UNPROVEN` |
+| `failed` | Scratch differs, and the source is shown unchanged since the recovery point | `RESTORE_SCRATCH_DIFFERS_FROM_SOURCE` |
+| `inconclusive` | A table could not be compared safely | `RESTORE_VERIFICATION_INCOMPLETE` |
+
+The source is shown unchanged since the recovery point only with
+`--point-in-time=after-preflight`: the point is after the first source read,
+and the closing read, taken at least two minutes after the point so recent
+writes have reached the statistics, matches it. The backup path can never show
+it, because the backup predates the run. There, and with an explicit point in
+time, any staging write after the recovery point makes the scratch differ, and
+the verdict is `inconclusive`, never `failed`. The watermark covers row writes,
+not schema changes, so no migration may run during a rehearsal.
+
+**Ownership and teardown.** The scratch name must be free at preflight. Cloud
+SQL refuses a create or clone whose name exists, so an accepted create or clone
+proves the scratch is this run's. Only then is teardown armed. If the create or
+clone is refused, fails, or returns no operation, the tool deletes nothing. It
+reports `teardown.armed: false` and `teardown.scratchPresent`. Another run may
+hold the name, or gcloud may have failed after sending.
+
+An armed teardown first waits, for up to 1 hour, until the scratch is out of
+`PENDING_CREATE` or maintenance and no operation on it is unfinished, because
+Cloud SQL refuses a patch while another operation runs. A clone that outlasted
+its bound is waited out here. It then patches the scratch to no deletion
+protection, no final backup and no retain-on-delete, and reads that back. If
+any of the three is still on, it refuses to delete, because a final backup
+would keep a restorable copy. Otherwise it deletes the scratch and checks that
+no instance or backup of it is left. A scratch still busy after an hour is
+left, with `RESTORE_REHEARSAL_SCRATCH_BUSY`, for cleanup.
 
 The source is only read. The gcloud guard allows a closed set of command
-shapes; every mutation names the scratch as its target, and the source appears
-only as the clone source or the backup's instance.
+shapes. Every mutation is `--async` and names the scratch as its target; the
+source appears only as the clone source or the backup's instance. An operation
+may be described only after a mutation of this run returned it, and operations
+may be listed only for the scratch.
 
 **The do-not-restore step.** The reapply step is an injected interface with no
 default list, because custody of the list is open (OA-9, decided after
@@ -420,30 +463,35 @@ manifest, and an injected step returned an exact `done` result.
   grants that role on the verifier account only. Check it with a read
   (`gcloud iam service-accounts get-iam-policy`). If the grant is missing, ask
   the owner: adding it is an IAM change outside the committed desired state.
-- Nothing writes to staging during the run (the scheduler trigger paused,
-  admission closed). Choose a point in time after the last write, or the copy
-  will legitimately differ.
+- Nothing writes to staging during the run, and no migration runs (the
+  scheduler trigger paused, admission closed). `sql instances describe` does
+  not report a last-write time, so prefer `--point-in-time=after-preflight`,
+  which needs no such time. For the backup path, staging must also have had no
+  writes since the backup's `endTime`, and the tool cannot check that: a
+  difference there reads `inconclusive`.
 
 **Commands** (from `apps/worker`; `SCRATCH` is the session scratchpad):
 
 ```bash
 node scripts/gcp-backup-restore-rehearsal.mjs rehearse --environment=staging \
-  --path=pitr --point-in-time=<RFC 3339 UTC, at least 1 minute ago, within 7 days>
+  --path=pitr --point-in-time=after-preflight
 ```
 
-The dry run makes no call. It prints the exact calls, the `scratch` name and
-the `authorization`, and `"rehearsalIdGenerated": true` when it chose the id.
-Rerun it with `--rehearsal-id=<that id>` and the same flags, check that the
-authorization is unchanged, then apply:
+The dry run makes no call. It prints the exact calls, the operation bounds,
+the `scratch` name and the `authorization`, and `"rehearsalIdGenerated": true`
+when it chose the id. Rerun it with `--rehearsal-id=<that id>` and the same
+flags, check that the authorization is unchanged, then apply:
 
 ```bash
 node scripts/gcp-backup-restore-rehearsal.mjs rehearse --environment=staging \
-  --path=pitr --point-in-time=<same> --rehearsal-id=<id> --apply \
+  --path=pitr --point-in-time=after-preflight --rehearsal-id=<id> --apply \
   --authorize=<the dry run's authorization> \
   --receipt-out="$SCRATCH/restore-rehearsal-<id>.json"; echo "exit=$?"
 ```
 
-For the backup path, take a backup run id from
+An explicit `--point-in-time=<RFC 3339 UTC, at least 1 minute ago, within 7
+days>` also works, but then a difference reads `inconclusive`. For the backup
+path, take a backup run id from
 `gcloud sql backups list --instance=tibotattle-staging-primary --project=tibotattle --format=json`
 (read-only), and pass `--path=backup --backup-id=<id>` in place of the point
 in time.
@@ -452,23 +500,30 @@ in time.
 |---|---|
 | 0 | Verified, at the image tail, the injected step done, scratch deleted. The CLI cannot reach it until OA-9 |
 | 2 | Verified and scratch deleted; uploads may not reopen (`uploadsBlockedBy`). Expected: `DO_NOT_RESTORE_STEP_NOT_PROVIDED`, plus `RESTORE_MIGRATION_BEHIND` if staging is behind this checkout |
-| 3 | Verification `failed` or `inconclusive`; scratch deleted. Read `verification.tables` and `verification.sourceStable` |
+| 3 | Verification `failed` or `inconclusive`; scratch deleted. Read `verification.code`, `verification.tables` and `recoveryPoint.coveredBySourceReads` |
 | 1 | Refused or failed. Read `code`, and `receipt.teardown` when present |
 
 Keep the receipt; it is content-free (names, counts, timings, booleans). The
-timings are `cloneMs` (or `createMs` and `restoreBackupMs`), `readyMs` (first
-mutation to a database session on the scratch), `verifyMs`, `teardownMs` and
-`totalMs`.
+timings are `pointInTimeWaitMs`, `cloneMs` and `labelMs` (or `createMs` and
+`restoreBackupMs`), each to its operation's end; `readyMs` (first mutation to a
+database session on the scratch); `verifyMs`; `teardownMs`; and `totalMs`.
 
 **Stop conditions.**
 
 - `RESTORE_REHEARSAL_SCRATCH_EXISTS`: that scratch name is taken. Pick a new
-  id; never reuse or adopt an instance.
-- Exit 1 with `receipt.teardown.scratchDeleted: false`: the scratch still
-  exists. `RESTORE_REHEARSAL_TEARDOWN_SETTINGS_UNSAFE` means its deletion
-  protection or final backup did not turn off, so the tool did not delete it.
-  Never delete it by hand with a final backup. Run the cleanup dry run, then
-  the cleanup with its authorization:
+  id; never reuse an instance.
+- Exit 1 with `receipt.teardown.armed: false` and `scratchPresent: true`
+  (`RESTORE_REHEARSAL_SCRATCH_OWNERSHIP_UNPROVEN`): the create or clone was
+  not accepted, or its operation failed, yet an instance carries the name. The
+  tool did not touch it. Another rehearsal may hold it; check that none is
+  running before any cleanup. `scratchPresent: null` means the listing could
+  not be read: list it by hand, read-only.
+- Exit 1 with `receipt.teardown.armed: true` and `scratchDeleted: false`: the
+  scratch still exists. `RESTORE_REHEARSAL_SCRATCH_BUSY` means an operation on
+  it was still running after the settle bound. `RESTORE_REHEARSAL_TEARDOWN_SETTINGS_UNSAFE`
+  means its deletion protection or final backup did not turn off, so the tool
+  did not delete it. Never delete it by hand with a final backup. Run the
+  cleanup dry run, then the cleanup with its authorization:
 
   ```bash
   node scripts/gcp-backup-restore-rehearsal.mjs cleanup --environment=staging --path=pitr --rehearsal-id=<id>
@@ -477,8 +532,26 @@ mutation to a database session on the scratch), `verifyMs`, `teardownMs` and
   ```
 
   Cleanup deletes only an instance labelled for that rehearsal id; otherwise it
-  refuses with `RESTORE_REHEARSAL_SCRATCH_NOT_OWNED`. If it still refuses,
-  stop and ask the owner.
+  refuses with `RESTORE_REHEARSAL_SCRATCH_NOT_OWNED`, before waiting or
+  mutating. Like the run, it waits up to an hour for the scratch to settle
+  before patching it; `RESTORE_REHEARSAL_SCRATCH_BUSY` means rerun it later.
+- A PITR clone whose label step never ran (its clone outlasted the bound, or
+  its submission failed after sending) carries no rehearsal labels, so plain
+  cleanup refuses it. If the receipt shows the clone was this rehearsal's
+  (`steps` has no `label`, or the teardown code above), and no other
+  rehearsal with this id is running, adopt it with its own authorization:
+
+  ```bash
+  node scripts/gcp-backup-restore-rehearsal.mjs cleanup --environment=staging --path=pitr --rehearsal-id=<id> --adopt-unlabelled
+  node scripts/gcp-backup-restore-rehearsal.mjs cleanup --environment=staging --path=pitr --rehearsal-id=<id> \
+    --adopt-unlabelled --apply \
+    --authorize=restore-rehearsal-cleanup-adopt-unlabelled:staging:tibotattle-staging-primary-rehearsal-<id>
+  ```
+
+  Adoption deletes the exact scratch name only when it carries no rehearsal
+  labels or this rehearsal's. It refuses any other rehearsal labels, and it
+  refuses the backup path, whose scratch is labelled when created. If it
+  refuses, stop and ask the owner.
 - `RESTORE_REHEARSAL_SCRATCH_BACKUP_REMAINS`: a backup of the deleted scratch
   is listed. The tool never deletes backups; ask the owner.
 - `teardown.finalBackups: "unavailable"`: the backup listing could not be
