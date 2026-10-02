@@ -32,7 +32,8 @@ left the machine.
 | `b9b004ed` | `--no-ff` merge of `claude/gcp-fastpath-dense` `6e78d64f` (25 commits): raised caps, the native-path oracle and golden-dense, the v1.2 occurrence reader fix, parity-compare v3 with per-date values, preview withholding on a refused fit, the day backstop, `--corpus`/`--dump`/`--refresh-profile` for the seed and test deploy, and decision D7 |
 | `c47f92d9` | `--no-ff` merge of `claude/gcp-fp-w2-integration` `7c310cac` (20 commits): OPS-10 and the shared runtime-grant policy, OPS-2 infrastructure as code, the SIMP-0 ledger removal from CR-3, EP-7 and OPS-1, the PT-2-lite seal, the PT-3 importer and primary migration 0063, plus the dense-side migration-tail pins moved to 63 |
 | `f8406093` | The edge end-to-end S9 stage holds the golden's withheld model dates to the per-date expectation, as the rehearsal does ([S9 seam](#s9-seam)) |
-| this commit | This receipt |
+| `f9beb7f2` | This receipt |
+| this commit | Review fixes: three stale plan citations, the test deploy's golden read before any remote command, and checks for the external-dump path ([Review fixes](#review-fixes-2026-10-02)) |
 
 The first parents are `3fa1ba64` and `b9b004ed`, and the second parents are
 `6e78d64f` and `7c310cac`.
@@ -77,7 +78,8 @@ Git reported four textual conflicts. Each resolution keeps both sides' intent.
     origin-bucket binding and source environment.
   - The dry-run seed returns both `dumpSha256` and `sourceIdentity`.
   - An origin-only run over a seeded schema reads the source identity with the
-    same `--dump`.
+    same `--dump`. As merged, it read it after the bucket writes; the review
+    fixes moved the read ahead of every remote command.
 - `docs/plans/2026-10-01-gcp-fastpath.md`: the Risks section keeps the OD-E6
   client-address bullet and takes the dense side's dense-owner bullet. The
   dense bullet supersedes the final side's earlier bullet about excluding
@@ -92,7 +94,9 @@ Git merged several files cleanly that were expected to conflict:
 - The 2026-10-01 receipts. Only the dense side changed the final-integration
   and local-rehearsal receipts, adding "decided later" notes.
 - The plan's OpenAI alignment section. It has no overlapping hunk, and it
-  already refers to the dense branch landing first.
+  already refers to the dense branch landing first. Its line citations were
+  not rechecked against the merged code; three had drifted
+  ([Review fixes](#review-fixes-2026-10-02)).
 
 ## Merge 2: the wave-2 integration (`c47f92d9`)
 
@@ -321,6 +325,109 @@ caused by these merges.
 - `tibotattle_dense_parity`, its three `dbab8e9e` schemas and
   `tibotattle_q1_parity` are kept.
 
+## Review fixes (2026-10-02)
+
+A review of `f9beb7f2` made three low-severity findings and one verification
+note with no defect. Each finding was confirmed before it was fixed, and none
+was rejected.
+
+### Plan citations
+
+Three citations in the plan's OpenAI alignment section pointed at code that
+the dense branch had moved. They were right at `3fa1ba64`:
+
+| Citation | Now |
+|---|---|
+| `ANALYTICS_V2_MODEL_DATES = 70` at `compute.ts:128` | `compute.ts:179` |
+| Retained owner-scoped rows at `store.ts:684-707` | `store.ts:751-774`, the owner-scoped block of `writeRunOutputs` |
+| `analytics-refresh.mjs:19-26,404-411` | The header at `:25-31`, and `analyticsRefreshPublicationDays` at `:502-509` |
+
+A scripted check then covered every `path:line` citation in the plan, and in
+each other living document changed since `7ef0e144`. It compared the cited
+lines in the commit that last wrote each document line (from `git blame`)
+with the same lines at `f9beb7f2`:
+
+- In the plan, 50 cited ranges matched and 4 were stale: exactly the three
+  citations above, one of which cites two ranges.
+- Six citations use a basename that exists in two places, this line and the
+  vendored `d43c8f92` tree. Neither copy changed after the citing commit.
+- The other living documents changed since `7ef0e144` have no `path:line`
+  citation. They are the two decisions, the edge-modes and operations
+  runbooks, `docs/README.md` and the edge IP probe README.
+
+Dated receipts were left as written, because they are point-in-time records.
+
+### Golden read before remote writes
+
+Finding: an origin-only test deploy over a seeded schema with
+`--corpus=dense` and no `--dump` ran the bucket create and the runtime
+binding, then refused with `GCP_FASTPATH_SEED_DUMP_REQUIRED`. It reproduced
+as a dry run.
+
+The same class reached further than the finding said. A dry run of
+`all --corpus=dense` without `--dump` printed the Cloud Build, the database
+create and the migrate Job before the seed refused, so a real run would have
+executed them first. That ordering already existed on the dense branch at
+`6e78d64f`.
+
+The fix in `apps/worker/scripts/gcp-fastpath-test-deploy.mjs`:
+
+- `main` resolves the golden before the first step whenever a selected step
+  reads it. Those steps are the seed, and an origin over a seeded schema
+  (`stepsReadGolden`). A refusal therefore precedes every command.
+- The golden is read once per run and reused by the dry-run seed and the
+  origin.
+- `stepOrigin` resolves the source identity before `ensureOriginBucket`.
+- Steps that do not read the golden, for example `refresh --corpus=dense`, still
+  need no `--dump`.
+- The help text says so.
+
+### External-dump coverage
+
+The new fixture `apps/worker/analytics-v2-test/fixtures/digest-only-golden.mjs`
+is a synthetic golden that commits only its dump's digest, as `golden-dense`
+does. Its three-table dump sits outside the checkout. A golden must live
+inside the checkout, so the golden directory is created under the ignored
+`.release-build` parent, as `test/local-review-build-policy.test.js` does. The
+fixture removes both afterwards. Three new cases use it:
+
+- **`gcp-fastpath-seed.check.mjs`:** `readSeedGolden(golden, { dump })`
+  returns the external dump's path, digest, clock and source identity. It
+  refuses without `--dump` and refuses a dump with one extra byte.
+- **`gcp-fastpath-test-deploy.check.mjs`:**
+  - An origin-only dry run over a seeded schema prints no command and refuses
+    without `--dump`. With `--dump`, it renders the dump's
+    `POSTGRES_SOURCE_ID` and `POSTGRES_SOURCE_NAMESPACE`.
+  - Four runs without `--dump` refuse before printing any command: `origin`,
+    `seed`, `all`, and `all --skip=seed` over a seeded schema, all with
+    `--corpus=dense`. `refresh --corpus=dense` still runs with the dense
+    profile.
+
+Against the pre-fix script, both new test-deploy cases fail. Each prints
+bucket commands before refusing.
+
+### Gates on the review-fix commit
+
+The gates ran serially on 2026-10-02 between 11:01Z and 11:12Z, with the
+same PostgreSQL environment as above.
+
+| Gate | Result |
+|---|---|
+| `npm run gcp:fastpath:scripts-check` (socket and TCP) | Exit 0, 68 of 68: the 65 above plus the three new cases. The TCP case where the seed runs as a non-superuser ran |
+| `npm run edge:e2e:check` | 18 of 18, plus the dry run of all three edge modes |
+| `npm run gcp:ops:infra:check` | 179 of 179 |
+| `cloud-run`: `node --test ./origin-edge-test-mode.check.mjs` | 22 of 22 |
+| Test-deploy `all --dry-run` with `--origin-env=EDGE_ORIGIN_MODE=edge-test`, Q-1 and dense with `--dump` | Exit 0 for both. The command log and report match the pre-fix script's exactly, after temporary paths are normalized. Q-1: dump `5a935fad…`, standard profile. Dense: dump `1d0bef8e…`, dense profile. Both have source `gcp-fastpath-oracle` and the `TiboTattleFastpathTelemetry` binding |
+| Test-deploy `origin --dry-run --corpus=dense` over `…_9669032a` | Without `--dump`: exit 1, `GCP_FASTPATH_SEED_DUMP_REQUIRED`, no command printed. With the dense dump: exit 0, and the YAML has both `POSTGRES_SOURCE_*` set to `gcp-fastpath-oracle` |
+| Root `npm run architecture:check` | Passed: 926 production files, 3,961 imports, 0 approved debt edges |
+| Root `npm run test:preflight`, with the changes staged | Passed: root hygiene clean, `git diff --check` and `git diff --cached --check` clean, documentation governance valid across 313 Markdown and 1,654 source and config files, 20 of 20 |
+
+These changes touch none of the analytics refresh, the route, the importers
+or the rehearsal. The Q-1 and dense rehearsals, `edge:e2e` and the other gates
+above were not rerun. After the gates, the cluster held only
+`postgres`, the templates, `tibotattle_dense_parity` and
+`tibotattle_q1_parity`, and no `fmerge_` role.
+
 ## Not proved here
 
 - This receipt does not cover the Worker `npm run check` as one command. Its
@@ -336,6 +443,8 @@ caused by these merges.
   production volumes or the largest real owner. The dense-owner parity
   receipt's open items still stand: a measured cloud run with the `dense`
   refresh profile, and the T-2 importer's quadratic reader verification.
+- The review fixes' ordering is proved by dry runs and local checks only. No
+  real `gcloud` command ran.
 - The hosted Worker gate still fails without the cloud-run dependencies, as
   it did before these merges. Fixing it is for the owner and the dense
   workstream.

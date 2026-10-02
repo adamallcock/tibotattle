@@ -9,6 +9,8 @@ import { dirname, join, relative, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
+import { DIGEST_ONLY_GOLDEN_NOW, DIGEST_ONLY_GOLDEN_SOURCE,
+  withDigestOnlyGolden } from "../analytics-v2-test/fixtures/digest-only-golden.mjs";
 import { localFastpathTcpHost, withLocalFastpathCloudDatabase } from "../postgres-test/fixtures/fastpath-cloud-database.mjs";
 import { GCP_FASTPATH_CLOUD_TARGET, GCP_FASTPATH_CLOUD_TARGET_REFUSALS,
   gcpFastpathCloudTargetRefusal } from "./gcp-fastpath-cloud-target.mjs";
@@ -123,6 +125,23 @@ test("--corpus selects a committed golden; the dense golden's dump must match it
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+// The dense corpus's path, with a synthetic dump: the golden commits only the
+// digest, and the source the origin is told comes from the external dump's bytes.
+test("a digest-only golden reads its digest, clock and source from the --dump its manifest pins", async () => {
+  await withDigestOnlyGolden(async ({ golden, dump, dumpSha256 }) => {
+    const read = await readSeedGolden(golden, { dump });
+    assert.equal(read.dumpPath, dump);
+    assert.equal(read.dumpSha256, dumpSha256);
+    assert.equal(read.nowIso, DIGEST_ONLY_GOLDEN_NOW);
+    assert.deepEqual({ ...read.sourceIdentity }, { ...DIGEST_ONLY_GOLDEN_SOURCE });
+    await assert.rejects(readSeedGolden(golden), (error) => error?.code === "GCP_FASTPATH_SEED_DUMP_REQUIRED");
+    const altered = join(dirname(dump), "altered.json");
+    await writeFile(altered, `${await readFile(dump, "utf8")} `);
+    await assert.rejects(readSeedGolden(golden, { dump: altered }),
+      (error) => error?.code === "GCP_FASTPATH_SEED_DUMP_DIGEST_MISMATCH");
+  });
 });
 
 test("seeded schemas are the rehearsal's names and pass every importer's prefix guard", () => {

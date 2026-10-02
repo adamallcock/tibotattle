@@ -654,7 +654,7 @@ function parseArgs(argv) {
     variant: "sidecar", mode: "fastpath-test", refreshEnv: [], refreshArgs: [], originEnv: [],
     query: "from=2026-04-15&to=2026-10-01", skip: new Set(), noExecute: false,
     schema: undefined, golden: undefined, schemaSuffix: undefined, replaceSeed: false, sourceIdentity: undefined,
-    corpus: undefined, dump: undefined, refreshProfile: undefined,
+    corpus: undefined, dump: undefined, refreshProfile: undefined, resolvedGolden: undefined,
   };
   for (const argument of rest) {
     if (argument === "--dry-run") { options.dryRun = true; continue; }
@@ -742,7 +742,8 @@ Options:
   --corpus=q1|dense       seed a committed golden by name instead of --golden: q1 (the default) or dense
                           (golden-dense, which needs --dump); also picks the refresh profile unless given
   --dump=<path>           the golden's source dump when the golden commits only its digest (golden-dense);
-                          refused unless its sha256 equals the golden manifest's sourceDump.jsonSha256
+                          refused unless its sha256 equals the golden manifest's sourceDump.jsonSha256;
+                          seed, and origin over a seeded schema, refuse without it before any remote command
   --refresh-profile=standard|dense   the refresh Job's task size (default: the corpus's, else standard)
   --schema-suffix=<hex8>  seeded schema suffix (default: from the commit and the golden dump digest)
   --replace-seed          drop and re-seed a seeded schema that lacks its completion marker
@@ -1026,6 +1027,27 @@ async function stepVerifyDatabase(runner) {
   }
 }
 
+function isSeededSchema(schema) {
+  return primarySchemaOf(schema).startsWith(FASTPATH_TEST_CLOUD_TARGET.seededSchemaPrefix);
+}
+
+/** The golden's manifest, dump digest, clock and source, read once per run (read-only). */
+async function seedGolden(options) {
+  if (options.resolvedGolden === undefined) {
+    const seedModule = await import("./gcp-fastpath-seed.mjs");
+    options.resolvedGolden = await seedModule.readSeedGolden(options.golden, { dump: options.dump });
+  }
+  return options.resolvedGolden;
+}
+
+/**
+ * Whether a selected step reads the golden: the seed, and an origin over a
+ * seeded schema, which is configured with the source the golden's dump pins.
+ */
+export function stepsReadGolden(steps, options) {
+  return steps.includes("seed") || (steps.includes("origin") && isSeededSchema(options.schema));
+}
+
 async function stepSeed(runner, options) {
   const commit = resolveCommit(options.commit);
   const seedModule = await import("./gcp-fastpath-seed.mjs");
@@ -1039,7 +1061,7 @@ async function stepSeed(runner, options) {
   if (runner.dryRun) {
     // Read-only: name the schema and clock the seed would hand to refresh and origin.
     if (plan.decision === "run") {
-      const golden = await seedModule.readSeedGolden(plan.golden, { dump: options.dump });
+      const golden = await seedGolden(options);
       const schema = seedModule.seededSchemas(options.schemaSuffix
         ?? seedModule.defaultSuffix(commit, golden.dumpSha256)).target;
       if (options.schema === undefined) options.schema = schema;
@@ -1108,15 +1130,15 @@ function ensureOriginBucket(runner) {
 }
 
 async function stepOrigin(runner, options, image) {
+  // Resolved before the bucket write: without the seed step in this run, a seeded
+  // schema holds the golden's source (a golden that commits only its dump digest
+  // needs the same --dump the seed used), so its refusal precedes every write.
+  let sourceIdentity = options.sourceIdentity ?? null;
+  if (sourceIdentity === null && isSeededSchema(options.schema)) {
+    sourceIdentity = (await seedGolden(options)).sourceIdentity;
+  }
   const { proof: bucketHistoryProof, binding: bucketBinding } = ensureOriginBucket(runner);
   const originEnv = originClockEnv(options.originEnv, options.now);
-  let sourceIdentity = options.sourceIdentity ?? null;
-  if (sourceIdentity === null && primarySchemaOf(options.schema).startsWith(FASTPATH_TEST_CLOUD_TARGET.seededSchemaPrefix)) {
-    // Without the seed step in this run: a seeded schema holds the golden's source
-    // (a golden that commits only its dump digest needs the same --dump the seed used).
-    const seedModule = await import("./gcp-fastpath-seed.mjs");
-    sourceIdentity = (await seedModule.readSeedGolden(options.golden, { dump: options.dump })).sourceIdentity;
-  }
   const yaml = renderOriginService({ image, variant: options.variant, mode: options.mode, originEnv,
     bucketHistoryProof, schema: options.schema, sourceIdentity });
   await mkdir(runner.out, { recursive: true, mode: 0o700 });
@@ -1213,6 +1235,10 @@ export async function main(argv = process.argv.slice(2)) {
       "protected"]
       .filter((step) => !options.skip.has(step))
     : [options.step];
+  // Before the first remote command: a golden that a selected step reads must
+  // resolve here (one that commits only its dump digest needs --dump, of that
+  // digest), so its refusal never follows a build, migration or bucket write.
+  if (stepsReadGolden(steps, options)) await seedGolden(options);
   const report = { project: FASTPATH_TEST.project, dryRun: options.dryRun, out, steps: [] };
   let image = options.image;
   let protectedBefore = null;

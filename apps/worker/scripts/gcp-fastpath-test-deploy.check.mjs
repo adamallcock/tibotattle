@@ -33,10 +33,12 @@ import {
   REFRESH_JOB_RESOURCES,
   refreshJobCommand,
   renderOriginService,
+  stepsReadGolden,
   validateOriginBucketPolicy,
   validateOriginPolicy,
 } from "./gcp-fastpath-test-deploy.mjs";
 import { readSeedGolden } from "./gcp-fastpath-seed.mjs";
+import { DIGEST_ONLY_GOLDEN_SOURCE, withDigestOnlyGolden } from "../analytics-v2-test/fixtures/digest-only-golden.mjs";
 import {
   analyticsV2TestClock,
   FASTPATH_TEST_CLOUD_TARGET,
@@ -545,4 +547,70 @@ test("a dry-run origin step prints the bucket binding before the origin is deplo
   assert.ok(binding < index("gcloud run services replace"), "the binding precedes the origin deploy");
   assert.equal(printed[binding].includes(`--role=${CLEANUP_ROLE}`) && printed[binding].includes(RUNTIME_MEMBER)
     && printed[binding].includes(LIVE_BUCKET_CONDITION_EXPRESSION), true);
+});
+
+/** main() with the console captured: the dry-run lines it printed, and its report or refusal. */
+async function capturedMain(argv) {
+  const printed = [];
+  const { error: printError, log: printLog } = console;
+  console.error = (line) => printed.push(String(line));
+  console.log = () => {};
+  try {
+    return { printed, report: await main(argv) };
+  } catch (error) {
+    return { printed, error };
+  } finally {
+    console.error = printError;
+    console.log = printLog;
+  }
+}
+
+// (2026-10-02 merge review): an origin-only run over a seeded schema with
+// --corpus=dense and no --dump created the bucket and added the runtime
+// binding, then refused; `all` built, created the database and migrated first.
+test("a digest-only golden without --dump is refused before any remote command; other steps do not read it", async () => {
+  const out = await mkdtemp(join(tmpdir(), "fastpath-deploy-dump-"));
+  try {
+    for (const argv of [
+      ["origin", "--dry-run", `--image=${IMAGE}`, "--corpus=dense", `--schema=${SEEDED}`],
+      ["seed", "--dry-run", "--commit=HEAD", "--corpus=dense"],
+      ["all", "--dry-run", "--commit=HEAD", `--image=${IMAGE}`, "--corpus=dense"],
+      ["all", "--dry-run", "--commit=HEAD", `--image=${IMAGE}`, "--corpus=dense", "--skip=seed", `--schema=${SEEDED}`],
+    ]) {
+      const { printed, error } = await capturedMain([...argv, `--out=${out}`]);
+      assert.equal(error?.code, "GCP_FASTPATH_SEED_DUMP_REQUIRED", argv.join(" "));
+      assert.deepEqual(printed, [], `${argv.join(" ")}: no command precedes the refusal`);
+    }
+    assert.equal(stepsReadGolden(["seed"], {}), true);
+    assert.equal(stepsReadGolden(["origin"], { schema: SEEDED }), true);
+    assert.equal(stepsReadGolden(["origin"], {}), false, "the pinned primary schema keeps the default source");
+    assert.equal(stepsReadGolden(["build", "migrate", "refresh", "verify"], { schema: SEEDED }), false);
+    const refresh = await capturedMain(["refresh", "--dry-run", `--image=${IMAGE}`, "--corpus=dense", `--out=${out}`]);
+    assert.equal(refresh.error, undefined);
+    assert.equal(refresh.report.steps[0].profile, "dense");
+  } finally {
+    await rm(out, { recursive: true, force: true });
+  }
+});
+
+test("an origin-only run over a seeded schema renders the source of the --dump a digest-only golden pins", async () => {
+  await withDigestOnlyGolden(async ({ golden, dump }) => {
+    const out = await mkdtemp(join(tmpdir(), "fastpath-deploy-dump-"));
+    try {
+      const argv = ["origin", "--dry-run", `--image=${IMAGE}`, `--golden=${golden}`, `--schema=${SEEDED}`,
+        `--out=${out}`];
+      const refused = await capturedMain(argv);
+      assert.equal(refused.error?.code, "GCP_FASTPATH_SEED_DUMP_REQUIRED");
+      assert.deepEqual(refused.printed, []);
+      const { report, error } = await capturedMain([...argv, `--dump=${dump}`]);
+      assert.equal(error, undefined);
+      const [origin] = report.steps;
+      assert.deepEqual({ ...origin.sourceIdentity }, { ...DIGEST_ONLY_GOLDEN_SOURCE });
+      const env = originContainerEnv(await readFile(origin.yamlPath, "utf8"));
+      assert.deepEqual([env.POSTGRES_SOURCE_ID, env.POSTGRES_SOURCE_NAMESPACE],
+        [DIGEST_ONLY_GOLDEN_SOURCE.sourceId, DIGEST_ONLY_GOLDEN_SOURCE.sourceNamespace]);
+    } finally {
+      await rm(out, { recursive: true, force: true });
+    }
+  });
 });

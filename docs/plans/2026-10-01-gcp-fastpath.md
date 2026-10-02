@@ -739,9 +739,9 @@ Working-copy lines 505-518.
 |---|---|
 | Thin edge | The release (`30c0feb0` to `f0067d0f`) changes neither `apps/worker/src/index.ts` nor `ingress-budget.ts`, the two production modules the edge entry imports; the edge files themselves exist only on this line. The edge deploys only from a branch that contains the live `DEPLOYMENT_SOURCE_COMMIT` ([edge decision §3](../decisions/2026-10-01-thin-worker-edge-proxy.md#3-edge-source-line)). Once P is live, the OD-E1 edge-port branch is cut from P instead of `d43c8f92`, and EP-0 to EP-3, EP-9, E4, E5 and the release-guard migration are re-ported blob-identical under OD-E1 and OD-E2. OD-E5's re-derivation of `EDGE_PRE_ADMISSION_GUARDS` applies only if `git diff d43c8f92 P -- apps/worker/src/index.ts` changes an admission call site. The edge-origin contract blob must be unchanged at P. OAI-8 checks both |
 | D1-to-PostgreSQL transfer and rehearsal | `apps/worker/scripts/postgres-cutover-rehearsal.mjs:10-15` and `production-typed-schema.mjs:44-51` build the D1 source model from this line's D1 migration directories, which hold this line's isolation 0013 and 0014. If production applies `main`'s `0013_performance_ultrafast.sql`, production D1 no longer matches that model. OAI-9 rebuilds the model from P's applied D1 migrations. The seeded rehearsal checks that `promax`, `ultrafast` and `gpt-6.1-sol` transfer as text or dictionary values. `postgres-v12-transfer.mjs:358` pins the v1.2 field dictionary `telemetry-v1.2-registry-2026-09-20.1`, which the release leaves unchanged |
-| GCP-only copies of kernel vocabulary | A re-vendor does not move them: the refusal reasons (`contract.ts` `ANALYTICS_V2_REFUSAL_REASONS` and the `0059_analytics_v2.sql:62-71` check), the cache band IDs (`0059_analytics_v2.sql:86-90`, `cache-windows-sql.ts`) and counters (`ANALYTICS_V2_CACHE_BAND_COUNTERS`), `ANALYTICS_V2_MODEL_DATES = 70` (`compute.ts:128`) and the route's `community-daily-read-v1.0` (`community-daily-route.ts:84`). OAI-3 checks each against P. A changed check set needs a PostgreSQL migration, which is an exception to OAI-4's no-migration expectation. The release changes none of the reducers or cache-retention files, so none of these moves now |
+| GCP-only copies of kernel vocabulary | A re-vendor does not move them: the refusal reasons (`contract.ts` `ANALYTICS_V2_REFUSAL_REASONS` and the `0059_analytics_v2.sql:62-71` check), the cache band IDs (`0059_analytics_v2.sql:86-90`, `cache-windows-sql.ts`) and counters (`ANALYTICS_V2_CACHE_BAND_COUNTERS`), `ANALYTICS_V2_MODEL_DATES = 70` (`compute.ts:179`) and the route's `community-daily-read-v1.0` (`community-daily-route.ts:84`). OAI-3 checks each against P. A changed check set needs a PostgreSQL migration, which is an exception to OAI-4's no-migration expectation. The release changes none of the reducers or cache-retention files, so none of these moves now |
 | Legacy built-in daily reader | `apps/worker/src/postgres-community-daily.ts:145` accepts only normalization `pro_x1_prolite_x4_plus_x20`, which the release changes. Outside `fastpath-test` it still serves the origin's `/api/v1/community/daily` (`cloud-run/server.mjs:610-616,757-770`). It must not be the mounted route at cutover; the analytics-v2 route replaces it |
-| Kernel identity of retained rows | `analytics_v2` rows carry no kernel commit or method stamp. Cache bands of owners a run does not recompute are retained (`store.ts:684-707`) and read without a method filter (`cache-windows-sql.ts:92-99`). A re-vendor that changed the cache-retention method would serve old-kernel rows under the new label. This release changes no cache-retention file, so it is not reached now; OAI-11 settles a run kernel stamp before the first re-vendor that changes a retained-row method |
+| Kernel identity of retained rows | `analytics_v2` rows carry no kernel commit or method stamp. Cache bands of owners a run does not recompute are retained (`store.ts:751-774`, the owner-scoped block of `writeRunOutputs`) and read without a method filter (`cache-windows-sql.ts:92-99`). A re-vendor that changed the cache-retention method would serve old-kernel rows under the new label. This release changes no cache-retention file, so it is not reached now; OAI-11 settles a run kernel stamp before the first re-vendor that changes a retained-row method |
 
 #### Superseded: the release plan's GCP section
 
@@ -804,12 +804,13 @@ GCP work separate from the Cloudflare rollout still stands.
   is stale
   (`vendor/analytics-d43c8f92/apps/worker/src/storage-community-daily.ts:376-387`).
   `analytics-refresh` republishes only the days named by the journal and the
-  days a previous run left blocked
-  (`apps/worker/cloud-run/analytics-refresh.mjs:19-26,404-411`). Its header
-  records why: untouched heads are never recomputed, so a roster change is not
-  applied to published history (D1). A recompute always uses the run's current
-  roster: `analytics-v2/owners.ts` requires an active participant, an active
-  device and an active owner link, and the retained accountless scope keeps
+  days a previous run left blocked (`analyticsRefreshPublicationDays`,
+  `apps/worker/cloud-run/analytics-refresh.mjs:502-509`). Its header
+  (`analytics-refresh.mjs:25-31`) records why: untouched heads are never
+  recomputed, so a roster change is not applied to published history (D1).
+  A recompute always uses the run's current roster: `analytics-v2/owners.ts`
+  requires an active participant, an active device and an active owner link,
+  and the retained accountless scope keeps
   only `user_opt_out` revocations. Republishing every stale head would
   therefore drop disconnected, reset or contained owners from every republished
   day, which D1 forbids. The release changes both spend fields, so the
