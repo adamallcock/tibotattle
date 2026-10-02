@@ -26,6 +26,21 @@ export const MINIMUM_POSTGRES_PENDING_OBJECT_SAFETY_WINDOW_MILLISECONDS = 60 * 6
 export const MAXIMUM_POSTGRES_PENDING_OBJECT_SAFETY_WINDOW_MILLISECONDS = 30 * 24 * 60 * 60 * 1000;
 export const POSTGRES_PENDING_OBJECT_RECONCILIATION_BATCH_LIMIT = 100;
 
+/**
+ * The E-PT4 cutover guard (staged primary migration
+ * *_pending_object_transfer_holds.sql). A pending_objects row whose
+ * object_key has an unreleased hold names an object that may still live only
+ * in Cloudflare R2 until the post-switch PT-7 copy; the reconciler never
+ * selects or claims it, so it can neither be cleared as "already absent" nor
+ * deleted. PT-7 releases each hold with releasePostgresPendingObjectTransferHolds.
+ * While the table is absent (the migration not applied) there are no holds;
+ * PT-8 preflight P13 refuses a cutover target without the table unless the
+ * owner recorded accept-orphan-registration-clearing.
+ */
+export const POSTGRES_PENDING_OBJECT_TRANSFER_HOLD_TABLE = "pending_object_transfer_holds";
+export const POSTGRES_PENDING_OBJECT_TRANSFER_HOLD_RELEASE_LIMIT = 1_000;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
+
 const LEASE_PREFIX = "pgq1";
 const LEASE_PATTERN = /^pgq1:([0-9]{13}):([0-9a-f]{32})$/u;
 const LEASE_SQL_PATTERN = "^pgq1:[0-9]{13}:[0-9a-f]{32}$";
@@ -132,6 +147,40 @@ function refsSql(schema: string, keyExpression: string): string {
     OR EXISTS (SELECT 1 FROM ${schema}."telemetry_v12_chunks" WHERE r2_key = ${keyExpression})`;
 }
 
+function unheldSql(schema: string, keyExpression: string): string {
+  return `NOT EXISTS (SELECT 1 FROM ${schema}."${POSTGRES_PENDING_OBJECT_TRANSFER_HOLD_TABLE}" hold
+    WHERE hold.object_key = ${keyExpression} AND hold.released_at IS NULL)`;
+}
+
+/** Whether this schema carries the transfer-hold table (read once per pass). */
+async function transferHoldsPresent(pool: PostgresPool, schema: string): Promise<boolean> {
+  const result = await withPostgresRead(pool, async (client) => client.query<{ present: boolean }>(
+    "SELECT to_regclass($1) IS NOT NULL AS present",
+    [`${schema}."${POSTGRES_PENDING_OBJECT_TRANSFER_HOLD_TABLE}"`],
+  ), { operation: "quarantine.reconcile.holds" });
+  const present = result.rows[0]?.present;
+  if (typeof present !== "boolean") {
+    throw new PostgresStorageError("unavailable", "quarantine.reconcile.holds");
+  }
+  return present;
+}
+
+async function isTransferHeld(
+  client: PostgresClient,
+  schema: string,
+  objectKey: string,
+): Promise<boolean> {
+  const result = await client.query<{ unheld: boolean }>(
+    `SELECT ${unheldSql(schema, "$1")} AS unheld WHERE $1::text IS NOT NULL`,
+    [objectKey],
+  );
+  const value: unknown = result.rows[0]?.unheld;
+  if (typeof value !== "boolean") {
+    throw new PostgresStorageError("unavailable", "quarantine.reconcile.holds");
+  }
+  return !value;
+}
+
 function referenceSelect(schema: string): string {
   return `SELECT (${refsSql(schema, "$1")}) AS referenced`;
 }
@@ -166,10 +215,12 @@ async function dueRows(
   nowEpoch: number,
   safetyWindowMilliseconds: number,
   maximumRegistrations: number,
+  holds: boolean,
 ): Promise<{ rows: PendingObjectRow[]; hasMore: boolean }> {
   const registeredCutoff = new Date(nowEpoch - safetyWindowMilliseconds).toISOString();
   const leaseCutoff = nowEpoch - safetyWindowMilliseconds;
   const refs = refsSql(schema, "pending.object_key");
+  const unheld = holds ? `AND ${unheldSql(schema, "pending.object_key")}` : "";
   const result = await withPostgresRead(pool, async (client) => client.query<PendingObjectRow>(
     `SELECT pending.contribution_id, pending.object_key, pending.object_kind,
             pending.registered_at, pending.reconciliation_state,
@@ -185,6 +236,7 @@ async function dueRows(
             OR (${staleLeaseSql("pending")})
           ))
         )
+        ${unheld}
       ORDER BY pending.registered_at, pending.contribution_id
       LIMIT $3`,
     [registeredCutoff, leaseCutoff, maximumRegistrations + 1],
@@ -202,6 +254,7 @@ async function claimObject(
   candidate: PendingObjectRow,
   nowEpoch: number,
   safetyWindowMilliseconds: number,
+  holds: boolean,
 ): Promise<ClaimedObject> {
   return withPostgresMutation(pool, async (client) => {
     const currentResult = await client.query<PendingObjectRow>(
@@ -221,6 +274,10 @@ async function claimObject(
     const registeredAt = current.registered_at instanceof Date
       ? current.registered_at.getTime() : Date.parse(current.registered_at);
     if (!Number.isFinite(registeredAt) || registeredAt > nowEpoch - safetyWindowMilliseconds) {
+      return { row: current, leaseId: "", action: "deferred" };
+    }
+    // Re-checked under the row lock: a held registration is never claimed.
+    if (holds && await isTransferHeld(client, schema, current.object_key)) {
       return { row: current, leaseId: "", action: "deferred" };
     }
 
@@ -360,12 +417,14 @@ export async function reconcilePostgresPendingObjects(
     return safeInvalidOptions();
   }
   const config = validateOptions(options);
+  const holds = await transferHoldsPresent(pool, config.schema);
   const page = await dueRows(
     pool,
     config.schema,
     config.nowEpoch,
     config.safetyWindowMilliseconds,
     config.maximumRegistrations,
+    holds,
   );
   let orphanObjectsDeleted = 0;
   let orphanObjectsAlreadyAbsent = 0;
@@ -377,7 +436,7 @@ export async function reconcilePostgresPendingObjects(
   for (const candidate of page.rows) {
     assertQuarantineObjectKey(candidate.object_key);
     const claim = await claimObject(
-      pool, config.schema, candidate, config.nowEpoch, config.safetyWindowMilliseconds,
+      pool, config.schema, candidate, config.nowEpoch, config.safetyWindowMilliseconds, holds,
     );
     if (claim.action === "deferred") {
       candidatesDeferred += 1;
@@ -425,4 +484,69 @@ export async function reconcilePostgresPendingObjects(
     candidatesDeferred,
     hasMore: page.hasMore,
   });
+}
+
+export interface PostgresPendingObjectTransferHoldRelease {
+  readonly schema?: PostgresSchemaOptions;
+  /** The objects PT-7 copied to GCS or proved absent from R2. */
+  readonly objectKeys: readonly string[];
+  /** sha256 of PT-7's owner-directory receipt covering these objects. */
+  readonly releaseReceiptSha256: string;
+}
+
+export interface PostgresPendingObjectTransferHoldReleaseResult {
+  /** Holds released by this call. */
+  readonly released: number;
+  /** Keys whose hold was already released (a retry); never re-released. */
+  readonly alreadyReleased: number;
+  /** Keys with no hold at all. */
+  readonly unknown: number;
+}
+
+/**
+ * Release the E-PT4 transfer holds for objects PT-7 has copied to GCS or
+ * proved absent from R2 (post-switch, owner-run). One-way and idempotent: a
+ * released hold keeps its first receipt digest, and the table's guard refuses
+ * any other change. Counts only; no key leaves this function.
+ */
+export async function releasePostgresPendingObjectTransferHolds(
+  pool: PostgresPool,
+  release: PostgresPendingObjectTransferHoldRelease,
+): Promise<PostgresPendingObjectTransferHoldReleaseResult> {
+  if (release === null || typeof release !== "object"
+      || !Array.isArray(release.objectKeys)
+      || release.objectKeys.length === 0
+      || release.objectKeys.length > POSTGRES_PENDING_OBJECT_TRANSFER_HOLD_RELEASE_LIMIT
+      || new Set(release.objectKeys).size !== release.objectKeys.length
+      || typeof release.releaseReceiptSha256 !== "string"
+      || !SHA256_PATTERN.test(release.releaseReceiptSha256)) {
+    return safeInvalidOptions();
+  }
+  for (const key of release.objectKeys) assertQuarantineObjectKey(key);
+  const { primarySchema } = createPostgresSchemaConfig(release.schema ?? {});
+  const schema = quotePostgresIdentifier(primarySchema);
+  const keys = [...release.objectKeys];
+  return withPostgresMutation(pool, async (client) => {
+    const updated = await client.query<{ object_key: string }>(
+      `UPDATE ${schema}."${POSTGRES_PENDING_OBJECT_TRANSFER_HOLD_TABLE}"
+          SET released_at = clock_timestamp(), release_receipt_sha256 = $2
+        WHERE object_key = ANY($1::text[]) AND released_at IS NULL
+        RETURNING object_key`,
+      [keys, release.releaseReceiptSha256],
+    );
+    const known = await client.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM ${schema}."${POSTGRES_PENDING_OBJECT_TRANSFER_HOLD_TABLE}"
+        WHERE object_key = ANY($1::text[])`,
+      [keys],
+    );
+    const present = Number(known.rows[0]?.n);
+    if (!Number.isSafeInteger(present) || present < updated.rows.length) {
+      throw new PostgresStorageError("unavailable", "quarantine.reconcile.holds");
+    }
+    return Object.freeze({
+      released: updated.rows.length,
+      alreadyReleased: present - updated.rows.length,
+      unknown: keys.length - present,
+    });
+  }, { operation: "quarantine.reconcile.holds.release" });
 }

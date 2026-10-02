@@ -130,7 +130,7 @@ function validEnv(mode, overrides = {}) {
 }
 
 function migrationFixtures() {
-  return Array.from({ length: 65 }, (_, index) => ({
+  return Array.from({ length: 67 }, (_, index) => ({
     role: "primary",
     version: index + 1,
     name: `${String(index + 1).padStart(4, "0")}_${index === 38
@@ -149,7 +149,9 @@ function migrationFixtures() {
                               ? "telemetry_contribution_trigger_search_path" : index === 62
                                 ? "enrollment_grants_erased_redeemer" : index === 63
                                   ? "append_only_residue" : index === 64
-                                    ? "interim_public_read" : `synthetic_migration_${index + 1}`}.sql`,
+                                    ? "interim_public_read" : index === 65
+                                      ? "community_aggregate_exclusions" : index === 66
+                                        ? "pending_object_transfer_holds" : `synthetic_migration_${index + 1}`}.sql`,
     sql: `-- migration ${index + 1}\n`,
     bytes: Buffer.byteLength(`-- migration ${index + 1}\n`),
     sha256: String(index + 1).padStart(64, "0"),
@@ -783,9 +785,9 @@ async function createDisposableSchema(pool, migrationRoot, { policyState = "read
 
 async function createPinnedMigrationRoot() {
   const current = await readPostgresMigrations({ role: "primary" });
-  const pinned = current.filter(migration => migration.version <= 65);
-  assert.equal(pinned.length, 65, "the A2 integration targets the current 65-migration manifest");
-  assert.equal(pinned.at(-1)?.name, "0065_interim_public_read.sql");
+  const pinned = current.filter(migration => migration.version <= 67);
+  assert.equal(pinned.length, 67, "the A2 integration targets the current 67-migration manifest");
+  assert.equal(pinned.at(-1)?.name, "0067_pending_object_transfer_holds.sql");
   const root = await mkdtemp(join(tmpdir(), `a2-daily-activation-${randomBytes(6).toString("hex")}-`));
   try {
     const directory = join(root, "primary");

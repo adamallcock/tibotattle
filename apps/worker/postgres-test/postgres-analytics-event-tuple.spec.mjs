@@ -70,8 +70,8 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL analytics event tuple migrations 00
 
   it("preserves legacy rows and allows NULL projections only for complete v1 receipts", async () => {
     const migrations = await readPostgresMigrations({ role: "primary", rootDirectory: POSTGRES_MIGRATION_ROOT });
-    expect(migrations).toHaveLength(65);
-    expect(migrations.at(-1)?.name).toBe("0065_interim_public_read.sql");
+    expect(migrations).toHaveLength(67);
+    expect(migrations.at(-1)?.name).toBe("0067_pending_object_transfer_holds.sql");
 
     legacyRoot = await mkdtemp(join(tmpdir(), "tibotattle-pg-event-tuple-v37-"));
     const legacyPrimary = join(legacyRoot, "primary");
