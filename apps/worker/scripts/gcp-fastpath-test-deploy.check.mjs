@@ -11,12 +11,14 @@ import {
   countMigrationsAtCommit,
   EDGE_PROXY_SOURCE,
   executeJobCommand,
+  FASTPATH_CORPORA,
   FASTPATH_TEST,
   migrateJobCommand,
   ORIGIN_TEST_CLOCK_ENV,
   originClockEnv,
   originInvokerCommand,
   primarySchemaOf,
+  REFRESH_JOB_PROFILES,
   REFRESH_JOB_RESOURCES,
   refreshJobCommand,
   renderOriginService,
@@ -28,6 +30,7 @@ import {
   fastpathTestDatabaseConfig,
 } from "../cloud-run/origin-fastpath-mode.mjs";
 import { GCP_FASTPATH_REHEARSAL_REFRESH_HEAP_MIB } from "./gcp-fastpath-rehearsal.mjs";
+import { GCP_FASTPATH_SEED } from "./gcp-fastpath-seed.mjs";
 import {
   analyticsRefreshResources,
   parseAnalyticsRefreshArguments,
@@ -101,6 +104,41 @@ test("migrate and refresh Jobs carry the exact database targets, identities and 
   expectCode(() => refreshJobCommand({ image: IMAGE, now: "yesterday" }), "FASTPATH_DEPLOY_NOW_INVALID");
   expectCode(() => refreshJobCommand({ image: IMAGE, extraArgs: ["--a,b"] }), "FASTPATH_DEPLOY_ARGS_INVALID");
   expectCode(() => refreshJobCommand({ image: IMAGE, extraEnv: [["bad-key", "1"]] }), "FASTPATH_DEPLOY_ENV_INVALID");
+});
+
+test("refresh profiles: the standard Job stays the default; the dense Job is 4 vCPU, 16 GiB with a fitting budget", () => {
+  assert.equal(REFRESH_JOB_RESOURCES, REFRESH_JOB_PROFILES.standard);
+  assert.deepEqual(Object.keys(REFRESH_JOB_PROFILES), ["standard", "dense"]);
+  assert.deepEqual(refreshJobCommand({ image: IMAGE }), refreshJobCommand({ image: IMAGE, profile: "standard" }));
+  const dense = refreshJobCommand({ image: IMAGE, now: "2026-10-01T12:46:00Z", profile: "dense" });
+  for (const flag of ["--cpu=4", "--memory=16Gi", "--task-timeout=14400s", "--max-retries=0"]) {
+    assert.equal(dense.includes(flag), true, flag);
+  }
+  assert.equal(dense.some((arg) => arg.startsWith("--args=--max-old-space-size=12288,dist/analytics-refresh.mjs,")), true);
+  assert.equal(dense.some((arg) => arg.startsWith("--set-env-vars=") && arg.includes("ANALYTICS_V2_MEMORY_BUDGET_MIB=10752")
+    && arg.includes("ANALYTICS_V2_TEST_CLOCK=1")), true);
+  // An explicit --refresh-env still overrides the profile's budget.
+  const overridden = refreshJobCommand({ image: IMAGE, profile: "dense",
+    extraEnv: [["ANALYTICS_V2_MEMORY_BUDGET_MIB", "8192"]] });
+  assert.equal(overridden.some((arg) => arg.includes("ANALYTICS_V2_MEMORY_BUDGET_MIB=8192")
+    && !arg.includes("ANALYTICS_V2_MEMORY_BUDGET_MIB=10752")), true);
+  const MIB = 1_048_576;
+  for (const [name, profile] of Object.entries(REFRESH_JOB_PROFILES)) {
+    const env = Object.fromEntries(profile.env);
+    // The job's own start-up guard accepts the profile's heap for its budget...
+    const resources = analyticsRefreshResources(env, (profile.heapMiB + 48) * MIB);
+    assert.ok(resources.requiredHeapBytes <= profile.heapMiB * MIB, name);
+    // ...and Cloud Run's memory holds the heap plus at least 1.5 GiB of native memory.
+    assert.ok(Number.parseInt(profile.memory, 10) * 1024 - profile.heapMiB >= 1_536, name);
+  }
+  expectCode(() => refreshJobCommand({ image: IMAGE, profile: "huge" }), "FASTPATH_DEPLOY_REFRESH_PROFILE_INVALID");
+});
+
+test("the corpora name the seed's committed goldens and their default refresh profiles", () => {
+  assert.deepEqual(Object.fromEntries(Object.entries(FASTPATH_CORPORA).map(([name, corpus]) => [name, corpus.golden])),
+    GCP_FASTPATH_SEED.corpora);
+  assert.equal(FASTPATH_CORPORA.q1.golden, GCP_FASTPATH_SEED.defaultGolden);
+  assert.deepEqual(Object.values(FASTPATH_CORPORA).map((corpus) => corpus.refreshProfile), ["standard", "dense"]);
 });
 
 test("origin service is private, references test secrets by name and keeps the origin on loopback", () => {

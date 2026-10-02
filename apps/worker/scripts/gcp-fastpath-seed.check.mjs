@@ -3,7 +3,8 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { lstat, readdir, readFile, realpath, stat } from "node:fs/promises";
+import { lstat, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -14,11 +15,13 @@ import { GCP_FASTPATH_CLOUD_TARGET, GCP_FASTPATH_CLOUD_TARGET_REFUSALS,
 import { GCP_FASTPATH_CONNECTION, validateTarget } from "./gcp-fastpath-connection.mjs";
 import { fastpathRehearsalSchemas } from "./gcp-fastpath-rehearsal.mjs";
 import {
+  corpusGolden,
   defaultSuffix,
   GCP_FASTPATH_SEED,
   goldenPath,
   loadSeedStages,
   planSeed,
+  readSeedGolden,
   runGcpFastpathSeed,
   SEED_STAGES,
   seededSchemas,
@@ -94,6 +97,31 @@ test("seed runs only from a checkout equal to the commit in stages, migrations a
   }
   assert.throws(() => goldenPath("/tmp/elsewhere"), (error) => error?.code === "GCP_FASTPATH_SEED_GOLDEN_INVALID");
   assert.equal(goldenPath(), GOLDEN);
+});
+
+test("--corpus selects a committed golden; the dense golden's dump must match its pinned digest", async () => {
+  assert.equal(corpusGolden("q1"), GCP_FASTPATH_SEED.defaultGolden);
+  assert.equal(corpusGolden("dense"), "apps/worker/analytics-v2-test/golden-dense");
+  for (const bad of ["Q1", "golden", "", undefined, "__proto__"]) {
+    assert.throws(() => corpusGolden(bad), (error) => error?.code === "GCP_FASTPATH_SEED_CORPUS_INVALID");
+  }
+  const q1 = await readSeedGolden(corpusGolden("q1"));
+  assert.match(q1.dumpSha256, /^[0-9a-f]{64}$/u);
+  assert.equal(q1.nowIso, "2026-10-01T12:00:00.000Z");
+  // golden-dense commits only its dump's digest.
+  await assert.rejects(readSeedGolden(corpusGolden("dense")),
+    (error) => error?.code === "GCP_FASTPATH_SEED_DUMP_REQUIRED");
+  const directory = await mkdtemp(join(tmpdir(), "gcp-fastpath-seed-check-"));
+  try {
+    const dump = join(directory, "usage-monitor-db.json");
+    await writeFile(dump, '{"schema":[],"tables":[]}\n');
+    await assert.rejects(readSeedGolden(corpusGolden("dense"), { dump }),
+      (error) => error?.code === "GCP_FASTPATH_SEED_DUMP_DIGEST_MISMATCH");
+    await assert.rejects(readSeedGolden(corpusGolden("q1"), { dump }),
+      (error) => error?.code === "GCP_FASTPATH_SEED_DUMP_AMBIGUOUS");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("seeded schemas are the rehearsal's names and pass every importer's prefix guard", () => {
