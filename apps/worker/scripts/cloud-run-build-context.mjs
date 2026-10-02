@@ -5,7 +5,8 @@
  * root around the existing Worker handlers; it must never be built from the
  * dirty repository root. Only the host, Worker source, the vendored d43c8f92
  * analytics kernels and the analytics-refresh Job, the MP-2-lite maintenance
- * Job and the production configuration it reads, canonical migrations,
+ * Job and the production configuration it reads, the route-family contract
+ * the admin route modules import, canonical migrations,
  * migration runner, the shared runtime-grant policy and the production
  * migration Job, the private daily publication Job and verifier, their
  * shared receipt contract, test-only activation and independent restore
@@ -88,6 +89,8 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/upload-authorization-formats.mjs", destination: "apps/worker/cloud-run/upload-authorization-formats.mjs" }),
   Object.freeze({ source: "cloud-run/envelopes", destination: "apps/worker/cloud-run/envelopes" }),
   Object.freeze({ source: "cloud-run/routes", destination: "apps/worker/cloud-run/routes" }),
+  // The CR-1 family contract the C-ADMIN route modules in cloud-run/routes import.
+  Object.freeze({ source: "cloud-run/postgres-family-contract.mjs", destination: "apps/worker/cloud-run/postgres-family-contract.mjs" }),
   // The edge-test origin (EORIGIN) and the EP-6 boundary and replay limiters
   // it composes in front of fastpath-test.
   Object.freeze({ source: "cloud-run/origin-edge-test-mode.mjs", destination: "apps/worker/cloud-run/origin-edge-test-mode.mjs" }),

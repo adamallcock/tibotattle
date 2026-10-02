@@ -267,3 +267,27 @@ The spec's parity method:
 - The broad Worker gate (`npm run product:worker:check`) and the
   `postgres:domain:check` suite did not run. The new check and spec are not
   yet registered in `package.json`; the integrator wires them (FC-1).
+
+## Integration into the final line (2026-10-02)
+
+The integrator merged `31d4e711` into `claude/gcp-fastpath-final` as
+`2bb6cb04` (pre-merge head `9700d167`), with no conflicts and no migrations.
+The merge broke two gates, and one integration commit fixes both:
+
+- `node ../scripts/cloud-run-build-context.mjs --check` (in the Cloud Run
+  check) refused `CLOUD_RUN_CONTEXT_IMPORT_OUTSIDE_CONTEXT`. `cloud-run/routes`
+  enters the audited context whole, and three route modules import
+  `cloud-run/postgres-family-contract.mjs`, which was not in it. The context
+  now carries that file. It passed at `9700d167` and failed at `2bb6cb04`.
+- `node scripts/ci-postgres-suite.mjs --plan` refused
+  `UNREGISTERED_POSTGRES_SPEC` for the new spec. The spec is now in
+  `postgres:domain:check`, and the check runs in the Cloud Run package's
+  `check` script (FC-1).
+
+Round 4 of the owner's answers settled the production commit as `d43c8f92`
+and moved OAI-3 (allowance v1.2 and preview v0.4) after cutover. The v0.3
+preview validator this port pins is therefore production's at the switch.
+
+The integration gates and their results are recorded in the cutover
+checklist's C-ADMIN entry. The cutover blocker and the three open owner
+questions above are unchanged.
