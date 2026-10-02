@@ -159,7 +159,13 @@ Each of these is fail-closed and covered by a negative test.
   - Without one, the whole overview is the Worker's 503
     `BACKEND_STORAGE_UNAVAILABLE`. It is never a zero.
   - While a ledger database exists, the faithful tombstone reader is bound
-    automatically.
+    automatically. **Superseded by C-SIMP-RECON (2026-10-02):** the
+    PostgreSQL line has no ledger, so that reader and the `pools.ledger` /
+    `ledgerSchema` options are removed (a stale root passing either is
+    refused), and `deletionLedger` is served only by an injected source.
+    The spec now uses the primary chain only and injects a synthetic
+    `deletionLedger` source. See
+    [the C-SIMP-RECON receipt](2026-10-02-gcp-c-simp-recon.md).
 - **Pending daily rebuilds** are counted the way the analytics-refresh job
   reads them: the distinct days named by journal events after
   `analytics_v2_journal_cursor`. Terminal events name no day.

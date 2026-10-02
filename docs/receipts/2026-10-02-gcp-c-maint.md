@@ -152,6 +152,12 @@ Safety properties:
   - `GCS_QUARANTINE_BUCKET_HISTORY_PROOF` (OD-2) is required: the
     bucket-birth receipt's `proof` JSON, or the receipt carrying it. Its
     bucket must equal `GCS_BUCKET_NAME`.
+    **Superseded by C-SIMP-RECON (2026-10-02):** the job no longer parses
+    the proof. It takes CR-3's `resources.bucketHistoryProof`, which accepts
+    only the closed four-key proof record (no receipt wrapper) and reports
+    `_MISSING` or `_INVALID` (a bucket mismatch is `_INVALID`; the job's
+    `_BUCKET_MISMATCH` code is gone). See
+    [the C-SIMP-RECON receipt](2026-10-02-gcp-c-simp-recon.md).
   - The job refuses `HOST_MODE` and `K_SERVICE`, even when empty, and any
     `PG_TEST_*` or `POSTGRES_MAINTENANCE_JOB_*` variable.
   - The job reads no other variable and reveals no secret.

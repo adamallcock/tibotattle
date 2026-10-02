@@ -32,10 +32,7 @@ import { beginPostgresAdminOperation, finishPostgresAdminOperation,
 import { readPostgresAdminAllowancePreview } from "../../src/postgres-admin-allowance-preview.ts";
 import { setPostgresCollectionControls } from "../../src/postgres-admin-collection-controls.ts";
 import { readPostgresAdminDatabaseHealth } from "../../src/postgres-admin-database-health.ts";
-import {
-  readPostgresAdminDeletionLedger,
-  readPostgresAdminOverview,
-} from "../../src/postgres-admin-overview.ts";
+import { readPostgresAdminOverview } from "../../src/postgres-admin-overview.ts";
 import { assertFrozenPathnames } from "../postgres-family-contract.mjs";
 import { ADMIN_ACTION_PATHNAMES, createAdminActionDispatch } from "./admin-action.mjs";
 import {
@@ -75,6 +72,18 @@ export const ADMIN_CONSOLE_PATHNAMES = assertFrozenPathnames(
 );
 
 const OVERVIEW_SOURCE_KEYS = Object.freeze(["syntheticContributions", "historicalPublication", "deletionLedger"]);
+/**
+ * The pools and schema options a composition root may pass. The PostgreSQL
+ * line has one database and no deletion ledger (decisions D2, D4 and D6 of
+ * 2026-09-26), so any other key, a ledger pool or schema from a stale root
+ * included, is refused rather than ignored.
+ */
+const POOL_KEYS = Object.freeze(["primary", "analytics"]);
+const SCHEMA_OPTION_KEYS = Object.freeze(["primarySchema"]);
+
+function closedKeys(value, allowed) {
+  return value !== null && typeof value === "object" && Object.keys(value).every((key) => allowed.includes(key));
+}
 
 function isPool(value) {
   return value !== null && typeof value === "object" && typeof value.connect === "function";
@@ -89,12 +98,15 @@ function optionalPool(name, value) {
  * Bind the default PostgreSQL adapters.
  *
  * deps (FC-3): requestContext, clock?, env (frozen Worker-shaped env),
- *   pools: {primary, ledger?, analytics?} (analytics defaults to primary,
- *     where 0059 places analytics_v2; an explicit analytics pool is probed
- *     as given and never falls back to primary),
- *   schemaOptions: {primarySchema, ledgerSchema?},
+ *   pools: {primary, analytics?} (analytics defaults to primary, where 0059
+ *     places analytics_v2; an explicit analytics pool is probed as given and
+ *     never falls back to primary). There is no ledger pool: the database
+ *     health's deletion_ledger role is always 'not_configured' (how the
+ *     closed DTO represents the retired role is OWN-17 question 3),
+ *   schemaOptions: {primarySchema},
  *   overviewSources?: {syntheticContributions?, historicalPublication?, deletionLedger?}
- *     (deletionLedger defaults to the ledger pool's tombstones while one exists),
+ *     (none has a default: each block is the Worker's 503 until the root
+ *     injects its source, which OWN-17 question 1 decides),
  *   readMetricsHistory?, readReconstructionProgress? (no GCP source: unavailable),
  *   maintenance?: {runMaintenance?, syncDistribution?, telemetryRuntimeActivation?,
  *     transportRollback?, v11EvidenceAdoption?} (unported: 503 POSTGRES_ROUTE_NOT_PORTED).
@@ -105,14 +117,12 @@ export function createAdminConsoleAdapters(deps) {
   if (pools === null || typeof pools !== "object" || !isPool(pools.primary)) {
     throw adminRouteConfigurationError("admin_console", "pools.primary");
   }
-  const ledgerPool = optionalPool("pools.ledger", pools.ledger);
+  if (!closedKeys(pools, POOL_KEYS)) throw adminRouteConfigurationError("admin_console", "pools");
   // The analytics role's database is the primary database on GCP (0059).
   const analyticsPool = optionalPool("pools.analytics", pools.analytics) ?? pools.primary;
   const schema = deps.schemaOptions?.primarySchema;
-  if (typeof schema !== "string") throw adminRouteConfigurationError("admin_console", "schemaOptions");
-  const ledgerSchema = deps.schemaOptions?.ledgerSchema;
-  if (ledgerPool !== undefined && typeof ledgerSchema !== "string") {
-    throw adminRouteConfigurationError("admin_console", "schemaOptions.ledgerSchema");
+  if (typeof schema !== "string" || !closedKeys(deps.schemaOptions, SCHEMA_OPTION_KEYS)) {
+    throw adminRouteConfigurationError("admin_console", "schemaOptions");
   }
   const env = deps.env;
   if (env === null || typeof env !== "object" || !Object.isFrozen(env)) {
@@ -124,12 +134,7 @@ export function createAdminConsoleAdapters(deps) {
         || typeof injected[key] !== "function")) {
     throw adminRouteConfigurationError("admin_console", "overviewSources");
   }
-  const overviewSources = Object.freeze({
-    ...(ledgerPool === undefined ? {} : {
-      deletionLedger: () => readPostgresAdminDeletionLedger(ledgerPool, ledgerSchema),
-    }),
-    ...injected,
-  });
+  const overviewSources = Object.freeze({ ...injected });
   const clock = deps.clock ?? Date.now;
   return Object.freeze({
     readOverview: ({ nowEpoch, diagnosticReference }) => readPostgresAdminOverview({
@@ -137,7 +142,7 @@ export function createAdminConsoleAdapters(deps) {
     }),
     readAllowancePreview: ({ nowEpoch }) => readPostgresAdminAllowancePreview(pools.primary, schema, nowEpoch),
     readDatabaseHealth: () => readPostgresAdminDatabaseHealth({
-      env, clock, pools: { primary: pools.primary, deletionLedger: ledgerPool, analytics: analyticsPool },
+      env, clock, pools: { primary: pools.primary, analytics: analyticsPool },
     }),
     ...(deps.readMetricsHistory === undefined ? {} : { readMetricsHistory: deps.readMetricsHistory }),
     ...(deps.readReconstructionProgress === undefined ? {}

@@ -37,8 +37,11 @@
  *     and erasure-proof settings and test seams;
  *   - GCS_QUARANTINE_BUCKET_HISTORY_PROOF (owner decision OD-2): the
  *     bucket-birth proof the GCS quarantine store needs for head() of a
- *     missing key and for delete(), as JSON (the receipt's `proof` object, or a
- *     receipt carrying it). Its bucket must equal GCS_BUCKET_NAME;
+ *     missing key and for delete(). The configuration parses it, once, as
+ *     CR-3's resources.bucketHistoryProof: exactly the OPS-2 receipt's closed
+ *     four-key proof record for GCS_BUCKET_NAME (no wrapper), with CR-3's
+ *     codes (_MISSING when absent or empty, _INVALID otherwise, a bucket
+ *     mismatch included). The job has no parser of its own;
  *   - refused here, even when empty: HOST_MODE and K_SERVICE (this is not the
  *     service), any PG_TEST_ variable (no local fallback endpoint) and any
  *     POSTGRES_MAINTENANCE_JOB_ variable (the job has no tunables).
@@ -59,7 +62,6 @@
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Connector } from "@google-cloud/cloud-sql-connector";
-import { createGcsErasureBucketHistoryProof } from "../src/gcs-erasure-object-store.ts";
 import { createGcsQuarantineObjectStore } from "../src/gcs-quarantine-object-store.ts";
 import { runPostgresLifecyclePass } from "../src/postgres-lifecycle-pass.ts";
 import { POSTGRES_RUNTIME_MIGRATIONS } from "../src/postgres-runtime-schema.ts";
@@ -80,7 +82,6 @@ export const POSTGRES_MAINTENANCE_JOB_CYCLE_MILLISECONDS = 60_000;
 export const POSTGRES_MAINTENANCE_JOB_APPLICATION_NAME = "tibotattle-maintenance-job";
 /** The trigger schedule the D-OPS4 Scheduler must use: every minute, as the Worker cron. */
 export const POSTGRES_MAINTENANCE_JOB_SCHEDULE = "* * * * *";
-export const POSTGRES_MAINTENANCE_JOB_HISTORY_PROOF_VARIABLE = "GCS_QUARANTINE_BUCKET_HISTORY_PROOF";
 /** Variables the job refuses even when empty, and the code each gives. */
 export const POSTGRES_MAINTENANCE_JOB_FORBIDDEN_VARIABLES = Object.freeze({
   HOST_MODE: "POSTGRES_MAINTENANCE_JOB_HOST_MODE_FORBIDDEN",
@@ -169,29 +170,6 @@ export function assertPostgresMaintenanceJobEnvironment(env) {
   }
 }
 
-/** The OD-2 bucket-birth proof, bound to the configured quarantine bucket. */
-export function readPostgresMaintenanceJobHistoryProof(env, bucket) {
-  const name = POSTGRES_MAINTENANCE_JOB_HISTORY_PROOF_VARIABLE;
-  const raw = has(env, name) ? env[name] : undefined;
-  if (typeof raw !== "string" || raw.length === 0) fail(`${name}_MISSING`);
-  let value;
-  try {
-    value = JSON.parse(raw);
-  } catch {
-    fail(`${name}_INVALID`);
-  }
-  const candidate = value !== null && typeof value === "object" && !Array.isArray(value)
-    && value.proof !== undefined ? value.proof : value;
-  let proof;
-  try {
-    proof = createGcsErasureBucketHistoryProof(candidate);
-  } catch {
-    fail(`${name}_INVALID`);
-  }
-  if (proof.bucket !== bucket) fail(`${name}_BUCKET_MISMATCH`);
-  return proof;
-}
-
 /**
  * Validate the whole environment for one profile and return the frozen
  * pieces the job composes from. Throws a coded Error; nothing is connected.
@@ -206,15 +184,16 @@ export function readPostgresMaintenanceJobConfiguration(env, profile) {
       || configuration.jobSwitches.POSTGRES_SCHEDULED_MAINTENANCE_ENABLED !== "enabled") {
     fail("POSTGRES_MAINTENANCE_JOB_PROFILE_INVALID");
   }
-  const { primary, iamUser, bucket } = configuration.resources;
-  const historyProof = readPostgresMaintenanceJobHistoryProof(env, bucket);
+  // OD-2: CR-3 parses the bucket-birth proof once (resources.bucketHistoryProof).
+  const { primary, iamUser, bucket, bucketHistoryProof } = configuration.resources;
+  if (bucketHistoryProof?.bucket !== bucket) fail("GCS_QUARANTINE_BUCKET_HISTORY_PROOF_INVALID");
   return Object.freeze({
     profile,
     plane: configuration.plane,
     primary,
     iamUser,
     bucket,
-    historyProof,
+    historyProof: bucketHistoryProof,
   });
 }
 

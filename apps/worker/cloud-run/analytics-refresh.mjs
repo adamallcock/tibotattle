@@ -447,7 +447,7 @@ function testTargetIdentities() {
     iam.service, iam.postgres.primary.instanceConnectionName, iam.postgres.ledger.instanceConnectionName,
     iam.postgres.primary.schema, iam.postgres.ledger.schema, iam.postgres.iamUser,
     `${iam.postgres.iamUser}.gserviceaccount.com`,
-    fastpath.instanceConnectionName, fastpath.database, fastpath.primarySchema, fastpath.ledgerSchema,
+    fastpath.instanceConnectionName, fastpath.database, fastpath.primarySchema,
     fastpath.iamUser, `${fastpath.iamUser}.gserviceaccount.com`, fastpath.refreshJob, fastpath.originService,
   ]);
 }

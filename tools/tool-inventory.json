@@ -201,7 +201,11 @@
         "apps/worker/scripts/telemetry-runtime-reconciliation.check.mjs",
         "apps/worker/scripts/telemetry-runtime-reconciliation.mjs",
         "apps/worker/scripts/typed-forward-migration.check.mjs",
-        "apps/worker/scripts/typed-forward-migration.mjs"
+        "apps/worker/scripts/typed-forward-migration.mjs",
+        "apps/worker/scripts/cloudflare-writer-fence.mjs",
+        "apps/worker/scripts/edge-mode-configuration.mjs",
+        "apps/worker/scripts/production-edge-mode.mjs",
+        "apps/worker/scripts/production-edge-mode.check.mjs"
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": "docs/runbooks/agent-release-operations.md",

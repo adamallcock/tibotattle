@@ -101,6 +101,8 @@ export const REFUSAL_SITES = Object.freeze({
   "cloud-run/postgres-community-graph-readback-diagnostic.mjs": { "LEDGER_*": 3 },
   "cloud-run/postgres-production-configuration.mjs": { "LEDGER_*": 6 },
   "cloud-run/postgres-production-migrations.mjs": { "CLOUD_RUN_IAM_TEST_TARGET.postgres.ledger": 2 },
+  // The refresh job mirrors CR-3's forbidden production variables (C-REFRESH).
+  "cloud-run/analytics-refresh.mjs": { "LEDGER_*": 3 },
 
   // Negative tests that prove those refusals.
   "cloud-run/host.check.mjs": { "LEDGER_*": 14, "CLOUD_RUN_IAM_TEST_TARGET.postgres.ledger": 4 },
@@ -109,6 +111,8 @@ export const REFUSAL_SITES = Object.freeze({
   "cloud-run/origin-route-modules.check.mjs": { LEDGER_EXPECTED_MIGRATIONS: 1, "LEDGER_*": 9 },
   "cloud-run/postgres-community-graph-benchmark.check.mjs": { "LEDGER_*": 1 },
   "cloud-run/postgres-community-graph-readback-diagnostic.check.mjs": { "LEDGER_*": 1 },
+  // The maintenance job's LEDGER_SCHEMA refusal (C-MAINT).
+  "cloud-run/postgres-maintenance-job.check.mjs": { "LEDGER_*": 1 },
   "cloud-run/postgres-production-configuration.check.mjs": { "LEDGER_*": 6 },
   "cloud-run/postgres-production-migrations.check.mjs": {
     "LEDGER_*": 4, "CLOUD_RUN_IAM_TEST_TARGET.postgres.ledger": 1,
@@ -231,7 +235,8 @@ export async function scanTree(root = WORKER_ROOT, paths = undefined) {
  *   query: CR B2's gate must call the reader;
  * - outside the dispatch, only the reviewed migrators and Jobs below name the
  *   history table, each for its own run receipt; a new module that names it
- *   fails until it is reviewed here.
+ *   fails until it is reviewed here;
+ * - the one exception is RECEIPT_READER_EXCEPTIONS (owner decision OWN-19).
  * The extraction updates this guard in the same change.
  */
 export const STORAGE_RECEIPT_READER = Object.freeze({
@@ -251,6 +256,27 @@ export const MIGRATION_HISTORY_MODULES = Object.freeze([
   "cloud-run/postgres-runtime-grants.mjs",
   "cloud-run/test-activation.mjs",
 ]);
+
+/**
+ * OWN-19 (owner, round 8, 2026-10-02): "pinned exception until CR phase B".
+ * C-MAINT's lifecycle pass checks the migration receipt itself, inside its
+ * own transaction (assertReceipt), so the check and the pass's work share
+ * one snapshot. It is the ONE named exception to the single-reader rule,
+ * counted at its exact history references and declaring no readSchemaReceipt.
+ * D-CRB (CR phase B) consolidates it and readSchemaReceipt into one shared
+ * reader and removes this entry; until then a third reader still fails, and
+ * the map may only shrink (an entry that stops naming the table fails until
+ * it is removed).
+ */
+export const RECEIPT_READER_EXCEPTIONS = Object.freeze({
+  "src/postgres-lifecycle-pass.ts": Object.freeze({
+    decision: "OWN-19",
+    until: "CR phase B (D-CRB)",
+    // MIGRATION_HISTORY_TABLE's declaration (its name and the table
+    // literal), the to_regclass probe and the one history query.
+    historyReferences: 4,
+  }),
+});
 
 const RECEIPT_SCOPE = /^(?:src\/.+\.ts|cloud-run\/.+\.(?:[cm]?js|ts))$/u;
 const HISTORY_TABLE = /_tibotattle_migration_history|\bMIGRATION_HISTORY_TABLE\b|\bmigrationHistoryTable\b/gu;
@@ -273,12 +299,21 @@ export function scanReceiptText(_path, text) {
 
 /** Every second copy of the storage receipt policy, as content-free messages. */
 export function receiptReaderViolations(scanned, reader = STORAGE_RECEIPT_READER,
-  modules = MIGRATION_HISTORY_MODULES) {
+  modules = MIGRATION_HISTORY_MODULES, exceptions = RECEIPT_READER_EXCEPTIONS) {
   const problems = [];
   for (const [file, counts] of Object.entries(scanned).sort(([left], [right]) => left.localeCompare(right))) {
     if (file === reader.file) continue;
     if ((counts.declarations ?? 0) > 0) {
       problems.push(`${file}: declares readSchemaReceipt; import the one reader`);
+    }
+    const exception = Object.hasOwn(exceptions, file) ? exceptions[file] : undefined;
+    if (exception !== undefined) {
+      const found = counts.history ?? 0;
+      if (found > exception.historyReferences) {
+        problems.push(`${file}: ${found} history references (${exception.decision} exception pinned ${
+          exception.historyReferences})`);
+      }
+      continue;
     }
     if ((counts.history ?? 0) > 0 && file.startsWith("src/")) {
       problems.push(`${file}: reads the migration history; extract the one reader into src instead`);
@@ -296,6 +331,13 @@ export function receiptReaderViolations(scanned, reader = STORAGE_RECEIPT_READER
   for (const file of modules) {
     if ((scanned[file]?.history ?? 0) === 0) {
       problems.push(`${file}: listed as a history reader but names no history table; remove it`);
+    }
+  }
+  for (const [file, exception] of Object.entries(exceptions)) {
+    const found = scanned[file]?.history ?? 0;
+    if (found < exception.historyReferences) {
+      problems.push(`${file}: ${exception.decision} exception pinned at ${exception.historyReferences} history ${
+        ""}references but found ${found}; shrink or remove it`);
     }
   }
   return problems;
@@ -450,6 +492,8 @@ if (process.argv.includes("--print")) {
     const current = Object.fromEntries([
       [reader, { history: STORAGE_RECEIPT_READER.historyReferences, declarations: 1 }],
       ...MIGRATION_HISTORY_MODULES.map((file) => [file, { history: 1 }]),
+      ...Object.entries(RECEIPT_READER_EXCEPTIONS).map(([file, { historyReferences }]) =>
+        [file, { history: historyReferences }]),
     ]);
     assert.deepEqual(receiptReaderViolations(current), []);
     // RD-2 re-implementing the reader in src.
@@ -481,6 +525,46 @@ if (process.argv.includes("--print")) {
     const { [listed]: _dropped, ...shrunk } = current;
     assert.deepEqual(receiptReaderViolations(shrunk),
       [`${listed}: listed as a history reader but names no history table; remove it`]);
+  });
+
+  test("OWN-19: the lifecycle pass is the one named, counted exception and a third reader still fails", async () => {
+    // Exactly one exception, named for the owner decision, until CR phase B.
+    assert.deepEqual(Object.keys(RECEIPT_READER_EXCEPTIONS), ["src/postgres-lifecycle-pass.ts"]);
+    const [[file, exception]] = Object.entries(RECEIPT_READER_EXCEPTIONS);
+    assert.equal(exception.decision, "OWN-19");
+    assert.equal(inReceiptScope(file), true);
+    // The pinned count is the module's real count.
+    const own = scanReceiptText(file, await readFile(join(WORKER_ROOT, file), "utf8"));
+    assert.deepEqual(own, { history: exception.historyReferences });
+    const reader = STORAGE_RECEIPT_READER.file;
+    const current = Object.fromEntries([
+      [reader, { history: STORAGE_RECEIPT_READER.historyReferences, declarations: 1 }],
+      ...MIGRATION_HISTORY_MODULES.map((path) => [path, { history: 1 }]),
+      [file, { history: exception.historyReferences }],
+    ]);
+    assert.deepEqual(receiptReaderViolations(current), []);
+    // Without the exception the pass is a second reader, as it was before OWN-19.
+    assert.deepEqual(receiptReaderViolations(current, STORAGE_RECEIPT_READER, MIGRATION_HISTORY_MODULES, {}),
+      [`${file}: reads the migration history; extract the one reader into src instead`]);
+    // A third reader still fails, in src or in cloud-run, with the exception in place.
+    const third = "src/postgres-readiness.ts";
+    assert.deepEqual(receiptReaderViolations({ ...current, [third]: { history: 1 } }),
+      [`${third}: reads the migration history; extract the one reader into src instead`]);
+    const host = "cloud-run/postgres-production-host.mjs";
+    assert.deepEqual(receiptReaderViolations({ ...current, [host]: { history: 1 } }),
+      [`${host}: names the migration history outside the reviewed readers`]);
+    // The exception is counted: it may not grow, may not declare
+    // readSchemaReceipt, and must shrink or go when its references do.
+    assert.deepEqual(receiptReaderViolations({ ...current, [file]: { history: exception.historyReferences + 1 } }),
+      [`${file}: ${exception.historyReferences + 1} history references (OWN-19 exception pinned ${
+        exception.historyReferences})`]);
+    assert.deepEqual(receiptReaderViolations({ ...current,
+      [file]: { history: exception.historyReferences, declarations: 1 } }),
+    [`${file}: declares readSchemaReceipt; import the one reader`]);
+    const { [file]: _gone, ...consolidated } = current;
+    assert.deepEqual(receiptReaderViolations(consolidated),
+      [`${file}: OWN-19 exception pinned at ${exception.historyReferences} history references but found 0; ${
+        ""}shrink or remove it`]);
   });
 
   test("the receipt guard covers product modules under src and cloud-run only", async () => {
