@@ -245,9 +245,13 @@ drafted for the privacy disclosure). On-demand backups are taken only through th
 tool. Sealed Cloudflare exports and frozen copies are kept 90 days, then
 deleted.
 
-The procedure below is a design, not a rehearsed runbook. Restore tooling and
-its rehearsal are `not built` (OPS-7, E-OPS7). Until the rehearsal exists, treat
-a restore as an owner-led operation with Claude preparing the plan.
+The procedure below is a design, not a rehearsed runbook. The staging
+rehearsal tool is `built` (E-OPS7,
+`apps/worker/scripts/gcp-backup-restore-rehearsal.mjs`, run as in
+[the staging runbook](./gcp-staging-apply.md#backup-restore-rehearsal-e-ops7)),
+but it has not run against a live instance, and restore tooling for a real
+recovery (OPS-7) is `not built`. Treat a restore as an owner-led operation with
+Claude preparing the plan.
 
 1. Brake if writes are unsafe, and pause the triggers.
 2. Restore into a **new** instance, from a backup or by point-in-time recovery.
@@ -296,7 +300,7 @@ accepted contributions. See
 |---|---|
 | Thresholds that justify the brake, the observation period, escalation and notification | Owner decisions, not recorded |
 | Monitoring, alerting and the origin-lock check | `not built` (E-OPS5) |
-| Restore tooling and its rehearsal | `not built` (OPS-7, E-OPS7) |
+| Restore tooling and its rehearsal | Staging rehearsal tool `built`, never run live (E-OPS7). Its do-not-restore step has no list until OA-9, so it never reports that uploads may reopen. Real-recovery tooling `not built` (OPS-7) |
 | Operator controls for collection containment at the origin | Route modules `built` (C-ADMIN; `set_collection_controls` works over the API), registration in the host `not built` (D-CRB), console blocked while the overview answers 503 (E-ADMIN); a Google Cloud operator wrapper is `not built` |
 | Scheduler pause-all and resume-all | `not built` (D-OPS3) |
 | Custody of the do-not-restore list and the erasure intake channel | Open (OA-9), decided after the cutover |

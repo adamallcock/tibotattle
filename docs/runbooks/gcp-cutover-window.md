@@ -672,6 +672,7 @@ the line after `95c158ba`.
 | Barrier proof producer, edge live capture producer | H.2, rollout | No command writes either file |
 | R2 to Cloud Storage copy | After | `not built` (PT-7) |
 | Observation duration and brake thresholds | H.7 | Owner decision, not recorded |
+| Backup-restore rehearsal | Preconditions (Backups) | Staging tool `built`, never run live (E-OPS7). Its do-not-restore step is injected with no list, because custody is OA-9 (decided after cutover). So the Backups precondition, which needs the list reapplied before uploads reopen, cannot clear before cutover as written. Owner decision needed |
 
 ## Evidence boundary
 

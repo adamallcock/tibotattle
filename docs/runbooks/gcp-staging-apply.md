@@ -24,8 +24,8 @@ pinning their versions, the bucket birth and its proof, committing the
 pins and the receipt, the owner's confirmation of the project-wide custom
 role, the first OPS-2 apply, and readback. It then lists the gated tail (the
 bootstrap image, the jobs, the service, migrate and roll) with the gate that
-holds each one. A gated step is not part of the approved work until its gate
-is cleared.
+holds each one, and the backup-restore rehearsal. A gated step is not part of
+the approved work until its gate is cleared.
 
 What the tooling guarantees, from code and offline checks
 (`npm --prefix apps/worker run gcp:ops:infra:check`):
@@ -351,9 +351,148 @@ at STG-PREP's base; take exact flags from the line you run.
 | Migrate: `node scripts/gcp-production-rollout.mjs migrate --environment=staging --commit=<commit> --digest=<digest> --backup-audit=<file> --migrate-receipt=<new file> --authorize=migrate:staging:<digest> --execute` | A clean readback (needs the service, so D-CRB, and the verifier grant), the staging lock as for the bootstrap image (the dry run's `lockRef` is `refs/heads/codex/staging-deployment-lock`), and quiescence: OPS-10 counts every Cloud Run job trigger in `us-east1`, so a running test-estate trigger refuses it |
 | Roll: `gcp-production-rollout.mjs roll ... --edge-live=<capture>` | A migrate receipt and a fresh `tibotattle-edge-live-capture-v1` capture of the tracked `env.staging` Worker. No repository command writes that capture yet, and the tracked staging Worker is the old workers.dev one, not the planned staging edge |
 
+## Backup-restore rehearsal (E-OPS7)
+
+`scripts/gcp-backup-restore-rehearsal.mjs` restores the staging primary
+`tibotattle-staging-primary` into ONE new scratch instance, verifies the copy
+and deletes the scratch. It is built and checked offline only (fake gcloud,
+fake database); nothing here has run against a live instance. The first live
+run is its qualification.
+
+**Authorization.** The rehearsal creates and then deletes
+`tibotattle-staging-primary-rehearsal-<id>` (`...-<id>b` for the backup path).
+The owner's staging approval covers new staging-named resources, but deleting
+one is a separate decision ([below](#if-something-must-be-undone)). Before
+`--apply`, ask the owner to approve the create-and-delete of that one scratch
+instance, naming the path and the recovery point.
+
+**What it does.** Two paths:
+
+- `--path=pitr`: `gcloud sql instances clone` at `--point-in-time`, then a
+  label patch (`tibotattle-purpose=restore-rehearsal`,
+  `tibotattle-rehearsal=<id>`).
+- `--path=backup`: `gcloud sql instances create` (the plane's posture, no
+  deletion protection, no automated backups, labelled), then
+  `gcloud sql backups restore <id> --restore-instance=<scratch>
+  --backup-instance=tibotattle-staging-primary`.
+
+It then waits for `RUNNABLE` and opens read-only sessions on the scratch and
+the source (`BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`, in sessions that
+default to read-only). It compares:
+
+- the migration history;
+- the schema shape (columns, indexes, constraints, functions);
+- every table's exact row count;
+- a keyed digest of the first and last N rows of every table, by primary key,
+  or by row text when a table has none.
+
+The digest key is random per run and never printed, so the receipt says only
+`equal` or `differs`. The source is read before and after; if it moved, the
+verdict is `inconclusive`.
+
+Teardown always runs once the scratch may exist. It patches the scratch to no
+deletion protection, no final backup and no retain-on-delete, and reads that
+back. If any of the three is still on, it refuses to delete, because a final
+backup would keep a restorable copy. Otherwise it deletes the scratch and
+checks that no instance or backup of it is left.
+
+The source is only read. The gcloud guard allows a closed set of command
+shapes; every mutation names the scratch as its target, and the source appears
+only as the clone source or the backup's instance.
+
+**The do-not-restore step.** The reapply step is an injected interface with no
+default list, because custody of the list is open (OA-9, decided after
+cutover). The CLI injects none, so every CLI receipt reads
+`"uploadsMayReopen": false` with `DO_NOT_RESTORE_STEP_NOT_PROVIDED` in
+`uploadsBlockedBy`. That is the expected result, not a failure. A receipt reads
+`true` only when the verification passed, the history equals this checkout's
+manifest, and an injected step returned an exact `done` result.
+
+**Preconditions.**
+
+- The gate passes: `npm run gcp:ops:infra:check`.
+- The staging database holds the migrated schema `tibotattle_staging` with its
+  `_tibotattle_migration_history`. If it does not, preflight refuses with
+  `RESTORE_REHEARSAL_SCHEMA_ABSENT` or `RESTORE_REHEARSAL_SOURCE_HISTORY_ABSENT`
+  before creating anything.
+- The operator can mint tokens for `tibotattle-staging-migrator`
+  (`roles/iam.serviceAccountTokenCreator` on that account). The desired state
+  grants that role on the verifier account only. Check it with a read
+  (`gcloud iam service-accounts get-iam-policy`). If the grant is missing, ask
+  the owner: adding it is an IAM change outside the committed desired state.
+- Nothing writes to staging during the run (the scheduler trigger paused,
+  admission closed). Choose a point in time after the last write, or the copy
+  will legitimately differ.
+
+**Commands** (from `apps/worker`; `SCRATCH` is the session scratchpad):
+
+```bash
+node scripts/gcp-backup-restore-rehearsal.mjs rehearse --environment=staging \
+  --path=pitr --point-in-time=<RFC 3339 UTC, at least 1 minute ago, within 7 days>
+```
+
+The dry run makes no call. It prints the exact calls, the `scratch` name and
+the `authorization`, and `"rehearsalIdGenerated": true` when it chose the id.
+Rerun it with `--rehearsal-id=<that id>` and the same flags, check that the
+authorization is unchanged, then apply:
+
+```bash
+node scripts/gcp-backup-restore-rehearsal.mjs rehearse --environment=staging \
+  --path=pitr --point-in-time=<same> --rehearsal-id=<id> --apply \
+  --authorize=<the dry run's authorization> \
+  --receipt-out="$SCRATCH/restore-rehearsal-<id>.json"; echo "exit=$?"
+```
+
+For the backup path, take a backup run id from
+`gcloud sql backups list --instance=tibotattle-staging-primary --project=tibotattle --format=json`
+(read-only), and pass `--path=backup --backup-id=<id>` in place of the point
+in time.
+
+| Exit | Meaning |
+|---|---|
+| 0 | Verified, at the image tail, the injected step done, scratch deleted. The CLI cannot reach it until OA-9 |
+| 2 | Verified and scratch deleted; uploads may not reopen (`uploadsBlockedBy`). Expected: `DO_NOT_RESTORE_STEP_NOT_PROVIDED`, plus `RESTORE_MIGRATION_BEHIND` if staging is behind this checkout |
+| 3 | Verification `failed` or `inconclusive`; scratch deleted. Read `verification.tables` and `verification.sourceStable` |
+| 1 | Refused or failed. Read `code`, and `receipt.teardown` when present |
+
+Keep the receipt; it is content-free (names, counts, timings, booleans). The
+timings are `cloneMs` (or `createMs` and `restoreBackupMs`), `readyMs` (first
+mutation to a database session on the scratch), `verifyMs`, `teardownMs` and
+`totalMs`.
+
+**Stop conditions.**
+
+- `RESTORE_REHEARSAL_SCRATCH_EXISTS`: that scratch name is taken. Pick a new
+  id; never reuse or adopt an instance.
+- Exit 1 with `receipt.teardown.scratchDeleted: false`: the scratch still
+  exists. `RESTORE_REHEARSAL_TEARDOWN_SETTINGS_UNSAFE` means its deletion
+  protection or final backup did not turn off, so the tool did not delete it.
+  Never delete it by hand with a final backup. Run the cleanup dry run, then
+  the cleanup with its authorization:
+
+  ```bash
+  node scripts/gcp-backup-restore-rehearsal.mjs cleanup --environment=staging --path=pitr --rehearsal-id=<id>
+  node scripts/gcp-backup-restore-rehearsal.mjs cleanup --environment=staging --path=pitr --rehearsal-id=<id> \
+    --apply --authorize=restore-rehearsal-cleanup:staging:tibotattle-staging-primary-rehearsal-<id>
+  ```
+
+  Cleanup deletes only an instance labelled for that rehearsal id; otherwise it
+  refuses with `RESTORE_REHEARSAL_SCRATCH_NOT_OWNED`. If it still refuses,
+  stop and ask the owner.
+- `RESTORE_REHEARSAL_SCRATCH_BACKUP_REMAINS`: a backup of the deleted scratch
+  is listed. The tool never deletes backups; ask the owner.
+- `teardown.finalBackups: "unavailable"`: the backup listing could not be
+  read. Check it by hand, read-only, before calling the run clean.
+
+Production is refused. `--environment=production` needs `--production` and a
+filled production desired state (OWN-5), and even then it only prints a
+`plan_only` document with no authorization. The production dress rehearsal is
+a separate, owner-authorized step.
+
 ## If something must be undone
 
-The tooling never deletes. Removing a staging resource is a separate,
+The plane tooling never deletes, except that the restore rehearsal deletes the
+scratch instance it created (and nothing else). Removing a staging resource is a separate,
 explicit decision: list exact targets, check they are staging-named and
 were made by this run, and ask the owner first. Cloud SQL has deletion
 protection on. A secret version is never destroyed to "retry"; a rerun adds
