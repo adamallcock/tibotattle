@@ -433,14 +433,29 @@ test("Secret Manager containers are exactly CR-3's secret names, never an edge-o
     assert.throws(() => manifest.validateDesiredState(committed("staging", (value) => { delete value.secrets[name]; })),
       { code: `SECRET_CONTAINER_MISSING:${name}` }, name);
   }
-  // Only those two: no other CR-3 secret is optional in production.
-  for (const name of ["IDENTITY_LINK_SECRET", "POSTGRES_RATE_LIMIT_SECRET", "ENVELOPE_PUBLIC_JWK", "ENVELOPE_PRIVATE_JWK",
-    "DISTRIBUTION_GITHUB_API_TOKEN"]) {
-    assert.equal(manifest.RETIRED_PRODUCTION_SECRET_NAMES.includes(name), false, name);
+  // Production may also leave out the optional GitHub token, which nothing on
+  // the production estate reads: the service renders exactly as with its
+  // version unpinned (the entry omitted), and nothing waits. Staging may not.
+  assert.deepEqual([...manifest.UNREAD_PRODUCTION_SECRET_NAMES], ["DISTRIBUTION_GITHUB_API_TOKEN"]);
+  assert.deepEqual([...manifest.PRODUCTION_OMITTABLE_SECRET_NAMES],
+    [...manifest.RETIRED_PRODUCTION_SECRET_NAMES, ...manifest.UNREAD_PRODUCTION_SECRET_NAMES]);
+  assert.equal(desired.secrets.DISTRIBUTION_GITHUB_API_TOKEN.version, null);
+  for (const name of manifest.UNREAD_PRODUCTION_SECRET_NAMES) {
+    assert.equal(configuration.OPTIONAL_SECRET_NAMES.includes(name), true, `${name} is optional in CR-3`);
+    const omitted = manifest.validateDesiredState(fixture((value) => { delete value.secrets[name]; }));
+    assert.equal(Object.hasOwn(omitted.secrets, name), false, name);
+    assert.equal(manifest.serviceRenderBlocker(omitted), null, name);
+    const rendered = manifest.renderService(omitted, IMAGE);
+    assert.equal(rendered.spec.template.spec.containers[0].env.some((entry) => entry.name === name), false, name);
+    assert.deepEqual(rendered, manifest.renderService(desired, IMAGE), name);
+    assert.throws(() => manifest.validateDesiredState(committed("staging", (value) => { delete value.secrets[name]; })),
+      { code: `SECRET_CONTAINER_MISSING:${name}` }, name);
+  }
+  // Only those three: no other CR-3 secret may be left out in production.
+  for (const name of ["IDENTITY_LINK_SECRET", "POSTGRES_RATE_LIMIT_SECRET", "ENVELOPE_PUBLIC_JWK", "ENVELOPE_PRIVATE_JWK"]) {
+    assert.equal(manifest.PRODUCTION_OMITTABLE_SECRET_NAMES.includes(name), false, name);
   }
   assert.equal(manifest.serviceRenderBlocker(desired), null);
-  refused((value) => { delete value.secrets.DISTRIBUTION_GITHUB_API_TOKEN; },
-    "SECRET_CONTAINER_MISSING:DISTRIBUTION_GITHUB_API_TOKEN");
   for (const name of [...configuration.EDGE_ONLY_SECRET_NAMES, "EDGE_PROOF_SECRET", "EDGE_PROOF_SHA256",
     "SPARKLE_SIGNING_KEY"]) {
     refused((value) => { value.secrets[name] = { version: "1" }; }, `SECRET_EDGE_ONLY_FORBIDDEN:${name}`);
@@ -1008,9 +1023,10 @@ test("the committed production desired state: OWN-5 filled by PROD-PREP, and ref
   assert.deepEqual([raw.project, raw.projectNumber, raw.region, raw.bucket.location],
     ["tibotattle-prod", "874229235044", "us-east1", "US-EAST1"]);
   assert.deepEqual(raw.serviceAccounts.verifier.tokenCreators, ["user:adamallcock@gmail.com"]);
-  // Round 12 retired Google and Apple sign-in: production never names their secrets.
+  // Round 12 retired Google and Apple sign-in, and nothing on the production
+  // estate reads the GitHub token: production never names those secrets.
   assert.deepEqual(Object.keys(raw.secrets), ["IDENTITY_LINK_SECRET", "POSTGRES_RATE_LIMIT_SECRET",
-    "ENVELOPE_PUBLIC_JWK", "ENVELOPE_PRIVATE_JWK", "DISTRIBUTION_GITHUB_API_TOKEN"]);
+    "ENVELOPE_PUBLIC_JWK", "ENVELOPE_PRIVATE_JWK"]);
   for (const name of Object.keys(raw.secrets)) assert.equal(raw.secrets[name].secretName, name, name);
   // The proposed full-recompute cadence: daily, created and kept PAUSED until OPS-3.
   assert.deepEqual(raw.scheduler["analytics-refresh"], {
@@ -1195,8 +1211,8 @@ test("committed files close each secret id to its plane's form, so a pasted valu
     assert.equal(secretName.pattern, `^(?:${name}|${manifest.PLANE_SECRET_ID.source.slice(1, -1)})$`, name);
     assert.equal(secretName.maxLength, 255, name);
     const pattern = new RegExp(secretName.pattern, "u");
-    // Production leaves out the secrets round 12 retired.
-    if (manifest.RETIRED_PRODUCTION_SECRET_NAMES.includes(name)) assert.equal(Object.hasOwn(production.secrets, name), false, name);
+    // Production leaves out the secrets round 12 retired and the unread GitHub token.
+    if (manifest.PRODUCTION_OMITTABLE_SECRET_NAMES.includes(name)) assert.equal(Object.hasOwn(production.secrets, name), false, name);
     else assert.equal(production.secrets[name].secretName, name, name);
     assert.equal(manifest.STAGING_SECRET_ID.test(staging.secrets[name].secretName), true, name);
     assert.equal(pattern.test(staging.secrets[name].secretName), true, name);
@@ -1249,14 +1265,21 @@ test("the committed JSON Schema has exactly the validator's closed key sets", ()
   }
   closed(schema.properties.customRole, shape.customRole, "customRole");
   assert.equal(schema.properties.customRole.properties.id.const, manifest.QUARANTINE_STORE_ROLE_ID);
-  // Every CR-3 name is a property; production may leave out the retired ones,
-  // so only the others are required (the validator holds staging to all).
+  // Every CR-3 name is a property; production may leave out the retired and
+  // unread ones, so only the others are required at the top, and the root's
+  // one conditional holds staging to all of them, as the validator does.
   const secretNames = [...configuration.REQUIRED_SECRET_NAMES, ...configuration.OPTIONAL_SECRET_NAMES];
   assert.equal(schema.properties.secrets.type, "object");
   assert.equal(schema.properties.secrets.additionalProperties, false);
   assert.deepEqual(Object.keys(schema.properties.secrets.properties), secretNames);
   assert.deepEqual(schema.properties.secrets.required,
-    secretNames.filter((name) => !manifest.RETIRED_PRODUCTION_SECRET_NAMES.includes(name)));
+    secretNames.filter((name) => !manifest.PRODUCTION_OMITTABLE_SECRET_NAMES.includes(name)));
+  assert.equal(schema.allOf.length, 1);
+  const [stagingSecrets] = schema.allOf;
+  assert.deepEqual(stagingSecrets.if, { required: ["environment"], properties: { environment: { const: "staging" } } });
+  assert.deepEqual(stagingSecrets.then, { properties: { secrets: { required: [...manifest.PRODUCTION_OMITTABLE_SECRET_NAMES] } } });
+  assert.deepEqual([...schema.properties.secrets.required, ...stagingSecrets.then.properties.secrets.required].sort(),
+    [...secretNames].sort());
   for (const secret of Object.values(schema.properties.secrets.properties)) closed(secret, shape.secret, "secret");
   closed(schema.properties.cloudSql, shape.cloudSql, "cloudSql");
   closed(schema.properties.bucket, shape.bucket, "bucket");

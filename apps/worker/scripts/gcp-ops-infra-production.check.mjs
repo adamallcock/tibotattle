@@ -19,7 +19,9 @@ process.env.PATH = "/nonexistent-gcloud-guard";
 const IMAGE = Object.freeze({ imageDigest: "c".repeat(64), sourceCommit: "d".repeat(40) });
 const PROOF = Object.freeze({ bucketGeneration: "1790000000000001", bucketMetageneration: "1" });
 const KEPT_SECRETS = Object.freeze(["IDENTITY_LINK_SECRET", "POSTGRES_RATE_LIMIT_SECRET", "ENVELOPE_PUBLIC_JWK",
-  "ENVELOPE_PRIVATE_JWK", "DISTRIBUTION_GITHUB_API_TOKEN"]);
+  "ENVELOPE_PRIVATE_JWK"]);
+// Round 12 retired the Google and Apple secrets; nothing on the production estate reads the GitHub token.
+const LEFT_OUT = /GOOGLE_OIDC_CLIENT_SECRET|APPLE_PRIVATE_KEY|DISTRIBUTION_GITHUB_API_TOKEN/u;
 
 /** The committed production file before the pins, then with the pins the main session makes. */
 function production(pin = () => {}) {
@@ -32,7 +34,7 @@ const deferred = (plan) => plan.operations.filter((entry) => entry.deferred !== 
   .map((entry) => `${entry.id}:${entry.deferred}`);
 const executable = (plan) => plan.operations.filter((entry) => entry.deferred === undefined).map((entry) => entry.id);
 
-test("the production apply rehearsal (in memory): birth, pass 1, pins and pass 2 converge with no retired secret", () => {
+test("the production apply rehearsal (in memory): birth, pass 1, pins and pass 2 converge with no left-out secret", () => {
   let desired = production();
   assert.deepEqual([desired.project, desired.projectNumber, desired.region, desired.projectTenancy],
     ["tibotattle-prod", "874229235044", "us-east1", "dedicated"]);
@@ -58,10 +60,10 @@ test("the production apply rehearsal (in memory): birth, pass 1, pins and pass 2
   assert.deepEqual([first.summary.refused, first.findings, first.blockers], [0, [], []]);
   const ids = executable(first);
   // Six accounts, the verifier grant, the custom role, six project bindings,
-  // the repository and its writer binding, five secrets and their accessor
+  // the repository and its writer binding, four secrets and their accessor
   // bindings, Cloud SQL with its database and two IAM users, the logging
   // exclusion, and the trigger created and paused at once.
-  assert.equal(ids.length, 33, ids.join("\n"));
+  assert.equal(ids.length, 31, ids.join("\n"));
   for (const id of ["custom-role:create", "artifact-registry:create", "cloud-sql:create", "cloud-sql-database:create",
     "cloud-sql-user:create:runtime", "cloud-sql-user:create:migrator", "logging-exclusion:create",
     "scheduler:create:analytics-refresh", "scheduler:pause:analytics-refresh",
@@ -79,8 +81,9 @@ test("the production apply rehearsal (in memory): birth, pass 1, pins and pass 2
     "run-job-iam:analytics-refresh:bind:roles/run.jobsExecutor|serviceAccount:tibotattle-scheduler@tibotattle-prod.iam.gserviceaccount.com|:BOOTSTRAP_IMAGE_REQUIRED",
   ]);
   const argv = first.operations.map((entry) => entry.argv.join(" ")).join("\n");
-  // Round 12: nothing names the retired Google and Apple secrets.
-  assert.doesNotMatch(argv, /GOOGLE_OIDC_CLIENT_SECRET|APPLE_PRIVATE_KEY|staging|tibotattle-test/u);
+  // Nothing names a left-out secret, a staging resource or a test resource.
+  assert.doesNotMatch(argv, LEFT_OUT);
+  assert.doesNotMatch(argv, /staging|tibotattle-test/u);
   // Cloud SQL IAM users go by their PostgreSQL names, never the full email (73b38784).
   const users = first.operations.filter((entry) => entry.id.startsWith("cloud-sql-user:create:"));
   assert.deepEqual(users.map((entry) => entry.argv[3]),
@@ -125,6 +128,7 @@ test("the production apply rehearsal (in memory): birth, pass 1, pins and pass 2
   assert.ok(mutations.length > 0);
   for (const call of mutations) {
     assert.ok(call.includes("--project=tibotattle-prod") || call.includes("tibotattle-prod"), call.join(" "));
-    assert.doesNotMatch(call.join(" "), /GOOGLE_OIDC_CLIENT_SECRET|APPLE_PRIVATE_KEY|tibotattle-test|staging/u);
+    assert.doesNotMatch(call.join(" "), LEFT_OUT);
+    assert.doesNotMatch(call.join(" "), /tibotattle-test|staging/u);
   }
 });

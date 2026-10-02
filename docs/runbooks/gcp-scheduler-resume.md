@@ -229,7 +229,7 @@ periodically and it notifies no one.
 |---|---|
 | OPS-3 `pause-all` and `resume-all`, ordered, with explicit authorization | `not built` (D-OPS3). Requirement: `resume-all` resumes only triggers in this plane's committed desired state with state `ENABLED` that were live `ENABLED` before the pause, never the roll receipt's `pausedTriggers` and never another estate's triggers |
 | The maintenance job and its trigger in the desired state, with a cadence | `not built` (D-OPS4) |
-| The refresh cadence | Production carries PROD-PREP's proposal, `15 2 * * *` UTC (one full-recompute run a day, about 50 min against a 14,400 s timeout), committed `PAUSED`; open for the owner to confirm. Staging has none. No default |
+| The refresh cadence | Production carries PROD-PREP's proposal, `15 2 * * *` UTC (one full-recompute run a day, about 50 min against a 14,400 s timeout), committed `PAUSED`. The owner confirms it before the production pass-1 apply, or it goes back to `null` (`docs/runbooks/gcp-production-apply.md`). Staging has none. No default |
 | Confirmation that a pause updates `userUpdateTime` | Open (OPS2-READ). Pause a staging trigger and read it back before the 6 hour threshold is relied on |
 | Periodic probe runner and notification target; alert on a refresh that exits 0 as `LOCK_HELD` or has no completed run | `not built` (E-OPS5) |
 | Owner confirmation of the 6 hour threshold | Open |

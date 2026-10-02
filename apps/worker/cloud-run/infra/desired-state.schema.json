@@ -23,6 +23,32 @@
     "scheduler",
     "stagingOrigin"
   ],
+  "allOf": [
+    {
+      "description": "Staging names every CR-3 secret: only production may leave out PRODUCTION_OMITTABLE_SECRET_NAMES.",
+      "if": {
+        "required": [
+          "environment"
+        ],
+        "properties": {
+          "environment": {
+            "const": "staging"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "secrets": {
+            "required": [
+              "GOOGLE_OIDC_CLIENT_SECRET",
+              "APPLE_PRIVATE_KEY",
+              "DISTRIBUTION_GITHUB_API_TOKEN"
+            ]
+          }
+        }
+      }
+    }
+  ],
   "properties": {
     "schemaVersion": {
       "const": "tibotattle-gcp-ops-infra-desired-state-v2"
@@ -269,13 +295,12 @@
     "secrets": {
       "type": "object",
       "additionalProperties": false,
-      "description": "CR-3's secret names. Production may leave out GOOGLE_OIDC_CLIENT_SECRET and APPLE_PRIVATE_KEY (round 12 retired Google and Apple sign-in; RETIRED_PRODUCTION_SECRET_NAMES), and the committed production file does; staging must name all seven until ROUTES-R12 narrows CR-3.",
+      "description": "CR-3's secret names. Production may leave out GOOGLE_OIDC_CLIENT_SECRET and APPLE_PRIVATE_KEY (round 12 retired Google and Apple sign-in; RETIRED_PRODUCTION_SECRET_NAMES) and DISTRIBUTION_GITHUB_API_TOKEN (nothing on the production estate reads it; UNREAD_PRODUCTION_SECRET_NAMES), and the committed production file does; staging must name all seven until ROUTES-R12 narrows CR-3 (the root allOf).",
       "required": [
         "IDENTITY_LINK_SECRET",
         "POSTGRES_RATE_LIMIT_SECRET",
         "ENVELOPE_PUBLIC_JWK",
-        "ENVELOPE_PRIVATE_JWK",
-        "DISTRIBUTION_GITHUB_API_TOKEN"
+        "ENVELOPE_PRIVATE_JWK"
       ],
       "properties": {
         "IDENTITY_LINK_SECRET": {

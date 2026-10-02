@@ -457,7 +457,8 @@ test("the CLI runs through a symlinked path, fails closed and finds no gcloud", 
 test("no OPS-2 module uses a shell, and the package runs exactly these checks", () => {
   for (const name of ["gcp-infra.mjs", "gcp-ops-infra-manifest.mjs", "gcp-ops-infra-operations.mjs",
     "gcp-ops-bucket-birth.mjs", "gcp-staging-desired-state.mjs", "gcp-staging-secrets.mjs", "gcp-staging-bucket-birth.mjs",
-    "gcp-scheduler-run-target.mjs", "gcp-ops-monitoring-policies.mjs", "gcp-monitoring.mjs"]) {
+    "gcp-scheduler-run-target.mjs", "gcp-ops-monitoring-policies.mjs", "gcp-monitoring.mjs",
+    "gcp-identity-link-pin-check.mjs"]) {
     const source = readFileSync(join(SCRIPTS_ROOT, name), "utf8");
     // A regular expression's .exec() is not a process call.
     assert.doesNotMatch(source, /\bexecSync\b|(?<![.\w])exec\(|\bexecFile|shell:\s*true|["'`](?:sh|bash|zsh)["'`]/u, name);
@@ -468,7 +469,7 @@ test("no OPS-2 module uses a shell, and the package runs exactly these checks", 
   for (const check of ["gcp-ops-infra-manifest.check.mjs", "gcp-ops-infra-operations.check.mjs",
     "gcp-ops-bucket-birth.check.mjs", "gcp-infra.check.mjs", "gcp-ops-infra-staging-service.check.mjs",
     "gcp-ops-infra-production.check.mjs", "gcp-staging-secrets.check.mjs", "gcp-staging-bucket-birth.check.mjs", "gcp-ops-monitoring-policies.check.mjs",
-    "gcp-monitoring.check.mjs"]) {
+    "gcp-monitoring.check.mjs", "gcp-identity-link-pin-check.check.mjs"]) {
     assert.ok(gate.includes(`./scripts/${check}`), check);
   }
   assert.doesNotMatch(gate, /gcloud|wrangler|--apply|apply /u);

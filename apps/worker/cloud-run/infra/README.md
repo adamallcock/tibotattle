@@ -9,8 +9,8 @@ a rollout reads.
 | File | Plane |
 |---|---|
 | `staging.desired-state.json` | Staging, in the shared GCP test project `tibotattle` (`projectTenancy: "shared"`), with new, staging-marked resources only. It is the synthetic plane for the staging load test (OPS-11), the staging edge's origin (OWN-7b) and migrate and roll drills. Production data and production secrets never enter it. |
-| `production.desired-state.json` | Production, in the dedicated project `tibotattle-prod` (number 874229235044, `us-east1`), filled by PROD-PREP under owner decisions round 13. The apply steps and their per-operation approvals are in `docs/runbooks/gcp-production-apply.md`. |
-| `desired-state.schema.json` | JSON Schema for editors and review. `scripts/gcp-ops-infra-manifest.mjs` `validateDesiredState` is authoritative. |
+| `production.desired-state.json` | Production, in the dedicated project `tibotattle-prod` (number 874229235044, `us-east1`), filled by PROD-PREP under owner decisions round 13. The apply steps, their approvals and the owner confirmations they wait for are in `docs/runbooks/gcp-production-apply.md`. |
+| `desired-state.schema.json` | JSON Schema for editors and review, including which secrets staging must name. `scripts/gcp-ops-infra-manifest.mjs` `validateDesiredState` is authoritative. |
 | `monitoring.md` | The runbook that the OPS-5 alert policies link to, one anchor per policy. The policies are derived from these desired states by `scripts/gcp-ops-monitoring-policies.mjs`. |
 
 The dress rehearsal (REH-1) runs on production data inside the production
@@ -39,6 +39,14 @@ production estate reads unclean until that instance is deleted.
   narrows CR-3. While CR-3 still requires a secret the file leaves out, the
   service is deferred (`SERVICE_RETIRED_SECRET_STILL_REQUIRED:<name>`); that
   clears itself when ROUTES-R12 drops the name.
+- Production may also leave out an optional CR-3 secret that nothing on the
+  production estate reads (`UNREAD_PRODUCTION_SECRET_NAMES`:
+  `DISTRIBUTION_GITHUB_API_TOKEN`), and the committed file does. The
+  origin's admin distribution view reads the stored GitHub snapshot and makes
+  no network request, the service's Worker env never carries the token, and
+  no production job syncs GitHub (D-OPS4 is not built). The service renders
+  without the entry. A future reader adds the container back with a
+  desired-state change.
 - Production never shares its project and never names a test-estate or
   staging resource. Staging names every plane resource with the `staging`
   token and never reuses a test-estate name.
@@ -66,9 +74,9 @@ created.
 | Setting | Committed value | Source |
 |---|---|---|
 | `project`, `projectNumber`, `region`, `bucket.location` | `tibotattle-prod`, `874229235044`, `us-east1`, `US-EAST1` | OWN-5 and round 13; the project number was read back by the main session |
-| `serviceAccounts.verifier.tokenCreators` | the owner's Google account | As staging (round 9); round 12 says the address is fine in tracked files |
-| `secrets` | the five CR-3 secrets the switch keeps, named by their variable names | Round 12 retired Google and Apple sign-in, so their two secrets are left out. `IDENTITY_LINK_SECRET` stays: the edge-admission replay keys its subjects with it, and the session ports, credential renew and the maintenance profile check the imported identity-link pin |
-| `scheduler.analytics-refresh.schedule` | `15 2 * * *` (UTC), state `PAUSED` | Claude's proposal for the full-recompute engine (about 50 min per dense run, 14,400 s timeout): one run a day, after the UTC day closes, done before the 07:00 backup; the advisory lock refuses an overlapping run. Open for the owner to confirm; the trigger stays paused until OPS-3 resumes it |
+| `serviceAccounts.verifier.tokenCreators` | the owner's Google account | Claude's proposal, mirroring staging. No owner decision names this grant for production: round 9 approved it on the staging verifier only, and round 12 covers the address in tracked files, not IAM. It is a new production grant that the owner confirms by name before the pass-1 apply (the runbook's owner confirmations) |
+| `secrets` | the four CR-3 secrets the production estate reads, named by their variable names | Round 12 retired Google and Apple sign-in, so their two secrets are left out, and nothing on the production estate reads `DISTRIBUTION_GITHUB_API_TOKEN`. `IDENTITY_LINK_SECRET` stays: the edge-admission replay keys its subjects with it, and the session ports, credential renew and the maintenance profile check the imported identity-link pin. `scripts/gcp-identity-link-pin-check.mjs` checks the version against that pin before PROD-3 |
+| `scheduler.analytics-refresh.schedule` | `15 2 * * *` (UTC), state `PAUSED` | Claude's proposal for the full-recompute engine (about 50 min per dense run, 14,400 s timeout): one run a day, after the UTC day closes, done before the 07:00 backup; the advisory lock refuses an overlapping run. D3 and MEAS-3 say the owner supplies the cadence, so the owner confirms it before the pass-1 apply, or it goes back to `null` and the trigger waits for a later apply. The trigger stays paused until OPS-3 resumes it |
 
 `service.telemetryStorageNamespace` stays `null`. Continuity requires the
 production Worker's own `TELEMETRY_STORAGE_NAMESPACE` (legacy and v1.1

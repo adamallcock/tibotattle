@@ -183,6 +183,25 @@ export const SERVICE_TEMPLATE_UNAVAILABLE = Object.freeze({});
  */
 export const RETIRED_PRODUCTION_SECRET_NAMES = Object.freeze(["GOOGLE_OIDC_CLIENT_SECRET", "APPLE_PRIVATE_KEY"]);
 
+/**
+ * CR-3 optional secrets that nothing on the production estate reads, so a
+ * production desired state may leave them out, and the committed file does.
+ * DISTRIBUTION_GITHUB_API_TOKEN: the origin's admin distribution view reads
+ * the stored GitHub snapshot through a fetcher that refuses every request
+ * (src/postgres-admin-distribution.ts), the service's Worker env never
+ * carries the token (cloud-run/server.mjs), and no production job syncs
+ * GitHub (D-OPS4 is not built). Leaving the container out keeps the
+ * credential out of one more store. The service renders without the entry,
+ * as for an unpinned optional version. A later reader adds the container
+ * back with a desired-state change.
+ */
+export const UNREAD_PRODUCTION_SECRET_NAMES = Object.freeze(["DISTRIBUTION_GITHUB_API_TOKEN"]);
+
+/** Every CR-3 secret a production desired state may leave out. */
+export const PRODUCTION_OMITTABLE_SECRET_NAMES = Object.freeze([
+  ...RETIRED_PRODUCTION_SECRET_NAMES, ...UNREAD_PRODUCTION_SECRET_NAMES,
+]);
+
 export const SERVICE_ACCOUNT_ROLES = Object.freeze([
   "runtime", "migrator", "scheduler", "builder", "edgeInvoker", "verifier",
 ]);
@@ -987,18 +1006,18 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
   };
 
   // Secret Manager secrets: exactly CR-3's required and optional names (less,
-  // in production, the retired ones), each named by its Secret Manager secret
-  // id, in its plane's form, and a pinned version number.
+  // in production, the retired and unread ones), each named by its Secret
+  // Manager secret id, in its plane's form, and a pinned version number.
   if (!isRecord(input.secrets)) fail("DESIRED_STATE_SHAPE_INVALID:secrets");
   const secretNames = [...REQUIRED_SECRET_NAMES, ...OPTIONAL_SECRET_NAMES];
   for (const name of Object.keys(input.secrets)) {
     if (!secretNames.includes(name)) fail(`SECRET_UNKNOWN:${name}`);
   }
-  // Production may leave out a retired secret (round 12); every other name is required.
-  const retiredSecretNames = environment === "production" ? RETIRED_PRODUCTION_SECRET_NAMES : [];
+  // Production may leave out a retired (round 12) or unread secret; every other name is required.
+  const omittableSecretNames = environment === "production" ? PRODUCTION_OMITTABLE_SECRET_NAMES : [];
   const secrets = {};
   for (const name of secretNames) {
-    if (!Object.hasOwn(input.secrets, name) && retiredSecretNames.includes(name)) continue;
+    if (!Object.hasOwn(input.secrets, name) && omittableSecretNames.includes(name)) continue;
     if (!Object.hasOwn(input.secrets, name)) fail(`SECRET_CONTAINER_MISSING:${name}`);
     closedKeys(input.secrets[name], DESIRED_STATE_SHAPE.secret, `secrets.${name}`);
     const secretName = text(input.secrets[name].secretName, SECRET_ID, `secrets.${name}.secretName`);
@@ -1320,6 +1339,10 @@ export function serviceTemplateValues(desired, { imageDigest, sourceCommit }) {
   for (const [name, secret] of Object.entries(desired.secrets)) {
     if (secret.version === null && secret.required) fail(`SECRET_VERSION_UNPINNED:${name}`);
     values[`SECRET_VERSION_${name}`] = secret.version ?? "";
+  }
+  // An optional secret the plane leaves out renders as an unpinned one: its entry is omitted.
+  for (const name of OPTIONAL_SECRET_NAMES) {
+    if (!Object.hasOwn(desired.secrets, name)) values[`SECRET_VERSION_${name}`] = "";
   }
   // STG-PREP: the staging template's own placeholders.
   return desired.environment === "staging" ? { ...values, ...stagingServiceTemplateValues(desired) } : values;

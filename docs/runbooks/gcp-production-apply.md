@@ -14,8 +14,9 @@ status: draft
 > under owner decisions round 13 ("Production infrastructure: start now ...
 > with per-operation owner approval ... triggers created PAUSED, with no
 > traffic"). Nothing here routes traffic, deploys a Worker, pushes a ref or
-> touches Cloudflare. Prepared by stream PROD-PREP; nothing here has run
-> against `tibotattle-prod`. The first live run is the qualification.
+> changes anything on Cloudflare. Prepared by stream PROD-PREP; nothing here
+> has run against `tibotattle-prod`. The first live run is the
+> qualification.
 
 ## Scope and claim boundary
 
@@ -23,24 +24,66 @@ In order: read-only checks, API enablement, the bucket birth and its pinned
 proof, OPS-2 pass 1 (accounts, grants, custom role, registry, secret
 containers, Cloud SQL with its IAM users, the logging exclusion, and the
 analytics-refresh trigger created and paused), readback, the secrets, the
-pins, and the production alert channel. The gated tail (the bootstrap image,
-the jobs, the service, migrate and roll) is listed with its gate and is not
-part of this approval.
+pins, the identity-link continuity check and the production alert channel.
+The gated tail (the bootstrap image, the jobs, the service, migrate and roll)
+is listed with its gate and is not part of this approval.
 
 What the offline checks prove (`npm run gcp:ops:infra:check`, including
-`scripts/gcp-ops-infra-production.check.mjs`): the committed file validates
-as a dedicated production plane; against the synthetic gcloud, the birth,
-pass 1, the pins and pass 2 converge; no operation names a retired Google or
-Apple secret, a staging or a test-estate resource; the Cloud SQL IAM users go
-by their PostgreSQL names. They do not prove that live gcloud output parses
-as the fake does, that the APIs below are the complete set, or that the
-builder can read Cloud Build's source bucket.
+`scripts/gcp-ops-infra-production.check.mjs` and
+`scripts/gcp-identity-link-pin-check.check.mjs`): the committed file
+validates as a dedicated production plane; against the synthetic gcloud, the
+birth, pass 1, the pins and pass 2 converge; no operation names a left-out
+secret (the Google and Apple secrets round 12 retired, or the unread GitHub
+token), a staging resource or a test-estate resource; the Cloud SQL IAM users
+go by their PostgreSQL names; the continuity check computes the Worker's
+identity-link fingerprint and prints no content. They do not prove that live
+gcloud output parses as the fake does, that the APIs below are the complete
+set, or that the builder can read Cloud Build's source bucket.
 
-**Approval granularity.** Each mutating step below is one approval. OPS-2
-applies an authorized plan whole: the pass 1 approval covers exactly the
-operations its plan lists, under its `planDigest`, and a changed estate
-changes the digest (`APPLY_PLAN_DIGEST_MISMATCH`). Show the owner the
-operation list with the digest.
+## Approvals
+
+**Granularity is not yet agreed.** Round 13 asks for "per-operation owner
+approval". OPS-2 cannot approve inside a pass: `apply` runs every executable
+operation of an authorized plan under one `planDigest` (31 operations in pass
+1), and a changed estate changes the digest (`APPLY_PLAN_DIGEST_MISMATCH`).
+Approving one digest over a listed set of operations is pass-level approval,
+which is coarser than round 13's wording, and the owner has not agreed to it.
+Step 5 therefore waits for the confirmations below. If the owner declines
+pass-level approval, step 5 does not run until a scoped apply exists (for
+example an `--only=<id,...>` set folded into the digest, so that IAM, Cloud
+SQL and the scheduler can be approved separately). That tooling is not built.
+
+**Owner confirmations before step 5.** Ask for each by name and record the
+answers as a round-13 follow-up in the owner decisions:
+
+1. Pass-level approval for OPS-2: one `planDigest` over the operation list
+   shown, in place of round 13's per-operation wording.
+2. The production verifier grant, `roles/iam.serviceAccountTokenCreator` for
+   `user:adamallcock@gmail.com` on `tibotattle-verifier@tibotattle-prod.iam.gserviceaccount.com`
+   (operation `verifier-iam:bind:roles/iam.serviceAccountTokenCreator|user:adamallcock@gmail.com|`).
+   This is a new production grant. Round 9 approved the same grant on the
+   staging verifier only, and no decision names it for production. The
+   verifier account's only other grant is `run.invoker` on the service.
+3. The refresh cadence `15 2 * * *` (UTC), which PROD-PREP proposed (D3 and
+   MEAS-3 say the owner supplies it). If the owner does not confirm it, set
+   `scheduler.analytics-refresh.schedule` to `null`, commit, and re-plan
+   before step 5: the trigger is then deferred (`SCHEDULER_CADENCE_UNSET`)
+   and created paused by a later digest once the cadence is decided.
+
+**The approvals, in order.** Each is asked for in chat, and each runs only
+after a clear yes:
+
+| Approval | Step | What it changes |
+|---|---|---|
+| 1 | 2 | Enables the APIs (one `gcloud services enable` call; there is no authorization token) |
+| 2 | 4 | Creates the bucket (`--authorize=bucket-birth:tibotattle-prod:tibotattle-quarantine`) |
+| 3 | 5 | OPS-2 pass 1 (`--authorize=<planDigest>`), after the three confirmations above |
+| 4 | 7 | Generates `POSTGRES_RATE_LIMIT_SECRET` version 1 straight into Secret Manager |
+| 5 | 11 | Creates the production alert channel (`--authorize=<planDigest>`) |
+
+The owner adds the owner-held secret versions in step 7 themselves. Step 10
+writes nothing, but it reads an owner-held secret's value into a local
+process, so it also needs the owner's OK (or the owner runs it).
 
 ## Before you start
 
@@ -86,7 +129,7 @@ node scripts/gcp-infra.mjs plan --environment=production > "$SCRATCH/prod-plan-0
 ```
 
 Expect `exit=2`, `summary.refused` 0, `findings` and `blockers` both exactly
-`["BUCKET_ABSENT", "BUCKET_PROOF_UNPINNED"]`, 33 executable and 6 deferred
+`["BUCKET_ABSENT", "BUCKET_PROOF_UNPINNED"]`, 31 executable and 6 deferred
 operations. Stop on a refused operation, any other finding, or any live
 plane resource you did not expect.
 
@@ -134,29 +177,37 @@ pass: the next plan reads it as `BUCKET_PROOF_STALE`, and apply refuses.
 
 ## 5. Apply, pass 1 (approval 3)
 
+Only after the three owner confirmations in [Approvals](#approvals).
+
 ```bash
 node scripts/gcp-infra.mjs plan --environment=production > "$SCRATCH/prod-plan-1.json"; echo "exit=$?"
 node -e 'const p=require(process.argv[1]);console.log(p.planDigest, JSON.stringify(p.summary), JSON.stringify(p.findings), JSON.stringify(p.blockers));for(const o of p.operations)console.log(o.deferred?"DEFERRED":"RUN", o.id, o.deferred??"")' "$SCRATCH/prod-plan-1.json"
 ```
 
-Expect exit 0, no findings or blockers, 33 executable, 6 deferred, 0 refused.
+Expect exit 0, no findings or blockers, 31 executable, 6 deferred, 0 refused.
 The owner approves this list and its `planDigest`:
 
 - executable: six service accounts; the verifier's token-creator grant for
-  the owner's account; the custom role `tibotattleQuarantineStore`; six
-  project bindings (Cloud SQL client and instance user for runtime and
-  migrator, the builder's log writer, and the runtime's bucket-scoped custom
-  role); the `tibotattle-images` repository and its builder writer binding;
-  the five secret containers (`IDENTITY_LINK_SECRET`,
-  `POSTGRES_RATE_LIMIT_SECRET`, `ENVELOPE_PUBLIC_JWK`, `ENVELOPE_PRIVATE_JWK`,
-  `DISTRIBUTION_GITHUB_API_TOKEN`) and the runtime's accessor binding on
-  each; the `tibotattle-primary` instance, its database and its two IAM users
-  (`tibotattle-runtime@tibotattle-prod.iam`, `tibotattle-migrator@tibotattle-prod.iam`);
-  the `_Default` sink's request-log exclusion; and the trigger
-  `tibotattle-analytics-refresh-trigger`, created and paused at once;
+  the owner's account (confirmation 2: a new production grant); the custom
+  role `tibotattleQuarantineStore`; six project bindings (Cloud SQL client
+  and instance user for runtime and migrator, the builder's log writer, and
+  the runtime's bucket-scoped custom role); the `tibotattle-images`
+  repository and its builder writer binding; the four secret containers
+  (`IDENTITY_LINK_SECRET`, `POSTGRES_RATE_LIMIT_SECRET`,
+  `ENVELOPE_PUBLIC_JWK`, `ENVELOPE_PRIVATE_JWK`) and the runtime's accessor
+  binding on each; the `tibotattle-primary` instance, its database and its
+  two IAM users (`tibotattle-runtime@tibotattle-prod.iam`,
+  `tibotattle-migrator@tibotattle-prod.iam`); the `_Default` sink's
+  request-log exclusion; and the trigger
+  `tibotattle-analytics-refresh-trigger` at `15 2 * * *` (confirmation 3),
+  created and paused at once;
 - deferred: the service and its two invoker bindings
   (`TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED`), both jobs and the scheduler's
   executor binding (`BOOTSTRAP_IMAGE_REQUIRED`).
+
+There is no container for `DISTRIBUTION_GITHUB_API_TOKEN`: nothing on the
+production estate reads it (`UNREAD_PRODUCTION_SECRET_NAMES`), and the
+service renders without it.
 
 ```bash
 node scripts/gcp-infra.mjs apply --environment=production --authorize=<planDigest> > "$SCRATCH/prod-apply-1.json"; echo "exit=$?"
@@ -181,37 +232,46 @@ the logging exclusion. Keep the files; they are content-free.
 
 ## 7. Secrets
 
-OPS-2 made the five containers in step 5. Versions come from two places.
+OPS-2 made the four containers in step 5. Versions come from two places.
 
 **Owner-held, carried over from Cloudflare, byte for byte (the owner runs
 these).** `IDENTITY_LINK_SECRET` must be the production Worker's exact value:
 the imported primary pins its keyed fingerprint under `production-v1`, and
 the origin never re-pins (`assertExistingPostgresIdentityLinkPin`), so any
 other value, a trailing newline included, fails the session ports with
-`IDENTITY_CONFIGURATION_INVALID`. `ENVELOPE_PUBLIC_JWK` and
-`ENVELOPE_PRIVATE_JWK` are one pair with the same `kid`.
-`DISTRIBUTION_GITHUB_API_TOKEN` is optional: add it, or leave its version
-unpinned and the service renders without it.
+`IDENTITY_CONFIGURATION_INVALID`. Step 10 checks it. `ENVELOPE_PUBLIC_JWK` and
+`ENVELOPE_PRIVATE_JWK` are one pair with the same `kid`. Do not add a
+`DISTRIBUTION_GITHUB_API_TOKEN`: production has no container for it, and
+nothing on the production estate would read it.
 
 ```bash
-<custody command that prints the exact value> | gcloud secrets versions add IDENTITY_LINK_SECRET --project=tibotattle-prod --data-file=-
+<custody command that prints the exact value> | gcloud secrets versions add IDENTITY_LINK_SECRET --project=tibotattle-prod --data-file=- --no-log-http
 ```
 
 The same for each name. The owner reports only the version numbers.
 
-**New random, generated straight into Secret Manager (the main session runs
-this; nobody sees the value).** `POSTGRES_RATE_LIMIT_SECRET` is origin-only
-and new; CR-3 needs at least 32 bytes.
+**New random, generated straight into Secret Manager (approval 4; the main
+session runs this, and nobody sees the value).** `POSTGRES_RATE_LIMIT_SECRET`
+is origin-only and new; CR-3 needs at least 32 bytes. The add is not
+idempotent: a second run adds version 2. So first confirm that the secret
+has no version yet:
+
+```bash
+gcloud secrets versions list POSTGRES_RATE_LIMIT_SECRET --project=tibotattle-prod --format="value(name,state)"
+```
+
+Expect no output. If anything is listed, stop and ask the owner. Then, once:
 
 ```bash
 openssl rand -base64 48 | tr -d '\n=' | tr '+/' '-_' \
   | gcloud secrets versions add POSTGRES_RATE_LIMIT_SECRET --project=tibotattle-prod --data-file=- --no-log-http --format="value(name)"
 ```
 
-Then read back states only:
+It prints the new version's name. Never rerun it after that. Then read back
+states only:
 
 ```bash
-for name in IDENTITY_LINK_SECRET POSTGRES_RATE_LIMIT_SECRET ENVELOPE_PUBLIC_JWK ENVELOPE_PRIVATE_JWK DISTRIBUTION_GITHUB_API_TOKEN; do
+for name in IDENTITY_LINK_SECRET POSTGRES_RATE_LIMIT_SECRET ENVELOPE_PUBLIC_JWK ENVELOPE_PRIVATE_JWK; do
   gcloud secrets versions list "$name" --project=tibotattle-prod --format="value(name,state)"
 done
 ```
@@ -233,8 +293,7 @@ npx wrangler versions view "$VERSION" --name app-usagemonitor --json | node -e '
 
 ## 9. Pin the versions and the namespace, and commit
 
-Set each pinned `version` to the number step 7 reported (leave
-`DISTRIBUTION_GITHUB_API_TOKEN` at `null` if the owner did not add it) and
+Set each pinned `version` to the number step 7 reported, and
 `service.telemetryStorageNamespace` to step 8's value. Then:
 
 ```bash
@@ -248,7 +307,52 @@ Expect exit 0 with 0 executable. The service and its bindings now wait on
 `SERVICE_RETIRED_SECRET_STILL_REQUIRED:GOOGLE_OIDC_CLIENT_SECRET`, and the jobs
 on the bootstrap image.
 
-## 10. The production alert channel (approval 4; OWN-5c)
+## 10. Identity-link continuity (read-only; a gate before PROD-3)
+
+This proves, before any migrate or roll, that the Secret Manager
+`IDENTITY_LINK_SECRET` version the service will mount is Cloudflare's value.
+Without it, a wrong byte would show only after the roll, as 503
+`IDENTITY_CONFIGURATION_INVALID`, and would silently change the edge
+admission's replay keys. Nothing here writes anything.
+
+First the expected pin, which is not secret, from production's D1 through
+the owner's Wrangler login (a read-only `SELECT`; the pin never changes once
+set, so any time before the seal reads the value the seal carries):
+
+```bash
+npx wrangler d1 execute app-usagemonitor-production --env production --remote --json \
+  --command "SELECT key_version, secret_fingerprint FROM identity_link_secret_configuration WHERE singleton = 1" \
+  > "$SCRATCH/identity-link-pin.json"; echo "exit=$?"
+```
+
+Then the check (with the owner's OK, because it reads the value into a local
+process, or the owner runs it):
+
+```bash
+node scripts/gcp-identity-link-pin-check.mjs --environment=production --pin-file="$SCRATCH/identity-link-pin.json"; echo "exit=$?"
+```
+
+It reads the version that step 9 pinned. To check a version before its pin
+is committed, add `--version=<n>`. It makes one read-only
+`gcloud secrets versions access ... --format=json --no-log-http` call and
+prints only the secret id, the version, `match` or `mismatch`, and
+content-free reasons, never the value or a fingerprint. Expect exit 0 and
+`"outcome": "match"`. Exit 2 is a mismatch:
+
+| Reason | Meaning |
+|---|---|
+| `FINGERPRINT_MISMATCH` with `MATCHES_WITHOUT_TRAILING_NEWLINE` | The custody command added a newline. The owner adds a new version without it (with `tr -d '\n'`), and the pin moves to it |
+| `FINGERPRINT_MISMATCH` with `MATCHES_WITH_TRAILING_NEWLINE` | The original value ends in a newline that was stripped. Add a new version with it |
+| `FINGERPRINT_MISMATCH` alone | Not Cloudflare's value. Stop and ask the owner |
+| `KEY_VERSION_MISMATCH` | The D1 pin's label is not `production-v1`, which the origin expects. Stop and ask |
+| `SECRET_TOO_SHORT` | Under 32 characters; the origin refuses it. Stop and ask |
+
+The superseded version stays (never destroy it to retry); only the pinned
+version is mounted. Keep the pin file for PT-3, whose `identityLinkPin` is
+the same `{keyVersion, secretFingerprint}`. Rerun this check before PROD-3's
+migrate and roll whenever the pinned version changes.
+
+## 11. The production alert channel (approval 5; OWN-5c)
 
 Write the owner's address to a private file (mode 0600, outside the
 repository), then:
@@ -265,9 +369,9 @@ Applying the alert policies is a later, separately authorized step.
 | Step | Gate |
 |---|---|
 | Bootstrap image: `node scripts/gcp-production-rollout.mjs build --environment=production --commit=<commit>`, then the same with `--authorize=build:production:<commit> --execute` | OPS-10 takes the production lock by pushing `refs/heads/codex/production-deployment-lock`, the ref the Cloudflare production deploys share. No push of it is authorized yet: the owner must authorize that push, and the build, explicitly |
-| Pass 2: `plan` and `apply --environment=production --bootstrap-image-digest=<digest> --bootstrap-source-commit=<commit>` | The image. Creates both jobs and the scheduler's executor binding; the trigger stays paused |
+| Pass 2: `plan` and `apply --environment=production --bootstrap-image-digest=<digest> --bootstrap-source-commit=<commit>` | The image. Creates both jobs and the scheduler's executor binding; the trigger stays paused. Under the same pass-level approval as step 5, if the owner accepted it |
 | The service and its invoker bindings | ROUTES-R12 drops `GOOGLE_OIDC_CLIENT_SECRET` and `APPLE_PRIVATE_KEY` from CR-3 and the service template; the deferral then clears itself. Also the namespace pin (step 8) |
-| Migrate and roll (PROD-3) | `docs/runbooks/gcp-rollout.md`, with the image and the edge in place |
+| Migrate and roll (PROD-3) | `docs/runbooks/gcp-rollout.md`, with the image and the edge in place, and step 10 reading `match` for the pinned version |
 | Resume the trigger | OPS-3 only, at cutover (`docs/runbooks/gcp-scheduler-resume.md`) |
 
 ## If something must be undone

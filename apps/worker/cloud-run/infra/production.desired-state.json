@@ -50,8 +50,7 @@
     "IDENTITY_LINK_SECRET": { "secretName": "IDENTITY_LINK_SECRET", "version": null },
     "POSTGRES_RATE_LIMIT_SECRET": { "secretName": "POSTGRES_RATE_LIMIT_SECRET", "version": null },
     "ENVELOPE_PUBLIC_JWK": { "secretName": "ENVELOPE_PUBLIC_JWK", "version": null },
-    "ENVELOPE_PRIVATE_JWK": { "secretName": "ENVELOPE_PRIVATE_JWK", "version": null },
-    "DISTRIBUTION_GITHUB_API_TOKEN": { "secretName": "DISTRIBUTION_GITHUB_API_TOKEN", "version": null }
+    "ENVELOPE_PRIVATE_JWK": { "secretName": "ENVELOPE_PRIVATE_JWK", "version": null }
   },
   "cloudSql": {
     "instance": "tibotattle-primary",
