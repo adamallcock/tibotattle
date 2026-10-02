@@ -41,13 +41,25 @@ Each plane has exactly one email channel, display name
 (staging), in that plane's project. `notification-channel` finds it or
 creates it.
 
-- **The address is supplied at run time only.** Prefer `--email-file`: an
+- **The address is supplied at run time only,** through `--email-file`: an
   absolute path to a regular file outside the repository, not a symlink,
   owned by the operator, mode `0600` or `0400`, holding one address and an
-  optional newline. `--email=<address>` also works, but it lands in shell
-  history. The address never enters a tracked file, stdout, stderr, the
-  plan digest or a receipt. It is passed to `gcloud` once, as the create's
+  optional newline. There is no address argument, so it never reaches shell
+  history. The tool never writes it to a tracked file, stdout, stderr, the
+  plan digest or a receipt. It passes it to `gcloud` once, as the create's
   `--channel-labels=email_address=...`.
+- **No gcloud log file.** `gcloud` writes every command's arguments to its
+  own log files (`~/.config/gcloud/logs`), and a channel list response
+  carries the address too. Every `notification-channel` call therefore runs
+  with `CLOUDSDK_CORE_DISABLE_FILE_LOGGING=true` and
+  `CLOUDSDK_CORE_LOG_HTTP=false`, which override the operator's gcloud
+  configuration. gcloud's stdout and stderr are never echoed.
+- **Where the address still goes.** These follow from creating the channel
+  at all, and are stated rather than hidden. The gcloud process's argument
+  list (visible to `ps` on the operator's machine) holds it while the create
+  runs. Cloud Monitoring stores it in the channel. The project's Admin
+  Activity audit log records the create request, which may include the
+  channel's labels.
 - **Dry run first.** Without `--authorize`, the command lists the project's
   channels (`gcloud beta monitoring channels list`) and prints either
   `action: "found"` with the channel's resource name, or `action: "create"`

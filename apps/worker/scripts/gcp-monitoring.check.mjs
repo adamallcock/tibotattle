@@ -15,6 +15,8 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { committedDesiredStatePath, loadCommittedDesiredState } from "./gcp-ops-infra-manifest.mjs";
 import {
+  CHANNEL_GCLOUD_ENV,
+  defaultMonitoringRunner,
   emailChannelDisplayName,
   ensureEmailChannel,
   guardedChannelGcloud,
@@ -79,7 +81,7 @@ async function run(argv, { runner = fakeMonitoring().runner, fetchImpl } = {}) {
 test("arguments are closed", () => {
   assert.deepEqual(parseGcpMonitoringArgs(["plan", "--environment=staging", `--notification-channel=${CHANNEL}`]), {
     command: "plan", desiredStatePath: null, environment: "staging", notificationChannel: CHANNEL, emailFile: null,
-    email: null, authorize: null });
+    authorize: null });
   for (const [argv, code] of [
     [[], "GCP_MONITORING_COMMAND_INVALID"],
     [["apply", "--environment=staging"], "GCP_MONITORING_COMMAND_INVALID"],
@@ -93,13 +95,15 @@ test("arguments are closed", () => {
     [["origin-lock-probe", "--environment=staging", "--apply"], "GCP_MONITORING_ARGUMENT_INVALID"],
     [["render", "--environment="], "GCP_MONITORING_ARGUMENT_INVALID"],
     [["plan", "--environment=staging", `--email=${SYNTHETIC_EMAIL}`], "GCP_MONITORING_ARGUMENT_INVALID"],
-    [["notification-channel", "--environment=staging"], "GCP_MONITORING_EMAIL_SOURCE_REQUIRED"],
+    [["notification-channel", "--environment=staging"], "GCP_MONITORING_EMAIL_FILE_REQUIRED"],
+    // There is no address argument: it would land in shell history and the process list.
+    [["notification-channel", "--environment=staging", `--email=${SYNTHETIC_EMAIL}`], "GCP_MONITORING_ARGUMENT_INVALID"],
     [["notification-channel", "--environment=staging", `--email=${SYNTHETIC_EMAIL}`, "--email-file=/x"],
-      "GCP_MONITORING_EMAIL_SOURCE_REQUIRED"],
+      "GCP_MONITORING_ARGUMENT_INVALID"],
     [["notification-channel", "--environment=staging", "--email-file=relative"], "GCP_MONITORING_EMAIL_FILE_PATH_INVALID"],
-    [["notification-channel", "--environment=staging", `--email=${SYNTHETIC_EMAIL}`, "--authorize=abc"],
+    [["notification-channel", "--environment=staging", "--email-file=/x", "--authorize=abc"],
       "GCP_MONITORING_AUTHORIZE_INVALID"],
-    [["notification-channel", "--environment=staging", `--email=${SYNTHETIC_EMAIL}`,
+    [["notification-channel", "--environment=staging", "--email-file=/x",
       `--notification-channel=${CHANNEL}`], "GCP_MONITORING_ARGUMENT_INVALID"],
   ]) {
     assert.throws(() => parseGcpMonitoringArgs(argv), { code }, argv.join(" "));
@@ -238,8 +242,10 @@ test("the origin-lock probe accepts exactly Google's front-end 403 and never pri
 function fakeChannels(initial = [], { createName = `projects/${PROJECT}/notificationChannels/555`, failCreate = false } = {}) {
   const channels = structuredClone(initial);
   const calls = [];
-  const runner = (argv) => {
+  const options = [];
+  const runner = (argv, runOptions) => {
     calls.push(argv);
+    options.push(runOptions);
     const shape = argv.slice(0, 4).join(" ");
     if (shape === "beta monitoring channels list") return { status: 0, stdout: JSON.stringify(channels) };
     if (shape === "beta monitoring channels create") {
@@ -253,7 +259,7 @@ function fakeChannels(initial = [], { createName = `projects/${PROJECT}/notifica
     }
     return { status: 2, stdout: "" };
   };
-  return { runner, calls, channels };
+  return { runner, calls, options, channels };
 }
 
 function privateEmailFile(contents = `${SYNTHETIC_EMAIL}\n`, mode = 0o600) {
@@ -282,9 +288,14 @@ test("notification-channel finds or creates the plane's one email channel, never
     assert.deepEqual(fake.calls.map((argv) => argv.slice(0, 4).join(" ")), ["beta monitoring channels list"]);
     assert.ok(noAddress(dry.out + dry.err));
     // The digest is the same whatever the address: it never binds or leaks it.
-    const other = await run(["notification-channel", "--environment=staging", "--email=someone-else@example.invalid"],
-      { runner: fakeChannels().runner });
-    assert.equal(JSON.parse(other.out).planDigest, plan.planDigest);
+    const otherFile = privateEmailFile("someone-else@example.invalid\n");
+    try {
+      const other = await run(["notification-channel", "--environment=staging", `--email-file=${otherFile.path}`],
+        { runner: fakeChannels().runner });
+      assert.equal(JSON.parse(other.out).planDigest, plan.planDigest);
+    } finally {
+      rmSync(otherFile.directory, { recursive: true, force: true });
+    }
     // A wrong digest is refused before any create.
     const wrong = await run(["notification-channel", "--environment=staging", `--email-file=${path}`,
       `--authorize=${"0".repeat(64)}`], { runner: fake.runner });
@@ -301,6 +312,15 @@ test("notification-channel finds or creates the plane's one email channel, never
     assert.ok(create.includes(`--project=${PROJECT}`) && create.includes("--type=email") && create.includes("--format=json"));
     assert.ok(create.includes(`--channel-labels=email_address=${SYNTHETIC_EMAIL}`), "the address goes only to gcloud");
     assert.equal(fake.calls.at(-1).slice(0, 4).join(" "), "beta monitoring channels list", "read back after create");
+    // gcloud logs every command's arguments to its own files: every channel
+    // call, the create above all, runs with file and HTTP logging off.
+    assert.deepEqual({ ...CHANNEL_GCLOUD_ENV },
+      { CLOUDSDK_CORE_DISABLE_FILE_LOGGING: "true", CLOUDSDK_CORE_LOG_HTTP: "false" });
+    assert.equal(fake.options.length, fake.calls.length);
+    for (const runOptions of fake.options) {
+      assert.deepEqual(runOptions, { env: { ...CHANNEL_GCLOUD_ENV } });
+    }
+    assert.equal(fake.options[fake.calls.indexOf(create)].env.CLOUDSDK_CORE_DISABLE_FILE_LOGGING, "true");
     // Idempotent: a second run finds it, with or without the digest, and creates nothing.
     for (const extra of [[], [`--authorize=${plan.planDigest}`]]) {
       const before = fake.calls.length;
@@ -393,5 +413,37 @@ test("the address file must be private, regular, outside the repository and hold
     assert.equal(refused.out, "");
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("the default runner spawns gcloud under the inherited environment, with the channel overrides winning", () => {
+  const spawned = [];
+  const spawn = (command, argv, options) => {
+    spawned.push({ command, argv, options });
+    return { status: 0, stdout: "[]", error: undefined };
+  };
+  const saved = { file: process.env.CLOUDSDK_CORE_DISABLE_FILE_LOGGING, http: process.env.CLOUDSDK_CORE_LOG_HTTP };
+  try {
+    // The operator's own environment asks for file and HTTP logging; the channel calls override it.
+    process.env.CLOUDSDK_CORE_DISABLE_FILE_LOGGING = "false";
+    process.env.CLOUDSDK_CORE_LOG_HTTP = "true";
+    const list = ["beta", "monitoring", "channels", "list", `--project=${PROJECT}`, "--format=json"];
+    assert.deepEqual(guardedChannelGcloud((argv, options) => defaultMonitoringRunner(argv, { ...options, spawn }),
+      PROJECT)(list), []);
+    const [call] = spawned;
+    assert.equal(call.command, "gcloud");
+    assert.deepEqual(call.argv, list);
+    assert.equal(call.options.env.CLOUDSDK_CORE_DISABLE_FILE_LOGGING, "true");
+    assert.equal(call.options.env.CLOUDSDK_CORE_LOG_HTTP, "false");
+    assert.equal(call.options.env.PATH, process.env.PATH, "the rest of the environment is inherited");
+    assert.equal(call.options.shell, undefined, "no shell");
+    // The monitoring readback keeps the inherited environment unchanged.
+    defaultMonitoringRunner(["logging", "metrics", "list"], { spawn });
+    assert.equal(spawned[1].options.env.CLOUDSDK_CORE_DISABLE_FILE_LOGGING, "false");
+  } finally {
+    for (const [name, value] of [["CLOUDSDK_CORE_DISABLE_FILE_LOGGING", saved.file], ["CLOUDSDK_CORE_LOG_HTTP", saved.http]]) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
   }
 });

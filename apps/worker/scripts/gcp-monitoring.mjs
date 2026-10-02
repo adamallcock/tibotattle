@@ -25,14 +25,17 @@
  *     only for exactly Google's front-end 403 (status 403, no origin marker
  *     header, Google's body text); the body is never printed.
  *   notification-channel (--environment | --desired-state)
- *           (--email-file=<abs path> | --email=<address>) [--authorize=<planDigest>]
+ *           --email-file=<abs path> [--authorize=<planDigest>]
  *     OWN-5c (owner, round 11: alerts by email). Finds, or creates, the
  *     plane's ONE email notification channel, display name
  *     tibotattle[-staging]-alerts-email. The address is supplied at run time
- *     only: preferably a private file (a regular file outside the
- *     repository, not a symlink, mode 0600 or 0400, one address), or the
- *     argument. It is never written to stdout, stderr, the plan digest or a
- *     receipt; the output carries the channel's resource name only. Without
+ *     only, from a private file (a regular file outside the repository, not
+ *     a symlink, mode 0600 or 0400, one address); there is no address
+ *     argument, so it never reaches shell history. It is never written to
+ *     stdout, stderr, the plan digest or a receipt; the output carries the
+ *     channel's resource name only. gcloud logs every command's arguments
+ *     to its own log files, so the channel calls run with gcloud's file
+ *     logging (and HTTP logging) off: CHANNEL_GCLOUD_ENV. Without
  *     --authorize this is a dry run: one list call, then "found" (with the
  *     channel name) or "create" (with the planDigest). With
  *     --authorize=<that planDigest> it creates the channel, then reads it
@@ -82,6 +85,19 @@ export const MONITORING_CHANNEL_COMMANDS = Object.freeze([
   "beta monitoring channels list",
   "beta monitoring channels create",
 ]);
+/**
+ * The environment overrides every notification-channel gcloud call runs
+ * under. gcloud writes each command's parsed arguments to its own log files
+ * ("Running [gcloud.…] with arguments: […]" at DEBUG, under
+ * ~/.config/gcloud/logs) unless core/disable_file_logging is set, and the
+ * create's --channel-labels carries the address, as does every list
+ * response; HTTP logging (core/log_http) would copy those responses too. An
+ * override wins over the operator's own gcloud configuration and environment.
+ */
+export const CHANNEL_GCLOUD_ENV = Object.freeze({
+  CLOUDSDK_CORE_DISABLE_FILE_LOGGING: "true",
+  CLOUDSDK_CORE_LOG_HTTP: "false",
+});
 const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const EMAIL_FILE_MAX_BYTES = 512;
 /** A conservative address shape: local@domain.tld, ASCII, at most 254 characters. */
@@ -104,7 +120,7 @@ const COMMANDS = Object.freeze({
   readback: Object.freeze([...SOURCE]),
   plan: Object.freeze([...SOURCE, "--notification-channel"]),
   "origin-lock-probe": Object.freeze([...SOURCE]),
-  "notification-channel": Object.freeze([...SOURCE, "--email-file", "--email", "--authorize"]),
+  "notification-channel": Object.freeze([...SOURCE, "--email-file", "--authorize"]),
 });
 
 function isRecord(value) {
@@ -130,11 +146,10 @@ export function parseGcpMonitoringArgs(argv) {
   if (desiredStatePath !== null && !isAbsolute(desiredStatePath)) fail("GCP_MONITORING_DESIRED_STATE_PATH_INVALID");
   if (environment !== null && !GCP_OPS_INFRA_ENVIRONMENTS.includes(environment)) fail("GCP_MONITORING_ENVIRONMENT_INVALID");
   const emailFile = values.get("--email-file") ?? null;
-  const email = values.get("--email") ?? null;
   const authorize = values.get("--authorize") ?? null;
   if (argv[0] === "notification-channel") {
-    if ((emailFile === null) === (email === null)) fail("GCP_MONITORING_EMAIL_SOURCE_REQUIRED");
-    if (emailFile !== null && !isAbsolute(emailFile)) fail("GCP_MONITORING_EMAIL_FILE_PATH_INVALID");
+    if (emailFile === null) fail("GCP_MONITORING_EMAIL_FILE_REQUIRED");
+    if (!isAbsolute(emailFile)) fail("GCP_MONITORING_EMAIL_FILE_PATH_INVALID");
     if (authorize !== null && !/^[0-9a-f]{64}$/u.test(authorize)) fail("GCP_MONITORING_AUTHORIZE_INVALID");
   }
   return Object.freeze({
@@ -143,7 +158,6 @@ export function parseGcpMonitoringArgs(argv) {
     environment,
     notificationChannel: values.get("--notification-channel") ?? null,
     emailFile: emailFile === null ? null : resolve(emailFile),
-    email,
     authorize,
   });
 }
@@ -151,10 +165,14 @@ export function parseGcpMonitoringArgs(argv) {
 // ---------------------------------------------------------------------------
 // Readback
 
-/** The default runner: spawnSync with an argv array and no shell. */
-export function defaultMonitoringRunner(argv) {
-  const result = spawnSync("gcloud", argv, {
+/**
+ * The default runner: spawnSync with an argv array and no shell, under the
+ * inherited environment plus `env` (whose entries win). `spawn` is for tests.
+ */
+export function defaultMonitoringRunner(argv, { env = {}, spawn = spawnSync } = {}) {
+  const result = spawn("gcloud", argv, {
     encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: GCLOUD_MAX_BUFFER_BYTES, windowsHide: true,
+    env: { ...process.env, ...env },
   });
   return { status: result.status, stdout: result.stdout, error: result.error };
 }
@@ -404,7 +422,11 @@ export function readAlertEmailFile(path) {
   }
 }
 
-/** A guard for notification-channel: only its two shapes, one --project, --format=json; output never echoed. */
+/**
+ * A guard for notification-channel: only its two shapes, one --project,
+ * --format=json, every call under CHANNEL_GCLOUD_ENV (no gcloud log file);
+ * output never echoed.
+ */
 export function guardedChannelGcloud(runner, project, { allowCreate = false } = {}) {
   if (typeof runner !== "function") fail("GCLOUD_RUNNER_INVALID");
   return (argv) => {
@@ -421,7 +443,7 @@ export function guardedChannelGcloud(runner, project, { allowCreate = false } = 
     const what = shape.replaceAll(" ", "-");
     let result;
     try {
-      result = runner([...argv]);
+      result = runner([...argv], { env: { ...CHANNEL_GCLOUD_ENV } });
     } catch {
       fail(`GCLOUD_CALL_FAILED:${what}`);
     }
@@ -468,8 +490,12 @@ function channelVerdict(channels) {
 
 /**
  * Finds or (under --authorize) creates the plane's one email channel. The
- * address never leaves this function except as the one create argument to
- * gcloud; the result and the plan digest carry the channel name only.
+ * address leaves this function only as the create's --channel-labels
+ * argument to gcloud, which runs with its file logging off; the result and
+ * the plan digest carry the channel name only. Outside this tool, the
+ * address is necessarily visible in the gcloud process's argument list while
+ * the create runs, is stored in the channel itself, and may appear in the
+ * project's Admin Activity audit log entry for the create request.
  */
 export function ensureEmailChannel(desired, { address, authorize = null, runner = defaultMonitoringRunner }) {
   validateAlertEmail(address);
@@ -574,7 +600,7 @@ export async function main(argv = process.argv.slice(2), {
       return result.verdict === "locked" ? 0 : 2;
     }
     if (config.command === "notification-channel") {
-      const address = config.emailFile !== null ? readEmailFile(config.emailFile) : validateAlertEmail(config.email);
+      const address = readEmailFile(config.emailFile);
       print(ensureEmailChannel(desired, { address, authorize: config.authorize, runner }));
       return 0;
     }
