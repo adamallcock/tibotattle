@@ -209,9 +209,15 @@ length depends on the export and import, which the cutover runbook orders.
    - `--analytics-drain-complete` is the operator's attestation that every
      in-flight Cloudflare erasure and analytics-delivery job has finished. EP-8
      records it; it does not prove it.
-   - Run `verify` after the plan's quiet window, at least 15 minutes after
-     apply. Its fence receipt pins the D1 bookmarks and the R2 digest that the
-     export must use.
+   - `inventory` and `plan` do not need a fenced Worker. Run them, and review
+     the writer set, before the fenced deploy; `apply` collects the inventory
+     again and refuses drift.
+   - `verify` succeeds only once now is at least `apply`'s finish time plus two
+     quiet windows plus the 5-minute analytics lag: 35 minutes at the 15-minute
+     minimum (`FENCE_WINDOW_TOO_SHORT` before then, and `FENCE_WINDOW_TOO_EARLY` for a
+     `--window-start` earlier than apply plus one quiet window).
+     Its fence receipt pins the D1 bookmarks and the R2 digest that the export
+     must use.
 
 The fence plan is a closed, owner-private file. It names the account, the
 production Worker, the fenced scripts with their expected crons or queue, the

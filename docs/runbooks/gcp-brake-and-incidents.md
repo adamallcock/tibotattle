@@ -184,8 +184,9 @@ What it does not do:
    Every gcp check runs again. Public health must report `ok` with the origin
    commit.
 7. **Observe and record** as in
-   [cutover window, H.7](./gcp-cutover-window.md#h7-observe). Resume any trigger
-   you paused under [GCP scheduler resume](./gcp-scheduler-resume.md#resume).
+   [cutover window, H.7](./gcp-cutover-window.md#h7-observe). Resume a trigger
+   you paused only if it was live `ENABLED` before you paused it, under
+   [GCP scheduler resume](./gcp-scheduler-resume.md#resume).
 
 If a brake deploy's outcome is uncertain, do not retry it blind. A retained
 deployment lock after an uncertain provider response is a stop. Follow the typed

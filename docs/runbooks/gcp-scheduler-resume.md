@@ -78,7 +78,11 @@ Use it before a rollout ([GCP origin rollout](./gcp-rollout.md)), before an
 operation that must not race a job, or to stop a job that is causing harm.
 
 1. **Authorize.** The owner authorizes each pause in chat.
-2. **Record** the trigger names, the time in UTC and the reason.
+2. **Record**, for every trigger you will pause: its name, its live state
+   (`gcloud scheduler jobs describe`), its committed state in the environment's
+   desired-state file, the time in UTC and the reason. Pause only triggers in
+   this plane's desired state. A resume after a rollout is decided from this
+   record, so it must exist before the first pause.
 3. **Pause each trigger** in the order the plan names. `not built` (OPS-3);
    until it exists:
 
@@ -167,10 +171,28 @@ once the origin is confirmed healthy.
 
 ## Resume after a rollout
 
-The roll receipt's `pausedTriggers` lists what the rollout found paused. Resume
-exactly those, after the roll receipt and its post-roll checks, using the steps
-above. The committed state is already `ENABLED` for a trigger that ran before
-the rollout, so step 3 changes nothing. The rollout itself never resumes.
+The roll receipt's `pausedTriggers` is not a resume list. It names every Cloud
+Run job trigger in the location that was paused at the roll, whoever owns it
+and whatever its committed state. It includes a trigger that was committed
+`PAUSED` and never resumed (the analytics-refresh trigger before its cold
+build, for example), a trigger the owner paused for an incident, and, in the
+shared staging project, another estate's triggers.
+
+Resume a trigger after a rollout only when all of these hold:
+
+- It is in this plane's committed desired state, not another estate's.
+- Its committed state is `ENABLED`.
+- Your record from the pause step shows it was live `ENABLED` immediately before
+  the rollout paused it, and no incident hold applies.
+
+Then use the steps above, after the roll receipt and its post-roll checks. For
+such a trigger the committed state is already `ENABLED`, so step 3 changes
+nothing. Use `pausedTriggers` only to check that nothing in it surprises you:
+a trigger that is paused and not in your record, or committed `PAUSED`, stays
+paused. A committed-`PAUSED` trigger is resumed only by its own first-resume
+step (for the refresh, [H.8](./gcp-cutover-window.md#h8-analytics-cold-build)).
+The rollout itself never resumes, and this procedure never touches another
+estate's triggers.
 
 ## Resume after an incident or the brake
 
@@ -205,7 +227,7 @@ periodically and it notifies no one.
 
 | Gap | State |
 |---|---|
-| OPS-3 `pause-all` and `resume-all`, ordered, with explicit authorization | `not built` (D-OPS3) |
+| OPS-3 `pause-all` and `resume-all`, ordered, with explicit authorization | `not built` (D-OPS3). Requirement: `resume-all` resumes only triggers in this plane's committed desired state with state `ENABLED` that were live `ENABLED` before the pause, never the roll receipt's `pausedTriggers` and never another estate's triggers |
 | The maintenance job and its trigger in the desired state, with a cadence | `not built` (D-OPS4) |
 | The refresh cadence | Open; set from the production-scale measurements. No default |
 | Confirmation that a pause updates `userUpdateTime` | Open (OPS2-READ). Pause a staging trigger and read it back before the 6 hour threshold is relied on |

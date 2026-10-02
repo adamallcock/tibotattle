@@ -20,6 +20,24 @@ The stream implements checklist item E-OPS8 (four GCP operations runbook
 drafts) and the edge half of C-DOCS. It touches no code, schema, generator or
 test.
 
+## Review round 2
+
+A review of the first commit (`36ce6140`) raised nine findings. Each was
+checked against the code on this branch (the fast-path line at `c80f99b9`)
+before anything changed. Disposition:
+
+| Finding | Disposition |
+|---|---|
+| D7 sign-off not recorded in the append-only decision | **Open, not edited.** See [Sign-offs](#sign-offs). It needs the owner's confirmation in chat |
+| H.4 `verify-unchanged` omitted the required `--seal-id` | Confirmed (`cutover-source-fence.mjs` passes `sealId` to `readCutoverSeal`, which refuses without a 64-hex value). Fixed, and the cutover runbook now says where `sealId` comes from |
+| Fence `verify` timing: the runbooks said 15 minutes after apply | Confirmed (`verifyCommand` in `cloudflare-writer-fence.mjs` needs `analyticsEndMs - startMs >= quietMs`, so now >= `appliedAt` + 2 x quiet + 5 minutes; 35 minutes at the minimum). Fixed in the cutover runbook (clock table, H.2, claim boundary, refusal table with `FENCE_WINDOW_TOO_SHORT`, `FENCE_WINDOW_TOO_EARLY`, `FENCE_NOT_QUIESCENT`, `FENCE_INVENTORY_CHANGED`) and in `production-edge-modes.md`, which carried the same sentence. The accepted edge decision says the window "starts at least 15 minutes after the last fence action", which is accurate, so it is unchanged |
+| `pausedTriggers` used as the resume list | Confirmed (`gcp-production-rollout.mjs` collects every Cloud Run job trigger in the location, with no filter on committed state or owner). The rollout and scheduler runbooks now resume only a trigger that is in this plane's committed desired state, committed `ENABLED`, and recorded live `ENABLED` before the pause. The rollout step 6 now requires that record before the first pause. The same filter is recorded as a requirement on D-OPS3 `resume-all` |
+| EP-8 `inventory` and `plan` ran only after the edge was fenced | Confirmed (both call `collectInventory` with `requireFenced: false`; only `apply` and `verify` require fenced, and the fingerprint excludes the production Worker's version and mode). Moved into H.1 as a read-only step, with the plan receipt sha256 logged; H.2 keeps the fenced deploy, `apply` and `verify`, and states the remaining stranding risk |
+| Rollout needed a fresh maintenance pass before `roll`, not after | Confirmed (`verifyServedCommit` uses the verifier path unless the live edge is in `gcp` mode, and the verifier path requires `/api/ready` to read `ready`; the check runs after the service and jobs moved). Added a precondition and a step 6 pass, corrected step 9, the failure table, and the first-rollout case, which was impossible as drafted |
+| Stale statements left in an Accepted record | Fixed by applying the stale-statement rule fully: the edge decision's section 15 no longer lists approval or the rollback policy as open (the policy is stated in section 10, citing OWN-10), and the 2026-08-04 admission decision's banner now says accepted |
+| Commit trailer names Sonnet, brief names Opus | **Rejected.** The work was done by Claude Sonnet 5.5, so a trailer naming another model would misattribute it. The trailer follows the session's attribution rule. The brief's trailer text came from computed task text, not from a user instruction in this session |
+| Optional docs check tying runbook commands to CLI argument tables | Not done. It is optional, the CLIs are still moving under wave 4, and it needs design for placeholders and `not built` markers. Revisit when the runbooks move from draft to maintained |
+
 ## What changed
 
 | Path | Change |
@@ -28,9 +46,10 @@ test.
 | `docs/runbooks/gcp-rollout.md` (new, draft) | OPS-10 preflight, build, migrate and roll, the accepted per-migration write outage, and the explicit scheduler pause and resume |
 | `docs/runbooks/gcp-brake-and-incidents.md` (new, draft) | The brake as gcp to fenced only (OWN-10), the fix-forward loop, leaving the brake, and incident classes |
 | `docs/runbooks/gcp-scheduler-resume.md` (new, draft) | The create-paused, resume-only-explicitly policy, the state model, and pause and resume steps |
-| `docs/decisions/2026-10-01-thin-worker-edge-proxy.md` | Status `proposed` to `accepted`, the opening notice, the status row, the sign-off checkbox and the evidence-boundary sentence record the owner's 2026-10-02 sign-off |
+| `docs/decisions/2026-10-01-thin-worker-edge-proxy.md` | Status `proposed` to `accepted`, the opening notice, the status row, the sign-off checkbox and the evidence-boundary sentence record the owner's 2026-10-02 sign-off. Review round 2: section 15 no longer lists approval and the rollback policy as open, and section 10 states the OWN-10 policy |
+| `docs/decisions/2026-08-04-public-upload-ingress-admission.md` | Review round 2: the banner says the gcp-mode supersession is accepted instead of proposed |
 | `docs/README.md` | The edge decision's row reads `Accepted 2026-10-02; implementation and cutover pending`; the production-edge-modes row says `accepted`; four rows list the draft runbooks under pending items |
-| `docs/runbooks/production-edge-modes.md` | The authority bullets name the accepted decision and the draft cutover runbook; the brake note records the OWN-10 answer instead of calling the rollback policy open |
+| `docs/runbooks/production-edge-modes.md` | The authority bullets name the accepted decision and the draft cutover runbook; the brake note records the OWN-10 answer instead of calling the rollback policy open. Review round 2: the fence `verify` timing and the inventory-and-plan ordering are corrected |
 
 The README and `production-edge-modes.md` edits are the minimum needed to avoid
 leaving known-wrong statements after the sign-off, as the documentation
@@ -39,15 +58,26 @@ guidance requires. They change no behavior.
 ## Sign-offs
 
 - **Edge decision.** Recorded as accepted, on the owner's 2026-10-02 sign-off
-  "as written". Its section 15 list of open owner choices still names the
-  approval and the rollback policy. That list is part of the record as written
-  and is not rewritten.
+  "as written". The evidence for that sign-off is the owner decision answers
+  file in the GCP parity workspace ("Edge record | Sign off ... as written"),
+  an agent-written summary of the owner's answers to question prompts. The
+  owner did not re-confirm it in chat in this review round. Review round 2
+  removed the now-inconsistent entries from section 15. If the owner does not
+  confirm, revert the status, notice, status row, checkbox and section 15 and
+  section 10 edits in this branch together.
 - **D7 in the append-only decision.** Not recorded in this change.
   `docs/decisions/2026-09-26-append-only-contributions.md` is unchanged: its
   notice, its sign-off row, the D7 paragraph that says the wording awaits
   confirmation, and the unticked D7 checkbox still read as before. The owner's
   2026-10-02 acceptance of D7's wording is in the owner decision answers, but the
-  edit to the record was not applied in this stream and remains open.
+  edit to the record was not applied in this stream and remains open. In review
+  round 2 the edit was again not applied: the permission layer denied it in the
+  first round, and the review's own remedy is the owner's confirmation in chat.
+  Pending that confirmation, four edits remain: the notice (lines 11-12), the
+  sign-off table row (line 22), the parenthetical at line 235, and the D7
+  checkbox (lines 383-388). The checkbox text covers the two points added on
+  2026-10-02 after review, so the confirmation must cover those two points as
+  well as the wording.
 
 ## What the drafts rest on
 
@@ -76,7 +106,10 @@ None of these is fixed here. Each is stated in the runbook that meets it.
 | Apply never deletes, so removing an unexpected public invoker binding is a manual owner step | Brake and incidents |
 | A trigger resumed but not yet committed as `ENABLED` is re-paused by the next apply | Scheduler resume |
 | `markLive` locks the transfer control schema in both databases and no unlock exists, so an abort after it spends the import target | Cutover window |
-| The edge decision's section 15, the fast-path plan's minimum cutover sequence and the append-only decision's D5 still describe the post-switch rollback policy as open; the owner answered it on 2026-10-02 | Brake and incidents, open gaps |
+| The fast-path plan's minimum cutover sequence and the append-only decision's D5 still describe the post-switch rollback policy as open; the owner answered it on 2026-10-02. The plan's "15-minute quiet window" and its 1.2 to 3.2 hour outage estimate also pre-date the 35-minute `verify` rule | Brake and incidents, open gaps |
+| `pausedTriggers` in the roll receipt lists every Cloud Run job trigger in the location, including committed-`PAUSED` and co-tenant triggers, so it cannot be a resume list. D-OPS3 `resume-all` must filter by committed state and the pre-pause live state | Rollout, scheduler resume |
+| The first roll of an empty origin cannot pass `roll`'s own served-commit check, because a maintenance pass must complete between `migrate` and `roll` and no maintenance job is in the rollout target (D-CRB, D-OPS4) | Rollout, first rollout |
+| After a `roll` that fails its served-commit check the service and jobs have already moved and no receipt exists; the retry needs a new edge capture, which no command writes | Rollout, failure table |
 
 ## Tooling the drafts depend on
 

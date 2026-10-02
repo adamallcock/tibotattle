@@ -45,7 +45,9 @@ with every precondition, attestation and abort path made explicit.
   data. The seal's provider export shapes have never been observed. The
   window's length (the plan estimates 1.2 to 3.2 hours of authenticated-route
   outage) is an estimate until the production-scale timings from the dress
-  rehearsal exist. No `gcloud` readback has been parsed from a live project.
+  rehearsal exist. The plan's "15-minute quiet window" counts one of the two
+  windows that EP-8 `verify` needs, so fence verification alone cannot finish
+  before 35 minutes after `apply`; check the estimate against that. No `gcloud` readback has been parsed from a live project.
 - **Decisions this draft encodes.**
   - The [edge decision](../decisions/2026-10-01-thin-worker-edge-proxy.md) is
     accepted: three modes, one Worker, one version at 100%.
@@ -104,7 +106,7 @@ the step's acceptance criteria are what the finished tool must satisfy.
 | Step | Edge mode after | Cloudflare writers | Google Cloud origin | Ends when | Way back |
 |---|---|---|---|---|---|
 | Preconditions | `worker` | Live | Pre-staged, migrated, empty, private | Every gate below is recorded | Nothing has changed |
-| H.1 Pre-flight and release pause | `worker` | Live | Ready | The go decision is logged | Stop |
+| H.1 Pre-flight and release pause | `worker` | Live | Ready | The EP-8 plan receipt exists and the go decision is logged | Stop |
 | H.2 Fence | `fenced` | Fenced, quiet window proven | Unchanged | EP-8 `verify` receipt exists | [Abort A](#abort-a-before-any-gcp-mode-version) |
 | H.3 Seal | `fenced` | Fenced | Unchanged | Seal manifest, projections and frozen export exist | Abort A; the seal is lost |
 | H.4 Import and verify | `fenced` | Fenced | Import, then `verified`, then `live` | `markLive` done, frozen read loaded, maintenance pass fresh | Abort A; the target database is spent |
@@ -153,7 +155,7 @@ prove them.
 
 | Clock | Limit |
 |---|---|
-| EP-8 quiet window | `verify` runs at least 15 minutes after the last fence action |
+| EP-8 quiet window | `verify` succeeds only when now is at least `appliedAt` + 2 x the plan's quiet window + 5 minutes of analytics lag: 35 minutes after `apply` at the 15-minute minimum. `appliedAt` is when `apply` finished, not when the fenced deploy ran |
 | Seal bookmarks | The bookmark before the export equals the fence receipt's, and the one after equals the one before |
 | Flip evidence | Re-read just before the flip. Any drift fails `CUTOVER_SOURCE_CHANGED_AFTER_SEAL` |
 | Origin readiness | Goes stale 2 hours after the last maintenance pass |
@@ -162,6 +164,9 @@ prove them.
 | Migrate receipt (rollout) | At most 24 hours old |
 
 ## H.1 Pre-flight and release pause
+
+Authorization: the read-only Cloudflare reads in steps 1 and 5 (inventory and
+plan; no write). `owner`.
 
 1. **Confirm the edge.** The live Worker is in `worker` mode on the edge-port
    line: one version at 100%, `deployment.sourceCommit` on public
@@ -184,9 +189,33 @@ prove them.
    late costs a full extra fence cycle. Tooling: the read-only pre-fence query
    is `not built` (E-QUIESCE). Until it exists, the owner confirms from the
    production erasure records that none is open.
-5. **Log the go decision.** Record UTC time, P, the edge commit, the origin
+5. **Inventory and plan the fence.** Neither command needs a fenced Worker,
+   and both are read-only, so a refusal here costs nothing. From `apps/worker`,
+   with `CLOUDFLARE_API_TOKEN` supplied through the approved credential
+   mechanism:
+
+   ```bash
+   node scripts/cloudflare-writer-fence.mjs inventory --plan=<private fence plan> --receipts=<private receipts directory>
+   node scripts/cloudflare-writer-fence.mjs plan --plan=<private fence plan> --receipts=<private receipts directory>
+   ```
+
+   Review the writer set against the OWN-12 plan: the production Worker, every
+   separately deployed writer, the analytics catch-up consumer and any recovery
+   analytics Worker. A script outside the plan that binds a listed D1 database
+   or R2 bucket fails closed (`WRITER_UNACCOUNTED`), and a fenced script whose
+   crons differ from the plan fails `SCHEDULE_DRIFT`. Fix either here, before
+   anything is fenced. `plan` prints the receipt sha256 that `apply` takes as
+   `--confirm` and `verify` as `--fence`. `built`.
+
+   The plan's fingerprint covers the fenced scripts, their versions and the
+   listed data resources, not the production Worker's version or mode, so it
+   survives the fenced deploy in H.2. `apply` collects the inventory again and
+   refuses `FENCE_INVENTORY_CHANGED` on any drift. Rerun both commands, and use
+   the new receipt's sha256, if any Worker deploys between this step and H.2 or
+   if the go decision waits long.
+6. **Log the go decision.** Record UTC time, P, the edge commit, the origin
    commit and the image digest, the plan digest the estate was last applied
-   from, and who is present.
+   from, the EP-8 plan receipt sha256, and who is present.
 
 Shipped clients are not notified. For the whole fenced window they get
 `503 MUTATION_BARRIER_ACTIVE` with `retry-after: 300`.
@@ -213,32 +242,36 @@ Authorizations: the typed fenced deploy, and the EP-8 apply. `owner`.
    commit; the API, admin, Sparkle guard and Apple paths answer
    `503 MUTATION_BARRIER_ACTIVE` with `no-store` and `retry-after: 300`;
    `www` asset paths redirect; `/release-site-manifest.json` is 200. `built`.
-2. **Fence the writers.** From `apps/worker`, with `CLOUDFLARE_API_TOKEN`
-   supplied through the approved credential mechanism:
+2. **Fence the writers.** `apply` needs the production Worker already fenced,
+   so it follows step 1. It collects the inventory again, so a script that
+   appeared since H.1 still fails closed. From `apps/worker`:
 
    ```bash
-   node scripts/cloudflare-writer-fence.mjs inventory --plan=<private fence plan> --receipts=<private receipts directory>
-   node scripts/cloudflare-writer-fence.mjs plan --plan=<private fence plan> --receipts=<private receipts directory>
    node scripts/cloudflare-writer-fence.mjs apply --plan=<private fence plan> --receipts=<private receipts directory> \
-     --confirm=<plan receipt sha256> --analytics-drain-complete
+     --confirm=<plan receipt sha256 from H.1> --analytics-drain-complete
    ```
 
-   `inventory` and `plan` are read-only. Review the writer set against the
-   OWN-12 plan: the production Worker, every separately deployed writer, the
-   analytics catch-up consumer and any recovery analytics Worker. A script
-   outside the plan that binds a listed D1 database or R2 bucket fails closed
-   (`WRITER_UNACCOUNTED`). `built`.
-3. **Prove quiescence.** Wait the plan's quiet window, at least 15 minutes after
-   apply, then run:
+   `built`.
+3. **Prove quiescence.** `verify` refuses until two quiet windows and the
+   analytics lag have passed since `apply` finished: it takes the D1 bookmarks
+   at the window start (`appliedAt` + one quiet window, unless `--window-start`
+   is given) and at now, and the analytics interval ends 5 minutes before now
+   and must itself be a full quiet window. At the 15-minute minimum, that is
+   35 minutes after `apply`. Run:
 
    ```bash
    node scripts/cloudflare-writer-fence.mjs verify --plan=<private fence plan> --receipts=<private receipts directory> \
-     --fence=<plan receipt sha256>
+     --fence=<plan receipt sha256 from H.1>
    ```
 
-   The receipt pins the D1 bookmarks and the quarantine bucket digest the
-   seal must use. D1 bookmark equality is authoritative; the provider's
-   analytics figures only corroborate. `built`.
+   With `--window-start=<instant>`, the start may not be earlier than `appliedAt`
+   plus one quiet window (`FENCE_WINDOW_TOO_EARLY`), and now must be at least
+   the start plus one quiet window plus 5 minutes (`FENCE_WINDOW_TOO_SHORT`).
+   Both timing refusals are decided from the apply receipt and the clock,
+   before `verify` reads anything from the provider, so running early and
+   retrying later costs nothing. The receipt pins the D1 bookmarks and the
+   quarantine bucket digest the seal must use. D1 bookmark equality is
+   authoritative; the provider's analytics figures only corroborate. `built`.
 4. **Capture the barrier proof.** Write the closed file
    `tibotattle-cutover-barrier-proof-v1` from two observed responses taken after
    the fence applied: public `GET /api/health` in barrier mode carrying the
@@ -246,6 +279,19 @@ Authorizations: the typed fenced deploy, and the EP-8 apply. `owner`.
    `503 MUTATION_BARRIER_ACTIVE` with `no-store` and `retry-after: 300`. The
    seal consumes it. No command in the repository produces the file; the
    operator writes it from the responses. `owner`.
+
+Stranding risk. From the fenced deploy until `verify` writes its receipt, the
+public edge is fenced and there is no typed way back to worker mode, because
+[Abort A](#abort-a-before-any-gcp-mode-version) consumes the verified fence
+receipt. H.1 moved every read-only check that can be made earlier. What can
+still strand the window: an `apply` refusal from drift since H.1
+(`FENCE_INVENTORY_CHANGED`, `WRITER_UNACCOUNTED`, `SCHEDULE_DRIFT`), a provider
+failure, and a `verify` refusal `FENCE_NOT_QUIESCENT`. Fix the cause and retry
+the step; do not weaken the window or the plan to get a receipt. After
+`FENCE_NOT_QUIESCENT`, a retry can pass only with a `--window-start` later
+than the stray write, and only once the writer is found and stopped. The fenced
+outage runs from the fenced deploy through `verify`, so size it as the deploy
+and `apply` time plus at least 35 minutes, not 15.
 
 Evidence kept: the EP-8 plan, apply and verify receipts, the barrier proof,
 the typed deploy operation record. Abort: [Abort A](#abort-a-before-any-gcp-mode-version).
@@ -286,7 +332,9 @@ Authorization: the D1 seal export, a read-only production operation. `owner`.
    the dump into one `0400` SQLite file, checks integrity, schema, ledgers,
    sequences and per-table aggregates against the remote, and deletes the dump.
    On any failure it deletes every artifact of the run and writes no manifest.
-   The manifest's `sealId` is the sha256 of its canonical body. `built`;
+   The manifest's `sealId` is the sha256 of its canonical body; `seal` prints it
+   with the manifest's sha256, and every later command that reads the seal takes
+   it as `--seal-id`. `built`;
    the provider has never been contacted, so real export shapes are unverified.
 4. **Derive the projections.** The journal projection and the content-free
    deletion-digest projection (the do-not-restore seed) come from the seal, and
@@ -353,9 +401,11 @@ list on the deploy line governs.
 
      ```bash
      node scripts/cutover-source-fence.mjs verify-unchanged --inventory <private seal inventory> \
-       --seal <seal manifest> --out <private owner directory> --execute --remote --owner-read-only
+       --seal <seal manifest> --seal-id <sealId> --out <private owner directory> --execute --remote --owner-read-only
      ```
 
+     `--seal-id` is required: it pins the manifest, and without a 64-hex value
+     the command refuses `CUTOVER_ARGUMENT_INVALID` before it reads anything.
      It writes `flip-evidence.json` (`0400`, never overwritten) and prints its
      sha256, or fails `CUTOVER_SOURCE_CHANGED_AFTER_SEAL`. `built`.
    - Restore the sealed collection controls exactly
@@ -543,7 +593,8 @@ Consequences, stated plainly: Cloudflare writes resume, so every seal and
 export taken under that fence is invalid and a later attempt needs a fresh
 fence and a fresh seal. The tooling does not import into a target that
 reached `live`. The fence receipt the abort needs exists only after EP-8
-`verify`; before that, there is no typed path back to worker mode.
+`verify`; before that, there is no typed path back to worker mode (see the
+stranding risk in [H.2](#h2-fence)).
 
 ## After the switch
 
@@ -579,7 +630,10 @@ noted.
 | `EDGE_MODE_ADMISSION_BINDING_MISSING`, `EDGE_MODE_SECRET_MISSING`, `EDGE_MODE_RELEASE_GUARD_MIGRATIONS_PENDING` | gcp deploy | A precondition of H.6 is missing |
 | `EDGE_ORIGIN_COMMIT_MISMATCH`, `EDGE_CONTRACT_DRIFT` | gcp deploy | The origin answered with another commit, or the contract blob differs between edge and origin commits |
 | `EDGE_PRIVACY_PAGE_NOT_CUTOVER`, `EDGE_PRIVACY_PAGE_PREMATURE` | Typed deploy | The marker is missing in gcp mode, or present before it |
-| `WRITER_UNACCOUNTED`, `SCHEDULE_DRIFT` | EP-8 | A script outside the plan binds a listed database or bucket, or a fenced script's crons differ from the plan |
+| `WRITER_UNACCOUNTED`, `SCHEDULE_DRIFT` | EP-8 inventory, plan, apply | A script outside the plan binds a listed database or bucket, or a fenced script's crons differ from the plan. At H.1 this is free; at `apply` the edge is already fenced |
+| `FENCE_INVENTORY_CHANGED` | EP-8 apply, verify | The fenced surface differs from the plan receipt's fingerprint. Rerun inventory and plan, then use the new receipt |
+| `FENCE_WINDOW_TOO_SHORT`, `FENCE_WINDOW_TOO_EARLY` | EP-8 verify | Run too soon: wait until `appliedAt` + 2 x the quiet window + 5 minutes (35 minutes at the minimum), or fix the `--window-start` |
+| `FENCE_NOT_QUIESCENT` | EP-8 verify | A D1 bookmark or the quarantine digest moved inside the window: something wrote after the fence. Find the writer; do not shorten the window |
 | `CUTOVER_SOURCE_BOOKMARK_DRIFT`, `CUTOVER_SOURCE_CHANGED_AFTER_SEAL` | Seal, flip evidence | A source changed after the fence. The seal is void |
 | `CUTOVER_ERASED_PARTICIPANT_PRESENT`, `CUTOVER_PARTICIPANT_ERASURE_PENDING` | Seal, PT-3 | An erased or mid-erasure participant is in the sealed set. Finish the erasure on Cloudflare and re-seal |
 | `CUTOVER_IDENTITY_LINK_SECRET_MISMATCH` | PT-3 | The origin's identity-link secret does not match the sealed pin. Do not rotate it to make the import pass |
