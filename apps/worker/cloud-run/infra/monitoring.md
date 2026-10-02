@@ -109,6 +109,7 @@ exists:
 | `SCHEDULER_CADENCE_UNSUPPORTED` | The cadence fires fewer than twice in 400 days, so no absence window fits |
 | `TRIGGER_COMMITTED_PAUSED` | The trigger is committed `PAUSED`, so no attempts or runs are expected |
 | `PRODUCER_NOT_IN_MANIFEST:<job>` | No manifest job emits the signal yet (D-OPS4 adds the jobs and probes) |
+| `PUBLIC_ORIGIN_UNASSIGNED` | A staging plane has no staging edge (`stagingOrigin`) yet, so edge-health has no public host to probe |
 
 A policy with one condition per trigger (scheduler-quiet) defers per
 trigger instead. A trigger with no usable cadence, or one committed
@@ -119,18 +120,33 @@ whole only when every trigger's condition does.
 ## origin-5xx-ratio
 
 **Page.** For 10 minutes, Cloud Run's 5xx responses exceed 2 % of all
-requests, in a 10-minute window that holds at least 50 requests. Both counts
-are taken net of the origin's deliberate unported answers first.
+requests, and the 10-minute window holds at least 5 of them. Both counts are
+taken net of the origin's deliberate unported answers first. The rendered
+query is `((errors / requests) > 0.02) and on() (errors >= 5)`, over
+`increase(...[10m])`.
 
-- **Request floor (50).** This is `ceil(1 / 0.02)`: the smallest window in
-  which one error cannot exceed 2 % (the comparison is strict). So a single
-  error never pages. Production's 30-day volume on the queried routes was
-  132,945 requests (OWN-2-GQL, 2026-10-02). That is a mean of about 31 per
-  10-minute window, so the floor sits just above an average window. A higher
-  floor would silence most windows. The cost: a window under 50 requests
-  never pages, even when every request fails. The Worker's 30-day 5xx
-  baselines were 3.55 % on community/daily, 3.47 % on accountless
-  enrollment and 1.33 % across all routes.
+- **Minimum error count (5), not a request floor.** One error never pages.
+  `increase()` extrapolates a count to the window's edges: about 1.1 times
+  with 60-second samples, and more for a sparse series. So one error can
+  read as about 1.1, and 45 requests as about 50. Five leaves a wide margin
+  over that. Below 250 requests in a window (5 / 0.02), the count binds: a
+  window whose requests all fail pages once it holds 5 of them, whatever
+  its volume. From 250 requests, the 2 % share binds. A window with fewer
+  than 5 failing requests never pages. For a dead origin, edge-health covers
+  that case, and in gcp mode its own probes add failing requests here too.
+  Five is a starting value, like round 9's: tune it after a week of real
+  traffic.
+- **Volume context, not evidence for a threshold.** Production's Worker
+  answered 132,945 requests in 30 days on the 16 routes queried (12 had
+  rows; OWN-2-GQL, 2026-10-02). That is a mean of about 31 per 10-minute
+  window, and only a lower bound for the origin. `WORKER_ROUTE_POLICY` has
+  51 paths, and routes such as health, readiness, sync state, manifests and
+  sessions were not queried. No per-window distribution was read. On those
+  16 routes the Worker's 5xx share was 1.33 % (community/daily 3.55 %,
+  accountless enrollment 3.47 %).
+- **Extrapolation is an assumption.** How Cloud Monitoring's PromQL
+  extrapolates `increase()` over these DELTA metrics is to be confirmed at
+  the first readback, with the metric names.
 - **Exclusions (`ORIGIN_5XX_EXCLUSIONS`).** Each one is an exact route path
   plus its status and code, never a code alone. Today every one is
   `503 POSTGRES_ROUTE_NOT_PORTED`:
@@ -144,16 +160,26 @@ are taken net of the origin's deliberate unported answers first.
   - OD-CR-2: `/api/v1/me/export` (participant export is retired);
   - C-ADMIN: `/api/v1/admin/action`, whose unported admin tasks answer this
     code.
-- **Never excluded.** `POSTGRES_TEST_ROUTE_UNSUPPORTED` and
-  `EDGE_ORIGIN_UNAVAILABLE` always count. So do these paths:
+- **Never excluded.** `originFiveXxExclusions` refuses these paths:
   `/api/v1/contributions` (v0.x uploads share it with every live upload and
   are refused there with a 4xx), `/api/v1/device/upload-authorizations`,
   `/api/v1/accountless/telemetry-performance-authorization` (round 12: a
   definite 4xx, so a 5xx from it is a defect), and the renew and disconnect
-  routes round 12 keeps. `originFiveXxExclusions` refuses all of these. It
-  also refuses any path that is not an exact `WORKER_ROUTE_POLICY` pathname.
-  The privacy scanner refuses a rendered query that names a code without its
-  route classes, or that drops the floor.
+  routes round 12 keeps. It also refuses any path that is not an exact
+  `WORKER_ROUTE_POLICY` pathname, any code other than
+  `POSTGRES_ROUTE_NOT_PORTED`, and two codes by name, as a guard only:
+  - `POSTGRES_TEST_ROUTE_UNSUPPORTED` counts as a 5xx if a deployed origin
+    ever answers it;
+  - `EDGE_ORIGIN_UNAVAILABLE` is made at the Cloudflare edge and never
+    reaches Cloud Run, so it is outside this alert's inputs altogether. A
+    total edge-to-origin outage leaves Cloud Run with fewer requests or
+    none, and this alert stays silent. edge-health covers that path.
+- **The scanner holds the whole query.** `scanMonitoringPrivacy` refuses a
+  rendered policy that excludes by code alone, by route alone or beyond the
+  table, names either guarded code, or differs in any other part from
+  `originFiveXxConditions` for the service the origin request metric reads:
+  operators, threshold, minimum error count, window, duration, or an extra
+  or missing condition.
 - **What the origin logs.** Cloud Run's request log carries the status but
   not the body's code. Its URL (`httpRequest`) is outside the privacy
   contract. The origin's own request line (CR-6, `postgres-host-dispatch.mjs`)
@@ -245,6 +271,43 @@ means the service may be publicly invokable. Read its IAM policy
 (`gcp-infra.mjs readback`) and remove any `allUsers` or
 `allAuthenticatedUsers` member by hand. OPS-2 refuses to plan that
 deletion. Then rerun `gcp-monitoring.mjs origin-lock-probe`.
+
+## edge-health
+
+**Page.** An unauthenticated GET of the plane's public `/api/health`,
+through the Cloudflare edge, did not get exactly 200 with `"status":"ok"` in
+the body. The host is production's public origin (`tibotattle.com`) or the
+staging edge's (`stagingOrigin.publicOrigin`). A staging plane with no
+staging edge yet renders no check, and this policy waits with
+`PUBLIC_ORIGIN_UNASSIGNED`.
+
+- **Why it exists.** In gcp mode the edge forwards public health to the
+  Cloud Run origin. When the edge cannot reach the origin, it answers
+  `503 EDGE_ORIGIN_UNAVAILABLE` itself, and nothing reaches Cloud Run.
+  origin-5xx-ratio and origin-lock cannot see that; this check can.
+- **In other modes.** The Worker answers health in worker mode, and barrier
+  health answers it in fenced mode, both with 200 and status `ok`. The check
+  passes there without exercising the origin. `503 EDGE_NOT_CONFIGURED`
+  fails it in any mode.
+- **Its own traffic.** In gcp mode each probe is a forwarded request, so the
+  probes add requests to origin-5xx-ratio's counts: successes while the
+  origin is healthy, and failures when the origin itself fails. The number
+  per window depends on how many checker locations Cloud Monitoring uses
+  (the API default, every region). Confirm it at the first readback.
+- **Assumptions to confirm at the first apply.** Cloudflare's bot and rate
+  rules must let Google's uptime checkers through. If they do not, the check
+  fails, which is a false page, never silence.
+
+What to do:
+
+1. Read the public `/api/health` answer and the edge's log line:
+   `edge_upstream_unavailable` with `EDGE_TOKEN_UNAVAILABLE`,
+   `EDGE_UPSTREAM_TIMEOUT`, `EDGE_UPSTREAM_NETWORK` or
+   `EDGE_UPSTREAM_UNMARKED`.
+   [Reading edge failures](../../../../docs/runbooks/production-edge-modes.md#reading-edge-failures)
+   maps each one to a cause.
+2. Follow the matching row in
+   [GCP brake and incidents](../../../../docs/runbooks/gcp-brake-and-incidents.md#incidents).
 
 ## sql-cpu
 

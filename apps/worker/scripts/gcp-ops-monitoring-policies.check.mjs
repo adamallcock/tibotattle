@@ -3,9 +3,12 @@
  * the rendered set for the committed staging plane and synthetic variants,
  * the privacy scanner (every rendered filter passes, forbidden and unlisted
  * fields fail), the origin-lock check (exactly 403, Google's text, no
- * credentials), the 5xx ratio's request floor and its exact route-plus-code
- * exclusions (never a code alone, never the live or 4xx routes), cadence-derived
- * windows and the closed deferrals and runbook anchors. No call is made.
+ * credentials), the edge-health check (the public host through the edge,
+ * exactly 200 with status ok), the 5xx ratio's minimum error count, evaluated
+ * window by window, and its exact route-plus-code exclusions (never a code
+ * alone, never the live or 4xx routes), the scanner's refusal of any other
+ * 5xx query, cadence-derived windows and the closed deferrals and runbook
+ * anchors. No call is made.
  */
 
 import assert from "node:assert/strict";
@@ -60,6 +63,7 @@ test("the committed staging plane renders the closed set, every policy deferred 
     "refresh-output-headroom": "SCHEDULER_CADENCE_UNSET",
     "scheduler-quiet": "SCHEDULER_CADENCE_UNSET",
     "origin-lock": "NOTIFICATION_CHANNEL_UNASSIGNED",
+    "edge-health": "NOTIFICATION_CHANNEL_UNASSIGNED",
     "sql-cpu": "NOTIFICATION_CHANNEL_UNASSIGNED",
     "sql-memory": "NOTIFICATION_CHANNEL_UNASSIGNED",
     "sql-disk": "NOTIFICATION_CHANNEL_UNASSIGNED",
@@ -159,7 +163,59 @@ test("the origin-lock check accepts exactly Google's 403, unauthenticated, on th
   }
 });
 
-test("the 5xx ratio: over 2 % for 10 minutes, at least 50 requests, net of exact route-plus-code exclusions", () => {
+test("edge-health probes the public host through the edge, where an edge-to-origin outage shows", async () => {
+  const rendered = monitoring.renderMonitoring(STAGING, { notificationChannel: CHANNEL });
+  assert.deepEqual(rendered.uptimeChecks.map(({ id }) => id), ["origin-lock", "edge-health"]);
+  const check = rendered.uptimeChecks.find(({ id }) => id === "edge-health");
+  const host = new URL(STAGING.stagingOrigin.publicOrigin).host;
+  assert.equal(host, "staging.tibotattle.com");
+  assert.deepEqual(check.body.monitoredResource, { type: "uptime_url", labels: { project_id: STAGING.project, host } });
+  assert.deepEqual(check.body.httpCheck, { requestMethod: "GET", path: "/api/health", port: 443, useSsl: true,
+    validateSsl: true, acceptedResponseStatusCodes: [{ statusValue: 200 }] });
+  assert.deepEqual(check.body.contentMatchers, [{ content: '"status":"ok"', matcher: "CONTAINS_STRING" }]);
+  const edge = policy(rendered, "edge-health");
+  assert.deepEqual([edge.severity, edge.deferred], ["page", undefined]);
+  assert.equal(edge.body.conditions[0].conditionThreshold.filter, 'metric.type="monitoring.googleapis.com/uptime_check/'
+    + `check_passed" AND resource.type="uptime_url" AND resource.label.host="${host}"`);
+  // Production probes its own public origin.
+  assert.equal(monitoring.publicEdgeHost({ environment: "production", stagingOrigin: null }), "tibotattle.com");
+  // A staging plane with no edge yet waits for one, and renders no check.
+  const edgeless = monitoring.renderMonitoring(staging((value) => { value.stagingOrigin = null; }),
+    { notificationChannel: CHANNEL });
+  assert.deepEqual(edgeless.uptimeChecks.map(({ id }) => id), ["origin-lock"]);
+  assert.equal(policy(edgeless, "edge-health").deferred, "PUBLIC_ORIGIN_UNASSIGNED");
+  assert.deepEqual(policy(edgeless, "edge-health").body.conditions, []);
+
+  // The edge's own unavailable answer is a 503 made at the edge: this check
+  // refuses it, and origin-5xx-ratio never sees it (Cloud Run gets nothing).
+  const proxy = readFileSync(join(WORKER_ROOT, "src/edge-origin-proxy.ts"), "utf8");
+  assert.match(proxy, /\{ error: \{ code: EDGE_ORIGIN_UNAVAILABLE, requestId \} \},\s*\{\s*status: 503,/u);
+  assert.equal(monitoring.EDGE_HEALTH_ACCEPTED_STATUSES.includes(503), false);
+  // Health in every edge mode is JSON with top-level status "ok" when healthy.
+  assert.ok(JSON.stringify({ status: "ok", mode: "migration-mutation-barrier" }).includes(monitoring.EDGE_HEALTH_OK_TEXT));
+
+  // The scanner holds each check to its contract.
+  const index = rendered.uptimeChecks.findIndex(({ id }) => id === "edge-health");
+  for (const [edit, code] of [
+    [(copy) => { copy.uptimeChecks[index].body.httpCheck.acceptedResponseStatusCodes.push({ statusValue: 503 }); },
+      "MONITORING_EDGE_HEALTH_INVALID"],
+    [(copy) => { copy.uptimeChecks[index].body.httpCheck.headers = { authorization: "Bearer x" }; },
+      "MONITORING_EDGE_HEALTH_INVALID"],
+    [(copy) => { copy.uptimeChecks[index].body.monitoredResource.labels.host = STAGING.service.host; },
+      "MONITORING_EDGE_HEALTH_INVALID"],
+    [(copy) => { copy.uptimeChecks[index].body.contentMatchers = []; }, "MONITORING_EDGE_HEALTH_INVALID"],
+    [(copy) => { copy.uptimeChecks[index].body.httpCheck.path = "/api/ready"; }, "MONITORING_EDGE_HEALTH_INVALID"],
+    [(copy) => { copy.uptimeChecks[0].body.monitoredResource.labels.host = host; }, "MONITORING_ORIGIN_LOCK_INVALID"],
+    [(copy) => { copy.uptimeChecks.push({ ...copy.uptimeChecks[index], id: "other" }); }, "MONITORING_UPTIME_CHECK_INVALID"],
+    [(copy) => { copy.uptimeChecks.push(copy.uptimeChecks[index]); }, "MONITORING_UPTIME_CHECK_INVALID"],
+  ]) {
+    const copy = structuredClone(rendered);
+    edit(copy);
+    assert.throws(() => monitoring.scanMonitoringPrivacy(copy), { code }, code);
+  }
+});
+
+test("the 5xx ratio: over 2 % for 10 minutes, with at least 5 net 5xx answers, net of exact exclusions", () => {
   const rendered = monitoring.renderMonitoring(STAGING);
   const promql = query(rendered, "origin-5xx-ratio");
   const service = `service_name="${STAGING.service.name}"`;
@@ -169,11 +225,15 @@ test("the 5xx ratio: over 2 % for 10 minutes, at least 50 requests, net of exact
   const excluded = "(sum(increase(logging_googleapis_com:user_tibotattle_staging_origin_request_failure{"
     + `monitored_resource="cloud_run_revision",${service},routeClass=~"${routeClasses.join("|")}",status="503",`
     + 'code="POSTGRES_ROUTE_NOT_PORTED"}[10m])) or vector(0))';
+  const errors = `(${requests(',response_code_class="5xx"')} - (${excluded}))`;
   const counted = `(${requests()} - (${excluded}))`;
-  assert.equal(promql, `((${requests(',response_code_class="5xx"')} - (${excluded})) / ${counted} > 0.02)`
-    + ` and on() (${counted} >= 50)`);
-  assert.equal(policy(rendered, "origin-5xx-ratio").body.conditions[0].conditionPrometheusQueryLanguage.duration, "600s");
+  assert.equal(promql, `((${errors} / ${counted}) > 0.02) and on() (${errors} >= 5)`);
+  const [condition] = policy(rendered, "origin-5xx-ratio").body.conditions;
+  assert.equal(policy(rendered, "origin-5xx-ratio").body.conditions.length, 1);
+  assert.equal(condition.conditionPrometheusQueryLanguage.duration, "600s");
   assert.equal(policy(rendered, "origin-5xx-ratio").severity, "page");
+  assert.deepEqual(policy(rendered, "origin-5xx-ratio").body.conditions,
+    monitoring.originFiveXxConditions(STAGING.service.name, `logging_googleapis_com:user_${rendered.metrics[0].name}`));
   // The origin request metric reads the closed line and its closed events only.
   const [requestLines] = rendered.metrics;
   assert.deepEqual(Object.keys(requestLines.body.labelExtractors), ["routeClass", "status", "code"]);
@@ -181,17 +241,155 @@ test("the 5xx ratio: over 2 % for 10 minutes, at least 50 requests, net of exact
   assert.deepEqual(monitoring.ORIGIN_REQUEST_LOG_CONTRACT.notPorted, { status: 503, code: "POSTGRES_ROUTE_NOT_PORTED" });
 });
 
-test("the request floor is the smallest count at which one error cannot page, from production's volume", () => {
-  const { originFiveXxRatio: ratio, originFiveXxMinimumRequests: floor } = monitoring.MONITORING_THRESHOLDS;
-  assert.equal(floor, Math.ceil(1 / ratio));
-  // Every eligible window: one error is at most 2 %, and the comparison is strict.
-  for (let requests = floor; requests <= floor * 20; requests += 1) assert.equal(1 / requests > ratio, false, requests);
-  // One error under the floor would have paged without it.
-  assert.equal(1 / (floor - 1) > ratio, true);
-  // OWN-2-GQL (2026-10-02): 132,945 requests in 30 days on the queried routes,
-  // a mean of about 31 per 10-minute window, so the floor sits just above it.
-  const meanPerWindow = 132_945 / (30 * 24 * 6);
-  assert.ok(meanPerWindow > 30 && meanPerWindow < floor, String(meanPerWindow));
+/**
+ * Evaluates origin-5xx-ratio's rendered query for one 10-minute window, its
+ * three sums replaced by values: Cloud Run's 5xx count (fiveXx), its request
+ * count (requests) and the origin's excluded-answer count (excluded). null is
+ * a sum over no series (PromQL's empty vector); a value may be fractional,
+ * since increase() extrapolates. PromQL semantics for label-free one-sample
+ * vectors: arithmetic propagates emptiness, a comparison without bool filters,
+ * `or` falls back, `and on()` and `unless on()` gate. Returns the alerting
+ * value or null, and refuses any token outside that grammar.
+ */
+function evaluateFiveXx(promql, { fiveXx, requests, excluded }) {
+  const text = promql
+    .replaceAll(/sum\(increase\(run_googleapis_com:request_count\{[^}]*,response_code_class="5xx"\}\[10m\]\)\)/gu, " F ")
+    .replaceAll(/sum\(increase\(run_googleapis_com:request_count\{[^}]*\}\[10m\]\)\)/gu, " R ")
+    .replaceAll(/sum\(increase\(logging_googleapis_com:user_[a-z_]+_origin_request_failure\{[^}]*\}\[10m\]\)\)/gu, " E ");
+  const tokens = text.match(/vector\(0\)|on\(\)|unless|and|or|>=|<=|[<>()+\-/]|[FRE]\b|\d+(?:\.\d+)?|\S+/gu);
+  const values = { F: fiveXx, R: requests, E: excluded };
+  let position = 0;
+  const peek = () => tokens[position];
+  const take = (expected) => {
+    const token = tokens[position];
+    position += 1;
+    if (expected !== undefined && token !== expected) throw new Error(`expected ${expected}, read ${token}`);
+    return token;
+  };
+  const arithmetic = (left, right, operate) => (left === null || right === null ? null : operate(left, right));
+  const COMPARE = { ">": (a, b) => a > b, ">=": (a, b) => a >= b, "<": (a, b) => a < b, "<=": (a, b) => a <= b };
+  function primary() {
+    const token = take();
+    if (token === "(") {
+      const value = union();
+      take(")");
+      return value;
+    }
+    if (token === "vector(0)") return 0;
+    if (Object.hasOwn(values, token)) return values[token];
+    if (/^\d+(?:\.\d+)?$/u.test(token)) return Number(token);
+    throw new Error(`unexpected token ${token}`);
+  }
+  function quotient() {
+    let left = primary();
+    while (peek() === "/") {
+      take();
+      left = arithmetic(left, primary(), (a, b) => a / b);
+    }
+    return left;
+  }
+  function difference() {
+    let left = quotient();
+    while (peek() === "+" || peek() === "-") {
+      const operator = take();
+      left = arithmetic(left, quotient(), operator === "+" ? (a, b) => a + b : (a, b) => a - b);
+    }
+    return left;
+  }
+  function comparison() {
+    const left = difference();
+    if (!Object.hasOwn(COMPARE, peek() ?? "")) return left;
+    const operator = take();
+    const right = difference();
+    return left === null || right === null || !COMPARE[operator](left, right) ? null : left;
+  }
+  function gate() {
+    let left = comparison();
+    while (peek() === "and" || peek() === "unless") {
+      const operator = take();
+      take("on()");
+      const right = comparison();
+      left = operator === "and" ? (left !== null && right !== null ? left : null) : (right === null ? left : null);
+    }
+    return left;
+  }
+  function union() {
+    let left = gate();
+    while (peek() === "or") {
+      take();
+      if (peek() === "on()") take();
+      const right = gate();
+      left = left ?? right;
+    }
+    return left;
+  }
+  const result = union();
+  assert.equal(position, tokens.length, "the whole query is read");
+  return result;
+}
+
+test("the 5xx query pages a failing window at any volume, never one error, and keeps 2 % at volume", () => {
+  const promql = query(monitoring.renderMonitoring(STAGING), "origin-5xx-ratio");
+  const pages = (window) => evaluateFiveXx(promql, { excluded: null, ...window }) !== null;
+  const { originFiveXxRatio: ratio, originFiveXxMinimumErrors: minimum } = monitoring.MONITORING_THRESHOLDS;
+  assert.deepEqual([ratio, minimum], [0.02, 5]);
+  // Every request fails: it pages from `minimum` requests up, whatever the
+  // volume (there is no request floor). Under `minimum` failing requests in
+  // the window it cannot; edge-health and the health probes' own traffic
+  // cover a dead origin then.
+  for (let requests = minimum; requests <= 2_000; requests += 1) {
+    assert.equal(pages({ requests, fiveXx: requests }), true, String(requests));
+  }
+  for (let requests = 1; requests < minimum; requests += 1) {
+    assert.equal(pages({ requests, fiveXx: requests }), false, String(requests));
+  }
+  // One error never pages at any volume, even as increase() reads it: about
+  // 1.1 with 60 s samples (45 real requests can read as 50.0), 2 or more for
+  // a sparse series. Anything under the minimum is safe.
+  assert.equal(pages({ requests: 50, fiveXx: 1.11 }), false);
+  for (const requests of [1, 2, 5, 31, 45, 49, 50, 51, 249, 250, 10_000]) {
+    for (const fiveXx of [1, 1.11, 2, 3.2, minimum - 0.01]) {
+      assert.equal(pages({ requests: Math.max(requests, fiveXx), fiveXx }), false, `${fiveXx} of ${requests}`);
+    }
+  }
+  // From minimum / ratio = 250 requests a window, the 2 % share binds (strictly).
+  assert.equal(minimum / ratio, 250);
+  assert.equal(pages({ requests: 249, fiveXx: 5 }), true);
+  assert.equal(pages({ requests: 250, fiveXx: 5 }), false, "exactly 2 %");
+  assert.equal(pages({ requests: 300, fiveXx: 5 }), false, "five errors under 2 %");
+  assert.equal(pages({ requests: 1_000, fiveXx: 20 }), false, "exactly 2 %");
+  assert.equal(pages({ requests: 1_000, fiveXx: 21 }), true);
+  // More errors in the same window never stop a page.
+  for (const requests of [10, 60, 300, 1_000]) {
+    let paged = false;
+    for (let fiveXx = 0; fiveXx <= requests; fiveXx += 1) {
+      const now = pages({ requests, fiveXx });
+      assert.ok(!paged || now, `${fiveXx} of ${requests}`);
+      paged = now;
+    }
+  }
+  // No series: no 5xx at all, or no request reached Cloud Run at all, which
+  // is what an edge-to-origin outage looks like from here (edge-health's job).
+  assert.equal(evaluateFiveXx(promql, { fiveXx: null, requests: 40, excluded: null }), null);
+  assert.equal(evaluateFiveXx(promql, { fiveXx: null, requests: null, excluded: null }), null);
+  // The evaluator refuses a shape it does not know.
+  assert.throws(() => evaluateFiveXx(`${promql} * 2`, { fiveXx: 1, requests: 1, excluded: null }));
+});
+
+test("the deliberate unported answers come off both counts and never page", () => {
+  const promql = query(monitoring.renderMonitoring(STAGING), "origin-5xx-ratio");
+  const pages = (window) => evaluateFiveXx(promql, window) !== null;
+  // Only unported answers fail: nothing pages, however many.
+  for (const excluded of [5, 30, 500]) {
+    assert.equal(pages({ requests: excluded + 10, fiveXx: excluded, excluded }), false, String(excluded));
+  }
+  // Net of them, five real errors page; four do not.
+  assert.equal(pages({ requests: 100, fiveXx: 30, excluded: 25 }), true);
+  assert.equal(pages({ requests: 100, fiveXx: 30, excluded: 26 }), false);
+  // The request count is net too: 6 of 300 is exactly 2 %, 6 of the 246 counted is 2.4 %.
+  assert.equal(pages({ requests: 300, fiveXx: 60, excluded: 54 }), true);
+  // Until the origin logs its line the term is 0, so unported 503s count as errors.
+  assert.equal(pages({ requests: 40, fiveXx: 10, excluded: null }), true);
 });
 
 test("5xx exclusions name round 12's retired routes and the deliberate unported answers by exact path", () => {
@@ -250,31 +448,61 @@ test("5xx exclusions refuse a code alone, an inexact path, a kept route and the 
   }
 });
 
-test("the scanner refuses a rendered 5xx query that drops the floor or excludes by code alone", () => {
+test("the scanner refuses a 5xx policy that differs from the contract in any part", () => {
   const rendered = monitoring.renderMonitoring(STAGING);
   const index = rendered.policies.findIndex(({ id }) => id === "origin-5xx-ratio");
   const tampered = (edit) => {
     const copy = structuredClone(rendered);
-    const condition = copy.policies[index].body.conditions[0].conditionPrometheusQueryLanguage;
-    condition.query = edit(condition.query);
+    edit(copy.policies[index].body, copy);
     return () => monitoring.scanMonitoringPrivacy(copy);
   };
+  const rewrite = (change) => (body) => {
+    const condition = body.conditions[0].conditionPrometheusQueryLanguage;
+    condition.query = change(condition.query);
+  };
+  const minimumClause = (promql) => promql.lastIndexOf(" and on() (");
+  const allFiveXx = 'sum(increase(run_googleapis_com:request_count{monitored_resource="cloud_run_revision",'
+    + `service_name="${STAGING.service.name}",response_code_class="5xx"}[10m]))`;
   for (const [edit, code] of [
-    [(promql) => promql.replaceAll(/routeClass=~"[^"]*",/gu, ""), "MONITORING_5XX_EXCLUSION_CODE_ALONE"],
-    [(promql) => promql.replaceAll('code="POSTGRES_ROUTE_NOT_PORTED"', 'code=~"POSTGRES_ROUTE_NOT_PORTED"'),
+    // Exclusions: never by code alone, by route alone, or beyond the table.
+    [rewrite((promql) => promql.replaceAll(/routeClass=~"[^"]*",/gu, "")), "MONITORING_5XX_EXCLUSION_CODE_ALONE"],
+    [rewrite((promql) => promql.replaceAll('code="POSTGRES_ROUTE_NOT_PORTED"', 'code=~"POSTGRES_ROUTE_NOT_PORTED"')),
       "MONITORING_5XX_EXCLUSION_CODE_ALONE"],
-    [(promql) => promql.replaceAll('routeClass=~"enroll|', 'routeClass=~"contributions|enroll|'),
+    [rewrite((promql) => promql.replaceAll(',code="POSTGRES_ROUTE_NOT_PORTED"', "")),
+      "MONITORING_5XX_EXCLUSION_SELECTOR_INVALID"],
+    [rewrite((promql) => promql.replaceAll(',status="503",code="POSTGRES_ROUTE_NOT_PORTED"', "")),
+      "MONITORING_5XX_EXCLUSION_SELECTOR_INVALID"],
+    [rewrite((promql) => promql.replaceAll(',status="503",', ",")), "MONITORING_5XX_EXCLUSION_SELECTOR_INVALID"],
+    [rewrite((promql) => promql.replaceAll('routeClass=~"enroll|', 'routeClass=~"contributions|enroll|')),
       "MONITORING_5XX_EXCLUSION_NOT_LISTED"],
-    [(promql) => promql.replaceAll('routeClass=~"enroll|', 'routeClass=~".*|'), "MONITORING_5XX_EXCLUSION_NOT_LISTED"],
-    [(promql) => promql.replaceAll("POSTGRES_ROUTE_NOT_PORTED", "POSTGRES_TEST_ROUTE_UNSUPPORTED"),
+    [rewrite((promql) => promql.replaceAll('routeClass=~"enroll|', 'routeClass=~".*|')), "MONITORING_5XX_EXCLUSION_NOT_LISTED"],
+    [rewrite((promql) => promql.replaceAll('status="503"', 'status="500"')), "MONITORING_5XX_EXCLUSION_NOT_LISTED"],
+    [rewrite((promql) => promql.replaceAll("POSTGRES_ROUTE_NOT_PORTED", "POSTGRES_TEST_ROUTE_UNSUPPORTED")),
       "MONITORING_5XX_EXCLUSION_CODE_FORBIDDEN"],
-    [(promql) => promql.replaceAll("POSTGRES_ROUTE_NOT_PORTED", "EDGE_ORIGIN_UNAVAILABLE"),
+    [rewrite((promql) => promql.replaceAll("POSTGRES_ROUTE_NOT_PORTED", "EDGE_ORIGIN_UNAVAILABLE")),
       "MONITORING_5XX_EXCLUSION_CODE_FORBIDDEN"],
-    [(promql) => promql.slice(0, promql.indexOf(" and on() (")), "MONITORING_5XX_MINIMUM_REQUESTS_MISSING"],
-    [(promql) => promql.replace(/>= 50\)$/u, ">= 1)"), "MONITORING_5XX_MINIMUM_REQUESTS_MISSING"],
+    // The minimum error count turned into a trigger, a no-op or nothing; the share loosened.
+    [rewrite((promql) => promql.replace(" and on() (", " or on() (")), "MONITORING_5XX_QUERY_NOT_CANONICAL"],
+    [rewrite((promql) => promql.replace(" and on() (", " unless on() (")), "MONITORING_5XX_QUERY_NOT_CANONICAL"],
+    [rewrite((promql) => `${promql.slice(0, minimumClause(promql))} and on() (vector(5) >= 5)`),
+      "MONITORING_5XX_QUERY_NOT_CANONICAL"],
+    [rewrite((promql) => promql.slice(0, minimumClause(promql))), "MONITORING_5XX_QUERY_NOT_CANONICAL"],
+    [rewrite((promql) => promql.replace(/>= 5\)$/u, ">= 1)")), "MONITORING_5XX_QUERY_NOT_CANONICAL"],
+    [rewrite((promql) => promql.replace("> 0.02)", "> 0.5)")), "MONITORING_5XX_QUERY_NOT_CANONICAL"],
+    [rewrite((promql) => promql.replaceAll("[10m]", "[1m]")), "MONITORING_5XX_QUERY_NOT_CANONICAL"],
+    // An extra subtraction of every 5xx, or the query moved to another service.
+    [rewrite((promql) => promql.replaceAll("or vector(0))))", `or vector(0)) - ${allFiveXx}))`)),
+      "MONITORING_5XX_QUERY_NOT_CANONICAL"],
+    [rewrite((promql) => promql.replaceAll(STAGING.service.name, "other-origin")), "MONITORING_5XX_QUERY_NOT_CANONICAL"],
+    // The duration, an added or a removed condition, or the policy itself.
+    [(body) => { body.conditions[0].conditionPrometheusQueryLanguage.duration = "0s"; }, "MONITORING_5XX_QUERY_NOT_CANONICAL"],
+    [(body) => { body.conditions.push(structuredClone(body.conditions[0])); }, "MONITORING_5XX_QUERY_NOT_CANONICAL"],
+    [(body) => { body.conditions = []; }, "MONITORING_5XX_QUERY_NOT_CANONICAL"],
+    [(body, copy) => { copy.policies.splice(index, 1); }, "MONITORING_5XX_QUERY_NOT_CANONICAL"],
   ]) {
     assert.throws(tampered(edit), { code }, code);
   }
+  assert.equal(monitoring.scanMonitoringPrivacy(structuredClone(rendered)), true);
 });
 
 test("refresh alerts: LOCK_HELD, and no completed run within cadence plus slack (a lost lock exits 0)", async () => {
@@ -471,6 +699,13 @@ test("every policy links to its own anchor in the maintained runbook", () => {
   assert.equal(/Open owner item \(OWN-5\)|The owner has two options/u.test(runbook), false);
   const source = readFileSync(join(SCRIPTS_ROOT, "gcp-ops-monitoring-policies.mjs"), "utf8");
   assert.match(source, /DECIDED: the owner accepted\s+\*\s+that delay for a daily trigger/u);
+  // The edge's own unavailable answer never reaches Cloud Run: neither the
+  // runbook nor the code may say origin-5xx-ratio counts it.
+  assert.match(runbook, new RegExp("`EDGE_ORIGIN_UNAVAILABLE` is made at the Cloudflare edge and never\\s+reaches Cloud "
+    + "Run, so it is outside this alert's inputs altogether", "u"));
+  assert.match(source, new RegExp("EDGE_ORIGIN_UNAVAILABLE is made at the Cloudflare edge and never reaches\\s+\\*\\s+Cloud "
+    + "Run, so it is outside origin-5xx-ratio's inputs altogether", "u"));
+  for (const text of [runbook, source]) assert.equal(/EDGE_ORIGIN_UNAVAILABLE`?\s+always count/u.test(text), false);
 });
 
 test("the origin request contract mirrors the origin's own log line where that module exists", async (t) => {
