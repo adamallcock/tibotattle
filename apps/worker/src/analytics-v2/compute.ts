@@ -10,18 +10,31 @@
  * (analytics-v2-test/compose-proof.spec.ts), which this module must reproduce
  * exactly on the same corpus.
  *
- * Scope tonight, each an explicit refusal rather than a fallback:
+ * Scope:
  * - Only owners routed `effective` are computed. Every other owner gets one
  *   owner refusal `non_effective_source_unported`. A non-effective owner with
  *   typed (v1, v1.1 or v1.2) evidence is a member of production's daily
  *   cohort, so every queued day it has evidence on is blocked; when its
  *   occurrences were not supplied, every queued day is blocked. A legacy-only
  *   (v0.2) owner is not a daily cohort member and blocks nothing.
+ * - Dense owners take production's native path (native-path.ts): where the
+ *   vendored shared reducers refuse at their experiment bounds (20,000
+ *   occurrences or 32 MiB a day, 120,000 usage rows or 1,024 pages a window,
+ *   an unrepresentable quota or usage day, a refused quota fold), the owner-day
+ *   or window is computed as d43c8f92's advanceStorageEffectiveAnalysis and
+ *   daily lane compute it. Only the GCP day backstop (resources.ts) refuses a
+ *   day, with the experiment's own reasons.
+ * - An effective owner whose deterministic memory estimate (resources.ts,
+ *   from its evidence counts) exceeds the run's budget is refused as a whole
+ *   before it is read: one owner refusal `memory_budget`, a daily refusal and
+ *   a blocked day for every queued day it has evidence on, no fit, and a
+ *   refused participant on every model date. Nothing of it is written, so its
+ *   stored rows from earlier runs are retained.
  * - A kernel refusal (SharedAnalyticsUnavailable, including the checkedRows
  *   source_conflict_or_order throw for conflict rows, and the cache reducer's
  *   CacheRetentionRefusedError group/session bounds) is recorded per owner,
- *   day and family, and the run carries on. There is no dense or native
- *   fallback. Any other kernel error is a defect and fails the run.
+ *   day and family, and the run carries on. Any other kernel error is a defect
+ *   and fails the run.
  * - A refused owner-day blocks that queued community day; the day keeps its
  *   prior published revision (A-3). A refused scalar fit removes the owner
  *   from the fit cohort and the preview's participant list. A refused model
@@ -29,8 +42,9 @@
  *   refused participant (v1ParticipantCount and refusedParticipantCount), so
  *   the published day states the cohort it could not evaluate. A model date
  *   with no evaluated owner is withheld. Refused evidence is never counted as
- *   zero. (d43c8f92's storage publication instead withholds the model day and
- *   the preview until every member has a result; that is a known divergence.)
+ *   zero. (d43c8f92's storage publication instead withholds a 14-date model
+ *   block until every member has a result; per-date publication with refused
+ *   owners counted is the owner's accepted decision of 2026-10-01.)
  *
  * Input contract (validated, fail closed):
  * - The run uses exactly these days, its horizon: the 170 analysis days
@@ -60,6 +74,13 @@
  *   that has a contributing owner. Within a counted day, an owner without a
  *   count takes production's floor of one device (countStorageDaily-
  *   ContributingDevices: "a contributing owner is at least one device").
+ * - Streaming (the Job): with `loadOwnerOccurrences`, effective owners are not
+ *   in `occurrencesByOwner`. `ownerEvidence` then gives each effective owner's
+ *   exact per-day counts (A-1 countOwnerOccurrences); the memory guard and the
+ *   cache horizon use them, each admitted owner is loaded once in digest
+ *   order and released after it is computed, and a load whose counts differ
+ *   from its evidence fails the run. Without a loader the evidence is counted
+ *   from `occurrencesByOwner` and the results are identical.
  *
  * Daily candidates are stamped with the revision a first publication gets
  * (revisionSeed + 1) and releasedAt = nowMs. `payloadSha256` identifies the
@@ -77,11 +98,7 @@ import {
   buildCommunityDailyPayload,
   buildCommunityModelCompositionDay,
   CACHE_RETENTION_METHOD,
-  evaluateSharedCacheDay,
-  evaluateSharedModelDate,
-  evaluateSharedScalarDate,
   modelHistoryWindow,
-  prepareSharedAnalyticsDay,
   publicInputs,
   validateV11DailyProjectionValues,
   validCachedAdminCommunityAllowancePreview,
@@ -106,14 +123,33 @@ import {
   type AnalyticsV2OwnerDigest,
   type AnalyticsV2OwnerFitsRow,
   type AnalyticsV2OwnerModelDateRow,
+  type AnalyticsV2OwnerResources,
   type AnalyticsV2OwnerSource,
   type AnalyticsV2Phase,
   type AnalyticsV2Refusal,
   type AnalyticsV2RunOutputs,
 } from "./contract";
+import {
+  analyticsV2CacheView,
+  evaluateAnalyticsV2CacheDay,
+  evaluateAnalyticsV2ModelDate,
+  evaluateAnalyticsV2ScalarDate,
+  prepareAnalyticsV2Day,
+  type AnalyticsV2CacheDay,
+  type AnalyticsV2PreparedDay,
+} from "./native-path";
 import { analyticsV2DayDigest, buildAnalyticsV2Pin, EMPTY_DAY_OCCURRENCES,
   type AnalyticsV2DayOccurrences } from "./pin";
 import { analyticsV2Refusal, compareAnalyticsV2Refusals, kernelRefusalReason } from "./refusals";
+import {
+  ANALYTICS_V2_DEFAULT_RESOURCES,
+  ANALYTICS_V2_MAX_READ_DAY_OCCURRENCES,
+  ANALYTICS_V2_MEMORY_MODEL,
+  analyticsV2OwnerMemoryEstimate,
+  validAnalyticsV2Resources,
+  type AnalyticsV2OwnerEvidence,
+  type AnalyticsV2Resources,
+} from "./resources";
 
 export type { AnalyticsV2DayOccurrences } from "./pin";
 
@@ -188,6 +224,28 @@ export interface ComputeAnalyticsV2Input {
   readonly cacheFromDay?: AnalyticsV2Day;
   /** Wall clock for phase timings only; defaults to performance.now. */
   readonly clock?: () => number;
+  /**
+   * Streaming read (the Job): returns one effective owner's occurrences over
+   * the read range. Each admitted effective owner is loaded exactly once, in
+   * digest order, and released after it is computed. With a loader,
+   * occurrencesByOwner holds non-effective owners only and ownerEvidence is
+   * required.
+   */
+  readonly loadOwnerOccurrences?: (ownerDigest: AnalyticsV2OwnerDigest) =>
+    Promise<ReadonlyMap<AnalyticsV2Day, AnalyticsV2DayOccurrences>>;
+  /**
+   * Exact per-day evidence counts of every effective owner over the read
+   * range (A-1 countOwnerOccurrences). Required with a loader and refused
+   * without one, where the counts come from occurrencesByOwner.
+   */
+  readonly ownerEvidence?: ReadonlyMap<AnalyticsV2OwnerDigest, AnalyticsV2OwnerEvidence>;
+  /** Budget and day backstop (resources.ts); defaults to ANALYTICS_V2_DEFAULT_RESOURCES. */
+  readonly resources?: AnalyticsV2Resources;
+  /**
+   * Heap bytes in use, sampled while an owner is computed and recorded as its
+   * heapPeakBytes. Operational metadata only: no decision reads it.
+   */
+  readonly memoryProbe?: () => number;
 }
 
 const invalid = (what: string): never => { throw new TypeError(`ANALYTICS_V2_INPUT_INVALID:${what}`); };
@@ -225,21 +283,58 @@ function analysisStart(today: AnalyticsV2Day): AnalyticsV2Day {
   return addDays(today, -(ANALYTICS_V2_ANALYSIS_DAYS - 1));
 }
 
-/** The first day with evidence of any effective owner in the input, or null. */
-function firstEvidenceDay(owners: readonly AnalyticsV2Owner[],
-  occurrencesByOwner: ReadonlyMap<AnalyticsV2OwnerDigest, ReadonlyMap<AnalyticsV2Day, AnalyticsV2DayOccurrences>>,
+/** The first day, through `throughDay`, with evidence of any owner in `evidenceByOwner`, or null. */
+function firstEvidenceDay(evidenceByOwner: ReadonlyMap<AnalyticsV2OwnerDigest, AnalyticsV2OwnerEvidence>,
   throughDay: AnalyticsV2Day): AnalyticsV2Day | null {
   let first: AnalyticsV2Day | null = null;
-  for (const owner of owners) {
-    if (owner.source !== "effective") continue;
-    const days = occurrencesByOwner.get(owner.ownerDigest);
-    if (!(days instanceof Map)) continue;
-    for (const [day, value] of days) {
-      dayStart(day, "occurrencesByOwner");
-      if (day <= throughDay && hasEvidence(dayOccurrences(value)) && (first === null || day < first)) first = day;
-    }
+  for (const evidence of evidenceByOwner.values()) {
+    for (const day of evidence.keys()) if (day <= throughDay && (first === null || day < first)) first = day;
   }
   return first;
+}
+
+function evidenceTotal(counts: { usage: number; quota: number; session: number }): number {
+  return counts.usage + counts.quota + counts.session;
+}
+
+/** The exact per-day counts of one owner's occurrences: days with evidence only. */
+function evidenceOf(days: ReadonlyMap<AnalyticsV2Day, AnalyticsV2DayOccurrences>): AnalyticsV2OwnerEvidence {
+  const evidence = new Map<AnalyticsV2Day, { usage: number; quota: number; session: number }>();
+  for (const [day, value] of days) {
+    const occurrences = dayOccurrences(value);
+    const counts = { usage: occurrences.usage.length, quota: occurrences.quota.length,
+      session: occurrences.session.length };
+    if (evidenceTotal(counts) > 0) evidence.set(day, Object.freeze(counts));
+  }
+  return evidence;
+}
+
+/** A supplied evidence map: valid days inside `range`, non-negative counts, no empty day. */
+function validEvidence(value: unknown, range: AnalyticsV2DayRange): AnalyticsV2OwnerEvidence {
+  if (!(value instanceof Map)) invalid("ownerEvidence");
+  for (const [day, counts] of value as Map<unknown, unknown>) {
+    dayStart(day as string, "ownerEvidence");
+    if ((day as string) < range.fromDay || (day as string) > range.throughDay) invalid("ownerEvidence.range");
+    const entry = counts as Record<string, unknown> | null;
+    if (!entry || typeof entry !== "object"
+      || Object.keys(entry).sort().join(",") !== "quota,session,usage"
+      || ![entry.usage, entry.quota, entry.session].every((count) => Number.isSafeInteger(count) && (count as number) >= 0)
+      || evidenceTotal(entry as { usage: number; quota: number; session: number }) === 0) invalid("ownerEvidence");
+  }
+  return value as AnalyticsV2OwnerEvidence;
+}
+
+/** True when `days` holds exactly the occurrences `evidence` counts. */
+function matchesEvidence(days: ReadonlyMap<AnalyticsV2Day, AnalyticsV2DayOccurrences>,
+  evidence: AnalyticsV2OwnerEvidence): boolean {
+  const counted = evidenceOf(days);
+  if (counted.size !== evidence.size) return false;
+  for (const [day, counts] of counted) {
+    const expected = evidence.get(day);
+    if (expected === undefined || expected.usage !== counts.usage || expected.quota !== counts.quota
+      || expected.session !== counts.session) return false;
+  }
+  return true;
 }
 
 /**
@@ -374,10 +469,44 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
   for (const day of queuedInput) dayStart(day, "queuedDays");
   const queued = [...new Set(queuedInput)].sort();
   if (!(input.occurrencesByOwner instanceof Map) || !(input.devicesByDay instanceof Map)) invalid("maps");
+  const resources = validAnalyticsV2Resources(input.resources ?? ANALYTICS_V2_DEFAULT_RESOURCES);
+  const loader = input.loadOwnerOccurrences;
+  if (loader !== undefined && typeof loader !== "function") invalid("loadOwnerOccurrences");
+  if ((loader === undefined) !== (input.ownerEvidence === undefined)) invalid("ownerEvidence");
+  if (input.memoryProbe !== undefined && typeof input.memoryProbe !== "function") invalid("memoryProbe");
+  const ownerSet = new Set(owners.map((owner) => owner.ownerDigest));
+  const effectiveDigests = owners.filter((owner) => owner.source === "effective").map((owner) => owner.ownerDigest);
+  for (const [ownerDigest, days] of input.occurrencesByOwner) {
+    if (!ownerSet.has(ownerDigest) || !(days instanceof Map)) invalid("occurrencesByOwner");
+    for (const [day, value] of days) {
+      dayStart(day, "occurrencesByOwner");
+      dayOccurrences(value);
+    }
+  }
+  // The effective owners' evidence: counted from the supplied occurrences, or
+  // the reader's exact counts when owners are streamed.
+  const evidenceByOwner = new Map<AnalyticsV2OwnerDigest, AnalyticsV2OwnerEvidence>();
+  if (loader === undefined) {
+    for (const ownerDigest of effectiveDigests) {
+      const days = input.occurrencesByOwner.get(ownerDigest);
+      if (days === undefined) invalid("occurrencesByOwner.missingEffectiveOwner");
+      evidenceByOwner.set(ownerDigest, evidenceOf(days!));
+    }
+  } else {
+    if (!(input.ownerEvidence instanceof Map)) invalid("ownerEvidence");
+    for (const [ownerDigest, evidence] of input.ownerEvidence!) {
+      if (!effectiveDigests.includes(ownerDigest) || !(evidence instanceof Map)) invalid("ownerEvidence");
+      for (const day of evidence.keys()) dayStart(day, "ownerEvidence");
+    }
+    for (const ownerDigest of effectiveDigests) {
+      if (input.occurrencesByOwner.has(ownerDigest)) invalid("occurrencesByOwner.streamedEffectiveOwner");
+      if (!input.ownerEvidence!.has(ownerDigest)) invalid("ownerEvidence.missingEffectiveOwner");
+    }
+  }
   // Production has no lower bound on cache history: by default the cache
   // horizon is the first evidence day (never later than the analysis start).
   const evidenceFrom = input.cacheFromDay === undefined
-    ? firstEvidenceDay(owners, input.occurrencesByOwner, today) : null;
+    ? firstEvidenceDay(loader === undefined ? evidenceByOwner : input.ownerEvidence!, today) : null;
   const cacheFromDay = input.cacheFromDay
     ?? (evidenceFrom !== null && evidenceFrom < analysisStart(today) ? evidenceFrom : analysisStart(today));
   const required = analyticsV2RequiredOccurrenceRange({ nowMs, queuedDays: queued,
@@ -388,13 +517,13 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
   if (!range || typeof range !== "object") invalid("occurrenceRange");
   dayStart(range.fromDay, "occurrenceRange"); dayStart(range.throughDay, "occurrenceRange");
   if (range.fromDay > required.fromDay || range.throughDay < required.throughDay) invalid("occurrenceRange");
-  const ownerSet = new Set(owners.map((owner) => owner.ownerDigest));
-  for (const [ownerDigest, days] of input.occurrencesByOwner) {
-    if (!ownerSet.has(ownerDigest) || !(days instanceof Map)) invalid("occurrencesByOwner");
-    for (const [day, value] of days) {
-      dayStart(day, "occurrencesByOwner");
-      if (day < range.fromDay || day > range.throughDay) invalid("occurrencesByOwner.range");
-      dayOccurrences(value);
+  const inRange = (days: ReadonlyMap<AnalyticsV2Day, unknown>): void => {
+    for (const day of days.keys()) if (day < range.fromDay || day > range.throughDay) invalid("occurrencesByOwner.range");
+  };
+  for (const days of input.occurrencesByOwner.values()) inRange(days);
+  if (loader !== undefined) {
+    for (const [ownerDigest, evidence] of input.ownerEvidence!) {
+      evidenceByOwner.set(ownerDigest, validEvidence(evidence, range));
     }
   }
   for (const [day, counts] of input.devicesByDay) {
@@ -409,63 +538,111 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
 
   const analysisDays = daysBetween(addDays(today, -(ANALYTICS_V2_ANALYSIS_DAYS - 1)), today);
   const modelDates = analysisDays.slice(-ANALYTICS_V2_MODEL_DATES);
+  const analysisFrom = analysisDays[0]!;
   // Cache days end today: a day after today is never a cache band, whatever
   // the read range happened to include.
-  const cacheDays = daysBetween(cacheFromDay, today);
   const queuedSet = new Set(queued);
   const refusals: AnalyticsV2Refusal[] = [];
   const ownerDays: AnalyticsV2OwnerDayRow[] = [];
   const cacheBands: AnalyticsV2CacheBandRow[] = [];
   const ownerFits: AnalyticsV2OwnerFitsRow[] = [];
   const ownerModelDates: AnalyticsV2OwnerModelDateRow[] = [];
+  const ownerResources: AnalyticsV2OwnerResources[] = [];
   const blocked = new Set<AnalyticsV2Day>();
-  /** queued day -> effective owner -> unfinalized daily values (owners in digest order). */
+  /** queued day -> computed owner -> unfinalized daily values (owners in digest order). */
   const dailyValues = new Map<AnalyticsV2Day, Map<AnalyticsV2OwnerDigest, V11DailyProjectionValues>>(
     queued.map((day) => [day, new Map()]));
   const fitsByOwner = new Map<AnalyticsV2OwnerDigest, readonly CommunityAllowanceFit[]>();
   const compositionsByDate = new Map<AnalyticsV2Day, Array<{ ownerDigest: string; result: V1ModelCompositionResult }>>(
     modelDates.map((day) => [day, []]));
-  /** model date -> effective owners whose evaluation the kernels refused. */
+  /** model date -> effective owners whose evaluation was refused (kernels or memory budget). */
   const modelRefusedByDate = new Map<AnalyticsV2Day, number>(modelDates.map((day) => [day, 0]));
-  const effectiveOwners: AnalyticsV2Owner[] = [];
+  /** Effective owners that were computed (admitted by the memory budget). */
+  const computedOwners: AnalyticsV2Owner[] = [];
+  // Every day a window, the cache horizon or the queue needs. Empty days are
+  // prepared too: a window is complete only when every one of its days is
+  // present. Evidence elsewhere in the read range is outside this run's
+  // horizon, so the outputs depend only on nowMs, the queue and cacheFromDay,
+  // never on how widely A-1 happened to read.
+  const neededDays = [...new Set<AnalyticsV2Day>([...analysisDays,
+    ...daysBetween(addDays(cacheFromDay, -CACHE_LOOKBACK_DAYS), today), ...queued])].sort();
+  const neededSet = new Set(neededDays);
 
   for (const owner of owners) {
-    const occurrences = input.occurrencesByOwner.get(owner.ownerDigest);
+    const ownerDigest = owner.ownerDigest;
     if (owner.source !== "effective") {
-      refusals.push(analyticsV2Refusal(owner.ownerDigest, null, "owner", "non_effective_source_unported"));
+      const occurrences = input.occurrencesByOwner.get(ownerDigest);
+      refusals.push(analyticsV2Refusal(ownerDigest, null, "owner", "non_effective_source_unported"));
       // Typed evidence makes the owner a member of production's daily cohort:
       // a queued day it may have evidence on cannot be published without it.
       if (owner.hasV1 || owner.hasV11 || owner.hasV12) {
         for (const day of queued) {
           if (occurrences !== undefined && !hasEvidence(occurrences.get(day))) continue;
           blocked.add(day);
-          refusals.push(analyticsV2Refusal(owner.ownerDigest, day, "daily", "non_effective_source_unported"));
+          refusals.push(analyticsV2Refusal(ownerDigest, day, "daily", "non_effective_source_unported"));
         }
       }
       continue;
     }
-    if (occurrences === undefined) invalid("occurrencesByOwner.missingEffectiveOwner");
-    effectiveOwners.push(owner);
-    const ownerDigest = owner.ownerDigest;
 
-    // ---- Prepare every day a window, the cache horizon or the queue needs.
-    // Empty days are prepared too: a window is complete only when every one of
-    // its days is present. Evidence elsewhere in the read range is outside this
-    // run's horizon, so the outputs depend only on nowMs, the queue and
-    // cacheFromDay, never on how widely A-1 happened to read.
-    const needed = new Set<AnalyticsV2Day>([...analysisDays, ...daysBetween(addDays(cacheFromDay, -CACHE_LOOKBACK_DAYS),
-      today), ...queued]);
-    const prepared = new Map<AnalyticsV2Day, SharedAnalyticsDay>();
+    // ---- The memory guard: a pure function of the evidence counts on the
+    // days this run uses, so a wider read never moves a decision. (The Job
+    // reads exactly those days, give or take queued days after today.)
+    const evidence = evidenceByOwner.get(ownerDigest)!;
+    const estimate = analyticsV2OwnerMemoryEstimate(
+      new Map([...evidence].filter(([day]) => neededSet.has(day))), analysisFrom, today);
+    const resource = { ownerDigest, ...estimate.occurrences, analysisUsage: estimate.analysisUsage,
+      maxDayOccurrences: estimate.maxDayOccurrences, estimateBytes: estimate.estimateBytes };
+    if (estimate.estimateBytes > resources.memoryBudgetBytes
+      || estimate.maxDayOccurrences > ANALYTICS_V2_MAX_READ_DAY_OCCURRENCES) {
+      refusals.push(analyticsV2Refusal(ownerDigest, null, "owner", "memory_budget"));
+      for (const day of queued) {
+        if (!evidence.has(day)) continue;
+        blocked.add(day);
+        refusals.push(analyticsV2Refusal(ownerDigest, day, "daily", "memory_budget"));
+      }
+      for (const day of modelDates) modelRefusedByDate.set(day, modelRefusedByDate.get(day)! + 1);
+      ownerResources.push(Object.freeze({ ...resource, admitted: false, heapPeakBytes: null }));
+      continue;
+    }
+
+    const occurrences = loader === undefined ? input.occurrencesByOwner.get(ownerDigest)!
+      : await timed("read", () => loader(ownerDigest));
+    if (loader !== undefined) {
+      if (!(occurrences instanceof Map)) invalid("loadOwnerOccurrences");
+      for (const [day, value] of occurrences) {
+        dayStart(day, "loadOwnerOccurrences");
+        dayOccurrences(value);
+      }
+      inRange(occurrences);
+      if (!matchesEvidence(occurrences, evidence)) invalid("loadOwnerOccurrences.evidence");
+    }
+    computedOwners.push(owner);
+    let heapPeak: number | null = null;
+    const sample = (): void => {
+      if (input.memoryProbe === undefined) return;
+      const used = input.memoryProbe();
+      if (Number.isSafeInteger(used) && used >= 0 && (heapPeak === null || used > heapPeak)) heapPeak = used;
+    };
+    sample();
+
+    // ---- Prepare every needed day once; cache days are reduced as soon as
+    // their 7-day lookback is prepared. Only the 170 analysis days keep their
+    // prepared usage rows; cache views are kept while a later day's lookback
+    // can reach them.
+    const prepared = new Map<AnalyticsV2Day, AnalyticsV2PreparedDay>();
+    const cacheViews = new Map<AnalyticsV2Day, AnalyticsV2CacheDay>();
     const dayDigests = new Map<AnalyticsV2Day, string>();
-    await timed("prepare", async () => {
-      for (const day of [...needed].sort()) {
-        const value = occurrences!.get(day) ?? EMPTY_DAY_OCCURRENCES;
-        if (day >= analysisDays[0]! && day <= today) dayDigests.set(day, await analyticsV2DayDigest(day, value));
+    for (const day of neededDays) {
+      const value = occurrences.get(day) ?? EMPTY_DAY_OCCURRENCES;
+      await timed("prepare", async () => {
+        if (day >= analysisFrom && day <= today) dayDigests.set(day, await analyticsV2DayDigest(day, value));
         let refusal: AnalyticsV2Refusal["reason"] | null = null, daily: V11DailyProjectionValues | null = null;
         try {
-          const shared = await prepareSharedAnalyticsDay({ day, ownerDigest, usage: value.usage,
-            quota: value.quota, session: value.session });
-          prepared.set(day, shared);
+          const shared = await prepareAnalyticsV2Day({ day, ownerDigest, usage: value.usage,
+            quota: value.quota, session: value.session }, resources);
+          if (day >= analysisFrom && day <= today) prepared.set(day, shared);
+          cacheViews.set(day, analyticsV2CacheView(shared));
           daily = stripFinalized(shared.daily);
           validateV11DailyProjectionValues(daily);
         } catch (error) {
@@ -478,16 +655,45 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
           else dailyValues.get(day)!.set(ownerDigest, daily);
         }
         if (hasEvidence(value)) ownerDays.push(Object.freeze({ ownerDigest, day, daily, refusal }));
+      });
+      sample();
+      // ---- Cache continuity: the day with its 7-day carry. A prepared day
+      // with no cache items has no groups and needs no reducer call; a refused
+      // day or lookback day is absent, and the reducer records that.
+      if (day >= cacheFromDay && day <= today) {
+        await timed("cache", () => {
+          const own = cacheViews.get(day);
+          if (own !== undefined && own.cacheItems.length === 0) return;
+          try {
+            const aggregate = evaluateAnalyticsV2CacheDay({ day, ownerDigest,
+              days: daysBetween(addDays(day, -CACHE_LOOKBACK_DAYS), day).flatMap((value) => cacheViews.get(value) ?? []) });
+            for (const group of aggregate.groups) {
+              for (const band of group.bands) {
+                cacheBands.push(Object.freeze({ ownerDigest, day, model: group.model, effort: group.effort,
+                  band: band.band, counters: bandCounters(band) }));
+              }
+            }
+          } catch (error) {
+            const reason = kernelRefusalReason(error);
+            if (reason === null) throw error;
+            refusals.push(analyticsV2Refusal(ownerDigest, day, "cache", reason));
+          }
+        });
       }
-    });
-    const windowFor = (day: AnalyticsV2Day): SharedAnalyticsDay[] => daysBetween(modelHistoryWindow(day).fromDay, day)
-      .flatMap((value) => prepared.get(value) ?? []);
+      const oldest = addDays(day, -CACHE_LOOKBACK_DAYS);
+      for (const kept of [...cacheViews.keys()]) if (kept <= oldest) cacheViews.delete(kept);
+    }
+    cacheViews.clear();
+    const windowFor = (day: AnalyticsV2Day): AnalyticsV2PreparedDay[] =>
+      daysBetween(modelHistoryWindow(day).fromDay, day).flatMap((value) => prepared.get(value) ?? []);
+    const quotaOccurrences = (day: AnalyticsV2Day) => (occurrences.get(day) ?? EMPTY_DAY_OCCURRENCES).quota;
 
     // ---- Current scalar fits: today only.
     await timed("scalar", async () => {
       try {
         const pin = await buildAnalyticsV2Pin({ owner, day: today, dayDigests });
-        const result = await evaluateSharedScalarDate({ pin, day: today, ownerDigest, days: windowFor(today) });
+        const result = await evaluateAnalyticsV2ScalarDate({ pin, day: today, ownerDigest, days: windowFor(today),
+          quotaOccurrences });
         fitsByOwner.set(ownerDigest, result.selectedFits);
         ownerFits.push(Object.freeze({ ownerDigest, asOfDay: today, fits: result.selectedFits }));
       } catch (error) {
@@ -496,14 +702,15 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
         refusals.push(analyticsV2Refusal(ownerDigest, today, "scalar", reason));
       }
     });
+    sample();
 
     // ---- Model history: each of the 70 dates over its own 101-day window.
     await timed("model", async () => {
       for (const day of modelDates) {
         try {
           const pin = await buildAnalyticsV2Pin({ owner, day, dayDigests });
-          const result = await evaluateSharedModelDate({ pin, day, ownerDigest,
-            days: windowFor(day) }) as V1ModelCompositionResult;
+          const result = await evaluateAnalyticsV2ModelDate({ pin, day, ownerDigest, days: windowFor(day),
+            quotaOccurrences }) as V1ModelCompositionResult;
           compositionsByDate.get(day)!.push({ ownerDigest, result });
           ownerModelDates.push(Object.freeze({ ownerDigest, day, result: withoutFingerprint(result) }));
         } catch (error) {
@@ -512,34 +719,11 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
           refusals.push(analyticsV2Refusal(ownerDigest, day, "model", reason));
           modelRefusedByDate.set(day, modelRefusedByDate.get(day)! + 1);
         }
+        sample();
       }
     });
-
-    // ---- Cache continuity: the day with its 7-day carry. A prepared day with
-    // no cache items has no groups and needs no reducer call.
-    await timed("cache", () => {
-      for (const day of cacheDays) {
-        // Every cache day was prepared above; an absent one was refused, and the
-        // reducer records that as incomplete_cache_day.
-        const own = prepared.get(day);
-        if (own !== undefined && own.cacheItems.length === 0) continue;
-        try {
-          const aggregate = evaluateSharedCacheDay({ day, ownerDigest,
-            days: daysBetween(addDays(day, -CACHE_LOOKBACK_DAYS), day).flatMap((value) => prepared.get(value) ?? []) });
-          for (const group of aggregate.groups) {
-            for (const band of group.bands) {
-              cacheBands.push(Object.freeze({ ownerDigest, day, model: group.model, effort: group.effort,
-                band: band.band, counters: bandCounters(band) }));
-            }
-          }
-        } catch (error) {
-          const reason = kernelRefusalReason(error);
-          if (reason === null) throw error;
-          refusals.push(analyticsV2Refusal(ownerDigest, day, "cache", reason));
-        }
-      }
-    });
-    // `prepared` (including transient usage rows) is released with this scope.
+    ownerResources.push(Object.freeze({ ...resource, admitted: true, heapPeakBytes: heapPeak }));
+    // `prepared` (with its usage rows) and the owner's occurrences are released with this scope.
   }
 
   // ---- Community outputs.
@@ -548,12 +732,15 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
     for (const day of queued) {
       if (blocked.has(day)) continue;
       const byOwner = dailyValues.get(day)!;
-      const values = effectiveOwners.map((owner) => byOwner.get(owner.ownerDigest)!);
+      // A memory-refused owner blocks every queued day it has evidence on, so
+      // on an unblocked day it has none: its values would be all zero, and
+      // publicInputs adds nothing for an owner without records.
+      const values = computedOwners.map((owner) => byOwner.get(owner.ownerDigest)!);
       const counted = input.devicesByDay.get(day);
       const devices = values.map((value, index) => {
         if (value.counts.usage + value.counts.quota + value.counts.session === 0) return 0;
         if (counted === undefined) return invalid("devicesByDay.missingDay");
-        return counted.get(effectiveOwners[index]!.ownerDigest) ?? 1;
+        return counted.get(computedOwners[index]!.ownerDigest) ?? 1;
       });
       const inputs = publicInputs(values, devices);
       const payload = buildCommunityDailyPayload({ day, revision: input.revisionSeed + 1, releasedAt: nowIso, ...inputs });
@@ -561,14 +748,14 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
         inputs }));
     }
 
-    const fits = effectiveOwners.flatMap((owner) => fitsByOwner.get(owner.ownerDigest) ?? []);
-    const cohort = effectiveOwners.filter((owner) => fitsByOwner.has(owner.ownerDigest)).map((owner) => owner.ownerDigest);
+    const fits = computedOwners.flatMap((owner) => fitsByOwner.get(owner.ownerDigest) ?? []);
+    const cohort = computedOwners.filter((owner) => fitsByOwner.has(owner.ownerDigest)).map((owner) => owner.ownerDigest);
     const modelDays: AdminCommunityModelCompositionDay[] = [];
     for (const day of modelDates) {
       const evaluated = compositionsByDate.get(day)!;
       if (evaluated.length === 0) continue;
-      // An effective owner the kernels refused for this date is still a
-      // member of its cohort: it is counted as refused, never dropped.
+      // An effective owner the kernels or the memory budget refused for this
+      // date is still a member of its cohort: it is counted as refused, never dropped.
       const refused = modelRefusedByDate.get(day)!;
       const collection: CachedCommunityModelCompositions = { compositions: [], v1ParticipantCount: refused,
         unsupportedSourceParticipantCount: 0, refusedParticipantCount: refused, storeAvailable: true };
@@ -604,5 +791,9 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
     refusals: refusals.sort(compareAnalyticsV2Refusals),
     journal: { lastSequence },
     timings,
+    resources: Object.freeze({
+      configuration: Object.freeze({ memoryModel: ANALYTICS_V2_MEMORY_MODEL.version, ...resources }),
+      owners: Object.freeze(ownerResources),
+    }),
   };
 }

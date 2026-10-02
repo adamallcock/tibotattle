@@ -109,11 +109,25 @@ export const MAX_ANALYTICS_V2_OCCURRENCE_DAYS = 400;
 const FIRST_EVIDENCE_FLOOR_DAY_NUMBER = -100_000;
 /** Occurrence ids expanded per source batch (production's page bound). */
 const EXPANSION_BATCH = 200;
-/** Distinct source variants one batch may expand to (production's bound). */
-const MAX_BATCH_SOURCE_ROWS = 3_200;
-/** Distinct v1.2 variants one batch may expand to (production's bound). */
-const MAX_BATCH_V12_ROWS = 16_384;
-/** Candidate coordinates one call may select before failing closed. */
+/**
+ * Distinct legacy or correction source variants one 200-id batch may expand
+ * to: 200 variants per occurrence. d43c8f92's Worker reader stops at 3,200
+ * (telemetry-usage-effective-reader.ts), a D1 statement bound; the GCP job
+ * holds one batch in memory (about 2 KB per variant), so it reconciles every
+ * variant production's reconcileGroups would see up to this bound.
+ */
+export const MAX_ANALYTICS_V2_BATCH_SOURCE_ROWS = 40_000;
+/** Distinct v1.2 variants one 200-id batch may expand to (production's Worker bound is 16,384). */
+export const MAX_ANALYTICS_V2_BATCH_V12_ROWS = 40_000;
+const MAX_BATCH_SOURCE_ROWS = MAX_ANALYTICS_V2_BATCH_SOURCE_ROWS;
+const MAX_BATCH_V12_ROWS = MAX_ANALYTICS_V2_BATCH_V12_ROWS;
+/**
+ * Candidate coordinates one call may select before failing closed. The Job
+ * splits its reads by the exact counts of countOwnerOccurrences so that a
+ * call stays near its configured read chunk; this is the hard ceiling, and a
+ * day larger than it refuses its owner before any read (resources.ts
+ * ANALYTICS_V2_MAX_READ_DAY_OCCURRENCES).
+ */
 export const MAX_ANALYTICS_V2_CANDIDATES = 2_000_000;
 
 const OCCURRENCE_ID = /^[A-Za-z0-9._:-]{8,128}$/u;
@@ -978,6 +992,63 @@ export async function readOwnerOccurrences(
       output.set(dayFromNumber(day), rows);
     }
     return output;
+  });
+}
+
+/** Renumber a statement's $n parameters by `offset` so several statements share one parameter list. */
+function shiftParameters(sql: string, offset: number): string {
+  return sql.replace(/\$(\d+)/gu, (_match, index: string) => `$${Number(index) + offset}`);
+}
+
+/**
+ * The exact number of occurrences readOwnerOccurrences returns for each
+ * observed day of [fromDay, throughDay], without expanding or decoding any
+ * source: the distinct (observed day, occurrence) candidates of the same
+ * selection (v1/v1.1 typed records, v1.2 domain days, and usage-correction
+ * facts when the runtime is active), counted in SQL. The reader emits one
+ * occurrence per candidate and day, so the analytics-refresh Job uses these
+ * counts for its memory guard and read spans before reading anything, and
+ * A-2 refuses a load whose counts differ. Days without candidates are absent.
+ */
+export async function countOwnerOccurrences(
+  context: AnalyticsV2SnapshotContext,
+  options: Omit<ReadOwnerOccurrencesOptions, "maxCandidates">,
+): Promise<Map<AnalyticsV2Day, number>> {
+  const s = quotedSchema(context.schema);
+  const now = nowTimestamp(context.nowMs);
+  const { ownerDigest, stream, fromDay, throughDay } = normalizeOptions({
+    ownerDigest: options?.ownerDigest, stream: options?.stream, fromDay: options?.fromDay,
+    throughDay: options?.throughDay,
+  } as ReadOwnerOccurrencesOptions);
+  return onReadSnapshot(context, async (client) => {
+    const scope = await readOwnerScope(client, s, ownerDigest);
+    const participantId = scope.participantId;
+    const sources: string[] = [];
+    const values: unknown[] = [];
+    const add = (sql: string, binds: readonly unknown[]): void => {
+      sources.push(`SELECT observed_day,occurrence_id FROM (${shiftParameters(sql, values.length)}) source`);
+      values.push(...binds);
+    };
+    if (scope.v1Namespace !== null || scope.v11Namespace !== null) {
+      add(legacyCandidatesSql(s), [ownerDigest, participantId, STREAM_CODES[stream], stream, fromDay, throughDay]);
+    }
+    if (scope.v12HeadActive) {
+      add(v12CandidatesSql(s), [participantId, stream, now, dayFromNumber(fromDay), dayFromNumber(throughDay)]);
+    }
+    if (stream === "usage" && scope.correctionActive) {
+      add(correctionCandidatesSql(s), [ownerDigest, fromDay * DAY_MS, (throughDay + 1) * DAY_MS]);
+    }
+    const counts = new Map<AnalyticsV2Day, number>();
+    if (sources.length === 0) return counts;
+    const result = await client.query<Record<string, unknown>>(
+      `SELECT observed_day,count(*)::text AS occurrences FROM (${sources.join("\nUNION\n")}) candidate
+        GROUP BY observed_day ORDER BY observed_day`, values);
+    for (const row of result.rows) {
+      const day = safeInteger(row.observed_day, -100_000, 100_000);
+      if (day < fromDay || day > throughDay) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+      counts.set(dayFromNumber(day), safeInteger(row.occurrences, 1));
+    }
+    return counts;
   });
 }
 

@@ -73,6 +73,8 @@ Recorded read-only by the fast-path analysis at the start of the night:
 | OD-8 | Whether v0.1 and v0.2 intake retire at cutover | Open. v1.0 and v1.1 intake are required either way |
 | OD-9 | Nothing touches production; ingestion-side D1 schema on Cloudflare stays frozen until the seal | In force |
 | OD-10 | Optional read-only export of published (day, revision) pairs so GCP revisions continue above them | Open |
+| OD-11 | Raise the GCP caps significantly and prove parity with production's native path for owners beyond them | Owner decision in chat on 2026-10-01; delivered on `claude/gcp-fp-caps` (see [Cap raise](#cap-raise-later-on-2026-10-01)) |
+| OD-12 | Model dates: production withholds a 14-date block until every member has a result, or publish per date with refused owners counted | Owner decision in chat on 2026-10-01: per-date publication is accepted |
 
 ## GCP-native analytics architecture
 
@@ -220,7 +222,7 @@ The rest become one job, one transaction and about eight tables.
 | D01 | Ordered quota and priced usage features | The vendored `d43c8f92` kernels, unchanged |
 | D02 | Resumable model-date batches | An in-memory loop over 70 dates with 101-day windows; no model-block store, no analytics migrations 0030 and 0031, no checkpoints |
 | D03 | Rolling-window reuse | Covered by the in-memory loop; nothing stored |
-| D04 | Statistical finishers | Unchanged: whole-window refusals, joint NNLS, medians and percentiles. Owners over 120,000 window rows or 20,000 rows per day are refusals tonight |
+| D04 | Statistical finishers | Unchanged: whole-window refusals, joint NNLS, medians and percentiles. Windows and days beyond the shared reducers' bounds take production's native path in memory (OD-11); an owner over the job's memory budget is an explicit `memory_budget` refusal |
 | D05 | Adoption into publication | Everything is written in the run's single transaction |
 | E01 | Cache preparation and the 7-day carry | `evaluateSharedCacheDay` with the exact carry, recomputed in full |
 | E02 | Session-neighbor index | Unnecessary: recomputing days d to d+7 is exact by construction |
@@ -411,10 +413,36 @@ or seeded on GCP or Cloudflare, and no production data was read.
   The 70 model dates, the 101-day windows and the 366-day read range stay:
   they are production method and contract constants.
 - **Open owner decisions.** Port production's block-and-withhold model-day
-  rule or accept and disclose per-date publication.
+  rule or accept and disclose per-date publication. (Decided later that day:
+  per-date publication is accepted, OD-12.)
 - **Not yet attempted.** A Docker build of the image, the D-1 test-project
   deploy and seed, the edge, production volumes, dense owners, the native
-  dense fallback and the memo.
+  dense fallback and the memo. (The dense path followed later that day; see
+  below.)
+
+### Cap raise, later on 2026-10-01
+
+Local and synthetic only, on `claude/gcp-fp-caps`; the evidence and gates are
+in the [cap-raise receipt](../receipts/2026-10-01-gcp-fastpath-caps.md).
+
+- The d43c8f92 shared reducers' 20,000-occurrence and 32 MiB day bounds, the
+  120,000-row and 1,024-page window bounds, the optional quota and usage day
+  preparation bounds and the quota fold refusal no longer refuse an owner.
+  `src/analytics-v2/native-path.ts` computes those days and windows the way
+  production's `advanceStorageEffectiveAnalysis` and daily lane do, from the
+  same exported kernel steps; the vendored files are unchanged.
+- A per-owner memory budget replaces them as the job's real limit. Each
+  effective owner's exact evidence counts are read first; an owner whose
+  deterministic estimate exceeds the budget is refused as a whole
+  (`memory_budget`) and never read. The job reads and computes one owner at a
+  time, so the heap holds the largest owner, not the corpus.
+- Defaults fit an 8 GiB Cloud Run task with a 6,144 MiB heap (budget
+  4,608 MiB, day backstop 250,000 occurrences and 256 MiB); each value can be
+  raised by Job environment within its bounds.
+- Parity: for six synthetic dense shapes, one beyond each bound, the scalar
+  fit and model compositions equal d43c8f92's `advanceStorageEffectiveAnalysis`
+  over the same occurrences; a dense day's daily values equal production's
+  one-record fold. The Q-1 rehearsal's served bytes are unchanged.
 
 ## Cutover backlog
 
@@ -434,7 +462,7 @@ still needs its own qualification.
 | PT-3 identity and authority importer, with PT-5a's v1.2 mapping | L | Credential and rotation hashes, owner links, the identity-link pin, consents and grants, accountless state and collection controls, with production target modes built on PT-1 | Import, and device authentication after the flip |
 | PT-4: v0.x importer | M | v0.x contributions and admission windows, or an owner decision to retire v0.x backed by traffic evidence | Completeness of raw evidence |
 | PT-8-lite: orchestrator | L | One disposition per sealed table keyed on the live ledger; the deletion-digest exclusion count; the identity-pin fingerprint check; a history-digest and manifest-digest parity sample between D1 and PostgreSQL | The go/no-go, and avoiding a fleet-wide re-upload storm |
-| Dense-owner path | L (estimate) | Run production's `advanceStorageEffectiveAnalysis` through the HX-4 sealed-SQLite D1 adapter (Node 24.10 or later) as the oracle, then port it and diff against the golden | Cutover: the largest real owner always takes this path |
+| Dense-owner path | M (remaining, estimate) | Delivered in memory on `claude/gcp-fp-caps` (OD-11). Remaining: a dense oracle through the real D1 effective reader (the HX-4 sealed-SQLite adapter, Node 24.10 or later) rather than a stand-in reader; calibrating the memory model on the Cloud SQL seed; choosing the task size for the largest real owner (about 2.52 million records; its estimate is roughly 4.2 to 10 GiB depending on how many fall in the 170 analysis days, so the 8 GiB default admits it only at the low end) | Cutover: the largest real owner always takes this path |
 | Non-effective sources | Depends on OD-4 | v1-only, mixed and v0.2 graph paths, needed only if the production check finds such owners | A parity claim for those owners |
 | Memo mode | M (estimate) | The digest-keyed owner-day memo, the dirty-owner cursor and the nightly full sweep, measured on real data | The cutover cadence (decision D3) |
 | OPS-2 to OPS-5, with OPS-10 | L | Scripted infrastructure with plan, readback and apply; Cloud Run Jobs and Cloud Scheduler as code; probe jobs; monitoring and alerting; the production migration job and rollout | Production origin deploy and operation |
@@ -475,7 +503,7 @@ approves that policy.
 | The separate deletion-ledger instance, the ledger 0007 transfer, the ledger and analytics-history transfer scripts, the staged 0053 erasure fences and the online erasure modules | Decisions D1 and D2 remove them. Deferred, not deleted tonight; the ordering constraint in D6 applies |
 | Register rows built for D1 rescans and Worker statement meters, analytics D1 migrations 0030 to 0035 and the Codex day catalogs | Cloud Run Jobs over PostgreSQL recompute exactly without them |
 | The memo, the worker pool and task sharding | Measured optimizations. The memo is required before the cutover cadence |
-| The dense-owner native path and the v1-only, mixed and v0.2 graph paths | D1-coupled orchestration rather than pure kernels; ported next via the HX-4 oracle. Recorded refusals tonight |
+| The v1-only, mixed and v0.2 graph paths | D1-coupled orchestration rather than pure kernels; ported next via the HX-4 oracle. Recorded refusals tonight. (The dense-owner native path was ported later on 2026-10-01, OD-11) |
 | The legacy GCP daily publisher and its test jobs | Superseded by `analytics-refresh` and the route module once parity passes; retired later in its own change, with tests |
 | Merging the Codex GCP line | The two lines are not reconciled tonight. Candidates to cherry-pick after review: the v1.1 capability failsafe, the gateway allowlist, the identity and social transfer rehearsals |
 | Syncing GitHub `main`, switching the allowance contract to v1.2, lifting capacity ceilings | Each changes kernel packages or parity bases and needs its own owner decision |
@@ -485,8 +513,11 @@ approves that policy.
 - Cutover is not tonight. The remaining critical path covers intake, the edge,
   the importers and seal, the dense path and memo, and production resources and
   secrets from the owner's custody.
-- Dense owners are excluded from tonight's parity gate, so tonight's parity
-  covers effective, non-dense owners on synthetic data only.
+- Dense owners were excluded from the night's parity gate. The cap raise
+  proves dense analysis against production's native kernels with a stand-in
+  reader on synthetic data; the reader at production volumes, production's
+  Worker-only cache refusals (which GCP does not reproduce) and the largest
+  real owner's task size remain open (see the cap-raise receipt).
 - The oracle may not converge under the Workers test pool. The fallback is a
   kernel-composed golden, which proves glue, I/O and the route but not
   production publisher semantics.

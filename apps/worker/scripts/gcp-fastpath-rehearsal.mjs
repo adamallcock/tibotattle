@@ -90,6 +90,12 @@ const PRIVATE_SOCKET = /^\/private\/tmp\/tibotattle-pg-[^/]+\/socket$/u;
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
 const COMMUNITY_DAILY_PATH = "/api/v1/community/daily";
 const REFRESH_TIMEOUT_MS = 30 * 60_000;
+/**
+ * The Node heap analytics-refresh runs with, as the deployed Job does
+ * (gcp-fastpath-test-deploy.mjs REFRESH_JOB_RESOURCES.heapMiB, pinned equal by
+ * its check): the job's default memory budget needs it.
+ */
+export const GCP_FASTPATH_REHEARSAL_REFRESH_HEAP_MIB = 6_144;
 
 class RehearsalError extends Error {
   constructor(code, details = {}) {
@@ -184,8 +190,8 @@ async function runRefresh({ node22, endpointEnv, schema, nowIso }) {
   let stderr;
   let exitCode = 0;
   try {
-    ({ stdout, stderr } = await execFileAsync(node22, [DIST_REFRESH, "--mode=full", `--now=${nowIso}`,
-      `--schema=${schema}`], {
+    ({ stdout, stderr } = await execFileAsync(node22, [`--max-old-space-size=${GCP_FASTPATH_REHEARSAL_REFRESH_HEAP_MIB}`,
+      DIST_REFRESH, "--mode=full", `--now=${nowIso}`, `--schema=${schema}`], {
       cwd: CLOUD_RUN_ROOT,
       env: { PATH: process.env.PATH, HOME: process.env.HOME, ANALYTICS_V2_TEST_CLOCK: "1", ...endpointEnv },
       maxBuffer: 64 * 1024 * 1024,

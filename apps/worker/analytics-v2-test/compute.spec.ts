@@ -15,6 +15,12 @@ import {
   type ComputeAnalyticsV2Input,
 } from "../src/analytics-v2/compute";
 import { ANALYTICS_V2_PHASES, ANALYTICS_V2_REFUSAL_REASONS, type AnalyticsV2Refusal } from "../src/analytics-v2/contract";
+import {
+  ANALYTICS_V2_DEFAULT_RESOURCES,
+  ANALYTICS_V2_MEMORY_MODEL,
+  analyticsV2OwnerMemoryEstimate,
+  validAnalyticsV2Resources,
+} from "../src/analytics-v2/resources";
 import { compareAnalyticsV2Refusals } from "../src/analytics-v2/refusals";
 import {
   CACHE_RETENTION_METHOD,
@@ -41,6 +47,7 @@ import {
   DAY_MS,
   dayMs,
   denseFacts,
+  DENSE_OWNER_PINS,
   effectiveV2Owner,
   label,
   legacyOnlyV2Owner,
@@ -124,6 +131,11 @@ function outputsDigest(outputs: AnalyticsV2ComputeOutputs): string {
   const { timings: _timings, ...rest } = outputs;
   return sha(canonicalJson(rest));
 }
+/** Exact per-day evidence counts of one owner's occurrences (what A-1 countOwnerOccurrences returns). */
+function evidenceOf(days: ReadonlyMap<string, { usage: readonly unknown[]; quota: readonly unknown[]; session: readonly unknown[] }>) {
+  return new Map([...days].filter(([, value]) => value.usage.length + value.quota.length + value.session.length > 0)
+    .map(([day, value]) => [day, { usage: value.usage.length, quota: value.quota.length, session: value.session.length }]));
+}
 const refusalsOf = (outputs: AnalyticsV2ComputeOutputs, ownerDigest: string) =>
   outputs.refusals.filter((refusal) => refusal.ownerDigest === ownerDigest);
 const fitOwners = (outputs: AnalyticsV2ComputeOutputs) => outputs.ownerFits.map((row) => row.ownerDigest);
@@ -196,7 +208,13 @@ describe("computeAnalyticsV2 (A-2)", () => {
     expect(first.refusals.length).toBeGreaterThan(0);
   }, 120_000);
 
-  it("(c) refuses a dense owner's windows explicitly, without throwing, and keeps it out of fits", async () => {
+  // Owner decision 2026-10-01 (raise the caps, prove parity): an owner beyond
+  // the d43c8f92 shared reducers' 120,000-row window bound used to be refused
+  // (usage_window_unrepresentable on the scalar fit and all 70 model dates).
+  // It is now computed on production's native path; native-parity.spec.ts
+  // proves these results equal to d43c8f92 advanceStorageEffectiveAnalysis
+  // over the same denseFacts corpus.
+  it("(c) computes a dense owner's windows beyond the shared 120,000-row bound and keeps it in the cohort", async () => {
     const corpus = composeProofCorpus();
     const dense = syntheticOwner(4, "pro");
     const owners = [...corpus.owners, effectiveV2Owner(dense)];
@@ -208,27 +226,29 @@ describe("computeAnalyticsV2 (A-2)", () => {
     const outputs = await computeAnalyticsV2(inputFor({ owners, occurrencesByOwner }, corpus.publishedDays));
     const wallMs = performance.now() - started;
 
-    const refused = refusalsOf(outputs, dense.digest);
-    expect(refused).toContainEqual({ ownerDigest: dense.digest, day: TODAY, family: "scalar",
-      reason: "usage_window_unrepresentable" });
-    const modelRefusals = refused.filter((refusal) => refusal.family === "model");
-    expect(modelRefusals.length).toBe(ANALYTICS_V2_MODEL_DATES);
-    expect(new Set(modelRefusals.map((refusal) => refusal.reason))).toEqual(new Set(["usage_window_unrepresentable"]));
-    expect(refused.every((refusal) => refusal.family === "scalar" || refusal.family === "model")).toBe(true);
-    expect(fitOwners(outputs)).not.toContain(dense.digest);
-    expect(outputs.ownerModelDates.some((row) => row.ownerDigest === dense.digest)).toBe(false);
+    expect(refusalsOf(outputs, dense.digest)).toEqual([]);
+    expect(outputs.refusals).toEqual([]);
+    expect(fitOwners(outputs)).toContain(dense.digest);
+    const denseFits = outputs.ownerFits.find((row) => row.ownerDigest === dense.digest)!.fits as unknown[];
+    const denseModels = outputs.ownerModelDates.filter((row) => row.ownerDigest === dense.digest);
+    expect(denseModels.length).toBe(ANALYTICS_V2_MODEL_DATES);
+    // Pinned: the dense owner's computed fits and 70 model results.
+    expect({ fits: denseFits.length, fitsSha256: sha(canonicalJson(denseFits)),
+      ready: denseModels.filter((row) => (row.result as { status: string }).status === "ready").length,
+      modelsSha256: sha(canonicalJson(denseModels)) }).toEqual(DENSE_OWNER_PINS);
     const preview = outputs.preview as AdminCommunityAllowancePreview;
-    expect(preview.coverage.uploadingParticipantCount).toBe(3);
-    // Every model day keeps it out of the composition but counts it as refused,
-    // so the published day states the four-owner cohort it could not complete.
+    expect(preview.coverage.uploadingParticipantCount).toBe(4);
+    // Every model day counts the four-owner cohort with nobody refused.
     expect(preview.models.days.length).toBe(ANALYTICS_V2_MODEL_DATES);
-    expect(preview.models.days.every((day) => day.v1ParticipantCount === 4 && day.refusedParticipantCount === 1
-      && day.fittedParticipantCount + day.unstableParticipantCount + day.staleParticipantCount === 3)).toBe(true);
-    // Its daily evidence still publishes: four contributing owners today.
+    expect(preview.models.days.every((day) => day.v1ParticipantCount === 4 && day.refusedParticipantCount === 0)).toBe(true);
     const today = outputs.dailyCandidates.find((candidate) => candidate.day === TODAY)!;
     expect(today.payload.totals.contributingParticipants).toBe(4);
-    // Its dense days still reduce cache continuity.
     expect(outputs.cacheBands.some((row) => row.ownerDigest === dense.digest && row.day === addDays(TODAY, -100))).toBe(true);
+    // Its resource entry: exact counts and the deterministic estimate, within the default budget.
+    const resource = outputs.resources!.owners.find((entry) => entry.ownerDigest === dense.digest)!;
+    expect(resource).toMatchObject({ usage: 7 * 17_200 + 63, quota: 7 * 9 + 63, session: 14, admitted: true,
+      heapPeakBytes: null, maxDayOccurrences: 17_210 });
+    expect(resource.estimateBytes).toBeLessThan(ANALYTICS_V2_DEFAULT_RESOURCES.memoryBudgetBytes);
 
     // Timings for this 4-owner x 170-day corpus, one core.
     expect(Object.keys(outputs.timings).sort()).toEqual(["cache", "community", "model", "prepare", "scalar"]);
@@ -236,25 +256,41 @@ describe("computeAnalyticsV2 (A-2)", () => {
     console.log(JSON.stringify({ a2Timings: { owners: 4, calendarDays: 170, denseWindowUsageRows: windowRows,
       wallMs: Math.round(wallMs), phasesMs: Object.fromEntries(Object.entries(outputs.timings)
         .map(([phase, ms]) => [phase, Math.round(ms!)])), node: process.version } }));
-  }, 600_000);
+  }, 900_000);
 
-  it("(c, day bound) refuses a day over the per-day occurrence bound and blocks that queued community day", async () => {
+  // Owner decision 2026-10-01: the shared reducers' 20,000-occurrence day
+  // bound is replaced by the GCP day backstop (default 250,000). Configured
+  // at its minimum, the old bound, the backstop refuses exactly as before.
+  it("(c, day bound) computes a day over 20,000 occurrences; the backstop at the old bound still refuses it", async () => {
     const corpus = composeProofCorpus();
     const crowded = syntheticOwner(4, "pro");
     const crowdedDay = addDays(TODAY, -30);
-    // 19,995 usage + 9 quota + 1 session rows: over the kernels' 20,000-row day bound.
+    // 19,995 usage + 9 quota + 1 session rows: over the shared reducers' 20,000-row day bound.
     const facts = denseFacts(crowded, { firstDenseBack: 30, denseDays: 1, usagePerDay: 19_995 });
-    const outputs = await computeAnalyticsV2(inputFor({ owners: [...corpus.owners, effectiveV2Owner(crowded)],
+    const input = inputFor({ owners: [...corpus.owners, effectiveV2Owner(crowded)],
       occurrencesByOwner: new Map([...corpus.occurrencesByOwner, [crowded.digest, facts]]) },
-    [...corpus.publishedDays, crowdedDay].sort()));
-    expect(outputs.blockedDays).toEqual([crowdedDay]);
-    expect(refusalsOf(outputs, crowded.digest)).toContainEqual({ ownerDigest: crowded.digest, day: crowdedDay,
+    [...corpus.publishedDays, crowdedDay].sort());
+    const outputs = await computeAnalyticsV2(input);
+    expect(outputs.blockedDays).toEqual([]);
+    expect(outputs.refusals).toEqual([]);
+    const row = outputs.ownerDays.find((value) => value.ownerDigest === crowded.digest && value.day === crowdedDay)!;
+    expect(row.refusal).toBeNull();
+    expect((row.daily as { counts: unknown }).counts).toEqual({ usage: 19_995, quota: 9, session: 1 });
+    expect(fitOwners(outputs)).toContain(crowded.digest);
+    const published = outputs.dailyCandidates.find((candidate) => candidate.day === crowdedDay)!;
+    expect(published.payload.totals).toMatchObject({ contributingParticipants: 1, usageEvents: 19_995,
+      quotaObservations: 9, sessionDimensions: 1 });
+
+    const atOldBound = await computeAnalyticsV2({ ...input,
+      resources: { ...ANALYTICS_V2_DEFAULT_RESOURCES, maxDayOccurrences: 20_000 } });
+    expect(atOldBound.blockedDays).toEqual([crowdedDay]);
+    expect(refusalsOf(atOldBound, crowded.digest)).toContainEqual({ ownerDigest: crowded.digest, day: crowdedDay,
       family: "daily", reason: "day_row_limit" });
-    expect(outputs.ownerDays).toContainEqual({ ownerDigest: crowded.digest, day: crowdedDay, daily: null,
+    expect(atOldBound.ownerDays).toContainEqual({ ownerDigest: crowded.digest, day: crowdedDay, daily: null,
       refusal: "day_row_limit" });
-    expect(fitOwners(outputs)).not.toContain(crowded.digest);
-    expect(outputs.dailyCandidates.map((candidate) => candidate.day)).toEqual(corpus.publishedDays);
-  }, 120_000);
+    expect(fitOwners(atOldBound)).not.toContain(crowded.digest);
+    expect(atOldBound.dailyCandidates.map((candidate) => candidate.day)).toEqual(corpus.publishedDays);
+  }, 240_000);
 
   it("(c, cache bound) records a day over the cache reducer's group bound as that owner-day's refusal and carries on", async () => {
     const corpus = composeProofCorpus();
@@ -447,6 +483,135 @@ describe("computeAnalyticsV2 (A-2)", () => {
     expect([...outputs.refusals].sort(compareAnalyticsV2Refusals)).toEqual(outputs.refusals);
     expect(new Set(outputs.refusals.map((refusal) => canonicalJson(refusal))).size).toBe(outputs.refusals.length);
   }, 120_000);
+
+  it("streams owners through a loader with outputs identical to the in-memory input", async () => {
+    const corpus = composeProofCorpus();
+    const conflictOwner = syntheticOwner(5);
+    const owners = [...corpus.owners, effectiveV2Owner(conflictOwner)];
+    const occurrencesByOwner = new Map([...corpus.occurrencesByOwner,
+      [conflictOwner.digest, conflictFacts(conflictOwner, addDays(TODAY, -1))]]);
+    const input = inputFor({ owners, occurrencesByOwner }, corpus.publishedDays);
+    const inMemory = await computeAnalyticsV2(input);
+    const ownerEvidence = new Map([...occurrencesByOwner].map(([digest, days]) => [digest, evidenceOf(days)]));
+    const loads: string[] = [];
+    const streamed = await computeAnalyticsV2({ ...input, occurrencesByOwner: new Map(), ownerEvidence,
+      loadOwnerOccurrences: async (digest) => { loads.push(digest); return occurrencesByOwner.get(digest)!; },
+      memoryProbe: () => 1_000 });
+    // Each effective owner is loaded once, in digest order.
+    expect(loads).toEqual(owners.map((owner) => owner.ownerDigest).sort());
+    const { timings: _a, resources: inMemoryResources, ...expected } = inMemory;
+    const { timings: streamedTimings, resources: streamedResources, ...actual } = streamed;
+    expect(sha(canonicalJson(actual))).toBe(sha(canonicalJson(expected)));
+    expect(Object.keys(streamedTimings)).toContain("read");
+    // Same counts and estimates; only the sampled heap differs (the probe).
+    expect(streamedResources!.owners.map(({ heapPeakBytes: _peak, ...entry }) => entry))
+      .toEqual(inMemoryResources!.owners.map(({ heapPeakBytes: _peak, ...entry }) => entry));
+    expect(streamedResources!.owners.every((entry) => entry.heapPeakBytes === 1_000)).toBe(true);
+    expect(inMemoryResources!.owners.every((entry) => entry.heapPeakBytes === null)).toBe(true);
+
+    // A load that differs from its counts fails the run; so do mixed modes.
+    const first = owners[0]!.ownerDigest;
+    await expect(computeAnalyticsV2({ ...input, occurrencesByOwner: new Map(), ownerEvidence,
+      loadOwnerOccurrences: async (digest) => (digest === first ? new Map() : occurrencesByOwner.get(digest)!) }))
+      .rejects.toThrow("ANALYTICS_V2_INPUT_INVALID:loadOwnerOccurrences.evidence");
+    await expect(computeAnalyticsV2({ ...input, ownerEvidence,
+      loadOwnerOccurrences: async (digest) => occurrencesByOwner.get(digest)! }))
+      .rejects.toThrow("ANALYTICS_V2_INPUT_INVALID:occurrencesByOwner.streamedEffectiveOwner");
+    await expect(computeAnalyticsV2({ ...input, ownerEvidence }))
+      .rejects.toThrow("ANALYTICS_V2_INPUT_INVALID:ownerEvidence");
+    await expect(computeAnalyticsV2({ ...input, occurrencesByOwner: new Map(),
+      ownerEvidence: new Map([...ownerEvidence].slice(1)),
+      loadOwnerOccurrences: async (digest) => occurrencesByOwner.get(digest)! }))
+      .rejects.toThrow("ANALYTICS_V2_INPUT_INVALID:ownerEvidence.missingEffectiveOwner");
+  }, 240_000);
+
+  it("(memory budget) refuses an owner whose estimate exceeds the budget before reading it, and counts it", async () => {
+    const corpus = composeProofCorpus();
+    const big = syntheticOwner(4, "pro");
+    const bigDay = corpus.publishedDays[3]!;
+    const owners = [...corpus.owners, effectiveV2Owner(big)];
+    // Ten analysis days of 120,000 usage rows, one of them queued: 1.2M rows.
+    const bigEvidence = new Map(Array.from({ length: 10 }, (_, index) => [addDays(bigDay, -index),
+      { usage: 120_000, quota: 9, session: 1 }]));
+    const ownerEvidence = new Map<string, ReadonlyMap<string, { usage: number; quota: number; session: number }>>(
+      [...corpus.occurrencesByOwner].map(([digest, days]) => [digest, evidenceOf(days)]));
+    ownerEvidence.set(big.digest, bigEvidence);
+    const loads: string[] = [];
+    const base = { ...inputFor({ owners, occurrencesByOwner: corpus.occurrencesByOwner }, corpus.publishedDays),
+      occurrencesByOwner: new Map(), ownerEvidence,
+      loadOwnerOccurrences: async (digest: string) => {
+        loads.push(digest);
+        return corpus.occurrencesByOwner.get(digest) ?? new Map();
+      } };
+    const outputs = await computeAnalyticsV2(base);
+    // Never read; one owner refusal and one daily refusal per queued day with evidence.
+    expect(loads).not.toContain(big.digest);
+    const bigQueued = corpus.publishedDays.filter((day) => bigEvidence.has(day));
+    expect(bigQueued).toEqual([bigDay]);
+    expect(refusalsOf(outputs, big.digest)).toEqual([
+      { ownerDigest: big.digest, day: null, family: "owner", reason: "memory_budget" },
+      { ownerDigest: big.digest, day: bigDay, family: "daily", reason: "memory_budget" },
+    ]);
+    expect(outputs.blockedDays).toEqual([bigDay]);
+    expect(outputs.dailyCandidates.map((candidate) => candidate.day))
+      .toEqual(corpus.publishedDays.filter((day) => day !== bigDay));
+    // Nothing of it is written; it leaves the fit cohort and is a refused member of every model date.
+    for (const rows of [outputs.ownerDays, outputs.cacheBands, outputs.ownerFits, outputs.ownerModelDates]) {
+      expect((rows as ReadonlyArray<{ ownerDigest: string }>).some((row) => row.ownerDigest === big.digest)).toBe(false);
+    }
+    const preview = outputs.preview as AdminCommunityAllowancePreview;
+    expect(preview.coverage.uploadingParticipantCount).toBe(3);
+    expect(preview.models.days.length).toBe(ANALYTICS_V2_MODEL_DATES);
+    expect(preview.models.days.every((day) => day.v1ParticipantCount === 4 && day.refusedParticipantCount === 1)).toBe(true);
+    const estimate = analyticsV2OwnerMemoryEstimate(bigEvidence, addDays(TODAY, -169), TODAY);
+    expect(outputs.resources!.owners.find((entry) => entry.ownerDigest === big.digest)).toEqual({
+      ownerDigest: big.digest, usage: 1_200_000, quota: 90, session: 10, analysisUsage: 1_200_000,
+      maxDayOccurrences: 120_010, estimateBytes: estimate.estimateBytes, admitted: false, heapPeakBytes: null });
+    expect(estimate.estimateBytes).toBeGreaterThan(ANALYTICS_V2_DEFAULT_RESOURCES.memoryBudgetBytes);
+    // The other owners are exactly what they are without it.
+    const without = await computeAnalyticsV2(inputFor(corpus, corpus.publishedDays));
+    expect(outputs.ownerFits).toEqual(without.ownerFits);
+    expect(outputs.cacheBands).toEqual(without.cacheBands);
+
+    // The decision follows the configured budget only: at 30 GiB it is admitted (and then read).
+    const roomy = { ...ANALYTICS_V2_DEFAULT_RESOURCES, memoryBudgetBytes: 30_720 * 1_048_576 };
+    await expect(computeAnalyticsV2({ ...base, resources: roomy })).rejects.toThrow(
+      "ANALYTICS_V2_INPUT_INVALID:loadOwnerOccurrences.evidence");
+    expect(loads.filter((digest) => digest === big.digest).length).toBe(1);
+    // A day over one read call's ceiling refuses its owner at any budget.
+    const huge = new Map([...ownerEvidence, [big.digest, new Map([[bigDay, { usage: 2_000_001, quota: 0, session: 0 }]])]]);
+    const hugeOutputs = await computeAnalyticsV2({ ...base, ownerEvidence: huge, resources: roomy });
+    expect(refusalsOf(hugeOutputs, big.digest)[0]).toEqual({ ownerDigest: big.digest, day: null, family: "owner",
+      reason: "memory_budget" });
+  }, 240_000);
+
+  it("estimates owner memory deterministically and validates resources", () => {
+    const evidence = new Map([
+      [addDays(TODAY, -300), { usage: 1_000, quota: 10, session: 1 }],
+      [addDays(TODAY, -5), { usage: 2_000, quota: 20, session: 2 }],
+    ]);
+    const model = ANALYTICS_V2_MEMORY_MODEL;
+    expect(analyticsV2OwnerMemoryEstimate(evidence, addDays(TODAY, -169), TODAY)).toEqual({
+      occurrences: { usage: 3_000, quota: 30, session: 3 }, analysisUsage: 2_000, maxDayOccurrences: 2_022,
+      estimateBytes: model.ownerOverheadBytes + 3_000 * model.heldBytesPerOccurrence.usage
+        + 30 * model.heldBytesPerOccurrence.quota + 3 * model.heldBytesPerOccurrence.session
+        + 2_000 * model.preparedBytesPerAnalysisUsage + 2_022 * model.transientBytesPerLargestDayOccurrence,
+    });
+    expect(validAnalyticsV2Resources(ANALYTICS_V2_DEFAULT_RESOURCES)).toEqual(ANALYTICS_V2_DEFAULT_RESOURCES);
+    for (const resources of [
+      { ...ANALYTICS_V2_DEFAULT_RESOURCES, maxDayOccurrences: 19_999 },
+      { ...ANALYTICS_V2_DEFAULT_RESOURCES, maxDayOccurrences: 250_001 },
+      { ...ANALYTICS_V2_DEFAULT_RESOURCES, maxDayRecordBytes: 32 * 1_048_576 - 1 },
+      { ...ANALYTICS_V2_DEFAULT_RESOURCES, memoryBudgetBytes: 1_024 * 1_048_576 - 1 },
+      { ...ANALYTICS_V2_DEFAULT_RESOURCES, memoryBudgetBytes: 30_720 * 1_048_576 + 1 },
+      { ...ANALYTICS_V2_DEFAULT_RESOURCES, extra: 1 },
+    ]) {
+      expect(() => validAnalyticsV2Resources(resources)).toThrow("ANALYTICS_V2_INPUT_INVALID:resources");
+    }
+    // The defaults: an 8 GiB task with a 6,144 MiB heap.
+    expect(ANALYTICS_V2_DEFAULT_RESOURCES).toEqual({ memoryBudgetBytes: 4_608 * 1_048_576, maxDayOccurrences: 250_000,
+      maxDayRecordBytes: 256 * 1_048_576 });
+  });
 
   it("withholds model days nobody could evaluate and still builds a valid preview", async () => {
     const outputs = await computeAnalyticsV2(inputFor({ owners: [legacyOnlyV2Owner(syntheticOwner(6))],
