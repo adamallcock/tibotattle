@@ -1,0 +1,1600 @@
+{
+  "schemaVersion": "analytics-candidate-checkpoint-v1",
+  "date": "2026-10-02",
+  "branch": "codex/maintained-analytics-framework",
+  "baseCommit": "f056940fefabed0c7f0e88353cf54845b077f0c8",
+  "changedFiles": 318,
+  "files": [
+    {
+      "path": "apps/web/public/admin-client.js",
+      "sha256": "953fcbc84b6f182c0cbb6a2b1ca766d647544be1d8a5d27d507a5c5527580e6a",
+      "bytes": 87363
+    },
+    {
+      "path": "apps/web/public/admin.css",
+      "sha256": "e32a0f00ffd1fba97b2524b7f133fb9e50eb8efdc3d08eea257d6fe34de80721",
+      "bytes": 28559
+    },
+    {
+      "path": "apps/web/public/admin.html",
+      "sha256": "03b31575eb3e30e0cfc5cdd05a34b5759757eb1d4a617e35b31e2a0e333abf4d",
+      "bytes": 27357
+    },
+    {
+      "path": "apps/web/public/admin.js",
+      "sha256": "35813f51ebc9c8fa751f0339e3b3aa2226039158a27c6ade2b7fcf1a98d0f9c8",
+      "bytes": 214693
+    },
+    {
+      "path": "apps/web/test/admin-client.test.mjs",
+      "sha256": "58b5bee5c5caf106b25f0e480129d30fe35f4a116ce5c801277dbaefc95b8bb9",
+      "bytes": 62564
+    },
+    {
+      "path": "apps/web/test/admin-site.test.mjs",
+      "sha256": "97c9617fd13a3c1a3369c902f3ac001a5e72b73e378275099d9e14d99e747066",
+      "bytes": 128533
+    },
+    {
+      "path": "apps/worker/package-lock.json",
+      "sha256": "9754a9a3f7e131294b8294e3249e91539fa60c620917870c01670bb7f720ad5d",
+      "bytes": 104281
+    },
+    {
+      "path": "apps/worker/package.json",
+      "sha256": "69ad589f9abe514a82df408d325ec49daf0e6ad720d853e22e6a477193a75034",
+      "bytes": 16402
+    },
+    {
+      "path": "apps/worker/scripts/d1-storage-plan.mjs",
+      "sha256": "9a2d472eb245632d48d45d7f6a60ba0de2f3973222ae66e0ea85ce48502d044d",
+      "bytes": 18322
+    },
+    {
+      "path": "apps/worker/scripts/d1-storage-restore-runner.mjs",
+      "sha256": "f107c8c0263b74a193d22a09eb73c10adeb57e5e20fba2c46743e5610df82dd1",
+      "bytes": 4978
+    },
+    {
+      "path": "apps/worker/scripts/d1-storage-restore.check.mjs",
+      "sha256": "4c2807b6d5794c00372916cace6657bfc31f6105266ea603cbd572f98fa03216",
+      "bytes": 17443
+    },
+    {
+      "path": "apps/worker/scripts/d1-storage-role.mjs",
+      "sha256": "32eedb8a84400724d59b7742da59d5ce29eea40f2fed70055a081c81badf644b",
+      "bytes": 3360
+    },
+    {
+      "path": "apps/worker/scripts/existing-role-forward-migration.check.mjs",
+      "sha256": "92c9ab65d57630118e6214d9c4369d890698cf296bacdd1ffcabd47765fde43b",
+      "bytes": 32710
+    },
+    {
+      "path": "apps/worker/scripts/production-typed-preflight.check.mjs",
+      "sha256": "58e43bceaa676c868652bd593154423d1451ad7e24a2032285fa514d0da000c3",
+      "bytes": 22994
+    },
+    {
+      "path": "apps/worker/scripts/production-typed-schema.check.mjs",
+      "sha256": "59d3438b074b6d8cdc55eef3e37570b88e2d8c8b68ee5e70264f4cc50f613150",
+      "bytes": 12874
+    },
+    {
+      "path": "apps/worker/scripts/production-typed-schema.mjs",
+      "sha256": "f4e088e9ea5e10a00b022440626b1bf4cb27c7533cec0238485713e7f4ec510d",
+      "bytes": 20023
+    },
+    {
+      "path": "apps/worker/src/accountless-enrollment.ts",
+      "sha256": "cc8799172c503293aea72dbe3843e25988f3d69b3f699cd266c2e33871a5c1e0",
+      "bytes": 21505
+    },
+    {
+      "path": "apps/worker/src/admin-operations.ts",
+      "sha256": "3e864fe49f9b67a8a780c3b88c62dafd9d4926afe563e72db78dcd659c925752",
+      "bytes": 32169
+    },
+    {
+      "path": "apps/worker/src/admin-ui.generated.ts",
+      "sha256": "d87d9be319b1a43a1f2c983d642a055b37460ca3f27d45d8d8b110736e70aabc",
+      "bytes": 510263
+    },
+    {
+      "path": "apps/worker/src/analytics-delivery.ts",
+      "sha256": "de7eb671b9d31f86da8e1d506258c0c23ba0e17bec4957d738ec15df79b46a6a",
+      "bytes": 14382
+    },
+    {
+      "path": "apps/worker/src/analytics-feature-controls.ts",
+      "sha256": "3d65f7a99ad312be673aa5bc01406dbf0a9cabc1fa9408f86ca8db663b1065cc",
+      "bytes": 1034
+    },
+    {
+      "path": "apps/worker/src/analytics-model-block.ts",
+      "sha256": "8a47d6a8972e081cd7cb5d912983c1c16678e0cae2ce6db63aa555eb4abbb3f5",
+      "bytes": 41074
+    },
+    {
+      "path": "apps/worker/src/analytics-shared-features.ts",
+      "sha256": "fb104f3a63d45e83a0337277cc86ba4a86771247ed1fb6f7b863a325b5545c08",
+      "bytes": 14974
+    },
+    {
+      "path": "apps/worker/src/authority-restore-schema.ts",
+      "sha256": "2bd32dfa334822355362c3c27071b8e0ab7d5e97541da1a27b9b827a3e09dc95",
+      "bytes": 5403
+    },
+    {
+      "path": "apps/worker/src/authority-restore.ts",
+      "sha256": "86ccb5dd20850809f60c70fc84c3f732ed1631d2e928e64352df5c4ca68d000c",
+      "bytes": 50061
+    },
+    {
+      "path": "apps/worker/src/cache-retention-day-worker.ts",
+      "sha256": "40543c510a9af974a584a2ae53d25bafe22e2d0ab160bc6e28c8f3e7078fe73e",
+      "bytes": 9466
+    },
+    {
+      "path": "apps/worker/src/cache-retention-day.ts",
+      "sha256": "615237c306717948d515554ed57e94d45abc75970bf71b4bb9fe4d840b389b05",
+      "bytes": 149246
+    },
+    {
+      "path": "apps/worker/src/cache-retention-events.ts",
+      "sha256": "d24830242790897aec027c35cc2bb9c0891fdaf652d4ca6846fd481b35cfbd78",
+      "bytes": 5217
+    },
+    {
+      "path": "apps/worker/src/collection-controls.ts",
+      "sha256": "6a940dc5ac9a10b6a10f6df44121fcf4e2296cb581a223bdadf120ff6307e0ab",
+      "bytes": 3678
+    },
+    {
+      "path": "apps/worker/src/d1-invocation-budget.ts",
+      "sha256": "2ef92b0eb15c83c25f7cd5fc99df8e2aa4dca5b5efacae5256c108349ff8768c",
+      "bytes": 11872
+    },
+    {
+      "path": "apps/worker/src/device-auth.ts",
+      "sha256": "6cc1f39304a439f2b2582f7802e85575786b9faf0c0acd29fcefe57369bd4062",
+      "bytes": 74548
+    },
+    {
+      "path": "apps/worker/src/effective-quota-day.ts",
+      "sha256": "dcda08f60b01e8aae6b4d23ff020cee8bc5b1933a30b9ddb25cb6695de3725e2",
+      "bytes": 11821
+    },
+    {
+      "path": "apps/worker/src/effective-usage-day.ts",
+      "sha256": "a9c6d162d24ae83d4809b156bc66c4592d22b37da46fbfef9f644611bb6a78e5",
+      "bytes": 9568
+    },
+    {
+      "path": "apps/worker/src/index.ts",
+      "sha256": "ccf5cbafa9e6f81928ba3af5b8e4b386c6fb93b83e4f983ac3e1a90bfc300824",
+      "bytes": 219253
+    },
+    {
+      "path": "apps/worker/src/participant-erasure.ts",
+      "sha256": "1013531b869485e872ca507c650dc211e02cf903c4cf9d9739089a3137fcb4d0",
+      "bytes": 13058
+    },
+    {
+      "path": "apps/worker/src/quota-analysis-v1.ts",
+      "sha256": "3db80786302fb66ddf9fd09d0f1241df121654d9f2c525cd80818bb9dea1e5da",
+      "bytes": 147019
+    },
+    {
+      "path": "apps/worker/src/quota-analysis-v11.ts",
+      "sha256": "2f09a35dc193ce01459776668e81f19bf4b00049b01be299c4b5780afdd6c680",
+      "bytes": 105639
+    },
+    {
+      "path": "apps/worker/src/repository.ts",
+      "sha256": "32f1460f5f7ae309306af5942a7eeff67ec81dc59345cd8c6d07304caade81e5",
+      "bytes": 40463
+    },
+    {
+      "path": "apps/worker/src/storage-analytics-runtime.ts",
+      "sha256": "1ad19723c7f61fed09e2972fde6c3ec3ad9f3e1f3d44f5d35412f52fa8d24d70",
+      "bytes": 63203
+    },
+    {
+      "path": "apps/worker/src/storage-analytics-shared-features.ts",
+      "sha256": "db03950805118b4ccd4218d0a4c98051f9105a79204bc583c46b6709e4bd5498",
+      "bytes": 59062
+    },
+    {
+      "path": "apps/worker/src/storage-analytics-worker.ts",
+      "sha256": "a5cccbaa3bbd49e1765689e0552e8f99c62ee71d8925a81aacecafbb8346a3d5",
+      "bytes": 18383
+    },
+    {
+      "path": "apps/worker/src/storage-community-authority.ts",
+      "sha256": "279b369a8025e5a376e74a0d83515592402908d4e06f08ce51cee2960b070818",
+      "bytes": 21930
+    },
+    {
+      "path": "apps/worker/src/storage-community-daily-devices.ts",
+      "sha256": "b6cc626264a6046ff3b9694c7d253b42e88b9d5181eddf0d99ca5d4e630df661",
+      "bytes": 12109
+    },
+    {
+      "path": "apps/worker/src/storage-community-daily.ts",
+      "sha256": "a4841edd4d4b89313eca342d8745c66d0b7628041d1c82f5abaf3785298c53be",
+      "bytes": 50067
+    },
+    {
+      "path": "apps/worker/src/storage-community-graph-model-block.ts",
+      "sha256": "5fe82220655abcc2c4ddcdf32f658b70e737484ad4635dcc04f0c3e748d4ed84",
+      "bytes": 11762
+    },
+    {
+      "path": "apps/worker/src/storage-community-graph-publication.ts",
+      "sha256": "5da9a08e0ff01085fab305412b0b1719b3611d7ffcfb88fde1162f99efc8e431",
+      "bytes": 45755
+    },
+    {
+      "path": "apps/worker/src/storage-community-graph-work.ts",
+      "sha256": "d94704336b7e6e6f03f6529331013371e45921e9c1f2fe40a9f47830c2ccd457",
+      "bytes": 32062
+    },
+    {
+      "path": "apps/worker/src/storage-community-graph.ts",
+      "sha256": "59dd1f825017f2e32abe2b6da8ec296089e0cf1d372b32ce99f304fe04d98932",
+      "bytes": 87786
+    },
+    {
+      "path": "apps/worker/src/storage-community-progress.ts",
+      "sha256": "435d38bb46133627a76f8bea0b8fd5d64e2eec924ccde3f0048a7e5e3f8fdda6",
+      "bytes": 32218
+    },
+    {
+      "path": "apps/worker/src/storage-effective-history.ts",
+      "sha256": "2430cd6e021cf0508e4ae3c916ea2d7cf8d77208dc9b8aae756007d81d20ecf3",
+      "bytes": 80892
+    },
+    {
+      "path": "apps/worker/src/storage-erasure.ts",
+      "sha256": "e4b0009227ee00766a8e7dcf529c123301a8c95cb254d521a2d852955467e8b9",
+      "bytes": 20372
+    },
+    {
+      "path": "apps/worker/src/storage-publication-worker.ts",
+      "sha256": "1918d840fe6586090927c4ab24aa4e8527d721eb67cad3c13f12435bbca13b1e",
+      "bytes": 6251
+    },
+    {
+      "path": "apps/worker/src/storage-v1-history.ts",
+      "sha256": "781e7f281308dd723d44f6ace12691750dfce404fa8b76fdbecca74006d3cf7a",
+      "bytes": 13103
+    },
+    {
+      "path": "apps/worker/src/telemetry-transport-policy.ts",
+      "sha256": "771ef63f1310520ec31cb343e24cba49a7876b1237d7c556dcc7ab4dac6c0b16",
+      "bytes": 43594
+    },
+    {
+      "path": "apps/worker/src/telemetry-usage-correction-repository.ts",
+      "sha256": "a9a41cb9aa9157bfd68e4b55ed89181b2762fb1e5c755a5bafb53797b1634386",
+      "bytes": 67697
+    },
+    {
+      "path": "apps/worker/src/telemetry-usage-effective-reader.ts",
+      "sha256": "a1535f2a4772e01f352d8ce484d5e219bc480c295e0671702fe0769101995f01",
+      "bytes": 70117
+    },
+    {
+      "path": "apps/worker/src/telemetry-v12-effective-reader.ts",
+      "sha256": "0b2166c538677ea7f9e0fd884c05d8aa54c7ed1cbbfa896261c145bab5c0200c",
+      "bytes": 29906
+    },
+    {
+      "path": "apps/worker/src/typed-telemetry-compatibility.ts",
+      "sha256": "a877a3f22cdad7cf5d798c4924d9b9fd75653ee3468e688972388df6141cdf9e",
+      "bytes": 24083
+    },
+    {
+      "path": "apps/worker/src/v11-daily-projection-values.ts",
+      "sha256": "f37b164520d00aba45eb0a3eca9eb1e1f4dfdf3eef720bac85bc776f43a2331a",
+      "bytes": 16988
+    },
+    {
+      "path": "apps/worker/test/analytics-model-block.spec.ts",
+      "sha256": "f723965a47bffe01dd17c12fbefb224c28abfe3dc03bd9ef9e16dc533496cddb",
+      "bytes": 26468
+    },
+    {
+      "path": "apps/worker/test/authority-restore.spec.ts",
+      "sha256": "a04b47b282e37e568405b139f1b1a9c57e074617e24c9dd1134fb1a27c533c0d",
+      "bytes": 23808
+    },
+    {
+      "path": "apps/worker/test/cache-retention-day.spec.ts",
+      "sha256": "75d9dfa0e11913e559fe001d3d374ab2e5a0178607e985d7afcc24b64cfd24a7",
+      "bytes": 107555
+    },
+    {
+      "path": "apps/worker/test/d1-invocation-budget.spec.ts",
+      "sha256": "bb5cf4a6f1be996d7c4c57ce252431cdaa8ae7a91f686074633e8a91b48b18af",
+      "bytes": 8916
+    },
+    {
+      "path": "apps/worker/test/fixtures/shared-analytics-corpus.ts",
+      "sha256": "68b25d49bb80a5727f062244188a333132a2b58f74e245dbae32caeb69fe82e8",
+      "bytes": 33554
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-profile.ts",
+      "sha256": "8f171a55c80dc309ef57a6bcc94e6ac61c4407a0b41b37e284c150e2c15b7533",
+      "bytes": 17793
+    },
+    {
+      "path": "apps/worker/test/storage-analytics-schedule.spec.ts",
+      "sha256": "ccdc352569b4c901141a9ef0f8de3c4157124aca6fcd823a4cfa55b2047b04a5",
+      "bytes": 25558
+    },
+    {
+      "path": "apps/worker/test/storage-analytics-shared-features.spec.ts",
+      "sha256": "6f331c748789b7e051a505b2d232f0e4f9d373c187fcc1068f7d0cf5edb4ef00",
+      "bytes": 47466
+    },
+    {
+      "path": "apps/worker/test/storage-community-daily.spec.ts",
+      "sha256": "fca057a5b9c8c2a2e24a038f2d44ca6e02396399435bddaaf5e5f68af90b4e8a",
+      "bytes": 99505
+    },
+    {
+      "path": "apps/worker/test/storage-community-graph-effective-selection.spec.ts",
+      "sha256": "ecb4dcf1514a96fb254b18e182ee5c530699efc68875b1be0dc057cd97a0163b",
+      "bytes": 32485
+    },
+    {
+      "path": "apps/worker/test/storage-community-graph-publication.spec.ts",
+      "sha256": "941e3a70907ca6589d6634ed0f4b11531eb7dc7b77d8f15e461c214642539c9d",
+      "bytes": 102326
+    },
+    {
+      "path": "apps/worker/test/storage-community-model-block-adoption.spec.ts",
+      "sha256": "8b0c8e25491b7a2b20f112f956f48854d12ea1d46f3a9d3105fb72cd2ef858ef",
+      "bytes": 27670
+    },
+    {
+      "path": "apps/worker/test/storage-effective-history-dependency.spec.ts",
+      "sha256": "e8893f3807a7ee16df01e0d310048569bc479d54e0a20594a7db1672aa177bf2",
+      "bytes": 152125
+    },
+    {
+      "path": "apps/worker/test/storage-erasure.spec.ts",
+      "sha256": "030948f227be5dea56e3bdeb7738b01500fa344cbecf597d49309a26f3eccb75",
+      "bytes": 53537
+    },
+    {
+      "path": "apps/worker/test/storage-pipeline-progress.spec.ts",
+      "sha256": "e41bbde7ce405a1cf0cf91e31969440f33a98f7d9c6995461ee72adb1d6e57b3",
+      "bytes": 14456
+    },
+    {
+      "path": "apps/worker/test/storage-shared-feature-consumers.spec.ts",
+      "sha256": "2ed083f8596d03c481cd7e8cbd644f06de9e24af0ffb65e570c7a574feda5e57",
+      "bytes": 25510
+    },
+    {
+      "path": "apps/worker/test/storage-shared-feature-graph.spec.ts",
+      "sha256": "6ed2374c8d165dc2352d76ae3dc932031424e9f676833aeb74d2942172c6a731",
+      "bytes": 11826
+    },
+    {
+      "path": "apps/worker/test/storage-v1-usage-resume.spec.ts",
+      "sha256": "b8bd5c9722b9f39971bd3f42e179d81c9fc5ec7377aab554e29a5212390effe4",
+      "bytes": 16817
+    },
+    {
+      "path": "apps/worker/test/telemetry-usage-correction-repository.spec.ts",
+      "sha256": "b3858a26966927f92058ece854df4adffd5f641bdb9c93561399edc98ede91d1",
+      "bytes": 40602
+    },
+    {
+      "path": "apps/worker/test/telemetry-usage-effective-reader.spec.ts",
+      "sha256": "dda6735572a59be008bffa8b240566afbe90c04a7695ef60705c4d8d80b16d9e",
+      "bytes": 66426
+    },
+    {
+      "path": "apps/worker/test/telemetry-v12-effective-reader.spec.ts",
+      "sha256": "4b9bbc99e3eb348506b19b0cfd807e2843ea39ebd0db523fe50ca6e3b059f431",
+      "bytes": 20863
+    },
+    {
+      "path": "apps/worker/test/typed-evidence-restore.spec.ts",
+      "sha256": "a548c925df9159642a70f4fe07b6229ad1d6e39cdfb42ce691f48efcf0a602fb",
+      "bytes": 22590
+    },
+    {
+      "path": "apps/worker/wrangler.analytics.example.jsonc",
+      "sha256": "38d57b995734f8ba442f6ba4bdc0fa64aaeffe498718629522aebce16f7c37e6",
+      "bytes": 1027
+    },
+    {
+      "path": "docs/plans/2026-09-28-analytics-redesign.md",
+      "sha256": "73d748738b468904549ab687a1d285164dd1bb9383d0eb93701a539daa1565b0",
+      "bytes": 195315
+    },
+    {
+      "path": "apps/web/test/fixtures/admin-maintained-pipeline-valid.json",
+      "sha256": "1fb96a4834fabfcc17978f5294fa8ab23115aabef7f2ac7f5bd63478d8458734",
+      "bytes": 6515
+    },
+    {
+      "path": "apps/worker/analytics-migrations/0034_shared_preparation_work.sql",
+      "sha256": "d5f63c46022c0a55a3541418047564a42cd55e4e323cc8c30058c6eb09c1f340",
+      "bytes": 13307
+    },
+    {
+      "path": "apps/worker/analytics-migrations/0035_effective_dependency_summaries.sql",
+      "sha256": "3625beb41b0dcd43f1387c914f197501f4af4c3c05d3fa4e27ac7ce8281cc20c",
+      "bytes": 5458
+    },
+    {
+      "path": "apps/worker/analytics-migrations/0036_canonical_analytics_facts.sql",
+      "sha256": "adb62fc7eaec89025a68714073bfd9093904a8a12baa6b39a2e3931f80bf4b60",
+      "bytes": 20827
+    },
+    {
+      "path": "apps/worker/analytics-migrations/0037_canonical_feature_contributions.sql",
+      "sha256": "5cbcb05d7a6bfdb328fe16581d563f7ac4612f5ee65ff28798b83dfd14f0ac42",
+      "bytes": 5566
+    },
+    {
+      "path": "apps/worker/analytics-migrations/0038_analytics_partition_work.sql",
+      "sha256": "0c6932c8bcdd560dd9d22fa678db1519776aabc62aa9fe29438b257920f8bd74",
+      "bytes": 15698
+    },
+    {
+      "path": "apps/worker/analytics-migrations/0039_canonical_rolling_inputs.sql",
+      "sha256": "830fa8f6263dc81211e921c5ffd972f171c1077742a5c61a325183a9c3465462",
+      "bytes": 14172
+    },
+    {
+      "path": "apps/worker/analytics-migrations/0040_canonical_cache_pairs.sql",
+      "sha256": "1b261acb478098a60c15dceb12558a613a8e91a9723c91d6635da4925d84ba73",
+      "bytes": 30608
+    },
+    {
+      "path": "apps/worker/analytics-migrations/0041_canonical_publication_closure.sql",
+      "sha256": "6904c246643994a7680e96628316cb22b2014109487fb83cb404f6f8ed278319",
+      "bytes": 21304
+    },
+    {
+      "path": "apps/worker/analytics-migrations/0042_terminal_replay_coverage.sql",
+      "sha256": "63b39f8af7c10e646e5e8187d2d0b79c18cd15970794855353399177bd26f2ad",
+      "bytes": 7159
+    },
+    {
+      "path": "apps/worker/analytics-migrations/0043_analytics_work_capacity.sql",
+      "sha256": "c3a216f2485aa1dac7a255968a724c32871638328af3f5ad4a6c50dbb1ae0d64",
+      "bytes": 6433
+    },
+    {
+      "path": "apps/worker/analytics-migrations/0044_canonical_quota_identity.sql",
+      "sha256": "73f3c188d209156c947a3b6babcc8acd0ddd40adb69a829c2e49544a4e17d05c",
+      "bytes": 494
+    },
+    {
+      "path": "apps/worker/analytics-migrations/0045_maintained_output_work.sql",
+      "sha256": "4e99d411431a915ce1793f35061f539e601c4c206d473302f70a0c69278dbbc3",
+      "bytes": 12980
+    },
+    {
+      "path": "apps/worker/analytics-migrations/0046_source_empty_outcomes.sql",
+      "sha256": "99f0fefad8db364875afdba743fa7296940a3903662046ed80af4cc49334208b",
+      "bytes": 4174
+    },
+    {
+      "path": "apps/worker/analytics-migrations/0047_analytics_cleanup_cadence.sql",
+      "sha256": "f7434285a02addd9497f44e870c2f635321475b93ec5f8b1e2660fdb06ffe3d9",
+      "bytes": 590
+    },
+    {
+      "path": "apps/worker/analytics-migrations/0048_canonical_cache_prepared_receipts.sql",
+      "sha256": "be89afab7523caf2a5aafcdf68b5bec54566042ba0f7dc9ce5d18e264890a168",
+      "bytes": 864
+    },
+    {
+      "path": "apps/worker/ingestion-isolation-migrations/0014_effective_dependency_mutations.sql",
+      "sha256": "d017de4bd7a18a0334368b34acb1ac6f3ec03c43a7368a4a87c0e67f8a9ebbaa",
+      "bytes": 119312
+    },
+    {
+      "path": "apps/worker/ingestion-isolation-migrations/0015_effective_selective_dependencies.sql",
+      "sha256": "8e6c5e8391fa491816b7eac709737ca05dcda13e87f04f5f82e5c1b9983e60fb",
+      "bytes": 280263
+    },
+    {
+      "path": "apps/worker/ingestion-isolation-migrations/0016_terminal_replay_coverage.sql",
+      "sha256": "6b012125f4f69e4c035c65d22ee86b63c9c71d7d9833078aac3c2ad7d5bf2de9",
+      "bytes": 1647
+    },
+    {
+      "path": "apps/worker/scripts/analytics-functional-startup-inputs.mjs",
+      "sha256": "f8233d557f51df5f3023dd1e1891c75df4f7e4ef4f6bc2cdbcf26e8b76d9020f",
+      "bytes": 2821
+    },
+    {
+      "path": "apps/worker/scripts/analytics-workload-c06-scope-transform.check.mjs",
+      "sha256": "dfef3df122623b76e739eac1edabcce774a1e81f51b095476aed32656890136d",
+      "bytes": 14859
+    },
+    {
+      "path": "apps/worker/scripts/analytics-workload-c06-scope-transform.mjs",
+      "sha256": "6ceb87741937ce6ecdf08d7450071fdfae005462f6216907a55edd562e4b47ef",
+      "bytes": 11136
+    },
+    {
+      "path": "apps/worker/scripts/analytics-workload-mutation-capture-transform.check.mjs",
+      "sha256": "058859a108520240b7b830269cb2c174166968cf846bc88e7b5d0dc68e624a0b",
+      "bytes": 2547
+    },
+    {
+      "path": "apps/worker/scripts/analytics-workload-mutation-capture-transform.mjs",
+      "sha256": "a3440504b68ce1a1a6b33591c189eef577f7b7f82f2c999746d4779bc6cb0964",
+      "bytes": 3303
+    },
+    {
+      "path": "apps/worker/scripts/analytics-workload-mutation-proof-v2.check.mjs",
+      "sha256": "0f30ae2a7be8e7b6ed96ec7b28358be95c2641ff509025d4d5d0dac15479d646",
+      "bytes": 31534
+    },
+    {
+      "path": "apps/worker/scripts/analytics-workload-mutation-proof-v2.mjs",
+      "sha256": "d2d4f46e2a2f4a477e2d0ddaa3451705a949ab84393b28119f5d7349817d0537",
+      "bytes": 54751
+    },
+    {
+      "path": "apps/worker/scripts/analytics-workload-mutation-proof.check.mjs",
+      "sha256": "411907b4c2684ffd4601d52fde2a7c73f598ed7ea1d787444bc7f8c65022b7bd",
+      "bytes": 15549
+    },
+    {
+      "path": "apps/worker/scripts/analytics-workload-mutation-proof.mjs",
+      "sha256": "89ec46f21ab19488bb370f2b96716947b20ff031ed347009ff74684700ad66b7",
+      "bytes": 32650
+    },
+    {
+      "path": "apps/worker/scripts/analytics-workload-publication-clock.check.mjs",
+      "sha256": "9b097f46d0a7b969c378b3634510d2e082e32f0596cccd89f371caefb4783e39",
+      "bytes": 19963
+    },
+    {
+      "path": "apps/worker/scripts/analytics-workload-publication-clock.mjs",
+      "sha256": "cdbd2065a892fc64583e85a8816fc32410695ed37e9cb918c99fc1f3024a5345",
+      "bytes": 15633
+    },
+    {
+      "path": "apps/worker/scripts/analytics-workload-runtime-observer.check.mjs",
+      "sha256": "37a31e044b14fc5d55b90cd09ce1c6d95d14c7802299167d48b70397f626b90d",
+      "bytes": 15939
+    },
+    {
+      "path": "apps/worker/scripts/analytics-workload-runtime-observer.mjs",
+      "sha256": "d1fe2266ef1221f3bd6decec8c5573d0c360eca31b197786538520a5803b4c21",
+      "bytes": 20098
+    },
+    {
+      "path": "apps/worker/scripts/benchmark-analytics-whole-workload.check.mjs",
+      "sha256": "5049db4106991ccd7bab2473f88a410261afdd054a337316983f28c4e2ff750c",
+      "bytes": 87709
+    },
+    {
+      "path": "apps/worker/scripts/benchmark-analytics-whole-workload.mjs",
+      "sha256": "266eba51ba8f2d6833426371383765f3930624d5733c73dcc661d382b281a150",
+      "bytes": 144000
+    },
+    {
+      "path": "apps/worker/scripts/d1-storage-role.check.mjs",
+      "sha256": "344a900b22ba00f16ce4b0f43b0a2f3774dfb09de95244353520dab2ad783a0e",
+      "bytes": 3631
+    },
+    {
+      "path": "apps/worker/scripts/daily-owner-cursor-restore.check.mjs",
+      "sha256": "f9a2d173e93b5ac2568f545e9d59a1095d4da920b2682bd0a8c58120f029a7ac",
+      "bytes": 8383
+    },
+    {
+      "path": "apps/worker/scripts/maintained-analytics-forward-migration.check.mjs",
+      "sha256": "e5740a67708f0b2f50ae36b1ee48825b6481efc89c0715670faef757d9a60549",
+      "bytes": 18788
+    },
+    {
+      "path": "apps/worker/scripts/maintained-analytics-forward-migration.mjs",
+      "sha256": "c64132d8f4c2afcfe264c822993832236e18ae24e8c9316da4e92b9257ff9140",
+      "bytes": 22051
+    },
+    {
+      "path": "apps/worker/scripts/maintained-analytics-forward-transport.check.mjs",
+      "sha256": "6404c577194caf84213c0026562be23345f57722465e06a77a4477384445f93a",
+      "bytes": 15503
+    },
+    {
+      "path": "apps/worker/scripts/maintained-analytics-forward-transport.mjs",
+      "sha256": "2ce19e0f838dd94abdca383ff31c80ade3045c2e46c0a10edb5f32e195bc6c60",
+      "bytes": 13520
+    },
+    {
+      "path": "apps/worker/scripts/migration-input-policy.check.mjs",
+      "sha256": "8a2377f2864cb8c4c370d20a560d8492f850fbbaf3f2da719d48d77ea5979e49",
+      "bytes": 3680
+    },
+    {
+      "path": "apps/worker/scripts/migration-input-policy.mjs",
+      "sha256": "116b1214a641c543251cf192110708e015490f89f14402ae7a414fe8dca42312",
+      "bytes": 2235
+    },
+    {
+      "path": "apps/worker/scripts/qualify-analytics-mutation-capture.mjs",
+      "sha256": "1e1a53bed676a64f934b66f21baaf59b2d1b47221b8daef73505708f217b7262",
+      "bytes": 6043
+    },
+    {
+      "path": "apps/worker/src/analytics-partition-work.ts",
+      "sha256": "a3e0522514d31264e4af65d83a61b5be3b8f4f1bb0bdfa4064434a4e21ae2892",
+      "bytes": 18429
+    },
+    {
+      "path": "apps/worker/src/cache-retention-date-cursor.ts",
+      "sha256": "775e693f37dc816e34c7b925158ed8932914cd7e2bd23dd1e2d2c739166536ca",
+      "bytes": 32155
+    },
+    {
+      "path": "apps/worker/src/cache-retention-session.ts",
+      "sha256": "13a6642ed86a19a0914e5b0263a706a32be0e7c1708e53ad57c9c8c6babb2033",
+      "bytes": 802
+    },
+    {
+      "path": "apps/worker/src/canonical-analytics-facts.ts",
+      "sha256": "7c397f04e296ba93a4e33df05796d3e308839bc702e4a5934651428e38d0ac3c",
+      "bytes": 22145
+    },
+    {
+      "path": "apps/worker/src/canonical-analytics-legacy-source.ts",
+      "sha256": "5a6e9e41bb3940e45a8a95657979207f7e4fcfe763a6b0138f5d4b7de38e5bda",
+      "bytes": 12238
+    },
+    {
+      "path": "apps/worker/src/canonical-cache-pairs.ts",
+      "sha256": "022a151c8e28cbd9b84bc0fcc1a36b85317e089aeb4c4b990d4c97dbcc38c175",
+      "bytes": 1714
+    },
+    {
+      "path": "apps/worker/src/canonical-feature-contributions.ts",
+      "sha256": "15eb03a8b59a646a7ca4529a15fe09a1f58cd3061702a78f40469290169c7729",
+      "bytes": 15422
+    },
+    {
+      "path": "apps/worker/src/canonical-rolling-inputs.ts",
+      "sha256": "016688df96623deb23a6ee85c1e891a5b1882e47a89bf6ecbcb53fcbab7ecfb0",
+      "bytes": 8321
+    },
+    {
+      "path": "apps/worker/src/d1-direct-write.ts",
+      "sha256": "5f5ff9cdd5f933f775b2ac994cc9c1ad6a53a6f8bf5b487f0991d2ef4e995982",
+      "bytes": 469
+    },
+    {
+      "path": "apps/worker/src/d1-schema-object-hints.ts",
+      "sha256": "a9cd79933c89a5242af70de9abfd34e632906758a3cd564e0c7c336e1d60eebd",
+      "bytes": 6304
+    },
+    {
+      "path": "apps/worker/src/effective-history-dependency.ts",
+      "sha256": "93300d1fea17a0344aabb4b19a4cf65291bee24b83e9e1c0b9b0dc07dfd3345d",
+      "bytes": 1142
+    },
+    {
+      "path": "apps/worker/src/storage-analytics-activity-group.ts",
+      "sha256": "41212e4037eaa1ff28952360c6d3ab9b423e3e854b3f00276d26932477d44fbb",
+      "bytes": 14290
+    },
+    {
+      "path": "apps/worker/src/storage-analytics-admin-progress.ts",
+      "sha256": "0a5ab1d76991d37fbd31b7f8fd85eed9f09da323679c3d5f74848bf020c7a253",
+      "bytes": 14388
+    },
+    {
+      "path": "apps/worker/src/storage-analytics-cache-group.ts",
+      "sha256": "8d9412236e635ec9ef49b1487230d6ede527a22a12bb476fe2232df52e95b572",
+      "bytes": 12377
+    },
+    {
+      "path": "apps/worker/src/storage-analytics-cache-work.ts",
+      "sha256": "8c5d14dc8185e243faaef4c4de4174df1754034b8403385f31a8625e49928ff6",
+      "bytes": 9089
+    },
+    {
+      "path": "apps/worker/src/storage-analytics-canonical-day.ts",
+      "sha256": "d818d6b6f19aa5bc2b376155ff796076ed47da7713e2f92c166de966dac2ecfc",
+      "bytes": 10859
+    },
+    {
+      "path": "apps/worker/src/storage-analytics-canonical-runtime.ts",
+      "sha256": "e19db7557085902b0a92cdaa7b15ed12891b933eb65b6a131eae9c60077cd883",
+      "bytes": 27079
+    },
+    {
+      "path": "apps/worker/src/storage-analytics-canonical-work.ts",
+      "sha256": "6694022070c25b8b3415ee214380edacd16b9e5d8051b139e789fa9e8bcdb4b6",
+      "bytes": 8854
+    },
+    {
+      "path": "apps/worker/src/storage-analytics-closure-fence.ts",
+      "sha256": "f7050b9286d2d4141cb2a962e28ba659513e053431a0648dc1e0d024b634bec7",
+      "bytes": 8905
+    },
+    {
+      "path": "apps/worker/src/storage-analytics-feature-group.ts",
+      "sha256": "aa7e4948bd7c06f0b6529fbf32ddcc1a2eddab6264e409213a3dd3ffb5bf6d35",
+      "bytes": 14123
+    },
+    {
+      "path": "apps/worker/src/storage-analytics-maintained-work.ts",
+      "sha256": "b27825f3c099a71c04917f61a71bce7d89917590eae6d16d2e344f0707592230",
+      "bytes": 29444
+    },
+    {
+      "path": "apps/worker/src/storage-analytics-partition-work.ts",
+      "sha256": "1a817ced618b01f70415cdace827985a59831e545fe2250e4971a879ac01aaaa",
+      "bytes": 37389
+    },
+    {
+      "path": "apps/worker/src/storage-analytics-preparation.ts",
+      "sha256": "1847382fcec1859abd0ec9baee9c934f9b9dfdd3296284d45a82e90747609856",
+      "bytes": 15239
+    },
+    {
+      "path": "apps/worker/src/storage-analytics-publication-work.ts",
+      "sha256": "0e7dbe2fa6adae73cae060a1ebaa4da501c67cc24f0776430db42359419c8bb0",
+      "bytes": 15369
+    },
+    {
+      "path": "apps/worker/src/storage-analytics-runtime-controls.ts",
+      "sha256": "689fecf0f53aa5e9ff242b7209245831d79a6eec1cb89b9284c056f71b9b3db5",
+      "bytes": 3800
+    },
+    {
+      "path": "apps/worker/src/storage-analytics-work-contract.ts",
+      "sha256": "5479492d08cf2cd48323a3d079f6b3dbdfdc2f467fcac019eb531cb0f7043d02",
+      "bytes": 1096
+    },
+    {
+      "path": "apps/worker/src/storage-analytics-work-effects.ts",
+      "sha256": "75c371f2bff35b82fb00bd82aa703208fef26f388ae26c6d3caeffbe1c968c4c",
+      "bytes": 32660
+    },
+    {
+      "path": "apps/worker/src/storage-analytics-work-proof.ts",
+      "sha256": "5743a49ef7aee92bbe13658d88fc482aeafa272f925980f09689f24845bea278",
+      "bytes": 14719
+    },
+    {
+      "path": "apps/worker/src/storage-analytics-work-retirement.ts",
+      "sha256": "2113f355d81d4065171c57071c4ec4f21bb392ab2f8e72757deefc7185260985",
+      "bytes": 5773
+    },
+    {
+      "path": "apps/worker/src/storage-canonical-analytics-facts.ts",
+      "sha256": "e79b153bc50b06185c07b2608a8a896fa6ac92ab5f0b53b26e5902e2653ca5c9",
+      "bytes": 47856
+    },
+    {
+      "path": "apps/worker/src/storage-canonical-analytics-input.ts",
+      "sha256": "6b6e5be24438e6e6b185a2c338aa1ab249f18cca08960565cb3699b7dbd98bff",
+      "bytes": 46215
+    },
+    {
+      "path": "apps/worker/src/storage-canonical-cache-pairs.ts",
+      "sha256": "60fc146a59ba3176ee865ea91d87769284136b6f972f3df17699e0aedd2a79e9",
+      "bytes": 83871
+    },
+    {
+      "path": "apps/worker/src/storage-canonical-feature-contributions.ts",
+      "sha256": "a29d9c309f74008e668b00b11657c8343427d41091dfa156ba2c720b1245c5fb",
+      "bytes": 27885
+    },
+    {
+      "path": "apps/worker/src/storage-canonical-publication.ts",
+      "sha256": "a42f8e02e4c2923f6d1614c8e40a0ce9af8fc4817a3463b65dba7871ee6d2539",
+      "bytes": 32510
+    },
+    {
+      "path": "apps/worker/src/storage-canonical-rolling-inputs.ts",
+      "sha256": "958d7cf2cbc8b62d09007fc38b0b7fa8476ecbe0262017f16181619c57f93563",
+      "bytes": 27871
+    },
+    {
+      "path": "apps/worker/src/storage-canonical-v1-window.ts",
+      "sha256": "735272059b329ef8db58f7bfa3bca2f7f5a7579a354824c2149c9bdb777711ab",
+      "bytes": 13546
+    },
+    {
+      "path": "apps/worker/src/storage-community-cache-publication.ts",
+      "sha256": "e217c0b66df15a408d5244275938c84798af8d6aeaeae310c62d1b710e4048a5",
+      "bytes": 16296
+    },
+    {
+      "path": "apps/worker/src/storage-community-daily-cursor.ts",
+      "sha256": "571dabf441e3934a2d7213f6ae6077c9ad27aa791c70966d18dfc628b821a4be",
+      "bytes": 12028
+    },
+    {
+      "path": "apps/worker/src/storage-community-publication-cohort.ts",
+      "sha256": "9d4b0d194a2e9d2852823531ccf19205810c600701760a60732ea500eebeb12e",
+      "bytes": 9621
+    },
+    {
+      "path": "apps/worker/src/storage-effective-dependency-mutations.ts",
+      "sha256": "a14e02a7937745337ab043e61d9a09adbaf4df3e6fe728d86deace436642ef2c",
+      "bytes": 13100
+    },
+    {
+      "path": "apps/worker/src/storage-effective-dependency-summaries.ts",
+      "sha256": "5097608b4885736f18e7a567bf92d52629b7a12a996a379ce89af805a4d078df",
+      "bytes": 21693
+    },
+    {
+      "path": "apps/worker/src/storage-effective-selective-dependencies.ts",
+      "sha256": "b51ca3ca518469391c2b183fd2f889cac74ff2b70b12a0f06d8995f8ab63fee6",
+      "bytes": 43346
+    },
+    {
+      "path": "apps/worker/src/storage-erasure-artifacts.ts",
+      "sha256": "9ddc7fb6d9dd77043904024f92ae3ed6590d93772260592fb3be4ac4e516e927",
+      "bytes": 23906
+    },
+    {
+      "path": "apps/worker/src/storage-model-block-adoption-batches.ts",
+      "sha256": "5295768602c0792aa11b2ae795e11e2e9626cd8b3411ea62706c65d23fcc650e",
+      "bytes": 1825
+    },
+    {
+      "path": "apps/worker/test/analytics-c06-operation-meter.spec.ts",
+      "sha256": "a5459fa6e2c40679943c7d637a9887280841f27d5ccc4b4629fb84c68bcf77c2",
+      "bytes": 5543
+    },
+    {
+      "path": "apps/worker/test/analytics-c06-operation-runtime.spec.ts",
+      "sha256": "f0cb6bb389b49342055317556aeccff869919b5ff4c322bc43a7ea847fc32dfe",
+      "bytes": 10759
+    },
+    {
+      "path": "apps/worker/test/analytics-c06-phase-evidence.spec.ts",
+      "sha256": "0fb8683a1069e2e38543d1eda81dd34e262436e1aa70e1c74bc8c0c0bbed450b",
+      "bytes": 23119
+    },
+    {
+      "path": "apps/worker/test/analytics-c06-qualification.spec.ts",
+      "sha256": "4f5e98e3626e4a2a6f10237495f6474bcfc0537d3aa4721aebda97ba527d05d9",
+      "bytes": 5445
+    },
+    {
+      "path": "apps/worker/test/analytics-c06-shared-qualification-v2.spec.ts",
+      "sha256": "a6636ea74733194f4a9af0d96307e8a232ea1680b526a62eb29f1add953b5e89",
+      "bytes": 10911
+    },
+    {
+      "path": "apps/worker/test/analytics-c06-source-lineage.spec.ts",
+      "sha256": "db655ea7f9008266ee6123d840fcb5322d3e9453d28b73a19d1f4d7a05f56935",
+      "bytes": 5803
+    },
+    {
+      "path": "apps/worker/test/analytics-c06-source-metadata-audit.spec.ts",
+      "sha256": "76745adb9b12fc0f5f576d3d3c883cc33a451dbc875b31700e434ac7b6521a6d",
+      "bytes": 6649
+    },
+    {
+      "path": "apps/worker/test/analytics-capability-query-profile.spec.ts",
+      "sha256": "673b90e2e08c51fe0520fefc1e2dd4bc22ff7af8d233d5fdc45973d00ccd83e2",
+      "bytes": 20528
+    },
+    {
+      "path": "apps/worker/test/analytics-explain-capability.spec.ts",
+      "sha256": "586cbbef8aceeb6e0887924e62407de847ac34e0b8246b0c57a00e8ec11792cf",
+      "bytes": 13525
+    },
+    {
+      "path": "apps/worker/test/analytics-feature-controls.spec.ts",
+      "sha256": "fc8e5bbcf3a54596b141705e6d6c6c66114c34f47bbb3ac188f90352fb922799",
+      "bytes": 1321
+    },
+    {
+      "path": "apps/worker/test/analytics-functional-action-trace.spec.ts",
+      "sha256": "34cd87d9f3079beaace8b7fda980cfb0b25d489a3fc1db92fa65924ac7dd048c",
+      "bytes": 4173
+    },
+    {
+      "path": "apps/worker/test/analytics-functional-boundaries.spec.ts",
+      "sha256": "efafb7b2294fef722ff3f59ba6251a7272179febf883c813c6c01e6f98462e98",
+      "bytes": 6380
+    },
+    {
+      "path": "apps/worker/test/analytics-functional-branches.spec.ts",
+      "sha256": "74279b213a1c0a30af8fba1d2741516d5d81417c1c67c2ceea3efe7875030c66",
+      "bytes": 13424
+    },
+    {
+      "path": "apps/worker/test/analytics-functional-input-scenarios.spec.ts",
+      "sha256": "4ac382f11214ee1d7b3c5d01919dc4715f6f592ee73beeb20e44a43180692903",
+      "bytes": 3232
+    },
+    {
+      "path": "apps/worker/test/analytics-functional-native-input.spec.ts",
+      "sha256": "1e3702926974e8495ddac5d953b1862cdc18d5d0ed8df77f209b57c6c8389547",
+      "bytes": 8927
+    },
+    {
+      "path": "apps/worker/test/analytics-functional-runtime-activation.spec.ts",
+      "sha256": "ba80b33f27e107e4f4136c486355cb3d97e4966473f063764f50eb9b627fbbab",
+      "bytes": 5975
+    },
+    {
+      "path": "apps/worker/test/analytics-functional-scenarios.spec.ts",
+      "sha256": "72fbf202c50a12e261ef157026d3c4d4071dccbadd8f8b50dab547156da9d1d8",
+      "bytes": 6442
+    },
+    {
+      "path": "apps/worker/test/analytics-legacy-selected-families.spec.ts",
+      "sha256": "c4296c1a4c4b3a8cb84b14db08c97a7e3858c56021d48c2048faea3e4198b977",
+      "bytes": 7610
+    },
+    {
+      "path": "apps/worker/test/analytics-mutation-capture.spec.ts",
+      "sha256": "2523c778db0445bb91e9bd4ee4729c531a1c4315ec1c0b286a68d259f91b61cd",
+      "bytes": 17671
+    },
+    {
+      "path": "apps/worker/test/analytics-native-source-cutoff.spec.ts",
+      "sha256": "ef42c80f0c16276b28131dffe181e60080ccbe0fe68890526eb21681553a9db9",
+      "bytes": 2041
+    },
+    {
+      "path": "apps/worker/test/analytics-partition-work.spec.ts",
+      "sha256": "370707b16187e9c14fe4cc189953e84e121c82a6c3e7f9d7e08f91dc7d77ad5b",
+      "bytes": 5916
+    },
+    {
+      "path": "apps/worker/test/analytics-performance-histogram.spec.ts",
+      "sha256": "16c6a33fee410ef1cb05de667ffcf5f100898f978a1d29583c7eacffc7aafa5e",
+      "bytes": 16395
+    },
+    {
+      "path": "apps/worker/test/analytics-preview-counter-action.spec.ts",
+      "sha256": "609f123972e0196532c7b392b5989cfba24d4ef87119a3812b97336242caf02f",
+      "bytes": 7195
+    },
+    {
+      "path": "apps/worker/test/analytics-preview-counter.spec.ts",
+      "sha256": "7ed5af5b70e57a5f059dff3a1744283be2206dc39a9d1dfef7208729d1f533be",
+      "bytes": 14953
+    },
+    {
+      "path": "apps/worker/test/analytics-retained-functional-clock.spec.ts",
+      "sha256": "5090c52eb1d44d78b6c8bd08c27f8b018f6680ad9dc565c54cee3643af959139",
+      "bytes": 3862
+    },
+    {
+      "path": "apps/worker/test/analytics-shared-feature-preparation.spec.ts",
+      "sha256": "dd5693af2396ea1538480fab1042ed5f22b2919496c174a46d224fe6166ce130",
+      "bytes": 11055
+    },
+    {
+      "path": "apps/worker/test/analytics-whole-workload-clock.spec.ts",
+      "sha256": "3d9f6c87a263fffbd0faafb46383ff9ea66fa53487a5c8879208f8b4cd93efc7",
+      "bytes": 14457
+    },
+    {
+      "path": "apps/worker/test/analytics-whole-workload-fixture.spec.ts",
+      "sha256": "5f78641393302ba118d70a7a60e51ac3b5aadefa889fffb643085342272a5ba9",
+      "bytes": 20046
+    },
+    {
+      "path": "apps/worker/test/analytics-whole-workload-profile.spec.ts",
+      "sha256": "ecbaaa8f2642f76be0394e274ed560a536ffbd6e1bf844d6b7297dbbaa9faca5",
+      "bytes": 26365
+    },
+    {
+      "path": "apps/worker/test/analytics-whole-workload.spec.ts",
+      "sha256": "861f3af324619d25ad4b05054f31f576dca0b4f8714d7310645477452ee355a9",
+      "bytes": 100113
+    },
+    {
+      "path": "apps/worker/test/authority-restore-presence-profile.spec.ts",
+      "sha256": "4ac394c02d6f130076b630b811c89f42b603afbfb46b60cec396e9ddb8e16f21",
+      "bytes": 8202
+    },
+    {
+      "path": "apps/worker/test/cache-retention-actual-meter.spec.ts",
+      "sha256": "8dbbe494e51e70a99080ca93e0eeba7a51a56e400fb767bf2a4241c250793bcf",
+      "bytes": 26328
+    },
+    {
+      "path": "apps/worker/test/cache-retention-date-cursor.spec.ts",
+      "sha256": "d51cd01d25d9da17f49c8a79807d16e9071478241bb90d70c560c5606b20c9f9",
+      "bytes": 42425
+    },
+    {
+      "path": "apps/worker/test/cache-retention-date-fairness.spec.ts",
+      "sha256": "63362b19cd6ba7af3be9a90b68f1b2a424dfff1d894c9af3997ad4a4bc012b82",
+      "bytes": 17475
+    },
+    {
+      "path": "apps/worker/test/cache-retention-native-carry-correctness.spec.ts",
+      "sha256": "c933dd4f3350ad4f5caef701e33a713e8d8bd5938c5087678fae988c652a835c",
+      "bytes": 47062
+    },
+    {
+      "path": "apps/worker/test/canonical-analytics-facts.spec.ts",
+      "sha256": "b321734d33dba0a66440f0eb309b3d3b735ea824004198b43ea9780749b26ffb",
+      "bytes": 35125
+    },
+    {
+      "path": "apps/worker/test/canonical-analytics-native-parity.spec.ts",
+      "sha256": "6e012363711601bd05968f774868256b57696cd486192858108ef9da9b0f8dba",
+      "bytes": 11048
+    },
+    {
+      "path": "apps/worker/test/canonical-feature-contributions.spec.ts",
+      "sha256": "6ef926a0c39b68d0b0122c3afb18aaa3eda9c4425e5dbd3e75bbbe2b82328f55",
+      "bytes": 23875
+    },
+    {
+      "path": "apps/worker/test/canonical-publication-coverage-profile.spec.ts",
+      "sha256": "ea494042e0b09faa118e2dee94ed3f6bb65657f9e557a98db1c81d4dc3d0cfff",
+      "bytes": 8289
+    },
+    {
+      "path": "apps/worker/test/canonical-rolling-inputs.spec.ts",
+      "sha256": "54c7c5309b62e4e947e7e889a0f9087894bfc8e08962d408d498636fbb4a2366",
+      "bytes": 6141
+    },
+    {
+      "path": "apps/worker/test/canonical-rolling-profile.spec.ts",
+      "sha256": "fd572c3d55a1265da36c9549ace75c8d85c496d016c5166ea3315218cd36172c",
+      "bytes": 14420
+    },
+    {
+      "path": "apps/worker/test/canonical-shared-feature-adapter.spec.ts",
+      "sha256": "c6ffbb1cfe5fdbf2b2d27781ee3f19de743a565b4a1a1f8c000883e430c492d4",
+      "bytes": 8197
+    },
+    {
+      "path": "apps/worker/test/collection-controls-budget.spec.ts",
+      "sha256": "057a603e80cb4eea51ba6e37776b592c86c62c3ecbbab793f6209c90b7545c08",
+      "bytes": 1759
+    },
+    {
+      "path": "apps/worker/test/d1-schema-object-hints.spec.ts",
+      "sha256": "85b92459998738dd1927d96bbe908da538f370dc3f76d3f772fff13de9681245",
+      "bytes": 20444
+    },
+    {
+      "path": "apps/worker/test/fixtures/analytics-legacy-selected-corpus.ts",
+      "sha256": "5133777447cd1f5ff17dea303d26fede776fe028a92d82dd8b5cd5a497b73f5b",
+      "bytes": 6400
+    },
+    {
+      "path": "apps/worker/test/fixtures/native-day-inventory-a1535f2a.json",
+      "sha256": "496e62a0a54a4de48ba18c04d5048f11b0473125d03f2980f7ffdddf7e3248de",
+      "bytes": 7322
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-c06-independent-policy.ts",
+      "sha256": "451bb26ed96cdecb9e3ba5923c405d669885bff76e5715f89cfb5715b3b84e2e",
+      "bytes": 300
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-c06-operation-scope.ts",
+      "sha256": "1fd59d3334976e4dbca6e9bae6cdc009901c98a7086514aa6121d201eac61d75",
+      "bytes": 4823
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-c06-phase-evidence.ts",
+      "sha256": "6f8ec2b20eef553ebc1c86df269a4940e9efaac26e6ace9356400c426fe8ea33",
+      "bytes": 26732
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-c06-qualification.ts",
+      "sha256": "5d4f11112b0b232eb9e7fc8c59c0c4f930270f3443a54ecd0516c1042a843113",
+      "bytes": 8417
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-c06-shared-qualification-v2.ts",
+      "sha256": "9f39a97bc1b924eb5717be1a843af09027b6b78419f6512874b5d30a4ec2253e",
+      "bytes": 15352
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-c06-source-lineage.ts",
+      "sha256": "db21fac801c6bd4f8a227971c122fae269f8163fb61ed288ba2efb765993c271",
+      "bytes": 28362
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-candidate.ts",
+      "sha256": "3eefcb49f5f0977ac78b08c116d237b49e7133a609c40cd671efa00b3b444728",
+      "bytes": 14624
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-functional-action-trace.ts",
+      "sha256": "4fe1729ee686def12e0d46ca9b0d4c47152e34334a61500cdfa212b7f87d760b",
+      "bytes": 3636
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-functional-boundaries.ts",
+      "sha256": "680203aee47d17714e671f31271203555e63e883934574a7d6bd06daf5812b43",
+      "bytes": 9176
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-functional-branches.ts",
+      "sha256": "830d9f5b528a7111a987fc4369ffff644c139ce3afd856d5602b52a340f0cf8d",
+      "bytes": 18920
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-functional-input-scenarios.ts",
+      "sha256": "22936a183435a792d62555934f74e2e916131202762031d3e372dfa250de16d5",
+      "bytes": 15633
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-functional-native-input.ts",
+      "sha256": "aaee7eb105ee6a282c8dd3327157e297f3adb9b3508c2e5879d96420fe939942",
+      "bytes": 35434
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-functional-qualification.ts",
+      "sha256": "a2ac7f5b61299a3812ff0bec39fc33a367dc683d02ca91ae19a577bad81b7c21",
+      "bytes": 3641
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-functional-runtime-activation.ts",
+      "sha256": "cd291c1075f6d27783b7bdd69530b3e0a2443bfeb8cdf5b1a91e2a10ba22245f",
+      "bytes": 12235
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-functional-scenarios.ts",
+      "sha256": "e8c4f760e36a82d39a833f058be136dfce78da1ed4f7e872eb1d5752d1f9ff05",
+      "bytes": 28827
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-functional-startup.ts",
+      "sha256": "e37633f159ee0dcababc7e8924385bb84468edfac8f0974f5e24907acab9dd63",
+      "bytes": 8775
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-logical-bytes.ts",
+      "sha256": "14440a40bbd5aae164f56cabb4330b5ad420a2aafac5eb61f25c022eb99bb2d7",
+      "bytes": 12180
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-manifest-work-proof-reference.ts",
+      "sha256": "d5903bd67d9b04ab36d50b20e4987129ef41291b9d8f32d25ad0a7031931c312",
+      "bytes": 5470
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-mutation-capture.ts",
+      "sha256": "6ea3130c0f076b65151d8f9296160563e67ef073441f36cb5f8417e715684e5c",
+      "bytes": 6070
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-mutation-current.ts",
+      "sha256": "1563bab9d59f1ae570fbc2f5b210842fc139397790a0a8f633d0bc513d844d4c",
+      "bytes": 1871
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-mutation-native-reference.ts",
+      "sha256": "6ce7d65cc5bd7510f7571e5faa1cc69b6cb58a29732f0a3d917c580e4dce7ffa",
+      "bytes": 46
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-mutation-replay.ts",
+      "sha256": "ca79c435cd72e8d41616b893330dc31191297152218692d7ff460d2ed9ba563d",
+      "bytes": 7325
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-native-mutation.ts",
+      "sha256": "ab43e50151b4d1577c323c53ad270d123a67ef3680170b5d6c23cbe90bc835b0",
+      "bytes": 8666
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-native-reference.ts",
+      "sha256": "73887eafa77cc90f979364c74153f817fc71a422276577caad6be695185c5ebd",
+      "bytes": 46
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-paired-source.ts",
+      "sha256": "a1c4f06bc12e2c45545fef58c6c599a88b9b2de4fae30a2ec008c07d696b70db",
+      "bytes": 4746
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-performance-histogram.ts",
+      "sha256": "ad34866cc9fe15c2d1cb55b53a3f30ab756fc703637cf57c359b9b8e1c08d973",
+      "bytes": 14490
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-preview-counter.ts",
+      "sha256": "955d9982b76d841d84b7b135bee9c2ee374a66e492dc9664de492c7726ba80da",
+      "bytes": 20455
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-retained-functional-clock.ts",
+      "sha256": "d5c8e7610db523fc2533356a5ba86a79302146aadf249bbb591ca44284a1af89",
+      "bytes": 4383
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-source-snapshot.ts",
+      "sha256": "f1dc9fd2e18e7183b1a9e7555ae1a096e3c743405592f1b9646cc87ac3f72569",
+      "bytes": 14607
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-sql-fixtures.d.ts",
+      "sha256": "2f4b4c578d7f16ead5e9d4ffc909313bfad9a04c47f64f6826a1e4c64c186b07",
+      "bytes": 165
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-store-inventory.ts",
+      "sha256": "817b5229bb3cd29ea46fceced907bbb8bb500fddad1d745df13306fe3fdd7843",
+      "bytes": 32930
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-whole-workload.ts",
+      "sha256": "5bf7ea9125bf80904195ab466f8f514a4c4b593bec9eeb5030689ef373d0f466",
+      "bytes": 23914
+    },
+    {
+      "path": "apps/worker/test/helpers/analytics-workload-kernels.ts",
+      "sha256": "187d9bb9b552b50a1f3c492b279aa84549fe9e3c8caf102f31f988db1d71cd00",
+      "bytes": 5706
+    },
+    {
+      "path": "apps/worker/test/helpers/canonical-rolling-profile.ts",
+      "sha256": "ef186a08af58039965064308c2f8b39306a879f820d6297913b461e046f54b9a",
+      "bytes": 13257
+    },
+    {
+      "path": "apps/worker/test/helpers/maintained-erasure.ts",
+      "sha256": "d6758395868d07d6e4530f11ea37e424803a0c4ef87ca952e41bd340969b0261",
+      "bytes": 9558
+    },
+    {
+      "path": "apps/worker/test/helpers/shared-window-statement-audit.ts",
+      "sha256": "d5b9e8e0ddaa1793eaa1976ad383a9e18acf584155012d4bbab057a0db43972b",
+      "bytes": 18645
+    },
+    {
+      "path": "apps/worker/test/maintained-analytics-forward-transport.spec.ts",
+      "sha256": "b9f32b10af720fd4a9c903e201c41fbe466be32ac30448c401a024b65c1cd1d5",
+      "bytes": 3736
+    },
+    {
+      "path": "apps/worker/test/maintained-analytics-migration-rehearsal.spec.ts",
+      "sha256": "608516995c9fac48596cd45892cf5144ee46eed90d3e5a0bfdb15b837e7022f6",
+      "bytes": 20389
+    },
+    {
+      "path": "apps/worker/test/storage-admission-mutation-proof.spec.ts",
+      "sha256": "273b405b7fb7751455ee411bf50fa004498f40a8f039370b6af8b10476e4b6fd",
+      "bytes": 4507
+    },
+    {
+      "path": "apps/worker/test/storage-analytics-activity-group.spec.ts",
+      "sha256": "28f279865a7d651494ee24d693111cc43964250e11620030c6b181b48e30ddad",
+      "bytes": 50250
+    },
+    {
+      "path": "apps/worker/test/storage-analytics-admin-progress.spec.ts",
+      "sha256": "cc9751bf14795d9b9a3704b308bc5a870dfffcb0e89a0c704bb9cdb0daae793f",
+      "bytes": 7138
+    },
+    {
+      "path": "apps/worker/test/storage-analytics-bounded-shared-window.spec.ts",
+      "sha256": "7d6c7ac798372340f620595edf543323bb402bdd1695cebe657ca1f0f08d3a1b",
+      "bytes": 36511
+    },
+    {
+      "path": "apps/worker/test/storage-analytics-cache-group.spec.ts",
+      "sha256": "85c14859df90fb99b606b6c85892c4947b972fdb344134a188b0afced8c49fb2",
+      "bytes": 59168
+    },
+    {
+      "path": "apps/worker/test/storage-analytics-cache-prerequisite.spec.ts",
+      "sha256": "81b7bb5b6215ff3f8d4276f1adad8135dc6250881401f166bf78aa2f4203abb0",
+      "bytes": 31659
+    },
+    {
+      "path": "apps/worker/test/storage-analytics-cache-receipt-integration.spec.ts",
+      "sha256": "129a9e9f008d0d1d11e28618c423cac98e6bc6ca8d304e782913869cf1424b85",
+      "bytes": 9049
+    },
+    {
+      "path": "apps/worker/test/storage-analytics-cache-work.spec.ts",
+      "sha256": "df427d5e271a55625aae5c16464f1cf7230dfc1a14c24357f2402f9193a1940b",
+      "bytes": 5340
+    },
+    {
+      "path": "apps/worker/test/storage-analytics-canonical-day.spec.ts",
+      "sha256": "fd27f7670f556f4d7f8b4f487245ddcec8972e853e15354d090aa2abdbf97726",
+      "bytes": 8375
+    },
+    {
+      "path": "apps/worker/test/storage-analytics-canonical-runtime.spec.ts",
+      "sha256": "ec0ab37b47464bd2e3531bf7d7bc9878c0d9ddc15b953bbebf07b8a5ea94aceb",
+      "bytes": 10585
+    },
+    {
+      "path": "apps/worker/test/storage-analytics-canonical-work.spec.ts",
+      "sha256": "abc10cf35f77c9e67ad70fb77eb28d017d02250ecca0d54f8c260a1ec30fc051",
+      "bytes": 5667
+    },
+    {
+      "path": "apps/worker/test/storage-analytics-capacity-reserve.spec.ts",
+      "sha256": "a5e2e1bcdf2eda08422c0deaef52c94cb1028bb921e1eb553d72a5660faf25d9",
+      "bytes": 5392
+    },
+    {
+      "path": "apps/worker/test/storage-analytics-closure-fence.spec.ts",
+      "sha256": "ff911d94a14776e38454d38dcb1a992fa651cf425e0446966dad880a8fddd490",
+      "bytes": 5267
+    },
+    {
+      "path": "apps/worker/test/storage-analytics-concurrency-profile.spec.ts",
+      "sha256": "48616e9ffb3b9424e4fd9b1a7150bb31e702864fe42940c4558cb581c8efd50d",
+      "bytes": 26266
+    },
+    {
+      "path": "apps/worker/test/storage-analytics-feature-group.spec.ts",
+      "sha256": "018d4f422826448c07ef36de98b0a7a92f531e658c387fea43baf14138ecf07e",
+      "bytes": 47684
+    },
+    {
+      "path": "apps/worker/test/storage-analytics-graph-publication-retention.spec.ts",
+      "sha256": "12d8c9a219a0df662e9fb70cf6a04e73caa12850e4bcffcd0431c613ee0267a9",
+      "bytes": 4136
+    },
+    {
+      "path": "apps/worker/test/storage-analytics-independent-coverage.spec.ts",
+      "sha256": "54c2675b0cbd24f389afdb1e0787fdbdeff257aa02716c0bfb9b4b127ed36999",
+      "bytes": 16575
+    },
+    {
+      "path": "apps/worker/test/storage-analytics-maintained-work.spec.ts",
+      "sha256": "a34a56957f947623b1b5b0b288bc7582a2309c4fb49625a6fffb25ab1313ecdb",
+      "bytes": 24183
+    },
+    {
+      "path": "apps/worker/test/storage-analytics-partition-work.spec.ts",
+      "sha256": "6df82113c30570f4cf943b9d4816a87a0731915cb4fa49f5ce922169a6ec1031",
+      "bytes": 70272
+    },
+    {
+      "path": "apps/worker/test/storage-analytics-preparation.spec.ts",
+      "sha256": "0e00822d7fcfc96ddd2db2e0c9b670df1f547aa4cc2b56319da9d456b024fb6d",
+      "bytes": 13875
+    },
+    {
+      "path": "apps/worker/test/storage-analytics-publication-admission.spec.ts",
+      "sha256": "20ee7f96f481b18d688f2568a81e5fb3182d72d487f925156f3771a2dc7b47dd",
+      "bytes": 7864
+    },
+    {
+      "path": "apps/worker/test/storage-analytics-publication-work.spec.ts",
+      "sha256": "fd3f7371248b3cdddbdfadc586824ead1bcff6f4c4f63d9bac199e69752eaef3",
+      "bytes": 13741
+    },
+    {
+      "path": "apps/worker/test/storage-analytics-skew-fairness.spec.ts",
+      "sha256": "7b1a1386c8c085245374e00b7be89e800b25e7bcc0e290da0036da486467d107",
+      "bytes": 108258
+    },
+    {
+      "path": "apps/worker/test/storage-analytics-work-effects.spec.ts",
+      "sha256": "b45a0adcfc33909cbb9950a0acb755ab0e070a448654e8b213531f68fa9f9344",
+      "bytes": 26244
+    },
+    {
+      "path": "apps/worker/test/storage-analytics-work-proof.spec.ts",
+      "sha256": "d458230e406cfa6ab3297290e3f8d1caf5cbff4122fbf3279b0db8e4ff2ebacc",
+      "bytes": 23056
+    },
+    {
+      "path": "apps/worker/test/storage-analytics-work-retirement.spec.ts",
+      "sha256": "a7ade78d44558c2681c23e22ffc2eb326bdc81201cfe29aa8c09f0b3372c8946",
+      "bytes": 4337
+    },
+    {
+      "path": "apps/worker/test/storage-bounded-shared-window-admission.spec.ts",
+      "sha256": "29caf86fe78ac1360fa35d2a3e9505da9bf501f4b2658a97f3d7fe96d5de7c63",
+      "bytes": 18613
+    },
+    {
+      "path": "apps/worker/test/storage-canonical-analytics-input.spec.ts",
+      "sha256": "c2dbd8137123603754db0ed00f8c42cd9cc7e50e743bba607ef4156b8f71073d",
+      "bytes": 47439
+    },
+    {
+      "path": "apps/worker/test/storage-canonical-cache-pairs.spec.ts",
+      "sha256": "f4a105990b8d60fd3001f0ca080287a8a2a8865e6d614326bdbfa2014fd1cdca",
+      "bytes": 81046
+    },
+    {
+      "path": "apps/worker/test/storage-canonical-empty-daily-publication.spec.ts",
+      "sha256": "694094a53ca0d836b4b422f458ab01d20c9293153e25c36a589eaf2843083b2a",
+      "bytes": 11663
+    },
+    {
+      "path": "apps/worker/test/storage-canonical-membership.spec.ts",
+      "sha256": "c821926c05db708b15d773274a971854bcc7d05b67c1e6caa1b6751ebacae510",
+      "bytes": 4115
+    },
+    {
+      "path": "apps/worker/test/storage-canonical-publication-retirement.spec.ts",
+      "sha256": "664e5786794de492a48578b14fad9e602deeeedc022904f6925054a8c441b876",
+      "bytes": 7624
+    },
+    {
+      "path": "apps/worker/test/storage-canonical-publication-scheduling.spec.ts",
+      "sha256": "d702cba3be45cd594ad871bd5f227883b9ae5f66a9be6f2146841e58a236209a",
+      "bytes": 7880
+    },
+    {
+      "path": "apps/worker/test/storage-canonical-publication.spec.ts",
+      "sha256": "c3cee32a5eceae88e1a61128a4123fa00bd81738e2b22b3bc981ffefb1cef9c5",
+      "bytes": 18635
+    },
+    {
+      "path": "apps/worker/test/storage-canonical-rolling-inputs.spec.ts",
+      "sha256": "83ff2d790d2b09640bb0cacbe7991efb24d0d16d3576a15d420f8464551b1d43",
+      "bytes": 41977
+    },
+    {
+      "path": "apps/worker/test/storage-community-daily-cursor.spec.ts",
+      "sha256": "48c7494cc9459e6d3ecba077f5de6d80258c1bed6900a692cc5e759595939709",
+      "bytes": 9642
+    },
+    {
+      "path": "apps/worker/test/storage-effective-dependency-schema-hints.spec.ts",
+      "sha256": "8ed8fbb9a199c0dc207e270cc0c23babad9ab70a5d07ce8fc0b356af87e759f0",
+      "bytes": 10179
+    },
+    {
+      "path": "apps/worker/test/storage-effective-dependency-summaries.spec.ts",
+      "sha256": "8cc5d68d90a8c124b57ca74a7b8cd3381f8fece97a2b9fe65e96106d4ab03584",
+      "bytes": 29748
+    },
+    {
+      "path": "apps/worker/test/storage-effective-selective-dependencies.spec.ts",
+      "sha256": "19f065e5e0b8c749e2a803abd09393bd2767b96838d99fe564a3ca16c6c93d2c",
+      "bytes": 53304
+    },
+    {
+      "path": "apps/worker/test/storage-effective-v12-dependency-plan.spec.ts",
+      "sha256": "8bcd68c90b7e0b11e4f38beb793d76405161543c3e8961eda9f8f82acf766a31",
+      "bytes": 23162
+    },
+    {
+      "path": "apps/worker/test/storage-erasure-artifacts.spec.ts",
+      "sha256": "18b3723199c29866d5c9a2d184dbae6b8a75f8e60e2b817b39fdbb62b274462f",
+      "bytes": 13823
+    },
+    {
+      "path": "apps/worker/test/storage-graph-scope-batch.spec.ts",
+      "sha256": "32a868d3dbe20b4468889e2968403573adc337e789ee25c53a22b162eb876c2e",
+      "bytes": 15435
+    },
+    {
+      "path": "apps/worker/test/storage-model-block-adoption-batches.spec.ts",
+      "sha256": "8c72a54e3b400bcda54b25220688ed67ca3a3c398d0648d5b3edb4c74fae117f",
+      "bytes": 2318
+    },
+    {
+      "path": "apps/worker/test/storage-model-block-adoption-lifecycle.spec.ts",
+      "sha256": "9c206df494fee8b945074320b4f4c70ff33ed7ce6c962a8c564a22ab4d0b44ff",
+      "bytes": 8744
+    },
+    {
+      "path": "apps/worker/test/storage-shared-feature-window-native-lifetime.spec.ts",
+      "sha256": "8f4172a97080702f9d9f0f71b6e2417b7fa7d445cb76035eef0794b141722673",
+      "bytes": 38555
+    },
+    {
+      "path": "apps/worker/test/storage-shared-feature-window-plan.spec.ts",
+      "sha256": "21e5248f5915aa7f91589483be3f278cf9041393e879922f92ef80139b344995",
+      "bytes": 18140
+    },
+    {
+      "path": "apps/worker/test/storage-shared-feature-window-reader.spec.ts",
+      "sha256": "b634894f61e0b2d8ce59025f5c8eec5ff67f3a422a779362d53f98bc803934ea",
+      "bytes": 5405
+    },
+    {
+      "path": "apps/worker/test/storage-source-terminal-epoch-index.spec.ts",
+      "sha256": "d469c4cb5d71e7c8dafa0066732bbec6d1bca6b1e6bc72481d084be97d7b27fc",
+      "bytes": 6504
+    },
+    {
+      "path": "apps/worker/test/telemetry-effective-reader-budget.spec.ts",
+      "sha256": "87a6e8f48526dcbe26b1a32a4b1fd8fce1ad75ab5a90f7b3cfbc0a908e44d0bd",
+      "bytes": 1994
+    },
+    {
+      "path": "apps/worker/test/telemetry-v12-effective-reader-scaling.spec.ts",
+      "sha256": "d5f43c446f1ba7751793954010dc95ffbbef2d0a9f99cc20b8a4e3c61c4b40a7",
+      "bytes": 13993
+    },
+    {
+      "path": "docs/plans/2026-09-30-maintained-analytics-framework.md",
+      "sha256": "8dcb20d1fcc9b112ea11769cf0af0059bad171c0b09657a87ee8c4755c84d3c9",
+      "bytes": 134263
+    },
+    {
+      "path": "docs/receipts/2026-10-01-maintained-analytics-comparison16.md",
+      "sha256": "a8ad449f1280608d06b857c22b5af23e8ddae6ffbe1deb49d53cac6eb1c6b55d",
+      "bytes": 4297
+    },
+    {
+      "path": "docs/receipts/2026-10-01-maintained-analytics-concurrency-local.md",
+      "sha256": "dcc0ea8aa6347401ec283999ba20dacc7ee422174f580d9047209ee985080f59",
+      "bytes": 3934
+    },
+    {
+      "path": "docs/receipts/2026-10-01-maintained-analytics-forward-local.md",
+      "sha256": "0ce810630c16ba9ea2723f0c96446f71cad69d52faf006ace96bf00a45e8f5f4",
+      "bytes": 8472
+    },
+    {
+      "path": "docs/receipts/2026-10-01-maintained-analytics-grouped-local.md",
+      "sha256": "33bb2c45a7f460c5f03ede1dfa12d1c9ec4a9070044624ce92a8502d91723340",
+      "bytes": 8562
+    },
+    {
+      "path": "docs/receipts/2026-10-01-maintained-analytics-migration-local.md",
+      "sha256": "4db8225be175b40e067286ab77d79e6ad11a3133ecec432b65920d1ef80beb4b",
+      "bytes": 15412
+    },
+    {
+      "path": "docs/receipts/2026-10-01-maintained-analytics-post-group-pair.md",
+      "sha256": "2c2f0dc45d6350cb0b443457d499413f0b113d4f35efd9a9ff0189793b22b65b",
+      "bytes": 6431
+    },
+    {
+      "path": "docs/receipts/2026-10-01-maintained-analytics-retry-pair.md",
+      "sha256": "5d8bbbb3c654487a5994cbc441ffd3a50bbc6555cd1319ddf89b8d21707e9a95",
+      "bytes": 7197
+    },
+    {
+      "path": "docs/receipts/2026-10-01-maintained-analytics-scheduling-local.md",
+      "sha256": "fef1d09516fa8caeeb3b142ac908a0429ed45082798e56032d4fcdd2bfb2f076",
+      "bytes": 8312
+    },
+    {
+      "path": "docs/receipts/2026-10-01-maintained-analytics-whole-pair.md",
+      "sha256": "4d562993a66297ec29c042bc3719ee572aba649aa83ffd1acde4f5db3ccb6dda",
+      "bytes": 8423
+    },
+    {
+      "path": "docs/receipts/2026-10-02-analytics-maintenance-pause.md",
+      "sha256": "17d0b00b9a834d20d1af5eb8c63c398c3e36ae9316e63545da69b081ed8f0e60",
+      "bytes": 5428
+    },
+    {
+      "path": "docs/reviews/2026-10-01-maintained-analytics-capacity-review.md",
+      "sha256": "b6daffa307c2dc1031c879ca5d4d91c77a03da9b5927192c872741b84d31caea",
+      "bytes": 30920
+    },
+    {
+      "path": "docs/reviews/2026-10-02-analytics-oracle-followup.md",
+      "sha256": "89a4c6b8b5d36d221b15fb119a202948247a9fb8ef3ce8a716e7710a5902b5d1",
+      "bytes": 49715
+    },
+    {
+      "path": "docs/runbooks/2026-10-01-maintained-analytics-forward-local.md",
+      "sha256": "51abcca8dcbe5458782d48cc898e812777c3d6d3e7f19d59aceb4b55c05b67a8",
+      "bytes": 9315
+    }
+  ],
+  "boundary": "Exact 318-file integrated candidate captured before checkpoint documentation and draft packaging."
+}

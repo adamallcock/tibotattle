@@ -1,0 +1,171 @@
+{
+  "schemaVersion": "analytics-draft-checkpoint-v1",
+  "date": "2026-10-02",
+  "status": "preserved-unapplied",
+  "baseCommit": "f056940fefabed0c7f0e88353cf54845b077f0c8",
+  "patches": [
+    {
+      "path": "docs/reviews/2026-10-02-analytics-drafts/2026-10-02-shared-window-maintained-proof-source.patch.json",
+      "patchSha256": "35db29a4aa61a59b157ee698b79a6f2244f5af48274289aa49a3ba3d476926ed",
+      "patchBytes": 12609
+    },
+    {
+      "path": "docs/reviews/2026-10-02-analytics-drafts/2026-10-02-shared-window-maintained-proof-controls.patch.json",
+      "patchSha256": "51ced979925995d7ecc31bd5f88b10700b5e92936a1677ea5439cb9ed18fa7b2",
+      "patchBytes": 20805
+    },
+    {
+      "path": "docs/reviews/2026-10-02-analytics-drafts/2026-10-02-shared-window-maintained-proof-dense.patch.json",
+      "patchSha256": "d910665a3c92bc04afec1ccfbb2d3e5b879995d02b2308e7bd0ec9402af5128f",
+      "patchBytes": 31273
+    },
+    {
+      "path": "docs/reviews/2026-10-02-analytics-drafts/2026-10-02-p11-c06-b2-v1.patch.json",
+      "patchSha256": "da0ff1c03521c32a7ee499a9afd2f5197c4c0b697da7e226e7a85c50cae6dbb0",
+      "patchBytes": 51273
+    },
+    {
+      "path": "docs/reviews/2026-10-02-analytics-drafts/2026-10-02-terminal-selective-erasure-v5.patch.json",
+      "patchSha256": "00f6ccdcf57daf061a911abfa48d9a2eccb13737283718c4d4961d3ee96aad6f",
+      "patchBytes": 2363
+    }
+  ],
+  "sharedWindow": {
+    "source": {
+      "files": [
+        {
+          "path": "apps/worker/src/storage-effective-dependency-summaries.ts",
+          "beforeSha256": "5097608b4885736f18e7a567bf92d52629b7a12a996a379ce89af805a4d078df",
+          "afterSha256": "824c0bed792f8894d44f894b699449c7c86d9a6856d9a500b364824ab4a444cf"
+        },
+        {
+          "path": "apps/worker/src/storage-analytics-shared-features.ts",
+          "beforeSha256": "db03950805118b4ccd4218d0a4c98051f9105a79204bc583c46b6709e4bd5498",
+          "afterSha256": "7b3b17f7bc776a7e0d00758e7488815c5f361ed636c91c854dc8b46329c85da6"
+        }
+      ],
+      "patchSha256": "35db29a4aa61a59b157ee698b79a6f2244f5af48274289aa49a3ba3d476926ed"
+    },
+    "addedFiles": [
+      {
+        "path": "apps/worker/test/storage-shared-window-maintained-proof.spec.ts",
+        "sha256": "2813bbc66761ea3c4530b1c1cb1bf198eee1387eabebeef3c6efe61ac780131c"
+      },
+      {
+        "path": "apps/worker/test/storage-shared-window-maintained-dense.spec.ts",
+        "sha256": "34f4d11a34e91c2c6af572703a218f00a192c6fb9de2cee4a8bc80938e94d993"
+      }
+    ],
+    "controlsPatchSha256": "51ced979925995d7ecc31bd5f88b10700b5e92936a1677ea5439cb9ed18fa7b2",
+    "densePatchSha256": "d910665a3c92bc04afec1ccfbb2d3e5b879995d02b2308e7bd0ec9402af5128f",
+    "controllers": [
+      {
+        "name": "maintained-window-baseline-1",
+        "runner": "2026-10-02-shared-window-maintained-proof/maintained-window-baseline-1/maintained-window-baseline-1-runner.mjs",
+        "runnerSha256": "d9e312042d03252676026a0b4c898b8cbf427580db450515fbf7a9b785282f05",
+        "pinSha256": "116fd231f10c39351bec725f0a7646187e18e0fffee0609d76e4ca72bd25ee6c",
+        "manifestSha256": "b66325e26eeea2bfbf8ee4e412ebcd3faace995202d334d78862264e3759340e"
+      },
+      {
+        "name": "maintained-window-controls-1",
+        "runner": "2026-10-02-shared-window-maintained-proof/maintained-window-controls-1/maintained-window-controls-1-runner.mjs",
+        "runnerSha256": "1c38d49f7808c01e71e4a5a5f63fb65f6bd824df8795e5ac93fdb4a4b99bf87b",
+        "pinSha256": "b99233b394ce0711e746e5d0e4ed09b7dde7322bc83e58672b6a5d44472ede11",
+        "manifestSha256": "1b757d6f1684a4afd777155f8a843122fa0b770f6f923e411db844c9c3d7cc96"
+      },
+      {
+        "name": "maintained-window-dense-1",
+        "runner": "2026-10-02-shared-window-maintained-proof/maintained-window-dense-1/maintained-window-dense-1-runner.mjs",
+        "runnerSha256": "e3335ee7cd89eefe948dc453be42e2d076e0a1b683c5e789b8c2aaab18317158",
+        "pinSha256": "8717c4c4797b458f60de39fb8d40a9a996a46f386c706c6967e5945f4c574129",
+        "manifestSha256": "1f1e26d863e80e25131de95ffa6760678f7b82fd9966db8a07be1a2a5e618ef9"
+      }
+    ],
+    "noCandidateWrites": true,
+    "noD1Runs": true
+  },
+  "p11B2": {
+    "schemaVersion": "p11-c06-b2-offtree-review-v1",
+    "status": "offtree-static-only-not-native-qualified",
+    "candidateChanged": false,
+    "patch": "2026-10-02-p11-c06-b2-v1.patch",
+    "patchSha256": "da0ff1c03521c32a7ee499a9afd2f5197c4c0b697da7e226e7a85c50cae6dbb0",
+    "files": [
+      {
+        "path": "apps/worker/test/helpers/analytics-mutation-replay.ts",
+        "baseSha256": "ca79c435cd72e8d41616b893330dc31191297152218692d7ff460d2ed9ba563d",
+        "sha256": "9b3a1e71f724b8d797bd73bc3319fd2b2593cbc4c9c6b7d3522e3b80d3fbb703",
+        "bytes": 7783
+      },
+      {
+        "path": "apps/worker/test/analytics-whole-workload.spec.ts",
+        "baseSha256": "861f3af324619d25ad4b05054f31f576dca0b4f8714d7310645477452ee355a9",
+        "sha256": "b695da59ba43b5cddea611ede9ea98fabd56dc7d61147b58cf0c9934bf5ec330",
+        "bytes": 101530
+      },
+      {
+        "path": "apps/worker/scripts/benchmark-analytics-whole-workload.mjs",
+        "baseSha256": "266eba51ba8f2d6833426371383765f3930624d5733c73dcc661d382b281a150",
+        "sha256": "995858841a83b2a54e9e74ff288f64aebcdccec7b7aaf155a4b48d4dc250cfe2",
+        "bytes": 148119
+      },
+      {
+        "path": "apps/worker/scripts/benchmark-analytics-whole-workload.check.mjs",
+        "baseSha256": "5049db4106991ccd7bab2473f88a410261afdd054a337316983f28c4e2ff750c",
+        "sha256": "ad26f9d4e2b11f572bf0085420b8a05d7f8ea0a1455ae2faadcf7024c49de1e8",
+        "bytes": 91164
+      },
+      {
+        "path": "apps/worker/test/helpers/analytics-c06-append-transition.ts",
+        "baseSha256": null,
+        "sha256": "40be019bcded4933eb5fd5fd8917baa0342e7afa6e93db01e1d6279e82586c7f",
+        "bytes": 16870
+      },
+      {
+        "path": "apps/worker/test/analytics-c06-append-transition.spec.ts",
+        "baseSha256": null,
+        "sha256": "1f045cb7c25e516a4d63faebd4debfd5b065b6be46dd5787678a8d70978dba45",
+        "bytes": 6213
+      }
+    ],
+    "protected": {
+      "apps/worker/scripts/analytics-workload-mutation-proof.mjs": "89ec46f21ab19488bb370f2b96716947b20ff031ed347009ff74684700ad66b7",
+      "apps/worker/scripts/analytics-workload-mutation-proof.check.mjs": "411907b4c2684ffd4601d52fde2a7c73f598ed7ea1d787444bc7f8c65022b7bd",
+      "apps/worker/scripts/analytics-workload-mutation-proof-v2.mjs": "d2d4f46e2a2f4a477e2d0ddaa3451705a949ab84393b28119f5d7349817d0537",
+      "apps/worker/scripts/analytics-workload-mutation-proof-v2.check.mjs": "0f30ae2a7be8e7b6ed96ec7b28358be95c2641ff509025d4d5d0dac15479d646"
+    },
+    "preservedLauncherCheckPrefixSha256": "5049db4106991ccd7bab2473f88a410261afdd054a337316983f28c4e2ff750c",
+    "validations": {
+      "pureNode": {
+        "tests": 33,
+        "passed": 33,
+        "path": "p11-b2-pure-final.log",
+        "sha256": "8da2eb8a56886b5ffcef4951714287aff963c1f5f17cee311057f28df5e0f7fb"
+      },
+      "launcherNode": {
+        "tests": 56,
+        "passed": 56,
+        "path": "p11-b2-launcher-1.log",
+        "sha256": "667c6cfe4b01a577436c8727ad4883521ce61be529be888574004f949cdccefb"
+      },
+      "typecheck": {
+        "exitCode": 0,
+        "path": "p11-b2-tsc-final.log",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "limits": [
+      "Existing approved v2 writer proof is revalidated with real private captured snapshots and hash preimages.",
+      "New entry/exit snapshot SQL is separately metered proof work, not hidden consumer cost.",
+      "All source writes remain unreviewed and refuse complete ACK.",
+      "Current separate qualifier retains C06_V2_MUTATION_ACK_REQUIRED; no automatic no-rescan qualification.",
+      "No native append execution or new native performance measurement in this slice."
+    ]
+  },
+  "terminalV5": {
+    "baseSourceSha256": "8e6c5e8391fa491816b7eac709737ca05dcda13e87f04f5f82e5c1b9983e60fb",
+    "draftSourceSha256": "9a282b0389345767d57d6871244d1239c8135bf218ec4840646bbad02ec8a60d",
+    "nativeTestsRun": false
+  },
+  "qualificationControllers": "Retained in local recovery archive; regenerate complete pins and unique prefixes before execution."
+}
