@@ -398,12 +398,19 @@ function publicModelConfig(metadata) {
 // fixed method claims inside them. Named because the cache projection has to
 // rebuild the exact wire shape it accepted, and a second spelling of a claim
 // is a second thing that can drift.
+//
+// v1.3 is v1.1's meaning (the Pro 20x basis, with `combined`) plus the closed
+// model-metadata block, so it is read on the same basis. A newer version, v1.4
+// included, is refused whole until this reader is changed to understand it.
 export const COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS = Object.freeze([
   "community-allowance-breakdowns-v1.0",
   "community-allowance-breakdowns-v1.1",
+  "community-allowance-breakdowns-v1.3",
 ]);
 const COMMUNITY_ALLOWANCE_BREAKDOWN_COMBINED_VERSION =
   "community-allowance-breakdowns-v1.1";
+const COMMUNITY_ALLOWANCE_BREAKDOWN_MODEL_METADATA_VERSION =
+  "community-allowance-breakdowns-v1.3";
 const COMMUNITY_ALLOWANCE_MODEL_BASIS =
   "seven_day_codex_pro20x_equivalent_per_model_composition";
 const COMMUNITY_ALLOWANCE_MODEL_GATE =
@@ -473,7 +480,8 @@ export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs =
     - 69 * MILLISECONDS_PER_DAY).toISOString().slice(0, 10);
   const allowedDays = new Set(publishedDays);
   const days = [];
-  const hasCombined = value.schemaVersion === COMMUNITY_ALLOWANCE_BREAKDOWN_COMBINED_VERSION;
+  const hasCombined = value.schemaVersion === COMMUNITY_ALLOWANCE_BREAKDOWN_COMBINED_VERSION
+    || value.schemaVersion === COMMUNITY_ALLOWANCE_BREAKDOWN_MODEL_METADATA_VERSION;
   // A malformed block is ignored whole and reported, never partly trusted: the
   // page then draws exactly what it would have drawn without one.
   const metadata = hasMetadataBlock ? publicModelMetadata(value.modelConfig) : null;
