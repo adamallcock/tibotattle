@@ -35,6 +35,15 @@ const GITHUB_HOSTED_RUNNER_LABELS = new Set([
   "macos-26-intel",
 ]);
 const WORKFLOW_EXTENSIONS = new Set([".yml", ".yaml"]);
+// Toolchain versions are supply-chain inputs, so actions/setup-node may only
+// select an exact version from this reviewed allowlist, never a range, alias or
+// expression. Every workflow may select the repository toolchain. The Cloud Run
+// image runtime is selected only by the hosted-backend workflow, where the edge
+// end-to-end spec runs under it beside the repository toolchain; no release or
+// packaging workflow may pick it up by accident.
+const REPOSITORY_NODE_VERSION = "26.2.0";
+const CLOUD_RUN_IMAGE_NODE_VERSION = "22.16.0";
+const CLOUD_RUN_IMAGE_NODE_WORKFLOWS = new Set([".github/workflows/hosted-backend.yml"]);
 
 function normalizePath(path) {
   return path.split(sep).join("/");
@@ -241,8 +250,13 @@ function stepParentIndent(lines, start, entryIndent) {
   return Math.max(0, entryIndent - 2);
 }
 
-function checkoutPersistenceEntry(lines, start, stepIndent) {
+/**
+ * The direct children of a step's `with:` mapping, in order. A key nested
+ * deeper, or set under another mapping such as `env:`, is not one of them.
+ */
+function stepWithEntries(lines, start, stepIndent) {
   const block = stepBlock(lines, start, stepIndent);
+  const entries = [];
   for (let index = 0; index < block.length; index += 1) {
     const withEntry = parseYamlKeyValue(block[index].line);
     if (withEntry?.key !== "with") continue;
@@ -254,12 +268,41 @@ function checkoutPersistenceEntry(lines, start, stepIndent) {
       const nestedEntry = parseYamlKeyValue(nestedLine.line);
       if (nestedEntry === null) continue;
       childIndent ??= nestedIndent;
-      if (nestedIndent === childIndent && nestedEntry.key === "persist-credentials") {
-        return nestedEntry;
-      }
+      if (nestedIndent === childIndent) entries.push(nestedEntry);
     }
   }
-  return undefined;
+  return entries;
+}
+
+function checkoutPersistenceEntry(lines, start, stepIndent) {
+  return stepWithEntries(lines, start, stepIndent).find(({ key }) => key === "persist-credentials");
+}
+
+/** Failures for one actions/setup-node step; `entries` are its with: children. */
+function setupNodeFailures(entries, { path, lineNumber }) {
+  const failures = [];
+  const versions = entries.filter(({ key }) => key === "node-version");
+  if (versions.length !== 1) {
+    failures.push(`${path}:${lineNumber}: actions/setup-node must set node-version exactly once, to a reviewed exact version`);
+  } else {
+    const version = unquoteYamlScalar(versions[0].value);
+    const allowed = version === REPOSITORY_NODE_VERSION
+      || (version === CLOUD_RUN_IMAGE_NODE_VERSION && CLOUD_RUN_IMAGE_NODE_WORKFLOWS.has(path));
+    if (!allowed) {
+      failures.push(`${path}:${lineNumber}: actions/setup-node node-version must be ${REPOSITORY_NODE_VERSION}`
+        + `, or ${CLOUD_RUN_IMAGE_NODE_VERSION} in ${[...CLOUD_RUN_IMAGE_NODE_WORKFLOWS].join(", ")} only`
+        + `; a range, alias, expression or unreviewed version is forbidden`);
+    }
+  }
+  for (const entry of entries) {
+    if (entry.key === "node-version-file") {
+      failures.push(`${path}:${lineNumber}: actions/setup-node must not read its version from node-version-file`);
+    }
+    if (entry.key === "check-latest" && unquoteYamlScalar(entry.value).toLowerCase() !== "false") {
+      failures.push(`${path}:${lineNumber}: actions/setup-node must not set check-latest to anything but false`);
+    }
+  }
+  return failures;
 }
 
 export function inspectWorkflowSource(source, { path = "workflow.yml" } = {}) {
@@ -289,6 +332,10 @@ export function inspectWorkflowSource(source, { path = "workflow.yml" } = {}) {
         if (persist === undefined) {
           failures.push(`${path}:${lineNumber}: actions/checkout must set persist-credentials explicitly to false`);
         }
+      }
+      if (value.startsWith("actions/setup-node@")) {
+        const stepIndent = stepParentIndent(lines, index, entry.indent);
+        failures.push(...setupNodeFailures(stepWithEntries(lines, index, stepIndent), { path, lineNumber }));
       }
     }
     if (entry.key === "pull_request_target") {

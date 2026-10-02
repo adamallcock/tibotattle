@@ -1,21 +1,42 @@
 name: Hosted backend
 
 # Source-level CI for the hosted backend: the Worker gate, the Cloud Run host
-# check and every apps/worker/postgres-test spec against PostgreSQL 17 in its
-# routed environment profile.
+# check with the offline production-tooling checks, and every
+# apps/worker/postgres-test spec against PostgreSQL 17 in its routed
+# environment profile, including the edge end-to-end spec.
 #
 # PostgreSQL 17 is the official postgres image pinned by digest in
 # apps/worker/scripts/ci-postgres-container.mjs, run as the runner uid with a
 # private 0700 socket directory. The PGDG apt fallback documented there is not
 # in use.
 #
+# Node.js: every job runs the repository toolchain, 26.2.0. The
+# postgres-17-suite job also installs Node.js 22.16.0, the Cloud Run image
+# runtime, and names it to the suite as EDGE_E2E_NODE, because the edge
+# end-to-end spec runs the Cloud Run origin under the image runtime. It installs
+# 22.16.0 first and 26.2.0 last, so `node` on PATH, the suite itself and the
+# spec's seeding rehearsal (its importers need the newer node:sqlite) stay on
+# 26.2.0. scripts/check-release-workflow-policy.mjs allows 22.16.0 in this
+# workflow only.
+#
+# Dependencies: all three jobs install the root, Worker and Cloud Run lockfiles.
+# The Worker gate's gcp:fastpath:scripts-check imports apps/worker/cloud-run
+# modules, which need @google-cloud/cloud-sql-connector.
+#
 # Skip enforcement is machine-checked only for apps/worker/postgres-test: the
-# postgres-17-suite job fails on any skipped or todo test there. The Worker gate
-# and the Cloud Run check run their own PostgreSQL-gated checks (for example
+# postgres-17-suite job fails on any skipped or todo test there, and on an
+# environment gap such as a missing EDGE_E2E_NODE or EDGE_E2E_GOLDEN. The Worker
+# gate and the Cloud Run check run their own PostgreSQL-gated checks (for example
 # apps/worker/scripts/postgres-*.check.mjs and apps/worker/cloud-run/*.check.mjs)
 # with the SOCKET profile exported, and the Cloud Run check also gets the
 # loopback TCP endpoint its daily-activation integration test requires, but a
 # skip inside those checks is reported by node:test without failing the job.
+#
+# The Cloud Run check also runs the offline parts of
+# gcp:production-tooling:local-check (the rollout CLI, the infrastructure
+# manifest and the cutover seal), which need no PostgreSQL, network or
+# credential. The PostgreSQL-backed part of that command,
+# postgres-production-migrations.spec.mjs, runs in the postgres-17-suite job.
 #
 # Read-only by construction: no secrets, no environments, no deployment, no
 # remote database or Cloudflare writes. A green run proves these source gates on
@@ -87,7 +108,9 @@ jobs:
           check-latest: false
           package-manager-cache: false
 
-      - name: Install locked root and Worker dependencies
+      # gcp:fastpath:scripts-check, run by the Worker gate, imports Cloud Run host
+      # modules, so this job needs the Cloud Run lockfile as well.
+      - name: Install locked root, Worker and Cloud Run dependencies
         run: |
           set -euo pipefail
           npm install --global corepack@0.34.0 --force --ignore-scripts
@@ -97,6 +120,7 @@ jobs:
           test "$(pnpm --version)" = "11.9.0"
           pnpm install --frozen-lockfile --ignore-scripts
           npm --prefix apps/worker ci
+          npm --prefix apps/worker/cloud-run ci
 
       - name: Create the private PostgreSQL socket root
         run: |
@@ -205,6 +229,19 @@ jobs:
       - name: Run the Cloud Run check
         run: npm --prefix apps/worker/cloud-run run check
 
+      # The offline parts of gcp:production-tooling:local-check. Its first
+      # component, postgres:production-migrations:check, is already covered: the
+      # Cloud Run check runs its offline half, and the postgres-17-suite job runs
+      # its PostgreSQL-backed spec.
+      - name: Check the production rollout tooling offline
+        run: npm --prefix apps/worker run gcp:production-rollout:check
+
+      - name: Check the infrastructure manifest and operations offline
+        run: npm --prefix apps/worker run gcp:ops:infra:check
+
+      - name: Check the cutover seal tooling offline
+        run: npm --prefix apps/worker run postgres:cutover-seal:check
+
       - name: Stop PostgreSQL 17
         if: always()
         run: node apps/worker/scripts/ci-postgres-container.mjs --stop
@@ -227,12 +264,49 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      # The Cloud Run image runtime, for the edge end-to-end spec. It goes first
+      # so that the repository toolchain installed after it stays first on PATH.
+      - name: Install the Cloud Run image runtime Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.16.0
+          check-latest: false
+          package-manager-cache: false
+
+      # EDGE_E2E_NODE must be an absolute path to the Node.js 22.16.0 binary and
+      # EDGE_E2E_GOLDEN an absolute path to the committed Q-1 golden; without
+      # them the suite reports an EDGE_E2E environment gap and fails.
+      # POSTGRES_V12_TRANSFER_Q1_DUMP names the same golden's dump for the
+      # transfer spec's Q-1 case, which the suite reports as silently skipped
+      # without it. Every value comes from the runner and the checkout, never
+      # from the event.
+      - name: Name the image runtime and the committed golden inputs
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "v22.16.0"
+          golden="$GITHUB_WORKSPACE/apps/worker/analytics-v2-test/golden"
+          test -f "$golden/community-daily-response.json"
+          test -f "$golden/dump/usage-monitor-db.json"
+          {
+            printf 'EDGE_E2E_NODE=%s\n' "$(command -v node)"
+            printf 'EDGE_E2E_GOLDEN=%s\n' "$golden"
+            printf 'POSTGRES_V12_TRANSFER_Q1_DUMP=%s\n' "$golden/dump/usage-monitor-db.json"
+          } >> "$GITHUB_ENV"
+
       - name: Install pinned Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 26.2.0
           check-latest: false
           package-manager-cache: false
+
+      # The edge spec's S9 seeding rehearsal runs under this runtime, not the
+      # image runtime: its importers need a newer node:sqlite than 22.16.0 has.
+      - name: Name the repository runtime for the edge end-to-end seeding rehearsal
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "v26.2.0"
+          printf 'EDGE_E2E_REHEARSAL_NODE=%s\n' "$(command -v node)" >> "$GITHUB_ENV"
 
       # Two specs import Cloud Run host modules, so this job needs its lockfile too.
       - name: Install locked root, Worker and Cloud Run dependencies
