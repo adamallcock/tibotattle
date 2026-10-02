@@ -847,9 +847,13 @@ GCP work separate from the Cloudflare rollout still stands.
   `packages/quota-analysis/src/quota-tracks.js` and `quota-calibration.js`
   differ from production (`c88c0a9cd`, a cumulative-cost cursor). OAI-4 keeps
   the change unless P supersedes it.
-- **Line-pinned export patches.** The generator's five `export` patches name
-  `d43c8f92` line numbers (`apps/worker/scripts/vendor-analytics-kernels.mjs:58`)
-  and refuse moved text. OAI-3 rebases them onto P.
+- **Export patches and the vendor path.** On `claude/gcp-fastpath-final` the
+  generator's five `export` patches name `d43c8f92` line numbers and refuse
+  moved text. K-VENDOR (`claude/gcp-fp-v-tool`, unmerged; receipt
+  [2026-10-02-gcp-k-vendor2](../receipts/2026-10-02-gcp-k-vendor2.md)) locates
+  them by symbol, adds the `buildPricingEvent` patch, keeps one stable vendor
+  path for every commit and generates the GCP-only vocabularies, so OAI-3
+  re-vendors at P without rebasing patches or moving imports.
 - **Q-1 corpus coverage.** The golden corpus holds only `pro`, `prolite` and
   `plus` owners and `standard` speed, so today's oracle exercises neither Fast
   nor the release's new plan, model and tier (OAI-6).

@@ -1,18 +1,20 @@
-// Mechanical identity check for every vendored analytics-kernel tree
-// (vendor/analytics-<commit>) and its copied kernel-parity specs, and the
-// negative tests for the generator's commit argument and symbol-located export
-// patches. Run from apps/worker:
+// Mechanical identity check for the vendored analytics-kernel tree (the one
+// stable directory, vendor/analytics-d43c8f92, whatever commit it holds), its
+// copied kernel-parity specs and the generated GCP-only vocabularies, and the
+// negative tests for the generator's commit argument, symbol-located export
+// patches, commit transitions and vocabulary derivation. Run from apps/worker:
 //   node scripts/vendor-analytics-kernels.check.mjs
-// It needs the git objects of each vendored commit and fails closed without
+// It needs the git objects of the vendored commit and fails closed without
 // them. The identity arithmetic (git blob ids, export-token removal and the
 // parity rewrite reversal) is implemented here independently of the generator;
 // only the reviewed lists are shared. The d43c8f92 export patches are pinned
 // below, both as the symbols the generator is given and as the lines the
-// generator must find them on. Other vendored commits are checked against
-// their own manifests. The generated type stubs are checked by re-emitting
+// generator must find them on; a tree holding another commit is checked
+// against its own manifest. The generated type stubs are checked by re-emitting
 // them, and by typechecking the app program plus one consumer of entry.ts with
-// this checkout's tsc. A scratch regeneration of d43c8f92 must reproduce the
-// committed tree byte for byte.
+// this checkout's tsc. A scratch regeneration of the committed commit must
+// reproduce the committed tree and vocabularies byte for byte, and so must a
+// round trip through another commit in the same stable directory.
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -29,8 +31,12 @@ import {
   commitsNamedIn, EXPORT_PATCHES, foreignCommitsNamed, locateExportSymbol, main, MANIFEST_FILE, MANIFEST_SCHEMA, maskNonCode,
   PARITY_HELPERS, PARITY_SPECS, parseArguments, parseCommit, planExportPatches, reachableInputs, regenerateTypeStubs,
   reportAtCommit, resolveExportPatches, SOURCE_COMMIT, VendorError, vendorLayout, VENDORED_PACKAGES, verifyExportPatches,
-  verifyVendoredTree, WEB_ROOTS,
+  verifyVendoredTree, WEB_ROOTS, STABLE_PARITY_RELATIVE, STABLE_VENDOR_RELATIVE, vocabulariesOfTree, workerIndexAt,
 } from "./vendor-analytics-kernels.mjs";
+import {
+  changedVocabularies, communityDailyReadSchemaVersion, constructedReasons, importedCallees, interfaceMembers,
+  renderKernelVocabularies, VOCABULARY_RELATIVE, VOCABULARY_SCHEMA, VocabularyError,
+} from "./analytics-kernel-vocabularies.mjs";
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const GENERATOR = join(WORKER_ROOT, "scripts", "vendor-analytics-kernels.mjs");
@@ -43,6 +49,7 @@ const PINNED_EXPORT_PATCHES = [
   ["apps/worker/src/telemetry-usage-effective-reader.ts", 999, "genericRecordJson", "function genericRecordJson("],
   ["apps/worker/src/telemetry-usage-effective-reader.ts", 1021, "genericOccurrence", "function genericOccurrence("],
   ["apps/worker/src/storage-community-daily.ts", 292, "publicInputs", "function publicInputs("],
+  ["apps/worker/src/quota-analysis-v1.ts", 735, "buildPricingEvent", "function buildPricingEvent("],
 ].map(([path, line, symbol, original]) => ({ path, line, symbol, original }));
 /** The generator's patch list: symbols and declaration kinds, no line numbers. */
 const PINNED_PATCH_SPECS = [
@@ -51,6 +58,7 @@ const PINNED_PATCH_SPECS = [
   ["apps/worker/src/telemetry-usage-effective-reader.ts", "genericRecordJson", "function"],
   ["apps/worker/src/telemetry-usage-effective-reader.ts", "genericOccurrence", "function"],
   ["apps/worker/src/storage-community-daily.ts", "publicInputs", "function"],
+  ["apps/worker/src/quota-analysis-v1.ts", "buildPricingEvent", "function"],
 ].map(([path, symbol, declaration]) => ({ path, symbol, declaration }));
 const PACKAGE_FILE = /^packages\/([a-z-]+)\/(package\.json|index\.js|index\.d\.ts|src\/.+)$/;
 
@@ -314,6 +322,17 @@ async function assertFacadeBundlesAndPrepares(tree) {
     assert.equal(day.daily.counts.usage + day.daily.counts.quota + day.daily.counts.session, 0);
     assert.equal(typeof kernels.publicInputs, "function");
     assert.equal(typeof kernels.reconcileGroups, "function");
+    // The per-event pricing seam: the projection, the pricer and the compiled registry.
+    assert.equal(kernels.buildPricingEvent({ components: {} }, "2026-09-30T00:00:00.000Z"), null, "no token observations price nothing");
+    const event = kernels.buildPricingEvent({ provider: "openai_codex", modelId: "gpt-5.5", billingSurface: "subscription",
+      speedMode: "standard", apiServiceTier: null, reasoningEffort: "medium",
+      components: { inputUncachedTokens: 1000, inputCacheReadTokens: 0, inputCacheWriteTokens: 0, outputTextTokens: 100,
+        outputReasoningTokens: 0, outputCombinedTokens: 100 } }, "2026-09-30T00:00:00.000Z");
+    assert.equal(event.totalInputContextTokens, 1000);
+    const priced = kernels.priceTelemetryUsageEvent(event);
+    assert.ok(Number.isSafeInteger(priced.costNanousd) && priced.costNanousd >= 0);
+    assert.match(kernels.APP_PRICE_REGISTRY_MANIFEST.sha256, /^[0-9a-f]{64}$/);
+    assert.ok(Array.isArray(kernels.APP_OFFICIAL_PRICE_CARDS) && kernels.APP_OFFICIAL_PRICE_CARDS.length > 0);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -385,31 +404,64 @@ function assertFacadeProvenance(tree) {
   for (const token of named) assert.ok(tree.commit.startsWith(token), `${tree.short}/entry.ts names commit ${token}`);
 }
 
+/**
+ * The generated vocabulary module must be exactly what the tree gives, derived
+ * again here from the files on disk and the commit's Worker entry.
+ */
+async function assertVocabulariesGenerated(tree) {
+  const { layout, manifest } = tree;
+  const derived = await vocabulariesOfTree({ layout, manifest, workerIndexText: workerIndexAt(WORKER_ROOT, tree.commit) });
+  assert.equal(derived.sourceCommit, tree.commit);
+  const committed = readFileSync(layout.vocabularyPath, "utf8");
+  const rendered = renderKernelVocabularies(derived);
+  assert.deepEqual(changedVocabularies(committed, rendered), [], `${layout.vocabularyRelative} drifted from the vendored kernels`);
+  assert.equal(committed, rendered, `${layout.vocabularyRelative} is not the rendering of the vendored tree; regenerate it`);
+  return derived;
+}
+
 // ---------------------------------------------------------------------------
-// Committed trees: d43c8f92 (pinned) and any other vendor/analytics-<8 hex>
+// The committed tree: one stable directory, checked against its own commit
 // ---------------------------------------------------------------------------
 
 const DEFAULT_LAYOUT = vendorLayout();
-const committedTrees = [describeTree(DEFAULT_LAYOUT, PINNED_EXPORT_PATCHES)];
-for (const name of readdirSync(join(WORKER_ROOT, "vendor")).filter((entry) => /^analytics-[0-9a-f]{8}$/.test(entry)).sort()) {
-  if (name === DEFAULT_LAYOUT.vendorRelative.split("/")[1]) continue;
-  const recorded = JSON.parse(readFileSync(join(WORKER_ROOT, "vendor", name, MANIFEST_FILE), "utf8"));
-  assert.ok(recorded.sourceCommit?.startsWith(name.slice("analytics-".length)), `${name} holds ${recorded.sourceCommit}`);
-  committedTrees.push(describeTree(vendorLayout({ commit: recorded.sourceCommit }), recorded.exportPatches));
-}
+const RECORDED = JSON.parse(readFileSync(join(DEFAULT_LAYOUT.vendorRoot, MANIFEST_FILE), "utf8"));
+/** The commit the stable directory holds now: d43c8f92 today, the production commit after a re-vendor. */
+const CURRENT = RECORDED.sourceCommit;
+const CURRENT_LAYOUT = vendorLayout({ commit: CURRENT });
+const committedTrees = [describeTree(CURRENT_LAYOUT, CURRENT === COMMIT ? PINNED_EXPORT_PATCHES : RECORDED.exportPatches)];
+
+test("the vendor root holds exactly the one stable tree, and the parity root exactly its specs", () => {
+  assert.deepEqual(readdirSync(join(WORKER_ROOT, "vendor")).sort(), [STABLE_VENDOR_RELATIVE.split("/")[1]]);
+  assert.deepEqual(readdirSync(join(WORKER_ROOT, "analytics-v2-test")).filter((name) => name.startsWith("kernel-parity")),
+    [STABLE_PARITY_RELATIVE.split("/")[1]]);
+});
 
 for (const tree of committedTrees) {
   const isDefault = tree.commit === COMMIT;
   const title = (text) => (isDefault ? text : `[${tree.short}] ${text}`);
 
-  test(title(isDefault ? "the manifest pins d43c8f92 and exactly five export patches" : `the manifest pins ${tree.short} and its recorded export patches`), () => {
+  test(title(isDefault ? "the manifest pins d43c8f92 and exactly six export patches" : `the manifest pins ${tree.short} and its recorded export patches`), () => {
     assertManifestPins(tree);
     if (!isDefault) return;
     assert.equal(SOURCE_COMMIT, COMMIT);
     assert.deepEqual(EXPORT_PATCHES.map((patch) => ({ ...patch })), PINNED_PATCH_SPECS);
-    assert.equal(tree.manifest.exportPatches.length, 5);
-    assert.equal(tree.manifest.counts.exportPatched, 5);
+    assert.equal(tree.manifest.exportPatches.length, 6);
+    assert.equal(tree.manifest.counts.exportPatched, 6);
+    assert.equal(tree.manifest.counts.exportPatchedFiles, 3);
     assert.equal(tree.manifest.exportsAlreadyPresent, undefined);
+  });
+
+  test(title("the generated GCP-only vocabularies are exactly what the vendored tree gives"), async () => {
+    const derived = await assertVocabulariesGenerated(tree);
+    if (!isDefault) return;
+    // Pinned at d43c8f92: the values the GCP copies and primary 0059 were written for.
+    assert.equal(derived.modelDates, 70);
+    assert.equal(derived.sharedAnalyticsRefusalReasons.length, 18);
+    assert.deepEqual(derived.cacheRetentionRefusalReasons, ["session_limit_exceeded", "group_limit_exceeded"]);
+    assert.equal(derived.cacheRetentionBandIds.length, 10);
+    assert.deepEqual(derived.cacheBandCounters, ["adjacencies", "reused_more_than_half", "matched_or_exceeded", "unordered_ties",
+      "excluded_insufficient_evidence", "excluded_context_contracted", "sessions"]);
+    assert.equal(derived.communityDailyReadSchemaVersion, "community-daily-read-v1.0");
   });
 
   test(title(`every vendored file equals git rev-parse ${tree.short}:<path> after export-token removal`), () => {
@@ -498,15 +550,22 @@ test("a production commit must be a full 40-hex commit id; abbreviations and ref
   assert.throws(() => vendorLayout({ commit: "d43c8f92" }), refusedWith("COMMIT_NOT_FULL_SHA"));
 });
 
-test("the vendor directory is named by the commit and the parity directory keeps d43c8f92's name", () => {
+test("the layout is stable: every commit vendors into the same directories", async () => {
   const other = "0123456789abcdef0123456789abcdef01234567";
   const layout = vendorLayout({ commit: other, outRoot: "/scratch/out" });
-  assert.equal(layout.vendorRelative, "vendor/analytics-01234567");
-  assert.equal(layout.parityRelative, "analytics-v2-test/kernel-parity-01234567");
-  assert.equal(layout.vendorRoot, "/scratch/out/vendor/analytics-01234567");
-  assert.equal(DEFAULT_LAYOUT.vendorRelative, "vendor/analytics-d43c8f92");
-  assert.equal(DEFAULT_LAYOUT.parityRelative, "analytics-v2-test/kernel-parity");
+  assert.equal(layout.commit, other);
+  assert.equal(layout.vendorRelative, "vendor/analytics-d43c8f92");
+  assert.equal(layout.parityRelative, "analytics-v2-test/kernel-parity");
+  assert.equal(layout.vocabularyRelative, "src/analytics-v2/kernel-vocabularies.generated.ts");
+  assert.equal(layout.vendorRoot, "/scratch/out/vendor/analytics-d43c8f92");
+  assert.equal(layout.vocabularyPath, "/scratch/out/src/analytics-v2/kernel-vocabularies.generated.ts");
+  assert.equal(VOCABULARY_RELATIVE, layout.vocabularyRelative);
+  for (const key of ["vendorRelative", "parityRelative", "vocabularyRelative"]) assert.equal(DEFAULT_LAYOUT[key], layout[key]);
   assert.equal(DEFAULT_LAYOUT.vendorRoot, join(WORKER_ROOT, "vendor/analytics-d43c8f92"));
+  // The Vitest config names the same root, so no re-vendor edits it (the
+  // path-literal test below covers every other consumer).
+  const config = await import(pathToFileURL(join(WORKER_ROOT, "vitest.analytics-v2.config.mjs")).href);
+  assert.equal(config.VENDORED_PACKAGE_ENTRIES["@app-usagemonitor/accounting"], join(DEFAULT_LAYOUT.vendorRoot, "packages/accounting/index.js"));
 });
 
 test("arguments are parsed strictly", () => {
@@ -850,20 +909,28 @@ function assertSameFiles(actual, expected, label) {
   for (const [path, bytes] of expected) assert.ok(actual.get(path).equals(bytes), `${label}: ${path} differs`);
 }
 
-test("regenerating d43c8f92 into a scratch directory reproduces the committed tree byte for byte", () => {
+/** Every file a run writes under an out root: the vendor tree, the parity specs and the vocabulary module. */
+function assertSameOutput(scratch, committed, label) {
+  assertSameFiles(snapshot(scratch.vendorRoot), snapshot(committed.vendorRoot), `${label}: vendor tree`);
+  assertSameFiles(snapshot(scratch.parityRoot), snapshot(committed.parityRoot), `${label}: parity specs`);
+  assert.ok(readFileSync(scratch.vocabularyPath).equals(readFileSync(committed.vocabularyPath)), `${label}: ${scratch.vocabularyRelative} differs`);
+}
+
+test("regenerating the committed commit into a scratch directory reproduces the committed tree byte for byte", () => {
   withScratch((out) => {
-    const run = runGenerator([`--commit=${COMMIT}`, `--out-root=${out}`, `--authored-from=${DEFAULT_LAYOUT.vendorRoot}`]);
+    const run = runGenerator([`--commit=${CURRENT}`, `--out-root=${out}`, `--authored-from=${DEFAULT_LAYOUT.vendorRoot}`]);
     assert.equal(run.status, 0, run.stderr);
     assert.match(run.stdout, /"status":"ok"/);
-    const scratch = vendorLayout({ commit: COMMIT, outRoot: out });
-    assertSameFiles(snapshot(scratch.vendorRoot), snapshot(DEFAULT_LAYOUT.vendorRoot), "vendor tree");
-    assertSameFiles(snapshot(scratch.parityRoot), snapshot(DEFAULT_LAYOUT.parityRoot), "parity specs");
-    assert.deepEqual(readdirSync(out).sort(), ["analytics-v2-test", "vendor"]);
-    // Without --commit the generator does the same, over its own previous output.
+    assert.equal(JSON.parse(run.stdout).replaced, undefined);
+    const scratch = vendorLayout({ commit: CURRENT, outRoot: out });
+    assertSameOutput(scratch, CURRENT_LAYOUT, "first run");
+    assert.deepEqual(readdirSync(out).sort(), ["analytics-v2-test", "src", "vendor"]);
+    assert.deepEqual(listFiles(join(out, "src")), [VOCABULARY_RELATIVE.slice("src/".length)]);
+    // Without --commit the generator vendors d43c8f92, over its own previous output.
+    if (CURRENT !== COMMIT) return;
     const again = runGenerator([`--out-root=${out}`]);
     assert.equal(again.status, 0, again.stderr);
-    assertSameFiles(snapshot(scratch.vendorRoot), snapshot(DEFAULT_LAYOUT.vendorRoot), "vendor tree, second run");
-    assertSameFiles(snapshot(scratch.parityRoot), snapshot(DEFAULT_LAYOUT.parityRoot), "parity specs, second run");
+    assertSameOutput(scratch, CURRENT_LAYOUT, "second run");
   });
 });
 
@@ -886,18 +953,47 @@ function placeFacadeFor(layout) {
 const OTHER_COMMIT = git(["rev-parse", "--verify", `${COMMIT}~25`]).trim();
 const TREE_SHAKEN_MODULES = ["analytics-delivery", "d1-invocation-budget", "v11-storage-journal"].map((name) => `apps/worker/src/${name}.ts`);
 
-test("another commit is vendored into its own directories and passes every per-tree assertion d43c8f92 does", async () => {
+/** d43c8f92's facade with its provenance text pointed at `short`, or naming no commit when `short` is null. */
+function facadeText(short) {
+  const text = readFileSync(join(DEFAULT_LAYOUT.vendorRoot, "entry.ts"), "utf8");
+  return short === null ? text.replaceAll(`commit ${COMMIT.slice(0, 8)}`, "the vendored commit").replaceAll(COMMIT.slice(0, 8), "the vendored commit")
+    : text.replaceAll(COMMIT.slice(0, 8), short);
+}
+
+test("another commit replaces the one the stable directory holds only after its facade is reviewed, and passes every per-tree assertion", async () => {
   assert.notEqual(OTHER_COMMIT, COMMIT);
+  assert.equal(CURRENT, COMMIT, "this test starts from the d43c8f92 tree; after a re-vendor, point it at the new commit's predecessor");
   await withWorkspace(async (out) => {
+    const seeded = runGenerator([`--commit=${COMMIT}`, `--out-root=${out}`, `--authored-from=${DEFAULT_LAYOUT.vendorRoot}`]);
+    assert.equal(seeded.status, 0, seeded.stderr);
     const layout = vendorLayout({ commit: OTHER_COMMIT, outRoot: out });
-    placeFacadeFor(layout);
+    const facade = join(layout.vendorRoot, "entry.ts");
+
+    // The facade still names d43c8f92: its provenance would be false for the other commit.
+    const before = snapshot(out);
+    const stale = runGenerator([`--commit=${OTHER_COMMIT}`, `--out-root=${out}`]);
+    assert.equal(stale.status, 1);
+    assert.match(stale.stderr, /^AUTHORED_PROVENANCE_MISMATCH: /);
+    // A facade that names no commit at all is not a reviewed transition either.
+    writeFileSync(facade, facadeText(null));
+    assert.deepEqual(commitsNamedIn(readFileSync(facade, "utf8")), []);
+    const unnamed = runGenerator([`--commit=${OTHER_COMMIT}`, `--out-root=${out}`]);
+    assert.equal(unnamed.status, 1);
+    assert.match(unnamed.stderr, new RegExp(`^VENDOR_TRANSITION_FACADE_UNREVIEWED: vendor/analytics-d43c8f92 holds ${COMMIT}`));
+    writeFileSync(facade, readFileSync(join(DEFAULT_LAYOUT.vendorRoot, "entry.ts")));
+    assertSameFiles(snapshot(out), before, "after refused transitions");
+
+    // Reviewed: the facade names the other commit. It replaces d43c8f92 in place.
+    writeFileSync(facade, facadeText(layout.short));
     const run = runGenerator([`--commit=${OTHER_COMMIT}`, `--out-root=${out}`]);
     assert.equal(run.status, 0, run.stderr);
-    assert.deepEqual(JSON.parse(run.stdout).verified, { standaloneBundle: true, closureModules: JSON.parse(run.stdout).verified.closureModules, load: true, typecheck: true });
-    assert.equal(layout.vendorRelative, `vendor/analytics-${OTHER_COMMIT.slice(0, 8)}`);
-    assert.equal(layout.parityRelative, `analytics-v2-test/kernel-parity-${OTHER_COMMIT.slice(0, 8)}`);
-    assert.deepEqual(readdirSync(join(out, "vendor")), [`analytics-${OTHER_COMMIT.slice(0, 8)}`]);
-    assert.deepEqual(readdirSync(join(out, "analytics-v2-test")), [`kernel-parity-${OTHER_COMMIT.slice(0, 8)}`]);
+    const logged = JSON.parse(run.stdout);
+    assert.equal(logged.replaced, COMMIT);
+    assert.deepEqual(logged.verified, { standaloneBundle: true, closureModules: logged.verified.closureModules, load: true, typecheck: true, vocabularies: true });
+    assert.equal(layout.vendorRelative, DEFAULT_LAYOUT.vendorRelative);
+    assert.equal(layout.parityRelative, DEFAULT_LAYOUT.parityRelative);
+    assert.deepEqual(readdirSync(join(out, "vendor")), [STABLE_VENDOR_RELATIVE.split("/")[1]]);
+    assert.deepEqual(readdirSync(join(out, "analytics-v2-test")), [STABLE_PARITY_RELATIVE.split("/")[1]]);
     const manifest = JSON.parse(readFileSync(join(layout.vendorRoot, MANIFEST_FILE), "utf8"));
     assert.equal(manifest.sourceCommit, OTHER_COMMIT);
     assert.deepEqual(manifest.exportPatches.map((patch) => patch.symbol), PINNED_PATCH_SPECS.map((spec) => spec.symbol));
@@ -914,7 +1010,10 @@ test("another commit is vendored into its own directories and passes every per-t
     await assertFacadeBundlesAndPrepares(tree);
     await assertTypeStubs(tree);
     assertTscConsumer(tree);
-    for (const entry of manifest.parityTests) assert.ok(entry.rewrite.to.includes(`vendor/analytics-${OTHER_COMMIT.slice(0, 8)}/`), entry.path);
+    for (const entry of manifest.parityTests) assert.ok(entry.rewrite.to.includes(`${STABLE_VENDOR_RELATIVE}/`), entry.path);
+    // The vocabularies were regenerated for the commit the tree now holds.
+    await assertVocabulariesGenerated(tree);
+    assert.match(readFileSync(layout.vocabularyPath, "utf8"), new RegExp(`SOURCE_COMMIT = "${OTHER_COMMIT}"`));
     assert.ok(readFileSync(join(layout.vendorRoot, "tsconfig.json")).equals(readFileSync(join(DEFAULT_LAYOUT.vendorRoot, "tsconfig.json"))));
 
     // The regression: those modules are in the closure as files, not stubs, and
@@ -935,11 +1034,21 @@ test("another commit is vendored into its own directories and passes every per-t
     const first = snapshot(out);
     const again = runGenerator([`--commit=${OTHER_COMMIT}`, `--out-root=${out}`]);
     assert.equal(again.status, 0, again.stderr);
+    assert.equal(JSON.parse(again.stdout).replaced, undefined);
     assertSameFiles(snapshot(out), first, "second run");
+
+    // And back: restoring d43c8f92's reviewed facade and vendoring d43c8f92 again
+    // reproduces the committed tree, parity specs and vocabularies byte for byte,
+    // with nothing left over from the other commit.
+    writeFileSync(facade, readFileSync(join(DEFAULT_LAYOUT.vendorRoot, "entry.ts")));
+    const back = runGenerator([`--commit=${COMMIT}`, `--out-root=${out}`]);
+    assert.equal(back.status, 0, back.stderr);
+    assert.equal(JSON.parse(back.stdout).replaced, OTHER_COMMIT);
+    assertSameOutput(vendorLayout({ commit: COMMIT, outRoot: out }), DEFAULT_LAYOUT, "round trip");
   });
 });
 
-test("the generator never overwrites reviewed files or another commit's directory", () => {
+test("the generator never overwrites reviewed files, and never replaces a commit its facade does not name", () => {
   withScratch((out) => {
     const unseeded = runGenerator([`--out-root=${out}`]);
     assert.equal(unseeded.status, 1);
@@ -955,18 +1064,26 @@ test("the generator never overwrites reviewed files or another commit's director
     assertSameFiles(snapshot(out), before, "after a refused reseed");
   });
   withScratch((out) => {
+    // The stable directory holds another commit, and the facade beside it names none.
     const dir = join(out, DEFAULT_LAYOUT.vendorRelative);
     mkdirSync(dir, { recursive: true });
-    for (const file of AUTHORED_FILES) writeFileSync(join(dir, file), readFileSync(join(DEFAULT_LAYOUT.vendorRoot, file)));
-    const foreign = { schemaVersion: MANIFEST_SCHEMA, sourceCommit: `d43c8f92${"0".repeat(32)}`, files: [{ path: "apps/worker/src/keep.ts" }] };
+    writeFileSync(join(dir, "entry.ts"), facadeText(null));
+    writeFileSync(join(dir, "tsconfig.json"), readFileSync(join(DEFAULT_LAYOUT.vendorRoot, "tsconfig.json")));
+    const foreign = { schemaVersion: MANIFEST_SCHEMA, sourceCommit: OTHER_COMMIT, files: [{ path: "apps/worker/src/keep.ts" }] };
     writeFileSync(join(dir, MANIFEST_FILE), JSON.stringify(foreign));
     mkdirSync(join(dir, "apps/worker/src"), { recursive: true });
     writeFileSync(join(dir, "apps/worker/src/keep.ts"), "keep\n");
     const before = snapshot(out);
     const run = runGenerator([`--out-root=${out}`]);
     assert.equal(run.status, 1);
-    assert.match(run.stderr, /^VENDOR_DIR_COMMIT_MISMATCH: /);
-    assertSameFiles(snapshot(out), before, "after a refused mismatch");
+    assert.match(run.stderr, new RegExp(`^VENDOR_TRANSITION_FACADE_UNREVIEWED: vendor/analytics-d43c8f92 holds ${OTHER_COMMIT}`));
+    assertSameFiles(snapshot(out), before, "after a refused transition");
+    // A manifest of a schema this generator does not know is never replaced.
+    writeFileSync(join(dir, MANIFEST_FILE), JSON.stringify({ ...foreign, schemaVersion: "analytics-kernel-vendor-manifest-v0" }));
+    writeFileSync(join(dir, "entry.ts"), readFileSync(join(DEFAULT_LAYOUT.vendorRoot, "entry.ts")));
+    const unknown = runGenerator([`--out-root=${out}`]);
+    assert.equal(unknown.status, 1);
+    assert.match(unknown.stderr, /^MANIFEST_SCHEMA_UNKNOWN: /);
   });
 });
 
@@ -1163,7 +1280,7 @@ test("the report resolves the patches at a commit, names drifted files, builds t
   assert.equal(report.ok, true);
   assert.equal(report.patchesOk, true);
   assert.deepEqual(report.patches.map(({ path, line, symbol, original }) => ({ path, line, symbol, original })), PINNED_EXPORT_PATCHES);
-  assert.deepEqual(report.summary, { apply: 5 });
+  assert.deepEqual(report.summary, { apply: 6 });
   assert.equal(report.verification.status, "passed");
   assert.deepEqual(report.drift.changed, []);
   assert.deepEqual(report.drift.removed, []);
@@ -1171,7 +1288,9 @@ test("the report resolves the patches at a commit, names drifted files, builds t
   assert.deepEqual(report.facade, { entry: "entry.ts", modules: report.facade.modules, unresolved: [] });
   assert.deepEqual(report.provenance, { entry: "entry.ts", named: [COMMIT.slice(0, 8)], foreign: [] });
   assert.equal(report.generation.status, "passed");
-  assert.equal(report.generation.counts.exportPatched, 5);
+  assert.equal(report.generation.counts.exportPatched, 6);
+  // The same commit gives the committed vocabularies: nothing to port.
+  assert.deepEqual(report.generation.vocabularies, { module: VOCABULARY_RELATIVE, changed: [] });
   // Against a reference whose recorded blobs are wrong the same commit reports every file as changed.
   const stale = { ...reference, files: reference.files.map((file) => ({ ...file, blob: "0".repeat(40) })), typeStubs: [], parityTests: [] };
   const drifted = await reportAtCommit({ commit: COMMIT, reference: stale });
@@ -1195,6 +1314,7 @@ test("the report is never ok for a facade it cannot build with, one that names a
   assert.equal(other.patchesOk, true);
   assert.equal(other.generation.status, "passed");
   assert.deepEqual(other.provenance.foreign, [COMMIT.slice(0, 8)]);
+  assert.ok(Array.isArray(other.generation.vocabularies.changed));
   assert.equal(other.ok, false);
   // No reference directory: there is no facade to build with, so no answer.
   const bare = await reportAtCommit({ commit: COMMIT, reference });
@@ -1217,4 +1337,137 @@ test("the report is never ok for a facade it cannot build with, one that names a
     assert.equal(renamed.generation.code, "VENDORED_TREE_TYPECHECK_FAILED");
     assert.equal(renamed.ok, false);
   });
+});
+
+// ---------------------------------------------------------------------------
+// The GCP-only vocabularies are derived, never listed
+// ---------------------------------------------------------------------------
+
+const refusedVocabulary = (code) => (error) => (error instanceof VocabularyError || error instanceof VendorError) && error.code === code;
+
+test("refusal reasons are the plain literals a class is constructed with, and anything else refuses", () => {
+  const reasons = (text) => constructedReasons({ text, path: "apps/worker/src/x.ts", className: "Refused", maskNonCode });
+  assert.deepEqual(reasons("throw new Refused('a_b');\nthrow new Refused(\"c\");\nif (x) throw new Refused( 'a_b' );\n"), ["a_b", "c"]);
+  // Decoys in comments, strings and templates, and other classes, are not constructions.
+  assert.deepEqual(reasons([
+    "// throw new Refused('in_comment');", "/* new Refused('in_block') */", "const s = \"new Refused('in_string')\";",
+    "const t = `new Refused('in_template')`;", "throw new NotRefused('other_class');", "throw new RefusedLater('prefix');", "",
+  ].join("\n")), []);
+  for (const bad of ["new Refused(reason);", "new Refused(`a`);", "new Refused('a' + b);", "new Refused('a', 1);",
+    "new Refused('Not-A-Reason');", "new Refused();", "new Refused(\n  cond ? 'a' : 'b');"]) {
+    assert.throws(() => reasons(`${bad}\n`), refusedVocabulary("VOCABULARY_REASON_NOT_LITERAL"), bad);
+  }
+  assert.throws(() => reasons("class Mine extends Refused {}\nthrow new Mine('x');\n"), refusedVocabulary("VOCABULARY_REFUSAL_CLASS_EXTENDED"));
+});
+
+test("interface members are read in declaration order, and a member the rule cannot read refuses", () => {
+  const members = (text) => interfaceMembers({ text, path: "x.ts", name: "C", maskNonCode });
+  assert.deepEqual(members("export interface C {\n  readonly band: Id;\n  /** a { brace } in a comment */\n  readonly a: number;\n  b?: number;\n\n}\n"), ["band", "a", "b"]);
+  for (const bad of [
+    "interface C {\n  a(): number;\n}\n",
+    "interface C {\n  a: { b: number };\n}\n",
+    "interface C {\n  a: number | null;\n}\n",
+    "interface C {\n  [key: string]: number;\n}\n",
+    "interface C {\n  a: number;\n}\ninterface C {\n  b: number;\n}\n",
+    "interface D {\n  a: number;\n}\n",
+    "interface C {\n}\n",
+  ]) assert.throws(() => members(bad), refusedVocabulary("VOCABULARY_SOURCE_CHANGED"), bad);
+});
+
+test("the cache family's source is the imported cache reducers one function calls", () => {
+  const callees = (body) => importedCallees({ functionName: "evaluate", modulePrefix: "./cache-retention-", path: "x.ts", maskNonCode, text: [
+    "import { reduceX, other as renamed, type T } from \"./cache-retention-values\";",
+    "import { helper } from './cache-retention-day';",
+    "import { unrelated } from \"./elsewhere\";",
+    "export function evaluate(input: { day: string; days: readonly T[] }): R {",
+    body,
+    "}",
+    "function later() { return helper(); }",
+    "",
+  ].join("\n") });
+  assert.deepEqual(callees("  unrelated();\n  return reduceX(input);"), [{ name: "reduceX", module: "./cache-retention-values" }]);
+  assert.deepEqual(callees("  // helper(input);\n  return reduceX(reduceX(input));"), [{ name: "reduceX", module: "./cache-retention-values" }]);
+  assert.deepEqual(callees("  helper();\n  return renamed(input);"),
+    [{ name: "helper", module: "./cache-retention-day" }, { name: "renamed", module: "./cache-retention-values" }]);
+  assert.throws(() => importedCallees({ functionName: "absent", modulePrefix: "./c", path: "x.ts", maskNonCode, text: "function a() {}\n" }),
+    refusedVocabulary("VOCABULARY_SOURCE_CHANGED"));
+});
+
+test("the community daily read version is the one schemaVersion literal of the Worker entry", () => {
+  const version = (text) => communityDailyReadSchemaVersion({ text, path: "apps/worker/src/index.ts" });
+  assert.equal(version("return json({\n  schemaVersion: \"community-daily-read-v1.0\",\n});\n"), "community-daily-read-v1.0");
+  assert.equal(version("a({ schemaVersion: 'community-daily-read-v2.13' }); b({ schemaVersion: \"community-daily-read-v2.13\" });"), "community-daily-read-v2.13");
+  for (const bad of [
+    "a({ schemaVersion: \"community-daily-read-v1.0\" }); b({ schemaVersion: \"community-daily-read-v1.1\" });",
+    "a({ schemaVersion: \"community-daily-read-v1.0\" }); const legacy = \"community-daily-read-v0.9\";",
+    "a({ schemaVersion: \"community-daily-read-v1\" });",
+    "a({ schemaVersion: \"community-daily-v1.0\" });",
+  ]) assert.throws(() => version(bad), refusedVocabulary("VOCABULARY_SOURCE_CHANGED"), bad);
+});
+
+test("a kernel change to any vocabulary changes the derivation, and a change the rules cannot follow refuses", async () => {
+  await withScratchAsync(async (dir) => {
+    const index = workerIndexAt(WORKER_ROOT, CURRENT);
+    const committed = readFileSync(CURRENT_LAYOUT.vocabularyPath, "utf8");
+    /** A copy of the committed vendor tree, changed by `edit(path => text, (path, text) => void)`, then derived. */
+    const derive = async (edit, workerIndexText = index) => {
+      const out = join(dir, `case-${Math.random().toString(16).slice(2)}`);
+      const layout = vendorLayout({ commit: CURRENT, outRoot: out });
+      cpSync(CURRENT_LAYOUT.vendorRoot, layout.vendorRoot, { recursive: true });
+      const read = (path) => readFileSync(join(layout.vendorRoot, path), "utf8");
+      edit?.(read, (path, text) => writeFileSync(join(layout.vendorRoot, path), text));
+      return vocabulariesOfTree({ layout, manifest: RECORDED, workerIndexText });
+    };
+    const reducers = "apps/worker/src/analytics-shared-reducers.ts";
+    const cache = "apps/worker/src/cache-retention-values.ts";
+
+    // Unchanged files give the committed module.
+    assert.equal(renderKernelVocabularies(await derive()), committed);
+    // A new reason in the kernel is a new reason in the vocabulary, and the
+    // difference names the one block a reviewer must port.
+    const added = await derive((read, write) => write(reducers,
+      `${read(reducers)}\nexport function probeOnly(): never { throw new SharedAnalyticsUnavailable('brand_new_reason'); }\n`));
+    assert.equal(added.sharedAnalyticsRefusalReasons.at(-1), "brand_new_reason");
+    assert.deepEqual(changedVocabularies(committed, renderKernelVocabularies(added)), ["KERNEL_SHARED_ANALYTICS_REFUSAL_REASONS"]);
+    // The cache family's reducer and band shape.
+    const band = await derive((read, write) => write(cache, read(cache)
+      .replace("\"over_twenty_four_hours\" as const", "\"over_one_day\" as const")));
+    assert.equal(band.cacheRetentionBandIds.at(-1), "over_one_day");
+    assert.deepEqual(changedVocabularies(committed, renderKernelVocabularies(band)), ["KERNEL_CACHE_RETENTION_BAND_IDS"]);
+    const dates = await derive((read, write) => write("apps/worker/src/admin-community-allowance.ts",
+      read("apps/worker/src/admin-community-allowance.ts").replace(/export const ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS =\n\s*COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS;/,
+        "export const ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS =\n  COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS + 7;")));
+    assert.equal(dates.modelDates, 77);
+    assert.deepEqual(changedVocabularies(committed, renderKernelVocabularies(dates)), ["KERNEL_MODEL_DATES"]);
+    const version = await derive(undefined, index.replace("community-daily-read-v1.0", "community-daily-read-v1.1"));
+    assert.deepEqual(changedVocabularies(committed, renderKernelVocabularies(version)), ["KERNEL_COMMUNITY_DAILY_READ_SCHEMA_VERSION"]);
+
+    // Refusals: a dynamic reason, a cache family routed elsewhere, a counter the
+    // reducer does not emit, and a Worker entry with no single read version.
+    await assert.rejects(derive((read, write) => write(reducers,
+      `${read(reducers)}\nexport function probeOnly(reason: string): never { throw new SharedAnalyticsUnavailable(reason); }\n`)),
+    refusedVocabulary("VOCABULARY_REASON_NOT_LITERAL"));
+    await assert.rejects(derive((read, write) => write(reducers, read(reducers).replace(
+      "  const sessions = new Set(own.cacheItems.map(item => item.sessionDigest));",
+      "  cacheRetentionSessionDigest(input.ownerDigest);\n  const sessions = new Set(own.cacheItems.map(item => item.sessionDigest));"))),
+    refusedVocabulary("VOCABULARY_SOURCE_CHANGED"));
+    await assert.rejects(derive((read, write) => write(cache, read(cache).replace(
+      "  readonly excludedContextContracted: number;\n  readonly sessions: number;",
+      "  readonly excludedContextContracted: number;\n  readonly excludedOther: number;\n  readonly sessions: number;"))),
+    refusedVocabulary("VOCABULARY_COUNTERS_DISAGREE"));
+    await assert.rejects(derive(undefined, index.replaceAll("community-daily-read-v1.0", "community-daily-read-v1")),
+      refusedVocabulary("VOCABULARY_SOURCE_CHANGED"));
+    await assert.rejects(derive(undefined, null), refusedVocabulary("VOCABULARY_SOURCE_MISSING"));
+  });
+});
+
+test("the rendered module is deterministic and names its schema and commit", async () => {
+  const derived = await vocabulariesOfTree({ layout: CURRENT_LAYOUT, manifest: RECORDED, workerIndexText: workerIndexAt(WORKER_ROOT, CURRENT) });
+  const text = renderKernelVocabularies(derived);
+  assert.equal(renderKernelVocabularies(JSON.parse(JSON.stringify(derived))), text);
+  assert.ok(text.startsWith("// GENERATED FILE. Do not edit by hand.\n"));
+  assert.ok(text.includes(`// Schema: ${VOCABULARY_SCHEMA}.`));
+  assert.ok(text.includes(`export const KERNEL_VOCABULARIES_SOURCE_COMMIT = "${CURRENT}" as const;`));
+  assert.ok(text.endsWith("\n") && !text.includes("\n\n\n") && !/[ \t]$/m.test(text));
+  assert.throws(() => renderKernelVocabularies({ ...derived, schemaVersion: "other" }), refusedVocabulary("VOCABULARY_SCHEMA_UNKNOWN"));
 });

@@ -1,9 +1,24 @@
 #!/usr/bin/env node
 // Vendors the production analytics kernels at a chosen production commit into
-// vendor/analytics-<first 8 hex of the commit> so the GCP line runs exactly
-// production's arithmetic, independently of its own src/ and workspace
-// packages. The commit is an argument (`--commit=<40-hex>`) and defaults to
-// d43c8f92, the revision vendored today.
+// the one STABLE vendor directory, vendor/analytics-d43c8f92, so the GCP line
+// runs exactly production's arithmetic, independently of its own src/ and
+// workspace packages. The commit is an argument (`--commit=<40-hex>`) and
+// defaults to d43c8f92, the revision vendored today.
+//
+// The directory does not move with the commit. Its name records the first
+// vendored revision and is a fixed path, not a provenance claim: MANIFEST.json
+// `sourceCommit` (and the reviewed entry.ts, which must name it) says which
+// commit the files are copies of. Every GCP import, the Vitest config and the
+// Cloud Run build guards name this one path (as KM-4's catalog-binding plugin
+// path map will), so a re-vendor at a new production commit rewrites the vendored files
+// in place, `git diff` shows the kernel change itself, and no import path
+// changes. Vendoring a different commit into it is a transition: the reviewed
+// facade must already name the new commit (VENDOR_TRANSITION_FACADE_UNREVIEWED).
+//
+// Each run also writes the GCP-only vocabularies (the 70 model dates, refusal
+// reasons, cache band ids and counters, community-daily-read-v1.0) derived from
+// the verified tree by analytics-kernel-vocabularies.mjs into
+// src/analytics-v2/kernel-vocabularies.generated.ts.
 //
 // The closure is computed, not listed: esbuild bundles entry.ts (the reviewed
 // facade), the website normalizer and the copied parity specs from a
@@ -25,7 +40,8 @@
 // tree's own tsconfig.json (esbuild alone passes a facade that re-exports a
 // name its module no longer has). Any failure refuses the run and leaves the
 // existing output as it was. The reviewed entry.ts carries provenance text for
-// one commit, so a facade that names any other commit is refused too.
+// one commit, so a facade that names any other commit is refused too. The
+// vocabularies are derived from the staged tree before anything is replaced.
 //
 // Export patches are located BY SYMBOL, never by line number. Each patch names
 // a file, a symbol and the declaration kind ("function", "async function" or
@@ -40,16 +56,17 @@
 //   node scripts/vendor-analytics-kernels.mjs [--commit=<40-hex>] [--out-root=<dir>]
 //        [--authored-from=<vendor dir>]
 //   node scripts/vendor-analytics-kernels.mjs --report [--commit=<40-hex>] [--reference=<MANIFEST.json>]
-// `--out-root` writes vendor/ and analytics-v2-test/ under <dir> instead of
-// apps/worker (a scratch dry run). `--authored-from` seeds a NEW vendor
+// `--out-root` writes vendor/, analytics-v2-test/ and the generated vocabulary
+// module under <dir> instead of apps/worker (a scratch dry run). `--authored-from` seeds a NEW vendor
 // directory with the reviewed entry.ts and tsconfig.json from another one; it
 // refuses when the target already holds them, and when that entry.ts names
 // another commit. `--report` writes nothing in the repository: it resolves
 // every export patch at the commit, lists blob drift against a reference
 // manifest (default: the vendored d43c8f92) and the facade imports that no
 // longer resolve, then builds the commit into a temporary directory it deletes
-// (the same closure, bundle, load and typecheck as a real run). Its `ok` means
-// "this commit can be vendored with this facade as it stands".
+// (the same closure, bundle, load, typecheck and vocabulary derivation as a
+// real run) and names the generated vocabularies that would change. Its `ok`
+// means "this commit can be vendored with this facade as it stands".
 // Verify with: node scripts/vendor-analytics-kernels.check.mjs
 
 import { execFileSync, spawnSync } from "node:child_process";
@@ -62,6 +79,9 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, posix, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+  changedVocabularies, deriveKernelVocabularies, renderKernelVocabularies, VOCABULARY_RELATIVE, VocabularyError,
+} from "./analytics-kernel-vocabularies.mjs";
 
 /** The default and original vendored revision (what runs without `--commit`). */
 export const SOURCE_COMMIT = "d43c8f92a059d9c577776f7eca8a331eb305b8a6";
@@ -87,6 +107,12 @@ export const PARITY_SPECS = Object.freeze([
 ]);
 export const PARITY_HELPERS = Object.freeze(["helpers/telemetry-v11.ts"]);
 export const EXPORT_TOKEN = "export ";
+/**
+ * The stable layout. These paths never depend on the vendored commit (see the
+ * header); the vendor directory's name records the first vendored revision.
+ */
+export const STABLE_VENDOR_RELATIVE = "vendor/analytics-d43c8f92";
+export const STABLE_PARITY_RELATIVE = "analytics-v2-test/kernel-parity";
 /** Declaration kinds a patch may name. */
 export const PATCH_DECLARATIONS = Object.freeze(["function", "async function", "const"]);
 
@@ -107,6 +133,8 @@ export const EXPORT_PATCHES = Object.freeze([
   { path: "apps/worker/src/telemetry-usage-effective-reader.ts", symbol: "genericRecordJson", declaration: "function" },
   { path: "apps/worker/src/telemetry-usage-effective-reader.ts", symbol: "genericOccurrence", declaration: "function" },
   { path: "apps/worker/src/storage-community-daily.ts", symbol: "publicInputs", declaration: "function" },
+  // The per-event pricing projection GCP stores and reprices (engine v2 K-PERCARD/K-REPRICE).
+  { path: "apps/worker/src/quota-analysis-v1.ts", symbol: "buildPricingEvent", declaration: "function" },
 ].map((patch) => Object.freeze(patch)));
 
 export class VendorError extends Error {
@@ -157,26 +185,24 @@ export function parseCommit(value) {
 }
 
 /**
- * Where one commit's vendored tree and parity specs live under `outRoot`
- * (apps/worker unless a scratch directory is named). The vendor directory is
- * named by the first eight hex digits. The parity specs of the original
- * revision keep `kernel-parity`; every other commit gets `kernel-parity-<eight>`
- * so two vendored revisions never share a parity directory.
+ * Where a commit's vendored tree, parity specs and generated vocabularies live
+ * under `outRoot` (apps/worker unless a scratch directory is named). The paths
+ * are the stable ones whatever the commit: one vendored revision at a time, in
+ * one place, so a re-vendor never changes an import path.
  */
 export function vendorLayout({ commit = SOURCE_COMMIT, outRoot = WORKER_ROOT } = {}) {
   const sha = parseCommit(commit);
-  const short = sha.slice(0, 8);
   const root = resolve(outRoot);
-  const vendorRelative = `vendor/analytics-${short}`;
-  const parityRelative = sha === SOURCE_COMMIT ? "analytics-v2-test/kernel-parity" : `analytics-v2-test/kernel-parity-${short}`;
   return Object.freeze({
     commit: sha,
-    short,
+    short: sha.slice(0, 8),
     outRoot: root,
-    vendorRelative,
-    vendorRoot: resolve(root, vendorRelative),
-    parityRelative,
-    parityRoot: resolve(root, parityRelative),
+    vendorRelative: STABLE_VENDOR_RELATIVE,
+    vendorRoot: resolve(root, STABLE_VENDOR_RELATIVE),
+    parityRelative: STABLE_PARITY_RELATIVE,
+    parityRoot: resolve(root, STABLE_PARITY_RELATIVE),
+    vocabularyRelative: VOCABULARY_RELATIVE,
+    vocabularyPath: resolve(root, VOCABULARY_RELATIVE),
   });
 }
 
@@ -185,6 +211,7 @@ export const VENDOR_RELATIVE = DEFAULT_LAYOUT.vendorRelative;
 export const VENDOR_ROOT = DEFAULT_LAYOUT.vendorRoot;
 export const PARITY_RELATIVE = DEFAULT_LAYOUT.parityRelative;
 export const PARITY_ROOT = DEFAULT_LAYOUT.parityRoot;
+export const VOCABULARY_PATH = DEFAULT_LAYOUT.vocabularyPath;
 
 /** Git's object id for a blob with these bytes. */
 export function gitBlobSha(bytes) {
@@ -810,12 +837,25 @@ export function assertSourceCommit(root, commit) {
   if (probe.status !== 0 || probe.stdout.trim() !== commit) throw new VendorError("SOURCE_COMMIT_UNAVAILABLE", commit);
 }
 
-/** A vendor directory belongs to one commit; never write another commit's output into it. */
-function assertDirectoryCommit(layout) {
+/**
+ * The stable directory holds one commit at a time, so vendoring another commit
+ * into it replaces the one it holds. That transition must already be reviewed:
+ * the facade that will sit beside the new files (entry.ts, edited first) must
+ * name the new commit, by a hex run of 7 to 40 digits that starts it. A facade
+ * that names no commit is enough to re-vendor the same commit, never to change
+ * it. Returns the commit being replaced, or null.
+ */
+function assertTransitionReviewed(layout, authoredDir) {
   const manifest = readManifest(layout);
-  if (manifest && manifest.sourceCommit !== layout.commit) {
-    throw new VendorError("VENDOR_DIR_COMMIT_MISMATCH", `${layout.vendorRelative} holds ${manifest.sourceCommit}, not ${layout.commit}`);
+  if (!manifest || manifest.sourceCommit === layout.commit) return null;
+  if (manifest.schemaVersion !== MANIFEST_SCHEMA) throw new VendorError("MANIFEST_SCHEMA_UNKNOWN", manifest.schemaVersion);
+  const text = readFileSync(join(authoredDir, "entry.ts"), "utf8");
+  const namesTarget = [...text.matchAll(/\b[0-9a-f]{7,40}\b/gi)].some((match) => layout.commit.startsWith(match[0].toLowerCase()));
+  if (!namesTarget) {
+    throw new VendorError("VENDOR_TRANSITION_FACADE_UNREVIEWED",
+      `${layout.vendorRelative} holds ${manifest.sourceCommit}; review entry.ts for ${layout.short} (its provenance text must name ${layout.short}) before ${layout.short} replaces it`);
   }
+  return manifest.sourceCommit;
 }
 
 /**
@@ -904,8 +944,8 @@ function resolveAuthoredSource(layout, authoredFrom, { provenance = true } = {})
 export async function withSourceExtraction({ layout = DEFAULT_LAYOUT, authoredFrom, provenance = true } = {}, fn) {
   const root = repoRoot();
   assertSourceCommit(root, layout.commit);
-  assertDirectoryCommit(layout);
   const authored = resolveAuthoredSource(layout, authoredFrom, { provenance });
+  const replacing = assertTransitionReviewed(layout, authored.dir);
   const tree = listTree(root, layout.commit, [WORKER_SRC, WORKER_TYPES, "apps/web/public",
     ...VENDORED_PACKAGES.map((pkg) => `packages/${pkg}`), ...paritySources().map(({ source }) => source)]);
   if (![...tree.keys()].some((path) => path.startsWith(`${WORKER_SRC}/`))) throw new VendorError("SOURCE_LAYOUT_UNEXPECTED", `${layout.commit} has no ${WORKER_SRC}`);
@@ -921,7 +961,7 @@ export async function withSourceExtraction({ layout = DEFAULT_LAYOUT, authoredFr
   try {
     for (const path of extractable) writeFile(join(scratch, path), applyExportPatches(path, blobs.get(tree.get(path).blob), exportPlan));
     for (const file of AUTHORED_FILES) writeFile(join(scratch, file), readFileSync(join(authored.dir, file)));
-    return await fn({ scratch, tree, exportPlan, authored, blobs: (path) => blobs.get(tree.get(path).blob) });
+    return await fn({ scratch, tree, exportPlan, authored, replacing, blobs: (path) => blobs.get(tree.get(path).blob) });
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
@@ -1147,9 +1187,35 @@ function writeVendorTree(layout, { authoredDir, files, typeStubs, parityTests })
   for (const test of parityTests) writeFile(join(layout.outRoot, test.path), test.bytes);
 }
 
-export async function vendorAnalyticsKernels({ log = console.log, commit = SOURCE_COMMIT, outRoot = WORKER_ROOT, authoredFrom, provenance = true } = {}) {
+/**
+ * The GCP-only vocabularies of a vendored tree on disk, as analytics-kernel-
+ * vocabularies.mjs derives them; its refusals become VendorErrors with the same
+ * code. `workerIndexText` is the commit's apps/worker/src/index.ts.
+ */
+export async function vocabulariesOfTree({ layout, manifest, workerIndexText, esbuild = loadEsbuild() }) {
+  try {
+    return await deriveKernelVocabularies({
+      vendorRoot: layout.vendorRoot, sourceCommit: manifest.sourceCommit,
+      vendoredSources: manifest.files.map((file) => file.path), workerIndexText,
+      esbuild, maskNonCode, nodeModules: join(WORKER_ROOT, "node_modules"),
+    });
+  } catch (error) {
+    if (error instanceof VocabularyError) throw new VendorError(error.code, error.message.slice(error.code.length + 2));
+    throw error;
+  }
+}
+
+/** The commit's Worker entry text (not vendored), read from git; refused when absent. */
+export function workerIndexAt(root, commit) {
+  const text = readTextAt(root, commit, "apps/worker/src/index.ts");
+  if (text === undefined) throw new VendorError("VOCABULARY_SOURCE_MISSING", `apps/worker/src/index.ts is not in ${commit}`);
+  return text;
+}
+
+export async function vendorAnalyticsKernels({ log = console.log, commit = SOURCE_COMMIT, outRoot = WORKER_ROOT, authoredFrom, provenance = true,
+  onVocabularies } = {}) {
   const layout = vendorLayout({ commit, outRoot });
-  return withSourceExtraction({ layout, authoredFrom, provenance }, async ({ scratch, tree, blobs, exportPlan, authored }) => {
+  return withSourceExtraction({ layout, authoredFrom, provenance }, async ({ scratch, tree, blobs, exportPlan, authored, replacing }) => {
     // 1. Runtime closure from the facade, the website normalizer and the parity specs.
     const esbuild = loadEsbuild();
     const parityInputs = new Set(paritySources().map(({ source }) => source));
@@ -1192,24 +1258,32 @@ export async function vendorAnalyticsKernels({ log = console.log, commit = SOURC
     });
 
     // 4. Prove the tree on its own before anything real is touched: stage exactly
-    //    the files that would be written, then bundle, load and typecheck the stage.
+    //    the files that would be written, then bundle, load and typecheck the
+    //    stage, and derive the GCP-only vocabularies from it.
+    const manifest = buildManifest({ layout, closure, files, typeStubs, parityTests, exportPlan });
     const stage = mkdtempSync(join(tmpdir(), "vendor-analytics-kernels-stage-"));
     let verified;
+    let vocabularies;
     try {
       const staged = vendorLayout({ commit: layout.commit, outRoot: stage });
       writeVendorTree(staged, { authoredDir: authored.dir, files, typeStubs, parityTests });
       verified = await verifyVendoredTree({ layout: staged, expectedReach: reach, ambientTypes: join(scratch, WORKER_TYPES), esbuild });
+      vocabularies = await vocabulariesOfTree({ layout: staged, manifest, esbuild,
+        workerIndexText: existsSync(join(scratch, "apps/worker/src/index.ts")) ? readFileSync(join(scratch, "apps/worker/src/index.ts"), "utf8") : undefined });
     } finally {
       rmSync(stage, { recursive: true, force: true });
     }
+    const rendered = renderKernelVocabularies(vocabularies);
+    onVocabularies?.(rendered);
 
     // 5. Replace previous output, then write.
     removePreviousOutput(readManifest(layout), layout);
     writeVendorTree(layout, { authoredDir: authored.seeded ? authored.dir : undefined, files, typeStubs, parityTests });
-    const manifest = buildManifest({ layout, closure, files, typeStubs, parityTests, exportPlan });
     writeFileSync(join(layout.vendorRoot, MANIFEST_FILE), `${JSON.stringify(manifest, null, 2)}\n`);
-    log(JSON.stringify({ status: "ok", sourceCommit: layout.commit, ...manifest.counts, externals: closure.externals,
-      verified: { standaloneBundle: true, closureModules: verified.closureModules, load: true, typecheck: true } }));
+    writeFile(layout.vocabularyPath, rendered);
+    log(JSON.stringify({ status: "ok", sourceCommit: layout.commit, ...(replacing ? { replaced: replacing } : {}), ...manifest.counts,
+      externals: closure.externals, vocabularies: layout.vocabularyRelative,
+      verified: { standaloneBundle: true, closureModules: verified.closureModules, load: true, typecheck: true, vocabularies: true } }));
     return manifest;
   });
 }
@@ -1261,7 +1335,10 @@ export function facadeAgainstCommit(root, commit, referenceDirectory) {
  * Builds the commit's tree into a temporary directory that is deleted again,
  * seeded from the reference directory's reviewed facade, with the provenance
  * check off (the report states provenance separately, so one run shows every
- * blocker). The generator's own refusals come back as `refused`.
+ * blocker). The generator's own refusals come back as `refused`. A passing run
+ * also names the generated vocabularies that would differ from the committed
+ * module (`vocabularies.changed`): each is a GCP copy, and possibly a primary
+ * 0059 CHECK set, that a re-vendor at this commit must port.
  */
 async function dryRunGeneration({ layout, referenceDirectory }) {
   if (!referenceDirectory || !AUTHORED_FILES.every((file) => existsSync(join(referenceDirectory, file)))) {
@@ -1269,9 +1346,12 @@ async function dryRunGeneration({ layout, referenceDirectory }) {
   }
   const scratch = mkdtempSync(join(tmpdir(), "vendor-analytics-kernels-report-"));
   try {
+    let rendered;
     const manifest = await vendorAnalyticsKernels({ commit: layout.commit, outRoot: scratch, authoredFrom: referenceDirectory,
-      provenance: false, log: () => {} });
-    return { status: "passed", counts: manifest.counts };
+      provenance: false, log: () => {}, onVocabularies: (text) => { rendered = text; } });
+    const committed = existsSync(VOCABULARY_PATH) ? readFileSync(VOCABULARY_PATH, "utf8") : "";
+    return { status: "passed", counts: manifest.counts,
+      vocabularies: { module: VOCABULARY_RELATIVE, changed: changedVocabularies(committed, rendered) } };
   } catch (error) {
     if (!(error instanceof VendorError)) throw error;
     return { status: "refused", code: error.code, detail: error.message };
