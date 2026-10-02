@@ -165,8 +165,8 @@ prove them.
 
 ## H.1 Pre-flight and release pause
 
-Authorization: the read-only Cloudflare reads in steps 1 and 5 (inventory and
-plan; no write). `owner`.
+Authorization: the read-only Cloudflare reads in steps 1, 4 and 5 (inventory,
+the quiescence statements, and plan; no write). `owner`.
 
 1. **Confirm the edge.** The live Worker is in `worker` mode on the edge-port
    line: one version at 100%, `deployment.sourceCommit` on public
@@ -186,9 +186,25 @@ plan; no write). `owner`.
    `owner`.
 4. **Check for participants that are not quiescent.** A participant that is
    mid-erasure refuses the seal and the identity import, and each one found
-   late costs a full extra fence cycle. Tooling: the read-only pre-fence query
-   is `not built` (E-QUIESCE). Until it exists, the owner confirms from the
-   production erasure records that none is open.
+   late costs a full extra fence cycle. Run the read-only quiescence check
+   (E-QUIESCE) with `--phase pre-fence`. It gates on mid-erasure participants,
+   tombstoned participants and pending erasure jobs, and prints counts and
+   opaque references only. From `apps/worker`, print each role's statement
+   (`ingestion`, `deletion-ledger`, `analytics`), run it through a read-only
+   `wrangler d1 execute <database> --remote --json --command "<statement>"`
+   with the owner's read-only credentials in the environment, save the output
+   privately, and evaluate it (the script's header has the exact commands):
+
+   ```bash
+   node scripts/cutover-quiescence-check.mjs queries --role ingestion --sql
+   node scripts/cutover-quiescence-check.mjs evaluate --phase pre-fence --ingestion-result <private file> --ledger-result <private file> --analytics-result <private file>
+   ```
+
+   `evaluate` cannot hash, so its best result is exit 3 with only
+   `deletion-digest-intersection` not evaluated; `check` on exported D1 files
+   answers the intersection. Exit 2 (`blocked`): finish the erasure on
+   Cloudflare and rerun; there is no override. `built`, but its statements and
+   the shape of Wrangler's output have not been run against the provider.
 5. **Inventory and plan the fence.** Neither command needs a fenced Worker,
    and both are read-only, so a refusal here costs nothing. From `apps/worker`,
    with `CLOUDFLARE_API_TOKEN` supplied through the approved credential
@@ -654,7 +670,8 @@ noted.
 
 Status is as of the line at `c80f99b9` and the checklist on 2026-10-02. The
 C-IPR, C-ADMIN and C-REFRESH rows were re-marked when this draft merged into
-the line after `95c158ba`.
+the line after `95c158ba`, and the E-QUIESCE row when E-QUIESCE merged after
+`ebb9304d`.
 
 | Gap | Affects | State |
 |---|---|---|
@@ -662,7 +679,7 @@ the line after `95c158ba`.
 | Production host composition, first-roll ready path, `HOST_ORIGIN` check | Preconditions, H.5 | `not built` (D-CRB); the origin refuses to start in production until it lands |
 | Telemetry importer production modes | H.4 | `not built` (D-PT5A) |
 | Import orchestrator and finalize sequencing | H.4 | `not built` (E-PT8) |
-| Read-only pre-fence quiescence query | H.1 | `not built` (E-QUIESCE) |
+| Read-only pre-fence quiescence query | H.1 | `built` (E-QUIESCE); not yet run against the provider |
 | Frozen public read: export format, loader, retirement | H.3, H.4, H.8 | `built` (C-IPR), with staged migration `0065` promoted at the C-SIMP merge; dropping the stored row is `not built` |
 | Admin routes at the origin | H.7 | Route modules `built` (C-ADMIN); registration in the host `not built` (D-CRB); the overview answers 503 until its sources exist (E-ADMIN) |
 | Refresh job production contract | H.8 | `built` (C-REFRESH) |
