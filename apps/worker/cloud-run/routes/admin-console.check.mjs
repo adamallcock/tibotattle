@@ -546,9 +546,43 @@ test("composition refuses malformed dependencies", () => {
     { ...base, env: {}, pools: { primary: { connect() {} } }, schemaOptions: { primarySchema: "s" } },
     { ...base, pools: { primary: { connect() {} } }, schemaOptions: { primarySchema: "s" },
       overviewSources: { other: async () => ({}) } },
+    // An explicit analytics value must be a pool; null or a non-pool never
+    // falls back to the primary default.
+    { ...base, pools: { primary: { connect() {} }, analytics: null }, schemaOptions: { primarySchema: "s" } },
+    { ...base, pools: { primary: { connect() {} }, analytics: {} }, schemaOptions: { primarySchema: "s" } },
   ]) {
     assert.throws(() => console_.createAdminConsoleAdapters(deps), /ADMIN_ROUTE_CONFIGURATION_INVALID/u);
   }
+});
+
+test("database health binds the analytics role to the primary pool by default, never as a fallback", async () => {
+  // Each pool counts its connections and refuses them, so every probe is
+  // 'unavailable' and no storage is touched.
+  const countingPool = () => {
+    const pool = { connects: 0, async connect() { pool.connects += 1; throw new Error("synthetic refusal"); } };
+    return pool;
+  };
+  const env = Object.freeze({ TELEMETRY_STORAGE_MODE: "typed",
+    TELEMETRY_STORAGE_NAMESPACE: "00000000-0000-4000-8000-0000000000ad" });
+  const health = (pools) => console_.createAdminConsoleAdapters({
+    requestContext: () => undefined, clock: () => NOW_MS, env, pools,
+    schemaOptions: { primarySchema: "s" },
+  }).readDatabaseHealth();
+  const statuses = (body) => body.databases.map((row) => [row.role, row.status]);
+
+  const primary = countingPool();
+  const byDefault = await health({ primary });
+  assert.equal(primary.connects, 2, "the primary and analytics roles each probe the primary pool");
+  assert.deepEqual(statuses(byDefault),
+    [["primary", "unavailable"], ["deletion_ledger", "not_configured"], ["analytics", "unavailable"]]);
+  assert.equal(byDefault.status, "degraded");
+
+  const primaryOnly = countingPool();
+  const analytics = countingPool();
+  const explicit = await health({ primary: primaryOnly, analytics });
+  assert.equal(primaryOnly.connects, 1);
+  assert.equal(analytics.connects, 1, "an explicit analytics pool is probed as given");
+  assert.deepEqual(statuses(explicit), statuses(byDefault));
 });
 
 test("the single dispatcher routes by exact pathname only", async () => {

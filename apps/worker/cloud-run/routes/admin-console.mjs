@@ -1,8 +1,10 @@
 /**
  * The six admin console routes on the PostgreSQL origin (GCP, C-ADMIN), as
  * one family for the composition root to register (D-CRB). Nothing here is
- * registered in the host; the root decides when the admin host stops being
- * refused (OD-CR-3).
+ * registered in the host. OD-CR-3 keeps the admin host refused until the
+ * admin routes are ported; whether this family, with the overview at 503
+ * until its unsourced blocks have sources, counts as ported is an open owner
+ * question, so registering it is not a decision this module takes.
  *
  * Root contract (d43c8f92 handleRequest, admin-hostname branch):
  * 1. A request on the admin host first passes the chokepoint
@@ -21,6 +23,8 @@
  * Defaults: every PostgreSQL reader and writer is bound here from the primary
  * pool and schema. Admin reads with no GCP source stay unavailable unless the
  * root injects one (see the route modules and src/postgres-admin-overview.ts).
+ * The database-health analytics role defaults to the primary pool, because
+ * primary migration 0059 places the analytics_v2 tables in that database.
  */
 
 import { beginPostgresAdminOperation, finishPostgresAdminOperation,
@@ -85,7 +89,9 @@ function optionalPool(name, value) {
  * Bind the default PostgreSQL adapters.
  *
  * deps (FC-3): requestContext, clock?, env (frozen Worker-shaped env),
- *   pools: {primary, ledger?, analytics?},
+ *   pools: {primary, ledger?, analytics?} (analytics defaults to primary,
+ *     where 0059 places analytics_v2; an explicit analytics pool is probed
+ *     as given and never falls back to primary),
  *   schemaOptions: {primarySchema, ledgerSchema?},
  *   overviewSources?: {syntheticContributions?, historicalPublication?, deletionLedger?}
  *     (deletionLedger defaults to the ledger pool's tombstones while one exists),
@@ -100,7 +106,8 @@ export function createAdminConsoleAdapters(deps) {
     throw adminRouteConfigurationError("admin_console", "pools.primary");
   }
   const ledgerPool = optionalPool("pools.ledger", pools.ledger);
-  const analyticsPool = optionalPool("pools.analytics", pools.analytics);
+  // The analytics role's database is the primary database on GCP (0059).
+  const analyticsPool = optionalPool("pools.analytics", pools.analytics) ?? pools.primary;
   const schema = deps.schemaOptions?.primarySchema;
   if (typeof schema !== "string") throw adminRouteConfigurationError("admin_console", "schemaOptions");
   const ledgerSchema = deps.schemaOptions?.ledgerSchema;

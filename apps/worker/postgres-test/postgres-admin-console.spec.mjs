@@ -99,6 +99,7 @@ async function loadModules() {
     health: await load("/src/postgres-admin-database-health.ts"),
     distribution: await load("/src/postgres-admin-distribution.ts"),
     controls: await load("/src/postgres-admin-collection-controls.ts"),
+    ingress: await load("/src/postgres-ingress-budget.ts"),
     adminConsole: await load("/cloud-run/routes/admin-console.mjs"),
     requestContext: await load("/cloud-run/postgres-request-context.mjs"),
     canonical: await load("/src/canonical-json.ts"),
@@ -631,6 +632,66 @@ test("pending daily rebuilds are the days the journal names after the refresh cu
   }
 });
 
+// The production origin's ingress policy (postgres-production-configuration.mjs).
+const INGRESS_POLICY_ENV = Object.freeze({
+  UPLOAD_INGRESS_MAX_CONCURRENT: "8",
+  UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE: "120",
+  UPLOAD_INGRESS_BURST: "16",
+  UPLOAD_INGRESS_LEASE_SECONDS: "90",
+});
+
+test("overview ingress is the Worker's readUploadIngressStatus over the PostgreSQL budget binding", { skip }, async () => {
+  const expected = await workerOverview();
+  const budget = m.ingress.createPostgresUploadIngressBudget(pool, { primarySchema: schema });
+  const requestedNames = [];
+  // The binding shape cloud-run/server.mjs composes.
+  const binding = (stub) => Object.freeze({ getByName: (name) => { requestedNames.push(name); return stub; } });
+  const read = (env) => m.overview.readPostgresAdminOverview({
+    pool, schema, env, nowEpoch: NOW_MS, sources: sourcesFrom(expected),
+  });
+  const budgetState = q("upload_ingress_budget_states");
+  try {
+    const fresh = await read(Object.freeze({ ...ENV, ...INGRESS_POLICY_ENV, UPLOAD_INGRESS_BUDGET: binding(budget) }));
+    assert.deepEqual(requestedNames, ["upload-ingress-budget-v0.1"]);
+    assert.deepEqual(fresh.ingress, { activeLeases: 0, maximumConcurrent: 8, availableStartTokens: 16, burst: 16,
+      concurrencyDenials: 0, startRateDenials: 0, lastDeniedAt: null });
+    // Only the ingress block differs from the Worker's body over the same evidence.
+    assert.equal(JSON.stringify(fresh), JSON.stringify({ ...expected, ingress: fresh.ingress }));
+
+    // Recorded denials are served from the PostgreSQL budget row.
+    await pool.query(`UPDATE ${budgetState} SET concurrency_denials = 3, start_rate_denials = 2,
+        last_denied_at = '2026-10-02T11:59:00Z' WHERE budget_name = 'upload-ingress-budget-v0.1'`);
+    const denied = await read(Object.freeze({ ...ENV, ...INGRESS_POLICY_ENV, UPLOAD_INGRESS_BUDGET: binding(budget) }));
+    assert.deepEqual([denied.ingress.concurrencyDenials, denied.ingress.startRateDenials, denied.ingress.lastDeniedAt],
+      [3, 2, "2026-10-02T11:59:00.000Z"]);
+
+    // Every malformed or failing status degrades the block to null; the rest
+    // of the overview is still served.
+    const validStatus = { activeLeases: 0, maximumConcurrent: 8, availableStartTokens: 16, burst: 16,
+      concurrencyDenials: 0, startRateDenials: 0, lastDeniedAtEpoch: null };
+    for (const env of [
+      Object.freeze({ ...ENV, ...INGRESS_POLICY_ENV,
+        UPLOAD_INGRESS_BUDGET: binding({ status: async () => ({ ...validStatus, activeLeases: -1 }) }) }),
+      Object.freeze({ ...ENV, ...INGRESS_POLICY_ENV,
+        UPLOAD_INGRESS_BUDGET: binding({ status: async () => ({ ...validStatus, burst: 1_201 }) }) }),
+      Object.freeze({ ...ENV, ...INGRESS_POLICY_ENV,
+        UPLOAD_INGRESS_BUDGET: binding({ status: async () => ({ ...validStatus, lastDeniedAtEpoch: "x" }) }) }),
+      Object.freeze({ ...ENV, ...INGRESS_POLICY_ENV, UPLOAD_INGRESS_BUDGET: binding({ status: async () => null }) }),
+      Object.freeze({ ...ENV, ...INGRESS_POLICY_ENV,
+        UPLOAD_INGRESS_BUDGET: binding({ status: async () => { throw new Error("synthetic"); } }) }),
+      Object.freeze({ ...ENV, ...INGRESS_POLICY_ENV, UPLOAD_INGRESS_BUDGET: Object.freeze({}) }),
+      Object.freeze({ ...ENV, ...INGRESS_POLICY_ENV, UPLOAD_INGRESS_BURST: "0",
+        UPLOAD_INGRESS_BUDGET: binding(budget) }),
+    ]) {
+      const body = await read(env);
+      assert.equal(body.ingress, null);
+      assert.equal(JSON.stringify(body), JSON.stringify(expected));
+    }
+  } finally {
+    await pool.query(`DELETE FROM ${budgetState}`);
+  }
+});
+
 test("a failed GitHub snapshot read is the Worker's own unavailable block", { skip }, async () => {
   await pool.query(`ALTER TABLE ${q("github_release_asset_snapshots")} RENAME TO c_admin_hidden_assets`);
   try {
@@ -713,17 +774,21 @@ function modelDay(day, values) {
   return value;
 }
 
+const DAY_MS = 86_400_000;
+
+/** A preview built at nowMs; its evidence dates sit two and three days earlier. */
 function syntheticPreview(nowMs) {
+  const at = (days) => new Date(nowMs - days * DAY_MS).toISOString();
   return m.kernels.buildAdminCommunityAllowancePreview([
     { participantId: "synthetic-participant-pro", planType: "pro",
-      capacityNanousd: 1_200_000_000_000, lastObservedAt: "2026-09-30T12:00:00.000Z" },
+      capacityNanousd: 1_200_000_000_000, lastObservedAt: at(2) },
     { participantId: "synthetic-participant-plus", planType: "plus",
-      capacityNanousd: 60_000_000_000, lastObservedAt: "2026-09-29T12:00:00.000Z" },
+      capacityNanousd: 60_000_000_000, lastObservedAt: at(3) },
   ], nowMs, undefined, {
     modelConfig: m.kernels.ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG,
     basis: m.kernels.ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS,
     gate: m.kernels.ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE,
-    days: [modelDay("2026-09-30", [["gpt-6-sol", 1_000, 1]])],
+    days: [modelDay(at(2).slice(0, 10), [["gpt-6-sol", 1_000, 1]])],
   });
 }
 
@@ -742,7 +807,17 @@ test("allowance preview serves the stored preview exactly as the Worker stores a
   const served = await m.preview.readPostgresAdminAllowancePreview(pool, schema, NOW_MS);
   // The Worker stores canonicalJson(preview) and serves JSON.parse of it.
   assert.equal(JSON.stringify(served), JSON.stringify(JSON.parse(m.canonical.canonicalJson(preview))));
-  for (const value of [undefined, null, { ...preview, generatedAt: "2026-10-02T12:10:00.000Z" },
+  // The vendored validator bounds only future skew, not age (production keeps
+  // a publication until a replacement is ready): a valid preview generated
+  // 120 days before the request is still served unchanged.
+  const old = syntheticPreview(NOW_MS - 120 * DAY_MS);
+  assert.ok(Date.parse(old.generatedAt) <= NOW_MS - 120 * DAY_MS);
+  await setPreview(old);
+  assert.equal(JSON.stringify(await m.preview.readPostgresAdminAllowancePreview(pool, schema, NOW_MS)),
+    JSON.stringify(JSON.parse(m.canonical.canonicalJson(old))));
+  // A preview generated beyond the future skew is the one time bound.
+  for (const value of [syntheticPreview(NOW_MS + 2 * DAY_MS), undefined, null,
+    { ...preview, generatedAt: "2026-10-02T12:10:00.000Z" },
     { ...preview, schemaVersion: "admin-community-allowance-preview-v0.0" }, { generatedAt: NOW_ISO }]) {
     await setPreview(value);
     assert.equal(await m.preview.readPostgresAdminAllowancePreview(pool, schema, NOW_MS), null);
@@ -850,7 +925,9 @@ test("the composed console serves the routes over PostgreSQL with the root's ide
     requestContext: store.accessor,
     clock: () => NOW_MS,
     env: ENV,
-    pools: { primary: pool, ledger: pool, analytics: pool },
+    // No analytics pool: the composition binds the analytics role to the
+    // primary pool, where 0059 places analytics_v2.
+    pools: { primary: pool, ledger: pool },
     schemaOptions: { primarySchema: schema, ledgerSchema },
     overviewSources: {
       syntheticContributions: async () => expected.counts.contributions.synthetic,
@@ -877,6 +954,24 @@ test("the composed console serves the routes over PostgreSQL with the root's ide
   assert.deepEqual(healthBody.databases.map((row) => [row.role, row.status]),
     [["primary", "reachable"], ["deletion_ledger", "reachable"], ["analytics", "reachable"]]);
   assert.equal(healthBody.status, "available");
+  // One database holds both roles, so they report the same size.
+  assert.equal(healthBody.databases[2].databaseBytes, healthBody.databases[0].databaseBytes);
+  // Without a ledger pool (after LEAD-SIMP retires the ledger) the closed DTO
+  // reports deletion_ledger not_configured, so the status stays degraded;
+  // how a retired role is represented is an open owner question. An explicit
+  // analytics pool that fails is reported as failing, never replaced by primary.
+  const failing = { connect: async () => { throw new Error("synthetic"); } };
+  for (const [pools, statuses] of [
+    [{ primary: pool }, ["reachable", "not_configured", "reachable"]],
+    [{ primary: pool, ledger: pool, analytics: failing }, ["reachable", "reachable", "unavailable"]],
+  ]) {
+    const body = await m.adminConsole.createAdminConsoleAdapters({
+      requestContext: store.accessor, clock: () => NOW_MS, env: ENV, pools,
+      schemaOptions: { primarySchema: schema, ledgerSchema },
+    }).readDatabaseHealth();
+    assert.deepEqual(body.databases.map((row) => row.status), statuses);
+    assert.equal(body.status, "degraded");
+  }
 
   await setPreview(null);
   const preview = await dispatch("admin_community_allowance_preview",
