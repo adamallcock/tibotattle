@@ -86,7 +86,7 @@ What follows from the decision:
 | Fresh lifecycle pass | `roll` | Whenever the live edge is not in `gcp` mode, `roll` checks the served commit through the verifier path, which needs `/api/ready` to read `ready`. Readiness goes stale 2 hours after the last completed maintenance pass, and the maintenance trigger, once one exists, is paused for the rollout, so the last completed pass must be under 2 hours old when `roll` reaches that check (`EDGE_ORIGIN_VERIFIER_NOT_READY` otherwise). This covers every pre-switch rollout, the pre-staging one included, and every rollout while the edge is braked to `fenced` |
 | Edge capture | `roll` | A verified capture of the live edge, at most 15 minutes old, for this environment |
 | Contract blob | `roll` | If the live edge is in gcp mode, `apps/worker/src/edge-origin-contract.ts` has the same Git blob at `--commit` and at the live edge's commit (`EDGE_CONTRACT_DRIFT`), and the edge points at this service |
-| Lock | Every mutating verb | The shared production deployment lock is free |
+| Lock | Every mutating verb | The environment's own coordination lock is free. Production takes the shared production deployment lock, `refs/heads/codex/production-deployment-lock`; staging takes only `refs/heads/codex/staging-deployment-lock` and never the production lock (owner decision 2026-10-02, round 9). The mapping is closed, and a dry run prints the exact ref as `lockRef` |
 | Authorization | Owner | Authorized in chat for this verb, this environment and this digest or commit |
 
 Staging notes. The staging plane lives in the shared test project, and the
@@ -237,6 +237,8 @@ and print the argv; they run no `gcloud` and make no request.
 | `EDGE_CONTRACT_DRIFT`, `ROLLOUT_EDGE_ORIGIN_MISMATCH` | The contract blob differs from the live gcp edge's, or the edge points at another service | Do not roll. See [contract changes](#contract-changes) |
 | `ROLLOUT_PUBLIC_HEALTH_COMMIT_MISMATCH`, `ROLLOUT_ORIGIN_COMMIT_MISMATCH`, `EDGE_ORIGIN_VERIFIER_*` | The served commit is not the rolled commit, or the verifier path failed. `EDGE_ORIGIN_VERIFIER_NOT_READY` means `/api/ready` did not read `ready`, usually a stale lifecycle pass. This check runs after the service and every job moved, so the roll has already happened and left no receipt | Run a maintenance pass, then run `roll` again for the same digest. The rerun needs a new edge capture (the first is likely past 15 minutes, and no command writes one, see [open gaps](#open-gaps)). Avoid it by meeting the fresh-pass precondition first. If the commit is wrong, treat the roll as incomplete and fix forward |
 | `PRODUCTION_COORDINATION_*` | The shared deployment lock is held | A retained lock is a stop. Do not retry with raw tools; follow the typed reconciliation in [Production service operations](./production-operations.md#guarded-deployment-wrapper) |
+| `STAGING_COORDINATION_*` | The staging deployment lock is held, or its state is uncertain | A retained staging lock is a stop. Do not delete or move `refs/heads/codex/staging-deployment-lock` by hand; report the owner commit to the owner. The production lock is not involved |
+| `ROLLOUT_LOCK_REF_MISMATCH`, `DEPLOYMENT_COORDINATION_*` | The lock offered for this environment is not its own ref, or the environment is not in the closed mapping | Stop. Nothing was pushed. Fix the checkout; never point one environment at another's lock |
 
 After a failure between `migrate` and a successful `roll`, the previous
 revision is still refusing its storage-gated routes. The priority is a

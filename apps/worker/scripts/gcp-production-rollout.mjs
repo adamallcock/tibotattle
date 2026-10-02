@@ -39,10 +39,15 @@
  *              (every other mode) must report --commit. The rollout never
  *              resumes a paused trigger: OPS-3 resume-all follows the roll.
  *
- * Every mutating verb runs under scripts/production-deployment-lock.mjs's
- * lock (shared with the Cloudflare production deploys), released on success
- * and on failure. Commands run through an injected runner as argv, never a
- * shell; no verb deletes anything. Without --execute a verb only validates
+ * Every mutating verb runs under its environment's coordination lock from
+ * scripts/production-deployment-lock.mjs, released on success and on failure.
+ * The mapping is closed (DEPLOYMENT_LOCK_REFS): production takes
+ * refs/heads/codex/production-deployment-lock, shared with the Cloudflare
+ * production deploys; staging takes its own
+ * refs/heads/codex/staging-deployment-lock and never the production lock
+ * (owner decision 2026-10-02, round 9). A dry run of a mutating verb prints
+ * that exact ref as lockRef. Commands run through an injected runner as argv,
+ * never a shell; no verb deletes anything. Without --execute a verb only validates
  * its inputs and prints the argv it would run: it runs no gcloud and no node,
  * makes no request, and runs only local read-only git where an input check
  * needs it.
@@ -97,7 +102,7 @@ import {
   EDGE_ORIGIN_CONTRACT_PATH,
   verifyEdgeOriginBeforeGcp,
 } from "./production-edge-mode.mjs";
-import { createProductionDeploymentLock } from "./production-deployment-lock.mjs";
+import { createEnvironmentDeploymentLock, deploymentLockRef } from "./production-deployment-lock.mjs";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 export const WORKER_ROOT = resolve(dirname(SCRIPT_FILE), "..");
@@ -161,7 +166,7 @@ const SERVICE_ACCOUNT = /^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0
 const REPOSITORY = /^([a-z]+-[a-z]+[0-9]{1,2})-docker\.pkg\.dev\/([a-z][a-z0-9-]{4,28}[a-z0-9])\/[a-z][a-z0-9-]{0,62}\/[a-z][a-z0-9-]{0,127}$/u;
 const EXECUTION = /^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
 const BACKUP_ID = /^[1-9][0-9]{0,18}$/u;
-const SAFE_CODE = /^(?:ROLLOUT_[A-Z0-9_]+|EDGE_CONTRACT_DRIFT|PRODUCTION_SIMP_RESIDUE_MISSING|PRODUCTION_MIGRATION_CONTRACT_[A-Z_]+|POSTGRES_PRODUCTION_MIGRATIONS_RECEIPT_INVALID|BACKUP_[A-Z0-9_]+|PRODUCTION_COORDINATION_[A-Z_]+|EDGE_ORIGIN_[A-Z_]+)$/u;
+const SAFE_CODE = /^(?:ROLLOUT_[A-Z0-9_]+|EDGE_CONTRACT_DRIFT|PRODUCTION_SIMP_RESIDUE_MISSING|PRODUCTION_MIGRATION_CONTRACT_[A-Z_]+|POSTGRES_PRODUCTION_MIGRATIONS_RECEIPT_INVALID|BACKUP_[A-Z0-9_]+|PRODUCTION_COORDINATION_[A-Z_]+|STAGING_COORDINATION_[A-Z_]+|DEPLOYMENT_COORDINATION_[A-Z_]+|EDGE_ORIGIN_[A-Z_]+)$/u;
 
 export class RolloutError extends Error {
   constructor(code) {
@@ -591,8 +596,12 @@ function liveService(context, target) {
 // ---------------------------------------------------------------------------
 // Lock
 
-async function underLock(context, record, operation) {
-  const lock = context.lockFactory({ repositoryRoot: REPOSITORY_ROOT });
+// The environment's own ref only: the factory refuses any other pair, and a
+// lock that reports another ref is refused before any owner is created.
+async function underLock(context, environment, record, operation) {
+  const ref = deploymentLockRef(environment);
+  const lock = context.lockFactory({ environment, ref, repositoryRoot: REPOSITORY_ROOT });
+  if (lock?.ref !== ref) fail("ROLLOUT_LOCK_REF_MISMATCH");
   const owner = await lock.createOwner({ id: context.uuid(), ...record });
   await lock.acquire(owner);
   context.lockEvents.push("acquired");
@@ -923,6 +932,8 @@ function dryRunResult(args, target, steps, extra = {}) {
     commit: args.commit,
     ...(args.digest === null ? {} : { digest: args.digest }),
     service: target.service,
+    // The exact coordination ref --execute would push; preflight takes no lock.
+    ...(args.verb === "preflight" ? {} : { lockRef: deploymentLockRef(args.environment) }),
     steps: steps.map((argv) => ({ argv })),
     ...extra,
   });
@@ -1086,7 +1097,7 @@ async function build(context, args, target) {
   }
   checkCheckout(context, args.commit);
   // A build replaces nothing that is deployed; its lock record names the commit it builds.
-  return underLock(context, { sourceCommit: args.commit, previousSourceCommit: args.commit }, async (assertOwned) => {
+  return underLock(context, args.environment, { sourceCommit: args.commit, previousSourceCommit: args.commit }, async (assertOwned) => {
     const directory = await mkdtemp(join(context.tmpdir(), "tibotattle-production-build-"));
     try {
       const configPath = join(directory, "cloudbuild.production.rendered.yaml");
@@ -1172,7 +1183,7 @@ async function migrate(context, args, target) {
   }
   checkCheckout(context, args.commit);
   const live = liveService(context, target);
-  return underLock(context, { sourceCommit: args.commit, previousSourceCommit: live.commit }, async (assertOwned) => {
+  return underLock(context, args.environment, { sourceCommit: args.commit, previousSourceCommit: live.commit }, async (assertOwned) => {
     assertQuiescent((await preflight(context, args, target)).scheduledJobs);
     const backups = [];
     for (let index = 0; index < PRE_MIGRATION_BACKUPS; index += 1) {
@@ -1270,7 +1281,7 @@ async function roll(context, args, target) {
   checkCheckout(context, args.commit);
   const live = liveService(context, target);
   assertEdgeTargetsService(edge, live, target);
-  return underLock(context, { sourceCommit: args.commit, previousSourceCommit: live.commit }, async (assertOwned) => {
+  return underLock(context, args.environment, { sourceCommit: args.commit, previousSourceCommit: live.commit }, async (assertOwned) => {
     const { scheduledJobs } = await preflight(context, args, target);
     assertQuiescent(scheduledJobs);
     assertEdgeCaptureFresh(context.now(), Date.parse(edge.capturedAt));
@@ -1339,7 +1350,7 @@ export async function runRollout(argv, dependencies = {}) {
   const args = parseRolloutArguments(argv);
   const context = {
     run: dependencies.run ?? spawnRunner,
-    lockFactory: dependencies.lockFactory ?? createProductionDeploymentLock,
+    lockFactory: dependencies.lockFactory ?? createEnvironmentDeploymentLock,
     now: dependencies.now ?? Date.now,
     uuid: dependencies.uuid ?? randomUUID,
     tmpdir: dependencies.tmpdir ?? tmpdir,
