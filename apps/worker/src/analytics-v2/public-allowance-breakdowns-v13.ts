@@ -12,32 +12,48 @@
  * DECLARED parity difference; every other byte is the oracle's.
  *
  * The block (`modelConfig`) is the closed shape the tolerant public reader
- * accepts (apps/web/public/community-data.js on claude/gcp-fp-w-web,
- * publicModelMetadata): an array of exactly `{ id, label, family, order }`,
- * at most 128 entries, each id once. Its content comes from the catalog
- * baseline (manifest_version 1):
+ * accepts (apps/web/public/community-data.js publicModelMetadata, on both
+ * claude/gcp-fp-w-web and claude/gcp-fp-w-web-onmain): an array of exactly
+ * `{ id, label, family, order }`, at most 128 entries, each id once. That
+ * reader CHARTS every model a valid block names, including one its own hide
+ * list keeps off the page, so the block names only models the public page is
+ * meant to chart. Its content comes from the catalog baseline
+ * (manifest_version 1) and a frozen per-version presentation table
+ * (PUBLIC_MODEL_PRESENTATION_BY_MANIFEST_VERSION), because manifest version 1
+ * carries no display section:
  *
  * - the public roster is every manifest model with provider `openai_codex`,
- *   allowanceTrack `primary` and hidden `false`, in manifest order. The reader
- *   refuses a block naming a separate-track or other-provider model, and a
- *   hidden model is never named;
- * - id and label are the manifest's, unchanged;
- * - family and order are presentation, which manifest version 1 does not
- *   carry. They come from a frozen table pinned to that version
- *   (PUBLIC_MODEL_PRESENTATION_BY_MANIFEST_VERSION): the seven models the
- *   d43c8f92 public page pins (apps/web/public/model-visuals.js
- *   MODEL_PRESENTATION_ORDER and its themes) keep their order 0..6 and family,
- *   and every other roster model is family `generic` with order
- *   7 + its roster index, which is the page's own fallback. A page reading the
- *   block therefore draws today's models in today's order and colours; what
- *   the block adds is a name and an order for a model the page's own catalog
- *   has never seen.
+ *   allowanceTrack `primary` and hidden `false`, in manifest order, minus the
+ *   version's `publicHidden` list. The reader refuses a block naming a
+ *   separate-track or other-provider model, and neither a manifest-hidden nor
+ *   a publicly hidden model is ever named;
+ * - for version 1, `publicHidden` is the owner's selected public comparison
+ *   ("six requested public allowance models", 2026-09-28: 6c3b683c on the
+ *   d43c8f92 line, 2d6cfbc8 on main). It is the 35 older primary models the
+ *   d43c8f92 page does not chart, which the shippable website branch
+ *   (claude/gcp-fp-w-web-onmain) freezes as PUBLIC_ALLOWANCE_HIDDEN_IDS. What
+ *   remains is exactly the d43c8f92 page's six charted models
+ *   (community-data.js PUBLIC_ALLOWANCE_MODEL_CONFIG). GPT-5.5 is not among
+ *   them;
+ * - id and label are the manifest's, unchanged (for version 1 they equal the
+ *   d43c8f92 page's own labels);
+ * - family and order are presentation. For version 1 the pinned list is the
+ *   d43c8f92 page's card order (astra, 6-sol, 6-luna, 5.6-terra, 5.6-sol,
+ *   5.6-luna, orders 0..5), each with its model-visuals.js theme as family. A
+ *   roster model neither pinned nor hidden (none in version 1) is family
+ *   `generic`, ordered after the pinned ones by roster index. The block
+ *   therefore names exactly the models the d43c8f92 page charts, in its order
+ *   and with its themes. What a block adds after cutover is a name and an
+ *   order for a model the page's own catalog has never seen.
  *
- * Unknown names (owner decision round 5). Only manifest roster models are ever
- * named. A tuple whose id the manifest does not name gets no metadata entry,
- * so the reader skips it and states the gap; it is not removed here, because
- * that would change bytes the oracle serves. At d43c8f92 such a tuple cannot
- * occur: the vendored preview validation admits only reviewed catalog ids.
+ * Unknown and hidden names (owner decision round 5). Only public roster
+ * models are ever named. A tuple whose id the block does not name gets no
+ * metadata entry: a reader that knows the id from its own catalog keeps the
+ * tuple without charting it (a hidden model such as GPT-5.5), and a reader
+ * that does not skips it and states the gap. The tuple is not removed here,
+ * because that would change bytes the oracle serves. At d43c8f92 an id outside
+ * the reviewed catalog cannot occur: the vendored preview validation admits
+ * only reviewed catalog ids.
  *
  * Errors are content-free closed codes. This file has no imports and only
  * erasable TypeScript syntax, so parity scripts load it under plain Node type
@@ -100,18 +116,26 @@ export interface PublicModelMetadataEntry {
 }
 
 export interface PublicModelPresentation {
-  /** Models in display order 0..n-1, each with its family. */
+  /** Charted models in display order 0..n-1, each with its family. */
   readonly pinned: readonly (readonly [id: string, family: string])[];
-  /** Family of every roster model not pinned: outside the reader's themed set. */
+  /**
+   * Primary roster models kept off the public page, never named, so a reader
+   * that charts every named model still never charts one. Each must be a
+   * primary openai_codex model of the manifest, listed once, and not pinned.
+   */
+  readonly publicHidden: readonly string[];
+  /** Family of every roster model neither pinned nor hidden: outside the reader's themed set. */
   readonly unpinnedFamily: string;
 }
 
 /**
  * Presentation per manifest version. Version 1 reproduces the d43c8f92 public
- * page (apps/web/public/model-visuals.js MODEL_PRESENTATION_ORDER and
- * MODEL_PRESENTATION_THEMES). A later manifest that binds metadata must add
- * its own entry here or carry presentation itself; an absent version fails
- * closed rather than borrowing another version's order.
+ * page: its six charted models (community-data.js PUBLIC_ALLOWANCE_MODEL_CONFIG)
+ * in its card order, each with its model-visuals.js theme, and the owner's
+ * hide list for every other primary model (see the module comment). A later
+ * manifest that binds metadata must add its own entry here or carry
+ * presentation itself. An absent version fails closed rather than borrowing
+ * another version's roster or order.
  */
 export const PUBLIC_MODEL_PRESENTATION_BY_MANIFEST_VERSION: Readonly<Record<number, PublicModelPresentation>> =
   Object.freeze({
@@ -119,11 +143,18 @@ export const PUBLIC_MODEL_PRESENTATION_BY_MANIFEST_VERSION: Readonly<Record<numb
       pinned: Object.freeze([
         Object.freeze(["gpt-6-astra", "astra"] as const),
         Object.freeze(["gpt-6-sol", "sol"] as const),
-        Object.freeze(["gpt-5.6-sol", "sol"] as const),
-        Object.freeze(["gpt-5.6-terra", "terra"] as const),
         Object.freeze(["gpt-6-luna", "luna"] as const),
+        Object.freeze(["gpt-5.6-terra", "terra"] as const),
+        Object.freeze(["gpt-5.6-sol", "sol"] as const),
         Object.freeze(["gpt-5.6-luna", "luna"] as const),
-        Object.freeze(["gpt-5.5", "classic"] as const),
+      ]),
+      publicHidden: Object.freeze([
+        "codex-auto-review", "gpt-4-turbo-2024-04-09", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano",
+        "gpt-4o", "gpt-4o-2024-05-13", "gpt-4o-mini", "gpt-5", "gpt-5-codex", "gpt-5-mini",
+        "gpt-5-nano", "gpt-5-pro", "gpt-5.1", "gpt-5.1-codex", "gpt-5.1-codex-mini", "gpt-5.2",
+        "gpt-5.2-codex", "gpt-5.2-pro", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano",
+        "gpt-5.4-pro", "gpt-5.5", "gpt-5.5-codex", "gpt-5.5-pro", "gpt-5.6-sol-wm", "o1", "o1-pro",
+        "o3", "o3-mini", "o3-pro", "o4-mini", "gpt-6.1-astra",
       ]),
       unpinnedFamily: "generic",
     }),
@@ -138,18 +169,21 @@ function exactKeysInOrder(value: Record<string, unknown>, keys: readonly string[
   return actual.length === keys.length && actual.every((key, index) => key === keys[index]);
 }
 
-/** The models a public page may name: openai_codex, primary track, not hidden, in manifest order. */
-export function publicCatalogRoster(models: readonly PublicCatalogModel[]): PublicCatalogModel[] {
+/** The manifest's primary Codex models (openai_codex, primary track), in manifest order. */
+function primaryCodexModels(models: readonly PublicCatalogModel[]): PublicCatalogModel[] {
   if (!Array.isArray(models)) fail("PUBLIC_MODEL_METADATA_CATALOG_INVALID");
   return models.filter((model) => isRecord(model) && model.provider === "openai_codex"
-    && model.allowanceTrack === "primary" && model.hidden === false);
+    && model.allowanceTrack === "primary");
 }
 
 /**
- * The closed metadata block for one manifest: its public roster with the
- * version's presentation. Throws when the version has no presentation, or the
+ * The closed metadata block for one manifest: its public roster (primary Codex
+ * models that are neither manifest-hidden nor on the version's publicHidden
+ * list) with the version's presentation. Throws when the version has no
+ * presentation; when the hide list names a model that is not a primary Codex
+ * model of the manifest, names one twice or names a pinned one; or when the
  * roster breaks the reader's grammars, bounds or uniqueness, or a pinned model
- * is missing from it; a reviewed catalog that cannot be published is refused,
+ * is missing from it. A reviewed catalog that cannot be published is refused,
  * never published partly.
  */
 export function buildPublicModelMetadata(manifest: {
@@ -161,8 +195,15 @@ export function buildPublicModelMetadata(manifest: {
     fail("PUBLIC_MODEL_METADATA_MANIFEST_UNSUPPORTED");
   }
   const presentation = PUBLIC_MODEL_PRESENTATION_BY_MANIFEST_VERSION[manifest.version]!;
-  const roster = publicCatalogRoster(manifest.models);
+  const primary = primaryCodexModels(manifest.models);
   const pinnedOrder = new Map(presentation.pinned.map(([id, family], index) => [id, { family, order: index }]));
+  const primaryIds = new Set(primary.map((model) => model.id));
+  const publicHidden = new Set(presentation.publicHidden);
+  if (publicHidden.size !== presentation.publicHidden.length
+      || presentation.publicHidden.some((id) => !primaryIds.has(id) || pinnedOrder.has(id))) {
+    fail("PUBLIC_MODEL_METADATA_CATALOG_INVALID");
+  }
+  const roster = primary.filter((model) => model.hidden === false && !publicHidden.has(model.id));
   const ids = new Set<string>();
   const entries = roster.map((model, index): PublicModelMetadataEntry => {
     const pinned = pinnedOrder.get(model.id);

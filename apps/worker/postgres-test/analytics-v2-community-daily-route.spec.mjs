@@ -635,7 +635,7 @@ test("breakdowns v1.3: only the declared relabel and catalog-baseline block diff
   const served = JSON.parse(text).allowanceBreakdowns;
   // The route's block (compiled baseline) is the committed manifest_version 1 file's.
   assert.deepEqual(modules.route.analyticsV2PublicModelMetadata(), expectedModelConfig());
-  assert.equal(served.modelConfig.length, 41);
+  assert.equal(served.modelConfig.length, 6);
   const { base, metadata } = modules.v13.reducePublicAllowanceBreakdownsV13(served);
   assert.deepEqual(metadata, expectedModelConfig());
   // The parity compare's declared block is the same bytes.
@@ -643,11 +643,14 @@ test("breakdowns v1.3: only the declared relabel and catalog-baseline block diff
     "analytics-v2-test/fixtures/breakdowns-v13-declared-model-metadata.json"), "utf8"))));
   const { modelConfig: _modelConfig, ...v11 } = expectedAllowanceBreakdowns();
   assert.equal(JSON.stringify(base), JSON.stringify({ ...v11, schemaVersion: "community-allowance-breakdowns-v1.1" }));
-  // Only reviewed public roster names are ever given metadata.
+  // Only the public roster is ever named: this fixture's served models are
+  // both on it, and neither a separate-track model nor one the owner's selected
+  // comparison keeps off the public page (GPT-5.5) is named.
   const servedIds = new Set(served.days.flatMap((day) => day.models.map(([id]) => id)));
   const named = new Set(served.modelConfig.map((entry) => entry.id));
   assert.ok([...servedIds].every((id) => named.has(id)));
   assert.equal(named.has("gpt-5.3-codex-spark"), false);
+  assert.equal(named.has("gpt-5.5"), false);
 });
 
 test("(b) bad parameters are 400 BODY_INVALID in the production error envelope", { skip }, async () => {

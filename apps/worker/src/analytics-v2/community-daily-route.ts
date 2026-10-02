@@ -476,8 +476,10 @@ function publicDayPayload(day: PublishedDay): void {
 /**
  * The model-metadata block served with every v1.3 breakdown: the catalog
  * baseline's public roster (manifest_version 1, the compiled d43c8f92
- * projection; owner decision round 7 keeps the compiled registry at cutover).
- * Binding a later manifest here is the post-cutover KM-4 change.
+ * projection; owner decision round 7 keeps the compiled registry at cutover),
+ * which is exactly the six models the d43c8f92 public page charts and never a
+ * model the owner's selected comparison hides. Binding a later manifest here
+ * is the post-cutover KM-4 change.
  */
 export function analyticsV2PublicModelMetadata(): readonly PublicModelMetadataEntry[] {
   return buildPublicModelMetadata(compiledBaselineCatalogManifest());

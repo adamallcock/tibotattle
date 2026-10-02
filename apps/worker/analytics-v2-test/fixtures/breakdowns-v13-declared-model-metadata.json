@@ -1,167 +1,5 @@
 [
   {
-    "id": "codex-auto-review",
-    "label": "Codex Auto-review",
-    "family": "generic",
-    "order": 7
-  },
-  {
-    "id": "gpt-4-turbo-2024-04-09",
-    "label": "GPT-4 Turbo (2024-04-09)",
-    "family": "generic",
-    "order": 8
-  },
-  {
-    "id": "gpt-4.1",
-    "label": "GPT-4.1",
-    "family": "generic",
-    "order": 9
-  },
-  {
-    "id": "gpt-4.1-mini",
-    "label": "GPT-4.1 Mini",
-    "family": "generic",
-    "order": 10
-  },
-  {
-    "id": "gpt-4.1-nano",
-    "label": "GPT-4.1 Nano",
-    "family": "generic",
-    "order": 11
-  },
-  {
-    "id": "gpt-4o",
-    "label": "GPT-4o",
-    "family": "generic",
-    "order": 12
-  },
-  {
-    "id": "gpt-4o-2024-05-13",
-    "label": "GPT-4o (2024-05-13)",
-    "family": "generic",
-    "order": 13
-  },
-  {
-    "id": "gpt-4o-mini",
-    "label": "GPT-4o Mini",
-    "family": "generic",
-    "order": 14
-  },
-  {
-    "id": "gpt-5",
-    "label": "GPT-5",
-    "family": "generic",
-    "order": 15
-  },
-  {
-    "id": "gpt-5-codex",
-    "label": "GPT-5 Codex",
-    "family": "generic",
-    "order": 16
-  },
-  {
-    "id": "gpt-5-mini",
-    "label": "GPT-5 Mini",
-    "family": "generic",
-    "order": 17
-  },
-  {
-    "id": "gpt-5-nano",
-    "label": "GPT-5 Nano",
-    "family": "generic",
-    "order": 18
-  },
-  {
-    "id": "gpt-5-pro",
-    "label": "GPT-5 Pro",
-    "family": "generic",
-    "order": 19
-  },
-  {
-    "id": "gpt-5.1",
-    "label": "GPT-5.1",
-    "family": "generic",
-    "order": 20
-  },
-  {
-    "id": "gpt-5.1-codex",
-    "label": "GPT-5.1 Codex",
-    "family": "generic",
-    "order": 21
-  },
-  {
-    "id": "gpt-5.1-codex-mini",
-    "label": "GPT-5.1 Codex Mini",
-    "family": "generic",
-    "order": 22
-  },
-  {
-    "id": "gpt-5.2",
-    "label": "GPT-5.2",
-    "family": "generic",
-    "order": 23
-  },
-  {
-    "id": "gpt-5.2-codex",
-    "label": "GPT-5.2 Codex",
-    "family": "generic",
-    "order": 24
-  },
-  {
-    "id": "gpt-5.2-pro",
-    "label": "GPT-5.2 Pro",
-    "family": "generic",
-    "order": 25
-  },
-  {
-    "id": "gpt-5.3-codex",
-    "label": "GPT-5.3 Codex",
-    "family": "generic",
-    "order": 26
-  },
-  {
-    "id": "gpt-5.4",
-    "label": "GPT-5.4",
-    "family": "generic",
-    "order": 27
-  },
-  {
-    "id": "gpt-5.4-mini",
-    "label": "GPT-5.4 Mini",
-    "family": "generic",
-    "order": 28
-  },
-  {
-    "id": "gpt-5.4-nano",
-    "label": "GPT-5.4 Nano",
-    "family": "generic",
-    "order": 29
-  },
-  {
-    "id": "gpt-5.4-pro",
-    "label": "GPT-5.4 Pro",
-    "family": "generic",
-    "order": 30
-  },
-  {
-    "id": "gpt-5.5",
-    "label": "GPT-5.5",
-    "family": "classic",
-    "order": 6
-  },
-  {
-    "id": "gpt-5.5-codex",
-    "label": "GPT-5.5 Codex",
-    "family": "generic",
-    "order": 32
-  },
-  {
-    "id": "gpt-5.5-pro",
-    "label": "GPT-5.5 Pro",
-    "family": "generic",
-    "order": 33
-  },
-  {
     "id": "gpt-5.6-luna",
     "label": "GPT-5.6 Luna",
     "family": "luna",
@@ -171,13 +9,7 @@
     "id": "gpt-5.6-sol",
     "label": "GPT-5.6 Sol",
     "family": "sol",
-    "order": 2
-  },
-  {
-    "id": "gpt-5.6-sol-wm",
-    "label": "GPT-5.6 Sol Work Mode",
-    "family": "generic",
-    "order": 36
+    "order": 4
   },
   {
     "id": "gpt-5.6-terra",
@@ -192,42 +24,6 @@
     "order": 0
   },
   {
-    "id": "o1",
-    "label": "o1",
-    "family": "generic",
-    "order": 39
-  },
-  {
-    "id": "o1-pro",
-    "label": "o1 Pro",
-    "family": "generic",
-    "order": 40
-  },
-  {
-    "id": "o3",
-    "label": "o3",
-    "family": "generic",
-    "order": 41
-  },
-  {
-    "id": "o3-mini",
-    "label": "o3 Mini",
-    "family": "generic",
-    "order": 42
-  },
-  {
-    "id": "o3-pro",
-    "label": "o3 Pro",
-    "family": "generic",
-    "order": 43
-  },
-  {
-    "id": "o4-mini",
-    "label": "o4 Mini",
-    "family": "generic",
-    "order": 44
-  },
-  {
     "id": "gpt-6-sol",
     "label": "GPT-6 Sol",
     "family": "sol",
@@ -237,12 +33,6 @@
     "id": "gpt-6-luna",
     "label": "GPT-6 Luna",
     "family": "luna",
-    "order": 4
-  },
-  {
-    "id": "gpt-6.1-astra",
-    "label": "GPT-6.1 Astra (forecast)",
-    "family": "generic",
-    "order": 47
+    "order": 2
   }
 ]

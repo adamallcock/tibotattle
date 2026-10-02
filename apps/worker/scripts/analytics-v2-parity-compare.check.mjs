@@ -295,18 +295,23 @@ function v13Fixture() {
 }
 
 test("the declared block is the committed manifest_version 1 public roster", () => {
-  assert.equal(ANALYTICS_V2_DECLARED_MODEL_METADATA.length, 41);
-  assert.deepEqual(ANALYTICS_V2_DECLARED_MODEL_METADATA.slice(0, 1),
-    [{ id: "codex-auto-review", label: "Codex Auto-review", family: "generic", order: 7 }]);
+  // The six models the d43c8f92 public page charts, in its card order; never
+  // a model the owner's selected comparison keeps off the page, such as GPT-5.5.
+  assert.deepEqual([...ANALYTICS_V2_DECLARED_MODEL_METADATA].sort((left, right) => left.order - right.order)
+    .map(({ id, family, order }) => [id, family, order]), [
+    ["gpt-6-astra", "astra", 0], ["gpt-6-sol", "sol", 1], ["gpt-6-luna", "luna", 2],
+    ["gpt-5.6-terra", "terra", 3], ["gpt-5.6-sol", "sol", 4], ["gpt-5.6-luna", "luna", 5],
+  ]);
   assert.deepEqual(ANALYTICS_V2_DECLARED_MODEL_METADATA.find((entry) => entry.id === "gpt-6-astra"),
     { id: "gpt-6-astra", label: "GPT-6 Astra", family: "astra", order: 0 });
+  assert.equal(ANALYTICS_V2_DECLARED_MODEL_METADATA.some((entry) => entry.id === "gpt-5.5"), false);
 });
 
 test("a served v1.3 block is the declared difference and nothing else", () => {
   const report = compareAnalyticsV2Parity(v13Fixture());
   assert.equal(report.unexpectedDiffs, 0);
   assert.deepEqual(report.breakdownsV13, { decision: report.breakdownsV13.decision, served: true, accepted: true,
-    declaredEntries: 41 });
+    declaredEntries: 6 });
   const declared = byName(report)["breakdowns-v13-metadata"];
   assert.equal(declared.expected, true);
   assert.deepEqual(declared.diffs.map((diff) => diff.path),
