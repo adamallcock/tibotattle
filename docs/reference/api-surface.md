@@ -163,7 +163,17 @@ an id of at most 128 characters from `A-Za-z0-9._:/+-`; a label of at most 80
 letters, digits, spaces and `.+_()×·/:-`; a lowercase family token of at most 24
 characters; an integer order from 0 to 9999. The block is all-or-nothing, a
 malformed one is ignored whole, and it cannot promote a separate-track or other
-provider's model onto the primary comparison. No server emits it yet.
+provider's model onto the primary comparison. A model the page's catalog does not
+know is drawn only once the block names it; an id neither names stays unrendered.
+
+The public reader accepts `community-allowance-breakdowns-v1.3` as well as
+v1.0 to v1.2. v1.3 is v1.1's meaning (the Pro 20x basis, `combined`, and the
+three personal plans `pro`, `prolite` and `plus`) with the `modelConfig` block
+appended, so it is read and labelled on the legacy basis; only v1.2 is the
+current Pro 10x basis. Any other version, v1.4 included, is refused whole until
+the reader is changed to understand it, and the page then shows breakdowns as
+unavailable while the daily activity still renders. No server in this tree emits
+v1.3 or the block yet.
 
 All three graph views use the same published snapshot; immutable daily rows
 are not rewritten or relabelled to achieve this. Generation/evidence dates are
