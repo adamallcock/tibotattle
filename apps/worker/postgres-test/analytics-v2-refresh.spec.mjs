@@ -495,7 +495,7 @@ test("resources: environment within bounds, and a heap partitioned into budget, 
     (dense.heapMiB + 48 - dense.memoryBudgetMiB - 256) * MIB - 250_000 * 4_096);
   // A run adds the part of the budget its largest admitted owner leaves (the
   // plan fixes it before any output is charged): with owner e (1,517 MiB)
-  // largest, about 9.5 GiB of output budget instead of 351 MiB.
+  // largest, about 9.4 GiB of output budget instead of 351 MiB.
   assert.equal(resources.analyticsV2OutputBudget(denseResources.compute, 1_517 * MIB, true),
     denseResources.compute.outputBudgetBytes + (dense.memoryBudgetMiB - 1_517) * MIB);
   const tuned = job.analyticsRefreshResources({ ANALYTICS_V2_MEMORY_BUDGET_MIB: "26624",
