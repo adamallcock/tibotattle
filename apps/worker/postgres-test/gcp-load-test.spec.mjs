@@ -362,6 +362,14 @@ function count(mix, prefix) {
     .reduce((total, [, value]) => total + value, 0);
 }
 
+const SERVER_ERROR = /^5\d\d(?::|$)/u;
+
+/** Every 5xx answer in a status mix, bare ('503') or labelled ('503:CODE'). */
+function serverErrors(mix) {
+  return Object.entries(mix ?? {}).filter(([label]) => SERVER_ERROR.test(label))
+    .reduce((total, [, value]) => total + value, 0);
+}
+
 test("run 1: enrollment, v1.2 uploads and activation through the edge, with a migrate-and-roll drill under load", {
   skip: SKIP, timeout: LONG,
 }, async () => {
@@ -406,12 +414,22 @@ test("run 1: enrollment, v1.2 uploads and activation through the edge, with a mi
     ["roll", "completed"]]);
   assert.ok(count(receipt.drill.during.statusMix, "503:BACKEND_STORAGE_UNAVAILABLE") > 0,
     JSON.stringify(receipt.drill.during.statusMix));
-  assert.equal(count(receipt.drill.before.statusMix, "503:"), 0);
-  assert.equal(count(receipt.drill.after.statusMix, "503:"), 0);
+  assert.equal(serverErrors(receipt.drill.before.statusMix), 0, JSON.stringify(receipt.drill.before.statusMix));
+  assert.equal(serverErrors(receipt.drill.after.statusMix), 0, JSON.stringify(receipt.drill.after.statusMix));
   assert.ok(receipt.drill.after.contributionsAccepted > 0, "uploads resumed on the new revision");
   assert.ok(receipt.refusalsByCode.BACKEND_STORAGE_UNAVAILABLE > 0);
-  assert.equal(count(receipt.statusMix, "503:POSTGRES_ROUTE_NOT_PORTED"), 0, "every route the load uses is ported");
+  // Every route the load uses is ported: the storage gate is the only 5xx under
+  // load. An unported route would show as 503:POSTGRES_TEST_ROUTE_UNSUPPORTED
+  // (today's flat body) or 503:POSTGRES_ROUTE_NOT_PORTED, and an unlabelled
+  // body as a bare '503'; none may appear.
+  assert.deepEqual(Object.keys(receipt.statusMixByPhase.load).filter((label) => SERVER_ERROR.test(label)),
+    ["503:BACKEND_STORAGE_UNAVAILABLE"], JSON.stringify(receipt.statusMixByPhase.load));
   assert.deepEqual(receipt.transportFailures, {}, "the roll drained the old revision without dropping a request");
+  // Each upload counted as paced reached its upload authorization; no pass
+  // failed on a pacer artifact.
+  assert.equal(receipt.load.paced, receipt.routes.upload_authorization.count);
+  assert.equal(receipt.load.discardedAtPassEnd, 0);
+  assert.equal(receipt.load.passes.byFailureCode.index_unavailable, undefined, JSON.stringify(receipt.load.passes));
 
   // PostgreSQL agrees with the receipt: one stored chunk per accepted upload,
   // one activated domain per completed device, nothing else in the schema.
@@ -453,5 +471,7 @@ test("run 2: one client address through the checked-in staging edge-tier limits 
     JSON.stringify(receipt.statusMixByPhase.load));
   assert.ok(receipt.refusalsByCode.ATTEMPT_LIMIT_REACHED >= 2);
   assert.equal(receipt.refusalsByCode.HTTP_503, undefined, "the preflight's not-ready answer is not a refusal");
+  assert.equal(serverErrors(receipt.statusMixByPhase.load), 0, JSON.stringify(receipt.statusMixByPhase.load));
+  assert.equal(receipt.load.passes.byFailureCode.index_unavailable, undefined, JSON.stringify(receipt.load.passes));
   assert.equal(receipt.load.targetMet, false);
 });

@@ -24,7 +24,9 @@
  * straight at an IAM-protected origin), any non-loopback http: origin and any
  * non-loopback IP literal. An executed run against anything but loopback needs
  * --authorize=GCP_LOAD_TEST:<target hostname>; a supplied authorization must
- * match in a dry run too.
+ * match in a dry run too. --out must be (or is created as) a private directory
+ * of this user's (0700 or narrower, not a symlink) and is proved writable
+ * before the first request.
  *
  * WORKLOAD. N synthetic accountless devices are enrolled through the real
  * public routes (accountless enrollment, the ownership grant and the v1.2
@@ -36,11 +38,14 @@
  * activation), each envelope sealed by the shipped createTelemetryV12Envelope.
  * Uploads are paced to --rate per minute overall and spread evenly across the
  * devices; a pass that stops on a retryable refusal resumes after its
- * Retry-After or a bounded backoff, exactly as a client would. As in E12's S5,
- * the client is configured for its loopback laboratory origin and the run maps
- * that origin to the target, rewriting only the capability answers'
- * destinationOrigin, which must equal --expected-destination-origin (default:
- * the target origin).
+ * Retry-After or a bounded backoff, exactly as a client would. A pass whose
+ * budget ends while it waits for a slot gives the slot back; a pass that the
+ * window's close stops is recorded as window_closed, not as a failure; and an
+ * upload counts as paced only once its envelope reaches a running pass. As in
+ * E12's S5, the client is configured for its loopback laboratory origin and
+ * the run maps that origin to the target, rewriting only the capability
+ * answers' destinationOrigin, which must equal --expected-destination-origin
+ * (default: the target origin).
  *
  * DRILL. --drill=<file> names a gcp-load-test-drill-v1 JSON file whose steps
  * are OPS-10 rollout invocations (scripts/gcp-production-rollout.mjs migrate or
@@ -49,16 +54,24 @@
  * child processes (no shell; their content-free output goes to stderr and the
  * rollout writes its own receipts). Once started, a drill runs until a step
  * fails and no step is ever killed. The receipt splits the status mix into
- * before, during and after the drill.
+ * before, during and after the drill. The drill runs only rollout steps: it
+ * starts no maintenance pass, and OPS-10 reports a failed migration Job as
+ * ROLLOUT_MIGRATION_FAILED without the runner's code, so OPS-11's
+ * conflict-and-rerun sub-check (POSTGRES_MIGRATION_CONFLICT) is run by the
+ * owner outside this harness.
  *
  * RECEIPT. Latency percentiles per route, the status mix (a non-2xx answer is
- * labelled with its closed error code, so 503 POSTGRES_ROUTE_NOT_PORTED and the
- * storage gate's 503 BACKEND_STORAGE_UNAVAILABLE stay distinct), refusals by
+ * labelled with its closed error code, nested ({ error: { code } }) or flat
+ * ({ error: "<CODE>" }), so an unported route's 503 POSTGRES_TEST_ROUTE_UNSUPPORTED
+ * or POSTGRES_ROUTE_NOT_PORTED and the storage gate's 503
+ * BACKEND_STORAGE_UNAVAILABLE stay distinct), refusals by
  * code, transport failures by kind, the achieved upload rate per minute, pass
  * outcomes and the drill windows. Written 0600 into a 0700 directory. It
  * never holds a device id, secret, bearer, envelope, body or client address.
  *
- * Outbound traffic goes only to the target origin; any other URL aborts the run.
+ * Outbound traffic goes only to the target origin: a URL that does not resolve
+ * to it (another host, or a path such as //host or /\host that would escape it)
+ * aborts the run.
  * Exit 0 with a receipt, 2 for a refusal (one JSON line on stderr with a closed
  * code), 1 for anything else.
  */
@@ -66,7 +79,7 @@
 import { spawn as spawnProcess } from "node:child_process";
 import { randomBytes, webcrypto } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { isIP } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -409,6 +422,12 @@ export function loadTestPlan(options, { limits = null, limitsUnavailable = false
       "edge-tier, origin-tier and ingress-budget limits sized for the target rate, or the refusals accepted as the measurement",
       "the owner's authorization in chat for this exact target, and for each drill step",
     ],
+    notCovered: [
+      "OPS-11's maintenance-pass sub-check (C-MAINT): a migration Job that meets a running maintenance pass must "
+        + "refuse POSTGRES_MIGRATION_CONFLICT and then rerun cleanly. The drill runs only OPS-10 rollout steps, starts "
+        + "no maintenance pass, and OPS-10 reports a failed migration Job only as ROLLOUT_MIGRATION_FAILED; the owner "
+        + "runs this check outside the harness and reads the code from the Job's log.",
+    ],
   };
 }
 
@@ -416,31 +435,65 @@ export function loadTestPlan(options, { limits = null, limitsUnavailable = false
 // Pacing
 
 /**
- * Slot pacing with no burst credit: one slot per 60000/ratePerMinute ms
- * overall and, when a device state is given, at most one slot per
- * perDeviceIntervalMs for that device. reserve() is pure given `now`.
+ * Slot pacing with no burst credit. Global slots lie on a fixed grid, one per
+ * 60000/ratePerMinute ms from the first reservation, and each holds at most
+ * one upload; when a device state is given, that device also waits
+ * perDeviceIntervalMs between its own slots. A reservation takes the earliest
+ * free grid slot at or after max(now, the device's next slot), so a device
+ * waiting out its own interval leaves the slots before it to other devices,
+ * and a slot in the past is never handed out. reserve() is pure given `now`.
+ *
+ * acquire(device, signal) reserves and waits for the slot. If `signal` (the
+ * pass) aborts first it rejects LOAD_TEST_PASS_ENDED and gives the slot and
+ * the device's spacing back; close() wakes every waiter, which rejects
+ * LOAD_TEST_WINDOW_CLOSED and gives its slot back. sleep(ms, signal) must
+ * settle (either way) when its signal aborts.
  */
-export function createPacer({ ratePerMinute, perDeviceIntervalMs = 0, clock = Date.now, sleep = (ms) => delay(ms) }) {
-  const globalIntervalMs = 60_000 / ratePerMinute;
-  let nextGlobal = Number.NEGATIVE_INFINITY;
-  let closed = false;
-  function reserve(device, now) {
-    const slot = Math.max(now, nextGlobal, device?.nextSlotAt ?? Number.NEGATIVE_INFINITY);
-    nextGlobal = slot + globalIntervalMs;
-    if (device) device.nextSlotAt = slot + perDeviceIntervalMs;
-    return slot;
+export function createPacer({ ratePerMinute, perDeviceIntervalMs = 0, clock = Date.now, sleep = defaultSleep }) {
+  const intervalMs = 60_000 / ratePerMinute;
+  const reserved = new Set();
+  const closer = new AbortController();
+  let anchor = null;
+  let pruneAt = 1_024;
+  const indexAtOrAfter = (time) => Math.max(0, Math.ceil((time - anchor) / intervalMs - 1e-9));
+  function take(device, now) {
+    anchor ??= now;
+    if (reserved.size >= pruneAt) {
+      // Slots before the current one can never be chosen again.
+      const floor = indexAtOrAfter(now) - 1;
+      for (const index of reserved) if (index < floor) reserved.delete(index);
+      pruneAt = Math.max(1_024, reserved.size * 2);
+    }
+    let index = indexAtOrAfter(Math.max(now, device?.nextSlotAt ?? Number.NEGATIVE_INFINITY));
+    while (reserved.has(index)) index += 1;
+    reserved.add(index);
+    const at = anchor + index * intervalMs;
+    const previousDeviceSlot = device?.nextSlotAt;
+    if (device) device.nextSlotAt = at + perDeviceIntervalMs;
+    return { index, at, device, previousDeviceSlot };
+  }
+  function release({ index, at, device, previousDeviceSlot }) {
+    reserved.delete(index);
+    if (device && device.nextSlotAt === at + perDeviceIntervalMs) device.nextSlotAt = previousDeviceSlot;
   }
   return Object.freeze({
-    reserve,
-    async acquire(device) {
-      if (closed) fail("LOAD_TEST_WINDOW_CLOSED");
+    reserve: (device, now) => take(device, now).at,
+    async acquire(device, signal = undefined) {
+      if (closer.signal.aborted) fail("LOAD_TEST_WINDOW_CLOSED");
+      if (signal?.aborted) fail("LOAD_TEST_PASS_ENDED");
       const now = clock();
-      const slot = reserve(device, now);
-      if (slot > now) await sleep(slot - now);
-      if (closed) fail("LOAD_TEST_WINDOW_CLOSED");
+      const reservation = take(device, now);
+      if (reservation.at > now) {
+        const wake = signal === undefined ? closer.signal : AbortSignal.any([closer.signal, signal]);
+        try { await sleep(reservation.at - now, wake); } catch { /* woken: the window closed or the pass ended */ }
+      }
+      if (closer.signal.aborted || signal?.aborted) {
+        release(reservation);
+        fail(closer.signal.aborted ? "LOAD_TEST_WINDOW_CLOSED" : "LOAD_TEST_PASS_ENDED");
+      }
     },
-    close() { closed = true; },
-    get closed() { return closed; },
+    close() { closer.abort(); },
+    get closed() { return closer.signal.aborted; },
   });
 }
 
@@ -466,11 +519,17 @@ export function routeLabel(method, pathname) {
   return ROUTE_LABELS[`${method} ${pathname}`] ?? "other";
 }
 
-/** The closed error code of a JSON error body, or null; never any other body content. */
+/**
+ * The closed error code of a JSON error body, or null; never any other body
+ * content. Both shapes the hosted service answers with count: the API error
+ * `{ error: { code } }` and the flat `{ error: "<CODE>" }` of the origin's
+ * unported routes (cloud-run/origin-edge-test-mode.mjs EDGE_TEST_UNPORTED_BODY).
+ */
 export function errorCodeOf(bytes) {
   try {
     const value = JSON.parse(Buffer.from(bytes).toString("utf8"));
-    const code = value?.error?.code;
+    const error = value !== null && typeof value === "object" && !Array.isArray(value) ? value.error : undefined;
+    const code = typeof error === "string" ? error : error?.code;
     return typeof code === "string" && ERROR_CODE.test(code) ? code : null;
   } catch {
     return null;
@@ -517,7 +576,8 @@ export function createLoadRecorder({ clock = Date.now } = {}) {
   const startedAt = clock();
   const samples = [];
   const passes = [];
-  const counters = { uploadsPaced: 0, uploadsDeclinedAfterWindow: 0 };
+  const counters = { uploadsPaced: 0, uploadsDeclinedAfterWindow: 0, reservationsReleasedAtPassEnd: 0,
+    envelopesDiscardedAtPassEnd: 0 };
   let loadStartedAt = null;
   return Object.freeze({
     startedAt,
@@ -556,8 +616,9 @@ export function summarizeSamples({ samples, passes, counters, loadStartedAt, win
     route.count += 1;
     increment(route.statusMix, sample.label);
     (latencies[sample.route] ??= []).push(sample.latencyMs);
-    // The preflight's own answers (an empty origin's /api/ready is 503 until its
-    // first maintenance pass) stay in statusMixByPhase.preflight, not here.
+    // The preflight's own answers stay in statusMixByPhase.preflight, not here:
+    // /api/ready may legitimately be 503 (the local fastpath-test origin, for
+    // one, answers it 503 POSTGRES_TEST_ROUTE_UNSUPPORTED).
     if (sample.phase === "preflight") continue;
     if (sample.transport !== null) increment(transportFailures, sample.transport);
     else if (!sample.ok) increment(refusalsByCode, sample.code ?? `HTTP_${String(sample.label).split(":")[0]}`);
@@ -570,9 +631,10 @@ export function summarizeSamples({ samples, passes, counters, loadStartedAt, win
   const minutes = Math.max(1, Math.ceil(windowMs / 60_000));
   const perMinute = Array.from({ length: minutes }, () => 0);
   for (const sample of inWindow) perMinute[Math.min(minutes - 1, Math.floor((sample.atMs - start) / 60_000))] += 1;
-  const passOutcomes = { complete: 0, partial: 0, failed: 0, byFailureCode: {} };
+  const passOutcomes = { complete: 0, partial: 0, failed: 0, windowClosed: 0, byFailureCode: {} };
   for (const pass of passes) {
-    passOutcomes[pass.status] = (passOutcomes[pass.status] ?? 0) + 1;
+    const key = pass.status === "window_closed" ? "windowClosed" : pass.status;
+    passOutcomes[key] = (passOutcomes[key] ?? 0) + 1;
     if (pass.failure !== null) increment(passOutcomes.byFailureCode, pass.failure);
   }
   let drill = null;
@@ -596,6 +658,8 @@ export function summarizeSamples({ samples, passes, counters, loadStartedAt, win
     uploads: {
       paced: counters.uploadsPaced,
       declinedAfterWindow: counters.uploadsDeclinedAfterWindow,
+      releasedAtPassEnd: counters.reservationsReleasedAtPassEnd ?? 0,
+      discardedAtPassEnd: counters.envelopesDiscardedAtPassEnd ?? 0,
       authorizationsGranted: load.filter((sample) => sample.route === "upload_authorization" && sample.ok).length,
       accepted: accepted.length,
       acceptedInWindow: inWindow.length,
@@ -656,11 +720,16 @@ export function createRecordingFetch({ fetch: baseFetch, targetOrigin, expectedD
     for (const origin of [LABORATORY_ORIGIN, targetOrigin]) {
       if (typeof href === "string" && href.startsWith(`${origin}/`)) path = href.slice(origin.length);
     }
-    if (path === null) {
+    // A path such as //host, /\host or /<tab>/host resolves to another
+    // authority; only what resolves to the target itself is sent.
+    let url = null;
+    if (path !== null) {
+      try { url = new URL(path, targetOrigin); } catch { url = null; }
+    }
+    if (url === null || url.origin !== targetOrigin) {
       onFatal("LOAD_TEST_OUTBOUND_REFUSED");
       fail("LOAD_TEST_OUTBOUND_REFUSED");
     }
-    const url = new URL(path, targetOrigin);
     const method = (init.method ?? "GET").toUpperCase();
     const route = routeLabel(method, url.pathname);
     const headers = new Headers(init.headers ?? {});
@@ -849,7 +918,7 @@ export async function runLoadTest(options, deps = {}) {
   const deadline = loadStart + windowMs;
   const graceMs = profile.passBudgetMs + profile.requestTimeoutMs;
   const pacer = createPacer({ ratePerMinute: profile.ratePerMinute, perDeviceIntervalMs: profile.perDeviceIntervalMs,
-    clock, sleep: (ms) => sleep(ms, controller.signal) });
+    clock, sleep: (ms, wake) => sleep(ms, AbortSignal.any([wake, controller.signal])) });
   const closeTimer = setTimeout(() => pacer.close(), windowMs);
   const abortTimer = setTimeout(() => controller.abort(), windowMs + graceMs);
   const day = deps.day ?? utcDay(loadStart);
@@ -867,23 +936,55 @@ export async function runLoadTest(options, deps = {}) {
     const fetchImpl = fetchOf(device.index);
     const readDay = () => syntheticV12Day(day, { chunks: profile.chunksPerDevice, recordsPerChunk: profile.recordsPerChunk,
       eventSeed: `gcp-load-test:${runId}:${device.index}`, parserVersion: LOAD_TEST_PARSER_VERSION });
+    // The shipped client runs createEnvelope under its pass budget but cannot
+    // cancel it: when the budget ends the pass returns while the envelope is
+    // still waiting for its slot. Each pass therefore carries its own signal,
+    // aborted when the pass returns, so a reservation it can no longer use is
+    // released and an envelope it can no longer send is not counted.
+    let pass = null;
     const createEnvelope = async (chunk) => {
+      const current = pass;
       try {
-        await pacer.acquire(device);
+        await pacer.acquire(device, current.signal);
       } catch (error) {
-        recorder.counters.uploadsDeclinedAfterWindow += 1;
+        if (error?.code === "LOAD_TEST_WINDOW_CLOSED") {
+          current.windowClosed = true;
+          recorder.counters.uploadsDeclinedAfterWindow += 1;
+        } else if (error?.code === "LOAD_TEST_PASS_ENDED") {
+          recorder.counters.reservationsReleasedAtPassEnd += 1;
+        }
         throw error;
       }
+      const envelope = await createTelemetryV12Envelope({ chunk, publicJwk: key.publicJwk, keyId: key.keyId,
+        cryptoImpl: webcrypto });
+      if (current.signal.aborted) {
+        recorder.counters.envelopesDiscardedAtPassEnd += 1;
+        fail("LOAD_TEST_PASS_ENDED");
+      }
+      // Counted only once the envelope goes back to a pass that is still running.
       recorder.counters.uploadsPaced += 1;
-      return createTelemetryV12Envelope({ chunk, publicJwk: key.publicJwk, keyId: key.keyId, cryptoImpl: webcrypto });
+      return envelope;
     };
     while (!controller.signal.aborted && clock() < deadline) {
-      const outcome = await runTelemetryV12Sync({
-        serverBaseUrl: LABORATORY_ORIGIN, deviceAuthorization: device.authorization, authorization, laboratory: true,
-        days: [day], readDay, createEnvelope, fetchImpl, signal: controller.signal,
-        maxDurationMs: profile.passBudgetMs, requestTimeoutMs: profile.requestTimeoutMs,
-        maxChunks: Math.min(MAX_CHUNKS_PER_PASS, profile.chunksPerDevice),
-      });
+      const passController = new AbortController();
+      pass = { signal: passController.signal, windowClosed: false };
+      let outcome;
+      try {
+        outcome = await runTelemetryV12Sync({
+          serverBaseUrl: LABORATORY_ORIGIN, deviceAuthorization: device.authorization, authorization, laboratory: true,
+          days: [day], readDay, createEnvelope, fetchImpl, signal: controller.signal,
+          maxDurationMs: profile.passBudgetMs, requestTimeoutMs: profile.requestTimeoutMs,
+          maxChunks: Math.min(MAX_CHUNKS_PER_PASS, profile.chunksPerDevice),
+        });
+      } finally {
+        passController.abort();
+      }
+      // The client reports an envelope refused at the window's close as a local
+      // index failure; it is the end of the measurement, not a failed pass.
+      if (pass.windowClosed && outcome.status !== "complete") {
+        recorder.pass({ status: "window_closed", failure: null, chunksUploaded: outcome.chunksUploaded });
+        return;
+      }
       recorder.pass(outcome);
       if (outcome.chunksUploaded > 0) device.retries = 0;
       if (outcome.status === "complete") {
@@ -951,6 +1052,7 @@ export async function runLoadTest(options, deps = {}) {
       "Synthetic, content-free accountless devices and records only.",
       "Measures this target, from these client addresses, at this time; another edge, origin, limit set or region is a separate measurement.",
       "Latency is client-observed and includes the network path to the target.",
+      "Not covered: OPS-11's maintenance-pass sub-check (a migration Job meeting a running pass refuses POSTGRES_MIGRATION_CONFLICT, then reruns cleanly); the owner runs it outside this harness.",
     ],
   };
 }
@@ -1055,9 +1157,48 @@ export function spawnDrillStep(argv, { spawn = spawnProcess } = {}) {
 // ---------------------------------------------------------------------------
 // CLI
 
-async function writeReceipt(out, receipt) {
+/**
+ * The receipt directory, made ready before the first request: created 0700
+ * when missing; otherwise a real directory (not a symlink) owned by this user
+ * with no group or other access. A probe file is created and removed to prove
+ * it is writable. Returns the absolute path. With create: false and probe:
+ * false (at write time) it only re-checks an existing directory.
+ */
+export async function prepareReceiptDirectory(out, { create = true, probe = true } = {}) {
+  if (typeof out !== "string" || out.length === 0) fail("LOAD_TEST_OUT_INVALID");
   const directory = resolve(out);
-  await mkdir(directory, { recursive: true, mode: 0o700 });
+  let metadata = null;
+  try {
+    metadata = await lstat(directory);
+  } catch (error) {
+    if (error?.code !== "ENOENT" || !create) fail("LOAD_TEST_OUT_INVALID");
+  }
+  if (metadata === null) {
+    try {
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      metadata = await lstat(directory);
+    } catch {
+      fail("LOAD_TEST_OUT_INVALID");
+    }
+  }
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) fail("LOAD_TEST_OUT_INVALID");
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (uid === null || metadata.uid !== uid || (metadata.mode & 0o077) !== 0) fail("LOAD_TEST_OUT_NOT_PRIVATE");
+  if (probe) {
+    const path = join(directory, `.gcp-load-test-probe-${randomBytes(8).toString("hex")}`);
+    try {
+      await writeFile(path, "", { mode: 0o600, flag: "wx" });
+      await unlink(path);
+    } catch {
+      fail("LOAD_TEST_OUT_UNWRITABLE");
+    }
+  }
+  return directory;
+}
+
+/** Writes the receipt 0600 (never over an existing file) after re-checking its directory. */
+export async function writeReceipt(out, receipt) {
+  const directory = await prepareReceiptDirectory(out, { create: false, probe: false });
   const path = join(directory, `gcp-load-test-${new Date().toISOString().replaceAll(":", "-")}.json`);
   await writeFile(path, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600, flag: "wx" });
   return path;
@@ -1082,6 +1223,8 @@ export async function main(argv, deps = {}) {
     stdout.write(`${JSON.stringify(plan, null, 2)}\n`);
     return plan;
   }
+  // A receipt directory that cannot hold the receipt is refused before any request.
+  const out = await prepareReceiptDirectory(options.out);
   const receipt = await runLoadTest(options, {
     ...deps,
     drill: drill === null ? deps.drill ?? null : {
@@ -1090,7 +1233,7 @@ export async function main(argv, deps = {}) {
     },
     progress: deps.progress ?? ((line) => stderr.write(`${JSON.stringify({ status: "progress", line })}\n`)),
   });
-  const path = await (deps.writeReceipt ?? writeReceipt)(options.out, receipt);
+  const path = await (deps.writeReceipt ?? writeReceipt)(out, receipt);
   stdout.write(`${JSON.stringify({ status: "ok", target: receipt.target.class, acceptedInWindow: receipt.load.acceptedInWindow,
     achievedPerMinute: receipt.load.achievedPerMinute, targetMet: receipt.load.targetMet, receipt: path })}\n`);
   return receipt;
