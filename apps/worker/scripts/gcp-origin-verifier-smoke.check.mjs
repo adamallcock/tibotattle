@@ -168,6 +168,8 @@ function syntheticOrigin({
     recordDiagnostic: async () => {},
     logger: () => {},
     adminHostPolicy: "refuse",
+    // OD-CR-6(iv) is open and has no default; the smoke never reads an unported route.
+    unportedRetryAfterSeconds: null,
   });
   const boundary = edgeDispatch.createEdgeOriginDispatch({
     invokerServiceAccount: INVOKER,

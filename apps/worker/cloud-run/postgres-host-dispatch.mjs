@@ -28,9 +28,10 @@
  *    this request's id, unlogged as the Worker's asset fetch is.
  * 7. Exact routes by disposition: root routes answer 404 NOT_FOUND (the
  *    method was enforced in step 4); unported routes answer
- *    503 POSTGRES_ROUTE_NOT_PORTED with retry-after 60 and never reach a
- *    family; a ported route runs its family handler inside the request
- *    context store with {requestId, routeId[, adminIdentityKey]}.
+ *    503 POSTGRES_ROUTE_NOT_PORTED, with the injected OD-CR-6(iv)
+ *    retry-after or none, and never reach a family; a ported route runs its
+ *    family handler inside the request context store with
+ *    {requestId, routeId[, adminIdentityKey]}.
  *    community_daily first passes the storage gate, and its 200 passes
  *    through unmodified (public, max-age=300); every other response is
  *    no-store.
@@ -82,11 +83,15 @@ export const ORIGIN_REQUEST_LOG_FIELDS = Object.freeze([
  */
 export const ORIGIN_ADMIN_HOST_POLICIES = Object.freeze(["refuse", "chokepoint"]);
 
-/** The closed answer for an unported route (and the admin host under 'refuse'). */
+/**
+ * The closed answer for an unported route (and the admin host under
+ * 'refuse'). Its retry-after is OD-CR-6(iv), an open owner decision, so it
+ * is not part of this constant: createProductionRequestHandler takes it as
+ * the required unportedRetryAfterSeconds.
+ */
 export const ORIGIN_ROUTE_NOT_PORTED = Object.freeze({
   status: 503,
   code: "POSTGRES_ROUTE_NOT_PORTED",
-  retryAfterSeconds: 60,
 });
 
 /**
@@ -135,6 +140,7 @@ export const ORIGIN_HANDLER_CONFIGURATION_CODES = Object.freeze([
   "PRODUCTION_HANDLER_DIAGNOSTIC_INVALID",
   "PRODUCTION_HANDLER_LOGGER_INVALID",
   "PRODUCTION_HANDLER_ADMIN_HOST_POLICY_UNDECIDED",
+  "PRODUCTION_HANDLER_UNPORTED_RETRY_AFTER_UNDECIDED",
   "PRIVATE_TEST_HANDLER_ORIGIN_INVALID",
   "PRIVATE_TEST_HANDLER_FALLBACK_INVALID",
 ]);
@@ -161,10 +167,22 @@ function noStore(response) {
   });
 }
 
-function routeNotPorted() {
-  return new ApiError(ORIGIN_ROUTE_NOT_PORTED.status, ORIGIN_ROUTE_NOT_PORTED.code, {
-    responseHeaders: { "retry-after": String(ORIGIN_ROUTE_NOT_PORTED.retryAfterSeconds) },
-  });
+/**
+ * OD-CR-6(iv) (open owner decision): the unported answer's retry-after.
+ * null sends none, as the base's fail-closed unported answers
+ * (postgres-test-dispatch.mjs and the edge-test EDGE_TEST_UNPORTED_BODY)
+ * send none; a positive safe integer sends that many seconds (the brief
+ * proposes 60, which apps/local/accountless-contribution.js retries as
+ * transient). There is no default.
+ */
+function validatedUnportedRetryAfter(value) {
+  if (value === null || (Number.isSafeInteger(value) && value >= 1)) return value;
+  throw configurationError("PRODUCTION_HANDLER_UNPORTED_RETRY_AFTER_UNDECIDED");
+}
+
+function routeNotPorted(retryAfterSeconds) {
+  return new ApiError(ORIGIN_ROUTE_NOT_PORTED.status, ORIGIN_ROUTE_NOT_PORTED.code,
+    retryAfterSeconds === null ? undefined : { responseHeaders: { "retry-after": String(retryAfterSeconds) } });
 }
 
 /** The Worker's methodNotAllowed: a 405 whose non-enumerable `allowed` lists the methods. */
@@ -282,7 +300,9 @@ function validatedLogger(logger) {
  * - storageGate: { assertCurrent() } (the receipt check, phase B);
  * - recordDiagnostic: (event) => Promise, e.g. recordPostgresDiagnosticError
  *   bound to the data pool; it never changes the answer;
- * - adminHostPolicy: one of ORIGIN_ADMIN_HOST_POLICIES (OD-CR-3, no default).
+ * - adminHostPolicy: one of ORIGIN_ADMIN_HOST_POLICIES (OD-CR-3, no default);
+ * - unportedRetryAfterSeconds: null or a positive integer, the unported
+ *   answer's retry-after (OD-CR-6(iv), no default).
  */
 export function createProductionRequestHandler({
   registry,
@@ -293,6 +313,7 @@ export function createProductionRequestHandler({
   recordDiagnostic,
   logger,
   adminHostPolicy,
+  unportedRetryAfterSeconds,
 } = {}) {
   if (!isProductionRouteRegistry(registry) || registry.routePolicy !== WORKER_ROUTE_POLICY) {
     throw configurationError("PRODUCTION_HANDLER_REGISTRY_INVALID");
@@ -313,6 +334,7 @@ export function createProductionRequestHandler({
   if (!ORIGIN_ADMIN_HOST_POLICIES.includes(adminHostPolicy)) {
     throw configurationError("PRODUCTION_HANDLER_ADMIN_HOST_POLICY_UNDECIDED");
   }
+  const retryAfterSeconds = validatedUnportedRetryAfter(unportedRetryAfterSeconds);
 
   function writeLog(fields) {
     try {
@@ -359,7 +381,7 @@ export function createProductionRequestHandler({
         || (configuredAdminHostname !== null && url.hostname === configuredAdminHostname);
       let adminIdentityKey = null;
       if (adminHost) {
-        if (adminHostPolicy === "refuse") throw routeNotPorted();
+        if (adminHostPolicy === "refuse") throw routeNotPorted(retryAfterSeconds);
         const identity = await verifyAdminAccessAssertion(request, env);
         adminIdentityKey = authorizeAdminEmail(identity, Reflect.get(env, "ACCESS_ADMIN_EMAIL"));
       } else if (configuredAdminHostname !== null
@@ -375,7 +397,7 @@ export function createProductionRequestHandler({
       if (route.kind === "asset") return noStore(errorResponse(new ApiError(404, "NOT_FOUND"), requestId));
       const resolved = registry.resolve(route.id);
       if (resolved.disposition === ORIGIN_ROUTE_DISPOSITIONS.ROOT) throw new ApiError(404, "NOT_FOUND");
-      if (resolved.disposition !== ORIGIN_ROUTE_DISPOSITIONS.PORTED) throw routeNotPorted();
+      if (resolved.disposition !== ORIGIN_ROUTE_DISPOSITIONS.PORTED) throw routeNotPorted(retryAfterSeconds);
       if (route.id === "community_daily") await storageGate.assertCurrent();
       const context = adminIdentityKey !== null && ADMIN_ROUTE_ID_SET.has(route.id)
         ? { requestId, routeId: route.id, adminIdentityKey }

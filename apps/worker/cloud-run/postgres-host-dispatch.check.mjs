@@ -23,6 +23,10 @@ const OWNER_EMAIL = "owner@synthetic.example";
 const ACCESS_TEAM_DOMAIN = "synthetic.cloudflareaccess.com";
 const ACCESS_AUD = "a".repeat(64);
 const ACCESS_KID = "synthetic-access-key";
+// OD-CR-6(iv) is open and the handler has no default: these checks choose the
+// brief's proposed 60 for the fixture and prove the other answers (no header,
+// another value) in their own test.
+const TEST_UNPORTED_RETRY_AFTER = 60;
 // Strings a log line must never carry (D: redaction).
 const SECRETS = Object.freeze({
   forwardedFor: "198.51.100.23",
@@ -99,6 +103,7 @@ function fixture({
   storageGate,
   logger,
   recordDiagnostic,
+  unportedRetryAfterSeconds = TEST_UNPORTED_RETRY_AFTER,
 } = {}) {
   const calls = [];
   const lines = [];
@@ -123,6 +128,7 @@ function fixture({
     recordDiagnostic: recordDiagnostic ?? (async (event) => { diagnostics.push(event); }),
     logger: logger ?? ((line) => { lines.push(line); }),
     adminHostPolicy,
+    unportedRetryAfterSeconds,
   });
   return {
     handler,
@@ -235,8 +241,8 @@ test("constants: log contract, admin ids, admin-host policies and the unported a
   assert.deepEqual([...dispatch.ORIGIN_REQUEST_LOG_FIELDS],
     ["level", "severity", "event", "requestId", "method", "routeClass", "code", "status"]);
   assert.deepEqual([...dispatch.ORIGIN_ADMIN_HOST_POLICIES], ["refuse", "chokepoint"]);
-  assert.deepEqual({ ...dispatch.ORIGIN_ROUTE_NOT_PORTED },
-    { status: 503, code: "POSTGRES_ROUTE_NOT_PORTED", retryAfterSeconds: 60 });
+  // The retry-after is OD-CR-6(iv), injected, so it is not part of the constant.
+  assert.deepEqual({ ...dispatch.ORIGIN_ROUTE_NOT_PORTED }, { status: 503, code: "POSTGRES_ROUTE_NOT_PORTED" });
   // handleRequest's six admin ids, as the edge also lists them.
   assert.deepEqual([...dispatch.ORIGIN_ADMIN_ROUTE_IDS].sort(), [...edgeProxy.EDGE_ADMIN_API_ROUTE_IDS].sort());
   for (const value of [dispatch.ORIGIN_REQUEST_LOG_EVENTS, dispatch.ORIGIN_REQUEST_LOG_FIELDS,
@@ -267,7 +273,7 @@ test("classifyOriginOutcome follows the Worker's catch classification", () => {
 // ---------------------------------------------------------------------------
 // Construction refusals (closed codes; OD-CR-3 has no default)
 
-test("createProductionRequestHandler refuses every malformed or undecided input", async () => {
+test("createProductionRequestHandler refuses every malformed or undecided input (OD-CR-3, OD-CR-6(iv))", async () => {
   const base = fixture();
   const store = contextModule.createRequestContextStore();
   const valid = {
@@ -278,8 +284,12 @@ test("createProductionRequestHandler refuses every malformed or undecided input"
     storageGate: { async assertCurrent() {} },
     recordDiagnostic: async () => {},
     adminHostPolicy: "refuse",
+    unportedRetryAfterSeconds: TEST_UNPORTED_RETRY_AFTER,
   };
   assert.equal(typeof dispatch.createProductionRequestHandler(valid), "function");
+  for (const unportedRetryAfterSeconds of [null, 1, 3600, Number.MAX_SAFE_INTEGER]) {
+    assert.equal(typeof dispatch.createProductionRequestHandler({ ...valid, unportedRetryAfterSeconds }), "function");
+  }
   const lookalike = registryModule.createProductionRouteRegistry({
     routePolicy: policy.map((route) => ({ ...route })),
     handlers: new Map(SCOPE().map((id) => [id, async () => new Response(null)])),
@@ -303,7 +313,13 @@ test("createProductionRequestHandler refuses every malformed or undecided input"
     ["PRODUCTION_HANDLER_ADMIN_HOST_POLICY_UNDECIDED", { adminHostPolicy: undefined }],
     ["PRODUCTION_HANDLER_ADMIN_HOST_POLICY_UNDECIDED", { adminHostPolicy: "" }],
     ["PRODUCTION_HANDLER_ADMIN_HOST_POLICY_UNDECIDED", { adminHostPolicy: "allow" }],
+    ...[undefined, 0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1, "60", true, {}]
+      .map((unportedRetryAfterSeconds) =>
+        ["PRODUCTION_HANDLER_UNPORTED_RETRY_AFTER_UNDECIDED", { unportedRetryAfterSeconds }]),
   ];
+  const { unportedRetryAfterSeconds: _omitted, ...withoutRetryAfter } = valid;
+  assert.throws(() => dispatch.createProductionRequestHandler(withoutRetryAfter),
+    { code: "PRODUCTION_HANDLER_UNPORTED_RETRY_AFTER_UNDECIDED" }, "an omitted key has no default");
   for (const [code, override] of cases) {
     assert.throws(() => dispatch.createProductionRequestHandler({ ...valid, ...override }), (error) => {
       assert.ok(error instanceof TypeError);
@@ -346,7 +362,7 @@ test("step 2, OD-CR-3 'refuse': every admin-host request is the unported 503, be
         () => f.edge(request(path, { method }), "admin"),
       ]) {
         await assertError(await f.handler(build()), 503, "POSTGRES_ROUTE_NOT_PORTED", `${method} ${path}`,
-          { retryAfter: "60" });
+          { retryAfter: String(TEST_UNPORTED_RETRY_AFTER) });
       }
     }
   }
@@ -384,7 +400,8 @@ test("step 2, OD-CR-3 'chokepoint': the Worker's Access chokepoint first, then t
   for (const id of dispatch.ORIGIN_ADMIN_ROUTE_IDS) {
     const [method] = methodsOf(id);
     await assertError(await f.handler(adminRequest(pathOf(id), { method, token: owner })), 503,
-      "POSTGRES_ROUTE_NOT_PORTED", id, { retryAfter: "60", requestId: EDGE_REQUEST_ID });
+      "POSTGRES_ROUTE_NOT_PORTED", id,
+      { retryAfter: String(TEST_UNPORTED_RETRY_AFTER), requestId: EDGE_REQUEST_ID });
     const wrong = method === "GET" ? "POST" : "GET";
     await assertError(await f.handler(adminRequest(pathOf(id), { method: wrong, token: owner })), 405,
       "METHOD_NOT_ALLOWED", `${id} ${wrong}`, { allow: methodsOf(id).join(", ") });
@@ -495,13 +512,33 @@ test("step 7: every unported route answers the closed 503 and reaches no family"
           method,
           ...(method === "POST" ? { body: "{\"synthetic\":true}", headers: { "content-type": "application/json" } } : {}),
         }))), 503, "POSTGRES_ROUTE_NOT_PORTED", `${method} ${id}`,
-        { retryAfter: "60", requestId: EDGE_REQUEST_ID });
+        { retryAfter: String(TEST_UNPORTED_RETRY_AFTER), requestId: EDGE_REQUEST_ID });
         assert.deepEqual(Object.keys(error), ["code", "requestId"]);
       }
     }
     assert.equal(f.calls.length, 0);
     assert.equal(f.gateCalls.length, 0);
     assert.equal(f.diagnostics.length, 0);
+  }
+});
+
+test("OD-CR-6(iv): the unported retry-after is the injected one, or none for null, at both unported sites", async () => {
+  for (const [unportedRetryAfterSeconds, expected] of [[null, null], [1, "1"], [3600, "3600"]]) {
+    const label = String(unportedRetryAfterSeconds);
+    const f = fixture({ unportedRetryAfterSeconds });
+    const unported = await f.handler(f.edge(request("/api/v1/enroll", { method: "POST" })));
+    const error = await assertError(unported, 503, "POSTGRES_ROUTE_NOT_PORTED", `unported ${label}`,
+      { retryAfter: expected ?? undefined, requestId: EDGE_REQUEST_ID });
+    assert.deepEqual(Object.keys(error), ["code", "requestId"]);
+    await assertError(await f.handler(f.edge(request("/api/health", { origin: ADMIN_ORIGIN }), "admin")), 503,
+      "POSTGRES_ROUTE_NOT_PORTED", `admin host ${label}`, { retryAfter: expected ?? undefined });
+    assert.equal(f.calls.length, 0);
+    assert.equal(f.diagnostics.length, 0);
+    assert.equal(f.lines.length, 2);
+    for (const line of parsedLines(f.lines)) {
+      assert.equal(line.code, "POSTGRES_ROUTE_NOT_PORTED");
+      assert.equal(line.level, "warn");
+    }
   }
 });
 
@@ -719,7 +756,7 @@ test("a failing log sink or diagnostic recorder never changes the answer", async
     await assertError(await f.handler(f.edge(request("/api/v1/envelope-key"))), 503, "BACKEND_STORAGE_UNAVAILABLE",
       Object.keys(options)[0], { requestId: EDGE_REQUEST_ID });
     await assertError(await f.handler(f.edge(request("/api/v1/enroll", { method: "POST" }))), 503,
-      "POSTGRES_ROUTE_NOT_PORTED", "unported", { retryAfter: "60" });
+      "POSTGRES_ROUTE_NOT_PORTED", "unported", { retryAfter: String(TEST_UNPORTED_RETRY_AFTER) });
   }
 });
 
@@ -755,6 +792,7 @@ test("behind EP-6, every unported route under every admission outcome is the mar
     recordDiagnostic: async () => {},
     logger: () => {},
     adminHostPolicy: "refuse",
+    unportedRetryAfterSeconds: TEST_UNPORTED_RETRY_AFTER,
   });
   const boundary = edgeDispatch.createEdgeOriginDispatch({
     invokerServiceAccount: INVOKER,
@@ -781,13 +819,14 @@ test("behind EP-6, every unported route under every admission outcome is the mar
       const response = await boundary(raw(pathOf(id), { method, outcome }));
       assert.equal(response.headers.get("x-tibotattle-origin"), "1", `${id} ${outcome}`);
       await assertError(response, 503, "POSTGRES_ROUTE_NOT_PORTED", `${id} ${outcome}`,
-        { retryAfter: "60", requestId: EDGE_REQUEST_ID });
+        { retryAfter: String(TEST_UNPORTED_RETRY_AFTER), requestId: EDGE_REQUEST_ID });
     }
   }
   // The admin host under 'refuse', marked the same way.
   const admin = await boundary(raw("/api/v1/admin/overview", { hostKind: "admin" }));
   assert.equal(admin.headers.get("x-tibotattle-origin"), "1");
-  await assertError(admin, 503, "POSTGRES_ROUTE_NOT_PORTED", "admin host", { retryAfter: "60" });
+  await assertError(admin, 503, "POSTGRES_ROUTE_NOT_PORTED", "admin host",
+    { retryAfter: String(TEST_UNPORTED_RETRY_AFTER) });
   // An asset is EP-6's edgeServedAssets answer, with the edge request id.
   const asset = await boundary(raw("/index.html"));
   const served = await edgeDispatch.edgeServedAssets.fetch(new Request(`${PUBLIC_ORIGIN}/index.html`));

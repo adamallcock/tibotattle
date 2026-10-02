@@ -40,7 +40,9 @@ import { createRequestContextStore } from "../cloud-run/postgres-request-context
  * (B) DTOs: buildPostgresReadinessBody and buildPostgresHealthBody over the
  *     same logical state equal the Worker's /api/ready and /api/health
  *     bodies (health minus the two keys the append-only decision removes).
- * (F) The documented deviations, each asserted explicitly.
+ * (F) The documented deviations, each asserted explicitly. The unported
+ *     retry-after is OD-CR-6(iv), injected with no default; F runs both the
+ *     brief's proposed 60 and the no-header answer.
  * Sections C to E (served-route replay, log redaction, no-store) run in
  * cloud-run/postgres-host-dispatch.check.mjs and the phase-B E12 rows.
  */
@@ -96,6 +98,9 @@ function origin(
   workerSettings: Env,
   adminHostPolicy: "refuse" | "chokepoint",
   ported: readonly string[] = [...SCOPE, ...CONTESTED],
+  // OD-CR-6(iv) is open and the handler has no default; this spec uses the
+  // brief's proposed 60 and proves the no-header answer in section F.
+  unportedRetryAfterSeconds: number | null = 60,
 ): Origin {
   const calls: string[] = [];
   const handlers = new Map(ported.map((id) => [id, async () => {
@@ -116,6 +121,7 @@ function origin(
     recordDiagnostic: async () => {},
     logger: () => {},
     adminHostPolicy,
+    unportedRetryAfterSeconds,
   });
   return { handler, calls, registry };
 }
@@ -584,20 +590,23 @@ describe("(B) RD-3 /api/health DTO parity", () => {
 // (F) Documented deviations
 
 describe("(F) documented deviations from the Worker", () => {
-  it("an unported route answers 503 POSTGRES_ROUTE_NOT_PORTED with retry-after 60, never a family", async () => {
-    const production = origin(workerEnv(), "refuse", SCOPE);
-    for (const id of production.registry.unportedRouteIds) {
-      if (ADMIN_IDS.includes(id)) continue;
-      const route = WORKER_ROUTE_POLICY.find((entry) => entry.id === id)!;
-      const response = await production.handler(new Request(PUBLIC_ORIGIN + route.pathname,
-        { method: routeMethods(id)[0]! }));
-      expect(response.status, id).toBe(503);
-      expect(response.headers.get("retry-after"), id).toBe("60");
-      expect(response.headers.get("cache-control"), id).toBe("no-store");
-      expect(await response.json(), id).toMatchObject({ error: { code: "POSTGRES_ROUTE_NOT_PORTED" } });
-    }
-    expect(production.calls).toStrictEqual([]);
-  });
+  it("an unported route answers 503 POSTGRES_ROUTE_NOT_PORTED with the OD-CR-6(iv) retry-after, never a family",
+    async () => {
+      for (const [retryAfterSeconds, expected] of [[60, "60"], [null, null]] as const) {
+        const production = origin(workerEnv(), "refuse", SCOPE, retryAfterSeconds);
+        for (const id of production.registry.unportedRouteIds) {
+          if (ADMIN_IDS.includes(id)) continue;
+          const route = WORKER_ROUTE_POLICY.find((entry) => entry.id === id)!;
+          const response = await production.handler(new Request(PUBLIC_ORIGIN + route.pathname,
+            { method: routeMethods(id)[0]! }));
+          expect(response.status, id).toBe(503);
+          expect(response.headers.get("retry-after"), id).toBe(expected);
+          expect(response.headers.get("cache-control"), id).toBe("no-store");
+          expect(await response.json(), id).toMatchObject({ error: { code: "POSTGRES_ROUTE_NOT_PORTED" } });
+        }
+        expect(production.calls).toStrictEqual([]);
+      }
+    });
 
   it("assets are a JSON 404 (the edge serves the site); the admin host under 'refuse' is the unported 503", async () => {
     const production = origin(workerEnv(), "refuse");
@@ -613,6 +622,10 @@ describe("(F) documented deviations from the Worker", () => {
     expect(await snapshot(refused)).toStrictEqual({ status: 503, code: "POSTGRES_ROUTE_NOT_PORTED", allow: null,
       cacheControl: "no-store", location: null });
     expect(refused.headers.get("retry-after")).toBe("60");
+    const withoutRetryAfter = origin(workerEnv(), "refuse", undefined, null);
+    const bare = await withoutRetryAfter.handler(new Request(`${ADMIN_ORIGIN}/api/health`));
+    expect((await snapshot(bare)).code).toBe("POSTGRES_ROUTE_NOT_PORTED");
+    expect(bare.headers.get("retry-after")).toBeNull();
   });
 
   it("the migration mutation barrier is not consulted at the origin (the edge's fenced mode owns it)", async () => {

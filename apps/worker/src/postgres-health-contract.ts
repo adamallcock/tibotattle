@@ -11,6 +11,15 @@
  * restore replay. participantDeletion stays false and
  * checks.restoreReplayComplete stays.
  *
+ * Builder and validator deliberately differ on one input. Without
+ * DEPLOYMENT_SOURCE_COMMIT, buildPostgresHealthBody omits `deployment`, as
+ * the Worker does; validatePostgresHealthBody requires it, because the
+ * production configuration (CR-3) always supplies a commit and the verifier
+ * smoke must refuse a body that cannot be tied to one. So a body built
+ * without a commit fails this validator (asserted in
+ * test/cloud-run-request-path-parity.spec.ts); a test mode that validates
+ * health must set DEPLOYMENT_SOURCE_COMMIT.
+ *
  * Import-free so plain Node scripts (scripts/gcp-origin-verifier-smoke.mjs)
  * can validate a live body without a bundler.
  */

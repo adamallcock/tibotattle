@@ -110,9 +110,10 @@ function capabilityFlags(value: unknown): PostgresHealthCapabilityFlags {
 
 /**
  * Verbatim port of the Worker's configuredDeploymentSourceCommit: absent is
- * null (the body then has no deployment block); anything but 7-64 lowercase
- * hex is 503 DEPLOYMENT_SOURCE_COMMIT_INVALID. The production configuration
- * (CR-3) always supplies 40 hex.
+ * null (the body then has no deployment block, which
+ * validatePostgresHealthBody rejects; see postgres-health-contract.ts);
+ * anything but 7-64 lowercase hex is 503 DEPLOYMENT_SOURCE_COMMIT_INVALID.
+ * The production configuration (CR-3) always supplies 40 hex.
  */
 export function postgresDeploymentSourceCommit(env: Env): string | null {
   const configured: unknown = Reflect.get(env, "DEPLOYMENT_SOURCE_COMMIT");
