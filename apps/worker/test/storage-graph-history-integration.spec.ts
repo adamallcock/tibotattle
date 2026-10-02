@@ -546,7 +546,15 @@ it('folds mixed v1 and v1.1 evidence once through resumable model and fit graphs
  expect({sourceRows:metadata.length,proofRows:proofs.results.length,digestMismatches:digestMismatches.slice(0,3)})
    .toEqual({sourceRows:metadata.length,proofRows:metadata.length,digestMismatches:[]});
  await activateTelemetryV11Domain(source(),v11Device,manifest);
- for(let attempt=0;attempt<30;attempt++)if((await advanceStorageAnalytics(bindings())).state==='idle')break;
+ // The domain window runs from the fixture's first day to the REAL current day
+ // (the predecessor is time-bound by the database clock), and the projection
+ // takes one step per window day plus the owner-active acknowledgement. A
+ // constant bound is therefore outgrown by the calendar: 30 stopped covering
+ // the window on 2026-09-30 and the owner never became active in the target.
+ // Bound the drain by the window and prove it settled.
+ let settled=false;
+ for(let attempt=0;attempt<days.length+8&&!settled;attempt++)settled=(await advanceStorageAnalytics(bindings())).state==='idle';
+ expect(settled).toBe(true);
 
  const owner=(await readStorageCommunityOwnerPage(source())).find(row=>row.participantId===before.participantId)!;
  expect(owner).toMatchObject({hasV1:true,hasV11:true,hasEffective:true});
