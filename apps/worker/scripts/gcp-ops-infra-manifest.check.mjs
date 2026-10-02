@@ -7,10 +7,11 @@
  */
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { resolveAnalyticsRefreshDatabase } from "../cloud-run/analytics-refresh.mjs";
 import * as configuration from "../cloud-run/postgres-production-configuration.mjs";
 import { TEST_MIGRATIONS_TARGETS } from "../cloud-run/test-migrations.mjs";
 import { GCP_PRIVATE_TEST_TARGET } from "./gcp-private-test-deploy.mjs";
@@ -25,6 +26,10 @@ const FIXTURE_PATH = join(SCRIPTS_ROOT, "fixtures/gcp-ops-infra/desired-state.sy
 const FIXTURE = JSON.parse(readFileSync(FIXTURE_PATH, "utf8"));
 const SERVICE_TEMPLATE = readFileSync(join(WORKER_ROOT, "cloud-run/production-service.template.yaml"), "utf8");
 const IMAGE = Object.freeze({ imageDigest: "a".repeat(64), sourceCommit: "b".repeat(40) });
+const UNMARKED_PROJECT = "example-ops-prod1";
+// OPS-10's modules (claude/gcp-fp-w2-opsdb), present only once integrated.
+const OPS10_MIGRATIONS_MODULE = join(WORKER_ROOT, "cloud-run/postgres-production-migrations.mjs");
+const OPS10_ROLLOUT_MODULE = join(SCRIPTS_ROOT, "gcp-production-rollout.mjs");
 const PARSED_PERMISSIONS = Object.freeze([
   "storage.buckets.get", "storage.objects.create", "storage.objects.delete",
   "storage.objects.get", "storage.objects.list",
@@ -34,6 +39,25 @@ function fixture(mutate = () => {}) {
   const value = structuredClone(FIXTURE);
   mutate(value);
   return value;
+}
+
+/** The fixture with an unmarked (still synthetic, content-free) project. */
+function unmarked(mutate = () => {}) {
+  const value = JSON.parse(JSON.stringify(FIXTURE).replaceAll("synthetic-ops-project", UNMARKED_PROJECT));
+  mutate(value);
+  return value;
+}
+
+function stagingNames(value) {
+  value.environment = "staging";
+  value.artifactRegistry.repository = "synthetic-staging-images";
+  value.serviceAccounts.builder.accountId = "synthetic-staging-builder";
+  value.cloudSql.instance = "synthetic-staging-primary";
+  value.bucket.name = "synthetic-staging-quarantine";
+  value.service.name = "synthetic-staging-origin";
+  value.jobs["production-migrate"].name = "synthetic-staging-migrate";
+  value.jobs["analytics-refresh"].name = "synthetic-staging-refresh";
+  value.scheduler["analytics-refresh"].name = "synthetic-staging-trigger";
 }
 
 function refused(mutate, code, options) {
@@ -76,8 +100,9 @@ test("the fast path renders exactly two jobs and one owner-cadenced scheduler tr
   refused((value) => { value.jobs["analytics-delivery"] = { name: "synthetic-analytics-delivery", maxConnections: 2 }; },
     "JOB_NAMES_MISMATCH");
   refused((value) => { delete value.jobs["production-migrate"]; }, "JOB_NAMES_MISMATCH");
-  refused((value) => { value.scheduler["production-migrate"] = { name: "synthetic-migrate-trigger", schedule: null }; },
-    "SCHEDULER_JOBS_MISMATCH");
+  refused((value) => {
+    value.scheduler["production-migrate"] = { name: "synthetic-migrate-trigger", schedule: null, state: "PAUSED" };
+  }, "SCHEDULER_JOBS_MISMATCH");
   // No default cadence (decision D3): null is "not decided", a bad cron is refused.
   assert.equal(manifest.validateDesiredState(fixture()).scheduler["analytics-refresh"].schedule, null);
   refused((value) => { delete value.scheduler["analytics-refresh"].schedule; },
@@ -91,6 +116,46 @@ test("the fast path renders exactly two jobs and one owner-cadenced scheduler tr
     assert.equal(manifest.validateDesiredState(fixture((value) => {
       value.scheduler["analytics-refresh"].schedule = schedule;
     })).scheduler["analytics-refresh"].schedule, schedule);
+  }
+});
+
+test("the trigger state is closed: PAUSED until OPS-3 resumes it, and never ENABLED without a cadence", () => {
+  assert.deepEqual([...manifest.SCHEDULER_TRIGGER_STATES], ["PAUSED", "ENABLED"]);
+  assert.equal(manifest.validateDesiredState(fixture()).scheduler["analytics-refresh"].state, "PAUSED");
+  refused((value) => { delete value.scheduler["analytics-refresh"].state; },
+    "DESIRED_STATE_KEY_MISSING:scheduler.analytics-refresh.state");
+  for (const state of ["paused", "RUNNING", "DISABLED", "UPDATE_FAILED", null, true, ""]) {
+    refused((value) => { value.scheduler["analytics-refresh"].state = state; },
+      "DESIRED_STATE_VALUE_INVALID:scheduler.analytics-refresh.state");
+  }
+  // A trigger with no cadence has never been resumed.
+  refused((value) => { value.scheduler["analytics-refresh"].state = "ENABLED"; },
+    "SCHEDULER_STATE_INVALID:analytics-refresh");
+  const resumed = manifest.validateDesiredState(fixture((value) => {
+    value.scheduler["analytics-refresh"].schedule = "15 3 * * *";
+    value.scheduler["analytics-refresh"].state = "ENABLED";
+  }));
+  assert.equal(resumed.scheduler["analytics-refresh"].state, "ENABLED");
+  // The state is part of the desired state, so it changes the plan's identity.
+  assert.notEqual(manifest.desiredStateDigest(resumed), manifest.desiredStateDigest(manifest.validateDesiredState(
+    fixture((value) => { value.scheduler["analytics-refresh"].schedule = "15 3 * * *"; }))));
+});
+
+test("the analytics-refresh job stays deferred while its entry refuses every non-test target", async () => {
+  assert.deepEqual({ ...manifest.DEFERRED_JOBS },
+    { "analytics-refresh": "ANALYTICS_REFRESH_PRODUCTION_TARGET_UNAVAILABLE" });
+  assert.deepEqual([...manifest.deployedJobNames()], ["production-migrate"]);
+  // The pin: the env OPS-2 would render for the job, run as that Cloud Run
+  // Job, is refused by cloud-run/analytics-refresh.mjs in both planes. Once
+  // the entry gains a reviewed production target path this fails; remove the
+  // DEFERRED_JOBS entry together with this assertion.
+  for (const value of [unmarked(), unmarked(stagingNames)]) {
+    const desired = manifest.validateDesiredState(value);
+    const job = manifest.renderJob(desired, "analytics-refresh", IMAGE);
+    const container = job.spec.template.spec.template.spec.containers[0];
+    const env = Object.fromEntries(container.env.map((entry) => [entry.name, entry.value]));
+    await assert.rejects(resolveAnalyticsRefreshDatabase({ ...env, CLOUD_RUN_JOB: job.metadata.name },
+      { schema: env.PRIMARY_SCHEMA }), { code: "ANALYTICS_V2_REFRESH_TARGET_FORBIDDEN" }, desired.environment);
   }
 });
 
@@ -188,13 +253,7 @@ test("the production and staging planes keep their markers apart", () => {
   refused((value) => { value.service.name = "synthetic-staging-origin"; },
     "DESIRED_STATE_STAGING_NAME_FORBIDDEN:service.name");
   const staging = (mutate) => fixture((value) => {
-    value.environment = "staging";
-    value.cloudSql.instance = "synthetic-staging-primary";
-    value.bucket.name = "synthetic-staging-quarantine";
-    value.service.name = "synthetic-staging-origin";
-    value.jobs["production-migrate"].name = "synthetic-staging-migrate";
-    value.jobs["analytics-refresh"].name = "synthetic-staging-refresh";
-    value.scheduler["analytics-refresh"].name = "synthetic-staging-trigger";
+    stagingNames(value);
     mutate(value);
   });
   assert.equal(manifest.validateDesiredState(staging(() => {})).environment, "staging");
@@ -203,6 +262,22 @@ test("the production and staging planes keep their markers apart", () => {
   assert.throws(() => manifest.validateDesiredState(staging((value) => {
     value.jobs["production-migrate"].name = "synthetic-staging-production-migrate";
   })), { code: "DESIRED_STATE_PRODUCTION_NAME_FORBIDDEN:jobs.production-migrate.name" });
+  // OPS-10 reads the image repository and the builder account as plane resources too.
+  assert.throws(() => manifest.validateDesiredState(staging((value) => {
+    value.serviceAccounts.builder.accountId = "synthetic-builder";
+  })), { code: "DESIRED_STATE_STAGING_MARKER_MISSING:serviceAccounts.builder.accountId" });
+  assert.throws(() => manifest.validateDesiredState(staging((value) => {
+    value.artifactRegistry.repository = "synthetic-images";
+  })), { code: "DESIRED_STATE_STAGING_MARKER_MISSING:artifactRegistry.imageRepository" });
+  refused((value) => { value.serviceAccounts.builder.accountId = "synthetic-staging-builder"; },
+    "DESIRED_STATE_STAGING_NAME_FORBIDDEN:serviceAccounts.builder.accountId");
+  refused((value) => { value.artifactRegistry.imageName = "staging-host"; },
+    "DESIRED_STATE_STAGING_NAME_FORBIDDEN:artifactRegistry.imageRepository");
+  // No plane resource carries a 'test' or 'rehearsal' token (OPS-10 refuses either).
+  refused((value) => { value.service.name = "synthetic-test-origin"; }, "DESIRED_STATE_TEST_TOKEN_NAME:service.name");
+  refused((value) => { value.artifactRegistry.repository = "test-images"; },
+    "DESIRED_STATE_TEST_TOKEN_NAME:artifactRegistry.imageRepository");
+  refused((value) => { value.bucket.name = "rehearsal-quarantine"; }, "DESIRED_STATE_REHEARSAL_NAME:plane:bucket.name");
 });
 
 test("Secret Manager containers are exactly CR-3's secret names, never an edge-only one", () => {
@@ -495,13 +570,105 @@ test("the two jobs render with their accounts, entries and bounds, the analytics
   }
   assert.equal(task(migrate).timeoutSeconds, "1800");
   assert.deepEqual(task(refresh).containers[0].args, ["dist/analytics-refresh.mjs", "--mode=full"]);
-  assert.deepEqual(task(migrate).containers[0].args, ["dist/postgres-production-migrations.mjs"]);
+  // OPS-10's PRODUCTION_MIGRATION_JOB entry (its build output) and exactly
+  // the env its validateProductionMigrationEnvironment reads.
+  assert.deepEqual(task(migrate).containers[0].args, ["dist/production-migrations.mjs"]);
   const migrateEnv = Object.fromEntries(task(migrate).containers[0].env.map((entry) => [entry.name, entry.value]));
-  assert.equal(migrateEnv.POSTGRES_MIGRATOR_IAM_USER, desired.cloudSql.migratorIamUser);
-  assert.equal(migrateEnv.POSTGRES_RUNTIME_IAM_USER, desired.cloudSql.runtimeIamUser);
+  assert.deepEqual(migrateEnv, {
+    MIGRATION_ENVIRONMENT: "production",
+    GOOGLE_CLOUD_PROJECT: "synthetic-ops-project",
+    PRODUCTION_MIGRATOR_SERVICE_ACCOUNT: desired.serviceAccounts.migrator.email,
+    POSTGRES_MIGRATOR_IAM_USER: desired.cloudSql.migratorIamUser,
+    POSTGRES_RUNTIME_IAM_USER: desired.cloudSql.runtimeIamUser,
+    ENVIRONMENT_PRIMARY_INSTANCE_CONNECTION_NAME: desired.cloudSql.connectionName,
+    PRIMARY_INSTANCE_CONNECTION_NAME: desired.cloudSql.connectionName,
+    PRIMARY_DATABASE: desired.cloudSql.database,
+    PRIMARY_SCHEMA: desired.cloudSql.schema,
+    DEPLOYMENT_SOURCE_COMMIT: "b".repeat(40),
+  });
   const build = readFileSync(join(WORKER_ROOT, "cloud-run/build.mjs"), "utf8");
   assert.match(build, /"dist\/analytics-refresh\.mjs"/u);
   assert.throws(() => manifest.renderJob(desired, "analytics-delivery", IMAGE), { code: "JOB_NAME_UNKNOWN" });
+  // The migration entry refuses a job whose name lacks the 'migrate' token or carries 'test'.
+  for (const name of ["synthetic-production-schema", "synthetic-migrations", "synthetic-migrate2"]) {
+    refused((value) => { value.jobs["production-migrate"].name = name; }, "JOB_NAME_INVALID:jobs.production-migrate.name");
+  }
+  refused((value) => { value.jobs["production-migrate"].name = "synthetic-test-migrate"; },
+    "DESIRED_STATE_TEST_TOKEN_NAME:jobs.production-migrate.name");
+});
+
+test("rolloutTarget gives OPS-10 its closed target from the environment's owner-held desired state", () => {
+  const path = "/synthetic-desired/production.json";
+  const stagingPath = "/synthetic-desired/staging.json";
+  const files = { [path]: JSON.stringify(unmarked()), [stagingPath]: JSON.stringify(unmarked(stagingNames)),
+    [FIXTURE_PATH]: JSON.stringify(FIXTURE) };
+  const readFile = (target) => {
+    if (!Object.hasOwn(files, target)) throw new Error("synthetic: unexpected read");
+    return files[target];
+  };
+  assert.deepEqual({ ...manifest.DESIRED_STATE_PATH_VARIABLES },
+    { production: "GCP_INFRA_DESIRED_STATE_PRODUCTION", staging: "GCP_INFRA_DESIRED_STATE_STAGING" });
+  const target = manifest.rolloutTarget("production", { env: { GCP_INFRA_DESIRED_STATE_PRODUCTION: path }, readFile });
+  assert.deepEqual(Object.keys(target), [...manifest.ROLLOUT_TARGET_KEYS]);
+  assert.deepEqual({ ...target, jobNames: [...target.jobNames] }, {
+    environment: "production",
+    project: UNMARKED_PROJECT,
+    region: "us-east1",
+    service: "synthetic-origin",
+    migrationJob: "synthetic-production-migrate",
+    // The deferred analytics-refresh job does not exist, so the rollout never moves it.
+    jobNames: ["synthetic-production-migrate"],
+    primaryInstance: "synthetic-primary",
+    imageRepository: `us-east1-docker.pkg.dev/${UNMARKED_PROJECT}/synthetic-images/synthetic-host`,
+    builderServiceAccount: `synthetic-builder@${UNMARKED_PROJECT}.iam.gserviceaccount.com`,
+  });
+  assert.equal(Object.isFrozen(target.jobNames), true);
+  assert.equal(manifest.rolloutTarget("staging", { env: { GCP_INFRA_DESIRED_STATE_STAGING: stagingPath }, readFile })
+    .service, "synthetic-staging-origin");
+  for (const [environment, env, code] of [
+    ["production", {}, "GCP_INFRA_DESIRED_STATE_UNCONFIGURED"],
+    ["production", { GCP_INFRA_DESIRED_STATE_PRODUCTION: "" }, "GCP_INFRA_DESIRED_STATE_UNCONFIGURED"],
+    ["production", { GCP_INFRA_DESIRED_STATE_STAGING: path }, "GCP_INFRA_DESIRED_STATE_UNCONFIGURED"],
+    ["production", { GCP_INFRA_DESIRED_STATE_PRODUCTION: "relative.json" }, "GCP_INFRA_DESIRED_STATE_PATH_INVALID"],
+    ["test", { GCP_INFRA_DESIRED_STATE_PRODUCTION: path }, "GCP_INFRA_ENVIRONMENT_INVALID"],
+    ["production", { GCP_INFRA_DESIRED_STATE_PRODUCTION: stagingPath }, "GCP_INFRA_ENVIRONMENT_MISMATCH"],
+    ["staging", { GCP_INFRA_DESIRED_STATE_STAGING: path }, "GCP_INFRA_ENVIRONMENT_MISMATCH"],
+    ["production", { GCP_INFRA_DESIRED_STATE_PRODUCTION: "/synthetic-desired/absent.json" }, "DESIRED_STATE_UNREADABLE"],
+    // The shipped synthetic fixture is never a rollout target.
+    ["production", { GCP_INFRA_DESIRED_STATE_PRODUCTION: FIXTURE_PATH }, "ROLLOUT_TARGET_SYNTHETIC_REFUSED"],
+  ]) {
+    assert.throws(() => manifest.rolloutTarget(environment, { env, readFile }), { code }, `${environment} ${code}`);
+  }
+});
+
+test("OPS-10 accepts the rendered migration job and the rollout target (runs once its modules are integrated)", {
+  skip: existsSync(OPS10_MIGRATIONS_MODULE) && existsSync(OPS10_ROLLOUT_MODULE)
+    ? false : "OPS-10 (claude/gcp-fp-w2-opsdb) is not on this branch",
+}, async () => {
+  const migrations = await import(pathToFileURL(OPS10_MIGRATIONS_MODULE).href);
+  const rollout = await import(pathToFileURL(OPS10_ROLLOUT_MODULE).href);
+  const job = migrations.PRODUCTION_MIGRATION_JOB;
+  assert.deepEqual([...manifest.JOB_DEFINITIONS["production-migrate"].args], [job.entry]);
+  assert.equal(manifest.JOB_DEFINITIONS["production-migrate"].account, job.serviceAccount);
+  assert.equal(manifest.JOB_DEFINITIONS["production-migrate"].timeoutSeconds, job.taskTimeoutSeconds);
+  assert.deepEqual([...rollout.ROLLOUT_TARGET_KEYS], [...manifest.ROLLOUT_TARGET_KEYS]);
+  for (const value of [unmarked(), unmarked(stagingNames)]) {
+    const desired = manifest.validateDesiredState(value);
+    const rendered = manifest.renderJob(desired, "production-migrate", IMAGE);
+    const task = rendered.spec.template.spec.template.spec;
+    assert.equal(task.maxRetries, job.maxRetries);
+    assert.equal(rendered.spec.template.spec.taskCount, job.tasks);
+    const env = Object.fromEntries(task.containers[0].env.map((entry) => [entry.name, entry.value]));
+    const config = migrations.validateProductionMigrationEnvironment({ ...env, CLOUD_RUN_JOB: rendered.metadata.name,
+      CLOUD_RUN_EXECUTION: `${rendered.metadata.name}-abcde`, CLOUD_RUN_TASK_INDEX: "0", CLOUD_RUN_TASK_COUNT: "1",
+      CLOUD_RUN_TASK_ATTEMPT: "0" });
+    assert.equal(config.environment, desired.environment);
+    assert.equal(config.target.kind, "environment");
+    assert.equal(config.migratorServiceAccount, desired.serviceAccounts.migrator.email);
+    const target = manifest.rolloutTargetFromDesiredState(desired);
+    assert.deepEqual(rollout.validateRolloutTarget(target, desired.environment), target);
+    assert.equal(target.migrationJob, rendered.metadata.name);
+  }
 });
 
 test("the scheduler trigger posts to jobs:run in UTC, with no retry, and needs an owner cadence", () => {
@@ -555,10 +722,14 @@ test("the one Cloud SQL instance renders PostgreSQL 17 ENTERPRISE with OPS-1 bac
   assert.equal(manifest.databaseFlagsArgument(desired).split(",").length, 10);
 });
 
-test("the manifest stays pure: no process environment, child process or network", () => {
+test("the manifest stays pure: no child process or network, and one process.env default", () => {
   const source = readFileSync(join(SCRIPTS_ROOT, "gcp-ops-infra-manifest.mjs"), "utf8");
   const code = source.replace(/\/\*[\s\S]*?\*\//gu, "").replace(/^\s*\/\/.*$/gmu, "");
-  assert.doesNotMatch(code, /process\.env|child_process|spawnSync|\bfetch\(|node:net|node:https?/u);
+  assert.doesNotMatch(code, /child_process|spawnSync|\bfetch\(|node:net|node:https?/u);
+  // rolloutTarget's default env (OPS-10 passes only the environment) is the
+  // one ambient input, and it only names the desired-state file's path.
+  assert.deepEqual([...code.matchAll(/process\.env/gu)].length, 1);
+  assert.match(code, /export function rolloutTarget\(environment, \{ env = process\.env, readFile, readSource \} = \{\}\) \{/u);
   assert.doesNotMatch(source, /postgres-ledger-authority/u);
   assert.match(source, /not Terraform/u);
 });

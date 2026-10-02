@@ -22,8 +22,27 @@
  * (APPLY_DELETE_REFUSED, APPLY_DESTRUCTIVE_CHANGE_REFUSED,
  * BUCKET_METADATA_UPDATE_REFUSED). No operation edits bucket IAM. An operation
  * whose inputs are not yet available (an image for a first create, a pinned
- * secret version, an owner-supplied scheduler cadence) is listed as deferred
- * and skipped.
+ * secret version, an owner-supplied scheduler cadence, a job DEFERRED_JOBS
+ * names) is listed as deferred and skipped.
+ *
+ * A state someone set by hand is never undone by apply: a disabled managed
+ * service account (SERVICE_ACCOUNT_DISABLED:<role>), or a custom role whose
+ * stage is not GA (CUSTOM_ROLE_DISABLED, CUSTOM_ROLE_STAGE_NOT_GA), is a
+ * finding and a blocker that refuses the whole plan until the owner decides.
+ *
+ * Scheduler trigger state is part of the desired state (PAUSED until OPS-3
+ * resumes it). Readback reads it; a trigger that runs while PAUSED is desired
+ * is a SCHEDULER_TRIGGER_ENABLED:<job> finding, and the plan pauses it, so a
+ * create whose pause failed is paused by the next apply rather than reported
+ * as converged (until then it runs, and OPS-10's require-clean preflight
+ * refuses the estate). Apply never resumes: a paused trigger whose desired
+ * state is ENABLED is a deferred resume (SCHEDULER_TRIGGER_RESUME_PENDING)
+ * for OPS-3.
+ * A state readback does not recognize is a blocker.
+ *
+ * infrastructureCleanliness(plan) is OPS-10's `readback --require-clean`
+ * verdict: clean only with no finding, no blocker, nothing executable, nothing
+ * refused, and no deferral outside CLEAN_DEFERRALS.
  *
  * The bucket is born only by gcp-ops-bucket-birth.mjs. Apply refuses until the
  * desired state pins that birth proof (APPLY_BUCKET_PROOF_UNPINNED), and
@@ -45,6 +64,7 @@ import {
   ARTIFACT_WRITER_ROLE,
   BUCKET_POSTURE,
   CLOUD_SQL_POSTURE,
+  DEFERRED_JOBS,
   JOBS_EXECUTOR_ROLE,
   JOB_NAMES,
   LOGGING_POSTURE,
@@ -54,6 +74,7 @@ import {
   SCHEDULED_JOB_NAMES,
   SCHEDULER_OAUTH_SCOPE,
   SCHEDULER_TIME_ZONE,
+  SCHEDULER_TRIGGER_STATES,
   SECRET_ACCESSOR_ROLE,
   SERVICE_ACCOUNT_ROLES,
   backupConfiguration,
@@ -103,7 +124,6 @@ export const READ_COMMANDS = Object.freeze([
 /** gcloud command shapes only an authorized apply may issue. None deletes. */
 export const MUTATING_COMMANDS = Object.freeze([
   "iam service-accounts create",
-  "iam service-accounts enable",
   "iam roles create",
   "iam roles update",
   "projects add-iam-policy-binding",
@@ -129,6 +149,23 @@ export const MUTATING_COMMANDS = Object.freeze([
 /** Operation actions apply runs; every other action refuses the plan. */
 export const EXECUTABLE_ACTIONS = Object.freeze(["create", "update", "bind"]);
 export const REFUSED_ACTIONS = Object.freeze(["delete", "destructive", "bucket-update"]);
+/** Cloud Scheduler job states readback reports; anything else is UNRECOGNIZED. */
+export const SCHEDULER_LIVE_STATES = Object.freeze(["ENABLED", "PAUSED", "DISABLED", "UPDATE_FAILED"]);
+/** IAM custom role stages readback reports; anything else is UNRECOGNIZED. */
+export const CUSTOM_ROLE_STAGES = Object.freeze(["ALPHA", "BETA", "GA", "DEPRECATED", "DISABLED", "EAP"]);
+/** The deferred resume of a paused trigger whose desired state is ENABLED (OPS-3 resumes). */
+export const SCHEDULER_RESUME_DEFERRAL = "SCHEDULER_TRIGGER_RESUME_PENDING";
+/**
+ * Deferrals that leave the estate clean for OPS-10: an owner decision not yet
+ * made (the D3 cadence), a job DEFERRED_JOBS names, and a resume OPS-3 owns.
+ * Every other deferral (a bootstrap image, a secret version, an unrecognized
+ * live image) means the estate is not yet what the desired state describes.
+ */
+export const CLEAN_DEFERRALS = Object.freeze([
+  "SCHEDULER_CADENCE_UNSET",
+  SCHEDULER_RESUME_DEFERRAL,
+  ...new Set(Object.values(DEFERRED_JOBS)),
+]);
 
 const FILE_PLACEHOLDER = "${FILE}";
 const GCLOUD_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
@@ -435,7 +472,7 @@ export function readbackInfrastructure(desired, { runner = defaultGcloudRunner }
     if (!isRecord(described)) outputInvalid("roles-describe");
     customRole = {
       deleted: described.deleted === true,
-      stage: described.stage ?? null,
+      stage: CUSTOM_ROLE_STAGES.includes(described.stage) ? described.stage : "UNRECOGNIZED",
       permissions: array(described.includedPermissions ?? [], "roles-describe").map(String).sort(),
     };
   }
@@ -561,7 +598,10 @@ export function readbackInfrastructure(desired, { runner = defaultGcloudRunner }
   const scheduler = {};
   for (const job of SCHEDULED_JOB_NAMES) {
     const entry = triggers.find((item) => tail(item?.name) === desired.scheduler[job].name);
-    scheduler[job] = entry === undefined ? null : { ...schedulerView(entry), state: entry.state ?? null };
+    scheduler[job] = entry === undefined ? null : {
+      ...schedulerView(entry),
+      state: SCHEDULER_LIVE_STATES.includes(entry.state) ? entry.state : "UNRECOGNIZED",
+    };
   }
 
   const findings = [];
@@ -574,6 +614,21 @@ export function readbackInfrastructure(desired, { runner = defaultGcloudRunner }
   }
   if (bucket?.publicMember === true) findings.push("BUCKET_POLICY_PUBLIC_MEMBER");
   if (customRole?.deleted === true) findings.push("CUSTOM_ROLE_DELETED");
+  if (customRole !== null && customRole.deleted !== true && customRole.stage !== "GA") {
+    findings.push(customRole.stage === "DISABLED" ? "CUSTOM_ROLE_DISABLED" : "CUSTOM_ROLE_STAGE_NOT_GA");
+  }
+  for (const role of SERVICE_ACCOUNT_ROLES) {
+    if (serviceAccounts[role]?.disabled === true) findings.push(`SERVICE_ACCOUNT_DISABLED:${role}`);
+  }
+  for (const job of SCHEDULED_JOB_NAMES) {
+    const state = scheduler[job]?.state;
+    if (state === undefined || state === null) continue;
+    if (state === "ENABLED" && desired.scheduler[job].state === "PAUSED") {
+      findings.push(`SCHEDULER_TRIGGER_ENABLED:${job}`);
+    } else if (!SCHEDULER_TRIGGER_STATES.includes(state)) {
+      findings.push(`SCHEDULER_TRIGGER_STATE_UNRECOGNIZED:${job}`);
+    }
+  }
   if (instanceNames.some((name) => name !== desired.cloudSql.instance)) findings.push("CLOUD_SQL_SECOND_INSTANCE");
   if (dataAccessAudit.length > 0) findings.push("DATA_ACCESS_AUDIT_ENABLED");
 
@@ -641,7 +696,7 @@ function bindingOperations(family, desiredBindings, liveBindings, addArgv, remov
   return operations;
 }
 
-function serviceAccountOperations(desired, observed) {
+function serviceAccountOperations(desired, observed, blockers) {
   const operations = [];
   for (const role of SERVICE_ACCOUNT_ROLES) {
     const account = desired.serviceAccounts[role];
@@ -653,9 +708,9 @@ function serviceAccountOperations(desired, observed) {
         `--display-name=TiboTattle ${role}`,
       ]));
     } else if (live.disabled) {
-      operations.push(operation(`service-account:update:${role}`, "update", [
-        "iam", "service-accounts", "enable", account.email, `--project=${desired.project}`,
-      ]));
+      // A disabled account was disabled on purpose (for example, to contain a
+      // leaked edge-invoker key). Re-enabling it is the owner's decision.
+      blockers.push(`SERVICE_ACCOUNT_DISABLED:${role}`);
     }
   }
   return operations;
@@ -676,14 +731,15 @@ function customRoleOperations(desired, observed, blockers) {
     blockers.push("CUSTOM_ROLE_DELETED");
     return [];
   }
+  // Apply creates the role at GA and never changes a stage: any other stage
+  // was set by hand (DISABLED withdraws the grant) and is the owner's call.
+  if (live.stage !== "GA") blockers.push(live.stage === "DISABLED" ? "CUSTOM_ROLE_DISABLED" : "CUSTOM_ROLE_STAGE_NOT_GA");
   const operations = [];
   const missing = role.permissions.filter((permission) => !live.permissions.includes(permission));
   const extra = live.permissions.filter((permission) => !role.permissions.includes(permission));
-  if (missing.length > 0 || live.stage !== "GA") {
+  if (missing.length > 0) {
     operations.push(operation("custom-role:update", "update", [
-      "iam", "roles", "update", role.id, project,
-      ...(missing.length > 0 ? [`--add-permissions=${missing.join(",")}`] : []),
-      ...(live.stage !== "GA" ? ["--stage=GA"] : []),
+      "iam", "roles", "update", role.id, project, `--add-permissions=${missing.join(",")}`,
     ]));
   }
   if (extra.length > 0) {
@@ -1024,7 +1080,7 @@ function serviceOperations(desired, observed, bootstrap, usage) {
   return operations;
 }
 
-function jobOperations(desired, observed, bootstrap, usage) {
+function jobOperations(desired, observed, bootstrap, usage, jobDeferrals) {
   const project = `--project=${desired.project}`;
   const region = `--region=${desired.region}`;
   const operations = [];
@@ -1037,8 +1093,11 @@ function jobOperations(desired, observed, bootstrap, usage) {
   for (const job of JOB_NAMES) {
     const live = observed.jobs.managed[job];
     const replaceArgv = ["run", "jobs", "replace", FILE_PLACEHOLDER, project, region];
-    const image = runImage(live, bootstrap, "JOB");
-    if (live === null) usage.bootstrap = true;
+    // A deferred job is never created (DEFERRED_JOBS); one that already exists
+    // is kept as it is, like any managed job.
+    const jobDeferral = live === null ? jobDeferrals[job] : undefined;
+    const image = jobDeferral === undefined ? runImage(live, bootstrap, "JOB") : { deferred: jobDeferral };
+    if (live === null && jobDeferral === undefined) usage.bootstrap = true;
     if (image.deferred !== undefined) {
       operations.push(operation(`run-job:${live === null ? "create" : "update"}:${job}`,
         live === null ? "create" : "update", replaceArgv, { deferred: image.deferred }));
@@ -1069,7 +1128,7 @@ function jobOperations(desired, observed, bootstrap, usage) {
   return operations;
 }
 
-function schedulerOperations(desired, observed) {
+function schedulerOperations(desired, observed, blockers, jobDeferrals) {
   const project = `--project=${desired.project}`;
   const location = `--location=${desired.region}`;
   const operations = [];
@@ -1096,13 +1155,31 @@ function schedulerOperations(desired, observed) {
       continue;
     }
     const flags = schedulerFlags(desired, job);
+    const pause = operation(`scheduler:pause:${job}`, "update",
+      ["scheduler", "jobs", "pause", trigger.name, project, location]);
     if (live === null) {
+      if (jobDeferrals[job] !== undefined && observed.jobs.managed[job] === null) {
+        // No trigger for a job that is not created.
+        operations.push(operation(`scheduler:create:${job}`, "create",
+          ["scheduler", "jobs", "create", "http", trigger.name, ...flags], { deferred: jobDeferrals[job] }));
+        continue;
+      }
+      // Cloud Scheduler creates a trigger ENABLED; apply pauses it at once and
+      // never resumes it (OPS-3 does). Should the pause fail, readback sees the
+      // ENABLED trigger and the next plan pauses it again.
       operations.push(operation(`scheduler:create:${job}`, "create",
         ["scheduler", "jobs", "create", "http", trigger.name, ...flags]));
-      // Created paused: apply never starts a schedule (OPS-3 resumes).
-      operations.push(operation(`scheduler:pause:${job}`, "update",
-        ["scheduler", "jobs", "pause", trigger.name, project, location]));
+      operations.push(pause);
       continue;
+    }
+    if (!SCHEDULER_TRIGGER_STATES.includes(live.state)) {
+      // DISABLED (by the system), UPDATE_FAILED or unknown: by hand only.
+      blockers.push(`SCHEDULER_TRIGGER_STATE_UNRECOGNIZED:${job}`);
+    } else if (live.state === "ENABLED" && trigger.state === "PAUSED") {
+      operations.push(pause);
+    } else if (live.state === "PAUSED" && trigger.state === "ENABLED") {
+      operations.push(operation(`scheduler:resume:${job}`, "update",
+        ["scheduler", "jobs", "resume", trigger.name, project, location], { deferred: SCHEDULER_RESUME_DEFERRAL }));
     }
     const wanted = {
       name: trigger.name,
@@ -1134,6 +1211,38 @@ export function normalizeBootstrap(bootstrap) {
   return Object.freeze({ imageDigest: bootstrap.imageDigest, sourceCommit: bootstrap.sourceCommit });
 }
 
+/**
+ * The job deferrals a plan applies: DEFERRED_JOBS unless a check passes its
+ * own map (only to exercise the path that applies once a deferral is lifted).
+ */
+export function normalizeJobDeferrals(jobDeferrals) {
+  if (jobDeferrals === undefined) return DEFERRED_JOBS;
+  if (jobDeferrals === null || typeof jobDeferrals !== "object" || Array.isArray(jobDeferrals)
+      || Object.entries(jobDeferrals).some(([job, reason]) => !JOB_NAMES.includes(job)
+        || typeof reason !== "string" || !/^[A-Z][A-Z0-9_]{0,95}$/u.test(reason))) {
+    fail("JOB_DEFERRALS_INVALID");
+  }
+  return Object.freeze({ ...jobDeferrals });
+}
+
+/**
+ * OPS-10's `readback --require-clean` verdict on a plan: clean only when it
+ * holds no finding, no blocker, no executable or refused operation, and no
+ * deferral outside CLEAN_DEFERRALS. Reasons are closed codes and operation ids.
+ */
+export function infrastructureCleanliness(plan) {
+  const reasons = [
+    ...plan.findings.map((finding) => `FINDING:${finding}`),
+    ...plan.blockers.map((blocker) => `BLOCKER:${blocker}`),
+    ...plan.operations.flatMap((entry) => {
+      if (REFUSED_ACTIONS.includes(entry.action)) return [`REFUSED:${entry.id}`];
+      if (entry.deferred === undefined) return [`EXECUTABLE:${entry.id}`];
+      return CLEAN_DEFERRALS.includes(entry.deferred) ? [] : [`DEFERRED:${entry.id}:${entry.deferred}`];
+    }),
+  ];
+  return deepFreeze({ clean: reasons.length === 0, reasons });
+}
+
 /** sha256 of the canonical JSON of a plan without its digest. */
 export function planDigestOf(plan) {
   const { planDigest: _ignored, ...body } = plan;
@@ -1144,16 +1253,17 @@ export function planDigestOf(plan) {
  * The deterministic plan for a desired state and a readback. The same inputs
  * always give the same operations, in the same order, and the same planDigest.
  */
-export function planInfrastructure(desired, readback, { bootstrap: rawBootstrap } = {}) {
+export function planInfrastructure(desired, readback, { bootstrap: rawBootstrap, jobDeferrals: rawDeferrals } = {}) {
   if (readback?.schema !== "tibotattle-gcp-ops-infra-readback-v1" || readback.project !== desired.project) {
     fail("PLAN_READBACK_INVALID");
   }
   const bootstrap = normalizeBootstrap(rawBootstrap);
+  const jobDeferrals = normalizeJobDeferrals(rawDeferrals);
   const observed = readback.observed;
   const blockers = [];
   const usage = { bootstrap: false };
   const operations = [
-    ...serviceAccountOperations(desired, observed),
+    ...serviceAccountOperations(desired, observed, blockers),
     ...customRoleOperations(desired, observed, blockers),
     ...projectIamOperations(desired, observed),
     ...repositoryOperations(desired, observed),
@@ -1162,8 +1272,8 @@ export function planInfrastructure(desired, readback, { bootstrap: rawBootstrap 
     ...bucketOperations(desired, observed, blockers),
     ...loggingOperations(desired, observed),
     ...serviceOperations(desired, observed, bootstrap, usage),
-    ...jobOperations(desired, observed, bootstrap, usage),
-    ...schedulerOperations(desired, observed),
+    ...jobOperations(desired, observed, bootstrap, usage, jobDeferrals),
+    ...schedulerOperations(desired, observed, blockers, jobDeferrals),
   ];
   if (bootstrap !== null && !usage.bootstrap) fail("BOOTSTRAP_IMAGE_UNUSED");
   if (desired.bucket.proof === null) blockers.push("BUCKET_PROOF_UNPINNED");
@@ -1223,13 +1333,14 @@ export function applyInfrastructure(desired, {
   runner = defaultGcloudRunner,
   authorize,
   bootstrap,
+  jobDeferrals,
   createSpecWriter = defaultWriteSpec,
 } = {}) {
   if (desired.synthetic) fail("APPLY_SYNTHETIC_TARGET_REFUSED");
   if (authorize === undefined || authorize === null) fail("APPLY_AUTHORIZATION_REQUIRED");
   if (typeof authorize !== "string" || !DIGEST.test(authorize)) fail("APPLY_AUTHORIZATION_INVALID");
   if (desired.bucket.proof === null) fail("APPLY_BUCKET_PROOF_UNPINNED");
-  const plan = planInfrastructure(desired, readbackInfrastructure(desired, { runner }), { bootstrap });
+  const plan = planInfrastructure(desired, readbackInfrastructure(desired, { runner }), { bootstrap, jobDeferrals });
   if (plan.planDigest !== authorize) fail("APPLY_PLAN_DIGEST_MISMATCH");
   if (plan.findings.includes("BUCKET_PROOF_STALE")) fail("BUCKET_PROOF_STALE");
   if (plan.operations.some((entry) => entry.action === "delete")) fail("APPLY_DELETE_REFUSED");
@@ -1273,10 +1384,10 @@ export function applyInfrastructure(desired, {
   const afterReadback = readbackInfrastructure(desired, { runner });
   let after;
   try {
-    after = planInfrastructure(desired, afterReadback, { bootstrap });
+    after = planInfrastructure(desired, afterReadback, { bootstrap, jobDeferrals });
   } catch (error) {
     if (error?.code !== "BOOTSTRAP_IMAGE_UNUSED") throw error;
-    after = planInfrastructure(desired, afterReadback, {});
+    after = planInfrastructure(desired, afterReadback, { jobDeferrals });
   }
   return deepFreeze({
     schema: GCP_OPS_INFRA_APPLY_SCHEMA,

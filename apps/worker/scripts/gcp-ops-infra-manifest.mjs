@@ -22,15 +22,21 @@
  * verifier). The fast path renders exactly two Cloud Run Jobs (JOB_NAMES):
  * the OPS-10 production migration and the analytics-refresh job, whose
  * Cloud Scheduler cadence the owner supplies (decision D3; there is no
- * default). Probe, restore-verify, ledger and Worker-era analytics jobs are
- * not rendered.
+ * default) and whose trigger state is closed: PAUSED until OPS-3 resumes it.
+ * The analytics-refresh job and trigger are deferred (DEFERRED_JOBS) while
+ * cloud-run/analytics-refresh.mjs refuses every non-test target. Probe,
+ * restore-verify, ledger and Worker-era analytics jobs are not rendered.
  *
  * This module is pure: it validates a desired-state object and renders the
  * resource specifications from it. It reads only repository files (the EP-7
  * templates and the GCS store sources it parses for the custom role), never a
- * live resource, and never a secret value. The real production identifiers
- * are owner-held; the repository ships only a synthetic fixture
- * (fixtures/gcp-ops-infra/), whose project marker apply refuses.
+ * live resource, and never a secret value. The one exception is
+ * rolloutTarget(environment), OPS-10's entry point, which reads the path of
+ * the environment's owner-held desired-state file from one named variable
+ * (DESIRED_STATE_PATH_VARIABLES). The real production identifiers are
+ * owner-held; the repository ships only a synthetic fixture
+ * (fixtures/gcp-ops-infra/), whose project marker apply and rolloutTarget
+ * refuse.
  *
  * Every refusal throws an Error whose message and `code` are the same named
  * constant (a code may carry a ':<path>' suffix naming the setting).
@@ -38,7 +44,7 @@
 
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { canonicalJson } from "../src/canonical-json.ts";
 import { CLOUD_RUN_IAM_TEST_TARGET } from "../cloud-run/postgres-test-dispatch.mjs";
@@ -77,6 +83,35 @@ export const GCP_OPS_INFRA_ENVIRONMENTS = Object.freeze(["production", "staging"
 export const JOB_NAMES = Object.freeze(["production-migrate", "analytics-refresh"]);
 /** Jobs a Cloud Scheduler trigger runs. production-migrate is manual (OPS-10). */
 export const SCHEDULED_JOB_NAMES = Object.freeze(["analytics-refresh"]);
+/**
+ * The trigger states a desired state may name. PAUSED until OPS-3 resumes the
+ * trigger; ENABLED records that it has. Apply never resumes: it pauses a live
+ * trigger that runs while PAUSED is desired, and leaves a resume to OPS-3.
+ */
+export const SCHEDULER_TRIGGER_STATES = Object.freeze(["PAUSED", "ENABLED"]);
+
+/**
+ * Jobs whose create, and whose trigger's create, OPS-2 defers, with the
+ * reason. cloud-run/analytics-refresh.mjs resolves its database only to the
+ * private test targets inside a Cloud Run Job and refuses everything else
+ * with ANALYTICS_V2_REFRESH_TARGET_FORBIDDEN, so a production or staging
+ * analytics-refresh Job could never run. The manifest check pins that
+ * refusal: once the entry gains a reviewed production target path, that
+ * check fails, and this entry is removed with it.
+ */
+export const DEFERRED_JOBS = Object.freeze({
+  "analytics-refresh": "ANALYTICS_REFRESH_PRODUCTION_TARGET_UNAVAILABLE",
+});
+
+/**
+ * The variable naming each environment's owner-held desired-state file (an
+ * absolute path outside the repository), read only by rolloutTarget and by
+ * the CLI's --environment form.
+ */
+export const DESIRED_STATE_PATH_VARIABLES = Object.freeze({
+  production: "GCP_INFRA_DESIRED_STATE_PRODUCTION",
+  staging: "GCP_INFRA_DESIRED_STATE_STAGING",
+});
 
 export const SERVICE_ACCOUNT_ROLES = Object.freeze([
   "runtime", "migrator", "scheduler", "builder", "edgeInvoker", "verifier",
@@ -172,19 +207,24 @@ export const LOGGING_POSTURE = Object.freeze({
 
 /** Cloud Run Job definitions for the fast path (rendered only; OPS-3-lite). */
 export const JOB_DEFINITIONS = Object.freeze({
-  // OPS-10's PRODUCTION_MIGRATION_JOB: manual, migrator account, 1,800 s, one
-  // primary pool of one connection. The entry follows the build convention
-  // for cloud-run/postgres-production-migrations.mjs (W2-OPSDB); its env keys
-  // mirror the test migrations job until OPS-10 publishes its own.
+  // OPS-10's PRODUCTION_MIGRATION_JOB (cloud-run/postgres-production-
+  // migrations.mjs on claude/gcp-fp-w2-opsdb e46ceb56, not on this base):
+  // manual, migrator account, one task, no retries, 1,800 s, one primary pool
+  // of one connection. The entry is its build output, and the env keys are
+  // exactly the ones its validateProductionMigrationEnvironment reads (Cloud
+  // Run supplies CLOUD_RUN_*). Mirrored until integration single-sources
+  // them; the manifest check runs that validator on this render once the
+  // module is present.
   "production-migrate": Object.freeze({
     account: "migrator",
-    args: Object.freeze(["dist/postgres-production-migrations.mjs"]),
+    args: Object.freeze(["dist/production-migrations.mjs"]),
     timeoutSeconds: 1_800,
     cpu: "1",
     memory: "512Mi",
     env: Object.freeze([
-      "PRIMARY_INSTANCE_CONNECTION_NAME", "PRIMARY_DATABASE", "PRIMARY_SCHEMA",
-      "POSTGRES_MIGRATOR_IAM_USER", "POSTGRES_RUNTIME_IAM_USER", "DEPLOYMENT_SOURCE_COMMIT",
+      "MIGRATION_ENVIRONMENT", "GOOGLE_CLOUD_PROJECT", "PRODUCTION_MIGRATOR_SERVICE_ACCOUNT",
+      "POSTGRES_MIGRATOR_IAM_USER", "POSTGRES_RUNTIME_IAM_USER", "ENVIRONMENT_PRIMARY_INSTANCE_CONNECTION_NAME",
+      "PRIMARY_INSTANCE_CONNECTION_NAME", "PRIMARY_DATABASE", "PRIMARY_SCHEMA", "DEPLOYMENT_SOURCE_COMMIT",
     ]),
   }),
   // cloud-run/analytics-refresh.mjs: one full recompute (the only mode).
@@ -581,6 +621,11 @@ function nameChecks(names, environment) {
   }
   for (const [path, name] of names.filter(([path]) => path.startsWith("plane:"))) {
     const label = path.slice("plane:".length);
+    // OPS-10's rollout-target rule: no plane resource carries a 'test' or
+    // 'rehearsal' token at all.
+    const tokens = name.toLowerCase().split(/[^a-z0-9]+/u);
+    if (tokens.includes("test")) fail(`DESIRED_STATE_TEST_TOKEN_NAME:${label}`);
+    if (tokens.includes("rehearsal")) fail(`DESIRED_STATE_REHEARSAL_NAME:${path}`);
     if (environment === "production" && STAGING_MARKER.test(name)) {
       fail(`DESIRED_STATE_STAGING_NAME_FORBIDDEN:${label}`);
     }
@@ -786,13 +831,19 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
   }
   const scheduler = {};
   for (const job of SCHEDULED_JOB_NAMES) {
-    closedKeys(input.scheduler[job], ["name", "schedule"], `scheduler.${job}`);
+    closedKeys(input.scheduler[job], ["name", "schedule", "state"], `scheduler.${job}`);
     const schedule = input.scheduler[job].schedule;
     // No default cadence: null means not yet decided (D3), and nothing is created.
     if (schedule !== null && !validCron(schedule)) fail(`SCHEDULER_CADENCE_INVALID:${job}`);
+    const state = input.scheduler[job].state;
+    if (!SCHEDULER_TRIGGER_STATES.includes(state)) fail(`DESIRED_STATE_VALUE_INVALID:scheduler.${job}.state`);
+    // A trigger with no cadence has never been resumed (OPS-3 resumes only a
+    // trigger that exists), so it can only be desired PAUSED.
+    if (schedule === null && state !== "PAUSED") fail(`SCHEDULER_STATE_INVALID:${job}`);
     scheduler[job] = {
       name: text(input.scheduler[job].name, RESOURCE_NAME, `scheduler.${job}.name`),
       schedule,
+      state,
     };
   }
 
@@ -814,12 +865,22 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
     ["iamUser.migrator", migratorIamUser],
     ["plane:cloudSql.instance", cloudSql.instance],
     ["plane:bucket.name", bucket.name],
+    // OPS-10 also requires the plane marker on the image repository and the
+    // builder account it reads from rolloutTarget.
+    ["plane:artifactRegistry.imageRepository", artifactRegistry.imageRepository],
+    ["plane:serviceAccounts.builder.accountId", serviceAccounts.builder.accountId],
     ["plane:service.name", service.name],
     ...JOB_NAMES.map((job) => [`plane:jobs.${job}.name`, jobs[job].name]),
     ...SCHEDULED_JOB_NAMES.map((job) => [`plane:scheduler.${job}.name`, scheduler[job].name]),
     ["cloudSql.connectionName", cloudSql.connectionName],
   ];
   nameChecks(names, environment);
+  // OPS-10's job-context rule: the production migration job's name carries
+  // the 'migrate' token (a 'test' token is refused above), or its entry
+  // refuses to run.
+  if (!jobs["production-migrate"].name.split("-").includes("migrate")) {
+    fail("JOB_NAME_INVALID:jobs.production-migrate.name");
+  }
   const resourceNames = [service.name, ...JOB_NAMES.map((job) => jobs[job].name)];
   if (new Set(resourceNames).size !== resourceNames.length) fail("CLOUD_RUN_NAMES_NOT_DISTINCT");
 
@@ -1095,6 +1156,12 @@ export function renderEdgeIamPolicy(desired, { templateText } = {}) {
 /** One job's env as name/value pairs, in definition order. */
 function jobEnv(desired, job, sourceCommit) {
   const values = {
+    MIGRATION_ENVIRONMENT: desired.environment,
+    GOOGLE_CLOUD_PROJECT: desired.project,
+    PRODUCTION_MIGRATOR_SERVICE_ACCOUNT: desired.serviceAccounts.migrator.email,
+    // The environment's configured primary: the migration job's target is
+    // that instance itself (a scratch rehearsal instance is never rendered).
+    ENVIRONMENT_PRIMARY_INSTANCE_CONNECTION_NAME: desired.cloudSql.connectionName,
     PRIMARY_INSTANCE_CONNECTION_NAME: desired.cloudSql.connectionName,
     PRIMARY_DATABASE: desired.cloudSql.database,
     PRIMARY_SCHEMA: desired.cloudSql.schema,
@@ -1262,4 +1329,68 @@ export function readDesiredStateFile(path, { readFile = (target) => readFileSync
   let parsed;
   try { parsed = JSON.parse(readFile(path)); } catch { fail("DESIRED_STATE_UNREADABLE"); }
   return validateDesiredState(parsed, readSource === undefined ? {} : { readSource });
+}
+
+/**
+ * The absolute path of an environment's owner-held desired-state file, from
+ * its DESIRED_STATE_PATH_VARIABLES entry in `env`.
+ */
+export function desiredStatePathFor(environment, env) {
+  if (!GCP_OPS_INFRA_ENVIRONMENTS.includes(environment)) fail("GCP_INFRA_ENVIRONMENT_INVALID");
+  const path = env !== null && typeof env === "object" ? env[DESIRED_STATE_PATH_VARIABLES[environment]] : undefined;
+  if (typeof path !== "string" || path.length === 0) fail("GCP_INFRA_DESIRED_STATE_UNCONFIGURED");
+  if (!isAbsolute(path)) fail("GCP_INFRA_DESIRED_STATE_PATH_INVALID");
+  return path;
+}
+
+/** A validated desired state that must describe `environment`. */
+export function requireEnvironment(desired, environment) {
+  if (!GCP_OPS_INFRA_ENVIRONMENTS.includes(environment)) fail("GCP_INFRA_ENVIRONMENT_INVALID");
+  if (desired.environment !== environment) fail("GCP_INFRA_ENVIRONMENT_MISMATCH");
+  return desired;
+}
+
+/** The Cloud Run Jobs OPS-2 deploys: JOB_NAMES less the deferred ones. */
+export function deployedJobNames() {
+  return Object.freeze(JOB_NAMES.filter((job) => !Object.hasOwn(DEFERRED_JOBS, job)));
+}
+
+/** The keys of OPS-10's closed RolloutTarget (scripts/gcp-production-rollout.mjs). */
+export const ROLLOUT_TARGET_KEYS = Object.freeze([
+  "environment", "project", "region", "service", "migrationJob", "jobNames", "primaryInstance",
+  "imageRepository", "builderServiceAccount",
+]);
+
+/**
+ * OPS-10's RolloutTarget for a validated desired state: the service, the
+ * deployed jobs (a deferred job does not exist, so the rollout never moves
+ * it), the one primary instance, the image repository and the builder.
+ */
+export function rolloutTargetFromDesiredState(desired) {
+  if (desired.synthetic) fail("ROLLOUT_TARGET_SYNTHETIC_REFUSED");
+  return deepFreeze({
+    environment: desired.environment,
+    project: desired.project,
+    region: desired.region,
+    service: desired.service.name,
+    migrationJob: desired.jobs["production-migrate"].name,
+    jobNames: deployedJobNames().map((job) => desired.jobs[job].name),
+    primaryInstance: desired.cloudSql.instance,
+    imageRepository: desired.artifactRegistry.imageRepository,
+    builderServiceAccount: desired.serviceAccounts.builder.email,
+  });
+}
+
+/**
+ * OPS-10's entry point: the environment's RolloutTarget, from the owner-held
+ * desired-state file its DESIRED_STATE_PATH_VARIABLES entry names. The file
+ * must validate, describe that environment and not be synthetic.
+ */
+export function rolloutTarget(environment, { env = process.env, readFile, readSource } = {}) {
+  const path = desiredStatePathFor(environment, env);
+  const desired = readDesiredStateFile(path, {
+    ...(readFile === undefined ? {} : { readFile }),
+    ...(readSource === undefined ? {} : { readSource }),
+  });
+  return rolloutTargetFromDesiredState(requireEnvironment(desired, environment));
 }

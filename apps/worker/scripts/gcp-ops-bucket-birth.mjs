@@ -18,6 +18,14 @@
  * IAM policy of a bucket. The access token comes from the injected runner
  * (`gcloud auth print-access-token`), lives only in this call and never
  * reaches output, an error or the receipt.
+ *
+ * The insert is the one irreversible step, and a rerun refuses the bucket it
+ * made, so the proof must survive whatever follows it. The --receipt-out file
+ * is reserved (created exclusively, owner-only, never through a symlink)
+ * before any call, so an existing or unwritable path refuses with nothing
+ * inserted (BUCKET_BIRTH_RECEIPT_PATH_UNAVAILABLE). Every failure after the
+ * insert carries `bucketInserted: true`, and a receipt write that fails
+ * carries the content-free receipt itself, which the CLI prints on stdout.
  */
 
 import { constants as fsConstants } from "node:fs";
@@ -26,6 +34,7 @@ import { isAbsolute } from "node:path";
 import { canonicalJson } from "../src/canonical-json.ts";
 import {
   BUCKET_POSTURE,
+  GcpOpsInfraError,
   bucketInsertBody,
   deepFreeze,
   fail,
@@ -159,26 +168,61 @@ async function discard(response) {
   try { await response?.body?.cancel(); } catch { /* never surface provider payloads */ }
 }
 
-/** Exclusive, owner-only receipt write; a partial file from this run is removed. */
-export async function writeBucketBirthReceipt(path, receipt) {
+/**
+ * Reserves the receipt file: created exclusively, owner-only and never through
+ * a symlink, before anything irreversible. Returns { write(receipt), release() }:
+ * write fills and syncs it once; release removes the still-empty reservation
+ * when the run ends without a receipt. On a failed write the partial file from
+ * this run is removed.
+ */
+export async function reserveBucketBirthReceipt(path) {
   if (typeof path !== "string" || !isAbsolute(path)) fail("BUCKET_BIRTH_RECEIPT_PATH_INVALID");
   let handle;
-  let created = false;
   try {
     handle = await open(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL
       | fsConstants.O_NOFOLLOW, 0o600);
-    created = true;
-    await handle.writeFile(`${JSON.stringify(receipt, null, 2)}\n`, "utf8");
-    await handle.sync();
-    await handle.close();
-    handle = undefined;
   } catch {
-    try { await handle?.close(); } catch { /* keep the original refusal */ }
-    if (created) {
-      try { await unlink(path); } catch { /* only this run's partial file */ }
-    }
-    fail("BUCKET_BIRTH_RECEIPT_WRITE_FAILED");
+    fail("BUCKET_BIRTH_RECEIPT_PATH_UNAVAILABLE");
   }
+  let settled = false;
+  const discardFile = async () => {
+    try { await handle.close(); } catch { /* keep the original outcome */ }
+    try { await unlink(path); } catch { /* only this run's own file */ }
+  };
+  return Object.freeze({
+    async write(receipt) {
+      if (settled) fail("BUCKET_BIRTH_RECEIPT_WRITE_FAILED");
+      settled = true;
+      try {
+        await handle.writeFile(`${JSON.stringify(receipt, null, 2)}\n`, "utf8");
+        await handle.sync();
+        await handle.close();
+      } catch {
+        await discardFile();
+        fail("BUCKET_BIRTH_RECEIPT_WRITE_FAILED");
+      }
+    },
+    async release() {
+      if (settled) return;
+      settled = true;
+      await discardFile();
+    },
+  });
+}
+
+/** Exclusive, owner-only receipt write; a partial file from this run is removed. */
+export async function writeBucketBirthReceipt(path, receipt) {
+  const reservation = await reserveBucketBirthReceipt(path);
+  await reservation.write(receipt);
+}
+
+/** Marks a failure after the insert: the bucket exists, and a rerun refuses it. */
+function afterInsert(error, receipt) {
+  const code = error instanceof GcpOpsInfraError ? error.code : "BUCKET_BIRTH_FAILED_AFTER_INSERT";
+  return Object.assign(new GcpOpsInfraError(code), {
+    bucketInserted: true,
+    ...(receipt === undefined ? {} : { receipt }),
+  });
 }
 
 function findBucket(list, name) {
@@ -197,7 +241,7 @@ export async function runBucketBirth(desired, {
   receiptPath = null,
   runner = defaultGcloudRunner,
   fetchImpl = globalThis.fetch,
-  writeReceipt = writeBucketBirthReceipt,
+  reserveReceipt = reserveBucketBirthReceipt,
 } = {}) {
   const request = bucketBirthRequest(desired);
   if (!apply) {
@@ -215,6 +259,41 @@ export async function runBucketBirth(desired, {
   if (receiptPath !== null && (typeof receiptPath !== "string" || !isAbsolute(receiptPath))) {
     fail("BUCKET_BIRTH_RECEIPT_PATH_INVALID");
   }
+  // Reserved before any call: a path that cannot take the receipt refuses
+  // here, with nothing inserted.
+  const reservation = receiptPath === null ? null : await reserveReceipt(receiptPath);
+  let inserted;
+  try {
+    inserted = await insertBucket(desired, request, { runner, fetchImpl });
+  } catch (error) {
+    await reservation?.release();
+    throw error;
+  }
+  let receipt;
+  try {
+    const readbackResponse = findBucket(inserted.read(inserted.listArgv), desired.bucket.name);
+    if (readbackResponse === undefined) fail("BUCKET_BIRTH_READBACK_MISSING");
+    receipt = createBucketBirthReceipt(desired, { createResponse: inserted.createResponse, readbackResponse });
+  } catch (error) {
+    await reservation?.release();
+    throw afterInsert(error);
+  }
+  if (reservation !== null) {
+    try {
+      await reservation.write(receipt);
+    } catch (error) {
+      throw afterInsert(error, receipt);
+    }
+  }
+  return deepFreeze({ status: "created", receipt });
+}
+
+/**
+ * The listing refusal, the token and the one insert. Returns the parsed
+ * create response; a failure before the insert succeeds throws as is, and
+ * one after it (an unreadable create response) is marked as after the insert.
+ */
+async function insertBucket(desired, request, { runner, fetchImpl }) {
   const read = guardedGcloud(runner, { mode: "read", project: desired.project });
   const listArgv = ["storage", "buckets", "list", `--project=${desired.project}`, "--raw", "--format=json"];
   if (findBucket(read(listArgv), desired.bucket.name) !== undefined) fail("BUCKET_BIRTH_BUCKET_EXISTS");
@@ -244,10 +323,11 @@ export async function runBucketBirth(desired, {
     await discard(response);
     fail("BUCKET_BIRTH_CREATE_FAILED");
   }
-  const createResponse = await boundedJson(response);
-  const readbackResponse = findBucket(read(listArgv), desired.bucket.name);
-  if (readbackResponse === undefined) fail("BUCKET_BIRTH_READBACK_MISSING");
-  const receipt = createBucketBirthReceipt(desired, { createResponse, readbackResponse });
-  if (receiptPath !== null) await writeReceipt(receiptPath, receipt);
-  return deepFreeze({ status: "created", receipt });
+  let createResponse;
+  try {
+    createResponse = await boundedJson(response);
+  } catch (error) {
+    throw afterInsert(error);
+  }
+  return { read, listArgv, createResponse };
 }

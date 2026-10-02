@@ -3,19 +3,21 @@
  * only under its exact authorization, refusal of an existing bucket (before
  * the insert from the listing, or from the insert's HTTP 409), a proof
  * receipt from the create response and an exact readback, and an access
- * token that never leaves the call. The runner and fetch are synthetic and
- * recorded; PATH is blanked, so no real gcloud can run.
+ * token that never leaves the call. The receipt file is reserved before any
+ * call, and a failure after the insert keeps the proof. The runner and fetch
+ * are synthetic and recorded; PATH is blanked, so no real gcloud can run.
  */
 
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
-import { readFileSync } from "node:fs";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import * as manifest from "./gcp-ops-infra-manifest.mjs";
 import * as birth from "./gcp-ops-bucket-birth.mjs";
+import { main } from "./gcp-infra.mjs";
 import { bornBucket } from "./fixtures/gcp-ops-infra/fake-gcloud.mjs";
 
 process.env.PATH = "/nonexistent-gcloud-guard";
@@ -35,6 +37,33 @@ function desiredState({ synthetic = false, proof = null } = {}) {
 function createdBucket(desired, extra = {}) {
   return bornBucket({ name: desired.bucket.name, location: desired.bucket.location,
     extra: { timeCreated: CREATED_AT, softDeletePolicy: { retentionDurationSeconds: "0" }, ...extra } });
+}
+
+/** A recording receipt reservation that never touches the filesystem. */
+function memoryReservations({ failWrite = false } = {}) {
+  const events = [];
+  return {
+    events,
+    reserveReceipt: async (path) => {
+      events.push({ event: "reserve", path });
+      return {
+        write: async (receipt) => {
+          events.push({ event: "write", path, receipt });
+          if (failWrite) manifest.fail("BUCKET_BIRTH_RECEIPT_WRITE_FAILED");
+        },
+        release: async () => { events.push({ event: "release", path }); },
+      };
+    },
+  };
+}
+
+async function withDirectory(run) {
+  const directory = await mkdtemp(join(tmpdir(), "gcp-ops-bucket-birth-"));
+  try {
+    return await run(directory);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 }
 
 /** A recording runner: bucket listings before and after the insert, and the token. */
@@ -143,15 +172,22 @@ test("an insert answered 409 is refused as an existing bucket; other failures ar
 test("one authorized insert yields the proof receipt, and the token never leaves the call", async () => {
   const desired = desiredState();
   const run = harness(desired);
-  const written = [];
+  const reservations = memoryReservations();
+  const reserveReceipt = async (path) => {
+    // Reserved before any call.
+    assert.deepEqual([run.calls.length, run.requests.length], [0, 0]);
+    return reservations.reserveReceipt(path);
+  };
   const result = await birth.runBucketBirth(desired, {
     apply: true,
     authorize: birth.bucketBirthAuthorization(desired),
     receiptPath: "/synthetic/receipt.json",
     runner: run.runner,
     fetchImpl: run.fetchImpl,
-    writeReceipt: async (path, receipt) => { written.push({ path, receipt }); },
+    reserveReceipt,
   });
+  const written = reservations.events.filter((entry) => entry.event === "write")
+    .map(({ path, receipt }) => ({ path, receipt }));
   assert.equal(result.status, "created");
   assert.equal(run.requests.length, 1);
   const [request] = run.requests;
@@ -202,18 +238,109 @@ test("a readback that differs from the insert is refused", async () => {
 });
 
 test("the receipt file is written once, owner-only, and never over an existing file", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "gcp-ops-bucket-birth-"));
-  try {
+  await withDirectory(async (directory) => {
     const path = join(directory, "receipt.json");
     const receipt = { schemaVersion: "tibotattle-gcp-bucket-birth-v1", proof: { bucketMetageneration: "1" } };
     await birth.writeBucketBirthReceipt(path, receipt);
     assert.deepEqual(JSON.parse(await readFile(path, "utf8")), receipt);
     assert.equal((await stat(path)).mode & 0o777, 0o600);
-    await assert.rejects(birth.writeBucketBirthReceipt(path, receipt), { code: "BUCKET_BIRTH_RECEIPT_WRITE_FAILED" });
+    await assert.rejects(birth.writeBucketBirthReceipt(path, receipt), { code: "BUCKET_BIRTH_RECEIPT_PATH_UNAVAILABLE" });
     await assert.rejects(birth.writeBucketBirthReceipt("relative.json", receipt), { code: "BUCKET_BIRTH_RECEIPT_PATH_INVALID" });
-  } finally {
-    await rm(directory, { recursive: true, force: true });
+    // A reservation is written at most once, and release leaves a written file alone.
+    const second = join(directory, "second.json");
+    const reservation = await birth.reserveBucketBirthReceipt(second);
+    assert.equal((await stat(second)).size, 0);
+    await reservation.write(receipt);
+    await reservation.release();
+    await assert.rejects(reservation.write(receipt), { code: "BUCKET_BIRTH_RECEIPT_WRITE_FAILED" });
+    assert.deepEqual(JSON.parse(await readFile(second, "utf8")), receipt);
+    // An unused reservation is removed on release.
+    const unused = join(directory, "unused.json");
+    await (await birth.reserveBucketBirthReceipt(unused)).release();
+    assert.equal(existsSync(unused), false);
+  });
+});
+
+test("an existing or unwritable receipt path refuses before any call, so nothing is inserted", async () => {
+  const desired = desiredState();
+  const authorize = birth.bucketBirthAuthorization(desired);
+  await withDirectory(async (directory) => {
+    const existing = join(directory, "receipt.json");
+    await writeFile(existing, "owner-kept\n");
+    for (const receiptPath of [existing, join(directory, "absent-directory", "receipt.json")]) {
+      const run = harness(desired);
+      await assert.rejects(birth.runBucketBirth(desired, { apply: true, authorize, receiptPath, runner: run.runner,
+        fetchImpl: run.fetchImpl }), { code: "BUCKET_BIRTH_RECEIPT_PATH_UNAVAILABLE" });
+      assert.deepEqual([run.calls.length, run.requests.length], [0, 0]);
+    }
+    assert.equal(await readFile(existing, "utf8"), "owner-kept\n");
+  });
+});
+
+test("a receipt write that fails after the insert still yields the receipt, and the CLI prints it", async () => {
+  const desired = desiredState();
+  const authorize = birth.bucketBirthAuthorization(desired);
+  const run = harness(desired);
+  const reservations = memoryReservations({ failWrite: true });
+  let thrown;
+  try {
+    await birth.runBucketBirth(desired, { apply: true, authorize, receiptPath: "/synthetic/receipt.json",
+      runner: run.runner, fetchImpl: run.fetchImpl, reserveReceipt: reservations.reserveReceipt });
+  } catch (error) {
+    thrown = error;
   }
+  assert.equal(thrown?.code, "BUCKET_BIRTH_RECEIPT_WRITE_FAILED");
+  assert.equal(thrown.bucketInserted, true);
+  assert.deepEqual(thrown.receipt.proof, { bucket: "synthetic-ops-quarantine", bucketGeneration: "1700000000000001",
+    bucketMetageneration: "1", softDeleteRetentionDurationSeconds: "0" });
+  assert.equal(run.requests.length, 1);
+  // Through the CLI: the content-free receipt goes to stdout, the code to stderr.
+  const unborn = JSON.stringify({ ...JSON.parse(JSON.stringify(FIXTURE).replaceAll("synthetic-ops-project",
+    "example-ops-prod1")), bucket: { ...FIXTURE.bucket, proof: null } });
+  const cliRun = harness(desired);
+  const out = [];
+  const err = [];
+  const code = await main(["bucket-birth", "--desired-state=/synthetic-desired/unborn.json", "--apply",
+    `--authorize=${authorize}`, "--receipt-out=/synthetic/receipt.json"], {
+    runner: cliRun.runner,
+    fetchImpl: cliRun.fetchImpl,
+    readFile: () => unborn,
+    reserveReceipt: memoryReservations({ failWrite: true }).reserveReceipt,
+    stdout: (text) => out.push(text),
+    stderr: (text) => err.push(text),
+  });
+  assert.equal(code, 1);
+  assert.deepEqual(JSON.parse(err.join("")), { status: "error", code: "BUCKET_BIRTH_RECEIPT_WRITE_FAILED",
+    bucketInserted: true });
+  const printed = JSON.parse(out.join(""));
+  assert.equal(printed.status, "created_receipt_unwritten");
+  assert.deepEqual(printed.receipt, JSON.parse(JSON.stringify(thrown.receipt)));
+  for (const text of [out.join(""), err.join("")]) assert.equal(text.includes(TOKEN), false);
+});
+
+test("a failure after the insert releases the reservation and says the bucket now exists", async () => {
+  const desired = desiredState();
+  const authorize = birth.bucketBirthAuthorization(desired);
+  await withDirectory(async (directory) => {
+    const receiptPath = join(directory, "receipt.json");
+    for (const [options, code, inserted] of [
+      [{ readback: createdBucket(desired, { metageneration: "2" }) }, "BUCKET_BIRTH_READBACK_MISMATCH", true],
+      [{ response: () => new Response("not json", { status: 200 }) }, "BUCKET_BIRTH_RESPONSE_INVALID", true],
+      [{ response: () => new Response("{}", { status: 403 }) }, "BUCKET_BIRTH_CREATE_FAILED", undefined],
+    ]) {
+      const run = harness(desired, options);
+      await assert.rejects(birth.runBucketBirth(desired, { apply: true, authorize, receiptPath, runner: run.runner,
+        fetchImpl: run.fetchImpl }), (error) => error.code === code && error.bucketInserted === inserted
+          && error.receipt === undefined, code);
+      assert.equal(existsSync(receiptPath), false, code);
+    }
+    // The real reservation, written once with the receipt, owner-only.
+    const run = harness(desired);
+    const result = await birth.runBucketBirth(desired, { apply: true, authorize, receiptPath, runner: run.runner,
+      fetchImpl: run.fetchImpl });
+    assert.deepEqual(JSON.parse(await readFile(receiptPath, "utf8")), JSON.parse(JSON.stringify(result.receipt)));
+    assert.equal((await stat(receiptPath)).mode & 0o777, 0o600);
+  });
 });
 
 test("the module never updates, deletes or reads the IAM policy of a bucket", () => {

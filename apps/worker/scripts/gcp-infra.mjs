@@ -3,11 +3,18 @@
 /**
  * Operator CLI for the production infrastructure (OPS-2).
  *
+ *   Every command takes --desired-state=<abs path>, or --environment=<env>
+ *   alone, which reads the path from that environment's variable
+ *   (GCP_INFRA_DESIRED_STATE_PRODUCTION or GCP_INFRA_DESIRED_STATE_STAGING).
+ *   With both, the file must describe that environment.
+ *
  *   render       --desired-state=<abs path> [--bootstrap-image-digest=<hex>
  *                --bootstrap-source-commit=<hex>]
  *     The rendered estate; no gcloud call.
- *   readback     --desired-state=<abs path>
+ *   readback     --desired-state=<abs path> [--require-clean]
  *     The live estate through describe, get-iam-policy and list calls only.
+ *     With --require-clean (OPS-10's preflight), the readback, its plan's
+ *     digest and summary, and a clean verdict; exit 0 only when clean.
  *   plan         --desired-state=<abs path> [--bootstrap-image-digest --bootstrap-source-commit]
  *     Readback plus the deterministic plan and its planDigest. This is the
  *     dry run; nothing changes.
@@ -21,11 +28,15 @@
  *                --authorize=bucket-birth:<project>:<bucket> --receipt-out=<abs path>]
  *     Dry run by default; with --apply, one bucket insert that refuses an
  *     existing bucket, and a proof receipt the owner pins in the desired state.
+ *     The --receipt-out file is reserved before the insert; should writing
+ *     it fail afterwards, the receipt is printed on stdout instead.
  *
  * Output is one content-free JSON document on stdout. Exit 0 on success, 2
  * when a plan or readback holds refused operations, blockers or findings that
- * apply would refuse, and 1 on any error, reported as {"status":"error",
- * "code":...} on stderr without echoing gcloud output. Every gcloud call is an
+ * apply would refuse (or, with --require-clean, when the estate is not
+ * clean), and 1 on any error, reported as {"status":"error", "code":...} on
+ * stderr without echoing gcloud output. A failure after a bucket insert adds
+ * "bucketInserted": true. Every gcloud call is an
  * argv array through the guarded runner; no shell is used.
  */
 
@@ -33,6 +44,8 @@ import { realpathSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  DEFERRED_JOBS,
+  GCP_OPS_INFRA_ENVIRONMENTS,
   GcpOpsInfraError,
   JOB_NAMES,
   SCHEDULED_JOB_NAMES,
@@ -41,15 +54,18 @@ import {
   databaseFlags,
   desiredProjectBindings,
   desiredStateDigest,
+  desiredStatePathFor,
   readDesiredStateFile,
   renderEdgeIamPolicy,
   renderJob,
   renderService,
+  requireEnvironment,
   schedulerFlags,
 } from "./gcp-ops-infra-manifest.mjs";
 import {
   applyInfrastructure,
   defaultGcloudRunner,
+  infrastructureCleanliness,
   normalizeBootstrap,
   planInfrastructure,
   readbackInfrastructure,
@@ -57,15 +73,17 @@ import {
 import { runBucketBirth } from "./gcp-ops-bucket-birth.mjs";
 
 export const GCP_OPS_INFRA_RENDER_SCHEMA = "tibotattle-gcp-ops-infra-render-v1";
+export const GCP_OPS_INFRA_CLEAN_SCHEMA = "tibotattle-gcp-ops-infra-clean-v1";
 
+const SOURCE = Object.freeze(["--desired-state", "--environment"]);
 const COMMANDS = Object.freeze({
-  render: Object.freeze(["--desired-state", "--bootstrap-image-digest", "--bootstrap-source-commit"]),
-  readback: Object.freeze(["--desired-state"]),
-  plan: Object.freeze(["--desired-state", "--bootstrap-image-digest", "--bootstrap-source-commit"]),
-  apply: Object.freeze(["--desired-state", "--authorize", "--bootstrap-image-digest", "--bootstrap-source-commit"]),
-  "bucket-birth": Object.freeze(["--desired-state", "--authorize", "--receipt-out", "--apply"]),
+  render: Object.freeze([...SOURCE, "--bootstrap-image-digest", "--bootstrap-source-commit"]),
+  readback: Object.freeze([...SOURCE, "--require-clean"]),
+  plan: Object.freeze([...SOURCE, "--bootstrap-image-digest", "--bootstrap-source-commit"]),
+  apply: Object.freeze([...SOURCE, "--authorize", "--bootstrap-image-digest", "--bootstrap-source-commit"]),
+  "bucket-birth": Object.freeze([...SOURCE, "--authorize", "--receipt-out", "--apply"]),
 });
-const BOOLEAN_FLAGS = Object.freeze(["--apply"]);
+const BOOLEAN_FLAGS = Object.freeze(["--apply", "--require-clean"]);
 
 function fail(code) {
   throw new GcpOpsInfraError(code);
@@ -94,8 +112,10 @@ export function parseGcpInfraArgs(argv) {
     values.set(name, value);
   }
   const desiredStatePath = values.get("--desired-state");
-  if (desiredStatePath === undefined) fail("GCP_INFRA_ARGUMENT_MISSING");
-  if (!isAbsolute(desiredStatePath)) fail("GCP_INFRA_DESIRED_STATE_PATH_INVALID");
+  const environment = values.get("--environment") ?? null;
+  if (desiredStatePath === undefined && environment === null) fail("GCP_INFRA_ARGUMENT_MISSING");
+  if (desiredStatePath !== undefined && !isAbsolute(desiredStatePath)) fail("GCP_INFRA_DESIRED_STATE_PATH_INVALID");
+  if (environment !== null && !GCP_OPS_INFRA_ENVIRONMENTS.includes(environment)) fail("GCP_INFRA_ENVIRONMENT_INVALID");
   const image = values.get("--bootstrap-image-digest");
   const commit = values.get("--bootstrap-source-commit");
   if ((image === undefined) !== (commit === undefined)) fail("BOOTSTRAP_IMAGE_INVALID");
@@ -108,10 +128,12 @@ export function parseGcpInfraArgs(argv) {
   if (receiptPath !== null && !isAbsolute(receiptPath)) fail("BUCKET_BIRTH_RECEIPT_PATH_INVALID");
   return Object.freeze({
     command,
-    desiredStatePath: resolve(desiredStatePath),
+    desiredStatePath: desiredStatePath === undefined ? null : resolve(desiredStatePath),
+    environment,
     bootstrap,
     authorize: values.get("--authorize") ?? null,
     apply,
+    requireClean: values.get("--require-clean") === true,
     receiptPath: receiptPath === null ? null : resolve(receiptPath),
   });
 }
@@ -142,9 +164,12 @@ export function renderInfrastructure(desired, { bootstrap = null } = {}) {
     bucket: bucketInsertBody(desired),
     serviceIam: renderEdgeIamPolicy(desired),
     service: image === null ? { unavailable: "BOOTSTRAP_IMAGE_REQUIRED" } : attempt(() => renderService(desired, image)),
-    jobs: Object.fromEntries(JOB_NAMES.map((job) => [job, image === null
-      ? { unavailable: "BOOTSTRAP_IMAGE_REQUIRED" } : attempt(() => renderJob(desired, job, image))])),
-    scheduler: Object.fromEntries(SCHEDULED_JOB_NAMES.map((job) => [job, attempt(() => schedulerFlags(desired, job))])),
+    jobs: Object.fromEntries(JOB_NAMES.map((job) => [job, Object.hasOwn(DEFERRED_JOBS, job)
+      ? { unavailable: DEFERRED_JOBS[job] }
+      : image === null ? { unavailable: "BOOTSTRAP_IMAGE_REQUIRED" } : attempt(() => renderJob(desired, job, image))])),
+    scheduler: Object.fromEntries(SCHEDULED_JOB_NAMES.map((job) => [job,
+      desired.scheduler[job].schedule !== null && Object.hasOwn(DEFERRED_JOBS, job)
+        ? { unavailable: DEFERRED_JOBS[job] } : attempt(() => schedulerFlags(desired, job))])),
   };
 }
 
@@ -159,23 +184,40 @@ export async function main(argv = process.argv.slice(2), {
   readFile,
   readSource,
   createSpecWriter,
-  writeReceipt,
+  reserveReceipt,
+  env = process.env,
   stdout = (text) => process.stdout.write(text),
   stderr = (text) => process.stderr.write(text),
 } = {}) {
+  const print = (value) => stdout(`${JSON.stringify(value, null, 2)}\n`);
   try {
     const config = parseGcpInfraArgs(argv);
-    const desired = readDesiredStateFile(config.desiredStatePath, {
+    const loaded = readDesiredStateFile(config.desiredStatePath ?? desiredStatePathFor(config.environment, env), {
       ...(readFile === undefined ? {} : { readFile }),
       ...(readSource === undefined ? {} : { readSource }),
     });
-    const print = (value) => stdout(`${JSON.stringify(value, null, 2)}\n`);
+    const desired = config.environment === null ? loaded : requireEnvironment(loaded, config.environment);
     if (config.command === "render") {
       print(renderInfrastructure(desired, { bootstrap: config.bootstrap }));
       return 0;
     }
     if (config.command === "readback") {
       const readback = readbackInfrastructure(desired, { runner });
+      if (config.requireClean) {
+        const plan = planInfrastructure(desired, readback);
+        const verdict = infrastructureCleanliness(plan);
+        print({
+          schema: GCP_OPS_INFRA_CLEAN_SCHEMA,
+          environment: desired.environment,
+          project: desired.project,
+          clean: verdict.clean,
+          reasons: verdict.reasons,
+          planDigest: plan.planDigest,
+          summary: plan.summary,
+          readback,
+        });
+        return verdict.clean ? 0 : 2;
+      }
       print(readback);
       return readback.findings.some((finding) => finding !== "BUCKET_PROOF_UNPINNED") ? 2 : 0;
     }
@@ -200,10 +242,19 @@ export async function main(argv = process.argv.slice(2), {
       receiptPath: config.receiptPath,
       runner,
       fetchImpl,
-      ...(writeReceipt === undefined ? {} : { writeReceipt }),
+      ...(reserveReceipt === undefined ? {} : { reserveReceipt }),
     }));
     return 0;
   } catch (error) {
+    if (error instanceof GcpOpsInfraError && error.bucketInserted === true) {
+      // The bucket exists now, and a rerun refuses it: never lose the proof.
+      // The receipt is content-free; it goes to stdout when its file failed.
+      if (error.code === "BUCKET_BIRTH_RECEIPT_WRITE_FAILED" && error.receipt !== undefined) {
+        print({ status: "created_receipt_unwritten", receipt: error.receipt });
+      }
+      stderr(`${JSON.stringify({ status: "error", code: error.code, bucketInserted: true })}\n`);
+      return 1;
+    }
     if (error?.code === "APPLY_OPERATION_FAILED" && Array.isArray(error.outcomes)) {
       // Which operations ran before the failure: ids and outcomes only.
       stderr(`${JSON.stringify({ status: "error", code: error.code, operation: error.operation,

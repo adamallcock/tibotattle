@@ -168,9 +168,6 @@ export function createFakeGcloud(world, { files = new Map(), failWhen = () => fa
       case path === "iam service-accounts create":
         world.serviceAccounts.push({ email: `${name(3)}@${project}.iam.gserviceaccount.com`, disabled: false });
         return done();
-      case path === "iam service-accounts enable":
-        world.serviceAccounts.find((account) => account.email === name(3)).disabled = false;
-        return done();
       case path === "iam roles list": return json(world.roles.map((role) => ({ name: role.name, deleted: role.deleted })));
       case path === "iam roles describe": return json(world.roles.find((role) => role.name.endsWith(`/${name(3)}`)));
       case path === "iam roles create":
@@ -312,9 +309,13 @@ export function createFakeGcloud(world, { files = new Map(), failWhen = () => fa
         });
         return done();
       }
-      case path === "scheduler jobs pause":
-        world.schedulerJobs.find((job) => job.name.endsWith(`/${name(3)}`)).state = "PAUSED";
+      case path === "scheduler jobs pause": {
+        // Cloud Scheduler pauses only an ENABLED job (FAILED_PRECONDITION otherwise).
+        const job = world.schedulerJobs.find((entry) => entry.name.endsWith(`/${name(3)}`));
+        if (job?.state !== "ENABLED") return { status: 1, stdout: "", stderr: "synthetic: not enabled" };
+        job.state = "PAUSED";
         return done();
+      }
       default:
         return { status: 2, stdout: "", stderr: "synthetic: unexpected command" };
     }

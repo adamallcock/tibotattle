@@ -5,7 +5,9 @@
  * readback and plan issue read shapes only, that nothing mutating runs
  * without a matching --authorize, and that apply refuses deletes,
  * destructive changes, bucket metadata changes and a stale or unpinned
- * bucket proof. PATH is blanked, so no real gcloud can run.
+ * bucket proof. Trigger state, disabled accounts, non-GA roles, the deferred
+ * analytics-refresh job and OPS-10's clean verdict are covered too. PATH is
+ * blanked, so no real gcloud can run.
  */
 
 import assert from "node:assert/strict";
@@ -32,6 +34,11 @@ const LIVE_IMAGE = Object.freeze({ imageDigest: "e".repeat(64), sourceCommit: "f
 // An unmarked copy for apply paths: still synthetic, content-free and only
 // ever run against the in-memory gcloud.
 const APPLY_PROJECT = "example-ops-prod1";
+// No job deferred: the path that applies once the analytics-refresh entry
+// gains a production target (manifest DEFERRED_JOBS), exercised here only.
+const UNDEFERRED = Object.freeze({ jobDeferrals: Object.freeze({}) });
+const CADENCE = (value) => { value.scheduler["analytics-refresh"].schedule = "15 3 * * *"; };
+const TRIGGER = "synthetic-analytics-refresh-trigger";
 
 function desiredState({ synthetic = true, mutate = () => {} } = {}) {
   let value = structuredClone(FIXTURE);
@@ -65,13 +72,17 @@ function plan(desired, runner, options = {}) {
 }
 
 /** A world in which apply has already converged the estate. */
-function convergedWorld(desired) {
+function convergedWorld(desired, options = {}) {
   const world = bornWorld(desired);
   const gcloud = fake(desired, world);
-  const first = plan(desired, gcloud.runner, { bootstrap: LIVE_IMAGE });
+  const first = plan(desired, gcloud.runner, { bootstrap: LIVE_IMAGE, ...options });
   operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: first.planDigest, bootstrap: LIVE_IMAGE,
-    createSpecWriter: () => gcloud.writer.create() });
+    createSpecWriter: () => gcloud.writer.create(), ...options });
   return world;
+}
+
+function trigger(world) {
+  return world.schedulerJobs.find((job) => job.name.endsWith(`/${TRIGGER}`));
 }
 
 function kinds(calls) {
@@ -136,9 +147,11 @@ test("the guard refuses unknown, deleting and secret-reading shapes, and mutatio
   assert.throws(() => read(["sql", "instances", "list", "--project=example-ops-prod1"]),
     { code: "GCLOUD_READ_FORMAT_REQUIRED" });
   assert.equal(calls.length, 0);
-  // Every mutating shape is a create, update, bind or pause; none deletes.
+  // Every mutating shape is a create, update, bind or pause; none deletes,
+  // and none enables or resumes what someone disabled or paused.
   for (const shape of operations.MUTATING_COMMANDS) {
-    assert.doesNotMatch(shape, /delete|remove|set-iam-policy|access|destroy|disable|execute|resume|storage buckets/u, shape);
+    assert.doesNotMatch(shape,
+      /delete|remove|set-iam-policy|access|destroy|disable|enable|execute|resume|storage buckets/u, shape);
   }
   for (const shape of operations.READ_COMMANDS) assert.match(shape, /(?:list|describe|get-iam-policy)$/u, shape);
   // A failed call is a named code that never echoes gcloud output.
@@ -177,7 +190,7 @@ test("the plan for the synthetic fixture holds the whole estate and no bucket ch
   assert.equal(result.synthetic, true);
   assert.deepEqual(result.blockers, []);
   assert.deepEqual(result.findings, []);
-  assert.deepEqual(result.summary, { executable: 34, deferred: 1, refused: 0 });
+  assert.deepEqual(result.summary, { executable: 32, deferred: 3, refused: 0 });
   const byId = new Map(result.operations.map((entry) => [entry.id, entry]));
   // The logging exclusion, the one instance with every SQL flag, and its users.
   assert.deepEqual(byId.get("logging-exclusion:create").argv, ["logging", "sinks", "update", "_Default",
@@ -206,11 +219,17 @@ test("the plan for the synthetic fixture holds the whole estate and no bucket ch
     `${desired.artifactRegistry.imageRepository}@sha256:${BOOTSTRAP.imageDigest}`);
   assert.deepEqual(ops(result, (entry) => entry.id.startsWith("run-service-iam:bind:")).map((entry) => entry.argv.at(-1)),
     ["--role=roles/run.invoker", "--role=roles/run.invoker"]);
-  // Exactly the two fast-path jobs; the trigger waits for the owner's cadence.
+  // Exactly the two fast-path jobs. The analytics-refresh job (and its
+  // scheduler grant) is deferred while its entry refuses a production target,
+  // and the trigger waits for the owner's cadence.
   assert.deepEqual(ops(result, (entry) => entry.id.startsWith("run-job:")).map((entry) => entry.id),
     ["run-job:create:production-migrate", "run-job:create:analytics-refresh"]);
-  assert.deepEqual(ops(result, (entry) => entry.deferred !== undefined).map((entry) => [entry.id, entry.deferred]),
-    [["scheduler:create:analytics-refresh", "SCHEDULER_CADENCE_UNSET"]]);
+  assert.deepEqual(ops(result, (entry) => entry.deferred !== undefined).map((entry) => [entry.id, entry.deferred]), [
+    ["run-job:create:analytics-refresh", "ANALYTICS_REFRESH_PRODUCTION_TARGET_UNAVAILABLE"],
+    [`run-job-iam:analytics-refresh:bind:roles/run.jobsExecutor|${desired.serviceAccounts.scheduler.member}|`,
+      "ANALYTICS_REFRESH_PRODUCTION_TARGET_UNAVAILABLE"],
+    ["scheduler:create:analytics-refresh", "SCHEDULER_CADENCE_UNSET"],
+  ]);
   // No bucket update, no bucket IAM operation, no delete.
   for (const entry of result.operations) {
     assert.equal(entry.argv.includes("buckets") && entry.argv[0] === "storage", false, entry.id);
@@ -262,15 +281,15 @@ test("apply refuses a stale planDigest with read calls only", () => {
 });
 
 /** Plans a doctored live estate, then applies with that plan's own digest. */
-function refusedApply(mutateWorld, code, { mutateDesired } = {}) {
+function refusedApply(mutateWorld, code, { mutateDesired, options = {} } = {}) {
   const desired = desiredState({ synthetic: false, mutate: mutateDesired });
-  const world = convergedWorld(desired);
+  const world = convergedWorld(desired, options);
   mutateWorld(world, desired);
   const gcloud = fake(desired, world);
-  const result = plan(desired, gcloud.runner);
+  const result = plan(desired, gcloud.runner, options);
   gcloud.calls.length = 0;
   assert.throws(() => operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: result.planDigest,
-    createSpecWriter: () => gcloud.writer.create() }), { code }, code);
+    createSpecWriter: () => gcloud.writer.create(), ...options }), { code }, code);
   assert.deepEqual([...new Set(kinds(gcloud.calls))], ["read"], code);
   return result;
 }
@@ -350,16 +369,14 @@ test("apply refuses bucket metadata changes and a stale or public bucket, and ne
 });
 
 test("apply runs only the authorized plan, mutating only after its reads, and converges", () => {
-  const desired = desiredState({ synthetic: false, mutate: (value) => {
-    value.scheduler["analytics-refresh"].schedule = "15 3 * * *";
-  } });
+  const desired = desiredState({ synthetic: false, mutate: CADENCE });
   const world = bornWorld(desired);
   const gcloud = fake(desired, world);
-  const result = plan(desired, gcloud.runner, { bootstrap: BOOTSTRAP });
+  const result = plan(desired, gcloud.runner, { bootstrap: BOOTSTRAP, ...UNDEFERRED });
   assert.deepEqual(result.summary, { executable: 36, deferred: 0, refused: 0 });
   gcloud.calls.length = 0;
   const receipt = operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: result.planDigest,
-    bootstrap: BOOTSTRAP, createSpecWriter: () => gcloud.writer.create() });
+    bootstrap: BOOTSTRAP, createSpecWriter: () => gcloud.writer.create(), ...UNDEFERRED });
   assert.equal(receipt.schema, "tibotattle-gcp-ops-infra-apply-v1");
   assert.equal(receipt.outcomes.length, result.operations.length);
   assert.ok(receipt.outcomes.every((entry) => entry.outcome === "applied"));
@@ -372,16 +389,168 @@ test("apply runs only the authorized plan, mutating only after its reads, and co
   assert.equal(sequence.filter((kind) => kind === "mutate").length, 36);
   assert.ok(sequence.slice(lastMutation + 1).every((kind) => kind === "read"));
   // The trigger was created and then paused; apply never resumes it.
-  const trigger = world.schedulerJobs.find((job) => job.name.endsWith("/synthetic-analytics-refresh-trigger"));
-  assert.equal(trigger.state, "PAUSED");
+  assert.equal(trigger(world).state, "PAUSED");
   assert.equal(gcloud.calls.some((argv) => argv.includes("resume")), false);
   // A second apply of the now-empty plan changes nothing.
   gcloud.calls.length = 0;
-  const empty = plan(desired, gcloud.runner);
+  const empty = plan(desired, gcloud.runner, UNDEFERRED);
   assert.equal(empty.summary.executable, 0);
+  assert.deepEqual(empty.findings, []);
   operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: empty.planDigest,
-    createSpecWriter: () => gcloud.writer.create() });
+    createSpecWriter: () => gcloud.writer.create(), ...UNDEFERRED });
   assert.equal(kinds(gcloud.calls).includes("mutate"), false);
+});
+
+test("by default the analytics-refresh job and trigger are deferred, never created, and the estate stays clean", () => {
+  const desired = desiredState({ synthetic: false, mutate: CADENCE });
+  const world = bornWorld(desired);
+  const gcloud = fake(desired, world);
+  const result = plan(desired, gcloud.runner, { bootstrap: BOOTSTRAP });
+  assert.deepEqual(result.summary, { executable: 32, deferred: 3, refused: 0 });
+  assert.deepEqual(ops(result, (entry) => entry.deferred !== undefined).map((entry) => entry.deferred),
+    Array(3).fill("ANALYTICS_REFRESH_PRODUCTION_TARGET_UNAVAILABLE"));
+  const receipt = operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: result.planDigest,
+    bootstrap: BOOTSTRAP, createSpecWriter: () => gcloud.writer.create() });
+  assert.deepEqual({ ...receipt.remaining, planDigest: null }, { planDigest: null, executable: 0, deferred: 3, refused: 0 });
+  assert.deepEqual(world.jobs.map((job) => job.metadata.name), ["synthetic-production-migrate"]);
+  assert.equal(world.schedulerJobs.length, 0);
+  assert.equal(gcloud.calls.some((argv) => argv[0] === "scheduler" && argv[1] === "jobs" && argv[2] !== "list"), false);
+  const after = plan(desired, gcloud.runner);
+  assert.deepEqual({ ...operations.infrastructureCleanliness(after) }, { clean: true, reasons: [] });
+  // Only the deferred job is absent: a bootstrap image would be unused, so it is refused.
+  assert.throws(() => plan(desired, gcloud.runner, { bootstrap: BOOTSTRAP }), { code: "BOOTSTRAP_IMAGE_UNUSED" });
+  assert.throws(() => plan(desired, gcloud.runner, { jobDeferrals: { "analytics-delivery": "X" } }),
+    { code: "JOB_DEFERRALS_INVALID" });
+  assert.throws(() => plan(desired, gcloud.runner, { jobDeferrals: { "analytics-refresh": "lower case" } }),
+    { code: "JOB_DEFERRALS_INVALID" });
+});
+
+test("a trigger whose pause failed after its create is paused by the next plan, not reported converged", () => {
+  const desired = desiredState({ synthetic: false, mutate: CADENCE });
+  const world = bornWorld(desired);
+  const failing = fake(desired, world, { failWhen: (argv) => argv.slice(0, 3).join(" ") === "scheduler jobs pause" });
+  const first = plan(desired, failing.runner, { bootstrap: BOOTSTRAP, ...UNDEFERRED });
+  assert.throws(() => operations.applyInfrastructure(desired, { runner: failing.runner, authorize: first.planDigest,
+    bootstrap: BOOTSTRAP, createSpecWriter: () => failing.writer.create(), ...UNDEFERRED }),
+  (error) => error.code === "APPLY_OPERATION_FAILED" && error.operation === "scheduler:pause:analytics-refresh");
+  // Cloud Scheduler created the trigger ENABLED, and the pause never ran.
+  assert.equal(trigger(world).state, "ENABLED");
+  const gcloud = fake(desired, world);
+  const readback = operations.readbackInfrastructure(desired, { runner: gcloud.runner });
+  assert.deepEqual(readback.findings, ["SCHEDULER_TRIGGER_ENABLED:analytics-refresh"]);
+  const replan = operations.planInfrastructure(desired, readback, UNDEFERRED);
+  assert.deepEqual(replan.operations.map((entry) => [entry.id, entry.action, entry.argv.slice(0, 4).join(" ")]),
+    [["scheduler:pause:analytics-refresh", "update", `scheduler jobs pause ${TRIGGER}`]]);
+  assert.deepEqual(replan.summary, { executable: 1, deferred: 0, refused: 0 });
+  assert.equal(operations.infrastructureCleanliness(replan).clean, false);
+  operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: replan.planDigest,
+    createSpecWriter: () => gcloud.writer.create(), ...UNDEFERRED });
+  assert.equal(trigger(world).state, "PAUSED");
+  const settled = plan(desired, gcloud.runner, UNDEFERRED);
+  assert.deepEqual([settled.findings, settled.operations], [[], []]);
+  // A process killed between the two calls ends in the same state and the same recovery.
+  const killed = convergedWorld(desired, UNDEFERRED);
+  trigger(killed).state = "ENABLED";
+  assert.deepEqual(plan(desired, fake(desired, killed).runner, UNDEFERRED).operations.map((entry) => entry.id),
+    ["scheduler:pause:analytics-refresh"]);
+});
+
+test("the trigger's desired state is honoured without ever resuming, and an unknown live state blocks", () => {
+  const paused = desiredState({ synthetic: false, mutate: CADENCE });
+  const resumed = desiredState({ synthetic: false, mutate: (value) => {
+    CADENCE(value);
+    value.scheduler["analytics-refresh"].state = "ENABLED";
+  } });
+  const world = convergedWorld(paused, UNDEFERRED);
+  assert.equal(trigger(world).state, "PAUSED");
+  // OPS-3 has not resumed it yet: the resume is deferred to OPS-3, never run.
+  const gcloud = fake(resumed, world);
+  const waiting = plan(resumed, gcloud.runner, UNDEFERRED);
+  assert.deepEqual(waiting.findings, []);
+  assert.deepEqual(waiting.operations.map((entry) => [entry.id, entry.deferred]),
+    [["scheduler:resume:analytics-refresh", "SCHEDULER_TRIGGER_RESUME_PENDING"]]);
+  assert.equal(operations.infrastructureCleanliness(waiting).clean, true);
+  gcloud.calls.length = 0;
+  const receipt = operations.applyInfrastructure(resumed, { runner: gcloud.runner, authorize: waiting.planDigest,
+    createSpecWriter: () => gcloud.writer.create(), ...UNDEFERRED });
+  assert.deepEqual(receipt.outcomes, [{ id: "scheduler:resume:analytics-refresh", outcome: "deferred",
+    reason: "SCHEDULER_TRIGGER_RESUME_PENDING" }]);
+  assert.equal(kinds(gcloud.calls).includes("mutate"), false);
+  assert.equal(trigger(world).state, "PAUSED");
+  // Once OPS-3 resumes it, a desired ENABLED trigger is left running.
+  trigger(world).state = "ENABLED";
+  const running = plan(resumed, fake(resumed, world).runner, UNDEFERRED);
+  assert.deepEqual([running.findings, running.operations], [[], []]);
+  // A live state that is neither ENABLED nor PAUSED is the owner's to resolve.
+  for (const state of ["DISABLED", "UPDATE_FAILED", "MARKER-STATE", undefined]) {
+    const result = refusedApply((doctored) => {
+      if (state === undefined) delete trigger(doctored).state;
+      else trigger(doctored).state = state;
+    }, "APPLY_BLOCKED", { mutateDesired: CADENCE, options: UNDEFERRED });
+    assert.deepEqual(result.blockers, ["SCHEDULER_TRIGGER_STATE_UNRECOGNIZED:analytics-refresh"], String(state));
+    assert.deepEqual(result.findings, ["SCHEDULER_TRIGGER_STATE_UNRECOGNIZED:analytics-refresh"], String(state));
+    assert.doesNotMatch(JSON.stringify(result), /MARKER/u);
+  }
+});
+
+test("a disabled managed account or a non-GA custom role blocks apply and is never re-enabled", () => {
+  for (const [mutate, code] of [
+    [(world, desired) => {
+      world.serviceAccounts.find((account) => account.email === desired.serviceAccounts.edgeInvoker.email).disabled = true;
+    }, "SERVICE_ACCOUNT_DISABLED:edgeInvoker"],
+    [(world, desired) => {
+      world.serviceAccounts.find((account) => account.email === desired.serviceAccounts.verifier.email).disabled = true;
+    }, "SERVICE_ACCOUNT_DISABLED:verifier"],
+    [(world) => { world.roles[0].stage = "DISABLED"; }, "CUSTOM_ROLE_DISABLED"],
+    [(world) => { world.roles[0].stage = "BETA"; }, "CUSTOM_ROLE_STAGE_NOT_GA"],
+    [(world) => { world.roles[0].stage = "DEPRECATED"; }, "CUSTOM_ROLE_STAGE_NOT_GA"],
+    [(world) => { world.roles[0].stage = "MARKER-STAGE"; }, "CUSTOM_ROLE_STAGE_NOT_GA"],
+  ]) {
+    const result = refusedApply(mutate, "APPLY_BLOCKED");
+    assert.deepEqual(result.blockers, [code], code);
+    assert.deepEqual(result.findings, [code], code);
+    assert.equal(result.summary.executable, 0, code);
+    assert.equal(result.operations.some((entry) => entry.argv.includes("enable")
+      || entry.argv.some((arg) => arg.startsWith("--stage"))), false, code);
+    assert.doesNotMatch(JSON.stringify(result), /MARKER/u, code);
+  }
+  // Bundled with unrelated drift, the disabled account still refuses the whole plan.
+  const bundled = refusedApply((world, desired) => {
+    world.serviceAccounts.find((account) => account.email === desired.serviceAccounts.edgeInvoker.email).disabled = true;
+    world.logBucket.retentionDays = 7;
+  }, "APPLY_BLOCKED");
+  assert.deepEqual(ops(bundled, (entry) => entry.deferred === undefined).map((entry) => entry.id),
+    ["logging-bucket:update"]);
+});
+
+test("OPS-10's clean verdict needs no finding, blocker, executable, refused or unexpected deferred operation", () => {
+  assert.deepEqual([...operations.CLEAN_DEFERRALS], ["SCHEDULER_CADENCE_UNSET", "SCHEDULER_TRIGGER_RESUME_PENDING",
+    "ANALYTICS_REFRESH_PRODUCTION_TARGET_UNAVAILABLE"]);
+  const desired = desiredState({ synthetic: false });
+  const world = convergedWorld(desired);
+  const converged = plan(desired, fake(desired, world).runner);
+  assert.deepEqual(converged.summary, { executable: 0, deferred: 3, refused: 0 });
+  assert.deepEqual({ ...operations.infrastructureCleanliness(converged) }, { clean: true, reasons: [] });
+  const verdict = (mutate) => {
+    const copy = structuredClone(world);
+    mutate(copy);
+    return operations.infrastructureCleanliness(plan(desired, fake(desired, copy).runner));
+  };
+  assert.deepEqual({ ...verdict((copy) => { copy.buckets[0].metageneration = "2"; }) },
+    { clean: false, reasons: ["FINDING:BUCKET_PROOF_STALE"] });
+  assert.deepEqual([...verdict((copy) => { copy.sink.exclusions[0].disabled = true; }).reasons],
+    ["EXECUTABLE:logging-exclusion:update"]);
+  assert.deepEqual([...verdict((copy) => { copy.logBucket.retentionDays = 400; }).reasons],
+    ["REFUSED:logging-bucket:destructive"]);
+  assert.deepEqual([...verdict((copy) => { copy.roles[0].stage = "DISABLED"; }).reasons],
+    ["FINDING:CUSTOM_ROLE_DISABLED", "BLOCKER:CUSTOM_ROLE_DISABLED"]);
+  assert.deepEqual([...verdict((copy) => { copy.services[0].spec.template.spec.containers[0].image = "example.invalid/x"; })
+    .reasons], ["DEFERRED:run-service:update:SERVICE_LIVE_IMAGE_UNRECOGNIZED"]);
+  // An empty project is far from clean, and an unpinned proof never is.
+  assert.equal(operations.infrastructureCleanliness(plan(desired, fake(desired, bornWorld(desired)).runner)).clean, false);
+  const unpinned = desiredState({ synthetic: false, mutate: (value) => { value.bucket.proof = null; } });
+  assert.deepEqual([...operations.infrastructureCleanliness(plan(unpinned, fake(unpinned, world).runner)).reasons],
+    ["FINDING:BUCKET_PROOF_UNPINNED", "BLOCKER:BUCKET_PROOF_UNPINNED"]);
 });
 
 test("apply never changes a live image or source commit, and refuses an unneeded bootstrap image", () => {
@@ -398,7 +567,8 @@ test("apply never changes a live image or source commit, and refuses an unneeded
     value.service.maxInstances = 3;
     value.service.rolloutOverlapInstances = 3;
   } });
-  world.jobs[1].spec.template.spec.template.spec.maxRetries = 3;
+  world.jobs.find((job) => job.metadata.name === "synthetic-production-migrate").spec.template.spec.template.spec
+    .maxRetries = 3;
   const gcloud = fake(scaled, world);
   const result = plan(scaled, gcloud.runner);
   const update = result.operations.find((entry) => entry.id === "run-service:update");
@@ -407,7 +577,7 @@ test("apply never changes a live image or source commit, and refuses an unneeded
   assert.equal(container.image, `${scaled.artifactRegistry.imageRepository}@sha256:${LIVE_IMAGE.imageDigest}`);
   assert.equal(container.env.find((entry) => entry.name === "DEPLOYMENT_SOURCE_COMMIT").value, LIVE_IMAGE.sourceCommit);
   assert.equal(spec.spec.template.metadata.annotations["autoscaling.knative.dev/maxScale"], "3");
-  const job = JSON.parse(result.operations.find((entry) => entry.id === "run-job:update:analytics-refresh").file.content);
+  const job = JSON.parse(result.operations.find((entry) => entry.id === "run-job:update:production-migrate").file.content);
   assert.ok(job.spec.template.spec.template.spec.containers[0].image.endsWith(LIVE_IMAGE.imageDigest));
   operations.applyInfrastructure(scaled, { runner: gcloud.runner, authorize: result.planDigest,
     createSpecWriter: () => gcloud.writer.create() });
@@ -427,7 +597,9 @@ test("first creates wait for a bootstrap image and the owner's pinned, enabled s
   const noImage = plan(desired, fake(desired, bornWorld(desired)).runner);
   assert.deepEqual(noImage.operations.filter((entry) => entry.deferred !== undefined).map((entry) => entry.deferred),
     ["BOOTSTRAP_IMAGE_REQUIRED", "BOOTSTRAP_IMAGE_REQUIRED", "BOOTSTRAP_IMAGE_REQUIRED", "BOOTSTRAP_IMAGE_REQUIRED",
-      "BOOTSTRAP_IMAGE_REQUIRED", "BOOTSTRAP_IMAGE_REQUIRED", "SCHEDULER_CADENCE_UNSET"]);
+      "ANALYTICS_REFRESH_PRODUCTION_TARGET_UNAVAILABLE", "ANALYTICS_REFRESH_PRODUCTION_TARGET_UNAVAILABLE",
+      "SCHEDULER_CADENCE_UNSET"]);
+  assert.equal(operations.infrastructureCleanliness(noImage).clean, false);
   const noValues = plan(desired, fake(desired, bornWorld(desired, { secrets: false })).runner, { bootstrap: BOOTSTRAP });
   assert.equal(noValues.operations.find((entry) => entry.id === "run-service:create").deferred,
     "SECRET_VERSION_UNAVAILABLE:IDENTITY_LINK_SECRET");
@@ -445,10 +617,8 @@ test("first creates wait for a bootstrap image and the owner's pinned, enabled s
 });
 
 test("idempotent updates: drift is set back without recreating anything", () => {
-  const desired = desiredState({ synthetic: false, mutate: (value) => {
-    value.scheduler["analytics-refresh"].schedule = "15 3 * * *";
-  } });
-  const world = convergedWorld(desiredState({ synthetic: false }));
+  const desired = desiredState({ synthetic: false, mutate: CADENCE });
+  const world = convergedWorld(desiredState({ synthetic: false }), UNDEFERRED);
   world.sqlInstances[0].settings.insightsConfig = { queryInsightsEnabled: true };
   world.sqlInstances[0].settings.databaseFlags.push({ name: "log_connections", value: "on" });
   world.sqlInstances[0].settings.tier = "db-custom-1-3840";
@@ -456,13 +626,14 @@ test("idempotent updates: drift is set back without recreating anything", () => 
   world.sink.exclusions[0].disabled = true;
   world.logBucket.retentionDays = 7;
   world.roles[0].includedPermissions = world.roles[0].includedPermissions.filter((p) => p !== "storage.objects.list");
-  world.serviceAccounts.find((account) => account.email === desired.serviceAccounts.builder.email).disabled = true;
   world.sqlInstances[0].settings.dataDiskSizeGb = "80";
   const gcloud = fake(desired, world);
-  const result = plan(desired, gcloud.runner);
+  const result = plan(desired, gcloud.runner, UNDEFERRED);
   assert.deepEqual(result.summary.refused, 0);
   const ids = result.operations.map((entry) => entry.id);
-  for (const id of ["service-account:update:builder", "custom-role:update", "artifact-registry:update",
+  assert.deepEqual(result.operations.find((entry) => entry.id === "custom-role:update").argv.slice(5),
+    ["--add-permissions=storage.objects.list"]);
+  for (const id of ["custom-role:update", "artifact-registry:update",
     "cloud-sql:update", "logging-exclusion:update", "logging-bucket:update", "scheduler:create:analytics-refresh",
     "scheduler:pause:analytics-refresh"]) {
     assert.ok(ids.includes(id), id);
@@ -475,14 +646,18 @@ test("idempotent updates: drift is set back without recreating anything", () => 
   assert.equal(ids.some((id) => id.endsWith(":create") && /^(?:cloud-sql|run-service|run-job|secret|custom-role)/u.test(id)),
     false);
   operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: result.planDigest,
-    createSpecWriter: () => gcloud.writer.create() });
-  assert.equal(plan(desired, gcloud.runner).summary.executable, 0);
+    createSpecWriter: () => gcloud.writer.create(), ...UNDEFERRED });
+  assert.equal(plan(desired, gcloud.runner, UNDEFERRED).summary.executable, 0);
   // A changed cadence is an update; the paused state is left alone.
   const recadenced = desiredState({ synthetic: false, mutate: (value) => {
     value.scheduler["analytics-refresh"].schedule = "45 4 * * *";
   } });
-  const again = plan(recadenced, fake(recadenced, world).runner);
+  const again = plan(recadenced, fake(recadenced, world).runner, UNDEFERRED);
   assert.deepEqual(again.operations.map((entry) => entry.id), ["scheduler:update:analytics-refresh"]);
+  // A drifted trigger that is also running is paused first, then updated.
+  trigger(world).state = "ENABLED";
+  assert.deepEqual(plan(recadenced, fake(recadenced, world).runner, UNDEFERRED).operations.map((entry) => entry.id),
+    ["scheduler:pause:analytics-refresh", "scheduler:update:analytics-refresh"]);
 });
 
 test("a failed operation stops apply, journals what ran and closes the spec writer", () => {

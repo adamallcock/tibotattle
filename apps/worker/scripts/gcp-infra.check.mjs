@@ -2,9 +2,10 @@
  * Offline check of the OPS-2 operator CLI (scripts/gcp-infra.mjs): closed
  * arguments, a dry run by default, render with no call, plan and readback
  * through read shapes only, apply only under --authorize and never for the
- * synthetic fixture, and named error codes that never echo gcloud output.
- * The runner is the synthetic in-memory gcloud; PATH is blanked for this
- * process and for the spawned CLI, so no real gcloud can run.
+ * synthetic fixture, OPS-10's `readback --require-clean --environment=<env>`
+ * form, and named error codes that never echo gcloud output. The runner is
+ * the synthetic in-memory gcloud; PATH is blanked for this process and for
+ * the spawned CLI, so no real gcloud can run.
  */
 
 import assert from "node:assert/strict";
@@ -49,7 +50,7 @@ function world(project) {
   return value;
 }
 
-async function run(argv, { project = "synthetic-ops-project", gcloud, writer = memoryWriter() } = {}) {
+async function run(argv, { project = "synthetic-ops-project", gcloud, writer = memoryWriter(), env = {} } = {}) {
   const fake = gcloud ?? createFakeGcloud(world(project), { files: writer.files, project, region: "us-east1" });
   const out = [];
   const err = [];
@@ -57,6 +58,7 @@ async function run(argv, { project = "synthetic-ops-project", gcloud, writer = m
     runner: fake.runner,
     fetchImpl: async () => { throw new Error("synthetic: no network in this check"); },
     readFile,
+    env,
     createSpecWriter: () => writer.create(),
     stdout: (text) => out.push(text),
     stderr: (text) => err.push(text),
@@ -66,7 +68,13 @@ async function run(argv, { project = "synthetic-ops-project", gcloud, writer = m
 
 test("arguments are closed and dangerous combinations are refused", () => {
   assert.deepEqual(parseGcpInfraArgs(["plan", `--desired-state=${FIXTURE_PATH}`]), {
-    command: "plan", desiredStatePath: FIXTURE_PATH, bootstrap: null, authorize: null, apply: false, receiptPath: null,
+    command: "plan", desiredStatePath: FIXTURE_PATH, environment: null, bootstrap: null, authorize: null, apply: false,
+    requireClean: false, receiptPath: null,
+  });
+  // OPS-10's preflight argv (ROLLOUT_ARGV.infraReadback): no path, the environment's variable names it.
+  assert.deepEqual(parseGcpInfraArgs(["readback", "--require-clean", "--environment=production"]), {
+    command: "readback", desiredStatePath: null, environment: "production", bootstrap: null, authorize: null,
+    apply: false, requireClean: true, receiptPath: null,
   });
   const cases = [
     [[], "GCP_INFRA_COMMAND_INVALID"],
@@ -87,6 +95,16 @@ test("arguments are closed and dangerous combinations are refused", () => {
     [["bucket-birth", `--desired-state=${FIXTURE_PATH}`, "--apply", "--authorize=bucket-birth:x:y",
       "--receipt-out=relative.json"], "BUCKET_BIRTH_RECEIPT_PATH_INVALID"],
     [["plan", `--desired-state=${FIXTURE_PATH}`, "--force"], "GCP_INFRA_ARGUMENT_INVALID"],
+    [["readback"], "GCP_INFRA_ARGUMENT_MISSING"],
+    [["readback", "--require-clean"], "GCP_INFRA_ARGUMENT_MISSING"],
+    [["readback", "--environment=test"], "GCP_INFRA_ENVIRONMENT_INVALID"],
+    [["readback", "--environment="], "GCP_INFRA_ARGUMENT_INVALID"],
+    [["readback", "--environment=production", "--environment=staging"], "GCP_INFRA_ARGUMENT_INVALID"],
+    [["readback", "--environment=production", "--require-clean", "--require-clean"], "GCP_INFRA_ARGUMENT_INVALID"],
+    [["readback", "--environment=production", "--require-clean=yes"], "GCP_INFRA_ARGUMENT_INVALID"],
+    [["plan", "--environment=production", "--require-clean"], "GCP_INFRA_ARGUMENT_INVALID"],
+    [["apply", "--environment=production", "--require-clean", "--authorize=" + "a".repeat(64)],
+      "GCP_INFRA_ARGUMENT_INVALID"],
   ];
   for (const [argv, code] of cases) {
     assert.throws(() => parseGcpInfraArgs(argv), { code }, argv.join(" "));
@@ -106,7 +124,9 @@ test("render makes no call and shows the estate", async () => {
   assert.deepEqual(Object.keys(rendered.jobs), ["production-migrate", "analytics-refresh"]);
   const withImage = JSON.parse((await run(["render", `--desired-state=${FIXTURE_PATH}`, ...IMAGE])).out);
   assert.equal(withImage.service.kind, "Service");
-  assert.equal(withImage.jobs["analytics-refresh"].kind, "Job");
+  assert.equal(withImage.jobs["production-migrate"].kind, "Job");
+  // Deferred while its entry refuses a production target.
+  assert.deepEqual(withImage.jobs["analytics-refresh"], { unavailable: "ANALYTICS_REFRESH_PRODUCTION_TARGET_UNAVAILABLE" });
   assert.doesNotMatch(JSON.stringify(withImage), /LEDGER|HISTORY_PROOF/u);
 });
 
@@ -167,6 +187,53 @@ test("apply refuses the synthetic fixture before any call, and runs an authorize
   assert.equal(error.operation, "service-account:create:runtime");
   assert.deepEqual(error.outcomes, [{ id: "service-account:create:runtime", outcome: "failed" }]);
   assert.equal(broken.err.includes("MARKER"), false);
+});
+
+test("readback --require-clean --environment is OPS-10's preflight: exit 0 only when clean", async () => {
+  const project = "example-ops-prod1";
+  const env = { GCP_INFRA_DESIRED_STATE_PRODUCTION: UNMARKED_PATH };
+  const preflight = ["readback", "--require-clean", "--environment=production"];
+  const writer = memoryWriter();
+  const gcloud = createFakeGcloud(world(project), { files: writer.files, project, region: "us-east1" });
+  // An estate apply has not built yet is not clean.
+  const empty = await run(preflight, { gcloud, env });
+  assert.equal(empty.code, 2, empty.err);
+  const dirty = JSON.parse(empty.out);
+  assert.equal(dirty.schema, "tibotattle-gcp-ops-infra-clean-v1");
+  assert.equal(dirty.clean, false);
+  assert.ok(dirty.reasons.includes("EXECUTABLE:cloud-sql:create"));
+  assert.ok(gcloud.calls.every((argv) => classifyGcloudCommand(argv) === "read"));
+  // Converge it, then the preflight passes; the readback is carried for OPS-10's digest.
+  const plan = JSON.parse((await run(["plan", "--environment=production", ...IMAGE], { gcloud, env })).out);
+  assert.equal((await run(["apply", "--environment=production", `--authorize=${plan.planDigest}`, ...IMAGE],
+    { gcloud, writer, env })).code, 0);
+  gcloud.calls.length = 0;
+  const clean = await run(preflight, { gcloud, env });
+  assert.equal(clean.code, 0, clean.out);
+  const verdict = JSON.parse(clean.out);
+  assert.deepEqual([verdict.clean, verdict.reasons, verdict.environment, verdict.project],
+    [true, [], "production", project]);
+  assert.deepEqual(verdict.summary, { executable: 0, deferred: 3, refused: 0 });
+  assert.equal(verdict.readback.schema, "tibotattle-gcp-ops-infra-readback-v1");
+  assert.ok(gcloud.calls.every((argv) => classifyGcloudCommand(argv) === "read"));
+  // A running trigger, a stale proof or any drift fails it.
+  gcloud.world.buckets[0].metageneration = "2";
+  const stale = await run(preflight, { gcloud, env });
+  assert.equal(stale.code, 2);
+  assert.deepEqual(JSON.parse(stale.out).reasons, ["FINDING:BUCKET_PROOF_STALE"]);
+  // The path comes only from the environment's own variable, and the file must describe it.
+  for (const [argv, environment, code] of [
+    [preflight, {}, "GCP_INFRA_DESIRED_STATE_UNCONFIGURED"],
+    [preflight, { GCP_INFRA_DESIRED_STATE_PRODUCTION: "relative.json" }, "GCP_INFRA_DESIRED_STATE_PATH_INVALID"],
+    [["readback", "--require-clean", "--environment=staging"], { GCP_INFRA_DESIRED_STATE_STAGING: UNMARKED_PATH },
+      "GCP_INFRA_ENVIRONMENT_MISMATCH"],
+    [["readback", "--environment=staging", `--desired-state=${UNMARKED_PATH}`], {}, "GCP_INFRA_ENVIRONMENT_MISMATCH"],
+  ]) {
+    const refused = await run(argv, { gcloud, env: environment });
+    assert.equal(refused.code, 1, code);
+    assert.deepEqual(JSON.parse(refused.err), { status: "error", code }, code);
+    assert.equal(refused.out, "", code);
+  }
 });
 
 test("bucket birth is a dry run by default and refuses the synthetic fixture", async () => {
