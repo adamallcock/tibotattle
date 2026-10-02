@@ -22,6 +22,10 @@
 //     journal writes must equal 0046's, statement for statement;
 //   * primary migrations numbered before 0046 (legacy history);
 //   * scripts/postgres-ingestion-journal-transfer.mjs, the sealed D1 import;
+//     its production counterpart, D-PT5A's 'ingestion-journal' stage, writes
+//     the same sealed D1-exact rows through the generic page writer of
+//     scripts/postgres-production-telemetry-engine.mjs, which never names the
+//     journal (reviewed at the D-PT5A merge; see REVIEWED_DYNAMIC_WRITERS);
 //   * D1 prepared statements in src/analytics-delivery.ts, the D1 Worker
 //     producer whose journal triggers (typed-ingestion 0002) enforce
 //     exactness; a PostgreSQL write in that file is not exempt.
@@ -94,11 +98,19 @@ const IDENTIFIER_RELATION = /^\$\{(?:[^`{}]*[(,]\s*)?([A-Za-z_$][\w$]*)\s*\)?\s*
  *   new journal-only SQLite file in the owner directory, in
  *   buildJournalSqlite's layout, written 0400. JOURNAL_TRANSFER reads that
  *   file; this module never opens PostgreSQL.
+ *   scripts/postgres-production-telemetry-modes.mjs (D-PT5A): its one computed
+ *   write is the chunk-registration hook's INSERT into pending_objects. It
+ *   names the journal only in the 'ingestion-journal' table spec and in
+ *   node:sqlite reads that validate the sealed D1 journal. That stage's
+ *   journal rows are the sealed D1-exact rows, inserted verbatim by the
+ *   engine's page writer (the production counterpart of JOURNAL_TRANSFER)
+ *   and verified against the sealed table digest.
  */
 const REVIEWED_DYNAMIC_WRITERS = new Map([
   ["scripts/postgres-analytics-history-transfer.mjs", 1],
   ["scripts/gcp-fastpath-rehearsal.mjs", 1],
   ["scripts/cutover-source-projections.mjs", 1],
+  ["scripts/postgres-production-telemetry-modes.mjs", 1],
 ]);
 
 /** Blank comments and regex-literal bodies (keeping offsets); strings and templates stay. */
