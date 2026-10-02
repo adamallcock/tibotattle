@@ -454,8 +454,8 @@ list on the deploy line governs.
    goes stale 2 hours after the last pass, and an empty origin reads not ready
    until the first pass. Run one pass by hand, then resume the maintenance
    trigger under [GCP scheduler resume](./gcp-scheduler-resume.md). The job
-   is `built` (C-MAINT); its trigger in the desired state is `not built`
-   (D-OPS4).
+   is `built` (C-MAINT); its trigger is in the committed desired state, created
+   paused at `* * * * *` (D-OPS4). Nothing starts a pass by hand yet.
 
 Evidence kept: the run's stage receipts (counts, digests, states), the
 flip-evidence sha256, the transfer run id. Abort: Abort A. The target database
@@ -690,7 +690,7 @@ the line after `95c158ba`, and the E-QUIESCE row when E-QUIESCE merged after
 | Frozen public read: export format, loader, retirement | H.3, H.4, H.8 | `built` (C-IPR), with migration `0065` promoted to primary at the C-SIMP-RECON merge; dropping the stored row is `not built` |
 | Admin routes at the origin | H.7 | Route modules `built` (C-ADMIN); registration in the host `not built` (D-CRB); the overview answers 503 until its sources exist (E-ADMIN) |
 | Refresh job production contract | H.8 | `built` (C-REFRESH) |
-| Maintenance job and trigger in the desired state | H.4 | `not built` (D-OPS4) |
+| Maintenance job and trigger in the desired state | H.4 | `built` (D-OPS4), created paused; applied and resumed in no project |
 | Scheduler pause-all and resume-all | H.4, H.8 | `not built` (D-OPS3) |
 | Monitoring and alerting, origin-lock check | H.7 | `not built` (E-OPS5) |
 | Barrier proof producer, edge live capture producer | H.2, rollout | No command writes either file |

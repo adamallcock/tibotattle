@@ -34,13 +34,18 @@
  * EP-7's template, invoked only by the edge-invoker account and the
  * read-only verifier (OD-CR-7), whose ID tokens the operator mints through a
  * roles/iam.serviceAccountTokenCreator grant on the verifier alone. The fast
- * path renders exactly two Cloud Run Jobs (JOB_NAMES): the OPS-10 production
- * migration and the analytics-refresh job, in the production refresh-job
+ * path renders exactly three Cloud Run Jobs (JOB_NAMES): the OPS-10 production
+ * migration, the analytics-refresh job, in the production refresh-job
  * contract (ANALYTICS_REFRESH_JOB_CONTRACT, the dense task profile until
- * MEAS-3), whose Cloud Scheduler cadence the owner supplies (decision D3;
- * there is no default) and whose trigger state is closed: created and paused
- * in one apply, and resumed only explicitly (OPS-3). Probe, restore-verify,
- * ledger and Worker-era analytics jobs are not rendered.
+ * MEAS-3), and the MP-2-lite maintenance job (MAINTENANCE_JOB_CONTRACT, D-OPS4).
+ * Two jobs have a Cloud Scheduler trigger. The analytics-refresh cadence is
+ * the owner's (decision D3; there is no default). The maintenance cadence is
+ * the Worker cron's, every minute, and the validator pins it
+ * (PINNED_SCHEDULER_CADENCES): a slower trigger leaves /api/ready not_ready.
+ * Every trigger's state is closed: created and paused in one apply, and
+ * resumed only explicitly (OPS-3). The OPS-4 probe jobs (cloud-run/
+ * ops-probe-contract.mjs OPS_PROBE_JOBS), restore-verify, ledger and
+ * Worker-era analytics jobs are not rendered.
  *
  * This module is pure: it validates a desired-state object and renders the
  * resource specifications from it. It reads only repository files (the
@@ -70,6 +75,14 @@ import {
   STAGING_RESOURCE_MARKER,
 } from "../cloud-run/postgres-production-configuration.mjs";
 import { desiredBackupConfiguration } from "../cloud-run/ops-backup-horizon.mjs";
+import {
+  POSTGRES_MAINTENANCE_JOB_ENTRY,
+  POSTGRES_MAINTENANCE_JOB_FORBIDDEN_PREFIXES,
+  POSTGRES_MAINTENANCE_JOB_FORBIDDEN_VARIABLES,
+  POSTGRES_MAINTENANCE_JOB_POOL_MAX,
+  POSTGRES_MAINTENANCE_JOB_PROFILES,
+  POSTGRES_MAINTENANCE_JOB_SCHEDULE,
+} from "../cloud-run/postgres-maintenance-job-contract.mjs";
 import { PRODUCTION_MIGRATION_JOB } from "../cloud-run/postgres-production-migrations.mjs";
 import {
   FASTPATH_MIGRATIONS_JOB,
@@ -124,9 +137,22 @@ export const OWNER_PLACEHOLDER_PATHS = Object.freeze(["project", "projectNumber"
 export const PROJECT_TENANCIES = Object.freeze(["dedicated", "shared"]);
 
 /** The fast-path Cloud Run Jobs, and nothing else (OPS-3-lite). */
-export const JOB_NAMES = Object.freeze(["production-migrate", "analytics-refresh"]);
+export const JOB_NAMES = Object.freeze(["production-migrate", "analytics-refresh", "maintenance"]);
 /** Jobs a Cloud Scheduler trigger runs. production-migrate is manual (OPS-10). */
-export const SCHEDULED_JOB_NAMES = Object.freeze(["analytics-refresh"]);
+export const SCHEDULED_JOB_NAMES = Object.freeze(["analytics-refresh", "maintenance"]);
+/**
+ * Triggers whose cadence is not the owner's to choose, by job. The maintenance
+ * pass reconciles at most 100 quarantine registrations per execution, the
+ * Worker's batch, so the trigger must run every minute, the cron of every
+ * d43c8f92 Worker environment: a slower trigger, or a sustained due rate above
+ * 100 a minute, leaves /api/ready not_ready and lets pending_objects grow. The
+ * value is the job's own contract constant
+ * (postgres-maintenance-job-contract.mjs). The validator refuses any other
+ * schedule, and a null one, for these (SCHEDULER_CADENCE_MISMATCH:<job>).
+ */
+export const PINNED_SCHEDULER_CADENCES = Object.freeze({
+  maintenance: POSTGRES_MAINTENANCE_JOB_SCHEDULE,
+});
 /**
  * The trigger states a desired state may name. Apply creates a trigger and
  * pauses it in the same apply, whatever its desired state, and binds the
@@ -155,6 +181,22 @@ export const SCHEDULER_PAUSE_ALERT_THRESHOLD_HOURS = 6;
  * defined. The mechanism stays for a job whose entry cannot yet run.
  */
 export const DEFERRED_JOBS = Object.freeze({});
+
+/**
+ * Jobs OPS-2 cannot render in an environment, with the reason: the job is not
+ * created there, is not in the rollout target, and its trigger is not created.
+ * The maintenance job's staging profile (staging-maintenance-job) reads the
+ * staging plane's own origins and identity values (ACCESS_TEAM_DOMAIN,
+ * ACCESS_AUD, ACCESS_ADMIN_EMAIL, IDENTITY_LINK_SECRET_VERSION and the
+ * Google and Apple identifiers, PUBLIC_ORIGIN, ADMIN_HOST_ORIGIN), which the
+ * desired state does not carry. They arrive with the staging service
+ * template (STG-PREP, D-CRB), the same prerequisite as
+ * SERVICE_TEMPLATE_UNAVAILABLE, so a staging maintenance job waits for it
+ * (STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE).
+ */
+export const JOB_ENVIRONMENT_UNAVAILABLE = Object.freeze({
+  maintenance: Object.freeze({ staging: "STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE" }),
+});
 
 /**
  * Services OPS-2 cannot render yet, by environment, with the reason. EP-7's
@@ -308,6 +350,44 @@ export const ANALYTICS_REFRESH_JOB_CONTRACT = Object.freeze({
     "PG_TEST_PORT", "PG_TEST_USER", "PG_TEST_DATABASE", "PG_TEST_PASSWORD"]),
 });
 
+/**
+ * The maintenance job's contract (D-OPS4; C-MAINT implements it in
+ * cloud-run/postgres-maintenance-job.mjs, whose constants are imported, not
+ * restated). Invocation: node dist/postgres-maintenance-job.mjs
+ * --profile=maintenance-job, as the runtime account, with one primary pool
+ * of POSTGRES_MAINTENANCE_JOB_POOL_MAX. The job refuses HOST_MODE, K_SERVICE,
+ * every PG_TEST_ variable and every POSTGRES_MAINTENANCE_JOB_ tunable, so a
+ * render carries none of them, and reads CLOUD_RUN_JOB from Cloud Run. Its
+ * configuration is exactly the maintenance-job profile of CR-3's
+ * readProductionConfiguration: the plane variables below, the OD-2 quarantine
+ * bucket birth proof (the same closed record the service renders), the
+ * POSTGRES_SCHEDULED_MAINTENANCE_ENABLED switch, and the profile's secrets by
+ * Secret Manager reference at a pinned version (IDENTITY_LINK_SECRET required,
+ * DISTRIBUTION_GITHUB_API_TOKEN optional and omitted when no version is
+ * pinned). The 300 s task timeout holds one pass of 100 object reconciliations
+ * with room for slow provider calls; a longer one would only delay the
+ * next minute's executions, which skip while a pass holds the maintenance lock.
+ * There are no retries (one attempt): the next minute is the retry.
+ */
+export const MAINTENANCE_JOB_CONTRACT = Object.freeze({
+  entry: `dist/${POSTGRES_MAINTENANCE_JOB_ENTRY}.mjs`,
+  profile: POSTGRES_MAINTENANCE_JOB_PROFILES[0],
+  taskTimeoutSeconds: 300,
+  cpu: "1",
+  memory: "512Mi",
+  poolMax: POSTGRES_MAINTENANCE_JOB_POOL_MAX,
+  schedule: POSTGRES_MAINTENANCE_JOB_SCHEDULE,
+  configurationEnv: Object.freeze([
+    "TELEMETRY_STORAGE_NAMESPACE", "PRIMARY_INSTANCE_CONNECTION_NAME", "PRIMARY_DATABASE", "PRIMARY_SCHEMA",
+    "POSTGRES_IAM_USER", "GCS_BUCKET_NAME", "GCS_QUARANTINE_BUCKET_HISTORY_PROOF",
+    "POSTGRES_SCHEDULED_MAINTENANCE_ENABLED",
+  ]),
+  provenanceEnv: Object.freeze(["DEPLOYMENT_SOURCE_COMMIT"]),
+  secrets: Object.freeze(["IDENTITY_LINK_SECRET", "DISTRIBUTION_GITHUB_API_TOKEN"]),
+  refusedVariables: Object.freeze(Object.keys(POSTGRES_MAINTENANCE_JOB_FORBIDDEN_VARIABLES)),
+  refusedPrefixes: Object.freeze(Object.keys(POSTGRES_MAINTENANCE_JOB_FORBIDDEN_PREFIXES)),
+});
+
 /** Cloud Run Job definitions for the fast path (rendered only; OPS-3-lite). */
 export const JOB_DEFINITIONS = Object.freeze({
   // OPS-10's PRODUCTION_MIGRATION_JOB (cloud-run/postgres-production-
@@ -335,6 +415,17 @@ export const JOB_DEFINITIONS = Object.freeze({
     memory: ANALYTICS_REFRESH_TASK_PROFILE.memory,
     env: Object.freeze([...ANALYTICS_REFRESH_JOB_CONTRACT.configurationEnv,
       ...ANALYTICS_REFRESH_JOB_CONTRACT.provenanceEnv]),
+  }),
+  // cloud-run/postgres-maintenance-job.mjs: one MP-2-lite lifecycle pass per
+  // execution, the maintenance-job profile (MAINTENANCE_JOB_CONTRACT).
+  maintenance: Object.freeze({
+    account: "runtime",
+    args: Object.freeze([MAINTENANCE_JOB_CONTRACT.entry, `--profile=${MAINTENANCE_JOB_CONTRACT.profile}`]),
+    timeoutSeconds: MAINTENANCE_JOB_CONTRACT.taskTimeoutSeconds,
+    cpu: MAINTENANCE_JOB_CONTRACT.cpu,
+    memory: MAINTENANCE_JOB_CONTRACT.memory,
+    env: Object.freeze([...MAINTENANCE_JOB_CONTRACT.configurationEnv, ...MAINTENANCE_JOB_CONTRACT.provenanceEnv]),
+    secrets: MAINTENANCE_JOB_CONTRACT.secrets,
   }),
 });
 
@@ -1048,6 +1139,9 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
   if (jobs["production-migrate"].maxConnections < PRODUCTION_MIGRATION_JOB.pools.primary) {
     fail("JOB_POOL_MAX_UNDERDECLARED:production-migrate");
   }
+  if (jobs.maintenance.maxConnections < MAINTENANCE_JOB_CONTRACT.poolMax) {
+    fail("JOB_POOL_MAX_UNDERDECLARED:maintenance");
+  }
 
   if (!isRecord(input.scheduler)
       || Object.keys(input.scheduler).sort().join() !== [...SCHEDULED_JOB_NAMES].sort().join()) {
@@ -1059,6 +1153,11 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
     const schedule = input.scheduler[job].schedule;
     // No default cadence: null means not yet decided (D3), and nothing is created.
     if (schedule !== null && !validCron(schedule)) fail(`SCHEDULER_CADENCE_INVALID:${job}`);
+    // A cadence the job's own contract fixes is not the desired state's to
+    // choose, and is never "not yet decided" (null).
+    if (Object.hasOwn(PINNED_SCHEDULER_CADENCES, job) && schedule !== PINNED_SCHEDULER_CADENCES[job]) {
+      fail(`SCHEDULER_CADENCE_MISMATCH:${job}`);
+    }
     const state = input.scheduler[job].state;
     if (!SCHEDULER_TRIGGER_STATES.includes(state)) fail(`DESIRED_STATE_VALUE_INVALID:scheduler.${job}.state`);
     // A trigger with no cadence has never been resumed (OPS-3 resumes only a
@@ -1454,28 +1553,85 @@ export function renderEdgeIamPolicy(desired, { templateText } = {}) {
 // ---------------------------------------------------------------------------
 // Rendering: jobs, scheduler, Cloud SQL, conditional bucket grant.
 
-/** One job's env as name/value pairs, in definition order. */
+/**
+ * The JSON text of the quarantine bucket's birth proof the maintenance job's
+ * configuration parses (OD-2): the service template's own closed four-key
+ * record for GCS_BUCKET_NAME. An unborn bucket has no proof to render.
+ */
+function bucketProofJson(desired) {
+  if (desired.bucket.proof === null) fail("JOB_RENDER_BUCKET_PROOF_UNPINNED");
+  return JSON.stringify({
+    bucket: desired.bucket.name,
+    bucketGeneration: desired.bucket.proof.bucketGeneration,
+    bucketMetageneration: desired.bucket.proof.bucketMetageneration,
+    softDeleteRetentionDurationSeconds: "0",
+  });
+}
+
+/**
+ * Why a job cannot be rendered for this environment, or null: the job does not
+ * exist there (JOB_ENVIRONMENT_UNAVAILABLE), or it reads the telemetry storage
+ * namespace and the desired state has not assigned it yet (it must equal the
+ * namespace the imported data carries, as for the service).
+ */
+export function jobRenderBlocker(desired, job) {
+  if (!JOB_NAMES.includes(job)) fail("JOB_NAME_UNKNOWN");
+  const unavailable = JOB_ENVIRONMENT_UNAVAILABLE[job];
+  if (unavailable !== undefined && Object.hasOwn(unavailable, desired.environment)) {
+    return unavailable[desired.environment];
+  }
+  if (JOB_DEFINITIONS[job].env.includes("TELEMETRY_STORAGE_NAMESPACE")
+      && desired.service.telemetryStorageNamespace === null) {
+    return "TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED";
+  }
+  return null;
+}
+
+/** One job's plain env as name/value pairs, in definition order. */
 function jobEnv(desired, job, sourceCommit) {
+  // Thunks: a value is computed only for a job that names it, so one that
+  // cannot be computed (an unpinned proof) never blocks another job's render.
   const values = {
-    ANALYTICS_REFRESH_TARGET: desired.environment,
-    ANALYTICS_V2_MEMORY_BUDGET_MIB: String(ANALYTICS_REFRESH_TASK_PROFILE.memoryBudgetMiB),
-    MIGRATION_ENVIRONMENT: desired.environment,
-    GOOGLE_CLOUD_PROJECT: desired.project,
-    PRODUCTION_MIGRATOR_SERVICE_ACCOUNT: desired.serviceAccounts.migrator.email,
+    ANALYTICS_REFRESH_TARGET: () => desired.environment,
+    ANALYTICS_V2_MEMORY_BUDGET_MIB: () => String(ANALYTICS_REFRESH_TASK_PROFILE.memoryBudgetMiB),
+    MIGRATION_ENVIRONMENT: () => desired.environment,
+    GOOGLE_CLOUD_PROJECT: () => desired.project,
+    PRODUCTION_MIGRATOR_SERVICE_ACCOUNT: () => desired.serviceAccounts.migrator.email,
     // The environment's configured primary: the migration job's target is
     // that instance itself (a scratch rehearsal instance is never rendered).
-    ENVIRONMENT_PRIMARY_INSTANCE_CONNECTION_NAME: desired.cloudSql.connectionName,
-    PRIMARY_INSTANCE_CONNECTION_NAME: desired.cloudSql.connectionName,
-    PRIMARY_DATABASE: desired.cloudSql.database,
-    PRIMARY_SCHEMA: desired.cloudSql.schema,
-    POSTGRES_IAM_USER: desired.cloudSql.runtimeIamUser,
-    POSTGRES_MIGRATOR_IAM_USER: desired.cloudSql.migratorIamUser,
-    POSTGRES_RUNTIME_IAM_USER: desired.cloudSql.runtimeIamUser,
-    DEPLOYMENT_SOURCE_COMMIT: sourceCommit,
+    ENVIRONMENT_PRIMARY_INSTANCE_CONNECTION_NAME: () => desired.cloudSql.connectionName,
+    PRIMARY_INSTANCE_CONNECTION_NAME: () => desired.cloudSql.connectionName,
+    PRIMARY_DATABASE: () => desired.cloudSql.database,
+    PRIMARY_SCHEMA: () => desired.cloudSql.schema,
+    POSTGRES_IAM_USER: () => desired.cloudSql.runtimeIamUser,
+    POSTGRES_MIGRATOR_IAM_USER: () => desired.cloudSql.migratorIamUser,
+    POSTGRES_RUNTIME_IAM_USER: () => desired.cloudSql.runtimeIamUser,
+    DEPLOYMENT_SOURCE_COMMIT: () => sourceCommit,
+    TELEMETRY_STORAGE_NAMESPACE: () => desired.service.telemetryStorageNamespace,
+    GCS_BUCKET_NAME: () => desired.bucket.name,
+    GCS_QUARANTINE_BUCKET_HISTORY_PROOF: () => bucketProofJson(desired),
+    POSTGRES_SCHEDULED_MAINTENANCE_ENABLED: () => "enabled",
   };
   return JOB_DEFINITIONS[job].env.map((name) => {
     if (!Object.hasOwn(values, name)) fail(`JOB_RENDER_ENV_UNRESOLVED:${name}`);
-    return { name, value: values[name] };
+    return { name, value: values[name]() };
+  });
+}
+
+/**
+ * One job's secret env: each secret by Secret Manager reference at its pinned
+ * version, as the service renders them. A required secret with no pinned
+ * version cannot be rendered; an optional one is omitted.
+ */
+function jobSecretEnv(desired, job) {
+  return (JOB_DEFINITIONS[job].secrets ?? []).flatMap((name) => {
+    const secret = desired.secrets[name];
+    if (secret === undefined) fail(`JOB_RENDER_SECRET_UNKNOWN:${name}`);
+    if (secret.version === null) {
+      if (secret.required) fail(`SECRET_VERSION_UNPINNED:${name}`);
+      return [];
+    }
+    return [{ name, valueFrom: { secretKeyRef: { name: secret.secretName, key: secret.version } } }];
   });
 }
 
@@ -1484,6 +1640,8 @@ export function renderJob(desired, job, { imageDigest, sourceCommit }) {
   if (!JOB_NAMES.includes(job)) fail("JOB_NAME_UNKNOWN");
   if (typeof imageDigest !== "string" || !IMAGE_DIGEST.test(imageDigest)) fail("JOB_RENDER_IMAGE_INVALID");
   if (typeof sourceCommit !== "string" || !SOURCE_COMMIT.test(sourceCommit)) fail("JOB_RENDER_SOURCE_COMMIT_INVALID");
+  const blocker = jobRenderBlocker(desired, job);
+  if (blocker !== null) fail(blocker);
   const definition = JOB_DEFINITIONS[job];
   return deepFreeze({
     apiVersion: "run.googleapis.com/v1",
@@ -1507,7 +1665,7 @@ export function renderJob(desired, job, { imageDigest, sourceCommit }) {
                 image: `${desired.artifactRegistry.imageRepository}@sha256:${imageDigest}`,
                 command: ["node"],
                 args: [...definition.args],
-                env: jobEnv(desired, job, sourceCommit),
+                env: [...jobEnv(desired, job, sourceCommit), ...jobSecretEnv(desired, job)],
                 resources: { limits: { cpu: definition.cpu, memory: definition.memory } },
               }],
             },
@@ -1674,9 +1832,14 @@ export function requireEnvironment(desired, environment) {
   return desired;
 }
 
-/** The Cloud Run Jobs OPS-2 deploys: JOB_NAMES less the deferred ones. */
-export function deployedJobNames() {
-  return Object.freeze(JOB_NAMES.filter((job) => !Object.hasOwn(DEFERRED_JOBS, job)));
+/**
+ * The Cloud Run Jobs OPS-2 deploys: JOB_NAMES less the deferred ones and, for
+ * a desired state, the jobs its environment cannot have
+ * (JOB_ENVIRONMENT_UNAVAILABLE).
+ */
+export function deployedJobNames(desired = null) {
+  return Object.freeze(JOB_NAMES.filter((job) => !Object.hasOwn(DEFERRED_JOBS, job)
+    && (desired === null || JOB_ENVIRONMENT_UNAVAILABLE[job]?.[desired.environment] === undefined)));
 }
 
 /** The keys of OPS-10's closed RolloutTarget (scripts/gcp-production-rollout.mjs). */
@@ -1705,7 +1868,7 @@ export function rolloutTargetFromDesiredState(desired) {
     region: desired.region,
     service: desired.service.name,
     migrationJob: desired.jobs["production-migrate"].name,
-    jobNames: deployedJobNames().map((job) => desired.jobs[job].name),
+    jobNames: deployedJobNames(desired).map((job) => desired.jobs[job].name),
     primaryInstance: desired.cloudSql.instance,
     imageRepository: desired.artifactRegistry.imageRepository,
     builderServiceAccount: desired.serviceAccounts.builder.email,

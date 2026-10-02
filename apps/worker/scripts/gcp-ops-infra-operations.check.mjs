@@ -40,6 +40,7 @@ const APPLY_PROJECT = "example-ops-prod1";
 const UNDEFERRED = Object.freeze({ jobDeferrals: Object.freeze({}) });
 const CADENCE = (value) => { value.scheduler["analytics-refresh"].schedule = "15 3 * * *"; };
 const TRIGGER = "synthetic-analytics-refresh-trigger";
+const MAINTENANCE_TRIGGER = "synthetic-maintenance-trigger";
 
 function desiredState({ synthetic = true, mutate = () => {} } = {}) {
   let value = structuredClone(FIXTURE);
@@ -84,6 +85,10 @@ function convergedWorld(desired, options = {}) {
 
 function trigger(world) {
   return world.schedulerJobs.find((job) => job.name.endsWith(`/${TRIGGER}`));
+}
+
+function maintenanceTrigger(world) {
+  return world.schedulerJobs.find((job) => job.name.endsWith(`/${MAINTENANCE_TRIGGER}`));
 }
 
 function kinds(calls) {
@@ -191,7 +196,8 @@ test("the plan for the synthetic fixture holds the whole estate and no bucket ch
   assert.equal(result.synthetic, true);
   assert.deepEqual(result.blockers, []);
   assert.deepEqual(result.findings, []);
-  assert.deepEqual(result.summary, { executable: 35, deferred: 1, refused: 0 });
+  // The fixture's three jobs and the maintenance trigger (created, paused, then granted) add four.
+  assert.deepEqual(result.summary, { executable: 39, deferred: 1, refused: 0 });
   const byId = new Map(result.operations.map((entry) => [entry.id, entry]));
   // The operator's token-creator grant on the verifier account alone.
   assert.deepEqual(byId.get("verifier-iam:bind:roles/iam.serviceAccountTokenCreator|group:synthetic-operators@example.com|")
@@ -225,10 +231,26 @@ test("the plan for the synthetic fixture holds the whole estate and no bucket ch
     `${desired.artifactRegistry.imageRepository}@sha256:${BOOTSTRAP.imageDigest}`);
   assert.deepEqual(ops(result, (entry) => entry.id.startsWith("run-service-iam:bind:")).map((entry) => entry.argv.at(-1)),
     ["--role=roles/run.invoker", "--role=roles/run.invoker"]);
-  // Exactly the two fast-path jobs, both created; only the trigger waits,
-  // for the owner's cadence.
+  // Exactly the three fast-path jobs, all created; only the refresh trigger
+  // waits, for the owner's cadence. The maintenance trigger has its own: every minute.
   assert.deepEqual(ops(result, (entry) => entry.id.startsWith("run-job:")).map((entry) => entry.id),
-    ["run-job:create:production-migrate", "run-job:create:analytics-refresh"]);
+    ["run-job:create:production-migrate", "run-job:create:analytics-refresh", "run-job:create:maintenance"]);
+  const maintenance = JSON.parse(byId.get("run-job:create:maintenance").file.content);
+  assert.deepEqual(maintenance.spec.template.spec.template.spec.containers[0].args,
+    ["dist/postgres-maintenance-job.mjs", "--profile=maintenance-job"]);
+  assert.deepEqual(maintenance.spec.template.spec.template.spec.containers[0].env
+    .filter((entry) => entry.valueFrom !== undefined).map((entry) => [entry.name, entry.valueFrom.secretKeyRef]),
+  [["IDENTITY_LINK_SECRET", { name: "IDENTITY_LINK_SECRET", key: "1" }]]);
+  assert.equal(maintenance.spec.template.spec.template.spec.serviceAccountName, desired.serviceAccounts.runtime.email);
+  assert.deepEqual(byId.get("scheduler:create:maintenance").argv, ["scheduler", "jobs", "create", "http",
+    "synthetic-maintenance-trigger", ...manifest.schedulerFlags(desired, "maintenance")]);
+  assert.ok(byId.get("scheduler:create:maintenance").argv.includes("--schedule=* * * * *"));
+  assert.equal(byId.get("scheduler:create:maintenance").deferred, undefined);
+  assert.deepEqual(byId.get("scheduler:pause:maintenance").argv, ["scheduler", "jobs", "pause",
+    "synthetic-maintenance-trigger", "--project=synthetic-ops-project", "--location=us-east1"]);
+  assert.deepEqual(byId.get(`run-job-iam:maintenance:bind:roles/run.jobsExecutor|${desired.serviceAccounts.scheduler.member}|`).argv,
+    ["run", "jobs", "add-iam-policy-binding", "synthetic-maintenance", "--project=synthetic-ops-project",
+      "--region=us-east1", `--member=${desired.serviceAccounts.scheduler.member}`, "--role=roles/run.jobsExecutor"]);
   const refresh = JSON.parse(byId.get("run-job:create:analytics-refresh").file.content);
   assert.deepEqual(refresh.spec.template.spec.template.spec.containers[0].args,
     ["--max-old-space-size=12288", "dist/analytics-refresh.mjs", "--mode=full"]);
@@ -378,7 +400,7 @@ test("apply runs only the authorized plan, mutating only after its reads, and co
   const world = bornWorld(desired);
   const gcloud = fake(desired, world);
   const result = plan(desired, gcloud.runner, { bootstrap: BOOTSTRAP, ...UNDEFERRED });
-  assert.deepEqual(result.summary, { executable: 37, deferred: 0, refused: 0 });
+  assert.deepEqual(result.summary, { executable: 41, deferred: 0, refused: 0 });
   gcloud.calls.length = 0;
   const receipt = operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: result.planDigest,
     bootstrap: BOOTSTRAP, createSpecWriter: () => gcloud.writer.create(), ...UNDEFERRED });
@@ -391,10 +413,12 @@ test("apply runs only the authorized plan, mutating only after its reads, and co
   const firstMutation = sequence.indexOf("mutate");
   const lastMutation = sequence.lastIndexOf("mutate");
   assert.ok(firstMutation > 0 && sequence.slice(0, firstMutation).every((kind) => kind === "read"));
-  assert.equal(sequence.filter((kind) => kind === "mutate").length, 37);
+  assert.equal(sequence.filter((kind) => kind === "mutate").length, 41);
   assert.ok(sequence.slice(lastMutation + 1).every((kind) => kind === "read"));
-  // The trigger was created and then paused; apply never resumes it.
+  // Both triggers were created and then paused; apply never resumes either.
   assert.equal(trigger(world).state, "PAUSED");
+  assert.equal(maintenanceTrigger(world).state, "PAUSED");
+  assert.equal(maintenanceTrigger(world).schedule, "* * * * *");
   assert.equal(gcloud.calls.some((argv) => argv.includes("resume")), false);
   // A second apply of the now-empty plan changes nothing.
   gcloud.calls.length = 0;
@@ -411,16 +435,20 @@ test("by default the analytics-refresh job deploys, and its trigger is created a
   const world = bornWorld(desired);
   const gcloud = fake(desired, world);
   const result = plan(desired, gcloud.runner, { bootstrap: BOOTSTRAP });
-  assert.deepEqual(result.summary, { executable: 37, deferred: 0, refused: 0 });
-  // Create, then pause at once, then (only then) the scheduler's run.jobsExecutor.
+  assert.deepEqual(result.summary, { executable: 41, deferred: 0, refused: 0 });
+  // Create, then pause at once, then (only then) the scheduler's run.jobsExecutor, for each trigger in turn.
   const executor = `run-job-iam:analytics-refresh:bind:roles/run.jobsExecutor|${desired.serviceAccounts.scheduler.member}|`;
-  assert.deepEqual(result.operations.slice(-3).map((entry) => entry.id),
-    ["scheduler:create:analytics-refresh", "scheduler:pause:analytics-refresh", executor]);
+  const maintenanceExecutor = `run-job-iam:maintenance:bind:roles/run.jobsExecutor|${desired.serviceAccounts.scheduler.member}|`;
+  assert.deepEqual(result.operations.slice(-6).map((entry) => entry.id), [
+    "scheduler:create:analytics-refresh", "scheduler:pause:analytics-refresh", executor,
+    "scheduler:create:maintenance", "scheduler:pause:maintenance", maintenanceExecutor]);
   const receipt = operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: result.planDigest,
     bootstrap: BOOTSTRAP, createSpecWriter: () => gcloud.writer.create() });
   assert.deepEqual({ ...receipt.remaining, planDigest: null }, { planDigest: null, executable: 0, deferred: 0, refused: 0 });
-  assert.deepEqual(world.jobs.map((job) => job.metadata.name), ["synthetic-production-migrate", "synthetic-analytics-refresh"]);
+  assert.deepEqual(world.jobs.map((job) => job.metadata.name),
+    ["synthetic-production-migrate", "synthetic-analytics-refresh", "synthetic-maintenance"]);
   assert.equal(trigger(world).state, "PAUSED");
+  assert.equal(maintenanceTrigger(world).state, "PAUSED");
   const after = plan(desired, gcloud.runner);
   assert.deepEqual({ ...operations.infrastructureCleanliness(after) }, { clean: true, reasons: [] });
   // Nothing left to create: a bootstrap image would be unused, so it is refused.
@@ -454,11 +482,16 @@ test("a trigger whose pause failed after its create is paused by the next plan, 
   const readback = operations.readbackInfrastructure(desired, { runner: gcloud.runner });
   assert.deepEqual(readback.findings, ["SCHEDULER_TRIGGER_ENABLED:analytics-refresh"]);
   const replan = operations.planInfrastructure(desired, readback, UNDEFERRED);
+  // The maintenance job was created before the scheduler section failed; its own trigger was never reached.
   assert.deepEqual(replan.operations.map((entry) => [entry.id, entry.action, entry.argv.slice(0, 4).join(" ")]),
     [["scheduler:pause:analytics-refresh", "update", `scheduler jobs pause ${TRIGGER}`],
       [`run-job-iam:analytics-refresh:bind:roles/run.jobsExecutor|${desired.serviceAccounts.scheduler.member}|`, "bind",
-        "run jobs add-iam-policy-binding synthetic-analytics-refresh"]]);
-  assert.deepEqual(replan.summary, { executable: 2, deferred: 0, refused: 0 });
+        "run jobs add-iam-policy-binding synthetic-analytics-refresh"],
+      ["scheduler:create:maintenance", "create", "scheduler jobs create http"],
+      ["scheduler:pause:maintenance", "update", `scheduler jobs pause ${MAINTENANCE_TRIGGER}`],
+      [`run-job-iam:maintenance:bind:roles/run.jobsExecutor|${desired.serviceAccounts.scheduler.member}|`, "bind",
+        "run jobs add-iam-policy-binding synthetic-maintenance"]]);
+  assert.deepEqual(replan.summary, { executable: 5, deferred: 0, refused: 0 });
   assert.equal(operations.infrastructureCleanliness(replan).clean, false);
   operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: replan.planDigest,
     createSpecWriter: () => gcloud.writer.create(), ...UNDEFERRED });
@@ -567,8 +600,9 @@ test("OPS-10's clean verdict needs no finding, blocker, executable, refused or u
   const unpinned = desiredState({ synthetic: false, mutate: (value) => { value.bucket.proof = null; } });
   assert.deepEqual([...operations.infrastructureCleanliness(plan(unpinned, fake(unpinned, world).runner)).reasons],
     ["FINDING:BUCKET_PROOF_UNPINNED", "BLOCKER:BUCKET_PROOF_UNPINNED",
-      // OD-2: the service renders the pinned proof, so it defers without one.
-      "DEFERRED:run-service:update:BUCKET_PROOF_UNPINNED"]);
+      // OD-2: the service and the maintenance job render the pinned proof, so each defers without one.
+      "DEFERRED:run-service:update:BUCKET_PROOF_UNPINNED",
+      "DEFERRED:run-job:update:maintenance:BUCKET_PROOF_UNPINNED"]);
 });
 
 test("apply never changes a live image or source commit, and refuses an unneeded bootstrap image", () => {
@@ -613,10 +647,12 @@ test("apply never changes a live image or source commit, and refuses an unneeded
 test("first creates wait for a bootstrap image and the owner's pinned, enabled secret versions", () => {
   const desired = desiredState({ synthetic: false });
   const noImage = plan(desired, fake(desired, bornWorld(desired)).runner);
-  // The service, its two invoker binds and both jobs wait for an image; the
-  // trigger for its cadence, and the scheduler's grant for its job.
+  // The service, its two invoker binds and the three jobs wait for an image; the
+  // refresh trigger for its cadence, and the scheduler's grant for each scheduled job
+  // (the maintenance trigger itself is created, paused, with no image to wait for).
   assert.deepEqual(noImage.operations.filter((entry) => entry.deferred !== undefined).map((entry) => entry.deferred),
-    [...Array(5).fill("BOOTSTRAP_IMAGE_REQUIRED"), "SCHEDULER_CADENCE_UNSET", "BOOTSTRAP_IMAGE_REQUIRED"]);
+    [...Array(6).fill("BOOTSTRAP_IMAGE_REQUIRED"), "SCHEDULER_CADENCE_UNSET", "BOOTSTRAP_IMAGE_REQUIRED",
+      "BOOTSTRAP_IMAGE_REQUIRED"]);
   assert.equal(operations.infrastructureCleanliness(noImage).clean, false);
   const noValues = plan(desired, fake(desired, bornWorld(desired, { secrets: false })).runner, { bootstrap: BOOTSTRAP });
   assert.equal(noValues.operations.find((entry) => entry.id === "run-service:create").deferred,
@@ -711,6 +747,8 @@ test("the module issues gcloud only as an argv array, with no shell and no delet
 
 const EXECUTOR = (desired) => `run-job-iam:analytics-refresh:bind:roles/run.jobsExecutor|${
   desired.serviceAccounts.scheduler.member}|`;
+const MAINTENANCE_EXECUTOR = (desired) => `run-job-iam:maintenance:bind:roles/run.jobsExecutor|${
+  desired.serviceAccounts.scheduler.member}|`;
 
 test("a trigger is never left unpaused at creation, even when its desired state is ENABLED", () => {
   // A desired ENABLED trigger that does not exist yet is still created and
@@ -722,11 +760,13 @@ test("a trigger is never left unpaused at creation, even when its desired state 
   const world = bornWorld(enabled);
   const gcloud = fake(enabled, world);
   const first = plan(enabled, gcloud.runner, { bootstrap: BOOTSTRAP });
-  assert.deepEqual(first.operations.slice(-3).map((entry) => entry.id),
-    ["scheduler:create:analytics-refresh", "scheduler:pause:analytics-refresh", EXECUTOR(enabled)]);
+  assert.deepEqual(first.operations.slice(-6).map((entry) => entry.id), [
+    "scheduler:create:analytics-refresh", "scheduler:pause:analytics-refresh", EXECUTOR(enabled),
+    "scheduler:create:maintenance", "scheduler:pause:maintenance", MAINTENANCE_EXECUTOR(enabled)]);
   operations.applyInfrastructure(enabled, { runner: gcloud.runner, authorize: first.planDigest, bootstrap: BOOTSTRAP,
     createSpecWriter: () => gcloud.writer.create() });
   assert.equal(trigger(world).state, "PAUSED");
+  assert.equal(maintenanceTrigger(world).state, "PAUSED");
   assert.equal(gcloud.calls.some((argv) => argv.includes("resume")), false);
   assert.deepEqual(plan(enabled, gcloud.runner).operations.map((entry) => [entry.id, entry.deferred]),
     [["scheduler:resume:analytics-refresh", "SCHEDULER_TRIGGER_RESUME_PENDING"]]);
@@ -828,7 +868,9 @@ function sharedStaging(value) {
   value.service.name = "synthetic-staging-origin";
   value.jobs["production-migrate"].name = "synthetic-staging-migrate";
   value.jobs["analytics-refresh"].name = "synthetic-staging-refresh";
+  value.jobs.maintenance.name = "synthetic-staging-maintenance";
   value.scheduler["analytics-refresh"].name = "synthetic-staging-trigger";
+  value.scheduler.maintenance.name = "synthetic-staging-maintenance-trigger";
   for (const [name, secret] of Object.entries(value.secrets)) {
     secret.secretName = `tibotattle-staging-${name.toLowerCase().replaceAll("_", "-")}`;
   }
@@ -860,7 +902,14 @@ test("a shared project's co-tenants and project-wide settings are never read int
     "DEFERRED:run-service:create:STAGING_SERVICE_TEMPLATE_UNAVAILABLE",
     `DEFERRED:run-service-iam:bind:roles/run.invoker|${shared.serviceAccounts.edgeInvoker.member}|:STAGING_SERVICE_TEMPLATE_UNAVAILABLE`,
     `DEFERRED:run-service-iam:bind:roles/run.invoker|${shared.serviceAccounts.verifier.member}|:STAGING_SERVICE_TEMPLATE_UNAVAILABLE`,
+    // The maintenance job, its trigger and the scheduler's grant wait for the same staging values (never created, never clean).
+    "DEFERRED:run-job:create:maintenance:STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE",
+    "DEFERRED:scheduler:create:maintenance:STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE",
+    `DEFERRED:run-job-iam:maintenance:bind:roles/run.jobsExecutor|${shared.serviceAccounts.scheduler.member}|:STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE`,
   ]);
+  assert.deepEqual(world.jobs.filter((job) => /staging/u.test(job.metadata.name)).map((job) => job.metadata.name),
+    ["synthetic-staging-migrate", "synthetic-staging-refresh"], "no staging maintenance job exists");
+  assert.equal(world.schedulerJobs.some((job) => job.name.endsWith("synthetic-staging-maintenance-trigger")), false);
   for (const [key, value] of Object.entries(before)) {
     const now = key === "auditConfigs" ? world.projectPolicy.auditConfigs
       : key === "sqlInstances" || key === "services" || key === "jobs" || key === "schedulerJobs"
@@ -900,13 +949,201 @@ test("the committed staging desired state plans only its own new resources in th
     assert.ok(named.some((arg) => /staging/u.test(arg)) || entry.id === "custom-role:create", entry.id);
   }
   const deferrals = new Set(ops(result, (entry) => entry.deferred !== undefined).map((entry) => entry.deferred));
-  assert.deepEqual([...deferrals].sort(), ["SCHEDULER_CADENCE_UNSET", "STAGING_SERVICE_TEMPLATE_UNAVAILABLE",
-    "VERIFIER_TOKEN_CREATOR_UNASSIGNED"]);
+  assert.deepEqual([...deferrals].sort(), ["SCHEDULER_CADENCE_UNSET", "STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE",
+    "STAGING_SERVICE_TEMPLATE_UNAVAILABLE", "VERIFIER_TOKEN_CREATOR_UNASSIGNED"]);
+  // The staging maintenance job, its trigger and the scheduler's grant are deferred, never created.
+  assert.deepEqual(ops(result, (entry) => /maintenance/u.test(entry.id)).map((entry) => [entry.id, entry.deferred]), [
+    ["run-job:create:maintenance", "STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE"],
+    ["scheduler:create:maintenance", "STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE"],
+    [`run-job-iam:maintenance:bind:roles/run.jobsExecutor|${desired.serviceAccounts.scheduler.member}|`,
+      "STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE"],
+  ]);
   assert.ok(ops(result, (entry) => entry.id === "secret:create:IDENTITY_LINK_SECRET")[0].argv
     .includes("tibotattle-staging-identity-link-secret"));
   // Apply refuses it until the bucket is born and its proof is committed.
   assert.throws(() => operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: result.planDigest,
     bootstrap: BOOTSTRAP }), { code: "APPLY_BUCKET_PROOF_UNPINNED" });
+});
+
+// ---------------------------------------------------------------------------
+// D-OPS4: the maintenance job and its every-minute trigger
+
+test("the maintenance job is created from the contract, its trigger is created paused at the pinned cadence, and apply converges without a resume", () => {
+  const desired = desiredState({ synthetic: false });
+  const world = bornWorld(desired);
+  const gcloud = fake(desired, world);
+  const result = plan(desired, gcloud.runner, { bootstrap: BOOTSTRAP });
+  const ids = result.operations.map((entry) => entry.id);
+  const at = (id) => ids.indexOf(id);
+  const executor = MAINTENANCE_EXECUTOR(desired);
+  // The job exists before its trigger, the trigger is paused at once, and only then may the scheduler run the job.
+  assert.ok(at("run-job:create:maintenance") >= 0);
+  assert.ok(at("run-job:create:maintenance") < at("scheduler:create:maintenance"));
+  assert.equal(at("scheduler:pause:maintenance"), at("scheduler:create:maintenance") + 1);
+  assert.ok(at(executor) > at("scheduler:pause:maintenance"));
+  assert.ok(ops(result, (entry) => /maintenance/u.test(entry.id)).every((entry) => entry.deferred === undefined));
+  const created = ops(result, (entry) => entry.id === "scheduler:create:maintenance")[0].argv;
+  assert.ok(created.includes("--schedule=* * * * *"));
+  assert.ok(created.includes("--max-retry-attempts=0"));
+  assert.ok(created.includes("--time-zone=Etc/UTC"));
+  assert.ok(created.includes(`--uri=https://run.googleapis.com/v2/projects/${desired.project}/locations/us-east1/jobs/synthetic-maintenance:run`));
+  operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: result.planDigest, bootstrap: BOOTSTRAP,
+    createSpecWriter: () => gcloud.writer.create() });
+  const live = world.jobs.find((job) => job.metadata.name === "synthetic-maintenance");
+  assert.deepEqual(live.spec.template.spec.template.spec.containers[0].args,
+    ["dist/postgres-maintenance-job.mjs", "--profile=maintenance-job"]);
+  assert.equal(live.spec.template.spec.template.spec.serviceAccountName, desired.serviceAccounts.runtime.email);
+  assert.equal(maintenanceTrigger(world).state, "PAUSED");
+  assert.equal(maintenanceTrigger(world).schedule, "* * * * *");
+  assert.equal(gcloud.calls.some((argv) => argv.includes("resume")), false);
+  assert.equal(JSON.stringify(world.jobPolicies["synthetic-maintenance"]).includes(desired.serviceAccounts.scheduler.member), true);
+  // Converged: nothing left, clean for OPS-10 (the paused trigger is committed PAUSED).
+  const after = plan(desired, gcloud.runner);
+  assert.deepEqual([after.findings, after.operations.filter((entry) => entry.deferred === undefined)], [[], []]);
+  assert.equal(operations.infrastructureCleanliness(after).clean, true);
+  // The committed ENABLED state waits for OPS-3's resume and stays clean, like the refresh trigger's.
+  const resumed = desiredState({ synthetic: false, mutate: (value) => { value.scheduler.maintenance.state = "ENABLED"; } });
+  const waiting = plan(resumed, fake(resumed, world).runner);
+  assert.deepEqual(waiting.operations.map((entry) => [entry.id, entry.deferred]),
+    [["scheduler:create:analytics-refresh", "SCHEDULER_CADENCE_UNSET"], ["scheduler:resume:maintenance", "SCHEDULER_TRIGGER_RESUME_PENDING"]]);
+  assert.equal(operations.infrastructureCleanliness(waiting).clean, true);
+  maintenanceTrigger(world).state = "ENABLED";
+  assert.deepEqual(plan(resumed, fake(resumed, world).runner).operations.map((entry) => entry.id), ["scheduler:create:analytics-refresh"]);
+});
+
+test("a maintenance trigger whose pause failed is paused by the next plan, and could not have started the job meanwhile", () => {
+  const desired = desiredState({ synthetic: false });
+  const world = bornWorld(desired);
+  const failing = fake(desired, world, { failWhen: (argv) => argv.slice(0, 3).join(" ") === "scheduler jobs pause"
+    && argv.includes(MAINTENANCE_TRIGGER) });
+  const first = plan(desired, failing.runner, { bootstrap: BOOTSTRAP });
+  assert.throws(() => operations.applyInfrastructure(desired, { runner: failing.runner, authorize: first.planDigest,
+    bootstrap: BOOTSTRAP, createSpecWriter: () => failing.writer.create() }),
+  (error) => error.code === "APPLY_OPERATION_FAILED" && error.operation === "scheduler:pause:maintenance");
+  // Created ENABLED by Cloud Scheduler; the grant that would let it run the job was never made.
+  assert.equal(maintenanceTrigger(world).state, "ENABLED");
+  assert.equal(JSON.stringify(world.jobPolicies["synthetic-maintenance"] ?? {}).includes("roles/run.jobsExecutor"), false);
+  const gcloud = fake(desired, world);
+  const readback = operations.readbackInfrastructure(desired, { runner: gcloud.runner });
+  assert.deepEqual(readback.findings, ["SCHEDULER_TRIGGER_ENABLED:maintenance"]);
+  const replan = operations.planInfrastructure(desired, readback);
+  assert.deepEqual(replan.operations.filter((entry) => entry.deferred === undefined).map((entry) => entry.id),
+    ["scheduler:pause:maintenance", MAINTENANCE_EXECUTOR(desired)]);
+  assert.equal(operations.infrastructureCleanliness(replan).clean, false);
+  operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: replan.planDigest,
+    createSpecWriter: () => gcloud.writer.create() });
+  assert.equal(maintenanceTrigger(world).state, "PAUSED");
+  const settled = plan(desired, gcloud.runner);
+  assert.deepEqual([settled.findings, settled.operations.filter((entry) => entry.deferred === undefined)], [[], []]);
+});
+
+test("the maintenance job and its trigger wait for what only the desired state and the estate can supply", () => {
+  const fixtureProject = (mutate) => desiredState({ synthetic: false, mutate });
+  const waitingFor = (result) => ops(result, (entry) => /maintenance/u.test(entry.id)).map((entry) => [entry.id, entry.deferred]);
+  const trigger3 = (desired, reason) => [
+    ["run-job:create:maintenance", reason],
+    ["scheduler:create:maintenance", reason],
+    [MAINTENANCE_EXECUTOR(desired), reason],
+  ];
+  for (const [mutate, reason] of [
+    [(value) => { value.secrets.IDENTITY_LINK_SECRET.version = null; }, "SECRET_VERSION_UNPINNED:IDENTITY_LINK_SECRET"],
+    [(value) => { value.service.telemetryStorageNamespace = null; }, "TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED"],
+  ]) {
+    const desired = fixtureProject(mutate);
+    const result = plan(desired, fake(desired, bornWorld(desired)).runner, { bootstrap: BOOTSTRAP });
+    // The job, its trigger and its grant wait for the same input: no trigger is made for a job that does not exist.
+    assert.deepEqual(waitingFor(result), trigger3(desired, reason), reason);
+    // Every other job still renders and is created.
+    assert.deepEqual(ops(result, (entry) => entry.id.startsWith("run-job:")).map((entry) => [entry.id, entry.deferred]),
+      [["run-job:create:production-migrate", undefined], ["run-job:create:analytics-refresh", undefined],
+        ["run-job:create:maintenance", reason]]);
+    assert.ok(operations.infrastructureCleanliness(result).reasons.includes(`DEFERRED:run-job:create:maintenance:${reason}`));
+    assert.equal(ops(result, (entry) => entry.id === "scheduler:pause:maintenance").length, 0);
+  }
+  // A pinned version the estate does not hold (disabled, or never added) defers it too.
+  const desired = fixtureProject(() => {});
+  const disabled = bornWorld(desired);
+  disabled.secretVersions.IDENTITY_LINK_SECRET[0].state = "DISABLED";
+  const result = plan(desired, fake(desired, disabled).runner, { bootstrap: BOOTSTRAP });
+  assert.deepEqual(waitingFor(result), trigger3(desired, "SECRET_VERSION_UNAVAILABLE:IDENTITY_LINK_SECRET"));
+  // An unborn bucket proof: the plan blocks and the job waits, like the service.
+  const unpinned = fixtureProject((value) => { value.bucket.proof = null; });
+  const blocked = plan(unpinned, fake(unpinned, bornWorld(unpinned)).runner, { bootstrap: BOOTSTRAP });
+  assert.deepEqual(blocked.blockers, ["BUCKET_PROOF_UNPINNED"]);
+  assert.deepEqual(waitingFor(blocked), trigger3(unpinned, "BUCKET_PROOF_UNPINNED"));
+  // A live job whose secret later becomes unavailable is kept as it is: the update is deferred, never a delete or a recreate.
+  const live = convergedWorld(desired);
+  live.secretVersions.IDENTITY_LINK_SECRET[0].state = "DISABLED";
+  const later = plan(desired, fake(desired, live).runner);
+  assert.deepEqual(later.operations.filter((entry) => /maintenance/u.test(entry.id)).map((entry) => [entry.id, entry.deferred]),
+    [["run-job:update:maintenance", "SECRET_VERSION_UNAVAILABLE:IDENTITY_LINK_SECRET"]]);
+  assert.equal(later.operations.some((entry) => entry.action === "delete" || entry.action === "destructive"), false);
+  assert.equal(operations.infrastructureCleanliness(later).clean, false);
+  // The other two jobs never read these inputs, so they are never deferred by them.
+  for (const job of ["production-migrate", "analytics-refresh"]) {
+    assert.equal(ops(result, (entry) => entry.id === `run-job:create:${job}`)[0].deferred, undefined, job);
+  }
+});
+
+test("a drifted maintenance job or trigger is set back, apply keeps the live image and commit, and a running trigger is paused", () => {
+  const desired = desiredState({ synthetic: false });
+  const world = convergedWorld(desired, UNDEFERRED);
+  const liveJob = () => world.jobs.find((job) => job.metadata.name === "synthetic-maintenance");
+  assert.ok(liveJob().spec.template.spec.template.spec.containers[0].image.endsWith(LIVE_IMAGE.imageDigest));
+  liveJob().spec.template.spec.template.spec.timeoutSeconds = "900";
+  maintenanceTrigger(world).schedule = "*/5 * * * *";
+  const gcloud = fake(desired, world);
+  const result = plan(desired, gcloud.runner, UNDEFERRED);
+  // (The refresh trigger still waits for the owner's cadence, a deferral that is not drift.)
+  const executable = result.operations.filter((entry) => entry.deferred === undefined);
+  assert.deepEqual(executable.map((entry) => entry.id), ["run-job:update:maintenance", "scheduler:update:maintenance"]);
+  const update = JSON.parse(executable[0].file.content);
+  const container = update.spec.template.spec.template.spec.containers[0];
+  assert.equal(update.spec.template.spec.template.spec.timeoutSeconds, "300");
+  assert.equal(container.image, `${desired.artifactRegistry.imageRepository}@sha256:${LIVE_IMAGE.imageDigest}`);
+  assert.equal(container.env.find((entry) => entry.name === "DEPLOYMENT_SOURCE_COMMIT").value, LIVE_IMAGE.sourceCommit);
+  assert.ok(executable[1].argv.includes("--schedule=* * * * *"));
+  operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: result.planDigest,
+    createSpecWriter: () => gcloud.writer.create(), ...UNDEFERRED });
+  assert.equal(maintenanceTrigger(world).schedule, "* * * * *");
+  assert.equal(plan(desired, gcloud.runner, UNDEFERRED).summary.executable, 0);
+  // A drifted env value (the proof of another bucket) is set back too; a different secret version likewise.
+  const env = liveJob().spec.template.spec.template.spec.containers[0].env;
+  env.find((entry) => entry.name === "GCS_BUCKET_NAME").value = "synthetic-other-bucket";
+  env.find((entry) => entry.name === "IDENTITY_LINK_SECRET").valueFrom.secretKeyRef.key = "7";
+  assert.deepEqual(plan(desired, fake(desired, world).runner, UNDEFERRED).operations
+    .filter((entry) => entry.deferred === undefined).map((entry) => entry.id), ["run-job:update:maintenance"]);
+  // A trigger left running while PAUSED is committed is a finding, and the next plan pauses it.
+  const dedicated = convergedWorld(desired, UNDEFERRED);
+  maintenanceTrigger(dedicated).state = "ENABLED";
+  const readback = operations.readbackInfrastructure(desired, { runner: fake(desired, dedicated).runner });
+  assert.deepEqual(readback.findings, ["SCHEDULER_TRIGGER_ENABLED:maintenance"]);
+  assert.deepEqual(operations.planInfrastructure(desired, readback, UNDEFERRED).operations
+    .filter((entry) => entry.deferred === undefined).map((entry) => entry.id), ["scheduler:pause:maintenance"]);
+  // A live state the model does not know blocks, naming the job.
+  maintenanceTrigger(dedicated).state = "DISABLED";
+  const blocked = operations.planInfrastructure(desired, operations.readbackInfrastructure(desired, { runner: fake(desired, dedicated).runner }), UNDEFERRED);
+  assert.deepEqual(blocked.blockers, ["SCHEDULER_TRIGGER_STATE_UNRECOGNIZED:maintenance"]);
+});
+
+test("the maintenance trigger is never created ahead of its job, resumed by apply or left without its pause", () => {
+  // A trigger with the cadence the contract pins is created paused; the executor grant follows the pause.
+  const desired = desiredState({ synthetic: false });
+  const first = plan(desired, fake(desired, bornWorld(desired)).runner, { bootstrap: BOOTSTRAP });
+  const sequence = first.operations.filter((entry) => /maintenance/u.test(entry.id)).map((entry) => entry.id);
+  assert.deepEqual(sequence, ["run-job:create:maintenance", "scheduler:create:maintenance", "scheduler:pause:maintenance",
+    MAINTENANCE_EXECUTOR(desired)]);
+  // The invariant refuses the maintenance trigger's create without its pause, as for the refresh trigger.
+  const create = { id: "scheduler:create:maintenance", action: "create", argv: [] };
+  const pause = { id: "scheduler:pause:maintenance", action: "update", argv: [] };
+  const bind = { id: MAINTENANCE_EXECUTOR(desired), action: "bind", argv: [] };
+  for (const bad of [[create], [create, { id: "logging-bucket:update", action: "update", argv: [] }, pause],
+    [bind, create, pause], [create, { ...pause, deferred: "X" }]]) {
+    assert.throws(() => operations.assertTriggersCreatedPaused(bad), { code: "SCHEDULER_CREATE_NOT_PAUSED" });
+  }
+  assert.equal(operations.assertTriggersCreatedPaused([create, pause, bind]).length, 3);
+  // No mutating command shape resumes anything (OPS-3 owns that), whichever trigger.
+  assert.equal(operations.MUTATING_COMMANDS.some((shape) => /resume/u.test(shape)), false);
 });
 
 test("secrets are read, created and granted by their Secret Manager ids", () => {
@@ -981,9 +1218,22 @@ test("the scheduler probe raises the paused-too-long signal only for a resumed t
     schema: "tibotattle-gcp-ops-infra-scheduler-probe-v1", environment: "production", project: APPLY_PROJECT,
     checkedAt: "2026-10-02T12:00:00.000Z", thresholdHours: 6,
     triggers: [{ job: "analytics-refresh", name: TRIGGER, desiredState: "ENABLED", liveState: "PAUSED", quietMinutes: 660,
-      verdict: "paused_too_long", alert: true }],
+      verdict: "paused_too_long", alert: true },
+    { job: "maintenance", name: MAINTENANCE_TRIGGER, desiredState: "PAUSED", liveState: "PAUSED", quietMinutes: null,
+      verdict: "paused_as_desired", alert: false }],
     alert: true, signal: "SCHEDULER_TRIGGER_PAUSED_TOO_LONG",
   });
+  // The maintenance trigger is probed like any other: committed ENABLED, left paused past the threshold, it alerts.
+  const maintenanceResumed = desiredState({ synthetic: false, mutate: (value) => { value.scheduler.maintenance.state = "ENABLED"; } });
+  const maintenanceWorld = convergedWorld(maintenanceResumed);
+  maintenanceTrigger(maintenanceWorld).userUpdateTime = "2026-10-02T01:00:00Z";
+  const quiet = operations.probeScheduler(maintenanceResumed, { runner: fake(maintenanceResumed, maintenanceWorld).runner, now: () => nowMs });
+  assert.deepEqual(quiet.triggers.map((entry) => [entry.job, entry.verdict, entry.alert]),
+    [["analytics-refresh", "absent_not_created", false], ["maintenance", "paused_too_long", true]]);
+  assert.equal(quiet.signal, "SCHEDULER_TRIGGER_PAUSED_TOO_LONG");
+  maintenanceTrigger(maintenanceWorld).state = "ENABLED";
+  assert.equal(operations.probeScheduler(maintenanceResumed, { runner: fake(maintenanceResumed, maintenanceWorld).runner,
+    now: () => nowMs }).alert, false);
   trigger(world).state = "ENABLED";
   const running = operations.probeScheduler(resumed, { runner: fake(resumed, world).runner, now: () => nowMs });
   assert.deepEqual([running.alert, running.signal, running.triggers[0].verdict], [false, null, "running"]);

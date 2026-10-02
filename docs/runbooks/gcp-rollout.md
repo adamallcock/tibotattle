@@ -164,8 +164,9 @@ and print the argv; they run no `gcloud` and make no request.
      `MIGRATION_IN_PROGRESS` while a migration runs. If `migrate` runs long
      enough to push the last pass past 2 hours before `roll`, the pass must run
      again before `roll` and extends the outage window. The maintenance job is
-     `built` (C-MAINT) but is not in the rollout target (D-OPS4), so how the pass
-     is started by hand is an open item.
+     `built` (C-MAINT) and is in the production rollout target and desired state
+     (D-OPS4), so `roll` moves its image with the other jobs. The tooling does not
+     execute a job, so how the pass is started by hand is still an open item.
 
    Record the paused list and the time in UTC. If the pause outlasts the
    scheduler probe's 6 hour threshold for a trigger whose committed state is
@@ -274,8 +275,9 @@ The first production rollout pre-stages the origin (checklist PROD-3):
    maintenance pass, and the verifier path inside `roll` requires `/api/ready`
    to read `ready`. A pass therefore has to complete after `migrate` and before
    `roll`: it cannot run between the roll and its check, because that check is
-   part of `roll`. How that first pass is started before any maintenance job
-   exists in the rollout target is the open first-roll item (D-CRB, D-OPS4).
+   part of `roll`. The maintenance job is now in the production rollout target
+   (D-OPS4), but nothing starts a pass between `migrate` and `roll`: that is the
+   open first-roll item (D-CRB).
    Until it is decided, expect the first roll's served-commit check to fail
    `EDGE_ORIGIN_VERIFIER_NOT_READY` after the service and jobs have moved.
 
@@ -287,9 +289,9 @@ The first production rollout pre-stages the origin (checklist PROD-3):
 | Live edge capture writer | `not built`. The roll consumes the file; nothing writes it |
 | Pre-migration backup count | The code takes two (`PRE_MIGRATION_BACKUPS`); the owner decided one plus point-in-time recovery. The change and its tests are `not built` (backup-count item) |
 | Pre-migration backup expiry | The code labels them to expire in 30 days. The privacy disclosure drafted for the cutover says pre-change backups are kept at most 90 days. Reconcile before either is published |
-| First-roll ready path | `not built` (D-CRB, D-OPS4): a pass must complete between `migrate` and `roll`, and nothing starts one yet |
+| First-roll ready path | `not built` (D-CRB): a pass must complete between `migrate` and `roll`, and nothing starts one yet. The maintenance job it would run is now in the desired state (D-OPS4) |
 | Contract-blob check on every origin deploy | The roll checks it only while the edge is in gcp mode. The all-modes check is `not built` (D-BLOB) |
-| Maintenance job in the rollout target | `not built` (D-OPS4). The manifest's jobs are the migration job and the refresh job |
+| Maintenance job in the rollout target | `built` (D-OPS4). The production target's jobs are the migration job, the refresh job and the maintenance job, and the staging target omits the maintenance job until its staging template exists. Not applied or rolled in any project |
 | First live readback of the OPS-2 estate | Open (OPS2-READ) |
 | Staging load test with a migrate and roll under load | Open (OPS-11) |
 
