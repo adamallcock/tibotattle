@@ -34,6 +34,18 @@
  *   read is temporarily unavailable; every error is production's envelope
  *   with `no-store`.
  *
+ * Interim frozen public read (OD-10, interim-public-read.ts). With no
+ * published day anywhere in analytics_v2_published_daily and one frozen
+ * Cloudflare export loaded in community_daily_frozen_export, the route serves
+ * that export, validated again on every read and projected onto the requested
+ * range, with its evidence date in response headers (the body stays inside the
+ * closed contract). The first published day, of any date, ends it for good:
+ * published days are never deleted, and the check shares the snapshot that
+ * reads the requested days. With neither a publication nor a frozen export
+ * the route answers exactly as above, and a frozen export that fails its
+ * digest or the contract is 503, never an empty answer. A schema without the
+ * frozen table (before its migration) is the same as no export.
+ *
  * Not ported, and why: the PUBLIC_ANALYTICS environment switch (mounting this
  * module is the GCP switch; the edge answers it), the public read limiter's
  * binding (injected by the composition root as assertPublicReadAllowed: the
@@ -78,6 +90,13 @@ import {
   type AnalyticsV2CacheWindowRows,
 } from "./cache-windows-sql";
 import { ANALYTICS_V2_SINGLETON_ID, ANALYTICS_V2_TABLES, type OriginRouteModule } from "./contract";
+import {
+  INTERIM_PUBLIC_READ_ROW_ID,
+  INTERIM_PUBLIC_READ_TABLE,
+  interimPublicReadHeaders,
+  projectInterimPublicRead,
+  verifyInterimPublicReadRow,
+} from "./interim-public-read";
 
 export const ANALYTICS_V2_COMMUNITY_DAILY_PATH = "/api/v1/community/daily" as const;
 export const ANALYTICS_V2_COMMUNITY_DAILY_SCHEMA_VERSION = "community-daily-read-v1.0" as const;
@@ -149,6 +168,11 @@ interface StoredRead {
   readonly previewText: string | null | undefined;
   /** The cache windows, or null when their read failed. */
   readonly cacheWindows: readonly AnalyticsV2CacheWindowRows[] | null;
+  /**
+   * The frozen export's stored row, only when no day is published anywhere
+   * and the export exists; null in every other state.
+   */
+  readonly interim: unknown;
 }
 
 interface PublishedDay {
@@ -211,6 +235,46 @@ function dailySql(schema: string): string {
  ORDER BY p.day::date`;
 }
 
+// One statement, one snapshot: whether any day has ever been published (the
+// whole table, not the requested range) and whether the frozen table exists.
+// to_regclass answers NULL for a missing relation, so a schema that predates
+// the frozen table never raises inside the snapshot.
+function interimStateSql(schema: string): string {
+  return `SELECT EXISTS (SELECT 1 FROM ${table(schema, ANALYTICS_V2_TABLES.publishedDaily)}) AS published,
+       to_regclass($1) IS NOT NULL AS frozen_table`;
+}
+
+function interimRowSql(schema: string): string {
+  return `SELECT f.payload_text::text AS payload_text,
+       f.payload_sha256::text AS payload_sha256,
+       to_char(f.captured_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS captured_at,
+       f.source_commit::text AS source_commit,
+       to_char(f.evidence_date, 'YYYY-MM-DD') AS evidence_date
+  FROM ${table(schema, INTERIM_PUBLIC_READ_TABLE)} f
+ WHERE f.id = ${INTERIM_PUBLIC_READ_ROW_ID}`;
+}
+
+/**
+ * The frozen export's row when it is the answer: nothing has been published
+ * and the export exists. Any malformed result is a failure of the whole read
+ * (503), never "no export": an unreadable frozen row must not turn into an
+ * empty public answer.
+ */
+async function readInterim(client: PostgresClient, schema: string): Promise<unknown> {
+  const state = await client.query<{ published: unknown; frozen_table: unknown }>(
+    interimStateSql(schema),
+    [`${quotePostgresIdentifier(schema)}.${quotePostgresIdentifier(INTERIM_PUBLIC_READ_TABLE)}`],
+  );
+  const row = state?.rows?.length === 1 ? state.rows[0] : undefined;
+  if (row === undefined || typeof row.published !== "boolean" || typeof row.frozen_table !== "boolean") {
+    storageUnavailable();
+  }
+  if (row.published || !row.frozen_table) return null;
+  const frozen = await client.query<Record<string, unknown>>(interimRowSql(schema));
+  if (!Array.isArray(frozen?.rows) || frozen.rows.length > 1) storageUnavailable();
+  return frozen.rows[0] ?? null;
+}
+
 function previewSql(schema: string): string {
   return `SELECT v.preview::text AS preview_text
   FROM ${table(schema, ANALYTICS_V2_TABLES.preview)} v
@@ -251,6 +315,13 @@ async function readStored(
   return withPostgresRead(pool, async (client) => {
     const daily = await client.query<StoredDailyRow>(dailySql(schema), [from, to]);
     if (!Array.isArray(daily?.rows)) storageUnavailable();
+    // A day in range proves a publication exists; otherwise ask the whole table.
+    const interim = daily.rows.length === 0 ? await readInterim(client, schema) : null;
+    if (interim !== null) {
+      // The frozen answer is the export alone: this line's own preview and
+      // cache bands are not mixed into it.
+      return { rows: daily.rows, previewText: null, cacheWindows: null, interim };
+    }
     const preview = await optionalRead(client, "analytics_v2_preview_read", async () => {
       const result = await client.query<{ preview_text: unknown }>(previewSql(schema));
       if (!Array.isArray(result?.rows) || result.rows.length > 1) throw new Error("preview shape");
@@ -264,6 +335,7 @@ async function readStored(
       rows: daily.rows,
       previewText: preview,
       cacheWindows: cacheWindows ?? null,
+      interim: null,
     };
   }, {
     operation: "analytics_v2.community_daily.read",
@@ -425,6 +497,26 @@ export function createAnalyticsV2CommunityDailyRoute(
     now = clock;
   }
 
+  /**
+   * The frozen export for the requested range, labelled in headers. A row that
+   * fails its digest or the contract is storage corruption: 503, as for a
+   * corrupt published row.
+   */
+  async function serveInterim(row: unknown, from: string, to: string): Promise<Response> {
+    let verified: Awaited<ReturnType<typeof verifyInterimPublicReadRow>>;
+    try {
+      verified = await verifyInterimPublicReadRow(row);
+    } catch {
+      return storageUnavailable();
+    }
+    const body = projectInterimPublicRead(verified.frozen, from, to);
+    return jsonResponse(body, 200, {
+      ...interimPublicReadHeaders(verified.record),
+      "cache-control": verified.frozen.allowanceReadState === "temporarily_unavailable"
+        ? "no-store" : ANALYTICS_V2_COMMUNITY_DAILY_PUBLIC_CACHE_CONTROL,
+    });
+  }
+
   async function serve(request: Request): Promise<Response> {
     if (request.method !== "GET") {
       throw new ApiError(405, "METHOD_NOT_ALLOWED", { responseHeaders: { allow: "GET" } });
@@ -452,6 +544,7 @@ export function createAnalyticsV2CommunityDailyRoute(
     } catch {
       storageUnavailable();
     }
+    if (read.interim !== null) return await serveInterim(read.interim, from, to);
     if (read.rows.length > ANALYTICS_V2_COMMUNITY_DAILY_MAX_RANGE_DAYS) storageUnavailable();
     const days: PublishedDay[] = [];
     for (const row of read.rows) days.push(await publishedDay(row, from, to));
