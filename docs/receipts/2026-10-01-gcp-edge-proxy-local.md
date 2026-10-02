@@ -513,9 +513,15 @@ the tooling and nothing by hand:
 | Protected services | `tibotattle-test-app` and `tibotattle-test-oauth-gateway` unchanged |
 
 The write tier passing on a schema that no one granted by hand shows that
-defect 4's fix works when deployed. Defect 3's step was exercised only on an
-existing binding: it read the binding back and reused it, but did not create
-one.
+defect 4's fix works when deployed. The redeploy exercised defect 3's step
+only on an existing binding, so at about 02:58 UTC the orchestrator removed
+the runtime account's conditioned binding from the bucket policy. With the
+owner's approval it then reran only the origin step at `d4ea418d`. The step
+read the policy and added the binding: `add-iam-policy-binding` with the
+`TiboTattleFastpathTelemetry` condition, then a read-back, reported as
+`added: true`. It deployed revision `00011-s5j`. At 03:00 UTC the write tier
+passed all 22 rows again, including the contribution, on the same seeded
+schema.
 
 ### Gates for the commit that adds this section
 
