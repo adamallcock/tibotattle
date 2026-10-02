@@ -344,6 +344,27 @@ test("a failure after the insert releases the reservation and says the bucket no
   });
 });
 
+test("a readback mismatch names the differing snapshot fields, and only their names", async () => {
+  const desired = desiredState();
+  const authorize = birth.bucketBirthAuthorization(desired);
+  await withDirectory(async (directory) => {
+    const receiptPath = join(directory, "receipt.json");
+    for (const [extra, expected] of [
+      [{ metageneration: "2" }, ["bucketMetageneration"]],
+      [{ timeCreated: "2026-10-02T16:48:19.000Z" }, ["timeCreated"]],
+    ]) {
+      const run = harness(desired, { readback: createdBucket(desired, extra) });
+      await assert.rejects(birth.runBucketBirth(desired, { apply: true, authorize, receiptPath, runner: run.runner,
+        fetchImpl: run.fetchImpl }), (error) => error.code === "BUCKET_BIRTH_READBACK_MISMATCH"
+          && error.bucketInserted === true
+          && JSON.stringify(error.differingFields) === JSON.stringify(expected)
+          // names only: no value from either response leaks into the diagnostics
+          && !JSON.stringify(error.differingFields).includes(Object.values(extra)[0]), JSON.stringify(extra));
+      assert.equal(existsSync(receiptPath), false);
+    }
+  });
+});
+
 test("the module never updates, deletes or reads the IAM policy of a bucket", () => {
   const source = readFileSync(join(SCRIPTS_ROOT, "gcp-ops-bucket-birth.mjs"), "utf8");
   const code = source.replace(/\/\*[\s\S]*?\*\//gu, "").replace(/^\s*\/\/.*$/gmu, "");

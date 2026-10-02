@@ -278,6 +278,8 @@ export async function main(argv = process.argv.slice(2), {
     stderr(`${JSON.stringify({ status: "error", code,
       ...(inserted ? { bucketInserted: true, receiptWritten: written, receiptPrinted: printed } : {}),
       ...(written ? { receiptFile: STAGING_BUCKET_BIRTH_RECEIPT_FILE } : {}),
+      // Snapshot field names only (content-free), for a readback mismatch.
+      ...(Array.isArray(error?.differingFields) ? { differingFields: error.differingFields } : {}),
     })}\n`);
     return 1;
   }
