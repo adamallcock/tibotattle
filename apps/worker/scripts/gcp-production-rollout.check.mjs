@@ -27,6 +27,7 @@ import {
 import { applyEdgeModeSnapshotDelta, liveEdgeMode } from "./edge-mode-configuration.mjs";
 import { createProductionLiveConfigSnapshot } from "./production-live-config.mjs";
 import {
+  assertOriginContractBlob,
   assessProductionBuild,
   EDGE_CAPTURE_MAX_AGE_MS,
   imageReference,
@@ -542,13 +543,14 @@ test("a dry run validates and prints argv only: no gcloud, no node, no request, 
     { fetch: () => assert.fail("never") }));
   assert.deepEqual(rollPlan.servedCommitCheck, { path: "origin-verifier", paths: ["/api/health", "/api/ready"] });
   assert.deepEqual(rollPlan.steps.at(-1).argv, ROLLOUT_ARGV.identityToken(TARGET));
-  assert.deepEqual(rollEstate.calls, []);
+  assert.deepEqual(rollEstate.calls, [ROLLOUT_ARGV.gitBlob(COMMIT, CONTRACT_PATH), ROLLOUT_ARGV.gitBlob(EDGE_COMMIT, CONTRACT_PATH)],
+    "the roll dry run runs only the two local contract blob reads (D-BLOB)");
   await writeFile(migratedPaths.edgeLive, capture(gcpLive));
   const gcpPlan = await runRollout(rollArgv(migratedPaths), dependencies(fakeEstate(), fakeLock()));
   assert.deepEqual(gcpPlan.servedCommitCheck, { path: "public-health", url: "https://tibotattle.com/api/health" });
 });
 
-test("migrate: preflight, quiescent jobs, two labelled pre-migration backups, then the job update and execution, under the lock",
+test("migrate: preflight, quiescent jobs, one labelled pre-migration backup, then the job update and execution, under the lock",
   async (t) => {
     const paths = await workspace(t);
     const estate = fakeEstate();
@@ -557,21 +559,22 @@ test("migrate: preflight, quiescent jobs, two labelled pre-migration backups, th
     const calls = estate.calls.map((argv) => argv.join(" "));
     const index = (prefix) => calls.findIndex((call) => call.startsWith(prefix));
     const creates = calls.map((call, position) => [call, position]).filter(([call]) => call.startsWith("gcloud sql backups create"));
-    assert.equal(creates.length, 2, "two pre-migration backups");
+    assert.equal(PRE_MIGRATION_BACKUPS, 1, "one pre-migration backup, with point-in-time recovery");
+    assert.equal(creates.length, PRE_MIGRATION_BACKUPS);
     for (const [call] of creates) {
       assert.match(call, /--description=tibotattle-expires-on=2026-11-01;purpose=pre-migration/u);
       assert.match(call, /--instance=tibotattle-primary /u);
       assert.match(call, /--location=us-east1/u);
     }
     assert.deepEqual(estate.calls.filter((argv) => argv.slice(0, 4).join(" ") === "gcloud sql backups create"),
-      [0, 1].map(() => ROLLOUT_ARGV.backupCreate(TARGET, "tibotattle-expires-on=2026-11-01;purpose=pre-migration")),
+      [ROLLOUT_ARGV.backupCreate(TARGET, "tibotattle-expires-on=2026-11-01;purpose=pre-migration")],
       "the dry-run argv is what createOnDemandBackup issues");
     const schedulerReads = calls.map((call, position) => [call, position])
       .filter(([call]) => call.startsWith("gcloud scheduler jobs list")).map(([, position]) => position);
     assert.equal(schedulerReads.length, 2);
     assert.ok(index("node scripts/gcp-infra.mjs readback --require-clean") < creates[0][1]);
     assert.ok(schedulerReads[0] < creates[0][1], "the jobs are quiescent before the first backup");
-    assert.ok(creates[1][1] < schedulerReads[1] && schedulerReads[1] < index(`gcloud run jobs update ${TARGET.migrationJob}`),
+    assert.ok(creates.at(-1)[1] < schedulerReads[1] && schedulerReads[1] < index(`gcloud run jobs update ${TARGET.migrationJob}`),
       "and again after the backups, right before the DDL");
     assert.ok(index(`gcloud run jobs update ${TARGET.migrationJob}`) < index(`gcloud run jobs execute ${TARGET.migrationJob}`));
     assert.ok(index(`gcloud run jobs execute`) < index("gcloud logging read"));
@@ -579,8 +582,7 @@ test("migrate: preflight, quiescent jobs, two labelled pre-migration backups, th
     assert.deepEqual(lock.records, [{ id: "00000000-0000-4000-8000-000000000001", sourceCommit: COMMIT,
       previousSourceCommit: OTHER_COMMIT }], "the lock records the live service's own commit");
     assert.equal(receipt.schema, ROLLOUT_MIGRATE_RECEIPT_SCHEMA);
-    assert.equal(receipt.backups.length, 2);
-    assert.notEqual(receipt.backups[0].id, receipt.backups[1].id);
+    assert.equal(receipt.backups.length, 1);
     assert.equal(receipt.execution, `${TARGET.migrationJob}-x7k2p`);
     assert.equal(receipt.migrationReceiptDigest, jobReceipt().digest);
     const written = JSON.parse(await readFile(paths.migrateReceipt, "utf8"));
@@ -692,7 +694,9 @@ test("roll refuses without a matching migrate receipt, before any command or loc
     [(value) => ({ ...value, digest: `sha256:${"e".repeat(64)}`, image: `${TARGET.imageRepository}@sha256:${"e".repeat(64)}` }),
       "ROLLOUT_MIGRATE_RECEIPT_INVALID"],
     [(value) => ({ ...value, commit: OTHER_COMMIT }), "ROLLOUT_MIGRATE_RECEIPT_INVALID"],
-    [(value) => ({ ...value, backups: value.backups.slice(0, 1) }), "ROLLOUT_MIGRATE_RECEIPT_INVALID"],
+    [(value) => ({ ...value, backups: [] }), "ROLLOUT_MIGRATE_RECEIPT_INVALID"],
+    [(value) => ({ ...value, backups: [...value.backups, { id: "1700000000000999", expiresOn: "2026-11-01" }] }),
+      "ROLLOUT_MIGRATE_RECEIPT_INVALID"],
   ]) {
     await writeFile(migratedPaths.migrateReceipt, JSON.stringify(edit(receipt)));
     const rollEstate = fakeEstate();
@@ -775,10 +779,10 @@ test("roll moves the service and every manifest job to one digest and commit, re
 test("outside gcp mode the served commit is read through the EP-6 verifier path on the service's own origin", async (t) => {
   for (const [edge, mode] of [[preEdgeLive, "unset"], [workerLive, "worker"], [fencedLive, "fenced"]]) {
     const paths = await migrated(t, { edge });
-    const estate = fakeEstate({ blobs: {} });
+    const estate = fakeEstate();
     const receipt = await runRollout(executeRoll(paths), dependencies(estate, fakeLock()));
     assert.equal(receipt.edge.mode, mode);
-    assert.equal(receipt.edge.contractBlob, null, "the contract does not bind an edge that does not forward");
+    assert.equal(receipt.edge.contractBlob, "a".repeat(40), "D-BLOB binds the origin to the live edge in every mode");
     assert.deepEqual(estate.calls.filter((argv) => argv.includes("print-identity-token")), [ROLLOUT_ARGV.identityToken(TARGET)]);
     assert.deepEqual(estate.requests.map(({ url }) => url), [`${SERVICE_URL}/api/health`, `${SERVICE_URL}/api/ready`]);
     assert.equal(estate.requests[0].init.headers["x-serverless-authorization"], `Bearer ${TOKEN}`);
@@ -797,6 +801,34 @@ test("a staging roll verifies a workers.dev-only gcp edge against staging's own 
   await writeFile(paths.edgeLive, capture(gcpLive));
   await assert.rejects(runRollout(executeRoll(paths, "staging"), dependencies(fakeEstate({ target: STAGING_TARGET }), fakeLock())),
     isCode("ROLLOUT_EDGE_LIVE_TARGET_MISMATCH"));
+});
+
+test("D-BLOB: roll refuses EDGE_CONTRACT_DRIFT in every edge mode, and against a pre-edge Worker with no contract", async (t) => {
+  for (const edge of [preEdgeLive, workerLive, fencedLive, gcpLive]) {
+    const paths = await migrated(t, { edge });
+    for (const blobs of [
+      { [`${COMMIT}:${CONTRACT_PATH}`]: "a".repeat(40), [`${EDGE_COMMIT}:${CONTRACT_PATH}`]: "b".repeat(40) },
+      // A pre-edge Worker's commit carries no contract file.
+      { [`${COMMIT}:${CONTRACT_PATH}`]: "a".repeat(40) },
+      // Nor may a candidate without one deploy against an edge that has one.
+      { [`${EDGE_COMMIT}:${CONTRACT_PATH}`]: "a".repeat(40) },
+      {},
+    ]) {
+      const estate = fakeEstate({ blobs });
+      const lock = fakeLock();
+      await assert.rejects(runRollout(executeRoll(paths), dependencies(estate, lock)), isCode("EDGE_CONTRACT_DRIFT"));
+      assert.equal(estate.calls.every(([command]) => command === "git"), true, "only local blob reads ran");
+      assert.deepEqual(lock.events, []);
+      await assert.rejects(runRollout(rollArgv(paths), dependencies(fakeEstate({ blobs }), fakeLock())),
+        isCode("EDGE_CONTRACT_DRIFT"), "the dry run refuses too");
+    }
+  }
+  assert.throws(() => assertOriginContractBlob({ originCommit: COMMIT, edgeCommit: EDGE_COMMIT, readBlob: () => "x" }),
+    isCode("EDGE_CONTRACT_DRIFT"), "a malformed blob id never matches");
+  assert.throws(() => assertOriginContractBlob({ originCommit: "HEAD", edgeCommit: EDGE_COMMIT, readBlob: () => "a".repeat(40) }),
+    isCode("EDGE_CONTRACT_DRIFT"), "only full commits are compared");
+  assert.equal(assertOriginContractBlob({ originCommit: COMMIT, edgeCommit: EDGE_COMMIT, readBlob: () => "a".repeat(40) }),
+    "a".repeat(40));
 });
 
 test("roll refuses EDGE_CONTRACT_DRIFT against a gcp-mode edge whose contract blob differs, before any command or lock", async (t) => {
@@ -896,7 +928,7 @@ test("roll releases the lock on failure, and a readback or served-commit mismatc
     [{ fail: "print-identity-token" }, "EDGE_ORIGIN_IDENTITY_TOKEN_UNAVAILABLE"],
   ]) {
     const lock = fakeLock();
-    await assert.rejects(runRollout(executeRoll(paths), dependencies(fakeEstate({ blobs: {}, ...estateOptions }), lock)),
+    await assert.rejects(runRollout(executeRoll(paths), dependencies(fakeEstate(estateOptions), lock)),
       isCode(code), code);
     assert.deepEqual(lock.events.filter((event) => event !== "assert"), ["acquire", "release"], code);
   }

@@ -295,8 +295,21 @@ web-only releases pause.
 Every origin deploy must check that
 `git rev-parse <origin commit>:apps/worker/src/edge-origin-contract.ts` equals
 the same blob at the live edge commit, read from the Cloudflare
-`DEPLOYMENT_SOURCE_COMMIT` binding. Refuse the deploy otherwise. The origin
-deploy tooling does not implement this check yet.
+`DEPLOYMENT_SOURCE_COMMIT` binding. Refuse the deploy otherwise.
+
+Both origin deploy tools apply this check (D-BLOB) in every edge mode, before
+any remote command. They read the live edge commit from the owner's fresh
+EP-9 capture (`{schema, capturedAt, snapshot, deployment}`, at most 15
+minutes old):
+
+- OPS-10's `gcp-production-rollout.mjs roll` (`--edge-live`);
+- the fast-path test deploy's `origin` step (`--edge-live` and
+  `--edge-environment`).
+
+Each refuses `EDGE_CONTRACT_DRIFT` when the two blobs differ, or when either
+commit has no contract file. A pre-edge Worker, such as the production
+commit `d43c8f92`, has no contract file. An origin roll therefore refuses
+until the edge port is live in worker mode (PROD-5).
 
 A contract change has no in-place path: brake to fenced, deploy the origin,
 then run the gcp deploy from an edge commit with the same blob.

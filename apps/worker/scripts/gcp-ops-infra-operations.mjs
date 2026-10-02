@@ -77,9 +77,10 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { constants as fsConstants, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { open, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { canonicalJson } from "../src/canonical-json.ts";
 import {
   ARTIFACT_WRITER_ROLE,
@@ -116,6 +117,7 @@ import {
   serviceRenderBlocker,
   sha256Hex,
 } from "./gcp-ops-infra-manifest.mjs";
+import { scheduledRunJob } from "./gcp-scheduler-run-target.mjs";
 
 export const GCP_OPS_INFRA_READBACK_SCHEMA = "tibotattle-gcp-ops-infra-readback-v1";
 export const GCP_OPS_INFRA_PLAN_SCHEMA = "tibotattle-gcp-ops-infra-plan-v1";
@@ -172,6 +174,13 @@ export const MUTATING_COMMANDS = Object.freeze([
   "logging sinks update",
   "logging buckets update",
 ]);
+/**
+ * The one gcloud shape OPS-3's resume-all may issue, and only in "resume"
+ * mode: apply and pause-all never know it (GCLOUD_COMMAND_FORBIDDEN).
+ */
+export const RESUME_COMMANDS = Object.freeze(["scheduler jobs resume"]);
+/** The one mutating shape OPS-3's pause-all may issue ("pause" mode). */
+export const PAUSE_COMMAND = "scheduler jobs pause";
 /** Operation actions apply runs; every other action refuses the plan. */
 export const EXECUTABLE_ACTIONS = Object.freeze(["create", "update", "bind"]);
 export const REFUSED_ACTIONS = Object.freeze(["delete", "destructive", "bucket-update"]);
@@ -207,18 +216,26 @@ function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-/** "read", "mutate" or null for one argv (without the gcloud binary). */
-export function classifyGcloudCommand(argv) {
-  if (!Array.isArray(argv) || argv.some((arg) => typeof arg !== "string")) return null;
+function positionalPath(argv) {
   const positional = [];
   for (const arg of argv) {
     if (arg.startsWith("-")) break;
     positional.push(arg);
   }
-  const path = positional.join(" ");
-  const matches = (shape) => path === shape || path.startsWith(`${shape} `);
-  if (MUTATING_COMMANDS.some(matches)) return "mutate";
-  if (READ_COMMANDS.some(matches)) return "read";
+  return positional.join(" ");
+}
+
+function matchesShape(path, shape) {
+  return path === shape || path.startsWith(`${shape} `);
+}
+
+/** "read", "mutate", "resume" or null for one argv (without the gcloud binary). */
+export function classifyGcloudCommand(argv) {
+  if (!Array.isArray(argv) || argv.some((arg) => typeof arg !== "string")) return null;
+  const path = positionalPath(argv);
+  if (MUTATING_COMMANDS.some((shape) => matchesShape(path, shape))) return "mutate";
+  if (READ_COMMANDS.some((shape) => matchesShape(path, shape))) return "read";
+  if (RESUME_COMMANDS.some((shape) => matchesShape(path, shape))) return "resume";
   return null;
 }
 
@@ -234,16 +251,23 @@ export function defaultGcloudRunner(argv) {
 }
 
 /**
- * Wraps a runner with the command guard. `mode` is "read" or "apply";
- * mutating shapes are refused unless the mode is "apply", and unknown shapes
- * are always refused. Failures never echo gcloud output.
+ * Wraps a runner with the command guard. `mode` is "read", "apply", "pause"
+ * or "resume": mutating shapes are refused unless the mode is "apply", except
+ * that "pause" (OPS-3 pause-all) may issue exactly PAUSE_COMMAND; the resume
+ * shape exists only in "resume" mode (OPS-3 resume-all), which issues nothing
+ * else that mutates. Unknown shapes are always refused. Failures never echo
+ * gcloud output.
  */
 export function guardedGcloud(runner, { mode, project }) {
   if (typeof runner !== "function") fail("GCLOUD_RUNNER_INVALID");
+  if (!["read", "apply", "pause", "resume"].includes(mode)) fail("GCLOUD_GUARD_MODE_INVALID");
   return function call(argv) {
     const kind = classifyGcloudCommand(argv);
-    if (kind === null) fail("GCLOUD_COMMAND_FORBIDDEN");
-    if (kind === "mutate" && mode !== "apply") fail("GCLOUD_MUTATION_UNAUTHORIZED");
+    if (kind === null || (kind === "resume" && mode !== "resume")) fail("GCLOUD_COMMAND_FORBIDDEN");
+    if (kind === "mutate" && !(mode === "apply"
+      || (mode === "pause" && matchesShape(positionalPath(argv), PAUSE_COMMAND)))) {
+      fail("GCLOUD_MUTATION_UNAUTHORIZED");
+    }
     if (argv.filter((arg) => arg === `--project=${project}`).length !== 1
         || argv.some((arg) => arg.startsWith("--project=") && arg !== `--project=${project}`)) {
       fail("GCLOUD_PROJECT_FLAG_INVALID");
@@ -258,7 +282,7 @@ export function guardedGcloud(runner, { mode, project }) {
     if (!isRecord(result) || result.status !== 0 || (result.error !== undefined && result.error !== null)) {
       fail(`GCLOUD_CALL_FAILED:${commandPath(argv)}`);
     }
-    if (kind === "mutate") return null;
+    if (kind === "mutate" || kind === "resume") return null;
     if (typeof result.stdout !== "string") fail(`GCLOUD_OUTPUT_INVALID:${commandPath(argv)}`);
     try {
       return JSON.parse(result.stdout === "" ? "[]" : result.stdout);
@@ -1620,4 +1644,350 @@ export function probeScheduler(desired, { runner = defaultGcloudRunner, now = ()
     alert: results.some((entry) => entry.alert),
     signal: results.some((entry) => entry.verdict === "paused_too_long") ? "SCHEDULER_TRIGGER_PAUSED_TOO_LONG" : null,
   });
+}
+
+// ---------------------------------------------------------------------------
+// OPS-3: pause-all and resume-all (D-OPS3)
+//
+// pause-all pauses every trigger of the plane, so OPS-10's
+// ROLLOUT_JOBS_NOT_PAUSED gate (every Cloud Scheduler trigger in the region
+// that runs a Cloud Run job is PAUSED, classified by
+// gcp-scheduler-run-target.mjs as the rollout classifies it) can be met, and
+// records which triggers it paused in a receipt. resume-all resumes only a
+// managed trigger whose committed state is ENABLED, that is live PAUSED, and
+// that the pause-all receipt names as paused by that run or the operator
+// names with --only (asserting that they paused it): a trigger someone paused
+// on purpose stays paused, and nothing committed PAUSED is ever resumed.
+//
+// The plane: in a dedicated project every trigger of the region; in a shared
+// project (staging in the GCP test project) only the plane's managed triggers
+// and any trigger that runs one of the plane's jobs. A co-tenant trigger is
+// never paused or resumed; one that runs a Cloud Run job and is not PAUSED is
+// a gate reason (the rollout reads it too), reported, never touched.
+//
+// Both are dry runs unless applied with the digest of the plan they print
+// (--authorize); an applied run re-reads the region, re-plans, refuses a
+// different digest or any blocker, then issues only `scheduler jobs pause`
+// (pause-all) or `scheduler jobs resume` (resume-all) through the guard.
+
+export const GCP_OPS_PAUSE_ALL_PLAN_SCHEMA = "tibotattle-gcp-ops-pause-all-plan-v1";
+export const GCP_OPS_PAUSE_ALL_RECEIPT_SCHEMA = "tibotattle-gcp-ops-pause-all-receipt-v1";
+export const GCP_OPS_RESUME_ALL_PLAN_SCHEMA = "tibotattle-gcp-ops-resume-all-plan-v1";
+export const GCP_OPS_RESUME_ALL_RECEIPT_SCHEMA = "tibotattle-gcp-ops-resume-all-receipt-v1";
+/** Why resume-all leaves a trigger as it is (closed). */
+export const RESUME_SKIP_REASONS = Object.freeze([
+  "STATE_UNRECOGNIZED", "COMMITTED_STATE_PAUSED", "TRIGGER_ABSENT", "ALREADY_ENABLED", "NOT_PAUSED_BY_PAUSE_ALL",
+  "NOT_SELECTED",
+]);
+const PAUSE_RECEIPT_KEYS = Object.freeze([
+  "schema", "environment", "project", "region", "planDigest", "status", "pausedAt", "paused", "alreadyPaused",
+  "failed", "triggers", "rolloutGate", "digest",
+]);
+const PAUSE_RECEIPT_MAX_BYTES = 256 * 1024;
+const TRIGGER_NAME = /^[A-Za-z0-9_-]{1,500}$/u;
+
+function sortedNames(names) {
+  return [...names].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+}
+
+/** The region's triggers as content-free views: name, live state and the Cloud Run job each runs. */
+function readTriggers(call, desired) {
+  const entries = array(call(["scheduler", "jobs", "list", `--project=${desired.project}`,
+    `--location=${desired.region}`, "--format=json"]), "scheduler-jobs");
+  return entries.map((entry) => {
+    const name = tail(entry?.name);
+    if (typeof name !== "string" || !TRIGGER_NAME.test(name)) outputInvalid("scheduler-jobs");
+    return Object.freeze({
+      name,
+      state: SCHEDULER_LIVE_STATES.includes(entry.state) ? entry.state : "UNRECOGNIZED",
+      runJob: scheduledRunJob(entry),
+    });
+  }).sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+}
+
+function managedTriggers(desired) {
+  return SCHEDULED_JOB_NAMES.map((job) => ({ job, ...desired.scheduler[job] }));
+}
+
+/** Whether a trigger belongs to the plane (see the section comment). */
+function inPlane(desired, trigger) {
+  if (desired.projectTenancy === "dedicated") return true;
+  return managedTriggers(desired).some(({ name }) => name === trigger.name)
+    || JOB_NAMES.some((job) => desired.jobs[job].name === trigger.runJob);
+}
+
+/**
+ * OPS-10's gate over a set of trigger views: satisfied when every trigger
+ * that runs a Cloud Run job is PAUSED (the rollout's rule, over the same
+ * classifier). Running executions are the rollout's own second condition.
+ */
+export function rolloutTriggerGate(triggers) {
+  const reasons = triggers.filter(({ runJob, state }) => runJob !== null && state !== "PAUSED")
+    .map(({ name }) => `TRIGGER_NOT_PAUSED:${name}`);
+  return deepFreeze({ satisfied: reasons.length === 0, reasons });
+}
+
+function digestOf(body) {
+  return sha256Hex(canonicalJson(body));
+}
+
+/** The pause-all plan for a set of trigger views (pure; the digest covers everything but itself). */
+export function pauseAllPlan(desired, triggers) {
+  const plane = triggers.filter((trigger) => inPlane(desired, trigger));
+  const foreign = triggers.filter((trigger) => !inPlane(desired, trigger));
+  const blockers = plane.filter(({ state }) => !["ENABLED", "PAUSED"].includes(state))
+    .map(({ name }) => `TRIGGER_STATE_UNRECOGNIZED:${name}`);
+  const after = triggers.map((trigger) => (inPlane(desired, trigger) && trigger.state === "ENABLED"
+    ? { ...trigger, state: "PAUSED" } : trigger));
+  const gate = rolloutTriggerGate(after);
+  const body = {
+    schema: GCP_OPS_PAUSE_ALL_PLAN_SCHEMA,
+    environment: desired.environment,
+    project: desired.project,
+    region: desired.region,
+    triggers: plane.map(({ name, state, runJob }) => ({ name, state, runJob,
+      action: state === "ENABLED" ? "pause" : "none" })),
+    // A co-tenant trigger is named only when it keeps the rollout gate shut.
+    foreignBlocking: foreign.filter(({ runJob, state }) => runJob !== null && state !== "PAUSED")
+      .map(({ name, state }) => ({ name, state })),
+    blockers,
+    rolloutGateAfter: gate,
+  };
+  return deepFreeze({ ...body, planDigest: digestOf(body) });
+}
+
+/** Reads the region and plans pause-all; read calls only. */
+export function planPauseAll(desired, { runner = defaultGcloudRunner } = {}) {
+  return pauseAllPlan(desired, readTriggers(guardedGcloud(runner, { mode: "read", project: desired.project }), desired));
+}
+
+/**
+ * Reserve a receipt file before anything changes: created exclusively,
+ * owner-only, never through a symlink. Returns { write(value), release() }.
+ */
+export async function reserveOpsReceipt(path) {
+  if (typeof path !== "string" || !isAbsolute(path)) fail("OPS_RECEIPT_PATH_INVALID");
+  let handle;
+  try {
+    handle = await open(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL
+      | fsConstants.O_NOFOLLOW, 0o600);
+  } catch {
+    fail("OPS_RECEIPT_PATH_UNAVAILABLE");
+  }
+  let settled = false;
+  return Object.freeze({
+    async write(value) {
+      if (settled) fail("OPS_RECEIPT_WRITE_FAILED");
+      settled = true;
+      try {
+        await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+        await handle.sync();
+        await handle.close();
+      } catch {
+        try { await handle.close(); } catch { /* keep the original outcome */ }
+        fail("OPS_RECEIPT_WRITE_FAILED");
+      }
+    },
+    async release() {
+      if (settled) return;
+      settled = true;
+      try { await handle.close(); } catch { /* only this run's own file */ }
+      try { await unlink(path); } catch { /* only this run's own file */ }
+    },
+  });
+}
+
+function applyPreconditions(desired, authorize, code) {
+  if (desired.synthetic) fail(`${code}_SYNTHETIC_TARGET_REFUSED`);
+  if (authorize === undefined || authorize === null) fail(`${code}_AUTHORIZATION_REQUIRED`);
+  if (typeof authorize !== "string" || !DIGEST.test(authorize)) fail(`${code}_AUTHORIZATION_INVALID`);
+}
+
+/**
+ * pause-all, applied: re-read, re-plan, refuse a different digest or any
+ * blocker, reserve the receipt, pause each ENABLED plane trigger in name
+ * order, read back, and write the receipt. The receipt is written whatever
+ * happens after the first pause (status "incomplete" with the trigger that
+ * failed), so resume-all can resume what was paused; a run that ends with
+ * a plane trigger not PAUSED fails PAUSE_ALL_INCOMPLETE after writing it.
+ */
+export async function applyPauseAll(desired, {
+  runner = defaultGcloudRunner,
+  authorize,
+  receiptPath,
+  now = () => Date.now(),
+  reserveReceipt = reserveOpsReceipt,
+} = {}) {
+  applyPreconditions(desired, authorize, "PAUSE_ALL");
+  if (typeof receiptPath !== "string" || !isAbsolute(receiptPath)) fail("PAUSE_ALL_RECEIPT_PATH_REQUIRED");
+  const plan = planPauseAll(desired, { runner });
+  if (plan.planDigest !== authorize) fail("PAUSE_ALL_PLAN_DIGEST_MISMATCH");
+  if (plan.blockers.length > 0) fail("PAUSE_ALL_BLOCKED");
+  const reservation = await reserveReceipt(receiptPath);
+  const call = guardedGcloud(runner, { mode: "pause", project: desired.project });
+  const paused = [];
+  let failed = null;
+  for (const trigger of plan.triggers.filter(({ action }) => action === "pause")) {
+    try {
+      call([...PAUSE_COMMAND.split(" "), trigger.name, `--project=${desired.project}`, `--location=${desired.region}`]);
+      paused.push(trigger.name);
+    } catch {
+      failed = trigger.name;
+      break;
+    }
+  }
+  let after;
+  try {
+    after = readTriggers(guardedGcloud(runner, { mode: "read", project: desired.project }), desired);
+  } catch {
+    after = null;
+  }
+  const planeAfter = after === null ? null : after.filter((trigger) => inPlane(desired, trigger));
+  const complete = failed === null && planeAfter !== null && planeAfter.every(({ state }) => state === "PAUSED");
+  const body = {
+    schema: GCP_OPS_PAUSE_ALL_RECEIPT_SCHEMA,
+    environment: desired.environment,
+    project: desired.project,
+    region: desired.region,
+    planDigest: plan.planDigest,
+    status: complete ? "complete" : "incomplete",
+    pausedAt: new Date(now()).toISOString(),
+    paused: sortedNames(paused),
+    alreadyPaused: sortedNames(plan.triggers.filter(({ state }) => state === "PAUSED").map(({ name }) => name)),
+    failed,
+    triggers: planeAfter === null ? null : planeAfter.map(({ name, state }) => ({ name, state })),
+    rolloutGate: after === null ? null : rolloutTriggerGate(after),
+  };
+  const receipt = deepFreeze({ ...body, digest: digestOf(body) });
+  await reservation.write(receipt);
+  if (!complete) {
+    throw Object.assign(new Error("PAUSE_ALL_INCOMPLETE"), { code: "PAUSE_ALL_INCOMPLETE", receipt });
+  }
+  return receipt;
+}
+
+/** A pause-all receipt for this plane, structurally valid and self-digested. */
+export function verifyPauseAllReceipt(receipt, desired) {
+  const ok = isRecord(receipt) && Object.keys(receipt).length === PAUSE_RECEIPT_KEYS.length
+    && PAUSE_RECEIPT_KEYS.every((key) => Object.hasOwn(receipt, key))
+    && receipt.schema === GCP_OPS_PAUSE_ALL_RECEIPT_SCHEMA
+    && receipt.environment === desired.environment && receipt.project === desired.project
+    && receipt.region === desired.region && DIGEST.test(receipt.planDigest ?? "")
+    && ["complete", "incomplete"].includes(receipt.status)
+    && typeof receipt.pausedAt === "string" && Number.isFinite(Date.parse(receipt.pausedAt))
+    && [receipt.paused, receipt.alreadyPaused].every((names) => Array.isArray(names)
+      && names.every((name) => typeof name === "string" && TRIGGER_NAME.test(name))
+      && new Set(names).size === names.length)
+    && (receipt.failed === null || (typeof receipt.failed === "string" && TRIGGER_NAME.test(receipt.failed)))
+    && receipt.digest === digestOf(Object.fromEntries(PAUSE_RECEIPT_KEYS.filter((key) => key !== "digest")
+      .map((key) => [key, receipt[key]])));
+  if (!ok) fail("PAUSE_ALL_RECEIPT_INVALID");
+  return deepFreeze(structuredClone(receipt));
+}
+
+/**
+ * The resume-all plan (pure). `pauseReceipt` is a verified pause-all receipt
+ * or null; `only` the operator's ordered trigger names or null. One of them
+ * is required. With `only`, exactly those triggers are resumed, in that
+ * order, and each must be eligible (committed ENABLED, live PAUSED or already
+ * ENABLED); without it, the receipt's paused triggers that are eligible, in
+ * name order.
+ */
+export function resumeAllPlan(desired, triggers, { pauseReceipt = null, only = null } = {}) {
+  if (pauseReceipt === null && only === null) fail("RESUME_ALL_SOURCE_REQUIRED");
+  const managed = managedTriggers(desired);
+  if (only !== null && (!Array.isArray(only) || only.length === 0 || new Set(only).size !== only.length
+      || only.some((name) => !managed.some((entry) => entry.name === name)))) {
+    fail("RESUME_ALL_ONLY_INVALID");
+  }
+  const pausedByPauseAll = new Set(pauseReceipt?.paused ?? []);
+  const blockers = [];
+  const decisions = managed.map(({ job, name, state: committed }) => {
+    const live = triggers.find((entry) => entry.name === name) ?? null;
+    const decide = (action, reason = null) => ({ job, name, committedState: committed, liveState: live?.state ?? null,
+      action, ...(reason === null ? {} : { reason }) });
+    if (live !== null && !["ENABLED", "PAUSED"].includes(live.state)) {
+      blockers.push(`TRIGGER_STATE_UNRECOGNIZED:${name}`);
+      return decide("none", "STATE_UNRECOGNIZED");
+    }
+    if (committed !== "ENABLED") return decide("none", "COMMITTED_STATE_PAUSED");
+    if (live === null) return decide("none", "TRIGGER_ABSENT");
+    if (live.state === "ENABLED") return decide("none", "ALREADY_ENABLED");
+    if (only !== null) return only.includes(name) ? decide("resume") : decide("none", "NOT_SELECTED");
+    return pausedByPauseAll.has(name) ? decide("resume") : decide("none", "NOT_PAUSED_BY_PAUSE_ALL");
+  });
+  if (only !== null) {
+    for (const name of only) {
+      const decision = decisions.find((entry) => entry.name === name);
+      if (decision.action !== "resume" && decision.reason !== "ALREADY_ENABLED") {
+        fail("RESUME_ALL_ONLY_INELIGIBLE");
+      }
+    }
+  }
+  const order = only ?? sortedNames(decisions.map(({ name }) => name));
+  const resume = order.filter((name) => decisions.find((entry) => entry.name === name)?.action === "resume");
+  const body = {
+    schema: GCP_OPS_RESUME_ALL_PLAN_SCHEMA,
+    environment: desired.environment,
+    project: desired.project,
+    region: desired.region,
+    source: { pauseReceiptDigest: pauseReceipt?.digest ?? null, only },
+    triggers: decisions,
+    resume,
+    blockers: sortedNames(new Set(blockers)),
+  };
+  return deepFreeze({ ...body, planDigest: digestOf(body) });
+}
+
+/** Reads the region and plans resume-all; read calls only. */
+export function planResumeAll(desired, { runner = defaultGcloudRunner, pauseReceipt = null, only = null } = {}) {
+  const receipt = pauseReceipt === null ? null : verifyPauseAllReceipt(pauseReceipt, desired);
+  const triggers = readTriggers(guardedGcloud(runner, { mode: "read", project: desired.project }), desired);
+  return resumeAllPlan(desired, triggers, { pauseReceipt: receipt, only });
+}
+
+/**
+ * resume-all, applied: re-read, re-plan, refuse a different digest or any
+ * blocker, resume each planned trigger in plan order, read back, and return a
+ * content-free receipt. A failed resume stops the run (RESUME_ALL_OPERATION_FAILED
+ * with the outcomes so far); a trigger not ENABLED afterwards is RESUME_ALL_INCOMPLETE.
+ */
+export function applyResumeAll(desired, {
+  runner = defaultGcloudRunner,
+  authorize,
+  pauseReceipt = null,
+  only = null,
+  now = () => Date.now(),
+} = {}) {
+  applyPreconditions(desired, authorize, "RESUME_ALL");
+  const plan = planResumeAll(desired, { runner, pauseReceipt, only });
+  if (plan.planDigest !== authorize) fail("RESUME_ALL_PLAN_DIGEST_MISMATCH");
+  if (plan.blockers.length > 0) fail("RESUME_ALL_BLOCKED");
+  const call = guardedGcloud(runner, { mode: "resume", project: desired.project });
+  const outcomes = [];
+  for (const name of plan.resume) {
+    try {
+      call([...RESUME_COMMANDS[0].split(" "), name, `--project=${desired.project}`, `--location=${desired.region}`]);
+    } catch {
+      outcomes.push({ name, outcome: "failed" });
+      throw Object.assign(new Error("RESUME_ALL_OPERATION_FAILED"), {
+        code: "RESUME_ALL_OPERATION_FAILED", operation: name, outcomes: deepFreeze([...outcomes]),
+      });
+    }
+    outcomes.push({ name, outcome: "resumed" });
+  }
+  const after = readTriggers(guardedGcloud(runner, { mode: "read", project: desired.project }), desired);
+  if (plan.resume.some((name) => after.find((entry) => entry.name === name)?.state !== "ENABLED")) {
+    fail("RESUME_ALL_INCOMPLETE");
+  }
+  const body = {
+    schema: GCP_OPS_RESUME_ALL_RECEIPT_SCHEMA,
+    environment: desired.environment,
+    project: desired.project,
+    region: desired.region,
+    planDigest: plan.planDigest,
+    resumedAt: new Date(now()).toISOString(),
+    outcomes,
+  };
+  return deepFreeze({ ...body, digest: digestOf(body) });
 }
