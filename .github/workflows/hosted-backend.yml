@@ -185,12 +185,6 @@ jobs:
     name: Cloud Run check
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    # postgres-community-daily-activation.check.mjs runs its real PostgreSQL 17
-    # test only over loopback TCP (it skips otherwise); this is the container's
-    # published 127.0.0.1 port.
-    env:
-      A2_DAILY_ACTIVATION_TEST_HOST: "127.0.0.1"
-      A2_DAILY_ACTIVATION_TEST_PORT: "55432"
     steps:
       - name: Check out the selected revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

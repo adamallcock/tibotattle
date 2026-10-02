@@ -81,17 +81,11 @@ const RESPONSE_HEADER_READS: Readonly<Record<string, readonly string[]>> = Objec
   // The GCP metadata server's identity on its token and project responses
   // (Cloud Run jobs only; never a request the edge forwards).
   "metadata-flavor": [
-    "../cloud-run/postgres-community-daily-activation.mjs",
-    "../cloud-run/postgres-community-daily-publish-test.mjs",
     "../cloud-run/postgres-community-graph-benchmark.mjs",
     "../cloud-run/postgres-community-graph-readback-diagnostic.mjs",
     "../cloud-run/test-activation.mjs",
     "../cloud-run/test-migrations.mjs",
   ],
-  // The live smoke checks the headers community/daily served.
-  "cache-control": ["../cloud-run/postgres-community-daily-live-smoke.mjs"],
-  "referrer-policy": ["../cloud-run/postgres-community-daily-live-smoke.mjs"],
-  "x-content-type-options": ["../cloud-run/postgres-community-daily-live-smoke.mjs"],
   // The edge checks the origin marker on the upstream response; the
   // edge-test origin's isEdgeOriginBoundaryRefusal checks that EP-6's 421
   // Response carries none.

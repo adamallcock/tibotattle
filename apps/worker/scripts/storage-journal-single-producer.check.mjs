@@ -77,10 +77,6 @@ const IDENTIFIER_RELATION = /^\$\{(?:[^`{}]*[(,]\s*)?([A-Za-z_$][\w$]*)\s*\)?\s*
  * that never reach the PostgreSQL journal. The count pins their computed write
  * sites, so a new one needs a fresh review; a literal journal write in these
  * files is still refused.
- *   scripts/postgres-analytics-history-transfer.mjs: insertSql writes only the
- *   three SPECS/ANALYTICS_EVENT_SPEC tables (analytics_owner_state,
- *   analytics_source_cursors, analytics_applied_events); the journal is only
- *   read and required empty.
  *   scripts/gcp-fastpath-rehearsal.mjs: buildJournalSqlite's one prepared
  *   node:sqlite INSERT copies the oracle dump's storage_source_state and
  *   storage_ingestion_changes rows into a new journal-only SQLite file in the
@@ -96,7 +92,6 @@ const IDENTIFIER_RELATION = /^\$\{(?:[^`{}]*[(,]\s*)?([A-Za-z_$][\w$]*)\s*\)?\s*
  *   file; this module never opens PostgreSQL.
  */
 const REVIEWED_DYNAMIC_WRITERS = new Map([
-  ["scripts/postgres-analytics-history-transfer.mjs", 1],
   ["scripts/gcp-fastpath-rehearsal.mjs", 1],
   ["scripts/cutover-source-projections.mjs", 1],
 ]);
@@ -451,7 +446,7 @@ INSERT INTO storage_owner_revisions (source_id) SELECT source_id FROM storage_in
     await write("src/other-insert.ts", "await client.query(`INSERT INTO ${schema}.storage_owner_revisions VALUES ($1)`);\n"
       + "await client.query(`INSERT INTO ${relation(schema, spec.name)} VALUES ($1)`);");
     await write("src/raw.test.ts", "await client.query(`INSERT INTO ${schema}.storage_ingestion_changes VALUES ($1)`);");
-    await write("scripts/postgres-analytics-history-transfer.mjs", "const T = [\"storage_ingestion_changes\"];\n"
+    await write("scripts/cutover-source-projections.mjs", "const T = [\"storage_ingestion_changes\"];\n"
       + "const sql = (schema, spec) => `INSERT INTO ${relation(schema, spec.name)} VALUES ($1)`;");
     // A reviewed later emitter replacement, at any number, keeps the version-0 body.
     const reviewedEmitter = "postgres/staged-migrations/primary/0091_owner_journal_emitter_head_precheck.sql";
@@ -518,14 +513,14 @@ CREATE FUNCTION rogue() RETURNS void AS $$ BEGIN INSERT INTO storage_ingestion_c
     await write("src/analytics-delivery.ts", "db.prepare(`INSERT INTO storage_ingestion_changes (a) VALUES (?)`);\n"
       + "await client.query(`INSERT INTO ${schema}.storage_ingestion_changes (a) VALUES ($1)`);");
     // A new computed write site in a reviewed dynamic writer needs review.
-    await write("scripts/postgres-analytics-history-transfer.mjs", "const T = [\"storage_ingestion_changes\"];\n"
+    await write("scripts/cutover-source-projections.mjs", "const T = [\"storage_ingestion_changes\"];\n"
       + "const sql = (schema, spec) => `INSERT INTO ${relation(schema, spec.name)} VALUES ($1)`;\n"
       + "const more = (schema, name) => `INSERT INTO ${relation(schema, name)} VALUES ($1)`;");
     const dirty = await checkJournalSingleProducer(root);
     const expected = [
       ...Object.keys(producers).filter((path) => path !== "src/names.ts"),
       "postgres/staged-migrations/primary/0046_owner_journal_authority.sql",
-      "scripts/postgres-analytics-history-transfer.mjs",
+      "scripts/cutover-source-projections.mjs",
       "src/analytics-delivery.ts",
     ].sort();
     assert.deepEqual(dirty.violations, expected);

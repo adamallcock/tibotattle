@@ -323,27 +323,15 @@ test("the PostgreSQL 17 suite gets the container's loopback TCP pair, and only t
   assert.match(container, /^export function ciPostgresTcpProfile\(/mu);
 });
 
-test("the Cloud Run check gives the daily-activation integration test the container's loopback TCP port", async () => {
-  // Without these two variables the real PostgreSQL 17 test in
-  // postgres-community-daily-activation.check.mjs skips and the job stays green.
+test("the Cloud Run check sets no PostgreSQL TCP or retired daily-activation variables", async () => {
+  // The A2 daily-activation check, the only Cloud Run test that dialled the
+  // container over loopback TCP, is retired with the legacy GCP daily
+  // publisher (E-RETIRE); the job keeps only the socket profile its steps export.
   const { workflow } = await loadWorkflow();
-  const container = await readFile(join(REPOSITORY_ROOT, CONTAINER_SCRIPT), "utf8");
-  const publish = [...container.matchAll(/^export const LOOPBACK_PUBLISH = "127\.0\.0\.1:(\d+):5432";$/gmu)];
-  assert.equal(publish.length, 1, "the container publishes exactly one loopback TCP port");
-  assert.deepEqual(workflow.jobs["cloud-run-check"].env, {
-    A2_DAILY_ACTIVATION_TEST_HOST: "127.0.0.1",
-    A2_DAILY_ACTIVATION_TEST_PORT: publish[0][1],
-  });
-
-  const cloudRun = "apps/worker/cloud-run";
-  const activation = "postgres-community-daily-activation.check.mjs";
-  const source = await readFile(join(REPOSITORY_ROOT, cloudRun, activation), "utf8");
-  assert.match(source, /process\.env\.A2_DAILY_ACTIVATION_TEST_HOST\b/u);
-  assert.match(source, /process\.env\.A2_DAILY_ACTIVATION_TEST_PORT\b/u);
-  assert.match(source, /REAL_PG_HOST === "127\.0\.0\.1"/u);
-  const packageJson = JSON.parse(await readFile(join(REPOSITORY_ROOT, cloudRun, "package.json"), "utf8"));
-  assert.match(packageJson.scripts.check, new RegExp(`node --test [^&]*\\./${activation.replaceAll(".", "\\.")}`, "u"),
-    "the Cloud Run check runs the daily-activation check under node --test");
+  assert.equal(workflow.jobs["cloud-run-check"].env, undefined);
+  const packageJson = JSON.parse(await readFile(join(REPOSITORY_ROOT, "apps/worker/cloud-run/package.json"), "utf8"));
+  assert.doesNotMatch(packageJson.scripts.check, /postgres-community-daily-/u,
+    "the Cloud Run check runs no retired daily publication job or check");
 });
 
 test("the PostgreSQL image is PostgreSQL 17 pinned by digest", async () => {

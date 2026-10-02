@@ -5,7 +5,6 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import pg from "pg";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
 import { createPostgresTestCommunityDailyDispatch } from "../cloud-run/postgres-test-dispatch.mjs";
-import { readPostgresCommunityDailyTestPreflight } from "../cloud-run/postgres-community-daily-publish-test.mjs";
 import { readPostgresPublishedCommunityDaily } from "../src/postgres-community-daily.ts";
 
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
@@ -154,33 +153,6 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL private community daily HTTP route"
       privateOrigin: "http://127.0.0.1:8080",
     });
   }
-
-  it("read-only publisher preflight blocks disabled controls and an undelivered journal tail", async () => {
-    const config = { schema, sourceId: SOURCE_ID, sourceNamespace: SOURCE_NAMESPACE, day: DAY };
-    const ready = await readPostgresCommunityDailyTestPreflight(pool, config);
-    expect(ready).toMatchObject({ status: "ready", blockers: [] });
-
-    // Primary 0050: 'contained' means all four flags off.
-    await pool.query(`UPDATE ${quotedSchema}.collection_controls SET control_state='contained',
-      enrollment_enabled=false, upload_registration_enabled=false, processing_enabled=false,
-      publication_enabled=false WHERE singleton=1`);
-    const blockedControls = await readPostgresCommunityDailyTestPreflight(pool, config);
-    expect(blockedControls).toMatchObject({
-      status: "blocked",
-      blockers: ["PUBLICATION_CONTROLS_DISABLED"],
-    });
-    await pool.query(`INSERT INTO ${quotedSchema}.storage_ingestion_changes(
-      source_id,sequence,event_digest,owner_digest,owner_revision,authority_epoch,kind,recorded_ms)
-      VALUES ($1,1,repeat('a',64),repeat('b',64),0,0,'source-updated',0)`, [SOURCE_ID]);
-    const blockedCursor = await readPostgresCommunityDailyTestPreflight(pool, config);
-    expect(blockedCursor).toMatchObject({
-      status: "blocked",
-      blockers: ["PUBLICATION_CONTROLS_DISABLED", "ANALYTICS_CURSOR_BEHIND_JOURNAL"],
-    });
-    const persisted = await pool.query(`SELECT control_state,publication_enabled
-      FROM ${quotedSchema}.collection_controls WHERE singleton=1`);
-    expect(persisted.rows[0]).toEqual({ control_state: "contained", publication_enabled: false });
-  });
 
   it("serves an honest empty activity day and omits unavailable allowance diagnostics", async () => {
     await insertRevision(1, "published", 0);

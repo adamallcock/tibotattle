@@ -44,10 +44,6 @@ const RETIRED_SEEDED_SINGLETONS = new Set(["current_queue_state", "preparation_c
  * be referenced.
  */
 export const ALLOWED_MENTIONS = Object.freeze([
-  ["scripts/postgres-analytics-applied-transfer.mjs", "community_model_history_dependencies", "inventory", 1],
-  ["scripts/postgres-analytics-applied-transfer.mjs", "community_model_composition_days", "inventory", 1],
-  ["scripts/postgres-analytics-applied-main-transfer.mjs", "community_model_history_dependencies", "inventory", 1],
-  ["scripts/postgres-analytics-applied-main-transfer.mjs", "community_model_composition_days", "inventory", 1],
   // PT-1 transfer emptiness list: 0057 keeps these seeded singletons, and a
   // fresh transfer target counts them as empty only through SEEDED_SINGLETONS.
   ["scripts/postgres-transfer-target.mjs", "current_queue_state", "inventory", 1],
