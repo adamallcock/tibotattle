@@ -68,7 +68,7 @@ their status changes; current Cloudflare behavior follows the authorities above.
 
 | Area | Document | Status | Boundary |
 |---|---|---|---|
-| GCP fast path | [GCP fast path](./plans/2026-10-01-gcp-fastpath.md) | In progress | Analytics-refresh architecture, redesign register mapping, local synthetic parity rehearsal and sized cutover backlog; no production change |
+| GCP fast path | [GCP fast path](./plans/2026-10-01-gcp-fastpath.md) | In progress | Analytics-refresh architecture, redesign register mapping, local synthetic parity rehearsal, sized cutover backlog and alignment with the OpenAI September 29 release; no production change |
 | GCP edge proxy | [Thin Worker edge proxy](./decisions/2026-10-01-thin-worker-edge-proxy.md) | Proposed; owner sign-off pending | Production Worker as a thin edge (worker, fenced, gcp) in front of an IAM-private Cloud Run origin, from an owner-authorized cutover; current Cloudflare behavior unchanged; no readiness claim |
 
 ## Lifecycle evidence
