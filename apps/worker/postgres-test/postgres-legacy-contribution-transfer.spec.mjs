@@ -12,6 +12,8 @@ import {
   LEGACY_TRIGGER_POLICY,
   LegacyContributionTransferError,
   OWNER_FLAG_ACCEPT_ORPHAN_REGISTRATION_CLEARING,
+  PENDING_OBJECT_TRANSFER_HOLD_GUARD,
+  PENDING_OBJECT_TRANSFER_HOLD_TABLE,
   checkPendingObjectTransferGuard,
   runLegacyContributionsProduction,
   runOperationalHistoryProduction,
@@ -25,6 +27,7 @@ import {
   withTransferTransaction,
 } from "../scripts/postgres-transfer-target.mjs";
 import {
+  POSTGRES_PENDING_OBJECT_TRANSFER_HOLD_RELEASE_LIMIT,
   reconcilePostgresPendingObjects,
   releasePostgresPendingObjectTransferHolds,
 } from "../src/postgres-quarantine-reconciliation.ts";
@@ -252,6 +255,38 @@ function syntheticObjectStore() {
   };
 }
 
+// The reconciler's due-row scan, recognised by its ORDER BY. If that SQL
+// changes, the seam never fires and the test that counts its firings fails.
+const DUE_ROW_SCAN = "ORDER BY pending.registered_at, pending.contribution_id";
+
+/**
+ * A test seam around a pool: after the reconciler's due-row scan returns, and
+ * before any claim transaction starts, `afterScan` runs once on its own
+ * connection (committed). This is the race the claim-time re-check exists for.
+ */
+function afterDueRowScan(pool, afterScan) {
+  const state = { fired: 0 };
+  return {
+    state,
+    async connect() {
+      const client = await pool.connect();
+      return {
+        async query(text, values) {
+          const result = await client.query(text, values);
+          if (state.fired === 0 && typeof text === "string" && text.includes(DUE_ROW_SCAN)) {
+            state.fired += 1;
+            await afterScan();
+          }
+          return result;
+        },
+        release(discard) {
+          return client.release(discard);
+        },
+      };
+    },
+  };
+}
+
 describe.skipIf(!PG_TEST_SOCKET)("D-PT4X legacy contributions, pending registrations and operational history on PostgreSQL 17", () => {
   let world;
   let history;
@@ -278,10 +313,21 @@ describe.skipIf(!PG_TEST_SOCKET)("D-PT4X legacy contributions, pending registrat
     [main, clean, bare] = cluster.targets;
     const exclusions = await migrationBySuffix(EXCLUSIONS_SUFFIX);
     const holds = await migrationBySuffix(HOLDS_SUFFIX);
-    // main and clean carry both staged migrations; bare has no transfer-hold table.
-    for (const [target, files] of [[main, [exclusions, holds]], [clean, [exclusions, holds]], [bare, [exclusions]]]) {
+    // Every target gets both migrations by the same path whether they are
+    // staged (the harness applies them) or promoted (the stock run already
+    // did, and the harness skips them). bare then loses the transfer-hold
+    // table and its guard function explicitly, so it is a target without the
+    // E-PT4 guard in both states.
+    for (const target of [main, clean, bare]) {
       await applyStockAndStagedMigrations({ role: "primary", schema: PRIMARY_SCHEMA, pool: target.ownerPrimary,
-        stagedFiles: files });
+        stagedFiles: [exclusions, holds] });
+    }
+    await bare.ownerPrimary.query(`DROP TABLE ${table(PENDING_OBJECT_TRANSFER_HOLD_TABLE)}`);
+    await bare.ownerPrimary.query(`DROP FUNCTION ${table(PENDING_OBJECT_TRANSFER_HOLD_GUARD)}()`);
+    for (const [target, present] of [[main, true], [clean, true], [bare, false]]) {
+      const relation = await target.ownerPrimary.query("SELECT to_regclass($1) IS NOT NULL AS present",
+        [table(PENDING_OBJECT_TRANSFER_HOLD_TABLE)]);
+      expect(relation.rows[0].present).toBe(present);
     }
   }, 900_000);
 
@@ -580,6 +626,103 @@ describe.skipIf(!PG_TEST_SOCKET)("D-PT4X legacy contributions, pending registrat
     }
   }, 600_000);
 
+  it("PT-7's release is closed: 1 to 1,000 distinct keys and a sha256 receipt digest, otherwise nothing changes", async () => {
+    const pool = main.ownerPrimary;
+    const limit = POSTGRES_PENDING_OBJECT_TRANSFER_HOLD_RELEASE_LIMIT;
+    const holds = [table(PENDING_OBJECT_TRANSFER_HOLD_TABLE)];
+    // Still held (the reconciler case released only the first two), so a call
+    // that slipped through would release it and change its row version.
+    const heldKey = history.pending[2].r2_key;
+    const receipt = sha("synthetic-pt7-closed-contract");
+    const keys = n => Array.from({ length: n }, () => `telemetry/${randomUUID()}`);
+    const before = await xmins(pool, holds);
+    const invalid = {
+      "no keys": { objectKeys: [], releaseReceiptSha256: receipt },
+      [`${limit + 1} keys`]: { objectKeys: [heldKey, ...keys(limit)], releaseReceiptSha256: receipt },
+      "a duplicate key": { objectKeys: [heldKey, heldKey], releaseReceiptSha256: receipt },
+      "an upper-case digest": { objectKeys: [heldKey], releaseReceiptSha256: "A".repeat(64) },
+      "a short digest": { objectKeys: [heldKey], releaseReceiptSha256: "a".repeat(63) },
+      "no digest": { objectKeys: [heldKey], releaseReceiptSha256: null },
+      "keys not an array": { objectKeys: heldKey, releaseReceiptSha256: receipt },
+    };
+    for (const [label, release] of Object.entries(invalid)) {
+      await expect(releasePostgresPendingObjectTransferHolds(pool, { schema: SCHEMAS, ...release }), label)
+        .rejects.toMatchObject({ name: "PostgresStorageError", code: "invalid" });
+    }
+    expect(await xmins(pool, holds)).toEqual(before);
+    // The limit is inclusive: 1,000 keys are accepted (all unknown here) and change nothing.
+    expect(await releasePostgresPendingObjectTransferHolds(pool, { schema: SCHEMAS, objectKeys: keys(limit),
+      releaseReceiptSha256: receipt })).toEqual({ released: 0, alreadyReleased: 0, unknown: limit });
+    expect(await xmins(pool, holds)).toEqual(before);
+    const held = await pool.query(`SELECT released_at IS NULL AS held FROM ${table(PENDING_OBJECT_TRANSFER_HOLD_TABLE)}
+      WHERE object_key = $1`, [heldKey]);
+    expect(held.rows).toEqual([{ held: true }]);
+  }, 600_000);
+
+  it("the claim re-checks the hold under its row lock: a hold written after the due-row scan defers the claim", async () => {
+    const pool = main.ownerPrimary;
+    const nowEpoch = Date.now() + 10 * DAY;
+    const store = syntheticObjectStore();
+    const options = { schema: SCHEMAS, nowEpoch, safetyWindowMilliseconds: HOUR, maximumRegistrations: 50 };
+    const late = { key: `telemetry/${randomUUID()}`, id: `contribution:${randomUUID()}` };
+    await pool.query(`INSERT INTO ${table("pending_objects")} (contribution_id, object_key, object_kind, registered_at)
+      VALUES ($1, $2, 'telemetry', $3)`, [late.id, late.key, new Date(nowEpoch - 3 * HOUR).toISOString()]);
+    const lateRow = async () => (await pool.query(`SELECT reconciliation_state, reconciliation_lease_id
+      FROM ${table("pending_objects")} WHERE object_key = $1`, [late.key])).rows;
+    // The scan sees an unheld, aged orphan; the hold lands before the claim.
+    const seam = afterDueRowScan(pool, () => pool.query(`INSERT INTO ${table(PENDING_OBJECT_TRANSFER_HOLD_TABLE)}
+      (object_key, contribution_id, seal_sha256) VALUES ($1, $2, $3)`, [late.key, late.id, forged.sealId]));
+    const raced = await reconcilePostgresPendingObjects(seam, store, options);
+    expect(seam.state.fired).toBe(1);
+    expect(raced).toMatchObject({ registrationsExamined: 1, candidatesDeferred: 1, deletionGraceStarted: 0,
+      orphanObjectsAlreadyAbsent: 0, orphanObjectsDeleted: 0, hasMore: false });
+    expect(await lateRow()).toEqual([{ reconciliation_state: "registered", reconciliation_lease_id: null }]);
+    expect(store.calls.head).toEqual([]);
+    // The next pass no longer selects it; PT-7's release lets it reconcile.
+    expect(await reconcilePostgresPendingObjects(pool, store, options))
+      .toMatchObject({ registrationsExamined: 0, candidatesDeferred: 0 });
+    expect(await releasePostgresPendingObjectTransferHolds(pool, { schema: SCHEMAS, objectKeys: [late.key],
+      releaseReceiptSha256: sha("synthetic-pt7-late") })).toEqual({ released: 1, alreadyReleased: 0, unknown: 0 });
+    expect(await reconcilePostgresPendingObjects(pool, store, options))
+      .toMatchObject({ registrationsExamined: 1, deletionGraceStarted: 1, candidatesDeferred: 0 });
+    expect((await lateRow())[0].reconciliation_state).toBe("deleting");
+    expect(store.calls.head).toEqual([]);
+  }, 600_000);
+
+  it("P13 and the stage never excuse a present but altered guard, with or without the owner flag", async () => {
+    const handle = handles.clean;
+    const pool = clean.ownerPrimary;
+    const holds = table(PENDING_OBJECT_TRANSFER_HOLD_TABLE);
+    const guard = PENDING_OBJECT_TRANSFER_HOLD_GUARD;
+    const flags = [OWNER_FLAG_ACCEPT_ORPHAN_REGISTRATION_CLEARING];
+    const intact = { check: "P13", guard: "transfer-holds-v1", holdTable: "present" };
+    const recreate = fn => `DROP TRIGGER ${guard} ON ${holds};
+      CREATE TRIGGER ${guard} BEFORE UPDATE OR DELETE ON ${holds} FOR EACH ROW EXECUTE FUNCTION ${table(fn)}()`;
+    const bypass = `${guard}_bypass`;
+    const alterations = {
+      disabled: [`ALTER TABLE ${holds} DISABLE TRIGGER ${guard}`, `ALTER TABLE ${holds} ENABLE TRIGGER ${guard}`],
+      "replica-only": [`ALTER TABLE ${holds} ENABLE REPLICA TRIGGER ${guard}`, `ALTER TABLE ${holds} ENABLE TRIGGER ${guard}`],
+      renamed: [`ALTER TRIGGER ${guard} ON ${holds} RENAME TO ${guard}_renamed`,
+        `ALTER TRIGGER ${guard}_renamed ON ${holds} RENAME TO ${guard}`],
+      "another function": [`CREATE FUNCTION ${table(bypass)}() RETURNS trigger LANGUAGE plpgsql AS $$
+          BEGIN RETURN NEW; END; $$; ${recreate(bypass)}`, `${recreate(guard)}; DROP FUNCTION ${table(bypass)}()`],
+    };
+    expect(await checkPendingObjectTransferGuard(handle)).toEqual(intact);
+    for (const [label, [alter, restore]] of Object.entries(alterations)) {
+      await pool.query(alter);
+      for (const ownerFlags of [[], flags]) {
+        await expect(checkPendingObjectTransferGuard(handle, { ownerFlags }), `${label} ${ownerFlags.length}`)
+          .rejects.toSatisfy(isCode("CUTOVER_PENDING_OBJECT_GUARD_MISSING"));
+      }
+      await expect(runPendingRegistrationsProduction({ handle, sealManifestPath: forged.manifestPath, ownerFlags: flags }), label)
+        .rejects.toSatisfy(isCode("CUTOVER_PENDING_OBJECT_GUARD_MISSING"));
+      await pool.query(restore);
+      expect(await checkPendingObjectTransferGuard(handle), label).toEqual(intact);
+    }
+    await expect(pool.query(`DELETE FROM ${holds}`))
+      .rejects.toMatchObject({ code: "P1005", message: "pending_object_transfer_hold_immutable" });
+  }, 600_000);
+
   it("without the hold table P13 and the stage refuse unless the owner accepts orphan-registration clearing; a differing mapped row conflicts", async () => {
     const handle = handles.bare;
     await runIdentityAuthorityTransfer({ handle, sealManifestPath: forged.manifestPath, identityLinkPin: PIN });
@@ -594,6 +737,26 @@ describe.skipIf(!PG_TEST_SOCKET)("D-PT4X legacy contributions, pending registrat
     await expect(checkPendingObjectTransferGuard(handle, { ownerFlags: ["some-other-flag"] }))
       .rejects.toSatisfy(isCode("CUTOVER_LEGACY_ARGUMENT_INVALID"));
 
+    // A row in PostgreSQL's own pending_quarantine_objects refuses the stage
+    // before any write, and again in the completion proof if one lands while
+    // the pages are being written.
+    const stray = { key: `telemetry/${randomUUID()}`, id: `contribution:${randomUUID()}` };
+    const seedQuarantine = () => bare.ownerPrimary.query(`INSERT INTO ${table("pending_quarantine_objects")}
+        (r2_key, contribution_id, object_kind, registered_at, reconciliation_state)
+      VALUES ($1, $2, 'telemetry', $3, 'registered')`, [stray.key, stray.id, new Date().toISOString()]);
+    const clearQuarantine = async () => {
+      await bare.ownerPrimary.query(`DELETE FROM ${table("pending_quarantine_objects")} WHERE r2_key = $1`, [stray.key]);
+      expect(await count(bare.ownerPrimary, "pending_quarantine_objects")).toBe(0);
+    };
+    const pendingStage = async () => (await bare.ownerPrimary.query(`SELECT state
+      FROM tibotattle_transfer.transfer_stage_receipts WHERE stage = 'pending-registrations'`)).rows;
+    await seedQuarantine();
+    await expect(runPendingRegistrationsProduction({ handle, sealManifestPath: forged.manifestPath, ownerFlags: flags }))
+      .rejects.toSatisfy(isCode("CUTOVER_PENDING_QUARANTINE_TARGET_NOT_EMPTY"));
+    expect(await count(bare.ownerPrimary, "pending_objects")).toBe(0);
+    expect(await pendingStage()).toEqual([]);
+    await clearQuarantine();
+
     const differing = history.pending[3];
     await bare.ownerPrimary.query(`INSERT INTO ${table("pending_objects")} (contribution_id, object_key, object_kind, registered_at)
       VALUES ($1, $2, 'telemetry', $3)`, [differing.contribution_id, differing.r2_key, new Date().toISOString()]);
@@ -602,6 +765,14 @@ describe.skipIf(!PG_TEST_SOCKET)("D-PT4X legacy contributions, pending registrat
       .rejects.toSatisfy(isCode("CUTOVER_PENDING_OBJECT_CONFLICT"));
     expect(await count(bare.ownerPrimary, "pending_objects")).toBe(1);
     await bare.ownerPrimary.query(`DELETE FROM ${table("pending_objects")}`);
+    // A quarantine row that lands after the pages commit fails the completion proof.
+    await expect(runPendingRegistrationsProduction({ handle, sealManifestPath: forged.manifestPath, ownerFlags: flags,
+      onPage: async ({ page }) => {
+        if (page === 1) await seedQuarantine();
+      } })).rejects.toSatisfy(isCode("CUTOVER_PENDING_QUARANTINE_TARGET_NOT_EMPTY"));
+    expect(await count(bare.ownerPrimary, "pending_objects")).toBe(history.pending.length);
+    expect(await pendingStage()).toEqual([{ state: "started" }]);
+    await clearQuarantine();
     // An extra row outside the sealed set fails the completion mapping proof
     // after the pages committed; removing it lets the resumed stage complete.
     const extra = `telemetry/${randomUUID()}`;
@@ -616,4 +787,42 @@ describe.skipIf(!PG_TEST_SOCKET)("D-PT4X legacy contributions, pending registrat
     expect(accepted.receiptSha256).not.toBe(receipts.pending.receiptSha256);
     expect(await count(bare.ownerPrimary, "pending_objects")).toBe(history.pending.length);
   }, 900_000);
+
+  it("the operational history refuses a missing or altered exclusions table and a foreign storage source id before any write", async () => {
+    const handle = handles.bare;
+    const pool = bare.ownerPrimary;
+    const exclusions = table("community_aggregate_exclusions");
+    const run = () => runOperationalHistoryProduction({ handle, sealManifestPath: forged.manifestPath });
+    const untouched = async () => {
+      expect(await count(pool, "analytics_admin_metric_snapshots")).toBe(0);
+      expect(await count(pool, "community_aggregate_exclusions")).toBe(0);
+      const written = await pool.query(`SELECT (SELECT count(*)::int FROM tibotattle_transfer.transfer_table_receipts
+          WHERE stage = 'post-import') AS receipts,
+        (SELECT count(*)::int FROM tibotattle_transfer.transfer_checkpoints WHERE stage = 'post-import') AS checkpoints`);
+      expect(written.rows).toEqual([{ receipts: 0, checkpoints: 0 }]);
+    };
+    const alterations = {
+      "table absent": [`ALTER TABLE ${exclusions} RENAME TO community_aggregate_exclusions_renamed`,
+        `ALTER TABLE ${table("community_aggregate_exclusions_renamed")} RENAME TO community_aggregate_exclusions`],
+      "column renamed": [`ALTER TABLE ${exclusions} RENAME COLUMN reason_code TO reason_code_renamed`,
+        `ALTER TABLE ${exclusions} RENAME COLUMN reason_code_renamed TO reason_code`],
+      "column retyped": [`ALTER TABLE ${exclusions} ALTER COLUMN created_at TYPE text USING created_at::text`,
+        `ALTER TABLE ${exclusions} ALTER COLUMN created_at TYPE timestamptz USING created_at::timestamptz`],
+    };
+    for (const [label, [alter, restore]] of Object.entries(alterations)) {
+      await pool.query(alter);
+      await expect(run(), label).rejects.toSatisfy(isCode("CUTOVER_TARGET_COLUMN_MISMATCH"));
+      await pool.query(restore);
+      await untouched();
+    }
+    // E-ADMIN: a target that already holds a different source id is refused.
+    await pool.query(`INSERT INTO ${table("storage_source_state")} (singleton, source_id, authority_epoch)
+      VALUES (1, 'synthetic-foreign-source', 0)`);
+    await expect(run()).rejects.toSatisfy(isCode("CUTOVER_SOURCE_IDENTITY_MISMATCH"));
+    await untouched();
+    // The sealed id itself passes, with main's receipt: the check is identity, not absence.
+    const sourceId = sealedDb.prepare("SELECT source_id FROM storage_source_state").get().source_id;
+    await pool.query(`UPDATE ${table("storage_source_state")} SET source_id = $1`, [sourceId]);
+    expect((await run()).receiptSha256).toBe(receipts.operational.receiptSha256);
+  }, 600_000);
 });
