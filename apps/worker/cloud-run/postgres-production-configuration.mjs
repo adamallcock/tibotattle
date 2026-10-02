@@ -114,6 +114,19 @@ export const PRODUCTION_POOL_SIZES = Object.freeze({
   readiness: 1,
 });
 
+/**
+ * The PostgreSQL application_name each service pool sets (the production
+ * host's createIamPool calls). The OPS-4 runtime probe classifies sessions by
+ * these names (cloud-run/ops-probe-contract.mjs OPS_APPLICATION_CLASSES maps
+ * each to "origin"), so a renamed pool must change both; the probe check pins
+ * them equal.
+ */
+export const PRODUCTION_POOL_APPLICATION_NAMES = Object.freeze({
+  data: "tibotattle-origin-data",
+  admission: "tibotattle-origin-admission",
+  readiness: "tibotattle-origin-readiness",
+});
+
 /** The Cloud SQL instance each service pool opens: always the one primary. */
 export const PRODUCTION_POOL_INSTANCES = Object.freeze({
   data: Object.freeze(["primary"]),

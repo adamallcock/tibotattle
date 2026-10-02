@@ -62,12 +62,17 @@ export const OPS_ACTIVITY_CLASSES = Object.freeze([
 
 /**
  * Application name to class. The names are the ones each workload's pool sets
- * (cloud-run/cloud-sql.mjs's default for the origin, analytics-refresh.mjs,
- * postgres-maintenance-job.mjs, postgres-production-migrations.mjs and the
- * runtime probe itself); the probe check pins each to its source. Any other
- * name, and any session whose name is empty, is class "other".
+ * (the production origin's three pools, PRODUCTION_POOL_APPLICATION_NAMES in
+ * postgres-production-configuration.mjs; cloud-run/cloud-sql.mjs's default
+ * for the test origins; analytics-refresh.mjs, postgres-maintenance-job.mjs,
+ * postgres-production-migrations.mjs and the runtime probe itself); the probe
+ * check pins each to its source. Any other name, and any session whose name
+ * is empty, is class "other".
  */
 export const OPS_APPLICATION_CLASSES = Object.freeze({
+  "tibotattle-origin-data": "origin",
+  "tibotattle-origin-admission": "origin",
+  "tibotattle-origin-readiness": "origin",
   "tibotattle-cloud-run-host": "origin",
   "tibotattle-analytics-refresh": "analytics",
   "tibotattle-maintenance-job": "maintenance",

@@ -21,6 +21,7 @@ import * as audit from "./ops-backup-audit-job.mjs";
 import * as contract from "./ops-probe-contract.mjs";
 import * as probe from "./ops-runtime-probe-job.mjs";
 import { POSTGRES_MAINTENANCE_JOB_APPLICATION_NAME } from "./postgres-maintenance-job-contract.mjs";
+import { PRODUCTION_POOL_APPLICATION_NAMES, PRODUCTION_POOL_SIZES } from "./postgres-production-configuration.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const WORKER_ROOT = resolve(ROOT, "..");
@@ -122,7 +123,18 @@ test("each application class is the name its own workload's pool sets", async ()
   assert.match(sources["postgres-production-migrations.mjs"], /MIGRATOR_APPLICATION_NAME = "tibotattle-production-migrator"/u);
   assert.equal(POSTGRES_MAINTENANCE_JOB_APPLICATION_NAME, "tibotattle-maintenance-job");
   assert.equal(contract.OPS_PROBE_JOBS["ops-runtime-probe"].applicationName, "tibotattle-ops-probe");
+  // The production origin (D-CRB) opens one pool per PRODUCTION_POOL_SIZES
+  // key, each under its own name; every one of them is the origin class.
+  assert.deepEqual(Object.keys(PRODUCTION_POOL_APPLICATION_NAMES), Object.keys(PRODUCTION_POOL_SIZES));
+  const host = await readFile(join(ROOT, "postgres-production-host.mjs"), "utf8");
+  assert.match(host, /applicationName: PRODUCTION_POOL_APPLICATION_NAMES\[name\],/u);
+  for (const name of Object.values(PRODUCTION_POOL_APPLICATION_NAMES)) {
+    assert.equal(contract.opsActivityClass(name), "origin", name);
+  }
   assert.deepEqual({ ...contract.OPS_APPLICATION_CLASSES }, {
+    "tibotattle-origin-data": "origin",
+    "tibotattle-origin-admission": "origin",
+    "tibotattle-origin-readiness": "origin",
     "tibotattle-cloud-run-host": "origin",
     "tibotattle-analytics-refresh": "analytics",
     "tibotattle-maintenance-job": "maintenance",

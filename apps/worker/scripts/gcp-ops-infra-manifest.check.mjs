@@ -1064,17 +1064,31 @@ test("rolloutTarget gives OPS-10 its closed target from the environment's commit
     // The EP-6 verifier path roll reads /api/health through outside gcp mode.
     verifierServiceAccount: `synthetic-verifier@${UNMARKED_PROJECT}.iam.gserviceaccount.com`,
     originAudience: "synthetic-edge-origin-audience",
-    // No maintenance Job in JOB_NAMES yet (D-OPS4): OPS-10's roll then refuses
-    // the origin-verifier path (ROLLOUT_MAINTENANCE_JOB_REQUIRED, D-CRB).
-    maintenanceJob: null,
+    // The deployed maintenance Job (D-OPS4): OPS-10 runs one lifecycle pass
+    // after the roll and before it verifies (D-CRB).
+    maintenanceJob: "synthetic-maintenance",
   });
   assert.equal(manifest.MAINTENANCE_JOB_KEY, "maintenance");
-  assert.equal(manifest.JOB_NAMES.includes(manifest.MAINTENANCE_JOB_KEY), false);
+  assert.equal(manifest.JOB_NAMES.includes(manifest.MAINTENANCE_JOB_KEY), true);
   assert.equal(Object.isFrozen(target.jobNames), true);
-  assert.equal(manifest.rolloutTarget("staging", { readFile }).service, "synthetic-staging-origin");
-  // A staging plane cannot have the maintenance job yet, so the rollout does not move it.
-  assert.deepEqual([...manifest.rolloutTarget("staging", { readFile }).jobNames],
-    ["synthetic-staging-migrate", "synthetic-staging-refresh"]);
+  assert.deepEqual(rollout.validateRolloutTarget(target, "production"), target);
+  // A staging plane cannot have the maintenance Job yet
+  // (STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE): the rollout does not
+  // move it, and the target names no maintenance Job although the staging
+  // desired state names one, so the target stays valid (one of jobNames or
+  // null) and OPS-10 refuses the origin-verifier roll there
+  // (ROLLOUT_MAINTENANCE_JOB_REQUIRED) instead of throwing.
+  const staging = manifest.rolloutTarget("staging", { readFile });
+  assert.equal(staging.service, "synthetic-staging-origin");
+  assert.deepEqual([...staging.jobNames], ["synthetic-staging-migrate", "synthetic-staging-refresh"]);
+  assert.equal(staging.maintenanceJob, null);
+  assert.deepEqual(rollout.validateRolloutTarget(staging, "staging"), staging);
+  // Every validated desired state carries the maintenance entry (the job
+  // list is exactly JOB_NAMES), so the derivation never reads a missing key.
+  assert.throws(() => manifest.validateDesiredState(unmarked((value) => {
+    stagingNames(value);
+    delete value.jobs.maintenance;
+  })), { code: "JOB_NAMES_MISMATCH" });
   const refusedWith = (environment, text, code) => {
     const reader = (path) => (path === manifest.committedDesiredStatePath(environment) ? text : readFile(path));
     assert.throws(() => manifest.rolloutTarget(environment, { readFile: reader }), { code }, `${environment} ${code}`);
@@ -1128,6 +1142,9 @@ test("OPS-10 accepts the rendered migration job and the rollout target (integrat
     const target = manifest.rolloutTargetFromDesiredState(desired);
     assert.deepEqual(rollout.validateRolloutTarget(target, desired.environment), target);
     assert.equal(target.migrationJob, rendered.metadata.name);
+    // Production deploys the maintenance Job and names it; staging cannot (D-OPS4).
+    assert.equal(target.maintenanceJob,
+      desired.environment === "production" ? manifest.renderJob(desired, "maintenance", IMAGE).metadata.name : null);
   }
 });
 

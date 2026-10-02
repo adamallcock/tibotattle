@@ -167,6 +167,7 @@ import {
   EDGE_ORIGIN_MODE,
   EDGE_TIER_RATE_LIMIT_BINDINGS,
   PRODUCTION_ADMISSION_TIMEOUTS,
+  PRODUCTION_POOL_APPLICATION_NAMES,
   createProductionWorkerEnv,
   readProductionConfiguration,
   revealProductionSecret,
@@ -680,7 +681,7 @@ export async function createPostgresProductionRuntime({
         database: primary.database,
         user: iamUser,
         max: configuration.poolSizes[name],
-        applicationName: `tibotattle-origin-${name}`,
+        applicationName: PRODUCTION_POOL_APPLICATION_NAMES[name],
       });
       pools.push(pool);
       return pool;

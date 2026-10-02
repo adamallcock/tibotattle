@@ -1850,10 +1850,13 @@ export const ROLLOUT_TARGET_KEYS = Object.freeze([
 
 /**
  * The JOB_NAMES key of the MP-2-lite maintenance Job (C-MAINT's
- * dist/postgres-maintenance-job.mjs). D-OPS4 adds it to JOB_NAMES; until
- * then a RolloutTarget's maintenanceJob is null, and OPS-10's roll refuses
- * the origin-verifier path (ROLLOUT_MAINTENANCE_JOB_REQUIRED), because only
- * a lifecycle pass makes a new origin's /api/ready read ready (D-CRB).
+ * dist/postgres-maintenance-job.mjs, added to JOB_NAMES by D-OPS4). A
+ * RolloutTarget names it only when the environment deploys it
+ * (deployedJobNames(desired)): staging cannot have it yet
+ * (JOB_ENVIRONMENT_UNAVAILABLE), so a staging target's maintenanceJob is
+ * null and OPS-10's roll refuses the origin-verifier path there
+ * (ROLLOUT_MAINTENANCE_JOB_REQUIRED), because only a lifecycle pass makes a
+ * new origin's /api/ready read ready (D-CRB).
  */
 export const MAINTENANCE_JOB_KEY = "maintenance";
 
@@ -1871,19 +1874,22 @@ export function rolloutTargetFromDesiredState(desired) {
   if (desired.synthetic) fail("ROLLOUT_TARGET_SYNTHETIC_REFUSED");
   if (desired.serviceAccounts.verifier === null) fail("ROLLOUT_TARGET_VERIFIER_REQUIRED");
   if (desired.serviceAccounts.verifier.tokenCreators === null) fail("ROLLOUT_TARGET_VERIFIER_TOKEN_CREATOR_UNASSIGNED");
+  // One list for both keys: the maintenance Job is the target's only when
+  // this environment deploys it, so it is always one of jobNames.
+  const deployed = deployedJobNames(desired);
   return deepFreeze({
     environment: desired.environment,
     project: desired.project,
     region: desired.region,
     service: desired.service.name,
     migrationJob: desired.jobs["production-migrate"].name,
-    jobNames: deployedJobNames(desired).map((job) => desired.jobs[job].name),
+    jobNames: deployed.map((job) => desired.jobs[job].name),
     primaryInstance: desired.cloudSql.instance,
     imageRepository: desired.artifactRegistry.imageRepository,
     builderServiceAccount: desired.serviceAccounts.builder.email,
     verifierServiceAccount: desired.serviceAccounts.verifier.email,
     originAudience: desired.service.audience,
-    maintenanceJob: deployedJobNames().includes(MAINTENANCE_JOB_KEY) ? desired.jobs[MAINTENANCE_JOB_KEY].name : null,
+    maintenanceJob: deployed.includes(MAINTENANCE_JOB_KEY) ? desired.jobs[MAINTENANCE_JOB_KEY].name : null,
   });
 }
 

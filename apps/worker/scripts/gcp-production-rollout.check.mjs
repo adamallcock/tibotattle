@@ -66,20 +66,23 @@ const TARGET = Object.freeze({
   maintenanceJob: "tibotattle-maintenance",
 });
 const STAGING_PROJECT = "w2-opsdb-staging-synth";
+// The staging target as OPS-2 derives it (rolloutTargetFromDesiredState):
+// staging cannot have the maintenance Job yet
+// (STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE, D-OPS4), so it is in
+// neither jobNames nor maintenanceJob.
 const STAGING_TARGET = Object.freeze({
   environment: "staging",
   project: STAGING_PROJECT,
   region: "us-east1",
   service: "tibotattle-staging-origin",
   migrationJob: "tibotattle-staging-migrate",
-  jobNames: Object.freeze(["tibotattle-staging-migrate", "tibotattle-staging-analytics",
-    "tibotattle-staging-maintenance"]),
+  jobNames: Object.freeze(["tibotattle-staging-migrate", "tibotattle-staging-analytics"]),
   primaryInstance: "tibotattle-staging-primary",
   imageRepository: `us-east1-docker.pkg.dev/${STAGING_PROJECT}/tibotattle-staging/origin`,
   builderServiceAccount: `tibotattle-staging-builder@${STAGING_PROJECT}.iam.gserviceaccount.com`,
   verifierServiceAccount: `tibotattle-staging-verifier@${STAGING_PROJECT}.iam.gserviceaccount.com`,
   originAudience: ORIGIN_AUDIENCE,
-  maintenanceJob: "tibotattle-staging-maintenance",
+  maintenanceJob: null,
 });
 const IMAGE = `${TARGET.imageRepository}@${DIGEST}`;
 const CONTRACT_PATH = "apps/worker/src/edge-origin-contract.ts";
@@ -401,16 +404,18 @@ const fencedLive = deployed(applyEdgeModeSnapshotDelta({ snapshot: withSecrets, 
 const gcpLive = deployed(applyEdgeModeSnapshotDelta({ snapshot: fencedLive, mode: "gcp", plan: GCP_PLAN, trackedConfig: TRACKED }),
   EDGE_COMMIT, versionId(155));
 const preEdgeLive = deployed(FIXTURE, EDGE_COMMIT, versionId(152));
-/** The staging Worker in gcp mode: its own name, no custom domain, its tracked PUBLIC_ORIGIN. */
-const stagingGcpLive = resnapshot(gcpLive, {
+/** A staging Worker: its own name, no custom domain, its tracked PUBLIC_ORIGIN. */
+const asStaging = (snapshot) => resnapshot(snapshot, {
   workerName: TRACKED.env.staging.name,
   domains: [],
-  namespaces: gcpLive.namespaces.map((namespace) => ({ ...namespace, script: TRACKED.env.staging.name,
+  namespaces: snapshot.namespaces.map((namespace) => ({ ...namespace, script: TRACKED.env.staging.name,
     name: `${TRACKED.env.staging.name}_${namespace.class}` })),
-  bindings: gcpLive.bindings.map((binding) => (binding.name === "PUBLIC_ORIGIN"
+  bindings: snapshot.bindings.map((binding) => (binding.name === "PUBLIC_ORIGIN"
     ? { ...binding, text: TRACKED.env.staging.vars.PUBLIC_ORIGIN }
     : binding.name === "ENVIRONMENT" ? { ...binding, text: "staging" } : binding)),
 });
+const stagingGcpLive = asStaging(gcpLive);
+const stagingWorkerLive = asStaging(workerLive);
 const capture = (snapshot, { capturedAt = new Date(NOW).toISOString(), deployment } = {}) => JSON.stringify({
   schema: ROLLOUT_EDGE_LIVE_SCHEMA,
   capturedAt,
@@ -809,6 +814,25 @@ test("a staging roll verifies a workers.dev-only gcp edge against staging's own 
   await assert.rejects(runRollout(executeRoll(paths, "staging"), dependencies(fakeEstate({ target: STAGING_TARGET }), fakeLock())),
     isCode("ROLLOUT_EDGE_LIVE_TARGET_MISMATCH"));
 });
+
+test("a staging target has no maintenance Job (D-OPS4), so its origin-verifier roll is refused before any command or lock",
+  async (t) => {
+    assert.deepEqual(validateRolloutTarget(STAGING_TARGET, "staging"), STAGING_TARGET);
+    assert.equal(STAGING_TARGET.jobNames.includes("tibotattle-staging-maintenance"), false);
+    // A staging target that names a maintenance Job outside its jobNames is
+    // the merge hazard D-CRB closed: refused as invalid, never rolled.
+    assert.throws(() => validateRolloutTarget({ ...STAGING_TARGET, maintenanceJob: "tibotattle-staging-maintenance" },
+      "staging"), isCode("ROLLOUT_TARGET_INVALID"));
+    const paths = await migrated(t, { target: STAGING_TARGET, edge: stagingGcpLive });
+    await writeFile(paths.edgeLive, capture(stagingWorkerLive));
+    const lock = fakeLock();
+    const estate = fakeEstate({ blobs: {}, target: STAGING_TARGET });
+    await assert.rejects(runRollout(executeRoll(paths, "staging"), dependencies(estate, lock)),
+      isCode("ROLLOUT_MAINTENANCE_JOB_REQUIRED"));
+    assert.deepEqual(lock.events, []);
+    assert.equal(estate.calls.some((argv) => argv[0] === "gcloud" && argv[3] !== "describe"), false);
+    assert.deepEqual(estate.requests, []);
+  });
 
 test("roll refuses EDGE_CONTRACT_DRIFT against a gcp-mode edge whose contract blob differs, before any command or lock", async (t) => {
   const paths = await migrated(t);
