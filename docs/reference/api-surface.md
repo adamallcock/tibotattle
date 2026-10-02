@@ -159,8 +159,7 @@ v1.0 and v1.1. v1.3 is v1.1's meaning (the Pro 20x basis, `combined`, and the
 three personal plans `pro`, `prolite` and `plus`) with the `modelConfig` block
 appended, so it is read on v1.1's basis. Any other version, v1.4 included, is
 refused whole until the reader is changed to understand it, and the page then
-shows breakdowns as unavailable while the daily activity still renders. No
-server in this tree emits v1.3 or the block yet.
+shows breakdowns as unavailable while the daily activity still renders.
 
 All three graph views use the same published snapshot; immutable daily rows
 are not rewritten or relabelled to achieve this. Generation/evidence dates are
