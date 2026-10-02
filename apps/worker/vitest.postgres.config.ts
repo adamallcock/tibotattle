@@ -19,6 +19,7 @@ export default defineConfig({
       "postgres-test/postgres-legacy-contribution-transfer.spec.mjs",
       "postgres-test/cutover-source-seal-rehearsal.spec.mjs",
       "postgres-test/postgres-production-telemetry-modes.spec.mjs",
+      "postgres-test/postgres-production-transfer.spec.mjs",
     ],
     fileParallelism: false,
   },

@@ -396,79 +396,202 @@ the session user and the schema-owner role. The frozen stage order is set by the
 tooling (`TRANSFER_STAGES` in `postgres-transfer-target.mjs`), and the stage
 list on the deploy line governs.
 
-1. **Run the stages in order.** The identity-and-authority stage (PT-3) is
-   `built`. It refuses before its first write on column or counter closure, any
-   invalid sealed value, an identity-link secret that does not match the pin
-   (`CUTOVER_IDENTITY_LINK_SECRET_MISMATCH`), a participant that is not
-   `active` or still carries a deletion fence
-   (`CUTOVER_PARTICIPANT_ERASURE_PENDING`), an incomplete public-source
-   bootstrap, and a broken accountless authority chain. Cooldowns and the
-   deletion ledger are not imported. The sealed v0.x history
-   (`legacy-contributions`), the pending registrations
-   (`pending-registrations`, one transfer hold per registration) and the
-   operational history (admin metric snapshots and
-   `community_aggregate_exclusions`, mapped in R3 post-import) are `built`
-   (D-PT4X; their tables are primary migrations `0066` and `0067`). The
-   production modes of the telemetry importers (D-PT5A) are `built` as eight
-   PT-1 stages in `postgres-production-telemetry-modes.mjs`:
-   `telemetry-v1-v11`, `typed-legacy`, `legacy-admission`,
-   `header-promotion`, `telemetry-v12`, `v12-event-sources`,
-   `usage-correction` and `ingestion-journal`. Each refuses on the sealed side
-   before it touches the target (column closure, an unrepresentable value, a
-   broken sealed foreign key, an erased owner link, a participant that is not
-   `active`), checks its prerequisites and trigger policy on the target, and
-   verifies a count and a canonical digest per table against the seal. Nothing
-   here has run against a real seal. The orchestrator that sequences all stages
-   (E-PT8) is `not built`:
-   `<command: E-PT8 orchestrator, one disposition per sealed table>`.
-2. **Check the orchestrator's dispositions and refusals.** One disposition per
-   sealed table, the deletion-digest exclusion count, the identity-pin
-   fingerprint, and a digest parity sample between the sealed files and
-   PostgreSQL. The orchestrator also refuses while the correction runtime is
-   active (`CUTOVER_CORRECTION_RUNTIME_ACTIVE`) and unless the public-source
-   bootstrap reads `completed=1`. `not built` (E-PT8).
-3. **Finalize to live, in this order.** The run must be `verified` first.
-   - Prove the sealed sources are unchanged:
+The PT-8-lite orchestrator (E-PT8,
+`apps/worker/scripts/postgres-production-transfer.mjs`, `S` below) sequences
+every step of H.4. It is `built` and proven only on a synthetic seal against a
+local PostgreSQL 17 target; it has not run against a real seal or a Cloud SQL
+target. Its reference, including the owner directory, the authorization
+tokens and every refusal, is [the orchestrator section](#h4-reference-the-pt-8-lite-orchestrator).
+
+1. **Preflight (read-only).** `node $S preflight --owner-dir <dir> <connection>`
+   runs P1 to P14 and prints `GO` with the `run` authorization token, or a
+   closed refusal code. Among them: one disposition per sealed table (P3), the
+   correction runtime staged with no facts (P4,
+   `CUTOVER_CORRECTION_RUNTIME_ACTIVE`), erasure quiescence (P5), the
+   deletion-digest exclusion count (P6), the public-source bootstrap at
+   `completed=1` (P7) and the identity-pin fingerprint (P8).
+2. **Import (protected).** `node $S run --owner-dir <dir> <connection>` is a dry
+   run that prints the plan and the token; add `--execute --confirm <token>`.
+   It runs the stages in dependency order: PT-3 `identity-authority`, D-PT4X
+   `legacy-contributions`, the eight D-PT5A stages, the waivers
+   (`performance` under the owner flag `performance-routes-retired`,
+   `accountless-retention` while its sealed table is empty, `objects` until
+   PT-7, the three analytics stages because analytics is recomputed),
+   D-PT4X `pending-registrations`, `owner-lifecycle-verify` and `post-import`.
+   Post-import restarts the typed identities (TL-1), maps the admin metric
+   history and the aggregate exclusions (D-PT4X), checks the invariants,
+   finalizes coverage, runs the parity sample, **loads the frozen public read**
+   (C-IPR) and **drops the staging relations**. Then the run moves to
+   `verifying` and `verified`. A killed `run` is rerun with the same token.
+3. **Finalize to live, in this order.** PT-1 admits the staging drop only
+   before `verified`, and refuses every write once a run is live, so the drop
+   and the frozen-read load happen inside step 2; the flip gate reads both
+   back.
+   - Owner: prove the sealed sources are unchanged after `verified`, into a
+     fresh directory `flip-1`:
 
      ```bash
      node scripts/cutover-source-fence.mjs verify-unchanged --inventory <private seal inventory> \
-       --seal <seal manifest> --seal-id <sealId> --out <private owner directory> --execute --remote --owner-read-only
+       --seal <seal manifest> --seal-id <sealId> --out <owner dir>/flip-1 --execute --remote --owner-read-only
      ```
 
-     `--seal-id` is required: it pins the manifest, and without a 64-hex value
-     the command refuses `CUTOVER_ARGUMENT_INVALID` before it reads anything.
-     It writes `flip-evidence.json` (`0400`, never overwritten) and prints its
-     sha256, or fails `CUTOVER_SOURCE_CHANGED_AFTER_SEAL`. `built`.
-   - Restore the sealed collection controls exactly
-     (`restoreSealedCollectionControls`). Without this, enrollment and
-     publication stay disabled after the switch. `built`; the call is made by
-     the orchestrator, `not built`.
-   - Drop the staging relations, run the flip gate (`assertFlipReady`: every
-     stage complete, no checkpoint cursor, controls equal to the sealed row, no
-     unnamed role member, no foreign privilege on the transfer schema, every
-     trigger enabled), and mark the run live (`markLive`) with the flip
-     evidence sha256. `built` as library calls; sequencing `not built`.
+     It writes `flip-evidence.json` (`0400`, never overwritten) or fails
+     `CUTOVER_SOURCE_CHANGED_AFTER_SEAL` (a fence breach: abort).
+   - `node $S release-controls --flip-evidence <flip-1>/flip-evidence.json`
+     (protected) restores the sealed collection controls exactly. Without
+     it, enrollment and publication stay disabled after the switch.
+   - Owner: `verify-unchanged` again, into `flip-2` (fresh evidence taken after
+     the release).
+   - `node $S flip-gate --flip-evidence <flip-2>/flip-evidence.json`
+     (read-only) reads back the staging drop and the loaded frozen read, runs
+     `assertFlipReady` and checks that no sealed Sparkle nonce is unexpired. It
+     writes `flip-gate.json` and prints the `mark-live` token.
+   - `node $S mark-live --flip-evidence-sha256 <flip-2 sha256>` (protected).
    - **`markLive` is a one-way door for that target.** It locks the transfer
-     control schema in both databases, the import handle only reads once a run
-     is live, and the tooling contains no unlock. If the window aborts after
-     it, the next attempt starts from a fresh seal and a new target; the owner
-     and Claude decide whether that is a new database on the instance or a new
-     instance.
-4. **Load the frozen public read.** Serve the frozen `community_daily` until the
-   first Google Cloud publication, with the evidence date labelled. The loader
-   and the route are `built` (C-IPR), with primary migration `0065` promoted;
-   the production load is a call from the import orchestrator, `not built`
-   (E-PT8).
+     control schema, the import handle only reads once a run is live, and the
+     tooling contains no unlock. If the window aborts after it, the next
+     attempt starts from a fresh seal and a new target; the owner and Claude
+     decide whether that is a new database on the instance or a new instance.
+4. **The frozen public read** is loaded by step 2 (before `markLive`), from the
+   OWN-4 export and its recorded facts in `pt8-inputs.json`. Its `payloadSha256`
+   is in `post-import.json` and `flip-gate.json`.
 5. **Run a maintenance pass and resume the maintenance trigger.** Readiness
    goes stale 2 hours after the last pass, and an empty origin reads not ready
-   until the first pass. Run one pass by hand, then resume the maintenance
-   trigger under [GCP scheduler resume](./gcp-scheduler-resume.md). The job
-   is `built` (C-MAINT); its trigger in the desired state is `not built`
-   (D-OPS4).
+   until the first pass. Run one pass by hand until it reports complete, then
+   `node $S post-live-check` (read-only), then resume the maintenance trigger
+   under [GCP scheduler resume](./gcp-scheduler-resume.md). The job is `built`
+   (C-MAINT); its trigger in the desired state is `not built` (D-OPS4). After
+   H.8, `node $S report` writes `pt8-report.json`.
 
-Evidence kept: the run's stage receipts (counts, digests, states), the
-flip-evidence sha256, the transfer run id. Abort: Abort A. The target database
+Evidence kept: the run's stage and table receipts (counts, digests, states),
+the owner directory's content-free receipts (`preflight.json`,
+`post-import.json`, `release-controls.json`, `flip-gate.json`,
+`mark-live.json`, `pt8-report.json`), the flip-evidence sha256 and the
+transfer run id. Abort: Abort A. The target database
 is spent.
+
+## H.4 reference: the PT-8-lite orchestrator
+
+Design: `design/pt8-lite-design-2026-10-02.md` in the cutover workspace, with
+the code-forced corrections of its section 1 applied. Round 13 holds: the
+cutover runs on the proven full-recompute analytics engine, so the
+orchestrator imports no analytics state and waives the three analytics stages.
+Round 12 holds: the native social chain is retired, and PT-3 still imports the
+tables the kept session routes and credential renew and disconnect
+authenticate against (pinned in `KEPT_SESSION_AUTHORITY_TABLES`); the retired
+chain's short-lived handoff rows are imported verbatim and are inert.
+
+**The seal is consumed, never produced.** The orchestrator reads a PT-2-lite
+seal only through `readCutoverSeal` and `openSealedSourceFromSeal`
+(`cutover-source-seal.mjs`), and the seal itself is taken at H.3 with that
+module's CLI. A change to the seal's ingestion layout behind those exports
+needs no orchestrator change, but the coverage gate (P3) refuses any sealed
+table that has no reviewed disposition.
+
+**Owner directory** (`0700`, outside the repository; files `0400` unless
+stated). The owner writes `pt8-inputs.json` (schema
+`tibotattle-pt8-lite-inputs-v1`, closed keys): `contractId`, `sealId`,
+`sealManifestPath`, `expectedSourceCommit` (P), `fenceReceiptSha256`,
+`expectedIdentityKeyVersion`, `deletionDigestProjection` (path and sha256, from
+`cutover-source-projections.mjs deletion-digests`), `interimPublicRead` (the
+OWN-4 export path and its recorded sha256, capture instant, source commit and
+evidence date), `schedulerEvidencePath` (a C-INFRA scheduler probe receipt
+taken after the fence), `ownerFlags` (`performance-routes-retired`,
+`accept-orphan-registration-clearing`) and `allowedRoleMembers`. The
+orchestrator writes `identity-pin.json`, `preflight.json`, `post-import.json`,
+`release-controls.json`, `flip-gate.json`, `mark-live.json`,
+`pt8-report.json` and the advisory `pt8-journal.ndjson` (`0600`). A receipt
+is written once; a rerun that computes identical bytes reuses it and any other
+result refuses `CUTOVER_RECEIPT_CONFLICT`. Every receipt is content-free:
+names, counts, states and sha256 digests.
+
+**Identity pin (owner only).** The deployed `IDENTITY_LINK_SECRET` is read from
+standard input only, never from an argument or the environment:
+
+```bash
+gcloud secrets versions access <N> --secret=<identity-link secret id> | \
+  node $S identity-pin --owner-dir <dir> --key-version <label> --secret-name <id> --secret-version <N>
+```
+
+A secret shorter than 32 characters and a version of `latest` are refused. The
+pin is a keyed digest: keep it in the owner directory only.
+
+**Connection.** Every database subcommand takes `--pg-socket <dir> --pg-port
+<n> --pg-user <transfer IAM user> --pg-database <db>`: a Unix socket directory
+owned by the operator with no group or other bits, such as a Cloud SQL Auth
+Proxy started with `--auto-iam-authn` and `--unix-socket`. TCP hosts are
+refused. The transfer login must reach the schema owner and
+`tibotattle_source_transfer` by `SET` only, never by inheritance (P10). That
+identity is not provisioned yet (PT8-I).
+
+**Dry run and tokens.** `run`, `release-controls`, `mark-live` and `abandon` are
+protected. Without `--execute` each performs only its read-only checks and
+prints the exact token it requires. With `--execute`, it runs only when
+`--confirm` equals that token (`CUTOVER_AUTHORIZATION_MISMATCH` otherwise,
+before any write). A token is the sha256 of the step name, the seal id, the
+contract, the inputs file and the step's own evidence (the preflight, the
+flip-1 evidence and run id, or the flip gate and flip-2 evidence), so it
+authorizes one step of one cutover.
+
+**Order.** Each step refuses `CUTOVER_STEP_ORDER_VIOLATION` out of order:
+
+| Step | Admitted when |
+|---|---|
+| `run` | `preflight.json` is GO for these inputs, and the run is absent, `preflight`, `importing`, `verifying` or `verified` (a no-op) |
+| `release-controls` | The run is `verified`; the flip-1 evidence was taken after `verified_at` |
+| `flip-gate` | The run is `verified`, `release-controls.json` exists, and the flip-2 evidence differs from flip-1 and was taken after the release |
+| `mark-live` | The flip gate passed for exactly this flip-2 sha256, or the run is already live with it (a readback) |
+| `post-live-check`, `report` | The run is `live` |
+| `abandon` | A run exists and is not `live` |
+
+Inside `run`, each stage requires every earlier stage of the plan complete.
+`run` holds the session advisory lock `tibotattle/production-transfer/v1`
+(`CUTOVER_ORCHESTRATOR_BUSY`) and C-MAINT's shared migration fence
+(`CUTOVER_MIGRATION_FENCE_HELD`) for its whole duration.
+
+**Kill and resume.** Rerun the same command with the same token. The database
+is authoritative: the run reopens for the same seal, complete stages are
+skipped, the runners resume at their last committed page, every post-import
+sub-step re-converges to equal receipts (the frozen read answers
+`already-loaded`), and finished transitions are no-ops. The synthetic proof
+kills the run after every committed step and compares every table receipt and
+stage receipt with a clean run.
+
+**Abort.** Before `markLive`: `abandon` (protected), then the fence release
+of Abort A. The abandoned target is spent: any new seal needs a fresh,
+migrated database (`CUTOVER_TARGET_NOT_EMPTY` otherwise). After `markLive`:
+the target is final for this seal.
+
+**Orchestrator refusals.** Preflight refuses before any target write:
+
+| Code | Check | First action |
+|---|---|---|
+| `CUTOVER_SEAL_SOURCE_COMMIT_MISMATCH`, `CUTOVER_SEAL_FENCE_MISMATCH` | P1, P2 | The seal is not the one these inputs name. Fix the inputs or re-seal |
+| `CUTOVER_COVERAGE_TABLE_UNKNOWN`, `CUTOVER_COVERAGE_TABLE_MISSING` | P3 | The sealed catalog differs from the reviewed dispositions. Re-derive the dispositions in code; never edit the seal |
+| `CUTOVER_COVERAGE_NOT_EMPTY` | P3 | A must-be-empty table holds rows (for example retention markers: PT8-G is needed) |
+| `CUTOVER_COVERAGE_DECISION_MISSING` | P3 | A non-empty table needs a recorded owner flag (`performance-routes-retired`) |
+| `CUTOVER_CORRECTION_RUNTIME_ACTIVE` | P4 | The sealed usage-correction runtime is active or holds facts. Owner decision (OWN-3) |
+| `CUTOVER_PARTICIPANT_ERASURE_PENDING`, `CUTOVER_OWNER_LINK_ERASED` | P3, P5 | An erasure is unfinished. Finish it on Cloudflare and re-seal |
+| `CUTOVER_ERASED_PARTICIPANT_PRESENT`, `CUTOVER_PROJECTION_SEAL_MISMATCH` | P6 | A sealed participant matches a tombstone, or the projection is not this seal's |
+| `CUTOVER_PUBLIC_SOURCE_BOOTSTRAP_INCOMPLETE` | P7 | The sealed bootstrap is not complete |
+| `CUTOVER_IDENTITY_LINK_SECRET_MISMATCH`, `CUTOVER_IDENTITY_LINK_VERSION_MISMATCH` | P8 | The pin differs from the sealed row or the deployed label. Never rotate the secret to pass |
+| `CUTOVER_CONTROLS_DEGRADE_IMPOSSIBLE` | P9 | The sealed controls admit no degraded form. Re-seal |
+| `CUTOVER_TARGET_NOT_EMPTY`, `CUTOVER_TRANSFER_LOGIN_MEMBERSHIP_INVALID`, `CUTOVER_TARGET_FROZEN_READ_TABLE_MISSING` | P10 | The target is not the pre-staged empty database, or the login's membership inherits |
+| `CUTOVER_SCHEDULER_NOT_PAUSED` | P11 | A trigger runs, or the probe predates the fence or is over 6 h old |
+| `CUTOVER_INTERIM_READ_FACTS_INVALID` and the C-IPR `INTERIM_PUBLIC_READ_*` codes | P12 | The OWN-4 export or its facts do not hold (captured after the fence, another commit, another day) |
+| `CUTOVER_PENDING_OBJECT_GUARD_MISSING` | P13 | The transfer-hold guard is absent and no owner flag accepts that |
+
+During `run` and finalize: `CUTOVER_OWNER_REVISIONS_DIVERGED`,
+`CUTOVER_PUBLIC_SOURCE_OWNERS_DIVERGED`, `CUTOVER_PENDING_OBJECT_CONFLICT`,
+`CUTOVER_RUNTIME_RESET_NOT_AT_SEED`, `CUTOVER_BOOTSTRAP_TARGET_INVALID`,
+`CUTOVER_TYPED_IDENTITY_HEADROOM_INVALID`, `CUTOVER_COVERAGE_RECEIPT_MISSING`,
+`CUTOVER_COVERAGE_RECEIPT_MISMATCH`, `CUTOVER_COVERAGE_RECEIPT_UNEXPECTED`,
+`CUTOVER_PARITY_SAMPLE_MISMATCH` (with the class), `CUTOVER_FLIP_EVIDENCE_INVALID`,
+`CUTOVER_FLIP_EVIDENCE_STALE`, `CUTOVER_INTERIM_READ_NOT_LOADED`,
+`CUTOVER_SPARKLE_NONCES_UNEXPIRED`, `CUTOVER_POST_LIVE_NOT_READY` and PT-1's own
+codes (for example `CUTOVER_FLIP_ROLE_MEMBERS_UNEXPECTED`). Each is a NO-GO:
+diagnose, never bypass. The design adds no override flag beyond the two named
+owner flags.
 
 ## H.5 Verifier smoke
 
@@ -694,7 +817,7 @@ the line after `95c158ba`, and the E-QUIESCE row when E-QUIESCE merged after
 | Verifier smoke command | H.1, H.5 | `in build` (verifier tooling) |
 | Production host composition, first-roll ready path, `HOST_ORIGIN` check | Preconditions, H.5 | `not built` (D-CRB); the origin refuses to start in production until it lands |
 | Telemetry importer production modes | H.4 | `built` (D-PT5A) on a synthetic seal only; the provider's real export shapes are unverified |
-| Import orchestrator and finalize sequencing | H.4 | `not built` (E-PT8) |
+| Import orchestrator and finalize sequencing | H.4 | `built` (E-PT8) on a synthetic seal and a local PostgreSQL 17 target only; the production transfer identity and its Cloud SQL Auth Proxy connection are not provisioned (PT8-I) |
 | Read-only pre-fence quiescence query | H.1 | `built` (E-QUIESCE); not yet run against the provider |
 | Frozen public read: export format, loader, retirement | H.3, H.4, H.8 | `built` (C-IPR), with migration `0065` promoted to primary at the C-SIMP-RECON merge; dropping the stored row is `not built` |
 | Admin routes at the origin | H.7 | Route modules `built` (C-ADMIN); registration in the host `not built` (D-CRB); the overview answers 503 until its sources exist (E-ADMIN) |
