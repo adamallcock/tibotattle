@@ -61,6 +61,12 @@
       "line": 292,
       "symbol": "publicInputs",
       "original": "function publicInputs("
+    },
+    {
+      "path": "apps/worker/src/quota-analysis-v1.ts",
+      "line": 735,
+      "symbol": "buildPricingEvent",
+      "original": "function buildPricingEvent("
     }
   ],
   "counts": {
@@ -69,8 +75,8 @@
     "web": 2,
     "parity": 6,
     "package": 40,
-    "exportPatched": 5,
-    "exportPatchedFiles": 2,
+    "exportPatched": 6,
+    "exportPatchedFiles": 3,
     "typeStubs": 3,
     "parityTests": 10
   },
@@ -323,8 +329,8 @@
     {
       "path": "apps/worker/src/quota-analysis-v1.ts",
       "blob": "fd0240f1dece5e7826b9065af2fca3a2ca9ad471",
-      "sha256": "5cde7bfc7e386fd492b5a7871312babdb261b11541428bef2ba4b9f762f81867",
-      "patch": "none",
+      "sha256": "d8ca925613e1040f3430fc89cf6fa758da4cbdc270e0933e86bca612a94e845e",
+      "patch": "export",
       "reach": "kernel"
     },
     {
