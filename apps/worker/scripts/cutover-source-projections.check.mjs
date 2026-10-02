@@ -1,14 +1,15 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmod, copyFile, lstat, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  CUTOVER_PARTICIPANT_STATES,
   PARTICIPANT_DELETION_DIGEST_DOMAIN,
-  assertNoActiveDeletionMatches,
-  countActiveDeletionMatches,
+  assertNoSealedParticipantDeletionMatches,
+  countSealedParticipantDeletionMatches,
   participantDeletionDigest,
   projectDeletionDigests,
   projectIngestionJournal,
@@ -23,7 +24,13 @@ import {
   sha256File,
 } from "./cutover-source-seal.mjs";
 import { createSealedSqliteIngestionJournalSource } from "./postgres-ingestion-journal-transfer.mjs";
-import { headCommit, outputPathsOf, prepareSealWorld, sealWorld } from "../postgres-test/fixtures/w2-seal/seal-harness.mjs";
+import {
+  forgeVariantSeal,
+  headCommit,
+  outputPathsOf,
+  prepareSealWorld,
+  sealWorld,
+} from "../postgres-test/fixtures/w2-seal/seal-harness.mjs";
 import {
   buildSyntheticDeletionLedgerD1,
   privateDirectory,
@@ -143,7 +150,7 @@ test("the deletion-digest projection holds exactly the sorted synthetic digests,
   }
 });
 
-test("the active-participant intersection is a count only: 0 when clean, 1 with a planted participant", async () => {
+test("the participant intersection is a count only over every state: 0 when clean, 1 with a planted participant", async () => {
   const ingestion = await openSealedSourceFromSeal(seal, "ingestion");
   const ledger = await openSealedSourceFromSeal(seal, "deletion-ledger");
   const directory = await privateDirectory("w2-seal-intersection-");
@@ -151,10 +158,13 @@ test("the active-participant intersection is a count only: 0 when clean, 1 with 
   try {
     const projected = await projectDeletionDigests({ sealedLedger: ledger, outputPath: join(directory, "digests.txt") });
     const digests = await readDeletionDigestProjection({ path: projected.path, expectedSha256: projected.sha256 });
-    const clean = await assertNoActiveDeletionMatches({ sealedIngestion: ingestion, digests });
-    assert.deepEqual(Object.keys(clean).sort(), ["activeParticipants", "deletionDigests", "matches"]);
+    const clean = await assertNoSealedParticipantDeletionMatches({ sealedIngestion: ingestion, digests });
+    assert.deepEqual(Object.keys(clean).sort(), ["deletionDigests", "matches", "participants", "participantsByState"]);
+    assert.deepEqual(Object.keys(clean.participantsByState), [...CUTOVER_PARTICIPANT_STATES]);
     assert.equal(clean.matches, 0);
-    assert.ok(clean.activeParticipants >= 5);
+    assert.ok(clean.participantsByState.active >= 5);
+    assert.equal(clean.participantsByState.deleting, 0);
+    assert.equal(clean.participants, ingestion.database().prepare("SELECT count(*) AS n FROM participants").get().n);
     assert.equal(clean.deletionDigests, world.digests.length);
 
     const plantedLedger = await buildSyntheticDeletionLedgerD1({ directory, commit: COMMIT,
@@ -165,10 +175,10 @@ test("the active-participant intersection is a count only: 0 when clean, 1 with 
       outputPath: join(directory, "planted.txt") });
     const plantedDigests = await readDeletionDigestProjection({ path: plantedProjection.path,
       expectedSha256: plantedProjection.sha256 });
-    const result = await countActiveDeletionMatches({ sealedIngestion: ingestion, digests: plantedDigests });
+    const result = await countSealedParticipantDeletionMatches({ sealedIngestion: ingestion, digests: plantedDigests });
     assert.equal(result.matches, 1);
-    await assert.rejects(assertNoActiveDeletionMatches({ sealedIngestion: ingestion, digests: plantedDigests }),
-      isCode("CUTOVER_ACTIVE_PARTICIPANT_DELETED"));
+    await assert.rejects(assertNoSealedParticipantDeletionMatches({ sealedIngestion: ingestion, digests: plantedDigests }),
+      isCode("CUTOVER_ERASED_PARTICIPANT_PRESENT"));
     const text = JSON.stringify(result);
     assert.equal(text.includes("participant:"), false, "no participant id leaves the intersection");
     assert.equal(text.includes(world.fixture.ids.participant), false);
@@ -176,6 +186,44 @@ test("the active-participant intersection is a count only: 0 when clean, 1 with 
     ingestion.close();
     ledger.close();
     planted?.close();
+  }
+});
+
+test("a 'deleting' participant (an interrupted erasure) is hashed too: its recorded tombstone refuses the seal", async () => {
+  // The Worker marks the participant deleting, then records its tombstone,
+  // and can still fail before the rows are gone; a fence can land there too.
+  const forged = await forgeVariantSeal(seal, `UPDATE participants SET state = 'deleting',
+      deletion_session_id = '${randomUUID()}' WHERE id = '${world.fixture.ids.participant}'`);
+  const variant = await readCutoverSeal({ manifestPath: forged.manifestPath, expectedSealId: forged.sealId });
+  const ingestion = await openSealedSourceFromSeal(variant, "ingestion");
+  try {
+    const tombstones = new Set([...world.digests, participantDeletionDigest(world.fixture.ids.participant)]);
+    const matched = await countSealedParticipantDeletionMatches({ sealedIngestion: ingestion, digests: tombstones });
+    assert.equal(matched.matches, 1);
+    assert.equal(matched.participantsByState.deleting, 1);
+    await assert.rejects(assertNoSealedParticipantDeletionMatches({ sealedIngestion: ingestion, digests: tombstones }),
+      isCode("CUTOVER_ERASED_PARTICIPANT_PRESENT"));
+    // Without a recorded tombstone the intersection is 0, but the participant
+    // is still counted as deleting; PT-3 refuses it before any write
+    // (CUTOVER_PARTICIPANT_ERASURE_PENDING, postgres-identity-authority-transfer).
+    const untombstoned = await countSealedParticipantDeletionMatches({ sealedIngestion: ingestion,
+      digests: new Set(world.digests) });
+    assert.deepEqual([untombstoned.matches, untombstoned.participantsByState.deleting], [0, 1]);
+    assert.equal(JSON.stringify(matched).includes(world.fixture.ids.participant), false);
+  } finally {
+    ingestion.close();
+  }
+  // A state outside the D1 CHECK is not a participant the projection can
+  // account for.
+  const unknown = await forgeVariantSeal(seal, `PRAGMA ignore_check_constraints = ON;
+    UPDATE participants SET state = 'erased' WHERE id = '${world.fixture.ids.participant}'`);
+  const unknownSeal = await readCutoverSeal({ manifestPath: unknown.manifestPath, expectedSealId: unknown.sealId });
+  const unknownIngestion = await openSealedSourceFromSeal(unknownSeal, "ingestion");
+  try {
+    await assert.rejects(countSealedParticipantDeletionMatches({ sealedIngestion: unknownIngestion,
+      digests: new Set(world.digests) }), isCode("CUTOVER_PROJECTION_INVALID"));
+  } finally {
+    unknownIngestion.close();
   }
 });
 

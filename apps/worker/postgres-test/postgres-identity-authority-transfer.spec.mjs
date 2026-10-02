@@ -118,7 +118,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PT-3 identity and authority importer on Postgr
     expect([receipts.rows[0].n, sealed.rows[0].n]).toEqual([0, 0]);
   }
 
-  it("refuses before any write: wrong pin, incomplete or foreign bootstrap, broken chain, unmapped counter or column, contained controls", async () => {
+  it("refuses before any write: wrong pin, incomplete or foreign bootstrap, broken chain, unmapped counter or column, a participant mid-erasure, contained controls", async () => {
     const variants = [
       { label: "wrong identity-link secret", sql: "SELECT 1", pin: { keyVersion: PIN.keyVersion,
         secretFingerprint: identityLinkFingerprint("w2-seal-fixture-not-the-configured-secret-0002") },
@@ -139,6 +139,9 @@ describe.skipIf(!PG_TEST_SOCKET)("PT-3 identity and authority importer on Postgr
         code: "CUTOVER_COUNTER_UNMAPPED" },
       { label: "unmapped column", sql: "ALTER TABLE web_sessions ADD COLUMN synthetic_extra TEXT",
         code: "CUTOVER_COLUMN_UNMAPPED" },
+      { label: "participant mid-erasure", sql: `UPDATE participants SET state = 'deleting',
+          deletion_session_id = '${randomUUID()}' WHERE id = '${world.fixture.ids.participant}'`,
+      code: "CUTOVER_PARTICIPANT_ERASURE_PENDING" },
       { label: "contained controls", sql: `UPDATE collection_controls SET control_state = 'contained',
           enrollment_enabled = 0, upload_registration_enabled = 0, processing_enabled = 0, publication_enabled = 0`,
       code: "CUTOVER_CONTROLS_DEGRADE_IMPOSSIBLE" },
@@ -204,13 +207,31 @@ describe.skipIf(!PG_TEST_SOCKET)("PT-3 identity and authority importer on Postgr
     expect(cleanReceipt.pages.device_upload_authorizations).toBe(Math.ceil(2042 / 97));
 
     // The stage receipt is complete, and a replay of the finished stage
-    // reproduces it without a conflict or a second write.
+    // reproduces it without a conflict or a second write: the controls and
+    // bootstrap rows, every receipt and checkpoint and every imported row
+    // keep their row versions (xmin) and the controls their updated_at.
     const stage = await target.ownerPrimary.query(`SELECT state, receipt_sha256 FROM tibotattle_transfer.transfer_stage_receipts
       WHERE stage = 'identity-authority'`);
     expect(stage.rows).toEqual([{ state: "complete", receipt_sha256: receipt.receiptSha256 }]);
+    const versions = async () => {
+      const relations = [table("collection_controls"), table("community_public_source_bootstrap"),
+        "tibotattle_transfer.transfer_stage_receipts", "tibotattle_transfer.transfer_table_receipts",
+        "tibotattle_transfer.transfer_checkpoints", "tibotattle_transfer.sealed_collection_controls",
+        ...IDENTITY_AUTHORITY_FROZEN_ORDER.map(table), table("input_versions")];
+      const result = {};
+      for (const relation of relations) {
+        result[relation] = (await target.ownerPrimary.query(`SELECT count(*)::int AS n,
+            md5(coalesce(string_agg(xmin::text, ',' ORDER BY xmin::text), '')) AS xmins FROM ${relation}`)).rows[0];
+      }
+      result.controls = (await target.ownerPrimary.query(`SELECT xmin::text AS xmin, updated_at
+        FROM ${table("collection_controls")}`)).rows;
+      return result;
+    };
+    const beforeReplay = await versions();
     const replay = await runIdentityAuthorityTransfer({ handle, sealManifestPath: manifestPath, identityLinkPin: PIN });
     expect(replay.receiptSha256).toBe(receipt.receiptSha256);
     expect(Object.values(replay.pages).every(pages => pages === 0)).toBe(true);
+    expect(await versions()).toEqual(beforeReplay);
 
     const text = JSON.stringify(receipt);
     for (const id of [world.fixture.ids.participant, world.fixture.ids.device, world.fixture.ids.session,

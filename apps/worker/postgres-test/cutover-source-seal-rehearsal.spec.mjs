@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { verifyCutoverFence, verifyCutoverUnchanged } from "../scripts/cutover-source-fence.mjs";
 import {
-  assertNoActiveDeletionMatches,
+  assertNoSealedParticipantDeletionMatches,
   projectDeletionDigests,
   projectIngestionJournal,
   readDeletionDigestProjection,
@@ -108,12 +108,13 @@ describe.skipIf(!PG_TEST_SOCKET)("W2-SEAL cutover source rehearsal on PostgreSQL
       const projectedDigests = await projectDeletionDigests({ sealedLedger: ledger,
         outputPath: join(projections, "deletion-digests.projection.txt") });
       digests = await readDeletionDigestProjection({ path: projectedDigests.path, expectedSha256: projectedDigests.sha256 });
-      intersection = await assertNoActiveDeletionMatches({ sealedIngestion: ingestion, digests });
+      intersection = await assertNoSealedParticipantDeletionMatches({ sealedIngestion: ingestion, digests });
     } finally {
       ingestion.close();
       ledger.close();
     }
     expect(intersection.matches).toBe(0);
+    expect(intersection.participantsByState.deleting).toBe(0);
     expect(intersection.deletionDigests).toBe(world.digests.length);
 
     const journalSchema = `storage_journal_transfer_target_${randomBytes(6).toString("hex")}`;

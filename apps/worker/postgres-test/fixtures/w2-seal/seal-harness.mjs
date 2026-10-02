@@ -3,7 +3,9 @@
 // injected fake transport and fake Wrangler export. Test-only.
 
 import { execFileSync } from "node:child_process";
-import { chmod, copyFile, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { readFileSync, statSync } from "node:fs";
+import { chmod, copyFile, mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import {
@@ -15,6 +17,7 @@ import {
 } from "../../../scripts/cutover-source-seal.mjs";
 import {
   SYNTHETIC_BOOKMARKS,
+  SYNTHETIC_D1,
   SYNTHETIC_DATABASE_NAMES,
   writeBarrierProofFixture,
   writeFenceReceiptFixture,
@@ -126,4 +129,70 @@ export async function forgeVariantSeal(seal, mutateSql) {
   const manifestPath = join(directory, "seal-manifest.json");
   await writePrivateFileOnce(manifestPath, `${canonicalJson({ ...next, sealId })}\n`, 0o400);
   return { directory, manifestPath, sealId, sealedAt: seal.manifest.createdAt };
+}
+
+/**
+ * A synthetic stand-in for the pinned Wrangler package, enough for the query
+ * launcher's CLI check (name wrangler, version 4.114.0, wrangler-dist/cli.js).
+ * It is never executed: the injected spawn answers every call.
+ */
+export async function writeFakeWranglerCli(directory) {
+  const root = join(directory, "wrangler");
+  await mkdir(join(root, "wrangler-dist"), { recursive: true, mode: 0o700 });
+  await writeFile(join(root, "package.json"), JSON.stringify({ name: "wrangler", version: "4.114.0",
+    main: "wrangler-dist/cli.js" }), { mode: 0o600 });
+  const cliPath = join(root, "wrangler-dist", "cli.js");
+  await writeFile(cliPath, "// synthetic stand-in; never executed\n", { mode: 0o600 });
+  return cliPath;
+}
+
+function roleOfConfig(configPath) {
+  const config = JSON.parse(readFileSync(configPath, "utf8"));
+  const databaseId = config.d1_databases?.[0]?.database_id;
+  const role = Object.keys(SYNTHETIC_DATABASE_NAMES).find(candidate => SYNTHETIC_D1[candidate] === databaseId);
+  if (role === undefined) throw new Error("W2_SEAL_FIXTURE_UNKNOWN_DATABASE");
+  return role;
+}
+
+/**
+ * The injected spawn behind the DEFAULT Wrangler transport and export (no
+ * provider is contacted): `d1 time-travel info <name> --json --config <c>`
+ * answers {bookmark} from `bookmarks` (a value, or a function of that role's
+ * call number); the query launcher's `d1 execute` runs the frozen SQL file
+ * (its sha256 checked as the preload does) on the role's synthetic file and
+ * answers Wrangler's JSON envelope; `d1 export` is createFakeWranglerSpawn.
+ * Each call records its kind, role and the pinned config's mode.
+ */
+export function createFakeWranglerProviderSpawn(world, { bookmarks = SYNTHETIC_BOOKMARKS, calls = [], observations = [] } = {}) {
+  const exporter = createFakeWranglerSpawn({ sources: world.exportPaths, observations });
+  const counts = {};
+  return (command, args, options) => {
+    if (args.includes("export")) {
+      calls.push({ kind: "export" });
+      return exporter(command, args, options);
+    }
+    const configPath = args[args.indexOf("--config") + 1];
+    const role = roleOfConfig(configPath);
+    const configMode = statSync(configPath).mode & 0o777;
+    if (args.includes("time-travel")) {
+      calls.push({ kind: "bookmark", role, configMode });
+      counts[role] = (counts[role] ?? 0) + 1;
+      const value = bookmarks[role];
+      return { status: 0, signal: null, stdout: JSON.stringify({ bookmark: typeof value === "function" ? value(counts[role]) : value }),
+        stderr: "" };
+    }
+    const flag = name => args.find(arg => arg.startsWith(`${name}=`))?.slice(name.length + 1);
+    const sql = readFileSync(flag("--tibo-query-path"), "utf8");
+    if (!args.includes("execute") || createHash("sha256").update(sql).digest("hex") !== flag("--tibo-query-sha256")) {
+      return { status: 1, signal: null, stdout: "", stderr: "" };
+    }
+    calls.push({ kind: "query", role, configMode });
+    const database = new DatabaseSync(world.remotePaths[role], { readOnly: true });
+    try {
+      const results = database.prepare(sql).all().map(row => ({ ...row }));
+      return { status: 0, signal: null, stdout: JSON.stringify([{ results, success: true, meta: {} }]), stderr: "" };
+    } finally {
+      database.close();
+    }
+  };
 }

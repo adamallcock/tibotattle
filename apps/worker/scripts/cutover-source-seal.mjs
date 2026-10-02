@@ -81,6 +81,7 @@ export const CUTOVER_ERROR_CODES = Object.freeze([
   "CUTOVER_AGGREGATE_MISMATCH",
   "CUTOVER_ARGUMENT_INVALID",
   "CUTOVER_BARRIER_PROOF_INVALID",
+  "CUTOVER_ERASED_PARTICIPANT_PRESENT",
   "CUTOVER_EXPECTED_LEDGER_INVALID",
   "CUTOVER_EXPORT_FAILED",
   "CUTOVER_EXPORT_FILE_UNSAFE",
@@ -96,7 +97,6 @@ export const CUTOVER_ERROR_CODES = Object.freeze([
   "CUTOVER_OUTPUT_EXISTS",
   "CUTOVER_OWNER_DIRECTORY_UNSAFE",
   "CUTOVER_PROJECTION_INVALID",
-  "CUTOVER_ACTIVE_PARTICIPANT_DELETED",
   "CUTOVER_REBUILD_FAILED",
   "CUTOVER_REMOTE_NOT_AUTHORIZED",
   "CUTOVER_REMOTE_RESPONSE_INVALID",
@@ -741,6 +741,11 @@ function wranglerEnvironment(environment, accountId, logPath) {
   };
 }
 
+/** The pinned one-database Wrangler config of a role (account id, D1 name and id; 0600). */
+function pinnedConfigPath(directory, role) {
+  return join(directory, `${role}.wrangler.json`);
+}
+
 async function writePinnedConfig(directory, source, accountId) {
   const body = `${JSON.stringify({
     name: "tibotattle-cutover-seal",
@@ -748,7 +753,7 @@ async function writePinnedConfig(directory, source, accountId) {
     compatibility_date: "2026-09-11",
     d1_databases: [{ binding: source.binding, database_name: source.databaseName, database_id: source.databaseId }],
   })}\n`;
-  const path = join(directory, `${source.role}.wrangler.json`);
+  const path = pinnedConfigPath(directory, source.role);
   if (!await exists(path)) await writePrivateFileOnce(path, body, 0o600);
   const stored = await readPrivateFile(path, 64 * 1024, "CUTOVER_OWNER_DIRECTORY_UNSAFE");
   if (!stored.equals(Buffer.from(body))) fail("CUTOVER_OWNER_DIRECTORY_UNSAFE");
@@ -757,8 +762,12 @@ async function writePinnedConfig(directory, source, accountId) {
 
 /**
  * The real read-only Wrangler transport (pinned private one-database config,
- * the reviewed query launcher, child stdio piped and dropped). Wired, never
- * run by tests or by this package: it needs remote plus ownerReadOnly.
+ * the reviewed query launcher, child stdio piped and dropped). It needs
+ * remote plus ownerReadOnly; tests drive it only through an injected spawn,
+ * never the provider. Each role's pinned config is written once into
+ * transportDirectory (a config this transport did not write is
+ * CUTOVER_OUTPUT_EXISTS) and dispose() removes every config it wrote; the
+ * caller disposes on success and on failure.
  */
 export function createWranglerCutoverTransport({
   inventory, transportDirectory, cliPath = DEFAULT_CLI_PATH, spawn = spawnSync, environment = process.env,
@@ -766,6 +775,14 @@ export function createWranglerCutoverTransport({
 } = {}) {
   if (remote !== true || ownerReadOnly !== true) fail("CUTOVER_REMOTE_NOT_AUTHORIZED");
   let sequence = 0;
+  const configs = new Set();
+  // Track the path before the first write so a failed write is still removed.
+  const pinnedConfig = async (source) => {
+    const path = pinnedConfigPath(transportDirectory, source.role);
+    if (!configs.has(path) && await exists(path)) fail("CUTOVER_OUTPUT_EXISTS", { role: source.role });
+    configs.add(path);
+    return writePinnedConfig(transportDirectory, source, inventory.accountId);
+  };
   const run = (command, args, logPath) => {
     let result;
     try {
@@ -781,7 +798,7 @@ export function createWranglerCutoverTransport({
   };
   return Object.freeze({
     async bookmark(source) {
-      const config = await writePinnedConfig(transportDirectory, source, inventory.accountId);
+      const config = await pinnedConfig(source);
       const logPath = join(transportDirectory, `${source.role}.bookmark-${sequence++}.log`);
       try {
         const stdout = run(process.execPath, [cliPath, "d1", "time-travel", "info", source.databaseName, "--json",
@@ -796,7 +813,7 @@ export function createWranglerCutoverTransport({
     },
     async query(source, sql) {
       assertSelectOnly(sql);
-      const config = await writePinnedConfig(transportDirectory, source, inventory.accountId);
+      const config = await pinnedConfig(source);
       const sqlPath = join(transportDirectory, `${source.role}.query-${sequence++}.sql`);
       const logPath = `${sqlPath}.log`;
       await writePrivateFileOnce(sqlPath, sql, 0o600);
@@ -814,6 +831,13 @@ export function createWranglerCutoverTransport({
       } finally {
         await removeIfPresent(sqlPath).catch(() => {});
         await removeIfPresent(logPath).catch(() => {});
+      }
+    },
+    /** Remove every pinned config this transport wrote (idempotent). */
+    async dispose() {
+      for (const path of [...configs]) {
+        await removeIfPresent(path);
+        configs.delete(path);
       }
     },
   });
@@ -1377,23 +1401,29 @@ export async function runCutoverSeal({
   if (await exists(manifestPath)) fail("CUTOVER_OUTPUT_EXISTS");
   const created = [];
   const previousUmask = process.umask(0o077);
+  // The default transport writes its own pinned configs into the owner
+  // directory; it is disposed on every path, before the manifest on success.
+  let ownedTransport = null;
   try {
-    const guarded = guardCutoverTransport(transport ?? createWranglerCutoverTransport({
+    ownedTransport = transport === undefined ? createWranglerCutoverTransport({
       inventory, transportDirectory: directory, cliPath, spawn, environment, remote, ownerReadOnly,
-    }), inventory);
+    }) : null;
+    const guarded = guardCutoverTransport(transport ?? ownedTransport, inventory);
     const sealedSources = [];
     for (const role of CUTOVER_SOURCE_ROLES) {
       const source = inventory.sources[role];
       const paths = sealPaths(directory, role);
-      for (const path of [paths.dump, paths.rebuild, paths.sealed, paths.log]) {
+      const configPath = pinnedConfigPath(directory, role);
+      for (const path of [paths.dump, paths.rebuild, paths.sealed, paths.log, configPath]) {
         if (await exists(path)) fail("CUTOVER_OUTPUT_EXISTS", { role });
       }
+      created.push(configPath);
       const fenced = fence.sources[role];
       const b0 = await guarded.bookmark(source);
       if (b0 !== fenced.bookmark) fail("CUTOVER_SOURCE_BOOKMARK_DRIFT", { role });
       const remoteFacts = await readRemoteSourceFacts(guarded, source);
-      const configPath = await writePinnedConfig(directory, source, inventory.accountId);
-      created.push(configPath, paths.dump, paths.log, paths.rebuild, paths.sealed);
+      created.push(paths.dump, paths.log, paths.rebuild, paths.sealed);
+      await writePinnedConfig(directory, source, inventory.accountId);
       await createPrivateEmptyFile(paths.dump);
       await createPrivateEmptyFile(paths.log);
       const exported = runExport({ spawn, cliPath, source, configPath, outputPath: paths.dump, logPath: paths.log,
@@ -1448,6 +1478,7 @@ export async function runCutoverSeal({
       }));
       await removeIfPresent(configPath);
     }
+    await ownedTransport?.dispose();
     const createdAt = now().toISOString();
     if (!INSTANT.test(createdAt)) fail("CUTOVER_ARGUMENT_INVALID");
     const body = {
@@ -1467,6 +1498,7 @@ export async function runCutoverSeal({
     return Object.freeze({ mode: "sealed", manifestPath, manifestSha256, sealId, manifest });
   } catch (error) {
     await cleanupArtifacts(created);
+    await ownedTransport?.dispose().catch(() => {});
     if (error instanceof CutoverSourceError) throw error;
     return fail("CUTOVER_REBUILD_FAILED");
   } finally {

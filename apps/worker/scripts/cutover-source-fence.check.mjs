@@ -19,7 +19,14 @@ import {
   writeFenceReceiptFixture,
   writeInventoryFixture,
 } from "../postgres-test/fixtures/w2-seal/fence-fixtures.mjs";
-import { headCommit, outputPathsOf, prepareSealWorld, sealWorld } from "../postgres-test/fixtures/w2-seal/seal-harness.mjs";
+import {
+  createFakeWranglerProviderSpawn,
+  headCommit,
+  outputPathsOf,
+  prepareSealWorld,
+  sealWorld,
+  writeFakeWranglerCli,
+} from "../postgres-test/fixtures/w2-seal/seal-harness.mjs";
 import { createFakeCutoverTransport, privateDirectory } from "../postgres-test/fixtures/w2-seal/synthetic-sources.mjs";
 
 // PT-2-lite fence consumption: verify-fence over a synthetic EP-8 receipt
@@ -118,6 +125,16 @@ test("the barrier proof is closed: barrier health with sourceCommit and a 503 MU
   const otherCommit = await writeBarrierProofFixture({ directory, sourceCommit: "e".repeat(40), name: "other.json" });
   await assert.rejects(verifyCutoverFence(fenceArgs({ barrierProofPath: otherCommit.path })),
     error => isCode("CUTOVER_BARRIER_PROOF_INVALID")(error) && error.check === "source-commit");
+  // EP-8 records a null commit when the live binding is absent or invalid:
+  // no proof, from any build, binds to that receipt.
+  const unpinned = await writeFenceReceiptFixture({ directory: await privateDirectory("w2-seal-fence-unpinned-"),
+    sourceCommit: null });
+  for (const commit of [SYNTHETIC_SOURCE_COMMIT, "e".repeat(40), "1".repeat(40)]) {
+    const proofFile = await writeBarrierProofFixture({ directory, sourceCommit: commit, name: `unpinned-${commit[0]}.json` });
+    await assert.rejects(verifyCutoverFence(fenceArgs({ fenceReceiptPath: unpinned.path, fenceReceiptSha256: unpinned.sha256,
+      barrierProofPath: proofFile.path })), error => isCode("CUTOVER_BARRIER_PROOF_INVALID")(error)
+      && error.check === "source-commit", commit);
+  }
   const early = await writeBarrierProofFixture({ directory, observedAtMs: world.fence.observedAfterMs - MINUTE, name: "early.json" });
   await assert.rejects(verifyCutoverFence(fenceArgs({ barrierProofPath: early.path })),
     error => isCode("CUTOVER_BARRIER_PROOF_INVALID")(error) && error.check === "observed-at");
@@ -175,6 +192,37 @@ test("verify-unchanged emits 0400 flip evidence only when every bookmark and agg
     isCode("CUTOVER_REMOTE_NOT_AUTHORIZED"));
   await assert.rejects(verifyCutoverUnchanged(unchangedArgs({ ownerDirectory: out, transport })),
     isCode("CUTOVER_OUTPUT_EXISTS"), "a second verification never overwrites the evidence");
+});
+
+test("verify-unchanged through the default Wrangler transport leaves only flip-evidence.json, or nothing", async () => {
+  // The real transport code path, driven by an injected spawn and a
+  // synthetic CLI stand-in; no provider and no Wrangler is run.
+  const cliPath = await writeFakeWranglerCli(await privateDirectory("w2-seal-cli-"));
+  const out = await privateDirectory("w2-seal-flip-default-");
+  const calls = [];
+  const result = await verifyCutoverUnchanged(unchangedArgs({ ownerDirectory: out, cliPath, environment: {},
+    spawn: createFakeWranglerProviderSpawn(world, { calls }) }));
+  assert.equal(result.mode, "verified");
+  assert.deepEqual(await readdir(out), ["flip-evidence.json"]);
+  for (const role of ["ingestion", "deletion-ledger"]) {
+    assert.ok(calls.some(call => call.role === role && call.kind === "bookmark"), role);
+    assert.ok(calls.some(call => call.role === role && call.kind === "query"), role);
+  }
+  assert.ok(calls.every(call => call.configMode === 0o600));
+
+  for (const bookmarks of [{ ...SYNTHETIC_BOOKMARKS, ingestion: "00000001-11111111-00000045" },
+    { ...SYNTHETIC_BOOKMARKS, "deletion-ledger": "00000001-33333333-00000004" }]) {
+    const failed = await privateDirectory("w2-seal-flip-default-drift-");
+    await assert.rejects(verifyCutoverUnchanged(unchangedArgs({ ownerDirectory: failed, cliPath, environment: {},
+      spawn: createFakeWranglerProviderSpawn(world, { bookmarks }) })), isCode("CUTOVER_SOURCE_CHANGED_AFTER_SEAL"));
+    assert.deepEqual(await readdir(failed), [], "no pinned config is left");
+  }
+  // A config this verification did not write is refused and left alone.
+  const stale = await privateDirectory("w2-seal-flip-default-stale-");
+  await writeFile(join(stale, "ingestion.wrangler.json"), "{}\n", { mode: 0o600 });
+  await assert.rejects(verifyCutoverUnchanged(unchangedArgs({ ownerDirectory: stale, cliPath, environment: {},
+    spawn: createFakeWranglerProviderSpawn(world) })), isCode("CUTOVER_OUTPUT_EXISTS"));
+  assert.deepEqual(await readdir(stale), ["ingestion.wrangler.json"]);
 });
 
 test("verify-unchanged refuses a moved bookmark, a changed aggregate, a changed schema or a changed sealed file", async () => {

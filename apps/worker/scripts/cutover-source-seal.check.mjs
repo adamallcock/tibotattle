@@ -33,7 +33,14 @@ import {
   SYNTHETIC_D1,
   writeInventoryFixture,
 } from "../postgres-test/fixtures/w2-seal/fence-fixtures.mjs";
-import { headCommit, outputPathsOf, prepareSealWorld, sealWorld } from "../postgres-test/fixtures/w2-seal/seal-harness.mjs";
+import {
+  createFakeWranglerProviderSpawn,
+  headCommit,
+  outputPathsOf,
+  prepareSealWorld,
+  sealWorld,
+  writeFakeWranglerCli,
+} from "../postgres-test/fixtures/w2-seal/seal-harness.mjs";
 import {
   DEFAULT_INGESTION_LEDGERS,
   Q1_INGESTION_DUMP,
@@ -406,4 +413,77 @@ test("a D1 id outside the inventory is never sealed", async () => {
   assert.equal(foreign.observations.length, 0);
   await assert.rejects(runCutoverSeal({ ...foreign.options, inventoryPath: join(directory, "absent.json") }),
     isCode("CUTOVER_INVENTORY_UNSAFE"));
+});
+
+test("the default Wrangler transport removes its pinned configs: only the sealed files on success, nothing on failure", async () => {
+  // The real transport and export code paths, driven by an injected spawn
+  // and a synthetic CLI stand-in; no provider and no Wrangler is run.
+  const cliPath = await writeFakeWranglerCli(await privateDirectory("w2-seal-cli-"));
+  const defaultTransport = (spawnOptions = {}, overrides = {}) => {
+    const calls = [];
+    const run = sealWorld(world, { overrides: { transport: undefined, cliPath, environment: {},
+      spawn: createFakeWranglerProviderSpawn(world, { calls, ...spawnOptions }), ...overrides } });
+    return run.then(value => ({ ...value, calls }));
+  };
+
+  const sealed = await defaultTransport();
+  const result = await sealed.run();
+  assert.equal(result.mode, "sealed");
+  assert.deepEqual(await listing(sealed.out),
+    ["deletion-ledger.sealed.sqlite", "ingestion.sealed.sqlite", "seal-manifest.json"]);
+  for (const role of ["ingestion", "deletion-ledger"]) {
+    const remote = sealed.calls.filter(call => call.role === role);
+    assert.ok(remote.some(call => call.kind === "bookmark") && remote.some(call => call.kind === "query"), role);
+    assert.ok(remote.every(call => call.configMode === 0o600), `${role}: the pinned config is 0600 while in use`);
+  }
+  // Wrangler's JSON envelope yields exactly the facts the injected transport reads.
+  const injected = await (await sealWorld(world)).run();
+  for (const [index, source] of result.manifest.sources.entries()) {
+    const other = injected.manifest.sources[index];
+    assert.deepEqual([source.schemaSha256, source.aggregatesSha256, source.sequenceSha256, source.ledgerSha256],
+      [other.schemaSha256, other.aggregatesSha256, other.sequenceSha256, other.ledgerSha256], source.role);
+  }
+
+  const failures = [
+    // B0 drift: the transport has written the ingestion config, the seal nothing.
+    { bookmarks: { ...SYNTHETIC_BOOKMARKS, ingestion: "00000001-11111111-00000043" }, code: "CUTOVER_SOURCE_BOOKMARK_DRIFT" },
+    // B1 drift, after the export: both the seal's and the transport's artifacts exist.
+    { bookmarks: { ...SYNTHETIC_BOOKMARKS, ingestion: call => (call === 1 ? SYNTHETIC_BOOKMARKS.ingestion
+      : "00000001-11111111-00000044") }, code: "CUTOVER_SOURCE_BOOKMARK_DRIFT" },
+    // The second source fails after the first was sealed.
+    { bookmarks: { ...SYNTHETIC_BOOKMARKS, "deletion-ledger": "00000001-33333333-00000009" },
+      code: "CUTOVER_SOURCE_BOOKMARK_DRIFT" },
+  ];
+  for (const failure of failures) {
+    const failed = await defaultTransport({ bookmarks: failure.bookmarks });
+    await assert.rejects(failed.run(), isCode(failure.code));
+    assert.ok(failed.calls.some(call => call.kind === "bookmark"));
+    assert.deepEqual(await listing(failed.out), [], "no config, dump, log or sealed file is left");
+  }
+
+  // A config this run did not write is never adopted or removed.
+  const stale = await defaultTransport();
+  await writeFile(join(stale.out, "ingestion.wrangler.json"), "{}\n", { mode: 0o600 });
+  await assert.rejects(stale.run(), isCode("CUTOVER_OUTPUT_EXISTS"));
+  assert.deepEqual(await listing(stale.out), ["ingestion.wrangler.json"]);
+  assert.equal(stale.calls.length, 0);
+});
+
+test("createWranglerCutoverTransport disposes every pinned config it wrote", async () => {
+  const inventory = await readCutoverInventory(world.inventory.path);
+  const directory = await privateDirectory("w2-seal-transport-");
+  const cliPath = await writeFakeWranglerCli(await privateDirectory("w2-seal-cli-"));
+  const calls = [];
+  const transport = createWranglerCutoverTransport({ inventory, transportDirectory: directory, cliPath, environment: {},
+    spawn: createFakeWranglerProviderSpawn(world, { calls }), remote: true, ownerReadOnly: true });
+  assert.equal(await transport.bookmark(inventory.sources.ingestion), SYNTHETIC_BOOKMARKS.ingestion);
+  assert.equal(await transport.bookmark(inventory.sources["deletion-ledger"]), SYNTHETIC_BOOKMARKS["deletion-ledger"]);
+  const rows = await transport.query(inventory.sources.ingestion, CUTOVER_SCHEMA_SQL);
+  assert.ok(rows.length > 0);
+  assert.deepEqual(await listing(directory), ["deletion-ledger.wrangler.json", "ingestion.wrangler.json"]);
+  for (const name of await listing(directory)) assert.equal((await lstat(join(directory, name))).mode & 0o777, 0o600);
+  await transport.dispose();
+  assert.deepEqual(await listing(directory), []);
+  await transport.dispose();
+  assert.deepEqual(calls.map(call => call.kind), ["bookmark", "bookmark", "query"]);
 });

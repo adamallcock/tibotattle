@@ -26,8 +26,12 @@
 //     COLUMN_MAP closure (CUTOVER_COLUMN_UNMAPPED), the frozen COUNTER_MAPPING
 //     over sqlite_sequence (CUTOVER_COUNTER_UNMAPPED), the identity-link pin
 //     against the configured fingerprint (CUTOVER_IDENTITY_LINK_SECRET_MISMATCH),
-//     the bootstrap (CUTOVER_PUBLIC_SOURCE_BOOTSTRAP_INCOMPLETE), the
-//     accountless authority chain (CUTOVER_ACCOUNTLESS_AUTHORITY_CHAIN_INVALID),
+//     erasure quiescence: every sealed participant 'active' with no
+//     deletion fence (CUTOVER_PARTICIPANT_ERASURE_PENDING; an interrupted
+//     Cloudflare erasure is never completed in PostgreSQL, which has no
+//     online erasure, so the owner finishes it and re-seals), the bootstrap
+//     (CUTOVER_PUBLIC_SOURCE_BOOTSTRAP_INCOMPLETE), the accountless authority
+//     chain (CUTOVER_ACCOUNTLESS_AUTHORITY_CHAIN_INVALID),
 //     the import transfer session, the reviewed trigger policy coverage and
 //     the frozen FK-topological order against the target's foreign keys.
 //   * Tables import in pages of at most 256 rows and 4 MiB. Each page is one
@@ -59,6 +63,7 @@ import {
   PostgresTransferTargetError,
   advancePrefixChain,
   applyIdentityHighWater,
+  assertCollectionControlsDegradedForImport,
   assertInstantRoundTrip,
   assertTriggerPolicyCoverage,
   createRowsDigest,
@@ -92,6 +97,7 @@ export const IDENTITY_AUTHORITY_ERROR_CODES = Object.freeze([
   "CUTOVER_IDENTITY_TRANSFER_FAILED",
   "CUTOVER_IMPORT_ORDER_INVALID",
   "CUTOVER_PAGE_ROW_TOO_LARGE",
+  "CUTOVER_PARTICIPANT_ERASURE_PENDING",
   "CUTOVER_PUBLIC_SOURCE_BOOTSTRAP_INCOMPLETE",
   "CUTOVER_SEEDED_ROW_UNMATCHED",
   "CUTOVER_SOURCE_SINGLETON_INVALID",
@@ -572,6 +578,19 @@ function assertIdentityLinkPin(database, pin) {
   }
 }
 
+/**
+ * Erasure quiescence (PT-8): no sealed participant may be mid-erasure. A
+ * 'deleting' row, or any row still carrying a deletion fence, is an
+ * interrupted Cloudflare erasure whose tombstone may already be recorded.
+ * PostgreSQL has no online erasure (SIMP-1), so nothing would ever finish
+ * it there; it is refused before any write. Only a count leaves here.
+ */
+function assertParticipantsQuiescent(database) {
+  const [row] = sourceAll(database, `SELECT count(*) AS n FROM participants
+    WHERE state IS NOT 'active' OR deletion_session_id IS NOT NULL`, [], "participants");
+  if (row?.n !== 0n) fail("CUTOVER_PARTICIPANT_ERASURE_PENDING", { table: "participants" });
+}
+
 function assertCounters(database) {
   const present = sourceAll(database, "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'sqlite_sequence'").length === 1;
   const counters = present ? sourceAll(database, "SELECT name, seq FROM sqlite_sequence ORDER BY name") : [];
@@ -968,6 +987,7 @@ export async function runIdentityAuthorityTransfer({
     for (const table of IDENTITY_AUTHORITY_TARGET_MISSING) {
       if (!sourceTablePresent(database, table)) fail("CUTOVER_SOURCE_TABLE_MISSING", { table });
     }
+    assertParticipantsQuiescent(database);
     // Every sealed value is canonicalized (and the table digest taken) now,
     // so an invalid value refuses here rather than after earlier pages.
     const sourceFacts = new Map(ENTRIES.map(item => [item.name, sourceTableFacts(database, item.spec, pageRows)]));
@@ -980,16 +1000,24 @@ export async function runIdentityAuthorityTransfer({
     await sealed.verify();
 
     // Stage start: receipts, controls and the bootstrap singleton, in one
-    // transaction (an invalid sealed controls row rolls it all back).
+    // transaction (an invalid sealed controls row rolls it all back). A
+    // replay of a completed stage writes no application row: it only proves
+    // the controls are still degraded at the sealed revision and the
+    // bootstrap still equals the seal (the receipt helpers are no-ops on
+    // equal complete rows and refuse a conflicting one).
     const controlsRecord = await withTransferTransaction(handle, "primary", async client => {
       await requireImportingRun(client, handle);
-      await stageReceipt(client, handle, { stage: IDENTITY_AUTHORITY_STAGE, state: "started" });
+      const started = await stageReceipt(client, handle, { stage: IDENTITY_AUTHORITY_STAGE, state: "started" });
       const recorded = await recordSealedCollectionControls(client, handle, controls);
-      await degradeCollectionControlsForImport(client, handle);
-      const updated = await q(client, `UPDATE ${quote(handle.primarySchema)}."community_public_source_bootstrap"
-          SET policy_version = $2, participant_cursor = $3, source_day_cursor = $4, completed = $5
-        WHERE singleton = $1`, bootstrap.canonical.parameters, "community_public_source_bootstrap");
-      if (updated.rowCount !== 1) fail("CUTOVER_SEEDED_ROW_UNMATCHED", { table: "community_public_source_bootstrap" });
+      if (started.state === "complete") {
+        await assertCollectionControlsDegradedForImport(client, handle);
+      } else {
+        await degradeCollectionControlsForImport(client, handle);
+        const updated = await q(client, `UPDATE ${quote(handle.primarySchema)}."community_public_source_bootstrap"
+            SET policy_version = $2, participant_cursor = $3, source_day_cursor = $4, completed = $5
+          WHERE singleton = $1`, bootstrap.canonical.parameters, "community_public_source_bootstrap");
+        if (updated.rowCount !== 1) fail("CUTOVER_SEEDED_ROW_UNMATCHED", { table: "community_public_source_bootstrap" });
+      }
       const bootstrapTarget = await targetTableFacts(client, handle.primarySchema,
         { name: BOOTSTRAP_SPEC.name, spec: BOOTSTRAP_SPEC });
       const sourceDigest = createRowsDigest();

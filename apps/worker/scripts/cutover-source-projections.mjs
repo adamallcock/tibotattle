@@ -14,10 +14,15 @@
 //                       written 0400 with its sha256. No ledger table is
 //                       imported anywhere.
 //   intersection        computes src/participant-deletion-digest.ts's digest
-//                       for every sealed ACTIVE participant in memory and
-//                       reports only the number that match a projected
-//                       digest. It must be 0 (CUTOVER_ACTIVE_PARTICIPANT_DELETED
-//                       otherwise). No participant id is ever written.
+//                       for every sealed participant, whatever its state, in
+//                       memory and reports only counts: participants per
+//                       state and the number that match a projected digest.
+//                       It must be 0 (CUTOVER_ERASED_PARTICIPANT_PRESENT
+//                       otherwise). No participant id is ever written. A
+//                       'deleting' participant (an interrupted Cloudflare
+//                       erasure) is hashed like any other: its tombstone may
+//                       already be recorded. PT-3 separately refuses any
+//                       participant that is not quiescent.
 
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
@@ -167,35 +172,44 @@ export async function readDeletionDigestProjection({ path, expectedSha256 } = {}
   return Object.freeze(new Set(digests));
 }
 
+// The participant states the D1 schema admits (migrations 0001 and 0058:
+// CHECK (state IN ('active', 'deleting'))). Any other value is not a
+// participant this projection can account for.
+export const CUTOVER_PARTICIPANT_STATES = Object.freeze(["active", "deleting"]);
+
 /**
- * Count, in memory, the sealed ACTIVE participants whose deletion digest is
- * in the projected set. Only counts leave this function.
+ * Count, in memory, the sealed participants (every state) whose deletion
+ * digest is in the projected set. Only counts leave this function.
  */
-export async function countActiveDeletionMatches({ sealedIngestion, digests } = {}) {
+export async function countSealedParticipantDeletionMatches({ sealedIngestion, digests } = {}) {
   const source = trusted(sealedIngestion);
   if (!(digests instanceof Set) || [...digests].some(digest => !DIGEST.test(digest))) fail("CUTOVER_ARGUMENT_INVALID");
   await source.verify();
-  const statement = source.database().prepare("SELECT id FROM participants WHERE state = 'active' AND id > ? ORDER BY id LIMIT 1000");
+  const statement = source.database().prepare("SELECT id, state FROM participants WHERE id > ? ORDER BY id LIMIT 1000");
+  const byState = Object.fromEntries(CUTOVER_PARTICIPANT_STATES.map(state => [state, 0]));
   let after = "";
-  let active = 0;
+  let participants = 0;
   let matches = 0;
   for (;;) {
     const page = statement.all(after);
     for (const row of page) {
-      active += 1;
+      if (typeof row.state !== "string" || !Object.hasOwn(byState, row.state)) fail("CUTOVER_PROJECTION_INVALID");
+      participants += 1;
+      byState[row.state] += 1;
       if (digests.has(participantDeletionDigest(row.id))) matches += 1;
     }
     if (page.length < 1000) break;
     after = page.at(-1).id;
   }
   await source.verify();
-  return Object.freeze({ activeParticipants: active, deletionDigests: digests.size, matches });
+  return Object.freeze({ participants, participantsByState: Object.freeze(byState), deletionDigests: digests.size,
+    matches });
 }
 
-/** The gate form: zero matches, or CUTOVER_ACTIVE_PARTICIPANT_DELETED. */
-export async function assertNoActiveDeletionMatches(options) {
-  const result = await countActiveDeletionMatches(options);
-  if (result.matches !== 0) fail("CUTOVER_ACTIVE_PARTICIPANT_DELETED");
+/** The gate form: zero matches, or CUTOVER_ERASED_PARTICIPANT_PRESENT. */
+export async function assertNoSealedParticipantDeletionMatches(options) {
+  const result = await countSealedParticipantDeletionMatches(options);
+  if (result.matches !== 0) fail("CUTOVER_ERASED_PARTICIPANT_PRESENT");
   return result;
 }
 
@@ -235,7 +249,7 @@ async function main(argv) {
       expectedSha256: options.digestsSha256 });
     const ingestion = await openSealedSourceFromSeal(seal, "ingestion");
     try {
-      const result = await countActiveDeletionMatches({ sealedIngestion: ingestion, digests });
+      const result = await countSealedParticipantDeletionMatches({ sealedIngestion: ingestion, digests });
       process.stdout.write(`${JSON.stringify({ command: options.command, ...result })}\n`);
       if (result.matches !== 0) process.exitCode = 1;
     } finally {

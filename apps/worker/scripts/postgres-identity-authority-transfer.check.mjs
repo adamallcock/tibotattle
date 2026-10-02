@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -197,6 +198,15 @@ test("every sealed-source refusal fires before the target is touched", async () 
     "CUTOVER_SOURCE_VALUE_INVALID"],
     [`PRAGMA ignore_check_constraints = ON;
       UPDATE accountless_enrollment_issuance SET budget_day = '2026-13-45'`, PIN, "CUTOVER_SOURCE_VALUE_INVALID"],
+    // Erasure quiescence: an interrupted Cloudflare erasure (deleting with
+    // its fence, a restore-replay NULL fence, or a fence left on an active
+    // row) is refused whether or not its tombstone was recorded.
+    [`UPDATE participants SET state = 'deleting', deletion_session_id = '${randomUUID()}'
+       WHERE id = '${world.fixture.ids.participant}'`, PIN, "CUTOVER_PARTICIPANT_ERASURE_PENDING"],
+    [`UPDATE participants SET state = 'deleting' WHERE id = '${world.fixture.ids.participant}'`, PIN,
+      "CUTOVER_PARTICIPANT_ERASURE_PENDING"],
+    [`UPDATE participants SET deletion_session_id = '${randomUUID()}' WHERE id = '${world.fixture.ids.participant}'`, PIN,
+      "CUTOVER_PARTICIPANT_ERASURE_PENDING"],
   ];
   for (const [sql, pin, code] of cases) {
     const forged = await forgeVariantSeal(seal, sql);

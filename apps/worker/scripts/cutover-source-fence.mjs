@@ -182,8 +182,12 @@ export async function verifyCutoverFence({
   if (appliedMs === null || observedMs < appliedMs || observedMs > now()) {
     fail("CUTOVER_BARRIER_PROOF_INVALID", { check: "observed-at" });
   }
+  // The proof binds to the fenced version only through this commit. EP-8
+  // records null when the live DEPLOYMENT_SOURCE_COMMIT binding is absent or
+  // invalid; such a Worker cannot answer the barrier health this proof
+  // requires, and a null pin would accept a proof captured from any build.
   const pinnedCommit = receipt.productionWorker.sourceCommit;
-  if (pinnedCommit !== null && pinnedCommit !== proof.sourceCommit) {
+  if (typeof pinnedCommit !== "string" || !COMMIT.test(pinnedCommit) || pinnedCommit !== proof.sourceCommit) {
     fail("CUTOVER_BARRIER_PROOF_INVALID", { check: "source-commit" });
   }
   const barrierProofSha256 = sha256Hex(proofBytes);
@@ -209,7 +213,11 @@ export async function verifyCutoverFence({
  * verify-unchanged --seal: every bookmark, schema digest and aggregate digest
  * read now through the read-only transport must equal the seal, and every
  * sealed file must still hash to its manifest digest. Only then is the
- * flip evidence written (0400) and its sha256 returned.
+ * flip evidence written (0400) and its sha256 returned. Without an injected
+ * transport the default Wrangler transport runs with the given spawn, CLI
+ * path and environment (their defaults when omitted); its pinned configs are
+ * removed on success and on failure, so the owner directory then holds only
+ * flip-evidence.json, or nothing.
  */
 export async function verifyCutoverUnchanged({
   inventoryPath,
@@ -220,6 +228,9 @@ export async function verifyCutoverUnchanged({
   remote = false,
   ownerReadOnly = false,
   transport = undefined,
+  spawn = undefined,
+  cliPath = undefined,
+  environment = undefined,
   now = () => new Date(),
   forbiddenRoots = undefined,
 } = {}) {
@@ -239,46 +250,55 @@ export async function verifyCutoverUnchanged({
     return Object.freeze({ mode: "dry-run", sealId, sources: CUTOVER_SOURCE_ROLES.length });
   }
   if (remote !== true || ownerReadOnly !== true) fail("CUTOVER_REMOTE_NOT_AUTHORIZED");
-  const guarded = guardCutoverTransport(transport ?? createWranglerCutoverTransport({
-    inventory, transportDirectory: directory, remote, ownerReadOnly,
-  }), inventory);
-  const sources = [];
-  for (const role of CUTOVER_SOURCE_ROLES) {
-    const sealedSource = seal.sources[role];
-    let facts;
-    try {
-      facts = await readRemoteUnchangedFacts(guarded, inventory.sources[role], sealedSource);
-    } catch (error) {
-      if (error instanceof CutoverSourceError && error.code === "CUTOVER_REMOTE_SQL_NOT_SELECT") throw error;
-      if (error instanceof CutoverSourceError && error.code === "CUTOVER_SOURCE_NOT_ALLOWED") throw error;
-      fail("CUTOVER_SOURCE_CHANGED_AFTER_SEAL", { role });
+  let ownedTransport = null;
+  try {
+    ownedTransport = transport === undefined ? createWranglerCutoverTransport({
+      inventory, transportDirectory: directory, spawn, cliPath, environment, remote, ownerReadOnly,
+    }) : null;
+    const guarded = guardCutoverTransport(transport ?? ownedTransport, inventory);
+    const sources = [];
+    for (const role of CUTOVER_SOURCE_ROLES) {
+      const sealedSource = seal.sources[role];
+      let facts;
+      try {
+        facts = await readRemoteUnchangedFacts(guarded, inventory.sources[role], sealedSource);
+      } catch (error) {
+        if (error instanceof CutoverSourceError && error.code === "CUTOVER_REMOTE_SQL_NOT_SELECT") throw error;
+        if (error instanceof CutoverSourceError && error.code === "CUTOVER_SOURCE_NOT_ALLOWED") throw error;
+        if (error instanceof CutoverSourceError && error.code === "CUTOVER_OUTPUT_EXISTS") throw error;
+        fail("CUTOVER_SOURCE_CHANGED_AFTER_SEAL", { role });
+      }
+      if (!facts.matches) fail("CUTOVER_SOURCE_CHANGED_AFTER_SEAL", { role });
+      sources.push(Object.freeze({
+        role,
+        databaseIdSha256: sealedSource.databaseIdSha256,
+        bookmark: facts.bookmark,
+        schemaSha256: facts.schemaSha256,
+        aggregatesSha256: facts.aggregatesSha256,
+        sealedSha256: sealedSource.sealedSha256,
+      }));
     }
-    if (!facts.matches) fail("CUTOVER_SOURCE_CHANGED_AFTER_SEAL", { role });
-    sources.push(Object.freeze({
-      role,
-      databaseIdSha256: sealedSource.databaseIdSha256,
-      bookmark: facts.bookmark,
-      schemaSha256: facts.schemaSha256,
-      aggregatesSha256: facts.aggregatesSha256,
-      sealedSha256: sealedSource.sealedSha256,
-    }));
+    await ownedTransport?.dispose();
+    const verifiedAt = now().toISOString();
+    const evidence = {
+      schema: CUTOVER_FLIP_EVIDENCE_SCHEMA,
+      sealId,
+      inventorySha256: inventory.inventorySha256,
+      fenceReceiptSha256: seal.manifest.fence.fenceReceiptSha256,
+      verifiedAt,
+      sources,
+    };
+    const text = `${canonicalJson(evidence)}\n`;
+    if (containsSignedUrl(text)) fail("CUTOVER_SECRET_IN_OUTPUT");
+    // One verification per owner directory: an existing flip-evidence.json
+    // is CUTOVER_OUTPUT_EXISTS, never overwritten.
+    const path = join(directory, "flip-evidence.json");
+    const flipEvidenceSha256 = await writePrivateFileOnce(path, text, 0o400);
+    return Object.freeze({ mode: "verified", path, flipEvidenceSha256, evidence: Object.freeze(evidence) });
+  } catch (error) {
+    await ownedTransport?.dispose().catch(() => {});
+    throw error;
   }
-  const verifiedAt = now().toISOString();
-  const evidence = {
-    schema: CUTOVER_FLIP_EVIDENCE_SCHEMA,
-    sealId,
-    inventorySha256: inventory.inventorySha256,
-    fenceReceiptSha256: seal.manifest.fence.fenceReceiptSha256,
-    verifiedAt,
-    sources,
-  };
-  const text = `${canonicalJson(evidence)}\n`;
-  if (containsSignedUrl(text)) fail("CUTOVER_SECRET_IN_OUTPUT");
-  // One verification per owner directory: an existing flip-evidence.json
-  // is CUTOVER_OUTPUT_EXISTS, never overwritten.
-  const path = join(directory, "flip-evidence.json");
-  const flipEvidenceSha256 = await writePrivateFileOnce(path, text, 0o400);
-  return Object.freeze({ mode: "verified", path, flipEvidenceSha256, evidence: Object.freeze(evidence) });
 }
 
 // ---------------------------------------------------------------------------
