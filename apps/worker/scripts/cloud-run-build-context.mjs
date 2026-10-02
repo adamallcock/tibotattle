@@ -5,7 +5,8 @@
  * root around the existing Worker handlers; it must never be built from the
  * dirty repository root. Only the host, Worker source, the vendored d43c8f92
  * analytics kernels and the analytics-refresh Job, canonical migrations,
- * migration runner, the private daily publication Job and verifier, their
+ * migration runner, the shared runtime-grant policy and the production
+ * migration Job, the private daily publication Job and verifier, their
  * shared receipt contract, test-only activation and independent restore
  * commands, the read-only ledger diagnostic, the guarded test-only ledger
  * reconciler, and the reviewed workspace packages enter this context.
@@ -36,9 +37,9 @@ const SECRET_PATH_PARTS = new Set([
   "credentials.json",
   "service-account.json",
 ]);
-const EXPECTED_PRIMARY_MIGRATION_COUNT = 62;
+const EXPECTED_PRIMARY_MIGRATION_COUNT = 63;
 const EXPECTED_LEDGER_MIGRATION_COUNT = 7;
-const EXPECTED_PRIMARY_MIGRATION_TAIL = "0062_telemetry_contribution_trigger_search_path.sql";
+const EXPECTED_PRIMARY_MIGRATION_TAIL = "0063_enrollment_grants_erased_redeemer.sql";
 const REQUIRED_LEDGER_DIAGNOSTIC_PATHS = new Set([
   "apps/worker/cloud-run/ledger-reconciliation-diagnostic.mjs",
   "apps/worker/cloud-run/ledger-reconciliation-diagnostic.check.mjs",
@@ -100,6 +101,12 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/synthetic-v12-smoke.check.mjs", destination: "apps/worker/cloud-run/synthetic-v12-smoke.check.mjs" }),
   Object.freeze({ source: "cloud-run/test-migrations.mjs", destination: "apps/worker/cloud-run/test-migrations.mjs" }),
   Object.freeze({ source: "cloud-run/test-migrations.check.mjs", destination: "apps/worker/cloud-run/test-migrations.check.mjs" }),
+  // The one runtime-grant policy the test and production migrators share, and
+  // the OPS-10 production migration job (primary role only).
+  Object.freeze({ source: "cloud-run/postgres-runtime-grants.mjs", destination: "apps/worker/cloud-run/postgres-runtime-grants.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-runtime-grants.check.mjs", destination: "apps/worker/cloud-run/postgres-runtime-grants.check.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-production-migrations.mjs", destination: "apps/worker/cloud-run/postgres-production-migrations.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-production-migrations.check.mjs", destination: "apps/worker/cloud-run/postgres-production-migrations.check.mjs" }),
   Object.freeze({ source: "cloud-run/test-activation.mjs", destination: "apps/worker/cloud-run/test-activation.mjs" }),
   Object.freeze({ source: "cloud-run/test-activation.check.mjs", destination: "apps/worker/cloud-run/test-activation.check.mjs" }),
   Object.freeze({ source: "cloud-run/synthetic-v12-cleanup.mjs", destination: "apps/worker/cloud-run/synthetic-v12-cleanup.mjs" }),

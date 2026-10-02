@@ -1,19 +1,22 @@
 #!/usr/bin/env node
 
 /**
- * Operator CLI for the Google Cloud backup-horizon policy (OPS-1).
+ * Operator CLI for the Google Cloud backup-horizon policy (OPS-1). The
+ * service runs on one Cloud SQL instance with no deletion ledger (decisions
+ * D2 and D4), so every command names that one instance, role 'primary'; a
+ * ledger instance or role is refused.
  *
  *   audit --environment=production|staging --project=<id>
- *         --primary-instance=<name> --ledger-instance=<name> [--region=<r>]
+ *         --primary-instance=<name> [--region=<r>]
  *     Read-only: `gcloud sql instances describe` and `gcloud sql backups list`
- *     for both instances. Prints the 'tibotattle-backup-horizon-audit-v1'
+ *     for the instance. Prints the 'tibotattle-backup-horizon-audit-v2'
  *     receipt; exits 0 ok, 2 warn, 3 breach, 1 error. The receipt covers the
- *     instances' backup runs only (its `coverage` field), not project-level
+ *     instance's backup runs only (its `coverage` field), not project-level
  *     backups that outlive a deleted instance.
  *
  *   create-on-demand --environment --project --instance=<name>
- *         --instance-role=primary|ledger --purpose=<enum> --expires-in-days=<1..90>
- *         --region=<r> --authorize=create-on-demand:<environment>:<role>
+ *         --instance-role=primary --purpose=<enum> --expires-in-days=<1..90>
+ *         --region=<r> --authorize=create-on-demand:<environment>:primary
  *     The only sanctioned way to take an on-demand backup: labelled
  *     'tibotattle-expires-on=YYYY-MM-DD;purpose=<enum>', stored in exactly
  *     --region (never the default multi-region), synchronous (never --async),
@@ -60,8 +63,8 @@ export const BACKUP_PRUNE_JOURNAL_SCHEMA = "tibotattle-backup-horizon-prune-v1";
 export const PRUNE_MAX_DELETIONS_PER_RUN = 10;
 export const PRUNE_RECEIPT_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 /**
- * Restated from scripts/gcp-test-database.mjs, which runs its job when
- * imported; gcp-backup-horizon.check.mjs pins the two literals together.
+ * Restated from scripts/gcp-test-database.mjs rather than imported from it;
+ * gcp-backup-horizon.check.mjs pins the two literals together.
  * Names must additionally be bare Cloud SQL instance ids.
  */
 export const INSTANCE_PATTERN = /^[A-Za-z0-9_.:-]{1,200}$/u;
@@ -77,7 +80,7 @@ const LIVE_PRUNABLE_RUN_STATUSES = new Set(["SUCCESSFUL", "DELETION_FAILED"]);
 
 const COMMANDS = Object.freeze({
   audit: Object.freeze({
-    required: ["--environment", "--project", "--primary-instance", "--ledger-instance"],
+    required: ["--environment", "--project", "--primary-instance"],
     optional: ["--region"],
   }),
   "create-on-demand": Object.freeze({
@@ -209,15 +212,11 @@ export function parseBackupHorizonArgs(argv) {
   const values = readFlags(argv.slice(1), COMMANDS[command]);
   const environment = validateEnvironment(values.get("--environment"));
   if (command === "audit") {
-    const primaryInstance = validateInstance(values.get("--primary-instance"));
-    const ledgerInstance = validateInstance(values.get("--ledger-instance"));
-    if (primaryInstance === ledgerInstance) fail("BACKUP_HORIZON_INSTANCES_NOT_DISTINCT");
     return Object.freeze({
       command,
       environment,
       project: validateProject(values.get("--project")),
-      primaryInstance,
-      ledgerInstance,
+      primaryInstance: validateInstance(values.get("--primary-instance")),
       region: validateRegion(values.get("--region") ?? null),
     });
   }
@@ -287,10 +286,10 @@ function listBackupRuns(spawn, project, instance) {
   return runs;
 }
 
-/** Read-only audit of both instances; returns the frozen receipt. */
+/** Read-only audit of the one instance; returns the frozen receipt. */
 export function runBackupHorizonAudit(config, { spawn = spawnSync, now = Date.now } = {}) {
   const instances = [];
-  for (const [role, instance] of [["primary", config.primaryInstance], ["ledger", config.ledgerInstance]]) {
+  for (const [role, instance] of [["primary", config.primaryInstance]]) {
     const settings = gcloudJson(spawn, describeInstanceArgs(config.project, instance),
       "BACKUP_HORIZON_DESCRIBE_FAILED", "BACKUP_HORIZON_DESCRIBE_INVALID");
     const backupRuns = gcloudJson(spawn, listBackupsArgs(config.project, instance),

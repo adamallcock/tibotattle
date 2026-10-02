@@ -27,6 +27,13 @@
  * apart from its placeholder service account and image. Nothing here reads a
  * live resource. Each guarded property is shown to fail on a doctored temp
  * copy.
+ *
+ * The origin has one Cloud SQL instance and no deletion ledger (decisions D2
+ * and D4, SIMP-0 item 7). The retired ledger and bucket-history settings are
+ * never origin configuration: a wrangler var of that name is unclassified
+ * drift. The Cloudflare deletion-ledger D1 stays in the production
+ * fingerprint and its DELETION_LEDGER binding stays absent from the origin
+ * env: that is cutover hygiene for the Worker, not a GCP resource.
  */
 
 import assert from "node:assert/strict";
@@ -527,6 +534,37 @@ test("unclassified or undeclared vars, secrets and hosts fail", async () => {
     wranglerText: doctorProduction(WRANGLER_TEXT,
       "\"bucket_name\": \"app-usagemonitor-production-quarantine\"",
       "\"bucket_name\": \"app-usagemonitor-production-quarantine-v2\""),
+  }), ["FINGERPRINT_CLOUDFLARE_RESOURCES_DRIFT"]);
+});
+
+test("the retired ledger and history-proof settings are never origin configuration", async () => {
+  const retired = [
+    "LEDGER_INSTANCE_CONNECTION_NAME", "LEDGER_DATABASE", "LEDGER_SCHEMA", "GCS_ERASURE_BUCKET_HISTORY_PROOF",
+  ];
+  const secrets = [...configuration.REQUIRED_SECRET_NAMES, ...configuration.OPTIONAL_SECRET_NAMES];
+  for (const name of retired) {
+    assert.equal(Object.hasOwn(configuration.PRODUCTION_VARS, name), false, name);
+    assert.equal(configuration.DEPLOYMENT_PROVIDED_VAR_NAMES.includes(name), false, name);
+    assert.equal(configuration.ORIGIN_ONLY_VAR_NAMES.includes(name), false, name);
+    assert.equal(secrets.includes(name), false, name);
+    assert.equal(configuration.PRODUCTION_FORBIDDEN_VARIABLES[name], `${name}_FORBIDDEN`, name);
+    // Declared in wrangler.jsonc, it is unclassified drift, never pinned or provided.
+    assert.deepEqual(await driftOfTempCopy({
+      wranglerText: doctorProduction(WRANGLER_TEXT,
+        "\"PUBLIC_ANALYTICS_MODE\": \"enabled\",",
+        `"PUBLIC_ANALYTICS_MODE": "enabled",\n        ${JSON.stringify(name)}: "synthetic",`),
+    }), [`VAR_UNCLASSIFIED:${name}`], name);
+  }
+  assert.equal(configuration.PRODUCTION_FORBIDDEN_VARIABLE_PREFIXES.LEDGER_, "LEDGER_CONFIGURATION_FORBIDDEN");
+  // The Worker's deletion-ledger D1 stays fingerprinted (staging may never
+  // name it) and its binding never reaches the origin env.
+  assert.ok(configuration.PRODUCTION_RESOURCE_FINGERPRINT.cloudflareResourceNames
+    .includes("app-usagemonitor-production-deletion-ledger"));
+  assert.ok(configuration.PRODUCTION_WORKER_ENV_ABSENT_KEYS.includes("DELETION_LEDGER"));
+  assert.deepEqual(await driftOfTempCopy({
+    wranglerText: doctorProduction(WRANGLER_TEXT,
+      "\"database_name\": \"app-usagemonitor-production-deletion-ledger\"",
+      "\"database_name\": \"app-usagemonitor-production-deletion-ledger-v2\""),
   }), ["FINGERPRINT_CLOUDFLARE_RESOURCES_DRIFT"]);
 });
 

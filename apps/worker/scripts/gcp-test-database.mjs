@@ -8,19 +8,31 @@
  * delegates canonical schema changes to postgres-migrations.mjs. It emits
  * closed, content-free results so connector/driver diagnostics never become
  * build or Cloud Run logs.
+ *
+ * The runtime role's grants are the one shared policy in
+ * cloud-run/postgres-runtime-grants.mjs (table DML, read-only migration
+ * history, and EXECUTE on exactly the runtime functions), applied and read
+ * back in one transaction; this job adds no grant of its own. The job runs
+ * only when this file is the entry point, so its functions can be imported
+ * (gcp-test-database.check.mjs); the Cloud SQL connector is loaded only then.
  */
 
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Connector } from "@google-cloud/cloud-sql-connector";
 import pg from "pg";
+import {
+  grantAndVerifyRuntimePrivileges,
+  isRuntimeGrantError,
+} from "../cloud-run/postgres-runtime-grants.mjs";
 import {
   applyPostgresMigrations,
   buildPostgresMigrationManifest,
 } from "./postgres-migrations.mjs";
 
 const { Pool } = pg;
+/** The shared grant policy reports this job's codes without a family prefix. */
+export const GCP_TEST_DATABASE_GRANT_CODE_PREFIX = "";
 const WORKER_ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const MIGRATION_ROOT = join(WORKER_ROOT, "postgres", "migrations");
 const SCHEMA_PATTERN = /^[a-z_][a-z0-9_]{0,62}$/u;
@@ -36,7 +48,7 @@ const DEFAULT_SCHEMA = Object.freeze({
   ledger: "tibotattle_ledger",
 });
 
-class JobError extends Error {
+export class JobError extends Error {
   constructor(code) {
     super(code);
     this.name = "JobError";
@@ -104,14 +116,6 @@ function quoteIdentifier(value) {
     fail("POSTGRES_IDENTIFIER_INVALID");
   }
   return `"${value}"`;
-}
-
-function quoteRole(value) {
-  if (typeof value !== "string" || !IAM_ROLE_PATTERN.test(value)
-      || Buffer.byteLength(value, "utf8") > 63) {
-    fail("POSTGRES_ROLE_INVALID");
-  }
-  return `"${value.replaceAll('"', '""')}"`;
 }
 
 function parseCommand() {
@@ -457,7 +461,7 @@ async function inspectRuntimePrivileges(pool, database, runtimeRole, manifest) {
   });
 }
 
-async function ensureSchema(migratorPool, database, migratorRole) {
+export async function ensureSchema(migratorPool, database, migratorRole) {
   const schema = quoteIdentifier(database.schema);
   let client;
   let transactionStarted = false;
@@ -506,67 +510,22 @@ async function ensureSchema(migratorPool, database, migratorRole) {
   }
 }
 
-async function grantRuntimePrivileges(migratorPool, database, runtimeRole) {
-  const schema = quoteIdentifier(database.schema);
-  const role = quoteRole(runtimeRole);
-  let client;
-  let transactionStarted = false;
-  let commitAttempted = false;
+/**
+ * Apply the shared runtime-grant policy (cloud-run/postgres-runtime-grants.mjs)
+ * to one role schema and read it back. Refusals keep this job's code family:
+ * `<ROLE>_RUNTIME_GRANT_FAILED`, `<ROLE>_RUNTIME_PRIVILEGES_INVALID`, and so on.
+ */
+export async function grantRuntimePrivileges(migratorPool, database, runtimeRole) {
   try {
-    client = await migratorPool.connect();
-    await client.query("BEGIN");
-    transactionStarted = true;
-    await client.query("SET LOCAL statement_timeout='30000ms'");
-    await client.query("SET LOCAL lock_timeout='5000ms'");
-    await client.query(`GRANT USAGE ON SCHEMA ${schema} TO ${role}`);
-    await client.query(
-      `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ${schema} TO ${role}`,
-    );
-    await client.query(
-      `GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA ${schema} TO ${role}`,
-    );
-    await client.query(`REVOKE CREATE ON SCHEMA ${schema} FROM ${role}`);
-    await client.query(
-      `REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER
-         ON ${schema}.${quoteIdentifier(HISTORY_TABLE)} FROM ${role}`,
-    );
-    await client.query(
-      `ALTER DEFAULT PRIVILEGES IN SCHEMA ${schema}
-         GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO ${role}`,
-    );
-    await client.query(
-      `ALTER DEFAULT PRIVILEGES IN SCHEMA ${schema}
-         GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO ${role}`,
-    );
-    // This function is intentionally revoked from PUBLIC by migration 0004;
-    // runtime primary writes use it for canonical atomic v1 admission. The
-    // independent ledger schema does not contain this function.
-    if (database.role === "primary") {
-      await client.query(
-        `GRANT EXECUTE ON FUNCTION ${schema}.${quoteIdentifier("insert_telemetry_v1_contribution")}(jsonb) TO ${role}`,
-      );
-    }
-    commitAttempted = true;
-    await client.query("COMMIT");
-  } catch {
-    if (transactionStarted && !commitAttempted) {
-      try {
-        await client.query("ROLLBACK");
-      } catch {
-        try { client?.release(true); } catch { /* sanitized outer failure */ }
-        client = null;
-        fail(`${database.role.toUpperCase()}_GRANT_ROLLBACK_FAILED`);
-      }
-    }
-    fail(`${database.role.toUpperCase()}_RUNTIME_GRANT_FAILED`);
-  } finally {
-    if (client !== null && client !== undefined) {
-      try {
-        client.release(commitAttempted ? false : true);
-      } catch {
-        fail(`${database.role.toUpperCase()}_GRANT_RELEASE_FAILED`);
-      }
-    }
+    await grantAndVerifyRuntimePrivileges(migratorPool, {
+      role: database.role,
+      schema: database.schema,
+      runtimeRole,
+      codePrefix: GCP_TEST_DATABASE_GRANT_CODE_PREFIX,
+    });
+  } catch (error) {
+    if (isRuntimeGrantError(error)) fail(error.code);
+    fail(`${String(database?.role).toUpperCase()}_RUNTIME_GRANT_FAILED`);
   }
 }
 
@@ -574,6 +533,7 @@ async function run(command) {
   const databases = databaseConfig();
   const manifest = await buildPostgresMigrationManifest({ rootDirectory: MIGRATION_ROOT });
   const digest = await sourceContentDigest();
+  const { Connector } = await import("@google-cloud/cloud-sql-connector");
   const connector = new Connector();
   const pools = [];
   try {
@@ -687,14 +647,21 @@ async function run(command) {
   }
 }
 
-const command = parseCommand();
-try {
-  const result = await run(command);
-  console.log(JSON.stringify(result, null, 2));
-} catch (error) {
-  const code = error instanceof JobError && typeof error.code === "string"
-    ? error.code
-    : "GCP_TEST_DATABASE_FAILED";
-  console.error(JSON.stringify({ status: "error", code }));
-  process.exitCode = 1;
+function invokedDirectly() {
+  return typeof process.argv[1] === "string"
+    && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+}
+
+if (invokedDirectly()) {
+  const command = parseCommand();
+  try {
+    const result = await run(command);
+    console.log(JSON.stringify(result, null, 2));
+  } catch (error) {
+    const code = error instanceof JobError && typeof error.code === "string"
+      ? error.code
+      : "GCP_TEST_DATABASE_FAILED";
+    console.error(JSON.stringify({ status: "error", code }));
+    process.exitCode = 1;
+  }
 }

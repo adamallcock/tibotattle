@@ -66,6 +66,20 @@ export const IMAGE_DEFAULT_SOCKET_DIRECTORY = "/var/run/postgresql";
 export const CONTAINER_DATA_DIRECTORY = "/var/lib/postgresql/data";
 export const POSTGRES_PORT = 5432;
 export const LOOPBACK_PUBLISH = "127.0.0.1:55432:5432";
+/**
+ * The loopback TCP pair a spec dials to reach this server over TCP: the
+ * published host port, which differs from PG_TEST_PORT (the socket's port).
+ * The hosted-backend PostgreSQL 17 suite job sets it as PG_TEST_TCP_HOST and
+ * PG_TEST_TCP_PORT; it is not part of the exported SOCKET profile, because
+ * the Worker and Cloud Run gates also read that profile and must not dial TCP.
+ */
+export function ciPostgresTcpProfile(publish = LOOPBACK_PUBLISH) {
+  const match = /^(127\.0\.0\.1):([1-9][0-9]{0,4}):([0-9]+)$/u.exec(publish);
+  if (match === null || Number(match[3]) !== POSTGRES_PORT) {
+    throw new CiPostgresError("CI_POSTGRES_PROFILE_INVALID", "the loopback publish must map 127.0.0.1:<port> to the server port");
+  }
+  return Object.freeze({ PG_TEST_TCP_HOST: match[1], PG_TEST_TCP_PORT: match[2] });
+}
 export const READINESS_TIMEOUT_MS = 60_000;
 export const READINESS_POLL_MS = 500;
 export const INIT_COMPLETE_MARKER = "PostgreSQL init process complete; ready for start up.";

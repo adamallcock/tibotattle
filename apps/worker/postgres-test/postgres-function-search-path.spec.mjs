@@ -130,9 +130,11 @@ test("PG17 0011's active-participant trigger resolves its table without a sessio
     });
     assert.equal(await contributionCount(pool, schema), 0);
 
-    // The production runner applies 0062 on top of the recorded prefix.
+    // The production runner applies 0062, and the promoted tail after it, on
+    // top of the recorded prefix.
     const after = await applyPostgresMigrations({ role: "primary", schema, pool });
-    assert.equal(after.migrations.at(-1)?.name, PIN_MIGRATION);
+    assert.equal(after.migrations.some((migration) => migration.name === PIN_MIGRATION), true);
+    assert.equal(after.migrations.at(-1)?.name, names.at(-1));
     assert.equal(after.applied, names.length);
     await assertNoRuntimeSearchPath(pool, schema);
 

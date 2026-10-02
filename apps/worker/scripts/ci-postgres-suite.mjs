@@ -22,24 +22,38 @@
  * The derived HOST list is frozen in EXPECTED_HOST_PROFILE_FILES; any change
  * fails PROFILE_ROUTING_DRIFT until it is reviewed here.
  *
- * Registration is read from the three places the Worker gate runs PostgreSQL
- * specs from: the `postgres:domain:check` script, and the include arrays of
- * vitest.postgres.config.ts and vitest.node.config.ts. UNREGISTERED_ALLOWLIST
- * names the specs registered in none of them; it may only shrink.
+ * Registration is read from the places the Worker gate runs PostgreSQL specs
+ * from: the `postgres:domain:check` script, the include arrays of
+ * vitest.postgres.config.ts and vitest.node.config.ts, and the frozen
+ * EXTRA_REGISTRATION_SCRIPTS (`edge:e2e`, `postgres:production-migrations:check`).
+ * UNREGISTERED_ALLOWLIST names the specs registered in none of them; it may
+ * only shrink.
+ *
+ * A spec registered by a script in SCRIPT_PROFILES runs in that explicit
+ * profile through the script's own steps instead of a SOCKET or HOST pass.
+ * EDGE_E2E (`edge:e2e`, postgres-test/edge-origin-e2e.spec.mjs) needs the
+ * cloud-run build, workerd and the image runtime (Node 22.16.0, named by
+ * EDGE_E2E_NODE), and its S9 stage reads the golden named by EDGE_E2E_GOLDEN.
+ * Without them the spec is reported as a named ENVIRONMENT_GAP and the run is
+ * "incomplete", never green and never a silent skip.
  *
  * Failure codes (one entry per file and test, never payloads):
  *   FAILED, ENV_PROFILE_CONFLICT, SILENTLY_SKIPPED, EMPTY_SPEC_FILE,
  *   UNREGISTERED_POSTGRES_SPEC, ALLOWLIST_STALE, REGISTERED_SPEC_MISSING,
  *   REGISTRATION_DUPLICATE, REGISTRATION_PARSE_FAILED,
  *   PROFILE_ROUTING_AMBIGUOUS, PROFILE_ROUTING_DRIFT, UNPLANNED_SPEC_RESULT,
- *   SUITE_PROCESS_FAILED, TAP_INCOMPLETE, TAP_PARSE_MISMATCH,
- *   VITEST_REPORT_INVALID.
+ *   SUITE_PROCESS_FAILED, PREREQUISITE_FAILED, TAP_INCOMPLETE,
+ *   TAP_PARSE_MISMATCH, VITEST_REPORT_INVALID.
+ * Environment gaps (reported apart from failures): ENVIRONMENT_GAP.
  *
  * An ENV_PROFILE_CONFLICT belongs to the family that owns the named spec. This
  * runner never edits or weakens a spec to obtain a green result.
  *
- * Usage (the SOCKET profile comes from ci-postgres-container.mjs):
+ * Usage (the SOCKET profile comes from ci-postgres-container.mjs; the
+ * hosted-backend workflow adds the container's loopback TCP pair,
+ * ciPostgresTcpProfile()):
  *   PG_TEST_SOCKET=/private/tmp/tibotattle-pg-ci/socket PG_TEST_PORT=5432 \
+ *   PG_TEST_TCP_HOST=127.0.0.1 PG_TEST_TCP_PORT=55432 \
  *     node scripts/ci-postgres-suite.mjs
  *   node scripts/ci-postgres-suite.mjs --plan    # static checks only, no database
  */
@@ -63,7 +77,39 @@ export const VITEST_REGISTRATION_CONFIGS = Object.freeze([
 ]);
 export const PROFILE_SOCKET = "SOCKET";
 export const PROFILE_HOST = "HOST";
+export const PROFILE_EDGE_E2E = "EDGE_E2E";
 export const NODE_RUNNER = "node";
+
+/**
+ * package.json scripts beyond postgres:domain:check whose ./postgres-test/
+ * specs count as registered. Frozen: a new entry is a reviewed change here.
+ */
+export const EXTRA_REGISTRATION_SCRIPTS = Object.freeze([
+  "edge:e2e",
+  "postgres:production-migrations:check",
+]);
+
+/**
+ * Registration scripts whose specs run in an explicit profile, through the
+ * script's own steps, rather than in the SOCKET or HOST pass.
+ */
+export const SCRIPT_PROFILES = Object.freeze({
+  "edge:e2e": PROFILE_EDGE_E2E,
+});
+
+/** The only steps an extra registration script may run before its specs. */
+export const EXTRA_SCRIPT_PREREQUISITES = Object.freeze([
+  "node ./cloud-run/build.mjs",
+]);
+
+/** The EDGE_E2E profile's runtime: the image's Node, named by EDGE_E2E_NODE. */
+export const EDGE_E2E_NODE_VERSION = "v22.16.0";
+export const EDGE_E2E_NODE_VARIABLE = "EDGE_E2E_NODE";
+export const EDGE_E2E_GOLDEN_VARIABLE = "EDGE_E2E_GOLDEN";
+
+export function scriptRunner(script) {
+  return `script:${script}`;
+}
 
 /**
  * PostgreSQL specs registered in none of the three sources. Shrink only: an
@@ -100,6 +146,8 @@ const PG_GATE_ENVIRONMENT = new Set(["PG_TEST_HOST", "PG_TEST_SOCKET"]);
 const SOCKET_DIRECTORY_PATTERN = /^\/private\/tmp\/tibotattle-pg-[^/]+\/socket$/u;
 const SPEC_FILE_PATTERN = /^[A-Za-z0-9._-]+\.(?:spec|check)\.mjs$/u;
 const DOMAIN_TOKEN_PATTERN = /^\.\/postgres-test\/([A-Za-z0-9._-]+\.mjs)$/u;
+// A non-PostgreSQL check an extra registration script may also run.
+const EXTRA_CHECK_TOKEN_PATTERN = /^\.\/(?:cloud-run|scripts)\/[A-Za-z0-9._-]+\.check\.mjs$/u;
 const GLOB_CHARACTERS = /[*?[\]{}!]/u;
 const ENV_FAILURE_PATTERN = new RegExp([
   String.raw`\bPG_TEST_[A-Z_]+\b`,
@@ -192,6 +240,67 @@ export function parseDomainCheckRegistration(script) {
   });
 }
 
+/**
+ * Tokenize one EXTRA_REGISTRATION_SCRIPTS script. Its `&&`-joined segments may
+ * only be:
+ *
+ *   node --test [--test-*[=value]]... <file>...   where each file is
+ *       ./postgres-test/<file>.mjs (registered) or
+ *       ./cloud-run|scripts/<file>.check.mjs (a non-PostgreSQL check)
+ *   one of EXTRA_SCRIPT_PREREQUISITES, exactly
+ *
+ * and must register at least one ./postgres-test/ spec. Anything else fails
+ * REGISTRATION_PARSE_FAILED.
+ */
+export function parseExtraRegistrationScript(name, script) {
+  if (typeof script !== "string" || script.trim() === "") {
+    throw new CiPostgresSuiteError("REGISTRATION_PARSE_FAILED", `package.json scripts["${name}"] is missing`);
+  }
+  const unsupported = (detail) => new CiPostgresSuiteError("REGISTRATION_PARSE_FAILED",
+    `unsupported ${name} ${detail}`);
+  const nodeFiles = [];
+  const testFlags = [];
+  const prerequisites = [];
+  for (const segment of script.split("&&")) {
+    const tokens = segment.trim().split(/\s+/u).filter(Boolean);
+    const command = tokens.join(" ");
+    if (EXTRA_SCRIPT_PREREQUISITES.includes(command)) {
+      if (nodeFiles.length > 0) throw unsupported(`prerequisite ${JSON.stringify(command)} after its specs`);
+      prerequisites.push(command);
+      continue;
+    }
+    if (tokens[0] === "node" && tokens[1] === "--test") {
+      let files = 0;
+      for (const token of tokens.slice(2)) {
+        if (/^--test(?:-[a-z]+)+(?:=[^\s=]+)?$/u.test(token)) {
+          testFlags.push(token);
+          continue;
+        }
+        const match = DOMAIN_TOKEN_PATTERN.exec(token);
+        if (match !== null) {
+          nodeFiles.push(`${POSTGRES_TEST_DIRECTORY}/${match[1]}`);
+          files += 1;
+          continue;
+        }
+        if (EXTRA_CHECK_TOKEN_PATTERN.test(token)) {
+          files += 1;
+          continue;
+        }
+        throw unsupported(`node --test argument ${JSON.stringify(token)}`);
+      }
+      if (files === 0) throw unsupported("node --test command without files");
+      continue;
+    }
+    throw unsupported(`command ${JSON.stringify(command)}`);
+  }
+  if (nodeFiles.length === 0) throw unsupported("registers no ./postgres-test/ spec");
+  return Object.freeze({
+    nodeFiles: Object.freeze(nodeFiles),
+    testFlags: Object.freeze([...new Set(testFlags)]),
+    prerequisites: Object.freeze(prerequisites),
+  });
+}
+
 function matchingBracket(source, openIndex, open, close) {
   let depth = 0;
   let quote = null;
@@ -260,10 +369,15 @@ export async function loadRegistration(workerRoot) {
       { label: config },
     );
   }
+  const scripts = {};
+  for (const name of EXTRA_REGISTRATION_SCRIPTS) {
+    scripts[name] = parseExtraRegistrationScript(name, packageJson?.scripts?.[name]);
+  }
   return Object.freeze({
     domainNodeFiles: domain.nodeFiles,
     domainVitestConfigs: domain.vitestConfigs,
     vitest: Object.freeze(vitest),
+    scripts: Object.freeze(scripts),
   });
 }
 
@@ -290,6 +404,9 @@ export function checkRegistrationRatchet({ onDisk, registration, allowlist = UNR
   for (const file of registration.domainNodeFiles) add(file, DOMAIN_CHECK_SCRIPT);
   for (const [config, files] of Object.entries(registration.vitest)) {
     for (const file of files) add(file, config);
+  }
+  for (const [script, { nodeFiles }] of Object.entries(registration.scripts ?? {})) {
+    for (const file of nodeFiles) add(file, script);
   }
   for (const [file, sources] of registered) {
     if (sources.length > 1) {
@@ -492,15 +609,30 @@ export async function planPostgresSuite({
 
   const candidates = [];
   const seen = new Set();
-  const addCandidate = (file, runner, source) => {
+  const addCandidate = (file, runner, source, extra = {}) => {
     if (seen.has(file)) return;
     seen.add(file);
-    candidates.push({ file, runner, source });
+    candidates.push({ file, runner, source, ...extra });
   };
   for (const config of VITEST_REGISTRATION_CONFIGS) {
     for (const file of registration.vitest[config]) addCandidate(file, `vitest:${config}`, config);
   }
   for (const file of registration.domainNodeFiles) addCandidate(file, NODE_RUNNER, DOMAIN_CHECK_SCRIPT);
+  for (const name of EXTRA_REGISTRATION_SCRIPTS) {
+    const script = registration.scripts[name];
+    const explicitProfile = Object.hasOwn(SCRIPT_PROFILES, name) ? SCRIPT_PROFILES[name] : null;
+    for (const file of script.nodeFiles) {
+      if (explicitProfile === null) {
+        addCandidate(file, NODE_RUNNER, name);
+      } else {
+        addCandidate(file, scriptRunner(name), name, {
+          explicitProfile,
+          prerequisites: script.prerequisites,
+          testFlags: script.testFlags,
+        });
+      }
+    }
+  }
   for (const file of allowlist) addCandidate(file, NODE_RUNNER, "UNREGISTERED_ALLOWLIST");
 
   const present = [];
@@ -516,14 +648,16 @@ export async function planPostgresSuite({
   failures.push(...routing.failures);
 
   const files = [];
-  for (const candidate of present) {
-    const profile = routing.routing.get(candidate.file);
-    if (profile === undefined) continue;
-    if (profile === PROFILE_HOST && candidate.runner !== NODE_RUNNER) {
+  for (const { explicitProfile, ...candidate } of present) {
+    const derived = routing.routing.get(candidate.file);
+    if (derived === undefined) continue;
+    if (derived === PROFILE_HOST && candidate.runner !== NODE_RUNNER) {
       failures.push(failure("PROFILE_ROUTING_DRIFT", candidate.file,
-        "HOST-routed specs must be node:test files"));
+        explicitProfile === undefined
+          ? "HOST-routed specs must be node:test files"
+          : `explicit ${explicitProfile} specs read the SOCKET profile`));
     }
-    files.push(Object.freeze({ ...candidate, profile }));
+    files.push(Object.freeze({ ...candidate, profile: explicitProfile ?? derived }));
   }
   return Object.freeze({
     files: Object.freeze(files),
@@ -717,14 +851,30 @@ export function parseVitestReport(report, { workerRoot }) {
  * @param {ReadonlyArray<{ pass: string, runner: string, exitCode: number,
  *   files: Map<string, { tests: Array, fileFailure: string|null }>,
  *   parseFailures: ReadonlyArray<string> }>} input.records
+ * @param {ReadonlyArray<{ code: "ENVIRONMENT_GAP", file: string, profile: string,
+ *   detail: string }>} [input.environmentGaps] planned files of an explicit
+ *   profile that could not run here. They are named, never counted as run,
+ *   and leave the status "incomplete" (or "failed"), never "passed".
  */
-export function evaluatePostgresSuite({ plan, records }) {
+export function evaluatePostgresSuite({ plan, records, environmentGaps = [] }) {
   const failures = [];
   const skipped = [];
-  const passedByPass = { [PROFILE_SOCKET]: 0, [PROFILE_HOST]: 0 };
+  const passedByPass = { [PROFILE_SOCKET]: 0, [PROFILE_HOST]: 0, [PROFILE_EDGE_E2E]: 0 };
   let tests = 0;
   const planned = new Map(plan.files.map((entry) => [entry.file, entry]));
   const seen = new Map();
+  const gaps = [];
+  for (const gap of environmentGaps) {
+    const entry = planned.get(gap?.file);
+    if (gap?.code !== "ENVIRONMENT_GAP" || entry === undefined || entry.profile !== gap.profile
+        || entry.profile === PROFILE_SOCKET || entry.profile === PROFILE_HOST) {
+      // Only an explicit-profile spec may be reported as an environment gap.
+      failures.push(failure("UNPLANNED_SPEC_RESULT", gap?.file ?? null, "environment gap for a routed spec"));
+      continue;
+    }
+    gaps.push(Object.freeze({ code: gap.code, file: gap.file, profile: gap.profile, detail: String(gap.detail) }));
+  }
+  const gapFiles = new Set(gaps.map(({ file }) => file));
   for (const record of records) {
     const before = failures.length;
     for (const code of record.parseFailures ?? []) {
@@ -768,19 +918,22 @@ export function evaluatePostgresSuite({ plan, records }) {
   }
   for (const [file] of planned) {
     const passes = seen.get(file) ?? [];
-    if (passes.length === 0) {
+    if (gapFiles.has(file)) {
+      if (passes.length > 0) failures.push(failure("PROFILE_ROUTING_DRIFT", file, "reported as run and as a gap"));
+    } else if (passes.length === 0) {
       failures.push(failure("EMPTY_SPEC_FILE", file, "no results were reported"));
     } else if (passes.length > 1) {
       failures.push(failure("PROFILE_ROUTING_DRIFT", file, `reported by ${passes.length} runs`));
     }
   }
   return Object.freeze({
-    status: failures.length === 0 ? "passed" : "failed",
+    status: failures.length > 0 ? "failed" : gaps.length > 0 ? "incomplete" : "passed",
     files: planned.size,
     tests,
     passedByPass: Object.freeze(passedByPass),
     skipped: Object.freeze(skipped),
     failures: Object.freeze(failures),
+    environmentGaps: Object.freeze(gaps),
   });
 }
 
@@ -788,18 +941,39 @@ export function evaluatePostgresSuite({ plan, records }) {
 // Execution
 // ---------------------------------------------------------------------------
 
+/** The loopback TCP pair a SOCKET-profile cluster may also offer; both or neither. */
+export const TCP_PROFILE_VARIABLES = Object.freeze(["PG_TEST_TCP_HOST", "PG_TEST_TCP_PORT"]);
+const LOOPBACK_TCP_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
+const TCP_PORT_PATTERN = /^[1-9][0-9]{0,4}$/u;
+
 /**
- * Read the SOCKET profile the caller exported. Only PG_TEST_SOCKET and
- * PG_TEST_PORT are accepted: every other PG_TEST_* variable (including
- * PG_TEST_HOST and PG_TEST_PASSWORD) is refused so no pass inherits it.
+ * Read the SOCKET profile the caller exported. Only PG_TEST_SOCKET,
+ * PG_TEST_PORT and the optional loopback TCP pair (PG_TEST_TCP_HOST and
+ * PG_TEST_TCP_PORT, set together: the same cluster's TCP listener, which the
+ * fast-path cloud-target specs dial) are accepted: every other PG_TEST_*
+ * variable (including PG_TEST_HOST and PG_TEST_PASSWORD) is refused so no pass
+ * inherits it. Without the pair, a spec gated on it reports its TCP tests as
+ * skipped (SILENTLY_SKIPPED), never as passed.
  */
 export function readSocketProfileInput(environment) {
   const extra = Object.keys(environment)
-    .filter((key) => key.startsWith("PG_TEST_") && key !== "PG_TEST_SOCKET" && key !== "PG_TEST_PORT")
+    .filter((key) => key.startsWith("PG_TEST_") && key !== "PG_TEST_SOCKET" && key !== "PG_TEST_PORT"
+      && !TCP_PROFILE_VARIABLES.includes(key))
     .sort();
   if (extra.length > 0) {
     throw new CiPostgresSuiteError("CI_SUITE_PROFILE_INVALID",
-      `unset ${extra.join(", ")}; the suite derives each pass profile from PG_TEST_SOCKET and PG_TEST_PORT`);
+      `unset ${extra.join(", ")}; the suite derives each pass profile from PG_TEST_SOCKET, PG_TEST_PORT `
+        + "and the optional PG_TEST_TCP_HOST and PG_TEST_TCP_PORT pair");
+  }
+  const tcpHost = environment.PG_TEST_TCP_HOST;
+  const tcpPort = environment.PG_TEST_TCP_PORT;
+  if ((tcpHost === undefined) !== (tcpPort === undefined)) {
+    throw new CiPostgresSuiteError("CI_SUITE_PROFILE_INVALID", "set PG_TEST_TCP_HOST and PG_TEST_TCP_PORT together");
+  }
+  if (tcpHost !== undefined && (!LOOPBACK_TCP_HOSTS.has(tcpHost) || typeof tcpPort !== "string"
+      || !TCP_PORT_PATTERN.test(tcpPort) || Number(tcpPort) > 65_535)) {
+    throw new CiPostgresSuiteError("CI_SUITE_PROFILE_INVALID",
+      "PG_TEST_TCP_HOST must be a loopback host and PG_TEST_TCP_PORT a TCP port number");
   }
   const socket = environment.PG_TEST_SOCKET;
   if (typeof socket !== "string" || !SOCKET_DIRECTORY_PATTERN.test(socket)) {
@@ -807,18 +981,25 @@ export function readSocketProfileInput(environment) {
       "PG_TEST_SOCKET must name a /private/tmp/tibotattle-pg-*/socket directory");
   }
   const port = environment.PG_TEST_PORT;
-  if (typeof port !== "string" || !/^[1-9][0-9]{0,4}$/u.test(port) || Number(port) > 65_535) {
+  if (typeof port !== "string" || !TCP_PORT_PATTERN.test(port) || Number(port) > 65_535) {
     throw new CiPostgresSuiteError("CI_SUITE_PROFILE_INVALID", "PG_TEST_PORT must be a TCP port number");
   }
-  return Object.freeze({ socket, port });
+  return Object.freeze(tcpHost === undefined ? { socket, port } : { socket, port, tcpHost, tcpPort });
 }
 
-export function passEnvironment(baseEnvironment, pass, { socket, port }) {
+/** One pass's PG_TEST_* profile; the loopback TCP pair reaches the SOCKET pass only. */
+export function passEnvironment(baseEnvironment, pass, { socket, port, tcpHost, tcpPort }) {
   const environment = {};
   for (const [key, value] of Object.entries(baseEnvironment)) {
     if (!key.startsWith("PG_TEST_") && value !== undefined) environment[key] = value;
   }
   if (pass === PROFILE_SOCKET) {
+    environment.PG_TEST_SOCKET = socket;
+    if (tcpHost !== undefined) {
+      environment.PG_TEST_TCP_HOST = tcpHost;
+      environment.PG_TEST_TCP_PORT = tcpPort;
+    }
+  } else if (pass === PROFILE_EDGE_E2E) {
     environment.PG_TEST_SOCKET = socket;
   } else if (pass === PROFILE_HOST) {
     environment.PG_TEST_HOST = socket;
@@ -855,12 +1036,48 @@ function reportFailingOutput({ file, text, result }) {
   if (failing) process.stderr.write(`\n--- ${file} ---\n${text}\n`);
 }
 
+/**
+ * The EDGE_E2E runtime, or the named reasons it is unavailable here: the
+ * image's Node (EDGE_E2E_NODE, an absolute path reporting v22.16.0), workerd
+ * installed for this Worker, and the golden the S9 stage reads
+ * (EDGE_E2E_GOLDEN, an absolute path). Probing runs only `<node> --version`.
+ */
+export async function probeEdgeE2eEnvironment({ workerRoot, environment, run }) {
+  const reasons = [];
+  const node = environment[EDGE_E2E_NODE_VARIABLE];
+  if (typeof node !== "string" || !node.startsWith("/")) {
+    reasons.push(`${EDGE_E2E_NODE_VARIABLE} must name the Node ${EDGE_E2E_NODE_VERSION} binary (the image runtime)`);
+  } else {
+    let version = null;
+    try {
+      const probe = await run(node, ["--version"], { cwd: workerRoot, env: {}, captureStdout: true });
+      version = probe.exitCode === 0 ? probe.stdout.trim() : null;
+    } catch {
+      version = null;
+    }
+    if (version !== EDGE_E2E_NODE_VERSION) {
+      reasons.push(`${EDGE_E2E_NODE_VARIABLE} does not report ${EDGE_E2E_NODE_VERSION}`);
+    }
+  }
+  if (!await exists(join(workerRoot, "node_modules", "workerd", "package.json"))) {
+    reasons.push("workerd is not installed in the Worker's node_modules");
+  }
+  const golden = environment[EDGE_E2E_GOLDEN_VARIABLE];
+  if (typeof golden !== "string" || !golden.startsWith("/")) {
+    reasons.push(`${EDGE_E2E_GOLDEN_VARIABLE} is unset, so the S9 golden read would skip`);
+  }
+  return reasons.length === 0
+    ? Object.freeze({ available: true, node })
+    : Object.freeze({ available: false, reasons: Object.freeze(reasons) });
+}
+
 export async function runPostgresSuite({
   workerRoot = WORKER_ROOT,
   environment = process.env,
   run = spawnProcess,
   onOutput = reportFailingOutput,
   plan: suppliedPlan = null,
+  probeEdgeE2e = probeEdgeE2eEnvironment,
 } = {}) {
   const profile = readSocketProfileInput(environment);
   const plan = suppliedPlan ?? await planPostgresSuite({ workerRoot });
@@ -869,12 +1086,14 @@ export async function runPostgresSuite({
       status: "failed",
       files: plan.files.length,
       tests: 0,
-      passedByPass: Object.freeze({ [PROFILE_SOCKET]: 0, [PROFILE_HOST]: 0 }),
+      passedByPass: Object.freeze({ [PROFILE_SOCKET]: 0, [PROFILE_HOST]: 0, [PROFILE_EDGE_E2E]: 0 }),
       skipped: Object.freeze([]),
       failures: plan.failures,
+      environmentGaps: Object.freeze([]),
     });
   }
   const records = [];
+  const environmentGaps = [];
   const reportDirectory = await mkdtemp(join(tmpdir(), "tibotattle-pg-suite-"));
   try {
     const socketEnvironment = passEnvironment(environment, PROFILE_SOCKET, profile);
@@ -937,10 +1156,64 @@ export async function runPostgresSuite({
         });
       }
     }
+    // Explicit profiles run last, through their registration script's steps.
+    const explicit = plan.files.filter(({ profile: pass }) => pass === PROFILE_EDGE_E2E);
+    const runtime = explicit.length === 0 ? null
+      : await probeEdgeE2e({ workerRoot, environment, run });
+    const prepared = new Set();
+    for (const entry of explicit) {
+      if (!runtime.available) {
+        environmentGaps.push({
+          code: "ENVIRONMENT_GAP",
+          file: entry.file,
+          profile: entry.profile,
+          detail: runtime.reasons.join("; "),
+        });
+        continue;
+      }
+      const passEnv = passEnvironment(environment, PROFILE_EDGE_E2E, profile);
+      let prerequisiteFailed = false;
+      for (const command of entry.prerequisites ?? []) {
+        if (prepared.has(command)) continue;
+        const { exitCode } = await run(runtime.node, command.split(" ").slice(1),
+          { cwd: workerRoot, env: passEnv, captureStdout: false });
+        if (exitCode !== 0) {
+          prerequisiteFailed = true;
+          records.push({
+            pass: PROFILE_EDGE_E2E,
+            runner: entry.runner,
+            file: entry.file,
+            exitCode,
+            files: new Map(),
+            parseFailures: ["PREREQUISITE_FAILED"],
+          });
+          break;
+        }
+        prepared.add(command);
+      }
+      if (prerequisiteFailed) continue;
+      const absoluteFile = join(workerRoot, entry.file);
+      const { exitCode, stdout } = await run(runtime.node, [
+        "--test",
+        ...(entry.testFlags ?? []).filter((flag) => !flag.startsWith("--test-reporter")),
+        "--test-reporter=tap",
+        `./${entry.file}`,
+      ], { cwd: workerRoot, env: passEnv, captureStdout: true });
+      const parsed = parseNodeTap(stdout, { absoluteFile, cwd: workerRoot });
+      onOutput({ file: entry.file, text: stdout, result: parsed });
+      records.push({
+        pass: PROFILE_EDGE_E2E,
+        runner: entry.runner,
+        file: entry.file,
+        exitCode,
+        files: new Map([[entry.file, { tests: parsed.tests, fileFailure: parsed.fileFailure }]]),
+        parseFailures: parsed.parseFailures,
+      });
+    }
   } finally {
     await rm(reportDirectory, { recursive: true, force: true });
   }
-  return evaluatePostgresSuite({ plan, records });
+  return evaluatePostgresSuite({ plan, records, environmentGaps });
 }
 
 function printFailures(failures) {
@@ -965,6 +1238,8 @@ async function main(argv) {
       status: plan.failures.length === 0 ? "planned" : "failed",
       files: plan.files.map(({ file, runner, profile }) => ({ file, runner, profile })),
       hostProfileFiles: plan.hostProfileFiles,
+      explicitProfileFiles: plan.files.filter(({ profile }) => profile === PROFILE_EDGE_E2E)
+        .map(({ file, runner, profile }) => ({ file, runner, profile })),
       unregisteredAllowlist: UNREGISTERED_ALLOWLIST,
       failures: plan.failures,
     }, null, 2)}\n`);
@@ -978,6 +1253,7 @@ async function main(argv) {
   process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
   if (summary.status !== "passed") {
     printFailures(summary.failures);
+    printFailures(summary.environmentGaps);
     process.exitCode = 1;
   }
 }

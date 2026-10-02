@@ -35,6 +35,7 @@ const HOUR = 60 * 60 * 1_000;
 const PROJECT = "synthetic-horizon-prod";
 const REGION = "us-east1";
 const PRIMARY = "synthetic-primary-a";
+// A second instance name, only to show that a ledger instance or role is refused.
 const LEDGER = "synthetic-ledger-a";
 const TEST_PRIMARY = GCP_PRIVATE_TEST_TARGET.primaryInstanceConnectionName.split(":").at(-1);
 const TEST_LEDGER = GCP_PRIVATE_TEST_TARGET.ledgerInstanceConnectionName.split(":").at(-1);
@@ -171,7 +172,6 @@ function auditArgv(extra = []) {
     "--environment=production",
     `--project=${PROJECT}`,
     `--primary-instance=${PRIMARY}`,
-    `--ledger-instance=${LEDGER}`,
     `--region=${REGION}`,
     ...extra,
   ];
@@ -220,11 +220,9 @@ function redigest(receipt) {
 
 function auditReceipt({
   primaryRuns,
-  ledgerRuns = automatedSeries(LEDGER),
   nowMs = NOW,
   project = PROJECT,
   primary = PRIMARY,
-  ledger = LEDGER,
 }) {
   return JSON.parse(JSON.stringify(assessBackupRuns({
     environment: "production",
@@ -233,7 +231,6 @@ function auditReceipt({
     region: REGION,
     instances: [
       { role: "primary", instance: primary, settings: describeInstance(primary), backupRuns: primaryRuns },
-      { role: "ledger", instance: ledger, settings: describeInstance(ledger), backupRuns: ledgerRuns },
     ],
   })));
 }
@@ -278,7 +275,6 @@ test("argument parsing is closed and always refuses test-estate targets", () => 
     environment: "production",
     project: PROJECT,
     primaryInstance: PRIMARY,
-    ledgerInstance: LEDGER,
     region: REGION,
   });
   const cases = [
@@ -286,11 +282,11 @@ test("argument parsing is closed and always refuses test-estate targets", () => 
     [auditArgv(["--async=true"]), "BACKUP_HORIZON_ARGUMENT_INVALID"],
     [auditArgv([`--region=${REGION}`]), "BACKUP_HORIZON_ARGUMENT_INVALID"],
     [auditArgv(["--project"]), "BACKUP_HORIZON_ARGUMENT_INVALID"],
-    [auditArgv().filter((arg) => !arg.startsWith("--ledger-instance")), "BACKUP_HORIZON_ARGUMENT_MISSING"],
+    [auditArgv().filter((arg) => !arg.startsWith("--primary-instance")), "BACKUP_HORIZON_ARGUMENT_MISSING"],
+    // One instance, no deletion ledger: a ledger instance is an unknown flag.
+    [auditArgv([`--ledger-instance=${LEDGER}`]), "BACKUP_HORIZON_ARGUMENT_INVALID"],
     [auditArgv().map((arg) => (arg === "--environment=production" ? "--environment=test" : arg)),
       "BACKUP_HORIZON_ENVIRONMENT_INVALID"],
-    [auditArgv().map((arg) => (arg.startsWith("--ledger") ? `--ledger-instance=${PRIMARY}` : arg)),
-      "BACKUP_HORIZON_INSTANCES_NOT_DISTINCT"],
     [auditArgv().map((arg) => (arg.startsWith("--primary") ? "--primary-instance=-rf" : arg)),
       "BACKUP_HORIZON_INSTANCE_INVALID"],
     [auditArgv().map((arg) => (arg.startsWith("--primary") ? `--primary-instance=${PROJECT}:${REGION}:x` : arg)),
@@ -313,7 +309,7 @@ test("argument parsing is closed and always refuses test-estate targets", () => 
     TEST_LEDGER,
   ]) {
     assert.equal(isTestTargetValue(value), true, value);
-    for (const flag of ["--project", "--primary-instance", "--ledger-instance"]) {
+    for (const flag of ["--project", "--primary-instance"]) {
       assert.throws(
         () => parseBackupHorizonArgs(auditArgv().map((arg) => (arg.startsWith(`${flag}=`) ? `${flag}=${value}` : arg))),
         (error) => error.code === "BACKUP_HORIZON_TEST_TARGET_REFUSED",
@@ -344,8 +340,8 @@ test("audit reads only describe and list, and exits by verdict", async () => {
   ];
   for (const scenario of scenarios) {
     const gcloud = fakeGcloud({
-      describes: { [PRIMARY]: describeInstance(PRIMARY, scenario.config), [LEDGER]: describeInstance(LEDGER) },
-      lists: { [PRIMARY]: scenario.primaryRuns, [LEDGER]: automatedSeries(LEDGER) },
+      describes: { [PRIMARY]: describeInstance(PRIMARY, scenario.config) },
+      lists: { [PRIMARY]: scenario.primaryRuns },
     });
     const io = capture();
     const exitCode = await main(auditArgv(), { spawn: gcloud.spawn, now: () => NOW, ...io });
@@ -358,9 +354,8 @@ test("audit reads only describe and list, and exits by verdict", async () => {
     assert.deepEqual(gcloud.calls.map(({ args }) => args), [
       ["sql", "instances", "describe", PRIMARY, `--project=${PROJECT}`, "--format=json"],
       ["sql", "backups", "list", `--instance=${PRIMARY}`, `--project=${PROJECT}`, "--format=json"],
-      ["sql", "instances", "describe", LEDGER, `--project=${PROJECT}`, "--format=json"],
-      ["sql", "backups", "list", `--instance=${LEDGER}`, `--project=${PROJECT}`, "--format=json"],
     ]);
+    assert.deepEqual(Object.keys(receipt.roles), ["primary"]);
     assertNoShell(gcloud.calls);
   }
   assert.deepEqual(AUDIT_EXIT_CODES, { ok: 0, warn: 2, breach: 3 });
@@ -369,7 +364,8 @@ test("audit reads only describe and list, and exits by verdict", async () => {
 test("audit refuses a test-target instance before any gcloud call", async () => {
   for (const argv of [
     auditArgv().map((arg) => (arg.startsWith("--primary") ? `--primary-instance=${TEST_PRIMARY}` : arg)),
-    auditArgv().map((arg) => (arg.startsWith("--ledger") ? `--ledger-instance=${TEST_LEDGER}` : arg)),
+    // The test estate's ledger instance is still a test target.
+    auditArgv().map((arg) => (arg.startsWith("--primary") ? `--primary-instance=${TEST_LEDGER}` : arg)),
     auditArgv().map((arg) => (arg.startsWith("--project") ? `--project=${GCP_PRIVATE_TEST_TARGET.project}` : arg)),
   ]) {
     const gcloud = fakeGcloud();
@@ -387,8 +383,8 @@ test("gcloud failures become named codes that never echo gcloud output", async (
     ["sql backups list", "BACKUP_HORIZON_LIST_FAILED"],
   ]) {
     const gcloud = fakeGcloud({
-      describes: { [PRIMARY]: describeInstance(PRIMARY), [LEDGER]: describeInstance(LEDGER) },
-      lists: { [PRIMARY]: automatedSeries(PRIMARY), [LEDGER]: automatedSeries(LEDGER) },
+      describes: { [PRIMARY]: describeInstance(PRIMARY) },
+      lists: { [PRIMARY]: automatedSeries(PRIMARY) },
       failWhen: (args) => args.slice(0, 3).join(" ") === verb,
     });
     const io = capture();
@@ -421,6 +417,8 @@ test("create-on-demand refuses bad requests before any gcloud call", async () =>
     [createArgv({ purpose: "manual" }), "BACKUP_ON_DEMAND_PURPOSE_INVALID"],
     [createArgv({ purpose: "pre-migration;purpose=rehearsal" }), "BACKUP_ON_DEMAND_PURPOSE_INVALID"],
     [createArgv({ authorize: "create-on-demand:production:ledger" }), "BACKUP_ON_DEMAND_AUTHORIZATION_MISMATCH"],
+    // There is no ledger role to back up.
+    [createArgv({ role: "ledger" }), "BACKUP_HORIZON_ROLE_INVALID"],
     [createArgv({ authorize: "create-on-demand:staging:primary" }), "BACKUP_ON_DEMAND_AUTHORIZATION_MISMATCH"],
     [createArgv({ extra: ["--async=true"] }), "BACKUP_HORIZON_ARGUMENT_INVALID"],
     [createArgv().map((arg) => (arg.startsWith("--instance=") ? `--instance=${TEST_PRIMARY}` : arg)),
@@ -439,6 +437,7 @@ test("create-on-demand refuses bad requests before any gcloud call", async () =>
   }
   for (const [overrides, code] of [
     [{ expiresInDays: 91 }, "BACKUP_ON_DEMAND_EXPIRY_INVALID"],
+    [{ instance: LEDGER, instanceRole: "ledger" }, "BACKUP_HORIZON_ROLE_INVALID"],
     [{ region: undefined }, "BACKUP_HORIZON_REGION_INVALID"],
     [{ region: null }, "BACKUP_HORIZON_REGION_INVALID"],
   ]) {
@@ -479,22 +478,24 @@ test("create-on-demand labels synchronously and reads the new backup back", asyn
     outcome: "created",
   });
 
-  const located = fakeGcloud({ lists: { [LEDGER]: [] } });
-  const ledgerReceipt = createOnDemandBackup({ spawn: located.spawn, now: () => NOW }, {
+  const STAGING_PRIMARY = "synthetic-staging-primary-a";
+  const located = fakeGcloud({ lists: { [STAGING_PRIMARY]: [] } });
+  const stagingReceipt = createOnDemandBackup({ spawn: located.spawn, now: () => NOW }, {
     environment: "staging",
     project: PROJECT,
-    instance: LEDGER,
-    instanceRole: "ledger",
+    instance: STAGING_PRIMARY,
+    instanceRole: "primary",
     purpose: "pre-restore",
     expiresInDays: 7,
     region: REGION,
   });
-  assert.equal(ledgerReceipt.expiresOn, "2026-10-03");
+  assert.equal(stagingReceipt.expiresOn, "2026-10-03");
+  assert.equal(stagingReceipt.role, "primary");
   assert.deepEqual(located.calls[1].args, [
-    "sql", "backups", "create", `--instance=${LEDGER}`, `--project=${PROJECT}`,
+    "sql", "backups", "create", `--instance=${STAGING_PRIMARY}`, `--project=${PROJECT}`,
     "--description=tibotattle-expires-on=2026-10-03;purpose=pre-restore", `--location=${REGION}`,
   ]);
-  assert.equal(Object.isFrozen(ledgerReceipt), true);
+  assert.equal(Object.isFrozen(stagingReceipt), true);
 });
 
 test("create-on-demand fails closed when the readback is missing, ambiguous or not successful", async () => {
@@ -644,7 +645,7 @@ test("prune deletes at most ten due entries per run, oldest first, and journals 
   const primaryRuns = [...automatedSeries(PRIMARY), ...due, ...keep];
   const receipt = auditReceipt({ primaryRuns });
   assert.equal(receipt.roles.primary.onDemand.length, 14);
-  const gcloud = fakeGcloud({ lists: { [PRIMARY]: primaryRuns, [LEDGER]: automatedSeries(LEDGER) } });
+  const gcloud = fakeGcloud({ lists: { [PRIMARY]: primaryRuns } });
   const io = capture();
   const exitCode = await main(pruneArgv(receipt.digest), {
     spawn: gcloud.spawn, now: () => NOW + 2 * HOUR, readReceipt: async () => structuredClone(receipt), ...io,
@@ -659,7 +660,7 @@ test("prune deletes at most ten due entries per run, oldest first, and journals 
   assert.deepEqual(deletes.map(({ args }) => args), oldestFirst.map((run) => [
     "sql", "backups", "delete", run.id, `--instance=${PRIMARY}`, `--project=${PROJECT}`, "--quiet",
   ]));
-  // Only list and delete: the ledger has no candidates, so it is not even listed.
+  // Only list and delete, and only the one instance.
   assert.deepEqual(gcloud.calls.filter(({ args }) => args[2] !== "delete").map(({ args }) => args), [
     ["sql", "backups", "list", `--instance=${PRIMARY}`, `--project=${PROJECT}`, "--format=json"],
   ]);
@@ -692,11 +693,11 @@ test("prune deletes at most ten due entries per run, oldest first, and journals 
 });
 
 test("prune stops at the first failed deletion and journals it", async () => {
-  const due = Array.from({ length: 3 }, (_, index) => dueOnDemand(LEDGER, 20 + index));
-  const ledgerRuns = [...automatedSeries(LEDGER), ...due];
-  const receipt = auditReceipt({ primaryRuns: automatedSeries(PRIMARY), ledgerRuns });
+  const due = Array.from({ length: 3 }, (_, index) => dueOnDemand(PRIMARY, 20 + index));
+  const primaryRuns = [...automatedSeries(PRIMARY), ...due];
+  const receipt = auditReceipt({ primaryRuns });
   const gcloud = fakeGcloud({
-    lists: { [LEDGER]: ledgerRuns },
+    lists: { [PRIMARY]: primaryRuns },
     failWhen: (args) => args[2] === "delete" && args[3] === due[1].id,
   });
   const io = capture();
@@ -732,15 +733,14 @@ test("prune refuses a verified receipt that names the test estate, before any gc
       primaryRuns: [...automatedSeries(TEST_PRIMARY), dueOnDemand(TEST_PRIMARY, 20)],
     }),
     auditReceipt({
-      ledger: TEST_LEDGER,
-      primaryRuns: [...automatedSeries(PRIMARY), dueOnDemand(PRIMARY, 20)],
-      ledgerRuns: automatedSeries(TEST_LEDGER),
+      primary: TEST_LEDGER,
+      primaryRuns: [...automatedSeries(TEST_LEDGER), dueOnDemand(TEST_LEDGER, 20)],
     }),
   ];
   for (const receipt of receipts) {
     // The receipt is well formed and digest-bound; only the test-target guard stops it.
     assert.equal(receipt.roles.primary.onDemand.filter(({ status }) => status === "due").length, 1);
-    const gcloud = fakeGcloud({ lists: { [PRIMARY]: [], [TEST_PRIMARY]: [] } });
+    const gcloud = fakeGcloud({ lists: { [PRIMARY]: [], [TEST_PRIMARY]: [], [TEST_LEDGER]: [] } });
     const io = capture();
     assert.equal(await main(pruneArgv(receipt.digest), {
       spawn: gcloud.spawn, now: () => NOW, readReceipt: async () => structuredClone(receipt), ...io,
@@ -784,32 +784,50 @@ test("prune never deletes a labelled backup the policy still keeps", async () =>
 });
 
 test("prune retries an overdue copy whose earlier deletion failed", async () => {
-  const failed = labelledOnDemand(LEDGER, { ageDays: 95, expiresInDays: 90, status: "DELETION_FAILED" });
-  const ledgerRuns = [...automatedSeries(LEDGER), failed];
-  const receipt = auditReceipt({ primaryRuns: automatedSeries(PRIMARY), ledgerRuns });
-  assert.deepEqual(receipt.roles.ledger.onDemand.map(({ id, status }) => [id, status]), [[failed.id, "overdue"]]);
-  const gcloud = fakeGcloud({ lists: { [LEDGER]: ledgerRuns } });
+  const failed = labelledOnDemand(PRIMARY, { ageDays: 95, expiresInDays: 90, status: "DELETION_FAILED" });
+  const primaryRuns = [...automatedSeries(PRIMARY), failed];
+  const receipt = auditReceipt({ primaryRuns });
+  assert.deepEqual(receipt.roles.primary.onDemand.map(({ id, status }) => [id, status]), [[failed.id, "overdue"]]);
+  const gcloud = fakeGcloud({ lists: { [PRIMARY]: primaryRuns } });
   const io = capture();
   assert.equal(await main(pruneArgv(receipt.digest), {
     spawn: gcloud.spawn, now: () => NOW, readReceipt: async () => structuredClone(receipt), ...io,
   }), 0);
   assert.deepEqual(deleteCalls(gcloud.calls).map(({ args }) => args), [
-    ["sql", "backups", "delete", failed.id, `--instance=${LEDGER}`, `--project=${PROJECT}`, "--quiet"],
+    ["sql", "backups", "delete", failed.id, `--instance=${PRIMARY}`, `--project=${PROJECT}`, "--quiet"],
   ]);
 });
 
-test("prune authorizes nothing for a role whose run evidence was unavailable", async () => {
-  const primaryRuns = [...automatedSeries(PRIMARY), dueOnDemand(PRIMARY, 20)];
-  const ledgerRuns = [...automatedSeries(LEDGER), { ...dueOnDemand(LEDGER, 20), expiryTime: "2027-01-01T00:00:00Z" }];
-  const receipt = auditReceipt({ primaryRuns, ledgerRuns });
-  assert.equal(receipt.roles.ledger.onDemand, null);
-  const gcloud = fakeGcloud({ lists: { [PRIMARY]: primaryRuns, [LEDGER]: ledgerRuns } });
+test("prune authorizes nothing when the run evidence was unavailable", async () => {
+  const primaryRuns = [...automatedSeries(PRIMARY), { ...dueOnDemand(PRIMARY, 20), expiryTime: "2027-01-01T00:00:00Z" }];
+  const receipt = auditReceipt({ primaryRuns });
+  assert.equal(receipt.roles.primary.onDemand, null);
+  const gcloud = fakeGcloud({ lists: { [PRIMARY]: primaryRuns } });
   const io = capture();
   assert.equal(await main(pruneArgv(receipt.digest), {
     spawn: gcloud.spawn, now: () => NOW, readReceipt: async () => structuredClone(receipt), ...io,
   }), 0);
-  assert.deepEqual(deleteCalls(gcloud.calls).map(({ args }) => args[4]), [`--instance=${PRIMARY}`]);
-  assert.equal(gcloud.calls.some(({ args }) => args.includes(`--instance=${LEDGER}`)), false);
+  assert.equal(gcloud.calls.length, 0);
+  assert.equal(JSON.parse(io.out.join("")).deleted, 0);
+});
+
+test("prune refuses a receipt that names a ledger role, before any gcloud call", async () => {
+  const primaryRuns = [...automatedSeries(PRIMARY), dueOnDemand(PRIMARY, 20)];
+  const plain = auditReceipt({ primaryRuns });
+  const withLedger = redigest({
+    ...plain,
+    roles: { ...plain.roles, ledger: { ...plain.roles.primary, instance: LEDGER } },
+  });
+  const v1 = redigest({ ...withLedger, schema: "tibotattle-backup-horizon-audit-v1" });
+  for (const receipt of [withLedger, v1]) {
+    const gcloud = fakeGcloud({ lists: { [PRIMARY]: primaryRuns, [LEDGER]: [] } });
+    const io = capture();
+    assert.equal(await main(pruneArgv(receipt.digest), {
+      spawn: gcloud.spawn, now: () => NOW, readReceipt: async () => structuredClone(receipt), ...io,
+    }), 1);
+    assert.equal(errorCode(io.err), "BACKUP_HORIZON_RECEIPT_INVALID");
+    assert.equal(gcloud.calls.length, 0);
+  }
 });
 
 test("the CLI runs through a symlinked path and never exits 0 silently", async () => {

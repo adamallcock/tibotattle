@@ -354,7 +354,7 @@ test("PG17 imports the verified D1 artifact through explicit mappings under migr
     assert.ok(String(locality.rows[0]?.version ?? "").startsWith("PostgreSQL 17."));
     await pool.query(`CREATE SCHEMA ${quoted}`); schemaCreated = true;
     const applied = await applyPostgresMigrations({ role: "primary", schema, pool });
-    assert.equal(applied.applied, 62);
+    assert.equal(applied.applied, 63);
     // The 0042/0043 permit needs 'degraded' with enrollment and publication off;
     // primary 0050 (D1 0009) makes 'degraded' a real mix and closes reason_code,
     // so processing stays on and the reason is the D1 'maintenance'.
@@ -482,7 +482,7 @@ test("PG17 synthetic permit imports exact v1.1 retained markers in bounded repla
     await pool.query(`CREATE SCHEMA ${quoted}`);
     schemaCreated = true;
     const applied = await applyPostgresMigrations({ role: "primary", schema, pool });
-    assert.equal(applied.applied, 62);
+    assert.equal(applied.applied, 63);
     // The 0042/0043 permit needs 'degraded' with enrollment and publication off;
     // primary 0050 (D1 0009) makes 'degraded' a real mix and closes reason_code,
     // so processing stays on and the reason is the D1 'maintenance'.

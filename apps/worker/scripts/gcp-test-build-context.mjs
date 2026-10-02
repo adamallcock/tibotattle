@@ -32,9 +32,9 @@ const SECRET_PATH_PARTS = new Set([
   "credentials.json",
   "service-account.json",
 ]);
-const EXPECTED_PRIMARY_MIGRATION_COUNT = 62;
+const EXPECTED_PRIMARY_MIGRATION_COUNT = 63;
 const EXPECTED_LEDGER_MIGRATION_COUNT = 7;
-const EXPECTED_PRIMARY_MIGRATION_TAIL = "0062_telemetry_contribution_trigger_search_path.sql";
+const EXPECTED_PRIMARY_MIGRATION_TAIL = "0063_enrollment_grants_erased_redeemer.sql";
 
 const ALLOWLIST = Object.freeze([
   Object.freeze({ source: "gcp-test/package.json", destination: "apps/worker/gcp-test/package.json" }),
@@ -43,6 +43,10 @@ const ALLOWLIST = Object.freeze([
   Object.freeze({ source: "gcp-test/cloudbuild.yaml", destination: "apps/worker/gcp-test/cloudbuild.yaml" }),
   Object.freeze({ source: "scripts/gcp-test-database.mjs", destination: "apps/worker/scripts/gcp-test-database.mjs" }),
   Object.freeze({ source: "scripts/postgres-migrations.mjs", destination: "apps/worker/scripts/postgres-migrations.mjs" }),
+  // The two modules gcp-test-database.mjs reaches: the migration runner the
+  // scripts/ path re-exports, and the shared runtime-grant policy.
+  Object.freeze({ source: "cloud-run/postgres-migrations.mjs", destination: "apps/worker/cloud-run/postgres-migrations.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-runtime-grants.mjs", destination: "apps/worker/cloud-run/postgres-runtime-grants.mjs" }),
   Object.freeze({ source: "postgres/migrations", destination: "apps/worker/postgres/migrations" }),
   Object.freeze({ source: "cloud-run/postgres-community-graph-benchmark.mjs", destination: "apps/worker/cloud-run/postgres-community-graph-benchmark.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-community-graph-benchmark.check.mjs", destination: "apps/worker/cloud-run/postgres-community-graph-benchmark.check.mjs" }),

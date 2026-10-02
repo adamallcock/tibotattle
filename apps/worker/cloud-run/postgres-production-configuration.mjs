@@ -29,6 +29,18 @@
  * names and the test project and region are not identities and are accepted;
  * the test instances themselves are still refused by name.
  *
+ * One Cloud SQL PostgreSQL 17 instance, no deletion ledger (append-only
+ * decision record 2026-09-26, D2 and D4; SIMP-0 item 7): every service pool
+ * opens the primary instance, and the configuration names only that
+ * instance, its database and schema. The retired ledger and bucket-history
+ * settings (LEDGER_INSTANCE_CONNECTION_NAME, LEDGER_DATABASE, LEDGER_SCHEMA,
+ * any other LEDGER_ name and GCS_ERASURE_BUCKET_HISTORY_PROOF) are refused
+ * when present, even empty, so a deployment rendered from a stale template
+ * fails closed instead of being silently ignored. The Cloudflare
+ * DELETION_LEDGER binding and the production deletion-ledger D1 name stay in
+ * the absent-key and fingerprint lists: that is cutover hygiene, not a GCP
+ * resource.
+ *
  * Staging is synthetic-only by default: it runs the closed admission posture
  * of the checked-in staging Worker (STAGING_CONTAINMENT_VARS and
  * STAGING_ORIGIN_TIER_RATE_LIMITS, pinned to wrangler.jsonc env.staging by the
@@ -85,27 +97,25 @@ export const PRODUCTION_WWW_HOST = "www.tibotattle.com";
 
 /**
  * PostgreSQL pool sizes for one service instance. `readiness` is the size of
- * each dedicated readiness pool; there is one on each Cloud SQL instance.
+ * the dedicated readiness pool on the one Cloud SQL instance.
  */
 export const PRODUCTION_POOL_SIZES = Object.freeze({
   data: 3,
-  ledger: 2,
   admission: 4,
   readiness: 1,
 });
 
-/** The Cloud SQL instances each service pool opens, one pool per entry. */
+/** The Cloud SQL instance each service pool opens: always the one primary. */
 export const PRODUCTION_POOL_INSTANCES = Object.freeze({
   data: Object.freeze(["primary"]),
-  ledger: Object.freeze(["ledger"]),
   admission: Object.freeze(["primary"]),
-  readiness: Object.freeze(["primary", "ledger"]),
+  readiness: Object.freeze(["primary"]),
 });
 
 /**
- * The most connections one service instance holds on each Cloud SQL instance
- * (primary: data + admission + readiness; ledger: ledger + readiness). The
- * infrastructure connection budget multiplies these by the instance count.
+ * The most connections one service instance holds on the Cloud SQL instance
+ * (primary: data + admission + readiness). The infrastructure connection
+ * budget multiplies this by the instance count.
  */
 export const PRODUCTION_POOL_CONNECTIONS_PER_INSTANCE = Object.freeze(
   Object.entries(PRODUCTION_POOL_INSTANCES).reduce((budget, [pool, instances]) => {
@@ -356,9 +366,15 @@ export const PRODUCTION_FORBIDDEN_VARIABLES = Object.freeze({
   EDGE_INVOKER_KEY_JSON: "EDGE_INVOKER_KEY_JSON_FORBIDDEN",
   DISTRIBUTION_ANALYTICS_API_TOKEN: "DISTRIBUTION_ANALYTICS_API_TOKEN_FORBIDDEN",
   SPARKLE_APPCAST_GUARD_TOKEN: "SPARKLE_APPCAST_GUARD_TOKEN_FORBIDDEN",
+  // Retired with the deletion ledger (decisions D2 and D4): one instance only.
+  LEDGER_INSTANCE_CONNECTION_NAME: "LEDGER_INSTANCE_CONNECTION_NAME_FORBIDDEN",
+  LEDGER_DATABASE: "LEDGER_DATABASE_FORBIDDEN",
+  LEDGER_SCHEMA: "LEDGER_SCHEMA_FORBIDDEN",
+  GCS_ERASURE_BUCKET_HISTORY_PROOF: "GCS_ERASURE_BUCKET_HISTORY_PROOF_FORBIDDEN",
 });
 export const PRODUCTION_FORBIDDEN_VARIABLE_PREFIXES = Object.freeze({
   HOST_RATE_LIMIT_: "HOST_RATE_LIMIT_OVERRIDE_FORBIDDEN",
+  LEDGER_: "LEDGER_CONFIGURATION_FORBIDDEN",
 });
 
 /**
@@ -504,15 +520,6 @@ const IAM_ROLE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9@_.-]{0,62}$/u;
 // Mirrors bucketName in src/gcs-erasure-object-store.ts, without dots (a
 // dotted name is a domain-verified bucket, which this service never uses).
 const BUCKET_PATTERN = /^[a-z0-9](?:[a-z0-9_-]{1,61}[a-z0-9])$/u;
-const GENERATION_PATTERN = /^[1-9][0-9]{0,18}$/u;
-const MAX_GENERATION = 9_223_372_036_854_775_807n;
-const MAX_HISTORY_PROOF_BYTES = 16_384;
-const HISTORY_PROOF_KEYS = Object.freeze([
-  "bucket",
-  "bucketGeneration",
-  "bucketMetageneration",
-  "softDeleteRetentionDurationSeconds",
-]);
 // Mirrors src/crypto.ts parseJwk.
 const ENVELOPE_KEY_ID_PATTERN = /^key:[A-Za-z0-9._-]{1,64}$/u;
 // Mirrors src/identity-link-configuration.ts.
@@ -630,45 +637,6 @@ function databaseResource(environment, role) {
   return Object.freeze({ instanceConnectionName, database, schema });
 }
 
-/**
- * Mirrors createGcsErasureBucketHistoryProof (src/gcs-erasure-object-store.ts)
- * and accepts either the proof or a bucket-birth receipt carrying it under
- * `proof`, as the test host does. The proof's keys are closed, as the test
- * deployment's readback requires.
- */
-function bucketHistoryProof(environment, bucket) {
-  const raw = environment.required("GCS_ERASURE_BUCKET_HISTORY_PROOF");
-  if (new TextEncoder().encode(raw).byteLength > MAX_HISTORY_PROOF_BYTES) {
-    configurationError("GCS_ERASURE_BUCKET_HISTORY_PROOF_INVALID");
-  }
-  let parsed;
-  try { parsed = JSON.parse(raw); } catch { parsed = undefined; }
-  const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
-  const proof = isObject(parsed) && parsed.proof !== undefined ? parsed.proof : parsed;
-  const generation = (value) => {
-    if (typeof value !== "string" || !GENERATION_PATTERN.test(value)
-        || BigInt(value) > MAX_GENERATION) {
-      configurationError("GCS_ERASURE_BUCKET_HISTORY_PROOF_INVALID");
-    }
-    return value;
-  };
-  if (!isObject(proof) || Object.keys(proof).sort().join() !== HISTORY_PROOF_KEYS.join()
-      || typeof proof.bucket !== "string" || proof.softDeleteRetentionDurationSeconds !== "0") {
-    configurationError("GCS_ERASURE_BUCKET_HISTORY_PROOF_INVALID");
-  }
-  const bucketGeneration = generation(proof.bucketGeneration);
-  const bucketMetageneration = generation(proof.bucketMetageneration);
-  if (proof.bucket !== bucket) {
-    configurationError("GCS_ERASURE_BUCKET_HISTORY_PROOF_BUCKET_MISMATCH");
-  }
-  return Object.freeze({
-    bucket,
-    bucketGeneration,
-    bucketMetageneration,
-    softDeleteRetentionDurationSeconds: "0",
-  });
-}
-
 function verifierServiceAccounts(environment, invoker) {
   if (!environment.has("EDGE_ORIGIN_VERIFIER_SERVICE_ACCOUNTS")) return Object.freeze([]);
   const raw = environment.value("EDGE_ORIGIN_VERIFIER_SERVICE_ACCOUNTS");
@@ -687,8 +655,10 @@ function verifierServiceAccounts(environment, invoker) {
  * The IAM test deployment's resource identities: its service, origin, Cloud
  * SQL instances, schemas, runtime identity and bucket. Each is a distinctive
  * name, so a deployment value equal to any of them, in any setting, reuses
- * the test deployment. Two kinds of CLOUD_RUN_IAM_TEST_TARGET value are
- * deliberately not identities:
+ * the test deployment. The test estate still has a second (ledger) instance
+ * and schema; production never configures one, but they stay identities, so
+ * the primary settings can never name them either. Two kinds of
+ * CLOUD_RUN_IAM_TEST_TARGET value are deliberately not identities:
  * - database names ('tibotattle', 'tibotattle_ledger') are scoped to their
  *   instance, and the test instances are refused by name; the same names on
  *   another instance are the repository's conventional names;
@@ -1006,15 +976,9 @@ export function readProductionConfiguration(processEnv, profile) {
   );
 
   const primary = databaseResource(environment, "primary");
-  const ledger = databaseResource(environment, "ledger");
-  if (ledger.instanceConnectionName === primary.instanceConnectionName) {
-    configurationError("LEDGER_INSTANCE_CONNECTION_NAME_NOT_INDEPENDENT");
-  }
-  if (ledger.schema === primary.schema) configurationError("LEDGER_SCHEMA_NOT_INDEPENDENT");
   const rawIamUser = environment.required("POSTGRES_IAM_USER");
   const iamUser = iamDatabaseUser(rawIamUser);
   const bucket = matching(environment, "GCS_BUCKET_NAME", BUCKET_PATTERN);
-  const historyProof = bucketHistoryProof(environment, bucket);
 
   // Database names are scoped to their instance, so they are not listed.
   const deploymentValues = [
@@ -1022,8 +986,6 @@ export function readProductionConfiguration(processEnv, profile) {
     ["TELEMETRY_STORAGE_NAMESPACE", namespace],
     ["PRIMARY_INSTANCE_CONNECTION_NAME", primary.instanceConnectionName],
     ["PRIMARY_SCHEMA", primary.schema],
-    ["LEDGER_INSTANCE_CONNECTION_NAME", ledger.instanceConnectionName],
-    ["LEDGER_SCHEMA", ledger.schema],
     ["POSTGRES_IAM_USER", rawIamUser],
     ["POSTGRES_IAM_USER", iamUser],
     ["GCS_BUCKET_NAME", bucket],
@@ -1057,7 +1019,6 @@ export function readProductionConfiguration(processEnv, profile) {
   const planeNames = [
     [workloadVariable, workload.name],
     ["PRIMARY_INSTANCE_CONNECTION_NAME", primary.instanceConnectionName],
-    ["LEDGER_INSTANCE_CONNECTION_NAME", ledger.instanceConnectionName],
     ["GCS_BUCKET_NAME", bucket],
     ...envelopeKeyId,
   ];
@@ -1094,10 +1055,8 @@ export function readProductionConfiguration(processEnv, profile) {
     secrets: secrets.handles,
     resources: Object.freeze({
       primary,
-      ledger,
       iamUser,
       bucket,
-      historyProof,
     }),
     poolSizes: PRODUCTION_POOL_SIZES,
     admissionTimeouts: PRODUCTION_ADMISSION_TIMEOUTS,
