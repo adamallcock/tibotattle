@@ -1026,9 +1026,12 @@ function cloudSqlOperations(desired, observed) {
     operations.push(operation("cloud-sql-database:create", "create", [
       "sql", "databases", "create", desired.cloudSql.database, `--instance=${instance}`, project,
     ]));
-    for (const [role, email] of users) {
+    // A PostgreSQL IAM service-account user is named by the account email
+    // WITHOUT ".gserviceaccount.com" (e.g. runtime@project.iam); Cloud SQL
+    // refuses the full email.
+    for (const [role, , iamUser] of users) {
       operations.push(operation(`cloud-sql-user:create:${role}`, "create", [
-        "sql", "users", "create", email, `--instance=${instance}`, project, "--type=cloud_iam_service_account",
+        "sql", "users", "create", iamUser, `--instance=${instance}`, project, "--type=cloud_iam_service_account",
       ]));
     }
     return operations;
@@ -1054,7 +1057,7 @@ function cloudSqlOperations(desired, observed) {
     const live = managed.users.find((user) => user.name === iamUser || user.name === email);
     if (live === undefined) {
       operations.push(operation(`cloud-sql-user:create:${role}`, "create", [
-        "sql", "users", "create", email, `--instance=${instance}`, project, "--type=cloud_iam_service_account",
+        "sql", "users", "create", iamUser, `--instance=${instance}`, project, "--type=cloud_iam_service_account",
       ]));
     } else if (live.type !== "CLOUD_IAM_SERVICE_ACCOUNT") {
       operations.push(operation(`cloud-sql-user:destructive:${role}`, "destructive", [

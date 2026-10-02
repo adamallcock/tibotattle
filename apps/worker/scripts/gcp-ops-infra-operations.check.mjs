@@ -209,9 +209,12 @@ test("the plan for the synthetic fixture holds the whole estate and no bucket ch
   for (const flag of manifest.databaseFlags(desired)) {
     assert.ok(byId.get("cloud-sql:create").argv.at(-1).includes(`${flag.name}=${flag.value}`), flag.name);
   }
+  // PostgreSQL IAM users are the email without ".gserviceaccount.com".
   assert.deepEqual(byId.get("cloud-sql-user:create:runtime").argv, ["sql", "users", "create",
-    desired.serviceAccounts.runtime.email, "--instance=synthetic-primary", "--project=synthetic-ops-project",
+    desired.cloudSql.runtimeIamUser, "--instance=synthetic-primary", "--project=synthetic-ops-project",
     "--type=cloud_iam_service_account"]);
+  assert.equal(byId.get("cloud-sql-user:create:runtime").argv.some((arg) => arg.endsWith(".gserviceaccount.com")), false);
+  assert.equal(byId.get("cloud-sql-user:create:migrator").argv[3], desired.cloudSql.migratorIamUser);
   assert.ok(byId.has("cloud-sql-user:create:migrator"));
   // The conditional custom role, with exactly the parsed permissions.
   assert.ok(byId.get("custom-role:create").argv.includes(`--permissions=${desired.customRole.permissions.join(",")}`));
