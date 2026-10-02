@@ -4,11 +4,13 @@
 //
 // Covered refusals: a tampered signature, a non-append-only update (in the
 // loader and in the database), a version regression (and a gap), an
-// out-of-grammar token, a version 1 that is not the compiled baseline, and a
-// tampered stored row. Covered reads: the compiled baseline fallback before
-// any load, byte-identical pricing from the loaded baseline, pinning, staged
-// activation, and the cutover analytics binding (kernels stay on the
-// compiled registry, stamped manifest version 1).
+// out-of-grammar token, a version 1 that is not the compiled baseline, a
+// tampered stored row, forged or edited card and retraction rows, and a
+// successor that activates before its predecessor. Covered reads: the
+// compiled baseline fallback before any load, byte-identical pricing from the
+// loaded baseline, pinning, staged activation, a key rotated out of the pins,
+// and the cutover analytics binding (kernels stay on the compiled registry,
+// stamped manifest version 1, with table faults report-only).
 //
 // Schemas: the promoted primary chain through the production runner plus the
 // staged catalog migration through the staged-migrations harness (once the
@@ -138,11 +140,10 @@ async function withClient(work) {
   }
 }
 
-const readPricing = (schema, nowMs = NOW_MS) => withClient((client) => store.readCatalogPricingRegistry({
-  client, schema, trustedKeys: signer.trustedKeys, nowMs,
-}));
-const readAnalytics = (schema, kernelBinding, nowMs = NOW_MS) => withClient((client) =>
-  store.readCatalogForAnalytics({ client, schema, trustedKeys: signer.trustedKeys, nowMs, kernelBinding }));
+const readPricing = (schema, nowMs = NOW_MS, trustedKeys = signer.trustedKeys) => withClient((client) =>
+  store.readCatalogPricingRegistry({ client, schema, trustedKeys, nowMs }));
+const readAnalytics = (schema, kernelBinding, nowMs = NOW_MS, trustedKeys = signer.trustedKeys) =>
+  withClient((client) => store.readCatalogForAnalytics({ client, schema, trustedKeys, nowMs, kernelBinding }));
 const pin = (schema, mode, version, reason) => withClient((client) => store.setCatalogPin({
   client, schema, mode, version, reason,
 }));
@@ -230,7 +231,8 @@ test("the staged migration is purely additive: no contract operation", { skip },
     JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
     WHERE n.nspname = $1 AND p.proname LIKE 'catalog\\_%' ORDER BY p.proname`, [schema]);
   assert.deepEqual(functions.rows.map((row) => row.proname),
-    ["catalog_append_only", "catalog_envelope_payload_text", "catalog_manifests_continuity"]);
+    ["catalog_append_only", "catalog_envelope_payload_text", "catalog_manifests_continuity",
+      "catalog_vocabulary_head_version"]);
   for (const row of functions.rows) {
     assert.ok(row.proconfig?.some((entry) => entry === `search_path=${schema}`
       || entry === `search_path="${schema}"` || entry.startsWith(`search_path=${schema},`)), row.proname);
@@ -408,10 +410,11 @@ test("an out-of-grammar token is refused by the loader and by the table", { skip
   assert.equal((await load(schema, await signer.sign(v2))).status, "loaded");
   const stored = await pool.query(`SELECT model FROM ${q(schema, "catalog_cards")} WHERE first_version = 2`);
   assert.deepEqual(stored.rows.map((row) => row.model), [colonArn]);
-  // The table holds the same grammar.
+  // The table holds the same grammar (written under the head version, so
+  // only the grammar CHECK can refuse it).
   const outOfGrammar = `INSERT INTO ${q(schema, "catalog_cards")}
       (card_id, card_digest, provider, model, service_tier, first_version)
-    VALUES ('synthetic:card', '${"a".repeat(64)}', 'openai', $1, 'standard', 1)`;
+    VALUES ('synthetic:card', '${"a".repeat(64)}', 'openai', $1, 'standard', 2)`;
   assert.match(await databaseRefusal(() => pool.query(outOfGrammar, [arnWithSlash])), /check constraint/u);
 });
 
@@ -427,8 +430,18 @@ test("a tampered stored row is refused on read, never served or replaced by the 
   await pool.query(`ALTER TABLE ${q(schema, "catalog_manifests")} DISABLE TRIGGER catalog_manifests_append_only`);
   await pool.query(`UPDATE ${q(schema, "catalog_manifests")} SET envelope_text = $1 WHERE version = 1`, [forged]);
   await pool.query(`ALTER TABLE ${q(schema, "catalog_manifests")} ENABLE TRIGGER catalog_manifests_append_only`);
+  // Wherever table content would be served or bound, the read fails closed.
   assert.equal(await refusal(() => readPricing(schema)), "CATALOG_STORE_TAMPERED");
-  assert.equal(await refusal(() => readAnalytics(schema)), "CATALOG_STORE_TAMPERED");
+  assert.equal(await refusal(() => readAnalytics(schema, "manifest")), "CATALOG_STORE_TAMPERED");
+  // The cutover binding binds nothing from the table, so the fault is
+  // report-only there: the run proceeds on the compiled registry, stamped 1.
+  const compiled = await readAnalytics(schema);
+  assert.deepEqual([compiled.kernelBinding, compiled.stampManifestVersion, compiled.boundManifest,
+    compiled.tableManifestVersion, compiled.tableManifestDigest, compiled.tableFault],
+  ["compiled_registry", 1, null, null, null, "CATALOG_STORE_TAMPERED"]);
+  // A frozen pin is still enforced before the table is consulted.
+  await pin(schema, "frozen", 1, "freeze");
+  assert.equal((await readAnalytics(schema)).tableFault, "CATALOG_STORE_TAMPERED");
   // The loader re-verifies the held head before appending to it.
   const next = await successorOf(store.compiledBaselineCatalogManifest());
   assert.equal(await refusal(async () => load(schema, await signer.sign(next))), "CATALOG_STORE_TAMPERED");
@@ -468,6 +481,11 @@ test("pins choose the read version; staged activation; the cutover analytics bin
   assert.equal(JSON.stringify(pinned.priceCards), JSON.stringify(APP_OFFICIAL_PRICE_CARDS));
   await pin(schema, "pinned", 3, "staging");
   assert.equal(await refusal(() => readPricing(schema)), "CATALOG_PIN_NOT_ACTIVE");
+  assert.equal(await refusal(() => readAnalytics(schema, "manifest")), "CATALOG_PIN_NOT_ACTIVE");
+  // The cutover binding binds nothing from the table: report-only.
+  const pending = await readAnalytics(schema);
+  assert.deepEqual([pending.stampManifestVersion, pending.tableManifestVersion, pending.tableFault],
+    [1, null, "CATALOG_PIN_NOT_ACTIVE"]);
   assert.equal(await refusal(() => pin(schema, "pinned", 9, "staging")), "CATALOG_PIN_VERSION_UNKNOWN");
   assert.equal(await refusal(() => pin(schema, "latest_verified", 2, "advance")), "CATALOG_STORE_ARGUMENT_INVALID");
   await pin(schema, "latest_verified", null, "advance");
@@ -476,13 +494,28 @@ test("pins choose the read version; staged activation; the cutover analytics bin
   // Cutover: kernels on the compiled registry are stamped version 1 whatever
   // the table holds; the post-cutover manifest binding stamps the pin.
   const compiled = await readAnalytics(schema);
-  assert.deepEqual([compiled.stampManifestVersion, compiled.boundManifest, compiled.tableManifestVersion],
-    [1, null, 2]);
+  assert.deepEqual([compiled.stampManifestVersion, compiled.boundManifest, compiled.tableManifestVersion,
+    compiled.tableFault], [1, null, 2, null]);
   const bound = await readAnalytics(schema, "manifest");
   assert.equal(bound.stampManifestVersion, 2);
   assert.equal(bound.boundManifest.version, 2);
+  assert.equal(bound.tableFault, null);
+
+  // A key rotated out of the pins: refused wherever table content is served
+  // or bound (named apart from tampering), report-only for the cutover binding.
+  const rotated = (await syntheticSigner("catalog-test-rotated")).trustedKeys;
+  assert.equal(await refusal(() => readPricing(schema, NOW_MS, rotated)), "CATALOG_STORE_KEY_UNTRUSTED");
+  assert.equal(await refusal(() => readAnalytics(schema, "manifest", NOW_MS, rotated)),
+    "CATALOG_STORE_KEY_UNTRUSTED");
+  const unpinned = await readAnalytics(schema, undefined, NOW_MS, rotated);
+  assert.deepEqual([unpinned.stampManifestVersion, unpinned.tableManifestVersion, unpinned.tableFault],
+    [1, null, "CATALOG_STORE_KEY_UNTRUSTED"]);
+
   await pin(schema, "frozen", 2, "freeze");
   assert.equal(await refusal(() => readAnalytics(schema)), "CATALOG_FROZEN_PIN_MISMATCH");
+  // The frozen pin is enforced even when the table itself is unreadable.
+  assert.equal(await refusal(() => readAnalytics(schema, undefined, NOW_MS, rotated)),
+    "CATALOG_FROZEN_PIN_MISMATCH");
   assert.equal((await readAnalytics(schema, "manifest")).stampManifestVersion, 2);
   await pin(schema, "frozen", 1, "freeze");
   assert.equal((await readAnalytics(schema)).stampManifestVersion, 1);
@@ -493,4 +526,136 @@ test("pins choose the read version; staged activation; the cutover analytics bin
   const events = await pool.query(`SELECT mode, version, reason FROM ${q(schema, "catalog_pin_events")}
     ORDER BY event_no`);
   assert.equal(events.rows.length, 5);
+});
+
+test("forged card and retraction rows are refused at the next load, never trusted", { skip }, async () => {
+  const cardsTable = (schema) => q(schema, "catalog_cards");
+  const retractionsTable = (schema) => q(schema, "catalog_card_retractions");
+  const forgeCard = (schema, card, { digest, model, firstVersion }) => pool.query(
+    `INSERT INTO ${cardsTable(schema)} (card_id, card_digest, provider, model, service_tier, first_version)
+     VALUES ($1, $2, $3, $4, $5, $6)`, [card.id, digest, card.provider, model, card.service_tier, firstVersion]);
+  const baseline = store.compiledBaselineCatalogManifest();
+  const introduced = syntheticCard("synthetic-forgery-probe-km1");
+  const v2 = await successorOf(baseline, (manifest) => {
+    manifest.priceCards.push(introduced);
+    manifest.models.push(syntheticModel("synthetic-forgery-probe-km1"));
+  });
+  const v2Envelope = await signer.sign(v2);
+  const introducedDigest = await contract.catalogCardDigest(introduced, contract.webCryptoSha256Hex);
+
+  // 1. The reported case: a row for a card the next manifest introduces,
+  //    written ahead of it with another digest and model.
+  const ahead = await createSchema();
+  await load(ahead, await signer.sign(baseline));
+  await forgeCard(ahead, introduced, { digest: "0".repeat(64), model: "some-other-model", firstVersion: 1 });
+  assert.equal(await refusal(() => load(ahead, v2Envelope)), "CATALOG_STORE_TAMPERED");
+  assert.deepEqual(await counts(ahead), { manifests: 1, cards: APP_OFFICIAL_PRICE_CARDS.length + 1, retractions: 0 });
+
+  // 2. The same card with its true bytes but written ahead of its manifest
+  //    still claims a version that never carried it: refused.
+  const exact = await createSchema();
+  await load(exact, await signer.sign(baseline));
+  await forgeCard(exact, introduced, { digest: introducedDigest, model: introduced.model, firstVersion: 1 });
+  assert.equal(await refusal(() => load(exact, v2Envelope)), "CATALOG_STORE_TAMPERED");
+
+  // 3. A row can only be written under the head version, so it can never
+  //    claim an older version than the one it was written under.
+  const history = await createSchema();
+  await load(history, await signer.sign(baseline));
+  await load(history, v2Envelope);
+  const later = syntheticCard("synthetic-forgery-probe-km2");
+  assert.equal(await databaseRefusal(() => forgeCard(history, later,
+    { digest: "a".repeat(64), model: later.model, firstVersion: 1 })), "catalog_vocabulary_not_head_version");
+
+  // 4. An existing card row edited behind the append-only trigger (superuser
+  //    only) disagrees with the signed head: refused.
+  const edited = await createSchema();
+  await load(edited, await signer.sign(baseline));
+  await pool.query(`ALTER TABLE ${cardsTable(edited)} DISABLE TRIGGER catalog_cards_append_only`);
+  await pool.query(`UPDATE ${cardsTable(edited)} SET model = 'some-other-model' WHERE card_no = 1`);
+  await pool.query(`ALTER TABLE ${cardsTable(edited)} ENABLE TRIGGER catalog_cards_append_only`);
+  assert.equal(await refusal(() => load(edited, v2Envelope)), "CATALOG_STORE_TAMPERED");
+  assert.deepEqual(await counts(edited), { manifests: 1, cards: APP_OFFICIAL_PRICE_CARDS.length, retractions: 0 });
+
+  // 5. A retraction written ahead of the manifest that retracts the card.
+  //    Before this check it would have broken the legitimate load on the
+  //    card_no key; now the load is refused as tampering instead.
+  const retracted = baseline.priceCards.find((card) => card.provider === "anthropic");
+  const v3 = await successorOf(v2, (manifest) => {
+    manifest.retractions.push({ cardId: retracted.id, inVersion: 3, reason: "withdrawn", supersededBy: [] });
+  });
+  const retraction = await createSchema();
+  await load(retraction, await signer.sign(baseline));
+  await load(retraction, v2Envelope);
+  const forgeRetraction = (schema, cardId, retractedIn, reason) => pool.query(
+    `INSERT INTO ${retractionsTable(schema)} (card_no, retracted_in, reason)
+     SELECT card_no, $2, $3 FROM ${cardsTable(schema)} WHERE card_id = $1`, [cardId, retractedIn, reason]);
+  await forgeRetraction(retraction, retracted.id, 2, "price_correction");
+  assert.equal(await refusal(async () => load(retraction, await signer.sign(v3))), "CATALOG_STORE_TAMPERED");
+  assert.deepEqual(await counts(retraction),
+    { manifests: 2, cards: APP_OFFICIAL_PRICE_CARDS.length + 1, retractions: 1 });
+  //    A retraction can only be written under the head version as well.
+  assert.equal(await databaseRefusal(() => forgeRetraction(retraction, introduced.id, 1, "withdrawn")),
+    "catalog_vocabulary_not_head_version");
+
+  // 6. A legitimately loaded retraction whose reason is edited behind the
+  //    trigger disagrees with the signed head at the next load.
+  const reason = await createSchema();
+  await load(reason, await signer.sign(baseline));
+  await load(reason, v2Envelope);
+  assert.equal((await load(reason, await signer.sign(v3))).retractionsAdded, 1);
+  await pool.query(`ALTER TABLE ${retractionsTable(reason)} DISABLE TRIGGER catalog_card_retractions_append_only`);
+  await pool.query(`UPDATE ${retractionsTable(reason)} SET reason = 'superseded'`);
+  await pool.query(`ALTER TABLE ${retractionsTable(reason)} ENABLE TRIGGER catalog_card_retractions_append_only`);
+  assert.equal(await refusal(async () => load(reason, await signer.sign(await successorOf(v3)))),
+    "CATALOG_STORE_TAMPERED");
+
+  // The untouched chain still loads every step.
+  const clean = await createSchema();
+  await load(clean, await signer.sign(baseline));
+  await load(clean, v2Envelope);
+  assert.equal((await load(clean, await signer.sign(v3))).status, "loaded");
+  assert.equal((await load(clean, await signer.sign(await successorOf(v3)))).status, "loaded");
+  const firstVersions = await pool.query(`SELECT first_version, count(*)::int AS cards
+    FROM ${cardsTable(clean)} GROUP BY first_version ORDER BY first_version`);
+  assert.deepEqual(firstVersions.rows, [
+    { first_version: 1, cards: APP_OFFICIAL_PRICE_CARDS.length }, { first_version: 2, cards: 1 },
+  ]);
+});
+
+test("a successor may not activate before its predecessor, in the loader or the table", { skip }, async () => {
+  const schema = await createSchema();
+  const baseline = store.compiledBaselineCatalogManifest();
+  await load(schema, await signer.sign(baseline));
+  const v2 = await successorOf(baseline, (manifest) => {
+    manifest.publishedAt = "2026-10-01T00:00:00Z";
+    manifest.activateAt = "2026-12-01T00:00:00Z";
+  });
+  await load(schema, await signer.sign(v2));
+  // A hotfix published later but activating earlier would carry v2 live early.
+  const early = await successorOf(v2, (manifest) => {
+    manifest.publishedAt = "2026-10-01T00:00:00Z";
+    manifest.activateAt = "2026-10-01T00:00:00Z";
+  });
+  const earlyEnvelope = await signer.sign(early);
+  assert.equal(await refusal(() => load(schema, earlyEnvelope)), "CATALOG_NOT_APPEND_ONLY");
+  assert.equal((await readPricing(schema)).manifestVersion, 1, "v2 stays pending");
+
+  // The table refuses the same row written outside the loader.
+  const digest = await contract.webCryptoSha256Hex(contract.canonicalCatalogPayloadText(early));
+  assert.equal(await databaseRefusal(() => pool.query(`INSERT INTO ${q(schema, "catalog_manifests")}
+      (version, previous_version, previous_digest, digest, key_id, envelope_text, published_at, activate_at)
+    VALUES (3, 2, $1, $2, $3, $4, $5::timestamptz, $6::timestamptz)`,
+  [early.previousDigest, digest, KEY_ID, earlyEnvelope, early.publishedAt, early.activateAt])),
+  "catalog_manifests_activation_regression");
+  assert.deepEqual(await counts(schema), { manifests: 2, cards: APP_OFFICIAL_PRICE_CARDS.length, retractions: 0 });
+
+  // Activating with or after v2 loads; both go live together on v2's date.
+  const together = await successorOf(v2, (manifest) => {
+    manifest.publishedAt = "2026-10-02T00:00:00Z";
+    manifest.activateAt = "2026-12-01T00:00:00Z";
+  });
+  assert.equal((await load(schema, await signer.sign(together))).status, "loaded");
+  assert.equal((await readPricing(schema)).manifestVersion, 1);
+  assert.equal((await readPricing(schema, Date.parse("2026-12-01T00:00:00.000Z"))).manifestVersion, 3);
 });

@@ -738,7 +738,10 @@ function sameJson(left: unknown, right: unknown): boolean {
  *   label and hidden flag, and a plan's label, may change);
  * - every card is carried with identical canonical bytes, active or retracted;
  * - earlier retractions are carried unchanged and new ones are in this version;
- * - publication time never moves backwards.
+ * - publication time never moves backwards;
+ * - activation time never moves backwards. A successor carries everything the
+ *   held manifest does, so activating it earlier would make a pending
+ *   manifest's content live before that manifest's own activateAt.
  */
 export async function assertCatalogManifestSuccessor({ held, heldDigest, next, digest }: {
   held: CatalogManifest;
@@ -751,7 +754,9 @@ export async function assertCatalogManifestSuccessor({ held, heldDigest, next, d
     fail("CATALOG_VERSION_GAP", "version");
   }
   if (next.previousDigest !== heldDigest) fail("CATALOG_CHAIN_MISMATCH", "previousDigest");
+  // Instants are fixed-width UTC (INSTANT), so text order is time order.
   if (next.publishedAt < held.publishedAt) fail("CATALOG_NOT_APPEND_ONLY", "publishedAt");
+  if (next.activateAt < held.activateAt) fail("CATALOG_NOT_APPEND_ONLY", "activateAt");
 
   const carried = <T>(section: string, before: readonly T[], after: readonly T[], key: (entry: T) => string,
     core: (entry: T) => unknown) => {

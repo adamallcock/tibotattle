@@ -15,7 +15,7 @@
 -- the next free primary number when it promotes this file, after K-STAMP's
 -- migration if that lands first, then regenerates src/postgres-runtime-schema.ts
 -- and moves the count and tail pins. The migration is purely additive (four
--- tables, three functions, triggers), so it needs no CONTRACT_MIGRATIONS entry.
+-- tables, four functions, triggers), so it needs no CONTRACT_MIGRATIONS entry.
 --
 -- CONTENT-FREE. Every row is reviewed public configuration: versions,
 -- digests, key ids, price-card ids, vocabulary tokens and the signed envelope
@@ -26,7 +26,9 @@
 -- TRUNCATE. A bad manifest is never removed: the operator pins the previous
 -- version (catalog_pin_events) and publishes a corrective successor. The
 -- manifest chain is enforced here as well as in the loader: version 1 first,
--- then exactly the held version plus one, naming the held digest.
+-- then exactly the held version plus one, naming the held digest and never
+-- activating before it. Card and retraction rows are written only under the
+-- head version being loaded.
 
 -- The payload text inside a catalog-envelope-v1 envelope (base64url, unpadded),
 -- or NULL when the envelope is not a JSON object with a string payload.
@@ -130,14 +132,19 @@ CREATE TABLE catalog_pin_events (
 -- first manifest is version 1, and every later one is exactly the held
 -- version plus one and names the held digest. A lower or equal version is a
 -- regression; concurrent loaders of the same version collide on the keys.
+-- Activation never moves backwards either: a successor carries all of the
+-- held manifest, so an earlier activate_at would make a pending manifest's
+-- content live before its own activation (latest_verified reads the highest
+-- active version).
 CREATE FUNCTION catalog_manifests_continuity()
 RETURNS trigger
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE
   held_version integer;
   held_digest text;
+  held_activate_at timestamptz;
 BEGIN
-  SELECT version, digest INTO held_version, held_digest
+  SELECT version, digest, activate_at INTO held_version, held_digest, held_activate_at
     FROM catalog_manifests ORDER BY version DESC LIMIT 1;
   IF held_version IS NULL THEN
     IF NEW.version <> 1 THEN
@@ -149,6 +156,8 @@ BEGIN
     RAISE EXCEPTION 'catalog_manifests_version_gap' USING ERRCODE = 'P1005';
   ELSIF NEW.previous_digest IS DISTINCT FROM held_digest THEN
     RAISE EXCEPTION 'catalog_manifests_chain_mismatch' USING ERRCODE = 'P1005';
+  ELSIF NEW.activate_at < held_activate_at THEN
+    RAISE EXCEPTION 'catalog_manifests_activation_regression' USING ERRCODE = 'P1005';
   END IF;
   RETURN NEW;
 END;
@@ -156,6 +165,39 @@ $$;
 CREATE TRIGGER catalog_manifests_continuity
 BEFORE INSERT ON catalog_manifests
 FOR EACH ROW EXECUTE FUNCTION catalog_manifests_continuity();
+
+-- The derived vocabulary is written only for the manifest being loaded: a
+-- card row's first_version and a retraction's retracted_in must equal the
+-- held head version (the loader inserts the manifest row first, in the same
+-- transaction). A row can therefore never claim an older version than the
+-- one it was written under. The loader additionally checks, under its lock,
+-- that both tables are exactly the projection of the re-verified head before
+-- it appends, so a row written outside the loader is refused at the next load.
+CREATE FUNCTION catalog_vocabulary_head_version()
+RETURNS trigger
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+DECLARE
+  head_version integer;
+  row_version integer;
+BEGIN
+  SELECT max(version) INTO head_version FROM catalog_manifests;
+  IF TG_TABLE_NAME = 'catalog_cards' THEN
+    row_version := NEW.first_version;
+  ELSE
+    row_version := NEW.retracted_in;
+  END IF;
+  IF head_version IS NULL OR row_version IS DISTINCT FROM head_version THEN
+    RAISE EXCEPTION 'catalog_vocabulary_not_head_version' USING ERRCODE = 'P1005';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER catalog_cards_head_version
+BEFORE INSERT ON catalog_cards
+FOR EACH ROW EXECUTE FUNCTION catalog_vocabulary_head_version();
+CREATE TRIGGER catalog_card_retractions_head_version
+BEFORE INSERT ON catalog_card_retractions
+FOR EACH ROW EXECUTE FUNCTION catalog_vocabulary_head_version();
 
 CREATE FUNCTION catalog_append_only()
 RETURNS trigger

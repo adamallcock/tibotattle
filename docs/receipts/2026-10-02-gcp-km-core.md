@@ -14,7 +14,8 @@ local PostgreSQL 17 fan-out cluster on a private Unix socket. No Cloudflare or
 Google Cloud resource was read or written, no Wrangler or gcloud command ran,
 nothing was pushed, and no production data was used. Every signing key is a
 synthetic Ed25519 key generated at test time; every fixture is synthetic. It
-is not merged.
+is not merged. It was updated the same day for review round 1 (see "Review
+round 1"); the gates below are the post-review run.
 
 ## Scope
 
@@ -55,7 +56,8 @@ overrides and the owner's round 7 answers applied:
   SHA is `sha256(JSON.stringify(cards))` in insertion order.
 - **Append-only.** A successor is exactly version + 1, names the held digest,
   carries every provider, speed, tier, model core, plan id, card (identical
-  bytes) and retraction; new retractions belong to the new version.
+  bytes) and retraction; new retractions belong to the new version; neither
+  `publishedAt` nor `activateAt` moves backwards.
 - **Adapters, not crypto.** Validators take an injected digest and signature
   verifier (the cross-check's package rule); WebCrypto defaults are separate
   exports. The module has no imports.
@@ -111,36 +113,49 @@ overrides and the owner's round 7 answers applied:
   `catalog_pin_events`. Content-free, no owner or participant column, so no
   FC-11 erasure inventory applies. Purely additive (no contract operation).
 - The database enforces what it can: version 1 first then exactly held + 1
-  naming the held digest (trigger), payload digest and fields equal the row
-  (CHECK over the decoded payload), wire grammar on card tokens, and no
-  UPDATE, DELETE or TRUNCATE on any catalog table.
+  naming the held digest and never activating before it (trigger), payload
+  digest and fields equal the row (CHECK over the decoded payload), wire
+  grammar on card tokens, card and retraction rows written only under the
+  head version (trigger), and no UPDATE, DELETE or TRUNCATE on any catalog
+  table.
 - **Loader** verifies signature, schema, canonical bytes and registry SHA,
-  then the compiled assertions, then (under a table lock) continuity against
-  the held head, which it re-verifies. Version 1 must equal
+  then the compiled assertions, then, under one lock over the manifest, card
+  and retraction tables, continuity against the held head, which it
+  re-verifies, and that the derived vocabulary is exactly the projection of
+  that head (see "Review round 1"). Version 1 must equal
   `CATALOG_BASELINE_DIGEST`. Identical reloads are no-ops; a different
   manifest for a loaded version is `CATALOG_VERSION_CONFLICT`.
-- **Read APIs.** `readCatalogPricingRegistry` (intake) returns the pinned,
+- **Read APIs** are bootstrap reads: each call fetches and re-verifies the
+  full envelope. `readCatalogPricingRegistry` (intake) returns the pinned,
   active, re-verified version's active cards, or the compiled baseline
-  stamped version 1 when there is no table, no load or nothing active.
-  `readCatalogForAnalytics` defaults to `compiled_registry`: it stamps
-  manifest version 1 and binds nothing whatever the table holds (kernels stay
-  compiled at cutover), reports the table version, and refuses a `frozen` pin
-  on any other version. The `manifest` binding (KM-4, post-cutover) stamps and
-  returns the pinned manifest. A tampered stored row is
-  `CATALOG_STORE_TAMPERED`, never a silent fallback.
+  stamped version 1 when there is no table, no load or nothing active, and
+  fails closed on a table fault. `readCatalogForAnalytics` defaults to
+  `compiled_registry`: it stamps manifest version 1 and binds nothing
+  whatever the table holds (kernels stay compiled at cutover), refuses a
+  `frozen` pin on any other version, and treats the table as report-only
+  (`tableFault`). The `manifest` binding (KM-4, post-cutover) stamps and
+  returns the pinned manifest and fails closed. A tampered stored row is
+  `CATALOG_STORE_TAMPERED` and a row whose key is not pinned is
+  `CATALOG_STORE_KEY_UNTRUSTED`, never a silent fallback.
 - **Pin** is an append-only event log: `latest_verified` (highest active),
   `pinned` and `frozen`, with closed reason codes.
 
 ### Invariant amendment
 
-The root `AGENTS.md` raw-account-identifier invariant now states that model,
-provider, speed, tier and plan names are vocabulary, plain text inside the
-wire grammar, else `unrecognized`; `packages/telemetry-contract/AGENTS.md`
-says the same and keeps the current client policy until the client change
-ships. `docs/decisions/2026-10-02-catalog-vocabulary-plain-text.md` records
-the decision (indexed in `docs/README.md`); `test/agent-guidance.test.js`
-pins the wording. The privacy page and in-app notice are not changed here
-(round 5 places them in the next client release).
+The root `AGENTS.md` raw-account-identifier invariant now states, in two
+normally wrapped lines, that model, provider, speed, tier and plan names in
+the wire grammar are vocabulary, not account IDs, and points at
+`docs/decisions/2026-10-02-catalog-vocabulary-plain-text.md`, which carries
+the exact grammar and the `unrecognized` rule. To keep the root file under
+200 lines (199), two dangling one-word continuation lines elsewhere were
+tightened without changing their meaning ("separate gates; one never proves
+another", "a dry run never authorizes a write").
+`packages/telemetry-contract/AGENTS.md` states the grammar and keeps the
+current client policy until the client change ships. The decision record is
+indexed in `docs/README.md`; `test/agent-guidance.test.js` pins the root
+wording, the pointer, and the grammar and `unrecognized` rule in the record.
+The privacy page and in-app notice are not changed here (round 5 places them
+in the next client release).
 
 ## Deviations from the design, and why
 
@@ -165,22 +180,39 @@ pins the wording. The privacy page and in-app notice are not changed here
    workflow job, Secret Manager secret or OIDC binding was created (protected
    operations).
 
+## Review round 1 (2026-10-02)
+
+Five findings were verified against the committed `58b711e0`; all five held
+and none was rejected. Each new negative test was run against the `58b711e0`
+store, contract and migration first and failed there (the forged-row loads
+returned `NO_ERROR`, the early-activating successor was accepted, and the
+cutover analytics read threw), then passed on the fix.
+
+| # | Finding | Verified | Fix |
+|---|---|---|---|
+| 1 (medium) | The loader skipped already-known card ids without comparing them, so `catalog_cards` (and retractions) could disagree with the signed chain | Yes: `if (knownIds.has(card.id)) continue;`, and the runtime grant gives INSERT on every table | Under one lock over the three tables, the loader requires the vocabulary to be exactly the projection of the re-verified head: the same card ids with the same digest, provider, model and tier, `first_version` between 1 and the head version and non-decreasing in `card_no` (load) order, and the same retractions (`retracted_in`, `reason`); otherwise `CATALOG_STORE_TAMPERED`. A new trigger lets card and retraction rows be written only under the head version, so a row can never claim an older version than it was written under; together with the check at every load this keeps `first_version` exact by induction. A retraction insert that touches no row is also refused. PG17 negatives: the reported forged row, a forged row with the true bytes written ahead of its manifest, a forged older `first_version`, an edited card row, a forged retraction (which previously would have broken the legitimate load on the `card_no` key), a forged older `retracted_in`, and an edited retraction reason |
+| 2 (medium) | The cutover `compiled_registry` binding resolved the table first, so a table fault stopped a run that binds nothing from it | Yes: `resolveCatalog` ran before the binding branch; the spec asserted the throw | In `compiled_registry` mode the frozen-pin check still runs first and still refuses; the table is then report-only: `CATALOG_STORE_TAMPERED`, `CATALOG_STORE_KEY_UNTRUSTED` or `CATALOG_PIN_NOT_ACTIVE` is returned as `tableFault` with null table fields and stamp 1. Database errors and invalid arguments still throw. The `manifest` binding and the intake read still fail closed. A stored row whose key is not pinned is now `CATALOG_STORE_KEY_UNTRUSTED` rather than `CATALOG_STORE_TAMPERED`, and a malformed pinned-key list is `CATALOG_STORE_ARGUMENT_INVALID`. This follows the cross-check's "stamped but not bound" rule and the design's "keep the current manifest" rule |
+| 3 (low) | A successor could declare an earlier `activateAt` and carry a pending predecessor live early | Yes: only `publishedAt` was ordered | `assertCatalogManifestSuccessor` requires `next.activateAt >= held.activateAt` (`CATALOG_NOT_APPEND_ONLY`, path `activateAt`), and the continuity trigger raises `catalog_manifests_activation_regression`. Vitest and PG17 negatives, plus a positive "activate together" case |
+| 4 (low) | The read APIs re-verify the full envelope on every call | Yes: measured locally on this branch, 10.8 ms mean over 50 calls for a 582,740-byte baseline envelope | Documented as bootstrap reads in the module header and on `readCatalogPricingRegistry`: once per analytics run, or once per pin re-read interval with the result held in memory (design §5.3), never per request. No caller exists yet; no cache was added |
+| 5 (low) | Root `AGENTS.md` was exactly 200 lines against its own "under 200 lines" rule, via one 205-character line | Yes | The carve-out is now a two-line pointer to the decision record; two dangling continuation lines elsewhere were tightened; the file is 199 lines. The guidance test still enforces `<= 200` while the prose says "under 200"; that pre-existing mismatch is left for the guidance owners |
+
 ## Gates run (all on this branch, local)
 
 | Command | Result |
 |---|---|
 | `node --test ./scripts/catalog-manifest.check.mjs` (apps/worker) | 5 of 5 pass |
 | `node ./scripts/catalog-manifest.mjs check` | ok, digest `da55288b…c941` |
-| `npx vitest run test/catalog-manifest.spec.ts` | 14 of 14 pass |
-| `PG_TEST_SOCKET=… PG_TEST_PORT=55433 node --test postgres-test/catalog-manifest-store.spec.mjs` | 8 of 8 pass; no `km_core_` schema left |
+| `npx vitest run test/catalog-manifest.spec.ts` | 15 of 15 pass |
+| `PG_TEST_SOCKET=… PG_TEST_PORT=55433 node --test postgres-test/catalog-manifest-store.spec.mjs` | 10 of 10 pass; no `km_core_` schema left (counted afterwards) |
+| the same spec and the vitest spec against the `58b711e0` store, contract and migration (new tests only, restored afterwards) | the five changed or new PG tests (including the migration function list) and the new vitest test fail, as intended |
 | `npx tsc --noEmit` (apps/worker) | pass |
-| `npm run postgres:migrations:check`, `npm run vendor:kernels:check` | pass |
-| `node scripts/ci-postgres-suite.mjs --plan`; `node --test scripts/ci-postgres-suite.check.mjs scripts/migration-numbering.check.mjs` | spec routed, 50 of 50 |
+| `npm run postgres:migrations:check`, `npm run vendor:kernels:check` | 10 of 10; pass |
+| `node scripts/ci-postgres-suite.mjs --plan`; `node --test scripts/ci-postgres-suite.check.mjs scripts/migration-numbering.check.mjs` | spec routed, no failures; 50 of 50 |
 | `node scripts/cloud-run-build-context.mjs --check` | pass |
 | root `npm run architecture:check` | pass (946 files) |
-| root `npm run test:preflight` | pass |
-| root `node --test test/agent-guidance.test.js`; `npm run docs:check` | 7 of 7; valid |
-| full Worker `npx vitest run` | 2,376 of 2,378 pass, 177 of 179 files. The two failures are outside this change: `storage-community-graph-publication.spec.ts` (a statement-meter measurement) passed when rerun alone; `storage-graph-history-integration.spec.ts` "folds mixed v1 and v1.1 evidence…" fails identically on the unmodified base `1bea3b5f` in a temporary detached worktree, since removed |
+| root `npm run test:preflight` | pass (exit 0) |
+| root `node --test test/agent-guidance.test.js`; `npm run docs:check` | 7 of 7; valid (322 Markdown files); root `AGENTS.md` 199 lines |
+| full Worker `npx vitest run` | 2,378 of 2,379 pass, 178 of 179 files. The one failure, `storage-graph-history-integration.spec.ts` "folds mixed v1 and v1.1 evidence…", also fails on the unmodified base `1bea3b5f` (checked in round 0 in a temporary detached worktree, since removed) |
 
 Environment gap, not a product result: `npm run workspace-packages:guard`
 reports `ACCOUNTING_PACKAGE_STALE` in this worktree and identically in the
@@ -195,9 +227,26 @@ the package's published `files`.
   Until then nothing loads, by design.
 - **Key revocation.** A held manifest is re-verified on every read and before
   every append, so removing a key from the pins makes every manifest it
-  signed unreadable and blocks appending to them. Rotation must keep the old
-  key in the `next` slot until a successor exists; recovering from a
-  compromised key needs a reviewed procedure (KA-3).
+  signed unservable (`CATALOG_STORE_KEY_UNTRUSTED` for intake pricing and the
+  `manifest` binding) and blocks appending to them. The cutover
+  `compiled_registry` analytics binding keeps running and reports the fault.
+  Rotation must keep the old key in the `next` slot until a successor exists;
+  recovering from a compromised key needs a reviewed procedure (KA-3).
+- **Staged activation and hotfixes.** Activation now never moves backwards
+  along the chain. While a manifest is pending, a corrective successor cannot
+  go live before it, because it carries the pending content. A hotfix for a
+  pending manifest's mistake activates with or after it and, being the higher
+  version, is what `latest_verified` serves from that moment; to keep the
+  pending content from ever going live, the operator pins an earlier version.
+- **The first `card_no` reader.** No read API serves `catalog_cards` yet.
+  The loader proves the vocabulary at every load; rows written outside the
+  loader after the last load are caught at the next load. K-PERCARD, the
+  first reader, should reuse the same check (`assertVocabularyIsHeadProjection`
+  in `src/postgres-catalog-store.ts`, exported then) rather than trust the
+  table between loads.
+- **Bootstrap reads.** The read APIs cost about 11 ms of CPU and the full
+  envelope per call. Callers hold the result per run or per pin interval;
+  a request-path caller needs a cache keyed by version, digest and key id.
 - **Integration.** Promote and number the staged migration after K-STAMP's,
   regenerate `src/postgres-runtime-schema.ts`, move the build-context count
   and tail pins. Wire the loader into the refresh or an ops job (KM-4 owns

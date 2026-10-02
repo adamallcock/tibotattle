@@ -222,14 +222,17 @@ test("agent guidance scopes the raw-identifier invariant for catalog vocabulary 
   ]);
   const grammar = "`[A-Za-z0-9._:-]{1,64}`";
   const decisionPath = "docs/decisions/2026-10-02-catalog-vocabulary-plain-text.md";
-  // The invariant itself still forbids raw account IDs; only vocabulary is carved out.
+  // The invariant itself still forbids raw account IDs; only vocabulary inside
+  // the wire grammar is carved out, and the root points at the decision record
+  // for the exact grammar and the `unrecognized` rule.
   assert.match(root, /raw\s+account IDs and session content must not enter derived artifacts/u);
   assert.match(
     root,
-    /Model, provider, speed, tier and plan names are vocabulary, not account IDs/u,
+    /Model, provider, speed, tier and plan names in the wire grammar are vocabulary,\s+not account IDs/u,
   );
-  assert.ok(root.includes(`plain text inside ${grammar}, else \`unrecognized\``));
-  assert.ok(root.includes(decisionPath));
+  assert.ok(root.includes(`(\`${decisionPath}\`)`));
+  assert.match(decision, /`\[A-Za-z0-9\._:-\]` with 1 to 64 characters/u);
+  assert.match(decision, /counted as `unrecognized`/u);
   assert.match(contract, /Model, provider, speed, tier and plan\s+names are vocabulary, not raw account\/scope identifiers/u);
   assert.ok(contract.includes(grammar));
   assert.ok(contract.includes(decisionPath));

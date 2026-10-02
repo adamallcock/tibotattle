@@ -336,6 +336,35 @@ describe("append-only successors", () => {
     }))).toBe("CATALOG_VERSION_GAP");
     expect(await check(await successorOf(held), "f".repeat(64))).toBe("CATALOG_CHAIN_MISMATCH");
   });
+
+  it("refuses a successor that activates before its predecessor, so staged activation cannot be skipped", async () => {
+    // v2 is published ahead and pending until December; a later v3 carries
+    // all of v2, so an earlier activateAt would make v2's content live early.
+    const v1 = compiledBaselineCatalogManifest();
+    const v2 = await successorOf(v1, (manifest) => {
+      manifest.publishedAt = "2026-10-01T00:00:00Z";
+      manifest.activateAt = "2026-12-01T00:00:00Z";
+    });
+    const v2Digest = await webCryptoSha256Hex(canonicalCatalogPayloadText(v2));
+    const check = (next: CatalogManifest) => codeOf(() => assertCatalogManifestSuccessor({
+      held: v2, heldDigest: v2Digest, next, digest: webCryptoSha256Hex,
+    }));
+    const early = await successorOf(v2, (manifest) => {
+      manifest.publishedAt = "2026-10-01T00:00:00Z";
+      manifest.activateAt = "2026-10-01T00:00:00Z";
+    });
+    await validateCatalogManifest(early, webCryptoSha256Hex);
+    expect(await check(early)).toBe("CATALOG_NOT_APPEND_ONLY");
+    expect(await check(await successorOf(v2, (manifest) => {
+      manifest.publishedAt = "2026-10-02T00:00:00Z";
+      manifest.activateAt = "2026-11-30T23:59:59Z";
+    }))).toBe("CATALOG_NOT_APPEND_ONLY");
+    // Equal or later activation is a normal successor.
+    expect(await check(await successorOf(v2, (manifest) => {
+      manifest.publishedAt = "2026-10-02T00:00:00Z";
+      manifest.activateAt = "2026-12-01T00:00:00Z";
+    }))).toBe("NO_ERROR");
+  });
 });
 
 describe("catalog-envelope-v1", () => {
