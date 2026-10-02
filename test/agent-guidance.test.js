@@ -231,10 +231,16 @@ test("agent guidance scopes the raw-identifier invariant for catalog vocabulary 
     /Model, provider, speed, tier and plan names in the wire grammar are vocabulary,\s+not account IDs/u,
   );
   assert.ok(root.includes(`(\`${decisionPath}\`)`));
-  // Round 11: in-grammar names may be listed in logs; out-of-grammar values are only counted.
-  assert.match(root, /not account IDs, and may be listed in logs; others are only counted/u);
-  assert.match(decision, /Operational logs may list in-grammar names \(round 11\)/u);
-  assert.match(decision, /A string outside the grammar is still only\s+counted, never listed/u);
+  // Round 11: only the unseen-name probe's log line may list in-grammar model,
+  // speed, tier and plan names; there is no general permission to list names in logs.
+  assert.match(
+    root,
+    /In logs,\s+only the unseen-name probe's line may list in-grammar model, speed, tier and plan names/u,
+  );
+  assert.doesNotMatch(root, /may be listed in logs/u);
+  assert.match(decision, /The unseen-name probe's log line may list in-grammar names \(round 11\)/u);
+  assert.match(decision, /listing these names, or provider names, in any\s+other log or diagnostic needs a new owner decision/u);
+  assert.match(decision, /A string outside the grammar is\s+still only\s+counted, never listed/u);
   assert.match(decision, /`\[A-Za-z0-9\._:-\]` with 1 to 64 characters/u);
   assert.match(decision, /counted as `unrecognized`/u);
   assert.match(contract, /Model, provider, speed, tier and plan\s+names are vocabulary, not raw account\/scope identifiers/u);

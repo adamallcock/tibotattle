@@ -43,12 +43,14 @@ status: accepted
 5. **Public surfaces draw only catalogued names.** Unknown names are stored
    and counted, never drawn raw on the public site, until the catalog or
    manifest adds them (round 5).
-6. **Operational logs may list in-grammar names (round 11).** The unseen-name
-   probe's log line may list in-grammar unseen model, speed, tier and plan
-   names, bounded per dimension, with record counts. This is the owner's
-   round-11 answer to the question that had held the listing against the
-   round-5 log retention wording. A string outside the grammar is still only
-   counted, never listed.
+6. **The unseen-name probe's log line may list in-grammar names (round 11).**
+   The unseen-name probe's log line may list in-grammar unseen model, speed,
+   tier and plan names, bounded per dimension, with record counts. This is
+   the owner's round-11 answer to the question that had held the listing
+   against the round-5 log retention wording. A string outside the grammar is
+   still only counted, never listed. The answer covers that one line and
+   those four dimensions only: listing these names, or provider names, in any
+   other log or diagnostic needs a new owner decision.
 
 ## What is unchanged
 
