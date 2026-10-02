@@ -22,22 +22,50 @@
 //  6. GETs /api/v1/community/daily?from=<golden from>&to=<golden to>;
 //  7. compares the response and the stored preview with the golden
 //     (scripts/analytics-v2-parity-compare.mjs, publication fields only
-//     normalized) and reports every difference per family;
+//     normalized) and reports every difference per family. The model dates
+//     the golden manifest lists as withheld (modelPublications.missing) may
+//     be published by the fast path, and only those: per-date model
+//     publication is the owner's decision of 2026-10-01 (fast-path plan OD-12);
 //  8. runs analytics-refresh again and checks it creates no new revision;
 //  9. drops every schema it created (unless --keep-schema).
+//
+// Options:
+//   --golden <dir>              the oracle golden (required)
+//   --dump <usage-monitor-db.json>
+//                               the golden's source dump when the golden does not
+//                               commit it (golden-dense); its sha256 must equal
+//                               the golden manifest's sourceDump.jsonSha256
+//   --per-date-expected <file>  also hold the stored preview and the served
+//                               allowanceBreakdowns exactly to an oracle's
+//                               per-date expectation (OD-12), for example
+//                               analytics-v2-test/golden-q1-node/per-date-expected.json
+//   --owner-reference <dir>     also hold every owner's stored fits, model dates,
+//                               owner-day values, cache bands and refusals to an
+//                               oracle's direct native references (owner-results.json
+//                               and cache-reference.json; scripts/analytics-v2-owner-parity-compare.mjs)
+//   --dense                     the golden is a dense production-code golden
+//                               (golden-dense): its served read was captured before
+//                               production's graph lane published, so the allowance
+//                               and preview families are held to its
+//                               per-date-expected.json, and its owner references
+//                               are the golden directory itself
+//   --refresh-timeout-minutes <n>  per analytics-refresh run (default 30, at most 720)
+//   --reuse-schema <schema>     skip steps 1 to 3 and run against a target an earlier
+//                               --keep-schema run imported (never dropped here)
+//   --keep-schema, --out <file>, --node22 <path>
 //
 // Rehearsal-only and local-only: it never reads production, never pushes and
 // never deploys. Inputs are the oracle's synthetic, content-free corpus; the
 // report holds counts, digests, day keys and synthetic aggregate values only.
 //
-// Exit codes: 0 when every step completed, the second run created no
-// revision and the parity compare found no unexpected difference; 1 when a
-// step completed but a gate failed (the report says which); 2 when the
-// rehearsal could not run.
+// Exit codes: 0 when every step completed, both refresh runs completed (not
+// LOCK_HELD), the second run created no revision and every requested compare
+// found no unexpected difference; 1 when a step completed but a gate failed
+// (the report says which); 2 when the rehearsal could not run.
 
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync } from "node:fs";
+import { createReadStream, existsSync } from "node:fs";
 import { chmod, lstat, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { DatabaseSync } from "node:sqlite";
@@ -47,7 +75,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import pg from "pg";
 
-import { compareAnalyticsV2Parity } from "./analytics-v2-parity-compare.mjs";
+import { compareAnalyticsV2Parity, withheldModelDatesOf } from "./analytics-v2-parity-compare.mjs";
+import {
+  compareAnalyticsV2OwnerParity,
+  readAnalyticsV2OwnerRows,
+} from "./analytics-v2-owner-parity-compare.mjs";
+import { comparePerDate } from "./gcp-fastpath-dense-oracle/per-date-compare.mjs";
 import { rebuildOracleSqlite } from "./gcp-fastpath-oracle-sqlite.mjs";
 import {
   compareFastpathOwnerRevisions,
@@ -89,7 +122,14 @@ const DEFAULT_NODE22 = join(homedir(), ".nvm/versions/node/v22.16.0/bin/node");
 const PRIVATE_SOCKET = /^\/private\/tmp\/tibotattle-pg-[^/]+\/socket$/u;
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
 const COMMUNITY_DAILY_PATH = "/api/v1/community/daily";
-const REFRESH_TIMEOUT_MS = 30 * 60_000;
+const DEFAULT_REFRESH_TIMEOUT_MINUTES = 30;
+const MAX_REFRESH_TIMEOUT_MINUTES = 720;
+/**
+ * The allowance read state production serves once a preview is published
+ * (the Q-1 golden's served read). A dense golden's own read was captured
+ * before its graph lane published, so its per-date expectation stands in.
+ */
+const PUBLISHED_ALLOWANCE_STATE = Object.freeze({ allowanceState: "ready", allowanceReadState: "confirmed" });
 /**
  * The Node heap analytics-refresh runs with, as the deployed Job does
  * (gcp-fastpath-test-deploy.mjs REFRESH_JOB_RESOURCES.heapMiB, pinned equal by
@@ -109,20 +149,81 @@ function fail(code, details) {
   throw new RehearsalError(code, details);
 }
 
-function parseArguments(argv) {
-  const options = { golden: null, keepSchema: false, out: null, node22: process.env.GCP_FASTPATH_NODE22 || DEFAULT_NODE22 };
+export function parseArguments(argv) {
+  const options = {
+    golden: null, keepSchema: false, out: null, node22: process.env.GCP_FASTPATH_NODE22 || DEFAULT_NODE22,
+    dump: null, perDateExpected: null, ownerReference: null, dense: false,
+    refreshTimeoutMinutes: DEFAULT_REFRESH_TIMEOUT_MINUTES, reuseSchema: null,
+  };
+  const valueOf = (index, argument) => {
+    const value = argv[index];
+    if (typeof value !== "string" || value.length === 0 || value.startsWith("--")) {
+      fail("REHEARSAL_ARGUMENT_INVALID", { argument });
+    }
+    return value;
+  };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
-    if (argument === "--golden") options.golden = argv[++index];
+    if (argument === "--golden") options.golden = valueOf(++index, argument);
     else if (argument === "--keep-schema") options.keepSchema = true;
-    else if (argument === "--out") options.out = argv[++index];
-    else if (argument === "--node22") options.node22 = argv[++index];
-    else fail("REHEARSAL_ARGUMENT_INVALID", { argument });
+    else if (argument === "--dense") options.dense = true;
+    else if (argument === "--out") options.out = valueOf(++index, argument);
+    else if (argument === "--node22") options.node22 = valueOf(++index, argument);
+    else if (argument === "--dump") options.dump = valueOf(++index, argument);
+    else if (argument === "--per-date-expected") options.perDateExpected = valueOf(++index, argument);
+    else if (argument === "--owner-reference") options.ownerReference = valueOf(++index, argument);
+    else if (argument === "--reuse-schema") options.reuseSchema = valueOf(++index, argument);
+    else if (argument === "--refresh-timeout-minutes") {
+      const minutes = Number(valueOf(++index, argument));
+      if (!Number.isSafeInteger(minutes) || minutes < 1 || minutes > MAX_REFRESH_TIMEOUT_MINUTES) {
+        fail("REHEARSAL_ARGUMENT_INVALID", { argument });
+      }
+      options.refreshTimeoutMinutes = minutes;
+    } else fail("REHEARSAL_ARGUMENT_INVALID", { argument });
   }
   if (typeof options.golden !== "string" || options.golden.length === 0) fail("REHEARSAL_GOLDEN_REQUIRED");
   options.golden = resolve(options.golden);
-  if (options.out !== null) options.out = resolve(options.out);
+  for (const key of ["out", "dump", "perDateExpected", "ownerReference"]) {
+    if (options[key] !== null) options[key] = resolve(options[key]);
+  }
+  if (options.dense) {
+    // A dense golden carries its own per-date expectation and owner references.
+    if (options.perDateExpected !== null || options.ownerReference !== null) {
+      fail("REHEARSAL_ARGUMENT_INVALID", { argument: "--dense" });
+    }
+    options.perDateExpected = join(options.golden, "per-date-expected.json");
+    options.ownerReference = options.golden;
+  }
+  if (options.reuseSchema !== null) {
+    if (!options.reuseSchema.startsWith(POSTGRES_FASTPATH_REHEARSAL_TARGET_SCHEMA_PREFIX)) {
+      fail("REHEARSAL_ARGUMENT_INVALID", { argument: "--reuse-schema" });
+    }
+    fastpathRehearsalSchemas(options.reuseSchema.slice(POSTGRES_FASTPATH_REHEARSAL_TARGET_SCHEMA_PREFIX.length));
+  }
   return options;
+}
+
+async function sha256OfFile(path) {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(path)) hash.update(chunk);
+  return hash.digest("hex");
+}
+
+/**
+ * The golden's source dump: committed under <golden>/dump, or given with
+ * --dump when the golden records only its digest. A dump the golden pins
+ * (manifest sourceDump.jsonSha256) must match it byte for byte.
+ */
+export async function resolveRehearsalDump({ golden, dump, manifest }) {
+  const committed = join(golden, "dump", "usage-monitor-db.json");
+  if (dump !== null && existsSync(committed)) fail("REHEARSAL_DUMP_AMBIGUOUS");
+  const path = dump ?? committed;
+  if (!existsSync(path)) fail("REHEARSAL_DUMP_MISSING");
+  const pinned = manifest?.sourceDump?.jsonSha256;
+  if (dump !== null && typeof pinned !== "string") fail("REHEARSAL_DUMP_UNPINNED");
+  const sha256 = await sha256OfFile(path);
+  if (typeof pinned === "string" && sha256 !== pinned) fail("REHEARSAL_DUMP_DIGEST_MISMATCH");
+  return { path, sha256, pinned: typeof pinned === "string" };
 }
 
 async function localEndpoint(env) {
@@ -184,7 +285,7 @@ async function freePort() {
   });
 }
 
-async function runRefresh({ node22, endpointEnv, schema, nowIso }) {
+async function runRefresh({ node22, endpointEnv, schema, nowIso, timeoutMinutes }) {
   const started = performance.now();
   let stdout;
   let stderr;
@@ -195,7 +296,7 @@ async function runRefresh({ node22, endpointEnv, schema, nowIso }) {
       cwd: CLOUD_RUN_ROOT,
       env: { PATH: process.env.PATH, HOME: process.env.HOME, ANALYTICS_V2_TEST_CLOCK: "1", ...endpointEnv },
       maxBuffer: 64 * 1024 * 1024,
-      timeout: REFRESH_TIMEOUT_MS,
+      timeout: timeoutMinutes * 60_000,
     }));
   } catch (error) {
     stdout = error.stdout ?? "";
@@ -424,6 +525,21 @@ export const FASTPATH_REHEARSAL_COUNTED_TABLES = Object.freeze([
   "telemetry_usage_correction_facts",
 ]);
 
+/**
+ * One refresh run's content-free cost: wall time, the job's own phase timings
+ * and memory summary (its peak resident set included), straight from its
+ * receipt.
+ */
+function refreshMeasurement(run) {
+  const receipt = run.receipt ?? {};
+  return {
+    wallMs: run.wallMs,
+    state: receipt.state ?? null,
+    timingsMs: receipt.timings ?? null,
+    memory: receipt.memory ?? null,
+  };
+}
+
 async function publishedSnapshot(pool, schema) {
   const result = await pool.query(`SELECT to_char(day,'YYYY-MM-DD') AS day, revision, payload_sha256,
       run_id::text AS run_id FROM ${quoteIdentifier(schema)}.analytics_v2_published_daily ORDER BY day`);
@@ -595,7 +711,17 @@ async function main() {
   const golden = JSON.parse(await readFile(join(options.golden, "community-daily-response.json"), "utf8"));
   const goldenPreview = JSON.parse(await readFile(join(options.golden, "preview.json"), "utf8"));
   const manifest = JSON.parse(await readFile(join(options.golden, "manifest.json"), "utf8"));
-  const dumpPath = join(options.golden, "dump", "usage-monitor-db.json");
+  const withheldModelDates = withheldModelDatesOf(manifest);
+  const perDateExpected = options.perDateExpected === null ? null
+    : JSON.parse(await readFile(options.perDateExpected, "utf8"));
+  const ownerReference = options.ownerReference === null ? null : {
+    ownerResults: JSON.parse(await readFile(join(options.ownerReference, "owner-results.json"), "utf8")),
+    cacheReference: JSON.parse(await readFile(join(options.ownerReference, "cache-reference.json"), "utf8")),
+    conflict: (JSON.parse(await readFile(join(options.ownerReference, "manifest.json"), "utf8"))).conflict ?? null,
+  };
+  const dump = options.reuseSchema === null
+    ? await resolveRehearsalDump({ golden: options.golden, dump: options.dump, manifest }) : null;
+  const dumpPath = dump?.path ?? null;
   const nowMs = manifest.nowMs;
   const nowIso = new Date(nowMs).toISOString();
   if (!Number.isSafeInteger(nowMs) || nowIso !== manifest.now) fail("REHEARSAL_GOLDEN_CLOCK_INVALID");
@@ -608,15 +734,20 @@ async function main() {
     ...(process.env.PG_TEST_USER ? { PG_TEST_USER: process.env.PG_TEST_USER } : {}),
     ...(process.env.PG_TEST_DATABASE ? { PG_TEST_DATABASE: process.env.PG_TEST_DATABASE } : {}),
   };
-  const { suffix, schema, ledgerSchema, controlSchema } = fastpathRehearsalSchemas(randomBytes(4).toString("hex"));
+  const { suffix, schema, ledgerSchema, controlSchema } = fastpathRehearsalSchemas(options.reuseSchema === null
+    ? randomBytes(4).toString("hex")
+    : options.reuseSchema.slice(POSTGRES_FASTPATH_REHEARSAL_TARGET_SCHEMA_PREFIX.length));
   const created = [];
   const timings = {};
   const report = {
     schemaVersion: GCP_FASTPATH_REHEARSAL_REPORT_VERSION,
     startedAt: new Date().toISOString(),
     node: { rehearsal: process.version, analyticsRefresh: node22Version },
-    golden: { nowMs, now: nowIso, from: golden.from, to: golden.to, sourceCommit: manifest.sourceCommit },
+    golden: { nowMs, now: nowIso, from: golden.from, to: golden.to, sourceCommit: manifest.sourceCommit,
+      withheldModelDates: withheldModelDates.length, dense: options.dense,
+      dump: dump === null ? null : { sha256: dump.sha256, pinnedByManifest: dump.pinned } },
     schema,
+    reusedSchema: options.reuseSchema !== null,
     steps: {},
     gates: {},
     timingsMs: timings,
@@ -629,38 +760,49 @@ async function main() {
     const version = await pool.query("SELECT current_setting('server_version_num')::integer AS version");
     if (Math.floor(version.rows[0].version / 10_000) !== 17) fail("REHEARSAL_POSTGRES_17_REQUIRED");
 
-    // 1. Fresh schemas, every promoted migration through the production runner.
-    await timed(timings, "migrate", async () => {
-      for (const name of [schema, ledgerSchema, controlSchema]) {
-        await pool.query(`CREATE SCHEMA ${quoteIdentifier(name)}`);
-        created.push(name);
-      }
-      const primary = await applyPostgresMigrations({ role: "primary", schema, pool });
-      const ledger = await applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool });
-      const expected = await readPostgresMigrations({ role: "primary" });
-      report.steps.migrate = {
-        primaryApplied: primary.applied, primaryTail: primary.migrations.at(-1)?.name,
-        ledgerApplied: ledger.applied, expectedPrimary: expected.length,
-      };
-      if (primary.applied !== expected.length) fail("REHEARSAL_MIGRATION_INCOMPLETE");
-    });
+    if (options.reuseSchema !== null) {
+      const present = await pool.query("SELECT count(*)::integer AS n FROM pg_namespace WHERE nspname = ANY($1)",
+        [[schema, ledgerSchema]]);
+      if (present.rows[0].n !== 2) fail("REHEARSAL_REUSE_SCHEMA_MISSING");
+    } else {
+      // 1. Fresh schemas, every promoted migration through the production runner.
+      await timed(timings, "migrate", async () => {
+        for (const name of [schema, ledgerSchema, controlSchema]) {
+          await pool.query(`CREATE SCHEMA ${quoteIdentifier(name)}`);
+          created.push(name);
+        }
+        const primary = await applyPostgresMigrations({ role: "primary", schema, pool });
+        const ledger = await applyPostgresMigrations({ role: "ledger", schema: ledgerSchema, pool });
+        const expected = await readPostgresMigrations({ role: "primary" });
+        report.steps.migrate = {
+          primaryApplied: primary.applied, primaryTail: primary.migrations.at(-1)?.name,
+          ledgerApplied: ledger.applied, expectedPrimary: expected.length,
+        };
+        if (primary.applied !== expected.length) fail("REHEARSAL_MIGRATION_INCOMPLETE");
+      });
 
-    // 2. The sealed SQLite rebuild of the oracle's USAGE_MONITOR_DB dump.
-    workDirectory = await realpath(await mkdtemp(join(tmpdir(), "gcp-fastpath-rehearsal-")));
-    const sealed = await timed(timings, "sqlite", async () => sealFastpathRehearsalSource({ dumpPath, workDirectory }));
-    report.steps.sqlite = sealed.report;
+      // 2. The sealed SQLite rebuild of the oracle's USAGE_MONITOR_DB dump.
+      workDirectory = await realpath(await mkdtemp(join(tmpdir(), "gcp-fastpath-rehearsal-")));
+      const sealed = await timed(timings, "sqlite", async () => sealFastpathRehearsalSource({ dumpPath, workDirectory }));
+      report.steps.sqlite = sealed.report;
 
-    // 3. Importers, in the plan's order (shared with the GCP seed).
-    Object.assign(report.steps, await loadFastpathRehearsalImporters({
-      pool, schema, controlSchema, suffix, sealedSource: sealed.sealedSource, dumpPath, workDirectory,
-      roster: manifest.owners, timings,
-    }));
+      // 3. Importers, in the plan's order (shared with the GCP seed).
+      Object.assign(report.steps, await loadFastpathRehearsalImporters({
+        pool, schema, controlSchema, suffix, sealedSource: sealed.sealedSource, dumpPath, workDirectory,
+        roster: manifest.owners, timings,
+      }));
+    }
 
     // 4. analytics-refresh (dist, Node 22) at the golden's clock.
-    const first = await runRefresh({ node22: options.node22, endpointEnv, schema, nowIso });
+    const first = await runRefresh({ node22: options.node22, endpointEnv, schema, nowIso,
+      timeoutMinutes: options.refreshTimeoutMinutes });
     timings["refresh:first"] = first.wallMs;
     report.steps.refreshFirst = { exitCode: first.exitCode, receipt: first.receipt, error: first.error };
     if (first.exitCode !== 0) fail("REHEARSAL_REFRESH_FAILED", { error: first.error });
+    // LOCK_HELD means another refresh in this database ran instead: nothing
+    // this run would compare was computed by it.
+    if (first.receipt?.state !== "complete") fail("REHEARSAL_REFRESH_INCOMPLETE", { state: first.receipt?.state ?? null });
+    report.measurement = { refreshFirst: refreshMeasurement(first) };
     const afterFirst = await publishedSnapshot(pool, schema);
 
     // 5-6. The fastpath-test origin and the public read.
@@ -682,15 +824,34 @@ async function main() {
       await writeFile(`${options.out}.preview.json`, `${JSON.stringify(actualPreview)}\n`, { flag: "wx" });
     }
 
-    // 7. Parity.
-    report.parity = await timed(timings, "parity", async () => compareAnalyticsV2Parity({
-      golden, actual, goldenPreview, actualPreview,
-    }));
+    // 7. Parity. A dense golden's served read predates production's model and
+    // preview publication, so its allowance families come from its per-date
+    // expectation; every other family is the served read's.
+    report.parity = await timed(timings, "parity", async () => (options.dense
+      ? compareAnalyticsV2Parity({
+        golden: { ...golden, ...PUBLISHED_ALLOWANCE_STATE, allowanceBreakdowns: perDateExpected.allowanceBreakdowns },
+        actual, goldenPreview: perDateExpected.preview, actualPreview,
+      })
+      : compareAnalyticsV2Parity({ golden, actual, goldenPreview, actualPreview, withheldModelDates })));
+    if (perDateExpected !== null) {
+      report.perDate = comparePerDate({ expected: perDateExpected, response: actual, preview: actualPreview });
+    }
+    if (ownerReference !== null) {
+      const rows = await timed(timings, "owner-rows", async () => readAnalyticsV2OwnerRows(pool, schema));
+      if (options.out !== null) {
+        await writeFile(`${options.out}.owner-rows.json`, `${JSON.stringify(rows)}\n`, { flag: "wx" });
+      }
+      report.ownerParity = await timed(timings, "owner-parity", async () => compareAnalyticsV2OwnerParity({
+        ...ownerReference, rows,
+      }));
+    }
 
     // 8. A second run at the same clock must create no revision.
-    const second = await runRefresh({ node22: options.node22, endpointEnv, schema, nowIso });
+    const second = await runRefresh({ node22: options.node22, endpointEnv, schema, nowIso,
+      timeoutMinutes: options.refreshTimeoutMinutes });
     timings["refresh:second"] = second.wallMs;
     report.steps.refreshSecond = { exitCode: second.exitCode, receipt: second.receipt, error: second.error };
+    report.measurement.refreshSecond = refreshMeasurement(second);
     const afterSecond = await publishedSnapshot(pool, schema);
     const changed = afterSecond.filter((row) => {
       const before = afterFirst.find((candidate) => candidate.day === row.day);
@@ -708,8 +869,10 @@ async function main() {
       importersCompleted: true,
       refreshFirstComplete: first.exitCode === 0,
       readStatus200: response.status === 200,
-      secondRunZeroNewRevisions: second.exitCode === 0 && changed.length === 0,
+      secondRunZeroNewRevisions: second.exitCode === 0 && second.receipt?.state === "complete" && changed.length === 0,
       parityZeroUnexpected: report.parity.unexpectedDiffs === 0,
+      ...(report.perDate === undefined ? {} : { perDateEqual: report.perDate.equal === true }),
+      ...(report.ownerParity === undefined ? {} : { ownerParityZeroUnexpected: report.ownerParity.unexpectedDiffs === 0 }),
     };
     report.status = Object.values(report.gates).every(Boolean) ? "pass" : "gate_failed";
   } catch (error) {
@@ -727,7 +890,9 @@ async function main() {
       report.originExit = await origin.close().catch(() => null);
     }
     if (workDirectory !== null) await rm(workDirectory, { recursive: true, force: true });
-    if (!options.keepSchema) {
+    if (options.reuseSchema !== null) {
+      report.keptSchemas = [schema, ledgerSchema, controlSchema];
+    } else if (!options.keepSchema) {
       await timed(timings, "cleanup", async () => {
         for (const name of [...created].reverse()) {
           await pool.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(name)} CASCADE`).catch(() => {});
