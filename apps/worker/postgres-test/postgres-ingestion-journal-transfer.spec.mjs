@@ -19,10 +19,14 @@ const PG_TEST_PORT = Number(process.env.PG_TEST_PORT ?? "55432");
 const PG_TEST_USER = process.env.PG_TEST_USER || "postgres";
 const PG_TEST_PASSWORD = process.env.PG_TEST_PASSWORD || "synthetic-local-only";
 const PG_TEST_DATABASE = process.env.PG_TEST_DATABASE || "postgres";
-// Loopback TCP to the same cluster (inet_server_addr() is not NULL there), for
-// the GCP fast-path cloud-target exception; the shared socket-only cluster
-// leaves it unset.
-const PG_TEST_TCP_HOST = localFastpathTcpHost();
+// Loopback TCP to the same cluster on PG_TEST_PORT (inet_server_addr() is not
+// NULL there), for the GCP fast-path cloud-target exception. It defaults to
+// 127.0.0.1, so both describes run wherever the cluster also listens on
+// loopback TCP; PG_TEST_TCP_HOST may name ::1 or localhost instead, and any
+// other host is refused here. A plain process.env binding, so the CI planner
+// (scripts/ci-postgres-suite.mjs) resolves the gate statically.
+const PG_TEST_TCP_HOST = process.env.PG_TEST_TCP_HOST || "127.0.0.1";
+localFastpathTcpHost({ PG_TEST_TCP_HOST });
 const SOURCE_ID = "synthetic-ingestion-journal-source";
 
 function digest(n) { return BigInt(n).toString(16).padStart(64, "0"); }
