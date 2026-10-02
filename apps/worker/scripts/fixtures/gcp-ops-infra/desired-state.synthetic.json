@@ -1,0 +1,96 @@
+{
+  "schemaVersion": "tibotattle-gcp-ops-infra-desired-state-v1",
+  "environment": "production",
+  "project": "synthetic-ops-project",
+  "projectNumber": "100000000001",
+  "region": "us-east1",
+  "artifactRegistry": {
+    "repository": "synthetic-images",
+    "imageName": "synthetic-host"
+  },
+  "serviceAccounts": {
+    "runtime": {
+      "accountId": "synthetic-runtime",
+      "projectRoles": ["roles/cloudsql.client", "roles/cloudsql.instanceUser"]
+    },
+    "migrator": {
+      "accountId": "synthetic-migrator",
+      "projectRoles": ["roles/cloudsql.client", "roles/cloudsql.instanceUser"]
+    },
+    "scheduler": {
+      "accountId": "synthetic-scheduler",
+      "projectRoles": []
+    },
+    "builder": {
+      "accountId": "synthetic-builder",
+      "projectRoles": ["roles/logging.logWriter"]
+    },
+    "edgeInvoker": {
+      "accountId": "synthetic-edge-invoker",
+      "projectRoles": []
+    },
+    "verifier": {
+      "accountId": "synthetic-verifier",
+      "projectRoles": []
+    }
+  },
+  "customRole": {
+    "id": "tibotattleQuarantineStore",
+    "permissions": [
+      "storage.buckets.get",
+      "storage.objects.create",
+      "storage.objects.delete",
+      "storage.objects.get",
+      "storage.objects.list"
+    ]
+  },
+  "secrets": {
+    "IDENTITY_LINK_SECRET": { "version": "1" },
+    "POSTGRES_RATE_LIMIT_SECRET": { "version": "1" },
+    "ENVELOPE_PUBLIC_JWK": { "version": "1" },
+    "ENVELOPE_PRIVATE_JWK": { "version": "1" },
+    "GOOGLE_OIDC_CLIENT_SECRET": { "version": "1" },
+    "APPLE_PRIVATE_KEY": { "version": "1" },
+    "DISTRIBUTION_GITHUB_API_TOKEN": { "version": null }
+  },
+  "cloudSql": {
+    "instance": "synthetic-primary",
+    "tier": "db-custom-2-8192",
+    "storageSizeGb": 50,
+    "backupStartTime": "07:00",
+    "maxConnections": 100,
+    "database": "synthetic_primary",
+    "schema": "synthetic_primary"
+  },
+  "bucket": {
+    "name": "synthetic-ops-quarantine",
+    "location": "US-EAST1",
+    "proof": {
+      "bucketGeneration": "1700000000000001",
+      "bucketMetageneration": "1"
+    }
+  },
+  "service": {
+    "name": "synthetic-origin",
+    "maxInstances": 4,
+    "rolloutOverlapInstances": 4,
+    "audience": "synthetic-edge-origin-audience",
+    "telemetryStorageNamespace": "synthetic-namespace"
+  },
+  "jobs": {
+    "production-migrate": {
+      "name": "synthetic-production-migrate",
+      "maxConnections": 1
+    },
+    "analytics-refresh": {
+      "name": "synthetic-analytics-refresh",
+      "maxConnections": 4
+    }
+  },
+  "scheduler": {
+    "analytics-refresh": {
+      "name": "synthetic-analytics-refresh-trigger",
+      "schedule": null
+    }
+  }
+}

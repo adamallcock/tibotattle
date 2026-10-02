@@ -41,13 +41,10 @@
 #                                      email, or empty for no verifier
 #   MAX_INSTANCES                      maximum instance count (see below)
 #   TELEMETRY_STORAGE_NAMESPACE        typed telemetry storage namespace
-#   PRIMARY_INSTANCE_CONNECTION_NAME   Cloud SQL primary instance
-#   PRIMARY_DATABASE, PRIMARY_SCHEMA   primary database and schema
-#   LEDGER_INSTANCE_CONNECTION_NAME    Cloud SQL ledger instance
-#   LEDGER_DATABASE, LEDGER_SCHEMA     ledger database and schema
+#   PRIMARY_INSTANCE_CONNECTION_NAME   the one Cloud SQL instance
+#   PRIMARY_DATABASE, PRIMARY_SCHEMA   its database and schema
 #   POSTGRES_IAM_USER                  the runtime's IAM database user
 #   GCS_BUCKET_NAME                    the quarantine object bucket
-#   GCS_ERASURE_BUCKET_HISTORY_PROOF   the bucket-birth history proof JSON
 #   SECRET_VERSION_<NAME>              the pinned Secret Manager version of
 #                                      each secret NAME below; for the
 #                                      optional GitHub distribution token,
@@ -59,6 +56,11 @@
 # the service over the public internet; invoker IAM, not network ingress, is
 # the boundary. Never disable the invoker IAM check and never grant
 # run.invoker to a public principal.
+#
+# The service uses one Cloud SQL instance and no deletion ledger (decisions
+# D2 and D4): no ledger instance, database or schema and no bucket-history
+# proof is configured here. The bucket-birth proof stays infrastructure
+# evidence, which the service does not read.
 #
 # Secrets come only from Secret Manager through secretKeyRef, with pinned
 # versions. The Cloudflare-only edge secrets (the edge client key secret, the
@@ -81,7 +83,7 @@ spec:
       annotations:
         autoscaling.knative.dev/minScale: '1'
         # Size MAX_INSTANCES against the Cloud SQL connection budget. Every
-        # instance holds the production pools (data, ledger, admission and
+        # instance holds the production pools (data, admission and
         # readiness), and a rollout briefly runs old and new revisions
         # together. The infrastructure validator checks the total against
         # max_connections before any apply.
@@ -124,18 +126,10 @@ spec:
               value: '${PRIMARY_DATABASE}'
             - name: PRIMARY_SCHEMA
               value: '${PRIMARY_SCHEMA}'
-            - name: LEDGER_INSTANCE_CONNECTION_NAME
-              value: '${LEDGER_INSTANCE_CONNECTION_NAME}'
-            - name: LEDGER_DATABASE
-              value: '${LEDGER_DATABASE}'
-            - name: LEDGER_SCHEMA
-              value: '${LEDGER_SCHEMA}'
             - name: POSTGRES_IAM_USER
               value: '${POSTGRES_IAM_USER}'
             - name: GCS_BUCKET_NAME
               value: '${GCS_BUCKET_NAME}'
-            - name: GCS_ERASURE_BUCKET_HISTORY_PROOF
-              value: '${GCS_ERASURE_BUCKET_HISTORY_PROOF}'
             # IDENTITY_LINK_SECRET also keys the edge admission replay.
             - name: IDENTITY_LINK_SECRET
               valueFrom:

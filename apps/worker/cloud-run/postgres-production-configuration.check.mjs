@@ -36,17 +36,16 @@ const vite = await createServer({
 });
 let canonical;
 try {
-  const [storage, crypto, identityLink, gcs, postgresClient, apple, rateLimiter, publication] = await Promise.all([
+  const [storage, crypto, identityLink, postgresClient, apple, rateLimiter, publication] = await Promise.all([
     vite.ssrLoadModule("/src/telemetry-storage-mode.ts"),
     vite.ssrLoadModule("/src/crypto.ts"),
     vite.ssrLoadModule("/src/identity-link-configuration.ts"),
-    vite.ssrLoadModule("/src/gcs-erasure-object-store.ts"),
     vite.ssrLoadModule("/src/postgres-client.ts"),
     vite.ssrLoadModule("/src/identity-apple.ts"),
     vite.ssrLoadModule("/src/postgres-rate-limiter.ts"),
     vite.ssrLoadModule("/src/storage-publication-worker.ts"),
   ]);
-  canonical = { storage, crypto, identityLink, gcs, postgresClient, apple, rateLimiter, publication };
+  canonical = { storage, crypto, identityLink, postgresClient, apple, rateLimiter, publication };
 } finally {
   await vite.close();
 }
@@ -72,6 +71,7 @@ function envelopeKeys(kid) {
   };
 }
 
+/** A bucket-birth history proof: retired as a runtime setting, used only to show its refusal. */
 function proof(bucket, extra = {}) {
   return JSON.stringify({
     bucket,
@@ -99,12 +99,8 @@ function productionResources() {
     PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:origin-primary",
     PRIMARY_DATABASE: "origin_primary",
     PRIMARY_SCHEMA: "origin_primary",
-    LEDGER_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:origin-ledger",
-    LEDGER_DATABASE: "origin_ledger",
-    LEDGER_SCHEMA: "origin_ledger",
     POSTGRES_IAM_USER: "origin-runtime@synthetic-project.iam",
     GCS_BUCKET_NAME: "synthetic-origin-quarantine",
-    GCS_ERASURE_BUCKET_HISTORY_PROOF: proof("synthetic-origin-quarantine"),
   };
 }
 
@@ -156,9 +152,7 @@ function stagingPlane() {
     ADMIN_HOST_ORIGIN: "https://admin.staging.synthetic.example",
     TELEMETRY_STORAGE_NAMESPACE: "synthetic-staging-namespace",
     PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:origin-staging-primary",
-    LEDGER_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:origin-staging-ledger",
     GCS_BUCKET_NAME: "synthetic-staging-quarantine",
-    GCS_ERASURE_BUCKET_HISTORY_PROOF: proof("synthetic-staging-quarantine"),
     ACCESS_TEAM_DOMAIN: "synthetic.cloudflareaccess.com",
     ACCESS_AUD: "a".repeat(64),
     ACCESS_ADMIN_EMAIL: "owner@synthetic.example",
@@ -223,6 +217,14 @@ function serviceBindings(originTier = configuration.ORIGIN_TIER_RATE_LIMITS) {
 
 const LEAK_MARKERS = Object.freeze([...Object.values(SECRET_VALUES), PRIVATE_EXPONENT]);
 
+// The deletion-ledger and bucket-history settings the single-instance
+// configuration retired (decisions D2 and D4, SIMP-0 item 7). Each is refused
+// when present at all, even empty, rather than ignored.
+const RETIRED_LEDGER_VARIABLE_NAMES = Object.freeze([
+  "LEDGER_INSTANCE_CONNECTION_NAME", "LEDGER_DATABASE", "LEDGER_SCHEMA",
+  "GCS_ERASURE_BUCKET_HISTORY_PROOF",
+]);
+
 // The refused variables, listed here independently of the module. Each one's
 // code is `${name}_FORBIDDEN`.
 const FORBIDDEN_VARIABLE_NAMES = Object.freeze([
@@ -230,6 +232,7 @@ const FORBIDDEN_VARIABLE_NAMES = Object.freeze([
   "DISTRIBUTION_ANALYTICS_API_TOKEN",
   "EDGE_CLIENT_KEY_SECRET", "EDGE_INVOKER_KEY_JSON", "EDGE_PROOF_SECRET", "EDGE_PROOF_SHA256",
   "IDENTITY_TEST_JWKS_JSON", "POSTGRES_TEST_HTTP_MODE", "SPARKLE_APPCAST_GUARD_TOKEN",
+  ...RETIRED_LEDGER_VARIABLE_NAMES,
 ]);
 
 // Every D1, R2 and asset binding and every test or development seam the
@@ -320,12 +323,13 @@ test("exports the frozen production constants", () => {
   assert.equal(configuration.PRODUCTION_PUBLIC_ORIGIN, "https://tibotattle.com");
   assert.equal(configuration.PRODUCTION_ADMIN_ORIGIN, "https://admin.tibotattle.com");
   assert.equal(configuration.PRODUCTION_WWW_HOST, "www.tibotattle.com");
-  assert.deepEqual(configuration.PRODUCTION_POOL_SIZES, { data: 3, ledger: 2, admission: 4, readiness: 1 });
-  // One readiness pool on each instance: primary 3 + 4 + 1, ledger 2 + 1.
+  // One Cloud SQL instance and no deletion ledger: no ledger pool, and the
+  // one readiness pool opens the primary, 3 + 4 + 1 connections per instance.
+  assert.deepEqual(configuration.PRODUCTION_POOL_SIZES, { data: 3, admission: 4, readiness: 1 });
   assert.deepEqual(configuration.PRODUCTION_POOL_INSTANCES, {
-    data: ["primary"], ledger: ["ledger"], admission: ["primary"], readiness: ["primary", "ledger"],
+    data: ["primary"], admission: ["primary"], readiness: ["primary"],
   });
-  assert.deepEqual(configuration.PRODUCTION_POOL_CONNECTIONS_PER_INSTANCE, { primary: 8, ledger: 3 });
+  assert.deepEqual(configuration.PRODUCTION_POOL_CONNECTIONS_PER_INSTANCE, { primary: 8 });
   assert.deepEqual(configuration.PRODUCTION_ADMISSION_TIMEOUTS, {
     lockTimeoutMilliseconds: 1_000,
     statementTimeoutMilliseconds: 2_000,
@@ -409,6 +413,7 @@ test("exports the frozen production constants", () => {
   ));
   assert.deepEqual(configuration.PRODUCTION_FORBIDDEN_VARIABLE_PREFIXES, {
     HOST_RATE_LIMIT_: "HOST_RATE_LIMIT_OVERRIDE_FORBIDDEN",
+    LEDGER_: "LEDGER_CONFIGURATION_FORBIDDEN",
   });
   assert.deepEqual(configuration.EDGE_ONLY_SECRET_NAMES, [
     "EDGE_CLIENT_KEY_SECRET", "EDGE_INVOKER_KEY_JSON", "DISTRIBUTION_ANALYTICS_API_TOKEN",
@@ -507,26 +512,18 @@ test("a valid production environment yields a frozen configuration with opaque s
     sourceCommit: COMMIT,
     workload: { kind: "service", name: "tibotattle-origin" },
   });
+  // One instance and no deletion ledger: no ledger resource and no
+  // bucket-history proof (SIMP-0 item 7).
   assert.deepEqual(config.resources, {
     primary: {
       instanceConnectionName: "synthetic-project:us-east1:origin-primary",
       database: "origin_primary",
       schema: "origin_primary",
     },
-    ledger: {
-      instanceConnectionName: "synthetic-project:us-east1:origin-ledger",
-      database: "origin_ledger",
-      schema: "origin_ledger",
-    },
     iamUser: "origin-runtime@synthetic-project.iam",
     bucket: "synthetic-origin-quarantine",
-    historyProof: {
-      bucket: "synthetic-origin-quarantine",
-      bucketGeneration: "1700000000000001",
-      bucketMetageneration: "1",
-      softDeleteRetentionDurationSeconds: "0",
-    },
   });
+  assert.deepEqual(Reflect.ownKeys(config.resources), ["primary", "iamUser", "bucket"]);
   assert.equal(config.poolSizes, configuration.PRODUCTION_POOL_SIZES);
   assert.equal(config.admissionTimeouts, configuration.PRODUCTION_ADMISSION_TIMEOUTS);
   assert.equal(config.rateLimits.edgeTier, configuration.EDGE_TIER_RATE_LIMIT_NAMES);
@@ -564,6 +561,8 @@ test("each forbidden variable aborts with its own code in every profile, even wh
     ...FORBIDDEN_VARIABLE_NAMES.map((name) => [name, `${name}_FORBIDDEN`]),
     ["HOST_RATE_LIMIT_ENROLLMENT_RATE_LIMIT_LIMIT", "HOST_RATE_LIMIT_OVERRIDE_FORBIDDEN"],
     ["HOST_RATE_LIMIT_CLIENT_ATTEMPT_RATE_LIMIT_PERIOD_SECONDS", "HOST_RATE_LIMIT_OVERRIDE_FORBIDDEN"],
+    // Any other ledger-named setting, by prefix.
+    ["LEDGER_POOL_SIZE", "LEDGER_CONFIGURATION_FORBIDDEN"],
   ];
   assert.equal(new Set(cases.map(([, code]) => code)).size, cases.length - 1);
   for (const [name, code] of cases) {
@@ -655,26 +654,26 @@ test("malformed secrets abort with named codes and never echo a value", () => {
 
 test("test-target resources abort", () => {
   const target = CLOUD_RUN_IAM_TEST_TARGET;
-  const testProof = proof(target.gcsBucket);
   const cases = [
     [{ K_SERVICE: target.service }, "K_SERVICE_TEST_TARGET_FORBIDDEN"],
     [{ HOST_ORIGIN: target.origin }, "HOST_ORIGIN_TEST_TARGET_FORBIDDEN"],
     [{ PRIMARY_INSTANCE_CONNECTION_NAME: target.postgres.primary.instanceConnectionName },
       "PRIMARY_INSTANCE_CONNECTION_NAME_TEST_TARGET_FORBIDDEN"],
     [{ PRIMARY_SCHEMA: target.postgres.primary.schema }, "PRIMARY_SCHEMA_TEST_TARGET_FORBIDDEN"],
-    [{ LEDGER_INSTANCE_CONNECTION_NAME: target.postgres.ledger.instanceConnectionName },
-      "LEDGER_INSTANCE_CONNECTION_NAME_TEST_TARGET_FORBIDDEN"],
-    [{ LEDGER_SCHEMA: target.postgres.ledger.schema }, "LEDGER_SCHEMA_TEST_TARGET_FORBIDDEN"],
+    // The test estate's second (ledger) instance and schema stay identities:
+    // production names one instance, and it may never be either of them.
+    [{ PRIMARY_INSTANCE_CONNECTION_NAME: target.postgres.ledger.instanceConnectionName },
+      "PRIMARY_INSTANCE_CONNECTION_NAME_TEST_TARGET_FORBIDDEN"],
+    [{ PRIMARY_SCHEMA: target.postgres.ledger.schema }, "PRIMARY_SCHEMA_TEST_TARGET_FORBIDDEN"],
     // A test database is refused through its instance.
     [{
-      LEDGER_INSTANCE_CONNECTION_NAME: target.postgres.ledger.instanceConnectionName,
-      LEDGER_DATABASE: target.postgres.ledger.database,
-    }, "LEDGER_INSTANCE_CONNECTION_NAME_TEST_TARGET_FORBIDDEN"],
+      PRIMARY_INSTANCE_CONNECTION_NAME: target.postgres.primary.instanceConnectionName,
+      PRIMARY_DATABASE: target.postgres.primary.database,
+    }, "PRIMARY_INSTANCE_CONNECTION_NAME_TEST_TARGET_FORBIDDEN"],
     [{ POSTGRES_IAM_USER: target.postgres.iamUser }, "POSTGRES_IAM_USER_TEST_TARGET_FORBIDDEN"],
     [{ POSTGRES_IAM_USER: `${target.postgres.iamUser}.gserviceaccount.com` },
       "POSTGRES_IAM_USER_TEST_TARGET_FORBIDDEN"],
-    [{ GCS_BUCKET_NAME: target.gcsBucket, GCS_ERASURE_BUCKET_HISTORY_PROOF: testProof },
-      "GCS_BUCKET_NAME_TEST_TARGET_FORBIDDEN"],
+    [{ GCS_BUCKET_NAME: target.gcsBucket }, "GCS_BUCKET_NAME_TEST_TARGET_FORBIDDEN"],
     [{ EDGE_INVOKER_SERVICE_ACCOUNT: `${target.postgres.iamUser}.gserviceaccount.com` },
       "EDGE_INVOKER_SERVICE_ACCOUNT_TEST_TARGET_FORBIDDEN"],
     [{ EDGE_ORIGIN_VERIFIER_SERVICE_ACCOUNTS: `${VERIFIERS[0]},${target.postgres.iamUser}.gserviceaccount.com` },
@@ -693,18 +692,18 @@ test("test-target resources abort", () => {
     expectCode(() => readProductionConfiguration(jobEnv(profile, { CLOUD_RUN_JOB: target.service }), profile),
       "CLOUD_RUN_JOB_TEST_TARGET_FORBIDDEN");
   }
-  expectCode(() => readProductionConfiguration(stagingEnv({ GCS_BUCKET_NAME: target.gcsBucket,
-    GCS_ERASURE_BUCKET_HISTORY_PROOF: testProof }), "staging"), "GCS_BUCKET_NAME_TEST_TARGET_FORBIDDEN");
+  expectCode(() => readProductionConfiguration(stagingEnv({ GCS_BUCKET_NAME: target.gcsBucket }), "staging"),
+    "GCS_BUCKET_NAME_TEST_TARGET_FORBIDDEN");
   // Resource identities, not name coincidences: the repository's conventional
   // database and schema names ('tibotattle', 'tibotattle_ledger', which the
   // test deployment's databases also use) are accepted on other instances.
   const conventional = expectAccepted(productionEnv({
     PRIMARY_DATABASE: target.postgres.primary.database,
     PRIMARY_SCHEMA: target.postgres.primary.database,
-    LEDGER_DATABASE: target.postgres.ledger.database,
-    LEDGER_SCHEMA: target.postgres.ledger.database,
     TELEMETRY_STORAGE_NAMESPACE: target.project,
   }), "production");
+  assert.equal(expectAccepted(productionEnv({ PRIMARY_DATABASE: target.postgres.ledger.database }), "production")
+    .resources.primary.database, "tibotattle_ledger");
   assert.deepEqual(conventional.resources.primary, {
     instanceConnectionName: "synthetic-project:us-east1:origin-primary",
     database: "tibotattle",
@@ -717,12 +716,8 @@ test("test-target resources abort", () => {
     PRIMARY_INSTANCE_CONNECTION_NAME: target.postgres.primary.instanceConnectionName,
     PRIMARY_DATABASE: target.postgres.primary.database,
     PRIMARY_SCHEMA: target.postgres.primary.schema,
-    LEDGER_INSTANCE_CONNECTION_NAME: target.postgres.ledger.instanceConnectionName,
-    LEDGER_DATABASE: target.postgres.ledger.database,
-    LEDGER_SCHEMA: target.postgres.ledger.schema,
     POSTGRES_IAM_USER: target.postgres.iamUser,
     GCS_BUCKET_NAME: target.gcsBucket,
-    GCS_ERASURE_BUCKET_HISTORY_PROOF: testProof,
   }), "production"), "K_SERVICE_TEST_TARGET_FORBIDDEN");
 });
 
@@ -795,45 +790,22 @@ test("Cloud SQL and bucket resources are validated", () => {
       "PRIMARY_INSTANCE_CONNECTION_NAME_INVALID"],
     [{ PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:origin-primary:extra" },
       "PRIMARY_INSTANCE_CONNECTION_NAME_INVALID"],
-    [{ LEDGER_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:origin-ledger/1" },
-      "LEDGER_INSTANCE_CONNECTION_NAME_INVALID"],
-    [{ LEDGER_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:origin-primary" },
-      "LEDGER_INSTANCE_CONNECTION_NAME_NOT_INDEPENDENT"],
+    [{ PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:origin-primary/1" },
+      "PRIMARY_INSTANCE_CONNECTION_NAME_INVALID"],
     [{ PRIMARY_DATABASE: "origin-primary" }, "PRIMARY_DATABASE_INVALID"],
-    [{ LEDGER_SCHEMA: "origin_primary" }, "LEDGER_SCHEMA_NOT_INDEPENDENT"],
     [{ PRIMARY_SCHEMA: "pg_origin" }, "PRIMARY_SCHEMA_INVALID"],
-    [{ LEDGER_SCHEMA: "information_schema" }, "LEDGER_SCHEMA_INVALID"],
-    [{ LEDGER_SCHEMA: "Origin_Ledger" }, "LEDGER_SCHEMA_INVALID"],
+    [{ PRIMARY_SCHEMA: "information_schema" }, "PRIMARY_SCHEMA_INVALID"],
+    [{ PRIMARY_SCHEMA: "Origin_Primary" }, "PRIMARY_SCHEMA_INVALID"],
+    [without(productionEnv(), "PRIMARY_SCHEMA"), "PRIMARY_SCHEMA_MISSING"],
     [{ POSTGRES_IAM_USER: "" }, "POSTGRES_IAM_USER_MISSING"],
     [{ POSTGRES_IAM_USER: "origin runtime" }, "POSTGRES_IAM_USER_INVALID"],
     [{ GCS_BUCKET_NAME: "Synthetic" }, "GCS_BUCKET_NAME_INVALID"],
     [{ GCS_BUCKET_NAME: "synthetic.origin.quarantine" }, "GCS_BUCKET_NAME_INVALID"],
-    [{ GCS_ERASURE_BUCKET_HISTORY_PROOF: "" }, "GCS_ERASURE_BUCKET_HISTORY_PROOF_MISSING"],
-    [{ GCS_ERASURE_BUCKET_HISTORY_PROOF: "{" }, "GCS_ERASURE_BUCKET_HISTORY_PROOF_INVALID"],
-    [{ GCS_ERASURE_BUCKET_HISTORY_PROOF: proof("synthetic-other-bucket") },
-      "GCS_ERASURE_BUCKET_HISTORY_PROOF_BUCKET_MISMATCH"],
-    [{ GCS_ERASURE_BUCKET_HISTORY_PROOF: proof("synthetic-origin-quarantine", { extra: "1" }) },
-      "GCS_ERASURE_BUCKET_HISTORY_PROOF_INVALID"],
-    [{ GCS_ERASURE_BUCKET_HISTORY_PROOF: proof("synthetic-origin-quarantine", { bucketGeneration: "0" }) },
-      "GCS_ERASURE_BUCKET_HISTORY_PROOF_INVALID"],
-    [{ GCS_ERASURE_BUCKET_HISTORY_PROOF: proof("synthetic-origin-quarantine",
-      { softDeleteRetentionDurationSeconds: "604800" }) }, "GCS_ERASURE_BUCKET_HISTORY_PROOF_INVALID"],
-    // Over 16 KiB, although otherwise a valid wrapped proof.
-    [{ GCS_ERASURE_BUCKET_HISTORY_PROOF: JSON.stringify({
-      padding: "x".repeat(16_384),
-      proof: JSON.parse(proof("synthetic-origin-quarantine")),
-    }) }, "GCS_ERASURE_BUCKET_HISTORY_PROOF_INVALID"],
   ];
   for (const [overrides, code] of cases) {
-    expectCode(() => readProductionConfiguration(productionEnv(overrides), "production"), code);
+    const env = "HOST_MODE" in overrides ? overrides : productionEnv(overrides);
+    expectCode(() => readProductionConfiguration(env, "production"), code);
   }
-  const wrapped = expectAccepted(productionEnv({
-    GCS_ERASURE_BUCKET_HISTORY_PROOF: JSON.stringify({
-      schemaVersion: "synthetic-receipt",
-      proof: JSON.parse(proof("synthetic-origin-quarantine")),
-    }),
-  }), "production");
-  assert.equal(wrapped.resources.historyProof.bucketGeneration, "1700000000000001");
   const serviceAccountUser = expectAccepted(productionEnv({
     POSTGRES_IAM_USER: "origin-runtime@synthetic-project.iam.gserviceaccount.com",
   }), "production");
@@ -870,17 +842,15 @@ test("staging requires its own plane and aborts on any production value", () => 
     // Apple's OAuth client (the id_token audience) is separated like Google's.
     [{ APPLE_SERVICES_ID: production.APPLE_SERVICES_ID }, "APPLE_SERVICES_ID_PRODUCTION_VALUE_FORBIDDEN"],
     [{ APPLE_KEY_ID: production.APPLE_KEY_ID }, "APPLE_KEY_ID_PRODUCTION_VALUE_FORBIDDEN"],
-    [{ GCS_BUCKET_NAME: "app-usagemonitor-production-quarantine",
-      GCS_ERASURE_BUCKET_HISTORY_PROOF: proof("app-usagemonitor-production-quarantine") },
-    "GCS_BUCKET_NAME_PRODUCTION_VALUE_FORBIDDEN"],
+    [{ GCS_BUCKET_NAME: "app-usagemonitor-production-quarantine" },
+      "GCS_BUCKET_NAME_PRODUCTION_VALUE_FORBIDDEN"],
     [{ K_SERVICE: "tibotattle-production-staging" }, "K_SERVICE_PRODUCTION_VALUE_FORBIDDEN"],
     [{ K_SERVICE: "tibotattle-origin" }, "K_SERVICE_STAGING_MARKER_MISSING"],
     [{ PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:origin-primary" },
       "PRIMARY_INSTANCE_CONNECTION_NAME_STAGING_MARKER_MISSING"],
-    [{ LEDGER_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:origin-production-staging-ledger" },
-      "LEDGER_INSTANCE_CONNECTION_NAME_PRODUCTION_VALUE_FORBIDDEN"],
-    [{ GCS_BUCKET_NAME: "synthetic-quarantine", GCS_ERASURE_BUCKET_HISTORY_PROOF: proof("synthetic-quarantine") },
-      "GCS_BUCKET_NAME_STAGING_MARKER_MISSING"],
+    [{ PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:origin-production-staging-primary" },
+      "PRIMARY_INSTANCE_CONNECTION_NAME_PRODUCTION_VALUE_FORBIDDEN"],
+    [{ GCS_BUCKET_NAME: "synthetic-quarantine" }, "GCS_BUCKET_NAME_STAGING_MARKER_MISSING"],
     [envelopeKeys("key:synthetic-production-check"), "ENVELOPE_KEY_ID_PRODUCTION_VALUE_FORBIDDEN"],
     [envelopeKeys("key:synthetic-check"), "ENVELOPE_KEY_ID_STAGING_MARKER_MISSING"],
     // A marker must be a delimited token, not a substring.
@@ -1028,8 +998,7 @@ test("staging jobs run on the staging plane with its identity, origins and marke
       [{ CLOUD_RUN_JOB: "tibotattle-production-staging-maintenance" }, "CLOUD_RUN_JOB_PRODUCTION_VALUE_FORBIDDEN"],
       [{ PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:origin-primary" },
         "PRIMARY_INSTANCE_CONNECTION_NAME_STAGING_MARKER_MISSING"],
-      [{ GCS_BUCKET_NAME: "synthetic-quarantine", GCS_ERASURE_BUCKET_HISTORY_PROOF: proof("synthetic-quarantine") },
-        "GCS_BUCKET_NAME_STAGING_MARKER_MISSING"],
+      [{ GCS_BUCKET_NAME: "synthetic-quarantine" }, "GCS_BUCKET_NAME_STAGING_MARKER_MISSING"],
       [{ ACCESS_AUD: configuration.PRODUCTION_VARS.ACCESS_AUD }, "ACCESS_AUD_PRODUCTION_VALUE_FORBIDDEN"],
       [{ IDENTITY_LINK_SECRET_VERSION: "production-v1" },
         "IDENTITY_LINK_SECRET_VERSION_PRODUCTION_VALUE_FORBIDDEN"],
@@ -1053,11 +1022,9 @@ test("production and its jobs refuse staging-marked resources", () => {
     [{ K_SERVICE: "tibotattle-staging-origin" }, "K_SERVICE_STAGING_VALUE_FORBIDDEN"],
     [{ PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:origin-staging-primary" },
       "PRIMARY_INSTANCE_CONNECTION_NAME_STAGING_VALUE_FORBIDDEN"],
-    [{ LEDGER_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:staging" },
-      "LEDGER_INSTANCE_CONNECTION_NAME_STAGING_VALUE_FORBIDDEN"],
-    [{ GCS_BUCKET_NAME: "synthetic-staging-quarantine",
-      GCS_ERASURE_BUCKET_HISTORY_PROOF: proof("synthetic-staging-quarantine") },
-    "GCS_BUCKET_NAME_STAGING_VALUE_FORBIDDEN"],
+    [{ PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:staging" },
+      "PRIMARY_INSTANCE_CONNECTION_NAME_STAGING_VALUE_FORBIDDEN"],
+    [{ GCS_BUCKET_NAME: "synthetic-staging-quarantine" }, "GCS_BUCKET_NAME_STAGING_VALUE_FORBIDDEN"],
     [envelopeKeys("key:staging-synthetic-check"), "ENVELOPE_KEY_ID_STAGING_VALUE_FORBIDDEN"],
   ];
   for (const [overrides, code] of cases) {
@@ -1469,22 +1436,21 @@ test("the IAM user, schema, Apple key and identity-version mirrors match their s
         .resources.iamUser, normalizeIamUser(value));
     }
   }
-  for (const [primary, ledger] of [
-    ["origin_primary", "origin_ledger"],
-    ["origin_primary", "origin_primary"],
-    ["pg_primary", "origin_ledger"],
-    ["origin_primary", "information_schema"],
-    ["Origin", "origin_ledger"],
-    ["_origin", "origin_ledger"],
-    ["a".repeat(63), "origin_ledger"],
-    ["a".repeat(64), "origin_ledger"],
+  // The primary schema grammar. Until SIMP-4 removes it, the canonical
+  // runtime validator still takes a second schema; a fixed, distinct probe
+  // name fills it, so only the primary value decides.
+  const SECOND_SCHEMA_PROBE = "synthetic_second_schema_probe";
+  for (const primary of [
+    "origin_primary", "pg_primary", "information_schema", "Origin", "_origin",
+    "a".repeat(63), "a".repeat(64), "origin-primary", "origin primary",
   ]) {
+    assert.notEqual(primary, SECOND_SCHEMA_PROBE);
     assert.equal(
-      acceptsProduction({ PRIMARY_SCHEMA: primary, LEDGER_SCHEMA: ledger }),
+      acceptsProduction({ PRIMARY_SCHEMA: primary }),
       acceptsCanonical(() => canonical.postgresClient.createPostgresSchemaConfig({
-        primarySchema: primary, ledgerSchema: ledger,
+        primarySchema: primary, ledgerSchema: SECOND_SCHEMA_PROBE,
       })),
-      `${primary}/${ledger}`,
+      primary,
     );
   }
   for (const key of [
@@ -1522,22 +1488,62 @@ test("the IAM user, schema, Apple key and identity-version mirrors match their s
   ));
 });
 
-test("every history proof accepted here is accepted by createGcsErasureBucketHistoryProof", () => {
-  const base = JSON.parse(proof("synthetic-origin-quarantine"));
-  const variants = [
-    base,
-    { ...base, bucketGeneration: "9223372036854775807" },
-    { ...base, bucketGeneration: "9223372036854775808" },
-    { ...base, bucketGeneration: "0" },
-    { ...base, bucketGeneration: "01" },
-    { ...base, bucketGeneration: 1 },
-    { ...base, bucketMetageneration: "" },
-    { ...base, softDeleteRetentionDurationSeconds: 0 },
-  ];
-  for (const variant of variants) {
-    const accepted = acceptsProduction({ GCS_ERASURE_BUCKET_HISTORY_PROOF: JSON.stringify(variant) });
-    const canonicalAccepted = acceptsCanonical(() =>
-      canonical.gcs.createGcsErasureBucketHistoryProof(variant));
-    assert.equal(accepted, canonicalAccepted, JSON.stringify(variant));
+test("one Cloud SQL instance and no deletion ledger: retired settings are refused, never read", () => {
+  // The pool map and the readiness roles name only the primary.
+  for (const instances of Object.values(configuration.PRODUCTION_POOL_INSTANCES)) {
+    assert.deepEqual([...instances], ["primary"]);
+  }
+  assert.equal(Object.hasOwn(configuration.PRODUCTION_POOL_SIZES, "ledger"), false);
+  assert.deepEqual(Object.keys(configuration.PRODUCTION_POOL_CONNECTIONS_PER_INSTANCE), ["primary"]);
+  // Each retired setting is refused when present, valid-looking or empty, in
+  // every profile: the closed-key rule here is refusal, not silent ignore.
+  const retired = {
+    LEDGER_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:origin-ledger",
+    LEDGER_DATABASE: "origin_ledger",
+    LEDGER_SCHEMA: "origin_ledger",
+    GCS_ERASURE_BUCKET_HISTORY_PROOF: proof("synthetic-origin-quarantine"),
+    LEDGER_ANY_OTHER_SETTING: "synthetic",
+  };
+  for (const [name, value] of Object.entries(retired)) {
+    const code = RETIRED_LEDGER_VARIABLE_NAMES.includes(name)
+      ? `${name}_FORBIDDEN`
+      : "LEDGER_CONFIGURATION_FORBIDDEN";
+    for (const supplied of [value, ""]) {
+      expectCode(() => readProductionConfiguration(productionEnv({ [name]: supplied }), "production"), code);
+      expectCode(() => readProductionConfiguration(stagingEnv({ [name]: supplied }), "staging"), code);
+      for (const profile of JOB_PROFILES) {
+        expectCode(() => readProductionConfiguration(jobEnv(profile, { [name]: supplied }), profile), code);
+      }
+    }
+  }
+  // The accepted configuration and its env carry none of them.
+  for (const [profile, env] of [
+    ["production", productionEnv()],
+    ["staging", stagingEnv()],
+    ...JOB_PROFILES.map((job) => [job, jobEnv(job)]),
+  ]) {
+    const config = expectAccepted(env, profile);
+    assert.deepEqual(Object.keys(config.resources), ["primary", "iamUser", "bucket"], profile);
+    const workerEnv = createProductionWorkerEnv(config, profile.endsWith("-job") ? {} : {
+      bindings: serviceBindings(config.rateLimits.originTier),
+    });
+    for (const key of [...Object.keys(retired), "DELETION_LEDGER"]) {
+      assert.equal(Reflect.get(workerEnv, key), undefined, `${profile} ${key}`);
+    }
+    assert.equal(JSON.stringify(config).toLowerCase().includes("ledger"), false, profile);
+  }
+  // Cutover hygiene stays: a stray Cloudflare DELETION_LEDGER binding still
+  // fails, and the production deletion-ledger D1 stays in the fingerprint.
+  const config = expectAccepted(productionEnv({ DELETION_LEDGER: "synthetic" }), "production");
+  expectCode(() => createProductionWorkerEnv(config, {
+    bindings: { ...serviceBindings(), DELETION_LEDGER: limiter() },
+  }), "PRODUCTION_BINDING_UNEXPECTED");
+  assert.ok(configuration.PRODUCTION_WORKER_ENV_ABSENT_KEYS.includes("DELETION_LEDGER"));
+  assert.ok(configuration.PRODUCTION_RESOURCE_FINGERPRINT.cloudflareResourceNames
+    .includes("app-usagemonitor-production-deletion-ledger"));
+  for (const job of JOB_PROFILES) {
+    expectCode(() => createProductionWorkerEnv(expectAccepted(jobEnv(job), job), {
+      bindings: { DELETION_LEDGER: limiter() },
+    }), "PRODUCTION_JOB_BINDINGS_FORBIDDEN");
   }
 });

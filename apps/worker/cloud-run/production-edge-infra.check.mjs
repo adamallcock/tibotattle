@@ -17,6 +17,10 @@
  * as parsed values, so comments and shadowed keys hold no public principal,
  * edge-only secret or concrete identifier.
  *
+ * The service has one Cloud SQL instance and no deletion ledger (decisions D2
+ * and D4, SIMP-0 item 8): a LEDGER_ name or the retired bucket-history proof
+ * anywhere in the template, comments included, is a finding.
+ *
  * The rendering contract at the end is the reference behaviour the
  * infrastructure tooling's renderer must match. Its sibling-module
  * cross-checks (CR-3's secret sets, EP-0's grammars) fail when the module is
@@ -29,6 +33,7 @@ import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
 import { isDeepStrictEqual } from "node:util";
 import { CLOUD_RUN_IAM_TEST_TARGET } from "./postgres-test-dispatch.mjs";
+import * as infrastructure from "../scripts/gcp-ops-infra-manifest.mjs";
 
 const SERVICE_TEMPLATE_URL = new URL("./production-service.template.yaml", import.meta.url);
 const IAM_TEMPLATE_URL = new URL("./production-edge-iam.template.json", import.meta.url);
@@ -72,6 +77,10 @@ const TEST_SEAM_NAME = new RegExp(`^(?:${[
   "HOST_RATE_LIMIT_[A-Z0-9_]*",
 ].join("|")})$`, "u");
 const PUBLIC_PRINCIPAL = /allUsers|allAuthenticatedUsers/iu;
+// Settings the single-instance origin retired with the deletion ledger.
+const RETIRED_NAMES = "LEDGER_[A-Z0-9_]+|GCS_ERASURE_BUCKET_HISTORY_PROOF";
+const RETIRED_NAME = new RegExp(`^(?:${RETIRED_NAMES})$`, "u");
+const RETIRED_TOKEN = new RegExp(`\\b(?:${RETIRED_NAMES})\\b`, "gu");
 
 const EXPECTED_PLAIN_ENV = Object.freeze({
   HOST: "0.0.0.0",
@@ -87,12 +96,8 @@ const EXPECTED_PLAIN_ENV = Object.freeze({
   PRIMARY_INSTANCE_CONNECTION_NAME: "${PRIMARY_INSTANCE_CONNECTION_NAME}",
   PRIMARY_DATABASE: "${PRIMARY_DATABASE}",
   PRIMARY_SCHEMA: "${PRIMARY_SCHEMA}",
-  LEDGER_INSTANCE_CONNECTION_NAME: "${LEDGER_INSTANCE_CONNECTION_NAME}",
-  LEDGER_DATABASE: "${LEDGER_DATABASE}",
-  LEDGER_SCHEMA: "${LEDGER_SCHEMA}",
   POSTGRES_IAM_USER: "${POSTGRES_IAM_USER}",
   GCS_BUCKET_NAME: "${GCS_BUCKET_NAME}",
-  GCS_ERASURE_BUCKET_HISTORY_PROOF: "${GCS_ERASURE_BUCKET_HISTORY_PROOF}",
 });
 
 // Secret version placeholders (SECRET_VERSION_<NAME>) join this set for each
@@ -102,9 +107,7 @@ const SERVICE_PLACEHOLDERS = Object.freeze([
   "IMAGE_DIGEST", "SOURCE_COMMIT", "SERVICE_HOST", "AUDIENCE",
   "EDGE_INVOKER_SA", "VERIFIER_SA", "MAX_INSTANCES",
   "TELEMETRY_STORAGE_NAMESPACE", "PRIMARY_INSTANCE_CONNECTION_NAME",
-  "PRIMARY_DATABASE", "PRIMARY_SCHEMA", "LEDGER_INSTANCE_CONNECTION_NAME",
-  "LEDGER_DATABASE", "LEDGER_SCHEMA", "POSTGRES_IAM_USER", "GCS_BUCKET_NAME",
-  "GCS_ERASURE_BUCKET_HISTORY_PROOF",
+  "PRIMARY_DATABASE", "PRIMARY_SCHEMA", "POSTGRES_IAM_USER", "GCS_BUCKET_NAME",
 ]);
 const IAM_PLACEHOLDERS = Object.freeze([
   "PROJECT", "REGION", "SERVICE", "EDGE_INVOKER_SA", "VERIFIER_SA",
@@ -354,6 +357,9 @@ function documentFindings(document, findings) {
     for (const match of value.matchAll(EDGE_ONLY_TOKEN)) {
       findings.add(`EDGE_ONLY_SECRET_PRESENT:${match[0]}`);
     }
+    for (const match of value.matchAll(RETIRED_TOKEN)) {
+      findings.add(`DELETION_LEDGER_SETTING_PRESENT:${match[0]}`);
+    }
     const concrete = value.replace(PLACEHOLDER, "");
     for (const [label, pattern] of CONCRETE_IDENTIFIERS) {
       if (pattern.test(concrete)) findings.add(`CONCRETE_IDENTIFIER_PRESENT:${label}`);
@@ -489,6 +495,7 @@ function serviceTemplateFindings(text) {
       closedKeys(reference.secretKeyRef, ["name", "key"], `${path}.valueFrom.secretKeyRef`, findings);
     }
     if (EDGE_ONLY_NAME.test(name)) return; // documentFindings names it.
+    if (RETIRED_NAME.test(name)) return; // documentFindings names it.
     if (TEST_SEAM_NAME.test(name)) {
       findings.add(`TEST_SEAM_PRESENT:${name}`);
       return;
@@ -666,13 +673,6 @@ const instanceConnectionName = (value) => {
   return parts.length === 3 && GCP_PROJECT_ID.test(parts[0]) && GCP_REGION.test(parts[1])
     && CLOUD_SQL_INSTANCE_ID.test(parts[2]);
 };
-const jsonObject = (value) => {
-  try {
-    return !value.includes("'") && isRecord(JSON.parse(value));
-  } catch {
-    return false;
-  }
-};
 
 const IAM_VALUE_GRAMMARS = Object.freeze({
   PROJECT: matches(GCP_PROJECT_ID),
@@ -697,12 +697,8 @@ const SERVICE_VALUE_GRAMMARS = Object.freeze({
   PRIMARY_INSTANCE_CONNECTION_NAME: instanceConnectionName,
   PRIMARY_DATABASE: matches(POSTGRES_IDENTIFIER),
   PRIMARY_SCHEMA: matches(POSTGRES_IDENTIFIER),
-  LEDGER_INSTANCE_CONNECTION_NAME: instanceConnectionName,
-  LEDGER_DATABASE: matches(POSTGRES_IDENTIFIER),
-  LEDGER_SCHEMA: matches(POSTGRES_IDENTIFIER),
   POSTGRES_IAM_USER: (value) => serviceAccountEmail(`${value}${SERVICE_ACCOUNT_DOMAIN_SUFFIX}`),
   GCS_BUCKET_NAME: matches(/^[a-z0-9][a-z0-9_-]{1,61}[a-z0-9]$/u),
-  GCS_ERASURE_BUCKET_HISTORY_PROOF: jsonObject,
   ...Object.fromEntries(REQUIRED_SECRET_NAMES.map((name) =>
     [`SECRET_VERSION_${name}`, matches(SECRET_VERSION)])),
   // An empty optional version omits that secret's entry.
@@ -830,12 +826,8 @@ const SYNTHETIC_SERVICE_VALUES = Object.freeze({
   PRIMARY_INSTANCE_CONNECTION_NAME: `${SYNTHETIC_PROJECT}:example-region1:example-primary`,
   PRIMARY_DATABASE: "example_primary",
   PRIMARY_SCHEMA: "example_primary_schema",
-  LEDGER_INSTANCE_CONNECTION_NAME: `${SYNTHETIC_PROJECT}:example-region1:example-ledger`,
-  LEDGER_DATABASE: "example_ledger",
-  LEDGER_SCHEMA: "example_ledger_schema",
   POSTGRES_IAM_USER: `example-runtime@${SYNTHETIC_PROJECT}.iam`,
   GCS_BUCKET_NAME: "example-origin-bucket",
-  GCS_ERASURE_BUCKET_HISTORY_PROOF: JSON.stringify({ bucket: "example-origin-bucket" }),
   ...Object.fromEntries([...REQUIRED_SECRET_NAMES, ...OPTIONAL_SECRET_NAMES].map((name, index) =>
     [`SECRET_VERSION_${name}`, String(index + 1)])),
 });
@@ -1436,6 +1428,41 @@ test("the YAML reader refuses syntax outside the reviewed subset", () => {
   ].join("\n")).value, { a: [{ name: "x", value: "it's" }, 7], b: true });
 });
 
+test("one Cloud SQL instance and no deletion ledger: no LEDGER_ or history-proof setting", () => {
+  // As checked in: no retired name anywhere, as an env entry, placeholder or comment.
+  assert.doesNotMatch(SERVICE_TEXT, /LEDGER_|GCS_ERASURE_BUCKET_HISTORY_PROOF/u);
+  assert.doesNotMatch(IAM_TEXT, /LEDGER_|GCS_ERASURE_BUCKET_HISTORY_PROOF/u);
+  for (const name of SERVICE_PLACEHOLDERS) assert.doesNotMatch(name, /LEDGER|HISTORY_PROOF/u, name);
+  const environment = parseStrictYaml(SERVICE_TEXT).value.spec.template.spec.containers[0].env;
+  const databaseNames = environment.map((entry) => entry.name)
+    .filter((name) => /INSTANCE_CONNECTION_NAME|_DATABASE$|_SCHEMA$/u.test(name));
+  assert.deepEqual(databaseNames, ["PRIMARY_INSTANCE_CONNECTION_NAME", "PRIMARY_DATABASE", "PRIMARY_SCHEMA"]);
+  // Restoring any retired setting, even as a comment, fails.
+  for (const name of ["LEDGER_INSTANCE_CONNECTION_NAME", "LEDGER_DATABASE", "LEDGER_SCHEMA",
+    "GCS_ERASURE_BUCKET_HISTORY_PROOF", "LEDGER_POOL_SIZE"]) {
+    const entry = `            - name: ${name}\n              value: '\${${name}}'\n`;
+    const doctored = withEnvEntry(entry);
+    const findings = serviceTemplateFindings(doctored);
+    assert.ok(findings.includes(`DELETION_LEDGER_SETTING_PRESENT:${name}`), `${name}: ${findings}`);
+    const plain = withEnvEntry(`            - name: ${name}\n              value: 'synthetic'\n`);
+    assert.ok(serviceTemplateFindings(plain).includes(`DELETION_LEDGER_SETTING_PRESENT:${name}`), name);
+    const comment = doctor(SERVICE_TEXT, "# Secrets come only from Secret Manager",
+      `# ${name} is configured elsewhere.\n# Secrets come only from Secret Manager`);
+    assert.deepEqual(serviceTemplateFindings(comment), [`DELETION_LEDGER_SETTING_PRESENT:${name}`], name);
+    // A render cannot carry a retired value either: it has no placeholder.
+    assert.throws(() => renderServiceTemplate(SERVICE_TEXT, { ...SYNTHETIC_SERVICE_VALUES, [name]: "synthetic" }),
+      { code: `RENDER_VALUE_UNUSED:${name}` }, name);
+  }
+  const rendered = renderServiceTemplate(SERVICE_TEXT, SYNTHETIC_SERVICE_VALUES);
+  assert.doesNotMatch(JSON.stringify(rendered), /LEDGER|HISTORY_PROOF/iu);
+  // The IAM template stays invoker-only for the edge account.
+  assert.deepEqual(iamTemplateFindings(IAM_TEXT), []);
+  assert.deepEqual(renderEdgeIamPolicy(IAM_TEXT, { ...SYNTHETIC_IAM_VALUES, VERIFIER_SA: "" }), {
+    bindings: [{ role: "roles/run.invoker", members: [`serviceAccount:${SYNTHETIC_INVOKER}`] }],
+    projectRoles: { [`serviceAccount:${SYNTHETIC_INVOKER}`]: [] },
+  });
+});
+
 test("every template placeholder has exactly one render grammar", () => {
   const servicePlaceholders = new Set(placeholderNames(SERVICE_TEXT));
   assert.deepEqual(Object.keys(SERVICE_VALUE_GRAMMARS).sort(), [...servicePlaceholders].sort());
@@ -1458,8 +1485,7 @@ test("rendering fills every placeholder into a digest-pinned, audience-bound spe
   assert.equal(env.get("EDGE_INVOKER_SERVICE_ACCOUNT").value, SYNTHETIC_INVOKER);
   assert.equal(env.get("DEPLOYMENT_SOURCE_COMMIT").value, SYNTHETIC_SERVICE_VALUES.SOURCE_COMMIT);
   assert.equal(env.get("HOST_ORIGIN").value, `https://${SYNTHETIC_SERVICE_VALUES.SERVICE_HOST}`);
-  assert.equal(env.get("GCS_ERASURE_BUCKET_HISTORY_PROOF").value,
-    SYNTHETIC_SERVICE_VALUES.GCS_ERASURE_BUCKET_HISTORY_PROOF);
+  assert.equal(env.get("GCS_BUCKET_NAME").value, SYNTHETIC_SERVICE_VALUES.GCS_BUCKET_NAME);
   assert.deepEqual(env.get("IDENTITY_LINK_SECRET").valueFrom.secretKeyRef,
     { name: "IDENTITY_LINK_SECRET", key: "1" });
   assert.deepEqual(env.get("DISTRIBUTION_GITHUB_API_TOKEN").valueFrom.secretKeyRef, {
@@ -1550,10 +1576,9 @@ test("each placeholder value must match its own grammar", () => {
     TELEMETRY_STORAGE_NAMESPACE: ["", "has space", "slash/namespace"],
     PRIMARY_INSTANCE_CONNECTION_NAME: ["", "example-primary", "example-origin-project:example-primary"],
     PRIMARY_DATABASE: ["", "1database", "data-base"],
-    LEDGER_SCHEMA: ["", "schema.name", "x".repeat(64)],
+    PRIMARY_SCHEMA: ["", "schema.name", "x".repeat(64)],
     POSTGRES_IAM_USER: ["", "example-runtime", "example-runtime@example-origin-project"],
     GCS_BUCKET_NAME: ["", "Example-Bucket", "example.bucket", "-bucket"],
-    GCS_ERASURE_BUCKET_HISTORY_PROOF: ["", "[]", "null", "{", "{\"bucket\":\"it's\"}"],
     SECRET_VERSION_IDENTITY_LINK_SECRET: ["", "latest", "0", "01", "1.0"],
     SECRET_VERSION_DISTRIBUTION_GITHUB_API_TOKEN: ["latest", "0"],
   };
@@ -1608,4 +1633,41 @@ test("structure and audience checks hold even under a permissive grammar", () =>
   assert.throws(() => iam({ SERVICE: "a\\u0041" }), { code: "RENDER_STRUCTURE_CHANGED" });
   // The unsafe-character screen does not depend on the grammar.
   assert.throws(() => service({ AUDIENCE: "line\nbreak" }), { code: "RENDER_VALUE_UNSAFE:AUDIENCE" });
+});
+
+test("the infrastructure tooling's renderer (OPS-2) matches this reference renderer", () => {
+  // The same placeholder values yield the same service object, with and
+  // without the verifier and the optional secret.
+  for (const values of [
+    SYNTHETIC_SERVICE_VALUES,
+    { ...SYNTHETIC_SERVICE_VALUES, VERIFIER_SA: "" },
+    { ...SYNTHETIC_SERVICE_VALUES, SECRET_VERSION_DISTRIBUTION_GITHUB_API_TOKEN: "" },
+  ]) {
+    const reference = renderServiceTemplate(SERVICE_TEXT, values);
+    const rendered = infrastructure.renderServiceTemplateValues(values, { templateText: SERVICE_TEXT });
+    assert.ok(isDeepStrictEqual(JSON.parse(JSON.stringify(rendered)), reference), JSON.stringify(values));
+  }
+  // Both refuse a template carrying a retired ledger setting or a weakened
+  // boundary, and a value with no placeholder.
+  const ledger = withEnvEntry("            - name: LEDGER_SCHEMA\n              value: '${PRIMARY_SCHEMA}'\n");
+  const internal = doctor(SERVICE_TEXT, "run.googleapis.com/ingress: all", "run.googleapis.com/ingress: internal");
+  const open = doctor(SERVICE_TEXT, "run.googleapis.com/invoker-iam-disabled: 'false'",
+    "run.googleapis.com/invoker-iam-disabled: 'true'");
+  for (const templateText of [ledger, internal, open]) {
+    assert.throws(() => renderServiceTemplate(templateText, SYNTHETIC_SERVICE_VALUES), { code: "RENDER_TEMPLATE_INVALID" });
+    assert.throws(() => infrastructure.renderServiceTemplateValues(SYNTHETIC_SERVICE_VALUES, { templateText }),
+      { code: "SERVICE_RENDER_INVARIANT_BROKEN" });
+  }
+  assert.throws(() => infrastructure.renderServiceTemplateValues({ ...SYNTHETIC_SERVICE_VALUES, LEDGER_SCHEMA: "x" },
+    { templateText: SERVICE_TEXT }), { code: "SERVICE_RENDER_UNUSED:LEDGER_SCHEMA" });
+  // The invoker policy agrees too: run.invoker for the edge invoker (and the
+  // verifier when present), no project role for either.
+  for (const verifier of [SYNTHETIC_VERIFIER, ""]) {
+    const reference = renderEdgeIamPolicy(IAM_TEXT, { ...SYNTHETIC_IAM_VALUES, VERIFIER_SA: verifier });
+    const rendered = infrastructure.renderEdgeIamPolicy({ serviceAccounts: {
+      edgeInvoker: { member: `serviceAccount:${SYNTHETIC_INVOKER}` },
+      verifier: verifier === "" ? null : { member: `serviceAccount:${verifier}` },
+    } }, { templateText: IAM_TEXT });
+    assert.ok(isDeepStrictEqual(JSON.parse(JSON.stringify(rendered)), reference), verifier);
+  }
 });
