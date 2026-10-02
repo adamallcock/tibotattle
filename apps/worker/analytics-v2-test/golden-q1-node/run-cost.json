@@ -1,0 +1,195 @@
+{
+ "schemaVersion": "gcp-fastpath-dense-run-cost-v1",
+ "note": "wall-clock measurements of this run on its host; not reproducible and never compared",
+ "runtime": {
+  "node": "v26.2.0",
+  "sqlite": "3.53.1",
+  "adapter": "cloud-run/sealed-sqlite-d1-adapter.mjs"
+ },
+ "seedMs": 11552,
+ "tierN": {
+  "ticks": 321,
+  "elapsedMs": 636161,
+  "laneMs": {
+   "analytics": 402515,
+   "publication": 122397,
+   "cache": 110005
+  },
+  "laneStats": {
+   "storage_analytics_schedule:progress:step_limit": 199,
+   "storage_analytics_long_schedule:deferred:query_budget": 29,
+   "storage_analytics_schedule:deferred:query_budget": 71,
+   "storage_analytics_long_schedule:deferred:step_limit": 3,
+   "storage_analytics_schedule:idle:complete": 19
+  },
+  "slowestLane": {
+   "ms": 3774,
+   "tick": 209,
+   "lane": "analytics"
+  },
+  "publicationPasses": 1,
+  "resumedFrom": "a prior run of the same corpus and cadence (--resume)"
+ },
+ "direct": {
+  "total": {
+   "ms": 413636,
+   "jobs": 6,
+   "statements": 1763553,
+   "steps": 143303,
+   "taskMs": 2440482
+  },
+  "owners": {
+   "a": {
+    "ms": 640986,
+    "fitsMs": 9281,
+    "maxModelMs": 10099
+   },
+   "b": {
+    "ms": 641931,
+    "fitsMs": 9530,
+    "maxModelMs": 10017
+   },
+   "c": {
+    "ms": 481139,
+    "fitsMs": 6878,
+    "maxModelMs": 7384
+   },
+   "d": {
+    "ms": 676426,
+    "fitsMs": 9685,
+    "maxModelMs": 10068
+   }
+  }
+ },
+ "cache": {
+  "settledLaneMs": {
+   "enabled": 25668,
+   "disabled": 24566
+  },
+  "reference": {
+   "ms": 34736,
+   "jobs": 6,
+   "tasks": 680,
+   "taskMs": 204630
+  }
+ },
+ "windowRoutingNote": "window routing time is in oracle.log (window-routing)",
+ "tierF": {
+  "scope": "all",
+  "total": {
+   "ms": 448131,
+   "statements": 2472226,
+   "jobs": 6
+  },
+  "owners": {
+   "a": {
+    "pages": {
+     "fits": {
+      "usagePages": 101,
+      "quotaPages": 101,
+      "usageRows": 1395
+     },
+     "modelDates": {
+      "usagePages": 7070,
+      "quotaPages": 7070,
+      "dates": 70
+     }
+    },
+    "cost": {
+     "ms": 655233,
+     "statements": 607274,
+     "invocations": 702,
+     "maxCheckpointBytes": 689044,
+     "fits": {
+      "ms": 8918,
+      "statements": 8713,
+      "invocations": 10,
+      "maxCheckpointParts": 7,
+      "maxCheckpointBytes": 689044
+     }
+    }
+   },
+   "b": {
+    "pages": {
+     "fits": {
+      "usagePages": 101,
+      "quotaPages": 101,
+      "usageRows": 1417
+     },
+     "modelDates": {
+      "usagePages": 7070,
+      "quotaPages": 7070,
+      "dates": 70
+     }
+    },
+    "cost": {
+     "ms": 706903,
+     "statements": 615453,
+     "invocations": 710,
+     "maxCheckpointBytes": 699164,
+     "fits": {
+      "ms": 10310,
+      "statements": 8794,
+      "invocations": 10,
+      "maxCheckpointParts": 8,
+      "maxCheckpointBytes": 699164
+     }
+    }
+   },
+   "c": {
+    "pages": {
+     "fits": {
+      "usagePages": 101,
+      "quotaPages": 101,
+      "usageRows": 1372
+     },
+     "modelDates": {
+      "usagePages": 7070,
+      "quotaPages": 7070,
+      "dates": 70
+     }
+    },
+    "cost": {
+     "ms": 535072,
+     "statements": 632048,
+     "invocations": 781,
+     "maxCheckpointBytes": 690937,
+     "fits": {
+      "ms": 7253,
+      "statements": 9026,
+      "invocations": 11,
+      "maxCheckpointParts": 8,
+      "maxCheckpointBytes": 690937
+     }
+    }
+   },
+   "d": {
+    "pages": {
+     "fits": {
+      "usagePages": 101,
+      "quotaPages": 101,
+      "usageRows": 1425
+     },
+     "modelDates": {
+      "usagePages": 7070,
+      "quotaPages": 7070,
+      "dates": 70
+     }
+    },
+    "cost": {
+     "ms": 747728,
+     "statements": 617451,
+     "invocations": 710,
+     "maxCheckpointBytes": 721657,
+     "fits": {
+      "ms": 10514,
+      "statements": 8769,
+      "invocations": 10,
+      "maxCheckpointParts": 8,
+      "maxCheckpointBytes": 721657
+     }
+    }
+   }
+  }
+ }
+}
