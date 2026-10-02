@@ -285,7 +285,9 @@ test("the committed desired states render offline: staging's waits are named, pr
   assert.deepEqual([rendered.environment, rendered.project, rendered.synthetic], ["staging", "tibotattle", false]);
   // STG-PREP: the staging template renders once the owner's Access AUD is committed.
   assert.deepEqual(rendered.service, { unavailable: "STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud" });
-  assert.deepEqual(rendered.verifierIam, { unavailable: "VERIFIER_TOKEN_CREATOR_UNASSIGNED" });
+  // The owner named the staging verifier operator on 2026-10-02.
+  assert.deepEqual(rendered.verifierIam, { account: "tibotattle-staging-verifier@tibotattle.iam.gserviceaccount.com",
+    role: "roles/iam.serviceAccountTokenCreator", members: ["user:adamallcock@gmail.com"] });
   assert.equal(rendered.jobs["analytics-refresh"].metadata.name, "tibotattle-staging-analytics-refresh");
   assert.equal(rendered.jobs["analytics-refresh"].spec.template.spec.template.spec.containers[0].env
     .find((entry) => entry.name === "ANALYTICS_REFRESH_TARGET").value, "staging");

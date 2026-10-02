@@ -727,9 +727,10 @@ test("rolloutTarget gives OPS-10 its closed target from the environment's commit
   assert.throws(() => manifest.rolloutTargetFromDesiredState(manifest.validateDesiredState(unmarked((value) => {
     value.serviceAccounts.verifier = null;
   }))), { code: "ROLLOUT_TARGET_VERIFIER_REQUIRED" });
-  // With no injected reader, the real committed files answer: staging waits
-  // for its operator, production for OWN-5.
-  assert.throws(() => manifest.rolloutTarget("staging"), { code: "ROLLOUT_TARGET_VERIFIER_TOKEN_CREATOR_UNASSIGNED" });
+  // With no injected reader, the real committed files answer: staging has its
+  // operator (owner, 2026-10-02) and resolves; production waits for OWN-5. The
+  // unassigned refusal stays proven above with tokenCreators null.
+  assert.doesNotThrow(() => manifest.rolloutTarget("staging"));
   assert.throws(() => manifest.rolloutTarget("production"), { code: "DESIRED_STATE_PLACEHOLDER_UNFILLED:project" });
 });
 
@@ -885,9 +886,9 @@ test("the committed staging desired state loads: a new plane in the shared GCP t
     ...Object.values(desired.jobs).map((job) => job.name), ...Object.values(desired.secrets).map((secret) => secret.secretName)]) {
     assert.match(name, /(?:^|-)staging(?:-|$)/u, name);
   }
-  // The verifier exists; its operator, the namespace, the cadence and the secret versions wait for the owner.
+  // The verifier exists with the operator the owner named (2026-10-02); the cadence waits for the owner.
   assert.equal(desired.serviceAccounts.verifier.accountId, "tibotattle-staging-verifier");
-  assert.equal(desired.serviceAccounts.verifier.tokenCreators, null);
+  assert.deepEqual(desired.serviceAccounts.verifier.tokenCreators, ["user:adamallcock@gmail.com"]);
   assert.deepEqual(desired.scheduler["analytics-refresh"], {
     name: "tibotattle-staging-analytics-refresh-trigger", schedule: null, state: "PAUSED" });
   // STG-PREP: staging is synthetic-only, so its namespace is its own synthetic one.

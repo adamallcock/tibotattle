@@ -905,8 +905,9 @@ test("the committed staging desired state plans only its own new resources in th
     assert.ok(named.some((arg) => /staging/u.test(arg)) || entry.id === "custom-role:create", entry.id);
   }
   const deferrals = new Set(ops(result, (entry) => entry.deferred !== undefined).map((entry) => entry.deferred));
+  // The verifier operator was named on 2026-10-02, so its grant is no longer deferred.
   assert.deepEqual([...deferrals].sort(), ["SCHEDULER_CADENCE_UNSET",
-    "STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud", "VERIFIER_TOKEN_CREATOR_UNASSIGNED"]);
+    "STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud"]);
   assert.ok(ops(result, (entry) => entry.id === "secret:create:IDENTITY_LINK_SECRET")[0].argv
     .includes("tibotattle-staging-identity-link-secret"));
   // Apply refuses it until the bucket is born and its proof is committed.

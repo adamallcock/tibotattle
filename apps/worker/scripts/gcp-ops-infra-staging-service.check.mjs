@@ -366,7 +366,8 @@ test("the staging apply rehearsal (in memory): pass 1 builds the plane, pass 2 t
     .map((entry) => `${entry.id}:${entry.deferred}`);
   const first = plan();
   assert.deepEqual([first.summary.refused, first.findings, first.blockers], [0, [], []]);
-  assert.equal(first.summary.executable, 26);
+  // 26 plane operations plus the verifier token-creator grant (operator named 2026-10-02).
+  assert.equal(first.summary.executable, 27);
   assert.ok(deferred(first).includes("run-service:create:STAGING_HOST_COMPOSITION_PENDING"));
   assert.ok(deferred(first).includes("run-job:create:production-migrate:BOOTSTRAP_IMAGE_REQUIRED"));
   operations.applyInfrastructure(staging, { runner: gcloud.runner, authorize: first.planDigest,
@@ -379,7 +380,6 @@ test("the staging apply rehearsal (in memory): pass 1 builds the plane, pass 2 t
   operations.applyInfrastructure(staging, { runner: gcloud.runner, authorize: second.planDigest, bootstrap: IMAGE,
     createSpecWriter: () => writer.create() });
   assert.deepEqual([...operations.infrastructureCleanliness(plan()).reasons], [
-    "DEFERRED:verifier-iam:token-creator:VERIFIER_TOKEN_CREATOR_UNASSIGNED",
     "DEFERRED:run-service:create:STAGING_HOST_COMPOSITION_PENDING",
     "DEFERRED:run-service-iam:bind:roles/run.invoker|serviceAccount:tibotattle-staging-invoker@tibotattle.iam.gserviceaccount.com|:STAGING_HOST_COMPOSITION_PENDING",
     "DEFERRED:run-service-iam:bind:roles/run.invoker|serviceAccount:tibotattle-staging-verifier@tibotattle.iam.gserviceaccount.com|:STAGING_HOST_COMPOSITION_PENDING",

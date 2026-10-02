@@ -33,7 +33,7 @@
     "verifier": {
       "accountId": "tibotattle-staging-verifier",
       "projectRoles": [],
-      "tokenCreators": null
+      "tokenCreators": ["user:adamallcock@gmail.com"]
     }
   },
   "customRole": {
