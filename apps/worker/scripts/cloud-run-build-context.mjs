@@ -124,8 +124,16 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/analytics-refresh.mjs", destination: "apps/worker/cloud-run/analytics-refresh.mjs" }),
   // The MP-2-lite maintenance Job and the production configuration it reads.
   Object.freeze({ source: "cloud-run/postgres-maintenance-job.mjs", destination: "apps/worker/cloud-run/postgres-maintenance-job.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-maintenance-job-contract.mjs", destination: "apps/worker/cloud-run/postgres-maintenance-job-contract.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-maintenance-job.check.mjs", destination: "apps/worker/cloud-run/postgres-maintenance-job.check.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-production-configuration.mjs", destination: "apps/worker/cloud-run/postgres-production-configuration.mjs" }),
+  // The OPS-4 probe jobs: the closed line contract, the runtime liveness probe,
+  // the backup-audit probe and the OPS-1 policy core the audit judges with.
+  Object.freeze({ source: "cloud-run/ops-probe-contract.mjs", destination: "apps/worker/cloud-run/ops-probe-contract.mjs" }),
+  Object.freeze({ source: "cloud-run/ops-runtime-probe-job.mjs", destination: "apps/worker/cloud-run/ops-runtime-probe-job.mjs" }),
+  Object.freeze({ source: "cloud-run/ops-backup-audit-job.mjs", destination: "apps/worker/cloud-run/ops-backup-audit-job.mjs" }),
+  Object.freeze({ source: "cloud-run/ops-probe-job.check.mjs", destination: "apps/worker/cloud-run/ops-probe-job.check.mjs" }),
+  Object.freeze({ source: "cloud-run/ops-backup-horizon.mjs", destination: "apps/worker/cloud-run/ops-backup-horizon.mjs" }),
   Object.freeze({ source: "src", destination: "apps/worker/src" }),
   // The d43c8f92 analytics kernels and their vendored packages; the
   // analytics-refresh entry and the community-daily route bundle them.

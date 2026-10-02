@@ -586,7 +586,8 @@
       "additionalProperties": false,
       "required": [
         "production-migrate",
-        "analytics-refresh"
+        "analytics-refresh",
+        "maintenance"
       ],
       "properties": {
         "production-migrate": {
@@ -626,6 +627,25 @@
               "maximum": 50
             }
           }
+        },
+        "maintenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "maxConnections"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "pattern": "^[a-z](?:[a-z0-9-]{0,47}[a-z0-9])?$"
+            },
+            "maxConnections": {
+              "type": "integer",
+              "minimum": 2,
+              "maximum": 50
+            }
+          }
         }
       }
     },
@@ -633,7 +653,8 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "analytics-refresh"
+        "analytics-refresh",
+        "maintenance"
       ],
       "properties": {
         "analytics-refresh": {
@@ -655,6 +676,32 @@
                 "null"
               ],
               "description": "Five-field cron in Etc/UTC; null until the owner sets the cadence (D3)"
+            },
+            "state": {
+              "enum": [
+                "PAUSED",
+                "ENABLED"
+              ],
+              "description": "PAUSED until OPS-3 resumes the trigger; apply never resumes"
+            }
+          }
+        },
+        "maintenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "schedule",
+            "state"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "pattern": "^[a-z](?:[a-z0-9-]{0,47}[a-z0-9])?$"
+            },
+            "schedule": {
+              "const": "* * * * *",
+              "description": "Pinned to the maintenance job's own cadence (POSTGRES_MAINTENANCE_JOB_SCHEDULE): every minute, as the d43c8f92 Worker cron; any other value, and null, is refused (SCHEDULER_CADENCE_MISMATCH)"
             },
             "state": {
               "enum": [

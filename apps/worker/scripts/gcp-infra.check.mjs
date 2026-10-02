@@ -138,10 +138,14 @@ test("render makes no call and shows the estate", async () => {
   const rendered = JSON.parse(result.out);
   assert.equal(rendered.schema, "tibotattle-gcp-ops-infra-render-v1");
   assert.equal(rendered.synthetic, true);
-  assert.equal(rendered.connectionBudget.total, 82);
+  assert.equal(rendered.connectionBudget.total, 84);
   assert.deepEqual(rendered.service, { unavailable: "BOOTSTRAP_IMAGE_REQUIRED" });
-  assert.deepEqual(rendered.scheduler, { "analytics-refresh": { unavailable: "SCHEDULER_CADENCE_UNSET" } });
-  assert.deepEqual(Object.keys(rendered.jobs), ["production-migrate", "analytics-refresh"]);
+  // The refresh trigger waits for the owner's cadence; the maintenance trigger's is pinned, so its flags render.
+  assert.deepEqual(Object.keys(rendered.scheduler), ["analytics-refresh", "maintenance"]);
+  assert.deepEqual(rendered.scheduler["analytics-refresh"], { unavailable: "SCHEDULER_CADENCE_UNSET" });
+  assert.ok(rendered.scheduler.maintenance.includes("--schedule=* * * * *"));
+  assert.ok(rendered.scheduler.maintenance.includes("--max-retry-attempts=0"));
+  assert.deepEqual(Object.keys(rendered.jobs), ["production-migrate", "analytics-refresh", "maintenance"]);
   assert.deepEqual(rendered.verifierIam, { account: "synthetic-verifier@synthetic-ops-project.iam.gserviceaccount.com",
     role: "roles/iam.serviceAccountTokenCreator", members: ["group:synthetic-operators@example.com"] });
   const withImage = JSON.parse((await run(["render", `--desired-state=${FIXTURE_PATH}`, ...IMAGE])).out);
@@ -150,6 +154,11 @@ test("render makes no call and shows the estate", async () => {
   // The analytics-refresh job renders the production refresh-job contract.
   assert.deepEqual(withImage.jobs["analytics-refresh"].spec.template.spec.template.spec.containers[0].args,
     ["--max-old-space-size=12288", "dist/analytics-refresh.mjs", "--mode=full"]);
+  // The maintenance job renders C-MAINT's job contract (D-OPS4), secrets by reference only.
+  assert.deepEqual(withImage.jobs.maintenance.spec.template.spec.template.spec.containers[0].args,
+    ["dist/postgres-maintenance-job.mjs", "--profile=maintenance-job"]);
+  assert.deepEqual(withImage.jobs.maintenance.spec.template.spec.template.spec.containers[0].env
+    .filter((entry) => entry.valueFrom !== undefined).map((entry) => entry.name), ["IDENTITY_LINK_SECRET"]);
   assert.doesNotMatch(JSON.stringify(withImage), /LEDGER|ERASURE_BUCKET_HISTORY_PROOF/u);
   // OD-2: the service carries the quarantine bucket's pinned birth proof.
   assert.match(JSON.stringify(withImage), /GCS_QUARANTINE_BUCKET_HISTORY_PROOF/u);
@@ -312,7 +321,9 @@ test("scheduler-probe reads the triggers once and exits 2 on the paused-too-long
   assert.equal(alerting.code, 2, alerting.err);
   const probe = JSON.parse(alerting.out);
   assert.equal(probe.signal, "SCHEDULER_TRIGGER_PAUSED_TOO_LONG");
-  assert.deepEqual(probe.triggers.map((entry) => [entry.verdict, entry.quietMinutes]), [["paused_too_long", 390]]);
+  // The maintenance trigger does not exist in this fake estate and is committed PAUSED: not created yet, no alert.
+  assert.deepEqual(probe.triggers.map((entry) => [entry.job, entry.verdict, entry.quietMinutes]),
+    [["analytics-refresh", "paused_too_long", 390], ["maintenance", "absent_not_created", null]]);
   assert.deepEqual(gcloud.calls.map((argv) => classifyGcloudCommand(argv)), ["read"]);
   const early = await run(["scheduler-probe", "--environment=production"], { gcloud, readFile: reader(resumed),
     now: () => Date.parse("2026-10-02T05:00:00Z") });

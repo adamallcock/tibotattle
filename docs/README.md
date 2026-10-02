@@ -73,6 +73,7 @@ their status changes; current Cloudflare behavior follows the authorities above.
 | GCP cutover window | [GCP cutover window](./runbooks/gcp-cutover-window.md) | Draft | Steps H.1 to H.8 with preconditions, attestations, abort path and tooling status; not operational and authorizes nothing |
 | GCP origin rollout | [GCP origin rollout](./runbooks/gcp-rollout.md) | Draft | Preflight, build, migrate and roll with the accepted per-migration write outage and an explicit scheduler pause and resume; forward only |
 | GCP scheduler resume | [GCP scheduler resume](./runbooks/gcp-scheduler-resume.md) | Draft | Triggers created paused and resumed only explicitly; state model, pause and resume steps; pause and resume tooling not built |
+| GCP ops probes | [GCP ops probes](./runbooks/gcp-ops-probes.md) | Draft | The content-free runtime liveness probe, the backup-audit probe and the log-redaction marker; line contract, unavailable reasons, open owner decisions; not registered or run in any project |
 | GCP brake and incidents | [GCP brake and incidents](./runbooks/gcp-brake-and-incidents.md) | Draft | Brake to fenced only, then fix forward; incident classes; brake thresholds and escalation not recorded |
 
 ## Lifecycle evidence

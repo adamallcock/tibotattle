@@ -84,12 +84,21 @@
     "analytics-refresh": {
       "name": "tibotattle-analytics-refresh",
       "maxConnections": 4
+    },
+    "maintenance": {
+      "name": "tibotattle-maintenance",
+      "maxConnections": 2
     }
   },
   "scheduler": {
     "analytics-refresh": {
       "name": "tibotattle-analytics-refresh-trigger",
       "schedule": null,
+      "state": "PAUSED"
+    },
+    "maintenance": {
+      "name": "tibotattle-maintenance-trigger",
+      "schedule": "* * * * *",
       "state": "PAUSED"
     }
   }
