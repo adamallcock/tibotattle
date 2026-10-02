@@ -262,12 +262,15 @@ export class GcsQuarantineObjectStore implements QuarantineObjectStore {
     accessToken: GcsQuarantineAccessTokenProvider,
     fetchImpl: GcsQuarantineFetch = (input, init) => fetch(input, init),
     timeoutMilliseconds = DEFAULT_TIMEOUT_MILLISECONDS,
-    historyProof?: GcsQuarantineBucketHistoryProof,
+    // Required (OD-2). A caller that wants the default fetch or timeout passes
+    // `undefined` for them explicitly; it cannot omit the proof.
+    historyProof: GcsQuarantineBucketHistoryProof,
   ) {
     bucketName(bucket);
     // OD-2: the quarantine store always reads the bucket's birth proof. A
     // composition without one is refused here instead of failing later on
-    // the first delete or head of a missing key.
+    // the first delete or head of a missing key. JavaScript composition roots
+    // are not type-checked, so the refusal stays at runtime too.
     if ((historyProof as unknown) === undefined || (historyProof as unknown) === null) throw unavailable();
     if (typeof accessToken !== "function" || typeof fetchImpl !== "function"
         || !Number.isSafeInteger(timeoutMilliseconds)
@@ -280,15 +283,22 @@ export class GcsQuarantineObjectStore implements QuarantineObjectStore {
     this.timeoutMilliseconds = timeoutMilliseconds;
     // The quarantine contract requires retained-data-safe deletion. Reuse the
     // reviewed generation/history erasure path rather than silently issuing a
-    // key-only DELETE against a bucket whose retention policy is unknown; the
-    // erasure store refuses a proof for any other bucket.
-    this.erasure = new GcsErasureObjectStore(
-      bucket,
-      accessToken,
-      fetchImpl,
-      timeoutMilliseconds,
-      historyProof,
-    );
+    // key-only DELETE against a bucket whose retention policy is unknown. The
+    // erasure store refuses a malformed proof or a proof for any other
+    // bucket; that refusal is reported with this adapter's error class.
+    let erasure: GcsErasureObjectStore;
+    try {
+      erasure = new GcsErasureObjectStore(
+        bucket,
+        accessToken,
+        fetchImpl,
+        timeoutMilliseconds,
+        historyProof,
+      );
+    } catch {
+      throw unavailable();
+    }
+    this.erasure = erasure;
   }
 
   private async within<T>(context: RequestContext, operation: () => Promise<T>): Promise<T> {
@@ -480,13 +490,17 @@ export function parseGcsQuarantineBucketHistoryProof(
   return proof;
 }
 
-/** Factory kept parallel to the R2 adapter for composition roots. */
+/**
+ * Factory kept parallel to the R2 adapter for composition roots. The bucket's
+ * birth proof is required (OD-2); pass `undefined` for the default fetch and
+ * timeout.
+ */
 export function createGcsQuarantineObjectStore(
   bucket: string,
   accessToken: GcsQuarantineAccessTokenProvider,
-  fetchImpl?: GcsQuarantineFetch,
-  timeoutMilliseconds?: number,
-  historyProof?: GcsQuarantineBucketHistoryProof,
+  fetchImpl: GcsQuarantineFetch | undefined,
+  timeoutMilliseconds: number | undefined,
+  historyProof: GcsQuarantineBucketHistoryProof,
 ): QuarantineObjectStore {
   return new GcsQuarantineObjectStore(
     bucket,

@@ -57,8 +57,8 @@ test("TRANSFER_STAGES is the frozen, ordered production stage list", () => {
     "owner-lifecycle-verify", "objects", "post-import",
   ]);
   assert.equal(new Set(TRANSFER_STAGES).size, TRANSFER_STAGES.length);
-  // No deletion-ledger stage (LEAD-SIMP); 'accountless-retention' stays
-  // pending owner decision OD-3.
+  // No deletion-ledger stage (LEAD-SIMP); 'accountless-retention' is kept by
+  // owner decision OD-3 (2026-10-02).
   assert.equal(TRANSFER_STAGES.some((stage) => /ledger/u.test(stage)), false);
   assert.ok(TRANSFER_STAGES.includes("accountless-retention"));
   for (const stage of TRANSFER_STAGES) assert.match(stage, /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/u);
