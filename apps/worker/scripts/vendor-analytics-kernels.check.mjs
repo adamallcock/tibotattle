@@ -16,17 +16,20 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync,
+} from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
-  applyExportPatches, assertExportPatchesResolved, assertPatchSpecs, AUTHORED_FILES, buildManifest, EXPORT_PATCHES,
-  locateExportSymbol, main, MANIFEST_FILE, MANIFEST_SCHEMA, maskNonCode, PARITY_HELPERS, PARITY_SPECS,
-  parseArguments, parseCommit, planExportPatches, regenerateTypeStubs, reportAtCommit, resolveExportPatches, SOURCE_COMMIT,
-  VendorError, vendorLayout, VENDORED_PACKAGES, verifyExportPatches, WEB_ROOTS,
+  applyExportPatches, assertExportPatchesResolved, assertPatchSpecs, assertSourceCommit, AUTHORED_FILES, buildManifest,
+  commitsNamedIn, EXPORT_PATCHES, foreignCommitsNamed, locateExportSymbol, main, MANIFEST_FILE, MANIFEST_SCHEMA, maskNonCode,
+  PARITY_HELPERS, PARITY_SPECS, parseArguments, parseCommit, planExportPatches, reachableInputs, regenerateTypeStubs,
+  reportAtCommit, resolveExportPatches, SOURCE_COMMIT, VendorError, vendorLayout, VENDORED_PACKAGES, verifyExportPatches,
+  verifyVendoredTree, WEB_ROOTS,
 } from "./vendor-analytics-kernels.mjs";
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -180,6 +183,209 @@ function assertNoCloudflareImports(tree) {
 }
 
 // ---------------------------------------------------------------------------
+// Whole-tree assertions: bundle, closure, stubs and tsc over a layout
+// ---------------------------------------------------------------------------
+
+const loadEsbuild = () => createRequire(join(WORKER_ROOT, "package.json"))("esbuild");
+
+async function withScratchAsync(fn) {
+  const dir = mkdtempSync(join(tmpdir(), "vendor-analytics-kernels-check-"));
+  try {
+    return await fn(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * A scratch out root. Bare packages resolve from <dir>/node_modules (a link to
+ * this checkout's), so a tree under <dir>/out bundles and typechecks the way a
+ * tree under apps/worker does.
+ */
+function withWorkspace(fn) {
+  return withScratchAsync((dir) => {
+    symlinkSync(join(WORKER_ROOT, "node_modules"), join(dir, "node_modules"), "dir");
+    const out = join(dir, "out");
+    mkdirSync(out);
+    return fn(out);
+  });
+}
+
+/**
+ * Every module esbuild parsed for one entry: the input graph walked over its
+ * resolved imports. `outputs[].inputs` is not that: it omits a module that
+ * tree-shaking removed although the files that import it still need it.
+ */
+function inputGraph(metafile, entryKey) {
+  const seen = new Set([entryKey]);
+  const pending = [entryKey];
+  while (pending.length) {
+    for (const edge of metafile.inputs[pending.pop()].imports) {
+      if (edge.external || !(edge.path in metafile.inputs) || seen.has(edge.path)) continue;
+      seen.add(edge.path);
+      pending.push(edge.path);
+    }
+  }
+  return [...seen].sort();
+}
+
+/** esbuild over the vendored tree itself: per entry, the input graph and the tree-shaken output inputs, relative to the out root. */
+async function vendoredClosure(tree) {
+  const { layout } = tree;
+  // esbuild reports real paths; a temporary directory is often a symlink (macOS /var).
+  const root = realpathSync(layout.outRoot);
+  const parityRoot = join(root, layout.parityRelative);
+  const entryPoints = { kernel: `${layout.vendorRelative}/entry.ts` };
+  WEB_ROOTS.forEach((path, index) => { entryPoints[`web${index}`] = `${layout.vendorRelative}/${path}`; });
+  PARITY_SPECS.forEach((spec, index) => { entryPoints[`parity${index}`] = `${layout.parityRelative}/${spec}`; });
+  const vendoredPackage = (name) => join(root, layout.vendorRelative, "packages", name.slice("@app-usagemonitor/".length), "index.js");
+  const result = await loadEsbuild().build({
+    absWorkingDir: root, entryPoints, bundle: true, write: false, metafile: true, platform: "node",
+    format: "esm", target: "node22", mainFields: ["module", "main"], outdir: join(root, ".vendor-closure-check"),
+    logLevel: "silent",
+    plugins: [{
+      name: "vendor-closure-check",
+      setup(build) {
+        build.onResolve({ filter: /.*/ }, (args) => {
+          if (args.path.startsWith(".") || args.path.startsWith("/")) return undefined;
+          if (args.path.startsWith("@app-usagemonitor/")) {
+            // Vendor-internal importers must resolve through tsconfig.json paths
+            // (what the plain esbuild CLI uses); parity specs mirror the Vitest plugin.
+            if (args.importer.startsWith(`${parityRoot}${sep}`)) return { path: vendoredPackage(args.path) };
+            return undefined;
+          }
+          return { path: args.path, external: true };
+        });
+      },
+    }],
+  });
+  const byEntry = {};
+  const outputInputs = {};
+  for (const output of Object.values(result.metafile.outputs)) {
+    const name = Object.entries(entryPoints).find(([, path]) => path === output.entryPoint)?.[0];
+    if (!name) continue;
+    byEntry[name] = inputGraph(result.metafile, output.entryPoint);
+    outputInputs[name] = Object.keys(output.inputs);
+  }
+  return { byEntry, outputInputs };
+}
+
+async function assertVendoredClosure(tree) {
+  const { layout, manifest } = tree;
+  const { byEntry } = await vendoredClosure(tree);
+  const prefix = `${layout.vendorRelative}/`;
+  const reachOf = (name) => (name === "kernel" ? "kernel" : name.startsWith("web") ? "web" : "parity");
+  const reach = new Map();
+  for (const name of ["kernel", ...Object.keys(byEntry).filter((key) => key !== "kernel").sort()]) {
+    for (const input of byEntry[name]) {
+      if (input.startsWith(`${layout.parityRelative}/`)) continue;
+      assert.ok(input.startsWith(prefix), `${name} reaches outside the vendor tree: ${input}`);
+      const path = input.slice(prefix.length);
+      if (path === "entry.ts") continue;
+      if (PACKAGE_FILE.test(path)) {
+        assert.ok(VENDORED_PACKAGES.includes(PACKAGE_FILE.exec(path)[1]), `${input} is not a vendored package`);
+        continue;
+      }
+      if (!reach.has(path)) reach.set(path, reachOf(name));
+    }
+  }
+  assert.ok(byEntry.kernel.some((input) => input.startsWith(`${prefix}packages/`)), "kernel resolved no vendored package");
+  const closure = [...reach.entries()].map(([path, value]) => `${value} ${path}`).sort();
+  const listed = manifest.files.filter((file) => file.reach !== "package").map((file) => `${file.reach} ${file.path}`).sort();
+  assert.deepEqual(closure, listed);
+}
+
+async function assertFacadeBundlesAndPrepares(tree) {
+  const { layout } = tree;
+  const result = await loadEsbuild().build({
+    absWorkingDir: realpathSync(layout.outRoot), entryPoints: [`${layout.vendorRelative}/entry.ts`], bundle: true, write: false,
+    platform: "node", format: "esm", mainFields: ["module", "main"], logLevel: "silent", metafile: true,
+  });
+  const inputs = Object.keys(result.metafile.inputs);
+  assert.ok(!inputs.some((input) => /node_modules\/@app-usagemonitor\//.test(input)), "bundle used non-vendored packages");
+  const dir = mkdtempSync(join(tmpdir(), "vendor-analytics-kernels-check-"));
+  try {
+    const file = join(dir, "kernels.mjs");
+    writeFileSync(file, result.outputFiles[0].contents);
+    const kernels = await import(pathToFileURL(file).href);
+    const day = await kernels.prepareSharedAnalyticsDay({ day: "2026-09-30", ownerDigest: "a".repeat(64),
+      usage: [], quota: [], session: [] });
+    assert.equal(day.day, "2026-09-30");
+    assert.equal(day.daily.counts.usage + day.daily.counts.quota + day.daily.counts.session, 0);
+    assert.equal(typeof kernels.publicInputs, "function");
+    assert.equal(typeof kernels.reconcileGroups, "function");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+async function assertTypeStubs(tree) {
+  const { layout, manifest } = tree;
+  assert.equal(manifest.counts.typeStubs, manifest.typeStubs.length);
+  const vendored = new Set(manifest.files.map((file) => file.path));
+  const expected = revParse(tree.commit, manifest.typeStubs.map((stub) => stub.source));
+  for (const stub of manifest.typeStubs) {
+    assert.equal(stub.path, stub.source.replace(/\.ts$/, ".d.ts"));
+    assert.ok(stub.source.startsWith("apps/worker/src/") && !vendored.has(stub.source), `${stub.source} must be unvendored Worker source`);
+    assert.equal(stub.sourceBlob, expected.get(stub.source), `${stub.source} differs from ${tree.short}`);
+    assert.equal(digest(readFileSync(join(layout.vendorRoot, stub.path))), stub.sha256, `${stub.path} differs from the manifest`);
+  }
+  const { frontier, stubs } = await regenerateTypeStubs(manifest, { outRoot: layout.outRoot });
+  assert.deepEqual(frontier, manifest.typeStubs.map((stub) => stub.source));
+  for (const stub of manifest.typeStubs) {
+    assert.ok(stubs.get(stub.path)?.equals(readFileSync(join(layout.vendorRoot, stub.path))), `${stub.path} is not the emitted declaration`);
+  }
+}
+
+function assertTscConsumer(tree) {
+  // The probe extends apps/worker/tsconfig.json from inside apps/worker so the
+  // program is exactly `npm run typecheck` plus one consumer of entry.ts.
+  const dir = mkdtempSync(join(WORKER_ROOT, ".vendor-tsc-probe-"));
+  try {
+    writeFileSync(join(dir, "probe.ts"), [
+      "import { prepareSharedAnalyticsDay, publicInputs, reconcileGroups, type SharedAnalyticsDay }",
+      `  from ${JSON.stringify(relative(dir, join(tree.layout.vendorRoot, "entry")).split(sep).join("/"))};`,
+      "export const probe: (day: string) => Promise<SharedAnalyticsDay> = (day) =>",
+      "  prepareSharedAnalyticsDay({ day, ownerDigest: \"a\".repeat(64), usage: [], quota: [], session: [] });",
+      "export const helpers = [publicInputs, reconcileGroups] as const;",
+      "",
+    ].join("\n"));
+    // The whole app program plus the probe, as if the probe lived in src/. `types`
+    // and `include` resolve from the project that uses them, so re-anchor them.
+    const app = JSON.parse(readFileSync(join(WORKER_ROOT, "tsconfig.json"), "utf8"));
+    const anchor = (entry) => relative(dir, resolve(WORKER_ROOT, entry)).split(sep).join("/");
+    writeFileSync(join(dir, "tsconfig.json"), JSON.stringify({
+      extends: "../tsconfig.json",
+      compilerOptions: { noEmit: true,
+        types: (app.compilerOptions.types ?? []).map((entry) => (entry.startsWith(".") ? anchor(entry) : entry)) },
+      include: (app.include ?? []).map(anchor),
+      files: ["probe.ts"],
+    }));
+    const result = spawnSync(join(WORKER_ROOT, "node_modules", ".bin", "tsc"), ["-p", dir, "--pretty", "false"],
+      { cwd: WORKER_ROOT, encoding: "utf8" });
+    assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * entry.ts states which commit its files are copies of. It must say this tree's
+ * own short id, and every commit it names (found independently of the
+ * generator: after the word "commit", or a hex run of 7-40 digits that mixes
+ * digits and letters) must be this tree's.
+ */
+function assertFacadeProvenance(tree) {
+  const text = readFileSync(join(tree.layout.vendorRoot, "entry.ts"), "utf8");
+  assert.ok(text.includes(tree.short), `${tree.short}/entry.ts does not state its own commit`);
+  const named = new Set();
+  for (const match of text.matchAll(/\b(commit\s+)?([0-9a-f]{7,40})\b/g)) {
+    if (match[1] || (/\d/.test(match[2]) && /[a-f]/.test(match[2]))) named.add(match[2]);
+  }
+  for (const token of named) assert.ok(tree.commit.startsWith(token), `${tree.short}/entry.ts names commit ${token}`);
+}
+
+// ---------------------------------------------------------------------------
 // Committed trees: d43c8f92 (pinned) and any other vendor/analytics-<8 hex>
 // ---------------------------------------------------------------------------
 
@@ -214,6 +420,10 @@ for (const tree of committedTrees) {
     assertDirectoryHoldsManifestFiles(tree);
   });
 
+  test(title("the authored facade's provenance text names this tree's commit and no other"), () => {
+    assertFacadeProvenance(tree);
+  });
+
   test(title(`each vendored package is complete at ${tree.short}`), () => {
     assertPackagesComplete(tree);
   });
@@ -242,140 +452,20 @@ for (const tree of committedTrees) {
     }
   });
 
-  /** esbuild over the vendored tree itself: inputs per entry, relative to apps/worker. */
-  async function vendoredClosure() {
-    const { layout } = tree;
-    const esbuild = createRequire(join(WORKER_ROOT, "package.json"))("esbuild");
-    const entryPoints = { kernel: `${layout.vendorRelative}/entry.ts` };
-    WEB_ROOTS.forEach((path, index) => { entryPoints[`web${index}`] = `${layout.vendorRelative}/${path}`; });
-    PARITY_SPECS.forEach((spec, index) => { entryPoints[`parity${index}`] = `${layout.parityRelative}/${spec}`; });
-    const vendoredPackage = (name) => join(layout.vendorRoot, "packages", name.slice("@app-usagemonitor/".length), "index.js");
-    const result = await esbuild.build({
-      absWorkingDir: WORKER_ROOT, entryPoints, bundle: true, write: false, metafile: true, platform: "node",
-      format: "esm", target: "node22", mainFields: ["module", "main"], outdir: join(WORKER_ROOT, ".vendor-closure-check"),
-      logLevel: "silent",
-      plugins: [{
-        name: "vendor-closure-check",
-        setup(build) {
-          build.onResolve({ filter: /.*/ }, (args) => {
-            if (args.path.startsWith(".") || args.path.startsWith("/")) return undefined;
-            if (args.path.startsWith("@app-usagemonitor/")) {
-              // Vendor-internal importers must resolve through tsconfig.json paths
-              // (what the plain esbuild CLI uses); parity specs mirror the Vitest plugin.
-              if (args.importer.startsWith(`${layout.parityRoot}${sep}`)) return { path: vendoredPackage(args.path) };
-              return undefined;
-            }
-            return { path: args.path, external: true };
-          });
-        },
-      }],
-    });
-    const byEntry = {};
-    for (const output of Object.values(result.metafile.outputs)) {
-      const name = Object.entries(entryPoints).find(([, path]) => path === output.entryPoint)?.[0];
-      if (name) byEntry[name] = Object.keys(output.inputs);
-    }
-    return byEntry;
-  }
-
   test(title("the manifest is exactly the runtime closure of the facade, the site normalizer and the parity specs"), async () => {
-    const { layout, manifest } = tree;
-    const byEntry = await vendoredClosure();
-    const prefix = `${layout.vendorRelative}/`;
-    const reachOf = (name) => (name === "kernel" ? "kernel" : name.startsWith("web") ? "web" : "parity");
-    const reach = new Map();
-    for (const name of ["kernel", ...Object.keys(byEntry).filter((key) => key !== "kernel").sort()]) {
-      for (const input of byEntry[name]) {
-        if (input.startsWith(`${layout.parityRelative}/`)) continue;
-        assert.ok(input.startsWith(prefix), `${name} reaches outside the vendor tree: ${input}`);
-        const path = input.slice(prefix.length);
-        if (path === "entry.ts") continue;
-        if (PACKAGE_FILE.test(path)) {
-          assert.ok(VENDORED_PACKAGES.includes(PACKAGE_FILE.exec(path)[1]), `${input} is not a vendored package`);
-          continue;
-        }
-        if (!reach.has(path)) reach.set(path, reachOf(name));
-      }
-    }
-    assert.ok(byEntry.kernel.some((input) => input.startsWith(`${prefix}packages/`)), "kernel resolved no vendored package");
-    const closure = [...reach.entries()].map(([path, value]) => `${value} ${path}`).sort();
-    const listed = manifest.files.filter((file) => file.reach !== "package").map((file) => `${file.reach} ${file.path}`).sort();
-    assert.deepEqual(closure, listed);
+    await assertVendoredClosure(tree);
   });
 
   test(title("the facade bundles for Node and prepares an empty owner-day"), async () => {
-    const { layout } = tree;
-    const esbuild = createRequire(join(WORKER_ROOT, "package.json"))("esbuild");
-    const result = await esbuild.build({
-      absWorkingDir: WORKER_ROOT, entryPoints: [`${layout.vendorRelative}/entry.ts`], bundle: true, write: false,
-      platform: "node", format: "esm", mainFields: ["module", "main"], logLevel: "silent", metafile: true,
-    });
-    const inputs = Object.keys(result.metafile.inputs);
-    assert.ok(!inputs.some((input) => /node_modules\/@app-usagemonitor\//.test(input)), "bundle used non-vendored packages");
-    const dir = mkdtempSync(join(tmpdir(), "vendor-analytics-kernels-check-"));
-    try {
-      const file = join(dir, "kernels.mjs");
-      writeFileSync(file, result.outputFiles[0].contents);
-      const kernels = await import(pathToFileURL(file).href);
-      const day = await kernels.prepareSharedAnalyticsDay({ day: "2026-09-30", ownerDigest: "a".repeat(64),
-        usage: [], quota: [], session: [] });
-      assert.equal(day.day, "2026-09-30");
-      assert.equal(day.daily.counts.usage + day.daily.counts.quota + day.daily.counts.session, 0);
-      assert.equal(typeof kernels.publicInputs, "function");
-      assert.equal(typeof kernels.reconcileGroups, "function");
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+    await assertFacadeBundlesAndPrepares(tree);
   });
 
   test(title(`type stubs are this tsc's declarations of the ${tree.short} modules vendored files name only for types`), async () => {
-    const { layout, manifest } = tree;
-    assert.equal(manifest.counts.typeStubs, manifest.typeStubs.length);
-    const vendored = new Set(manifest.files.map((file) => file.path));
-    const expected = revParse(tree.commit, manifest.typeStubs.map((stub) => stub.source));
-    for (const stub of manifest.typeStubs) {
-      assert.equal(stub.path, stub.source.replace(/\.ts$/, ".d.ts"));
-      assert.ok(stub.source.startsWith("apps/worker/src/") && !vendored.has(stub.source), `${stub.source} must be unvendored Worker source`);
-      assert.equal(stub.sourceBlob, expected.get(stub.source), `${stub.source} differs from ${tree.short}`);
-      assert.equal(digest(readFileSync(join(layout.vendorRoot, stub.path))), stub.sha256, `${stub.path} differs from the manifest`);
-    }
-    const { frontier, stubs } = await regenerateTypeStubs(manifest);
-    assert.deepEqual(frontier, manifest.typeStubs.map((stub) => stub.source));
-    for (const stub of manifest.typeStubs) {
-      assert.ok(stubs.get(stub.path)?.equals(readFileSync(join(layout.vendorRoot, stub.path))), `${stub.path} is not the emitted declaration`);
-    }
+    await assertTypeStubs(tree);
   });
 
   test(title("a tsc-checked consumer can import the facade with this checkout's tsconfig"), () => {
-    // The probe extends apps/worker/tsconfig.json from inside apps/worker so the
-    // program is exactly `npm run typecheck` plus one consumer of entry.ts.
-    const dir = mkdtempSync(join(WORKER_ROOT, ".vendor-tsc-probe-"));
-    try {
-      writeFileSync(join(dir, "probe.ts"), [
-        "import { prepareSharedAnalyticsDay, publicInputs, reconcileGroups, type SharedAnalyticsDay }",
-        `  from ${JSON.stringify(relative(dir, join(tree.layout.vendorRoot, "entry")).split(sep).join("/"))};`,
-        "export const probe: (day: string) => Promise<SharedAnalyticsDay> = (day) =>",
-        "  prepareSharedAnalyticsDay({ day, ownerDigest: \"a\".repeat(64), usage: [], quota: [], session: [] });",
-        "export const helpers = [publicInputs, reconcileGroups] as const;",
-        "",
-      ].join("\n"));
-      // The whole app program plus the probe, as if the probe lived in src/. `types`
-      // and `include` resolve from the project that uses them, so re-anchor them.
-      const app = JSON.parse(readFileSync(join(WORKER_ROOT, "tsconfig.json"), "utf8"));
-      const anchor = (entry) => relative(dir, resolve(WORKER_ROOT, entry)).split(sep).join("/");
-      writeFileSync(join(dir, "tsconfig.json"), JSON.stringify({
-        extends: "../tsconfig.json",
-        compilerOptions: { noEmit: true,
-          types: (app.compilerOptions.types ?? []).map((entry) => (entry.startsWith(".") ? anchor(entry) : entry)) },
-        include: (app.include ?? []).map(anchor),
-        files: ["probe.ts"],
-      }));
-      const result = spawnSync(join(WORKER_ROOT, "node_modules", ".bin", "tsc"), ["-p", dir, "--pretty", "false"],
-        { cwd: WORKER_ROOT, encoding: "utf8" });
-      assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+    assertTscConsumer(tree);
   });
 }
 
@@ -626,6 +716,40 @@ test("the lexer is not derailed by regex literals, division, nested templates or
   assert.equal(maskNonCode("x = `a${b}c`;").length, "x = `a${b}c`;".length);
 });
 
+test("a regex after an if, while or for header, or after a closing brace, is a regex; after any other `)` it is a division", () => {
+  // The decoy sits inside a template literal; the real declaration is on the stated line.
+  const decoy = "const t = `\nfunction foo() {}\n`;\n";
+  const regexCases = [
+    [`declare const c: boolean, s: string;\nif (c) /\`/.test(s);\nfunction foo() { return 1; }\n${decoy}`, 3],
+    [`declare const c: boolean, s: string;\nwhile (c) /'/.test(s);\nfunction foo() { return 1; }\n${decoy}`, 3],
+    [`declare const c: boolean, s: string;\nfor (const x of s) /"/.test(x);\nfunction foo() { return 1; }\n${decoy}`, 3],
+    [`declare const c: boolean, s: string;\nfor await (const x of s) /\`/.test(x);\nfunction foo() { return 1; }\n${decoy}`, 3],
+    ["declare const a: boolean, b: string;\nif (a) {}\n/\"/.test(b);\nfunction foo() {}\n", 4],
+    ["if (a) {}\n/\"/.test(b);\nfunction foo() {}\n", 3],
+  ];
+  for (const [text, line] of regexCases) {
+    const found = locate(text, "foo");
+    assert.equal(found.status, "apply", text);
+    assert.equal(found.line, line, text);
+  }
+  // Divisions stay divisions: read as regexes they would swallow a template's backtick and leave the file unclosed.
+  for (const text of ["const r = (a) / 2 + `/`;\nfunction foo() {}\n", "const r = f(a) / 2 + `/`;\nfunction foo() {}\n",
+    "const r = a[0] / 2 + `/`;\nfunction foo() {}\n", "const q = (a + b) / 2 / 3;\nfunction foo() {}\n",
+    // A call that is only named like a keyword is not a header.
+    "const r = a.if(b) / 2 + `/`;\nfunction foo() {}\n"]) {
+    const found = locate(text, "foo");
+    assert.equal(found.status, "apply", text);
+    assert.equal(found.line, 2, text);
+  }
+});
+
+test("the parser backstop accepts a patch whose declaration follows a regex the lexer had to read from context", async () => {
+  const esbuild = loadEsbuild();
+  const text = "declare const c: boolean, s: string;\nif (c) /`/.test(s);\nfunction foo() { return 1; }\nconst t = `\nfunction foo() {}\n`;\n";
+  const plan = await planExportPatches({ patches: [{ ...patchFor("foo") }], readText: () => text, esbuild });
+  assert.equal(plan[0].line, 3);
+});
+
 test("a source the lexer cannot close is refused", () => {
   for (const text of ["/* never closed\nfunction foo() {}\n", "const t = `open\nfunction foo() {}\n", "const s = \"open\nfunction foo() {}\n",
     "const t = `a ${ b \nfunction foo() {}\n"]) {
@@ -743,31 +867,73 @@ test("regenerating d43c8f92 into a scratch directory reproduces the committed tr
   });
 });
 
-test("another commit is vendored into its own directories, verified like d43c8f92, and regenerates identically", () => {
-  const parent = git(["rev-parse", "--verify", `${COMMIT}^`]).trim();
-  assert.notEqual(parent, COMMIT);
-  withScratch((out) => {
-    const run = runGenerator([`--commit=${parent}`, `--out-root=${out}`, `--authored-from=${DEFAULT_LAYOUT.vendorRoot}`]);
+/** A reviewed facade for another commit: d43c8f92's, with its provenance text pointed at that commit. */
+function placeFacadeFor(layout) {
+  mkdirSync(layout.vendorRoot, { recursive: true });
+  writeFileSync(join(layout.vendorRoot, "entry.ts"),
+    readFileSync(join(DEFAULT_LAYOUT.vendorRoot, "entry.ts"), "utf8").replaceAll(COMMIT.slice(0, 8), layout.short));
+  writeFileSync(join(layout.vendorRoot, "tsconfig.json"), readFileSync(join(DEFAULT_LAYOUT.vendorRoot, "tsconfig.json")));
+}
+
+/**
+ * A commit whose runtime closure differs from d43c8f92's: 25 commits earlier,
+ * three Worker modules (analytics-delivery, d1-invocation-budget and
+ * v11-storage-journal) are used for values only from code that tree-shaking
+ * removes. A generator that took its closure from the bundle's outputs left them
+ * out, wrote type stubs for them, and still printed ok for a tree that cannot be
+ * bundled.
+ */
+const OTHER_COMMIT = git(["rev-parse", "--verify", `${COMMIT}~25`]).trim();
+const TREE_SHAKEN_MODULES = ["analytics-delivery", "d1-invocation-budget", "v11-storage-journal"].map((name) => `apps/worker/src/${name}.ts`);
+
+test("another commit is vendored into its own directories and passes every per-tree assertion d43c8f92 does", async () => {
+  assert.notEqual(OTHER_COMMIT, COMMIT);
+  await withWorkspace(async (out) => {
+    const layout = vendorLayout({ commit: OTHER_COMMIT, outRoot: out });
+    placeFacadeFor(layout);
+    const run = runGenerator([`--commit=${OTHER_COMMIT}`, `--out-root=${out}`]);
     assert.equal(run.status, 0, run.stderr);
-    const layout = vendorLayout({ commit: parent, outRoot: out });
-    assert.equal(layout.vendorRelative, `vendor/analytics-${parent.slice(0, 8)}`);
-    assert.equal(layout.parityRelative, `analytics-v2-test/kernel-parity-${parent.slice(0, 8)}`);
-    assert.deepEqual(readdirSync(join(out, "vendor")), [`analytics-${parent.slice(0, 8)}`]);
-    assert.deepEqual(readdirSync(join(out, "analytics-v2-test")), [`kernel-parity-${parent.slice(0, 8)}`]);
+    assert.deepEqual(JSON.parse(run.stdout).verified, { standaloneBundle: true, closureModules: JSON.parse(run.stdout).verified.closureModules, load: true, typecheck: true });
+    assert.equal(layout.vendorRelative, `vendor/analytics-${OTHER_COMMIT.slice(0, 8)}`);
+    assert.equal(layout.parityRelative, `analytics-v2-test/kernel-parity-${OTHER_COMMIT.slice(0, 8)}`);
+    assert.deepEqual(readdirSync(join(out, "vendor")), [`analytics-${OTHER_COMMIT.slice(0, 8)}`]);
+    assert.deepEqual(readdirSync(join(out, "analytics-v2-test")), [`kernel-parity-${OTHER_COMMIT.slice(0, 8)}`]);
     const manifest = JSON.parse(readFileSync(join(layout.vendorRoot, MANIFEST_FILE), "utf8"));
-    assert.equal(manifest.sourceCommit, parent);
+    assert.equal(manifest.sourceCommit, OTHER_COMMIT);
     assert.deepEqual(manifest.exportPatches.map((patch) => patch.symbol), PINNED_PATCH_SPECS.map((spec) => spec.symbol));
     const tree = describeTree(layout, manifest.exportPatches);
+    // The same assertions as every committed tree, over the regenerated one.
     assertManifestPins(tree);
     assertFilesMatchCommit(tree);
     assertDirectoryHoldsManifestFiles(tree);
+    assertFacadeProvenance(tree);
     assertPackagesComplete(tree);
     assertParitySpecsRewritten(tree);
     assertNoCloudflareImports(tree);
-    for (const entry of manifest.parityTests) assert.ok(entry.rewrite.to.includes(`vendor/analytics-${parent.slice(0, 8)}/`), entry.path);
-    for (const file of AUTHORED_FILES) assert.ok(readFileSync(join(layout.vendorRoot, file)).equals(readFileSync(join(DEFAULT_LAYOUT.vendorRoot, file))));
+    await assertVendoredClosure(tree);
+    await assertFacadeBundlesAndPrepares(tree);
+    await assertTypeStubs(tree);
+    assertTscConsumer(tree);
+    for (const entry of manifest.parityTests) assert.ok(entry.rewrite.to.includes(`vendor/analytics-${OTHER_COMMIT.slice(0, 8)}/`), entry.path);
+    assert.ok(readFileSync(join(layout.vendorRoot, "tsconfig.json")).equals(readFileSync(join(DEFAULT_LAYOUT.vendorRoot, "tsconfig.json"))));
+
+    // The regression: those modules are in the closure as files, not stubs, and
+    // they are exactly what an output-based closure misses at this commit.
+    const vendored = new Set(manifest.files.map((file) => file.path));
+    const stubbed = new Set(manifest.typeStubs.map((stub) => stub.source));
+    for (const path of TREE_SHAKEN_MODULES) {
+      assert.ok(vendored.has(path), `${path} must be vendored as a file`);
+      assert.ok(!stubbed.has(path), `${path} must not be replaced by a type stub`);
+    }
+    const { byEntry, outputInputs } = await vendoredClosure(tree);
+    const shaken = byEntry.kernel.filter((input) => !outputInputs.kernel.includes(input)).map((input) => input.slice(`${layout.vendorRelative}/`.length));
+    assert.ok(TREE_SHAKEN_MODULES.every((path) => shaken.includes(path)), `expected ${TREE_SHAKEN_MODULES.join(", ")} to be parsed but not in the bundle's outputs; got ${shaken.join(", ")}`);
+    // d43c8f92 itself keeps no such module, so this commit really does differ.
+    const base = JSON.parse(readFileSync(join(DEFAULT_LAYOUT.vendorRoot, MANIFEST_FILE), "utf8"));
+    assert.notDeepEqual(manifest.files.map((file) => file.path), base.files.map((file) => file.path));
+
     const first = snapshot(out);
-    const again = runGenerator([`--commit=${parent}`, `--out-root=${out}`]);
+    const again = runGenerator([`--commit=${OTHER_COMMIT}`, `--out-root=${out}`]);
     assert.equal(again.status, 0, again.stderr);
     assertSameFiles(snapshot(out), first, "second run");
   });
@@ -804,7 +970,194 @@ test("the generator never overwrites reviewed files or another commit's director
   });
 });
 
-test("the report resolves the patches at a commit, names drifted files and writes nothing", async () => {
+// ---------------------------------------------------------------------------
+// The closure is every parsed module, not the tree-shaken outputs
+// ---------------------------------------------------------------------------
+
+test("the closure keeps a module used only from dead code and drops a type-only import", async () => {
+  await withScratchAsync(async (dir) => {
+    writeFileSync(join(dir, "a.ts"), [
+      "import { b } from \"./b\";", "import type { T } from \"./t\";", "import { U } from \"./u\";",
+      "export function live(x: T): U { return x as unknown as U; }",
+      "function dead() { return b(); }", "void dead;", "",
+    ].join("\n"));
+    writeFileSync(join(dir, "b.ts"), "export function b() { return 1; }\n");
+    writeFileSync(join(dir, "t.ts"), "export type T = string;\n");
+    writeFileSync(join(dir, "u.ts"), "export type U = number;\n");
+    const result = await loadEsbuild().build({ absWorkingDir: realpathSync(dir), entryPoints: { a: "a.ts" }, bundle: true, write: false,
+      metafile: true, format: "esm", outdir: "out", logLevel: "silent" });
+    const [output] = Object.values(result.metafile.outputs);
+    // The defect in one line: the output's inputs forget b.ts although a.ts imports it for a value.
+    assert.deepEqual(Object.keys(output.inputs), ["a.ts"]);
+    assert.deepEqual(reachableInputs(result.metafile, "a.ts"), ["a.ts", "b.ts"]);
+    assert.throws(() => reachableInputs(result.metafile, "nowhere.ts"), refusedWith("CLOSURE_ENTRY_MISSING"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The generator proves the tree on its own before it writes anything
+// ---------------------------------------------------------------------------
+
+/** One regeneration of d43c8f92 into a scratch workspace, copied per case. */
+function withGeneratedBase(fn) {
+  return withWorkspace(async (out) => {
+    const run = runGenerator([`--commit=${COMMIT}`, `--out-root=${out}`, `--authored-from=${DEFAULT_LAYOUT.vendorRoot}`]);
+    assert.equal(run.status, 0, run.stderr);
+    return fn(out);
+  });
+}
+
+test("the generator refuses a facade that re-exports a name its module no longer has, and keeps the existing output", async () => {
+  await withGeneratedBase((out) => {
+    const layout = vendorLayout({ commit: COMMIT, outRoot: out });
+    const before = snapshot(out);
+    const facade = join(layout.vendorRoot, "entry.ts");
+    // esbuild bundles this without a word; only tsc reports the missing member.
+    writeFileSync(facade, readFileSync(facade, "utf8").replace("  evaluateSharedCacheDay,\n", "  evaluateSharedCacheDay,\n  noSuchExportAnywhere,\n"));
+    const run = runGenerator([`--commit=${COMMIT}`, `--out-root=${out}`]);
+    assert.equal(run.status, 1);
+    assert.match(run.stderr, /^VENDORED_TREE_TYPECHECK_FAILED: .*TS2305.*noSuchExportAnywhere/);
+    assert.equal(run.stdout, "");
+    writeFileSync(facade, readFileSync(join(DEFAULT_LAYOUT.vendorRoot, "entry.ts")));
+    assertSameFiles(snapshot(out), before, "after a refused run");
+  });
+});
+
+test("the standalone verifier refuses a written tree that cannot be bundled, loaded or typechecked", async () => {
+  await withGeneratedBase(async (out) => {
+    const base = vendorLayout({ commit: COMMIT, outRoot: out });
+    const manifest = JSON.parse(readFileSync(join(base.vendorRoot, MANIFEST_FILE), "utf8"));
+    const expectedReach = new Map(manifest.files.filter((file) => file.reach !== "package").map((file) => [file.path, file.reach]));
+    const ambientTypes = join(dirname(out), "worker-configuration.d.ts");
+    writeFileSync(ambientTypes, git(["show", `${COMMIT}:apps/worker/worker-configuration.d.ts`]));
+    /** A copy of the generated tree that `change(layout)` may damage, then verified. */
+    const verifying = async (change, options = {}) => {
+      const copy = join(dirname(out), `case-${Math.random().toString(16).slice(2)}`);
+      mkdirSync(copy);
+      cpSync(out, copy, { recursive: true });
+      const layout = vendorLayout({ commit: COMMIT, outRoot: copy });
+      change?.(layout);
+      return verifyVendoredTree({ layout, expectedReach, ambientTypes, ...options });
+    };
+    const rejects = (promise, code, pattern) => assert.rejects(promise, (error) => error instanceof VendorError && error.code === code
+      && (pattern === undefined || pattern.test(error.message)), `${code} ${pattern ?? ""}`);
+
+    const passed = await verifying();
+    assert.ok(passed.closureModules >= expectedReach.size, "the closure covers every vendored non-package file");
+    assert.ok(passed.exports > 0);
+
+    // 1. A file the facade needs for a value is gone: the tree cannot be bundled.
+    const needed = "apps/worker/src/d1-invocation-budget.ts";
+    assert.ok(expectedReach.has(needed));
+    await rejects(verifying((layout) => rmSync(join(layout.vendorRoot, needed))), "VENDORED_TREE_UNBUNDLABLE", /Could not resolve "\.\/d1-invocation-budget"/);
+    // 2. The closure the files give differs from the one the extraction found.
+    const fewer = new Map(expectedReach);
+    fewer.delete(needed);
+    await rejects(verifying(undefined, { expectedReach: fewer }), "VENDORED_CLOSURE_MISMATCH", /d1-invocation-budget/);
+    await rejects(verifying(undefined, { expectedReach: new Map([...expectedReach, ["apps/worker/src/not-reached.ts", "kernel"]]) }),
+      "VENDORED_CLOSURE_MISMATCH", /not-reached/);
+    // 3. A module that bundles but throws when it loads.
+    await rejects(verifying((layout) => {
+      const file = join(layout.vendorRoot, "apps/worker/src/cache-retention-values.ts");
+      writeFileSync(file, `${readFileSync(file, "utf8")}\nthrow new Error("boom at load");\n`);
+    }), "VENDORED_TREE_UNLOADABLE", /boom at load/);
+    // 4. A facade esbuild accepts and tsc does not.
+    await rejects(verifying((layout) => {
+      const file = join(layout.vendorRoot, "entry.ts");
+      writeFileSync(file, `${readFileSync(file, "utf8")}\nexport { missingFromModule } from "./apps/worker/src/cache-retention-values";\n`);
+    }), "VENDORED_TREE_TYPECHECK_FAILED", /missingFromModule/);
+    // 5. No ambient Worker types to check against.
+    await rejects(verifying(undefined, { ambientTypes: join(dirname(out), "absent.d.ts") }), "AMBIENT_TYPES_MISSING");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Provenance of the reviewed facade
+// ---------------------------------------------------------------------------
+
+test("the commits a facade names are found by the word commit or by a hex run that mixes digits and letters", () => {
+  assert.deepEqual(commitsNamedIn("a byte copy of commit d43c8f92 (the production Worker)"), ["d43c8f92"]);
+  assert.deepEqual(commitsNamedIn("commit DEADBEEF, and 0123456789abcdef0123456789abcdef01234567"),
+    ["0123456789abcdef0123456789abcdef01234567", "deadbeef"]);
+  // Words, plain numbers, short runs and longer digests are not commits.
+  assert.deepEqual(commitsNamedIn("a facade for the decade, 20260930, 1234567, deadbeef, abc123 and fed3 ".concat("a".repeat(64))), []);
+  assert.deepEqual(foreignCommitsNamed("commit d43c8f92 and 1234abcd", COMMIT), ["1234abcd"]);
+  assert.deepEqual(foreignCommitsNamed("commit d43c8f9 and d43c8f92a059d9c577776f7eca8a331eb305b8a6", COMMIT), []);
+  assert.deepEqual(foreignCommitsNamed("a facade that names no commit", COMMIT), []);
+  // A short id of digits only is a number to the heuristic; a known source commit makes it a mention.
+  assert.deepEqual(commitsNamedIn("copies of 22142599 and the date 20260930"), []);
+  assert.deepEqual(foreignCommitsNamed("copies of 22142599 and the date 20260930", COMMIT, ["221425991741f8de63181749e4189a35ad7eaaef"]), ["22142599"]);
+  assert.deepEqual(foreignCommitsNamed("copies of 22142599", "221425991741f8de63181749e4189a35ad7eaaef", ["221425991741f8de63181749e4189a35ad7eaaef"]), []);
+});
+
+test("a facade that names another commit is refused, whether seeded or already in place, and nothing is written", () => {
+  withScratch((out) => {
+    const seeded = runGenerator([`--commit=${OTHER_COMMIT}`, `--out-root=${out}`, `--authored-from=${DEFAULT_LAYOUT.vendorRoot}`]);
+    assert.equal(seeded.status, 1);
+    assert.match(seeded.stderr, new RegExp(`^AUTHORED_PROVENANCE_MISMATCH: .*names commit ${COMMIT.slice(0, 8)}, not ${OTHER_COMMIT.slice(0, 8)}`));
+    assert.equal(seeded.stdout, "");
+    assert.deepEqual(readdirSync(out), []);
+    const layout = vendorLayout({ commit: OTHER_COMMIT, outRoot: out });
+    mkdirSync(layout.vendorRoot, { recursive: true });
+    for (const file of AUTHORED_FILES) writeFileSync(join(layout.vendorRoot, file), readFileSync(join(DEFAULT_LAYOUT.vendorRoot, file)));
+    const before = snapshot(out);
+    const placed = runGenerator([`--commit=${OTHER_COMMIT}`, `--out-root=${out}`]);
+    assert.equal(placed.status, 1);
+    assert.match(placed.stderr, /^AUTHORED_PROVENANCE_MISMATCH: /);
+    assertSameFiles(snapshot(out), before, "after a refused facade");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The commit must be a commit: an annotated tag id is not
+// ---------------------------------------------------------------------------
+
+test("an annotated tag id and a tree id are refused as the source commit", () => {
+  withScratch((dir) => {
+    const run = (...args) => execFileSync("git", ["-c", "user.name=check", "-c", "user.email=check@example.invalid", "-c", "commit.gpgsign=false",
+      "-c", "tag.gpgsign=false", ...args], { cwd: dir, encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" } }).trim();
+    run("init", "-q");
+    writeFileSync(join(dir, "file"), "synthetic\n");
+    run("add", "file");
+    run("commit", "-q", "-m", "synthetic");
+    const commit = run("rev-parse", "HEAD");
+    run("tag", "-a", "annotated", "-m", "synthetic");
+    const tag = run("rev-parse", "annotated");
+    const tree = run("rev-parse", "HEAD^{tree}");
+    assert.ok(new Set([commit, tag, tree]).size === 3);
+    assert.doesNotThrow(() => assertSourceCommit(dir, commit));
+    for (const id of [tag, tree, "0".repeat(40)]) assert.throws(() => assertSourceCommit(dir, id), refusedWith("SOURCE_COMMIT_UNAVAILABLE"), id);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Consumers that name a vendored tree
+// ---------------------------------------------------------------------------
+
+test("every vendored-tree path named outside the trees names a tree that exists", () => {
+  // Adopting another commit means editing these (the receipt lists them). This
+  // cannot say which consumers a commit change must touch; it does catch one
+  // that still names a tree that was renamed or removed.
+  const repo = git(["rev-parse", "--show-toplevel"]).trim();
+  const out = execFileSync("git", ["grep", "-I", "-o", "-h", "-E", "vendor/analytics-[0-9a-f]{8}|kernel-parity(-[0-9a-f]{8})?", "--", ".",
+    ":(exclude)docs", ":(exclude)apps/worker/vendor", ":(exclude)apps/worker/analytics-v2-test/kernel-parity",
+    ":(exclude)apps/worker/analytics-v2-test/kernel-parity-*", ":(exclude)apps/worker/scripts/vendor-analytics-kernels.mjs",
+    ":(exclude)apps/worker/scripts/vendor-analytics-kernels.check.mjs"], { cwd: repo, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  const named = [...new Set(out.split("\n").filter(Boolean))].sort();
+  assert.ok(named.length > 0, "expected the analytics-v2 consumers to name the vendored tree");
+  for (const literal of named) {
+    const path = literal.startsWith("vendor/") ? join(WORKER_ROOT, literal) : join(WORKER_ROOT, "analytics-v2-test", literal);
+    assert.ok(existsSync(path), `a tracked file names ${literal}, which does not exist; update it with the tree that replaced it`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The report
+// ---------------------------------------------------------------------------
+
+test("the report resolves the patches at a commit, names drifted files, builds the tree on its own and writes nothing", async () => {
+  const porcelain = () => git(["status", "--porcelain", "--untracked-files=all", "--", "."]);
+  const before = porcelain();
   const reference = JSON.parse(readFileSync(join(DEFAULT_LAYOUT.vendorRoot, MANIFEST_FILE), "utf8"));
   const report = await reportAtCommit({ commit: COMMIT, reference, referenceDirectory: DEFAULT_LAYOUT.vendorRoot });
   assert.equal(report.ok, true);
@@ -816,11 +1169,15 @@ test("the report resolves the patches at a commit, names drifted files and write
   assert.deepEqual(report.drift.removed, []);
   assert.equal(report.drift.identical, report.drift.checked);
   assert.deepEqual(report.facade, { entry: "entry.ts", modules: report.facade.modules, unresolved: [] });
+  assert.deepEqual(report.provenance, { entry: "entry.ts", named: [COMMIT.slice(0, 8)], foreign: [] });
+  assert.equal(report.generation.status, "passed");
+  assert.equal(report.generation.counts.exportPatched, 5);
   // Against a reference whose recorded blobs are wrong the same commit reports every file as changed.
   const stale = { ...reference, files: reference.files.map((file) => ({ ...file, blob: "0".repeat(40) })), typeStubs: [], parityTests: [] };
   const drifted = await reportAtCommit({ commit: COMMIT, reference: stale });
   assert.equal(drifted.drift.changed.length, reference.files.length);
   assert.equal(drifted.facade, null);
+  assert.equal(drifted.provenance, null);
   const run = runGenerator(["--report"]);
   assert.equal(run.status, 0, run.stderr);
   assert.equal(JSON.parse(run.stdout).ok, true);
@@ -828,4 +1185,36 @@ test("the report resolves the patches at a commit, names drifted files and write
   assert.equal(missing.status, 1);
   assert.match(missing.stderr, /^REFERENCE_MANIFEST_MISSING: /);
   assert.equal(typeof main, "function");
+  assert.equal(porcelain(), before, "the report left files behind in the repository");
+});
+
+test("the report is never ok for a facade it cannot build with, one that names another commit, or one whose imports are gone", async () => {
+  const reference = JSON.parse(readFileSync(join(DEFAULT_LAYOUT.vendorRoot, MANIFEST_FILE), "utf8"));
+  // Another commit with d43c8f92's facade: everything builds, but the provenance text would be false there.
+  const other = await reportAtCommit({ commit: OTHER_COMMIT, reference, referenceDirectory: DEFAULT_LAYOUT.vendorRoot });
+  assert.equal(other.patchesOk, true);
+  assert.equal(other.generation.status, "passed");
+  assert.deepEqual(other.provenance.foreign, [COMMIT.slice(0, 8)]);
+  assert.equal(other.ok, false);
+  // No reference directory: there is no facade to build with, so no answer.
+  const bare = await reportAtCommit({ commit: COMMIT, reference });
+  assert.equal(bare.patchesOk, true);
+  assert.equal(bare.generation.status, "skipped");
+  assert.equal(bare.ok, false);
+  // A facade that imports a module the commit does not have.
+  await withScratchAsync(async (dir) => {
+    for (const file of AUTHORED_FILES) writeFileSync(join(dir, file), readFileSync(join(DEFAULT_LAYOUT.vendorRoot, file)));
+    writeFileSync(join(dir, "entry.ts"), `${readFileSync(join(dir, "entry.ts"), "utf8")}\nexport { nothing } from "./apps/worker/src/no-such-module";\n`);
+    const gone = await reportAtCommit({ commit: COMMIT, reference, referenceDirectory: dir });
+    assert.deepEqual(gone.facade.unresolved, ["apps/worker/src/no-such-module"]);
+    assert.equal(gone.generation.status, "skipped");
+    assert.equal(gone.ok, false);
+    // A facade the commit's files satisfy, with a rename the facade did not follow: the build says so.
+    writeFileSync(join(dir, "entry.ts"), `${readFileSync(join(DEFAULT_LAYOUT.vendorRoot, "entry.ts"), "utf8")}\nexport { missingFromModule } from "./apps/worker/src/cache-retention-values";\n`);
+    const renamed = await reportAtCommit({ commit: COMMIT, reference, referenceDirectory: dir });
+    assert.deepEqual(renamed.facade.unresolved, []);
+    assert.equal(renamed.generation.status, "refused");
+    assert.equal(renamed.generation.code, "VENDORED_TREE_TYPECHECK_FAILED");
+    assert.equal(renamed.ok, false);
+  });
 });

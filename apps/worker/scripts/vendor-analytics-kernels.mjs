@@ -7,14 +7,25 @@
 //
 // The closure is computed, not listed: esbuild bundles entry.ts (the reviewed
 // facade), the website normalizer and the copied parity specs from a
-// throwaway extraction of the commit, and its metafile names every runtime
-// input. Each input is then written byte-for-byte from its git blob. The three
-// workspace packages are vendored whole (package.json, index.js, index.d.ts and
-// src/**). The only edits are the `export ` tokens that EXPORT_PATCHES adds.
-// Type-only imports are erased by esbuild and are deliberately not vendored;
-// for the few Worker modules that vendored files name only for types, tsc
-// emits declaration stubs from the commit's sources so that tsc-checked
-// consumers of entry.ts still typecheck.
+// throwaway extraction of the commit, and its metafile names every module it
+// parsed for each entry (the input graph, not the tree-shaken output: a module
+// imported for a value but used only from dead code is still a module the
+// vendored files cannot do without). Each module is then written byte-for-byte
+// from its git blob. The three workspace packages are vendored whole
+// (package.json, index.js, index.d.ts and src/**). The only edits are the
+// `export ` tokens that EXPORT_PATCHES adds. Type-only imports are erased by
+// esbuild and are deliberately not vendored; for the few Worker modules that
+// vendored files name only for types, tsc emits declaration stubs from the
+// commit's sources so that tsc-checked consumers of entry.ts still typecheck.
+//
+// Nothing real is written until the tree has been proven on its own. The files
+// that would be written are staged in a temporary directory and, from those
+// files alone, every entry bundles, the closure re-derived from them equals the
+// extraction's, the bundled facade loads, and tsc accepts the facade under the
+// tree's own tsconfig.json (esbuild alone passes a facade that re-exports a
+// name its module no longer has). Any failure refuses the run and leaves the
+// existing output as it was. The reviewed entry.ts carries provenance text for
+// one commit, so a facade that names any other commit is refused too.
 //
 // Export patches are located BY SYMBOL, never by line number. Each patch names
 // a file, a symbol and the declaration kind ("function", "async function" or
@@ -32,16 +43,20 @@
 // `--out-root` writes vendor/ and analytics-v2-test/ under <dir> instead of
 // apps/worker (a scratch dry run). `--authored-from` seeds a NEW vendor
 // directory with the reviewed entry.ts and tsconfig.json from another one; it
-// refuses when the target already holds them. `--report` writes nothing: it
-// resolves every export patch at the commit and lists vendored files whose
-// blobs differ from a reference manifest (default: the vendored d43c8f92).
+// refuses when the target already holds them, and when that entry.ts names
+// another commit. `--report` writes nothing in the repository: it resolves
+// every export patch at the commit, lists blob drift against a reference
+// manifest (default: the vendored d43c8f92) and the facade imports that no
+// longer resolve, then builds the commit into a temporary directory it deletes
+// (the same closure, bundle, load and typecheck as a real run). Its `ok` means
+// "this commit can be vendored with this facade as it stands".
 // Verify with: node scripts/vendor-analytics-kernels.check.mjs
 
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
-  existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmdirSync, rmSync, symlinkSync, unlinkSync,
-  writeFileSync,
+  copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmdirSync, rmSync,
+  symlinkSync, unlinkSync, writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -232,7 +247,12 @@ export function reverseParityRewrite(text, { from, to }) {
 const REGEX_PRECEDING_WORDS = new Set([
   "return", "typeof", "instanceof", "in", "of", "new", "delete", "void", "throw", "case", "do", "else", "yield", "await",
 ]);
-const REGEX_PRECEDING_PUNCTUATION = new Set(["(", ",", "=", ":", "[", "!", "&", "|", "?", "{", ";", "+", "-", "*", "%", "<", ">", "~", "^"]);
+// A `/` after `}` starts a regex (a statement after a block); a division after a
+// `}` needs an object or function literal as its left operand, which real code
+// does not write. A `/` after `)` is a regex only when that `)` closes the header
+// of an if/while/for/with statement; `(a + b) / 2` and `f() / 2` are divisions.
+const REGEX_PRECEDING_PUNCTUATION = new Set(["(", ",", "=", ":", "[", "!", "&", "|", "?", "{", "}", ";", "+", "-", "*", "%", "<", ">", "~", "^"]);
+const STATEMENT_HEADER_WORDS = new Set(["if", "while", "for", "with"]);
 
 /** End offset of a regex literal that starts at `start`, or -1 when the slash is not one (a regex cannot span lines). */
 function regexLiteralEnd(text, start) {
@@ -258,7 +278,9 @@ function regexLiteralEnd(text, start) {
  * over the result see code only. Code inside `${}` stays visible. The scan is
  * deliberately small; it fails closed with SOURCE_UNLEXABLE on an unterminated
  * construct, and the parser-level export check in `verifyExportPatches` backs
- * it up.
+ * it up. It tells a regex from a division by the previous token, tracking
+ * which `)` closes an if/while/for/with header; what it cannot know, it gets
+ * wrong on one line at most (a regex cannot span lines).
  */
 export function maskNonCode(text) {
   const out = text.split("");
@@ -268,6 +290,8 @@ export function maskNonCode(text) {
   };
   const unlexable = (what, at) => { throw new VendorError("SOURCE_UNLEXABLE", `${what} at offset ${at}`); };
   const templateDepths = [];
+  // One entry per open `(`: true when it opens an if/while/for/with header.
+  const parenHeaders = [];
   let depth = 0;
   let inTemplate = false;
   let last = { kind: "none", text: "" };
@@ -311,7 +335,8 @@ export function maskNonCode(text) {
     }
     if (char === "`") { blank(index, index + 1); index += 1; inTemplate = true; continue; }
     if (char === "/") {
-      const regexAllowed = last.kind === "none" || (last.kind === "punct" && REGEX_PRECEDING_PUNCTUATION.has(last.text))
+      const regexAllowed = last.kind === "none"
+        || (last.kind === "punct" && (REGEX_PRECEDING_PUNCTUATION.has(last.text) || (last.text === ")" && last.closesHeader)))
         || (last.kind === "word" && REGEX_PRECEDING_WORDS.has(last.text));
       const end = regexAllowed ? regexLiteralEnd(text, index) : -1;
       if (end > 0) { blank(index, end); index = end; last = { kind: "value", text: "/" }; continue; }
@@ -331,9 +356,14 @@ export function maskNonCode(text) {
     if (/[\w$]/.test(char)) {
       let end = index + 1;
       while (end < length && /[\w$]/.test(text[end])) end += 1;
-      last = { kind: "word", text: text.slice(index, end) }; index = end;
+      const word = text.slice(index, end);
+      if (last.kind === "punct" && last.text === ".") last = { kind: "value", text: word }; // a property name, even `a.if`
+      else if (!(word === "await" && last.kind === "word" && last.text === "for")) last = { kind: "word", text: word }; // `for await (` is still a for header
+      index = end;
       continue;
     }
+    if (char === "(") { parenHeaders.push(last.kind === "word" && STATEMENT_HEADER_WORDS.has(last.text)); last = { kind: "punct", text: char }; index += 1; continue; }
+    if (char === ")") { last = { kind: "punct", text: char, closesHeader: parenHeaders.pop() === true }; index += 1; continue; }
     last = { kind: "punct", text: char }; index += 1;
   }
   if (inTemplate || templateDepths.length) unlexable("unterminated template literal", length);
@@ -592,15 +622,50 @@ function writeFile(path, bytes) {
   writeFileSync(path, bytes);
 }
 
+/** esbuild's build errors as one line: unique messages with their location, the first six. */
+function summarizeBuildFailure(error) {
+  const texts = [...new Set(error.errors.map((entry) => `${entry.text}${entry.location ? ` (${entry.location.file}:${entry.location.line})` : ""}`))];
+  return `${texts.slice(0, 6).join("; ")}${texts.length > 6 ? `; and ${texts.length - 6} more` : ""}`;
+}
+
 /**
- * Runs esbuild over a tree laid out like the vendor directory and returns the
- * runtime inputs of each named entry plus every bare import left external.
- * `@app-usagemonitor/*` must resolve through the tree's tsconfig.json paths;
- * any `cloudflare:` import fails the build.
+ * Every module esbuild parsed for one entry: the entry's input plus everything
+ * reachable over `metafile.inputs[*].imports` through non-external edges.
+ *
+ * This is deliberately NOT `metafile.outputs[*].inputs`. That list names only
+ * the modules whose code survived tree-shaking, so a module that is imported
+ * for a value but used only from dead code drops out of it, although the
+ * vendored files still import it and the bundle cannot resolve it without the
+ * file. Imports that TypeScript erases (`import type`, or names used only in
+ * type positions) are never resolved by esbuild and carry no resolved path, so
+ * they are not followed: only genuine type-only imports leave the closure.
  */
-export async function computeRuntimeClosure({ esbuild, root, entryPoints }) {
+export function reachableInputs(metafile, entryKey) {
+  if (!metafile.inputs[entryKey]) throw new VendorError("CLOSURE_ENTRY_MISSING", entryKey);
+  const seen = new Set([entryKey]);
+  const pending = [entryKey];
+  while (pending.length) {
+    for (const edge of metafile.inputs[pending.pop()].imports ?? []) {
+      if (edge.external || !metafile.inputs[edge.path] || seen.has(edge.path)) continue;
+      seen.add(edge.path);
+      pending.push(edge.path);
+    }
+  }
+  return [...seen].sort();
+}
+
+/**
+ * Bundles `entryPoints` (name -> path relative to `root`) and returns each
+ * entry's reachable inputs, every bare import left external, and each entry's
+ * bundled output. `@app-usagemonitor/*` resolves through the nearest
+ * tsconfig.json `paths` unless `packageFor(specifier, importer)` names a file;
+ * any `cloudflare:` import fails the build. A build error (an unresolved
+ * import) throws a VendorError carrying `failureCode` and esbuild's messages.
+ */
+async function bundleEntries({ esbuild, root, entryPoints, packageFor, failureCode }) {
   const externals = new Map();
   const cloudflare = [];
+  const outdir = join(root, ".closure-out");
   const result = await esbuild.build({
     absWorkingDir: root,
     entryPoints,
@@ -611,14 +676,18 @@ export async function computeRuntimeClosure({ esbuild, root, entryPoints }) {
     format: "esm",
     target: "node22",
     mainFields: ["module", "main"],
-    outdir: join(root, ".closure-out"),
+    outdir,
     logLevel: "silent",
     plugins: [{
       name: "vendor-closure-externals",
       setup(build) {
         build.onResolve({ filter: /.*/ }, (args) => {
           const spec = args.path;
-          if (spec.startsWith(".") || spec.startsWith("/") || spec.startsWith("@app-usagemonitor/")) return undefined;
+          if (spec.startsWith(".") || spec.startsWith("/")) return undefined;
+          if (spec.startsWith("@app-usagemonitor/")) {
+            const path = packageFor?.(spec, args.importer);
+            return path ? { path } : undefined;
+          }
           if (spec.startsWith("cloudflare:")) cloudflare.push(`${args.importer} -> ${spec}`);
           const name = spec.startsWith("node:") ? spec : spec.split("/").slice(0, spec.startsWith("@") ? 2 : 1).join("/");
           if (!externals.has(name)) externals.set(name, new Set());
@@ -627,19 +696,33 @@ export async function computeRuntimeClosure({ esbuild, root, entryPoints }) {
         });
       },
     }],
+  }).catch((error) => {
+    if (!Array.isArray(error?.errors)) throw error;
+    throw new VendorError(failureCode, summarizeBuildFailure(error));
   });
   if (cloudflare.length) throw new VendorError("CLOUDFLARE_IMPORT_IN_CLOSURE", cloudflare.join(", "));
   const byEntry = {};
-  for (const output of Object.values(result.metafile.outputs)) {
+  const bundles = {};
+  for (const [outputPath, output] of Object.entries(result.metafile.outputs)) {
     if (!output.entryPoint) continue;
     const name = Object.entries(entryPoints).find(([, file]) => output.entryPoint === posix.normalize(file.split(sep).join("/")))?.[0];
     if (!name) throw new VendorError("CLOSURE_ENTRY_UNMAPPED", output.entryPoint);
-    byEntry[name] = Object.keys(output.inputs).sort();
+    byEntry[name] = reachableInputs(result.metafile, output.entryPoint);
+    bundles[name] = result.outputFiles.find((file) => file.path === resolve(root, outputPath))?.contents;
   }
   for (const name of Object.keys(entryPoints)) {
     if (!byEntry[name]) throw new VendorError("CLOSURE_ENTRY_MISSING", name);
   }
-  return { byEntry, externals: [...externals.keys()].sort(), esbuildVersion: esbuild.version };
+  return { byEntry, bundles, externals: [...externals.keys()].sort(), esbuildVersion: esbuild.version };
+}
+
+/**
+ * The runtime closure of each entry, from a tree laid out like the vendor
+ * directory, as every module esbuild parsed for it (see `reachableInputs`).
+ */
+export async function computeRuntimeClosure({ esbuild, root, entryPoints }) {
+  const { byEntry, externals, esbuildVersion } = await bundleEntries({ esbuild, root, entryPoints, failureCode: "CLOSURE_BUILD_FAILED" });
+  return { byEntry, externals, esbuildVersion };
 }
 
 /** Entry points for a tree laid out like the vendor directory (paths relative to root). */
@@ -722,7 +805,7 @@ function removePreviousOutput(previous, layout) {
 }
 
 /** The commit must exist here as exactly this id, and as a commit (not a tag or tree that peels to one). */
-function assertSourceCommit(root, commit) {
+export function assertSourceCommit(root, commit) {
   const probe = spawnSync("git", ["rev-parse", "--verify", "--quiet", `${commit}^{commit}`], { cwd: root, encoding: "utf8" });
   if (probe.status !== 0 || probe.stdout.trim() !== commit) throw new VendorError("SOURCE_COMMIT_UNAVAILABLE", commit);
 }
@@ -736,13 +819,62 @@ function assertDirectoryCommit(layout) {
 }
 
 /**
+ * The commits a text names: a hex run of 7 to 40 digits that follows the word
+ * "commit", or that mixes digits with the letters a-f (which excludes English
+ * words and plain numbers). Lowercased, sorted, deduplicated.
+ */
+export function commitsNamedIn(text) {
+  const named = new Set();
+  for (const match of text.matchAll(/\b(commit\s+)?([0-9a-f]{7,40})\b/gi)) {
+    const token = match[2].toLowerCase();
+    if (match[1] || (/[0-9]/.test(token) && /[a-f]/.test(token))) named.add(token);
+  }
+  return [...named].sort();
+}
+
+/**
+ * The commits a reviewed entry.ts names that are not `commit`; an empty list
+ * means its provenance text holds. `knownCommits` are commits the facade is
+ * known to have been written for (the manifest beside it): any hex run of 7 to
+ * 40 digits that starts one of them counts as naming it, even a short id made
+ * only of digits that the heuristic above cannot tell from a number.
+ */
+export function foreignCommitsNamed(entryText, commit, knownCommits = []) {
+  const named = new Set(commitsNamedIn(entryText));
+  for (const match of entryText.matchAll(/\b[0-9a-f]{7,40}\b/gi)) {
+    const token = match[0].toLowerCase();
+    if (knownCommits.some((known) => known.startsWith(token))) named.add(token);
+  }
+  return [...named].sort().filter((token) => !commit.startsWith(token));
+}
+
+/**
+ * entry.ts carries provenance text ("a byte copy of commit ...") that is true
+ * for exactly one commit. Copying it into the directory of another commit would
+ * state a falsehood nobody reviewed, so a facade that names any other commit is
+ * refused. A facade that names no commit passes. The count of export tokens its
+ * header states cannot be checked; the author must keep it true.
+ */
+function assertAuthoredProvenance(layout, authoredDir) {
+  const manifest = existsSync(join(authoredDir, MANIFEST_FILE)) ? JSON.parse(readFileSync(join(authoredDir, MANIFEST_FILE), "utf8")) : null;
+  const foreign = foreignCommitsNamed(readFileSync(join(authoredDir, "entry.ts"), "utf8"), layout.commit,
+    typeof manifest?.sourceCommit === "string" ? [manifest.sourceCommit] : []);
+  if (foreign.length) {
+    throw new VendorError("AUTHORED_PROVENANCE_MISMATCH",
+      `${join(authoredDir, "entry.ts")} names commit ${foreign.join(", ")}, not ${layout.short}; review and correct its provenance text for ${layout.short} before it is used there`);
+  }
+}
+
+/**
  * Where the reviewed entry.ts and tsconfig.json come from. A vendor directory
  * that holds them keeps them (they are hand-written and never overwritten).
  * `authoredFrom` seeds a directory that holds neither, and is refused when it
- * holds either.
+ * holds either. Either way the facade's provenance text must not name another
+ * commit; a dry run (`--report`) turns that check off to see the rest.
  */
-function resolveAuthoredSource(layout, authoredFrom) {
+function resolveAuthoredSource(layout, authoredFrom, { provenance = true } = {}) {
   const own = AUTHORED_FILES.filter((file) => existsSync(join(layout.vendorRoot, file)));
+  let source;
   if (authoredFrom) {
     if (own.length) {
       throw new VendorError("AUTHORED_FILES_EXIST", `${layout.vendorRelative} already holds ${own.join(", ")}; --authored-from only seeds a directory that has none`);
@@ -751,14 +883,17 @@ function resolveAuthoredSource(layout, authoredFrom) {
     for (const file of AUTHORED_FILES) {
       if (!existsSync(join(dir, file))) throw new VendorError("AUTHORED_FILE_MISSING", `${join(dir, file)}`);
     }
-    return { dir, seeded: true };
-  }
-  for (const file of AUTHORED_FILES) {
-    if (!existsSync(join(layout.vendorRoot, file))) {
-      throw new VendorError("AUTHORED_FILE_MISSING", `${layout.vendorRelative}/${file} (seed a new vendor directory with --authored-from=<vendor dir>)`);
+    source = { dir, seeded: true };
+  } else {
+    for (const file of AUTHORED_FILES) {
+      if (!existsSync(join(layout.vendorRoot, file))) {
+        throw new VendorError("AUTHORED_FILE_MISSING", `${layout.vendorRelative}/${file} (seed a new vendor directory with --authored-from=<vendor dir>)`);
+      }
     }
+    source = { dir: layout.vendorRoot, seeded: false };
   }
-  return { dir: layout.vendorRoot, seeded: false };
+  if (provenance) assertAuthoredProvenance(layout, source.dir);
+  return source;
 }
 
 /**
@@ -766,11 +901,11 @@ function resolveAuthoredSource(layout, authoredFrom) {
  * directory (export patches applied, authored files copied), then deletes it.
  * Every export patch must resolve by symbol before anything is extracted.
  */
-export async function withSourceExtraction({ layout = DEFAULT_LAYOUT, authoredFrom } = {}, fn) {
+export async function withSourceExtraction({ layout = DEFAULT_LAYOUT, authoredFrom, provenance = true } = {}, fn) {
   const root = repoRoot();
   assertSourceCommit(root, layout.commit);
   assertDirectoryCommit(layout);
-  const authored = resolveAuthoredSource(layout, authoredFrom);
+  const authored = resolveAuthoredSource(layout, authoredFrom, { provenance });
   const tree = listTree(root, layout.commit, [WORKER_SRC, WORKER_TYPES, "apps/web/public",
     ...VENDORED_PACKAGES.map((pkg) => `packages/${pkg}`), ...paritySources().map(({ source }) => source)]);
   if (![...tree.keys()].some((path) => path.startsWith(`${WORKER_SRC}/`))) throw new VendorError("SOURCE_LAYOUT_UNEXPECTED", `${layout.commit} has no ${WORKER_SRC}`);
@@ -796,8 +931,11 @@ const RELATIVE_SPECIFIER = /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+)["'](\.{1,
 
 /**
  * Worker modules that vendored TypeScript names but that are not vendored.
- * The runtime closure is complete, so every such import is type-only; tsc
- * still resolves it. `exists` tells whether a path exists at the commit.
+ * The runtime closure holds every module esbuild parsed, so what is left over
+ * is imported only for types (esbuild erased it); tsc still resolves it. That
+ * is verified, not assumed: the written tree is bundled on its own, and an
+ * import that is not type-only fails there. `exists` tells whether a path
+ * exists at the commit.
  */
 export function typeOnlyFrontier(vendored, readVendored, exists) {
   const frontier = new Set();
@@ -903,9 +1041,115 @@ export function buildManifest({ layout, closure, files, typeStubs, parityTests, 
   };
 }
 
-export async function vendorAnalyticsKernels({ log = console.log, commit = SOURCE_COMMIT, outRoot = WORKER_ROOT, authoredFrom } = {}) {
+// ---------------------------------------------------------------------------
+// Standalone verification of the tree as it will be written
+// ---------------------------------------------------------------------------
+
+/** Entry points of a written tree: paths relative to its out root. */
+function writtenEntryPoints(layout) {
+  const entries = { kernel: `${layout.vendorRelative}/entry.ts` };
+  WEB_ROOTS.forEach((path, index) => { entries[`web${index}`] = `${layout.vendorRelative}/${path}`; });
+  PARITY_SPECS.forEach((spec, index) => { entries[`parity${index}`] = `${layout.parityRelative}/${spec}`; });
+  return entries;
+}
+
+/** Closure inputs of a written tree as `classifyClosure` reads them: vendor-relative, parity specs left whole. */
+function relativizeWrittenClosure(byEntry, layout) {
+  const relative = {};
+  for (const [name, inputs] of Object.entries(byEntry)) {
+    relative[name] = inputs.map((input) => {
+      if (input.startsWith(`${layout.vendorRelative}/`)) return input.slice(layout.vendorRelative.length + 1);
+      if (input.startsWith(`${layout.parityRelative}/`)) return input;
+      throw new VendorError("VENDORED_TREE_REACHES_OUTSIDE", `${name} reaches ${input}`);
+    });
+  }
+  return relative;
+}
+
+const reachLines = (reach) => [...reach].map(([path, value]) => `${value} ${path}`).sort();
+
+/**
+ * Proves a written tree stands on its own, from the files alone and
+ * independently of the extraction it came from. `layout` names a tree already
+ * on disk (the generator verifies a staged copy before it replaces anything):
+ *   1. every entry (the facade, the website normalizer, the parity specs)
+ *      bundles with esbuild, so no import is unresolved, including a module
+ *      that tree-shaking removed from the bundle's output;
+ *   2. the closure re-derived from the written files is exactly `expectedReach`;
+ *   3. the bundled facade loads;
+ *   4. tsc, under the tree's own tsconfig.json and the commit's Worker ambient
+ *      types, accepts the facade with no diagnostic. esbuild cannot do this
+ *      part: it bundles `export { renamed } from "./x"` silently when x has no
+ *      such export, and tsc reports it.
+ * Any failure throws a VendorError. It writes only `.verify`,
+ * `tsconfig.verify.json` and a `node_modules` link in the layout's root, which
+ * is why the generator runs it on a staged directory that it deletes.
+ */
+export async function verifyVendoredTree({ layout, expectedReach, ambientTypes, esbuild = loadEsbuild() }) {
+  // esbuild reports real paths; a temporary directory is often a symlink (macOS /var).
+  const root = realpathSync(layout.outRoot);
+  const parityRoot = join(root, layout.parityRelative);
+  const vendoredPackage = (specifier, importer) => (importer.startsWith(`${parityRoot}${sep}`)
+    ? join(root, layout.vendorRelative, "packages", specifier.slice("@app-usagemonitor/".length), "index.js") : undefined);
+  const built = await bundleEntries({ esbuild, root, entryPoints: writtenEntryPoints(layout), packageFor: vendoredPackage,
+    failureCode: "VENDORED_TREE_UNBUNDLABLE" });
+
+  const parityPrefix = `${layout.parityRelative}/`;
+  const reach = classifyClosure(relativizeWrittenClosure(built.byEntry, layout), { isParityInput: (input) => input.startsWith(parityPrefix) });
+  const want = reachLines(expectedReach);
+  const have = reachLines(reach);
+  const missing = want.filter((line) => !have.includes(line));
+  const extra = have.filter((line) => !want.includes(line));
+  if (missing.length || extra.length) {
+    throw new VendorError("VENDORED_CLOSURE_MISMATCH", `the written tree reaches ${extra.length ? extra.join(", ") : "nothing"} that the extraction did not`
+      + ` and does not reach ${missing.length ? missing.join(", ") : "nothing"} that it did`);
+  }
+
+  const verifyDir = join(root, ".verify");
+  mkdirSync(verifyDir, { recursive: true });
+  if (!existsSync(join(root, "node_modules"))) symlinkSync(join(WORKER_ROOT, "node_modules"), join(root, "node_modules"), "dir");
+  const bundlePath = join(verifyDir, "kernel.mjs");
+  writeFileSync(bundlePath, built.bundles.kernel);
+  let loaded;
+  try {
+    loaded = await import(pathToFileURL(bundlePath).href);
+  } catch (error) {
+    throw new VendorError("VENDORED_TREE_UNLOADABLE", String(error?.message ?? error));
+  }
+  if (!Object.keys(loaded).length) throw new VendorError("VENDORED_TREE_UNLOADABLE", "the bundled facade exports nothing");
+
+  if (!ambientTypes || !existsSync(ambientTypes)) throw new VendorError("AMBIENT_TYPES_MISSING", `${WORKER_TYPES} is not in the commit`);
+  copyFileSync(ambientTypes, join(verifyDir, "worker-configuration.d.ts"));
+  writeFileSync(join(root, "tsconfig.verify.json"), JSON.stringify({
+    extends: `./${layout.vendorRelative}/tsconfig.json`,
+    compilerOptions: { types: ["./.verify/worker-configuration.d.ts"] },
+    files: [`./${layout.vendorRelative}/entry.ts`],
+  }));
+  const tsc = spawnSync(join(WORKER_ROOT, "node_modules", ".bin", "tsc"), ["-p", "tsconfig.verify.json", "--pretty", "false"],
+    { cwd: root, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  if (tsc.error) throw new VendorError("VENDORED_TREE_TYPECHECK_FAILED", String(tsc.error));
+  if (tsc.status !== 0) {
+    const lines = `${tsc.stdout ?? ""}`.split("\n").filter(Boolean);
+    throw new VendorError("VENDORED_TREE_TYPECHECK_FAILED", `${lines.slice(0, 6).join("; ")}${lines.length > 6 ? `; and ${lines.length - 6} more` : ""}`);
+  }
+  return { closureModules: reach.size, exports: Object.keys(loaded).length };
+}
+
+/**
+ * Writes one commit's files under `layout`: the vendored files and type stubs,
+ * the parity specs and, when `authoredDir` is given, the reviewed facade and
+ * tsconfig.json copied from it. Returns nothing; callers decide what replaces
+ * what.
+ */
+function writeVendorTree(layout, { authoredDir, files, typeStubs, parityTests }) {
+  if (authoredDir) for (const file of AUTHORED_FILES) writeFile(join(layout.vendorRoot, file), readFileSync(join(authoredDir, file)));
+  for (const file of [...files, ...typeStubs]) writeFile(join(layout.vendorRoot, file.path), file.bytes);
+  for (const test of parityTests) writeFile(join(layout.outRoot, test.path), test.bytes);
+}
+
+export async function vendorAnalyticsKernels({ log = console.log, commit = SOURCE_COMMIT, outRoot = WORKER_ROOT, authoredFrom, provenance = true } = {}) {
   const layout = vendorLayout({ commit, outRoot });
-  return withSourceExtraction({ layout, authoredFrom }, async ({ scratch, tree, blobs, exportPlan, authored }) => {
+  return withSourceExtraction({ layout, authoredFrom, provenance }, async ({ scratch, tree, blobs, exportPlan, authored }) => {
     // 1. Runtime closure from the facade, the website normalizer and the parity specs.
     const esbuild = loadEsbuild();
     const parityInputs = new Set(paritySources().map(({ source }) => source));
@@ -947,14 +1191,25 @@ export async function vendorAnalyticsKernels({ log = console.log, commit = SOURC
       return { path: `${layout.parityRelative}/${rel}`, source, blob: tree.get(source).blob, rewrite, bytes: Buffer.from(text, "utf8") };
     });
 
-    // 4. Replace previous output, then write.
+    // 4. Prove the tree on its own before anything real is touched: stage exactly
+    //    the files that would be written, then bundle, load and typecheck the stage.
+    const stage = mkdtempSync(join(tmpdir(), "vendor-analytics-kernels-stage-"));
+    let verified;
+    try {
+      const staged = vendorLayout({ commit: layout.commit, outRoot: stage });
+      writeVendorTree(staged, { authoredDir: authored.dir, files, typeStubs, parityTests });
+      verified = await verifyVendoredTree({ layout: staged, expectedReach: reach, ambientTypes: join(scratch, WORKER_TYPES), esbuild });
+    } finally {
+      rmSync(stage, { recursive: true, force: true });
+    }
+
+    // 5. Replace previous output, then write.
     removePreviousOutput(readManifest(layout), layout);
-    if (authored.seeded) for (const file of AUTHORED_FILES) writeFile(join(layout.vendorRoot, file), readFileSync(join(authored.dir, file)));
-    for (const file of [...files, ...typeStubs]) writeFile(join(layout.vendorRoot, file.path), file.bytes);
-    for (const test of parityTests) writeFile(join(layout.outRoot, test.path), test.bytes);
+    writeVendorTree(layout, { authoredDir: authored.seeded ? authored.dir : undefined, files, typeStubs, parityTests });
     const manifest = buildManifest({ layout, closure, files, typeStubs, parityTests, exportPlan });
     writeFileSync(join(layout.vendorRoot, MANIFEST_FILE), `${JSON.stringify(manifest, null, 2)}\n`);
-    log(JSON.stringify({ status: "ok", sourceCommit: layout.commit, ...manifest.counts, externals: closure.externals }));
+    log(JSON.stringify({ status: "ok", sourceCommit: layout.commit, ...manifest.counts, externals: closure.externals,
+      verified: { standaloneBundle: true, closureModules: verified.closureModules, load: true, typecheck: true } }));
     return manifest;
   });
 }
@@ -1003,11 +1258,41 @@ export function facadeAgainstCommit(root, commit, referenceDirectory) {
 }
 
 /**
- * Writes nothing. Resolves every export patch at `commit`, confirms the
- * resolvable set with the parser, and (when a reference manifest is given)
- * lists the reference's files whose blobs differ at `commit` and the facade
- * imports that no longer resolve. `patchesOk` is the patch result alone;
- * `ok` also requires a facade that still resolves.
+ * Builds the commit's tree into a temporary directory that is deleted again,
+ * seeded from the reference directory's reviewed facade, with the provenance
+ * check off (the report states provenance separately, so one run shows every
+ * blocker). The generator's own refusals come back as `refused`.
+ */
+async function dryRunGeneration({ layout, referenceDirectory }) {
+  if (!referenceDirectory || !AUTHORED_FILES.every((file) => existsSync(join(referenceDirectory, file)))) {
+    return { status: "skipped", detail: `there is no reviewed ${AUTHORED_FILES.join(" and ")} to build with; pass --reference=<a vendor directory's ${MANIFEST_FILE}>` };
+  }
+  const scratch = mkdtempSync(join(tmpdir(), "vendor-analytics-kernels-report-"));
+  try {
+    const manifest = await vendorAnalyticsKernels({ commit: layout.commit, outRoot: scratch, authoredFrom: referenceDirectory,
+      provenance: false, log: () => {} });
+    return { status: "passed", counts: manifest.counts };
+  } catch (error) {
+    if (!(error instanceof VendorError)) throw error;
+    return { status: "refused", code: error.code, detail: error.message };
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Writes nothing in the repository. Resolves every export patch at `commit`,
+ * confirms the resolvable set with the parser, and (when a reference manifest
+ * is given) lists the reference's files whose blobs differ at `commit`, the
+ * facade imports that no longer resolve and the commits the facade's provenance
+ * text names. When the patches and the facade's imports resolve it then does
+ * what the generator does, into a temporary directory it deletes: the closure,
+ * the standalone bundle, the load and the typecheck of the facade (`generation`).
+ * `patchesOk` is the patch result alone. `ok` is the whole answer, "this commit
+ * can be vendored with this facade as it stands", and needs all four: the
+ * patches, a facade whose imports resolve, provenance text that names no other
+ * commit, and a passing generation. A report with no reference directory has no
+ * facade to build with, so it is never `ok`.
  */
 export async function reportAtCommit({ commit, reference, referenceDirectory } = {}) {
   const layout = vendorLayout({ commit });
@@ -1032,7 +1317,19 @@ export async function reportAtCommit({ commit, reference, referenceDirectory } =
     ...(PATCH_OK.has(status) ? {} : { detail }),
   }));
   const facade = referenceDirectory ? facadeAgainstCommit(root, layout.commit, referenceDirectory) : null;
+  const entryPath = referenceDirectory ? join(referenceDirectory, "entry.ts") : null;
+  const provenance = entryPath && existsSync(entryPath)
+    ? (() => {
+      const text = readFileSync(entryPath, "utf8");
+      const known = typeof reference?.sourceCommit === "string" ? [reference.sourceCommit] : [];
+      return { entry: "entry.ts", named: commitsNamedIn(text), foreign: foreignCommitsNamed(text, layout.commit, known) };
+    })()
+    : null;
   const patchesOk = resolutions.every((resolution) => PATCH_OK.has(resolution.status)) && verification.status === "passed";
+  const facadeOk = facade !== null && facade.unresolved.length === 0;
+  let generation = { status: "skipped", detail: "a patch did not resolve" };
+  if (patchesOk && !facadeOk) generation = { status: "skipped", detail: facade ? "the facade imports modules the commit no longer has" : "there is no reviewed facade to build with" };
+  else if (patchesOk) generation = await dryRunGeneration({ layout, referenceDirectory });
   return {
     commit: layout.commit,
     vendorDirectory: layout.vendorRelative,
@@ -1041,9 +1338,10 @@ export async function reportAtCommit({ commit, reference, referenceDirectory } =
     verification,
     drift: reference ? driftAgainstReference(root, layout.commit, reference) : null,
     facade,
+    provenance,
+    generation,
     patchesOk,
-    // The commit can be vendored with this facade only when the patches resolve and the facade's imports all exist.
-    ok: patchesOk && (facade === null || facade.unresolved.length === 0),
+    ok: patchesOk && facadeOk && provenance !== null && provenance.foreign.length === 0 && generation.status === "passed",
   };
 }
 
