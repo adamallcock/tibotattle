@@ -34,8 +34,8 @@ import {
   verifyVendoredTree, WEB_ROOTS, STABLE_PARITY_RELATIVE, STABLE_VENDOR_RELATIVE, vocabulariesOfTree, workerIndexAt,
 } from "./vendor-analytics-kernels.mjs";
 import {
-  changedVocabularies, communityDailyReadSchemaVersion, constructedReasons, importedCallees, interfaceMembers,
-  renderKernelVocabularies, VOCABULARY_RELATIVE, VOCABULARY_SCHEMA, VocabularyError,
+  bundledConstructedReasons, changedVocabularies, communityDailyReadSchemaVersion, constructedReasons, interfaceMembers,
+  REFUSAL_CLASSES, renderKernelVocabularies, VOCABULARY_RELATIVE, VOCABULARY_SCHEMA, VocabularyError,
 } from "./analytics-kernel-vocabularies.mjs";
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -1346,7 +1346,8 @@ test("the report is never ok for a facade it cannot build with, one that names a
 const refusedVocabulary = (code) => (error) => (error instanceof VocabularyError || error instanceof VendorError) && error.code === code;
 
 test("refusal reasons are the plain literals a class is constructed with, and anything else refuses", () => {
-  const reasons = (text) => constructedReasons({ text, path: "apps/worker/src/x.ts", className: "Refused", maskNonCode });
+  const defining = "apps/worker/src/defining.ts";
+  const reasons = (text, path = "apps/worker/src/x.ts") => constructedReasons({ text, path, className: "Refused", definingPath: defining, maskNonCode });
   assert.deepEqual(reasons("throw new Refused('a_b');\nthrow new Refused(\"c\");\nif (x) throw new Refused( 'a_b' );\n"), ["a_b", "c"]);
   // Decoys in comments, strings and templates, and other classes, are not constructions.
   assert.deepEqual(reasons([
@@ -1354,10 +1355,60 @@ test("refusal reasons are the plain literals a class is constructed with, and an
     "const t = `new Refused('in_template')`;", "throw new NotRefused('other_class');", "throw new RefusedLater('prefix');", "",
   ].join("\n")), []);
   for (const bad of ["new Refused(reason);", "new Refused(`a`);", "new Refused('a' + b);", "new Refused('a', 1);",
-    "new Refused('Not-A-Reason');", "new Refused();", "new Refused(\n  cond ? 'a' : 'b');"]) {
+    "new Refused('Not-A-Reason');", "new Refused();", "new Refused(\n  cond ? 'a' : 'b');", "new Refused;",
+    "const f = (r) => new Refused(r);"]) {
     assert.throws(() => reasons(`${bad}\n`), refusedVocabulary("VOCABULARY_REASON_NOT_LITERAL"), bad);
   }
   assert.throws(() => reasons("class Mine extends Refused {}\nthrow new Mine('x');\n"), refusedVocabulary("VOCABULARY_REFUSAL_CLASS_EXTENDED"));
+
+  // The forms a source may name the class in: a plain import (type-only too),
+  // instanceof, and in the defining module its one declaration and a local export.
+  assert.deepEqual(reasons([
+    "import { other, Refused, type Kind } from './defining';", "import type { Refused } from './defining';",
+    "if (error instanceof Refused) throw new Refused('kept');", "",
+  ].join("\n")), ["kept"]);
+  assert.deepEqual(reasons([
+    "export class Refused extends Error {}", "function f() { throw new Refused('own'); }", "export { f, Refused };", "",
+  ].join("\n"), defining), ["own"]);
+  assert.throws(() => reasons("throw new Refused('x');\n", defining), refusedVocabulary("VOCABULARY_SOURCE_CHANGED"));
+  assert.throws(() => reasons("export class Refused extends Error {}\nclass Refused2 {}\nexport class Refused extends Error {}\n", defining),
+    refusedVocabulary("VOCABULARY_SOURCE_CHANGED"));
+  assert.throws(() => reasons("class Refused extends Error {}\nthrow new Refused('x');\n"), refusedVocabulary("VOCABULARY_SOURCE_CHANGED"));
+
+  // Anything that could construct the class under another name refuses rather than under-reports.
+  for (const bad of [
+    "import { Refused as U } from './defining';\nthrow new U('aliased_reason');",
+    "import { other, Refused as U } from \"./defining\";\nthrow new U('aliased_reason');",
+    "import { Thing as Refused } from './elsewhere';\nthrow new Refused('borrowed');",
+    "import * as R from './defining';\nthrow new R.Refused('ns_reason');",
+    "import * as R from './defining.ts';\nthrow new R['Refused']('computed_member');",
+    "import Default, * as R from '../src/defining';\nR.thing();",
+    "export * from './defining';",
+    "export * as R from './defining';",
+    "const m = await import('./defining');\nthrow new m.Refused('dynamic');",
+    "const m = await import(name);",
+    "const E = Refused;\nthrow new E('var_reason');",
+    "throw Reflect.construct(Refused, ['reflected']);",
+    "const table = { Refused };",
+    "throw new errors.Refused('member');",
+    "if (e instanceof Refused.prototype.constructor) {}",
+    "export { Refused } from './defining';",
+    "import { Refused } from './defining';\nexport { Refused };",
+    "export { Refused as Other } from './defining';",
+  ]) assert.throws(() => reasons(`${bad}\n`), refusedVocabulary("VOCABULARY_REFUSAL_CLASS_ALIASED"), bad);
+  // A namespace or dynamic import of another module is not a route to the class.
+  assert.deepEqual(reasons("import * as other from './other';\nconst m = await import('./elsewhere');\nthrow new Refused('ok');\n"), ["ok"]);
+});
+
+test("the reasons a bundle constructs are its plain literals, and a renamed class refuses", () => {
+  const bundled = (text) => bundledConstructedReasons({ text, className: "Refused", maskNonCode });
+  assert.deepEqual(bundled("var Refused = class extends Error {};\nfunction a() { throw new Refused(\"b_c\"); }\n// new Refused(\"dead\")\nthrow new Refused('a');\n"),
+    ["b_c", "a"]);
+  assert.throws(() => bundled("var Refused2 = class extends Error {};\nthrow new Refused2(\"hidden\");\n"), refusedVocabulary("VOCABULARY_PROBE_RENAMED"));
+  assert.throws(() => bundled("throw new Refused(reason);\n"), refusedVocabulary("VOCABULARY_REASON_NOT_LITERAL"));
+  assert.deepEqual(Object.keys(REFUSAL_CLASSES).sort(), ["cache", "shared"]);
+  assert.deepEqual(REFUSAL_CLASSES.cache, { className: "CacheRetentionRefusedError", definingPath: "apps/worker/src/cache-retention-values.ts" });
+  assert.deepEqual(REFUSAL_CLASSES.shared, { className: "SharedAnalyticsUnavailable", definingPath: "apps/worker/src/analytics-shared-reducers.ts" });
 });
 
 test("interface members are read in declaration order, and a member the rule cannot read refuses", () => {
@@ -1372,25 +1423,6 @@ test("interface members are read in declaration order, and a member the rule can
     "interface D {\n  a: number;\n}\n",
     "interface C {\n}\n",
   ]) assert.throws(() => members(bad), refusedVocabulary("VOCABULARY_SOURCE_CHANGED"), bad);
-});
-
-test("the cache family's source is the imported cache reducers one function calls", () => {
-  const callees = (body) => importedCallees({ functionName: "evaluate", modulePrefix: "./cache-retention-", path: "x.ts", maskNonCode, text: [
-    "import { reduceX, other as renamed, type T } from \"./cache-retention-values\";",
-    "import { helper } from './cache-retention-day';",
-    "import { unrelated } from \"./elsewhere\";",
-    "export function evaluate(input: { day: string; days: readonly T[] }): R {",
-    body,
-    "}",
-    "function later() { return helper(); }",
-    "",
-  ].join("\n") });
-  assert.deepEqual(callees("  unrelated();\n  return reduceX(input);"), [{ name: "reduceX", module: "./cache-retention-values" }]);
-  assert.deepEqual(callees("  // helper(input);\n  return reduceX(reduceX(input));"), [{ name: "reduceX", module: "./cache-retention-values" }]);
-  assert.deepEqual(callees("  helper();\n  return renamed(input);"),
-    [{ name: "helper", module: "./cache-retention-day" }, { name: "renamed", module: "./cache-retention-values" }]);
-  assert.throws(() => importedCallees({ functionName: "absent", modulePrefix: "./c", path: "x.ts", maskNonCode, text: "function a() {}\n" }),
-    refusedVocabulary("VOCABULARY_SOURCE_CHANGED"));
 });
 
 test("the community daily read version is the one schemaVersion literal of the Worker entry", () => {
@@ -1420,6 +1452,13 @@ test("a kernel change to any vocabulary changes the derivation, and a change the
     };
     const reducers = "apps/worker/src/analytics-shared-reducers.ts";
     const cache = "apps/worker/src/cache-retention-values.ts";
+    const events = "apps/worker/src/cache-retention-events.ts";
+    const day = "apps/worker/src/cache-retention-day.ts";
+    /** `text` with `from` replaced once; `from` must be there, so a moved anchor fails here rather than testing nothing. */
+    const swap = (text, from, to) => {
+      assert.ok(text.includes(from), `anchor not found: ${from}`);
+      return text.replace(from, to);
+    };
 
     // Unchanged files give the committed module.
     assert.equal(renderKernelVocabularies(await derive()), committed);
@@ -1442,15 +1481,50 @@ test("a kernel change to any vocabulary changes the derivation, and a change the
     const version = await derive(undefined, index.replace("community-daily-read-v1.0", "community-daily-read-v1.1"));
     assert.deepEqual(changedVocabularies(committed, renderKernelVocabularies(version)), ["KERNEL_COMMUNITY_DAILY_READ_SCHEMA_VERSION"]);
 
-    // Refusals: a dynamic reason, a cache family routed elsewhere, a counter the
-    // reducer does not emit, and a Worker entry with no single read version.
+    // The cache family is every construction the facade reaches, however many
+    // modules away: a helper in another module that reduceCacheRetentionDay
+    // calls adds its reason ...
+    const transitive = await derive((read, write) => {
+      write(events, `${swap(read(events),
+        "import { validCacheRetentionToken, type CacheRetentionItem } from './cache-retention-values';",
+        "import { CacheRetentionRefusedError, validCacheRetentionToken, type CacheRetentionItem } from './cache-retention-values';")}
+export function probeTransitiveRefusal(): never { throw new CacheRetentionRefusedError("transitive_reason"); }\n`);
+      write(cache, `import { probeTransitiveRefusal } from "./cache-retention-events";\n${swap(read(cache),
+        "  const dayEndMs = dayStartMs + 86_400_000;\n  const previous = new Map<string, CacheRetentionEvent>();",
+        "  if (eventsRead > 1_000_000_000_000) probeTransitiveRefusal();\n  const dayEndMs = dayStartMs + 86_400_000;\n  const previous = new Map<string, CacheRetentionEvent>();")}`);
+    });
+    assert.deepEqual(transitive.cacheRetentionRefusalReasons, ["transitive_reason", "session_limit_exceeded", "group_limit_exceeded"]);
+    assert.deepEqual(changedVocabularies(committed, renderKernelVocabularies(transitive)), ["KERNEL_CACHE_RETENTION_REFUSAL_REASONS"]);
+    // ... and so does a D1 day lane once the facade exposes it ...
+    const exposed = await derive((read, write) => write("entry.ts", swap(read("entry.ts"),
+      "export { cacheRetentionEventFromRecord, cacheRetentionSessionDigest } from",
+      "export { cacheRetentionEventFromRecord, cacheRetentionSessionDigest, createCacheRetentionDayReader } from")));
+    for (const reason of ["day_page_limit_exceeded", "usage_row_refused", "session_limit_exceeded", "group_limit_exceeded"]) {
+      assert.ok(exposed.cacheRetentionRefusalReasons.includes(reason), reason);
+    }
+    assert.deepEqual(changedVocabularies(committed, renderKernelVocabularies(exposed)), ["KERNEL_CACHE_RETENTION_REFUSAL_REASONS"]);
+    // ... while a construction nothing reachable calls is left out.
+    const dead = await derive((read, write) => write(cache,
+      `${read(cache)}\nfunction unreachableProbe(): never { throw new CacheRetentionRefusedError("dead_reason"); }\n`));
+    assert.equal(renderKernelVocabularies(dead), committed);
+
+    // Refusals: a dynamic reason, a refusal class reached under another name, a
+    // counter the reducer does not emit, and a Worker entry with no single read version.
     await assert.rejects(derive((read, write) => write(reducers,
       `${read(reducers)}\nexport function probeOnly(reason: string): never { throw new SharedAnalyticsUnavailable(reason); }\n`)),
     refusedVocabulary("VOCABULARY_REASON_NOT_LITERAL"));
-    await assert.rejects(derive((read, write) => write(reducers, read(reducers).replace(
-      "  const sessions = new Set(own.cacheItems.map(item => item.sessionDigest));",
-      "  cacheRetentionSessionDigest(input.ownerDigest);\n  const sessions = new Set(own.cacheItems.map(item => item.sessionDigest));"))),
-    refusedVocabulary("VOCABULARY_SOURCE_CHANGED"));
+    await assert.rejects(derive((read, write) => write(day, swap(read(day),
+      "  CacheRetentionRefusedError,\n  applyCacheRetentionReducerCarryPage,", "  CacheRetentionRefusedError as DayRefused,\n  applyCacheRetentionReducerCarryPage,"))),
+    refusedVocabulary("VOCABULARY_REFUSAL_CLASS_ALIASED"));
+    await assert.rejects(derive((read, write) => write(reducers,
+      `${read(reducers)}\nconst Unavailable = SharedAnalyticsUnavailable;\nexport function probeOnly(): never { throw new Unavailable('local_alias'); }\n`)),
+    refusedVocabulary("VOCABULARY_REFUSAL_CLASS_ALIASED"));
+    // A construction in the bundle that no vendored source scan read (here, in
+    // the facade itself, under an alias the bundler resolves) refuses too.
+    await assert.rejects(derive((read, write) => write("entry.ts", `${read("entry.ts")}
+import { CacheRetentionRefusedError as FacadeRefused } from "./apps/worker/src/cache-retention-values";
+export function probeFacade(): never { throw new FacadeRefused("facade_reason"); }\n`)),
+    refusedVocabulary("VOCABULARY_PROBE_DISAGREES"));
     await assert.rejects(derive((read, write) => write(cache, read(cache).replace(
       "  readonly excludedContextContracted: number;\n  readonly sessions: number;",
       "  readonly excludedContextContracted: number;\n  readonly excludedOther: number;\n  readonly sessions: number;"))),

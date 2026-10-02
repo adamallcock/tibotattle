@@ -4,10 +4,19 @@
 // scripts/vendor-analytics-kernels.check.mjs). A re-vendor that changes a
 // kernel vocabulary regenerates that module, and this spec then fails until
 // every GCP copy, including the primary 0059 CHECK sets, has been ported.
+//
+// The named copies are compared exactly. Copies this spec does not name are
+// found by scanning the GCP code (see COPY_ROOTS): a read schema version, a
+// band list or a counter list there must hold the whole kernel vocabulary, so
+// a copy added later, or one that arrives with another branch, is checked too.
 import { readdirSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import {
+  ANALYTICS_V2_CACHE_COUNTERS as PARITY_CACHE_COUNTERS,
+  REFUSAL_REASONS as PARITY_REFUSAL_REASONS,
+} from "../scripts/analytics-v2-owner-parity-compare.mjs";
 import { ANALYTICS_V2_CACHE_RETENTION_BAND_IDS } from "../src/analytics-v2/cache-windows-sql";
 import { ANALYTICS_V2_COMMUNITY_DAILY_SCHEMA_VERSION } from "../src/analytics-v2/community-daily-route";
 import { ANALYTICS_V2_MODEL_DATES } from "../src/analytics-v2/compute";
@@ -40,6 +49,56 @@ const MIGRATION_DIRECTORIES = ["postgres/migrations/primary", "postgres/staged-m
 const GCP_OWN_REFUSAL_REASONS = ["non_effective_source_unported", "day_occurrences_exceeded", "memory_budget"];
 
 const sorted = (values: readonly string[]) => [...values].sort();
+const camelCase = (name: string) => name.replace(/_([a-z])/g, (_, letter: string) => letter.toUpperCase());
+
+/**
+ * Whether a migration file comes after 0059: every primary migration but 0059
+ * itself and the numbered ones before it, so a staged NNNN_ placeholder counts.
+ */
+function laterMigration(name: string): boolean {
+  return name.endsWith(".sql") && name !== MIGRATION && !(/^\d{4}_/.test(name) && name < MIGRATION);
+}
+
+/**
+ * Whether a later migration touches a closed set this spec reads from 0059:
+ * it names analytics_v2_cache_bands (the band CHECK and the counter columns),
+ * names analytics_v2_owner_day together with its refusal column or constraint,
+ * or restates a refusal or band set in any CHECK form (`IN (...)`,
+ * `= ANY (ARRAY[...])`, `<> ALL (...)`).
+ */
+function touchesClosedSet(sql: string): boolean {
+  return /analytics_v2_cache_bands/i.test(sql)
+    || (/analytics_v2_owner_day/i.test(sql) && /refusal/i.test(sql))
+    || /\b(?:refusal|band)\b"?\)?\s*(?:::\s*[a-z_ ]+(?:\[\])?\s*\)?\s*)?(?:(?:NOT\s+)?IN\s*\(|(?:=|<>|!=)\s*(?:ANY|ALL)\s*\()/i.test(sql);
+}
+
+/**
+ * Where GCP code may hold a vocabulary copy, relative to apps/worker. Tests,
+ * checks and their fixtures are left out: they may quote an old or invalid
+ * value on purpose.
+ */
+const COPY_ROOTS = ["src/analytics-v2", "cloud-run", "scripts", "postgres"];
+const COPY_SKIPPED_DIRECTORIES = new Set(["node_modules", "dist"]);
+const COPY_FILE = /\.(?:ts|mjs|js|sql)$/;
+const TEST_FILE = /\.(?:check|spec|test)\.[cm]?[jt]s$/;
+
+function copyCandidates(): { readonly path: string; readonly text: string }[] {
+  const files: { path: string; text: string }[] = [];
+  const walk = (directory: string) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        if (!entry.name.startsWith(".") && !COPY_SKIPPED_DIRECTORIES.has(entry.name)) walk(path);
+      } else if (entry.isFile() && COPY_FILE.test(entry.name) && !TEST_FILE.test(entry.name)) {
+        files.push({ path: relative(WORKER_ROOT, path).split(sep).join("/"), text: readFileSync(path, "utf8") });
+      }
+    }
+  };
+  for (const root of COPY_ROOTS) walk(join(WORKER_ROOT, root));
+  return files.sort((left, right) => (left.path < right.path ? -1 : 1));
+}
+
+const named = (text: string, word: string) => new RegExp(`(?<![\\w$])${word}(?![\\w$])`).exec(text)?.index ?? -1;
 
 /** The quoted members of the `<column> ... CHECK (<column> IN (...))` list in a migration's text. */
 function checkInList(sql: string, column: string): string[] {
@@ -58,7 +117,7 @@ function migrationText(): { readonly sql: string; readonly later: readonly strin
   });
   const own = files.filter((file) => file.name === MIGRATION);
   expect(own, `${MIGRATION} must exist exactly once (promoted or staged)`).toHaveLength(1);
-  const later = files.filter((file) => /^\d{4}_/.test(file.name) && file.name > MIGRATION).map((file) => file.path);
+  const later = files.filter((file) => laterMigration(file.name)).map((file) => file.path);
   return { sql: readFileSync(own[0].path, "utf8"), later };
 }
 
@@ -102,10 +161,66 @@ describe("GCP-only vocabularies equal the vendored kernels'", () => {
     expect(table).not.toBeNull();
     const counters = [...table![1].matchAll(/^ {2}([a-z_]+) bigint NOT NULL CHECK \(\1 >= 0\),$/gm)].map((column) => column[1]);
     expect(counters).toEqual([...KERNEL_CACHE_BAND_COUNTERS]);
-    // A later primary migration that redefines either closed set makes 0059 no
-    // longer the authority this spec reads: point the spec at that migration.
+    // A later primary migration, numbered or staged, that touches either closed
+    // set or the counter columns makes 0059 no longer the whole authority this
+    // spec reads: point the spec at that migration.
     for (const path of later) {
-      expect(readFileSync(path, "utf8"), `${path} redefines a closed analytics_v2 set`).not.toMatch(/\b(?:refusal|band)\s+IN\s*\(/);
+      expect(touchesClosedSet(readFileSync(path, "utf8")), `${path} touches a closed analytics_v2 set; repoint this spec at it`).toBe(false);
+    }
+  });
+
+  it("the later-migration guard sees staged placeholders and every way a closed set can be restated", () => {
+    for (const name of ["0060_x.sql", "0100_x.sql", "NNNN_x.sql", "nnnn_x.sql", "staged.sql"]) expect(laterMigration(name), name).toBe(true);
+    for (const name of [MIGRATION, "0058_x.sql", "0001_x.sql", "NNNN_x.md"]) expect(laterMigration(name), name).toBe(false);
+    for (const sql of [
+      "ALTER TABLE analytics_v2_cache_bands ADD COLUMN excluded_other bigint NOT NULL DEFAULT 0;",
+      "ALTER TABLE ONLY public.ANALYTICS_V2_CACHE_BANDS DROP CONSTRAINT analytics_v2_cache_bands_band_check;",
+      "ALTER TABLE analytics_v2_owner_day DROP CONSTRAINT analytics_v2_owner_day_refusal_check;",
+      "ALTER TABLE x ADD CONSTRAINT y CHECK (refusal IN ('a'));",
+      "ALTER TABLE x ADD CONSTRAINT y CHECK (band NOT IN ('a'));",
+      "CHECK ((refusal = ANY (ARRAY['a'::text, 'b'::text])))",
+      "CHECK (((band)::text = ANY ((ARRAY['a'::character varying])::text[])))",
+      "CHECK (\"refusal\" <> ALL ('{a}'::text[]))",
+    ]) expect(touchesClosedSet(sql), sql).toBe(true);
+    for (const sql of [
+      "CREATE INDEX analytics_v2_published_daily_day ON analytics_v2_published_daily(day);",
+      "-- served is the first GCP publication (any analytics_v2_published_daily row",
+      "ALTER TABLE analytics_v2_runs ADD COLUMN note text;",
+      "CREATE TABLE bands_of_x (id text PRIMARY KEY);",
+    ]) expect(touchesClosedSet(sql), sql).toBe(false);
+  });
+
+  it("the owner parity compare's counters and refusal mapping are the kernel's", () => {
+    expect([...PARITY_CACHE_COUNTERS]).toEqual(KERNEL_CACHE_BAND_COUNTERS.map(camelCase));
+    for (const [family, reasons] of Object.entries(PARITY_REFUSAL_REASONS)) {
+      for (const reason of reasons as readonly string[]) expect(ANALYTICS_V2_REFUSAL_REASONS, `${family}: ${reason}`).toContain(reason);
+    }
+  });
+
+  it("every other copy in GCP code holds the whole kernel vocabulary", () => {
+    const files = copyCandidates();
+    expect(files.some((file) => file.path === `postgres/migrations/primary/${MIGRATION}`)).toBe(true);
+    const counters = KERNEL_CACHE_BAND_COUNTERS.map((counter) => [counter, camelCase(counter)] as const);
+    const distinctive = counters.filter(([counter]) => counter.includes("_"));
+    for (const { path, text } of files) {
+      // The community daily read version: any mention is the kernel's.
+      for (const match of text.matchAll(/community-daily-read-v\d+(?:\.\d+)*/g)) {
+        expect(match[0], `${path} names a community daily read version`).toBe(KERNEL_COMMUNITY_DAILY_READ_SCHEMA_VERSION);
+      }
+      // A band list names every band, first in the kernel's order. A file that
+      // takes its bands from a checked constant derives them and is exempt.
+      const bandAt = KERNEL_CACHE_RETENTION_BAND_IDS.map((band) => named(text, band));
+      if (bandAt.some((index) => index >= 0) && !/\bANALYTICS_V2_CACHE_(?:RETENTION_BAND_IDS|BANDS)\b/.test(text)) {
+        expect(KERNEL_CACHE_RETENTION_BAND_IDS.filter((_, index) => bandAt[index] < 0), `${path} names some cache bands but not these`).toEqual([]);
+        expect([...bandAt].sort((left, right) => left - right), `${path} names the cache bands out of the kernel's order`).toEqual(bandAt);
+      }
+      // A counter list names every counter, snake_case or camelCase. A file that
+      // takes its counters from the checked constant derives them and is exempt.
+      if (distinctive.some((forms) => forms.some((form) => named(text, form) >= 0))
+          && !/\bANALYTICS_V2_CACHE_BAND_COUNTERS\b/.test(text)) {
+        const missing = counters.filter((forms) => forms.every((form) => named(text, form) < 0)).map(([counter]) => counter);
+        expect(missing, `${path} names some cache band counters but not these`).toEqual([]);
+      }
     }
   });
 });

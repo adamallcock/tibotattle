@@ -20,13 +20,18 @@
 //     synthetic two-event session;
 //   - sharedAnalyticsRefusalReasons are the string literals passed to
 //     `new SharedAnalyticsUnavailable(...)` anywhere in the vendored Worker
-//     sources; a non-literal argument or a subclass refuses the derivation;
+//     sources;
 //   - cacheRetentionRefusalReasons are the literals passed to
-//     `new CacheRetentionRefusedError(...)` in cache-retention-values.ts, the
-//     module of the one cache reducer evaluateSharedCacheDay calls. The
-//     derivation confirms that evaluateSharedCacheDay calls exactly that
-//     reducer from the cache-retention modules, so a kernel that routes the
-//     cache family through another module refuses rather than under-reports;
+//     `new CacheRetentionRefusedError(...)` in the vendored code the reviewed
+//     facade (entry.ts) reaches: the constructions that survive in the facade's
+//     tree-shaken bundle. That follows every call path, however many modules
+//     it crosses, and leaves out the D1 day lanes the facade never reaches;
+//   - for both classes every source must name the class only by
+//     `new <class>(<one plain literal>)`, `instanceof <class>`, its one
+//     declaration in its defining module, or a plain unaliased import. An
+//     alias, a member or value reference, a re-export, a subclass, or a
+//     namespace, star or dynamic import of the defining module could construct
+//     the class under another name, so each refuses rather than under-reports;
 //   - communityDailyReadSchemaVersion is the one `schemaVersion:
 //     "community-daily-read-v<major>.<minor>"` literal in the commit's
 //     apps/worker/src/index.ts. index.ts is not vendored (it is the Cloudflare
@@ -42,7 +47,7 @@
 
 import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, posix } from "node:path";
 import { pathToFileURL } from "node:url";
 
 export const VOCABULARY_SCHEMA = "analytics-kernel-vocabularies-v1";
@@ -51,15 +56,18 @@ export const VOCABULARY_RELATIVE = "src/analytics-v2/kernel-vocabularies.generat
 
 /** The vendored and commit sources each vocabulary is derived from. */
 export const VOCABULARY_SOURCES = Object.freeze({
+  facade: "entry.ts",
   sharedReducers: "apps/worker/src/analytics-shared-reducers.ts",
   cacheValues: "apps/worker/src/cache-retention-values.ts",
   adminAllowance: "apps/worker/src/admin-community-allowance.ts",
   workerIndex: "apps/worker/src/index.ts",
 });
+/** Each refusal class and the vendored module that declares it. */
+export const REFUSAL_CLASSES = Object.freeze({
+  shared: Object.freeze({ className: "SharedAnalyticsUnavailable", definingPath: VOCABULARY_SOURCES.sharedReducers }),
+  cache: Object.freeze({ className: "CacheRetentionRefusedError", definingPath: VOCABULARY_SOURCES.cacheValues }),
+});
 const WORKER_SRC = "apps/worker/src/";
-const CACHE_MODULE_PREFIX = "./cache-retention-";
-const CACHE_REDUCER = Object.freeze({ name: "reduceCacheRetentionDay", module: "./cache-retention-values" });
-const CACHE_EVALUATOR = "evaluateSharedCacheDay";
 const COUNTER_INTERFACE = "CacheRetentionBandCounters";
 const REASON = /^[a-z][a-z0-9_]{0,63}$/;
 const BAND_ID = /^[a-z][a-z0-9_]{0,63}$/;
@@ -75,26 +83,133 @@ export class VocabularyError extends Error {
 const lineOf = (text, index) => text.slice(0, index).split("\n").length;
 const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+/** One plain string literal as the only constructor argument, at the start of `rest`. */
+const REASON_ARGUMENT = /^\s*\(\s*(['"])([^'"\\\n]*)\1\s*\)/;
+/** The literal module specifier at the start of `rest`, or null. */
+const specifierAt = (rest) => /^\s*(['"])([^'"\n]+)\1/.exec(rest)?.[2] ?? null;
+
+/** Whether a relative specifier written in the module at `path` names the module at `target`. */
+function resolvesTo(path, specifier, target) {
+  if (!specifier.startsWith(".")) return false;
+  const resolved = posix.normalize(posix.join(posix.dirname(path), specifier)).replace(/\.[cm]?[jt]s$/, "");
+  const wanted = target.replace(/\.ts$/, "");
+  return resolved === wanted || `${resolved}/index` === wanted;
+}
+
+/**
+ * The brace clauses of a module's import and export statements
+ * (`import [type] [Default,] { ... } from` and `export [type] { ... } [from]`):
+ * the offsets of their braces, their kind, and whether an export clause
+ * re-exports from another module.
+ */
+function braceClauses(masked) {
+  const clauses = [];
+  for (const match of masked.matchAll(/(?<![\w$.])(import|export)\s+(?:type\s+)?(?:[A-Za-z_$][\w$]*\s*,\s*)?\{([^{}]*)\}/g)) {
+    const close = match.index + match[0].length - 1;
+    clauses.push({ kind: match[1], open: close - match[2].length - 1, close,
+      reexport: match[1] === "export" && /^\s*from(?![\w$])/.test(masked.slice(close + 1)) });
+  }
+  return clauses;
+}
+
+/** Statements that load a whole module, each of which could reach a class by any name. */
+const MODULE_LOADS = Object.freeze([
+  [/(?<![\w$.])import\s+(?:type\s+)?(?:[A-Za-z_$][\w$]*\s*,\s*)?\*\s*as\s+[A-Za-z_$][\w$]*\s*from(?![\w$])/g, (module) => `imports ${module} as a namespace`],
+  [/(?<![\w$.])export\s+(?:type\s+)?\*(?:\s*as\s+[A-Za-z_$][\w$]*)?\s*from(?![\w$])/g, (module) => `re-exports ${module} with export *`],
+  [/(?<![\w$.])import\s*\(/g, (module) => `imports ${module} dynamically`],
+]);
+
 /**
  * The string-literal reasons passed to `new <className>(...)` in one source, in
- * order of first appearance. Every construction must pass exactly one plain
- * string literal: a variable, a template or an expression would make the set
- * open, so it refuses. A class that extends <className> refuses too.
+ * order of first appearance.
+ *
+ * Every construction must pass exactly one plain string literal: a variable, a
+ * template or an expression would make the set open, so it refuses. And the
+ * source may name the class in only four ways: `new <className>(...)`,
+ * `instanceof <className>`, its one declaration (in `definingPath` only, and
+ * there exactly once), and a plain name in an import clause, or in a local
+ * export clause of the defining module. Anything else could construct the class
+ * under a name this scan does not read, so it refuses: a subclass
+ * (VOCABULARY_REFUSAL_CLASS_EXTENDED); an alias in an import or export clause,
+ * a re-export, a member reference (`ns.<className>`), a value use
+ * (`const X = <className>`, `f(<className>)`), or a namespace, `export *` or
+ * dynamic import of the defining module, or a dynamic import of a computed
+ * module (VOCABULARY_REFUSAL_CLASS_ALIASED).
  */
-export function constructedReasons({ text, path, className, maskNonCode }) {
+export function constructedReasons({ text, path, className, definingPath, maskNonCode }) {
+  if (typeof definingPath !== "string" || !definingPath) throw new VocabularyError("VOCABULARY_SOURCE_MISSING", `no defining module for ${className}`);
   const masked = maskNonCode(text);
   const name = escapeRegExp(className);
-  const extended = new RegExp(`(?<![\\w$.])extends\\s+${name}(?![\\w$])`).exec(masked);
-  if (extended) {
-    throw new VocabularyError("VOCABULARY_REFUSAL_CLASS_EXTENDED", `${path}:${lineOf(text, extended.index)} extends ${className}`);
+  const defining = path === definingPath;
+  const at = (index) => `${path}:${lineOf(text, index)}`;
+  const aliased = (index, detail) => new VocabularyError("VOCABULARY_REFUSAL_CLASS_ALIASED", `${at(index)} ${detail}`);
+
+  for (const [pattern, what] of MODULE_LOADS) {
+    for (const match of masked.matchAll(pattern)) {
+      const specifier = specifierAt(text.slice(match.index + match[0].length));
+      if (specifier === null) throw aliased(match.index, `loads a computed module, which could reach ${className}`);
+      if (resolvesTo(path, specifier, definingPath)) throw aliased(match.index, `${what(specifier)}, the module that declares ${className}`);
+    }
   }
+
+  const clauses = braceClauses(masked);
   const reasons = [];
-  for (const match of masked.matchAll(new RegExp(`(?<![\\w$.])new\\s+${name}\\s*\\(`, "g"))) {
-    const open = match.index + match[0].length - 1;
-    const literal = /^\(\s*(['"])([^'"\\\n]*)\1\s*\)/.exec(text.slice(open));
+  let declarations = 0;
+  for (const match of masked.matchAll(new RegExp(`(?<![\\w$])${name}(?![\\w$])`, "g"))) {
+    const index = match.index;
+    const end = index + match[0].length;
+    const clause = clauses.find((candidate) => candidate.open < index && index < candidate.close);
+    if (clause) {
+      const start = Math.max(masked.lastIndexOf(",", index), clause.open) + 1;
+      const comma = masked.indexOf(",", end);
+      const words = masked.slice(start, comma < 0 || comma > clause.close ? clause.close : comma).trim().split(/\s+/);
+      if (words.length > 1 && words[0] === "type") words.shift();
+      if (words.length !== 1) throw aliased(index, `renames ${className} in an ${clause.kind} clause`);
+      if (clause.kind === "export" && (!defining || clause.reexport)) throw aliased(index, `re-exports ${className}, which only ${definingPath} may export`);
+      continue;
+    }
+    const before = masked.slice(Math.max(0, index - 80), index);
+    if (/\.\s*$/.test(before)) throw aliased(index, `refers to ${className} as a member`);
+    if (/(?<![\w$.])extends\s+$/.test(before)) throw new VocabularyError("VOCABULARY_REFUSAL_CLASS_EXTENDED", `${at(index)} extends ${className}`);
+    if (/(?<![\w$.])class\s+$/.test(before)) {
+      if (!defining) throw new VocabularyError("VOCABULARY_SOURCE_CHANGED", `${at(index)} declares another class named ${className}; ${definingPath} declares it`);
+      declarations += 1;
+      continue;
+    }
+    if (/(?<![\w$.])instanceof\s+$/.test(before) && !/^\s*[.[(]/.test(masked.slice(end))) continue;
+    if (/(?<![\w$.])new\s+$/.test(before)) {
+      const literal = REASON_ARGUMENT.exec(text.slice(end));
+      if (!literal || !REASON.test(literal[2])) {
+        throw new VocabularyError("VOCABULARY_REASON_NOT_LITERAL", `${at(index)} constructs ${className} without one plain reason literal`);
+      }
+      if (!reasons.includes(literal[2])) reasons.push(literal[2]);
+      continue;
+    }
+    throw aliased(index, `refers to ${className} other than by new, instanceof, its declaration or a plain import`);
+  }
+  if (defining && declarations !== 1) throw new VocabularyError("VOCABULARY_SOURCE_CHANGED", `${path} declares class ${className} ${declarations} times, not once`);
+  return reasons;
+}
+
+/**
+ * The reasons `new <className>(...)` is given in a bundle's output, in order of
+ * first appearance: the constructions the bundle's entry can reach. The bundler
+ * drops only code it can prove nothing reachable references, so this errs
+ * towards more reasons, never fewer. Run it only over sources that
+ * constructedReasons accepted, so the bundle names the class only as itself
+ * (the bundler resolves import names to the declared one). A bundler-renamed
+ * copy (`<className>2`) would hide constructions, so it refuses.
+ */
+export function bundledConstructedReasons({ text, className, maskNonCode }) {
+  const masked = maskNonCode(text);
+  const name = escapeRegExp(className);
+  const renamed = new RegExp(`(?<![\\w$])${name}\\d+(?![\\w$])`).exec(masked);
+  if (renamed) throw new VocabularyError("VOCABULARY_PROBE_RENAMED", `the bundle renames ${className} to ${renamed[0]}`);
+  const reasons = [];
+  for (const match of masked.matchAll(new RegExp(`(?<![\\w$.])new\\s+${name}(?![\\w$])`, "g"))) {
+    const literal = REASON_ARGUMENT.exec(text.slice(match.index + match[0].length));
     if (!literal || !REASON.test(literal[2])) {
-      throw new VocabularyError("VOCABULARY_REASON_NOT_LITERAL",
-        `${path}:${lineOf(text, match.index)} constructs ${className} without one plain reason literal`);
+      throw new VocabularyError("VOCABULARY_REASON_NOT_LITERAL", `the bundle constructs ${className} without one plain reason literal`);
     }
     if (!reasons.includes(literal[2])) reasons.push(literal[2]);
   }
@@ -140,57 +255,6 @@ export function interfaceMembers({ text, path, name, maskNonCode }) {
   return members;
 }
 
-/** Named value imports of one module: Map<local name, specifier>. */
-function namedImports(text, masked) {
-  const imports = new Map();
-  // The lexer blanks the specifier string, quotes included, so read it from the source.
-  for (const match of masked.matchAll(/(?<![\w$.])import\s+(?!type\b)\{([^}]*)\}\s*from(?![\w$])/g)) {
-    const specifier = /^\s*(['"])([^'"]+)\1/.exec(text.slice(match.index + match[0].length));
-    if (!specifier) continue;
-    for (const part of match[1].split(",")) {
-      const words = part.trim().split(/\s+/).filter(Boolean);
-      if (!words.length || words[0] === "type") continue;
-      imports.set(words.length === 3 && words[1] === "as" ? words[2] : words[0], specifier[2]);
-    }
-  }
-  return imports;
-}
-
-/**
- * The imported functions that one top-level function calls, as
- * `{ name, module }`, for imports whose specifier starts with `modulePrefix`.
- */
-export function importedCallees({ text, path, functionName, modulePrefix, maskNonCode }) {
-  const masked = maskNonCode(text);
-  const declarations = [...masked.matchAll(new RegExp(`^(?:export\\s+)?function\\s+${escapeRegExp(functionName)}\\s*\\(`, "gm"))];
-  if (declarations.length !== 1) {
-    throw new VocabularyError("VOCABULARY_SOURCE_CHANGED", `${path} declares function ${functionName} ${declarations.length} times, not once`);
-  }
-  // Skip the parameter list (it may hold a type literal), then take the body.
-  let depth = 0;
-  let index = declarations[0].index + declarations[0][0].length - 1;
-  for (; index < masked.length; index += 1) {
-    if (masked[index] === "(") depth += 1;
-    else if (masked[index] === ")" && --depth === 0) break;
-  }
-  const open = masked.indexOf("{", index);
-  if (index >= masked.length || open < 0) {
-    throw new VocabularyError("VOCABULARY_SOURCE_UNPARSED", `${path} function ${functionName} has no body`);
-  }
-  if (/[{};=]/.test(masked.slice(index + 1, open))) {
-    throw new VocabularyError("VOCABULARY_SOURCE_CHANGED", `${path} function ${functionName} has a return type this derivation cannot read`);
-  }
-  const [start, end] = braceBlock(masked, open, `${path} function ${functionName}`);
-  const imports = namedImports(text, masked);
-  const callees = [];
-  for (const call of masked.slice(start, end).matchAll(/(?<![\w$.])([A-Za-z_$][\w$]*)\s*\(/g)) {
-    const module = imports.get(call[1]);
-    if (module === undefined || !module.startsWith(modulePrefix)) continue;
-    if (!callees.some((callee) => callee.name === call[1])) callees.push({ name: call[1], module });
-  }
-  return callees;
-}
-
 /**
  * The one community daily read schema version in the commit's Worker entry: the
  * value of a `schemaVersion:` property. Every literal that starts with
@@ -221,16 +285,15 @@ function probeEvents(day) {
 }
 
 /**
- * Bundles the named vendored modules from the tree at `vendorRoot` on their own
- * and loads them. @app-usagemonitor imports must resolve inside the tree.
+ * Bundles `contents` (an entry that re-exports vendored modules) from the tree
+ * at `vendorRoot` on its own, with tree shaking, and returns the output text.
+ * @app-usagemonitor imports must resolve inside the tree.
  */
-async function loadVendoredModules({ esbuild, vendorRoot, nodeModules, exports }) {
-  const contents = Object.entries(exports)
-    .map(([path, names]) => `export { ${names.join(", ")} } from ${JSON.stringify(`./${path.replace(/\.ts$/, "")}`)};`).join("\n");
+async function bundleVendored({ esbuild, vendorRoot, contents, sourcefile }) {
   let result;
   try {
     result = await esbuild.build({
-      stdin: { contents, loader: "ts", resolveDir: vendorRoot, sourcefile: "kernel-vocabularies-probe.ts" },
+      stdin: { contents, loader: "ts", resolveDir: vendorRoot, sourcefile },
       bundle: true, write: false, metafile: true, platform: "node", format: "esm", target: "node22",
       mainFields: ["module", "main"], logLevel: "silent",
       plugins: [{
@@ -246,11 +309,20 @@ async function loadVendoredModules({ esbuild, vendorRoot, nodeModules, exports }
   }
   const strays = Object.keys(result.metafile.inputs).filter((input) => /(?:^|\/)node_modules\/@app-usagemonitor\//.test(input));
   if (strays.length) throw new VocabularyError("VOCABULARY_PROBE_PACKAGE_UNVENDORED", strays.join(", "));
+  return result.outputFiles[0].text;
+}
+
+const reexport = (path, names) => `export ${names ? `{ ${names.join(", ")} }` : "*"} from ${JSON.stringify(`./${path.replace(/\.ts$/, "")}`)};`;
+
+/** Bundles the named vendored modules on their own and loads them. */
+async function loadVendoredModules({ esbuild, vendorRoot, nodeModules, exports }) {
+  const code = await bundleVendored({ esbuild, vendorRoot, sourcefile: "kernel-vocabularies-probe.ts",
+    contents: Object.entries(exports).map(([path, names]) => reexport(path, names)).join("\n") });
   const dir = mkdtempSync(join(tmpdir(), "kernel-vocabularies-"));
   try {
     symlinkSync(nodeModules, join(dir, "node_modules"), "dir");
     const file = join(dir, "probe.mjs");
-    writeFileSync(file, result.outputFiles[0].contents);
+    writeFileSync(file, code);
     return await import(pathToFileURL(file).href);
   } catch (error) {
     if (error instanceof VocabularyError) throw error;
@@ -279,25 +351,33 @@ export async function deriveKernelVocabularies({ vendorRoot, sourceCommit, vendo
     if (!vendoredSources.includes(path)) throw new VocabularyError("VOCABULARY_SOURCE_MISSING", `${path} is not vendored`);
   }
 
-  // Refusal reasons.
-  const shared = [];
-  for (const path of [...vendoredSources].filter((source) => source.startsWith(WORKER_SRC) && source.endsWith(".ts")).sort()) {
-    for (const reason of constructedReasons({ text: read(path), path, className: "SharedAnalyticsUnavailable", maskNonCode })) {
-      if (!shared.includes(reason)) shared.push(reason);
+  // Refusal reasons: every construction in the vendored Worker sources, each
+  // source naming the class only in the forms constructedReasons reads.
+  const workerSources = [...vendoredSources].filter((source) => source.startsWith(WORKER_SRC) && source.endsWith(".ts")).sort();
+  const reasonsOf = ({ className, definingPath }) => {
+    const reasons = [];
+    for (const path of workerSources) {
+      for (const reason of constructedReasons({ text: read(path), path, className, definingPath, maskNonCode })) {
+        if (!reasons.includes(reason)) reasons.push(reason);
+      }
     }
+    return reasons;
+  };
+  const shared = reasonsOf(REFUSAL_CLASSES.shared);
+  if (!shared.length) throw new VocabularyError("VOCABULARY_SOURCE_CHANGED", `no ${REFUSAL_CLASSES.shared.className} reason is constructed in the vendored sources`);
+  // The cache family is what the facade can reach: the vendored D1 day lanes
+  // construct further reasons that the GCP path never runs.
+  const cacheClass = REFUSAL_CLASSES.cache.className;
+  const cacheConstructed = reasonsOf(REFUSAL_CLASSES.cache);
+  const reachable = bundledConstructedReasons({ className: cacheClass, maskNonCode,
+    text: await bundleVendored({ esbuild, vendorRoot, sourcefile: "kernel-vocabularies-facade.ts", contents: reexport(VOCABULARY_SOURCES.facade) }) });
+  const unread = reachable.filter((reason) => !cacheConstructed.includes(reason));
+  if (unread.length) {
+    throw new VocabularyError("VOCABULARY_PROBE_DISAGREES", `the facade bundle constructs ${cacheClass} with ${unread.join(", ")}, which no vendored source does`);
   }
-  if (!shared.length) throw new VocabularyError("VOCABULARY_SOURCE_CHANGED", "no SharedAnalyticsUnavailable reason is constructed in the vendored sources");
-  const reducersText = read(VOCABULARY_SOURCES.sharedReducers);
-  const callees = importedCallees({ text: reducersText, path: VOCABULARY_SOURCES.sharedReducers, functionName: CACHE_EVALUATOR,
-    modulePrefix: CACHE_MODULE_PREFIX, maskNonCode });
-  if (JSON.stringify(callees) !== JSON.stringify([CACHE_REDUCER])) {
-    throw new VocabularyError("VOCABULARY_SOURCE_CHANGED",
-      `${CACHE_EVALUATOR} calls ${JSON.stringify(callees)} from the cache-retention modules, not exactly ${CACHE_REDUCER.name}; review where the cache family's refusals come from`);
-  }
+  const cacheReasons = cacheConstructed.filter((reason) => reachable.includes(reason));
+  if (!cacheReasons.length) throw new VocabularyError("VOCABULARY_SOURCE_CHANGED", `the facade reaches no ${cacheClass} construction`);
   const cacheText = read(VOCABULARY_SOURCES.cacheValues);
-  const cacheReasons = constructedReasons({ text: cacheText, path: VOCABULARY_SOURCES.cacheValues,
-    className: "CacheRetentionRefusedError", maskNonCode });
-  if (!cacheReasons.length) throw new VocabularyError("VOCABULARY_SOURCE_CHANGED", `${VOCABULARY_SOURCES.cacheValues} constructs no CacheRetentionRefusedError`);
 
   // Runtime values and the counter confirmation.
   const loaded = await loadVendoredModules({ esbuild, vendorRoot, nodeModules, exports: {
@@ -372,8 +452,8 @@ export function renderKernelVocabularies(vocabularies) {
     `export const KERNEL_SHARED_ANALYTICS_REFUSAL_REASONS = ${list(v.sharedAnalyticsRefusalReasons)};`,
     "",
     "/**",
-    " * The CacheRetentionRefusedError reasons cache-retention-values.ts constructs: the module of",
-    " * reduceCacheRetentionDay, the one cache reducer evaluateSharedCacheDay calls.",
+    " * The CacheRetentionRefusedError reasons constructed by the vendored code the reviewed facade",
+    " * (entry.ts) reaches, in vendored source order: the constructions left in its tree-shaken bundle.",
     " */",
     `export const KERNEL_CACHE_RETENTION_REFUSAL_REASONS = ${list(v.cacheRetentionRefusalReasons)};`,
     "",

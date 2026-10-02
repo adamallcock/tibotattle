@@ -38,8 +38,8 @@ export const KERNEL_SHARED_ANALYTICS_REFUSAL_REASONS = Object.freeze([
 ] as const);
 
 /**
- * The CacheRetentionRefusedError reasons cache-retention-values.ts constructs: the module of
- * reduceCacheRetentionDay, the one cache reducer evaluateSharedCacheDay calls.
+ * The CacheRetentionRefusedError reasons constructed by the vendored code the reviewed facade
+ * (entry.ts) reaches, in vendored source order: the constructions left in its tree-shaken bundle.
  */
 export const KERNEL_CACHE_RETENTION_REFUSAL_REASONS = Object.freeze([
   "session_limit_exceeded",
