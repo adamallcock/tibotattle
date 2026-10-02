@@ -48,10 +48,13 @@ async function admitSyntheticUsageDay({ pool, schema, options, nowEpoch, modules
 
   await pool.query(`UPDATE ${table("telemetry_v12_runtime")} SET state='active', changed_at=$1 WHERE id=1`, [now]);
   await pool.query(`UPDATE ${table("telemetry_v12_typed_runtime")} SET state='active', changed_at=$1 WHERE id=1`, [now]);
+  // A social owner must carry the current participant consent before the typed
+  // v1.2 admission accepts a write (TELEMETRY_REQUIRED otherwise), matching the
+  // live enrollment path and the sibling PostgreSQL transport specs.
   await pool.query(
-    `INSERT INTO ${table("participants")} (id, owner_kind, state, created_at)
-     VALUES ($1, 'social', 'active', $2)`,
-    [participantId, now],
+    `INSERT INTO ${table("participants")} (id, owner_kind, state, consent_version, created_at)
+     VALUES ($1, 'social', 'active', $2, $3)`,
+    [participantId, modules.TELEMETRY_CONSENT_VERSION, now],
   );
   await pool.query(
     `INSERT INTO ${table("web_sessions")} (
@@ -287,7 +290,8 @@ test("PostgreSQL normalized telemetry v1.2 migrates forward from primary version
     const { createPostgresTypedV12Domain } =
       await vite.ssrLoadModule("/src/postgres-typed-v12-domain.ts");
     const { sha256Hex } = await vite.ssrLoadModule("/src/crypto.ts");
-    const modules = { ...admission, ...reader, sha256Hex };
+    const { TELEMETRY_CONSENT_VERSION } = await vite.ssrLoadModule("/src/constants.ts");
+    const modules = { ...admission, ...reader, sha256Hex, TELEMETRY_CONSENT_VERSION };
 
     tempRoot = await mkdtemp(join(tmpdir(), "tibotattle-postgres-v12-prior-"));
     const priorPrimaryDirectory = join(tempRoot, "primary");
@@ -1057,21 +1061,45 @@ test("PostgreSQL normalized telemetry v1.2 migrates forward from primary version
     );
     assert.equal(deleteGuards.rows[0]?.count, 4);
 
-    await pool.query(`UPDATE "${schema}"."participants" SET state='deleting' WHERE id=$1`, [admitted.principal.participantId]);
+    await pool.query(
+      `UPDATE "${schema}"."participants" SET state='deleting', deletion_session_id='synthetic-typed-v12-fence'
+        WHERE id=$1`,
+      [admitted.principal.participantId],
+    );
     const eraseCountsBefore = await pool.query(
       `SELECT (SELECT count(*)::integer FROM "${schema}"."telemetry_v12_typed_records") AS records,
               (SELECT count(*)::integer FROM "${schema}"."telemetry_v12_typed_usage") AS usage,
               (SELECT count(*)::integer FROM "${schema}"."telemetry_v12_typed_quota") AS quota,
               (SELECT count(*)::integer FROM "${schema}"."telemetry_v12_typed_session_tools") AS session_tools`,
     );
-    const erasureDelete = await pool.query(
-      `DELETE FROM "${schema}"."telemetry_v12_typed_records"
-        WHERE manifest_id IN (
-          SELECT id FROM "${schema}"."telemetry_v12_day_manifests" WHERE participant_id=$1
-        )`,
+    assert.ok(eraseCountsBefore.rows[0]?.records > 0 && eraseCountsBefore.rows[0]?.usage > 0
+      && eraseCountsBefore.rows[0]?.quota > 0 && eraseCountsBefore.rows[0]?.session_tools > 0,
+    "erasure is proven against populated typed source, not empty tables");
+    // Ready source is retained (migration 0035): neither the deleting state nor a
+    // direct typed-record delete authorizes removing it. Only the terminal owner
+    // erasure cascade, with its same-transaction receipt, does.
+    await assert.rejects(
+      pool.query(
+        `DELETE FROM "${schema}"."telemetry_v12_typed_records"
+          WHERE manifest_id IN (
+            SELECT id FROM "${schema}"."telemetry_v12_day_manifests" WHERE participant_id=$1
+          )`,
+        [admitted.principal.participantId],
+      ),
+      (error) => error?.code === "P1005",
+      "a deleting participant's ready typed source cannot be deleted directly",
+    );
+    const retainedAfterRefusal = await pool.query(
+      `SELECT count(*)::integer AS records FROM "${schema}"."telemetry_v12_typed_records"`,
+    );
+    assert.equal(retainedAfterRefusal.rows[0]?.records, eraseCountsBefore.rows[0]?.records,
+      "the refused direct delete leaves every typed record in place");
+    const erasure = await pool.query(
+      `DELETE FROM "${schema}"."participants"
+        WHERE id=$1 AND state='deleting' AND deletion_session_id='synthetic-typed-v12-fence'`,
       [admitted.principal.participantId],
     );
-    assert.equal(erasureDelete.rowCount, eraseCountsBefore.rows[0]?.records);
+    assert.equal(erasure.rowCount, 1, "the terminal participant erasure cascade succeeds");
     const remainingChildren = await pool.query(
       `SELECT (SELECT count(*)::integer FROM "${schema}"."telemetry_v12_typed_records") AS records,
               (SELECT count(*)::integer FROM "${schema}"."telemetry_v12_typed_usage") AS usage,
@@ -1079,6 +1107,10 @@ test("PostgreSQL normalized telemetry v1.2 migrates forward from primary version
               (SELECT count(*)::integer FROM "${schema}"."telemetry_v12_typed_session_tools") AS session_tools`,
     );
     assert.deepEqual(remainingChildren.rows[0], { records: 0, usage: 0, quota: 0, session_tools: 0 });
+    const erasureReceipts = await pool.query(
+      `SELECT count(*)::integer AS receipts FROM "${schema}"."storage_owner_erasure_receipts"`,
+    );
+    assert.equal(erasureReceipts.rows[0]?.receipts, 1, "the cascade carries its own terminal erasure receipt");
 
     const typedRecordColumns = await pool.query(
       `SELECT column_name FROM information_schema.columns
