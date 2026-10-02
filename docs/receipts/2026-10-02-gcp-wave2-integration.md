@@ -11,8 +11,8 @@ This is a 2026-10-02 receipt for the wave-2 integration on branch
 `claude/gcp-fp-w2-integration`. It starts from `claude/gcp-fastpath-final` at
 `3fa1ba64` and merges the three reviewed wave-2 packages, settles the seams
 between them, and promotes W2-SEAL's migration as primary 0063. A later
-review-fix commit on the same branch corrects five review findings
-([Review fixes](#review-fixes)). It records **local, synthetic** evidence only: one macOS arm64 workstation, Node 26.2.0
+review-fix commit on the same branch, `1e531eb3`, corrects five review
+findings ([Review fixes](#review-fixes)). It records **local, synthetic** evidence only: one macOS arm64 workstation, Node 26.2.0
 for repository tooling, Node 22.16.0 (the image runtime) where noted, and the
 local PostgreSQL 17.10 fan-out cluster on a private Unix socket (port 55433,
 which also listens on loopback TCP). Nothing was built in Cloud Build,
@@ -32,7 +32,7 @@ the repository's own.
 | `f2063efc` | Primary 0063 promoted, with the count and tail pins moved, OPS-10's contract review of 0063 and the SIMP residue rule |
 | `aa2ae89b` | The cross-package seams, the gate registrations (withdrawn by the review fixes) and the journal-guard review |
 | `5f8e1551` | The first version of this receipt and the fast-path plan's backlog rows |
-| The review-fix commit | The [review fixes](#review-fixes): the four keys leave the Worker gates, PT-3 enforces the do-not-restore rule, and this receipt and the plan rows are corrected |
+| `1e531eb3` | The [review fixes](#review-fixes): the four keys leave the Worker gates, PT-3 enforces the do-not-restore rule, and this receipt and the plan rows are corrected |
 
 ### Merge reconciliation
 
@@ -255,8 +255,8 @@ before it was fixed; none was rejected.
 
 ### Gates after the review fixes
 
-These ran serially on the review-fix code, with the same environments as
-above.
+These ran serially on the code at `1e531eb3`, with the same environments
+as above.
 
 | Gate | Result |
 |---|---|
