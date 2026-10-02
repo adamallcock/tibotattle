@@ -63,6 +63,7 @@ const TARGET = Object.freeze({
   builderServiceAccount: `tibotattle-builder@${PROJECT}.iam.gserviceaccount.com`,
   verifierServiceAccount: `tibotattle-verifier@${PROJECT}.iam.gserviceaccount.com`,
   originAudience: ORIGIN_AUDIENCE,
+  maintenanceJob: "tibotattle-maintenance",
 });
 const STAGING_PROJECT = "w2-opsdb-staging-synth";
 const STAGING_TARGET = Object.freeze({
@@ -71,12 +72,14 @@ const STAGING_TARGET = Object.freeze({
   region: "us-east1",
   service: "tibotattle-staging-origin",
   migrationJob: "tibotattle-staging-migrate",
-  jobNames: Object.freeze(["tibotattle-staging-migrate", "tibotattle-staging-analytics"]),
+  jobNames: Object.freeze(["tibotattle-staging-migrate", "tibotattle-staging-analytics",
+    "tibotattle-staging-maintenance"]),
   primaryInstance: "tibotattle-staging-primary",
   imageRepository: `us-east1-docker.pkg.dev/${STAGING_PROJECT}/tibotattle-staging/origin`,
   builderServiceAccount: `tibotattle-staging-builder@${STAGING_PROJECT}.iam.gserviceaccount.com`,
   verifierServiceAccount: `tibotattle-staging-verifier@${STAGING_PROJECT}.iam.gserviceaccount.com`,
   originAudience: ORIGIN_AUDIENCE,
+  maintenanceJob: "tibotattle-staging-maintenance",
 });
 const IMAGE = `${TARGET.imageRepository}@${DIGEST}`;
 const CONTRACT_PATH = "apps/worker/src/edge-origin-contract.ts";
@@ -128,13 +131,15 @@ function jobReceipt(overrides = {}, target = TARGET) {
   return { ...body, digest: productionMigrationReceiptDigest(body) };
 }
 
-function serviceResource(image, commit, { url = SERVICE_URL, env } = {}) {
+function serviceResource(image, commit, { url = SERVICE_URL, env, hostOrigin = url } = {}) {
   return {
     apiVersion: "serving.knative.dev/v1",
     kind: "Service",
     metadata: { annotations: { "run.googleapis.com/urls": JSON.stringify([url]) } },
     spec: { template: { spec: { containers: [{ image,
-      env: env ?? [{ name: "DEPLOYMENT_SOURCE_COMMIT", value: commit }] }] } } },
+      env: env ?? [{ name: "DEPLOYMENT_SOURCE_COMMIT", value: commit },
+        // The CR-7 host's one accepted origin (OPS-2 renders it; roll checks it).
+        ...(hostOrigin === null ? [] : [{ name: "HOST_ORIGIN", value: hostOrigin }])] }] } } },
     status: {
       url,
       latestReadyRevisionName: "tibotattle-origin-00002-abc",
@@ -451,6 +456,8 @@ test("arguments: closed verbs and flags, absolute input paths, and an exact auth
 test("the target is closed and never a test, rehearsal or other-plane resource", () => {
   assert.deepEqual(validateRolloutTarget(TARGET, "production"), TARGET);
   assert.deepEqual(validateRolloutTarget(STAGING_TARGET, "staging"), STAGING_TARGET);
+  assert.deepEqual(validateRolloutTarget({ ...TARGET, maintenanceJob: null }, "production"),
+    { ...TARGET, maintenanceJob: null }, "a desired state without the maintenance Job yet (D-OPS4)");
   for (const [overrides, code] of [
     [{ extra: "x" }, "ROLLOUT_TARGET_INVALID"],
     [{ environment: "staging" }, "ROLLOUT_TARGET_INVALID"],
@@ -462,6 +469,11 @@ test("the target is closed and never a test, rehearsal or other-plane resource",
     [{ verifierServiceAccount: TARGET.builderServiceAccount }, "ROLLOUT_TARGET_INVALID"],
     [{ originAudience: "" }, "ROLLOUT_TARGET_INVALID"],
     [{ originAudience: undefined }, "ROLLOUT_TARGET_INVALID"],
+    // The maintenance Job is null or one of the rolled jobs, never the migration Job.
+    [{ maintenanceJob: undefined }, "ROLLOUT_TARGET_INVALID"],
+    [{ maintenanceJob: "tibotattle-other-maintenance" }, "ROLLOUT_TARGET_INVALID"],
+    [{ maintenanceJob: TARGET.migrationJob }, "ROLLOUT_TARGET_INVALID"],
+    [{ maintenanceJob: 1 }, "ROLLOUT_TARGET_INVALID"],
     [{ service: "tibotattle-test-app" }, "ROLLOUT_TARGET_TEST_FORBIDDEN"],
     [{ primaryInstance: "tibotattle-test-primary-20260922" }, "ROLLOUT_TARGET_TEST_FORBIDDEN"],
     [{ primaryInstance: "tibotattle-primary-rehearsal-0a1b2c3d" }, "ROLLOUT_TARGET_TEST_FORBIDDEN"],
@@ -750,9 +762,10 @@ test("roll moves the service and every manifest job to one digest and commit, re
     const firstUpdate = estate.calls.findIndex((argv) => argv[3] === "update");
     assert.ok(estate.calls.findIndex((argv) => argv.slice(0, 4).join(" ") === "gcloud scheduler jobs list") < firstUpdate,
       "the jobs are quiescent before anything moves");
-    const lastCall = estate.calls.at(-1).join(" ");
-    assert.equal(lastCall, "node scripts/gcp-infra.mjs readback --require-clean --environment=production",
-      "the infrastructure readback closes the commands");
+    assert.deepEqual(estate.calls.slice(-2).map((argv) => argv.join(" ")), [
+      "node scripts/gcp-infra.mjs readback --require-clean --environment=production",
+      ROLLOUT_ARGV.jobExecute(TARGET, TARGET.maintenanceJob).join(" "),
+    ], "the infrastructure readback, then one maintenance pass (the first-roll ready path), close the commands");
     assert.deepEqual(estate.requests.map(({ url, init }) => [url, init.method, init.credentials, init.redirect]),
       [["https://tibotattle.com/api/health", "GET", "omit", "error"]], "then the public health, through the gcp edge");
     assert.equal(estate.calls.some((argv) => argv.includes("print-identity-token")), false);
@@ -898,6 +911,77 @@ test("roll releases the lock on failure, and a readback or served-commit mismatc
       isCode(code), code);
     assert.deepEqual(lock.events.filter((event) => event !== "assert"), ["acquire", "release"], code);
   }
+});
+
+test("the service's HOST_ORIGIN is its one run.app origin, and a gcp edge must forward to exactly it", async (t) => {
+  const paths = await migrated(t);
+  // HOST_ORIGIN absent, duplicated, another run.app origin or not run.app: refused before the lock.
+  for (const liveEnv of [
+    [{ name: "DEPLOYMENT_SOURCE_COMMIT", value: OTHER_COMMIT }],
+    [{ name: "DEPLOYMENT_SOURCE_COMMIT", value: OTHER_COMMIT }, { name: "HOST_ORIGIN", value: SERVICE_URL },
+      { name: "HOST_ORIGIN", value: SERVICE_URL }],
+    [{ name: "DEPLOYMENT_SOURCE_COMMIT", value: OTHER_COMMIT },
+      { name: "HOST_ORIGIN", value: "https://tibotattle-other-origin.a.run.app" }],
+    [{ name: "DEPLOYMENT_SOURCE_COMMIT", value: OTHER_COMMIT }, { name: "HOST_ORIGIN", value: "https://tibotattle.com" }],
+    [{ name: "DEPLOYMENT_SOURCE_COMMIT", value: OTHER_COMMIT }, { name: "HOST_ORIGIN", value: `${SERVICE_URL}/` }],
+  ]) {
+    const estate = fakeEstate({ liveEnv });
+    const lock = fakeLock();
+    await assert.rejects(runRollout(executeRoll(paths), dependencies(estate, lock)),
+      isCode("ROLLOUT_SERVICE_HOST_ORIGIN_INVALID"), JSON.stringify(liveEnv.at(-1)));
+    assert.deepEqual(lock.events, []);
+    assert.equal(estate.calls.some((argv) => argv[3] === "update"), false);
+  }
+  // Both of Cloud Run's URL forms belong to the service, but the edge must
+  // forward to the one the origin accepts (EDGE_UPSTREAM_ORIGIN === HOST_ORIGIN).
+  const otherForm = "https://tibotattle-origin-synthetic-ue.a.run.app";
+  const estate = fakeEstate();
+  estate.state.service.metadata.annotations["run.googleapis.com/urls"] = JSON.stringify([SERVICE_URL, otherForm]);
+  estate.state.service.spec.template.spec.containers[0].env = [
+    { name: "DEPLOYMENT_SOURCE_COMMIT", value: OTHER_COMMIT }, { name: "HOST_ORIGIN", value: otherForm },
+  ];
+  const lock = fakeLock();
+  await assert.rejects(runRollout(executeRoll(paths), dependencies(estate, lock)), isCode("ROLLOUT_EDGE_ORIGIN_MISMATCH"));
+  assert.deepEqual(lock.events, []);
+});
+
+test("first roll: the maintenance pass runs before verification, and the verifier path needs a maintenance Job", async (t) => {
+  // Outside gcp mode the EP-6 verifier needs /api/ready to read ready, which
+  // only a lifecycle pass makes true: the pass runs between the readback and
+  // the verifier's token.
+  const paths = await migrated(t);
+  await writeFile(paths.edgeLive, capture(workerLive));
+  const estate = fakeEstate({ blobs: {} });
+  await runRollout(executeRoll(paths), dependencies(estate, fakeLock()));
+  const joined = estate.calls.map((argv) => argv.join(" "));
+  const pass = joined.indexOf(ROLLOUT_ARGV.jobExecute(TARGET, TARGET.maintenanceJob).join(" "));
+  const token = joined.indexOf(ROLLOUT_ARGV.identityToken(TARGET).join(" "));
+  const readback = joined.indexOf("node scripts/gcp-infra.mjs readback --require-clean --environment=production");
+  assert.ok(readback >= 0 && readback < pass && pass < token, "readback, then the pass, then the verifier");
+  assert.equal(joined.filter((line) => line.startsWith("gcloud run jobs execute")).length, 1);
+  // Without a maintenance Job the origin-verifier path is refused before any command or lock.
+  const noJob = { ...TARGET, maintenanceJob: null };
+  const lock = fakeLock();
+  const bare = fakeEstate({ blobs: {}, target: noJob });
+  await assert.rejects(runRollout(executeRoll(paths), dependencies(bare, lock, { loadTarget: async () => noJob })),
+    isCode("ROLLOUT_MAINTENANCE_JOB_REQUIRED"));
+  assert.deepEqual(lock.events, []);
+  assert.equal(bare.calls.some((argv) => argv[0] === "gcloud" && argv[3] !== "describe"), false);
+  // A failed pass fails the roll closed and releases the lock.
+  const failed = fakeEstate({ blobs: {}, fail: `run jobs execute ${TARGET.maintenanceJob}` });
+  const failedLock = fakeLock();
+  await assert.rejects(runRollout(executeRoll(paths), dependencies(failed, failedLock)),
+    isCode("ROLLOUT_MAINTENANCE_PASS_FAILED"));
+  assert.deepEqual(failedLock.events.filter((event) => event !== "assert"), ["acquire", "release"]);
+  const unsucceeded = fakeEstate({ blobs: {}, executionStatus: { succeededCount: 0, failedCount: 1 } });
+  await assert.rejects(runRollout(executeRoll(paths), dependencies(unsucceeded, fakeLock())),
+    isCode("ROLLOUT_MAINTENANCE_PASS_FAILED"));
+  // In gcp mode the public health path needs no readiness, so a missing job
+  // is reported by the dry run, never refused.
+  await writeFile(paths.edgeLive, capture(gcpLive));
+  const gcpEstate = fakeEstate({ target: noJob });
+  await runRollout(executeRoll(paths), dependencies(gcpEstate, fakeLock(), { loadTarget: async () => noJob }));
+  assert.equal(gcpEstate.calls.some((argv) => argv.join(" ").startsWith("gcloud run jobs execute")), false);
 });
 
 // ---------------------------------------------------------------------------

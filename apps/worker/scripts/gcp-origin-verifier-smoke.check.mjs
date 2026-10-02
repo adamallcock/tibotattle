@@ -48,6 +48,8 @@ const TARGET = Object.freeze({
   builderServiceAccount: `tibotattle-builder@${PROJECT}.iam.gserviceaccount.com`,
   verifierServiceAccount: VERIFIER,
   originAudience: AUDIENCE,
+  // The rollout target's maintenance Job (D-CRB): none until D-OPS4.
+  maintenanceJob: null,
 });
 const NOW = Date.parse("2026-10-02T12:00:00.000Z");
 const CYCLE = "2026-10-02T11:00:00.000Z";
@@ -319,7 +321,12 @@ test("the CLI fails closed without the owner's desired state, with or without --
       assert.equal(result.code, 2, argv.join(" "));
       const printed = JSON.parse(result.stderr);
       assert.equal(printed.ok, false);
-      assert.equal(printed.code, argv.length === 1 ? "ORIGIN_SMOKE_ARGUMENT_INVALID" : "GCP_INFRA_DESIRED_STATE_UNCONFIGURED");
+      // The committed production desired state still holds OWN-5's
+      // placeholders: OPS-2 refuses it with DESIRED_STATE_PLACEHOLDER_UNFILLED:
+      // <field>, which is not a closed code, so the smoke closes it (C-INFRA
+      // retired GCP_INFRA_DESIRED_STATE_UNCONFIGURED; this check first ran in
+      // CI with D-CRB's registration).
+      assert.equal(printed.code, argv.length === 1 ? "ORIGIN_SMOKE_ARGUMENT_INVALID" : "ORIGIN_SMOKE_TARGET_UNAVAILABLE");
       assert.equal(result.stdout, "");
     }
   } finally {

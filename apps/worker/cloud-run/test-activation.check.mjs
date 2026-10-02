@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readPostgresMigrations, POSTGRES_MIGRATION_ROOT } from "./postgres-migrations.mjs";
-import { CLOUD_RUN_IAM_TEST_TARGET } from "./postgres-test-dispatch.mjs";
+import { CLOUD_RUN_IAM_TEST_TARGET } from "./cloud-run-iam-test-target.mjs";
 import {
   parseTestActivationConfig,
   runTestActivation,

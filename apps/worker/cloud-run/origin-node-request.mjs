@@ -1,8 +1,9 @@
 /**
- * CR-7: the Node-to-EP-6 request adapter of the Cloud Run origin (phase A).
+ * CR-7: the Node-to-EP-6 request adapter of the Cloud Run origin.
  *
- * A generalized copy of the edge-test adapter in origin-edge-test-mode.mjs
- * (edgeTestRequestFromNode and its helpers), for the production host:
+ * The one Node adapter in front of EP-6, for the production host and the
+ * edge-test origin (D-CRB moved it here from origin-edge-test-mode.mjs and
+ * deleted the copies there):
  * - originRequestFromNode accepts a Host equal to HOST_ORIGIN's host and,
  *   with acceptRevisionTags, a Cloud Run revision-tag Host
  *   '<tag>---<that host>' (tag: a lowercase letter, then at most 45 of
@@ -18,19 +19,15 @@
  *   unmarked 421 and connection: close (writeOriginBoundaryRefusal) and logs
  *   with logOriginBoundaryRefusal.
  *
- * Phase A adds this module beside the edge-test copy and changes nothing
- * that imports it. isEdgeOriginBoundaryRefusal is re-exported from
- * origin-edge-test-mode.mjs for now: it reads the origin marker on EP-6's
- * response, and test/edge-request-header-allowlist.spec.ts reviews that read
- * per file (RESPONSE_HEADER_READS). Phase B moves the function and its
- * ratchet entry here, points origin-edge-test-mode.mjs at this module and
- * deletes the edge-test duplicates, in one change.
+ * isEdgeOriginBoundaryRefusal reads the origin marker on EP-6's response;
+ * test/edge-request-header-allowlist.spec.ts reviews that read for this file
+ * (RESPONSE_HEADER_READS).
  *
  * Plain ESM. It opens no pool, reads no network and logs nothing but the
  * refusal lines it is asked to write.
  */
 
-import { ORIGIN_BOUNDARY_ERROR_BODY } from "../src/edge-origin-contract.ts";
+import { EDGE_HEADERS, ORIGIN_BOUNDARY_ERROR_BODY } from "../src/edge-origin-contract.ts";
 import {
   EDGE_ORIGIN_BOUNDARY_REFUSAL_REASONS,
   EDGE_ORIGIN_INVOKER_SCHEME_KINDS,
@@ -41,7 +38,12 @@ import {
   ORIGIN_BOUNDARY_ERROR_HEADERS,
 } from "./postgres-edge-origin-dispatch.mjs";
 
-export { isEdgeOriginBoundaryRefusal } from "./origin-edge-test-mode.mjs";
+/** EP-6's constant refusal: a 421 without the origin marker. */
+export function isEdgeOriginBoundaryRefusal(response) {
+  return response instanceof Response
+    && response.status === 421
+    && !response.headers.has(EDGE_HEADERS.originMarker);
+}
 
 /**
  * The constant reason of each originRequestFromNode refusal site, for

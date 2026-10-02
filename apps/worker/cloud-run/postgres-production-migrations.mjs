@@ -43,15 +43,15 @@
  * or a NOT NULL column without a default) is a contract change. Each one must
  * be listed, with its sha256, in the reviewed CONTRACT_MIGRATIONS map; the
  * promoted tail 0001-0065 is classified once below. That review covers the
- * SQL a previous revision issues, not its storage fence. The only runtime
- * receipt fence that exists (readSchemaReceipt in postgres-test-dispatch.mjs)
- * admits a migration history only when it equals the image's manifest
- * exactly, so behind it a revision built before a migration answers every
- * storage-gated route 503 BACKEND_STORAGE_UNAVAILABLE from migrate until the
- * roll. The production host (CR-7) must either admit a history that extends
- * its manifest only by reviewed expand-compatible migrations, or the rollout
- * must treat migrate-to-roll as a write outage and keep it short; the
- * fast-path plan's CR-7 and OPS-10 rows record this.
+ * SQL a previous revision issues, not its storage fence. The runtime receipt
+ * fence (the one reader, src/postgres-schema-receipt.ts readSchemaReceipt,
+ * behind the origin's storage gate in postgres-test-dispatch.mjs) admits a
+ * migration history only when it equals the image's manifest exactly, so
+ * behind it a revision built before a migration answers every storage-gated
+ * route 503 BACKEND_STORAGE_UNAVAILABLE from migrate until the roll. The
+ * owner accepted that short write outage on each migration, with a storage
+ * gate TTL of 0 (OD-ROLL / OD-CR-10, 2026-10-02), so the production host
+ * (D-CRB) keeps the exact-match fence and never admits a newer history.
  *
  * Identity: the attached identity is read through google-auth-library's
  * Application Default Credentials (the metadata server on Cloud Run, which
@@ -78,7 +78,7 @@ import {
   RUNTIME_PRIMARY_FUNCTIONS,
   runtimeGrantPolicyDigest,
 } from "./postgres-runtime-grants.mjs";
-import { CLOUD_RUN_IAM_TEST_TARGET } from "./postgres-test-dispatch.mjs";
+import { CLOUD_RUN_IAM_TEST_TARGET } from "./cloud-run-iam-test-target.mjs";
 
 export const PRODUCTION_MIGRATION_RECEIPT_SCHEMA = "tibotattle-gcp-migration-v1";
 export const PRODUCTION_PRIMARY_MANIFEST_SCHEMA = "tibotattle-postgres-primary-manifest-v1";

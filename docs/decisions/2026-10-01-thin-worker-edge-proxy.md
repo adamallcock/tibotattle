@@ -673,10 +673,14 @@ new owner decision and a reviewed matrix change.
   procedure. Under the blob rule as written, the only path is through the brake
   (gcp to fenced, origin deploy, fenced to gcp), and the forwarded routes are
   unavailable for that window.
-- **Fail-closed today.** The fast-path test origin's health is a test schema and
-  it does not serve `/api/ready` (finding F8). A gcp deploy therefore cannot
-  pass against any fast-path origin. It can pass only once the production
-  origin composition (CR-6 and CR-7) serves Worker-shaped health and readiness.
+- **Fail-closed until a production origin is rolled.** Finding F8 (no
+  `/api/ready` on the fast-path origin) is closed in source by D-CRB
+  (2026-10-02): the production origin composition (CR-6 and CR-7,
+  `HOST_MODE=production|staging`) and the fastpath-test mode serve
+  Worker-shaped `/api/health` (RD-3) and `/api/ready` (RD-2). Readiness stays
+  `503` until C-MAINT's lifecycle pass has written its rows, so the verifier
+  passes only against a rolled production-host revision after its first
+  maintenance pass; nothing of that is deployed yet.
 - **Gated on the production-zone probe (OD-E6): passed on 2026-10-02.**
   Lifting F8 does not clear the switch by itself. Until the owner had re-run
   the address probe from the `tibotattle.com` zone and recorded a pass

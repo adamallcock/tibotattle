@@ -26,6 +26,7 @@ import * as hostDispatch from "../cloud-run/postgres-host-dispatch.mjs";
 import * as productionRegistry from "../cloud-run/postgres-production-registry.mjs";
 // @ts-expect-error -- plain ESM Cloud Run module without declarations; Vite resolves it.
 import { createRequestContextStore } from "../cloud-run/postgres-request-context.mjs";
+import { createPostgresAdminAccessChokepoint } from "../src/postgres-admin-access";
 
 /**
  * CR-6/RD-2/RD-3 request-path parity (W3-CRA phase A), in the Workers pool
@@ -44,7 +45,12 @@ import { createRequestContextStore } from "../cloud-run/postgres-request-context
  *     retry-after is OD-CR-6(iv), injected with no default; F runs both the
  *     brief's proposed 60 and the no-header answer.
  * Sections C to E (served-route replay, log redaction, no-store) run in
- * cloud-run/postgres-host-dispatch.check.mjs and the phase-B E12 rows.
+ * cloud-run/postgres-host-dispatch.check.mjs, the E12 rows
+ * (postgres-test/edge-origin-e2e.spec.mjs) and, for the composed
+ * HOST_MODE origin over PostgreSQL 17, postgres-test/postgres-production-host.spec.mjs.
+ * Phase B (D-CRB) pins the composition root's answers: the admin host
+ * refused (OD-CR-3, until ADMIN-R12 opens it after round 12's OWN-17
+ * answer; the chokepoint cells here run the switch's other position) and no unported retry-after (OD-CR-6(iv)).
  */
 
 interface TestBindings extends Env {
@@ -121,6 +127,11 @@ function origin(
     recordDiagnostic: async () => {},
     logger: () => {},
     adminHostPolicy,
+    // The chokepoint is built once over the env (C-ADMIN); this test env may
+    // carry the Access test keys, which only a test origin honours.
+    ...(adminHostPolicy === "chokepoint"
+      ? { adminAccess: createPostgresAdminAccessChokepoint(workerSettings, { allowTestJwks: true }) }
+      : {}),
     unportedRetryAfterSeconds,
   });
   return { handler, calls, registry };

@@ -5,6 +5,7 @@ import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { createServer } from "vite";
 import {
+  ADMIN_HOST_ROUTE_IDS,
   OD_CR_1_CONTESTED_ROUTE_IDS,
   OD_CR_2_UNPORTED_ROUTE_IDS,
   ORIGIN_ROOT_ROUTE_IDS,
@@ -18,18 +19,21 @@ import {
   createProductionRouteRegistry,
   isProductionRouteRegistry,
 } from "./postgres-production-registry.mjs";
+import { createOriginRouteModuleRegistry, defineOriginRouteModule } from "./origin-route-modules.mjs";
 
-// CR-6 registry (W3-CRA phase A) without a database: the pinned d43c8f92
-// route table against the Worker's own WORKER_ROUTE_POLICY, the injected
-// OD-CR-1 ported set with and without the nine contested routes, and every
-// closed refusal. Every handler is a synthetic stub.
+// CR-6 registry without a database: the pinned d43c8f92 route table against
+// the Worker's own WORKER_ROUTE_POLICY, the injected ported set (scope, the
+// OD-CR-1 contested routes and the OD-CR-2 admin routes), the production
+// list in src/backend-composition.ts, the route-module fold (one registry)
+// and every closed refusal. Every handler is a synthetic stub.
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 let vite;
 let policy;
 let matchWorkerRoute;
-let edgeTestServedRouteIds;
+let productionPortedRouteIds;
+let productionAdminRouteIds;
 
 before(async () => {
   vite = await createServer({
@@ -40,8 +44,10 @@ before(async () => {
     appType: "custom",
   });
   ({ WORKER_ROUTE_POLICY: policy, matchWorkerRoute } = await vite.ssrLoadModule("/src/route-registry.ts"));
-  ({ EDGE_TEST_SERVED_ROUTE_IDS: edgeTestServedRouteIds } =
-    await vite.ssrLoadModule("/cloud-run/origin-edge-test-mode.mjs"));
+  ({
+    POSTGRES_PORTED_WORKER_ROUTE_IDS: productionPortedRouteIds,
+    POSTGRES_ADMIN_HOST_ROUTE_IDS: productionAdminRouteIds,
+  } = await vite.ssrLoadModule("/src/backend-composition.ts"));
 });
 
 after(async () => {
@@ -121,27 +127,29 @@ test("the table is the d43c8f92 policy: 51 routes in Worker order, one class eac
   const count = (routeClass) => PRODUCTION_ROUTE_TABLE.filter((route) => route.routeClass === routeClass).length;
   assert.equal(count(PRODUCTION_ROUTE_CLASSES.SCOPE), 21);
   assert.equal(count(PRODUCTION_ROUTE_CLASSES.OD_CR_1), 9);
-  assert.equal(count(PRODUCTION_ROUTE_CLASSES.OD_CR_2), 19);
+  assert.equal(count(PRODUCTION_ROUTE_CLASSES.ADMIN), 6);
+  assert.equal(count(PRODUCTION_ROUTE_CLASSES.OD_CR_2), 13);
   assert.equal(count(PRODUCTION_ROUTE_CLASSES.ROOT), 2);
 });
 
-test("the class lists match the brief and the edge-test served set", () => {
+test("the class lists match the brief and the production ported list", () => {
   assert.deepEqual([...POSTGRES_SCOPE_ROUTE_IDS].sort(), [...BRIEF_SCOPE].sort());
   assert.deepEqual([...OD_CR_1_CONTESTED_ROUTE_IDS].sort(), [...BRIEF_CONTESTED].sort());
   assert.deepEqual([...ORIGIN_ROOT_ROUTE_IDS], ["apple_domain_association", "sparkle_appcast_guard"]);
   const all = new Set([...POSTGRES_SCOPE_ROUTE_IDS, ...OD_CR_1_CONTESTED_ROUTE_IDS,
-    ...OD_CR_2_UNPORTED_ROUTE_IDS, ...ORIGIN_ROOT_ROUTE_IDS]);
-  assert.equal(all.size, 51, "the four classes are disjoint and cover the policy");
-  // EDGE_TEST_SERVED_ROUTE_IDS (origin-edge-test-mode.mjs) is the fastpath-test
-  // served set: every scope route but ready (unported in edge-test today, F8)
-  // plus the nine OD-CR-1 routes.
-  const scopeWithoutReady = POSTGRES_SCOPE_ROUTE_IDS.filter((id) => id !== "ready");
-  assert.deepEqual([...edgeTestServedRouteIds].sort(),
-    [...scopeWithoutReady, ...OD_CR_1_CONTESTED_ROUTE_IDS].sort());
-  // The unported class is the six admin routes plus the thirteen other routes the brief names.
+    ...ADMIN_HOST_ROUTE_IDS, ...OD_CR_2_UNPORTED_ROUTE_IDS, ...ORIGIN_ROOT_ROUTE_IDS]);
+  assert.equal(all.size, 51, "the five classes are disjoint and cover the policy");
+  // The production list (src/backend-composition.ts, OD-CR-1: all nine) is
+  // scope plus the contested routes, in Worker order; the edge-test and
+  // loopback origins serve exactly this list too.
+  assert.deepEqual([...productionPortedRouteIds],
+    policy.map((route) => route.id).filter((id) =>
+      POSTGRES_SCOPE_ROUTE_IDS.includes(id) || OD_CR_1_CONTESTED_ROUTE_IDS.includes(id)));
+  // OD-CR-2: the admin class is the policy's admin authority, as composition names it.
   const admin = policy.filter((route) => route.authority === "admin").map((route) => route.id);
-  assert.equal(admin.length, 6);
-  for (const id of admin) assert.ok(OD_CR_2_UNPORTED_ROUTE_IDS.includes(id), id);
+  assert.deepEqual([...ADMIN_HOST_ROUTE_IDS], admin);
+  assert.deepEqual([...productionAdminRouteIds], admin);
+  assert.equal(OD_CR_2_UNPORTED_ROUTE_IDS.length, 13);
   for (const id of ["enroll", "identity_google_start", "identity_google_callback", "identity_google_result",
     "identity_apple_start", "identity_apple_callback", "identity_apple_result", "security_reset",
     "participant_export", "telemetry_performance_capabilities", "telemetry_performance_consent",
@@ -157,7 +165,9 @@ test("online erasure is retired: no policy route, DELETE /api/v1/me is unknown_a
   assert.equal(matchWorkerRoute("/api/v1/me").kind, "unknown_api");
   const adminAction = RETIRED_ONLINE_ERASURE_SURFACES.find((surface) => surface.routeId === "admin_action");
   assert.ok(adminAction !== undefined);
-  assert.ok(OD_CR_2_UNPORTED_ROUTE_IDS.includes("admin_action"), "admin_action stays unported");
+  // admin_action is the C-ADMIN port, served on the admin host only; its
+  // participantErasure task is closed there (CLOSED_RUN_MAINTENANCE_TASK_KEYS).
+  assert.ok(ADMIN_HOST_ROUTE_IDS.includes("admin_action"));
   // No route id or pathname names erasure or deletion.
   for (const route of policy) assert.doesNotMatch(`${route.id} ${route.pathname}`, /eras|delet/iu);
 });
@@ -210,11 +220,19 @@ test("scope only (OD-CR-1 answers none): 21 ported, 28 unported, 2 root", () => 
   }
 });
 
-test("scope plus all nine contested routes: 30 ported, 19 unported, 2 root", () => {
-  const ported = [...POSTGRES_SCOPE_ROUTE_IDS, ...OD_CR_1_CONTESTED_ROUTE_IDS];
+test("the production list (scope plus all nine contested routes): 30 ported, 19 unported, 2 root", () => {
+  const registry = build({ portedRouteIds: productionPortedRouteIds });
+  assertCoverage(registry, productionPortedRouteIds);
+  assert.equal(registry.portedRouteIds.length, 30);
+  assert.deepEqual([...registry.unportedRouteIds],
+    [...ADMIN_HOST_ROUTE_IDS, ...OD_CR_2_UNPORTED_ROUTE_IDS].sort());
+});
+
+test("an open admin host adds the six admin routes: 36 ported, 13 unported, 2 root", () => {
+  const ported = [...productionPortedRouteIds, ...ADMIN_HOST_ROUTE_IDS];
   const registry = build({ portedRouteIds: ported });
   assertCoverage(registry, ported);
-  assert.equal(registry.portedRouteIds.length, 30);
+  assert.equal(registry.portedRouteIds.length, 36);
   assert.deepEqual([...registry.unportedRouteIds], [...OD_CR_2_UNPORTED_ROUTE_IDS].sort());
 });
 
@@ -305,8 +323,8 @@ test("PRODUCTION_ROUTE_ROOT_CLAIMED: a root route ported or given a handler", ()
   }
 });
 
-test("PRODUCTION_ROUTE_PORT_UNDECIDED: no od-cr-2 route can be ported before OD-CR-2", () => {
-  assert.equal(OD_CR_2_UNPORTED_ROUTE_IDS.length, 19);
+test("PRODUCTION_ROUTE_PORT_UNDECIDED: no od-cr-2 route can be ported without an owner answer", () => {
+  assert.equal(OD_CR_2_UNPORTED_ROUTE_IDS.length, 13);
   for (const id of OD_CR_2_UNPORTED_ROUTE_IDS) {
     refused(() => build({ portedRouteIds: [...POSTGRES_SCOPE_ROUTE_IDS, id] }),
       "PRODUCTION_ROUTE_PORT_UNDECIDED", id);
@@ -336,6 +354,7 @@ test("PRODUCTION_ROUTE_HANDLER_UNEXPECTED: a handler outside the ported set", ()
   const extraKeys = [
     ...OD_CR_2_UNPORTED_ROUTE_IDS,
     ...OD_CR_1_CONTESTED_ROUTE_IDS,
+    ...ADMIN_HOST_ROUTE_IDS,
     EFFECTIVE_PAGE_PATH,
     "/api/health",
     "unknown_api",
@@ -357,6 +376,77 @@ test("PRODUCTION_ROUTE_HANDLER_MISSING: every ported id has a function", () => {
     handlers.set(id, { fetch: stub(id) });
     refused(() => build({ portedRouteIds: ported, handlers }), "PRODUCTION_ROUTE_HANDLER_MISSING", `${id} not a function`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// One registry: the route modules fold into the ported handlers
+
+const DAILY = "/api/v1/community/daily";
+const UPLOAD_AUTHORIZATIONS = "/api/v1/device/upload-authorizations";
+
+function modulesFor(entries) {
+  return createOriginRouteModuleRegistry({
+    routePolicy: policy,
+    modules: entries.map(([method, pathname, body]) => defineOriginRouteModule({
+      method, pathname, overridesBuiltIn: true,
+      handler: async (_request, context) => new Response(JSON.stringify({ body, context }), { status: 200 }),
+    })),
+  });
+}
+
+test("route modules fold into the registry: the module for the method, else the built-in", async () => {
+  const contexts = [];
+  const registry = createProductionRouteRegistry({
+    routePolicy: policy,
+    portedRouteIds: productionPortedRouteIds,
+    handlers: handlersFor(productionPortedRouteIds),
+    routeModules: modulesFor([["GET", DAILY, "daily-module"], ["POST", UPLOAD_AUTHORIZATIONS, "upload-module"]]),
+    routeModuleContext: (request) => {
+      contexts.push(request);
+      return Object.freeze({ origin: "https://tibotattle.test", hostMode: "synthetic", requestId: "id" });
+    },
+  });
+  const daily = new Request(`https://tibotattle.test${DAILY}?from=2026-10-01&to=2026-10-01`);
+  const served = await registry.resolve("community_daily").handler(daily);
+  assert.deepEqual(await served.json(), {
+    body: "daily-module", context: { origin: "https://tibotattle.test", hostMode: "synthetic", requestId: "id" },
+  });
+  assert.deepEqual(contexts, [daily]);
+  const upload = await registry.resolve("device_upload_authorization").handler(
+    new Request(`https://tibotattle.test${UPLOAD_AUTHORIZATIONS}`, { method: "POST", body: "{}" }));
+  assert.equal((await upload.json()).body, "upload-module");
+  // No module for this method: the built-in answers; a route without a module is untouched.
+  const builtIn = await registry.resolve("community_daily").handler(
+    new Request(`https://tibotattle.test${DAILY}`, { method: "POST", body: "{}" }));
+  assert.equal(await builtIn.text(), "community_daily");
+  assert.equal(registry.resolve("contributions").handler.routeId, "contributions");
+  // Each module call built its context once; the built-in answer built none.
+  assert.equal(contexts.length, 2);
+});
+
+test("PRODUCTION_ROUTE_MODULES_INVALID and a module for an unported route", () => {
+  const modules = modulesFor([["GET", DAILY, "daily-module"]]);
+  for (const [routeModules, routeModuleContext] of [
+    [{ pathnames: [DAILY], size: 1, resolve: () => null }, () => ({})],
+    [Object.freeze({ ...modules }), () => ({})],
+    [modules, undefined],
+    [modules, {}],
+    [null, () => ({})],
+  ]) {
+    refused(() => createProductionRouteRegistry({
+      routePolicy: policy, portedRouteIds: productionPortedRouteIds,
+      handlers: handlersFor(productionPortedRouteIds), routeModules, routeModuleContext,
+    }), "PRODUCTION_ROUTE_MODULES_INVALID");
+  }
+  // The scope always ports both overridable built-ins, so a module can only
+  // reach an unported route through a policy that is not the pinned one;
+  // the registry still refuses it on its own pathname check.
+  refused(() => createProductionRouteRegistry({
+    routePolicy: policy, portedRouteIds: productionPortedRouteIds,
+    handlers: handlersFor(productionPortedRouteIds),
+    routeModules: Object.assign(Object.create(null), modules),
+    routeModuleContext: () => ({}),
+  }), "PRODUCTION_ROUTE_MODULES_INVALID", "a copy is not an issued module registry");
 });
 
 test("PRODUCTION_ROUTE_UNKNOWN: resolve answers only policy ids", () => {

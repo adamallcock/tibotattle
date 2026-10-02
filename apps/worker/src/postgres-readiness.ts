@@ -1,5 +1,5 @@
 /**
- * RD-2 /api/ready for the Cloud Run origin: the pure half (CR-6/CR-7 phase A).
+ * RD-2 /api/ready for the Cloud Run origin (CR-6/CR-7).
  *
  * lifecycleReadiness is a verbatim port of the d43c8f92 Worker function of
  * the same name (src/index.ts, before handleReady), over the PostgreSQL
@@ -7,22 +7,35 @@
  * buildPostgresReadinessBody mirrors handleReady's body for typed storage
  * mode, where the aggregate rebuild is delegated.
  *
- * Nothing here reads storage. The readers (one REPEATABLE READ READ ONLY
- * transaction over the primary receipt, retention_state,
- * quarantine_reconciliation_state and the typed pins) and the
- * postgres-readiness-dispatch.mjs dispatcher are phase B: they need
- * LEAD-SIMP's single primary-only receipt reader (critic conflict 3). A
- * missing retention or reconciliation row, an unpinned namespace or a
- * receipt that is not current is the reader's 503
- * BACKEND_STORAGE_UNAVAILABLE, before this builder runs, exactly as the
- * Worker throws before building its body.
+ * readPostgresReadinessState is the one storage read (D-CRB): a single
+ * REPEATABLE READ READ ONLY transaction over the primary migration receipt
+ * (through the one shared reader, src/postgres-schema-receipt.ts),
+ * retention_state and quarantine_reconciliation_state (the rows C-MAINT's
+ * lifecycle pass writes) and the typed v1 and v1.1 namespace pins. A receipt
+ * that is not current, a missing row or an unpinned namespace is 503
+ * BACKEND_STORAGE_UNAVAILABLE, before the builder runs, exactly as the
+ * Worker throws before building its body (owner decision OD-CR-4:
+ * Worker-exact readiness; an empty origin reads not_ready until the first
+ * pass). It reads no ledger and no erasure relation.
  */
 import { BACKEND_LIFECYCLE_STALE_MILLISECONDS } from "./constants";
+import { ApiError } from "./errors";
+import {
+  quotePostgresIdentifier,
+  withPostgresRead,
+  type PostgresClient,
+  type PostgresPool,
+} from "./postgres-client";
 import {
   maintenanceCyclesMatch,
+  readPostgresQuarantineReconciliationState,
+  readPostgresRetentionState,
+  StateShapeError,
   type PostgresQuarantineReconciliationState,
   type PostgresRetentionState,
 } from "./postgres-lifecycle-state";
+import { readSchemaReceipt, type PostgresSchemaReceiptMigration } from "./postgres-schema-receipt";
+import { encodeTypedTelemetryId } from "./typed-telemetry-codec";
 import {
   POSTGRES_READINESS_RUN_STATES,
   POSTGRES_READINESS_SEMANTICS,
@@ -196,4 +209,94 @@ export function buildPostgresReadinessBody(
     },
   };
   return { httpStatus: ready ? 200 : 503, body };
+}
+
+/** The transaction bounds of the readiness read (the readiness pool, one connection). */
+export const POSTGRES_READINESS_READ_TIMEOUTS = Object.freeze({
+  statementTimeoutMilliseconds: 3_000,
+  lockTimeoutMilliseconds: 1_000,
+});
+
+export interface PostgresReadinessReadOptions {
+  readonly primarySchema: string;
+  /** TELEMETRY_STORAGE_NAMESPACE: the typed v1 and v1.1 pins must name it. */
+  readonly sourceNamespace: string;
+  /** The image's manifest (POSTGRES_RUNTIME_MIGRATIONS.primary). */
+  readonly expectedPrimaryMigrations: readonly PostgresSchemaReceiptMigration[];
+}
+
+function storageUnavailable(): ApiError {
+  return new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+}
+
+function sameBytes(value: unknown, expected: Uint8Array): boolean {
+  return value instanceof Uint8Array && value.byteLength === expected.byteLength
+    && value.every((byte, index) => byte === expected[index]);
+}
+
+/**
+ * The d43c8f92 typed pin (telemetry-storage-mode.ts resolveTelemetryStorageMode
+ * for 'v1' and 'v11'): the singleton admission state names the configured
+ * namespace, carries runtime contract version 1 and joins a namespace row
+ * whose original id is exactly encodeTypedTelemetryId(namespace).
+ * PostgreSQL has no typed_telemetry_schema table, so that third join of the
+ * D1 query is omitted.
+ */
+async function assertTypedPin(
+  client: PostgresClient,
+  quotedSchema: string,
+  stateTable: "typed_v1_admission_state" | "typed_v11_admission_state",
+  sourceNamespace: string,
+): Promise<void> {
+  const originalId = encodeTypedTelemetryId(sourceNamespace);
+  const result = await client.query<{ source_namespace: unknown; runtime_contract_version: unknown; original_id: unknown }>(
+    `SELECT state.source_namespace, state.runtime_contract_version, namespace.original_id
+       FROM ${quotedSchema}."${stateTable}" state
+       JOIN ${quotedSchema}."typed_telemetry_namespaces" namespace ON namespace.id = state.namespace_id
+      WHERE state.id = 1`,
+  );
+  const row = result.rows[0];
+  if (result.rows.length !== 1 || row === undefined || row.source_namespace !== sourceNamespace
+      || Number(row.runtime_contract_version) !== 1 || !sameBytes(row.original_id, originalId)) {
+    throw storageUnavailable();
+  }
+}
+
+/**
+ * Read the state readiness reports, in one REPEATABLE READ READ ONLY snapshot
+ * with POSTGRES_READINESS_READ_TIMEOUTS. Throws 503 BACKEND_STORAGE_UNAVAILABLE
+ * for a receipt that is not current, a missing or malformed row, or an
+ * unpinned namespace (an invalid namespace setting included); a driver
+ * failure propagates as the sanitized PostgresStorageError, which the root
+ * answers 500 INTERNAL_ERROR, as the Worker answers a D1 failure.
+ */
+export async function readPostgresReadinessState(
+  pool: PostgresPool,
+  options: PostgresReadinessReadOptions,
+): Promise<PostgresReadinessState> {
+  const { primarySchema, sourceNamespace, expectedPrimaryMigrations } = options;
+  let quotedSchema: string;
+  try {
+    quotedSchema = quotePostgresIdentifier(primarySchema);
+    encodeTypedTelemetryId(sourceNamespace);
+  } catch {
+    throw storageUnavailable();
+  }
+  return withPostgresRead(pool, async (client) => {
+    const receipt = await readSchemaReceipt(client, { schema: primarySchema, expected: expectedPrimaryMigrations });
+    if (receipt !== "current") throw storageUnavailable();
+    const schema = { primarySchema };
+    const retention = await readPostgresRetentionState(client, schema);
+    if (retention === null) throw storageUnavailable();
+    const reconciliation = await readPostgresQuarantineReconciliationState(client, schema);
+    if (reconciliation === null) throw storageUnavailable();
+    await assertTypedPin(client, quotedSchema, "typed_v1_admission_state", sourceNamespace);
+    await assertTypedPin(client, quotedSchema, "typed_v11_admission_state", sourceNamespace);
+    return Object.freeze({ retention, reconciliation });
+  }, {
+    ...POSTGRES_READINESS_READ_TIMEOUTS,
+    operation: "readiness.read",
+    preserveSafeError: (error) => error instanceof ApiError ? error
+      : error instanceof StateShapeError ? storageUnavailable() : null,
+  });
 }

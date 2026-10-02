@@ -22,7 +22,7 @@ import {
 } from "../cloud-run/analytics-refresh.mjs";
 import * as configuration from "../cloud-run/postgres-production-configuration.mjs";
 import * as migrations from "../cloud-run/postgres-production-migrations.mjs";
-import { CLOUD_RUN_IAM_TEST_TARGET } from "../cloud-run/postgres-test-dispatch.mjs";
+import { CLOUD_RUN_IAM_TEST_TARGET } from "../cloud-run/cloud-run-iam-test-target.mjs";
 import { GCP_PRIVATE_TEST_TARGET } from "./gcp-test-project.mjs";
 import { FASTPATH_TEST, REFRESH_JOB_PROFILES } from "./gcp-fastpath-test-deploy.mjs";
 import * as manifest from "./gcp-ops-infra-manifest.mjs";
@@ -789,7 +789,12 @@ test("rolloutTarget gives OPS-10 its closed target from the environment's commit
     // The EP-6 verifier path roll reads /api/health through outside gcp mode.
     verifierServiceAccount: `synthetic-verifier@${UNMARKED_PROJECT}.iam.gserviceaccount.com`,
     originAudience: "synthetic-edge-origin-audience",
+    // No maintenance Job in JOB_NAMES yet (D-OPS4): OPS-10's roll then refuses
+    // the origin-verifier path (ROLLOUT_MAINTENANCE_JOB_REQUIRED, D-CRB).
+    maintenanceJob: null,
   });
+  assert.equal(manifest.MAINTENANCE_JOB_KEY, "maintenance");
+  assert.equal(manifest.JOB_NAMES.includes(manifest.MAINTENANCE_JOB_KEY), false);
   assert.equal(Object.isFrozen(target.jobNames), true);
   assert.equal(manifest.rolloutTarget("staging", { readFile }).service, "synthetic-staging-origin");
   const refusedWith = (environment, text, code) => {

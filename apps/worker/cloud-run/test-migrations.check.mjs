@@ -28,7 +28,7 @@ import {
   functionSignature,
   restrictedFunctionsMatchPolicy,
 } from "./test-migrations.mjs";
-import { CLOUD_RUN_IAM_TEST_TARGET } from "./postgres-test-dispatch.mjs";
+import { CLOUD_RUN_IAM_TEST_TARGET } from "./cloud-run-iam-test-target.mjs";
 
 const EXECUTION = "tibotattle-test-database-migrate-20260924-abc12";
 // The retired A2 primary target (owner decision OD-6): the shared test

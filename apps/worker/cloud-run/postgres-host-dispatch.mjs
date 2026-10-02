@@ -1,5 +1,5 @@
 /**
- * CR-6: the Worker-order request handler of the Cloud Run origin (phase A).
+ * CR-6: the Worker-order request handler of the Cloud Run origin.
  *
  * createProductionRequestHandler is the inner handler EP-6
  * (createEdgeOriginDispatch) wraps in production and, after phase B, in
@@ -14,9 +14,15 @@
  *    never rebuilds on www).
  * 2. The admin host follows the injected OD-CR-3 policy, which has no
  *    default: 'refuse' answers 503 POSTGRES_ROUTE_NOT_PORTED before
- *    anything else; 'chokepoint' runs the Worker's Access verification and
- *    owner pin first, then continues (admin route ids get the identity key
- *    in their request context).
+ *    anything else; 'chokepoint' runs the injected Access chokepoint
+ *    (src/postgres-admin-access.ts createPostgresAdminAccessChokepoint, built
+ *    once: the Worker's Access verification and owner pin) on every
+ *    admin-host request first. A ported admin route id then goes straight to
+ *    its family with {requestId, routeId, adminIdentityKey} registered: the
+ *    registry method envelope does not run first, because the family answers
+ *    its own 405 after the identity check (C-ADMIN root contract). Any other
+ *    route, an unported admin id included, continues through the generic
+ *    pipeline below.
  * 3. On the public host, the admin surface paths and the six admin route ids
  *    answer 404 NOT_FOUND.
  * 4. An exact route checks its registry methods: 405 METHOD_NOT_ALLOWED with
@@ -49,7 +55,6 @@
  * over the same registry. Phase B wires both (see the W3-CRA receipt).
  */
 
-import { authorizeAdminEmail, verifyAdminAccessAssertion } from "../src/admin-access.ts";
 import {
   adminHostname,
   canonicalPublicOrigin,
@@ -140,6 +145,7 @@ export const ORIGIN_HANDLER_CONFIGURATION_CODES = Object.freeze([
   "PRODUCTION_HANDLER_DIAGNOSTIC_INVALID",
   "PRODUCTION_HANDLER_LOGGER_INVALID",
   "PRODUCTION_HANDLER_ADMIN_HOST_POLICY_UNDECIDED",
+  "PRODUCTION_HANDLER_ADMIN_ACCESS_INVALID",
   "PRODUCTION_HANDLER_UNPORTED_RETRY_AFTER_UNDECIDED",
   "PRIVATE_TEST_HANDLER_ORIGIN_INVALID",
   "PRIVATE_TEST_HANDLER_FALLBACK_INVALID",
@@ -168,12 +174,11 @@ function noStore(response) {
 }
 
 /**
- * OD-CR-6(iv) (open owner decision): the unported answer's retry-after.
- * null sends none, as the base's fail-closed unported answers
- * (postgres-test-dispatch.mjs and the edge-test EDGE_TEST_UNPORTED_BODY)
- * send none; a positive safe integer sends that many seconds (the brief
- * proposes 60, which apps/local/accountless-contribution.js retries as
- * transient). There is no default.
+ * OD-CR-6(iv): the unported answer's retry-after. The composition root
+ * passes null (postgres-production-host.mjs
+ * PRODUCTION_UNPORTED_RETRY_AFTER_SECONDS): none is sent, as the loopback
+ * fallback's fail-closed answers (postgres-test-dispatch.mjs) send none. A
+ * positive safe integer would send that many seconds. There is no default.
  */
 function validatedUnportedRetryAfter(value) {
   if (value === null || (Number.isSafeInteger(value) && value >= 1)) return value;
@@ -290,6 +295,20 @@ function validatedLogger(logger) {
 }
 
 /**
+ * The storage gate before a route module: a receipt that is not current, or
+ * a gate that cannot read it, is 503 BACKEND_STORAGE_UNAVAILABLE (the answer
+ * the v1.2 family gives for the same gate), never the 500 of an unexpected
+ * throw.
+ */
+async function assertStorageCurrent(storageGate) {
+  try {
+    await storageGate.assertCurrent();
+  } catch {
+    throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+  }
+}
+
+/**
  * Build the production request handler. Every parameter is required except
  * logger (console.log by default):
  * - registry: an issued CR-6 registry over the Worker's WORKER_ROUTE_POLICY;
@@ -301,6 +320,8 @@ function validatedLogger(logger) {
  * - recordDiagnostic: (event) => Promise, e.g. recordPostgresDiagnosticError
  *   bound to the data pool; it never changes the answer;
  * - adminHostPolicy: one of ORIGIN_ADMIN_HOST_POLICIES (OD-CR-3, no default);
+ * - adminAccess: the Access chokepoint, (request) => Promise<identityKey>,
+ *   required with 'chokepoint' and refused with 'refuse';
  * - unportedRetryAfterSeconds: null or a positive integer, the unported
  *   answer's retry-after (OD-CR-6(iv), no default).
  */
@@ -313,6 +334,7 @@ export function createProductionRequestHandler({
   recordDiagnostic,
   logger,
   adminHostPolicy,
+  adminAccess,
   unportedRetryAfterSeconds,
 } = {}) {
   if (!isProductionRouteRegistry(registry) || registry.routePolicy !== WORKER_ROUTE_POLICY) {
@@ -333,6 +355,9 @@ export function createProductionRequestHandler({
   const log = validatedLogger(logger);
   if (!ORIGIN_ADMIN_HOST_POLICIES.includes(adminHostPolicy)) {
     throw configurationError("PRODUCTION_HANDLER_ADMIN_HOST_POLICY_UNDECIDED");
+  }
+  if (adminHostPolicy === "chokepoint" ? typeof adminAccess !== "function" : adminAccess !== undefined) {
+    throw configurationError("PRODUCTION_HANDLER_ADMIN_ACCESS_INVALID");
   }
   const retryAfterSeconds = validatedUnportedRetryAfter(unportedRetryAfterSeconds);
 
@@ -382,14 +407,18 @@ export function createProductionRequestHandler({
       let adminIdentityKey = null;
       if (adminHost) {
         if (adminHostPolicy === "refuse") throw routeNotPorted(retryAfterSeconds);
-        const identity = await verifyAdminAccessAssertion(request, env);
-        adminIdentityKey = authorizeAdminEmail(identity, Reflect.get(env, "ACCESS_ADMIN_EMAIL"));
+        adminIdentityKey = await adminAccess(request);
       } else if (configuredAdminHostname !== null
           && (isAdminSurfacePath(url.pathname)
             || (route.kind === "exact" && ADMIN_ROUTE_ID_SET.has(route.id)))) {
         throw new ApiError(404, "NOT_FOUND");
       }
-      if (route.kind === "exact") assertRouteMethod(request, route);
+      // A ported admin route answers its own 405 after the identity check (the
+      // C-ADMIN family, as the Worker's handlers); an unported one keeps the
+      // registry envelope, then the unported answer.
+      const adminRoute = adminIdentityKey !== null && route.kind === "exact" && ADMIN_ROUTE_ID_SET.has(route.id)
+        && registry.resolve(route.id).disposition === ORIGIN_ROUTE_DISPOSITIONS.PORTED;
+      if (route.kind === "exact" && !adminRoute) assertRouteMethod(request, route);
       if (route.id === "community_daily" && !publicAnalyticsEnabled(env)) {
         return noStore(errorResponse(new ApiError(503, "PUBLICATION_DISABLED"), requestId));
       }
@@ -398,8 +427,8 @@ export function createProductionRequestHandler({
       const resolved = registry.resolve(route.id);
       if (resolved.disposition === ORIGIN_ROUTE_DISPOSITIONS.ROOT) throw new ApiError(404, "NOT_FOUND");
       if (resolved.disposition !== ORIGIN_ROUTE_DISPOSITIONS.PORTED) throw routeNotPorted(retryAfterSeconds);
-      if (route.id === "community_daily") await storageGate.assertCurrent();
-      const context = adminIdentityKey !== null && ADMIN_ROUTE_ID_SET.has(route.id)
+      if (route.id === "community_daily") await assertStorageCurrent(storageGate);
+      const context = adminRoute
         ? { requestId, routeId: route.id, adminIdentityKey }
         : { requestId, routeId: route.id };
       const response = await requestContextStore.dispatch(request, context, resolved.handler);

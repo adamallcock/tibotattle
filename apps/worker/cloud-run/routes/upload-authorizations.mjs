@@ -50,6 +50,7 @@
  */
 
 import { defineOriginRouteModule } from "../origin-route-modules.mjs";
+import { requestIdFrom } from "../postgres-request-context.mjs";
 import {
   parseUploadAuthorizationRequest,
   resolveUploadAuthorizationFormat,
@@ -150,7 +151,7 @@ export function createUploadAuthorizationRouteModule(dependencies) {
     }
     // The built-in serves no query string on this route.
     if (url.search) return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
-    const requestId = crypto.randomUUID();
+    const requestId = requestIdFrom(deps.requestContext, request);
     try {
       await deps.assertStorageCurrent();
       deps.assertAdmissionBindings(admissionEnv);

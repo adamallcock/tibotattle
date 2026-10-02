@@ -1,9 +1,12 @@
 /**
  * Shared request plumbing for the v1.1 origin route modules (GCP fast path,
  * IN-2): the Worker's readBoundedJson, deviceSyncPrincipal and error body,
- * over injected PostgreSQL adapters. Plain JavaScript with no imports, so
- * node:test specs load the route modules directly.
+ * over injected PostgreSQL adapters. Plain JavaScript whose one import is
+ * the import-free request-context leaf, so node:test specs load the route
+ * modules directly.
  */
+
+import { requestIdFrom } from "../postgres-request-context.mjs";
 
 export function routeFailure(status, code, responseHeaders) {
   return Object.assign(new Error(code), {
@@ -35,12 +38,21 @@ export function jsonResponse(status, value, additionalHeaders = {}) {
 }
 
 /**
+ * The root's request id for this exact Request (OD-CR-6 (i)): the route's
+ * error body carries the id the root logs, through deps.requestContext (FC-4).
+ * Without an accessor (a unit harness) a fresh id is minted.
+ */
+export function routeRequestId(deps, request) {
+  return requestIdFrom(deps?.requestContext, request);
+}
+
+/**
  * The Worker's catch path (index.ts, family contract FC-5): a closed
  * ApiError-shaped error keeps its status, code, details and headers; anything
  * else is 500 INTERNAL_ERROR, and no thrown message reaches the body. Storage
  * failures arrive here already closed as 503 BACKEND_STORAGE_UNAVAILABLE.
  */
-export function routeErrorResponse(error) {
+export function routeErrorResponse(error, requestId = crypto.randomUUID()) {
   const closed = Number.isSafeInteger(error?.status) && error.status >= 400 && error.status <= 599
     && typeof error?.code === "string" && /^[A-Z0-9_]+$/u.test(error.code);
   const effective = closed ? error : routeFailure(500, "INTERNAL_ERROR");
@@ -51,7 +63,7 @@ export function routeErrorResponse(error) {
   return jsonResponse(effective.status, {
     error: {
       code: effective.code,
-      requestId: crypto.randomUUID(),
+      requestId,
       ...(effective.publicDetails && typeof effective.publicDetails === "object"
         ? { details: effective.publicDetails } : {}),
     },

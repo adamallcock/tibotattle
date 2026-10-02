@@ -41,7 +41,7 @@ import {
   OPERATOR_ONLY_PRIMARY_FUNCTIONS,
   RUNTIME_PRIMARY_FUNCTIONS,
 } from "./postgres-runtime-grants.mjs";
-import { CLOUD_RUN_IAM_TEST_TARGET } from "./postgres-test-dispatch.mjs";
+import { CLOUD_RUN_IAM_TEST_TARGET } from "./cloud-run-iam-test-target.mjs";
 import {
   FASTPATH_MIGRATION_TARGETS,
   GRAPH_BENCHMARK_MIGRATION_TARGETS,

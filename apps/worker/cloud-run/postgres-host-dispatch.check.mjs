@@ -48,6 +48,7 @@ let adminUi;
 let routeRegistry;
 let edgeProxy;
 let adminAccess;
+let adminChokepoint;
 let policy;
 
 before(async () => {
@@ -60,7 +61,7 @@ before(async () => {
   });
   const load = (path) => vite.ssrLoadModule(path);
   [dispatch, registryModule, contextModule, edgeDispatch, limiters, errors, adminUi, routeRegistry,
-    edgeProxy, adminAccess] = await Promise.all([
+    edgeProxy, adminAccess, adminChokepoint] = await Promise.all([
     load("/cloud-run/postgres-host-dispatch.mjs"),
     load("/cloud-run/postgres-production-registry.mjs"),
     load("/cloud-run/postgres-request-context.mjs"),
@@ -71,6 +72,7 @@ before(async () => {
     load("/src/route-registry.ts"),
     load("/src/edge-origin-proxy.ts"),
     load("/src/admin-access.ts"),
+    load("/src/postgres-admin-access.ts"),
   ]);
   policy = routeRegistry.WORKER_ROUTE_POLICY;
 });
@@ -128,6 +130,11 @@ function fixture({
     recordDiagnostic: recordDiagnostic ?? (async (event) => { diagnostics.push(event); }),
     logger: logger ?? ((line) => { lines.push(line); }),
     adminHostPolicy,
+    // The chokepoint is built once over the env (C-ADMIN); the loopback
+    // fixtures alone may honour the test key seam.
+    ...(adminHostPolicy === "chokepoint"
+      ? { adminAccess: adminChokepoint.createPostgresAdminAccessChokepoint(env, { allowTestJwks: true }) }
+      : {}),
     unportedRetryAfterSeconds,
   });
   return {
@@ -313,6 +320,9 @@ test("createProductionRequestHandler refuses every malformed or undecided input 
     ["PRODUCTION_HANDLER_ADMIN_HOST_POLICY_UNDECIDED", { adminHostPolicy: undefined }],
     ["PRODUCTION_HANDLER_ADMIN_HOST_POLICY_UNDECIDED", { adminHostPolicy: "" }],
     ["PRODUCTION_HANDLER_ADMIN_HOST_POLICY_UNDECIDED", { adminHostPolicy: "allow" }],
+    ["PRODUCTION_HANDLER_ADMIN_ACCESS_INVALID", { adminHostPolicy: "chokepoint" }],
+    ["PRODUCTION_HANDLER_ADMIN_ACCESS_INVALID", { adminHostPolicy: "chokepoint", adminAccess: {} }],
+    ["PRODUCTION_HANDLER_ADMIN_ACCESS_INVALID", { adminAccess: async () => "owner@synthetic.example" }],
     ...[undefined, 0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1, "60", true, {}]
       .map((unportedRetryAfterSeconds) =>
         ["PRODUCTION_HANDLER_UNPORTED_RETRY_AFTER_UNDECIDED", { unportedRetryAfterSeconds }]),
@@ -376,44 +386,76 @@ test("step 2, OD-CR-3 'refuse': every admin-host request is the unported 503, be
   }
 });
 
-test("step 2, OD-CR-3 'chokepoint': the Worker's Access chokepoint first, then the generic pipeline", async () => {
+test("step 2, OD-CR-3 'chokepoint': the Access chokepoint first, then the admin families or the generic pipeline", async () => {
   adminAccess.clearAdminAccessJwksCacheForTests();
   // Unconfigured Access fails closed exactly as the Worker does.
   const unconfigured = fixture({ adminHostPolicy: "chokepoint" });
   await assertError(await unconfigured.handler(unconfigured.edge(request("/api/health", { origin: ADMIN_ORIGIN }), "admin")),
     503, "ADMIN_NOT_CONFIGURED", "unconfigured");
   const access = await accessFixture();
-  const f = fixture({ adminHostPolicy: "chokepoint", env: access.env });
-  const adminRequest = (path, { method = "GET", token, email } = {}) => f.edge(request(path, {
+  const adminRequest = (f, path, { method = "GET", token } = {}) => f.edge(request(path, {
     method,
     origin: ADMIN_ORIGIN,
     headers: token === undefined ? {} : { "cf-access-jwt-assertion": token },
   }), "admin");
-  await assertError(await f.handler(adminRequest("/api/v1/admin/overview")), 403, "ACCESS_REQUIRED", "no token");
-  await assertError(await f.handler(adminRequest("/api/v1/admin/overview", { token: "a.b.c" })), 403,
-    "ACCESS_REQUIRED", "malformed token");
-  const stranger = await access.token({ email: "stranger@synthetic.example" });
-  await assertError(await f.handler(adminRequest("/api/v1/admin/overview", { token: stranger })), 403,
-    "ADMIN_REQUIRED", "valid Access identity, not the owner");
   const owner = await access.token();
-  // Admin route ids: method first (as handleRequest's assertWorkerRouteMethod), then unported.
+  const stranger = await access.token({ email: "stranger@synthetic.example" });
+
+  // The admin family registered (OD-CR-2, C-ADMIN): every admin-host request
+  // passes the chokepoint first; an admin id then goes straight to its family
+  // with the identity key, for every method (the family answers its own 405).
+  const open = fixture({
+    adminHostPolicy: "chokepoint",
+    env: access.env,
+    ported: [...SCOPE_AND_CONTESTED(), ...registryModule.ADMIN_HOST_ROUTE_IDS],
+  });
+  await assertError(await open.handler(adminRequest(open, "/api/v1/admin/overview")), 403, "ACCESS_REQUIRED", "no token");
+  await assertError(await open.handler(adminRequest(open, "/api/v1/admin/overview", { token: "a.b.c" })), 403,
+    "ACCESS_REQUIRED", "malformed token");
+  await assertError(await open.handler(adminRequest(open, "/api/v1/admin/overview", { token: stranger })), 403,
+    "ADMIN_REQUIRED", "valid Access identity, not the owner");
+  assert.equal(open.calls.length, 0, "no family runs before the chokepoint admits the owner");
   for (const id of dispatch.ORIGIN_ADMIN_ROUTE_IDS) {
     const [method] = methodsOf(id);
-    await assertError(await f.handler(adminRequest(pathOf(id), { method, token: owner })), 503,
+    const wrong = method === "GET" ? "POST" : "GET";
+    for (const verb of [method, wrong]) {
+      const response = await open.handler(adminRequest(open, pathOf(id), { method: verb, token: owner }));
+      assert.equal(response.status, 200, `${id} ${verb}`);
+      assert.equal(response.headers.get("cache-control"), "no-store");
+      const call = open.calls.at(-1);
+      assert.equal(call.id, id);
+      assert.deepEqual({ ...call.context },
+        { requestId: EDGE_REQUEST_ID, routeId: id, adminIdentityKey: OWNER_EMAIL }, `${id} ${verb}`);
+    }
+  }
+  // A non-admin route on the admin host falls through to its family, without an identity key.
+  const served = await open.handler(adminRequest(open, "/api/health", { token: owner }));
+  assert.equal(served.status, 200);
+  assert.deepEqual({ ...open.calls.at(-1).context }, { requestId: EDGE_REQUEST_ID, routeId: "health" });
+  // An unported route on the admin host is the closed unported answer, after the chokepoint.
+  await assertError(await open.handler(adminRequest(open, "/api/v1/me/export", { token: owner })), 503,
+    "POSTGRES_ROUTE_NOT_PORTED", "unported on the admin host",
+    { retryAfter: String(TEST_UNPORTED_RETRY_AFTER), requestId: EDGE_REQUEST_ID });
+  await assertError(await open.handler(adminRequest(open, "/api/v1/me/export")), 403, "ACCESS_REQUIRED",
+    "unported on the admin host without a token");
+  // The admin UI paths are the edge's to serve: an asset 404 here (documented deviation).
+  await assertError(await open.handler(adminRequest(open, "/admin", { token: owner })), 404, "NOT_FOUND", "admin UI",
+    { requestId: EDGE_REQUEST_ID });
+
+  // Without the admin family the six ids are unported on the admin host too:
+  // the registry method envelope first (as handleRequest's
+  // assertWorkerRouteMethod), then the unported answer.
+  const closed = fixture({ adminHostPolicy: "chokepoint", env: access.env });
+  for (const id of dispatch.ORIGIN_ADMIN_ROUTE_IDS) {
+    const [method] = methodsOf(id);
+    await assertError(await closed.handler(adminRequest(closed, pathOf(id), { method, token: owner })), 503,
       "POSTGRES_ROUTE_NOT_PORTED", id,
       { retryAfter: String(TEST_UNPORTED_RETRY_AFTER), requestId: EDGE_REQUEST_ID });
     const wrong = method === "GET" ? "POST" : "GET";
-    await assertError(await f.handler(adminRequest(pathOf(id), { method: wrong, token: owner })), 405,
+    await assertError(await closed.handler(adminRequest(closed, pathOf(id), { method: wrong, token: owner })), 405,
       "METHOD_NOT_ALLOWED", `${id} ${wrong}`, { allow: methodsOf(id).join(", ") });
   }
-  // A non-admin route on the admin host falls through to its family, without an identity key.
-  const served = await f.handler(adminRequest("/api/health", { token: owner }));
-  assert.equal(served.status, 200);
-  assert.deepEqual({ ...f.calls.at(-1).context }, { requestId: EDGE_REQUEST_ID, routeId: "health" });
-  // The admin UI paths are the edge's to serve: an asset 404 here (documented deviation).
-  await assertError(await f.handler(adminRequest("/admin", { token: owner })), 404, "NOT_FOUND", "admin UI",
-    { requestId: EDGE_REQUEST_ID });
-  assert.equal(f.calls.length, 1);
+  assert.equal(closed.calls.length, 0);
 });
 
 test("step 3: on the public host, admin paths and the six admin ids are 404 for every method", async () => {
@@ -597,6 +639,15 @@ test("community_daily: storage gate first; 200 unmodified, anything else no-stor
   // Other ported routes never call the gate here (families probe it themselves).
   await drift.handler(request("/api/health"));
   assert.equal(drift.calls.length, 1);
+  // The real gate throws a plain error carrying status 503 (and a gate that
+  // cannot read throws anything): both are the 503, never a 500.
+  for (const thrown of [Object.assign(new Error("BACKEND_STORAGE_UNAVAILABLE"),
+    { code: "BACKEND_STORAGE_UNAVAILABLE", status: 503 }), new TypeError("synthetic gate failure")]) {
+    const plain = fixture({ storageGate: { async assertCurrent() { throw thrown; } } });
+    await assertError(await plain.handler(plain.edge(request("/api/v1/community/daily"))),
+      503, "BACKEND_STORAGE_UNAVAILABLE", `gate throws ${thrown.name}`, { requestId: EDGE_REQUEST_ID });
+    assert.equal(plain.calls.length, 0);
+  }
 });
 
 // ---------------------------------------------------------------------------

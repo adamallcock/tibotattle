@@ -10,11 +10,15 @@ import {
   createUploadAuthorizationFormats,
   registerContributionEnvelope,
 } from "./contribution-envelope-registry.mjs";
+import { requestIdFrom } from "./postgres-request-context.mjs";
+import { isProductionConfiguration } from "./postgres-production-configuration.mjs";
+import {
+  POSTGRES_SCHEMA_RECEIPT_MAJOR,
+  readSchemaReceipt,
+} from "../src/postgres-schema-receipt.ts";
 
 const SCHEMA_IDENTIFIER = /^[a-z_][a-z0-9_]{0,62}$/u;
 const DIGEST = /^[0-9a-f]{64}$/u;
-const MIGRATION_HISTORY_TABLE = "_tibotattle_migration_history";
-const POSTGRES_MAJOR_REQUIRED = 17;
 const CONTRIBUTIONS_PATH = "/api/v1/contributions";
 const COMMUNITY_DAILY_PATH = "/api/v1/community/daily";
 const PARTICIPANT_DEVICES_PATH = "/api/v1/me/devices";
@@ -45,36 +49,6 @@ const DEVICE_UPLOAD_AUTHORIZATION_HEADER =
 const PAIRING_BODY_READ_POLICY = Object.freeze({
   maximumTotalMilliseconds: 15_000,
   maximumIdleMilliseconds: 5_000,
-});
-// The named A2 test deployment's identities. Its cloud-run-iam host mode is
-// retired (owner decision OD-6, 2026-10-02): no host mode serves as this
-// service any more, but its resources stay in the test project until owner
-// action OA-4, so the production refusal lists keep naming every value here
-// (and the shared test database remains the analytics-refresh Job's
-// non-fast-path test target). The `postgres.ledger` entry is a frozen
-// identity of the test estate's ledger instance (retired with the deletion
-// ledger, decisions D2, D4 and D6): no runtime path reads it.
-export const CLOUD_RUN_IAM_TEST_TARGET = Object.freeze({
-  project: "tibotattle",
-  region: "us-east1",
-  service: "tibotattle-test-app",
-  origin: "https://tibotattle-test-app-5t5mehqi7a-ue.a.run.app",
-  listenHost: "0.0.0.0",
-  port: 8080,
-  postgres: Object.freeze({
-    primary: Object.freeze({
-      instanceConnectionName: "tibotattle:us-east1:tibotattle-test-primary-20260922",
-      database: "tibotattle",
-      schema: "tibotattle_v12_a2_20260925",
-    }),
-    ledger: Object.freeze({
-      instanceConnectionName: "tibotattle:us-east1:tibotattle-test-ledger-20260922",
-      database: "tibotattle_ledger",
-      schema: "tibotattle_ledger_v12_a2_20260925",
-    }),
-    iamUser: "tibotattle-test-runtime@tibotattle.iam",
-  }),
-  gcsBucket: "tibotattle-gcs-test-cleanup-20260925-a2",
 });
 
 function configurationError(code) {
@@ -170,6 +144,32 @@ function isAllowedPostgresTestOrigin(value) {
   }
 }
 
+/**
+ * The origins a route family admits (wave-3 host brief B2(a)). A test mode
+ * admits exactly its private origin (loopback http://127.0.0.1:<port>, or
+ * edge-test's https://tibotattle.test). The production host passes the CR-3
+ * configuration it was built from: then the private origin must be that
+ * configuration's public origin, and the admin origin is admitted beside it,
+ * because EP-6 rebuilds an admin-host request on https://admin.<apex> and the
+ * admin host's non-admin routes reach the families behind the chokepoint.
+ * The widening rests only on CR-3's provenance (isProductionConfiguration):
+ * a lookalike configuration is refused, never trusted.
+ */
+function admittedPostgresOrigins(privateOrigin, productionConfiguration) {
+  if (productionConfiguration !== null && productionConfiguration !== undefined) {
+    if (!isProductionConfiguration(productionConfiguration)
+        || privateOrigin !== productionConfiguration.origins.public) {
+      configurationError("POSTGRES_TEST_PRIVATE_ORIGIN_INVALID");
+    }
+    const { public: publicOrigin, admin: adminOrigin } = productionConfiguration.origins;
+    return Object.freeze({ has: (origin) => origin === publicOrigin || origin === adminOrigin });
+  }
+  if (!isAllowedPostgresTestOrigin(privateOrigin)) {
+    configurationError("POSTGRES_TEST_PRIVATE_ORIGIN_INVALID");
+  }
+  return Object.freeze({ has: (origin) => origin === privateOrigin });
+}
+
 /** src/session.ts hasSessionCookie: only the session cookie counts, not any cookie. */
 function hasSessionCookie(cookieHeader) {
   if (!cookieHeader) return false;
@@ -182,15 +182,24 @@ function isRateLimitBinding(limiter) {
   return limiter !== null && typeof limiter === "object" && typeof limiter.limit === "function";
 }
 
-/** Test-only dispatch bypasses the Worker handler entirely, including D1. */
-export async function dispatchCloudRunHostRequest(request, runtime, workerHandler) {
+/**
+ * The host's one request entry: the runtime's private test dispatch, its
+ * test health dispatch, or the production dispatch (HOST_MODE production or
+ * staging, EP-6 in front of the CR-6 handler). The Worker's D1 handler is
+ * never a fallback: a runtime with none of them answers 503
+ * POSTGRES_REQUEST_PATH_UNSUPPORTED (no-store).
+ */
+export async function dispatchCloudRunHostRequest(request, runtime) {
   if (typeof runtime?.postgresTestDispatch === "function") {
     return runtime.postgresTestDispatch(request);
   }
   if (typeof runtime?.postgresTestHealthDispatch === "function") {
     return runtime.postgresTestHealthDispatch(request);
   }
-  return workerHandler(request, runtime?.env);
+  if (typeof runtime?.productionDispatch === "function") {
+    return runtime.productionDispatch(request);
+  }
+  return json(503, { error: { code: "POSTGRES_REQUEST_PATH_UNSUPPORTED", requestId: crypto.randomUUID() } });
 }
 
 function json(status, value, additionalHeaders = {}) {
@@ -206,7 +215,12 @@ function json(status, value, additionalHeaders = {}) {
   });
 }
 
-async function readSchemaReceipt(pool, schema, expected) {
+/**
+ * The storage receipt in its own bounded read-only transaction, through the
+ * one shared reader (src/postgres-schema-receipt.ts readSchemaReceipt, OWN-19
+ * consolidated by D-CRB). Any driver failure is "unavailable", never a throw.
+ */
+async function readStorageReceipt(pool, schema, expected) {
   let client;
   let transactionOpen = false;
   try {
@@ -215,38 +229,10 @@ async function readSchemaReceipt(pool, schema, expected) {
     transactionOpen = true;
     await client.query("SET LOCAL statement_timeout = '3000ms'");
     await client.query("SET LOCAL lock_timeout = '1000ms'");
-    const schemaResult = await client.query(
-      `SELECT current_setting('server_version_num')::integer AS server_version_num,
-              EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = $1) AS schema_exists`,
-      [schema],
-    );
-    const schemaRow = schemaResult.rows[0];
-    const serverMajor = Math.floor(Number(schemaRow?.server_version_num) / 10_000);
-    if (serverMajor !== POSTGRES_MAJOR_REQUIRED) {
-      await client.query("ROLLBACK");
-      transactionOpen = false;
-      return "unsupported_postgres_version";
-    }
-    if (schemaRow?.schema_exists !== true) {
-      await client.query("ROLLBACK");
-      transactionOpen = false;
-      return "schema_missing";
-    }
-    const history = await client.query(
-      `SELECT version, name, checksum_sha256
-         FROM ${schemaTable(schema)}."${MIGRATION_HISTORY_TABLE}"
-        ORDER BY version`,
-    );
-    const matches = history.rows.length === expected.length
-      && expected.every((migration, index) => {
-        const actual = history.rows[index];
-        return actual?.version === migration.version
-          && actual?.name === migration.name
-          && actual?.checksum_sha256 === migration.sha256;
-      });
+    const status = await readSchemaReceipt(client, { schema, expected });
     await client.query("COMMIT");
     transactionOpen = false;
-    return matches ? "current" : "receipt_mismatch";
+    return status;
   } catch {
     if (transactionOpen) {
       try { await client.query("ROLLBACK"); } catch { /* Keep the safe health result. */ }
@@ -270,21 +256,37 @@ function validatedExpectedManifest(expectedMigrations) {
   return validateExpectedMigrations(expectedMigrations.primary, "primary");
 }
 
+/** The largest positive-result TTL a storage gate accepts (OD-CR-10's read bound). */
+export const POSTGRES_STORAGE_GATE_MAX_TTL_MILLISECONDS = 15_000;
+
 /**
- * The storage gate every PostgreSQL test route runs before it touches a
- * pool: the primary migration receipt must equal the expected manifest,
- * read in a bounded read-only transaction. There is no ledger receipt
- * (decisions D2, D4 and D6). The returned assertStorageCurrent() resolves
- * when it is current and otherwise throws 503 BACKEND_STORAGE_UNAVAILABLE,
- * the refusal the v1.2 dispatch gives. Route modules composed beside the
- * dispatch (the upload-authorization route module, the v1.1 intake routes)
- * bind this check so a stale or newer schema refuses them exactly as it
- * refuses the built-in routes.
+ * The storage gate every PostgreSQL route runs before it touches a pool: the
+ * primary migration receipt must equal the expected manifest, read through
+ * the one shared reader in a bounded read-only transaction
+ * (readStorageReceipt). There is no ledger receipt (decisions D2, D4 and D6).
+ *
+ * - assertCurrent() resolves when the receipt is current and otherwise
+ *   throws 503 BACKEND_STORAGE_UNAVAILABLE (no retry-after), the refusal the
+ *   Worker and the v1.2 dispatch give.
+ * - probe(request) is the same check as a Response (200 or 503, no body):
+ *   the healthDispatch shape the route families call before their reads.
+ *
+ * positiveTtlMilliseconds (default 0, at most 15 000) is how long a
+ * 'current' result is reused; nothing else is ever cached, so a drifted or
+ * newer schema is seen on the next call. With 0 (the owner's write-path
+ * answer, OD-ROLL / OD-CR-10, and the only value the origin uses) every call
+ * makes its own receipt read, which starts after the call: no request is ever
+ * admitted on a read older than itself, and no two requests are released in
+ * lock step by a shared read (a request's own work starts when its own read
+ * ends, as it did before the gate existed). With a positive TTL, callers that
+ * miss the cache share one read in flight.
  */
-export function createPostgresTestStorageReceiptCheck({
+export function createPostgresStorageGate({
   primaryPool,
   schemaOptions,
   expectedMigrations,
+  positiveTtlMilliseconds = 0,
+  clock = Date.now,
   ...retired
 }) {
   if (!validPool(primaryPool) || Object.keys(retired).length !== 0) {
@@ -292,10 +294,60 @@ export function createPostgresTestStorageReceiptCheck({
   }
   const schemas = validatedSchemas(schemaOptions);
   const expected = validatedExpectedManifest(expectedMigrations);
-  return async function assertStorageCurrent() {
-    const primaryReceipt = await readSchemaReceipt(primaryPool, schemas.primary, expected);
-    if (primaryReceipt !== "current") throw storageUnavailable();
-  };
+  if (!Number.isSafeInteger(positiveTtlMilliseconds) || positiveTtlMilliseconds < 0
+      || positiveTtlMilliseconds > POSTGRES_STORAGE_GATE_MAX_TTL_MILLISECONDS
+      || typeof clock !== "function") {
+    configurationError("POSTGRES_STORAGE_GATE_CONFIGURATION_INVALID");
+  }
+  const read = () => readStorageReceipt(primaryPool, schemas.primary, expected);
+  let currentAt = null;
+  let inFlight = null;
+
+  /** TTL > 0 only: one read shared by the callers that missed the cache. */
+  function sharedRead() {
+    inFlight ??= read().then((status) => {
+      if (status === "current") currentAt = clock();
+      return status;
+    }).finally(() => {
+      inFlight = null;
+    });
+    return inFlight;
+  }
+
+  async function assertCurrent() {
+    if (positiveTtlMilliseconds === 0) {
+      if (await read() !== "current") throw storageUnavailable();
+      return;
+    }
+    if (currentAt !== null) {
+      const age = clock() - currentAt;
+      if (Number.isFinite(age) && age >= 0 && age < positiveTtlMilliseconds) return;
+    }
+    if (await sharedRead() !== "current") throw storageUnavailable();
+  }
+
+  async function probe() {
+    try {
+      await assertCurrent();
+      return new Response(null, { status: 200, headers: { "cache-control": "no-store" } });
+    } catch {
+      return new Response(null, { status: 503, headers: { "cache-control": "no-store" } });
+    }
+  }
+
+  return Object.freeze({ assertCurrent, probe });
+}
+
+/**
+ * The uncached storage gate as one function (createPostgresStorageGate with
+ * a TTL of 0): resolves when the receipt is current, otherwise throws 503
+ * BACKEND_STORAGE_UNAVAILABLE. Route modules composed beside the dispatch
+ * (the upload-authorization route module, the v1.1 intake routes) bind it so
+ * a stale or newer schema refuses them exactly as it refuses the built-in
+ * routes.
+ */
+export function createPostgresTestStorageReceiptCheck(options) {
+  return createPostgresStorageGate({ ...options, positiveTtlMilliseconds: 0 }).assertCurrent;
 }
 
 /**
@@ -331,7 +383,7 @@ export function createPostgresTestHealthDispatch({
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
     }
 
-    const primary = await readSchemaReceipt(primaryPool, schemas.primary, expected);
+    const primary = await readStorageReceipt(primaryPool, schemas.primary, expected);
     const ready = primary === "current";
     return json(ready ? 200 : 503, {
       schemaVersion: "gcp-postgres-test-health-v2",
@@ -339,7 +391,7 @@ export function createPostgresTestHealthDispatch({
       status: ready ? "ready" : "not_ready",
       workerApplicationReady: false,
       checks: {
-        postgresMajor: POSTGRES_MAJOR_REQUIRED,
+        postgresMajor: POSTGRES_SCHEMA_RECEIPT_MAJOR,
         primaryMigrationReceipt: {
           status: primary,
           version: expected.length,
@@ -378,6 +430,8 @@ function communityDailyQuery(url) {
  * current allowance fit producer and cache-retention lane.
  */
 export function createPostgresTestCommunityDailyDispatch({
+  requestContext,
+  productionConfiguration = null,
   primaryPool,
   schemaOptions,
   sourceIdentity,
@@ -399,8 +453,9 @@ export function createPostgresTestCommunityDailyDispatch({
     configurationError("POSTGRES_TEST_COMMUNITY_DAILY_DISPATCH_CONFIGURATION_INVALID");
   }
   const schemas = validatedSchemas(schemaOptions);
-  if (!isAllowedPostgresTestOrigin(privateOrigin)) {
-    configurationError("POSTGRES_TEST_PRIVATE_ORIGIN_INVALID");
+  const admittedOrigins = admittedPostgresOrigins(privateOrigin, productionConfiguration);
+  if (requestContext !== undefined && typeof requestContext !== "function") {
+    configurationError("POSTGRES_TEST_REQUEST_CONTEXT_INVALID");
   }
 
   return async function dispatchPostgresTestCommunityDaily(request) {
@@ -408,16 +463,16 @@ export function createPostgresTestCommunityDailyDispatch({
     try { url = new URL(request.url); } catch {
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
     }
-    if (url.origin !== privateOrigin || url.pathname !== COMMUNITY_DAILY_PATH) {
+    if (!admittedOrigins.has(url.origin) || url.pathname !== COMMUNITY_DAILY_PATH) {
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
     }
     if (request.method !== "GET") {
       return routeError(Object.assign(new Error("METHOD_NOT_ALLOWED"), {
         code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "GET" },
-      }), crypto.randomUUID());
+      }), requestIdFrom(requestContext, request));
     }
 
-    const requestId = crypto.randomUUID();
+    const requestId = requestIdFrom(requestContext, request);
     try {
       if (request.body !== null) {
         throw Object.assign(new Error("BODY_INVALID"), { code: "BODY_INVALID", status: 400 });
@@ -526,6 +581,8 @@ async function readPersonalDeviceRevocationId(request, readBoundedRequestBody, m
 
 /** Private Cloud Run test routes for Worker-compatible personal device reads and revocation. */
 export function createPostgresTestParticipantDevicesDispatch({
+  requestContext,
+  productionConfiguration = null,
   primaryPool,
   schemaOptions,
   authenticatePostgresPersonalSession,
@@ -549,8 +606,9 @@ export function createPostgresTestParticipantDevicesDispatch({
     configurationError("POSTGRES_TEST_PARTICIPANT_DEVICES_DISPATCH_CONFIGURATION_INVALID");
   }
   const schemas = validatedSchemas(schemaOptions);
-  if (!isAllowedPostgresTestOrigin(privateOrigin)) {
-    configurationError("POSTGRES_TEST_PRIVATE_ORIGIN_INVALID");
+  const admittedOrigins = admittedPostgresOrigins(privateOrigin, productionConfiguration);
+  if (requestContext !== undefined && typeof requestContext !== "function") {
+    configurationError("POSTGRES_TEST_REQUEST_CONTEXT_INVALID");
   }
 
   return async function dispatchPostgresTestParticipantDevices(request) {
@@ -560,10 +618,10 @@ export function createPostgresTestParticipantDevicesDispatch({
     }
     const isDeviceList = url.pathname === PARTICIPANT_DEVICES_PATH;
     const isDeviceRevocation = url.pathname === PARTICIPANT_DEVICE_REVOKE_PATH;
-    if (url.origin !== privateOrigin || (!isDeviceList && !isDeviceRevocation)) {
+    if (!admittedOrigins.has(url.origin) || (!isDeviceList && !isDeviceRevocation)) {
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
     }
-    const requestId = crypto.randomUUID();
+    const requestId = requestIdFrom(requestContext, request);
     const requiredMethod = isDeviceList ? "GET" : "POST";
     if (request.method !== requiredMethod) {
       return routeError(personalDevicesRequestError(405, "METHOD_NOT_ALLOWED", {
@@ -631,6 +689,8 @@ export function createPostgresTestParticipantDevicesDispatch({
 
 /** Private Cloud Run test routes for Worker-compatible social session read and logout. */
 export function createPostgresTestPersonalSessionDispatch({
+  requestContext,
+  productionConfiguration = null,
   primaryPool,
   schemaOptions,
   authenticatePostgresPersonalSession,
@@ -651,8 +711,9 @@ export function createPostgresTestPersonalSessionDispatch({
     configurationError("POSTGRES_TEST_PERSONAL_SESSION_DISPATCH_CONFIGURATION_INVALID");
   }
   const schemas = validatedSchemas(schemaOptions);
-  if (!isAllowedPostgresTestOrigin(privateOrigin)) {
-    configurationError("POSTGRES_TEST_PRIVATE_ORIGIN_INVALID");
+  const admittedOrigins = admittedPostgresOrigins(privateOrigin, productionConfiguration);
+  if (requestContext !== undefined && typeof requestContext !== "function") {
+    configurationError("POSTGRES_TEST_REQUEST_CONTEXT_INVALID");
   }
 
   return async function dispatchPostgresTestPersonalSession(request) {
@@ -662,10 +723,10 @@ export function createPostgresTestPersonalSessionDispatch({
     }
     const isSessionRead = url.pathname === PERSONAL_SESSION_PATH;
     const isLogout = url.pathname === PERSONAL_LOGOUT_PATH;
-    if (url.origin !== privateOrigin || (!isSessionRead && !isLogout)) {
+    if (!admittedOrigins.has(url.origin) || (!isSessionRead && !isLogout)) {
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
     }
-    const requestId = crypto.randomUUID();
+    const requestId = requestIdFrom(requestContext, request);
     const requiredMethod = isSessionRead ? "GET" : "POST";
     if (request.method !== requiredMethod) {
       return routeError(personalDevicesRequestError(405, "METHOD_NOT_ALLOWED", {
@@ -743,6 +804,8 @@ export function createPostgresTestPersonalSessionDispatch({
 
 /** Private Cloud Run test route for issuing a session-bound device pairing. */
 export function createPostgresTestDevicePairingDispatch({
+  requestContext,
+  productionConfiguration = null,
   primaryPool,
   schemaOptions,
   authenticatePostgresPersonalSession,
@@ -767,8 +830,9 @@ export function createPostgresTestDevicePairingDispatch({
     configurationError("POSTGRES_TEST_DEVICE_PAIRING_DISPATCH_CONFIGURATION_INVALID");
   }
   const schemas = validatedSchemas(schemaOptions);
-  if (!isAllowedPostgresTestOrigin(privateOrigin)) {
-    configurationError("POSTGRES_TEST_PRIVATE_ORIGIN_INVALID");
+  const admittedOrigins = admittedPostgresOrigins(privateOrigin, productionConfiguration);
+  if (requestContext !== undefined && typeof requestContext !== "function") {
+    configurationError("POSTGRES_TEST_REQUEST_CONTEXT_INVALID");
   }
 
   return async function dispatchPostgresTestDevicePairing(request) {
@@ -776,10 +840,10 @@ export function createPostgresTestDevicePairingDispatch({
     try { url = new URL(request.url); } catch {
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
     }
-    if (url.origin !== privateOrigin || url.pathname !== PERSONAL_DEVICE_PAIRING_PATH) {
+    if (!admittedOrigins.has(url.origin) || url.pathname !== PERSONAL_DEVICE_PAIRING_PATH) {
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
     }
-    const requestId = crypto.randomUUID();
+    const requestId = requestIdFrom(requestContext, request);
     if (request.method !== "POST") {
       return routeError(personalDevicesRequestError(405, "METHOD_NOT_ALLOWED", {
         allow: "POST",
@@ -878,6 +942,8 @@ export function createPostgresTestDevicePairingDispatch({
 
 /** Private Cloud Run test route for granting social-device v1.2 consent. */
 export function createPostgresTestTelemetryV12ConsentDispatch({
+  requestContext,
+  productionConfiguration = null,
   primaryPool,
   schemaOptions,
   authenticatePostgresPersonalSession,
@@ -899,8 +965,9 @@ export function createPostgresTestTelemetryV12ConsentDispatch({
     configurationError("POSTGRES_TEST_TELEMETRY_V12_CONSENT_DISPATCH_CONFIGURATION_INVALID");
   }
   const schemas = validatedSchemas(schemaOptions);
-  if (!isAllowedPostgresTestOrigin(privateOrigin)) {
-    configurationError("POSTGRES_TEST_PRIVATE_ORIGIN_INVALID");
+  const admittedOrigins = admittedPostgresOrigins(privateOrigin, productionConfiguration);
+  if (requestContext !== undefined && typeof requestContext !== "function") {
+    configurationError("POSTGRES_TEST_REQUEST_CONTEXT_INVALID");
   }
 
   return async function dispatchPostgresTestTelemetryV12Consent(request) {
@@ -908,10 +975,10 @@ export function createPostgresTestTelemetryV12ConsentDispatch({
     try { url = new URL(request.url); } catch {
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
     }
-    if (url.origin !== privateOrigin || url.pathname !== PERSONAL_TELEMETRY_V12_CONSENT_PATH) {
+    if (!admittedOrigins.has(url.origin) || url.pathname !== PERSONAL_TELEMETRY_V12_CONSENT_PATH) {
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
     }
-    const requestId = crypto.randomUUID();
+    const requestId = requestIdFrom(requestContext, request);
     if (request.method !== "POST") {
       return routeError(personalDevicesRequestError(405, "METHOD_NOT_ALLOWED", {
         allow: "POST",
@@ -1005,6 +1072,8 @@ export function createPostgresTestTelemetryV12ConsentDispatch({
 
 /** Private Cloud Run test route for claiming a social device pairing. */
 export function createPostgresTestDevicePairingClaimDispatch({
+  requestContext,
+  productionConfiguration = null,
   primaryPool,
   schemaOptions,
   claimPostgresDevicePairing,
@@ -1022,8 +1091,9 @@ export function createPostgresTestDevicePairingClaimDispatch({
     configurationError("POSTGRES_TEST_DEVICE_PAIRING_CLAIM_DISPATCH_CONFIGURATION_INVALID");
   }
   const schemas = validatedSchemas(schemaOptions);
-  if (!isAllowedPostgresTestOrigin(privateOrigin)) {
-    configurationError("POSTGRES_TEST_PRIVATE_ORIGIN_INVALID");
+  const admittedOrigins = admittedPostgresOrigins(privateOrigin, productionConfiguration);
+  if (requestContext !== undefined && typeof requestContext !== "function") {
+    configurationError("POSTGRES_TEST_REQUEST_CONTEXT_INVALID");
   }
 
   return async function dispatchPostgresTestDevicePairingClaim(request) {
@@ -1031,10 +1101,10 @@ export function createPostgresTestDevicePairingClaimDispatch({
     try { url = new URL(request.url); } catch {
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
     }
-    if (url.origin !== privateOrigin || url.pathname !== DEVICE_PAIRING_CLAIM_PATH) {
+    if (!admittedOrigins.has(url.origin) || url.pathname !== DEVICE_PAIRING_CLAIM_PATH) {
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
     }
-    const requestId = crypto.randomUUID();
+    const requestId = requestIdFrom(requestContext, request);
     if (request.method !== "POST") {
       return routeError(personalDevicesRequestError(405, "METHOD_NOT_ALLOWED", {
         allow: "POST",
@@ -1728,6 +1798,7 @@ async function handlePostgresTestContribution({
   request,
   admissionEnv,
   assertUploadIngressRequestAllowed,
+  uploadIngress,
   primaryPool,
   schema,
   claimPostgresDeviceUploadAuthorization,
@@ -1745,8 +1816,19 @@ async function handlePostgresTestContribution({
   let principal = null;
   let persistStarted = false;
   let handlerReturned = false;
+  let ingressLease = null;
+  let heartbeat = null;
   try {
-    // d43c8f92 index.ts:3339 assertUploadIngressRateLimitBindings.
+    // d43c8f92 index.ts:3337-3340: assertUploadIngressConfiguration, then
+    // assertUploadIngressRateLimitBindings, then the body-read policy, all
+    // before the request preflight. Without the injected ingress authority
+    // (the shared PostgreSQL budget) the route fails closed.
+    if (!isUploadIngressAuthority(uploadIngress)) {
+      throw Object.assign(new Error("ADMISSION_CONFIGURATION_INVALID"), {
+        code: "ADMISSION_CONFIGURATION_INVALID", status: 503,
+      });
+    }
+    uploadIngress.assertConfiguration(admissionEnv);
     if (typeof assertUploadIngressRequestAllowed !== "function"
         || !isRateLimitBinding(admissionEnv?.UPLOAD_INGRESS_REQUEST_RATE_LIMIT)
         || !isRateLimitBinding(admissionEnv?.UPLOAD_INGRESS_CLIENT_RATE_LIMIT)) {
@@ -1754,6 +1836,7 @@ async function handlePostgresTestContribution({
         code: "ADMISSION_CONFIGURATION_INVALID", status: 503,
       });
     }
+    const bodyReadPolicy = uploadIngress.bodyReadPolicy(admissionEnv);
     // d43c8f92 index.ts:621-644 contributionRequestPreflight.
     if (hasSessionCookie(request.headers.get("cookie"))) {
       throw Object.assign(new Error("UPLOAD_AUTH_INVALID"), {
@@ -1793,10 +1876,12 @@ async function handlePostgresTestContribution({
       request,
       admissionEnv,
     );
-    const bytes = await readBoundedRequestBody(request, maxRequestBytes, {
-      maximumTotalMilliseconds: 15_000,
-      maximumIdleMilliseconds: 5_000,
-    });
+    // d43c8f92 index.ts:3348-3354: the shared ingress lease begins before the
+    // body is consumed, and its heartbeat fences every later step.
+    ingressLease = await uploadIngress.acquireLease(admissionEnv);
+    heartbeat = uploadIngress.startHeartbeat(admissionEnv, ingressLease);
+    const bytes = await readBoundedRequestBody(request, maxRequestBytes, bodyReadPolicy);
+    await heartbeat.assertActive();
     let raw;
     let envelope;
     try {
@@ -1832,6 +1917,7 @@ async function handlePostgresTestContribution({
         ? { schema }
         : { schema, accountlessAuthorizationVersion: "v1.1" },
     );
+    await heartbeat.assertActive();
     const claimed = await readClaimedContributionPrincipal(
       primaryPool, schema.primarySchema, claim, envelopeDigest, bodyBytes,
     );
@@ -1855,6 +1941,7 @@ async function handlePostgresTestContribution({
         markPersistStarted() { persistStarted = true; },
       }),
     );
+    await heartbeat.assertActive();
     if (registration.ownsReceipt) return response;
     handlerReturned = true;
     let contributionId;
@@ -1877,7 +1964,35 @@ async function handlePostgresTestContribution({
       // despite a lost response. Its registered row remains recoverable.
     }
     throw error;
+  } finally {
+    // d43c8f92 index.ts:3436-3447: stop the heartbeat, then release the
+    // lease; a failed release never turns a committed contribution into a
+    // client failure (the lease expires on its own).
+    if (heartbeat !== null) await heartbeat.stop();
+    if (ingressLease !== null) {
+      try {
+        await uploadIngress.releaseLease(admissionEnv, ingressLease);
+      } catch {
+        console.warn(JSON.stringify({ level: "warn", event: "upload_ingress_lease_release_failed" }));
+      }
+    }
   }
+}
+
+const UPLOAD_INGRESS_AUTHORITY_KEYS = Object.freeze([
+  "acquireLease", "assertConfiguration", "bodyReadPolicy", "releaseLease", "startHeartbeat",
+]);
+
+/**
+ * The injected upload-ingress authority (src/upload-ingress-admission.ts
+ * bound by the composition root): assertConfiguration(env),
+ * bodyReadPolicy(env), acquireLease(env), startHeartbeat(env, lease) and
+ * releaseLease(env, lease), exactly.
+ */
+function isUploadIngressAuthority(value) {
+  return value !== null && typeof value === "object"
+    && Object.keys(value).sort().join(",") === UPLOAD_INGRESS_AUTHORITY_KEYS.join(",")
+    && UPLOAD_INGRESS_AUTHORITY_KEYS.every((key) => typeof value[key] === "function");
 }
 
 async function readPostgresCollectionControls(pool, schema) {
@@ -2002,6 +2117,8 @@ async function readV12StagedChunkVector(pool, schema, principal, manifestId) {
  * predecessor/activation, manifest registration, upload grants, and chunk writes.
  */
 export function createPostgresTestV12DayManifestDispatch({
+  requestContext,
+  productionConfiguration = null,
   primaryPool,
   schemaOptions,
   expectedMigrations,
@@ -2015,6 +2132,8 @@ export function createPostgresTestV12DayManifestDispatch({
   assertUploadAuthorizationBindings,
   assertUploadAuthorizationAllowed,
   assertUploadIngressRequestAllowed = null,
+  uploadIngress = null,
+  storageGate = null,
   authenticatePostgresDevice,
   disconnectPostgresAuthenticatedDevice,
   readPostgresDeviceSyncState,
@@ -2054,6 +2173,9 @@ export function createPostgresTestV12DayManifestDispatch({
       || typeof assertUploadAuthorizationAllowed !== "function"
       || (assertUploadIngressRequestAllowed !== null
         && typeof assertUploadIngressRequestAllowed !== "function")
+      || (uploadIngress !== null && !isUploadIngressAuthority(uploadIngress))
+      || (storageGate !== null && (typeof storageGate !== "object"
+        || typeof storageGate.assertCurrent !== "function"))
       || typeof authenticatePostgresDevice !== "function"
       || typeof disconnectPostgresAuthenticatedDevice !== "function"
       || typeof readPostgresDeviceSyncCapabilities !== "function"
@@ -2081,10 +2203,12 @@ export function createPostgresTestV12DayManifestDispatch({
     configurationError("POSTGRES_TEST_V12_DISPATCH_CONFIGURATION_INVALID");
   }
   const schemas = validatedSchemas(schemaOptions);
-  const expected = validatedExpectedManifest(expectedMigrations);
-  if (!isAllowedPostgresTestOrigin(privateOrigin)) {
-    configurationError("POSTGRES_TEST_PRIVATE_ORIGIN_INVALID");
-  }
+  // The receipt gate: the root's (production and edge-test pass the shared
+  // gate) or, by default, an uncached one over the same manifest.
+  const assertStorageCurrent = (storageGate ?? createPostgresStorageGate({
+    primaryPool, schemaOptions, expectedMigrations,
+  })).assertCurrent;
+  const admittedOrigins = admittedPostgresOrigins(privateOrigin, productionConfiguration);
   if (accountlessAuthority !== undefined
       && (accountlessAuthority === null || typeof accountlessAuthority !== "object"
         || typeof accountlessAuthority.authenticateV12Grant !== "function"
@@ -2174,13 +2298,16 @@ export function createPostgresTestV12DayManifestDispatch({
     envelopePrivateJwk,
     sourceNamespace,
   });
+  if (requestContext !== undefined && typeof requestContext !== "function") {
+    configurationError("POSTGRES_TEST_REQUEST_CONTEXT_INVALID");
+  }
 
   return async function dispatchPostgresTestV12DayManifest(request) {
     let url;
     try { url = new URL(request.url); } catch {
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
     }
-    if (url.origin !== privateOrigin) {
+    if (!admittedOrigins.has(url.origin)) {
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
     }
     if (request.method === "GET" && url.pathname === "/api/health") {
@@ -2225,46 +2352,46 @@ export function createPostgresTestV12DayManifestDispatch({
     if (envelopeKeyPath && request.method !== "GET") {
       return routeError(Object.assign(new Error("METHOD_NOT_ALLOWED"), {
         code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "GET" },
-      }), crypto.randomUUID());
+      }), requestIdFrom(requestContext, request));
     }
     if (manifestPath && !manifestRoute && !manifestReadRoute) {
       return routeError(Object.assign(new Error("METHOD_NOT_ALLOWED"), {
         code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "GET, POST" },
-      }), crypto.randomUUID());
+      }), requestIdFrom(requestContext, request));
     }
     if ((syncStatePath || syncManifestPath || syncCapabilitiesPath || syncCapabilitiesV12Path)
         && request.method !== "GET") {
       return routeError(Object.assign(new Error("METHOD_NOT_ALLOWED"), {
         code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "GET" },
-      }), crypto.randomUUID());
+      }), requestIdFrom(requestContext, request));
     }
     if (disconnectPath && request.method !== "POST") {
       return routeError(Object.assign(new Error("METHOD_NOT_ALLOWED"), {
         code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "POST" },
-      }), crypto.randomUUID());
+      }), requestIdFrom(requestContext, request));
     }
     if ((v12DomainPredecessorPath || v12DomainActivatePath)
         && request.method !== "POST") {
       return routeError(Object.assign(new Error("METHOD_NOT_ALLOWED"), {
         code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "POST" },
-      }), crypto.randomUUID());
+      }), requestIdFrom(requestContext, request));
     }
     if (v12EffectivePagePath && request.method !== "GET") {
       return routeError(Object.assign(new Error("METHOD_NOT_ALLOWED"), {
         code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "GET" },
-      }), crypto.randomUUID());
+      }), requestIdFrom(requestContext, request));
     }
     if ((accountlessEnrollmentPath || accountlessOwnershipPath || accountlessV12AuthorizationPath
       || accountlessRenewalPath)
         && request.method !== "POST") {
       return routeError(Object.assign(new Error("METHOD_NOT_ALLOWED"), {
         code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "POST" },
-      }), crypto.randomUUID());
+      }), requestIdFrom(requestContext, request));
     }
     if (deviceCredentialRenewalPath && request.method !== "POST") {
       return routeError(Object.assign(new Error("METHOD_NOT_ALLOWED"), {
         code: "METHOD_NOT_ALLOWED", status: 405, responseHeaders: { allow: "POST" },
-      }), crypto.randomUUID());
+      }), requestIdFrom(requestContext, request));
     }
     // d43c8f92 index.ts:710, 740, 767 and 842: every accountless route
     // refuses a browser session cookie (not any cookie) with AUTH_INVALID.
@@ -2273,7 +2400,7 @@ export function createPostgresTestV12DayManifestDispatch({
         && hasSessionCookie(request.headers.get("cookie"))) {
       return routeError(Object.assign(new Error("AUTH_INVALID"), {
         code: "AUTH_INVALID", status: 401,
-      }), crypto.randomUUID());
+      }), requestIdFrom(requestContext, request));
     }
     if ((!envelopeKeyRoute && !manifestRoute && !manifestReadRoute
         && !uploadAuthorizationRoute && !disconnectRoute && !contributionRoute
@@ -2297,16 +2424,13 @@ export function createPostgresTestV12DayManifestDispatch({
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
     }
 
-    const requestId = crypto.randomUUID();
+    const requestId = requestIdFrom(requestContext, request);
     try {
       // Like the Worker route, envelope-key is public configuration projection
       // and must remain available without opening the database pool.
       if (envelopeKeyRoute) return json(200, publicEnvelopeKey(envelopePublicJwk));
 
-      const primaryReceipt = await readSchemaReceipt(primaryPool, schemas.primary, expected);
-      if (primaryReceipt !== "current") {
-        throw storageUnavailable();
-      }
+      await assertStorageCurrent();
 
       assertAdmissionBindings(admissionEnv);
       const schema = Object.freeze({
@@ -2476,6 +2600,7 @@ export function createPostgresTestV12DayManifestDispatch({
           request,
           admissionEnv,
           assertUploadIngressRequestAllowed,
+          uploadIngress,
           primaryPool,
           schema,
           claimPostgresDeviceUploadAuthorization,

@@ -2426,11 +2426,28 @@ test("PG17 through the landed origin dispatch: a shipped client authorizes with 
   const keys = await envelopeKeys();
   const store = memoryObjectStore();
   const allowAll = () => ({ async limit() { return { success: true }; } });
+  // The contributions preamble takes the Worker's upload-ingress lease (D-CRB)
+  // from the PostgreSQL budget, at wrangler.jsonc env.production's policy.
+  const [ingress, ingressBudget] = await Promise.all([
+    workerModule("/src/upload-ingress-admission.ts"), workerModule("/src/postgres-ingress-budget.ts"),
+  ]);
+  const budget = ingressBudget.createPostgresUploadIngressBudget(pool, { primarySchema: schemaOptions.primarySchema });
   const admissionEnv = Object.freeze({
     ENVIRONMENT: "test", ENROLLMENT_RATE_LIMIT: allowAll(), RECOVERY_RATE_LIMIT: allowAll(),
     CLIENT_ATTEMPT_RATE_LIMIT: allowAll(), PUBLIC_READ_RATE_LIMIT: allowAll(),
     UPLOAD_AUTHORIZATION_RATE_LIMIT: allowAll(), UPLOAD_PRINCIPAL_RATE_LIMIT: allowAll(),
     UPLOAD_INGRESS_REQUEST_RATE_LIMIT: allowAll(), UPLOAD_INGRESS_CLIENT_RATE_LIMIT: allowAll(),
+    UPLOAD_INGRESS_QUEUE_MODE: "disabled", UPLOAD_INGRESS_MAX_CONCURRENT: "64",
+    UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE: "1200", UPLOAD_INGRESS_BURST: "1200", UPLOAD_INGRESS_LEASE_SECONDS: "90",
+    UPLOAD_INGRESS_BODY_TOTAL_SECONDS: "60", UPLOAD_INGRESS_BODY_IDLE_SECONDS: "15",
+    UPLOAD_INGRESS_BUDGET: Object.freeze({ getByName: () => budget }),
+  });
+  const uploadIngress = Object.freeze({
+    assertConfiguration: ingress.assertUploadIngressConfiguration,
+    bodyReadPolicy: ingress.uploadIngressBodyReadPolicy,
+    acquireLease: ingress.acquireUploadIngressLease,
+    startHeartbeat: ingress.startUploadIngressLeaseHeartbeat,
+    releaseLease: ingress.releaseUploadIngressLease,
   });
   const mustNotCall = (name) => async () => { throw new Error(`${name} must not be called`); };
   const assertV12UploadAllowed = (formatPool, device, nowEpoch, { schema: formatSchema }) =>
@@ -2475,6 +2492,7 @@ test("PG17 through the landed origin dispatch: a shipped client authorizes with 
       createTelemetryV01ContributionEnvelope({ admitTelemetryV01Contribution: admission.admitPostgresTelemetryV01Contribution }),
     ],
     uploadAuthorizationFormats: legacyFormats,
+    uploadIngress,
   });
   const routeModule = createUploadAuthorizationRouteModule({
     primaryPool: pool, schema: schemaOptions, maxRequestBytes: MAX_REQUEST_BYTES, admissionEnv,

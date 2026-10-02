@@ -9,7 +9,7 @@ import {
   closeCloudSqlResources,
   createIamPool as createCloudSqlIamPool,
 } from "./cloud-sql.mjs";
-import { CLOUD_RUN_IAM_TEST_TARGET } from "./postgres-test-dispatch.mjs";
+import { CLOUD_RUN_IAM_TEST_TARGET } from "./cloud-run-iam-test-target.mjs";
 
 export const TEST_ACTIVATION_JOB = "tibotattle-v12-test-activate";
 export const TEST_ACTIVATION_SERVICE_ACCOUNT =

@@ -1,5 +1,5 @@
 /**
- * CR-6: the production route registry of the Cloud Run origin (phase A).
+ * CR-6: the production route registry of the Cloud Run origin.
  *
  * One registry for the three origin modes (production, edge-test and the
  * loopback fastpath-test). It classifies every route of the Worker's
@@ -15,17 +15,26 @@
  *
  * PRODUCTION_ROUTE_TABLE pins the 51 routes in Worker order (their position
  * in the d43c8f92 policy) with their class:
- * - scope (21): ported by this item's scope (CR-6/CR-7, RD-2, RD-3);
- * - od-cr-1 (9): ported in fastpath-test and edge-test but not named in
- *   scope; the open owner decision OD-CR-1 picks which ones production
- *   serves;
- * - od-cr-2 (19): unported; OD-CR-2 decides per route whether it is ported
- *   before the flip or answers 503 at cutover;
+ * - scope (21): ported by the CR-6/CR-7 scope (with RD-2 and RD-3);
+ * - od-cr-1 (9): the contested routes; the owner answered OD-CR-1 on
+ *   2026-10-02 by porting all nine (src/backend-composition.ts
+ *   POSTGRES_PORTED_WORKER_ROUTE_IDS is scope plus these);
+ * - admin (6): the admin console routes, which OD-CR-2 requires at the
+ *   switch (ported by C-ADMIN); they are served only on the admin host,
+ *   behind the Access chokepoint, and only when the composition root opens
+ *   the admin host (OD-CR-3; ADMIN-R12 opens it after round 12);
+ * - od-cr-2 (13): unported (enroll, Google and Apple sign-in, security
+ *   reset, participant export and the four performance routes), decided
+ *   from production traffic (OD-CR-2); they answer 503 at cutover;
  * - root (2).
- * The ported set is INJECTED (OD-CR-1, no default): it must contain every
- * scope route and may add any subset of the od-cr-1 routes. Porting an
- * od-cr-2 route needs the owner's OD-CR-2 answer and a reviewed change of
- * its class here first.
+ * The ported set is INJECTED: it must contain every scope route and may add
+ * any subset of the od-cr-1 and admin routes. Porting an od-cr-2 route needs
+ * an owner answer and a reviewed change of its class here first.
+ *
+ * One registry (wave-3 critic host gap 5): the origin's route modules
+ * (origin-route-modules.mjs, the overridable built-ins community/daily and
+ * device/upload-authorizations) are folded into this registry's handlers at
+ * startup, so a request consults this registry alone.
  *
  * Retired by append-only (accepted decision 2026-09-26, Variant B offline
  * purge): no online erasure route exists. DELETE /api/v1/me is outside the
@@ -33,11 +42,14 @@
  * and its participantErasure branch (d43c8f92 index.ts handleAdminAction) is
  * never part of a port. RETIRED_ONLINE_ERASURE_SURFACES records both.
  *
- * Plain ESM with no imports: the policy is injected (the request handler
- * then requires it to be the Worker's own WORKER_ROUTE_POLICY object).
+ * Plain ESM whose one import is the import-free route-module seam: the
+ * policy is injected (the request handler then requires it to be the
+ * Worker's own WORKER_ROUTE_POLICY object).
  * Every refusal is a TypeError whose code is one of
  * PRODUCTION_ROUTE_REGISTRY_CODES; nothing else is put into an error.
  */
+
+import { ORIGIN_OVERRIDABLE_BUILT_INS, isOriginRouteModuleRegistry } from "./origin-route-modules.mjs";
 
 export const ORIGIN_ROUTE_DISPOSITIONS = Object.freeze({
   PORTED: "ported",
@@ -49,6 +61,7 @@ export const ORIGIN_ROUTE_DISPOSITIONS = Object.freeze({
 export const PRODUCTION_ROUTE_CLASSES = Object.freeze({
   SCOPE: "scope",
   OD_CR_1: "od-cr-1",
+  ADMIN: "admin",
   OD_CR_2: "od-cr-2",
   ROOT: "root",
 });
@@ -72,6 +85,7 @@ export const PRODUCTION_ROUTE_PARITY_BASIS = Object.freeze({
 
 const S = PRODUCTION_ROUTE_CLASSES.SCOPE;
 const C = PRODUCTION_ROUTE_CLASSES.OD_CR_1;
+const A = PRODUCTION_ROUTE_CLASSES.ADMIN;
 const U = PRODUCTION_ROUTE_CLASSES.OD_CR_2;
 const R = PRODUCTION_ROUTE_CLASSES.ROOT;
 
@@ -95,12 +109,12 @@ export const PRODUCTION_ROUTE_TABLE = Object.freeze([
   ["identity_apple_result", U],
   ["session", C],
   ["logout", C],
-  ["admin_overview", U],
-  ["admin_metrics_history", U],
-  ["admin_community_allowance_preview", U],
-  ["admin_database_health", U],
-  ["admin_reconstruction_progress", U],
-  ["admin_action", U],
+  ["admin_overview", A],
+  ["admin_metrics_history", A],
+  ["admin_community_allowance_preview", A],
+  ["admin_database_health", A],
+  ["admin_reconstruction_progress", A],
+  ["admin_action", A],
   ["security_reset", U],
   ["device_pairing", C],
   ["device_pairing_claim", C],
@@ -138,9 +152,11 @@ function idsOfClass(routeClass) {
 
 /** The 21 routes this item ports in production. */
 export const POSTGRES_SCOPE_ROUTE_IDS = idsOfClass(S);
-/** OD-CR-1: the 9 routes fastpath-test and edge-test serve that production may add. */
+/** OD-CR-1: the 9 contested routes (all ported, owner answer 2026-10-02). */
 export const OD_CR_1_CONTESTED_ROUTE_IDS = idsOfClass(C);
-/** OD-CR-2: the 19 routes the origin does not serve. */
+/** OD-CR-2: the 6 admin console routes, served on the admin host behind the chokepoint. */
+export const ADMIN_HOST_ROUTE_IDS = idsOfClass(A);
+/** OD-CR-2: the 13 routes the origin does not serve. */
 export const OD_CR_2_UNPORTED_ROUTE_IDS = idsOfClass(U);
 
 /** Online-erasure surfaces retired under append-only; neither is a registry route. */
@@ -153,7 +169,7 @@ export const RETIRED_ONLINE_ERASURE_SURFACES = Object.freeze([
   Object.freeze({
     surface: "POST /api/v1/admin/action participantErasure",
     routeId: "admin_action",
-    originAnswer: "503 POSTGRES_ROUTE_NOT_PORTED; a later admin_action port omits this branch",
+    originAnswer: "the admin_action port (C-ADMIN) closes this task (CLOSED_RUN_MAINTENANCE_TASK_KEYS)",
   }),
 ]);
 
@@ -168,6 +184,7 @@ export const PRODUCTION_ROUTE_REGISTRY_CODES = Object.freeze([
   "PRODUCTION_ROUTE_HANDLERS_INVALID",
   "PRODUCTION_ROUTE_HANDLER_UNEXPECTED",
   "PRODUCTION_ROUTE_HANDLER_MISSING",
+  "PRODUCTION_ROUTE_MODULES_INVALID",
   "PRODUCTION_ROUTE_UNKNOWN",
 ]);
 
@@ -208,7 +225,7 @@ function validatedPolicy(routePolicy) {
   return routePolicy;
 }
 
-/** The injected ported set: scope plus any OD-CR-1 subset, nothing else. */
+/** The injected ported set: scope plus any OD-CR-1 and admin subset, nothing else. */
 function validatedPortedIds(portedRouteIds, policyIds) {
   if (!Array.isArray(portedRouteIds)
       || portedRouteIds.some((id) => typeof id !== "string")
@@ -240,9 +257,38 @@ function validatedHandlers(handlers, ported) {
 }
 
 /**
+ * Fold the route modules into the ported handlers: for each pathname a
+ * module serves, the route's handler becomes "the module registered for the
+ * request's method, with routeModuleContext(request), else the built-in".
+ * Only an overridable built-in of a ported route may carry a module.
+ */
+function foldedHandlers(snapshot, policy, ported, routeModules, routeModuleContext) {
+  if (routeModules === undefined) return snapshot;
+  if (!isOriginRouteModuleRegistry(routeModules) || typeof routeModuleContext !== "function") {
+    refuse("PRODUCTION_ROUTE_MODULES_INVALID");
+  }
+  const folded = new Map(snapshot);
+  for (const pathname of routeModules.pathnames) {
+    const entry = policy.find((candidate) => candidate.pathname === pathname);
+    if (entry === undefined || !ORIGIN_OVERRIDABLE_BUILT_INS.includes(pathname) || !ported.has(entry.id)) {
+      refuse("PRODUCTION_ROUTE_HANDLER_UNEXPECTED");
+    }
+    const builtIn = snapshot.get(entry.id);
+    folded.set(entry.id, async function routeModuleOrBuiltIn(request) {
+      const routeModule = routeModules.resolve(request.method, pathname);
+      return routeModule === null ? builtIn(request) : routeModule.handler(request, routeModuleContext(request));
+    });
+  }
+  return folded;
+}
+
+/**
  * Build the registry. routePolicy is the Worker's WORKER_ROUTE_POLICY;
- * handlers a Map<routeId, (request) => Promise<Response>>; portedRouteIds
- * the injected OD-CR-1 answer (required, no default). Refusals, in order:
+ * handlers a Map<routeId, (request) => Promise<Response>> (each ported
+ * route's built-in); portedRouteIds the injected ported set (required, no
+ * default); routeModules (optional) an origin route-module registry with
+ * routeModuleContext(request), the per-request module context, folded into
+ * the handlers of the routes they serve. Refusals, in order:
  * - PRODUCTION_ROUTE_COVERAGE_INCOMPLETE: the policy is not 51 well-formed
  *   entries with distinct ids and pathnames, or a ported id is not in it;
  * - PRODUCTION_ROUTE_PARITY_BASIS_DRIFT: 51 entries, but not the pinned
@@ -255,8 +301,10 @@ function validatedHandlers(handlers, ported) {
  * - PRODUCTION_ROUTE_HANDLERS_INVALID: handlers is not a Map;
  * - PRODUCTION_ROUTE_HANDLER_UNEXPECTED: a handler key outside the ported
  *   set (an unported id, a pathname such as the v1.2 effective page, or
- *   any other key);
- * - PRODUCTION_ROUTE_HANDLER_MISSING: a ported id without a function.
+ *   any other key), or a route module for a route that is not ported;
+ * - PRODUCTION_ROUTE_HANDLER_MISSING: a ported id without a function;
+ * - PRODUCTION_ROUTE_MODULES_INVALID: routeModules is not an issued
+ *   route-module registry, or routeModuleContext is not a function.
  *
  * Returns a frozen registry: resolve(routeId) gives a frozen
  * { disposition, handler } (handler null unless ported; an id outside the
@@ -264,11 +312,14 @@ function validatedHandlers(handlers, ported) {
  * portedPathnames in Worker order; unportedRouteIds sorted; rootRouteIds;
  * coverage 'complete' (ported + unported + root is exactly the policy).
  */
-export function createProductionRouteRegistry({ routePolicy, handlers, portedRouteIds } = {}) {
+export function createProductionRouteRegistry({
+  routePolicy, handlers, portedRouteIds, routeModules, routeModuleContext,
+} = {}) {
   const policy = validatedPolicy(routePolicy);
   const policyIds = new Set(policy.map((entry) => entry.id));
   const ported = validatedPortedIds(portedRouteIds, policyIds);
-  const snapshot = validatedHandlers(handlers, ported);
+  const snapshot = foldedHandlers(validatedHandlers(handlers, ported), policy, ported, routeModules,
+    routeModuleContext);
   const resolutions = new Map();
   for (const entry of policy) {
     const disposition = ROOT_IDS.has(entry.id)

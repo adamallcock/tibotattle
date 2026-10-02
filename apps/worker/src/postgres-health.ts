@@ -1,5 +1,5 @@
 /**
- * RD-3 /api/health for the Cloud Run origin: the pure half (CR-6/CR-7 phase A).
+ * RD-3 /api/health for the Cloud Run origin (CR-6/CR-7).
  *
  * buildPostgresHealthBody reproduces the d43c8f92 Worker health body
  * (src/index.ts handleRequest, route 'health') in exact key order, with the
@@ -9,18 +9,27 @@
  * postgresDeploymentSourceCommit is a verbatim port of the Worker's
  * configuredDeploymentSourceCommit.
  *
- * Nothing here reads storage. The readers (collection controls, the
- * retention row, SELECT 1 and the object-store probe) and
- * postgres-health-dispatch.mjs are phase B: the dispatcher needs LEAD-SIMP's
- * primary-only reader and the OD-2 outcome for objectStore.head (critic
- * build order step 2). The phase-B dispatcher runs, in Worker order:
- * configuredEnrollmentMode(env), the admission preflight, the readers and
- * probes, postgresDeploymentSourceCommit(env), then this builder.
+ * The readers (D-CRB) are readPostgresHealthControls (the collection
+ * controls, 503 COLLECTION_CONTROL_UNAVAILABLE on failure) and
+ * readPostgresHealthRetention (the retention row, 503
+ * BACKEND_STORAGE_UNAVAILABLE when absent, then SELECT 1), on the readiness
+ * pool. cloud-run/postgres-health-dispatch.mjs runs, in Worker order:
+ * configuredEnrollmentMode(env), the admission preflight, the controls, the
+ * retention row, the object-store shape, SELECT 1, the object-store probe
+ * (head of the probe key, which the GCS store answers with the OD-2 bucket
+ * birth proof), postgresDeploymentSourceCommit(env), then this builder. The
+ * Worker's deletion-ledger probe is dropped with the ledger.
  */
 import { configuredAccountScopedIngestMode } from "./account-scoped-ingest";
 import type { CollectionControls } from "./collection-controls";
 import { ApiError } from "./errors";
-import type { PostgresRetentionState } from "./postgres-lifecycle-state";
+import { withPostgresRead, type PostgresPool } from "./postgres-client";
+import { readPostgresCollectionControlsFromPool } from "./postgres-collection-controls";
+import {
+  readPostgresRetentionState,
+  StateShapeError,
+  type PostgresRetentionState,
+} from "./postgres-lifecycle-state";
 import { publicAnalyticsEnabled } from "./public-analytics-gate";
 import {
   POSTGRES_HEALTH_CAPABILITY_FLAG_KEYS,
@@ -196,4 +205,42 @@ export function buildPostgresHealthBody(input: PostgresHealthInput): PostgresHea
       coordinatedSignInAdmission: flags.coordinatedSignInAdmission,
     },
   };
+}
+
+/** The health read's transaction bounds (the readiness pool, one connection). */
+export const POSTGRES_HEALTH_READ_TIMEOUTS = Object.freeze({
+  statementTimeoutMilliseconds: 3_000,
+  lockTimeoutMilliseconds: 1_000,
+});
+
+/**
+ * The Worker's readCollectionControls on the origin: 503
+ * COLLECTION_CONTROL_UNAVAILABLE for a missing, malformed or unreadable row.
+ */
+export function readPostgresHealthControls(pool: PostgresPool, primarySchema: string): Promise<PostgresHealthControls> {
+  return readPostgresCollectionControlsFromPool(pool, primarySchema);
+}
+
+/**
+ * The Worker's retention read and its SELECT 1, in one read-only snapshot:
+ * 503 BACKEND_STORAGE_UNAVAILABLE when the row is absent or malformed; a
+ * driver failure propagates (the root answers 500 INTERNAL_ERROR, as the
+ * Worker answers a D1 failure).
+ */
+export function readPostgresHealthRetention(pool: PostgresPool, primarySchema: string): Promise<PostgresHealthRetention> {
+  return withPostgresRead(pool, async (client) => {
+    const retention = await readPostgresRetentionState(client, { primarySchema });
+    if (retention === null) throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+    await client.query("SELECT 1");
+    return Object.freeze({
+      state: retention.state,
+      quarantineRetentionComplete: retention.quarantineRetentionComplete,
+      restoreReplayComplete: retention.restoreReplayComplete,
+    });
+  }, {
+    ...POSTGRES_HEALTH_READ_TIMEOUTS,
+    operation: "health.read",
+    preserveSafeError: (error) => error instanceof ApiError ? error
+      : error instanceof StateShapeError ? new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE") : null,
+  });
 }

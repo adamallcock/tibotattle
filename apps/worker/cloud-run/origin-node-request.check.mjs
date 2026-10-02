@@ -9,12 +9,12 @@ import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import { createServer } from "vite";
 
-// CR-7 Node adapter (W3-CRA phase A): origin-node-request.mjs against the
-// edge-test adapter it generalizes (origin-edge-test-mode.mjs) on one request
-// table, the revision-tag Host rule, and the raw Node path over real HTTP on
-// 127.0.0.1 through the real EP-6 boundary, wired as phase B's production
-// serve() will be (see the W3-CRA receipt). Every token, account and host is
-// synthetic; nothing listens beyond 127.0.0.1 and nothing reaches Google.
+// CR-7 Node adapter: origin-node-request.mjs, the one Node adapter in front
+// of EP-6 (D-CRB deleted the edge-test copy it generalized), on a pinned
+// request table, the revision-tag Host rule, and the raw Node path over real
+// HTTP on 127.0.0.1 through the real EP-6 boundary, wired as the production
+// serve() is. Every token, account and host is synthetic; nothing listens
+// beyond 127.0.0.1 and nothing reaches Google.
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const INVOKER = "edge-invoker@synthetic-edge-0.iam.gserviceaccount.com";
@@ -26,7 +26,6 @@ const RUN_APP_ORIGIN = `https://${RUN_APP_HOST}`;
 
 let vite;
 let node;
-let edgeTest;
 let edgeDispatch;
 let limiters;
 let contract;
@@ -40,9 +39,8 @@ before(async () => {
     appType: "custom",
   });
   const load = (path) => vite.ssrLoadModule(path);
-  [node, edgeTest, edgeDispatch, limiters, contract] = await Promise.all([
+  [node, edgeDispatch, limiters, contract] = await Promise.all([
     load("/cloud-run/origin-node-request.mjs"),
-    load("/cloud-run/origin-edge-test-mode.mjs"),
     load("/cloud-run/postgres-edge-origin-dispatch.mjs"),
     load("/cloud-run/postgres-edge-admission-limiters.mjs"),
     load("/src/edge-origin-contract.ts"),
@@ -92,64 +90,84 @@ function outcome(build) {
 }
 
 // ---------------------------------------------------------------------------
-// One table, both adapters
+// One pinned table
 
-test("constants: the same refusal vocabulary as the edge-test adapter, disjoint from EP-6's", () => {
-  assert.deepEqual([...node.ORIGIN_REQUEST_REFUSAL_REASONS], [...edgeTest.EDGE_TEST_REQUEST_REFUSAL_REASONS]);
-  assert.equal(node.ORIGIN_BOUNDARY_REFUSAL_EVENT, edgeTest.EDGE_ORIGIN_BOUNDARY_REFUSAL_EVENT);
-  assert.equal(node.ORIGIN_LINGER_MAX_MILLISECONDS, edgeTest.EDGE_TEST_LINGER_MAX_MILLISECONDS);
+test("constants: the refusal vocabulary, disjoint from EP-6's, and the boundary refusal predicate", () => {
+  assert.deepEqual([...node.ORIGIN_REQUEST_REFUSAL_REASONS], [
+    "host_origin_invalid", "host_origin_not_canonical", "host_header_missing", "host_mismatch",
+    "request_target_invalid", "request_target_too_long", "request_target_unparseable",
+    "request_target_origin", "raw_headers_invalid", "node_request_invalid",
+  ]);
+  assert.equal(node.ORIGIN_BOUNDARY_REFUSAL_EVENT, "edge_origin_boundary_refusal");
+  assert.equal(node.ORIGIN_LINGER_MAX_MILLISECONDS, 15_000);
   for (const reason of node.ORIGIN_REQUEST_REFUSAL_REASONS) {
     assert.equal(edgeDispatch.EDGE_ORIGIN_BOUNDARY_REFUSAL_REASONS.includes(reason), false, reason);
   }
-  // Phase A keeps one definition of the marker read (the header ratchet reviews it per file).
-  assert.equal(node.isEdgeOriginBoundaryRefusal, edgeTest.isEdgeOriginBoundaryRefusal);
+  // EP-6's constant refusal is a 421 without the origin marker; a marked 421
+  // (an origin answer EP-6 passed through) is not one.
+  assert.equal(node.isEdgeOriginBoundaryRefusal(new Response("x", { status: 421 })), true);
+  assert.equal(node.isEdgeOriginBoundaryRefusal(new Response("x", {
+    status: 421, headers: { [contract.EDGE_HEADERS.originMarker]: "1" } })), false);
+  assert.equal(node.isEdgeOriginBoundaryRefusal(new Response("x", { status: 200 })), false);
+  assert.equal(node.isEdgeOriginBoundaryRefusal({ status: 421, headers: new Headers() }), false);
 });
 
-test("both adapters build the same Request or refuse with the same reason on one table", () => {
+test("the adapter builds the pinned Request or refuses with the pinned reason", () => {
   const hostOrigin = "http://127.0.0.1:43020";
   const longest = `/${"q".repeat(16_384 - hostOrigin.length - 1)}`;
+  const served = (url, extra = {}) => ({ url, method: "GET", body: null, ...extra });
   const table = [
-    ["plain GET", fake("/api/health", "127.0.0.1:43020"), { hostOrigin }],
-    ["query kept", fake("/api/v1/device/sync/state?x=1&y=%20", "127.0.0.1:43020"), { hostOrigin }],
-    ["'//host' stays a path", fake("//evil.example/x", "127.0.0.1:43020"), { hostOrigin }],
-    ["longest target", fake(longest, "127.0.0.1:43020"), { hostOrigin }],
-    ["Host case-insensitive", fake("/api/health", "LocalHost:43020"), { hostOrigin: "http://localhost:43020" }],
-    ["POST without a body", fake("/api/v1/contributions", "127.0.0.1:43020", { method: "POST" }), { hostOrigin }],
-    ["raw headers joined", fake("/api/health", "127.0.0.1:43020", { rawHeaders: ["Host", "127.0.0.1:43020",
-      "x-tibotattle-edge-host", "apex", "x-tibotattle-edge-host", "admin", "cf-connecting-ip", "203.0.113.9"] }),
-    { hostOrigin }],
-    ["too long", fake(`${longest}q`, "127.0.0.1:43020"), { hostOrigin }],
-    ["asterisk", fake("*", "127.0.0.1:43020"), { hostOrigin }],
-    ["absolute", fake("http://evil.example/x", "127.0.0.1:43020"), { hostOrigin }],
-    ["missing Host", fake("/api/health", null), { hostOrigin }],
-    ["other port", fake("/api/health", "127.0.0.1:43021"), { hostOrigin }],
-    ["other host", fake("/api/health", "tibotattle.test"), { hostOrigin }],
-    ["origin with a path", fake("/api/health", "127.0.0.1:43020"), { hostOrigin: `${hostOrigin}/` }],
-    ["no origin", fake("/api/health", "127.0.0.1:43020"), {}],
+    ["plain GET", fake("/api/health", "127.0.0.1:43020"), { hostOrigin }, served(`${hostOrigin}/api/health`)],
+    ["query kept", fake("/api/v1/device/sync/state?x=1&y=%20", "127.0.0.1:43020"), { hostOrigin },
+      served(`${hostOrigin}/api/v1/device/sync/state?x=1&y=%20`)],
+    ["'//host' stays a path", fake("//evil.example/x", "127.0.0.1:43020"), { hostOrigin },
+      served(`${hostOrigin}//evil.example/x`)],
+    ["longest target", fake(longest, "127.0.0.1:43020"), { hostOrigin }, served(`${hostOrigin}${longest}`)],
+    ["Host case-insensitive", fake("/api/health", "LocalHost:43020"), { hostOrigin: "http://localhost:43020" },
+      served("http://localhost:43020/api/health")],
+    ["POST without a body", fake("/api/v1/contributions", "127.0.0.1:43020", { method: "POST" }), { hostOrigin },
+      served(`${hostOrigin}/api/v1/contributions`, { method: "POST" })],
+    ["too long", fake(`${longest}q`, "127.0.0.1:43020"), { hostOrigin }, { reason: "request_target_too_long" }],
+    ["asterisk", fake("*", "127.0.0.1:43020"), { hostOrigin }, { reason: "request_target_invalid" }],
+    ["absolute", fake("http://evil.example/x", "127.0.0.1:43020"), { hostOrigin }, { reason: "request_target_invalid" }],
+    ["missing Host", fake("/api/health", null), { hostOrigin }, { reason: "host_header_missing" }],
+    ["other port", fake("/api/health", "127.0.0.1:43021"), { hostOrigin }, { reason: "host_mismatch" }],
+    ["other host", fake("/api/health", "tibotattle.test"), { hostOrigin }, { reason: "host_mismatch" }],
+    ["origin with a path", fake("/api/health", "127.0.0.1:43020"), { hostOrigin: `${hostOrigin}/` },
+      { reason: "host_origin_not_canonical" }],
+    ["no origin", fake("/api/health", "127.0.0.1:43020"), {}, { reason: "host_origin_invalid" }],
     ["bad raw header", fake("/api/health", "127.0.0.1:43020", { rawHeaders: ["Host", "127.0.0.1:43020", "bad name", "x"] }),
-      { hostOrigin }],
-    ["TRACE", fake("/api/health", "127.0.0.1:43020", { method: "TRACE" }), { hostOrigin }],
-    ["run.app GET", fake("/api/ready", RUN_APP_HOST), { hostOrigin: RUN_APP_ORIGIN }],
-    ["run.app tag without opt-in", fake("/api/ready", `blue---${RUN_APP_HOST}`), { hostOrigin: RUN_APP_ORIGIN }],
+      { hostOrigin }, { reason: "raw_headers_invalid" }],
+    ["TRACE", fake("/api/health", "127.0.0.1:43020", { method: "TRACE" }), { hostOrigin },
+      { reason: "node_request_invalid" }],
+    ["run.app GET", fake("/api/ready", RUN_APP_HOST), { hostOrigin: RUN_APP_ORIGIN }, served(`${RUN_APP_ORIGIN}/api/ready`)],
+    ["run.app tag without opt-in", fake("/api/ready", `blue---${RUN_APP_HOST}`), { hostOrigin: RUN_APP_ORIGIN },
+      { reason: "host_mismatch" }],
   ];
   const reasons = new Set();
-  for (const [label, req, options] of table) {
-    const original = outcome(() => edgeTest.edgeTestRequestFromNode(req, RES, options));
-    const generalized = outcome(() => node.originRequestFromNode(req, RES, options));
-    if (original.reason !== undefined) {
-      assert.equal(original.code, "EDGE_TEST_ORIGIN_BOUNDARY_REFUSED", label);
-      assert.equal(generalized.code, "ORIGIN_REQUEST_BOUNDARY_REFUSED", label);
-      assert.equal(generalized.reason, original.reason, label);
-      reasons.add(generalized.reason);
+  for (const [label, req, options, expected] of table) {
+    const actual = outcome(() => node.originRequestFromNode(req, RES, options));
+    if (expected.reason !== undefined) {
+      assert.deepEqual(actual, { reason: expected.reason, code: "ORIGIN_REQUEST_BOUNDARY_REFUSED" }, label);
+      reasons.add(actual.reason);
     } else {
-      assert.deepEqual(generalized, original, label);
+      assert.equal(actual.url, expected.url, label);
+      assert.equal(actual.method, expected.method, label);
+      assert.equal(actual.body, expected.body, label);
     }
   }
   assert.deepEqual([...reasons].sort(), node.ORIGIN_REQUEST_REFUSAL_REASONS
     .filter((reason) => !["request_target_unparseable", "request_target_origin"].includes(reason)).sort());
+  // Every raw header reaches EP-6, repeated values joined as Headers joins them.
+  const joined = node.originRequestFromNode(fake("/api/health", "127.0.0.1:43020", { rawHeaders: [
+    "Host", "127.0.0.1:43020", "x-tibotattle-edge-host", "apex", "x-tibotattle-edge-host", "admin",
+    "cf-connecting-ip", "203.0.113.9"] }), RES, { hostOrigin });
+  assert.deepEqual([...joined.headers], [
+    ["cf-connecting-ip", "203.0.113.9"], ["host", "127.0.0.1:43020"], ["x-tibotattle-edge-host", "apex, admin"],
+  ]);
 });
 
-test("originRequestFromNode refuses a non-http(s) HOST_ORIGIN the edge-test adapter never sees", () => {
+test("originRequestFromNode refuses a non-http(s) HOST_ORIGIN", () => {
   for (const hostOrigin of ["ftp://127.0.0.1:43020", "file:///tmp", "data:,x"]) {
     assert.throws(() => node.originRequestFromNode(fake("/api/health", "127.0.0.1:43020"), RES, { hostOrigin }),
       (error) => error instanceof node.OriginBoundaryRefusal && error.reason === "host_origin_invalid", hostOrigin);
@@ -188,7 +206,7 @@ test("revision tags: '<tag>---<host>' only with acceptRevisionTags on an https o
     { hostOrigin: "http://127.0.0.1:43020", acceptRevisionTags: true }), { reason: "host_mismatch" });
 });
 
-test("the refusal log line and the written 421 are byte-identical to the edge-test ones", () => {
+test("the refusal log line is built from an allowlist and the written 421 is EP-6's constant refusal", () => {
   const diagnostics = [
     { reason: "host_mismatch" },
     new node.OriginBoundaryRefusal("request_target_invalid"),
@@ -201,10 +219,24 @@ test("the refusal log line and the written 421 are byte-identical to the edge-te
     null,
     "host_mismatch",
   ];
-  for (const diagnostic of diagnostics) {
-    assert.equal(node.originBoundaryRefusalLogLine(diagnostic), edgeTest.edgeTestBoundaryRefusalLogLine(diagnostic));
+  const expected = [
+    "{\"event\":\"edge_origin_boundary_refusal\",\"reason\":\"host_mismatch\"}",
+    "{\"event\":\"edge_origin_boundary_refusal\",\"reason\":\"request_target_invalid\"}",
+    "{\"event\":\"edge_origin_boundary_refusal\",\"reason\":\"invoker_segments\",\"invokerShape\":{"
+      + "\"bearerPrefix\":true,\"scheme\":\"Bearer\",\"separatorSpaces\":1,\"segments\":2,"
+      + "\"segmentEmpty\":[false,true],\"segmentBase64url\":[true,false],\"signatureRemovedByGoogle\":false}}",
+    "{\"event\":\"edge_origin_boundary_refusal\",\"reason\":\"email_mismatch\",\"invokerShape\":{"
+      + "\"bearerPrefix\":false,\"scheme\":null,\"separatorSpaces\":null,\"segments\":null,"
+      + "\"segmentEmpty\":[],\"segmentBase64url\":[],\"signatureRemovedByGoogle\":false}}",
+    "{\"event\":\"edge_origin_boundary_refusal\",\"reason\":\"host_mismatch\"}",
+    "{\"event\":\"edge_origin_boundary_refusal\",\"reason\":\"unclassified\"}",
+    "{\"event\":\"edge_origin_boundary_refusal\",\"reason\":\"unclassified\"}",
+    "{\"event\":\"edge_origin_boundary_refusal\",\"reason\":\"unclassified\"}",
+  ];
+  diagnostics.forEach((diagnostic, index) => {
+    assert.equal(node.originBoundaryRefusalLogLine(diagnostic), expected[index], String(index));
     assert.doesNotMatch(node.originBoundaryRefusalLogLine(diagnostic), /must-not-appear|evil\.example/u);
-  }
+  });
   const lines = [];
   node.logOriginBoundaryRefusal({ reason: "host_mismatch" }, (line) => lines.push(line));
   node.logOriginBoundaryRefusal({ reason: "host_mismatch" }, () => { throw new Error("sink down"); });
@@ -215,9 +247,12 @@ test("the refusal log line and the written 421 are byte-identical to the edge-te
     end(body) { written.at(-1).body = body; },
   });
   node.writeOriginBoundaryRefusal(capture());
-  edgeTest.writeEdgeTestBoundaryRefusal(capture());
-  assert.deepEqual(written[0], written[1]);
+  assert.equal(written.length, 1);
   assert.equal(written[0].status, 421);
+  assert.deepEqual(written[0].headers, {
+    ...edgeDispatch.ORIGIN_BOUNDARY_ERROR_HEADERS,
+    "content-length": String(Buffer.byteLength(contract.ORIGIN_BOUNDARY_ERROR_BODY)),
+  });
   assert.equal(written[0].headers.connection, "close");
   assert.equal(written[0].body, contract.ORIGIN_BOUNDARY_ERROR_BODY);
 });
