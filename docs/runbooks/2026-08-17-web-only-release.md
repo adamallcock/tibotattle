@@ -218,10 +218,10 @@ checkout or a previously built directory as evidence for this candidate.
 
 ## 4. Deploy only after explicit production authorization
 
-This is the only web-only deploy entry point. It validates the receipt, repeat
-checks the candidate scope, and invokes the production immutable-snapshot and
-migration safeguards. It is still a Worker deployment, so it requires the
-normal production credentials and explicit authorization.
+Before P1 this is the only web-only deploy entry point. It validates the
+receipt, repeat checks the candidate scope, and invokes the typed production
+immutable-snapshot safeguards. It is still a Worker deployment, so it requires
+the normal production credentials and explicit authorization.
 
 The receipt's exact `baseCommit` is forwarded as the reviewed production
 predecessor. Under the shared deployment lock, live health must still name that
@@ -229,12 +229,43 @@ base before Wrangler starts. A newer deployment makes this receipt stale: merge
 the intended changes onto the new base and requalify, never auto-adopt live
 source or bypass the guard. Interrupted outcomes use the production operation
 journal and [explicit recovery procedure](production-operations.md#guarded-deployment-wrapper).
+A proven pre-mutation refusal with no retained lock may use the same valid
+receipt and a fresh, absolute private `--operation` directory after its cause
+is fixed. Preserve the first journal. An uncertain or attempted deployment
+must be reconciled, never retried with a fresh directory.
+
+Production uses typed storage, so the entry point accepts only its typed form,
+with an owner-private live inventory. Without the inventory and live-site pins
+it is refused before the receipt is read
+(`PRODUCTION_UNTYPED_DEPLOY_REFUSED`): on this line the untyped form would
+render the checked-in `env.production`, the JSON storage layout without the
+edge entry. First run the read-only `production:reconcile`
+procedure in [Production operations](production-operations.md#guarded-deployment-wrapper)
+against this clean candidate and require all database roles to qualify. Pin the
+current public manifest bytes and the full deployed source commit that produced
+them. The receipt supplies the candidate manifest SHA-256; the command verifies
+the live preimage and candidate postimage separately and preserves the live
+bindings, schedules, ingress, and secrets. Before the upload it also proves the
+pinned public source: it must be the live commit or one of its ancestors
+(`PRODUCTION_REPLACED_PUBLIC_SOURCE_NOT_ON_LIVE_LINE`), and the live
+manifest's source provenance must match its public source files
+(`PRODUCTION_REPLACED_PUBLIC_SOURCE_UNPROVEN`). Typed website publication never
+accepts `--confirm-migrations` and never applies a database migration.
 
 ```bash
 npm run product:web-release:deploy -- \
   --receipt "$PWD/.release-build/web-release-receipt.json" \
-  --confirm DEPLOY_PRODUCTION
+  --confirm DEPLOY_PRODUCTION \
+  --inventory /absolute/private/live-inventory.json \
+  --inventory-sha256 <reviewed-inventory-sha256> \
+  --retained-public-source <full-deployed-public-source-sha> \
+  --expected-live-manifest-sha256 <reviewed-live-manifest-sha256>
 ```
+
+If the candidate source changes after preparation, prepare a new receipt before
+deployment. A source whose typed schema differs from production cannot use this
+website-only lane; build a clean candidate from the live source and carry only
+the reviewed public-site closure.
 
 Never substitute a raw `wrangler deploy` command: it would bypass the
 web-only receipt and source-scope checks. Record the successful source commit,
@@ -245,11 +276,12 @@ baseline.
 
 From the first typed worker-mode edge deploy (P1 in
 [Production edge modes](production-edge-modes.md)), `product:web-release:deploy`
-is refused (`EDGE_MODE_REQUIRED_FOR_EDGE_LIVE`): it has no edge mode, and a
-typed deploy without one would replace the edge entry. Preparation is
-unchanged. Deploy the same fresh receipt through the typed production command,
-from `apps/worker` on the candidate commit, with the live mode (the owner's
-2026-10-02 decision for releases after the switch):
+with its typed pins is refused (`EDGE_MODE_REQUIRED_FOR_EDGE_LIVE`): it has no
+edge mode, and a typed deploy without one would replace the edge entry.
+Without the pins it is always refused (`PRODUCTION_UNTYPED_DEPLOY_REFUSED`).
+Preparation is unchanged. Deploy the same fresh receipt through the typed
+production command, from `apps/worker` on the candidate commit, with the live
+mode (the owner's 2026-10-02 decision for releases after the switch):
 
 ```bash
 npm run production:deploy -- --confirm DEPLOY_PRODUCTION \
@@ -279,7 +311,10 @@ Do not deploy an old checkout directly: the scope gate deliberately requires
 the candidate to descend from the current deployed base.
 
 **Once production runs the edge entry,** roll back by re-deploying a
-previously released site by its receipt:
+previously released site by its receipt. Keep each release's receipt,
+generated site and production operation journal directory privately, prepared
+on the edge-port line, which runs these deploys (a receipt or site prepared on
+this line can fail there):
 
 1. Restore that release's private copy of the generated site into
    `.release-build/public-release-site` of a clean checkout of the live commit
@@ -287,15 +322,21 @@ previously released site by its receipt:
    that directory.
 2. Run the typed command above with
    `--rollback-web-release-receipt <absolute restored receipt>` in place of
-   `--web-release-receipt`, the receipt's `site.manifestSha256` as the
-   candidate, and the live site as the replaced pair. On a checkout of the
-   live commit itself, add a fresh, absolute private `--operation` directory;
-   the default one for that commit holds the earlier deploy's journal.
+   `--web-release-receipt`, plus
+   `--rollback-release-operation <that release's unmodified journal directory>`,
+   the receipt's `site.manifestSha256` as the candidate, and the live site as
+   the replaced pair. On a checkout of the live commit itself, add a fresh,
+   absolute private `--operation` directory; the default one for that commit
+   holds the earlier deploy's journal.
 
 The receipt's source must be the live commit or one of its ancestors, the
 restored site must still match the receipt byte for byte, and the staged site
-is pinned to the receipt's source commit. After the switch the restored site
-must carry the privacy marker, so the site cannot roll back past the switch.
+is pinned to the receipt's source commit. The journal must be a verified typed
+production deploy, on the live line, that left exactly this site live from
+the receipt's source commit (`PRODUCTION_ROLLBACK_OPERATION_INVALID`,
+`PRODUCTION_ROLLBACK_SITE_NOT_RELEASED`): a receipt alone never proves that a
+site was released. After the switch the restored site must carry the privacy
+marker, so the site cannot roll back past the switch.
 
 **Before the edge entry,** or when no private copy of the earlier site
 survives, make a new, clean revert commit on top of the current deployed

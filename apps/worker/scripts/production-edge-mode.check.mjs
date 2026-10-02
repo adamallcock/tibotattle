@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse } from "jsonc-parser";
 import { DEPLOYMENT_ENDPOINTS } from "../../../config/deployment-endpoints.js";
-import { openOperation, readOperation } from "../../../scripts/lib/release-operation.mjs";
+import { identityDigest, openOperation, readOperation } from "../../../scripts/lib/release-operation.mjs";
 import { EDGE_FENCE_RETRY_AFTER_SECONDS } from "../src/edge-origin-contract.ts";
 import {
   EDGE_MODE_FENCE_RETRY_AFTER,
@@ -384,6 +384,12 @@ async function deployHarness({
     expectedLiveManifestSha256: "1".repeat(64),
     candidatePublicManifestSha256: candidate,
     publicReleaseManifestRecheck: async () => ({ ok: true, code: null }),
+    // A changed site proves its replaced source against the live manifest
+    // bytes (stage-production-assets.check.mjs covers the real proof).
+    replacedPublicSourceCheck: async ({ sourceCommit }) => {
+      calls.replacedSources = [...(calls.replacedSources ?? []), sourceCommit];
+      return { publicSourceCommit: sourceCommit };
+    },
     healthRecheck: async () => ({ ok: true, code: null, sourceCommit: isDeployed ? SOURCE : LIVE }),
     publicSurfaceRecheck: async () => ({ ok: true, code: null }),
     fetchImpl,
@@ -974,6 +980,29 @@ test("after the cutover a gcp redeploy may retain the marked site and gcp -> fen
 
 const RELEASED_SITE = sha("9");
 
+/** The operation record a verified forward release of RELEASED_SITE left. */
+function releasedSiteJournal() {
+  const typed = {
+    schema: "production-typed-operation-v1",
+    liveConfigurationFingerprint: "f".repeat(64),
+    predecessorSourceCommit: sha("8"),
+    retainedPublicSourceCommit: sha("8"),
+    expectedLiveManifestSha256: "7".repeat(64),
+    candidatePublicManifestSha256: "2".repeat(64),
+    expectedSchemaIdentity: { schema: "production-typed-schema-v1" },
+  };
+  const binding = { sourceCommit: RELEASED_SITE, previousSourceCommit: sha("8"), confirmedMigrations: null, typed };
+  return {
+    schema: 1,
+    kind: "production",
+    binding: identityDigest(binding),
+    id: "00000000-0000-4000-8000-000000000001",
+    createdAt: "2026-10-02T00:00:00.000Z",
+    updatedAt: "2026-10-02T00:00:00.000Z",
+    state: { owner: sha("b"), ...binding, stage: "verified", outcome: "verified", code: "PRODUCTION_DEPLOYED", lock: "released" },
+  };
+}
+
 /**
  * The deploy options the CLI would produce for a candidate site: the parsed
  * arguments, resolved against a synthetic web-release receipt. Only the site
@@ -987,6 +1016,7 @@ async function cliCandidateSite({ mode, rollback = false, liveManifest = "1".rep
     "--inventory", "/synthetic/inventory.json", "--inventory-sha256", "a".repeat(64),
     "--candidate-public-manifest-sha256", "2".repeat(64),
     rollback ? "--rollback-web-release-receipt" : "--web-release-receipt", "/synthetic/.release-build/web-release-receipt.json",
+    ...(rollback ? ["--rollback-release-operation", "/synthetic/release-operation"] : []),
     "--replaced-public-source", LIVE,
     "--replaced-live-manifest-sha256", liveManifest,
     `--edge-mode=${mode}`,
@@ -1002,6 +1032,8 @@ async function cliCandidateSite({ mode, rollback = false, liveManifest = "1".rep
     verifyReceipt: async () => ({
       receipt: { sourceCommit: rollback ? RELEASED_SITE : SOURCE, baseCommit: LIVE, site: { manifestSha256: "2".repeat(64) } },
     }),
+    // The verified journal of the release that left the site live.
+    readReleaseOperation: async () => releasedSiteJournal(),
   });
   assert.equal(resolved.ok, true, resolved.code);
   const pins = ["expectedSourceCommit", "expectedPreviousSourceCommit", "retainedPublicSourceCommit",
@@ -1021,6 +1053,15 @@ test("the H.6 switch ships the marked candidate site from the CLI and pins the r
   assert.equal(record.state.typed.expectedLiveManifestSha256, "1".repeat(64));
   assert.equal(record.state.typed.retainedPublicSourceCommit, LIVE);
   assert.equal(record.state.typed.candidatePublicSourceCommit, undefined);
+  // The replaced source is proven against the live manifest, not taken on trust.
+  assert.deepEqual(harness.calls.replacedSources, [LIVE]);
+  const unproven = await gcpHarness({ overrides: {
+    ...cli,
+    replacedPublicSourceCheck: async () => { throw new Error("provenance does not match"); },
+  } });
+  const refused = await observeDeployment(unproven);
+  assertNotStarted(refused, unproven, "PRODUCTION_REPLACED_PUBLIC_SOURCE_UNPROVEN");
+  assert.equal(refused.coordination, "not_acquired");
 });
 
 test("a CLI candidate site keeps the privacy-page rule: marker refused before the switch, required in gcp", async () => {

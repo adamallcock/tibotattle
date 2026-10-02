@@ -33,10 +33,18 @@ import {
   validateEdgeModePublicSurface,
 } from "./check-deployment-endpoints.mjs";
 import { checkLocalWorkspacePackages } from "./check-local-workspace-packages.mjs";
-import { stageProductionAssets } from "./stage-production-assets.mjs";
+import {
+  stageProductionAssets,
+  verifyPinnedPublicReleaseManifestSource,
+} from "./stage-production-assets.mjs";
 import { ADMIN_UI_SOURCES } from "./generate-admin-ui-assets.mjs";
 import { runReleasePreflight } from "./release-preflight.mjs";
-import { openOperation, operationError, readOperation } from "../../../scripts/lib/release-operation.mjs";
+import {
+  identityDigest,
+  openOperation,
+  operationError,
+  readOperation,
+} from "../../../scripts/lib/release-operation.mjs";
 import { createProductionDeploymentLock } from "./production-deployment-lock.mjs";
 import { readPrivateProductionInventory } from "./production-reconcile.mjs";
 import { createProductionLiveProvider } from "./production-live-provider.mjs";
@@ -1460,12 +1468,14 @@ export async function recheckProductionPublicSurface({
  * Verify the retained public release manifest independently of the Worker
  * deployment. The manifest is public, but its exact bytes are a release input:
  * a backend deploy must not silently replace the live public site with a
- * different release tree.
+ * different release tree. With includeBytes the verified bytes are returned
+ * too, so a changed-site deploy can prove which commit produced them.
  */
 export async function recheckProductionPublicReleaseManifest({
   fetchImpl = globalThis.fetch,
   expectedSha256,
   timeoutMs = 10_000,
+  includeBytes = false,
 } = {}) {
   if (!PRODUCTION_SHA256_PATTERN.test(expectedSha256 ?? "")) {
     return localFailure("PRODUCTION_PUBLIC_RELEASE_MANIFEST_EXPECTATION_INVALID");
@@ -1503,7 +1513,7 @@ export async function recheckProductionPublicReleaseManifest({
       || typedConfigDigest(bytes) !== expectedSha256) {
     return localFailure("PRODUCTION_PUBLIC_RELEASE_MANIFEST_MISMATCH");
   }
-  return { ok: true, code: null, sha256: expectedSha256 };
+  return { ok: true, code: null, sha256: expectedSha256, ...(includeBytes === true ? { bytes } : {}) };
 }
 
 const PRODUCTION_EDGE_BARRIER_HEALTH_MODE = "migration-mutation-barrier";
@@ -1704,6 +1714,7 @@ async function runProductionDeploymentFromSnapshot({
   expectedLiveManifestSha256 = null,
   candidatePublicManifestSha256 = null,
   candidatePublicSourceCommit = null,
+  replacedPublicSourceCheck = verifyPinnedPublicReleaseManifestSource,
   beforeMutation = async () => { throw operationError("PRODUCTION_COORDINATION_REQUIRED"); },
   finalMutationRecheck = null,
   mutationIntent = async () => { throw operationError("PRODUCTION_COORDINATION_REQUIRED"); },
@@ -1890,6 +1901,7 @@ async function runProductionDeploymentFromSnapshot({
         fetchImpl,
         expectedSha256: expectedLiveManifestSha256,
         timeoutMs: PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS,
+        includeBytes: candidatePublicManifestSha256 !== null,
       });
     } catch {
       return typedFailure("PRODUCTION_TYPED_PUBLIC_RELEASE_MANIFEST_UNREACHABLE");
@@ -1899,6 +1911,21 @@ async function runProductionDeploymentFromSnapshot({
         "PRODUCTION_TYPED_PUBLIC_RELEASE_MANIFEST_INVALID",
         manifest?.code,
       );
+    }
+    // A changed site replaces the live one. Its pinned source commit is
+    // recorded as the replaced site's source, so prove it: the live manifest
+    // bytes just matched their sha256, and their source provenance must match
+    // that commit's public source files.
+    if (candidatePublicManifestSha256 !== null) {
+      try {
+        await replacedPublicSourceCheck({
+          repositoryRoot: snapshotRepositoryRoot,
+          sourceCommit: retainedPublicSourceCommit,
+          manifestBytes: manifest.bytes,
+        });
+      } catch {
+        return typedFailure("PRODUCTION_REPLACED_PUBLIC_SOURCE_UNPROVEN");
+      }
     }
   }
   let health;
@@ -2139,6 +2166,7 @@ async function runUncoordinatedProductionDeployment({
   expectedLiveManifestSha256 = null,
   candidatePublicManifestSha256 = null,
   candidatePublicSourceCommit = null,
+  replacedPublicSourceCheck = verifyPinnedPublicReleaseManifestSource,
   beforeMutation,
   finalMutationRecheck,
   mutationIntent,
@@ -2294,6 +2322,7 @@ async function runUncoordinatedProductionDeployment({
       expectedLiveManifestSha256,
       candidatePublicManifestSha256,
       candidatePublicSourceCommit,
+      replacedPublicSourceCheck,
       beforeMutation,
       finalMutationRecheck,
       mutationIntent,
@@ -2390,6 +2419,11 @@ async function assertEdgePredecessorBinding({ edgeDeployment, expectedPreviousSo
   }
 }
 
+// Without typedProduction this renders the checked-in env.production. That
+// untyped form stays as the library path the checks exercise; neither
+// operator entry point reaches it: production:deploy refuses it at parse and
+// product:web-release:deploy before the receipt
+// (PRODUCTION_UNTYPED_DEPLOY_REFUSED).
 export async function runProductionDeployment(options) {
   const { confirmation, workerDirectory, expectedPreviousSourceCommit,
     sourceCommitCheck = checkedOutSourceCommit, sourceTreeCleanCheck = checkedOutSourceTreeClean,
@@ -2494,6 +2528,14 @@ export async function runProductionDeployment(options) {
     if (typedOperationPin?.candidatePublicSourceCommit !== undefined
         && !lock.isAncestor(typedOperationPin.candidatePublicSourceCommit, source.sourceCommit)) {
       return localFailure("PRODUCTION_CANDIDATE_PUBLIC_SOURCE_NOT_ANCESTOR");
+    }
+    // The site a changed-site deploy replaces was built on the live line:
+    // its source commit is the live commit or one of its ancestors. The
+    // pre-upload manifest recheck then proves that commit produced the live
+    // manifest.
+    if (typedOperationPin?.candidatePublicManifestSha256 !== undefined
+        && !lock.isAncestor(typedOperationPin.retainedPublicSourceCommit, expectedPreviousSourceCommit)) {
+      return localFailure("PRODUCTION_REPLACED_PUBLIC_SOURCE_NOT_ON_LIVE_LINE");
     }
     const binding = {
       sourceCommit: source.sourceCommit, previousSourceCommit: expectedPreviousSourceCommit,
@@ -2884,14 +2926,17 @@ function assertProductionEdgeArguments(result) {
 
 // Candidate-site arguments: a typed edge deploy that ships a public site other
 // than the live one. The candidate manifest comes with exactly one web-release
-// receipt (a forward release, or a rollback to a previously released site) and
+// receipt (a forward release, or a rollback to a previously released site,
+// which also names the verified production operation that released it) and
 // the replaced pair: the live public source and live manifest the deploy
-// replaces. The replaced pair is pinned before the upload, like the retained
-// pair, but unlike it the site changes, so the two pairs never mix.
+// replaces. The replaced pair is proven before the upload (the live manifest
+// bytes, and the commit that produced them), like the retained pair, but
+// unlike it the site changes, so the two pairs never mix.
 const PRODUCTION_CANDIDATE_SITE_ARGUMENTS = new Map([
   ["--candidate-public-manifest-sha256", "candidatePublicManifestSha256"],
   ["--web-release-receipt", "webReleaseReceiptPath"],
   ["--rollback-web-release-receipt", "rollbackWebReleaseReceiptPath"],
+  ["--rollback-release-operation", "rollbackReleaseOperationDirectory"],
   ["--replaced-public-source", "replacedPublicSourceCommit"],
   ["--replaced-live-manifest-sha256", "replacedLiveManifestSha256"],
 ]);
@@ -2909,7 +2954,9 @@ const PRODUCTION_CANDIDATE_SITE_ARGUMENTS = new Map([
  *   stays, the candidate says it changes;
  * - PRODUCTION_CANDIDATE_SITE_UNCHANGED: the candidate equals the replaced live
  *   manifest; a deploy that keeps the site uses the retained pair;
- * - PRODUCTION_ARGUMENTS_INVALID: anything else incomplete or malformed.
+ * - PRODUCTION_ARGUMENTS_INVALID: anything else incomplete or malformed,
+ *   including a rollback receipt without its absolute
+ *   --rollback-release-operation, or that flag on a forward release.
  */
 function assertProductionCandidateSiteArguments(result) {
   const present = [...PRODUCTION_CANDIDATE_SITE_ARGUMENTS.values()].filter((name) => name in result);
@@ -2924,6 +2971,8 @@ function assertProductionCandidateSiteArguments(result) {
   }
   if ((result.webReleaseReceiptPath === undefined) === (result.rollbackWebReleaseReceiptPath === undefined)
       || !isAbsolute(result.webReleaseReceiptPath ?? result.rollbackWebReleaseReceiptPath)
+      || (result.rollbackWebReleaseReceiptPath === undefined) !== (result.rollbackReleaseOperationDirectory === undefined)
+      || (result.rollbackReleaseOperationDirectory !== undefined && !isAbsolute(result.rollbackReleaseOperationDirectory))
       || result.inventoryPath === undefined
       || result.confirmedMigrations !== undefined
       || !PRODUCTION_SHA256_PATTERN.test(result.candidatePublicManifestSha256)
@@ -2978,9 +3027,62 @@ export function parseProductionDeploymentArgs(argv) {
       || (result.expectedLiveManifestSha256 !== undefined && !PRODUCTION_SHA256_PATTERN.test(result.expectedLiveManifestSha256))
       || (result.retainedPublicSourceCommit !== undefined && !PRODUCTION_SOURCE_COMMIT_PATTERN.test(result.retainedPublicSourceCommit))) {
     throw operationError("PRODUCTION_ARGUMENTS_INVALID");
+  } else if (!result.inventoryPath) {
+    // The untyped deploy renders the checked-in env.production: on this line
+    // that is the JSON storage layout without the edge entry. It would replace
+    // a typed production Worker, drop a live edge and skip every edge gate,
+    // the privacy-page rule included, and nothing without an inventory can
+    // see which is live. Every production deploy is typed.
+    throw operationError("PRODUCTION_UNTYPED_DEPLOY_REFUSED");
   }
   assertProductionEdgeArguments(result);
   return result;
+}
+
+/**
+ * The site a verified typed production deploy left live, read from its
+ * operation journal: the candidate it shipped (built from its deploy source,
+ * or from the rollback source it named), or the retained site it kept. Both
+ * were proven at staging against their source commit. null unless the journal
+ * is a verified typed production operation whose state still matches the
+ * binding digest it was opened with.
+ */
+function releasedSiteOfOperation(record) {
+  const state = record?.state;
+  const pin = state?.typed;
+  if (record?.kind !== "production"
+      || state?.outcome !== "verified"
+      || state.stage !== "verified"
+      || !PRODUCTION_SOURCE_COMMIT_PATTERN.test(state.sourceCommit ?? "")
+      || !PRODUCTION_SOURCE_COMMIT_PATTERN.test(state.previousSourceCommit ?? "")
+      || state.confirmedMigrations !== null
+      || pin?.schema !== "production-typed-operation-v1"
+      || !PRODUCTION_SOURCE_COMMIT_PATTERN.test(pin.retainedPublicSourceCommit ?? "")
+      || !PRODUCTION_SHA256_PATTERN.test(pin.expectedLiveManifestSha256 ?? "")
+      || (pin.candidatePublicManifestSha256 !== undefined
+        && !PRODUCTION_SHA256_PATTERN.test(pin.candidatePublicManifestSha256))
+      || (pin.candidatePublicSourceCommit !== undefined
+        && (pin.candidatePublicManifestSha256 === undefined
+          || !PRODUCTION_SOURCE_COMMIT_PATTERN.test(pin.candidatePublicSourceCommit)))
+      || record.binding !== identityDigest({
+        sourceCommit: state.sourceCommit,
+        previousSourceCommit: state.previousSourceCommit,
+        confirmedMigrations: null,
+        typed: pin,
+      })) {
+    return null;
+  }
+  return pin.candidatePublicManifestSha256 === undefined
+    ? {
+      manifestSha256: pin.expectedLiveManifestSha256,
+      sourceCommit: pin.retainedPublicSourceCommit,
+      deploySourceCommit: state.sourceCommit,
+    }
+    : {
+      manifestSha256: pin.candidatePublicManifestSha256,
+      sourceCommit: pin.candidatePublicSourceCommit ?? state.sourceCommit,
+      deploySourceCommit: state.sourceCommit,
+    };
 }
 
 /**
@@ -2995,12 +3097,16 @@ export function parseProductionDeploymentArgs(argv) {
  * - Rollback (--rollback-web-release-receipt): a previously released site.
  *   Its source must be on the live line (an ancestor of, or equal to,
  *   --expected-previous-source); otherwise PRODUCTION_ROLLBACK_RECEIPT_NOT_ON_LIVE_LINE.
- *   The deploy source stays HEAD, and the staged site is pinned to the
- *   receipt's source commit.
+ *   --rollback-release-operation names the journal of the verified typed
+ *   production deploy that left this site live; it must be readable and
+ *   intact (PRODUCTION_ROLLBACK_OPERATION_INVALID), and its site must be the
+ *   candidate manifest from the receipt's source commit, deployed on the live
+ *   line (PRODUCTION_ROLLBACK_SITE_NOT_RELEASED). The deploy source stays
+ *   HEAD, and the staged site is pinned to the receipt's source commit.
  *
  * Either way the receipt's manifest must be the candidate
  * (PRODUCTION_CANDIDATE_RECEIPT_MISMATCH), and the replaced pair becomes the
- * live preimage the deploy rechecks before the upload. Staging then proves the
+ * live preimage the deploy proves before the upload. Staging then proves the
  * snapshot's site is exactly the candidate manifest, built from the pinned
  * commit. Options without a candidate pass through unchanged.
  */
@@ -3010,11 +3116,13 @@ export async function resolveProductionCandidateSite({
   headCommit = checkedOutSourceCommit,
   isAncestor = null,
   verifyReceipt = null,
+  readReleaseOperation = readOperation,
 } = {}) {
   const {
     candidatePublicManifestSha256,
     webReleaseReceiptPath,
     rollbackWebReleaseReceiptPath,
+    rollbackReleaseOperationDirectory,
     replacedPublicSourceCommit,
     replacedLiveManifestSha256,
     ...rest
@@ -3033,6 +3141,9 @@ export async function resolveProductionCandidateSite({
       || rest.expectedLiveManifestSha256 !== undefined
       || (webReleaseReceiptPath === undefined) === (rollbackWebReleaseReceiptPath === undefined)
       || typeof receiptPath !== "string" || !isAbsolute(receiptPath)
+      || rollback !== (rollbackReleaseOperationDirectory !== undefined)
+      || (rollback && (typeof rollbackReleaseOperationDirectory !== "string"
+        || !isAbsolute(rollbackReleaseOperationDirectory)))
       || !PRODUCTION_SHA256_PATTERN.test(candidatePublicManifestSha256 ?? "")
       || !PRODUCTION_SHA256_PATTERN.test(replacedLiveManifestSha256 ?? "")
       || !PRODUCTION_SOURCE_COMMIT_PATTERN.test(replacedPublicSourceCommit ?? "")
@@ -3080,6 +3191,26 @@ export async function resolveProductionCandidateSite({
     onLiveLine = false;
   }
   if (onLiveLine !== true) return localFailure("PRODUCTION_ROLLBACK_RECEIPT_NOT_ON_LIVE_LINE");
+  // The receipt proves the site's bytes and scope, not that it was ever live:
+  // the named journal must show a verified production deploy that left this
+  // exact site, from this exact commit, live on this line.
+  let released;
+  try {
+    released = releasedSiteOfOperation(await readReleaseOperation(rollbackReleaseOperationDirectory));
+  } catch {
+    released = null;
+  }
+  if (released === null) return localFailure("PRODUCTION_ROLLBACK_OPERATION_INVALID");
+  let releasedOnLiveLine = false;
+  if (released.manifestSha256 === candidatePublicManifestSha256
+      && released.sourceCommit === receipt.sourceCommit) {
+    try {
+      releasedOnLiveLine = await ancestor(released.deploySourceCommit, rest.expectedPreviousSourceCommit);
+    } catch {
+      releasedOnLiveLine = false;
+    }
+  }
+  if (releasedOnLiveLine !== true) return localFailure("PRODUCTION_ROLLBACK_SITE_NOT_RELEASED");
   return {
     ok: true,
     code: null,
@@ -3128,12 +3259,11 @@ async function main() {
     const code = /^PRODUCTION_[A-Z_]+$/u.test(error?.code ?? "") ? error.code : "PRODUCTION_ARGUMENTS_INVALID";
     process.stderr.write(
       `${code}\n`
-        + "Usage: production-deploy.mjs "
+        + "Usage (typed only; an untyped deploy is refused PRODUCTION_UNTYPED_DEPLOY_REFUSED): production-deploy.mjs "
         + `--confirm ${PRODUCTION_DEPLOY_CONFIRMATION} `
         + "--expected-previous-source FULL_SHA [--operation PRIVATE_DIRECTORY] "
-        + "[--inventory PRIVATE_JSON --inventory-sha256 SHA256 "
-        + "--retained-public-source FULL_SHA --expected-live-manifest-sha256 SHA256] "
-        + "[--confirm-migrations BINDING:0000_name.sql,...]\n"
+        + "--inventory PRIVATE_JSON --inventory-sha256 SHA256 "
+        + "--retained-public-source FULL_SHA --expected-live-manifest-sha256 SHA256\n"
         + "Reconcile only: --confirm RECONCILE_PRODUCTION_DEPLOYMENT --operation PRIVATE_DIRECTORY --executor-stopped\n"
         + "Typed recovery: --confirm RECONCILE_TYPED_PRODUCTION_DEPLOYMENT --operation PRIVATE_DIRECTORY --executor-stopped --inventory PRIVATE_JSON --inventory-sha256 SHA256\n"
         + "Edge modes (typed only): --edge-mode worker [--fence-receipt PRIVATE_JSON --fence-receipt-sha256 SHA256] | --edge-mode fenced "
@@ -3141,7 +3271,8 @@ async function main() {
         + "typed recovery of a gcp operation adds --edge-plan PRIVATE_JSON\n"
         + "Changed site (typed, --edge-mode worker or gcp; replaces the retained pair): "
         + "--candidate-public-manifest-sha256 SHA256 "
-        + "(--web-release-receipt ABSOLUTE_RECEIPT | --rollback-web-release-receipt ABSOLUTE_RECEIPT) "
+        + "(--web-release-receipt ABSOLUTE_RECEIPT | --rollback-web-release-receipt ABSOLUTE_RECEIPT "
+        + "--rollback-release-operation ABSOLUTE_RELEASE_OPERATION_DIRECTORY) "
         + "--replaced-public-source FULL_SHA --replaced-live-manifest-sha256 SHA256\n",
     );
     process.exit(2);

@@ -16,7 +16,10 @@ import {
   createPublicReleaseSourceProvenance,
   PUBLIC_RELEASE_MANIFEST_SCHEMA,
 } from "../../../scripts/public-release-provenance.js";
-import { stageProductionAssets } from "./stage-production-assets.mjs";
+import {
+  stageProductionAssets,
+  verifyPinnedPublicReleaseManifestSource,
+} from "./stage-production-assets.mjs";
 
 function git(root, arguments_) {
   return execFileSync("/usr/bin/git", ["-C", root, ...arguments_], {
@@ -413,4 +416,38 @@ test("a candidate site stages only as exactly its manifest, built from the commi
   // A candidate manifest the staged site does not produce.
   await assert.rejects(stage({ retainedPublicSourceCommit: released, expectedLiveManifestSha256: "0".repeat(64) }),
     /does not match the expected live manifest/u);
+});
+
+test("a served manifest proves only the commit whose public source produced it", async (t) => {
+  // production:deploy proves the replaced site's source this way, on the live
+  // manifest bytes it has just matched to --replaced-live-manifest-sha256.
+  const value = await fixture();
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+  const released = value.sourceCommit;
+  const manifestBytes = await readFile(join(value.source, "release-site-manifest.json"));
+  const verify = (sourceCommit, bytes = manifestBytes) => verifyPinnedPublicReleaseManifestSource({
+    repositoryRoot: value.root,
+    sourceCommit,
+    manifestBytes: bytes,
+  });
+  assert.deepEqual(await verify(released), { publicSourceCommit: released });
+  // A later commit that left the public source alone has the same closure.
+  await writeFile(join(value.root, "unrelated.txt"), "not public source\n");
+  git(value.root, ["add", "unrelated.txt"]);
+  git(value.root, ["commit", "--quiet", "-m", "unrelated"]);
+  const unrelated = git(value.root, ["rev-parse", "HEAD"]).trim();
+  assert.deepEqual(await verify(unrelated), { publicSourceCommit: unrelated });
+  // A later commit that changed the public source did not produce these bytes.
+  await writeFile(join(value.publicSource, "community.js"), "console.log('next release');\n");
+  git(value.root, ["add", "apps/web/public/community.js"]);
+  git(value.root, ["commit", "--quiet", "-m", "next release"]);
+  const head = git(value.root, ["rev-parse", "HEAD"]).trim();
+  await assert.rejects(verify(head), /does not match the source snapshot/u);
+  // A nonexistent or malformed commit, and bytes that are not a release manifest.
+  await assert.rejects(verify("f".repeat(40)), /cannot be resolved/u);
+  await assert.rejects(verify("short"), /40-character/u);
+  await assert.rejects(verify(released, Buffer.from("not json")), /not valid JSON/u);
+  await assert.rejects(verify(released, Buffer.from('{"schemaVersion":"other"}')), /unsupported shape/u);
+  await assert.rejects(verify(released, Buffer.alloc(0)), /unavailable/u);
+  await assert.rejects(verify(released, "{}"), /unavailable/u);
 });

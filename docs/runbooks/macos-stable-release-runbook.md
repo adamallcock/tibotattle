@@ -1087,7 +1087,9 @@ before npm --prefix apps/worker run production:deploy -- --confirm
 DEPLOY_PRODUCTION; a raw Wrangler deploy does not rebuild the baked installer
 metadata. See [2026-08-17-web-only-release.md](./2026-08-17-web-only-release.md)
 only for an intentionally website-only change that reuses an already released
-artifact.
+artifact. On this line the deploy command takes the typed flags in
+[Production service operations](./production-operations.md#guarded-deployment-wrapper);
+without `--inventory` it is refused (`PRODUCTION_UNTYPED_DEPLOY_REFUSED`).
 
 Refresh the social share card first. It is the og:image/twitter:image for
 every link preview of the site, and its headline figure is a published estimate
