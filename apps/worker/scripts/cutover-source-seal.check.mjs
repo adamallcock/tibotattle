@@ -61,12 +61,38 @@ import {
 // PT-2-lite seal acceptance. Local only: the transport and the Wrangler
 // export are injected fakes over synthetic D1 files; nothing contacts a
 // provider. Run: node --test ./scripts/cutover-source-seal.check.mjs
+//
+// It needs full git history: several checks read pinned commits as git
+// objects (the Cloudflare production line d43c8f92, and the restore-base
+// generator commit with its parent). A checkout without them, such as a
+// depth-1 clone, is an environment gap. Each check that needs them fails and
+// names it; none skips, because a skip would pass as partial proof. The
+// hosted-backend workflow's Cloud Run check checks out full history for this.
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const COMMIT = headCommit(WORKER_ROOT);
+const D43 = "d43c8f92a059d9c577776f7eca8a331eb305b8a6";
 let world;
 
 const isCode = code => error => error instanceof CutoverSourceError && error.code === code;
+
+const commitPresent = (commit) => {
+  try {
+    execFileSync("git", ["-C", WORKER_ROOT, "cat-file", "-e", `${commit}^{commit}`], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/** Fails, naming the environment gap, unless every pinned commit object is in this checkout. */
+function requireCommits(...commits) {
+  const missing = commits.filter(commit => !commitPresent(commit));
+  if (missing.length > 0) {
+    assert.fail(`CUTOVER_SEAL_CHECK_ENVIRONMENT_GAP: this checkout lacks the pinned commit object(s) ${missing.join(", ")}`
+      + " (a shallow clone?). Fetch full history and rerun; this check does not skip without them.");
+  }
+}
 
 async function listing(directory) {
   return (await readdir(directory)).sort();
@@ -152,24 +178,16 @@ test("expected ledgers come from git objects at the commit with bare names and f
     isCode("CUTOVER_EXPECTED_LEDGER_INVALID"));
   // At the Cloudflare production line (d43c8f92) the Q-1 oracle applied every
   // ingestion directory through one Wrangler ledger; the bare-name expected
-  // ledger reproduces its 90 rows exactly. Skipped only where that commit
-  // object is absent (a shallow clone).
-  let present = true;
-  try {
-    execFileSync("git", ["-C", WORKER_ROOT, "cat-file", "-e", "d43c8f92a059d9c577776f7eca8a331eb305b8a6^{commit}"],
-      { stdio: "ignore" });
-  } catch {
-    present = false;
-  }
-  if (present) {
-    const q1 = buildExpectedLedger({ source: { role: "ingestion", ledgers: { d1_migrations: [
-      "migrations", "typed-ingestion-migrations", "ingestion-bridge-migrations", "typed-v1-admission-migrations",
-      "typed-v11-admission-migrations", "ingestion-isolation-migrations"] } },
-    commit: "d43c8f92a059d9c577776f7eca8a331eb305b8a6" });
-    const dump = JSON.parse(await readFile(Q1_INGESTION_DUMP, "utf8"));
-    const rows = dump.tables.find(table => table.name === "d1_migrations").rows.map(row => row[1]);
-    assert.deepEqual(q1.ledgers.d1_migrations.map(row => row.name), rows);
-  }
+  // ledger reproduces its 90 rows exactly. Without that commit object this
+  // fails as an environment gap.
+  requireCommits(D43);
+  const q1 = buildExpectedLedger({ source: { role: "ingestion", ledgers: { d1_migrations: [
+    "migrations", "typed-ingestion-migrations", "ingestion-bridge-migrations", "typed-v1-admission-migrations",
+    "typed-v11-admission-migrations", "ingestion-isolation-migrations"] } },
+  commit: D43 });
+  const dump = JSON.parse(await readFile(Q1_INGESTION_DUMP, "utf8"));
+  const rows = dump.tables.find(table => table.name === "d1_migrations").rows.map(row => row[1]);
+  assert.deepEqual(q1.ledgers.d1_migrations.map(row => row.name), rows);
 });
 
 test("remote reads are SELECT-only; a mutation never reaches the transport", async () => {
@@ -500,17 +518,9 @@ test("createWranglerCutoverTransport disposes every pinned config it wrote", asy
 // The restore-base ingestion layout (SEAL-RESTORE-BASE). Production ingestion
 // carries the restore-era ledger: the generated 0001_restore_base.sql row plus
 // the files applied after it. The layout is selected explicitly and accepts
-// exactly that ledger.
+// exactly that ledger. These checks need the generator commit object (and,
+// for the live shape, d43c8f92); without them they fail as an environment gap.
 
-const D43 = "d43c8f92a059d9c577776f7eca8a331eb305b8a6";
-const commitPresent = (commit) => {
-  try {
-    execFileSync("git", ["-C", WORKER_ROOT, "cat-file", "-e", `${commit}^{commit}`], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-};
 const restoreSource = { role: "ingestion", layout: CUTOVER_RESTORE_BASE_LAYOUT, ledgers: RESTORE_INGESTION_LEDGERS };
 const blobSha256 = (commit, path) => createHash("sha256")
   .update(execFileSync("git", ["-C", WORKER_ROOT, "cat-file", "blob", `${commit}:apps/worker/${path}`])).digest("hex");
@@ -582,15 +592,15 @@ test("the folded role inputs are recomputed from git objects exactly as the rest
     assert.deepEqual(fromGit.migrations.map(row => ({ ...row })), fromTree.migrations);
     assert.equal(fromGit.inputSha256, fromTree.inputSha256, "the same digest as d1-storage-role.mjs inputSha256");
   }
-  if (commitPresent(CUTOVER_RESTORE_BASE.generatorCommit)) {
-    const folded = cutoverRoleInputsAt({ commit: CUTOVER_RESTORE_BASE.generatorCommit });
-    assert.equal(folded.migrations.length, CUTOVER_RESTORE_BASE.roleInputCount);
-    assert.equal(folded.inputSha256, CUTOVER_RESTORE_BASE.roleInputsSha256,
-      "the qualification's role-inputs.json inputSha256");
-  }
+  requireCommits(CUTOVER_RESTORE_BASE.generatorCommit);
+  const folded = cutoverRoleInputsAt({ commit: CUTOVER_RESTORE_BASE.generatorCommit });
+  assert.equal(folded.migrations.length, CUTOVER_RESTORE_BASE.roleInputCount);
+  assert.equal(folded.inputSha256, CUTOVER_RESTORE_BASE.roleInputsSha256,
+    "the qualification's role-inputs.json inputSha256");
 });
 
-test("the restore-base expected ledger is the pinned base row plus exactly the unfolded tail", { skip: !commitPresent(CUTOVER_RESTORE_BASE.generatorCommit) }, async () => {
+test("the restore-base expected ledger is the pinned base row plus exactly the unfolded tail", async () => {
+  requireCommits(CUTOVER_RESTORE_BASE.generatorCommit, `${CUTOVER_RESTORE_BASE.generatorCommit}~1`, D43);
   const restore = buildExpectedLedger({ source: restoreSource, commit: COMMIT });
   assert.equal(restore.layout, CUTOVER_RESTORE_BASE_LAYOUT);
   assert.deepEqual(Object.keys(restore.ledgers), ["d1_storage_migrations"]);
@@ -606,25 +616,23 @@ test("the restore-base expected ledger is the pinned base row plus exactly the u
 
   // At the production line the layout reproduces the 13-row live restore-era
   // ledger (names and git-blob digest prefixes from the wave 14 evidence).
-  if (commitPresent(D43)) {
-    const live = buildExpectedLedger({ source: restoreSource, commit: D43 }).ledgers.d1_storage_migrations
-      .map(row => `${row.name}:${row.sha256.slice(0, 12)}`);
-    assert.deepEqual(live, [
-      "0001_restore_base.sql:396753809b96",
-      "0061_accountless_history_retention.sql:0d6d9d233907",
-      "0062_v1_acquisition_vocabulary.sql:50efab3fcea6",
-      "0005_owner_occurrence_lookup.sql:970bf68dcf1d",
-      "0004_v1_multidevice_source_update.sql:65ade40d101d",
-      "0005_opt_out_retains_history.sql:17e4d02f0fa7",
-      "0006_usage_correction_facts.sql:cbcac1caef1e",
-      "0007_usage_correction_admission.sql:3893f350f4c7",
-      "0008_telemetry_v12.sql:d5802b4a1d22",
-      "0009_performance_reports.sql:cfd43797151e",
-      "0010_accountless_v12_renewal.sql:1400953fc3a0",
-      "0011_v12_public_eligibility.sql:580019549ec4",
-      "0012_v12_empty_day_manifests.sql:92298adaaa32",
-    ]);
-  }
+  const live = buildExpectedLedger({ source: restoreSource, commit: D43 }).ledgers.d1_storage_migrations
+    .map(row => `${row.name}:${row.sha256.slice(0, 12)}`);
+  assert.deepEqual(live, [
+    "0001_restore_base.sql:396753809b96",
+    "0061_accountless_history_retention.sql:0d6d9d233907",
+    "0062_v1_acquisition_vocabulary.sql:50efab3fcea6",
+    "0005_owner_occurrence_lookup.sql:970bf68dcf1d",
+    "0004_v1_multidevice_source_update.sql:65ade40d101d",
+    "0005_opt_out_retains_history.sql:17e4d02f0fa7",
+    "0006_usage_correction_facts.sql:cbcac1caef1e",
+    "0007_usage_correction_admission.sql:3893f350f4c7",
+    "0008_telemetry_v12.sql:d5802b4a1d22",
+    "0009_performance_reports.sql:cfd43797151e",
+    "0010_accountless_v12_renewal.sql:1400953fc3a0",
+    "0011_v12_public_eligibility.sql:580019549ec4",
+    "0012_v12_empty_day_manifests.sql:92298adaaa32",
+  ]);
 
   // Fail closed on git facts that no longer describe the base.
   const realGit = (args, { repositoryRoot }) => execFileSync("git", ["-C", repositoryRoot, ...args],
@@ -648,7 +656,8 @@ test("the restore-base expected ledger is the pinned base row plus exactly the u
     isCode("CUTOVER_EXPECTED_LEDGER_INVALID"), "a commit that predates the base generator");
 });
 
-test("the restore-base layout seals the restore-era ledger and refuses every other ledger", { skip: !commitPresent(CUTOVER_RESTORE_BASE.generatorCommit) }, async () => {
+test("the restore-base layout seals the restore-era ledger and refuses every other ledger", async () => {
+  requireCommits(CUTOVER_RESTORE_BASE.generatorCommit);
   const sealed = await ledgerVariant({ name: "restore", ledgers: RESTORE_INGESTION_LEDGERS, layout: CUTOVER_RESTORE_BASE_LAYOUT,
     inventoryMutate: restoreInventory });
   const result = await sealed.run();

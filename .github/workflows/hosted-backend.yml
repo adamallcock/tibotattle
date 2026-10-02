@@ -35,7 +35,9 @@ name: Hosted backend
 # The Cloud Run check also runs the offline parts of
 # gcp:production-tooling:local-check (the rollout CLI, the infrastructure
 # manifest and the cutover seal), which need no PostgreSQL, network or
-# credential. The PostgreSQL-backed part of that command,
+# credential. It is the only job that checks out full history, because the
+# cutover seal check reads pinned commits as git objects; it fails, and never
+# skips, when they are absent. The PostgreSQL-backed part of that command,
 # postgres-production-migrations.spec.mjs, runs in the postgres-17-suite job.
 #
 # Read-only by construction: no secrets, no environments, no deployment, no
@@ -192,10 +194,15 @@ jobs:
       A2_DAILY_ACTIVATION_TEST_HOST: "127.0.0.1"
       A2_DAILY_ACTIVATION_TEST_PORT: "55432"
     steps:
+      # Full history: the cutover seal check reads pinned commits as git
+      # objects (the restore-base generator commit 8da57e76 and its parent, and
+      # the Cloudflare production line d43c8f92, which is not an ancestor of
+      # this line and arrives with the repository's other branches). It fails
+      # as an environment gap without them.
       - name: Check out the selected revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 1
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Install pinned Node.js

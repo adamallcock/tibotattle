@@ -109,11 +109,42 @@ synthetic ingestion D1 with its ledgers rewritten:
 - The fresh-chain layout refuses a restore-era ledger under both directory
   layouts. The restore layout refuses a fresh-chain ledger under both.
 
+## CI coverage
+
+A review found that, in CI, the restore cases above skipped without failing.
+The only CI runner of this file is `.github/workflows/hosted-backend.yml`, job
+`cloud-run-check`, step "Check the cutover seal tooling offline"
+(`npm --prefix apps/worker run postgres:cutover-seal:check`). That job checked
+out at depth 1, so `8da57e76` and `d43c8f92` were absent. Two tests skipped,
+and two passed without running their pinned-commit assertions. The follow-up
+on this branch:
+
+- `cloud-run-check` checks out full history (`fetch-depth: 0`).
+  `test/hosted-backend-workflow.test.js` pins this, and it pins depth 1 for
+  the other jobs.
+- Every check that reads a pinned commit object (`8da57e76`, its parent, and
+  `d43c8f92`) now fails with `CUTOVER_SEAL_CHECK_ENVIRONMENT_GAP` when that
+  object is missing. None skips. This includes the earlier Q-1 oracle
+  comparison at `d43c8f92`.
+- Reproduced locally: a depth-1 clone of `2aca5bfb` running the new check
+  file gives 15 passed, 4 failed and 0 skipped. Each failure names the gap.
+  Before the change, the reviewer's run of the restore and folded-inputs
+  cases in the same setup gave 2 passed and 2 skipped. The full-history
+  worktree gives 19/19 with 0 skipped.
+- `d43c8f92` is not an ancestor of this line. A full-history checkout gets it
+  only through a remote branch: on 2026-10-02 that was origin
+  `codex/maintained-analytics-framework`. If no branch or tag on origin keeps
+  it, the CI step fails as an environment gap. A durable tag would remove
+  that dependency.
+- The working-tree comparison in the folded-inputs check runs only when the
+  six ingestion directories are clean against HEAD. A CI checkout always is.
+- Not proven: a hosted GitHub Actions run of this job. Nothing was pushed.
+
 ## Gates
 
 | Command | Result |
 |---|---|
-| `node --test ./scripts/cutover-source-seal.check.mjs` (apps/worker) | 19/19 |
+| `node --test ./scripts/cutover-source-seal.check.mjs` (apps/worker, full history) | 19/19, 0 skipped |
 | `npm run postgres:cutover-seal:check` (apps/worker) | pass, 76/76 (seal, fence, projections, identity transfer, quiescence, legacy transfer checks) |
 | `npm run test:preflight` (root) | pass, exit 0 |
 | `npm run architecture:check` (root) | pass: 932 production files, 3,968 imports, 0 approved debt edges |
@@ -130,6 +161,9 @@ synthetic ingestion D1 with its ledgers rewritten:
 - The restore layout requires the live ingestion D1 to have no
   `d1_migrations` table. The wave 14 evidence names only the storage ledger;
   if the private receipt shows a Wrangler ledger table on ingestion as well,
-  the layout refuses and needs a decision.
+  the layout refuses and needs a decision. `production-operations.md` now
+  says that `0063` goes to production ingestion as a `d1_storage_migrations`
+  row, never through Wrangler, and to stop if a `d1_migrations` table shows
+  up there.
 - Not proven: any live seal, export or ledger read. The provider has never
   been contacted by the seal.

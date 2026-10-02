@@ -521,21 +521,43 @@ is applied.
 
 The GCP line carried `0013` and `0014` under earlier numbers until they were
 renamed, byte-identically, to follow `0012`. The D1 ledgers record bare file
-names. Before applying `0013` or `0014` anywhere, read back only the migration
-names in `d1_storage_migrations` and `d1_migrations` of every Cloudflare D1
-database, in every environment and role, and confirm that none is one of the
-retired names listed as `RETIRED_ISOLATION_NAMES` in
+names. Before applying `0013` or `0014` anywhere, read back which of
+`d1_storage_migrations` and `d1_migrations` exist, and only the migration
+names in each, for every Cloudflare D1 database in every environment and role.
+Confirm that none is one of the retired names listed as
+`RETIRED_ISOLATION_NAMES` in
 `apps/worker/scripts/ingestion-isolation-sequence.check.mjs`. If one is
 present, stop and re-plan: never relabel or re-apply an applied migration.
 That check also pins every isolation file's bytes and name, and models the
-ledger rows from the storage operator's own submission.
+ledger rows from the storage operator's own submission. Its model applies
+baseline files through Wrangler's `d1_migrations`, a fresh chain; it does not
+model the restore-era production ingestion ledger described next.
 
-`0014` also needs baseline `0063_accountless_history_transfer_source.sql` in
-the role's `d1_migrations`. GitHub `main`'s baseline ends at `0062`, so the
-production ingestion D1 lacks it unless it was applied separately. `0063` is a
-baseline (Wrangler `d1_migrations`) migration, not a storage-migration
-submission: it needs its own authorization,
-[admission and rehearsal](./release-migration-rehearsal.md) and receipt. If the
+`0014` also needs baseline `0063_accountless_history_transfer_source.sql`
+applied first. GitHub `main`'s baseline ends at `0062`, so the production
+ingestion D1 lacks it unless it was applied separately. Apply `0063` into the
+ledger that already records the role's later baseline files, never into a
+second ledger:
+
+- Production ingestion is a restore-era D1. The 2026-10-02 read-only ledger
+  readback recorded `d1_storage_migrations` with 13 rows and named no other
+  ledger table. The rows are the generated `0001_restore_base.sql` (the base
+  folded baseline `0001` to `0060` and the early files of the other five
+  ingestion directories) and every file applied after it, baseline `0061` and
+  `0062` included ([restore-base receipt](../receipts/2026-10-02-gcp-int-c-seal-restore-base.md)).
+  There, `0063` is a bare-name `d1_storage_migrations` row submitted through
+  the reviewed storage-migration path, like `0061` and `0062`. Do not apply it
+  through Wrangler: that creates a `d1_migrations` table, and the cutover
+  seal's restore-base layout refuses a ledger it does not expect
+  (`CUTOVER_LEDGER_MISMATCH`; [GCP cutover H.3](./gcp-cutover-window.md#h3-seal)).
+  If a readback shows a `d1_migrations` table on production ingestion, stop:
+  the restore-base layout no longer describes it, and the seal inventory needs
+  an owner decision before it is written.
+- A role whose readback records its baseline files in Wrangler's
+  `d1_migrations` keeps that baseline path, with its
+  [admission and rehearsal](./release-migration-rehearsal.md).
+
+Either way `0063` needs its own authorization, rehearsal and receipt. If the
 readback does not show `0063` and it is not applied first, do not apply
 `0014`; record the owner's decision to defer it, which also defers every
 deploy of a tree that contains it.
@@ -556,10 +578,11 @@ Choose one order before applying anything:
 - Or first land `0063`, `0013` and `0014` byte-identically, under the same
   names, on GitHub `main`. `main` then cannot deploy until they are applied.
 
-Then apply `0063` through the baseline path when the readback lacks it, then
-`0013`, then `0014`, each storage file with its bare-name
+Then apply `0063` when the readback lacks it, into the ledger chosen above,
+then `0013`, then `0014`, each storage file with its bare-name
 `d1_storage_migrations` row in the same submission through the reviewed
-storage-migration path, and read both ledgers' bare names back afterwards.
+storage-migration path. Afterwards, read back which ledger tables exist and
+their bare names.
 
 Run the local populated rehearsal from the repository root. It uses
 synthetic content-free rows, enables foreign-key checks, verifies every mapped
