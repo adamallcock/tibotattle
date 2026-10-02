@@ -403,9 +403,14 @@ list on the deploy line governs.
    `active` or still carries a deletion fence
    (`CUTOVER_PARTICIPANT_ERASURE_PENDING`), an incomplete public-source
    bootstrap, and a broken accountless authority chain. Cooldowns and the
-   deletion ledger are not imported. The production modes of the telemetry
-   importers (D-PT5A) and the orchestrator that sequences all stages
-   (E-PT8) are `not built`:
+   deletion ledger are not imported. The sealed v0.x history
+   (`legacy-contributions`), the pending registrations
+   (`pending-registrations`, one transfer hold per registration) and the
+   operational history (admin metric snapshots and
+   `community_aggregate_exclusions`, mapped in R3 post-import) are `built`
+   (D-PT4X; their tables are primary migrations `0066` and `0067`). The
+   production modes of the telemetry importers (D-PT5A) and the orchestrator
+   that sequences all stages (E-PT8) are `not built`:
    `<command: E-PT8 orchestrator, one disposition per sealed table>`.
 2. **Check the orchestrator's dispositions and refusals.** One disposition per
    sealed table, the deletion-digest exclusion count, the identity-pin
@@ -628,8 +633,10 @@ Each item is its own authorized operation. Order is flexible except where
 noted.
 
 - Copy the frozen R2 objects to Google Cloud Storage (PT-7, reduced). `not built`.
-  Guard the maintenance pass's reconciliation against objects still in R2 until
-  the copy is done.
+  The maintenance pass's reconciliation guard against objects still in R2 is
+  `built` (E-PT4, in D-PT4X): the reconciler never touches a registration with
+  an unreleased transfer hold, and PT-7 releases each hold, one way, after the
+  object is copied or proven absent.
 - Integration commit: set `wrangler.jsonc` `main` to `src/edge-entry.ts` and
   record that production is typed-rendered.
 - Delete the retired Cloudflare storage secrets, a separately authorized step

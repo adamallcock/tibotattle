@@ -1,10 +1,10 @@
 -- pending_object_transfer_holds: the E-PT4 reconciliation guard.
 --
--- NUMBER. 0902 is a PLACEHOLDER (the stream brief's NNNN), chosen outside the
--- range any sibling stream stages so two staged files never share a version.
--- The integrator assigns the next free primary number at promotion and renames
--- the file; specs find it by its name suffix. Purely additive (one table, one
--- function, one trigger): no CONTRACT_MIGRATIONS entry.
+-- NUMBER. Primary 0067, assigned by the integrator at the D-PT4X merge
+-- (2026-10-02), right after community_aggregate_exclusions (0066). Until then
+-- it was staged as staged-migrations/primary/0902_pending_object_transfer_holds.sql
+-- (a placeholder number); specs find it by its name suffix. Purely additive
+-- (one table, one function, one trigger): no CONTRACT_MIGRATIONS entry.
 --
 -- WHY. The cutover imports every sealed D1 pending_quarantine_objects row into
 -- pending_objects (the 'pending-registrations' stage). Those registrations name

@@ -1,12 +1,12 @@
 -- community_aggregate_exclusions: the operator abuse and quality exclusions
 -- (N-EXCL, round 5: "Port them").
 --
--- NUMBER. 0901 is a PLACEHOLDER (the stream brief's NNNN), chosen outside the
--- range any sibling stream stages so two staged files never share a version.
--- The integrator assigns the next free primary number at promotion and renames
--- the file; specs find it by its name suffix, so no spec changes then. The
--- migration is purely additive (one table, one index, one function, one
--- trigger), so it needs no CONTRACT_MIGRATIONS entry.
+-- NUMBER. Primary 0066, assigned by the integrator at the D-PT4X merge
+-- (2026-10-02), right after the interim public read (0065). Until then it was
+-- staged as staged-migrations/primary/0901_community_aggregate_exclusions.sql
+-- (a placeholder number); specs find it by its name suffix. The migration is
+-- purely additive (one table, one index, one function, one trigger), so it
+-- needs no CONTRACT_MIGRATIONS entry.
 --
 -- The table is the D1 table of migrations/0023 (rewritten verbatim by 0058),
 -- with D1's TEXT instants as timestamptz and the same CHECKs:
