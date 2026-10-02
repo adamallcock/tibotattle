@@ -20,24 +20,34 @@ import {
   checkRegistrationRatchet,
   classifyFailureDetail,
   deriveFileProfile,
+  EDGE_E2E_GOLDEN_VARIABLE,
+  EDGE_E2E_NODE_VARIABLE,
+  EDGE_E2E_NODE_VERSION,
   evaluatePostgresSuite,
   EXPECTED_HOST_PROFILE_FILES,
+  EXTRA_REGISTRATION_SCRIPTS,
+  EXTRA_SCRIPT_PREREQUISITES,
   extractGateExpressions,
   listPostgresTestFiles,
   loadRegistration,
   parseDomainCheckRegistration,
+  parseExtraRegistrationScript,
   parseNodeTap,
   parseVitestInclude,
   parseVitestReport,
   passEnvironment,
   planPostgresSuite,
+  probeEdgeE2eEnvironment,
+  PROFILE_EDGE_E2E,
   readSocketProfileInput,
   runPostgresSuite,
+  SCRIPT_PROFILES,
   UNREGISTERED_ALLOWLIST,
 } from "./ci-postgres-suite.mjs";
 import {
   CI_WORK_DIRECTORY,
   ciPostgresProfiles,
+  ciPostgresTcpProfile,
   CONTAINER_NAME,
   CONTAINER_SOCKET_DIRECTORY,
   dockerRunArguments,
@@ -52,6 +62,11 @@ import {
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SOCKET = "/private/tmp/tibotattle-pg-ci/socket";
+const EDGE_SPEC = "postgres-test/edge-origin-e2e.spec.mjs";
+const PRODUCTION_MIGRATIONS_SPEC = "postgres-test/postgres-production-migrations.spec.mjs";
+const JOURNAL_TRANSFER_SPEC = "postgres-test/postgres-ingestion-journal-transfer.spec.mjs";
+const EDGE_NODE = "/synthetic/node-v22.16.0/bin/node";
+const EDGE_GOLDEN = "/synthetic/golden";
 
 async function withWorkerCopy(callback) {
   const root = await mkdtemp(join(tmpdir(), "tibotattle-pg-suite-check-"));
@@ -91,8 +106,9 @@ test("routing over the real postgres-test directory derives exactly the frozen H
   assert.equal(new Set(planned).size, planned.length, "each file is planned once");
   for (const file of onDisk) assert.ok(planned.includes(file), `${file} is planned`);
   for (const entry of plan.files) {
-    assert.equal(entry.profile, EXPECTED_HOST_PROFILE_FILES.includes(entry.file) ? "HOST" : "SOCKET",
-      entry.file);
+    assert.equal(entry.profile, entry.file === EDGE_SPEC
+      ? PROFILE_EDGE_E2E
+      : EXPECTED_HOST_PROFILE_FILES.includes(entry.file) ? "HOST" : "SOCKET", entry.file);
   }
   for (const socketOnly of [
     "postgres-test/postgres-maintenance.spec.mjs",
@@ -720,9 +736,10 @@ test("the union of passes must place every planned file in its routed pass exact
     status: "passed",
     files: 2,
     tests: 4,
-    passedByPass: { SOCKET: 2, HOST: 2 },
+    passedByPass: { SOCKET: 2, HOST: 2, EDGE_E2E: 0 },
     skipped: [],
     failures: [],
+    environmentGaps: [],
   });
   summary = evaluatePostgresSuite({ plan, records: [
     nodeRecord("SOCKET", socketFile, passing),
@@ -760,11 +777,16 @@ ok 1 - ${name}
 `;
 }
 
-function fakeSuiteRunner({ plan, skipFile = null }) {
+function fakeSuiteRunner({ plan, skipFile = null, prerequisiteExit = 0 }) {
   const calls = [];
   const run = async (command, args, { cwd, env, captureStdout }) => {
     calls.push({ command, args, cwd, env: { ...env }, captureStdout });
-    assert.equal(command, process.execPath);
+    if (command === EDGE_NODE) {
+      if (args[0] === "./cloud-run/build.mjs") return { exitCode: prerequisiteExit, stdout: "" };
+      assert.equal(args[0], "--test");
+    } else {
+      assert.equal(command, process.execPath);
+    }
     if (args.includes("run")) {
       const config = args[args.indexOf("--config") + 1];
       const output = args.find((arg) => arg.startsWith("--outputFile=")).slice("--outputFile=".length);
@@ -796,6 +818,8 @@ ok 1 - gated # SKIP
   return { run, calls };
 }
 
+const edgeAvailable = async () => ({ available: true, node: EDGE_NODE });
+
 test("the runner sends each file to its routed profile and never sets PG_TEST_PASSWORD", async () => {
   const plan = await planPostgresSuite({ workerRoot: WORKER_ROOT });
   const { run, calls } = fakeSuiteRunner({ plan });
@@ -805,6 +829,7 @@ test("the runner sends each file to its routed profile and never sets PG_TEST_PA
     run,
     onOutput: () => {},
     plan,
+    probeEdgeE2e: edgeAvailable,
   });
   assert.equal(summary.status, "passed", JSON.stringify(summary.failures));
   assert.deepEqual(summary.skipped, []);
@@ -844,8 +869,21 @@ test("the runner sends each file to its routed profile and never sets PG_TEST_PA
   }
   const hostCalls = nodeCalls.filter(({ env }) => env.PG_TEST_HOST !== undefined).map(({ args }) => args[3].slice(2));
   assert.deepEqual(hostCalls.sort(), [...EXPECTED_HOST_PROFILE_FILES].sort());
-  assert.ok(nodeCalls.findIndex(({ env }) => env.PG_TEST_HOST !== undefined)
-    > nodeCalls.findLastIndex(({ env }) => env.PG_TEST_SOCKET !== undefined), "SOCKET pass runs first");
+  const routedCalls = nodeCalls.filter(({ command }) => command === process.execPath);
+  assert.ok(routedCalls.findIndex(({ env }) => env.PG_TEST_HOST !== undefined)
+    > routedCalls.findLastIndex(({ env }) => env.PG_TEST_SOCKET !== undefined), "SOCKET pass runs first");
+  const edgeCalls = calls.filter(({ command }) => command === EDGE_NODE);
+  assert.deepEqual(edgeCalls.map(({ args }) => args), [
+    ["./cloud-run/build.mjs"],
+    ["--test", "--test-concurrency=1", "--test-reporter=tap", `./${EDGE_SPEC}`],
+  ], "EDGE_E2E runs last, through edge:e2e's own steps, under the image runtime");
+  assert.ok(calls.indexOf(edgeCalls[0]) > calls.findLastIndex(({ env }) => env.PG_TEST_HOST !== undefined));
+  for (const call of edgeCalls) {
+    assert.equal(call.env.PG_TEST_SOCKET, SOCKET);
+    assert.equal(call.env.PG_TEST_HOST, undefined);
+  }
+  assert.equal(summary.passedByPass.EDGE_E2E, 1);
+  assert.deepEqual(summary.environmentGaps, []);
 });
 
 test("a skip inside the routed pass fails the whole run", async () => {
@@ -905,6 +943,241 @@ test("the caller supplies only the SOCKET profile; the runner builds each pass e
     { PATH: "/bin", PG_TEST_SOCKET: SOCKET, PG_TEST_PORT: "5432" });
   assert.deepEqual(passEnvironment({ PATH: "/bin", PG_TEST_SOCKET: "stale" }, "HOST", { socket: SOCKET, port: "5432" }),
     { PATH: "/bin", PG_TEST_HOST: SOCKET, PG_TEST_PORT: "5432" });
+});
+
+test("the CI container's loopback TCP pair is its published port and passes the suite's profile reader", () => {
+  assert.deepEqual(ciPostgresTcpProfile(), { PG_TEST_TCP_HOST: "127.0.0.1", PG_TEST_TCP_PORT: "55432" });
+  assert.deepEqual(Object.keys(ciPostgresProfiles().socket), ["PG_TEST_SOCKET", "PG_TEST_PORT"],
+    "the exported SOCKET profile stays socket-only");
+  assert.deepEqual(readSocketProfileInput({ ...ciPostgresProfiles().socket, ...ciPostgresTcpProfile() }),
+    { socket: ciPostgresProfiles().socket.PG_TEST_SOCKET, port: "5432", tcpHost: "127.0.0.1", tcpPort: "55432" });
+  for (const publish of ["0.0.0.0:55432:5432", "127.0.0.1:55432:5433"]) {
+    assert.throws(() => ciPostgresTcpProfile(publish), /CI_POSTGRES_PROFILE_INVALID/u, publish);
+  }
+});
+
+test("the loopback TCP pair is optional, set together, loopback only, and reaches the SOCKET pass alone", () => {
+  const tcp = { PG_TEST_SOCKET: SOCKET, PG_TEST_PORT: "5432", PG_TEST_TCP_HOST: "127.0.0.1", PG_TEST_TCP_PORT: "55432" };
+  const profile = readSocketProfileInput(tcp);
+  assert.deepEqual(profile, { socket: SOCKET, port: "5432", tcpHost: "127.0.0.1", tcpPort: "55432" });
+  assert.deepEqual(passEnvironment({ PATH: "/bin", ...tcp }, "SOCKET", profile),
+    { PATH: "/bin", PG_TEST_SOCKET: SOCKET, PG_TEST_PORT: "5432", PG_TEST_TCP_HOST: "127.0.0.1", PG_TEST_TCP_PORT: "55432" });
+  assert.deepEqual(passEnvironment({ PATH: "/bin", ...tcp }, "HOST", profile),
+    { PATH: "/bin", PG_TEST_HOST: SOCKET, PG_TEST_PORT: "5432" }, "HOST specs never dial TCP");
+  assert.deepEqual(passEnvironment({ PATH: "/bin", ...tcp }, "EDGE_E2E", profile),
+    { PATH: "/bin", PG_TEST_SOCKET: SOCKET, PG_TEST_PORT: "5432" });
+  for (const edit of [
+    (value) => { delete value.PG_TEST_TCP_PORT; },
+    (value) => { delete value.PG_TEST_TCP_HOST; },
+    (value) => { value.PG_TEST_TCP_HOST = "10.0.0.5"; },
+    (value) => { value.PG_TEST_TCP_PORT = "0"; },
+    (value) => { value.PG_TEST_TCP_PORT = "70000"; },
+  ]) {
+    const value = { ...tcp };
+    edit(value);
+    assert.throws(() => readSocketProfileInput(value), /CI_SUITE_PROFILE_INVALID/u, JSON.stringify(value));
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Extra registration scripts and the explicit EDGE_E2E profile
+// ---------------------------------------------------------------------------
+
+test("the extra registration scripts are frozen, and only edge:e2e has an explicit profile", () => {
+  assert.deepEqual(EXTRA_REGISTRATION_SCRIPTS, ["edge:e2e", "postgres:production-migrations:check"]);
+  assert.deepEqual(SCRIPT_PROFILES, { "edge:e2e": PROFILE_EDGE_E2E });
+  assert.deepEqual(EXTRA_SCRIPT_PREREQUISITES, ["node ./cloud-run/build.mjs"]);
+  for (const value of [EXTRA_REGISTRATION_SCRIPTS, SCRIPT_PROFILES, EXTRA_SCRIPT_PREREQUISITES]) {
+    assert.equal(Object.isFrozen(value), true);
+  }
+});
+
+test("the real plan has no failures: edge-origin-e2e runs in EDGE_E2E and the production migration spec in SOCKET", async () => {
+  const plan = await planPostgresSuite({ workerRoot: WORKER_ROOT });
+  assert.deepEqual(plan.failures, []);
+  const edge = plan.files.find(({ file }) => file === EDGE_SPEC);
+  assert.deepEqual({ runner: edge.runner, source: edge.source, profile: edge.profile, prerequisites: edge.prerequisites,
+    testFlags: edge.testFlags }, {
+    runner: "script:edge:e2e", source: "edge:e2e", profile: PROFILE_EDGE_E2E,
+    prerequisites: ["node ./cloud-run/build.mjs"], testFlags: ["--test-concurrency=1"],
+  });
+  const production = plan.files.find(({ file }) => file === PRODUCTION_MIGRATIONS_SPEC);
+  assert.deepEqual({ runner: production.runner, source: production.source, profile: production.profile },
+    { runner: "node", source: "postgres:production-migrations:check", profile: "SOCKET" });
+  assert.equal(plan.files.find(({ file }) => file === JOURNAL_TRANSFER_SPEC).profile, "SOCKET");
+  assert.equal(plan.files.filter(({ profile }) => profile === PROFILE_EDGE_E2E).length, 1);
+  for (const file of [EDGE_SPEC, PRODUCTION_MIGRATIONS_SPEC]) {
+    assert.equal(UNREGISTERED_ALLOWLIST.includes(file), false, `${file} is registered, not allowlisted`);
+  }
+  const registration = await loadRegistration(WORKER_ROOT);
+  const { registered } = checkRegistrationRatchet({ onDisk: await listPostgresTestFiles(WORKER_ROOT), registration });
+  assert.deepEqual(registered.get(EDGE_SPEC), ["edge:e2e"]);
+  assert.deepEqual(registered.get(PRODUCTION_MIGRATIONS_SPEC), ["postgres:production-migrations:check"]);
+});
+
+test("extra registration scripts parse closed: specs, non-PostgreSQL checks and allowlisted prerequisites only", () => {
+  assert.deepEqual(parseExtraRegistrationScript("edge:e2e",
+    "node ./cloud-run/build.mjs && node --test --test-concurrency=1 ./postgres-test/edge-origin-e2e.spec.mjs"), {
+    nodeFiles: [EDGE_SPEC], testFlags: ["--test-concurrency=1"], prerequisites: ["node ./cloud-run/build.mjs"],
+  });
+  assert.deepEqual(parseExtraRegistrationScript("x",
+    "node --test ./cloud-run/a.check.mjs ./scripts/b.check.mjs && node --test ./postgres-test/c.spec.mjs").nodeFiles,
+  ["postgres-test/c.spec.mjs"], "non-PostgreSQL checks are accepted but never registered as specs");
+  for (const script of [
+    undefined,
+    "",
+    "node --test ./cloud-run/a.check.mjs",
+    "npm run edge:e2e",
+    "node ./scripts/other-build.mjs && node --test ./postgres-test/a.spec.mjs",
+    "node --test ./postgres-test/a.spec.mjs && node ./cloud-run/build.mjs",
+    "node --test ./cloud-run/server.mjs ./postgres-test/a.spec.mjs",
+    "node --test ./test/a.spec.mjs",
+    "node --test --import ./setup.mjs ./postgres-test/a.spec.mjs",
+    "vitest run --config vitest.postgres.config.ts",
+    "node --test ./postgres-test/a.spec.mjs; node --test ./postgres-test/b.spec.mjs",
+  ]) {
+    assert.throws(() => parseExtraRegistrationScript("synthetic", script), /REGISTRATION_PARSE_FAILED/u, String(script));
+  }
+});
+
+test("removing, emptying or double-registering an extra script fails the plan closed", async () => {
+  for (const [name, edit, expected] of [
+    ["edge:e2e", (scripts) => { delete scripts["edge:e2e"]; }, ["REGISTRATION_PARSE_FAILED"]],
+    ["postgres:production-migrations:check",
+      (scripts) => { scripts["postgres:production-migrations:check"] = "node --test ./cloud-run/postgres-runtime-grants.check.mjs"; },
+      ["REGISTRATION_PARSE_FAILED"]],
+    ["postgres:domain:check", (scripts) => { scripts["postgres:domain:check"] += ` ./${PRODUCTION_MIGRATIONS_SPEC}`; },
+      ["REGISTRATION_DUPLICATE"]],
+  ]) {
+    await withWorkerCopy(async (root) => {
+      await editJson(join(root, "package.json"), (value) => edit(value.scripts));
+      const plan = await planPostgresSuite({ workerRoot: root });
+      assert.deepEqual(codes(plan.failures), expected, name);
+    });
+  }
+});
+
+test("an explicit-profile spec that derives HOST fails PROFILE_ROUTING_DRIFT", async () => {
+  await withWorkerCopy(async (root) => {
+    const edge = join(root, EDGE_SPEC);
+    // Its gates read a local SKIP; rewrite them to read PG_TEST_HOST alone.
+    await writeFile(edge, (await readFile(edge, "utf8")).replaceAll("skip: SKIP", "skip: !process.env.PG_TEST_HOST"));
+    const plan = await planPostgresSuite({ workerRoot: root, expectedHostFiles: [...EXPECTED_HOST_PROFILE_FILES, EDGE_SPEC] });
+    assert.deepEqual(plan.failures.map(({ code, file, detail }) => [code, file, detail]), [
+      ["PROFILE_ROUTING_DRIFT", EDGE_SPEC, `explicit ${PROFILE_EDGE_E2E} specs read the SOCKET profile`],
+    ]);
+  });
+});
+
+test("the journal-transfer gate resolves statically; an unbound PG_TEST_* gate is still ambiguous", async () => {
+  const source = await readFile(join(WORKER_ROOT, JOURNAL_TRANSFER_SPEC), "utf8");
+  assert.match(source, /const PG_TEST_TCP_HOST = process\.env\.PG_TEST_TCP_HOST;/u,
+    "no default host: a socket-only cluster never dials TCP");
+  assert.match(source, /localFastpathTcpPort\(\{ PG_TEST_TCP_PORT: process\.env\.PG_TEST_TCP_PORT \}, PG_TEST_PORT\)/u);
+  assert.match(source, /port: PG_TEST_TCP_PORT \}/u, "the TCP pool dials PG_TEST_TCP_PORT, not the socket's port");
+  assert.match(source, /describe\.skipIf\(!PG_TEST_SOCKET \|\| !PG_TEST_TCP_HOST\)\(/u,
+    "the second describe runs only where the suite (or the caller) supplies the loopback TCP pair");
+  assert.deepEqual(deriveFileProfile(source), { profile: "SOCKET", ambiguous: false, gates: ["SOCKET", "SOCKET"], reasons: [] });
+  const helper = deriveFileProfile(`
+const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
+const PG_TEST_TCP_HOST = localFastpathTcpHost();
+describe.skipIf(!PG_TEST_SOCKET || !PG_TEST_TCP_HOST)("suite", () => {});
+`);
+  assert.deepEqual([helper.ambiguous, helper.reasons], [true, ["unresolved PG_TEST_TCP_HOST"]],
+    "the pre-fix binding stays ambiguous, so the planner never guesses");
+});
+
+test("without the EDGE_E2E runtime the spec is a named environment gap: never run, never green, never skipped", async () => {
+  const plan = await planPostgresSuite({ workerRoot: WORKER_ROOT });
+  const { run, calls } = fakeSuiteRunner({ plan });
+  const summary = await runPostgresSuite({
+    workerRoot: WORKER_ROOT,
+    environment: { PG_TEST_SOCKET: SOCKET, PG_TEST_PORT: "5432" },
+    run,
+    onOutput: () => {},
+    plan,
+  });
+  assert.equal(summary.status, "incomplete");
+  assert.deepEqual(summary.failures, []);
+  assert.deepEqual(summary.skipped, []);
+  assert.equal(summary.environmentGaps.length, 1);
+  assert.deepEqual({ ...summary.environmentGaps[0], detail: undefined },
+    { code: "ENVIRONMENT_GAP", file: EDGE_SPEC, profile: PROFILE_EDGE_E2E, detail: undefined });
+  assert.match(summary.environmentGaps[0].detail, new RegExp(`${EDGE_E2E_NODE_VARIABLE} must name the Node v22\\.16\\.0`, "u"));
+  assert.match(summary.environmentGaps[0].detail, new RegExp(`${EDGE_E2E_GOLDEN_VARIABLE} is unset`, "u"));
+  assert.equal(calls.some(({ args }) => args.includes(`./${EDGE_SPEC}`) || args[0] === "./cloud-run/build.mjs"), false,
+    "no edge process starts without its runtime");
+  assert.equal(summary.passedByPass.EDGE_E2E, 0);
+});
+
+test("the EDGE_E2E probe names each missing piece and accepts only the image runtime", async () => {
+  const version = (stdout, exitCode = 0) => async (command, args) => {
+    assert.deepEqual([command, args], [EDGE_NODE, ["--version"]]);
+    return { exitCode, stdout };
+  };
+  const environment = { [EDGE_E2E_NODE_VARIABLE]: EDGE_NODE, [EDGE_E2E_GOLDEN_VARIABLE]: EDGE_GOLDEN };
+  assert.deepEqual(await probeEdgeE2eEnvironment({ workerRoot: WORKER_ROOT, environment,
+    run: version(`${EDGE_E2E_NODE_VERSION}\n`) }), { available: true, node: EDGE_NODE });
+  for (const [label, probe, reason] of [
+    ["wrong Node", { environment, run: version("v26.2.0\n") }, /does not report v22\.16\.0/u],
+    ["Node fails", { environment, run: version("", 1) }, /does not report v22\.16\.0/u],
+    ["relative Node", { environment: { ...environment, [EDGE_E2E_NODE_VARIABLE]: "node" }, run: version("") },
+      /must name the Node/u],
+    ["no golden", { environment: { [EDGE_E2E_NODE_VARIABLE]: EDGE_NODE }, run: version(`${EDGE_E2E_NODE_VERSION}\n`) },
+      /EDGE_E2E_GOLDEN is unset/u],
+  ]) {
+    const result = await probeEdgeE2eEnvironment({ workerRoot: WORKER_ROOT, ...probe });
+    assert.equal(result.available, false, label);
+    assert.match(result.reasons.join("; "), reason, label);
+  }
+  const withoutWorkerd = await probeEdgeE2eEnvironment({ workerRoot: tmpdir(), environment,
+    run: version(`${EDGE_E2E_NODE_VERSION}\n`) });
+  assert.deepEqual(withoutWorkerd, { available: false, reasons: ["workerd is not installed in the Worker's node_modules"] });
+});
+
+test("a failing EDGE_E2E prerequisite fails the run and the spec does not start", async () => {
+  const plan = await planPostgresSuite({ workerRoot: WORKER_ROOT });
+  const { run, calls } = fakeSuiteRunner({ plan, prerequisiteExit: 1 });
+  const summary = await runPostgresSuite({
+    workerRoot: WORKER_ROOT,
+    environment: { PG_TEST_SOCKET: SOCKET, PG_TEST_PORT: "5432" },
+    run,
+    onOutput: () => {},
+    plan,
+    probeEdgeE2e: edgeAvailable,
+  });
+  assert.equal(summary.status, "failed");
+  assert.deepEqual(summary.failures.map(({ code, file }) => [code, file]), [
+    ["PREREQUISITE_FAILED", EDGE_SPEC],
+    ["EMPTY_SPEC_FILE", EDGE_SPEC],
+  ]);
+  assert.equal(calls.some(({ args }) => args.includes(`./${EDGE_SPEC}`)), false);
+});
+
+test("only an explicit-profile spec may be a gap, and a gap may not also report results", () => {
+  const plan = { files: [
+    { file: EDGE_SPEC, profile: PROFILE_EDGE_E2E },
+    { file: "postgres-test/socket.spec.mjs", profile: "SOCKET" },
+  ] };
+  const passing = tapParse(PASSING_TAP);
+  const socketRecord = nodeRecord("SOCKET", "postgres-test/socket.spec.mjs", passing);
+  let summary = evaluatePostgresSuite({ plan, records: [socketRecord], environmentGaps: [
+    { code: "ENVIRONMENT_GAP", file: EDGE_SPEC, profile: PROFILE_EDGE_E2E, detail: "synthetic" },
+  ] });
+  assert.deepEqual([summary.status, summary.failures, summary.environmentGaps.length], ["incomplete", [], 1]);
+  summary = evaluatePostgresSuite({ plan, records: [], environmentGaps: [
+    { code: "ENVIRONMENT_GAP", file: "postgres-test/socket.spec.mjs", profile: "SOCKET", detail: "synthetic" },
+    { code: "ENVIRONMENT_GAP", file: EDGE_SPEC, profile: PROFILE_EDGE_E2E, detail: "synthetic" },
+  ] });
+  assert.deepEqual(summary.failures.map(({ code, file }) => [code, file]), [
+    ["UNPLANNED_SPEC_RESULT", "postgres-test/socket.spec.mjs"],
+    ["EMPTY_SPEC_FILE", "postgres-test/socket.spec.mjs"],
+  ]);
+  summary = evaluatePostgresSuite({ plan, records: [socketRecord, nodeRecord(PROFILE_EDGE_E2E, EDGE_SPEC, passing)],
+    environmentGaps: [{ code: "ENVIRONMENT_GAP", file: EDGE_SPEC, profile: PROFILE_EDGE_E2E, detail: "synthetic" }] });
+  assert.deepEqual(codes(summary.failures), ["PROFILE_ROUTING_DRIFT"]);
+  summary = evaluatePostgresSuite({ plan, records: [socketRecord, nodeRecord(PROFILE_EDGE_E2E, EDGE_SPEC, passing)] });
+  assert.deepEqual([summary.status, summary.passedByPass.EDGE_E2E], ["passed", 2]);
 });
 
 // ---------------------------------------------------------------------------

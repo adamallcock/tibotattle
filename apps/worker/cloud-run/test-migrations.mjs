@@ -12,6 +12,15 @@ import {
   closeCloudSqlResources,
   createIamPool as createCloudSqlIamPool,
 } from "./cloud-sql.mjs";
+import {
+  ensureSchema as ensureRoleSchema,
+  grantAndVerifyRuntimePrivileges as grantAndVerifyRoleRuntimePrivileges,
+  OPERATOR_ONLY_PRIMARY_FUNCTIONS,
+  readBackReceipts as readBackRoleReceipts,
+  RUNTIME_PRIMARY_FUNCTIONS,
+} from "./postgres-runtime-grants.mjs";
+
+export { functionSignature, restrictedFunctionsMatchPolicy } from "./postgres-runtime-grants.mjs";
 
 export const TEST_MIGRATIONS_JOB = "tibotattle-test-database-migrate";
 export const GRAPH_BENCHMARK_MIGRATIONS_JOB = "tibotattle-public-graph-benchmark-migrate";
@@ -110,57 +119,12 @@ export const FASTPATH_MIGRATION_TARGETS = Object.freeze({
 const EXPECTED_MIGRATION_COUNT_PATTERN = /^[1-9]\d{0,3}$/u;
 
 /**
- * Primary functions the migrations revoke from PUBLIC that the runtime role
- * must execute: canonical v1 admission (0004), and the owner journal's append
- * and owner-link mint (0046). Both are SECURITY INVOKER and run as the
- * request's role inside the v1.2 owner-bridge trigger (0055, every v1.2
- * domain activation), v1.1 live admission (0060) and legacy contribution
- * admission (0061), so without EXECUTE those routes answer 503.
+ * The runtime-grant policy lives in postgres-runtime-grants.mjs, shared with
+ * the production migration job (OPS-10) and scripts/gcp-test-database.mjs.
+ * These names are the same frozen values under their test-era export names.
  */
-export const TEST_RUNTIME_PRIMARY_FUNCTIONS = Object.freeze([
-  Object.freeze({ name: "insert_telemetry_v1_contribution", args: "jsonb" }),
-  Object.freeze({ name: "storage_journal_append", args: "text, text, text, text, text" }),
-  Object.freeze({ name: "storage_owner_link_ensure", args: "text, text" }),
-]);
-/**
- * Maintenance entrypoints revoked from PUBLIC (0055, 0060, 0052) that only an
- * operator or schema-owner role runs. The runtime role must never execute
- * them; the read-back also refuses any other non-PUBLIC function it can run.
- */
-export const TEST_OPERATOR_ONLY_PRIMARY_FUNCTIONS = Object.freeze([
-  Object.freeze({ name: "storage_v11_bridge_backfill", args: "integer" }),
-  Object.freeze({ name: "storage_v12_bridge_backfill", args: "integer" }),
-  Object.freeze({ name: "typed_telemetry_restart_identities", args: "" }),
-]);
-
-/** `name(args)`, as the read-back renders pg_proc rows (oidvectortypes). */
-export function functionSignature({ name, args }) {
-  return `${name}(${args})`;
-}
-
-/**
- * True when the non-PUBLIC functions of one role schema are exactly as the
- * runtime policy requires: the runtime role executes every runtime function
- * and nothing else among them, and every operator-only entrypoint is present
- * and closed to it.
- */
-export function restrictedFunctionsMatchPolicy(role, rows) {
-  if (!Array.isArray(rows)) return false;
-  const runtime = role === "primary" ? TEST_RUNTIME_PRIMARY_FUNCTIONS.map(functionSignature).sort() : [];
-  const operatorOnly = role === "primary" ? TEST_OPERATOR_ONLY_PRIMARY_FUNCTIONS.map(functionSignature) : [];
-  const executable = new Map();
-  for (const row of rows) {
-    if (row === null || typeof row !== "object" || typeof row.signature !== "string"
-        || typeof row.runtime_execute !== "boolean" || executable.has(row.signature)) {
-      return false;
-    }
-    executable.set(row.signature, row.runtime_execute);
-  }
-  const granted = [...executable].filter(([, allowed]) => allowed).map(([signature]) => signature).sort();
-  return granted.length === runtime.length
-    && granted.every((signature, index) => signature === runtime[index])
-    && operatorOnly.every((signature) => executable.get(signature) === false);
-}
+export const TEST_RUNTIME_PRIMARY_FUNCTIONS = RUNTIME_PRIMARY_FUNCTIONS;
+export const TEST_OPERATOR_ONLY_PRIMARY_FUNCTIONS = OPERATOR_ONLY_PRIMARY_FUNCTIONS;
 
 const A2_PROFILE = "a2";
 export const GRAPH_BENCHMARK_MIGRATION_PROFILE = "community-graph-benchmark";
@@ -170,7 +134,6 @@ const FASTPATH_PROFILE = FASTPATH_MIGRATION_PROFILE;
 const EXECUTION_PATTERN = /^[a-z][a-z0-9-]{0,62}$/u;
 const MIGRATION_NAME_PATTERN = /^\d{4}_[a-z][a-z0-9_-]*\.sql$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
-const HISTORY_TABLE = "_tibotattle_migration_history";
 const MIGRATOR_APPLICATION_NAME = "tibotattle-test-database-migrator";
 const METADATA_EMAIL_URL =
   "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email";
@@ -277,313 +240,33 @@ function validateApplyResult(result, role, target, expected) {
   }
 }
 
-function quoteSchema(schema) {
-  // These are fixed constants, but retain a local guard before SQL rendering.
-  if (!/^[a-z_][a-z0-9_]{0,62}$/u.test(schema)) {
-    fail("POSTGRES_TEST_MIGRATIONS_SCHEMA_INVALID");
-  }
-  return `"${schema}"`;
+const TEST_MIGRATIONS_CODE_PREFIX = "POSTGRES_TEST_MIGRATIONS_";
+
+export async function ensureSchema(pool, role, target) {
+  return ensureRoleSchema(pool, {
+    role,
+    schema: target.schema,
+    ownerRole: TEST_MIGRATIONS_IAM_USER,
+    codePrefix: TEST_MIGRATIONS_CODE_PREFIX,
+  });
 }
 
-function quoteRole(role) {
-  if (typeof role !== "string" || role !== TEST_MIGRATIONS_RUNTIME_IAM_USER) {
-    fail("POSTGRES_TEST_MIGRATIONS_RUNTIME_ROLE_INVALID");
-  }
-  return `"${role.replaceAll('"', '""')}"`;
+export async function grantAndVerifyRuntimePrivileges(pool, role, target) {
+  return grantAndVerifyRoleRuntimePrivileges(pool, {
+    role,
+    schema: target.schema,
+    runtimeRole: TEST_MIGRATIONS_RUNTIME_IAM_USER,
+    codePrefix: TEST_MIGRATIONS_CODE_PREFIX,
+  });
 }
 
-function rowsFrom(result, code) {
-  if (result === null || typeof result !== "object"
-      || !Array.isArray(result.rows)
-      || result.rowCount !== null && result.rowCount !== result.rows.length) {
-    fail(code);
-  }
-  return result.rows;
-}
-
-async function ensureSchema(pool, role, target) {
-  const schemaSql = quoteSchema(target.schema);
-  let client;
-  let transactionOpen = false;
-  let discard = false;
-  try {
-    client = await pool.connect();
-    await client.query("BEGIN");
-    transactionOpen = true;
-    await client.query("SET LOCAL statement_timeout='30000ms'");
-    await client.query("SET LOCAL lock_timeout='5000ms'");
-    const currentRows = rowsFrom(await client.query(
-      "SELECT pg_get_userbyid(nspowner) AS owner FROM pg_namespace WHERE nspname=$1",
-      [target.schema],
-    ), `POSTGRES_TEST_MIGRATIONS_${role.toUpperCase()}_SCHEMA_READ_FAILED`);
-    if (currentRows.length > 1) {
-      fail(`POSTGRES_TEST_MIGRATIONS_${role.toUpperCase()}_SCHEMA_READ_FAILED`);
-    }
-    if (currentRows.length === 0) {
-      await client.query(`CREATE SCHEMA ${schemaSql}`);
-    } else if (currentRows[0]?.owner !== TEST_MIGRATIONS_IAM_USER) {
-      fail(`POSTGRES_TEST_MIGRATIONS_${role.toUpperCase()}_SCHEMA_OWNER_UNEXPECTED`);
-    }
-    const ownerRows = rowsFrom(await client.query(
-      "SELECT pg_get_userbyid(nspowner) AS owner FROM pg_namespace WHERE nspname=$1",
-      [target.schema],
-    ), `POSTGRES_TEST_MIGRATIONS_${role.toUpperCase()}_SCHEMA_READ_FAILED`);
-    if (ownerRows.length !== 1 || ownerRows[0]?.owner !== TEST_MIGRATIONS_IAM_USER) {
-      fail(`POSTGRES_TEST_MIGRATIONS_${role.toUpperCase()}_SCHEMA_OWNER_UNEXPECTED`);
-    }
-    await client.query("COMMIT");
-    transactionOpen = false;
-  } catch (error) {
-    discard = true;
-    if (transactionOpen) {
-      try {
-        await client.query("ROLLBACK");
-        transactionOpen = false;
-      } catch {
-        fail(`POSTGRES_TEST_MIGRATIONS_${role.toUpperCase()}_SCHEMA_ROLLBACK_FAILED`);
-      }
-    }
-    if (typeof error?.code === "string"
-        && /^POSTGRES_TEST_MIGRATIONS_[A-Z0-9_]+$/u.test(error.code)) throw error;
-    fail(`POSTGRES_TEST_MIGRATIONS_${role.toUpperCase()}_SCHEMA_SETUP_FAILED`);
-  } finally {
-    if (client !== undefined) {
-      try {
-        await client.release(discard || transactionOpen);
-      } catch {
-        fail(`POSTGRES_TEST_MIGRATIONS_${role.toUpperCase()}_SCHEMA_RELEASE_FAILED`);
-      }
-    }
-  }
-}
-
-async function grantAndVerifyRuntimePrivileges(pool, role, target) {
-  const schema = quoteSchema(target.schema);
-  const runtimeRole = quoteRole(TEST_MIGRATIONS_RUNTIME_IAM_USER);
-  const historyTable = `"${HISTORY_TABLE}"`;
-  const tableRelation = `${target.schema}.${HISTORY_TABLE}`;
-  let client;
-  let transactionOpen = false;
-  let discard = false;
-  try {
-    client = await pool.connect();
-    await client.query("BEGIN");
-    transactionOpen = true;
-    await client.query("SET LOCAL statement_timeout='30000ms'");
-    await client.query("SET LOCAL lock_timeout='5000ms'");
-
-    // The A2 schemas are isolated to this test environment. Reset only direct
-    // grants on these exact schemas, then grant the runtime role only the
-    // privileges exercised by the application. Migration history remains
-    // read-only to runtime.
-    await client.query(`REVOKE ALL ON SCHEMA ${schema} FROM ${runtimeRole}`);
-    await client.query(`GRANT USAGE ON SCHEMA ${schema} TO ${runtimeRole}`);
-    await client.query(`REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA ${schema} FROM ${runtimeRole}`);
-    await client.query(
-      `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ${schema} TO ${runtimeRole}`,
-    );
-    await client.query(`REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ${schema} FROM ${runtimeRole}`);
-    await client.query(
-      `GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA ${schema} TO ${runtimeRole}`,
-    );
-    await client.query(
-      `REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER
-         ON ${schema}.${historyTable} FROM ${runtimeRole}`,
-    );
-    await client.query(
-      `ALTER DEFAULT PRIVILEGES IN SCHEMA ${schema}
-         REVOKE ALL ON TABLES FROM ${runtimeRole}`,
-    );
-    await client.query(
-      `ALTER DEFAULT PRIVILEGES IN SCHEMA ${schema}
-         GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO ${runtimeRole}`,
-    );
-    await client.query(
-      `ALTER DEFAULT PRIVILEGES IN SCHEMA ${schema}
-         REVOKE ALL ON SEQUENCES FROM ${runtimeRole}`,
-    );
-    await client.query(
-      `ALTER DEFAULT PRIVILEGES IN SCHEMA ${schema}
-         GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO ${runtimeRole}`,
-    );
-    // Function grants are reset the same way: no direct grant survives on any
-    // routine of the schema, then the primary runtime functions are granted.
-    // PUBLIC's default EXECUTE on the other functions is the migrations' own.
-    await client.query(`REVOKE ALL ON ALL ROUTINES IN SCHEMA ${schema} FROM ${runtimeRole}`);
-    if (role === "primary") {
-      for (const { name, args } of TEST_RUNTIME_PRIMARY_FUNCTIONS) {
-        await client.query(`GRANT EXECUTE ON FUNCTION ${schema}."${name}"(${args}) TO ${runtimeRole}`);
-      }
-    }
-
-    const rows = rowsFrom(await client.query(
-      `SELECT
-         has_schema_privilege($1, $2, 'USAGE') AS schema_usage,
-         has_schema_privilege($1, $2, 'CREATE') AS schema_create,
-         (SELECT count(*) > 0 AND COALESCE(bool_and(
-             has_table_privilege($1, rel.oid, 'SELECT')
-             AND has_table_privilege($1, rel.oid, 'INSERT')
-             AND has_table_privilege($1, rel.oid, 'UPDATE')
-             AND has_table_privilege($1, rel.oid, 'DELETE')
-           ), false)
-            FROM pg_class rel
-            JOIN pg_namespace ns ON ns.oid = rel.relnamespace
-           WHERE ns.nspname = $2 AND rel.relkind IN ('r', 'p', 'v', 'm', 'f')
-             AND rel.relname <> $4) AS application_tables_dml,
-         (SELECT COALESCE(bool_and(
-             has_sequence_privilege($1, rel.oid, 'USAGE')
-             AND has_sequence_privilege($1, rel.oid, 'SELECT')
-             AND has_sequence_privilege($1, rel.oid, 'UPDATE')
-           ), true)
-            FROM pg_class rel
-            JOIN pg_namespace ns ON ns.oid = rel.relnamespace
-           WHERE ns.nspname = $2 AND rel.relkind = 'S') AS sequences_access,
-         has_table_privilege($1, $3, 'SELECT') AS history_select,
-         has_table_privilege($1, $3, 'INSERT') AS history_insert,
-         has_table_privilege($1, $3, 'UPDATE') AS history_update,
-         has_table_privilege($1, $3, 'DELETE') AS history_delete,
-         (SELECT count(*) = 4
-                 AND array_agg(acl.privilege_type ORDER BY acl.privilege_type)
-                   = ARRAY['DELETE', 'INSERT', 'SELECT', 'UPDATE']::text[]
-                 AND bool_and(NOT acl.is_grantable)
-            FROM pg_default_acl defaults
-            CROSS JOIN LATERAL aclexplode(defaults.defaclacl) acl
-           WHERE defaults.defaclobjtype = 'r'
-             AND defaults.defaclnamespace = to_regnamespace($2)
-             AND pg_get_userbyid(defaults.defaclrole) = current_user
-             AND pg_get_userbyid(acl.grantee) = $1) AS default_tables_dml,
-         (SELECT count(*) = 3
-                 AND array_agg(acl.privilege_type ORDER BY acl.privilege_type)
-                   = ARRAY['SELECT', 'UPDATE', 'USAGE']::text[]
-                 AND bool_and(NOT acl.is_grantable)
-            FROM pg_default_acl defaults
-            CROSS JOIN LATERAL aclexplode(defaults.defaclacl) acl
-           WHERE defaults.defaclobjtype = 'S'
-             AND defaults.defaclnamespace = to_regnamespace($2)
-             AND pg_get_userbyid(defaults.defaclrole) = current_user
-             AND pg_get_userbyid(acl.grantee) = $1) AS default_sequences_access,
-         (SELECT count(*) = 0
-            FROM pg_default_acl defaults
-            CROSS JOIN LATERAL aclexplode(defaults.defaclacl) acl
-           WHERE defaults.defaclobjtype = 'r'
-             AND defaults.defaclnamespace = 0
-             AND pg_get_userbyid(defaults.defaclrole) = current_user
-             AND pg_get_userbyid(acl.grantee) = $1) AS no_global_table_defaults,
-         (SELECT count(*) = 0
-            FROM pg_default_acl defaults
-            CROSS JOIN LATERAL aclexplode(defaults.defaclacl) acl
-           WHERE defaults.defaclobjtype = 'S'
-             AND defaults.defaclnamespace = 0
-             AND pg_get_userbyid(defaults.defaclrole) = current_user
-             AND pg_get_userbyid(acl.grantee) = $1) AS no_global_sequence_defaults,
-         (SELECT COALESCE(json_agg(json_build_object(
-             'signature', fn.proname || '(' || pg_catalog.oidvectortypes(fn.proargtypes) || ')',
-             'runtime_execute', has_function_privilege($1, fn.oid, 'EXECUTE')
-           ) ORDER BY fn.proname, fn.oid), '[]'::json)
-            FROM pg_proc fn
-           WHERE fn.pronamespace = to_regnamespace($2)
-             AND NOT has_function_privilege('public', fn.oid, 'EXECUTE')) AS restricted_functions`,
-      [
-        TEST_MIGRATIONS_RUNTIME_IAM_USER,
-        target.schema,
-        tableRelation,
-        HISTORY_TABLE,
-      ],
-    ), `POSTGRES_TEST_MIGRATIONS_${role.toUpperCase()}_RUNTIME_PRIVILEGES_READ_FAILED`);
-    const actual = rows[0];
-    if (rows.length !== 1
-        || actual?.schema_usage !== true
-        || actual?.schema_create !== false
-        || actual?.application_tables_dml !== true
-        || actual?.sequences_access !== true
-        || actual?.history_select !== true
-        || actual?.history_insert !== false
-        || actual?.history_update !== false
-        || actual?.history_delete !== false
-        || actual?.default_tables_dml !== true
-        || actual?.default_sequences_access !== true
-        || actual?.no_global_table_defaults !== true
-        || actual?.no_global_sequence_defaults !== true
-        || !restrictedFunctionsMatchPolicy(role, actual?.restricted_functions)) {
-      fail(`POSTGRES_TEST_MIGRATIONS_${role.toUpperCase()}_RUNTIME_PRIVILEGES_INVALID`);
-    }
-    await client.query("COMMIT");
-    transactionOpen = false;
-  } catch (error) {
-    discard = true;
-    if (transactionOpen) {
-      try {
-        await client.query("ROLLBACK");
-        transactionOpen = false;
-      } catch {
-        fail(`POSTGRES_TEST_MIGRATIONS_${role.toUpperCase()}_RUNTIME_PRIVILEGES_ROLLBACK_FAILED`);
-      }
-    }
-    if (typeof error?.code === "string"
-        && /^POSTGRES_TEST_MIGRATIONS_[A-Z0-9_]+$/u.test(error.code)) throw error;
-    fail(`POSTGRES_TEST_MIGRATIONS_${role.toUpperCase()}_RUNTIME_GRANT_FAILED`);
-  } finally {
-    if (client !== undefined) {
-      try {
-        await client.release(discard || transactionOpen);
-      } catch {
-        fail(`POSTGRES_TEST_MIGRATIONS_${role.toUpperCase()}_RUNTIME_PRIVILEGES_RELEASE_FAILED`);
-      }
-    }
-  }
-}
-
-async function readBackReceipts(pool, role, target, expected) {
-  let client;
-  let transactionOpen = false;
-  let discard = false;
-  try {
-    client = await pool.connect();
-    await client.query("BEGIN READ ONLY");
-    transactionOpen = true;
-    await client.query("SET LOCAL statement_timeout='30000ms'");
-    await client.query("SET LOCAL lock_timeout='5000ms'");
-    const receiptRows = rowsFrom(await client.query(
-      `SELECT version, name, checksum_sha256
-         FROM ${quoteSchema(target.schema)}."${HISTORY_TABLE}"
-        ORDER BY version`,
-    ), `POSTGRES_TEST_MIGRATIONS_${role.toUpperCase()}_RECEIPT_READ_FAILED`);
-    if (receiptRows.length !== expected.length) {
-      fail(`POSTGRES_TEST_MIGRATIONS_${role.toUpperCase()}_RECEIPT_MISMATCH`);
-    }
-    for (let index = 0; index < expected.length; index += 1) {
-      const actual = receiptRows[index];
-      const wanted = expected[index];
-      if (actual?.version !== wanted.version
-          || actual?.name !== wanted.name
-          || actual?.checksum_sha256 !== wanted.sha256) {
-        fail(`POSTGRES_TEST_MIGRATIONS_${role.toUpperCase()}_RECEIPT_MISMATCH`);
-      }
-    }
-    await client.query("COMMIT");
-    transactionOpen = false;
-  } catch (error) {
-    discard = true;
-    if (transactionOpen) {
-      try {
-        await client.query("ROLLBACK");
-        transactionOpen = false;
-      } catch {
-        fail(`POSTGRES_TEST_MIGRATIONS_${role.toUpperCase()}_RECEIPT_ROLLBACK_FAILED`);
-      }
-    }
-    if (typeof error?.code === "string"
-        && /^POSTGRES_TEST_MIGRATIONS_[A-Z0-9_]+$/u.test(error.code)) throw error;
-    fail(`POSTGRES_TEST_MIGRATIONS_${role.toUpperCase()}_RECEIPT_READ_FAILED`);
-  } finally {
-    if (client !== undefined) {
-      try {
-        await client.release(discard || transactionOpen);
-      } catch {
-        fail(`POSTGRES_TEST_MIGRATIONS_${role.toUpperCase()}_RECEIPT_RELEASE_FAILED`);
-      }
-    }
-  }
+export async function readBackReceipts(pool, role, target, expected) {
+  return readBackRoleReceipts(pool, {
+    role,
+    schema: target.schema,
+    expected,
+    codePrefix: TEST_MIGRATIONS_CODE_PREFIX,
+  });
 }
 
 /**

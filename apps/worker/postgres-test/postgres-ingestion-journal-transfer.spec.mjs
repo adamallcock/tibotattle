@@ -12,7 +12,11 @@ import {
   transferPostgresIngestionJournal,
 } from "../scripts/postgres-ingestion-journal-transfer.mjs";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
-import { localFastpathTcpHost, withLocalFastpathCloudDatabase } from "./fixtures/fastpath-cloud-database.mjs";
+import {
+  localFastpathTcpHost,
+  localFastpathTcpPort,
+  withLocalFastpathCloudDatabase,
+} from "./fixtures/fastpath-cloud-database.mjs";
 
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
 const PG_TEST_PORT = Number(process.env.PG_TEST_PORT ?? "55432");
@@ -20,9 +24,15 @@ const PG_TEST_USER = process.env.PG_TEST_USER || "postgres";
 const PG_TEST_PASSWORD = process.env.PG_TEST_PASSWORD || "synthetic-local-only";
 const PG_TEST_DATABASE = process.env.PG_TEST_DATABASE || "postgres";
 // Loopback TCP to the same cluster (inet_server_addr() is not NULL there), for
-// the GCP fast-path cloud-target exception; the shared socket-only cluster
-// leaves it unset.
-const PG_TEST_TCP_HOST = localFastpathTcpHost();
+// the GCP fast-path cloud-target exception: PG_TEST_TCP_HOST (127.0.0.1, ::1
+// or localhost; anything else is refused here) on PG_TEST_TCP_PORT, which
+// defaults to PG_TEST_PORT. Unset, the second describe skips, so a
+// socket-only cluster never dials TCP; the CI suite (scripts/ci-postgres-suite.mjs)
+// passes both for its SOCKET pass. Plain process.env bindings, so the
+// planner resolves the gate statically.
+const PG_TEST_TCP_HOST = process.env.PG_TEST_TCP_HOST;
+localFastpathTcpHost({ PG_TEST_TCP_HOST });
+const PG_TEST_TCP_PORT = localFastpathTcpPort({ PG_TEST_TCP_PORT: process.env.PG_TEST_TCP_PORT }, PG_TEST_PORT);
 const SOURCE_ID = "synthetic-ingestion-journal-source";
 
 function digest(n) { return BigInt(n).toString(16).padStart(64, "0"); }
@@ -203,7 +213,7 @@ describe.skipIf(!PG_TEST_SOCKET || !PG_TEST_TCP_HOST)(
       let fixture;
       try {
         fixture = await makeSealedSource();
-        await withLocalFastpathCloudDatabase({ admin, tcpHost: PG_TEST_TCP_HOST, port: PG_TEST_PORT },
+        await withLocalFastpathCloudDatabase({ admin, tcpHost: PG_TEST_TCP_HOST, port: PG_TEST_TCP_PORT },
           async ({ database, roles, tcpPool }) => {
             expect(database).toBe("tibotattle_fastpath");
             const migrator = tcpPool({ user: roles.migrator, max: 2 });
