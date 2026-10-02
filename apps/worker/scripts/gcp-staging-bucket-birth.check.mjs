@@ -51,8 +51,11 @@ function receiptFor(desired) {
     createResponse: created(desired), readbackResponse: created(desired) })));
 }
 
-/** A recording gcloud runner and fetch: listings before and after the one insert, and a token. */
-function harness(desired, { existing = false, readbackMissing = false, createBody } = {}) {
+/**
+ * A recording gcloud runner and fetch: listings before and after the one
+ * insert, and a token. `readback` replaces the bucket the listing returns.
+ */
+function harness(desired, { existing = false, readbackMissing = false, createBody, readback } = {}) {
   const calls = [];
   const requests = [];
   let inserted = false;
@@ -60,7 +63,8 @@ function harness(desired, { existing = false, readbackMissing = false, createBod
     calls.push([...argv]);
     if (argv[0] === "auth" && argv[1] === "print-access-token") return { status: 0, stdout: `${TOKEN}\n` };
     if (argv.slice(0, 3).join(" ") === "storage buckets list") {
-      return { status: 0, stdout: JSON.stringify((existing || inserted) && !readbackMissing ? [created(desired)] : []) };
+      return { status: 0, stdout: JSON.stringify((existing || inserted) && !readbackMissing
+        ? [readback ?? created(desired)] : []) };
     }
     return { status: 2, stdout: "" };
   };
@@ -265,6 +269,40 @@ test("after the insert, stderr always says where the proof is: printed, or lost"
       assert.equal(store.writes, 0, code);
       await assert.rejects(flow.runStagingBucketBirth(desired, { mode: "pin-only", receiptPath: lostPath, pinStore: store }),
         { code: "STAGING_BUCKET_BIRTH_RECEIPT_MISSING" }, code);
+    }
+  });
+});
+
+test("a readback mismatch puts the differing field names, and nothing else, on stderr", async () => {
+  const desired = staging();
+  const later = "2026-10-02T16:48:19.000Z";
+  await withDirectory(async (directory) => {
+    for (const [options, expected, values] of [
+      [{ readback: created(desired, { metageneration: "2" }) }, ["bucketMetageneration"], []],
+      [{ readback: created(desired, { timeCreated: later }) }, ["timeCreated"], ["16:48:19", "12:00:00"]],
+      [{ readback: created(desired, { generation: "1759363200000077", timeCreated: later }) },
+        ["bucketGeneration", "timeCreated"], ["1759363200000077", GENERATION, "16:48:19", "12:00:00"]],
+      // Both responses agree on a metageneration other than "1".
+      [{ readback: created(desired, { metageneration: "2" }),
+        createBody: JSON.stringify(created(desired, { metageneration: "2" })) }, ["readbackMetagenerationNotOne"], []],
+    ]) {
+      const receiptPath = join(directory, `${expected.join("-")}.json`);
+      const run = harness(desired, options);
+      const store = memoryStore();
+      let out = "";
+      let err = "";
+      assert.equal(await flow.main(["--environment=staging", "--apply", `--authorize=${AUTHORIZE}`], {
+        loadDesired: () => desired, runner: run.runner, fetchImpl: run.fetchImpl, receiptPath, pinStore: store,
+        stdout: (text) => { out += text; }, stderr: (text) => { err += text; } }), 1, expected.join());
+      assert.deepEqual(JSON.parse(err), { status: "error", code: "BUCKET_BIRTH_READBACK_MISMATCH", bucketInserted: true,
+        receiptWritten: false, receiptPrinted: false, differingFields: expected });
+      // Names only: no generation, metageneration, instant or token reaches stderr, and stdout is empty.
+      for (const value of [TOKEN, ...values]) assert.equal(err.includes(value), false, value);
+      assert.doesNotMatch(err, /\d/u);
+      assert.equal(out, "");
+      assert.equal(run.requests.length, 1);
+      assert.equal(existsSync(receiptPath), false);
+      assert.equal(store.writes, 0);
     }
   });
 });

@@ -103,15 +103,29 @@ attempts. Confirm with
 paused too long). If OPS-3 `pause-all` paused it for a rollout, finish the
 rollout and run `resume-all` with that pause-all receipt.
 
-**Trade-off awaiting the owner (OWN-5).** The owner asked for an alert when
-a trigger stays paused for more than a few hours. This policy is a
-log-absence proxy, so it fires only after the larger of 6 hours and the
-cadence plus 60 minutes: about 25 hours for a daily trigger. The exact
-6-hour signal is the scheduler probe's `SCHEDULER_TRIGGER_PAUSED_TOO_LONG`,
-which no scheduled job runs yet. Closing that gap needs a periodic job that
-runs the probe and logs its verdict, plus a log metric on it. Until the
-owner confirms the proxy or asks for that job, treat this threshold as a
-proposal.
+**Open owner item (OWN-5): the alert does not enforce 6 hours.** On
+2026-10-02 (round 9, "Alert thresholds") the owner accepted "scheduler
+paused > 6 h" as a starting value. This policy cannot alert at 6 hours for
+a daily trigger:
+
+- It is a log-absence proxy. It fires only after the larger of 6 hours and
+  the cadence plus 60 minutes, which is about 25 hours for a daily trigger.
+  The 6-hour floor binds only for a trigger that fires at least every 5
+  hours.
+- The exact 6-hour signal is the scheduler probe's
+  `SCHEDULER_TRIGGER_PAUSED_TOO_LONG`. Only an operator runs the probe: no
+  scheduled job runs it yet.
+- Round 9 records only the 6-hour value. It does not acknowledge the
+  proxy's delay.
+
+The owner has two options:
+
+- accept the roughly 25-hour proxy explicitly;
+- ask for a periodic job that runs the probe and logs its verdict, with a
+  log metric and an alert on it.
+
+Until the owner chooses, a paused daily trigger alerts after about 25
+hours, not 6. The operator's probe is the only 6-hour check.
 
 ## origin-lock
 

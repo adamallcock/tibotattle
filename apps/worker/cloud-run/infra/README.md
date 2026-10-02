@@ -54,18 +54,18 @@ created.
 | `scheduler.analytics-refresh.schedule` | The trigger is not created (decision D3: no default cadence) |
 | `stagingOrigin.accessAud` (staging only) | The staging service is not rendered (`STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud`) until the owner creates the staging admin Access application |
 
-### Staging values Claude filled, for the owner to confirm
+### Staging values Claude filled, confirmed by the owner
 
 Stream STG-PREP (Claude, not the owner) committed these staging values so
-that the staging service can render once the owner values above arrive. No
-owner decision contradicts them, but the owner has not confirmed them either.
-The owner confirms or replaces each one before the staging service first
-renders. Until D-CRB lands, OPS-2 defers that service in any case.
+that the staging service can render once the owner values above arrive. The
+owner confirmed all six as committed on 2026-10-02 (owner decisions, round 9,
+"Staging values"). Until D-CRB lands, OPS-2 defers the staging service in any
+case.
 
 | Setting | Committed value | Source |
 |---|---|---|
 | `service.telemetryStorageNamespace` | `tibotattle-staging-synthetic` | Claude's choice. Staging imports no data, so the rule that it equals the imported data's namespace holds trivially |
-| `stagingOrigin.publicOrigin` | `https://staging.tibotattle.com` | Staging edge plan proposal D-S1, not yet confirmed by the owner |
+| `stagingOrigin.publicOrigin` | `https://staging.tibotattle.com` | Staging edge plan proposal D-S1 |
 | `stagingOrigin.accessTeamDomain` | `tibotattle.cloudflareaccess.com` | Production's Access team (CR-3's production values); the staging edge plan (D-S3) proposes reusing it |
 | `stagingOrigin.accessAdminEmail` | the owner's admin email | Production's Access admin email (CR-3's production values) |
 | `stagingOrigin.identityLinkSecretVersion` | `staging-gcp-v1` | Claude's label for the staging identity-link secret; CR-3 refuses a production label |
@@ -136,7 +136,9 @@ paused-too-long signal. It exits 2 when a trigger whose committed state is
 attempt in that time. OPS-5 renders the matching alert (`scheduler-quiet` in
 `monitoring.md`): no Cloud Scheduler attempt within max(6 h, cadence plus
 slack). That is about 25 hours for a daily trigger, so it is a proxy, not
-the 6-hour signal; the trade-off waits for the owner (OWN-5). The alert is
+the 6-hour signal. The owner accepted the 6-hour value in round 9, but has
+not yet accepted the proxy's delay or asked for a scheduled probe (OWN-5,
+open; see `monitoring.md`). The alert is
 not applied yet and waits for the cadence and the owner's notification
 channel (OWN-5c). The probe also assumes that pausing a trigger updates its
 `userUpdateTime`. The first owner-run readback against the test project has

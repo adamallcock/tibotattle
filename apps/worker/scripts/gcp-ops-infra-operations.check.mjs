@@ -681,6 +681,40 @@ test("idempotent updates: drift is set back without recreating anything", () => 
     ["scheduler:pause:analytics-refresh", "scheduler:update:analytics-refresh"]);
 });
 
+test("a rerun with the instance present creates missing IAM users by their PostgreSQL names, never the full email", () => {
+  // The rerun after a first apply that stopped at cloud-sql-user:create: the
+  // managed instance and database exist, and neither IAM user does.
+  const desired = desiredState({ synthetic: false });
+  const instance = desired.cloudSql.instance;
+  const world = convergedWorld(desired, UNDEFERRED);
+  world.sqlUsers[instance] = world.sqlUsers[instance].filter((user) => user.type !== "CLOUD_IAM_SERVICE_ACCOUNT");
+  assert.deepEqual(world.sqlInstances.map((entry) => entry.name), [instance]);
+  assert.ok(world.sqlDatabases[instance].some((database) => database.name === desired.cloudSql.database));
+  const gcloud = fake(desired, world);
+  const users = [["runtime", desired.cloudSql.runtimeIamUser], ["migrator", desired.cloudSql.migratorIamUser]];
+  const createArgv = (iamUser) => ["sql", "users", "create", iamUser, `--instance=${instance}`,
+    `--project=${desired.project}`, "--type=cloud_iam_service_account"];
+  const result = plan(desired, gcloud.runner, UNDEFERRED);
+  assert.deepEqual([result.summary.refused, result.findings, result.blockers], [0, [], []]);
+  const executable = ops(result, (entry) => entry.deferred === undefined);
+  assert.deepEqual(executable.map((entry) => [entry.id, entry.argv]),
+    users.map(([role, iamUser]) => [`cloud-sql-user:create:${role}`, createArgv(iamUser)]));
+  for (const [role, iamUser] of users) {
+    assert.notEqual(iamUser, desired.serviceAccounts[role].email, role);
+    assert.equal(desired.serviceAccounts[role].email.endsWith(".gserviceaccount.com"), true, role);
+  }
+  for (const entry of executable) {
+    assert.equal(entry.argv.some((arg) => arg.endsWith(".gserviceaccount.com")), false, entry.id);
+  }
+  operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: result.planDigest,
+    createSpecWriter: () => gcloud.writer.create(), ...UNDEFERRED });
+  assert.equal(plan(desired, gcloud.runner, UNDEFERRED).summary.executable, 0);
+  // A first apply that made only the runtime user: the rerun creates only the migrator.
+  world.sqlUsers[instance] = world.sqlUsers[instance].filter((user) => user.name !== desired.cloudSql.migratorIamUser);
+  assert.deepEqual(ops(plan(desired, fake(desired, world).runner, UNDEFERRED), (entry) => entry.deferred === undefined)
+    .map((entry) => [entry.id, entry.argv]), [["cloud-sql-user:create:migrator", createArgv(desired.cloudSql.migratorIamUser)]]);
+});
+
 test("a failed operation stops apply, journals what ran and closes the spec writer", () => {
   const desired = desiredState({ synthetic: false });
   const gcloud = fake(desired, bornWorld(desired), { failWhen: (argv) => argv[0] === "secrets" && argv[1] === "create" });

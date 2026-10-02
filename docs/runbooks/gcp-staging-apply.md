@@ -89,11 +89,16 @@ Expected: `exit=2` (blockers). In the JSON: `"environment": "staging"`,
 both exactly `["BUCKET_ABSENT", "BUCKET_PROOF_UNPINNED"]`. Executable
 operations create the six `tibotattle-staging-*` service accounts and their
 project roles, the custom role, the `tibotattle-staging-images` repository,
-seven `tibotattle-staging-*` secrets and their accessor bindings, and the
-`tibotattle-staging-primary` instance, database and IAM users. Deferred:
-the service (`STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud`), both jobs
-(`BOOTSTRAP_IMAGE_REQUIRED`), the trigger (`SCHEDULER_CADENCE_UNSET`) and
-the verifier grant (`VERIFIER_TOKEN_CREATOR_UNASSIGNED`).
+seven `tibotattle-staging-*` secrets and their accessor bindings, the
+`tibotattle-staging-primary` instance, database and IAM users, and the
+verifier grant. The verifier grant is one `iam service-accounts
+add-iam-policy-binding` of `roles/iam.serviceAccountTokenCreator` on
+`tibotattle-staging-verifier` for the operator that
+`serviceAccounts.verifier.tokenCreators` names. The owner named that operator
+in round 9, and `d86f9155` committed it. Deferred: the service and its two
+invoker bindings (`STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud`), both
+jobs and the scheduler's executor binding (`BOOTSTRAP_IMAGE_REQUIRED`), and
+the trigger (`SCHEDULER_CADENCE_UNSET`). The verifier grant is not deferred.
 
 Stop, and do not continue, if any of these holds:
 
@@ -227,7 +232,11 @@ rerun `--apply` in any of these cases:
   then run `--pin-only`, which verifies the receipt before pinning.
 - `"receiptWritten": false, "receiptPrinted": false`, and nothing on stdout:
   the bucket was born, but no receipt exists. Examples are
-  `BUCKET_BIRTH_READBACK_MISSING` and `BUCKET_BIRTH_RESPONSE_INVALID`. The
+  `BUCKET_BIRTH_READBACK_MISSING`, `BUCKET_BIRTH_RESPONSE_INVALID` and
+  `BUCKET_BIRTH_READBACK_MISMATCH`. A mismatch also carries
+  `differingFields`: the names, never the values, of the snapshot fields
+  that differ, or `readbackMetagenerationNotOne` when both responses agree
+  on a metageneration other than `"1"`. The
   proof cannot be recovered with this tooling: `--pin-only` refuses with
   `STAGING_BUCKET_BIRTH_RECEIPT_MISSING`. **Stop and ask the owner.** Never
   write a receipt by hand and never adopt the bucket.
@@ -281,14 +290,25 @@ only non-staging-named entry is `custom-role:create` for
 `tibotattleQuarantineStore`.
 
 Expected plan: exit 0, no findings or blockers, `summary.refused` 0. With
-the secrets and bucket already made, about 26 executable operations
-(accounts, roles, repository, accessor bindings, Cloud SQL) and 8 deferred
-(the service and its two invoker bindings on
-`STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud`, both jobs and the
-scheduler's executor binding on `BOOTSTRAP_IMAGE_REQUIRED`, the trigger on
-`SCHEDULER_CADENCE_UNSET`, the verifier grant on
-`VERIFIER_TOKEN_CREATOR_UNASSIGNED`). The in-memory rehearsal of exactly
-this pass is the last test of `scripts/gcp-ops-infra-staging-service.check.mjs`.
+the secrets and bucket already made, the first plan has 27 executable
+operations and 7 deferred.
+
+- Executable: the accounts, roles, repository, accessor bindings, Cloud SQL,
+  and the verifier grant from step 1.
+- Deferred: the service and its two invoker bindings on
+  `STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud`, both jobs and the
+  scheduler's executor binding on `BOOTSTRAP_IMAGE_REQUIRED`, and the
+  trigger on `SCHEDULER_CADENCE_UNSET`.
+
+The in-memory rehearsal of this pass is the last test of
+`scripts/gcp-ops-infra-staging-service.check.mjs`. It uses a synthetic
+Access AUD, so its service deferral reads `STAGING_HOST_COMPOSITION_PENDING`.
+
+A rerun after a partial pass 1 plans only what is still missing. Cloud SQL
+IAM users are created under their PostgreSQL user names, for example
+`tibotattle-staging-runtime@tibotattle.iam`. Cloud SQL refuses the full
+`.gserviceaccount.com` email. If any `cloud-sql-user:create` argv ends with
+`.gserviceaccount.com`, stop: that checkout lacks `73b38784`.
 
 Expected apply: exit 0 and an apply receipt listing each operation's
 outcome. Cloud SQL creation takes several minutes.
@@ -306,7 +326,9 @@ node scripts/gcp-infra.mjs readback --environment=staging --require-clean > "$SC
 ```
 
 Expected: the first exits 0 with no finding. The second exits 2 with
-`"clean": false`, and its reasons are only the deferrals listed in step 7.
+`"clean": false`. Its reasons are the six service, job and executor-binding
+deferrals listed in step 7. The trigger's `SCHEDULER_CADENCE_UNSET` is a
+clean deferral (`CLEAN_DEFERRALS`), so it is not a reason.
 This is the first owner-run readback of the test project (OPS2-READ): check
 that the service-account policy, the scheduler listing and the custom role
 parsed, and keep the files as evidence (they are content-free).
@@ -320,13 +342,13 @@ at STG-PREP's base; take exact flags from the line you run.
 
 | Step | Gate |
 |---|---|
-| Name the verifier's operator: set `serviceAccounts.verifier.tokenCreators` to `["user:<operator account>"]` in the staging file, commit, plan and apply (one `iam service-accounts add-iam-policy-binding` on the staging verifier) | The owner names the operator (the README lists it as an owner value). OPS-10 refuses every staging verb until it is set (`ROLLOUT_TARGET_VERIFIER_TOKEN_CREATOR_UNASSIGNED`) |
+| Done: name the verifier's operator in `serviceAccounts.verifier.tokenCreators` | Cleared. The owner named the operator in round 9 ("Staging verifier operator"), and `d86f9155` committed it to the staging file. The grant is now an executable operation in steps 1 and 7, not a deferral. With the operator named, OPS-10 accepts the committed staging rollout target, so `ROLLOUT_TARGET_VERIFIER_TOKEN_CREATOR_UNASSIGNED` no longer applies (`17f3a78e`) |
 | Set `stagingOrigin.accessAud` to the staging admin Access application's AUD tag, commit | The owner creates that Access application (staging edge plan, phase C). Until then the service stays deferred |
-| Bootstrap image: `node scripts/gcp-production-rollout.mjs build --environment=staging --commit=<commit> --authorize=build:staging:<commit> --execute` | The verifier operator above, and the staging lock. Every OPS-10 mutating verb (`build`, `migrate`, `roll`) for staging takes the staging coordination lock by pushing `refs/heads/codex/staging-deployment-lock` to GitHub, and never takes or reads the production lock `refs/heads/codex/production-deployment-lock` (`scripts/production-deployment-lock.mjs`, closed mapping `DEPLOYMENT_LOCK_REFS`). The owner authorized pushes of that one staging ref on 2026-10-02 (round 9, "Deploy lock"); no other push is authorized. First run the same command without `--authorize` and `--execute`: stop unless its `lockRef` reads exactly `refs/heads/codex/staging-deployment-lock`. A dry run with no `lockRef` comes from a checkout without STG-LOCK, which would take the production lock: stop. A held or uncertain staging lock (`STAGING_COORDINATION_*`) is a stop; so is `ROLLOUT_LOCK_REF_MISMATCH` or `DEPLOYMENT_COORDINATION_*` |
+| Bootstrap image: `node scripts/gcp-production-rollout.mjs build --environment=staging --commit=<commit> --authorize=build:staging:<commit> --execute` | The verifier grant applied in pass 1 (step 7), and the staging lock. Every OPS-10 mutating verb (`build`, `migrate`, `roll`) for staging takes the staging coordination lock by pushing `refs/heads/codex/staging-deployment-lock` to GitHub, and never takes or reads the production lock `refs/heads/codex/production-deployment-lock` (`scripts/production-deployment-lock.mjs`, closed mapping `DEPLOYMENT_LOCK_REFS`). The owner authorized pushes of that one staging ref on 2026-10-02 (round 9, "Deploy lock"); no other push is authorized. First run the same command without `--authorize` and `--execute`: stop unless its `lockRef` reads exactly `refs/heads/codex/staging-deployment-lock`. A dry run with no `lockRef` comes from a checkout without STG-LOCK, which would take the production lock: stop. A held or uncertain staging lock (`STAGING_COORDINATION_*`) is a stop; so is `ROLLOUT_LOCK_REF_MISMATCH` or `DEPLOYMENT_COORDINATION_*` |
 | Apply, pass 2: `plan --environment=staging --bootstrap-image-digest=<digest> --bootstrap-source-commit=<commit>`, then `apply` with the same bootstrap flags and the new plan digest. Creates both jobs and the executor binding | The image. The scheduler trigger stays absent until the owner sets the cadence (D3) |
 | The service | D-CRB must land the staging host composition: the server reads no `HOST_MODE` yet, so OPS-2 defers the service (`STAGING_HOST_COMPOSITION_PENDING`). The D-CRB merge removes that entry from `SERVICE_COMPOSITION_PENDING` together with its check; then pass 2 also creates the service |
 | Backup audit: `node scripts/gcp-backup-horizon.mjs audit --environment=staging --project=tibotattle --primary-instance=tibotattle-staging-primary --region=us-east1` | Read-only; exit 0 or 2 is usable, 3 is a breach |
-| Migrate: `node scripts/gcp-production-rollout.mjs migrate --environment=staging --commit=<commit> --digest=<digest> --backup-audit=<file> --migrate-receipt=<new file> --authorize=migrate:staging:<digest> --execute` | A clean readback (needs the service, so D-CRB, and the operator), the staging lock as for the bootstrap image (the dry run's `lockRef` is `refs/heads/codex/staging-deployment-lock`), and quiescence: OPS-10 counts every Cloud Run job trigger in `us-east1`, so a running test-estate trigger refuses it |
+| Migrate: `node scripts/gcp-production-rollout.mjs migrate --environment=staging --commit=<commit> --digest=<digest> --backup-audit=<file> --migrate-receipt=<new file> --authorize=migrate:staging:<digest> --execute` | A clean readback (needs the service, so D-CRB, and the verifier grant), the staging lock as for the bootstrap image (the dry run's `lockRef` is `refs/heads/codex/staging-deployment-lock`), and quiescence: OPS-10 counts every Cloud Run job trigger in `us-east1`, so a running test-estate trigger refuses it |
 | Roll: `gcp-production-rollout.mjs roll ... --edge-live=<capture>` | A migrate receipt and a fresh `tibotattle-edge-live-capture-v1` capture of the tracked `env.staging` Worker. No repository command writes that capture yet, and the tracked staging Worker is the old workers.dev one, not the planned staging edge |
 
 ## If something must be undone

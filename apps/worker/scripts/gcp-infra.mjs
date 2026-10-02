@@ -57,8 +57,9 @@
  * apply would refuse (or, with --require-clean, when the estate is not
  * clean, or when the scheduler probe raises its signal), and 1 on any error, reported as {"status":"error", "code":...} on
  * stderr without echoing gcloud output. A failure after a bucket insert adds
- * "bucketInserted": true. Every gcloud call is an
- * argv array through the guarded runner; no shell is used.
+ * "bucketInserted": true; a readback mismatch also adds "differingFields",
+ * the names (never the values) of the snapshot fields that differ. Every
+ * gcloud call is an argv array through the guarded runner; no shell is used.
  */
 
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
@@ -367,7 +368,9 @@ export async function main(argv = process.argv.slice(2), {
       if (error.code === "BUCKET_BIRTH_RECEIPT_WRITE_FAILED" && error.receipt !== undefined) {
         print({ status: "created_receipt_unwritten", receipt: error.receipt });
       }
-      stderr(`${JSON.stringify({ status: "error", code: error.code, bucketInserted: true })}\n`);
+      stderr(`${JSON.stringify({ status: "error", code: error.code, bucketInserted: true,
+        // Snapshot field names only (content-free), for a readback mismatch.
+        ...(Array.isArray(error.differingFields) ? { differingFields: error.differingFields } : {}) })}\n`);
       return 1;
     }
     if (error?.code === "PAUSE_ALL_INCOMPLETE" && error.receipt !== undefined) {
