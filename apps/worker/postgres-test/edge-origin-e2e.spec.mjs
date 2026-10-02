@@ -119,6 +119,12 @@ const SKIP = !PG_TEST_SOCKET;
 const GOLDEN = process.env.EDGE_E2E_GOLDEN ? resolve(process.env.EDGE_E2E_GOLDEN) : null;
 const EDGE_TREE = process.env.EDGE_E2E_EDGE_TREE ? resolve(process.env.EDGE_E2E_EDGE_TREE) : null;
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+/** Whether the edge tree's index.ts re-exports isPostgresWorkerRequestPathSupported. */
+async function edgeIndexExportsPostgresPath() {
+  const index = await readFile(join(EDGE_TREE ?? WORKER_ROOT, "src", "index.ts"), "utf8");
+  return /^export \{ isPostgresWorkerRequestPathSupported \} from "\.\/backend-composition";$/mu.test(index);
+}
 const DIST_SERVER = join(WORKER_ROOT, "cloud-run", "dist", "server.mjs");
 const SOURCE_ID = "synthetic-edge-e2e-journal";
 const NAMESPACE = "synthetic-edge-e2e-namespace";
@@ -384,7 +390,9 @@ async function fixture() {
   fixturePromise ??= (async () => {
     assert.ok(existsSync(DIST_SERVER), "run `node cloud-run/build.mjs` first");
     const m = await loadModules();
-    const compatibility = await readCompatibility(WORKER_ROOT);
+    // With EDGE_E2E_EDGE_TREE, the checked-in settings and main are the edge
+    // tree's: S0 compares worker mode with that line's own main.
+    const compatibility = await readCompatibility(EDGE_TREE ?? WORKER_ROOT);
     const bundle = await buildEdgeBundle({ workerRoot: WORKER_ROOT, edgeTree: EDGE_TREE });
     disposers.push(() => bundle.cleanup());
     const socket = await localSocket();
@@ -706,8 +714,11 @@ test("S0 modes: fenced, absent and invalid gcp answer at the edge; worker mode e
   assert.equal(f.compatibility.e2e.date, f.compatibility.checkedIn.date);
   assert.deepEqual(f.compatibility.e2e.flags, f.compatibility.checkedIn.flags);
   // workerd starts the bundle only when every named export is a handler or function.
+  // The production line's index.ts (d43c8f92) has no PostgreSQL request-path
+  // export; an edge tree that lacks it is held to the list without it.
   assert.deepEqual([...f.bundle.exports], ["UploadIngressBudget", "contributionRequestPreflight", "default", "handleRequest",
-    "isPostgresWorkerRequestPathSupported", "runScheduledMaintenance"]);
+    ...(await edgeIndexExportsPostgresPath() ? ["isPostgresWorkerRequestPathSupported"] : []),
+    "runScheduledMaintenance"]);
 
   const fenced = await createEdgeInstance({ ...f.common, mode: "fenced", invokerKeyJson: f.invoker.keyJson });
   disposers.push(() => fenced.dispose());
@@ -780,7 +791,8 @@ test("S0 modes: fenced, absent and invalid gcp answer at the edge; worker mode e
   // Worker mode is today's main: the edge bundle in worker mode and the
   // checked-in wrangler.jsonc main, built with the same settings, answer the
   // same requests with the same bytes (request ids aside).
-  const todayBundle = await buildEdgeBundle({ workerRoot: WORKER_ROOT, main: f.compatibility.checkedIn.main });
+  const todayBundle = await buildEdgeBundle({ workerRoot: WORKER_ROOT, edgeTree: EDGE_TREE,
+    main: f.compatibility.checkedIn.main });
   disposers.push(() => todayBundle.cleanup());
   const today = await createReferenceInstance({ ...f.common, bundle: todayBundle, mode: null, envelope: f.keys });
   disposers.push(() => today.dispose());
