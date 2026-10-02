@@ -16,7 +16,7 @@ status: accepted
 
 | Field | Value |
 |---|---|
-| Decided by the owner | In chat on 2026-10-02: round 3 (plain text, no hashing), its amendment (structural guard only), and round 7 (the guard is exactly the v1.x wire grammar) |
+| Decided by the owner | In chat on 2026-10-02: round 3 (plain text, no hashing), its amendment (structural guard only), round 7 (the guard is exactly the v1.x wire grammar), and round 11 (the unseen-name probe's log line may list in-grammar names) |
 | Applies to | Model, provider, speed, tier and plan names wherever TiboTattle stores, derives or publishes them |
 | Invariant amended | The raw-account-identifier rule in the root `AGENTS.md`, and the free-text rule in `packages/telemetry-contract/AGENTS.md` |
 | First implementation | The signed catalog manifest token guard (`catalog-token-guard-v1`, `apps/worker/src/catalog-manifest.ts`) on the GCP fast-path line |
@@ -43,6 +43,12 @@ status: accepted
 5. **Public surfaces draw only catalogued names.** Unknown names are stored
    and counted, never drawn raw on the public site, until the catalog or
    manifest adds them (round 5).
+6. **Operational logs may list in-grammar names (round 11).** The unseen-name
+   probe's log line may list in-grammar unseen model, speed, tier and plan
+   names, bounded per dimension, with record counts. This is the owner's
+   round-11 answer to the question that had held the listing against the
+   round-5 log retention wording. A string outside the grammar is still only
+   counted, never listed.
 
 ## What is unchanged
 
@@ -64,11 +70,8 @@ status: accepted
   privacy page and in-app notice update, which the owner placed in the next
   client release (round 5). Until KC-3 ships, clients keep the current
   fingerprint/unknown policy for unknown models.
-- **Held, a separate step:** the K-DETECT unseen-token probe
-  (`apps/worker/cloud-run/unseen-token-probe.mjs`) still prints counts only
-  (`UNSEEN_TOKEN_LISTING` is `held`). Its plain-text listing, bounded to
-  in-grammar names, is built and checked. The flip to `plain` belongs with
-  the change that schedules the probe (D-OPS4), because the line then reaches
-  Cloud Logging. It waits for the owner to confirm that listing these names
-  there agrees with the round-5 retention wording that logs never include
-  upload contents.
+- **Done on the GCP line (round 11, 2026-10-02):** the owner said yes to the
+  K-DETECT unseen-token probe (`apps/worker/cloud-run/unseen-token-probe.mjs`)
+  listing in-grammar unseen model, speed, tier and plan names on its Cloud
+  Logging line (decision 6). `UNSEEN_TOKEN_LISTING` is `plain`. The probe is
+  not scheduled yet (D-OPS4), so no such line has reached Cloud Logging.

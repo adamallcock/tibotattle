@@ -15,8 +15,7 @@
  * It reads both typed families (the retained v1/v1.1 typed_telemetry_* tables
  * and the v1.2 telemetry_v12_typed_* tables) through typed_telemetry_dictionary,
  * grouped by token: no owner, device, session, account or record identifier
- * is selected, and the output holds counts (and, once listing is allowed,
- * tokens) only. A token the catalog does not name is "unseen" when it fits
+ * is selected, and the output holds counts and in-grammar tokens only. A token the catalog does not name is "unseen" when it fits
  * UNSEEN_TOKEN_GRAMMAR, the v1.x wire grammar (owner decision, round 7 "Name
  * guard"), and "unrecognized" otherwise: an ARN with "/", an email address or
  * anything over 64 characters is counted, never printed. The sentinels
@@ -24,17 +23,17 @@
  * separately, so a rise in "other" speed (Ultrafast) or "unknown" model shows
  * even when no new token appears.
  *
- * Listing is HELD (UNSEEN_TOKEN_LISTING): the probe reports how many distinct
- * unseen tokens each dimension holds and how many records carry them, and
- * prints no token. The owner's round-3 amendment lets these names pass in
- * plain text, and the root AGENTS.md invariant is already narrowed for them
- * (KM-CORE, docs/decisions/2026-10-02-catalog-vocabulary-plain-text.md). The
- * flip to "plain" is a separate pending step for the change that schedules
- * this probe (D-OPS4). From then on the line reaches Cloud Logging, and the
- * owner's round-5 retention wording says logs never include upload contents,
- * so the flip waits for the owner to confirm that listing these names there
- * is allowed. The bounded listing below is already checked.
- *
+ * Listing is PLAIN (UNSEEN_TOKEN_LISTING): the owner said yes in round 11
+ * (2026-10-02) to the probe's Cloud Logging line listing in-grammar unseen
+ * model, speed, tier and plan names, which are vocabulary, not account IDs
+ * (round-3 amendment; the root AGENTS.md invariant and
+ * docs/decisions/2026-10-02-catalog-vocabulary-plain-text.md). Per dimension
+ * the line lists at most UNSEEN_TOKEN_LIST_LIMIT unseen tokens, by records
+ * then by token, with their record counts, and counts the rest
+ * (unseenOverflow). A string outside UNSEEN_TOKEN_GRAMMAR is only counted
+ * (unrecognized), never listed, whatever the listing. "held" (counts only)
+ * stays available to callers.
+
  * One JSON line on stdout per run (schema tibotattle-unseen-token-probe-v1),
  * which OPS-5's log-based metric keys on (verdict "unseen" or "clear"); one
  * JSON error line with a closed code and no verdict on stderr otherwise
@@ -77,15 +76,17 @@ export const UNSEEN_TOKEN_SENTINELS = Object.freeze(["unknown", "other", "mixed"
  */
 export const UNSEEN_TOKEN_GRAMMAR = /^[A-Za-z0-9._:-]{1,64}$/u;
 /**
- * Whether unseen tokens are printed: "held" (counts only). The root AGENTS.md
- * invariant is already narrowed for model, speed, tier and plan names (owner,
- * round-3 amendment). Flipping this to "plain" is a separate step that waits
- * for the scheduled probe job (D-OPS4) and the owner's confirmation (see the
- * header).
+ * Whether unseen tokens are printed: "plain" (owner, round 11) lists the
+ * in-grammar unseen tokens, bounded per dimension; "held" carries counts only.
  */
 export const UNSEEN_TOKEN_LISTINGS = Object.freeze(["held", "plain"]);
-export const UNSEEN_TOKEN_LISTING = "held";
-/** At most this many unseen tokens are listed per dimension; the rest are counted. */
+export const UNSEEN_TOKEN_LISTING = "plain";
+/**
+ * At most this many unseen tokens are listed per dimension; the rest are
+ * counted (unseenOverflow). A caller may list fewer, never more, so one line
+ * holds at most 4 x 50 tokens of at most 64 characters (well under Cloud
+ * Logging's entry limit).
+ */
 export const UNSEEN_TOKEN_LIST_LIMIT = 50;
 export const UNSEEN_TOKEN_PROBE_VERDICTS = Object.freeze(["clear", "unseen"]);
 
@@ -198,14 +199,17 @@ export async function readDayTokenCounts(client, { schema, day }) {
  * The content-free report for one day's (dimension, token, records) rows
  * against a catalog. Pure and deterministic. Per dimension it counts the
  * distinct unseen tokens (unseenDistinct) and their records, and the
- * unrecognized ones; with listing "plain" it also lists the unseen tokens,
- * sorted and bounded (unseen, unseenListed, unseenOverflow). With listing
- * "held", the default, no token is carried at all.
+ * unrecognized ones; with listing "plain", the default, it also lists the
+ * in-grammar unseen tokens, sorted and bounded (unseen, unseenListed,
+ * unseenOverflow). With listing "held" no token is carried at all.
  */
 export function unseenTokenReport(rows, { day, catalog = bundledTokenCatalog(), listLimit = UNSEEN_TOKEN_LIST_LIMIT,
   listing = UNSEEN_TOKEN_LISTING }) {
   observedDay(day);
   if (!UNSEEN_TOKEN_LISTINGS.includes(listing)) fail("UNSEEN_TOKEN_PROBE_LISTING_INVALID");
+  if (!Number.isSafeInteger(listLimit) || listLimit < 0 || listLimit > UNSEEN_TOKEN_LIST_LIMIT) {
+    fail("UNSEEN_TOKEN_PROBE_LIST_LIMIT_INVALID");
+  }
   if (!Array.isArray(rows)) fail("UNSEEN_TOKEN_PROBE_ROWS_INVALID");
   const dimensions = Object.fromEntries(UNSEEN_TOKEN_DIMENSIONS.map((dimension) => [dimension, {
     records: 0, distinct: 0, sentinels: Object.fromEntries(UNSEEN_TOKEN_SENTINELS.map((token) => [token, 0])),

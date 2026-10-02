@@ -51,7 +51,7 @@ and updated authoritative documentation.
   logs, diagnostics, issues, commits, or PRs. Opt-in Crashpad dumps and explicit
   owner-only raw crash exports are sole local exceptions; never project/upload them (`docs/decisions/2026-09-21-opt-in-crash-doctor.md`).
   Model, provider, speed, tier and plan names in the wire grammar are vocabulary,
-  not account IDs (`docs/decisions/2026-10-02-catalog-vocabulary-plain-text.md`).
+  not account IDs, and may be listed in logs; others are only counted (`docs/decisions/2026-10-02-catalog-vocabulary-plain-text.md`).
 - Hosted contribution is optional, content-free and pseudonymous. Follow the
   accountless Electron defaults and transition in
   `docs/decisions/2026-09-04-accountless-sharing-policy.md`; preserve durable

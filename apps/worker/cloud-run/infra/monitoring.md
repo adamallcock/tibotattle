@@ -172,18 +172,18 @@ manifest.
   characters; owner decision, round 7) is **unseen**.
 - Any other token is **unrecognized**: for example an ARN with `/`, an email
   address, or a name over 64 characters. It is counted and never printed.
-- **The probe prints no token today** (`UNSEEN_TOKEN_LISTING` is `held`).
-  The probe line carries, per dimension, the number of distinct unseen
-  tokens and their records, and the number of unrecognized ones. It does not
-  say which token is new.
-- The owner allowed these names in plain text (round-3 amendment), and the
-  root `AGENTS.md` invariant is already narrowed for them
-  ([decision record](../../../../docs/decisions/2026-10-02-catalog-vocabulary-plain-text.md)).
-  The flip to `plain` is a separate pending step for the change that
-  schedules the probe (D-OPS4). From then on the line reaches Cloud Logging.
-  The owner's round-5 retention wording says logs never include upload
-  contents, so the flip waits for the owner to confirm that listing these
-  names there is allowed.
+- **The probe line lists in-grammar unseen names** (`UNSEEN_TOKEN_LISTING`
+  is `plain`; owner decision, round 11). Per dimension it lists at most 50
+  unseen tokens (`UNSEEN_TOKEN_LIST_LIMIT`), most records first, each with
+  its record count, and counts the rest in `unseenOverflow`. It also
+  carries the number of distinct unseen tokens and their records, and the
+  number of unrecognized ones. Out-of-grammar strings are only counted,
+  never listed. Read the probe's own log line for the names: the log metric
+  extracts only the verdict.
+- These names are vocabulary, not account IDs (root `AGENTS.md`;
+  [decision record](../../../../docs/decisions/2026-10-02-catalog-vocabulary-plain-text.md)).
+  The probe still has no manifest job (D-OPS4), so the policy stays
+  deferred with `PRODUCER_NOT_IN_MANIFEST:unseen-token-probe`.
 
 ## unseen-tokens-silent
 

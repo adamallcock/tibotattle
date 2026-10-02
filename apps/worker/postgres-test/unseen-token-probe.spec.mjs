@@ -111,8 +111,8 @@ test("the probe's one read counts both typed families' tokens for exactly that d
   const client = await pool.connect();
   try {
     await seed(client, schema);
-    // The default report holds the listing: counts only.
-    const report = await runUnseenTokenProbe(client, { schema, day: DAY });
+    // A held report carries counts only.
+    const report = await runUnseenTokenProbe(client, { schema, day: DAY, listing: "held" });
     assert.deepEqual([report.verdict, report.listing], ["unseen", "held"]);
     assert.deepEqual([report.dimensions.model.records, report.dimensions.model.distinct,
       report.dimensions.model.unseenDistinct, report.dimensions.model.unseenRecords], [3, 2, 1, 2]);
@@ -122,8 +122,9 @@ test("the probe's one read counts both typed families' tokens for exactly that d
     // quota's promax, and the v1.2 usage attribution and quota (plus).
     assert.deepEqual([report.dimensions.plan.records, report.dimensions.plan.unseenDistinct], [5, 1]);
     assert.doesNotMatch(JSON.stringify(report), /gpt-6\.1-sol|ultrafast|promax|synthetic/u);
-    // The same read with listing allowed names exactly that day's unseen tokens.
-    const listed = await runUnseenTokenProbe(client, { schema, day: DAY, listing: "plain" });
+    // The default (owner, round 11) lists exactly that day's in-grammar unseen tokens.
+    const listed = await runUnseenTokenProbe(client, { schema, day: DAY });
+    assert.equal(listed.listing, "plain");
     assert.deepEqual(listed.dimensions.model.unseen, [{ token: "gpt-6.1-sol", records: 2 }]);
     assert.deepEqual(listed.dimensions.speed.unseen, [{ token: "ultrafast", records: 1 }]);
     assert.deepEqual(listed.dimensions.tier.unseen, []);
