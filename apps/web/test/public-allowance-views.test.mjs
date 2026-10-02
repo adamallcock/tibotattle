@@ -227,7 +227,13 @@ test("optional public breakdown rejects private extras and invalid evidence with
     value => { value.days[0].byPlanType.pro.band80Usd.raw = "PRIVATE_CANARY"; },
     value => { value.days[0].byPlanType.team = value.days[0].byPlanType.pro; },
     // An UNKNOWN model id no longer invalidates the block: that tuple is
-    // dropped and counted instead (community-model-tolerance.test.mjs).
+    // dropped and counted instead (community-model-tolerance.test.mjs). A
+    // reviewed model kept off the primary comparison, an id that is not shaped
+    // like a model id, and a repeated id are still producer faults.
+    value => { value.days[0].models = [["gpt-5.3-codex-spark", 1234, 1]]; },
+    value => { value.days[0].models = [["claude-opus-5", 1234, 1]]; },
+    value => { value.days[0].models = [["<private-model-canary>", 1234, 1]]; },
+    value => { value.days[0].models = [["private-model-canary", 1234, 1], ["private-model-canary", 1234, 1]]; },
     value => { value.days[0].models = [["gpt-6-astra", 1234, 1, "PRIVATE_CANARY"]]; },
     value => { value.days[0].models = [[null, 1234, 1]]; },
     value => { value.days[0].models = [["gpt-6-astra", 1234, 1], "private-model-canary"]; },

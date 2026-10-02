@@ -1585,7 +1585,9 @@ export function renderCommunityAllowanceSection({
 }) {
   const { clear, node } = createDomHelpers(documentRef);
   const locale = documentRef?.documentElement?.lang ?? "en-US";
-  const series = normalizeCommunityDailySeries(payload);
+  // A payload handed over with retained provenance came out of this browser's
+  // own store, and only such a payload may carry the stored-copy counters.
+  const series = normalizeCommunityDailySeries(payload, { retained: cache !== null && cache !== undefined });
   // v1.0 breakdowns contain only plan/model rows: the aggregate still comes
   // from independently published daily values. Later breakdowns own their
   // combined estimate, so labels must follow the selected value's source.

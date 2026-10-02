@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { buildCommunityAllowanceChartModel, renderCommunityAllowanceSection } from "../public/community-view.js";
 import {
-  PUBLIC_ALLOWANCE_MODEL_CONFIG, PUBLIC_MODEL_METADATA_MAX_ENTRIES,
+  COMMUNITY_DAILY_CACHE_SCHEMA_IDENTITY, PUBLIC_ALLOWANCE_MODEL_CONFIG, PUBLIC_MODEL_METADATA_MAX_ENTRIES,
   normalizeCommunityDailySeries, normalizePublicAllowanceBreakdowns,
   projectCommunityDailyPayloadForCache, publicAllowanceModels,
 } from "../public/community-data.js";
+import { createLastKnownGoodStore } from "../public/last-known-good.js";
 import { REVIEWED_MODEL_CATALOG } from "../public/model-catalog.generated.js";
 import { translate } from "../public/localization.js";
 import { publicAllowanceFixture } from "./fixtures/public-allowance.js";
@@ -40,22 +41,23 @@ class Element {
 }
 const documentRef = () => ({ documentElement: { lang: "en-US" }, createElement: tag => new Element(tag),
   createElementNS: (_, tag) => new Element(tag) });
-function render(payload, view) {
+function render(payload, view, cache = null) {
   const container = new Element("div");
-  const state = renderCommunityAllowanceSection({ documentRef: documentRef(), container, payload, view });
+  const state = renderCommunityAllowanceSection({ documentRef: documentRef(), container, payload, view, cache });
   return { container, state, text: container.text };
 }
+// The provenance community.js hands a view for a payload read back from the store.
+const RETAINED = Object.freeze({ fetchedAt: "2026-09-07T10:00:00.000Z", ageMs: 7_200_000 });
+const NOTICE = translate("community.allowance.unrecognizedModels", {}, "en-US");
 const everyAttribute = element => element.descendants().flatMap(node => [...node.attributes.values()].map(String));
 
 test("an unknown model tuple is dropped and counted while every other breakdown survives", () => {
-  const payload = withTuples(publicAllowanceFixture(NOW), [
-    [CANARY, 4321, 2], [SECOND_CANARY, 99, 1], ["gpt-5.3-codex-spark", 800, 1], ["claude-opus-5", 700, 1],
-  ]);
+  const payload = withTuples(publicAllowanceFixture(NOW), [[CANARY, 4321, 2], [SECOND_CANARY, 99, 1]]);
   const normalized = normalizeCommunityDailySeries(payload, { nowMs: NOW });
   const { breakdowns } = normalized;
   assert.notEqual(breakdowns, null, "one unknown model must not null every breakdown");
-  assert.equal(breakdowns.unrecognizedModelTuples, 20, "four tuples on each of five days");
-  assert.equal(breakdowns.unrecognizedModelCount, 4, "distinct ids, counted without being kept");
+  assert.equal(breakdowns.unrecognizedModelTuples, 10, "two tuples on each of five days");
+  assert.equal(breakdowns.unrecognizedModelCount, 2, "distinct ids, counted without being kept");
   assert.equal(breakdowns.modelMetadata, "absent");
   // Known tuples are untouched, and nothing unknown was kept anywhere.
   const clean = normalizeCommunityDailySeries(publicAllowanceFixture(NOW), { nowMs: NOW }).breakdowns;
@@ -84,14 +86,16 @@ test("the tuple's numbers and shape stay closed, even when its id is unknown", (
     assert.equal(normalized.state, "published", "activity is never hidden by an invalid breakdown");
     assert.doesNotMatch(JSON.stringify(normalized), new RegExp(CANARY, "u"));
   }
-  // A duplicated KNOWN id is still a producer fault. A repeated unknown id is
-  // not retained, so it is only counted twice.
+  // One tuple per model per day, known or not: a duplicated id is a producer
+  // fault whether or not this page can name it.
   const duplicate = withTuples(publicAllowanceFixture(NOW), [["gpt-6-astra", 1, 1], ["gpt-6-astra", 1, 1]]);
   assert.equal(normalizeCommunityDailySeries(duplicate, { nowMs: NOW }).breakdowns, null);
   const repeated = withTuples(publicAllowanceFixture(NOW), [[CANARY, 1, 1], [CANARY, 2, 1]]);
-  const counted = normalizeCommunityDailySeries(repeated, { nowMs: NOW }).breakdowns;
-  assert.equal(counted.unrecognizedModelTuples, 10);
-  assert.equal(counted.unrecognizedModelCount, 1);
+  assert.equal(normalizeCommunityDailySeries(repeated, { nowMs: NOW }).breakdowns, null);
+  // The same unknown id on different days is one model over time, not a repeat.
+  const acrossDays = normalizeCommunityDailySeries(withTuples(publicAllowanceFixture(NOW), [[CANARY, 1, 1]]), { nowMs: NOW });
+  assert.equal(acrossDays.breakdowns.unrecognizedModelTuples, 5);
+  assert.equal(acrossDays.breakdowns.unrecognizedModelCount, 1);
   // Everything outside the model tuples is as closed as before.
   for (const mutate of [
     value => { value.participant_id = "PRIVATE_CANARY"; },
@@ -106,6 +110,40 @@ test("the tuple's numbers and shape stay closed, even when its id is unknown", (
   const atCap = publicAllowanceFixture(NOW);
   atCap.allowanceBreakdowns.days[0].models = Array.from({ length: 256 }, (_, index) => [`next-${index}`, 1, 1]);
   assert.equal(normalizeCommunityDailySeries(atCap, { nowMs: NOW }).breakdowns.unrecognizedModelTuples, 256);
+});
+
+test("an unknown id is skipped only if it is shaped like a model id, and a reviewed off-roster model is a producer fault", () => {
+  // The skip is for identities newer than this page. Anything that is not even
+  // shaped like a model id, and every id the catalog reviewed and kept off the
+  // primary comparison, still refuses the block, so a producer fault cannot hide
+  // behind "newer model".
+  const refused = [
+    ["markup", "<script>alert(1)</script>"], ["oversized id", `g${"x".repeat(100_000)}`],
+    ["one over the id length cap", `g${"x".repeat(128)}`], ["empty id", ""],
+    ["leading separator", "-gpt-7"], ["space", "gpt 7"], ["quote", 'gpt-7"'], ["newline", "gpt-7\nnova"],
+    ["control character", "gpt-7\u0007"], ["non-ASCII look-alike", "gpt-7-\u043d"],
+    ["a reviewed separate-track model", "gpt-5.3-codex-spark"], ["another provider's model", "claude-opus-5"],
+  ];
+  for (const [name, id] of refused) {
+    const normalized = normalizeCommunityDailySeries(withTuples(publicAllowanceFixture(NOW), [[id, 1234, 2]]), { nowMs: NOW });
+    assert.equal(normalized.breakdowns, null, name);
+    assert.equal(normalized.state, "published", `${name}: activity is never hidden by an invalid breakdown`);
+    assert.doesNotMatch(JSON.stringify(normalized), /script|xxxx|nova/u, name);
+  }
+  // Rendered, the refusal is the existing honest "breakdowns unavailable"
+  // state, never the newer-model notice, which would misdescribe a fault.
+  for (const id of ["gpt-5.3-codex-spark", "claude-opus-5", "<script>"]) {
+    const models = render(withTuples(publicAllowanceFixture(), [[id, 1234, 2]]), "models");
+    assert.equal(models.state, "breakdowns_unavailable", id);
+    assert.ok(!models.text.includes(NOTICE), id);
+    assert.ok(models.text.includes(translate("community.allowance.breakdownsUnavailable", {}, "en-US")), id);
+  }
+  // The same ids are fine once they are not on the primary comparison's
+  // excluded list and are shaped like a model id (the boundary itself).
+  for (const id of ["gpt-7-nova", `g${"x".repeat(127)}`, "o9", "vendor/model:v1+exp_2.0"]) {
+    const normalized = normalizeCommunityDailySeries(withTuples(publicAllowanceFixture(NOW), [[id, 1234, 2]]), { nowMs: NOW });
+    assert.equal(normalized.breakdowns?.unrecognizedModelTuples, 5, id);
+  }
 });
 
 test("a model with no known identity is never rendered, and the model view says its estimates are left out", () => {
@@ -245,11 +283,13 @@ test("the stored copy keeps an applied block, drops every unrecognized tuple, an
   const stored = projectCommunityDailyPayloadForCache(payload, { nowMs: NOW });
   assert.deepEqual(stored.allowanceBreakdowns.modelConfig, [NEWER]);
   assert.doesNotMatch(JSON.stringify(stored), new RegExp(CANARY, "u"));
-  const reread = normalizeCommunityDailySeries(stored, { nowMs: NOW });
+  const reread = normalizeCommunityDailySeries(stored, { nowMs: NOW, retained: true });
   assert.equal(reread.breakdowns.modelMetadata, "applied");
   assert.deepEqual(reread.breakdowns.days, live.breakdowns.days);
   assert.deepEqual(reread.breakdowns.modelConfig, live.breakdowns.modelConfig);
-  assert.equal(reread.breakdowns.unrecognizedModelTuples, 0, "the dropped tuples are not in the stored copy");
+  // The omitted tuples are gone from the stored copy, and the gap is not.
+  assert.equal(live.breakdowns.unrecognizedModelTuples, 5);
+  assert.deepEqual(reread, live, "the whole re-read series equals the live one, omission counts included");
   assert.deepEqual(buildCommunityAllowanceChartModel(reread, { view: "models" }),
     buildCommunityAllowanceChartModel(live, { view: "models" }));
   // Without a block there is no stored block, exactly as before.
@@ -261,6 +301,99 @@ test("the stored copy keeps an applied block, drops every unrecognized tuple, an
     withMetadata(publicAllowanceFixture(NOW), [{ ...NEWER, order: -1 }]), { nowMs: NOW });
   assert.equal("modelConfig" in rejected.allowanceBreakdowns, false);
 });
+
+test("a cached render states the gap a live render states, because the stored copy keeps a content-free count", () => {
+  const payload = withTuples(publicAllowanceFixture(NOW), [[CANARY, 4321, 2], [SECOND_CANARY, 99, 1]]);
+  const stored = projectCommunityDailyPayloadForCache(payload, { nowMs: NOW });
+  // Two integers, no id, no tuple, no wording.
+  assert.deepEqual(stored.allowanceBreakdowns.retainedUnrecognizedModels, { tuples: 10, models: 2 });
+  assert.doesNotMatch(JSON.stringify(stored), new RegExp(`${CANARY}|${SECOND_CANARY}`, "u"));
+  const live = normalizeCommunityDailySeries(payload, { nowMs: NOW });
+  const reread = normalizeCommunityDailySeries(stored, { nowMs: NOW, retained: true });
+  assert.deepEqual(reread, live);
+  // Rendered, in every state the model view can reach.
+  const liveModels = render(payload, "models");
+  const cachedModels = render(stored, "models", RETAINED);
+  assert.ok(liveModels.text.includes(NOTICE));
+  assert.ok(cachedModels.text.includes(NOTICE), "the retained render must not conceal the gap");
+  assert.equal(cachedModels.state, liveModels.state);
+  assert.ok(cachedModels.text.includes("GPT-6 Astra"), "known models still draw from the retained copy");
+  assert.doesNotMatch(cachedModels.text, new RegExp(`${CANARY}|${SECOND_CANARY}`, "u"));
+  for (const view of ["aggregate", "plans"]) assert.ok(!render(stored, view, RETAINED).text.includes(NOTICE), view);
+  // Only unknown tuples: the accumulating state states the gap from the cache too.
+  const onlyUnknown = publicAllowanceFixture(NOW);
+  onlyUnknown.allowanceBreakdowns.days.forEach(day => { day.models = [[CANARY, 10, 1]]; });
+  const emptyCached = render(projectCommunityDailyPayloadForCache(onlyUnknown, { nowMs: NOW }), "models", RETAINED);
+  assert.equal(emptyCached.state, "estimates_accumulating");
+  assert.ok(emptyCached.text.includes(NOTICE));
+  // Nothing was left out: nothing is stored and nothing is claimed.
+  const clean = projectCommunityDailyPayloadForCache(publicAllowanceFixture(NOW), { nowMs: NOW });
+  assert.equal("retainedUnrecognizedModels" in clean.allowanceBreakdowns, false);
+  assert.ok(!render(clean, "models", RETAINED).text.includes(NOTICE));
+  // With a metadata block the omitted model is still omitted, and still said.
+  const named = withMetadata(withTuples(publicAllowanceFixture(NOW), [[NEWER.id, 5000, 2], [CANARY, 1, 1]]), [NEWER]);
+  assert.ok(render(projectCommunityDailyPayloadForCache(named, { nowMs: NOW }), "models", RETAINED).text.includes(NOTICE));
+});
+
+test("the notice survives the real last-known-good store, from a live answer to a failed refresh", () => {
+  const entries = new Map();
+  const storage = { getItem: key => entries.get(key) ?? null, setItem: (key, value) => { entries.set(key, value); },
+    removeItem: key => { entries.delete(key); } };
+  const clock = { ms: NOW };
+  const store = createLastKnownGoodStore({
+    key: "community-daily", schemaVersion: COMMUNITY_DAILY_CACHE_SCHEMA_IDENTITY, storage, now: () => clock.ms,
+    project: payload => projectCommunityDailyPayloadForCache(payload, { nowMs: clock.ms }),
+  });
+  const payload = withTuples(publicAllowanceFixture(NOW), [[CANARY, 4321, 2]]);
+  const liveResult = store.resolve({ payload, failure: null });
+  assert.equal(liveResult.state, "live");
+  assert.ok(render(liveResult.payload, "models").text.includes(NOTICE));
+  clock.ms += 2 * 3_600_000;
+  const cached = store.resolve({ payload: null, failure: Object.assign(new Error("down"), { status: 503 }) });
+  assert.equal(cached.state, "cached");
+  assert.doesNotMatch(JSON.stringify([...entries.values()]), new RegExp(CANARY, "u"), "no id reaches storage");
+  const retained = { fetchedAt: cached.fetchedAt, ageMs: cached.ageMs };
+  const cachedModels = render(cached.payload, "models", retained);
+  assert.ok(cachedModels.text.includes(NOTICE), "the gap shown live is shown from the cache too");
+  assert.ok(cachedModels.text.includes("GPT-6 Astra"));
+});
+
+test("the stored-copy counters are closed and bounded, and only a stored copy may carry them", () => {
+  const stored = () => projectCommunityDailyPayloadForCache(
+    withTuples(publicAllowanceFixture(NOW), [[CANARY, 4321, 2], [SECOND_CANARY, 99, 1]]), { nowMs: NOW });
+  const days = stored().days.map(day => day.day);
+  const read = (mutate, retained = true) => {
+    const copy = structuredClone(stored());
+    mutate(copy.allowanceBreakdowns);
+    return normalizePublicAllowanceBreakdowns(copy.allowanceBreakdowns, days, NOW, { retained });
+  };
+  assert.notEqual(read(() => {}), null, "the unmodified stored copy is accepted");
+  // A live payload is the wire contract, which has no such key.
+  assert.equal(read(() => {}, false), null);
+  assert.equal(normalizeCommunityDailySeries(stored(), { nowMs: NOW }).breakdowns, null,
+    "a stored copy read without retained provenance is refused, never partly trusted");
+  assert.equal(normalizeCommunityDailySeries(stored(), { nowMs: NOW }).state, "published", "activity is still rendered");
+  const bad = [
+    ["not an object", () => 10], ["null", () => null], ["array", () => [10, 2]],
+    ["missing models", () => ({ tuples: 10 })], ["missing tuples", () => ({ models: 2 })],
+    ["extra key", () => ({ tuples: 10, models: 2, id: CANARY })],
+    ["zero tuples", () => ({ tuples: 0, models: 0 })], ["zero models", () => ({ tuples: 10, models: 0 })],
+    ["negative", () => ({ tuples: -1, models: 1 })], ["fractional", () => ({ tuples: 10.5, models: 2 })],
+    ["string", () => ({ tuples: "10", models: 2 })], ["NaN", () => ({ tuples: Number.NaN, models: 1 })],
+    ["unsafe integer", () => ({ tuples: Number.MAX_SAFE_INTEGER + 1, models: 1 })],
+    ["more models than tuples", () => ({ tuples: 2, models: 3 })],
+    ["over what 70 days of 256 tuples can carry", () => ({ tuples: 70 * 256 + 1, models: 2 })],
+  ];
+  for (const [name, value] of bad) assert.equal(read(copy => { copy.retainedUnrecognizedModels = value(); }), null, name);
+  assert.notEqual(read(copy => { copy.retainedUnrecognizedModels = { tuples: 70 * 256, models: 70 * 256 }; }), null,
+    "accepted exactly at the bound");
+  // A stored copy never holds a tuple it left out, so one that both claims an
+  // omission and still carries an unknown tuple contradicts itself.
+  assert.equal(read(copy => { copy.days[0].models = [...copy.days[0].models, [CANARY, 1, 1]]; }), null);
+  // It is still an exact envelope: any other key is refused as before.
+  assert.equal(read(copy => { copy.participant_id = "PRIVATE_CANARY"; }), null);
+});
+
 
 // The page charts a selected roster (2d6cfbc8, "six requested public allowance
 // models") and keeps older generations off it with an explicit, frozen hide
