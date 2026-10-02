@@ -76,11 +76,55 @@ before the commit.
 ### Not changed, and why
 
 `fixture()` in the same file has a second constant drain (`n < 30`). It runs the
-v1-only projection, which has no calendar-sized window, and it passes. Five
-sibling Worker specs use constant drains too (`storage-erasure`,
-`graph-day-fold-integration`, `graph-day-projection`,
-`storage-community-graph-publication`, `cache-retention-day`): all 163 of their
-tests pass today, so they do not share this time bomb.
+v1-only projection, which has no calendar-sized window, and it passes.
+
+Five sibling Worker specs also drain the analytics projection with constant
+bounds (`storage-erasure`, `graph-day-fold-integration`, `graph-day-projection`,
+`storage-community-graph-publication`, `cache-retention-day`). They do not share
+this time bomb, and the reason is structural. Their passing today (163/163) is
+corroboration only: a passing run cannot rule out a calendar-anchored window.
+
+The rule: `createTelemetryV11DomainPredecessor` always puts today in the known
+days (`apps/worker/src/telemetry-v11-domain.ts:165`) and activation rejects a
+manifest that ends before the predecessor does (`:282`). An activated v1.1
+domain therefore always ends at the real current day, so a constant drain bound
+stays valid only if the window's start also moves with today (or the clock is
+pinned). In the five siblings it does:
+
+- `storage-erasure.spec.ts` builds each fixture day as `today() - n` (`:28`,
+  `:38`) and ends the domain at `today()` (`:48`).
+- `graph-day-fold-integration.spec.ts` (`:72`), `graph-day-projection.spec.ts`
+  (`:752`) and `cache-retention-day.spec.ts` (`:1028`, `:1382`) build a fixed
+  count of days back from today and end at today.
+- `storage-community-graph-publication.spec.ts` runs from yesterday to today
+  (`day()` and `today()`, `:48-49`).
+
+The window length is constant in each. The mixed case in
+`storage-graph-history-integration.spec.ts` was different: its v1 evidence starts
+at a fixed past date (2026-09-01, `:111`) while the window end follows the
+calendar.
+
+A scan of the 34 specs under `apps/worker/test/` that create a predecessor or
+activate a domain found one other fixed past start:
+`community-daily-device-dedupe.spec.ts` (`DAY = "2026-08-01"` at `:110`, window
+to today, about 63 days). It does not share the failure:
+
+- It has no analytics drain. Its one bounded loop,
+  `drainCommunityPublicSourceBootstrap` (4 pages of 32 days, in
+  `rebuildAndReadDay`), returned `completed` on its first call in each of the 10
+  cases that reach it, measured with a temporary probe that was reverted before
+  the commit.
+- What does grow is the staging cost, one staged day per calendar day. The
+  slowest of its 21 cases takes 1.6 s today against the default 5 s test timeout
+  (`vitest.config.ts` sets no `testTimeout`). The headroom beyond today was not
+  measured. The spec is green, so this stream left it alone; anchoring `DAY`
+  relative to today, or bounding the staged window, is a follow-up for whoever
+  next touches that spec.
+
+The other 32 specs use single-day windows, which the rule above forces to equal
+today, windows that start at a today-relative day, or pass a pinned clock to the
+predecessor (`telemetry-v12-transport.spec.ts`). The `postgres-test/` fixtures
+that activate a domain were not re-audited for this.
 
 ## (b) typed-v12-normalized, `PG_TEST_HOST` profile
 
@@ -144,6 +188,8 @@ All commands ran in `fp/T-REDTESTS`. Every result is local and synthetic.
 | The same case with the bound at `days.length - 5` | fails on the new assertion, as intended (restored) |
 | `vitest run` on `storage-erasure`, `graph-day-fold-integration`, `graph-day-projection`, `storage-community-graph-publication`, `cache-retention-day` | 5 files, 163/163 |
 | `PG_TEST_HOST=<fan-out socket> PG_TEST_PORT=55433 node --test postgres-test/typed-v12-normalized.spec.mjs` | 1/1 (failed at the base with `TELEMETRY_REQUIRED`) |
+| `vitest run test/community-daily-device-dedupe.spec.ts` (apps/worker), unmodified | 21/21, slowest case 1.6 s |
+| The same spec with a temporary probe on the bootstrap drain loop | probe only, reverted byte-identical before the commit; the first drain was already `completed` in all 10 cases that reach it |
 | `tsc --noEmit` (apps/worker) | exit 0 |
 | `node --test scripts/ci-postgres-suite.check.mjs` (apps/worker) | 43/43 |
 | `npm run architecture:check` (root) | passed (928 production files, 3,977 imports) |
