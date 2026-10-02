@@ -31,14 +31,35 @@
  * finding and a blocker that refuses the whole plan until the owner decides.
  *
  * Scheduler trigger state is part of the desired state (PAUSED until OPS-3
- * resumes it). Readback reads it; a trigger that runs while PAUSED is desired
- * is a SCHEDULER_TRIGGER_ENABLED:<job> finding, and the plan pauses it, so a
+ * resumes it). A plan creates a trigger and pauses it immediately, and binds
+ * the scheduler account's run.jobsExecutor on the job only after that pause
+ * (assertTriggersCreatedPaused refuses any other order), so a trigger whose
+ * pause failed is ENABLED but cannot start the job. Readback reads the state;
+ * a trigger that runs while PAUSED is desired is a
+ * SCHEDULER_TRIGGER_ENABLED:<job> finding, and the plan pauses it, so a
  * create whose pause failed is paused by the next apply rather than reported
- * as converged (until then it runs, and OPS-10's require-clean preflight
- * refuses the estate). Apply never resumes: a paused trigger whose desired
- * state is ENABLED is a deferred resume (SCHEDULER_TRIGGER_RESUME_PENDING)
- * for OPS-3.
- * A state readback does not recognize is a blocker.
+ * as converged (meanwhile OPS-10's require-clean preflight refuses the
+ * estate). Apply never resumes: a paused trigger whose desired state is
+ * ENABLED is a deferred resume (SCHEDULER_TRIGGER_RESUME_PENDING) for OPS-3.
+ * A state readback does not recognize is a blocker. probeScheduler is the
+ * paused-too-long signal: a resumed trigger left PAUSED past the threshold.
+ *
+ * The verifier account carries the operator's
+ * roles/iam.serviceAccountTokenCreator grant (OD-CR-7), read with
+ * `iam service-accounts get-iam-policy` and bound with
+ * `iam service-accounts add-iam-policy-binding`. Until the desired state
+ * names the operator the grant is a deferral that keeps the estate unclean,
+ * and any grant of an impersonation role on the verifier account's own
+ * policy that it does not name is a delete apply refuses. Grants that reach
+ * the verifier from above it are not read: an impersonation role held on the
+ * project policy (readback keeps only the plane's own and public members
+ * there), on a folder or the organization, or through a basic or custom role.
+ *
+ * In a shared project (projectTenancy 'shared', the staging plane in the GCP
+ * test project) readback keeps only the plane's own instances, services,
+ * jobs and triggers, so co-tenant resources are never planned for deletion,
+ * and it neither reads nor plans the project-wide logging and Data Access
+ * audit settings.
  *
  * infrastructureCleanliness(plan) is OPS-10's `readback --require-clean`
  * verdict: clean only with no finding, no blocker, nothing executable, nothing
@@ -75,8 +96,10 @@ import {
   SCHEDULER_OAUTH_SCOPE,
   SCHEDULER_TIME_ZONE,
   SCHEDULER_TRIGGER_STATES,
+  SCHEDULER_PAUSE_ALERT_THRESHOLD_HOURS,
   SECRET_ACCESSOR_ROLE,
   SERVICE_ACCOUNT_ROLES,
+  TOKEN_CREATOR_ROLE,
   backupConfiguration,
   cloudSqlCreateArgs,
   databaseFlags,
@@ -90,6 +113,7 @@ import {
   renderJob,
   renderService,
   schedulerFlags,
+  serviceRenderBlocker,
   sha256Hex,
 } from "./gcp-ops-infra-manifest.mjs";
 
@@ -100,6 +124,7 @@ export const GCP_OPS_INFRA_APPLY_SCHEMA = "tibotattle-gcp-ops-infra-apply-v1";
 /** gcloud command shapes readback may issue (always with --format=json). */
 export const READ_COMMANDS = Object.freeze([
   "iam service-accounts list",
+  "iam service-accounts get-iam-policy",
   "iam roles list",
   "iam roles describe",
   "projects get-iam-policy",
@@ -124,6 +149,7 @@ export const READ_COMMANDS = Object.freeze([
 /** gcloud command shapes only an authorized apply may issue. None deletes. */
 export const MUTATING_COMMANDS = Object.freeze([
   "iam service-accounts create",
+  "iam service-accounts add-iam-policy-binding",
   "iam roles create",
   "iam roles update",
   "projects add-iam-policy-binding",
@@ -155,11 +181,15 @@ export const SCHEDULER_LIVE_STATES = Object.freeze(["ENABLED", "PAUSED", "DISABL
 export const CUSTOM_ROLE_STAGES = Object.freeze(["ALPHA", "BETA", "GA", "DEPRECATED", "DISABLED", "EAP"]);
 /** The deferred resume of a paused trigger whose desired state is ENABLED (OPS-3 resumes). */
 export const SCHEDULER_RESUME_DEFERRAL = "SCHEDULER_TRIGGER_RESUME_PENDING";
+/** The operator's token-creator grant while the desired state names no operator (not clean). */
+export const VERIFIER_TOKEN_CREATOR_DEFERRAL = "VERIFIER_TOKEN_CREATOR_UNASSIGNED";
 /**
  * Deferrals that leave the estate clean for OPS-10: an owner decision not yet
  * made (the D3 cadence), a job DEFERRED_JOBS names, and a resume OPS-3 owns.
  * Every other deferral (a bootstrap image, a secret version, an unrecognized
- * live image) means the estate is not yet what the desired state describes.
+ * live image, the verifier's unnamed operator, a service template or
+ * telemetry namespace not yet available) means the estate is not yet what
+ * the desired state describes.
  */
 export const CLEAN_DEFERRALS = Object.freeze([
   "SCHEDULER_CADENCE_UNSET",
@@ -441,15 +471,32 @@ function schedulerView(job) {
 }
 
 /**
+ * Roles on the verifier account that let a principal act as it or mint its
+ * tokens. Every binding of one on the verifier account's own policy is
+ * managed: the committed tokenCreators are the whole set there, so a
+ * hand-made grant on that policy is a delete apply refuses. The same roles
+ * held on the project, a folder or the organization are not read.
+ */
+export const VERIFIER_IMPERSONATION_ROLES = Object.freeze([
+  TOKEN_CREATOR_ROLE, "roles/iam.serviceAccountOpenIdTokenCreator", "roles/iam.serviceAccountUser",
+]);
+
+/**
  * Reads the live estate. Only describe, get-iam-policy and list calls are
  * made, each through the guard in read mode; the result holds no secret value
- * and no payload, only the managed fields of each resource.
+ * and no payload, only the managed fields of each resource. In a shared
+ * project, co-tenant resources are not read into the result and project-wide
+ * logging settings are not read at all.
  */
 export function readbackInfrastructure(desired, { runner = defaultGcloudRunner } = {}) {
   const call = guardedGcloud(runner, { mode: "read", project: desired.project });
   const project = `--project=${desired.project}`;
   const region = desired.region;
   const json = "--format=json";
+  const dedicated = desired.projectTenancy === "dedicated";
+  // In a dedicated project every name is the plane's concern; in a shared
+  // one only the plane's own names are.
+  const planeNames = (names, managed) => (dedicated ? names : names.filter((name) => managed.includes(name)));
   const managedMembers = new Set(SERVICE_ACCOUNT_ROLES
     .map((role) => desired.serviceAccounts[role]?.member).filter(Boolean));
   const managedBindings = (policy, what) => policyBindings(policy, what)
@@ -462,6 +509,16 @@ export function readbackInfrastructure(desired, { runner = defaultGcloudRunner }
     if (account === null) continue;
     const live = accounts.find((entry) => isRecord(entry) && entry.email === account.email);
     serviceAccounts[role] = live === undefined ? null : { disabled: live.disabled === true };
+  }
+
+  // The operator's token-creator grant lives on the verifier account itself.
+  const verifier = desired.serviceAccounts.verifier;
+  let verifierPolicy = null;
+  if (verifier !== null && serviceAccounts.verifier !== null) {
+    const creators = new Set(verifier.tokenCreators ?? []);
+    verifierPolicy = policyBindings(call(["iam", "service-accounts", "get-iam-policy", verifier.email, project, json]),
+      "verifier-policy").filter((binding) => VERIFIER_IMPERSONATION_ROLES.includes(binding.role)
+      || managedMembers.has(binding.member) || creators.has(binding.member) || isPublicMember(binding.member));
   }
 
   const roles = array(call(["iam", "roles", "list", project, "--show-deleted", json]), "roles");
@@ -479,7 +536,8 @@ export function readbackInfrastructure(desired, { runner = defaultGcloudRunner }
 
   const projectPolicy = call(["projects", "get-iam-policy", desired.project, project, json]);
   const auditConfigs = Array.isArray(projectPolicy?.auditConfigs) ? projectPolicy.auditConfigs : [];
-  const dataAccessAudit = auditConfigs
+  // Project-wide: managed only in a dedicated project.
+  const dataAccessAudit = !dedicated ? null : auditConfigs
     .filter((config) => isRecord(config)
       && ["allServices", ...LOGGING_POSTURE.dataAccessAuditOffServices].includes(config.service))
     .flatMap((config) => (Array.isArray(config.auditLogConfigs) ? config.auditLogConfigs : [])
@@ -503,14 +561,14 @@ export function readbackInfrastructure(desired, { runner = defaultGcloudRunner }
 
   const secretList = array(call(["secrets", "list", project, json]), "secrets");
   const secrets = {};
-  for (const name of Object.keys(desired.secrets)) {
-    const entry = secretList.find((secret) => isRecord(secret) && tail(secret.name) === name);
+  for (const [name, { secretName }] of Object.entries(desired.secrets)) {
+    const entry = secretList.find((secret) => isRecord(secret) && tail(secret.name) === secretName);
     if (entry === undefined) {
       secrets[name] = null;
       continue;
     }
     const replicas = entry.replication?.userManaged?.replicas;
-    const versions = array(call(["secrets", "versions", "list", name, project, json]), "secret-versions");
+    const versions = array(call(["secrets", "versions", "list", secretName, project, json]), "secret-versions");
     secrets[name] = {
       replication: Array.isArray(replicas)
         ? `user-managed:${replicas.map((replica) => replica?.location).sort().join(",")}`
@@ -518,12 +576,13 @@ export function readbackInfrastructure(desired, { runner = defaultGcloudRunner }
       versions: Object.fromEntries(versions.filter(isRecord)
         .map((version) => [tail(version.name), version.state ?? "UNKNOWN"])
         .sort(([left], [right]) => left.localeCompare(right))),
-      bindings: managedBindings(call(["secrets", "get-iam-policy", name, project, json]), "secret-policy"),
+      bindings: managedBindings(call(["secrets", "get-iam-policy", secretName, project, json]), "secret-policy"),
     };
   }
 
   const instances = array(call(["sql", "instances", "list", project, json]), "sql-instances");
-  const instanceNames = instances.map((instance) => instance?.name).filter((name) => typeof name === "string").sort();
+  const instanceNames = planeNames(instances.map((instance) => instance?.name)
+    .filter((name) => typeof name === "string").sort(), [desired.cloudSql.instance]);
   const instanceEntry = instances.find((instance) => instance?.name === desired.cloudSql.instance);
   let cloudSql = null;
   if (instanceEntry !== undefined) {
@@ -550,19 +609,23 @@ export function readbackInfrastructure(desired, { runner = defaultGcloudRunner }
     };
   }
 
-  const sink = call(["logging", "sinks", "describe", "_Default", project, json]);
-  if (!isRecord(sink)) outputInvalid("logging-sink");
-  const exclusion = (Array.isArray(sink.exclusions) ? sink.exclusions : [])
-    .find((entry) => entry?.name === LOGGING_POSTURE.exclusionName);
-  const logBucket = call(["logging", "buckets", "describe", "_Default", "--location=global", project, json]);
-  if (!isRecord(logBucket)) outputInvalid("logging-bucket");
-  const logging = {
-    exclusion: exclusion === undefined ? null : { filter: exclusion.filter ?? null, disabled: exclusion.disabled === true },
-    retentionDays: Number(logBucket.retentionDays ?? 30),
-  };
+  let logging = null;
+  if (dedicated) {
+    const sink = call(["logging", "sinks", "describe", "_Default", project, json]);
+    if (!isRecord(sink)) outputInvalid("logging-sink");
+    const exclusion = (Array.isArray(sink.exclusions) ? sink.exclusions : [])
+      .find((entry) => entry?.name === LOGGING_POSTURE.exclusionName);
+    const logBucket = call(["logging", "buckets", "describe", "_Default", "--location=global", project, json]);
+    if (!isRecord(logBucket)) outputInvalid("logging-bucket");
+    logging = {
+      exclusion: exclusion === undefined ? null : { filter: exclusion.filter ?? null, disabled: exclusion.disabled === true },
+      retentionDays: Number(logBucket.retentionDays ?? 30),
+    };
+  }
 
   const services = array(call(["run", "services", "list", project, `--region=${region}`, json]), "run-services");
-  const serviceNames = services.map((entry) => entry?.metadata?.name).filter((name) => typeof name === "string").sort();
+  const serviceNames = planeNames(services.map((entry) => entry?.metadata?.name)
+    .filter((name) => typeof name === "string").sort(), [desired.service.name]);
   const serviceEntry = services.find((entry) => entry?.metadata?.name === desired.service.name);
   let service = null;
   if (serviceEntry !== undefined) {
@@ -576,7 +639,8 @@ export function readbackInfrastructure(desired, { runner = defaultGcloudRunner }
   }
 
   const jobList = array(call(["run", "jobs", "list", project, `--region=${region}`, json]), "run-jobs");
-  const jobNames = jobList.map((entry) => entry?.metadata?.name).filter((name) => typeof name === "string").sort();
+  const jobNames = planeNames(jobList.map((entry) => entry?.metadata?.name)
+    .filter((name) => typeof name === "string").sort(), JOB_NAMES.map((job) => desired.jobs[job].name));
   const jobs = {};
   for (const job of JOB_NAMES) {
     const entry = jobList.find((item) => item?.metadata?.name === desired.jobs[job].name);
@@ -594,7 +658,8 @@ export function readbackInfrastructure(desired, { runner = defaultGcloudRunner }
   }
 
   const triggers = array(call(["scheduler", "jobs", "list", project, `--location=${region}`, json]), "scheduler-jobs");
-  const triggerNames = triggers.map((entry) => tail(entry?.name)).filter((name) => typeof name === "string").sort();
+  const triggerNames = planeNames(triggers.map((entry) => tail(entry?.name))
+    .filter((name) => typeof name === "string").sort(), SCHEDULED_JOB_NAMES.map((job) => desired.scheduler[job].name));
   const scheduler = {};
   for (const job of SCHEDULED_JOB_NAMES) {
     const entry = triggers.find((item) => tail(item?.name) === desired.scheduler[job].name);
@@ -630,14 +695,17 @@ export function readbackInfrastructure(desired, { runner = defaultGcloudRunner }
     }
   }
   if (instanceNames.some((name) => name !== desired.cloudSql.instance)) findings.push("CLOUD_SQL_SECOND_INSTANCE");
-  if (dataAccessAudit.length > 0) findings.push("DATA_ACCESS_AUDIT_ENABLED");
+  if (dataAccessAudit !== null && dataAccessAudit.length > 0) findings.push("DATA_ACCESS_AUDIT_ENABLED");
+  if (verifierPolicy?.some((binding) => isPublicMember(binding.member))) findings.push("VERIFIER_POLICY_PUBLIC_MEMBER");
 
   return deepFreeze({
     schema: GCP_OPS_INFRA_READBACK_SCHEMA,
     project: desired.project,
     region,
+    projectTenancy: desired.projectTenancy,
     observed: {
       serviceAccounts,
+      verifierPolicy,
       customRole,
       projectBindings: managedBindings(projectPolicy, "project-policy"),
       dataAccessAudit,
@@ -716,6 +784,38 @@ function serviceAccountOperations(desired, observed, blockers) {
   return operations;
 }
 
+/**
+ * The operator's roles/iam.serviceAccountTokenCreator grant on the verifier
+ * account (OD-CR-7), and no other impersonation grant on that account's own
+ * policy. Deferred until the desired state names the operator; a live
+ * impersonation grant on that policy the desired state does not name is a
+ * delete apply refuses. Inherited grants (project, folder, organization) are
+ * outside this check.
+ */
+function verifierIamOperations(desired, observed) {
+  const verifier = desired.serviceAccounts.verifier;
+  if (verifier === null) return [];
+  const project = `--project=${desired.project}`;
+  const add = (binding) => ["iam", "service-accounts", "add-iam-policy-binding", verifier.email, project,
+    `--member=${binding.member}`, `--role=${binding.role}`];
+  const remove = (binding) => ["iam", "service-accounts", "remove-iam-policy-binding", verifier.email, project,
+    `--member=${binding.member}`, `--role=${binding.role}`];
+  const live = observed.verifierPolicy;
+  if (verifier.tokenCreators === null) {
+    return [
+      operation("verifier-iam:token-creator", "bind", ["iam", "service-accounts", "add-iam-policy-binding",
+        verifier.email, project, `--role=${TOKEN_CREATOR_ROLE}`], { deferred: VERIFIER_TOKEN_CREATOR_DEFERRAL }),
+      ...(live === null ? [] : bindingOperations("verifier-iam", [], live, add, remove)),
+    ];
+  }
+  const desiredBindings = verifier.tokenCreators.map((member) => ({ role: TOKEN_CREATOR_ROLE, member, condition: null }));
+  // An account this plan creates has no policy yet: bind after its create.
+  if (live === null) {
+    return desiredBindings.map((binding) => operation(`verifier-iam:bind:${bindingId(binding)}`, "bind", add(binding)));
+  }
+  return bindingOperations("verifier-iam", desiredBindings, live, add, remove);
+}
+
 function customRoleOperations(desired, observed, blockers) {
   const role = desired.customRole;
   const live = observed.customRole;
@@ -758,7 +858,7 @@ function projectIamOperations(desired, observed) {
       `--member=${binding.member}`, `--role=${binding.role}`, conditionFlag(binding.condition)],
     (binding) => ["projects", "remove-iam-policy-binding", project, `--project=${project}`,
       `--member=${binding.member}`, `--role=${binding.role}`, conditionFlag(binding.condition)]);
-  if (observed.dataAccessAudit.length > 0) {
+  if (observed.dataAccessAudit !== null && observed.dataAccessAudit.length > 0) {
     // Turning Data Access logs off needs a whole-policy replacement, which
     // this tooling never issues; the owner changes the audit config by hand.
     operations.push(operation("audit-config:destructive", "destructive", [
@@ -807,24 +907,25 @@ function secretOperations(desired, observed) {
   const project = `--project=${desired.project}`;
   const operations = [];
   const accessor = { role: SECRET_ACCESSOR_ROLE, member: desired.serviceAccounts.runtime.member, condition: null };
-  for (const name of Object.keys(desired.secrets)) {
+  // Operation ids name the variable; every argv names its Secret Manager id.
+  for (const [name, { secretName }] of Object.entries(desired.secrets)) {
     const live = observed.secrets[name];
-    const add = (binding) => ["secrets", "add-iam-policy-binding", name, project,
+    const add = (binding) => ["secrets", "add-iam-policy-binding", secretName, project,
       `--member=${binding.member}`, `--role=${binding.role}`];
     if (live === null) {
       operations.push(operation(`secret:create:${name}`, "create", [
-        "secrets", "create", name, project, "--replication-policy=user-managed", `--locations=${desired.region}`,
+        "secrets", "create", secretName, project, "--replication-policy=user-managed", `--locations=${desired.region}`,
       ]));
       operations.push(operation(`secret-iam:${name}:bind:${bindingId(accessor)}`, "bind", add(accessor)));
       continue;
     }
     if (live.replication !== `user-managed:${desired.region}`) {
       operations.push(operation(`secret:destructive:${name}`, "destructive", [
-        "secrets", "delete", name, project,
+        "secrets", "delete", secretName, project,
       ], { reason: "replication" }));
     }
     operations.push(...bindingOperations(`secret-iam:${name}`, [accessor], live.bindings, add,
-      (binding) => ["secrets", "remove-iam-policy-binding", name, project,
+      (binding) => ["secrets", "remove-iam-policy-binding", secretName, project,
         `--member=${binding.member}`, `--role=${binding.role}`]));
   }
   return operations;
@@ -985,6 +1086,8 @@ function bucketOperations(desired, observed, blockers) {
 }
 
 function loggingOperations(desired, observed) {
+  // Project-wide settings: a shared project's are not this plane's to change.
+  if (observed.logging === null) return [];
   const project = `--project=${desired.project}`;
   const operations = [];
   const exclusion = observed.logging.exclusion;
@@ -1041,7 +1144,7 @@ function serviceOperations(desired, observed, bootstrap, usage) {
   const live = observed.service.managed;
   const replaceArgv = ["run", "services", "replace", FILE_PLACEHOLDER, project, region];
   const image = runImage(live, bootstrap, "SERVICE");
-  const deferral = image.deferred ?? serviceDeferral(desired, observed);
+  const deferral = serviceRenderBlocker(desired) ?? image.deferred ?? serviceDeferral(desired, observed);
   if (live === null) usage.bootstrap = true;
   if (deferral !== null) {
     if (live === null) operations.push(operation("run-service:create", "create", replaceArgv, { deferred: deferral }));
@@ -1080,7 +1183,12 @@ function serviceOperations(desired, observed, bootstrap, usage) {
   return operations;
 }
 
-function jobOperations(desired, observed, bootstrap, usage, jobDeferrals) {
+/**
+ * The Cloud Run Jobs, and their IAM. A scheduled job's run.jobsExecutor
+ * binds for the scheduler account are returned apart (executorBinds), for
+ * the scheduler family to issue after its trigger's create and pause.
+ */
+function jobOperations(desired, observed, bootstrap, usage, jobDeferrals, executorBinds) {
   const project = `--project=${desired.project}`;
   const region = `--region=${desired.region}`;
   const operations = [];
@@ -1114,21 +1222,23 @@ function jobOperations(desired, observed, bootstrap, usage, jobDeferrals) {
       : [];
     const add = (binding) => ["run", "jobs", "add-iam-policy-binding", desired.jobs[job].name, project, region,
       `--member=${binding.member}`, `--role=${binding.role}`];
-    if (live === null) {
-      for (const binding of desiredBindings) {
-        operations.push(operation(`run-job-iam:${job}:bind:${bindingId(binding)}`, "bind", add(binding),
-          image.deferred === undefined ? {} : { deferred: image.deferred }));
-      }
-    } else {
-      operations.push(...bindingOperations(`run-job-iam:${job}`, desiredBindings, live.bindings, add,
+    const iam = live === null
+      ? desiredBindings.map((binding) => operation(`run-job-iam:${job}:bind:${bindingId(binding)}`, "bind", add(binding),
+        image.deferred === undefined ? {} : { deferred: image.deferred }))
+      : bindingOperations(`run-job-iam:${job}`, desiredBindings, live.bindings, add,
         (binding) => ["run", "jobs", "remove-iam-policy-binding", desired.jobs[job].name, project, region,
-          `--member=${binding.member}`, `--role=${binding.role}`]));
+          `--member=${binding.member}`, `--role=${binding.role}`]);
+    if (SCHEDULED_JOB_NAMES.includes(job)) {
+      executorBinds[job] = iam.filter((entry) => entry.action === "bind");
+      operations.push(...iam.filter((entry) => entry.action !== "bind"));
+    } else {
+      operations.push(...iam);
     }
   }
   return operations;
 }
 
-function schedulerOperations(desired, observed, blockers, jobDeferrals) {
+function schedulerOperations(desired, observed, blockers, jobDeferrals, executorBinds) {
   const project = `--project=${desired.project}`;
   const location = `--location=${desired.region}`;
   const operations = [];
@@ -1139,65 +1249,92 @@ function schedulerOperations(desired, observed, blockers, jobDeferrals) {
     }
   }
   for (const job of SCHEDULED_JOB_NAMES) {
-    const trigger = desired.scheduler[job];
-    const live = observed.scheduler.managed[job];
-    if (trigger.schedule === null) {
-      // No cadence until the owner supplies one (decision D3): nothing is
-      // created, and a live trigger is drift that only the owner removes.
-      if (live === null) {
-        operations.push(operation(`scheduler:create:${job}`, "create",
-          ["scheduler", "jobs", "create", "http", trigger.name, project, location],
-          { deferred: "SCHEDULER_CADENCE_UNSET" }));
-      } else {
-        operations.push(operation(`scheduler:delete:${trigger.name}`, "delete",
-          ["scheduler", "jobs", "delete", trigger.name, project, location]));
-      }
-      continue;
-    }
-    const flags = schedulerFlags(desired, job);
-    const pause = operation(`scheduler:pause:${job}`, "update",
-      ["scheduler", "jobs", "pause", trigger.name, project, location]);
-    if (live === null) {
-      if (jobDeferrals[job] !== undefined && observed.jobs.managed[job] === null) {
-        // No trigger for a job that is not created.
-        operations.push(operation(`scheduler:create:${job}`, "create",
-          ["scheduler", "jobs", "create", "http", trigger.name, ...flags], { deferred: jobDeferrals[job] }));
-        continue;
-      }
-      // Cloud Scheduler creates a trigger ENABLED; apply pauses it at once and
-      // never resumes it (OPS-3 does). Should the pause fail, readback sees the
-      // ENABLED trigger and the next plan pauses it again.
-      operations.push(operation(`scheduler:create:${job}`, "create",
-        ["scheduler", "jobs", "create", "http", trigger.name, ...flags]));
-      operations.push(pause);
-      continue;
-    }
-    if (!SCHEDULER_TRIGGER_STATES.includes(live.state)) {
-      // DISABLED (by the system), UPDATE_FAILED or unknown: by hand only.
-      blockers.push(`SCHEDULER_TRIGGER_STATE_UNRECOGNIZED:${job}`);
-    } else if (live.state === "ENABLED" && trigger.state === "PAUSED") {
-      operations.push(pause);
-    } else if (live.state === "PAUSED" && trigger.state === "ENABLED") {
-      operations.push(operation(`scheduler:resume:${job}`, "update",
-        ["scheduler", "jobs", "resume", trigger.name, project, location], { deferred: SCHEDULER_RESUME_DEFERRAL }));
-    }
-    const wanted = {
-      name: trigger.name,
-      schedule: trigger.schedule,
-      timeZone: SCHEDULER_TIME_ZONE,
-      uri: jobRunUri(desired, job),
-      httpMethod: "POST",
-      serviceAccountEmail: desired.serviceAccounts.scheduler.email,
-      scope: SCHEDULER_OAUTH_SCOPE,
-      retryCount: 0,
-      overrides: false,
-    };
-    const { state: _state, ...view } = live;
-    if (canonicalJson(wanted) !== canonicalJson(view)) {
-      operations.push(operation(`scheduler:update:${job}`, "update",
-        ["scheduler", "jobs", "update", "http", trigger.name, ...flags]));
-    }
+    operations.push(...triggerOperations(desired, observed, blockers, jobDeferrals, job));
+    // Only now may the scheduler account run the job: a trigger whose pause
+    // failed above is ENABLED but cannot start it.
+    operations.push(...(executorBinds[job] ?? []));
   }
+  return operations;
+}
+
+/** One trigger's operations: create then pause, pause, deferred resume or update. */
+function triggerOperations(desired, observed, blockers, jobDeferrals, job) {
+  const project = `--project=${desired.project}`;
+  const location = `--location=${desired.region}`;
+  const trigger = desired.scheduler[job];
+  const live = observed.scheduler.managed[job];
+  if (trigger.schedule === null) {
+    // No cadence until the owner supplies one (decision D3): nothing is
+    // created, and a live trigger is drift that only the owner removes.
+    return [live === null
+      ? operation(`scheduler:create:${job}`, "create", ["scheduler", "jobs", "create", "http", trigger.name, project,
+        location], { deferred: "SCHEDULER_CADENCE_UNSET" })
+      : operation(`scheduler:delete:${trigger.name}`, "delete", ["scheduler", "jobs", "delete", trigger.name, project,
+        location])];
+  }
+  const flags = schedulerFlags(desired, job);
+  const pause = operation(`scheduler:pause:${job}`, "update",
+    ["scheduler", "jobs", "pause", trigger.name, project, location]);
+  if (live === null) {
+    if (jobDeferrals[job] !== undefined && observed.jobs.managed[job] === null) {
+      // No trigger for a job that is not created.
+      return [operation(`scheduler:create:${job}`, "create",
+        ["scheduler", "jobs", "create", "http", trigger.name, ...flags], { deferred: jobDeferrals[job] })];
+    }
+    // Cloud Scheduler creates a trigger ENABLED; apply pauses it at once,
+    // whatever the desired state, and never resumes it (OPS-3 does). Should
+    // the pause fail, readback sees the ENABLED trigger and the next plan
+    // pauses it again; meanwhile it cannot start the job, because the
+    // scheduler account's run.jobsExecutor is bound only after this pause.
+    return [operation(`scheduler:create:${job}`, "create",
+      ["scheduler", "jobs", "create", "http", trigger.name, ...flags]), pause];
+  }
+  const operations = [];
+  if (!SCHEDULER_TRIGGER_STATES.includes(live.state)) {
+    // DISABLED (by the system), UPDATE_FAILED or unknown: by hand only.
+    blockers.push(`SCHEDULER_TRIGGER_STATE_UNRECOGNIZED:${job}`);
+  } else if (live.state === "ENABLED" && trigger.state === "PAUSED") {
+    operations.push(pause);
+  } else if (live.state === "PAUSED" && trigger.state === "ENABLED") {
+    operations.push(operation(`scheduler:resume:${job}`, "update",
+      ["scheduler", "jobs", "resume", trigger.name, project, location], { deferred: SCHEDULER_RESUME_DEFERRAL }));
+  }
+  const wanted = {
+    name: trigger.name,
+    schedule: trigger.schedule,
+    timeZone: SCHEDULER_TIME_ZONE,
+    uri: jobRunUri(desired, job),
+    httpMethod: "POST",
+    serviceAccountEmail: desired.serviceAccounts.scheduler.email,
+    scope: SCHEDULER_OAUTH_SCOPE,
+    retryCount: 0,
+    overrides: false,
+  };
+  const { state: _state, ...view } = live;
+  if (canonicalJson(wanted) !== canonicalJson(view)) {
+    operations.push(operation(`scheduler:update:${job}`, "update",
+      ["scheduler", "jobs", "update", "http", trigger.name, ...flags]));
+  }
+  return operations;
+}
+
+/**
+ * The trigger state model as a plan invariant: every executable trigger
+ * create is immediately followed by that trigger's executable pause, and no
+ * run.jobsExecutor bind for a scheduled job precedes it. Anything else is
+ * refused (SCHEDULER_CREATE_NOT_PAUSED) before a plan is returned.
+ */
+export function assertTriggersCreatedPaused(operations) {
+  operations.forEach((entry, index) => {
+    if (entry.deferred !== undefined || !/^scheduler:create:/u.test(entry.id)) return;
+    const job = entry.id.slice("scheduler:create:".length);
+    const next = operations[index + 1];
+    if (next?.id !== `scheduler:pause:${job}` || next.deferred !== undefined) fail("SCHEDULER_CREATE_NOT_PAUSED");
+    if (operations.slice(0, index).some((earlier) => earlier.deferred === undefined
+        && earlier.id.startsWith(`run-job-iam:${job}:bind:`))) {
+      fail("SCHEDULER_CREATE_NOT_PAUSED");
+    }
+  });
   return operations;
 }
 
@@ -1262,8 +1399,10 @@ export function planInfrastructure(desired, readback, { bootstrap: rawBootstrap,
   const observed = readback.observed;
   const blockers = [];
   const usage = { bootstrap: false };
+  const executorBinds = {};
   const operations = [
     ...serviceAccountOperations(desired, observed, blockers),
+    ...verifierIamOperations(desired, observed),
     ...customRoleOperations(desired, observed, blockers),
     ...projectIamOperations(desired, observed),
     ...repositoryOperations(desired, observed),
@@ -1272,9 +1411,10 @@ export function planInfrastructure(desired, readback, { bootstrap: rawBootstrap,
     ...bucketOperations(desired, observed, blockers),
     ...loggingOperations(desired, observed),
     ...serviceOperations(desired, observed, bootstrap, usage),
-    ...jobOperations(desired, observed, bootstrap, usage, jobDeferrals),
-    ...schedulerOperations(desired, observed, blockers, jobDeferrals),
+    ...jobOperations(desired, observed, bootstrap, usage, jobDeferrals, executorBinds),
+    ...schedulerOperations(desired, observed, blockers, jobDeferrals, executorBinds),
   ];
+  assertTriggersCreatedPaused(operations);
   if (bootstrap !== null && !usage.bootstrap) fail("BOOTSTRAP_IMAGE_UNUSED");
   if (desired.bucket.proof === null) blockers.push("BUCKET_PROOF_UNPINNED");
   const ids = operations.map((entry) => entry.id);
@@ -1400,5 +1540,84 @@ export function applyInfrastructure(desired, {
       deferred: after.summary.deferred,
       refused: after.summary.refused,
     },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler probe: the paused-too-long signal
+
+export const GCP_OPS_INFRA_SCHEDULER_PROBE_SCHEMA = "tibotattle-gcp-ops-infra-scheduler-probe-v1";
+/** The probe's verdicts; those in SCHEDULER_PROBE_ALERTS raise the signal. */
+export const SCHEDULER_PROBE_VERDICTS = Object.freeze([
+  "running", "paused_as_desired", "paused_within_threshold", "paused_too_long", "paused_evidence_unavailable",
+  "absent", "absent_not_created", "state_unrecognized",
+]);
+export const SCHEDULER_PROBE_ALERTS = Object.freeze([
+  "paused_too_long", "paused_evidence_unavailable", "absent", "state_unrecognized",
+]);
+const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/u;
+
+function instantMs(value) {
+  if (typeof value !== "string" || !RFC3339.test(value)) return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * One trigger's verdict. A trigger whose desired state is ENABLED (OPS-3 has
+ * resumed it) and that is live PAUSED raises the signal once neither a user
+ * change (pause, resume or update) nor an attempt is newer than the
+ * threshold; with no usable timestamp it raises paused_evidence_unavailable
+ * rather than guessing. A trigger desired PAUSED (before OPS-3 resumes it)
+ * is paused by design. `live` is the Cloud Scheduler job, or null.
+ */
+export function schedulerPauseVerdict({ desiredState, live, nowMs,
+  thresholdHours = SCHEDULER_PAUSE_ALERT_THRESHOLD_HOURS }) {
+  if (!SCHEDULER_TRIGGER_STATES.includes(desiredState) || !Number.isSafeInteger(nowMs) || nowMs < 0
+      || !Number.isSafeInteger(thresholdHours) || thresholdHours < 1 || thresholdHours > 168) {
+    fail("SCHEDULER_PROBE_INPUT_INVALID");
+  }
+  const result = (liveState, verdict, quietMinutes = null) => Object.freeze({
+    liveState, quietMinutes, verdict, alert: SCHEDULER_PROBE_ALERTS.includes(verdict),
+  });
+  if (live === null || live === undefined) return result(null, desiredState === "ENABLED" ? "absent" : "absent_not_created");
+  const state = SCHEDULER_LIVE_STATES.includes(live.state) ? live.state : "UNRECOGNIZED";
+  if (state === "ENABLED") return result(state, "running");
+  if (state !== "PAUSED") return result(state, "state_unrecognized");
+  if (desiredState === "PAUSED") return result(state, "paused_as_desired");
+  const instants = [live.userUpdateTime, live.lastAttemptTime].map(instantMs).filter((ms) => ms !== null);
+  const latest = instants.length === 0 ? null : Math.max(...instants);
+  if (latest === null || latest > nowMs) return result(state, "paused_evidence_unavailable");
+  const quietMinutes = Math.floor((nowMs - latest) / 60_000);
+  return result(state, quietMinutes >= thresholdHours * 60 ? "paused_too_long" : "paused_within_threshold", quietMinutes);
+}
+
+/**
+ * The scheduler probe: one read call (the location's scheduler jobs, through
+ * the read guard) and a content-free verdict per managed trigger. `alert` is
+ * true when any trigger raises the signal; the CLI then exits 2, so any
+ * periodic runner can alert on the exit code.
+ */
+export function probeScheduler(desired, { runner = defaultGcloudRunner, now = () => Date.now(),
+  thresholdHours = SCHEDULER_PAUSE_ALERT_THRESHOLD_HOURS } = {}) {
+  const call = guardedGcloud(runner, { mode: "read", project: desired.project });
+  const triggers = array(call(["scheduler", "jobs", "list", `--project=${desired.project}`,
+    `--location=${desired.region}`, "--format=json"]), "scheduler-jobs");
+  const nowMs = now();
+  const results = SCHEDULED_JOB_NAMES.map((job) => {
+    const name = desired.scheduler[job].name;
+    const live = triggers.find((entry) => isRecord(entry) && tail(entry.name) === name) ?? null;
+    return Object.freeze({ job, name, desiredState: desired.scheduler[job].state,
+      ...schedulerPauseVerdict({ desiredState: desired.scheduler[job].state, live, nowMs, thresholdHours }) });
+  });
+  return deepFreeze({
+    schema: GCP_OPS_INFRA_SCHEDULER_PROBE_SCHEMA,
+    environment: desired.environment,
+    project: desired.project,
+    checkedAt: new Date(nowMs).toISOString(),
+    thresholdHours,
+    triggers: results,
+    alert: results.some((entry) => entry.alert),
+    signal: results.some((entry) => entry.verdict === "paused_too_long") ? "SCHEDULER_TRIGGER_PAUSED_TOO_LONG" : null,
   });
 }

@@ -4,7 +4,8 @@
  * Build the audited Cloud Run host context. The host is a Node composition
  * root around the existing Worker handlers; it must never be built from the
  * dirty repository root. Only the host, Worker source, the vendored d43c8f92
- * analytics kernels and the analytics-refresh Job, canonical migrations,
+ * analytics kernels and the analytics-refresh Job, the MP-2-lite maintenance
+ * Job and the production configuration it reads, canonical migrations,
  * migration runner, the shared runtime-grant policy and the production
  * migration Job, the private daily publication Job and verifier, their
  * shared receipt contract, test-only activation and independent restore
@@ -134,6 +135,10 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/owner-bootstrap.mjs", destination: "apps/worker/cloud-run/owner-bootstrap.mjs" }),
   Object.freeze({ source: "cloud-run/request-boundary.mjs", destination: "apps/worker/cloud-run/request-boundary.mjs" }),
   Object.freeze({ source: "cloud-run/analytics-refresh.mjs", destination: "apps/worker/cloud-run/analytics-refresh.mjs" }),
+  // The MP-2-lite maintenance Job and the production configuration it reads.
+  Object.freeze({ source: "cloud-run/postgres-maintenance-job.mjs", destination: "apps/worker/cloud-run/postgres-maintenance-job.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-maintenance-job.check.mjs", destination: "apps/worker/cloud-run/postgres-maintenance-job.check.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-production-configuration.mjs", destination: "apps/worker/cloud-run/postgres-production-configuration.mjs" }),
   Object.freeze({ source: "src", destination: "apps/worker/src" }),
   // The d43c8f92 analytics kernels and their vendored packages; the
   // analytics-refresh entry and the community-daily route bundle them.

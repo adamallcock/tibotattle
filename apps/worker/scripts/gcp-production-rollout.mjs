@@ -46,10 +46,13 @@
  *
  * The environment's resources come from the infrastructure manifest
  * (scripts/gcp-ops-infra-manifest.mjs, OPS-2): its rolloutTarget(environment)
- * returns the closed RolloutTarget below, whose jobNames are the manifest's
- * JOB_NAMES for that environment, less the jobs it defers. A missing module,
- * or a manifest refusal (an unconfigured, unreadable, synthetic or
- * verifier-less desired state), refuses every verb with
+ * reads that environment's committed desired state
+ * (cloud-run/infra/<env>.desired-state.json) and returns the closed
+ * RolloutTarget below, whose jobNames are the manifest's JOB_NAMES for that
+ * environment, less the jobs it defers. A missing module, or a manifest
+ * refusal (an owner placeholder still unfilled, an unreadable, synthetic or
+ * verifier-less desired state, or no operator named for the verifier's
+ * token-creator grant), refuses every verb with
  * ROLLOUT_INFRA_MANIFEST_UNAVAILABLE.
  *
  * Output and errors are content-free: names, digests, commits and closed codes.
@@ -323,7 +326,7 @@ export function validateRolloutTarget(target, environment) {
   return deepFreeze(structuredClone(target));
 }
 
-/** The default target source: the OPS-2 infrastructure manifest. */
+/** The default target source: the OPS-2 infrastructure manifest's committed desired state. */
 export async function loadRolloutTargetFromInfraManifest(environment) {
   let manifest;
   try {

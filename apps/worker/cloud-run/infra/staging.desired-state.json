@@ -1,0 +1,96 @@
+{
+  "schemaVersion": "tibotattle-gcp-ops-infra-desired-state-v2",
+  "environment": "staging",
+  "projectTenancy": "shared",
+  "project": "tibotattle",
+  "projectNumber": "806510610397",
+  "region": "us-east1",
+  "artifactRegistry": {
+    "repository": "tibotattle-staging-images",
+    "imageName": "tibotattle-host"
+  },
+  "serviceAccounts": {
+    "runtime": {
+      "accountId": "tibotattle-staging-runtime",
+      "projectRoles": ["roles/cloudsql.client", "roles/cloudsql.instanceUser"]
+    },
+    "migrator": {
+      "accountId": "tibotattle-staging-migrator",
+      "projectRoles": ["roles/cloudsql.client", "roles/cloudsql.instanceUser"]
+    },
+    "scheduler": {
+      "accountId": "tibotattle-staging-scheduler",
+      "projectRoles": []
+    },
+    "builder": {
+      "accountId": "tibotattle-staging-builder",
+      "projectRoles": ["roles/logging.logWriter"]
+    },
+    "edgeInvoker": {
+      "accountId": "tibotattle-staging-invoker",
+      "projectRoles": []
+    },
+    "verifier": {
+      "accountId": "tibotattle-staging-verifier",
+      "projectRoles": [],
+      "tokenCreators": null
+    }
+  },
+  "customRole": {
+    "id": "tibotattleQuarantineStore",
+    "permissions": [
+      "storage.buckets.get",
+      "storage.objects.create",
+      "storage.objects.delete",
+      "storage.objects.get",
+      "storage.objects.list"
+    ]
+  },
+  "secrets": {
+    "IDENTITY_LINK_SECRET": { "secretName": "tibotattle-staging-identity-link-secret", "version": null },
+    "POSTGRES_RATE_LIMIT_SECRET": { "secretName": "tibotattle-staging-rate-limit-secret", "version": null },
+    "ENVELOPE_PUBLIC_JWK": { "secretName": "tibotattle-staging-envelope-public-jwk", "version": null },
+    "ENVELOPE_PRIVATE_JWK": { "secretName": "tibotattle-staging-envelope-private-jwk", "version": null },
+    "GOOGLE_OIDC_CLIENT_SECRET": { "secretName": "tibotattle-staging-google-oidc-client-secret", "version": null },
+    "APPLE_PRIVATE_KEY": { "secretName": "tibotattle-staging-apple-private-key", "version": null },
+    "DISTRIBUTION_GITHUB_API_TOKEN": { "secretName": "tibotattle-staging-distribution-github-token", "version": null }
+  },
+  "cloudSql": {
+    "instance": "tibotattle-staging-primary",
+    "tier": "db-custom-4-16384",
+    "storageSizeGb": 50,
+    "backupStartTime": "07:00",
+    "maxConnections": 100,
+    "database": "tibotattle_staging",
+    "schema": "tibotattle_staging"
+  },
+  "bucket": {
+    "name": "tibotattle-staging-quarantine",
+    "location": "US-EAST1",
+    "proof": null
+  },
+  "service": {
+    "name": "tibotattle-staging-origin",
+    "maxInstances": 4,
+    "rolloutOverlapInstances": 4,
+    "audience": "tibotattle-staging-edge-origin",
+    "telemetryStorageNamespace": null
+  },
+  "jobs": {
+    "production-migrate": {
+      "name": "tibotattle-staging-migrate",
+      "maxConnections": 1
+    },
+    "analytics-refresh": {
+      "name": "tibotattle-staging-analytics-refresh",
+      "maxConnections": 4
+    }
+  },
+  "scheduler": {
+    "analytics-refresh": {
+      "name": "tibotattle-staging-analytics-refresh-trigger",
+      "schedule": null,
+      "state": "PAUSED"
+    }
+  }
+}
