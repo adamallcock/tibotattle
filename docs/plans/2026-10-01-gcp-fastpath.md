@@ -34,7 +34,8 @@ status: in-progress
   A01 to H07 and X01 to X05 refer to the 2026-09-28 analytics redesign plan on
   the Codex analytics line, which is not on this branch.
 - [Alignment with the OpenAI September 29 release](#alignment-with-the-openai-september-29-release)
-  maps that release's plan, which is on GitHub `main`, to this line. The line
+  maps that release's plan (the release owner's working copy in its Codex
+  worktree and the copy committed on GitHub `main`) to this line. The line
   stays on `d43c8f92` parity until the release reaches Cloudflare production.
 
 ## Source lines
@@ -70,7 +71,7 @@ Recorded read-only by the fast-path analysis at the start of the night:
 | OD-2 | The 2026-09-26 SIMP-0, SIMP-1 and SIMP-4 briefs supersede the 2026-09-27 ones. The integration lead is the only migration-numbering authority (0057 ISO-1, 0058 ISO-2, 0059 analytics_v2; later numbers assigned at landing) | Default taken; no SIMP code tonight |
 | OD-3 | Production-parity eligibility: `community_public_source_owners` as production computes it. The gap from D1 is documented | Default taken |
 | OD-4 | Owner-run, read-only production checks: the correction-runtime row; owner counts by source routing; owners whose 101-day window exceeds 120,000 usage rows | Owner action; Claude does not run production reads |
-| OD-5 | Serve the allowance breakdowns contract that production serves: `community-allowance-breakdowns-v1.1` at `d43c8f92`, and v1.2 once the OpenAI September 29 release is deployed and re-vendored ([alignment](#alignment-with-the-openai-september-29-release)) | Default taken; restated on 2026-10-01 |
+| OD-5 | Serve production's `community-allowance-breakdowns-v1.1` contract. Serving v1.2 after the OpenAI September 29 release is the open OD-OAI-3 ([alignment](#alignment-owner-decisions)) | Default taken |
 | OD-6 | Approve the decision record text | Approved in chat on 2026-09-30 |
 | OD-7 | The D-1 test-project deploy stretch, on new test-only resources only | Relayed to the final integration as owner-approved for the `tibotattle` test project, including seeding `tibotattle_fastpath`. D-1's tooling is merged and checked locally; nothing was deployed or seeded during the integration |
 | OD-8 | Whether v0.1 and v0.2 intake retire at cutover | Open. v1.0 and v1.1 intake are required either way |
@@ -477,36 +478,55 @@ approves that policy.
 
 ## Alignment with the OpenAI September 29 release
 
-This section is a plan written on 2026-10-01 from source inspection only. No
-code on this line changes for the release yet. No test exercised the release
-vocabulary, and nothing ran against GCP, Cloudflare or production.
+This section is a plan written on 2026-10-01 from source inspection and revised
+the same day after review. No code on this line changes for the release yet. No
+test exercised the release vocabulary, and nothing ran against GCP, Cloudflare or
+production.
 
-The release is planned in `docs/plans/2026-09-29-openai-release-update-plan.md`,
-committed on GitHub `main` at `f0067d0f`. It is not on this branch. The release
-owner's working copy is an earlier draft of the same file; `main` adds its
-client PR boundary, client merge qualification and main Worker follow-up
-sections, which do not change the mapping below.
+### Source documents
+
+| Copy | Location and state | Identity |
+|---|---|---|
+| Release owner's working copy | `/Users/adamallcock/.codex/worktrees/bdc9/app-usagemonitor/docs/plans/2026-09-29-openai-release-update-plan.md`, read only. Untracked in a Codex worktree whose `HEAD` is `30c0feb0`. Front matter `status: in-progress`; last modified 2026-09-29 | 596 lines; SHA-256 `fde291926240989d202ec95da6e82a7fa22fd03e8e0c23b49c3197629fe98f66` |
+| Committed copy | `docs/plans/2026-09-29-openai-release-update-plan.md` on GitHub `main` at `f0067d0f`, unchanged at `396204d3` (the local `origin/main` ref as last fetched). Not on this branch | 711 lines; SHA-256 `83ff24cb8464ccf0f5c85293fa57b68465ed805b7202d84e71fc3922141582a5` |
+
+- The two copies differ only in the scope sentence (working-copy lines 14-15)
+  and in three sections the committed copy inserts before working-copy line 30:
+  the client PR boundary, client merge qualification and main Worker follow-up.
+  Those sections record PR history and do not change the mapping, so the
+  mapping covers both copies. Release-plan line numbers below are working-copy
+  numbers; from line 30 on, the committed copy's numbers are 115 higher.
+- Re-check trigger: OAI-2 recomputes both SHA-256 values. If either differs from
+  the values above, the changed sections are re-mapped before any OAI item at P
+  starts. The working copy belongs to the release owner's agent and is never
+  edited from this line.
 
 ### Where the release stands
 
 - GitHub `main` `f0067d0f` holds the client work (PR #257, merged as
   `e5250c86`) and the Worker publications for Pro 10x and Pro Max 25x
-  (PR #258, implemented in `27967a9a` and merged as `f0067d0f`). Draft PR #223
-  (Pro Max 50x) is still open; #258's 25x policy replaces its product
-  assumption.
+  (PR #258, implemented in `27967a9a` and merged as `f0067d0f`). The ten later
+  commits up to `396204d3` change neither the release plan nor any vendored or
+  intake source. Draft PR #223 (Pro Max 50x) is still open; #258's 25x policy
+  replaces its product assumption.
 - Cloudflare production still runs `d43c8f92`. It and `main` diverge at
   `960f75ab`: `main` lacks 48 production commits, production lacks 63 `main`
   commits, and no branch contains both.
-- 26 of the 132 vendored files change in the release: 8 Worker modules, 2 web
-  modules and 16 package files. The release also adds
+- Counted by Git blob over the 132 vendored files, the release itself
+  (`30c0feb0` to `f0067d0f`, PRs #257 and #258) changes 26: 8 Worker modules,
+  2 web modules and 16 package files. It also changes `validation.ts`, the
+  source of one of the three vendored type stubs, and adds
   `packages/quota-analysis/src/included-allowance-speed.js`, which the package
-  rule would vendor. Another 28 vendored files differ only through the
-  divergence, and 11 of those do not exist on `main` at all: the shared
-  analytics reducers, features and input, the effective quota-day and
-  usage-day modules and their storage, `typed-v11-chunk-completeness.ts`,
-  `cache-retention-events.ts`, `storage-community-daily-pending.ts` and
-  `analytics-model-block-contract.ts`. Vendoring `main` would therefore drop
-  production code that the fast path runs.
+  rule would vendor. Another 28 vendored files differ from `main` only through
+  the divergence. They include the three package `package.json` version bumps,
+  which `main` made before the release; counted from the merge base `960f75ab`,
+  the figure is 29. Twelve of the 28 do not exist on `main`: the shared
+  analytics features, input and reducers, `storage-analytics-shared-features.ts`,
+  the effective quota-day and usage-day modules and their storage,
+  `typed-v11-chunk-completeness.ts`, `cache-retention-events.ts`,
+  `storage-community-daily-pending.ts` and `analytics-model-block-contract.ts`.
+  Vendoring `main` would therefore drop production code that the fast path
+  runs.
 
 ### Alignment policy
 
@@ -535,9 +555,21 @@ sections, which do not change the mapping below.
    rows (`:428`, `:1028`), and the usage-feature validator rejects them
    (`:206`). What follows for the owner's day has not been tested; this rule
    avoids depending on it.
-5. At the seal, the vendored source commit equals the Cloudflare production
+5. Readers before writers. GCP intake reads what clients write. At `d43c8f92`
+   parity it refuses any v1.0, v1.1 or v1.2 chunk that carries a `promax` plan
+   (`packages/telemetry-contract/src/telemetry-v1.2.js:140,202`,
+   `telemetry-v1.1.js:99,145`, `apps/worker/src/telemetry-v1.ts:122,253`), as
+   Cloudflare production does today. The GCP origin must therefore run P's
+   intake (OAI-4) before it serves any public client release that sends
+   `promax` (OD-OAI-1). Inside the line, the kernels read what intake admits,
+   which is why item 4 moves them together. Old clients keep working: OAI-4
+   checks that old vocabulary is still admitted.
+6. Membership of a published day never changes for the release. Republication
+   follows the append-only decision (D1): see OAI-5 and OD-OAI-4.
+7. At the seal, the vendored source commit equals the Cloudflare production
    commit. Whether the release can instead ship on GCP after a cutover at
-   `d43c8f92` parity is OD-OAI-1.
+   `d43c8f92` parity is OD-OAI-1. Serving the release's public contract is
+   OD-OAI-3, because OD-5 names v1.1.
 
 ### Mapping of the release plan
 
@@ -556,10 +588,10 @@ Paths are on this branch unless marked `main`.
 
 | Release item | GCP disposition | Evidence |
 |---|---|---|
-| 1. Separate money and allowance | Inherits for analytics: server pricing v0.6 and the new accounting cards arrive with the re-vendor. No hosted consumer applies the allowance speed weights. GCP change: every published day's spend block changes method (OAI-5), and v0.1 intake prices with this line's own server pricing and stores the result (OAI-4) | `main` `apps/worker/src/server-pricing.ts:23`, `packages/accounting/src/price-registry.js:13`, `apps/worker/src/community-daily-spend.ts:8-9`; `apps/worker/src/server-pricing.ts:18`, `apps/worker/src/postgres-legacy-contribution-admission.ts:2023,2041-2062` |
+| 1. Separate money and allowance | Inherits for analytics: server pricing v0.6 and the new accounting cards arrive with the re-vendor. No hosted consumer applies the allowance speed weights. GCP change: every published day's spend block becomes stale, and older days regain current spend only through OAI-5 under OD-OAI-4. v0.1 intake prices with this line's own server pricing and stores the result (OAI-4) | `main` `apps/worker/src/server-pricing.ts:23`, `packages/accounting/src/price-registry.js:13`, `apps/worker/src/community-daily-spend.ts:8-9`; `apps/worker/src/server-pricing.ts:18`, `apps/worker/src/postgres-legacy-contribution-admission.ts:2023,2041-2062` |
 | 2. Ultrafast as a third speed | GCP change for v0.1 intake, whose closed speed and tier lists gain `ultrafast` in the package (OAI-4). v1.0, v1.1 and v1.2 already accept bounded strings. PostgreSQL stores speed and tier as text or dictionary values, so no migration is needed. Analytics inherits. The performance enums are Conditional (OAI-10) | `main` `packages/telemetry-contract/src/telemetry-v0.1.js:201,208`; `apps/worker/postgres/migrations/primary/0011_retained_telemetry.sql:80-81,109-116`, `0025_typed_v12_normalized.sql:5-8`, `0030_legacy_typed_telemetry.sql:265-267` |
-| 3. Keep Pro's identity and change the ratios | GCP change, in one branch: `promax` joins `TELEMETRY_PLAN_TYPES`, which every intake version checks (OAI-4), and the kernels' plan roster (OAI-3). Raw fits and history inherit: each full run refits every owner from source under an unchanged fit method, and there is no era split to port. No migration is needed, because plan types are text or dictionary values | `main` `packages/telemetry-contract/src/constants.js:29`, `apps/worker/src/community-allowance.ts:223`; `packages/telemetry-contract/src/telemetry-v1.2.js:140,202`, `telemetry-v1.1.js:99,145`; `apps/worker/src/telemetry-v1.ts:122,253`, `telemetry-validation.ts:3,55-63` |
-| 4. Version the normalization, the public contract and the caches | Inherits. The route serves whatever the vendored `projectPublicAllowanceGraph` emits, so it moves to `community-allowance-breakdowns-v1.2` and preview v0.4 with the re-vendor. The `analytics_v2` tables carry no method key, but none is needed here: each run recomputes fits, model dates and the preview from source, and the route reads only the preview, the published days and the cache bands, whose method the release leaves unchanged. Nothing resumes under the old unit. A preview written by the old kernel fails the new validator and reads as `temporarily_unavailable` until the next run. GCP changes: OD-5 now means production's current contract (OAI-1), the route spec pins the v1.1 shape (OAI-3), and daily heads need OAI-5 | `apps/worker/src/analytics-v2/community-daily-route.ts:65-67,325-338`, `contract.ts:59-68`; `main` `apps/worker/src/public-allowance-breakdowns.ts:10-11`, `admin-community-allowance.ts:36-37,267-270` |
+| 3. Keep Pro's identity and change the ratios | GCP change, in one branch: `promax` joins `TELEMETRY_PLAN_TYPES`, which every intake version checks (OAI-4), and the kernels' plan roster (OAI-3). Raw fits and history inherit: each full run refits every owner from source, and there is no era split to port. The fit method itself is unchanged, but the vendored fit-cache identity includes `SERVER_PRICING_METHOD_VERSION` and `APP_PRICE_REGISTRY_MANIFEST.sha256`, which the release changes, so fitted dollar capacities are repriced under v0.6 and v0.9. They are not renormalized: normalization applies at projection. No migration is needed, because plan types are text or dictionary values | `main` `packages/telemetry-contract/src/constants.js:29`, `apps/worker/src/community-allowance.ts:223`; `packages/telemetry-contract/src/telemetry-v1.2.js:140,202`, `telemetry-v1.1.js:99,145`; `apps/worker/src/telemetry-v1.ts:122,253`, `telemetry-validation.ts:3,55-63`; `vendor/analytics-d43c8f92/apps/worker/src/community-allowance.ts:114,121` |
+| 4. Version the normalization, the public contract and the caches | Inherits once OD-OAI-3 allows it. The route serves whatever the vendored `projectPublicAllowanceGraph` emits, so it moves to `community-allowance-breakdowns-v1.2` and preview v0.4 with the re-vendor. Each run recomputes fits, model dates and the preview from source, and the route reads only the preview, the published days and the cache bands, whose method the release leaves unchanged. Nothing resumes under the old unit. A preview written by the old kernel fails the new validator and reads as `temporarily_unavailable` until the next run. The `analytics_v2` rows carry no kernel stamp; that matters only for a future re-vendor that changes a retained-row method (OAI-11). GCP changes: the route spec pins the v1.1 shape (OAI-3), and daily heads need OAI-5 | `apps/worker/src/analytics-v2/community-daily-route.ts:65-67,325-338`, `contract.ts:59-68`; `main` `apps/worker/src/public-allowance-breakdowns.ts:10-11`, `admin-community-allowance.ts:36-37,267-270` |
 | 5. Exclude dots only on billing evidence | Not applicable now: the release has no hosted change and no wire field for dots. A future closed eligibility field would arrive through the same re-vendor and package sync. A new wire field would also need intake changes, and possibly PostgreSQL columns, at that time | Release plan, decision 5 |
 
 #### Source inventory
@@ -572,6 +604,7 @@ Paths are on this branch unless marked `main`.
 | Persistence: `telemetry-v0.1.js`, package types and the v0.x schemas | GCP change: v0.1 intake (OAI-4) |
 | Persistence: client v1 chunks and the v1.1 and v1.2 schemas | The client part is not applicable. The v1.1 schema change and the v1.2 validators reach intake through OAI-4. The release leaves the v1.2 field dictionary version unchanged; `0025_typed_v12_normalized.sql:14` pins it, so changing it would need a migration |
 | Persistence: performance contribution, `telemetry-performance-v1*.js` and its types | Conditional: the performance routes are unported (PF-1, PF-2). If they are ported, OAI-10 applies |
+| Retained R7 evidence goes stale when accounting sources change (lines 370-371) | GCP change in evidence only. R7 is already stale on this line: in this worktree at `b87dc931`, `test/r7-generated-release-evidence.test.js` fails both its tests on the `workloadCodeSha256` invariant. The receipts were last regenerated in `46784e94` (2026-09-22), and three later commits on this line changed workload sources, including `c88c0a9cd`. OAI-4 changes the R7 workload sources (`src/r7-release-evidence-schema.js:122-166`) again. The protected regeneration is not routine validation and is not part of any OAI item; OAI-8 runs root `npm test` and records these two failures as expected |
 | Client, public website, admin and agent displays (13 rows) | Not applicable: the website and the admin UI stay on Cloudflare. Two constraints remain. The website reader must accept v1.2 before the origin emits it; `main` `apps/web/public/community-data.js:359-361` already accepts v1.0, v1.1 and v1.2. `community-data.js` is also vendored for the parity tests and inherits. Admin preview v0.4 matters only once the admin routes are ported |
 | Optional quota windows and desktop behavior; the dots source boundary; the observed live public surface | Not applicable |
 
@@ -584,23 +617,52 @@ Paths are on this branch unless marked `main`.
 | `telemetry-v1.ts` and the closed plan enum of v1.1 and v1.2 | GCP change: OAI-4 for intake, with OAI-3 for the kernels. No migration |
 | `admin-model-history.js` roster freeze | Inherits in the vendored package. The admin model-history route is Conditional on the admin route ports |
 | `server-pricing.ts` and the `quota-analysis-v1.ts` pricing casts | Inherits for analytics (OAI-3). The intake copy is OAI-4 |
-| Synthetic route types in `validation.ts` and `repository.ts` | Not applicable: the synthetic-preview path exists only in the Worker's `index.ts` and is not registered in the GCP envelope registry |
+| Synthetic route types in `validation.ts` and `repository.ts` | Not applicable: the synthetic-preview path exists only in the Worker's `index.ts` and is not registered in the GCP envelope registry. The `validation.ts` type stub is regenerated with the re-vendor (OAI-3) |
 | Typed codecs and typed migration 0001 | Inherits: these are dictionary values. The PostgreSQL `typed_telemetry_dictionary` accepts any value of 1 to 64 characters |
 | `plan-attribution.js` and `model-composition.js` | Inherits; the release does not change them |
 | `community-allowance.ts` fit, cache and normalization rows; scalar and composition calculations in `admin-community-allowance.ts` | Inherits (OAI-3) |
 | The same-plan era refusal in `quota-analysis-v11.ts` | Inherits; the release does not change it |
-| The four-plan v1.2 result in `public-allowance-breakdowns.ts` | Inherits. The GCP route spec and the website-first order are GCP-owned (OAI-3, OAI-11) |
-| `community-daily-spend.ts` and the daily readers | GCP change: OAI-5 |
+| The four-plan v1.2 result in `public-allowance-breakdowns.ts` | Inherits under OD-OAI-3. The GCP route spec and the website-first order are GCP-owned (OAI-3, OAI-11) |
+| `community-daily-spend.ts` and the daily readers | GCP change: OAI-5, spend fields only, under OD-OAI-4 |
 | Graph, model-history and daily cache and checkpoint invalidation | Inherits for fits, model dates and the preview: the full recompute keeps no checkpoints. Daily heads need OAI-5 |
-| Price-drift backfill and the 70-day allowance bound in `community-daily-aggregates.ts` | The typed-storage read never serves a daily allowance block (`community-daily-route.ts:383-386`), so only spend applies. OAI-5 matches production's stale-head rule, which has no day bound |
+| Price-drift backfill and the 70-day allowance bound in `community-daily-aggregates.ts` | The typed-storage read never serves a daily allowance block (`community-daily-route.ts:383-386`), so only spend applies. Production republishes every stale head with no day bound; OAI-5 ports only the spend condition, and only with membership fixed |
 | The 25 pp floor and the fit and publication thresholds; the shared pricer's missing `surface` | Inherits: these are kernel constants. Dots eligibility is not applicable yet |
+
+#### Release order, recomputation and rollback
+
+Working-copy lines 505-518.
+
+| Release rule | GCP disposition |
+|---|---|
+| Prepare server readers before new client writers | Policy item 5. GCP intake reaches P (OAI-4) before the GCP origin serves a client release that sends `promax`; OD-OAI-1 records the dependency |
+| Compatible web readers before a new public schema | OAI-11: the website reader that accepts v1.2 is live before the origin serves it |
+| Define how old clients consume or decline newer data | Inherits: the origin serves P's public contract, so an old reader sees what production serves at P. OAI-4 checks that old vocabulary is still admitted |
+| Estimate the queued recomputation scope; bounded resumable jobs; generation fencing | `analytics-refresh` is one full run under an advisory lock, with forward-only revisions (`0059_analytics_v2.sql:149-165`). It is not resumable. Before OAI-5 runs on any non-synthetic database, it records the number of stale heads and the owner-day reads they need; if one run cannot hold them, OAI-5 splits by day range |
+| Additive source repair; explicit correction of misclassified tiers | Not applicable to GCP storage: source repair is client-side. Stored v0.1 rows keep the server pricing they were admitted with, labelled by its stored method version (OAI-4) |
+| No blanket destructive rebuild; no relabeling of published history | OAI-5 never relabels. It adds a revision only when membership is provably unchanged, and otherwise leaves the head. The forward-only trigger forbids rewriting a revision |
+| Rollback preserves newer data and freezes incompatible publication instead of running an older writer | OAI-11: rollback is a freeze. The previous image's `analytics-refresh` never runs over post-upgrade state |
+
+#### GCP surfaces the release plan does not name
+
+| Surface | GCP disposition |
+|---|---|
+| Thin edge | The release (`30c0feb0` to `f0067d0f`) changes neither `apps/worker/src/index.ts` nor `ingress-budget.ts`, the two production modules the edge entry imports; the edge files themselves exist only on this line. The edge deploys only from a branch that contains the live `DEPLOYMENT_SOURCE_COMMIT` ([edge decision §3](../decisions/2026-10-01-thin-worker-edge-proxy.md#3-edge-source-line)). Once P is live, the OD-E1 edge-port branch is cut from P instead of `d43c8f92`, and EP-0 to EP-3, EP-9, E4, E5 and the release-guard migration are re-ported blob-identical under OD-E1 and OD-E2. OD-E5's re-derivation of `EDGE_PRE_ADMISSION_GUARDS` applies only if `git diff d43c8f92 P -- apps/worker/src/index.ts` changes an admission call site. The edge-origin contract blob must be unchanged at P. OAI-8 checks both |
+| D1-to-PostgreSQL transfer and rehearsal | `apps/worker/scripts/postgres-cutover-rehearsal.mjs:10-15` and `production-typed-schema.mjs:44-51` build the D1 source model from this line's D1 migration directories, which hold this line's isolation 0013 and 0014. If production applies `main`'s `0013_performance_ultrafast.sql`, production D1 no longer matches that model. OAI-9 rebuilds the model from P's applied D1 migrations. The seeded rehearsal checks that `promax`, `ultrafast` and `gpt-6.1-sol` transfer as text or dictionary values. `postgres-v12-transfer.mjs:358` pins the v1.2 field dictionary `telemetry-v1.2-registry-2026-09-20.1`, which the release leaves unchanged |
+| GCP-only copies of kernel vocabulary | A re-vendor does not move them: the refusal reasons (`contract.ts` `ANALYTICS_V2_REFUSAL_REASONS` and the `0059_analytics_v2.sql:62-71` check), the cache band IDs (`0059_analytics_v2.sql:86-90`, `cache-windows-sql.ts`) and counters (`ANALYTICS_V2_CACHE_BAND_COUNTERS`), `ANALYTICS_V2_MODEL_DATES = 70` (`compute.ts:128`) and the route's `community-daily-read-v1.0` (`community-daily-route.ts:84`). OAI-3 checks each against P. A changed check set needs a PostgreSQL migration, which is an exception to OAI-4's no-migration expectation. The release changes none of the reducers or cache-retention files, so none of these moves now |
+| Legacy built-in daily reader | `apps/worker/src/postgres-community-daily.ts:145` accepts only normalization `pro_x1_prolite_x4_plus_x20`, which the release changes. Outside `fastpath-test` it still serves the origin's `/api/v1/community/daily` (`cloud-run/server.mjs:610-616,757-770`). It must not be the mounted route at cutover; the analytics-v2 route replaces it |
+| Kernel identity of retained rows | `analytics_v2` rows carry no kernel commit or method stamp. Cache bands of owners a run does not recompute are retained (`store.ts:684-707`) and read without a method filter (`cache-windows-sql.ts:92-99`). A re-vendor that changed the cache-retention method would serve old-kernel rows under the new label. This release changes no cache-retention file, so it is not reached now; OAI-11 settles a run kernel stamp before the first re-vendor that changes a retained-row method |
 
 #### Superseded: the release plan's GCP section
 
-The release plan's "Separate GCP / PostgreSQL candidate" section reviews
-candidate `6bb1b5c3` on the Codex line (`codex/gcp-cutover-integration-20260924`),
-which is not an ancestor of this branch. The fast path supersedes each consumer
-it lists:
+The release plan's "Separate GCP / PostgreSQL candidate" section (working-copy
+lines 475-490) reviews checkpoint `6bb1b5c3` on the Codex line
+`codex/gcp-cutover-integration-20260924`. This line descends from that Codex
+cutover history up to `1470f041`, which is `6bb1b5c3`'s parent and its merge
+base with this line; `6bb1b5c3` is one later checkpoint commit (graph publisher
+batching). Of the four modules the section lists,
+`postgres-community-allowance-fits.ts` and `postgres-community-graph.ts` are
+byte-identical here, and the daily publisher and the stream publisher differ.
+For serving, the fast path supersedes each consumer:
 
 - `postgres-community-daily-publisher.ts`, by the vendored daily payload and
   spend kernels in `analytics-refresh`;
@@ -612,8 +674,8 @@ it lists:
 - the daily-publisher, roundtrip, graph-cohort and allowance-fit PostgreSQL
   tests, by the Q-1 and dense oracles at P.
 
-Same-named modules remain on this line for benchmarks and diagnostics only.
-They retire with the legacy daily publisher (see
+The four modules remain on this line for benchmarks and diagnostics only. They
+retire with the legacy daily publisher (see
 [Discarded or deferred](#discarded-or-deferred)). That section's rule to keep
 GCP work separate from the Cloudflare rollout still stands.
 
@@ -623,20 +685,20 @@ GCP work separate from the Cloudflare rollout still stands.
 |---|---|
 | Prices; unsupported combinations | Production's package and kernel tests, plus the kernel-parity specs the generator copies from P (OAI-3). OAI-6 adds Sol 6.1 Standard and Fast, Astra Ultrafast, and Sol 6.1 Ultrafast to the Q-1 corpus; Sol 6.1 Ultrafast must stay unpriced |
 | Speed evidence; money versus allowance; dots; displays; desktop windows | Not applicable: local parsing, client-side weighting and display surfaces |
-| Conservation and history | OAI-6 checks server values at P. OAI-5 republishes every stale head once and then creates no new revision |
+| Conservation and history | OAI-6 checks server values at P. OAI-5 republishes a stale head at most once, never changes its membership, and creates no revision on a second run |
 | Plans | OAI-4 tests intake on PostgreSQL 17. OAI-6 adds a Pro Max owner and checks that an empty Pro Max cohort publishes no estimate |
 | Fits and publication | OAI-6 and OAI-7; the thresholds are kernel constants |
-| Transport and storage | OAI-4 round trips for v0.1, v1.0, v1.1 and v1.2 on PostgreSQL 17. No migration is expected; one is needed only if P changes the v1.2 field dictionary version |
+| Transport and storage | OAI-4 round trips for v0.1, v1.0, v1.1 and v1.2 on PostgreSQL 17. No migration is expected; one is needed only if P changes the v1.2 field dictionary version or a GCP-only vocabulary copy |
 | Performance | Conditional (OAI-10) |
-| Operations | OAI-5 replaces production's bounded D1 backfills with republication in a single run. The release plan's "real PostgreSQL tests for its candidate lane" become OAI-6 to OAI-8. Website and API consistency after a deploy remains a separate gate |
+| Operations | Production's bounded D1 backfills have no GCP counterpart: `analytics-refresh` is one full run, and OAI-5 records its scope first. The release plan's "real PostgreSQL tests for its candidate lane" become OAI-6 to OAI-8. Website and API consistency after a deploy remains a separate gate |
 
 #### Implementation phases
 
 | Phase | GCP disposition |
 |---|---|
-| 0. Reconcile the base | OAI-2: identify P, then branch from the current GCP head |
+| 0. Reconcile the base | OAI-2: identify P, recheck both release-plan copies, then branch from the current GCP head |
 | 1. Shared vocabulary and prices | OAI-3 and OAI-4 |
-| 2. Semantic contracts | Adopted from P; OD-5 restated (OAI-1) |
+| 2. Semantic contracts | Adopted from P once OD-OAI-3 is decided; OD-5 names v1.1 until then |
 | 3. Local pipeline and storage | Not applicable |
 | 4. Hosted pipeline and public contract | OAI-3 to OAI-7. The phase's "PostgreSQL parity separately if in scope" gate becomes OAI-6 to OAI-8 |
 | 5. All display surfaces | Not applicable. The website reader ships before the origin emits v1.2 (OAI-11) |
@@ -645,16 +707,42 @@ GCP work separate from the Cloudflare rollout still stands.
 
 ### Deltas outside the release plan
 
-- **Untouched daily heads.** `analytics-refresh` republishes only the days
-  named by the journal and the days a previous run left blocked
-  (`apps/worker/cloud-run/analytics-refresh.mjs:19-26,404-411`). Production
-  also republishes every head whose spend `pricingMethodVersion` or
-  `registrySha256`, device method or correction state is stale
+- **Untouched daily heads and the append-only decision.** Production
+  republishes every head whose authority fields, containment epoch, spend
+  `pricingMethodVersion` or `registrySha256`, device method or correction state
+  is stale
   (`vendor/analytics-d43c8f92/apps/worker/src/storage-community-daily.ts:376-387`).
-  The release changes both spend fields. The route drops any spend block that
-  is not current (`community-daily-route.ts:379-382`), so a re-vendor without
-  OAI-5 would remove the API-equivalent value from every older day. At
-  `d43c8f92` the gap has no effect, because every head is current.
+  `analytics-refresh` republishes only the days named by the journal and the
+  days a previous run left blocked
+  (`apps/worker/cloud-run/analytics-refresh.mjs:19-26,404-411`). Its header
+  records why: untouched heads are never recomputed, so a roster change is not
+  applied to published history (D1). A recompute always uses the run's current
+  roster: `analytics-v2/owners.ts` requires an active participant, an active
+  device and an active owner link, and the retained accountless scope keeps
+  only `user_opt_out` revocations. Republishing every stale head would
+  therefore drop disconnected, reset or contained owners from every republished
+  day, which D1 forbids. The release changes both spend fields, so the
+  question arises for every published day at once. The route drops a spend
+  block that is not current (`community-daily-route.ts:371-386`), so after a
+  re-vendor, older days serve no API-equivalent value (an explicit absence,
+  never zero) until OAI-5 reprices them. At `d43c8f92` every head is current.
+  OAI-5 ports only the spend condition, and only with membership fixed
+  (OD-OAI-4). It does not port the authority, collection, containment,
+  device-method or correction-state conditions: D1 and D5 remove containment
+  epochs and controls-driven rebuilds, and `analytics_v2_published_daily` has no
+  authority column (`contract.ts:98-100`). OAI-3 records whether P changes the
+  daily device method or the correction state, because GCP would not follow.
+- **Price registry version name.** `main` `f0067d0f` names the registry with the
+  OpenAI cards `app-official-api-prices-v0.9`
+  (`packages/accounting/src/price-registry.js:13`; this line and `d43c8f92` are
+  at v0.8). The unmerged `claude/anthropic-price-review-0928` (`df1b7ff8`, not an
+  ancestor of `f0067d0f`) uses the same name for different bytes: the withdrawn
+  Sonnet 5 rise corrected, and new Claude Batch and Fast cards. If that branch
+  merged under v0.9, or were folded into P without a new name, one version name
+  would identify two registries. The Anthropic correction needs the next
+  version (v0.10) or a distinct one inside P. GCP tests read P's exported
+  `APP_PRICE_REGISTRY_VERSION`, `APP_PRICE_REGISTRY_MANIFEST.sha256` and
+  `SERVER_PRICING_METHOD_VERSION` instead of pinning literals (OAI-4, OAI-6).
 - **D1 migration number 0013.** `main` adds
   `ingestion-isolation-migrations/0013_performance_ultrafast.sql`. This line
   holds the unapplied `0013_v12_quarantine_admission.sql` and
@@ -662,7 +750,7 @@ GCP work separate from the Cloudflare rollout still stands.
   `apps/worker/scripts/ingestion-isolation-sequence.check.mjs:33-35` and
   `apps/worker/src/telemetry-runtime-activation.ts:102-105`. Whichever file
   reaches production D1 first keeps 0013. This line already renumbered these
-  files once, in `a0fc9e39` on 2026-09-26 (OAI-9).
+  files once, in `a0fc9e39` on 2026-09-26 (OAI-9, OD-OAI-2).
 - **GCP-only package change.** This line's
   `packages/quota-analysis/src/quota-tracks.js` and `quota-calibration.js`
   differ from production (`c88c0a9cd`, a cumulative-cost cursor). OAI-4 keeps
@@ -682,21 +770,39 @@ Acceptance tests and owned files for each item are in plan-v5 under
 | Item | Size | Delivers | Order |
 |---|---|---|---|
 | OAI-1 | S | This section, the plan-v5 entry and the coordination note for the release owner | Done in this change |
-| OAI-2 | S | Identify P: check its ancestry from `d43c8f92` and that it carries #258, and record it in plan-v5 | First at P |
-| OAI-3 | M | Re-vendor from P: generator constants and export patches, the new vendor directory and its importers, the route spec's served contract, and an audit of every hand port against `git diff d43c8f92 P` for the production source it cites | At P, in one branch with OAI-4, after the dense branch lands |
-| OAI-4 | M | Move the workspace packages and intake-side Worker modules (`server-pricing.ts` at least) to P's bytes, keep the GCP-only package change, refresh the Worker package copies, and add PostgreSQL 17 intake specs | At P, in the same branch as OAI-3 |
-| OAI-5 | M | Republish stale heads with production's stale-head rule | Now: after the dense branch lands, before P |
+| OAI-2 | S | Identify P: check its ancestry from `d43c8f92` and that it carries #258, recompute both release-plan SHA-256 values, and record P in plan-v5 | First at P |
+| OAI-3 | M | Re-vendor from P: generator constants and export patches, the new vendor directory and its importers, and the route spec's served contract. Audit every hand port against `git diff d43c8f92 P` for the production source it cites, including `storage-community-graph-publication.ts` and the dense native path's sources. Check every GCP-only vocabulary copy against P | At P, in one branch with OAI-4, after the dense branch lands and OD-OAI-3 is decided |
+| OAI-4 | M | Move the workspace packages and intake-side Worker modules (`server-pricing.ts` at least) to P's bytes, keep the GCP-only package change, refresh the Worker package copies, audit every intake hand port against `git diff d43c8f92 P`, and add PostgreSQL 17 intake specs that read P's exported constants | At P, in the same branch as OAI-3 |
+| OAI-5 | M | Reprice older days' spend without changing membership: the spend condition only; republish a stale head only over the owner set it was published with, and otherwise leave it | After OD-OAI-4 and the dense branch; before P |
 | OAI-6 | L | Extend the Q-1 corpus (Pro Max owner, Sol 6.1, Fast and Ultrafast on subscription and API tiers) and regenerate the golden at P | After OAI-3 and OAI-4 |
 | OAI-7 | M | Re-run the dense oracle at P | After the dense branch lands and OAI-3 |
 | OAI-8 | M | Run the alignment gates at P and write a dated receipt | Last at P. Before the seal when P reaches Cloudflare before cutover |
-| OAI-9 | S | Settle the 0013 conflict: renumber this line's unapplied D1 files after production's tail, or retire them (OD-OAI-2) | Before either file 0013 reaches production D1 |
+| OAI-9 | S | Settle the 0013 conflict (renumber this line's unapplied D1 files after production's tail, or retire them, per OD-OAI-2) and rebuild the transfer and rehearsal D1 model from P's applied D1 migrations | Before either file 0013 reaches production D1 |
 | OAI-10 | M | Port the performance schema in its post-`0013` shape: `ultrafast` in both closed checks, the 2026-09-29 dictionary pin, both cohort dictionary triggers and the grant-contract match. The pre-`0013` shape is never ported | Only if PF-1 and PF-2 are kept |
-| OAI-11 | S | Kernel-upgrade order: the website reader first, then the job and service rollout of the new image, with the fail-closed preview window and rollback stated | Before the first upgrade after cutover |
+| OAI-11 | S | Kernel-upgrade order and freeze rollback (below), and a decision on a run kernel stamp | Before the first upgrade after cutover |
+
+OAI-11 order for each kernel upgrade after cutover:
+
+1. The website reader that accepts the new public contract is live.
+2. Pause the refresh scheduler, so no run of the old Job image can start.
+3. Point the Job at the new image and complete one run.
+4. Roll out the service with the new image. It serves the new contract and
+   admits the new vocabulary.
+5. Resume the scheduler.
+
+Between steps 3 and 4 the old service reads new-kernel state. A preview written
+by the new kernel fails the old validator and reads as
+`temporarily_unavailable`, and every day whose spend block the new run wrote
+under new constants is served without spend. Both windows close at step 4.
+Rollback is a freeze: pause the Job and its scheduler, keep serving the last
+revisions, and roll forward with a fix. The previous image's `analytics-refresh`
+never runs over post-upgrade state; it would republish every head under the old
+constants and meet vocabulary its kernels do not know.
 
 ### Alignment gates
 
 - At P:
-  - OAI-2's ancestry check;
+  - OAI-2's ancestry check and the release-plan re-check;
   - the vendor manifest check against P;
   - the kernel-parity specs copied from P;
   - the one-command rehearsal against a golden regenerated at P on the
@@ -705,13 +811,23 @@ Acceptance tests and owned files for each item are in plan-v5 under
   - the dense oracle at P;
   - `tsc`, the full `postgres:domain:check`, the default Worker vitest run
     and the Cloud Run build;
+  - root `npm test`, with the two `test/r7-generated-release-evidence.test.js`
+    failures recorded as expected and the protected R7 regeneration not run;
+  - the edge checks: no admission call-site change in `index.ts` (OD-E5) and
+    an unchanged edge-origin contract blob;
+  - the transfer rehearsal against P's D1 model (OAI-9);
   - `npm run architecture:check` and `npm run test:preflight`.
-- Intake: the OAI-4 PostgreSQL 17 specs pass, and an unknown plan is still
-  refused.
+- Intake: the OAI-4 PostgreSQL 17 specs pass, old vocabulary is still
+  admitted, and an unknown plan is still refused.
+- History: after OAI-5's spend-only republication, an owner disconnected after
+  a day was published still contributes to that day, and every payload field
+  except the spend block and the revision fields equals the prior revision.
 - Order:
   - intake and kernels land on the line in the same merge;
+  - GCP intake runs P's bytes before the GCP origin serves a client release
+    that sends `promax` (OD-OAI-1);
   - the website reader that accepts v1.2 is live before the origin serves v1.2;
-  - a new image's job run and service rollout follow OAI-11.
+  - each kernel upgrade follows the OAI-11 order.
 - Seal: the vendored source commit equals the Cloudflare production commit.
 
 Every gate here is local and synthetic unless it says otherwise. None of them
@@ -721,8 +837,10 @@ is a GCP deploy, a Cloudflare deploy, a production migration or a cutover.
 
 | ID | Question | Default |
 |---|---|---|
-| OD-OAI-1 | If the seal comes before the release reaches Cloudflare: delay the cutover until the release is deployed and re-vendored, or cut over at `d43c8f92` parity and ship the release on GCP afterwards, from a reviewed release commit that descends from `d43c8f92`, through OAI-3 to OAI-8 | None taken |
-| OD-OAI-2 | The 0013 conflict: renumber this line's unapplied D1 0013 and 0014, or retire them if the fast-path seal no longer needs them | Renumber after production's tail once production applies its 0013, as `a0fc9e39` did |
+| OD-OAI-1 | If the seal comes before the release reaches Cloudflare: delay the cutover until the release is deployed and re-vendored, or cut over at `d43c8f92` parity and ship the release on GCP afterwards, from a reviewed release commit that descends from `d43c8f92`, through OAI-3 to OAI-8. Under the second option, GCP must run P's intake before any public client release that sends `promax`; otherwise the owner accepts and discloses that Pro Max users' v1.0, v1.1 and v1.2 uploads are refused | None taken |
+| OD-OAI-2 | The 0013 conflict: renumber this line's unapplied D1 0013 and 0014, or retire them if the fast-path seal no longer needs them | None taken. Proposed: renumber after production's tail once production applies its 0013, as `a0fc9e39` did |
+| OD-OAI-3 | Serve the release's public contract: follow production to `community-allowance-breakdowns-v1.2` and admin preview v0.4 at P. OD-5 names v1.1, and a plain re-vendor cannot keep v1.1, because the vendored projection emits v1.2 | None taken. Until decided, OD-5 stands and OAI-3 does not land |
+| OD-OAI-4 | How older published days regain current spend (OAI-5). (a) From OAI-5 on, record per published revision the owner digests it folded (a new `analytics_v2` table, or an equivalent proven from `analytics_v2_owner_day`); republish a stale head only over that set, reading each recorded owner's retained evidence whether or not the owner is still eligible, and only if every non-spend field is unchanged; leave heads without a record. (b) Use the owner-history eligibility contract that OA-2 settles, if it defines membership per published day. (c) Leave every stale head: older days serve no API-equivalent value. (d) Republish over the current roster, which requires amending D1 | None taken. Without a decision the line is in (c) |
 
 ## Discarded or deferred
 
@@ -736,7 +854,7 @@ is a GCP deploy, a Cloudflare deploy, a production migration or a cutover.
 | The dense-owner native path and the v1-only, mixed and v0.2 graph paths | D1-coupled orchestration rather than pure kernels; ported next via the HX-4 oracle. Recorded refusals tonight |
 | The legacy GCP daily publisher and its test jobs | Superseded by `analytics-refresh` and the route module once parity passes; retired later in its own change, with tests |
 | Merging the Codex GCP line | The two lines are not reconciled tonight. Candidates to cherry-pick after review: the v1.1 capability failsafe, the gateway allowlist, the identity and social transfer rehearsals |
-| Syncing GitHub `main`, switching the allowance contract to v1.2, lifting capacity ceilings | Each changes kernel packages or parity bases and needs its own owner decision. GitHub `main` is never vendored; v1.2 arrives only by following production ([alignment](#alignment-with-the-openai-september-29-release)) |
+| Syncing GitHub `main`, switching the allowance contract to v1.2, lifting capacity ceilings | Each changes kernel packages or parity bases and needs its own owner decision; for v1.2 that decision is OD-OAI-3. GitHub `main` is never vendored ([alignment](#alignment-with-the-openai-september-29-release)) |
 
 ## Risks
 
