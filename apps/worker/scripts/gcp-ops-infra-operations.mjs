@@ -49,8 +49,11 @@
  * `iam service-accounts get-iam-policy` and bound with
  * `iam service-accounts add-iam-policy-binding`. Until the desired state
  * names the operator the grant is a deferral that keeps the estate unclean,
- * and any live grant of an impersonation role it does not name is a delete
- * apply refuses.
+ * and any grant of an impersonation role on the verifier account's own
+ * policy that it does not name is a delete apply refuses. Grants that reach
+ * the verifier from above it are not read: an impersonation role held on the
+ * project policy (readback keeps only the plane's own and public members
+ * there), on a folder or the organization, or through a basic or custom role.
  *
  * In a shared project (projectTenancy 'shared', the staging plane in the GCP
  * test project) readback keeps only the plane's own instances, services,
@@ -469,8 +472,10 @@ function schedulerView(job) {
 
 /**
  * Roles on the verifier account that let a principal act as it or mint its
- * tokens. Every binding of one is managed: the committed tokenCreators are
- * the whole set, so a hand-made grant is a delete apply refuses.
+ * tokens. Every binding of one on the verifier account's own policy is
+ * managed: the committed tokenCreators are the whole set there, so a
+ * hand-made grant on that policy is a delete apply refuses. The same roles
+ * held on the project, a folder or the organization are not read.
  */
 export const VERIFIER_IMPERSONATION_ROLES = Object.freeze([
   TOKEN_CREATOR_ROLE, "roles/iam.serviceAccountOpenIdTokenCreator", "roles/iam.serviceAccountUser",
@@ -781,9 +786,11 @@ function serviceAccountOperations(desired, observed, blockers) {
 
 /**
  * The operator's roles/iam.serviceAccountTokenCreator grant on the verifier
- * account (OD-CR-7), and nothing else that could impersonate it. Deferred
- * until the desired state names the operator; a live impersonation grant the
- * desired state does not name is a delete apply refuses.
+ * account (OD-CR-7), and no other impersonation grant on that account's own
+ * policy. Deferred until the desired state names the operator; a live
+ * impersonation grant on that policy the desired state does not name is a
+ * delete apply refuses. Inherited grants (project, folder, organization) are
+ * outside this check.
  */
 function verifierIamOperations(desired, observed) {
   const verifier = desired.serviceAccounts.verifier;

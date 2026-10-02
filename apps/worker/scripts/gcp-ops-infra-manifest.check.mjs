@@ -20,7 +20,7 @@ import * as configuration from "../cloud-run/postgres-production-configuration.m
 import * as migrations from "../cloud-run/postgres-production-migrations.mjs";
 import { TEST_MIGRATIONS_TARGETS } from "../cloud-run/test-migrations.mjs";
 import { GCP_PRIVATE_TEST_TARGET } from "./gcp-private-test-deploy.mjs";
-import { FASTPATH_TEST } from "./gcp-fastpath-test-deploy.mjs";
+import { FASTPATH_TEST, REFRESH_JOB_PROFILES } from "./gcp-fastpath-test-deploy.mjs";
 import * as manifest from "./gcp-ops-infra-manifest.mjs";
 import * as rollout from "./gcp-production-rollout.mjs";
 
@@ -63,7 +63,7 @@ function stagingNames(value) {
   value.jobs["analytics-refresh"].name = "synthetic-staging-refresh";
   value.scheduler["analytics-refresh"].name = "synthetic-staging-trigger";
   for (const [name, secret] of Object.entries(value.secrets)) {
-    secret.secretName = `synthetic-staging-${name.toLowerCase().replaceAll("_", "-")}`;
+    secret.secretName = `tibotattle-staging-${name.toLowerCase().replaceAll("_", "-")}`;
   }
 }
 
@@ -153,7 +153,16 @@ test("the analytics-refresh job renders the production refresh-job contract in t
   assert.deepEqual({ ...manifest.DEFERRED_JOBS }, {});
   assert.deepEqual([...manifest.deployedJobNames()], ["production-migrate", "analytics-refresh"]);
   assert.deepEqual({ ...manifest.ANALYTICS_REFRESH_TASK_PROFILE }, { name: "dense", cpu: "4", memory: "16Gi",
-    heapMiB: 12_288, memoryBudgetMiB: 9_216, timeoutSeconds: 14_400 });
+    heapMiB: 12_288, memoryBudgetMiB: 10_752, timeoutSeconds: 14_400 });
+  // It is the dense measurement profile (MEAS-3 runs it), field for field,
+  // including the budget that profile sets, so the two cannot drift.
+  const dense = REFRESH_JOB_PROFILES.dense;
+  assert.deepEqual({ cpu: String(dense.cpu), memory: dense.memory, heapMiB: dense.heapMiB,
+    timeoutSeconds: dense.taskTimeoutSeconds, env: dense.env.map((entry) => [...entry]) }, {
+    cpu: manifest.ANALYTICS_REFRESH_TASK_PROFILE.cpu, memory: manifest.ANALYTICS_REFRESH_TASK_PROFILE.memory,
+    heapMiB: manifest.ANALYTICS_REFRESH_TASK_PROFILE.heapMiB,
+    timeoutSeconds: manifest.ANALYTICS_REFRESH_TASK_PROFILE.timeoutSeconds,
+    env: [["ANALYTICS_V2_MEMORY_BUDGET_MIB", String(manifest.ANALYTICS_REFRESH_TASK_PROFILE.memoryBudgetMiB)]] });
   for (const value of [unmarked(), unmarked(stagingNames)]) {
     const desired = manifest.validateDesiredState(value);
     const job = manifest.renderJob(desired, "analytics-refresh", IMAGE);
@@ -173,7 +182,7 @@ test("the analytics-refresh job renders the production refresh-job contract in t
       PRIMARY_DATABASE: desired.cloudSql.database,
       PRIMARY_SCHEMA: desired.cloudSql.schema,
       POSTGRES_IAM_USER: desired.cloudSql.runtimeIamUser,
-      ANALYTICS_V2_MEMORY_BUDGET_MIB: "9216",
+      ANALYTICS_V2_MEMORY_BUDGET_MIB: "10752",
       DEPLOYMENT_SOURCE_COMMIT: IMAGE.sourceCommit,
     });
     for (const refusedName of manifest.ANALYTICS_REFRESH_JOB_CONTRACT.refusedEnv) {
@@ -193,7 +202,8 @@ test("the analytics-refresh job renders the production refresh-job contract in t
     const MIB = 1024 * 1024;
     const heap = manifest.ANALYTICS_REFRESH_TASK_PROFILE.heapMiB * MIB;
     const resources = analyticsRefreshResources(env, heap);
-    assert.equal(resources.compute.memoryBudgetBytes, 9_216 * MIB);
+    assert.equal(resources.compute.memoryBudgetBytes, 10_752 * MIB);
+    assert.ok(resources.requiredHeapBytes <= heap);
     assert.throws(() => analyticsRefreshResources(env, resources.requiredHeapBytes - MIB),
       { code: "ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT" });
   }
@@ -362,7 +372,10 @@ test("Secret Manager containers are exactly CR-3's secret names, never an edge-o
     refused((value) => { value.secrets.IDENTITY_LINK_SECRET.secretName = secretName; },
       "DESIRED_STATE_VALUE_INVALID:secrets.IDENTITY_LINK_SECRET.secretName");
   }
-  refused((value) => { value.secrets.APPLE_PRIVATE_KEY.secretName = "IDENTITY_LINK_SECRET"; }, "SECRET_NAMES_NOT_DISTINCT");
+  refused((value) => {
+    value.secrets.IDENTITY_LINK_SECRET.secretName = "tibotattle-shared-secret";
+    value.secrets.APPLE_PRIVATE_KEY.secretName = "tibotattle-shared-secret";
+  }, "SECRET_NAMES_NOT_DISTINCT");
   // Secret ids are project-wide: a test-estate secret is never reused.
   refused((value) => { value.secrets.ENVELOPE_PRIVATE_JWK.secretName = "tibotattle-test-envelope-private-jwk-20260922"; },
     "DESIRED_STATE_TEST_TARGET_NAME:plane:secrets.ENVELOPE_PRIVATE_JWK.secretName");
@@ -953,7 +966,9 @@ test("committed files refuse test names, shared tenancy and staging names in pro
   // Staging keeps its marker everywhere, never the production token, and never a test name.
   for (const [mutate, code] of [
     [(value) => { value.secrets.IDENTITY_LINK_SECRET.secretName = "IDENTITY_LINK_SECRET"; },
-      "DESIRED_STATE_STAGING_MARKER_MISSING:secrets.IDENTITY_LINK_SECRET.secretName"],
+      "SECRET_ID_FORM_INVALID:secrets.IDENTITY_LINK_SECRET.secretName"],
+    [(value) => { value.secrets.IDENTITY_LINK_SECRET.secretName = "synthetic-staging-identity-link"; },
+      "SECRET_ID_FORM_INVALID:secrets.IDENTITY_LINK_SECRET.secretName"],
     [(value) => { value.cloudSql.instance = "tibotattle-staging-production-primary"; },
       "DESIRED_STATE_PRODUCTION_NAME_FORBIDDEN:cloudSql.instance"],
     [(value) => { value.service.name = "tibotattle-test-app"; }, "DESIRED_STATE_TEST_TARGET_NAME:plane:service.name"],
@@ -1008,6 +1023,60 @@ test("committed files refuse secret material anywhere, before any shape check", 
     value.service.audience = "tibotattle-staging-edge-origin-audience-with-a-long-lowercase-name";
   })).service.audience.length > 32, true);
   assert.ok(manifest.SECRET_VALUE_KEYS.includes("value"));
+});
+
+test("committed files close each secret id to its plane's form, so a pasted value is never an id", () => {
+  // Synthetic stand-ins for the shapes the secret-material scan cannot tell
+  // from an identifier: lowercase hex, uppercase hex, lowercase base64url and
+  // a mixed-case token shorter than the scan's 32 characters.
+  const pasted = [
+    "0f1e2d3c4b5a6978".repeat(4),
+    "0F1E2D3C4B5A6978".repeat(4),
+    "c3ludghldglj_c2vjcmv0-dmfsdwu0zm9ylxrlc3q",
+    "Ab3dEf6hIj9lMn2pQr5tUv8xYz1bCd4wX".slice(0, 31),
+  ];
+  const code = "SECRET_ID_FORM_INVALID:secrets.IDENTITY_LINK_SECRET.secretName";
+  for (const value of pasted) {
+    assert.throws(() => manifest.validateDesiredState(filledProduction((desired) => {
+      desired.secrets.IDENTITY_LINK_SECRET.secretName = value;
+    })), { code }, `production ${value}`);
+    assert.throws(() => manifest.validateDesiredState(committed("staging", (desired) => {
+      desired.secrets.IDENTITY_LINK_SECRET.secretName = value;
+    })), { code }, `staging ${value}`);
+  }
+  // Production: the variable name EP-7's template uses, or a tibotattle- id;
+  // never another variable's name, a foreign prefix or upper-case words.
+  for (const value of ["APPLE_PRIVATE_KEY", "IDENTITY_LINK", "identity-link-secret", "Tibotattle-identity-link",
+    "tibotattle_identity_link", "tibotattle-", "tibotattle--identity"]) {
+    assert.throws(() => manifest.validateDesiredState(filledProduction((desired) => {
+      desired.secrets.IDENTITY_LINK_SECRET.secretName = value;
+    })), { code }, `production ${value}`);
+  }
+  assert.equal(manifest.validateDesiredState(filledProduction((desired) => {
+    desired.secrets.IDENTITY_LINK_SECRET.secretName = "tibotattle-identity-link";
+  })).secrets.IDENTITY_LINK_SECRET.secretName, "tibotattle-identity-link");
+  // Staging: only tibotattle-staging- ids.
+  for (const value of ["tibotattle-identity-link", "staging-identity-link", "tibotattle-staging-"]) {
+    assert.throws(() => manifest.validateDesiredState(committed("staging", (desired) => {
+      desired.secrets.IDENTITY_LINK_SECRET.secretName = value;
+    })), { code }, `staging ${value}`);
+  }
+  // The committed ids are in their forms, and the JSON Schema states the
+  // union of both forms per variable and refuses every pasted value.
+  const schema = JSON.parse(readFileSync(join(WORKER_ROOT, manifest.DESIRED_STATE_JSON_SCHEMA_FILE), "utf8"));
+  const production = JSON.parse(COMMITTED.production);
+  const staging = JSON.parse(COMMITTED.staging);
+  assert.equal(manifest.STAGING_SECRET_ID.source.startsWith("^tibotattle-staging-"), true);
+  for (const [name, node] of Object.entries(schema.properties.secrets.properties)) {
+    const secretName = node.properties.secretName;
+    assert.equal(secretName.pattern, `^(?:${name}|${manifest.PLANE_SECRET_ID.source.slice(1, -1)})$`, name);
+    assert.equal(secretName.maxLength, 255, name);
+    const pattern = new RegExp(secretName.pattern, "u");
+    assert.equal(production.secrets[name].secretName, name, name);
+    assert.equal(manifest.STAGING_SECRET_ID.test(staging.secrets[name].secretName), true, name);
+    assert.equal(pattern.test(staging.secrets[name].secretName), true, name);
+    for (const value of pasted) assert.equal(pattern.test(value), false, `${name} ${value}`);
+  }
 });
 
 test("the verifier's token creators are the operator's principals only, closed and normalized", () => {

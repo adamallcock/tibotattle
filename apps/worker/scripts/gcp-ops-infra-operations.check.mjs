@@ -743,7 +743,7 @@ test("a trigger is never left unpaused at creation, even when its desired state 
   assert.equal(operations.assertTriggersCreatedPaused([{ ...create, deferred: "SCHEDULER_CADENCE_UNSET" }, bind]).length, 2);
 });
 
-test("the verifier's token-creator grant waits for the operator, and no unnamed principal may impersonate it", () => {
+test("the verifier's token-creator grant waits for the operator, and its own policy names no other impersonator", () => {
   // Unassigned: a deferral that keeps the estate unclean.
   const unassigned = desiredState({ synthetic: false, mutate: (value) => { value.serviceAccounts.verifier.tokenCreators = null; } });
   const world = convergedWorld(unassigned);
@@ -769,8 +769,18 @@ test("the verifier's token-creator grant waits for the operator, and no unnamed 
   assert.equal(operations.infrastructureCleanliness(plan(assigned, gcloud.runner)).clean, true);
   assert.ok(gcloud.calls.some((argv) => argv.slice(0, 3).join(" ") === "iam service-accounts get-iam-policy"
     && argv[3] === assigned.serviceAccounts.verifier.email));
-  // A hand-made impersonation grant the desired state does not name, or a
-  // public member, is a delete apply refuses.
+  // The boundary of this check (receipt, Not covered): an impersonation role
+  // held on the project policy by a principal the plane does not manage is
+  // not read, so it neither appears in the readback nor keeps the estate
+  // unclean.
+  world.projectPolicy.bindings.push({ role: "roles/iam.serviceAccountTokenCreator", members: ["user:someone@example.com"] });
+  const inherited = plan(assigned, gcloud.runner);
+  assert.equal(operations.infrastructureCleanliness(inherited).clean, true);
+  assert.equal(JSON.stringify(inherited).includes("someone@example.com"), false);
+  world.projectPolicy.bindings.pop();
+  // A hand-made impersonation grant on the verifier's own policy that the
+  // desired state does not name, or a public member there, is a delete apply
+  // refuses.
   for (const [role, member] of [["roles/iam.serviceAccountTokenCreator", "user:someone@example.com"],
     ["roles/iam.serviceAccountOpenIdTokenCreator", "user:someone@example.com"],
     ["roles/iam.serviceAccountUser", "group:others@example.com"], ["roles/iam.serviceAccountTokenCreator", "allUsers"]]) {
@@ -818,7 +828,7 @@ function sharedStaging(value) {
   value.jobs["analytics-refresh"].name = "synthetic-staging-refresh";
   value.scheduler["analytics-refresh"].name = "synthetic-staging-trigger";
   for (const [name, secret] of Object.entries(value.secrets)) {
-    secret.secretName = `synthetic-staging-${name.toLowerCase().replaceAll("_", "-")}`;
+    secret.secretName = `tibotattle-staging-${name.toLowerCase().replaceAll("_", "-")}`;
   }
 }
 
@@ -899,7 +909,7 @@ test("the committed staging desired state plans only its own new resources in th
 
 test("secrets are read, created and granted by their Secret Manager ids", () => {
   const desired = desiredState({ synthetic: false, mutate: (value) => {
-    for (const [name, secret] of Object.entries(value.secrets)) secret.secretName = `synthetic-${name.toLowerCase().replaceAll("_", "-")}`;
+    for (const [name, secret] of Object.entries(value.secrets)) secret.secretName = `tibotattle-${name.toLowerCase().replaceAll("_", "-")}`;
   } });
   const world = bornWorld(desired, { secrets: false });
   withSecretValues(world, { project: desired.project, region: desired.region,
@@ -907,12 +917,12 @@ test("secrets are read, created and granted by their Secret Manager ids", () => 
   const gcloud = fake(desired, world);
   const result = plan(desired, gcloud.runner, { bootstrap: BOOTSTRAP });
   assert.deepEqual(ops(result, (entry) => entry.id.startsWith("secret:create:")).map((entry) => entry.argv[2]),
-    ["synthetic-distribution-github-api-token"]);
+    ["tibotattle-distribution-github-api-token"]);
   assert.ok(ops(result, (entry) => entry.id.startsWith("secret-iam:IDENTITY_LINK_SECRET:"))[0].argv
-    .includes("synthetic-identity-link-secret"));
+    .includes("tibotattle-identity-link-secret"));
   const service = JSON.parse(ops(result, (entry) => entry.id === "run-service:create")[0].file.content);
   assert.deepEqual(service.spec.template.spec.containers[0].env.find((entry) => entry.name === "IDENTITY_LINK_SECRET")
-    .valueFrom.secretKeyRef, { name: "synthetic-identity-link-secret", key: "1" });
+    .valueFrom.secretKeyRef, { name: "tibotattle-identity-link-secret", key: "1" });
   operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: result.planDigest, bootstrap: BOOTSTRAP,
     createSpecWriter: () => gcloud.writer.create() });
   assert.equal(operations.infrastructureCleanliness(plan(desired, gcloud.runner)).clean, true);

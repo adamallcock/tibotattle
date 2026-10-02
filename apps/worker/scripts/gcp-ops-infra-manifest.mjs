@@ -144,7 +144,8 @@ export const SCHEDULER_TRIGGER_STATES = Object.freeze(["PAUSED", "ENABLED"]);
  * scheduler probe (gcp-infra.mjs scheduler-probe) reports
  * SCHEDULER_TRIGGER_PAUSED_TOO_LONG when a trigger whose desired state is
  * ENABLED is live PAUSED and neither a user change nor an attempt is newer
- * than this threshold.
+ * than this threshold. The probe is the signal only: the alert also needs a
+ * periodic runner and a notification target (E-OPS5), which are not built.
  */
 export const SCHEDULER_PAUSE_ALERT_THRESHOLD_HOURS = 6;
 
@@ -262,19 +263,22 @@ export const LOGGING_POSTURE = Object.freeze({
 
 /**
  * The analytics-refresh task profile. The default production profile is the
- * dense one (4 vCPU, 16 GiB, a 12288 MiB heap, a 4 h task timeout) until the
- * largest real owner is measured on Cloud Run (MEAS-3). The per-owner memory
- * budget keeps analytics-refresh.mjs's own default ratio (4608 of a 6144 MiB
- * heap) and leaves its heap reserve (512 MiB plus 4 KiB per default
- * read-chunk occurrence) inside the heap; the manifest check proves both
- * against that module's exported bounds.
+ * dense measurement profile (gcp-fastpath-test-deploy.mjs
+ * REFRESH_JOB_PROFILES.dense: 4 vCPU, 16 GiB, a 12288 MiB heap, a 10752 MiB
+ * per-owner memory budget, a 4 h task timeout) until the largest real owner
+ * is measured on Cloud Run (MEAS-3). That budget is the one the memory model
+ * says admits the largest real owner even when every record falls in the
+ * analysis days, and it leaves analytics-refresh.mjs's heap reserve (512 MiB
+ * plus 4 KiB per default read-chunk occurrence) inside the heap. The manifest
+ * check holds this profile equal to the measurement profile and proves the
+ * budget against that module's exported bounds.
  */
 export const ANALYTICS_REFRESH_TASK_PROFILE = Object.freeze({
   name: "dense",
   cpu: "4",
   memory: "16Gi",
   heapMiB: 12_288,
-  memoryBudgetMiB: 9_216,
+  memoryBudgetMiB: 10_752,
   timeoutSeconds: 14_400,
 });
 
@@ -368,6 +372,15 @@ const SOURCE_COMMIT = /^[a-f0-9]{40}$/u;
 const PERMISSION = /^[a-z][a-zA-Z0-9]*(?:\.[a-zA-Z0-9]+){2}$/u;
 /** A Secret Manager secret id. */
 const SECRET_ID = /^[A-Za-z0-9_-]{1,255}$/u;
+/**
+ * The plane's own Secret Manager ids, closed per plane so that a pasted
+ * secret value (hex, lowercase base64url, a short token) never passes as an
+ * id. Production names a secret by the variable name EP-7's template uses, or
+ * by a `tibotattle-` id of lowercase words; staging, which shares its
+ * project, by a `tibotattle-staging-` id of lowercase words.
+ */
+export const PLANE_SECRET_ID = /^tibotattle-[a-z0-9]+(?:-[a-z0-9]+)*$/u;
+export const STAGING_SECRET_ID = /^tibotattle-staging-[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 /** An IAM principal that may mint the verifier's tokens: a user, a group or a service account. */
 const TOKEN_CREATOR_MEMBER = /^(?:user|group|serviceAccount):[A-Za-z0-9._%+-]{1,64}@[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}$/u;
 const MAX_TOKEN_CREATORS = 4;
@@ -945,7 +958,8 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
   };
 
   // Secret Manager secrets: exactly CR-3's required and optional names, each
-  // named by its Secret Manager secret id and a pinned version number.
+  // named by its Secret Manager secret id, in its plane's form, and a pinned
+  // version number.
   if (!isRecord(input.secrets)) fail("DESIRED_STATE_SHAPE_INVALID:secrets");
   const secretNames = [...REQUIRED_SECRET_NAMES, ...OPTIONAL_SECRET_NAMES];
   for (const name of Object.keys(input.secrets)) {
@@ -956,6 +970,10 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
     if (!Object.hasOwn(input.secrets, name)) fail(`SECRET_CONTAINER_MISSING:${name}`);
     closedKeys(input.secrets[name], DESIRED_STATE_SHAPE.secret, `secrets.${name}`);
     const secretName = text(input.secrets[name].secretName, SECRET_ID, `secrets.${name}.secretName`);
+    if (!(environment === "production" ? secretName === name || PLANE_SECRET_ID.test(secretName)
+      : STAGING_SECRET_ID.test(secretName))) {
+      fail(`SECRET_ID_FORM_INVALID:secrets.${name}.secretName`);
+    }
     const version = input.secrets[name].version;
     if (version !== null) text(version, SECRET_VERSION, `secrets.${name}.version`);
     secrets[name] = { secretName, version, required: REQUIRED_SECRET_NAMES.includes(name) };

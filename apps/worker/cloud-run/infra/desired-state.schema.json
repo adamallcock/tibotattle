@@ -288,8 +288,9 @@
           "properties": {
             "secretName": {
               "type": "string",
-              "pattern": "^[A-Za-z0-9_-]{1,255}$",
-              "description": "The Secret Manager secret id; never a value"
+              "pattern": "^(?:IDENTITY_LINK_SECRET|tibotattle-[a-z0-9]+(?:-[a-z0-9]+)*)$",
+              "maxLength": 255,
+              "description": "The Secret Manager secret id, never a value. Production: the variable name or a tibotattle- id; staging: a tibotattle-staging- id"
             },
             "version": {
               "type": [
@@ -311,8 +312,9 @@
           "properties": {
             "secretName": {
               "type": "string",
-              "pattern": "^[A-Za-z0-9_-]{1,255}$",
-              "description": "The Secret Manager secret id; never a value"
+              "pattern": "^(?:POSTGRES_RATE_LIMIT_SECRET|tibotattle-[a-z0-9]+(?:-[a-z0-9]+)*)$",
+              "maxLength": 255,
+              "description": "The Secret Manager secret id, never a value. Production: the variable name or a tibotattle- id; staging: a tibotattle-staging- id"
             },
             "version": {
               "type": [
@@ -334,8 +336,9 @@
           "properties": {
             "secretName": {
               "type": "string",
-              "pattern": "^[A-Za-z0-9_-]{1,255}$",
-              "description": "The Secret Manager secret id; never a value"
+              "pattern": "^(?:ENVELOPE_PUBLIC_JWK|tibotattle-[a-z0-9]+(?:-[a-z0-9]+)*)$",
+              "maxLength": 255,
+              "description": "The Secret Manager secret id, never a value. Production: the variable name or a tibotattle- id; staging: a tibotattle-staging- id"
             },
             "version": {
               "type": [
@@ -357,8 +360,9 @@
           "properties": {
             "secretName": {
               "type": "string",
-              "pattern": "^[A-Za-z0-9_-]{1,255}$",
-              "description": "The Secret Manager secret id; never a value"
+              "pattern": "^(?:ENVELOPE_PRIVATE_JWK|tibotattle-[a-z0-9]+(?:-[a-z0-9]+)*)$",
+              "maxLength": 255,
+              "description": "The Secret Manager secret id, never a value. Production: the variable name or a tibotattle- id; staging: a tibotattle-staging- id"
             },
             "version": {
               "type": [
@@ -380,8 +384,9 @@
           "properties": {
             "secretName": {
               "type": "string",
-              "pattern": "^[A-Za-z0-9_-]{1,255}$",
-              "description": "The Secret Manager secret id; never a value"
+              "pattern": "^(?:GOOGLE_OIDC_CLIENT_SECRET|tibotattle-[a-z0-9]+(?:-[a-z0-9]+)*)$",
+              "maxLength": 255,
+              "description": "The Secret Manager secret id, never a value. Production: the variable name or a tibotattle- id; staging: a tibotattle-staging- id"
             },
             "version": {
               "type": [
@@ -403,8 +408,9 @@
           "properties": {
             "secretName": {
               "type": "string",
-              "pattern": "^[A-Za-z0-9_-]{1,255}$",
-              "description": "The Secret Manager secret id; never a value"
+              "pattern": "^(?:APPLE_PRIVATE_KEY|tibotattle-[a-z0-9]+(?:-[a-z0-9]+)*)$",
+              "maxLength": 255,
+              "description": "The Secret Manager secret id, never a value. Production: the variable name or a tibotattle- id; staging: a tibotattle-staging- id"
             },
             "version": {
               "type": [
@@ -426,8 +432,9 @@
           "properties": {
             "secretName": {
               "type": "string",
-              "pattern": "^[A-Za-z0-9_-]{1,255}$",
-              "description": "The Secret Manager secret id; never a value"
+              "pattern": "^(?:DISTRIBUTION_GITHUB_API_TOKEN|tibotattle-[a-z0-9]+(?:-[a-z0-9]+)*)$",
+              "maxLength": 255,
+              "description": "The Secret Manager secret id, never a value. Production: the variable name or a tibotattle- id; staging: a tibotattle-staging- id"
             },
             "version": {
               "type": [
