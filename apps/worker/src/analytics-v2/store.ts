@@ -338,9 +338,12 @@ function validTimings(value: unknown, field: string): Partial<Record<AnalyticsV2
   return timings;
 }
 
-const RESOURCE_CONFIGURATION_KEYS = "maxDayOccurrences,maxDayRecordBytes,memoryBudgetBytes,memoryModel";
-const OWNER_RESOURCE_KEYS = "admitted,analysisUsage,estimateBytes,heapPeakBytes,maxDayOccurrences,ownerDigest,quota,session,usage";
+const RESOURCE_CONFIGURATION_KEYS =
+  "maxDayOccurrences,maxDayRecordBytes,memoryBudgetBytes,memoryModel,outputBudgetBytes,outputModel";
+const OWNER_RESOURCE_KEYS =
+  "admitted,analysisUsage,estimateBytes,heapPeakBytes,maxDayOccurrences,outputBytes,ownerDigest,quota,session,usage";
 const MEMORY_MODEL = /^analytics-v2-memory-model-v[0-9]+$/u;
+const OUTPUT_MODEL = /^analytics-v2-output-model-v[0-9]+$/u;
 
 /**
  * The run's resource record (contract AnalyticsV2RunResources): closed keys,
@@ -350,13 +353,14 @@ const MEMORY_MODEL = /^analytics-v2-memory-model-v[0-9]+$/u;
 function validResources(value: unknown, effective: ReadonlySet<string>,
   refusedOwners: ReadonlySet<string>): AnalyticsV2RunResources | null {
   if (value === undefined) return null;
-  if (!plainObject(value) || Object.keys(value).sort().join(",") !== "configuration,owners") invalid("resources");
+  if (!plainObject(value) || Object.keys(value).sort().join(",") !== "account,configuration,owners") invalid("resources");
   const configuration = value.configuration;
   if (!plainObject(configuration) || Object.keys(configuration).sort().join(",") !== RESOURCE_CONFIGURATION_KEYS
-      || typeof configuration.memoryModel !== "string" || !MEMORY_MODEL.test(configuration.memoryModel)) {
+      || typeof configuration.memoryModel !== "string" || !MEMORY_MODEL.test(configuration.memoryModel)
+      || typeof configuration.outputModel !== "string" || !OUTPUT_MODEL.test(configuration.outputModel)) {
     invalid("resources.configuration");
   }
-  for (const name of ["memoryBudgetBytes", "maxDayOccurrences", "maxDayRecordBytes"]) {
+  for (const name of ["memoryBudgetBytes", "maxDayOccurrences", "maxDayRecordBytes", "outputBudgetBytes"]) {
     if (assertNonNegativeSafeInteger(configuration[name], `resources.configuration.${name}`) < 1) {
       invalid(`resources.configuration.${name}`);
     }
@@ -370,7 +374,8 @@ function validResources(value: unknown, effective: ReadonlySet<string>,
     assertOwnerDigest(entry.ownerDigest, effective, "resources.owners.ownerDigest");
     if ((entry.ownerDigest as string) <= previous) invalid("resources.owners.ownerDigest");
     previous = entry.ownerDigest as string;
-    for (const name of ["usage", "quota", "session", "analysisUsage", "maxDayOccurrences", "estimateBytes"]) {
+    for (const name of ["usage", "quota", "session", "analysisUsage", "maxDayOccurrences", "estimateBytes",
+      "outputBytes"]) {
       assertNonNegativeSafeInteger(entry[name], `resources.owners.${name}`);
     }
     if (typeof entry.admitted !== "boolean" || entry.admitted === refusedOwners.has(entry.ownerDigest as string)) {
@@ -381,7 +386,18 @@ function validResources(value: unknown, effective: ReadonlySet<string>,
     owners.push(entry as unknown as AnalyticsV2OwnerResources);
   }
   if (owners.length !== effective.size) invalid("resources.owners");
-  return { configuration: configuration as unknown as AnalyticsV2RunResources["configuration"], owners };
+  const account = value.account;
+  if (!plainObject(account) || Object.keys(account).sort().join(",") !== "accountBytes,heldInputBytes") {
+    invalid("resources.account");
+  }
+  const heldInputBytes = assertNonNegativeSafeInteger(account.heldInputBytes, "resources.account.heldInputBytes");
+  const accountBytes = assertNonNegativeSafeInteger(account.accountBytes, "resources.account.accountBytes");
+  if (heldInputBytes > accountBytes
+      || owners.reduce((total, entry) => total + entry.outputBytes, heldInputBytes) > accountBytes) {
+    invalid("resources.account");
+  }
+  return { configuration: configuration as unknown as AnalyticsV2RunResources["configuration"], owners,
+    account: { heldInputBytes, accountBytes } };
 }
 
 /**
@@ -647,10 +663,13 @@ function rowCountOf(result: unknown): number | null {
 
 /**
  * Insert JSON rows through jsonb_to_recordset in bounded chunks; every chunk
- * must affect exactly its own row count.
+ * must affect exactly its own row count. Rows are taken from an iterable, so
+ * a caller can map them lazily and the write holds one chunk of row copies,
+ * not a copy of a whole family (the run's outputs are already in the heap,
+ * charged to the output account).
  */
 async function forEachRecordsetChunk(
-  rows: readonly unknown[],
+  rows: Iterable<unknown>,
   visit: (json: string, count: number) => Promise<void>,
 ): Promise<void> {
   let parts: string[] = [];
@@ -672,10 +691,15 @@ async function forEachRecordsetChunk(
   await flush();
 }
 
+/** `rows` mapped one at a time, as forEachRecordsetChunk consumes them. */
+function* mapped<Row, Mapped>(rows: readonly Row[], map: (row: Row) => Mapped): Generator<Mapped> {
+  for (const row of rows) yield map(row);
+}
+
 async function insertRecordset(
   client: PostgresClient,
   statement: string,
-  rows: readonly unknown[],
+  rows: Iterable<unknown>,
   field: string,
   shortfall: AnalyticsV2StoreErrorCode = "ANALYTICS_V2_WRITE_FAILED",
 ): Promise<void> {
@@ -778,7 +802,7 @@ export async function writeRunOutputs(
        SELECT owner_digest, day, daily, refusal, run_id
          FROM jsonb_to_recordset($1::jsonb)
            AS row(owner_digest text, day date, daily jsonb, refusal text, run_id uuid)`,
-      outputs.ownerDays.map((row) => ({
+      mapped(outputs.ownerDays, (row) => ({
         owner_digest: row.ownerDigest,
         day: row.day,
         daily: row.daily ?? null,
@@ -796,7 +820,7 @@ export async function writeRunOutputs(
            AS row(owner_digest text, day date, model text, effort text, band text,
                   ${ANALYTICS_V2_CACHE_BAND_COUNTERS.map((name) => `${name} bigint`).join(", ")},
                   run_id uuid)`,
-      outputs.cacheBands.map((row) => ({
+      mapped(outputs.cacheBands, (row) => ({
         owner_digest: row.ownerDigest,
         day: row.day,
         model: row.model,
@@ -812,7 +836,7 @@ export async function writeRunOutputs(
        SELECT owner_digest, as_of_day, fits, run_id
          FROM jsonb_to_recordset($1::jsonb)
            AS row(owner_digest text, as_of_day date, fits jsonb, run_id uuid)`,
-      outputs.ownerFits.map((row) => ({
+      mapped(outputs.ownerFits, (row) => ({
         owner_digest: row.ownerDigest,
         as_of_day: row.asOfDay,
         fits: row.fits,
@@ -825,7 +849,7 @@ export async function writeRunOutputs(
        SELECT owner_digest, day, result, run_id
          FROM jsonb_to_recordset($1::jsonb)
            AS row(owner_digest text, day date, result jsonb, run_id uuid)`,
-      outputs.ownerModelDates.map((row) => ({
+      mapped(outputs.ownerModelDates, (row) => ({
         owner_digest: row.ownerDigest,
         day: row.day,
         result: row.result,
@@ -952,7 +976,8 @@ export async function writeRunOutputs(
     // The run row's timings also carry the resource record (bounds applied,
     // and each effective owner's evidence size, estimate and sampled heap).
     const recorded = prepared.resources === null ? timings
-      : { ...timings, resources: prepared.resources.configuration, owners: prepared.resources.owners };
+      : { ...timings, resources: prepared.resources.configuration, owners: prepared.resources.owners,
+        account: prepared.resources.account };
     await client.query(
       `INSERT INTO ${relation(schema, tables.runs)}
          (run_id, started_at, finished_at, mode, state, owners, owner_days, refusals, publication, timings)

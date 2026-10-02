@@ -16,9 +16,12 @@
  *   3. compute with A-2 (pure, single-threaded), one effective owner at a
  *      time: A-1's exact evidence counts (countOwnerOccurrences) decide the
  *      per-owner memory guard and the read spans before anything is read; an
- *      admitted owner is then read in the same snapshot, computed and
- *      released, so the heap holds the largest owner, not the corpus. The
- *      exporting transaction stays open until the last read;
+ *      admitted owner is then read in the same snapshot in bounded segments
+ *      (the history before the analysis horizon in 60-day segments, each
+ *      released before the next, then the analysis horizon), computed and
+ *      released, so the heap holds one segment of the largest owner, not its
+ *      whole history or the corpus. The exporting transaction stays open
+ *      until the last read;
  *   4. write everything with store.ts writeRunOutputs in ONE transaction on
  *      the same session, then release the lock.
  *
@@ -30,16 +33,53 @@
  * to published history; terminal journal events stop future uploads only and
  * re-queue nothing (2026-09-26 owner decisions).
  *
+ * Production and staging (ANALYTICS_REFRESH_TARGET=production|staging): the
+ * reviewed target path. The invocation is exactly
+ *   node --max-old-space-size=<heap> dist/analytics-refresh.mjs --mode=full
+ * (ANALYTICS_REFRESH_PRODUCTION_JOB), with no --schema, --now or
+ * --revision-seed, on the real clock. The environment is closed
+ * (ANALYTICS_REFRESH_PRODUCTION_ENV): ANALYTICS_REFRESH_TARGET,
+ * PRIMARY_INSTANCE_CONNECTION_NAME, PRIMARY_DATABASE, PRIMARY_SCHEMA,
+ * POSTGRES_IAM_USER and ANALYTICS_V2_MEMORY_BUDGET_MIB. Any other variable in
+ * the job's configuration namespaces (ANALYTICS_, PRIMARY_, POSTGRES_, PG_,
+ * LEDGER_), every variable postgres-production-configuration.mjs (CR-3)
+ * refuses in production (its test seams, edge secrets, the retired ledger
+ * settings), ANALYTICS_V2_TEST_CLOCK and GOOGLE_APPLICATION_CREDENTIALS are
+ * refused, as are a test or rehearsal target (the IAM test and fast-path
+ * resources, a test or rehearsal schema, database, instance or job) and a
+ * resource carrying the other plane's marker (CR-3's convention: a staging
+ * resource carries 'staging' and never 'production'; a production one never
+ * carries 'staging'). Platform variables Cloud Run sets (CLOUD_RUN_*, K_*,
+ * PATH, HOME and so on) are outside these namespaces and are not read, except
+ * the Cloud Run job context: CLOUD_RUN_JOB, one task (CLOUD_RUN_TASK_INDEX=0,
+ * CLOUD_RUN_TASK_COUNT=1) and no K_SERVICE.
+ *
+ * Without ANALYTICS_REFRESH_TARGET the Job keeps its test targets (below).
+ *
  * Flags:
- *   --mode=full            required; the only mode tonight
+ *   --mode=full            required; the only mode
  *   --schema=<identifier>  runtime (primary) schema; defaults to PRIMARY_SCHEMA
+ *                          (refused under a production target)
  *   --now=<ISO instant>    pin the clock; accepted only under a test clock
- *                          (ANALYTICS_V2_TEST_CLOCK=1 or a POSTGRES_TEST_HTTP_MODE)
- *   --revision-seed=<n>    published revisions start above n (default 0)
+ *                          (ANALYTICS_V2_TEST_CLOCK=1 or a POSTGRES_TEST_HTTP_MODE),
+ *                          never under a production target
+ *   --revision-seed=<n>    published revisions start above n (default 0;
+ *                          refused under a production target)
  *   --help
  *
+ * Time guard: a run with a known task timeout (a production target takes its
+ * profile's, ANALYTICS_REFRESH_PRODUCTION_JOB; elsewhere
+ * ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS may set one) refuses with a
+ * receipt before the task timeout instead of being killed: it refuses
+ * ANALYTICS_V2_REFRESH_DEADLINE_PROJECTED when the remaining owners cannot
+ * finish even at the measured phase rates (ANALYTICS_REFRESH_TIME_MODEL), and
+ * ANALYTICS_V2_REFRESH_DEADLINE_EXCEEDED rather than start a step that could
+ * cross the point where the write, the rollback and the receipt still fit.
+ * Nothing is written either way.
+ *
  * Resources (environment; defaults sized for an 8 GiB task whose Node heap
- * is --max-old-space-size=6144; each value must lie within its bounds):
+ * is --max-old-space-size=6144; each value must lie within its bounds; a
+ * production target accepts only the memory budget and requires it):
  *   ANALYTICS_V2_MEMORY_BUDGET_MIB       per-owner memory estimate budget
  *                                        (default 4608, 1024..30720); an owner
  *                                        over it is refused with memory_budget
@@ -49,18 +89,24 @@
  *                                        (default 256, 32..256)
  *   ANALYTICS_V2_READ_CHUNK_OCCURRENCES  occurrences one read call targets
  *                                        (default 250000, 10000..2000000)
- * The run refuses to start (ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT) unless
- * the heap limit covers the budget plus the reserve: 512 MiB plus 4 KiB per
- * read-chunk occurrence.
+ * The heap is partitioned: the per-owner budget, the read reserve (4 KiB per
+ * read-chunk occurrence), a 256 MiB runtime reserve, and the rest is the
+ * output budget, which A-2's output account charges every held output row
+ * against (resources.ts). The run refuses to start
+ * (ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT) unless the output budget is at
+ * least 64 MiB, and refuses mid-run (ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED,
+ * nothing written) when the account exceeds it.
  *
- * Database: in a Cloud Run Job (CLOUD_RUN_JOB set) it connects through
- * cloud-sql.mjs createIamPool and, until cutover, only to the private test
- * primary instance (production refusal stays in place). Elsewhere it needs a
- * local endpoint: PG_TEST_SOCKET (a private /private/tmp/tibotattle-pg-*
- * socket directory) or a loopback PG_TEST_HOST, with PG_TEST_PORT.
+ * Database: under a production target, the configured Cloud SQL instance
+ * through cloud-sql.mjs createIamPool. Otherwise, in a Cloud Run Job
+ * (CLOUD_RUN_JOB set), only the private test primary or the fast-path test
+ * database. Elsewhere it needs a local endpoint: PG_TEST_SOCKET (a private
+ * /private/tmp/tibotattle-pg-* socket directory) or a loopback PG_TEST_HOST,
+ * with PG_TEST_PORT.
  *
  * Output: one content-free JSON receipt line on stdout (counts and calendar
- * days only), or one JSON error line with a closed code on stderr. Exit 0 for
+ * days only), or one JSON error line with a closed code on stderr (a deadline
+ * or output-budget refusal adds its content-free figures). Exit 0 for
  * complete and LOCK_HELD, 2 for a usage refusal, 1 for any other failure.
  *
  * The TypeScript store and the A-1/A-2 modules are loaded through literal
@@ -80,7 +126,11 @@ import {
   createIamPool as createCloudSqlIamPool,
   normalizeIamUser,
 } from "./cloud-sql.mjs";
-import { FASTPATH_TEST_CLOUD_TARGET, isFastpathTestSchema } from "./origin-fastpath-mode.mjs";
+import {
+  FASTPATH_TEST_CLOUD_TARGET,
+  FASTPATH_TEST_SCHEMA_PREFIXES,
+  isFastpathTestSchema,
+} from "./origin-fastpath-mode.mjs";
 import { CLOUD_RUN_IAM_TEST_TARGET } from "./postgres-test-dispatch.mjs";
 
 /** Mirrors contract.ts ANALYTICS_V2_REFRESH_ENTRY; the spec pins the equality. */
@@ -92,6 +142,37 @@ export const ANALYTICS_REFRESH_MODES = Object.freeze(["full"]);
 /** POSTGRES_TEST_HTTP_MODE values the host accepts (server.mjs postgresTestHttpMode). */
 const TEST_HTTP_MODES = new Set(["health-only", "health-and-v12-day-manifest", "cloud-run-iam", "fastpath-test"]);
 const FLAG = /^--([a-z][a-z-]*)=(.*)$/su;
+/** The production target's planes (ANALYTICS_REFRESH_TARGET). */
+export const ANALYTICS_REFRESH_TARGETS = Object.freeze(["production", "staging"]);
+/** The closed environment of a production or staging run, in the order C-INFRA renders it. */
+export const ANALYTICS_REFRESH_PRODUCTION_ENV = Object.freeze([
+  "ANALYTICS_REFRESH_TARGET", "PRIMARY_INSTANCE_CONNECTION_NAME", "PRIMARY_DATABASE", "PRIMARY_SCHEMA",
+  "POSTGRES_IAM_USER", "ANALYTICS_V2_MEMORY_BUDGET_MIB",
+]);
+/** Configuration namespaces a production run closes: any other name in them is refused. */
+export const ANALYTICS_REFRESH_CLOSED_PREFIXES = Object.freeze(["ANALYTICS_", "PRIMARY_", "POSTGRES_", "PG_", "LEDGER_"]);
+/**
+ * The production refresh Job as C-INFRA renders it. The task profile is the
+ * dense one (4 vCPU, 16 GiB, a 12,288 MiB heap, a 10,752 MiB per-owner
+ * budget, 4 h) until MEAS-3 measures the largest real owner on Cloud Run
+ * (dense-owner parity receipt). One task, no retries: a run either writes
+ * everything in one transaction or nothing, and the time guard refuses it
+ * before taskTimeoutSeconds. `args` follows `node`.
+ */
+export const ANALYTICS_REFRESH_PRODUCTION_JOB = Object.freeze({
+  entry: "dist/analytics-refresh.mjs",
+  profile: "dense",
+  cpu: "4",
+  memory: "16Gi",
+  heapMiB: 12_288,
+  memoryBudgetMiB: 10_752,
+  taskTimeoutSeconds: 14_400,
+  tasks: 1,
+  parallelism: 1,
+  maxRetries: 0,
+  args: Object.freeze(["--max-old-space-size=12288", "dist/analytics-refresh.mjs", "--mode=full"]),
+  env: ANALYTICS_REFRESH_PRODUCTION_ENV,
+});
 const KNOWN_FLAGS = new Set(["mode", "schema", "now", "revision-seed"]);
 const ISO_INSTANT = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?Z$/u;
 const SCHEMA_IDENTIFIER = /^[a-z_][a-z0-9_]{0,62}$/u;
@@ -123,6 +204,26 @@ const DEFAULT_OCCURRENCE_CHUNK_DAYS = 400;
 const READ_SUMMARY_KEYS = Object.freeze(["unlinkedTypedOwners", "terminalOwners", "nonEffectiveUnread"]);
 const MIB = 1_024 * 1_024;
 const ENV_DECIMAL = /^(?:0|[1-9]\d{0,9})$/u;
+// Cloud Run job names: a DNS label starting with a letter (CR-3's pattern).
+const CLOUD_RUN_NAME = /^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
+// project:region:instance (CR-3's INSTANCE_CONNECTION_NAME_PATTERN).
+const INSTANCE_CONNECTION_NAME =
+  /^[a-z][a-z0-9-]{4,28}[a-z0-9]:[a-z]+-[a-z]+[0-9]+:[a-z](?:[a-z0-9-]{0,96}[a-z0-9])?$/u;
+// CR-3's DATABASE_PATTERN (cloud-sql.mjs DATABASE_PATTERN).
+const DATABASE_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/u;
+// A disposable rehearsal instance (postgres-production-migrations.mjs SCRATCH_INSTANCE_PATTERN).
+const SCRATCH_INSTANCE = /-rehearsal-[a-z0-9]{8}b?$/u;
+/** Tokens that mark a test or rehearsal resource; a production target refuses them. */
+const TEST_TOKENS = Object.freeze(["test", "rehearsal", "fastpath"]);
+/** Schema prefixes of the test and rehearsal estates (refused under a production target). */
+const TEST_SCHEMA_PREFIXES = Object.freeze([
+  ...FASTPATH_TEST_SCHEMA_PREFIXES,
+  "typed_legacy_transfer_rehearsal_",
+  "tibotattle_test_",
+]);
+/** Bounds of ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS (a test or local run's task timeout). */
+const TASK_TIMEOUT_SECONDS = Object.freeze({ name: "ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS", minimum: 60,
+  maximum: 604_800 });
 /**
  * The Job's resource environment. The first three mirror resources.ts
  * ANALYTICS_V2_RESOURCE_BOUNDS (in MiB where named so); the spec pins the
@@ -139,16 +240,48 @@ export const ANALYTICS_REFRESH_RESOURCE_ENV = Object.freeze({
     maximum: 2_000_000, default: 250_000 }),
 });
 /**
- * Heap the Job keeps outside the per-owner budget: fixed headroom for the
- * accumulated outputs of earlier owners, the non-effective owners' queued-day
- * occurrences and the community fold, plus the reader's transient per
- * candidate of one read call (an estimate: decoded sources and reconciliation
- * state of one expansion batch per candidate). The fixed part does not scale
- * with the roster or the cache horizon: every computed owner's rows are held
- * until the single write, so a large enough roster can outgrow it (the
- * dense-owner parity receipt states the measured scale).
+ * The heap partition outside the per-owner budget:
+ * - runtimeBytes: the bundled modules and kernels, the roster, every
+ *   effective owner's evidence counts, the journal days, the device counts,
+ *   the community fold (references into held rows) and one write chunk;
+ * - bytesPerReadCandidate: the reader's transient per candidate of one read
+ *   call (an estimate: decoded sources and reconciliation state of one
+ *   expansion batch per candidate);
+ * - the rest of the heap is the output budget, which A-2's output account
+ *   charges every held output row and the non-effective owners' held
+ *   occurrences against (resources.ts). It must be at least
+ *   minimumOutputBudgetBytes.
+ * The accumulated outputs are accounted, not covered by a fixed reserve: a
+ * roster or history whose outputs outgrow the heap refuses the run
+ * (ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED) before the heap is exhausted.
  */
-export const ANALYTICS_REFRESH_HEAP_RESERVE = Object.freeze({ fixedBytes: 512 * MIB, bytesPerReadCandidate: 4_096 });
+export const ANALYTICS_REFRESH_HEAP_RESERVE = Object.freeze({ runtimeBytes: 256 * MIB, bytesPerReadCandidate: 4_096,
+  minimumOutputBudgetBytes: 64 * MIB });
+/** resources.ts ANALYTICS_V2_RESOURCE_BOUNDS.outputBudgetBytes.maximum (the spec pins the equality). */
+const MAX_OUTPUT_BUDGET_BYTES = 30_720 * MIB;
+
+/**
+ * Measured phase rates (Node.js 22.16.0, local PostgreSQL 17, the dense-final
+ * refresh of docs/receipts/2026-10-01-gcp-dense-owner-parity.md: 360,462
+ * occurrences and about 294,000 analysis usage rows for owner e; read 134 s,
+ * prepare 107.5 s, scalar 15.1 s, model 399.3 s, write under 1 s for about
+ * 12 MB of rows), rounded down. The owner projection uses them as measured,
+ * so a run is refused early only when even the local rates cannot finish;
+ * a step about to start is projected at stepFactor times them (the test
+ * deploy read Cloud SQL about 5x slower than locally), so no step starts that
+ * could cross the refusal point. The write projection is deliberately
+ * conservative: about 12 times the measured local rate, plus a fixed minute.
+ */
+export const ANALYTICS_REFRESH_TIME_MODEL = Object.freeze({
+  readMsPerOccurrence: 0.37,
+  prepareMsPerOccurrence: 0.29,
+  scalarMsPerAnalysisUsage: 0.05,
+  modelMsPerAnalysisUsage: 1.35,
+  stepFactor: 5,
+  writeFixedMs: 60_000,
+  writeMsPerAccountMiB: 1_000,
+  exitMarginMs: 120_000,
+});
 /** Mirrors occurrence-source.ts MAX_ANALYTICS_V2_CANDIDATES (one read call's ceiling); the spec pins it. */
 export const ANALYTICS_REFRESH_MAX_READ_CANDIDATES = 2_000_000;
 
@@ -166,11 +299,18 @@ refusal) or 1 (failure).
   --revision-seed=<n>    first published revision is above n (default 0)
   --help                 print this text
 
+Production and staging: ANALYTICS_REFRESH_TARGET=production|staging with
+exactly PRIMARY_INSTANCE_CONNECTION_NAME, PRIMARY_DATABASE, PRIMARY_SCHEMA,
+POSTGRES_IAM_USER and ANALYTICS_V2_MEMORY_BUDGET_MIB; no --schema, --now or
+--revision-seed; run as node --max-old-space-size=12288 dist/analytics-refresh.mjs
+--mode=full (the dense profile, 4 h task timeout).
+
 Resources (environment, within bounds): ANALYTICS_V2_MEMORY_BUDGET_MIB (4608),
 ANALYTICS_V2_MAX_DAY_OCCURRENCES (250000), ANALYTICS_V2_MAX_DAY_RECORD_MIB (256),
-ANALYTICS_V2_READ_CHUNK_OCCURRENCES (250000). The Node heap limit must cover the
-budget plus 512 MiB plus 4 KiB per read-chunk occurrence (run the Job with
---max-old-space-size=6144 for the defaults).
+ANALYTICS_V2_READ_CHUNK_OCCURRENCES (250000), and, outside production,
+ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS (none). The Node heap limit must cover
+the budget, 256 MiB, 4 KiB per read-chunk occurrence and a 64 MiB output budget
+(run the Job with --max-old-space-size=6144 for the defaults).
 `;
 
 function fail(code, extra = {}) {
@@ -217,6 +357,13 @@ export function parseAnalyticsRefreshArguments(argv, env = {}) {
   }
   const mode = flags.get("mode");
   if (!ANALYTICS_REFRESH_MODES.includes(mode)) usageFail("ANALYTICS_V2_REFRESH_MODE_INVALID");
+  // A production target's invocation is exactly --mode=full: its schema is
+  // PRIMARY_SCHEMA, its clock is real and its revisions follow stored state.
+  if (analyticsRefreshProductionTargetRequested(env)) {
+    for (const name of ["schema", "now", "revision-seed"]) {
+      if (flags.has(name)) fail("ANALYTICS_V2_REFRESH_ARGUMENT_FORBIDDEN", { usage: true, field: name });
+    }
+  }
   let nowMs = null;
   if (flags.has("now")) {
     if (!analyticsRefreshTestClockAllowed(env)) usageFail("ANALYTICS_V2_TEST_CLOCK_FORBIDDEN");
@@ -240,6 +387,190 @@ export function parseAnalyticsRefreshArguments(argv, env = {}) {
   });
 }
 
+/** True when the environment names a production target at all (even an invalid one). */
+export function analyticsRefreshProductionTargetRequested(env) {
+  return env !== null && typeof env === "object" && Object.hasOwn(env, "ANALYTICS_REFRESH_TARGET");
+}
+
+function tokensOf(value) {
+  return value.toLowerCase().split(/[^a-z0-9]+/u).filter((token) => token.length > 0);
+}
+
+function markerPattern(marker) {
+  return new RegExp(`(?:^|[^a-z0-9])${marker}(?:[^a-z0-9]|$)`, "iu");
+}
+
+/**
+ * Every resource identity of the IAM test deployment and the fast-path test
+ * estate: a production target naming any of them is refused, whatever else it
+ * says (CR-3's testTargetIdentities, plus the fast-path resources).
+ */
+function testTargetIdentities() {
+  const iam = CLOUD_RUN_IAM_TEST_TARGET;
+  const fastpath = FASTPATH_TEST_CLOUD_TARGET;
+  return new Set([
+    iam.service, iam.postgres.primary.instanceConnectionName, iam.postgres.ledger.instanceConnectionName,
+    iam.postgres.primary.schema, iam.postgres.ledger.schema, iam.postgres.iamUser,
+    `${iam.postgres.iamUser}.gserviceaccount.com`,
+    fastpath.instanceConnectionName, fastpath.database, fastpath.primarySchema, fastpath.ledgerSchema,
+    fastpath.iamUser, `${fastpath.iamUser}.gserviceaccount.com`, fastpath.refreshJob, fastpath.originService,
+  ]);
+}
+const TEST_TARGET_VALUES = testTargetIdentities();
+
+/**
+ * CR-3's production refusal policy (cloud-run/postgres-production-configuration.mjs):
+ * the variables and prefixes it refuses in production, its plane markers and
+ * the production resource fingerprint values a staging run must not name.
+ * Mirrored, not imported: CR-3 imports Worker TypeScript (so the source entry
+ * could not answer --help under plain Node 22) and is not part of the audited
+ * image build context. The spec pins every value equal to CR-3's exports.
+ */
+export const ANALYTICS_REFRESH_CR3_POLICY = Object.freeze({
+  forbiddenVariables: Object.freeze([
+    "ACCESS_TEST_JWKS_JSON", "IDENTITY_TEST_JWKS_JSON", "POSTGRES_TEST_HTTP_MODE", "ADMIN_OWNER_FIXTURE_JSON",
+    "ADMIN_OWNER_PREVIOUS_FIXTURE_JSON", "EDGE_PROOF_SECRET", "EDGE_PROOF_SHA256", "EDGE_CLIENT_KEY_SECRET",
+    "EDGE_INVOKER_KEY_JSON", "DISTRIBUTION_ANALYTICS_API_TOKEN", "SPARKLE_APPCAST_GUARD_TOKEN",
+    "LEDGER_INSTANCE_CONNECTION_NAME", "LEDGER_DATABASE", "LEDGER_SCHEMA", "GCS_ERASURE_BUCKET_HISTORY_PROOF",
+  ]),
+  forbiddenPrefixes: Object.freeze(["HOST_RATE_LIMIT_", "LEDGER_"]),
+  stagingMarker: "staging",
+  productionMarker: "production",
+  fingerprint: Object.freeze([
+    "https://tibotattle.com", "https://admin.tibotattle.com", "https://www.tibotattle.com",
+    "tibotattle.com", "admin.tibotattle.com", "www.tibotattle.com",
+    "3ffbc68d303a9da74f462a685b788c57935c65024df4e9b144e1c872598bb61c", "production-v1",
+    "806510610397-f6k0uje651hpurbmfr7vub9iqj04428j.apps.googleusercontent.com", "com.usagemonitor.web", "L58X7J2J7A",
+    "app-usagemonitor", "app-usagemonitor-production", "app-usagemonitor-production-deletion-ledger",
+    "app-usagemonitor-production-quarantine", "tibotattle-updates",
+  ]),
+});
+const PRODUCTION_POLICY = Object.freeze({
+  forbiddenVariables: ANALYTICS_REFRESH_CR3_POLICY.forbiddenVariables,
+  forbiddenPrefixes: ANALYTICS_REFRESH_CR3_POLICY.forbiddenPrefixes,
+  fingerprint: new Set(ANALYTICS_REFRESH_CR3_POLICY.fingerprint),
+  stagingMarker: markerPattern(ANALYTICS_REFRESH_CR3_POLICY.stagingMarker),
+  productionMarker: markerPattern(ANALYTICS_REFRESH_CR3_POLICY.productionMarker),
+});
+
+function productionValue(env, name, pattern) {
+  const value = env[name];
+  if (typeof value !== "string" || value.length === 0) fail("ANALYTICS_V2_REFRESH_ENV_MISSING", { field: name });
+  if (!pattern.test(value)) fail("ANALYTICS_V2_REFRESH_ENV_INVALID", { field: name });
+  return value;
+}
+
+/**
+ * The reviewed production target path (C-REFRESH): read the closed
+ * environment of a production or staging run, or return null when no
+ * ANALYTICS_REFRESH_TARGET is set (the Job's test targets apply). Refuses,
+ * with a closed code naming the setting and never its value:
+ * - ANALYTICS_V2_REFRESH_TARGET_INVALID: a target other than production or staging;
+ * - ANALYTICS_V2_TEST_CLOCK_FORBIDDEN: ANALYTICS_V2_TEST_CLOCK present (even empty);
+ * - ANALYTICS_V2_REFRESH_ENV_FORBIDDEN: any CR-3 production-forbidden variable or
+ *   prefix, GOOGLE_APPLICATION_CREDENTIALS, or any other variable in the
+ *   closed namespaces (ANALYTICS_REFRESH_CLOSED_PREFIXES);
+ * - ANALYTICS_V2_REFRESH_CONTEXT_INVALID: not one task of a Cloud Run Job;
+ * - ANALYTICS_V2_REFRESH_ENV_MISSING / _ENV_INVALID: a contract variable absent or malformed;
+ * - ANALYTICS_V2_REFRESH_TEST_TARGET_FORBIDDEN: a test or rehearsal resource;
+ * - ANALYTICS_V2_REFRESH_PLANE_MISMATCH: a resource carrying the other plane's marker.
+ */
+export async function readAnalyticsRefreshProductionTarget(env = {}) {
+  if (env === null || typeof env !== "object") fail("ANALYTICS_V2_REFRESH_TARGET_INVALID");
+  if (!analyticsRefreshProductionTargetRequested(env)) return null;
+  const target = env.ANALYTICS_REFRESH_TARGET;
+  if (!ANALYTICS_REFRESH_TARGETS.includes(target)) fail("ANALYTICS_V2_REFRESH_TARGET_INVALID");
+  if (Object.hasOwn(env, "ANALYTICS_V2_TEST_CLOCK")) fail("ANALYTICS_V2_TEST_CLOCK_FORBIDDEN");
+  const policy = PRODUCTION_POLICY;
+  const names = Object.keys(env);
+  for (const name of policy.forbiddenVariables) {
+    if (Object.hasOwn(env, name)) fail("ANALYTICS_V2_REFRESH_ENV_FORBIDDEN", { field: name });
+  }
+  for (const prefix of policy.forbiddenPrefixes) {
+    const name = names.find((candidate) => candidate.startsWith(prefix));
+    if (name !== undefined) fail("ANALYTICS_V2_REFRESH_ENV_FORBIDDEN", { field: name });
+  }
+  if (Object.hasOwn(env, "GOOGLE_APPLICATION_CREDENTIALS")) {
+    fail("ANALYTICS_V2_REFRESH_ENV_FORBIDDEN", { field: "GOOGLE_APPLICATION_CREDENTIALS" });
+  }
+  for (const name of names.sort()) {
+    if (ANALYTICS_REFRESH_CLOSED_PREFIXES.some((prefix) => name.startsWith(prefix))
+        && !ANALYTICS_REFRESH_PRODUCTION_ENV.includes(name)) {
+      fail("ANALYTICS_V2_REFRESH_ENV_FORBIDDEN", { field: name });
+    }
+  }
+  const job = env.CLOUD_RUN_JOB;
+  if (typeof job !== "string" || !CLOUD_RUN_NAME.test(job) || Object.hasOwn(env, "K_SERVICE")
+      || env.CLOUD_RUN_TASK_INDEX !== "0" || env.CLOUD_RUN_TASK_COUNT !== "1") {
+    fail("ANALYTICS_V2_REFRESH_CONTEXT_INVALID");
+  }
+  const instanceConnectionName = productionValue(env, "PRIMARY_INSTANCE_CONNECTION_NAME", INSTANCE_CONNECTION_NAME);
+  const database = productionValue(env, "PRIMARY_DATABASE", DATABASE_IDENTIFIER);
+  const schema = productionValue(env, "PRIMARY_SCHEMA", SCHEMA_IDENTIFIER);
+  if (schema.startsWith("pg_") || schema === "information_schema") {
+    fail("ANALYTICS_V2_REFRESH_ENV_INVALID", { field: "PRIMARY_SCHEMA" });
+  }
+  const rawIamUser = productionValue(env, "POSTGRES_IAM_USER", /^.{1,128}$/su);
+  let iamUser;
+  try {
+    iamUser = normalizeIamUser(rawIamUser, "POSTGRES_IAM_USER");
+  } catch {
+    fail("ANALYTICS_V2_REFRESH_ENV_INVALID", { field: "POSTGRES_IAM_USER" });
+  }
+  productionValue(env, "ANALYTICS_V2_MEMORY_BUDGET_MIB", ENV_DECIMAL);
+  // Test and rehearsal resources, by identity and by name.
+  const settings = [["CLOUD_RUN_JOB", job], ["PRIMARY_INSTANCE_CONNECTION_NAME", instanceConnectionName],
+    ["PRIMARY_DATABASE", database], ["PRIMARY_SCHEMA", schema], ["POSTGRES_IAM_USER", rawIamUser],
+    ["POSTGRES_IAM_USER", iamUser]];
+  for (const [name, value] of settings) {
+    if (TEST_TARGET_VALUES.has(value) || policy.fingerprint.has(value)
+        || (name !== "POSTGRES_IAM_USER" && tokensOf(value).some((token) => TEST_TOKENS.includes(token)))) {
+      fail("ANALYTICS_V2_REFRESH_TEST_TARGET_FORBIDDEN", { field: name });
+    }
+  }
+  const instance = instanceConnectionName.split(":")[2];
+  if (SCRATCH_INSTANCE.test(instance)) fail("ANALYTICS_V2_REFRESH_TEST_TARGET_FORBIDDEN",
+    { field: "PRIMARY_INSTANCE_CONNECTION_NAME" });
+  if (TEST_SCHEMA_PREFIXES.some((prefix) => schema.startsWith(prefix))) {
+    fail("ANALYTICS_V2_REFRESH_TEST_TARGET_FORBIDDEN", { field: "PRIMARY_SCHEMA" });
+  }
+  // CR-3's plane markers on the plane-identifying names.
+  for (const [name, value] of [["CLOUD_RUN_JOB", job], ["PRIMARY_INSTANCE_CONNECTION_NAME", instanceConnectionName]]) {
+    if (target === "staging" ? !policy.stagingMarker.test(value) || policy.productionMarker.test(value)
+      : policy.stagingMarker.test(value)) {
+      fail("ANALYTICS_V2_REFRESH_PLANE_MISMATCH", { field: name });
+    }
+  }
+  return Object.freeze({
+    target,
+    job,
+    instanceConnectionName,
+    database,
+    schema,
+    iamUser,
+    taskTimeoutSeconds: ANALYTICS_REFRESH_PRODUCTION_JOB.taskTimeoutSeconds,
+  });
+}
+
+/**
+ * The task timeout the time guard enforces, in milliseconds, or null: a
+ * production target's profile timeout; otherwise
+ * ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS when set (within its bounds).
+ */
+export function analyticsRefreshTaskTimeoutMs(env, productionTarget) {
+  if (productionTarget !== null && productionTarget !== undefined) return productionTarget.taskTimeoutSeconds * 1_000;
+  const text = env?.[TASK_TIMEOUT_SECONDS.name];
+  if (text === undefined || text === "") return null;
+  if (typeof text !== "string" || !ENV_DECIMAL.test(text)) {
+    fail("ANALYTICS_V2_REFRESH_RESOURCES_INVALID", { field: TASK_TIMEOUT_SECONDS.name });
+  }
+  const seconds = Number(text);
+  if (seconds < TASK_TIMEOUT_SECONDS.minimum || seconds > TASK_TIMEOUT_SECONDS.maximum) {
+    fail("ANALYTICS_V2_REFRESH_RESOURCES_INVALID", { field: TASK_TIMEOUT_SECONDS.name });
+  }
+  return seconds * 1_000;
+}
+
 function resourceValue(env, entry) {
   const text = env?.[entry.name];
   if (text === undefined || text === "") return entry.default;
@@ -254,27 +585,30 @@ function resourceValue(env, entry) {
 }
 
 /**
- * The run's resources from the environment, and the heap they need. Refused
- * before any connection: a value outside its bounds
- * (ANALYTICS_V2_REFRESH_RESOURCES_INVALID), or a heap limit below the budget
- * plus the reserve (ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT). This bounds one
- * admitted owner's estimate plus a fixed reserve. It is not a bound on the
- * whole run: the outputs accumulated before the last owner are covered only by
- * the fixed reserve, which does not grow with the roster or the horizon.
+ * The run's resources from the environment, and the heap partition they
+ * imply. Refused before any connection: a value outside its bounds
+ * (ANALYTICS_V2_REFRESH_RESOURCES_INVALID), or a heap limit that leaves less
+ * than the minimum output budget after the per-owner budget, the read
+ * reserve and the runtime reserve (ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT).
+ * The rest of the heap is the output budget (compute.outputBudgetBytes), so
+ * the whole run is bounded: one admitted owner's estimate, the accounted
+ * outputs and held inputs, and the reserves.
  */
 export function analyticsRefreshResources(env, heapLimitBytes) {
   const spec = ANALYTICS_REFRESH_RESOURCE_ENV;
+  const reserve = ANALYTICS_REFRESH_HEAP_RESERVE;
   const memoryBudgetBytes = resourceValue(env, spec.memoryBudgetMiB) * MIB;
   const maxDayOccurrences = resourceValue(env, spec.maxDayOccurrences);
   const maxDayRecordBytes = resourceValue(env, spec.maxDayRecordMiB) * MIB;
   const readChunkOccurrences = resourceValue(env, spec.readChunkOccurrences);
-  const requiredHeapBytes = memoryBudgetBytes + ANALYTICS_REFRESH_HEAP_RESERVE.fixedBytes
-    + readChunkOccurrences * ANALYTICS_REFRESH_HEAP_RESERVE.bytesPerReadCandidate;
+  const reservedBytes = memoryBudgetBytes + reserve.runtimeBytes + readChunkOccurrences * reserve.bytesPerReadCandidate;
+  const requiredHeapBytes = reservedBytes + reserve.minimumOutputBudgetBytes;
   if (!Number.isSafeInteger(heapLimitBytes) || heapLimitBytes < requiredHeapBytes) {
     fail("ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT");
   }
+  const outputBudgetBytes = Math.min(heapLimitBytes - reservedBytes, MAX_OUTPUT_BUDGET_BYTES);
   return Object.freeze({
-    compute: Object.freeze({ memoryBudgetBytes, maxDayOccurrences, maxDayRecordBytes }),
+    compute: Object.freeze({ memoryBudgetBytes, maxDayOccurrences, maxDayRecordBytes, outputBudgetBytes }),
     readChunkOccurrences,
     heapLimitBytes,
     requiredHeapBytes,
@@ -303,13 +637,27 @@ async function privateSocketDirectory(directory) {
 }
 
 /**
- * The database target. A Cloud Run Job may reach only the private test
- * primary until cutover: the shared test database, or, for the fast-path
- * refresh Job alone, the disposable fast-path database and only a pinned or
- * seeded fast-path schema (`schema`, the parsed --schema). Anywhere else
- * only a loopback or private-socket PostgreSQL is accepted.
+ * The database target. Under a production target
+ * (readAnalyticsRefreshProductionTarget), its configured Cloud SQL instance,
+ * database and IAM user; the schema must be its PRIMARY_SCHEMA. Without one,
+ * a Cloud Run Job may reach only the private test primary: the shared test
+ * database, or, for the fast-path refresh Job alone, the disposable fast-path
+ * database and only a pinned or seeded fast-path schema (`schema`, the parsed
+ * --schema). Anywhere else only a loopback or private-socket PostgreSQL is
+ * accepted.
  */
 export async function resolveAnalyticsRefreshDatabase(env = {}, { schema } = {}) {
+  const production = await readAnalyticsRefreshProductionTarget(env);
+  if (production !== null) {
+    if (schema !== production.schema) fail("ANALYTICS_V2_REFRESH_TARGET_FORBIDDEN");
+    return Object.freeze({
+      kind: "cloud-sql",
+      target: production.target,
+      instanceConnectionName: production.instanceConnectionName,
+      database: production.database,
+      iamUser: production.iamUser,
+    });
+  }
   if (typeof env.CLOUD_RUN_JOB === "string" && env.CLOUD_RUN_JOB.length > 0) {
     if (env.K_SERVICE !== undefined) fail("ANALYTICS_V2_REFRESH_CONTEXT_INVALID");
     const fastpath = env.CLOUD_RUN_JOB === FASTPATH_TEST_CLOUD_TARGET.refreshJob;
@@ -640,10 +988,11 @@ function compareOwners(left, right) {
  *   loadOwnerOccurrences, ownerEvidence, resources}) over ONE contiguous range
  *   that covers analyticsV2RequiredOccurrenceRange.
  *
- * Effective owners are counted over the whole range during read and loaded
- * over it, one at a time, during compute: every stream in contiguous spans of
- * at most MAX_ANALYTICS_V2_OCCURRENCE_DAYS days and, by the counts, about the
- * read chunk of occurrences. A-2 skips the load of an owner its memory guard
+ * Effective owners are counted over the whole range during read and loaded,
+ * one at a time and one A-2 segment at a time, during compute: every stream
+ * of the requested segment (the whole range when A-2 names none) in
+ * contiguous spans of at most MAX_ANALYTICS_V2_OCCURRENCE_DAYS days and, by
+ * the counts, about the read chunk of occurrences. A-2 skips the load of an owner its memory guard
  * refuses and refuses a load that differs from the counts. A non-effective owner with
  * typed evidence is a member of production's daily cohort: it is read over
  * the queued days only, so A-2 blocks exactly the queued days it has evidence
@@ -750,7 +1099,7 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
   }
 
   return Object.freeze({
-    async read({ pool, schema, nowMs, state, resources }) {
+    async read({ pool, schema, nowMs, state, resources, checkpoint = () => {} }) {
       const context = Object.freeze({ pool, schema, nowMs });
       const readChunk = resources?.readChunkOccurrences
         ?? ANALYTICS_REFRESH_RESOURCE_ENV.readChunkOccurrences.default;
@@ -775,6 +1124,7 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
       let firstEvidenceDay = null;
       for (const owner of ownerList) {
         if (owner.source !== "effective") continue;
+        checkpoint(Object.freeze({ kind: "read" }));
         const first = await readFirstEvidenceDay(context, { ownerDigest: owner.ownerDigest, throughDay: today });
         if (first === null) continue;
         if (!isDay(first) || first > today) fail("ANALYTICS_V2_REFRESH_OCCURRENCES_INVALID");
@@ -806,6 +1156,7 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
       const occurrencesByOwner = new Map();
       let nonEffectiveUnread = 0;
       for (const owner of ownerList) {
+        checkpoint(Object.freeze({ kind: "read" }));
         if (owner.source === "effective") {
           const counted = await countOwnerEvidence(context, owner.ownerDigest, fullRange);
           ownerEvidence.set(owner.ownerDigest, counted.evidence);
@@ -827,14 +1178,21 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
       const devicesByDay = await countDevices(context, { days: contributing });
       if (!(devicesByDay instanceof Map)) fail("ANALYTICS_V2_REFRESH_DEVICES_INVALID");
 
-      // One effective owner's occurrences over the whole range, in spans of
-      // about the read chunk by its exact counts. Called by A-2 only while the
-      // run's read snapshot is open (runAnalyticsRefresh closes it after compute).
-      const loadOwnerOccurrences = async (ownerDigest) => {
+      // One effective owner's occurrences over one A-2 segment (the whole
+      // range when none is named), in spans of about the read chunk by its
+      // exact counts. Called by A-2 only while the run's read snapshot is open
+      // (runAnalyticsRefresh closes it after compute).
+      const loadOwnerOccurrences = async (ownerDigest, segment = occurrenceRange) => {
         const counts = streamCounts.get(ownerDigest);
         if (counts === undefined) fail("ANALYTICS_V2_REFRESH_OCCURRENCES_INVALID");
+        if (segment === null || typeof segment !== "object" || !isDay(segment.fromDay) || !isDay(segment.throughDay)
+            || segment.fromDay > segment.throughDay || segment.fromDay < occurrenceRange.fromDay
+            || segment.throughDay > occurrenceRange.throughDay) {
+          fail("ANALYTICS_V2_REFRESH_RANGE_INVALID");
+        }
+        const bounded = Object.freeze({ fromDay: segment.fromDay, throughDay: segment.throughDay });
         return readOwnerDays(context, ownerDigest, (stream) =>
-          analyticsRefreshReadSpans(occurrenceRange, chunkDays, counts[stream], readChunk).map((span) => ({
+          analyticsRefreshReadSpans(bounded, chunkDays, counts[stream], readChunk).map((span) => ({
             fromDay: span.fromDay,
             throughDay: span.throughDay,
             maxCandidates: Math.min(ANALYTICS_REFRESH_MAX_READ_CANDIDATES, Math.max(readChunk, span.occurrences)),
@@ -858,7 +1216,7 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
         ...(resources?.compute === undefined ? {} : { resources: resources.compute }),
       };
     },
-    async compute(inputs, { nowMs, revisionSeed, memoryProbe = defaultMemoryProbe }) {
+    async compute(inputs, { nowMs, revisionSeed, memoryProbe = defaultMemoryProbe, checkpoint }) {
       const outputs = await computeOutputs({
         owners: inputs.owners,
         occurrencesByOwner: inputs.occurrencesByOwner,
@@ -872,6 +1230,7 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
         ownerEvidence: inputs.ownerEvidence,
         ...(inputs.resources === undefined ? {} : { resources: inputs.resources }),
         memoryProbe,
+        ...(checkpoint === undefined ? {} : { checkpoint }),
       });
       if (outputs === null || typeof outputs !== "object" || !Array.isArray(outputs.dailyCandidates)
           || !Array.isArray(outputs.blockedDays)) {
@@ -922,6 +1281,110 @@ export async function loadAnalyticsV2Modules() {
   });
 }
 
+/**
+ * The time guard (see the header). With no task timeout it is inert. With
+ * one, the refusal point is the task deadline less the exit margin and the
+ * projected write of the current output account; a checkpoint refuses
+ * - ANALYTICS_V2_REFRESH_DEADLINE_PROJECTED when the plan, or the remaining
+ *   owners at an owner checkpoint, cannot finish before it at the measured
+ *   rates, and
+ * - ANALYTICS_V2_REFRESH_DEADLINE_EXCEEDED when the refusal point has passed,
+ *   or a step about to start (a segment load and its days, one model date)
+ *   could cross it at stepFactor times the measured rates.
+ * The error carries `deadline`, content-free seconds and owner counts.
+ */
+export function createAnalyticsRefreshTimeGuard({ startedAtMs, taskTimeoutMs, wallClock,
+  model = ANALYTICS_REFRESH_TIME_MODEL }) {
+  if (taskTimeoutMs === null || taskTimeoutMs === undefined) {
+    return Object.freeze({ active: false, checkpoint() {}, beforeWrite() {}, summary: () => null });
+  }
+  if (!Number.isSafeInteger(startedAtMs) || !Number.isSafeInteger(taskTimeoutMs) || taskTimeoutMs < 1
+      || typeof wallClock !== "function") {
+    fail("ANALYTICS_V2_REFRESH_DEADLINE_INVALID");
+  }
+  const deadlineMs = startedAtMs + taskTimeoutMs;
+  let plannedOwners = null;
+  let projections = null;
+  let plannedMs = null;
+  let ownerIndex = -1;
+  let ownerAnalysisUsage = 0;
+  let accountBytes = 0;
+  const writeMs = (bytes) => model.writeFixedMs + model.writeMsPerAccountMiB * (bytes / MIB);
+  const refuseAtMs = () => deadlineMs - model.exitMarginMs - writeMs(accountBytes);
+  const ownerMs = (owner) => (owner.admitted
+    ? (model.readMsPerOccurrence + model.prepareMsPerOccurrence) * owner.occurrences
+      + (model.scalarMsPerAnalysisUsage + model.modelMsPerAnalysisUsage) * owner.analysisUsage
+    : 0);
+  const seconds = (milliseconds) => Math.max(0, Math.ceil(milliseconds / 1_000));
+  const refuse = (code, now, projectedMs = null) => fail(code, {
+    deadline: Object.freeze({
+      taskTimeoutSeconds: seconds(taskTimeoutMs),
+      elapsedSeconds: seconds(now - startedAtMs),
+      refuseAtSeconds: seconds(refuseAtMs() - startedAtMs),
+      ...(projectedMs === null ? {} : { projectedSeconds: seconds(projectedMs) }),
+      ownersStarted: Math.max(0, ownerIndex + 1),
+      ownersPlanned: projections === null ? null : projections.length,
+    }),
+  });
+  const now = () => {
+    const value = wallClock();
+    if (!Number.isSafeInteger(value)) fail("ANALYTICS_V2_REFRESH_DEADLINE_INVALID");
+    return value;
+  };
+  const remainingMs = (fromIndex) => projections.slice(fromIndex).reduce((total, value) => total + value, 0);
+  return Object.freeze({
+    active: true,
+    checkpoint(event) {
+      const at = now();
+      if (Number.isSafeInteger(event?.accountBytes) && event.accountBytes >= 0) accountBytes = event.accountBytes;
+      if (at > refuseAtMs()) refuse("ANALYTICS_V2_REFRESH_DEADLINE_EXCEEDED", at);
+      switch (event?.kind) {
+        case "plan": {
+          if (!Array.isArray(event.owners)) fail("ANALYTICS_V2_REFRESH_DEADLINE_INVALID");
+          plannedOwners = event.owners;
+          projections = event.owners.map(ownerMs);
+          plannedMs = remainingMs(0);
+          if (at + plannedMs > refuseAtMs()) refuse("ANALYTICS_V2_REFRESH_DEADLINE_PROJECTED", at, plannedMs);
+          break;
+        }
+        case "owner": {
+          if (projections === null || !Number.isSafeInteger(event.index) || event.index >= projections.length) {
+            fail("ANALYTICS_V2_REFRESH_DEADLINE_INVALID");
+          }
+          ownerIndex = event.index;
+          // Only an admitted owner is read and computed.
+          ownerAnalysisUsage = plannedOwners[event.index].admitted ? plannedOwners[event.index].analysisUsage : 0;
+          const remaining = remainingMs(event.index);
+          if (at + remaining > refuseAtMs()) refuse("ANALYTICS_V2_REFRESH_DEADLINE_PROJECTED", at, remaining);
+          break;
+        }
+        case "segment": {
+          const step = model.stepFactor * (model.readMsPerOccurrence + model.prepareMsPerOccurrence)
+            * (Number.isSafeInteger(event.occurrences) ? event.occurrences : 0);
+          if (at + step > refuseAtMs()) refuse("ANALYTICS_V2_REFRESH_DEADLINE_EXCEEDED", at, step);
+          break;
+        }
+        case "model": {
+          const step = model.stepFactor * model.modelMsPerAnalysisUsage * ownerAnalysisUsage / 70;
+          if (at + step > refuseAtMs()) refuse("ANALYTICS_V2_REFRESH_DEADLINE_EXCEEDED", at, step);
+          break;
+        }
+        default:
+          break;
+      }
+    },
+    beforeWrite(bytes) {
+      if (Number.isSafeInteger(bytes) && bytes >= 0) accountBytes = bytes;
+      const at = now();
+      if (at > refuseAtMs()) refuse("ANALYTICS_V2_REFRESH_DEADLINE_EXCEEDED", at);
+    },
+    summary: () => Object.freeze({
+      taskTimeoutSeconds: seconds(taskTimeoutMs),
+      plannedSeconds: plannedMs === null ? null : seconds(plannedMs),
+    }),
+  });
+}
+
 function safeCode(error, fallback) {
   return typeof error?.code === "string" && SAFE_CODE.test(error.code) ? error.code : fallback;
 }
@@ -958,6 +1421,11 @@ function memorySummary(resources, recorded, peakRssBytes) {
     largestEstimateMiB: toMiB(largest(owners.map((owner) => owner.estimateBytes ?? 0))),
     largestHeapPeakMiB: toMiB(largest(owners.map((owner) => owner.heapPeakBytes ?? 0))),
     peakRssMiB: Number.isSafeInteger(peakRssBytes) && peakRssBytes >= 0 ? toMiB(peakRssBytes) : null,
+    outputModel: typeof recorded?.configuration?.outputModel === "string" ? recorded.configuration.outputModel : null,
+    outputBudgetMiB: Math.floor(resources.compute.outputBudgetBytes / MIB),
+    accountMiB: Number.isSafeInteger(recorded?.account?.accountBytes) ? toMiB(recorded.account.accountBytes) : null,
+    heldInputMiB: Number.isSafeInteger(recorded?.account?.heldInputBytes) ? toMiB(recorded.account.heldInputBytes) : null,
+    largestOwnerOutputMiB: toMiB(largest(owners.map((owner) => owner.outputBytes ?? 0))),
   });
 }
 
@@ -967,11 +1435,30 @@ function countBy(values, key) {
   return Object.fromEntries(Object.entries(counts).sort(([left], [right]) => (left < right ? -1 : 1)));
 }
 
+/** A refusal's content-free figures for the error line: closed keys, safe integers or null only. */
+function refusalFigures(error) {
+  if (error?.code === "ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED" && Number.isSafeInteger(error.accountBytes)
+      && Number.isSafeInteger(error.outputBudgetBytes)) {
+    return { outputAccount: Object.freeze({ accountMiB: Math.ceil(error.accountBytes / MIB),
+      outputBudgetMiB: Math.floor(error.outputBudgetBytes / MIB) }) };
+  }
+  const deadline = error?.deadline;
+  if (deadline !== null && typeof deadline === "object" && /^ANALYTICS_V2_REFRESH_DEADLINE_/u.test(error.code ?? "")) {
+    const keys = ["taskTimeoutSeconds", "elapsedSeconds", "refuseAtSeconds", "projectedSeconds", "ownersStarted",
+      "ownersPlanned"];
+    return { deadline: Object.freeze(Object.fromEntries(keys
+      .filter((key) => Object.hasOwn(deadline, key) && (deadline[key] === null || Number.isSafeInteger(deadline[key])))
+      .map((key) => [key, deadline[key]]))) };
+  }
+  return {};
+}
+
 /**
  * Run one refresh. dependencies (tests and the composition root only):
  * createPool(database, {connector}), createConnector(), closeResources(),
  * modules ({store, pipeline}), wallClock(), randomUUID(), heapLimitBytes, peakRssBytes().
- * Returns the receipt; throws an error carrying a closed code and phase.
+ * Returns the receipt; throws an error carrying a closed code and phase (and,
+ * for a deadline or output-budget refusal, its content-free figures).
  */
 export async function runAnalyticsRefresh({
   argv = process.argv.slice(2),
@@ -985,6 +1472,7 @@ export async function runAnalyticsRefresh({
   const nowMs = parsed.nowMs ?? startedAtMs;
   const base = {
     schemaVersion: ANALYTICS_REFRESH_RECEIPT_VERSION,
+    target: null,
     mode: parsed.mode,
     schema: parsed.schema,
     now: new Date(nowMs).toISOString(),
@@ -1001,8 +1489,15 @@ export async function runAnalyticsRefresh({
   let receipt;
   let failure;
   try {
+    const production = await readAnalyticsRefreshProductionTarget(env);
+    if (production !== null) base.target = production.target;
     const resources = analyticsRefreshResources(env,
       dependencies.heapLimitBytes ?? getHeapStatistics().heap_size_limit);
+    const guard = createAnalyticsRefreshTimeGuard({ startedAtMs,
+      taskTimeoutMs: analyticsRefreshTaskTimeoutMs(env, production), wallClock });
+    // A deadline that leaves no room for the write and the exit is refused
+    // before any module, pool or lock.
+    guard.checkpoint(Object.freeze({ kind: "start" }));
     const database = await resolveAnalyticsRefreshDatabase(env, { schema: parsed.schema });
     phase = "modules";
     const modules = dependencies.modules ?? await loadAnalyticsV2Modules();
@@ -1050,6 +1545,7 @@ export async function runAnalyticsRefresh({
           state,
           revisionSeed: parsed.revisionSeed,
           resources,
+          checkpoint: guard.checkpoint,
         });
         readMs = Math.max(0, wallClock() - readStartedMs);
         // Owners are read in the same snapshot while they are computed.
@@ -1058,6 +1554,7 @@ export async function runAnalyticsRefresh({
           mode: parsed.mode,
           nowMs,
           revisionSeed: parsed.revisionSeed,
+          ...(guard.active ? { checkpoint: guard.checkpoint } : {}),
         });
       } finally {
         await readPool.close();
@@ -1071,6 +1568,7 @@ export async function runAnalyticsRefresh({
       }
 
       phase = "write";
+      guard.beforeWrite(outputs.resources?.account?.accountBytes);
       const runId = (dependencies.randomUUID ?? randomUUID)();
       const written = await store.writeRunOutputs(client, outputs, {
         schema: parsed.schema,
@@ -1103,6 +1601,7 @@ export async function runAnalyticsRefresh({
         cursor: written.cursor,
         timings: written.timings,
         memory: memorySummary(resources, outputs.resources, (dependencies.peakRssBytes ?? defaultPeakRssBytes)()),
+        timeGuard: guard.summary(),
       });
     }
   } catch (error) {
@@ -1116,6 +1615,7 @@ export async function runAnalyticsRefresh({
       ...(typeof error?.field === "string" && /^[A-Za-z0-9_.]{1,80}$/u.test(error.field)
         ? { field: error.field } : {}),
       ...(error?.usage === true ? { usage: true } : {}),
+      ...refusalFigures(error),
     });
   } finally {
     if (client !== undefined) {
@@ -1167,6 +1667,9 @@ async function main() {
       phase: typeof error?.phase === "string" ? error.phase : "configuration",
       ...(typeof error?.sqlState === "string" ? { sqlState: error.sqlState } : {}),
       ...(typeof error?.field === "string" ? { field: error.field } : {}),
+      ...(error?.deadline !== null && typeof error?.deadline === "object" ? { deadline: error.deadline } : {}),
+      ...(error?.outputAccount !== null && typeof error?.outputAccount === "object"
+        ? { outputAccount: error.outputAccount } : {}),
     })}\n`);
     process.exitCode = error?.usage === true ? 2 : 1;
   }

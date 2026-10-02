@@ -21,6 +21,9 @@
  *   hotel   social, v1.2 only, seeded only with `dense`  effective / effective
  *   india   social, v1.2 only, seeded only with `v12Scope`  effective / effective
  *   juliet  social, v1.2 only, seeded only with `v12Scope`  effective / effective
+ *   kilo    social, v1 + v1.1, seeded only with `denseLegacy`  effective / mixed
+ *   lima    social, v1 + v1.1, seeded only with `legacyScope`  effective / mixed
+ *   mike    social, v1.1 only, seeded only with `legacyScope`  effective / v1.1
  *
  * The usage-correction runtime row is immutable once written, so each runtime
  * state gets its own schema: seedAnalyticsV2Fixture({ correctionRuntime }).
@@ -38,6 +41,26 @@
  * holds (the schema's ready guard forbids this, so the fixture bypasses that
  * trigger for this one row); and juliet's record, another participant's.
  * Nothing else changes.
+ *
+ * `denseLegacy: { days, usagePerDay, v1PerDay = 0, throughDay = D3 }`
+ * (C-REFRESH, the legacy expansion at volume) adds kilo: `days` consecutive
+ * days through `throughDay`, each with `usagePerDay` v1.1 usage records (one
+ * retained generation, one ready manifest a day, 200-record chunks) and
+ * `v1PerDay` v1 usage records (accepted 200-record chunks). Every 10th v1
+ * record repeats a v1.1 occurrence of its day with identical content, so
+ * both legacy formats meet in one group. Occurrence ids, sessions and times
+ * are derived from fixed labels. Nothing else changes.
+ *
+ * `legacyScope: true` (C-REFRESH, the review of the legacy expansion and
+ * candidate rewrite) adds lima and mike. One usage occurrence id,
+ * OCCURRENCES.legacyScoped, has exactly one eligible typed legacy record
+ * (lima's first v1 device, D1 10:00) and three ineligible variants with other
+ * event times on D1, each of which the legacy readers must exclude: a record
+ * of lima's second v1 device in a superseded chunk, a record of lima's third
+ * v1 device in a chunk that accepted one record fewer than it declares, and
+ * mike's v1.1 record (another participant's). lima's v1.1 device also holds
+ * OCCURRENCES.legacyFirst at D1 00:00:00.000 and OCCURRENCES.legacyLast at
+ * D3 23:59:59.999, the first and last instants of the fixture's days.
  */
 
 import { createHash } from "node:crypto";
@@ -80,6 +103,12 @@ export const OCCURRENCES = Object.freeze({
   corrected: `event:v2:${digest("occurrence:corrected")}`,
   /** echo usage in v1.1 (D1). */
   echo: `event:v2:${digest("occurrence:echo")}`,
+  /** lima usage with one eligible v1 record and three ineligible variants (D1, `legacyScope` only). */
+  legacyScoped: `event:v2:${digest("occurrence:legacy-scoped")}`,
+  /** lima v1.1 usage at the first instant of D1 (`legacyScope` only). */
+  legacyFirst: `event:v2:${digest("occurrence:legacy-first")}`,
+  /** lima v1.1 usage at the last instant of D3 (`legacyScope` only). */
+  legacyLast: `event:v2:${digest("occurrence:legacy-last")}`,
 });
 /** The totals the correction fact reports for OCCURRENCES.corrected. */
 export const CORRECTED_TOTALS = Object.freeze({ totalInputContextTokens: 1_000, outputCombinedTokens: 75 });
@@ -161,7 +190,7 @@ const PLAN_BASES = ["unavailable", "same_source_occurrence", "provisional_marker
  * digests are the bytes the production readers verify.
  */
 export async function seedAnalyticsV2Fixture({ pool, schema, modules, correctionRuntime, dense = null,
-  v12Scope = false }) {
+  v12Scope = false, denseLegacy = null, legacyScope = false }) {
   if (correctionRuntime !== "active" && correctionRuntime !== "staged") throw new Error("fixture_runtime_invalid");
   const { codec, v12codec, reconciliation, sha256Hex } = modules;
   const quoted = `"${schema}"`;
@@ -906,6 +935,85 @@ export async function seedAnalyticsV2Fixture({ pool, schema, modules, correction
     juliet = Object.freeze({ participantId: julietId, ownerDigest: julietDigest, devices: Object.freeze([julietDevice]) });
   }
 
+  // kilo (opt-in): a dense v1 + v1.1 legacy owner (see the module comment).
+  let kilo = null;
+  if (denseLegacy !== null) {
+    const { days, usagePerDay, v1PerDay = 0, throughDay = D3 } = denseLegacy;
+    if (!Number.isSafeInteger(days) || days < 1 || days > 400 || !Number.isSafeInteger(usagePerDay)
+        || usagePerDay < 1 || !Number.isSafeInteger(v1PerDay) || v1PerDay < 0 || !/^\d{4}-\d{2}-\d{2}$/u.test(throughDay)) {
+      throw new Error("fixture_dense_legacy_invalid");
+    }
+    const kiloId = await participant("kilo", "social");
+    const kiloV11 = await socialDevice(kiloId, "kilo-v11");
+    const kiloV1 = await socialDevice(kiloId, "kilo-v1");
+    const kiloDigest = await linkOwner(kiloId, "kilo");
+    const spacing = Math.floor(86_000_000 / Math.max(usagePerDay, v1PerDay));
+    const occurrence = (day, index) => `event:v2:${digest(`occurrence:kilo:${day}:${index}`)}`;
+    const timeOf = (day, index) => new Date(Date.parse(`${day}T00:00:00.000Z`) + 1_000 + index * spacing).toISOString();
+    const chunked = (records) => {
+      const result = [];
+      for (let offset = 0; offset < records.length; offset += 200) result.push(records.slice(offset, offset + 200));
+      return result;
+    };
+    const dayList = Array.from({ length: days }, (_, index) =>
+      new Date((dayNumber(throughDay) - (days - 1) + index) * DAY_MS).toISOString().slice(0, 10));
+    await v11Generation({ participantId: kiloId, deviceId: kiloV11, ownerDigest: kiloDigest, name: "kilo-v11",
+      days: dayList.map((day) => ({ day, chunks: chunked(Array.from({ length: usagePerDay }, (_, index) =>
+        usageRecord("v11", occurrence(day, index), timeOf(day, index)))).map((records) => ({ stream: "usage", records })) })) });
+    for (const day of dayList) {
+      const records = Array.from({ length: v1PerDay }, (_, index) => {
+        const shared = index % 10 === 0 && index < usagePerDay;
+        return usageRecord("v1", shared ? occurrence(day, index) : occurrence(day, `v1:${index}`), timeOf(day, index),
+          shared ? { sessionUuid: uuid(`session:${occurrence(day, index)}`) } : {});
+      });
+      for (const chunk of chunked(records)) {
+        await v1Chunk({ participantId: kiloId, deviceId: kiloV1, ownerDigest: kiloDigest, stream: "usage", day,
+          records: chunk });
+      }
+    }
+    kilo = Object.freeze({ participantId: kiloId, ownerDigest: kiloDigest, devices: Object.freeze([kiloV11, kiloV1]),
+      days: Object.freeze(dayList) });
+  }
+
+  // lima and mike (opt-in): one legacy occurrence with one eligible record and
+  // three variants the legacy readers must exclude, plus first- and
+  // last-instant records (see the module comment).
+  let lima = null;
+  let mike = null;
+  if (legacyScope) {
+    const scoped = (format, time) => usageRecord(format, OCCURRENCES.legacyScoped, at(D1, time));
+    const limaId = await participant("lima", "social");
+    const limaEligible = await socialDevice(limaId, "lima-v1");
+    const limaSuperseded = await socialDevice(limaId, "lima-v1-superseded");
+    const limaIncomplete = await socialDevice(limaId, "lima-v1-incomplete");
+    const limaV11 = await socialDevice(limaId, "lima-v11");
+    const limaDigest = await linkOwner(limaId, "lima");
+    await v1Chunk({ participantId: limaId, deviceId: limaEligible, ownerDigest: limaDigest, stream: "usage", day: D1,
+      records: [scoped("v1", "10:00:00")] });
+    const superseded = await v1Chunk({ participantId: limaId, deviceId: limaSuperseded, ownerDigest: limaDigest,
+      stream: "usage", day: D1, records: [scoped("v1", "10:30:00")] });
+    await q(`UPDATE ${table("telemetry_v1_chunks")} SET superseded_at=$2 WHERE id=$1`, [superseded.chunkId, ISSUED]);
+    const incomplete = await v1Chunk({ participantId: limaId, deviceId: limaIncomplete, ownerDigest: limaDigest,
+      stream: "usage", day: D1, records: [scoped("v1", "10:45:00"), usageRecord("v1",
+        `event:v2:${digest("occurrence:legacy-incomplete-peer")}`, at(D1, "10:46:00"))] });
+    await q(`UPDATE ${table("telemetry_v1_chunks")} SET accepted_record_count=record_count-1 WHERE id=$1`,
+      [incomplete.chunkId]);
+    await v11Generation({ participantId: limaId, deviceId: limaV11, ownerDigest: limaDigest, name: "lima-v11", days: [
+      { day: D1, chunks: [{ stream: "usage", records: [usageRecord("v11", OCCURRENCES.legacyFirst,
+        `${D1}T00:00:00.000Z`)] }] },
+      { day: D3, chunks: [{ stream: "usage", records: [usageRecord("v11", OCCURRENCES.legacyLast,
+        `${D3}T23:59:59.999Z`)] }] },
+    ] });
+    lima = Object.freeze({ participantId: limaId, ownerDigest: limaDigest,
+      devices: Object.freeze([limaEligible, limaSuperseded, limaIncomplete, limaV11]) });
+    const mikeId = await participant("mike", "social");
+    const mikeV11 = await socialDevice(mikeId, "mike-v11");
+    const mikeDigest = await linkOwner(mikeId, "mike");
+    await v11Generation({ participantId: mikeId, deviceId: mikeV11, ownerDigest: mikeDigest, name: "mike-v11",
+      days: [{ day: D1, chunks: [{ stream: "usage", records: [scoped("v11", "11:00:00")] }] }] });
+    mike = Object.freeze({ participantId: mikeId, ownerDigest: mikeDigest, devices: Object.freeze([mikeV11]) });
+  }
+
   const lastSequence = Number((await q(`SELECT COALESCE(max(sequence),0)::text AS sequence
     FROM ${table("storage_ingestion_changes")}`)).rows[0].sequence);
   return Object.freeze({
@@ -919,6 +1027,8 @@ export async function seedAnalyticsV2Fixture({ pool, schema, modules, correction
       delta: Object.freeze({ participantId: deltaId, ownerDigest: deltaDigest, devices: Object.freeze([deltaDevice]) }),
       ...(hotel === null ? {} : { hotel }),
       ...(india === null ? {} : { india, juliet }),
+      ...(kilo === null ? {} : { kilo }),
+      ...(lima === null ? {} : { lima, mike }),
     }),
     sequences: Object.freeze({
       alphaV1Usage: alphaV1Usage.sequence, alphaV1Quota: alphaV1Quota.sequence,

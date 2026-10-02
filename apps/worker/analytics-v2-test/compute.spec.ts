@@ -17,7 +17,10 @@ import {
 import { ANALYTICS_V2_PHASES, ANALYTICS_V2_REFUSAL_REASONS, type AnalyticsV2Refusal } from "../src/analytics-v2/contract";
 import {
   ANALYTICS_V2_DEFAULT_RESOURCES,
+  ANALYTICS_V2_HISTORY_SEGMENT_DAYS,
   ANALYTICS_V2_MEMORY_MODEL,
+  analyticsV2HistorySegments,
+  analyticsV2OutputRowBytes,
   analyticsV2OwnerMemoryEstimate,
   validAnalyticsV2Resources,
 } from "../src/analytics-v2/resources";
@@ -135,6 +138,11 @@ function outputsDigest(outputs: AnalyticsV2ComputeOutputs): string {
 function evidenceOf(days: ReadonlyMap<string, { usage: readonly unknown[]; quota: readonly unknown[]; session: readonly unknown[] }>) {
   return new Map([...days].filter(([, value]) => value.usage.length + value.quota.length + value.session.length > 0)
     .map(([day, value]) => [day, { usage: value.usage.length, quota: value.quota.length, session: value.session.length }]));
+}
+type DayOccurrences = { usage: readonly unknown[]; quota: readonly unknown[]; session: readonly unknown[] };
+/** The days of `days` inside an inclusive range (what a segment load returns). */
+function within<T>(days: ReadonlyMap<string, T>, range: { fromDay: string; throughDay: string }): Map<string, T> {
+  return new Map([...days].filter(([day]) => day >= range.fromDay && day <= range.throughDay));
 }
 const refusalsOf = (outputs: AnalyticsV2ComputeOutputs, ownerDigest: string) =>
   outputs.refusals.filter((refusal) => refusal.ownerDigest === ownerDigest);
@@ -594,13 +602,18 @@ describe("computeAnalyticsV2 (A-2)", () => {
     const ownerEvidence = new Map([...occurrencesByOwner].map(([digest, days]) => [digest, evidenceOf(days)]));
     const loads: string[] = [];
     const streamed = await computeAnalyticsV2({ ...input, occurrencesByOwner: new Map(), ownerEvidence,
-      loadOwnerOccurrences: async (digest) => { loads.push(digest); return occurrencesByOwner.get(digest)!; },
+      loadOwnerOccurrences: async (digest, range) => {
+        loads.push(digest);
+        return within(occurrencesByOwner.get(digest)!, range);
+      },
       memoryProbe: () => 1_000 });
-    // Each effective owner is loaded once, in digest order.
+    // No history before the analysis horizon: each effective owner is loaded
+    // once (its one segment), in digest order.
     expect(loads).toEqual(owners.map((owner) => owner.ownerDigest).sort());
     const { timings: _a, resources: inMemoryResources, ...expected } = inMemory;
     const { timings: streamedTimings, resources: streamedResources, ...actual } = streamed;
     expect(sha(canonicalJson(actual))).toBe(sha(canonicalJson(expected)));
+    expect(streamedResources!.account).toEqual(inMemoryResources!.account);
     expect(Object.keys(streamedTimings)).toContain("read");
     // Same counts and estimates; only the sampled heap differs (the probe).
     expect(streamedResources!.owners.map(({ heapPeakBytes: _peak, ...entry }) => entry))
@@ -611,7 +624,8 @@ describe("computeAnalyticsV2 (A-2)", () => {
     // A load that differs from its counts fails the run; so do mixed modes.
     const first = owners[0]!.ownerDigest;
     await expect(computeAnalyticsV2({ ...input, occurrencesByOwner: new Map(), ownerEvidence,
-      loadOwnerOccurrences: async (digest) => (digest === first ? new Map() : occurrencesByOwner.get(digest)!) }))
+      loadOwnerOccurrences: async (digest, range) => (digest === first ? new Map()
+        : within(occurrencesByOwner.get(digest)!, range)) }))
       .rejects.toThrow("ANALYTICS_V2_INPUT_INVALID:loadOwnerOccurrences.evidence");
     await expect(computeAnalyticsV2({ ...input, ownerEvidence,
       loadOwnerOccurrences: async (digest) => occurrencesByOwner.get(digest)! }))
@@ -622,6 +636,143 @@ describe("computeAnalyticsV2 (A-2)", () => {
       ownerEvidence: new Map([...ownerEvidence].slice(1)),
       loadOwnerOccurrences: async (digest) => occurrencesByOwner.get(digest)! }))
       .rejects.toThrow("ANALYTICS_V2_INPUT_INVALID:ownerEvidence.missingEffectiveOwner");
+  }, 240_000);
+
+  it("(bounded history) loads the days before the analysis horizon in segments, with outputs identical to the in-memory input", async () => {
+    const corpus = composeProofCorpus();
+    const queued = corpus.publishedDays;
+    const first = syntheticOwner(1);
+    const analysisFrom = addDays(TODAY, -169);
+    // History on both sides of segment edges, the last history day, and the
+    // seven-day cache carry into the analysis horizon.
+    const historyDays = [-400, -290, -289, -230, -229, -176, -171, -170].map((back) => addDays(TODAY, back));
+    const history = new Map(corpus.occurrencesByOwner.get(first.digest)!);
+    for (const day of historyDays) history.set(day, composeFacts(first, day).get(day)!);
+    const occurrencesByOwner = new Map([...corpus.occurrencesByOwner, [first.digest, history]]);
+    const cacheFromDay = historyDays[0]!;
+    const occurrenceRange = analyticsV2RequiredOccurrenceRange({ nowMs: NOW_MS, queuedDays: queued, cacheFromDay });
+    const input = { owners: corpus.owners, occurrencesByOwner, occurrenceRange, cacheFromDay,
+      devicesByDay: oneDevicePerOwner(occurrencesByOwner, queued), queuedDays: queued, nowMs: NOW_MS, revisionSeed: 0 };
+    const inMemory = await computeAnalyticsV2(input);
+    const ownerEvidence = new Map([...occurrencesByOwner].map(([digest, days]) => [digest, evidenceOf(days)]));
+    const loads: Array<{ digest: string; fromDay: string; throughDay: string }> = [];
+    const streamed = await computeAnalyticsV2({ ...input, occurrencesByOwner: new Map(), ownerEvidence,
+      loadOwnerOccurrences: async (digest, range) => {
+        loads.push({ digest, ...range });
+        return within(occurrencesByOwner.get(digest)!, range);
+      } });
+    const { timings: _a, ...expected } = inMemory;
+    const { timings: _b, ...actual } = streamed;
+    expect(sha(canonicalJson(actual))).toBe(sha(canonicalJson(expected)));
+    for (const day of historyDays) {
+      expect(streamed.cacheBands.some((row) => row.ownerDigest === first.digest && row.day === day), day).toBe(true);
+    }
+    // Every owner: the history segments oldest first (60 days each, counted
+    // back from the day before the analysis start), then the analysis horizon.
+    const segments = [...analyticsV2HistorySegments(occurrenceRange.fromDay, analysisFrom),
+      { fromDay: analysisFrom, throughDay: occurrenceRange.throughDay }];
+    expect(segments.slice(0, -1).every((segment) => (dayMs(segment.throughDay) - dayMs(segment.fromDay)) / DAY_MS + 1
+      <= ANALYTICS_V2_HISTORY_SEGMENT_DAYS)).toBe(true);
+    expect(segments.length).toBe(1 + Math.ceil((dayMs(analysisFrom) - dayMs(occurrenceRange.fromDay)) / DAY_MS / 60));
+    expect(loads).toEqual(corpus.owners.map((owner) => owner.ownerDigest).sort()
+      .flatMap((digest) => segments.map((segment) => ({ digest, ...segment }))));
+
+    // A segment load outside its range, or missing a counted day, fails the run.
+    await expect(computeAnalyticsV2({ ...input, occurrencesByOwner: new Map(), ownerEvidence,
+      loadOwnerOccurrences: async (digest) => occurrencesByOwner.get(digest)! }))
+      .rejects.toThrow("ANALYTICS_V2_INPUT_INVALID:loadOwnerOccurrences.range");
+    await expect(computeAnalyticsV2({ ...input, occurrencesByOwner: new Map(), ownerEvidence,
+      loadOwnerOccurrences: async (digest, range) => {
+        const loaded = within(occurrencesByOwner.get(digest)!, range);
+        loaded.delete(historyDays[3]!);
+        return loaded;
+      } })).rejects.toThrow("ANALYTICS_V2_INPUT_INVALID:loadOwnerOccurrences.evidence");
+  }, 240_000);
+
+  it("(output account) charges every held row and refuses the run beyond the output budget", async () => {
+    const corpus = composeProofCorpus();
+    const legacy = legacyOnlyV2Owner(syntheticOwner(6));
+    // Non-effective typed owners: their queued-day occurrences are held inputs.
+    const typedOwners = [7, 8, 9].map((n) => syntheticOwner(n));
+    const typedFacts = new Map(typedOwners.map((owner) => [owner.digest, composeFacts(owner)]));
+    const owners = [...corpus.owners, legacy, ...typedOwners.map(v1OnlyV2Owner)];
+    const occurrencesByOwner = new Map([...corpus.occurrencesByOwner, ...typedFacts]);
+    const input = inputFor({ owners, occurrencesByOwner }, corpus.publishedDays);
+    const outputs = await computeAnalyticsV2(input);
+    const rowBytes = (rows: readonly unknown[]) => rows.reduce((total: number, row) => total + analyticsV2OutputRowBytes(row), 0);
+    const account = outputs.resources!.account;
+    // Held inputs: the non-effective typed owners' occurrences only.
+    const held = [...typedFacts.values()].flatMap((facts) => [...evidenceOf(facts).values()]).reduce((total, counts) => total
+      + counts.usage * ANALYTICS_V2_MEMORY_MODEL.heldBytesPerOccurrence.usage
+      + counts.quota * ANALYTICS_V2_MEMORY_MODEL.heldBytesPerOccurrence.quota
+      + counts.session * ANALYTICS_V2_MEMORY_MODEL.heldBytesPerOccurrence.session, 0);
+    expect(account.heldInputBytes).toBe(held);
+    expect(account.accountBytes).toBe(held + rowBytes(outputs.ownerDays) + rowBytes(outputs.cacheBands)
+      + rowBytes(outputs.ownerFits) + rowBytes(outputs.ownerModelDates) + rowBytes(outputs.refusals));
+    for (const entry of outputs.resources!.owners) {
+      const own = <T extends { ownerDigest: string }>(rows: readonly T[]) => rows.filter((row) => row.ownerDigest === entry.ownerDigest);
+      expect(entry.outputBytes).toBe(rowBytes(own(outputs.ownerDays)) + rowBytes(own(outputs.cacheBands))
+        + rowBytes(own(outputs.ownerFits)) + rowBytes(own(outputs.ownerModelDates)) + rowBytes(own(outputs.refusals)));
+    }
+    expect(outputs.resources!.configuration).toMatchObject({ outputModel: "analytics-v2-output-model-v1",
+      outputBudgetBytes: ANALYTICS_V2_DEFAULT_RESOURCES.outputBudgetBytes });
+    expect(account.accountBytes).toBeGreaterThan(1_048_576);
+
+    // The budget is an exact bound: at the account it completes, one byte
+    // below it the run is refused with the account it reached and nothing else.
+    const exact = await computeAnalyticsV2({ ...input,
+      resources: { ...ANALYTICS_V2_DEFAULT_RESOURCES, outputBudgetBytes: account.accountBytes } });
+    const withoutBudget = (value: AnalyticsV2ComputeOutputs) => {
+      const { timings: _timings, resources, ...rest } = value;
+      return sha(canonicalJson({ ...rest, owners: resources!.owners, account: resources!.account }));
+    };
+    expect(withoutBudget(exact)).toBe(withoutBudget(outputs));
+    const refused = computeAnalyticsV2({ ...input,
+      resources: { ...ANALYTICS_V2_DEFAULT_RESOURCES, outputBudgetBytes: account.accountBytes - 1 } });
+    await expect(refused).rejects.toMatchObject({ code: "ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED",
+      accountBytes: account.accountBytes, outputBudgetBytes: account.accountBytes - 1 });
+  }, 240_000);
+
+  it("(checkpoints) reports the plan and progress, and a throwing checkpoint ends the run", async () => {
+    const corpus = composeProofCorpus();
+    const big = syntheticOwner(4, "pro");
+    const owners = [...corpus.owners, effectiveV2Owner(big)];
+    const bigEvidence = new Map([[corpus.publishedDays[3]!, { usage: 2_000_001, quota: 0, session: 0 }]]);
+    const ownerEvidence = new Map<string, ReadonlyMap<string, { usage: number; quota: number; session: number }>>(
+      [...corpus.occurrencesByOwner].map(([digest, days]) => [digest, evidenceOf(days)]));
+    ownerEvidence.set(big.digest, bigEvidence);
+    const base = { ...inputFor({ owners, occurrencesByOwner: corpus.occurrencesByOwner }, corpus.publishedDays),
+      occurrencesByOwner: new Map(), ownerEvidence,
+      loadOwnerOccurrences: async (digest: string, range: { fromDay: string; throughDay: string }) =>
+        within(corpus.occurrencesByOwner.get(digest) ?? new Map(), range) };
+    const events: Array<Record<string, unknown>> = [];
+    const outputs = await computeAnalyticsV2({ ...base, checkpoint: (event) => { events.push({ ...event }); } });
+    const digests = owners.map((owner) => owner.ownerDigest).sort();
+    expect(events[0]).toEqual({ kind: "plan", owners: digests.map((digest) => {
+      const entry = outputs.resources!.owners.find((owner) => owner.ownerDigest === digest)!;
+      return { ownerDigest: digest, admitted: entry.admitted, occurrences: entry.usage + entry.quota + entry.session,
+        analysisUsage: entry.analysisUsage, estimateBytes: entry.estimateBytes };
+    }) });
+    expect(events.filter((event) => event.kind === "owner").map((event) => [event.index, event.ownerDigest]))
+      .toEqual(digests.map((digest, index) => [index, digest]));
+    // The refused owner is never loaded: segments and model dates belong to
+    // the three computed owners. Each has two segments: the seven-day cache
+    // lookback before the read range (known empty, never loaded) and the
+    // analysis horizon.
+    expect(analyticsV2HistorySegments(addDays(TODAY, -176), addDays(TODAY, -169)).length).toBe(1);
+    expect(events.filter((event) => event.kind === "segment").length).toBe(3 * 2);
+    expect(events.filter((event) => event.kind === "model").length).toBe(3 * ANALYTICS_V2_MODEL_DATES);
+    expect(events.at(-1)).toEqual({ kind: "community", accountBytes: outputs.resources!.account.accountBytes });
+    // accountBytes never decreases.
+    const accounts = events.slice(1).map((event) => event.accountBytes as number);
+    expect(accounts.every((value, index) => index === 0 || value >= accounts[index - 1]!)).toBe(true);
+
+    let seen = 0;
+    await expect(computeAnalyticsV2({ ...base, checkpoint: (event) => {
+      if (event.kind === "model" && ++seen === 5) throw Object.assign(new Error("STOP"), { code: "ANALYTICS_V2_SPEC_STOP" });
+    } })).rejects.toMatchObject({ code: "ANALYTICS_V2_SPEC_STOP" });
+    await expect(computeAnalyticsV2({ ...base, checkpoint: 1 as unknown as () => void }))
+      .rejects.toThrow("ANALYTICS_V2_INPUT_INVALID:checkpoint");
   }, 240_000);
 
   it("(memory budget) refuses an owner whose estimate exceeds the budget before reading it, and counts it", async () => {
@@ -665,7 +816,9 @@ describe("computeAnalyticsV2 (A-2)", () => {
     const estimate = analyticsV2OwnerMemoryEstimate(bigEvidence, addDays(TODAY, -169), TODAY);
     expect(outputs.resources!.owners.find((entry) => entry.ownerDigest === big.digest)).toEqual({
       ownerDigest: big.digest, usage: 1_200_000, quota: 90, session: 10, analysisUsage: 1_200_000,
-      maxDayOccurrences: 120_010, estimateBytes: estimate.estimateBytes, admitted: false, heapPeakBytes: null });
+      maxDayOccurrences: 120_010, estimateBytes: estimate.estimateBytes, admitted: false, heapPeakBytes: null,
+      // Its refusals are its only outputs, charged to the account.
+      outputBytes: refusalsOf(outputs, big.digest).reduce((total, refusal) => total + analyticsV2OutputRowBytes(refusal), 0) });
     expect(estimate.estimateBytes).toBeGreaterThan(ANALYTICS_V2_DEFAULT_RESOURCES.memoryBudgetBytes);
     // The other owners are exactly what they are without it.
     const without = await computeAnalyticsV2(inputFor(corpus, corpus.publishedDays));
@@ -690,12 +843,38 @@ describe("computeAnalyticsV2 (A-2)", () => {
       [addDays(TODAY, -5), { usage: 2_000, quota: 20, session: 2 }],
     ]);
     const model = ANALYTICS_V2_MEMORY_MODEL;
+    expect(model.version).toBe("analytics-v2-memory-model-v2");
+    // The history day (today-300) is held in its own segment, never with the
+    // analysis horizon: the estimate is the larger of the two, not their sum.
     expect(analyticsV2OwnerMemoryEstimate(evidence, addDays(TODAY, -169), TODAY)).toEqual({
       occurrences: { usage: 3_000, quota: 30, session: 3 }, analysisUsage: 2_000, maxDayOccurrences: 2_022,
-      estimateBytes: model.ownerOverheadBytes + 3_000 * model.heldBytesPerOccurrence.usage
-        + 30 * model.heldBytesPerOccurrence.quota + 3 * model.heldBytesPerOccurrence.session
+      estimateBytes: model.ownerOverheadBytes + 2_000 * model.heldBytesPerOccurrence.usage
+        + 20 * model.heldBytesPerOccurrence.quota + 2 * model.heldBytesPerOccurrence.session
         + 2_000 * model.preparedBytesPerAnalysisUsage + 2_022 * model.transientBytesPerLargestDayOccurrence,
     });
+    // A history segment larger than the analysis horizon sets the estimate,
+    // with its own prepared rows and the seven-day cache carry into it.
+    const heavyHistory = new Map([
+      [addDays(TODAY, -200), { usage: 9_000, quota: 0, session: 0 }],
+      [addDays(TODAY, -236), { usage: 100, quota: 0, session: 0 }],
+      [addDays(TODAY, -5), { usage: 2_000, quota: 20, session: 2 }],
+    ]);
+    // today-200 is in segment [today-229, today-170]; today-236 is in the
+    // seven days before it, so its usage is carried.
+    expect(analyticsV2HistorySegments(addDays(TODAY, -300), addDays(TODAY, -169)).at(-1))
+      .toEqual({ fromDay: addDays(TODAY, -229), throughDay: addDays(TODAY, -170) });
+    expect(analyticsV2OwnerMemoryEstimate(heavyHistory, addDays(TODAY, -169), TODAY).estimateBytes).toBe(
+      model.ownerOverheadBytes + 9_000 * model.heldBytesPerOccurrence.usage
+        + (9_000 + 100) * model.preparedBytesPerAnalysisUsage + 9_000 * model.transientBytesPerLargestDayOccurrence);
+    // The estimate stops growing with retained history: a steady owner has
+    // the same estimate after 200 or 2,000 days.
+    const steady = (days: number) => new Map(Array.from({ length: days }, (_, index) =>
+      [addDays(TODAY, -index), { usage: 1_100, quota: 4_500, session: 200 }]));
+    const recent = analyticsV2OwnerMemoryEstimate(steady(200), addDays(TODAY, -169), TODAY);
+    const retained = analyticsV2OwnerMemoryEstimate(steady(2_000), addDays(TODAY, -169), TODAY);
+    expect(retained.occurrences.usage).toBe(10 * recent.occurrences.usage);
+    expect(retained.estimateBytes).toBe(recent.estimateBytes);
+    expect(retained.estimateBytes).toBeLessThan(ANALYTICS_V2_DEFAULT_RESOURCES.memoryBudgetBytes);
     expect(validAnalyticsV2Resources(ANALYTICS_V2_DEFAULT_RESOURCES)).toEqual(ANALYTICS_V2_DEFAULT_RESOURCES);
     for (const resources of [
       { ...ANALYTICS_V2_DEFAULT_RESOURCES, maxDayOccurrences: 19_999 },
@@ -703,13 +882,18 @@ describe("computeAnalyticsV2 (A-2)", () => {
       { ...ANALYTICS_V2_DEFAULT_RESOURCES, maxDayRecordBytes: 32 * 1_048_576 - 1 },
       { ...ANALYTICS_V2_DEFAULT_RESOURCES, memoryBudgetBytes: 1_024 * 1_048_576 - 1 },
       { ...ANALYTICS_V2_DEFAULT_RESOURCES, memoryBudgetBytes: 30_720 * 1_048_576 + 1 },
+      { ...ANALYTICS_V2_DEFAULT_RESOURCES, outputBudgetBytes: 1_048_576 - 1 },
+      { ...ANALYTICS_V2_DEFAULT_RESOURCES, outputBudgetBytes: 30_720 * 1_048_576 + 1 },
+      { ...ANALYTICS_V2_DEFAULT_RESOURCES, outputBudgetBytes: 1.5 * 1_048_576 + 0.5 },
+      (({ outputBudgetBytes: _omitted, ...rest }) => rest)(ANALYTICS_V2_DEFAULT_RESOURCES),
       { ...ANALYTICS_V2_DEFAULT_RESOURCES, extra: 1 },
     ]) {
       expect(() => validAnalyticsV2Resources(resources)).toThrow("ANALYTICS_V2_INPUT_INVALID:resources");
     }
     // The defaults: an 8 GiB task with a 6,144 MiB heap.
     expect(ANALYTICS_V2_DEFAULT_RESOURCES).toEqual({ memoryBudgetBytes: 4_608 * 1_048_576, maxDayOccurrences: 250_000,
-      maxDayRecordBytes: 256 * 1_048_576 });
+      maxDayRecordBytes: 256 * 1_048_576, outputBudgetBytes: 1_024 * 1_048_576 });
+    expect(ANALYTICS_V2_HISTORY_SEGMENT_DAYS).toBe(60);
   });
 
   it("withholds model days nobody could evaluate and still builds a valid preview", async () => {
