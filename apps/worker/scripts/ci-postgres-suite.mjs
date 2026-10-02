@@ -49,8 +49,11 @@
  * An ENV_PROFILE_CONFLICT belongs to the family that owns the named spec. This
  * runner never edits or weakens a spec to obtain a green result.
  *
- * Usage (the SOCKET profile comes from ci-postgres-container.mjs):
+ * Usage (the SOCKET profile comes from ci-postgres-container.mjs; the
+ * hosted-backend workflow adds the container's loopback TCP pair,
+ * ciPostgresTcpProfile()):
  *   PG_TEST_SOCKET=/private/tmp/tibotattle-pg-ci/socket PG_TEST_PORT=5432 \
+ *   PG_TEST_TCP_HOST=127.0.0.1 PG_TEST_TCP_PORT=55432 \
  *     node scripts/ci-postgres-suite.mjs
  *   node scripts/ci-postgres-suite.mjs --plan    # static checks only, no database
  */
@@ -938,18 +941,39 @@ export function evaluatePostgresSuite({ plan, records, environmentGaps = [] }) {
 // Execution
 // ---------------------------------------------------------------------------
 
+/** The loopback TCP pair a SOCKET-profile cluster may also offer; both or neither. */
+export const TCP_PROFILE_VARIABLES = Object.freeze(["PG_TEST_TCP_HOST", "PG_TEST_TCP_PORT"]);
+const LOOPBACK_TCP_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
+const TCP_PORT_PATTERN = /^[1-9][0-9]{0,4}$/u;
+
 /**
- * Read the SOCKET profile the caller exported. Only PG_TEST_SOCKET and
- * PG_TEST_PORT are accepted: every other PG_TEST_* variable (including
- * PG_TEST_HOST and PG_TEST_PASSWORD) is refused so no pass inherits it.
+ * Read the SOCKET profile the caller exported. Only PG_TEST_SOCKET,
+ * PG_TEST_PORT and the optional loopback TCP pair (PG_TEST_TCP_HOST and
+ * PG_TEST_TCP_PORT, set together: the same cluster's TCP listener, which the
+ * fast-path cloud-target specs dial) are accepted: every other PG_TEST_*
+ * variable (including PG_TEST_HOST and PG_TEST_PASSWORD) is refused so no pass
+ * inherits it. Without the pair, a spec gated on it reports its TCP tests as
+ * skipped (SILENTLY_SKIPPED), never as passed.
  */
 export function readSocketProfileInput(environment) {
   const extra = Object.keys(environment)
-    .filter((key) => key.startsWith("PG_TEST_") && key !== "PG_TEST_SOCKET" && key !== "PG_TEST_PORT")
+    .filter((key) => key.startsWith("PG_TEST_") && key !== "PG_TEST_SOCKET" && key !== "PG_TEST_PORT"
+      && !TCP_PROFILE_VARIABLES.includes(key))
     .sort();
   if (extra.length > 0) {
     throw new CiPostgresSuiteError("CI_SUITE_PROFILE_INVALID",
-      `unset ${extra.join(", ")}; the suite derives each pass profile from PG_TEST_SOCKET and PG_TEST_PORT`);
+      `unset ${extra.join(", ")}; the suite derives each pass profile from PG_TEST_SOCKET, PG_TEST_PORT `
+        + "and the optional PG_TEST_TCP_HOST and PG_TEST_TCP_PORT pair");
+  }
+  const tcpHost = environment.PG_TEST_TCP_HOST;
+  const tcpPort = environment.PG_TEST_TCP_PORT;
+  if ((tcpHost === undefined) !== (tcpPort === undefined)) {
+    throw new CiPostgresSuiteError("CI_SUITE_PROFILE_INVALID", "set PG_TEST_TCP_HOST and PG_TEST_TCP_PORT together");
+  }
+  if (tcpHost !== undefined && (!LOOPBACK_TCP_HOSTS.has(tcpHost) || typeof tcpPort !== "string"
+      || !TCP_PORT_PATTERN.test(tcpPort) || Number(tcpPort) > 65_535)) {
+    throw new CiPostgresSuiteError("CI_SUITE_PROFILE_INVALID",
+      "PG_TEST_TCP_HOST must be a loopback host and PG_TEST_TCP_PORT a TCP port number");
   }
   const socket = environment.PG_TEST_SOCKET;
   if (typeof socket !== "string" || !SOCKET_DIRECTORY_PATTERN.test(socket)) {
@@ -957,18 +981,25 @@ export function readSocketProfileInput(environment) {
       "PG_TEST_SOCKET must name a /private/tmp/tibotattle-pg-*/socket directory");
   }
   const port = environment.PG_TEST_PORT;
-  if (typeof port !== "string" || !/^[1-9][0-9]{0,4}$/u.test(port) || Number(port) > 65_535) {
+  if (typeof port !== "string" || !TCP_PORT_PATTERN.test(port) || Number(port) > 65_535) {
     throw new CiPostgresSuiteError("CI_SUITE_PROFILE_INVALID", "PG_TEST_PORT must be a TCP port number");
   }
-  return Object.freeze({ socket, port });
+  return Object.freeze(tcpHost === undefined ? { socket, port } : { socket, port, tcpHost, tcpPort });
 }
 
-export function passEnvironment(baseEnvironment, pass, { socket, port }) {
+/** One pass's PG_TEST_* profile; the loopback TCP pair reaches the SOCKET pass only. */
+export function passEnvironment(baseEnvironment, pass, { socket, port, tcpHost, tcpPort }) {
   const environment = {};
   for (const [key, value] of Object.entries(baseEnvironment)) {
     if (!key.startsWith("PG_TEST_") && value !== undefined) environment[key] = value;
   }
-  if (pass === PROFILE_SOCKET || pass === PROFILE_EDGE_E2E) {
+  if (pass === PROFILE_SOCKET) {
+    environment.PG_TEST_SOCKET = socket;
+    if (tcpHost !== undefined) {
+      environment.PG_TEST_TCP_HOST = tcpHost;
+      environment.PG_TEST_TCP_PORT = tcpPort;
+    }
+  } else if (pass === PROFILE_EDGE_E2E) {
     environment.PG_TEST_SOCKET = socket;
   } else if (pass === PROFILE_HOST) {
     environment.PG_TEST_HOST = socket;

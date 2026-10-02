@@ -60,8 +60,8 @@ export const BACKUP_PRUNE_JOURNAL_SCHEMA = "tibotattle-backup-horizon-prune-v1";
 export const PRUNE_MAX_DELETIONS_PER_RUN = 10;
 export const PRUNE_RECEIPT_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 /**
- * Restated from scripts/gcp-test-database.mjs, which runs its job when
- * imported; gcp-backup-horizon.check.mjs pins the two literals together.
+ * Restated from scripts/gcp-test-database.mjs rather than imported from it;
+ * gcp-backup-horizon.check.mjs pins the two literals together.
  * Names must additionally be bare Cloud SQL instance ids.
  */
 export const INSTANCE_PATTERN = /^[A-Za-z0-9_.:-]{1,200}$/u;

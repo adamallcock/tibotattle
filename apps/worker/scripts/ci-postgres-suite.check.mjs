@@ -47,6 +47,7 @@ import {
 import {
   CI_WORK_DIRECTORY,
   ciPostgresProfiles,
+  ciPostgresTcpProfile,
   CONTAINER_NAME,
   CONTAINER_SOCKET_DIRECTORY,
   dockerRunArguments,
@@ -944,6 +945,40 @@ test("the caller supplies only the SOCKET profile; the runner builds each pass e
     { PATH: "/bin", PG_TEST_HOST: SOCKET, PG_TEST_PORT: "5432" });
 });
 
+test("the CI container's loopback TCP pair is its published port and passes the suite's profile reader", () => {
+  assert.deepEqual(ciPostgresTcpProfile(), { PG_TEST_TCP_HOST: "127.0.0.1", PG_TEST_TCP_PORT: "55432" });
+  assert.deepEqual(Object.keys(ciPostgresProfiles().socket), ["PG_TEST_SOCKET", "PG_TEST_PORT"],
+    "the exported SOCKET profile stays socket-only");
+  assert.deepEqual(readSocketProfileInput({ ...ciPostgresProfiles().socket, ...ciPostgresTcpProfile() }),
+    { socket: ciPostgresProfiles().socket.PG_TEST_SOCKET, port: "5432", tcpHost: "127.0.0.1", tcpPort: "55432" });
+  for (const publish of ["0.0.0.0:55432:5432", "127.0.0.1:55432:5433"]) {
+    assert.throws(() => ciPostgresTcpProfile(publish), /CI_POSTGRES_PROFILE_INVALID/u, publish);
+  }
+});
+
+test("the loopback TCP pair is optional, set together, loopback only, and reaches the SOCKET pass alone", () => {
+  const tcp = { PG_TEST_SOCKET: SOCKET, PG_TEST_PORT: "5432", PG_TEST_TCP_HOST: "127.0.0.1", PG_TEST_TCP_PORT: "55432" };
+  const profile = readSocketProfileInput(tcp);
+  assert.deepEqual(profile, { socket: SOCKET, port: "5432", tcpHost: "127.0.0.1", tcpPort: "55432" });
+  assert.deepEqual(passEnvironment({ PATH: "/bin", ...tcp }, "SOCKET", profile),
+    { PATH: "/bin", PG_TEST_SOCKET: SOCKET, PG_TEST_PORT: "5432", PG_TEST_TCP_HOST: "127.0.0.1", PG_TEST_TCP_PORT: "55432" });
+  assert.deepEqual(passEnvironment({ PATH: "/bin", ...tcp }, "HOST", profile),
+    { PATH: "/bin", PG_TEST_HOST: SOCKET, PG_TEST_PORT: "5432" }, "HOST specs never dial TCP");
+  assert.deepEqual(passEnvironment({ PATH: "/bin", ...tcp }, "EDGE_E2E", profile),
+    { PATH: "/bin", PG_TEST_SOCKET: SOCKET, PG_TEST_PORT: "5432" });
+  for (const edit of [
+    (value) => { delete value.PG_TEST_TCP_PORT; },
+    (value) => { delete value.PG_TEST_TCP_HOST; },
+    (value) => { value.PG_TEST_TCP_HOST = "10.0.0.5"; },
+    (value) => { value.PG_TEST_TCP_PORT = "0"; },
+    (value) => { value.PG_TEST_TCP_PORT = "70000"; },
+  ]) {
+    const value = { ...tcp };
+    edit(value);
+    assert.throws(() => readSocketProfileInput(value), /CI_SUITE_PROFILE_INVALID/u, JSON.stringify(value));
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Extra registration scripts and the explicit EDGE_E2E profile
 // ---------------------------------------------------------------------------
@@ -1036,9 +1071,12 @@ test("an explicit-profile spec that derives HOST fails PROFILE_ROUTING_DRIFT", a
 
 test("the journal-transfer gate resolves statically; an unbound PG_TEST_* gate is still ambiguous", async () => {
   const source = await readFile(join(WORKER_ROOT, JOURNAL_TRANSFER_SPEC), "utf8");
-  assert.match(source, /const PG_TEST_TCP_HOST = process\.env\.PG_TEST_TCP_HOST \|\| "127\.0\.0\.1";/u);
+  assert.match(source, /const PG_TEST_TCP_HOST = process\.env\.PG_TEST_TCP_HOST;/u,
+    "no default host: a socket-only cluster never dials TCP");
+  assert.match(source, /localFastpathTcpPort\(\{ PG_TEST_TCP_PORT: process\.env\.PG_TEST_TCP_PORT \}, PG_TEST_PORT\)/u);
+  assert.match(source, /port: PG_TEST_TCP_PORT \}/u, "the TCP pool dials PG_TEST_TCP_PORT, not the socket's port");
   assert.match(source, /describe\.skipIf\(!PG_TEST_SOCKET \|\| !PG_TEST_TCP_HOST\)\(/u,
-    "the second describe keeps its gate; with the loopback default it runs whenever the socket is set");
+    "the second describe runs only where the suite (or the caller) supplies the loopback TCP pair");
   assert.deepEqual(deriveFileProfile(source), { profile: "SOCKET", ambiguous: false, gates: ["SOCKET", "SOCKET"], reasons: [] });
   const helper = deriveFileProfile(`
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;

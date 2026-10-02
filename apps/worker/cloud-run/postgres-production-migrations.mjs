@@ -102,18 +102,35 @@ export const CONTRACT_OPERATION_KINDS = Object.freeze([
   "rename",
   "set-not-null",
   "add-not-null-without-default",
+  "alter-type",
+  "add-constraint",
+  "unique-index",
+  "dynamic-sql",
 ]);
 
 /**
  * Reviewed contract migrations of the promoted primary tail (0001-0062),
- * classified once with classifyContractOperations and pinned by sha256. Each
- * is safe against the previous revision because it runs inside the
- * migration's own transaction and only replaces, relaxes or retires objects
- * the shipped code no longer depends on. A new contract migration (the SIMP
- * residue included) must be added here, reviewed, before any image carrying
- * it can migrate a target.
+ * classified with classifyContractOperations and pinned by sha256. A
+ * production, staging or scratch database receives this tail in its first
+ * migrate, onto an empty schema before any revision serves it, so none of
+ * them can break a serving previous revision there; each reason records what
+ * the operation does, including where it tightens. A migration after the tail
+ * runs between migrate and roll while the previous revision still serves, so
+ * it must be safe against that revision, and it (the SIMP residue included)
+ * must be added here, reviewed, before any image carrying it can migrate a
+ * target.
  */
 export const CONTRACT_MIGRATIONS = Object.freeze({
+  "0008_pending_object_reconciliation.sql": Object.freeze({
+    sha256: "c43fc6b4ef4b1592a60798a50eddf683973a10df6844aa42a7c88b351ea3ce7e",
+    operations: Object.freeze(["dynamic-sql"]),
+    reason: "EXECUTE only inside the chunk reconciliation-guard trigger function: a schema-qualified SELECT ... FOR UPDATE of the pending object at insert time; no dynamic SQL runs during the migration",
+  }),
+  "0010_v1_analytical_side_effects.sql": Object.freeze({
+    sha256: "60a5a159610bb4e627382a0ac4ae4292e78e75bd269b67fbc91f70d0f88c62e5",
+    operations: Object.freeze(["dynamic-sql"]),
+    reason: "EXECUTE only inside the replaced reconciliation-guard trigger function (the same pending-object row lock, counted); no dynamic SQL runs during the migration",
+  }),
   "0014_effective_source_revision.sql": Object.freeze({
     sha256: "ad124ecdc7b008e18c11a7faf45886c666b7ca42b40322089d597641a515ed3c",
     operations: Object.freeze(["drop"]),
@@ -121,48 +138,93 @@ export const CONTRACT_MIGRATIONS = Object.freeze({
   }),
   "0016_publication_authority.sql": Object.freeze({
     sha256: "a97c64175d4af12a2b06782007491c7acb9da2364003cc09110e7b5356b31b9d",
-    operations: Object.freeze(["drop"]),
-    reason: "replaces collection_controls_revision_check with the same-named widened check",
+    operations: Object.freeze(["drop", "add-constraint", "unique-index"]),
+    reason: "promotes the contained revision-0 collection-controls bootstrap to 1, then re-creates collection_controls_revision_check as revision >= 1 (tightened from >= 0; any other revision-0 row aborts the migration); the unique index covers pending_objects.registration_token, added here with a fresh random md5 default per row",
   }),
   "0017_readiness_sweep_fence.sql": Object.freeze({
     sha256: "96ad7866bb6083a2f0e0415c6a86a7a4efe492310a1fced1606c5c012493986c",
-    operations: Object.freeze(["drop"]),
-    reason: "replaces postgres_readiness_sweeps_state_check with the same-named widened check",
+    operations: Object.freeze(["drop", "add-constraint"]),
+    reason: "replaces postgres_readiness_sweeps_state_check with the same-named check widened to admit 'ledger'",
   }),
   "0023_analytics_fit_results.sql": Object.freeze({
     sha256: "3cd6cfbdff5ed8a9c8da56f6f3b03343049655952b7169a989f8fb09cbcbd43a",
-    operations: Object.freeze(["drop"]),
-    reason: "replaces analytics_owner_results_metric_check with the same-named widened check",
+    operations: Object.freeze(["drop", "add-constraint"]),
+    reason: "replaces analytics_owner_results_metric_check with the same-named check widened to admit 'fits'",
   }),
   "0026_v12_domain_days_and_input_revision.sql": Object.freeze({
     sha256: "7e15b4d82b196e1ad8b6ef98c253e91f6204921d2f54207ab3346a8cf0a025e5",
-    operations: Object.freeze(["drop"]),
-    reason: "re-creates the domain-day manifest foreign key under the same name; DROP NOT NULL only relaxes",
+    operations: Object.freeze(["drop", "add-constraint", "unique-index"]),
+    reason: "re-creates the domain-day manifest foreign key under the same name, deferred; DROP NOT NULL only relaxes; the predecessor single-representation check admits every earlier row (winners_json set, the new days_json NULL); the generation unique index narrows uniqueness from (participant, device, manifest) to (participant, manifest), a tightening an earlier writer could hit",
+  }),
+  "0029_legacy_source_membership.sql": Object.freeze({
+    sha256: "c8d9bb75659705492d3d14f23570ad3207677e75b17b27f032ccfd6c24b15c87",
+    operations: Object.freeze(["add-constraint"]),
+    reason: "the membership UNIQUE includes the primary key id, so every existing and future row already satisfies it; it backs a composite foreign key",
   }),
   "0035_v12_ready_manifest_retention.sql": Object.freeze({
     sha256: "a3fb5f597f7e202b7803a5345f52f4a1a2285fc56cc2c5d119c0b2a2571a0872",
     operations: Object.freeze(["drop"]),
     reason: "drops only the temporary upgrade-audit table the migration itself creates",
   }),
+  "0036_streamed_publication_proofs.sql": Object.freeze({
+    sha256: "136645a7a262d756813c43f305930c8cf5435ab5415ef8bad3c38a6c3e07dee8",
+    operations: Object.freeze(["add-constraint"]),
+    reason: "the member proof-shape check admits a row whose three new proof columns are NULL, which is every row an earlier writer makes",
+  }),
+  "0038_analytics_event_tuple_versions.sql": Object.freeze({
+    sha256: "c20e692d07cd16ae5f870832610ce6bdf7b97eb734fe4ed96b821fdd85757b2f",
+    operations: Object.freeze(["add-constraint"]),
+    reason: "both tuple-version checks admit version 0 with every new column NULL, the default for every row an earlier writer makes",
+  }),
+  "0039_analytics_applied_projection_v1.sql": Object.freeze({
+    sha256: "5750810077d5a9124e8605007b514e841136177f88db473905cec289ff833ecc",
+    operations: Object.freeze(["add-constraint"]),
+    reason: "relaxes projection_json to NULL only for version-1 tuples; version-0 rows, the only ones an earlier writer makes, keep projection_json",
+  }),
   "0043_accountless_history_d1_import.sql": Object.freeze({
     sha256: "417709f265294a547d7585617241922bf633042a141d08dbf51f418dcd653b00",
-    operations: Object.freeze(["drop"]),
-    reason: "replaces two import-run checks with same-named widened checks",
+    operations: Object.freeze(["drop", "add-constraint"]),
+    reason: "replaces two import-run checks with same-named checks widened to the D1 snapshot source and target version 43; the fence-state and fence-metadata checks admit the synthetic-fixture rows at the new columns' defaults",
+  }),
+  "0046_owner_journal_authority.sql": Object.freeze({
+    sha256: "ca26390533fdc9a053319a9e128ef94a074a44037e9e581f56b2a1f4e90be062",
+    operations: Object.freeze(["unique-index"]),
+    reason: "the partial unique index covers only event_tuple_version = 1 rows, which no earlier writer makes; version-0 rows are outside it",
   }),
   "0049_lifecycle_readiness_state.sql": Object.freeze({
     sha256: "6f2770085b9a6b0b1e068312685e09a24594178f92327d89a98d37279a38bb22",
-    operations: Object.freeze(["drop"]),
-    reason: "replaces retention_state_state_check with the same-named widened check",
+    operations: Object.freeze(["drop", "add-constraint"]),
+    reason: "converts the 'idle' retention singleton to 'never_run', then replaces the 0007 state check with the Worker vocabulary and adds failure-code, failed-cycle, lease-pair and counter checks; a row outside that contract aborts the migration, and a writer of the 0007 'idle' state would be refused",
   }),
   "0050_admin_audit_and_collection_controls.sql": Object.freeze({
     sha256: "234e455574620c19041dcd4a3ee19947b9b4db346190aaaa3a8c5406ad50cc81",
-    operations: Object.freeze(["drop", "set-not-null"]),
-    reason: "re-keys admin_action_audit on a backfilled identity id and closes collection_controls.reason_code after backfilling the bootstrap row; a non-vocabulary reason aborts the migration",
+    operations: Object.freeze(["drop", "set-not-null", "add-constraint"]),
+    reason: "re-keys admin_action_audit on a backfilled identity id with operation_id unique and shape-checked, and closes collection_controls.reason_code and its state flags after backfilling the bootstrap row; a non-vocabulary row aborts the migration",
+  }),
+  "0051_transport_floor_parity.sql": Object.freeze({
+    sha256: "1f36dc7558ab85b8a90a05530efeca23abad432c9808a32a7515e7c412c591bd",
+    operations: Object.freeze(["add-constraint", "unique-index"]),
+    reason: "closes the transport floors to the four ranked formats and one floor per device, as the D1 isolation schema enforces; a store holding a rank-12 floor or a duplicate device floor refuses the migration; the rollback foreign key targets the operation_id 0050 made unique",
+  }),
+  "0052_typed_telemetry_live_allocators.sql": Object.freeze({
+    sha256: "8257867f0c707a30f57f1bf16c21c2012f89108a7e4d0abe9e4926976e58a093",
+    operations: Object.freeze(["dynamic-sql"]),
+    reason: "the migration calls typed_telemetry_restart_identities() once: it locks the nine typed tables and restarts each id identity at max(id) + 1, never lower; the runtime role cannot execute it",
+  }),
+  "0053_community_publication_authority.sql": Object.freeze({
+    sha256: "dd3f7f293d63295688ced56a558befa5f2018a85a61304c8cab9e0df6993ae15",
+    operations: Object.freeze(["add-constraint"]),
+    reason: "the daily authority-shape check admits provenance NULL with every new column NULL, which is every row an earlier writer makes",
   }),
   "0055_v12_owner_bridge.sql": Object.freeze({
     sha256: "bd6027ef988dea6c9a34a9c8fb494c33bc8d820bdd77c5e165ada3bcdd627681",
     operations: Object.freeze(["drop"]),
     reason: "replaces the v1.2 domain-head source-revision trigger with the owner bridge in one transaction",
+  }),
+  "0056_production_transfer_control.sql": Object.freeze({
+    sha256: "bfc8637b903b33ec02b07f087f3b5345edd4fbcab7ebcb08d732b846edc0e346",
+    operations: Object.freeze(["dynamic-sql"]),
+    reason: "EXECUTE only inside tibotattle_transfer.install_transfer_live_lock(), which the migration defines but never calls; the transfer tool calls it on its own schema once a run is live",
   }),
   "0057_upload_path_analytics_retirement.sql": Object.freeze({
     sha256: "439cbf18d64fdcaa2ea33ab34762d99471b2214e176c8f695c8b444d69043faa",
@@ -324,16 +386,66 @@ const NON_COLUMN_ADD = new Set([
   "CONSTRAINT", "PRIMARY", "UNIQUE", "FOREIGN", "CHECK", "EXCLUDE", "VALUE", "GENERATED",
 ]);
 
+const TABLE_NAME = String.raw`([A-Z_][A-Z0-9_]*(?:\.[A-Z_][A-Z0-9_]*)?)`;
+
 /**
- * The contract operations one migration's SQL performs, as a sorted subset of
- * CONTRACT_OPERATION_KINDS. Detection is lexical and deliberately broad:
- * every DROP of an object (DROP NOT NULL only relaxes, so it is not one),
- * every RENAME, every SET NOT NULL, and every added column that is NOT NULL
- * without a DEFAULT or generation expression.
+ * Tables a plain CREATE TABLE (no IF NOT EXISTS) makes in this migration: they
+ * cannot exist before it, so the previous revision never writes them. A
+ * blanked quoted identifier (_QUOTED_) is never a name.
+ */
+function tablesCreatedHere(text) {
+  const names = new Set();
+  for (const match of text.matchAll(new RegExp(String.raw`\bCREATE\s+(?:UNLOGGED\s+)?TABLE\s+(?!IF\b)${TABLE_NAME}`, "gu"))) {
+    if (!match[1].includes("_QUOTED_")) names.add(match[1]);
+  }
+  return names;
+}
+
+/** The table of the ALTER TABLE statement an ADD at `index` belongs to, or null. */
+function alteredTable(text, index) {
+  let table = null;
+  for (const match of text.slice(0, index).matchAll(
+    new RegExp(String.raw`\bALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?${TABLE_NAME}`, "gu"),
+  )) {
+    table = { name: match[1], end: match.index + match[0].length };
+  }
+  return table !== null && !text.slice(table.end, index).includes(";") ? table.name : null;
+}
+
+/**
+ * The contract operations one migration's SQL performs: tightening or
+ * removing changes the previous revision, still serving between migrate and
+ * roll, could fail on. Returned as a sorted subset of CONTRACT_OPERATION_KINDS.
+ * Detection is lexical and deliberately broad:
+ *   drop          every DROP of an object (DROP NOT NULL only relaxes);
+ *   rename        every RENAME;
+ *   set-not-null  every SET NOT NULL;
+ *   add-not-null-without-default
+ *                 every added column that is NOT NULL without a DEFAULT or
+ *                 generation expression;
+ *   alter-type    every column type change (ALTER [COLUMN] c [SET DATA] TYPE);
+ *   add-constraint
+ *                 every CHECK, UNIQUE, PRIMARY KEY, FOREIGN KEY or EXCLUDE
+ *                 constraint added to a table by ALTER TABLE without NOT
+ *                 VALID (UNIQUE, PRIMARY KEY and EXCLUDE cannot be NOT VALID),
+ *                 or added outside an ALTER TABLE (a domain);
+ *   unique-index  every CREATE UNIQUE INDEX;
+ *   dynamic-sql   every EXECUTE of a statement (string literals are blanked
+ *                 here, so dynamic SQL is never read and is reviewed instead;
+ *                 GRANT EXECUTE ON and trigger EXECUTE FUNCTION/PROCEDURE are
+ *                 not dynamic SQL).
+ * A constraint or unique index on a table that a plain CREATE TABLE makes in
+ * the same migration is not a contract operation: that table is new.
+ *
+ * Not detected, so left to migration review: a constraint declared inline on
+ * an added column (the previous revision writes NULL or the column's default
+ * there), and behaviour changes inside trigger or function bodies
+ * (CREATE TRIGGER, CREATE OR REPLACE FUNCTION).
  */
 export function classifyContractOperations(sql) {
   if (typeof sql !== "string") fail("PRODUCTION_MIGRATION_CONTRACT_INPUT_INVALID");
   const text = sqlKeywords(sql).toUpperCase();
+  const created = tablesCreatedHere(text);
   const kinds = new Set();
   if (/\bDROP\s+(?!NOT\s+NULL\b)[A-Z]/u.test(text)) kinds.add("drop");
   if (/\bRENAME\b/u.test(text)) kinds.add("rename");
@@ -345,6 +457,25 @@ export function classifyContractOperations(sql) {
       kinds.add("add-not-null-without-default");
     }
   }
+  if (/\bALTER\s+(?:COLUMN\s+)?(?:IF\s+EXISTS\s+)?[A-Z_][A-Z0-9_]*\s+(?:SET\s+DATA\s+)?TYPE\b/u.test(text)) {
+    kinds.add("alter-type");
+  }
+  for (const match of text.matchAll(
+    /\bADD\s+(?:CONSTRAINT\s+[A-Z_][A-Z0-9_]*\s+)?(?:CHECK|UNIQUE|PRIMARY\s+KEY|FOREIGN\s+KEY|EXCLUDE)\b/gu,
+  )) {
+    if (/\bNOT\s+VALID\b/u.test(clauseFrom(text, match.index))) continue;
+    const table = alteredTable(text, match.index);
+    if (table === null || !created.has(table)) kinds.add("add-constraint");
+  }
+  // A unique index whose table cannot be read is a contract operation too.
+  const uniqueIndexes = [...text.matchAll(/\bCREATE\s+UNIQUE\s+INDEX\b/gu)].length;
+  const indexedTables = [...text.matchAll(new RegExp(String.raw`\bCREATE\s+UNIQUE\s+INDEX(?:\s+CONCURRENTLY)?`
+    + String.raw`(?:\s+IF\s+NOT\s+EXISTS)?(?:\s+(?!ON\b)[A-Z_][A-Z0-9_]*)?\s+ON\s+(?:ONLY\s+)?${TABLE_NAME}`, "gu"))]
+    .map((match) => match[1]);
+  if (indexedTables.length !== uniqueIndexes || indexedTables.some((table) => !created.has(table))) {
+    kinds.add("unique-index");
+  }
+  if (/\bEXECUTE\b(?!\s+(?:ON|FUNCTION|PROCEDURE)\b)/u.test(text)) kinds.add("dynamic-sql");
   return Object.freeze(CONTRACT_OPERATION_KINDS.filter((kind) => kinds.has(kind)));
 }
 

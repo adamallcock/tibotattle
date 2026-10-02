@@ -341,7 +341,7 @@ test("the attached identity must be the configured migrator, before any manifest
   }
 });
 
-test("contract classification finds drops, renames and tightenings, and nothing in comments, strings or relaxations", () => {
+test("contract classification finds drops, renames, tightenings and dynamic SQL, and nothing in comments, strings, relaxations or new tables", () => {
   const kinds = (sql) => [...classifyContractOperations(sql)];
   assert.deepEqual(kinds("ALTER TABLE t DROP COLUMN c;"), ["drop"]);
   assert.deepEqual(kinds("DROP INDEX IF EXISTS i;"), ["drop"]);
@@ -351,11 +351,44 @@ test("contract classification finds drops, renames and tightenings, and nothing 
   assert.deepEqual(kinds("ALTER TABLE t ADD c integer NOT NULL, ADD COLUMN d text;"), ["add-not-null-without-default"]);
   assert.deepEqual(kinds("CREATE FUNCTION f() RETURNS void AS $body$ BEGIN DROP TABLE x; END $body$ LANGUAGE plpgsql;"),
     ["drop"], "function bodies are code and are scanned");
+  // Tightenings the previous revision can fail on.
+  assert.deepEqual(kinds("ALTER TABLE t ALTER COLUMN c TYPE integer USING c::integer;"), ["alter-type"]);
+  assert.deepEqual(kinds("ALTER TABLE t ALTER c SET DATA TYPE bigint;"), ["alter-type"]);
+  for (const sql of [
+    "ALTER TABLE t ADD CONSTRAINT k CHECK (c IS NOT NULL);",
+    "ALTER TABLE t ADD CONSTRAINT k CHECK (c > 0);",
+    "ALTER TABLE t ADD CONSTRAINT u UNIQUE (c);",
+    "ALTER TABLE ONLY t ADD PRIMARY KEY (id);",
+    "ALTER TABLE t ADD CONSTRAINT f FOREIGN KEY (c) REFERENCES u(id);",
+    "ALTER TABLE t ADD EXCLUDE USING gist (c WITH &&);",
+    "ALTER TABLE t ADD COLUMN d text, ADD CHECK (c > 0);",
+    "ALTER DOMAIN d ADD CONSTRAINT k CHECK (VALUE > 0);",
+  ]) assert.deepEqual(kinds(sql), ["add-constraint"], sql);
+  for (const sql of [
+    "CREATE UNIQUE INDEX i ON t (c);",
+    "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS i ON ONLY s.t (c);",
+    "CREATE UNIQUE INDEX ON t (c);",
+    "CREATE TABLE IF NOT EXISTS t (c integer); CREATE UNIQUE INDEX i ON t (c);",
+    "CREATE TABLE \"t\" (c integer); CREATE UNIQUE INDEX i ON \"t\" (c);",
+    // An index whose table cannot be read fails closed, even beside a new table's index.
+    "CREATE TABLE t (c integer); CREATE UNIQUE INDEX i ON t (c); CREATE UNIQUE INDEX j ON (c);",
+  ]) assert.deepEqual(kinds(sql), ["unique-index"], sql);
+  assert.deepEqual(kinds("DO $$ BEGIN EXECUTE 'DROP TABLE t'; END $$;"), ["dynamic-sql"],
+    "a string literal is blanked, so dynamic SQL is flagged for review rather than read");
+  assert.deepEqual(kinds("CREATE FUNCTION f() RETURNS void AS $$ BEGIN EXECUTE format('SELECT %I', x); END $$ LANGUAGE plpgsql;"),
+    ["dynamic-sql"]);
   for (const sql of [
     "ALTER TABLE t ADD COLUMN c text NOT NULL DEFAULT 'x';",
     "ALTER TABLE t ADD COLUMN c bigint NOT NULL GENERATED ALWAYS AS IDENTITY;",
     "ALTER TABLE t ALTER COLUMN c DROP NOT NULL;",
-    "ALTER TABLE t ADD CONSTRAINT k CHECK (c IS NOT NULL);",
+    "ALTER TABLE t ADD CONSTRAINT k CHECK (c > 0) NOT VALID;",
+    "ALTER TABLE t ADD CONSTRAINT f FOREIGN KEY (c) REFERENCES u(id) NOT VALID;",
+    "CREATE TABLE t (c integer); CREATE UNIQUE INDEX i ON t (c); ALTER TABLE t ADD CONSTRAINT k CHECK (c > 0);",
+    "CREATE INDEX i ON t (c);",
+    "ALTER TYPE e ADD VALUE 'x';",
+    "GRANT EXECUTE ON FUNCTION f() TO r; REVOKE EXECUTE ON FUNCTION g() FROM PUBLIC;",
+    "CREATE TRIGGER x BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();",
+    "CREATE TRIGGER x BEFORE INSERT ON t FOR EACH ROW EXECUTE PROCEDURE f();",
     "CREATE TEMP TABLE x (id integer) ON COMMIT DROP;",
     "-- DROP TABLE t; RENAME; SET NOT NULL\nSELECT 1;",
     "/* DROP TABLE t; /* nested */ RENAME */ SELECT 1;",
@@ -375,8 +408,8 @@ test("the promoted primary tail 0001-0062 is classified once and pinned in CONTR
     assert.deepEqual([...entry.operations], [...classified[name]], name);
     assert.ok(entry.reason.length > 20, name);
   }
-  assert.equal(Object.keys(CONTRACT_MIGRATIONS).length, 12);
-  assert.equal(assertExpandCompatible(primary), 12);
+  assert.equal(Object.keys(CONTRACT_MIGRATIONS).length, 23);
+  assert.equal(assertExpandCompatible(primary), 23);
 });
 
 test("an unreviewed, changed or stale contract migration refuses the image", () => {
@@ -386,7 +419,16 @@ test("an unreviewed, changed or stale contract migration refuses the image", () 
   assert.throws(() => assertExpandCompatible(renaming), isCode("PRODUCTION_MIGRATION_CONTRACT_UNREVIEWED"));
   const reviewed = { ...CONTRACT_MIGRATIONS, [dropping.at(-1).name]: { sha256: dropping.at(-1).sha256, operations: ["drop"],
     reason: "synthetic reviewed contract migration" } };
-  assert.equal(assertExpandCompatible(dropping, reviewed), 13);
+  assert.equal(assertExpandCompatible(dropping, reviewed), 24);
+  for (const [name, sql] of [
+    ["w2_opsdb_retype.sql", "ALTER TABLE participants ALTER COLUMN created_at TYPE text;"],
+    ["w2_opsdb_check.sql", "ALTER TABLE participants ADD CONSTRAINT w2_opsdb_check CHECK (id <> '');"],
+    ["w2_opsdb_unique.sql", "CREATE UNIQUE INDEX w2_opsdb_unique ON participants (created_at);"],
+    ["w2_opsdb_dynamic.sql", "DO $$ BEGIN EXECUTE 'DROP TABLE participants'; END $$;"],
+  ]) {
+    assert.throws(() => assertExpandCompatible(withExtraMigration(primary, name, sql)),
+      isCode("PRODUCTION_MIGRATION_CONTRACT_UNREVIEWED"), name);
+  }
   const changed = primary.map((migration) => migration.name === "0050_admin_audit_and_collection_controls.sql"
     ? { ...migration, sha256: "f".repeat(64) } : migration);
   assert.throws(() => assertExpandCompatible(changed), isCode("PRODUCTION_MIGRATION_CONTRACT_UNREVIEWED"));
@@ -445,7 +487,7 @@ test("a fresh scratch target: read-only history first, then schema, forward runn
   assert.equal(receipt.target.kind, "scratch");
   assert.equal(receipt.migrations.count, 62);
   assert.equal(receipt.migrations.manifestSha256, primaryManifestSha256(primary));
-  assert.equal(receipt.migrations.contractReviewed, 12);
+  assert.equal(receipt.migrations.contractReviewed, 23);
   assert.equal(receipt.migrations.simpResidue, null);
   assert.equal(receipt.ledger, "not-migrated");
   assert.equal(receipt.sourceCommit, "c".repeat(40));

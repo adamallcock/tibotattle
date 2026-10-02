@@ -9,6 +9,8 @@ COPY apps/worker/gcp-test/package-lock.json ./package-lock.json
 RUN npm ci --ignore-scripts --no-audit --no-fund
 
 COPY apps/worker/scripts/postgres-migrations.mjs ./apps/worker/scripts/postgres-migrations.mjs
+COPY apps/worker/cloud-run/postgres-migrations.mjs ./apps/worker/cloud-run/postgres-migrations.mjs
+COPY apps/worker/cloud-run/postgres-runtime-grants.mjs ./apps/worker/cloud-run/postgres-runtime-grants.mjs
 COPY apps/worker/scripts/gcp-test-database.mjs ./apps/worker/scripts/gcp-test-database.mjs
 COPY apps/worker/postgres/migrations ./apps/worker/postgres/migrations
 COPY apps/worker/gcp-test/source-content-digest.txt ./SOURCE_CONTENT_DIGEST

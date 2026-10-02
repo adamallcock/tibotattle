@@ -213,6 +213,13 @@ jobs:
     name: PostgreSQL 17 suite
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    # The fast-path cloud-target specs also dial the server over loopback TCP:
+    # the container's published 127.0.0.1 port (ciPostgresTcpProfile), which
+    # differs from the socket's PG_TEST_PORT. The suite passes this pair to its
+    # SOCKET pass only; without it those tests would report as skipped.
+    env:
+      PG_TEST_TCP_HOST: "127.0.0.1"
+      PG_TEST_TCP_PORT: "55432"
     steps:
       - name: Check out the selected revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

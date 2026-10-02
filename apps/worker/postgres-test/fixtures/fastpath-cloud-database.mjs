@@ -9,7 +9,8 @@
  * and CREATEROLE that is not a superuser. The stand-in is a database with
  * exactly that name, owned by a NOLOGIN NOSUPERUSER CREATEDB CREATEROLE group,
  * a LOGIN migrator in the group, and pools over loopback TCP
- * (PG_TEST_TCP_HOST, the cluster's PG_TEST_PORT).
+ * (PG_TEST_TCP_HOST, on PG_TEST_TCP_PORT when the TCP listener's port differs
+ * from the cluster's PG_TEST_PORT, as in the CI container).
  *
  * The database name is the cloud's, so checks sharing a cluster serialize on
  * an advisory lock held in the admin database for the whole run, and an
@@ -33,6 +34,17 @@ export function localFastpathTcpHost(env = process.env) {
   if (host === undefined || host === "") return null;
   assert.ok(LOOPBACK_HOSTS.has(host), "PG_TEST_TCP_HOST must be 127.0.0.1, ::1 or localhost");
   return host;
+}
+
+/**
+ * The loopback TCP port: PG_TEST_TCP_PORT when set, else `socketPort` (a
+ * cluster that listens on the socket's port over TCP too).
+ */
+export function localFastpathTcpPort(env = process.env, socketPort) {
+  const value = env.PG_TEST_TCP_PORT;
+  const port = value === undefined || value === "" ? socketPort : Number(value);
+  assert.ok(Number.isSafeInteger(port) && port > 0 && port <= 65_535, "PG_TEST_TCP_PORT must be a TCP port number");
+  return port;
 }
 
 /**

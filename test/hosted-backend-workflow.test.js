@@ -273,7 +273,24 @@ test("three jobs run the Worker gate, the Cloud Run check and the routed Postgre
   assert.match(worker[site], /--output "\$GITHUB_WORKSPACE\/\.release-build\/public-release-site"/u);
   assert.match(worker[site], /--social-image "\$social_card"/u);
   assert.deepEqual(workflow.jobs["worker-gate"].env, { WRANGLER_SEND_METRICS: "false" });
-  assert.equal(workflow.jobs["postgres-17-suite"].env, undefined);
+});
+
+test("the PostgreSQL 17 suite gets the container's loopback TCP pair, and only that job does", async () => {
+  // Without the pair the journal-transfer spec's TCP tests skip, which the
+  // suite reports as SILENTLY_SKIPPED; with a wrong port they fail to connect.
+  const { workflow } = await loadWorkflow();
+  const container = await readFile(join(REPOSITORY_ROOT, CONTAINER_SCRIPT), "utf8");
+  const publish = [...container.matchAll(/^export const LOOPBACK_PUBLISH = "127\.0\.0\.1:(\d+):5432";$/gmu)];
+  assert.equal(publish.length, 1, "the container publishes exactly one loopback TCP port");
+  assert.deepEqual(workflow.jobs["postgres-17-suite"].env, {
+    PG_TEST_TCP_HOST: "127.0.0.1",
+    PG_TEST_TCP_PORT: publish[0][1],
+  });
+  for (const id of ["worker-gate", "cloud-run-check"]) {
+    assert.equal(Object.keys(workflow.jobs[id].env ?? {}).some((name) => name.startsWith("PG_TEST_")), false,
+      `${id} never dials the TCP pair`);
+  }
+  assert.match(container, /^export function ciPostgresTcpProfile\(/mu);
 });
 
 test("the Cloud Run check gives the daily-activation integration test the container's loopback TCP port", async () => {
