@@ -298,11 +298,39 @@ export function planWeeklyApiEquivalentUsd(referenceUsd, planType) {
   return referenceUsd / PLAN_REFERENCE_MULTIPLIERS[planType];
 }
 
+// Every primary Codex model this build's reviewed catalog can name is drawable
+// when the server publishes an estimate for it. The catalog, not a hand roster,
+// decides which models exist; model-visuals.js only decides how a model looks.
 export const PUBLIC_ALLOWANCE_MODEL_CONFIG = Object.freeze(REVIEWED_MODEL_CATALOG
   .filter(model => model.provider === "openai_codex" && model.allowanceTrack === "primary")
   .map(model => Object.freeze({ modelId: model.id, label: model.label })));
-const PUBLIC_ALLOWANCE_MODEL_IDS = new Set(PUBLIC_ALLOWANCE_MODEL_CONFIG.map(model => model.modelId));
 const PUBLIC_ALLOWANCE_PLAN_IDS = Object.freeze(["pro", "prolite", "plus"]);
+
+// An allowance-breakdown day carries one tuple per identified model. A server
+// that knows a newer model than this page does is expected, so the tuple count
+// is bounded by a fixed sanity cap rather than by this build's catalog size.
+const PUBLIC_BREAKDOWN_MODELS_PER_DAY_MAX = 256;
+const PUBLIC_BREAKDOWN_DAYS_MAX = 70;
+// A retained copy states how many tuples it left out as two content-free
+// integers. They can never exceed what a live payload could have carried.
+const RETAINED_UNRECOGNIZED_KEYS = Object.freeze(["tuples", "models"]);
+const RETAINED_UNRECOGNIZED_TUPLES_MAX = PUBLIC_BREAKDOWN_DAYS_MAX * PUBLIC_BREAKDOWN_MODELS_PER_DAY_MAX;
+
+// Optional, additive model metadata on the breakdown block. It lets the server
+// name and order models this build's catalog has never seen. Closed on every
+// axis: exact keys, bounded count, token grammars and an integer order. The id
+// is only ever a join key; what the page may print is the validated label.
+export const PUBLIC_MODEL_METADATA_MAX_ENTRIES = 128;
+const PUBLIC_MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,127}$/u;
+const PUBLIC_MODEL_LABEL_PATTERN = /^[\p{L}\p{N}][\p{L}\p{N} .+_()×·/:-]{0,79}$/u;
+const PUBLIC_MODEL_FAMILY_PATTERN = /^[a-z][a-z0-9-]{0,23}$/u;
+const PUBLIC_MODEL_ORDER_MAX = 9999;
+// Reviewed identities that are deliberately not on the primary comparison
+// (a separate allowance track, or another provider). A metadata block cannot
+// promote them; the catalog's own classification wins.
+const PUBLIC_MODEL_CATALOG_EXCLUDED_IDS = new Set(REVIEWED_MODEL_CATALOG
+  .filter(model => model.provider !== "openai_codex" || model.allowanceTrack !== "primary")
+  .map(model => model.id));
 const exactObject = (value, keys) => value !== null && typeof value === "object"
   && !Array.isArray(value) && Object.keys(value).length === keys.length
   && keys.every(key => Object.prototype.hasOwnProperty.call(value, key));
@@ -331,6 +359,41 @@ function publicAllowanceSummary(value) {
     fitCount: value.fitCount, band80Usd };
 }
 
+/**
+ * The optional published model-metadata block, or null when any part of it is
+ * outside the closed contract. All-or-nothing: a partly valid block is never
+ * partly trusted. Returns a map of model id to its validated presentation.
+ */
+function publicModelMetadata(value) {
+  if (!Array.isArray(value) || value.length > PUBLIC_MODEL_METADATA_MAX_ENTRIES) return null;
+  const entries = new Map();
+  for (const entry of value) {
+    if (!exactObject(entry, ["id", "label", "family", "order"])
+        || typeof entry.id !== "string" || !PUBLIC_MODEL_ID_PATTERN.test(entry.id)
+        || PUBLIC_MODEL_CATALOG_EXCLUDED_IDS.has(entry.id) || entries.has(entry.id)
+        || typeof entry.label !== "string" || !PUBLIC_MODEL_LABEL_PATTERN.test(entry.label)
+        || typeof entry.family !== "string" || !PUBLIC_MODEL_FAMILY_PATTERN.test(entry.family)
+        || !Number.isSafeInteger(entry.order) || entry.order < 0
+        || entry.order > PUBLIC_MODEL_ORDER_MAX) return null;
+    entries.set(entry.id, { label: entry.label, family: entry.family, order: entry.order });
+  }
+  return entries;
+}
+
+/**
+ * The drawable models for one publication: this build's reviewed catalog in
+ * catalog order, then any metadata-only models in published order. Metadata
+ * replaces the catalog's label and adds a family and order; it never removes a
+ * catalog model. Without metadata this is exactly the catalog roster.
+ */
+function publicModelConfig(metadata) {
+  const config = new Map(PUBLIC_ALLOWANCE_MODEL_CONFIG.map(model => [model.modelId, model]));
+  for (const [modelId, { label, family, order }] of metadata ?? []) {
+    config.set(modelId, Object.freeze({ modelId, label, family, order }));
+  }
+  return [...config.values()];
+}
+
 // The published breakdown contract versions this reader honours, and the two
 // fixed method claims inside them. Named because the cache projection has to
 // rebuild the exact wire shape it accepted, and a second spelling of a claim
@@ -346,18 +409,59 @@ const COMMUNITY_ALLOWANCE_MODEL_BASIS =
 const COMMUNITY_ALLOWANCE_MODEL_GATE =
   "shared_composition_kernel_identification";
 
+const PUBLIC_BREAKDOWN_ENVELOPE_KEYS = Object.freeze(["schemaVersion", "basis",
+  "referencePlanType", "normalization", "modelBasis", "modelGate", "generatedAt", "days"]);
+
+/**
+ * The count a retained copy carries for the tuples its projection left out, or
+ * null when it is malformed. Two bounded integers and nothing else: a retained
+ * copy has to keep saying that a gap exists, and no id ever reaches storage.
+ */
+function retainedUnrecognizedCounts(value) {
+  if (!exactObject(value, RETAINED_UNRECOGNIZED_KEYS)
+      || !Number.isSafeInteger(value.tuples) || value.tuples < 1
+      || value.tuples > RETAINED_UNRECOGNIZED_TUPLES_MAX
+      || !Number.isSafeInteger(value.models) || value.models < 1
+      || value.models > value.tuples) return null;
+  return { tuples: value.tuples, models: value.models };
+}
+
 /** New public contract, never the private preview. Invalid optional breakdowns
- * cannot hide the separately validated daily activity or aggregate estimates. */
-export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs = Date.now()) {
-  if (!exactObject(value, ["schemaVersion", "basis", "referencePlanType", "normalization",
-    "modelBasis", "modelGate", "generatedAt", "days"])
+ * cannot hide the separately validated daily activity or aggregate estimates.
+ *
+ * Model identity is tolerant in one way only. A tuple whose model id is not
+ * known (to this build's catalog, or to a valid `modelConfig` block) is skipped
+ * and counted, so a model newer than this page costs its own series instead of
+ * every breakdown. The skip is for identities this page has never heard of: an
+ * id outside the id grammar, a repeated id, and an id the catalog reviewed and
+ * kept off the primary comparison (a separate allowance track, or another
+ * provider) are producer faults that refuse the block, exactly as for a known
+ * id. The tuple's numbers must still be valid, the id is never retained or
+ * rendered, and every other part of the contract stays closed.
+ *
+ * `retained` is true only for a payload this browser stored itself. Its
+ * projection leaves the skipped tuples out and records how many as
+ * `retainedUnrecognizedModels`, so a cached render still states the gap. A live
+ * payload carrying that key is not on the wire contract and is refused. */
+export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs = Date.now(), { retained = false } = {}) {
+  const isRecord = value !== null && typeof value === "object" && !Array.isArray(value);
+  const hasMetadataBlock = isRecord && Object.prototype.hasOwnProperty.call(value, "modelConfig");
+  const hasRetainedCounts = retained && isRecord
+    && Object.prototype.hasOwnProperty.call(value, "retainedUnrecognizedModels");
+  const carried = hasRetainedCounts ? retainedUnrecognizedCounts(value.retainedUnrecognizedModels) : null;
+  if (hasRetainedCounts && carried === null) return null;
+  if (!exactObject(value, [
+    ...PUBLIC_BREAKDOWN_ENVELOPE_KEYS,
+    ...(hasMetadataBlock ? ["modelConfig"] : []),
+    ...(hasRetainedCounts ? ["retainedUnrecognizedModels"] : []),
+  ])
       || !COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS.includes(value.schemaVersion)
       || value.basis !== COMMUNITY_ALLOWANCE_BASIS || value.referencePlanType !== "pro"
       || value.normalization !== COMMUNITY_ALLOWANCE_NORMALIZATION
       || value.modelBasis !== COMMUNITY_ALLOWANCE_MODEL_BASIS
       || value.modelGate !== COMMUNITY_ALLOWANCE_MODEL_GATE
       || typeof value.generatedAt !== "string" || !Number.isFinite(nowMs)
-      || !Array.isArray(value.days) || value.days.length > 70) return null;
+      || !Array.isArray(value.days) || value.days.length > PUBLIC_BREAKDOWN_DAYS_MAX) return null;
   const generatedMs = Date.parse(value.generatedAt);
   // Keep the publication's actual dates; only the server can invalidate its
   // source. An ordinary refresh does not expire a previously published graph.
@@ -370,12 +474,20 @@ export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs =
   const allowedDays = new Set(publishedDays);
   const days = [];
   const hasCombined = value.schemaVersion === COMMUNITY_ALLOWANCE_BREAKDOWN_COMBINED_VERSION;
+  // A malformed block is ignored whole and reported, never partly trusted: the
+  // page then draws exactly what it would have drawn without one.
+  const metadata = hasMetadataBlock ? publicModelMetadata(value.modelConfig) : null;
+  const modelMetadata = !hasMetadataBlock ? "absent" : metadata === null ? "rejected" : "applied";
+  const modelConfig = publicModelConfig(metadata);
+  const knownModelIds = new Set(modelConfig.map(model => model.modelId));
+  let unrecognizedModelTuples = 0;
+  const unrecognizedModelIds = new Set();
   for (const row of value.days) {
     if (!exactObject(row, hasCombined ? ["day", "combined", "byPlanType", "models"] : ["day", "byPlanType", "models"]) || !publicDay(row.day)
         || !allowedDays.has(row.day) || row.day < earliestDay || row.day >= today || row.day >= generatedDay
         || (days.length > 0 && row.day <= days.at(-1).day)
         || !exactObject(row.byPlanType, PUBLIC_ALLOWANCE_PLAN_IDS)
-        || !Array.isArray(row.models) || row.models.length > PUBLIC_ALLOWANCE_MODEL_IDS.size) return null;
+        || !Array.isArray(row.models) || row.models.length > PUBLIC_BREAKDOWN_MODELS_PER_DAY_MAX) return null;
     const byPlanType = {};
     for (const id of PUBLIC_ALLOWANCE_PLAN_IDS) {
       const summary = publicAllowanceSummary(row.byPlanType[id]);
@@ -385,17 +497,40 @@ export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs =
     const models = [];
     const seen = new Set();
     for (const tuple of row.models) {
-      if (!Array.isArray(tuple) || tuple.length !== 3
-          || !PUBLIC_ALLOWANCE_MODEL_IDS.has(tuple[0]) || seen.has(tuple[0])
+      // The shape and numbers are validated for every tuple, known or not. Only
+      // the identity is tolerant, and only to the extent of leaving the tuple out.
+      if (!Array.isArray(tuple) || tuple.length !== 3 || typeof tuple[0] !== "string"
           || !publicDollars(tuple[1]) || !publicCount(tuple[2]) || tuple[2] < 1) return null;
+      const known = knownModelIds.has(tuple[0]);
+      // An identity this page does not know may be skipped, but only if it is
+      // shaped like a model id at all. A reviewed identity kept off the primary
+      // comparison is not "newer than this page": it is a producer fault.
+      if (!known && (!PUBLIC_MODEL_ID_PATTERN.test(tuple[0])
+          || PUBLIC_MODEL_CATALOG_EXCLUDED_IDS.has(tuple[0]))) return null;
+      // One tuple per model per day, known or not.
+      if (seen.has(tuple[0])) return null;
       seen.add(tuple[0]);
+      if (!known) {
+        unrecognizedModelTuples += 1;
+        unrecognizedModelIds.add(tuple[0]);
+        continue;
+      }
       models.push([tuple[0], tuple[1], tuple[2]]);
     }
     const combined = hasCombined ? publicAllowanceSummary(row.combined) : null;
     if (hasCombined && combined === null) return null;
     days.push({ day: row.day, ...(hasCombined ? { combined } : {}), byPlanType, models });
   }
-  return { generatedAt: value.generatedAt, hasCombined, modelConfig: PUBLIC_ALLOWANCE_MODEL_CONFIG, days };
+  // A stored copy's projection never keeps a skipped tuple, so a copy that
+  // both carries a count and still holds one contradicts itself: refuse it.
+  if (carried !== null && unrecognizedModelTuples > 0) return null;
+  return {
+    generatedAt: value.generatedAt, hasCombined, modelConfig, days,
+    // Counts only. An unrecognized id is dropped before it reaches this value.
+    unrecognizedModelTuples: unrecognizedModelTuples + (carried?.tuples ?? 0),
+    unrecognizedModelCount: unrecognizedModelIds.size + (carried?.models ?? 0),
+    modelMetadata,
+  };
 }
 
 function normalizedDailyAllowance(candidate) {
@@ -690,7 +825,7 @@ function normalizedDailyDay(candidate) {
  * out-of-order series — collapses to `unsupported_schema` rather than a
  * partially trusted render.
  */
-export function normalizeCommunityDailySeries(payload, { nowMs = Date.now() } = {}) {
+export function normalizeCommunityDailySeries(payload, { nowMs = Date.now(), retained = false } = {}) {
   if (!payload) return { state: "service_unavailable", days: [] };
   const from = dayString(payload.from);
   const to = dayString(payload.to);
@@ -721,7 +856,7 @@ export function normalizeCommunityDailySeries(payload, { nowMs = Date.now() } = 
     to,
     allowanceState: payload.allowanceState,
     breakdowns: payload.allowanceState === "ready"
-      ? normalizePublicAllowanceBreakdowns(payload.allowanceBreakdowns, days.map(day => day.day), nowMs) : null,
+      ? normalizePublicAllowanceBreakdowns(payload.allowanceBreakdowns, days.map(day => day.day), nowMs, { retained }) : null,
     // Community-wide, not per-day: the lane measures gaps between consecutive
     // requests across the whole published window.
     cacheRetention: normalizedCacheRetention(payload.cacheRetention),
@@ -770,8 +905,23 @@ function cachedBreakdowns(breakdowns) {
     modelBasis: COMMUNITY_ALLOWANCE_MODEL_BASIS,
     modelGate: COMMUNITY_ALLOWANCE_MODEL_GATE,
     generatedAt: breakdowns.generatedAt,
-    // `modelConfig` is this build's reviewed catalog, not published data, so
-    // it is never stored: the reader supplies it again on the way back out.
+    // This build's reviewed catalog is not published data, so it is never
+    // stored: the reader supplies it again on the way back out. A published
+    // metadata block IS data the stored tuples depend on (a model only it
+    // names would otherwise be dropped on the way back in), so exactly the
+    // entries it supplied are rebuilt, in the closed wire shape.
+    ...(breakdowns.modelMetadata === "applied" ? {
+      modelConfig: breakdowns.modelConfig.filter(model => model.order !== undefined)
+        .map(model => ({ id: model.modelId, label: model.label, family: model.family, order: model.order })),
+    } : {}),
+    // Tuples this page could not name are left out above, and the gap is not:
+    // two content-free integers keep a cached render saying what the live one
+    // said. Absent when nothing was left out.
+    ...(breakdowns.unrecognizedModelTuples > 0 ? {
+      retainedUnrecognizedModels: {
+        tuples: breakdowns.unrecognizedModelTuples, models: breakdowns.unrecognizedModelCount,
+      },
+    } : {}),
     days: breakdowns.days.map(row => ({
       day: row.day,
       ...(breakdowns.hasCombined ? { combined: row.combined } : {}),
@@ -814,9 +964,11 @@ function cachedDay(day) {
  * allowance breakdown that failed its checks, is absent here exactly as it
  * was absent from the render; it is never repaired or filled in.
  *
- * The result re-normalizes to the same series the original did, which is what
- * makes a cached render identical to the live one rather than a second,
- * looser interpretation. Re-normalizing later only ever gets stricter: the
+ * The result re-normalizes (as retained) to the same series the original did,
+ * which is what makes a cached render identical to the live one rather than a
+ * second, looser interpretation. That includes the gap: tuples for models this
+ * page could not name are never stored, but how many were left out is, as two
+ * integers, so a cached render states the same omission a live one does. Re-normalizing later only ever gets stricter: the
  * breakdown checks that depend on the current day move against acceptance,
  * never towards it, so time cannot promote a refused payload.
  *
