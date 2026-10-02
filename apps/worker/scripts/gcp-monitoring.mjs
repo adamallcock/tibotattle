@@ -2,8 +2,11 @@
 
 /**
  * Operator CLI for monitoring and alerting as code (OPS-5, E-OPS5): render,
- * readback and plan only. Nothing here creates, changes or deletes a
- * monitoring resource; apply is a later, separately authorized stream.
+ * readback and plan for the metrics, uptime check and policies, and the one
+ * email notification channel (OWN-5c). The only write is notification-channel
+ * creating that channel under its plan digest; nothing here changes or
+ * deletes a monitoring resource, and applying the policies is a later,
+ * separately authorized stream.
  *
  *   render  (--environment=<production|staging> | --desired-state=<abs path>)
  *           [--notification-channel=projects/<project>/notificationChannels/<id>]
@@ -21,17 +24,32 @@
  *     One unauthenticated GET of https://<service host>/api/health. Exit 0
  *     only for exactly Google's front-end 403 (status 403, no origin marker
  *     header, Google's body text); the body is never printed.
+ *   notification-channel (--environment | --desired-state)
+ *           (--email-file=<abs path> | --email=<address>) [--authorize=<planDigest>]
+ *     OWN-5c (owner, round 11: alerts by email). Finds, or creates, the
+ *     plane's ONE email notification channel, display name
+ *     tibotattle[-staging]-alerts-email. The address is supplied at run time
+ *     only: preferably a private file (a regular file outside the
+ *     repository, not a symlink, mode 0600 or 0400, one address), or the
+ *     argument. It is never written to stdout, stderr, the plan digest or a
+ *     receipt; the output carries the channel's resource name only. Without
+ *     --authorize this is a dry run: one list call, then "found" (with the
+ *     channel name) or "create" (with the planDigest). With
+ *     --authorize=<that planDigest> it creates the channel, then reads it
+ *     back. A channel of that name whose address or type differs, or more
+ *     than one, is refused and never changed. Pass the printed name to
+ *     render and plan as --notification-channel.
  *
- * The notification channel (OWN-5c) is an input: it is never written to the
- * output, which says only "assigned" or "unassigned". Output is one
+ * The notification channel (OWN-5c) is an input to render and plan: it is
+ * never written to their output, which says only "assigned" or "unassigned". Output is one
  * content-free JSON document on stdout; errors are {"status":"error","code"}
  * on stderr without gcloud output. Exit 0 on success, 2 when a plan holds a
  * refused delete or the origin is not locked, 1 on any error.
  */
 
 import { spawnSync } from "node:child_process";
-import { realpathSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { closeSync, fstatSync, lstatSync, openSync, readSync, realpathSync, constants as fsConstants } from "node:fs";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { canonicalJson } from "../src/canonical-json.ts";
 import {
@@ -54,6 +72,21 @@ import {
 export const GCP_MONITORING_READBACK_SCHEMA = "tibotattle-gcp-monitoring-readback-v1";
 export const GCP_MONITORING_PLAN_SCHEMA = "tibotattle-gcp-monitoring-plan-v1";
 export const GCP_MONITORING_ORIGIN_LOCK_SCHEMA = "tibotattle-gcp-monitoring-origin-lock-v1";
+export const GCP_MONITORING_CHANNEL_SCHEMA = "tibotattle-gcp-monitoring-channel-v1";
+/**
+ * The only gcloud shapes notification-channel issues (Cloud Monitoring's
+ * channel commands are in the beta track; the shapes are confirmed at the
+ * first run against the test project, like the readback's).
+ */
+export const MONITORING_CHANNEL_COMMANDS = Object.freeze([
+  "beta monitoring channels list",
+  "beta monitoring channels create",
+]);
+const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+const EMAIL_FILE_MAX_BYTES = 512;
+/** A conservative address shape: local@domain.tld, ASCII, at most 254 characters. */
+const EMAIL_ADDRESS = /^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$/u;
+const CHANNEL_NAME = /^projects\/([a-z][a-z0-9-]{4,28}[a-z0-9])\/notificationChannels\/[0-9]{1,24}$/u;
 /** The only gcloud shapes this CLI issues: list calls. */
 export const MONITORING_READ_COMMANDS = Object.freeze([
   "logging metrics list",
@@ -71,6 +104,7 @@ const COMMANDS = Object.freeze({
   readback: Object.freeze([...SOURCE]),
   plan: Object.freeze([...SOURCE, "--notification-channel"]),
   "origin-lock-probe": Object.freeze([...SOURCE]),
+  "notification-channel": Object.freeze([...SOURCE, "--email-file", "--email", "--authorize"]),
 });
 
 function isRecord(value) {
@@ -95,11 +129,22 @@ export function parseGcpMonitoringArgs(argv) {
   if (desiredStatePath === null && environment === null) fail("GCP_MONITORING_ARGUMENT_MISSING");
   if (desiredStatePath !== null && !isAbsolute(desiredStatePath)) fail("GCP_MONITORING_DESIRED_STATE_PATH_INVALID");
   if (environment !== null && !GCP_OPS_INFRA_ENVIRONMENTS.includes(environment)) fail("GCP_MONITORING_ENVIRONMENT_INVALID");
+  const emailFile = values.get("--email-file") ?? null;
+  const email = values.get("--email") ?? null;
+  const authorize = values.get("--authorize") ?? null;
+  if (argv[0] === "notification-channel") {
+    if ((emailFile === null) === (email === null)) fail("GCP_MONITORING_EMAIL_SOURCE_REQUIRED");
+    if (emailFile !== null && !isAbsolute(emailFile)) fail("GCP_MONITORING_EMAIL_FILE_PATH_INVALID");
+    if (authorize !== null && !/^[0-9a-f]{64}$/u.test(authorize)) fail("GCP_MONITORING_AUTHORIZE_INVALID");
+  }
   return Object.freeze({
     command: argv[0],
     desiredStatePath: desiredStatePath === null ? null : resolve(desiredStatePath),
     environment,
     notificationChannel: values.get("--notification-channel") ?? null,
+    emailFile: emailFile === null ? null : resolve(emailFile),
+    email,
+    authorize,
   });
 }
 
@@ -288,6 +333,177 @@ export function planMonitoring(rendered, readback) {
 }
 
 // ---------------------------------------------------------------------------
+// Notification channel (OWN-5c)
+
+/** The plane's one email channel: tibotattle-alerts-email or tibotattle-staging-alerts-email. */
+export function emailChannelDisplayName(desired) {
+  return `${desired.environment === "production" ? "tibotattle" : "tibotattle-staging"}-alerts-email`;
+}
+
+/** A syntactically plausible address, or a closed refusal that never carries the value. */
+export function validateAlertEmail(value) {
+  if (typeof value !== "string" || value.length > 254 || !EMAIL_ADDRESS.test(value)) fail("GCP_MONITORING_EMAIL_INVALID");
+  return value;
+}
+
+function insideRepository(path) {
+  const relation = relative(REPOSITORY_ROOT, path);
+  return relation === "" || (!relation.startsWith(`..${sep}`) && relation !== ".." && !isAbsolute(relation));
+}
+
+/**
+ * Reads the address from a private file: a regular file (not a symlink),
+ * outside this repository, readable by its owner only (no group or other
+ * bits), at most 512 bytes, holding one address and an optional newline.
+ */
+export function readAlertEmailFile(path) {
+  if (typeof path !== "string" || !isAbsolute(path)) fail("GCP_MONITORING_EMAIL_FILE_PATH_INVALID");
+  let link;
+  try {
+    link = lstatSync(path);
+  } catch {
+    fail("GCP_MONITORING_EMAIL_FILE_UNREADABLE");
+  }
+  if (link.isSymbolicLink() || !link.isFile()) fail("GCP_MONITORING_EMAIL_FILE_UNSAFE");
+  let real;
+  try {
+    real = realpathSync(path);
+  } catch {
+    fail("GCP_MONITORING_EMAIL_FILE_UNREADABLE");
+  }
+  let repository = REPOSITORY_ROOT;
+  try {
+    repository = realpathSync(REPOSITORY_ROOT);
+  } catch {
+    // The resolved root is compared below either way.
+  }
+  if (insideRepository(real) || insideRepository(resolve(path))
+      || real === repository || real.startsWith(`${repository}${sep}`)) {
+    fail("GCP_MONITORING_EMAIL_FILE_IN_REPOSITORY");
+  }
+  let descriptor;
+  try {
+    descriptor = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+  } catch {
+    fail("GCP_MONITORING_EMAIL_FILE_UNREADABLE");
+  }
+  try {
+    const info = fstatSync(descriptor);
+    if (!info.isFile() || (info.mode & 0o077) !== 0 || info.size > EMAIL_FILE_MAX_BYTES
+        || (typeof process.getuid === "function" && info.uid !== process.getuid())) {
+      fail("GCP_MONITORING_EMAIL_FILE_UNSAFE");
+    }
+    const buffer = Buffer.alloc(EMAIL_FILE_MAX_BYTES + 1);
+    const length = readSync(descriptor, buffer, 0, buffer.length, 0);
+    if (length > EMAIL_FILE_MAX_BYTES) fail("GCP_MONITORING_EMAIL_FILE_UNSAFE");
+    const text = buffer.subarray(0, length).toString("utf8");
+    buffer.fill(0);
+    return validateAlertEmail(text.endsWith("\n") ? text.slice(0, -1) : text);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+/** A guard for notification-channel: only its two shapes, one --project, --format=json; output never echoed. */
+export function guardedChannelGcloud(runner, project, { allowCreate = false } = {}) {
+  if (typeof runner !== "function") fail("GCLOUD_RUNNER_INVALID");
+  return (argv) => {
+    const shape = Array.isArray(argv) ? shapeOf(argv) : null;
+    if (!Array.isArray(argv) || argv.some((arg) => typeof arg !== "string")
+        || !MONITORING_CHANNEL_COMMANDS.includes(shape)
+        || (shape === "beta monitoring channels create" && !allowCreate)) {
+      fail("GCLOUD_COMMAND_FORBIDDEN");
+    }
+    if (argv.filter((arg) => arg.startsWith("--project=")).length !== 1 || !argv.includes(`--project=${project}`)) {
+      fail("GCLOUD_PROJECT_FLAG_INVALID");
+    }
+    if (!argv.includes("--format=json")) fail("GCLOUD_READ_FORMAT_REQUIRED");
+    const what = shape.replaceAll(" ", "-");
+    let result;
+    try {
+      result = runner([...argv]);
+    } catch {
+      fail(`GCLOUD_CALL_FAILED:${what}`);
+    }
+    if (!isRecord(result) || result.status !== 0 || (result.error !== undefined && result.error !== null)
+        || typeof result.stdout !== "string") {
+      fail(`GCLOUD_CALL_FAILED:${what}`);
+    }
+    try {
+      return JSON.parse(result.stdout === "" ? "[]" : result.stdout);
+    } catch {
+      return fail(`GCLOUD_OUTPUT_INVALID:${what}`);
+    }
+  };
+}
+
+/** The plane's channels of that display name, reduced to name, type and whether the address matches. */
+function listPlaneEmailChannels(call, desired, address) {
+  const listed = call(["beta", "monitoring", "channels", "list", `--project=${desired.project}`, "--format=json"]);
+  if (!Array.isArray(listed)) fail("GCLOUD_OUTPUT_INVALID:beta-monitoring-channels-list");
+  const displayName = emailChannelDisplayName(desired);
+  return listed.filter((entry) => isRecord(entry) && entry.displayName === displayName).map((entry) => {
+    const name = typeof entry.name === "string" ? entry.name : "";
+    const match = CHANNEL_NAME.exec(name);
+    if (match === null || match[1] !== desired.project) fail("MONITORING_CHANNEL_NAME_INVALID");
+    const listedAddress = entry.labels?.email_address;
+    return {
+      name,
+      type: entry.type ?? null,
+      addressMatches: typeof listedAddress === "string" && listedAddress.toLowerCase() === address.toLowerCase(),
+      enabled: entry.enabled !== false,
+    };
+  });
+}
+
+function channelVerdict(channels) {
+  if (channels.length > 1) fail("MONITORING_CHANNEL_AMBIGUOUS");
+  if (channels.length === 0) return null;
+  const [channel] = channels;
+  if (channel.type !== "email") fail("MONITORING_CHANNEL_TYPE_MISMATCH");
+  if (!channel.addressMatches) fail("MONITORING_CHANNEL_ADDRESS_MISMATCH");
+  if (!channel.enabled) fail("MONITORING_CHANNEL_DISABLED");
+  return channel;
+}
+
+/**
+ * Finds or (under --authorize) creates the plane's one email channel. The
+ * address never leaves this function except as the one create argument to
+ * gcloud; the result and the plan digest carry the channel name only.
+ */
+export function ensureEmailChannel(desired, { address, authorize = null, runner = defaultMonitoringRunner }) {
+  validateAlertEmail(address);
+  const displayName = emailChannelDisplayName(desired);
+  const list = guardedChannelGcloud(runner, desired.project);
+  const existing = channelVerdict(listPlaneEmailChannels(list, desired, address));
+  const body = {
+    schema: GCP_MONITORING_CHANNEL_SCHEMA,
+    environment: desired.environment,
+    project: desired.project,
+    displayName,
+    type: "email",
+    action: existing === null ? "create" : "found",
+    channel: existing?.name ?? null,
+  };
+  const planDigest = sha256Hex(canonicalJson(body));
+  if (existing !== null || authorize === null) {
+    return deepFreeze({ ...body, planDigest, applied: false });
+  }
+  if (authorize !== planDigest) fail("MONITORING_CHANNEL_AUTHORIZATION_MISMATCH");
+  const create = guardedChannelGcloud(runner, desired.project, { allowCreate: true });
+  const created = create(["beta", "monitoring", "channels", "create", `--project=${desired.project}`,
+    `--display-name=${displayName}`, "--type=email", `--channel-labels=email_address=${address}`,
+    `--user-labels=managed-by=tibotattle-ops-5,environment=${desired.environment}`,
+    "--description=TiboTattle OPS-5 alerts (OWN-5c)", "--format=json"]);
+  const name = isRecord(created) && typeof created.name === "string" ? created.name : "";
+  const match = CHANNEL_NAME.exec(name);
+  if (match === null || match[1] !== desired.project) fail("MONITORING_CHANNEL_CREATE_UNCONFIRMED");
+  const readback = channelVerdict(listPlaneEmailChannels(list, desired, address));
+  if (readback === null || readback.name !== name) fail("MONITORING_CHANNEL_CREATE_UNCONFIRMED");
+  return deepFreeze({ ...body, action: "created", channel: name, planDigest, applied: true });
+}
+
+// ---------------------------------------------------------------------------
 // Origin lock
 
 async function boundedText(response) {
@@ -337,6 +553,7 @@ export async function main(argv = process.argv.slice(2), {
   readFile,
   readSource,
   now,
+  readEmailFile = readAlertEmailFile,
   stdout = (text) => process.stdout.write(text),
   stderr = (text) => process.stderr.write(text),
 } = {}) {
@@ -355,6 +572,11 @@ export async function main(argv = process.argv.slice(2), {
       const result = await probeOriginLock(desired, { fetchImpl, ...(now === undefined ? {} : { now }) });
       print(result);
       return result.verdict === "locked" ? 0 : 2;
+    }
+    if (config.command === "notification-channel") {
+      const address = config.emailFile !== null ? readEmailFile(config.emailFile) : validateAlertEmail(config.email);
+      print(ensureEmailChannel(desired, { address, authorize: config.authorize, runner }));
+      return 0;
     }
     if (config.command === "readback") {
       print(readbackMonitoring(desired, { runner }));

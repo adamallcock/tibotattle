@@ -3,15 +3,18 @@
 This is the runbook that every alert policy links to. Each policy's
 documentation links to `#<policy id>` here. The policies are code in
 `scripts/gcp-ops-monitoring-policies.mjs` (OPS-5, E-OPS5).
-`scripts/gcp-monitoring.mjs` renders them, reads them back and plans them.
+`scripts/gcp-monitoring.mjs` renders them, reads them back and plans them,
+and finds or creates the plane's one email notification channel.
 
 **Status (2026-10-02):** the policies have been rendered, planned and
 tested offline only. Nothing has been created in any project, and no apply
 command exists yet. The PromQL names of log-based metrics and the shape of
 Cloud Scheduler's attempt log are assumptions until the first readback
-against the test project. Until the owner supplies the notification channel
-(OWN-5c), every alert policy is deferred with
-`NOTIFICATION_CHANNEL_UNASSIGNED`.
+against the test project. Until a notification channel is passed to render
+and plan (OWN-5c), every alert policy is deferred with
+`NOTIFICATION_CHANNEL_UNASSIGNED`. The owner chose email (round 11): the
+staging channel is created in the test project at staging roll time, and
+the production channel is a PROD-1 step.
 
 ## Commands
 
@@ -20,6 +23,7 @@ node scripts/gcp-monitoring.mjs render --environment=staging [--notification-cha
 node scripts/gcp-monitoring.mjs readback --environment=staging
 node scripts/gcp-monitoring.mjs plan --environment=staging [--notification-channel=...]
 node scripts/gcp-monitoring.mjs origin-lock-probe --environment=staging
+node scripts/gcp-monitoring.mjs notification-channel --environment=staging --email-file=<abs path> [--authorize=<planDigest>]
 ```
 
 - **render** makes no call.
@@ -27,6 +31,41 @@ node scripts/gcp-monitoring.mjs origin-lock-probe --environment=staging
   uptime checks and alert policies.
 - **origin-lock-probe** sends one unauthenticated request. The CLI never
   prints the channel's value.
+- **notification-channel** issues one list call. It is the only command that
+  can write, and only with `--authorize`.
+
+## Email notification channel (OWN-5c)
+
+Each plane has exactly one email channel, display name
+`tibotattle-alerts-email` (production) or `tibotattle-staging-alerts-email`
+(staging), in that plane's project. `notification-channel` finds it or
+creates it.
+
+- **The address is supplied at run time only.** Prefer `--email-file`: an
+  absolute path to a regular file outside the repository, not a symlink,
+  owned by the operator, mode `0600` or `0400`, holding one address and an
+  optional newline. `--email=<address>` also works, but it lands in shell
+  history. The address never enters a tracked file, stdout, stderr, the
+  plan digest or a receipt. It is passed to `gcloud` once, as the create's
+  `--channel-labels=email_address=...`.
+- **Dry run first.** Without `--authorize`, the command lists the project's
+  channels (`gcloud beta monitoring channels list`) and prints either
+  `action: "found"` with the channel's resource name, or `action: "create"`
+  with a `planDigest`.
+- **Create under the digest.** Rerun with `--authorize=<planDigest>`. It
+  creates the channel (`gcloud beta monitoring channels create`, type
+  `email`, user labels `managed-by=tibotattle-ops-5` and the environment),
+  reads it back, and prints `action: "created"` with the resource name. A
+  rerun prints `found` and creates nothing.
+- **Refusals, never changes.** More than one channel of that name, a
+  different address, a non-email type, a disabled channel, or a name in
+  another project is refused with a closed code. Fix those by hand in the
+  console; the tool never updates or deletes a channel.
+- **Use it.** Pass the printed resource name to `render` and `plan` as
+  `--notification-channel=projects/<project>/notificationChannels/<id>`.
+  Receipts record that name only.
+- The `beta monitoring channels` command shapes are assumptions until the
+  first run against the test project, like the readback's.
 
 ## Privacy contract
 
@@ -53,7 +92,7 @@ exists:
 
 | Deferral | Meaning |
 |---|---|
-| `NOTIFICATION_CHANNEL_UNASSIGNED` | OWN-5c: there is no notification channel yet |
+| `NOTIFICATION_CHANNEL_UNASSIGNED` | OWN-5c: no notification channel was passed (create or find it with `notification-channel`) |
 | `SCHEDULER_CADENCE_UNSET` | The trigger has no committed cadence (decision D3) |
 | `SCHEDULER_CADENCE_UNSUPPORTED` | The cadence fires fewer than twice in 400 days, so no absence window fits |
 | `TRIGGER_COMMITTED_PAUSED` | The trigger is committed `PAUSED`, so no attempts or runs are expected |

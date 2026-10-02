@@ -8,11 +8,20 @@
  */
 
 import assert from "node:assert/strict";
+import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { committedDesiredStatePath, loadCommittedDesiredState } from "./gcp-ops-infra-manifest.mjs";
 import {
+  emailChannelDisplayName,
+  ensureEmailChannel,
+  guardedChannelGcloud,
   guardedMonitoringGcloud,
   main,
+  MONITORING_CHANNEL_COMMANDS,
+  readAlertEmailFile,
   MONITORING_READ_COMMANDS,
   parseGcpMonitoringArgs,
   planMonitoring,
@@ -26,6 +35,8 @@ process.env.PATH = "/nonexistent-gcloud-guard";
 const STAGING = loadCommittedDesiredState("staging");
 const PROJECT = STAGING.project;
 const CHANNEL = `projects/${PROJECT}/notificationChannels/1234567890`;
+/** Obviously fake: the .invalid TLD never resolves (RFC 2606). */
+const SYNTHETIC_EMAIL = "alerts@example.invalid";
 const GOOGLE_403 = "<html><title>403 Forbidden</title><h1>Error: Forbidden</h1><h2>Your client does not have permission"
   + " to get URL <code>/api/health</code> from this server.</h2></html>";
 
@@ -67,7 +78,8 @@ async function run(argv, { runner = fakeMonitoring().runner, fetchImpl } = {}) {
 
 test("arguments are closed", () => {
   assert.deepEqual(parseGcpMonitoringArgs(["plan", "--environment=staging", `--notification-channel=${CHANNEL}`]), {
-    command: "plan", desiredStatePath: null, environment: "staging", notificationChannel: CHANNEL });
+    command: "plan", desiredStatePath: null, environment: "staging", notificationChannel: CHANNEL, emailFile: null,
+    email: null, authorize: null });
   for (const [argv, code] of [
     [[], "GCP_MONITORING_COMMAND_INVALID"],
     [["apply", "--environment=staging"], "GCP_MONITORING_COMMAND_INVALID"],
@@ -80,6 +92,15 @@ test("arguments are closed", () => {
     [["readback", "--environment=staging", `--notification-channel=${CHANNEL}`], "GCP_MONITORING_ARGUMENT_INVALID"],
     [["origin-lock-probe", "--environment=staging", "--apply"], "GCP_MONITORING_ARGUMENT_INVALID"],
     [["render", "--environment="], "GCP_MONITORING_ARGUMENT_INVALID"],
+    [["plan", "--environment=staging", `--email=${SYNTHETIC_EMAIL}`], "GCP_MONITORING_ARGUMENT_INVALID"],
+    [["notification-channel", "--environment=staging"], "GCP_MONITORING_EMAIL_SOURCE_REQUIRED"],
+    [["notification-channel", "--environment=staging", `--email=${SYNTHETIC_EMAIL}`, "--email-file=/x"],
+      "GCP_MONITORING_EMAIL_SOURCE_REQUIRED"],
+    [["notification-channel", "--environment=staging", "--email-file=relative"], "GCP_MONITORING_EMAIL_FILE_PATH_INVALID"],
+    [["notification-channel", "--environment=staging", `--email=${SYNTHETIC_EMAIL}`, "--authorize=abc"],
+      "GCP_MONITORING_AUTHORIZE_INVALID"],
+    [["notification-channel", "--environment=staging", `--email=${SYNTHETIC_EMAIL}`,
+      `--notification-channel=${CHANNEL}`], "GCP_MONITORING_ARGUMENT_INVALID"],
   ]) {
     assert.throws(() => parseGcpMonitoringArgs(argv), { code }, argv.join(" "));
   }
@@ -211,4 +232,166 @@ test("the origin-lock probe accepts exactly Google's front-end 403 and never pri
   assert.equal(ok.out.includes("Your client"), false, "the body is never printed");
   const open = await run(["origin-lock-probe", "--environment=staging"], { fetchImpl: respond(200, "{}") });
   assert.equal(open.code, 2);
+});
+
+/** A synthetic project's notification channels; create appends one and returns it. */
+function fakeChannels(initial = [], { createName = `projects/${PROJECT}/notificationChannels/555`, failCreate = false } = {}) {
+  const channels = structuredClone(initial);
+  const calls = [];
+  const runner = (argv) => {
+    calls.push(argv);
+    const shape = argv.slice(0, 4).join(" ");
+    if (shape === "beta monitoring channels list") return { status: 0, stdout: JSON.stringify(channels) };
+    if (shape === "beta monitoring channels create") {
+      if (failCreate) return { status: 1, stdout: SYNTHETIC_EMAIL };
+      const label = argv.find((arg) => arg.startsWith("--channel-labels=email_address="));
+      const created = { name: createName, type: "email", enabled: true,
+        displayName: argv.find((arg) => arg.startsWith("--display-name=")).slice("--display-name=".length),
+        labels: { email_address: label.slice("--channel-labels=email_address=".length) } };
+      channels.push(created);
+      return { status: 0, stdout: JSON.stringify(created) };
+    }
+    return { status: 2, stdout: "" };
+  };
+  return { runner, calls, channels };
+}
+
+function privateEmailFile(contents = `${SYNTHETIC_EMAIL}\n`, mode = 0o600) {
+  const directory = mkdtempSync(join(tmpdir(), "own5c-channel-"));
+  const path = join(directory, "alert-email");
+  writeFileSync(path, contents, { mode });
+  chmodSync(path, mode);
+  return { directory, path };
+}
+
+const noAddress = (text) => !text.includes(SYNTHETIC_EMAIL) && !text.includes("example.invalid");
+
+test("notification-channel finds or creates the plane's one email channel, never printing the address", async () => {
+  assert.deepEqual([...MONITORING_CHANNEL_COMMANDS], ["beta monitoring channels list", "beta monitoring channels create"]);
+  assert.equal(emailChannelDisplayName(STAGING), "tibotattle-staging-alerts-email");
+  const { directory, path } = privateEmailFile();
+  try {
+    // Dry run on an empty project: one list call, the create is planned under a digest.
+    const fake = fakeChannels();
+    const dry = await run(["notification-channel", "--environment=staging", `--email-file=${path}`], { runner: fake.runner });
+    assert.equal(dry.code, 0, dry.err);
+    const plan = JSON.parse(dry.out);
+    assert.deepEqual([plan.action, plan.channel, plan.applied, plan.displayName, plan.type],
+      ["create", null, false, "tibotattle-staging-alerts-email", "email"]);
+    assert.match(plan.planDigest, /^[0-9a-f]{64}$/u);
+    assert.deepEqual(fake.calls.map((argv) => argv.slice(0, 4).join(" ")), ["beta monitoring channels list"]);
+    assert.ok(noAddress(dry.out + dry.err));
+    // The digest is the same whatever the address: it never binds or leaks it.
+    const other = await run(["notification-channel", "--environment=staging", "--email=someone-else@example.invalid"],
+      { runner: fakeChannels().runner });
+    assert.equal(JSON.parse(other.out).planDigest, plan.planDigest);
+    // A wrong digest is refused before any create.
+    const wrong = await run(["notification-channel", "--environment=staging", `--email-file=${path}`,
+      `--authorize=${"0".repeat(64)}`], { runner: fake.runner });
+    assert.deepEqual([wrong.code, JSON.parse(wrong.err).code], [1, "MONITORING_CHANNEL_AUTHORIZATION_MISMATCH"]);
+    assert.equal(fake.calls.some((argv) => argv[3] === "create"), false);
+    // Authorized: one create, then a read-back; the output is the channel name only.
+    const applied = await run(["notification-channel", "--environment=staging", `--email-file=${path}`,
+      `--authorize=${plan.planDigest}`], { runner: fake.runner });
+    assert.equal(applied.code, 0, applied.err);
+    const receipt = JSON.parse(applied.out);
+    assert.deepEqual([receipt.action, receipt.channel, receipt.applied], ["created", `projects/${PROJECT}/notificationChannels/555`, true]);
+    assert.ok(noAddress(applied.out + applied.err), "the receipt carries the channel name only");
+    const create = fake.calls.find((argv) => argv[3] === "create");
+    assert.ok(create.includes(`--project=${PROJECT}`) && create.includes("--type=email") && create.includes("--format=json"));
+    assert.ok(create.includes(`--channel-labels=email_address=${SYNTHETIC_EMAIL}`), "the address goes only to gcloud");
+    assert.equal(fake.calls.at(-1).slice(0, 4).join(" "), "beta monitoring channels list", "read back after create");
+    // Idempotent: a second run finds it, with or without the digest, and creates nothing.
+    for (const extra of [[], [`--authorize=${plan.planDigest}`]]) {
+      const before = fake.calls.length;
+      const found = await run(["notification-channel", "--environment=staging", `--email-file=${path}`, ...extra],
+        { runner: fake.runner });
+      assert.equal(found.code, 0, found.err);
+      assert.deepEqual([JSON.parse(found.out).action, JSON.parse(found.out).channel],
+        ["found", `projects/${PROJECT}/notificationChannels/555`]);
+      assert.equal(fake.calls.slice(before).some((argv) => argv[3] === "create"), false);
+    }
+    // The found channel feeds render and plan as --notification-channel.
+    assert.equal(renderMonitoring(STAGING, { notificationChannel: receipt.channel }).notificationChannel, "assigned");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("notification-channel refuses an ambiguous, mismatched or unconfirmed channel and never changes one", () => {
+  const displayName = "tibotattle-staging-alerts-email";
+  const channel = (id, extra = {}) => ({ name: `projects/${PROJECT}/notificationChannels/${id}`, displayName,
+    type: "email", enabled: true, labels: { email_address: SYNTHETIC_EMAIL }, ...extra });
+  for (const [channels, code] of [
+    [[channel(1), channel(2)], "MONITORING_CHANNEL_AMBIGUOUS"],
+    [[channel(1, { labels: { email_address: "other@example.invalid" } })], "MONITORING_CHANNEL_ADDRESS_MISMATCH"],
+    [[channel(1, { type: "sms" })], "MONITORING_CHANNEL_TYPE_MISMATCH"],
+    [[channel(1, { enabled: false })], "MONITORING_CHANNEL_DISABLED"],
+    [[channel(1, { name: "projects/other-project/notificationChannels/1" })], "MONITORING_CHANNEL_NAME_INVALID"],
+  ]) {
+    const fake = fakeChannels(channels);
+    assert.throws(() => ensureEmailChannel(STAGING, { address: SYNTHETIC_EMAIL, runner: fake.runner }),
+      (error) => error.code === code && noAddress(error.message), code);
+    assert.equal(fake.calls.some((argv) => argv[3] === "create"), false);
+  }
+  // Case differences in the address still match; other planes' channels are ignored.
+  const mixed = fakeChannels([channel(9, { labels: { email_address: "Alerts@Example.Invalid" } }),
+    { ...channel(10), displayName: "tibotattle-alerts-email" }]);
+  assert.equal(ensureEmailChannel(STAGING, { address: SYNTHETIC_EMAIL, runner: mixed.runner }).channel,
+    `projects/${PROJECT}/notificationChannels/9`);
+  // A create that fails, or that the read-back does not show, is unconfirmed; gcloud output is never echoed.
+  const planDigest = ensureEmailChannel(STAGING, { address: SYNTHETIC_EMAIL, runner: fakeChannels().runner }).planDigest;
+  assert.throws(() => ensureEmailChannel(STAGING, { address: SYNTHETIC_EMAIL, authorize: planDigest,
+    runner: fakeChannels([], { failCreate: true }).runner }),
+  (error) => error.code === "GCLOUD_CALL_FAILED:beta-monitoring-channels-create" && noAddress(error.message));
+  assert.throws(() => ensureEmailChannel(STAGING, { address: SYNTHETIC_EMAIL, authorize: planDigest,
+    runner: fakeChannels([], { createName: "projects/other-project/notificationChannels/5" }).runner }),
+  { code: "MONITORING_CHANNEL_CREATE_UNCONFIRMED" });
+  // The list-only guard never creates; every call is pinned to the plane's project and JSON.
+  const guard = guardedChannelGcloud(fakeChannels().runner, PROJECT);
+  for (const [argv, code] of [
+    [["beta", "monitoring", "channels", "create", `--project=${PROJECT}`, "--format=json"], "GCLOUD_COMMAND_FORBIDDEN"],
+    [["beta", "monitoring", "channels", "delete", `--project=${PROJECT}`, "--format=json"], "GCLOUD_COMMAND_FORBIDDEN"],
+    [["beta", "monitoring", "channels", "update", `--project=${PROJECT}`, "--format=json"], "GCLOUD_COMMAND_FORBIDDEN"],
+    [["beta", "monitoring", "channels", "list", "--project=other", "--format=json"], "GCLOUD_PROJECT_FLAG_INVALID"],
+    [["beta", "monitoring", "channels", "list", `--project=${PROJECT}`], "GCLOUD_READ_FORMAT_REQUIRED"],
+  ]) {
+    assert.throws(() => guard(argv), { code }, argv.join(" "));
+  }
+  for (const address of ["", "not-an-address", "a@b", "spaces in@example.invalid", `${"a".repeat(250)}@example.invalid`,
+    "x@example.invalid\nBcc: y@example.invalid"]) {
+    assert.throws(() => ensureEmailChannel(STAGING, { address, runner: fakeChannels().runner }),
+      { code: "GCP_MONITORING_EMAIL_INVALID" }, JSON.stringify(address));
+  }
+});
+
+test("the address file must be private, regular, outside the repository and hold one address", async () => {
+  const { directory, path } = privateEmailFile();
+  try {
+    assert.equal(readAlertEmailFile(path), SYNTHETIC_EMAIL);
+    chmodSync(path, 0o644);
+    assert.throws(() => readAlertEmailFile(path), { code: "GCP_MONITORING_EMAIL_FILE_UNSAFE" });
+    chmodSync(path, 0o600);
+    const link = join(directory, "link");
+    symlinkSync(path, link);
+    assert.throws(() => readAlertEmailFile(link), { code: "GCP_MONITORING_EMAIL_FILE_UNSAFE" });
+    assert.throws(() => readAlertEmailFile(join(directory, "missing")), { code: "GCP_MONITORING_EMAIL_FILE_UNREADABLE" });
+    assert.throws(() => readAlertEmailFile(directory), { code: "GCP_MONITORING_EMAIL_FILE_UNSAFE" });
+    for (const contents of [`${SYNTHETIC_EMAIL}\n${SYNTHETIC_EMAIL}\n`, "", `${"x".repeat(600)}`, " alerts@example.invalid"]) {
+      writeFileSync(path, contents);
+      assert.throws(() => readAlertEmailFile(path), (error) => /^GCP_MONITORING_EMAIL_(?:INVALID|FILE_UNSAFE)$/u
+        .test(error.code) && noAddress(error.message), JSON.stringify(contents.slice(0, 20)));
+    }
+    // A file inside the repository is refused, so the address cannot be committed by accident.
+    const inside = join(dirname(fileURLToPath(import.meta.url)), "gcp-monitoring.check.mjs");
+    assert.throws(() => readAlertEmailFile(inside), { code: "GCP_MONITORING_EMAIL_FILE_IN_REPOSITORY" });
+    // The CLI's failure line is a closed code only.
+    writeFileSync(path, "not-an-address\n");
+    const refused = await run(["notification-channel", "--environment=staging", `--email-file=${path}`],
+      { runner: fakeChannels().runner });
+    assert.deepEqual([refused.code, JSON.parse(refused.err)], [1, { status: "error", code: "GCP_MONITORING_EMAIL_INVALID" }]);
+    assert.equal(refused.out, "");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
