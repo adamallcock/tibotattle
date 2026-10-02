@@ -389,6 +389,46 @@ test("the pending-journal backlog is capped at 10001, exactly, in the statement 
   }
 });
 
+test("the journal reads walk the (source_id, sequence) primary key: no scan of the journal and a bounded pending read", { skip: SKIP, timeout: 240_000 }, async () => {
+  await environment();
+  try {
+    await seeding(async (client) => {
+      await client.query(`INSERT INTO ${table("storage_source_state")} (singleton, source_id, authority_epoch) VALUES (1, 'synthetic-source-a', 0)`);
+      await seedJournal(client, { from: 1, count: 20_000, recordedMs: Date.now() });
+      await client.query(`INSERT INTO ${table("storage_ingestion_changes")}
+        (source_id, sequence, event_digest, owner_digest, owner_revision, authority_epoch, kind, recorded_ms)
+        SELECT 'synthetic-source-b', n, md5('b' || n::text) || md5('c' || n::text), $1::text, 1, 0, 'source-updated', 1
+          FROM generate_series(1::bigint, 20000::bigint) AS n`, [OWNER_SENTINEL]);
+      await client.query(`INSERT INTO ${table("analytics_v2_journal_cursor")} (id, last_sequence, run_id) VALUES (1, 9, $1)`, [randomUUID()]);
+    });
+    await pool.query(`ANALYZE ${table("storage_ingestion_changes")}`);
+    // The statements the probe really issues, captured from a real run.
+    const issued = [];
+    await withClient(async (real) => {
+      const recording = { query: (text, values) => { issued.push({ text, values }); return real.query(text, values); } };
+      const lines = await collectOpsRuntimeSignals({ client: recording, schema: SCHEMA });
+      assert.equal(new Map(lines.map((line) => [line.probe, line])).get("analytics_journal_pending_events").value, OPS_BACKLOG_CAP);
+    });
+    const journalReads = issued.filter((entry) => entry.text.includes("storage_ingestion_changes"));
+    assert.equal(journalReads.length, 4, "the head, the backlog head, the bounded count and the oldest undelivered row");
+    for (const entry of journalReads) {
+      const plan = await pool.query(`EXPLAIN (FORMAT JSON) ${entry.text}`, entry.values);
+      const nodes = JSON.stringify(plan.rows[0]["QUERY PLAN"]);
+      // The journal (40,000 rows over two sources) is only ever reached through its primary key.
+      assert.doesNotMatch(nodes, /"Node Type":"Seq Scan","[^}]*"Relation Name":"storage_ingestion_changes"/u, entry.text.slice(0, 70));
+      assert.match(nodes, /storage_ingestion_changes_pkey/u, entry.text.slice(0, 70));
+    }
+    // The bounded count stops at the cap: its plan limits the scan, it does not count the whole range.
+    const pending = journalReads.find((entry) => entry.text.includes("count(*)::text AS pending"));
+    const analyzed = await pool.query(`EXPLAIN (ANALYZE, FORMAT JSON) ${pending.text}`, pending.values);
+    const plan = JSON.stringify(analyzed.rows[0]["QUERY PLAN"]);
+    const actualRows = [...plan.matchAll(/"Actual Rows":(\d+)/gu)].map((match) => Number(match[1]));
+    assert.ok(Math.max(...actualRows) <= OPS_BACKLOG_CAP, `no node returns more than the cap: ${actualRows}`);
+  } finally {
+    await resetJournal();
+  }
+});
+
 test("every probe transaction is read only, with the two bounds, on a real session", { skip: SKIP, timeout: 120_000 }, async () => {
   await environment();
   await withClient(async (real) => {
