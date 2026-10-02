@@ -379,3 +379,38 @@ test("staging refuses a missing shared admin dependency and never publishes the 
   await updateManifestRow(value.source, "community.js");
   await assert.rejects(stage(), /local-only route or control/u);
 });
+
+test("a candidate site stages only as exactly its manifest, built from the commit it is pinned to", async (t) => {
+  // production:deploy --candidate-public-manifest-sha256 stages with the
+  // candidate as the expected manifest, pinned to the deploy source (forward)
+  // or to the released commit named by a rollback receipt.
+  const value = await fixture();
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+  const released = value.sourceCommit;
+  const releasedManifest = createHash("sha256")
+    .update(await readFile(join(value.source, "release-site-manifest.json")))
+    .digest("hex");
+  await writeFile(join(value.publicSource, "community.js"), "console.log('next release');\n");
+  git(value.root, ["add", "apps/web/public/community.js"]);
+  git(value.root, ["commit", "--quiet", "-m", "next release"]);
+  const head = git(value.root, ["rev-parse", "HEAD"]).trim();
+  const stage = (pins) => stageProductionAssets({
+    repositoryRoot: value.root,
+    sourceDirectory: value.source,
+    destinationDirectory: value.destination,
+    expectedSourceCommit: head,
+    ...pins,
+  });
+
+  // The released site restored for a rollback stages against its own commit.
+  const rollback = await stage({ retainedPublicSourceCommit: released, expectedLiveManifestSha256: releasedManifest });
+  assert.equal(rollback.sourceCommit, head);
+  assert.equal(rollback.publicSourceCommit, released);
+  assert.equal(rollback.manifestSha256, releasedManifest);
+  // The same bytes are not a forward candidate of HEAD: they were built from another commit.
+  await assert.rejects(stage({ retainedPublicSourceCommit: head, expectedLiveManifestSha256: releasedManifest }),
+    /does not match the source snapshot/u);
+  // A candidate manifest the staged site does not produce.
+  await assert.rejects(stage({ retainedPublicSourceCommit: released, expectedLiveManifestSha256: "0".repeat(64) }),
+    /does not match the expected live manifest/u);
+});

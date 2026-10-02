@@ -39,6 +39,7 @@ import {
   parseProductionDeploymentArgs,
   recheckProductionHealth,
   recheckProductionPublicSurface,
+  resolveProductionCandidateSite,
 } from "./production-deploy.mjs";
 import { openOperation, readOperation } from "../../../scripts/lib/release-operation.mjs";
 import { stageProductionAssets } from "./stage-production-assets.mjs";
@@ -2110,8 +2111,10 @@ test("typed deployment rejects a contradictory nested predecessor before pinning
   assert.deepEqual(calls, []);
 });
 
-for (const mode of ["retained", "candidate", "bad-preimage", "bad-postimage", "mutated-options"]) test(`typed deployment preserves immutable config and manifest transition: ${mode}`, async (t) => {
+const FIXTURE_ROLLBACK_SITE_COMMIT = "d".repeat(40);
+for (const mode of ["retained", "candidate", "rollback", "rollback-off-line", "bad-preimage", "bad-postimage", "mutated-options"]) test(`typed deployment preserves immutable config and manifest transition: ${mode}`, async (t) => {
   const candidate = mode === "retained" ? null : "2".repeat(64);
+  const rollbackSource = mode.startsWith("rollback") ? FIXTURE_ROLLBACK_SITE_COMMIT : null;
   const manifestChecks = [];
   const fixture = await immutableSnapshotFixture();
   t.after(() => rm(fixture.root, { recursive: true, force: true }));
@@ -2192,6 +2195,10 @@ for (const mode of ["retained", "candidate", "bad-preimage", "bad-postimage", "m
     retainedPublicSourceCommit: FIXTURE_PREVIOUS_COMMIT,
     expectedLiveManifestSha256: "1".repeat(64),
     candidatePublicManifestSha256: candidate,
+    ...(rollbackSource === null ? {} : { candidatePublicSourceCommit: rollbackSource }),
+    ...(mode === "rollback-off-line"
+      ? { coordinationFactory: () => ({ ...coordinationFixture(), isAncestor: (previous) => previous !== rollbackSource }) }
+      : {}),
     migrationGateCheck: null,
     determinePendingMigrations: async () => assert.fail("Qualified typed roles must not query the legacy migration ledger"),
     releasePreflight: async () => ({ state: "ready", blockers: [] }),
@@ -2199,7 +2206,9 @@ for (const mode of ["retained", "candidate", "bad-preimage", "bad-postimage", "m
     checkEndpoints: async () => {},
     stageAssets: async ({ repositoryRoot, expectedSourceCommit, retainedPublicSourceCommit, expectedLiveManifestSha256 }) => {
       assert.equal(expectedSourceCommit, fixture.sourceCommit);
-      assert.equal(retainedPublicSourceCommit, candidate === null ? FIXTURE_PREVIOUS_COMMIT : fixture.sourceCommit);
+      assert.equal(retainedPublicSourceCommit, candidate === null
+        ? FIXTURE_PREVIOUS_COMMIT
+        : rollbackSource ?? fixture.sourceCommit);
       assert.equal(expectedLiveManifestSha256, candidate ?? "1".repeat(64));
       assert.equal(realpathSync(repositoryRoot), repositoryRoot);
       const configMetadata = await lstat(
@@ -2220,6 +2229,14 @@ for (const mode of ["retained", "candidate", "bad-preimage", "bad-postimage", "m
     },
   });
   const result = await runProductionDeployment(configured);
+  if (mode === "rollback-off-line") {
+    // The rollback site's commit must be in the deploy source: refused before
+    // the journal, the lock or Wrangler.
+    assert.deepEqual(result, { ok: false, code: "PRODUCTION_CANDIDATE_PUBLIC_SOURCE_NOT_ANCESTOR" });
+    assert.equal(deployed, false);
+    assert.deepEqual(manifestChecks, []);
+    return;
+  }
   if (["bad-preimage", "bad-postimage"].includes(mode)) {
     assert.equal(result.ok, false);
     assert.equal(deployed, mode === "bad-postimage");
@@ -2234,6 +2251,7 @@ for (const mode of ["retained", "candidate", "bad-preimage", "bad-postimage", "m
   assert.equal(captures, 4);
   const record = await readOperation(configured.operationDirectory);
   assert.equal(record.state.typed.candidatePublicManifestSha256 ?? null, candidate);
+  assert.equal(record.state.typed.candidatePublicSourceCommit ?? null, rollbackSource);
   assert.equal(record.state.typed.schema, "production-typed-operation-v1");
   assert.equal(record.state.typed.liveConfigurationFingerprint, baseline.fingerprint);
   assert.equal(record.state.typed.retainedPublicSourceCommit, FIXTURE_PREVIOUS_COMMIT);
@@ -2403,4 +2421,251 @@ test("typed candidate manifest rejects malformed values before provider or snaps
    createSourceSnapshot:()=>assert.fail("snapshot must not run")}));
   assert.deepEqual(result,{ok:false,code:"PRODUCTION_TYPED_INPUT_INVALID"});
  }
+});
+
+// ---------------------------------------------------------------------------
+// Candidate-site CLI: shipping a changed public site through the typed path
+
+const CANDIDATE_MANIFEST = "2".repeat(64);
+const REPLACED_MANIFEST = "1".repeat(64);
+const RECEIPT_PATH = "/synthetic/checkout/.release-build/web-release-receipt.json";
+
+function candidateSiteArgs({ receiptFlag = "--web-release-receipt", edge = ["--edge-mode", "worker"], extra = [] } = {}) {
+  return [
+    "--confirm", "DEPLOY_PRODUCTION",
+    "--expected-previous-source", FIXTURE_PREVIOUS_COMMIT,
+    "--inventory", "/private/inventory.json",
+    "--inventory-sha256", "1".repeat(64),
+    "--candidate-public-manifest-sha256", CANDIDATE_MANIFEST,
+    receiptFlag, RECEIPT_PATH,
+    "--replaced-public-source", FIXTURE_PREVIOUS_COMMIT,
+    "--replaced-live-manifest-sha256", REPLACED_MANIFEST,
+    ...edge,
+    ...extra,
+  ];
+}
+
+function withoutArgument(argv, name) {
+  const index = argv.indexOf(name);
+  assert.notEqual(index, -1, name);
+  return [...argv.slice(0, index), ...argv.slice(index + 2)];
+}
+
+test("candidate-site CLI arguments are closed, need an edge mode and never mix with the retained pair", () => {
+  assert.deepEqual(parseProductionDeploymentArgs(candidateSiteArgs()), {
+    confirmation: "DEPLOY_PRODUCTION",
+    expectedPreviousSourceCommit: FIXTURE_PREVIOUS_COMMIT,
+    inventoryPath: "/private/inventory.json",
+    inventorySha256: "1".repeat(64),
+    candidatePublicManifestSha256: CANDIDATE_MANIFEST,
+    webReleaseReceiptPath: RECEIPT_PATH,
+    replacedPublicSourceCommit: FIXTURE_PREVIOUS_COMMIT,
+    replacedLiveManifestSha256: REPLACED_MANIFEST,
+    edgeMode: "worker",
+  });
+  assert.equal(parseProductionDeploymentArgs(candidateSiteArgs({ receiptFlag: "--rollback-web-release-receipt" }))
+    .rollbackWebReleaseReceiptPath, RECEIPT_PATH);
+  assert.equal(parseProductionDeploymentArgs(candidateSiteArgs({
+    edge: ["--edge-mode=gcp", "--edge-plan=/private/plan.json", `--origin-commit=${"d".repeat(40)}`,
+      "--origin-verifier-account=verifier@synthetic-project.iam.gserviceaccount.com"],
+  })).edgeMode, "gcp");
+
+  const refusals = [
+    // The flag without --edge-mode: the privacy-page rule would not run.
+    [candidateSiteArgs({ edge: [] }), "PRODUCTION_CANDIDATE_SITE_EDGE_MODE_REQUIRED"],
+    [candidateSiteArgs({ edge: [], extra: ["--expected-live-manifest-sha256", REPLACED_MANIFEST] }),
+      "PRODUCTION_CANDIDATE_SITE_EDGE_MODE_REQUIRED"],
+    // A site change while fenced.
+    [candidateSiteArgs({ edge: ["--edge-mode", "fenced"] }), "PRODUCTION_CANDIDATE_SITE_FENCED"],
+    // Both manifest flags together, or any part of the retained pair.
+    [candidateSiteArgs({ extra: ["--expected-live-manifest-sha256", REPLACED_MANIFEST] }),
+      "PRODUCTION_CANDIDATE_SITE_RETAINED_PIN_CONFLICT"],
+    [candidateSiteArgs({ extra: ["--retained-public-source", FIXTURE_PREVIOUS_COMMIT] }),
+      "PRODUCTION_CANDIDATE_SITE_RETAINED_PIN_CONFLICT"],
+    [candidateSiteArgs({ extra: ["--retained-public-source", FIXTURE_PREVIOUS_COMMIT,
+      "--expected-live-manifest-sha256", REPLACED_MANIFEST] }), "PRODUCTION_CANDIDATE_SITE_RETAINED_PIN_CONFLICT"],
+    // A candidate equal to the live manifest it replaces is a no-op: refused.
+    [[...withoutArgument(candidateSiteArgs(), "--replaced-live-manifest-sha256"),
+      "--replaced-live-manifest-sha256", CANDIDATE_MANIFEST], "PRODUCTION_CANDIDATE_SITE_UNCHANGED"],
+    // Incomplete or malformed.
+    [withoutArgument(candidateSiteArgs(), "--web-release-receipt"), "PRODUCTION_ARGUMENTS_INVALID"],
+    [candidateSiteArgs({ extra: ["--rollback-web-release-receipt", RECEIPT_PATH] }), "PRODUCTION_ARGUMENTS_INVALID"],
+    [[...withoutArgument(candidateSiteArgs(), "--web-release-receipt"), "--web-release-receipt", "relative/receipt.json"],
+      "PRODUCTION_ARGUMENTS_INVALID"],
+    [withoutArgument(candidateSiteArgs(), "--replaced-public-source"), "PRODUCTION_ARGUMENTS_INVALID"],
+    [withoutArgument(candidateSiteArgs(), "--replaced-live-manifest-sha256"), "PRODUCTION_ARGUMENTS_INVALID"],
+    [withoutArgument(withoutArgument(candidateSiteArgs(), "--inventory"), "--inventory-sha256"), "PRODUCTION_ARGUMENTS_INVALID"],
+    [candidateSiteArgs({ extra: ["--confirm-migrations", "BINDING:0001_test.sql"] }), "PRODUCTION_ARGUMENTS_INVALID"],
+    [[...withoutArgument(candidateSiteArgs(), "--candidate-public-manifest-sha256"),
+      "--candidate-public-manifest-sha256", "A".repeat(64)], "PRODUCTION_ARGUMENTS_INVALID"],
+    [withoutArgument(candidateSiteArgs(), "--candidate-public-manifest-sha256"), "PRODUCTION_ARGUMENTS_INVALID"],
+    [candidateSiteArgs({ extra: ["--candidate-public-manifest-sha256", CANDIDATE_MANIFEST] }), "PRODUCTION_ARGUMENTS_INVALID"],
+    [candidateSiteArgs({ edge: ["--edge-mode", "proxy"] }), "PRODUCTION_ARGUMENTS_INVALID"],
+    [["--confirm", "RECONCILE_TYPED_PRODUCTION_DEPLOYMENT", "--operation", "/private/operation", "--executor-stopped",
+      "--inventory", "/private/inventory.json", "--inventory-sha256", "1".repeat(64),
+      "--candidate-public-manifest-sha256", CANDIDATE_MANIFEST], "PRODUCTION_ARGUMENTS_INVALID"],
+  ];
+  for (const [argv, code] of refusals) {
+    assert.throws(() => parseProductionDeploymentArgs(argv), { code }, argv.join(" "));
+  }
+});
+
+function receiptVerifier({ sourceCommit = FIXTURE_SOURCE_COMMIT, baseCommit = FIXTURE_PREVIOUS_COMMIT,
+  manifestSha256 = CANDIDATE_MANIFEST, calls = [] } = {}) {
+  return async (input) => {
+    calls.push(input);
+    return { receipt: { sourceCommit, baseCommit, site: { manifestSha256 } } };
+  };
+}
+
+async function resolveCandidate(argv, overrides = {}) {
+  return resolveProductionCandidateSite({
+    options: parseProductionDeploymentArgs(argv),
+    workerDirectory: "/synthetic/checkout/apps/worker",
+    headCommit: () => FIXTURE_SOURCE_COMMIT,
+    isAncestor: async () => assert.fail("a forward release never walks the live line"),
+    ...overrides,
+  });
+}
+
+test("a forward candidate site needs a fresh, matching web-release receipt and pins the replaced live site", async () => {
+  const calls = [];
+  const resolved = await resolveCandidate(candidateSiteArgs(), { verifyReceipt: receiptVerifier({ calls }) });
+  assert.deepEqual(resolved, {
+    ok: true,
+    code: null,
+    options: {
+      confirmation: "DEPLOY_PRODUCTION",
+      expectedPreviousSourceCommit: FIXTURE_PREVIOUS_COMMIT,
+      inventoryPath: "/private/inventory.json",
+      inventorySha256: "1".repeat(64),
+      edgeMode: "worker",
+      // The receipt's source becomes the exact deploy source.
+      expectedSourceCommit: FIXTURE_SOURCE_COMMIT,
+      // The replaced pair is the live preimage, rechecked before the upload.
+      retainedPublicSourceCommit: FIXTURE_PREVIOUS_COMMIT,
+      expectedLiveManifestSha256: REPLACED_MANIFEST,
+      candidatePublicManifestSha256: CANDIDATE_MANIFEST,
+    },
+  });
+  assert.deepEqual(calls, [{ repositoryRoot: "/synthetic/checkout", receiptPath: RECEIPT_PATH }]);
+
+  // A mismatched receipt: it was prepared for another site.
+  assert.deepEqual(await resolveCandidate(candidateSiteArgs(), {
+    verifyReceipt: receiptVerifier({ manifestSha256: "3".repeat(64) }),
+  }), { ok: false, code: "PRODUCTION_CANDIDATE_RECEIPT_MISMATCH" });
+  // A stale receipt: prepared for another checkout, or against a base that is no longer live.
+  assert.deepEqual(await resolveCandidate(candidateSiteArgs(), {
+    verifyReceipt: receiptVerifier({ sourceCommit: "e".repeat(40) }),
+  }), { ok: false, code: "PRODUCTION_CANDIDATE_RECEIPT_STALE" });
+  assert.deepEqual(await resolveCandidate(candidateSiteArgs(), {
+    verifyReceipt: receiptVerifier({ baseCommit: "e".repeat(40) }),
+  }), { ok: false, code: "PRODUCTION_CANDIDATE_RECEIPT_STALE" });
+  // A receipt the lane no longer accepts (changed scope, regenerated site, bad shape).
+  assert.deepEqual(await resolveCandidate(candidateSiteArgs(), {
+    verifyReceipt: async () => { throw new Error("Web-only release receipt no longer matches the generated site."); },
+  }), { ok: false, code: "PRODUCTION_CANDIDATE_RECEIPT_INVALID" });
+  assert.deepEqual(await resolveCandidate(candidateSiteArgs(), {
+    verifyReceipt: async () => ({ receipt: { sourceCommit: "short" } }),
+  }), { ok: false, code: "PRODUCTION_CANDIDATE_RECEIPT_INVALID" });
+  assert.deepEqual(await resolveCandidate(candidateSiteArgs(), {
+    verifyReceipt: receiptVerifier(),
+    headCommit: () => null,
+  }), { ok: false, code: "PRODUCTION_SOURCE_REVISION_UNAVAILABLE" });
+});
+
+test("the candidate-site resolver uses the real web-release lane and refuses a missing receipt", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "production-candidate-receipt-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, "apps", "worker"), { recursive: true });
+  const argv = [...withoutArgument(candidateSiteArgs(), "--web-release-receipt"),
+    "--web-release-receipt", join(root, ".release-build", "web-release-receipt.json")];
+  assert.deepEqual(await resolveProductionCandidateSite({
+    options: parseProductionDeploymentArgs(argv),
+    workerDirectory: join(root, "apps", "worker"),
+    headCommit: () => assert.fail("no source read before the receipt verifies"),
+  }), { ok: false, code: "PRODUCTION_CANDIDATE_RECEIPT_INVALID" });
+  await mkdir(join(root, ".release-build"), { recursive: true });
+  await writeFile(join(root, ".release-build", "web-release-receipt.json"), "{}\n");
+  assert.deepEqual(await resolveProductionCandidateSite({
+    options: parseProductionDeploymentArgs(argv),
+    workerDirectory: join(root, "apps", "worker"),
+    headCommit: () => assert.fail("no source read before the receipt verifies"),
+  }), { ok: false, code: "PRODUCTION_CANDIDATE_RECEIPT_INVALID" });
+});
+
+test("a rollback re-deploys a previously released site by its receipt from the live line", async () => {
+  const released = "e".repeat(40);
+  const ancestry = [];
+  const rollbackArgs = candidateSiteArgs({ receiptFlag: "--rollback-web-release-receipt" });
+  const resolved = await resolveCandidate(rollbackArgs, {
+    verifyReceipt: receiptVerifier({ sourceCommit: released, baseCommit: "9".repeat(40) }),
+    isAncestor: async (previous, candidate) => {
+      ancestry.push([previous, candidate]);
+      return true;
+    },
+  });
+  assert.equal(resolved.ok, true, resolved.code);
+  assert.deepEqual(ancestry, [[released, FIXTURE_PREVIOUS_COMMIT]]);
+  assert.equal(resolved.options.expectedSourceCommit, FIXTURE_SOURCE_COMMIT);
+  assert.equal(resolved.options.candidatePublicSourceCommit, released);
+  assert.equal(resolved.options.candidatePublicManifestSha256, CANDIDATE_MANIFEST);
+  assert.equal(resolved.options.expectedLiveManifestSha256, REPLACED_MANIFEST);
+  assert.equal(resolved.options.rollbackWebReleaseReceiptPath, undefined);
+
+  assert.deepEqual(await resolveCandidate(rollbackArgs, {
+    verifyReceipt: receiptVerifier({ sourceCommit: released }),
+    isAncestor: async () => false,
+  }), { ok: false, code: "PRODUCTION_ROLLBACK_RECEIPT_NOT_ON_LIVE_LINE" });
+  assert.deepEqual(await resolveCandidate(rollbackArgs, {
+    verifyReceipt: receiptVerifier({ sourceCommit: released }),
+    isAncestor: async () => { throw new Error("git unavailable"); },
+  }), { ok: false, code: "PRODUCTION_ROLLBACK_RECEIPT_NOT_ON_LIVE_LINE" });
+  assert.deepEqual(await resolveCandidate(rollbackArgs, {
+    verifyReceipt: receiptVerifier({ sourceCommit: released, manifestSha256: "3".repeat(64) }),
+  }), { ok: false, code: "PRODUCTION_CANDIDATE_RECEIPT_MISMATCH" });
+});
+
+test("the candidate-site resolver passes other deploys through and re-closes its inputs for programmatic callers", async () => {
+  const plain = parseProductionDeploymentArgs(["--confirm", "DEPLOY_PRODUCTION", "--expected-previous-source", FIXTURE_PREVIOUS_COMMIT]);
+  assert.deepEqual(await resolveProductionCandidateSite({ options: plain, workerDirectory: "/synthetic/apps/worker" }),
+    { ok: true, code: null, options: plain });
+  const verifyReceipt = async () => assert.fail("invalid inputs never reach the receipt");
+  const valid = parseProductionDeploymentArgs(candidateSiteArgs());
+  for (const options of [
+    { ...plain, webReleaseReceiptPath: RECEIPT_PATH },
+    { ...valid, edgeMode: undefined },
+    { ...valid, edgeMode: "fenced" },
+    { ...valid, expectedLiveManifestSha256: REPLACED_MANIFEST },
+    { ...valid, rollbackWebReleaseReceiptPath: RECEIPT_PATH },
+    { ...valid, webReleaseReceiptPath: "relative.json" },
+    { ...valid, replacedLiveManifestSha256: CANDIDATE_MANIFEST },
+  ]) {
+    assert.deepEqual(await resolveProductionCandidateSite({ options, workerDirectory: "/synthetic/apps/worker", verifyReceipt }),
+      { ok: false, code: "PRODUCTION_ARGUMENTS_INVALID" });
+  }
+});
+
+test("a rollback source commit needs a candidate manifest and a full commit", async () => {
+  const base = {
+    inventory: { snapshot: { sourceCommit: FIXTURE_PREVIOUS_COMMIT, fingerprint: "f".repeat(64) } },
+    workerDirectory: "/synthetic/worker",
+    expectedPreviousSourceCommit: FIXTURE_PREVIOUS_COMMIT,
+    retainedPublicSourceCommit: FIXTURE_PREVIOUS_COMMIT,
+    expectedLiveManifestSha256: REPLACED_MANIFEST,
+    configTools: { createSnapshot: (value) => value.snapshot },
+    buildSchemas: async () => assert.fail("refused before the schema identity"),
+  };
+  for (const extra of [
+    { candidatePublicSourceCommit: "d".repeat(40) },
+    { candidatePublicManifestSha256: CANDIDATE_MANIFEST, candidatePublicSourceCommit: "short" },
+  ]) {
+    assert.deepEqual(await createTypedProductionOperationPin({ ...base, ...extra }),
+      { ok: false, code: "PRODUCTION_TYPED_INPUT_INVALID" });
+  }
+  const legacy = await runProductionDeployment(readyOptions({
+    candidatePublicSourceCommit: "d".repeat(40),
+    createSourceSnapshot: () => assert.fail("snapshot must not run"),
+  }));
+  assert.deepEqual(legacy, { ok: false, code: "PRODUCTION_TYPED_INPUT_INVALID" });
 });

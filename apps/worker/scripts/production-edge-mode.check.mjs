@@ -31,6 +31,7 @@ import {
   recheckFencedPublicSurface,
   recheckProductionEdgeHealth,
   reconcileTypedProductionDeployment,
+  resolveProductionCandidateSite,
   runProductionDeployment,
 } from "./production-deploy.mjs";
 import {
@@ -489,6 +490,17 @@ test("the same typed deploy without --edge-mode installs the plain render with n
   ]);
   assert.equal(harness.calls.captures, 4);
   assert.equal(Object.hasOwn((await readOperation(harness.operationDirectory)).state.typed, "edge"), false);
+});
+
+test("a typed deploy without --edge-mode is refused over a live edge, so the entry and the edge gates cannot be skipped", async () => {
+  for (const baseline of [workerLive(), fencedLive(), gcpLive()]) {
+    const harness = await deployHarness({ baseline, privacyMarked: true, candidate: "2".repeat(64) });
+    const result = await observeDeployment(harness);
+    assert.deepEqual(result, { ok: false, code: "EDGE_MODE_REQUIRED_FOR_EDGE_LIVE" });
+    assert.deepEqual(harness.calls.wrangler, []);
+    assert.equal(harness.calls.snapshots, 0);
+    assert.deepEqual(await readdir(harness.operationDirectory), []);
+  }
 });
 
 test("forbidden transitions refuse before any snapshot, journal or upload", async () => {
@@ -955,6 +967,91 @@ test("after the cutover a gcp redeploy may retain the marked site and gcp -> fen
   assert.equal(fenced.edge.liveMode, "gcp");
   // gcp -> fenced keeps the guard D1 and origin settings, so it can never go back to worker.
   assert.deepEqual(fence.calls.installed.env.production.d1_databases.map((entry) => entry.binding), ["RELEASE_GUARD_DB"]);
+});
+
+// ---------------------------------------------------------------------------
+// A changed site from the CLI (--candidate-public-manifest-sha256)
+
+const RELEASED_SITE = sha("9");
+
+/**
+ * The deploy options the CLI would produce for a candidate site: the parsed
+ * arguments, resolved against a synthetic web-release receipt. Only the site
+ * and source pins reach the harness; its own seams replace the plan file, the
+ * inventory file and the verifier account.
+ */
+async function cliCandidateSite({ mode, rollback = false, liveManifest = "1".repeat(64) } = {}) {
+  const parsed = parseProductionDeploymentArgs([
+    "--confirm", PRODUCTION_DEPLOY_CONFIRMATION,
+    "--expected-previous-source", LIVE,
+    "--inventory", "/synthetic/inventory.json", "--inventory-sha256", "a".repeat(64),
+    "--candidate-public-manifest-sha256", "2".repeat(64),
+    rollback ? "--rollback-web-release-receipt" : "--web-release-receipt", "/synthetic/.release-build/web-release-receipt.json",
+    "--replaced-public-source", LIVE,
+    "--replaced-live-manifest-sha256", liveManifest,
+    `--edge-mode=${mode}`,
+    ...(mode === "gcp"
+      ? ["--edge-plan=/synthetic/plan.json", `--origin-commit=${ORIGIN_COMMIT}`, `--origin-verifier-account=${VERIFIER}`]
+      : []),
+  ]);
+  const resolved = await resolveProductionCandidateSite({
+    options: parsed,
+    workerDirectory: "/synthetic/checkout/apps/worker",
+    headCommit: () => SOURCE,
+    isAncestor: async (previous, candidate) => previous === RELEASED_SITE && candidate === LIVE,
+    verifyReceipt: async () => ({
+      receipt: { sourceCommit: rollback ? RELEASED_SITE : SOURCE, baseCommit: LIVE, site: { manifestSha256: "2".repeat(64) } },
+    }),
+  });
+  assert.equal(resolved.ok, true, resolved.code);
+  const pins = ["expectedSourceCommit", "expectedPreviousSourceCommit", "retainedPublicSourceCommit",
+    "expectedLiveManifestSha256", "candidatePublicManifestSha256", "candidatePublicSourceCommit", "edgeMode"];
+  return Object.fromEntries(pins.filter((name) => resolved.options[name] !== undefined)
+    .map((name) => [name, resolved.options[name]]));
+}
+
+test("the H.6 switch ships the marked candidate site from the CLI and pins the replaced live site", async () => {
+  const cli = await cliCandidateSite({ mode: "gcp" });
+  const harness = await gcpHarness({ overrides: cli });
+  const result = await observeDeployment(harness);
+  assert.equal(result.ok, true, result.code);
+  assert.equal(result.edge.liveMode, "fenced");
+  const record = await readOperation(harness.operationDirectory);
+  assert.equal(record.state.typed.candidatePublicManifestSha256, "2".repeat(64));
+  assert.equal(record.state.typed.expectedLiveManifestSha256, "1".repeat(64));
+  assert.equal(record.state.typed.retainedPublicSourceCommit, LIVE);
+  assert.equal(record.state.typed.candidatePublicSourceCommit, undefined);
+});
+
+test("a CLI candidate site keeps the privacy-page rule: marker refused before the switch, required in gcp", async () => {
+  // The marker before the switch: a worker-mode web release, a rollback, or P1.
+  for (const [baseline, rollback] of [[workerLive(), false], [workerLive(), true], [preEdgeLive(), false]]) {
+    const cli = await cliCandidateSite({ mode: "worker", rollback });
+    const harness = await deployHarness({ baseline, mode: "worker", privacyMarked: true, overrides: cli });
+    const result = await observeDeployment(harness);
+    assertNotStarted(result, harness, "EDGE_PRIVACY_PAGE_PREMATURE");
+    assert.equal(result.coordination, "not_acquired");
+  }
+  // The gcp mode with the old site: the first switch, and a gcp-era rollback past the cutover.
+  const switchCli = await cliCandidateSite({ mode: "gcp" });
+  const oldSite = await gcpHarness({ privacyMarked: false, overrides: switchCli });
+  assertNotStarted(await observeDeployment(oldSite), oldSite, "EDGE_PRIVACY_PAGE_NOT_CUTOVER");
+  const rollbackCli = await cliCandidateSite({ mode: "gcp", rollback: true });
+  const pastCutover = await gcpHarness({ baseline: gcpLive(), privacyMarked: false, overrides: rollbackCli });
+  assertNotStarted(await observeDeployment(pastCutover), pastCutover, "EDGE_PRIVACY_PAGE_NOT_CUTOVER");
+});
+
+test("after the switch a web-only release and a rollback go through the gcp deploy with their candidate sites", async () => {
+  const release = await gcpHarness({ baseline: gcpLive(), overrides: await cliCandidateSite({ mode: "gcp" }) });
+  const released = await observeDeployment(release);
+  assert.equal(released.ok, true, released.code);
+  assert.equal(released.edge.liveMode, "gcp");
+  const rollback = await gcpHarness({ baseline: gcpLive(), overrides: await cliCandidateSite({ mode: "gcp", rollback: true }) });
+  const rolledBack = await observeDeployment(rollback);
+  assert.equal(rolledBack.ok, true, rolledBack.code);
+  const record = await readOperation(rollback.operationDirectory);
+  assert.equal(record.state.typed.candidatePublicSourceCommit, RELEASED_SITE);
+  assert.equal(record.state.typed.candidatePublicManifestSha256, "2".repeat(64));
 });
 
 // ---------------------------------------------------------------------------

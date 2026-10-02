@@ -877,6 +877,12 @@ npm run production:deploy -- --confirm DEPLOY_PRODUCTION \
   --expected-live-manifest-sha256 <reviewed-live-manifest-sha256>
 ```
 
+A typed deployment that changes the public site instead pins a candidate
+manifest proven by its web-release receipt, never the retained pair; see
+[Changing the public site](production-edge-modes.md#changing-the-public-site).
+Once the live Worker runs the edge entry, every typed deployment names its
+`--edge-mode` (`EDGE_MODE_REQUIRED_FOR_EDGE_LIVE` otherwise).
+
 The typed path preserves the live bindings, settings and ingress, and rechecks
 all three database contracts at the deployment boundary. It refuses migration
 confirmations and never applies database migrations. Schema differences require

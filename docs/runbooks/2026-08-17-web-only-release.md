@@ -187,9 +187,10 @@ npm run product:web-release:prepare -- \
 ```
 
 The command writes the generated site and local receipt but makes no network
-mutation. Keep both until post-deployment verification is complete. The
-candidate must remain clean and at the same commit between preparation and
-deployment.
+mutation. Keep both until post-deployment verification is complete, then keep
+a private copy of both as this release's rollback point (see
+[Rollback](#rollback)); the receipt carries private Git SHAs. The candidate
+must remain clean and at the same commit between preparation and deployment.
 
 ## 3. Validate before asking for deployment authority
 
@@ -240,14 +241,67 @@ web-only receipt and source-scope checks. Record the successful source commit,
 receipt digest, deploy time, and live smoke-check result as the next deployed
 baseline.
 
+### Once production runs the edge entry
+
+From the first typed worker-mode edge deploy (P1 in
+[Production edge modes](production-edge-modes.md)), `product:web-release:deploy`
+is refused (`EDGE_MODE_REQUIRED_FOR_EDGE_LIVE`): it has no edge mode, and a
+typed deploy without one would replace the edge entry. Preparation is
+unchanged. Deploy the same fresh receipt through the typed production command,
+from `apps/worker` on the candidate commit, with the live mode (the owner's
+2026-10-02 decision for releases after the switch):
+
+```bash
+npm run production:deploy -- --confirm DEPLOY_PRODUCTION \
+  --expected-previous-source "$DEPLOYED_SOURCE_COMMIT" \
+  --inventory /absolute/private/live-inventory.json \
+  --inventory-sha256 <reviewed-inventory-sha256> \
+  --candidate-public-manifest-sha256 <the receipt's site.manifestSha256> \
+  --web-release-receipt /absolute/candidate-checkout/.release-build/web-release-receipt.json \
+  --replaced-public-source <full-deployed-public-source-sha> \
+  --replaced-live-manifest-sha256 <reviewed-live-manifest-sha256> \
+  --edge-mode gcp --edge-plan <private gcp plan> \
+  --origin-commit <live origin commit> --origin-verifier-account <verifier account>
+```
+
+Before the fence use `--edge-mode worker` with no gcp flags; while the edge is
+fenced, web-only releases pause. The command re-verifies the receipt with this
+lane's checks and requires it to be fresh: its source must be the checked-out
+commit and its base the live commit. It refuses the retained pair
+(`--retained-public-source`, `--expected-live-manifest-sha256`) alongside a
+candidate, a candidate equal to the live manifest, and a candidate without an
+edge mode; [Production edge modes](production-edge-modes.md#changing-the-public-site)
+lists every refusal.
+
 ## Rollback
 
 Do not deploy an old checkout directly: the scope gate deliberately requires
-the candidate to descend from the current deployed base. Instead, make a new,
-clean revert commit on top of the current deployed web-only source that changes
-only allowed public files. Prepare and authorize it through the same lane,
-reusing the same released installer evidence unless an approved client release
-also changes it.
+the candidate to descend from the current deployed base.
+
+**Once production runs the edge entry,** roll back by re-deploying a
+previously released site by its receipt:
+
+1. Restore that release's private copy of the generated site into
+   `.release-build/public-release-site` of a clean checkout of the live commit
+   (or a descendant of it), and its receipt under `.release-build`, outside
+   that directory.
+2. Run the typed command above with
+   `--rollback-web-release-receipt <absolute restored receipt>` in place of
+   `--web-release-receipt`, the receipt's `site.manifestSha256` as the
+   candidate, and the live site as the replaced pair. On a checkout of the
+   live commit itself, add a fresh, absolute private `--operation` directory;
+   the default one for that commit holds the earlier deploy's journal.
+
+The receipt's source must be the live commit or one of its ancestors, the
+restored site must still match the receipt byte for byte, and the staged site
+is pinned to the receipt's source commit. After the switch the restored site
+must carry the privacy marker, so the site cannot roll back past the switch.
+
+**Before the edge entry,** or when no private copy of the earlier site
+survives, make a new, clean revert commit on top of the current deployed
+web-only source that changes only allowed public files. Prepare and authorize
+it through the same lane, reusing the same released installer evidence unless
+an approved client release also changes it.
 
 This makes each web release and rollback a short, independently reviewable
 commit. Other agents can prepare their own candidates in separate worktrees;

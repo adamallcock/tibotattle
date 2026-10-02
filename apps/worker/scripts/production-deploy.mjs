@@ -95,6 +95,14 @@ async function loadProductionEdgeMode() {
   return productionEdgeModeModule;
 }
 
+// The web-release receipt verifier (scripts/web-release-lane.js) loads only for
+// a candidate-site deploy from the CLI, for the same reason.
+let webReleaseLaneModule = null;
+async function loadWebReleaseLane() {
+  webReleaseLaneModule ??= await import("../../../scripts/web-release-lane.js");
+  return webReleaseLaneModule;
+}
+
 // Options only an --edge-mode deploy may carry.
 const PRODUCTION_EDGE_OPTION_NAMES = Object.freeze([
   "edgePlan",
@@ -196,6 +204,7 @@ export async function createTypedProductionOperationPin({
   retainedPublicSourceCommit,
   expectedLiveManifestSha256,
   candidatePublicManifestSha256 = null,
+  candidatePublicSourceCommit = null,
   buildSchemas = buildTypedProductionExpectedSchemas,
   configTools = defaultTypedConfigTools,
 } = {}) {
@@ -203,6 +212,11 @@ export async function createTypedProductionOperationPin({
       || !PRODUCTION_SOURCE_COMMIT_PATTERN.test(retainedPublicSourceCommit ?? "")
       || !PRODUCTION_SHA256_PATTERN.test(expectedLiveManifestSha256 ?? "")
       || (candidatePublicManifestSha256 !== null && !PRODUCTION_SHA256_PATTERN.test(candidatePublicManifestSha256))
+      // A candidate site built from another commit (a rollback) names that
+      // commit; it is meaningless without a candidate manifest.
+      || (candidatePublicSourceCommit !== null
+        && (candidatePublicManifestSha256 === null
+          || !PRODUCTION_SOURCE_COMMIT_PATTERN.test(candidatePublicSourceCommit)))
       || typeof buildSchemas !== "function"
       || typeof configTools?.createSnapshot !== "function") {
     return typedFailure("PRODUCTION_TYPED_INPUT_INVALID");
@@ -239,6 +253,7 @@ export async function createTypedProductionOperationPin({
       retainedPublicSourceCommit,
       expectedLiveManifestSha256,
       ...(candidatePublicManifestSha256 === null ? {} : { candidatePublicManifestSha256 }),
+      ...(candidatePublicSourceCommit === null ? {} : { candidatePublicSourceCommit }),
       expectedSchemaIdentity: schemaIdentity,
     },
   };
@@ -1688,6 +1703,7 @@ async function runProductionDeploymentFromSnapshot({
   retainedPublicSourceCommit = null,
   expectedLiveManifestSha256 = null,
   candidatePublicManifestSha256 = null,
+  candidatePublicSourceCommit = null,
   beforeMutation = async () => { throw operationError("PRODUCTION_COORDINATION_REQUIRED"); },
   finalMutationRecheck = null,
   mutationIntent = async () => { throw operationError("PRODUCTION_COORDINATION_REQUIRED"); },
@@ -1844,9 +1860,15 @@ async function runProductionDeploymentFromSnapshot({
         "worker-assets",
       ),
       expectedSourceCommit: sourceCommit,
+      // A candidate site is pinned to the commit it was built from: the deploy
+      // source for a forward release, the released commit for a rollback.
       ...(retainedPublicSourceCommit === null
         ? {}
-        : { retainedPublicSourceCommit: candidatePublicManifestSha256 === null ? retainedPublicSourceCommit : sourceCommit }),
+        : {
+          retainedPublicSourceCommit: candidatePublicManifestSha256 === null
+            ? retainedPublicSourceCommit
+            : candidatePublicSourceCommit ?? sourceCommit,
+        }),
       ...(expectedLiveManifestSha256 === null
         ? {}
         : { expectedLiveManifestSha256: candidatePublicManifestSha256 ?? expectedLiveManifestSha256 }),
@@ -2116,6 +2138,7 @@ async function runUncoordinatedProductionDeployment({
   retainedPublicSourceCommit = null,
   expectedLiveManifestSha256 = null,
   candidatePublicManifestSha256 = null,
+  candidatePublicSourceCommit = null,
   beforeMutation,
   finalMutationRecheck,
   mutationIntent,
@@ -2201,6 +2224,7 @@ async function runUncoordinatedProductionDeployment({
     }
     if (!typedOperationPin
         || (typedOperationPin.candidatePublicManifestSha256 ?? null) !== candidatePublicManifestSha256
+        || (typedOperationPin.candidatePublicSourceCommit ?? null) !== candidatePublicSourceCommit
         || prepared.baseline?.fingerprint !== typedOperationPin.liveConfigurationFingerprint
         || JSON.stringify(prepared.expectedSchemaIdentity)
           !== JSON.stringify(typedOperationPin.expectedSchemaIdentity)) {
@@ -2269,6 +2293,7 @@ async function runUncoordinatedProductionDeployment({
       retainedPublicSourceCommit,
       expectedLiveManifestSha256,
       candidatePublicManifestSha256,
+      candidatePublicSourceCommit,
       beforeMutation,
       finalMutationRecheck,
       mutationIntent,
@@ -2381,7 +2406,8 @@ export async function runProductionDeployment(options) {
   const hasExpectedLiveManifestSha256 = options.expectedLiveManifestSha256 !== undefined
     && options.expectedLiveManifestSha256 !== null;
   if (!options.typedProduction
-      && (hasRetainedPublicSourceCommit || hasExpectedLiveManifestSha256 || options.candidatePublicManifestSha256 != null)) {
+      && (hasRetainedPublicSourceCommit || hasExpectedLiveManifestSha256
+        || options.candidatePublicManifestSha256 != null || options.candidatePublicSourceCommit != null)) {
     return typedFailure("PRODUCTION_TYPED_INPUT_INVALID");
   }
   if (options.typedProduction?.expectedPreviousSourceCommit !== undefined
@@ -2402,6 +2428,7 @@ export async function runProductionDeployment(options) {
         retainedPublicSourceCommit: options.retainedPublicSourceCommit,
         expectedLiveManifestSha256: options.expectedLiveManifestSha256,
         candidatePublicManifestSha256: options.candidatePublicManifestSha256 ?? null,
+        candidatePublicSourceCommit: options.candidatePublicSourceCommit ?? null,
       });
     } catch (error) {
       pinResult = typedFailure(
@@ -2413,6 +2440,22 @@ export async function runProductionDeployment(options) {
     }
     if (!pinResult?.ok) return pinResult ?? typedFailure("PRODUCTION_TYPED_OPERATION_PIN_FAILED");
     typedOperationPin = pinResult.pin;
+    // Without --edge-mode the typed render installs the checked-in entry. Over
+    // a live edge (any version carrying EDGE_UPSTREAM_MODE) that would replace
+    // the edge entry and skip every edge gate, the privacy-page rule included,
+    // so the deploy must name the live mode instead.
+    if (options.edgeMode === undefined) {
+      let liveEdge;
+      try {
+        const live = (options.typedProduction.configTools ?? defaultTypedConfigTools)
+          .createSnapshot(options.typedProduction.inventory);
+        liveEdge = Array.isArray(live?.bindings)
+          && live.bindings.some((binding) => binding?.name === "EDGE_UPSTREAM_MODE");
+      } catch {
+        liveEdge = true;
+      }
+      if (liveEdge) return localFailure("EDGE_MODE_REQUIRED_FOR_EDGE_LIVE");
+    }
     if (options.publicReleaseManifestRecheck === null
         || (options.publicReleaseManifestRecheck !== undefined
           && typeof options.publicReleaseManifestRecheck !== "function")) {
@@ -2447,6 +2490,11 @@ export async function runProductionDeployment(options) {
   try {
     lock = coordinationFactory({ repositoryRoot });
     if (!lock.isAncestor(expectedPreviousSourceCommit, source.sourceCommit)) return localFailure("PRODUCTION_PREVIOUS_SOURCE_NOT_ANCESTOR");
+    // A rollback site must come from a commit the deploy source contains.
+    if (typedOperationPin?.candidatePublicSourceCommit !== undefined
+        && !lock.isAncestor(typedOperationPin.candidatePublicSourceCommit, source.sourceCommit)) {
+      return localFailure("PRODUCTION_CANDIDATE_PUBLIC_SOURCE_NOT_ANCESTOR");
+    }
     const binding = {
       sourceCommit: source.sourceCommit, previousSourceCommit: expectedPreviousSourceCommit,
       confirmedMigrations: options.confirmedMigrations ?? null,
@@ -2621,7 +2669,10 @@ export async function reconcileTypedProductionDeployment({
         || !EXACT_COMMIT.test(pin.retainedPublicSourceCommit ?? "")
         || !PRODUCTION_SHA256_PATTERN.test(pin.expectedLiveManifestSha256 ?? "")
         || (pin.candidatePublicManifestSha256 !== undefined
-          && !PRODUCTION_SHA256_PATTERN.test(pin.candidatePublicManifestSha256))) {
+          && !PRODUCTION_SHA256_PATTERN.test(pin.candidatePublicManifestSha256))
+        || (pin.candidatePublicSourceCommit !== undefined
+          && (pin.candidatePublicManifestSha256 === undefined
+            || !EXACT_COMMIT.test(pin.candidatePublicSourceCommit)))) {
       throw operationError("PRODUCTION_TYPED_RECONCILIATION_INVALID");
     }
     // An edge-mode operation re-binds its pinned mode and plan, and repeats
@@ -2831,6 +2882,60 @@ function assertProductionEdgeArguments(result) {
   }
 }
 
+// Candidate-site arguments: a typed edge deploy that ships a public site other
+// than the live one. The candidate manifest comes with exactly one web-release
+// receipt (a forward release, or a rollback to a previously released site) and
+// the replaced pair: the live public source and live manifest the deploy
+// replaces. The replaced pair is pinned before the upload, like the retained
+// pair, but unlike it the site changes, so the two pairs never mix.
+const PRODUCTION_CANDIDATE_SITE_ARGUMENTS = new Map([
+  ["--candidate-public-manifest-sha256", "candidatePublicManifestSha256"],
+  ["--web-release-receipt", "webReleaseReceiptPath"],
+  ["--rollback-web-release-receipt", "rollbackWebReleaseReceiptPath"],
+  ["--replaced-public-source", "replacedPublicSourceCommit"],
+  ["--replaced-live-manifest-sha256", "replacedLiveManifestSha256"],
+]);
+
+/**
+ * Close the candidate-site arguments before any other deploy rule, so their
+ * refusals carry their own codes:
+ * - PRODUCTION_CANDIDATE_SITE_EDGE_MODE_REQUIRED: no --edge-mode, so the
+ *   privacy-page rule (EDGE_PRIVACY_PAGE_PREMATURE / _NOT_CUTOVER) would not
+ *   run;
+ * - PRODUCTION_CANDIDATE_SITE_FENCED: a site change while fenced (releases
+ *   pause while the fence is up; the brake keeps the live site);
+ * - PRODUCTION_CANDIDATE_SITE_RETAINED_PIN_CONFLICT: the retained pair
+ *   (--retained-public-source, --expected-live-manifest-sha256) says the site
+ *   stays, the candidate says it changes;
+ * - PRODUCTION_CANDIDATE_SITE_UNCHANGED: the candidate equals the replaced live
+ *   manifest; a deploy that keeps the site uses the retained pair;
+ * - PRODUCTION_ARGUMENTS_INVALID: anything else incomplete or malformed.
+ */
+function assertProductionCandidateSiteArguments(result) {
+  const present = [...PRODUCTION_CANDIDATE_SITE_ARGUMENTS.values()].filter((name) => name in result);
+  if (present.length === 0) return;
+  const refuse = (code = "PRODUCTION_ARGUMENTS_INVALID") => { throw operationError(code); };
+  if (result.confirmation !== PRODUCTION_DEPLOY_CONFIRMATION
+      || result.candidatePublicManifestSha256 === undefined) refuse();
+  if (result.edgeMode === undefined) refuse("PRODUCTION_CANDIDATE_SITE_EDGE_MODE_REQUIRED");
+  if (result.edgeMode === "fenced") refuse("PRODUCTION_CANDIDATE_SITE_FENCED");
+  if (result.retainedPublicSourceCommit !== undefined || result.expectedLiveManifestSha256 !== undefined) {
+    refuse("PRODUCTION_CANDIDATE_SITE_RETAINED_PIN_CONFLICT");
+  }
+  if ((result.webReleaseReceiptPath === undefined) === (result.rollbackWebReleaseReceiptPath === undefined)
+      || !isAbsolute(result.webReleaseReceiptPath ?? result.rollbackWebReleaseReceiptPath)
+      || result.inventoryPath === undefined
+      || result.confirmedMigrations !== undefined
+      || !PRODUCTION_SHA256_PATTERN.test(result.candidatePublicManifestSha256)
+      || !PRODUCTION_SHA256_PATTERN.test(result.replacedLiveManifestSha256 ?? "")
+      || !PRODUCTION_SOURCE_COMMIT_PATTERN.test(result.replacedPublicSourceCommit ?? "")) {
+    refuse();
+  }
+  if (result.candidatePublicManifestSha256 === result.replacedLiveManifestSha256) {
+    refuse("PRODUCTION_CANDIDATE_SITE_UNCHANGED");
+  }
+}
+
 export function parseProductionDeploymentArgs(argv) {
   argv = argv.flatMap(splitProductionEdgeArgument);
   const names = new Map([["--confirm", "confirmation"], ["--confirm-migrations", "confirmedMigrations"],
@@ -2839,6 +2944,7 @@ export function parseProductionDeploymentArgs(argv) {
     ["--retained-public-source", "retainedPublicSourceCommit"],
     ["--retained-public-source-commit", "retainedPublicSourceCommit"],
     ["--expected-live-manifest-sha256", "expectedLiveManifestSha256"],
+    ...PRODUCTION_CANDIDATE_SITE_ARGUMENTS,
     ...PRODUCTION_EDGE_ARGUMENTS]);
   const result = {};
   for (let i = 0; i < argv.length; i += 1) {
@@ -2847,6 +2953,8 @@ export function parseProductionDeploymentArgs(argv) {
     if (!name || name in result || !value || value.startsWith("--") || value.includes("\0")) throw operationError("PRODUCTION_ARGUMENTS_INVALID");
     result[name] = value;
   }
+  assertProductionCandidateSiteArguments(result);
+  const candidateSite = result.candidatePublicManifestSha256 !== undefined;
   if (result.confirmation === "RECONCILE_TYPED_PRODUCTION_DEPLOYMENT") {
     if (!result.operationDirectory || !result.executorStopped
         || !result.inventoryPath || !result.inventorySha256
@@ -2865,7 +2973,7 @@ export function parseProductionDeploymentArgs(argv) {
       || result.executorStopped
       || (Boolean(result.inventoryPath) !== Boolean(result.inventorySha256))
       || (Boolean(result.retainedPublicSourceCommit) !== Boolean(result.expectedLiveManifestSha256))
-      || Boolean(result.inventoryPath) !== Boolean(result.retainedPublicSourceCommit)
+      || Boolean(result.inventoryPath) !== (Boolean(result.retainedPublicSourceCommit) || candidateSite)
       || (result.inventorySha256 !== undefined && !PRODUCTION_SHA256_PATTERN.test(result.inventorySha256))
       || (result.expectedLiveManifestSha256 !== undefined && !PRODUCTION_SHA256_PATTERN.test(result.expectedLiveManifestSha256))
       || (result.retainedPublicSourceCommit !== undefined && !PRODUCTION_SOURCE_COMMIT_PATTERN.test(result.retainedPublicSourceCommit))) {
@@ -2873,6 +2981,110 @@ export function parseProductionDeploymentArgs(argv) {
   }
   assertProductionEdgeArguments(result);
   return result;
+}
+
+/**
+ * Turn the CLI's candidate-site arguments into runProductionDeployment inputs,
+ * after proving them against a web-release receipt (scripts/web-release-lane.js
+ * re-runs the receipt's scope, catalogue proofs and generated-site match):
+ *
+ * - Forward (--web-release-receipt): the receipt must be fresh. Its source is
+ *   the checked-out HEAD, which becomes the deploy's exact source, and its base
+ *   is --expected-previous-source, the live commit the shared lock rechecks.
+ *   Otherwise PRODUCTION_CANDIDATE_RECEIPT_STALE.
+ * - Rollback (--rollback-web-release-receipt): a previously released site.
+ *   Its source must be on the live line (an ancestor of, or equal to,
+ *   --expected-previous-source); otherwise PRODUCTION_ROLLBACK_RECEIPT_NOT_ON_LIVE_LINE.
+ *   The deploy source stays HEAD, and the staged site is pinned to the
+ *   receipt's source commit.
+ *
+ * Either way the receipt's manifest must be the candidate
+ * (PRODUCTION_CANDIDATE_RECEIPT_MISMATCH), and the replaced pair becomes the
+ * live preimage the deploy rechecks before the upload. Staging then proves the
+ * snapshot's site is exactly the candidate manifest, built from the pinned
+ * commit. Options without a candidate pass through unchanged.
+ */
+export async function resolveProductionCandidateSite({
+  options,
+  workerDirectory,
+  headCommit = checkedOutSourceCommit,
+  isAncestor = null,
+  verifyReceipt = null,
+} = {}) {
+  const {
+    candidatePublicManifestSha256,
+    webReleaseReceiptPath,
+    rollbackWebReleaseReceiptPath,
+    replacedPublicSourceCommit,
+    replacedLiveManifestSha256,
+    ...rest
+  } = options ?? {};
+  if (candidatePublicManifestSha256 === undefined) {
+    return Object.keys(rest).length === Object.keys(options ?? {}).length
+      ? { ok: true, code: null, options }
+      : localFailure("PRODUCTION_ARGUMENTS_INVALID");
+  }
+  const rollback = rollbackWebReleaseReceiptPath !== undefined;
+  const receiptPath = rollback ? rollbackWebReleaseReceiptPath : webReleaseReceiptPath;
+  if (typeof workerDirectory !== "string"
+      || rest.edgeMode === undefined
+      || rest.edgeMode === "fenced"
+      || rest.retainedPublicSourceCommit !== undefined
+      || rest.expectedLiveManifestSha256 !== undefined
+      || (webReleaseReceiptPath === undefined) === (rollbackWebReleaseReceiptPath === undefined)
+      || typeof receiptPath !== "string" || !isAbsolute(receiptPath)
+      || !PRODUCTION_SHA256_PATTERN.test(candidatePublicManifestSha256 ?? "")
+      || !PRODUCTION_SHA256_PATTERN.test(replacedLiveManifestSha256 ?? "")
+      || !PRODUCTION_SOURCE_COMMIT_PATTERN.test(replacedPublicSourceCommit ?? "")
+      || !PRODUCTION_SOURCE_COMMIT_PATTERN.test(rest.expectedPreviousSourceCommit ?? "")
+      || candidatePublicManifestSha256 === replacedLiveManifestSha256) {
+    return localFailure("PRODUCTION_ARGUMENTS_INVALID");
+  }
+  const repositoryRoot = resolve(workerDirectory, "../..");
+  let receipt;
+  try {
+    const verify = verifyReceipt ?? (await loadWebReleaseLane()).verifyWebReleaseReceipt;
+    receipt = (await verify({ repositoryRoot, receiptPath }))?.receipt;
+  } catch {
+    return localFailure("PRODUCTION_CANDIDATE_RECEIPT_INVALID");
+  }
+  if (!PRODUCTION_SOURCE_COMMIT_PATTERN.test(receipt?.sourceCommit ?? "")
+      || !PRODUCTION_SOURCE_COMMIT_PATTERN.test(receipt?.baseCommit ?? "")
+      || !PRODUCTION_SHA256_PATTERN.test(receipt?.site?.manifestSha256 ?? "")) {
+    return localFailure("PRODUCTION_CANDIDATE_RECEIPT_INVALID");
+  }
+  if (receipt.site.manifestSha256 !== candidatePublicManifestSha256) {
+    return localFailure("PRODUCTION_CANDIDATE_RECEIPT_MISMATCH");
+  }
+  const head = headCommit(workerDirectory);
+  if (!PRODUCTION_SOURCE_COMMIT_PATTERN.test(head ?? "")) {
+    return localFailure("PRODUCTION_SOURCE_REVISION_UNAVAILABLE");
+  }
+  const sitePins = {
+    retainedPublicSourceCommit: replacedPublicSourceCommit,
+    expectedLiveManifestSha256: replacedLiveManifestSha256,
+    candidatePublicManifestSha256,
+  };
+  if (!rollback) {
+    if (receipt.sourceCommit !== head || receipt.baseCommit !== rest.expectedPreviousSourceCommit) {
+      return localFailure("PRODUCTION_CANDIDATE_RECEIPT_STALE");
+    }
+    return { ok: true, code: null, options: { ...rest, expectedSourceCommit: head, ...sitePins } };
+  }
+  const ancestor = isAncestor ?? (async (previous, candidate) => (await loadProductionEdgeMode())
+    .gitIsAncestor({ repositoryDirectory: workerDirectory, previous, candidate }));
+  let onLiveLine;
+  try {
+    onLiveLine = await ancestor(receipt.sourceCommit, rest.expectedPreviousSourceCommit);
+  } catch {
+    onLiveLine = false;
+  }
+  if (onLiveLine !== true) return localFailure("PRODUCTION_ROLLBACK_RECEIPT_NOT_ON_LIVE_LINE");
+  return {
+    ok: true,
+    code: null,
+    options: { ...rest, expectedSourceCommit: head, ...sitePins, candidatePublicSourceCommit: receipt.sourceCommit },
+  };
 }
 
 /**
@@ -2912,9 +3124,11 @@ async function productionEdgeRunOptions(runOptions) {
 
 async function main() {
   let options;
-  try { options = parseProductionDeploymentArgs(process.argv.slice(2)); } catch {
+  try { options = parseProductionDeploymentArgs(process.argv.slice(2)); } catch (error) {
+    const code = /^PRODUCTION_[A-Z_]+$/u.test(error?.code ?? "") ? error.code : "PRODUCTION_ARGUMENTS_INVALID";
     process.stderr.write(
-      "Usage: production-deploy.mjs "
+      `${code}\n`
+        + "Usage: production-deploy.mjs "
         + `--confirm ${PRODUCTION_DEPLOY_CONFIRMATION} `
         + "--expected-previous-source FULL_SHA [--operation PRIVATE_DIRECTORY] "
         + "[--inventory PRIVATE_JSON --inventory-sha256 SHA256 "
@@ -2924,7 +3138,11 @@ async function main() {
         + "Typed recovery: --confirm RECONCILE_TYPED_PRODUCTION_DEPLOYMENT --operation PRIVATE_DIRECTORY --executor-stopped --inventory PRIVATE_JSON --inventory-sha256 SHA256\n"
         + "Edge modes (typed only): --edge-mode worker [--fence-receipt PRIVATE_JSON --fence-receipt-sha256 SHA256] | --edge-mode fenced "
         + "| --edge-mode gcp --edge-plan PRIVATE_JSON --origin-commit FULL_SHA --origin-verifier-account EMAIL; "
-        + "typed recovery of a gcp operation adds --edge-plan PRIVATE_JSON\n",
+        + "typed recovery of a gcp operation adds --edge-plan PRIVATE_JSON\n"
+        + "Changed site (typed, --edge-mode worker or gcp; replaces the retained pair): "
+        + "--candidate-public-manifest-sha256 SHA256 "
+        + "(--web-release-receipt ABSOLUTE_RECEIPT | --rollback-web-release-receipt ABSOLUTE_RECEIPT) "
+        + "--replaced-public-source FULL_SHA --replaced-live-manifest-sha256 SHA256\n",
     );
     process.exit(2);
   }
@@ -2942,25 +3160,32 @@ async function main() {
       : options.confirmation === "RECONCILE_TYPED_PRODUCTION_DEPLOYMENT"
         ? reconcileTypedProductionDeployment
         : runProductionDeployment;
-    const runOptions = {
-      ...options,
-      wrangler,
-      workerDirectory,
-    };
-    if (options.inventoryPath) {
-      const inventory = await readPrivateProductionInventory(
-        options.inventoryPath,
-        options.inventorySha256,
-      );
-      runOptions.typedProduction = {
-        inventory,
-        provider: createProductionLiveProvider({
-          accountId: inventory.accountId,
-          workerName: inventory.workerName,
-        }),
+    // A candidate site is proven against its web-release receipt before the
+    // inventory is read or anything remote runs.
+    const candidate = await resolveProductionCandidateSite({ options, workerDirectory });
+    if (!candidate.ok) {
+      result = { ok: false, code: candidate.code };
+    } else {
+      const runOptions = {
+        ...candidate.options,
+        wrangler,
+        workerDirectory,
       };
+      if (runOptions.inventoryPath) {
+        const inventory = await readPrivateProductionInventory(
+          runOptions.inventoryPath,
+          runOptions.inventorySha256,
+        );
+        runOptions.typedProduction = {
+          inventory,
+          provider: createProductionLiveProvider({
+            accountId: inventory.accountId,
+            workerName: inventory.workerName,
+          }),
+        };
+      }
+      result = await run(await productionEdgeRunOptions(runOptions));
     }
-    result = await run(await productionEdgeRunOptions(runOptions));
   } catch (error) {
     const code = typeof error?.code === "string"
       && (error.code.startsWith("PRODUCTION_RECONCILE_")
