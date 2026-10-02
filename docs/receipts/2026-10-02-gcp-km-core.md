@@ -281,6 +281,15 @@ unchanged and describe the branch as it was then. On
   and verifies the envelope against the pins before writing it.
 - Pinning loads nothing: the read APIs still serve the compiled baseline
   until a deliberate load (proved in `catalog-manifest-store.spec.mjs` with
-  the real pins, and by an offline check that no runtime module calls the
-  loader).
+  the real pins). Cutover serves the baseline because no runtime code loads
+  or reads the store; the one runtime importer takes only
+  `compiledBaselineCatalogManifest`.
+- Correction on review (same day): the offline check committed in
+  `7b2cf92f` was a name regex for loader calls, which an aliased or
+  destructured import bypassed. It is now an import ratchet in
+  `catalog-manifest.check.mjs`: a runtime source under `apps/worker` may
+  import only `compiledBaselineCatalogManifest` and types from
+  `postgres-catalog-store`, and any other named, aliased, namespace,
+  default, side-effect, dynamic or `require` import, or re-export, fails it.
+  A specifier computed at run time is beyond a text check.
 - Runbook: `docs/runbooks/gcp-catalog-manifest-signing.md`.

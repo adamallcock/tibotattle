@@ -33,9 +33,17 @@ channels.
 
 Pinning loads nothing. Until a signed manifest is deliberately loaded into
 the store, every read serves the compiled baseline, stamped manifest version
-1, which is what is served at cutover (round 7). The offline check fails if
-any runtime module starts calling the loader; the PostgreSQL spec proves an
-empty store under the real pins serves the compiled baseline.
+1, which is what is served at cutover (round 7). Cutover serves the baseline
+because no runtime code loads or reads the store: the one runtime importer
+of `postgres-catalog-store` takes only `compiledBaselineCatalogManifest`.
+An offline import ratchet in `scripts/catalog-manifest.check.mjs` keeps it
+that way. It fails if any runtime source under `apps/worker` imports
+anything else from the store (the loader, the pin writer or the read APIs),
+or reaches it through an alias, a namespace, default, side-effect, dynamic
+or `require` import, or a re-export. A module specifier computed at run
+time is beyond a text check; review covers that. KM-4 widens the ratchet's
+allowlist on purpose. The PostgreSQL spec proves an empty store under the
+real pins serves the compiled baseline.
 
 ## Custody
 

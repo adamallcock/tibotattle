@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -148,29 +148,116 @@ test("the pinned keys are the round-11 public keys: fingerprints hold and no key
   }
 });
 
-test("pinning loads nothing: no runtime module calls the loader, so the compiled baseline is served", async () => {
-  // Round 7: the compiled registry is what is served at cutover. With the
-  // keys pinned, a manifest reaches the store only through a deliberate
-  // loadCatalogManifest call; KM-4 (the first post-cutover change) adds the
-  // first runtime caller, and must change this check on purpose. The
-  // PostgreSQL spec proves the read side: an empty store under the real pins
-  // serves the compiled baseline (catalog-manifest-store.spec.mjs).
-  const { readdir } = await import("node:fs/promises");
-  const workerRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-  const callers = [];
-  async function walk(relative) {
-    for (const entry of await readdir(join(workerRoot, relative), { withFileTypes: true })) {
-      const path = join(relative, entry.name);
-      if (entry.isDirectory()) {
-        if (!["dist", "node_modules", "vendor"].includes(entry.name)) await walk(path);
-      } else if (/\.(?:ts|mjs|js)$/u.test(entry.name) && !/\.(?:check|spec|test)\./u.test(entry.name)
-          && /\bloadCatalogManifest\w*\s*\(/u.test(await readFile(join(workerRoot, path), "utf8"))) {
-        callers.push(path);
+/**
+ * The catalog store's only runtime import (round 7 serves the compiled
+ * registry at cutover): the compiled baseline, which reads no table. Types
+ * erase. Every other export of postgres-catalog-store (the loader, the pin
+ * writer and the read APIs) stays out of runtime code until KM-4, the first
+ * post-cutover change, widens this list on purpose.
+ */
+const CATALOG_STORE_MODULE = "postgres-catalog-store";
+const CATALOG_STORE_RUNTIME_IMPORTS = Object.freeze(["compiledBaselineCatalogManifest"]);
+/** One static `import { … } from "<relative path>/postgres-catalog-store[.ext]";` statement on its own lines. */
+const CATALOG_STORE_STATIC_IMPORT = new RegExp(String.raw`^[ \t]*import[ \t]+(type[ \t]+)?\{([^{}]*)\}[ \t]*from[ \t]*(["'])`
+  + String.raw`(?:\.{1,2}\/)+(?:[\w.-]+\/)*${CATALOG_STORE_MODULE}(?:\.(?:ts|mts|js|mjs))?\3[ \t]*;?[ \t]*$`, "gmu");
+const TYPE_ONLY_SPECIFIER = /^type\s+[A-Za-z_$][\w$]*$/u;
+
+/**
+ * The import-graph ratchet for one runtime source text. Every literal mention
+ * of the store's module name must be the specifier of an allowed static
+ * import: named imports of CATALOG_STORE_RUNTIME_IMPORTS (no alias) or types.
+ * A namespace, default, aliased, side-effect, dynamic or require import, a
+ * re-export, or any other mention is a violation. A specifier computed at run
+ * time is outside a text check's reach; review covers that.
+ */
+function catalogStoreImportViolations(text) {
+  const mentions = text.split(CATALOG_STORE_MODULE).length - 1;
+  const violations = [];
+  let statements = 0;
+  for (const [, typeOnly, list] of text.matchAll(CATALOG_STORE_STATIC_IMPORT)) {
+    statements += 1;
+    if (typeOnly !== undefined) continue;
+    for (const specifier of list.split(",").map((entry) => entry.trim()).filter((entry) => entry !== "")) {
+      if (!CATALOG_STORE_RUNTIME_IMPORTS.includes(specifier) && !TYPE_ONLY_SPECIFIER.test(specifier)) {
+        violations.push(`import not allowed: ${specifier.replace(/\s+/gu, " ")}`);
       }
     }
   }
-  for (const root of ["src", "cloud-run", "scripts"]) await walk(root);
-  assert.deepEqual(callers, [join("src", "postgres-catalog-store.ts")], "only the store defines the loader");
+  if (mentions !== statements) violations.push("store referenced outside an allowed static import");
+  return violations;
+}
+
+/** Runtime sources under apps/worker: no tests, specs, checks, vendored or built code, and not the store itself. */
+async function scanRuntimeCatalogStoreImports() {
+  const workerRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const skipped = new Set(["node_modules", "dist", "vendor", "test", "postgres-test", "analytics-v2-test"]);
+  const store = join("src", `${CATALOG_STORE_MODULE}.ts`);
+  const importers = [];
+  const violations = [];
+  let scanned = 0;
+  async function walk(relativeDirectory) {
+    for (const entry of await readdir(join(workerRoot, relativeDirectory), { withFileTypes: true })) {
+      const path = join(relativeDirectory, entry.name);
+      if (entry.isDirectory()) {
+        if (!skipped.has(entry.name) && !entry.name.startsWith(".")) await walk(path);
+      } else if (/\.(?:[cm]?[jt]s|tsx)$/u.test(entry.name) && !/\.(?:check|spec|test)\./u.test(entry.name)
+          && path !== store) {
+        scanned += 1;
+        const text = await readFile(join(workerRoot, path), "utf8");
+        if (!text.includes(CATALOG_STORE_MODULE)) continue;
+        importers.push(path);
+        for (const reason of catalogStoreImportViolations(text)) violations.push({ path, reason });
+      }
+    }
+  }
+  await walk("");
+  return { scanned, importers, violations };
+}
+
+test("pinning loads nothing: runtime code imports nothing from the catalog store but the compiled baseline", async () => {
+  // Round 7: the compiled registry is what is served at cutover. With the
+  // keys pinned, a manifest reaches the store only through a deliberate load;
+  // KM-4 (the first post-cutover change) adds the first runtime use of the
+  // loader or the read APIs, and must widen CATALOG_STORE_RUNTIME_IMPORTS on
+  // purpose. The PostgreSQL spec proves the read side: an empty store under
+  // the real pins serves the compiled baseline (catalog-manifest-store.spec.mjs).
+  const refused = {
+    aliased: "import { loadCatalogManifestInTransaction as applyManifest } from \"../postgres-catalog-store\";\n"
+      + "await applyManifest({});",
+    aliasedAllowed: "import { compiledBaselineCatalogManifest as baseline } from \"../postgres-catalog-store\";",
+    dynamic: "const { loadCatalogManifest: load } = await import(\"../postgres-catalog-store\");\nawait load({});",
+    dynamicAllowed: "const { compiledBaselineCatalogManifest } = await import(\"./postgres-catalog-store.ts\");",
+    namespace: "import * as store from \"../postgres-catalog-store\";\nawait store.readCatalogForAnalytics({});",
+    defaultImport: "import store from \"../postgres-catalog-store\";",
+    mixed: "import { compiledBaselineCatalogManifest, readCatalogForAnalytics } from \"./postgres-catalog-store.ts\";",
+    readApi: "import {\n  readCatalogPricingRegistryFromPool,\n} from \"../../src/postgres-catalog-store\";",
+    pinWriter: "import { setCatalogPin } from \"../postgres-catalog-store.js\";",
+    reExport: "export { loadCatalogManifest } from \"../postgres-catalog-store\";",
+    exportAll: "export * from \"../postgres-catalog-store\";",
+    sideEffect: "import \"../postgres-catalog-store\";",
+    requireCall: "const store = require(\"../postgres-catalog-store\");",
+    importEquals: "import store = require(\"../postgres-catalog-store\");",
+    sameLine: "import { compiledBaselineCatalogManifest } from \"../postgres-catalog-store\"; "
+      + "import { setCatalogPin } from \"../postgres-catalog-store\";",
+    trailingComment: "import { compiledBaselineCatalogManifest } from \"../postgres-catalog-store\"; // postgres-catalog-store",
+  };
+  for (const [name, text] of Object.entries(refused)) {
+    assert.notDeepEqual(catalogStoreImportViolations(text), [], name);
+  }
+  for (const text of [
+    "import { compiledBaselineCatalogManifest } from \"../postgres-catalog-store\";",
+    "import {\n  compiledBaselineCatalogManifest,\n} from \"../../src/postgres-catalog-store.ts\";",
+    "import type { CatalogPin, CatalogLoadReceipt } from \"../postgres-catalog-store\";",
+    "import { type CatalogPin, compiledBaselineCatalogManifest } from './postgres-catalog-store';",
+    "export const unrelated = 1;",
+  ]) {
+    assert.deepEqual(catalogStoreImportViolations(text), [], text);
+  }
+  const { scanned, importers, violations } = await scanRuntimeCatalogStoreImports();
+  assert.deepEqual(violations, []);
+  assert.ok(scanned > 100, `the scan walks the runtime tree (${scanned} files)`);
+  assert.ok(importers.includes(join("src", "analytics-v2", "community-daily-route.ts")),
+    "the scan sees the one real importer, which takes the compiled baseline only");
 });
 
 test("sign refuses under CI before it reads a key, and under every listed marker", async () => {
