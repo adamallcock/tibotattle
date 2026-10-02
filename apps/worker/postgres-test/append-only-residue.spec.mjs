@@ -353,8 +353,9 @@ after(async () => {
   await admin.end();
 });
 
-test("the residue migration is the last primary file, after 0053 and 0063, and raises only constants", () => {
-  assert.equal(PRIMARY.at(-1).name, RESIDUE_NAME);
+test("the residue migration follows 0053 and 0063, only the additive 0065 follows it, and it raises only constants", () => {
+  assert.deepEqual(PRIMARY.filter(({ version }) => version > RESIDUE_VERSION).map(({ name }) => name),
+    ["0065_interim_public_read.sql"]);
   assert.ok(RESIDUE_VERSION > 63, "the residue follows 0063");
   assert.equal(/\bEXECUTE\b/u.test(RESIDUE_SQL), false, "no dynamic SQL (OPS-10 expand classifier)");
   const raises = [...RESIDUE_SQL.matchAll(/RAISE EXCEPTION ('[^']*'|[^;]*);/gu)].map((match) => match[1]);
@@ -374,7 +375,8 @@ test("PG17: a fresh database applies the whole chain with the residue's catalog"
     await pool.query(`CREATE SCHEMA ${q(SCHEMA)}`);
     const result = await applyPostgresMigrations({ role: "primary", schema: SCHEMA, pool });
     assert.equal(result.applied, PRIMARY.length);
-    assert.deepEqual((await history(pool)).at(-1), { version: RESIDUE_VERSION, name: RESIDUE_NAME });
+    assert.deepEqual((await history(pool)).find(({ version }) => version === RESIDUE_VERSION),
+      { version: RESIDUE_VERSION, name: RESIDUE_NAME });
     await catalogAfterResidue(pool, SCHEMA);
     // The pinned retention flags refuse any writer, by constraint name.
     await assert.rejects(pool.query(
@@ -415,7 +417,7 @@ test("PG17: the upgrade keeps every published row byte-identical and keeps the a
 
     const result = await applyPostgresMigrations({ role: "primary", schema: SCHEMA, pool });
     assert.equal(result.applied, PRIMARY.length);
-    assert.equal((await history(pool)).length, RESIDUE_VERSION);
+    assert.equal((await history(pool)).length, PRIMARY.length);
     assert.deepEqual(await snapshot(pool), before, "published rows, heads, preview and retention are unchanged");
     await catalogAfterResidue(pool, SCHEMA);
 
@@ -443,7 +445,7 @@ test("PG17: the upgrade keeps every published row byte-identical and keeps the a
     const second = await applyPostgresMigrations({ role: "primary", schema: SECOND_SCHEMA, pool });
     assert.equal(second.applied, PRIMARY.length);
     await catalogAfterResidue(pool, SECOND_SCHEMA);
-    assert.equal((await history(pool)).length, RESIDUE_VERSION, "the first schema's history is unchanged");
+    assert.equal((await history(pool)).length, PRIMARY.length, "the first schema's history is unchanged");
   });
 });
 
@@ -472,7 +474,7 @@ test("PG17: two application schemas held below the residue in one database each 
     // leaves the second schema below the residue with every object in place.
     assert.equal((await applyPostgresMigrations({ role: "primary", schema: SCHEMA, pool })).applied,
       PRIMARY.length);
-    assert.equal((await history(pool, SCHEMA)).length, RESIDUE_VERSION);
+    assert.equal((await history(pool, SCHEMA)).length, PRIMARY.length);
     await catalogAfterResidue(pool, SCHEMA);
     assert.deepEqual(await contractColumns(pool), contractAfter);
     assert.equal((await history(pool, SECOND_SCHEMA)).length, RESIDUE_VERSION - 1);
@@ -485,13 +487,15 @@ test("PG17: two application schemas held below the residue in one database each 
     // contract shape no further.
     assert.equal((await applyPostgresMigrations({ role: "primary", schema: SECOND_SCHEMA, pool })).applied,
       PRIMARY.length);
-    assert.equal((await history(pool, SECOND_SCHEMA)).length, RESIDUE_VERSION);
+    assert.equal((await history(pool, SECOND_SCHEMA)).length, PRIMARY.length);
     await catalogAfterResidue(pool, SECOND_SCHEMA);
     assert.deepEqual(await contractColumns(pool), contractAfter);
     assert.deepEqual(await snapshot(pool, SCHEMA), firstBefore);
     assert.deepEqual(await snapshot(pool, SECOND_SCHEMA), secondBefore);
-    assert.deepEqual((await history(pool, SCHEMA)).at(-1), { version: RESIDUE_VERSION, name: RESIDUE_NAME });
-    assert.deepEqual((await history(pool, SECOND_SCHEMA)).at(-1), { version: RESIDUE_VERSION, name: RESIDUE_NAME });
+    assert.deepEqual((await history(pool, SCHEMA)).find(({ version }) => version === RESIDUE_VERSION),
+      { version: RESIDUE_VERSION, name: RESIDUE_NAME });
+    assert.deepEqual((await history(pool, SECOND_SCHEMA)).find(({ version }) => version === RESIDUE_VERSION),
+      { version: RESIDUE_VERSION, name: RESIDUE_NAME });
   });
 });
 

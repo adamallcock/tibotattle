@@ -432,7 +432,7 @@ test("PG17 typed legacy import streams bounded D1 pages, rolls back a failed pag
     await pool.query(`CREATE SCHEMA ${quoted(controlSchema)}`);
     controlCreated = true;
     const migrated = await applyPostgresMigrations({ role: "primary", schema: targetSchema, pool });
-    assert.equal(migrated.applied, 63);
+    assert.equal(migrated.applied, 65);
 
     const fixture = syntheticRows();
     const source = syntheticD1Source({ mutableRows: fixture.rows, d1BlobArrays: true });

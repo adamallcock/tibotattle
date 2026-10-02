@@ -369,8 +369,8 @@ Authorization: the D1 seal export, a read-only production operation. `owner`.
 5. **Take the frozen public read.** Export the current `community_daily` read
    model from production, read-only, at the seal, in the format the interim
    read item defines (OWN-4). `owner`; the format and the loader are `built`
-   (C-IPR). The loader's table is in staged migration `0065`, whose promotion
-   is owed at the C-SIMP merge.
+   (C-IPR). The loader's table is primary migration `0065`, promoted at the
+   C-SIMP-RECON merge.
 
 Refusals to plan for: `CUTOVER_SOURCE_BOOKMARK_DRIFT` (a write reached a D1
 after the fence), `CUTOVER_LEDGER_MISMATCH` or `CUTOVER_SCHEMA_MISMATCH`
@@ -442,7 +442,7 @@ list on the deploy line governs.
      instance.
 4. **Load the frozen public read.** Serve the frozen `community_daily` until the
    first Google Cloud publication, with the evidence date labelled. The loader
-   and the route are `built` (C-IPR), once staged migration `0065` is promoted;
+   and the route are `built` (C-IPR), with primary migration `0065` promoted;
    the production load is a call from the import orchestrator, `not built`
    (E-PT8).
 5. **Run a maintenance pass and resume the maintenance trigger.** Readiness
@@ -680,7 +680,7 @@ the line after `95c158ba`, and the E-QUIESCE row when E-QUIESCE merged after
 | Telemetry importer production modes | H.4 | `not built` (D-PT5A) |
 | Import orchestrator and finalize sequencing | H.4 | `not built` (E-PT8) |
 | Read-only pre-fence quiescence query | H.1 | `built` (E-QUIESCE); not yet run against the provider |
-| Frozen public read: export format, loader, retirement | H.3, H.4, H.8 | `built` (C-IPR), with staged migration `0065` promoted at the C-SIMP merge; dropping the stored row is `not built` |
+| Frozen public read: export format, loader, retirement | H.3, H.4, H.8 | `built` (C-IPR), with migration `0065` promoted to primary at the C-SIMP-RECON merge; dropping the stored row is `not built` |
 | Admin routes at the origin | H.7 | Route modules `built` (C-ADMIN); registration in the host `not built` (D-CRB); the overview answers 503 until its sources exist (E-ADMIN) |
 | Refresh job production contract | H.8 | `built` (C-REFRESH) |
 | Maintenance job and trigger in the desired state | H.4 | `not built` (D-OPS4) |

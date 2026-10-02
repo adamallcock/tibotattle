@@ -7,10 +7,9 @@
 -- export format and its closed validation, scripts/gcp-interim-public-read-load.mjs
 -- is the only writer, and src/analytics-v2/community-daily-route.ts serves it.
 --
--- NUMBER. 0065 is a placeholder (the staged harness needs four digits). The
--- integrator assigns the next free primary number when it promotes this file,
--- after the append-only residue (0064), and then regenerates
--- src/postgres-runtime-schema.ts and moves the count and tail pins. The
+-- NUMBER. Primary 0065, assigned by the integrator at the C-SIMP-RECON merge
+-- (2026-10-02), right after the append-only residue (0064). Until then it was
+-- staged as staged-migrations/primary/0065_interim_public_read.sql. The
 -- migration is purely additive (one table, one function, one trigger), so it
 -- needs no CONTRACT_MIGRATIONS entry.
 --

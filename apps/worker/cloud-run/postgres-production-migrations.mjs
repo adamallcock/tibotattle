@@ -42,7 +42,7 @@
  * still serves, so a migration that drops, renames or tightens (SET NOT NULL,
  * or a NOT NULL column without a default) is a contract change. Each one must
  * be listed, with its sha256, in the reviewed CONTRACT_MIGRATIONS map; the
- * promoted tail 0001-0064 is classified once below. That review covers the
+ * promoted tail 0001-0065 is classified once below. That review covers the
  * SQL a previous revision issues, not its storage fence. The only runtime
  * receipt fence that exists (readSchemaReceipt in postgres-test-dispatch.mjs)
  * admits a migration history only when it equals the image's manifest
@@ -136,7 +136,7 @@ export const CONTRACT_OPERATION_KINDS = Object.freeze([
 ]);
 
 /**
- * Reviewed contract migrations of the promoted primary tail (0001-0064),
+ * Reviewed contract migrations of the promoted primary tail (0001-0065),
  * classified with classifyContractOperations and pinned by sha256. A
  * production, staging or scratch database receives this tail in its first
  * migrate, onto an empty schema before any revision serves it, so none of

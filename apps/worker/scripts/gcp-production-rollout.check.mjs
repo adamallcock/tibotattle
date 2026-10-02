@@ -82,11 +82,14 @@ const IMAGE = `${TARGET.imageRepository}@${DIGEST}`;
 const CONTRACT_PATH = "apps/worker/src/edge-origin-contract.ts";
 const TOKEN = "eyJhbGciOiJSUzI1NiJ9.eyJzeW50aGV0aWMiOnRydWV9.c3ludGhldGlj";
 
-// The checkout's real manifest, which ends with LEAD-SIMP's residue
-// (0064_append_only_residue.sql, final name per OD-1). The "missing
-// residue" case slices it off rather than naming a file at a fixed number.
+// The checkout's real manifest, which carries LEAD-SIMP's residue
+// (0064_append_only_residue.sql, final name per OD-1) followed by the
+// additive 0065 interim public read. The "missing residue" case slices off
+// the residue and everything after it rather than naming a file at a fixed
+// number.
 const MIGRATIONS = Object.freeze(await readPostgresMigrations({ role: "primary" }));
-const residueFree = Object.freeze(MIGRATIONS.slice(0, -1));
+const RESIDUE = MIGRATIONS.find(({ name }) => name.endsWith("_append_only_residue.sql"));
+const residueFree = Object.freeze(MIGRATIONS.slice(0, MIGRATIONS.indexOf(RESIDUE)));
 
 const isCode = (code) => (error) => error?.code === code;
 
@@ -111,7 +114,7 @@ function jobReceipt(overrides = {}, target = TARGET) {
       manifestSha256: primaryManifestSha256(MIGRATIONS),
       historySha256: "e".repeat(64),
       contractReviewed: 23,
-      simpResidue: MIGRATIONS.at(-1).name,
+      simpResidue: RESIDUE.name,
     },
     roles: { migrator: `tibotattle-migrator@${target.project}.iam`, runtime: `tibotattle-runtime@${target.project}.iam` },
     runtimeGrants: {

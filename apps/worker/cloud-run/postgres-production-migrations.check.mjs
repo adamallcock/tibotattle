@@ -64,7 +64,9 @@ const primary = await readPostgresMigrations({ role: "primary" });
 // The "missing residue" cases slice it off, with its contract entry, instead
 // of naming a synthetic file at a hard-coded number.
 const REAL_RESIDUE = "0064_append_only_residue.sql";
-const residueFree = Object.freeze(primary.slice(0, -1));
+// The manifest before the residue (0001-0063): the residue and everything
+// promoted after it (0065, the interim public read) sliced off.
+const residueFree = Object.freeze(primary.slice(0, primary.findIndex(({ name }) => name === REAL_RESIDUE)));
 const residueFreeContracts = Object.freeze(Object.fromEntries(Object.entries(CONTRACT_MIGRATIONS)
   .filter(([name]) => name !== REAL_RESIDUE)));
 
@@ -431,7 +433,7 @@ test("contract classification finds drops, renames, tightenings and dynamic SQL,
   ]) assert.deepEqual(kinds(sql), [], sql);
 });
 
-test("the promoted primary tail 0001-0064 is classified once and pinned in CONTRACT_MIGRATIONS", () => {
+test("the promoted primary tail 0001-0065 is classified once and pinned in CONTRACT_MIGRATIONS", () => {
   const classified = Object.fromEntries(primary.map((migration) => [migration.name, classifyContractOperations(migration.sql)])
     .filter(([, operations]) => operations.length > 0));
   assert.deepEqual(Object.keys(CONTRACT_MIGRATIONS).sort(), Object.keys(classified).sort());
@@ -444,8 +446,11 @@ test("the promoted primary tail 0001-0064 is classified once and pinned in CONTR
   assert.equal(Object.keys(CONTRACT_MIGRATIONS).length, 25);
   assert.equal(assertExpandCompatible(primary), 25);
   // LEAD-SIMP's residue: reviewed with exactly the operations it performs.
-  const residue = primary.at(-1);
-  assert.equal(residue.name, REAL_RESIDUE);
+  const residue = primary.find(({ name }) => name === REAL_RESIDUE);
+  assert.equal(residue.version, 64);
+  // The interim public read (0065) follows it and is additive: no entry.
+  assert.equal(primary.at(-1).name, "0065_interim_public_read.sql");
+  assert.deepEqual([...classifyContractOperations(primary.at(-1).sql)], []);
   assert.deepEqual([...CONTRACT_MIGRATIONS[REAL_RESIDUE].operations], ["drop", "add-constraint"]);
   assert.deepEqual([...classifyContractOperations(residue.sql)], ["drop", "add-constraint"]);
   assert.doesNotMatch(residue.sql, /EXECUTE/iu, "the residue carries no dynamic SQL, comments included");
@@ -509,7 +514,7 @@ test("history versus manifest: behind and current proceed; ahead and non-prefix 
   assert.deepEqual({ ...compareHistoryToManifest(rows(primary.slice(0, 40)), primary) },
     { applied: 40, pending: primary.length - 40 });
   assert.deepEqual({ ...compareHistoryToManifest(rows(primary), primary) }, { applied: primary.length, pending: 0 });
-  assert.equal(primary.length, 64);
+  assert.equal(primary.length, 65);
   const newer = rows(withExtraMigration(primary, "w2_opsdb_newer.sql", "SELECT 1;"));
   assert.throws(() => compareHistoryToManifest(newer, primary), isCode("MIGRATION_STATE_NEWER_THAN_IMAGE"));
   const diverged = [
@@ -541,7 +546,7 @@ test("a fresh scratch target: read-only history first, then schema, forward runn
   assert.equal(verifyProductionMigrationReceipt(receipt).digest, receipt.digest);
   assert.equal(receipt.schema, PRODUCTION_MIGRATION_RECEIPT_SCHEMA);
   assert.equal(receipt.target.kind, "scratch");
-  assert.equal(receipt.migrations.count, 64);
+  assert.equal(receipt.migrations.count, 65);
   assert.equal(receipt.migrations.manifestSha256, primaryManifestSha256(primary));
   assert.equal(receipt.migrations.contractReviewed, 25);
   assert.equal(receipt.migrations.simpResidue, REAL_RESIDUE);
@@ -575,12 +580,12 @@ test("a non-scratch target needs the SIMP residue in the image manifest; refused
     isCode("PRODUCTION_SIMP_RESIDUE_MISSING"));
   assert.deepEqual(refused.counts, { identity: 1, manifest: 1, pools: 0, apply: 0, closes: 0 });
   assert.deepEqual(refused.events, []);
-  // The real 64-migration manifest is accepted for a non-scratch target.
+  // The real 65-migration manifest is accepted for a non-scratch target.
   const accepted = harness();
   const receipt = await runProductionMigrations({ env, dependencies: accepted.dependencies });
   assert.equal(receipt.target.kind, "environment");
   assert.equal(receipt.migrations.simpResidue, REAL_RESIDUE);
-  assert.equal(verifyProductionMigrationReceipt(receipt).migrations.count, 64);
+  assert.equal(verifyProductionMigrationReceipt(receipt).migrations.count, 65);
   // A synthetic residue named from the manifest length also satisfies the guard.
   const synthetic = withExtraMigration(residueFree, "simp_append_only_residue.sql", "SELECT 1;\n");
   const syntheticRun = harness({ migrations: synthetic, contractMigrations: residueFreeContracts });

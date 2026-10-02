@@ -146,8 +146,9 @@ test("Worker migration receipt source is generated exactly from canonical SQL", 
   // Wave-1 promotion (claude/gcp-fastpath-base): primary 0047-0058 moved
   // from staged-migrations/ unchanged, then the fast path promoted primary
   // 0059 (analytics_v2) the same way, the wave-2 integration promoted
-  // W2-SEAL's 0063, and LEAD-SIMP added the append-only residue 0064, so the
-  // runtime receipt fences the whole promoted primary chain.
+  // W2-SEAL's 0063, LEAD-SIMP added the append-only residue 0064, and the
+  // C-SIMP-RECON integration promoted C-IPR's interim public read as 0065, so
+  // the runtime receipt fences the whole promoted primary chain.
   for (const migration of [
     '"0047_host_diagnostic_errors.sql"',
     '"0048_rate_limit_buckets_unlogged.sql"',
@@ -167,12 +168,13 @@ test("Worker migration receipt source is generated exactly from canonical SQL", 
     '"0062_telemetry_contribution_trigger_search_path.sql"',
     '"0063_enrollment_grants_erased_redeemer.sql"',
     '"0064_append_only_residue.sql"',
+    '"0065_interim_public_read.sql"',
   ]) {
     assert.equal(renderPostgresRuntimeSchema(manifest).includes(migration), true);
   }
   assert.equal(manifest.schemaVersion, "tibotattle-postgres-migration-manifest-v2");
   assert.deepEqual(Object.keys(manifest.roles), ["primary"]);
-  assert.equal(manifest.roles.primary.length, 64);
+  assert.equal(manifest.roles.primary.length, 65);
   // No frozen ledger fragment reaches the Worker receipt.
   const rendered = renderPostgresRuntimeSchema(manifest);
   for (const ledgerOnly of [

@@ -148,8 +148,8 @@ async function createTarget(pool) {
   const quoted = `"${schema}"`;
   await pool.query(`CREATE SCHEMA ${quoted}`);
   const migration = await applyPostgresMigrations({ role: "primary", schema, pool });
-  expect(migration.applied).toBe(64);
-  expect(migration.migrations.at(-1)?.name).toBe("0064_append_only_residue.sql");
+  expect(migration.applied).toBe(65);
+  expect(migration.migrations.at(-1)?.name).toBe("0065_interim_public_read.sql");
   return { schema, quoted, table: name => `${quoted}."${name}"` };
 }
 
