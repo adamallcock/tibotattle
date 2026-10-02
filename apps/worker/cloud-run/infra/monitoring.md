@@ -172,13 +172,18 @@ manifest.
   characters; owner decision, round 7) is **unseen**.
 - Any other token is **unrecognized**: for example an ARN with `/`, an email
   address, or a name over 64 characters. It is counted and never printed.
-- **The probe prints no token today.** The owner allowed these names in
-  plain text (round-3 amendment). That amendment also requires the change
-  that prints them to narrow the root `AGENTS.md` "raw account IDs"
-  invariant. Until that change lands, `UNSEEN_TOKEN_LISTING` is `held`.
-  The probe line then carries, per dimension, the number of distinct unseen
+- **The probe prints no token today** (`UNSEEN_TOKEN_LISTING` is `held`).
+  The probe line carries, per dimension, the number of distinct unseen
   tokens and their records, and the number of unrecognized ones. It does not
   say which token is new.
+- The owner allowed these names in plain text (round-3 amendment), and the
+  root `AGENTS.md` invariant is already narrowed for them
+  ([decision record](../../../../docs/decisions/2026-10-02-catalog-vocabulary-plain-text.md)).
+  The flip to `plain` is a separate pending step for the change that
+  schedules the probe (D-OPS4). From then on the line reaches Cloud Logging.
+  The owner's round-5 retention wording says logs never include upload
+  contents, so the flip waits for the owner to confirm that listing these
+  names there is allowed.
 
 ## unseen-tokens-silent
 

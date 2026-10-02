@@ -50,7 +50,8 @@ const SAMPLE_ROWS = Object.freeze([
 ]);
 
 test("by default the report holds the listing: counts only, no token text, the verdict unchanged", () => {
-  assert.equal(UNSEEN_TOKEN_LISTING, "held", "plain-text listing waits for the root AGENTS.md invariant narrowing");
+  assert.equal(UNSEEN_TOKEN_LISTING, "held",
+    "plain-text listing is a separate step that waits for the scheduled probe (D-OPS4) and the owner's confirmation");
   const catalog = bundledTokenCatalog();
   assert.ok(catalog.model.has("gpt-5.5") && catalog.model.has("unknown"));
   assert.ok(catalog.plan.has("prolite") && !catalog.plan.has("promax"));

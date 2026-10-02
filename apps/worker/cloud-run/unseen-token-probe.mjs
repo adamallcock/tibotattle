@@ -24,13 +24,16 @@
  * separately, so a rise in "other" speed (Ultrafast) or "unknown" model shows
  * even when no new token appears.
  *
- * Listing is HELD (UNSEEN_TOKEN_LISTING): the owner's round-3 amendment lets
- * these names pass in plain text, but requires the change that does so to
- * narrow the root AGENTS.md "raw account IDs" invariant and its tests and
- * docs. Until that change lands, the probe reports how many distinct unseen
- * tokens each dimension holds and how many records carry them, and prints no
- * token. The change that narrows the invariant flips UNSEEN_TOKEN_LISTING to
- * "plain"; the bounded listing below is already checked.
+ * Listing is HELD (UNSEEN_TOKEN_LISTING): the probe reports how many distinct
+ * unseen tokens each dimension holds and how many records carry them, and
+ * prints no token. The owner's round-3 amendment lets these names pass in
+ * plain text, and the root AGENTS.md invariant is already narrowed for them
+ * (KM-CORE, docs/decisions/2026-10-02-catalog-vocabulary-plain-text.md). The
+ * flip to "plain" is a separate pending step for the change that schedules
+ * this probe (D-OPS4). From then on the line reaches Cloud Logging, and the
+ * owner's round-5 retention wording says logs never include upload contents,
+ * so the flip waits for the owner to confirm that listing these names there
+ * is allowed. The bounded listing below is already checked.
  *
  * One JSON line on stdout per run (schema tibotattle-unseen-token-probe-v1),
  * which OPS-5's log-based metric keys on (verdict "unseen" or "clear"); one
@@ -74,9 +77,11 @@ export const UNSEEN_TOKEN_SENTINELS = Object.freeze(["unknown", "other", "mixed"
  */
 export const UNSEEN_TOKEN_GRAMMAR = /^[A-Za-z0-9._:-]{1,64}$/u;
 /**
- * Whether unseen tokens are printed: "held" (counts only) until the change
- * that narrows the root AGENTS.md "raw account IDs" invariant for model,
- * speed, tier and plan names (owner, round-3 amendment) flips it to "plain".
+ * Whether unseen tokens are printed: "held" (counts only). The root AGENTS.md
+ * invariant is already narrowed for model, speed, tier and plan names (owner,
+ * round-3 amendment). Flipping this to "plain" is a separate step that waits
+ * for the scheduled probe job (D-OPS4) and the owner's confirmation (see the
+ * header).
  */
 export const UNSEEN_TOKEN_LISTINGS = Object.freeze(["held", "plain"]);
 export const UNSEEN_TOKEN_LISTING = "held";

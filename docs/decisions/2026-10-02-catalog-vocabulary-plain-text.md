@@ -64,3 +64,11 @@ status: accepted
   privacy page and in-app notice update, which the owner placed in the next
   client release (round 5). Until KC-3 ships, clients keep the current
   fingerprint/unknown policy for unknown models.
+- **Held, a separate step:** the K-DETECT unseen-token probe
+  (`apps/worker/cloud-run/unseen-token-probe.mjs`) still prints counts only
+  (`UNSEEN_TOKEN_LISTING` is `held`). Its plain-text listing, bounded to
+  in-grammar names, is built and checked. The flip to `plain` belongs with
+  the change that schedules the probe (D-OPS4), because the line then reaches
+  Cloud Logging. It waits for the owner to confirm that listing these names
+  there agrees with the round-5 retention wording that logs never include
+  upload contents.
