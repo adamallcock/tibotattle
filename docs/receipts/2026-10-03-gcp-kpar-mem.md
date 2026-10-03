@@ -47,17 +47,17 @@ loaded, so timing ratios describe these runs and are not isolated causal gains.
 |---|---|---:|---|---|---:|
 | I-w1 inline | 2026-10-03 17:14:17 | 19,526 | complete | 53 computed, 0 refused | 5,463 |
 | N3 four Workers | 2026-10-03 17:17:40 | 8,393 | complete | 53 computed, 0 refused | 10,705 |
-| N4 four Workers, explicit young cap | pending | pending | pending | pending | pending |
+| N4 four Workers, explicit young cap | 2026-10-03 18:37:50 | 5,584 | complete | 53 computed, 0 refused | 11,274 |
 
 Phase timing sums (seconds), not sequential wall-time components:
 
-| Phase | I-w1 | N3 |
-|---|---:|---:|
-| Read | 4,029.390 | 5,296.048 |
-| Prepare | 3,614.229 | 3,936.656 |
-| Scalar | 311.371 | 333.056 |
-| Model | 11,546.612 | 13,366.253 |
-| Write | 7.069 | 6.441 |
+| Phase | I-w1 | N3 | N4 |
+|---|---:|---:|---:|
+| Read | 4,029.390 | 5,296.048 | 4,422.069 |
+| Prepare | 3,614.229 | 3,936.656 | 2,651.629 |
+| Scalar | 311.371 | 333.056 | 216.674 |
+| Model | 11,546.612 | 13,366.253 | 8,597.804 |
+| Write | 7.069 | 6.441 | 6.510 |
 
 Concurrent loads/Workers add their own phase times; their sum can exceed wall
 and is not CPU time. N3 sampled mean 2.38 busy cores out of four versus 0.91
@@ -72,13 +72,24 @@ that field samples delayed GC callbacks: it is **not** an exact post-GC live-hea
 peak. Recovery names it `largestGcCallbackHeapMiB` and describes it correctly.
 Neither sample proves a worst-case memory bound; admission and alone retry do.
 
-N3 and I-w1 have exactly equal output digests in every family the inherited
+N4 had zero OOM retries, peak four Workers and three loads, admission charge
+11,049 MiB within the same 11,216 MiB pool. Its receipt reports main heap
+2,254 MiB and largest sampled owner heap 4,840 MiB. The old delayed GC callback
+field reports 4,739 MiB (88%); it has the same sampling limitation described
+above. Sampled mean busy cores were 2.44. These loaded-host results identify
+prior bundles only and do not qualify corrected source checkpoint `ceb02449`
+or a combined kernel 5 candidate.
+
+N4, N3 and I-w1 have exactly equal output digests in every family the inherited
 measurement harness records: cache bands, journal cursor, owner days, owner
-fits, model dates, preview and published daily payloads. No masking was applied.
+fits, model dates, preview and published daily payloads. The recorded digest
+values were compared directly, without additional masking. The inherited
+harness already removes its documented run/stamp fields when hashing rows.
 The [retained aggregate digest proof](./2026-10-03-gcp-kpar-digests.json)
 records all seven comparisons. This gate does not claim coverage of later
 Wave 23/25 tables.
-Both completed runs dropped their own clones. N4 remains owned and untouched.
+All three completed runs dropped their own clones. Captured N4 bundle hashes
+were rechecked unchanged when its final result was collected.
 
 | Captured bundle | SHA-256 |
 |---|---|
@@ -130,11 +141,11 @@ preserved; no install or lockfile change was performed.
 
 ## Integration and remaining proof
 
-- Collect N4 final receipt/digests and compare them with I-w1; no new full-corpus
-  benchmark is authorized or required for recovery. If it fails, preserve the
-  failure and report the remaining gate honestly.
-- Complete focused final tests, docs checks, preflight and architecture checks;
-  commit the owned change locally only.
+- N4 final receipt and seven-family equality are collected. No additional
+  benchmark was launched for this inherited evidence.
+- Reviewed source checkpoint `ceb02449` passed the focused final tests, docs,
+  preflight and architecture gates recorded above. Full corrected/combined
+  candidate performance and memory qualification remain open.
 - Keep branch-local kernel 3 (inherited measurement) and 4 (recovery's correctly
   named Worker metric) separate here. At Wave 25 DROP both branch-local entries
   and pins; derive one consolidated kernel 5 with method v2 on the merged line.

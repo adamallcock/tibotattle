@@ -10,6 +10,10 @@
       "n3": {
         "rows": 542650,
         "sha256": "6869423003c35bd5df0c577af55676fe979d6f0af3e7624a4bdb83c34cf01279"
+      },
+      "n4": {
+        "rows": 542650,
+        "sha256": "6869423003c35bd5df0c577af55676fe979d6f0af3e7624a4bdb83c34cf01279"
       }
     },
     "analytics_v2_journal_cursor": {
@@ -18,6 +22,10 @@
         "sha256": "6335c48a1346d8e63391a025aa18bbca89dbb6e8c5ccc97f38b044269fe9be9d"
       },
       "n3": {
+        "rows": 1,
+        "sha256": "6335c48a1346d8e63391a025aa18bbca89dbb6e8c5ccc97f38b044269fe9be9d"
+      },
+      "n4": {
         "rows": 1,
         "sha256": "6335c48a1346d8e63391a025aa18bbca89dbb6e8c5ccc97f38b044269fe9be9d"
       }
@@ -30,6 +38,10 @@
       "n3": {
         "rows": 10025,
         "sha256": "440c027199bc15c66bc856ab92f9989173e0fe849988421db05974b2bba87eb0"
+      },
+      "n4": {
+        "rows": 10025,
+        "sha256": "440c027199bc15c66bc856ab92f9989173e0fe849988421db05974b2bba87eb0"
       }
     },
     "analytics_v2_owner_fits": {
@@ -38,6 +50,10 @@
         "sha256": "048e65764c54d36e5e1935732829222d6f379e330dfff44a9007423a10b4f837"
       },
       "n3": {
+        "rows": 53,
+        "sha256": "048e65764c54d36e5e1935732829222d6f379e330dfff44a9007423a10b4f837"
+      },
+      "n4": {
         "rows": 53,
         "sha256": "048e65764c54d36e5e1935732829222d6f379e330dfff44a9007423a10b4f837"
       }
@@ -50,6 +66,10 @@
       "n3": {
         "rows": 3710,
         "sha256": "0f15aa65af67a614812034115704951d109aadab493b600b383400c9fb3ffd96"
+      },
+      "n4": {
+        "rows": 3710,
+        "sha256": "0f15aa65af67a614812034115704951d109aadab493b600b383400c9fb3ffd96"
       }
     },
     "analytics_v2_preview": {
@@ -58,6 +78,10 @@
         "sha256": "a32b8d4355b5d4d82ae815cd2a84530c9f782d1b392d9ed0a5b27e4dc6f87fcb"
       },
       "n3": {
+        "rows": 1,
+        "sha256": "a32b8d4355b5d4d82ae815cd2a84530c9f782d1b392d9ed0a5b27e4dc6f87fcb"
+      },
+      "n4": {
         "rows": 1,
         "sha256": "a32b8d4355b5d4d82ae815cd2a84530c9f782d1b392d9ed0a5b27e4dc6f87fcb"
       }
@@ -70,7 +94,12 @@
       "n3": {
         "rows": 488,
         "sha256": "1a22fb778ed4c4edcdff815413e57782f12e2405bb586e916fc9b163eca234d6"
+      },
+      "n4": {
+        "rows": 488,
+        "sha256": "1a22fb778ed4c4edcdff815413e57782f12e2405bb586e916fc9b163eca234d6"
       }
     }
-  }
+  },
+  "qualification": "Inherited immutable bundle comparison only; corrected source and combined candidate qualification remain open."
 }
