@@ -5,12 +5,15 @@
 // - usage-row-evidence-memo: a usage row evaluated again (the same object, as
 //   the native path's model windows re-read an owner's prepared rows) gives
 //   exactly what a fresh copy of the row gives, the session step still runs
-//   before the price on every call, and a row whose record_json or
-//   observed_at changed is evaluated again;
+//   before the price on every call, a row whose record_json or observed_at
+//   changed is evaluated again, rows past the intern tables' bound answer
+//   exactly, and the memo keeps no dropped row alive;
 // - daily-fold-trusted-state: folding an owner-day one record at a time with
 //   the trusted fold returns, after every record, exactly the state the
 //   checked fold returns, including past the 200-cell top-K, and a record the
 //   checked fold refuses is refused the same way.
+import { setFlagsFromString } from "node:v8";
+import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import {
   advanceV11UsageReduction,
@@ -150,6 +153,52 @@ describe("source patch usage-row-evidence-memo", () => {
     expect(await v11PreparedUsageDayRow(row, sessionDigest)).toEqual(await v11PreparedUsageDayRow(fresh(other), sessionDigest));
     row.observed_at = new Date(start + 86_399_000).toISOString();
     expect(await v11PreparedUsageDayRow(row, sessionDigest)).toEqual(await v11PreparedUsageDayRow(fresh(row), sessionDigest));
+  });
+
+  it("answers exactly past the intern tables' bound, for attributions and model ids it does not share", async () => {
+    // More distinct attributions and model ids than the bounded intern tables
+    // hold (4,096 each): every row, before and past the bound, keeps the
+    // values its own record carries. The reference is the record itself, not
+    // another memoized evaluation, so a table that shared a wrong value would
+    // show here.
+    const trackOf = (index: number) => `account-track:v2:${index.toString(16).padStart(64, "0")}`;
+    const distinct = Array.from({ length: 4_200 }, (_, index) => usageRow(index, {
+      modelId: `synthetic-model-${index}`, accountPlanAttribution: { ...attribution, accountTrackId: trackOf(index) },
+    }));
+    for (let pass = 0; pass < 2; pass += 1) {
+      for (const [index, row] of distinct.entries()) {
+        const feature = await prepareV11UsageFeature(row, owner);
+        expect([feature.outcome, feature.accountScopeId, feature.modelId])
+          .toEqual(["priced", trackOf(index), `synthetic-model-${index}`]);
+        const dayRow = await v11PreparedUsageDayRow(row, sessionDigest);
+        expect(dayRow.status === "row" && dayRow.row.accountScopeId).toBe(trackOf(index));
+      }
+    }
+    for (const row of [distinct[0]!, distinct[4_199]!, rows[0]!]) {
+      expect(await v11PreparedUsageDayRow(row, sessionDigest)).toEqual(await v11PreparedUsageDayRow(fresh(row), sessionDigest));
+      expect(await prepareV11UsageFeature(row, owner)).toEqual(await prepareV11UsageFeature(fresh(row), owner));
+    }
+  });
+
+  it("keeps no row alive: once an owner's rows are dropped, the memo lets them be collected", async () => {
+    // The memo is keyed weakly on the row object, so inline (one heap for
+    // every owner) it never holds a finished owner's rows or their memos.
+    setFlagsFromString("--expose-gc");
+    const collect = runInNewContext("gc") as () => void;
+    const refs: WeakRef<UsageRow>[] = [];
+    await (async () => {
+      const dropped = Array.from({ length: 64 }, (_, index) => usageRow(index));
+      for (const row of dropped) {
+        await v11PreparedUsageDayRow(row, sessionDigest);
+        await prepareV11UsageFeature(row, owner);
+        refs.push(new WeakRef(row));
+      }
+    })();
+    for (let pass = 0; pass < 10 && refs.some((ref) => ref.deref() !== undefined); pass += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      collect();
+    }
+    expect(refs.filter((ref) => ref.deref() !== undefined)).toHaveLength(0);
   });
 });
 
