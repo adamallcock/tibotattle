@@ -85,8 +85,8 @@ test("Worker wrapper remains a compute closure root and covers both result hando
 test("cooperative duration overshoot is incomplete and cannot claim full coverage", () => {
   const root = fixture(), c = coordinator(root), config = c.grant("owner");
   let time = 0;
-  const p = startWorkerProfile({ ...config, durationMs: 1 }, { createSession: () => fake(empty), observerFactory: noObserver, now: () => time });
-  time = 10; p.finish(); c.exited(config.id, 0); c.finish();
+  const p = startWorkerProfile(config, { createSession: () => fake(empty), observerFactory: noObserver, now: () => time });
+  time = WORKER_PROFILE_LIMITS.durationMs + 9; p.finish(); c.exited(config.id, 0); c.finish();
   const m = JSON.parse(readFileSync(join(settings(root).directory, "manifest.json")));
   assert.equal(m.completeCoverage, false); assert.equal(m.captures[0].durationOvershootMs, 9);
 });
@@ -113,4 +113,35 @@ test("identity, unknown metadata and altered raw profile cannot qualify coverage
     assert.equal(manifest.completeCoverage, false); assert.equal(manifest.captures[0].error, "WORKER_PROFILE_CAPTURE_MISSING_OR_INVALID");
     assert.ok(!text.includes("must-not-escape"));
   }
+});
+
+
+test("complete capture requires coupled verified profile, outcome and duration facts", () => {
+  const corruptions = [
+    (s) => { s.profileSha256 = null; s.profileBytes = 0; },
+    (s) => { s.profileBytes = 0; },
+    (s) => { s.reason = "work-failed"; },
+    (s) => { s.reason = "duration-limit"; },
+    (s) => { s.error = "WORKER_PROFILE_CAPTURE_FAILED"; },
+    (s) => { s.elapsedMs = WORKER_PROFILE_LIMITS.durationMs + 1; s.durationOvershootMs = 1; },
+    (s) => { s.elapsedMs = WORKER_PROFILE_LIMITS.durationMs + 1; s.durationOvershootMs = 0; },
+    (s) => { s.durationOvershootMs = 1; },
+    (s) => { s.stoppedAt = null; },
+  ];
+  for (const corrupt of corruptions) {
+    const root = fixture(), c = coordinator(root), config = c.grant("owner");
+    startWorkerProfile(config, { createSession: () => fake(empty), observerFactory: noObserver }).finish();
+    const path = join(config.directory, "summary.json"), summary = JSON.parse(readFileSync(path));
+    assert.equal(summary.coverage, "complete"); corrupt(summary);
+    writeFileSync(path, JSON.stringify(summary), { mode: 0o600 }); c.exited(config.id, 1); c.finish();
+    const manifest = JSON.parse(readFileSync(join(settings(root).directory, "manifest.json")));
+    assert.equal(manifest.completeCoverage, false);
+    assert.equal(manifest.captures[0].error, "WORKER_PROFILE_CAPTURE_MISSING_OR_INVALID");
+  }
+});
+
+test("zero-capture runs cannot claim complete Worker coverage", () => {
+  const root = fixture(), c = coordinator(root); c.finish();
+  const manifest = JSON.parse(readFileSync(join(settings(root).directory, "manifest.json")));
+  assert.equal(manifest.captures.length, 0); assert.equal(manifest.completeCoverage, false);
 });

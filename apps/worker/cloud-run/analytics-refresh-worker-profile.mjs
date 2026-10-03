@@ -97,6 +97,11 @@ export function createWorkerProfileCoordinator(settings, { workerUrl, runId = ra
               || summary.identity?.parentId !== entry.parentId || summary.identity?.attempt !== entry.attempt) {
             throw fault("WORKER_PROFILE_CAPTURE_INVALID");
           }
+          if (summary.durationOvershootMs !== Math.max(0, summary.elapsedMs - WORKER_PROFILE_LIMITS.durationMs)
+              || (summary.coverage === "complete" && (summary.profileSha256 === null
+                || summary.profileBytes < 1 || summary.error !== null || summary.reason !== "complete"
+                || summary.elapsedMs > WORKER_PROFILE_LIMITS.durationMs || summary.durationOvershootMs !== 0
+                || summary.stoppedAt === null))) throw fault("WORKER_PROFILE_CAPTURE_INVALID");
           if (summary.profileSha256 !== null) {
             const profilePath = join(directory, "capture.cpuprofile"), profileInfo = lstatSync(profilePath);
             if (!profileInfo.isFile() || profileInfo.isSymbolicLink() || profileInfo.nlink !== 1
@@ -110,7 +115,7 @@ export function createWorkerProfileCoordinator(settings, { workerUrl, runId = ra
         } catch { return { ...entry, termination: exits.get(entry.id) ?? null, coverage: "incomplete", error: "WORKER_PROFILE_CAPTURE_MISSING_OR_INVALID" }; }
       });
       save(join(settings.directory, "manifest.json"), { binding, analyticsRunId, limits: WORKER_PROFILE_LIMITS, captures, skipped,
-        completeCoverage: skipped === 0 && captures.every((entry) => entry.coverage === "complete" && entry.termination !== null),
+        completeCoverage: captures.length > 0 && skipped === 0 && captures.every((entry) => entry.coverage === "complete" && entry.termination !== null),
         limitations: ["local synthetic only", "cooperative duration; inspector allocation not capped",
           "profiled peaks include inspector overhead", "process CPU is not isolate CPU"] });
     },
