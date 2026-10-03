@@ -57,9 +57,15 @@ export async function erasedRedeemerMigration() {
 
 /**
  * Create the roles and the transfer-role grant, then `count` targets. The
- * returned dispose() drops everything this harness created.
+ * returned dispose() drops everything this harness created. `collations[i]`
+ * (default none: the cluster's template, C on the local clusters) creates
+ * target i from template0 with that LC_COLLATE and LC_CTYPE, for example
+ * en_US.UTF-8, the documented Cloud SQL default for a database created
+ * without a collation flag.
  */
-export async function createW2SealCluster({ socket, port, user, password, database, count = 1, label = "w2" }) {
+export async function createW2SealCluster({ socket, port, user, password, database, count = 1, label = "w2", collations = [] }) {
+  assert.ok(Array.isArray(collations) && collations.every(name => name === null || name === undefined
+    || /^[A-Za-z0-9_.@-]{1,64}$/u.test(name)), "collations must be plain locale names");
   const endpoint = await localSocket(socket, port);
   const base = { ...endpoint, password, ssl: false, connectionTimeoutMillis: 5_000 };
   const admin = new pg.Client({ ...base, user, database });
@@ -111,7 +117,9 @@ export async function createW2SealCluster({ socket, port, user, password, databa
     for (let index = 0; index < count; index += 1) {
       const databases = { primary: `w2_seal_primary_${suffix}_${index}` };
       for (const name of Object.values(databases)) {
-        await admin.query(`CREATE DATABASE "${name}" OWNER "${roles.owner}"`);
+        const collation = collations[index] ?? null;
+        await admin.query(collation === null ? `CREATE DATABASE "${name}" OWNER "${roles.owner}"`
+          : `CREATE DATABASE "${name}" OWNER "${roles.owner}" TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE '${collation}' LC_CTYPE '${collation}'`);
         created.databases.push(name);
       }
       const ownerPrimary = pool(roles.owner, databases.primary);
