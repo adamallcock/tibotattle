@@ -44,6 +44,7 @@ import {
   type TelemetryV11Record,
   type TelemetryV12Record,
 } from "@app-usagemonitor/telemetry-contract";
+import { canonicalJson } from "../canonical-json";
 import { sha256Hex } from "../crypto";
 import type { PostgresClient } from "../postgres-client";
 import { decodeTelemetryV12Record, type TelemetryV12TypedRecordRow } from "../telemetry-v12-typed-codec";
@@ -70,18 +71,26 @@ import {
 } from "./contract";
 import {
   DAY_MS,
+  analyticsV2PreparedStatement,
+  analyticsV2Statement,
   correctionRuntimeActiveSql,
   dayFromNumber,
   dayNumber,
   nowTimestamp,
   onReadSnapshot,
+  participantExclusionsWatermarkSql,
+  queryPrepared,
   quotedSchema,
+  readParticipantActiveExclusions,
   safeInteger,
   sourceFail,
   typedIdTextSql,
   v12RetainedAuthorizationScopeSql,
+  withGenericPlans,
+  type AnalyticsV2PreparedStatement,
   type AnalyticsV2SnapshotContext,
 } from "./owners";
+import { analyticsV2ExclusionsOn } from "./exclusions";
 
 export type { EffectiveTelemetryOccurrence, EffectiveTelemetryStream };
 
@@ -228,11 +237,8 @@ interface OwnerScope {
   readonly v12HeadActive: boolean;
 }
 
-async function readOwnerScope(client: PostgresClient, s: string, ownerDigest: string): Promise<OwnerScope> {
-  const result = await client.query<{
-    participant_id: unknown; v1_namespace: unknown; v11_namespace: unknown; correction_present: unknown;
-    correction_active: unknown; v12_generation_id: unknown; v12_state: unknown;
-  }>(`SELECT link.participant_id,v1.source_namespace AS v1_namespace,v11.source_namespace AS v11_namespace,
+function ownerScopeSql(s: string): string {
+  return `SELECT link.participant_id,v1.source_namespace AS v1_namespace,v11.source_namespace AS v11_namespace,
           EXISTS(SELECT 1 FROM ${s}.telemetry_usage_correction_runtime r WHERE r.id=1
             AND r.schema_version='telemetry-usage-correction-v1' AND r.method_version='usage-total-correction-v1')
             AS correction_present,
@@ -247,7 +253,14 @@ async function readOwnerScope(client: PostgresClient, s: string, ownerDigest: st
      LEFT JOIN ${s}.typed_v11_admission_state v11 ON v11.id=1 AND v11.runtime_contract_version=1
      LEFT JOIN ${s}.telemetry_v12_domain_heads v12head ON v12head.participant_id=link.participant_id
      LEFT JOIN ${s}.telemetry_v12_runtime v12runtime ON v12runtime.id=1
-    WHERE link.owner_digest=$1 AND link.state='active' LIMIT 2`, [ownerDigest]);
+    WHERE link.owner_digest=$1 AND link.state='active' LIMIT 2`;
+}
+
+async function readOwnerScope(client: PostgresClient, s: string, ownerDigest: string): Promise<OwnerScope> {
+  const result = await queryPrepared<{
+    participant_id: unknown; v1_namespace: unknown; v11_namespace: unknown; correction_present: unknown;
+    correction_active: unknown; v12_generation_id: unknown; v12_state: unknown;
+  }>(client, (await readerStatements(s)).scope, [ownerDigest]);
   const row = result.rows[0];
   if (result.rows.length !== 1 || row === undefined || typeof row.participant_id !== "string"
       || row.correction_present !== true || typeof row.correction_active !== "boolean") {
@@ -952,6 +965,42 @@ async function parseCorrectionFact(row: Record<string, unknown>): Promise<Teleme
 }
 
 // ---------------------------------------------------------------------------
+// Prepared statements (K-READ)
+// ---------------------------------------------------------------------------
+
+/**
+ * The statements a reader call issues once per call or once per 200-id batch,
+ * prepared per connection (owners.ts analyticsV2PreparedStatement). The
+ * candidate, count and first-evidence statements stay unnamed: they run once
+ * per span with range parameters a generic plan could misjudge.
+ */
+interface ReaderStatements {
+  readonly scope: AnalyticsV2PreparedStatement;
+  readonly legacySources: AnalyticsV2PreparedStatement;
+  readonly v12Sources: AnalyticsV2PreparedStatement;
+  readonly correctionSources: AnalyticsV2PreparedStatement;
+}
+
+const READER_STATEMENT_SCHEMAS = 64;
+const readerStatementCache = new Map<string, Promise<ReaderStatements>>();
+
+/** The prepared statements for quoted schema `s` (a pure function of `s`, cached). */
+function readerStatements(s: string): Promise<ReaderStatements> {
+  let cached = readerStatementCache.get(s);
+  if (cached === undefined) {
+    if (readerStatementCache.size >= READER_STATEMENT_SCHEMAS) readerStatementCache.clear();
+    cached = (async () => Object.freeze({
+      scope: await analyticsV2PreparedStatement("occurrences.scope", ownerScopeSql(s)),
+      legacySources: await analyticsV2PreparedStatement("occurrences.legacy_sources", legacySourcesSql(s)),
+      v12Sources: await analyticsV2PreparedStatement("occurrences.v12_sources", v12OccurrencesSql(s)),
+      correctionSources: await analyticsV2PreparedStatement("occurrences.correction_sources", correctionVariantsSql(s)),
+    }))();
+    readerStatementCache.set(s, cached);
+  }
+  return cached;
+}
+
+// ---------------------------------------------------------------------------
 // The adapter
 // ---------------------------------------------------------------------------
 
@@ -992,6 +1041,50 @@ function usageRow(row: EffectiveUsageOccurrence): EffectiveTelemetryOccurrence {
 }
 
 /**
+ * The candidates of one owner, stream and day range (step 1 of the module
+ * comment), and what step 2 expands: every candidate group across all days.
+ * Production expands v1.2 usage sources only for a participant with a v1.2
+ * head (readV12EffectiveUsageSources), and v1.2 quota/session sources
+ * whenever the v1.2 runtime is active (readEffectiveTelemetryOwnerDayPage).
+ */
+async function readCandidates(client: PostgresClient, s: string, now: string, scope: OwnerScope, options: {
+  readonly ownerDigest: string; readonly stream: EffectiveTelemetryStream; readonly fromDay: number;
+  readonly throughDay: number; readonly maxCandidates: number;
+}): Promise<{
+  candidates: Map<number, Map<string, Candidate>>; corrections: boolean; expandV12: boolean; occurrenceIds: string[];
+}> {
+  const { ownerDigest, stream, fromDay, throughDay, maxCandidates } = options;
+  const participantId = scope.participantId;
+  const streamBinds = [ownerDigest, participantId, STREAM_CODES[stream], stream];
+  const candidates = new Map<number, Map<string, Candidate>>();
+  if (scope.v1Namespace !== null || scope.v11Namespace !== null) {
+    const legacy = await client.query<Record<string, unknown>>(
+      analyticsV2Statement("occurrences.legacy_candidates", legacyCandidatesSql(s)), [...streamBinds, fromDay, throughDay]);
+    addCandidates(candidates, legacy.rows, fromDay, throughDay);
+  }
+  if (scope.v12HeadActive) {
+    const v12 = await client.query<Record<string, unknown>>(
+      analyticsV2Statement("occurrences.v12_candidates", v12CandidatesSql(s)),
+      [participantId, stream, now, dayFromNumber(fromDay), dayFromNumber(throughDay)]);
+    addCandidates(candidates, v12.rows, fromDay, throughDay);
+  }
+  const corrections = stream === "usage" && scope.correctionActive;
+  if (corrections) {
+    const archive = await client.query<Record<string, unknown>>(
+      analyticsV2Statement("occurrences.correction_candidates", correctionCandidatesSql(s)),
+      [ownerDigest, fromDay * DAY_MS, (throughDay + 1) * DAY_MS]);
+    addCandidates(candidates, archive.rows, fromDay, throughDay);
+  }
+  let candidateCount = 0;
+  for (const byOccurrence of candidates.values()) candidateCount += byOccurrence.size;
+  if (candidateCount > maxCandidates) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
+  const expandV12 = stream === "usage" ? scope.v12HeadActive : scope.v12RuntimeActive;
+  const occurrenceIds = [...new Set([...candidates.values()].flatMap((byOccurrence) => [...byOccurrence.keys()]))]
+    .sort(compareText);
+  return { candidates, corrections, expandV12, occurrenceIds };
+}
+
+/**
  * Read one owner's effective occurrences for one stream over
  * [fromDay, throughDay], grouped by observed day. Days without candidates
  * are absent from the map (absence is "no evidence", never zero). Throws
@@ -1012,34 +1105,8 @@ export async function readOwnerOccurrences(
     const streamBinds = [ownerDigest, participantId, STREAM_CODES[stream], stream];
 
     // 1. Candidates per observed day.
-    const candidates = new Map<number, Map<string, Candidate>>();
-    if (scope.v1Namespace !== null || scope.v11Namespace !== null) {
-      const legacy = await client.query<Record<string, unknown>>(legacyCandidatesSql(s),
-        [...streamBinds, fromDay, throughDay]);
-      addCandidates(candidates, legacy.rows, fromDay, throughDay);
-    }
-    if (scope.v12HeadActive) {
-      const v12 = await client.query<Record<string, unknown>>(v12CandidatesSql(s),
-        [participantId, stream, now, dayFromNumber(fromDay), dayFromNumber(throughDay)]);
-      addCandidates(candidates, v12.rows, fromDay, throughDay);
-    }
-    const corrections = stream === "usage" && scope.correctionActive;
-    if (corrections) {
-      const archive = await client.query<Record<string, unknown>>(correctionCandidatesSql(s),
-        [ownerDigest, fromDay * DAY_MS, (throughDay + 1) * DAY_MS]);
-      addCandidates(candidates, archive.rows, fromDay, throughDay);
-    }
-    let candidateCount = 0;
-    for (const byOccurrence of candidates.values()) candidateCount += byOccurrence.size;
-    if (candidateCount > maxCandidates) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
-
-    // 2. Expand every candidate group across all days. Production expands
-    // v1.2 usage sources only for a participant with a v1.2 head
-    // (readV12EffectiveUsageSources), and v1.2 quota/session sources whenever
-    // the v1.2 runtime is active (readEffectiveTelemetryOwnerDayPage).
-    const expandV12 = stream === "usage" ? scope.v12HeadActive : scope.v12RuntimeActive;
-    const occurrenceIds = [...new Set([...candidates.values()].flatMap((byOccurrence) => [...byOccurrence.keys()]))]
-      .sort(compareText);
+    const { candidates, corrections, expandV12, occurrenceIds } = await readCandidates(client, s, now, scope,
+      { ownerDigest, stream, fromDay, throughDay, maxCandidates });
     const direct = new Map<string, TypedTelemetryCompatibilityRecord[]>();
     const v12 = new Map<string, TelemetryV12EffectiveRecord[]>();
     const facts = new Map<string, TelemetryUsageCorrectionFactRow[]>();
@@ -1047,45 +1114,49 @@ export async function readOwnerOccurrences(
       const group = target.get(id);
       if (group) group.push(value); else target.set(id, [value]);
     };
-    for (const batch of chunks(occurrenceIds, EXPANSION_BATCH)) {
-      const encoded = batch.map(occurrenceHex);
-      const requested = new Set(batch);
-      if (scope.v1Namespace !== null || scope.v11Namespace !== null) {
-        const rows = await client.query<LegacyRow>(legacySourcesSql(s), [...streamBinds, encoded]);
-        if (rows.rows.length > MAX_BATCH_SOURCE_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
-        const decoded: TypedTelemetryCompatibilityRecord[] = [];
-        for (const row of rows.rows) decoded.push(await decodeLegacyRow(row, participantId, sourceNamespace, stream));
-        // d43c8f92 readSourceBatches order: (occurrence id, physical row id).
-        const physical = new Map(rows.rows.map((row, index) => [decoded[index]!, safeInteger(row.storage_row_id, 1)]));
-        decoded.sort((left, right) => compareText(left.occurrence_id, right.occurrence_id)
-          || physical.get(left)! - physical.get(right)!);
-        for (const row of decoded) {
-          if (!requested.has(row.occurrence_id)) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
-          push(direct, row.occurrence_id, row);
+    const statements = await readerStatements(s);
+    const batches = chunks(occurrenceIds, EXPANSION_BATCH);
+    if (batches.length > 0) await withGenericPlans(client, async () => {
+      for (const batch of batches) {
+        const encoded = batch.map(occurrenceHex);
+        const requested = new Set(batch);
+        if (scope.v1Namespace !== null || scope.v11Namespace !== null) {
+          const rows = await queryPrepared<LegacyRow>(client, statements.legacySources, [...streamBinds, encoded]);
+          if (rows.rows.length > MAX_BATCH_SOURCE_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
+          const decoded: TypedTelemetryCompatibilityRecord[] = [];
+          for (const row of rows.rows) decoded.push(await decodeLegacyRow(row, participantId, sourceNamespace, stream));
+          // d43c8f92 readSourceBatches order: (occurrence id, physical row id).
+          const physical = new Map(rows.rows.map((row, index) => [decoded[index]!, safeInteger(row.storage_row_id, 1)]));
+          decoded.sort((left, right) => compareText(left.occurrence_id, right.occurrence_id)
+            || physical.get(left)! - physical.get(right)!);
+          for (const row of decoded) {
+            if (!requested.has(row.occurrence_id)) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+            push(direct, row.occurrence_id, row);
+          }
+        }
+        if (expandV12) {
+          const rows = await queryPrepared<V12StorageRow>(client, statements.v12Sources,
+            [participantId, stream, now, encoded, MAX_BATCH_V12_ROWS + 1]);
+          if (rows.rows.length > MAX_BATCH_V12_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
+          for (const row of rows.rows) {
+            const record = await decodeV12Row(stream, row);
+            if (!requested.has(record.occurrenceId)) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+            push(v12, record.occurrenceId, record);
+          }
+        }
+        if (corrections) {
+          const rows = await queryPrepared<Record<string, unknown>>(client, statements.correctionSources,
+            [ownerDigest, encoded, MAX_BATCH_SOURCE_ROWS + 1]);
+          if (rows.rows.length > MAX_BATCH_SOURCE_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
+          for (const row of rows.rows) {
+            const fact = await parseCorrectionFact(row);
+            if (fact.ownerDigest !== ownerDigest || fact.participantId !== participantId
+                || !requested.has(fact.source.occurrenceId)) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+            push(facts, fact.source.occurrenceId, fact);
+          }
         }
       }
-      if (expandV12) {
-        const rows = await client.query<V12StorageRow>(v12OccurrencesSql(s),
-          [participantId, stream, now, encoded, MAX_BATCH_V12_ROWS + 1]);
-        if (rows.rows.length > MAX_BATCH_V12_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
-        for (const row of rows.rows) {
-          const record = await decodeV12Row(stream, row);
-          if (!requested.has(record.occurrenceId)) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
-          push(v12, record.occurrenceId, record);
-        }
-      }
-      if (corrections) {
-        const rows = await client.query<Record<string, unknown>>(correctionVariantsSql(s),
-          [ownerDigest, encoded, MAX_BATCH_SOURCE_ROWS + 1]);
-        if (rows.rows.length > MAX_BATCH_SOURCE_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
-        for (const row of rows.rows) {
-          const fact = await parseCorrectionFact(row);
-          if (fact.ownerDigest !== ownerDigest || fact.participantId !== participantId
-              || !requested.has(fact.source.occurrenceId)) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
-          push(facts, fact.source.occurrenceId, fact);
-        }
-      }
-    }
+    });
 
     // 3. Reconcile per observed day with the vendored d43c8f92 kernels.
     const output = new Map<AnalyticsV2Day, EffectiveTelemetryOccurrence[]>();
@@ -1158,9 +1229,9 @@ export async function countOwnerOccurrences(
     }
     const counts = new Map<AnalyticsV2Day, number>();
     if (sources.length === 0) return counts;
-    const result = await client.query<Record<string, unknown>>(
+    const result = await client.query<Record<string, unknown>>(analyticsV2Statement("occurrences.counts",
       `SELECT observed_day,count(*)::text AS occurrences FROM (${sources.join("\nUNION\n")}) candidate
-        GROUP BY observed_day ORDER BY observed_day`, values);
+        GROUP BY observed_day ORDER BY observed_day`), values);
     for (const row of result.rows) {
       const day = safeInteger(row.observed_day, -100_000, 100_000);
       if (day < fromDay || day > throughDay) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
@@ -1205,8 +1276,8 @@ export async function readOwnerFirstEvidenceDay(
       const day = safeInteger(value, fromDay, throughDay);
       if (first === null || day < first) first = day;
     };
-    const firstOf = (sql: string): string =>
-      `SELECT min(candidate.observed_day)::integer AS first_day FROM (${sql}) candidate`;
+    const firstOf = (sql: string): string => analyticsV2Statement("occurrences.first_evidence",
+      `SELECT min(candidate.observed_day)::integer AS first_day FROM (${sql}) candidate`);
     for (const stream of ["usage", "quota", "session"] as const) {
       if (scope.v1Namespace !== null || scope.v11Namespace !== null) {
         take((await client.query<Record<string, unknown>>(firstOf(legacyCandidatesSql(s)),
@@ -1222,5 +1293,194 @@ export async function readOwnerFirstEvidenceDay(
       }
     }
     return first === null ? null : dayFromNumber(first);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Evidence identity (K-READ): the owner watermark W(o) and the day fingerprint F(o,d)
+// ---------------------------------------------------------------------------
+
+/**
+ * Version of the fingerprint and watermark constructions below (v2: both
+ * carry the community aggregate exclusions, N-EXCL).
+ */
+export const ANALYTICS_V2_EVIDENCE_IDENTITY_METHOD = "analytics-v2-evidence-identity-v2" as const;
+
+/** A driver row as canonical data: bytea as hex, every column by name. */
+function canonicalRow(row: Record<string, unknown>): Array<[string, unknown]> {
+  return Object.keys(row).sort().map((key) => {
+    const value = row[key];
+    return [key, value instanceof Uint8Array ? `\\x${Buffer.from(value).toString("hex")}`
+      : value instanceof Date ? value.toISOString() : value ?? null];
+  });
+}
+
+/**
+ * F(o,d) for every day of [fromDay, throughDay] on which the owner has a
+ * candidate in any stream: a sha256 over each stream's candidates of the day
+ * (occurrence id and candidate time, in reader order) and, for each of them,
+ * every source row the reader's expansion selects for that occurrence on any
+ * day (all columns of the legacy, v1.2 and correction rows, in physical
+ * order), with the owner scope that decides which families are read, and the
+ * participant's active community aggregate exclusions that cover d (N-EXCL:
+ * id and interval, exclusions.ts), which decide whether the owner's d enters
+ * the community aggregates. It runs exactly the reader's statements (the same
+ * candidate SQL and the same prepared expansion statements) and skips
+ * decoding and reconciliation, so an unchanged F(o,d) means
+ * readOwnerOccurrences returns the same occurrences for (o, d), and so the
+ * same analyticsV2DayDigest, and the same exclusion of (o, d): the reader's
+ * output is a pure function of the scope, the candidates and those rows. A day absent
+ * from the map has no candidate (known empty); the reader's refusals
+ * (ANALYTICS_V2_SOURCE_*) are the reader's here too. Content-free: the
+ * fingerprint is a digest of rows the snapshot already holds, never stored
+ * with them.
+ */
+export async function readOwnerDayFingerprints(
+  context: AnalyticsV2SnapshotContext,
+  options: Omit<ReadOwnerOccurrencesOptions, "stream">,
+): Promise<Map<AnalyticsV2Day, string>> {
+  const s = quotedSchema(context.schema);
+  const now = nowTimestamp(context.nowMs);
+  const base = normalizeOptions({ ...options, stream: "usage" } as ReadOwnerOccurrencesOptions);
+  return onReadSnapshot(context, async (client) => {
+    const scope = await readOwnerScope(client, s, base.ownerDigest);
+    const scopeKey = [scope.participantId, scope.v1Namespace, scope.v11Namespace, scope.correctionActive,
+      scope.v12RuntimeActive, scope.v12HeadActive];
+    const exclusions = await readParticipantActiveExclusions(client, s, scope.participantId);
+    const statements = await readerStatements(s);
+    const byDay = new Map<number, Record<EffectiveTelemetryStream, string | null>>();
+    for (const stream of ["usage", "quota", "session"] as const) {
+      const { candidates, corrections, expandV12, occurrenceIds } = await readCandidates(client, s, now, scope,
+        { ...base, stream });
+      const streamBinds = [base.ownerDigest, scope.participantId, STREAM_CODES[stream], stream];
+      // Each occurrence's selected source rows, digested once.
+      const sourceDigests = new Map<string, string>();
+      const batches = chunks(occurrenceIds, EXPANSION_BATCH);
+      if (batches.length > 0) await withGenericPlans(client, async () => {
+        for (const batch of batches) {
+          const encoded = batch.map(occurrenceHex);
+          const byOccurrence = new Map<string, { legacy: unknown[]; v12: unknown[]; facts: unknown[] }>(
+            batch.map((id) => [id, { legacy: [], v12: [], facts: [] }]));
+          const keyed = (blob: unknown) => byOccurrence.get(occurrenceText(blob)) ?? sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+          if (scope.v1Namespace !== null || scope.v11Namespace !== null) {
+            const rows = await queryPrepared<LegacyRow>(client, statements.legacySources, [...streamBinds, encoded]);
+            if (rows.rows.length > MAX_BATCH_SOURCE_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
+            const ordered = [...rows.rows].sort((left, right) =>
+              safeInteger(left.storage_row_id, 1) - safeInteger(right.storage_row_id, 1));
+            for (const row of ordered) keyed(row.occurrence_id).legacy.push(canonicalRow(row as unknown as Record<string, unknown>));
+          }
+          if (expandV12) {
+            const rows = await queryPrepared<V12StorageRow>(client, statements.v12Sources,
+              [scope.participantId, stream, now, encoded, MAX_BATCH_V12_ROWS + 1]);
+            if (rows.rows.length > MAX_BATCH_V12_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
+            for (const row of rows.rows) keyed(row.occurrence_id).v12.push(canonicalRow(row));
+          }
+          if (corrections) {
+            const rows = await queryPrepared<Record<string, unknown>>(client, statements.correctionSources,
+              [base.ownerDigest, encoded, MAX_BATCH_SOURCE_ROWS + 1]);
+            if (rows.rows.length > MAX_BATCH_SOURCE_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
+            for (const row of rows.rows) keyed(row.occurrence_id).facts.push(canonicalRow(row));
+          }
+          for (const [id, sources] of byOccurrence) {
+            sourceDigests.set(id, await sha256Hex(canonicalJson([sources.legacy, sources.v12, sources.facts])));
+          }
+        }
+      });
+      for (const [day, byOccurrence] of candidates) {
+        const ordered = [...byOccurrence.values()].sort(compareCandidates)
+          .map((candidate) => [candidate.occurrence_id, candidate.observed_at_ms, sourceDigests.get(candidate.occurrence_id)!]);
+        const entry = byDay.get(day) ?? { usage: null, quota: null, session: null };
+        entry[stream] = await sha256Hex(canonicalJson([ANALYTICS_V2_EVIDENCE_IDENTITY_METHOD, stream, dayFromNumber(day),
+          scopeKey, ordered]));
+        byDay.set(day, entry);
+      }
+    }
+    const output = new Map<AnalyticsV2Day, string>();
+    for (const day of [...byDay.keys()].sort((left, right) => left - right)) {
+      const entry = byDay.get(day)!;
+      const covering = analyticsV2ExclusionsOn(exclusions, dayFromNumber(day))
+        .map((exclusion) => [exclusion.exclusionId, exclusion.effectiveAtUs, exclusion.expiresAtUs]);
+      output.set(dayFromNumber(day), await sha256Hex(canonicalJson([ANALYTICS_V2_EVIDENCE_IDENTITY_METHOD,
+        dayFromNumber(day), entry.usage, entry.quota, entry.session, covering])));
+    }
+    return output;
+  });
+}
+
+/** Owners one watermark statement reads (the roster is paged by this). */
+export const MAX_ANALYTICS_V2_WATERMARK_OWNERS = 1_000;
+
+/**
+ * W(o) for each of `ownerDigests`: a sha256 over the owner's monotonic
+ * journal head (storage_owner_revisions: revision, authority epoch, state,
+ * last sequence, content digest), its active owner link and participant
+ * state, the reader's retained v1.2 authorization scope rows for the
+ * participant at the pinned clock, the participant's v1.2 domain head, its
+ * community aggregate exclusion rows of any state (N-EXCL), and the runtime
+ * and admission states that decide which source families the reader reads.
+ * One statement covers every requested owner. An owner without
+ * an active link or journal head gets the digest of its absence, never an
+ * inferred value.
+ *
+ * Advisory (K-READ): the incremental planner (K-INCR) may skip an owner only
+ * once its mutation tests prove that every intake, correction, generation
+ * replacement and link change moves one of these inputs; until then nothing
+ * reads W(o) to skip work, and F(o,d) is the evidence identity of record.
+ */
+export async function readOwnerWatermarks(context: AnalyticsV2SnapshotContext,
+  ownerDigests: readonly string[]): Promise<Map<string, string>> {
+  if (!Array.isArray(ownerDigests) || ownerDigests.length > MAX_ANALYTICS_V2_WATERMARK_OWNERS
+      || !ownerDigests.every((digest) => typeof digest === "string" && ANALYTICS_V2_OWNER_DIGEST_PATTERN.test(digest))
+      || new Set(ownerDigests).size !== ownerDigests.length) {
+    sourceFail("ANALYTICS_V2_SOURCE_INVALID");
+  }
+  const s = quotedSchema(context.schema);
+  const now = nowTimestamp(context.nowMs);
+  return onReadSnapshot(context, async (client) => {
+    const output = new Map<string, string>();
+    if (ownerDigests.length === 0) return output;
+    const result = await client.query<Record<string, unknown>>(analyticsV2Statement("occurrences.watermark",
+      `WITH requested AS MATERIALIZED (
+         SELECT DISTINCT value AS owner_digest FROM unnest($1::text[]) value
+       ), retained AS MATERIALIZED (
+         ${v12RetainedAuthorizationScopeSql(s, "$2::timestamptz", "reader")}
+       )
+       SELECT requested.owner_digest,
+              link.participant_id,
+              participant.state AS participant_state,
+              owner_revision.revision::text AS revision,
+              owner_revision.authority_epoch::text AS authority_epoch,
+              owner_revision.state AS owner_state,
+              owner_revision.last_sequence::text AS last_sequence,
+              owner_revision.content_digest,
+              (SELECT string_agg(retained.device_id, ',' ORDER BY retained.device_id COLLATE "C")
+                 FROM retained WHERE retained.participant_id = link.participant_id) AS retained_devices,
+              (SELECT head.generation_id FROM ${s}.telemetry_v12_domain_heads head
+                WHERE head.participant_id = link.participant_id) AS v12_generation_id,
+              ${participantExclusionsWatermarkSql(s, "link.participant_id")} AS exclusions,
+              (SELECT state FROM ${s}.telemetry_v12_runtime WHERE id = 1) AS v12_state,
+              ${correctionRuntimeActiveSql(s)} AS correction_active,
+              (SELECT namespace_id::text || ':' || source_namespace FROM ${s}.typed_v1_admission_state
+                WHERE id = 1 AND runtime_contract_version = 1) AS v1_namespace,
+              (SELECT namespace_id::text || ':' || source_namespace FROM ${s}.typed_v11_admission_state
+                WHERE id = 1 AND runtime_contract_version = 1) AS v11_namespace
+         FROM requested
+         LEFT JOIN ${s}.storage_v11_owner_links link
+           ON link.owner_digest = requested.owner_digest AND link.state = 'active'
+         LEFT JOIN ${s}.participants participant ON participant.id = link.participant_id
+         LEFT JOIN ${s}.storage_source_state source ON source.singleton = 1
+         LEFT JOIN ${s}.storage_owner_revisions owner_revision
+           ON owner_revision.source_id = source.source_id AND owner_revision.owner_digest = requested.owner_digest
+        ORDER BY requested.owner_digest`), [[...ownerDigests], now]);
+    for (const row of result.rows) {
+      const digest = row.owner_digest;
+      if (typeof digest !== "string" || output.has(digest) || !ownerDigests.includes(digest)) {
+        sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+      }
+      output.set(digest, await sha256Hex(canonicalJson([ANALYTICS_V2_EVIDENCE_IDENTITY_METHOD, "watermark",
+        canonicalRow(row)])));
+    }
+    if (output.size !== ownerDigests.length) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+    return output;
   });
 }

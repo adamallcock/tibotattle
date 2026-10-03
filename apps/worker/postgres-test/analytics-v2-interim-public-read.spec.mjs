@@ -29,6 +29,7 @@ import { readPostgresMigrations } from "../cloud-run/postgres-migrations.mjs";
 import { classifyContractOperations } from "../cloud-run/postgres-production-migrations.mjs";
 import {
   applyStockAndStagedMigrations,
+  defaultAnalyticsV2FixtureStamps,
   listStagedMigrations,
   postgresTestEndpoint,
 } from "./staged-migrations-harness.mjs";
@@ -121,6 +122,7 @@ async function createSchema() {
   schemas.push(schema);
   await pool.query(`CREATE SCHEMA "${schema}"`);
   await applyStockAndStagedMigrations({ role: "primary", schema, pool, stagedFiles: [migrationName] });
+  await defaultAnalyticsV2FixtureStamps(pool, schema);
   await pool.query(`UPDATE ${q(schema, "collection_controls")} SET revision = revision + 1,
       control_state = 'operational', enrollment_enabled = true, upload_registration_enabled = true,
       processing_enabled = true, publication_enabled = true, reason_code = 'maintenance',

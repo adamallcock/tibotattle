@@ -25,7 +25,7 @@ import type { PostgresPool } from "../postgres-client";
 import type { WorkerRouteMethod } from "../route-registry";
 
 /** Version of this contract; bump with any name or shape change. */
-export const ANALYTICS_V2_CONTRACT_VERSION = "analytics-v2-contract-v0.4" as const;
+export const ANALYTICS_V2_CONTRACT_VERSION = "analytics-v2-contract-v0.5" as const;
 
 /**
  * The analytics_v2 migration: primary role, runtime schema, number assigned in
@@ -64,6 +64,8 @@ export const ANALYTICS_V2_TABLES = Object.freeze({
   publishedDaily: "analytics_v2_published_daily",
   preview: "analytics_v2_preview",
   journalCursor: "analytics_v2_journal_cursor",
+  // K-STAMP (staged migration analytics_v2_run_stamps): kernel-registry.json's copy.
+  kernels: "analytics_v2_kernels",
 } as const);
 export type AnalyticsV2TableKey = keyof typeof ANALYTICS_V2_TABLES;
 export type AnalyticsV2TableName = (typeof ANALYTICS_V2_TABLES)[AnalyticsV2TableKey];
@@ -87,19 +89,25 @@ export type AnalyticsV2CacheBandCounter = (typeof ANALYTICS_V2_CACHE_BAND_COUNTE
 export const ANALYTICS_V2_COLUMNS = Object.freeze({
   runs: Object.freeze([
     "run_id", "started_at", "finished_at", "mode", "state", "owners", "owner_days",
-    "refusals", "publication", "timings",
+    "refusals", "publication", "timings", "kernel_id", "manifest_version", "compatibility_sha256",
+    "exclusions_sha256",
   ] as const),
-  ownerDay: Object.freeze(["owner_digest", "day", "daily", "refusal", "run_id"] as const),
+  ownerDay: Object.freeze(["owner_digest", "day", "daily", "refusal", "run_id", "kernel_id", "manifest_version"] as const),
   cacheBands: Object.freeze([
     "owner_digest", "day", "model", "effort", "band", ...ANALYTICS_V2_CACHE_BAND_COUNTERS, "run_id",
+    "kernel_id", "manifest_version",
   ] as const),
-  ownerFits: Object.freeze(["owner_digest", "as_of_day", "fits", "run_id"] as const),
-  ownerModelDates: Object.freeze(["owner_digest", "day", "result", "run_id"] as const),
+  ownerFits: Object.freeze(["owner_digest", "as_of_day", "fits", "run_id", "kernel_id", "manifest_version"] as const),
+  ownerModelDates: Object.freeze(["owner_digest", "day", "result", "run_id", "kernel_id", "manifest_version"] as const),
   publishedDaily: Object.freeze([
-    "day", "revision", "released_at", "payload", "payload_sha256", "run_id",
+    "day", "revision", "released_at", "payload", "payload_sha256", "run_id", "kernel_id", "manifest_version",
   ] as const),
-  preview: Object.freeze(["id", "preview", "computed_at", "run_id"] as const),
+  preview: Object.freeze(["id", "preview", "computed_at", "run_id", "kernel_id", "manifest_version"] as const),
   journalCursor: Object.freeze(["id", "last_sequence", "run_id"] as const),
+  kernels: Object.freeze([
+    "kernel_id", "production_commit", "vendor_manifest_sha256", "compute_closure_sha256",
+    "price_registry_sha256", "price_registry_version", "method_version", "registered_at",
+  ] as const),
 } as const satisfies Record<AnalyticsV2TableKey, readonly string[]>);
 
 /** Primary keys. Singletons (preview, journal cursor) use id = 1. */
@@ -112,6 +120,7 @@ export const ANALYTICS_V2_PRIMARY_KEYS = Object.freeze({
   publishedDaily: Object.freeze(["day"] as const),
   preview: Object.freeze(["id"] as const),
   journalCursor: Object.freeze(["id"] as const),
+  kernels: Object.freeze(["kernel_id"] as const),
 } as const satisfies Record<AnalyticsV2TableKey, readonly string[]>);
 
 export const ANALYTICS_V2_SINGLETON_ID = 1 as const;

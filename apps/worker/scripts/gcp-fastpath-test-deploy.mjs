@@ -266,17 +266,28 @@ export function migrateJobCommand({ image, expectedCounts }) {
  * the task timeout is two hours.
  *
  * dense: the dense-owner measurement profile (receipt
- * docs/receipts/2026-10-01-gcp-dense-owner-parity.md). A 16 GiB task (Cloud
- * Run needs 4 vCPU for it) with a 12,288 MiB heap and a 10,752 MiB budget,
- * which the memory model says admits the largest real owner (about 2.52
- * million records) even when every record falls in the 170 analysis days.
- * Compute stays single-threaded; the extra vCPUs are Cloud Run's minimum for
- * the memory and serve the garbage collector and the database driver. Four
- * hours of task time cover the local dense run several times over.
+ * docs/receipts/2026-10-01-gcp-dense-owner-parity.md), which is the
+ * production profile (OPS-2's ANALYTICS_REFRESH_TASK_PROFILE pins the two
+ * equal). A 16 GiB task (Cloud Run needs 4 vCPU for it) with a 12,288 MiB
+ * heap and a 10,752 MiB budget, which the memory model says admits the
+ * largest real owner (about 2.52 million records) even when every record
+ * falls in the 170 analysis days. Compute stays inline (one owner at a time);
+ * the extra vCPUs are Cloud Run's minimum for the memory and serve the
+ * garbage collector and the database driver. Four hours of task time cover
+ * the local dense run several times over.
+ *
+ * dense-workers: the same task and budget with four compute Workers (K-PAR,
+ * one per vCPU, the largest owner alone) and a 3,072 MiB main heap (runtime,
+ * one read chunk, the output account). It is the MEAS-3 measurement of the
+ * Workers' heap peaks on real owners, which the production profile waits for
+ * (K-CORE-A review); it is not the production profile.
  */
 export const REFRESH_JOB_PROFILES = Object.freeze({
-  standard: Object.freeze({ cpu: 2, memory: "8Gi", heapMiB: 6_144, taskTimeoutSeconds: 7_200, env: Object.freeze([]) }),
-  dense: Object.freeze({ cpu: 4, memory: "16Gi", heapMiB: 12_288, taskTimeoutSeconds: 14_400,
+  standard: Object.freeze({ cpu: 2, memory: "8Gi", heapMiB: 6_144, workers: 1, taskTimeoutSeconds: 7_200,
+    env: Object.freeze([]) }),
+  dense: Object.freeze({ cpu: 4, memory: "16Gi", heapMiB: 12_288, workers: 1, taskTimeoutSeconds: 14_400,
+    env: Object.freeze([Object.freeze(["ANALYTICS_V2_MEMORY_BUDGET_MIB", "10752"])]) }),
+  "dense-workers": Object.freeze({ cpu: 4, memory: "16Gi", heapMiB: 3_072, workers: 4, taskTimeoutSeconds: 14_400,
     env: Object.freeze([Object.freeze(["ANALYTICS_V2_MEMORY_BUDGET_MIB", "10752"])]) }),
 });
 /** The default (standard) profile; the local rehearsal runs its heap. */
@@ -301,6 +312,7 @@ export function refreshJobCommand({ image, now, schema, extraEnv = [], extraArgs
     `--max-old-space-size=${resources.heapMiB}`,
     "dist/analytics-refresh.mjs", "--mode=full", `--schema=${primarySchemaOf(schema)}`,
     ...(now === undefined ? [] : [`--now=${now}`]),
+    ...(resources.workers > 1 ? [`--workers=${resources.workers}`] : []),
     ...extraArgs,
   ];
   if (args.some((arg) => /[,\s]/u.test(arg))) fail("FASTPATH_DEPLOY_ARGS_INVALID");
@@ -724,7 +736,8 @@ Steps:
                    skips with its reason when a chain stage is absent at --commit; refresh and origin then read
                    that schema at the golden's clock unless --schema/--now say otherwise
   refresh          deploy + execute ${FASTPATH_TEST.refreshJob} (--refresh-profile: standard 2 vCPU, 8 GiB,
-                   heap 6,144 MiB, 2 h; dense 4 vCPU, 16 GiB, heap 12,288 MiB, budget 10,752 MiB, 4 h)
+                   heap 6,144 MiB, 2 h; dense 4 vCPU, 16 GiB, heap 12,288 MiB, budget 10,752 MiB, 4 h;
+                   dense-workers: dense with four compute Workers and a 3,072 MiB main heap, for MEAS-3)
   origin           create/verify gs://${FASTPATH_TEST.originBucket}; ensure the runtime SA's one binding on it
                    (condition ${ORIGIN_BUCKET_RUNTIME_BINDING.condition.title}, read back; any other runtime binding is
                    refused); deploy IAM-private ${FASTPATH_TEST.originService}; journey SA is the only invoker; a seeded
@@ -751,7 +764,8 @@ Options:
   --dump=<path>           the golden's source dump when the golden commits only its digest (golden-dense);
                           refused unless its sha256 equals the golden manifest's sourceDump.jsonSha256;
                           seed, and origin over a seeded schema, refuse without it before any remote command
-  --refresh-profile=standard|dense   the refresh Job's task size (default: the corpus's, else standard)
+  --refresh-profile=standard|dense|dense-workers   the refresh Job's task size (default: the corpus's,
+                          else standard)
   --schema-suffix=<hex8>  seeded schema suffix (default: from the commit and the golden dump digest)
   --replace-seed          drop and re-seed a seeded schema that lacks its completion marker
   --schema=<schema>       primary schema for refresh/origin: ${FASTPATH_TEST.primarySchema}

@@ -16,6 +16,7 @@ import { lstat, realpath, stat } from "node:fs/promises";
 import { test } from "node:test";
 import pg from "pg";
 import { applyPostgresMigrations } from "../cloud-run/postgres-migrations.mjs";
+import { defaultAnalyticsV2FixtureStamps } from "./staged-migrations-harness.mjs";
 
 const PG_TEST_HOST = process.env.PG_TEST_HOST;
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
@@ -214,6 +215,7 @@ test("PG17: deleting a participant cascades its raw rows, writes one receipt and
     assert.equal(Math.floor(server.rows[0].version / 10_000), 17);
     await pool.query(`CREATE SCHEMA "${schema}"`);
     await applyPostgresMigrations({ role: "primary", schema, pool });
+    await defaultAnalyticsV2FixtureStamps(pool, schema);
 
     // No online-erasure relation or function exists to call.
     for (const name of ["analytics_storage_erasure_fences", "analytics_storage_erasure_receipts",

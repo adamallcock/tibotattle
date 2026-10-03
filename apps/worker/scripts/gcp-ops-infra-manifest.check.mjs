@@ -15,6 +15,8 @@ import {
   ANALYTICS_REFRESH_PRODUCTION_ENV,
   ANALYTICS_REFRESH_PRODUCTION_JOB,
   ANALYTICS_REFRESH_RESOURCE_ENV,
+  ANALYTICS_REFRESH_TASK_MEMORY_CHECK,
+  ANALYTICS_REFRESH_WORKER_HEAP_RESERVE_BYTES,
   analyticsRefreshResources,
   analyticsRefreshTaskTimeoutMs,
   parseAnalyticsRefreshArguments,
@@ -101,6 +103,8 @@ async function assertRefreshRenderIsProductionJob(job, desired) {
   assert.deepEqual(container.args, [...profile.args]);
   assert.equal(container.args[0], `--max-old-space-size=${profile.heapMiB}`);
   assert.equal(container.args[1], profile.entry);
+  assert.equal(parseAnalyticsRefreshArguments(container.args.slice(2), {
+    ...Object.fromEntries(container.env.map((entry) => [entry.name, entry.value])) }).workers, profile.workers);
   assert.deepEqual(container.resources, { limits: { cpu: profile.cpu, memory: profile.memory } });
   assert.equal(task.timeoutSeconds, String(profile.taskTimeoutSeconds));
   assert.equal(task.maxRetries, profile.maxRetries);
@@ -239,14 +243,14 @@ test("the analytics-refresh job renders the production refresh-job contract in t
   assert.deepEqual({ ...manifest.DEFERRED_JOBS }, {});
   assert.deepEqual([...manifest.deployedJobNames()], ["production-migrate", "analytics-refresh", "maintenance"]);
   assert.deepEqual({ ...manifest.ANALYTICS_REFRESH_TASK_PROFILE }, { name: "dense", cpu: "4", memory: "16Gi",
-    heapMiB: 12_288, memoryBudgetMiB: 10_752, timeoutSeconds: 14_400 });
+    heapMiB: 12_288, memoryBudgetMiB: 10_752, workers: 1, timeoutSeconds: 14_400 });
   // It is the dense measurement profile (MEAS-3 runs it), field for field,
   // including the budget that profile sets, so the two cannot drift.
   const dense = REFRESH_JOB_PROFILES.dense;
-  assert.deepEqual({ cpu: String(dense.cpu), memory: dense.memory, heapMiB: dense.heapMiB,
+  assert.deepEqual({ cpu: String(dense.cpu), memory: dense.memory, heapMiB: dense.heapMiB, workers: dense.workers,
     timeoutSeconds: dense.taskTimeoutSeconds, env: dense.env.map((entry) => [...entry]) }, {
     cpu: manifest.ANALYTICS_REFRESH_TASK_PROFILE.cpu, memory: manifest.ANALYTICS_REFRESH_TASK_PROFILE.memory,
-    heapMiB: manifest.ANALYTICS_REFRESH_TASK_PROFILE.heapMiB,
+    heapMiB: manifest.ANALYTICS_REFRESH_TASK_PROFILE.heapMiB, workers: manifest.ANALYTICS_REFRESH_TASK_PROFILE.workers,
     timeoutSeconds: manifest.ANALYTICS_REFRESH_TASK_PROFILE.timeoutSeconds,
     env: [["ANALYTICS_V2_MEMORY_BUDGET_MIB", String(manifest.ANALYTICS_REFRESH_TASK_PROFILE.memoryBudgetMiB)]] });
   for (const value of [unmarked(), unmarked(stagingNames)]) {
@@ -254,7 +258,8 @@ test("the analytics-refresh job renders the production refresh-job contract in t
     const job = manifest.renderJob(desired, "analytics-refresh", IMAGE);
     const task = job.spec.template.spec.template.spec;
     const container = task.containers[0];
-    // node --max-old-space-size=<heap> dist/analytics-refresh.mjs --mode=full, nothing else.
+    // node --max-old-space-size=<heap> dist/analytics-refresh.mjs --mode=full, nothing else: owners are
+    // computed inline until MEAS-3 measures the compute Workers (K-CORE-A review).
     assert.deepEqual(container.command, ["node"]);
     assert.deepEqual(container.args, ["--max-old-space-size=12288", "dist/analytics-refresh.mjs", "--mode=full"]);
     assert.deepEqual(container.resources, { limits: { cpu: "4", memory: "16Gi" } });
@@ -283,15 +288,25 @@ test("the analytics-refresh job renders the production refresh-job contract in t
     assert.equal(parsed.mode, "full");
     assert.equal(parsed.schema, desired.cloudSql.schema);
     assert.equal(parsed.nowMs, null);
-    // Its resource gate admits the rendered budget under the profile's heap,
-    // and refuses it under a heap one MiB short of budget plus reserve.
+    assert.equal(parsed.workers, 1);
+    // Its resource gate admits the rendered budget under the profile's heap
+    // (inline: the budget is inside the heap), and refuses it under a heap
+    // one MiB short of budget plus reserve.
     const MIB = 1024 * 1024;
     const heap = manifest.ANALYTICS_REFRESH_TASK_PROFILE.heapMiB * MIB;
-    const resources = analyticsRefreshResources(env, heap);
+    const resources = analyticsRefreshResources(env, heap, { workers: parsed.workers });
     assert.equal(resources.compute.memoryBudgetBytes, 10_752 * MIB);
     assert.ok(resources.requiredHeapBytes <= heap);
-    assert.throws(() => analyticsRefreshResources(env, resources.requiredHeapBytes - MIB),
+    assert.throws(() => analyticsRefreshResources(env, resources.requiredHeapBytes - MIB, { workers: parsed.workers }),
       { code: "ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT" });
+    // The task memory holds the heap (and, inline, no Worker heaps), with the
+    // native reserve left over.
+    const memory = ANALYTICS_REFRESH_TASK_MEMORY_CHECK;
+    assert.equal(memory.taskMemoryMiB, Number.parseInt(manifest.ANALYTICS_REFRESH_TASK_PROFILE.memory, 10) * 1024);
+    const workerMiB = manifest.ANALYTICS_REFRESH_TASK_PROFILE.workers > 1
+      ? manifest.ANALYTICS_REFRESH_TASK_PROFILE.memoryBudgetMiB + ANALYTICS_REFRESH_WORKER_HEAP_RESERVE_BYTES / MIB : 0;
+    assert.ok(manifest.ANALYTICS_REFRESH_TASK_PROFILE.heapMiB + workerMiB
+      <= memory.taskMemoryMiB - memory.nativeReserveMiB);
 
     // The render IS the entry's production job (C-REFRESH), field for field.
     await assertRefreshRenderIsProductionJob(job, desired);
@@ -306,6 +321,8 @@ test("the analytics-refresh job renders the production refresh-job contract in t
       ["8Gi", (value) => { containerOf(value).resources.limits.memory = "8Gi"; }],
       ["2 vCPU", (value) => { containerOf(value).resources.limits.cpu = "2"; }],
       ["heap 6144", (value) => { containerOf(value).args[0] = "--max-old-space-size=6144"; }],
+      ["four workers", (value) => { containerOf(value).args.push("--workers=4"); }],
+      ["one worker flag", (value) => { containerOf(value).args.push("--workers=1"); }],
       ["retries", (value) => { value.spec.template.spec.template.spec.maxRetries = 3; }],
       ["two tasks", (value) => { value.spec.template.spec.taskCount = 2; }],
       ["budget", (value) => { containerOf(value).env.find((entry) => entry.name === "ANALYTICS_V2_MEMORY_BUDGET_MIB")

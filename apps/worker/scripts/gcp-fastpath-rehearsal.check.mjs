@@ -29,6 +29,19 @@ test("the Q-1 rehearsal takes optional per-date and owner references", () => {
     [false, "/n/per-date-expected.json", "/n", null]);
 });
 
+test("K-CORE-A: staged primary migrations and compute Workers are opt-in and bounded", () => {
+  const plain = parseArguments(["--golden", "/g/golden"]);
+  assert.deepEqual([plain.stagedPrimary, plain.refreshWorkers], [[], 1]);
+  const options = parseArguments(["--golden", "/g/golden", "--staged-primary", "0911_analytics_v2_run_stamps.sql",
+    "--refresh-workers", "4"]);
+  assert.deepEqual([options.stagedPrimary, options.refreshWorkers], [["0911_analytics_v2_run_stamps.sql"], 4]);
+  for (const argv of [["--staged-primary", "../0911_x.sql"], ["--staged-primary", "kernel.sql"],
+    ["--staged-primary", "0911_a.sql", "--staged-primary", "0911_a.sql"], ["--refresh-workers", "0"],
+    ["--refresh-workers", "17"], ["--refresh-workers", "2.5"]]) {
+    assert.throws(() => parseArguments(["--golden", "/g", ...argv]), refused("REHEARSAL_ARGUMENT_INVALID"), argv.join(" "));
+  }
+});
+
 test("options are closed and bounded", () => {
   assert.throws(() => parseArguments([]), refused("REHEARSAL_GOLDEN_REQUIRED"));
   for (const argv of [["--golden"], ["--golden", "/g", "--dump"], ["--golden", "/g", "--dump", "--dense"],

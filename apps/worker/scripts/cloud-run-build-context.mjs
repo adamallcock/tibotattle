@@ -124,6 +124,12 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/owner-bootstrap.mjs", destination: "apps/worker/cloud-run/owner-bootstrap.mjs" }),
   Object.freeze({ source: "cloud-run/request-boundary.mjs", destination: "apps/worker/cloud-run/request-boundary.mjs" }),
   Object.freeze({ source: "cloud-run/analytics-refresh.mjs", destination: "apps/worker/cloud-run/analytics-refresh.mjs" }),
+  // K-CORE-A: the refresh Job's read side (K-SPLIT), its compute Worker pool
+  // and Worker entry (K-PAR), and the build-time kernel identity (K-STAMP).
+  Object.freeze({ source: "cloud-run/analytics-refresh-read.mjs", destination: "apps/worker/cloud-run/analytics-refresh-read.mjs" }),
+  Object.freeze({ source: "cloud-run/analytics-refresh-pool.mjs", destination: "apps/worker/cloud-run/analytics-refresh-pool.mjs" }),
+  Object.freeze({ source: "cloud-run/analytics-refresh-worker.mjs", destination: "apps/worker/cloud-run/analytics-refresh-worker.mjs" }),
+  Object.freeze({ source: "cloud-run/analytics-kernel-closure.mjs", destination: "apps/worker/cloud-run/analytics-kernel-closure.mjs" }),
   // The MP-2-lite maintenance Job and the production configuration it reads.
   Object.freeze({ source: "cloud-run/postgres-maintenance-job.mjs", destination: "apps/worker/cloud-run/postgres-maintenance-job.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-maintenance-job-contract.mjs", destination: "apps/worker/cloud-run/postgres-maintenance-job-contract.mjs" }),
