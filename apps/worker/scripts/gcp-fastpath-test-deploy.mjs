@@ -134,6 +134,21 @@ export const FASTPATH_MEASUREMENT = Object.freeze({
     ["log_parameter_max_length_on_error", "0"], ["log_statement", "none"], ["log_temp_files", "-1"],
     ["max_connections", "100"],
   ].map((pair) => Object.freeze(pair))),
+  // MEAS-SYNTH profiling: diagnostics production's instance does not run, set
+  // at creation so nothing restarts mid-run. pg_stat_statements tracks nested
+  // statements too, and I/O timing feeds its block times, pg_stat_io and
+  // pg_stat_database. meas-create refuses unless the version's flag listing
+  // names each of these.
+  diagnosticFlags: Object.freeze([["pg_stat_statements.track", "all"], ["track_io_timing", "on"]]
+    .map((pair) => Object.freeze(pair))),
+  // Applied only when the version's flag listing names them (meas-create
+  // records which): Cloud SQL loads pg_stat_statements by default where no
+  // such switch exists.
+  optionalDiagnosticFlags: Object.freeze([["cloudsql.enable_pg_stat_statements", "on"]]
+    .map((pair) => Object.freeze(pair))),
+  // Query Insights (standard, ENTERPRISE): on, with sampled plans, the longest
+  // query text, and neither client addresses nor application tags.
+  queryInsights: Object.freeze({ queryPlansPerMinute: 5, queryStringLength: 4_500 }),
   labels: Object.freeze({ app: "tibotattle", environment: "test", "managed-by": "claude-fastpath",
     purpose: "meas-prodtier" }),
   // The fast-path test identities: the seed's migrator and the Job's runtime user.
@@ -197,10 +212,11 @@ export const EDGE_TEST_UNMIRRORED_SETTINGS = Object.freeze({
 const SOURCE_IDENTITY = /^[A-Za-z0-9._:-]{1,200}$/u;
 const STEPS = Object.freeze([
   "build", "database", "migrate", "verify-database", "seed", "refresh", "refresh-idle", "refresh-uncapped", "origin",
-  "verify", "protected", "all", "meas-create", "meas-teardown",
+  "verify", "protected", "all", "meas-create", "meas-teardown", "meas-pgstat-enable", "meas-pgstat", "meas-metrics",
 ]);
 /** The steps --meas-instance applies to (the measurement estate has no migrate Job, origin or golden seed). */
-const MEASUREMENT_STEPS = Object.freeze(["meas-create", "meas-teardown", "refresh", "refresh-idle", "refresh-uncapped"]);
+const MEASUREMENT_STEPS = Object.freeze(["meas-create", "meas-teardown", "meas-pgstat-enable", "meas-pgstat",
+  "meas-metrics", "refresh", "refresh-idle", "refresh-uncapped"]);
 /** A Cloud SQL operation id (`sql instances create --async` names one). */
 const SQL_OPERATION = /^[a-z0-9][a-z0-9-]{0,99}$/u;
 /** The refresh job's own task-timeout setting (cloud-run/analytics-refresh.mjs TASK_TIMEOUT_SECONDS). */
@@ -465,16 +481,62 @@ export function measurementInstancesListed(listed) {
     .map((entry) => String(entry.name)).sort();
 }
 
-/** Create one measurement instance (asynchronously; meas-create waits on the operation). */
-export function measInstanceCreateCommand(instance) {
+/** Read-only: the database flags Cloud SQL supports for the measurement instance's version. */
+export function measFlagsListCommand() {
+  return gcloudArgs(["sql", "flags", "list", `--database-version=${FASTPATH_MEASUREMENT.databaseVersion}`,
+    `--project=${FASTPATH_TEST.project}`, "--format=json"]);
+}
+
+/**
+ * The flags a measurement instance is created with, from a flag listing
+ * (`sql flags list` entries, by name): production's mirrored flags and the
+ * required diagnostics always (refused, FASTPATH_DEPLOY_MEAS_FLAG_UNSUPPORTED,
+ * when the listing does not name one), the optional diagnostics when it names
+ * them. Sorted by name.
+ */
+export function measCreateFlags(listed) {
+  if (!Array.isArray(listed)) fail("FASTPATH_DEPLOY_JSON_INVALID", "sql flags list");
+  const supported = new Set(listed.map((entry) => entry?.name).filter((name) => typeof name === "string"));
   const m = FASTPATH_MEASUREMENT;
+  const unsupported = [...m.databaseFlags, ...m.diagnosticFlags].map(([name]) => name)
+    .filter((name) => !supported.has(name));
+  if (unsupported.length > 0) fail("FASTPATH_DEPLOY_MEAS_FLAG_UNSUPPORTED", unsupported.join(","));
+  const optional = m.optionalDiagnosticFlags.filter(([name]) => supported.has(name));
+  return Object.freeze({
+    flags: Object.freeze([...m.databaseFlags, ...m.diagnosticFlags, ...optional]
+      .sort(([left], [right]) => (left < right ? -1 : 1))),
+    optionalApplied: Object.freeze(optional.map(([name]) => name)),
+    optionalUnlisted: Object.freeze(m.optionalDiagnosticFlags.map(([name]) => name).filter((name) => !supported.has(name))),
+  });
+}
+
+/** Whether `flags` is exactly a set measCreateFlags can return (mirrored and required, optional ones only). */
+function measFlagsAllowed(flags) {
+  const m = FASTPATH_MEASUREMENT;
+  const required = [...m.databaseFlags, ...m.diagnosticFlags];
+  const allowed = new Map([...required, ...m.optionalDiagnosticFlags]);
+  return Array.isArray(flags) && required.every(([name, value]) => flags.some(([n, v]) => n === name && v === value))
+    && flags.every(([name, value]) => allowed.get(name) === value)
+    && new Set(flags.map(([name]) => name)).size === flags.length;
+}
+
+/** Create one measurement instance (asynchronously; meas-create waits on the operation). */
+export function measInstanceCreateCommand(instance, flags = measCreateFlags(
+  [...FASTPATH_MEASUREMENT.databaseFlags, ...FASTPATH_MEASUREMENT.diagnosticFlags].map(([name]) => ({ name }))).flags) {
+  const m = FASTPATH_MEASUREMENT;
+  if (!measFlagsAllowed(flags)) fail("FASTPATH_DEPLOY_ARGUMENT_INVALID", "database flags");
   return gcloudArgs(["sql", "instances", "create", assertMeasurementInstance(instance).instance,
     `--project=${FASTPATH_TEST.project}`, `--region=${m.region}`,
     `--database-version=${m.databaseVersion}`, `--edition=${m.edition}`, `--tier=${m.tier}`,
     `--availability-type=${m.availabilityType}`, "--storage-type=SSD", `--storage-size=${m.storageSizeGb}GB`,
     "--storage-auto-increase", "--no-deletion-protection", "--no-backup",
-    "--assign-ip", "--connector-enforcement=REQUIRED", "--no-insights-config-query-insights-enabled",
-    `--database-flags=${m.databaseFlags.map(([name, value]) => `${name}=${value}`).join(",")}`,
+    "--assign-ip", "--connector-enforcement=REQUIRED",
+    // Query Insights, unlike production (MEAS-SYNTH profiling).
+    "--insights-config-query-insights-enabled",
+    `--insights-config-query-plans-per-minute=${m.queryInsights.queryPlansPerMinute}`,
+    `--insights-config-query-string-length=${m.queryInsights.queryStringLength}`,
+    "--no-insights-config-record-application-tags", "--no-insights-config-record-client-address",
+    `--database-flags=${flags.map(([name, value]) => `${name}=${value}`).join(",")}`,
     "--labels=" + Object.entries(m.labels).map(([key, value]) => `${key}=${value}`).join(","),
     "--async", "--format=json"]);
 }
@@ -565,7 +627,16 @@ export function measurementInstanceMismatches(described, instance) {
     ["authorizedNetworks", (Array.isArray(ip.authorizedNetworks) ? ip.authorizedNetworks : []).length === 0],
     ["connectorEnforcement", settings.connectorEnforcement === "REQUIRED"],
     ["databaseFlags", m.databaseFlags.every(([name, value]) => flags[name] === value)
-      && Object.keys(flags).length === m.databaseFlags.length],
+      && Object.keys(flags).every((name) => m.databaseFlags.some(([mirrored]) => mirrored === name)
+        || m.diagnosticFlags.some(([diagnostic]) => diagnostic === name)
+        || m.optionalDiagnosticFlags.some(([optional]) => optional === name))],
+    // MEAS-SYNTH profiling diagnostics (meas-create refuses an instance without them).
+    ["diagnosticFlags", m.diagnosticFlags.every(([name, value]) => flags[name] === value)
+      && m.optionalDiagnosticFlags.every(([name, value]) => flags[name] === undefined || flags[name] === value)],
+    ["queryInsights", settings.insightsConfig?.queryInsightsEnabled === true
+      && Number(settings.insightsConfig?.queryPlansPerMinute) === m.queryInsights.queryPlansPerMinute
+      && Number(settings.insightsConfig?.queryStringLength) === m.queryInsights.queryStringLength
+      && settings.insightsConfig?.recordClientAddress !== true && settings.insightsConfig?.recordApplicationTags !== true],
     ["labels", Object.entries(m.labels).every(([key, value]) => labels[key] === value)],
   ].filter(([, equal]) => !equal).map(([field]) => field);
 }
@@ -1119,6 +1190,7 @@ function parseArgs(argv) {
     schema: undefined, golden: undefined, schemaSuffix: undefined, replaceSeed: false, sourceIdentity: undefined,
     corpus: undefined, dump: undefined, refreshProfile: undefined, resolvedGolden: undefined,
     taskTimeoutSeconds: undefined, afterRefresh: undefined, measInstance: undefined,
+    label: undefined, as: "migrator", since: undefined, until: undefined,
   };
   for (const argument of rest) {
     if (argument === "--dry-run") { options.dryRun = true; continue; }
@@ -1146,6 +1218,16 @@ function parseArgs(argv) {
     else if (key === "refresh-arg") options.refreshArgs.push(value);
     else if (key === "after-refresh") options.afterRefresh = resolve(value);
     else if (key === "meas-instance") options.measInstance = assertMeasurementInstance(value).instance;
+    else if (key === "label") {
+      if (!/^[a-z0-9][a-z0-9-]{0,39}$/u.test(value)) fail("FASTPATH_DEPLOY_ARGUMENT_INVALID", "--label");
+      options.label = value;
+    } else if (key === "as") {
+      if (!["migrator", "runtime"].includes(value)) fail("FASTPATH_DEPLOY_ARGUMENT_INVALID", "--as");
+      options.as = value;
+    } else if (key === "since" || key === "until") {
+      if (!ISO_INSTANT.test(value)) fail("FASTPATH_DEPLOY_ARGUMENT_INVALID", `--${key}`);
+      options[key] = value;
+    }
     else if (key === "task-timeout-seconds") {
       if (!/^[1-9][0-9]{0,6}$/u.test(value)) fail("FASTPATH_DEPLOY_TASK_TIMEOUT_INVALID", value);
       options.taskTimeoutSeconds = Number(value);
@@ -1177,6 +1259,12 @@ function parseArgs(argv) {
   }
   if (step.startsWith("meas-") && options.measInstance === undefined) {
     fail("FASTPATH_DEPLOY_ARGUMENT_INVALID", `${step} needs --meas-instance`);
+  }
+  if (step === "meas-pgstat" && options.label === undefined) {
+    fail("FASTPATH_DEPLOY_ARGUMENT_INVALID", "meas-pgstat needs --label");
+  }
+  if (step === "meas-metrics" && (options.since === undefined || options.until === undefined)) {
+    fail("FASTPATH_DEPLOY_ARGUMENT_INVALID", "meas-metrics needs --since and --until");
   }
   return options;
 }
@@ -1226,6 +1314,18 @@ Steps:
                    fails (FASTPATH_DEPLOY_MEAS_TEARDOWN_INCOMPLETE) on any error, or while ANY measurement instance
                    (label purpose=${FASTPATH_MEASUREMENT.labels.purpose} or the ${FASTPATH_MEASUREMENT.instancePrefix} prefix) remains in
                    the project, naming it (remainingMeasurementInstances): tear that one down by its name. Rerunnable
+  meas-pgstat-enable  as the migrator IAM user (Cloud SQL connector), on the --meas-instance database only:
+                   CREATE EXTENSION IF NOT EXISTS pg_stat_statements, then pg_stat_statements_reset() when allowed
+                   (meas-pgstat-enable.json). Fails FASTPATH_DEPLOY_MEAS_PGSTAT_UNAVAILABLE when the extension cannot
+                   be created; the run script then measures without statement statistics
+  meas-pgstat      read-only (BEGIN READ ONLY, 60 s statement timeout), as --as=migrator (default) or runtime: one
+                   content-free snapshot of pg_stat_statements, pg_stat_database, pg_stat_io, pg_stat_wal, the
+                   checkpointer, the seeded schema's table I/O and the sessions by wait event
+                   (meas-pgstat-<--label>.json)
+  meas-metrics     read-only: Cloud Monitoring time series between --since and --until for the measurement Job's
+                   container CPU and memory utilisation and received bytes, and the --meas-instance instance's CPU,
+                   memory, disk operations and bytes sent (project ${FASTPATH_TEST.project} only; the operator's
+                   access token, held in memory) (meas-metrics.json)
 Options:
   --commit=<ref>          commit to build (required for build, migrate and all)
   --image=<repo@sha256:>  use an existing image digest instead of building
@@ -1256,6 +1356,9 @@ Options:
                           (a seeded --schema only). The date is a name, not a clock: pin the literal name once per
                           measurement. Cloud SQL may hold a deleted instance's name for days (up to a week, per its
                           documentation), so a retry after a teardown takes another unused valid date
+  --label=<name>          meas-pgstat: the snapshot's label ([a-z0-9-], up to 40)
+  --as=migrator|runtime   meas-pgstat: the IAM user it reads as (default migrator)
+  --since=<ISO> --until=<ISO>  meas-metrics: the window read
   --skip=a,b              skip steps inside "all"
   --no-execute            create/update Jobs without executing them
   --dry-run               print every command; run nothing remote and write nothing remote
@@ -1422,15 +1525,21 @@ function stepDatabase(runner) {
 
 const defaultSleep = (milliseconds) => new Promise((resolveWait) => setTimeout(resolveWait, milliseconds));
 
+/** The refresh Job's profile summary schema (cloud-run/analytics-refresh-profile.mjs; the check pins it). */
+export const REFRESH_PROFILE_SCHEMA = "analytics-refresh-profile-v1";
+
 /**
  * One execution's log, read until it holds a content-free status line (log
- * ingestion lags the execution): the status lines, oldest first, and Cloud
- * Run's own text messages (a timeout or memory kill leaves only those).
+ * ingestion lags the execution): the status lines, oldest first, the
+ * profiler's summary lines (`profiles`, oldest first; they carry no status),
+ * and Cloud Run's own text messages (a timeout or memory kill leaves only
+ * those).
  */
 export async function readExecutionLog(runner, job, execution, { since, attempts = 12, intervalMs = 10_000,
   sleep = defaultSleep } = {}) {
   const read = executionLogsCommand(job, execution, { since });
   let systemMessages = [];
+  let profiles = [];
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const listed = runner.json(read, { read: true, quiet: attempt > 0 }) ?? [];
     const entries = (Array.isArray(listed) ? listed : [])
@@ -1439,24 +1548,26 @@ export async function readExecutionLog(runner, job, execution, { since, attempts
       .map(({ entry }) => entry);
     const lines = [];
     systemMessages = [];
+    profiles = [];
     for (const entry of entries) {
       const value = entry?.jsonPayload ?? (() => {
         try { return JSON.parse(entry?.textPayload ?? ""); } catch { return null; }
       })();
       if (value && typeof value === "object" && typeof value.status === "string") lines.push(value);
+      else if (value && typeof value === "object" && value.profile === REFRESH_PROFILE_SCHEMA) profiles.push(value);
       else if (typeof entry?.textPayload === "string" && systemMessages.length < 50) {
         systemMessages.push({ timestamp: entry.timestamp ?? null, severity: entry.severity ?? null,
           text: entry.textPayload.slice(0, 500) });
       }
     }
-    if (lines.length > 0) return { lines, systemMessages };
+    if (lines.length > 0) return { lines, systemMessages, profiles };
     if (attempt + 1 < attempts) await sleep(intervalMs);
   }
-  return { lines: [], systemMessages };
+  return { lines: [], systemMessages, profiles };
 }
 
 async function jobExecutionResult(runner, job, execution) {
-  return (await readExecutionLog(runner, job, execution.metadata?.name)).lines;
+  return readExecutionLog(runner, job, execution.metadata?.name);
 }
 
 async function deployAndExecuteJob(runner, options, job, deployCommand) {
@@ -1472,7 +1583,9 @@ async function deployAndExecuteJob(runner, options, job, deployCommand) {
   }
   const status = execution?.status ?? {};
   const succeeded = Number(status.succeededCount ?? 0) === 1 && Number(status.failedCount ?? 0) === 0;
-  const lines = execution?.metadata?.name ? await jobExecutionResult(runner, job, execution) : [];
+  const log = execution?.metadata?.name ? await jobExecutionResult(runner, job, execution)
+    : { lines: [], profiles: [] };
+  const lines = log.lines;
   return {
     job,
     execution: execution?.metadata?.name ?? null,
@@ -1482,6 +1595,7 @@ async function deployAndExecuteJob(runner, options, job, deployCommand) {
     durationSeconds: status.startTime && status.completionTime
       ? (Date.parse(status.completionTime) - Date.parse(status.startTime)) / 1000 : null,
     results: lines,
+    profiles: log.profiles ?? [],
   };
 }
 
@@ -1624,6 +1738,11 @@ async function stepRefresh(runner, options, image) {
   const receipt = { step: "refresh", image, schema: primarySchemaOf(options.schema), now: options.now ?? null,
     profile: options.refreshProfile, resources: REFRESH_JOB_PROFILES[options.refreshProfile],
     measInstance: target.measInstance, instanceConnectionName: target.instanceConnectionName, ...result };
+  if (!runner.dryRun && options.noExecute) {
+    // Deployed only: refresh-uncapped may follow this receipt (the profiled
+    // production-tier run, without a guarded execution first).
+    receipt.path = await runner.receipt("refresh.json", receipt);
+  }
   if (!runner.dryRun && !options.noExecute) {
     receipt.path = await runner.receipt("refresh.json", receipt);
     if (!result.succeeded) fail("FASTPATH_DEPLOY_REFRESH_FAILED", JSON.stringify(result.results?.at(-1) ?? null));
@@ -1658,15 +1777,25 @@ export async function stepMeasCreate(runner, options, { wallClock = Date.now } =
   const existed = listedInstances(runner).some((entry) => entry.name === instance);
   const before = existed ? runner.json(describe, { read: true }) : null;
   const receipt = { step: "meas-create", instance, instanceConnectionName, existed,
-    createSeconds: null, state: null, mismatches: null, databaseCreated: false, usersCreated: [] };
+    createSeconds: null, state: null, mismatches: null, databaseCreated: false, usersCreated: [],
+    databaseFlags: null, optionalFlagsApplied: null, optionalFlagsUnlisted: null,
+    queryInsights: FASTPATH_MEASUREMENT.queryInsights };
   if (existed) {
     const foreign = measurementInstanceMismatches(before, instance);
     if (foreign.includes("labels") || foreign.includes("name") || foreign.includes("project")) {
       fail("FASTPATH_DEPLOY_MEAS_INSTANCE_FOREIGN", foreign.join(","));
     }
   } else {
+    // Read-only, before any write: every flag must be one the version supports.
+    const listedFlags = runner.json(measFlagsListCommand(), { read: true, placeholderJson: [
+      ...FASTPATH_MEASUREMENT.databaseFlags, ...FASTPATH_MEASUREMENT.diagnosticFlags,
+      ...FASTPATH_MEASUREMENT.optionalDiagnosticFlags].map(([name]) => ({ name })) });
+    const { flags, optionalApplied, optionalUnlisted } = measCreateFlags(listedFlags);
+    receipt.databaseFlags = flags.map(([name, value]) => `${name}=${value}`);
+    receipt.optionalFlagsApplied = optionalApplied;
+    receipt.optionalFlagsUnlisted = optionalUnlisted;
     const started = wallClock();
-    const created = runner.exec(measInstanceCreateCommand(instance),
+    const created = runner.exec(measInstanceCreateCommand(instance, flags),
       { placeholder: JSON.stringify({ name: "dry-run-operation" }) });
     runner.exec(sqlOperationWaitCommand(sqlOperationOf(created)), { read: true });
     receipt.createSeconds = runner.dryRun ? null : Math.round((wallClock() - started) / 1_000);
@@ -1784,6 +1913,105 @@ export async function stepMeasTeardown(runner, options) {
   return receipt;
 }
 
+/** The measurement database's pool as one of the fast-path test identities (scripts/gcp-fastpath-connection.mjs). */
+async function measPool(options, as, applicationName) {
+  const { createGcpFastpathPool } = await import("./gcp-fastpath-connection.mjs");
+  return createGcpFastpathPool({ as, max: 1, applicationName, measInstance: options.measInstance });
+}
+
+/**
+ * meas-pgstat-enable (see HELP): the one write the database-side profile
+ * needs, on the disposable measurement database only. The reset makes the
+ * first snapshot start after the seed; when the role may not reset, the
+ * snapshots' deltas still separate the seed from the refresh.
+ */
+export async function stepMeasPgStatEnable(runner, options, { createPool = measPool } = {}) {
+  const { instance } = assertMeasurementInstance(options.measInstance);
+  runner.print(["(connector)", `--meas-instance=${instance}`, "--as=migrator",
+    "CREATE EXTENSION IF NOT EXISTS pg_stat_statements; SELECT pg_stat_statements_reset()"],
+  "measurement database only");
+  if (runner.dryRun) return { step: "meas-pgstat-enable", instance, dryRun: true };
+  const receipt = { step: "meas-pgstat-enable", instance, extension: null, reset: false, sqlState: null };
+  const connection = await createPool(options, "migrator", "tibotattle-meas-pgstat");
+  try {
+    try {
+      await connection.pool.query("CREATE EXTENSION IF NOT EXISTS pg_stat_statements");
+      const version = await connection.pool.query(
+        "SELECT extversion FROM pg_extension WHERE extname = 'pg_stat_statements'");
+      receipt.extension = /^[0-9.]{1,16}$/u.test(version.rows[0]?.extversion ?? "") ? version.rows[0].extversion : null;
+    } catch (error) {
+      receipt.sqlState = typeof error?.code === "string" && /^[0-9A-Z]{5}$/u.test(error.code) ? error.code : null;
+    }
+    if (receipt.extension !== null) {
+      try {
+        await connection.pool.query("SELECT pg_stat_statements_reset()");
+        receipt.reset = true;
+      } catch { /* not allowed for this role: deltas still apply */ }
+    }
+  } finally {
+    await connection.close();
+  }
+  receipt.path = await runner.receipt("meas-pgstat-enable.json", receipt);
+  if (receipt.extension === null) fail("FASTPATH_DEPLOY_MEAS_PGSTAT_UNAVAILABLE", receipt.sqlState ?? "absent");
+  return receipt;
+}
+
+/** meas-pgstat (see HELP): one read-only, content-free statistics snapshot. */
+export async function stepMeasPgStat(runner, options, { createPool = measPool } = {}) {
+  const { instance } = assertMeasurementInstance(options.measInstance);
+  runner.print(["(connector)", `--meas-instance=${instance}`, `--as=${options.as}`, "BEGIN READ ONLY",
+    "pg_stat_statements pg_stat_database pg_stat_io pg_stat_wal pg_stat_checkpointer pg_stat_user_tables pg_stat_activity"],
+  "read-only");
+  if (runner.dryRun) return { step: "meas-pgstat", instance, label: options.label, dryRun: true };
+  const { readMeasPgStat } = await import("./gcp-fastpath-prod-shape/meas-pgstat.mjs");
+  const connection = await createPool(options, options.as, "tibotattle-meas-pgstat");
+  let snapshot;
+  try {
+    const client = await connection.pool.connect();
+    try {
+      snapshot = await readMeasPgStat(client, { label: options.label, roles: {
+        migrator: FASTPATH_TEST.migratorIamUser, runtime: FASTPATH_TEST.runtimeIamUser } });
+    } finally {
+      client.release();
+    }
+  } finally {
+    await connection.close();
+  }
+  const receipt = { step: "meas-pgstat", instance, as: options.as, ...snapshot };
+  receipt.path = await runner.receipt(`meas-pgstat-${options.label}.json`, receipt);
+  return { step: "meas-pgstat", instance, label: options.label, path: receipt.path,
+    statements: snapshot.statements?.length ?? null, errors: snapshot.errors };
+}
+
+/** The operator's own access token (read-only use), held in memory only. */
+function operatorAccessToken() {
+  const minted = spawnSync("gcloud", ["auth", "print-access-token", `--project=${FASTPATH_TEST.project}`],
+    { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 64 * 1024 });
+  const token = minted.status === 0 ? String(minted.stdout).trim() : "";
+  if (token.length === 0 || token.length > 16 * 1024 || !/^[\x21-\x7e]+$/u.test(token)) {
+    fail("FASTPATH_DEPLOY_TOKEN_FAILED", "gcloud auth print-access-token");
+  }
+  return token;
+}
+
+/** meas-metrics (see HELP): read-only Cloud Monitoring series for the measurement Job and instance. */
+export async function stepMeasMetrics(runner, options, { token = operatorAccessToken, fetchImpl = fetch } = {}) {
+  const { instance } = assertMeasurementInstance(options.measInstance);
+  const { measMetricsRequests, readMeasMetrics } = await import("./gcp-fastpath-prod-shape/meas-metrics.mjs");
+  const requests = measMetricsRequests({ instance, since: options.since, until: options.until });
+  runner.print(["gcloud", "auth", "print-access-token", `--project=${FASTPATH_TEST.project}`],
+    "token kept in memory; read-only GETs follow");
+  for (const request of requests) runner.print(["GET", request.url], "read-only");
+  if (runner.dryRun) return { step: "meas-metrics", instance, requests: requests.length, dryRun: true };
+  const result = await readMeasMetrics({ instance, since: options.since, until: options.until, token: token(),
+    fetchImpl });
+  const receipt = { step: "meas-metrics", ...result };
+  receipt.path = await runner.receipt("meas-metrics.json", receipt);
+  return { step: "meas-metrics", instance, path: receipt.path, metrics: result.metrics.map((metric) => ({
+    metric: metric.metric, aligner: metric.aligner, httpStatus: metric.httpStatus, series: metric.series.length,
+    ...(metric.error === undefined ? {} : { error: metric.error }) })) };
+}
+
 /** Content-free classification of a finished uncapped execution. */
 export function uncappedOutcome({ completed, succeeded, statusLine, durationSeconds, taskTimeoutSeconds }) {
   if (!completed) return { outcome: "unfinished", code: null };
@@ -1867,7 +2095,10 @@ export async function stepRefreshUncapped(runner, options, image, { sleep = defa
     ["profile", guarded?.profile === options.refreshProfile],
     ["measInstance", (guarded?.measInstance ?? null) === target.measInstance],
     ["job", guarded?.job === job],
-    ["execution", typeof guarded?.execution === "string" && guarded.execution.length > 0],
+    // An executed refresh names its execution; a deployed-only one (refresh
+    // --no-execute) says it did not execute.
+    ["execution", guarded?.executed === false
+      || (typeof guarded?.execution === "string" && guarded.execution.length > 0)],
   ].filter(([, equal]) => !equal).map(([field]) => field);
   if (guardedMismatches.length > 0) {
     fail("FASTPATH_DEPLOY_UNCAPPED_AFTER_REFRESH_MISMATCH", guardedMismatches.join(","));
@@ -1890,11 +2121,12 @@ export async function stepRefreshUncapped(runner, options, image, { sleep = defa
     step: "refresh-uncapped", job, measInstance: target.measInstance, image, schema, now: options.now ?? null,
     profile: options.refreshProfile,
     taskTimeoutSeconds: timeout, overrides: render(execute),
-    afterRefresh: { path: options.afterRefresh, execution: guarded.execution, succeeded: guarded.succeeded ?? null,
+    afterRefresh: { path: options.afterRefresh, executed: guarded.executed !== false,
+      execution: guarded.execution ?? null, succeeded: guarded.succeeded ?? null,
       durationSeconds: guarded.durationSeconds ?? null, statusLine: guardedLine },
     jobTask, requestedAt: null, execution: null, executionTask: null, executionMismatches: null,
     completed: false, succeeded: false, status: null, durationSeconds: null, outcome: null, code: null,
-    statusLine: null, results: [], systemMessages: [], logRead: null,
+    statusLine: null, results: [], systemMessages: [], profiles: [], logRead: null,
   };
   if (runner.dryRun) {
     runner.exec(execute, { placeholder: "" });
@@ -1962,6 +2194,7 @@ export async function stepRefreshUncapped(runner, options, image, { sleep = defa
       sleep });
     receipt.results = log.lines;
     receipt.systemMessages = log.systemMessages;
+    receipt.profiles = log.profiles ?? [];
     receipt.statusLine = refreshStatusLine(log.lines);
     Object.assign(receipt, uncappedOutcome({ completed: receipt.completed, succeeded: receipt.succeeded,
       statusLine: receipt.statusLine, durationSeconds: receipt.durationSeconds, taskTimeoutSeconds: timeout }));
@@ -2143,6 +2376,9 @@ export async function main(argv = process.argv.slice(2)) {
       result = assertRefreshIdle(runner, { job: refreshTarget({ measInstance: options.measInstance }).job });
     } else if (step === "meas-create") result = await stepMeasCreate(runner, options);
     else if (step === "meas-teardown") result = await stepMeasTeardown(runner, options);
+    else if (step === "meas-pgstat-enable") result = await stepMeasPgStatEnable(runner, options);
+    else if (step === "meas-pgstat") result = await stepMeasPgStat(runner, options);
+    else if (step === "meas-metrics") result = await stepMeasMetrics(runner, options);
     else if (step === "refresh-uncapped") result = await stepRefreshUncapped(runner, options, image);
     else if (step === "origin") result = await stepOrigin(runner, options, image);
     else if (step === "verify") result = await stepVerify(runner, options);

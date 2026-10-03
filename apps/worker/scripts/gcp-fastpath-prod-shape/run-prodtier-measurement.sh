@@ -11,6 +11,16 @@
 # names no other instance. The instance is deleted on every exit the shell
 # can trap (see "Teardown" below).
 #
+# Profiling (MEAS-SYNTH, 2026-10-03): the main deliverable is ONE profiled,
+# UNCAPPED run per profile, which shows where its time goes even if it is
+# killed: the Job's CPU profiler (ANALYTICS_V2_REFRESH_PROFILE=cpu) logs a
+# content-free summary every 30 min and at exit or SIGTERM; the database's
+# pg_stat_statements, pg_stat_database and pg_stat_io are snapshotted before
+# the run, every MEAS_PGSTAT_INTERVAL during it and after it (meas-pgstat,
+# read-only); Cloud Monitoring's CPU and memory series for the Job and the
+# instance are read after it (meas-metrics, read-only). The guarded run (the
+# production time guard's refusal) is optional and off by default.
+#
 #   zsh apps/worker/scripts/gcp-fastpath-prod-shape/run-prodtier-measurement.sh
 #
 # Environment (all optional):
@@ -31,6 +41,15 @@
 #                   "dense-workers" for K-PAR's four compute Workers)
 #   MEAS_UNCAPPED_TIMEOUT  the uncapped execution's task timeout and time
 #                   guard (default 172,800 s, 48 h; 14,401..604,800)
+#   MEAS_GUARDED    1: execute the guarded refresh first (the production time
+#                   guard, 14,400 s) and run uncapped only when it does not
+#                   complete. Default 0: deploy the Job without executing it
+#                   (refresh --no-execute) and run uncapped directly
+#   MEAS_CPU_PROFILE  the Job's CPU profiler: "cpu" (default) or "off"
+#   MEAS_CPU_SAMPLE_US  its V8 sampling interval (default 10000 us; the
+#                   receipt states the measured overhead, 1000..100000)
+#   MEAS_PGSTAT_INTERVAL  seconds between meas-pgstat snapshots during a run
+#                   (default 1800)
 #
 # Steps:
 #   preflight  clean checkout of HEAD for every path the seed and image use;
@@ -45,15 +64,29 @@
 #              IAM user; runs on THIS machine, Node 26, large heap; the local
 #              import took 24 min, the connector's round trips make this
 #              hours)
+#   pgstat-enable  D meas-pgstat-enable: pg_stat_statements on the measurement
+#              database and a reset after the seed. Failure is not fatal: the
+#              run then measures without statement statistics (Query Insights
+#              and the other views still apply)
 #   per profile in MEAS_PROFILES:
-#     refresh  D refresh --meas-instance with the profile and the production
-#              time guard (ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS=14400) at
-#              the corpus clock. A guard refusal is data; the script stops
-#              unless refresh.json exists and is not LOCK_HELD
-#     uncapped when the guarded run did not complete: D refresh-uncapped
+#     pgstat   D meas-pgstat --label=<profile>-before (read-only)
+#     refresh  MEAS_GUARDED=1: D refresh --meas-instance with the profile and
+#              the production time guard
+#              (ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS=14400) at the corpus
+#              clock; a guard refusal is data; the script stops unless
+#              refresh.json exists and is not LOCK_HELD. Default: D refresh
+#              --no-execute, which deploys the Job only (refresh.json records
+#              executed false)
+#     uncapped when no guarded run completed: D refresh-uncapped
 #              (execution-level task timeout and guard at
-#              MEAS_UNCAPPED_TIMEOUT), timed to its end
-#   collect    summary.json: each run's duration, outcome and phase timings
+#              MEAS_UNCAPPED_TIMEOUT), timed to its end. While it (or the
+#              guarded run) executes, a sampler takes D meas-pgstat
+#              --label=<profile>-during-NN every MEAS_PGSTAT_INTERVAL
+#     pgstat   D meas-pgstat --label=<profile>-after
+#     metrics  D meas-metrics over the execution's window (read-only)
+#   collect    summarize-prodtier.mjs: summary.json, each run's duration,
+#              outcome and phase timings, the profiler's last summary and
+#              cadence, the database delta and the Cloud Monitoring summaries
 #   teardown   (trap, every exit) D meas-teardown: cancel and delete the
 #              measurement Job, delete the instance, read both back absent
 #              from listings that succeeded; it fails while any measurement
@@ -89,11 +122,22 @@ NODE26=${MEAS_NODE26:-$HOME/.nvm/versions/node/v26.2.0/bin/node}
 NOW=2026-10-01T12:46:00.000Z
 PROFILES=(${=${MEAS_PROFILES:-dense}})
 UNCAPPED_TIMEOUT=${MEAS_UNCAPPED_TIMEOUT:-172800}
-GUARD=(--refresh-env=ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS=14400)
+GUARDED=${MEAS_GUARDED:-0}
+CPU_PROFILE=${MEAS_CPU_PROFILE:-cpu}
+CPU_SAMPLE_US=${MEAS_CPU_SAMPLE_US:-10000}
+PGSTAT_INTERVAL=${MEAS_PGSTAT_INTERVAL:-1800}
+# The Job's env beyond its profile: the production time guard (the uncapped
+# execution overrides it) and the CPU profiler. refresh and refresh-uncapped
+# take the same list, so the uncapped run reads back the Job refresh deployed.
+REFRESH_ENV=(--refresh-env=ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS=14400)
+[[ "$CPU_PROFILE" == cpu ]] && REFRESH_ENV+=(--refresh-env=ANALYTICS_V2_REFRESH_PROFILE=cpu
+  --refresh-env=ANALYTICS_V2_REFRESH_PROFILE_SAMPLE_US="$CPU_SAMPLE_US")
 D() { "$NODE26" scripts/gcp-fastpath-test-deploy.mjs "$@"; }
 step() { echo "== $(date -u +%H:%M:%S) $1"; }
 TORN=0
 CHILD=0
+SAMPLER=0
+PGSTAT=1
 # A long step (see "Teardown" above):
 #   child <stdout file> <stderr file, or - for the stdout file> <command...>
 child() {
@@ -103,7 +147,51 @@ child() {
 }
 # A process and all its descendants (D's subshell, node, the gcloud it runs).
 tree() { local p; print -r -- $1; for p in $(pgrep -P $1 2>/dev/null); do tree $p; done; }
-stop() { (( CHILD )) && kill -TERM $(tree $CHILD) 2>/dev/null; CHILD=0; exit 130; }
+stop() { (( SAMPLER )) && kill -TERM $(tree $SAMPLER) 2>/dev/null; SAMPLER=0
+  (( CHILD )) && kill -TERM $(tree $CHILD) 2>/dev/null; CHILD=0; exit 130; }
+# One read-only database snapshot (bounded: a 15 s connect and 60 s statement
+# timeout); a failure is recorded, never fatal.
+pgstat() {
+  (( PGSTAT )) || return 0
+  D meas-pgstat --meas-instance="$INSTANCE" --label="$1" --out="$OUT/pgstat" > "$OUT/pgstat/$1.log" 2>&1 \
+    || echo "pgstat $1 failed (see $OUT/pgstat/$1.log)"
+}
+# Snapshots every PGSTAT_INTERVAL while a run executes (a background loop the
+# stop trap also ends).
+sampler() {
+  local n=0
+  while true; do
+    sleep "$PGSTAT_INTERVAL"
+    n=$(( n + 1 ))
+    pgstat "$1-during-$(printf %02d $n)"
+  done
+}
+# child, with the sampler running for its duration:
+#   sampled <label> <stdout file> <stderr file, or -> <command...>
+sampled() {
+  local label=$1; shift
+  sampler "$label" &
+  SAMPLER=$!
+  child "$@"; local rc=$?
+  (( SAMPLER )) && kill -TERM $(tree $SAMPLER) 2>/dev/null; SAMPLER=0
+  return $rc
+}
+# The Cloud Monitoring read for one run: the execution's window from its
+# receipt, five minutes either side (read-only; rerunnable for six weeks).
+metrics() {
+  local receipt=$1 label=$2 window
+  window=$("$NODE26" -e '
+    const r = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+    const start = Date.parse(r.status?.startTime ?? r.startTime ?? r.requestedAt ?? "");
+    const end = Date.parse(r.status?.completionTime ?? r.completionTime ?? "") || Date.now();
+    if (!Number.isFinite(start)) process.exit(1);
+    const iso = (ms) => new Date(Math.min(ms, Date.now())).toISOString();
+    console.log(iso(start - 300000) + " " + iso(end + 300000));' "$receipt" 2>/dev/null) \
+    || { echo "metrics $label: no execution window in $receipt"; return 0; }
+  mkdir -p -m 700 "$OUT/metrics"
+  D meas-metrics --meas-instance="$INSTANCE" --since="${window% *}" --until="${window#* }" \
+    --out="$OUT/metrics/$label" > "$OUT/metrics/$label.log" 2>&1 || echo "metrics $label failed (see $OUT/metrics/$label.log)"
+}
 teardown() {
   [[ $TORN == 1 ]] && return; TORN=1
   step teardown
@@ -118,6 +206,7 @@ teardown() {
 mkdir -p -m 700 "$OUT"
 print -r -- "$INSTANCE" > "$OUT/instance"
 echo "commit $COMMIT"; echo "instance $INSTANCE"; echo "corpus $CORPUS"; echo "profiles ${PROFILES[*]}"; echo "out $OUT"
+echo "guarded $GUARDED; cpu profile $CPU_PROFILE at $CPU_SAMPLE_US us; pgstat every $PGSTAT_INTERVAL s"
 cd "$WORKER" || exit 2
 
 step preflight
@@ -132,6 +221,10 @@ for PROFILE in "${PROFILES[@]}"; do
   [[ "$PROFILE" == dense || "$PROFILE" == dense-workers ]] || { echo "preflight FAILED: profile $PROFILE"; exit 1; }
 done
 [[ "$UNCAPPED_TIMEOUT" == <14401-604800> ]] || { echo "preflight FAILED: MEAS_UNCAPPED_TIMEOUT must be 14401..604800"; exit 1; }
+[[ "$GUARDED" == 0 || "$GUARDED" == 1 ]] || { echo "preflight FAILED: MEAS_GUARDED must be 0 or 1"; exit 1; }
+[[ "$CPU_PROFILE" == cpu || "$CPU_PROFILE" == off ]] || { echo "preflight FAILED: MEAS_CPU_PROFILE must be cpu or off"; exit 1; }
+[[ "$CPU_SAMPLE_US" == <1000-100000> ]] || { echo "preflight FAILED: MEAS_CPU_SAMPLE_US must be 1000..100000"; exit 1; }
+[[ "$PGSTAT_INTERVAL" == <60-86400> ]] || { echo "preflight FAILED: MEAS_PGSTAT_INTERVAL must be 60..86400"; exit 1; }
 "$NODE26" -e '
   const fs = require("fs"), path = require("path"), crypto = require("crypto");
   const m = JSON.parse(fs.readFileSync(process.argv[1] + "/corpus-manifest.json", "utf8"));
@@ -174,51 +267,58 @@ child "$OUT/seed.json" "$OUT/seed.log" \
 SCHEMA=$("$NODE26" -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).schema)' "$OUT/seed.json")
 echo "schema $SCHEMA"
 
+mkdir -p -m 700 "$OUT/pgstat"
+step pgstat-enable
+D meas-pgstat-enable --meas-instance="$INSTANCE" --out="$OUT/pgstat" > "$OUT/pgstat/enable.log" 2>&1 \
+  || echo "pg_stat_statements unavailable (see $OUT/pgstat/enable.log): measuring without statement statistics"
+
 for PROFILE in "${PROFILES[@]}"; do
   RUN=$OUT/$PROFILE
-  step "refresh $PROFILE"
-  child "$RUN.refresh.log" - \
-    D refresh --meas-instance="$INSTANCE" --image="$IMG" --schema="$SCHEMA" --now="$NOW" --refresh-profile="$PROFILE" "${GUARD[@]}" \
-    --out="$RUN/refresh"
-  echo "refresh $PROFILE rc=$? (a guard refusal is data)"; tail -c 1500 "$RUN.refresh.log"; echo
-  # No refresh.json: the wrapper refused or the deploy failed; nothing was measured.
-  if [[ ! -f "$RUN/refresh/refresh.json" ]]; then echo "refresh $PROFILE FAILED before an execution; not measuring"; exit 1; fi
-  OUTCOME=$("$NODE26" -e '
-    const r = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
-    const line = Array.isArray(r.results) && r.results.length > 0 ? r.results.at(-1) : null;
-    console.log(line === null ? "no-status-line" : line.status === "ok" ? String(line.state) : `failed:${line.code}`);' \
-    "$RUN/refresh/refresh.json")
-  echo "guarded $PROFILE outcome $OUTCOME"
-  if [[ "$OUTCOME" == "LOCK_HELD" ]]; then echo "refresh $PROFILE FAILED: LOCK_HELD on the measurement database"; exit 1; fi
+  mkdir -p -m 700 "$RUN"
+  pgstat "$PROFILE-before"
+  if [[ "$GUARDED" == 1 ]]; then
+    step "refresh $PROFILE (guarded)"
+    sampled "$PROFILE-guarded" "$RUN.refresh.log" - \
+      D refresh --meas-instance="$INSTANCE" --image="$IMG" --schema="$SCHEMA" --now="$NOW" --refresh-profile="$PROFILE" \
+      "${REFRESH_ENV[@]}" --out="$RUN/refresh"
+    echo "refresh $PROFILE rc=$? (a guard refusal is data)"; tail -c 1500 "$RUN.refresh.log"; echo
+    # No refresh.json: the wrapper refused or the deploy failed; nothing was measured.
+    if [[ ! -f "$RUN/refresh/refresh.json" ]]; then echo "refresh $PROFILE FAILED before an execution; not measuring"; exit 1; fi
+    OUTCOME=$("$NODE26" -e '
+      const r = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+      const line = Array.isArray(r.results) && r.results.length > 0 ? r.results.at(-1) : null;
+      console.log(line === null ? "no-status-line" : line.status === "ok" ? String(line.state) : `failed:${line.code}`);' \
+      "$RUN/refresh/refresh.json")
+    echo "guarded $PROFILE outcome $OUTCOME"
+    if [[ "$OUTCOME" == "LOCK_HELD" ]]; then echo "refresh $PROFILE FAILED: LOCK_HELD on the measurement database"; exit 1; fi
+  else
+    # The profiled uncapped run is the measurement: deploy the Job only.
+    step "deploy $PROFILE (no guarded execution)"
+    child "$RUN.refresh.log" - \
+      D refresh --meas-instance="$INSTANCE" --image="$IMG" --schema="$SCHEMA" --now="$NOW" --refresh-profile="$PROFILE" \
+      "${REFRESH_ENV[@]}" --no-execute --out="$RUN/refresh" \
+      || { echo "deploy $PROFILE FAILED"; tail -c 1500 "$RUN.refresh.log"; exit 1; }
+    [[ -f "$RUN/refresh/refresh.json" ]] || { echo "deploy $PROFILE wrote no refresh.json"; exit 1; }
+    OUTCOME=deployed
+  fi
   if [[ "$OUTCOME" != "complete" ]]; then
     step "uncapped $PROFILE"
-    child "$RUN.uncapped.log" - \
+    sampled "$PROFILE" "$RUN.uncapped.log" - \
       D refresh-uncapped --meas-instance="$INSTANCE" --image="$IMG" --schema="$SCHEMA" --now="$NOW" \
-      --refresh-profile="$PROFILE" "${GUARD[@]}" \
+      --refresh-profile="$PROFILE" "${REFRESH_ENV[@]}" \
       --task-timeout-seconds="$UNCAPPED_TIMEOUT" --after-refresh="$RUN/refresh/refresh.json" \
       --out="$RUN/uncapped"
     echo "uncapped $PROFILE rc=$? (receipt $RUN/uncapped/refresh-uncapped.json)"; tail -c 1500 "$RUN.uncapped.log"; echo
+    pgstat "$PROFILE-after"
+    step "metrics $PROFILE"
+    metrics "$RUN/uncapped/refresh-uncapped.json" "$PROFILE"
+  else
+    pgstat "$PROFILE-after"
+    step "metrics $PROFILE"
+    metrics "$RUN/refresh/refresh.json" "$PROFILE"
   fi
 done
 
 step collect
-"$NODE26" -e '
-  const fs = require("fs"), path = require("path");
-  const [out, ...profiles] = process.argv.slice(1);
-  const read = (file) => { try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return null; } };
-  const line = (receipt) => (Array.isArray(receipt?.results) && receipt.results.length > 0 ? receipt.results.at(-1) : null);
-  const summary = { create: read(path.join(out, "create/meas-create.json")),
-    seed: (({ schema, durationSeconds, instanceConnectionName, timingsMs }) => ({ schema, durationSeconds,
-      instanceConnectionName, timingsMs }))(read(path.join(out, "seed.json")) ?? {}), runs: {} };
-  for (const profile of profiles) {
-    const guarded = read(path.join(out, profile, "refresh/refresh.json"));
-    const uncapped = read(path.join(out, profile, "uncapped/refresh-uncapped.json"));
-    const pick = (receipt, status) => receipt === null ? null : { execution: receipt.execution,
-      durationSeconds: receipt.durationSeconds, outcome: receipt.outcome ?? null, state: status?.state ?? null,
-      code: status?.code ?? null, timingsMs: status?.timings ?? null, memory: status?.memory ?? null,
-      readsPhaseWallMs: status?.reads?.phaseWallMs ?? null, deadline: status?.deadline ?? null };
-    summary.runs[profile] = { guarded: pick(guarded, line(guarded)), uncapped: pick(uncapped, uncapped?.statusLine ?? null) };
-  }
-  fs.writeFileSync(path.join(out, "summary.json"), JSON.stringify(summary, null, 2) + "\n", { mode: 0o600 });
-  console.log(JSON.stringify(summary.runs, null, 1));' "$OUT" "${PROFILES[@]}"
+"$NODE26" scripts/gcp-fastpath-prod-shape/summarize-prodtier.mjs "$OUT" "${PROFILES[@]}"
 exit 0

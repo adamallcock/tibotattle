@@ -3222,6 +3222,40 @@ test("production target: --schema, --now and --revision-seed are refused before 
   }
 });
 
+test("production target: the CPU profiler is refused in production, accepted in staging and the test targets", async () => {
+  const profile = { ANALYTICS_V2_REFRESH_PROFILE: "cpu", ANALYTICS_V2_REFRESH_PROFILE_SAMPLE_US: "5000",
+    ANALYTICS_V2_REFRESH_PROFILE_SUMMARY_SECONDS: "1800" };
+  for (const name of [...Object.keys(profile), "ANALYTICS_V2_REFRESH_PROFILE_DIR", "ANALYTICS_V2_REFRESH_PROFILE_X"]) {
+    for (const value of ["cpu", ""]) {
+      await refusedTarget(productionEnvironment("production", { [name]: value }), "ANALYTICS_V2_REFRESH_PROFILE_FORBIDDEN",
+        name);
+    }
+  }
+  // Staging accepts the mode, the sampling interval and the summary period, nothing else.
+  const staging = productionEnvironment("staging", profile);
+  assert.equal((await job.readAnalyticsRefreshProductionTarget(staging)).target, "staging");
+  assert.deepEqual(job.readAnalyticsRefreshProfileSettings(staging, { target: "staging" }),
+    { mode: "cpu", sampleUs: 5_000, summaryMs: 1_800_000, directory: null });
+  for (const name of ["ANALYTICS_V2_REFRESH_PROFILE_DIR", "ANALYTICS_V2_REFRESH_PROFILE_X"]) {
+    await refusedTarget({ ...staging, [name]: "/tmp/x" }, "ANALYTICS_V2_REFRESH_ENV_FORBIDDEN", name);
+  }
+  // The measurement Job (a test target) accepts it; inside Cloud Run never a local directory.
+  const measurement = { ...profile, CLOUD_RUN_JOB: FASTPATH_MEASUREMENT_CLOUD_TARGET.refreshJob };
+  assert.equal(job.readAnalyticsRefreshProfileSettings(measurement).sampleUs, 5_000);
+  assert.throws(() => job.readAnalyticsRefreshProfileSettings({ ...measurement,
+    ANALYTICS_V2_REFRESH_PROFILE_DIR: "/tmp/x" }), { code: "ANALYTICS_V2_REFRESH_PROFILE_FORBIDDEN" });
+  // A production run with the profiler is refused in configuration, before any profiler, pool or module.
+  let created = 0;
+  await assert.rejects(job.runAnalyticsRefresh({ argv: ["--mode=full"], env: productionEnvironment("production",
+    { ANALYTICS_V2_REFRESH_PROFILE: "cpu" }), dependencies: {
+    createProfiler: () => { created += 1; return {}; }, createPool: () => { created += 1; return {}; },
+    createConnector: () => { created += 1; return {}; },
+    modules: { get store() { created += 1; return {}; }, pipeline: {} } } }),
+  (error) => error.code === "ANALYTICS_V2_REFRESH_PROFILE_FORBIDDEN" && error.phase === "configuration"
+    && error.field === "ANALYTICS_V2_REFRESH_PROFILE");
+  assert.equal(created, 0);
+});
+
 test("time guard (K-PAR): remaining owners are spread over the workers, never faster than the largest alone", () => {
   const model = job.ANALYTICS_REFRESH_TIME_MODEL;
   const clock = 1_000_000;

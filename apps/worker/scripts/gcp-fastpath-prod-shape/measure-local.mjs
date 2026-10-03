@@ -7,6 +7,7 @@
 //     apps/worker/scripts/gcp-fastpath-prod-shape/measure-local.mjs \
 //       --corpus <seed-source.mjs work dir> --out <report.json> [--keep-database] [--reuse-database <name>]
 //       [--clone-from <name>] [--import-only] [--profile dense|dense-workers] [--guard-probe] [--node22 <path>]
+//       [--cpu-profile <sample interval, us>] [--cpu-profile-dir <absolute dir>]
 //
 //  1. creates a fresh database meas_synth_<8 hex> on the cluster (never an
 //     existing one), a fast-path rehearsal target schema in it, and applies
@@ -43,6 +44,12 @@
 //     refusal came in its first 600 s, not that the plan checkpoint was
 //     reached or passed;
 //  6. drops the database (unless --keep-database).
+//
+// --cpu-profile <us> runs the refresh with the job's opt-in CPU profiler
+// (cloud-run/analytics-refresh-profile.mjs: ANALYTICS_V2_REFRESH_PROFILE=cpu at
+// that sampling interval); the report keeps every content-free summary line
+// (steps.refresh.profileLines) and the last one (steps.refresh.profile).
+// --cpu-profile-dir also keeps one sanitized .cpuprofile per window there.
 //
 // Local and synthetic only: no network, no production data, no secrets.
 // The report holds counts, sizes, timings and digests only.
@@ -104,7 +111,8 @@ function fail(code, detail) {
 
 function parseArguments(argv) {
   const options = { corpus: null, out: null, keepDatabase: false, reuseDatabase: null, guardProbe: false,
-    cloneFrom: null, importOnly: false, profile: "dense", node22: process.env.GCP_FASTPATH_NODE22 || DEFAULT_NODE22 };
+    cloneFrom: null, importOnly: false, profile: "dense", node22: process.env.GCP_FASTPATH_NODE22 || DEFAULT_NODE22,
+    cpuProfileUs: null, cpuProfileDir: null };
   for (let index = 0; index < argv.length; index++) {
     const argument = argv[index], next = () => argv[++index];
     if (argument === "--corpus") options.corpus = resolve(next());
@@ -116,6 +124,11 @@ function parseArguments(argv) {
     else if (argument === "--import-only") options.importOnly = true;
     else if (argument === "--profile") options.profile = next();
     else if (argument === "--node22") options.node22 = next();
+    else if (argument === "--cpu-profile") {
+      const value = next();
+      if (!/^[1-9]\d{3,5}$/u.test(value ?? "")) fail("MEAS_SYNTH_ARGUMENT_INVALID", "--cpu-profile takes 1000..100000 us");
+      options.cpuProfileUs = Number(value);
+    } else if (argument === "--cpu-profile-dir") options.cpuProfileDir = resolve(next());
     else fail("MEAS_SYNTH_ARGUMENT_INVALID", argument);
   }
   if (!options.corpus || !options.out) fail("MEAS_SYNTH_ARGUMENT_INVALID", "--corpus and --out are required");
@@ -127,6 +140,9 @@ function parseArguments(argv) {
     fail("MEAS_SYNTH_ARGUMENT_INVALID", "--import-only imports a fresh database and runs nothing");
   }
   if (options.importOnly) options.keepDatabase = true;
+  if (options.cpuProfileDir !== null && options.cpuProfileUs === null) {
+    fail("MEAS_SYNTH_ARGUMENT_INVALID", "--cpu-profile-dir needs --cpu-profile");
+  }
   options.profile = measureProfile(options.profile);
   return options;
 }
@@ -175,6 +191,23 @@ function refreshEnv(endpoint, database, profile, extra = {}) {
   return { PATH: process.env.PATH, HOME: process.env.HOME, ANALYTICS_V2_TEST_CLOCK: "1",
     ANALYTICS_V2_MEMORY_BUDGET_MIB: String(profile.budgetMiB),
     PG_TEST_SOCKET: endpoint.host, PG_TEST_PORT: String(endpoint.port), PG_TEST_DATABASE: database, ...extra };
+}
+
+/** The profiler environment for --cpu-profile (empty without it). */
+export function cpuProfileEnv({ cpuProfileUs = null, cpuProfileDir = null } = {}) {
+  if (cpuProfileUs === null) return {};
+  return { ANALYTICS_V2_REFRESH_PROFILE: "cpu", ANALYTICS_V2_REFRESH_PROFILE_SAMPLE_US: String(cpuProfileUs),
+    ...(cpuProfileDir === null ? {} : { ANALYTICS_V2_REFRESH_PROFILE_DIR: cpuProfileDir }) };
+}
+
+/** The job's content-free profile summary lines (analytics-refresh-profile.mjs), oldest first. */
+export function profileLines(text) {
+  const lines = [];
+  for (const line of String(text ?? "").split("\n")) {
+    if (!line.startsWith("{\"profile\":")) continue;
+    try { lines.push(JSON.parse(line)); } catch { /* not JSON */ }
+  }
+  return lines;
 }
 
 /** The job's arguments under a profile (the wrapper's refreshJobCommand order). */
@@ -252,10 +285,11 @@ async function childPid(parentPid, { attempts = 50 } = {}) {
 }
 
 /** One full refresh under /usr/bin/time -l, measured to the end, its process sampled. */
-async function runRefresh({ node22, endpoint, database, schema, outDir, label, profile }) {
+async function runRefresh({ node22, endpoint, database, schema, outDir, label, profile, cpuProfile = {} }) {
   const started = performance.now();
   const child = spawn("/usr/bin/time", ["-l", node22, ...refreshArguments(profile, schema)], {
-    cwd: CLOUD_RUN_ROOT, env: refreshEnv(endpoint, database, profile), stdio: ["ignore", "pipe", "pipe"],
+    cwd: CLOUD_RUN_ROOT, env: refreshEnv(endpoint, database, profile, cpuProfileEnv(cpuProfile)),
+    stdio: ["ignore", "pipe", "pipe"],
   });
   let stdout = "", stderr = "";
   child.stdout.on("data", (chunk) => { stdout += chunk; });
@@ -272,7 +306,7 @@ async function runRefresh({ node22, endpoint, database, schema, outDir, label, p
   const samples = sampler?.samples ?? [];
   await writeFile(join(outDir, `${label}.samples.json`), `${JSON.stringify(samples)}\n`);
   return { exitCode, wallMs, receipt: lastJson(stdout), error: exitCode === 0 ? null : lastJson(stderr),
-    time: parseTimeL(stderr),
+    time: parseTimeL(stderr), profileLines: profileLines(stderr),
     utilisation: utilisationSummary(samples, { cores: profile.cpu }) };
 }
 
@@ -446,14 +480,15 @@ async function main() {
     }
     console.error(`# refresh (profile ${options.profile.name}) on ${schema}`);
     const run = await runRefresh({ node22: options.node22, endpoint, database, schema, outDir, label: "refresh-1",
-      profile: options.profile });
+      profile: options.profile, cpuProfile: { cpuProfileUs: options.cpuProfileUs, cpuProfileDir: options.cpuProfileDir } });
     report.steps.refresh = { exitCode: run.exitCode, wallMs: run.wallMs, state: run.receipt?.state ?? null,
       timingsMs: run.receipt?.timings ?? null, memory: run.receipt?.memory ?? null, reads: run.receipt?.reads ?? null,
       utilisation: run.utilisation,
       owners: run.receipt?.owners ?? null, ownerDays: run.receipt?.ownerDays ?? null,
       refusals: run.receipt?.refusals ?? null, refusalsByReason: run.receipt?.refusalsByReason ?? null,
       published: Array.isArray(run.receipt?.published) ? run.receipt.published.length : null,
-      blocked: run.receipt?.blocked ?? null, error: run.error, time: run.time };
+      blocked: run.receipt?.blocked ?? null, error: run.error, time: run.time,
+      cpuProfileUs: options.cpuProfileUs, profile: run.profileLines.at(-1) ?? null, profileLines: run.profileLines };
     await save();
     report.steps.outputs = await outputSizes(pool, schema);
     report.steps.outputDigests = await outputDigests(pool, schema);

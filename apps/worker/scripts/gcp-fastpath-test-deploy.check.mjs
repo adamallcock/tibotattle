@@ -36,6 +36,8 @@ import {
   measDatabasesListCommand,
   measExecutionCancelCommand,
   measIamUserCreateCommand,
+  measCreateFlags,
+  measFlagsListCommand,
   measInstanceCreateCommand,
   measInstanceDeleteCommand,
   measInstanceDescribeCommand,
@@ -64,7 +66,11 @@ import {
   renderOriginService,
   runningExecutions,
   sqlOperationWaitCommand,
+  REFRESH_PROFILE_SCHEMA,
   stepMeasCreate,
+  stepMeasMetrics,
+  stepMeasPgStat,
+  stepMeasPgStatEnable,
   stepMeasTeardown,
   stepRefreshUncapped,
   stepsReadGolden,
@@ -1084,7 +1090,7 @@ test("readExecutionLog orders status lines oldest first and waits out ingestion 
   assert.deepEqual(sleeps, [7, 7]);
   const empty = await readExecutionLog(scriptedRunner(() => []), REFRESH_JOB, execution,
     { attempts: 2, sleep: async () => {} });
-  assert.deepEqual(empty, { lines: [], systemMessages: [] });
+  assert.deepEqual(empty, { lines: [], systemMessages: [], profiles: [] });
 });
 
 test("a dry-run refresh-uncapped prints only reads and the one execution, never a deploy", async () => {
@@ -1205,7 +1211,10 @@ function measInstanceResource(overrides = {}, settingsOverrides = {}) {
     name: MEAS, project: "tibotattle", region: "us-east1", databaseVersion: "POSTGRES_17", state: "RUNNABLE",
     settings: { tier: "db-custom-4-16384", edition: "ENTERPRISE", availabilityType: "ZONAL", dataDiskType: "PD_SSD",
       connectorEnforcement: "REQUIRED", ipConfiguration: { ipv4Enabled: true, authorizedNetworks: [] },
-      databaseFlags: FASTPATH_MEASUREMENT.databaseFlags.map(([name, value]) => ({ name, value })),
+      databaseFlags: [...FASTPATH_MEASUREMENT.databaseFlags, ...FASTPATH_MEASUREMENT.diagnosticFlags]
+        .map(([name, value]) => ({ name, value })),
+      insightsConfig: { queryInsightsEnabled: true, queryPlansPerMinute: 5, queryStringLength: 4500,
+        recordApplicationTags: false, recordClientAddress: false },
       userLabels: { ...FASTPATH_MEASUREMENT.labels }, deletionProtectionEnabled: false, ...settingsOverrides },
     ...overrides,
   };
@@ -1316,11 +1325,25 @@ test("the measurement instance is production's shape: tier, storage, posture and
   const reference = cloudSqlCreateArgs({ ...loadCommittedDesiredState("staging"),
     cloudSql: { ...loadCommittedDesiredState("staging").cloudSql, tier: production.cloudSql.tier,
       storageSizeGb: production.cloudSql.storageSizeGb, maxConnections: production.cloudSql.maxConnections } });
-  const shared = (args) => args.filter((arg) => /^--(?:database-version|edition|tier|availability-type|storage-type|storage-size|storage-auto-increase|assign-ip|connector-enforcement|no-insights-config-query-insights-enabled|database-flags)\b/u.test(arg));
+  const shared = (args) => args.filter((arg) => /^--(?:database-version|edition|tier|availability-type|storage-type|storage-size|storage-auto-increase|assign-ip|connector-enforcement)\b/u.test(arg));
   assert.deepEqual(shared(create), shared([...reference]));
-  assert.equal(shared(create).length, 11);
-  const own = create.filter((arg) => !shared([arg]).length && !["sql", "instances", "create", MEAS].includes(arg));
+  assert.equal(shared(create).length, 9);
+  // Flags: production's, plus the profiling diagnostics, nothing else.
+  const flagsOf = (args) => args.find((arg) => arg.startsWith("--database-flags=")).slice("--database-flags=".length)
+    .split(",").sort();
+  const productionFlags = flagsOf([...reference]);
+  const diagnostics = m.diagnosticFlags.map(([name, value]) => `${name}=${value}`);
+  assert.deepEqual(flagsOf(create), [...productionFlags, ...diagnostics].sort());
+  assert.deepEqual(diagnostics, ["pg_stat_statements.track=all", "track_io_timing=on"]);
+  // Query Insights: production keeps it off; the measurement instance turns it on, without client
+  // addresses or application tags (a stated divergence for the profile).
+  assert.equal(reference.includes("--no-insights-config-query-insights-enabled"), true);
+  const own = create.filter((arg) => !shared([arg]).length && !arg.startsWith("--database-flags=")
+    && !["sql", "instances", "create", MEAS].includes(arg));
   assert.deepEqual(own, ["--project=tibotattle", "--region=us-east1", "--no-deletion-protection", "--no-backup",
+    "--insights-config-query-insights-enabled", "--insights-config-query-plans-per-minute=5",
+    "--insights-config-query-string-length=4500", "--no-insights-config-record-application-tags",
+    "--no-insights-config-record-client-address",
     "--labels=app=tibotattle,environment=test,managed-by=claude-fastpath,purpose=meas-prodtier", "--async",
     "--format=json"]);
   assert.equal(create.some((arg) => /authorized-networks|--no-assign-ip|--network=|--deletion-protection$/u.test(arg)), false);
@@ -1331,14 +1354,60 @@ test("the measurement instance is production's shape: tier, storage, posture and
     connectorEnforcement: "NOT_REQUIRED", tier: "db-g1-small" }), MEAS), ["tier", "authorizedNetworks", "connectorEnforcement"]);
   assert.deepEqual(measurementInstanceMismatches(measInstanceResource({}, { userLabels: {} }), MEAS), ["labels"]);
   assert.deepEqual(measurementInstanceMismatches(measInstanceResource({}, {
-    databaseFlags: [...FASTPATH_MEASUREMENT.databaseFlags.map(([name, value]) => ({ name, value })),
-      { name: "log_statement", value: "all" }] }), MEAS), ["databaseFlags"]);
+    databaseFlags: [...FASTPATH_MEASUREMENT.databaseFlags, ...FASTPATH_MEASUREMENT.diagnosticFlags]
+      .map(([name, value]) => ({ name, value })).concat([{ name: "log_statement", value: "all" }]) }), MEAS),
+  ["databaseFlags"]);
+  // The profiling diagnostics: required flags, an optional flag only at its value, and Query Insights.
+  assert.deepEqual(measurementInstanceMismatches(measInstanceResource({}, {
+    databaseFlags: FASTPATH_MEASUREMENT.databaseFlags.map(([name, value]) => ({ name, value })) }), MEAS),
+  ["diagnosticFlags"]);
+  assert.deepEqual(measurementInstanceMismatches(measInstanceResource({}, {
+    databaseFlags: [...FASTPATH_MEASUREMENT.databaseFlags, ...FASTPATH_MEASUREMENT.diagnosticFlags,
+      ...FASTPATH_MEASUREMENT.optionalDiagnosticFlags].map(([name, value]) => ({ name, value })) }), MEAS), []);
+  assert.deepEqual(measurementInstanceMismatches(measInstanceResource({}, {
+    databaseFlags: [...FASTPATH_MEASUREMENT.databaseFlags, ...FASTPATH_MEASUREMENT.diagnosticFlags]
+      .map(([name, value]) => ({ name, value })).concat([{ name: "cloudsql.enable_pg_stat_statements", value: "off" }]) }),
+  MEAS), ["diagnosticFlags"]);
+  for (const insightsConfig of [undefined, { queryInsightsEnabled: false }, { queryInsightsEnabled: true,
+    queryPlansPerMinute: 5, queryStringLength: 4500, recordClientAddress: true }]) {
+    assert.deepEqual(measurementInstanceMismatches(measInstanceResource({}, { insightsConfig }), MEAS), ["queryInsights"]);
+  }
+});
+
+test("meas-create's flags: a listing must name every mirrored and required flag; optional ones only when listed", () => {
+  const m = FASTPATH_MEASUREMENT;
+  assert.deepEqual(measFlagsListCommand(), ["gcloud", "sql", "flags", "list", "--database-version=POSTGRES_17",
+    "--project=tibotattle", "--format=json"]);
+  const names = (pairs) => pairs.map(([name]) => ({ name }));
+  const without = measCreateFlags(names([...m.databaseFlags, ...m.diagnosticFlags]));
+  assert.deepEqual(without.optionalApplied, []);
+  assert.deepEqual(without.optionalUnlisted, ["cloudsql.enable_pg_stat_statements"]);
+  assert.deepEqual(without.flags.map(([name]) => name), [...m.databaseFlags, ...m.diagnosticFlags].map(([name]) => name)
+    .sort());
+  const withOptional = measCreateFlags(names([...m.databaseFlags, ...m.diagnosticFlags, ...m.optionalDiagnosticFlags,
+    ["unrelated_flag"]]));
+  assert.deepEqual(withOptional.optionalApplied, ["cloudsql.enable_pg_stat_statements"]);
+  assert.equal(measInstanceCreateCommand(MEAS, withOptional.flags).find((arg) => arg.startsWith("--database-flags="))
+    .includes("cloudsql.enable_pg_stat_statements=on"), true);
+  for (const missing of ["track_io_timing", "pg_stat_statements.track", "cloudsql.iam_authentication"]) {
+    expectCode(() => measCreateFlags(names([...m.databaseFlags, ...m.diagnosticFlags])
+      .filter(({ name }) => name !== missing)), "FASTPATH_DEPLOY_MEAS_FLAG_UNSUPPORTED");
+  }
+  expectCode(() => measCreateFlags({ flags: [] }), "FASTPATH_DEPLOY_JSON_INVALID");
+  // The create command takes only a set measCreateFlags can return.
+  for (const flags of [m.databaseFlags, [...m.databaseFlags, ...m.diagnosticFlags, ["log_statement", "all"]],
+    [...m.databaseFlags, ["track_io_timing", "off"], ["pg_stat_statements.track", "all"]]]) {
+    expectCode(() => measInstanceCreateCommand(MEAS, flags), "FASTPATH_DEPLOY_ARGUMENT_INVALID");
+  }
 });
 
 test("meas-create builds the instance once, waits, reads it back, and refuses an instance it did not build", async () => {
   let created = false;
+  const listing = [...FASTPATH_MEASUREMENT.databaseFlags, ...FASTPATH_MEASUREMENT.diagnosticFlags]
+    .map(([name]) => ({ name }));
   const fresh = measRunner((kind) => {
     if (kind === "sql instances list") return [OTHER_INSTANCE];
+    if (kind === "sql flags list") return listing;
     if (kind === "sql instances describe") return created ? measInstanceResource() : assert.fail("describe before create");
     if (kind === "sql instances create") { created = true; return { name: "op-create-1" }; }
     if (kind === "sql operations wait") return undefined;
@@ -1350,12 +1419,15 @@ test("meas-create builds the instance once, waits, reads it back, and refuses an
   });
   let clock = 0;
   const receipt = await stepMeasCreate(fresh, { measInstance: MEAS }, { wallClock: () => (clock += 450_000) });
-  assert.deepEqual(fresh.commands.map(sqlKind), ["sql instances list", "sql instances create", "sql operations wait",
-    "sql instances describe", "sql databases list", "sql databases create", "sql users list", "sql users create",
-    "sql users create"]);
+  assert.deepEqual(fresh.commands.map(sqlKind), ["sql instances list", "sql flags list", "sql instances create",
+    "sql operations wait", "sql instances describe", "sql databases list", "sql databases create", "sql users list",
+    "sql users create", "sql users create"]);
   assert.deepEqual(fresh.commands[0], measInstancesListCommand());
-  assert.deepEqual(fresh.commands[1], measInstanceCreateCommand(MEAS));
-  assert.deepEqual(fresh.commands[2], sqlOperationWaitCommand("op-create-1"));
+  assert.deepEqual(fresh.commands[1], measFlagsListCommand());
+  assert.deepEqual(fresh.commands[2], measInstanceCreateCommand(MEAS));
+  assert.deepEqual(fresh.commands[3], sqlOperationWaitCommand("op-create-1"));
+  assert.deepEqual(receipt.optionalFlagsUnlisted, ["cloudsql.enable_pg_stat_statements"]);
+  assert.equal(receipt.databaseFlags.includes("track_io_timing=on"), true);
   assert.deepEqual(fresh.commands.slice(-2), FASTPATH_MEASUREMENT.iamServiceAccounts
     .map((account) => measIamUserCreateCommand(MEAS, account)));
   assert.deepEqual([receipt.existed, receipt.createSeconds, receipt.state, receipt.mismatches, receipt.databaseCreated],
@@ -1403,6 +1475,7 @@ test("meas-create builds the instance once, waits, reads it back, and refuses an
   let made = false;
   const drifted = measRunner((kind) => {
     if (kind === "sql instances list") return [];
+    if (kind === "sql flags list") return listing;
     if (kind === "sql instances describe") return made ? measInstanceResource({}, { connectorEnforcement: "NOT_REQUIRED" }) : FAILED;
     if (kind === "sql instances create") { made = true; return { name: "op-create-2" }; }
     if (kind === "sql operations wait") return undefined;
@@ -1411,6 +1484,16 @@ test("meas-create builds the instance once, waits, reads it back, and refuses an
   await assert.rejects(stepMeasCreate(drifted, { measInstance: MEAS }),
     (error) => error?.code === "FASTPATH_DEPLOY_MEAS_INSTANCE_UNEXPECTED" && error.message.endsWith("RUNNABLE,connectorEnforcement"));
   assert.deepEqual(drifted.receipts["meas-create.json"].mismatches, ["connectorEnforcement"]);
+
+  // A version whose listing lacks a required diagnostic flag: refused before any write.
+  const unsupported = measRunner((kind) => {
+    if (kind === "sql instances list") return [];
+    if (kind === "sql flags list") return listing.filter(({ name }) => name !== "track_io_timing");
+    return assert.fail(kind);
+  });
+  await assert.rejects(stepMeasCreate(unsupported, { measInstance: MEAS }),
+    (error) => error?.code === "FASTPATH_DEPLOY_MEAS_FLAG_UNSUPPORTED" && error.message.endsWith("track_io_timing"));
+  assert.deepEqual(unsupported.commands.map(sqlKind), ["sql instances list", "sql flags list"]);
 });
 
 test("meas-teardown cancels and deletes the Job, deletes only an instance it built, and is idempotent", async () => {
@@ -1675,4 +1758,234 @@ test("--meas-instance applies to the measurement steps only, and the meas steps 
     assert.equal(await run([step]), "FASTPATH_DEPLOY_ARGUMENT_INVALID", step);
     assert.equal(await run([step, "--meas-instance=tibotattle-primary"]), "FASTPATH_DEPLOY_MEAS_INSTANCE_INVALID", step);
   }
+});
+
+// ---------------------------------------------------------------------------
+// MEAS-SYNTH profiling: the profiled uncapped run, the database snapshots and
+// the Cloud Monitoring read.
+
+test("the profiler's summary lines are collected apart from status lines; the schema matches the Job's", async () => {
+  const { ANALYTICS_REFRESH_PROFILE_SCHEMA } = await import("../cloud-run/analytics-refresh-profile.mjs");
+  assert.equal(REFRESH_PROFILE_SCHEMA, ANALYTICS_REFRESH_PROFILE_SCHEMA);
+  const profile = (sequence, reason) => ({ profile: REFRESH_PROFILE_SCHEMA, sequence, reason, phase: "compute" });
+  const runner = scriptedRunner(() => [
+    { timestamp: "2026-10-04T03:00:01Z", jsonPayload: { status: "ok", state: "complete" } },
+    { timestamp: "2026-10-04T03:00:00Z", jsonPayload: profile(1, "exit") },
+    { timestamp: "2026-10-04T00:30:00Z", textPayload: JSON.stringify(profile(0, "interval")) },
+    { timestamp: "2026-10-04T00:00:01Z", jsonPayload: { profile: "something-else", sequence: 9 } },
+  ]);
+  const log = await readExecutionLog(runner, REFRESH_JOB, `${REFRESH_JOB}-ab12c`, { attempts: 1 });
+  assert.deepEqual(log.lines, [{ status: "ok", state: "complete" }]);
+  assert.deepEqual(log.profiles.map(({ sequence, reason }) => [sequence, reason]), [[0, "interval"], [1, "exit"]]);
+});
+
+test("the profiled run needs no guarded execution: refresh --no-execute deploys, refresh-uncapped follows it", async () => {
+  const deployedOnly = (dir) => ["refresh", `--image=${IMAGE}`, `--schema=${SEEDED}`, `--now=${MEAS_NOW}`,
+    "--refresh-profile=dense", `--meas-instance=${MEAS}`, "--no-execute",
+    "--refresh-env=ANALYTICS_V2_REFRESH_PROFILE=cpu", `--out=${join(dir, "out")}`];
+  await withFakeGcloud({
+    "run jobs list": { stdout: "[]" },
+    "run jobs deploy": { stdout: "" },
+  }, {
+    argv: deployedOnly,
+    async check({ result, calls, dir }) {
+      assert.deepEqual(result, { ok: true });
+      assert.deepEqual(calls.map((args) => kindOf(["gcloud", ...args])), ["run jobs list", "run jobs deploy"],
+        "deployed, never executed");
+      const deploy = calls[1];
+      assert.equal(deploy[3], MEAS_JOB);
+      assert.equal(deploy.find((arg) => arg.startsWith("--set-env-vars=")).includes("ANALYTICS_V2_REFRESH_PROFILE=cpu"),
+        true);
+      const receipt = JSON.parse(await readFile(join(dir, "out", "refresh.json"), "utf8"));
+      assert.deepEqual([receipt.step, receipt.executed, receipt.job, receipt.measInstance], ["refresh", false, MEAS_JOB,
+        MEAS]);
+    },
+  });
+  const dir = await mkdtemp(join(tmpdir(), "fastpath-uncapped-"));
+  try {
+    const env = [...GUARD_ENV, ["ANALYTICS_V2_REFRESH_PROFILE", "cpu"]];
+    const measTask = expectedRefreshTask({ image: IMAGE, now: MEAS_NOW, schema: SEEDED, extraEnv: env,
+      profile: "dense", measInstance: MEAS });
+    const guarded = { job: MEAS_JOB, measInstance: MEAS, executed: false, execution: undefined, succeeded: undefined,
+      durationSeconds: undefined, results: undefined };
+    const options = { ...await uncappedOptions(dir, guarded), measInstance: MEAS, refreshEnv: env };
+    const name = `${MEAS_JOB}-p9xyz`;
+    const execution = taskResource("Execution", { ...measTask, env: { ...measTask.env,
+      [REFRESH_TASK_TIMEOUT_ENV]: String(UNCAPPED) }, timeoutSeconds: UNCAPPED },
+    { metadata: { name, creationTimestamp: "2026-10-04T00:00:05Z" },
+      status: { startTime: "2026-10-04T00:00:20Z", completionTime: "2026-10-04T12:00:20Z", succeededCount: 1,
+        failedCount: 0, conditions: [{ type: "Completed", status: "True" }] } });
+    const ok = scriptedRunner((command, nth) => {
+      const kind = kindOf(command);
+      if (kind === "run jobs list") return [{ metadata: { name: MEAS_JOB } }];
+      if (kind === "run jobs describe") return taskResource("Job", measTask);
+      if (kind === "run jobs executions list" && nth === 1) return [];
+      if (kind === "run jobs execute") return execution;
+      if (kind === "logging read") {
+        return [{ timestamp: "2026-10-04T12:00:19Z", jsonPayload: { status: "ok", state: "complete" } },
+          { timestamp: "2026-10-04T12:00:18Z", jsonPayload: { profile: REFRESH_PROFILE_SCHEMA, sequence: 24,
+            reason: "exit" } }];
+      }
+      return assert.fail(kind);
+    });
+    const receipt = await stepRefreshUncapped(ok, options, IMAGE, NO_WAIT);
+    assert.deepEqual([receipt.outcome, receipt.afterRefresh.executed, receipt.afterRefresh.execution,
+      receipt.durationSeconds], ["complete", false, null, 43_200]);
+    assert.deepEqual(receipt.profiles.map(({ sequence }) => sequence), [24]);
+    // A deployed-only receipt that names an execution is a contradiction only the executed flag settles;
+    // one with neither is still refused.
+    const neither = scriptedRunner((command) => assert.fail(`no remote command: ${kindOf(command)}`));
+    await assert.rejects(stepRefreshUncapped(neither, { ...await uncappedOptions(dir, { ...guarded, executed: undefined }),
+      measInstance: MEAS, refreshEnv: env }, IMAGE, NO_WAIT),
+    (error) => error?.code === "FASTPATH_DEPLOY_UNCAPPED_AFTER_REFRESH_MISMATCH" && error.message.endsWith("execution"));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+/** A pg client stand-in for the snapshot: records every statement, answers from `answer(text)`. */
+function snapshotClient(answer) {
+  const sent = [];
+  return {
+    sent,
+    async query(text, values) {
+      sent.push(text.replace(/\s+/gu, " ").trim());
+      const value = answer(text, values);
+      if (value instanceof Error) throw value;
+      return { rows: value ?? [] };
+    },
+    release() {},
+  };
+}
+
+function snapshotPool(client, calls) {
+  return async (options, as, applicationName) => {
+    calls.push({ instance: options.measInstance, as, applicationName });
+    return { pool: { connect: async () => client, query: (text) => client.query(text) },
+      async close() { calls.push("closed"); } };
+  };
+}
+
+test("meas-pgstat reads one content-free snapshot in a read-only transaction and writes nothing", async () => {
+  const statement = (query, role, total) => ({ role, queryid: "-7351234567890", toplevel: true, query,
+    figures: { calls: 3, total_exec_time: total, rows: 9, shared_blks_read: 4, shared_blk_read_time: 1.5, userid: 10 } });
+  const client = snapshotClient((text) => {
+    if (/FROM pg_settings/u.test(text)) return [{ name: "track_io_timing", setting: "on", unit: null }];
+    if (/FROM pg_extension/u.test(text)) return [{ extversion: "1.11" }];
+    if (/FROM pg_stat_statements/u.test(text)) {
+      return [
+        statement("/* analytics_v2:occurrences.load */ SELECT x FROM t WHERE owner = $1 AND note = 'person@example.com'",
+          FASTPATH_TEST.runtimeIamUser, 900),
+        statement("INSERT INTO t VALUES ($$secret body$$, E'it''s')", FASTPATH_TEST.migratorIamUser, 50),
+        statement("<insufficient privilege>", "someone-else", 10),
+      ];
+    }
+    if (/FROM pg_stat_database/u.test(text)) return [{ row: { blks_read: 7, blks_hit: 70, datname: "x", stats_reset: "t" } }];
+    if (/FROM pg_stat_io/u.test(text)) return [{ row: { backend_type: "client backend", object: "relation",
+      context: "normal", reads: 5, read_time: 2.5, op_bytes: 8192 } }];
+    if (/to_regclass/u.test(text)) return [{ present: true }];
+    if (/FROM pg_stat_activity/u.test(text)) return [{ role: FASTPATH_TEST.runtimeIamUser,
+      application_name: "tibotattle-analytics-refresh", backend_type: "client backend", state: "active",
+      wait_event_type: "IO", wait_event: "DataFileRead", sessions: 1 }, { role: "x", application_name: "psql 'private'",
+      backend_type: "client backend", state: "idle", wait_event_type: null, wait_event: null, sessions: 2 }];
+    return [];
+  });
+  const calls = [];
+  const runner = measRunner(() => assert.fail("no gcloud"));
+  const result = await stepMeasPgStat(runner, { measInstance: MEAS, label: "during-03", as: "migrator" },
+    { createPool: snapshotPool(client, calls) });
+  assert.deepEqual(calls, [{ instance: MEAS, as: "migrator", applicationName: "tibotattle-meas-pgstat" }, "closed"]);
+  assert.equal(client.sent[0], "BEGIN READ ONLY");
+  assert.equal(client.sent.at(-1), "ROLLBACK");
+  for (const text of client.sent) {
+    assert.match(text, /^(?:BEGIN READ ONLY|ROLLBACK|SET LOCAL statement_timeout|SAVEPOINT|RELEASE SAVEPOINT|SELECT )/u, text);
+  }
+  const receipt = runner.receipts["meas-pgstat-during-03.json"];
+  assert.equal(result.path, "/receipts/meas-pgstat-during-03.json");
+  const text = JSON.stringify(receipt);
+  for (const leaked of ["person@example.com", "secret body", "it''s", "private", FASTPATH_TEST.runtimeIamUser,
+    FASTPATH_TEST.migratorIamUser, "someone-else"]) {
+    assert.equal(text.includes(leaked), false, leaked);
+  }
+  assert.deepEqual(receipt.statements.map(({ role, family, text: statementText }) => [role, family, statementText]), [
+    ["runtime", "occurrences.load", "/* analytics_v2:occurrences.load */ SELECT x FROM t WHERE owner = $1 AND note = '?'"],
+    ["migrator", null, "INSERT INTO t VALUES ('?', '?')"],
+    ["other", null, "(hidden)"],
+  ]);
+  assert.deepEqual([receipt.statementsTotal, receipt.hiddenStatements, receipt.statements[0].shared_blk_read_time],
+    [3, 1, 1.5]);
+  assert.equal(Object.hasOwn(receipt.statements[0], "userid"), false);
+  assert.deepEqual(receipt.database, { blks_read: 7, blks_hit: 70 });
+  assert.deepEqual(receipt.sessions.map(({ role, application, waitEvent }) => [role, application, waitEvent]),
+    [["other", "other", null], ["runtime", "tibotattle-analytics-refresh", "DataFileRead"]]);
+  // A label is required and closed.
+  for (const argv of [["meas-pgstat", `--meas-instance=${MEAS}`], ["meas-pgstat", `--meas-instance=${MEAS}`, "--label=A B"],
+    ["meas-pgstat", `--meas-instance=${MEAS}`, "--label=x", "--as=postgres"]]) {
+    await assert.rejects(main([...argv, "--dry-run", `--out=${join(tmpdir(), "fastpath-meas-args")}`]),
+      (error) => error?.code === "FASTPATH_DEPLOY_ARGUMENT_INVALID", argv.join(" "));
+  }
+});
+
+test("meas-pgstat-enable creates the extension on the measurement database only and fails when it cannot", async () => {
+  const ok = snapshotClient((text) => (/FROM pg_extension/u.test(text) ? [{ extversion: "1.11" }] : []));
+  const calls = [];
+  const runner = measRunner(() => assert.fail("no gcloud"));
+  const receipt = await stepMeasPgStatEnable(runner, { measInstance: MEAS }, { createPool: snapshotPool(ok, calls) });
+  assert.deepEqual([receipt.extension, receipt.reset], ["1.11", true]);
+  assert.deepEqual(ok.sent, ["CREATE EXTENSION IF NOT EXISTS pg_stat_statements",
+    "SELECT extversion FROM pg_extension WHERE extname = 'pg_stat_statements'", "SELECT pg_stat_statements_reset()"]);
+  assert.deepEqual(calls[0], { instance: MEAS, as: "migrator", applicationName: "tibotattle-meas-pgstat" });
+  const denied = snapshotClient((text) => (/CREATE EXTENSION/u.test(text)
+    ? Object.assign(new Error("permission denied"), { code: "42501" }) : []));
+  const failing = measRunner(() => assert.fail("no gcloud"));
+  await assert.rejects(stepMeasPgStatEnable(failing, { measInstance: MEAS }, { createPool: snapshotPool(denied, []) }),
+    (error) => error?.code === "FASTPATH_DEPLOY_MEAS_PGSTAT_UNAVAILABLE" && error.message.endsWith("42501"));
+  assert.deepEqual(failing.receipts["meas-pgstat-enable.json"].sqlState, "42501");
+  await assert.rejects(stepMeasPgStatEnable(failing, { measInstance: "tibotattle-primary" }),
+    (error) => error?.code === "FASTPATH_DEPLOY_MEAS_INSTANCE_INVALID");
+});
+
+test("meas-metrics reads only the measurement Job's and instance's series in the test project, GET only", async () => {
+  const requests = [];
+  const fetchImpl = async (url, init) => {
+    requests.push({ url, init });
+    const metric = new URL(url).searchParams.get("filter");
+    if (metric.includes("memory/utilizations")) return { ok: false, status: 404, json: async () => ({}) };
+    return { ok: true, status: 200, json: async () => ({ timeSeries: [{
+      resource: { type: "cloud_run_job", labels: { job_name: MEAS_JOB, location: "us-east1", instance_id: "abc123" } },
+      metric: { labels: { state: "active" } },
+      points: [{ interval: { endTime: "2026-10-04T00:02:00Z" }, value: { doubleValue: 0.5 } },
+        { interval: { endTime: "2026-10-04T00:01:00Z" }, value: { distributionValue: { mean: 0.25 } } },
+        { interval: { endTime: "2026-10-04T00:03:00Z" }, value: { int64Value: "1" } }] }] }) };
+  };
+  const runner = measRunner(() => assert.fail("no gcloud"));
+  const result = await stepMeasMetrics(runner, { measInstance: MEAS, since: "2026-10-04T00:00:00Z",
+    until: "2026-10-04T13:00:00Z" }, { token: () => "test-token-value", fetchImpl });
+  assert.ok(requests.length >= 8);
+  for (const { url, init } of requests) {
+    const parsed = new URL(url);
+    assert.equal(parsed.origin + parsed.pathname, "https://monitoring.googleapis.com/v3/projects/tibotattle/timeSeries");
+    assert.equal(init.method, "GET");
+    assert.equal(init.headers.authorization, "Bearer test-token-value");
+    const filter = parsed.searchParams.get("filter");
+    assert.ok(filter.includes(`resource.labels.job_name = "${MEAS_JOB}"`)
+      || filter.includes(`resource.labels.database_id = "tibotattle:${MEAS}"`), filter);
+    assert.equal(url.includes("test-token-value"), false);
+  }
+  const receipt = runner.receipts["meas-metrics.json"];
+  assert.equal(JSON.stringify(receipt).includes("test-token-value"), false);
+  const cpu = receipt.metrics.find(({ metric, aligner }) => metric === "job-cpu-utilization" && aligner === "ALIGN_MEAN");
+  assert.deepEqual([cpu.httpStatus, cpu.series[0].points, cpu.series[0].mean, cpu.series[0].max, cpu.series[0].first],
+    [200, 3, 0.5833, 1, "2026-10-04T00:01:00Z"]);
+  assert.deepEqual(cpu.series[0].resource, { job_name: MEAS_JOB, location: "us-east1" }, "only closed labels are kept");
+  assert.equal(receipt.metrics.find(({ metric }) => metric === "job-memory-utilization").httpStatus, 404);
+  assert.equal(result.metrics.length, requests.length);
+  for (const argv of [["meas-metrics", `--meas-instance=${MEAS}`], ["meas-metrics", `--meas-instance=${MEAS}`,
+    "--since=2026-10-04T00:00:00Z"], ["meas-metrics", `--meas-instance=${MEAS}`, "--since=yesterday",
+    "--until=2026-10-04T00:00:00Z"]]) {
+    await assert.rejects(main([...argv, "--dry-run", `--out=${join(tmpdir(), "fastpath-meas-args")}`]),
+      (error) => error?.code === "FASTPATH_DEPLOY_ARGUMENT_INVALID", argv.join(" "));
+  }
+  await assert.rejects(stepMeasMetrics(runner, { measInstance: MEAS, since: "2026-10-04T13:00:00Z",
+    until: "2026-10-04T00:00:00Z" }, { token: () => "t", fetchImpl }), (error) => error?.code === "MEAS_METRICS_WINDOW_INVALID");
 });

@@ -26,15 +26,253 @@ What this proves, and what it does not:
   `refresh-uncapped`, which times the long run.
 - Nothing here read production data or touched a remote resource.
 
-This receipt holds two rounds, both on 2026-10-03:
+This receipt holds three rounds, all on 2026-10-03:
 
-- **Second round** (next section): the same corpus on the K-CORE-A engine
+- **Third round** (next section): profiling for the production-tier cloud
+  run. It adds the job's opt-in CPU profiler, database statistics snapshots
+  and a Cloud Monitoring read, makes one profiled uncapped run the kit's
+  default, and measures the profiler's overhead on a 1% slice. It supersedes
+  the second round's kit where it says so.
+- **Second round**: the same corpus on the K-CORE-A engine
   (`claude/gcp-fastpath-final` `f6cbab90`, merged at `71b3a21b`). It
   supersedes the first round's cloud projection, its K-CORE-A notes and its
   cloud gate. It adds a production-tier cloud kit.
 - **First round** (from "Corpus" on): the pre-K-CORE-A engine (`f8a8620d`).
   It is kept unchanged as that day's evidence. Its corpus and import facts
   still hold.
+
+## Third round: profiling the production-tier run
+
+The owner asked (2026-10-03) for the 10 to 13 h production-tier run to be
+fully profiled, and for a small slice to show where the time goes. This round
+adds the profiling to the kit and checks it locally on a 1% slice. **No cloud
+step ran.** Branch `claude/gcp-fp-meas-synth`, on `cfd610f0`.
+
+### What the kit now records
+
+**The job (`apps/worker/cloud-run/analytics-refresh-profile.mjs`):**
+
+- `ANALYTICS_V2_REFRESH_PROFILE=cpu` starts node:inspector's sampling
+  profiler in the job's main thread. `ANALYTICS_V2_REFRESH_PROFILE_SAMPLE_US`
+  sets the interval (default 10,000 us, 1,000 to 100,000).
+- Every 30 min (`ANALYTICS_V2_REFRESH_PROFILE_SUMMARY_SECONDS`), at exit
+  (complete, refused, failed, the time guard included) and on SIGTERM (Cloud
+  Run's task timeout or a cancel), it writes one JSON line to stderr:
+  - the top 40 functions by self time and by total time since the start, the
+    top 20 files, and the window's top 15;
+  - the run phase and owner progress counts;
+  - heap and resident set, GC count and time by kind, CPU time and busy
+    cores, and event-loop utilisation.
+- It is content-free. A function is `<repository path>:<name>`. The path
+  comes from the bundle's own module markers, and any other path is cut to its
+  repository or `node_modules` tail. A name that is not identifier-like is
+  `(unnamed)`, and a compiled regular expression is `(native):(regexp)`.
+- A production target refuses every `ANALYTICS_V2_REFRESH_PROFILE*` variable
+  (`ANALYTICS_V2_REFRESH_PROFILE_FORBIDDEN`). A staging target accepts the
+  mode, interval and period, and nothing else. The test targets, the
+  measurement job included, accept them too. Only a local run, outside Cloud
+  Run, accepts `ANALYTICS_V2_REFRESH_PROFILE_DIR` for raw `.cpuprofile` files.
+- The line has no `status` key. The wrapper's log read keeps the lines apart
+  (`profiles` in `refresh.json` and `refresh-uncapped.json`), and they stay in
+  Cloud Logging if the run is killed.
+- **No raw profile is uploaded from Cloud Run.** The runtime account's only
+  bucket write is the fast-path origin bucket's `telemetry/` namespace, which
+  the origin reads, and the job image has no storage client. The summary lines
+  are the cloud record.
+- It profiles the main thread only. K-PAR Workers (`dense-workers`) are
+  separate isolates and are not sampled.
+
+**The database (the wrapper):**
+
+- `meas-create` reads `gcloud sql flags list --database-version=POSTGRES_17`
+  first and refuses before any write unless the listing names every flag. It
+  then creates the instance with production's flags plus
+  `pg_stat_statements.track=all` and `track_io_timing=on`.
+  `cloudsql.enable_pg_stat_statements=on` is added only when the listing names
+  it (this round could not check whether it exists), and the receipt records
+  which. Query Insights is on: 5 plans per minute, 4,500-byte query text, no
+  client addresses or application tags. Everything is set at creation, so
+  nothing restarts mid-run.
+  - This is a stated divergence from production, which runs Insights off and
+    neither diagnostic flag. Their overhead was not measured.
+- `meas-pgstat-enable` (the one write, on the measurement database only, as
+  the migrator IAM user): `CREATE EXTENSION IF NOT EXISTS pg_stat_statements`,
+  then `pg_stat_statements_reset()` when the role may. If it fails, the run
+  goes on without statement statistics.
+- `meas-pgstat --label=<name>`: read-only (`BEGIN READ ONLY`, 60 s statement
+  timeout), through the connector, as the migrator. It snapshots
+  `pg_stat_statements` (query fingerprint, normalized text with every literal
+  replaced by `'?'`, the K-PGSTAT family tag), `pg_stat_database`,
+  `pg_stat_io`, `pg_stat_wal`, `pg_stat_checkpointer`, the seeded schema's
+  table and index I/O, and the sessions by wait event. Roles and application
+  names are classed, never named.
+
+**Cloud Run:** `meas-metrics --since --until` reads Cloud Monitoring
+(read-only GETs, project `tibotattle` only, the operator's token held in
+memory). It reads the measurement job's container CPU and memory utilisation
+(per-minute mean and 99th percentile) and received bytes, and the instance's
+CPU, memory, disk operations and bytes sent.
+
+**The run shape (`run-prodtier-measurement.sh`):**
+
+- One profiled, **uncapped** run per profile is the default. `refresh
+  --no-execute` deploys the job (its `refresh.json` says `executed: false`),
+  and `refresh-uncapped` follows it directly.
+- The guarded run is optional (`MEAS_GUARDED=1`, default off). Round 17 raises
+  the timeout anyway.
+- Database snapshots are taken before the run, every 30 min during it (a
+  sampler beside the waited child) and after it. Then the metrics are read.
+- `summarize-prodtier.mjs` writes `summary.json`. It works on a partial
+  directory, so a killed run still shows its last profile line, its database
+  delta to the last snapshot and its sessions.
+- Teardown is unchanged: the `EXIT` trap, and a signal stops the child and the
+  sampler at once (`prod-shape.check.mjs` sends TERM to the script's own
+  functions with a sampler running).
+
+### The 1% slice: where the time goes
+
+This was run locally, as a check of the profiler and its overhead:
+
+- The production-shaped generator at scale 0.01: 54 owners and 82,971
+  records (usage 68,581, quota 11,642, session 2,748), sealed `c3fed4dc…`.
+- Imported once through the reviewed chain (69 migrations), then one template
+  copy per run.
+- Node 22.16.0 for the job, the `dense` profile, on the PostgreSQL 17 fan-out
+  cluster.
+- The host was shared and loaded (load 7 to 9). The databases were dropped
+  afterwards.
+
+One run at 1 ms sampling (74.8 s wall):
+
+| Phase | Time |
+|---|---:|
+| Read | 37.6 s: 15,032 statements, 23.7 s in statements, 13.9 s unattributed client work |
+| Prepare | 27.6 s |
+| Model | 6.9 s |
+| Scalar, community, cache, write | 1.2, 0.5, 0.2, 0.4 s |
+
+The profile of the main thread, by share of sampled time:
+
+- 37% idle: waiting on PostgreSQL, in line with the 23.7 s of statements.
+- Most of the CPU goes to preparing days.
+  `analytics-shared-reducers.ts:prepareSharedAnalyticsDay` holds 27% in total.
+  Inside it:
+  - `v11-daily-projection-values.ts:foldV11DailyProjectionValues`: 21%
+    (validate 14%, merge 11%, normalize 9%; `closed` alone 5% self);
+  - telemetry v1.1 parsing and canonical JSON: about 7%;
+  - reconciliation (`reconcileGroups`): 7%;
+  - pricing (`priceChunkUsageRecord`): 7%.
+- GC: about 4% (8,139 minor collections, 2.1 s). Compiled regular expressions:
+  about 3%.
+
+**This mix is not the 13 h run's.** At full scale the model phase is 58% of
+the local run (8,688 of 15,061 s). Here it is 9%, because it grows with each
+owner's analysis rows. So the slice says where read and prepare time goes. It
+says little about model time. The cloud run's profile lines answer that.
+
+### Profiler overhead
+
+The same slice was run with the profiler off and at 1, 5 and 10 ms, three
+times each, interleaved, on template copies:
+
+| Sampling | Wall time, s (3 runs) | Fastest vs off | Median vs off | Samples |
+|---|---|---:|---:|---:|
+| off | 74.6, 71.7, 82.4 | | | |
+| 1 ms | 74.8, 75.3, 81.8 | +4.3% | +1.0% | about 54,000 |
+| 5 ms | 76.1, 75.8, 92.5 | +5.7% | +2.1% | about 12,000 |
+| 10 ms | 74.7, 84.2, 85.6 | +4.2% | +12.9% | about 6,500 |
+
+A fixed CPU-bound loop was also timed: five fresh processes per mode,
+interleaved, about 2.2 s each. Its medians against off were −0.2% (1 ms),
++2.1% (5 ms) and −1.0% (10 ms).
+
+What these show:
+
+- The profiler's cost is **not separable from this host's noise**. With the
+  profiler off, the slice alone spread 15%.
+- The differences do not scale with the sampling rate: 1 ms takes about
+  eight times the samples of 10 ms at the same cost.
+- The defensible statement is: under about 5% on this host at 1 to 10 ms, and
+  about 2% or less on pure compute.
+- The kit samples at 10 ms. That gives about 180,000 samples per 30-minute
+  window, with the smallest footprint.
+- The overhead on Cloud Run is not measured.
+
+### Running it
+
+The run script (`apps/worker/scripts/gcp-fastpath-prod-shape/run-prodtier-measurement.sh`)
+is the runbook: its header lists every step and setting. Defaults:
+
+- the `dense` profile only;
+- no guarded run;
+- the CPU profiler at 10 ms;
+- database snapshots every 1,800 s;
+- an uncapped cap of 172,800 s.
+
+The image must be built from this round's commit. An image of `cfd610f0` has
+no profiler: it ignores the setting and runs unprofiled.
+
+| Step | Expected duration |
+|---|---|
+| Build | about 2 to 15 min |
+| `meas-create` (flag listing first) | 10 to 20 min |
+| Seed | 2 to 6 h |
+| `meas-pgstat-enable`, each `meas-pgstat` | under a minute each |
+| Deploy (`refresh --no-execute`) | about a minute |
+| Uncapped, profiled `dense` run | 10 to 13 h projected (cap 48 h); about 26 profile lines and 26 snapshots |
+| `meas-metrics` | about a minute; rerunnable later, read-only |
+| `meas-teardown` | about 5 to 10 min |
+
+If the run is killed:
+
+- The job's last profile lines are in Cloud Logging (filter
+  `jsonPayload.profile="analytics-refresh-profile-v1"` on the measurement
+  job).
+- The snapshots taken so far are in `$OUT/pgstat`, and
+  `summarize-prodtier.mjs $OUT dense` summarises them.
+- Teardown follows the second round's rules.
+
+### Reproduce (third round)
+
+Local only:
+
+- Generate the slice, then import it once:
+
+  ```
+  … seed-source.mjs --work-dir <dir> --scale 0.01
+  … measure-local.mjs --corpus <dir> --out <import.json> --import-only
+  ```
+
+- One run per mode, each on a template copy:
+
+  ```
+  … measure-local.mjs --corpus <dir> --out <report.json> --clone-from meas_synth_<hex> [--cpu-profile 1000|5000|10000] [--cpu-profile-dir <dir>]
+  ```
+
+  Each report keeps every profile line (`steps.refresh.profileLines`).
+
+- Checks, all passing on this branch:
+  - `apps/worker/cloud-run` `npm run check`, under Node 26;
+  - `npm --prefix apps/worker run gcp:fastpath:scripts-check`;
+  - `npm --prefix apps/worker run gcp:ops:infra:check`;
+  - the refresh spec's "database targets|production target" tests;
+  - root `npm run test:preflight` and `npm run architecture:check`.
+
+### Gates this round has not passed
+
+- No gcloud command ran. This affects four things:
+  - whether `cloudsql.enable_pg_stat_statements` exists, which the create
+    handles either way;
+  - whether the migrator may `CREATE EXTENSION`: the IAM users'
+    `cloudsqlsuperuser` membership on a fresh instance is still the second
+    round's assumption, and a failure leaves the run without statement
+    statistics;
+  - whether Cloud Monitoring serves container utilisation for a
+    `cloud_run_job`: a metric that answers an error is recorded and the rest
+    go on;
+  - Query Insights' plan sampling on this tier.
+- Cloud Logging's retention bounds how long the profile lines can be read
+  back. Each line is about 11 KB.
 
 ## Second round: K-CORE-A engine
 

@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -270,20 +270,36 @@ test("the production-tier script reaches only its measurement instance, through 
     .join("\n").replaceAll("\\\n", " ");
   assert.doesNotMatch(code, /(?:^|[\s;|&(`$])gcloud(?:\s|$)/mu, "no direct gcloud command");
   const steps = new Set([...code.matchAll(/(?:^|[\s;{])D ([a-z-]+)/gmu)].map(([, step]) => step));
-  assert.deepEqual([...steps].sort(), ["build", "meas-create", "meas-teardown", "refresh", "refresh-uncapped"]);
+  assert.deepEqual([...steps].sort(), ["build", "meas-create", "meas-metrics", "meas-pgstat", "meas-pgstat-enable",
+    "meas-teardown", "refresh", "refresh-uncapped"]);
   const lines = code.split("\n");
-  // A long step is `child <stdout> <stderr|-> <command>`: a background child the shell waits on.
-  const CHILD = /^child\s+\S+\s+\S+\s+/u;
+  // A long step is `child <stdout> <stderr|-> <command>` (or `sampled <label> ...`, the same with the
+  // database sampler running): a background child the shell waits on.
+  const CHILD = /^(?:child|sampled\s+\S+)\s+\S+\s+\S+\s+/u;
   const calls = (step) => lines.filter((line) => line.trimStart().replace(CHILD, "").startsWith(`D ${step} `));
-  for (const step of ["meas-create", "meas-teardown", "refresh", "refresh-uncapped"]) {
+  for (const step of ["meas-create", "meas-teardown", "refresh", "refresh-uncapped", "meas-pgstat-enable", "meas-pgstat",
+    "meas-metrics"]) {
     assert.ok(calls(step).length > 0, step);
     for (const line of calls(step)) assert.equal(line.includes('--meas-instance="$INSTANCE"'), true, `${step} names the instance`);
   }
   for (const step of ["refresh", "refresh-uncapped"]) {
-    for (const flag of ['--image="$IMG"', '--schema="$SCHEMA"', '--now="$NOW"', '--refresh-profile="$PROFILE"', '"${GUARD[@]}"']) {
-      assert.equal(calls(step)[0].includes(flag), true, `${step} ${flag}`);
+    for (const line of calls(step)) {
+      for (const flag of ['--image="$IMG"', '--schema="$SCHEMA"', '--now="$NOW"', '--refresh-profile="$PROFILE"',
+        '"${REFRESH_ENV[@]}"']) {
+        assert.equal(line.includes(flag), true, `${step} ${flag}`);
+      }
     }
   }
+  // The profiled uncapped run is the default: the guarded execution is opt-in, and without it the Job is
+  // deployed only (refresh --no-execute) for refresh-uncapped to follow. The CPU profiler is on by default.
+  assert.match(code, /^GUARDED=\$\{MEAS_GUARDED:-0\}$/mu);
+  assert.match(code, /^CPU_PROFILE=\$\{MEAS_CPU_PROFILE:-cpu\}$/mu);
+  assert.equal(calls("refresh").filter((line) => line.includes("--no-execute")).length, 1);
+  assert.match(code, /REFRESH_ENV\+=\(--refresh-env=ANALYTICS_V2_REFRESH_PROFILE=cpu\s+--refresh-env=ANALYTICS_V2_REFRESH_PROFILE_SAMPLE_US="\$CPU_SAMPLE_US"\)/u);
+  // Database snapshots before, during (the sampler) and after; Cloud Monitoring after.
+  for (const label of ['"$PROFILE-before"', '"$PROFILE-after"']) assert.ok(code.includes(`pgstat ${label}`), label);
+  assert.match(code, /pgstat "\$1-during-\$\(printf %02d \$n\)"/u);
+  assert.equal(calls("refresh-uncapped").every((line) => line.trimStart().startsWith("sampled ")), true);
   const seed = lines.find((line) => line.includes("gcp-fastpath-seed.mjs seed"));
   assert.equal(seed.includes('--meas-instance="$INSTANCE"'), true, "the seed dials the measurement instance only");
   // The teardown trap is set before the instance can exist, and runs on every exit.
@@ -321,23 +337,31 @@ test("the production-tier script's signal handling tears down at once and leaves
   };
   const marker = `29.${process.pid % 10_000}1`;
   const dir = mkdtempSync(join(tmpdir(), "prodtier-trap-"));
-  const harness = ["set -u", "zmodload zsh/datetime", "T0=$EPOCHREALTIME", "TORN=0", "CHILD=0",
+  const harness = ["set -u", "zmodload zsh/datetime", "T0=$EPOCHREALTIME", "TORN=0", "CHILD=0", "SAMPLER=0",
     definition("child"), definition("tree"), definition("stop"),
     "teardown() { [[ $TORN == 1 ]] && return; TORN=1; printf 'teardown %.1f\\n' $(( EPOCHREALTIME - T0 )); }",
     // D's shape: a function whose process runs another (node, then its gcloud).
     `D() { /bin/sh -c '/bin/sleep ${marker}; true'; }`,
     "trap teardown EXIT", "trap stop INT TERM HUP",
     `child "${join(dir, "step.log")}" - D x || exit 1`, "echo finished"].join("\n");
+  // The same with the database sampler running beside the step (`sampled`): both trees end.
+  const samplerMarker = `31.${process.pid % 10_000}2`;
+  const sampledHarness = harness.replace(`child "${join(dir, "step.log")}" - D x || exit 1`, [
+    `PGSTAT_INTERVAL=${samplerMarker}`, "pgstat() { true; }", definition("sampler"), definition("sampled"),
+    `sampled lbl "${join(dir, "step.log")}" - D x || exit 1`].join("\n"));
   const running = () => spawnSync("pgrep", ["-f", `sleep ${marker}`], { encoding: "utf8" }).status === 0;
+  const samplerRunning = () => spawnSync("pgrep", ["-f", `sleep ${samplerMarker}`], { encoding: "utf8" }).status === 0;
   try {
-    for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
-      const shell = spawn("zsh", ["-c", harness], { stdio: ["ignore", "pipe", "pipe"] });
+    for (const [signal, script] of [["SIGTERM", harness], ["SIGINT", harness], ["SIGHUP", harness],
+      ["SIGTERM", sampledHarness]]) {
+      const shell = spawn("zsh", ["-c", script], { stdio: ["ignore", "pipe", "pipe"] });
       let output = "";
       shell.stdout.on("data", (chunk) => { output += chunk; });
       const exited = new Promise((resolveExit) => shell.on("exit", (code) => resolveExit(code)));
       const started = Date.now();
       while (!running() && Date.now() - started < 10_000) await new Promise((wake) => setTimeout(wake, 100));
       assert.equal(running(), true, "the stand-in step started");
+      if (script === sampledHarness) assert.equal(samplerRunning(), true, "the sampler is running beside it");
       const signalled = Date.now();
       shell.kill(signal);
       const code = await exited;
@@ -346,9 +370,11 @@ test("the production-tier script's signal handling tears down at once and leaves
       assert.match(output, /^teardown \d+\.\d\n$/u, `${signal}: teardown ran, the step did not finish`);
       await new Promise((wake) => setTimeout(wake, 300));
       assert.equal(running(), false, `${signal}: no orphaned grandchild`);
+      assert.equal(samplerRunning(), false, `${signal}: no orphaned sampler`);
     }
   } finally {
     spawnSync("pkill", ["-f", `sleep ${marker}`]);
+    spawnSync("pkill", ["-f", `sleep ${samplerMarker}`]);
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -374,4 +400,90 @@ test("the local measurement runs the wrapper's dense profiles and summarises bus
   // Run identity, stamps and instants only: every stored value is compared.
   assert.deepEqual([...OUTPUT_DIGEST_VOLATILE_KEYS].sort(), ["compatibility_sha256", "computed_at", "finished_at",
     "kernel_id", "manifest_version", "registered_at", "released_at", "run_id", "started_at", "timings"]);
+});
+
+// MEAS-SYNTH profiling: the local run's profiler options, the database delta
+// and the run's summary over a partial receipt directory.
+test("the local measurement passes the profiler's env and keeps only its summary lines", async () => {
+  const { cpuProfileEnv, profileLines } = await import("./measure-local.mjs");
+  assert.deepEqual(cpuProfileEnv(), {});
+  assert.deepEqual(cpuProfileEnv({ cpuProfileUs: 5_000 }), { ANALYTICS_V2_REFRESH_PROFILE: "cpu",
+    ANALYTICS_V2_REFRESH_PROFILE_SAMPLE_US: "5000" });
+  assert.deepEqual(cpuProfileEnv({ cpuProfileUs: 1_000, cpuProfileDir: "/abs/dir" }).ANALYTICS_V2_REFRESH_PROFILE_DIR,
+    "/abs/dir");
+  const stderr = ['{"profile":"analytics-refresh-profile-v1","sequence":0}', "not json",
+    '{"status":"failed","code":"X"}', '{"profile":"analytics-refresh-profile-v1","sequence":1}', "  1 real"].join("\n");
+  assert.deepEqual(profileLines(stderr).map(({ sequence }) => sequence), [0, 1]);
+});
+
+test("the database delta ranks statements by server time and counts a new statement from zero", async () => {
+  const { measPgStatDelta, measStatementText, measStatementFamily, measRoleClass } = await import("./meas-pgstat.mjs");
+  const row = (queryid, calls, total, extra = {}) => ({ queryid, role: "runtime", toplevel: true, family: null,
+    text: "SELECT $1", calls, total_exec_time: total, total_plan_time: 1, rows: calls, ...extra });
+  const before = { label: "dense-before", takenAt: "t0", extension: { name: "pg_stat_statements" },
+    statements: [row("1", 10, 100), row("2", 5, 50)], database: { blks_read: 10, numbackends: 3 },
+    io: [{ backend_type: "client backend", object: "relation", context: "normal", reads: 4, op_bytes: 8192 }],
+    wal: { wal_bytes: 100 } };
+  const after = { label: "dense-after", takenAt: "t1", extension: { name: "pg_stat_statements" },
+    statements: [row("1", 12, 130), row("2", 5, 50), row("3", 2, 900, { family: "occurrences.load" })],
+    database: { blks_read: 25, numbackends: 1 },
+    io: [{ backend_type: "client backend", object: "relation", context: "normal", reads: 10, op_bytes: 8192 }],
+    wal: { wal_bytes: 160 } };
+  const delta = measPgStatDelta(before, after);
+  assert.deepEqual(delta.statements.map(({ queryid, calls, total_exec_time: ms }) => [queryid, calls, ms]),
+    [["3", 2, 900], ["1", 2, 30]]);
+  assert.deepEqual([delta.execMs, delta.statementsComparable, delta.database, delta.wal],
+    [930, true, { blks_read: 15 }, { wal_bytes: 60 }]);
+  assert.deepEqual(delta.io, [{ backend_type: "client backend", object: "relation", context: "normal", reads: 6 }]);
+  assert.equal(measStatementText("SELECT 'a''b', $tag$x$tag$, E'\\n' FROM t WHERE c = 'cut"), "SELECT '?', '?', '?' FROM t WHERE c = '?'");
+  assert.equal(measStatementText("<insufficient privilege>"), "(hidden)");
+  assert.equal(measStatementText("x".repeat(500)).length, 240);
+  assert.equal(measStatementFamily("/* analytics_v2:owners.list */ SELECT 1"), "owners.list");
+  assert.equal(measStatementFamily("SELECT 1 /* analytics_v2:owners.list */"), null);
+  assert.deepEqual(["m", "r", "cloudsqladmin", "postgres", "someone"].map((name) => measRoleClass(name,
+    { migrator: "m", runtime: "r" })), ["migrator", "runtime", "cloudsqladmin", "postgres", "other"]);
+});
+
+test("the run summary reads a partial receipt directory: a killed run still shows its profile and database delta", async () => {
+  const { summarizeProdtier } = await import("./summarize-prodtier.mjs");
+  const dir = mkdtempSync(join(tmpdir(), "prodtier-summary-"));
+  try {
+    const write = (path, value) => {
+      mkdirSync(dirname(join(dir, path)), { recursive: true });
+      writeFileSync(join(dir, path), JSON.stringify(value));
+    };
+    const snapshot = (label, calls, sessions = []) => ({ label, takenAt: label, extension: { name: "pg_stat_statements" },
+      statements: [{ queryid: "1", role: "runtime", toplevel: true, family: "occurrences.load", text: "SELECT $1",
+        calls, total_exec_time: calls * 10 }], database: { blks_read: calls }, io: [], wal: {}, sessions });
+    write("dense/refresh/refresh.json", { step: "refresh", executed: false, job: "j" });
+    // Killed: refresh-uncapped never wrote its receipt, and no "after" snapshot was taken.
+    write("pgstat/meas-pgstat-dense-before.json", snapshot("dense-before", 0));
+    write("pgstat/meas-pgstat-dense-during-01.json", snapshot("dense-during-01", 5));
+    write("pgstat/meas-pgstat-dense-during-02.json", snapshot("dense-during-02", 9,
+      [{ role: "runtime", waitEvent: "DataFileRead", sessions: 1 }]));
+    write("pgstat/meas-pgstat-dense-workers-during-01.json", snapshot("dense-workers-during-01", 99));
+    const summary = summarizeProdtier(dir, ["dense"]);
+    const dense = summary.runs.dense;
+    assert.deepEqual(dense.guarded, { executed: false });
+    assert.equal(dense.uncapped, null);
+    assert.deepEqual(dense.snapshots, { before: true, during: 2, after: false });
+    assert.deepEqual([dense.database.to.label, dense.database.execMs, dense.database.statements[0].calls],
+      ["dense-during-02", 90, 9]);
+    assert.deepEqual(dense.sessions.map(({ label }) => label), ["dense-before", "dense-during-01", "dense-during-02"]);
+    assert.equal(dense.cloudMonitoring, null);
+    // With the uncapped receipt and its profile lines, the last line and the cadence are kept.
+    const line = (sequence, reason) => ({ profile: "analytics-refresh-profile-v1", sequence, reason, phase: "compute",
+      elapsedSeconds: sequence * 1800, progress: { ownersStarted: sequence }, memory: { heapUsedMiB: 1 },
+      eventLoop: { utilization: 0.9 }, gc: { ms: 5 }, top: { self: [["(garbage collector)", 1, 1]] } });
+    write("dense/uncapped/refresh-uncapped.json", { step: "refresh-uncapped", execution: "j-x", durationSeconds: 3_600,
+      outcome: "complete", statusLine: { status: "ok", state: "complete", timings: { read: 1 } },
+      profiles: [line(0, "interval"), line(1, "exit")] });
+    const full = summarizeProdtier(dir, ["dense"]).runs.dense;
+    assert.deepEqual([full.uncapped.outcome, full.uncapped.state, full.profile.lines, full.profile.last.reason],
+      ["complete", "complete", 2, "exit"]);
+    assert.deepEqual(full.profile.cadence.map(({ sequence, elapsedSeconds }) => [sequence, elapsedSeconds]),
+      [[0, 0], [1, 1800]]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

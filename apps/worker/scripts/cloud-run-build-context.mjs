@@ -129,6 +129,8 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/analytics-refresh-read.mjs", destination: "apps/worker/cloud-run/analytics-refresh-read.mjs" }),
   Object.freeze({ source: "cloud-run/analytics-refresh-pool.mjs", destination: "apps/worker/cloud-run/analytics-refresh-pool.mjs" }),
   Object.freeze({ source: "cloud-run/analytics-refresh-worker.mjs", destination: "apps/worker/cloud-run/analytics-refresh-worker.mjs" }),
+  // MEAS-SYNTH: the refresh Job's opt-in CPU profiler (refused under a production target).
+  Object.freeze({ source: "cloud-run/analytics-refresh-profile.mjs", destination: "apps/worker/cloud-run/analytics-refresh-profile.mjs" }),
   Object.freeze({ source: "cloud-run/analytics-kernel-closure.mjs", destination: "apps/worker/cloud-run/analytics-kernel-closure.mjs" }),
   // The MP-2-lite maintenance Job and the production configuration it reads.
   Object.freeze({ source: "cloud-run/postgres-maintenance-job.mjs", destination: "apps/worker/cloud-run/postgres-maintenance-job.mjs" }),
