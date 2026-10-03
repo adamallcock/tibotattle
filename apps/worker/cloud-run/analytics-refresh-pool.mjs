@@ -375,7 +375,7 @@ export function createAnalyticsRefreshOwnerPool({ workers, memoryBudgetBytes, po
           stats.blockSerializedBytes += event.serializedBytes;
           stats.blockCloneMs += event.cloneMs;
           stats.blockEvaluationMs += event.evaluationMs;
-          stats.blockHeapPeakBytes = Math.max(stats.blockHeapPeakBytes ?? 0, event.heapPeakBytes ?? 0);
+          if (event.heapPeakBytes !== null) stats.blockHeapPeakBytes = Math.max(stats.blockHeapPeakBytes ?? 0, event.heapPeakBytes);
           stats.blockMeasurements.push({ ownerIndex: parent.task.index, blockIndex: child.blockId,
             serializedBytes: event.serializedBytes, cloneMs: event.cloneMs, evaluationMs: event.evaluationMs,
             heapPeakBytes: event.heapPeakBytes ?? null, memoRebuildMs: null });

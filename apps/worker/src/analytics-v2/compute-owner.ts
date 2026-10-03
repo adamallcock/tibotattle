@@ -33,15 +33,10 @@ import {
 } from "../../vendor/analytics-d43c8f92/entry";
 import {
   ANALYTICS_V2_DAY_PATTERN,
-  type AnalyticsV2CacheBandRow,
   type AnalyticsV2Day,
   type AnalyticsV2Owner,
-  type AnalyticsV2OwnerDayPriceRow,
-  type AnalyticsV2OwnerDayRow,
-  type AnalyticsV2OwnerFitsRow,
-  type AnalyticsV2OwnerModelDateRow,
+  type AnalyticsV2OwnerEmission,
   type AnalyticsV2Phase,
-  type AnalyticsV2Refusal,
 } from "./contract";
 import {
   type AnalyticsV2CacheDay,
@@ -124,14 +119,7 @@ export interface AnalyticsV2OwnerRunContext {
   readonly resources: AnalyticsV2Resources;
 }
 
-/** One owner output, handed to the caller in production order. */
-export type AnalyticsV2OwnerEmission =
-  | { readonly kind: "ownerDay"; readonly row: AnalyticsV2OwnerDayRow }
-  | { readonly kind: "ownerDayPrice"; readonly row: AnalyticsV2OwnerDayPriceRow }
-  | { readonly kind: "cacheBand"; readonly row: AnalyticsV2CacheBandRow }
-  | { readonly kind: "refusal"; readonly refusal: AnalyticsV2Refusal }
-  | { readonly kind: "fits"; readonly row: AnalyticsV2OwnerFitsRow }
-  | { readonly kind: "modelDate"; readonly row: AnalyticsV2OwnerModelDateRow };
+export type { AnalyticsV2OwnerEmission } from "./contract";
 
 /** A progress event inside one owner (the Job's time guard); content-free. */
 export type AnalyticsV2OwnerProgress =

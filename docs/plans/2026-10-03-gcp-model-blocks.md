@@ -2,7 +2,7 @@
 title: GCP MODEL-BLOCKS implementation and qualification
 date: 2026-10-03
 type: plan
-status: in-progress
+status: source-validated-qualification-pending
 ---
 
 Base: `48c26716a478bf92a830c27ea9c8ab7a90a0d929`, the coordinator-approved FINAL,
@@ -23,3 +23,8 @@ MODEL-BLOCKS owns `units.ts`, `compute-owner.ts`, compute emission observer,
 pool/Worker grant additions and model flag hunks. Other lanes own native path,
 reader, telemetry binding and read-concurrency hunks. No main-checkout edits,
 cloud writes, registry/pin finalization, or large imports/benchmarks.
+
+Source proof and remaining scheduled measurements are recorded in
+[the implementation receipt](../receipts/2026-10-03-gcp-perf-model-blocks.md).
+Stage and dispatch checkpoints passed independent scoped review; consolidated
+registration, complete gates and large-corpus memory/performance remain pending.

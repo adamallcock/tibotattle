@@ -789,3 +789,12 @@ export interface UploadAuthorizationFormats {
   readonly has: (telemetrySchemaVersion: unknown) => boolean;
   readonly resolve: (telemetrySchemaVersion: unknown) => UploadAuthorizationFormat | null;
 }
+
+/** One owner output, handed to the caller in production order. */
+export type AnalyticsV2OwnerEmission =
+  | { readonly kind: "ownerDay"; readonly row: AnalyticsV2OwnerDayRow }
+  | { readonly kind: "ownerDayPrice"; readonly row: AnalyticsV2OwnerDayPriceRow }
+  | { readonly kind: "cacheBand"; readonly row: AnalyticsV2CacheBandRow }
+  | { readonly kind: "refusal"; readonly refusal: AnalyticsV2Refusal }
+  | { readonly kind: "fits"; readonly row: AnalyticsV2OwnerFitsRow }
+  | { readonly kind: "modelDate"; readonly row: AnalyticsV2OwnerModelDateRow };

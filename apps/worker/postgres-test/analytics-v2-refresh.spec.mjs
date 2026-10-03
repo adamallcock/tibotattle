@@ -3373,7 +3373,9 @@ test("PG17 K-PAR: W=2/4/8 x b=1/5/14/70 over the real readers and kernels writes
   const dump = async (pool, schema) => {
     const rows = {};
     for (const table of ["analytics_v2_owner_day", "analytics_v2_cache_bands", "analytics_v2_owner_fits",
-      "analytics_v2_owner_model_dates", "analytics_v2_published_daily"]) {
+      "analytics_v2_owner_model_dates", "analytics_v2_published_daily", "analytics_v2_owner_day_price",
+      "analytics_v2_price_cards", "analytics_v2_kernel_cards", "analytics_v2_price_bases",
+      "analytics_v2_daily_owner_sets", "analytics_v2_daily_contributions", "analytics_v2_journal_cursor"]) {
       rows[table] = await ownerScopedRows(pool, schema, table);
     }
     rows.preview = (await pool.query(`SELECT preview::text AS preview, kernel_id, manifest_version

@@ -75,7 +75,10 @@ for (const workers of [2, 4, 8]) for (const size of [1, 5, 14, 70]) {
     assert.ok(stats.modelBlocksPerOwner.every((owner) => owner.blocks === Math.ceil(70 / size)));
     assert.equal(stats.blockGrantsRequested, stats.blockGrantsGranted + stats.blockGrantsRefused);
     if (workers === 8 && size < 70) assert.ok(stats.blockGrantsGranted > 0, "real block path exercised");
-    if (size === 70) assert.equal(stats.blockGrantsGranted, 0, "one last block is evaluated by its owner");
+    if (size === 70) {
+      assert.equal(stats.blockGrantsGranted, 0, "one last block is evaluated by its owner");
+      assert.equal(stats.blockHeapPeakBytes, null, "no child sample is explicitly unavailable");
+    }
     console.log(JSON.stringify({ workers, size, sequenceDigest: inlineDigest, blockedOwners: stats.modelBlockedOwners,
       granted: stats.blockGrantsGranted, refused: stats.blockGrantsRefused }));
   });

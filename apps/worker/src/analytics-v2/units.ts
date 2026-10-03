@@ -3,7 +3,7 @@ import { CACHE_RETENTION_METHOD, modelHistoryWindow, validateV11DailyProjectionV
   type CommunityAllowanceFit, type SharedAnalyticsDay, type V11DailyProjectionValues,
   type V1ModelCompositionResult } from "../../vendor/analytics-d43c8f92/entry";
 import { ANALYTICS_V2_CACHE_BAND_COUNTERS, type AnalyticsV2CacheBandCounter,
-  type AnalyticsV2Day, type AnalyticsV2Owner, type AnalyticsV2Refusal } from "./contract";
+  type AnalyticsV2Day, type AnalyticsV2Owner, type AnalyticsV2OwnerEmission, type AnalyticsV2Refusal } from "./contract";
 import { analyticsV2CacheView, evaluateAnalyticsV2CacheDay, evaluateAnalyticsV2ModelDate,
   evaluateAnalyticsV2ScalarDate, prepareAnalyticsV2Day,
   type AnalyticsV2CacheDay, type AnalyticsV2PreparedDay } from "./native-path";
@@ -12,7 +12,6 @@ import { analyticsV2DayDigest, analyticsV2RefusedDayDigest, buildAnalyticsV2Pin,
 import { attributeAnalyticsV2DayPrices } from "./price-attribution";
 import { analyticsV2Refusal, kernelRefusalReason } from "./refusals";
 import type { AnalyticsV2Resources } from "./resources";
-import type { AnalyticsV2OwnerEmission } from "./compute-owner";
 
 const CACHE_LOOKBACK_DAYS = CACHE_RETENTION_METHOD.lookbackDays;
 const addDays = (day: string, n: number) => new Date(Date.parse(`${day}T00:00:00.000Z`) + n * 86400000).toISOString().slice(0, 10);
