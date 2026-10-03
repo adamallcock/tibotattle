@@ -1235,7 +1235,8 @@ test("readback accepts exactly the User-Agent header Cloud Scheduler injects, an
   // header, an empty or malformed map, or a body (with or without the injected header).
   const variants = {
     "another value": (target) => { target.headers = { "User-Agent": "Google-Cloud-Scheduler/2" }; },
-    "the documented App Engine default": (target) => {
+    // AppEngineHttpTarget's documented default; the planner builds an HttpTarget, whose docs name Google-Cloud-Scheduler.
+    "the AppEngineHttpTarget default value": (target) => {
       target.headers = { "User-Agent": "AppEngine-Google; (+http://code.google.com/appengine)" };
     },
     "a lower-case name": (target) => { target.headers = { "user-agent": "Google-Cloud-Scheduler" }; },
@@ -1255,6 +1256,46 @@ test("readback accepts exactly the User-Agent header Cloud Scheduler injects, an
     assert.deepEqual(operations.infrastructureCleanliness(plan(desired, fake(desired, drifted).runner, UNDEFERRED))
       .reasons, ["EXECUTABLE:scheduler:update:maintenance"], label);
   }
+});
+
+test("the planned trigger update cannot clear a stray header or body, so the plan keeps proposing it", () => {
+  // The runbooks tell the operator to repair a stray header or body by hand, because the planned
+  // update names no header or body flag. This binds that claim to the fake's update semantics.
+  const desired = desiredState({ synthetic: false });
+  const strays = {
+    "an extra header": (target) => { target.headers = { ...INJECTED_SCHEDULER_HEADERS, Accept: "text/plain" }; },
+    "a body": (target) => { target.body = "e30="; },
+  };
+  for (const [label, mutate] of Object.entries(strays)) {
+    const world = convergedWorld(desired, UNDEFERRED);
+    mutate(maintenanceTrigger(world).httpTarget);
+    const drifted = structuredClone(maintenanceTrigger(world).httpTarget);
+    const gcloud = fake(desired, world);
+    const result = plan(desired, gcloud.runner, UNDEFERRED);
+    const executable = result.operations.filter((entry) => entry.deferred === undefined);
+    assert.deepEqual(executable.map((entry) => entry.id), ["scheduler:update:maintenance"], label);
+    assert.equal(executable[0].argv.some((arg) => /^--(?:headers|update-headers|remove-headers|clear-headers|message-body|clear-message-body)/u
+      .test(arg)), false, label);
+    operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: result.planDigest,
+      createSpecWriter: () => gcloud.writer.create(), ...UNDEFERRED });
+    // The update ran, and the stray header or body is still stored beside the injected header.
+    assert.ok(gcloud.calls.some((argv) => argv.slice(0, 4).join(" ") === "scheduler jobs update http"), label);
+    assert.deepEqual(maintenanceTrigger(world).httpTarget.headers, drifted.headers, label);
+    assert.equal(maintenanceTrigger(world).httpTarget.body, drifted.body, label);
+    assert.deepEqual(operations.infrastructureCleanliness(plan(desired, fake(desired, world).runner, UNDEFERRED)).reasons,
+      ["EXECUTABLE:scheduler:update:maintenance"], label);
+  }
+  // The fake does not model header or body flags, so an argv carrying one is refused, not silently honoured.
+  const world = convergedWorld(desired, UNDEFERRED);
+  const { runner } = fake(desired, world);
+  for (const extra of ["--headers=Accept=text/plain", "--update-headers=Accept=text/plain", "--remove-headers=Accept",
+    "--clear-headers", "--message-body=e30="]) {
+    const outcome = runner(["scheduler", "jobs", "update", "http", MAINTENANCE_TRIGGER, `--project=${desired.project}`,
+      `--location=${desired.region}`, extra]);
+    assert.equal(outcome.status, 2, extra);
+    assert.match(outcome.stderr, /not modelled/u, extra);
+  }
+  assert.deepEqual(maintenanceTrigger(world).httpTarget.headers, INJECTED_SCHEDULER_HEADERS);
 });
 
 test("a drifted maintenance job or trigger is set back, apply keeps the live image and commit, and a running trigger is paused", () => {
