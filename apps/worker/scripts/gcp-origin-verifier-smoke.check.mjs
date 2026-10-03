@@ -311,24 +311,41 @@ test("dry run: validates the target, prints the content-free plan, asks for no t
   }), { code: "GCP_INFRA_DESIRED_STATE_UNCONFIGURED" });
 });
 
-test("the CLI fails closed without the owner's desired state, with or without --execute", async () => {
+test("the CLI on the committed production desired state: a dry run without --execute, fails closed without gcloud", async () => {
+  // PROD-PREP filled the committed production desired state, so the OPS-2
+  // target now loads: without --execute the CLI prints its dry-run plan and
+  // reads nothing; with --execute and no gcloud on PATH the token source
+  // fails closed before any probe. An unloadable target's closed codes are
+  // covered in-process above (ORIGIN_SMOKE_TARGET_UNAVAILABLE).
   const empty = await mkdtemp(join(tmpdir(), "w3-cra-smoke-path-"));
   try {
     const env = { PATH: empty };
-    for (const argv of [args(), args({ execute: true }), ["--environment=production"]]) {
-      const result = await execFile(process.execPath, [SCRIPT, ...argv], { env, timeout: 30_000 })
-        .then(() => ({ code: 0 }), (error) => error);
-      assert.equal(result.code, 2, argv.join(" "));
-      const printed = JSON.parse(result.stderr);
-      assert.equal(printed.ok, false);
-      // The committed production desired state still holds OWN-5's
-      // placeholders: OPS-2 refuses it with DESIRED_STATE_PLACEHOLDER_UNFILLED:
-      // <field>, which is not a closed code, so the smoke closes it (C-INFRA
-      // retired GCP_INFRA_DESIRED_STATE_UNCONFIGURED; this check first ran in
-      // CI with D-CRB's registration).
-      assert.equal(printed.code, argv.length === 1 ? "ORIGIN_SMOKE_ARGUMENT_INVALID" : "ORIGIN_SMOKE_TARGET_UNAVAILABLE");
-      assert.equal(result.stdout, "");
-    }
+    const run = (argv) => execFile(process.execPath, [SCRIPT, ...argv], { env, timeout: 30_000 })
+      .then(({ stdout, stderr }) => ({ code: 0, stdout, stderr }), (error) => error);
+
+    const dry = await run(args());
+    assert.equal(dry.code, 0, dry.stderr);
+    assert.equal(dry.stderr, "");
+    const planned = JSON.parse(dry.stdout);
+    assert.equal(planned.mode, "dry-run");
+    assert.equal(planned.environment, "production");
+    assert.equal(planned.rollGate, "verifyEdgeOriginBeforeGcp");
+
+    const executed = await run(args({ execute: true }));
+    assert.equal(executed.code, 1, executed.stderr);
+    const receipt = JSON.parse(executed.stdout);
+    assert.equal(receipt.mode, "execute");
+    assert.equal(receipt.ok, false);
+    assert.equal(receipt.code, "EDGE_ORIGIN_IDENTITY_TOKEN_UNAVAILABLE");
+    assert.deepEqual(receipt.probes, []);
+    assert.equal(receipt.rollGate, null);
+
+    const incomplete = await run(["--environment=production"]);
+    assert.equal(incomplete.code, 2);
+    assert.equal(incomplete.stdout, "");
+    const printed = JSON.parse(incomplete.stderr);
+    assert.equal(printed.ok, false);
+    assert.equal(printed.code, "ORIGIN_SMOKE_ARGUMENT_INVALID");
   } finally {
     await rm(empty, { recursive: true, force: true });
   }
