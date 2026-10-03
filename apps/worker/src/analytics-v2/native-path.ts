@@ -108,6 +108,63 @@ const USAGE_PAGES_PER_CALL = 1_024;
 const OWNER_DIGEST = /^[0-9a-f]{64}$/u;
 const DAY_LABEL = /^\d{4}-\d{2}-\d{2}$/u;
 
+/** Row evidence is immutable while its validation key matches. Only primitives
+ * are retained, and every hit builds new objects in the vendored key order.
+ * Weak ownership releases an owner together with its occurrence objects; date
+ * blocks deliberately rebuild this memo with their cloned occurrences. */
+type QuotaActive = NonNullable<ReturnType<typeof mapEffectiveQuotaPageRow>["active"]>;
+type QuotaRowTemplate = Pick<QuotaActive,
+  "observedAtMs" | "deviceId" | "provider" | "limitId" | "planType" | "planVariant"
+  | "accountBasis" | "accountTrackId" | "planBasis" | "planEraId" | "occurrenceId"
+  | "slot" | "usedPercent" | "windowDurationMinutes" | "resetsAt" | "resetsAtMs"> & {
+  readonly recordJson: string | null; readonly eventTime: string | null; readonly day: string;
+};
+const quotaRowTemplates = new WeakMap<EffectiveTelemetryOccurrence, QuotaRowTemplate>();
+const quotaRowStrings = new Map<string, string>();
+function internQuotaString<T extends string | null>(value: T): T {
+  if (value === null) return value;
+  const known = quotaRowStrings.get(value);
+  if (known !== undefined) return known as T;
+  if (quotaRowStrings.size < 4096) quotaRowStrings.set(value, value);
+  return value;
+}
+export function mapAnalyticsV2QuotaPageRow(row: EffectiveTelemetryOccurrence, day: string,
+  ordinal: number): ReturnType<typeof mapEffectiveQuotaPageRow> {
+  const known = quotaRowTemplates.get(row);
+  if (known !== undefined && known.recordJson === row.recordJson && known.eventTime === row.eventTime
+    && row.stream === "quota" && row.status === "compatible" && known.day === day
+    && Number.isSafeInteger(ordinal) && ordinal > 0) {
+    return { physicalId: ordinal, sourceRowId: ordinal, observedAtMs: known.observedAtMs,
+      active: { id: ordinal, observedAtMs: known.observedAtMs, observedAt: row.eventTime!,
+        observedDay: day, deviceId: known.deviceId, provider: known.provider,
+        limitId: known.limitId, planType: known.planType, planVariant: known.planVariant,
+        accountBasis: known.accountBasis, accountTrackId: known.accountTrackId,
+        planBasis: known.planBasis, planEraId: known.planEraId,
+        occurrenceId: known.occurrenceId, slot: known.slot, usedPercent: known.usedPercent,
+        windowDurationMinutes: known.windowDurationMinutes, resetsAt: known.resetsAt,
+        resetsAtMs: known.resetsAtMs } };
+  }
+  const mapped = mapEffectiveQuotaPageRow(row, day, ordinal), active = mapped.active!;
+  quotaRowTemplates.set(row, { recordJson: row.recordJson, eventTime: row.eventTime, day,
+    observedAtMs: active.observedAtMs,
+    deviceId: active.deviceId,
+    provider: internQuotaString(active.provider),
+    limitId: internQuotaString(active.limitId),
+    planType: internQuotaString(active.planType),
+    planVariant: internQuotaString(active.planVariant),
+    accountBasis: internQuotaString(active.accountBasis),
+    accountTrackId: internQuotaString(active.accountTrackId),
+    planBasis: internQuotaString(active.planBasis),
+    planEraId: internQuotaString(active.planEraId),
+    occurrenceId: active.occurrenceId,
+    slot: internQuotaString(active.slot),
+    usedPercent: active.usedPercent,
+    windowDurationMinutes: active.windowDurationMinutes,
+    resetsAt: active.resetsAt,
+    resetsAtMs: active.resetsAtMs });
+  return mapped;
+}
+
 const unexpectedDatabaseRead = (): never => {
   throw new Error("ANALYTICS_V2_NATIVE_PATH_UNEXPECTED_DATABASE_READ");
 };
@@ -226,7 +283,7 @@ Promise<AnalyticsV2PreparedDay> {
   let quotaBounded = false;
   for (let offset = 0; offset < input.quota.length; offset += PAGE_SIZE) {
     const rows = input.quota.slice(offset, offset + PAGE_SIZE)
-      .map((row, index) => mapEffectiveQuotaPageRow(row, input.day, offset + index + 1));
+      .map((row, index) => mapAnalyticsV2QuotaPageRow(row, input.day, offset + index + 1));
     quotaPending = appendEffectiveQuotaDay(quotaPending, input.day, rows, QUOTA_WINDOW_MINUTES);
     if (quotaPending === null) { quotaBounded = true; break; }
   }
@@ -394,7 +451,7 @@ Promise<V11CompletedQuotaAcquisition | { status: "not_testable"; reason: string 
         if (cursor.complete) return [];
         const dayRows = occurrencesOf(cursor.day);
         const page = dayRows.slice(cursor.offset, cursor.offset + PAGE_SIZE);
-        const mapped = page.map((row) => mapEffectiveQuotaPageRow(row, cursor.day, ++cursor.ordinal));
+        const mapped = page.map((row) => mapAnalyticsV2QuotaPageRow(row, cursor.day, ++cursor.ordinal));
         if (cursor.offset + page.length < dayRows.length) cursor.offset += page.length;
         else {
           const nextDay = quotaDays.find((day) => day > cursor.day);
