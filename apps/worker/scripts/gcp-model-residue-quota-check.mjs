@@ -31,22 +31,37 @@ export async function loadQuotaHarness() {
   }catch(error){await rm(directory,{recursive:true,force:true});throw error;}
 }
 export function compareQuotaRows(module, days) {
-  let rows=0,comparisons=0,mapMisses=0,maximumMisses=0;const digest=createHash('sha256');
+  let rows=0,comparisons=0,mapMisses=0,maximumMisses=0,refusedRows=0,refusalMapCalls=0;
+  const digest=createHash('sha256');
+  const capture=(operation)=> {try{return {value:operation()};}catch(error){return {error};}};
   for(const [day,occurrences] of days) for(const row of occurrences) {
-    let misses=0,prior;
+    let misses=0,prior,refused=false;
     for(const ordinal of [1,43,200,Number.MAX_SAFE_INTEGER]) {
-      const expected=module.mapEffectiveQuotaPageRow(row,day,ordinal),before=module.quotaHarnessCalls(row);
-      const value=module.mapAnalyticsV2QuotaPageRow(row,day,ordinal);
+      const expected=capture(()=>module.mapEffectiveQuotaPageRow(row,day,ordinal)),before=module.quotaHarnessCalls(row);
+      const actual=capture(()=>module.mapAnalyticsV2QuotaPageRow(row,day,ordinal));
       misses+=module.quotaHarnessCalls(row)-before;
-      assert.equal(JSON.stringify(value),JSON.stringify(expected));
-      assert.notEqual(value,prior);assert.notEqual(value.active,prior?.active);
-      assert.equal(Object.isFrozen(value),Object.isFrozen(expected));assert.equal(Object.isFrozen(value.active),Object.isFrozen(expected.active));
-      for(const primitive of Object.values(value.active)) assert.ok(primitive===null||['string','number','boolean'].includes(typeof primitive));
-      digest.update(JSON.stringify(value));prior=value;comparisons++;
+      if(expected.error) {
+        assert.equal(actual.error?.constructor,expected.error.constructor);
+        assert.equal(actual.error.message,expected.error.message);refused=true;
+        digest.update(JSON.stringify([expected.error.constructor.name,expected.error.message]));
+      } else {
+        assert.equal(actual.error,undefined);
+        const value=actual.value;
+        assert.equal(JSON.stringify(value),JSON.stringify(expected.value));
+        assert.notEqual(value,prior);assert.notEqual(value.active,prior?.active);
+        assert.equal(Object.isFrozen(value),Object.isFrozen(expected.value));
+        assert.equal(Object.isFrozen(value.active),Object.isFrozen(expected.value.active));
+        for(const primitive of Object.values(value.active)) assert.ok(primitive===null||['string','number','boolean'].includes(typeof primitive));
+        digest.update(JSON.stringify(value));prior=value;
+      }
+      comparisons++;
     }
-    assert.ok(misses<=1);mapMisses+=misses;maximumMisses=Math.max(maximumMisses,misses);rows++;
+    if(refused) {assert.equal(misses,4);refusedRows++;refusalMapCalls+=misses;}
+    else {assert.ok(misses<=1);mapMisses+=misses;maximumMisses=Math.max(maximumMisses,misses);}
+    rows++;
   }
-  return {rows,comparisons,mismatches:0,mapMisses,maximumMisses,meanMisses:rows?mapMisses/rows:0,sha256:digest.digest('hex')};
+  return {rows,comparisons,mismatches:0,refusedRows,refusalMapCalls,mapMisses,maximumMisses,
+    meanMisses:rows>refusedRows?mapMisses/(rows-refusedRows):0,sha256:digest.digest('hex')};
 }
 if(process.argv[1] && resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
   const fixtureArg=process.argv.slice(2).find(value=>value.startsWith('--fixture='));

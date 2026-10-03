@@ -50,10 +50,12 @@ describe('quota row primitive evidence memo', () => {
       Object.assign(value, row()); differential(value);
     }
   });
-  it('maps each object at most twice including prepare across four phases and 71 windows', async () => {
+  it('maps each object at most twice given one preparation mapping across four phases and 71 windows', async () => {
     const harness = await loadQuotaHarness();
     try {
       const rows = Array.from({length:128}, (_,index)=>row(index));
+      // One original-map call stands in for preparation; this exercises the
+      // helper directly. Native acquisition instrumentation is a corpus gate.
       for (const value of rows) harness.module.mapEffectiveQuotaPageRow(value, day, 1);
       for (let window=0;window<71;window++) for (let phase=0;phase<4;phase++) for (const [index,value] of rows.entries())
         harness.module.mapAnalyticsV2QuotaPageRow(value, day, index+1+window);
