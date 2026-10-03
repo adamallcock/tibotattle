@@ -4,8 +4,9 @@
 // Each target is one dedicated primary database (w2_seal_*; decision D4
 // leaves no deletion-ledger database, and SIMP-4 makes the target
 // primary-only), owned by a schema-owner role, with the promoted primary
-// chain (through the append-only residue; the erased-redeemer migration
-// would go through the staged-migrations harness while staged) applied by
+// chain (through the append-only residue; the erased-redeemer and REV-SEED
+// revision-floor migrations go through the staged-migrations harness while
+// staged) applied by
 // the production runner, and the contract registered. The transfer login is a deliberate, non-escalating
 // member of tibotattle_source_transfer, so storage_journal_transfer_session()
 // is true for it; the cluster-global role is created and granted under the
@@ -29,6 +30,8 @@ export const TRANSFER_ROLE = "tibotattle_source_transfer";
 export const TRANSFER_ROLE_LOCK = 460_046;
 export const PRIMARY_SCHEMA = "w2_seal_primary";
 export const ERASED_REDEEMER_SUFFIX = "_enrollment_grants_erased_redeemer.sql";
+/** REV-SEED's revision floor (the PT-8-lite 'analytics-community-history' stage loads it). */
+export const REVISION_FLOOR_SUFFIX = "_analytics_v2_revision_floor.sql";
 
 export async function localSocket(socket, port) {
   assert.match(socket ?? "", /^\/private\/tmp\/tibotattle-pg-[^/]+\/socket$/u);
@@ -41,18 +44,23 @@ export async function localSocket(socket, port) {
   return { host: resolved, port };
 }
 
-/** The erased-redeemer migration by name suffix: staged (applied by the harness) or promoted. */
-export async function erasedRedeemerMigration() {
+/** A primary migration by name suffix: staged (applied by the harness) or promoted. */
+export async function primaryMigrationBySuffix(suffix) {
   let staged = [];
   try {
-    staged = (await readdir(join(STAGED_MIGRATIONS_ROOT, "primary"))).filter(name => name.endsWith(ERASED_REDEEMER_SUFFIX));
+    staged = (await readdir(join(STAGED_MIGRATIONS_ROOT, "primary"))).filter(name => name.endsWith(suffix));
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
   const promoted = (await readPostgresMigrations({ role: "primary" })).map(migration => migration.name)
-    .filter(name => name.endsWith(ERASED_REDEEMER_SUFFIX));
-  assert.equal(staged.length + promoted.length, 1, "exactly one erased-redeemer migration, staged or promoted");
+    .filter(name => name.endsWith(suffix));
+  assert.equal(staged.length + promoted.length, 1, `exactly one ${suffix} migration, staged or promoted`);
   return { name: staged[0] ?? promoted[0], staged: staged.length === 1 };
+}
+
+/** The erased-redeemer migration by name suffix: staged (applied by the harness) or promoted. */
+export async function erasedRedeemerMigration() {
+  return primaryMigrationBySuffix(ERASED_REDEEMER_SUFFIX);
 }
 
 /**
@@ -113,6 +121,8 @@ export async function createW2SealCluster({ socket, port, user, password, databa
     }
     await admin.query(`GRANT ${TRANSFER_ROLE} TO "${roles.transfer}"`);
     const erased = await erasedRedeemerMigration();
+    const stagedFiles = [erased, await primaryMigrationBySuffix(REVISION_FLOOR_SUFFIX)]
+      .filter(migration => migration.staged).map(migration => migration.name);
     const targets = [];
     for (let index = 0; index < count; index += 1) {
       const databases = { primary: `w2_seal_primary_${suffix}_${index}` };
@@ -124,9 +134,9 @@ export async function createW2SealCluster({ socket, port, user, password, databa
       }
       const ownerPrimary = pool(roles.owner, databases.primary);
       await ownerPrimary.query(`CREATE SCHEMA "${PRIMARY_SCHEMA}"`);
-      if (erased.staged) {
+      if (stagedFiles.length > 0) {
         await applyStockAndStagedMigrations({ role: "primary", schema: PRIMARY_SCHEMA, pool: ownerPrimary,
-          stagedFiles: [erased.name] });
+          stagedFiles });
       } else {
         await applyPostgresMigrations({ role: "primary", schema: PRIMARY_SCHEMA, pool: ownerPrimary });
       }

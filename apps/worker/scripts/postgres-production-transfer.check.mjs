@@ -220,8 +220,15 @@ test("the stage plan covers PT-1's stages once, in dependency order; waivers are
   // It writes no table receipt: coverage keeps exactly PT-3's one receipt for the pin table.
   assert.equal(DISPOSITIONS.some(item => item.stage === IDENTITY_LINK_ROTATION_STAGE), false);
   assert.equal(stagePrerequisites("post-import").length, TRANSFER_STAGES.length - 1);
-  assert.deepEqual(Object.keys(WAIVABLE).sort(), ["accountless-retention", "analytics-community-history", "analytics-expectation",
+  assert.deepEqual(Object.keys(WAIVABLE).sort(), ["accountless-retention", "analytics-expectation",
     "analytics-history", "objects", "performance"]);
+  // REV-SEED (round 14): the revision floor is loaded, never waived, and it
+  // writes no table receipt (the analytics D1 is never sealed).
+  assert.deepEqual(STAGE_PLAN.find(entry => entry.stage === "analytics-community-history"),
+    { stage: "analytics-community-history", kind: "runner" });
+  assert.equal(codeOf(() => assertWaiverAllowed("analytics-community-history", "analytics-recomputed:d3")),
+    "CUTOVER_STAGE_WAIVER_REFUSED");
+  assert.equal(DISPOSITIONS.some(item => item.stage === "analytics-community-history"), false);
   for (const [stage, [reason]] of Object.entries(WAIVABLE)) assert.doesNotThrow(() => assertWaiverAllowed(stage, reason));
   assert.equal(codeOf(() => assertWaiverAllowed("performance", "another-reason")), "CUTOVER_STAGE_WAIVER_REFUSED");
   // A stage with an imported or mapped table is never waivable.
@@ -238,7 +245,7 @@ test("the merged trigger policy covers every importer and the disposition policy
     "community_aggregate_exclusions", "collection_controls"]) {
     assert.ok(Object.hasOwn(COMPLETE_TRIGGER_POLICY, tableName), tableName);
   }
-  assert.equal(dispositionPolicySha256(), "154244fd7e2b06895c3bddc22c284e848788c8cbc53a8aaab6348a3844e3bac8",
+  assert.equal(dispositionPolicySha256(), "288baae6789b801af27884f5034bcc6d6d2eb9b0de9f2d6f88408d6230e9f6ce",
     "a reviewed change to dispositions, rules, flags, the stage plan or the trigger policy must update this pin");
 });
 
@@ -772,6 +779,7 @@ function inputs(overrides = {}) {
     interimPublicRead: { exportPath: "/owner/own4.json", sha256: "4".repeat(64), capturedAt: "2026-10-01T23:30:00.000Z",
       sourceCommit: "1".repeat(40), evidenceDate: "2026-10-01" },
     adminHistoryExport: { path: "/owner/admin-history-export.json", sha256: "5".repeat(64) },
+    revisionFloor: { path: "/owner/revision-floor.json", sha256: "6".repeat(64) },
     schedulerEvidencePath: "/owner/scheduler.json",
     ownerFlags: [OWNER_FLAG_PERFORMANCE_ROUTES_RETIRED],
     allowedRoleMembers: [],
@@ -787,10 +795,13 @@ test("pt8-inputs.json is a closed contract", () => {
     { deletionDigestProjection: { path: "/x", sha256: "nope" } },
     { adminHistoryExport: { path: "relative/export.json", sha256: "5".repeat(64) } },
     { adminHistoryExport: { path: "/owner/admin-history-export.json", sha256: "nope" } },
-    { adminHistoryExport: { path: "/owner/admin-history-export.json", sha256: "5".repeat(64), extra: 1 } }]) {
+    { adminHistoryExport: { path: "/owner/admin-history-export.json", sha256: "5".repeat(64), extra: 1 } },
+    { revisionFloor: { path: "relative/revision-floor.json", sha256: "6".repeat(64) } },
+    { revisionFloor: { path: "/owner/revision-floor.json", sha256: "nope" } },
+    { revisionFloor: { path: "/owner/revision-floor.json", sha256: "6".repeat(64), provenance: "synthetic" } }]) {
     assert.throws(() => validateTransferInputs(inputs(bad)), { code: "CUTOVER_INPUTS_INVALID" }, JSON.stringify(bad));
   }
-  for (const key of ["schedulerEvidencePath", "adminHistoryExport"]) {
+  for (const key of ["schedulerEvidencePath", "adminHistoryExport", "revisionFloor"]) {
     const missing = inputs();
     delete missing[key];
     assert.throws(() => validateTransferInputs(missing), { code: "CUTOVER_INPUTS_INVALID" }, key);

@@ -81,6 +81,34 @@ export const CUTOVER_SEALABLE_SOURCES = Object.freeze({
 export const CUTOVER_SOURCE_ROLES = Object.freeze(Object.keys(CUTOVER_SEALABLE_SOURCES));
 export const CUTOVER_LEDGER_TABLES = Object.freeze(["d1_migrations", "d1_storage_migrations"]);
 
+/**
+ * REV-SEED (owner decisions round 14): the one NON-sealable read role. Its
+ * source is the production analytics D1, which is never sealed, and the
+ * guarded transport admits exactly one statement against it, pinned by its
+ * sha256 (any other SQL is CUTOVER_FLOOR_STATEMENT_REFUSED, after the
+ * SELECT-only rule). The statement returns Cloudflare's largest community
+ * daily revision per day, over every source id (a superset is safe) and
+ * including withheld days (a viewer may have seen an earlier revision): the
+ * current heads, and the publication rows that retirement may not yet have
+ * deleted. analytics_community_daily_queue.revision is a work counter, not a
+ * published revision, and is not read. The rows are days and integers only.
+ * LIMIT 4001 detects a floor over CUTOVER_REVISION_FLOOR_MAX_DAYS. The
+ * capture is cutover-revision-floor.mjs; the inventory never names this
+ * role, so seal, verify-unchanged and the projections cannot reach it.
+ */
+export const CUTOVER_ANALYTICS_FLOOR_ROLE = "analytics-floor";
+export const CUTOVER_REVISION_FLOOR_MAX_DAYS = 4000;
+export const CUTOVER_REVISION_FLOOR_STATEMENT = "SELECT day,MAX(revision) AS revision FROM "
+  + "(SELECT day,revision FROM analytics_community_daily_heads UNION ALL "
+  + "SELECT day,revision FROM analytics_community_daily_publications) "
+  + `GROUP BY day ORDER BY day LIMIT ${CUTOVER_REVISION_FLOOR_MAX_DAYS + 1}`;
+export const CUTOVER_REVISION_FLOOR_STATEMENT_SHA256 = createHash("sha256")
+  .update(CUTOVER_REVISION_FLOOR_STATEMENT).digest("hex");
+/** The non-sealable read roles and the one statement sha256 each admits. */
+const CUTOVER_PINNED_READ_ROLES = Object.freeze({
+  [CUTOVER_ANALYTICS_FLOOR_ROLE]: CUTOVER_REVISION_FLOOR_STATEMENT_SHA256,
+});
+
 // Ledger layouts. "fresh-chain" (the default when a source names no layout)
 // expects every file of the role's directories at the commit, one row each.
 // "ingestion-restore-base-v1" is the restore-era production ingestion ledger:
@@ -135,6 +163,7 @@ export const CUTOVER_ERROR_CODES = Object.freeze([
   "CUTOVER_EXPORT_STATEMENT_REFUSED",
   "CUTOVER_FENCE_RECEIPT_INVALID",
   "CUTOVER_FENCE_SOURCE_MISMATCH",
+  "CUTOVER_FLOOR_STATEMENT_REFUSED",
   "CUTOVER_INTEGRITY_FAILED",
   "CUTOVER_INVENTORY_INVALID",
   "CUTOVER_INVENTORY_UNSAFE",
@@ -860,9 +889,22 @@ export function assertSelectOnly(sql) {
 }
 
 /**
+ * A pinned read role (CUTOVER_ANALYTICS_FLOOR_ROLE) admits exactly its one
+ * statement; any other role is unaffected here.
+ */
+export function assertPinnedRoleStatement(role, sql) {
+  if (!Object.hasOwn(CUTOVER_PINNED_READ_ROLES, role)) return sql;
+  if (typeof sql !== "string" || sha256Hex(sql) !== CUTOVER_PINNED_READ_ROLES[role]) {
+    fail("CUTOVER_FLOOR_STATEMENT_REFUSED");
+  }
+  return sql;
+}
+
+/**
  * Wrap an injected transport: every call names an inventory source (anything
- * else is CUTOVER_SOURCE_NOT_ALLOWED), every query is SELECT-only, and every
- * response is checked before use.
+ * else is CUTOVER_SOURCE_NOT_ALLOWED), every query is SELECT-only, a pinned
+ * read role runs only its pinned statement, and every response is checked
+ * before use.
  */
 export function guardCutoverTransport(transport, inventory) {
   if (!record(transport) || typeof transport.bookmark !== "function" || typeof transport.query !== "function") {
@@ -885,6 +927,7 @@ export function guardCutoverTransport(transport, inventory) {
     async query(source, sql) {
       const allowed = target(source);
       assertSelectOnly(sql);
+      assertPinnedRoleStatement(allowed.role, sql);
       let rows;
       try {
         rows = await transport.query(allowed, sql);
@@ -982,6 +1025,7 @@ export function createWranglerCutoverTransport({
     },
     async query(source, sql) {
       assertSelectOnly(sql);
+      assertPinnedRoleStatement(source?.role, sql);
       const config = await pinnedConfig(source);
       const sqlPath = join(transportDirectory, `${source.role}.query-${sequence++}.sql`);
       const logPath = `${sqlPath}.log`;

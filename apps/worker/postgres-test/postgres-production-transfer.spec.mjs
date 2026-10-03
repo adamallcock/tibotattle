@@ -20,6 +20,12 @@ import { verifyCutoverUnchanged } from "../scripts/cutover-source-fence.mjs";
 import { participantDeletionDigest, projectDeletionDigests } from "../scripts/cutover-source-projections.mjs";
 import { openSealedSourceFromSeal, readCutoverSeal, writePrivateFileOnce } from "../scripts/cutover-source-seal.mjs";
 import {
+  CUTOVER_REVISION_FLOOR_SCHEMA,
+  renderRevisionFloorFile,
+  revisionFloorSealFacts,
+  writeSyntheticRevisionFloor,
+} from "../scripts/cutover-revision-floor.mjs";
+import {
   ORCHESTRATOR_LOCK_KEY,
   MIGRATION_FENCE_LOCK_PREFIX,
   OWNER_FILES,
@@ -136,7 +142,7 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
    */
   async function ownerDirectory(target, { manifest = manifestPath, sealId = seal.manifest.sealId, inputs = {},
     pinSecret = SYNTHETIC_IDENTITY_LINK_SECRET, ledgerSeal = null, scheduler = {}, rotation = null,
-    pinKeyVersion = SEALED_IDENTITY_LINK_VERSION } = {}) {
+    pinKeyVersion = SEALED_IDENTITY_LINK_VERSION, floor = null } = {}) {
     const directory = await privateDirectory("ept8-owner-");
     let rotationInputs = {};
     if (rotation === null) {
@@ -166,6 +172,12 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
     }
     const bytes = exportBytes(goldenExportBody());
     await writePrivateFileOnce(join(directory, "own4-export.json"), bytes, 0o400);
+    // REV-SEED: the dress rehearsal's synthetic floor (round 14), each frozen
+    // day at its frozen revision, bound to this seal; or a spec-made floor.
+    const revisionFloor = floor === null
+      ? await writeSyntheticRevisionFloor({ manifestPath: manifest, sealId, frozenDays: frozenDays(),
+        ownerDirectory: directory, now: CONTEXT_NOW })
+      : await writeFloorFile(directory, floor);
     // The C-INFRA probe's own shape (probeScheduler): one entry per managed trigger.
     await writePrivateFileOnce(join(directory, "scheduler-probe.json"), `${JSON.stringify({
       schema: SCHEDULER_PROBE_SCHEMA, environment: "production", project: DESIRED_PROJECT,
@@ -183,6 +195,7 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
       interimPublicRead: { exportPath: join(directory, "own4-export.json"), sha256: exportSha256(bytes),
         capturedAt: FIXTURE_CAPTURED_AT, sourceCommit: world.commit, evidenceDate: FIXTURE_EVIDENCE_DATE },
       adminHistoryExport: await adminHistoryExportFor(manifest, sealId),
+      revisionFloor: { path: revisionFloor.path, sha256: revisionFloor.floorSha256 },
       schedulerEvidencePath: join(directory, "scheduler-probe.json"),
       ownerFlags: [OWNER_FLAG_PERFORMANCE_ROUTES_RETIRED],
       allowedRoleMembers: [],
@@ -191,6 +204,21 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
     };
     await writePrivateFileOnce(join(directory, OWNER_FILES.inputs), `${JSON.stringify(value)}\n`, 0o400);
     return directory;
+  }
+
+  /** The frozen read's days as the floor loader sees them ({ day, revision }). */
+  function frozenDays() {
+    return goldenExportBody().days.map(({ day, revision }) => ({ day, revision }));
+  }
+
+  /** A spec-made synthetic floor file: `days` ([day, revision] pairs) bound to `boundTo` (a seal; default the main one). */
+  async function writeFloorFile(directory, { days, boundTo = seal }) {
+    const { text, floorSha256 } = renderRevisionFloorFile({ schema: CUTOVER_REVISION_FLOOR_SCHEMA, provenance: "synthetic",
+      ...revisionFloorSealFacts(boundTo), capturedAt: CONTEXT_NOW().toISOString(), capture: null, days,
+      dayCount: days.length, maxRevision: Math.max(...days.map(([, revision]) => revision)) });
+    const path = join(directory, "revision-floor.json");
+    await writePrivateFileOnce(path, text, 0o400);
+    return { path, floorSha256 };
   }
 
   /** One paused entry per managed trigger: the committed production desired state's scheduler map (P11). */
@@ -445,6 +473,18 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
       FROM ${table("analytics_admin_metric_snapshots")}
      WHERE captured_at IN ('2026-10-01T22:00:00.000Z'::timestamptz, '2026-10-01T23:00:00.000Z'::timestamptz)`);
     expect(mapped[0].n).toBe(2);
+    // REV-SEED: the 'analytics-community-history' stage loaded the synthetic
+    // floor once (the killed run's resumes wrote nothing twice), before markLive.
+    const golden = frozenDays();
+    const { rows: floorSource } = await target.ownerPrimary.query(`SELECT provenance, seal_id::text AS seal_id,
+        day_count, max_revision, analytics_bookmark_sha256 FROM ${table("analytics_v2_revision_floor_source")}`);
+    expect(floorSource).toEqual([{ provenance: "synthetic", seal_id: seal.manifest.sealId, day_count: golden.length,
+      max_revision: Math.max(...golden.map(item => item.revision)), analytics_bookmark_sha256: null }]);
+    const { rows: floorDays } = await target.ownerPrimary.query(`SELECT to_char(day, 'YYYY-MM-DD') AS day, revision
+      FROM ${table("analytics_v2_revision_floor")} ORDER BY day`);
+    expect(floorDays).toEqual([...golden].sort((a, b) => (a.day < b.day ? -1 : 1)));
+    expect(resumed.stages.find(row => row.stage === "analytics-community-history"))
+      .toMatchObject({ state: "complete", row_count: String(golden.length) });
     // One receipt per sealed table, with exactly the disposition's token and stage.
     const present = new Set(resumed.tables.map(row => `${row.source_role}:${row.source_table}`));
     for (const item of DISPOSITIONS) {
@@ -706,6 +746,13 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
     expect(otherExport.sha256).not.toBe(mainExport.sha256);
     await refuse({ inputs: { adminHistoryExport: otherExport } }, "CUTOVER_ADMIN_HISTORY_EXPORT_MISMATCH",
       "P15 another seal's export");
+    // P16 (REV-SEED): the floor at its pin, bound to this seal, and at or above every frozen revision.
+    const golden = frozenDays().map(({ day, revision }) => [day, revision]).sort(([a], [b]) => (a < b ? -1 : 1));
+    await refuse({ floor: { days: golden.slice(1) } }, "REVISION_FLOOR_BELOW_FROZEN_EXPORT", "P16 a frozen day missing");
+    await refuse({ floor: { days: golden, boundTo: await readCutoverSeal({ manifestPath: otherSeal.manifest,
+      expectedSealId: otherSeal.sealId }) } }, "REVISION_FLOOR_SEAL_MISMATCH", "P16 another seal's floor");
+    await refuse({ inputs: { revisionFloor: { path: join(await privateDirectory("ept8-floor-"), "absent.json"),
+      sha256: "f".repeat(64) } } }, "REVISION_FLOOR_FILE_INVALID", "P16 an unreadable floor");
     // Nothing above wrote to the target.
     expect(await targetRows(target)).toBe(0);
 

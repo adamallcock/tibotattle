@@ -41,7 +41,13 @@
  * reviewed target path. The invocation is exactly
  *   node --max-old-space-size=<heap> dist/analytics-refresh.mjs --mode=full
  * (ANALYTICS_REFRESH_PRODUCTION_JOB: inline, no --workers), with no --schema, --now or
- * --revision-seed, on the real clock. The environment is closed
+ * --revision-seed, on the real clock: revisions follow the stored heads and
+ * the stored Cloudflare revision floor (REV-SEED: the cutover import loads
+ * it before markLive; store-publication.ts nextPublishedRevision). A
+ * production target refuses ANALYTICS_V2_REVISION_FLOOR_ABSENT, in the read
+ * snapshot before any read or compute and writing nothing, when no floor is
+ * loaded; a staging target or a test target treats an absent floor as 0.
+ * The environment is closed
  * (ANALYTICS_REFRESH_PRODUCTION_ENV): ANALYTICS_REFRESH_TARGET,
  * PRIMARY_INSTANCE_CONNECTION_NAME, PRIMARY_DATABASE, PRIMARY_SCHEMA,
  * POSTGRES_IAM_USER and ANALYTICS_V2_MEMORY_BUDGET_MIB. Any other variable in
@@ -77,7 +83,8 @@
  *                          (ANALYTICS_V2_TEST_CLOCK=1 or a POSTGRES_TEST_HTTP_MODE),
  *                          never under a production target
  *   --revision-seed=<n>    published revisions start above n (default 0;
- *                          refused under a production target)
+ *                          refused under a production target); each day's
+ *                          revision is max(head, floor, n) + 1
  *   --workers=<n>          compute Workers, 1..16 (default 1: every owner is
  *                          computed inline, one at a time). With more, owners
  *                          run in Workers of dist/analytics-refresh-worker.mjs
@@ -139,7 +146,9 @@
  * it applied (N-EXCL, src/analytics-v2/exclusions.ts: an owner excluded on a
  * day is left out of that day's public daily and allowance preview; the run
  * row records the digest of the exclusions applied, and a run that finds
- * them changed republishes every published day).
+ * them changed republishes every published day), and the revision floor it
+ * read (REV-SEED `revisionFloor`: present, dayCount and maxRevision; 0 and 0
+ * when absent).
  *
  * The TypeScript store and the A-1/A-2 modules are loaded through literal
  * dynamic imports, so esbuild bundles them into the dist entry while the
@@ -391,7 +400,8 @@ refusal) or 1 (failure).
   --schema=<identifier>  runtime schema (default: PRIMARY_SCHEMA)
   --now=<ISO instant>    test clock only: requires ANALYTICS_V2_TEST_CLOCK=1
                          or POSTGRES_TEST_HTTP_MODE
-  --revision-seed=<n>    first published revision is above n (default 0)
+  --revision-seed=<n>    first published revision is above n (default 0); a
+                         day publishes at max(head, revision floor, n) + 1
   --workers=<n>          compute Workers, 1..16 (default 1: inline)
   --help                 print this text
 
@@ -399,7 +409,9 @@ Production and staging: ANALYTICS_REFRESH_TARGET=production|staging with
 exactly PRIMARY_INSTANCE_CONNECTION_NAME, PRIMARY_DATABASE, PRIMARY_SCHEMA,
 POSTGRES_IAM_USER and ANALYTICS_V2_MEMORY_BUDGET_MIB; no --schema, --now or
 --revision-seed; run as node --max-old-space-size=12288 dist/analytics-refresh.mjs
---mode=full (the dense profile, inline, 4 h task timeout).
+--mode=full (the dense profile, inline, 4 h task timeout). A production target
+refuses ANALYTICS_V2_REVISION_FLOOR_ABSENT until the cutover import has loaded
+the revision floor.
 
 Resources (environment, within bounds): ANALYTICS_V2_MEMORY_BUDGET_MIB (4608),
 ANALYTICS_V2_MAX_DAY_OCCURRENCES (250000), ANALYTICS_V2_MAX_DAY_RECORD_MIB (256),
@@ -1054,6 +1066,22 @@ function exclusionSummary(value) {
     changed: value.changed, republishedDays: value.republishedDays });
 }
 
+/**
+ * The receipt's content-free revision floor (REV-SEED): whether the cutover's
+ * floor is loaded, its day count and its largest revision. Anything but the
+ * store's closed summary reads as absent.
+ */
+function revisionFloorSummary(value) {
+  const absent = Object.freeze({ present: false, dayCount: 0, maxRevision: 0 });
+  if (value === null || typeof value !== "object"
+      || Object.keys(value).sort().join(",") !== "dayCount,maxRevision,present"
+      || value.present !== true || !Number.isSafeInteger(value.dayCount) || value.dayCount < 1
+      || !Number.isSafeInteger(value.maxRevision) || value.maxRevision < 1 || value.maxRevision > MAX_REVISION_SEED) {
+    return absent;
+  }
+  return Object.freeze({ present: true, dayCount: value.dayCount, maxRevision: value.maxRevision });
+}
+
 function safeCode(error, fallback) {
   return typeof error?.code === "string" && SAFE_CODE.test(error.code) ? error.code : fallback;
 }
@@ -1212,6 +1240,15 @@ export async function runAnalyticsRefresh({
       await client.query("SET LOCAL idle_in_transaction_session_timeout=0");
       const snapshot = (await client.query("SELECT pg_export_snapshot() AS snapshot"))?.rows?.[0]?.snapshot;
       const state = await store.readAnalyticsV2RefreshState(client, { schema: parsed.schema });
+      // REV-SEED: a production run publishes only above Cloudflare's last
+      // revisions, so it refuses before any read or compute without the
+      // floor the cutover import loads. Staging and test targets publish
+      // above whatever floor is stored, none being 0.
+      const revisionFloor = revisionFloorSummary(state?.revisionFloor);
+      base.revisionFloor = revisionFloor;
+      if (production?.target === "production" && !revisionFloor.present) {
+        fail("ANALYTICS_V2_REVISION_FLOOR_ABSENT");
+      }
       // K-PGSTAT: the read side's round trips by statement family, and the
       // server's execution and planning time for the same families when
       // pg_stat_statements is readable (snapshots on their own connection).

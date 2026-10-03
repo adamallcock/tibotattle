@@ -280,10 +280,11 @@ The rest become one job, one transaction and about eight tables.
   erasures, and the eligibility semantics chosen under OA-2. The owner either
   accepts and discloses the differences or requires a frozen published
   snapshot for pre-seal dates.
-- Published revisions restart unless OD-10 is approved, so
-  `community-daily:<day>:r<rev>` aggregate IDs change at cutover. The site
-  renders totals and is unaffected; an external consumer keyed on aggregate IDs
-  would see new IDs.
+- Published revisions do not restart (owner decisions 2026-10-02, rounds 12
+  and 14; REV-SEED). The cutover import loads Cloudflare's last published
+  revision per day as a floor before the switch, and each day GCP republishes
+  continues above it, so no `community-daily:<day>:r<rev>` aggregate ID is
+  reused for other content. Days Cloudflare never published start at r1.
 - Recompute removes the analytics D1 import and history proof (HX-1, HX-2,
   HX-3, HX-5, HX-6), the GB-2 to GB-8 and AN-2 to AN-8 ports, OJ-6's analytics
   verification, the analytics half of PT-5b, EP-8's analytics-drain

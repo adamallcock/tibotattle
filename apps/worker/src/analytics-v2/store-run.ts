@@ -39,6 +39,32 @@ import {
 import { ANALYTICS_V2_NO_EXCLUSIONS_SHA256 } from "./exclusions";
 import { validAnalyticsV2KernelEntry, type AnalyticsV2RunStamp } from "./kernel";
 
+/**
+ * REV-SEED's revision-floor tables (staged migration
+ * analytics_v2_revision_floor): Cloudflare's last published revision per day
+ * and the floor's singleton provenance. The cutover import writes them once;
+ * the store and the Job only read them. They are named here, in the store's
+ * plumbing, not in contract.ts: contract.ts is in the kernel compute closure
+ * (cloud-run/analytics-kernel-closure.mjs), and a revision floor decides no
+ * kernel value, so naming it there would mint a new compute class.
+ */
+export const ANALYTICS_V2_REVISION_FLOOR_TABLES = Object.freeze({
+  revisionFloor: "analytics_v2_revision_floor",
+  revisionFloorSource: "analytics_v2_revision_floor_source",
+} as const);
+/** Their columns, in DDL order, and primary keys (the PG17 spec holds the migration to them). */
+export const ANALYTICS_V2_REVISION_FLOOR_COLUMNS = Object.freeze({
+  revisionFloor: Object.freeze(["day", "revision"] as const),
+  revisionFloorSource: Object.freeze([
+    "id", "provenance", "seal_id", "floor_sha256", "fence_receipt_sha256", "analytics_bookmark_sha256",
+    "source_commit", "captured_at", "day_count", "max_revision", "loaded_at",
+  ] as const),
+} as const);
+export const ANALYTICS_V2_REVISION_FLOOR_PRIMARY_KEYS = Object.freeze({
+  revisionFloor: Object.freeze(["day"] as const),
+  revisionFloorSource: Object.freeze(["id"] as const),
+} as const);
+
 /** The ten closed cache-continuity bands (d43c8f92 CACHE_RETENTION_BAND_IDS). */
 export const ANALYTICS_V2_CACHE_BANDS = Object.freeze([
   "under_one_minute",
@@ -864,11 +890,27 @@ export interface AnalyticsV2RefreshState {
   readonly appliedExclusionsSha256: string;
   /** Every day with a published head, ascending (republished when the exclusions change). */
   readonly publishedDays: readonly AnalyticsV2Day[];
+  /**
+   * The cutover's revision floor (REV-SEED), content-free: whether its
+   * singleton provenance row exists, and the day count and largest revision
+   * it records (0 and 0 when absent). The Job refuses a production run
+   * without one (ANALYTICS_V2_REVISION_FLOOR_ABSENT); the store applies the
+   * day rows whatever the target.
+   */
+  readonly revisionFloor: AnalyticsV2RevisionFloorSummary;
+}
+
+/** The content-free summary of the revision floor a run reads (REV-SEED). */
+export interface AnalyticsV2RevisionFloorSummary {
+  readonly present: boolean;
+  readonly dayCount: number;
+  readonly maxRevision: number;
 }
 
 /**
  * Read the cursor, the carried blocked days, the cache floor, the applied
- * exclusions digest and the published days. Runs in the caller's transaction
+ * exclusions digest, the published days and the revision floor's summary.
+ * Runs in the caller's transaction
  * (the Job's read snapshot).
  */
 export async function readAnalyticsV2RefreshState(
@@ -884,6 +926,7 @@ export async function readAnalyticsV2RefreshState(
   let runRows: { blocked: unknown; exclusions_sha256: unknown }[];
   let floorRows: { day: unknown }[];
   let publishedRows: { day: unknown }[];
+  let revisionFloorRows: { day_count: unknown; max_revision: unknown }[];
   try {
     cursorRows = rowsOf(await client.query(
       `SELECT last_sequence::text AS last_sequence
@@ -902,6 +945,10 @@ export async function readAnalyticsV2RefreshState(
     publishedRows = rowsOf(await client.query(
       `SELECT to_char(day, 'YYYY-MM-DD') AS day FROM ${relation(schema, ANALYTICS_V2_TABLES.publishedDaily)}
         ORDER BY day LIMIT $1`, [ANALYTICS_V2_OUTPUT_LIMITS.days + 1],
+    ), "ANALYTICS_V2_READ_FAILED");
+    revisionFloorRows = rowsOf(await client.query(
+      `SELECT day_count, max_revision FROM ${relation(schema, ANALYTICS_V2_REVISION_FLOOR_TABLES.revisionFloorSource)} WHERE id=$1`,
+      [ANALYTICS_V2_SINGLETON_ID],
     ), "ANALYTICS_V2_READ_FAILED");
   } catch (error) {
     if (error instanceof AnalyticsV2StoreError) throw error;
@@ -929,11 +976,23 @@ export async function readAnalyticsV2RefreshState(
   if (publishedDays.length > ANALYTICS_V2_OUTPUT_LIMITS.days || !publishedDays.every(isAnalyticsV2Day)) {
     fail("ANALYTICS_V2_STATE_INVALID", "publishedDaily");
   }
+  const floorRow = revisionFloorRows[0];
+  if (revisionFloorRows.length > 1 || (floorRow !== undefined
+      && (!Number.isSafeInteger(floorRow.day_count) || (floorRow.day_count as number) < 1
+        || !Number.isSafeInteger(floorRow.max_revision) || (floorRow.max_revision as number) < 1
+        || (floorRow.max_revision as number) > ANALYTICS_V2_MAX_REVISION_SEED))) {
+    fail("ANALYTICS_V2_STATE_INVALID", "revisionFloor");
+  }
+  const revisionFloor: AnalyticsV2RevisionFloorSummary = floorRow === undefined
+    ? Object.freeze({ present: false, dayCount: 0, maxRevision: 0 })
+    : Object.freeze({ present: true, dayCount: floorRow.day_count as number,
+      maxRevision: floorRow.max_revision as number });
   return Object.freeze({
     cursor,
     carriedBlockedDays: Object.freeze(sortedDays(blocked as AnalyticsV2Day[])),
     cacheFloorDay: cacheFloorDay as AnalyticsV2Day | null,
     appliedExclusionsSha256: (applied as string | null) ?? ANALYTICS_V2_NO_EXCLUSIONS_SHA256,
     publishedDays: Object.freeze(publishedDays as AnalyticsV2Day[]),
+    revisionFloor,
   });
 }

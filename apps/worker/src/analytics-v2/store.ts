@@ -19,8 +19,9 @@
  *     retention policy. The manual offline erasure runbook is the only path
  *     that deletes an owner's rows;
  *  3. it publishes each daily candidate whose content digest differs from the
- *     stored head: revision = max(previous, revisionSeed) + 1 and
- *     releasedAt = nowMs. An unchanged digest keeps the row untouched, and a
+ *     stored head: revision = max(previous, the day's revision floor,
+ *     revisionSeed) + 1 (store-publication.ts nextPublishedRevision; REV-SEED)
+ *     and releasedAt = nowMs. An unchanged digest keeps the row untouched, and a
  *     blocked day is never written, so it keeps its prior row (or stays
  *     absent);
  *  4. it upserts the preview, advances the journal cursor (never backwards),
@@ -34,7 +35,8 @@
  * candidate payload with its three revision-bound fields (aggregateId,
  * revision, releasedAt) replaced by the values this store assigns, and
  * payload_sha256 digests the payload WITHOUT those fields. Given the same
- * prior state, nowMs and revisionSeed, the stored rows are byte-identical.
+ * prior state, revision floor, nowMs and revisionSeed, the stored rows are
+ * byte-identical.
  * The candidate's payloadSha256 must equal analyticsV2DailyContentSha256 of
  * its payload; a disagreement is refused rather than silently re-derived.
  *
@@ -52,6 +54,8 @@ import { ANALYTICS_V2_SHA256_PATTERN, type AnalyticsV2PublicationSummary, type A
 import { analyticsV2CompatibilitySha256 } from "./kernel";
 import { writeAnalyticsV2DerivedFamilies } from "./store-derived";
 import { writeAnalyticsV2Preview, writeAnalyticsV2PublishedDaily } from "./store-publication";
+// REV-SEED: the one published-revision computation, for every publishing path.
+export { nextPublishedRevision } from "./store-publication";
 import {
   AnalyticsV2StoreError,
   UUID,
@@ -92,6 +96,9 @@ export {
   ANALYTICS_V2_MAX_DAILY_PAYLOAD_BYTES,
   ANALYTICS_V2_MAX_REVISION_SEED,
   ANALYTICS_V2_OUTPUT_LIMITS,
+  ANALYTICS_V2_REVISION_FLOOR_COLUMNS,
+  ANALYTICS_V2_REVISION_FLOOR_PRIMARY_KEYS,
+  ANALYTICS_V2_REVISION_FLOOR_TABLES,
   AnalyticsV2StoreError,
   analyticsV2DailyContentSha256,
   analyticsV2UtcDay,
@@ -102,6 +109,7 @@ export {
 } from "./store-run";
 export type {
   AnalyticsV2RefreshState,
+  AnalyticsV2RevisionFloorSummary,
   AnalyticsV2RunHorizon,
   AnalyticsV2StoreErrorCode,
   AnalyticsV2WriteReceipt,

@@ -133,7 +133,11 @@ export const STAGE_PLAN = Object.freeze([
   Object.freeze({ stage: "objects", kind: "waiver", reason: "deferred-post-flip:pt-7" }),
   Object.freeze({ stage: "analytics-expectation", kind: "waiver", reason: "analytics-recomputed:d3" }),
   Object.freeze({ stage: "analytics-history", kind: "waiver", reason: "analytics-recomputed:d3" }),
-  Object.freeze({ stage: "analytics-community-history", kind: "waiver", reason: "analytics-recomputed:d3" }),
+  // REV-SEED (round 14): Cloudflare's per-day revision floor, loaded before
+  // markLive so GCP's publications continue above it
+  // (cutover-revision-floor.mjs). The analytics D1 is never sealed, so this
+  // stage writes no table receipt; its stage receipt digests the floor.
+  Object.freeze({ stage: "analytics-community-history", kind: "runner" }),
   Object.freeze({ stage: "post-import", kind: "orchestrator" }),
 ]);
 

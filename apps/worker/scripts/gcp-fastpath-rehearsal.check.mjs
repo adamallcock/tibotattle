@@ -6,7 +6,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { parseArguments, resolveRehearsalDump } from "./gcp-fastpath-rehearsal.mjs";
+import { parseArguments, resolveRehearsalDump, syntheticRehearsalFloorDays } from "./gcp-fastpath-rehearsal.mjs";
 
 const refused = (code) => (error) => error?.code === code;
 
@@ -82,4 +82,17 @@ test("an external dump must match the digest the golden manifest pins", async ()
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("REV-SEED: the synthetic revision floor option is a fresh-schema rehearsal of a pure floor", () => {
+  assert.equal(parseArguments(["--golden", "/g/golden"]).syntheticRevisionFloor, false);
+  assert.equal(parseArguments(["--golden", "/g/golden", "--synthetic-revision-floor"]).syntheticRevisionFloor, true);
+  assert.throws(() => parseArguments(["--golden", "/g", "--synthetic-revision-floor", "--reuse-schema",
+    "typed_legacy_transfer_rehearsal_target_fastpath_0a1b2c3d"]), (error) => error?.code === "REHEARSAL_ARGUMENT_INVALID");
+  const days = Array.from({ length: 15 }, (_, index) => ({ day: `2026-09-${String(index + 1).padStart(2, "0")}`, revision: 1 }));
+  const floor = syntheticRehearsalFloorDays([...days].reverse());
+  assert.equal(floor.length, 13, "each seventh day has no floor");
+  assert.deepEqual(floor.slice(0, 7), [["2026-09-01", 1], ["2026-09-02", 2], ["2026-09-03", 3], ["2026-09-04", 4],
+    ["2026-09-05", 5], ["2026-09-06", 1], ["2026-09-08", 3]]);
+  assert.deepEqual(syntheticRehearsalFloorDays(days), floor, "a pure function of the golden");
 });

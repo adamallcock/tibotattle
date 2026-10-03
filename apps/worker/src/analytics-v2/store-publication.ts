@@ -4,10 +4,21 @@
  *
  * Inside the run's write transaction (store.ts writeRunOutputs) it publishes
  * each daily candidate whose content digest differs from the stored head:
- * revision = max(previous, revisionSeed) + 1 and releasedAt = nowMs. An
- * unchanged digest keeps the row untouched, and a blocked day is never
+ * revision = nextPublishedRevision(previous, the day's revision floor,
+ * revisionSeed), that is max(head, floor, seed) + 1, and releasedAt = nowMs.
+ * An unchanged digest keeps the row untouched, and a blocked day is never
  * written, so it keeps its prior row (or stays absent). The preview row is
- * upserted. Moved out of store.ts unchanged in behaviour.
+ * upserted.
+ *
+ * The revision floor (REV-SEED, owner decisions rounds 12 and 14) is
+ * Cloudflare's last published revision per day, loaded once by the cutover
+ * import before the first publication and immutable after it. A day
+ * Cloudflare published at rN continues at rN+1; a day it never published
+ * starts at r1. nextPublishedRevision is the ONE place a published revision
+ * is computed: every publishing path (this full-mode write, and any later
+ * incremental, reprice or purge republish) must call it, and a static check
+ * holds that no other module computes one. The database refuses a head at or
+ * below its floor independently (analytics_v2_published_daily_above_floor).
  */
 
 import type { PostgresClient } from "../postgres-client";
@@ -19,6 +30,8 @@ import {
 import type { AnalyticsV2RunStamp } from "./kernel";
 import {
   ANALYTICS_V2_MAX_DAILY_PAYLOAD_BYTES,
+  ANALYTICS_V2_MAX_REVISION_SEED,
+  ANALYTICS_V2_REVISION_FLOOR_TABLES,
   fail,
   forEachRecordsetChunk,
   insertRecordset,
@@ -28,6 +41,22 @@ import {
   type PreparedOutputs,
   type StoredHeadRow,
 } from "./store-run";
+
+/**
+ * The revision a changed day publishes at: one above the stored head, the
+ * day's revision floor and the run's revision seed, whichever is largest.
+ * `head` and `floor` are absent (undefined or null) when the day has none.
+ * Pure: the same inputs always give the same revision.
+ */
+export function nextPublishedRevision(input: {
+  readonly head?: number | null;
+  readonly floor?: number | null;
+  readonly seed: number;
+}): number {
+  const parts = [input.head ?? 0, input.floor ?? 0, input.seed];
+  if (!parts.every((value) => Number.isSafeInteger(value) && value >= 0)) fail("ANALYTICS_V2_STATE_INVALID", "revision");
+  return Math.max(...parts) + 1;
+}
 
 /** Publish the changed daily candidates; returns the published and unchanged days, in candidate order. */
 export async function writeAnalyticsV2PublishedDaily(client: PostgresClient, schema: string,
@@ -54,6 +83,24 @@ export async function writeAnalyticsV2PublishedDaily(client: PostgresClient, sch
       heads.set(row.day, row);
     }
   }
+  // The revision floor of the candidate days (REV-SEED). Immutable once any
+  // day is published, so reading it here, in the write transaction, is exact.
+  const floors = new Map<string, number>();
+  if (candidateDays.length > 0) {
+    for (const row of rowsOf<{ day: unknown; revision: unknown }>(await client.query(
+      `SELECT to_char(day, 'YYYY-MM-DD') AS day, revision
+         FROM ${relation(schema, ANALYTICS_V2_REVISION_FLOOR_TABLES.revisionFloor)}
+        WHERE day = ANY($1::date[]) ORDER BY day`,
+      [candidateDays],
+    ), "ANALYTICS_V2_WRITE_FAILED")) {
+      if (typeof row.day !== "string" || typeof row.revision !== "number"
+          || !Number.isSafeInteger(row.revision) || row.revision < 1
+          || row.revision > ANALYTICS_V2_MAX_REVISION_SEED) {
+        fail("ANALYTICS_V2_STATE_INVALID", "revisionFloor");
+      }
+      floors.set(row.day, row.revision);
+    }
+  }
   const published: AnalyticsV2Day[] = [];
   const unchanged: AnalyticsV2Day[] = [];
   const publishRows: unknown[] = [];
@@ -63,7 +110,8 @@ export async function writeAnalyticsV2PublishedDaily(client: PostgresClient, sch
       unchanged.push(candidate.day);
       continue;
     }
-    const revision = Math.max(head?.revision ?? 0, prepared.revisionSeed) + 1;
+    const revision = nextPublishedRevision({ head: head?.revision, floor: floors.get(candidate.day),
+      seed: prepared.revisionSeed });
     const payload = stampAnalyticsV2DailyPayload(candidate.payload, {
       day: candidate.day,
       revision,

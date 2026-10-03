@@ -26,14 +26,16 @@
 //   target-check      Read-only, before the fence: contract, PostgreSQL 17,
 //                     migration tail, empty target, transfer-login memberships,
 //                     trigger-policy coverage, the frozen-read table.
-//   preflight         Read-only: P1-P15 (seal, fence binding, coverage,
+//   preflight         Read-only: P1-P16 (seal, fence binding, coverage,
 //                     correction runtime, erasure quiescence, the deletion-
 //                     digest exclusion count, bootstrap, identity pin bound
 //                     to the sealed row and to the committed production
 //                     desired state's mount, controls, target, scheduler
 //                     pause, the OWN-4 export, the pending-object guard,
 //                     Sparkle nonces, the analytics D1 admin history export
-//                     bound to this seal). GO writes preflight.json (0400);
+//                     bound to this seal, the REV-SEED revision floor bound
+//                     to this seal and at or above every frozen-read
+//                     revision). GO writes preflight.json (0400);
 //                     NO-GO writes nothing.
 //   run               PROTECTED. Re-proves P10's memberships and P11's
 //                     scheduler pause, then R1 open/begin, R2 every stage of
@@ -117,6 +119,15 @@ import {
   loadInterimPublicReadInTransaction,
   readInterimExportFile,
 } from "./gcp-interim-public-read-load.mjs";
+import {
+  REVISION_FLOOR_TABLES,
+  assertRevisionFloorBinding,
+  assertRevisionFloorCoversFrozen,
+  loadRevisionFloorInTransaction,
+  readRevisionFloorFile,
+  revisionFloorSealFacts,
+  revisionFloorSummary,
+} from "./cutover-revision-floor.mjs";
 import {
   PARTICIPANT_NOT_QUIESCENT_PREDICATE,
   PUBLIC_SOURCE_BOOTSTRAP_POLICY,
@@ -273,6 +284,8 @@ export const IDENTITY_ROTATION_AUTHORIZATION_STEP = "identity-rotation";
 const AUTHORIZATION_STEPS = Object.freeze([...PROTECTED_STEPS, IDENTITY_ROTATION_AUTHORIZATION_STEP]);
 /** PT-8's own stage that moves the imported pin to the rotated label, and its checkpoint. */
 export const IDENTITY_LINK_ROTATION_STAGE = "identity-link-rotation";
+/** REV-SEED's stage (round 14): it loads the revision floor before markLive. */
+export const REVISION_FLOOR_STAGE = "analytics-community-history";
 const IDENTITY_LINK_ROTATION_CHECKPOINT = "identity-link-pin";
 /**
  * Round 16: the labels a production rotation moves between, from the
@@ -346,6 +359,7 @@ export const PRODUCTION_TRANSFER_ERROR_CODES = Object.freeze([
   "CUTOVER_SPARKLE_NONCES_UNEXPIRED",
   "CUTOVER_STEP_ORDER_VIOLATION",
   "CUTOVER_TARGET_FROZEN_READ_TABLE_MISSING",
+  "CUTOVER_TARGET_REVISION_FLOOR_TABLE_MISSING",
   "CUTOVER_TRANSFER_LOGIN_MEMBERSHIP_INVALID",
   "CUTOVER_TYPED_IDENTITY_HEADROOM_INVALID",
 ]);
@@ -495,12 +509,16 @@ function absolutePath(value, code = "CUTOVER_INPUTS_INVALID") {
  * P8-R and requires the identity-rotation token at `run`. adminHistoryExport
  * is { path, sha256 }: H.3 step 6's analytics D1 export
  * (cutover-admin-history-export.mjs), which post-import's admin history
- * mapping requires and P15 binds to the seal.
+ * mapping requires and P15 binds to the seal. revisionFloor is { path,
+ * sha256 }: H.3 step 7's revision-floor.json (cutover-revision-floor.mjs
+ * capture, or its synthetic floor at the dress rehearsal), which the
+ * 'analytics-community-history' stage loads and P16 binds to the seal and
+ * the frozen read.
  */
 export function validateTransferInputs(value) {
   const keys = ["schema", "contractId", "sealId", "sealManifestPath", "expectedSourceCommit", "fenceReceiptSha256",
     "expectedIdentityKeyVersion", "deletionDigestProjection", "interimPublicRead", "adminHistoryExport",
-    "schedulerEvidencePath", "ownerFlags", "allowedRoleMembers"];
+    "revisionFloor", "schedulerEvidencePath", "ownerFlags", "allowedRoleMembers"];
   const rotationDeclared = record(value) && Object.hasOwn(value, "identityLinkRotation");
   exactKeys(value, rotationDeclared ? [...keys, "identityLinkRotation"] : keys, "CUTOVER_INPUTS_INVALID");
   if (rotationDeclared) {
@@ -523,6 +541,9 @@ export function validateTransferInputs(value) {
   exactKeys(value.adminHistoryExport, ["path", "sha256"], "CUTOVER_INPUTS_INVALID");
   absolutePath(value.adminHistoryExport.path);
   sha(value.adminHistoryExport.sha256, "CUTOVER_INPUTS_INVALID");
+  exactKeys(value.revisionFloor, ["path", "sha256"], "CUTOVER_INPUTS_INVALID");
+  absolutePath(value.revisionFloor.path);
+  sha(value.revisionFloor.sha256, "CUTOVER_INPUTS_INVALID");
   const interim = exactKeys(value.interimPublicRead, ["exportPath", "sha256", "capturedAt", "sourceCommit", "evidenceDate"],
     "CUTOVER_INPUTS_INVALID");
   absolutePath(interim.exportPath);
@@ -993,6 +1014,19 @@ async function interimReadCheck(context, seal) {
     capturedAt: receipt.capturedAt }) };
 }
 
+/**
+ * REV-SEED: the owner's revision floor at its pinned sha256, bound to this
+ * seal (id, fence receipt, source commit) and at or above every revision the
+ * frozen read serves (REVISION_FLOOR_BELOW_FROZEN_EXPORT). Read-only.
+ */
+async function revisionFloorCheck(context, seal) {
+  const floor = assertRevisionFloorBinding(await readRevisionFloorFile({ path: context.inputs.revisionFloor.path,
+    expectedSha256: context.inputs.revisionFloor.sha256 }), revisionFloorSealFacts(seal));
+  const { prepared } = await interimReadCheck(context, seal);
+  const covered = assertRevisionFloorCoversFrozen(floor, prepared.frozen.days);
+  return { floor, receipt: Object.freeze({ ...revisionFloorSummary(floor), frozenDaysCovered: covered.frozenDays }) };
+}
+
 function sparkleNonceCount(database, atSeconds) {
   return sealedCount(database, `SELECT count(*) AS n FROM sparkle_appcast_guard_nonces WHERE expires_at > ${Math.floor(atSeconds)}`);
 }
@@ -1003,9 +1037,14 @@ function sparkleNonceCount(database, atSeconds) {
 async function targetFacts(handle, { requireEmptyFrozenRead = true } = {}) {
   return withTransferTransaction(handle, "primary", async client => {
     const coverage = await assertTriggerPolicyCoverage(client, handle.primarySchema, COMPLETE_TRIGGER_POLICY);
-    const { rows: tables } = await client.query(`SELECT to_regclass($1) IS NOT NULL AS frozen, to_regclass($2) IS NOT NULL AS published`,
-      [`${quote(handle.primarySchema)}.${INTERIM_PUBLIC_READ_TABLE}`, `${quote(handle.primarySchema)}.${PUBLISHED_DAILY_TABLE}`]);
+    const { rows: tables } = await client.query(`SELECT to_regclass($1) IS NOT NULL AS frozen, to_regclass($2) IS NOT NULL AS published,
+        to_regclass($3) IS NOT NULL AS floor, to_regclass($4) IS NOT NULL AS floor_source`,
+      [`${quote(handle.primarySchema)}.${INTERIM_PUBLIC_READ_TABLE}`, `${quote(handle.primarySchema)}.${PUBLISHED_DAILY_TABLE}`,
+        `${quote(handle.primarySchema)}.${REVISION_FLOOR_TABLES.floor}`,
+        `${quote(handle.primarySchema)}.${REVISION_FLOOR_TABLES.source}`]);
     if (tables[0]?.frozen !== true || tables[0]?.published !== true) fail("CUTOVER_TARGET_FROZEN_READ_TABLE_MISSING");
+    // REV-SEED: the 'analytics-community-history' stage loads the floor here.
+    if (tables[0]?.floor !== true || tables[0]?.floor_source !== true) fail("CUTOVER_TARGET_REVISION_FLOOR_TABLE_MISSING");
     if (requireEmptyFrozenRead) {
       // A published day ends the frozen read; only a refresh writes one.
       const { rows } = await client.query(`SELECT (SELECT count(*) FROM ${quote(handle.primarySchema)}.${PUBLISHED_DAILY_TABLE})::int AS published`);
@@ -1182,6 +1221,9 @@ export async function runPreflight(context) {
     checks.P15 = await checkAdminHistoryExportBinding({ seal, database: ingestion,
       adminHistoryExportPath: context.inputs.adminHistoryExport.path,
       adminHistoryExportSha256: context.inputs.adminHistoryExport.sha256 });
+    // P16 the revision floor (REV-SEED): pinned, bound to this seal, and at or
+    // above every frozen-read revision; the stage loads it.
+    checks.P16 = (await revisionFloorCheck(context, seal)).receipt;
     return Object.freeze({
       schema: `${PRODUCTION_TRANSFER_SCHEMA}-preflight`,
       verdict: "GO",
@@ -1299,11 +1341,35 @@ async function runOwnerLifecycleVerify(context, handle, sealed) {
   return Object.freeze({ stage, ownerRevisions: revisions.sourceRows });
 }
 
+/**
+ * The 'analytics-community-history' stage (REV-SEED, round 14): the per-day
+ * revision floor, loaded once in one transaction with its stage receipt, so
+ * markLive (which requires every stage complete) cannot precede it. The
+ * receipt digests the floor's identity, not the load state, so a rerun after
+ * a crash between the load and the receipt writes an equal receipt.
+ */
+async function runRevisionFloorStage(context, handle, sealed) {
+  const stage = REVISION_FLOOR_STAGE;
+  const { floor, receipt } = await revisionFloorCheck(context, sealed.seal);
+  const summary = { schema: `${PRODUCTION_TRANSFER_SCHEMA}-revision-floor`, sealId: context.inputs.sealId,
+    floor: receipt };
+  const receiptSha256 = HASH(canonicalJson(summary));
+  const loaded = await withTransferTransaction(handle, "primary", async client => {
+    await requireImportingRun(client, handle);
+    for (const prerequisite of stagePrerequisites(stage)) await assertStageCompleteIn(client, handle, prerequisite);
+    const result = await loadRevisionFloorInTransaction({ client, schema: handle.primarySchema, floor });
+    await stageReceipt(client, handle, { stage, state: "complete", rowCount: floor.dayCount, byteCount: 0, receiptSha256 });
+    return result;
+  });
+  return Object.freeze({ stage, receiptSha256, floorSha256: floor.floorSha256, state: loaded.state });
+}
+
 async function runStage(context, handle, sealed, entry, rotation) {
   const base = { handle, sealManifestPath: context.inputs.sealManifestPath, ...context.runnerOptions };
   if (entry.kind === "waiver") return runWaiver(context, handle, sealed, entry);
   await assertPrerequisites(handle, entry.stage);
   if (entry.stage === "owner-lifecycle-verify") return runOwnerLifecycleVerify(context, handle, sealed);
+  if (entry.stage === REVISION_FLOOR_STAGE) return runRevisionFloorStage(context, handle, sealed);
   if (entry.stage === IDENTITY_LINK_ROTATION_STAGE) return runIdentityLinkRotation(context, handle, rotation);
   let result;
   if (entry.stage === "identity-authority") {
